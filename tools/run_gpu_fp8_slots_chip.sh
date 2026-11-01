@@ -18,11 +18,13 @@ cd "$HERE" || exit 2
   uname -a; nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null; free -g | head -2
 } > "$EVID/device.txt"
 make PHYSICS_DIR="$PHYS" -j10 build/gpu_fp8_slots_test > "$EVID/build.log" 2>&1 || { echo "GPU_FP8_SLOTS_CHIP: FAIL build"; exit 1; }
-# A stale nvrm.o compiled from another physics checkout survives a PHYSICS_DIR change (make sees it up to
-# date) and changes the allocator under the test: refuse the run unless nvrm.o came from $PHYS.
-NVRM_D=$(find build -name nvrm.d | head -1)
-if [ -z "$NVRM_D" ] || ! grep -q "$(cd "$PHYS" && pwd)/nvrm/nvrm.c" "$NVRM_D"; then
-    echo "GPU_FP8_SLOTS_CHIP: FAIL build (nvrm.o not built from $PHYS; rm -rf build and rerun)"; exit 1
+# nvrm.o is no longer built from $PHYS: it is part of libcudapp.a in the CUDApp stage the Makefile links.
+# Refuse the run unless that stage verifies against cudapp.lock and holds its own nvrm build.
+STAGE=${CUDAPP_STAGE:-${OUT_DIR:-build}/cudapp}
+sh tools/cudapp-stage.sh --verify cudapp.lock "$STAGE" > "$EVID/cudapp-source.json" 2>> "$EVID/build.log" ||
+    { echo "GPU_FP8_SLOTS_CHIP: FAIL build (CUDApp stage $STAGE does not verify against cudapp.lock)"; exit 1; }
+if [ ! -s "$STAGE/build/nvrm.d" ] || ! grep -q '^ *nvrm/nvrm\.c ' "$STAGE/build/nvrm.d"; then
+    echo "GPU_FP8_SLOTS_CHIP: FAIL build (nvrm.o not built in the CUDApp stage $STAGE; rm -rf build and rerun)"; exit 1
 fi
 T=./build/gpu_fp8_slots_test
 fail=0
