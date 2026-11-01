@@ -1088,7 +1088,11 @@ static bool m18_clean_clone_realpath(const char *name, const char *value, char o
 /* The CUDApp inputs of the nested build, resolved in this process: the stage
  * (CUDAPP_STAGE, else ${OUT_DIR:-build}/cudapp), the checkout (CUDAPP_DIR, else
  * the repository the stage recorded) and the pinned tools OMEGA_OMC and
- * OMEGA_BRIDGE, which tools/cudapp-stage.sh requires. */
+ * OMEGA_BRIDGE, which tools/cudapp-stage.sh requires. The stage is only
+ * verified here and names the checkout; it is never handed to the nested build,
+ * which stages its own copy under its own build/ (a resolved stage directory is
+ * not a snapshot link, so cudapp-stage.sh refuses to publish over it, and the
+ * caller's link would otherwise be republished by the copy). */
 static bool m18_clean_clone_cudapp_inputs(char stage[PATH_MAX], char cudapp[PATH_MAX], char omc[PATH_MAX],
                                           char bridge[PATH_MAX]) {
     char fallback[PATH_MAX];
@@ -1173,7 +1177,7 @@ static bool test_m18_gate16_clean_clone(void) {
         return false;
     }
     char root[PATH_MAX], checkout[PATH_MAX], log_path[PATH_MAX], physics_arg[PATH_MAX + 16];
-    char cudapp_arg[PATH_MAX + 16], stage_arg[PATH_MAX + 16], omc_arg[PATH_MAX + 16], bridge_arg[PATH_MAX + 16];
+    char cudapp_arg[PATH_MAX + 16], omc_arg[PATH_MAX + 16], bridge_arg[PATH_MAX + 16];
     char *git_top[] = {"git", "rev-parse", "--show-toplevel", NULL};
     if (!omega_cc_capture_line(NULL, "git", git_top, root, sizeof(root))) {
         fprintf(stderr, "M18 clean clone: git rev-parse --show-toplevel failed\n");
@@ -1184,20 +1188,18 @@ static bool test_m18_gate16_clean_clone(void) {
     int n2 = snprintf(log_path, sizeof(log_path), "%s/clean_clone_m18.log", clone);
     int n3 = snprintf(physics_arg, sizeof(physics_arg), "PHYSICS_DIR=%s", physics_dir_resolved);
     int n4 = snprintf(cudapp_arg, sizeof(cudapp_arg), "CUDAPP_DIR=%s", cudapp_dir);
-    int n5 = snprintf(stage_arg, sizeof(stage_arg), "CUDAPP_STAGE=%s", stage_dir);
     int n6 = snprintf(omc_arg, sizeof(omc_arg), "OMEGA_OMC=%s", omc_path);
     int n7 = snprintf(bridge_arg, sizeof(bridge_arg), "OMEGA_BRIDGE=%s", bridge_dir);
     if (n1 < 0 || (size_t)n1 >= sizeof(checkout) || n2 < 0 || (size_t)n2 >= sizeof(log_path) ||
         n3 < 0 || (size_t)n3 >= sizeof(physics_arg) || n4 < 0 || (size_t)n4 >= sizeof(cudapp_arg) ||
-        n5 < 0 || (size_t)n5 >= sizeof(stage_arg) || n6 < 0 || (size_t)n6 >= sizeof(omc_arg) ||
-        n7 < 0 || (size_t)n7 >= sizeof(bridge_arg)) {
+        n6 < 0 || (size_t)n6 >= sizeof(omc_arg) || n7 < 0 || (size_t)n7 >= sizeof(bridge_arg)) {
         (void)rmdir(clone);
         return false;
     }
     char *verify_argv[] = {"sh", "tools/cudapp-stage.sh", "--verify", "cudapp.lock", stage_dir, NULL};
     char *cp_argv[] = {"cp", "-r", "--", root, checkout, NULL};
     char *clean_argv[] = {"make", "clean", NULL};
-    char *make_argv[] = {"make", "-j", physics_arg, cudapp_arg, stage_arg, omc_arg, bridge_arg, NULL};
+    char *make_argv[] = {"make", "-j", physics_arg, cudapp_arg, omc_arg, bridge_arg, NULL};
     char *run_argv[] = {"./build/omegatool", "--run-m18-gates", NULL};
     const char *step = "cudapp-stage --verify";
     int rc = omega_cc_run(root, "sh", verify_argv, NULL, false);

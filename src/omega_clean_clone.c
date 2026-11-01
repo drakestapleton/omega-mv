@@ -23,9 +23,11 @@ bool omega_cc_path_is_plain(const char *s) {
     return true;
 }
 
-/* Child side: environment, directory, output, then exec. Never returns. */
+/* Child side: environment, directory, output, then exec. Never returns.
+ * OUT_DIR and CUDAPP_STAGE are dropped so the copy builds, stages and reads its
+ * own build/ and build/cudapp, never the caller's. */
 static void cc_child(const char *dir, const char *prog, char *const argv[], const char *out_rel, bool in_clean_clone) {
-    if (unsetenv("OUT_DIR") != 0) _exit(127);
+    if (unsetenv("OUT_DIR") != 0 || unsetenv("CUDAPP_STAGE") != 0) _exit(127);
     if (in_clean_clone && setenv("OMEGA_IN_CLEAN_CLONE", "1", 1) != 0) _exit(127);
     if (dir && chdir(dir) != 0) _exit(127);
     /* Opened after chdir: the name is fixed by the caller, never built from a path. */
