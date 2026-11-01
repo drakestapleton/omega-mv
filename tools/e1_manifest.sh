@@ -63,7 +63,7 @@ if [ "${1:-}" = --canonical-evidence ]; then
     [ "$#" -gt 0 ]
     mkdir -p "$target"
     for input in "$@"; do
-        case $input in src/*.[ch]) ;; *) echo "invalid canonical source: $input" >&2; exit 2;; esac
+        case $input in src/*.[ch]|src/*.ident|tests/*.[ch]|om/*.om) ;; *) echo "invalid canonical source: $input" >&2; exit 2;; esac
         case $input in */../*|*/./*) exit 2;; esac
         [ -s "$source/$input" ] && [ -f "$source/$input" ] || {
             echo "missing or empty canonical source: $input" >&2; exit 2;

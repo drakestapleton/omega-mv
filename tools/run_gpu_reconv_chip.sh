@@ -39,7 +39,8 @@ OUT=$OUT_ROOT/GPU-RECONV-$SHA
 mkdir -p "$OUT"
 bash tools/e1_manifest.sh --canonical-evidence "$OUT" \
     src/omega_gpu_elementwise_api.c src/omega_gpu_elementwise_api.h \
-    src/omega_bw_reconv.h src/omega_blackwell_codegen.c || exit 2
+    src/omega_bw_reconv.h src/omega_blackwell_codegen.c src/cudapp_om_units.ident \
+    om/encoder/bw_enc_sm121.om tests/gpu_reconv_test.c tests/bw_warp_sim.h || exit 2
 if ! make PHYSICS_DIR="$P" build/gpu_reconv_test > "$OUT/build.log" 2>&1; then
     echo "GPU-RECONV BUILD FAIL (see $OUT/build.log)"; exit 1
 fi
@@ -53,8 +54,7 @@ fi
 # shellcheck disable=SC2086
 ./build/gpu_reconv_test --out "$OUT/receipt.json" $EXTRA > "$OUT/run.log" 2>&1
 rc=$?
-cp build/cudapp/source/om/encoder/bw_enc_sm121.om build/cudapp/source/src/cudapp_om_units.ident src/omega_om_units.ident \
-    tests/gpu_reconv_test.c tests/bw_warp_sim.h "$OUT/" || exit 2
+cp src/omega_om_units.ident "$OUT/" || exit 2
 (cd "$OUT" && for file in *; do
     [ "$file" != SHA256SUMS ] || continue
     [ -f "$file" ] && sha256sum -- "$file" || exit 2

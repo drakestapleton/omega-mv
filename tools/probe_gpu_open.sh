@@ -32,7 +32,8 @@ cd "$(dirname "$0")/.." || exit 2
 P=${PHYSICS_DIR:-../physics}
 mkdir -p "$OUT"
 bash tools/e1_manifest.sh --canonical-evidence "$OUT" \
-    src/omega_gpu_session.c src/omega_gpu_platform.c src/omega_gpu_platform_linux.c || exit 2
+    src/omega_gpu_session.c src/omega_gpu_platform.c src/omega_gpu_platform_linux.c \
+    tests/gpu_session_probe.c || exit 2
 make PHYSICS_DIR="$P" build/gpu_session_probe > "$OUT/build.log" 2>&1 || { echo "PROBE BUILD FAIL"; exit 1; }
 PR=./build/gpu_session_probe
 LOG="$OUT/probe.log"; : > "$LOG"
@@ -60,7 +61,7 @@ run_variant overlap
 grep -c 'rc=OK' "$LOG" > "$OUT/ok_count.txt"
 grep 'rc=' "$LOG" | grep -v 'rc=OK' | grep -v negative_control > "$OUT/failures.txt"
 echo "end $(date -u +%FT%TZ)" >> "$OUT/device.txt"
-cp tests/gpu_session_probe.c tools/probe_gpu_open.sh "$OUT/" || exit 2
+cp tools/probe_gpu_open.sh "$OUT/" || exit 2
 (cd "$OUT" && for file in *; do
     [ "$file" != SHA256SUMS ] || continue
     [ -f "$file" ] && sha256sum -- "$file" || exit 2

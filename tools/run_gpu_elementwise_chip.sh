@@ -29,7 +29,8 @@ SHA=$(git rev-parse --short HEAD)
 OUT=${1:-$HOME/workspace/evidence-out}/FB1-CUT4-$SHA
 mkdir -p "$OUT"
 bash tools/e1_manifest.sh --canonical-evidence "$OUT" \
-    src/omega_gpu_elementwise_api.c src/omega_gpu_elementwise_api.h || exit 2
+    src/omega_gpu_elementwise_api.c src/omega_gpu_elementwise_api.h \
+    tests/gpu_elementwise_test.c || exit 2
 if ! make PHYSICS_DIR="$P" build/gpu_elementwise_test > "$OUT/build.log" 2>&1; then
     echo "FB1-CUT4 BUILD FAIL (see $OUT/build.log)"; exit 1
 fi
@@ -42,7 +43,6 @@ fi
 } > "$OUT/device.txt"
 ./build/gpu_elementwise_test --out "$OUT/receipt.json" > "$OUT/run.log" 2>&1
 rc=$?
-cp tests/gpu_elementwise_test.c "$OUT/" || exit 2
 (cd "$OUT" && for file in *; do
     [ "$file" != SHA256SUMS ] || continue
     [ -f "$file" ] && sha256sum -- "$file" || exit 2
