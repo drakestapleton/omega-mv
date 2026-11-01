@@ -438,6 +438,17 @@ OS flag values remain target-native.
 See [the backend design and evidence](../X86-LINUX.md) for the register map,
 syscall adaptation, seed-chain boundaries and qualification status.
 
+An initial line `target x86efi` selects the x86-64 UEFI backend: the same x86-64 code
+generator wrapped in a PE32+ EFI application image with the UEFI entry/exit and Microsoft
+x64 firmware calls. Only whole programs (`fn main`) are accepted; a bare unit is refused
+at line 1 with error 25, and Linux host words such as `read` and `write` are refused with
+error 25 at their line. The firmware is reached through one word, `efi`
+(keyword id 178), recognised only under `target x86efi` (elsewhere it is an ordinary name,
+and a call to it is error 3): `r = efi OP ARG A OFF N`, OP a literal 0..13, `OFF+N <= len A`
+(else trap 3), bit 63 of the ulong result marks an error code. A trap T returns the
+EFI_STATUS `2^63 | (100 + T)`. See [the x86efi design and evidence](../X86-EFI.md) for
+the operations, the efi 12 file contract and qualification status.
+
 ### 9.2 Functions and calls
 
 - `fn` may appear many times. A names pass reads every signature before any code is written, so a call
