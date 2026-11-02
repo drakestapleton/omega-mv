@@ -17,6 +17,7 @@
 #include "omega_blackwell_codegen.h"
 #include "omega_blackwell_submit.h"
 #include "sha256.h"
+#include "omega_path_check.h"
 #include <string.h>
 /* native v1 P07 cut A.2 (aienos#286, docs/numeric/OMEGA_GPU_NATIVE_BOUNDARY.md): with OMEGA_GPU_NO_POSIX this file
  * builds -ffreestanding. Code generation then runs only through the allocation-free entry points
@@ -416,13 +417,17 @@ static int bw_c_encode_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *ra
             }
             break;
 
-        case BW_IR_LDG_E:
-            /* LDG.E Rd, desc[URd][Ra.64] */
+        case BW_IR_LDG_E: {
+            /* LDG.E Rd, desc[URd][Ra.64+imm]: the 32-bit size (4) of the LDG.E.64 / LDG.E.128 words below; imm as there
+             * (signed 24-bit byte offset at bits 40..63, w[1] bits 8..31), unchanged words when imm is 0. */
+            int32_t off = (int32_t)insn->imm;
+            if (off < -(1 << 23) || off >= (1 << 23)) return -1;
             w[0] = 0x7981 | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
-            w[1] = (uint32_t)(ureg & 0xff);
+            w[1] = (uint32_t)(ureg & 0xff) | (((uint32_t)off & 0xffffffU) << 8);
             w[2] = 0x0c1e1900;
             w[3] = insn->control ? insn->control : 0x000f2200;
             break;
+        }
 
         case BW_IR_STG_E: {
             /* STG.E desc[URd][Ra.64+imm], Rb. imm = signed 24-bit byte offset at bits 40..63 (w[1] bits
@@ -1257,8 +1262,15 @@ int omega_blackwell_verify_codegen_fixtures_fb1cut4(void) {
  * every kernel the library builds. Unset (the normal case) it does nothing; the freestanding build has no files. */
 void omega_kernel_dump(const uint8_t *code, size_t len) {
 #ifndef OMEGA_GPU_NO_POSIX
-    const char *dir = getenv("OMEGA_KERNEL_DUMP_DIR");
-    if (!dir || !dir[0] || !code || !len) return;
+    const char *env = getenv("OMEGA_KERNEL_DUMP_DIR");
+    if (!env || !env[0] || !code || !len) return;
+    /* Only the checked copy (src/omega_path_check.h) is opened; a refused directory is a diagnostic, which
+     * tools/sm121dis/corpus.sh fails on, never a silent skip. */
+    char dir[4000];
+    if (omega_path_copy(dir, sizeof dir, env) != 0) {
+        BW_DIAG("omega_kernel_dump: OMEGA_KERNEL_DUMP_DIR refused (src/omega_path_check.h)\n");
+        return;
+    }
     uint8_t d[SHA256_DIGEST_SIZE]; sha256_hash(code, len, d);
     char path[4096];
     int n = snprintf(path, sizeof path, "%s/%02x%02x%02x%02x%02x%02x%02x%02x.bin",
