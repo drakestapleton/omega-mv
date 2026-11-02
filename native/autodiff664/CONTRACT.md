@@ -1,4 +1,4 @@
-# Native reverse-mode tape (bounded) — `native/autodiff664/tape.om`
+# Native reverse-mode tape (bounded): `native/autodiff664/tape.om`
 
 Status: IMPLEMENTED and EXERCISED on the host (aarch64 Linux, DGX Spark). Not
 QUALIFIED on hardware, not MERGED, not DEPLOYED. Tracks omega-mv #664 (native
@@ -69,9 +69,13 @@ A refusal records nothing (the node count is unchanged).
 
 ## Evidence (host)
 
-The pinned compiler is omega-mv `seed/out/omc`, SHA-256
+The recorded host suite used omega-mv `seed/out/omc`, SHA-256
 `be8c51301307555254fc59e351d281aae1aa096d91521777e33a41c8b446448a` (main 9920aab1; the suite
 first passed with `62775d2a391cfef7cde64e387655caa9809a267093112910ec76bfa568f3712b`).
+That pin is historical. The committed compiler on this branch is
+`b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`
+(`seed/omc/omc.om` `16b4ca40a5bd7796ac08b55d1ceadac1260e52298ed123f45418e77b3221c749`).
+The tape suite was NOT_RUN against that compiler.
 
 ```sh
 OMC=<pinned omc> OUT=<scratch> sh tests/autodiff664/run-tape.sh

@@ -107,8 +107,8 @@ each check it cannot run and exits 77 when nothing could run).
 
 | Gate | Result |
 |---|---|
-| AArch64 as stored | 1305 tracked `.om` files at this head, compiled as stored by omc `b4f45121` and main's omc `be8c5130`: 664 compiled to identical bytes, 637 refused with the same status and stderr, 4 differ. The 4 are `tests/x86efi/exit/e1.om`, `exit/e2.om`, `file/t1.om` and `refusals/g4.om`: `b4f45121` accepts them and `be8c5130` refuses error 25. `tests/x86efi/float/efi-pre.om` is refused error 25 by both |
-| x86linux | the 1300 files that do not already say `target x86efi`, with `target x86linux` prepended when the file had no target line: 647 compiled to identical bytes, 653 refused identically, 0 differ |
+| AArch64 as stored | 1305 tracked `.om` files, `tools/x86efi/corpus_diff.sh` asis, omc `b4f45121` against main's omc `be8c5130`: 663 identical, 638 same-refusal, 4 differ. The 4 are `tests/x86efi/exit/e1.om`, `exit/e2.om`, `file/t1.om` and `refusals/g4.om`: `b4f45121` accepts them and `be8c5130` refuses error 25. `tests/x86efi/float/efi-pre.om` is error 25 from both. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130.tsv`. Run on x86_64 under qemu-user. A native AArch64 run is NOT_RUN |
+| x86linux | the same 1305 files with mode x86linux (a `target x86linux` line is prepended only when the file has no target line): 647 identical, 654 same-refusal, 4 differ. Those 4 are the same `target x86efi` programs. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130_x86linux.tsv` |
 | Float parity (`float/`) | one program printing 41 bit patterns (add, sub, mul, div, sqrt, exp, log, int/float conversions, saturating casts, NaN, f32) gives identical output as x86efi, x86linux (qemu-x86_64) and AArch64; floats survive 40+ firmware calls. An MXCSR round-toward-zero mutant fails it |
 | efi 12 refusals (`refusals/`) | 21 results (codes above, path lengths 0/255/256, busy, nothing open, read-only write, bad volume) match; OFF+N past the array traps 3 |
 | efi 12 round trip (`file/`) | create, write, close, reopen, positioned write, read back: results and the bytes on disk match. A mutant with the Read/Write protocol offsets 32/40 swapped fails it |

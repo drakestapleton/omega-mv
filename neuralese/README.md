@@ -20,7 +20,7 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 Current pin after the x86efi reseed (#1015, branch `feat/x86efi-main`, 2026-11-01): committed
 `seed/out/omc` SHA-256
 `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`, compiler
-source SHA-256 `6ccefeffea05a7d263209a14db35b5a82112d5bd0ab23f2560016ca3ca22ba65`.
+source SHA-256 `16b4ca40a5bd7796ac08b55d1ceadac1260e52298ed123f45418e77b3221c749`.
 The previous pin, after the scrub live-float reseed (#994) merged as
 `9920aab1413983c2867d02d75b2276341595adb8`, was
 `be8c51301307555254fc59e351d281aae1aa096d91521777e33a41c8b446448a` (source
