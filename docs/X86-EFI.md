@@ -1,9 +1,10 @@
 # x86-64 UEFI backend (`target x86efi`)
 
 Status: **DRAFT; IMPLEMENTED and EXERCISED under emulation (QEMU q35 + OVMF)**, 2026-11-01.
-Draft aien-dev/aien-train#53 records one physical iMac run of an image built with this omc
+Draft aien-dev/aien-train#53 at `e08443c3` records one physical iMac run of an image built with this omc
 (`b4f45121`, `evidence/OMEGALLM/imac/`): EXERCISED on physical hardware (one machine).
-This repository has no physical-firmware gate. Base: `aien-dev/omega-mv` main `ba5559d9`.
+This repository has no physical-firmware gate. The compiler was built on main `ba5559d9`.
+This branch also contains main `f9a9a40b` (#995). That merge did not change `seed/omc/omc.om` or `seed/out/omc`.
 Implementation: `seed/omc/omc.om` (functions `xp` through `xf12`, plus hooks in `kw`, the value
 parser, the driver, `xleave`, `xfinish`, `xlead` and `xeof`). It reuses the x86linux instruction
 selection, register model and SSE2 float code of [X86-LINUX.md](X86-LINUX.md); only the image
@@ -106,8 +107,8 @@ each check it cannot run and exits 77 when nothing could run).
 
 | Gate | Result |
 |---|---|
-| AArch64 unchanged | `seed/host/check.sh` passes, fixpoint reproduced; all 1241 `.om` files tracked on main `ba5559d9` give the same bytes and status as main's omc: 621 compile, 620 are refused identically |
-| x86linux unchanged | the same 1241 files with `target x86linux`: 605 compile byte-identical, 636 are refused identically |
+| AArch64 unchanged | `seed/host/check.sh` passes, fixpoint reproduced; all 1241 `.om` files tracked on main `ba5559d9` (the compiler's parent; this corpus was not rerun against main `f9a9a40b`) give the same bytes and status as that main's omc: 621 compile, 620 are refused identically |
+| x86linux unchanged | the same 1241 files, on that same `ba5559d9` base, with `target x86linux`: 605 compile byte-identical, 636 are refused identically |
 | Float parity (`float/`) | one program printing 41 bit patterns (add, sub, mul, div, sqrt, exp, log, int/float conversions, saturating casts, NaN, f32) gives identical output as x86efi, x86linux (qemu-x86_64) and AArch64; floats survive 40+ firmware calls. An MXCSR round-toward-zero mutant fails it |
 | efi 12 refusals (`refusals/`) | 21 results (codes above, path lengths 0/255/256, busy, nothing open, read-only write, bad volume) match; OFF+N past the array traps 3 |
 | efi 12 round trip (`file/`) | create, write, close, reopen, positioned write, read back: results and the bytes on disk match. A mutant with the Read/Write protocol offsets 32/40 swapped fails it |
@@ -120,5 +121,5 @@ EXERCISED on physical hardware (one machine).
 
 ## Limits
 
-The compiler stays at the om4 cap of 512 functions. Allen's stack (#977, #983, #980, #981) carries
+The compiler uses 510 of the om4 cap of 512 functions (`seed/omc/size-history.tsv`). Allen's stack (#977, #983, #980, #981) carries
 an older x86efi on a different base; its register slots and live-slot saves are not ported here.
