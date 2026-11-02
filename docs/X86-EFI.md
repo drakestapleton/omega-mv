@@ -1,7 +1,9 @@
 # x86-64 UEFI backend (`target x86efi`)
 
-Status: **DRAFT; IMPLEMENTED and EXERCISED under emulation (QEMU q35 + OVMF) only**, 2026-11-01.
-Physical firmware (the Allen iMac) is NOT_RUN. Base: `aien-dev/omega-mv` main `ba5559d9`.
+Status: **DRAFT; IMPLEMENTED and EXERCISED under emulation (QEMU q35 + OVMF)**, 2026-11-01.
+Draft aien-dev/aien-train#53 records one physical iMac run of an image built with this omc
+(`b4f45121`, `evidence/OMEGALLM/imac/`): EXERCISED on physical hardware (one machine).
+This repository has no physical-firmware gate. Base: `aien-dev/omega-mv` main `ba5559d9`.
 Implementation: `seed/omc/omc.om` (functions `xp` through `xf12`, plus hooks in `kw`, the value
 parser, the driver, `xleave`, `xfinish`, `xlead` and `xeof`). It reuses the x86linux instruction
 selection, register model and SSE2 float code of [X86-LINUX.md](X86-LINUX.md); only the image
@@ -112,8 +114,9 @@ each check it cannot run and exits 77 when nothing could run).
 | Exit flush (`exit/`) | a file written with sub 3 and left open is on disk with all 10 bytes after `return` and after trap 3. The previous omc (`d0f756d9…`, no exit cleanup) leaves a 0-byte file in both cases |
 | GUIDs | values checked; see above |
 
-NOT_RUN: physical firmware, efi ops 0..11, the ConOut NULL refusal, GOP Blt, network, entropy,
-pointer, native x86 execution of the seed.
+NOT_RUN in this repository's gates: efi ops 0..11, the ConOut NULL refusal, GOP Blt, network,
+entropy, pointer, native x86 execution of the seed. The iMac run cited above is
+EXERCISED on physical hardware (one machine).
 
 ## Limits
 
