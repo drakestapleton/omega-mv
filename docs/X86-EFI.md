@@ -34,7 +34,7 @@ calibrates it once with Boot Services `Stall(100000)`, so every image pays a 100
 
 ## The `efi` word
 
-`r = efi OP ARG A OFF N`: OP is a literal 0..13, ARG a ulong, A a uchar array with `OFF+N <= len A`
+`r = efi OP ARG A OFF N`: OP is a literal 0..14, ARG a ulong, A a uchar array with `OFF+N <= len A`
 (else trap 3, the same check as `read`/`write`). The result is a ulong; bit 63 set means an error
 whose code is in the low bits.
 
@@ -53,6 +53,7 @@ whose code is in the low bits.
 | 11 | boot-file read/write, fixed path `\EFI\BOOT\BOOTX64.EFI` (Allen fork contract, #981) | shipped, NOT_RUN |
 | 12 | general file, below | EXERCISED (EMULATED) |
 | 13 | console, below | EXERCISED (EMULATED) |
+| 14 | machine identity, below | EXERCISED (EMULATED) |
 
 ### efi 13 console
 
@@ -90,6 +91,24 @@ Slot state after an error:
   returns 40 when Flush failed. With nothing open it is refusal 35.
 - A file still open when the program returns, exits or traps is flushed and closed by the exit.
 
+### efi 14 identity
+
+Read-only facts about the machine, selected by ARG; the result is the number of bytes written to
+`A[OFF..)` unless noted.
+
+| ARG | Result |
+|---|---|
+| `L << 16` (bits 0..15 zero) | CPUID leaf L (L < 2^32, ECX 0): EAX, EBX, ECX, EDX as 16 little-endian bytes; N < 16 is error 5; result 16 |
+| 1 | SystemTable FirmwareVendor (SystemTable+24): its UCS-2 code units up to the NUL, whole units only, at most N bytes; 0 when the pointer is NULL |
+| 2 | SystemTable FirmwareRevision (SystemTable+32), the u32 itself; nothing is written |
+| `3 + (P << 16)` | the SMBIOS structure table from byte P: min(N, length − P) bytes, 0 when P ≥ length. The table is found in the ConfigurationTable through the SMBIOS 3 GUID (anchor `_SM3_`, 64-bit address at +16, maximum size at +12) when present, else the SMBIOS GUID (anchor `_SM_`, 32-bit address at +24, length at +22); neither, a wrong anchor or a zero address is error 44 |
+| anything else | error 32 |
+
+The structures are left to the program. A program that must not reveal the machine reads only the
+fields it prints; `tests/x86efi/ident/id.om` reads type 1 Manufacturer, Product Name and Version and
+never the serial number (offset 7) or the UUID (8..23). Error 44 is NOT_RUN: OVMF always installs
+SMBIOS.
+
 ## GUIDs
 
 GOP, SNP, RNG, Simple Pointer, Absolute Pointer, Simple File System, LoadedImage and FileInfo are
@@ -113,6 +132,7 @@ each check it cannot run and exits 77 when nothing could run).
 | efi 12 round trip (`file/`) | create, write, close, reopen, positioned write, read back: results and the bytes on disk match. A mutant with the Read/Write protocol offsets 32/40 swapped fails it |
 | Exit flush (`exit/`) | a file written with sub 3 and left open is on disk with all 10 bytes after `return` and after trap 3. The previous omc (`d0f756d9…`, no exit cleanup) leaves a 0-byte file in both cases |
 | GUIDs | values checked; see above |
+| Machine identity (`ident/`, omc sha256 `3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`) | under `-smbios type=1,manufacturer=OmegaTest,product=IdentBox,version=7.1,serial=…,uuid=…` and both `smbios-entry-point-type=64` and `=32`: brand `QEMU TCG CPU version 2.5+`, FirmwareVendor `Ubuntu distribution of EDK II`, `sm=OmegaTest/IdentBox/7.1`, a positioned read equal to the table bytes, 8 results (N 0, P past the end, CPUID 16, N 15 → 5, L ≥ 2^32 and three bad subs → 32) match `expected.txt`; FirmwareRevision is 8 hex digits (`00010000` on Ubuntu OVMF); the serial and UUID are not in the output. Negative control: manufacturer `OtherMaker` changes the output. Manual mutants (not in the runner): a wrong SMBIOS 2 GUID gives `sm=-` under the 32-bit entry point and is still correct under the 64-bit one, so the SMBIOS 3 path is the one used there; a wrong SMBIOS 3 GUID still gives the right strings through the SMBIOS 2 fallback, which OVMF also publishes under the 64-bit setting. Every tracked `.om` file (1297), as is and with `target x86linux`, gives the same bytes and status from this omc as from `b4f45121` (2594 compiles) |
 
 NOT_RUN in this repository's gates: efi ops 0..11, the ConOut NULL refusal, GOP Blt, network,
 entropy, pointer, native x86 execution of the seed. The iMac run cited above is
@@ -120,5 +140,5 @@ EXERCISED on physical hardware (one machine).
 
 ## Limits
 
-The compiler stays at the om4 cap of 512 functions. Allen's stack (#977, #983, #980, #981) carries
+The compiler has 511 functions, under the om4 cap of 512. Allen's stack (#977, #983, #980, #981) carries
 an older x86efi on a different base; its register slots and live-slot saves are not ported here.

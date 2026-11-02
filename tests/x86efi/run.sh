@@ -33,6 +33,8 @@ command -v timeout > /dev/null 2>&1 || { efi=no; why="timeout not found"; }
 block() { tr -d '\r' < "$1" | awk '/^==B$/ { on = 1; next } on && /^==/ { exit } on { print }'; }
 
 # boot NAME SOURCE...: compile the concatenated sources, boot the image; leaves $work/NAME/{serial.log,disk.img}.
+# $mach is the -machine value, $smb the -smbios value (none when empty).
+mach=q35 smb=
 boot() {
   name=$1; shift; d=$work/$name; mkdir -p "$d"
   cat "$@" > "$d/app.om"
@@ -40,7 +42,7 @@ boot() {
   cp "$vars" "$d/vars.fd"
   dd if=/dev/zero of="$d/disk.img" bs=1048576 count=16 2> /dev/null
   mformat -i "$d/disk.img" :: && mmd -i "$d/disk.img" ::/EFI ::/EFI/BOOT && mcopy -i "$d/disk.img" "$d/app.efi" ::/EFI/BOOT/BOOTX64.EFI
-  timeout "$wait" qemu-system-x86_64 -machine q35 -cpu max -m 512 -display none \
+  timeout "$wait" qemu-system-x86_64 -machine "$mach" -cpu max -m 512 -display none ${smb:+-smbios "$smb"} \
     -drive if=pflash,format=raw,readonly=on,file="$code" -drive if=pflash,format=raw,file="$d/vars.fd" \
     -device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file="$d/disk.img" \
     -device usb-storage,bus=xhci.0,drive=stick -net none -serial file:"$d/serial.log" -no-reboot
@@ -92,5 +94,25 @@ for e in e1 e2; do
 done
 trapped "$work/exit-e1/serial.log" && bad "exit e1: unexpected trap" || ok "exit e1: returned without a trap"
 trapped "$work/exit-e2/serial.log" && ok "exit e2: ended in trap 3" || bad "exit e2: no trap 3 status"
+# ident: efi 14 under both SMBIOS entry points (QEMU's 64-bit SMBIOS3 and the 32-bit _SM_). The type 1
+# record carries a serial and a UUID that the program must not print. Negative control: another
+# manufacturer must change the output, so the strings come from the firmware.
+I=$here/ident
+idsmb=type=1,manufacturer=OmegaTest,product=IdentBox,version=7.1,serial=SECRET123,uuid=12345678-1234-1234-1234-123456789abc
+for ep in 64 32; do
+  mach=q35,smbios-entry-point-type=$ep smb=$idsmb
+  if boot "ident-$ep" "$I/id.om"; then
+    block "$work/ident-$ep/serial.log" | cmp -s - "$I/expected.txt" && ok "ident SMBIOS $ep-bit: $(wc -l < "$I/expected.txt") lines match (brand, FirmwareVendor, type 1, results)" || bad "ident SMBIOS $ep-bit differs"
+    rev=$(tr -d '\r' < "$work/ident-$ep/serial.log" | sed -n 's/^==R \([0-9a-f]\{8\}\)$/\1/p')
+    [ -n "$rev" ] && ok "ident SMBIOS $ep-bit: FirmwareRevision $rev" || bad "ident SMBIOS $ep-bit: no FirmwareRevision line"
+    tr -d '\r' < "$work/ident-$ep/serial.log" | grep -q 'SECRET123\|12345678' && bad "ident SMBIOS $ep-bit: serial or UUID printed" || ok "ident SMBIOS $ep-bit: no serial or UUID in the output"
+  fi
+done
+mach=q35 smb=type=1,manufacturer=OtherMaker,product=IdentBox,version=7.1
+if boot ident-neg "$I/id.om"; then
+  if block "$work/ident-neg/serial.log" | cmp -s - "$I/expected.txt"; then bad "ident negative control: OtherMaker gave the expected output"
+  else block "$work/ident-neg/serial.log" | grep -qx 'sm=OtherMaker/IdentBox/7.1' && ok "ident negative control: OtherMaker differs from expected and is reported" || bad "ident negative control: OtherMaker not reported"; fi
+fi
+mach=q35 smb=
 echo "SUMMARY pass=$pass fail=$fail not_run=$notrun"
 [ $fail = 0 ]
