@@ -4,11 +4,15 @@
 #   path verdict exit_new exit_old sha256_new sha256_old
 # verdict:
 #   identical: both compilers exit 0 and write the same stdout bytes
-#   same-refusal: both exit nonzero with the same status and the same stderr
+#   same-refusal: both exit with the same status in 1..128 and write the same stderr
+#   signal: either compiler was killed by a signal (exit 129 or above; 139 is SIGSEGV, which is how
+#     a guest segfault under qemu-user reaches the shell). Never counted as a refusal; each such
+#     line is also reported on stderr as CORPUS_DIFF_SIGNAL.
 #   differ: any other pair
 # stdout is hashed even when a compiler refuses (the hash is of the bytes it wrote).
 # A compiler that is not a native executable for this machine is NOT_RUN (exit 3).
 # CORPUS_DIFF_ALLOW_QEMU=1 runs that pair anyway and records the host on stderr.
+# file(1) decides whether a compiler is native; without it the script is NOT_RUN (exit 3).
 # No em dash or en dash is used in this file.
 set -eu
 if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
@@ -24,6 +28,7 @@ case $mode in
   *) echo "mode must be asis or x86linux" >&2; exit 2 ;;
 esac
 [ -f "$new" ] && [ -f "$old" ] || { echo "NOT_RUN missing compiler" >&2; exit 3; }
+command -v file > /dev/null 2>&1 || { echo "NOT_RUN file(1) not found; it is needed to check that both compilers are native executables" >&2; exit 3; }
 
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$root"
@@ -76,7 +81,10 @@ git ls-files '*.om' | while IFS= read -r path; do
   set -e
   nh=$(sha256sum "$tmp/new.out" | cut -d ' ' -f 1)
   oh=$(sha256sum "$tmp/old.out" | cut -d ' ' -f 1)
-  if [ "$nr" -eq 0 ] && [ "$orc" -eq 0 ] && cmp -s "$tmp/new.out" "$tmp/old.out"; then
+  if [ "$nr" -gt 128 ] || [ "$orc" -gt 128 ]; then
+    verdict=signal
+    echo "CORPUS_DIFF_SIGNAL $path exit_new=$nr exit_old=$orc" >&2
+  elif [ "$nr" -eq 0 ] && [ "$orc" -eq 0 ] && cmp -s "$tmp/new.out" "$tmp/old.out"; then
     verdict=identical
   elif [ "$nr" -ne 0 ] && [ "$orc" -ne 0 ] && [ "$nr" -eq "$orc" ] && cmp -s "$tmp/new.err" "$tmp/old.err"; then
     verdict=same-refusal
@@ -87,3 +95,5 @@ git ls-files '*.om' | while IFS= read -r path; do
   n=$((n + 1))
 done > "$out"
 echo "CORPUS_DIFF lines=$(wc -l < "$out") mode=$mode out=$out"
+sig=$(awk -F '\t' '$2 == "signal"' "$out" | wc -l)
+[ "$sig" -eq 0 ] || echo "CORPUS_DIFF_SIGNAL total=$sig (a compiler was killed by a signal; not a refusal)" >&2

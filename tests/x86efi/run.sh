@@ -84,13 +84,19 @@ if boot file "$here/file/t1.om"; then
   block "$work/file/serial.log" | cmp -s - "$here/file/expected.txt" && ok "file: round trip results match" || bad "file: results differ"
   [ "$(diskfile "$work/file/disk.img" T.TXT)" = abcd ] && ok "file: T.TXT on disk is abcd" || bad "file: T.TXT on disk is not abcd"
 fi
-# exit: a file left open is flushed and closed by return (e1) and by a trap (e2).
+# exit: a file left open is flushed and closed by return (e1) and by a trap (e2). The status check
+# runs only for an image that booted, wrote a serial log and left the expected file on disk.
 for e in e1 e2; do
   if boot "exit-$e" "$here/exit/$e.om"; then
-    [ "$(diskfile "$work/exit-$e/disk.img" X.TXT)" = ABCDEFGHIJ ] && ok "exit $e: X.TXT on disk is the 10 written bytes" || bad "exit $e: X.TXT on disk is '$(diskfile "$work/exit-$e/disk.img" X.TXT)'"
+    s=$work/exit-$e/serial.log got=$(diskfile "$work/exit-$e/disk.img" X.TXT)
+    if [ "$got" = ABCDEFGHIJ ]; then ok "exit $e: X.TXT on disk is the 10 written bytes"; else bad "exit $e: X.TXT on disk is '$got'"; fi
+    if [ ! -s "$s" ]; then bad "exit $e: no serial log at $s"
+    elif [ "$got" != ABCDEFGHIJ ]; then bad "exit $e: status not checked, the disk check failed"
+    elif [ $e = e1 ]; then
+      if trapped "$s"; then bad "exit e1: unexpected trap"; else ok "exit e1: returned without a trap"; fi
+    elif trapped "$s"; then ok "exit e2: ended in trap 3"
+    else bad "exit e2: no trap 3 status"; fi
   fi
 done
-trapped "$work/exit-e1/serial.log" && bad "exit e1: unexpected trap" || ok "exit e1: returned without a trap"
-trapped "$work/exit-e2/serial.log" && ok "exit e2: ended in trap 3" || bad "exit e2: no trap 3 status"
 echo "SUMMARY pass=$pass fail=$fail not_run=$notrun"
 [ $fail = 0 ]
