@@ -102,7 +102,7 @@ Read-only facts about the machine, selected by ARG; the result is the number of 
 | `L << 16` (bits 0..15 zero) | CPUID leaf L (L < 2^32, ECX 0): EAX, EBX, ECX, EDX as 16 little-endian bytes; N < 16 is error 5; result 16 |
 | 1 | SystemTable FirmwareVendor (SystemTable+24): its UCS-2 code units up to the NUL, whole units only, at most N bytes; 0 when the pointer is NULL |
 | 2 | SystemTable FirmwareRevision (SystemTable+32), the u32 itself; nothing is written |
-| `3 + (P << 16)` | the SMBIOS structure table from byte P: min(N, length − P) bytes, 0 when P ≥ length. The table is found in the ConfigurationTable through the SMBIOS 3 GUID (anchor `_SM3_`, 64-bit address at +16, maximum size at +12) when present, else the SMBIOS GUID (anchor `_SM_`, 32-bit address at +24, length at +22); neither, a wrong anchor or a zero address is error 44 |
+| `3 + (P << 16)` | the SMBIOS structure table from byte P: min(N, length − P) bytes, 0 when P ≥ length. The table is found in the ConfigurationTable through the SMBIOS 3 GUID (anchor `_SM3_`, of which the code compares the first 4 bytes `_SM3`; 64-bit address at +16, maximum size at +12) when present, else the SMBIOS GUID (anchor `_SM_`, 32-bit address at +24, length at +22); neither, a wrong anchor or a zero address is error 44. On SMBIOS 3 the length is the entry point's maximum size, which the specification allows to exceed the real table, so a read near the end can return bytes past the last structure (identity-mapped firmware memory under Boot Services); callers stop at the type 127 end-of-table structure |
 | anything else | error 32 |
 
 The structures are left to the program. A program that must not reveal the machine reads only the
@@ -117,7 +117,7 @@ embedded as packed constants (`xg` in `omc.om`); all eight were checked against 
 specification values and the Allen fork. Exercised: Simple File System, LoadedImage and FileInfo
 (efi 12). GOP, SNP, RNG and the pointer protocols are NOT_RUN in this repository.
 
-## Evidence (2026-11-01, omc sha256 `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`)
+## Evidence (2026-11-01, omc sha256 `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55` unless a row names another omc)
 
 All runs are emulated: OVMF `OVMF_CODE_4M` on QEMU q35, the image as `\EFI\BOOT\BOOTX64.EFI` on a
 16 MiB FAT16 usb-storage disk, serial console captured to a file. The programs, their expected
