@@ -92,13 +92,13 @@ fixture generators, executes all53 cases, and compares exact exits and verdict
 bytes. Each child has a30-second deadline. Scratch and child outputs remain
 available for inspection; the shell creates a separate directory on each run.
 
-The required compiler is main's seeded `seed/out/omc`, executable
-`be8c51301307555254fc59e351d281aae1aa096d91521777e33a41c8b446448a`, built from
-`seed/omc/omc.om` `d4b4b89d8a58cc90d30d15a525b417e4b31e5bfe5288d21d665f1c7958a330f6`
-(both pinned in `compiler.sha256`; main 9920aab1, #994). The original qualification used the corrected
+The required compiler is this branch's seeded `seed/out/omc`, executable
+`b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`, built from
+`seed/omc/omc.om` `16b4ca40a5bd7796ac08b55d1ceadac1260e52298ed123f45418e77b3221c749`
+(both pinned in `compiler.sha256`). The original qualification used the corrected
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
-executable 9f48f66a; the pin moved to main's compiler (62775d2a, then 1578b357, then be8c5130) each time
-this branch merged main, and the gate was rerun with it. Each of these main compilers emits the same
+executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
+then b4f45121) and the gate was rerun. Each of these compilers emits the same
 classifier bytes (b527a20c). The entry refuses with 3 for any other compiler. It
 does not fetch code, accept an arbitrary environment compiler, silently select an
 older profile, or waive missing prerequisites.
