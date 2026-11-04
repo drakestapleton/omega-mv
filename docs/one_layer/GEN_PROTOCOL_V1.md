@@ -453,3 +453,17 @@ The runner, reducer, corpus builder and custodian scripts are specified by their
   keyword ids 199/200). The reader chain in `tools/` has no such words; conditions, section 5 reference
   lengths and the decision rule are unchanged, so no protocol content changed. `GEN_PROTOCOL_V1.md`
   re-hashed for this line. `make test-gen-protocol` re-run at the #946 head.
+- **v1, file pins re-hashed after OMEGESE drift on main (before any held-out task; revision stays 1, as in
+  train r3 and #946):** `OMEGESE.md` re-hashed from `b625c60c...` to `9b58a4e7...`. Ten merges to main
+  changed it after #946 without re-pinning, so `make test-gen-protocol` failed on main from #970 on:
+  #970 (security673: branch-span error 24, `execpure`), #965 (error-code registry, section 9.14), #967
+  (IR casts), #875 (OM-2 `dit` and `scrub`, 9.13.1), #918 (peername metadata), #848 and #857 (omc
+  `while`/`for ... bound N` up to 2^63-1; IR mode keeps 1..1000000), #994 (scrub keeps float registers),
+  train r4 #995 (carrying #818, irwasm v7, sections 11.1/11.2) and #1015 (target x86efi). None is
+  protocol content: OMEGESE section 5 ("Measured (phase 1)", which item 3 of section 5 here cites for
+  reference lengths) is byte-identical; the reader chain (`tools/exp445/reader.sh`,
+  `tools/omegese/omegese.c`, `arms/common.md`, `arms/omegese.md`) and every other pinned file are
+  unchanged; conditions and the decision rule are unchanged. The OMEGESE section 3 grammar and section 4
+  lowering lines for `while`/`for ... bound N` now describe omc; the reader's `omegese emit` still accepts
+  `while ... bound` 1..1000000 only. `GEN_PROTOCOL_V1.md` re-hashed for this line. `make
+  test-gen-protocol` re-run on main d3d1b1bc.
