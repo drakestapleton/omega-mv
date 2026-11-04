@@ -5,7 +5,8 @@
 # tests/one_layer/exp445/pack_dev.sh (which packs only its own directory, so it cannot be called here):
 # first every hidden/expected is checked against gen_expected.c (computed from the prompts, independently
 # of reference.osc; a mismatch refuses), and the case directories must be exactly the task ids of META.
-# Reproducible bytes (ustar, sorted, owner 0, mtime 0). META stays OUTSIDE the tarball (member rules).
+# Reproducible bytes (ustar, sorted, owner 0, mtime 0, modes 0664 files / 0775 directories whatever the
+# checkout umask: --mode sets them, so umask 0022 and 0002 give the same pack). META stays OUTSIDE the tarball (member rules).
 # Then: tests/one_layer/acceptance/ola.sh tasks-check <outdir>/tasks.tar <outdir>/TASKS.sha256
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,7 +24,7 @@ for c in "$HERE"/tasks/cases/*/; do
   cmp -s "$T/exp" "$c/hidden/expected" || { echo "pack_dev: $id hidden/expected differs from gen_expected" >&2; exit 1; }
   n=$((n + 1))
 done
-(cd "$HERE" && tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 -cf "$OUT/tasks.tar.tmp" tasks)
+(cd "$HERE" && tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 --mode=a+rX,ug+w,o-w -cf "$OUT/tasks.tar.tmp" tasks)
 mv "$OUT/tasks.tar.tmp" "$OUT/tasks.tar"
 (cd "$OUT" && sha256sum tasks.tar > TASKS.sha256.tmp && mv TASKS.sha256.tmp TASKS.sha256)
 echo "pack_dev: $n dev tasks -> $OUT/tasks.tar ($(cut -c1-16 "$OUT/TASKS.sha256")...)"

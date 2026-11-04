@@ -467,3 +467,12 @@ The runner, reducer, corpus builder and custodian scripts are specified by their
   lowering lines for `while`/`for ... bound N` now describe omc; the reader's `omegese emit` still accepts
   `while ... bound` 1..1000000 only. `GEN_PROTOCOL_V1.md` re-hashed for this line. `make
   test-gen-protocol` re-run on main d3d1b1bc.
+- **v1, `pack_dev.sh` re-hashed for umask-independent member modes (before any held-out task; revision
+  stays 1, as in train r3 and #946):** the dev pack stored each member with its on-disk mode, which
+  depends on the checkout umask. Under umask 0002 (the Spark) files are 0664 and directories 0775 and
+  the pack is `5f06a64a...`, the pinned `splits.dev.pack_sha256`; under umask 0022 (the GitHub
+  `ubuntu-24.04-arm` runner) they are 0644/0755 and the pack is `6f85afa7...`, so the dev-pack check
+  failed there. The tar line now passes `--mode=a+rX,ug+w,o-w`, which gives 0664/0775 under any umask
+  that keeps the owner read bit; umask 0022, 0002 and 0077 checkouts all give `5f06a64a...`, so
+  `pack_sha256` and the task bytes are unchanged. Only the `pack_dev.sh` pin changes. `GEN_PROTOCOL_V1.md`
+  re-hashed for this line. `make test-gen-protocol` re-run under umask 0022 and 0002.
