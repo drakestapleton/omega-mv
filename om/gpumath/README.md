@@ -213,6 +213,16 @@ relabels #751's original parity tables nor turns #857's host parity report
 into a new full-suite run under `be8c5130…`. This documentation correction did
 not independently remeasure or execute the program.
 
+## Compile check under omc `b4f45121…9b55` (2026-11-04, measured)
+
+Main's #1015 reseed moved the compiler pin to
+`b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55` and its README line
+reported the 29,272-byte size under it. Re-measured after merging main `d3d1b1bc`
+(Linux AArch64 host): `gpumath.om` (`b17b6ef0…dcde`, unchanged since #751) compiles with rc 0 under
+both `be8c5130…448a` and `b4f45121…9b55` to the same 29,272-byte program, sha256
+`dd23b3b78c5b2b538f32076e56ef7d6307abebbef5bc269355b9debcc7fcb64f`. This is a compile-size and
+byte-identity check only; the corpus, mutant and binding parity suite was not rerun for it.
+
 ## Limits
 
 - The parity contract is the current object. If the C were built without contraction
