@@ -1,10 +1,10 @@
 # x86-64 UEFI backend (`target x86efi`)
 
-Status: **DRAFT; IMPLEMENTED and EXERCISED under emulation (QEMU q35 + OVMF)**, 2026-11-01.
+Status (2026-11-04): **IMPLEMENTED; EXERCISED under emulation (QEMU q35 + OVMF)**; not QUALIFIED on hardware.
 Draft aien-dev/aien-train#53 at `e08443c3` records one physical iMac run of an image built with this omc
 (`b4f45121`, `evidence/OMEGALLM/imac/`): EXERCISED on physical hardware (one machine).
 This repository has no physical-firmware gate. The compiler was built on main `ba5559d9`.
-This branch also contains main `f9a9a40b` (#995). That merge did not change `seed/omc/omc.om` or `seed/out/omc`.
+The x86efi branch (PR #1015) also merged main `f9a9a40b` (#995) and main `19b8340d` (#996). Neither merge changed `seed/omc/omc.om` or `seed/out/omc`.
 Implementation: `seed/omc/omc.om` (functions `xp` through `xf12`, plus hooks in `kw`, the value
 parser, the driver, `xleave`, `xfinish`, `xlead` and `xeof`). It reuses the x86linux instruction
 selection, register model and SSE2 float code of [X86-LINUX.md](X86-LINUX.md); only the image
@@ -115,7 +115,7 @@ SMBIOS.
 GOP, SNP, RNG, Simple Pointer, Absolute Pointer, Simple File System, LoadedImage and FileInfo are
 embedded as packed constants (`xg` in `omc.om`); all eight were checked against the UEFI
 specification values and the Allen fork. Exercised: Simple File System, LoadedImage and FileInfo
-(efi 12). GOP, SNP, RNG and the pointer protocols are NOT_RUN in this branch.
+(efi 12). GOP, SNP, RNG and the pointer protocols are NOT_RUN in this repository.
 
 ## Evidence (2026-11-01, omc sha256 `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`)
 
@@ -126,9 +126,9 @@ each check it cannot run and exits 77 when nothing could run).
 
 | Gate | Result |
 |---|---|
-| AArch64 as stored | 1305 tracked `.om` files, `tools/x86efi/corpus_diff.sh` asis, omc `b4f45121` against main's omc `be8c5130`: 663 identical, 638 same-refusal, 4 differ. The 4 are `tests/x86efi/exit/e1.om`, `exit/e2.om`, `file/t1.om` and `refusals/g4.om`: `b4f45121` accepts them and `be8c5130` refuses error 25. `tests/x86efi/float/efi-pre.om` is error 25 from both. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130.tsv`. Run on x86_64 under qemu-user. A native AArch64 run is NOT_RUN |
-| x86linux | the same 1305 files with mode x86linux (a `target x86linux` line is prepended only when the file has no target line): 647 identical, 654 same-refusal, 4 differ. Those 4 are the same `target x86efi` programs. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130_x86linux.tsv` |
-| Float parity (`float/`) | one program printing 41 bit patterns (add, sub, mul, div, sqrt, exp, log, int/float conversions, saturating casts, NaN, f32) gives identical output as x86efi, x86linux (qemu-x86_64) and AArch64; floats survive 40+ firmware calls. An MXCSR round-toward-zero mutant fails it |
+| AArch64 as stored | 1305 tracked `.om` files, `tools/x86efi/corpus_diff.sh` asis, omc `b4f45121` against main's omc `be8c5130`: 663 identical, 638 same-refusal, 4 differ. The 4 are `tests/x86efi/exit/e1.om`, `exit/e2.om`, `file/t1.om` and `refusals/g4.om`: `b4f45121` accepts them and `be8c5130` refuses error 25. `tests/x86efi/float/efi-pre.om` is error 25 from both. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130.tsv`, first recorded on x86_64 under qemu-user. On 2026-11-04 a native AArch64 run (DGX Spark, Linux aarch64, both compilers native) reproduced it byte for byte (TSV sha256 `e07c912bb0c8c05375190ed6b2e7518d7bac4441ca224490c07809f94fb9f78e`), once in the PR review and once again after the corpus_diff.sh fixes |
+| x86linux | the same 1305 files with mode x86linux (a `target x86linux` line is prepended only when the file has no target line): 647 identical, 654 same-refusal, 4 differ. Those 4 are the same `target x86efi` programs. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130_x86linux.tsv`; the 2026-11-04 native AArch64 runs reproduced it byte for byte (sha256 `04604a9d3cbf037d08c4ae431159b880e7a855564e54db24504e9e18a1cdac35`) |
+| Float parity (`float/`) | one program printing 41 bit patterns (add, sub, mul, div, sqrt, exp, log, int/float conversions, saturating casts, NaN, f32) gives identical output as x86efi, x86linux (qemu-x86_64) and AArch64; floats survive 40+ firmware calls. An MXCSR round-toward-zero mutant fails it. The AArch64 leg ran natively on 2026-11-04 (DGX Spark, `PASS float aarch64: same lines as x86efi` from `tests/x86efi/run.sh`) |
 | efi 12 refusals (`refusals/`) | 21 results (codes above, path lengths 0/255/256, busy, nothing open, read-only write, bad volume) match; OFF+N past the array traps 3 |
 | efi 12 round trip (`file/`) | create, write, close, reopen, positioned write, read back: results and the bytes on disk match. A mutant with the Read/Write protocol offsets 32/40 swapped fails it |
 | Exit flush (`exit/`) | a file written with sub 3 and left open is on disk with all 10 bytes after `return` and after trap 3. The previous omc (`d0f756d9…`, no exit cleanup) leaves a 0-byte file in both cases |
