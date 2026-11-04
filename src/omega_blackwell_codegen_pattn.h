@@ -1,10 +1,26 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef OMEGA_BLACKWELL_CODEGEN_PATTN_H
 #define OMEGA_BLACKWELL_CODEGEN_PATTN_H
 /*
  * omega_blackwell_codegen_pattn: causal prefill attention for Qwen3-30B-A3B on tensor cores (OWN-30B L1 attention,
  * 2026-10-13). One launch per chunk of up to 64 consecutive tokens of one layer. New file; uses the opcodes of
- * omega_blackwell_codegen.h plus the SHFL.BFLY and F2FP.BF16.F32.PACK_AB placeholders of omega_blackwell_codegen_tc.h
- * (patched after encoding with omega_tc_patch_code).
+ * omega_blackwell_codegen.h only (SHFL.BFLY and F2FP.BF16.F32.PACK_AB are native encoder entries since training R5;
+ * before R5 they were placeholders patched after encoding).
  *
  * Grid (ceil(mc / W), 4): CTA (cx, cy) serves KV head cy and the chunk tokens cx*W .. cx*W+W-1 (W = warps, 4 or 8).
  * Row tile = 16 query rows = 2 tokens x the 8 query heads of the group: row g (0..7) = token 2*tile, head cy*8+g;
@@ -77,7 +93,7 @@ typedef struct {
 int omega_pattn_spec_ok(const OmegaPrefillAttnSpec *spec);
 /* Builds the register-allocated IR program. 0 ok, -1 refused or over BW_MAX_IR_INSNS / BW_MAX_VREGS. */
 int omega_blackwell_codegen_prefill_attn_prog(const OmegaPrefillAttnSpec *spec, BlackwellIRProgram *prog);
-/* Instruction, peak-register and placeholder counts (host, no device). */
-int omega_prefill_attn_prog_stats(const OmegaPrefillAttnSpec *spec, uint32_t *insns, uint32_t *gprs, uint32_t *placeholders);
+/* Instruction and peak-register counts (host, no device). */
+int omega_prefill_attn_prog_stats(const OmegaPrefillAttnSpec *spec, uint32_t *insns, uint32_t *gprs);
 
 #endif

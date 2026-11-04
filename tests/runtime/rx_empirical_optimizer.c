@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * OMEGA_EMPIRICAL_OPTIMIZER -- realization choice from measured experience.
  *
@@ -46,6 +62,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -226,6 +243,7 @@ typedef struct {
 
 static CoreClass g_class[RX_CM_CORES];
 static char g_cpus_desc[256];
+static cpu_set_t g_allowed;   /* the affinity mask the test started with: the only cpus it may use */
 
 static void discover(void) {
     g_class[RX_CM_CORE_X925] = (CoreClass){ .name = "Cortex-X925", .meter = "cpu_p",
@@ -234,8 +252,12 @@ static void discover(void) {
                                             .cache_bytes = 512u << 10 };
     g_class[RX_CM_CORE_OTHER] = (CoreClass){ .name = "other", .meter = NULL,
                                              .cache_bytes = 1u << 20 };
+    CPU_ZERO(&g_allowed);
+    if (sched_getaffinity(0, sizeof g_allowed, &g_allowed) != 0)
+        for (int c = 0; c < 64; c++) CPU_SET(c, &g_allowed);
     long n = sysconf(_SC_NPROCESSORS_CONF);
     for (long c = 0; c < n && c < 64; c++) {
+        if (!CPU_ISSET((int)c, &g_allowed)) continue;   /* taskset/cgroup: not ours to time on */
         char path[128];
         snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/regs/identification/midr_el1", c);
         FILE *fp = fopen(path, "r");
@@ -342,6 +364,93 @@ static uint32_t thermal_c(void) {
 
 static char g_meter_dir[128];
 
+/* ---- experience record tap (default off; aien-train #24 ORIG-1, omega #731) ----
+ * OMEGA_EMPIRICAL_RECORDS=<fd> appends one fixed 256-byte little-endian
+ * record per cost table to descriptor fd (3..1023), which the caller opened
+ * for append on a regular file, e.g. OMEGA_EMPIRICAL_RECORDS=3 ... 3>>records.bin.
+ * The harness opens no path named by its environment; any other value leaves
+ * the tap off. Records hold the state the consumer saw and every eligible arm's
+ * measured, digest-checked cost. Observation only: no decision, measurement
+ * or verdict of this harness reads it. Layout omexp-v1, 32 words of 8 bytes:
+ *   0 magic 0x314f4d4558505243 ("CRPXEMO1" LE)  1 version 1
+ *   2 family (0 train grid, 1 validation grid, 2 H1, 3 H2, 4 H3, 5 coverage sample)
+ *   3 core class (RX_CM_CORE_*)  4 pressure bucket  5 M  6 N  7 calls
+ *   8 job seed  9 state bytes  10 cache bytes  11 thermal C  12 eligible mask
+ *   13 arm count  14 sequence  15 monotonic ns
+ *   16..23 ps per call per arm (0 = not measured)  24..29 verified flag per arm
+ *   30 reference digest  31 digest mismatches during this table (0 = all verified) */
+#define OMEXP_MAGIC 0x314f4d4558505243ull
+static int g_tap_fd = -1;
+static uint64_t g_tap_seq;
+static uint32_t g_tap_family, g_tap_core, g_tap_pressure;
+
+static void tap_open(void) {
+    const char *p = getenv("OMEGA_EMPIRICAL_RECORDS");
+    if (!p || !p[0]) return;
+    char *end;
+    errno = 0;
+    long fd = strtol(p, &end, 10);
+    struct stat sb;
+    int fl = -1;
+    if (errno != 0 || *end != '\0' || fd < 3 || fd > 1023 || (fl = fcntl((int)fd, F_GETFL)) < 0 ||
+        (fl & O_ACCMODE) == O_RDONLY || !(fl & O_APPEND) || fstat((int)fd, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        fprintf(stderr, "  record tap: OMEGA_EMPIRICAL_RECORDS=%s is not a descriptor 3..1023 open for append "
+                        "on a regular file; tap off\n", p);
+        return;
+    }
+    g_tap_fd = (int)fd;
+}
+
+static void tap_ctx(uint32_t family, uint32_t core, uint32_t pressure) {
+    g_tap_family = family;
+    g_tap_core = core;
+    g_tap_pressure = pressure;
+}
+
+static void tap_record(const Job *j, const uint64_t table[N_ARMS], uint64_t mismatches) {
+    if (g_tap_fd < 0) return;
+    uint64_t w[32];
+    uint8_t b[256];
+    memset(w, 0, sizeof w);
+    w[0] = OMEXP_MAGIC;
+    w[1] = 1;
+    w[2] = g_tap_family;
+    w[3] = g_tap_core;
+    w[4] = g_tap_pressure;
+    w[5] = j->M;
+    w[6] = j->N;
+    w[7] = j->calls;
+    w[8] = j->seed;
+    w[9] = ((uint64_t)j->M * j->N + j->M + j->N) * 8u;
+    w[10] = g_class[g_tap_core].cache_bytes;
+    w[11] = thermal_c();
+    w[12] = g_eligible;
+    w[13] = N_ARMS;
+    w[14] = g_tap_seq++;
+    w[15] = now_ns();
+    for (uint32_t a = 0; a < N_ARMS && a < 8; a++) {
+        w[16 + a] = table[a] == UINT64_MAX ? 0 : table[a];
+        w[24 + a] = g_verified[a] ? 1u : 0u;
+    }
+    w[30] = j->ref_digest;
+    w[31] = mismatches;
+    for (int i = 0; i < 32; i++)
+        for (int k = 0; k < 8; k++) b[i * 8 + k] = (uint8_t)(w[i] >> (8 * k));
+    size_t off = 0;
+    while (off < sizeof b) {
+        ssize_t n = write(g_tap_fd, b + off, sizeof b - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+}
+
+/* truth_table plus the tap; the table itself is unchanged. */
+static void truth_table_tap(const Job *j, uint64_t table[N_ARMS]) {
+    uint64_t before = K.mismatches;
+    truth_table(j, table);
+    tap_record(j, table, K.mismatches - before);
+}
+
 static void find_meter(void) {
     for (int h = 0; h < 32; h++) {
         char path[128], name[64] = { 0 };
@@ -416,7 +525,7 @@ static void pressure_on(int timed) {
     long n = sysconf(_SC_NPROCESSORS_CONF);
     g_press_n = 0;
     for (long c = n - 1; c >= 0 && g_press_n < PRESS_THREADS; c--) {
-        if ((int)c == timed) continue;
+        if ((int)c == timed || !CPU_ISSET((int)c, &g_allowed)) continue;
         g_press_arg[g_press_n] = (PressArg){ (int)c, g_press_n };
         if (pthread_create(&g_press[g_press_n], NULL, press_main, &g_press_arg[g_press_n]) == 0)
             g_press_n++;
@@ -621,14 +730,42 @@ static RxCmFeatures features(const Job *j, uint32_t core, uint32_t pressure, uin
 typedef struct {
     uint64_t measures, selects, fallbacks, touched_ineligible;
     uint64_t explore_ps;
-    uint64_t max_extra_ps;      /* largest single exploration charge */
 } LearnStats;
 
+/* The online exploration budget, audited per core class over H1, H2 and H3:
+ * the online model's counters run across all three. The rule the learner
+ * spends by: a measurement starts only while spent exploration is under
+ * explore_frac of chosen work plus the allowance. */
+typedef struct {
+    uint64_t started_over;    /* measurements started at or over the line */
+    uint64_t last_extra_ps;   /* the latest exploration charge since the counters were reset */
+} BudgetAudit;
+
+static double budget_line(const RxCostModel *m, const RxCmPolicy *p) {
+    return p->explore_frac * (double)m->work_ps + (double)p->explore_allow_ps;
+}
+
+/* Before a measurement runs, with the counters the policy decided on. */
+static void audit_start(BudgetAudit *a, const RxCostModel *m, const RxCmPolicy *p) {
+    if ((double)m->explore_ps >= budget_line(m, p)) a->started_over++;
+}
+
+/* After a group of jobs. Every measurement started under the line and the
+ * line only grows with chosen work, so spent exploration minus the latest
+ * charge is still under it: the total exceeds the line by less than that one
+ * charge. A group that measured nothing is held to the charge that last
+ * crossed the line, which an earlier group may have made. */
+static int audit_over(const BudgetAudit *a, const RxCostModel *m, const RxCmPolicy *p) {
+    return a->started_over != 0 || m->explore_ps < a->last_extra_ps ||
+           (double)(m->explore_ps - a->last_extra_ps) >= budget_line(m, p);
+}
+
 /* One job for an online learner: decide, run what it decided, learn from
- * those runs only. Returns the policy's cost in table terms (ps). */
+ * those runs only. Returns the policy's cost in table terms (ps). `audit`
+ * is NULL where the budget is not judged (training). */
 static double learner_job(RxCostModel *m, const RxCmPolicy *p, const Job *j, uint32_t core,
                           uint32_t pressure, uint32_t *current, const uint64_t *table,
-                          LearnStats *s) {
+                          LearnStats *s, BudgetAudit *audit) {
     RxCmFeatures f = features(j, core, pressure, *current);
     RxCmDecision d;
     rx_cm_decide(m, p, &f, 1, &d);
@@ -641,12 +778,13 @@ static double learner_job(RxCostModel *m, const RxCmPolicy *p, const Job *j, uin
          * quarter of the calls. The probe is the exploration cost. */
         uint32_t a = d.measure[0], b = d.measure[1];
         uint32_t probe = j->calls / 4u < 3u ? 3u : j->calls / 4u;
+        if (audit) audit_start(audit, m, p);
         uint64_t ta = time_arm_chunked(a, j, j->calls), tb = time_arm_chunked(b, j, probe);
         RxCmObservation oa = { ta, ta == 0 }, ob = { tb, tb == 0 };
         rx_cm_observe(m, &f, a, &oa);
         rx_cm_observe(m, &f, b, &ob);
         rx_cm_charge(m, ta * j->calls, tb * probe);
-        if (tb * probe > s->max_extra_ps) s->max_extra_ps = tb * probe;
+        if (audit) audit->last_extra_ps = tb * probe;
         *current = ta <= tb ? a : b;
         s->measures++;
         s->explore_ps += table[b] * probe;
@@ -660,6 +798,50 @@ static double learner_job(RxCostModel *m, const RxCmPolicy *p, const Job *j, uin
     if (d.action == RX_CM_SELECT) s->selects++;
     else s->fallbacks++;
     return (double)table[d.arm] * j->calls;
+}
+
+/* The audit on a fixed sequence through the cost model's own decisions, no
+ * timing: H1 measures until its last probe ends over the line, H2 is refused
+ * every measurement and runs chosen work only, so it measures nothing while
+ * the total is still over the line. Neither is a violation; a measurement
+ * started over the line and exploration charged without a measurement are. */
+static void budget_audit_selftest(const RxCmPolicy *p) {
+    RxCostModel m;
+    rx_cm_init(&m, N_ARMS);
+    Job j = { 64, 64, 1, 1, 0 };
+    RxCmFeatures f = features(&j, 0, 0, ARM_REF);
+    f.eligible = (1u << ARM_REF) | (1u << ARM_U2);
+    const uint64_t work = 100000000ull, extra = 400000000ull;   /* 0.1 ms chosen, 0.4 ms probed */
+    BudgetAudit a = { 0, 0 };
+    uint32_t measured = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        RxCmDecision d;
+        rx_cm_decide(&m, p, &f, 1, &d);
+        if (d.action != RX_CM_MEASURE) break;
+        audit_start(&a, &m, p);
+        rx_cm_charge(&m, work, extra);
+        a.last_extra_ps = extra;
+        measured++;
+    }
+    CHECK(measured > 0 && (double)m.explore_ps >= budget_line(&m, p),
+          "budget self-test: H1 measured %u and ends over the line", measured);
+    CHECK(!audit_over(&a, &m, p), "budget self-test: H1 within its budget");
+    uint32_t h2_measured = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        RxCmDecision d;
+        rx_cm_decide(&m, p, &f, 1, &d);
+        if (d.action == RX_CM_MEASURE) h2_measured++;
+        rx_cm_charge(&m, work, 0);
+    }
+    CHECK(h2_measured == 0 && (double)m.explore_ps >= budget_line(&m, p),
+          "budget self-test: H2 measured %u and stays over the line", h2_measured);
+    CHECK(!audit_over(&a, &m, p), "budget self-test: a group that measured nothing is held to the last charge");
+    BudgetAudit over = a;
+    audit_start(&over, &m, p);
+    CHECK(audit_over(&over, &m, p), "budget self-test: a measurement started over the line is caught");
+    RxCostModel unmeasured = m;
+    rx_cm_charge(&unmeasured, 0, extra / 2u);
+    CHECK(audit_over(&a, &unmeasured, p), "budget self-test: exploration charged with no measurement is caught");
 }
 
 static uint32_t frozen_choice(const RxCostModel *m, const RxCmPolicy *p, const Job *j,
@@ -808,15 +990,16 @@ static void train_class(RxCostModel *m, uint32_t k) {
     LearnStats s;
     memset(&s, 0, sizeof s);
     uint32_t current = ARM_REF;
+    tap_ctx(0, k, 0);
     for (int pass = 0; pass < 2; pass++) {
         shuffle(jobs, n, 99u + (uint64_t)pass + k);
         for (uint32_t i = 0; i < n; i++) {
             job_load(&jobs[i]);
             uint64_t table[N_ARMS];
-            truth_table(&jobs[i], table);
+            truth_table_tap(&jobs[i], table);
             for (uint32_t a = 0; a < N_ARMS; a++)
                 if (g_eligible & (1u << a)) R.train_cost[k][a] += (double)table[a] * jobs[i].calls;
-            learner_job(m, &g_train_policy, &jobs[i], k, 0, &current, table, &s);
+            learner_job(m, &g_train_policy, &jobs[i], k, 0, &current, table, &s, NULL);
         }
     }
     R.train_jobs[k] = 2 * n;
@@ -860,10 +1043,11 @@ static void build_validation(void) {
     for (uint32_t k = 0; k < RX_CM_CORES; k++) {
         if (!R.present[k]) continue;
         place_quiet(k);
+        tap_ctx(1, k, 0);
         g_val.n[k] = grid(g_val.jobs[k], VAL_M, NA(VAL_M), VAL_N, NA(VAL_N), 5000u + k);
         for (uint32_t i = 0; i < g_val.n[k]; i++) {
             job_load(&g_val.jobs[k][i]);
-            truth_table(&g_val.jobs[k][i], g_val.table[k][i]);
+            truth_table_tap(&g_val.jobs[k][i], g_val.table[k][i]);
         }
     }
 }
@@ -1137,6 +1321,43 @@ static int promote_phase(const RxCostModel *m, RxCostModel *durable) {
     return 0;
 }
 
+/* ---- coverage sample (default off; ORIG v2, aien-train#24/#25, benchmarks#45) ----
+ * OMEGA_EMPIRICAL_COVERAGE=<n> with the record tap on: after the held-out
+ * phase, n further log-uniform shapes per present core class (M, N in
+ * [1, 8192], M N <= MAX_ELEMS, seed 9000 + core) are measured with the same
+ * truth table and tapped as family 5. Observation only: no policy, judge,
+ * learner or verdict of this harness sees them. Without the tap it does nothing;
+ * n above 640 is capped, a negative or non-numeric n takes no sample. */
+#define COVERAGE_MAX 640u
+
+static uint32_t coverage_count(void) {
+    const char *e = getenv("OMEGA_EMPIRICAL_COVERAGE");
+    if (g_tap_fd < 0 || !e || !e[0]) return 0;
+    char *end;
+    errno = 0;
+    long v = strtol(e, &end, 10);
+    if (errno != 0 || *end != '\0' || v < 0) {
+        fprintf(stderr, "  coverage sample: OMEGA_EMPIRICAL_COVERAGE=%s is not a count >= 0; no sample\n", e);
+        return 0;
+    }
+    return v > (long)COVERAGE_MAX ? COVERAGE_MAX : (uint32_t)v;
+}
+
+static void coverage_sample(uint32_t k, uint32_t count) {
+    uint64_t s = 9000u + k;
+    uint32_t n = 0;
+    tap_ctx(5, k, 0);
+    while (n < count) {
+        uint32_t M = log_uniform(&s, 0.0, 13.0), N = log_uniform(&s, 0.0, 13.0);
+        if (M < 1 || N < 1 || (uint64_t)M * N > MAX_ELEMS || M > MAX_M || N > MAX_N) continue;
+        Job j = { M, N, calls_for(M, N), 9000u + k + (uint64_t)n * 2654435761u, 0 };
+        job_load(&j);
+        uint64_t table[N_ARMS];
+        truth_table_tap(&j, table);
+        n++;
+    }
+}
+
 /* ---- held-out ---- */
 
 static Job g_h1[MAX_JOBS], g_h2[MAX_JOBS];
@@ -1149,21 +1370,21 @@ static int cmp_d(const void *a, const void *b) {
 }
 
 static void heldout(const RxCostModel *durable, uint32_t k, uint32_t dist, Job *jobs, uint32_t n,
-                    RxCostModel *online) {
+                    RxCostModel *online, BudgetAudit *audit) {
     DistResult *D = &R.d[k][dist];
     uint32_t pressure = dist == D_H3 ? 1u : 0u;
     LearnStats s;
     memset(&s, 0, sizeof s);
     uint32_t current = ARM_REF;
-    uint64_t explore_before = online->explore_ps, work_before = online->work_ps;
     double contention[MAX_JOBS];
     uint32_t n_cont = 0;
     if (pressure) pressure_on(g_class[k].timed);
+    tap_ctx(2 + dist, k, pressure);
     for (uint32_t i = 0; i < n; i++) {
         Job *j = &jobs[i];
         job_load(j);
         uint64_t table[N_ARMS];
-        truth_table(j, table);
+        truth_table_tap(j, table);
         if (dist == D_H1) memcpy(g_h1_table[k][i], table, sizeof table);
         RxCmDecision d;
         uint32_t fz = frozen_choice(durable, &g_frozen_policy, j, k, pressure, &d);
@@ -1174,7 +1395,7 @@ static void heldout(const RxCostModel *durable, uint32_t k, uint32_t dist, Job *
         uint32_t choice[4] = { dispatch_rule(j->N), ARM_REF, R.best_static[k], fz };
         for (uint32_t p = 0; p < 4; p++) D->cost[p] += (double)table[choice[p]] * j->calls;
         D->cost[P_ORACLE] += (double)table[oracle] * j->calls;
-        D->cost[P_ONLINE] += learner_job(online, &g_online_policy, j, k, pressure, &current, table, &s);
+        D->cost[P_ONLINE] += learner_job(online, &g_online_policy, j, k, pressure, &current, table, &s, audit);
         if (dist < D_H3)
             for (uint32_t p = 0; p < 4; p++) g_choice[k][dist][p][i] = choice[p];
         coverage(durable, j, k, pressure, table, &D->cov_n, &D->cov_in80, &D->cov_in95);
@@ -1187,14 +1408,7 @@ static void heldout(const RxCostModel *durable, uint32_t k, uint32_t dist, Job *
     D->fallbacks = s.fallbacks;
     D->explore_ps = s.explore_ps;
     R.touched_ineligible += s.touched_ineligible;
-    (void)explore_before;
-    (void)work_before;
-    /* The rule the learner spends by: a measurement starts only while spent
-     * exploration is under explore_frac of chosen work plus the allowance, so
-     * the total can exceed that line by at most one measurement. */
-    double line = g_online_policy.explore_frac * (double)online->work_ps +
-                  (double)g_online_policy.explore_allow_ps;
-    if ((double)online->explore_ps > line + (double)s.max_extra_ps) R.explore_budget_violations++;
+    if (audit_over(audit, online, &g_online_policy)) R.explore_budget_violations++;
     if (n_cont) {
         qsort(contention, n_cont, sizeof(double), cmp_d);
         D->contention_median = contention[n_cont / 2];
@@ -1489,6 +1703,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     discover();
     find_meter();
+    tap_open();
     for (uint32_t k = 0; k < RX_CM_CORES; k++) R.present[k] = g_class[k].n > 0;
     printf("[*] cores: %s; energy meter: %s\n", g_cpus_desc, g_meter_dir[0] ? g_meter_dir : "none");
     R.thermal_start = thermal_c();
@@ -1505,6 +1720,7 @@ int main(void) {
     g_train_policy.explore_allow_ps = 200000000000ull;
     g_online_policy.explore_frac = 0.05;                /* held-out: 5% of chosen work */
     g_online_policy.explore_allow_ps = 500000000ull;    /* plus 0.5 ms to get started */
+    budget_audit_selftest(&g_online_policy);
 
     printf("[*] arms: synthesize, verify in a forked child\n");
     setup_arms();
@@ -1541,13 +1757,14 @@ int main(void) {
         place_quiet(k);
         RxCostModel online = durable;
         online.explore_ps = online.work_ps = 0;
+        BudgetAudit audit = { 0, 0 };   /* runs with the online counters, across H1, H2, H3 */
         uint32_t n1 = unseen_shapes(g_h1, 60, 7000u + k);
         uint32_t n2 = thin_mix(g_h2, 60, 8000u + k);
-        heldout(&durable, k, D_H1, g_h1, n1, &online);
+        heldout(&durable, k, D_H1, g_h1, n1, &online, &audit);
         place_quiet(k);
-        heldout(&durable, k, D_H2, g_h2, n2, &online);
+        heldout(&durable, k, D_H2, g_h2, n2, &online, &audit);
         place_quiet(k);
-        heldout(&durable, k, D_H3, g_h1, n1, &online);
+        heldout(&durable, k, D_H3, g_h1, n1, &online, &audit);
         if (g_class[k].n) {
             place_quiet(k);
             replay(k, D_H1, g_h1, n1);
@@ -1578,6 +1795,15 @@ int main(void) {
         rx_cm_digest(&durable, c);
         R.online_not_durable = changed && memcmp(b, c, 32) == 0;
         CHECK(R.online_not_durable, "online learning changed only the working copy");
+    }
+    uint32_t cover = coverage_count();
+    if (cover) {
+        printf("[*] coverage sample: %u shapes per core class, tapped as family 5\n", cover);
+        for (uint32_t k = 0; k < RX_CM_CORES; k++) {
+            if (!R.present[k]) continue;
+            place_quiet(k);
+            coverage_sample(k, cover);
+        }
     }
     R.thermal_end = thermal_c();
     loadavg(R.load_end, sizeof R.load_end);

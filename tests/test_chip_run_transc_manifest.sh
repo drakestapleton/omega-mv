@@ -1,4 +1,19 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Host-only check of tools/manifests/numeric_transc.chiprun and its wrapper
 # tools/run_numeric_transc_gate.sh. No GPU, no chip sources, no real build: a fake omega and
 # fake physics (git repos in a temp dir), a tiny fake chip binary and fake host tier, run through
@@ -23,7 +38,7 @@ FAKE_PHYS=/nonexistent-physics-for-test
 
 # Pinned from the old script (origin/main before this change): receipt keys in order, gcc sources in order.
 OLD_KEYS="gate row reference omega_commit omega_tree_clean_before omega_tree_clean_after omega_commit_unchanged_after physics_commit physics_lock_pin physics_tree_clean_before physics_tree_clean_after physics_commit_unchanged_after binary_sha256 chip_log_sha256 kernels nvdisasm_check host_tier ops_requested ops chip_exit_status started_utc finished_utc verdict"
-OLD_SRCS="tests/test_omega_numeric_transc_gb10.c src/omega_numeric_divsqrt_gb10.c src/omega_numeric_transc.c src/omega_numeric.c src/omega_numeric_provenance.c src/omega_blackwell_encoder.c src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_blackwell_qmd.c src/sha256.c $FAKE_PHYS/nvrm/nvrm.c $FAKE_PHYS/m16/m16_native.c"
+OLD_SRCS="tests/test_omega_numeric_transc_gb10.c src/omega_numeric_divsqrt_gb10.c src/omega_numeric_transc.c src/omega_numeric.c src/omega_numeric_provenance.c src/omega_blackwell_encoder.c src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_blackwell_qmd.c src/omega_om_units.c $FAKE_PHYS/nvrm/nvrm.c $FAKE_PHYS/m16/m16_native.c"
 
 # Cross-check of the pins against the old script, only while origin/main still has it.
 OLDSH=$(git -C "$HERE" show origin/main:tools/run_numeric_transc_gate.sh 2>/dev/null)
@@ -49,8 +64,10 @@ int main(int argc, char **argv) {
     const char *v = !strcmp(m, "fail") ? "FAIL" : (!strcmp(m, "notrun") || !strcmp(m, "notrun0")) ? "NOT_RUN" : "PASS";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--chip")) continue;
-        printf("RESULT chip %s checked=%s exhaustive=%s mismatches=%s unwritten=0 verdict=%s\n", argv[i],
-               strcmp(v, "NOT_RUN") ? "4294967296" : "0", strcmp(v, "NOT_RUN") ? "true" : "false", strcmp(v, "FAIL") ? "0" : "7", v);
+        /* digest: a hex word that starts with a digit, so a loose number test in the manifest would break it */
+        printf("RESULT chip %s checked=%s exhaustive=%s mismatches=%s unwritten=0 verdict=%s digest=%s\n", argv[i],
+               strcmp(v, "NOT_RUN") ? "4294967296" : "0", strcmp(v, "NOT_RUN") ? "true" : "false", strcmp(v, "FAIL") ? "0" : "7", v,
+               strcmp(v, "NOT_RUN") ? "227cb65782077d82" : "none");
     }
     if (strcmp(m, "silent")) printf("VERDICT %s\n", v);
     return (strcmp(m, "pass") && strcmp(m, "silent") && strcmp(m, "notrun0")) ? 1 : 0;
@@ -72,7 +89,7 @@ build_world() { # MANIFEST
     git -C "$PHYS" rev-parse HEAD > "$OM/physics.lock"
     echo "build/" > "$OM/.gitignore"
     printf '#!/bin/sh\nif [ "$1" = --digest ]; then printf "EXP2 12 aaaa\\nLOG2 34 bbbb\\n"; exit ${FAKE_DIGEST_RC:-0}; fi\necho "[PASS] fake host check"; echo "FAKE_HOST_LAST"; exit ${FAKE_HOST_RC:-0}\n' > "$OM/tools/fakehost.sh"
-    printf '#!/bin/sh\necho "[PASS] fake nvd"\necho "nvdisasm fake provenance line"\necho "VERDICT PASS"\nexit ${FAKE_NVD_RC:-0}\n' > "$OM/tools/divsqrt_nvdisasm_check.sh"
+    printf '#!/bin/sh\necho "[PASS] fake nvd"\necho "disassembler: fake provenance line"\necho "nvdisasm noise line"\necho "VERDICT PASS"\nexit ${FAKE_NVD_RC:-0}\n' > "$OM/tools/divsqrt_nvdisasm_check.sh"
     printf 'build/test_omega_numeric_transc_gb10_cpu:\n\tmkdir -p build && cp tools/fakehost.sh $@ && chmod +x $@\n' > "$OM/Makefile"
     chmod +x "$OM/tools/"*.sh "$OM/tools/run_numeric_transc_gate.sh"
     g "$OM" add -A && g "$OM" commit -q -m omega
@@ -109,14 +126,14 @@ suite() {
     runw happy -- ; HAPPY_R=$R
     ck happy_exit test "$RC" = 0
     ck happy_last_line last_is "VERDICT PASS"
-    ck happy_results_echoed test "$(grep -c '^RESULT chip ' "$OUT")" = 9
+    ck happy_results_echoed test "$(grep -c '^RESULT chip ' "$OUT")" = 11
     ck happy_noise_not_echoed lacks '^noise'
     ck happy_receipt_line has '^RECEIPT /.*\.json$'
     ck happy_no_chiprun_line lacks '^CHIP_RUN:'
-    ck happy_default_ops rj '.ops_requested == ["EXP2","LOG2","SIGMOID","TANH","SIN","COS","ERF","GELU","RSQRT"] and (.ops | map(.op)) == ["EXP2","LOG2","SIGMOID","TANH","SIN","COS","ERF","GELU","RSQRT"]'
-    ck happy_ops_typed rj '.ops[0] == {op:"EXP2",checked:4294967296,exhaustive:true,mismatches:0,unwritten:0,verdict:"PASS"}'
+    ck happy_default_ops rj '.ops_requested == ["EXP2","LOG2","SIGMOID","TANH","SIN","COS","ERF","GELU","RSQRT","EXP","LOG"] and (.ops | map(.op)) == ["EXP2","LOG2","SIGMOID","TANH","SIN","COS","ERF","GELU","RSQRT","EXP","LOG"]'
+    ck happy_ops_typed rj '.ops[0] == {op:"EXP2",checked:4294967296,exhaustive:true,mismatches:0,unwritten:0,verdict:"PASS",digest:"227cb65782077d82"}'
     ck happy_kernels rj '.kernels == [{op:"EXP2",instructions:12,sha256:"aaaa"},{op:"LOG2",instructions:34,sha256:"bbbb"}]'
-    ck happy_nvd rj '.nvdisasm_check == "nvdisasm fake provenance line"'
+    ck happy_nvd rj '.nvdisasm_check == "disassembler: fake provenance line\nVERDICT PASS"'
     ck happy_host_tier rj '.host_tier == "FAKE_HOST_LAST"'
     ck happy_gate_fields rj '.gate == "E1-TRANSC-GB10" and .verdict == "PASS" and .chip_exit_status == 0 and (.row | startswith("E1 gap table row 10")) and (.reference | startswith("omega_math_<op>"))'
     ck happy_flag_dropped test ! -e "$FLAG"
@@ -234,8 +251,9 @@ mutant nonvd 's#^tools/divsqrt_nvdisasm_check.sh > #true > #' nvdfail_refusal
 mutant nokdig 's#^build/test_omega_numeric_transc_gb10_cpu --digest > .*#true#' happy_kernels
 mutant nokdigcheck 's#^build/test_omega_numeric_transc_gb10_cpu --digest > \(.*\) || { echo "kernel digest failed"; exit 1; }$#build/test_omega_numeric_transc_gb10_cpu --digest > \1#' digfail_refusal
 mutant pass_loose "s/^PASS_LINE=.*/PASS_LINE='^VERDICT'/" notrun0_receipt
+mutant loosenum 's/test("^\[0-9\]+\$")/test("^[0-9]")/' happy_ops_typed
 sed 's#^SOURCES="src/omega_numeric_divsqrt_gb10.c #SOURCES="#' "$MAN" > "$T/m_dropsrc"
-sed 's#src/sha256.c#src/sha256_nope.c#' "$MAN" > "$T/m_badfile"
+sed 's#src/omega_om_units.c#src/sha256_nope.c#' "$MAN" > "$T/m_badfile"
 for m in m_dropsrc m_badfile; do [ "$(load_list "$T/$m")" = "$OLD_SRCS" ] && bad "mutant $m passed check 2" || ok "mutant $m fails check 2"; done
 ( PHYSICS=$FAKE_PHYS; . "$T/m_badfile"; for s in $TEST_SOURCE $SOURCES; do [ -f "$HERE/$s" ] || exit 1; done ) && bad "mutant badfile passed 2b" || ok "mutant badfile fails 2b"
 

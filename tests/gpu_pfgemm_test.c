@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* gpu_pfgemm_test.c (OWN-30B T3b, 2026-10-13): tensor-core grouped FP8 GEMM v2, device resident (omega_blackwell_codegen_tc2.h,
  * omega_gpu_pfgemm.c).
  *   --host-only  register budgets of the production specs; the SWIGLU layout transform against a double oracle on the
@@ -79,11 +95,11 @@ static float emu_phys(const Prob *p, uint32_t i, uint32_t c) {
     return acc * R(KB);
 #undef R
 }
-/* the kernel's epilogue arithmetic: MUFU.EX2, FADD, MUFU.RCP, FMUL x 3, F2FP. The two MUFU results pass through ws_mufu_ftz
- * (bw_warp_sim_tc.h): the chip's MUFU flushes a subnormal result to a sign-preserving zero, so for t = -g log2 e in (126, 128)
+/* the kernel's epilogue arithmetic: MUFU.EX2, FADD, MUFU.RCP, FMUL x 3, F2FP. The two MUFU ops go through ws_mufu_ex2 / ws_mufu_rcp
+ * (bw_mufu_ftz.h, omega #462): the chip's MUFU flushes a subnormal result to a sign-preserving zero, so for t = -g log2 e in (126, 128)
  * (g in (-88.72, -87.34)) the reciprocal is +-0 and the activation is +-0, not the 2^-56-ish product an IEEE 1/d would give. */
 static uint16_t swiglu_bits(float g, float u) {
-    float t = g * u2f(0xbfb8aa3bu), ex = ws_mufu_ftz(exp2f(ws_mufu_ftz(t))), d = ex + 1.0f, r = ws_mufu_ftz(1.0f / ws_mufu_ftz(d)), o = g * r;
+    float t = g * u2f(0xbfb8aa3bu), ex = ws_mufu_ex2(t), d = ex + 1.0f, r = ws_mufu_rcp(d), o = g * r;
     o = o * u; o = o * u2f(0x5f800000u);
     return bf16_rn(o);
 }

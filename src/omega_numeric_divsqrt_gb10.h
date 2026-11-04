@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef OMEGA_NUMERIC_DIVSQRT_GB10_H
 #define OMEGA_NUMERIC_DIVSQRT_GB10_H
 /*
@@ -20,7 +36,8 @@
  * The only non-integer instruction is I2FP.F32.S32 on a subnormal's
  * fraction (< 2^23, so the conversion is exact) to find its leading bit.
  *
- * E1 row 10 adds the transcendentals (EXP2, LOG2) to the same frame. Their
+ * E1 row 10 adds the transcendentals (EXP2, LOG2, ..., and the natural EXP
+ * and LOG of src/omega_numeric.c) to the same frame. Their
  * bodies issue the frozen CPU sequence of src/omega_numeric_transc.c in the
  * written order: FADD (FSUB = FADD with -Rb), FMUL and FFMA (single
  * rounding) in place of the AArch64 FADD/FSUB/FMUL/FMADD, the integer DIV
@@ -31,13 +48,17 @@
  * and turns any NaN result into 0x7fffffff (the GB10 canonical NaN); the
  * chip run, not the model, establishes GB10 parity.
  */
+#include "omega_numeric.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 /* DIV and SQRT (E1 row 7) and the transcendentals of E1 row 10, each a
- * GB10 realization of the frozen CPU sequence in src/omega_numeric_transc.c. */
-typedef enum { OMEGA_DS_DIV = 0, OMEGA_DS_SQRT = 1, OMEGA_DS_EXP2 = 2, OMEGA_DS_LOG2 = 3, OMEGA_DS_SIGMOID = 4, OMEGA_DS_TANH = 5, OMEGA_DS_SIN = 6, OMEGA_DS_COS = 7, OMEGA_DS_ERF = 8, OMEGA_DS_GELU = 9, OMEGA_DS_RSQRT = 10, OMEGA_DS_OP_COUNT = 11 } OmegaDsOp;
+ * GB10 realization of the frozen CPU sequence in src/omega_numeric_transc.c
+ * (EXP and LOG: omega_math_exp / omega_math_log in src/omega_numeric.c,
+ * unfused FMUL/FADD/FSUB, no FFMA). */
+typedef enum { OMEGA_DS_DIV = 0, OMEGA_DS_SQRT = 1, OMEGA_DS_EXP2 = 2, OMEGA_DS_LOG2 = 3, OMEGA_DS_SIGMOID = 4, OMEGA_DS_TANH = 5, OMEGA_DS_SIN = 6, OMEGA_DS_COS = 7, OMEGA_DS_ERF = 8, OMEGA_DS_GELU = 9, OMEGA_DS_RSQRT = 10, OMEGA_DS_EXP = 11, OMEGA_DS_LOG = 12, OMEGA_DS_OP_COUNT = 13 } OmegaDsOp;
 
 typedef enum {
     DSK_IADD3_R = 0, /* IADD3 Rd, PT, PT, [-]Ra, [-]Rb, Rc            */
@@ -123,10 +144,16 @@ int omega_ds_listing(OmegaDsOp op, char *buf, size_t len);
  * AArch64 instructions, NaN results as 0x7fffffff). */
 uint32_t omega_ds_host_exec(OmegaDsOp op, uint32_t a, uint32_t b);
 
-/* The CPU semantic the chip must equal for DIV and SQRT: omega_math_div /
- * omega_math_sqrt (0x7fc00000 for any other op; the transcendental semantic
- * lives in src/omega_numeric_transc.c, which this module does not link). */
+/* The CPU semantic the chip must equal for DIV, SQRT, EXP and LOG:
+ * omega_math_div / omega_math_sqrt / omega_math_exp / omega_math_log of
+ * src/omega_numeric.c (0x7fc00000 for any other op; the row-10
+ * transcendental semantic lives in src/omega_numeric_transc.c, which this
+ * module does not link). */
 uint32_t omega_ds_cpu_semantic(OmegaDsOp op, uint32_t a, uint32_t b);
+
+/* The whole-program kernel that runs numeric op `op` (DIV, SQRT, EXP, LOG;
+ * omega_numeric_op_whole_kernel), or OMEGA_DS_OP_COUNT for any other op. */
+OmegaDsOp omega_ds_op_for_numeric(OmegaNumericOp op);
 
 /* Structural pre-submission check of a kernel image (see CHECK: markers).
  * Returns 0 or a negative OMEGA_NUMERIC_ERR_* and writes "ds_<check>: ..." */

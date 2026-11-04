@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef OMEGA_BLACKWELL_CODEGEN_TC_H
 #define OMEGA_BLACKWELL_CODEGEN_TC_H
 /*
@@ -48,8 +64,9 @@ int omega_blackwell_codegen_tc_probe_prog(int mutant, BlackwellIRProgram *prog);
  * Grid: grid_x = n / (warps * 8 * ct) (exact), grid_y = tiles. CTA: 32 * warps threads; shared 2 * 16 * rt * 128 bytes.
  * mutant (tests only): 1 drops the block scale, 2 never advances the scale pointer, 3 row tile i reads tile i^1 (rt >= 2),
  * 4 drops the last 64-element chunk of every 128 block. Each must be caught. */
+#define OMEGA_TCGEMM_MAX_K 32768u /* the K loop runs KB = k / 128 iterations; nothing else grows with k (omega#541) */
 typedef struct {
-    uint32_t k;     /* multiple of 128, 128 .. 16384 */
+    uint32_t k;     /* multiple of 128, 128 .. OMEGA_TCGEMM_MAX_K */
     uint32_t rt;    /* row tiles (16 rows) per CTA: 1, 2 or 4 */
     uint32_t ct;    /* column tiles (8 weight rows) per warp: 1, 2 or 4; rt * ct >= 4 */
     uint32_t warps; /* 1, 2, 4 or 8; (16 * rt * 8) % (32 * warps) == 0 */
@@ -81,21 +98,9 @@ int omega_blackwell_codegen_tc_peak_prog(uint32_t iters, uint32_t chains, uint32
  * CTA distinct (DRAM); groups = 1: every CTA the same bytes (shows any cache reuse of these buffers). */
 int omega_blackwell_codegen_tc_bw_prog(uint32_t iters, uint32_t groups, uint32_t threads, BlackwellIRProgram *prog);
 
-/* ---- opcodes the shared encoder lacks, emitted as same-footprint placeholders and patched after encoding ----
- * SHFL.BFLY PT, Rd, Ra, lane, 0x1f: a BW_IR_SHFL_DOWN whose imm carries OMEGA_TC_MARK_BFLY; the patch sets bit 26 of word 1
- *   (nvcc 13.0.88 sm_121 oracle, investigations/2026-10-13-t3-mma-oracle/attn/fa_ops.sass: SHFL.BFLY PT, R5, R0, 0x1, 0x1f =
- *   0x0c201f0000057f89 / 0x004e2800000e0000; the shared encoder's SHFL.DOWN word 1 is 0x08001f00 | lane << 21).
- * F2FP.BF16.F32.PACK_AB Rd, Ra, Rb (Rd = bf16_rn(Ra) << 16 | bf16_rn(Rb)): a BW_IR_FMNMX_MAX whose imm is OMEGA_TC_MARK_F2FP;
- *   the patch rewrites the opcode to 0x723e and word 2 to 0x000010ff (oracle: F2FP.BF16.F32.PACK_AB R9, R3, R0 =
- *   0x000000000309723e / 0x000fe200000010ff; registers stay at Rd 16..23, Ra 24..31, Rb 32..39 as FMNMX). F2FP needs no
- *   scoreboard in the oracle (fixed latency), as FMNMX. */
-#define OMEGA_TC_MARK_BFLY 0x80000000u
-#define OMEGA_TC_MARK_F2FP 0x46320000u
-/* patch the encoded code (len bytes, one 16-byte word per IR instruction); returns the number patched or -1 on a word that
- * does not hold the expected placeholder bits */
-int omega_tc_patch_code(const BlackwellIRProgram *prog, uint8_t *code, size_t len);
-/* encoder self-test: placeholders encoded and patched against the oracle words (register fields excluded); 0 = pass */
-int omega_tc_patch_selftest(char *msg, size_t msgn);
+/* SHFL.BFLY and F2FP.BF16.F32.PACK_AB were placeholders patched after encoding (omega_tc_patch_code) until training R5;
+ * they are now native encoder entries (BW_IR_SHFL_BFLY, BW_IR_F2FP_BF16_PACK, golden words in
+ * omega_blackwell_verify_codegen_fixtures_bfly_f2fp) and the emitted bytes are unchanged. */
 
 #ifdef __cplusplus
 }

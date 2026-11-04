@@ -1,4 +1,19 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # tests/run_numeric_gates.sh -- M19R Gate 5 (OMEGA-NUMERIC-0) qualification.
 #
 #   tests/run_numeric_gates.sh --omega-candidate SHA --physics-candidate SHA
@@ -51,8 +66,9 @@
 # re-hash them and re-run the log checks.
 # The historical file evidence/m19r_gate5_omega_numeric_evidence.json is not
 # touched; its hash is recorded as the predecessor.
-# All 40 ops in the manifest (the 15 original ops, the 23 E1 scalar ops, and
-# DIV and SQRT, which run the E1 row 7 whole-program kernels),
+# All 42 ops in the manifest (the 15 original ops, the 23 E1 scalar ops,
+# DIV and SQRT, which run the E1 row 7 whole-program kernels, and EXP and
+# LOG, which run the E1 row 10 whole-program kernels),
 # LDS_STS and REDUCE_SUM included, need one GB10
 # parity line each (FFMA one per c) at n=4096 with zero mismatches against the
 # CPU reference. REDUCE_SUM checks lane 0 of each warp (n/32 sums) and must
@@ -98,7 +114,7 @@ FSETP_NE_SEL:INT_EXACT FSETP_NUM_SEL:INT_EXACT FSETP_NAN_SEL:INT_EXACT FSETP_LTU
 FSETP_LEU_SEL:INT_EXACT FSETP_GTU_SEL:INT_EXACT FSETP_GEU_SEL:INT_EXACT FSETP_EQU_SEL:INT_EXACT
 FSETP_NEU_SEL:INT_EXACT F2I_FLOOR:INT_EXACT F2I_CEIL:INT_EXACT F2I_RNI:INT_EXACT F2U:INT_EXACT
 I2FP_U32:BIT_EXACT F32_TO_F16:F16_BITS F32_TO_BF16:BF16_BITS F16_TO_F32:BIT_EXACT
-BF16_TO_F32:BIT_EXACT FFMA_V:BIT_EXACT DIV:BIT_EXACT SQRT:BIT_EXACT"
+BF16_TO_F32:BIT_EXACT FFMA_V:BIT_EXACT DIV:BIT_EXACT SQRT:BIT_EXACT EXP:BIT_EXACT LOG:BIT_EXACT"
 NUM_ENCODED_OPS=$(printf '%s\n' $NUM_OP_MANIFEST | cut -d: -f1 | tr '\n' ' ')
 # Elements per launch (N in tests/test_omega_numeric.c).
 NUM_CORPUS_N=4096
@@ -157,7 +173,7 @@ num_build() {
         src/omega_numeric_divsqrt_gb10.c \
         src/omega_numeric_provenance.c src/omega_blackwell_codegen.c \
         src/omega_blackwell_encoder.c src/omega_blackwell_matmul.c src/omega_blackwell_qmd.c \
-        src/forge_realization.c src/aegis_verification.c src/sha256.c \
+        src/forge_realization.c src/aegis_verification.c src/omega_om_units.c \
         "$p/forge/forge_descriptor.c" "$p/forge/forge_realize.c" "$p/sha256_clean.c" \
         "$p/nvrm/nvrm.c" "$p/m16/m16_native.c") > "$log" 2>&1 ||
         m19r_fail "build failed; see $log" || return 1

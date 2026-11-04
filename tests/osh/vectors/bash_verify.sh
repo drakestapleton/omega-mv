@@ -1,9 +1,28 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # bash_verify.sh: prove the expectations in bash_vectors.tsv against REAL bash 5.2 (not the reference lexer).
 # For each vector it runs the input under bash and the "equivalent" script (the continuation-free form, or the
 # script rendered from the expected tokens when the equiv column is "-") and requires identical transcripts
 # (stdout, stderr, and the files written). Usage: bash_verify.sh [bash_vectors.tsv]   Writes bash_verified.log.
 set -u
+# omega#344: the reference run is pinned, so a caller's locale, PATH, TZ or exported variables cannot change bash's answers
+if [ "${BASH_VERIFY_PINNED:-}" != 1 ]; then
+    exec env -i BASH_VERIFY_PINNED=1 PATH=/usr/bin:/bin LC_ALL=C TZ=UTC TMPDIR="${TMPDIR:-/tmp}" bash "$0" "$@"
+fi
 here=$(cd "$(dirname "$0")" && pwd)
 tsv=${1:-$here/bash_vectors.tsv}
 ver=$(bash --version | head -1)
@@ -42,7 +61,7 @@ render() { # expect tokens -> script
 }
 n=0; bad=0
 log="$here/bash_verified.log"
-{ echo "bash: $ver"; echo "file: bash_vectors.tsv"; } > "$log"
+{ echo "bash: $ver ($(command -v bash))"; echo "env: env -i, LC_ALL=C TZ=UTC PATH=/usr/bin:/bin"; echo "file: bash_vectors.tsv"; } > "$log"
 while IFS=$'\t' read -r id inp exp eq; do
 	case $id in c*) ;; *) continue ;; esac
 	n=$((n + 1))

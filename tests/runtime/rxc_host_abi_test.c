@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * rxc_host_abi_test.c -- NEXT-PHASE-1 cut 1a: the host ABI facade over
  * COMPOSITION-2, through build/librx_compose.a only (no test hooks).
@@ -239,6 +255,17 @@ int main(void) {
     printf("abi layout: info %u result %u record %u repair %u\n", lay[0], lay[1], lay[2], lay[3]);
 
     t_wait_ms(dir);
+
+    /* A dir refused by src/omega_path_check.h is an argument error and creates nothing (Rev1001 on #1006). */
+    {
+        char bad[320];
+        snprintf(bad, sizeof bad, "%s/refused dir", dir);
+        RxcHost *hb = NULL;
+        RxcHostInfo ib;
+        int brc = rxc_host_open(bad, RXC_HOST_ROOT_PROVISIONED, ROOT, sizeof ROOT - 1, 0x5E55ull, 0, &hb, &ib);
+        CHECK(brc == RXC_HOST_E_ARG && !hb, "refused dir -> E_ARG (%d)", brc);
+        CHECK(access(bad, F_OK) != 0, "refused dir not created");
+    }
 
     /* ---- T1 ---- */
     RxcHostInfo i1;

@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* Omega Visor V1 - lane 4: evidence (receipt) inspection. See visor_evidence.h. */
 #include "visor_evidence.h"
 
@@ -441,10 +457,56 @@ int visor_evidence_load(const char *path, VisorEvidenceRecord *out) {
 /* ------------------------------------------------------------------ */
 /* Directory walk (sorted, deterministic)                              */
 /* ------------------------------------------------------------------ */
-#define VISOR_EVIDENCE_MAX_FILES 1024
-static char g_paths[VISOR_EVIDENCE_MAX_FILES][256];
-static size_t g_npaths;
-static bool g_paths_overflow;
+/* The kept set never depends on readdir order (omega-mv#404): below the cap every regular
+ * file is kept; past it the list is a max-heap on strcmp and a later path replaces the
+ * largest kept one when it sorts before it, so the scan keeps exactly the g_max_files
+ * smallest paths of the tree, whatever order the filesystem returned them in. */
+typedef char VisorPath[256];
+static VisorPath *g_paths;
+static size_t g_npaths, g_paths_alloc;
+static size_t g_max_files = VISOR_EVIDENCE_MAX_FILES;
+static bool g_paths_overflow, g_paths_oom;
+
+size_t visor_evidence_set_max_files(size_t cap) {
+    size_t prev = g_max_files;
+    g_max_files = cap ? cap : VISOR_EVIDENCE_MAX_FILES;
+    return prev;
+}
+
+static void heap_sift_down(size_t i) {
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < g_npaths && strcmp(g_paths[l], g_paths[m]) > 0) m = l;
+        if (r < g_npaths && strcmp(g_paths[r], g_paths[m]) > 0) m = r;
+        if (m == i) return;
+        VisorPath t;
+        memcpy(t, g_paths[i], sizeof(t));
+        memcpy(g_paths[i], g_paths[m], sizeof(t));
+        memcpy(g_paths[m], t, sizeof(t));
+        i = m;
+    }
+}
+
+static void keep_path(const VisorPath p) {
+    if (g_npaths < g_max_files) {
+        if (g_npaths == g_paths_alloc) {
+            size_t n = g_paths_alloc ? g_paths_alloc * 2 : 1024;
+            if (n > g_max_files) n = g_max_files;
+            VisorPath *q = realloc(g_paths, n * sizeof(*q));
+            if (!q) { g_paths_oom = true; return; }
+            g_paths = q;
+            g_paths_alloc = n;
+        }
+        memcpy(g_paths[g_npaths++], p, sizeof(VisorPath));
+        if (g_npaths == g_max_files)
+            for (size_t i = g_npaths / 2; i-- > 0;) heap_sift_down(i);
+        return;
+    }
+    g_paths_overflow = true;
+    if (strcmp(p, g_paths[0]) >= 0) return;            /* sorts after every kept path */
+    memcpy(g_paths[0], p, sizeof(VisorPath));
+    heap_sift_down(0);
+}
 
 static void walk(const char *dir, int depth) {
     if (depth > 8) return;
@@ -453,15 +515,14 @@ static void walk(const char *dir, int depth) {
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] == '.') continue;
-        char p[256];
+        VisorPath p;
         int w = snprintf(p, sizeof(p), "%s%s%s", dir, dir[strlen(dir) - 1] == '/' ? "" : "/", e->d_name);
         if (w < 0 || (size_t)w >= sizeof(p)) { g_paths_overflow = true; continue; }
         struct stat st;
         if (lstat(p, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) { walk(p, depth + 1); continue; }
         if (!S_ISREG(st.st_mode)) continue;               /* symlinks and devices are not followed */
-        if (g_npaths >= VISOR_EVIDENCE_MAX_FILES) { g_paths_overflow = true; continue; }
-        memcpy(g_paths[g_npaths++], p, sizeof(p));
+        keep_path(p);
     }
     closedir(d);
 }
@@ -473,8 +534,10 @@ static int collect(const char *root) {
     if (!root || !root[0] || stat(root, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
     g_npaths = 0;
     g_paths_overflow = false;
+    g_paths_oom = false;
     walk(root, 0);
-    qsort(g_paths, g_npaths, sizeof(g_paths[0]), cmp_path);
+    if (g_paths_oom) return -1;                        /* fail closed: a dropped path could hide evidence */
+    if (g_npaths) qsort(g_paths, g_npaths, sizeof(g_paths[0]), cmp_path);
     return 0;
 }
 

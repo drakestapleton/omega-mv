@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* omega_bw_em.h: the IR emitter helpers shared by the OWN-30B tensor-core generators (T3/T3b; private, static, header-only).
  * Moved verbatim out of omega_blackwell_codegen_tc.c (T3 cut 1, chip-proven scheduling rules); see that file for the history. */
 #ifndef OMEGA_BW_EM_H
@@ -140,6 +156,6 @@ static void nop(Em *e, uint32_t stall) {
 }
 static void lop3(Em *e, int d, int a, int b, int c, uint32_t lut) { BlackwellIRInsn i = I0(BW_IR_LOP3_LUT); i.dst_vreg = d; i.src1_vreg = a; i.src2_vreg = b; i.src3_vreg = c; i.imm = lut; emit(e, i, K_FIXED); }
 static void iadd(Em *e, int d, int a, int b) { BlackwellIRInsn i = I0(BW_IR_IADD3); i.dst_vreg = d; i.src1_vreg = a; i.src2_vreg = b; emit(e, i, K_FIXED); }
-static void shfl_bfly(Em *e, int d, int a, uint32_t lane) { shfl_down(e, d, a, OMEGA_TC_MARK_BFLY | (lane & 31u)); }
-static void f2fp_pack(Em *e, int d, int hi, int lo) { BlackwellIRInsn i = I0(BW_IR_FMNMX_MAX); i.dst_vreg = d; i.src1_vreg = hi; i.src2_vreg = lo; i.imm = OMEGA_TC_MARK_F2FP; emit(e, i, K_FIXED); }
+static void shfl_bfly(Em *e, int d, int a, uint32_t lane) { BlackwellIRInsn i = I0(BW_IR_SHFL_BFLY); i.dst_vreg = d; i.src1_vreg = a; i.imm = lane & 31u; emit(e, i, K_VAR); }
+static void f2fp_pack(Em *e, int d, int hi, int lo) { BlackwellIRInsn i = I0(BW_IR_F2FP_BF16_PACK); i.dst_vreg = d; i.src1_vreg = hi; i.src2_vreg = lo; emit(e, i, K_FIXED); }
 #endif

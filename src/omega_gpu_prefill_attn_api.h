@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef OMEGA_GPU_PREFILL_ATTN_API_H
 #define OMEGA_GPU_PREFILL_ATTN_API_H
 /*
@@ -72,7 +88,7 @@ int omega_gpu_prefill_attn_kv_mirror_available(void);
 uint32_t omega_gpu_prefill_attn_test_launch_ns(uint64_t *ns, uint32_t cap);
 #define OMEGA_GPU_PATTN_HOST_PASS 1024u /* host entry: tokens per staged pass in split mode */
 
-/* host: build + encode + patch the kernel for a spec into code (cap bytes); returns the code size or 0 (tests) */
-size_t omega_gpu_prefill_attn_encode(const OmegaPrefillAttnSpec *spec, uint8_t *code, size_t cap, uint32_t *gprs, int *patched);
+/* host: build + encode the kernel for a spec into code (cap bytes); returns the code size or 0 (tests) */
+size_t omega_gpu_prefill_attn_encode(const OmegaPrefillAttnSpec *spec, uint8_t *code, size_t cap, uint32_t *gprs);
 
 #endif

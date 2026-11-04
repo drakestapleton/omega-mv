@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * rx_compose.h -- COMPOSITION-2: one World, one causal path.
  *
@@ -244,7 +260,8 @@ typedef struct RxCompose {
  * reopened (a torn journal tail is repaired, then the chain is verified), the
  * World is built with `n_workers` (the composition owns it; see
  * rx_compose_attach to run inside an existing World), state is recovered
- * OLD-or-NEW. */
+ * OLD-or-NEW. `dir` must pass src/omega_path_check.h (omega_path_copy) and
+ * be under 168 bytes; otherwise RX_ERR_ARG and nothing is created. */
 int  rx_compose_open(RxCompose *c, const char *dir, const AienMachineId *self, uint64_t session,
                      const SrRouter *router, RxcContract contract, AienosCapAdmin *admin,
                      AienosCapView *view, uint32_t n_workers);

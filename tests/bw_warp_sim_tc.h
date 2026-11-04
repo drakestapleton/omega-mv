@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* bw_warp_sim.h: host SIMT simulator for the Blackwell IR (omega #308).
  *
  * Models what the earlier per-thread simulators could not: a warp of 32 lanes with an
@@ -28,13 +44,15 @@
  *                      an exit jumped past it, or a target was corrupted)
  *   WS_E_NEVER_JOINED  the warp finished with a barrier still armed
  *   WS_E_SELF_BRANCH, WS_E_PC, WS_E_OP, WS_E_SHIFT, WS_E_MEM, WS_E_SMEM, WS_E_FRAGS
+ *   WS_E_IMADHI_RC     IMAD.HI.U32 with an odd register Rc. An even Rc is modelled as the 64-bit pair
+ *                      Rc+1:Rc the chip reads (omega #492, nvcc oracle, chip probe pending); odd has no evidence
  * Every error names the pc. Memory: global addresses are host pointers (optionally range
  * checked); shared memory is a per-CTA buffer poisoned at CTA start so a read of a word
  * nobody wrote shows up in the oracle comparison.
  *
  * Per-lane ALU semantics are those of the two earlier simulators (tests/gpu_attention_test.c,
- * bench/prime_race/tests/gb10_sieve_host_test.c). EX2 and RCP are exact here; the chip's
- * are approximate. LDCU64 (memory descriptor) is not modelled. */
+ * bench/prime_race/tests/gb10_sieve_host_test.c). MUFU EX2 / RCP / RSQ are the correctly
+ * rounded IEEE value with the chip's subnormal flush (bw_mufu_ftz.h); the chip's are approximate. LDCU64 (memory descriptor) is not modelled. */
 #ifndef BW_WARP_SIM_TC_H
 #define BW_WARP_SIM_TC_H
 /* bw_warp_sim_k.h (OWN-30B cut 8, 2026-10-13): tests/bw_warp_sim.h plus the system-scope opcodes the decode attention
@@ -46,6 +64,7 @@
  * encoder emits and bw_warp_sim_k.h ignored. Timing (stall counts, scoreboards) is not modelled. */
 
 #include "omega_blackwell_codegen.h"
+#include "bw_mufu_ftz.h" /* MUFU EX2 / RCP / RSQ: the chip's flush of subnormal inputs and results (omega #462) */
 #include "bw_hmma_model.h"
 #include "omega_blackwell_codegen_tc.h"
 #include "omega_blackwell_codegen_qmma.h"
@@ -70,12 +89,12 @@ static QmmaModel ws_qmma_model = { 32, 26, 0, 2, 0 }; /* chip-exact 262144/26214
 enum {
     WS_OK = 0, WS_E_SHFL_SPLIT, WS_E_SHFL_EXITED, WS_E_BAR_SPLIT, WS_E_BSYNC_UNARMED, WS_E_BSSY_REARM,
     WS_E_JOIN_MISMATCH, WS_E_NONMEMBER, WS_E_STUCK, WS_E_NEVER_JOINED, WS_E_SELF_BRANCH, WS_E_PC,
-    WS_E_OP, WS_E_SHIFT, WS_E_MEM, WS_E_SMEM, WS_E_FRAGS, WS_E_BAR_TIMEOUT, WS_E_STEPS
+    WS_E_OP, WS_E_SHIFT, WS_E_MEM, WS_E_SMEM, WS_E_FRAGS, WS_E_BAR_TIMEOUT, WS_E_STEPS, WS_E_IMADHI_RC
 };
 static const char *ws_err_name(int e) {
     static const char *const n[] = { "OK", "SHFL_SPLIT", "SHFL_EXITED", "BAR_SPLIT", "BSYNC_UNARMED", "BSSY_REARM",
         "JOIN_MISMATCH", "NONMEMBER", "STUCK", "NEVER_JOINED", "SELF_BRANCH", "PC", "OP", "SHIFT", "MEM", "SMEM",
-        "FRAGS", "BAR_TIMEOUT", "STEPS" };
+        "FRAGS", "BAR_TIMEOUT", "STEPS", "IMADHI_RC" };
     return (e >= 0 && e < (int)(sizeof n / sizeof n[0])) ? n[e] : "?";
 }
 
@@ -125,16 +144,7 @@ static void ws_wrs(WsLane *l, int v, unsigned sub, uint32_t x, const BlackwellIR
 static float ws_u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static uint32_t ws_f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static uint32_t ws_bf16_rn(uint32_t u) { if ((u & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u; return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16; } /* f32 bits -> bf16 bits, round to nearest even */
-/* MUFU (the SASS EX2 / RCP / RSQ unit) flushes a subnormal result to a sign-preserving zero. Chip-observed on GB10: the SwiGLU
- * reciprocal 1 / (2^t + 1) for t in (126, 128) came back as +-0 on all 101 of 101 differing elements (evidence
- * OWN30B-L1G-PFGEMM-SWIGLU-FTZ-df9bd9c4, gpu_pfgemm_test host red test). Doc-inferred, not separately chip-observed: the input flush
- * and the EX2 / RSQ cases follow the same rule, PTX ISA 9.7.3.13 (rcp) and 9.7.3.21 (ex2) "flushes subnormal inputs and results to
- * sign-preserving zero" for the .ftz form, which is what the bare MUFU we emit is (the non-ftz PTX variants are ptxas sequences around
- * MUFU; NVIDIA publishes no SASS semantics). Limit: the chip's MUFU is approximate (RCP 1 ulp, EX2 2 ulp), the model flushes a correctly
- * rounded IEEE result, so right at the subnormal boundary the two can disagree 0 versus nonzero. This simulator and the pfgemm reference
- * go through this helper; bw_warp_sim.h, bw_warp_sim_k.h, bw_warp_sim_pa.h and gpu_attention_test.c still model MUFU as IEEE (issue filed
- * with PR #461). omega_numeric.c has its own ftz() on the library side. */
-static float ws_mufu_ftz(float f) { uint32_t u = ws_f2u(f); if ((u & 0x7f800000u) == 0u) u &= 0x80000000u; return ws_u2f(u); }
+/* MUFU EX2 / RCP / RSQ: the flush rule and its evidence live in bw_mufu_ftz.h (shared by every simulator, omega #462). */
 static uint32_t ws_lut3(uint32_t lut, uint32_t a, uint32_t b, uint32_t c) {
     uint32_t r = 0;
     for (int i = 0; i < 8; i++) if (lut >> i & 1) r |= ((i & 4) ? a : ~a) & ((i & 2) ? b : ~b) & ((i & 1) ? c : ~c);
@@ -166,7 +176,16 @@ static void ws_lane_exec(WsSim *s, WsLane *l, const BlackwellIRInsn *in, int pc,
     case BW_IR_MOV_RZ: ws_wrs(l, in->dst_vreg, in->dst_subreg, 0, p); break;
     case BW_IR_IMAD: ws_wrs(l, in->dst_vreg, in->dst_subreg, in->src2_vreg >= 0 ? a * b + c : a * in->imm + c, p); break;
     case BW_IR_IMAD_WIDE: ws_wr64(l, in->dst_vreg, (uint64_t)a * in->imm + ws_rd64(l, in->src3_vreg, p), p); break;
-    case BW_IR_IMAD_HI_U32: ws_wrs(l, in->dst_vreg, in->dst_subreg, (uint32_t)(((uint64_t)a * b) >> 32) + c, p); break;
+    case BW_IR_IMAD_HI_U32: { /* Rd = hi32(Ra * Rb + Rc+1:Rc). A register Rc is a 64-bit pair, low word Rc (omega #492, nvcc 13.0
+                               * oracle evidence/IMADHI-RC-ORACLE-nvcc13.0-20261016, not chip-probed); an odd Rc has no evidence: refused */
+        uint64_t c64 = 0;
+        int rc = in->src3_vreg >= 0 ? p->regalloc.vreg_to_phys[in->src3_vreg] : -1;
+        if (rc >= 0) {
+            rc = (rc + in->src3_subreg) & 0xff;
+            if (rc & 1) { ws_fail(s, WS_E_IMADHI_RC, pc, "IMAD.HI.U32 with an odd register Rc (the chip reads a 64-bit pair; nvcc emits only even bases, odd not chip-probed): use RZ or an even pair"); return; }
+            c64 = (uint64_t)l->r[rc] | ((uint64_t)l->r[rc + 1] << 32);
+        }
+        ws_wrs(l, in->dst_vreg, in->dst_subreg, (uint32_t)(((uint64_t)a * b + c64) >> 32), p); break; }
     case BW_IR_IADD3: ws_wrs(l, in->dst_vreg, in->dst_subreg, a + b, p); break; /* the encoder's IADD3 has Rc = RZ */
     case BW_IR_SHF_R: ws_wrs(l, in->dst_vreg, in->dst_subreg, a >> (in->imm & 31), p); break;
     case BW_IR_SHF_L_U32: if (b >= 32) { ws_fail(s, WS_E_SHIFT, pc, "SHF.L.U32 amount >= 32 (not chip-verified)"); return; } ws_wrs(l, in->dst_vreg, in->dst_subreg, a << b, p); break;
@@ -174,7 +193,7 @@ static void ws_lane_exec(WsSim *s, WsLane *l, const BlackwellIRInsn *in, int pc,
     case BW_IR_LOP3_XOR: ws_wrs(l, in->dst_vreg, in->dst_subreg, a ^ b, p); break;
     case BW_IR_LOP3_LUT: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_lut3(in->imm & 0xff, a, b, c), p); break;
     case BW_IR_ISETP_GE_U32: l->p0 = a >= b; break;
-    case BW_IR_LDG_E: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t x; memcpy(&x, (const void *)(uintptr_t)ad, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
+    case BW_IR_LDG_E: { uint64_t ad = ws_rd64(l, in->src1_vreg, p) + (uint64_t)(int64_t)(int32_t)in->imm; if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t x; memcpy(&x, (const void *)(uintptr_t)ad, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
     case BW_IR_LDG_E_U16: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 2, pc)) return; uint16_t x; memcpy(&x, (const void *)(uintptr_t)ad, 2); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
     case BW_IR_STG_E: { uint64_t ad = ws_rd64(l, in->src1_vreg, p) + (uint64_t)(int64_t)(int32_t)in->imm; if (!ws_mem_ok(s, ad, 4, pc)) return; memcpy((void *)(uintptr_t)ad, &b, 4); break; }
     case BW_IR_LDG_E_64: case BW_IR_LDG_E_128: { unsigned n = in->op == BW_IR_LDG_E_64 ? 8u : 16u; uint64_t ad = ws_rd64(l, in->src1_vreg, p) + (uint64_t)(int64_t)(int32_t)in->imm; if (!ws_mem_ok(s, ad, n, pc)) { if (getenv("WS_DBG")) fprintf(stderr, "  tid %u cx %u cy %u\n", tid, cx, cy); return; } if (ad & (n - 1)) { ws_fail(s, WS_E_MEM, pc, "wide global load not naturally aligned"); return; } uint32_t x[4]; memcpy(x, (const void *)(uintptr_t)ad, n); for (unsigned i = 0; i < n / 4; i++) ws_wrs(l, in->dst_vreg, i, x[i], p); break; }
@@ -185,17 +204,19 @@ static void ws_lane_exec(WsSim *s, WsLane *l, const BlackwellIRInsn *in, int pc,
     case BW_IR_FSUB: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_u2f(a) - ws_u2f(b)), p); break;
     case BW_IR_FMUL: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_u2f(a) * ws_u2f(b)), p); break;
     case BW_IR_FFMA: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(fmaf(ws_u2f(a), ws_u2f(b), ws_u2f(c))), p); break;
+    case BW_IR_F2FP_BF16_PACK: ws_wrs(l, in->dst_vreg, in->dst_subreg, (ws_bf16_rn(a) << 16) | ws_bf16_rn(b), p); break; /* F2FP.BF16.F32.PACK_AB */
     case BW_IR_FMNMX_MAX:
-        if (in->imm == OMEGA_TC_MARK_F2FP) { ws_wrs(l, in->dst_vreg, in->dst_subreg, (ws_bf16_rn(a) << 16) | ws_bf16_rn(b), p); break; } /* F2FP.BF16.F32.PACK_AB placeholder */
         if (in->imm == OMEGA_QMMA_MARK_F2E4) { ws_wrs(l, in->dst_vreg, in->dst_subreg, (uint32_t)qm_e4m3_rne_sat(ws_u2f(a)) << 8 | qm_e4m3_rne_sat(ws_u2f(b)), p); break; } /* F2FP.SATFINITE.E4M3 placeholder (NaN not modelled) */
         ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(fmaxf(ws_u2f(a), ws_u2f(b))), p); break;
     case BW_IR_FMNMX_MIN: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(fminf(ws_u2f(a), ws_u2f(b))), p); break;
-    case BW_IR_MUFU_EX2: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_ftz(exp2f(ws_mufu_ftz(ws_u2f(a))))), p); break;
-    case BW_IR_MUFU_RCP: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_ftz(1.0f / ws_mufu_ftz(ws_u2f(a)))), p); break;
-    case BW_IR_MUFU_RSQ: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_ftz(1.0f / sqrtf(ws_mufu_ftz(ws_u2f(a))))), p); break;
+    case BW_IR_MUFU_EX2: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_ex2(ws_u2f(a))), p); break;
+    case BW_IR_MUFU_RCP: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_rcp(ws_u2f(a))), p); break;
+    case BW_IR_MUFU_RSQ: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_rsq(ws_u2f(a))), p); break;
     case BW_IR_LDG_STRONG_SYS: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t x; memcpy(&x, (const void *)(uintptr_t)ad, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
     case BW_IR_STG_STRONG_SYS: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; memcpy((void *)(uintptr_t)ad, &b, 4); break; }
     case BW_IR_ATOMG_ADD_STRONG_SYS: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t old; memcpy(&old, (const void *)(uintptr_t)ad, 4); uint32_t nw = old + b; memcpy((void *)(uintptr_t)ad, &nw, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, old, p); break; }
+    /* f32 atomic add, flush-to-zero on both inputs and the result (PTX add.rn.ftz.f32); returns the old word */
+    case BW_IR_ATOMG_ADD_F32_STRONG_SYS: case BW_IR_ATOMG_ADD_F32_STRONG_GPU: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t old; memcpy(&old, (const void *)(uintptr_t)ad, 4); uint32_t nw = ws_f2u(ws_mufu_ftz(ws_mufu_ftz(ws_u2f(old)) + ws_mufu_ftz(ws_u2f(b)))); memcpy((void *)(uintptr_t)ad, &nw, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, old, p); break; }
     case BW_IR_MEMBAR_ALL_SYS: break;
     default: ws_fail(s, WS_E_OP, pc, "opcode not modelled"); return;
     }
@@ -292,13 +313,13 @@ static int ws_run_warp(WsSim *s, WsWarp *w, uint32_t warp, uint32_t cx, uint32_t
             }
             break;
         }
-        case BW_IR_SHFL_DOWN: {
+        case BW_IR_SHFL_DOWN: case BW_IR_SHFL_BFLY: {
             if (w->exited) { ws_fail(s, WS_E_SHFL_EXITED, pc, "SHFL on a warp with exited lanes"); return -1; }
             if (mask != live) { ws_fail(s, WS_E_SHFL_SPLIT, pc, "SHFL on a split warp"); return -1; }
             uint32_t src[WS_WARP];
             for (int L = 0; L < WS_WARP; L++) src[L] = ws_rd(&w->lane[L], in->src1_vreg, p);
             for (int L = 0; L < WS_WARP; L++) {
-                int from = (in->imm & OMEGA_TC_MARK_BFLY) ? (L ^ (int)(in->imm & 31)) : L + (int)(in->imm & 31); /* BFLY placeholder (omega_blackwell_codegen_tc.h) */
+                int from = in->op == BW_IR_SHFL_BFLY ? (L ^ (int)(in->imm & 31)) : L + (int)(in->imm & 31);
                 ws_wr(&w->lane[L], in->dst_vreg, from < WS_WARP ? src[from] : src[L], p);
             }
             f->pc = pc + 1;
@@ -332,8 +353,8 @@ static int ws_run_warp(WsSim *s, WsWarp *w, uint32_t warp, uint32_t cx, uint32_t
                 int gg = L / 4, tt = L % 4;
                 const WsLane *ln = &w->lane[L];
                 uint32_t a4[4], b2[2], c4[4];
-                for (unsigned q = 0; q < 4; q++) { a4[q] = ws_rds(ln, in->src1_vreg, q, p); c4[q] = in->src3_vreg >= 0 ? ws_rds(ln, in->src3_vreg, q, p) : 0u; }
-                for (unsigned q = 0; q < 2; q++) b2[q] = ws_rds(ln, in->src2_vreg, q, p);
+                for (unsigned q = 0; q < 4; q++) { a4[q] = ws_rds(ln, in->src1_vreg, in->src1_subreg + q, p); c4[q] = in->src3_vreg >= 0 ? ws_rds(ln, in->src3_vreg, in->src3_subreg + q, p) : 0u; }
+                for (unsigned q = 0; q < 2; q++) b2[q] = ws_rds(ln, in->src2_vreg, in->src2_subreg + q, p); /* operands may start at a subregister (the encoder adds it) */
                 const int ar[4] = { gg, gg + 8, gg, gg + 8 }, ac[4] = { 2 * tt, 2 * tt, 2 * tt + 8, 2 * tt + 8 };
                 for (unsigned q = 0; q < 4; q++) { A[ar[q]][ac[q]] = ws_u2f(a4[q] << 16); A[ar[q]][ac[q] + 1] = ws_u2f(a4[q] & 0xffff0000u); }
                 for (unsigned q = 0; q < 2; q++) { B[2 * tt + 8 * q][gg] = ws_u2f(b2[q] << 16); B[2 * tt + 8 * q + 1][gg] = ws_u2f(b2[q] & 0xffff0000u); }

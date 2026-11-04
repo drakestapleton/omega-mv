@@ -1,4 +1,19 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # test_m19r_qualify.sh -- negative tests for candidate binding, immutable
 # qualification emission and gate counting in tools/m19r_qualify.sh, plus
 # golden tests for the canonical JSON helper tools/json_canon.c.
@@ -10,8 +25,8 @@ HERE=$(cd -P "$(dirname "$0")/.." && pwd)
 m19r_build_canon || { echo "FAIL: cannot build tools/json_canon.c"; exit 1; }
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP" "$M19R_TMP"' EXIT
-fails=0
-ok() { echo "  [PASS] $1"; }
+fails=0 passes=0
+ok() { echo "  [PASS] $1"; passes=$((passes + 1)); }
 bad() { echo "  [FAIL] $1"; fails=$((fails + 1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
@@ -181,6 +196,7 @@ c=$TMP/c_inv3; mkdir "$c"; mkrun "$c" r1 PASS; mkrun "$c" r2 FAILED; chmod u+w "
 check "INVALID takes precedence over FAIL" '[ "$(verdict "$c" 2)" = INVALID ]'
 check "bad arguments exit 2" '"$CAMP" --campaign-dir "$TMP/nonexistent" --runs 2 > /dev/null 2>&1; [ $? = 2 ]'
 
+printf 'TOTAL GATES: %d | PASSED: %d | FAILED: %d\n' "$((passes + fails))" "$passes" "$fails"
 if [ "$fails" -ne 0 ]; then
     echo "M19R qualifier tests: $fails FAILED"
     exit 1

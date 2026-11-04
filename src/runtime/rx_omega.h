@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * rx_omega.h -- Omega as a resident realization faculty (ADR 0016 §43, R10).
  *
@@ -60,7 +76,8 @@ enum {
  *            4..7 realization id
  * selection: 0 epoch, 1..4 realization id (zero = reference), 5 ps/call,
  *            6 regime, 7 reference ps/call
- * regime = (M << 32) | N. */
+ * regime = (M << 32) | N. Every ns and ps above is the executing thread's CPU
+ * time (CLOCK_THREAD_CPUTIME_ID), not wall-clock time. */
 enum { RX_OMEGA_SYNTHESIZED = 1 };
 enum { RX_OMEGA_PASSED = 1, RX_OMEGA_REFUSED = 2 };
 enum { RX_OMEGA_MEASURED = 1, RX_OMEGA_DECLINED = 2 };
@@ -103,7 +120,15 @@ typedef struct {
     uint64_t hot_ns;
     uint32_t margin_pct;        /* a realization must beat the reference by this */
     uint32_t sandbox_ms;
+    /* Test only (R15 SEQ parity): when set, the cost of `calls` matvec calls
+     * replaces the wall-clock time measured around them, in serve and in
+     * measure. The calls still run. kind is the realization kind, or
+     * RX_OMEGA_COST_REFERENCE for the reference. NULL measures, as always. */
+    uint64_t (*cost_ns)(void *ctx, uint32_t kind, uint32_t M, uint32_t N, uint64_t calls);
+    void *cost_ctx;
 } RxOmegaConfig;
+
+#define RX_OMEGA_COST_REFERENCE UINT32_MAX
 
 typedef struct {
     RxObjRef request, demand, result, search, selection;

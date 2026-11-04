@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * E1 row 7: correctly rounded FP32 DIV and SQRT on the GB10.
  *
@@ -6,7 +22,7 @@
  *                   host model of the body vs omega_math_* and the AArch64
  *                   FDIV/FSQRT on the hard corpus, edge classes and random
  *                   samples. Exit 0 only when every [PASS] holds. No device.
- *   --dump DIR      writes DIR/{div,sqrt,exp2,log2}.bin and .lst (the
+ *   --dump DIR      writes DIR/<op>.bin and .lst (div, sqrt, exp2, ..., exp, log; the
  *                   expected nvdisasm text) for tools/divsqrt_nvdisasm_check.sh
  *   --digest        prints the SHA-256 of each emitted kernel
  *   --host-sqrt-all host model of SQRT on all 2^32 inputs
@@ -21,6 +37,7 @@
 #include "omega_blackwell_encoder.h"
 #include "omega_blackwell_qmd.h"
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
@@ -28,6 +45,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+/* 0644, not fopen's 0666 & ~umask: a dumped kernel or listing is never world-writable */
+static FILE *create_0644(const char *path, const char *mode) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    FILE *f = fd >= 0 ? fdopen(fd, mode) : NULL;
+    if (fd >= 0 && !f) close(fd);
+    return f;
+}
 
 static int g_pass, g_fail;
 static void check(int ok, const char *id) {
@@ -309,15 +335,15 @@ static int dump(const char *dir) {
         uint8_t code[OMEGA_DS_MAX_CODE_BYTES];
         size_t len = 0;
         char path[512];
-        static const char *const NM[OMEGA_DS_OP_COUNT] = { "div", "sqrt", "exp2", "log2", "sigmoid", "tanh", "sin", "cos", "erf", "gelu", "rsqrt" };
+        static const char *const NM[OMEGA_DS_OP_COUNT] = { "div", "sqrt", "exp2", "log2", "sigmoid", "tanh", "sin", "cos", "erf", "gelu", "rsqrt", "exp", "log" };
         const char *nm = NM[op];
         if (build((OmegaDsOp)op, code, &len) != 0 || omega_ds_listing((OmegaDsOp)op, lst, sizeof(lst)) != 0) return 1;
         snprintf(path, sizeof(path), "%s/%s.bin", dir, nm);
-        FILE *f = fopen(path, "wb");
+        FILE *f = create_0644(path, "wb");
         if (!f || fwrite(code, 1, len, f) != len) return 1;
         fclose(f);
         snprintf(path, sizeof(path), "%s/%s.lst", dir, nm);
-        f = fopen(path, "w");
+        f = create_0644(path, "w");
         if (!f || fputs(lst, f) < 0) return 1;
         fclose(f);
     }

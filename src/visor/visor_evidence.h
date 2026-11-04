@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* Omega Visor V1 - lane 4: evidence (receipt) inspection.
  *
  * Reads receipt files under an evidence root directly (never includes
@@ -35,6 +51,9 @@
 #define VISOR_EVIDENCE_MAX_ITEMS 16
 #define VISOR_EVIDENCE_MAX_UNPARSED_PATHS 8
 #define VISOR_EVIDENCE_MAX_FILE_BYTES (256u * 1024u)
+/* Walk cap: regular files kept per scan. Past it the scan keeps the lexicographically
+ * smallest paths (never the first ones readdir returned) and sets truncated. */
+#define VISOR_EVIDENCE_MAX_FILES ((size_t)131072)
 
 typedef enum {
     VISOR_QUAL_UNKNOWN, VISOR_QUAL_SIMULATED, VISOR_QUAL_HOST, VISOR_QUAL_QEMU, VISOR_QUAL_SILICON
@@ -73,8 +92,12 @@ typedef struct {
 
 const char *visor_qual_scope_name(VisorQualScope s);
 
-/* All receipts under root, depth-first, sorted by path. -1 if root unreadable. */
+/* All receipts under root, depth-first, sorted by path. -1 if root unreadable or the
+ * path list cannot be allocated. */
 int visor_evidence_scan(const char *evidence_root, VisorEvidenceView *out);
+/* Sets the walk cap (0 restores VISOR_EVIDENCE_MAX_FILES); returns the previous cap.
+ * Tests lower it to prove the cap keeps the same files for any readdir order. */
+size_t visor_evidence_set_max_files(size_t cap);
 /* Receipts whose bytes mention the id's 64-hex form (semantic, realization or
  * machine id, any nesting). count==0 means "no evidence" and returns 0. */
 int visor_evidence_for_id(const char *evidence_root, const SemanticId *id, VisorEvidenceView *out);

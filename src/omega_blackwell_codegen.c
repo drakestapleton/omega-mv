@@ -1,14 +1,33 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "omega_blackwell_codegen.h"
 #include "omega_blackwell_submit.h"
 #include "sha256.h"
+#include "omega_path_check.h"
 #include <string.h>
 /* native v1 P07 cut A.2 (aienos#286, docs/numeric/OMEGA_GPU_NATIVE_BOUNDARY.md): with OMEGA_GPU_NO_POSIX this file
  * builds -ffreestanding. Code generation then runs only through the allocation-free entry points
  * (omega_blackwell_kernel_encode_into: the caller supplies the code buffer and its capacity); the allocating
  * generators, their diagnostics and the printing variation self-test exist only in the hosted build. */
 #ifndef OMEGA_GPU_NO_POSIX
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #define BW_DIAG(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define BW_DIAG(...) ((void)0)
@@ -141,10 +160,11 @@ int omega_bw_regalloc_solve(BlackwellIRProgram *prog) {
     /*
      * Bounded deterministic linear-scan register allocator.
      * Computes genuine live intervals across virtual registers and assigns
-     * available physical GPRs (R2..R127) and UGPRs (UR4..UR31).
+     * available physical GPRs (R2..R127, or up to the program's opt-in gpr_limit) and UGPRs (UR4..UR31).
      * Enforces even-alignment and dual-register reservation for 64-bit pairs.
      */
-    bool gpr_busy[BW_PHYS_GPR_MAX];
+    const int gpr_lim = ra->gpr_limit ? (int)ra->gpr_limit : BW_PHYS_GPR_MAX;
+    bool gpr_busy[BW_PHYS_GPR_HW_LIMIT];
     memset(gpr_busy, 0, sizeof(gpr_busy));
 
     int max_phys_used = BW_PHYS_GPR_START;
@@ -178,9 +198,9 @@ int omega_bw_regalloc_solve(BlackwellIRProgram *prog) {
         for (int p = 0; p < ra->num_vregs; p++) {
             if (ra->intervals[p].active && ra->intervals[p].last_use < iv->first_def) {
                 int freed = ra->intervals[p].phys_reg;
-                if (freed >= 0 && freed < BW_PHYS_GPR_MAX) {
+                if (freed >= 0 && freed < gpr_lim) {
                     uint32_t bsize = ra->intervals[p].bundle_size ? ra->intervals[p].bundle_size : (ra->intervals[p].is_pair ? 2 : (ra->intervals[p].is_quad ? 4 : 1));
-                    for (uint32_t k = 0; k < bsize && (freed + (int)k) < BW_PHYS_GPR_MAX; k++) {
+                    for (uint32_t k = 0; k < bsize && (freed + (int)k) < gpr_lim; k++) {
                         gpr_busy[freed + k] = false;
                     }
                 }
@@ -194,7 +214,7 @@ int omega_bw_regalloc_solve(BlackwellIRProgram *prog) {
         if (bsize == 4) {
             /* 128-bit quad requires 4-alignment and 4 contiguous free registers */
             int start = (BW_PHYS_GPR_START + 3) & ~3;
-            for (int p = start; p <= BW_PHYS_GPR_MAX - 4; p += 4) {
+            for (int p = start; p <= gpr_lim - 4; p += 4) {
                 if (!gpr_busy[p] && !gpr_busy[p + 1] && !gpr_busy[p + 2] && !gpr_busy[p + 3]) {
                     assigned = p;
                     for (int k = 0; k < 4; k++) gpr_busy[p + k] = true;
@@ -204,7 +224,7 @@ int omega_bw_regalloc_solve(BlackwellIRProgram *prog) {
         } else if (bsize == 2) {
             /* 64-bit pair requires even alignment and contiguous free registers */
             int start = (BW_PHYS_GPR_START + 1) & ~1;
-            for (int p = start; p <= BW_PHYS_GPR_MAX - 2; p += 2) {
+            for (int p = start; p <= gpr_lim - 2; p += 2) {
                 if (!gpr_busy[p] && !gpr_busy[p + 1]) {
                     assigned = p;
                     gpr_busy[p] = true;
@@ -213,7 +233,7 @@ int omega_bw_regalloc_solve(BlackwellIRProgram *prog) {
                 }
             }
         } else {
-            for (int p = BW_PHYS_GPR_START; p < BW_PHYS_GPR_MAX; p++) {
+            for (int p = BW_PHYS_GPR_START; p < gpr_lim; p++) {
                 if (!gpr_busy[p]) {
                     assigned = p;
                     gpr_busy[p] = true;
@@ -259,7 +279,24 @@ int omega_bw_regalloc_solve(BlackwellIRProgram *prog) {
     return 0;
 }
 
-static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *ra, uint32_t w[4]) {
+/* ---- sm_121 instruction encoder (aien-dev/CUDApp#79) ---------------------------------------------------
+ * The hosted build encodes through om/encoder/bw_enc_sm121.om: seeded Omega, compiled by the pinned omc and
+ * linked through the omega-bridge native binding src/omega_om_units.c (generated by om/units.sh, never edited
+ * by hand). The C encoder below is migration-pending: it is compiled only
+ *   - in the freestanding build (OMEGA_GPU_NO_POSIX), because the bridge binding needs pthread and mmap and the
+ *     freestanding binding is still a proposal (successor: the same .om unit behind a caller-stack binding);
+ *   - with CUDAPP_MIGRATION_PENDING_C_ENCODER, the differential oracle build (make CUDAPP_ENCODER=c);
+ *   - with CUDAPP_MIGRATION_PENDING_ENCODER_DIFF, which encodes every instruction and program both ways, aborts on
+ *     any byte difference and logs each agreement to $CUDAPP_ENCODER_DIFF_LOG (make CUDAPP_ENCODER=diff).
+ * Successor of the C body: bw_enc_sm121.om; it is deleted once the freestanding binding lands. */
+#if defined(OMEGA_GPU_NO_POSIX) || defined(CUDAPP_MIGRATION_PENDING_C_ENCODER)
+#define BW_ENC_C_PRIMARY 1
+#endif
+#if defined(BW_ENC_C_PRIMARY) && defined(CUDAPP_MIGRATION_PENDING_ENCODER_DIFF)
+#error "CUDAPP_MIGRATION_PENDING_ENCODER_DIFF needs the .om encoder: not with OMEGA_GPU_NO_POSIX or the C encoder"
+#endif
+#if defined(BW_ENC_C_PRIMARY) || defined(CUDAPP_MIGRATION_PENDING_ENCODER_DIFF)
+static int bw_c_encode_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *ra, uint32_t w[4]) {
     memset(w, 0, 16);
 
     int dst = (insn->dst_vreg >= 0) ? (ra->vreg_to_phys[insn->dst_vreg] + insn->dst_subreg) : 0;
@@ -371,22 +408,26 @@ static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *
                 w[0] = 0x7c0c | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
                 w[1] = (uint32_t)(ureg & 0xff);
                 w[2] = 0x0bf06070;
-                w[3] = 0x002fda00;
+                w[3] = insn->control ? insn->control : 0x002fda00;
             } else {
                 w[0] = 0x780c | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
                 w[1] = insn->imm;
                 w[2] = 0x03f06270;
-                w[3] = 0x001fda00;
+                w[3] = insn->control ? insn->control : 0x001fda00;
             }
             break;
 
-        case BW_IR_LDG_E:
-            /* LDG.E Rd, desc[URd][Ra.64] */
+        case BW_IR_LDG_E: {
+            /* LDG.E Rd, desc[URd][Ra.64+imm]: the 32-bit size (4) of the LDG.E.64 / LDG.E.128 words below; imm as there
+             * (signed 24-bit byte offset at bits 40..63, w[1] bits 8..31), unchanged words when imm is 0. */
+            int32_t off = (int32_t)insn->imm;
+            if (off < -(1 << 23) || off >= (1 << 23)) return -1;
             w[0] = 0x7981 | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
-            w[1] = (uint32_t)(ureg & 0xff);
+            w[1] = (uint32_t)(ureg & 0xff) | (((uint32_t)off & 0xffffffU) << 8);
             w[2] = 0x0c1e1900;
             w[3] = insn->control ? insn->control : 0x000f2200;
             break;
+        }
 
         case BW_IR_STG_E: {
             /* STG.E desc[URd][Ra.64+imm], Rb. imm = signed 24-bit byte offset at bits 40..63 (w[1] bits
@@ -414,7 +455,7 @@ static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *
             w[0] = 0x7210 | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
             w[1] = (uint32_t)(src2 & 0xff);
             w[2] = 0x07ffe0ff;
-            w[3] = 0x010fca00;
+            w[3] = insn->control ? insn->control : 0x010fca00; /* omega-mv#545: the emitter's waits, not a fixed SB4 wait */
             break;
 
         case BW_IR_HMMA_F16:
@@ -529,6 +570,17 @@ static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *
             w[3] = insn->control ? insn->control : 0x00321e00;
             break;
 
+        case BW_IR_ATOMG_ADD_F32_STRONG_SYS:
+        case BW_IR_ATOMG_ADD_F32_STRONG_GPU:
+            /* ATOMG.E.ADD.F32.FTZ.RN.STRONG.{SYS,GPU} PT, Rd|RZ, desc[UR][Ra.64], Rb (omega_blackwell_verify_codegen_fixtures_atomf32).
+             * Float opcode 0x9a3; w2 bit 26 selects the desc[] form, type 9 (w2 bits 9..12) is F32.FTZ.RN, order (w2 bits
+             * 13..16) 0xa = SYS, 0x7 = GPU. No destination vreg encodes RZ (the generic default 0 would clobber R0). */
+            w[0] = 0x79a3 | ((uint32_t)(insn->dst_vreg < 0 ? 0xff : (dst & 0xff)) << 16) | ((uint32_t)(src1 & 0xff) << 24);
+            w[1] = (uint32_t)(src2 & 0xff) | 0x80000000u;
+            w[2] = (insn->op == BW_IR_ATOMG_ADD_F32_STRONG_GPU ? 0x0c1ef300u : 0x0c1f5300u) | (uint32_t)(ureg & 0xff);
+            w[3] = insn->control ? insn->control : 0x00321e00;
+            break;
+
         case BW_IR_ISETP_GE_U32:
             /* ISETP.GE.U32.AND P0, PT, Ra, Rb, PT. Checked with nvdisasm -b SM121. */
             w[0] = 0x720c | ((uint32_t)(src1 & 0xff) << 24);
@@ -633,6 +685,14 @@ static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *
             w[3] = insn->control ? insn->control : 0x000e2400;
             break;
 
+        case BW_IR_MUFU_LG2:
+            /* MUFU.LG2 Rd, Ra (nvdisasm 13.0 -b SM121 decodes sub-op 0x0c00 as MUFU.LG2) */
+            w[0] = 0x7308U | ((uint32_t)(dst & 0xff) << 16);
+            w[1] = (uint32_t)(src1 & 0xff);
+            w[2] = 0x00000c00;
+            w[3] = insn->control ? insn->control : 0x000e2400;
+            break;
+
         case BW_IR_MUFU_RSQ:
             /* MUFU.RSQ Rd, Ra */
             w[0] = 0x7308U | ((uint32_t)(dst & 0xff) << 16);
@@ -647,6 +707,24 @@ static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *
             w[1] = 0x08001f00U | (((uint32_t)insn->imm & 0x1f) << 21);
             w[2] = 0x000e0000;
             w[3] = insn->control ? insn->control : 0x000e2400;
+            break;
+
+        case BW_IR_SHFL_BFLY:
+            /* SHFL.BFLY PT, Rd, Ra, lane, 0x1f: SHFL.DOWN with bit 58 (w[1] bit 26) set
+             * (omega_blackwell_verify_codegen_fixtures_bfly_f2fp) */
+            w[0] = 0x7f89U | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
+            w[1] = 0x0c001f00U | (((uint32_t)insn->imm & 0x1f) << 21);
+            w[2] = 0x000e0000;
+            w[3] = insn->control ? insn->control : 0x000e2400;
+            break;
+
+        case BW_IR_F2FP_BF16_PACK:
+            /* F2FP.BF16.F32.PACK_AB Rd, Ra, Rb (omega_blackwell_verify_codegen_fixtures_bfly_f2fp). The default control
+             * is FMNMX's: the kernels emitted this as a patched FMNMX_MAX before R5 and their bytes must not move. */
+            w[0] = 0x723eU | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
+            w[1] = (uint32_t)(src2 & 0xff);
+            w[2] = 0x000010ff;
+            w[3] = insn->control ? insn->control : 0x004fc400;
             break;
 
         case BW_IR_LDS:
@@ -669,7 +747,7 @@ static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *
             w[0] = insn->predicate_p0 ? 0x0000094d : 0x0000794d;
             w[1] = 0x00000000;
             w[2] = 0x03800000;
-            w[3] = 0x000fea00;
+            w[3] = insn->control ? insn->control : 0x000fea00;
             break;
 
         case BW_IR_BRA: {
@@ -818,6 +896,111 @@ static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *
     }
     return 0;
 }
+#endif /* C encoder, migration-pending */
+
+#ifdef BW_ENC_C_PRIMARY
+static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *ra, uint32_t w[4]) {
+    return bw_c_encode_insn(insn, ra, w);
+}
+#else
+#include "omega_native.h"
+/* The .om unit reads the IR as 8 ulongs per instruction and the allocation as one 288-entry table; these are the
+ * layouts its source documents (om/encoder/bw_enc_sm121.om), so the enum values and sizes are pinned here. */
+#define BW_OM_INS_LEN 8192u  /* BW_MAX_IR_INSNS * 8 */
+#define BW_OM_PHYS_LEN 288u  /* BW_MAX_VREGS + BW_MAX_UVREGS */
+#define BW_OM_CODE_LEN 16384u /* BW_MAX_IR_INSNS * 16 */
+_Static_assert(BW_MAX_IR_INSNS == 1024 && BW_MAX_VREGS == 256 && BW_MAX_UVREGS == 32, "bw_enc_sm121.om array sizes");
+_Static_assert(BW_IR_NOP == 0 && BW_IR_MOV_RZ == 1 && BW_IR_MOV_IMM == 2 && BW_IR_S2R == 3 && BW_IR_LDC == 4 &&
+               BW_IR_LDC64 == 5 && BW_IR_LDCU == 6 && BW_IR_LDCU64 == 7 && BW_IR_IMAD == 8 && BW_IR_IMAD_WIDE == 9 &&
+               BW_IR_ISETP_GE == 10 && BW_IR_LDG_E == 11 && BW_IR_STG_E == 12 && BW_IR_STG_EF == 13 &&
+               BW_IR_IADD3 == 14 && BW_IR_HMMA_F16 == 15 && BW_IR_HMMA_BF16 == 16 && BW_IR_SHF_R == 17 &&
+               BW_IR_LOP3_AND == 18 && BW_IR_LDG_E_U16 == 19 && BW_IR_LDG_STRONG_SYS == 20 && BW_IR_LDG_MMIO == 21 &&
+               BW_IR_STG_STRONG_SYS == 22 && BW_IR_MEMBAR_ALL_SYS == 23 && BW_IR_MEMBAR_SC_SYS == 24 &&
+               BW_IR_CCTL_IVALL == 25 && BW_IR_ATOMG_ADD_STRONG_SYS == 26 && BW_IR_ATOMG_EXCH_STRONG_SYS == 27 &&
+               BW_IR_ISETP_GE_U32 == 28 && BW_IR_LOP3_XOR == 29, "bw_enc_sm121.om opcode numbers 0-29");
+_Static_assert(BW_IR_FADD == 30 && BW_IR_FSUB == 31 && BW_IR_FMUL == 32 && BW_IR_FFMA == 33 && BW_IR_FSETP == 34 &&
+               BW_IR_FSEL == 35 && BW_IR_FMNMX_MIN == 36 && BW_IR_FMNMX_MAX == 37 && BW_IR_I2FP == 38 &&
+               BW_IR_F2I == 39 && BW_IR_MUFU_RCP == 40 && BW_IR_MUFU_RSQ == 41 && BW_IR_SHFL_DOWN == 42 &&
+               BW_IR_LDS == 43 && BW_IR_STS == 44 && BW_IR_EXIT == 45 && BW_IR_BRA == 46 && BW_IR_MUFU_EX2 == 47 &&
+               BW_IR_BAR_SYNC == 48 && BW_IR_LDS32 == 49 && BW_IR_STS32 == 50 && BW_IR_LOP3_LUT == 51 &&
+               BW_IR_SHF_L_U32 == 52 && BW_IR_IMAD_HI_U32 == 53 && BW_IR_BSSY == 54 && BW_IR_BSYNC == 55 &&
+               BW_IR_LDG_E_64 == 56 && BW_IR_LDG_E_128 == 57 && BW_IR_LDS128 == 58 && BW_IR_MUFU_LG2 == 59,
+               "bw_enc_sm121.om opcode numbers 30-59");
+_Static_assert(BW_IR_SHFL_BFLY == 60 && BW_IR_F2FP_BF16_PACK == 61 && BW_IR_ATOMG_ADD_F32_STRONG_SYS == 62 &&
+               BW_IR_ATOMG_ADD_F32_STRONG_GPU == 63, "bw_enc_sm121.om opcode numbers 60-63");
+
+/* Encodes n instructions through the .om unit into code (BW_OM_CODE_LEN bytes). pad != 0 is program mode (NOP
+ * padding to a multiple of 8, at least 32). Returns the bytes written; 0 = refused. */
+static size_t bw_om_encode(const BlackwellIRInsn *insns, size_t n, const OmegaRegAlloc *ra, int pad, uint8_t *code) {
+    if (n > BW_MAX_IR_INSNS) return 0;
+    uint64_t ins[BW_OM_INS_LEN], phys[BW_OM_PHYS_LEN];
+    for (size_t i = 0; i < n; i++) {
+        const BlackwellIRInsn *in = &insns[i];
+        uint64_t *r = &ins[i * 8];
+        r[0] = (uint64_t)(int64_t)(int)in->op;
+        r[1] = (uint64_t)(int64_t)in->dst_vreg;
+        r[2] = (uint64_t)(int64_t)in->src1_vreg;
+        r[3] = (uint64_t)(int64_t)in->src2_vreg;
+        r[4] = (uint64_t)(int64_t)in->src3_vreg;
+        r[5] = (uint64_t)(int64_t)in->ureg;
+        r[6] = (uint64_t)in->imm | (uint64_t)in->control << 32;
+        r[7] = (uint64_t)in->is_uniform | (uint64_t)in->predicate_p0 << 1 | (uint64_t)in->predicate_not << 2 |
+               (uint64_t)in->bar_reg << 8 | (uint64_t)in->dst_subreg << 16 | (uint64_t)in->src1_subreg << 24 |
+               (uint64_t)in->src2_subreg << 32 | (uint64_t)in->src3_subreg << 40;
+    }
+    for (size_t i = n * 8; i < BW_OM_INS_LEN; i++) ins[i] = 0;
+    for (int i = 0; i < BW_MAX_VREGS; i++) phys[i] = (uint64_t)(int64_t)ra->vreg_to_phys[i];
+    for (int i = 0; i < BW_MAX_UVREGS; i++) phys[BW_MAX_VREGS + i] = (uint64_t)(int64_t)ra->uvreg_to_phys[i];
+    uint64_t bytes = 0;
+    if (omega_bw_enc_sm121(&bytes, ins, BW_OM_INS_LEN, phys, BW_OM_PHYS_LEN, (uint64_t)n, pad ? 1u : 0u, code,
+                           BW_OM_CODE_LEN) != OMEGA_OK)
+        return 0;
+    return (size_t)bytes;
+}
+
+#ifdef CUDAPP_MIGRATION_PENDING_ENCODER_DIFF
+/* One line per agreement, appended; any disagreement aborts the process after naming it. */
+static void bw_enc_diff_note(const char *what, size_t insns, const uint8_t *code, size_t len, int agree) {
+    char hex[17] = "-";
+    if (len) {
+        uint8_t d[SHA256_DIGEST_SIZE]; sha256_hash(code, len, d);
+        for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", (unsigned)d[i]);
+    }
+    const char *path = getenv("CUDAPP_ENCODER_DIFF_LOG");
+    if (path && path[0]) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            char line[160];
+            int k = snprintf(line, sizeof line, "%s insns=%zu bytes=%zu sha16=%s %s\n", what, insns, len, hex,
+                             agree ? "SAME" : "DIFFER");
+            if (k > 0 && write(fd, line, (size_t)k) != k) BW_DIAG("encoder diff: short log write\n");
+            close(fd);
+        }
+    }
+    if (!agree) {
+        BW_DIAG("ENCODER DIFF: .om and C encoders disagree (%s, %zu insns)\n", what, insns);
+        abort();
+    }
+}
+#endif
+
+static int encode_single_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *ra, uint32_t w[4]) {
+    uint8_t code[BW_OM_CODE_LEN];
+    int rc = bw_om_encode(insn, 1, ra, 0, code) == 16 ? 0 : -1;
+    memset(w, 0, 16);
+    if (rc == 0)
+        for (int k = 0; k < 4; k++)
+            w[k] = (uint32_t)code[4 * k] | (uint32_t)code[4 * k + 1] << 8 | (uint32_t)code[4 * k + 2] << 16 |
+                   (uint32_t)code[4 * k + 3] << 24;
+#ifdef CUDAPP_MIGRATION_PENDING_ENCODER_DIFF
+    uint32_t c[4];
+    int crc = bw_c_encode_insn(insn, ra, c);
+    bw_enc_diff_note("insn", 1, rc == 0 ? code : NULL, rc == 0 ? 16 : 0,
+                     crc == rc && (rc != 0 || memcmp(c, w, 16) == 0));
+#endif
+    return rc;
+}
+#endif
 
 /* Prime race cut (2026-10-05): golden words for LOP3_LUT, SHF_L_U32 and IMAD_HI_U32.
  * Each expected (w0, w1, w2) is the low 96 bits of an instruction nvcc 13.0.88 emitted
@@ -963,6 +1146,86 @@ int omega_blackwell_verify_codegen_fixtures_reconv(void) {
     return 0;
 }
 
+
+/* Training R5 (2026-10-15): golden words for SHFL.BFLY and F2FP.BF16.F32.PACK_AB, the two instructions the prefill
+ * kernels emitted as placeholders patched after encoding until R5. Oracle: nvcc 13.0.88 -arch=sm_121, cuobjdump -sass,
+ * sealed in evidence/OWN30B-T3-TC-PEAK-BW-5faa0f70-20261013T2236Z/fa_ops.{cu,sass} (low 64-bit word, then high; the top
+ * 23 bits of the high word are the control word and are not compared):
+ *   SHFL.BFLY PT, R5, R0, 0x1, 0x1f ;      0x0c201f0000057f89 0x004e2800000e0000
+ *   SHFL.BFLY PT, R7, R8, 0x1, 0x1f ;      0x0c201f0008077f89 0x008e6200000e0000
+ *   SHFL.BFLY PT, R4, R9, 0x2, 0x1f ;      0x0c401f0009047f89 0x000e2800000e0000
+ *   SHFL.BFLY PT, R6, R11, 0x2, 0x1f ;     0x0c401f000b067f89 0x000e6200000e0000
+ *   F2FP.BF16.F32.PACK_AB R9, R3, R0 ;     0x000000000309723e 0x000fe200000010ff
+ *   F2FP.BF16.F32.PACK_AB R13, R13, R10 ;  0x0000000a0d0d723e 0x000fe400000010ff
+ * SHFL.BFLY is SHFL.DOWN (oracle words in omega_numeric.c, lanes 16 .. 1) with bit 58 set (Mesa NAK mode field 58..59: Idx 0,
+ * Up 1, Down 2, Bfly 3; same lane field 53..57); the lane check below covers every lane 0 .. 31 against that rule. 0 = all good. */
+int omega_blackwell_verify_codegen_fixtures_bfly_f2fp(void) {
+    static const struct {
+        BlackwellIROpcode op; int d, a, b; uint32_t imm; uint32_t w0, w1, w2; const char *text;
+    } fx[] = {
+        { BW_IR_SHFL_BFLY, 5, 0, -1, 1, 0x00057f89U, 0x0c201f00U, 0x000e0000U, "SHFL.BFLY PT, R5, R0, 0x1, 0x1f" },
+        { BW_IR_SHFL_BFLY, 7, 8, -1, 1, 0x08077f89U, 0x0c201f00U, 0x000e0000U, "SHFL.BFLY PT, R7, R8, 0x1, 0x1f" },
+        { BW_IR_SHFL_BFLY, 4, 9, -1, 2, 0x09047f89U, 0x0c401f00U, 0x000e0000U, "SHFL.BFLY PT, R4, R9, 0x2, 0x1f" },
+        { BW_IR_SHFL_BFLY, 6, 11, -1, 2, 0x0b067f89U, 0x0c401f00U, 0x000e0000U, "SHFL.BFLY PT, R6, R11, 0x2, 0x1f" },
+        { BW_IR_F2FP_BF16_PACK, 9, 3, 0, 0, 0x0309723eU, 0x00000000U, 0x000010ffU, "F2FP.BF16.F32.PACK_AB R9, R3, R0" },
+        { BW_IR_F2FP_BF16_PACK, 13, 13, 10, 0, 0x0d0d723eU, 0x0000000aU, 0x000010ffU, "F2FP.BF16.F32.PACK_AB R13, R13, R10" },
+    };
+    uint32_t w[4];
+    for (int i = 0; i < (int)(sizeof fx / sizeof fx[0]); i++) {
+        BlackwellIRInsn in;
+        memset(&in, 0, sizeof in);
+        in.op = fx[i].op; in.dst_vreg = fx[i].d; in.src1_vreg = fx[i].a; in.src2_vreg = fx[i].b;
+        in.src3_vreg = -1; in.ureg = -1; in.imm = fx[i].imm;
+        if (omega_blackwell_encode_one(&in, w) != 0) return -(2 * i + 1);
+        if (w[0] != fx[i].w0 || w[1] != fx[i].w1 || w[2] != fx[i].w2) return -(2 * i + 2);
+    }
+    for (uint32_t lane = 0; lane < 32; lane++) {
+        BlackwellIRInsn in; uint32_t d[4];
+        memset(&in, 0, sizeof in);
+        in.op = BW_IR_SHFL_DOWN; in.dst_vreg = 9; in.src1_vreg = 2; in.src2_vreg = in.src3_vreg = in.ureg = -1; in.imm = lane;
+        if (omega_blackwell_encode_one(&in, d) != 0) return -100;
+        in.op = BW_IR_SHFL_BFLY;
+        if (omega_blackwell_encode_one(&in, w) != 0) return -101;
+        if (w[0] != d[0] || w[1] != (d[1] | 0x04000000U) || w[2] != d[2] || w[3] != d[3]) return -102;
+    }
+    return 0;
+}
+
+/* Training R5 part 2: f32 global atomic add. Starting map from Mesa NAK sm70_encode.rs (a08a0b9, sm >= 90 float ATOMG;
+ * Mesa ranges are half-open): opcode 0x9a3, op 87..90 (Add 0, Min 2, Max 4), type 73..76 (F32 = 9, which is .FTZ.RN;
+ * 12 decodes as .RN without FTZ), order 77..80 (Strong System 0xa, Strong GPU 0x7), pred-dst 81..83 = PT, eviction
+ * 84..86 = 1, bit 63 = Ra.64, bit 91 = UR form. Then every word below was decoded offline with nvdisasm -b SM121
+ * (CUDA 13.0) to the text shown. Where Mesa and the decoder disagree the decoder (and the chip probe) win: this word
+ * sets bit 90 (w2 bit 26), which falls inside Mesa's op field, yet it decodes as .ADD with desc[UR][R.64]; without it
+ * the same word decodes as [R.64+UR]. (Bit 88 decodes as .MIN, so the op field is there.)
+ *   0x80000005020479a3 0x00321e000c1f5306  ATOMG.E.ADD.F32.FTZ.RN.STRONG.SYS PT, R4, desc[UR6][R2.64], R5 ;
+ *   0x800000070a0979a3 0x00321e000c1f5304  ATOMG.E.ADD.F32.FTZ.RN.STRONG.SYS PT, R9, desc[UR4][R10.64], R7 ;
+ *   0x8000000502ff79a3 0x00321e000c1f5306  ATOMG.E.ADD.F32.FTZ.RN.STRONG.SYS PT, RZ, desc[UR6][R2.64], R5 ;
+ *   0x80000005020479a3 0x00321e000c1ef306  ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, R4, desc[UR6][R2.64], R5 ;
+ *   0x800000070a0979a3 0x00321e000c1ef304  ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, R9, desc[UR4][R10.64], R7 ;
+ *   0x8000000502ff79a3 0x00321e000c1ef306  ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, RZ, desc[UR6][R2.64], R5 ;
+ * Rows with d = -1 (no destination vreg) must encode RZ, not R0. Chip proof: tests/gpu_atomf32_probe_test.c. 0 = all good. */
+int omega_blackwell_verify_codegen_fixtures_atomf32(void) {
+    static const struct { BlackwellIROpcode op; int d, a, b, u; uint32_t w0, w1, w2; } fx[] = {
+        { BW_IR_ATOMG_ADD_F32_STRONG_SYS, 4, 2, 5, 6, 0x020479a3U, 0x80000005U, 0x0c1f5306U },
+        { BW_IR_ATOMG_ADD_F32_STRONG_SYS, 9, 10, 7, 4, 0x0a0979a3U, 0x80000007U, 0x0c1f5304U },
+        { BW_IR_ATOMG_ADD_F32_STRONG_SYS, 255, 2, 5, 6, 0x02ff79a3U, 0x80000005U, 0x0c1f5306U },
+        { BW_IR_ATOMG_ADD_F32_STRONG_SYS, -1, 2, 5, 6, 0x02ff79a3U, 0x80000005U, 0x0c1f5306U },
+        { BW_IR_ATOMG_ADD_F32_STRONG_GPU, 4, 2, 5, 6, 0x020479a3U, 0x80000005U, 0x0c1ef306U },
+        { BW_IR_ATOMG_ADD_F32_STRONG_GPU, 9, 10, 7, 4, 0x0a0979a3U, 0x80000007U, 0x0c1ef304U },
+        { BW_IR_ATOMG_ADD_F32_STRONG_GPU, -1, 2, 5, 6, 0x02ff79a3U, 0x80000005U, 0x0c1ef306U },
+    };
+    uint32_t w[4];
+    for (int i = 0; i < (int)(sizeof fx / sizeof fx[0]); i++) {
+        BlackwellIRInsn in;
+        memset(&in, 0, sizeof in);
+        in.op = fx[i].op; in.dst_vreg = fx[i].d; in.src1_vreg = fx[i].a; in.src2_vreg = fx[i].b;
+        in.src3_vreg = -1; in.ureg = fx[i].u;
+        if (omega_blackwell_encode_one(&in, w) != 0) return -(2 * i + 1);
+        if (w[0] != fx[i].w0 || w[1] != fx[i].w1 || w[2] != fx[i].w2 || w[3] != 0x00321e00U) return -(2 * i + 2);
+    }
+    return 0;
+}
 /* FB-1 cut 4: word-level fixtures for the four additive ops (checked against the
  * nvdisasm decodes recorded in docs/numeric/FB1_CUT4_ELEMENTWISE.md). 0 = all good. */
 int omega_blackwell_verify_codegen_fixtures_fb1cut4(void) {
@@ -994,15 +1257,44 @@ int omega_blackwell_verify_codegen_fixtures_fb1cut4(void) {
     return 0;
 }
 
-int omega_bw_encode_program(const BlackwellIRProgram *prog, uint8_t *code_buf, size_t max_len, size_t *out_len) {
-    if (!prog || !code_buf || !out_len) return -1;
+/* Kernel capture (C6 of docs/OMEGA.md, tools/sm121dis): with OMEGA_KERNEL_DUMP_DIR set, every encoded kernel is written
+ * there as <first 16 hex of its SHA-256>.bin, once per distinct body, so the disassembler can be checked against nvdisasm on
+ * every kernel the library builds. Unset (the normal case) it does nothing; the freestanding build has no files. */
+void omega_kernel_dump(const uint8_t *code, size_t len) {
+#ifndef OMEGA_GPU_NO_POSIX
+    const char *env = getenv("OMEGA_KERNEL_DUMP_DIR");
+    if (!env || !env[0] || !code || !len) return;
+    /* Only the checked copy (src/omega_path_check.h) is opened; a refused directory is a diagnostic, which
+     * tools/sm121dis/corpus.sh fails on, never a silent skip. */
+    char dir[4000];
+    if (omega_path_copy(dir, sizeof dir, env) != 0) {
+        BW_DIAG("omega_kernel_dump: OMEGA_KERNEL_DUMP_DIR refused (src/omega_path_check.h)\n");
+        return;
+    }
+    uint8_t d[SHA256_DIGEST_SIZE]; sha256_hash(code, len, d);
+    char path[4096];
+    int n = snprintf(path, sizeof path, "%s/%02x%02x%02x%02x%02x%02x%02x%02x.bin",
+                     dir, (unsigned)d[0], (unsigned)d[1], (unsigned)d[2], (unsigned)d[3],
+                     (unsigned)d[4], (unsigned)d[5], (unsigned)d[6], (unsigned)d[7]);
+    if (n < 0 || (size_t)n >= sizeof path) return;
+    /* Private, exclusive creation: an existing body or symlink is left alone. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(path); BW_DIAG("omega_kernel_dump: write failed, removed %s\n", path); return; }
+    /* A body cut short (a full disk) must not stay under its full-content name: it would be compared as a smaller kernel
+     * and, created O_EXCL, never rewritten. tools/sm121dis/corpus.sh fails on these diagnostics. */
+    int bad = fwrite(code, 1, len, f) != len;
+    if (fclose(f) != 0) bad = 1;
+    if (bad) { unlink(path); BW_DIAG("omega_kernel_dump: write failed, removed %s\n", path); }
+#else
+    (void)code; (void)len;
+#endif
+}
 
-    size_t padded_insns = (prog->count + 7) & ~7ULL;
-    if (padded_insns < 32) padded_insns = 32;
-
-    size_t req_bytes = padded_insns * 16;
-    if (max_len < req_bytes) return -1;
-
+#ifdef BW_ENC_C_PRIMARY
+static int bw_encode_program_bytes(const BlackwellIRProgram *prog, uint8_t *code_buf, size_t req_bytes) {
+    size_t padded_insns = req_bytes / 16;
     uint8_t *p = code_buf;
     for (size_t i = 0; i < padded_insns; i++) {
         uint32_t w[4];
@@ -1017,30 +1309,53 @@ int omega_bw_encode_program(const BlackwellIRProgram *prog, uint8_t *code_buf, s
             w[2] = 0x00000000;
             w[3] = 0x000fc000;
         }
-
-        p[0] = (uint8_t)(w[0] & 0xff);
-        p[1] = (uint8_t)((w[0] >> 8) & 0xff);
-        p[2] = (uint8_t)((w[0] >> 16) & 0xff);
-        p[3] = (uint8_t)((w[0] >> 24) & 0xff);
-
-        p[4] = (uint8_t)(w[1] & 0xff);
-        p[5] = (uint8_t)((w[1] >> 8) & 0xff);
-        p[6] = (uint8_t)((w[1] >> 16) & 0xff);
-        p[7] = (uint8_t)((w[1] >> 24) & 0xff);
-
-        p[8] = (uint8_t)(w[2] & 0xff);
-        p[9] = (uint8_t)((w[2] >> 8) & 0xff);
-        p[10] = (uint8_t)((w[2] >> 16) & 0xff);
-        p[11] = (uint8_t)((w[2] >> 24) & 0xff);
-
-        p[12] = (uint8_t)(w[3] & 0xff);
-        p[13] = (uint8_t)((w[3] >> 8) & 0xff);
-        p[14] = (uint8_t)((w[3] >> 16) & 0xff);
-        p[15] = (uint8_t)((w[3] >> 24) & 0xff);
-
+        for (int k = 0; k < 4; k++) {
+            p[4 * k] = (uint8_t)(w[k] & 0xff);
+            p[4 * k + 1] = (uint8_t)((w[k] >> 8) & 0xff);
+            p[4 * k + 2] = (uint8_t)((w[k] >> 16) & 0xff);
+            p[4 * k + 3] = (uint8_t)((w[k] >> 24) & 0xff);
+        }
         p += 16;
     }
+    return 0;
+}
+#else
+static int bw_encode_program_bytes(const BlackwellIRProgram *prog, uint8_t *code_buf, size_t req_bytes) {
+    uint8_t code[BW_OM_CODE_LEN];
+    size_t got = bw_om_encode(prog->insns, prog->count, &prog->regalloc, 1, code);
+    int rc = (got == req_bytes && got != 0) ? 0 : -1;
+#ifdef CUDAPP_MIGRATION_PENDING_ENCODER_DIFF
+    /* The C oracle encodes the same program, instruction by instruction, NOP-padded the same way. */
+#ifdef CUDAPP_ENCODER_DIFF_SELFTEST
+    if (rc == 0) code[0] ^= 1; /* red check of the comparison itself: one flipped bit must abort */
+#endif
+    uint8_t ref[BW_OM_CODE_LEN];
+    int crc = 0;
+    for (size_t i = 0; i < req_bytes / 16 && crc == 0; i++) {
+        uint32_t w[4] = { 0x00007918, 0, 0, 0x000fc000 };
+        if (i < prog->count) crc = bw_c_encode_insn(&prog->insns[i], &prog->regalloc, w);
+        for (int k = 0; k < 16; k++) ref[16 * i + (size_t)k] = (uint8_t)(w[k / 4] >> (8 * (k % 4)));
+    }
+    bw_enc_diff_note("program", prog->count, rc == 0 ? code : NULL, rc == 0 ? req_bytes : 0,
+                     crc == rc && (rc != 0 || memcmp(code, ref, req_bytes) == 0));
+#endif
+    if (rc == 0) memcpy(code_buf, code, req_bytes);
+    return rc;
+}
+#endif
 
+int omega_bw_encode_program(const BlackwellIRProgram *prog, uint8_t *code_buf, size_t max_len, size_t *out_len) {
+    if (!prog || !code_buf || !out_len) return -1;
+
+    size_t padded_insns = (prog->count + 7) & ~7ULL;
+    if (padded_insns < 32) padded_insns = 32;
+
+    size_t req_bytes = padded_insns * 16;
+    if (max_len < req_bytes) return -1;
+
+    if (bw_encode_program_bytes(prog, code_buf, req_bytes) != 0) return -1;
+
+    omega_kernel_dump(code_buf, req_bytes);
     *out_len = req_bytes;
     return 0;
 }
@@ -2537,3 +2852,9 @@ int omega_blackwell_test_codegen_variation(void) {
 /* Declared registers: peak + 2 rounded up to 8 (see omega_blackwell_codegen.h for the chip evidence). */
 uint32_t omega_bw_gpr_declared(uint32_t peak) { return ((peak + 2u + 7u) / 8u) * 8u; }
 int omega_bw_gpr_declared_ok(uint32_t declared, uint32_t peak) { return declared % 8u == 0u && declared >= peak + 2u; }
+
+int omega_bw_ir_set_gpr_limit(BlackwellIRProgram *prog, uint32_t limit) {
+    if (!prog || limit <= BW_PHYS_GPR_MAX || limit > BW_PHYS_GPR_HW_LIMIT) return -1;
+    prog->regalloc.gpr_limit = limit;
+    return 0;
+}
