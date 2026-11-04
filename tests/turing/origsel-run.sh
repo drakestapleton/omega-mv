@@ -163,9 +163,12 @@ streams() {
 # retrain TAG REC ALLOW: the pinned aien-train V2=1 run (trainer and controls) on REC.
 retrain() {
   # The trainer's glue reads pinned objects with git show, so it needs a clone at the pin.
+  # The trainer pins its own compilers (OMC, OMC2), so a caller's OMC for this runner must not reach it;
+  # ORIGSEL_TRAIN_OMC names the trainer's compiler when it is not at the trainer's default path.
   [ -d "$BUILD/train" ] || { git clone -q --no-hardlinks "$TRAIN" "$BUILD/train" && git -C "$BUILD/train" checkout -q "$TRAINC"; } || return 1
   [ "$(git -C "$BUILD/train" rev-parse HEAD)" = "$TRAINC" ] || return 1
-  V2=1 RECORDS="$2" ALLOW="$3" OUT="$OUT/train-$1" BUILD="$BUILD/train-$1" sh "$BUILD/train/tests/si19/run-select.sh" \
+  env -u OMC -u OMC2 ${ORIGSEL_TRAIN_OMC:+OMC="$ORIGSEL_TRAIN_OMC"} \
+    V2=1 RECORDS="$2" ALLOW="$3" OUT="$OUT/train-$1" BUILD="$BUILD/train-$1" sh "$BUILD/train/tests/si19/run-select.sh" \
     > "$OUT/train-$1.log" 2>&1 || return 2
   grep -q SI19_SELECT_V2_RUN_PASS "$OUT/train-$1.log" || return 3
 }

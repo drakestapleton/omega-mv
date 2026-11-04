@@ -30,5 +30,10 @@ MODE=measure RECORDS=<collected file> ALLOW=<allow list> [IMAGES=<V2=1 build dir
 V1="<v1 owner file> <v1 sealed file>" OUT=<outside the tree> nice -n 19 sh tests/turing/origsel-run.sh
 ```
 
+`OMC` names this evaluator's compiler (default `seed/out/omc`); its sha256 must equal the `omc` line of
+`origsel.pin`, so on a tree whose `seed/out/omc` has moved past the pin, pass the pinned build. The
+pinned trainer checks its own compiler pin and never sees this `OMC`; `ORIGSEL_TRAIN_OMC` names the
+trainer's compiler when it is not at the trainer's default path.
+
 Status words: QUALIFIED_IMPROVEMENT, NO_IMPROVEMENT(COST_BOUND), NO_IMPROVEMENT,
 INCONCLUSIVE(UNDERPOWERED), INCONCLUSIVE, INVALID, BLOCKED. Host-only: GB10 NOT_RUN, energy NOT_MEASURED.
