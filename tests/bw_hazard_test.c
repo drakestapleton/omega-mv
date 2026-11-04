@@ -10,9 +10,12 @@
  *   4. sweep: every generator over its accepted shapes (production kernels, mutant 0), encoded and patched as the
  *      launchers do; every finding is printed and must be on the triaged list below.
  *
- * --nvdisasm: additionally cross-checks the decoder against nvdisasm (offline oracle, CUDA 13 -b SM121) on every
- * distinct kernel: the base registers each instruction names must be the ones the decoder found. */
+ * --disasm: additionally cross-checks the decoder against Omega's own sm_121 disassembler (src/omega_sm121_disasm.c,
+ * in process) on every distinct kernel: the base registers each instruction names must be the ones the decoder found.
+ * The disassembler is checked word for word against nvdisasm by test-sm121dis; this test never calls nvdisasm (bar C6
+ * of docs/OMEGA.md: every check that called nvdisasm calls ours). */
 #include "omega_bw_hazard.h"
+#include "omega_sm121_disasm.h"
 #include "omega_blackwell_codegen.h"
 #include "omega_blackwell_codegen_moe.h"
 #include "omega_blackwell_codegen_moe2.h"
@@ -38,7 +41,7 @@
 #include <string.h>
 #include <unistd.h>
 
-static int g_checks, g_failed, g_nvdisasm;
+static int g_checks, g_failed, g_disasm;
 static const char *g_dump_dir; /* --dump DIR: write each distinct kernel with findings as DIR/<family>-<n>.bin (triage) */
 #define CHECK(c, ...) do { g_checks++; if (!(c)) { g_failed++; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
@@ -348,7 +351,7 @@ static Known g_known[] = {
 
 static uint64_t fnv(const uint8_t *p, size_t n) { uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; } return h; }
 
-static void nvdisasm_cross_check(const char *family, const char *variant, const uint8_t *code, size_t len);
+static void disasm_cross_check(const char *family, const char *variant, const uint8_t *code, size_t len);
 
 static void sweep_bytes(const char *family, const char *variant, const uint8_t *code, size_t len) {
     g_variants++;
@@ -381,15 +384,14 @@ static void sweep_bytes(const char *family, const char *variant, const uint8_t *
         if (fd >= 0 && !f) close(fd);
         if (f) { fwrite(code, 1, len, f); fclose(f); printf("DUMP %s = %s %s\n", path, family, variant); }
     }
-    if (g_nvdisasm) nvdisasm_cross_check(family, variant, code, len);
+    if (g_disasm) disasm_cross_check(family, variant, code, len);
 }
 
-/* encode + the launcher's patch steps */
-enum { P_NONE = 0, P_TC = 1, P_QMMA = 2 };
+/* encode + the launcher's patch step (SHFL.BFLY and F2FP.BF16 are native encoder words since training R5; only QMMA is patched) */
+enum { P_NONE = 0, P_QMMA = 1 };
 static void sweep_prog(const char *family, const char *variant, int patch) {
     size_t len = 0;
     if (omega_bw_encode_program(&g_prog, g_code, sizeof g_code, &len) != 0) { CHECK(0, "%s %s: encode failed", family, variant); return; }
-    if ((patch & P_TC) && omega_tc_patch_code(&g_prog, g_code, len) < 0) { CHECK(0, "%s %s: tc patch failed", family, variant); return; }
     if ((patch & P_QMMA) && omega_qmma_patch_code(&g_prog, g_code, len) < 0) { CHECK(0, "%s %s: qmma patch failed", family, variant); return; }
     sweep_bytes(family, variant, g_code, len);
 }
@@ -457,10 +459,10 @@ static void sweep(void) {
           OmegaTcGemmSpec s = { ks[a], rt, ct, w, 0 }; snprintf(v, sizeof v, "k%u rt%u ct%u warps%u", ks[a], rt, ct, w);
           if (BUILD(omega_blackwell_codegen_tcgemm_prog(&s, &g_prog))) sweep_prog("tcgemm", v, P_NONE);
       } }
-    if (BUILD(omega_blackwell_codegen_tc_probe_prog(0, &g_prog))) sweep_prog("tc_probe", "mutant0", P_TC);
+    if (BUILD(omega_blackwell_codegen_tc_probe_prog(0, &g_prog))) sweep_prog("tc_probe", "mutant0", P_NONE);
     for (unsigned ch = 1; ch <= 16; ch *= 2) for (unsigned st = 1; st <= 4; st++) {
         snprintf(v, sizeof v, "iters5 chains%u stall%u threads64", ch, st);
-        if (BUILD(omega_blackwell_codegen_tc_peak_prog(5, ch, st, 64, &g_prog))) sweep_prog("tc_peak", v, P_TC);
+        if (BUILD(omega_blackwell_codegen_tc_peak_prog(5, ch, st, 64, &g_prog))) sweep_prog("tc_peak", v, P_NONE);
         snprintf(v, sizeof v, "iters64 chains%u stall%u threads128", ch, st);
         if (BUILD(omega_blackwell_codegen_qmma_peak_prog(64, ch, st, 128, &g_prog))) sweep_prog("qmma_peak", v, P_QMMA);
     }
@@ -473,41 +475,41 @@ static void sweep(void) {
         if (BUILD(omega_blackwell_codegen_qmma_probe_prog(0, nops, &g_prog))) sweep_prog("qmma_probe", v, P_QMMA);
     }
     if (BUILD(omega_blackwell_codegen_f2e4_probe_prog(&g_prog))) sweep_prog("f2e4_probe", "-", P_QMMA);
-    /* prefill module kernels (omega_gpu_prefill.c applies both patches to every one of them) */
+    /* prefill module kernels (omega_gpu_prefill.c applies the QMMA patch to every one of them) */
     { unsigned ks[] = { 128, 768, 2048, 4096, 16384 };
       for (unsigned a = 0; a < 5; a++) for (unsigned rt = 2; rt <= 8; rt *= 2) for (unsigned w = 4; w <= 16; w *= 2) for (unsigned aq = 1; aq <= 2; aq++)
       for (unsigned epi = 0; epi <= 1; epi++) for (unsigned dir = 0; dir <= 1; dir++) {
           OmegaTc2Spec s = { ks[a], rt, 2, w, aq, epi, dir, 0, 0 };
           s.n = 4u * w * 8u * 2u; if (epi) s.n *= 2u;
           snprintf(v, sizeof v, "k%u rt%u warps%u aqn%u epi%u direct%u n%u", ks[a], rt, w, aq, epi, dir, s.n);
-          if (BUILD(omega_blackwell_codegen_tc2_prog(&s, &g_prog))) sweep_prog("tc2", v, P_TC | P_QMMA);
+          if (BUILD(omega_blackwell_codegen_tc2_prog(&s, &g_prog))) sweep_prog("tc2", v, P_QMMA);
       }
       for (unsigned a = 0; a < 5; a++) for (unsigned w = 8; w <= 16; w *= 2) for (unsigned epi = 0; epi <= 1; epi++) for (unsigned dir = 0; dir <= 1; dir++)
       for (unsigned wt = 0; wt <= 120; wt += 60) {
           OmegaQgSpec s = { ks[a], 4, w, epi, dir, 512, wt, 0 };
           snprintf(v, sizeof v, "k%u warps%u epi%u direct%u n512 wait%u", ks[a], w, epi, dir, wt);
-          if (BUILD(omega_blackwell_codegen_qgemm_prog(&s, &g_prog))) sweep_prog("qgemm", v, P_TC | P_QMMA);
+          if (BUILD(omega_blackwell_codegen_qgemm_prog(&s, &g_prog))) sweep_prog("qgemm", v, P_QMMA);
       }
       for (unsigned a = 0; a < 4; a++) for (unsigned it = 0; it <= 2; it++) {
           OmegaPqSpec s = { .k = ks[a], .in_type = it }; snprintf(v, sizeof v, "k%u in_type%u", ks[a], it);
-          if (BUILD(omega_blackwell_codegen_pq_prog(&s, &g_prog))) sweep_prog("pq", v, P_TC | P_QMMA);
+          if (BUILD(omega_blackwell_codegen_pq_prog(&s, &g_prog))) sweep_prog("pq", v, P_QMMA);
       } }
     { unsigned ks[] = { 768, 2048, 4096 }, es[] = { 8, 64, 128 }, ts[] = { 1, 16, 128, 1024 };
       for (unsigned a = 0; a < 3; a++) for (unsigned b = 0; b < 3; b++) for (unsigned c = 0; c < 4; c++) {
           OmegaRlSpec s = { ks[a], es[b], ts[c], 0 }; snprintf(v, sizeof v, "k%u e%u t%u", ks[a], es[b], ts[c]);
-          if (BUILD(omega_blackwell_codegen_rl_prog(&s, &g_prog))) sweep_prog("rl", v, P_TC | P_QMMA);
+          if (BUILD(omega_blackwell_codegen_rl_prog(&s, &g_prog))) sweep_prog("rl", v, P_QMMA);
       }
       unsigned hs[] = { 768, 2048, 4096 };
       for (unsigned a = 0; a < 3; a++) for (unsigned tk = 1; tk <= 8; tk *= 2) {
           OmegaMcSpec s = { hs[a], tk, 0 }; snprintf(v, sizeof v, "h%u top_k%u", hs[a], tk);
-          if (BUILD(omega_blackwell_codegen_mc_prog(&s, &g_prog))) sweep_prog("mc", v, P_TC | P_QMMA);
+          if (BUILD(omega_blackwell_codegen_mc_prog(&s, &g_prog))) sweep_prog("mc", v, P_QMMA);
       } }
-    if (BUILD(omega_blackwell_codegen_pf_copy_prog(&g_prog))) sweep_prog("pf_copy", "-", P_TC | P_QMMA);
-    /* prefill attention: the API's own host encode (build + encode + tc patch) */
+    if (BUILD(omega_blackwell_codegen_pf_copy_prog(&g_prog))) sweep_prog("pf_copy", "-", P_QMMA);
+    /* prefill attention: the API's own host encode (build + encode) */
     for (unsigned w = 4; w <= 8; w *= 2) for (unsigned md = 0; md <= 2; md++) for (unsigned mir = 0; mir <= 1; mir++) {
         OmegaPrefillAttnSpec s = { w, 0, md, mir };
-        static uint8_t pa[OMEGA_BW_CODE_CAP_MAX + 4096]; uint32_t gp = 0; int np = 0;
-        size_t len = omega_gpu_prefill_attn_encode(&s, pa, sizeof pa, &gp, &np);
+        static uint8_t pa[OMEGA_BW_CODE_CAP_MAX + 4096]; uint32_t gp = 0;
+        size_t len = omega_gpu_prefill_attn_encode(&s, pa, sizeof pa, &gp);
         snprintf(v, sizeof v, "warps%u mode%u mirror%u", w, md, mir);
         if (len) sweep_bytes("prefill_attn", v, pa, len);
     }
@@ -563,30 +565,25 @@ static void sweep(void) {
       if (omega_bw_ir_append(&g_prog, &ex) >= 0 && omega_bw_ir_append(&g_prog, &self) >= 0 && omega_bw_regalloc_solve(&g_prog) == 0) sweep_prog("cmdlist_nop", "-", P_NONE); }
 }
 
-/* ----------------------------------------------------------------------------------------- nvdisasm cross-check */
-static size_t g_nv_insns, g_nv_bad, g_nv_kernels;
+/* ----------------------------------------------------------------------------------- disassembler cross-check (C6) */
+static size_t g_dis_insns, g_dis_bad, g_dis_kernels;
 static int decoded_has(const OmegaBwInsn *d, int reg, int uniform) {
     for (unsigned j = 0; j < d->nr; j++) if (d->rd[j].uniform == uniform && d->rd[j].reg == reg) return 1;
     for (unsigned j = 0; j < d->nw; j++) if (d->wr[j].uniform == uniform && d->wr[j].reg == reg) return 1;
     return 0;
 }
-static void nvdisasm_cross_check(const char *family, const char *variant, const uint8_t *code, size_t len) {
-    char path[] = "/tmp/bw_hazard_nvdisasm_XXXXXX";
-    int fd = mkstemp(path); if (fd < 0) { CHECK(0, "mkstemp"); return; }
-    FILE *f = fdopen(fd, "wb"); fwrite(code, 1, len, f); fclose(f);
-    char cmd[600]; snprintf(cmd, sizeof cmd, "/usr/local/cuda/bin/nvdisasm -b SM121 -raw '%s' 2>&1", path);
-    FILE *p = popen(cmd, "r");
-    if (!p) { remove(path); CHECK(0, "nvdisasm popen"); return; }
-    char line[1024]; size_t seen = 0; g_nv_kernels++;
-    while (fgets(line, sizeof line, p)) {
-        char *s = strstr(line, "/*"); if (!s || s[6] != '*' || s[7] != '/') continue; /* the address field, e.g. 0040 */
-        unsigned addr; if (sscanf(s + 2, "%4x", &addr) != 1) continue;
-        size_t pc = addr / 16u; if (pc * 16u >= len) continue;
-        char *t = s + 8; while (*t == ' ') t++;
-        char *end = strchr(t, ';'); if (end) *end = 0;
-        OmegaBwInsn d; if (omega_bw_decode(code + pc * 16u, &d) != 0) continue; /* unreachable padding words are not decoded either */
-        seen++; g_nv_insns++;
-        /* every register token nvdisasm prints must be a base register the decoder has, and vice versa */
+static void disasm_cross_check(const char *family, const char *variant, const uint8_t *code, size_t len) {
+    size_t seen = 0; g_dis_kernels++;
+    for (size_t pc = 0; pc * 16u + 16u <= len; pc++) {
+        const uint8_t *w = code + pc * 16u;
+        OmegaBwInsn d; if (omega_bw_decode(w, &d) != 0) continue; /* unreachable padding words are not decoded either */
+        seen++; g_dis_insns++;
+        uint64_t lo = 0, hi = 0;
+        for (int i = 7; i >= 0; i--) { lo = lo << 8 | w[i]; hi = hi << 8 | w[8 + i]; }
+        char t[256];
+        int rc = omega_sm121_disasm(lo, hi, pc * 16u, t, sizeof t);
+        if (rc != 0) { g_dis_bad++; if (g_dis_bad <= 20) printf("DISASM UNKNOWN %s %s IR %zu: decoder %s, disassembler rc %d lo %016llx hi %016llx\n", family, variant, pc, d.name, rc, (unsigned long long)lo, (unsigned long long)hi); continue; }
+        /* every register token the disassembler prints must be a base register the decoder has, and vice versa */
         int nvr[16], nvu[16], nn = 0, nu = 0;
         for (char *q = t; *q; q++) {
             int uni = 0; char *r = q;
@@ -605,16 +602,15 @@ static void nvdisasm_cross_check(const char *family, const char *variant, const 
             for (int i = 0; i < (o->uniform ? nu : nn); i++) if ((o->uniform ? nvu[i] : nvr[i]) == o->reg) f2 = 1;
             ok = f2;
         }
-        if (!ok) { g_nv_bad++; if (g_nv_bad <= 20) printf("NVDISASM MISMATCH %s %s IR %zu: '%s' vs decoder %s (%u reads, %u writes)\n", family, variant, pc, t, d.name, d.nr, d.nw); }
+        if (!ok) { g_dis_bad++; if (g_dis_bad <= 20) printf("DISASM MISMATCH %s %s IR %zu: '%s' vs decoder %s (%u reads, %u writes)\n", family, variant, pc, t, d.name, d.nr, d.nw); }
     }
-    int st = pclose(p); remove(path);
-    CHECK(st == 0 && seen > 0, "%s %s: nvdisasm ran (status %d, %zu instructions)", family, variant, st, seen);
+    CHECK(seen > 0, "%s %s: disassembled %zu instructions", family, variant, seen);
 }
 
 int main(int argc, char **argv) {
     const char *dir = "tests/fixtures/bw_hazard";
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--nvdisasm")) g_nvdisasm = 1;
+        if (!strcmp(argv[i], "--disasm")) g_disasm = 1;
         else if (!strcmp(argv[i], "--fixtures") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) g_dump_dir = argv[++i];
     }
@@ -640,9 +636,9 @@ int main(int argc, char **argv) {
     printf("sweep: %zu variants built, %zu distinct kernels, %zu clean, %zu with findings, %zu findings, %zu not checked\n",
            g_variants, g_nseen, clean, g_nseen - clean - g_unchecked, g_findings_total, g_unchecked);
     CHECK(g_nseen >= 50, "the sweep built only %zu distinct kernels", g_nseen);
-    if (g_nvdisasm) {
-        printf("nvdisasm cross-check: %zu kernels, %zu instructions, %zu mismatched\n", g_nv_kernels, g_nv_insns, g_nv_bad);
-        CHECK(g_nv_bad == 0 && g_nv_insns > 0, "nvdisasm cross-check");
+    if (g_disasm) {
+        printf("disassembler cross-check (sm121dis, in process): %zu kernels, %zu instructions, %zu mismatched\n", g_dis_kernels, g_dis_insns, g_dis_bad);
+        CHECK(g_dis_bad == 0 && g_dis_insns > 0, "disassembler cross-check");
     }
     printf("bw_hazard_test: %d checks, %d failed: %s\n", g_checks, g_failed, g_failed ? "FAIL" : "PASS");
     return g_failed ? 1 : 0;
