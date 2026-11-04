@@ -20,8 +20,8 @@
 # evidence-immutable.yml, crumb.yml). Manifests under tests/gates/ name this script plus one
 # step word, so no manifest needs shell expansion (ADR 0028 P6).
 #
-# Pinned sibling sources. The hosted jobs check out aien-spark/physics at physics.lock (rx-host
-# at its own hard-coded commit), aien-dev/aienux at aienos.lock and aien-dev/aienux at
+# Pinned sibling sources. The hosted jobs checked out aien-spark/physics at physics.lock,
+# aien-dev/aienux at aienos.lock and aien-dev/aienux at
 # argus.lock, as physics-src/, aienos-src/ and aienos-argus/ next to the Makefile, and exclude
 # them from git status. Here the same commits are materialised under build/pins/ (build/ is
 # gitignored) from the sibling local clones ../physics and ../aienos, offline.
@@ -64,6 +64,9 @@ pin() {
   ) 9>"$PINS/.$name.lock"
   obs "pin_${name//-/_}" "\"$sha\""
 }
+# Every step that builds against physics takes the commit from physics.lock, never a literal:
+# the Makefile's check-physics-lock refuses any other commit, so a literal here goes red on
+# the next lock bump (it did for the e95e3ed bump, omega#508, and again for 048e5f5, omega#523).
 physics_pin() { pin physics-src physics "$(lock physics.lock)"; export PHYSICS_DIR="$PINS/physics-src"; }
 aienos_pin()  { pin aienos-src aienos "$(lock aienos.lock)"; export AIENOS_R7_DIR="$PINS/aienos-src"; export AIENOS_COMMIT="$(lock aienos.lock)"; }
 argus_pin()   { pin aienos-argus aienos "$(lock argus.lock)"; export ARGUS_REPO="$PINS/aienos-argus"; }
@@ -83,12 +86,15 @@ receipt() {
 gates_pass() { grep -E 'TOTAL GATES: [0-9]+ \| PASSED: [0-9]+ \| FAILED: 0' "$1" && ! grep -E 'FAILED: [1-9]' "$1"; }
 
 # speed <make target> <receipt file> <gate word>: a speed test (tests/runtime/rx_quiet_reps.h) that found
-# the machine too busy to time ends with `AIEN-OBS not_run_reason "cpu_busy"` and exit 77; make reports
+# the machine too busy to time, or a leg it claims faster disturbed significantly more often than the
+# other leg, ends with `AIEN-OBS not_run_reason "cpu_busy"` (or "leg_skew") and exit 77; make reports
 # any failing recipe as 2, so the refusal is read from the test's own receipt for this step: "failures": 0
 # and the gate word NOT_RUN, which the test writes only when nothing it judged failed. Then the step goes
-# on, so every other check is still judged, and ends NOT_RUN (exit 77) only if nothing else failed.
+# on, so every other check is still judged, and ends NOT_RUN (exit 77) only if nothing else failed, with
+# reason leg_skew when any refused receipt says so, else cpu_busy.
 # Anything else is the failure it was. A passing run gets the receipt check it always had.
 BUSY=0
+BUSY_REASON=cpu_busy
 speed() {
   local target="$1" file="$2" word="$3" rc=0 r f bad=1
   make "$target" || rc=$?
@@ -103,10 +109,11 @@ speed() {
     while IFS= read -r f; do
       grep -q '"failures": 0,' "$f" && grep -q '"candidate_bound": true,' "$f" &&
         grep -q "\"$word\": \"NOT_RUN\"" "$f" || bad=1
+      if grep -q '"not_run_reason": "leg_skew"' "$f"; then BUSY_REASON=leg_skew; fi
     done <<< "$r"
   fi
   if [ "$bad" = 0 ]; then
-    echo "run.sh: $target: machine too busy to time (cpu_busy); not judged, the rest of the step runs" >&2
+    echo "run.sh: $target: refused to time ($BUSY_REASON; the test's NOT RUN lines say why); not judged, the rest of the step runs" >&2
     printf '%s\n' "$r" | xargs sha256sum
     BUSY=1
     return 0
@@ -137,6 +144,12 @@ case "$step" in
     grep -E 'TOTAL GATES: ([0-9]+) \| PASSED: \1 \| FAILED: 0' build/base.log
     ! grep -qE 'FAILED: [1-9]|\[FAIL\]|\(FAIL\)' build/base.log
     ;;
+  gpu-tgemm)          # pr-smoke.yml smoke job, "Training GEMM host proofs" step: physics-src at physics.lock;
+                      # budgets and warp simulator, no GPU
+    physics_pin; set -o pipefail; mkdir -p build
+    make test-gpu-tgemm | tee build/tgemm.log
+    test "$(grep -c '^GPU_TGEMM: PASS' build/tgemm.log)" = 2
+    ;;
   language)           # pr-smoke.yml and host-suites-3.yml (same command)
     set -o pipefail; mkdir -p build
     make $NOPHYS test-language | tee build/lang.log
@@ -151,6 +164,13 @@ case "$step" in
     ! grep -q '^FAIL' build/transc.log
     obs mutants_killed 10
     ;;
+  gpu-tern)           # pr-smoke.yml smoke job, KT1 ternary GEMV step: physics-src at physics.lock; host battery
+                      # and warp simulator, no chip
+    physics_pin; set -o pipefail; mkdir -p build
+    make test-gpu-tern | tee build/tern.log
+    test "$(grep -cE '^gpu_tern_test: [0-9]+ checks, 0 failed: PASS$' build/tern.log)" -eq 2
+    ! grep -q '^FAIL' build/tern.log
+    ;;
   # host-suites.yml
   searchtrace)        make $NOPHYS test-searchtrace ;;
   estimation)         for t in test-estimation test-est-tools test-estimation-v3 test-est3c-tools; do make $NOPHYS $t; done ;;
@@ -160,7 +180,7 @@ case "$step" in
   compiler)           make $NOPHYS test-compiler-quick; make $NOPHYS test-compiler-full ;;
   one-layer-acceptance) make $NOPHYS test-one-layer-acceptance ;;
   physics0)           make $NOPHYS physics0-test ;;
-  chip-tool-selftests) for t in test-m19r-qualify test-gate14-combine test-window-lane-guard test-unwritten-trap-host test-ldst-host test-dgraph-receipt; do make $NOPHYS $t; done ;;
+  chip-tool-selftests) for t in test-m19r-qualify test-gate14-combine test-gate-physics-pin test-window-lane-guard test-unwritten-trap-host test-ldst-host test-dgraph-receipt; do make $NOPHYS $t; done ;;
   # seed compiler (no hosted mirror; Spark only): rebuild from the loader, full qualification, IR oracles required
   seed)               make OUT_DIR=build build/omegese/omegese build/omega_emit/omega_emit build/checker2/checker2
                       sh seed/omega-from-seed.sh
@@ -168,6 +188,7 @@ case "$step" in
                       if grep -q "^SKIP" "$OUT_DIR.seed-check.log"; then echo "OMEGA-SEED: a seed gate was skipped" >&2; exit 1; fi
                       # gate5 checks that seed/omc/size-history.tsv ends with a row for this omc; check.sh does not run it
                       sh seed/omc/gate5.sh 2>&1 | tee "$OUT_DIR.seed-gate5.log"
+                      grep -q "^PASS native-host qualification" "$OUT_DIR.seed-check.log" || { echo "OMEGA-SEED: native-host qualification did not pass" >&2; exit 1; }
                       tail -1 "$OUT_DIR.seed-gate5.log" | grep -q "^GATE5 PASS" || { echo "OMEGA-SEED: gate5 failed" >&2; exit 1; } ;;
   # omega-mv#731 ORIG-4 (no hosted mirror; host only): the shadow advisor's glue over the
   # pinned aien-train units (native/orig4/orig4.pin, one aien-train main commit), materialised
@@ -215,6 +236,9 @@ case "$step" in
   bw-hazard)          physics_pin; make test-bw-hazard ;;
   numeric2)           make $NOPHYS test-numeric-reduce-cpu test-divsqrt-host ;;
   tensor)             make $NOPHYS test-tensor; make $NOPHYS test-tensor-store; make $NOPHYS test-m20-receipt; make $NOPHYS test-tensor-mutations ;;
+  atomf32-probe-host) # host-suites-2.yml gpu-engine job, "f32 global atomic add probe in the warp simulator" step:
+                      # physics-src at physics.lock; host, no device (the chip run is by hand)
+    physics_pin; make test-atomf32-probe-host ;;
   gpu-decode-graph)   physics_pin; make test-gpu-decode-graph ;;
   # host-suites-3.yml
   numeric-lifecycle)  make $NOPHYS test-numeric-lifecycle ;;
@@ -257,15 +281,20 @@ case "$step" in
     ;;
   # rx-host.yml
   rx-host-reference)
-    pin physics-src-6d7cf0d physics 6d7cf0d4d8eb2cda7b512100ff6058e25dbb3ddf
-    export PHYSICS_COMMIT=6d7cf0d4d8eb2cda7b512100ff6058e25dbb3ddf PHYSICS_DIR="$PINS/physics-src-6d7cf0d"
+    physics_pin; export PHYSICS_COMMIT="$(lock physics.lock)"
     aienos_pin; set -o pipefail; mkdir -p build
-    make test-r3 test-r7 test-r16-operator-authority-misuse test-r8 test-r9 test-r12 test-rx-emergency test-action-graph test-state-projection test-capability-query test-capability-graph test-skillroute-compose test-semantic-comm test-cognitive-routing test-sem-incremental test-cortex test-jspace-prod test-composition test-composition-attach-asan test-composition-gate test-fabric test-fabric-living | tee build/rx-host-reference.log
+    # The hosted job runs these as one make line; the speed test test-action-graph is taken out (speed,
+    # above) so a busy machine is a refusal and the targets after it still run, in the same order.
+    # All test output also goes to build/rx-host-reference.log, so a step that hits its time limit
+    # leaves a record of the test that was running. speed runs in this shell (BUSY), so its output
+    # reaches the log through a process substitution, not a pipe.
+    make test-r3 test-r7 test-r16-operator-authority-misuse test-r8 test-r9 test-r12 test-rx-emergency | tee build/rx-host-reference.log
+    speed test-action-graph rx_action_graph_receipt.json OMEGA_ACTION_GRAPH_IR_PASS > >(tee -a build/rx-host-reference.log)
+    make test-state-projection test-capability-query test-capability-graph test-skillroute-compose test-semantic-comm test-cognitive-routing test-sem-incremental test-cortex test-jspace-prod test-composition test-composition-attach-asan test-composition-gate test-fabric test-fabric-living | tee -a build/rx-host-reference.log
     make test-machine-identity | tee -a build/rx-host-reference.log
     make test-effect-cap64 | tee build/effect-cap64.log
     grep -q '^OMEGA_EFFECT_CAP64_PASS$' build/effect-cap64.log
     receipt omega_state_projection_receipt.json '"failures": 0,' '"candidate_bound": true,' '"OMEGA_STATE_PROJECTION_PASS": "PASS"'
-    receipt rx_action_graph_receipt.json '"failures": 0,' '"candidate_bound": true,' '"OMEGA_ACTION_GRAPH_IR_PASS": "PASS"'
     # omega-mv#404 item 2: PASS means the package energy counter (hwmon aien_spbm, found by the
     # same name-prefix test rx_sem_incremental uses) measured the work; HOST_PASS_ENERGY_UNMEASURED
     # means this host has no such counter. The verdict must match this host; PASS_UNBOUND and FAIL
@@ -289,11 +318,10 @@ case "$step" in
     tools/rx_host_receipts.sh heartbeat "$r"
     tools/rx_host_receipts.sh native "$native" "$OMEGA_CANDIDATE_COMMIT"
     tools/rx_host_receipts.sh generation "$generation" "$OMEGA_CANDIDATE_COMMIT"
-    if [ "$BUSY" = 1 ]; then obs not_run_reason '"cpu_busy"'; exit 77; fi
+    if [ "$BUSY" = 1 ]; then obs not_run_reason "\"$BUSY_REASON\""; exit 77; fi
     ;;
   faculty-arm)
-    pin physics-src-6d7cf0d physics 6d7cf0d4d8eb2cda7b512100ff6058e25dbb3ddf
-    export PHYSICS_DIR="$PINS/physics-src-6d7cf0d"
+    physics_pin
     aienos_pin; argus_pin; set -o pipefail; mkdir -p build
     make OUT_DIR=build/pid $NOPHYS test-program-id
     make OUT_DIR=build/prz $NOPHYS test-program-realize
@@ -330,9 +358,8 @@ case "$step" in
     # Chip and spark steps follow physics.lock like every other step. Makefile check-physics-lock
     # (a prerequisite of omegatool, rx_composition_gate_gpu and libomega_gpu.a) refuses any other
     # physics commit, and omegatool itself now needs the physics API of the lock (nvrm_channel_n,
-    # L136 via #614). The former hard-coded 6d7cf0d4 failed every such chip gate on the judge once
-    # #614 moved the lock to 048e5f5 (main 18c653b3, 2026-10-25). faculty-arm and rx-host-reference
-    # keep their own pin: they mirror the hosted rx-host job, which checks out that commit itself.
+    # L136 via #614). The former hard-coded physics literal failed every such chip gate on the judge
+    # once #614 moved the lock to 048e5f5 (main 18c653b3, 2026-10-25).
     physics_pin
     aienos_pin; argus_pin
     make "$t"
@@ -356,7 +383,24 @@ case "$step" in
     ;;
   zero-disk-secrets)
     echo "Auditing repository for prohibited plaintext secret files..."
-    if find . -maxdepth 4 -name ".env*" -not -path "*/.git/*" -not -path "*/build/*" | grep -q .; then
+    # Inspect every tracked path, including forced additions under generated dirs.
+    # NUL records preserve whitespace/newlines; producer failures are not "no hits".
+    if ! git ls-files -z > "$OUT_DIR/secret-tracked"; then
+      echo "::error::Cannot enumerate tracked paths." >&2; exit 1
+    fi
+    while IFS= read -r -d '' path; do
+      case "${path##*/}" in
+        .env*) echo "::error::Tracked plaintext .env path found."
+               obs env_files_found true; exit 1 ;;
+      esac
+    done < "$OUT_DIR/secret-tracked"
+    # Also catch untracked working-tree secrets. Only root build output and git
+    # metadata are excluded; tracked files in build were already checked above.
+    if ! find . \( -path './.git' -o -path './build' \) -prune -o \
+        -name '.env*' -print -quit > "$OUT_DIR/secret-untracked"; then
+      echo "::error::Cannot complete plaintext secret search." >&2; exit 1
+    fi
+    if [ -s "$OUT_DIR/secret-untracked" ]; then
       echo "::error::Prohibited plaintext .env file found. Use an approved AIEN SecretProvider."
       obs env_files_found true; exit 1
     fi
