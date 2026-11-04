@@ -1,9 +1,10 @@
 # x86-64 UEFI backend (`target x86efi`)
 
 Status: **DRAFT; IMPLEMENTED and EXERCISED under emulation (QEMU q35 + OVMF)**, 2026-11-01.
-Draft aien-dev/aien-train#53 records one physical iMac run of an image built with this omc
+Draft aien-dev/aien-train#53 at `e08443c3` records one physical iMac run of an image built with this omc
 (`b4f45121`, `evidence/OMEGALLM/imac/`): EXERCISED on physical hardware (one machine).
-This repository has no physical-firmware gate. Base: `aien-dev/omega-mv` main `ba5559d9`.
+This repository has no physical-firmware gate. The compiler was built on main `ba5559d9`.
+This branch also contains main `f9a9a40b` (#995). That merge did not change `seed/omc/omc.om` or `seed/out/omc`.
 Implementation: `seed/omc/omc.om` (functions `xp` through `xf12`, plus hooks in `kw`, the value
 parser, the driver, `xleave`, `xfinish`, `xlead` and `xeof`). It reuses the x86linux instruction
 selection, register model and SSE2 float code of [X86-LINUX.md](X86-LINUX.md); only the image
@@ -125,8 +126,8 @@ each check it cannot run and exits 77 when nothing could run).
 
 | Gate | Result |
 |---|---|
-| AArch64 unchanged | `seed/host/check.sh` passes, fixpoint reproduced; all 1241 `.om` files tracked on main `ba5559d9` give the same bytes and status as main's omc: 621 compile, 620 are refused identically |
-| x86linux unchanged | the same 1241 files with `target x86linux`: 605 compile byte-identical, 636 are refused identically |
+| AArch64 as stored | 1305 tracked `.om` files, `tools/x86efi/corpus_diff.sh` asis, omc `b4f45121` against main's omc `be8c5130`: 663 identical, 638 same-refusal, 4 differ. The 4 are `tests/x86efi/exit/e1.om`, `exit/e2.om`, `file/t1.om` and `refusals/g4.om`: `b4f45121` accepts them and `be8c5130` refuses error 25. `tests/x86efi/float/efi-pre.om` is error 25 from both. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130.tsv`. Run on x86_64 under qemu-user. A native AArch64 run is NOT_RUN |
+| x86linux | the same 1305 files with mode x86linux (a `target x86linux` line is prepended only when the file has no target line): 647 identical, 654 same-refusal, 4 differ. Those 4 are the same `target x86efi` programs. TSV: `evidence/x86efi/corpus_b4f45121_vs_be8c5130_x86linux.tsv` |
 | Float parity (`float/`) | one program printing 41 bit patterns (add, sub, mul, div, sqrt, exp, log, int/float conversions, saturating casts, NaN, f32) gives identical output as x86efi, x86linux (qemu-x86_64) and AArch64; floats survive 40+ firmware calls. An MXCSR round-toward-zero mutant fails it |
 | efi 12 refusals (`refusals/`) | 21 results (codes above, path lengths 0/255/256, busy, nothing open, read-only write, bad volume) match; OFF+N past the array traps 3 |
 | efi 12 round trip (`file/`) | create, write, close, reopen, positioned write, read back: results and the bytes on disk match. A mutant with the Read/Write protocol offsets 32/40 swapped fails it |
@@ -140,5 +141,5 @@ EXERCISED on physical hardware (one machine).
 
 ## Limits
 
-The compiler has 511 functions, under the om4 cap of 512. Allen's stack (#977, #983, #980, #981) carries
+The compiler uses 511 of the om4 cap of 512 functions (`seed/omc/size-history.tsv`). Allen's stack (#977, #983, #980, #981) carries
 an older x86efi on a different base; its register slots and live-slot saves are not ported here.
