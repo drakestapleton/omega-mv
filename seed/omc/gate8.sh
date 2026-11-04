@@ -83,6 +83,19 @@ refuse neg_ir 3
 refuse neg_void_value 7
 refuse neg_f32_fall 18
 refuse neg_bitcast_width 7
+refuse neg_int_assign 7
+refuse neg_int_ret 7
+refuse neg_int_arg 7
+refuse neg_int_put 7
+
+# Literal rounding (#1024): 512 literals, each rounded once to nearest even. lit_round.want holds the
+# bits from seed/omc/float-lits.py's exact rational oracle (Python fractions), never from omc.
+n=$((n+1))
+"$S" < "$T/lit_round.om" > "$B/lit_round.bin" 2> "$B/lit_round.err" || bad "lit_round: compiler refused it ($(cat "$B/lit_round.err"))"
+chmod +x "$B/lit_round.bin"
+"$B/lit_round.bin" | od -An -v -tx8 -w8 | tr -d ' ' > "$B/lit_round.got"
+cut -d' ' -f1 "$T/lit_round.want" | cmp -s - "$B/lit_round.got" || bad "lit_round: bits differ from lit_round.want"
+say "PASS lit_round $(wc -l < "$T/lit_round.want") literals"
 
 say "PASS gate8 $n cases"
 exit 0

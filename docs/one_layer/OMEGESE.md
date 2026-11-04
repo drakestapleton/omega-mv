@@ -617,13 +617,17 @@ conversion is error 7.
 
 - Literals: `digits.digits[(e|E)[+|-]digits][f32|f64]`; a digit must be present on both sides of the
   dot, and a leading `-` negates. A literal with no suffix takes its type from context exactly as an
-  integer literal does; where no context gives a float type it is error 11. The decimal text is
-  converted exactly to the target type, keeping a 64-bit significand, a binary exponent and one
-  sticky bit, then rounding once to nearest even: 0.1f64 is 0x3FB999999999999A. The full binary32 and
-  binary64 range is covered, including subnormals (5e-324, 1e-45) and signed zero. A literal that
-  rounds to infinity is refused (error 8); one below the smallest subnormal underflows to signed
+  integer literal does; where no context gives a float type it is error 11. An integer literal where
+  a float is expected (assignment, `ret`, argument, `put`, `new` fill) is error 7; write `f64 1` or
+  `1.0`. The decimal text is converted exactly: digits times a power of ten is held as an exact
+  quotient of two integers, long division gives a 64-bit significand and the remainder gives the
+  sticky bit, then the value is rounded once to nearest even: 0.1f64 is 0x3FB999999999999A and
+  6816.702656e-27 is 0x3B207B55A6D4A130. The full binary32 and binary64 range is covered, including
+  subnormals (5e-324, 1e-45; 2.4703282292062328e-324 is 0x1) and signed zero. A literal that
+  rounds to infinity is refused (error 8); one at or below half the smallest subnormal rounds to signed
   zero. The significant digits must still fit in 2^63-1 (error 8 beyond that). (gate8 f64_bits,
-  f32_bits, neg_ambiguous, neg_dot, neg_overflow, neg_overflow2, neg_overflow3)
+  f32_bits, lit_round, neg_int_*, neg_ambiguous, neg_dot, neg_overflow, neg_overflow2,
+  neg_overflow3; `seed/omc/float-lits.py diff OMC N SEED` is the randomized differential)
 - Operators: `+ - * /` and unary `neg`; comparisons `eq ne lt le gt ge`. Bit operators, shifts and
   `rem` on a float are error 7. IEEE results: division by zero and overflow give infinity, 0/0 gives
   NaN, and no float operation traps. NaN compares false everywhere except `ne`, which is true. -0.0

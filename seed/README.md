@@ -427,6 +427,13 @@ converter now keeps a normalized 64-bit significand, a binary exponent and one s
   values, values just below the overflow boundary, and values that underflow to zero.
 - `gate8` now has 23 cases: the two literal fixtures cover large and subnormal values, and
   `neg_overflow2`/`neg_overflow3` check that a literal which rounds to infinity is refused.
+- Correction (#1024, #1026): the per-digit `fmul10`/`fdiv10` steps truncated at every factor of ten,
+  so some literals came out one ulp low (6816.702656e-27 gave 0x3B207B55A6D4A12F, not ...130;
+  2.4703282292062328e-324 gave 0, not 0x1). `fbits` now forms the exact quotient of two integers in
+  40 32-bit limbs (`fbmul`, `fbpow`, `fbsub`) and rounds once. `gate8 lit_round` checks 512 literals
+  against `seed/omc/float-lits.py`'s exact rational oracle, and `float-lits.py diff OMC N SEED` is
+  the randomized differential (1,000,000 literals, seed 1024: 0 mismatches). An integer literal under
+  a float type, formerly stored as raw bits, is now error 7 (`gate8 neg_int_*`).
 
 ## Rung R12: layout queries (done)
 
