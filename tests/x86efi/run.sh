@@ -33,6 +33,7 @@ command -v timeout > /dev/null 2>&1 || { efi=no; why="timeout not found"; }
 block() { tr -d '\r' < "$1" | awk '/^==B$/ { on = 1; next } on && /^==/ { exit } on { print }'; }
 
 # boot NAME SOURCE...: compile the concatenated sources, boot the image; leaves $work/NAME/{serial.log,disk.img}.
+# A $work/NAME/disk2.img made before the call is attached as a second USB stick.
 boot() {
   name=$1; shift; d=$work/$name; mkdir -p "$d"
   cat "$@" > "$d/app.om"
@@ -40,10 +41,12 @@ boot() {
   cp "$vars" "$d/vars.fd"
   dd if=/dev/zero of="$d/disk.img" bs=1048576 count=16 2> /dev/null
   mformat -i "$d/disk.img" :: && mmd -i "$d/disk.img" ::/EFI ::/EFI/BOOT && mcopy -i "$d/disk.img" "$d/app.efi" ::/EFI/BOOT/BOOTX64.EFI
+  second=
+  [ -f "$d/disk2.img" ] && second="-drive if=none,id=stick2,format=raw,file=$d/disk2.img -device usb-storage,bus=xhci.0,drive=stick2"
   timeout "$wait" qemu-system-x86_64 -machine q35 -cpu max -m 512 -display none \
     -drive if=pflash,format=raw,readonly=on,file="$code" -drive if=pflash,format=raw,file="$d/vars.fd" \
     -device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file="$d/disk.img" \
-    -device usb-storage,bus=xhci.0,drive=stick -net none -serial file:"$d/serial.log" -no-reboot
+    -device usb-storage,bus=xhci.0,drive=stick $second -net none -serial file:"$d/serial.log" -no-reboot
   return 0
 }
 # trapped LOG: OVMF reports the image's EFI_STATUS 2^63|103 (trap 3) as "...: 00000067".
@@ -83,6 +86,16 @@ fi
 if boot file "$here/file/t1.om"; then
   block "$work/file/serial.log" | cmp -s - "$here/file/expected.txt" && ok "file: round trip results match" || bad "file: results differ"
   [ "$(diskfile "$work/file/disk.img" T.TXT)" = abcd ] && ok "file: T.TXT on disk is abcd" || bad "file: T.TXT on disk is not abcd"
+fi
+# file11: efi 11 on two volumes: count and boot index, read the boot image, write it over the
+# other stick's 4-byte BOOTX64.EFI, read it back; volume 9 is error 19.
+d=$work/file11; mkdir -p "$d"; printf junk > "$d/junk"
+dd if=/dev/zero of="$d/disk2.img" bs=1048576 count=16 2> /dev/null
+mformat -i "$d/disk2.img" :: && mmd -i "$d/disk2.img" ::/EFI ::/EFI/BOOT && mcopy -i "$d/disk2.img" "$d/junk" ::/EFI/BOOT/BOOTX64.EFI
+if boot file11 "$here/file11/t1.om"; then
+  block "$d/serial.log" | cmp -s - "$here/file11/expected.txt" && ok "file11: results match" || bad "file11: results differ"
+  mcopy -n -i "$d/disk2.img" ::/EFI/BOOT/BOOTX64.EFI "$d/out.efi" 2> /dev/null
+  cmp -s "$d/out.efi" "$d/app.efi" && ok "file11: second stick's BOOTX64.EFI is the booted image" || bad "file11: second stick's BOOTX64.EFI is not the booted image"
 fi
 # exit: a file left open is flushed and closed by return (e1) and by a trap (e2). The status check
 # runs only for an image that booted, wrote a serial log and left the expected file on disk.

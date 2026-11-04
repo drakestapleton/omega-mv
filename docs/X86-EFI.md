@@ -51,7 +51,7 @@ whose code is in the low bits.
 | 8 | network start (SNP) | shipped, NOT_RUN |
 | 9 | pointer state | shipped, NOT_RUN |
 | 10 | milliseconds (TSC) | shipped, NOT_RUN |
-| 11 | boot-file read/write, fixed path `\EFI\BOOT\BOOTX64.EFI` (Allen fork contract, #981) | shipped, NOT_RUN |
+| 11 | boot-file read/write, fixed path `\EFI\BOOT\BOOTX64.EFI` (Allen fork contract, #981) | EXERCISED (EMULATED): `tests/x86efi/file11` |
 | 12 | general file, below | EXERCISED (EMULATED) |
 | 13 | console, below | EXERCISED (EMULATED) |
 
