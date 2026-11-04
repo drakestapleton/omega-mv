@@ -1,6 +1,6 @@
 # x86-64 Linux backend (FR-9)
 
-Status: **DRAFT; native x86 qualification NOT_RUN**, 2026-10-28.
+Status: **DRAFT; native x86 qualification NOT_RUN**, measured again 2026-10-30.
 The canonical integration base is `aien-dev/omega-mv` commit
 `d94a503f7aae57d09697046405da2e9a5895be6d`, with compiler batch 3 integrated
 at `7bce2a4fddc43268ac2af09cddc4a5a67d78312d`; the historical backend is
@@ -159,6 +159,11 @@ error 25. The draft now contains an `xhost` dispatcher and native host helpers,
 including socket, polling and device/mapping routes; wiring and coverage are
 still being integrated. Their presence alone does not establish support for
 every existing host fixture. Reusing AArch64 emitters is not an implementation.
+
+`execprog` (word 124) in `xhpack` calls `close_range(3, ~0U, CLOSE_RANGE_UNSHARE)` (syscall 436)
+before `execve`, and a nonzero result skips the exec and returns that kernel error, matching the
+AArch64 descriptor boundary. `execpure` (word 198) has no x86 strict-profile lowering (Landlock,
+seccomp and limits are AArch64-only); `xhost` refuses it with error 25.
 
 A complete host lowering needs a per-word x86 Linux syscall-number and
 argument-order mapping, checked against the x86 UAPI rather than
@@ -439,9 +444,26 @@ The compiler binary is identical for both runs. Native x86 qualification and
 independent review remain outstanding. The additive acceptance receipt records
 both revisions and the original full-run verdict.
 
+Re-measured at source `62d1d0d668f897386a0e311374f8dbcc5c32dde8` (2026-10-30)
+with the same compiler binary (sha256 `62775d2a…`), the pinned QEMU 10.0.14
+oracle (sha256 `fd7ae776…`) and omega-bridge at `1958a189` (x86 support merged):
+15182 PASS, 0 FAIL, 2 NOT_RUN, 222 EXCLUDED, runner exit 1, aggregate verdict
+FAIL because NOT_RUN is not PASS. The three additional PASS rows against the
+2026-10-28 count are fixtures added since `7ab5fdd0`
+(`seed/omc/contracts/forvalcontinue.om`, `seed/omc/contracts/forvalfinal.om`,
+`tests/ecosystem663/metadata-test.om`). The two NOT_RUN rows are unchanged:
+`seed/host/tests/devcall.om` and `seed/host/tests/uvmctl.om`, both classified
+EMULATOR_ARTIFACT by the runner's own QEMU `-strace` challenge (invalid fd -1,
+requests `0xc020462b` and `0x30000001`, QEMU errno 25 ENOTTY against the native
+requirement of EBADF). x86 execution is EMULATED; AArch64 execution is
+HOST_TESTED. Native x86 execution remains NOT_RUN. The additive receipt is
+`seed/qualification/x86-linux/20261030-main-62d1d0d6.json`; the historical
+receipt is unchanged. This measurement is EXERCISED, not QUALIFIED, MERGED or
+DEPLOYED.
+
 The current integration preserves every frozen manifest and historical receipt.
-Current acceptance applies the already declared `manifest-c2-capacity.txt` and
-`manifest-c2-batch2.txt` deltas to their named rows, while separately replaying
+Current acceptance applies the already declared `manifest-c2-capacity.txt`,
+`manifest-c2-batch2.txt`, `manifest-c2-fpvreg.txt` and `manifest-c2-closerange.txt` deltas to their named rows, while separately replaying
 the original rows against their pinned historical compiler. The old OM-1
 `s1-rot-refused` assertion likewise remains a historical replay; the current
 assertion comes from `leak/candidate.cases` and requires OM-2 acceptance.
@@ -504,6 +526,33 @@ Coverage distinctions must accompany any result:
   ceiling 3 on both targets; the production compiler's ceiling is unchanged.
 - `psync` invokes syncfs on the scratch descriptor and therefore flushes its
   filesystem; a temporary directory does not isolate that kernel effect.
+- `effect-scratch` (`seed/omc/x86_corpus_drivers.py` `effect_plan`) drives the
+  security673 and S5 conductors that launch programs or touch files, each keyed
+  by exact source sha: `pkt-consumer`, `runimage`, `embed`, `scrub-ctl`,
+  `scrub-mem`, `path-consumer`, `renames-consumer`, `exec-parent` and
+  `pure-child`. Inputs are SHA-pinned repository files copied into the private
+  per-architecture scratch; launched programs are the same native AArch64 file
+  in both runs (`exec-child` built natively from pinned `exec-child.om`, the
+  pinned evidence images, or the host `/bin/true`, `/bin/echo` and `/bin/tr`
+  pinned to Ubuntu coreutils 9.4-3ubuntu6.3 arm64, whose mismatch is BLOCKED).
+  Each run gets a 10-second CPU limit; only `exec-parent` raises
+  `RLIMIT_NOFILE` to 65600 because it duplicates a descriptor to 65537.
+  `pure-child` runs outside `execpure`, so it exits 43 at its first fd check;
+  its later arms are not exercised. `gate669.om` (sha `1f0e7222`) runs as the
+  x86 parent in a repository-shaped scratch: its 21 compiled, executed or
+  copied repository inputs (security673 corpora and consumers, the six
+  `seed/authority` gates, `effect-ok`, `seed/trace/sha256-gate.om`) are
+  SHA-pinned, `seed/rung4/om4.bin` is a copy of the operator compiler, and
+  `seed/omc/omc.om`, the source the gate rebuilds twice and compares, is copied
+  with its sha recorded. Its host children `/usr/bin/objdump` (binutils
+  2.42-4ubuntu2.10 arm64) with its shared objects and loader, and `/bin/true`,
+  are pinned; any pin mismatch is BLOCKED. The full run and argument `3`
+  (#671 hostile ingress) must exit 0; arguments `0`, `1` and `2` are the gate's
+  own fail-closed controls (child exit 7, self-SIGKILL, 30-second deadline
+  overrun) and must exit 99. Only whole `elapsed_ns=<digits>` stdout lines, the
+  gate's wall-clock observations, are masked before the native/x86 comparison;
+  their count and every other byte and scratch file must match. Each arm has a
+  300-second deadline.
 
 The disassembly check linearly decodes code bytes, including unreachable code,
 while carving source-matched jump-protected literal spans. A mnemonic inventory
