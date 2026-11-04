@@ -2,9 +2,11 @@
 # gate3.sh -- the checks of rung 3 (seed/README.md). Run from the repo root:  sh seed/rung3/gate3.sh
 # Needs build/omegese/omegese and build/omega_emit/omega_emit (the C path, built by make through
 # quiet-build) and cc for the reference runner. Nothing here writes a byte of seed/ except om3.bin,
-# which only asm2 makes. Results: evidence/SEED-0/rung3/.
+# which only asm2 makes. Results: build/seed/r3/evidence/. The recorded receipt evidence/SEED-0/rung3/ (and
+# seed/rung3/om3.audit) is only read: the results are compared with it at the end (seed/check/receipt.sh),
+# never written over it.
 set -eu
-R=seed/rung3; B=build/seed/r3; E=evidence/SEED-0/rung3
+R=seed/rung3; B=build/seed/r3; E=$B/evidence; REC=evidence/SEED-0/rung3
 T=tests/one_layer/exp445/dev/tasks/cases; O=tests/one_layer/omegese/dev
 mkdir -p "$B" "$E"
 fail=0
@@ -24,8 +26,8 @@ fsz=$(od -An -tu4 -j96 -N4 $R/om3.bin | tr -d ' ')
 sha256sum $R/om3.bin | tee "$E/om3.sha256" >> "$E/gate3.log"
 
 # 2. every instruction of om3 decodes (objdump, reference) to its name, registers, numbers, label
-if sh seed/check/audit2.sh $R/om3.s $R/om3.bin > $R/om3.audit; then :; fi
-tail -1 $R/om3.audit | tee -a "$E/gate3.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
+if sh seed/check/audit2.sh $R/om3.s $R/om3.bin > $E/om3.audit; then :; fi
+tail -1 $E/om3.audit | tee -a "$E/gate3.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
 #    controls: a wrong name, register, label and number in the text must each be caught
 for c in 's/^  add.x x12 x12 x0$/  sub.x x12 x12 x0/' 's/^  mov.x x21 x20$/  mov.x x21 x19/' \
          's/^  b RD$/  b RDDONE/' 's/^  ubfm.x x1 x1 54 53$/  ubfm.x x1 x1 54 52/' \
@@ -91,5 +93,7 @@ t 13 'fn f a uint to uint\nabcdefghi = a\nret a\nend\n'
 t 15 'fn f a uint to uint\nret a\n'
 t 9  'fn f a uint to uint\nret a\nend\nend\n'
 t 16 'ret 5\n'
+# the recorded receipt is compared, never rewritten; the verdict below is the checks' alone
+say "$(sh seed/check/receipt.sh "$E" "$REC" $R/om3.audit || true)"
 [ $fail = 0 ] && say "GATE3 PASS" || say "GATE3 FAIL"
 exit $fail
