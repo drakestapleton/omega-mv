@@ -42,9 +42,15 @@ static bool popen_read_line(const char *cmd, char *out, size_t n) {
     bool got = (fgets(buf, sizeof(buf), p) != NULL);
     pclose(p);
     if (!got || !trim_line(buf)) return false;
-    if (strlen(buf) >= n) return false;
-    strcpy(out, buf);
+    size_t len = strlen(buf);
+    if (len >= n) return false;
+    memcpy(out, buf, len + 1);
     return true;
+}
+
+/* c when it is a lower-case hex digit, -1 otherwise */
+static int hex_byte(int c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ? c : -1;
 }
 
 /* ---- run_id -------------------------------------------------------------- */
@@ -60,10 +66,20 @@ const char *omega_evidence_run_id(void) {
         char ts[32];
         strftime(ts, sizeof(ts), "%Y%m%dT%H%M%SZ", &tm_info);
 
-        char sha[64];
-        if (!popen_read_line("git rev-parse --short=12 HEAD 2>/dev/null", sha, sizeof(sha))) {
-            snprintf(sha, sizeof(sha), "unknown");
+        /* The run id names the evidence directory (omega_evidence_path), so git's answer is kept only as
+         * lower-case hex, copied byte by byte; anything else is "unknown". */
+        char line[64], sha[64];
+        size_t k = 0;
+        if (popen_read_line("git rev-parse --short=12 HEAD 2>/dev/null", line, sizeof(line))) {
+            for (; line[k]; k++) {
+                int c = hex_byte((unsigned char)line[k]);
+                if (c < 0) break;
+                sha[k] = (char)c;
+            }
+            if (line[k]) k = 0;
         }
+        sha[k] = '\0';
+        if (k == 0) snprintf(sha, sizeof(sha), "unknown");
         snprintf(g_run_id, sizeof(g_run_id), "%s-%s", ts, sha);
         g_run_id_ready = true;
     }
@@ -133,6 +149,15 @@ int omega_evidence_write_digest(const char *relstem, const char *ext, const void
     return 0;
 }
 
+FILE *omega_evidence_create(const char *path) {
+    if (!path) return NULL;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "w");
+    if (!f) close(fd);
+    return f;
+}
+
 /* ---- commit identity --------------------------------------------------- */
 
 bool omega_evidence_run_commit(char out[41]) {
@@ -159,8 +184,9 @@ bool omega_evidence_physics_commit(char *out, size_t n) {
     bool got = (fgets(buf, sizeof(buf), f) != NULL);
     fclose(f);
     if (!got || !trim_line(buf)) return false;
-    if (strlen(buf) >= n) return false;
-    strcpy(out, buf);
+    size_t len = strlen(buf);
+    if (len >= n) return false;
+    memcpy(out, buf, len + 1);
     return true;
 }
 

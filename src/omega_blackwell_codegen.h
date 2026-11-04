@@ -47,7 +47,7 @@ typedef enum {
     BW_IR_IMAD,         /* IMAD Rd, Ra, Rb/imm, Rc (multiply-add) */
     BW_IR_IMAD_WIDE,    /* IMAD.WIDE.U32 Rd:Rd+1, Ra, imm, Rc:Rc+1 */
     BW_IR_ISETP_GE,     /* ISETP.GE P0, PT, Ra, Rb/imm, PT */
-    BW_IR_LDG_E,        /* LDG.E Rd, desc[URd][Ra.64] */
+    BW_IR_LDG_E,        /* LDG.E Rd, desc[URd][Ra.64+imm] */
     BW_IR_STG_E,        /* STG.E desc[URd][Ra.64], Rb */
     BW_IR_STG_EF,       /* STG.E.EF: evict the line so the other side can see it */
     BW_IR_IADD3,        /* IADD3 Rd, PT, PT, Ra, Rb, Rc */
@@ -101,8 +101,13 @@ typedef enum {
                          * truth table over Ra = 0xf0, Rb = 0xcc, Rc = 0xaa (a|b = 0xfc, ~(a|b) = 0x03) */
     BW_IR_SHF_L_U32,    /* SHF.L.U32 Rd, Ra, Rb, RZ: Rd = Ra << Rb, register amount (the form nvcc emits
                          * for PTX shl.b32). Amounts >= 32 are NOT chip-verified: callers keep Rb < 32 */
-    BW_IR_IMAD_HI_U32,  /* IMAD.HI.U32 Rd, Ra, Rb, Rc: Rd = hi32(Ra * Rb) + Rc mod 2^32 (nvcc emits this
-                         * word for __umulhi(a, b) + c) */
+    BW_IR_IMAD_HI_U32,  /* IMAD.HI.U32 Rd, Ra, Rb, Rc: Rd = hi32(Ra * Rb + Rc+1:Rc), low word Rc. Rc is a 64-bit register
+                         * pair, NOT one 32-bit word: nvcc 13.0 zeroes the upper half before using a 32-bit c, puts
+                         * __umulhi(a, b) + c through the pair {lo 0, hi c}, and emits only even pair bases (R2, R4, UR4
+                         * in evidence/IMADHI-RC-ORACLE-nvcc13.0-20261016). Compiler reading, not chip-probed (omega #492).
+                         * The warp simulators model an even Rc as that pair and refuse an odd Rc (no evidence).
+                         * hi32(Ra * Rb) + c32 is NOT this instruction with Rc = c32: use RZ then IADD3, or SHF.R + IADD3
+                         * (the PR #487 odd-column bug, tests/gpu_imadhi_rc_test.c). Rc = RZ: src3_vreg = -1 */
     /* Structured warp reconvergence (omega #308, 2026-10-05), additive. Words matched against
      * nvcc 13.0.88 -arch=sm_121 output (BSSY.RECONVERGENT / BSYNC.RECONVERGENT; the oracle
      * kernels are listed in docs/gpu-reconvergence-308.md) and the Mesa NAK encoder
@@ -123,7 +128,24 @@ typedef enum {
     BW_IR_LDS128,       /* LDS.128 Rd..Rd+3, [Ra+imm] */
     /* Gated DeltaNet softplus (2026-10-18, omega#542): sub-op 0x0c00 checked with nvdisasm 13.0 -b SM121, which decodes
      * "MUFU.LG2 R2, R4" (EX2 0x0800, RCP 0x1000, RSQ 0x1400 decode the same way). log2(x), approximate. */
-    BW_IR_MUFU_LG2      /* MUFU.LG2 Rd, Ra */
+    BW_IR_MUFU_LG2,     /* MUFU.LG2 Rd, Ra */
+    /* Training R5 (2026-10-15), additive (numbers 60..63 after MUFU_LG2, pinned for om/encoder/bw_enc_sm121.om): native
+     * entries for the two instructions the prefill kernels used to emit as placeholders patched after encoding.
+     * Words: omega_blackwell_verify_codegen_fixtures_bfly_f2fp. */
+    BW_IR_SHFL_BFLY,    /* SHFL.BFLY PT, Rd, Ra, imm & 31, 0x1f: Rd = Ra of lane (lane ^ imm) */
+    BW_IR_F2FP_BF16_PACK, /* F2FP.BF16.F32.PACK_AB Rd, Ra, Rb: Rd = bf16_rn(Ra) << 16 | bf16_rn(Rb) (fixed latency) */
+    /* Training R5 part 2 (2026-10-15), additive: f32 global atomic add, the float twins of BW_IR_ATOMG_ADD_STRONG_SYS.
+     * Flush-to-zero like every f32 global atomic add (CUDA Programming Guide: "equivalent to PTX add.rn.ftz.f32").
+     * dst_vreg < 0 encodes RZ: the add happens and the old value is dropped (no register is written).
+     * Two scopes, same arithmetic:
+     *   .STRONG.SYS  for a word the CPU (or another agent) may watch while the kernel runs: host-visible memory.
+     *   .STRONG.GPU  for a word only this GPU touches during the kernel and reads in a later launch, e.g. a gradient
+     *                accumulated in device memory. This is the scope nvcc gives atomicAdd.
+     * nvcc's no-return form is REDG; Mesa's sm90 float REDG layout (opcode 0x9a6) does not decode on SM121 in any variant
+     * tried, so ATOMG with RZ is the no-return form here. Words: omega_blackwell_verify_codegen_fixtures_atomf32;
+     * chip probe: tests/gpu_atomf32_probe_test.c. */
+    BW_IR_ATOMG_ADD_F32_STRONG_SYS, /* ATOMG.E.ADD.F32.FTZ.RN.STRONG.SYS PT, Rd|RZ, desc[UR][Ra.64], Rb: Rd = old, mem += Rb */
+    BW_IR_ATOMG_ADD_F32_STRONG_GPU, /* ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, Rd|RZ, desc[UR][Ra.64], Rb: Rd = old, mem += Rb */
 } BlackwellIROpcode;
 
 /* Barrier (reconvergence) registers: the sm_121 BSSY/BSYNC words carry a 4-bit barrier id
@@ -348,6 +370,14 @@ int omega_blackwell_verify_codegen_fixtures_fragmm(void);
 /* omega #308: golden words for BSSY / BSYNC (nvcc 13.0.88 sm_121 oracle), plus the
  * encoder's refusals (negative delta, barrier id > 15). 0 = pass. */
 int omega_blackwell_verify_codegen_fixtures_reconv(void);
+
+/* Training R5: golden words for SHFL.BFLY and F2FP.BF16.F32.PACK_AB (nvcc 13.0.88 sm_121 oracle sealed in
+ * evidence/OWN30B-T3-TC-PEAK-BW-5faa0f70-20261013T2236Z), plus SHFL.BFLY = SHFL.DOWN with bit 58 for every lane. 0 = pass. */
+int omega_blackwell_verify_codegen_fixtures_bfly_f2fp(void);
+
+/* Training R5 part 2: golden words for ATOMG.E.ADD.F32.FTZ.RN.STRONG.SYS and .STRONG.GPU, with and without a destination
+ * (decoded with nvdisasm -b SM121; no nvcc). 0 = pass. */
+int omega_blackwell_verify_codegen_fixtures_atomf32(void);
 
 /* omega #308: encodes one instruction with a given physical register map of
  * identity (vreg n -> Rn) so offline tools can disassemble single words. 0 = ok. */
