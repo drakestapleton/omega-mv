@@ -16,16 +16,11 @@ attacker gains. A reproducer (a source file, a byte string, a recorded TLS fligh
 useful thing you can send. If the report involves a secret, say where it was exposed and do not
 include the secret itself. Do not post proof-of-concept payloads publicly.
 
-## Response targets
+## Handling
 
-This project has one maintainer; the targets below are best effort and stated honestly.
-
-- Acknowledgement: within 3 working days.
-- Triage and severity: within 7 days of acknowledgement.
-- Fix or mitigation for confirmed issues: aim for 30 days for high and critical, 90 days
-  otherwise, with a status update at least every 14 days until closed.
-- Disclosure: coordinated. An advisory is published with credit (unless you ask otherwise)
-  once the fix is on the default branch. Default embargo 90 days, negotiable.
+This project has one maintainer and publishes no response-time commitment. Reports are handled
+privately and disclosed in coordination with the reporter, with credit unless you ask otherwise,
+once the fix is on the default branch.
 
 ## Scope
 

@@ -50,6 +50,7 @@
 #include "omega_blackwell_codegen.h"
 #include "omega_sm121_disasm.h" /* C6 (L386): Omega's own disassembler replaces nvdisasm here */
 #include "bw_warp_sim.h" /* omega #308: SIMT warp simulator for --divergent */
+#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -57,6 +58,14 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* 0644, not fopen's 0666 & ~umask: a receipt is never world-writable */
+static FILE *create_0644(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (fd >= 0 && !f) close(fd);
+    return f;
+}
 
 static int g_checks, g_failed;
 static int g_sim_mode; /* --sim: the host simulator never opens the device */
@@ -350,7 +359,7 @@ static void batch_single_repeat_checks(const char *name, const BatchCtx *bc, con
 
 
 static int chip(const char *out_path) {
-    FILE *out = out_path ? fopen(out_path, "w") : NULL;
+    FILE *out = out_path ? create_0644(out_path) : NULL;
     if (out_path && !out) { printf("cannot open %s\n", out_path); return 2; }
     if (out) fprintf(out, "{\"schema\":\"OMEGA_GPU_ATTENTION_V1\",\"tolerances\":{\"rel\":2e-4,\"abs\":2e-5,\"large_scores_rel\":1e-3,\"large_scores_abs\":1e-4},\"cases\":[");
     uint32_t seed = 0xfb1c0005u;
@@ -757,7 +766,7 @@ static int sim_step(SimThr *t, const BlackwellIRProgram *p, uint32_t tid, uint32
         case BW_IR_LOP3_AND: wrs(t, in->dst_vreg, in->dst_subreg, a & in->imm, p); break;
         case BW_IR_LOP3_XOR: wrs(t, in->dst_vreg, in->dst_subreg, a ^ b, p); break;
         case BW_IR_ISETP_GE_U32: t->p0 = a >= b; break;
-        case BW_IR_LDG_E: { uint32_t x; memcpy(&x, (const void *)(uintptr_t)rd64(t, in->src1_vreg, p), 4); wrs(t, in->dst_vreg, in->dst_subreg, x, p); break; }
+        case BW_IR_LDG_E: { uint32_t x; memcpy(&x, (const void *)(uintptr_t)(rd64(t, in->src1_vreg, p) + (uint64_t)(int64_t)(int32_t)in->imm), 4); wrs(t, in->dst_vreg, in->dst_subreg, x, p); break; }
         case BW_IR_LDG_E_U16: { uint16_t x; memcpy(&x, (const void *)(uintptr_t)rd64(t, in->src1_vreg, p), 2); wrs(t, in->dst_vreg, in->dst_subreg, x, p); break; }
         case BW_IR_STG_E: memcpy((void *)(uintptr_t)rd64(t, in->src1_vreg, p), &b, 4); break;
         case BW_IR_LDG_E_64: case BW_IR_LDG_E_128: { unsigned n = in->op == BW_IR_LDG_E_64 ? 8u : 16u; uint64_t ad = rd64(t, in->src1_vreg, p) + (uint64_t)(int64_t)(int32_t)in->imm; if (ad & (n - 1)) { g_sim_err = 5; t->done = 1; return 0; } uint32_t x[4]; memcpy(x, (const void *)(uintptr_t)ad, n); for (unsigned i = 0; i < n / 4; i++) wrs(t, in->dst_vreg, i, x[i], p); break; }
@@ -858,7 +867,7 @@ static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, 
  * context falls with more CTAs per (sequence, head) or stays flat (bandwidth bound: the four query heads of a
  * kv head each read its slice). */
 static int split_timing(const char *out_path) {
-    FILE *out = out_path ? fopen(out_path, "w") : NULL;
+    FILE *out = out_path ? create_0644(out_path) : NULL;
     if (out_path && !out) { printf("cannot open %s\n", out_path); return 2; }
     enum { N = 100 };
     const uint32_t hd = g_hd, nqh = 32, nkv = 8, bs = 16, layers = 2, layer = 1;
@@ -912,7 +921,7 @@ static int split_timing(const char *out_path) {
 }
 
 static int timing(const char *out_path) {
-    FILE *out = out_path ? fopen(out_path, "w") : NULL;
+    FILE *out = out_path ? create_0644(out_path) : NULL;
     if (out_path && !out) { printf("cannot open %s\n", out_path); return 2; }
     enum { N = 100 };
     const uint32_t hd = 64, nqh = 32, nkv = 4, seq = 2048;
@@ -968,7 +977,7 @@ static int timing(const char *out_path) {
  * through this path and are reported as unavailable. Under --sim the timings are host-simulator
  * timings and the receipt says so. */
 static int sweep(const char *out_path) {
-    FILE *out = out_path ? fopen(out_path, "w") : NULL;
+    FILE *out = out_path ? create_0644(out_path) : NULL;
     if (out_path && !out) { printf("cannot open %s\n", out_path); return 2; }
     const int N = g_sim_mode ? 1 : 20;
     const uint32_t hd = 64, bs = 16, layers = 1, layer = 0;
