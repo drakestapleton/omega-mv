@@ -43,7 +43,7 @@ int main(void)
     }
     sha256_final(&c, d);
     put("fips", 3, d);
-    for (unsigned t = 0; t <= 1100 + sizeof big / sizeof big[0] - 1; t++) {
+    for (unsigned t = 0; t < 1101 + sizeof big / sizeof big[0]; t++) {
         const unsigned n = t <= 1100 ? t : big[t - 1101];
         for (unsigned k = 0; k < n; k++) buf[k] = (uint8_t)next();
         sha256_hash(buf, n, d);
