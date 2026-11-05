@@ -20,8 +20,8 @@ call sites are unchanged (`om2-evidence/AUDIT-L838.txt`).
 
 Pins: omc `62775d2a391cfef7cde64e387655caa9809a267093112910ec76bfa568f3712b`
 (rebuilt by `seed/omega-from-seed.sh`; `om/units.sh` `OMC_PIN`);
-generator `src/native.om` of omega-bridge `2ea57cbed70154b256defbc3bf48c40c9fb00ab4`
-(`om/omega-bridge.lock`; sha256 `a564bf20d99b65b2336c443b7f1e0e00cd866afff9db6b6a73e9488df9e00dd3`),
+generator `src/native.om` of omega-bridge `962924233146f349da8486c7bce726f67b4dac4c`
+(omega-bridge#45 merged; `om/omega-bridge.lock`; sha256 `2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d`),
 whose outputs `freest` and `fapic` generate `src/omega_om_units_fs.c`.
 
 ## Behaviour (spec/omegese-om2.md section 7, errata E3)
