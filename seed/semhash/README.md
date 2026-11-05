@@ -51,11 +51,13 @@ The other exit codes are:
 
 ## Duplicate-function report (#827 M1)
 
-`sh seed/semhash/dups.sh SEMHASH [DIR...]` hashes every `.om` unit under the given directories
-(default `om seed`, from the repository root, in `LC_ALL=C` path order), puts each unit's path in
-front of its `FN` lines and pipes them to `SEMHASH dups`. A unit that semhash refuses becomes
-`SKIP path rc=N reason`. Equal hashes mean equal meaning as far as this tool can prove it (see the
-next two sections), so a group is a set of functions that one shared definition could replace.
+`sh seed/semhash/dups.sh SEMHASH [-i INDEX] [DIR...]` hashes every `.om` unit under the given
+directories (default `om seed`, from the repository root, in `LC_ALL=C` path order), puts each
+unit's path in front of its `FN` lines and pipes them to `SEMHASH dups`. A unit that semhash
+refuses becomes `SKIP path rc=N reason`. With `-i INDEX` the records themselves, which form the
+function-level meaning-hash index (one `PATH FN name hex line=N...` line per function), are also
+written to `INDEX`. Equal hashes mean equal meaning as far as this tool can prove it (see the next
+two sections), so a group is a set of functions that one shared definition could replace.
 The grouping is in `semhash.om`; the script only lists files and runs the tool.
 
 At omega-mv `d3d1b1bc` the report over `om/` and `seed/` is `dups/report-d3d1b1bc.txt`:
