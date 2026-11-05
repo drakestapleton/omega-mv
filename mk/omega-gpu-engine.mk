@@ -180,16 +180,58 @@ build/test_codegen_freestanding: $(CODEGEN_FS_TEST_DEPS) $(GPU_FS_LINK)
 # split), and the FIPS digests must be the published ones. Controls: the hosted codegen test hashes through the
 # Omega binding (omega2_sha256_*), and a copy of the freestanding binding whose machine code loads round constant
 # K[0] as 0x428a2f99 (movz x1,#0x2f98 -> #0x2f99) must FAIL the comparison.
-.PHONY: test-sha256-freestanding-parity
+.PHONY: test-sha256-freestanding-parity test-sha256-freestanding-red-control
 SHA256_FS_PARITY_DEPS = tests/test_sha256_freestanding_parity.c src/sha256.h src/omega_api_decl.h src/omega_native.h
 SHA256_FS_RED = build/sha256_parity_red
+# A killed digest mutant must finish normally and emit every expected case, in order. A crash,
+# empty/partial output or malformed digest is a broken control, not evidence of a digest mismatch.
+# Arguments: executable, mutant output, known-good output (already checked above).
+define SHA256_FS_CHECK_RED
+"$(1)" > "$(2)" || { echo "RED CHECK BROKEN: mutant did not complete"; exit 1; }; \
+awk 'NF != 3 || ($$1 != "fips" && $$1 != "len") || length($$3) != 64 || $$3 ~ /[^0-9a-f]/ { exit 1 }' "$(2)" \
+	|| { echo "RED CHECK BROKEN: malformed mutant output"; exit 1; }; \
+awk '{ print $$1, $$2 }' "$(2)" > "$(2).cases" && \
+awk '{ print $$1, $$2 }' "$(3)" > "$(2).expected-cases" && \
+cmp -s "$(2).cases" "$(2).expected-cases" \
+	|| { echo "RED CHECK BROKEN: mutant did not emit every expected case in order"; exit 1; }; \
+awk '{ print $$3 }' "$(2)" > "$(2).digests" && \
+awk '{ print $$3 }' "$(3)" > "$(2).expected-digests" \
+	|| { echo "RED CHECK BROKEN: could not read digests"; exit 1; }; \
+if cmp -s "$(2).digests" "$(2).expected-digests"; then echo "RED CHECK BROKEN: a wrong round constant passed"; exit 1; \
+else [ $$? = 1 ] || { echo "RED CHECK BROKEN: could not compare mutant output"; exit 1; }; \
+echo "red check: K[0] changed in the freestanding machine code FAILS the comparison after a complete run"; fi
+endef
+
+# Host-only checks of the same control, with synthetic executables and output. No Omega code runs.
+test-sha256-freestanding-red-control:
+	@set -eu; mkdir -p build; d=$$(mktemp -d build/sha256-red-control.XXXXXX); trap 'rm -rf "$$d"' EXIT; \
+	printf 'fips 0 %064d\nlen 0 %064d\n' 0 0 > "$$d/reference"; \
+	printf 'fips 0 %064d\nlen 0 %064d\n' 1 1 > "$$d/wrong"; \
+	printf '%s\n' '#!/bin/sh' 'case "$$CASE" in' \
+	  'failed-empty) exit 1 ;;' 'failed-full) cat "$$BAD"; exit 1 ;;' 'empty) exit 0 ;;' \
+	  'partial) head -n 1 "$$BAD" ;;' 'malformed) printf "fips 0 bad\nlen 0 bad\n" ;;' \
+	  'reordered) tail -n 1 "$$BAD"; head -n 1 "$$BAD" ;;' \
+	  'extra) cat "$$BAD"; head -n 1 "$$BAD" ;;' \
+	  'whitespace) sed "s/ /  /g" "$$REF" ;;' 'no-newline) printf "%s" "$$(cat "$$REF")" ;;' \
+	  'unchanged) cat "$$REF" ;;' 'wrong) cat "$$BAD" ;;' 'esac' > "$$d/runner"; \
+	chmod +x "$$d/runner"; REF="$$d/reference"; BAD="$$d/wrong"; export REF BAD CASE; \
+	for CASE in failed-empty failed-full empty partial malformed reordered extra unchanged whitespace no-newline; do \
+	  if ( $(call SHA256_FS_CHECK_RED,$$d/runner,$$d/red,$$d/reference) ) > "$$d/log" 2>&1; then \
+	    echo "FAIL SHA256 red control accepted $$CASE"; cat "$$d/log"; exit 1; \
+	  fi; \
+	done; \
+	CASE=wrong; ( $(call SHA256_FS_CHECK_RED,$$d/runner,$$d/red,$$d/reference) ) > "$$d/log" 2>&1 \
+	  || { echo "FAIL SHA256 red control rejected a complete digest mismatch"; cat "$$d/log"; exit 1; }; \
+	echo "PASS SHA256 red control: 10 broken controls refused, complete digest mismatch accepted (synthetic host-only)"
+
 build/test_sha256_parity_hosted: $(SHA256_FS_PARITY_DEPS) src/omega_om_units.c
 	@mkdir -p build
 	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Isrc -o $@ tests/test_sha256_freestanding_parity.c src/omega_om_units.c -pthread
 build/test_sha256_parity_freestanding: $(SHA256_FS_PARITY_DEPS) $(GPU_FS_DIR)/omega_om_units_fs.o
 	@mkdir -p build
 	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc -o $@ tests/test_sha256_freestanding_parity.c $(GPU_FS_DIR)/omega_om_units_fs.o
-test-sha256-freestanding-parity: build/test_sha256_parity_hosted build/test_sha256_parity_freestanding build/test_codegen_hosted
+test-sha256-freestanding-parity: build/test_sha256_parity_hosted build/test_sha256_parity_freestanding build/test_codegen_hosted \
+		test-sha256-freestanding-red-control
 	./build/test_sha256_parity_hosted > build/sha256_parity_hosted.txt
 	./build/test_sha256_parity_freestanding > build/sha256_parity_freestanding.txt
 	cmp build/sha256_parity_hosted.txt build/sha256_parity_freestanding.txt
@@ -210,9 +252,7 @@ test-sha256-freestanding-parity: build/test_sha256_parity_hosted build/test_sha2
 	gcc $(GPU_FS_CFLAGS) -c -o $(SHA256_FS_RED)/red.o $(SHA256_FS_RED)/red.c
 	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc -o $(SHA256_FS_RED)/parity_red tests/test_sha256_freestanding_parity.c \
 		$(SHA256_FS_RED)/red.o
-	@./$(SHA256_FS_RED)/parity_red > $(SHA256_FS_RED)/red.txt || true; \
-	if cmp -s $(SHA256_FS_RED)/red.txt build/sha256_parity_hosted.txt; then echo "RED CHECK BROKEN: a wrong round constant passed"; exit 1; \
-	else echo "red check: K[0] changed in the freestanding machine code FAILS the comparison ($$(cmp $(SHA256_FS_RED)/red.txt build/sha256_parity_hosted.txt | head -1))"; fi
+	@$(call SHA256_FS_CHECK_RED,$(SHA256_FS_RED)/parity_red,$(SHA256_FS_RED)/red.txt,build/sha256_parity_hosted.txt)
 test-codegen-freestanding: build/test_codegen_hosted build/test_codegen_freestanding test-gpu-fs-allowlist-control \
 		test-sha256-freestanding-parity
 	./build/test_codegen_hosted --dump > build/codegen_dump_hosted.txt
