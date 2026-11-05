@@ -22,6 +22,8 @@
 # A unit, compiler or profile that changes without regenerating these files fails --check.
 # OMEGA_UNITS (the unit list, repo-relative or absolute) and OMEGA_UNITS_DEST (output directory, default src)
 # override the defaults; mk/om-encoder.mk uses them to build mutant encoders beside the real binding.
+# Freestanding selection follows source-file identity, so absolute paths and aliases of FS_UNITS work.
+# With no selected freestanding unit, omega_om_units_fs.c contains only a comment (no stale binding).
 set -eu
 OMC_PIN=b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55
 NATIVE_PIN=2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d
@@ -48,13 +50,19 @@ for u in $UNITS; do
   { cat "$src"; printf '\0'; printf '%08d' "$(wc -c < "$T/u.bin")"; cat "$T/u.bin"
     [ $abi = 1 ] || printf 'omega-unit %s %s\n' "$name" "$OMC_PIN"; } > "$T/u.in"
   cat "$T/u.in" >> "$T/units.in"
-  case " $FS_UNITS " in *" $u "*) cat "$T/u.in" >> "$T/fs.in";; esac
+  for fs in $FS_UNITS; do
+    if [ "$src" -ef "$ROOT/$fs" ]; then cat "$T/u.in" >> "$T/fs.in"; break; fi
+  done
   echo "omega-ident 1 unit=$name abi=$abi profile=$prof src=$(sha256sum < "$src" | cut -c1-64) omc=$OMC_PIN path=$u" >> "$T/omega_om_units.ident"
 done
 { "$T/native" c < "$T/units.in"; "$T/native" apic < "$T/units.in"; } > "$T/omega_om_units.c"
 "$T/native" h < "$T/units.in" > "$T/omega_native.h"
 "$T/native" apih < "$T/units.in" > "$T/omega_api_decl.h"
-{ "$T/native" freest < "$T/fs.in"; "$T/native" fapic < "$T/fs.in"; } > "$T/omega_om_units_fs.c"
+if [ -s "$T/fs.in" ]; then
+  { "$T/native" freest < "$T/fs.in"; "$T/native" fapic < "$T/fs.in"; } > "$T/omega_om_units_fs.c"
+else
+  printf '/* No freestanding units selected by OMEGA_UNITS. */\n' > "$T/omega_om_units_fs.c"
+fi
 if [ "${1:-}" = --check ]; then
   bad=0
   for f in $OUTS; do cmp -s "$T/$f" "$DEST/$f" || { echo "FAIL $DEST/$f differs from the pinned tools' output"; bad=1; }; done
