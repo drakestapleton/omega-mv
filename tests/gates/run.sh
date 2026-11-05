@@ -240,6 +240,12 @@ case "$step" in
                       # physics-src at physics.lock; host, no device (the chip run is by hand)
     physics_pin; make test-atomf32-probe-host ;;
   gpu-decode-graph)   physics_pin; make test-gpu-decode-graph ;;
+  gpu-prefill-host)   # omega #456: the prefill host/sim tests and the -Werror build of tools/own30b_decode_profile.c; no device
+    physics_pin; set -o pipefail; mkdir -p build
+    make test-gpu-prefill-host check-own30b-decode-profile | tee "$OUT_DIR/prefill-host.log"
+    grep -qx 'test-gpu-prefill-host: PASS (8 prefill tests, host model + warp simulator, no device)' "$OUT_DIR/prefill-host.log"
+    grep -qx 'check-own30b-decode-profile: PASS (compiles with -Werror)' "$OUT_DIR/prefill-host.log"
+    ;;
   # host-suites-3.yml
   numeric-lifecycle)  make $NOPHYS test-numeric-lifecycle ;;
   numeric-transc-digest)
