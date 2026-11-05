@@ -77,6 +77,11 @@ That pin is historical. The x86efi compiler from PR #1015 is
 (`seed/omc/omc.om` `16b4ca40a5bd7796ac08b55d1ceadac1260e52298ed123f45418e77b3221c749`).
 On 2026-11-04 the tape suite passed against it natively (DGX Spark, Linux aarch64):
 `TAPE_SUITE_PASS NATIVE_TAPE_PASS checks=302`, all three compiled mutants failed with status 1.
+The compiler of PR #1022 (`efi 14`) is
+`3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`
+(`seed/omc/omc.om` `0effe37afc4ddd0507151c9f2afa34b3e6774eae7006cbecd8c59f11bc386db7`).
+On 2026-11-04 the tape suite passed against it the same way (DGX Spark, Linux aarch64, core 9):
+`TAPE_SUITE_PASS NATIVE_TAPE_PASS checks=302`, all three compiled mutants failed with status 1.
 
 ```sh
 OMC=<pinned omc> OUT=<scratch> sh tests/autodiff664/run-tape.sh
