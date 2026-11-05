@@ -23,9 +23,10 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`,
-   from `seed/omc/omc.om` `16b4ca40a5bd7796ac08b55d1ceadac1260e52298ed123f45418e77b3221c749`).
-   The earlier audit pin `be8c51301307555254fc59e351d281aae1aa096d91521777e33a41c8b446448a` was main 9920aab1 and is historical.
+   `3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`,
+   from `seed/omc/omc.om` `0effe37afc4ddd0507151c9f2afa34b3e6774eae7006cbecd8c59f11bc386db7`; the x86efi
+   `efi 14` reseed of PR #1022). The earlier audit pins `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`
+   (PR #1015, main d3d1b1bc) and `be8c51301307555254fc59e351d281aae1aa096d91521777e33a41c8b446448a` (main 9920aab1) are historical.
 2. Native host words (ids 100..165) and device and mapping words (ids 166..177) in
    `docs/one_layer/OMEGESE.md` and `seed/host/`: what effects compiled programs can perform.
 3. Seeded libraries that parse input: `seed/json`, `seed/net` (`http.om`), `seed/wasm`,
