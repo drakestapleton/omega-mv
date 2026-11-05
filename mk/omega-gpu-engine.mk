@@ -162,7 +162,10 @@ test-gpu-engine-freestanding: $(GPU_FS_LINK) build/test_omega_gpu_engine_freesta
 # nm -u check to refuse it (a check that can never fail proves nothing).
 .PHONY: test-codegen-freestanding test-gpu-fs-allowlist-control
 CODEGEN_FS_TEST_DEPS = tests/test_omega_codegen_freestanding.c src/omega_blackwell_codegen.h src/omega_blackwell_matmul.h
-build/test_codegen_hosted: $(CODEGEN_FS_TEST_DEPS) src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_om_units.c
+# The hosted side encodes through the .om encoder (om/encoder/bw_enc_sm121.om via src/omega_om_units.c), the
+# freestanding side through the migration-pending C encoder, so the cmp below is also an .om-vs-C differential.
+build/test_codegen_hosted: $(CODEGEN_FS_TEST_DEPS) src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_om_units.c \
+		src/omega_native.h
 	@mkdir -p build
 	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc -o $@ tests/test_omega_codegen_freestanding.c \
 		src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_om_units.c
@@ -173,17 +176,20 @@ build/test_codegen_freestanding: $(CODEGEN_FS_TEST_DEPS) $(GPU_FS_LINK)
 
 # The freestanding SHA-256 binding against the hosted one: tests/test_sha256_freestanding_parity.c built over
 # src/omega_om_units.c (hosted) and over the GPU_FS_CFLAGS object of src/omega_om_units_fs.c must print the same
-# digests (the FIPS 180-2 vectors, lengths 0..300 of a fixed-seed stream one-shot and split), and the FIPS
-# digests must be the published ones.
+# digests (the FIPS 180-2 vectors; lengths 0..1100, 4096, 65536 and 1048583 of a fixed-seed stream one-shot and
+# split), and the FIPS digests must be the published ones. Controls: the hosted codegen test hashes through the
+# Omega binding (omega2_sha256_*), and a copy of the freestanding binding whose machine code loads round constant
+# K[0] as 0x428a2f99 (movz x1,#0x2f98 -> #0x2f99) must FAIL the comparison.
 .PHONY: test-sha256-freestanding-parity
 SHA256_FS_PARITY_DEPS = tests/test_sha256_freestanding_parity.c src/sha256.h src/omega_api_decl.h src/omega_native.h
+SHA256_FS_RED = build/sha256_parity_red
 build/test_sha256_parity_hosted: $(SHA256_FS_PARITY_DEPS) src/omega_om_units.c
 	@mkdir -p build
 	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Isrc -o $@ tests/test_sha256_freestanding_parity.c src/omega_om_units.c -pthread
 build/test_sha256_parity_freestanding: $(SHA256_FS_PARITY_DEPS) $(GPU_FS_DIR)/omega_om_units_fs.o
 	@mkdir -p build
 	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc -o $@ tests/test_sha256_freestanding_parity.c $(GPU_FS_DIR)/omega_om_units_fs.o
-test-sha256-freestanding-parity: build/test_sha256_parity_hosted build/test_sha256_parity_freestanding
+test-sha256-freestanding-parity: build/test_sha256_parity_hosted build/test_sha256_parity_freestanding build/test_codegen_hosted
 	./build/test_sha256_parity_hosted > build/sha256_parity_hosted.txt
 	./build/test_sha256_parity_freestanding > build/sha256_parity_freestanding.txt
 	cmp build/sha256_parity_hosted.txt build/sha256_parity_freestanding.txt
@@ -193,8 +199,20 @@ test-sha256-freestanding-parity: build/test_sha256_parity_hosted build/test_sha2
 	  '3 cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0' > build/sha256_parity_fips.txt
 	@grep '^fips ' build/sha256_parity_freestanding.txt | cmp -s - build/sha256_parity_fips.txt \
 	  || { echo "sha256 freestanding parity: FIPS digests wrong"; exit 1; }
-	@[ "$$(grep -c '^len ' build/sha256_parity_freestanding.txt)" = 301 ] || { echo "sha256 freestanding parity: expected 301 lengths"; exit 1; }
-	@echo "sha256 freestanding parity: hosted and freestanding bindings agree on 4 FIPS vectors and 301 lengths (0..300)"
+	@[ "$$(grep -c '^len ' build/sha256_parity_freestanding.txt)" = 1104 ] || { echo "sha256 freestanding parity: expected 1104 lengths"; exit 1; }
+	@echo "sha256 freestanding parity: hosted and freestanding bindings agree on 4 FIPS vectors and 1104 lengths (0..1100, 4096, 65536, 1048583)"
+	@n=$$(nm build/test_codegen_hosted | grep -c ' T omega2_sha256_'); [ "$$n" -ge 4 ] || \
+		{ echo "FAIL: the hosted codegen test does not hash through the Omega binding"; exit 1; }; \
+	echo "control: hosted codegen test links $$n omega2_sha256_* functions"
+	@mkdir -p $(SHA256_FS_RED)
+	sed 's/0x01,0xf3,0x85,0xd2/0x21,0xf3,0x85,0xd2/' src/omega_om_units_fs.c > $(SHA256_FS_RED)/red.c
+	@! cmp -s $(SHA256_FS_RED)/red.c src/omega_om_units_fs.c || { echo "RED MUTANT BROKEN: sed changed nothing"; exit 1; }
+	gcc $(GPU_FS_CFLAGS) -c -o $(SHA256_FS_RED)/red.o $(SHA256_FS_RED)/red.c
+	gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc -o $(SHA256_FS_RED)/parity_red tests/test_sha256_freestanding_parity.c \
+		$(SHA256_FS_RED)/red.o
+	@./$(SHA256_FS_RED)/parity_red > $(SHA256_FS_RED)/red.txt || true; \
+	if cmp -s $(SHA256_FS_RED)/red.txt build/sha256_parity_hosted.txt; then echo "RED CHECK BROKEN: a wrong round constant passed"; exit 1; \
+	else echo "red check: K[0] changed in the freestanding machine code FAILS the comparison ($$(cmp $(SHA256_FS_RED)/red.txt build/sha256_parity_hosted.txt | head -1))"; fi
 test-codegen-freestanding: build/test_codegen_hosted build/test_codegen_freestanding test-gpu-fs-allowlist-control \
 		test-sha256-freestanding-parity
 	./build/test_codegen_hosted --dump > build/codegen_dump_hosted.txt

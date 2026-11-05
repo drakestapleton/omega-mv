@@ -44,15 +44,15 @@
  *                      an exit jumped past it, or a target was corrupted)
  *   WS_E_NEVER_JOINED  the warp finished with a barrier still armed
  *   WS_E_SELF_BRANCH, WS_E_PC, WS_E_OP, WS_E_SHIFT, WS_E_MEM, WS_E_SMEM, WS_E_FRAGS
- *   WS_E_IMADHI_RC     IMAD.HI.U32 with a register Rc: the chip reads Rc as a 64-bit pair (omega #492,
- *                      nvcc oracle, chip probe pending), so a non-RZ Rc is refused, not modelled
+ *   WS_E_IMADHI_RC     IMAD.HI.U32 with an odd register Rc. An even Rc is modelled as the 64-bit pair
+ *                      Rc+1:Rc the chip reads (omega #492, nvcc oracle, chip probe pending); odd has no evidence
  * Every error names the pc. Memory: global addresses are host pointers (optionally range
  * checked); shared memory is a per-CTA buffer poisoned at CTA start so a read of a word
  * nobody wrote shows up in the oracle comparison.
  *
  * Per-lane ALU semantics are those of the two earlier simulators (tests/gpu_attention_test.c,
- * bench/prime_race/tests/gb10_sieve_host_test.c). EX2 and RCP are exact here; the chip's
- * are approximate. LDCU64 (memory descriptor) is not modelled. */
+ * bench/prime_race/tests/gb10_sieve_host_test.c). MUFU EX2 / RCP / RSQ are the correctly
+ * rounded IEEE value with the chip's subnormal flush (bw_mufu_ftz.h); the chip's are approximate. LDCU64 (memory descriptor) is not modelled. */
 #ifndef BW_WARP_SIM_K_H
 #define BW_WARP_SIM_K_H
 /* bw_warp_sim_k.h (OWN-30B cut 8, 2026-10-13): tests/bw_warp_sim.h plus the system-scope opcodes the decode attention
@@ -60,6 +60,7 @@
  * The simulator runs CTAs one after another, so an atomic counter sees every earlier CTA's add. */
 
 #include "omega_blackwell_codegen.h"
+#include "bw_mufu_ftz.h" /* MUFU EX2 / RCP / RSQ: the chip's flush of subnormal inputs and results (omega #462) */
 #include "omega_blackwell_codegen_tc.h"
 #include <math.h>
 #include <stdint.h>
@@ -108,6 +109,7 @@ typedef struct {
     uint32_t smem_bytes;
     WsRange ranges[WS_MAX_RANGES]; int nranges; /* when > 0, every global access must fall in one */
     int order;                /* 0 = lowest pc first, 1 = highest pc first */
+    uint32_t warp_sched;      /* warp visit order per barrier phase: 0 ascending, 1 descending, else a seed for a fresh shuffle each phase */
     int trace;                /* print every issue of warp 0 of CTA (0,0) */
     uint64_t step_budget;     /* scheduling steps per warp before "step budget" (0 = 2e9); tests of a dropped loop guard set it low */
     /* results */
@@ -166,9 +168,16 @@ static void ws_lane_exec(WsSim *s, WsLane *l, const BlackwellIRInsn *in, int pc,
     case BW_IR_MOV_RZ: ws_wrs(l, in->dst_vreg, in->dst_subreg, 0, p); break;
     case BW_IR_IMAD: ws_wrs(l, in->dst_vreg, in->dst_subreg, in->src2_vreg >= 0 ? a * b + c : a * in->imm + c, p); break;
     case BW_IR_IMAD_WIDE: ws_wr64(l, in->dst_vreg, (uint64_t)a * in->imm + ws_rd64(l, in->src3_vreg, p), p); break;
-    case BW_IR_IMAD_HI_U32: /* Rd = hi32(Ra * Rb) with Rc = RZ. The chip reads a register Rc as a 64-bit pair (omega #492): refused until a chip probe pins the model */
-        if (in->src3_vreg >= 0) { ws_fail(s, WS_E_IMADHI_RC, pc, "IMAD.HI.U32 with a register Rc (the chip reads Rc as a 64-bit pair, not chip-probed): use RZ, or SHF.R + IADD3"); return; }
-        ws_wrs(l, in->dst_vreg, in->dst_subreg, (uint32_t)(((uint64_t)a * b) >> 32), p); break;
+    case BW_IR_IMAD_HI_U32: { /* Rd = hi32(Ra * Rb + Rc+1:Rc). A register Rc is a 64-bit pair, low word Rc (omega #492, nvcc 13.0
+                               * oracle evidence/IMADHI-RC-ORACLE-nvcc13.0-20261016, not chip-probed); an odd Rc has no evidence: refused */
+        uint64_t c64 = 0;
+        int rc = in->src3_vreg >= 0 ? p->regalloc.vreg_to_phys[in->src3_vreg] : -1;
+        if (rc >= 0) {
+            rc = (rc + in->src3_subreg) & 0xff;
+            if (rc & 1) { ws_fail(s, WS_E_IMADHI_RC, pc, "IMAD.HI.U32 with an odd register Rc (the chip reads a 64-bit pair; nvcc emits only even bases, odd not chip-probed): use RZ or an even pair"); return; }
+            c64 = (uint64_t)l->r[rc] | ((uint64_t)l->r[rc + 1] << 32);
+        }
+        ws_wrs(l, in->dst_vreg, in->dst_subreg, (uint32_t)(((uint64_t)a * b + c64) >> 32), p); break; }
     case BW_IR_IADD3: ws_wrs(l, in->dst_vreg, in->dst_subreg, a + b, p); break; /* the encoder's IADD3 has Rc = RZ */
     case BW_IR_SHF_R: ws_wrs(l, in->dst_vreg, in->dst_subreg, a >> (in->imm & 31), p); break;
     case BW_IR_SHF_L_U32: if (b >= 32) { ws_fail(s, WS_E_SHIFT, pc, "SHF.L.U32 amount >= 32 (not chip-verified)"); return; } ws_wrs(l, in->dst_vreg, in->dst_subreg, a << b, p); break;
@@ -176,7 +185,7 @@ static void ws_lane_exec(WsSim *s, WsLane *l, const BlackwellIRInsn *in, int pc,
     case BW_IR_LOP3_XOR: ws_wrs(l, in->dst_vreg, in->dst_subreg, a ^ b, p); break;
     case BW_IR_LOP3_LUT: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_lut3(in->imm & 0xff, a, b, c), p); break;
     case BW_IR_ISETP_GE_U32: l->p0 = a >= b; break;
-    case BW_IR_LDG_E: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t x; memcpy(&x, (const void *)(uintptr_t)ad, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
+    case BW_IR_LDG_E: { uint64_t ad = ws_rd64(l, in->src1_vreg, p) + (uint64_t)(int64_t)(int32_t)in->imm; if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t x; memcpy(&x, (const void *)(uintptr_t)ad, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
     case BW_IR_LDG_E_U16: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 2, pc)) return; uint16_t x; memcpy(&x, (const void *)(uintptr_t)ad, 2); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
     /* STG.E takes the signed 24-bit byte offset the encoder writes (nvdisasm 13.0 -b SM121 decodes "STG.E desc[UR4][R4.64+0x1e0c], R9", omega#542) */
     case BW_IR_STG_E: { uint64_t ad = ws_rd64(l, in->src1_vreg, p) + (uint64_t)(int64_t)(int32_t)in->imm; if (!ws_mem_ok(s, ad, 4, pc)) return; memcpy((void *)(uintptr_t)ad, &b, 4); break; }
@@ -189,13 +198,12 @@ static void ws_lane_exec(WsSim *s, WsLane *l, const BlackwellIRInsn *in, int pc,
     case BW_IR_FMUL: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_u2f(a) * ws_u2f(b)), p); break;
     case BW_IR_I2FP: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u((float)(int32_t)a), p); break; /* I2FP.F32.S32, round to nearest */
     case BW_IR_FFMA: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(fmaf(ws_u2f(a), ws_u2f(b), ws_u2f(c))), p); break;
-    case BW_IR_FMNMX_MAX:
-        if (in->imm == OMEGA_TC_MARK_F2FP) { ws_wrs(l, in->dst_vreg, in->dst_subreg, (ws_k_bf16_rn(a) << 16) | ws_k_bf16_rn(b), p); break; } /* F2FP.BF16.F32.PACK_AB placeholder (L313 bf16 state) */
-        ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(fmaxf(ws_u2f(a), ws_u2f(b))), p); break;
+    case BW_IR_F2FP_BF16_PACK: ws_wrs(l, in->dst_vreg, in->dst_subreg, (ws_k_bf16_rn(a) << 16) | ws_k_bf16_rn(b), p); break; /* F2FP.BF16.F32.PACK_AB (L313 bf16 state) */
+    case BW_IR_FMNMX_MAX: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(fmaxf(ws_u2f(a), ws_u2f(b))), p); break;
     case BW_IR_FMNMX_MIN: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(fminf(ws_u2f(a), ws_u2f(b))), p); break;
-    case BW_IR_MUFU_EX2: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(exp2f(ws_u2f(a))), p); break;
-    case BW_IR_MUFU_RCP: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(1.0f / ws_u2f(a)), p); break;
-    case BW_IR_MUFU_RSQ: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(1.0f / sqrtf(ws_u2f(a))), p); break;
+    case BW_IR_MUFU_EX2: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_ex2(ws_u2f(a))), p); break;
+    case BW_IR_MUFU_RCP: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_rcp(ws_u2f(a))), p); break;
+    case BW_IR_MUFU_RSQ: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(ws_mufu_rsq(ws_u2f(a))), p); break;
     case BW_IR_MUFU_LG2: ws_wrs(l, in->dst_vreg, in->dst_subreg, ws_f2u(log2f(ws_u2f(a))), p); break;
     case BW_IR_LDG_STRONG_SYS: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; uint32_t x; memcpy(&x, (const void *)(uintptr_t)ad, 4); ws_wrs(l, in->dst_vreg, in->dst_subreg, x, p); break; }
     case BW_IR_STG_STRONG_SYS: { uint64_t ad = ws_rd64(l, in->src1_vreg, p); if (!ws_mem_ok(s, ad, 4, pc)) return; memcpy((void *)(uintptr_t)ad, &b, 4); break; }
@@ -296,13 +304,13 @@ static int ws_run_warp(WsSim *s, WsWarp *w, uint32_t warp, uint32_t cx, uint32_t
             }
             break;
         }
-        case BW_IR_SHFL_DOWN: {
+        case BW_IR_SHFL_DOWN: case BW_IR_SHFL_BFLY: {
             if (w->exited) { ws_fail(s, WS_E_SHFL_EXITED, pc, "SHFL on a warp with exited lanes"); return -1; }
             if (mask != live) { ws_fail(s, WS_E_SHFL_SPLIT, pc, "SHFL on a split warp"); return -1; }
             uint32_t src[WS_WARP];
             for (int L = 0; L < WS_WARP; L++) src[L] = ws_rd(&w->lane[L], in->src1_vreg, p);
-            /* SHFL.BFLY (imm bit 31, OMEGA_TC_MARK_BFLY: patched in after encoding, omega_blackwell_codegen_tc.h): lane L reads L ^ lane */
-            if (in->imm & 0x80000000u) { for (int L = 0; L < WS_WARP; L++) ws_wr(&w->lane[L], in->dst_vreg, src[L ^ (int)(in->imm & 31)], p); f->pc = pc + 1; break; }
+            /* SHFL.BFLY: lane L reads L ^ lane */
+            if (in->op == BW_IR_SHFL_BFLY) { for (int L = 0; L < WS_WARP; L++) ws_wr(&w->lane[L], in->dst_vreg, src[L ^ (int)(in->imm & 31)], p); f->pc = pc + 1; break; }
             for (int L = 0; L < WS_WARP; L++) { int from = L + (int)(in->imm & 31); ws_wr(&w->lane[L], in->dst_vreg, from < WS_WARP ? src[from] : src[L], p); }
             f->pc = pc + 1;
             break;
@@ -338,9 +346,16 @@ static int ws_run(WsSim *s, uint32_t grid_x, uint32_t grid_y) {
         /* Barrier phases: every warp runs until all of its fragments are parked at BAR.SYNC or it
          * has finished (exited lanes do not hold the barrier up: INFERRED, see WS_E_BAR_SPLIT).
          * Then every parked fragment is released and the next phase starts. */
+        uint32_t rng = s->warp_sched;
         for (int phase = 0; ; phase++) {
             int parked = 0;
-            for (uint32_t w = 0; w < nw && !s->err; w++) {
+            /* visit order: the chip gives no order between warps, so a slot or barrier mistake that the fixed order hides
+             * must show under the reversed or a shuffled one */
+            uint32_t vis[WS_MAX_WARPS];
+            for (uint32_t i = 0; i < nw; i++) vis[i] = s->warp_sched == 1 ? nw - 1u - i : i;
+            if (s->warp_sched > 1) for (uint32_t i = nw - 1u; i > 0; i--) { rng = rng * 1664525u + 1013904223u; uint32_t j = (rng >> 8) % (i + 1u); uint32_t t = vis[i]; vis[i] = vis[j]; vis[j] = t; }
+            for (uint32_t vi = 0; vi < nw && !s->err; vi++) {
+                const uint32_t w = vis[vi];
                 if (warps[w].nfrag == 0) continue;
                 int r = ws_run_warp(s, &warps[w], w, cx, cy, trace && w == 0);
                 if (r < 0) break;

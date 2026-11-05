@@ -3,8 +3,9 @@
  * binding src/omega_om_units_fs.c compiled with GPU_FS_CFLAGS. Both print the same lines; the make
  * target compares them byte for byte and checks the FIPS 180-2 digests.
  *   fips <i> <digest>   empty, "abc", the 448-bit message, one million 'a' (in uneven update calls)
- *   len <n> <digest>    n = 0..300 bytes from a fixed-seed xorshift64 stream, one-shot; the same bytes
- *                       through init/update/final split at a seeded point must give the same digest
+ *   len <n> <digest>    n = 0..1100 (every padding boundary 55/56/63/64/65 and its block multiples), 4096,
+ *                       65536 and 1048583 bytes from a fixed-seed xorshift64 stream, one-shot; the same
+ *                       bytes through init/update/final split at a seeded point must give the same digest
  *                       (else "split-mismatch <n>" and exit 1). */
 #include "sha256.h"
 #include <stdio.h>
@@ -27,20 +28,23 @@ static uint64_t next(void)
 int main(void)
 {
     static const char *const fips[] = { "", "abc", "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" };
-    static uint8_t buf[1000000];
+    enum { MILLION = 1000000, LEN_MAX = 1048583 };
+    static const unsigned big[] = { 4096, 65536, LEN_MAX };
+    static uint8_t buf[LEN_MAX];
     uint8_t d[SHA256_DIGEST_SIZE], e[SHA256_DIGEST_SIZE];
     sha256_ctx c;
     unsigned i;
     for (i = 0; i < 3; i++) { sha256_hash((const uint8_t *)fips[i], strlen(fips[i]), d); put("fips", i, d); }
-    memset(buf, 'a', sizeof buf);
+    memset(buf, 'a', MILLION);
     sha256_init(&c);
-    for (size_t off = 0, step = 1; off < sizeof buf; off += step, step = step * 3 + 7) {
-        size_t n = sizeof buf - off < step ? sizeof buf - off : step;
+    for (size_t off = 0, step = 1; off < MILLION; off += step, step = step * 3 + 7) {
+        size_t n = MILLION - off < step ? MILLION - off : step;
         sha256_update(&c, buf + off, n);
     }
     sha256_final(&c, d);
     put("fips", 3, d);
-    for (unsigned n = 0; n <= 300; n++) {
+    for (unsigned t = 0; t <= 1100 + sizeof big / sizeof big[0] - 1; t++) {
+        const unsigned n = t <= 1100 ? t : big[t - 1101];
         for (unsigned k = 0; k < n; k++) buf[k] = (uint8_t)next();
         sha256_hash(buf, n, d);
         const unsigned cut = n ? (unsigned)(next() % (n + 1)) : 0;
