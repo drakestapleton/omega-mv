@@ -183,7 +183,7 @@ def run_omc(omc, lits, tmp):
         r = subprocess.run([omc], stdin=fi, stdout=fo, stderr=subprocess.PIPE)
     if r.returncode != 0:
         return None, r.returncode, r.stderr.decode()
-    os.chmod(exe, 0o755)
+    os.chmod(exe, 0o700)
     r = subprocess.run([exe], stdout=subprocess.PIPE)
     if r.returncode != 0:
         raise SystemExit("FLOATDIFF INVALID program exit %d" % r.returncode)
