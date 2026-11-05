@@ -32,6 +32,7 @@ makes it print `SEMHASH NOT_RUN` and exit 3.
 | `semhash canon < u.om` | the unit with locals renamed by first occurrence (`v0 v1 ...`, or the first of `w y z q` whose letter-digit names are unused), with notes and blank lines dropped and tokens joined by one space | 0 |
 | `semhash diff a.om b.om` | `SAME`, `CHANGED` or `REMOVED name`, `RENAMED a->b`, `ADDED name`, then `EXPORTS CHANGED` and `ENTRY CHANGED a->b` if they apply, then `DIFF SAME` or `DIFF CHANGED n=K` | 0 same, 1 changed |
 | `semhash keywords` | the keyword table (`word code`) the tool classifies with | 0 |
+| `semhash dups < records` | records are hash-mode `FN` lines with a unit path in front (`PATH FN name hex line=N...`). Every `SKIP ...` line is echoed. Then, for each set of two or more records with the same 64-digit hash, `DUP hex n=K` followed by `  PATH name line=N...` per member, in input order; last `DUPS groups=G fns=F records=R skipped=S` | 0 |
 
 The other exit codes are:
 
@@ -47,6 +48,23 @@ The other exit codes are:
   - no free canon letter;
   - canon of an `om2 fmt` unit.
 - 91-94: internal errors.
+
+## Duplicate-function report (#827 M1)
+
+`sh seed/semhash/dups.sh SEMHASH [DIR...]` hashes every `.om` unit under the given directories
+(default `om seed`, from the repository root, in `LC_ALL=C` path order), puts each unit's path in
+front of its `FN` lines and pipes them to `SEMHASH dups`. A unit that semhash refuses becomes
+`SKIP path rc=N reason`. Equal hashes mean equal meaning as far as this tool can prove it (see the
+next two sections), so a group is a set of functions that one shared definition could replace.
+The grouping is in `semhash.om`; the script only lists files and runs the tool.
+
+At omega-mv `d3d1b1bc` the report over `om/` and `seed/` is `dups/report-d3d1b1bc.txt`:
+`DUPS groups=449 fns=1542 records=6959 skipped=17`. The 17 skipped units are the
+deliberately malformed compiler fixtures (CR bytes, unterminated blocks) and
+`dups/refused.om`. The largest group is 66 copies of `fn main to int` / `ret 0`. Many groups are
+test fixtures that repeat a helper on purpose; others, such as `inb`, `obflush`, `ob1` and
+`hexval` in `om/aarch64`, `om/codec`, `om/evidence`, `om/gpumath` and `om/tls`, are library code
+that could share one unit.
 
 ## What a function hash covers
 
@@ -103,6 +121,11 @@ Run `sh seed/semhash/check.sh` from anywhere. It makes these checks:
 5. **Refusals and usage**: the CR input, reserved-byte input and unknown-mode cases are checked.
 6. **Mutant**: a copy of the tool with `while` dropped from its table must fail both keyword parity
    and the oracle (`mutant killed`).
+7. **Dups**: `dups.sh` over `dups/` (`a.om`, `b.om`, `refused.om`) must print `dups/dups.exp`
+   exactly: `a.om sq` and `b.om sq2` (a renamed parameter) group, `inc` and `inc2` (a different
+   constant) do not, and `refused.om` is a SKIP. Control: the same records with one hash digit
+   changed past the first 16 must give `groups=0`, so grouping compares the whole hash, not the key.
 
-`cases` in the PASS line counts the oracle-identical units plus the non-control cases. `controls`
-counts the `neg_*` cases, the three refusal and usage checks and the killed mutant.
+`cases` in the PASS line counts the oracle-identical units, the non-control cases and the dups
+check. `controls` counts the `neg_*` cases, the three refusal and usage checks, the killed mutant
+and the dups control.
