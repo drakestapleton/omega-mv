@@ -1,4 +1,19 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # run_gpu_fp8_v2_chip.sh EVIDENCE_DIR [PHYSICS_DIR]
 # OWN-30B W-L2c chip gate for the FP8 GEMV variant 2 (omega_blackwell_codegen_moe2.c), run as a whole under the GB10 lock:
 #   flock /tmp/aien-gb10.lock tools/run_gpu_fp8_v2_chip.sh EVID
@@ -10,6 +25,7 @@
 # Verdict line last: "GPU_FP8_V2_CHIP: PASS|FAIL". Steps 0, 2 and the hash equality decide; GB/s are recorded.
 set -u
 EVID="${1:?evidence dir}"; PHYS="${2:-$HOME/workspace/physics-own30b-k}"
+"$(dirname "$0")/require_physics_pin.sh" "$PHYS" || exit 2  # omega#456: refuse a Physics checkout other than physics.lock
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$EVID"
 cd "$HERE" || exit 2

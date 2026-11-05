@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * aien_machine_id.h -- the one canonical AIEN machine identity (M20).
  *
@@ -231,7 +247,9 @@ static inline int aien_mid_from_text(const char *s, AienMachineId *out) {
 
 /* ---- aien_machine_id.c -------------------------------------------------- */
 
-/* Persist atomically (temp file, fsync, rename, fsync directory). */
+/* Persist atomically (temp file, fsync, rename, fsync directory). A path that
+ * src/omega_path_check.h refuses (a ".." component, a byte outside its set, too
+ * long) is AIEN_MID_E_ARG for both calls, before any file is touched. */
 int aien_mid_store(const char *path, const AienMachineId *m);
 /* Load; any file that is not exactly one valid record is rejected. */
 int aien_mid_load(const char *path, AienMachineId *out);

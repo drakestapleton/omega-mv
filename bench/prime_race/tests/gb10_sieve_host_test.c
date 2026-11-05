@@ -1,6 +1,22 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* Host tests for the native GB10 prime sieve (no device is opened).
  *
- *   gb10_sieve_host_test            golden words of the three new ops, codegen budget, nvdisasm
+ *   gb10_sieve_host_test            golden words of the three new ops, codegen budget, sm121dis
  *                                   listing + every branch target, then the allocated IR program
  *                                   run by a host IR simulator over the limits sweep against an
  *                                   independent Eratosthenes oracle; the mutant must be caught
@@ -17,6 +33,7 @@
 #include "prime_race_impl.h"
 #include "omega_blackwell_codegen.h"
 #include "omega_gpu_elementwise_api.h"
+#include "omega_sm121_disasm.h"
 #include "bw_warp_sim.h" /* SIMT warp simulator (omega #308): the regioned sieves run through it */
 #include <inttypes.h>
 #include <stdio.h>
@@ -138,7 +155,10 @@ static void sim_thread(const BlackwellIRProgram *p, Thr *tp, uint32_t tid, uint3
         case BW_IR_MOV_RZ: wr(&t, in->dst_vreg, 0, p); break;
         case BW_IR_IMAD: wr(&t, in->dst_vreg, in->src2_vreg >= 0 ? a * b + c : a * in->imm + c, p); break;
         case BW_IR_IMAD_WIDE: wr64(&t, in->dst_vreg, (uint64_t)a * in->imm + rd64(&t, in->src3_vreg, p), p); break;
-        case BW_IR_IMAD_HI_U32: wr(&t, in->dst_vreg, (uint32_t)(((uint64_t)a * b) >> 32) + c, p); break;
+        case BW_IR_IMAD_HI_U32: { /* hi32(a * b + Rc+1:Rc): a register Rc is a 64-bit pair (omega #492, nvcc oracle); odd Rc: err 9 */
+            uint64_t c64 = 0;
+            if (in->src3_vreg >= 0 && p->regalloc.vreg_to_phys[in->src3_vreg] >= 0) { if (p->regalloc.vreg_to_phys[in->src3_vreg] & 1) { g_sim_err = 9; return; } c64 = rd64(&t, in->src3_vreg, p); }
+            wr(&t, in->dst_vreg, (uint32_t)(((uint64_t)a * b + c64) >> 32), p); break; }
         case BW_IR_IADD3: wr(&t, in->dst_vreg, a + b, p); break; /* the encoder's IADD3 has Rc = RZ */
         case BW_IR_SHF_R: wr(&t, in->dst_vreg, a >> (in->imm & 31), p); break;
         case BW_IR_SHF_L_U32: if (b >= 32) { g_sim_err = 8; return; } wr(&t, in->dst_vreg, a << b, p); break;
@@ -380,25 +400,20 @@ static void fixed_schedule_check(const BlackwellIRProgram *p, const OmegaBlackwe
     free(bad.code);
 }
 
-/* ------------------------------------------------------------- nvdisasm */
+/* ------------------------------------------------------------- sm121dis */
 /* every word decodes, the new ops appear, and every BRA lands where the IR says */
 static const char *const MUST_GLOBAL[] = { "LOP3.LUT", "SHF.L.U32", "IMAD.HI.U32", "@P0 BRA", "@!P0 BRA", "@P0 EXIT", "STG.E", "LDG.E" };
 static const char *const MUST_STAGED[] = { "LDS", "STS", "BAR.SYNC", "LDG.E", "STG.E", "IMAD.HI.U32", "@P0 BRA", "@!P0 BRA" };
-static void nvdisasm_check(const OmegaBlackwellKernel *k, const BlackwellIRProgram *p, const char *const *must, const char *tag) {
-    const char *nv = "/usr/local/cuda/bin/nvdisasm";
-    if (access(nv, X_OK) != 0) { printf("nvdisasm: not present, listing check SKIPPED\n"); return; }
-    char bin[64], lst[64], cmd[256];
-    snprintf(bin, sizeof bin, "/tmp/pr_gb10_sieve_%d.bin", (int)getpid());
-    snprintf(lst, sizeof lst, "/tmp/pr_gb10_sieve_%d.sass", (int)getpid());
-    FILE *f = fopen(bin, "wb");
-    if (!f) { CHECK(0, "cannot write %s", bin); return; }
-    fwrite(k->code, 1, k->code_size, f); fclose(f);
-    snprintf(cmd, sizeof cmd, "%s -b SM121 %s > %s 2>&1", nv, bin, lst);
-    int rc = system(cmd);
-    unlink(bin);
-    CHECK(rc == 0, "nvdisasm rc %d", rc);
-    FILE *l = fopen(lst, "r");
-    if (!l) { CHECK(0, "cannot read %s", lst); return; }
+static void sm121dis_check(const OmegaBlackwellKernel *k, const BlackwellIRProgram *p, const char *const *must, const char *tag) {
+    char lst[64];
+    snprintf(lst, sizeof lst, "/tmp/pr_gb10_sieve_%d.sass.XXXXXX", (int)getpid());
+    int fd = mkstemp(lst); /* private, unique listing; read back the same descriptor */
+    FILE *f = fd >= 0 ? fdopen(fd, "w+") : NULL;
+    if (!f) { if (fd >= 0) close(fd); CHECK(0, "cannot write %s", lst); return; }
+    int rc = omega_sm121_listing(k->code, k->code_size, f);
+    CHECK(rc == 0, "sm121dis rc %d", rc);
+    if (fflush(f) != 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); CHECK(0, "cannot read %s", lst); return; }
+    FILE *l = f;
     int seen[8] = {0}, insns = 0, bad = 0, bra_ok = 0, bra_bad = 0;
     char line[512];
     while (fgets(line, sizeof line, l)) {
@@ -415,14 +430,15 @@ static void nvdisasm_check(const OmegaBlackwellKernel *k, const BlackwellIRProgr
             unsigned long target = strtoul(br + 4, NULL, 16);
             unsigned long want = (unsigned long)((int)(addr / 16) + (int32_t)in->imm) * 16;
             if (in->op == BW_IR_BRA && target == want) bra_ok++;
-            else { bra_bad++; printf("  branch at 0x%04x: nvdisasm target 0x%lx, IR target 0x%lx\n", addr, target, want); }
+            else { bra_bad++; printf("  branch at 0x%04x: sm121dis target 0x%lx, IR target 0x%lx\n", addr, target, want); }
         }
     }
-    fclose(l);
-    for (int i = 0; i < 8; i++) CHECK(seen[i], "nvdisasm listing lacks %s (%s)", must[i], lst);
+    CHECK(!ferror(l), "read listing %s", lst);
+    CHECK(fclose(l) == 0, "close listing %s", lst);
+    for (int i = 0; i < 8; i++) CHECK(seen[i], "sm121dis listing lacks %s (%s)", must[i], lst);
     CHECK(bad == 0, "%d undecodable words (%s)", bad, lst);
     CHECK(bra_bad == 0 && bra_ok >= 6, "branch targets: %d match, %d differ", bra_ok, bra_bad);
-    printf("nvdisasm (%s): %d words, %d undecodable, %d branch targets checked (%s)\n", tag, insns, bad, bra_ok, lst);
+    printf("sm121dis (%s): %d words, %d undecodable, %d branch targets checked (%s)\n", tag, insns, bad, bra_ok, lst);
     if (g_failed == 0) unlink(lst);
 }
 
@@ -479,6 +495,26 @@ int main(int argc, char **argv) {
     /* 1. golden words */
     int fx = omega_blackwell_verify_codegen_fixtures_intops();
     CHECK(fx == 0, "golden words LOP3_LUT / SHF_L_U32 / IMAD_HI_U32 (rc %d)", fx);
+    /* omega #492: this per-thread simulator reads a register Rc of IMAD.HI.U32 as the pair Rc+1:Rc
+     * (nvcc oracle evidence/IMADHI-RC-ORACLE-nvcc13.0-20261016) and refuses an odd Rc (err 9). */
+    {
+        static BlackwellIRProgram ip;
+        memset(&ip, 0, sizeof ip);
+        ip.insns[0] = (BlackwellIRInsn){ .op = BW_IR_IMAD_HI_U32, .dst_vreg = 3, .src1_vreg = 0, .src2_vreg = 1, .src3_vreg = 2, .ureg = -1 };
+        ip.insns[1] = (BlackwellIRInsn){ .op = BW_IR_EXIT, .dst_vreg = -1, .src1_vreg = -1, .src2_vreg = -1, .src3_vreg = -1, .ureg = -1 };
+        ip.count = 2; ip.regalloc.num_vregs = 4;
+        const int ph[4] = { 4, 5, 6, 8 };
+        for (int v = 0; v < 4; v++) ip.regalloc.vreg_to_phys[v] = ph[v];
+        Thr t; memset(&t, 0, sizeof t);
+        t.r[4] = 0xdeadbeefu; t.r[5] = 0x10000u; t.r[6] = 0x56780000u; t.r[7] = 0x3f803f80u;
+        const uint32_t want = (uint32_t)(((uint64_t)0xdeadbeefu * 0x10000u + (((uint64_t)0x3f803f80u << 32) | 0x56780000u)) >> 32);
+        g_sim_err = 0; sim_thread(&ip, &t, 0, 0);
+        CHECK(g_sim_err == 0 && t.done && t.r[8] == want, "IMAD.HI.U32 even Rc: err %d out 0x%08x want pair 0x%08x", g_sim_err, t.r[8], want);
+        ip.regalloc.vreg_to_phys[2] = 7; memset(&t, 0, sizeof t);
+        g_sim_err = 0; sim_thread(&ip, &t, 0, 0);
+        CHECK(g_sim_err == 9, "IMAD.HI.U32 odd Rc not refused (err %d)", g_sim_err);
+        g_sim_err = 0;
+    }
 
     /* The scheduling pass is shared by every elementwise family. This is
      * codegen only: no public launcher or device session is called. */
@@ -517,7 +553,7 @@ int main(int argc, char **argv) {
     printf("\n");
     CHECK(k.gpr_count <= 64, "GPR budget %u > 64", k.gpr_count);
     CHECK(memcmp(k.code_digest, mk.code_digest, 32) != 0, "mutant kernel differs from production");
-    nvdisasm_check(&k, prog, MUST_GLOBAL, "global table");
+    sm121dis_check(&k, prog, MUST_GLOBAL, "global table");
     fixed_schedule_check(prog, &k);
     {
         int hz = sb_hazards(prog, 1);
@@ -606,7 +642,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < 32; i++) printf("%02x", sk.code_digest[i]);
             printf("\n");
             CHECK(sk.gpr_count <= 64, "staged GPR budget %u > 64", sk.gpr_count);
-            nvdisasm_check(&sk, sp, MUST_STAGED, "staged");
+            sm121dis_check(&sk, sp, MUST_STAGED, "staged");
             fixed_schedule_check(sp, &sk);
             int hz = sb_hazards(sp, 1);
             CHECK(hz == 0, "scoreboard hazards in the staged kernel: %d", hz);
@@ -719,7 +755,7 @@ int main(int argc, char **argv) {
             printf("\n");
             CHECK(sb_hazards(dp, 1) == 0, "%s scoreboard hazards", dv[v].name);
             CHECK(fixed_hazards(dp, &dk) == 0, "%s encoded fixed RAW hazards", dv[v].name);
-            if (!dv[v].staged) nvdisasm_check(&dk, dp, MUST_DIV, dv[v].name);
+            if (!dv[v].staged) sm121dis_check(&dk, dp, MUST_DIV, dv[v].name);
             int dfail = 0, dn = 0;
             for (int order = 0; order < 2; order++) for (size_t i = 0; i < nl; i++, dn++) {
                 uint64_t L = lims[i], *want = oracle_bitmap(L), *got = calloc(pr_words64(L) + 1, 8);

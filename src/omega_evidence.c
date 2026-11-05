@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "omega_evidence.h"
 #include "sha256.h"
 #include <errno.h>
@@ -26,9 +42,15 @@ static bool popen_read_line(const char *cmd, char *out, size_t n) {
     bool got = (fgets(buf, sizeof(buf), p) != NULL);
     pclose(p);
     if (!got || !trim_line(buf)) return false;
-    if (strlen(buf) >= n) return false;
-    strcpy(out, buf);
+    size_t len = strlen(buf);
+    if (len >= n) return false;
+    memcpy(out, buf, len + 1);
     return true;
+}
+
+/* c when it is a lower-case hex digit, -1 otherwise */
+static int hex_byte(int c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ? c : -1;
 }
 
 /* ---- run_id -------------------------------------------------------------- */
@@ -44,10 +66,20 @@ const char *omega_evidence_run_id(void) {
         char ts[32];
         strftime(ts, sizeof(ts), "%Y%m%dT%H%M%SZ", &tm_info);
 
-        char sha[64];
-        if (!popen_read_line("git rev-parse --short=12 HEAD 2>/dev/null", sha, sizeof(sha))) {
-            snprintf(sha, sizeof(sha), "unknown");
+        /* The run id names the evidence directory (omega_evidence_path), so git's answer is kept only as
+         * lower-case hex, copied byte by byte; anything else is "unknown". */
+        char line[64], sha[64];
+        size_t k = 0;
+        if (popen_read_line("git rev-parse --short=12 HEAD 2>/dev/null", line, sizeof(line))) {
+            for (; line[k]; k++) {
+                int c = hex_byte((unsigned char)line[k]);
+                if (c < 0) break;
+                sha[k] = (char)c;
+            }
+            if (line[k]) k = 0;
         }
+        sha[k] = '\0';
+        if (k == 0) snprintf(sha, sizeof(sha), "unknown");
         snprintf(g_run_id, sizeof(g_run_id), "%s-%s", ts, sha);
         g_run_id_ready = true;
     }
@@ -117,6 +149,15 @@ int omega_evidence_write_digest(const char *relstem, const char *ext, const void
     return 0;
 }
 
+FILE *omega_evidence_create(const char *path) {
+    if (!path) return NULL;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "w");
+    if (!f) close(fd);
+    return f;
+}
+
 /* ---- commit identity --------------------------------------------------- */
 
 bool omega_evidence_run_commit(char out[41]) {
@@ -143,8 +184,9 @@ bool omega_evidence_physics_commit(char *out, size_t n) {
     bool got = (fgets(buf, sizeof(buf), f) != NULL);
     fclose(f);
     if (!got || !trim_line(buf)) return false;
-    if (strlen(buf) >= n) return false;
-    strcpy(out, buf);
+    size_t len = strlen(buf);
+    if (len >= n) return false;
+    memcpy(out, buf, len + 1);
     return true;
 }
 
@@ -161,4 +203,30 @@ void omega_evidence_hardware_from_nvrm(const Nvrm *rm, OmegaEvidenceHardware *ou
         snprintf(&out->gpu_uuid_hex[i * 2], 3, "%02x", rm->gpu_uuid[i]);
     }
     out->gpu_uuid_hex[32] = '\0';
+}
+
+bool omega_evidence_self_binary(char *out, size_t n) {
+    if (!out || n == 0) return false;
+    /* The program name comes from the running executable, never a literal:
+     * this file is linked into production binaries (rx_r13_living_host), and
+     * tools/r16_authpath.sh refuses any legacy program name in their strings. */
+    char self[4096];
+    ssize_t r = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (r <= 0) {
+        out[0] = '\0';
+        return false;
+    }
+    self[r] = '\0';
+    const char *slash = strrchr(self, '/');
+    const char *name = slash ? slash + 1 : self;
+    const char *out_dir = getenv("OUT_DIR");
+    if (!out_dir || !*out_dir) out_dir = "build";
+    int len = snprintf(out, n, "%s/%s", out_dir, name);
+    if (len > 0 && (size_t)len < n && access(out, R_OK) == 0) return true;
+    len = snprintf(out, n, "%s", self);
+    if (len <= 0 || (size_t)len >= n) {
+        out[0] = '\0';
+        return false;
+    }
+    return access(out, R_OK) == 0;
 }

@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* osh_expand_ref.c -- see osh_expand_ref.h. */
 #include "osh_expand_ref.h"
 
@@ -334,12 +350,12 @@ void osh_xr_pipe(const uint8_t *in, size_t n, const OshRefLex *lx, const OshRefP
                 } else {
                     c.mode = 1;
                     /* export NAME=v: bash expands the argument as an assignment (no splitting) when the command word
-                     * is the plain word export */
-                    if ((tk->flags & 16) && anyw && c.blk[0] > 0 && c.blk[5] == 6 &&
+                     * is the plain word export and is the command's first word (omega#344: `$e export` is not) */
+                    if ((tk->flags & 16) && anyw && (uint64_t)(anyw - 1) == c.a0off && c.blk[0] > 0 && c.blk[5] == 6 &&
                         memcmp(out->out + c.blk[4], "export", 6) == 0 && c.a0off + 6 < n &&
                         memcmp(in + c.a0off, "export", 6) == 0 && (in[c.a0off + 6] == ' ' || in[c.a0off + 6] == '\t'))
                         c.mode = 4;
-                    anyw = 1;
+                    if (!anyw) anyw = (int)tk->start + 1;
                     expand_word(&c, tk->start, tk->start + tk->len);
                 }
                 t++;

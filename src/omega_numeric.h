@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef OMEGA_NUMERIC_H
 #define OMEGA_NUMERIC_H
 
@@ -261,7 +277,7 @@ const OmegaNumericOpInfo *omega_numeric_op_find(const char *name);
 const char *omega_numeric_compare_name(OmegaNumericCompare c);
 
 /* Ops whose GB10 kernel is a whole program from
- * src/omega_numeric_divsqrt_gb10.c (DIV, SQRT) instead of a patch into the
+ * src/omega_numeric_divsqrt_gb10.c (DIV, SQRT, EXP, LOG) instead of a patch into the
  * calibrated vecadd: they have no patch words, omega_numeric_build_kernel
  * refuses them, and their structural checks (omega_ds_check_args, _kernel,
  * _digest, _qmd) run inside omega_ds_gb10_run before the device is opened. */

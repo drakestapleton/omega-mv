@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * COMPOSITION-2 WP-B + WP-C: one World, one causal path, OLD-or-NEW.
  *
@@ -642,6 +658,17 @@ static void t_pending(void) {
     rmtree(d);
 }
 
+/* A dir refused by src/omega_path_check.h is an argument error and creates nothing. */
+static void t_refused_dir(void) {
+    printf("[*] refused dir: RX_ERR_ARG, nothing created\n");
+    char bad[240];
+    snprintf(bad, sizeof bad, "%s/refused dir", g_base);
+    reset_c();
+    int rc = fx_open(&g_fx, &g_c, bad, 1);
+    CHECK(rc == RX_ERR_ARG, "refused dir -> RX_ERR_ARG (%d)", rc);
+    CHECK(access(bad, F_OK) != 0, "refused dir not created");
+}
+
 int main(void) {
     snprintf(g_base, sizeof g_base, "/tmp/rx_compose_test.XXXXXX");
     if (!mkdtemp(g_base)) { perror("mkdtemp"); return 1; }
@@ -652,6 +679,7 @@ int main(void) {
     t_authority();
     t_cortex();
     t_pending();
+    t_refused_dir();
     fx_free(&g_fx);
     rmtree(g_base);
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);

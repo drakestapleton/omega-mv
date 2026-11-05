@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * rxc_host_abi.h -- NEXT-PHASE-1 cut 1a: a thin C ABI over COMPOSITION-2
  * (rx_compose) for a host program in another language (the sovereign-core
@@ -220,7 +236,9 @@ typedef struct {
  * the machine derived from (root_kind, root[0..root_len)). Identity: a dir
  * that already holds machine.id must hold this machine (RXC_HOST_E_IDENTITY
  * otherwise). `info` (may be NULL) is filled on success and on
- * RXC_HOST_E_TORN / RXC_HOST_E_IDENTITY. `flags` must be 0. */
+ * RXC_HOST_E_TORN / RXC_HOST_E_IDENTITY. `flags` must be 0. `dir` must
+ * pass src/omega_path_check.h (omega_path_copy) and be under 184 bytes;
+ * otherwise RXC_HOST_E_ARG and nothing is created. */
 int rxc_host_open(const char *dir, uint32_t root_kind, const uint8_t *root, size_t root_len,
                   uint64_t session, uint32_t flags, RxcHost **out, RxcHostInfo *info);
 

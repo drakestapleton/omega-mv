@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * Simulated GB10 driver for the host test of the Blackwell GPU engine backend
  * (tests/test_omega_blackwell_engine.c). NOT_RUN: written in cut A3b2 and never
@@ -82,6 +98,7 @@ typedef struct {
     int open_fail;
     int channel_fail;
     int submit_fail;
+    int submit_faults_device; /* with submit_fail: the failed submit also sets rm.faulted, as a channel error does */
     int close_fail;
     uint64_t alloc_max;   /* largest nvrm_alloc the fake grants, 0 = the default 1 MiB */
     int alloc_fail_nth;   /* 1-based nvrm_alloc call that misbehaves, 0 = none */

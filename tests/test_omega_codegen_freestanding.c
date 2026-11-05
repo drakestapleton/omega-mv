@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* test_omega_codegen_freestanding.c -- native v1 P07 cut A.2 (aienos#286, aien-architecture#190).
  *
  * Built twice by mk/omega-gpu-engine.mk (make test-codegen-freestanding):
@@ -171,16 +187,22 @@ static void buffer_contract(void) {
               "%s: exact-size encode differs (rc %d)", f->name, rc);
     }
 }
+#endif
 
+/* Golden words (nvcc/nvdisasm oracles, independent of either encoder). The hosted build runs them with --golden
+ * through the .om encoder (om/encoder/bw_enc_sm121.om); the freestanding build through the C encoder. */
 static void golden_fixtures(void) {
     CHECK(omega_blackwell_verify_codegen_fixtures() == 0, "golden words (rc %d)", omega_blackwell_verify_codegen_fixtures());
     CHECK(omega_blackwell_verify_codegen_fixtures_fb1cut4() == 0, "fb1cut4 golden words");
     CHECK(omega_blackwell_verify_codegen_fixtures_intops() == 0, "intops golden words");
     CHECK(omega_blackwell_verify_codegen_fixtures_fragmm() == 0, "fragmm golden words");
     CHECK(omega_blackwell_verify_codegen_fixtures_reconv() == 0, "reconv golden words");
+    CHECK(omega_blackwell_verify_codegen_fixtures_bfly_f2fp() == 0, "SHFL.BFLY / F2FP.BF16 golden words (rc %d)", omega_blackwell_verify_codegen_fixtures_bfly_f2fp());
+    CHECK(omega_blackwell_verify_codegen_fixtures_atomf32() == 0, "ATOMG.E.ADD.F32 golden words (rc %d)", omega_blackwell_verify_codegen_fixtures_atomf32());
     CHECK(omega_blackwell_test_regalloc_bounds() == 0, "regalloc bounds");
 }
 
+#ifdef OMEGA_GPU_NO_POSIX
 /* The freestanding omega_fp32_to_bf16 (integer rounding) against the hosted __bf16 cast, every input. */
 static void bf16_sweep(void) {
     uint64_t bad = 0;
@@ -208,7 +230,12 @@ int main(int argc, char **argv) {
     printf("%s: freestanding codegen contract (%zu fixtures, %d failing checks)\n", fails ? "FAIL" : "PASS", (size_t)NFX, fails);
     return fails ? 1 : 0;
 #else
-    fprintf(stderr, "hosted build: only --dump\n");
+    if (argc > 1 && strcmp(argv[1], "--golden") == 0) {
+        golden_fixtures();
+        printf("%s: hosted golden-word fixtures through the .om encoder (%d failing checks)\n", fails ? "FAIL" : "PASS", fails);
+        return fails ? 1 : 0;
+    }
+    fprintf(stderr, "hosted build: only --dump or --golden\n");
     return 2;
 #endif
 }

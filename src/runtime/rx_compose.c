@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * rx_compose.c -- COMPOSITION-2: one World, one causal path (rx_compose.h).
  *
@@ -9,6 +25,7 @@
 #include "rx_compose.h"
 #include "rx_cortex_record.h"
 #include "sha256.h"
+#include "omega_path_check.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -856,7 +873,10 @@ static int open_home(RxCompose *c, const char *dir, const AienMachineId *self, u
     c->router = router;
     c->contract = contract;
     c->admin = admin;
-    if (mkdir(dir, 0700) && errno != EEXIST) return RX_ERR_ARG;
+    /* Check before mkdir (src/omega_path_check.h): a refused dir is an argument error and creates nothing. */
+    char checked[sizeof c->dir];
+    if (omega_path_copy(checked, sizeof checked, dir) != 0) return RX_ERR_ARG;
+    if (mkdir(checked, 0700) && errno != EEXIST) return RX_ERR_ARG;
 
     char p[256];
     path_in(p, sizeof p, dir, "machine.id");

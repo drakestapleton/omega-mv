@@ -1,4 +1,19 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # test_numeric_qualify.sh -- host-only tests of the Gate 5 (OMEGA-NUMERIC-0)
 # qualifier in tests/run_numeric_gates.sh: physics pin checks, gate log
 # checks and the immutable digest-named receipt writer. No GPU, no device.
@@ -66,10 +81,6 @@ good_log() {
         mode=$(mode_of "$op")
         echo "OMEGA_NUMERIC_REGISTRY_JSON:{\"op\":\"$op\",\"encoded\":true,\"compare\":\"$mode\",\"launches\":$([ "$op" = FFMA ] && echo 8 || echo 1)}"
     done
-    # Not encoded for GB10: EXP LOG.
-    for op in EXP LOG; do
-        echo "OMEGA_NUMERIC_REGISTRY_JSON:{\"op\":\"$op\",\"encoded\":false,\"compare\":\"BIT_EXACT\",\"launches\":1}"
-    done
     for id in $NUM_EXPECTED_IDS; do echo "[PASS] $id"; done
     echo "OMEGA_NUMERIC_HWDESC_JSON:{\"source\":\"FORGE_PROBE\",\"descriptor_digest\":\"$fake_digest\",\"derived_alias\":\"UNIT_TEST_FAKE_NOT_HARDWARE\"}"
     for op in $NUM_ENCODED_OPS; do
@@ -97,7 +108,7 @@ $2
     cmp -s "$TMP/good.log" "$TMP/$1.log" && bad "fixture $1: the edit changed nothing"; }
 check "complete passing log accepted" 'num_check_log "$TMP/good.log"'
 check "  hardware digest read from the log" '[ "$NUM_HWDIGEST" = "$fake_digest" ]'
-check "  47 GB10 parity lines kept (FFMA x8 + 39 ops)" '[ "$(printf "%s" "$NUM_PARITY" | jq length)" = 47 ]'
+check "  49 GB10 parity lines kept (FFMA x8 + 41 ops)" '[ "$(printf "%s" "$NUM_PARITY" | jq length)" = 49 ]'
 check "  run id and binary digest read from the run line" '[ "$NUM_LOG_RUN_ID" = "$LOG_RUN_ID" ] && [ "$NUM_LOG_BINARY_SHA" = "$LOG_BIN_SHA" ]'
 sed 's/"source":"FORGE_PROBE"/"source":"FAKE_NON_HARDWARE_CPU_ONLY","fake":true/' "$TMP/good.log" > "$TMP/fake.log"
 check "CPU-only fake descriptor refused" '! num_check_log "$TMP/fake.log"'
@@ -163,13 +174,13 @@ check "a ninth FFMA launch refused" '! num_check_log "$TMP/ffma9.log"'
 check "a second FADD launch refused" '! num_check_log "$TMP/fadd2.log"'
 gb10 cbits '/"op":"FADD"/s/"n":4096/"c_bits":"0x3f800000","n":4096/'
 check "c_bits on a non-FFMA op refused" '! num_check_log "$TMP/cbits.log"'
-gb10 stray '/"op":"FADD"/s/"op":"FADD"/"op":"EXP"/'
+gb10 stray '/"op":"FADD"/s/"op":"FADD"/"op":"NOPE"/'
 check "parity line for an op outside the manifest refused" '! num_check_log "$TMP/stray.log"'
 sed '/OMEGA_NUMERIC_REGISTRY_JSON:{"op":"FADD"/s/"compare":"BIT_EXACT"/"compare":"SEED_BOUND"/' "$TMP/good.log" > "$TMP/reg1.log"
 check "registry comparison differing from the manifest refused" '! num_check_log "$TMP/reg1.log"'
 sed '/OMEGA_NUMERIC_REGISTRY_JSON:{"op":"FFMA"/s/"launches":8/"launches":1/' "$TMP/good.log" > "$TMP/reg2.log"
 check "registry launch count differing from the manifest refused" '! num_check_log "$TMP/reg2.log"'
-sed '/OMEGA_NUMERIC_REGISTRY_JSON:{"op":"EXP"/s/"encoded":false/"encoded":true/' "$TMP/good.log" > "$TMP/reg3.log"
+{ cat "$TMP/good.log"; echo 'OMEGA_NUMERIC_REGISTRY_JSON:{"op":"NOPE","encoded":true,"compare":"BIT_EXACT","launches":1}'; } > "$TMP/reg3.log"
 check "registry encoding an op the manifest does not list refused" '! num_check_log "$TMP/reg3.log"'
 # LDS_STS and REDUCE_SUM: one line each, full check, declared summation order.
 grep -v '"op":"LDS_STS","tier":"gb10"' "$TMP/good.log" > "$TMP/nolds.log"
@@ -278,7 +289,7 @@ export STUB_LOG=$TMP/stub_body.log
 fresh_run() {
     NUM_RUN_ID=unit-$1-$RANDOM NUM_RUN_DIR=$TMP/run-$NUM_RUN_ID
     mkdir -p "$NUM_RUN_DIR"
-    gcc -std=gnu11 -O2 -I"$HERE/src" -o "$NUM_RUN_DIR/test_omega_numeric" "$TMP/stub.c" "$HERE/src/sha256.c" || return 1
+    gcc -std=gnu11 -O2 -I"$HERE/src" -o "$NUM_RUN_DIR/test_omega_numeric" "$TMP/stub.c" "$HERE/src/omega_om_units.c" || return 1
     NUM_BINARY_SHA=$(m19r_sha_file "$NUM_RUN_DIR/test_omega_numeric")
     NUM_RUN_COMMIT=$NUM_OMEGA_CAND
     STUB_RC=$1 num_execute "$omega" "$NUM_RUN_DIR/test_omega_numeric"

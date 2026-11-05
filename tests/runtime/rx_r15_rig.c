@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /* rx_r15_rig.c -- see rx_r15_rig.h. The body is built exactly as
  * tests/runtime/rx_r13_living.c builds its POSITIVE case. */
 #include "rx_r15_rig.h"
@@ -37,6 +53,14 @@ static void pause_us(int us) {
     nanosleep(&ts, NULL);
 }
 
+static RxAienConfig g_aien_cfg;
+static int g_aien_cfg_set;
+
+void r15_set_aien_config(const RxAienConfig *cfg) {
+    g_aien_cfg_set = cfg != NULL;
+    if (cfg) g_aien_cfg = *cfg;
+}
+
 const char *r15_config_name(R15Config c) {
     return c == R15_RES4 ? "RES-4" : c == R15_RES1 ? "RES-1" : "SEQ";
 }
@@ -52,6 +76,36 @@ static RxCapRef mint(R15Rig *r, uint32_t subject, uint64_t resource, uint32_t ri
 static uint64_t field(R15Rig *r, RxObjRef ref, uint32_t i) {
     RxObject o;
     return rx_world_read(&r->w, ref, &o) == RX_OK ? o.field[i] : UINT64_MAX;
+}
+
+/* Fixed matvec cost per call in ns, by core class and realization kind
+ * (0..3, then the reference; any other kind is priced as the reference):
+ * Omega's own measure of each kind on this GB10, unloaded, 2026-10-19. On
+ * A725 quad4 is inside the 10% margin, so the first search keeps the
+ * reference; on X925 quad4 wins and its cost is under 55% of the A725
+ * incumbent, so the goal is MET. */
+static const uint64_t k_model_ns[2][5] = {
+    {13300, 11100, 11300, 6060, 6200},      /* A725 */
+    {4900, 4400, 4900, 2700, 4600},         /* X925 */
+};
+
+static int g_cost_model;
+
+void r15_use_cost_model(int on) { g_cost_model = on; }
+
+/* X925 costs apply once the episode's goal is in the world. The goal is
+ * published after the X925 placement, so the cost change is tied to a world
+ * event, not to when the episode's thread gets to run: a thread paused
+ * between steps cannot open a window of X925 costs under the A725
+ * placement, or of A725 costs in the X925 search. The goal is read live, so
+ * the one demand window spanning the goal mixes both costs; it can only add
+ * a miss to the A725 prediction, which the X925 costs fail anyway. A failed
+ * read counts as X925. */
+static uint64_t model_cost(void *ctx, uint32_t kind, uint32_t M, uint32_t N, uint64_t calls) {
+    R15Rig *r = ctx;
+    (void)M; (void)N;                       /* the rig serves one shape, R15_M x R15_N */
+    uint32_t cls = field(r, r->aien.o.goal, 0) != 0;
+    return calls * k_model_ns[cls][kind < 4 ? kind : 4];
 }
 
 static const RxSnapshotDep *snapshot(RxCtx *c, RxObjRef ref) {
@@ -313,10 +367,15 @@ int r15_start_with(R15Rig *r, R15Config config, const uint32_t *fixture_subjects
     RxOmegaConfig oc;
     rx_omega_default_config(&oc);
     oc.hot_calls = 64; oc.hot_ns = 200000; oc.margin_pct = 10;
+    if (g_cost_model) {
+        oc.cost_ns = model_cost;
+        oc.cost_ctx = r;
+    }
     if (rx_omega_create_objects(&r->omega, &r->w, &oc) != RX_OK) return -1;
     r->omega.keys = &r->keys_omega;
     RxAienConfig ac;
-    rx_aien_default_config(&ac);
+    if (g_aien_cfg_set) ac = g_aien_cfg;
+    else rx_aien_default_config(&ac);
     RxAienInputs ai = {r->omega.o.demand, r->omega.o.selection};
     if (rx_aien_create_objects(&r->aien, &r->w, &ac, &ai) != RX_OK) return -1;
     r->aien.keys = &r->keys_aien;
@@ -628,6 +687,7 @@ static int orchestration_error(R15Rig *r) {
 /* ---- the episode ---------------------------------------------------------- */
 
 #define EFAIL(...) do { snprintf(out->why, sizeof out->why, __VA_ARGS__); return -1; } while (0)
+#define ULL(x) ((unsigned long long)(x))
 
 static void slot_snapshot(R15Rig *r, R15Outcome *out) {
     for (uint32_t k = 0; k < r->omega.cfg.n_slots && k < RX_OMEGA_SLOTS; k++) {
@@ -674,7 +734,12 @@ int r15_episode(R15Rig *r, uint64_t target_ns, R15Outcome *out) {
     while (field(r, r->aien.o.prediction, 6) != RX_AIEN_PRED_CONFIRMED && now_ns() < limit)
         if (serve(r) != 0 || orchestration_error(r)) EFAIL("serve before confirmation: %s", r->serve_why);
     if (field(r, r->aien.o.prediction, 6) != RX_AIEN_PRED_CONFIRMED)
-        EFAIL("AIEN never confirmed the incumbent cost");
+        EFAIL("AIEN never confirmed the incumbent cost (belief: baseline mean %llu ns, last "
+              "interval %llu ns, intervals %llu, miss streak %llu; prediction state %llu, hits "
+              "%llu; %llu requests served)", ULL(field(r, r->aien.o.belief, 4)),
+              ULL(field(r, r->aien.o.belief, 6)), ULL(field(r, r->aien.o.belief, 5)),
+              ULL(field(r, r->aien.o.belief, 7)), ULL(field(r, r->aien.o.prediction, 6)),
+              ULL(field(r, r->aien.o.prediction, 3)), ULL(r->request_seq));
     out->incumbent_ns = field(r, r->aien.o.prediction, 5);
     out->target_ns = target_ns ? target_ns : out->incumbent_ns * TARGET_PCT / 100u;
     rx_gen_active(r->gen, &out->gen_before, &out->lineage_before);

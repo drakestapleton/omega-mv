@@ -1,4 +1,19 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # tools/run_gpu_reconv_chip.sh [OUT_ROOT] [-- extra gate args]
 # omega #308 chip gate: structured warp reconvergence. Runs the host part first (encoder
 # goldens, region bookkeeping, refusals, nvdisasm, every probe through the SIMT warp
@@ -36,7 +51,7 @@ fi
 ./build/gpu_reconv_test --out "$OUT/receipt.json" $EXTRA > "$OUT/run.log" 2>&1
 rc=$?
 cp src/omega_gpu_elementwise_api.c src/omega_gpu_elementwise_api.h src/omega_bw_reconv.h src/omega_blackwell_codegen.c \
-   tests/gpu_reconv_test.c tests/bw_warp_sim.h "$OUT/"
+   om/encoder/bw_enc_sm121.om src/omega_om_units.ident tests/gpu_reconv_test.c tests/bw_warp_sim.h "$OUT/"
 (cd "$OUT" && sha256sum -- * > SHA256SUMS)
 tail -1 "$OUT/run.log"
 echo "GPU-RECONV chip gate rc=$rc receipt=$OUT/receipt.json"

@@ -1,10 +1,27 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * osh_vars.c -- the shell's variable table and the fresh-per-exec environment (ABI section 4.5, 7.2, 9.1).
  * The environment of a child is built from this table only; the process-global environ is read once, at
  * osh_session_init, and never again. Names and values are raw bytes without NUL.
  * Bookkeeping as bash 5.2 does it: PWD per POSIX; SHLVL = inherited level + 1 (non-numeric counts as 0, never below 0,
  * above 1000 resets to 1 with a warning); OLDPWD exported, kept only when the inherited value names a directory and
- * set by cd. `_` (bash's last argument) is not maintained.
+ * set by cd. `_` is not a shell variable ($_ is refused as SPECIAL_PARAM); as bash does, each program started gets
+ * _=<the path osh executes> in its environment (osh_build_envp prog).
  */
 #include "osh_host.h"
 #include "osh_priv.h"
@@ -173,9 +190,25 @@ void osh_envp_free(char **envp)
     free(envp);
 }
 
-char **osh_build_envp(const OshSession *s, const OshAssign *ov, int nov)
+static int envp_put(char **e, size_t *n, const char *name, const char *value)
 {
-    char **e = calloc(s->nvars + s->nraw + (size_t)nov + 1, sizeof *e);
+    size_t nl = strlen(name), vl = strlen(value);
+    char *str = malloc(nl + vl + 2);
+    if (!str) return -1;
+    memcpy(str, name, nl);
+    str[nl] = '=';
+    memcpy(str + nl + 1, value, vl + 1);
+    size_t j = 0;
+    for (; j < *n; j++)
+        if (strncmp(e[j], name, nl) == 0 && e[j][nl] == '=') break;
+    if (j < *n) { free(e[j]); e[j] = str; }
+    else e[(*n)++] = str;
+    return 0;
+}
+
+char **osh_build_envp(const OshSession *s, const OshAssign *ov, int nov, const char *prog)
+{
+    char **e = calloc(s->nvars + s->nraw + (size_t)nov + 2, sizeof *e);
     if (!e) return NULL;
     size_t n = 0;
     for (size_t i = 0; i < s->nvars; i++) {
@@ -193,19 +226,10 @@ char **osh_build_envp(const OshSession *s, const OshAssign *ov, int nov)
         if (!(e[n] = strdup(s->raw_env[i]))) { osh_envp_free(e); return NULL; }
         n++;
     }
-    for (int k = 0; k < nov; k++) {
-        size_t nl = strlen(ov[k].name), vl = strlen(ov[k].value);
-        char *str = malloc(nl + vl + 2);
-        if (!str) { osh_envp_free(e); return NULL; }
-        memcpy(str, ov[k].name, nl);
-        str[nl] = '=';
-        memcpy(str + nl + 1, ov[k].value, vl + 1);
-        size_t j = 0;
-        for (; j < n; j++)
-            if (strncmp(e[j], ov[k].name, nl) == 0 && e[j][nl] == '=') break;
-        if (j < n) { free(e[j]); e[j] = str; }
-        else e[n++] = str;
-    }
+    for (int k = 0; k < nov; k++)
+        if (envp_put(e, &n, ov[k].name, ov[k].value)) { osh_envp_free(e); return NULL; }
+    /* bash puts _=<the path it executes> into every program's environment, over any inherited or assigned _ */
+    if (prog && envp_put(e, &n, "_", prog)) { osh_envp_free(e); return NULL; }
     e[n] = NULL;
     return e;
 }

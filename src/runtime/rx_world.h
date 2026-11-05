@@ -1,3 +1,19 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*
  * rx_world.h -- first heartbeat of the resident reaction runtime (ADR 0016).
  *
@@ -820,6 +836,8 @@ int  rx_world_caller_check_fn(void *world, uint32_t subject, const RxCallerCred 
                                            capability may also pause the world */
 #define RX_HALT_ALREADY       1   /* stop: already stopped, nothing changed */
 #define RX_HALT_NOT_STOPPED   2   /* resume: not stopped, nothing changed */
+/* A dir that src/omega_path_check.h refuses (a ".." component, a byte outside
+ * its set, too long) is RX_ERR_ARG, and the world's halt directory is unchanged. */
 int  rx_world_set_halt_dir(RxWorld *w, const char *dir);
 int  rx_world_emergency_stop(RxWorld *w, uint32_t subject, const RxCallerCred *cred,
                              RxCapRef cap, int32_t reason, RxHaltStatus *out);
