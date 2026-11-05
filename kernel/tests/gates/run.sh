@@ -15,18 +15,20 @@
 # limitations under the License.
 
 # tests/gates/run.sh: the one entry point for the local verification gates of aienos.
-# Every step runs the SAME command as the hosted job it mirrors (.github/workflows/ck-kernel.yml,
-# native-suites.yml, crypto-boundary.yml, infer-crate.yml, crumb.yml; ci.yml is disabled on
-# GitHub and its two surviving suites are declared here too). Manifests under tests/gates/ name
-# this script plus one step word, so no manifest needs shell expansion (ADR 0028 P6).
+# Every step runs the SAME command as the hosted job it replaced. #427 removed those workflows
+# (ck-kernel.yml, native-suites.yml, crypto-boundary.yml, infer-crate.yml, crumb.yml, ci.yml). The
+# only hosted runs left are crumb verify and the portable smoke set in the advisory AIEN Checks job
+# (aien-verification.yml); the workflow names below say where each command came from.
+# Manifests under tests/gates/ name this script plus one step word, so no manifest needs shell
+# expansion (ADR 0028 P6).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 step="${1:?usage: tests/gates/run.sh <step>}"
 obs() { printf 'AIEN-OBS %s %s\n' "$1" "$2"; }
 
-# The hosted jobs keep the quiet flag and the QEMU gate lock in the runner's temp dir, never
-# in ~/workspace (ck-kernel.yml, native-suites.yml). Same here.
+# The removed hosted jobs kept the quiet flag and the QEMU gate lock in the runner's temp dir,
+# never in ~/workspace (ck-kernel.yml, native-suites.yml). Same here.
 TMP="$(mktemp -d /tmp/aienos-gate.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 export AIENOS_QUIET_FLAG="$TMP/spark-quiet"
@@ -57,11 +59,11 @@ native_suite() {
 
 case "$step" in
   crumb-verify)
-    # Hosted crumb.yml builds the crumb tool from the aien-architecture commit in crumb.lock.
+    # The removed hosted crumb.yml built the crumb tool from the aien-architecture commit in crumb.lock.
     # Same here, from the sibling checkout ../aien-architecture into a temp dir outside the
     # tree, so a newer crumb on PATH can never change the verdict.
     if [ ! -d ../aien-architecture ]; then
-      echo "run.sh: ../aien-architecture is missing; the hosted job checks out aien-dev/aien-architecture at crumb.lock" >&2
+      echo "run.sh: ../aien-architecture is missing; check out aien-dev/aien-architecture beside this tree (the tool is built at crumb.lock)" >&2
       exit 3
     fi
     pin=$(tr -d '[:space:]' < crumb.lock)

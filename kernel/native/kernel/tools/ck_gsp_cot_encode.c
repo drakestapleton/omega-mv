@@ -385,13 +385,18 @@ static void check(int ok, const char *what) {
     printf("  %s %s\n", ok ? "ok  " : "FAIL", what);
     if (!ok) fails++;
 }
-static void expect_refused(int rc, const char *why, const char *want, const char *what) {
+static void expect_refused_rc(int rc, const char *why, const char *want, const char *what) {
     int ok = rc != 0 && why && strcmp(why, want) == 0;
     printf("  %s refused: %s", ok ? "ok  " : "FAIL", what);
     if (!ok) printf(" (rc=%d why=%s want=%s)", rc, why ? why : "(null)", want);
     printf("\n");
     if (!ok) fails++;
 }
+/* The call that writes the reason through &why must finish before why is read. As two arguments
+ * of one function call their evaluation order is unspecified (C11 6.5.2.2p10): x86-64 gcc 13 read
+ * why first and every check saw the previous reason (#483). The statement boundary sequences them. */
+#define expect_refused(call, why, want, what) \
+    do { int expect_rc_ = (call); expect_refused_rc(expect_rc_, (why), (want), (what)); } while (0)
 
 static int selftest(void) {
     const char *why = "";
