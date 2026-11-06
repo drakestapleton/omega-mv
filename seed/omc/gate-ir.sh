@@ -68,6 +68,22 @@ ir_refuse continue_use 3 'ir
 fn main to int
 continue
 end'
+# Contract lines are not IR v1 statements: refuse with 30, never read them as a local (#791).
+ir_refuse requires_line 30 'ir
+fn f x uint to uint
+requires lt x 10
+ret x
+end'
+ir_refuse ensures_line 30 'ir
+fn f x uint to uint
+ensures lt x 10
+ret x
+end'
+ir_refuse invariant_line 30 'ir
+fn f x uint to uint
+invariant lt x 10
+ret x
+end'
 # Integer constants fold to the IR of their literal; float constants are still refused.
 printf 'ir\nconst N uint 5\nfn f to uint\nret N\nend\n' > "$B/c1.om"
 printf 'ir\nfn f to uint\nret uint 5\nend\n' > "$B/c2.om"
@@ -87,6 +103,110 @@ ir_fold() { # name const-source literal-source
 ir_fold trap_const 'ir\nconst T uint 2\nfn f to uint\ntrap T\nend' 'ir\nfn f to uint\ntrap 2\nend'
 ir_fold bound_const 'ir\nconst B ulong 3\nfn f to uint\nx = uint 0\nwhile lt x uint 2 bound B\nx = add x uint 1\nend\nret x\nend' 'ir\nfn f to uint\nx = uint 0\nwhile lt x uint 2 bound 3\nx = add x uint 1\nend\nret x\nend'
 ir_fold for_const 'ir\nconst K ulong 4\nfn f to uint\nx = uint 0\nfor i ulong K\nx = add x uint 1\nend\nret x\nend' 'ir\nfn f to uint\nx = uint 0\nfor i ulong 4\nx = add x uint 1\nend\nret x\nend'
+# for ... bound N: a constant N folds to its literal; an explicit bound 1000000 is the unbounded default.
+ir_fold for_bound_const 'ir\nconst B ulong 3\nfn f a uint to uint\nx = uint 0\nfor i uint a bound B\nx = add x uint 1\nend\nret x\nend' 'ir\nfn f a uint to uint\nx = uint 0\nfor i uint a bound 3\nx = add x uint 1\nend\nret x\nend'
+ir_fold for_bound_default 'ir\nfn f a uint to uint\nx = uint 0\nfor i uint a bound 1000000\nx = add x uint 1\nend\nret x\nend' 'ir\nfn f a uint to uint\nx = uint 0\nfor i uint a\nx = add x uint 1\nend\nret x\nend'
+ir_refuse for_bound_zero 8 'ir
+fn f a uint to uint
+for i uint a bound 0
+end
+ret a
+end'
+ir_refuse for_bound_over 8 'ir
+fn f a uint to uint
+for i uint 3 bound 9223372036854775808
+end
+ret a
+end'
+# A number count with a bound gets the counter guard, which checker2 proves terminating.
+printf 'ir\nfn f a uint to uint\ns = uint 0\nfor i uint 7 bound 5\ns = add s a\nend\nret s\nend\n' > "$B/forbn.om"
+timeout 5 "$B/stage2" < "$B/forbn.om" > "$B/forbn.ir"
+build/checker2/checker2 check "$B/forbn.ir" > "$B/forbn.check"
+grep -q '^checker2=ACCEPT ' "$B/forbn.check" || fail 'for_num_bound checker refusal'
+echo 'PASS for_num_bound guarded; checker2 ACCEPT'
+# IR bound range = the C oracle's (omegese.c, 1..1000000) = the guard range checker2 proves
+# (c2_check.c "loop bounds"): bound 1000000 is emitted and accepted, bound 1000001 is error 8.
+printf 'fn f a uint to uint\nx = uint 0\nwhile lt x a bound 1000000\nx = add x uint 1\nend\nret x\nend\n' > "$B/wbmax.omegese"
+build/omegese/omegese emit "$B/wbmax.omegese" "$B/wbmax.json" > /dev/null
+build/omega_emit/omega_emit emit "$B/wbmax.json" "$B/wbmax.oracle" > /dev/null
+{ printf 'ir\n'; cat "$B/wbmax.omegese"; } > "$B/wbmax.om"
+timeout 5 "$B/stage2" < "$B/wbmax.om" > "$B/wbmax.ir"
+cmp -s "$B/wbmax.oracle" "$B/wbmax.ir" || fail 'while_bound_max differs from the oracle'
+build/checker2/checker2 check "$B/wbmax.ir" > "$B/wbmax.check"
+grep -q '^checker2=ACCEPT ' "$B/wbmax.check" || fail 'while_bound_max checker refusal'
+echo 'PASS while_bound_max identical; checker2 ACCEPT'
+printf 'fn f a uint to uint\nx = uint 0\nwhile lt x a bound 1000001\nx = add x uint 1\nend\nret x\nend\n' > "$B/wbover.omegese"
+if build/omegese/omegese emit "$B/wbover.omegese" "$B/wbover.json" > /dev/null 2>&1; then fail 'oracle accepted while bound 1000001'; fi
+ir_refuse while_bound_over 8 'ir
+fn f a uint to uint
+x = uint 0
+while lt x a bound 1000001
+x = add x uint 1
+end
+ret x
+end'
+printf 'ir\nfn f a uint to uint\nx = uint 0\nfor i uint a bound 1000000\nx = add x uint 1\nend\nret x\nend\n' > "$B/fbmax.om"
+timeout 5 "$B/stage2" < "$B/fbmax.om" > "$B/fbmax.ir"
+build/checker2/checker2 check "$B/fbmax.ir" > "$B/fbmax.check"
+grep -q '^checker2=ACCEPT ' "$B/fbmax.check" || fail 'for_bound_max checker refusal'
+echo 'PASS for_bound_max guarded; checker2 ACCEPT'
+ir_refuse for_bound_c2 8 'ir
+fn f a uint to uint
+x = uint 0
+for i uint a bound 1000001
+x = add x uint 1
+end
+ret x
+end'
+# IR count range = the C oracle's (omegese.c for_line, 0..1000000), so an unguarded loop over a number never
+# counts past what checker2 proves: count 1000000 is emitted identical to the oracle and accepted; 1000001 and a
+# minus sign (-1, -0) are refused by both; an integer constant count is held to the same range (error 8).
+printf 'fn f to ulong\ns = ulong 0\nfor i ulong 1000000\ns = add s i\nend\nret s\nend\n' > "$B/fcmax.omegese"
+build/omegese/omegese emit "$B/fcmax.omegese" "$B/fcmax.json" > /dev/null
+build/omega_emit/omega_emit emit "$B/fcmax.json" "$B/fcmax.oracle" > /dev/null
+{ printf 'ir\n'; cat "$B/fcmax.omegese"; } > "$B/fcmax.om"
+timeout 5 "$B/stage2" < "$B/fcmax.om" > "$B/fcmax.ir"
+cmp -s "$B/fcmax.oracle" "$B/fcmax.ir" || fail 'for_count_max differs from the oracle'
+build/checker2/checker2 check "$B/fcmax.ir" > "$B/fcmax.check"
+grep -q '^checker2=ACCEPT ' "$B/fcmax.check" || fail 'for_count_max checker refusal'
+echo 'PASS for_count_max identical; checker2 ACCEPT'
+for v in 1000001 -1 -0; do
+    printf 'fn f to long\ns = long 0\nfor i long %s\ns = add s i\nend\nret s\nend\n' "$v" > "$B/fcbad.omegese"
+    if build/omegese/omegese emit "$B/fcbad.omegese" "$B/fcbad.json" > /dev/null 2>&1; then fail "oracle accepted for count $v"; fi
+done
+ir_refuse for_count_over 8 'ir
+fn f to ulong
+s = ulong 0
+for i ulong 1000001
+s = add s i
+end
+ret s
+end'
+ir_refuse for_count_neg 8 'ir
+fn f to long
+s = long 0
+for i long -1
+s = add s i
+end
+ret s
+end'
+ir_refuse for_count_negzero 8 'ir
+fn f to long
+s = long 0
+for i long -0
+s = add s i
+end
+ret s
+end'
+ir_refuse for_count_const_over 8 'ir
+const K ulong 1000001
+fn f to ulong
+s = ulong 0
+for i ulong K
+s = add s i
+end
+ret s
+end'
 ir_refuse float_const 9 'ir
 const H f64 0.1
 fn f to f64
@@ -205,6 +325,216 @@ fn f to uint
 x = neg true
 ret uint 0
 end'
+# Validation: every word of a line is read, names follow scope, and what IR v1 cannot lower is refused.
+ir_refuse trailing_value 5 'ir
+fn f a uint to uint
+x = add a 1 7
+ret x
+end'
+ir_refuse untyped_new 11 'ir
+fn f a uint to uint
+foo 1 a 0 1
+ret a
+end'
+ir_refuse missing_operand 4 'ir
+fn f a uint to uint
+x = add a
+ret x
+end'
+ir_refuse bare_neg 11 'ir
+fn f to ulong
+ret neg 5
+end'
+ir_refuse end_trailing 5 'ir
+fn f a uint to uint
+if eq a 0
+ret 1
+end a
+ret a
+end'
+ir_refuse while_trailing 5 'ir
+fn f to uint
+x = uint 0
+while lt x uint 3 x
+x = add x uint 1
+end
+ret x
+end'
+ir_refuse ret_missing 4 'ir
+fn f to uint
+ret
+end'
+ir_refuse ret_void_value 5 'ir
+fn f to void
+ret uint 1
+end'
+ir_refuse keyword_name 16 'ir
+fn f to uint
+add = uint 1
+ret uint 0
+end'
+ir_refuse stmt_number 16 'ir
+fn f to uint
+5
+ret uint 0
+end'
+ir_refuse shadow_param_for 10 'ir
+fn f n uint to uint
+for n uint 3
+end
+ret n
+end'
+ir_refuse shadow_nested_for 10 'ir
+fn f n uint to uint
+s = uint 0
+for i uint n
+for i uint 2
+s = add s i
+end
+end
+ret s
+end'
+ir_refuse param_dup 10 'ir
+fn f a uint a uint to uint
+ret a
+end'
+ir_refuse param_fn_name 10 'ir
+fn g to uint
+ret uint 1
+end
+fn f g uint to uint
+ret g
+end'
+ir_refuse param_self_name 10 'ir
+fn f f uint to uint
+ret f
+end'
+ir_refuse scope_if 3 'ir
+fn f n uint to uint
+if gt n 0
+y = uint 3
+end
+ret y
+end'
+ir_refuse scope_else 3 'ir
+fn f n uint to uint
+if gt n 0
+y = uint 3
+ret y
+else
+ret y
+end
+ret n
+end'
+ir_refuse scope_for 3 'ir
+fn f to uint
+for i uint 3
+end
+ret i
+end'
+ir_refuse fallthrough 18 'ir
+fn f a uint to uint
+if eq a 0
+ret 1
+end
+end'
+ir_refuse float_param 9 'ir
+fn f a f64 to f64
+ret a
+end'
+ir_refuse float_ret 9 'ir
+fn f a uint to f64
+ret a
+end'
+ir_refuse else_twice 15 'ir
+fn f a uint to uint
+if eq a 0
+ret 1
+else
+ret 2
+else
+ret 3
+end
+end'
+ir_refuse else_outside 15 'ir
+fn f to uint
+else
+ret uint 0
+end'
+ir_refuse eof_in_fn 15 'ir
+fn f to uint
+ret uint 0'
+ir_refuse range_typed 8 'ir
+fn f to uchar
+ret 300
+end'
+ir_refuse range_bare 8 'ir
+fn f a uchar to uchar
+ret add a 300
+end'
+ir_refuse range_bare_left 8 'ir
+fn f a uchar to uchar
+ret sub 256 a
+end'
+ir_refuse range_negative 8 'ir
+fn f to uint
+ret uint -1
+end'
+# Locals, parameters and for counters are at most 8 bytes (13, as native); a word over 8 bytes is never a
+ir_refuse cast_lit_range 8 'ir
+fn f to uchar
+ret uchar 256
+end'
+ir_refuse cast_opnd_range 8 'ir
+fn f c uchar to ulong
+ret ulong sub c 300
+end'
+ir_refuse cast_signed_range 8 'ir
+fn f c byte to long
+ret long sub c -129
+end'
+ir_refuse cast_bool_num 9 'ir
+fn f c uchar to bool
+ret bool c
+end'
+ir_refuse cast_num_bool 9 'ir
+fn f b bool to ulong
+ret ulong b
+end'
+ir_refuse cast_cmp_bool 9 'ir
+fn f a uint b uint to ulong
+ret ulong eq a b
+end'
+ir_refuse long_local 13 'ir
+fn f n uint to uint
+counterxy = add n uint 1
+ret counterxy
+end'
+ir_refuse long_param 13 'ir
+fn f counterxy uint to uint
+ret counterxy
+end'
+ir_refuse long_for 13 'ir
+fn f to uint
+for counterxy uint 3
+end
+ret uint 0
+end'
+ir_refuse long_prefix_ref 3 'ir
+fn f n uint to uint
+counterx = add n uint 1
+ret counterxy
+end'
+# Same IR from two spellings: a note after the path ended is skipped like any note.
+ir_same() { # name source-a source-b
+    printf '%b\n' "$2" > "$B/$1a.om"
+    printf '%b\n' "$3" > "$B/$1b.om"
+    timeout 5 "$B/stage2" < "$B/$1a.om" > "$B/$1a.ir"
+    timeout 5 "$B/stage2" < "$B/$1b.om" > "$B/$1b.ir"
+    cmp -s "$B/$1a.ir" "$B/$1b.ir" || fail "$1 IR differs between the two spellings"
+    echo "PASS $1 same IR"
+}
+ir_same note_dead 'ir\nfn f to uint\nret uint 1\nnote after the path ended\nend' 'ir\nfn f to uint\nret uint 1\nend'
 
 # Multi-function units with calls: byte-identical to the C oracle and checker2 ACCEPT.
 ir_multi() { # name source
@@ -233,6 +563,42 @@ ir_multi break_nested 'fn f to uint\nx = uint 0\nwhile lt x uint 5 bound 20\ny =
 ir_multi shift_mixed 'fn f to ulong\nret shl ulong 1 uint 3\nend'
 ir_multi cmp_assign 'fn f to bool\nx = lt uint 1 uint 2\nx = eq uint 1 uint 1\nret x\nend'
 ir_multi cast_ret 'fn f to uchar\nret uchar uint 1\nend'
+ir_multi cast_wide 'fn f c uchar to ulong\nret ulong sub c 48\nend'
+ir_multi cast_left 'fn f c uchar to ulong\nret ulong sub 255 c\nend'
+ir_multi cast_u2s 'fn f c uchar to long\nret long sub c 48\nend'
+ir_multi cast_s2s 'fn f c byte to long\nret long add c 1\nend'
+ir_multi cast_s2u 'fn f c byte to ulong\nret ulong sub c 1\nend'
+ir_multi cast_narrow 'fn f x ulong to uchar\nret uchar sub x 1\nend'
+ir_multi cast_narrow_s 'fn f x long to byte\nret byte add x 1\nend'
+ir_multi cast_same_ty 'fn f x uint to uint\nret uint add x 1\nend'
+ir_multi cast_un 'fn f c uchar to ulong\nret ulong not c\nend'
+ir_multi cast_call 'fn g a uchar to uchar\nret add a 1\nend\nfn f c uchar to ulong\nret ulong g c\nend'
+ir_multi cast_assign 'fn f c uchar to ulong\nx = ulong sub c 48\nret x\nend'
+ir_multi cast_nested 'fn f c uchar to ulong\nret ulong uint mul c 2\nend'
+ir_multi cast_arg 'fn g a ulong to ulong\nret add a 1\nend\nfn f c uchar to ulong\nret g ulong sub c 48\nend'
+ir_multi cast_lit_var 'fn f to uint\nx = uint 5\nret uint x\nend'
+ir_multi cast_nest_var 'fn f x uint to uint\nret uint uint x\nend'
+ir_multi cast_same_assign 'fn f x uint to uint\ny = uint x\nret y\nend'
+ir_multi cast_same_param 'fn f x uint to uint\nret uint x\nend'
+ir_multi cast_neg_lit 'fn f c byte to long\nret long sub c -128\nend'
+ir_multi cast_ulong_max 'fn f to ulong\nret ulong 18446744073709551615\nend'
+ir_multi cast_cond 'fn f c uchar to uint\nif lt ulong c 10\nret 1\nend\nret 0\nend'
+# A same-type cast of an integer or bool constant is the constant itself (the oracle's konst rule), not a mov.
+ir_multi cast_same_konst 'fn f to uint\nret uint uint 5\nend'
+ir_multi cast_same_bool 'fn f to bool\nret bool true\nend'
+ir_multi cast_same_arg 'fn g a ulong to ulong\nret add a 1\nend\nfn f to ulong\nret g ulong ulong 7\nend'
+ir_multi bool_and 'fn f a bool b bool to bool\nret and a b\nend'
+ir_multi bool_or 'fn f a bool b bool to bool\nret or a b\nend'
+ir_multi bool_xor 'fn f a bool b bool to bool\nret xor a b\nend'
+ir_multi void_fall 'fn sink a uint to void\nend\nfn f to uint\nsink uint 1\nret uint 2\nend'
+ir_multi for_reuse 'fn f to uint\ns = uint 0\nfor i uint 3\ns = add s i\nend\nfor i uint 2\ns = add s i\nend\nret s\nend'
+ir_multi for_value 'fn f n uint to uint\ns = uint 0\nfor i uint n\ns = add s i\nend\nret s\nend'
+ir_multi for_value_expr 'fn f n uchar to uint\ns = uint 0\nfor i uchar add n uchar 1\nif eq i uchar 3\nbreak\nend\ns = add s uint 1\nend\nret s\nend'
+ir_multi scope_reuse 'fn f a uint to uint\nif gt a 1\ny = add a 1\nret y\nend\ny = add a 2\nret y\nend'
+ir_multi call_long_prefix 'fn increment_one a uint to uint\nret add a uint 1\nend\nfn increment_two a uint to uint\nret add a uint 2\nend\nfn f to uint\nret increment_two uint 4\nend'
+# A contract word followed by = is an assignment to a local of that name, as in the C oracle (only the clause form is error 30).
+ir_multi ensures_assign 'fn f to ulong\nensures = ulong 1\nret ensures\nend'
+ir_multi requires_assign 'fn f to ulong\nx = ulong 1\nrequires = add x x\nrequires = add requires x\nret requires\nend'
 # Random two-function programs with a call: differential against the oracle.
 rm -f "$B"/fz*
 awk -v dir="$B" 'BEGIN{
@@ -284,5 +650,5 @@ for f in "$B"/fz*.omegese; do
 done
 [ "$fzn" = 30 ] || fail "fuzz ran $fzn of 30 programs"
 echo "PASS 30 random two-function call units identical; checker2 ACCEPT"
-echo 'SCALAR_IR_CHECKPOINT 10/10 + 26 refusals + 9 multi-call units + 3 break units + 1 shift unit + 1 bool unit + 1 cast unit + 30 fuzz units; structs IR spec-blocked'
+echo 'SCALAR_IR_CHECKPOINT 10/10 + 31 refusals + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; structs IR spec-blocked'
 echo 'RC=0'

@@ -1,7 +1,7 @@
 # OSC-1 compiler slice (docs/osc/OSC-1-DESIGN.md) and the OSC-0B exit gate
 # (II.11 executable memory model). Files under src/compiler/ and tests/compiler/.
 # Picked up by `-include mk/*.mk`; not part of `all` or `test`. Links nothing
-# but src/compiler/** and src/sha256.c (no physics, no runtime, no gate suites);
+# but src/compiler/** and src/omega_om_units.c (no physics, no runtime, no gate suites);
 # the OSC-2 item 4 test also links the legacy writer src/aarch64_encoder.c + decoder.
 # OSC-1 slice; not a general Omega compiler; no self-hosting.
 #
@@ -21,7 +21,7 @@ COMPILER_MK := 1
 OSC_DIR = $(OUT_DIR)/compiler
 OSC_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc -Isrc/compiler -Isrc/compiler/model
 OSC_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-OSC_LIB = $(filter-out src/compiler/oscc_main.c,$(wildcard src/compiler/*.c)) src/sha256.c
+OSC_LIB = $(filter-out src/compiler/oscc_main.c,$(wildcard src/compiler/*.c)) src/omega_om_units.c
 OSC_MODEL = src/compiler/model/osc_model.c
 OSC_MODEL_GEN = src/compiler/model/osc_model_gen.c
 OSC_HDRS = $(wildcard src/compiler/*.h) $(wildcard src/compiler/model/*.h) src/sha256.h
@@ -84,7 +84,9 @@ $(OSC_DIR)/test_legacy_a64_asan: tests/compiler/test_legacy_a64.c $(OSC_LEGACY_A
 # ASan legs run with detect_stack_use_after_return=0: with the fake stack on, every
 # osc_ir_validate call (a 6 KB frame) ran about 50x slower on the Spark (measured
 # 0.012 ms vs 2.6 ms per encode); use-after-return is not what this test probes.
-OSC_DEC_MUTANTS = 1 2 3 4 5 6 7 8
+# Mutants 9..22 (omega#450): 9 every count/length maximum off, 10 unknown opcode admitted,
+# 11..22 one count/length maximum off each (sites listed in src/compiler/osc_ir.c).
+OSC_DEC_MUTANTS = 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22
 OSC_DEC_ASAN_ENV = ASAN_OPTIONS=detect_stack_use_after_return=0
 .PHONY: test-osc-ir-decode test-osc-ir-decode-quick test-osc-ir-decode-mutants
 
