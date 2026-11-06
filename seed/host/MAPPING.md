@@ -224,7 +224,7 @@ NOT_RUN unless separately qualified.
 
 The current-main landing rebuild of #1050 preserves every stack head, including
 #1046's original commits, and produces compiler fingerprint
-`836dd67fe1d7db58c1c93e3f02521f4201f70ef9127857d43bcf29577be0aee9`.
+`96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763`.
 The full native-host qualification and `tests/gates/run.sh om-units` pass with
 that compiler on Linux AArch64 under a device-hidden bwrap sandbox. This updates
 active compiler-consumer pins, not frozen bridge profiles or hardware evidence.
