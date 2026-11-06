@@ -1,0 +1,807 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note OMEGA-NUMERIC reference tier in Omega: the pure scalar definitions of
+note src/omega_numeric.c (E1 scalar contract, Omega div/sqrt/exp/log, compare
+note classes, launch shape). Every FP32/FP16/BF16 value travels as raw bits in
+note a ulong. The C file keeps the pointer loops, the asm realization tier and
+note the registry tables; CUDAPP_MIGRATION_PENDING_C_NUMERIC selects the old C
+note bodies as the differential oracle. One exported dispatcher, numeric_ref,
+note because a hosted unit exports only its last function.
+const M32 ulong 4294967295
+const SGN ulong 2147483648
+const ABS ulong 2147483647
+const INF ulong 2139095040
+const QNAN ulong 2143289344
+const QBIT ulong 4194304
+const TOP ulong 9223372036854775808
+fn isnan32 u ulong to bool
+ret gt and u ABS INF
+end
+fn issnan u ulong to bool
+ret and isnan32 u eq and u QBIT 0
+end
+fn iszero32 u ulong to bool
+ret eq and u ABS 0
+end
+fn msb64 v ulong to ulong
+note v is nonzero, so the leading one bit is found within 64 passes
+p = ulong 63
+while eq and shr v p 1 0 bound 64
+p = sub p 1
+end
+ret p
+end
+note Round sig * 2^e2 (s <= 0: exact shift up) to the lsb chosen by rndfmt.
+fn rndsh sig ulong s long p long to ulong
+if le s 0
+ret shl sig ulong neg s
+end
+if gt s add p 1
+ret 0
+end
+u = ulong s
+mant = ulong 0
+if lt u 64
+mant = shr sig u
+end
+g = and shr sig sub u 1 1
+r = and sig sub shl ulong 1 sub u 1 1
+if and eq g 1 or ne r 0 eq and mant 1 1
+mant = add mant 1
+end
+ret mant
+end
+note ref_round_small: sig * 2^e2 (exact, sig > 0) to a format with man
+note explicit bits, bias bias and all-ones exponent emaxf; RNE, subnormals
+note kept, overflow to infinity. Returns the bits without the sign. A sticky
+note amount below sig is passed as sig*2+1 at e2-1.
+fn rndfmt sig ulong e2 long man long bias long emaxf ulong to ulong
+p = long msb64 sig
+be = add add p e2 bias
+inf = shl emaxf ulong man
+if ge be long emaxf
+ret inf
+end
+s = sub sub sub 1 bias man e2
+if ge be 1
+s = sub p man
+end
+mant = rndsh sig s p
+bits = mant
+if ge be 1
+bits = add shl ulong sub be 1 ulong man mant
+end
+if ge bits inf
+ret inf
+end
+ret bits
+end
+fn rnd32 sig ulong e2 long to ulong
+ret rndfmt sig e2 23 127 255
+end
+note ref_split: finite FP32 magnitude as m * 2^e, m below 2^24.
+fn mant32 x ulong to ulong
+f = and x 8388607
+if ne and shr x 23 255 0
+ret or f 8388608
+end
+ret f
+end
+fn expo32 x ulong to long
+be = and shr x 23 255
+if ne be 0
+ret sub long be 150
+end
+ret long -149
+end
+note omega_unpack: finite nonzero magnitude as m * 2^e, m in [2^23, 2^24).
+fn unpm x ulong to ulong
+m = mant32 x
+while eq and m 8388608 0 bound 24
+m = shl m 1
+end
+ret m
+end
+fn unpe x ulong to long
+m = mant32 x
+e = expo32 x
+while eq and m 8388608 0 bound 24
+m = shl m 1
+e = sub e 1
+end
+ret e
+end
+note Order key of a non-NaN FP32: -0 and +0 share a key.
+fn okey u ulong to ulong
+if ne and u SGN 0
+ret sub SGN and u ABS
+end
+ret add SGN u
+end
+fn fmin32 a ulong b ulong to ulong
+if isnan32 a
+ret b
+end
+if isnan32 b
+ret a
+end
+if and iszero32 a iszero32 b
+ret and or a b SGN
+end
+if lt okey a okey b
+ret a
+end
+ret b
+end
+fn fmax32 a ulong b ulong to ulong
+if isnan32 a
+ret b
+end
+if isnan32 b
+ret a
+end
+if and iszero32 a iszero32 b
+ret and and a b SGN
+end
+if gt okey a okey b
+ret a
+end
+ret b
+end
+fn fsetpge a ulong b ulong to ulong
+if or isnan32 a isnan32 b
+ret 0
+end
+if ge okey a okey b
+ret 1
+end
+ret 0
+end
+note ref_order: PL 1, PE 2, PG 4, PU 8.
+fn order a ulong b ulong to ulong
+if or isnan32 a isnan32 b
+ret 8
+end
+ka = okey a
+kb = okey b
+if lt ka kb
+ret 1
+end
+if gt ka kb
+ret 4
+end
+ret 2
+end
+fn fsetpred mask ulong a ulong b ulong to ulong
+if ne and mask order a b 0
+ret 1
+end
+ret 0
+end
+fn fadd32 a ulong b ulong to ulong
+ret ulong bitcast uint add bitcast f32 uint a bitcast f32 uint b
+end
+fn fsub32 a ulong b ulong to ulong
+ret ulong bitcast uint sub bitcast f32 uint a bitcast f32 uint b
+end
+fn fmul32 a ulong b ulong to ulong
+ret ulong bitcast uint mul bitcast f32 uint a bitcast f32 uint b
+end
+fn i2f32 a ulong to ulong
+if eq a 0
+ret 0
+end
+if ne and a SGN 0
+ret or SGN rnd32 sub ulong 4294967296 a 0
+end
+ret rnd32 a 0
+end
+fn u2f32 a ulong to ulong
+if eq a 0
+ret 0
+end
+ret rnd32 a 0
+end
+note Integer part and fraction class of |x| (finite, nonzero): ip*4 + frac,
+note frac 0 none, 1 below half, 2 half, 3 above; TOP when |x| >= 2^40.
+fn ipfrac u ulong to ulong
+m = mant32 u
+e = expo32 u
+if ge e 0
+if gt e 16
+ret TOP
+end
+ret shl shl m ulong e 2
+end
+if ge neg e 40
+ret 1
+end
+sh = ulong neg e
+ip = shr m sh
+rm = and m sub shl ulong 1 sh 1
+h = shl ulong 1 sub sh 1
+fr = ulong 3
+if eq rm 0
+fr = 0
+else
+if lt rm h
+fr = 1
+else
+if eq rm h
+fr = 2
+end
+end
+end
+ret or shl ip 2 fr
+end
+fn satv ng bool uns bool to ulong
+if uns
+if ng
+ret 0
+end
+ret M32
+end
+if ng
+ret SGN
+end
+ret ABS
+end
+fn clampi ng bool mag ulong uns bool to ulong
+if uns
+if ng
+ret 0
+end
+if gt mag M32
+ret M32
+end
+ret mag
+end
+if ng
+if gt mag SGN
+ret SGN
+end
+ret and sub 0 mag M32
+end
+if gt mag ABS
+ret ABS
+end
+ret mag
+end
+note ref_to_int: mode 0 RTZ, 1 floor, 2 ceil, 3 RNE; saturating to int32
+note (uns false) or uint32 (uns true); NaN -> 0. Result: the 32 result bits.
+fn toint u ulong mode ulong uns bool to ulong
+if isnan32 u
+ret 0
+end
+ng = ne and u SGN 0
+x = and u ABS
+if eq x INF
+ret satv ng uns
+end
+if eq x 0
+ret 0
+end
+pf = ipfrac x
+if eq pf TOP
+ret satv ng uns
+end
+ret clampi ng intrnd pf mode ng uns
+end
+note Integer magnitude of ipfrac pf after rounding mode mode (ng: negative).
+fn intrnd pf ulong mode ulong ng bool to ulong
+ip = shr pf 2
+fr = and pf 3
+up = false
+if eq mode 1
+up = and ng ne fr 0
+end
+if eq mode 2
+up = and not ng ne fr 0
+end
+if eq mode 3
+up = or eq fr 3 and eq fr 2 eq and ip 1 1
+end
+if up
+ret add ip 1
+end
+ret ip
+end
+note ref_narrow: FP32 to a 16-bit format (man bits, bias, emaxf).
+fn narrow u ulong man ulong bias long emaxf ulong to ulong
+sign = and shr u 16 32768
+be = and shr u 23 255
+f = and u 8388607
+inf = shl emaxf man
+if eq be 255
+if eq f 0
+ret or sign inf
+end
+ret or or or sign inf shl ulong 1 sub man 1 shr f sub 23 man
+end
+if and eq be 0 eq f 0
+ret sign
+end
+ret or sign rndfmt mant32 u expo32 u long man bias emaxf
+end
+fn f16to32 h ulong to ulong
+sign = shl and h 32768 16
+be = and shr h 10 31
+f = and h 1023
+if eq be 31
+if eq f 0
+ret or sign INF
+end
+ret or or sign INF or QBIT shl f 13
+end
+if eq be 0
+if eq f 0
+ret sign
+end
+note f >= 1 reaches bit 10 within 10 shifts; e is the biased exponent
+e = ulong 113
+while eq and f 1024 0 bound 10
+f = shl f 1
+e = sub e 1
+end
+ret or or sign shl e 23 shl and f 1023 13
+end
+ret or or sign shl add be 112 23 shl f 13
+end
+fn bf16to32 h ulong to ulong
+ret shl and h 65535 16
+end
+note omega_ref_ffma_int tail: X is the term with the leading bit at or
+note above Y's. X is moved to bit 62; lost bits of Y are ORed into bit 0.
+fn fmaord X ulong ex long sx ulong Y ulong ey long sy ulong to ulong
+up = sub 62 long msb64 X
+xs = shl X ulong up
+xe = sub ex up
+d = sub xe ey
+ys = Y
+if lt d 0
+ys = shl Y ulong neg d
+else
+if ge d 64
+ys = 1
+else
+if gt d 0
+ys = shr Y ulong d
+if ne and Y sub shl ulong 1 ulong d 1 0
+ys = or ys 1
+end
+end
+end
+end
+m = add xs ys
+s = sx
+if ne sx sy
+if ge xs ys
+m = sub xs ys
+else
+m = sub ys xs
+s = sy
+end
+end
+if eq m 0
+ret 0
+end
+ret or s rnd32 m xe
+end
+fn fmaadd X ulong ex long sx ulong Y ulong ey long sy ulong to ulong
+if gt add long msb64 Y ey add long msb64 X ex
+ret fmaord Y ey sy X ex sx
+end
+ret fmaord X ex sx Y ey sy
+end
+fn fmafin xa ulong xb ulong xc ulong ps ulong cs ulong to ulong
+mp = mul mant32 xa mant32 xb
+ep = add expo32 xa expo32 xb
+if eq xc 0
+ret or ps rnd32 mp ep
+end
+ret fmaadd mp ep ps mant32 xc expo32 xc cs
+end
+fn ffmaint a ulong b ulong c ulong to ulong
+ps = and xor a b SGN
+cs = and c SGN
+xa = and a ABS
+xb = and b ABS
+xc = and c ABS
+if or or gt xa INF gt xb INF gt xc INF
+ret QNAN
+end
+pinf = or eq xa INF eq xb INF
+pz = or eq xa 0 eq xb 0
+if and pinf pz
+ret QNAN
+end
+if pinf
+if and eq xc INF ne cs ps
+ret QNAN
+end
+ret or ps INF
+end
+if eq xc INF
+ret c
+end
+if pz
+if ne xc 0
+ret c
+end
+ret and ps cs
+end
+ret fmafin xa xb xc ps cs
+end
+note AArch64 FMADD (FPCR DN=0): FPProcessNaNs3(addend c, a, b), signaling
+note NaNs first, then a quiet addend with inf*0 gives the default NaN.
+fn ffmahw a ulong b ulong c ulong to ulong
+if issnan c
+ret or c QBIT
+end
+if issnan a
+ret or a QBIT
+end
+if issnan b
+ret or b QBIT
+end
+if isnan32 c
+xa = and a ABS
+xb = and b ABS
+if or and eq xa INF eq xb 0 and eq xa 0 eq xb INF
+ret QNAN
+end
+ret c
+end
+if isnan32 a
+ret a
+end
+if isnan32 b
+ret b
+end
+ret ffmaint a b c
+end
+fn divfin ax ulong ay ulong sign ulong to ulong
+my = unpm ay
+rm = unpm ax
+q = ulong 0
+for i ulong 27
+q = shl q 1
+if ge rm my
+rm = sub rm my
+q = or q 1
+end
+rm = shl rm 1
+end
+st = ulong 0
+if ne rm 0
+st = 1
+end
+ret or sign rnd32 or shl q 1 st sub sub sub unpe ax unpe ay 26 1
+end
+fn mdiv x ulong y ulong to ulong
+if or isnan32 x isnan32 y
+ret QNAN
+end
+sign = and xor x y SGN
+ax = and x ABS
+ay = and y ABS
+if eq ay 0
+if eq ax 0
+ret QNAN
+end
+ret or sign INF
+end
+if eq ax 0
+ret sign
+end
+if eq ax INF
+if eq ay INF
+ret QNAN
+end
+ret or sign INF
+end
+if eq ay INF
+ret sign
+end
+ret divfin ax ay sign
+end
+fn sqfin mm ulong e long to ulong
+op = shl mm 28
+s = ulong 0
+one = shl ulong 1 62
+while gt one op bound 32
+one = shr one 2
+end
+while ne one 0 bound 32
+t = add s one
+if ge op t
+op = sub op t
+s = add shr s 1 one
+else
+s = shr s 1
+end
+one = shr one 2
+end
+st = ulong 0
+if ne op 0
+st = 1
+end
+ret rnd32 or shl s 1 st sub sub div e 2 14 1
+end
+fn msqrt x ulong to ulong
+if isnan32 x
+ret QNAN
+end
+if iszero32 x
+ret x
+end
+if ne and x SGN 0
+ret QNAN
+end
+if eq x INF
+ret INF
+end
+mm = unpm x
+e = unpe x
+if ne rem e 2 0
+mm = shl mm 1
+e = sub e 1
+end
+ret sqfin mm e
+end
+note AArch64 FSQRT (DN=0): a NaN operand is returned quiet.
+fn ieeesqrt x ulong to ulong
+if isnan32 x
+ret or x QBIT
+end
+ret msqrt x
+end
+fn ieeediv x ulong y ulong to ulong
+ret ulong bitcast uint div bitcast f32 uint x bitcast f32 uint y
+end
+fn f32of u ulong to f32
+ret bitcast f32 uint u
+end
+fn bitsof v f32 to ulong
+ret ulong bitcast uint v
+end
+fn pow2 k long to f32
+ret bitcast f32 uint shl add k 127 23
+end
+fn expscal poly f32 k long to ulong
+if gt k 127
+ret bitsof mul mul poly f32of 2130706432 pow2 sub k 127
+end
+if lt k long -126
+ret bitsof mul mul poly pow2 add k 100 pow2 long -100
+end
+ret bitsof mul poly pow2 k
+end
+fn exppoly x f32 k long to ulong
+fk = f32 k
+r = sub sub x mul fk f32of 1060205056 mul fk f32of 901758606
+p = mul r add f32of 1026206379 mul r f32of 1007192201
+p = mul r add f32of 1042983595 p
+p = mul r add f32of 1056964608 p
+poly = add f32of 1065353216 mul r add f32of 1065353216 p
+ret expscal poly k
+end
+fn mexp u ulong to ulong
+if isnan32 u
+ret QNAN
+end
+x = f32of u
+if lt x f32of 3268411392
+ret 0
+end
+if gt x f32of 1118925336
+ret INF
+end
+prod = mul x f32of 1069066811
+k = int 0
+if ge prod f32of 0
+k = int add prod f32of 1056964608
+else
+k = int sub prod f32of 1056964608
+end
+ret exppoly x long k
+end
+fn logpoly m f32 e long to ulong
+z = f32of mdiv bitsof sub m f32of 1065353216 bitsof add m f32of 1065353216
+z2 = mul z z
+poly = add f32of 1065353216 mul z2 add f32of 1051372203 mul z2 add f32of 1045220557 mul z2 f32of 1041385765
+lnm = mul mul f32of 1073741824 z poly
+ret bitsof add mul f32 e f32of 1060205080 lnm
+end
+fn mlog u ulong to ulong
+if isnan32 u
+ret QNAN
+end
+if lt f32of u f32of 0
+ret QNAN
+end
+if iszero32 u
+ret 4286578688
+end
+if eq u INF
+ret INF
+end
+x = u
+ea = long 0
+if eq and shr u 23 255 0
+x = bitsof mul f32of u f32of 1258291200
+ea = long -23
+end
+e = add sub long and shr x 23 255 127 ea
+m = f32of or and x 8388607 1065353216
+if gt m f32of 1068827891
+m = mul m f32of 1056964608
+e = add e 1
+end
+ret logpoly m e
+end
+fn bitseq a ulong b ulong to ulong
+if and isnan32 a isnan32 b
+ret 1
+end
+if eq a b
+ret 1
+end
+ret 0
+end
+note omega_numeric_compare_equal: mode 0 BIT_EXACT, 1 INT_EXACT,
+note 2 SEED_BOUND, 3 F16_BITS, 4 BF16_BITS.
+fn b2u v bool to ulong
+if v
+ret 1
+end
+ret 0
+end
+fn cmpeq mode ulong ex ulong got ulong to ulong
+if eq mode 0
+ret bitseq ex got
+end
+if eq mode 1
+ret b2u eq ex got
+end
+if or eq mode 3 eq mode 4
+if or ne shr ex 16 0 ne shr got 16 0
+ret 0
+end
+inf = ulong 31744
+if eq mode 4
+inf = 32640
+end
+en = gt and ex 32767 inf
+gn = gt and got 32767 inf
+if or en gn
+ret b2u and en gn
+end
+ret b2u eq ex got
+end
+ret 0
+end
+fn levels n ulong to ulong
+if eq n 0
+ret 0
+end
+l = ulong 1
+cap = ulong 32
+while lt cap n bound 13
+if gt cap 576460752303423487
+cap = sub ulong 0 1
+else
+cap = mul cap 32
+end
+l = add l 1
+end
+ret l
+end
+fn shape cnt ulong to ulong
+g = and div add cnt 63 64 M32
+if eq g 0
+ret 1
+end
+ret g
+end
+note Float constants are written as the bits of the C `f` literals, because
+note the pinned decimal conversion is not always correctly rounded (omega-mv#1024).
+note Dispatcher. Codes are the OMEGA_NUMERIC_OM_* values of src/omega_numeric.c.
+fn numeric_ref op ulong a ulong b ulong c ulong to ulong
+if eq op 0
+ret fadd32 a b
+end
+if eq op 1
+ret fsub32 a b
+end
+if eq op 2
+ret fmul32 a b
+end
+if eq op 3
+ret ffmahw a b c
+end
+if eq op 4
+ret ffmaint a b c
+end
+if eq op 5
+ret fmin32 a b
+end
+if eq op 6
+ret fmax32 a b
+end
+if eq op 7
+ret fsetpge a b
+end
+if eq op 8
+ret fsetpred c a b
+end
+if eq op 9
+ret i2f32 a
+end
+if eq op 10
+ret u2f32 a
+end
+if eq op 11
+ret toint a 0 false
+end
+if eq op 12
+ret toint a 1 false
+end
+if eq op 13
+ret toint a 2 false
+end
+if eq op 14
+ret toint a 3 false
+end
+if eq op 15
+ret toint a 0 true
+end
+if eq op 16
+ret narrow a 10 15 31
+end
+if eq op 17
+ret narrow a 7 127 255
+end
+if eq op 18
+ret f16to32 a
+end
+if eq op 19
+ret bf16to32 a
+end
+if eq op 20
+ret mdiv a b
+end
+if eq op 21
+ret msqrt a
+end
+if eq op 22
+ret mexp a
+end
+if eq op 23
+ret mlog a
+end
+if eq op 24
+ret ieeediv a b
+end
+if eq op 25
+ret ieeesqrt a
+end
+if eq op 26
+ret and sub 2129859008 a M32
+end
+if eq op 27
+ret bitseq a b
+end
+if eq op 28
+ret cmpeq a b c
+end
+if eq op 29
+ret levels a
+end
+if eq op 30
+ret shape a
+end
+note unknown codes never come from the C wrappers
+ret 0
+end
