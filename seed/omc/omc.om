@@ -1361,6 +1361,9 @@ end
 if eq w 7308604897285727600
 ret 224
 end
+if eq w 6384998
+ret 227
+end
 if eq get om2 0 0
 ret 0
 end
@@ -1936,15 +1939,17 @@ global fg_e long 1
 global fg_q ulong 1
 global fg_m ulong 1
 global fg_stk ulong 1
-global fg_low ulong 1
-global fg_ov ulong 1
+global fbn ulong 80
 
 note ======== float literals: decimal text to IEEE-754 binary32/binary64 ========
-note The literal is fnd * 10^fp10. The converter normalizes fnd to a 64-bit significand, applies the
-note decimal scale one factor of ten at a time (fmul10/fdiv10) while folding lost bits into one sticky
-note flag, then rounds once (froundsh) and packs (fpack). It covers the full IEEE range, subnormals
-note included, and refuses (error 8) only a value that rounds to infinity or whose digits do not fit
-note in 2^63-1.
+note The literal is fnd * 10^fp10 = A / D with A = fnd * 10^max(fp10,0) and D = 10^max(-fp10,0), both
+note held exactly as 40 32-bit limbs in fbn (A at 0, D at 40). The smaller of the two is shifted to the
+note other's bit length, then restoring division yields the first 64 quotient bits (fg_m, leading bit
+note set) and a remainder whose nonzero-ness is the sticky flag (fg_stk); froundsh rounds that exact
+note truncation once to nearest even and fpack packs it, subnormals included (#1024: the old converter
+note scaled one factor of ten at a time and dropped bits at every step). fp10 < -343 means a value
+note below (2^63-1)*10^-344 < 2^-1075, signed zero; fp10 > 308 means at least 10^309, above the
+note binary64 maximum (error 8). So A and D never exceed 1141 bits.
 
 note blen: bits needed for x (0 for zero)
 fn blen x ulong to ulong
@@ -1959,8 +1964,8 @@ end
 note fparse: read the literal text inp[pos, pos+len) into fsgn, fnd, fp10, fsuf (0 none, 1 f32, 2 f64).
 note Grammar: [-]digits[.digits][(e|E)[+|-]digits][f32|f64]. At most 2^63-1 significant digits
 note (error 8), a dot with no digit after it is error 6, |exponent| <= 999 (error 8).
-note The digit scans here and in fexp and the decimal steps in fbits run as nested 999999-pass loops: a
-note literal of more than 1000000 zero digits trapped 4 in a single loop's hidden 1000000-pass guard (#965).
+note The digit scans here and in fexp run as nested 999999-pass loops: a literal of more than 1000000
+note zero digits trapped 4 in a single loop's hidden 1000000-pass guard (#965).
 fn fparse pos ulong ln ulong to void
 p = pos
 e = add pos ln
@@ -2090,48 +2095,66 @@ end
 ret p
 end
 
-note fbits: the parsed literal as IEEE bits of type ty (10 f32, 11 f64). Zero keeps the sign (-0.0).
-note fmul10 / fdiv10: one exact decimal step on the normalized significand fg_m (value = fg_m * 2^fg_e),
-note keeping fg_m in [2^63, 2^64) and folding every lost bit into fg_stk. No rounding happens here.
-fn fmul10 to void
-m = get fg_m 0
-hi = shr m 32
-lo = and m 4294967295
-p0 = mul lo 10
-p1 = mul hi 10
-hi2 = add p1 shr p0 32
-put fg_low 0 or shl and hi2 4294967295 32 and p0 4294967295
-put fg_ov 0 shr hi2 32
-fmn10
+note fbmul: limbs fbn[o, o+40) times k (k < 2^32, so each limb step fits 64 bits); the product must fit
+note in 40 limbs. Returns its bit length, so fbmul o 1 only measures.
+fn fbmul o ulong k ulong to ulong
+c = ulong 0
+t = ulong 0
+i = ulong 0
+while lt i 40
+j = add o i
+v = add mul get fbn j k c
+put fbn j and v 4294967295
+c = shr v 32
+if ne and v 4294967295 0
+t = add mul i 32 blen and v 4294967295
+end
+i = add i 1
+end
+ret t
 end
 
-fn fmn10 to void
-ov = get fg_ov 0
-low = get fg_low 0
-s = blen ov
-if ne s 0
-st = or get fg_stk 0 and low sub shl 1 s 1
-put fg_stk 0 st
-put fg_m 0 or shl ov sub 64 s shr low s
-put fg_e 0 add get fg_e 0 long s
-else
-put fg_m 0 low
+note fbpow: fbn[o, o+40) times b^n (b 2 or 10), in factors that stay below 2^32.
+fn fbpow o ulong b ulong n ulong to void
+while gt n 0
+m = ulong 1
+c = ulong 0
+while and lt c n le mul m b 4294967295
+m = mul m b
+c = add c 1
+end
+t = fbmul o m
+n = sub n c
 end
 end
 
-fn fdiv10 to void
-m = get fg_m 0
-q = div m 10
-if ne rem m 10 0
-put fg_stk 0 1
+note fbsub: one restoring-division step. If A >= D then A = A - D and 1, else A is kept and 0.
+fn fbsub to ulong
+r = ulong 2
+i = ulong 40
+while and gt i 0 eq r 2
+i = sub i 1
+a = get fbn i
+d = get fbn add i 40
+if lt a d
+r = ulong 0
 end
-s = ulong 0
-while lt q 9223372036854775808
-q = shl q 1
-s = add s 1
+if gt a d
+r = ulong 1
 end
-put fg_m 0 q
-put fg_e 0 sub get fg_e 0 long s
+end
+if eq r 0
+ret 0
+end
+b = ulong 0
+i = ulong 0
+while lt i 40
+v = sub sub get fbn i get fbn add i 40 b
+put fbn i and v 4294967295
+b = shr v 63
+i = add i 1
+end
+ret 1
 end
 
 note froundsh: round fg_m right by sh bits to fg_q, nearest even; the guard and every lower bit
@@ -2210,10 +2233,11 @@ q = or q shl get fsgn 0 sub w 1
 ret q
 end
 
+note fbits: the parsed literal as IEEE bits of type ty (10 f32, 11 f64). Zero keeps the sign (-0.0).
 fn fbits ty ulong to ulong
 put fg_ty 0 ty
-put fg_stk 0 0
-if eq get fnd 0 0
+p = get fp10 0
+if or eq get fnd 0 0 lt p -343
 w = ulong 64
 if eq ty 10
 w = ulong 32
@@ -2224,34 +2248,41 @@ b = shl ulong 1 sub w 1
 end
 ret b
 end
-b = blen get fnd 0
-sh = sub 64 b
-put fg_m 0 shl get fnd 0 sh
-put fg_e 0 sub 0 long sh
-p = get fp10 0
-if gt p 0
+if gt p 308
+fail 8
+end
 i = ulong 0
-n = ulong p
-while lt i n
-fmul10
+while lt i 80
+put fbn i 0
 i = add i 1
 end
+put fbn 0 and get fnd 0 4294967295
+put fbn 1 shr get fnd 0 32
+put fbn 40 1
+if gt p 0
+fbpow 0 10 ulong p
 else
-if lt p 0
-i = ulong 0
-n = ulong sub 0 p
-while lt i n
-c = sub n i
-if gt c 999999
-c = ulong 999999
+fbpow 40 10 ulong sub 0 p
 end
-for k ulong c
-fdiv10
+a = fbmul 0 1
+d = fbmul 40 1
+e = long 0
+if lt a d
+fbpow 0 2 sub d a
+e = sub 0 long sub d a
+else
+fbpow 40 2 sub a d
+e = long sub a d
 end
-i = add i c
+q = ulong 0
+while lt q 9223372036854775808
+q = or shl q 1 fbsub
+a = fbmul 0 2
+e = sub e 1
 end
-end
-end
+put fg_m 0 q
+put fg_e 0 add e 1
+put fg_stk 0 fbmul 0 1
 ret fpack
 end
 
@@ -4461,6 +4492,74 @@ fp_minmax c at va vb vtw r
 put rk 0 9
 put rv 0 r
 end
+put rt 0 at
+vdec
+end
+
+note FMADD (scalar), ARM C7: one rounded multiply-add, not FMUL followed by FADD.
+note The addend is Ra, bits 14..10; multiplicands Rn, Rm are bits 9..5, 20..16.
+fn ffma dst ulong to void
+o = get fpo 0
+put fpo 0 0
+note x86's baseline is SSE2, not FMA3. No unfused fallback is permitted.
+if or ne get irmode 0 0 ne get xtarget 0 0
+fail 9
+end
+put fpw 0 1
+rdval 0 0 255 0
+if eq get rk 0 6
+fail 11
+end
+at = get rt 0
+if eq isfloat at 0
+fail 7
+end
+ak = get rk 0
+av = get rv 0
+put fpw 0 1
+rdval 0 0 255 0
+if eq get rk 0 6
+fail 11
+end
+if ne get rt 0 at
+fail 7
+end
+bk = get rk 0
+bv = get rv 0
+put fpw 0 1
+rdval 0 0 255 0
+if eq get rk 0 6
+fail 11
+end
+if ne get rt 0 at
+fail 7
+end
+va = fvop ak av at 0
+vb = fvop bk bv at 1
+vc = fvop get rk 0 get rv 0 at 2
+r = ulong 0
+vd = ulong 3
+if eq o 0
+r = destreg dst
+else
+r = fvdst o
+vd = vtw r
+end
+b = ulong 520093696
+if eq at 11
+b = 524288000
+end
+b = or b shl vb 16
+b = or b shl vc 10
+b = or b shl va 5
+emit or b vd
+if eq o 0
+fv2x at vd r
+put rk 0 1
+else
+put rk 0 9
+end
+put rv 0 r
 put rt 0 at
 vdec
 end
@@ -7416,7 +7515,7 @@ if eq e f
 fail 19
 end
 t = alloc
-matconst t 16383
+matconst t 1048576
 e3 3942645760 31 get fr add x 22 t
 trapc 8 3
 save
@@ -8103,7 +8202,9 @@ if eq exp 0
 vdone 2 get tw 0 get tbig 0
 ret
 end
-if ge exp 64
+note an integer literal where a float is expected is the mixing OMEGESE 9.9 refuses (error 7); before
+note this it was stored as raw bits (f64 x = 1 held 0x1). The conversion f64 1 reads it with exp 0.
+if or ge exp 64 ne isfloat exp 0
 fail 7
 end
 range get tw 0 exp get tbig 0
@@ -8257,6 +8358,11 @@ fintr c dst
 else
 fminmax c dst
 end
+ret
+end
+if eq c 227
+fwreq
+ffma dst
 ret
 end
 if eq c 95
@@ -16017,7 +16123,7 @@ xhs 2 get fr add x 25
 xhcmp 2 32
 xtrap 1 3
 xhs 9 get fr add x 22
-xhcmp 9 16383
+xhcmp 9 1048576
 xtrap 8 3
 xhb 13 e get fr add x 24
 xhb 8 f get fr add x 21

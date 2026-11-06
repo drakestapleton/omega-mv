@@ -19,8 +19,8 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 Current pin after integrating the hosted-x86 ABI1 stack (#1050, 2026-11-06): committed
 `seed/out/omc` SHA-256
-`836dd67fe1d7db58c1c93e3f02521f4201f70ef9127857d43bcf29577be0aee9`, compiler
-source SHA-256 `428112d43345a9ead98babb17c0f3b7f1aba2a4b342b9f466eebb7c4a10b873f`.
+`96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763`, compiler
+source SHA-256 `9622f66b63b09ae3ba6a22339058f22e789f8956007caf2ded166cba966c2d4d`.
 The previous pin, after the x86efi reseed (#1015, merged as
 `d3d1b1bc7e3b970016a2176435f78c8f0251bad1`), was
 `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55` (source
@@ -150,7 +150,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    836dd67fe1d7db58c1c93e3f02521f4201f70ef9127857d43bcf29577be0aee9 \
+    96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763 \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -380,7 +380,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc 836dd67fe1d7db58c1c93e3f02521f4201f70ef9127857d43bcf29577be0aee9 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc 96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763 neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch

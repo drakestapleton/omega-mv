@@ -13,7 +13,7 @@ bootstrap and test orchestration remain disclosed development tools.
 | `mapdrop handle` | Unmap the entire owned mapping. Zero on success or negative errno. Retires the slot on success; the next mapping gets a different generation. |
 | `mapread handle offset A off n` | Copy n bytes from the mapping into writable byte array A. Return n as long. |
 | `mapwrite handle offset A off n` | Copy n bytes from byte array A into a writable mapping. Return n as long. Read-only source views/text are accepted. |
-| `devcall fd request H hoff 32 P poff n` | RM_ALLOC or RM_CONTROL only. Binds a checked writable parameter span in a private header, sets its length, and copies back non-pointer fields. Caller pointer bytes must be zero; header and parameter spans must not overlap. Parameter length is at most 16383. |
+| `devcall fd request H hoff 32 P poff n` | RM_ALLOC or RM_CONTROL only. Binds a checked writable parameter span in a private header, sets its length, and copies back non-pointer fields. Caller pointer bytes must be zero; header and parameter spans must not overlap. Parameter length is at most 1048576 bytes (1 MiB); larger lengths trap 3 (exit 103). |
 | `uvmctl fd command A off n` | Literal Linux UVM request from the explicit ABI580.173.02 allowlist, with its exact writable payload length. |
 | `vfioctl fd request A off n` | Literal VFIO request from the allowlist below, with its exact byte count. Signed Linux ioctl result. `fd` is int; `request` a literal uint; `A` uchar bytes. |
 | `vfiomap fd A off 32` | Read-only shared mapping of one VFIO region. `A off 32` is the `vfio_region_info` returned by `DEVICE_GET_REGION_INFO`; its flags must contain READ and MMAP, and the compiler maps exactly its size at its offset. Returns a mapping handle or negative errno. `mapset`/`mapwrite` through the handle trap. |
@@ -152,6 +152,13 @@ mapping's full lifetime. The model runner must freeze and verify weight identiti
 Device calls use checked byte spans. `devcall` supplies one scoped parameter
 pointer in a private32-byte NVOS21/NVOS54 header. It never copies that pointer
 back. This work does not qualify arbitrary device commands.
+The parameter cap is the default `RMAPI_PARAM_COPY_MAX_PARAMS_SIZE` in
+[`param_copy.h`](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/20e4e6e1/src/nvidia/inc/kernel/rmapi/param_copy.h#L63).
+WolframLanguageEvaluator: `2^20` -> `1048576` bytes.
+The runtime passes the already checked caller span directly; only the private
+32-byte header is allocated on the stack, independent of parameter length.
+Large callers can use image-backed `global` arrays without a stack allocation.
+This does not change `devctl`: its payload size remains encoded in the ioctl request.
 GPU submission and mapped-device coherency require their separate existing
 runtime qualifications. Tests here open ordinary files, anonymous memory and
 pipes; compiler host tests do not open a GPU device or alter a running model.
@@ -320,7 +327,7 @@ NOT_RUN unless separately qualified.
 
 The current-main landing rebuild of #1050 preserves every stack head, including
 #1046's original commits, and produces compiler fingerprint
-`836dd67fe1d7db58c1c93e3f02521f4201f70ef9127857d43bcf29577be0aee9`.
+`96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763`.
 The full native-host qualification and `tests/gates/run.sh om-units` pass with
 that compiler on Linux AArch64 under a device-hidden bwrap sandbox. This updates
 active compiler-consumer pins, not frozen bridge profiles or hardware evidence.
