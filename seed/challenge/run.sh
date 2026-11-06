@@ -6,7 +6,7 @@
 #
 #   sh seed/challenge/run.sh                 # from the repo root of a full clone (needs the pin commit)
 #   sh seed/challenge/run.sh --tree DIR      # check an already extracted tree instead (negative controls)
-#   options: --expect FILE (default seed/challenge/expected.txt), --out DIR (default build/seed/challenge)
+#   options: --expect FILE (default seed/challenge/expected.txt, version 2; expected-v1.txt is version 1), --out DIR (default build/seed/challenge)
 #
 # Exit 0 = CHALLENGE PASS, 1 = CHALLENGE FAIL, 2 = usage, 3 = NOT_RUN (not AArch64 Linux, or pin missing).
 # The hash log is <out>/challenge.log.
