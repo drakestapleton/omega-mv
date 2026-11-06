@@ -16,8 +16,8 @@ bootstrap and test orchestration remain disclosed development tools.
 | `devcall fd request H hoff 32 P poff n` | RM_ALLOC or RM_CONTROL only. Binds a checked writable parameter span in a private header, sets its length, and copies back non-pointer fields. Caller pointer bytes must be zero; header and parameter spans must not overlap. Parameter length is at most 16383. |
 | `uvmctl fd command A off n` | Literal Linux UVM request from the explicit ABI580.173.02 allowlist, with its exact writable payload length. |
 | `mapaddr handle` | The owned live mapping's base address as ulong, for driver address serialization. Does not permit access through an arbitrary integer address. Works on reservations. |
-| `mapget handle offset width` | Aligned uint32 or uint64 load, returned as ulong; width is literal int4 or8. Exactly one load, bracketed by DSB SY. Requires readable memory. |
-| `mapset handle offset width value` | Aligned uint32 or uint64 store from ulong, returning long0; width is literal int4 or8. A uint32 store refuses truncation. Exactly one store, bracketed by DSB SY. Requires writable memory. |
+| `mapget handle offset width` | Aligned uint32 or uint64 load, returned as ulong; width is literal int4 or8. Exactly one load, bracketed by DSB SY on AArch64 or MFENCE on x86-64. Requires readable memory. |
+| `mapset handle offset width value` | Aligned uint32 or uint64 store from ulong, returning long0; width is literal int4 or8. A uint32 store refuses truncation. Exactly one store, bracketed by DSB SY on AArch64 or MFENCE on x86-64. Requires writable memory. |
 | `maphold address bytes` | Reserve an unused, page-aligned span with PROT_NONE and MAP_FIXED_NOREPLACE. Address is at least64KiB and the whole span is below1TiB. Return an owned handle or errno. A kernel that ignores NOREPLACE is detected by checking the returned address; an unexpected result is unmapped and returns -95. |
 | `mapbind handle fd offset access` | Bind a shared file/device mapping to the entire owned reservation, with literal access1 or3. No existing data mapping may be replaced. Return long0 or errno. Failed bind with successful cleanup retires the handle. Function-mode double failure quarantines it for cleanup only (below). |
 | `cpufence` | Statement, keyword 199: a standalone host CPU publication barrier, AArch64 `DSB SY`, x86-64 `MFENCE`. It orders ordinary stores, for example `mapwrite` or plain array stores, before a later `mapset` doorbell or flag. A `mapget`/`mapset` access already carries its own barriers. See OMEGESE §10, "Host CPU ordering words". Proof: `seed/host/cpufence.sh`. |
@@ -26,7 +26,8 @@ bootstrap and test orchestration remain disclosed development tools.
 `cpufence` and `cpurelax` are accepted in every function unit. An OM-2 function unit
 (first line `om2`, no `fn main`) may also use `devctl`, `mapnew`, `mapdrop`, `mapread`,
 `mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget`, `mapset`, `maphold` and `mapbind`.
-These words remain error9 in OM-1 function units and other targets (gate
+These words are supported on AArch64 Linux and `target x86linux`; they remain
+error9 in OM-1 function units and other targets (gate
 `seed/omc/om2/fnhost/fnhost.cases`). A handle is a long; `mapaddr` exposes only its
 owned live address, not general integer-pointer access.
 
@@ -35,7 +36,8 @@ slots (address, length, generation, access) and eight low handle bits for slot+1
 The129th live mapping returns-24 without calling mmap.
 
 **Function-mode context ABI (draft, Drake approval required before merge):**
-entry31 of the caller's runtime table (`LDR` from `[x7,#248]`) is a data pointer
+entry31 of the caller's runtime table (`LDR` from `[x7,#248]` on AArch64;
+`MOV` from `[r14+248]` on x86-64) is a data pointer
 to four u64 header words: capacity, generation base, generation limit, zero-reserved;
 then capacity32-byte slots. Capacity is1..4098. Handles use13 low bits for slot+1
 and50 generation bits; each slot starts at the caller's generation base and is
@@ -111,3 +113,42 @@ linux/mman.h. AArch64 encodings use seed/rung2/table.s2. The device request rule
 comes from the reviewed L605 src/device/omc.om, source 0dee699. Existing host
 source is f0499f415571bdd7496b6de391096915e78f7556. These device words are on
 main: `hdevctl` is defined in seed/omc/omc.om (verified at main e5b32567).
+
+## Hosted x86-64 Linux lowering
+
+Hosted and program-mode x86 calls share the existing emitter. Mapping uses Linux
+`mmap` syscall9 and `munmap` syscall11; `devctl`, `devcall` and `uvmctl` use
+`ioctl` syscall16. The argument registers are RDI, RSI, RDX, R10, R8 and R9;
+RAX carries the signed result. No libc syscall wrapper is linked. Mapping flags
+are unchanged: MAP_SHARED/PRIVATE with the existing anonymous options,
+PROT_NONE|MAP_FIXED_NOREPLACE for `maphold`, and MAP_SHARED|MAP_FIXED for
+`mapbind`. Copies (`mapread`/`mapwrite`) are byte copies, not ordered MMIO;
+`mapaddr` only exports a checked owned address.
+
+The hosted admission set is the same as AArch64: the mapping/ioctl words above,
+`fclose`, `fopen`, `fstat`, `stat`, `lstat`, `getuid`, `geteuid`, `getgid`,
+`getegid`, `monons`, `realns` and `sleepns`, plus the existing basic input/output.
+There is no new generic syscall or arbitrary-address operation.
+
+`mapget` and `mapset` each emit exactly one aligned load or store between two
+MFENCE instructions. `cpufence` emits MFENCE and `cpurelax` PAUSE. Do not replace
+these fences with a compiler barrier based on ordinary write-back TSO: mapped
+device memory can be write-combining and weakly ordered. Intel SDM volume2B,
+order253667-093US, September2026, **MFENCE**, page4-15, guarantees that preceding
+loads and stores become globally visible before later loads or stores, and
+explicitly discusses weakly ordered memory types. **SFENCE** orders stores but
+not loads; MFENCE is the deliberately conservative common barrier for both
+operations. Source: [Intel SDM volume2B](https://cdrdv2.intel.com/v1/dl/getContent/671241).
+The compiler emits instructions in order without a host-language optimizer;
+there is no separate C compiler-barrier substitution. CPU ordering does not prove
+PCIe completion, GPU coherency or hardware suitability.
+
+The x86 emitter leaves R12 (native nonlocal return anchor), R14 (runtime table)
+and R15 (stack floor) untouched. RBX anchors the saved slot snapshot; R13 scratch
+is restored before returning. The ordinary program-mode initial argument stack
+in R13 is therefore preserved too.
+
+The hosted compiler cases pin both targets' emitted bytes. Wrong-mmap-syscall and
+missing-MFENCE compiler mutants must fail those byte checks; this is instruction
+structure evidence, not a claim that QEMU reproduces WC reordering. The bridge
+adds memfd/ioctl/C differential runtime fixtures under the x86 QEMU oracle.
