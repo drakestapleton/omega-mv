@@ -1,0 +1,338 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Zero-copy buffer sharing between processes over the NVIDIA RM client, ABI 580.173.02.
+note Compose after native/nvrm/context.om. Reuses its descriptors, handles and mapping slots.
+note Export grants DUP_OBJECT by RM_SHARE with the OS security token policy (same user only).
+note Import duplicates the owner's memory with RM_DUP_OBJECT, proves its size, then maps it
+note for the CPU and the GPU at one address. Read-only imports set every access flag read-only.
+note The duplicate holds its own reference: the pages outlive the owner's free or exit.
+note Share record, 24 bytes little endian: 0 magic OMZC, 4 version 1, 8 owner client,
+note 12 owner memory handle, 16 byte size (whole 4 KiB pages).
+note Stages: 51 export, 52 duplicate, 53 size proof and CPU map, 54 UVM range, 55 DMA map,
+note 56 UVM external mapping, 57 imported.
+global nvshrec uchar 24
+note Slot provenance: the duplicate handle an import put in a slot. Handles come from nvseq
+note and are never reused, so a stale entry cannot match a later allocation's handle.
+global nvshobj uint 96
+fn nvshput off ulong v uint to void
+for i ulong 4
+put nvshrec add off i uchar and shr v mul i 8 255
+end
+end
+fn nvshget off ulong to uint
+v = uint 0
+for i ulong 4
+v = or v shl uint get nvshrec add off i mul i 8
+end
+ret v
+end
+fn nvshp64 off ulong v ulong to void
+for i ulong 8
+put nvshrec add off i uchar and shr v mul i 8 255
+end
+end
+fn nvshg64 off ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get nvshrec add off i mul i 8
+end
+ret v
+end
+
+note Publish one owned, fully mapped buffer. Fills nvshrec on success.
+note A buffer imported from another process is refused (EPERM): only the owner exports.
+fn nvexport m long to bool
+if or ne get nvfault 0 0 ne get nvstate 0 1
+put nverr 0 neg long 5
+ret false
+end
+slot = nvfind m
+if eq slot 96
+put nverr 0 neg long 22
+ret false
+end
+h = get nvmobj slot
+if or ne get nvmflag slot 15 eq h 0
+put nverr 0 neg long 22
+ret false
+end
+if eq get nvshobj slot h
+put nverr 0 neg long 1
+ret false
+end
+put nvstage 0 51
+npzero
+npput 0 get nvobj 0
+npput 4 h
+note RS_SHARE_POLICY: target 0, access mask bit RS_ACCESS_DUP_OBJECT, type OS security token, action 0.
+npput 8 0
+npput 12 1
+npput 16 2
+r = devctl get nvfd 0 uint 3222816309 nvpar 0 24
+if not nvos r npget 20
+ret false
+end
+for i ulong len nvshrec
+put nvshrec i 0
+end
+nvshput 0 1129991503
+nvshput 4 1
+nvshput 8 get nvobj 0
+nvshput 12 h
+nvshp64 16 get nvmlen slot
+ret true
+end
+
+note RM_MAP_MEMORY on the control device. Returns a negative errno or the RM status.
+fn nvshmap obj uint off ulong n ulong ro bool fd long to long
+npzero
+npput 0 get nvobj 0
+npput 4 get nvobj 1
+npput 8 obj
+npp64 16 off
+npp64 24 n
+if ro
+npput 44 1
+end
+npput 48 uint fd
+r = devctl get nvfd 0 uint 3224913486 nvpar 0 56
+if lt r 0
+ret r
+end
+if gt r 0
+ret neg long 5
+end
+ret long npget 40
+end
+
+note Size proof and CPU map. RM refuses a map that starts at or past the object's end
+note (INVALID_BASE 0x20) and one that runs past it (INVALID_LIMIT 0x2e). A probe one page
+note past the claimed end must be refused as INVALID_BASE, and the full claimed span must map.
+note Either mismatch returns -1 with nverr -34 (ERANGE). The caller frees the duplicate,
+note which also retires any RM CPU mapping record the probe or map created.
+fn nvshcpu obj uint size ulong ro bool to long
+fd = fopen nvctl 0 len nvctl 524290 0
+if lt fd 0
+put nverr 0 fd
+ret neg long 1
+end
+st = nvshmap obj size 4096 ro fd
+if eq st 32
+st = nvshmap obj 0 size ro fd
+if eq st 46
+st = neg long 34
+end
+else
+if eq st 0
+st = neg long 34
+end
+end
+if ne st 0
+r = fclose int fd
+if ne r 0
+put nvfault 0 1
+end
+put nverr 0 st
+ret neg long 1
+end
+if gt get nvnext 0 sub 1099511627776 size
+r = fclose int fd
+put nverr 0 neg long 75
+ret neg long 1
+end
+m = maphold get nvnext 0 size
+if gt m 0
+put nvnext 0 add get nvnext 0 size
+r = neg long 1
+if ro
+r = mapbind m int fd 0 1
+else
+r = mapbind m int fd 0 3
+end
+if ne r 0
+m = r
+end
+end
+r = fclose int fd
+if ne r 0
+put nverr 0 r
+put nvfault 0 1
+if gt m 0
+r = mapdrop m
+if ne r 0
+put nvunpub 0 m
+end
+end
+ret neg long 1
+end
+if lt m 0
+put nverr 0 m
+ret neg long 1
+end
+ret m
+end
+
+note Import the buffer described by nvshrec. want is the byte size the caller expects.
+note Returns the CPU mapping handle; its address is also the GPU virtual address.
+note Clean refusals leave no slot, RM object or mapping and do not fault the context:
+note malformed record -22, size different from want or from the object -34, slots full -24,
+note RM refusal of the duplicate (wrong handle, not shared) the positive RM status.
+fn nvimport want ulong ro bool to long
+if or eq get nvreg 1 0 ne get nvfault 0 0
+put nverr 0 neg long 5
+ret neg long 1
+end
+if not nvshchk want
+ret neg long 1
+end
+slot = ulong 96
+for i ulong 96
+if and eq slot 96 eq get nvmflag i 0
+slot = i
+end
+end
+if eq slot 96
+put nverr 0 neg long 24
+ret neg long 1
+end
+if eq get nvseq 0 4294967295
+put nverr 0 neg long 75
+ret neg long 1
+end
+h = get nvseq 0
+put nvseq 0 add h 1
+put nvstage 0 52
+npzero
+npput 0 get nvobj 0
+npput 4 get nvobj 1
+npput 8 h
+npput 12 nvshget 8
+npput 16 nvshget 12
+npput 20 0
+r = devctl get nvfd 0 uint 3223078452 nvpar 0 28
+if not nvos r npget 24
+ret neg long 1
+end
+d = npget 8
+if eq d 0
+put nverr 0 neg long 22
+put nvfault 0 1
+ret neg long 1
+end
+put nvmobj slot d
+put nvmlen slot want
+put nvmflag slot 1
+put nvshobj slot d
+put nvstage 0 53
+m = nvshcpu d want ro
+if le m 0
+e = get nverr 0
+if nvmrel slot
+put nverr 0 e
+end
+ret neg long 1
+end
+put nvmmap slot m
+put nvmaddr slot mapaddr m
+put nvmflag slot 3
+if not nvshgpu slot ro
+ret neg long 1
+end
+put nvstage 0 57
+ret m
+end
+
+note Record checks before any RM call. Malformed -22; size other than want -34.
+fn nvshchk want ulong to bool
+if or ne nvshget 0 1129991503 ne nvshget 4 1
+put nverr 0 neg long 22
+ret false
+end
+if or eq nvshget 8 0 eq nvshget 12 0
+put nverr 0 neg long 22
+ret false
+end
+size = nvshg64 16
+if or eq size 0 gt size 68719476736
+put nverr 0 neg long 22
+ret false
+end
+if ne and size 4095 0
+put nverr 0 neg long 22
+ret false
+end
+if ne size want
+put nverr 0 neg long 34
+ret false
+end
+ret true
+end
+
+note GPU side of an import, after the CPU map, as in nvalloc: UVM external range at the CPU
+note address, DMA map at that fixed address, UVM external mapping. A failure here leaves the
+note slot quarantined and the context faulted; nvmclose or nvmforce releases it.
+fn nvshgpu slot ulong ro bool to bool
+va = get nvmaddr slot
+size = get nvmlen slot
+d = get nvmobj slot
+if or ne and va 4095 0 gt va sub 562949869535232 size
+put nverr 0 neg long 75
+put nvfault 0 1
+ret false
+end
+put nvstage 0 54
+npzero
+npp64 0 va
+npp64 8 size
+r = uvmctl get nvfd 2 uint 73 nvpar 0 24
+if not nvos r npget 16
+put nvfault 0 1
+ret false
+end
+put nvmflag slot 7
+put nvstage 0 55
+npzero
+npput 0 get nvobj 0
+npput 4 get nvobj 1
+npput 8 get nvobj 3
+npput 12 d
+npp64 24 size
+fl = uint 33040
+if ro
+fl = 33041
+end
+npput 32 fl
+npp64 48 va
+r = devctl get nvfd 0 uint 3225437783 nvpar 0 64
+if not nvos r npget 56
+put nvfault 0 1
+ret false
+end
+put nvmflag slot 15
+if ne npg64 48 va
+put nverr 0 neg long 22
+put nvfault 0 1
+ret false
+end
+put nvstage 0 56
+npzero
+npp64 0 va
+npp64 8 size
+for i ulong 16
+put nvpar add i 24 get nvuuid i
+end
+kind = uint 1
+if ro
+kind = 3
+end
+npput 40 kind
+npp64 9240 1
+npput 9248 uint get nvfd 0
+npput 9252 get nvobj 0
+npput 9256 d
+r = uvmctl get nvfd 2 uint 33 nvpar 0 9264
+if not nvos r npget 9260
+put nvfault 0 1
+ret false
+end
+ret true
+end
