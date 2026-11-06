@@ -1,0 +1,485 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note The plan of the general GEMM (CUDApp#144): validation, route, tiling, k parts and the per-batch alpha, over two
+note word windows. x holds the call (written by the C shell, src/omega_gpu_gemm_ex.c), p the plan (read back by it).
+note Codes: 0 OK, 1 BAD_ARGS, 2 TOO_LARGE, 3 UNSUPPORTED (the shell maps them to OMEGA_GPU_GEMM_*).
+note x: 0 op_a, 1 op_b, 2 m, 3 n, 4 k, 5 batch, 6 a_type, 7 b_type, 8 c_type, 9 lda, 10 stride_a, 11 ldb, 12 stride_b,
+note 13 ldc, 14 stride_c, 15 alpha f32 bits, 16 beta f32 bits, 17 compute, 18 scale, 19 scale_a ptr, 20 scale_b ptr,
+note 21 scale_stride_a, 22 scale_stride_b, 23 block_m, 24 block_n, 25 block_k, 26 a ptr, 27 b ptr, 28 c ptr, 29 mutant;
+note op 1: 30 k0, 31 mc, 32 nc, 33 any_bad, 34 m0, 35 n0; op 2: 30 sa[0] bits, 31 sb[0] bits, 32 any_bad;
+note op 3 (fp8 rows): 30 w, 31 scale, 32 y, 33 x32, 34 x16 (ptrs), 35 n, 36 k, 37 m, 38 block, 39 ldy.
+note p (op 0): 0 code, 1 batch, 2 lda, 3 ldb, 4 ldc, 5 op_b in effect, 6 route, 7 core type, 8 kmax, 9 one part,
+note 10 compute (alpha != 0), 11 beta f64 bits, 12 sa_r, 13 sa_c, 14 sb_c, 15 16 scale counts a b, 17 18 scale batches
+note a b, 19 direct shape, 20 dm, 21 tm, 22 tn, 23 kcore, 24 layout, 25 core esize, 26 27 28 esize a b c, 30 31 row op
+note of A' and B', 32 B' row-major (FFMA), 33 core layout, 34 na, 35 nb, 44 45 46 extents a b c;
+note op 1: 36 kc (advance), 37 ku (k the core runs), 38 kb, 39 zero copy, 40 41 byte offsets of A and B, 47 core K;
+note op 2: 42 alpha f64 bits, 43 direct now; op 3: 0 code, 1 ldy, 2 kb, 3 slab rows, 4 a_type.
+note Constants (Wolfram): 2^64-1 18446744073709551615, 2^56 72057594037927936, 2^58 288230376151711744,
+note 2^31-1 2147483647, 2^32-1 4294967295, 32 MiB 33554432, f64 1.0 bits 4607182418800017408.
+
+note stored rows x cols with leading dimension ld: the span, 0 when ld is short or the span passes 2^56
+fn gx_span rows ulong cols ulong ld ulong to ulong
+if lt ld cols
+ret 0
+end
+if gt sub rows 1 div 72057594037927936 ld
+ret 0
+end
+ret add mul sub rows 1 ld cols
+end
+
+note the elements batch copies of a span reach: 0 when the product or sum overflows or passes 2^58
+fn gx_ext span ulong stride ulong batch ulong to ulong
+b1 = sub batch 1
+if ne b1 0
+if gt stride div 18446744073709551615 b1
+ret 0
+end
+end
+t = mul b1 stride
+e = add t span
+if lt e t
+ret 0
+end
+if gt e 288230376151711744
+ret 0
+end
+ret e
+end
+
+note 1 when byte ranges [a, a + pa) and [b, b + qb) overlap (address arithmetic modulo 2^64)
+fn gx_ovl a ulong pa ulong b ulong qb ulong to ulong
+if and lt a add b qb lt b add a pa
+ret 1
+end
+ret 0
+end
+
+note the C3 leading-dimension check of one operand (omega_gpu_gemm.c ld_span): 1 when the span fits 32-bit indexing
+fn gx_lds col ulong r ulong kk ulong ld ulong to ulong
+ou = r
+iu = kk
+if eq col 1
+ou = kk
+iu = r
+end
+l = ld
+if eq l 0
+l = iu
+end
+if or lt l iu gt l 4294967295
+ret 0
+end
+if gt add mul sub ou 1 l iu 4294967295
+ret 0
+end
+ret 1
+end
+
+note omega_gpu_gemm_span: 1 when C3 can address the operands in place
+fn gx_gspan lay ulong mm ulong nn ulong kk ulong lda ulong ldb ulong to ulong
+if or or eq mm 0 eq nn 0 eq kk 0
+ret 0
+end
+if eq gx_lds and lay 1 mm kk lda 0
+ret 0
+end
+ret gx_lds xor shr and lay 2 1 1 nn kk ldb
+end
+
+note the route (low byte) and the core type (next byte): C l.228-239
+fn gx_route comp ulong ta ulong tb ulong to ulong
+if eq comp 2
+ret 773
+end
+if and eq ta tb eq ta 1
+ret 1
+end
+if and eq ta tb eq ta 2
+ret 513
+end
+if and eq ta tb eq ta 3
+ret 257
+end
+if and and ne ta 0 ne ta 2 and ne tb 0 ne tb 2
+ret 2
+end
+if and and ne ta 0 ne ta 1 and ne tb 0 ne tb 1
+ret 514
+end
+if eq comp 1
+ret 4
+end
+ret 3
+end
+
+note op 0, part 1b (C l.202-211): default leading dimensions, spans, the C batch stride, extents
+fn gx_valb x view ulong 48 p edit ulong 64 to ulong
+r = get x 2
+c = get x 4
+if eq get x 0 1
+r = get x 4
+c = get x 2
+end
+put p 2 get x 9
+if eq get x 9 0
+put p 2 c
+end
+put p 48 gx_span r c get p 2
+r = get x 4
+c = get x 3
+if eq get x 1 1
+r = get x 3
+c = get x 4
+end
+put p 3 get x 11
+if eq get x 11 0
+put p 3 c
+end
+put p 49 gx_span r c get p 3
+put p 4 get x 13
+if eq get x 13 0
+put p 4 get x 3
+end
+put p 50 gx_span get x 2 get x 3 get p 4
+if or eq get p 48 0 eq get p 49 0
+ret 1
+end
+if eq get p 50 0
+ret 1
+end
+if gt get p 1 1
+if lt get x 14 get p 50
+ret 1
+end
+end
+put p 44 gx_ext get p 48 get x 10 get p 1
+put p 45 gx_ext get p 49 get x 12 get p 1
+put p 46 gx_ext get p 50 get x 14 get p 1
+if or eq get p 44 0 eq get p 45 0
+ret 1
+end
+if eq get p 46 0
+ret 1
+end
+ret 0
+end
+
+note op 0, part 1 (C l.194-211): defaults, ranges, sizes, spans and extents
+fn gx_val x view ulong 48 p edit ulong 64 to ulong
+b = get x 5
+if eq b 0
+b = 1
+end
+put p 1 b
+if or gt get x 0 1 gt get x 1 1
+ret 1
+end
+if or gt get x 6 4 gt get x 7 4
+ret 1
+end
+if or gt get x 8 4 gt get x 17 2
+ret 1
+end
+if or gt get x 18 2 eq get x 28 0
+ret 1
+end
+m = get x 2
+n = get x 3
+k = get x 4
+if or or eq m 0 eq n 0 eq k 0
+ret 1
+end
+if or gt m 2147483647 gt n 2147483647
+ret 2
+end
+if or gt k 2147483647 gt b 2147483647
+ret 2
+end
+if gt get x 8 2
+ret 3
+end
+ret gx_valb view x edit p
+end
+
+note op 0, part 2 (C l.212-226): operand pointers, overlap with C, the scale grid
+fn gx_val2 x view ulong 48 p edit ulong 64 to ulong
+put p 26 gx_es get x 6
+put p 27 gx_es get x 7
+put p 28 gx_es get x 8
+cb = mul get p 46 get p 28
+put p 10 0
+if ne bitcast f32 uint get x 15 bitcast f32 uint 0
+put p 10 1
+if or eq get x 26 0 eq get x 27 0
+ret 1
+end
+if eq gx_ovl get x 28 cb get x 26 mul get p 44 get p 26 1
+ret 1
+end
+if eq gx_ovl get x 28 cb get x 27 mul get p 45 get p 27 1
+ret 1
+end
+end
+sc = get x 18
+put p 12 0
+put p 13 0
+put p 14 0
+put p 15 0
+put p 16 0
+if ne sc 0
+if or eq get x 19 0 eq get x 20 0
+ret 1
+end
+put p 15 1
+put p 16 1
+end
+if eq sc 2
+if or or eq get x 23 0 eq get x 24 0 eq get x 25 0
+ret 1
+end
+put p 12 div sub add get x 2 get x 23 1 get x 23
+put p 13 div sub add get x 4 get x 25 1 get x 25
+put p 14 div sub add get x 3 get x 24 1 get x 24
+put p 15 mul get p 12 get p 13
+put p 16 mul get p 13 get p 14
+end
+put p 17 1
+if ne get x 21 0
+put p 17 get p 1
+end
+put p 18 1
+if ne get x 22 0
+put p 18 get p 1
+end
+ret 0
+end
+
+note op 0, part 4: the core k of one part, buffer sizes, the core esize and the row ops of A' and B' (row.om ops)
+fn gx_val4 x view ulong 48 p edit ulong 64 to ulong
+r = get p 6
+kc = get x 4
+if gt kc get p 8
+kc = get p 8
+end
+kcore = kc
+if eq r 3
+kcore = mul 9 mul shr add kc 15 4 16
+end
+put p 23 kcore
+put p 34 add mul get p 21 kcore 16
+put p 35 add mul get p 22 kcore 16
+ct = get p 7
+put p 25 2
+if eq ct 1
+put p 25 1
+end
+if eq ct 3
+put p 25 4
+end
+put p 32 0
+put p 33 2
+if eq r 5
+put p 30 0
+put p 31 0
+put p 32 1
+put p 33 0
+ret 0
+end
+if eq r 3
+put p 30 5
+put p 31 6
+ret 0
+end
+if eq r 4
+put p 30 4
+put p 31 4
+ret 0
+end
+put p 30 2
+if eq ct 1
+put p 30 3
+end
+if eq ct 2
+put p 30 1
+end
+put p 31 get p 30
+ret 0
+end
+
+note op 0, part 3 (C l.227-240 and the plan of omega_gpu_gemm_ex l.351-370): route, k part size, tiles, row ops
+fn gx_val3 x view ulong 48 p edit ulong 64 to ulong
+r = gx_route get x 17 get x 6 get x 7
+put p 7 shr r 8
+r = and r 255
+put p 6 r
+put p 8 16384
+if eq r 3
+put p 8 1808
+end
+put p 5 get x 1
+if eq get x 29 2
+put p 5 0
+end
+put p 9 0
+if and le get x 4 get p 8 ne get x 18 2
+put p 9 1
+end
+bt = f64 bitcast f32 uint get x 16
+if eq get x 29 4
+bt = bitcast f64 ulong 0
+end
+put p 11 bitcast ulong bt
+put p 24 or get x 0 shl get p 5 1
+n = get x 2
+put p 20 n
+if gt n 16384
+put p 20 16384
+end
+put p 21 n
+if gt n 4096
+put p 21 4096
+end
+n = get x 3
+put p 22 n
+if gt n 4096
+put p 22 4096
+end
+put p 19 0
+if and eq get p 10 1 eq get p 9 1
+if and eq r 1 eq bt bitcast f64 ulong 0
+if and eq get x 8 0 eq get p 4 n
+if le n 16384
+put p 19 gx_gspan get p 24 get p 20 n get x 4 get p 2 get p 3
+end
+end
+end
+end
+ret gx_val4 view x edit p
+end
+
+note op 1 (C l.388, l.411-420, run_part l.264-270): one k part from k0 of the tile at (m0, n0), mc x nc
+fn gx_kpart x view ulong 48 p edit ulong 64 to ulong
+k0 = get x 30
+kc = sub get x 4 k0
+if gt kc get p 8
+kc = get p 8
+end
+put p 38 0
+if eq get x 18 2
+bk = get x 25
+if gt kc sub bk rem k0 bk
+kc = sub bk rem k0 bk
+end
+put p 38 div k0 bk
+if eq get x 29 3
+put p 38 rem add get p 38 1 get p 13
+end
+end
+ku = kc
+if and eq get x 29 1 eq add k0 kc get x 4
+ku = sub kc 1
+end
+put p 36 kc
+put p 37 ku
+put p 47 ku
+if eq get p 6 3
+put p 47 mul 9 mul shr add ku 15 4 16
+end
+put p 39 0
+if and eq get p 6 1 eq get x 33 0
+put p 39 gx_gspan get p 24 get x 31 get x 32 ku get p 2 get p 3
+end
+put p 40 add mul get x 34 get p 2 k0
+if eq get x 0 1
+put p 40 add mul k0 get p 2 get x 34
+end
+put p 41 add mul k0 get p 3 get x 35
+if eq get p 5 1
+put p 41 add mul get x 35 get p 3 k0
+end
+put p 40 mul get p 40 get p 26
+put p 41 mul get p 41 get p 26
+ret 0
+end
+
+note op 2 (C l.377-389): this batch's alpha (times the tensor scales) and whether C3 writes C directly
+fn gx_batch x view ulong 48 p edit ulong 64 to ulong
+al = f64 bitcast f32 uint get x 15
+if eq get x 18 1
+al = mul al mul f64 bitcast f32 uint get x 30 f64 bitcast f32 uint get x 31
+end
+put p 42 bitcast ulong al
+put p 43 0
+if and and eq get p 19 1 eq get x 32 0 eq al bitcast f64 ulong 4607182418800017408
+put p 43 1
+end
+ret 0
+end
+
+note op 3 (C l.455-461): the fp8 block-row fallback's checks, ldy, k blocks and dequantized rows per slab
+fn gx_fp8v x view ulong 48 p edit ulong 64 to ulong
+n = get x 35
+k = get x 36
+bl = get x 38
+ly = get x 39
+put p 0 1
+if or eq get x 30 0 eq get x 31 0
+ret 1
+end
+if eq get x 32 0
+ret 1
+end
+if eq eq get x 33 0 eq get x 34 0
+ret 1
+end
+if or or eq n 0 eq k 0 or eq get x 37 0 eq bl 0
+ret 1
+end
+if and ne ly 0 lt ly n
+ret 1
+end
+if eq ly 0
+ly = n
+end
+put p 0 0
+put p 1 ly
+put p 2 div sub add k bl 1 bl
+rows = div 33554432 mul k 4
+if eq rows 0
+rows = 1
+end
+if gt rows n
+rows = n
+end
+put p 3 rows
+put p 4 1
+if ne get x 33 0
+put p 4 0
+end
+ret 0
+end
+
+note the entry: op 0 plans a call (validation through the row ops), 1 one k part, 2 one batch, 3 the fp8 rows checks
+fn gemm_ex_plan op ulong x view ulong 48 p edit ulong 64 to ulong
+if eq op 0
+r = gx_val view x edit p
+if ne r 0
+ret r
+end
+r = gx_val2 view x edit p
+if ne r 0
+ret r
+end
+ret gx_val3 view x edit p
+end
+if eq op 1
+ret gx_kpart view x edit p
+end
+if eq op 2
+ret gx_batch view x edit p
+end
+if eq op 3
+ret gx_fp8v view x edit p
+end
+ret 1
+end

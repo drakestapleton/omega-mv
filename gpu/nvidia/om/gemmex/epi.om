@@ -1,0 +1,70 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note The epilogue of one tile row (or, when no element is recomputed, of adjacent rows packed as one; every element is
+note independent) of the general GEMM (CUDApp#144, src/omega_gpu_gemm_ex.c l.428-439, store_c):
+note v = alpha * a (a = 0 + P for one k part, else the k-part sum; the host recompute where flagged), plus beta * C
+note when beta != 0 (a NaN beta counts), stored as f32, or RNE bf16 / f16 through the f64 to f32 round to odd.
+note q: 0 nc (<= 4096), 1 c_type, 2 compute, 3 one part, 4 alpha f64 bits, 5 beta f64 bits. c holds the nc stored C
+note elements of the row (the C shell copies them in and out); pv the nc P bits (binary32). Gives the elements recomputed (host_fixed).
+note The q words are read once, into scalars: a store into the byte view c may alias q, so a q read inside the element
+note loop would be read again after every store.
+
+note ms: bits 0-1 the c_type, bit 2 compute, bit 3 k-part sums (clear: one k part).
+note the compute part of element j before alpha (called only with bit 2 set). For one k part a = 0 + P: that add gives
+note P itself except -0 + 0 = +0 (IEEE 754 6.3, round to nearest; a NaN P stays the same quiet NaN), so the P bits
+note 80000000 (2147483648) become 0 instead.
+fn gx_ea pv view uchar 65536 acc view ulong 4096 fix view ulong 4096 bad view uchar 4096 j ulong ms ulong to f64
+a = bitcast f64 get acc j
+if eq and ms 8 0
+p = gx_get view pv j 4
+if eq p uint 2147483648
+p = uint 0
+end
+a = f64 bitcast f32 p
+end
+if ne get bad j 0
+a = bitcast f64 get fix j
+end
+ret a
+end
+
+note the beta term and the store of element j as c_type (ms bits 0-1)
+fn gx_eb c edit uchar 65536 j ulong ms ulong bt f64 v f64 to void
+ct = and ms 3
+es = gx_es ct
+w = v
+if ne bt bitcast f64 ulong 0
+w = add w mul bt f64 gx_ldf ct gx_get view c j es
+end
+u = bitcast uint f32 w
+if eq ct 1
+u = gx_f2bf bitcast uint gx_d2fo w
+end
+if eq ct 2
+u = gx_f2h bitcast uint gx_d2fo w
+end
+gx_put edit c j es u
+end
+
+fn gemm_ex_epi q view ulong 8 pv view uchar 65536 acc view ulong 4096 fix view ulong 4096 bad view uchar 4096 c edit uchar 65536 to ulong
+ms = get q 1
+if ne get q 2 0
+ms = or ms 12
+if ne get q 3 0
+ms = xor ms 8
+end
+end
+al = bitcast f64 get q 4
+bt = bitcast f64 get q 5
+n = ulong 0
+for j ulong get q 0
+if gt ms 3
+gx_eb edit c j ms bt mul al gx_ea view pv view acc view fix view bad j ms
+if ne get bad j 0
+n = add n 1
+end
+else
+gx_eb edit c j ms bt bitcast f64 ulong 0
+end
+end
+ret n
+end
