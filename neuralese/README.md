@@ -17,7 +17,7 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after the x86efi anchor fix (#NNNN, branch `fix/x86efi-anchor-semhash-fma`, 2026-11-06): committed
+Current pin after the x86efi anchor fix (branch `hive/omega-mv-x86efi-semhash`, from `fix/x86efi-anchor-semhash-fma`, 2026-11-06): committed
 `seed/out/omc` SHA-256
 `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`, compiler
 source SHA-256 `2c0fc44bdd607f9e84315e15c7c7ea263a5f0b6d83aa3f446fa6ed975e8ef34c`.

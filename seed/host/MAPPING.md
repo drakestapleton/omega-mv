@@ -349,7 +349,7 @@ gate passes under the device-hidden sandbox, including the IRQ runtime
 oracle and compiler mutants. This is host qualification, not hardware IRQ
 delivery or authorization to repin a downstream driver's compiler.
 
-The x86efi anchor fix (#NNNN) births compiler
+The x86efi anchor fix (branch `hive/omega-mv-x86efi-semhash`) births compiler
 `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`
 from source
 `2c0fc44bdd607f9e84315e15c7c7ea263a5f0b6d83aa3f446fa6ed975e8ef34c`.
