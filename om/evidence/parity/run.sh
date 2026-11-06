@@ -14,7 +14,7 @@
 # directory size (filesystem-dependent: ext4 4096, tmpfs 40..3800), so any TMPDIR works; the stream
 # directory is created 775 whatever the caller's umask.
 set -eu
-OMC_PIN=96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763
+OMC_PIN=b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3
 NATIVE_PIN=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
 P=$(cd "$(dirname "$0")" && pwd)
 OM=$P/../evidence.om
