@@ -1,0 +1,919 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note doctor: the checklist decisions and text of tools/doctor/cudapp_doctor.c. The C shell probes (fopen and
+note fgets of the version file, access of the device files and nvcc paths, the PCI scan and chip table, the
+note meminfo sscanf, uname) and passes the facts here; this unit picks every line, parses the module
+note version, formats the memory figures (fmt.om) and counts the FAIL lines.
+note facts f (ulong 256), texts in the blob b (uchar 262144) as offset and length pairs:
+note 0,1 root; 2,3 ABI; 4,5 compiler; 6 uname ok; 7..12 sysname, release, machine; 13 version file read;
+note 14,15 its first line; 16..18 nvidiactl, nvidia0, nvidia-uvm (0 ok, 1 missing, 2 not rw); 19 GPU count
+note as scanned, this unit reports the first 16); 20 PCI scan failed; 21 meminfo read; 22 MemTotal kB; 23 MemAvailable kB; 24 nvcc
+note (0 none, 1 /usr/local/cuda/bin/nvcc, 2 /usr/bin/nvcc). GPU i at 32 + 12 i: 0,1 bdf; 2 in the chip
+note table; 3 device is GB10 (0x2e12); 4..9 name, sm, receipt when known, else 4,5 the refusal text.
+note Returns fails * 2^32 + output length, or 2^63 + 1 when the ABI or compiler text holds % or a newline
+note (the C printed them as part of a printf format), 2^63 + 2 when a refusal text has no newline or is
+note shorter than its "GPU <bdf>: " prefix.
+const DCGPU ulong 32
+const DCMB f64 1048576.0
+fn dc_s o edit uchar 786432 p ulong w ulong n ulong to ulong
+i = ulong 0
+while lt i n bound 9
+put o add p i uchar and shr w mul i 8 255
+i = add i 1
+end
+ret add p n
+end
+fn dc_cp o edit uchar 786432 p ulong b view uchar 262144 at ulong n ulong to ulong
+for i ulong n
+put o add p i get b add at i
+end
+ret add p n
+end
+fn dc_ft o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 i ulong to ulong
+ret dc_cp o p b get f i get f add i 1
+end
+fn dc_u o edit uchar 786432 p ulong v ulong to ulong
+w = fm_ndig v
+k = add p w
+x = v
+for i ulong w
+k = sub k 1
+put o k uchar add 48 rem x 10
+x = div x 10
+end
+ret add p w
+end
+note dc_tag: "  %-5s " of FAIL (0), warn (1), ok (2), info (3); a FAIL counts in st 0.
+fn dc_tag o edit uchar 786432 p ulong st edit ulong 4 t ulong to ulong
+if eq t 0
+put st 0 add get st 0 1
+note s "  FAIL  "
+p = dc_s o p 2314934085979873312 8
+ret p
+end
+if eq t 1
+note s "  warn  "
+p = dc_s o p 2314971646008959008 8
+ret p
+end
+if eq t 2
+note s "  ok    "
+p = dc_s o p 2314885532081922080 8
+ret p
+end
+note s "  info  "
+p = dc_s o p 2314972694198165536 8
+ret p
+end
+note dc_more: one line "        <segment>" per newline-ended segment of b at..at+n-1, plus the last one when
+note it is not empty (the C loop stops at the terminating zero).
+fn dc_more o edit uchar 786432 p ulong b view uchar 262144 at ulong n ulong to ulong
+s = at
+e = add at n
+while lt s e bound 262145
+note s "        "
+p = dc_s o p 2314885530818453536 8
+k = s
+while lt k e bound 262145
+if eq get b k uchar 10
+break
+end
+k = add k 1
+end
+p = dc_cp o p b s sub k s
+put o p uchar 10
+p = add p 1
+s = add k 1
+end
+ret p
+end
+note dc_m8: 1 when b pos.. holds the n (<= 8) bytes of the little-endian word w before e.
+fn dc_m8 b view uchar 262144 pos ulong e ulong w ulong n ulong to ulong
+if gt add pos n e
+ret ulong 0
+end
+for i ulong n
+if ne ulong get b add pos i and shr w mul i 8 255
+ret ulong 0
+end
+end
+ret ulong 1
+end
+note dc_bad: 1 when the text at..at+n-1 holds % or a newline.
+fn dc_bad b view uchar 262144 at ulong n ulong to ulong
+for i ulong n
+c = get b add at i
+if eq c uchar 37
+ret ulong 1
+end
+if eq c uchar 10
+ret ulong 1
+end
+end
+ret ulong 0
+end
+note dc_mstart: index of the first "Module" in at..e-1 (strstr), at when there is none.
+fn dc_mstart b view uchar 262144 at ulong e ulong to ulong
+s = at
+while lt s e bound 262145
+note s "Module"
+if ne dc_m8 b s e 111516500389709 6 0
+ret s
+end
+s = add s 1
+end
+ret at
+end
+note dc_open: 1 when at..e-1 contains "Open Kernel Module".
+fn dc_open b view uchar 262144 at ulong e ulong to ulong
+s = at
+while lt s e bound 262145
+note s "Open Ker" "nel Modu" "le"
+a = dc_m8 b s e 8243077295634739279 8
+c = dc_m8 b add s 8 e 8459008377155773806 8
+d = dc_m8 b add s 16 e 25964 2
+if ne and and a c d 0
+ret ulong 1
+end
+s = add s 1
+end
+ret ulong 0
+end
+fn dc_dig c ulong to ulong
+if ge c 48
+if le c 57
+ret ulong 1
+end
+end
+ret ulong 0
+end
+note dc_ver: the first run of digits and dots after "Module" (or from the start) with more than two bytes,
+note a dot and fewer than 64 bytes: returns its offset * 256 + length, 0 when there is none.
+fn dc_ver b view uchar 262144 at ulong n ulong to ulong
+e = add at n
+s = dc_mstart b at e
+while lt s e bound 262145
+if ne dc_dig ulong get b s 0
+k = ulong 0
+dt = ulong 0
+while lt add s k e bound 262145
+c = ulong get b add s k
+if eq c 46
+dt = ulong 1
+else
+if eq dc_dig c 0
+break
+end
+end
+k = add k 1
+end
+if gt k 2
+if ne dt 0
+if lt k 64
+ret or shl s 8 k
+end
+end
+end
+s = add s sub k 1
+end
+s = add s 1
+end
+ret ulong 0
+end
+note dc_eq: 1 when the texts at a (length n) and at c (length m) are equal.
+fn dc_eq b view uchar 262144 a ulong n ulong c ulong m ulong to ulong
+if ne n m
+ret ulong 0
+end
+for i ulong n
+if ne get b add a i get b add c i
+ret ulong 0
+end
+end
+ret ulong 1
+end
+fn dc_abi o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 to ulong
+ret dc_ft o p f b 2
+end
+fn dc_mnone o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 st edit ulong 4 to ulong
+p = dc_tag o p st 0
+note s "NVIDIA kernel module: not loaded ("
+p = dc_s o p 7719241544247105102 8
+p = dc_s o p 8029109360601756261 8
+p = dc_s o p 8029390620829971812 8
+p = dc_s o p 7234298746084532340 8
+p = dc_s o p 10272 2
+p = dc_ft o p f b 0
+note s "/proc/driver/nvidia/version does not exist)\n"
+p = dc_s o p 8242765322112888879 8
+p = dc_s o p 7599382571296061033 8
+p = dc_s o p 8318823019982186852 8
+p = dc_s o p 8315174762841010025 8
+p = dc_s o p 7599935561254530592 8
+p = dc_s o p 170488947 4
+note s "        CUDA++ uses no NVIDIA user-space software, but it talks to NVIDIA's kernel module.\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 8439793166470894915 8
+p = dc_s o p 5629622052994639219 8
+p = dc_s o p 8319591351411034454 8
+p = dc_s o p 7305790156121666149 8
+p = dc_s o p 8242000134883210016 8
+p = dc_s o p 7575182620743445605 8
+p = dc_s o p 2338330744771059828 8
+p = dc_s o p 5279425298211827572 8
+p = dc_s o p 7958535002297411393 8
+p = dc_s o p 7815263158106352741 8
+p = dc_s o p 667237 3
+note s "        Do this: sudo modprobe nvidia && sudo modprobe nvidia-uvm\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4211825973867343684 8
+p = dc_s o p 8029109373470339872 8
+p = dc_s o p 7935454016877785188 8
+p = dc_s o p 2748920225308371318 8
+p = dc_s o p 8029109373470339872 8
+p = dc_s o p 7935454016877785188 8
+p = dc_s o p 8535778565153909110 8
+p = dc_s o p 2669 2
+note s "        If modprobe finds no module, install NVIDIA's open kernel module "
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 8246201347450365513 8
+p = dc_s o p 7236837538582061679 8
+p = dc_s o p 7237123112283545715 8
+p = dc_s o p 8317701148704599157 8
+p = dc_s o p 5284497113930817908 8
+p = dc_s o p 8101729933614729540 8
+p = dc_s o p 7308905025183444581 8
+p = dc_s o p 7308345369542074476 8
+p = dc_s o p 32 1
+p = dc_abi o p f b
+note s " (the open-gpu-kernel-modules release of that number), then run make doctor again.\n"
+p = dc_s o p 8101729874579040288 8
+p = dc_s o p 7722958061638086245 8
+p = dc_s o p 8029123654252917349 8
+p = dc_s o p 7309940825170670948 8
+p = dc_s o p 7381153934383080812 8
+p = dc_s o p 8461736434098271264 8
+p = dc_s o p 8367736664178909805 8
+p = dc_s o p 2336934389682693480 8
+p = dc_s o p 7165055622473015661 8
+p = dc_s o p 7593464113577226100 8
+p = dc_s o p 667246 3
+ret p
+end
+fn dc_mwrong o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 v ulong to ulong
+note s "NVIDIA kernel module: version "
+p = dc_s o p 7719241544247105102 8
+p = dc_s o p 8029109360601756261 8
+p = dc_s o p 7311066480264377700 8
+p = dc_s o p 35658687673202 6
+p = dc_cp o p b shr v 8 and v 255
+note s " is loaded; CUDA++ speaks the "
+p = dc_s o p 7233184986725312800 8
+p = dc_s o p 4702977657673573477 8
+p = dc_s o p 7737577168441453355 8
+p = dc_s o p 35619916226675 6
+p = dc_abi o p f b
+note s " interface\n"
+p = dc_s o p 7018422849374152992 8
+p = dc_s o p 681315 3
+note s "        Why: CUDA++ builds its driver calls from the "
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4923915573298554967 8
+p = dc_s o p 7811904092957780801 8
+p = dc_s o p 7214893546864669540 8
+p = dc_s o p 7017488320073984370 8
+p = dc_s o p 7885647255505693804 8
+p = dc_s o p 139140297760 5
+p = dc_abi o p f b
+note s " open-module headers\n"
+p = dc_s o p 8029123662842982176 8
+p = dc_s o p 7018130082676634980 8
+p = dc_s o p 44886549860 5
+note s "        (third_party/nvidia-open-"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 8097301097592943656 8
+p = dc_s o p 7599382571414483553 8
+p = dc_s o p 7954887939624888676 8
+p = dc_s o p 45 1
+p = dc_abi o p f b
+note s "). The layout of those calls can change between module versions,\n"
+p = dc_s o p 7791338854113357353 8
+p = dc_s o p 7381153998842067297 8
+p = dc_s o p 7142820555474367520 8
+p = dc_s o p 7953747407939595361 8
+p = dc_s o p 2334385705639764768 8
+p = dc_s o p 2336916743122085218 8
+p = dc_s o p 8511914812230627181 8
+p = dc_s o p 3203025184780153445 8
+p = dc_s o p 10 1
+note s "        and a wrong layout fails in strange ways, so the doctor refuses instead of guessing.\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 8248096844079722081 8
+p = dc_s o p 8032558527420001903 8
+p = dc_s o p 8317138478892610677 8
+p = dc_s o p 7021802806838192416 8
+p = dc_s o p 8320788950816221038 8
+p = dc_s o p 7307218078066221100 8
+p = dc_s o p 2338053702233842720 8
+p = dc_s o p 2338324178100708722 8
+p = dc_s o p 2334097595258072681 8
+p = dc_s o p 8319104491599193711 8
+p = dc_s o p 43728203369 5
+note s "        This is the only version CUDA++ asks you to match: no toolkit, no framework build, no extension build.\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 2338328219631577172 8
+p = dc_s o p 8749489599637973108 8
+p = dc_s o p 7957695011148363296 8
+p = dc_s o p 2317993992531559200 8
+p = dc_s o p 8462115405134787425 8
+p = dc_s o p 7166460028376806432 8
+p = dc_s o p 8031079698469501544 8
+p = dc_s o p 7935391421923290223 8
+p = dc_s o p 8603402928459751535 8
+p = dc_s o p 7811904092961993327 8
+p = dc_s o p 8675375920160189540 8
+p = dc_s o p 2336927755350730100 8
+p = dc_s o p 2865758617564514 7
+note s "        Do this: install the "
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4211825973867343684 8
+p = dc_s o p 7812726606361684256 8
+p = dc_s o p 139140297760 5
+p = dc_abi o p f b
+note s " open kernel module, or port the client to your version\n"
+p = dc_s o p 7307970478859120416 8
+p = dc_s o p 7237123112232644210 8
+p = dc_s o p 2338053340533189749 8
+p = dc_s o p 7307218078150061936 8
+p = dc_s o p 2338615488351593248 8
+p = dc_s o p 2338060278192697204 8
+p = dc_s o p 751660686516577654 8
+note s "        (CONTRIBUTING.md, \"Port a driver version\": copy the new headers, rebuild, run make test and make hello-gpu).\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4776439401847669544 8
+p = dc_s o p 7236491060045239381 8
+p = dc_s o p 2338619928923480108 8
+p = dc_s o p 8243124888234369121 8
+p = dc_s o p 7957695011148363296 8
+p = dc_s o p 2340025105102420514 8
+p = dc_s o p 2339450055106586740 8
+p = dc_s o p 3203029539791922536 8
+p = dc_s o p 7236274654160450080 8
+p = dc_s o p 7020303052929376300 8
+p = dc_s o p 2338620986089301355 8
+p = dc_s o p 7308041941661544033 8
+p = dc_s o p 7434721071324293152 8
+p = dc_s o p 43724141936 5
+ret p
+end
+fn dc_mod o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 st edit ulong 4 to ulong
+if eq get f 13 0
+ret dc_mnone o p f b st
+end
+at = get f 14
+n = get f 15
+v = dc_ver b at n
+if eq v 0
+p = dc_tag o p st 0
+note s "NVIDIA kernel module: loaded, but its version could not be read from: "
+p = dc_s o p 7719241544247105102 8
+p = dc_s o p 8029109360601756261 8
+p = dc_s o p 8028827670876550500 8
+p = dc_s o p 8458358425190229089 8
+p = dc_s o p 7311066725328953460 8
+p = dc_s o p 8026294619592029042 8
+p = dc_s o p 2338616625292668021 8
+p = dc_s o p 2334097595219076450 8
+p = dc_s o p 35435316212326 6
+k = n
+if gt k 120
+k = ulong 120
+end
+p = dc_cp o p b at k
+note s "\n        Do this: report it with the output of `cat /proc/driver/nvidia/version` attached.\n"
+p = dc_s o p 2314885530818453514 8
+p = dc_s o p 8316293034885989408 8
+p = dc_s o p 8390891584273653818 8
+p = dc_s o p 7526756837609466144 8
+p = dc_s o p 8391735665605768224 8
+p = dc_s o p 6926648854367729008 8
+p = dc_s o p 8030604433265287523 8
+p = dc_s o p 8243124888234372963 8
+p = dc_s o p 3414125872510561839 8
+p = dc_s o p 6948613773778380150 8
+p = dc_s o p 7307199665625391392 8
+p = dc_s o p 667236 3
+ret p
+end
+if eq dc_eq b shr v 8 and v 255 get f 2 get f 3 0
+p = dc_tag o p st 0
+ret dc_mwrong o p f b v
+end
+if eq dc_open b at add at n 0
+p = dc_tag o p st 1
+note s "NVIDIA kernel module: the closed module "
+p = dc_s o p 7719241544247105102 8
+p = dc_s o p 8029109360601756261 8
+p = dc_s o p 7526676312424740196 8
+p = dc_s o p 7234315298837569637 8
+p = dc_s o p 2334391233313467680 8
+p = dc_cp o p b shr v 8 and v 255
+note s " is loaded; CUDA++ was qualified on the open module of that version\n"
+p = dc_s o p 7233184986725312800 8
+p = dc_s o p 4702977657673573477 8
+p = dc_s o p 8151642187988216619 8
+p = dc_s o p 7234304265016861045 8
+p = dc_s o p 2334386829831073568 8
+p = dc_s o p 7237123112266199151 8
+p = dc_s o p 8367800735125302389 8
+p = dc_s o p 8318823019731771752 8
+p = dc_s o p 175009641 4
+note s "        It uses the same calls and should work. If anything fails, switch to the open module and say so in your report.\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 2338324178096125001 8
+p = dc_s o p 7308604917384833140 8
+p = dc_s o p 6998720730445734688 8
+p = dc_s o p 7815275222770148462 8
+p = dc_s o p 2318908997382905956 8
+p = dc_s o p 7526774392225818185 8
+p = dc_s o p 7811882119909043817 8
+p = dc_s o p 7166468868806814835 8
+p = dc_s o p 7307218078066286696 8
+p = dc_s o p 8029109369191821088 8
+p = dc_s o p 7236828442999420260 8
+p = dc_s o p 2337213314941154080 8
+p = dc_s o p 2338060278192696937 8
+p = dc_s o p 733651824152700274 8
+ret p
+end
+p = dc_tag o p st 2
+note s "NVIDIA kernel module: open module "
+p = dc_s o p 7719241544247105102 8
+p = dc_s o p 8029109360601756261 8
+p = dc_s o p 8101729689844610404 8
+p = dc_s o p 7815263158106353253 8
+p = dc_s o p 8293 2
+p = dc_cp o p b shr v 8 and v 255
+note s " (CUDA++ speaks "
+p = dc_s o p 3110651729373505568 8
+p = dc_s o p 2338330697593287456 8
+p = dc_abi o p f b
+note s ")\n"
+p = dc_s o p 2601 2
+ret p
+end
+fn dc_node o edit uchar 786432 p ulong i ulong to ulong
+if eq i 0
+note s "/dev/nvidiactl"
+p = dc_s o p 7599382571363165231 8
+p = dc_s o p 119247139334500 6
+ret p
+end
+if eq i 1
+note s "/dev/nvidia0"
+p = dc_s o p 7599382571363165231 8
+p = dc_s o p 811690340 4
+ret p
+end
+note s "/dev/nvidia-uvm"
+p = dc_s o p 7599382571363165231 8
+p = dc_s o p 30811018106071396 7
+ret p
+end
+fn dc_nod o edit uchar 786432 p ulong f view ulong 256 st edit ulong 4 to ulong
+bad = ulong 0
+for i ulong 3
+s = get f add 16 i
+if eq s 1
+p = dc_tag o p st 0
+note s "device files: "
+p = dc_s o p 7358993268768925028 8
+p = dc_s o p 35435416218729 6
+p = dc_node o p i
+note s " is missing\n"
+p = dc_s o p 8319108854100224288 8
+p = dc_s o p 174550633 4
+if eq i 2
+note s "        Do this: sudo modprobe nvidia-uvm   (creates /dev/nvidia-uvm; CUDA++ maps GPU memory through it)\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4211825973867343684 8
+p = dc_s o p 8029109373470339872 8
+p = dc_s o p 7935454016877785188 8
+p = dc_s o p 8535778565153909110 8
+p = dc_s o p 7310014169164554349 8
+p = dc_s o p 7306016311923274849 8
+p = dc_s o p 7019251898354904950 8
+p = dc_s o p 6143789756275127597 8
+p = dc_s o p 8097873589919498564 8
+p = dc_s o p 7308533321083330675 8
+p = dc_s o p 8243966800727011181 8
+p = dc_s o p 2987128040764962159 8
+p = dc_s o p 10 1
+else
+note s "        Do this: sudo modprobe nvidia   (or run nvidia-modprobe once, which creates the device files)\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4211825973867343684 8
+p = dc_s o p 8029109373470339872 8
+p = dc_s o p 7935454016877785188 8
+p = dc_s o p 2314885811220539766 8
+p = dc_s o p 2336934389682958120 8
+p = dc_s o p 7867051229370218094 8
+p = dc_s o p 2334380212662330479 8
+p = dc_s o p 7527520677224738415 8
+p = dc_s o p 7018141364397826921 8
+p = dc_s o p 2334386829831398772 8
+p = dc_s o p 7358993268768925028 8
+p = dc_s o p 11173145963625 6
+end
+bad = add bad 1
+end
+if eq s 2
+p = dc_tag o p st 0
+note s "device files: "
+p = dc_s o p 7358993268768925028 8
+p = dc_s o p 35435416218729 6
+p = dc_node o p i
+note s " exists but this user cannot open it for reading and writing\n"
+p = dc_s o p 2338340670574978336 8
+p = dc_s o p 8316293034886329698 8
+p = dc_s o p 7017488320073790752 8
+p = dc_s o p 7309464380405411438 8
+p = dc_s o p 8245921732316700782 8
+p = dc_s o p 7453010313196433952 8
+p = dc_s o p 7598266502335062304 8
+p = dc_s o p 44684962164 5
+note s "        Do this: ask the machine's owner to add you to the group that owns it (ls -l on the file shows it),\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4211825973867343684 8
+p = dc_s o p 7307218077999128864 8
+p = dc_s o p 7308895142333738272 8
+p = dc_s o p 8243116152216122151 8
+p = dc_s o p 2334100875203540000 8
+p = dc_s o p 8367810652205838201 8
+p = dc_s o p 8103505641670206824 8
+p = dc_s o p 8606133097150837792 8
+p = dc_s o p 7793514839516672878 8
+p = dc_s o p 2336927441696399475 8
+p = dc_s o p 7308332182666569844 8
+p = dc_s o p 7575181530044592928 8
+p = dc_s o p 170666356 4
+note s "        or set the module option NVreg_DeviceFileMode=0666.\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 8367816086726406767 8
+p = dc_s o p 7815263158106350952 8
+p = dc_s o p 7957695015410409573 8
+p = dc_s o p 4926770202774228512 8
+p = dc_s o p 7811852429924333157 8
+p = dc_s o p 3904688382616227173 8
+p = dc_s o p 170800694 4
+bad = add bad 1
+end
+end
+if eq bad 0
+p = dc_tag o p st 2
+note s "device files: /dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm can be opened by this user\n"
+p = dc_s o p 7358993268768925028 8
+p = dc_s o p 7219024163114413161 8
+p = dc_s o p 7594310829029160549 8
+p = dc_s o p 7306016311806813025 8
+p = dc_s o p 7019251898354904950 8
+p = dc_s o p 7939694845922058288 8
+p = dc_s o p 8535778565153909110 8
+p = dc_s o p 7305437204000743533 8
+p = dc_s o p 2334102031707434784 8
+p = dc_s o p 2338328528881219938 8
+p = dc_s o p 44868924277 5
+end
+ret p
+end
+note dc_ref: the FAIL line of a refused GPU g (facts base g). The first line is the refusal text after
+note "GPU <bdf>: " up to its first newline (to its end when that newline is inside the prefix, as printf
+note "%.*s" with a negative precision prints all); the rest goes to dc_more.
+fn dc_ref o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 st edit ulong 4 g ulong to ulong
+at = get f add g 4
+n = get f add g 5
+e = add at n
+fi = add add at 6 get f add g 1
+nl = at
+while lt nl e bound 262145
+if eq get b nl uchar 10
+break
+end
+nl = add nl 1
+end
+if ge nl e
+put st 2 2
+ret p
+end
+if gt fi e
+put st 2 2
+ret p
+end
+p = dc_tag o p st 0
+note s "GPU "
+p = dc_s o p 542462023 4
+p = dc_ft o p f b g
+note s ": "
+p = dc_s o p 8250 2
+if ge nl fi
+p = dc_cp o p b fi sub nl fi
+else
+p = dc_cp o p b fi sub e fi
+end
+put o p uchar 10
+p = add p 1
+ret dc_more o p b add nl 1 sub e add nl 1
+end
+fn dc_gok o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 st edit ulong 4 g ulong to ulong
+p = dc_tag o p st 2
+note s "GPU "
+p = dc_s o p 542462023 4
+p = dc_ft o p f b g
+note s ": "
+p = dc_s o p 8250 2
+p = dc_ft o p f b add g 4
+note s " ("
+p = dc_s o p 10272 2
+p = dc_ft o p f b add g 6
+note s "), supported target (historical summary: "
+p = dc_s o p 8030041785346567209 8
+p = dc_s o p 8241996475536864370 8
+p = dc_s o p 8316292708468811111 8
+p = dc_s o p 2336349386297208692 8
+p = dc_s o p 4213524689155093875 8
+p = dc_s o p 32 1
+p = dc_ft o p f b add g 8
+note s ")\n"
+p = dc_s o p 2601 2
+note s "        raw M16 evidence unavailable; not current-commit qualification\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 2321096865283006834 8
+p = dc_s o p 7305804402280461925 8
+p = dc_s o p 7811882189719500064 8
+p = dc_s o p 8029390625124934241 8
+p = dc_s o p 7954890152741118068 8
+p = dc_s o p 8388356097741892980 8
+p = dc_s o p 7594873735819391264 8
+p = dc_s o p 2936174556766563 7
+if ne get f add g 3 0
+put st 1 1
+end
+ret p
+end
+fn dc_gpu o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 st edit ulong 4 to ulong
+if ne get f 20 0
+p = dc_tag o p st 0
+note s "GPU: cannot read "
+p = dc_s o p 7953747406981779527 8
+p = dc_s o p 7233174017378905966 8
+p = dc_s o p 32 1
+p = dc_ft o p f b 0
+note s "/sys/bus/pci/devices\n"
+p = dc_s o p 8319663842577183535 8
+p = dc_s o p 8531335223917637679 8
+p = dc_s o p 44885697385 5
+note s "        Do this: run make doctor on the machine itself, not in a container without /sys.\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4211825973867343684 8
+p = dc_s o p 7737585620858794528 8
+p = dc_s o p 8245937413158084709 8
+p = dc_s o p 2334386829831073568 8
+p = dc_s o p 2334393380863435117 8
+p = dc_s o p 2318340523933529193 8
+p = dc_s o p 6998715218728873838 8
+p = dc_s o p 7955997369423586080 8
+p = dc_s o p 8027794332106912357 8
+p = dc_s o p 3347152483685266549 8
+p = dc_s o p 10 1
+ret p
+end
+n = get f 19
+if eq n 0
+p = dc_tag o p st 0
+note s "GPU: no NVIDIA GPU found in /sys/bus/pci/devices\n"
+p = dc_s o p 2337207816325255239 8
+p = dc_s o p 5125168158881699406 8
+p = dc_s o p 7236850772546180432 8
+p = dc_s o p 8320808432788465952 8
+p = dc_s o p 7594036745779634735 8
+p = dc_s o p 8315161591618561071 8
+p = dc_s o p 10 1
+note s "        Do this: check the GPU is seated and powered (lspci | grep -i nvidia).\n"
+p = dc_s o p 2314885530818453536 8
+p = dc_s o p 4211825973867343684 8
+p = dc_s o p 8367806182301655840 8
+p = dc_s o p 7575148376516224360 8
+p = dc_s o p 7234316338103263347 8
+p = dc_s o p 8606220697354527008 8
+p = dc_s o p 8317066731434898021 8
+p = dc_s o p 8243593360416793456 8
+p = dc_s o p 8533793980014424165 8
+p = dc_s o p 2865505029940329 7
+ret p
+end
+if gt n 16
+n = ulong 16
+end
+for i ulong n
+g = add DCGPU mul i 12
+if ne get f add g 2 0
+p = dc_gok o p f b st g
+else
+p = dc_ref o p f b st g
+end
+end
+ret p
+end
+note dc_gib: "%.1f" of kB / 1048576.0, the kB count rounded to f64 first as (double) does.
+fn dc_gib o edit uchar 786432 p ulong v ulong to ulong
+t = new uchar 1600 0
+n = fm_f div f64 v DCMB 1 t
+for i ulong n
+put o add p i get t i
+end
+ret add p n
+end
+fn dc_mem o edit uchar 786432 p ulong f view ulong 256 st edit ulong 4 to ulong
+if eq get f 21 0
+p = dc_tag o p st 3
+note s "memory: cannot read /proc/meminfo\n"
+p = dc_s o p 2322302090265585005 8
+p = dc_s o p 8223700941521445219 8
+p = dc_s o p 8030604433264238949 8
+p = dc_s o p 7380952757880827747 8
+p = dc_s o p 2671 2
+ret p
+end
+if ne get st 1 0
+p = dc_tag o p st 2
+note s "memory: "
+p = dc_s o p 2322302090265585005 8
+p = dc_gib o p get f 22
+note s " GiB shared by the CPU and the GPU, "
+p = dc_s o p 7018986601647261472 8
+p = dc_s o p 8367821570011587954 8
+p = dc_s o p 6998687624145692008 8
+p = dc_s o p 5125207875246908526 8
+p = dc_s o p 539776336 4
+p = dc_gib o p get f 23
+note s " GiB available now\n"
+p = dc_s o p 7022907460111910688 8
+p = dc_s o p 7935454059608239209 8
+p = dc_s o p 685935 3
+ret p
+end
+p = dc_tag o p st 3
+note s "memory: "
+p = dc_s o p 2322302090265585005 8
+p = dc_gib o p get f 22
+note s " GiB system memory, "
+p = dc_s o p 8320808368934045472 8
+p = dc_s o p 8029185230041343348 8
+p = dc_s o p 539785586 4
+p = dc_gib o p get f 23
+note s " GiB available now\n"
+p = dc_s o p 7022907460111910688 8
+p = dc_s o p 7935454059608239209 8
+p = dc_s o p 685935 3
+ret p
+end
+fn dc_tk o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 st edit ulong 4 to ulong
+t = get f 24
+p = dc_tag o p st 3
+if eq t 0
+note s "CUDA toolkit: not needed and not used by CUDA++ (none installed)\n"
+p = dc_s o p 8029764342507656515 8
+p = dc_s o p 8029390621081430892 8
+p = dc_s o p 7234298763096760436 8
+p = dc_s o p 8390045716217487648 8
+p = dc_s o p 8746589041877808416 8
+p = dc_s o p 2317993992531559200 8
+p = dc_s o p 7955925836743274024 8
+p = dc_s o p 2982620369575310451 8
+p = dc_s o p 10 1
+else
+note s "CUDA toolkit: not needed and not used by CUDA++ (one is installed at "
+p = dc_s o p 8029764342507656515 8
+p = dc_s o p 8029390621081430892 8
+p = dc_s o p 7234298763096760436 8
+p = dc_s o p 8390045716217487648 8
+p = dc_s o p 8746589041877808416 8
+p = dc_s o p 2317993992531559200 8
+p = dc_s o p 2338328219397025576 8
+p = dc_s o p 7308335461136821865 8
+p = dc_s o p 139391475812 5
+if eq t 1
+note s "/usr/local/cuda/bin/nvcc"
+p = dc_s o p 7165064483209180463 8
+p = dc_s o p 3414120447861550177 8
+p = dc_s o p 7161698048063465826 8
+else
+note s "/usr/bin/nvcc"
+p = dc_s o p 7955998172649846063 8
+p = dc_s o p 426870468143 5
+end
+note s "; that is fine)\n"
+p = dc_s o p 7575182534950264891 8
+p = dc_s o p 732227939313524851 8
+end
+p = dc_tag o p st 3
+note s "compiler: this doctor was built by "
+p = dc_s o p 8243113893085146979 8
+p = dc_s o p 7214893499608735802 8
+p = dc_s o p 7023117819775837039 8
+p = dc_s o p 2338613306708861043 8
+p = dc_s o p 2128226 3
+p = dc_ft o p f b 4
+note s "; CUDA++ needs only make and a C compiler\n"
+p = dc_s o p 3110651729373503547 8
+p = dc_s o p 8007527012499811872 8
+p = dc_s o p 7308041941662919790 8
+p = dc_s o p 4836972791547715872 8
+p = dc_s o p 7308332226908742432 8
+p = dc_s o p 2674 2
+ret p
+end
+fn dc_head o edit uchar 786432 p ulong f view ulong 256 b view uchar 262144 st edit ulong 4 to ulong
+note s "cudapp doctor: is this machine ready for CUDA++?\n"
+p = dc_s o p 7214890231020156259 8
+p = dc_s o p 7575118836407755631 8
+p = dc_s o p 7863411845950087283 8
+p = dc_s o p 8223684444467782497 8
+p = dc_s o p 8245921732400275813 8
+p = dc_s o p 4551779407707325216 8
+p = dc_s o p 10 1
+note s "Diagnostic only: direct library use has no driver-version or PCI-ID admission guard.\n"
+p = dc_s o p 8391173050692888900 8
+p = dc_s o p 4213518147948405609 8
+p = dc_s o p 2338603393874486304 8
+p = dc_s o p 2340027244252129644 8
+p = dc_s o p 2338319731383432053 8
+p = dc_s o p 7311146985109614446 8
+p = dc_s o p 8028074745930329458 8
+p = dc_s o p 5279151288497414254 8
+p = dc_s o p 7596838514759846189 8
+p = dc_s o p 8459766083726439283 8
+p = dc_s o p 43728007777 5
+if ne get f 6 0
+p = dc_tag o p st 3
+note s "system: "
+p = dc_s o p 2322288840375761267 8
+p = dc_ft o p f b 7
+put o p uchar 32
+p = add p 1
+p = dc_ft o p f b 9
+put o p uchar 32
+p = add p 1
+p = dc_ft o p f b 11
+put o p uchar 10
+p = add p 1
+end
+ret p
+end
+fn dc_foot o edit uchar 786432 p ulong nf ulong to ulong
+if eq nf 0
+note s "READY. Next: make hello-gpu\n"
+p = dc_s o p 5629550495145215314 8
+p = dc_s o p 7737585619986315365 8
+p = dc_s o p 3273954666935230565 8
+p = dc_s o p 175468647 4
+ret p
+end
+note s "NOT READY: "
+p = dc_s o p 4918288487097323342 8
+p = dc_s o p 2112089 3
+p = dc_u o p nf
+note s " problem"
+p = dc_s o p 7882825892814286880 8
+if ne nf 1
+put o p uchar 115
+p = add p 1
+end
+note s " above. Fix the first FAIL line and run make doctor again.\n"
+p = dc_s o p 2318902417491648800 8
+p = dc_s o p 2334386829831727430 8
+p = dc_s o p 4703482545360234854 8
+p = dc_s o p 2334393380926147657 8
+p = dc_s o p 2336934389682040417 8
+p = dc_s o p 7165055622473015661 8
+p = dc_s o p 7593464113577226100 8
+p = dc_s o p 667246 3
+ret p
+end
+fn doctor f view ulong 256 b view uchar 262144 o edit uchar 786432 to ulong
+if ne or dc_bad b get f 2 get f 3 dc_bad b get f 4 get f 5 0
+ret or shl ulong 1 63 1
+end
+st = new ulong 4 0
+p = dc_head o 0 f b st
+p = dc_mod o p f b st
+p = dc_nod o p f st
+p = dc_gpu o p f b st
+if ne get st 2 0
+ret or shl ulong 1 63 2
+end
+p = dc_mem o p f st
+p = dc_tk o p f b st
+nf = get st 0
+p = dc_foot o p nf
+ret or shl nf 32 p
+end
