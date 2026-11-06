@@ -888,13 +888,21 @@ static void test_nvme_bind_discovery(void)
     CHECK(has(x, "dma_gate: nvme bus master revoked\n") && has(x, "abort FAILED, stays confined (rc="));
     CHECK(!has(x, "returned to abort"));
     CHECK(has(x, "nvme: bind refused, already owned by seg 0003 01:00.0 (bound=0 bm_on=0 confined=1)"));
+    /* #489: a reset quiesce while the abort is still refused retries the release; the stream stays confined,
+     * so quiesce must report the controller LIVE, never released-now. */
+    ck_host_capture_start();
+    ck_stage_quiesce();
+    ck_host_capture_stop();
+    CHECK(ck_host_unconfine_calls == un0 + 2);
+    CHECK(has(ck_host_capture_text(), "devices: quiesce before reset nvme=LIVE\n"));
+    CHECK(!has(ck_host_capture_text(), "nvme=released-now"));
     ck_host_unconfine_fail = 0;
     ck_host_capture_start();
     ck_dev_nvme_release();                                          /* retry: the abort now succeeds */
     ck_host_capture_stop();
-    CHECK(ck_host_unconfine_calls == un0 + 2 && has(ck_host_capture_text(), "returned to abort (rc=0)"));
+    CHECK(ck_host_unconfine_calls == un0 + 3 && has(ck_host_capture_text(), "returned to abort (rc=0)"));
     CHECK(ck_stage_devices() == NVME_EVS);                          /* ownership returned: bound again, once */
-    CHECK(ck_host_confine_calls == calls0 + 2 && ck_host_unconfine_calls == un0 + 3);
+    CHECK(ck_host_confine_calls == calls0 + 2 && ck_host_unconfine_calls == un0 + 4);
 
     /* 7. Stage level, firmware bus master that will not clear. The bind refuses (fail closed) and the stage's
      *    release must NOT hand the owner back: the device was written and may still be a bus master. A second
@@ -2923,6 +2931,13 @@ static void test_net_release_refused(void)
     grants = ck_host_confine_calls;
     CHECK(ck_net_bind_selftest(&vf, &caps) == CK_NET_E_ARG); /* still live: release it first */
     CHECK(ck_host_confine_calls == grants && ck_net_live() == 1);
+    /* #489: a reset quiesce while the abort is still refused leaves virtio-net live and must say so. */
+    ck_host_capture_start();
+    ck_stage_quiesce();
+    ck_host_capture_stop();
+    CHECK(ck_net_live() == 1);
+    CHECK(has(ck_host_capture_text(), "devices: quiesce before reset virtio_net=LIVE\n"));
+    CHECK(!has(ck_host_capture_text(), "virtio_net=released-now"));
     ck_host_unconfine_fail = 0;
     ck_host_capture_start();
     ck_net_release();

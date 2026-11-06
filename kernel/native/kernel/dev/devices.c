@@ -216,9 +216,13 @@ void ck_stage_quiesce(void)
     int was_live = g_nvme.pf && (g_nvme.bm_on || g_nvme.confined);
     if (was_live)
         ck_dev_nvme_release();
+    /* A refused abort leaves the stream confined (or bus mastering on): that is LIVE, never released (#489). */
     ck_printf("devices: quiesce before reset nvme=%s\n",
-              !g_nvme.pf ? "none" : was_live ? "released-now" : "already-released");
-    if (net_live) ck_printf("devices: quiesce before reset virtio_net=released-now\n");
+              !g_nvme.pf                            ? "none"
+              : (g_nvme.bm_on || g_nvme.confined)   ? "LIVE"
+              : was_live                            ? "released-now"
+                                                    : "already-released");
+    if (net_live) ck_printf("devices: quiesce before reset virtio_net=%s\n", ck_net_live() ? "LIVE" : "released-now");
 #endif
     if (rtl_live) ck_printf("devices: quiesce before reset rtl8127=%s\n", ck_rtl8127_live() ? "LIVE" : "released-now");
     if (xhci_live) ck_printf("devices: quiesce before reset xhci=%s\n", ck_xhci_live() ? "LIVE" : "released-now");
