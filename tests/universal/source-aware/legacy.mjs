@@ -13,9 +13,16 @@ const cmd=(e,a)=>{let r=spawnSync(e,a,{maxBuffer:16*1024*1024});if(r.status!==0)
 //     the OSC IR decoder (src/compiler/osc_ir.c; the default build defines no mutant, so every refusal stays
 //     live) and #963 made the osh follow-ups (src/osh). The oracle below is built from the current
 //     src/compiler and the src/osh .osc files are fixtures, so the byte-identical IR comparison covers both.
+//     Two more were merged on 2026-11-06: #525 (OSC IR format version 6, issue #451; src/compiler/osc_ir.c
+//     re-pinned and src/compiler/osc_ir.h pinned; osc_ir_encode still writes versions 1..5 byte for byte, and
+//     the oracle is built from these files) and #962 (checker2 refuses some-path leaks and aliased mutable
+//     borrows, issue #465; src/checker2/c2_check.c, linked into the oracle, which requires checker2 to accept
+//     every lowered fixture). Both are covered by the byte-identical IR comparison below.
 //     Any further edit to a pinned file fails here until it is reviewed and its hash re-pinned.
 const ACCEPTED={
- 'src/compiler/osc_ir.c':'eca9afd656100ed58c23314a8b6e367a94eb5b8656504cbaf60f5397e9c92cef',
+ 'src/checker2/c2_check.c':'a3457a3bd07014826cf65426f15ad67f4fdcaf2195f23559d10e5fbfa808c6e3',
+ 'src/compiler/osc_ir.c':'f09cbe0c5093d912526b4b0c1e5a43a4b8409a4d12a40cb6592fb1cf9db1edfc',
+ 'src/compiler/osc_ir.h':'e0d39653177e0e9515311e5ae56302fd296c094dc40fc1dedf890eeb4f61fa97',
  'src/osh/host/osh_builtin.c':'24658416184462ca93830efbd7bf5c318b13d0259c413fd738acc9bca1b02a86',
  'src/osh/host/osh_exec.c':'086762229ce1cc2023ec0712483cd4f0431b0ac36ab450b40e625ab665ad9e1a',
  'src/osh/host/osh_host.h':'5ec628fb5ef7f90306e9d32f31d8ad79a77dd50880d2824d90c364dfbcd26ea5',
