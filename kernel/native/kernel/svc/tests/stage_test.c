@@ -877,6 +877,11 @@ static void test_nvme_bind_discovery(void)
     calls0 = ck_host_confine_calls;
     un0 = ck_host_unconfine_calls;
     ck_host_unconfine_fail = 1;
+    ck_host_faults_up = 1; /* two events for the NVMe stream (rid 0x100, mock sid 0x40 | rid) wait in the queue */
+    ck_host_fault_sid = 0x140u;
+    ck_host_fault_n = 2;
+    ck_host_fault_first = (struct ck_dma_fault){CK_DMA_FAULT_TRANSLATION, 0x140u, 0x80001000ull, 0};
+    unsigned fc0 = ck_host_fault_calls;
     ck_host_capture_start();
     CHECK(ck_stage_devices() == NVME_EVS);
     CHECK(ck_host_confine_calls == calls0 + 1 && ck_host_unconfine_calls == un0 + 1);
@@ -888,6 +893,11 @@ static void test_nvme_bind_discovery(void)
     CHECK(has(x, "abort FAILED, stays confined (rc=-2: abort command failed)\n")); /* #480: the reason is named */
     CHECK(!has(x, "returned to abort"));
     CHECK(has(x, "nvme: bind refused, already owned by seg 0003 01:00.0 (bound=0 bm_on=0 confined=1)"));
+    /* #479: the failed release drained the stream's faults exactly once and logged them; the refused rerun
+     * released nothing, so it drained nothing. Confinement and ownership are unchanged (checked above). */
+    CHECK(ck_host_confine_rid == 0x100u);
+    CHECK(ck_host_fault_calls == fc0 + 1 && ck_host_fault_n == 0);
+    CHECK(has(x, "smmu: nvme stream 0x140 faults=2 first type=0x10 addr=0x80001000\n"));
     /* #489: a reset quiesce while the abort is still refused retries the release; the stream stays confined,
      * so quiesce must report the controller LIVE, never released-now. */
     ck_host_capture_start();
@@ -896,11 +906,15 @@ static void test_nvme_bind_discovery(void)
     CHECK(ck_host_unconfine_calls == un0 + 2);
     CHECK(has(ck_host_capture_text(), "devices: quiesce before reset nvme=LIVE\n"));
     CHECK(!has(ck_host_capture_text(), "nvme=released-now"));
+    /* #479: that retried release failed too, so it drained the stream's (now empty) queue once more. */
+    CHECK(ck_host_fault_calls == fc0 + 2 && has(ck_host_capture_text(), "smmu: nvme stream 0x140 faults=0\n"));
     ck_host_unconfine_fail = 0;
     ck_host_capture_start();
     ck_dev_nvme_release();                                          /* retry: the abort now succeeds */
     ck_host_capture_stop();
     CHECK(ck_host_unconfine_calls == un0 + 3 && has(ck_host_capture_text(), "returned to abort (rc=0)"));
+    CHECK(ck_host_fault_calls == fc0 + 2 && !has(ck_host_capture_text(), "faults")); /* a good release drains nothing */
+    ck_host_faults_up = 0;
     CHECK(ck_stage_devices() == NVME_EVS);                          /* ownership returned: bound again, once */
     CHECK(ck_host_confine_calls == calls0 + 2 && ck_host_unconfine_calls == un0 + 4);
 
@@ -2794,6 +2808,7 @@ static void test_xhci_release_refused(void)
     CHECK(rc == CK_XHCI_E_RELEASE && strcmp(ck_xhci_state(), "release-failed") == 0 && ck_xhci_live() == 1);
     CHECK(ck_host_confine_calls == grants + 1);
     CHECK(has(ck_host_capture_text(), "abort FAILED, stays confined"));
+    CHECK(has(ck_host_capture_text(), "faults: no SMMU event queue to drain\n")); /* #479, no SMMU up */
     grants = ck_host_confine_calls;
     CHECK(ck_xhci_fence(&s) == CK_XHCI_E_ARG && ck_host_confine_calls == grants && ck_xhci_live() == 1);
     ck_host_unconfine_fail = 0;
@@ -2821,6 +2836,11 @@ static void test_xhci_release_refused(void)
     ck_host_confine_named_rc = 0;
     ck_host_unconfine_fail = 1;
     ck_host_unconfine_allow = 1; /* PCI abort succeeds; the platform abort is the one refused */
+    ck_host_faults_up = 1;       /* #479: one event for the platform stream (mock sid 0x5) waits in the queue */
+    ck_host_fault_sid = 0x5u;
+    ck_host_fault_n = 1;
+    ck_host_fault_first = (struct ck_dma_fault){CK_DMA_FAULT_TRANSLATION, 0x5u, 0x13801000ull, 1};
+    unsigned fc0 = ck_host_fault_calls;
     xhci_model_bar[0] = bar;
     xhci_model_bar[1] = pbar;
     xhci_model_steps = 0;
@@ -2838,6 +2858,9 @@ static void test_xhci_release_refused(void)
     CHECK(xhci_model_steps > 0);                /* the driver's polls drove the model */
     CHECK(has(x, "abort FAILED, stays confined"));
     CHECK(has(x, "trying 1 ACPI platform controller"));
+    CHECK(ck_host_fault_calls == fc0 + 1 && ck_host_fault_n == 0); /* drained once, for the refused stream only */
+    CHECK(has(x, "smmu: xhci stream 0x5 faults=1 first type=0x10 addr=0x13801000 (event queue overflowed)\n"));
+    ck_host_faults_up = 0;
     grants = ck_host_confine_calls;
     CHECK(ck_xhci_fence(&s) == CK_XHCI_E_ARG && ck_host_confine_calls == grants);
     ck_host_unconfine_fail = 0;
@@ -2912,6 +2935,7 @@ static void test_net_release_refused(void)
     CHECK((pci_r16(cfg, 4) & 0x4u) == 0); /* bus master revoked even though the abort failed */
     CHECK(ck_host_confine_calls == grants + 1);
     CHECK(has(x, "abort FAILED, stays confined"));
+    CHECK(has(x, "smmu: virtio_net stream 0x") && has(x, "faults: no SMMU event queue to drain\n")); /* #479 */
     CHECK(!has(x, "returned to abort"));
     grants = ck_host_confine_calls;
     CHECK(ck_net_bind_selftest(&vf, &caps) == CK_NET_E_ARG); /* still live: release it first */

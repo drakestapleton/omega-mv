@@ -105,6 +105,7 @@ void ck_dev_nvme_release(void)
         ck_printf("smmu: nvme stream 0x%x %s (rc=%d%s%s)\n", g_nvme.stream_id,
                   urc == 0 ? "returned to abort" : "abort FAILED, stays confined", urc, urc ? ": " : "",
                   urc ? ck_dma_unconfine_why(urc) : "");
+        if (urc != 0) ck_dma_fault_report("nvme", g_nvme.stream_id);
     }
     /* Ownership is given back only once DMA is fully off (bus master and stream). */
     if (!g_nvme.bm_on && !g_nvme.confined && !g_nvme.stuck) g_nvme.claimed = 0;

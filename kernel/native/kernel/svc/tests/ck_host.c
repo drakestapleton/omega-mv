@@ -326,8 +326,24 @@ int ck_dma_unconfine(uint32_t stream_id)
     }
     return ck_host_confine_rc == 0 ? 0 : CK_SMMU_EARG;
 }
+/* SMMU fault queue model. ck_host_faults_up = 0 (default): no SMMU is up, -1.
+ * Otherwise ck_host_fault_n events for ck_host_fault_sid are pending (the first
+ * is ck_host_fault_first); a call naming that stream drains them all. */
+int ck_host_faults_up;
+int ck_host_fault_n;
+uint32_t ck_host_fault_sid;
+struct ck_dma_fault ck_host_fault_first;
+unsigned ck_host_fault_calls;
 int ck_dma_faults(uint32_t stream_id, struct ck_dma_fault *first)
 {
-    (void)stream_id; (void)first;
-    return -1;
+    if (!ck_host_faults_up)
+        return -1;
+    ck_host_fault_calls++;
+    if (stream_id != ck_host_fault_sid || ck_host_fault_n <= 0)
+        return 0;
+    int n = ck_host_fault_n;
+    ck_host_fault_n = 0;
+    if (first)
+        *first = ck_host_fault_first;
+    return n;
 }

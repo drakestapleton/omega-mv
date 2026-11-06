@@ -179,6 +179,7 @@ void ck_xhci_release(void)
         ck_printf("smmu: xhci stream 0x%x %s (rc=%d%s%s)\n", x->stream_id,
                   urc == 0 ? "returned to abort" : "abort FAILED, stays confined", urc, urc ? ": " : "",
                   urc ? ck_dma_unconfine_why(urc) : "");
+        if (urc != 0) ck_dma_fault_report("xhci", x->stream_id);
     }
 }
 

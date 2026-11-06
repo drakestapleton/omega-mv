@@ -203,6 +203,25 @@ struct ck_dma_fault {
     int overflow;
 };
 int ck_dma_faults(uint32_t stream_id, struct ck_dma_fault *first);
+/* Release-failed evidence (#479): when a stream cannot be returned to abort,
+ * drain its SMMU fault events once and log what they hold. Read-only: no DMA
+ * buffer is freed or reused, and the stream stays confined. */
+static inline void ck_dma_fault_report(const char *who, uint32_t stream_id)
+{
+    struct ck_dma_fault f;
+    f.type = 0;
+    f.stream_id = stream_id;
+    f.addr = 0;
+    f.overflow = 0;
+    int n = ck_dma_faults(stream_id, &f);
+    if (n < 0)
+        ck_printf("smmu: %s stream 0x%x faults: no SMMU event queue to drain\n", who, stream_id);
+    else if (n == 0)
+        ck_printf("smmu: %s stream 0x%x faults=0%s\n", who, stream_id, f.overflow ? " (event queue overflowed)" : "");
+    else
+        ck_printf("smmu: %s stream 0x%x faults=%d first type=0x%x addr=0x%llx%s\n", who, stream_id, n, f.type,
+                  (unsigned long long)f.addr, f.overflow ? " (event queue overflowed)" : "");
+}
 
 /* Entropy (arch/rndr.c over core/entropy.c): the Arm RNDR instruction or a
  * refusal; there is no fallback source. ck_entropy_fill returns 0 with len
