@@ -2,9 +2,14 @@ note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 note mathlibs_ir.om: CUDA++ math-library kernels for the GB10 (sm_121), emitted as BlackwellIR records.
 note kind 0: xoshiro256** random numbers (variant 0 raw 64-bit, 1 uniform f32, 2 normal f32).
 note kind 1: batched complex f32 Stockham FFT, n = 2^a (4..2048), radix 4 plus one radix-2 stage when a is odd.
-note kind 2: the FFT twiddle table w^m, m < n, as f32 pairs (re bits | im bits << 32), computed in f64.
-note The algorithms are the public-domain xoshiro256** and SplitMix64 (Blackman and Vigna) and the
-note Stockham FFT; the stream matches aien-math src/stats/random.om bit for bit (fixture in tests/).
+note kind 2: the FFT twiddle table w^m, m < n, n = 2^a (4..4096), as f32 pairs (re bits | im bits << 32), in f64.
+note kind 3: Philox4x32-10 counter-based random numbers, the stream of cuRAND's curandStatePhilox4_32_10_t.
+note kind 4: real-FFT split (R2C, after an N/2-point complex FFT) or merge (C2R, before it), N = 2^a (8..4096).
+note kind 5: complex f32 transpose [batch][2^a][2^b] -> [batch][2^b][2^a].
+note kind 6: the pass plan (data) of an R2C, C2R or 1-, 2-, 3-D complex transform over kinds 1, 4 and 5.
+note The algorithms are the public-domain xoshiro256** and SplitMix64 (Blackman and Vigna), Philox4x32-10
+note (Salmon, Moraes, Dror and Shaw, SC'11) and the Stockham FFT; the xoshiro stream matches aien-math
+note src/stats/random.om bit for bit and the Philox stream the Random123 known answers (fixtures in tests/).
 note Record (8 ulong): op, dst, src1, src2, src3 (vreg or 2^64-1 for none), ureg, imm | control << 32,
 note uniform | p0 << 1 | not << 2 | dsub << 16 | s1sub << 24 | s2sub << 32 | s3sub << 40.
 note The records replay through src/omega_gpu_om_ir.c (C register allocator, migration-pending) and
@@ -995,19 +1000,400 @@ put ins k tw1 k lg dir
 end
 end
 
+note ---- kind 3: Philox4x32-10 (Salmon, Moraes, Dror, Shaw 2011; Random123), the stream of cuRAND's
+note curandStatePhilox4_32_10_t. Arguments: 0x380 out, 0x388 key (the 64-bit seed), 0x390 subsequence of stream 0,
+note 0x398 first counter block (offset / 4), 0x3a0 blocks per stream, 0x3a4 stream count. Thread g is stream g with
+note counter (blk0 + j, subseq0 + g) as two 64-bit halves; block j of stream g is the uint4 out[j ns + g].
+note P: 0 ureg desc, 1 out, 2 key, 3 counter high pair, 4 counter low pair, 5 blocks left, 6 streams, 7 out index,
+note 8 one, 9 zero, 10..19 round keys k0 + r W0, 20..29 round keys k1 + r W1.
+const PHM0 ulong 3528531795
+const PHM1 ulong 3449720151
+const PHW0 ulong 2654435769
+const PHW1 ulong 3144134277
+
+fn ppro ins edit ulong 8192 m edit ulong 512 P edit ulong 32 to void
+put P 0 nu m 2
+emit ins m okk LDCU64 KUVAR 1 NONE r4 get P 0 NONE NONE NONE 856
+put P 1 vl ins m LDC64 2 NONE 896
+put P 2 vl ins m LDC64 2 NONE 904
+s0 = vl ins m LDC64 2 NONE 912
+put P 4 vl ins m LDC64 2 NONE 920
+put P 5 vl ins m LDC 1 NONE 928
+put P 6 vl ins m LDC 1 NONE 932
+t = vl ins m S2R 1 NONE 33
+c = vl ins m S2R 1 NONE 37
+g = imi ins m c 128 t
+isge ins m g get P 6
+exitp ins m
+put P 3 imw ins m g 1 s0
+put P 7 g
+put P 8 mov ins m 1
+z = nv m 1
+ef ins m MOVRZ r4 z NONE NONE NONE 0
+put P 9 z
+end
+
+note round keys (mutant 1 bumps k1 by W0)
+fn pkeys ins edit ulong 8192 m edit ulong 512 P edit ulong 32 mut ulong to void
+k = get P 2
+w1 = PHW1
+if eq mut 1
+w1 = PHW0
+end
+put P 10 sb k 0
+put P 20 sb k 1
+for r ulong 9
+q = add r 1
+one = get P 8
+x = imi ins m one and mul q PHW0 LO32 sb k 0
+put P add 10 q x
+x = imi ins m one and mul q w1 LO32 sb k 1
+put P add 20 q x
+end
+end
+
+note one round: lo0:hi0 = M0 c0, lo1:hi1 = M1 c2; c = (hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0)
+fn pround ins edit ulong 8192 m edit ulong 512 st edit ulong 4 k0 ulong k1 ulong to void
+w0 = imw ins m get st 0 PHM0 NONE
+w1 = imw ins m get st 2 PHM1 NONE
+put st 0 lut ins m sb w1 1 get st 1 k0 150
+put st 2 lut ins m sb w0 1 get st 3 k1 150
+put st 1 sb w1 0
+put st 3 sb w0 0
+end
+
+fn pstore ins edit ulong 8192 m edit ulong 512 P view ulong 32 st view ulong 4 to void
+ad = imw ins m get P 7 16 get P 1
+for i ulong 4
+stg ins m ad get st i mul i 4 get P 0
+end
+end
+
+note per block: ten rounds (mutant 2: nine), store, counter low += 1, out index += streams
+fn ploop ins edit ulong 8192 m edit ulong 512 P view ulong 32 st edit ulong 4 mut ulong to void
+nr = ulong 10
+if eq mut 2
+nr = 9
+end
+blk = get P 4
+lbeg m
+put st 0 sb blk 0
+put st 1 sb blk 1
+put st 2 sb get P 3 0
+put st 3 sb get P 3 1
+for r ulong nr
+pround ins m edit st get P add 10 r get P add 20 r
+end
+pstore ins m view P view st
+ef ins m IMADW r4 blk get P 8 NONE blk 1
+e = get P 7
+ef ins m IMAD r4 e get P 6 NONE e 1
+c = get P 5
+ef ins m IMAD r4 c get P 8 NONE c M1
+isge ins m get P 9 c
+bback ins m
+lend m
+end
+
+fn phik ins edit ulong 8192 m edit ulong 512 mut ulong to void
+P = new ulong 32 0
+st = new ulong 4 0
+ppro ins m edit P
+pkeys ins m edit P mut
+ploop ins m view P edit st mut
+tail ins m
+end
+
+note ---- kind 4: the real-FFT post-pass (b 0, split) and pre-pass (b 1, merge) for N = 2^a, n = N / 2.
+note One CTA of n / 2 threads per row; thread t takes the pair (t, n - t), and every thread also writes element n / 2
+note (identical bits). Split: Z = FFT_n(x read as complex) in rows of n -> X in rows of n + 1 (cuFFT R2C layout):
+note E = (Z_t + conj Z_(n-t)) / 2, O = (Z_t - conj Z_(n-t)) / 2i, P = W^t O, X_t = E + P, X_(n-t) = conj (E - P),
+note X_(n/2) = conj Z_(n/2). Merge: X in rows of n + 1 -> Z' in rows of n, A = X_t + conj X_(n-t),
+note Q = W^-t (X_t - conj X_(n-t)), Z'_t = A + iQ, Z'_(n-t) = conj A + i conj Q, Z'_(n/2) = 2 conj X_(n/2); the
+note unnormalized inverse FFT_n of Z' is the C2R output (cuFFT convention: C2R(R2C(x)) = N x).
+note Arguments: 0x380 in, 0x388 out, 0x390 twiddles of N (forward for split, inverse for merge).
+note Q: 0 ureg desc, 1 in row, 2 out row, 3 twiddles, 4 tid, 5 n - tid, 6 (n - tid) mod n.
+note V: 0 first input pair, 1 partner pair, 2 twiddle pair, 3 / 4 E or A, 5 P or Q (p2 re im).
+note Mutants: 1 drops the twiddle multiply, 2 skips element n / 2.
+const FRH f32 0.5
+const FRNH f32 -0.5
+const FRN1 f32 -1.0
+const FR2 f32 2.0
+const FRN2 f32 -2.0
+
+fn andi ins edit ulong 8192 m edit ulong 512 a ulong imm ulong to ulong
+d = nv m 1
+ef ins m LAND r4 d a NONE NONE imm
+ret d
+end
+
+note (re + i im) times the twiddle pair w: a fresh p2 re im
+fn cmw ins edit ulong 8192 m edit ulong 512 re ulong im ulong w ulong to ulong
+t1 = fo ins m FMUL re sb w 0
+t2 = fo ins m FMUL im sb w 1
+t3 = fo ins m FMUL im sb w 0
+i2 = ffm ins m re sb w 1 t3
+ret p2 fo ins m FSUB t1 t2 i2
+end
+
+fn rpro4 ins edit ulong 8192 m edit ulong 512 Q edit ulong 16 lg ulong dir ulong to void
+n = shl 1 sub lg 1
+put Q 0 nu m 2
+emit ins m okk LDCU64 KUVAR 1 NONE r4 get Q 0 NONE NONE NONE 856
+put Q 1 vl ins m LDC64 2 NONE 896
+put Q 2 vl ins m LDC64 2 NONE 904
+put Q 3 vl ins m LDC64 2 NONE 912
+c = vl ins m S2R 1 NONE 37
+t = vl ins m S2R 1 NONE 33
+put Q 4 t
+si = add n dir
+so = sub add n 1 dir
+put Q 1 imw ins m c mul si 8 get Q 1
+put Q 2 imw ins m c mul so 8 get Q 2
+v = imi ins m t M1 mov ins m n
+put Q 5 v
+put Q 6 andi ins m v sub n 1
+end
+
+note V 0 = in[t], V 1 = in[(n - t) mod n] (split) or in[n - t] (merge), V 2 = twiddle t
+fn rld4 ins edit ulong 8192 m edit ulong 512 Q view ulong 16 V edit ulong 8 dir ulong to void
+u = get Q 0
+put V 0 gl ins m imw ins m get Q 4 8 get Q 1 0 u
+put V 1 gl ins m imw ins m get Q sub 6 dir 8 get Q 1 0 u
+put V 2 gl ins m imw ins m get Q 4 8 get Q 3 0 u
+end
+
+fn rsplit ins edit ulong 8192 m edit ulong 512 V edit ulong 8 mut ulong to void
+a = get V 0
+b = get V 1
+h = mov ins m fb FRH
+put V 3 fo ins m FMUL fo ins m FADD sb a 0 sb b 0 h
+put V 4 fo ins m FMUL fo ins m FSUB sb a 1 sb b 1 h
+o1 = fo ins m FMUL fo ins m FADD sb a 1 sb b 1 h
+o2 = fo ins m FMUL fo ins m FSUB sb a 0 sb b 0 mov ins m fb FRNH
+p = p2 o1 o2
+if ne mut 1
+p = cmw ins m o1 o2 get V 2
+end
+put V 5 p
+end
+
+note X_t = (Er + Pr, Ei + Pi), X_(n-t) = (Er - Pr, Pi - Ei)
+fn sst4 ins edit ulong 8192 m edit ulong 512 Q view ulong 16 V view ulong 8 to void
+er = get V 3
+ei = get V 4
+pr = and get V 5 65535
+pi = shr get V 5 16
+u = get Q 0
+x = imw ins m get Q 4 8 get Q 2
+stg ins m x fo ins m FADD er pr 0 u
+stg ins m x fo ins m FADD ei pi 4 u
+x = imw ins m get Q 5 8 get Q 2
+stg ins m x fo ins m FSUB er pr 0 u
+stg ins m x fo ins m FSUB pi ei 4 u
+end
+
+fn rmerge ins edit ulong 8192 m edit ulong 512 V edit ulong 8 mut ulong to void
+a = get V 0
+b = get V 1
+put V 3 fo ins m FADD sb a 0 sb b 0
+put V 4 fo ins m FSUB sb a 1 sb b 1
+d1 = fo ins m FSUB sb a 0 sb b 0
+d2 = fo ins m FADD sb a 1 sb b 1
+q = p2 d1 d2
+if ne mut 1
+q = cmw ins m d1 d2 get V 2
+end
+put V 5 q
+end
+
+note Z'_((n-t) mod n) = (Ar + Qi, Qr - Ai) first, then Z'_t = (Ar - Qi, Ai + Qr) (t = 0 keeps the second)
+fn mst4 ins edit ulong 8192 m edit ulong 512 Q view ulong 16 V view ulong 8 to void
+ar = get V 3
+ai = get V 4
+qr = and get V 5 65535
+qi = shr get V 5 16
+u = get Q 0
+x = imw ins m get Q 6 8 get Q 2
+stg ins m x fo ins m FADD ar qi 0 u
+stg ins m x fo ins m FSUB qr ai 4 u
+x = imw ins m get Q 4 8 get Q 2
+stg ins m x fo ins m FSUB ar qi 0 u
+stg ins m x fo ins m FADD ai qr 4 u
+end
+
+note element n / 2: split conj Z, merge 2 conj X
+fn rmid ins edit ulong 8192 m edit ulong 512 Q view ulong 16 lg ulong dir ulong to void
+o = shl 1 add lg 1
+u = get Q 0
+z = gl ins m get Q 1 o u
+if eq dir 0
+stg ins m get Q 2 sb z 0 o u
+stg ins m get Q 2 fo ins m FMUL sb z 1 mov ins m fb FRN1 add o 4 u
+ret
+end
+stg ins m get Q 2 fo ins m FMUL sb z 0 mov ins m fb FR2 o u
+stg ins m get Q 2 fo ins m FMUL sb z 1 mov ins m fb FRN2 add o 4 u
+end
+
+fn rk4 ins edit ulong 8192 m edit ulong 512 lg ulong dir ulong mut ulong to void
+Q = new ulong 16 0
+V = new ulong 8 0
+rpro4 ins m edit Q lg dir
+rld4 ins m view Q edit V dir
+if eq dir 0
+rsplit ins m edit V mut
+sst4 ins m view Q view V
+else
+rmerge ins m edit V mut
+mst4 ins m view Q view V
+end
+if ne mut 2
+rmid ins m view Q lg dir
+end
+tail ins m
+end
+
+note ---- kind 5: complex f32 transpose [batch][R][C] -> [batch][C][R], R = 2^a, C = 2^b; 256 threads, one element
+note each. Arguments: 0x380 in, 0x388 out, 0x390 element count, 0x394 first element of this launch.
+note Element g = (hi, r, c) goes to hi + c R + r. Mutants: 1 copies (identity), 2 drops the batch part hi.
+note T: 0 ureg desc, 1 in, 2 out, 3 g.
+fn trpro ins edit ulong 8192 m edit ulong 512 T edit ulong 8 to void
+put T 0 nu m 2
+emit ins m okk LDCU64 KUVAR 1 NONE r4 get T 0 NONE NONE NONE 856
+put T 1 vl ins m LDC64 2 NONE 896
+put T 2 vl ins m LDC64 2 NONE 904
+tot = vl ins m LDC 1 NONE 912
+g0 = vl ins m LDC 1 NONE 916
+c = vl ins m S2R 1 NONE 37
+t = vl ins m S2R 1 NONE 33
+g = fo ins m IADD3 imi ins m c 256 g0 t
+put T 3 g
+isge ins m g tot
+exitp ins m
+end
+
+fn trix ins edit ulong 8192 m edit ulong 512 g ulong lr ulong lc ulong mut ulong to ulong
+if eq mut 1
+ret g
+end
+cc = andi ins m g sub shl 1 lc 1
+rr = andi ins m sh ins m g lc sub shl 1 lr 1
+o = imi ins m cc shl 1 lr rr
+if eq mut 2
+ret o
+end
+k = shl 1 add lr lc
+k = and sub 0 k LO32
+hi = andi ins m g k
+ret fo ins m IADD3 o hi
+end
+
+fn trk ins edit ulong 8192 m edit ulong 512 lr ulong lc ulong mut ulong to void
+T = new ulong 8 0
+trpro ins m edit T
+g = get T 3
+v = gl ins m imw ins m g 8 get T 1 0 get T 0
+ad = imw ins m trix ins m g lr lc mut 8 get T 2
+stg ins m ad sb v 0 0 get T 0
+stg ins m ad sb v 1 4 get T 0
+tail ins m
+end
+
+note ---- kind 6: the pass plan (data). a = mode | ndim << 4 (mode 0 complex ndim-D, 1 R2C, 2 C2R); b = log2 of the
+note dims, 4 bits each, dim 0 (outermost) at bits 0..3 (R2C / C2R: log2 N 3..12); c = direction (mode 0 only).
+note Word 0 = steps; word s + 1 = kind | a << 8 | b << 16 | src << 24 | dst << 32 | log2 rows per batch item << 40,
+note buffers 0 in, 1 out, 2 scratch. ndim-D: per round r, the FFT along dim ndim - 1 - r (contiguous) to scratch,
+note then the transpose [R][C] -> [C][R] back to out; after ndim rounds the layout is the input's again.
+fn pstep k ulong a ulong b ulong s ulong d ulong r ulong to ulong
+ret or or or k shl a 8 or shl b 16 shl s 24 or shl d 32 shl r 40
+end
+
+fn plan1 ins edit ulong 8192 mode ulong lg ulong to ulong
+if or lt lg 3 gt lg 12
+ret 1
+end
+h = sub lg 1
+put ins 0 2
+if eq mode 1
+put ins 1 pstep 1 h 0 0 2 0
+put ins 2 pstep 4 lg 0 2 1 0
+ret 0
+end
+put ins 1 pstep 4 lg 1 0 2 0
+put ins 2 pstep 1 h 1 2 1 0
+ret 0
+end
+
+fn plann ins edit ulong 8192 nd ulong b ulong dir ulong to ulong
+if ne shr b mul 4 nd 0
+ret 1
+end
+tot = ulong 0
+for i ulong nd
+l = and shr b mul 4 i 15
+if or lt l 2 gt l 11
+ret 1
+end
+tot = add tot l
+end
+if gt tot 27
+ret 1
+end
+if eq nd 1
+put ins 0 1
+put ins 1 pstep 1 b dir 0 1 0
+ret 0
+end
+put ins 0 mul nd 2
+for r ulong nd
+l = and shr b mul 4 sub sub nd 1 r 15
+s = ulong 1
+if eq r 0
+s = 0
+end
+put ins add 1 mul r 2 pstep 1 l dir s 2 sub tot l
+put ins add 2 mul r 2 pstep 5 sub tot l l 2 1 0
+end
+ret 0
+end
+
+fn plan ins edit ulong 8192 a ulong b ulong c ulong to ulong
+mode = and a 15
+nd = shr a 4
+if gt mode 2
+ret 1
+end
+if gt mode 0
+if or ne nd 1 ne c 0
+ret 1
+end
+ret plan1 ins mode b
+end
+if or or lt nd 1 gt nd 3 gt c 1
+ret 1
+end
+ret plann ins nd b c
+end
+
 note ---- entry. kind 0 RNG (a variant 0..2, b 0, c mutant 0..2); kind 1 FFT (a log2 n 2..11, b direction
-note 0 forward / 1 inverse, c mutant 0..2); kind 2 twiddles (a log2 n, b direction, c 0).
+note 0 forward / 1 inverse, c mutant 0..2); kind 2 twiddles (a log2 n 2..12, b direction, c 0); kind 3 Philox
+note (a 0, b 0, c mutant 0..2); kind 4 real-FFT split / merge (a log2 N 3..12, b 0 split / 1 merge, c mutant 0..2);
+note kind 5 transpose (a log2 R 2..25, b log2 C 2..11, a + b <= 27, c mutant 0..2); kind 6 pass plan (data).
 note Returns 0 built, 1 refused arguments, 2 emitter error (meta 4 holds the code).
 fn mathlibs_ir kind ulong a ulong b ulong c ulong ins edit ulong 8192 meta edit ulong 512 to ulong
 for i ulong 512
 put meta i 0
 end
 if eq kind 2
-if or or lt a 2 gt a 11 or gt b 1 ne c 0
+if or or lt a 2 gt a 12 or gt b 1 ne c 0
 ret 1
 end
 twid ins a b
 ret 0
+end
+if eq kind 6
+ret plan ins a b c
 end
 if eq kind 0
 if or or gt a 2 ne b 0 gt c 2
@@ -1021,7 +1407,28 @@ ret 1
 end
 fftk ins meta a b c
 end
-if gt kind 2
+if eq kind 3
+if or or ne a 0 ne b 0 gt c 2
+ret 1
+end
+phik ins meta c
+end
+if eq kind 4
+if or or lt a 3 gt a 12 or gt b 1 gt c 2
+ret 1
+end
+rk4 ins meta a b c
+end
+if eq kind 5
+if or or lt a 2 gt a 25 or lt b 2 gt b 11
+ret 1
+end
+if or gt add a b 27 gt c 2
+ret 1
+end
+trk ins meta a b c
+end
+if gt kind 5
 ret 1
 end
 if ne get meta 4 0
