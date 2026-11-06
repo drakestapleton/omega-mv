@@ -93,12 +93,12 @@ bytes. Each child has a30-second deadline. Scratch and child outputs remain
 available for inspection; the shell creates a separate directory on each run.
 
 The required compiler is this branch's seeded `seed/out/omc`, executable
-`3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`, built from
-`seed/omc/omc.om` `0effe37afc4ddd0507151c9f2afa34b3e6774eae7006cbecd8c59f11bc386db7`
+`530ce312fb7981e254d6c638ac4354fb2d36ce91119ccb73ef0f059f01b7dbd7`, built from
+`seed/omc/omc.om` `7c88ebb596a65f17ca6d725555d82b501d1dc70a3afc5c9557fff3663125ac85`
 (both pinned in `compiler.sha256`). The original qualification used the corrected
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
 executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
-then b4f45121, then 3ad9f10f) and the gate was rerun. Each of these compilers emits the same
+then b4f45121, then 3ad9f10f, then 530ce312) and the gate was rerun. Each of these compilers emits the same
 classifier bytes (b527a20c). The entry refuses with 3 for any other compiler. It
 does not fetch code, accept an arbitrary environment compiler, silently select an
 older profile, or waive missing prerequisites.
