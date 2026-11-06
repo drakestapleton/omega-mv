@@ -49,7 +49,11 @@ tramp_pm32:
     or $0x900, %eax                    /* LME + NXE: the kernel's tables carry NX bits */
     wrmsr
     mov %cr0, %eax
+#ifdef CK_X86_WX_MUTANT_AP_NO_WP
+    or $0x80000000, %eax               /* TEST-ONLY mutant (#484): PG without WP on the AP */
+#else
     or $0x80010000, %eax               /* PG + WP: read-only pages bind this core too */
+#endif
     mov %eax, %cr0
     ljmpl *(ck_x86_tramp_far64 - ck_x86_tramp_start)(%ebx)
 

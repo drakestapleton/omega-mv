@@ -85,7 +85,8 @@
 
 /* W^X negative controls (make IMACKERN_WX_MUTANT=..., QEMU only, never
  * deployed): no_nx drops every NX bit, text_writable leaves the code
- * writable. The W^X probes below must then fail. */
+ * writable, ap_no_wp starts the secondary cores without CR0.WP (smp_x86.S).
+ * The W^X probes or the wx_audit core count below must then fail. */
 #define PTE_XD (1ull << 63) /* the hardware execute-disable bit */
 #ifdef CK_X86_WX_MUTANT_NO_NX
 #define PTE_NX 0ull
@@ -1590,7 +1591,7 @@ void ck_x86_kernel_entry(struct ck_handoff *h)
     hand = h;
     tables_load();
     ck_puts("\nreport_kind: kernel\n");
-#if defined(CK_X86_WX_MUTANT_NO_NX) || defined(CK_X86_WX_MUTANT_TEXT_RW)
+#if defined(CK_X86_WX_MUTANT_NO_NX) || defined(CK_X86_WX_MUTANT_TEXT_RW) || defined(CK_X86_WX_MUTANT_AP_NO_WP)
     ck_puts("wx: TEST-ONLY W^X mutant build, page permissions deliberately broken, never deploy\n");
 #endif
     ck_printf("exit_boot_services: ok attempts=%u\n", h->exit_attempts);

@@ -31,8 +31,9 @@
 # ACPI S5 by itself. W^X (#409): each run must show writes to code and read-only
 # data and execution from heap and stack faulting with the right #PF error code,
 # and an audit of every page table leaf (only the code executable, nothing
-# writable and executable, NXE and WP on every core). Two TEST-ONLY mutant builds
-# (IMACKERN_WX_MUTANT=no_nx, =text_writable) must make those probes panic.
+# writable and executable, NXE and WP on every core). Three TEST-ONLY mutant builds
+# (IMACKERN_WX_MUTANT=no_nx, =text_writable at -smp 1; =ap_no_wp, secondary cores
+# without CR0.WP, at -smp 4) must make those checks panic.
 # The kernel's report reaches the serial log through COM1, which QEMU has and the
 # iMac does not. Needs qemu-system-x86_64, OVMF, mtools and an x86_64 gcc. Final line:
 #     AIENOS_IMAC_KERNEL: PASS|FAIL|NOT_RUN [(...)]      exit 0 / 1 / 2 (tools) / 3 (NOT_RUN)
@@ -176,15 +177,15 @@ run max max xapic
 run qemu64 qemu64 xapic
 # W^X negative controls: the probes run before the clock is measured, so a mutant's
 # panic halts instead of powering off; wait for the panic line, then stop QEMU.
-mutant() { # IMACKERN_WX_MUTANT value, expected panic pattern
-    local m="$1" mo="${out}-wx-$1" mi="${work}/wx-$1.img" log="${work}/wx-$1.log" hit=0
+mutant() { # IMACKERN_WX_MUTANT value, expected panic pattern, QEMU core count (default 1)
+    local m="$1" mo="${out}-wx-$1" mi="${work}/wx-$1.img" log="${work}/wx-$1.log" hit=0 smp="${3:-1}"
     make -s -C native/kernel X86_CROSS="${cross}" OUT="${mo}" AIENOS_COMMIT="${commit}" IMACKERN_WX_MUTANT="${m}" imac-kernel >/dev/null
     truncate -s 64M "${mi}"
     mformat -i "${mi}" -F ::
     mmd -i "${mi}" ::/EFI ::/EFI/BOOT
     mcopy -i "${mi}" "${mo}/IMACKERN.EFI" ::/EFI/BOOT/BOOTX64.EFI
     cp "${vars_fd}" "${work}/vars.fd"
-    qemu-system-x86_64 -M q35 -accel tcg -cpu max -smp 1 -m 1024 \
+    qemu-system-x86_64 -M q35 -accel tcg -cpu max -smp "${smp}" -m 1024 \
         -drive if=pflash,format=raw,readonly=on,file="${code_fd}" \
         -drive if=pflash,format=raw,file="${work}/vars.fd" \
         -drive if=none,id=esp,format=raw,file="${mi}" -device ide-hd,drive=esp,bus=ide.0 \
@@ -208,5 +209,8 @@ mutant() { # IMACKERN_WX_MUTANT value, expected panic pattern
 }
 mutant no_nx '^panic: wx: FAIL nx=on wp=on text_write=fault ro_write=fault heap_exec=ALLOWED stack_exec=ALLOWED$'
 mutant text_writable '^panic: wx: FAIL nx=on wp=on text_write=ALLOWED ro_write=fault heap_exec=fault stack_exec=fault$'
+# The secondary cores start without CR0.WP (#484): the boot core's probes pass, so the failure must be the
+# wx_audit core count, 1 of 4 cores with NXE and WP, after all three cores started.
+mutant ap_no_wp '^panic: wx_audit: FAIL wx_pages=0 exec_pages=([1-9][0-9]*) text_pages=\1 exec_outside_text=0 ro_writable=0 cores_nx_wp=1/4$' 4
 if [[ ${fails} == 0 ]]; then echo "${tag}: PASS"; exit 0; fi
 echo "${tag}: FAIL (${fails} checks)"; exit 1
