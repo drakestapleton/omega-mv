@@ -146,6 +146,10 @@ typedef enum {
      * chip probe: tests/gpu_atomf32_probe_test.c. */
     BW_IR_ATOMG_ADD_F32_STRONG_SYS, /* ATOMG.E.ADD.F32.FTZ.RN.STRONG.SYS PT, Rd|RZ, desc[UR][Ra.64], Rb: Rd = old, mem += Rb */
     BW_IR_ATOMG_ADD_F32_STRONG_GPU, /* ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, Rd|RZ, desc[UR][Ra.64], Rb: Rd = old, mem += Rb */
+    /* Omegese kernels (L386, 2026-10-21), additive. The words are the E1 conversion words the numeric
+     * suite runs on the chip (src/omega_numeric.c E1_CVT: OMEGA_NOP_I2FP_U32, OMEGA_NOP_F2U). */
+    BW_IR_I2FP_U32,     /* I2FP.F32.U32 Rd, Ra: round to nearest even; fixed latency */
+    BW_IR_F2I_U32       /* F2I.U32.TRUNC.NTZ Rd, Ra: toward zero, saturating, NaN -> 0; variable latency */
 } BlackwellIROpcode;
 
 /* Barrier (reconvergence) registers: the sm_121 BSSY/BSYNC words carry a 4-bit barrier id
@@ -174,7 +178,8 @@ typedef struct {
                          * this instruction). 0 branches to itself. */
     uint32_t control;   /* Bundle control word */
     bool is_uniform;    /* True if targets/uses uniform registers */
-    bool predicate_p0;  /* True if predicated on P0 */
+    bool predicate_p0;  /* True if predicated on P0. Every opcode honours it: the guard field, bits 12..15
+                         * of the first word (7 = always, 0 = @P0, 8 = @!P0) */
     bool predicate_not; /* With predicate_p0, encode @!P0 */
     uint8_t dst_subreg; /* Subregister offset (0..3) within register bundle */
     uint8_t src1_subreg;
@@ -378,6 +383,9 @@ int omega_blackwell_verify_codegen_fixtures_bfly_f2fp(void);
 /* Training R5 part 2: golden words for ATOMG.E.ADD.F32.FTZ.RN.STRONG.SYS and .STRONG.GPU, with and without a destination
  * (decoded with nvdisasm -b SM121; no nvcc). 0 = pass. */
 int omega_blackwell_verify_codegen_fixtures_atomf32(void);
+/* L386: the guard predicate on ordinary ops (@P0 / @!P0 MOV, STG, LDG, EXIT) and the I2FP_U32 / F2I_U32
+ * words; checked against the E1 chip words and the BRA guard field. 0 = pass. */
+int omega_blackwell_verify_codegen_fixtures_guard(void);
 
 /* omega #308: encodes one instruction with a given physical register map of
  * identity (vreg n -> Rn) so offline tools can disassemble single words. 0 = ok. */
