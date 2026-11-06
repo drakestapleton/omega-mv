@@ -1,0 +1,146 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Requires DriverOmega gsp/irqqueue.om iqcommand model adapter, not a physical RPC.
+note Event rows: VA,access,decision,PA,PTE,mapping-mask; up to16 per caller batch.
+note Queue records use DriverOmega five-u64 LE ABI, op2 invalidate before op1 replay.
+note UVREPLAY means records emitted, NEVER completed invalidation/replay. Cancel/fatal are local decisions.
+global sev ulong 96
+global sen ulong 1
+global sqbad ulong 1
+fn sevent act ulong pa ulong pte ulong mask ulong to ulong
+if ge get sen 0 16
+ret UVENOM
+end
+o = mul get sen 0 6
+put sev o get uvfva 0
+put sev add o 1 get uvfacc 0
+put sev add o 2 act
+put sev add o 3 pa
+put sev add o 4 pte
+put sev add o 5 mask
+put sen 0 add get sen 0 1
+ret act
+end
+fn sdecision to ulong
+if eq get uvfval 0 0
+ret UVIGN
+end
+if or eq get slive 0 0 ne get sqbad 0 0
+ret UVFATAL
+end
+if or eq get uvfen 0 0 or eq get uvfrep 0 0 ge get uvftyp 0 3
+ret UVFATAL
+end
+if gt get uvfacc 0 3
+ret UVFATAL
+end
+i = sfind get uvfva 0
+if eq i 64
+ret UVCANCEL
+end
+if eq sget i 7 1
+ret UVCANCEL
+end
+if eq sget i 2 0
+ret UVCANCEL
+end
+if and eq sget i 6 1 or eq get uvfacc 0 1 eq get uvfacc 0 2
+ret UVFATAL
+end
+ret UVREPLAY
+end
+fn sqready to bool
+if or ne get iqcmode 0 1 ne get iqcstate 0 1
+ret false
+end
+if gt sub get iqcprod 0 get iqccons 0 6
+ret false
+end
+if gt get iqcseq 0 18446744073709551613
+ret false
+end
+if gt get iqcprod 0 18446744073709551613
+ret false
+end
+ret true
+end
+fn sqemit va ulong pa ulong mask ulong to ulong
+r = iqcommand 2 add get iqcseq 0 1 va pa mask
+if ne r 0
+put sqbad 0 1
+ret UVFATAL
+end
+r = iqcommand 1 add get iqcseq 0 1 va pa mask
+if ne r 0
+put sqbad 0 1
+ret UVFATAL
+end
+ret UVREPLAY
+end
+fn squiescent to bool
+ret and eq get iqcprod 0 get iqccons 0 eq get fbget 0 get fbput 0
+end
+fn spermission i ulong acc ulong to ulong
+if eq sget i 6 1
+ret 4
+end
+if or eq acc 1 eq acc 2
+ret 0
+end
+if eq sget i 5 1
+ret 4
+end
+ret 0
+end
+fn ssetpte va ulong pa ulong pcf ulong to ulong
+r = uvread va UV4K
+if eq r UVMAPPED
+if ne get uvdpa 0 pa
+ret UVEPERM
+end
+if eq get uvdpcf 0 pcf
+ret UVOK
+end
+note Change permissions on the same physical page, not a copy or a new physical residency.
+r = uvunmap va UV4K UV4K
+if ne r UVOK
+ret r
+end
+end
+ret uvmap va pa UV4K UV4K UVAPSYS pcf
+end
+fn smapfault i ulong j ulong to ulong
+va = get uvfva 0
+pa = add sget i 2 sub va sget i 0
+mask = smask i get uvfacc 0
+pcf = spermission i get uvfacc 0
+r = ssetpte va pa pcf
+if ne r UVOK
+ret sevent UVFATAL 0 0 0
+end
+put spage mul j 3 va
+put spage add mul j 3 1 mask
+r = sqemit va pa mask
+ret sevent r pa uvld64 get uvleaf 0 mask
+end
+fn sservice to ulong
+act = sdecision
+if ne act UVREPLAY
+ret sevent act 0 0 0
+end
+if ge get sen 0 16
+ret UVENOM
+end
+note Serialized caller owns queue, no concurrent producer. Reserve TWO slots before PTE change.
+if not sqready
+ret UVENOM
+end
+i = sfind get uvfva 0
+j = spfind get uvfva 0
+if eq j 128
+j = spfree
+end
+if eq j 128
+ret UVENOM
+end
+ret smapfault i j
+end
