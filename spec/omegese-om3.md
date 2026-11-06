@@ -21,9 +21,25 @@ not stated here.
 - An OM-2 function unit (first line `om2`, no `fn main`) may use the host words `fopen`, `fclose`,
   `fstat`, `stat`, `lstat`, `getuid`, `geteuid`, `getgid` and `getegid` (OMEGESE.md section 10) on
   AArch64, with their program-mode meaning and machine code.
+- The same units may use the clocks `monons`, `realns` and `sleepns` and the device words `devctl`,
+  `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget`,
+  `mapset`, `maphold` and `mapbind` (`seed/host/MAPPING.md`). Function-mode entry31
+  is a data pointer to a32-byte capacity/generation header followed by1..4098
+  32-byte owned slots; handles have13 low slot bits. The bridge supplies an
+  explicit context with disjoint generation ranges and serializes its calls.
+  Fixed bind can replace only the whole owned PROT_NONE reservation; failure
+  unmaps/retires the token if cleanup succeeds. Cleanup failure traps3 with a
+  quarantined owner: bind/read/write refuse; mapaddr/drop remain available,
+  and destroy stays busy until drop succeeds. Neither outcome promises to
+  preserve a reservation. An absent table pointer may fault, not status34.
+- **Context ABI revision is DRAFT and requires Drake approval before merge.**
+  It supersedes the unmerged#1040 raw128-slot function-mode format, not an
+  accepted frozen OM-2 feature. The bridge must reject incompatible mapping
+  compiler/runtime fingerprints. Program-mode raw128 slots/eight slot bits,
+  frozen C2 manifest, pure and file/identity units stay unchanged.
 - Every other host word in function mode, any host word in an OM-1 function unit, and any host word for
   another target is error 9.
 - These words do not form a sandbox: a caller that embeds such a unit grants it the file and identity
-  view of its own process, so the omega-bridge refuses a unit that names one unless the caller opts in.
+  view (and, for the device words, the ioctl and mapping view) of its own process, so the omega-bridge refuses a unit that names one unless the caller opts in.
 - Gate: `seed/omc/om2/fnhost/fnhost.cases` with the mutants in `seed/omc/om2/fnhost/mutants.cases`,
   run by `seed/host/check.sh`.

@@ -924,11 +924,23 @@ itself byte for byte. The original subset retains its machine code. The new
 words are reserved and require program mode (error 9 in function mode), with one
 exception: an OM-2 function unit (first line `om2`, no `fn main`) may use the file
 and identity subset `fopen`, `fclose`, `fstat`, `stat`, `lstat`, `getuid`,
-`geteuid`, `getgid` and `getegid` on the AArch64 target. Each of these is an
-inline `svc` with its arguments saved and restored around it; none reads argv,
-the x28 stack floor or a global, and none writes x7 or x19-x28, so a unit called
-through the omega-bridge native ABI keeps its frame. Every other host word, every OM-1 function unit and every
-other target stay error 9 (PROPOSED contract `spec/omegese-om3.md` section 1, gate
+`geteuid`, `getgid` and `getegid`, the clocks `monons`, `realns` and `sleepns`, and
+the device subset `devctl`, `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `devcall`,
+`uvmctl`, `mapaddr`, `mapget`, `mapset`, `maphold` and `mapbind` (`seed/host/MAPPING.md`) on the AArch64
+target. Each of these is an inline `svc` with its arguments saved and restored around
+it; none reads argv, the x28 stack floor or a global, and none writes x7 or x19-x28,
+so a unit called through the omega-bridge native ABI keeps its frame. In function
+mode entry31 points at a32-byte header followed by1..4098 owned32-byte mapping
+slots. The header supplies capacity and nonwrapping generation limits; handles
+have13 low slot bits. The bridge selects an explicit context and serializes
+its calls. Fixed bind replaces only an entire live PROT_NONE reservation in
+that table. Failed bind retires its token on successful cleanup; a cleanup
+failure traps3 and leaves an inaccessible, un-rebindable owner for mapdrop only
+(mapaddr may inspect it). The bridge refuses destroy while it is live.
+Program mode retains its raw128
+slots and eight slot bits. Every other host word, every OM-1 function unit and
+other targets stay error9. This context-format contract is a draft requiring
+Drake approval before merge (PROPOSED `spec/omegese-om3.md` section1, gate
 `seed/omc/om2/fnhost/fnhost.cases`).
 
 All results below have type `long`. Successful kernel results are nonnegative;
@@ -1120,6 +1132,10 @@ foreign-language compiler or runtime is on the new implementation path.
 The proposed device/memory extension adds checked `devctl`, `mapnew`,
 `mapdrop`, `mapread` and `mapwrite` to this same compiler. Its exact type,
 ownership, range and refusal contract is [seed/host/MAPPING.md](../../seed/host/MAPPING.md).
+The draft `devctl` boundary also admits five exact aien-gpu ABI1 request
+numbers, not arbitrary type-A ioctls; changing their direction or encoded
+payload size is refused. See the pinned UAPI and Wolfram-derived matrix there.
+Drake must approve this trust-surface extension before merge.
 It adds process-local mapped resources while the compiler's own storage remains
 fixed pools. GPU launch and model execution are separate, still-unqualified gates.
 
