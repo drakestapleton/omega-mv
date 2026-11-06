@@ -1,0 +1,105 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note One gathered run of the general GEMM (CUDApp#144, src/omega_gpu_gemm_ex.c run_part, scan_bad): n stored elements
+note of type t, packed little-endian in src by the C shell, become core-type elements in dst, or are scanned.
+note ops 0 1 2 (put_core f32 f16 bf16, non-finite as 0), 3 (e4m3 copy, NaN as 0), 4 (FAST_BF16: RNE bf16), 5 6 (the
+note nine bf16x3 planes of A' and B', round16(n) per plane) give the dst elements written; 7 gives 1 when any element is
+note non-finite, 8 sets dst[j] = 1 for every non-finite j; 9 (t = any | rowbad << 1, src the column flags) sets
+note dst[j] = 1 exactly where the epilogue recomputes. Plane tables as nibbles (Wolfram FromDigits of the C TA/TB
+note reversed): TA {2,2,1,2,1,0,1,0,0} 16851234, TB {2,1,2,0,1,2,0,1,0} 270598674.
+
+note the core bits of one element (ops 0 1 2 4)
+fn gx_cv op ulong t ulong u uint to uint
+b = bitcast uint gx_ldf t u
+if not gx_fin b
+ret 0
+end
+if eq op 0
+ret b
+end
+if eq op 1
+ret gx_f2h b
+end
+if eq op 2
+ret shr b 16
+end
+ret gx_f2bf b
+end
+
+note the nine planes of one element: plane (tt >> 4q) & 15 of the split s at q * kp + kk
+fn gx_pl9 tt ulong s ulong kp ulong kk ulong dst edit uchar 65536 to void
+for q ulong 9
+pl = mul and shr tt mul q 4 15 16
+gx_put edit dst add mul q kp kk 2 uint and shr s pl 65535
+end
+end
+
+note ops 5 and 6: plane q of element kk at q * kp + kk, the planes past n zero
+fn gx_x3 tt ulong t ulong n ulong src view uchar 65536 dst edit uchar 65536 to ulong
+kp = mul shr add n 15 4 16
+es = gx_es t
+for kk ulong kp
+s = ulong 0
+if lt kk n
+s = gx_split bitcast uint gx_ldf t gx_get view src kk es
+end
+gx_pl9 tt s kp kk edit dst
+end
+ret mul 9 kp
+end
+
+note ops 7 8 9
+fn gx_scan op ulong t ulong n ulong src view uchar 65536 dst edit uchar 65536 to ulong
+if eq op 9
+for j ulong n
+v = uchar 0
+if ne and t 1 0
+if or ne and t 2 0 ne get src j 0
+v = uchar 1
+end
+end
+put dst j v
+end
+ret n
+end
+es = gx_es t
+for i ulong n
+if gx_bad t gx_get view src i es
+if eq op 7
+ret 1
+end
+put dst i uchar 1
+end
+end
+ret 0
+end
+
+fn gemm_ex_row op ulong t ulong n ulong src view uchar 65536 dst edit uchar 65536 to ulong
+if ge op 7
+ret gx_scan op t n view src edit dst
+end
+if eq op 5
+ret gx_x3 16851234 t n view src edit dst
+end
+if eq op 6
+ret gx_x3 270598674 t n view src edit dst
+end
+if eq op 3
+for i ulong n
+b = get src i
+if eq and b 127 127
+b = uchar 0
+end
+put dst i b
+end
+ret n
+end
+es = gx_es t
+ce = ulong 2
+if eq op 0
+ce = ulong 4
+end
+for i ulong n
+gx_put edit dst i ce gx_cv op t gx_get view src i es
+end
+ret n
+end
