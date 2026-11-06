@@ -1,0 +1,167 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note scan_plan.om: the launch plans of the CUDA++ scans and the radix sort (row C3 of docs/OMEGA.md). Ops 0..4
+note reproduce the C level drivers of src/omega_gpu_scan.c launch for launch (the C stays as the migration-pending
+note differential oracle, CUDAPP_MIGRATION_PENDING_C_SCAN). Each launch runs a kernel of om/scan/scan_ir.om.
+note op 0/1/2 reduce (sum/max/min) n f32 at inva, levels in scratch; 3 inclusive f32 prefix sum inva -> outva;
+note 4 the same over u32; 5 stable LSD radix sort of n u32 keys at inva (in place); 6 the same for key-value pairs
+note ([keys n | values n] at inva). 4-bit digits, 8 passes between inva and the scratch copy, ending in inva.
+note Plan words: 0 launches, 1 scratch words (u32) the plan uses from scrva, 2 the reduce result VA, 3 the shift of
+note the launch being written, 4 overflow; launch i at 16 + 12 i: kind, grid, then the 10 argument words
+note (in lo, in hi, out lo, out hi, tot lo, tot hi, len, tiles, warps, shift).
+note Returns 0 ok, 1 bad arguments, 2 n above 2^28 (or a plan overflow).
+
+const LO32 ulong 4294967295
+const MAXN ulong 268435456
+const MAXL ulong 169
+
+note ceil(len / 32): the 32-element tiles of len
+fn tiles nw ulong to ulong
+ret shr add nw 31 5
+end
+
+note CTAs of 256 threads (8 warps, one tile each per step), at most 1024
+fn grid nw ulong to ulong
+t = shr add tiles nw 7 3
+if eq t 0
+ret 1
+end
+if gt t 1024
+ret 1024
+end
+ret t
+end
+
+fn lau plan edit ulong 2048 k ulong in ulong ov ulong tot ulong nw ulong to void
+i = get plan 0
+if ge i MAXL
+put plan 4 1
+ret
+end
+b = add 16 mul i 12
+g = grid nw
+put plan b k
+put plan add b 1 g
+put plan add b 2 and in LO32
+put plan add b 3 shr in 32
+put plan add b 4 and ov LO32
+put plan add b 5 shr ov 32
+put plan add b 6 and tot LO32
+put plan add b 7 shr tot 32
+put plan add b 8 nw
+put plan add b 9 tiles nw
+put plan add b 10 mul g 8
+put plan add b 11 get plan 3
+put plan 0 add i 1
+end
+
+note one reduction level per launch, each writing its tile results after the last; plan 2 = the result VA
+fn pred plan edit ulong 2048 k ulong n ulong in ulong scr ulong to void
+ov = scr
+go = ulong 1
+w = ulong 0
+for i ulong 8
+if ne go 0
+lau plan k in ov 0 n
+n = tiles n
+in = ov
+ov = add ov mul n 4
+w = add w n
+if le n 1
+go = ulong 0
+end
+end
+end
+put plan 1 w
+put plan 2 in
+end
+
+note an inclusive scan of n words in -> out with the tile kernel tk and the carry kernel tk + 1; level totals from
+note sp; returns the scratch words used
+fn ppre plan edit ulong 2048 tk ulong n ulong in ulong ov ulong sp ulong to ulong
+buf = new ulong 9 0
+ln = new ulong 9 0
+put buf 0 ov
+put ln 0 n
+s0 = sp
+l = ulong 0
+for i ulong 8
+if eq get ln 8 0
+n = tiles get ln l
+lau plan tk in get buf l sp get ln l
+put buf add l 1 sp
+in = sp
+sp = add sp mul n 4
+if eq n 1
+put ln 8 1
+else
+put ln add l 1 n
+l = add l 1
+end
+end
+end
+for i ulong 8
+if gt l 0
+l = sub l 1
+lau plan add tk 1 get buf l get buf add l 1 0 get ln l
+end
+end
+ret shr sub sp s0 2
+end
+
+note radix sort: per pass the digit histogram (cnt[0] = 0, cnt[1 + dig * tiles + tile]), the in-place u32
+note scan of the 16 * tiles counts, then the stable scatter
+note one pass: ks = scatter kind | shift << 8; plan 1 = the sort's scratch words (the copy, cnt, the counts' scan)
+fn pas plan edit ulong 2048 ks ulong src ulong dst ulong cnt ulong n ulong to void
+t16 = mul tiles n 16
+put plan 3 shr ks 8
+lau plan 7 src 0 cnt n
+put plan 3 0
+w = ppre plan 5 t16 add cnt 4 add cnt 4 add cnt mul add t16 1 4
+put plan 3 shr ks 8
+lau plan and ks 255 src dst cnt n
+put plan 3 0
+w = add w add t16 1
+put plan 1 add w mul n sub and ks 255 7
+end
+
+fn psort plan edit ulong 2048 kv ulong n ulong a ulong scr ulong to void
+cnt = add scr mul mul n add kv 1 4
+for p ulong 8
+src = a
+dst = scr
+if ne and p 1 0
+src = scr
+dst = a
+end
+k = shl sub 28 mul p 4 8
+k = or k add 8 kv
+pas plan k src dst cnt n
+end
+end
+
+note ---- entry
+fn scan_plan op ulong n ulong inva ulong outva ulong scrva ulong plan edit ulong 2048 to ulong
+for i ulong 2048
+put plan i 0
+end
+if or gt op 6 eq n 0
+ret 1
+end
+if gt n MAXN
+ret 2
+end
+if le op 2
+pred plan op n inva scrva
+end
+if or eq op 3 eq op 4
+w = ppre plan add 3 mul sub op 3 2 n inva outva scrva
+put plan 1 w
+end
+if ge op 5
+psort plan sub op 5 n inva scrva
+end
+if ne get plan 4 0
+ret 2
+end
+ret 0
+end
