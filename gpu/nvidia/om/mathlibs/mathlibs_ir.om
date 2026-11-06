@@ -7,6 +7,8 @@ note kind 3: Philox4x32-10 counter-based random numbers, the stream of cuRAND's 
 note kind 4: real-FFT split (R2C, after an N/2-point complex FFT) or merge (C2R, before it), N = 2^a (8..4096).
 note kind 5: complex f32 transpose [batch][2^a][2^b] -> [batch][2^b][2^a].
 note kind 6: the pass plan (data) of an R2C, C2R or 1-, 2-, 3-D complex transform over kinds 1, 4 and 5.
+note kinds 7..13: any-length FFT for cufftPlanMany: mixed-radix (2, 3, 4, 5, 7) Stockham passes, Bluestein steps,
+note strided gather / scatter copy, and their data (twiddles of any n, chirp, factor plan, magic divisor).
 note The algorithms are the public-domain xoshiro256** and SplitMix64 (Blackman and Vigna), Philox4x32-10
 note (Salmon, Moraes, Dror and Shaw, SC'11) and the Stockham FFT; the xoshiro stream matches aien-math
 note src/stats/random.om bit for bit and the Philox stream the Random123 known answers (fixtures in tests/).
@@ -973,11 +975,11 @@ end
 ret or ulong bitcast uint fr shl ulong bitcast uint fi 32
 end
 
-note w^k = exp(+-2 pi i k / n): 4k = q n + r; angle (pi/2) r / n, folded to (pi/2) (n - r) / n with cos and
-note sin swapped when r > n/2, so the series only sees [0, pi/4]
-fn tw1 k ulong lg ulong dir ulong to ulong
-n = shl 1 lg
-q = shr mul k 4 lg
+note w^k = exp(+-2 pi i k / n), any n >= 1, k < n: 4k = q n + r; angle (pi/2) r / n, folded to (pi/2) (n - r) / n
+note with cos and sin swapped when r > n/2, so the series only sees [0, pi/4] (for n = 2^lg the same bits as the
+note shift form the power-of-two kernels used before kinds 7..13 existed)
+fn twg k ulong n ulong dir ulong to ulong
+q = div mul k 4 n
 r = sub mul k 4 mul q n
 sw = gt r shr n 1
 if sw
@@ -994,10 +996,9 @@ end
 ret tq q c s dir
 end
 
-fn twid ins edit ulong 8192 lg ulong dir ulong to void
-n = shl 1 lg
+fn twid ins edit ulong 8192 n ulong dir ulong to void
 for k ulong n
-put ins k tw1 k lg dir
+put ins k twg k n dir
 end
 end
 
@@ -1838,11 +1839,563 @@ end
 ret plann ins nd b c
 end
 
+note ---- kinds 7..13: general-length FFT (cufftPlanMany). Kind 7 is one Stockham radix-R pass (R 2, 3, 4, 5, 7),
+note kind 8 the four Bluestein steps (any other length through a power-of-two M >= 2N - 1), kind 9 the strided
+note gather / scatter / rotate copy, kinds 10..13 their data (twiddles of any n, chirp, factor plan, magic divisor).
+note The kernels run 128 threads per CTA, one butterfly or element per thread, chunked by a 'first' word like kind 5.
+note Every launch passes np 64-bit pointers at 0x380 + 8 i, then 32-bit words: word 0 total, word 1 first, ...
+const LDGE ulong 11
+const SGN ulong 2147483648
+
+note d = a * b + c (IMAD register form, low 32 bits); c may be NONE (zero)
+fn imr ins edit ulong 8192 m edit ulong 512 a ulong b ulong c ulong to ulong
+d = nv m 1
+ef ins m IMAD r4 d a b c 0
+ret d
+end
+
+note 32-bit global load (LDG.E) of [a]
+fn g32 ins edit ulong 8192 m edit ulong 512 a ulong u ulong to ulong
+d = nv m 1
+emit ins m okk LDGE KVAR 0 u r4 d a NONE NONE 0
+ret d
+end
+
+note x div d and x mod d for x < 2^32, 1 <= d < 2^31, mg = min(floor(2^32 / d), 2^32 - 1), nd = 2^32 - d:
+note q0 = hi32(x mg) is q - 1 or q; t = x - (q0 + 1) d is r - d < 0 (q0 = q) or r >= 0 (q0 = q - 1), so
+note inc = (~t) >> 31, q = q0 + inc, r = x - q d. Returns p2 q r.
+fn mdiv ins edit ulong 8192 m edit ulong 512 x ulong d ulong mg ulong to ulong
+nd = imi ins m d M1 NONE
+q = fo ins m IMADHI x mg
+t = fo ins m IADD3 imr ins m q nd x nd
+i = sh ins m lut ins m t t NONE 15 31
+q = fo ins m IADD3 q i
+ret p2 q imr ins m q nd x
+end
+
+note G: 0 ureg desc, 1..3 pointers, 4 + w word w; returns g = ctaid 128 + tid + first after the exit on g >= total
+fn kpro ins edit ulong 8192 m edit ulong 512 G edit ulong 32 np ulong nw ulong to ulong
+u = nu m 2
+put G 0 u
+emit ins m okk LDCU64 KUVAR 1 NONE r4 u NONE NONE NONE 856
+for i ulong np
+put G add 1 i vl ins m LDC64 2 NONE add 896 mul i 8
+end
+b = add 896 mul np 8
+for j ulong nw
+put G add 4 j vl ins m LDC 1 NONE add b mul j 4
+end
+c = vl ins m S2R 1 NONE 37
+t = vl ins m S2R 1 NONE 33
+g = fo ins m IADD3 imi ins m c 128 get G 5 t
+isge ins m g get G 4
+exitp ins m
+ret g
+end
+
+note ---- kind 7: one Stockham pass, radix R = a (2, 3, 4, 5, 7), b 0 forward / 1 inverse, c mutant (1 the
+note butterfly runs the other direction, 2 drops the twiddle multiply). Pointers 0x380 in, 0x388 out, 0x390
+note twiddles of N in the transform's direction. Words: 0 T butterflies, 1 first, 2 NR = N / R, 3 magic NR, 4 Ns,
+note 5 magic Ns, 6 s = N / (Ns R), 7 N. Butterfly g: row, j = g divmod NR; k = j mod Ns; v_r = in[row N + j + r NR]
+note times w^(r k s); X_m = sum_r v_r exp(-+2 pi i r m / R) goes to out[row N + R j - (R - 1) k + m Ns].
+note G 20 row, 21 j, 22 k.
+note radix constants (Wolfram, f32 round-to-nearest bits): cos and sin of 2 pi j / R; s 0 cos, 1 sin
+fn rcv R ulong j ulong s ulong to ulong
+if eq R 3
+if eq s 0
+ret 3204448256
+end
+ret 1063105495
+end
+if eq R 5
+if eq j 1
+if eq s 0
+ret 1050556282
+end
+ret 1064532081
+end
+if eq s 0
+ret 3209632701
+end
+ret 1058437400
+end
+if eq j 1
+if eq s 0
+ret 1059036423
+end
+ret 1061692956
+end
+if eq j 2
+if eq s 0
+ret 3194215559
+end
+ret 1064932576
+end
+if eq s 0
+ret 3211175397
+end
+ret 1054746114
+end
+
+note G 23 = address of in[row N + j], 24 = k s; V 2r, 2r + 1 = the twiddled inputs (operand refs)
+fn rld1 ins edit ulong 8192 m edit ulong 512 G view ulong 32 V edit ulong 16 r ulong mut ulong to void
+a = get G 23
+if gt r 0
+a = imw ins m get G 6 mul r 8 a
+end
+w = gl ins m a 0 get G 0
+re = sb w 0
+im = sb w 1
+if gt r 0
+if ne mut 2
+a = imw ins m get G 24 mul r 8 get G 3
+a = gl ins m a 0 get G 0
+a = cmw ins m re im a
+re = and a 65535
+im = shr a 16
+end
+end
+put V mul r 2 re
+put V add 1 mul r 2 im
+end
+
+fn rld7 ins edit ulong 8192 m edit ulong 512 G edit ulong 32 V edit ulong 16 R ulong mut ulong to void
+a = imw ins m imr ins m get G 20 get G 11 get G 21 8 get G 1
+put G 23 a
+if ne mut 2
+e = imr ins m get G 22 get G 10 NONE
+put G 24 e
+end
+for r ulong R
+rld1 ins m view G edit V r mut
+end
+end
+
+fn dr2 ins edit ulong 8192 m edit ulong 512 V view ulong 16 Y edit ulong 16 to void
+put Y 0 fo ins m FADD get V 0 get V 2
+put Y 1 fo ins m FADD get V 1 get V 3
+put Y 2 fo ins m FSUB get V 0 get V 2
+put Y 3 fo ins m FSUB get V 1 get V 3
+end
+
+note X0 = s02 + s13, X2 = s02 - s13; forward X1 = d02 - i d13, X3 = d02 + i d13 (inverse swaps X1, X3)
+fn dr4 ins edit ulong 8192 m edit ulong 512 V view ulong 16 Y edit ulong 16 fw ulong to void
+a0 = fo ins m FADD get V 0 get V 4
+a1 = fo ins m FADD get V 1 get V 5
+b0 = fo ins m FADD get V 2 get V 6
+b1 = fo ins m FADD get V 3 get V 7
+put Y 0 fo ins m FADD a0 b0
+put Y 1 fo ins m FADD a1 b1
+put Y 4 fo ins m FSUB a0 b0
+put Y 5 fo ins m FSUB a1 b1
+a0 = fo ins m FSUB get V 0 get V 4
+a1 = fo ins m FSUB get V 1 get V 5
+b0 = fo ins m FSUB get V 2 get V 6
+b1 = fo ins m FSUB get V 3 get V 7
+k = ulong 2
+l = ulong 6
+if eq fw 0
+k = 6
+l = 2
+end
+put Y k fo ins m FADD a0 b1
+put Y add k 1 fo ins m FSUB a1 b0
+put Y l fo ins m FSUB a0 b1
+put Y add l 1 fo ins m FADD a1 b0
+end
+
+note odd R, h = (R - 1) / 2. Work array W: 0..15 the inputs v (re, im refs); 16 + 2r, 17 + 2r = a_r = v_r + v_(R-r);
+note 24 + 2r, 25 + 2r = b_r = v_r - v_(R-r); 32 + j cos, 36 + j sin, 40 + j -sin of 2 pi j / R (j <= h);
+note 48 R, 49 forward flag, 50..53 the running P re, P im, Q re, Q im.
+fn dpre ins edit ulong 8192 m edit ulong 512 W edit ulong 64 to void
+R = get W 48
+h = shr sub R 1 1
+for i ulong h
+r = add i 1
+p = mul r 2
+q = mul sub R r 2
+put W add p 16 fo ins m FADD get W p get W q
+put W add p 17 fo ins m FADD get W add p 1 get W add q 1
+put W add p 24 fo ins m FSUB get W p get W q
+put W add p 25 fo ins m FSUB get W add p 1 get W add q 1
+put W add r 32 mov ins m rcv R r 0
+put W add r 36 mov ins m rcv R r 1
+put W add r 40 mov ins m add rcv R r 1 SGN
+end
+end
+
+note one term r = i + 1 of output m: P += a_r C(rm), Q += b_r S(rm), with C(j) = C(R - j), S(j) = -S(R - j) for j > h
+fn dterm ins edit ulong 8192 m edit ulong 512 W edit ulong 64 mm ulong i ulong to void
+R = get W 48
+h = shr sub R 1 1
+r = mul add i 1 2
+j = mul add i 1 mm
+j = sub j mul div j R R
+s = ulong 36
+if gt j h
+j = sub R j
+s = 40
+end
+put W 50 ffm ins m get W add r 16 get W add j 32 get W 50
+put W 51 ffm ins m get W add r 17 get W add j 32 get W 51
+if eq i 0
+put W 52 fo ins m FMUL get W add r 24 get W add j s
+put W 53 fo ins m FMUL get W add r 25 get W add j s
+ret
+end
+put W 52 ffm ins m get W add r 24 get W add j s get W 52
+put W 53 ffm ins m get W add r 25 get W add j s get W 53
+end
+
+note forward X_m = (Pr + Qi, Pi - Qr), X_(R-m) = (Pr - Qi, Pi + Qr); inverse swaps them
+fn dodm ins edit ulong 8192 m edit ulong 512 W edit ulong 64 Y edit ulong 16 mm ulong to void
+R = get W 48
+put W 50 get W 0
+put W 51 get W 1
+for i ulong shr sub R 1 1
+dterm ins m edit W mm i
+end
+k = mm
+l = sub R mm
+if eq get W 49 0
+k = sub R mm
+l = mm
+end
+put Y mul k 2 fo ins m FADD get W 50 get W 53
+put Y add 1 mul k 2 fo ins m FSUB get W 51 get W 52
+put Y mul l 2 fo ins m FSUB get W 50 get W 53
+put Y add 1 mul l 2 fo ins m FADD get W 51 get W 52
+end
+
+note W 54, 55 = X_0 = v_0 + sum a_r
+fn dsum ins edit ulong 8192 m edit ulong 512 W edit ulong 64 to void
+put W 54 get W 0
+put W 55 get W 1
+for i ulong shr sub get W 48 1 1
+r = mul add i 1 2
+put W 54 fo ins m FADD get W 54 get W add r 16
+put W 55 fo ins m FADD get W 55 get W add r 17
+end
+end
+
+fn dodd ins edit ulong 8192 m edit ulong 512 V view ulong 16 Y edit ulong 16 R ulong fw ulong to void
+W = new ulong 64 0
+for i ulong 16
+put W i get V i
+end
+put W 48 R
+put W 49 fw
+dpre ins m edit W
+dsum ins m edit W
+put Y 0 get W 54
+put Y 1 get W 55
+for i ulong shr sub R 1 1
+dodm ins m edit W edit Y add i 1
+end
+end
+
+fn rst7 ins edit ulong 8192 m edit ulong 512 G view ulong 32 Y view ulong 16 R ulong to void
+u = get G 0
+t = imi ins m get G 22 sub 4294967296 sub R 1 NONE
+t = imi ins m get G 21 R t
+oa = imw ins m imr ins m get G 20 get G 11 t 8 get G 2
+for k ulong R
+a = oa
+if gt k 0
+a = imw ins m get G 8 mul k 8 oa
+end
+stg ins m a get Y mul k 2 0 u
+stg ins m a get Y add 1 mul k 2 4 u
+end
+end
+
+fn rpk ins edit ulong 8192 m edit ulong 512 R ulong dir ulong mut ulong to void
+G = new ulong 32 0
+V = new ulong 16 0
+Y = new ulong 16 0
+g = kpro ins m edit G 3 8
+x = mdiv ins m g get G 6 get G 7
+put G 20 and x 65535
+put G 21 shr x 16
+x = mdiv ins m shr x 16 get G 8 get G 9
+put G 22 shr x 16
+rld7 ins m edit G edit V R mut
+fw = eq dir 0
+if eq mut 1
+fw = ne dir 0
+end
+f = ulong 0
+if fw
+f = 1
+end
+if eq R 2
+dr2 ins m view V edit Y
+end
+if eq R 4
+dr4 ins m view V edit Y f
+end
+if eq and R 1 1
+dodd ins m view V edit Y R f
+end
+rst7 ins m view G view Y R
+tail ins m
+end
+
+note ---- kind 8: Bluestein steps over rows of M = 2^b (b 5..13); a variant, c mutant. Pointers 0x380 src,
+note 0x388 dst, 0x390 aux; words 0 total, 1 first, 2 N. g = row M + n.
+note a 0 pre: dst[g] = 0, then for n < N dst[g] = src[row N + n] chirp[n] (mutant 1: no chirp);
+note a 1 mul: dst[g] = src[g] B[n] (in place allowed);
+note a 2 post: for n < N dst[row N + n] = src[g] chirp[n] 2^-b (mutant 2: no 2^-b);
+note a 3 B build over g < M: j = min(g, M - g); dst[g] = conj chirp[j] for j < N, else 0.
+note chirp[n] = exp(-+i pi n^2 / N) (kind 11). G 20 n, 21 row.
+fn bpre ins edit ulong 8192 m edit ulong 512 G view ulong 32 g ulong mut ulong to void
+wa = imw ins m g 8 get G 2
+x = mov ins m 0
+stg ins m wa x 0 get G 0
+stg ins m wa x 4 get G 0
+isge ins m get G 20 get G 6
+exitp ins m
+x = imr ins m get G 21 get G 6 get G 20
+x = gl ins m imw ins m x 8 get G 1 0 get G 0
+p = p2 sb x 0 sb x 1
+if ne mut 1
+p = gl ins m imw ins m get G 20 8 get G 3 0 get G 0
+p = cmw ins m sb x 0 sb x 1 p
+end
+stg ins m wa and p 65535 0 get G 0
+stg ins m wa shr p 16 4 get G 0
+end
+
+fn bmul ins edit ulong 8192 m edit ulong 512 G view ulong 32 g ulong to void
+e = gl ins m imw ins m g 8 get G 1 0 get G 0
+p = gl ins m imw ins m get G 20 8 get G 3 0 get G 0
+p = cmw ins m sb e 0 sb e 1 p
+e = imw ins m g 8 get G 2
+stg ins m e and p 65535 0 get G 0
+stg ins m e shr p 16 4 get G 0
+end
+
+fn bpost ins edit ulong 8192 m edit ulong 512 G view ulong 32 g ulong lg ulong mut ulong to void
+isge ins m get G 20 get G 6
+exitp ins m
+e = gl ins m imw ins m g 8 get G 1 0 get G 0
+p = gl ins m imw ins m get G 20 8 get G 3 0 get G 0
+p = cmw ins m sb e 0 sb e 1 p
+re = and p 65535
+im = shr p 16
+if ne mut 2
+e = mov ins m shl sub 127 lg 23
+re = fo ins m FMUL re e
+im = fo ins m FMUL im e
+end
+e = imr ins m get G 21 get G 6 get G 20
+e = imw ins m e 8 get G 2
+stg ins m e re 0 get G 0
+stg ins m e im 4 get G 0
+end
+
+fn bbld ins edit ulong 8192 m edit ulong 512 G view ulong 32 g ulong lg ulong to void
+wa = imw ins m g 8 get G 2
+c = mov ins m 0
+stg ins m wa c 0 get G 0
+stg ins m wa c 4 get G 0
+c = imi ins m g M1 mov ins m shl 1 lg
+d = imi ins m c M1 g
+d = imr ins m sh ins m d 31 d c
+isge ins m d get G 6
+exitp ins m
+c = gl ins m imw ins m d 8 get G 3 0 get G 0
+stg ins m wa sb c 0 0 get G 0
+d = mov ins m SGN
+stg ins m wa fo ins m LXOR sb c 1 d 4 get G 0
+end
+
+fn bsk ins edit ulong 8192 m edit ulong 512 v ulong lg ulong mut ulong to void
+G = new ulong 32 0
+g = kpro ins m edit G 3 3
+if eq v 3
+bbld ins m view G g lg
+tail ins m
+ret
+end
+put G 20 andi ins m g sub shl 1 lg 1
+put G 21 sh ins m g lg
+if eq v 0
+bpre ins m view G g mut
+end
+if eq v 1
+bmul ins m view G g
+end
+if eq v 2
+bpost ins m view G g lg mut
+end
+tail ins m
+end
+
+note ---- kind 9: strided copy of total elements, a mode (0 complex, 1 real -> complex with im 0, 2 complex -> real
+note part, 3 complex conjugated), c mutant (1 drops the conjugate, 2 drops the source batch stride). Pointers 0x380
+note src, 0x388 dst. Words: 0 total, 1 first, 2 d0, 3 magic d0, 4 d1, 5 magic d1, 6 d2, 7 magic d2, 8 sbase, 9 sb,
+note 10 s0, 11 s1, 12 s2, 13 dbase, 14 db, 15 t0, 16 t1, 17 t2. Element g = ((b d2 + i2) d1 + i1) d0 + i0 reads
+note src[sbase + b sb + i2 s2 + i1 s1 + i0 s0] and writes dst[dbase + b db + i2 t2 + i1 t1 + i0 t0]; index
+note arithmetic is mod 2^32, so a stride may be negative (2^32 - s) when the final index is in range.
+note G 24 i0, 25 i1, 26 i2, 27 b.
+fn cidx ins edit ulong 8192 m edit ulong 512 G view ulong 32 o ulong mut ulong to ulong
+s = imr ins m get G 24 get G add o 2 get G o
+s = imr ins m get G 25 get G add o 3 s
+s = imr ins m get G 26 get G add o 4 s
+if ne mut 2
+s = imr ins m get G 27 get G add o 1 s
+end
+ret s
+end
+
+note G 28 source index, 29 destination index
+fn cmv ins edit ulong 8192 m edit ulong 512 G view ulong 32 mode ulong mut ulong to void
+u = get G 0
+if eq mode 1
+v = g32 ins m imw ins m get G 28 4 get G 1 u
+da = imw ins m get G 29 8 get G 2
+stg ins m da v 0 u
+stg ins m da mov ins m 0 4 u
+ret
+end
+w = gl ins m imw ins m get G 28 8 get G 1 0 u
+if eq mode 2
+stg ins m imw ins m get G 29 4 get G 2 sb w 0 0 u
+ret
+end
+im = sb w 1
+if eq mode 3
+if ne mut 1
+im = fo ins m LXOR im mov ins m SGN
+end
+end
+da = imw ins m get G 29 8 get G 2
+stg ins m da sb w 0 0 u
+stg ins m da im 4 u
+end
+
+fn cpk ins edit ulong 8192 m edit ulong 512 mode ulong mut ulong to void
+G = new ulong 32 0
+g = kpro ins m edit G 2 18
+x = mdiv ins m g get G 6 get G 7
+put G 24 shr x 16
+x = mdiv ins m and x 65535 get G 8 get G 9
+put G 25 shr x 16
+x = mdiv ins m and x 65535 get G 10 get G 11
+put G 26 shr x 16
+put G 27 and x 65535
+s = cidx ins m view G 12 mut
+put G 28 s
+s = cidx ins m view G 17 0
+put G 29 s
+cmv ins m view G mode mut
+tail ins m
+end
+
+note ---- kinds 10..13 (data). 10: twiddles w^k, k < a (a 2..8192), b direction. 11: chirp exp(-+i pi n^2 / a),
+note n < a (a 2..4096), b direction, as w^(n^2 mod 2a) of 2a. 12: factor plan of a (2..4096): word 0 the pass length
+note M, 1 Bluestein flag, 2 passes, 3.. radices (4s, one 2, 3s, 5s, 7s); a length with another prime factor runs
+note Bluestein on M = the least power of two >= 2a - 1. 13: word 0 = magic min(floor(2^32 / a), 2^32 - 1), a 1..2^31-1.
+fn chirp ins edit ulong 8192 n ulong dir ulong to void
+t = mul n 2
+for i ulong n
+s = mul i i
+put ins i twg sub s mul div s t t t dir
+end
+end
+
+fn fpr ins edit ulong 8192 x ulong R ulong lim ulong to ulong
+y = x
+for i ulong lim
+if eq sub y mul div y R R 0
+k = get ins 2
+put ins add 3 k R
+put ins 2 add k 1
+y = div y R
+end
+end
+ret y
+end
+
+fn fpl ins edit ulong 8192 n ulong to ulong
+if or lt n 2 gt n 4096
+ret 1
+end
+for i ulong 32
+put ins i 0
+end
+put ins 0 n
+x = fpr ins n 4 6
+x = fpr ins x 2 1
+x = fpr ins x 3 7
+x = fpr ins x 5 5
+x = fpr ins x 7 4
+if eq x 1
+ret 0
+end
+mm = ulong 1
+for i ulong 14
+if lt mm sub mul n 2 1
+mm = mul mm 2
+end
+end
+for i ulong 32
+put ins i 0
+end
+put ins 0 mm
+put ins 1 1
+x = fpr ins mm 4 7
+x = fpr ins x 2 1
+ret 0
+end
+
+fn gdata ins edit ulong 8192 kind ulong a ulong b ulong c ulong to ulong
+if ne c 0
+ret 1
+end
+if eq kind 10
+if or or lt a 2 gt a 8192 gt b 1
+ret 1
+end
+twid ins a b
+ret 0
+end
+if eq kind 11
+if or or lt a 2 gt a 4096 gt b 1
+ret 1
+end
+chirp ins a b
+ret 0
+end
+if ne b 0
+ret 1
+end
+if gt kind 13
+ret 1
+end
+if eq kind 12
+x = fpl ins a
+ret x
+end
+if or lt a 1 gt a 2147483647
+ret 1
+end
+put ins 0 M1
+if gt a 1
+put ins 0 div PW1 a
+end
+ret 0
+end
+
 note ---- entry. kind 0 RNG (a variant 0..2, b 0, c mutant 0..2); kind 1 FFT (a log2 n 2..11, b direction
 note 0 forward / 1 inverse, c mutant 0..2); kind 2 twiddles (a log2 n 2..12, b direction, c 0); kind 3 Philox
 note distributions (a distribution 0..4, b offset mod 4, c mutant 0..6); kind 4 real-FFT split / merge (a log2 N
 note 3..12, b 0 split / 1 merge, c mutant 0..2);
-note kind 5 transpose (a log2 R 2..25, b log2 C 2..11, a + b <= 27, c mutant 0..2); kind 6 pass plan (data).
+note kind 5 transpose (a log2 R 2..25, b log2 C 2..11, a + b <= 27, c mutant 0..2); kind 6 pass plan (data);
+note kind 7 Stockham pass (a radix 2, 3, 4, 5, 7, b direction, c mutant 0..2); kind 8 Bluestein step (a variant
+note 0..3, b log2 M 5..13, c mutant 0..2); kind 9 strided copy (a mode 0..3, b 0, c mutant 0..2); kinds 10..13
+note data (twiddles of any n, chirp, factor plan, magic divisor).
 note Returns 0 built, 1 refused arguments, 2 emitter error (meta 4 holds the code).
 fn mathlibs_ir kind ulong a ulong b ulong c ulong ins edit ulong 8192 meta edit ulong 512 to ulong
 for i ulong 512
@@ -1852,8 +2405,11 @@ if eq kind 2
 if or or lt a 2 gt a 12 or gt b 1 ne c 0
 ret 1
 end
-twid ins a b
+twid ins shl 1 a b
 ret 0
+end
+if gt kind 9
+ret gdata ins kind a b c
 end
 if eq kind 6
 ret plan ins a b c
@@ -1891,7 +2447,25 @@ ret 1
 end
 trk ins meta a b c
 end
-if gt kind 5
+if eq kind 7
+if or or gt c 2 gt b 1 or or lt a 2 gt a 7 eq a 6
+ret 1
+end
+rpk ins meta a b c
+end
+if eq kind 8
+if or or gt a 3 gt c 2 or lt b 5 gt b 13
+ret 1
+end
+bsk ins meta a b c
+end
+if eq kind 9
+if or or gt a 3 ne b 0 gt c 2
+ret 1
+end
+cpk ins meta a c
+end
+if gt kind 9
 ret 1
 end
 if ne get meta 4 0
