@@ -18,6 +18,8 @@ bootstrap and test orchestration remain disclosed development tools.
 | `vfioctl fd request A off n` | Literal VFIO request from the allowlist below, with its exact byte count. Signed Linux ioctl result. `fd` is int; `request` a literal uint; `A` uchar bytes. |
 | `vfiomap fd A off 32` | Read-only shared mapping of one VFIO region. `A off 32` is the `vfio_region_info` returned by `DEVICE_GET_REGION_INFO`; its flags must contain READ and MMAP, and the compiler maps exactly its size at its offset. Returns a mapping handle or negative errno. `mapset`/`mapwrite` through the handle trap. |
 | `vfiomapw fd A off 32` | As `vfiomap`, but the region flags must contain READ, WRITE and MMAP and the mapping is shared read/write, so `mapget`/`mapset` drive device registers (one aligned access each, DSB SY on both sides). |
+| `eventfd initial` | `initial` is uint. Creates Linux eventfd2 with CLOEXEC and NONBLOCK, no semaphore mode; returns long fd or negative errno. Use existing `read`/`write` with exactly eight bytes, `waitio`/`pollfds` for readiness, and `fclose` for close. |
+| `vfioirq fd request A off n` | `fd` is int acquired by successful `vfioctl GROUP_GET_DEVICE_FD`; request is literal uint15213 (GET_IRQ_INFO) or15214 (SET_IRQS). A is writable uchar bytes, offsets/counts ulong. Checks exact caller-supplied argsz and the bounded IRQ contract below. Returns signed Linux ioctl result. |
 | `mapaddr handle` | The owned live mapping's base address as ulong, for driver address serialization. Does not permit access through an arbitrary integer address. Works on reservations. |
 | `mapget handle offset width` | Aligned uint32 or uint64 load, returned as ulong; width is literal int4 or8. Exactly one load, bracketed by DSB SY. Requires readable memory. |
 | `mapset handle offset width value` | Aligned uint32 or uint64 store from ulong, returning long0; width is literal int4 or8. A uint32 store refuses truncation. Exactly one store, bracketed by DSB SY. Requires writable memory. |
@@ -76,10 +78,70 @@ more the compiler writes `argsz = n` before the call, so the kernel copies at mo
 n bytes back. CHECK_EXTENSION and SET_IOMMU pass the 4-byte value read from the
 span. Every other request, a non-literal request, a non-uchar span or library
 mode is refused at compile time; a wrong count, a bad SET_IOMMU value or an empty
-device name traps 3 at run time. IRQ, reset and migration
-requests are not covered. Note that closing a vfio-pci device fd lets Linux reset the
-function (FLR) or, when every reset method is disabled, the bus (SBR); the allowlist
-cannot prevent that kernel behaviour.
+device name traps 3 at run time. IRQ requests use the separate `vfioirq` word
+below; reset and migration remain excluded. Note that closing a vfio-pci device
+fd lets Linux reset the function (FLR) or, when every reset method is disabled,
+the bus (SBR); the allowlist cannot prevent that kernel behaviour.
+
+### Typed IRQ and eventfd extension
+
+This profile extends compiler base `397e67040fb74853c6814097fe02ae4e1ebd6f66`
+(the driver pin). It emits AArch64 Linux syscalls directly. That source revision
+has no hosted x86 VFIO lowering; this extension does not imply x86 support.
+
+`vfioirq GET_IRQ_INFO` requires exactly16 bytes and an argsz field equal to16.
+The caller supplies flags/index/count bytes; Linux validates the IRQ index and
+reports capabilities. No capability chain beyond the fixed header is admitted.
+`SET_IRQS` accepts only these exact forms (all fields are Linux little-endian):
+
+| flags | count and payload |
+| --- | --- |
+| DATA_EVENTFD \| ACTION_TRIGGER =36 | count1..64; n =20+4*count, argsz=n. Each signed32 payload fd is a live eventfd created by `eventfd`, or -1 to deassign that vector. |
+| DATA_NONE \| ACTION_TRIGGER =33 | count0, start0, argsz=n=20; disables the selected IRQ index. |
+| DATA_NONE \| ACTION_MASK =9 or ACTION_UNMASK =17 | count1..64, argsz=n=20; no payload. The driver must first check GET_IRQ_INFO's MASKABLE capability; Linux enforces the device's masking support. The compiler does not invent that capability. |
+
+For every SET form, start+count must fit uint32. Index selection and actual
+device vector bounds remain kernel checks. Other flags, mismatched argsz,
+oversized counts and malformed payload sizes trap3 (exit103) before ioctl.
+Unlike older `vfioctl` records, `vfioirq` validates argsz rather than overwriting it.
+There is no DATA_BOOL, userspace trigger-without-eventfd, arbitrary ioctl or
+arbitrary syscall escape hatch.
+
+A separate private128-slot descriptor-kind table is keyed by the complete int
+fd, not indexed by its numeric magnitude. GET_DEVICE_FD and eventfd reserve a
+slot *before* their acquisition syscall; table exhaustion returns -24 without
+acquiring or closing a resource. Only successful acquisitions get a kind tag.
+`fclose` retires its tag before calling Linux, even when close returns an error.
+A successful `dupfd` (dup3) retires the destination tag; failed duplication leaves
+it unchanged. Duplication does not propagate tags. Helpers compiled before the
+first acquisition use the same table. Fork inherits the table; exec creates a
+new program table, and new eventfds have CLOEXEC.
+
+These are current-descriptor kind checks, not generation handles or an isolation
+boundary. Kernel fd-number reuse can make a stale integer name a newly acquired
+resource. Do not retain stale descriptors. Successful GET_DEVICE_FD is trusted
+under Linux's VFIO group-fd contract, not an authentication proof for arbitrary
+inherited descriptors or a malicious kernel. A raw/inherited device or eventfd
+is not admitted by `vfioirq`. Closing an eventfd does not explicitly deassign
+its VFIO IRQ registration: the driver must deassign/disable before closing the
+eventfd and device, then observe its normal channel quiescence contract.
+
+NONBLOCK prevents an empty eventfd read from blocking indefinitely; EAGAIN is
+returned unchanged. CLOEXEC prevents incidental eventfd inheritance across exec.
+Readiness, eventfd write/read success and the host fixture are not GPU completion
+or physical interrupt-delivery evidence. Kernel errors remain signed errno.
+
+Run `taskset -c 10-14 nice -n 10 sh seed/host/irq.sh` after the seed fixpoint.
+The GCC UAPI layout oracle compares C and Omega serialized records byte for byte.
+The ptrace fixture executes real ioctls against a memfd (ENOTTY); only the
+GROUP_GET_DEVICE_FD return is replaced to exercise the admitted-kind path.
+It checks actual syscall arguments and errno, descriptor invalidation, high
+numeric fds and capacity before acquisition. It never opens a VFIO/NVIDIA device.
+QEMU user-mode checks a VFIO-less refusal and translated eventfd behavior; it
+is not system-emulator VFIO delivery or hardware qualification. Compiler mutants
+must compile and execute and then be killed by the independent runtime oracle.
+Real VFIO IRQ delivery is NOT_RUN until Drake authorizes a hardware window.
+
 
 DMA: IOMMU_MAP_DMA15217/32 (`struct vfio_iommu_type1_dma_map`, vfio.h) never
 takes an address from Omega code. The caller writes an Omega mapping handle into

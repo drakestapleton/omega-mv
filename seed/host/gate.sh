@@ -80,6 +80,7 @@ compile vfio
 compile vfiocheck
 (cd "$stage"; ./vfiocheck "$OMC")
 test ! -e "$stage/case.om"
+sh seed/host/irq.sh
 compile structfile
 (cd "$stage"; ./structfile)
 test ! -e "$stage/structfile.tmp"
