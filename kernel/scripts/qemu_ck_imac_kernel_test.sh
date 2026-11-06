@@ -34,6 +34,10 @@
 # writable and executable, NXE and WP on every core). Three TEST-ONLY mutant builds
 # (IMACKERN_WX_MUTANT=no_nx, =text_writable at -smp 1; =ap_no_wp, secondary cores
 # without CR0.WP, at -smp 4) must make those checks panic.
+# TLB shootdown (#485): each run must show every secondary core's stale writable
+# and stale present translation of a page gone after the boot core made it
+# read-only and then unmapped it; the TEST-ONLY mutant no_shootdown (invlpg on the
+# boot core only, -smp 4) must make that probe panic.
 # The kernel's report reaches the serial log through COM1, which QEMU has and the
 # iMac does not. Needs qemu-system-x86_64, OVMF, mtools and an x86_64 gcc. Final line:
 #     AIENOS_IMAC_KERNEL: PASS|FAIL|NOT_RUN [(...)]      exit 0 / 1 / 2 (tools) / 3 (NOT_RUN)
@@ -135,6 +139,7 @@ run() { # name, -cpu model, expected APIC mode
     chk "${name}: data disk identified" "${txt}" "^ahci_disk: ctrl=0 disk=1 port=1 link=gen[0-9] model=\"QEMU HARDDISK\" blocks=131072 block=512 mib=64 access=read-only\$"
     chk "${name}: data disk AIENOS partition where written" "${txt}" "^ahci_gpt: ctrl=0 disk=1 gpt=valid used=3 aienos first_lba=${a_first} last_lba=${a_last}\$"
     chk "${name}: three secondary cores started, drawing the night" "${txt}" "^smp: cpus=4 started=3 failed=0 bsp_id=0 ap_ids=[0-9]+,[0-9]+,[0-9]+ trampoline=0x[0-9a-f]+ state=drawing helpers=[0-2]\$"
+    chk "${name}: TLB shootdown reaches every secondary core" "${txt}" '^tlb_shootdown: ok cores=3 stale_write_allowed=0 stale_read_allowed=0 shootdowns=14 acks=36$'
     chk "${name}: NVMe controller found" "${txt}" "^pci: nvme [0-9a-f:.]+ id=1b36:0010 "
     chk "${name}: NVMe disk identified" "${txt}" "^nvme_disk: ctrl=0 disk=0 version=1\\.[0-9]+ nsid=1 blocks=65536 block=512 mib=32 access=read-only\$"
     chk "${name}: NVMe AIENOS partition where written" "${txt}" "^nvme_gpt: ctrl=0 disk=0 gpt=valid used=3 aienos first_lba=${n_first} last_lba=${n_last}\$"
@@ -175,8 +180,8 @@ run() { # name, -cpu model, expected APIC mode
 }
 run max max xapic
 run qemu64 qemu64 xapic
-# W^X negative controls: the probes run before the clock is measured, so a mutant's
-# panic halts instead of powering off; wait for the panic line, then stop QEMU.
+# W^X and TLB negative controls: the W^X probes run before the clock is measured, so
+# a mutant's panic may halt instead of powering off; wait for the panic line, then stop QEMU.
 mutant() { # IMACKERN_WX_MUTANT value, expected panic pattern, QEMU core count (default 1)
     local m="$1" mo="${out}-wx-$1" mi="${work}/wx-$1.img" log="${work}/wx-$1.log" hit=0 smp="${3:-1}"
     make -s -C native/kernel X86_CROSS="${cross}" OUT="${mo}" AIENOS_COMMIT="${commit}" IMACKERN_WX_MUTANT="${m}" imac-kernel >/dev/null
@@ -201,7 +206,7 @@ mutant() { # IMACKERN_WX_MUTANT value, expected panic pattern, QEMU core count (
     qpid=""
     if [[ ${hit} == 1 ]] && tr -d '\r' <"${log}" | grep -aq '^wx: TEST-ONLY W^X mutant build'; then
         echo "PASS  mutant ${m}: W^X probes catch it"
-        tr -d '\r' <"${log}" | grep -a '^panic: wx'
+        tr -d '\r' <"${log}" | grep -aE -- "$2"
     else
         echo "FAIL  mutant ${m}: no match for: $2"; fails=$((fails + 1))
         tr -d '\r' <"${log}" | tail -20
@@ -209,8 +214,11 @@ mutant() { # IMACKERN_WX_MUTANT value, expected panic pattern, QEMU core count (
 }
 mutant no_nx '^panic: wx: FAIL nx=on wp=on text_write=fault ro_write=fault heap_exec=ALLOWED stack_exec=ALLOWED$'
 mutant text_writable '^panic: wx: FAIL nx=on wp=on text_write=ALLOWED ro_write=fault heap_exec=fault stack_exec=fault$'
-# The secondary cores start without CR0.WP (#484): the boot core's probes pass, so the failure must be the
-# wx_audit core count, 1 of 4 cores with NXE and WP, after all three cores started.
-mutant ap_no_wp '^panic: wx_audit: FAIL wx_pages=0 exec_pages=([1-9][0-9]*) text_pages=\1 exec_outside_text=0 ro_writable=0 cores_nx_wp=1/4$' 4
+mutant no_shootdown '^panic: tlb_shootdown: FAIL cores=3 stale_write_allowed=3 stale_read_allowed=3$' 4
+# The secondary cores start without CR0.WP (#484): the boot core's probes pass. The TLB shootdown probe (#485)
+# runs on the secondary cores before wx_audit, and without WP their writes to the page made read-only succeed
+# while the unmapped page still faults: write side fails on all three cores, read side holds. (Without the
+# shootdown probe, the wx_audit core count, 1 of 4 cores with NXE and WP, catches the same mutant.)
+mutant ap_no_wp '^panic: tlb_shootdown: FAIL cores=3 stale_write_allowed=3 stale_read_allowed=0$' 4
 if [[ ${fails} == 0 ]]; then echo "${tag}: PASS"; exit 0; fi
 echo "${tag}: FAIL (${fails} checks)"; exit 1

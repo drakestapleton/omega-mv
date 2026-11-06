@@ -181,7 +181,7 @@ a 4 KiB guard page under the stack), proves the guard page faults and the fault
 is contained, measures the TSC against the HPET, runs the local APIC timer
 (xAPIC) for 20 interrupts at 100 Hz, starts every other core the MADT lists
 (INIT-SIPI-SIPI into the `x86/smp_x86.S` trampoline below 1 MiB; each core loads
-the kernel's tables, checks in and halts), then walks PCI (`x86/pci_x86.c`, MCFG
+the kernel's tables, turns interrupts on, checks in and draws or halts), then walks PCI (`x86/pci_x86.c`, MCFG
 ECAM window; device registers above the identity map are mapped on demand) and
 reads every disk without writing. SATA through `x86/ahci_x86.c` (polled, no
 controller or port reset, only IDENTIFY DEVICE and READ DMA EXT exist and the
@@ -375,13 +375,24 @@ PAT cache types and the stack guard; the 2 MiB pages around the image and the
 trampoline are split into 4 KiB pages at the boundaries from
 `../boot/image_x86_64.ld`. The trampoline page is never writable and executable
 at once (writable while it is filled, executable while a core runs it,
-read-only no-execute once the cores are parked). At boot the kernel proves it:
+read-only no-execute once the cores are started). TLB shootdown (#485):
+`invlpg` flushes only the core that runs it, and the started cores keep
+running, so every page table change that takes rights away or unmaps
+(`tlb_flush_page`, the trampoline's included) also sends an IPI (vector 0xf0)
+to every secondary core that has checked in and waits until each has flushed
+the page and acknowledged; a core that does not answer within a second is a
+panic. Mappings are only ever added beside that (device registers, not
+present before), and no core caches a not-present entry. At boot the kernel proves it:
 writes to code and to read-only data and execution from heap and stack must
-each fault with the right error code (`wx: ok ...`), and after the cores and
+each fault with the right error code (`wx: ok ...`); each secondary core in
+turn caches a writable translation of a page, the boot core makes the page
+read-only and then unmaps it, and the core's next write and next read must
+each fault (`tlb_shootdown: ok cores=3 ...`); and after the cores and
 disks are up an audit of every page table leaf must find nothing writable and
 executable, only the code executable, and NXE and WP on every core
-(`wx_audit: ok ...`). The QEMU test also builds two TEST-ONLY mutants
-(`make imac-kernel IMACKERN_WX_MUTANT=no_nx` or `=text_writable`) and fails
+(`wx_audit: ok ...`). The QEMU test also builds four TEST-ONLY mutants
+(`make imac-kernel IMACKERN_WX_MUTANT=no_nx`, `=text_writable`, `=ap_no_wp` or
+`=no_shootdown`, the last two run with four cores) and fails
 unless their probes panic. None of this holds from the first instruction: W^X,
 NX and WP are enforced only once `mm_build` (`x86/kmain_x86.c`) sets EFER.NXE,
 loads the kernel's own tables into CR3 and sets CR0.WP. Until that CR3 load the

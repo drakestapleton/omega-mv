@@ -67,6 +67,8 @@
 #define SEL_DATA 0x10
 #define SEL_TSS 0x18
 #define VEC_TIMER 0x40
+#define VEC_TLB_PROBE 0x50 /* the shootdown self-test's probe on a secondary core */
+#define VEC_TLB 0xf0       /* TLB shootdown: flush tlb_va on this core and acknowledge */
 #define VEC_SPURIOUS 0xff
 #define STACK_BYTES (64u << 10)
 #define IST_BYTES (16u << 10)
@@ -85,8 +87,9 @@
 
 /* W^X negative controls (make IMACKERN_WX_MUTANT=..., QEMU only, never
  * deployed): no_nx drops every NX bit, text_writable leaves the code
- * writable, ap_no_wp starts the secondary cores without CR0.WP (smp_x86.S).
- * The W^X probes or the wx_audit core count below must then fail. */
+ * writable, ap_no_wp starts the secondary cores without CR0.WP (smp_x86.S),
+ * no_shootdown leaves the other cores' TLBs stale (invlpg on the boot core
+ * only). The W^X and TLB probes or the wx_audit core count below must then fail. */
 #define PTE_XD (1ull << 63) /* the hardware execute-disable bit */
 #ifdef CK_X86_WX_MUTANT_NO_NX
 #define PTE_NX 0ull
@@ -726,6 +729,11 @@ static struct {
 } probe;
 static volatile uint64_t ticks, tick_tsc[32];
 static volatile uint64_t stray_irqs;
+/* TLB shootdown (#485, tlb_flush_page): the page every secondary core is to
+ * flush and how many have done so. */
+static volatile uint64_t tlb_va;
+static volatile uint32_t tlb_acks;
+static void tlb_probe_run(void);
 static volatile uint32_t *xapic;
 
 static const char *const exc_name[32] = {
@@ -761,6 +769,17 @@ void ck_x86_trap(struct ck_x86_frame *f)
         probe.cr2 = ck_rd_cr2();
         probe.err = f->error;
         f->rip = probe.resume;
+        return;
+    }
+    if (f->vector == VEC_TLB) {
+        __asm__ volatile("invlpg (%0)" ::"r"(tlb_va) : "memory");
+        apic_wr(APIC_EOI, 0);
+        __atomic_fetch_add(&tlb_acks, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    if (f->vector == VEC_TLB_PROBE) {
+        apic_wr(APIC_EOI, 0); /* first, so VEC_TLB can arrive while the probe waits */
+        tlb_probe_run();
         return;
     }
     if (f->vector == VEC_TIMER) {
@@ -991,6 +1010,8 @@ int ck_x86_map_mmio(uint64_t pa, uint64_t len)
             *e = a | PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT | PTE_NX;
             mm.pages_uc++;
         }
+        /* only not-present entries become present here, and no core caches a
+         * not-present translation, so the other cores need no shootdown */
         __asm__ volatile("invlpg (%0)" ::"r"(a) : "memory");
     }
     return 0;
@@ -1138,8 +1159,9 @@ static void apic_start(struct apic_report *ar)
  * Each enabled local APIC the MADT lists (other than this core's) gets INIT,
  * SIPI, SIPI pointing at the trampoline (smp_x86.S). A started core loads the
  * kernel's GDT (no task register) and IDT, sets the same PAT, enables its
- * local APIC, records its APIC ID, checks in, and halts with interrupts off.
- * Nothing is scheduled on it yet. */
+ * local APIC, records its APIC ID, turns interrupts on (only IPIs reach it:
+ * its LVT entries are masked, the I/O APIC lines too), checks in, and runs
+ * the night's drawing or halts. */
 #define SMP_MAX 16u
 #define AP_STACK_PAGES 4u
 #define APIC_ICR_LO 0x300
@@ -1177,13 +1199,14 @@ static void ap_entry(void *arg)
     ap_ids[idx] = apic_rd(APIC_ID) >> 24;
     if ((ck_rdmsr(MSR_EFER) & EFER_NXE) && (ck_rd_cr0() & CR0_WP))
         __atomic_fetch_add(&ap_nx_wp, 1, __ATOMIC_SEQ_CST);
+    __asm__ volatile("sti" ::: "memory"); /* before checking in: a shootdown can come any time after */
     __atomic_fetch_add(&ap_up, 1, __ATOMIC_SEQ_CST);
     if (idx == 0) /* the first one draws the night's frames, the next two help */
         draw_loop();
     else if (idx < 3)
         help_loop();
     for (;;)
-        __asm__ volatile("cli; hlt");
+        __asm__ volatile("hlt");
 }
 
 static int icr_send(uint32_t id, uint32_t lo)
@@ -1213,14 +1236,50 @@ static uint32_t tramp_at(const char *sym)
     return (uint32_t)(tramp_pa + (uint64_t)(uintptr_t)(sym - ck_x86_tramp_start));
 }
 
-/* The trampoline page is never writable and executable at once: RW+NX while
- * it is filled, RX while a core runs it, R+NX once the cores are parked (a
- * parked core runs nothing, so no TLB shootdown). */
+/* TLB shootdown (#485). invlpg drops a translation from this core's TLB only,
+ * so a change that takes rights from a page (or unmaps it) is not done until
+ * every core that may hold the old translation has dropped it too: the page
+ * is flushed here, VEC_TLB goes to every secondary core that has checked in,
+ * and this returns once each has flushed it and acknowledged. A core that
+ * does not answer within a second is a panic, never a page left stale. Only
+ * the boot core changes page tables, so one request is in flight at a time. */
+static uint32_t tlb_shootdowns, tlb_acked;
+static void tlb_flush_page(uint64_t va)
+{
+    __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
+#ifndef CK_X86_WX_MUTANT_NO_SHOOTDOWN
+    uint32_t n = __atomic_load_n(&ap_up, __ATOMIC_ACQUIRE);
+    if (n > SMP_MAX)
+        n = SMP_MAX;
+    if (!n)
+        return;
+    tlb_va = va;
+    __atomic_store_n(&tlb_acks, 0, __ATOMIC_SEQ_CST);
+    for (uint32_t k = 0; k < n; k++)
+        if (icr_send(ap_ids[k], 0x4000 | VEC_TLB)) /* fixed, assert */
+            ck_panic("tlb: shootdown IPI to core %u not delivered", ap_ids[k]);
+    uint64_t t0 = ck_rdtsc();
+    uint32_t got;
+    while ((got = __atomic_load_n(&tlb_acks, __ATOMIC_ACQUIRE)) < n) {
+        if (ck_rdtsc() - t0 > tsc_hz)
+            ck_panic("tlb: shootdown of 0x%llx acknowledged by %u of %u secondary cores", (unsigned long long)va,
+                     got, n);
+        ck_pause();
+    }
+    tlb_shootdowns++;
+    tlb_acked += got;
+#endif
+}
+
+/* The trampoline page is never writable and executable at once, on any core:
+ * RW+NX while it is filled, RX while a core runs it, R+NX once the cores are
+ * started. The cores already started are running and still hold its RX
+ * translation from their own start, so every change is a shootdown. */
 static void tramp_prot(uint64_t bits)
 {
     uint64_t *e = pte_4k(tramp_pa);
     *e = (*e & (PTE_ADDR | PTE_PCD | PTE_PWT)) | PTE_P | bits;
-    __asm__ volatile("invlpg (%0)" ::"r"(tramp_pa) : "memory");
+    tlb_flush_page(tramp_pa);
 }
 
 static void smp_start(const struct apic_report *ar, struct smp_report *sr)
@@ -1320,6 +1379,93 @@ static int probe_exec(uint8_t *buf)
                      : "rax", "memory");
     probe.armed = 0;
     return probe.hit && probe.cr2 == a && (probe.err & 0x1b) == 0x11;
+}
+
+static int probe_read(uint64_t a)
+{
+    probe.hit = 0;
+    probe.armed = 1;
+    __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
+                     "mov %%rax, %0\n\t"
+                     "movb (%1), %%al\n"
+                     "1:"
+                     : "=m"(probe.resume)
+                     : "r"(a)
+                     : "rax", "memory");
+    probe.armed = 0;
+    return probe.hit && probe.cr2 == a && !(probe.err & 1);
+}
+
+/* ---- TLB shootdown self-test (#485) ----
+ * On each secondary core in turn: the core writes tlb_page (so it caches a
+ * writable translation), the boot core makes the page read-only and shoots
+ * it down, and the core's next write must fault; the core reads the page
+ * (a fresh read-only translation), the boot core unmaps it and shoots it
+ * down, and the core's next read must fault. Between its accesses the core
+ * waits inside the VEC_TLB_PROBE handler with interrupts on and touches
+ * nothing else, so a translation the shootdown missed is still in its TLB
+ * and the access goes through. */
+static uint8_t tlb_page[CK_PAGE] __attribute__((aligned(CK_PAGE)));
+static volatile uint32_t tlb_step, tlb_faults; /* tlb_faults: bit 0 the write faulted, bit 1 the read */
+
+static void tlb_probe_run(void)
+{
+    uint64_t a = (uint64_t)(uintptr_t)tlb_page;
+    __asm__ volatile("sti" ::: "memory");
+    *(volatile uint8_t *)tlb_page = 1;
+    __atomic_store_n(&tlb_step, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&tlb_step, __ATOMIC_ACQUIRE) != 2)
+        ck_pause();
+    uint32_t got = (uint32_t)probe_write(a);
+    (void)*(volatile uint8_t *)tlb_page;
+    __atomic_store_n(&tlb_step, 3, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&tlb_step, __ATOMIC_ACQUIRE) != 4)
+        ck_pause();
+    got |= (uint32_t)probe_read(a) << 1;
+    __asm__ volatile("cli" ::: "memory");
+    tlb_faults = got;
+    __atomic_store_n(&tlb_step, 5, __ATOMIC_RELEASE);
+}
+
+static void tlb_wait(uint32_t s, uint32_t id)
+{
+    uint64_t t0 = ck_rdtsc();
+    while (__atomic_load_n(&tlb_step, __ATOMIC_ACQUIRE) != s) {
+        if (ck_rdtsc() - t0 > tsc_hz)
+            ck_panic("tlb_shootdown: core %u stopped before step %u", id, s);
+        ck_pause();
+    }
+}
+
+static void tlb_selftest(void)
+{
+    uint32_t n = __atomic_load_n(&ap_up, __ATOMIC_ACQUIRE), stale_w = 0, stale_r = 0;
+    if (n > SMP_MAX)
+        n = SMP_MAX;
+    uint64_t a = (uint64_t)(uintptr_t)tlb_page, *e = pte_4k(a), rw = *e;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t id = ap_ids[k];
+        __atomic_store_n(&tlb_step, 0, __ATOMIC_SEQ_CST);
+        if (icr_send(id, 0x4000 | VEC_TLB_PROBE)) /* fixed, assert */
+            ck_panic("tlb_shootdown: probe IPI to core %u not delivered", id);
+        tlb_wait(1, id);
+        *e = rw & ~PTE_W;
+        tlb_flush_page(a);
+        __atomic_store_n(&tlb_step, 2, __ATOMIC_RELEASE);
+        tlb_wait(3, id);
+        *e = 0;
+        tlb_flush_page(a);
+        __atomic_store_n(&tlb_step, 4, __ATOMIC_RELEASE);
+        tlb_wait(5, id);
+        *e = rw;
+        tlb_flush_page(a);
+        stale_w += !(tlb_faults & 1);
+        stale_r += !(tlb_faults & 2);
+    }
+    if (stale_w || stale_r)
+        ck_panic("tlb_shootdown: FAIL cores=%u stale_write_allowed=%u stale_read_allowed=%u", n, stale_w, stale_r);
+    ck_printf("tlb_shootdown: ok cores=%u stale_write_allowed=0 stale_read_allowed=0 shootdowns=%u acks=%u\n", n,
+              tlb_shootdowns, tlb_acked);
 }
 
 static void wx_probes(void)
@@ -1509,17 +1655,7 @@ static __attribute__((noreturn)) void kernel_main(void *arg)
 
     /* The guard page faults, and the fault is contained. */
     uint64_t g = (uint64_t)(uintptr_t)kstack;
-    probe.hit = 0;
-    probe.armed = 1;
-    __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
-                     "mov %%rax, %0\n\t"
-                     "movb (%1), %%al\n"
-                     "1:"
-                     : "=m"(probe.resume)
-                     : "r"(g)
-                     : "rax", "memory");
-    probe.armed = 0;
-    if (probe.hit && probe.cr2 == g && !(probe.err & 1))
+    if (probe_read(g))
         ck_printf("guard_page: ok fault=contained (#PF cr2=0x%llx error=0x%llx, not present)\n",
                   (unsigned long long)probe.cr2, (unsigned long long)probe.err);
     else
@@ -1561,6 +1697,7 @@ static __attribute__((noreturn)) void kernel_main(void *arg)
                   sr.listed, sr.started, sr.failed, ar.id, sr.started ? ids : "none",
                   (unsigned long long)tramp_pa, draw_on ? "drawing" : "halted", draw_helpers);
     }
+    tlb_selftest();
 
     const struct ck_x86_storage_result *st = ck_x86_storage(h->rsdp, &frames, tsc_hz, mm.top);
     ck_x86_sound(&frames, tsc_hz, night_t0); /* before the keyboard: the chirp is already under way */
@@ -1591,7 +1728,8 @@ void ck_x86_kernel_entry(struct ck_handoff *h)
     hand = h;
     tables_load();
     ck_puts("\nreport_kind: kernel\n");
-#if defined(CK_X86_WX_MUTANT_NO_NX) || defined(CK_X86_WX_MUTANT_TEXT_RW) || defined(CK_X86_WX_MUTANT_AP_NO_WP)
+#if defined(CK_X86_WX_MUTANT_NO_NX) || defined(CK_X86_WX_MUTANT_TEXT_RW) || defined(CK_X86_WX_MUTANT_AP_NO_WP) || \
+    defined(CK_X86_WX_MUTANT_NO_SHOOTDOWN)
     ck_puts("wx: TEST-ONLY W^X mutant build, page permissions deliberately broken, never deploy\n");
 #endif
     ck_printf("exit_boot_services: ok attempts=%u\n", h->exit_attempts);
