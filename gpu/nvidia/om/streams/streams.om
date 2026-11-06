@@ -1,0 +1,264 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note C4 streams (CUDApp#115): the pure part of src/omega_gpu_cmdlist.c emit_chunk / submit_pair and of the
+note queue selection (AIEN_OMEGA_GPU_CHANNELS, omega_gpu_session_extra_queue). Pure computation: no host
+note words. The C shell writes the words into the pushbuffer and submits; the effectful pieces (ioctl, mmap,
+note GPPut, doorbell) wait for omega-bridge#29.
+note Entry streams_words op a o: a is the input record, o the output words (each below 2^32), o 30 the
+note barrier chosen and o 31 the launch kind for op 1. The value is the word count, or the op's scalar result.
+note op 0 setup: the 18 compute-class setup words
+note op 1 launch: a = i done wait_va indep skip first_none barrier stamps stamps_va mode q1_va
+note      wait_for ACQUIRE (clc96f SEM_ADDR_LO 0x5c .. SEM_EXECUTE 0x6c, payload DONE 6, OPERATION_ACQUIRE 0),
+note      the barrier choice and its words, PCAS send; o 31 = 0 skipped, 1 PCAS sent, 2 inline QMDs follow
+note op 2 inline QMD header: a = va (3 words; C copies the 96 QMD words after it)
+note op 3 end: a = stamps stamps_va end marker_va (final WAIT_FOR_IDLE + stamp, then the 17 tail words)
+note op 4 channels: a = present len c0 max_extra; value = channel count (1 unless one digit 2..1+max_extra)
+note op 5 pair marker: a = marker_page_va k (k 0 queue 0, 1 queue 1); value = completion marker va,
+note      o 0 and o 1 = the two 32-bit marker words (index from the 0x100 marker offset) to clear
+note op 6 extra queue: a = i open1 open2 open3; value 0 index outside 1..3, 1 already open, 2 out of order, 3 open it
+const WMASK ulong 4294967295
+const MTHDTAG ulong 536870912
+const DONE ulong 6
+const MARKER1 ulong 1145324612
+const MARKER2 ulong 1179010630
+const SEMREL ulong 1048577
+const INVALL ulong 4113
+const INVDATA ulong 16
+const INVFLUSH ulong 20
+const BWFI ulong 0
+const BNONE ulong 1
+const BWDATA ulong 3
+const BFLUSH ulong 4
+note REFUSED: an op outside 0..6 or a pair queue above 1; the C caller treats it as a broken generator
+const REFUSED ulong 18446744073709551615
+fn mthd s ulong m ulong c ulong to ulong
+ret or or or MTHDTAG shl c 16 shl s 13 shr m 2
+end
+
+fn pw o edit ulong 32 n ulong v ulong to ulong
+put o n v
+ret add n 1
+end
+
+fn stamp o edit ulong 32 n ulong sva ulong slot ulong to ulong
+va = add sva mul slot 16
+k = pw o n mthd 1 344 5
+k = pw o k slot
+k = pw o k 0
+k = pw o k and va WMASK
+k = pw o k shr va 32
+ret pw o k 0
+end
+
+fn setup o edit ulong 32 to ulong
+k = pw o 0 536944737
+k = pw o k 52928
+k = pw o k 536944786
+k = pw o k 1
+k = pw o k 536944808
+k = pw o k 15
+k = pw o k 536946013
+k = pw o k 3
+k = pw o k 536946014
+k = pw o k 536870912
+k = pw o k 536946015
+k = pw o k 1048575
+k = pw o k 536946007
+k = pw o k 3
+k = pw o k 536946008
+k = pw o k 570425344
+k = pw o k 536946009
+ret pw o k 0
+end
+
+note wait_for: host semaphore ACQUIRE of the other list's launch semaphore, before the barrier
+fn acquire o edit ulong 32 va ulong to ulong
+k = pw o 0 mthd 0 92 5
+k = pw o k and va WMASK
+k = pw o k shr va 32
+k = pw o k DONE
+k = pw o k 0
+ret pw o k 0
+end
+
+note barrier: a waited launch always WFI; the first of a submission WFI unless first_none at launch 0;
+note a launch marked independent none; otherwise the submission's barrier
+fn choose a view ulong 16 to ulong
+if ne get a 2 0
+ret BWFI
+end
+if eq get a 0 get a 1
+if and eq get a 0 0 ne get a 5 0
+ret BNONE
+end
+ret BWFI
+end
+if ne get a 3 0
+ret BNONE
+end
+ret get a 6
+end
+
+fn barrier o edit ulong 32 n ulong a view ulong 16 b ulong to ulong
+k = n
+if ne b BFLUSH
+k = pw o k mthd 1 272 1
+k = pw o k 0
+else
+k = pw o k mthd 1 540 1
+k = pw o k INVFLUSH
+end
+if ne get a 7 0
+k = stamp o k get a 8 get a 0
+end
+if eq b BWFI
+k = pw o k mthd 1 540 1
+k = pw o k INVALL
+end
+if eq b BWDATA
+k = pw o k mthd 1 540 1
+k = pw o k INVDATA
+end
+ret k
+end
+
+fn launch a view ulong 16 o edit ulong 32 to ulong
+n = ulong 0
+if ne get a 2 0
+n = acquire o get a 2
+end
+put o 31 0
+put o 30 BNONE
+if ne get a 4 0
+if eq get a 0 sub get a 4 1
+ret n
+end
+end
+b = choose a
+put o 30 b
+if and ne get a 0 get a 1 ne get a 3 0
+if ne get a 7 0
+n = stamp o n get a 8 get a 0
+end
+end
+if ne b BNONE
+n = barrier o n a b
+end
+if ne get a 9 0
+put o 31 2
+ret n
+end
+n = pw o n mthd 1 692 1
+n = pw o n and shr get a 10 8 WMASK
+n = pw o n mthd 1 704 1
+n = pw o n 3
+put o 31 1
+ret n
+end
+
+fn inlinehd a view ulong 16 o edit ulong 32 to ulong
+va = get a 0
+k = pw o 0 mthd 1 792 98
+k = pw o k or 1073741824 and shr va 40 511
+ret pw o k and shr va 8 WMASK
+end
+
+fn finish a view ulong 16 o edit ulong 32 to ulong
+n = ulong 0
+if ne get a 0 0
+n = pw o n mthd 1 272 1
+n = pw o n 0
+n = stamp o n get a 1 get a 2
+end
+mva = get a 3
+n = pw o n mthd 0 92 5
+n = pw o n and mva WMASK
+n = pw o n shr mva 32
+n = pw o n MARKER1
+n = pw o n 0
+n = pw o n SEMREL
+n = pw o n mthd 0 40 4
+n = pw o n 0
+n = pw o n 0
+n = pw o n 0
+n = pw o n 2147483648
+mva = add mva 16
+n = pw o n mthd 0 92 5
+n = pw o n and mva WMASK
+n = pw o n shr mva 32
+n = pw o n MARKER2
+n = pw o n 0
+ret pw o n SEMREL
+end
+
+note AIEN_OMEGA_GPU_CHANNELS: unset, empty, longer than one character or not 2..1+max_extra -> 1
+fn channels a view ulong 16 to ulong
+if eq get a 0 0
+ret 1
+end
+if ne get a 1 1
+ret 1
+end
+c = get a 2
+if lt c 50
+ret 1
+end
+if gt c add 49 get a 3
+ret 1
+end
+ret sub c 48
+end
+
+note submit_pair: queue k's completion markers at the page's 0x100 + k * 0x80 (and +0x10 for the second)
+fn pairmk a view ulong 16 o edit ulong 32 to ulong
+k = get a 1
+if gt k 1
+ret REFUSED
+end
+put o 0 mul k 32
+put o 1 add mul k 32 4
+ret add add get a 0 256 mul k 128
+end
+
+note extra_queue: index 1..3, queues open in order
+fn xqueue a view ulong 16 to ulong
+i = get a 0
+if or eq i 0 gt i 3
+ret 0
+end
+if ne get a i 0
+ret 1
+end
+for j ulong 3
+if lt add j 1 i
+if eq get a add j 1 0
+ret 2
+end
+end
+end
+ret 3
+end
+
+fn streams_words op ulong a view ulong 16 o edit ulong 32 to ulong
+if eq op 0
+ret setup o
+end
+if eq op 1
+ret launch a o
+end
+if eq op 2
+ret inlinehd a o
+end
+if eq op 3
+ret finish a o
+end
+if eq op 4
+ret channels a
+end
+if eq op 5
+ret pairmk a o
+end
+if eq op 6
+ret xqueue a
+end
+ret REFUSED
+end
