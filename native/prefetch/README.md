@@ -93,8 +93,8 @@ bytes. Each child has a30-second deadline. Scratch and child outputs remain
 available for inspection; the shell creates a separate directory on each run.
 
 The required compiler is this branch's seeded `seed/out/omc`, executable
-`96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763`, built from
-`seed/omc/omc.om` `9622f66b63b09ae3ba6a22339058f22e789f8956007caf2ded166cba966c2d4d`
+`b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3`, built from
+`seed/omc/omc.om` `5419943aad39c6205bb673c1ddb1be874b1877163cc2f143c07a742cf347456c`
 (both pinned in `compiler.sha256`). The original qualification used the corrected
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
 executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
