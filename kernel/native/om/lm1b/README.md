@@ -142,6 +142,22 @@ raw outputs are in `evidence/gate/`). The ELF it built has the same SHA-256 as t
 - Budget 5 on a 19-id prompt: `status cancelled passes 5`, then the next job's tokens and bits equal the
   reference.
 - `fault 1`: exit status 112 and no reply line for that job.
+- Bounds traps (aienux#481): three copies of the program each change one line of `fn mv`. One reads a row 100
+  bytes before the end of the model, so the copy runs past the 2,388,000-byte last pool. One copies a row
+  one byte longer than `rb`. One rewrites the line with the same value as a control. The first two exit
+  103 (trap 3) with no reply line. The control answers with the reference's first two tokens. See
+  "Bounds checks" below.
+
+## Bounds checks
+
+`rowcp` splits a row across two pools and assumes the next pool is long enough. With the pinned tensor
+offsets this always holds; if it did not, the fallback is the compiler's per-access check. omc has no
+option to turn that check off. It reads the program on stdin and takes no arguments, and `elemaddr`
+(`seed/omc/omc.om` at omega-mv 0d72560a, the source of the pinned omc) emits `CMP` plus `B.HS` to trap 3
+for every run-time index of a `get` or `put`. A constant index outside the array is compile error 21. The
+boot fixture is meant to run these same ELF bytes, so the checks travel with them. gate.sh step 8e shows
+them firing in this program, for both `get` and `put`. [INFERENCE] until the fixture exists: a fixture
+that rebuilt the program with another compiler or another pin would need step 8e rerun against it.
 
 ## Limits
 

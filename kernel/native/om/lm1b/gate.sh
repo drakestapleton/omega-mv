@@ -110,6 +110,28 @@ echo "job f1 gen 2 budget 1000 stop $EOS fault 1 ids $C" > "$O/fault-jobs.txt"
 "$O/lm1b" 3< "$MODEL" < "$O/fault-jobs.txt" > "$O/fault.out" 2> "$O/fault.err"
 check fault-exit "$?" 112
 check fault-no-reply "$(grep -c '^job f1' "$O/fault.out")" 0
+# 8e. omc bounds-checks every get and put on a global in these bytes (aienux#481): rowcp's pool split assumes the next
+# pool is long enough, and the fallback is Omega's per-access trap 3 (exit 103). Three copies of the program differ
+# from lm1b.om in one line of fn mv: a row read past the end of the last pool (m48 holds 2,388,000 bytes), a row copy
+# one byte longer than rb, and a control that rewrites the same line with the same value. The two out-of-range copies
+# must trap with no reply; the control must answer like the reference.
+bvar() {
+  sed "s/^$2\$/$3/" "$HERE/lm1b.om" > "$O/$1.om"
+  check "$1-edited" "$(cmp -s "$HERE/lm1b.om" "$O/$1.om"; echo $?)" 1
+  "$OMC" < "$O/$1.om" > "$O/$1" 2> "$O/$1.err"
+  check "$1-compile" "$?" 0
+  chmod +x "$O/$1"
+  echo "job $1 gen 2 budget 1000 stop $EOS fault 0 ids $C" | "$O/$1" 3< "$MODEL" > "$O/$1.out" 2>&1
+}
+bvar oob-get 'base = get tof ti' 'base = ulong 807694268'
+check oob-get-exit "$?" 103
+check oob-get-no-reply "$(grep -c '^job oob-get' "$O/oob-get.out")" 0
+bvar oob-put 'rowcp add base mul r rbs rbs' 'rowcp add base mul r rbs 8193'
+check oob-put-exit "$?" 103
+check oob-put-no-reply "$(grep -c '^job oob-put' "$O/oob-put.out")" 0
+bvar oob-ctl 'base = get tof ti' 'base = add get tof ti ulong 0'
+check oob-ctl-exit "$?" 0
+check oob-ctl-vs-ref "$(jtok "$O/oob-ctl.out" oob-ctl)" "$(awk 'NR==1{print $1" "$2" "$3} NR==2{print $1" "$2" "$3}' "$O/ref-cow.want")"
 
 if [ -z "$FAILS" ]; then echo "RC=0"; exit 0; fi
 echo "failed:$FAILS"
