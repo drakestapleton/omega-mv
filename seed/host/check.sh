@@ -97,6 +97,20 @@ grep -qx 'OM2GATE FAIL cases=10 pass=2 fail=8 invalid=0 not_run=0' "$run/bndmut.
 [ "$(grep -c '^VERDICT ctl-bnd-[a-z]*-g0-run PASS ' "$run/bndmut.log")" = 2 ]
 [ "$(grep -c '^VERDICT bnd-[a-z]*-[a-z0-9-]* FAIL ' "$run/bndmut.log")" = 8 ]
 echo 'PASS expression boundaries (47 cases) and 2 operand mutants killed'
+# OM-2 function-mode host words: admitted subset, context tables and x86 syscall/fence mutants.
+"$B/gate" seed/out/omc "$pin" seed/omc/om2/fnhost/fnhost.cases "$run/fnhost" > "$run/fnhost.log" || { cat "$run/fnhost.log"; exit 1; }
+grep -qx 'OM2GATE PASS cases=21 pass=21 fail=0 invalid=0 not_run=0' "$run/fnhost.log"
+if "$B/gate" seed/out/omc "$pin" seed/omc/om2/fnhost/mutants.cases "$run/fnhostmut" > "$run/fnhostmut.log"; then
+    echo 'FAIL function-mode host-word mutant survived' >&2
+    exit 1
+else
+    status=$?
+    [ "$status" = 1 ] || { cat "$run/fnhostmut.log"; exit 1; }
+fi
+grep -qx 'OM2GATE FAIL cases=24 pass=12 fail=12 invalid=0 not_run=0' "$run/fnhostmut.log"
+[ "$(grep -c '^VERDICT ctl-fn-[a-z0-9]* PASS ' "$run/fnhostmut.log")" = 12 ]
+[ "$(grep -c '^VERDICT fn-[a-z0-9]* FAIL ' "$run/fnhostmut.log")" = 12 ]
+echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2
@@ -124,6 +138,9 @@ build/seed/host/gate
 sh seed/host/negative.sh
 sh seed/host/regression.sh
 sh seed/host/cpufence.sh
+seed/out/omc < seed/host/aien-ioctl.om > "$run/aien-ioctl"
+chmod +x "$run/aien-ioctl"
+"$run/aien-ioctl" "$(pwd)/seed/out/omc" "$(command -v qemu-x86_64)" "$run/aien-ioctl-cases"
 if readelf -l -d seed/out/omc | grep -Eq 'INTERP|NEEDED'; then
     echo 'FAIL unexpected compiler runtime dependency' >&2
     exit 1

@@ -6,19 +6,23 @@ set -eu
 cd "$(dirname "$0")/../.."
 [ "$(uname -m)" = aarch64 ] || { echo "SKIP gate-irequiv: needs aarch64 (omc emits AArch64)"; exit 0; }
 OMC=seed/out/omc
-PIN=3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194
+PIN=836dd67fe1d7db58c1c93e3f02521f4201f70ef9127857d43bcf29577be0aee9
 [ "$(sha256sum "$OMC" | cut -d' ' -f1)" = "$PIN" ] || { echo "FAIL pin: $OMC"; exit 1; }
 B=build/seed/equiv
 mkdir -p "$B"
 fails=0
 bad() { echo "FAIL $*"; fails=$((fails + 1)); }
 
-# The shared reader (lines 43-496) must stay byte-identical to irwasm and irspirv.
-for o in seed/wasm/irwasm.om seed/spirv/irspirv.om; do
-	sed -n 43,496p seed/equiv/irequiv.om > "$B/r1"
-	sed -n 43,496p "$o" > "$B/r2"
-	cmp -s "$B/r1" "$B/r2" || bad "reader drift vs $o"
-done
+# irequiv.om lines 43-496 are the OSC IR v1 reader and validator, byte-identical to irspirv.om.
+# irwasm.om forked it for IR v7 (#818): its lines 65-843 must equal that v1 reader with the
+# recorded v7 edits of seed/equiv/irwasm-v7.sed applied, byte for byte. A change on either side
+# that is not in the recorded edits is drift.
+sed -n 43,496p seed/equiv/irequiv.om > "$B/r1"
+sed -n 43,496p seed/spirv/irspirv.om > "$B/r2"
+cmp -s "$B/r1" "$B/r2" || bad "reader drift vs seed/spirv/irspirv.om"
+sed -n 65,843p seed/wasm/irwasm.om > "$B/r2"
+sed -f seed/equiv/irwasm-v7.sed "$B/r1" > "$B/r1v7" || bad "apply seed/equiv/irwasm-v7.sed"
+cmp -s "$B/r1v7" "$B/r2" || bad "reader drift vs seed/wasm/irwasm.om (v1 reader + seed/equiv/irwasm-v7.sed)"
 
 "$OMC" < seed/equiv/irequiv.om > "$B/irequiv" 2> "$B/irequiv.err" || { cat "$B/irequiv.err"; echo "FAIL compile irequiv"; exit 1; }
 [ -s "$B/irequiv.err" ] && bad "compile stderr not empty"
@@ -85,6 +89,35 @@ for source in tests/one_layer/omegese/dev/*.omegese seed/wasm/*.unit.om seed/spi
 	printf '%s\n' "$source" > "$B/nx-$id.source"
 	{ printf 'ir\n'; cat "$source"; } | "$OMC" > "$B/nx-$id.ir" || bad "ir $source"
 done
+
+# Reader verdicts: irwasm's v7 reader must accept every v1 unit irequiv accepts and refuse the
+# malformed ones with the same status; a version-7 header stays irwasm's alone (irequiv: VERSION).
+"$OMC" < seed/wasm/irwasm.om > "$B/irwasm" || { echo "FAIL compile irwasm"; exit 1; }
+chmod +x "$B/irwasm"
+{ printf X; tail -c +2 "$B/pop16.ir"; } > "$B/bad-magic.ir"
+{ head -c 7 "$B/pop16.ir"; printf '\002'; tail -c +9 "$B/pop16.ir"; } > "$B/bad-version.ir"
+{ head -c 7 "$B/pop16.ir"; printf '\007'; tail -c +9 "$B/pop16.ir"; } > "$B/v7-header.ir"
+{ cat "$B/pop16.ir"; printf Z; } > "$B/bad-trail.ir"
+rd_units=0
+rd_agree=0
+verdict() {
+	set +e
+	"$B/irwasm" < "$1" > /dev/null 2>&1; w=$?
+	"$B/irequiv" eval ir_reader_probe < "$1" > /dev/null 2>&1; e=$?
+	set -e
+	[ "$e" = 3 ] && e=0
+	rd_units=$((rd_units + 1))
+	if [ "$w" = "$2" ] && [ "$e" = "$2" ]; then rd_agree=$((rd_agree + 1)); else bad "reader verdict $1: irwasm $w, irequiv $e, want $2"; fi
+}
+for u in "$B"/nx-*.ir; do verdict "$u" 0; done
+for u in hexv clamp rot bitrev pop16 wide; do verdict "$B/$u.ir" 0; done
+verdict "$B/bad-magic.ir" 20
+verdict "$B/bad-version.ir" 21
+verdict "$B/trunc.ir" 22
+verdict "$B/bad-trail.ir" 27
+set +e; "$B/irequiv" eval ir_reader_probe < "$B/v7-header.ir" > /dev/null 2>&1; st=$?; set -e
+[ "$st" = 21 ] || bad "v7 header: irequiv status $st, want 21 (VERSION)"
+echo "READERS units=$rd_units agree=$rd_agree"
 tab=$(printf '\t')
 nx_rows=0
 nx_equal=0
