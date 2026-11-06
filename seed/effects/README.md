@@ -32,9 +32,12 @@ binary from another producer will usually fail closed.
 
 `sh seed/effects/check.sh` (pinned omc; strace, bwrap, od and dd as oracles):
 
-- closure: every keyword with a host code in `seed/omc/genkw.awk` is in the table;
+- closure: every keyword with a host code in `seed/omc/genkw.awk` (all `split("…")` lists,
+  found by content) is in the table, except `const`/`qty` (types) and `cpufence`/`cpurelax`,
+  which lower to `DSB SY`/`YIELD`; a probe shows they add no syscall beyond exit (93).
   `omc.om` has exactly 5 SVC emit sites (a new site means the table needs review)
-- probe parity: one compiled probe per word; the ELF syscalls equal the table row
+- probe parity: one compiled probe per word; the ELF syscalls equal the table row. A row
+  lists any number of syscalls (`execpure` lowers to ten, `execprog` to execve and close_range)
 - self manifest, fixtures, policy refusals with word, class and line
 - every program-mode unit in `seed/host/tests` and `seed/rung4/tests`, and omc itself:
   binary syscalls lie within the source manifest

@@ -11,9 +11,11 @@ for repositories enrolled by `.aien/verify.pub` at the base ref, runs the portab
 smoke set selected from the base ref. It does not fetch a signed Spark bundle for
 every pull request. Hosted checks are advisory, not Alpha qualification.
 
-Verifier source revisions are pinned in the workflow. `actions/checkout@v4`,
-`actions/cache@v4` and `dtolnay/rust-toolchain@stable` remain upstream-tracking
-references. The toolchain policy is stable Rust, not an immutable compiler or a
+Verifier source revisions are pinned in the workflow. Actions are pinned to
+commit SHAs in every workflow except `vkspirv-lavapipe.yml`, which uses tag
+references for `actions/checkout` and `actions/upload-artifact`. Both
+`dtolnay/rust-toolchain` steps install `toolchain: stable`, which tracks upstream
+stable Rust. The toolchain policy is stable Rust, not an immutable compiler or a
 fully pinned CI execution environment. A verifier source pin must not be described
 as end-to-end immutable supply-chain reproducibility.
 
