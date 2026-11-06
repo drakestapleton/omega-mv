@@ -1,0 +1,109 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note GSP host interrupt service policy. Host model ONLY; no physical IRQ/MMIO admission.
+note Source: NVIDIA open-gpu-kernel-modules 580.173.02 @20e4e6e19cc26ba47b5cbe23130a396be100c427
+note kernel_gsp_tu102.c:1188-1203: clear edge SWGEN0 BEFORE draining RPC, stop register access on lockdown.
+note kernel_falcon_ga102.c:318-320: pending = FALCON_IRQSTAT & RISCV_IRQMASK & RISCV_IRQDEST.
+note dev_falcon_v4.h:26-35: IRQSCLR=4, IRQSTAT=8, SWGEN0 bit6, HALT bit4.
+note WolframLanguageEvaluator {2^6,2^4,BitOr[2^6,2^4]} -> {64,16,80}.
+note HALT/unknown routed sources are not implemented CrashCat/ECC handlers: retain them and quarantine.
+note iqinit admits one nonzero generation exactly once. No reset/rearm/reclaim or idle claim exists.
+note iqservice gen budget returns serviced events, or -1 args, -4 lifecycle, -9 non-model/inactive,
+note -10 generation, -11 budget exhausted, -12 quarantined, -13 unsupported IRQ, -14 lockdown,
+note -15 peer service failure. iqdone is progress before an error, never completion/idle authority.
+note Link irqsim.om explicitly. Its seam iqread/iqclear/iqready/iqrecv/iqmask/iqpm has no device effects.
+const IQSW uint 64
+const IQMAX ulong 64
+global iqmode ulong 1
+global iqstate ulong 1
+global iqgen ulong 1
+global iqdone ulong 1
+global iqpend uint 1
+fn iqinit gen ulong to long
+if eq gen 0
+ret -1
+end
+if ne get iqstate 0 0
+ret -4
+end
+put iqgen 0 gen
+put iqstate 0 1
+ret 0
+end
+fn iqstop err long to long
+iqmask
+put iqstate 0 2
+ret err
+end
+fn iqpump budget ulong to long
+note At most IQMAX messages plus one readiness check; never consumes beyond caller budget.
+for i ulong IQMAX
+if not iqready
+ret long get iqdone 0
+end
+if ge get iqdone 0 budget
+ret iqstop -11
+end
+r = iqrecv
+if lt r 0
+ret iqstop -15
+end
+if or eq r 1 eq r 2
+put iqdone 0 add get iqdone 0 1
+else
+ret iqstop -15
+end
+if eq r 2
+note Lockdown notification forbids ALL subsequent register accesses, including status/masking.
+put iqstate 0 3
+ret long get iqdone 0
+end
+end
+if iqready
+ret iqstop -11
+end
+ret long get iqdone 0
+end
+fn iqservice gen ulong budget ulong to long
+if or eq budget 0 gt budget IQMAX
+ret -1
+end
+if ne gen get iqgen 0
+ret -10
+end
+if eq get iqstate 0 2
+ret -12
+end
+if eq get iqstate 0 3
+ret -14
+end
+if ne get iqstate 0 1
+ret -4
+end
+if ne get iqmode 0 0
+ret -9
+end
+if not iqpm
+ret -9
+end
+put iqdone 0 0
+p = iqread
+put iqpend 0 p
+if eq p 0
+ret 0
+end
+if ne and p not IQSW 0
+ret iqstop -13
+end
+note This acknowledgement must precede the first RPC readiness/service access.
+iqclear IQSW
+r = iqpump budget
+if lt r 0
+ret r
+end
+if eq get iqstate 0 3
+ret r
+end
+note Preserve a new edge raised during or after draining. Never clear status after service.
+put iqpend 0 iqread
+ret r
+end
