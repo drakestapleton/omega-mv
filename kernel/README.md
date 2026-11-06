@@ -56,6 +56,34 @@ For component status, [ROADMAP.md](ROADMAP.md) is the AIENOS plan, but its newes
 - **Free inside reversible state; explicit authorization at irreversible steps.**
 - **Language:** Rust is scaffolding, Omega is the destination, and C or assembly stay only where hardware, boot, ABI or measurement needs them (aien-architecture ADR 0024). No Python, no CUDA toolkit, no CUDA-shaped APIs, and no systemd or Linux init in boot, services or tooling. Dependencies in the trusted base are rare and built offline.
 
+## How it works and how we built it
+
+One boot of the C kernel, in order:
+
+1. UEFI calls `_start` ([native/boot/efi_entry.S](native/boot/efi_entry.S)). It relocates the image, then calls `efi_main`, which exits boot services.
+2. `ck_kernel_entry` ([native/kernel/core/kmain.c](native/kernel/core/kmain.c)) builds the kernel's own page tables: text RX, data RW+XN, guard pages.
+3. It drops from EL2 to EL1h ([ADR 0009](docs/adr/0009-el2-bootstrap-to-el1h-kernel-transition.md)).
+4. It brings up GICv3 and the 10 ms timer.
+5. It runs the M3 checks:
+   - cooperative threads, timer preemption and EL0 isolation;
+   - typed IPC, where every send, receive and delegation passes one capability gate (`ck_cap_lookup` / `gated` in [native/kernel/core/ipc.c](native/kernel/core/ipc.c)). A missing right returns `CK_IPC_MISSING_RIGHTS`, and the EL0 caller gets `DENIED`.
+
+The C kernel was ported step for step from the earlier Rust kernel:
+- the core boot in aienos #194 (`34c6053`);
+- the M3 isolation and IPC port in aienos #201 (`0d0efa5`).
+
+Each Rust check pattern has a matching C gate in [native/kernel/GATES.md](native/kernel/GATES.md). Two limits apply:
+- scheduling is cooperative inside one kernel thread, and no secondary core runs tasks;
+- QEMU results qualify nothing physical.
+
+[native/kernel/WALKTHROUGH.md](native/kernel/WALKTHROUGH.md) follows that boot function by function. It covers the Rust-to-C history and the multi-threaded TCG hang that the gate avoids, and it gives a ten-second reproduction with the expected output, including a fail-closed refusal case:
+
+```bash
+make -s -C native/kernel OUT=$PWD/target/teach $PWD/target/teach/host/test_ipc && ./target/teach/host/test_ipc   # test_ipc: PASS (75 checks)
+bash scripts/qemu_ck_boot_test.sh                                   # AIENOS_CK_M3: PASS, AIENOS_CK_M1: PASS
+AIENOS_QEMU_CPU=neoverse-n1 bash scripts/qemu_ck_boot_test.sh       # no FEAT_RNG: AIENOS_CK_M1: FAIL (refusal)
+```
+
 ## Build and test
 
 The C code needs only gcc, binutils, make and a shell. On a host that is not AArch64, the kernel Makefile uses the `aarch64-linux-gnu-` cross tools. Host tests:
