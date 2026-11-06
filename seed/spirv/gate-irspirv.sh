@@ -21,7 +21,7 @@ SPIRV_VAL=${SPIRV_VAL:-spirv-val}
 PYTHON=${PYTHON:-python3}
 command -v "$SPIRV_VAL" >/dev/null || notrun "requires spirv-val ($SPIRV_VAL)"
 command -v "$PYTHON" >/dev/null || notrun "requires Python parity oracle ($PYTHON)"
-pin=d5d7d1029bf1b7011570d346e320bc793a0f3ee3c227033f7f8d2bbc292c4054
+pin=3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194
 [ -f "$OMC" ] || fail "compiler $OMC missing"
 [ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
 case "${POCL_LIBRARY:-}" in /*/libpocl.so*) ;; *) notrun 'POCL_LIBRARY must name the absolute trusted PoCL shared library' ;; esac

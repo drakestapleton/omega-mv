@@ -21,6 +21,22 @@ second table. Nothing new was compiled to do it: the new part is text.
   program those generators can make, it writes the program as a text listing in `asm2`'s language and, next
   to it, the bytes the C code made. It never writes a byte under `seed/`.
 
+## Build
+
+`gate6.sh` needs the reference tool at `build/seed/r6/sm121list`. Build it from the repository root, then run
+the gate:
+
+```sh
+mkdir -p build/seed/r6
+gcc -O1 -Isrc -o build/seed/r6/sm121list seed/sm121/sm121list.c src/omega_blackwell_codegen*.c \
+  src/omega_blackwell_matmul.c src/omega_blackwell_encoder.c src/omega_gpu_fmt.c src/omega_om_units.c -lm
+sh seed/sm121/gate6.sh
+```
+
+The gate writes its result files to `build/seed/r6/evidence/`. The recorded receipt `evidence/SEED-0/sm121/`
+is only read: the gate's last line before the verdict says whether each result file equals its recorded copy
+(`seed/check/receipt.sh`); a rerun never rewrites it.
+
 ## How the checks work
 
 The C code generator is the referee, never an input to the table: I read its source and wrote the table by
@@ -38,7 +54,7 @@ hand; the gate then compares.
 6. On the chip: the seed-made vector add runs on the GB10 through the existing launcher (no CUDA library),
    with a receipt.
 
-Results: `evidence/SEED-0/sm121/`.
+Results: `build/seed/r6/evidence/`; recorded receipt: `evidence/SEED-0/sm121/`.
 
 ## Limits, said plainly
 
