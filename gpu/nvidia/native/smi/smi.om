@@ -1,0 +1,1267 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note smi.om: cudapp-smi, a read-only GPU status reporter (the CUDA++ successor of nvidia-smi).
+note Data sources, field table and gaps: native/smi/README.md.
+note
+note Build: this unit is OM-2. The compiled program is this file, the NVRM context library and the
+note RM query unit, fed to the pinned seeded omc in this order (omc has no forward global references):
+note   cat native/smi/smi.om native/nvrm/context.om native/smi/rm.om | omc > cudapp-smi
+note Usage: cudapp-smi [--root DIR] [--rm]
+note   --root DIR  read DIR/proc and DIR/sys instead of /proc and /sys (fixture trees)
+note   --rm        also query the resource manager through /dev/nvidiactl and /dev/nvidia0 (one GPU only);
+note               the device nodes are always the real ones, whatever --root says
+note Without --rm the program opens only files under ROOT/proc and ROOT/sys, read-only, and reads
+note symbolic links under ROOT/proc/<pid>/fd. It never opens a device and never writes a file.
+note
+note Report (stdout, key=value lines, only after every check passed; keys follow nvidia-smi --query-gpu):
+note   source=procfs+sysfs[+rm]   driver_version=<v>   count=<n>
+note   per GPU g (sorted by PCI address): gpu.g.pci.bus_id .pci.domain .pci.bus .pci.device .uuid
+note   .minor_number .vbios_version .gsp_firmware_version .pci.device_id .pci.sub_device_id
+note   .pci.base_classcode .pci.sub_classcode .pcie.link.gen.current .pcie.link.gen.max
+note   .pcie.link.width.current .pcie.link.width.max, and without --rm .name .temperature.gpu .pstate as [N/A]
+note   then per GPU: gpu.g.holder.k.pid .holder.k.process_name, gpu.g.holders=<n>
+note   then proc.scanned=<n> proc.uninspectable=<n>, then with --rm the rm.om keys.
+note   [N/A] marks a field whose source file is absent or which this source cannot provide.
+note
+note Exit codes (a refusal writes one line "SMI REFUSE <reason>" to stderr and nothing to stdout):
+note    0 report written
+note    2 usage
+note    3 I/O: a present file or directory could not be read, or stdout write failed
+note    4 no NVIDIA driver: ROOT/proc/driver/nvidia/version is absent
+note   10 malformed version file: no line starting "NVRM version:" or no dotted numeric version token
+note   11 information file lacks GPU UUID, Bus Location or Device Minor
+note   12 malformed GPU entry: directory name not dddd:bb:dd.f, Bus Location differs from the directory
+note      name, malformed GPU UUID, Device Minor not 0..255, Video BIOS or GPU Firmware malformed
+note   13 PCI vendor is not 0x10de
+note   14 malformed sysfs number (hex must be 0x + 1..8 lowercase digits; decimal 1..9 digits)
+note   15 unknown PCIe link speed
+note   19 capacity: path, file, GPU count (8), holder count (4096) or report (65536 bytes) exceeded
+note   30..34 resource-manager refusals, see rm.om
+note Runtime traps exit 100 + trap code (Omegese 9.1); none is expected on any input.
+om2
+
+text trf "SMI REFUSE "
+text tnl "\n"
+text tuse "usage: cudapp-smi [--root DIR] [--rm]"
+text tio "I/O error"
+text tnodrv "NVIDIA driver not loaded (no proc/driver/nvidia/version)"
+text tbver "malformed driver version file"
+text tmkey "information file lacks a required key"
+text tbgpu "malformed GPU entry"
+text tvend "PCI vendor is not NVIDIA"
+text tbnum "malformed sysfs number"
+text tbspd "unknown PCIe link speed"
+text tcap "capacity exceeded"
+text targr "--root"
+text targm "--rm"
+text tver "/proc/driver/nvidia/version"
+text tgpd "/proc/driver/nvidia/gpus"
+text tinfo "/information"
+text tsysd "/sys/bus/pci/devices/"
+text tproc0 "/proc"
+text tproc "/proc/"
+text tfd "/fd"
+text tcmd "/cmdline"
+text tcomm "/comm"
+text tdevn "/dev/nvidia"
+text tgpup "GPU-"
+text tnvrm "NVRM version:"
+text kuuid "GPU UUID:"
+text kbusl "Bus Location:"
+text kminor "Device Minor:"
+text kvbios "Video BIOS:"
+text kgspfw "GPU Firmware:"
+text fvend "/vendor"
+text fdevi "/device"
+text fsvnd "/subsystem_vendor"
+text fsdev "/subsystem_device"
+text fclass "/class"
+text fcls "/current_link_speed"
+text fclw "/current_link_width"
+text fmls "/max_link_speed"
+text fmlw "/max_link_width"
+text sunk "Unknown"
+text sg1 "2.5 GT/s"
+text sg2 "5.0 GT/s"
+text sg3 "8.0 GT/s"
+text sg4 "16.0 GT/s"
+text sg5 "32.0 GT/s"
+text sg6 "64.0 GT/s"
+text tna "[N/A]"
+text tsrc "source=procfs+sysfs"
+text tsrcrm "+rm"
+text kdrv "driver_version="
+text kcount "count="
+text kgpu "gpu."
+text kbusid "pci.bus_id="
+text kdom "pci.domain=0x"
+text kbus "pci.bus=0x"
+text kdevice "pci.device=0x"
+text kuuido "uuid="
+text kmino "minor_number="
+text kvbo "vbios_version="
+text kgspo "gsp_firmware_version="
+text kdevid "pci.device_id="
+text ksubid "pci.sub_device_id="
+text kbcls "pci.base_classcode="
+text kscls "pci.sub_classcode="
+text kgenc "pcie.link.gen.current="
+text kgenm "pcie.link.gen.max="
+text kwidc "pcie.link.width.current="
+text kwidm "pcie.link.width.max="
+text kname "name="
+text ktemp "temperature.gpu="
+text kpst "pstate="
+text khold "holder."
+text kpid ".pid="
+text kpname ".process_name="
+text kholds "holders="
+text kscan "proc.scanned="
+text kunins "proc.uninspectable="
+
+global gob uchar 65536
+global gpath uchar 4096
+global groot uchar 2048
+global gfile uchar 16384
+note Directory buffers carry 256 bytes of slack past the getdnts capacity, so record fields read
+note at a record start below the returned length stay in bounds.
+global gdir uchar 33024
+global gdir2 uchar 16640
+global glnk uchar 64
+global ggpu uchar 128
+global gmin ulong 8
+global gseen uchar 8
+global gpg uchar 4096
+global gpp ulong 4096
+note gst: 0 output fill, 1 root length, 2 path length, 3 file length, 4 value offset, 5 value length,
+note 6 GPU count, 7 holder pair count, 8 uninspectable processes, 9 --rm given, 10 scanned processes,
+note 11 proc directory readable, 12 resource-manager refusal code (rm.om)
+global gst ulong 16
+
+fn refuse code int msg view uchar * to void
+n = write 2 trf 0 len trf
+n = write 2 msg 0 len msg
+n = write 2 tnl 0 len tnl
+exit code
+end
+
+note The report is held whole and written once, so a refusal leaves stdout empty.
+fn oflush to void
+n = get gst 0
+if gt n 0
+w = write 1 gob 0 n
+if ne w long n
+refuse 3 tio
+end
+put gst 0 0
+end
+end
+
+fn oc b uchar to void
+if ge get gst 0 len gob
+refuse 19 tcap
+end
+put gob get gst 0 b
+put gst 0 add get gst 0 1
+end
+
+fn ot t view uchar * to void
+for i ulong len t
+oc get t i
+end
+end
+
+fn onl to void
+oc 10
+end
+
+fn ona to void
+ot tna
+onl
+end
+
+fn odec v ulong to void
+d = new uchar 20 0
+n = ulong 0
+x = v
+while lt n 20 bound 21
+put d n uchar add rem x 10 48
+n = add n 1
+x = div x 10
+if eq x 0
+break
+end
+end
+while gt n 0 bound 21
+n = sub n 1
+oc get d n
+end
+end
+
+fn ohu n ulong to uchar
+if lt n 10
+ret uchar add n 48
+end
+ret uchar add n 55
+end
+
+note Uppercase hex without prefix, at least w digits (w 0: no leading zeros, at least one digit).
+fn ohxw v ulong w ulong to void
+on = false
+for i ulong 16
+nb = and shr v sub 60 mul i 4 15
+if or or ne nb 0 on or ge add i w 16 eq i 15
+oc ohu nb
+on = true
+end
+end
+end
+
+fn og g ulong t view uchar * to void
+ot kgpu
+odec g
+oc 46
+ot t
+end
+
+note Optional decimal value: negative means the source file was absent.
+fn odopt v long to void
+if lt v 0
+ona
+ret
+end
+odec ulong v
+onl
+end
+
+fn ofile o ulong n ulong to void
+for i ulong n
+oc get gfile add o i
+end
+end
+
+fn ofileu o ulong n ulong to void
+for i ulong n
+c = get gfile add o i
+if and ge c 97 le c 122
+c = sub c 32
+end
+oc c
+end
+end
+
+fn ogpu g ulong o ulong n ulong to void
+for i ulong n
+c = get ggpu add mul g 16 add o i
+if and ge c 97 le c 122
+c = sub c 32
+end
+oc c
+end
+end
+
+fn pclr to void
+n = get gst 1
+for i ulong n
+put gpath i get groot i
+end
+put gst 2 n
+end
+
+fn pc b uchar to void
+n = get gst 2
+if ge n sub len gpath 1
+refuse 19 tcap
+end
+put gpath n b
+put gst 2 add n 1
+end
+
+fn pt t view uchar * to void
+for i ulong len t
+pc get t i
+end
+end
+
+fn pdec v ulong to void
+d = new uchar 20 0
+n = ulong 0
+x = v
+while lt n 20 bound 21
+put d n uchar add rem x 10 48
+n = add n 1
+x = div x 10
+if eq x 0
+break
+end
+end
+while gt n 0 bound 21
+n = sub n 1
+pc get d n
+end
+end
+
+fn pgpu g ulong to void
+for i ulong 12
+pc get ggpu add mul g 16 i
+end
+end
+
+fn pdir2 o ulong n ulong to void
+for i ulong n
+pc get gdir2 add o i
+end
+end
+
+note Reads the file named by gpath into gfile; returns its length or minus errno. At most
+note len gfile - 1 bytes are read, so get gfile at the returned length stays in bounds.
+fn rdf to long
+fd = fopen gpath 0 get gst 2 0 0
+if lt fd 0
+put gst 3 0
+ret fd
+end
+t = ulong 0
+cap = sub len gfile 1
+while lt t cap bound 100000
+r = read int fd gfile t sub cap t
+if lt r 0
+c = fclose int fd
+put gst 3 0
+ret r
+end
+if eq r 0
+break
+end
+t = add t ulong r
+end
+c = fclose int fd
+put gst 3 t
+ret long t
+end
+
+note Like rdf, but a file that fills gfile is refused rather than read truncated.
+fn rdopt to long
+r = rdf
+if ge r long sub len gfile 1
+refuse 19 tcap
+end
+ret r
+end
+
+fn isws c uchar to bool
+ret or or eq c 32 eq c 9 or eq c 10 eq c 13
+end
+
+fn ishx c uchar to bool
+ret or and ge c 48 le c 57 and ge c 97 le c 102
+end
+
+fn hxv c uchar to ulong
+if le c 57
+ret ulong sub c 48
+end
+ret ulong sub c 87
+end
+
+fn lnpre o ulong t view uchar * to bool
+n = get gst 3
+if gt len t sub n o
+ret false
+end
+for k ulong len t
+if ne get gfile add o k get t k
+ret false
+end
+end
+ret true
+end
+
+note Finds the first line of gfile starting with t; sets gst 4 to the byte after t.
+fn findk t view uchar * to bool
+n = get gst 3
+o = ulong 0
+while lt o n bound 100000
+if lnpre o t
+put gst 4 add o len t
+ret true
+end
+while and lt o n ne get gfile o 10 bound 100000
+o = add o 1
+end
+o = add o 1
+end
+ret false
+end
+
+note From gst 4, skips blanks; sets gst 4 and gst 5 to the value up to the line end, trailing blanks trimmed.
+fn val to void
+n = get gst 3
+o = get gst 4
+while and lt o n or eq get gfile o 32 eq get gfile o 9 bound 100000
+o = add o 1
+end
+e = o
+while and lt e n ne get gfile e 10 bound 100000
+e = add e 1
+end
+while gt e o bound 100000
+c = get gfile sub e 1
+if not or or eq c 32 eq c 9 eq c 13
+break
+end
+e = sub e 1
+end
+put gst 4 o
+put gst 5 sub e o
+end
+
+fn isver o ulong n ulong to bool
+if or eq n 0 gt n 32
+ret false
+end
+dots = ulong 0
+prev = uchar 46
+for i ulong n
+c = get gfile add o i
+if eq c 46
+if eq prev 46
+ret false
+end
+dots = add dots 1
+else
+if or lt c 48 gt c 57
+ret false
+end
+end
+prev = c
+end
+ret and gt dots 0 ne prev 46
+end
+
+fn pver to void
+pclr
+pt tver
+r = rdopt
+if lt r 0
+if eq r neg long 2
+refuse 4 tnodrv
+end
+refuse 3 tio
+end
+if not findk tnvrm
+refuse 10 tbver
+end
+n = get gst 3
+o = get gst 4
+found = false
+while and lt o n ne get gfile o 10 bound 100000
+if isws get gfile o
+o = add o 1
+continue
+end
+e = o
+while and lt e n not isws get gfile e bound 100000
+e = add e 1
+end
+if isver o sub e o
+put gst 4 o
+put gst 5 sub e o
+found = true
+break
+end
+o = e
+end
+if not found
+refuse 10 tbver
+end
+ot kdrv
+ofile get gst 4 get gst 5
+onl
+end
+
+note Directory entry helpers over getdents64 records: d_reclen u16 at 16, d_name at 19.
+fn dlen o ulong to ulong
+ret or ulong get gdir add o 16 shl ulong get gdir add o 17 8
+end
+
+fn dlen2 o ulong to ulong
+ret or ulong get gdir2 add o 16 shl ulong get gdir2 add o 17 8
+end
+
+fn dnam o ulong e ulong to ulong
+n = ulong 0
+while and lt add o n e ne get gdir add o n 0 bound 300
+n = add n 1
+end
+ret n
+end
+
+fn dnam2 o ulong e ulong to ulong
+n = ulong 0
+while and lt add o n e ne get gdir2 add o n 0 bound 300
+n = add n 1
+end
+ret n
+end
+
+fn isdot o ulong n ulong to bool
+if or eq n 0 gt n 2
+ret false
+end
+if ne get gdir o 46
+ret false
+end
+ret or eq n 1 eq get gdir add o 1 46
+end
+
+fn isbus o ulong n ulong to bool
+if ne n 12
+ret false
+end
+for i ulong 12
+c = get gdir add o i
+if or eq i 4 eq i 7
+if ne c 58
+ret false
+end
+continue
+end
+if eq i 10
+if ne c 46
+ret false
+end
+continue
+end
+if not ishx c
+ret false
+end
+end
+ret true
+end
+
+fn addgpu o ulong n ulong to void
+if not isbus o n
+refuse 12 tbgpu
+end
+g = get gst 6
+if ge g 8
+refuse 19 tcap
+end
+for i ulong 12
+put ggpu add mul g 16 i get gdir add o i
+end
+put gst 6 add g 1
+end
+
+fn gpult a ulong b ulong to bool
+for i ulong 12
+x = get ggpu add mul a 16 i
+y = get ggpu add mul b 16 i
+if ne x y
+ret lt x y
+end
+end
+ret false
+end
+
+fn gpusw a ulong b ulong to void
+for i ulong 16
+x = get ggpu add mul a 16 i
+put ggpu add mul a 16 i get ggpu add mul b 16 i
+put ggpu add mul b 16 i x
+end
+end
+
+fn lsgpu to void
+put gst 6 0
+pclr
+pt tgpd
+fd = fopen gpath 0 get gst 2 16384 0
+if lt fd 0
+if eq fd neg long 2
+ret
+end
+refuse 3 tio
+end
+while true bound 10000
+r = getdnts int fd gdir 0 32768
+if lt r 0
+refuse 3 tio
+end
+if eq r 0
+break
+end
+o = ulong 0
+while lt o ulong r bound 100000
+rl = dlen o
+if lt rl 20
+refuse 3 tio
+end
+e = add o rl
+nm = add o 19
+l = dnam nm e
+if not isdot nm l
+addgpu nm l
+end
+o = e
+end
+end
+c = fclose int fd
+n = get gst 6
+for i ulong n
+for j ulong sub sub n i 1
+if gpult add j 1 j
+gpusw j add j 1
+end
+end
+end
+end
+
+note Bus Location must equal the directory name exactly.
+fn chkbus g ulong to void
+if ne get gst 5 12
+refuse 12 tbgpu
+end
+o = get gst 4
+for i ulong 12
+if ne get gfile add o i get ggpu add mul g 16 i
+refuse 12 tbgpu
+end
+end
+end
+
+fn chkuuid to void
+o = get gst 4
+if ne get gst 5 40
+refuse 12 tbgpu
+end
+if not lnpre o tgpup
+refuse 12 tbgpu
+end
+for i ulong 36
+c = get gfile add o add 4 i
+if or or eq i 8 eq i 13 or eq i 18 eq i 23
+if ne c 45
+refuse 12 tbgpu
+end
+continue
+end
+if not ishx c
+refuse 12 tbgpu
+end
+end
+end
+
+fn pminor to ulong
+o = get gst 4
+n = get gst 5
+if or eq n 0 gt n 3
+refuse 12 tbgpu
+end
+v = ulong 0
+for i ulong n
+c = get gfile add o i
+if or lt c 48 gt c 57
+refuse 12 tbgpu
+end
+v = add mul v 10 ulong sub c 48
+end
+if gt v 255
+refuse 12 tbgpu
+end
+ret v
+end
+
+fn chkvb to void
+o = get gst 4
+n = get gst 5
+if or eq n 0 gt n 32
+refuse 12 tbgpu
+end
+for i ulong n
+c = get gfile add o i
+if not or ishx c eq c 46
+refuse 12 tbgpu
+end
+end
+end
+
+fn chkprn to void
+o = get gst 4
+n = get gst 5
+if or eq n 0 gt n 63
+refuse 12 tbgpu
+end
+for i ulong n
+c = get gfile add o i
+if or lt c 33 gt c 126
+refuse 12 tbgpu
+end
+end
+end
+
+note Information file fields, validated and written in report order.
+fn rinfo g ulong to void
+pclr
+pt tgpd
+pc 47
+pgpu g
+pt tinfo
+r = rdopt
+if lt r 0
+refuse 3 tio
+end
+if not findk kbusl
+refuse 11 tmkey
+end
+val
+chkbus g
+og g kbusid
+oc 48
+oc 48
+oc 48
+oc 48
+ogpu g 0 4
+oc 58
+ogpu g 5 2
+oc 58
+ogpu g 8 4
+onl
+og g kdom
+ogpu g 0 4
+onl
+og g kbus
+ogpu g 5 2
+onl
+og g kdevice
+ogpu g 8 2
+onl
+if not findk kuuid
+refuse 11 tmkey
+end
+val
+chkuuid
+og g kuuido
+ofile get gst 4 get gst 5
+onl
+if not findk kminor
+refuse 11 tmkey
+end
+val
+put gmin g pminor
+og g kmino
+odec get gmin g
+onl
+og g kvbo
+if findk kvbios
+val
+chkvb
+ofileu get gst 4 get gst 5
+onl
+else
+ona
+end
+og g kgspo
+if findk kgspfw
+val
+chkprn
+ofile get gst 4 get gst 5
+onl
+else
+ona
+end
+end
+
+fn psys g ulong t view uchar * to void
+pclr
+pt tsysd
+pgpu g
+pt t
+end
+
+note sysfs "0x" + 1..8 lowercase hex digits, optional newline; minus one when the file is absent.
+fn rdhex to long
+r = rdopt
+if lt r 0
+ret neg long 1
+end
+n = get gst 3
+if gt n 0
+if eq get gfile sub n 1 10
+n = sub n 1
+end
+end
+if or or lt n 3 gt n 10 or ne get gfile 0 48 ne get gfile 1 120
+refuse 14 tbnum
+end
+v = ulong 0
+for i ulong sub n 2
+c = get gfile add 2 i
+if not ishx c
+refuse 14 tbnum
+end
+v = or shl v 4 hxv c
+end
+ret long v
+end
+
+fn rddec to long
+r = rdopt
+if lt r 0
+ret neg long 1
+end
+n = get gst 3
+if gt n 0
+if eq get gfile sub n 1 10
+n = sub n 1
+end
+end
+if or eq n 0 gt n 9
+refuse 14 tbnum
+end
+v = ulong 0
+for i ulong n
+c = get gfile i
+if or lt c 48 gt c 57
+refuse 14 tbnum
+end
+v = add mul v 10 ulong sub c 48
+end
+ret long v
+end
+
+note PCIe generation from the sysfs link speed; minus one when absent or "Unknown".
+fn rdgen to long
+r = rdopt
+if lt r 0
+ret neg long 1
+end
+if lnpre 0 sunk
+ret neg long 1
+end
+if lnpre 0 sg1
+ret 1
+end
+if lnpre 0 sg2
+ret 2
+end
+if lnpre 0 sg3
+ret 3
+end
+if lnpre 0 sg4
+ret 4
+end
+if lnpre 0 sg5
+ret 5
+end
+if lnpre 0 sg6
+ret 6
+end
+refuse 15 tbspd
+ret 0
+end
+
+fn ohexid hi long lo long to void
+if or lt hi 0 lt lo 0
+ona
+ret
+end
+oc 48
+oc 120
+ohxw or shl ulong hi 16 ulong lo 8
+onl
+end
+
+fn rsys g ulong to void
+psys g fvend
+ven = rdhex
+if and ge ven 0 ne ven 0x10de
+refuse 13 tvend
+end
+psys g fdevi
+dev = rdhex
+psys g fsvnd
+sven = rdhex
+psys g fsdev
+sdev = rdhex
+psys g fclass
+cls = rdhex
+og g kdevid
+ohexid dev ven
+og g ksubid
+ohexid sdev sven
+og g kbcls
+if lt cls 0
+ona
+else
+oc 48
+oc 120
+ohxw shr ulong cls 16 0
+onl
+end
+og g kscls
+if lt cls 0
+ona
+else
+oc 48
+oc 120
+ohxw and shr ulong cls 8 255 0
+onl
+end
+end
+
+fn rlink g ulong to void
+psys g fcls
+v = rdgen
+og g kgenc
+odopt v
+psys g fmls
+v = rdgen
+og g kgenm
+odopt v
+psys g fclw
+v = rddec
+og g kwidc
+odopt v
+psys g fmlw
+v = rddec
+og g kwidm
+odopt v
+end
+
+note Exact match "/dev/nvidia<1..3 digits>"; returns the minor or minus one.
+fn lnkmin n long to long
+if or lt n 12 gt n 14
+ret neg long 1
+end
+for i ulong len tdevn
+if ne get glnk i get tdevn i
+ret neg long 1
+end
+end
+v = long 0
+for i ulong sub ulong n len tdevn
+c = get glnk add len tdevn i
+if or lt c 48 gt c 57
+ret neg long 1
+end
+v = add mul v 10 long sub c 48
+end
+ret v
+end
+
+fn addpair g ulong pid ulong to void
+k = get gst 7
+if ge k len gpp
+refuse 19 tcap
+end
+put gpg k uchar g
+put gpp k pid
+put gst 7 add k 1
+end
+
+fn fdmin pid ulong o ulong n ulong to long
+pclr
+pt tproc
+pdec pid
+pt tfd
+pc 47
+pdir2 o n
+r = readlnk gpath 0 get gst 2 glnk 0 len glnk
+if le r 0
+ret neg long 1
+end
+ret lnkmin r
+end
+
+fn chkfd pid ulong o ulong n ulong to void
+m = fdmin pid o n
+if lt m 0
+ret
+end
+mu = ulong m
+ng = get gst 6
+for g ulong ng
+if ne get gseen g 0
+continue
+end
+if eq get gmin g mu
+put gseen g 1
+addpair g pid
+end
+end
+end
+
+note One process: every /dev/nvidia<minor> link in ROOT/proc/<pid>/fd marks it as a holder of that GPU.
+fn scanpid pid ulong to void
+for i ulong len gseen
+put gseen i 0
+end
+pclr
+pt tproc
+pdec pid
+pt tfd
+fd = fopen gpath 0 get gst 2 16384 0
+if lt fd 0
+put gst 8 add get gst 8 1
+ret
+end
+while true bound 10000
+r = getdnts int fd gdir2 0 16384
+if le r 0
+break
+end
+o = ulong 0
+while lt o ulong r bound 100000
+rl = dlen2 o
+if lt rl 20
+break
+end
+e = add o rl
+nm = add o 19
+l = dnam2 nm e
+if and gt l 0 ne get gdir2 nm 46
+chkfd pid nm l
+end
+o = e
+end
+end
+c = fclose int fd
+end
+
+fn piddec o ulong n ulong to long
+if or eq n 0 gt n 10
+ret neg long 1
+end
+v = ulong 0
+for i ulong n
+c = get gdir add o i
+if or lt c 48 gt c 57
+ret neg long 1
+end
+v = add mul v 10 ulong sub c 48
+end
+ret long v
+end
+
+fn pairlt a ulong b ulong to bool
+if ne get gpg a get gpg b
+ret lt get gpg a get gpg b
+end
+ret lt get gpp a get gpp b
+end
+
+fn pairsw a ulong b ulong to void
+x = get gpg a
+put gpg a get gpg b
+put gpg b x
+y = get gpp a
+put gpp a get gpp b
+put gpp b y
+end
+
+fn scan to void
+put gst 7 0
+put gst 8 0
+put gst 10 0
+put gst 11 0
+pclr
+pt tproc0
+fd = fopen gpath 0 get gst 2 16384 0
+if lt fd 0
+ret
+end
+put gst 11 1
+while true bound 10000
+r = getdnts int fd gdir 0 32768
+if lt r 0
+refuse 3 tio
+end
+if eq r 0
+break
+end
+o = ulong 0
+while lt o ulong r bound 100000
+rl = dlen o
+if lt rl 20
+refuse 3 tio
+end
+e = add o rl
+nm = add o 19
+pid = piddec nm dnam nm e
+if ge pid 0
+put gst 10 add get gst 10 1
+scanpid ulong pid
+end
+o = e
+end
+end
+c = fclose int fd
+n = get gst 7
+for i ulong n
+for j ulong sub sub n i 1
+if pairlt add j 1 j
+pairsw j add j 1
+end
+end
+end
+end
+
+note Process name: argv[0] from cmdline, else comm; bytes outside 32..126 print as '?'.
+fn oname pid ulong to void
+pclr
+pt tproc
+pdec pid
+pt tcmd
+r = rdf
+n = ulong 0
+while and lt n ulong r ne get gfile n 0 bound 20000
+n = add n 1
+end
+if eq n 0
+pclr
+pt tproc
+pdec pid
+pt tcomm
+r2 = rdf
+if gt r2 0
+n = ulong r2
+if eq get gfile sub n 1 10
+n = sub n 1
+end
+end
+end
+if eq n 0
+ona
+ret
+end
+if gt n 1024
+n = 1024
+end
+for i ulong n
+c = get gfile i
+if or lt c 32 gt c 126
+c = 63
+end
+oc c
+end
+onl
+end
+
+fn oholder g ulong to void
+if eq get gst 11 0
+og g kholds
+ona
+ret
+end
+k = ulong 0
+for i ulong get gst 7
+if eq ulong get gpg i g
+p = get gpp i
+og g khold
+odec k
+ot kpid
+odec p
+onl
+og g khold
+odec k
+ot kpname
+oname p
+k = add k 1
+end
+end
+og g kholds
+odec k
+onl
+end
+
+note The whole /proc and /sys report; rm.om main calls it before any resource-manager query.
+fn report to void
+ot tsrc
+if ne get gst 9 0
+ot tsrcrm
+end
+onl
+pver
+lsgpu
+ot kcount
+odec get gst 6
+onl
+for g ulong get gst 6
+rinfo g
+rsys g
+rlink g
+if eq get gst 9 0
+og g kname
+ona
+og g ktemp
+ona
+og g kpst
+ona
+end
+end
+scan
+for g ulong get gst 6
+oholder g
+end
+ot kscan
+if eq get gst 11 0
+ona
+else
+odec get gst 10
+onl
+end
+ot kunins
+if eq get gst 11 0
+ona
+else
+odec get gst 8
+onl
+end
+end
+
+fn argis n long t view uchar * to bool
+if ne ulong n len t
+ret false
+end
+for i ulong len t
+if ne get gpath i get t i
+ret false
+end
+end
+ret true
+end
+
+note Parses the command line into gst 1 (root length, groot) and gst 9 (--rm).
+fn args to void
+ac = argcnt
+i = long 1
+root = false
+while lt i ac bound 16
+n = argread ulong i gpath 0 len gpath
+if le n 0
+refuse 2 tuse
+end
+if argis n targm
+if ne get gst 9 0
+refuse 2 tuse
+end
+put gst 9 1
+i = add i 1
+continue
+end
+if not argis n targr
+refuse 2 tuse
+end
+if or root ge add i 1 ac
+refuse 2 tuse
+end
+root = true
+m = argread ulong add i 1 groot 0 len groot
+if or le m 0 ge m long len groot
+refuse 2 tuse
+end
+put gst 1 ulong m
+i = add i 2
+end
+end
