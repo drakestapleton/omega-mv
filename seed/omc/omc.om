@@ -1345,6 +1345,9 @@ end
 if eq w 7308604897285727600
 ret 224
 end
+if eq w 6384998
+ret 227
+end
 if eq get om2 0 0
 ret 0
 end
@@ -1920,15 +1923,17 @@ global fg_e long 1
 global fg_q ulong 1
 global fg_m ulong 1
 global fg_stk ulong 1
-global fg_low ulong 1
-global fg_ov ulong 1
+global fbn ulong 80
 
 note ======== float literals: decimal text to IEEE-754 binary32/binary64 ========
-note The literal is fnd * 10^fp10. The converter normalizes fnd to a 64-bit significand, applies the
-note decimal scale one factor of ten at a time (fmul10/fdiv10) while folding lost bits into one sticky
-note flag, then rounds once (froundsh) and packs (fpack). It covers the full IEEE range, subnormals
-note included, and refuses (error 8) only a value that rounds to infinity or whose digits do not fit
-note in 2^63-1.
+note The literal is fnd * 10^fp10 = A / D with A = fnd * 10^max(fp10,0) and D = 10^max(-fp10,0), both
+note held exactly as 40 32-bit limbs in fbn (A at 0, D at 40). The smaller of the two is shifted to the
+note other's bit length, then restoring division yields the first 64 quotient bits (fg_m, leading bit
+note set) and a remainder whose nonzero-ness is the sticky flag (fg_stk); froundsh rounds that exact
+note truncation once to nearest even and fpack packs it, subnormals included (#1024: the old converter
+note scaled one factor of ten at a time and dropped bits at every step). fp10 < -343 means a value
+note below (2^63-1)*10^-344 < 2^-1075, signed zero; fp10 > 308 means at least 10^309, above the
+note binary64 maximum (error 8). So A and D never exceed 1141 bits.
 
 note blen: bits needed for x (0 for zero)
 fn blen x ulong to ulong
@@ -1943,8 +1948,8 @@ end
 note fparse: read the literal text inp[pos, pos+len) into fsgn, fnd, fp10, fsuf (0 none, 1 f32, 2 f64).
 note Grammar: [-]digits[.digits][(e|E)[+|-]digits][f32|f64]. At most 2^63-1 significant digits
 note (error 8), a dot with no digit after it is error 6, |exponent| <= 999 (error 8).
-note The digit scans here and in fexp and the decimal steps in fbits run as nested 999999-pass loops: a
-note literal of more than 1000000 zero digits trapped 4 in a single loop's hidden 1000000-pass guard (#965).
+note The digit scans here and in fexp run as nested 999999-pass loops: a literal of more than 1000000
+note zero digits trapped 4 in a single loop's hidden 1000000-pass guard (#965).
 fn fparse pos ulong ln ulong to void
 p = pos
 e = add pos ln
@@ -2074,48 +2079,66 @@ end
 ret p
 end
 
-note fbits: the parsed literal as IEEE bits of type ty (10 f32, 11 f64). Zero keeps the sign (-0.0).
-note fmul10 / fdiv10: one exact decimal step on the normalized significand fg_m (value = fg_m * 2^fg_e),
-note keeping fg_m in [2^63, 2^64) and folding every lost bit into fg_stk. No rounding happens here.
-fn fmul10 to void
-m = get fg_m 0
-hi = shr m 32
-lo = and m 4294967295
-p0 = mul lo 10
-p1 = mul hi 10
-hi2 = add p1 shr p0 32
-put fg_low 0 or shl and hi2 4294967295 32 and p0 4294967295
-put fg_ov 0 shr hi2 32
-fmn10
+note fbmul: limbs fbn[o, o+40) times k (k < 2^32, so each limb step fits 64 bits); the product must fit
+note in 40 limbs. Returns its bit length, so fbmul o 1 only measures.
+fn fbmul o ulong k ulong to ulong
+c = ulong 0
+t = ulong 0
+i = ulong 0
+while lt i 40
+j = add o i
+v = add mul get fbn j k c
+put fbn j and v 4294967295
+c = shr v 32
+if ne and v 4294967295 0
+t = add mul i 32 blen and v 4294967295
+end
+i = add i 1
+end
+ret t
 end
 
-fn fmn10 to void
-ov = get fg_ov 0
-low = get fg_low 0
-s = blen ov
-if ne s 0
-st = or get fg_stk 0 and low sub shl 1 s 1
-put fg_stk 0 st
-put fg_m 0 or shl ov sub 64 s shr low s
-put fg_e 0 add get fg_e 0 long s
-else
-put fg_m 0 low
+note fbpow: fbn[o, o+40) times b^n (b 2 or 10), in factors that stay below 2^32.
+fn fbpow o ulong b ulong n ulong to void
+while gt n 0
+m = ulong 1
+c = ulong 0
+while and lt c n le mul m b 4294967295
+m = mul m b
+c = add c 1
+end
+t = fbmul o m
+n = sub n c
 end
 end
 
-fn fdiv10 to void
-m = get fg_m 0
-q = div m 10
-if ne rem m 10 0
-put fg_stk 0 1
+note fbsub: one restoring-division step. If A >= D then A = A - D and 1, else A is kept and 0.
+fn fbsub to ulong
+r = ulong 2
+i = ulong 40
+while and gt i 0 eq r 2
+i = sub i 1
+a = get fbn i
+d = get fbn add i 40
+if lt a d
+r = ulong 0
 end
-s = ulong 0
-while lt q 9223372036854775808
-q = shl q 1
-s = add s 1
+if gt a d
+r = ulong 1
 end
-put fg_m 0 q
-put fg_e 0 sub get fg_e 0 long s
+end
+if eq r 0
+ret 0
+end
+b = ulong 0
+i = ulong 0
+while lt i 40
+v = sub sub get fbn i get fbn add i 40 b
+put fbn i and v 4294967295
+b = shr v 63
+i = add i 1
+end
+ret 1
 end
 
 note froundsh: round fg_m right by sh bits to fg_q, nearest even; the guard and every lower bit
@@ -2194,10 +2217,11 @@ q = or q shl get fsgn 0 sub w 1
 ret q
 end
 
+note fbits: the parsed literal as IEEE bits of type ty (10 f32, 11 f64). Zero keeps the sign (-0.0).
 fn fbits ty ulong to ulong
 put fg_ty 0 ty
-put fg_stk 0 0
-if eq get fnd 0 0
+p = get fp10 0
+if or eq get fnd 0 0 lt p -343
 w = ulong 64
 if eq ty 10
 w = ulong 32
@@ -2208,34 +2232,41 @@ b = shl ulong 1 sub w 1
 end
 ret b
 end
-b = blen get fnd 0
-sh = sub 64 b
-put fg_m 0 shl get fnd 0 sh
-put fg_e 0 sub 0 long sh
-p = get fp10 0
-if gt p 0
+if gt p 308
+fail 8
+end
 i = ulong 0
-n = ulong p
-while lt i n
-fmul10
+while lt i 80
+put fbn i 0
 i = add i 1
 end
+put fbn 0 and get fnd 0 4294967295
+put fbn 1 shr get fnd 0 32
+put fbn 40 1
+if gt p 0
+fbpow 0 10 ulong p
 else
-if lt p 0
-i = ulong 0
-n = ulong sub 0 p
-while lt i n
-c = sub n i
-if gt c 999999
-c = ulong 999999
+fbpow 40 10 ulong sub 0 p
 end
-for k ulong c
-fdiv10
+a = fbmul 0 1
+d = fbmul 40 1
+e = long 0
+if lt a d
+fbpow 0 2 sub d a
+e = sub 0 long sub d a
+else
+fbpow 40 2 sub a d
+e = long sub a d
 end
-i = add i c
+q = ulong 0
+while lt q 9223372036854775808
+q = or shl q 1 fbsub
+a = fbmul 0 2
+e = sub e 1
 end
-end
-end
+put fg_m 0 q
+put fg_e 0 add e 1
+put fg_stk 0 fbmul 0 1
 ret fpack
 end
 
@@ -4445,6 +4476,74 @@ fp_minmax c at va vb vtw r
 put rk 0 9
 put rv 0 r
 end
+put rt 0 at
+vdec
+end
+
+note FMADD (scalar), ARM C7: one rounded multiply-add, not FMUL followed by FADD.
+note The addend is Ra, bits 14..10; multiplicands Rn, Rm are bits 9..5, 20..16.
+fn ffma dst ulong to void
+o = get fpo 0
+put fpo 0 0
+note x86's baseline is SSE2, not FMA3. No unfused fallback is permitted.
+if or ne get irmode 0 0 ne get xtarget 0 0
+fail 9
+end
+put fpw 0 1
+rdval 0 0 255 0
+if eq get rk 0 6
+fail 11
+end
+at = get rt 0
+if eq isfloat at 0
+fail 7
+end
+ak = get rk 0
+av = get rv 0
+put fpw 0 1
+rdval 0 0 255 0
+if eq get rk 0 6
+fail 11
+end
+if ne get rt 0 at
+fail 7
+end
+bk = get rk 0
+bv = get rv 0
+put fpw 0 1
+rdval 0 0 255 0
+if eq get rk 0 6
+fail 11
+end
+if ne get rt 0 at
+fail 7
+end
+va = fvop ak av at 0
+vb = fvop bk bv at 1
+vc = fvop get rk 0 get rv 0 at 2
+r = ulong 0
+vd = ulong 3
+if eq o 0
+r = destreg dst
+else
+r = fvdst o
+vd = vtw r
+end
+b = ulong 520093696
+if eq at 11
+b = 524288000
+end
+b = or b shl vb 16
+b = or b shl vc 10
+b = or b shl va 5
+emit or b vd
+if eq o 0
+fv2x at vd r
+put rk 0 1
+else
+put rk 0 9
+end
+put rv 0 r
 put rt 0 at
 vdec
 end
@@ -6809,7 +6908,12 @@ end
 
 note Bounded mapping table belongs to the emitted program, not the compiler process.
 note 128 slots of address, byte length, generation, access. Only owned spans are accessible.
+note Function mode has no program image: the caller's runtime table supplies the zero-initialised
+note 4096-byte table at entry 31 (mcheck and mnew load it from [x7, #248]); nothing is reserved here.
 fn mtinit to void
+if eq get progmode 0 0
+ret
+end
 if eq get maptab 0 0
 p = get poolb 0
 if gt p 1073737728
@@ -6837,21 +6941,46 @@ end
 note Validate a long handle in X10; produce entry X11, base X13, length X12.
 note The slot's generation defeats a stale handle after close and slot reuse.
 fn mcheck to void
+if eq get progmode 0 0
+matconst 15 8191
+else
 matconst 15 255
+end
 e3 2315255808 11 10 15
 mimmed 4043309056 31 11 1
 trapc 3 3
+if eq get progmode 0 0
+mload 14 7 31
+mload 14 14 0
+mimmed 4043309056 31 14 1
+trapc 3 3
+matconst 15 4098
+e3 3942645760 31 14 15
+trapc 8 3
+e3 3942645760 31 11 14
+trapc 8 3
+else
 mimmed 4043309056 31 11 128
 trapc 8 3
+end
 mimmed 3506438144 11 11 1
 matconst 15 32
 e3 2600500224 11 11 15
+if eq get progmode 0 0
+mload 15 7 31
+mimmed 2432696320 15 15 32
+else
 matconst 15 get maptab 0
+end
 e3 2332033024 11 11 15
 mload 14 11 2
 mimmed 4043309056 31 14 0
 trapc 0 3
+if eq get progmode 0 0
+matconst 15 13
+else
 matconst 15 8
+end
 e3 2596283392 10 10 15
 e3 3942645760 31 10 14
 trapc 1 3
@@ -6924,20 +7053,45 @@ trapc 1 3
 matconst 4 18446744073709551615
 matconst 5 0
 end
+if eq get progmode 0 0
+mload 9 7 31
+mload 12 9 0
+mimmed 4043309056 31 12 1
+trapc 3 3
+matconst 15 4098
+e3 3942645760 31 12 15
+trapc 8 3
+mload 14 9 2
+mimmed 4043309056 31 14 1
+trapc 3 3
+matconst 15 1125899906842623
+e3 3942645760 31 14 15
+trapc 8 3
+mimmed 2432696320 9 9 32
+else
 matconst 9 get maptab 0
+end
 matconst 10 1
 head = get oc 0
 mload 11 9 0
 mimmed 4043309056 31 11 0
 used = mbranch 1
 mload 11 9 2
+if eq get progmode 0 0
+e3 3942645760 31 11 14
+else
 matconst 15 36028797018963967
 e3 3942645760 31 11 15
+end
 vacant = mbranch 3
 patch19 used get oc 0
 mimmed 2432696320 9 9 32
 mimmed 2432696320 10 10 1
+if eq get progmode 0 0
+e3 3942645760 31 10 12
+else
 mimmed 4043309056 31 10 128
+end
 again = mbranch 9
 patch19 again head
 matconst 0 18446744073709551592
@@ -6974,7 +7128,11 @@ mimmed 2432696320 11 11 1
 mstore 11 9 2
 matconst 15 acc
 mstore 15 9 3
+if eq get progmode 0 0
+matconst 15 13
+else
 matconst 15 8
+end
 e3 2596282368 0 11 15
 e3 2852126720 0 0 10
 patch19 failed get oc 0
@@ -7025,6 +7183,11 @@ patch19 failed get oc 0
 e3 2852126720 10 31 0
 e3 2852126720 0 31 13
 e3 2852126720 1 31 12
+note Preserve a droppable owner but forbid a second bind if cleanup also fails.
+if eq get progmode 0 0
+matconst 15 4
+mstore 15 11 3
+end
 hsys 215
 mimmed 4043309056 31 0 0
 trapc 1 3
@@ -7052,6 +7215,10 @@ mcheck
 mload 15 11 3
 mimmed 4043309056 31 15 0
 trapc 0 3
+if eq get progmode 0 0
+mimmed 4043309056 31 15 3
+trapc 8 3
+end
 hload x 3 0
 e3 3942645760 31 0 12
 trapc 8 3
@@ -7103,7 +7270,7 @@ if eq e f
 fail 19
 end
 t = alloc
-matconst t 16383
+matconst t 1048576
 e3 3942645760 31 get fr add x 22 t
 trapc 8 3
 save
@@ -7186,6 +7353,10 @@ hload x 1 0
 mload 15 11 3
 mimmed 4043309056 31 15 0
 trapc 0 3
+if eq get progmode 0 0
+mimmed 4043309056 31 15 3
+trapc 8 3
+end
 e3 3942645760 31 0 12
 trapc 8 3
 e3 3405774848 12 12 0
@@ -7236,8 +7407,36 @@ end
 if ne get xtarget 0 0
 fail 25
 end
+note Function mode (no program image: no argv in x27, no x28 stack floor, no globals) refuses host
+note words with error 9, except in an OM-2 unit the file and identity subset that needs none of the
+note image: fclose 100, fopen 110, fstat 117, stat 140, getuid 145, geteuid 146, getgid 147, getegid 148,
+note lstat 149 (OMEGESE.md 10, spec/omegese-om2.md); the clocks monons 109, realns 130 and sleepns 120;
+note and the device subset devctl 166, mapnew 167, mapdrop 168, mapread 169, mapwrite 170, devcall 171,
+note uvmctl 172, mapaddr 173, mapget 174, mapset 175, maphold 176 and mapbind 177. Fixed replacement
+note is only over a whole live PROT_NONE reservation owned by this table. Each is save, inline svc,
+note restore; x7 and x19..x28 are never written. Function-mode table entry31 points at a 32-byte
+note header (capacity1..4098, generation base, generation limit, reserved) then capacity32-byte slots.
+note Handles use13slot bits; program mode retains its raw128slots and8slot-bit handles.
 if eq get progmode 0 0
+if eq get om2 0 0
 fail 9
+end
+ok = ulong 0
+if or or eq c 100 eq c 110 or eq c 117 eq c 140
+ok = ulong 1
+end
+if and ge c 145 le c 149
+ok = ulong 1
+end
+if or or eq c 109 eq c 120 eq c 130
+ok = ulong 1
+end
+if and ge c 166 le c 177
+ok = ulong 1
+end
+if eq ok 0
+fail 9
+end
 end
 x = mul get depth 0 32
 put fr add x 7 get nslot 0
@@ -7332,7 +7531,7 @@ end
 if eq c 166
 note Same bounded ioctl contract as L605 src/device/omc.om at 0dee699.
 note Compose with native host words instead of maintaining a second compiler.
-note Only literal FIONREAD or encoded read/write NVRM F requests, exact writable bytes.
+note Only literal FIONREAD, encoded read/write NVRM F, or five exact aien-gpu ABI1 A requests.
 put fr add x 23 xhreq 166 x
 e = harray x 1
 t = alloc
@@ -7594,7 +7793,9 @@ if eq exp 0
 vdone 2 get tw 0 get tbig 0
 ret
 end
-if ge exp 64
+note an integer literal where a float is expected is the mixing OMEGESE 9.9 refuses (error 7); before
+note this it was stored as raw bits (f64 x = 1 held 0x1). The conversion f64 1 reads it with exp 0.
+if or ge exp 64 ne isfloat exp 0
 fail 7
 end
 range get tw 0 exp get tbig 0
@@ -7748,6 +7949,11 @@ fintr c dst
 else
 fminmax c dst
 end
+ret
+end
+if eq c 227
+fwreq
+ffma dst
 ret
 end
 if eq c 95
@@ -14151,10 +14357,12 @@ ret 0
 end
 
 note Linux x86-64 host ABI: Linux v6.17 arch/x86/entry/syscalls/syscall_64.tbl.
-note R13 is the initial argument stack; R14 is the saved slot snapshot, private to lowering.
+note RBX anchors the saved slot snapshot; preserve R13 (initial argument stack) in its spare tail.
+note R12 (nonlocal native return), R14 (runtime dispatch), R15 (stack floor) are never scratch.
 fn xhbegin to void
 save
-xrr 137 14 4
+xmem 137 13 4 144
+xrr 137 3 4
 end
 fn xha x ulong i ulong r ulong to void
 q = add add x 8 mul i 2
@@ -14166,12 +14374,12 @@ else
 if eq k 6
 xaddr r v
 else
-xmem 139 r 14 mul v 8
+xmem 139 r 3 mul v 8
 end
 end
 end
 fn xhs r ulong s ulong to void
-xmem 139 r 14 mul s 8
+xmem 139 r 3 mul s 8
 end
 fn xhb r ulong e ulong off ulong to void
 if ge get nm_kind sub e 1 4
@@ -14189,6 +14397,7 @@ emitb 5
 end
 fn xhdone dst ulong x ulong bytes ulong to void
 xsp 0 bytes
+xmem 139 13 3 144
 hreturn dst x
 end
 fn xhcmp r ulong v ulong to void
@@ -14434,27 +14643,27 @@ xrr 133 0 0
 bad = xbranch 11
 ximm 2 0
 for j ulong 16
-xmem 137 2 12 mul j 8
+xmem 137 2 13 mul j 8
 end
 for j ulong 2
 xmem 139 2 4 mul j 8
-xmem 137 2 12 mul j 8
+xmem 137 2 13 mul j 8
 end
 xhraw 2 4 24 4
-xhput 2 12 16 4
+xhput 2 13 16 4
 xhraw 2 4 16 4
-xhput 2 12 20 4
+xhput 2 13 20 4
 xmem 139 2 4 28
-xmem 137 2 12 24
+xmem 137 2 13 24
 xmem 139 2 4 40
-xmem 137 2 12 32
+xmem 137 2 13 32
 xmem 139 2 4 48
-xmem 137 2 12 48
+xmem 137 2 13 48
 xhraw 2 4 56 4
-xhput 2 12 56 4
+xhput 2 13 56 4
 for j ulong 7
 xmem 139 2 4 add 64 mul j 8
-xmem 137 2 12 add 64 mul j 8
+xmem 137 2 13 add 64 mul j 8
 end
 ximm 0 0
 xpatch bad get oc 0
@@ -14496,7 +14705,7 @@ end
 if eq c 117
 xhcmp 2 128
 xtrap 3 3
-xrr 137 12 6
+xrr 137 13 6
 xsp 1 144
 xrr 137 6 4
 xhcall 5
@@ -14559,7 +14768,7 @@ xhs 2 get fr add x 22
 xrr 133 2 2
 xtrap 0 3
 xhpath x
-xhb 12 e get fr add x 27
+xhb 13 e get fr add x 27
 xhs 2 get fr add x 28
 xhcmp 2 128
 xtrap 3 3
@@ -14759,7 +14968,7 @@ emitb 3
 xrr 1 6 2
 end
 xmem 139 6 6 0
-xrr 137 12 6
+xrr 137 13 6
 ximm 2 0
 scan = get oc 0
 xhraw 0 6 0 1
@@ -14776,7 +14985,7 @@ xhs 1 get fr add x 22
 xrr 57 2 1
 small = xbranch 8
 xhb 7 e get fr add x 21
-xrr 137 6 12
+xrr 137 6 13
 xrr 137 1 2
 emitb 243
 emitb 164
@@ -14951,7 +15160,7 @@ xtrap 1 3
 end
 xsp 1 8192
 xrr 137 10 4
-xmem 141 12 4 4096
+xmem 141 13 4 4096
 ximm 9 0
 outer = get oc 0
 xrr 57 9 8
@@ -14973,8 +15182,8 @@ else
 xrr 133 1 1
 xtrap 0 3
 end
-xmem 137 10 12 0
-xhadd 12 8
+xmem 137 10 13 0
+xhadd 13 8
 xrr 41 2 1
 inner = get oc 0
 xrr 133 1 1
@@ -14999,10 +15208,10 @@ xpatch done get oc 0
 xrr 133 2 2
 xtrap 1 3
 ximm 0 0
-xmem 137 0 12 0
+xmem 137 0 13 0
 if eq c 124
 note As on AArch64: close_range(3, ~0U, CLOSE_RANGE_UNSHARE) first; a nonzero result skips execve
-note and returns that kernel error. RDI/RSI/RDX are reloaded after the call; R12 holds the argv end.
+note and returns that kernel error. RDI/RSI/RDX are reloaded after the call; R13 holds the argv end.
 ximm 7 3
 ximm 6 4294967295
 ximm 2 2
@@ -15011,7 +15220,7 @@ xrr 133 0 0
 p = xbranch 1
 xmem 139 7 4 4096
 xmem 141 6 4 4096
-xrr 137 2 12
+xrr 137 2 13
 xhcall 59
 xpatch p get oc 0
 else
@@ -15036,31 +15245,55 @@ end
 end
 xhdone dst x 8192
 end
-note Owned mapping handles keep the existing 128-slot generation/access table and ABI.
+note Hosted handles use the entry31 context header and 13 slot bits; programs retain raw128 slots.
 fn xhmcheck to void
-xrr 137 12 10
+xrr 137 13 10
+if eq get progmode 0 0
+ximm 0 8191
+else
 ximm 0 255
-xrr 33 12 0
-xhcmp 12 1
+end
+xrr 33 13 0
+xhcmp 13 1
 xtrap 3 3
-xhcmp 12 128
+if eq get progmode 0 0
+xmem 139 0 14 248
+xmem 139 0 0 0
+xhcmp 0 1
+xtrap 3 3
+xhcmp 0 4098
 xtrap 8 3
-xhsub 12 1
-xb 73 193 228
+xrr 57 13 0
+xtrap 8 3
+else
+xhcmp 13 128
+xtrap 8 3
+end
+xhsub 13 1
+xb 73 193 229
 emitb 5
+if eq get progmode 0 0
+xmem 139 0 14 248
+xhadd 0 32
+else
 xaddr 0 get maptab 0
-xrr 1 12 0
-xmem 139 9 12 16
+end
+xrr 1 13 0
+xmem 139 9 13 16
 xrr 133 9 9
 xtrap 0 3
 xb 73 193 234
+if eq get progmode 0 0
+emitb 13
+else
 emitb 8
+end
 xrr 57 10 9
 xtrap 1 3
-xmem 139 8 12 0
+xmem 139 8 13 0
 xrr 133 8 8
 xtrap 0 3
-xmem 139 9 12 8
+xmem 139 9 13 8
 end
 fn xhmnew c ulong dst ulong x ulong to void
 acc = ulong 0
@@ -15121,19 +15354,46 @@ xtrap 1 3
 ximm 8 18446744073709551615
 ximm 9 0
 end
-xaddr 12 get maptab 0
+if eq get progmode 0 0
+xmem 139 13 14 248
+xmem 139 0 13 0
+xhcmp 0 1
+xtrap 3 3
+xhcmp 0 4098
+xtrap 8 3
+xmem 139 0 13 16
+xhcmp 0 1
+xtrap 3 3
+xhcmp 0 1125899906842623
+xtrap 8 3
+xhadd 13 32
+else
+xaddr 13 get maptab 0
+end
 ximm 2 1
 head = get oc 0
-xmem 139 0 12 0
+xmem 139 0 13 0
 xrr 133 0 0
 used = xbranch 1
-xmem 139 10 12 16
+xmem 139 10 13 16
+if eq get progmode 0 0
+xmem 139 11 14 248
+xmem 139 11 11 16
+xrr 57 10 11
+else
 xhcmp 10 36028797018963967
+end
 vacant = xbranch 3
 xpatch used get oc 0
-xhadd 12 32
+xhadd 13 32
 xhadd 2 1
+if eq get progmode 0 0
+xmem 139 11 14 248
+xmem 139 11 11 0
+xrr 57 2 11
+else
 xhcmp 2 128
+end
 again = xbranch 9
 xpatch again head
 ximm 0 sub ulong 0 24
@@ -15167,17 +15427,21 @@ ximm 0 sub ulong 0 95
 wrong = xbranch 14
 xpatch exact get oc 0
 end
-xmem 137 0 12 0
+xmem 137 0 13 0
 xmem 139 2 4 8
-xmem 137 2 12 8
+xmem 137 2 13 8
 xmem 139 2 4 16
 xhadd 2 1
-xmem 137 2 12 16
+xmem 137 2 13 16
 ximm 0 acc
-xmem 137 0 12 24
+xmem 137 0 13 24
 xrr 137 0 2
 xb 72 193 224
+if eq get progmode 0 0
+emitb 13
+else
 emitb 8
+end
 xmem 139 2 4 0
 xrr 9 0 2
 xpatch failed get oc 0
@@ -15203,7 +15467,7 @@ end
 xhbegin
 xha x 0 10
 xhmcheck
-xmem 139 0 12 24
+xmem 139 0 13 24
 xrr 133 0 0
 xtrap 1 3
 xsp 1 32
@@ -15222,20 +15486,22 @@ xmem 139 2 4 0
 xrr 57 0 2
 xtrap 1 3
 ximm 0 acc
-xmem 137 0 12 24
+xmem 137 0 13 24
 ximm 0 0
 done = xbranch 14
 xpatch failed get oc 0
 xmem 137 0 4 16
+ximm 0 4
+xmem 137 0 13 24
 xmem 139 7 4 0
 xmem 139 6 4 8
 xhcall 11
 xrr 133 0 0
 xtrap 1 3
 ximm 0 0
-xmem 137 0 12 0
-xmem 137 0 12 8
-xmem 137 0 12 24
+xmem 137 0 13 0
+xmem 137 0 13 8
+xmem 137 0 13 24
 xmem 139 0 4 16
 xpatch done get oc 0
 xhdone dst x 32
@@ -15251,9 +15517,11 @@ e = harray x wr
 xhbegin
 xha x 4 10
 xhmcheck
-xmem 139 0 12 24
+xmem 139 0 13 24
 xrr 133 0 0
 xtrap 0 3
+xhcmp 0 3
+xtrap 8 3
 xha x 3 2
 xrr 57 2 9
 xtrap 8 3
@@ -15265,7 +15533,7 @@ xrr 1 8 2
 xhb 7 e get fr add x 21
 xrr 137 6 8
 if eq c 170
-xmem 139 0 12 24
+xmem 139 0 13 24
 xhcmp 0 3
 xtrap 1 3
 xrr 137 6 7
@@ -15304,9 +15572,11 @@ xhbegin
 xha x 0 10
 xhmcheck
 xha x 1 2
-xmem 139 0 12 24
+xmem 139 0 13 24
 xrr 133 0 0
 xtrap 0 3
+xhcmp 0 3
+xtrap 8 3
 xrr 57 2 9
 xtrap 8 3
 xrr 41 9 2
@@ -15319,7 +15589,7 @@ xrr 133 0 0
 xtrap 1 3
 xrr 1 8 2
 if eq c 175
-xmem 139 0 12 24
+xmem 139 0 13 24
 xhcmp 0 3
 xtrap 1 3
 xha x 3 2
@@ -15360,7 +15630,14 @@ n = ulong 4
 if eq c 166
 if ne q 21531
 if ne and q 3221290752 3221243392
+ok = eq q 2154840336
+ok = or ok eq q 3224387873
+ok = or ok eq q 3222815010
+ok = or ok eq q 3225960739
+ok = or ok eq q 3222815012
+if not ok
 fail 9
+end
 end
 n = and shr q 16 16383
 if eq n 0
@@ -15437,22 +15714,22 @@ xhs 2 get fr add x 25
 xhcmp 2 32
 xtrap 1 3
 xhs 9 get fr add x 22
-xhcmp 9 16383
+xhcmp 9 1048576
 xtrap 8 3
-xhb 12 e get fr add x 24
+xhb 13 e get fr add x 24
 xhb 8 f get fr add x 21
 xrr 133 9 9
 empty = xbranch 0
 xrr 137 2 8
 xrr 1 2 9
-xrr 57 2 12
+xrr 57 2 13
 before = xbranch 9
-xmem 141 2 12 32
+xmem 141 2 13 32
 xrr 57 8 2
 xtrap 3 3
 xpatch before get oc 0
 xpatch empty get oc 0
-xmem 139 2 12 16
+xmem 139 2 13 16
 xrr 133 2 2
 xtrap 1 3
 xrr 133 9 9
@@ -15461,7 +15738,7 @@ ximm 8 0
 xpatch nonzero get oc 0
 xsp 1 32
 for j ulong 4
-xmem 139 0 12 mul j 8
+xmem 139 0 13 mul j 8
 xmem 137 0 4 mul j 8
 end
 xmem 137 8 4 16
@@ -15473,7 +15750,7 @@ xhcall 16
 for j ulong 4
 if ne j 2
 xmem 139 2 4 mul j 8
-xmem 137 2 12 mul j 8
+xmem 137 2 13 mul j 8
 end
 end
 xhdone dst x 32
@@ -15482,8 +15759,26 @@ fn xhost c ulong dst ulong to void
 if ne get xtarget 0 1
 fail 25
 end
-if eq get progmode 0 0
+if eq 0 get progmode 0
+if eq 0 get om2 0
 fail 9
+end
+ok = ulong 0
+if or or eq c 100 eq c 110 or eq c 117 eq c 140
+ok = ulong 1
+end
+if and le c 149 ge c 145
+ok = ulong 1
+end
+if or or eq c 130 eq c 109 eq c 120
+ok = ulong 1
+end
+if and le c 177 ge c 166
+ok = ulong 1
+end
+if eq ok 0
+fail 9
+end
 end
 note execpure (198) has no x86 strict-profile lowering; refuse it rather than run an unconfined exec.
 if eq c 198
@@ -15523,9 +15818,9 @@ xrr 137 6 9
 xhcall 11
 xrr 133 0 0
 failed = xbranch 1
-xmem 137 0 12 0
-xmem 137 0 12 8
-xmem 137 0 12 24
+xmem 137 0 13 0
+xmem 137 0 13 8
+xmem 137 0 13 24
 xpatch failed get oc 0
 xhdone dst x 0
 ret
