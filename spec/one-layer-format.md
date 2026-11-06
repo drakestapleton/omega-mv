@@ -686,3 +686,19 @@ byte flips now lands on version 6 and is refused DOMAIN):
 Not in this change: the front end (`osc_lower`) still writes versions 1..5 and fills no requirement
 objects; translating `requires` / `ensures` source into objects, evaluating them, and teaching the
 independent checker decoder (`src/checker2`) to read version 6 are follow-up work.
+
+### 11.10 Role under the seeded `.om` programme (decided 2026-11-06)
+
+Version 6 is a bounded compatibility format of the C OSC pipeline (`src/compiler`), not an identity
+of seeded `.om` programs. Its obligations are exactly these:
+
+- No existing identity moves. Versions 1..5 are written and hashed byte for byte as before, and no
+  producer (`osc_lower`, the seeded `omc` or any other) switches to version 6 in this change.
+- A version 6 identity names only a version 6 unit. It is never relabelled as, or compared equal
+  to, a version 1..5 identity, a seeded wire v7 (section 10) or v8 identity, or the hash of any
+  `.om` source or `omc` output. The domain tag (11.1) enforces this separation in the bytes.
+- Numeric identifiers, structured requirement objects and the domain tag are properties of this
+  wire format only. A seeded `.om` producer that wants them must specify its own mapping and
+  qualification against this section first (omega#625); this section grants none.
+- checker2 receipts, the #451 acceptance and the omega#623 proof receipts stay open obligations
+  until `src/checker2` reads version 6; until then no receipt may cite a version 6 identity.
