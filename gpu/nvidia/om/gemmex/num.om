@@ -1,0 +1,194 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note The number formats of the general GEMM (src/omega_gpu_gemm_ex.h, CUDApp#144), shared by every om/gemmex unit.
+note Values travel as raw IEEE bits (f32 as uint, f64 as ulong); the f32/f64 arithmetic is the seeded float set:
+note one rounding per operator, round to nearest even, no fused operations.
+note Bit constants (Wolfram FromDigits): 0x7f800000 2139095040, 0x7fc00000 2143289344, 0x7fffff 8388607,
+note 0x7fffffff 2147483647, 0x7fff 32767, 0x8000 32768, 0x7c00 31744, 0x200 512, 0x477ff000 1199566848,
+note 0x38800000 947912704, 0x33000000 855638016, 0x800000 8388608, 0xfff 4095, 0x3ff 1023, 0xffff0000 4294901760,
+note 0x7f80 32640, 0x33800000 864026624 (f32 2^-24), 0x3b000000 989855744 (f32 2^-9).
+
+note finite f32 bits: the exponent field is not all ones
+fn gx_fin u uint to bool
+ret ne and u 2139095040 2139095040
+end
+
+note binary16 bits to f32, exact
+fn gx_h2f h uint to f32
+s = shl shr h 15 31
+e = and shr h 10 31
+m = and h 1023
+if eq e 31
+ret bitcast f32 or or s 2139095040 shl m 13
+end
+if eq e 0
+v = mul f32 m bitcast f32 uint 864026624
+if ne s 0
+ret neg v
+end
+ret v
+end
+ret bitcast f32 or or s shl add e 112 23 shl m 13
+end
+
+note e4m3 byte to f32, exact; 0x7f and 0xff are NaN (0x7fc00000), there is no infinity
+fn gx_e4m3 b uint to f32
+e = and shr b 3 15
+m = and b 7
+if and eq e 15 eq m 7
+ret bitcast f32 uint 2143289344
+end
+v = bitcast f32 or shl add e 120 23 shl m 20
+if eq e 0
+v = mul f32 m bitcast f32 uint 989855744
+end
+if ne and b 128 0
+ret neg v
+end
+ret v
+end
+
+note a stored element (raw bits u of type t: 0 f32, 1 bf16, 2 f16, 3 e4m3, 4 e5m2) to f32; an e5m2 byte is the top
+note byte of an f16
+fn gx_ldf t ulong u uint to f32
+if eq t 0
+ret bitcast f32 u
+end
+if eq t 1
+ret bitcast f32 shl u 16
+end
+if eq t 2
+ret gx_h2f u
+end
+if eq t 3
+ret gx_e4m3 u
+end
+ret gx_h2f shl u 8
+end
+
+note a stored element is non-finite (inf, NaN; e4m3: NaN only) when its exponent field has every bit set
+fn gx_bad t ulong u uint to bool
+if eq t 0
+ret eq and u 2139095040 2139095040
+end
+if eq t 1
+ret eq and u 32640 32640
+end
+if eq t 2
+ret eq and u 31744 31744
+end
+if eq t 3
+ret eq and u 127 127
+end
+ret eq and u 124 124
+end
+
+note f32 bits to bf16 bits, round to nearest even; a NaN stays a NaN (quiet bit set when the payload is cut)
+fn gx_f2bf u uint to uint
+if not gx_fin u
+if ne and u 8388607 0
+ret or shr u 16 64
+end
+ret shr u 16
+end
+ret shr add add u 32767 and shr u 16 1 16
+end
+
+note f32 bits to f16 bits, round to nearest even (subnormals rounded, overflow to infinity, NaN quieted)
+fn gx_f2h u uint to uint
+s = and shr u 16 32768
+a = and u 2147483647
+if ge a 2139095040
+if gt a 2139095040
+ret or or s 31744 512
+end
+ret or s 31744
+end
+if ge a 1199566848
+ret or s 31744
+end
+if lt a 947912704
+if lt a 855638016
+ret s
+end
+mt = or and a 8388607 8388608
+sh = sub 126 shr a 23
+q = shr mt sh
+rm = and mt sub shl uint 1 sh 1
+hf = shl uint 1 sub sh 1
+if gt rm hf
+q = add q 1
+end
+if and eq rm hf ne and q 1 0
+q = add q 1
+end
+ret or s q
+end
+r = add add a 4095 and shr a 13 1
+ret or s or shl sub shr r 23 112 10 and shr r 13 1023
+end
+
+note f64 to f32 rounding to odd: one more rounding to bf16 or f16 is then the correct rounding of v
+fn gx_d2fo v f64 to f32
+f = f32 v
+u = bitcast uint f
+if ne v v
+ret f
+end
+if not gx_fin u
+ret f
+end
+if eq f64 f v
+ret f
+end
+if ne and u 1 0
+ret f
+end
+if gt fabs v fabs f64 f
+ret bitcast f32 add u 1
+end
+ret bitcast f32 sub u 1
+end
+
+note exact split of a finite f32 into three bf16 planes by truncation (hi | mid << 16 | lo << 32); non-finite: 0
+fn gx_split u uint to ulong
+if not gx_fin u
+ret 0
+end
+r1 = sub bitcast f32 u bitcast f32 and u 4294901760
+u1 = bitcast uint r1
+u2 = bitcast uint sub r1 bitcast f32 and u1 4294901760
+p = or ulong shr u 16 shl ulong shr u1 16 16
+ret or p shl ulong shr u2 16 32
+end
+
+note the byte size of a stored element of type t
+fn gx_es t ulong to ulong
+if eq t 0
+ret 4
+end
+if le t 2
+ret 2
+end
+ret 1
+end
+
+note element i (little-endian, es bytes) of a byte window
+fn gx_get s view uchar 65536 i ulong es ulong to uint
+p = mul i es
+v = uint get s p
+if gt es 1
+v = or v shl uint get s add p 1 8
+end
+if gt es 2
+v = or v shl uint get s add p 2 16
+v = or v shl uint get s add p 3 24
+end
+ret v
+end
+
+note store element i (little-endian, es bytes) into a byte window
+fn gx_put d edit uchar 65536 i ulong es ulong v uint to void
+for b ulong es
+put d add mul i es b uchar and shr v mul b 8 255
+end
+end
