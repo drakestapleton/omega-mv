@@ -33,8 +33,9 @@ gcc -O1 -Isrc -o build/seed/r6/sm121list seed/sm121/sm121list.c src/omega_blackw
 sh seed/sm121/gate6.sh
 ```
 
-The gate rewrites its result files in `evidence/SEED-0/sm121/`. If the run is only a check, put the tracked
-copies back afterwards with `git checkout -- evidence/SEED-0/sm121`.
+The gate writes its result files to `build/seed/r6/evidence/`. The recorded receipt `evidence/SEED-0/sm121/`
+is only read: the gate's last line before the verdict says whether each result file equals its recorded copy
+(`seed/check/receipt.sh`); a rerun never rewrites it.
 
 ## How the checks work
 
@@ -53,7 +54,7 @@ hand; the gate then compares.
 6. On the chip: the seed-made vector add runs on the GB10 through the existing launcher (no CUDA library),
    with a receipt.
 
-Results: `evidence/SEED-0/sm121/`.
+Results: `build/seed/r6/evidence/`; recorded receipt: `evidence/SEED-0/sm121/`.
 
 ## Limits, said plainly
 
