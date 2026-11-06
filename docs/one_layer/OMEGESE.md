@@ -1115,6 +1115,22 @@ ownership, range and refusal contract is [seed/host/MAPPING.md](../../seed/host/
 It adds process-local mapped resources while the compiler's own storage remains
 fixed pools. GPU launch and model execution are separate, still-unqualified gates.
 
+#### `devcall` (keyword 171)
+
+`devcall fd request H hoff 32 P poff n` returns `long`, the ioctl result or
+negative Linux errno. `fd` is `int`, `request` a literal `uint` RM_ALLOC or
+RM_CONTROL request, `H` and `P` writable `uchar` arrays, and `hoff`, `poff`
+and `n` are `ulong`. The header span must be exactly 32 bytes and the
+parameter span at most 1048576 bytes (inclusive, the RM default copy-in cap).
+Both slices must fit their arrays, must not overlap, and the header's caller
+pointer bytes must be zero; violations trap 3 (exit 103).
+The checked parameter span is bound directly, not copied onto the stack;
+only a private 32-byte header is stack-backed. See
+[`MAPPING.md`](../../seed/host/MAPPING.md) for the ABI and upstream cap source.
+`seed/host/tests/devcall.om` checks harmless memfd ioctls at 16384, 55888
+and 1048576 bytes, and refusal at 1048577 bytes. `devctl` retains its
+request-encoded size limit.
+
 ### Host CPU ordering words (#939)
 
 | Statement | Meaning |

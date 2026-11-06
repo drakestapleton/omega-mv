@@ -55,6 +55,18 @@ grep -qx 'VERDICT mutant-requires FAIL run exit=0 expected=109 stdout=match stde
 grep -qx 'VERDICT mutant-proof FAIL run exit=0 expected=109 stdout=match stderr=match' "$run/mutant.log"
 grep -qx 'OM2GATE FAIL cases=2 pass=0 fail=2 invalid=0 not_run=0' "$run/mutant.log"
 echo 'PASS contract-enforcement mutant detected by exact runtime-status mismatch'
+# #1042: exact-cap refusal and missing-cap mutants must both be detected.
+if "$B/gate" seed/out/omc "$pin" seed/host/devcall-mutants.cases "$run/devcall-mutants" > "$run/devcall-mutants.log"; then
+    echo 'FAIL devcall parameter-cap mutant survived' >&2
+    exit 1
+else
+    status=$?
+    [ "$status" = 1 ] || { cat "$run/devcall-mutants.log"; exit 1; }
+fi
+grep -q '^VERDICT devcall-cap-offbyone FAIL run exit=103 expected=0 ' "$run/devcall-mutants.log"
+grep -q '^VERDICT devcall-cap-removed FAIL run exit=80 expected=0 ' "$run/devcall-mutants.log"
+grep -qx 'OM2GATE FAIL cases=2 pass=0 fail=2 invalid=0 not_run=0' "$run/devcall-mutants.log"
+echo 'PASS devcall parameter cap: off-by-one and removed-check mutants killed'
 # Packed-list hostile ingress (#671): generated packets reach execprog from stdin.
 "$B/gate" seed/out/omc "$pin" seed/qualification/security673/packets.cases "$run/packets"
 if "$B/gate" seed/out/omc "$pin" seed/qualification/security673/packets-mutant.cases "$run/packets-mutant" > "$run/packets-mutant.log"; then

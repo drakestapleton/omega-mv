@@ -33,6 +33,13 @@ fixture baseline against the original native parent. The fixture gate itself is
 `seed/host/gate.om`, compiled by `seed/out/omc`; the remaining shell step only
 builds and launches it.
 
+The `devcall` fixture uses image-backed parameter storage and a harmless memfd,
+not a device descriptor. It requires Linux ENOTTY for 16384-byte, 55888-byte
+and inclusive 1048576-byte spans, and trap 3 for 1048577 bytes or a slice past
+the array. The same host check runs `devcall-mutants.cases` through the Omega
+conductor and requires attribution of both killed compiler mutants:
+an off-by-one rejection at the cap and a removed cap check. No GPU is opened.
+
 Verified on the Spark on 2026-10-23:
 
 - Native file create/read/write/seek/sync/chmod/close/unlink and errno checks.
