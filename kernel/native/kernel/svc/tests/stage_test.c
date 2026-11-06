@@ -2073,7 +2073,13 @@ static void test_usb_hid(void)
     CHECK(ck_hid_usage(0x38, 0).c == '/' && ck_hid_usage(0x37, 0).c == '.' && ck_hid_usage(0x37, 1).c == '>');
     CHECK(ck_hid_usage(0x34, 0).c == '\'' && ck_hid_usage(0x34, 1).c == '"' && ck_hid_usage(0x31, 0).c == '\\');
     CHECK(ck_hid_usage(0x2d, 1).c == '_' && ck_hid_usage(0x33, 1).c == ':' && ck_hid_usage(0x35, 1).c == '~');
-    CHECK(ck_hid_usage(0x32, 0).kind == CK_KEY_NONE && ck_hid_usage(0x2b, 0).kind == CK_KEY_NONE); /* non-US, Tab */
+    CHECK(ck_hid_usage(0x32, 0).kind == CK_KEY_NONE); /* non-US */
+    CHECK(ck_hid_usage(0x2b, 0).kind == CK_KEY_TAB && ck_hid_usage(0x4f, 0).kind == CK_KEY_RIGHT &&
+          ck_hid_usage(0x50, 0).kind == CK_KEY_LEFT && ck_hid_usage(0x51, 0).kind == CK_KEY_DOWN &&
+          ck_hid_usage(0x52, 1).kind == CK_KEY_UP); /* Tab and the arrows move a choice */
+    CHECK(ck_hid_usage(0x4a, 0).kind == CK_KEY_HOME && ck_hid_usage(0x4b, 0).kind == CK_KEY_PGUP &&
+          ck_hid_usage(0x4d, 0).kind == CK_KEY_END && ck_hid_usage(0x4e, 1).kind == CK_KEY_PGDN &&
+          ck_hid_usage(0x4c, 0).kind == CK_KEY_NONE); /* the reading keys scroll the code; Delete yields nothing */
     {
         int all = 1; /* every printable character but space comes from exactly one key */
         for (int ch = 0x21; ch <= 0x7e; ch++) {

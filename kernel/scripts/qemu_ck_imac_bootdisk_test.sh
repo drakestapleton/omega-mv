@@ -13,7 +13,7 @@
 #   start 1  stick (NETLDR.EFI) + network: the server offers the signed
 #            default kernel; it adds Allen's section and the boot section
 #            (EFI System Partition, 256 MiB) in unused space, installs itself
-#            as \EFI\BOOT\BOOTX64.EFI (slot A), reports boot_time; goodbye (Allen sleeps).
+#            as \EFI\BOOT\BOOTX64.EFI (slot A), reports boot_time; goodbye selects ACPI S5.
 #            Host: fsck.fat finds nothing to repair, mtools reads BOOTX64.EFI
 #            equal to the kernel image, the old partition and the stick are
 #            byte-identical.
@@ -63,8 +63,8 @@ nb="${out}/host/ck_imac_netboot"
 gpt="${out}/host/ck_gpt_image"
 "${nb}" keygen "${work}/test.key" "${work}/test.pub" >/dev/null
 mk CK_NETLDR_KEYS="${work}/test.pub" CK_NETLDR_FALLBACK_S=8 imac-netldr
-mk imac-kernel
-make -s -C native/kernel X86_CROSS="${cross}" OUT="${out2}" AIENOS_COMMIT="${second}" imac-kernel >/dev/null
+mk CK_SLOT_KEYS="${work}/test.pub" imac-kernel
+make -s -C native/kernel X86_CROSS="${cross}" OUT="${out2}" AIENOS_COMMIT="${second}" CK_SLOT_KEYS="${work}/test.pub" imac-kernel >/dev/null
 push() { NETBOOT_TOOL_OUT="${out}" bash scripts/ck_imac_netboot_push.sh "$1" "${work}/test.key" "${work}/spool" >/dev/null; }
 
 stick="${work}/stick.img"
@@ -137,11 +137,29 @@ say() { # name "lower-case words": typed through the QEMU monitor, then Enter
     echo "sendkey ret" >&3
     exec 3>&-
 }
-off() { wait_for "$1" 60 '^power: Allen asleep'; } # after goodbye Allen sleeps; run() then stops QEMU
+off() { wait_for "$1" 60 '^power: off via ACPI S5 '; } # QEMU has no supported panel: goodbye selects S5
 ready='^keyboard: type a line and press Enter'
-run() { # name with-stick: start, wait for Allen, goodbye (he sleeps), stop; result in name.txt
+run() { # name with-stick: start, wait for Allen, goodbye (S5), cleanup; result in name.txt
     start "$1" "$2"
     if wait_for "$1" 400 "${ready}"; then
+        if [[ "$1" == one ]]; then
+            # A fresh disk now opens setup before chat. Complete its real
+            # keyboard path without granting optional device/model consent.
+            # Sending goodbye here used to type it into setup instead.
+            local step
+            for step in intent scan consent llm ready; do
+                if wait_for "$1" 40 "^wizard: step ${step}$"; then
+                    printf 'sendkey esc\n' >"${work}/$1.mon.in"
+                    sleep 0.2
+                else
+                    fail "1: setup reached ${step} before chat"
+                    break
+                fi
+            done
+            wait_for "$1" 40 '^wizard: finished' || fail "1: setup finished before goodbye"
+        else
+            chk "$1: completed setup stays closed" "${work}/$1.log" '^wizard: setup finished on an earlier start'
+        fi
         say "$1" "goodbye"
         off "$1" || true
     fi
@@ -161,7 +179,7 @@ chk "1: Allen's section added" "${work}/one.txt" '^allen_memory: AIENOS partitio
 chk "1: boot section added in unused space" "${work}/one.txt" '^boot_disk: boot section added, entry [0-9]+, first_lba=[0-9]+ last_lba=[0-9]+ \(256 MiB, EFI System Partition\); the existing partitions were not touched$'
 chk "1: installed in slot A, read back" "${work}/one.txt" "^boot_disk: installed this kernel \\(commit ${commit:0:12}, generation [0-9]+, [0-9]+ bytes\\) as .EFI.BOOT.BOOTX64\\.EFI, slot A, new FAT32 volume, [0-9]+ blocks in [0-9]+ ms, read back exact; "
 chk "1: boot times reported with the loader" "${work}/one.txt" '^boot_time: since power on: firmware until the loader [0-9]+ ms, loader [0-9]+ ms, kernel [0-9]+ ms; Allen.s window at [0-9]+ ms$'
-chk "1: Allen asleep after goodbye" "${work}/one.txt" '^power: Allen asleep'
+chk "1: ACPI S5 after goodbye" "${work}/one.txt" '^power: off via ACPI S5 '
 nochk "1: no write refused by the fence" "${work}/one.txt" 'ahci_write: .*refused'
 first="$(grep -aoE '^boot_disk: boot section added, entry [0-9]+, first_lba=[0-9]+' "${work}/one.txt" | grep -oE '[0-9]+$' || echo 0)"
 if [[ "${first}" -gt 0 ]]; then

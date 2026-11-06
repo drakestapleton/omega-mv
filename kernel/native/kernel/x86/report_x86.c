@@ -25,7 +25,7 @@
  * authorized peer, never this broadcast.
  *
  * What is sent: ck_x86_report_filter's copy of the console's RAM copy
- * (console_x86.c, the first 16 KiB), which keeps only complete, printable,
+ * (console_x86.c, the first 64 KiB), which keeps only complete, printable,
  * bounded lines that start with a fixed kernel diagnostic key and drops
  * everything else whole. The raw console is never sent. The copy is cut into
  * parts of CK_X86_REPORT_CHUNK bytes; each part is one UDP datagram from
@@ -51,6 +51,10 @@
 #endif
 #include "aienos_net.h"
 #include "report_x86.h"
+#include "console_log.h"
+
+_Static_assert(CK_X86_REPORT_MAX >= CK_X86_LOG_BYTES, "the report must hold a full console copy");
+_Static_assert(CK_X86_REPORT_MAX / CK_X86_REPORT_CHUNK <= 64, "the listener rebuilds at most 64 parts");
 
 #define REPORT_HDR "AIENOS-REPORT v=2 auth=none "
 
@@ -64,11 +68,11 @@
  * report until it is added here. */
 static const char *const allowed_keys[] = {
     "acpi_rsdp", "ahci", "ahci_disk", "ahci_gpt", "ahci_part", "ahci_port", "ahci_read", "ahci_write",
-    "aienos_commit", "allen_memory", "apic", "boot_disk", "boot_time", "cpu", "descriptors", "exit_boot_services",
+    "aienos_commit", "allen-code", "allen_memory", "apic", "bench", "boot_disk", "boot_time", "courier", "cpu", "descriptors", "dmar", "exit_boot_services",
     "firmware_cpl", "firmware_revision", "firmware_vendor", "gop", "guard_page", "handoff", "image", "kernel",
-    "kernel_impl", "keyboard", "madt", "net", "net_tg3", "note", "nvme", "nvme_disk", "nvme_gpt", "nvme_read", "paging",
+    "kernel_impl", "keyboard", "local_model", "local_tools", "madt", "net", "net_tg3", "note", "nvme", "nvme_disk", "nvme_gpt", "nvme_read", "paging",
     "panic", "pci", "power", "ram", "report", "report_kind", "screen", "smp", "sound", "stack", "storage", "summary",
-    "timebase", "timer_irq", "timer_stats", "usb", "xhci",
+    "timebase", "timer_irq", "timer_stats", "usb", "wizard", "xhci",
 };
 static const char *const allowed_lines[] = {
     "AIENOS-KERNEL-0",
@@ -131,6 +135,18 @@ static size_t dec(char *out, unsigned v)
     while (n)
         out[k++] = t[--n];
     return k;
+}
+
+size_t ck_x86_report_seal(char *out, size_t len, size_t cap, size_t dropped)
+{
+    static const char head[] = "report: console_copy_full dropped_bytes=";
+    if (!out || !dropped || cap - len < sizeof head + 11) /* digits of a 32-bit count, '\n' */
+        return len;
+    memcpy(out + len, head, sizeof head - 1);
+    len += sizeof head - 1;
+    len += dec(out + len, dropped > 0xffffffffu ? 0xffffffffu : (unsigned)dropped);
+    out[len++] = '\n';
+    return len;
 }
 
 unsigned ck_x86_report_parts(size_t len)
@@ -230,7 +246,8 @@ unsigned ck_x86_report_hold(uint64_t tsc_hz, unsigned seconds)
          * the machine; the raw console never does. */
         size_t raw_len;
         const char *raw = ck_x86_console_log(&raw_len);
-        size_t n_len = ck_x86_report_filter(raw, raw_len, report, sizeof report);
+        size_t n_len = ck_x86_report_filter(raw, raw_len, report, sizeof report - CK_X86_REPORT_NOTE_MAX);
+        n_len = ck_x86_report_seal(report, n_len, sizeof report, ck_x86_console_log_dropped());
         if (n_len != len || !run) {
             len = n_len;
             parts = ck_x86_report_parts(len);
@@ -248,5 +265,44 @@ unsigned ck_x86_report_hold(uint64_t tsc_hz, unsigned seconds)
     /* Printed after the last copy, so only the screen shows it. */
     ck_printf("report: rounds=%u parts=%u bytes=%u send_failures=%u\n", rounds, parts, (unsigned)len, failed);
     return rounds;
+}
+#endif
+
+#ifndef CK_X86_REPORT_HOST
+/* Allen's courier over Ethernet (courier_udp.h) bound to the chip: lab image
+ * only, like everything else in this file. The far side's address is the
+ * broadcast address unless the lab image was built with another
+ * (make imac-kernel CK_X86_REPORT=1 CK_COURIER_PEER=192.168.1.108). */
+#include "courier_udp.h"
+#ifndef CK_COURIER_PEER_STR
+#define CK_COURIER_PEER_STR "255.255.255.255"
+#endif
+static int nio_send(void *c, const uint8_t *f, size_t n) { (void)c; return ck_x86_tg3_send(f, n); }
+static size_t nio_recv(void *c, uint8_t *f, size_t cap) { (void)c; return ck_x86_tg3_recv(f, cap); }
+static int nio_link(void *c) { (void)c; return ck_x86_tg3_link(); }
+static uint64_t nio_now(void *c) { (void)c; return ck_rdtsc(); }
+static const ck_netio nio = {0, nio_send, nio_recv, nio_link, nio_now};
+
+static void dotted(const char *s, uint8_t out[4])
+{
+    for (int i = 0; i < 4; i++) {
+        unsigned v = 0;
+        while (*s >= '0' && *s <= '9')
+            v = v * 10 + (unsigned)(*s++ - '0');
+        out[i] = (uint8_t)v;
+        if (*s == '.')
+            s++;
+    }
+}
+
+const ck_courier *ck_x86_courier_udp(uint64_t tsc_hz)
+{
+    if (!ck_x86_tg3_ready())
+        return 0;
+    uint8_t mac[6], peer[4];
+    static const uint8_t none[4] = {0, 0, 0, 0};
+    ck_x86_tg3_mac(mac);
+    dotted(CK_COURIER_PEER_STR, peer);
+    return ck_courier_udp_init(&nio, mac, none, peer, CK_COURIER_PORT, tsc_hz);
 }
 #endif

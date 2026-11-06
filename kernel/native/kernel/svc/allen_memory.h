@@ -7,19 +7,22 @@
  *
  * One copy is one unit:
  *   0   "AIENALM1"                        8 bytes
- *   8   version (2)                       u32 little endian
+ *   8   version (2..4)                    u32 little endian
  *   12  payload length                    u32
  *   16  generation                        u64, +1 on every save
  *   24  zero                              8 bytes
  *   32  SHA-256 of bytes 0..31 and the payload
  *   64  payload: starts u32, lines u32, name[24], fact count u32, note
- *       count u32, then per fact key[48] val[64] are(u8); the rest zero
+ *       count u32, then per fact key[48] val[64] are(u8); v3+: self[24];
+ *       v4+: sky_mode(u8) sky_region(u8) sky_have_loc(u8) pad(u8) lat_udeg(s32) lon_udeg(s32);
  * A save writes generation g+1 over the OLDER copy, flushes the disk's write
  * cache, then reads it back and checks it; the newer copy is never touched
  * until the older one holds the newer state. Loading reads both and keeps
  * the valid copy with the highest generation. A copy is valid only when every
  * field checks out: magic, version, exact length, fingerprint, fact count,
- * NUL-terminated folded text (a-z, 0-9, single spaces), a name of letters.
+ * NUL-terminated folded text (a-z, 0-9, single spaces), a name of letters,
+ * and v4+ sky fields in range (mode 0..2, region 0..11, have_loc 0..1, pad 0,
+ * latitude within +-90 and longitude within +-180 degrees).
  * Freestanding (no libc, no heap): every disk access goes through the
  * partition view handed in. Host tested in svc/tests/allen_memory_test.c,
  * power cuts included. */

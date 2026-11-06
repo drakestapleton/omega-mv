@@ -15,6 +15,7 @@
 #include "allen_memory.h"
 #include "allen_reply.h"
 #include "disk_file.h"
+#include "sha256.h"
 #include "disk_part.h"
 #include "gpt_add.h"
 #include "gpt_write.h"
@@ -124,6 +125,80 @@ static void test_codec(void)
     }
     ck_allen_mem_encode(&full, 9, u);
     CHECK(ck_allen_mem_decode(u, &b, &gen) == 0 && !memcmp(&full, &b, sizeof full));
+    /* Allen's own name rides along (version 3), and a version 2 unit written
+     * before he had one still reads, with no name. */
+    ck_allen_memory named = a;
+    strcpy(named.self, "Nova");
+    ck_allen_mem_encode(&named, 11, u);
+    CHECK(ck_allen_mem_decode(u, &b, &gen) == 0 && gen == 11 && !strcmp(b.self, "Nova") && !strcmp(b.name, "Drake"));
+    strcpy(named.self, "nova");
+    ck_allen_mem_encode(&named, 11, v);
+    CHECK(ck_allen_mem_decode(v, &b, &gen) != 0); /* a name starts with a capital, like the person's */
+    ck_allen_mem_encode(&a, 5, v);
+    {
+        /* the same memory as version 2: no self field, shorter payload, resealed */
+        uint32_t plen = 0;
+        for (int i = 3; i >= 0; i--)
+            plen = plen << 8 | v[12 + i];
+        plen -= CK_ALLEN_NAME_MAX + 12u; /* v2 has neither self (24B) nor sky fields (12B) */
+        v[8] = 2, v[9] = v[10] = v[11] = 0;
+        for (int i = 0; i < 4; i++)
+            v[12 + i] = (uint8_t)(plen >> (8 * i));
+        sha256_ctx h;
+        sha256_init(&h);
+        sha256_update(&h, v, 32);
+        sha256_update(&h, v + 64, plen);
+        sha256_final(&h, v + 32);
+    }
+    CHECK(ck_allen_mem_decode(v, &b, &gen) == 0 && gen == 5 && !b.self[0] && !memcmp(&a, &b, sizeof a));
+    v[8] = 5; /* a version from the future is refused */
+    CHECK(ck_allen_mem_decode(v, &b, &gen) != 0);
+    /* the sky fields (version 4) round-trip; out-of-range ones are refused like any other bad field */
+    ck_allen_memory sky = a;
+    sky.sky_mode = 1, sky.sky_region = 11, sky.sky_have_loc = 1;
+    sky.sky_lat_udeg = -90000000, sky.sky_lon_udeg = 180000000;
+    ck_allen_mem_encode(&sky, 12, u);
+    CHECK(ck_allen_mem_decode(u, &b, &gen) == 0 && gen == 12 && !memcmp(&sky, &b, sizeof sky));
+    const struct {
+        uint8_t mode, region, have;
+        int32_t lat, lon;
+    } bad_sky[] = {
+        {3, 0, 0, 0, 0},                 /* sky_mode 0..2 */
+        {255, 0, 0, 0, 0},
+        {2, 12, 0, 0, 0},                /* 12 regions */
+        {1, 0, 2, 0, 0},                 /* sky_have_loc 0 or 1 */
+        {1, 0, 1, 90000001, 0},          /* latitude within +-90 degrees */
+        {1, 0, 1, -90000001, 0},
+        {1, 0, 1, 0, 180000001},         /* longitude within +-180 degrees */
+        {1, 0, 1, 0, INT32_MIN},
+    };
+    for (size_t i = 0; i < sizeof bad_sky / sizeof bad_sky[0]; i++) {
+        ck_allen_memory s = a;
+        s.sky_mode = bad_sky[i].mode, s.sky_region = bad_sky[i].region, s.sky_have_loc = bad_sky[i].have;
+        s.sky_lat_udeg = bad_sky[i].lat, s.sky_lon_udeg = bad_sky[i].lon;
+        ck_allen_mem_encode(&s, 12, v);
+        CHECK(ck_allen_mem_decode(v, &b, &gen) != 0);
+    }
+    {
+        /* the reserved byte after sky_have_loc must be zero (allen_reply.h); set it and reseal */
+        ck_allen_mem_encode(&sky, 12, v);
+        uint32_t plen = 0;
+        for (int i = 3; i >= 0; i--)
+            plen = plen << 8 | v[12 + i];
+        v[64 + plen - 12 + 3] = 1;
+        sha256_ctx h;
+        sha256_init(&h);
+        sha256_update(&h, v, 32);
+        sha256_update(&h, v + 64, plen);
+        sha256_final(&h, v + 32);
+        CHECK(ck_allen_mem_decode(v, &b, &gen) != 0);
+        v[64 + plen - 12 + 3] = 0; /* the same unit with the byte back to zero reads */
+        sha256_init(&h);
+        sha256_update(&h, v, 32);
+        sha256_update(&h, v + 64, plen);
+        sha256_final(&h, v + 32);
+        CHECK(ck_allen_mem_decode(v, &b, &gen) == 0 && !memcmp(&sky, &b, sizeof sky));
+    }
 }
 
 /* A memory large enough that one copy spans all 8 blocks of its unit, so a
@@ -311,7 +386,7 @@ static void test_teach_restart(void)
     static uint8_t u[CK_ALLEN_MEM_UNIT];
     ck_allen_mind_init(&m, 0);
     m.lasting = 1;
-    CHECK(ck_allen_welcome(&m) == NULL);
+    CHECK(says(ck_allen_welcome(&m), "What will you call me?"));
     CHECK(says(ck_allen_answer(&m, "My name is Drake", 1), "Nice to meet you, Drake. I'll remember that."));
     CHECK(m.changed == 1);
     m.changed = 0;
@@ -330,6 +405,13 @@ static void test_teach_restart(void)
     CHECK(says(ck_allen_answer(&m, "remember blue", 6), "Teach me like this"));
     CHECK(says(ck_allen_answer(&m, "what is 2 plus 2", 6), "2 plus 2 is 4."));
 
+    /* number(): nine digits are the limit; longer digit runs are refused before they can overflow */
+    CHECK(says(ck_allen_answer(&m, "what is 999999999 plus 1", 6), "999999999 plus 1 is 1000000000."));
+    CHECK(!strstr(ck_allen_answer(&m, "what is 1000000000 plus 1", 6), " is 1000000001"));
+    CHECK(!strstr(ck_allen_answer(&m, "what is 1 plus 1000000000", 6), " is 1000000001"));
+    CHECK(!strstr(ck_allen_answer(&m, "what is 999999999999999999999999 plus 1", 6), " plus "));
+    CHECK(!strstr(ck_allen_answer(&m, "what is 1 times 99999999999999999999999999999", 6), " times "));
+
     /* "restart": the memory goes to disk bytes and comes back in a new mind */
     m.mem.starts = 1;
     ck_allen_mem_encode(&m.mem, 5, u);
@@ -347,7 +429,7 @@ static void test_teach_restart(void)
     CHECK(m2.changed == 1 && m2.mem.nfacts == 1);
     CHECK(says(ck_allen_answer(&m2, "forget the cat", 1), "I don't remember anything about the cat."));
     CHECK(says(ck_allen_answer(&m2, "forget everything", 1), "forgotten everything"));
-    CHECK(m2.mem.nfacts == 0 && !m2.mem.name[0] && ck_allen_welcome(&m2) == NULL);
+    CHECK(m2.mem.nfacts == 0 && !m2.mem.name[0] && says(ck_allen_welcome(&m2), "What will you call me?"));
     CHECK(says(ck_allen_answer(&m2, "what do you remember", 1), "Nothing yet."));
 
     /* without a disk Allen says it only lasts until power off */

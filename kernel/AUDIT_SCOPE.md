@@ -91,6 +91,7 @@ tests/gates/run.sh zero-disk-secrets
 
 Every gate is `tests/gates/run.sh <step>`; steps include `crumb-verify`, `ck-host-tests`,
 `ck-stage-tests`, `ck-gate-selftest`, `ck-hold-selftest`, `ck-owner-keys`, `ck-qemu-gates`,
+`ck-qemu-external` (fails unless `ALLEN_MODEL`, `LOCAL_MODEL_WEIGHTS` and `LOCAL_MODEL_TOKENIZER` are given),
 `ck-b7b-probe`, `native-net`, `native-sig`, `native-crypto`, `native-m5`, `native-disk`,
 `native-argus`, `native-capability`, `disk-qemu`, `crypto-boundary`, `infer-crate`,
 `store-native`, `verify-all` and `zero-disk-secrets`. Native suites must print lines such as

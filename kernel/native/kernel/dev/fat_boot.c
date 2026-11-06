@@ -365,6 +365,18 @@ static int slot_holds(const disk_dev *p, const geo *g, int k, const uint8_t *man
     return a == 1 ? same_on_disk(p, clus_sec(g, base + 128u), img, len) : a;
 }
 
+int ck_fatb_manifest_read(const disk_dev *p, uint32_t serial, uint8_t man[CK_FATB_MAN_BYTES])
+{
+    geo g;
+    ck_fatb_state st;
+    int rc = geometry(p, &g);
+    if (rc || (rc = ck_fatb_state_read(p, serial, &st)))
+        return rc;
+    if (!st.ours || st.slot < 0)
+        return CK_FATB_ENOTOURS;
+    return rd(p, clus_sec(&g, slot_base(&g, st.slot)), CK_FATB_MAN_BYTES / SEC, man);
+}
+
 /* Writes slot k's FAT sectors in both FATs: the manifest and image chains
  * when len > 0, all free when len == 0. */
 static int slot_fat(const disk_dev *p, const geo *g, int k, uint32_t len, uint32_t *count)

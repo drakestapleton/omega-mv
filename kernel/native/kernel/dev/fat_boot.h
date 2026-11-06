@@ -77,6 +77,11 @@ typedef struct {
  * CK_FATB_OK (also for "not ours") or CK_FATB_EGEOM / CK_FATB_EIO. */
 int ck_fatb_state_read(const disk_dev *p, uint32_t serial, ck_fatb_state *st);
 
+/* Copies BOOTX64.MAN of the slot \EFI\BOOT names (CK_FATB_MAN_BYTES bytes) into
+ * man. Reads only. CK_FATB_OK; CK_FATB_ENOTOURS when the volume is not ours or
+ * holds no complete slot; or CK_FATB_EGEOM / CK_FATB_EIO. */
+int ck_fatb_manifest_read(const disk_dev *p, uint32_t serial, uint8_t man[CK_FATB_MAN_BYTES]);
+
 /* Writes an empty AIENOS boot volume over the whole partition view p: both
  * FATs, the three directories, then (last, after a flush) the FSInfo and
  * boot sectors and their backups. */

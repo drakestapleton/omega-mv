@@ -8,19 +8,21 @@
 # (on the approved list). That disk starts as ck_gpt_image "one-old": one existing
 # partition (sentinel-a, filled with a pattern) and the rest unused.
 #   boot 1  the kernel lists the partition, adds a 1 GiB AIENOS partition in the
-#           unused space, finds the memory empty and saves start 1; keys typed
-#           from outside the guest: "my name is drake", "remember my favorite
-#           color is blue", "save the gate code is 4471", "goodbye" (each
-#           change saved, the note before the copy that counts it; QEMU powers
-#           off). Then, on the host: the kernel's own parser finds the AIENOS
-#           partition, and every block that changed is a GPT block, one of the
-#           two memory copies or note 0; the sentinel partition is byte-identical.
+#           unused space, finds the memory empty and saves start 1; the setup
+#           wizard opens (a first start) and is left with Escape at each step;
+#           then keys typed from outside the guest: "my name is drake", "remember
+#           my favorite color is blue", "save the gate code is 4471", "goodbye"
+#           (each change saved, the note before the copy that counts it; QEMU
+#           powers off). Then, on the host: the kernel's own parser finds the
+#           AIENOS partition, and every block that changed is a GPT block, one of
+#           the two memory copies, note 0 or one of the two setup copies; the
+#           sentinel partition is byte-identical.
 #   boot 2  the same disk: the partition is found (not added again), memory
 #           loads (1 fact, name known, 1 earlier start) and 1 note, Allen speaks
 #           first ("Welcome back, Drake. I still remember 1 thing you taught me,
 #           and your 1 note."), answers "what is my favorite color", "what is
 #           the gate code" and "how many times have you restarted" from the
-#           disk, then goodbye (Allen sleeps; QEMU is then stopped).
+#           disk, then goodbye (the unsupported QEMU display selects ACPI S5).
 #   other   a copy of the disk after boot 1 on another machine, under a model
 #           on no list ("WDC WD10EZEX"): the section alone makes it Allen's,
 #           memory and the note load (booting anywhere).
@@ -136,9 +138,9 @@ say() {
     echo "sendkey ret" >&3
     exec 3>&-
 }
-off() { # name: after goodbye Allen sleeps (the kernel says so within a few seconds); then QEMU is stopped
+off() { # name: QEMU has no supported panel, so goodbye selects ACPI S5 after the black frame
     local r=1
-    wait_for "$1" 60 '^power: Allen asleep' && r=0
+    wait_for "$1" 60 '^power: off via ACPI S5 ' && r=0
     stop "$1"
     return $r
 }
@@ -148,7 +150,21 @@ ready='^keyboard: type a line and press Enter'
 start one "${work}/hdd.img"
 start whole "${work}/whole.img"
 b1_off=0
+b1_setup=0
 if wait_for one 300 "${ready}" && wait_for one 60 '^allen_memory: saved generation 1 '; then
+    # A first start on a disk with a section opens the setup wizard
+    # (x86/setup_x86.c), which takes every key whole until it finishes; lines
+    # typed before that never reach Allen. Leave each step with Escape, as a
+    # person declining the optional consents would, then talk to him.
+    for step in intent scan consent llm ready; do
+        if wait_for one 40 "^wizard: step ${step}$"; then
+            printf 'sendkey esc\n' >"${work}/one.mon.in"
+            sleep 0.2
+        else
+            break
+        fi
+    done
+    wait_for one 40 '^wizard: finished' && b1_setup=1
     say one "my name is drake"
     wait_for one 120 '^allen_memory: saved generation 2 ' || true
     say one "remember my favorite color is blue"
@@ -171,6 +187,8 @@ chk "1: one partition counted" "${work}/one.txt" '^allen_memory: the disk has 1 
 chk "1: AIENOS partition added in unused space" "${work}/one.txt" '^allen_memory: AIENOS partition added, entry [0-9]+, first_lba=[0-9]+ last_lba=[0-9]+ \(1024 MiB\); the existing partitions were not touched$'
 chk "1: write ranges closed after the add" "${work}/one.txt" 'write ranges closed$'
 chk "1: memory empty on a first start" "${work}/one.txt" '^allen_memory: empty \(a first start\); Allen starts fresh$'
+chk "1: setup opens on the first start" "${work}/one.txt" '^wizard: step hello$'
+[[ ${b1_setup} == 1 ]] && pass "1: setup finished before the typed lines" || fail "1: setup did not finish; the typed lines went into it"
 chk "1: no notes yet" "${work}/one.txt" '^allen_memory: 0 notes loaded \(0 damaged\)$'
 chk "1: start 1 saved" "${work}/one.txt" '^allen_memory: saved generation 1 to copy [AB] \(0 facts, 0 notes\) in [0-9]+ ms$'
 chk "1: Allen learns the name" "${work}/one.txt" "^allen: Nice to meet you, Drake\. I'll remember that\.\$"
@@ -186,8 +204,8 @@ else
     fail "1: the note was not written first"
 fi
 chk "1: goodbye saves the line count" "${work}/one.txt" '^allen_memory: saved generation 5 to copy [AB] \(1 fact, 1 note\)'
-chk "1: Allen asleep after goodbye" "${work}/one.txt" '^power: Allen asleep'
-[[ ${b1_off} == 1 ]] && pass "1: sleep seen before QEMU was stopped" || fail "1: no sleep after goodbye"
+chk "1: ACPI S5 after goodbye" "${work}/one.txt" '^power: off via ACPI S5 '
+[[ ${b1_off} == 1 ]] && pass "1: S5 requested before QEMU cleanup" || fail "1: no S5 after goodbye"
 nochk "1: no write refused by the fence" "${work}/one.txt" 'ahci_write: .*refused'
 nochk "1: no failed save" "${work}/one.txt" 'save FAILED'
 
@@ -200,16 +218,19 @@ if [[ -n "${pf}" && $((pl - pf + 1)) == 2097152 ]]; then pass "host: the kernel'
 if [[ -n "${pf}" ]] && grep -aqE "first_lba=${pf} last_lba=${pl} " "${work}/one.txt"; then pass "host: same range the kernel reported"; else fail "host: range differs from the kernel's"; fi
 blocks=$(( $(stat -c %s "${work}/hdd.img") / 512 ))
 # Every changed byte must be in LBA 1..33, the last 33 LBAs, the two 4096-byte copies
-# or note 0 (the third 4096-byte unit): the first 24 blocks of the partition.
+# or note 0 (the third 4096-byte unit): the first 24 blocks of the partition; or the
+# setup wizard's two copies (svc/setup_store.h: units CK_SETUP_FIRST =
+# CK_ALLEN_DISK_UNITS = 2 + 512 notes and the next, so blocks 4112..4127).
 bad="$(cmp -l "${work}/hdd.before" "${work}/hdd.img" 2>/dev/null | awk -v pf="${pf:-0}" -v last=$((blocks - 1)) '
     { lba = int(($1 - 1) / 512); n++
       if (lba == 0) { print "lba 0 changed"; exit }
       if (lba >= 1 && lba <= 33) next
       if (lba >= last - 32 && lba <= last) next
       if (pf > 0 && lba >= pf && lba < pf + 24) next
+      if (pf > 0 && lba >= pf + 4112 && lba < pf + 4128) next
       print "lba " lba " changed"; exit }
     END { if (n == 0) print "nothing changed" }' || true)"
-[[ -z "${bad}" ]] && pass "host: only the GPT, the two memory copies and note 0 changed" || fail "host: ${bad}"
+[[ -z "${bad}" ]] && pass "host: only the GPT, the two memory copies, note 0 and the setup copies changed" || fail "host: ${bad}"
 s0="$(dd if="${work}/hdd.before" bs=512 skip=2048 count=16384 status=none | sha256sum)"
 s1="$(dd if="${work}/hdd.img" bs=512 skip=2048 count=16384 status=none | sha256sum)"
 [[ "${s0}" == "${s1}" ]] && pass "host: the old partition is byte-identical" || fail "host: the old partition changed"
@@ -255,6 +276,7 @@ echo "== boot 2: the same disk after a stop =="
 chk "2: Allen's section found" "${work}/two.txt" '^allen_memory: Allen'"'"'s section is on disk [0-9]+ \([0-9]+ blocks of 512 bytes\)$'
 chk "2: AIENOS partition found, not added again" "${work}/two.txt" '^allen_memory: AIENOS partition found, entry [0-9]+, first_lba='"${pf:-x}"' last_lba='"${pl:-x}"'$'
 nochk "2: no second partition" "${work}/two.txt" 'AIENOS partition added'
+chk "2: completed setup stays closed" "${work}/two.txt" '^wizard: setup finished on an earlier start'
 chk "2: memory loaded" "${work}/two.txt" '^allen_memory: loaded generation 5 \(2 of 2 copies valid\): 1 fact, name known, 1 earlier start$'
 chk "2: the note loaded" "${work}/two.txt" '^allen_memory: 1 note loaded \(0 damaged\)$'
 chk "2: start 2 saved" "${work}/two.txt" '^allen_memory: saved generation 6 '
@@ -262,8 +284,8 @@ chk "2: Allen welcomes Drake back first" "${work}/two.txt" '^allen: Welcome back
 chk "2: the fact remembered across the power off" "${work}/two.txt" '^allen: Your favorite color is blue\.$'
 chk "2: the note handed back across the power off" "${work}/two.txt" '^allen: From your notes: the gate code is 4471\.$'
 chk "2: the start count remembered" "${work}/two.txt" "^allen: This is start number 2 for me, and I've answered [0-9]+ lines in all\.\$"
-chk "2: Allen asleep after goodbye" "${work}/two.txt" '^power: Allen asleep'
-[[ ${b2_off} == 1 ]] && pass "2: sleep seen before QEMU was stopped" || fail "2: no sleep after goodbye"
+chk "2: ACPI S5 after goodbye" "${work}/two.txt" '^power: off via ACPI S5 '
+[[ ${b2_off} == 1 ]] && pass "2: S5 requested before QEMU cleanup" || fail "2: no S5 after goodbye"
 nochk "2: no write refused by the fence" "${work}/two.txt" 'ahci_write: .*refused'
 
 echo "== other: the same section on another machine, under a model on no list =="

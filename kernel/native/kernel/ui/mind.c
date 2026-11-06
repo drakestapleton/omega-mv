@@ -208,25 +208,92 @@ void ck_mind_at(ck_mind *m, uint32_t t)
         y0 = ck_min(y0, m->py[i]), y1 = ck_max(y1, m->py[i]);
     }
     m->hx = m->cx * 16 + 8, m->hy = m->cy * 16 + 8;
-    m->hr = (int32_t)(R16 * 52 / 100 * scale / 65536);
-    int32_t halo = (int32_t)(R16 * 17 / 10 * ck_min((int32_t)(scale >> 8), 256) / 256);
-    int32_t pad = S(8) * 16;
-    x0 = ck_min(x0 - pad, m->hx - halo), x1 = ck_max(x1 + pad, m->hx + halo);
-    y0 = ck_min(y0 - pad, m->hy - halo), y1 = ck_max(y1 + pad, m->hy + halo);
+    /* Native-pixel heart: scale changes the network, not its point lights. */
+    m->hr = 24;
+    int32_t pad = 48; /* native points and their coverage edge */
+    x0 = ck_min(x0 - pad, m->hx - m->hr - 16), x1 = ck_max(x1 + pad, m->hx + m->hr + 16);
+    y0 = ck_min(y0 - pad, m->hy - m->hr - 16), y1 = ck_max(y1 + pad, m->hy + m->hr + 16);
     m->box = (ck_rect){(x0 >> 4) - 1, (y0 >> 4) - 1, ((x1 - x0) >> 4) + 3, ((y1 - y0) >> 4) + 3};
 }
 
 ck_rect ck_mind_dirty(const ck_mind *m) { return ck_union(m->was, m->box); }
+
+/* A filled geometric point, constant light inside and one-pixel coverage
+ * at its boundary. No radial falloff, bloom, or extra light outside the edge. */
+static void point(ck_canvas *out, const ck_rect *clip, int32_t cx, int32_t cy,
+                  int32_t radius, uint32_t color, uint32_t alpha)
+{
+    if (radius <= 0 || !alpha)
+        return;
+    ck_rect box = {(cx - radius - 8) >> 4, (cy - radius - 8) >> 4, 0, 0};
+    box.w = ((cx + radius + 8) >> 4) - box.x + 1;
+    box.h = ((cy + radius + 8) >> 4) - box.y + 1;
+    ck_rect canvas = {0, 0, out->w, out->h};
+    if (!ck_clip(&box, clip) || !ck_clip(&box, &canvas))
+        return;
+    int64_t inner = ck_max(radius - 8, 0), outer = (int64_t)radius + 8;
+    int64_t inner2 = inner * inner, outer2 = outer * outer;
+    for (int32_t y = box.y; y < box.y + box.h; y++) {
+        int64_t dy = (int64_t)y * 16 + 8 - cy, dy2 = dy * dy;
+        uint32_t *row = out->px + (size_t)y * (size_t)out->w;
+        for (int32_t x = box.x; x < box.x + box.w; x++) {
+            int64_t dx = (int64_t)x * 16 + 8 - cx;
+            int64_t d2 = dx * dx + dy2;
+            if (d2 >= outer2)
+                continue;
+            uint32_t coverage = radius >= 8 && d2 <= inner2 ? 256u :
+                ck_cover((int32_t)ck_isqrt((uint64_t)d2) - radius);
+            if (coverage)
+                row[x] = ck_mix(row[x], color, coverage * alpha >> 8);
+        }
+    }
+}
+
+/* Same native thread projection as ck_thread, but coverage mixing prevents
+ * crossings and background stars accumulating into interior white lights.
+ * Local to the mind: sky light remains additive. */
+static void thread(ck_canvas *cv, const ck_rect *clip, int32_t x0, int32_t y0,
+                   int32_t x1, int32_t y1, int32_t width, uint32_t a0, uint32_t a1)
+{
+    if (width <= 0 || (!a0 && !a1))
+        return;
+    int steep = ck_abs(y1 - y0) > ck_abs(x1 - x0);
+    if (steep) {
+        int32_t t = x0; x0 = y0; y0 = t;
+        t = x1; x1 = y1; y1 = t;
+    }
+    if (x0 > x1) {
+        int32_t t = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+        uint32_t u = a0; a0 = a1; a1 = u;
+    }
+    int32_t len = ck_max(x1 - x0, 1);
+    int64_t grad = (int64_t)(y1 - y0) * 65536 / len;
+    uint32_t slant = (uint32_t)(ck_isqrt((uint64_t)(65536ll * 65536ll + grad * grad)) >> 8);
+    int32_t radius = (int32_t)((int64_t)width * slant >> 9);
+    int32_t first = ck_max((x0 + 7) >> 4, steep ? clip->y : clip->x);
+    int32_t last = ck_min((x1 - 8) >> 4, (steep ? clip->y + clip->h : clip->x + clip->w) - 1);
+    for (int32_t X = first; X <= last; X++) {
+        int32_t along = X * 16 + 8 - x0;
+        int32_t yc = y0 + (int32_t)(along * grad >> 16);
+        uint32_t a = (uint32_t)((int32_t)a0 + ((int32_t)a1 - (int32_t)a0) * along / len);
+        for (int32_t Y = (yc - radius - 8) >> 4; Y <= (yc + radius + 8) >> 4; Y++) {
+            int32_t x = steep ? Y : X, y = steep ? X : Y;
+            if (x < clip->x || y < clip->y || x >= clip->x + clip->w || y >= clip->y + clip->h ||
+                x < 0 || y < 0 || x >= cv->w || y >= cv->h)
+                continue;
+            uint32_t coverage = ck_cover(ck_abs(Y * 16 + 8 - yc) - radius);
+            size_t p = (size_t)y * (size_t)cv->w + (size_t)x;
+            cv->px[p] = ck_mix(cv->px[p], CK_RGB(120, 140, 255), a * coverage >> 8);
+        }
+    }
+}
 
 void ck_mind_draw(const ck_mind *m, ck_canvas *out, const ck_rect *r)
 {
     if (!m->alpha || !ck_meets(m->box, r))
         return;
     uint32_t A = m->alpha, form = (uint32_t)ck_prog(m->t, m->born, m->born + CK_MIND_FORM_MS);
-    int64_t R16 = (int64_t)m->R * 16;
-    /* the halo: a faint blue light round the whole mind, swelling a little with the heart */
-    ck_glow(out, r, m->hx, m->hy, (int32_t)(R16 * 17 / 10), CK_RGB(60, 74, 210), (52 + m->heart / 8) * A >> 8);
-    ck_glow(out, r, m->hx, m->hy, (int32_t)R16, CK_RGB(112, 92, 255), (30 + m->heart / 8) * A >> 8);
     /* the threads, fading in once the points have mostly gathered */
     uint32_t ta = ck_smooth(((int32_t)form - 128) * 2) * A >> 8;
     if (ta)
@@ -234,17 +301,13 @@ void ck_mind_draw(const ck_mind *m, ck_canvas *out, const ck_rect *r)
             unsigned a = m->ea[i], b = m->eb[i];
             uint32_t a0 = (m->lum[a] * (16u + m->near[a] * 60u / 256u) >> 8) * ta >> 8,
                      a1 = (m->lum[b] * (16u + m->near[b] * 60u / 256u) >> 8) * ta >> 8;
-            ck_thread(out, r, m->px[a], m->py[a], m->px[b], m->py[b], CK_RGB(120, 140, 255), a0, a1);
-            if (m->k > 320) /* a second strand on big screens, so the thread keeps its weight */
-                ck_thread(out, r, m->px[a], m->py[a] + 16, m->px[b], m->py[b] + 16, CK_RGB(120, 140, 255), a0 / 2,
-                          a1 / 2);
+            thread(out, r, m->px[a], m->py[a], m->px[b], m->py[b], (int32_t)m->k / 16, a0, a1);
         }
-    /* the points: pale blue-white, warming as they light */
+    /* Cool native-pixel points, including activation; never warm/white discs. */
     for (unsigned i = 0; i < CK_MIND_NODES; i++) {
-        int32_t rad = (int32_t)((int64_t)S(3) * 16 * (160 + m->near[i] * 120 / 256) >> 8);
-        uint32_t c = ck_mix(CK_RGB(206, 222, 255), CK_RGB(255, 214, 160), m->act[i]);
-        ck_glow(out, r, m->px[i], m->py[i], rad * 3, c, (m->lum[i] * 50 >> 8) * A >> 8);
-        ck_glow(out, r, m->px[i], m->py[i], rad, c, m->lum[i] * A >> 8);
+        int32_t rad = 16;
+        uint32_t c = ck_mix(CK_RGB(32, 72, 144), CK_RGB(48, 112, 192), m->act[i]);
+        point(out, r, m->px[i], m->py[i], rad, c, m->lum[i] * A >> 8);
     }
     /* the sparks, each with a short fading tail */
     for (unsigned i = 0; i < m->nspark; i++) {
@@ -256,11 +319,11 @@ void ck_mind_draw(const ck_mind *m, ck_canvas *out, const ck_rect *r)
             int32_t g = ck_clamp(f - k * 22, 0, 256);
             int32_t x = m->px[a] + (int32_t)((int64_t)(m->px[b] - m->px[a]) * g >> 8);
             int32_t y = m->py[a] + (int32_t)((int64_t)(m->py[b] - m->py[a]) * g >> 8);
-            ck_glow(out, r, x, y, S(5) * 16 - k * S(1) * 16, CK_RGB(255, 222, 176), (200 >> k) * A >> 8);
+            point(out, r, x, y, 16 - k * 4, CK_RGB(48, 112, 192), (200 >> k) * A >> 8);
         }
     }
-    /* the heart: a warm light at the centre, and a small bright core */
-    ck_glow(out, r, m->hx, m->hy, m->hr, CK_RGB(255, 210, 170), m->heart * 7 / 10 * A >> 8);
-    ck_glow(out, r, m->hx, m->hy, m->hr * 2 / 5, CK_RGB(255, 236, 214), (90 + m->heart) * A >> 8);
-    ck_glow(out, r, m->hx, m->hy, m->hr / 8, CK_RGB(255, 250, 240), 230 * A >> 8);
+    /* Voice and cadence modulate a cool point, not a bright central lamp. */
+    point(out, r, m->hx, m->hy, m->hr,
+          ck_mix(CK_RGB(32, 72, 144), CK_RGB(48, 112, 192), m->heart),
+          ck_min(90 + (int32_t)m->heart, 256) * A >> 8);
 }

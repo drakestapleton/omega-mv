@@ -37,7 +37,9 @@
 /* ---- HID boot keyboard report (HID 1.11 appendix B.1) ---- */
 #define CK_HID_REPORT_LEN 8u
 #define CK_HID_MAX_KEYS 6u
-enum ck_key_kind { CK_KEY_NONE = 0, CK_KEY_CHAR, CK_KEY_ENTER, CK_KEY_BACKSPACE, CK_KEY_ESCAPE };
+enum ck_key_kind { CK_KEY_NONE = 0, CK_KEY_CHAR, CK_KEY_ENTER, CK_KEY_BACKSPACE, CK_KEY_ESCAPE,
+                   CK_KEY_UP, CK_KEY_DOWN, CK_KEY_LEFT, CK_KEY_RIGHT, CK_KEY_TAB, /* moves: the line editor ignores them */
+                   CK_KEY_PGUP, CK_KEY_PGDN, CK_KEY_HOME, CK_KEY_END }; /* reading keys (code on the screen): ignored too */
 typedef struct {
     uint8_t kind; /* enum ck_key_kind */
     char c;       /* CK_KEY_CHAR only */
@@ -49,8 +51,11 @@ typedef struct {
 /* Fixed keymap (US layout, the only one): every printable ASCII character a
  * US keyboard types, with and without shift (a-z A-Z, 0-9 and !@#$%^&*(),
  * space, and the symbol keys - = [ ] \ ; ' ` , . / and their shifted
- * _ + { } | : " ~ < > ?), plus Enter, Backspace, Escape. Every other usage
- * (function keys, arrows, Tab, the non-US key) yields nothing. */
+ * _ + { } | : " ~ < > ?), plus Enter, Backspace, Escape, the four arrows and
+ * Tab (usages 0x4f..0x52, 0x2b), which only move a choice, and Home, Page Up,
+ * End and Page Down (0x4a, 0x4b, 0x4d, 0x4e), which only scroll the code on the
+ * screen (USB HID Usage Tables 1.5 p91-92). Every other usage (function keys,
+ * the non-US key) yields nothing. */
 ck_key_event ck_hid_usage(uint8_t usage, int shift);
 /* Decode one 8-byte report: one event per usage that was not pressed in the
  * previous report (key repeat is not generated). A phantom/rollover report

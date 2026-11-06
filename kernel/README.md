@@ -120,6 +120,7 @@ Since 2026-10-18 (PR [#427](https://github.com/aien-dev/aienux/pull/427)), all t
 - [docs/native/](docs/native/): Pi 5 run records.
 - [native/kernel/GATES.md](native/kernel/GATES.md): every emulator gate row and its status.
 - [docs/adr/](docs/adr/README.md): AIENOS decision records.
+- [docs/design/DESIGN.md](docs/design/DESIGN.md): Allen's design system (colour, type, motion, sound, voice, accessibility), exported to C, Rust and CSS by `cargo run -p allen-design-tokens -- generate`; the boot reference sketch and its maths are in [docs/design/boot/](docs/design/boot/), and mockups of every first-run screen in [docs/design/screens/](docs/design/screens/) (pictures and a browser sketch, not shown on real hardware)
 
 ## Human-Directed Agentic Engineering
 

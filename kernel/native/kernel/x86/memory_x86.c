@@ -19,7 +19,9 @@
  *      verified kernel installed as \EFI\BOOT\BOOTX64.EFI so the disk starts
  *      AIENOS by itself;
  *   5. the write range is set to the units of the section Allen uses (the two
- *      memory copies and the note units, svc/allen_memory.h) and nothing
+ *      memory copies and the note units, svc/allen_memory.h), and the two
+ *      units after them for the setup wizard's records (svc/setup_store.h)
+ *      when the section has room for them, and nothing
  *      else; the newest valid copy is loaded, then the notes it counts.
  * NVMe disks are never written (no write path exists). With no usable disk
  * Allen remembers only until the power goes off. The conversation itself
@@ -27,6 +29,7 @@
  * ("3 facts", "2 notes"). */
 #include "../core/ck_internal.h"
 #include "../svc/allen_memory.h"
+#include "../svc/setup_store.h"
 #include "disk_part.h"
 #include "gpt_add.h"
 #include "fat_boot.h"
@@ -34,6 +37,9 @@
 #include "../../boot/netboot_proto.h"
 #include "../../boot/slot_format.h"
 #include "x86.h"
+
+extern const uint8_t ck_slot_loader_keys[][32];
+extern const unsigned ck_slot_loader_nkeys;
 
 #define ALLEN_PART_MIB 1024u
 #define BOOT_PART_MIB 256u
@@ -47,6 +53,7 @@ static ck_part part;
 static ck_allen_store store;
 static unsigned disk_index;
 static int lasting;
+static int setup_room; /* the setup wizard's two units are inside the write range */
 static uint64_t hz;
 
 static int same_text(const char *a, const char *b)
@@ -109,8 +116,14 @@ static int add_section(const disk_dev *d, const ck_gpt_info *gi)
  * network loader handed over a verified kernel, that kernel is installed as
  * \EFI\BOOT\BOOTX64.EFI, so the next start needs no stick and no network
  * (Drake approved a small boot section in free space on this disk,
- * 2026-10-17). Its SHA-512 is checked again here against the signed
- * manifest. A disk that already has another system's EFI System Partition is
+ * 2026-10-17). Its manifest signature and image SHA-512 are checked again
+ * here against the kernel's configured owner keys, before any boot-section
+ * write window is opened. An image built without owner keys cannot install.
+ * The network is unauthenticated, so an older owner-signed kernel can be
+ * replayed: a kernel whose generation is below the installed kernel's
+ * policy_generation (the floor that kernel set, slot_format.h) is refused, as
+ * is any install when the installed manifest cannot be read.
+ * A disk that already has another system's EFI System Partition is
  * never touched. Without a handed-over kernel only what is there is reported.
  * Writes happen only inside the windows opened here and closed right after:
  * the GPT blocks while the partition is added, then the partition itself. */
@@ -160,11 +173,29 @@ static void boot_section(const disk_dev *d)
         return;
     }
     uint64_t t0 = ck_rdtsc();
-    uint8_t dig[AIENOS_SHA512_DIGEST_LEN];
-    aienos_sha512(obj + CK_SLOT_UNIT, (size_t)m->image_len, dig);
-    if (memcmp(dig, m->image_sha512, sizeof dig)) {
-        ck_puts("boot_disk: the kernel's SHA-512 differs from its signed manifest; nothing installed\n");
+    struct ck_slot_eval verified;
+    if (!ck_slot_verify(m, obj + CK_SLOT_UNIT, np->object_len - CK_SLOT_UNIT,
+                        ck_slot_loader_keys, ck_slot_loader_nkeys, &verified) ||
+        m->image_len > UINT32_MAX) {
+        ck_puts("boot_disk: owner signature or image verification failed; nothing installed\n");
         return;
+    }
+    if (rc == CK_GPT_OK) {
+        static uint8_t installed[CK_FATB_MAN_BYTES];
+        const struct ck_slot_manifest *im = (const void *)installed;
+        int mr = ck_fatb_manifest_read(&bp.dev, boot_serial(&bp), installed);
+        if (mr != CK_FATB_OK && mr != CK_FATB_ENOTOURS) {
+            ck_printf("boot_disk: the installed kernel's manifest could not be read (%s); nothing installed\n",
+                      ck_fatb_strerror(mr));
+            return;
+        }
+        if (mr == CK_FATB_OK && !memcmp(im->magic, CK_SLOT_MANIFEST_MAGIC, 8) &&
+            verified.generation < im->policy_generation) {
+            ck_printf("boot_disk: generation %llu is below the installed kernel's floor %llu (generation %llu); "
+                      "an older kernel is not installed\n", (unsigned long long)verified.generation,
+                      (unsigned long long)im->policy_generation, (unsigned long long)im->generation);
+            return;
+        }
     }
     if (rc == CK_GPT_ENOPART && d->block_size != 512u) {
         ck_printf("boot_disk: %u-byte sectors: the boot section handles 512 only; nothing added\n", d->block_size);
@@ -266,6 +297,10 @@ int ck_x86_memory_open(ck_allen_memory *mem, ck_allen_notes *notes, uint64_t tsc
     boot_section(d);
 
     uint64_t units = (uint64_t)CK_ALLEN_DISK_UNITS * CK_ALLEN_MEM_UNIT / d->block_size;
+    uint64_t with_setup = (uint64_t)(CK_SETUP_FIRST + CK_SETUP_UNITS) * CK_ALLEN_MEM_UNIT / d->block_size;
+    setup_room = part.blocks >= with_setup;
+    if (setup_room)
+        units = with_setup;
     if (part.blocks < units || ck_x86_ahci_allow(disk_index, part.first_lba, part.first_lba + units - 1u))
         return no_memory("could not open Allen's section for writing");
     rc = ck_allen_store_load(&store, &part.dev, mem);
@@ -296,6 +331,8 @@ static int failed(const char *what, int rc)
     ck_printf("allen_memory: %s FAILED (rc=%d); nothing more is written this start\n", what, rc);
     return -1;
 }
+
+const disk_dev *ck_x86_memory_part(void) { return lasting && setup_room ? &part.dev : 0; }
 
 int ck_x86_memory_save(const ck_allen_memory *mem)
 {

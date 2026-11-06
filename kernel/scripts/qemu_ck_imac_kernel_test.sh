@@ -46,6 +46,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 tag="AIENOS_IMAC_KERNEL"
+# Opt-in firmware-inventory coverage. This device advertises a DMAR table;
+# the kernel only reads it and never enables or configures DMA remapping.
+iommu=()
+case "${AIENOS_IMAC_DMAR:-0}" in
+    0) ;;
+    1) iommu=(-device intel-iommu,intremap=on,caching-mode=on) ;;
+    *) echo "${tag}: FAIL (AIENOS_IMAC_DMAR must be 0 or 1)"; exit 1 ;;
+esac
 code_fd="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
 vars_fd="${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
 cross=""
@@ -98,6 +106,7 @@ run() { # name, -cpu model, expected APIC mode
     local audio="none,id=snd0" keep="${AIENOS_IMAC_KERNEL_KEEP_DIR:-}"
     [[ -z "${keep}" ]] || audio="wav,id=snd0,path=${keep}/${name}.wav,out.frequency=48000,out.channels=2,out.format=s16"
     qemu-system-x86_64 -M q35 -accel tcg -cpu "${cpu}" -smp 4 -m 1024 \
+        "${iommu[@]}" \
         -drive if=pflash,format=raw,readonly=on,file="${code_fd}" \
         -drive if=pflash,format=raw,file="${work}/vars.fd" \
         -drive if=none,id=esp,format=raw,file="${img}" -device ide-hd,drive=esp,bus=ide.0 \
@@ -121,8 +130,17 @@ run() { # name, -cpu model, expected APIC mode
     chk "${name}: commit" "${txt}" "^aienos_commit: ${commit}\$"
     chk "${name}: GOP found" "${txt}" '^gop: ok '
     chk "${name}: RSDP" "${txt}" '^acpi_rsdp: 0x[0-9a-f]*[1-9a-f][0-9a-f]*$'
+    if [[ "${AIENOS_IMAC_DMAR:-0}" == 1 ]]; then
+        chk "${name}: DMAR firmware inventory" "${txt}" '^dmar: inventory bytes=[0-9]+ address_bits=[0-9]+ flags=[0-9]+ units=[1-9][0-9]* regions=[0-9]+ scopes=[1-9][0-9]* other=[0-9]+$'
+        chk "${name}: DMAR remapping unit" "${txt}" '^dmar: unit=0 segment=0 base=0x[0-9a-f]+ register_bytes=[0-9]+ include_all=[01]$'
+        chk "${name}: DMAR IOAPIC path" "${txt}" '^dmar: scope=[0-9]+ owner=unit:0 segment=0 type=3 enum=[0-9]+ start_bus=[0-9]+ path=[0-9a-f.]+$'
+        chk "${name}: inventory grants no protection" "${txt}" '^dmar: inventory-only register_access=none; DMA confinement NOT QUALIFIED$'
+    else
+        chk "${name}: absent DMAR grants no protection" "${txt}" '^dmar: absent-or-invalid; DMA confinement NOT QUALIFIED$'
+    fi
+    chk "${name}: PCI segment and requester reported" "${txt}" '^pci: fn .* segment=0 requester=[0-9a-f]{4}$'
     chk "${name}: left boot services" "${txt}" '^exit_boot_services: ok attempts=[1-8]$'
-    chk "${name}: descriptor tables" "${txt}" '^descriptors: gdt=5 tss=yes ist1=df,nmi,mc idt=256$'
+    chk "${name}: descriptor tables" "${txt}" '^descriptors: gdt=7 tss=yes ist1=df,nmi,mc idt=256$'
     chk "${name}: handoff checked" "${txt}" '^handoff: CHANDOF3 ok$'
     chk "${name}: screen on the framebuffer" "${txt}" '^screen: gop [0-9]+x[0-9]+ .* map=wc scale=[1-4] grid=[0-9]+x[0-9]+$'
     chk "${name}: own page tables" "${txt}" '^paging: root=0x[0-9a-f]+ firmware_cr3=0x[0-9a-f]+ switched=yes top_gib=[0-9]+ pages_2m_wb=[1-9][0-9]* pages_2m_wc=[1-9][0-9]* pages_2m_uc=[1-9][0-9]* pt_frames=[0-9]+ fb=wc pat1=wc$'

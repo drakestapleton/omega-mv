@@ -151,6 +151,8 @@ int main(int argc, char **argv)
     /* 2. install */
     ck_fatb_state st;
     CHECK(ck_fatb_state_read(&p.dev, serial, &st) == CK_FATB_OK && st.ours == 0 && st.slot == -1);
+    static uint8_t got_man[CK_FATB_MAN_BYTES];
+    CHECK(ck_fatb_manifest_read(&p.dev, serial, got_man) == CK_FATB_ENOTOURS); /* not formatted yet */
     static uint8_t man1[CK_FATB_MAN_BYTES], man2[CK_FATB_MAN_BYTES];
     const uint32_t len1 = 300001, len2 = 123457;
     uint8_t *img1 = malloc(len1), *img2 = malloc(len2);
@@ -177,6 +179,8 @@ int main(int argc, char **argv)
     free(after);
     CHECK(ck_fatb_state_read(&p.dev, serial, &st) == CK_FATB_OK && st.ours && st.slot == 0 && st.image_len == len1);
     CHECK(ck_fatb_state_read(&p.dev, serial + 1u, &st) == CK_FATB_OK && st.ours == 0); /* another serial: not ours */
+    CHECK(ck_fatb_manifest_read(&p.dev, serial, got_man) == CK_FATB_OK && !memcmp(got_man, man1, sizeof man1));
+    CHECK(ck_fatb_manifest_read(&p.dev, serial + 1u, got_man) == CK_FATB_ENOTOURS);
     {
         /* what FAT drivers change in normal use leaves it ours; any other change is named */
         uint8_t s0[BS];
@@ -228,6 +232,7 @@ int main(int argc, char **argv)
     CHECK(pread(f.fd, base, p.blocks * BS, (off_t)(p.first_lba * BS)) == (ssize_t)(p.blocks * BS));
     uint64_t total = 0;
     CHECK(install(&f, &p, 0, man2, img2, len2, &r, &total) == CK_FATB_OK && r.written && r.slot == 1);
+    CHECK(ck_fatb_manifest_read(&p.dev, serial, got_man) == CK_FATB_OK && !memcmp(got_man, man2, sizeof man2));
     int last = 0, bad = 0, switches = 0;
     uint64_t first_new = 0;
     for (uint64_t cut = 0; cut <= total; cut += cut < 16 || total - cut < 16 ? 1 : total / 97 + 1) {

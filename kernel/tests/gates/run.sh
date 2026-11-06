@@ -57,6 +57,36 @@ native_suite() {
   obs not_run_in_log false
 }
 
+# One test script inside a step. It counts only when it exits 0 AND prints every required line
+# whole (several print NOT_RUN and exit 0, 2 or 3; that is never a pass). Each failure is
+# counted in $script_fail so the step runs every script and fails at the end.
+# Usage: must_pass NAME LINE_REGEX... -- COMMAND...
+script_pass=0
+script_fail=0
+must_pass() {
+  local name="$1" log rc=0 r req=()
+  shift
+  while [ "$1" != -- ]; do req+=("$1"); shift; done
+  shift
+  log="$TMP/script-$name.log"
+  echo "== $name: $*"
+  "$@" 2>&1 | tee "$log" || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "script $name: exit $rc, not PASS"; script_fail=$((script_fail + 1)); return 0
+  fi
+  for r in "${req[@]}"; do
+    if ! grep -aqxE -- "$r" "$log"; then
+      echo "script $name: no line matching '$r', not PASS"; script_fail=$((script_fail + 1)); return 0
+    fi
+  done
+  echo "script $name: PASS"; script_pass=$((script_pass + 1))
+}
+scripts_verdict() {
+  obs scripts_pass "$script_pass"
+  obs scripts_fail "$script_fail"
+  [ "$script_fail" = 0 ]
+}
+
 case "$step" in
   crumb-verify)
     # The removed hosted crumb.yml built the crumb tool from the aien-architecture commit in crumb.lock.
@@ -73,7 +103,33 @@ case "$step" in
     "$TMP/tools/crumb/crumb" verify .
     ;;
   # ck-kernel.yml, host steps (ubuntu-24.04-arm there, AArch64 here)
-  ck-host-tests)      make -C native/kernel test sanitize ;;
+  ck-host-tests)
+    make -C native/kernel test sanitize
+    bash scripts/ck_swap_disk_bound_test.sh
+    bash scripts/ck_imac_lab_services_test.sh
+    bash scripts/check_local_model.sh --self-test
+    # Host-only kernel regressions (no QEMU machine, no model server, no network beyond loopback
+    # and a private namespace). ck_courier_udp_frame needs sudo -n for unshare --net.
+    must_pass fat_boot 'AIENOS_FAT_BOOT: PASS' -- bash scripts/ck_fat_boot_test.sh
+    must_pass allen_memory 'AIENOS_ALLEN_MEMORY: PASS' -- bash scripts/ck_allen_memory_test.sh
+    must_pass allen_canvas 'AIENOS_ALLEN_CANVAS: PASS' -- bash scripts/ck_allen_canvas_test.sh
+    must_pass allen_code 'AIENOS_ALLEN_CODE: PASS' -- bash scripts/ck_allen_code_test.sh
+    must_pass allen_ui 'AIENOS_ALLEN_UI: PASS' -- bash scripts/ck_allen_ui_test.sh
+    must_pass boot_show 'AIENOS_BOOT_SHOW: PASS' -- bash scripts/ck_boot_show_test.sh
+    must_pass courier_udp_frame 'COURIER_FRAMES: PASS .*' \
+      'COURIER_FRAME_ACK_CONTROL: PASS withholding GOT triggers real LINE retransmission' \
+      -- env -u KEEP_LOGS bash scripts/ck_courier_udp_frame_test.sh
+    must_pass courier_udp 'AIENOS_COURIER_UDP: PASS' -- env -u ALLEN_MODEL bash scripts/ck_courier_udp_test.sh
+    must_pass imac_bsdp 'AIENOS_IMAC_BSDP: PASS' -- bash scripts/ck_imac_bsdp_test.sh
+    must_pass imac_report 'AIENOS_IMAC_REPORT: PASS' -- bash scripts/ck_imac_report_test.sh
+    must_pass imac_security 'AIENOS_IMAC_SECURITY: PASS' -- bash scripts/ck_imac_security_test.sh
+    must_pass setup_wizard 'AIENOS_SETUP_WIZARD: PASS' -- bash scripts/ck_setup_wizard_test.sh
+    must_pass sky 'AIENOS_SKY: PASS' -- bash scripts/ck_sky_test.sh
+    must_pass sky_sharpness 'AIENOS_SKY_SHARPNESS: PASS' -- bash scripts/ck_sky_sharpness_test.sh
+    must_pass virtio_av 'AIENOS_VIRTIO_AV: PASS' -- bash scripts/ck_virtio_av_test.sh
+    must_pass mind_phases 'AIENOS_MIND_PHASES: PASS' -- sh scripts/ck_mind_phases_test.sh "$TMP/mind-phases"
+    scripts_verdict
+    ;;
   ck-stage-tests)     make -C native/kernel stage-test stage-sanitize ;;
   ck-gate-selftest)   bash scripts/ck_gates.sh --self-test ;;
   ck-hold-selftest)   bash scripts/gate_hold_selftest.sh ;;
@@ -95,7 +151,42 @@ case "$step" in
       else echo "required gate ${g}: not PASS"; fail=1; fi
     done
     obs required_gates_pass "$n"
+    # Self-contained QEMU tests of the iMac kernel: no model server (allen_code replays its
+    # recorded replies), no hardware; gpu_bench's BARs are RAM stand-ins. Each takes the gate lock.
+    must_pass allen_memory_qemu 'AIENOS_ALLEN_MEMORY_QEMU: PASS' -- bash scripts/qemu_ck_allen_memory_test.sh
+    must_pass imac_bootdisk 'AIENOS_IMAC_BOOTDISK: PASS' -- bash scripts/qemu_ck_imac_bootdisk_test.sh
+    must_pass imac_swap 'AIENOS_IMAC_SWAP: PASS' -- bash scripts/qemu_ck_imac_swap_test.sh
+    must_pass imac_kernel 'AIENOS_IMAC_KERNEL: PASS' -- env AIENOS_IMAC_DMAR=0 bash scripts/qemu_ck_imac_kernel_test.sh
+    must_pass imac_keyboard 'AIENOS_IMAC_KEYBOARD: PASS' -- bash scripts/qemu_ck_imac_keyboard_test.sh
+    must_pass boot_show_qemu 'AIENOS_CK_BOOT_SHOW: PASS' -- bash scripts/qemu_ck_boot_show_test.sh aarch64 tcg
+    must_pass gpu_bench 'AIENOS_GPU_BENCH: PASS' -- bash scripts/qemu_ck_gpu_bench_test.sh
+    must_pass local_tools 'LOCAL_TOOLS: PASS cpu=qemu64' 'LOCAL_TOOLS: PASS cpu=max' \
+      -- env LOCAL_TOOLS_OUT="$TMP/local-tools" bash scripts/qemu_ck_local_tools_test.sh
+    must_pass allen_code_qemu 'AIENOS_ALLEN_CODE_QEMU: PASS' -- env ALLEN_CODE_LIVE=0 bash scripts/qemu_ck_allen_code_test.sh
+    scripts_verdict || fail=1
     exit ${fail}
+    ;;
+  # Not hosted: QEMU tests that need outside inputs. A missing input is a FAIL, never a pass.
+  #   ALLEN_MODEL            host:port of an OpenAI-shape model server answering /health
+  #                          (allen_courier, allen_wizard); no default, so the shared server
+  #                          is only ever used when the operator names it
+  #   LOCAL_MODEL_WEIGHTS    pinned stories15M.bin (local_model checks its sha256)
+  #   LOCAL_MODEL_TOKENIZER  pinned tokenizer.bin
+  ck-qemu-external)
+    missing=0
+    for v in ALLEN_MODEL LOCAL_MODEL_WEIGHTS LOCAL_MODEL_TOKENIZER; do
+      if [ -z "${!v:-}" ]; then echo "::error::ck-qemu-external needs $v" >&2; missing=$((missing + 1)); fi
+    done
+    for v in LOCAL_MODEL_WEIGHTS LOCAL_MODEL_TOKENIZER; do
+      if [ -n "${!v:-}" ] && [ ! -r "${!v}" ]; then echo "::error::$v=${!v} is not a readable file" >&2; missing=$((missing + 1)); fi
+    done
+    obs inputs_missing "$missing"
+    [ "$missing" = 0 ] || exit 1
+    must_pass allen_courier 'AIENOS_ALLEN_COURIER: PASS' -- bash scripts/qemu_ck_allen_courier_test.sh
+    must_pass allen_wizard 'AIENOS_ALLEN_WIZARD: PASS' -- bash scripts/qemu_ck_allen_wizard_test.sh
+    must_pass local_model 'LOCAL_MODEL: PASS cpu=qemu64' 'LOCAL_MODEL: PASS cpu=max' \
+      -- env -u LOCAL_MODEL_CPUS LOCAL_MODEL_OUT="$TMP/local-model" bash scripts/qemu_ck_local_model_test.sh
+    scripts_verdict
     ;;
   ck-b7b-probe)
     bash scripts/qemu_ck_b7b_probe_test.sh --self-test
