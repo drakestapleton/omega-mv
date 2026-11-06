@@ -444,8 +444,8 @@ x64 firmware calls. Only whole programs (`fn main`) are accepted; a bare unit is
 at line 1 with error 25, and Linux host words such as `read` and `write` are refused with
 error 25 at their line. The firmware is reached through one word, `efi`
 (keyword id 178), recognised only under `target x86efi` (elsewhere it is an ordinary name,
-and a call to it is error 3): `r = efi OP ARG A OFF N`, OP a literal 0..13 (a literal outside
-0..13 is error 25, an OP that is not a literal, such as a name, is error 16), `OFF+N <= len A`
+and a call to it is error 3): `r = efi OP ARG A OFF N`, OP a literal 0..14 (a literal outside
+0..14 is error 25, an OP that is not a literal, such as a name, is error 16), `OFF+N <= len A`
 (else trap 3), bit 63 of the ulong result marks an error code. A trap T returns the
 EFI_STATUS `2^63 | (100 + T)`. See [the x86efi design and evidence](../X86-EFI.md) for
 the operations, the efi 12 file contract and qualification status.
@@ -911,7 +911,7 @@ cannot be read). In IR mode (section 11) the same codes apply; a contract line (
 | omc 22 | malformed text literal |
 | omc 23 | size capacity |
 | omc 24 | AArch64 branch displacement out of range |
-| omc 25 | unknown target, an AArch64-only path on another target, or an x86efi refusal (bare unit, Linux host word, efi OP literal outside 0..13) |
+| omc 25 | unknown target, an AArch64-only path on another target, or an x86efi refusal (bare unit, Linux host word, efi OP literal outside 0..14) |
 | omc 26 | no emitting site |
 | omc 27 | fresh element read before it is definitely written, or fresh array passed on |
 | omc 28 | abstract type: seal outside its constructor, or an unsupported holds |
@@ -1344,7 +1344,8 @@ deleted must be caught.
 ### Equivalence of scalar IR functions (seed/equiv, issue 826)
 
 `seed/equiv/irequiv.om` is a seeded-Omega interpreter for the same OSC IR v1 units (its reader is
-irwasm's, copied verbatim). `irequiv check A B` runs both functions on every input of a signature of
+irspirv's v1 reader byte for byte; irwasm's v7 reader is that reader plus the edits recorded in
+`seed/equiv/irwasm-v7.sed`). `irequiv check A B` runs both functions on every input of a signature of
 at most 24 bits (all 256 for one uchar, all 65536 for a ushort or two uchars) and prints
 `EQUIV PASS ... checked=N differing=0`, or `EQUIV FAIL ... differing=K first=<input>` with both
 results; equal means the same bits or the same trap code. Wider signatures are only sampled

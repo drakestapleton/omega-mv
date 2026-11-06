@@ -2,9 +2,11 @@
 # gate4.sh -- the checks of rung 4 (seed/README.md). Run from the repo root:  sh seed/rung4/gate4.sh
 # Needs build/omegese/omegese and build/omega_emit/omega_emit (the C path, built by make through
 # quiet-build), cc for the reference runner and committed expected outputs for the program tests. Oracles only:
-# none of them writes a byte of seed/; om4.bin is made by asm2 alone. Results: evidence/SEED-0/rung4/.
+# none of them writes a byte of seed/; om4.bin is made by asm2 alone. Results: build/seed/r4/evidence/. The
+# recorded receipt evidence/SEED-0/rung4/ (and seed/rung4/om4.audit) is only read: the results are compared
+# with it at the end (seed/check/receipt.sh), never written over it.
 set -eu
-R=seed/rung4; B=build/seed/r4; E=evidence/SEED-0/rung4; X=$R/tests
+R=seed/rung4; B=build/seed/r4; E=$B/evidence; REC=evidence/SEED-0/rung4; X=$R/tests
 T=tests/one_layer/exp445/dev/tasks/cases; O=tests/one_layer/omegese/dev
 TAB="seed/rung2/table.s2 seed/rung3/table3.s2 $R/table4.s2"
 mkdir -p "$B" "$E"
@@ -22,8 +24,8 @@ size=$(stat -c %s $R/om4.bin); fsz=$(od -An -tu4 -j96 -N4 $R/om4.bin | tr -d ' '
 sha256sum $R/om4.bin | tee "$E/om4.sha256" >> "$E/gate4.log"
 
 # 2. every instruction of om4 decodes (objdump, reference) to its name, registers, numbers, label
-if sh seed/check/audit2.sh $R/om4.s $R/om4.bin > $R/om4.audit; then :; fi
-tail -1 $R/om4.audit | tee -a "$E/gate4.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
+if sh seed/check/audit2.sh $R/om4.s $R/om4.bin > $E/om4.audit; then :; fi
+tail -1 $E/om4.audit | tee -a "$E/gate4.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
 for c in 's/^  movz.x x25 0x181 1$/  movz.x x26 0x181 1/' 's/^  b.hs BO_SDIV$/  b.hs BO_RET/' \
          's/^  ldr.x.r x12 sp x11$/  ldr.x.r x12 sp x10/' 's/^  ubfm.x x11 x11 1 63$/  ubfm.x x11 x11 2 63/' \
          's/^  movz.x x0 0x63ff 0$/  movz.x x0 0x63fe 0/'; do
@@ -208,5 +210,7 @@ if [ "$nf" -gt 0 ]; then
   cases=$((cases + 1))
 fi
 say "cases run: $cases"
+# the recorded receipt is compared, never rewritten; the verdict below is the checks' alone
+say "$(sh seed/check/receipt.sh "$E" "$REC" $R/om4.audit || true)"
 [ $fail = 0 ] && say "GATE4 PASS" || say "GATE4 FAIL"
 exit $fail

@@ -35,10 +35,21 @@ echo "omc $PIN"
 echo "effects sha256 $(sha256sum < "$E" | cut -c1-64)"
 
 # 1. Closure: every keyword with a host code (>= 100, except the non-host type/declaration
-#    keywords const and qty) is in the table,
-#    and the table holds nothing else besides read/write.
-sed -n 16,18p seed/omc/genkw.awk | grep -oE '[a-z0-9]+:[0-9]+' \
-    | awk -F: '$2 >= 100 && $1 != "const" && $1 != "qty" { print $1 }' | sort > "$B/kw.txt"
+#    keywords const and qty, and the CPU ordering words cpufence and cpurelax, which lower to
+#    DSB SY / YIELD with no SVC; checked below) is in the table,
+#    and the table holds nothing else besides read/write. The keyword lists are found by
+#    content (every split("...") line of genkw.awk), not by line number.
+grep 'split("[a-z]' seed/omc/genkw.awk | grep -oE '[a-z0-9]+:[0-9]+' \
+    | awk -F: '$2 >= 100 && $1 != "const" && $1 != "qty" && $1 != "cpufence" && $1 != "cpurelax" { print $1 }' \
+    | sort > "$B/kw.txt"
+for w in cpufence cpurelax; do
+    grep 'split("[a-z]' seed/omc/genkw.awk | grep -qE "[\" ]$w:[0-9]+" || bad "closure: $w no longer in genkw.awk; review exclusion"
+done
+printf 'fn main to int\ncpufence\ncpurelax\nret 0\nend\n' > "$B/probe/cpuord.om"
+if build "$B/probe/cpuord.om" "$B/probe/cpuord"; then
+    c=$("$E" elf < "$B/probe/cpuord" | sys_of)
+    [ "$c" = 93 ] && ok "cpufence/cpurelax issue no syscall (ELF syscalls = 93)" || bad "cpufence/cpurelax syscalls = $c"
+else bad "cpufence/cpurelax probe does not compile: $(cat "$B/probe/cpuord.err")"; fi
 "$E" table | cut -d' ' -f1 | grep -v -x -e read -e write | sort > "$B/tab.txt"
 if cmp -s "$B/kw.txt" "$B/tab.txt"; then ok "closure: $(wc -l < "$B/kw.txt") host keywords == table"
 else bad "closure: host keywords differ from table"; diff "$B/kw.txt" "$B/tab.txt"; fi
@@ -55,12 +66,12 @@ probe() { # probe EXPR OUT
 probe_parity() { # probe_parity TOOL -> prints mismatches, returns count
     m=0
     "$1" table > "$B/probe/table.txt"
-    while read -r w cl s1 s2; do
+    while read -r w cl rest; do
         expr=$(grep "^$w|" $C/probes.txt | head -1 | cut -d'|' -f2-)
         [ -n "$expr" ] || { echo "  no probe for $w"; m=$((m + 1)); continue; }
         probe "$expr" "$B/probe/$w" || { echo "  probe $w does not compile: $(cat "$B/probe/$w.err")"; m=$((m + 1)); continue; }
         got=$("$E" elf < "$B/probe/$w" | sys_of | tr ',' '\n' | grep -v -x 93 | sort -n | tr '\n' ' ')
-        exp=$(printf '%s\n%s\n' "$s1" "$s2" | grep -v -x -- - | sort -n -u | tr '\n' ' ')
+        exp=$(printf '%s\n' $rest | grep -v -x -- - | sort -n -u | tr '\n' ' ')
         [ "$got" = "$exp" ] || { echo "  $w table=[$exp] elf=[$got]"; m=$((m + 1)); }
     done < "$B/probe/table.txt"
     return $m
