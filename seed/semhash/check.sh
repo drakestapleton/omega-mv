@@ -7,6 +7,8 @@
 #   4 controls         meaning changes report CHANGED where expected (cases/*.exp)
 #   5 mutant           a copy with one keyword dropped must fail check 1 and check 2
 #   6 rename           a fn-name-only rename reports RENAMED with an equal fn hash
+#   7 dups             dups.sh over seed/semhash/dups matches dups.exp; a hash changed past the
+#                      16-digit key must not group (full-hash compare)
 # Prints SEMHASH PASS cases=N controls=M (exit 0), SEMHASH FAIL ... (exit 1), or
 # SEMHASH NOT_RUN ... (exit 3) when the pinned compiler is missing or differs.
 # Run from anywhere; paths are relative to the repository root.
@@ -157,6 +159,23 @@ printf 'fn main to int\n$v0 = 1\nret 0\nend\n' > "$W/rsv.om"
 "$SH" nosuchmode < /dev/null > /dev/null 2>&1; rc=$?
 [ "$rc" = 2 ] || fail "unknown mode: exit $rc, want 2"
 CONTROLS=$((CONTROLS + 3))
+
+# ---- 7 dups: duplicate-function report (#827). dups.sh end to end over the fixtures, then a
+# control on the raw records: one hash digit changed past the 16-digit key must split the group.
+D=seed/semhash/dups
+sh seed/semhash/dups.sh "$SH" $D > "$W/dups.got" 2>&1
+rc=$?
+if [ "$rc" = 0 ] && cmp -s $D/dups.exp "$W/dups.got"; then
+    printf 'dups: %s\n' "$(tail -n 1 "$W/dups.got")"; CASES=$((CASES + 1))
+else
+    fail "dups: exit $rc $(diff $D/dups.exp "$W/dups.got" | tr '\n' ' ')"
+fi
+for f in $D/a.om $D/b.om; do "$SH" < "$f" | sed -n "s|^FN |$f FN |p"; done > "$W/dups.in"
+awk '$2 == "FN" && $3 == "sq2" { d = substr($4, 41, 1) == "0" ? "1" : "0"; $4 = substr($4, 1, 40) d substr($4, 42) } { print }' \
+    "$W/dups.in" > "$W/dups.mut"
+got=$("$SH" dups < "$W/dups.mut" | tail -n 1)
+if [ "$got" = 'DUPS groups=0 fns=0 records=6 skipped=0' ]; then CONTROLS=$((CONTROLS + 1))
+else fail "dups control: a hash differing past the key: $got"; fi
 
 # ---- 5 mutant: drop one keyword from the table; check 1 and check 2 must both fail for it
 sed 's/\\nwhile 69\\n/\\n/' seed/semhash/semhash.om > "$W/mut/semhash.om"
