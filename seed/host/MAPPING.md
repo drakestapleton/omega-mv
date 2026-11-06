@@ -348,3 +348,15 @@ the existing function-mode host-word byte contracts. The full native-host
 gate passes under the device-hidden sandbox, including the IRQ runtime
 oracle and compiler mutants. This is host qualification, not hardware IRQ
 delivery or authorization to repin a downstream driver's compiler.
+
+The x86efi anchor fix (#NNNN) births compiler
+`5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`
+from source
+`2c0fc44bdd607f9e84315e15c7c7ea263a5f0b6d83aa3f446fa6ed975e8ef34c`.
+Since #1050, `xhbegin` anchors the slot snapshot in RBX, but `xefival` still
+loaded the firmware ARG into RBX before reading the A and N slots and returned
+through an unset R14, so every `efi` operation faulted. `xefival` now saves the
+caller's R14 at snapshot offset 152, carries the anchor in firmware-preserved
+R14 across the call, loads ARG last and restores R13 and R14 from the snapshot
+tail. `tests/x86efi/run.sh` under QEMU/OVMF goes from 4/25 to 25/25; this is
+emulated, not hardware evidence.

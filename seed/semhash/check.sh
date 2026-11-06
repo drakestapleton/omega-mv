@@ -15,7 +15,7 @@
 set -u
 cd "$(dirname "$0")/../.." || exit 3
 OMC=${OMC:-seed/out/omc}
-PIN=${SEMHASH_OMC_PIN:-b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3}
+PIN=${SEMHASH_OMC_PIN:-5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df}
 W=${SEMHASH_OUT:-build/semhash-check}
 C=seed/semhash/cases
 

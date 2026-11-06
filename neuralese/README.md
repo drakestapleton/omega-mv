@@ -17,11 +17,19 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after integrating the hosted-x86 ABI1 stack (#1050, 2026-11-06): committed
+Current pin after the x86efi anchor fix (#NNNN, branch `fix/x86efi-anchor-semhash-fma`, 2026-11-06): committed
 `seed/out/omc` SHA-256
-`96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763`, compiler
-source SHA-256 `9622f66b63b09ae3ba6a22339058f22e789f8956007caf2ded166cba966c2d4d`.
-The previous pin, after the x86efi reseed (#1015, merged as
+`5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`, compiler
+source SHA-256 `2c0fc44bdd607f9e84315e15c7c7ea263a5f0b6d83aa3f446fa6ed975e8ef34c`.
+The previous pin, after the #1045 VFIO integration (merged as
+`8dc0fc5cee188d863b271611e678faf08e1966bd`), was
+`b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3` (source
+`5419943aad39c6205bb673c1ddb1be874b1877163cc2f143c07a742cf347456c`); before that, after
+the hosted-x86 ABI1 stack (#1050, merged as
+`49d7961628ffbed5a8b013c7541995a24e64820f`), was
+`96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763` (source
+`9622f66b63b09ae3ba6a22339058f22e789f8956007caf2ded166cba966c2d4d`); before that,
+after the x86efi reseed (#1015, merged as
 `d3d1b1bc7e3b970016a2176435f78c8f0251bad1`), was
 `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55` (source
 `16b4ca40a5bd7796ac08b55d1ceadac1260e52298ed123f45418e77b3221c749`); before that, after
@@ -150,7 +158,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763 \
+    5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -366,7 +374,7 @@ It is exactly the committed `seed/out/omc` introduced by
 the lock. Read-only `git show <revision>:seed/out/omc | sha256sum` resolved the
 older `2c824805...` at82a399b9 and `49923639...` at ec07d25d as different
 historical binaries. No compiler change is part of NL4. After the reseed
-recorded at the top of this file, the committed compiler is `3ad9f10f...`; the
+recorded at the top of this file, the committed compiler is `5f90edea...`; the
 lock and receipt below keep the `d6290c76...` run unedited, and the command
 below uses the current pin because the conductor refuses any other hash.
 
@@ -380,7 +388,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc 96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch
