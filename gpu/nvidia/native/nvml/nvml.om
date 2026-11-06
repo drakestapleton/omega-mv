@@ -1,0 +1,492 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note nvml.om: state, transport requests, error policy, nvmlInit_v2 and nvmlShutdown for compat/nvml.
+note Pure unit nvml_step (nvml.om, query.om, step.om). The C shell compat/nvml/cudapp_nvml.c owns no
+note policy: it calls omega_nvml_step, performs the one action the step asks for through
+note omega2_nvrm_open_file, omega2_nvrm_close_file or omega2_nvrm_ioctl (native/nvrm/transport.om),
+note writes the result back and calls the step again until the step reports done.
+note RM layouts: open-gpu-kernel-modules 580.173.02 (commit 20e4e6e1), src/common/sdk/nvidia/inc.
+note Constants: evidence/NVML-2026-11-06/wolfram.txt.
+note
+note s (ulong 128), written by C: 0 op, 1..4 arguments, 14 action result, 15 omega2 status.
+note   written by the step: 5 scalar output, 6 nvmlReturn_t, 7 bytes of b at OO to copy out,
+note   8 action (0 done, 1 ioctl, 2 open the path at PO of length 13, 3 close), 9 fd,
+note   10 ioctl nr, 11 header bytes at b 0, 12 params bytes at b PO, 27 store the scalar (1).
+note   state: 16 init refcount, 17 phase (1 live), 18 control fd+1, 19 root client, 20 next handle,
+note   21 GPU count, 22 resume point, 23 loop index, 24 pending error, 25 cursor, 26 scratch.
+note   GPU k (at most 8) at 32+8k: 0 fd+1, 1 minor, 2 gpuId, 3 deviceInstance, 4 device handle,
+note   5 subdevice handle, 6 compute class.
+note b (uchar 83296): header 0..4607, params PO..PO+55887, output OO..OO+22799.
+
+const SN ulong 128
+const BN ulong 83296
+const PO ulong 4608
+const OO ulong 60496
+
+fn g32 b edit uchar BN off ulong to ulong
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get b add off i mul i 8
+end
+ret v
+end
+
+fn g64 b edit uchar BN off ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get b add off i mul i 8
+end
+ret v
+end
+
+fn p32 b edit uchar BN off ulong v ulong to void
+for i ulong 4
+put b add off i uchar and shr v mul i 8 255
+end
+end
+
+fn p64 b edit uchar BN off ulong v ulong to void
+for i ulong 8
+put b add off i uchar and shr v mul i 8 255
+end
+end
+
+fn bzero b edit uchar BN off ulong n ulong to void
+for i ulong n
+put b add off i 0
+end
+end
+
+fn dv k ulong f ulong to ulong
+ret add 32 add mul k 8 f
+end
+
+fn done s edit ulong SN code ulong to void
+put s 6 code
+put s 8 0
+put s 22 0
+end
+
+fn act s edit ulong SN k ulong fd ulong nr ulong hl ulong pl ulong to void
+put s 8 k
+put s 9 fd
+put s 10 nr
+put s 11 hl
+put s 12 pl
+end
+
+fn cfd s edit ulong SN to ulong
+ret sub get s 18 1
+end
+
+note NV_ESC_RM_CONTROL (nr 42), NVOS54 32-byte header: hClient 0, hObject 4, cmd 8, status 28.
+fn ctl s edit ulong SN b edit uchar BN obj ulong cmd ulong n ulong to void
+bzero b 0 32
+p32 b 0 get s 19
+p32 b 4 obj
+p32 b 8 cmd
+act s 1 cfd s 42 32 n
+end
+
+note NV_ESC_RM_ALLOC (nr 43), NVOS21 32-byte header: hRoot 0, parent 4, hObjectNew 8, hClass 12,
+note status 28. The root client (class 65, NV01_ROOT_CLIENT) takes its handle from RM.
+fn alc s edit ulong SN b edit uchar BN par ulong cls ulong n ulong to void
+bzero b 0 32
+p32 b 0 get s 19
+p32 b 4 par
+if ne cls 65
+p32 b 8 get s 20
+put s 20 add get s 20 1
+end
+p32 b 12 cls
+act s 1 cfd s 43 32 n
+end
+
+note NV_ESC_RM_FREE (nr 41), NVOS00 16-byte header: hRoot 0, parent 4, hObjectOld 8, status 12.
+fn rmfree s edit ulong SN b edit uchar BN root ulong par ulong obj ulong to void
+bzero b 0 16
+p32 b 0 root
+p32 b 4 par
+p32 b 8 obj
+act s 1 cfd s 41 16 0
+end
+
+note The device path /dev/nvidia<minor> or /dev/nvidiactl at PO; result its length.
+fn path b edit uchar BN minor ulong isctl ulong to ulong
+p64 b PO 7599382571363165231
+if eq isctl 1
+p64 b add PO 8 119247139334500
+ret 14
+end
+p32 b add PO 8 6383972
+n = add PO 11
+if ge minor 100
+put b n uchar add 48 div minor 100
+n = add n 1
+end
+if ge minor 10
+put b n uchar add 48 rem div minor 10 10
+n = add n 1
+end
+put b n uchar add 48 rem minor 10
+ret sub add n 1 PO
+end
+
+note Transport results are a long carried as its two's-complement bits in a ulong; -1 is
+note 18446744073709551615 (2^64-1), -2 ...614, -6 ...610, -13 ...603, -19 ...597.
+note An ioctl result: a nonzero omega2 status or an errno other than EPERM/EACCES (NO_PERMISSION 4)
+note is UNKNOWN (999).
+fn ioerr s edit ulong SN to ulong
+if ne get s 15 0
+ret 999
+end
+x = get s 14
+if eq x 0
+ret 0
+end
+if or eq x 18446744073709551615 eq x 18446744073709551603
+ret 4
+end
+ret 999
+end
+
+note An open result: ENOENT, ENXIO or ENODEV is DRIVER_NOT_LOADED (9), EPERM or EACCES NO_PERMISSION.
+note A non-negative result (below 2^63) is the descriptor.
+fn operr s edit ulong SN to ulong
+if ne get s 15 0
+ret 999
+end
+x = get s 14
+if lt x 9223372036854775808
+ret 0
+end
+if or or eq x 18446744073709551614 eq x 18446744073709551610 eq x 18446744073709551597
+ret 9
+end
+if or eq x 18446744073709551615 eq x 18446744073709551603
+ret 4
+end
+ret 999
+end
+
+note RM status (nvstatuscodes.h): 0x1B INSUFFICIENT_PERMISSIONS -> 4, 0x0F GPU_IS_LOST -> 15,
+note 0x56 NOT_SUPPORTED -> 3, anything else UNKNOWN.
+fn rmerr v ulong to ulong
+if eq v 0
+ret 0
+end
+if eq v 27
+ret 4
+end
+if eq v 15
+ret 15
+end
+if eq v 86
+ret 3
+end
+ret 999
+end
+
+fn chk s edit ulong SN b edit uchar BN off ulong to ulong
+e = ioerr s
+if ne e 0
+ret e
+end
+ret rmerr g32 b off
+end
+
+note Teardown, resume points 100 and 101: per GPU free the subdevice, free the device, close its fd;
+note then free the root client and close the control fd. Cursor s 25 walks items 0..25.
+fn tdtry s edit ulong SN b edit uchar BN t ulong to bool
+if lt t 24
+d = div t 3
+r = rem t 3
+if eq r 0
+x = get s dv d 5
+if ne x 0
+put s dv d 5 0
+rmfree s b get s 19 get s dv d 4 x
+ret true
+end
+ret false
+end
+if eq r 1
+x = get s dv d 4
+if ne x 0
+put s dv d 4 0
+rmfree s b get s 19 get s 19 x
+ret true
+end
+ret false
+end
+x = get s dv d 0
+if ne x 0
+put s dv d 0 0
+act s 3 sub x 1 0 0 0
+ret true
+end
+ret false
+end
+if eq t 24
+x = get s 19
+if ne x 0
+rmfree s b x x x
+put s 19 0
+ret true
+end
+ret false
+end
+x = get s 18
+if ne x 0
+act s 3 sub x 1 0 0 0
+put s 18 0
+ret true
+end
+ret false
+end
+
+fn tdstep s edit ulong SN b edit uchar BN to void
+for t ulong 26
+if ge t get s 25
+if tdtry s b t
+put s 25 add t 1
+put s 22 101
+ret
+end
+end
+end
+e = get s 24
+if eq e 0
+e = get s 26
+end
+for i ulong 96
+put s add 16 i 0
+end
+done s e
+end
+
+fn tdres s edit ulong SN b edit uchar BN to void
+e = ulong 0
+if eq get s 8 1
+e = chk s b 12
+else
+e = ioerr s
+end
+if ne e 0
+put s 26 999
+end
+tdstep s b
+end
+
+fn fail s edit ulong SN b edit uchar BN code ulong to void
+put s 24 code
+put s 25 0
+put s 26 0
+tdstep s b
+end
+
+note Next GPU: NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2 (0x205, ctrl0000gpu.h:172-185) gives deviceInstance.
+fn devnext s edit ulong SN b edit uchar BN to void
+k = get s 23
+if ge k get s 21
+put s 17 1
+put s 16 1
+done s 0
+ret
+end
+bzero b PO 32
+p32 b PO get s dv k 2
+ctl s b get s 19 517 32
+put s 22 5
+end
+
+note NV_ESC_CARD_INFO (nr 200): 64 entries of 72 bytes, valid 0, gpu_id 16, minor_number 56.
+fn cards s edit ulong SN b edit uchar BN to void
+e = ioerr s
+if ne e 0
+fail s b e
+ret
+end
+n = ulong 0
+for i ulong 64
+o = mul i 72
+if ne get b o 0
+if ge n 8
+fail s b 999
+ret
+end
+m = g32 b add o 56
+if gt m 255
+fail s b 999
+ret
+end
+put s dv n 1 m
+put s dv n 2 g32 b add o 16
+n = add n 1
+end
+end
+put s 21 n
+put s 23 0
+devnext s b
+end
+
+note NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2 (0x800292, ctrl0080gpu.h:506): numClasses 0, classList 4.
+note 52928 is BLACKWELL_COMPUTE_B (0xCEC0), the class GET_PIDS filters on.
+fn clist s edit ulong SN b edit uchar BN k ulong to void
+n = g32 b PO
+if gt n 200
+fail s b 999
+ret
+end
+c = ulong 0
+for i ulong n
+if eq g32 b add add PO 4 mul i 4 52928
+c = 52928
+end
+end
+put s dv k 6 c
+put s 23 add k 1
+devnext s b
+end
+
+fn devstep s edit ulong SN b edit uchar BN pc ulong to void
+k = get s 23
+if eq pc 6
+e = operr s
+if ne e 0
+fail s b e
+ret
+end
+put s dv k 0 add get s 14 1
+bzero b 0 4
+p32 b 0 cfd s
+act s 1 get s 14 201 4 0
+put s 22 7
+ret
+end
+e = ulong 0
+if eq pc 7
+e = ioerr s
+else
+e = chk s b 28
+end
+if ne e 0
+fail s b e
+ret
+end
+if eq pc 5
+put s dv k 3 g32 b add PO 8
+n = path b get s dv k 1 0
+act s 2 0 0 0 0
+put s 13 n
+put s 22 6
+ret
+end
+if eq pc 7
+bzero b PO 56
+p32 b PO get s dv k 3
+p32 b add PO 4 get s 19
+alc s b get s 19 128 56
+put s 22 8
+ret
+end
+if eq pc 8
+put s dv k 4 g32 b 8
+bzero b PO 4
+alc s b get s dv k 4 8320 4
+put s 22 9
+ret
+end
+if eq pc 9
+put s dv k 5 g32 b 8
+bzero b PO 804
+ctl s b get s dv k 4 8389266 804
+put s 22 10
+ret
+end
+clist s b k
+end
+
+note nvmlInit_v2: a live library only counts the reference. Otherwise open /dev/nvidiactl, allocate
+note the root client, read the card table, then per GPU: id info, open and register its device
+note node, allocate NV01_DEVICE_0 (128) and NV20_SUBDEVICE_0 (8320), read the class list.
+note Any failure tears everything down and returns its code with the refcount still 0.
+fn init s edit ulong SN b edit uchar BN to void
+pc = get s 22
+if ge pc 100
+tdres s b
+ret
+end
+if eq pc 0
+if gt get s 16 0
+put s 16 add get s 16 1
+done s 0
+ret
+end
+for i ulong 96
+put s add 16 i 0
+end
+put s 20 3472883713
+n = path b 0 1
+act s 2 0 0 0 0
+put s 13 n
+put s 22 1
+ret
+end
+if eq pc 1
+e = operr s
+if ne e 0
+done s e
+ret
+end
+put s 18 add get s 14 1
+bzero b PO 4
+alc s b 0 65 0
+put s 22 2
+ret
+end
+if eq pc 2
+e = chk s b 28
+if ne e 0
+fail s b e
+ret
+end
+x = g32 b 8
+if eq x 0
+fail s b 999
+ret
+end
+put s 19 x
+bzero b 0 4608
+act s 1 cfd s 200 4608 0
+put s 22 3
+ret
+end
+if eq pc 3
+cards s b
+ret
+end
+devstep s b pc
+end
+
+note nvmlShutdown: UNINITIALIZED (1) without a live library; the last reference tears down and
+note reports UNKNOWN if any free or close failed (the library is closed either way).
+fn shut s edit ulong SN b edit uchar BN to void
+pc = get s 22
+if ge pc 100
+tdres s b
+ret
+end
+if eq get s 16 0
+done s 1
+ret
+end
+if gt get s 16 1
+put s 16 sub get s 16 1
+done s 0
+ret
+end
+put s 24 0
+put s 25 0
+put s 26 0
+tdstep s b
+end
