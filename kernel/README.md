@@ -2,7 +2,7 @@
 
 > **Status: experimental, pre-alpha. Nothing here is qualified for real use.** The C kernel has run on a Raspberry Pi 5 and on a 2017 iMac, but only in test builds with TEST keys or throwaway secrets. It has not been booted on the NVIDIA DGX Spark. There are no support, stability or compatibility promises. Expect breaking changes.
 
-Aienux is the AienOS kernel: our own operating system kernel, built to replace Linux on the DGX Spark. AienOS is the whole system built on it. It is agent-native: the agent is the control plane, and the model is never the kernel. The kernel stays small, deterministic and non-intelligent, and the agent is never the root of trust. Most of the kernel is C in `native/`. An older Rust kernel and tools live in `crates/`.
+Aienux is the AienOS kernel: my own operating system kernel, built to replace Linux on the DGX Spark. AienOS is the whole system built on it. It is agent-native: the agent is the control plane, and the model is never the kernel. The kernel stays small, deterministic and non-intelligent, and the agent is never the root of trust. Most of the kernel is C in `native/`. An older Rust kernel and tools live in `crates/`.
 
 ```text
 Firmware -> AIEN Boot -> AIEN Kernel -> AIEN Runtime -> AIEN Agent -> You
@@ -56,7 +56,7 @@ For component status, [ROADMAP.md](ROADMAP.md) is the AIENOS plan, but its newes
 - **Free inside reversible state; explicit authorization at irreversible steps.**
 - **Language:** Rust is scaffolding, Omega is the destination, and C or assembly stay only where hardware, boot, ABI or measurement needs them (aien-architecture ADR 0024). No Python, no CUDA toolkit, no CUDA-shaped APIs, and no systemd or Linux init in boot, services or tooling. Dependencies in the trusted base are rare and built offline.
 
-## How it works and how we built it
+## How it works and how I built it
 
 One boot of the C kernel, in order:
 
