@@ -20,7 +20,7 @@
  *                 key wins), codegen budget per depth and mutant, refusals. No device.
  *   --sim         the kernel through tests/bw_warp_sim_k.h (no chip): contexts 1, 7, 256, 257, 301, 701 (1..3
  *                 splits, the cross-split combine), both fragment orders, every mutant caught at context 301.
- *   (default)     the chip: parity against the double reference at contexts 1, 7, 256, 1024, 4096, 8192, 32768
+ *   (default)     the chip: parity against the double reference at contexts 1, 7, 256, 1024, 4096, 8192, 32768, 65536, 100000, 131072
  *                 (the appended K/V row read back and compared), second call identical, timing medians with
  *                 the host caches evicted, every mutant caught at context 301, JSON receipt with --out.
  * Tolerance: |out - ref| <= 3e-3 * max|v| + 1e-6 per element (MUFU.EX2 / RSQ are 2^-22-ish, bf16 rounding of the
@@ -33,12 +33,22 @@
 #include "omega_gpu_session.h"
 #include "omega_gpu_hostmath.h"
 #include "bw_warp_sim_k.h"
+#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+/* 0644, not fopen's 0666 & ~umask: a receipt is never world-writable */
+static FILE *create_0644(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (fd >= 0 && !f) close(fd);
+    return f;
+}
 
 static int g_checks, g_failed;
 #define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_failed++; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -123,9 +133,9 @@ static void omega_decode_attn_reference(const float *qkv, const uint16_t *kc, co
 /* the library's libm-free host math against libm: RoPE rows bit-equal or within one f32 ulp, double values close */
 static void host_math_vs_libm(void) {
     uint32_t s = 77; unsigned flips = 0, worse = 0; double maxd = 0;
-    static const uint32_t fixed[] = { 0, 1, 2, 3, 100, 255, 256, 4095, 4096, 8191, 32767, 32768, 65535 };
+    static const uint32_t fixed[] = { 0, 1, 2, 3, 100, 255, 256, 4095, 4096, 8191, 32767, 32768, 65535, 65536, 99999, 131071 };
     for (unsigned n = 0; n < 1000 + sizeof fixed / sizeof fixed[0]; n++) {
-        uint32_t pos = n < sizeof fixed / sizeof fixed[0] ? fixed[n] : lcg(&s) % 65536u;
+        uint32_t pos = n < sizeof fixed / sizeof fixed[0] ? fixed[n] : lcg(&s) % OMEGA_GPU_DATTN_MAX_POS;
         float row[128]; omega_dattn_rope_row(pos, THETA, row);
         for (unsigned i = 0; i < 64; i++) {
             double ang = (double)pos * pow(THETA, -(double)(2 * i) / 128.0);
@@ -225,7 +235,9 @@ static void host_only(void) {
       s.depth = 1; s.mutant = 5; CHECK(omega_decode_attn_prog_stats(&s, NULL, NULL) != 0, "mutant 5 refused"); }
     CHECK(omega_gpu_decode_attn_cache_alloc(0, 256, THETA, NULL) == OMEGA_GPU_DATTN_BAD_ARGS, "NULL out refused");
     { OmegaGpuDecodeAttnCache *c = (OmegaGpuDecodeAttnCache *)1;
-      CHECK(omega_gpu_decode_attn_cache_alloc(1, 100, THETA, &c) == OMEGA_GPU_DATTN_BAD_ARGS && c == NULL, "max_pos not a multiple of 256 refused before any device work"); }
+      CHECK(omega_gpu_decode_attn_cache_alloc(1, 100, THETA, &c) == OMEGA_GPU_DATTN_BAD_ARGS && c == NULL, "max_pos not a multiple of 256 refused before any device work");
+      c = (OmegaGpuDecodeAttnCache *)1;
+      CHECK(omega_gpu_decode_attn_cache_alloc(1, OMEGA_GPU_DATTN_MAX_POS + 256u, THETA, &c) == OMEGA_GPU_DATTN_BAD_ARGS && c == NULL, "max_pos above OMEGA_GPU_DATTN_MAX_POS refused before any device work"); }
     CHECK(OMEGA_DATTN_SHARED_BYTES <= 16384u, "shared memory within the QMD cap (%u)", OMEGA_DATTN_SHARED_BYTES);
 }
 
@@ -332,10 +344,10 @@ static int fill_history(OmegaGpuDecodeAttnCache *cache, const Case *c) {
     return OMEGA_GPU_DATTN_OK;
 }
 static int chip_run(const char *out_path, uint32_t reps) {
-    FILE *out = out_path ? fopen(out_path, "w") : NULL;
+    FILE *out = out_path ? create_0644(out_path) : NULL;
     if (out_path && !out) { printf("cannot write %s\n", out_path); return 1; }
     if (out) fprintf(out, "{\"receipt\":\"OMEGA_GPU_DECODE_ATTN_V1\",\"reps\":%u,\"evict\":%d,\"points\":[", reps, g_evict);
-    const uint32_t MAXP = 32768;
+    const uint32_t MAXP = OMEGA_GPU_DATTN_MAX_POS;
     OmegaGpuDecodeAttnCache *cache = NULL;
     double t0 = now_ms();
     int rc = omega_gpu_decode_attn_cache_alloc(1, MAXP, THETA, &cache);
@@ -345,6 +357,7 @@ static int chip_run(const char *out_path, uint32_t reps) {
     struct { uint32_t pos; float qscale; const char *name; } pts[] = {
         { 0, 1.0f, "context 1" }, { 6, 1.0f, "context 7" }, { 255, 1.0f, "context 256" }, { 300, 4.0f, "context 301 sharp q" },
         { 1023, 1.0f, "context 1024" }, { 4095, 1.0f, "context 4096" }, { 8191, 1.0f, "context 8192" }, { 32767, 1.0f, "context 32768" },
+        { 65535, 1.0f, "context 65536 (old cap)" }, { 99999, 1.0f, "context 100000" }, { 131071, 1.0f, "context 131072 (cap)" },
     };
     int first = 1;
     for (size_t i = 0; i < sizeof pts / sizeof pts[0]; i++) {
@@ -429,7 +442,7 @@ static int geometry_refusal(uint32_t qh, uint32_t kvh, uint32_t hd, const char *
     for (int i = 0; i < nw; i++) printf("  reason %d: %s\n", i + 1, why[i]);
     printf("  needed: a decode attention kernel for this geometry (ternary engine design KT3)\n");
     if (out_path) {
-        FILE *f = fopen(out_path, "w");
+        FILE *f = create_0644(out_path);
         if (f) {
             fprintf(f, "{\"test\":\"gpu_decode_attn_test\",\"q_heads\":%u,\"kv_heads\":%u,\"head_dim\":%u,\"kernel_q_heads\":%u,\"kernel_kv_heads\":%u,\"reasons\":[",
                     qh, kvh, hd, OMEGA_GPU_DATTN_Q_HEADS, OMEGA_GPU_DATTN_KV_HEADS);
