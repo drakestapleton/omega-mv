@@ -17,8 +17,10 @@
  *     (gpu/contract/gb10_gsp.devc). Writes need a second switch, allow_boot=1, and CAP_SYS_RAWIO. The SEC2
  *     doorbell (QUEUE_HEAD(0)) can be rung once per load: a failed start-up is never retried without a reset.
  *     remove sets gone under the device lock first. After that, register access, INFO and mmap return -ENODEV.
- *     A live arena VMA or an open fd keeps the arena (leak until reboot) instead of freeing it. sysfs unbind
- *     is not offered (suppress_bind_attrs).
+ *     A live arena VMA or an open fd keeps the arena (leak until reboot) instead of freeing it. A probe after
+ *     remove (PCI rescan) is refused with -EBUSY while such an fd, VMA or a rung doorbell survives; otherwise it
+ *     clears gone and the info. The lock is static, never re-initialised. arena_mib must be 1..SIZE_MAX >> 20.
+ *     sysfs unbind is not offered (suppress_bind_attrs).
  * The start-up logic itself (gpu/gsp_mmio.c, dev/gb10_gsp_boot.c) runs in user space (aien_gsp_boot) over these two
  * ioctls, so the driver core stays AGPL and outside this GPL module. GB10B has no FSP: SEC2 takes the start-up packet.
  * What comes next (not here): the RPC subset (docs/numeric/DRIVER_FLOOR.md), the channel from
@@ -85,11 +87,12 @@ static struct {
 	dma_addr_t heap_iova;
 	size_t heap_bytes;
 	struct aien_gpu_info info;
-	struct mutex lock;      /* register access, the doorbell latch, and gone */
+	struct mutex lock;      /* register access, the doorbell latch, and gone; initialised once, never per probe */
 	atomic_t open;          /* one opener at a time; stays set until the last file ref drops */
 	atomic_t maps;          /* live arena VMAs (mmap counts; vm_ops open/close track splits) */
-	bool gone;              /* set at the start of remove; register, INFO and mmap then return -ENODEV */
-} g;
+	bool gone;              /* set at the start of remove; register, INFO and mmap then return -ENODEV.
+	                         * A later probe clears it only when no fd, VMA or doorbell survives. */
+} g = { .lock = __MUTEX_INITIALIZER(g.lock) };
 
 static bool aien_gpu_listed(const u32 *list, size_t n, u32 off)
 {
@@ -244,6 +247,22 @@ static int aien_gpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev_info(&pdev->dev, "aien-gpu: allow_bind=0, not binding\n");
 		return -ENODEV;
 	}
+	if (!arena_mib || arena_mib > SIZE_MAX >> 20) {
+		dev_err(&pdev->dev, "aien-gpu: arena_mib %u out of range (1..SIZE_MAX >> 20)\n", arena_mib);
+		return -EINVAL;
+	}
+	/* Probe after remove (PCI remove + rescan). An fd or arena VMA from the previous binding, or an
+	 * attempted GSP start-up (arena and heap leaked until reboot), keeps the device refused. Otherwise
+	 * start from a clean state: the lock is static, so an old release() can never see it re-initialised. */
+	mutex_lock(&g.lock);
+	if (g.gone && (atomic_read(&g.open) || atomic_read(&g.maps) || g.info.doorbells)) {
+		mutex_unlock(&g.lock);
+		dev_warn(&pdev->dev, "aien-gpu: previous binding still has an fd, a mapping or a GSP start-up; reboot first\n");
+		return -EBUSY;
+	}
+	g.gone = false;
+	memset(&g.info, 0, sizeof(g.info));
+	mutex_unlock(&g.lock);
 	rc = pcim_enable_device(pdev);
 	if (rc)
 		return rc;
@@ -254,7 +273,6 @@ static int aien_gpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	g.info.dma_bits = AIEN_GPU_DMA_BITS;
 	g.info.allow_boot = allow_boot;
 	g.info.bar0_pa = pci_resource_start(pdev, 0);
-	mutex_init(&g.lock);
 	g.bar0 = pcim_iomap(pdev, 0, 0);
 	if (!g.bar0)
 		return -ENOMEM;

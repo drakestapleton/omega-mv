@@ -74,6 +74,38 @@ static int pt_alloc(struct ck_gmmu_as *as, uint64_t *pa)
     return CK_GMMU_ENOMEM;
 }
 
+/* A table address read back from table memory must name a page of this
+ * address space's pool that is in use. Anything else (a stray or corrupted
+ * PDE) would make the walk read and write outside the page tables. */
+static int pt_live(const struct ck_gmmu_as *as, uint64_t pa)
+{
+#ifdef CK_GPU_MUTANT_NO_PDE_CHECK
+    (void)as;
+    (void)pa;
+    return 1;
+#else
+    for (uint32_t i = 0; i < as->pt_count; i++)
+        if (as->pt_pa[i] == pa)
+            return as->pt_used[i] != 0;
+    return 0;
+#endif
+}
+
+static int overlaps_pool(const struct ck_gmmu_as *as, uint64_t pa, uint64_t size)
+{
+#ifdef CK_GPU_MUTANT_NO_POOL_OVERLAP
+    (void)as;
+    (void)pa;
+    (void)size;
+    return 0;
+#else
+    for (uint32_t i = 0; i < as->pt_count; i++)
+        if (as->pt_pa[i] < pa + size && pa < as->pt_pa[i] + CK_GMMU_PT_BYTES)
+            return 1;
+    return 0;
+#endif
+}
+
 static uint32_t pt_free_count(const struct ck_gmmu_as *as)
 {
     uint32_t n = 0;
@@ -98,12 +130,14 @@ int ck_gmmu_as_init(struct ck_gmmu_as *as, const struct ck_gpu_window *win, uint
     return pt_alloc(as, &as->root_pa);
 }
 
-enum walk_r { W_FREE, W_MAPPED, W_MISSING, W_CONFLICT };
+enum walk_r { W_FREE, W_MAPPED, W_MISSING, W_CONFLICT, W_CORRUPT };
 
 /* Walk to the leaf slot for `va` at page size `page`. With create=0 nothing
  * is written; *miss_lv gets the first level whose table does not exist yet
  * (W_MISSING). With create=1 missing tables are allocated (the caller has
- * already checked the pool). *leaf is the PTE slot on W_FREE / W_MAPPED. */
+ * already checked the pool). *leaf is the PTE slot on W_FREE / W_MAPPED.
+ * W_CORRUPT: a PDE read back from table memory does not point at a live page
+ * of this pool; nothing was dereferenced through it. */
 static enum walk_r walk(struct ck_gmmu_as *as, uint64_t va, uint64_t page, int create, uint32_t *miss_lv,
                         volatile uint64_t **leaf)
 {
@@ -125,6 +159,8 @@ static enum walk_r walk(struct ck_gmmu_as *as, uint64_t va, uint64_t page, int c
             v = *e;
         }
         tbl = v & PDE_ADDR_MASK;
+        if (!pt_live(as, tbl))
+            return W_CORRUPT;
     }
     volatile uint64_t *d = ent(as, tbl, lv_index(LV_PD0, va), 16);
     uint64_t w0 = d[0], w1 = d[1];
@@ -167,6 +203,8 @@ static enum walk_r walk(struct ck_gmmu_as *as, uint64_t va, uint64_t page, int c
         d[0] = nd[0];
     } else {
         pt = big ? (w0 & DUAL_BIG_ADDR_MASK) : (w1 & PTE_ADDR_MASK);
+        if (!pt_live(as, pt))
+            return W_CORRUPT;
     }
     volatile uint64_t *p = ent(as, pt, lv_index(big ? LV_BIG : LV_SMALL, va), 8);
     *leaf = p;
@@ -206,6 +244,8 @@ int ck_gmmu_map(struct ck_gmmu_as *as, uint64_t va, uint64_t pa, uint64_t size, 
     if (pa >= (1ull << CK_GMMU_PA_BITS) || !pa_in_window(as->win, pa, size))
         return CK_GMMU_ERANGE;
 #endif
+    if (overlaps_pool(as, pa, size))
+        return CK_GMMU_ERANGE; /* a GPU mapping never covers its own page tables */
 
     /* Dry run: every page must be free, and count the page-table pages the
      * map would create. Pages run in VA order, so a table instance at level
@@ -218,6 +258,10 @@ int ck_gmmu_map(struct ck_gmmu_as *as, uint64_t va, uint64_t pa, uint64_t size, 
         uint32_t miss = 0;
         volatile uint64_t *leaf = 0;
         enum walk_r w = walk(as, va + off, page, 0, &miss, &leaf);
+        if (w == W_CORRUPT) {
+            as->dead = 1;
+            return CK_GMMU_EDEAD;
+        }
 #ifndef CK_GPU_MUTANT_NO_OVERLAP
         if (w == W_MAPPED || w == W_CONFLICT)
 #else
@@ -267,7 +311,12 @@ int ck_gmmu_unmap(struct ck_gmmu_as *as, uint64_t va, uint64_t size, uint64_t pa
     for (uint64_t off = 0; off < size; off += page) {
         uint32_t miss = 0;
         volatile uint64_t *leaf = 0;
-        if (walk(as, va + off, page, 0, &miss, &leaf) != W_MAPPED)
+        enum walk_r w = walk(as, va + off, page, 0, &miss, &leaf);
+        if (w == W_CORRUPT) {
+            as->dead = 1;
+            return CK_GMMU_EDEAD;
+        }
+        if (w != W_MAPPED)
             return CK_GMMU_ENOENT;
     }
     for (uint64_t off = 0; off < size; off += page) {

@@ -106,12 +106,13 @@ enum ck_gmmu_status {
     CK_GMMU_OK = 0,
     CK_GMMU_EINVAL,     /* bad argument: size, page size, flags */
     CK_GMMU_EALIGN,     /* VA, PA or size not aligned to the page size */
-    CK_GMMU_ERANGE,     /* VA beyond 57 bits, or PA outside the window */
+    CK_GMMU_ERANGE,     /* VA beyond 57 bits, PA outside the window, or PA over the page-table pool */
     CK_GMMU_EBUSY,      /* overlaps an existing mapping or a different page size */
     CK_GMMU_ENOMEM,     /* page-table pool exhausted */
     CK_GMMU_ENOENT,     /* unmap of a range that is not fully mapped */
     CK_GMMU_ETIMEDOUT,  /* invalidate never completed */
-    CK_GMMU_EDEAD,      /* the address space latched a failure; refuses everything */
+    CK_GMMU_EDEAD,      /* the address space latched a failure (invalidate timeout, or a PDE
+                         * read back that names no live page of the pool); refuses everything */
 };
 
 #define CK_GMMU_MAX_PT 64u /* page-table pages per address space (bounded) */
@@ -122,7 +123,7 @@ struct ck_gmmu_as {
     uint64_t pt_pa[CK_GMMU_MAX_PT]; /* page-table pool, carved by the caller */
     uint8_t pt_used[CK_GMMU_MAX_PT];
     uint32_t pt_count;
-    uint32_t dead;                  /* latched after an invalidate timeout */
+    uint32_t dead;                  /* latched after an invalidate timeout or a corrupt PDE */
 };
 
 /* pool_pa: CK_GMMU_MAX_PT * 4 KiB inside the window, 4 KiB aligned; pages

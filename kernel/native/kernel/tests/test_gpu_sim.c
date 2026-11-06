@@ -484,6 +484,59 @@ static void test_gp_va40(void)
     CHECK(ck_gpu_chan_teardown(&ch, 2, 0, 0) == CK_GCHAN_OK);
 }
 
+/* Entry slot of `va` at level lv (0 = PD4 root .. 4 = PD0, 16-byte dual
+ * entries), found by following the PDEs gmmu wrote. */
+static uint64_t *pd_slot(uint64_t va, unsigned lv)
+{
+    static const uint8_t lo[5] = {56, 47, 38, 29, 21}, bits[5] = {1, 9, 9, 9, 8};
+    uint64_t tbl = as.root_pa;
+    for (unsigned l = 0;; l++) {
+        uint64_t idx = (va >> lo[l]) & ((1ull << bits[l]) - 1);
+        uint64_t *p = (uint64_t *)(mem + (tbl - PA_BASE) + idx * (l == 4 ? 16u : 8u));
+        if (l == lv)
+            return p;
+        tbl = *p & 0x000FFFFFFFFFF000ull;
+    }
+}
+
+/* 11. #493 N2/N3: a PDE read back from table memory must name a live page
+ * of the pool (else latch EDEAD, touch nothing), and no mapping may cover
+ * the page-table pool itself. */
+static void test_pde_and_pool(void)
+{
+    uint64_t va = VA_BASE, junk = DATA_PA + 0x10000;
+    uint8_t before[4096];
+
+    /* Map path: a PD3 entry redirected into data memory (0xA5 garbage). */
+    fresh(64);
+    CHECK(ck_gmmu_map(&as, va, DATA_PA, 0x1000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_OK);
+    *pd_slot(va, 1) = ck_gmmu_pde(junk, CK_GMMU_PDE_AP_SYS_COH);
+    memcpy(before, mem + (junk - PA_BASE), sizeof before);
+    CHECK(ck_gmmu_map(&as, va + 0x1000, DATA_PA + 0x1000, 0x1000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_EDEAD);
+    CHECK(as.dead == 1);
+    CHECK(memcmp(before, mem + (junk - PA_BASE), sizeof before) == 0);
+    CHECK(ck_gmmu_map(&as, va + 0x200000, DATA_PA, 0x1000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_EDEAD); /* latched */
+
+    /* Unmap path: the PD0 small-table half redirected into data memory. */
+    fresh(64);
+    CHECK(ck_gmmu_map(&as, va, DATA_PA, 0x1000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_OK);
+    uint64_t nd[2];
+    ck_gmmu_dual_pde(nd, 0, CK_GMMU_PDE_AP_INVALID, junk, CK_GMMU_PDE_AP_SYS_COH);
+    pd_slot(va, 4)[1] = nd[1];
+    memcpy(before, mem + (junk - PA_BASE), sizeof before);
+    CHECK(ck_gmmu_unmap(&as, va, 0x1000, CK_GMMU_SZ_4K) == CK_GMMU_EDEAD);
+    CHECK(as.dead == 1);
+    CHECK(memcmp(before, mem + (junk - PA_BASE), sizeof before) == 0); /* no PTE cleared in data */
+
+    /* Pool overlap: 8 page-table pages at POOL_PA. */
+    fresh(8);
+    CHECK(ck_gmmu_map(&as, va, POOL_PA, 0x1000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_ERANGE);          /* the root */
+    CHECK(ck_gmmu_map(&as, va, POOL_PA + 0x7000, 0x1000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_ERANGE); /* last page */
+    CHECK(ck_gmmu_map(&as, va, POOL_PA + 0x6000, 0x4000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_ERANGE); /* straddles end */
+    CHECK(ck_gmmu_map(&as, va, POOL_PA + 0x8000, 0x1000, CK_GMMU_SZ_4K, 2, 0) == CK_GMMU_OK);     /* first page after */
+    CHECK(as.dead == 0);
+}
+
 int main(void)
 {
     mem = aligned_alloc(4096, MEM_BYTES);
@@ -499,6 +552,7 @@ int main(void)
     test_reopen();
     test_huge_levels();
     test_gp_va40();
+    test_pde_and_pool();
     free(mem);
     return ck_t_verdict("test_gpu_sim");
 }
