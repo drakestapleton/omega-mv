@@ -1342,7 +1342,8 @@ deleted must be caught.
 ### Equivalence of scalar IR functions (seed/equiv, issue 826)
 
 `seed/equiv/irequiv.om` is a seeded-Omega interpreter for the same OSC IR v1 units (its reader is
-irwasm's, copied verbatim). `irequiv check A B` runs both functions on every input of a signature of
+irspirv's v1 reader byte for byte; irwasm's v7 reader is that reader plus the edits recorded in
+`seed/equiv/irwasm-v7.sed`). `irequiv check A B` runs both functions on every input of a signature of
 at most 24 bits (all 256 for one uchar, all 65536 for a ushort or two uchars) and prints
 `EQUIV PASS ... checked=N differing=0`, or `EQUIV FAIL ... differing=K first=<input>` with both
 results; equal means the same bits or the same trap code. Wider signatures are only sampled
