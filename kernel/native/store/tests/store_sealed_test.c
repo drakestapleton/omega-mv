@@ -212,9 +212,19 @@ static void test_rollback(void)
     memset(t, 0, (size_t)RIG_ANCHOR_UNITS * 4096u);
     CHECK(file_save(g_path, t, RIG_BYTES) == 0, "write");
     SCHECK_EQ(open_rc(&K), SS_E_ROLLBACK, "missing anchor at gen 4");
-    /* whole-disk rollback (both regions) is NOT detected: documented limit */
+    /* LIMITATION, whole-image freshness: rolling back both regions together is
+     * NOT detected. It needs a monotonic counter outside the disk (TPM NV,
+     * TRUST-1, aienux#32). The mount succeeds at the stale generation 2 and
+     * reports a valid resume, so a successful mount is never proof of freshness. */
     CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "write");
-    SCHECK_EQ(open_rc(&K), 0, "whole-disk rollback mounts (needs TPM NV, TRUST-1)");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "whole-disk rollback mounts (LIMITATION: needs TPM NV, #32)");
+        SCHECK_EQ(ss_generation(&s), 2, "whole-disk rollback: stale generation 2 is served, not 4");
+        SCHECK_EQ(s.rb, SS_RB_VALID_RESUME, "whole-disk rollback reports a valid resume (undetected)");
+        rig_close(&r);
+    }
 
     /* forked anchor: same counter, different digest, valid MAC */
     CHECK(file_save(g_path, img_c, RIG_BYTES) == 0, "write");
@@ -955,6 +965,133 @@ static void last_pair(uint8_t out[24])
     memcpy(out + 16, g_ws.env[0] + 44, 8);
 }
 
+/* ---- independent envelope id oracle (#445) ----
+ * HMAC-SHA256 (RFC 2104) and HKDF-Expand (RFC 5869) written here over the
+ * argus SHA-256 alone, pinned by published vectors, so the expected pair is
+ * computed without envid_derive, aienos_hmac_* or m5_hkdf_expand. The input
+ * layout is the V2 rule as documented above envid_derive (store_sealed.c):
+ * uuid 16 || generation u64 || index u32 || kind u16 || version u16 ||
+ * key_generation u64 || identity_class u8 || plaintext_len u64 ||
+ * SHA-256(plaintext), little-endian, after the domain string and its NUL.
+ * The envelope id (object key input) is bytes 0..15 of the HMAC, the nonce
+ * prefix bytes 16..23; both live in one key scope, the store's k_domain. */
+static void or_hmac(const uint8_t *key, size_t klen, const uint8_t *a, size_t alen, const uint8_t *b,
+                    size_t blen, uint8_t out[32])
+{
+    uint8_t k0[64], pad[64], ih[32];
+    memset(k0, 0, sizeof k0);
+    if (klen > 64) sha256_hash(key, klen, k0);
+    else memcpy(k0, key, klen);
+    sha256_ctx c;
+    for (int i = 0; i < 64; i++) pad[i] = k0[i] ^ 0x36;
+    sha256_init(&c);
+    sha256_update(&c, pad, 64);
+    sha256_update(&c, a, alen);
+    if (blen) sha256_update(&c, b, blen);
+    sha256_final(&c, ih);
+    for (int i = 0; i < 64; i++) pad[i] = k0[i] ^ 0x5c;
+    sha256_init(&c);
+    sha256_update(&c, pad, 64);
+    sha256_update(&c, ih, 32);
+    sha256_final(&c, out);
+}
+
+/* HKDF-Expand, L <= 64, info <= 64 bytes */
+static void or_hkdf_expand(const uint8_t prk[32], const uint8_t *info, size_t ilen, uint8_t *out, size_t L)
+{
+    uint8_t t[32], msg[32 + 64 + 1];
+    size_t got = 0, tl = 0;
+    for (uint8_t i = 1; got < L; i++) {
+        memcpy(msg, t, tl);
+        memcpy(msg + tl, info, ilen);
+        msg[tl + ilen] = i;
+        or_hmac(prk, 32, msg, tl + ilen + 1, NULL, 0, t);
+        tl = 32;
+        size_t n = L - got < 32 ? L - got : 32;
+        memcpy(out + got, t, n);
+        got += n;
+    }
+}
+
+static int hex_eq(const uint8_t *got, const char *hex, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        unsigned v = 0;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1 || got[i] != (uint8_t)v) return 0;
+    }
+    return 1;
+}
+
+static void le(uint8_t *p, uint64_t v, int n)
+{
+    for (int i = 0; i < n; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+/* expected (envelope_id || nonce_prefix) of the object at (gen, index) */
+static void oracle_pair(const ss_keys *k, uint64_t gen, uint32_t index, uint16_t kind, uint16_t version,
+                        const uint8_t *pt, size_t len, uint8_t out[24])
+{
+    static const char info[] = "AIENOS-SEALED-ENVID-KEY-V2", dom[] = "AIENOS-SEALED-ENVID-V2";
+    uint8_t key[32], m[16 + 8 + 4 + 2 + 2 + 8 + 1 + 8 + 32], h[32];
+    or_hkdf_expand(k->k_domain, (const uint8_t *)info, sizeof info, key, sizeof key);
+    memcpy(m, RIG_UUID, 16);
+    le(m + 16, gen, 8);
+    le(m + 24, index, 4);
+    le(m + 28, kind, 2);
+    le(m + 30, version, 2);
+    le(m + 32, k->key_generation, 8);
+    m[40] = k->identity_class;
+    le(m + 41, len, 8);
+    sha256_hash(pt, len, m + 49);
+    or_hmac(key, sizeof key, (const uint8_t *)dom, sizeof dom, m, sizeof m, h);
+    memcpy(out, h, 24);
+}
+
+static void test_envid_oracle(void)
+{
+    /* the oracle's primitives against published vectors */
+    uint8_t h[42];
+    sha256_hash((const uint8_t *)"abc", 3, h);
+    CHECK(hex_eq(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", 32), "SHA-256 FIPS 180 'abc'");
+    uint8_t k0b[20];
+    memset(k0b, 0x0b, sizeof k0b);
+    or_hmac(k0b, sizeof k0b, (const uint8_t *)"Hi There", 8, NULL, 0, h);
+    CHECK(hex_eq(h, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", 32), "HMAC RFC 4231 case 1");
+    or_hmac((const uint8_t *)"Jefe", 4, (const uint8_t *)"what do ya want ", 16, (const uint8_t *)"for nothing?", 12, h);
+    CHECK(hex_eq(h, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", 32), "HMAC RFC 4231 case 2");
+    static const uint8_t prk[32] = {0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf, 0x0d, 0xdc, 0x3f,
+                                    0x0d, 0xc4, 0x7b, 0xba, 0x63, 0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f,
+                                    0x9c, 0x31, 0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2, 0xb3, 0xe5};
+    static const uint8_t info[10] = {0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9};
+    or_hkdf_expand(prk, info, sizeof info, h, 42);
+    CHECK(hex_eq(h, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", 42),
+          "HKDF-Expand RFC 5869 case 1");
+
+    /* gen 2 = {P1 kind 40 v1 at index 0, P2 kind 41 v2 at index 1}: every
+     * bound field is nonzero in object 1, so dropping any one changes it */
+    uint8_t ids[2][32], want[24], got[24];
+    make_gen2(ids);
+    oracle_pair(&K, 2, 0, 40, 1, P1, sizeof P1, want);
+    memcpy(got, g_ws.env[0] + 28, 16);
+    memcpy(got + 16, g_ws.env[0] + 44, 8);
+    CHECK(memcmp(got, want, 24) == 0, "gen 2 object 0 pair equals the independent oracle");
+    oracle_pair(&K, 2, 1, 41, 2, P2, sizeof P2, want);
+    memcpy(got, g_ws.env[1] + 28, 16);
+    memcpy(got + 16, g_ws.env[1] + 44, 8);
+    CHECK(memcmp(got, want, 24) == 0, "gen 2 object 1 pair equals the independent oracle");
+    if (g_bs == 512)
+        printf("envid oracle: key scope k_domain (rig seed 0x11, class %u, key_generation %llu), store RIG_UUID;"
+               " gen 2 index 0 kind 40 v1 %zu B = %u chunk(s), index 1 kind 41 v2 %zu B = %u chunk(s) of %u B\n",
+               (unsigned)K.identity_class, (unsigned long long)K.key_generation, sizeof P1,
+               (unsigned)((sizeof P1 + SS_CHUNK - 1) / SS_CHUNK), sizeof P2,
+               (unsigned)((sizeof P2 + SS_CHUNK - 1) / SS_CHUNK), (unsigned)SS_CHUNK);
+    /* the same object under another key scope is a different pair; pairs are
+     * only required to be new within one scope, never across unrelated keys */
+    uint8_t other[24];
+    oracle_pair(&K_OTHER, 2, 1, 41, 2, P2, sizeof P2, other);
+    CHECK(memcmp(other, want, 24) != 0, "oracle: another k_domain gives another pair");
+}
+
 static void test_nonce(void)
 {
     uint8_t ids[2][32];
@@ -970,6 +1107,11 @@ static void test_nonce(void)
         uint8_t id[32];
         advance(&K, 42, q, 600, id, 0);
         last_pair(pairs[r]);
+        {
+            uint8_t want[24];
+            oracle_pair(&K, 3, 0, 42, 1, q, 600, want);
+            CHECK(memcmp(pairs[r], want, 24) == 0, "rollback rewrite %d: pair equals the independent oracle", r);
+        }
         rig rr;
         ss_store s;
         SCHECK_EQ(sopen(&rr, &s, &K), 0, "rewritten gen 3 mounts");
@@ -1109,6 +1251,7 @@ int main(int argc, char **argv)
         test_keyslot();
         test_anchor_crash();
         test_nonce();
+        test_envid_oracle();
         test_keyslot_limits();
         printf("sealed store, %u-byte blocks: %s\n", g_bs, g_failed == before ? "ok" : "FAILED");
         unlink(g_path);

@@ -472,22 +472,26 @@ static int envid_derive(const ss_store *s, uint64_t gen, uint32_t index, uint16_
                         uint16_t version, const uint8_t *pt, size_t len, uint8_t out[32])
 {
     uint8_t k[32], ph[32], m[16 + 8 + 4 + 2 + 2 + 8 + 1 + 8 + 32];
+    /* Zeroed first, so a mutant that drops one bound field below (the envid-*
+     * guards) derives a fixed, wrong value that the tests' independent oracle
+     * sees, instead of whatever the stack held. */
+    memset(m, 0, sizeof m);
     if (m5_hkdf_expand(s->keys.k_domain, (const uint8_t *)ENVID_KEY_INFO, sizeof(ENVID_KEY_INFO), k,
                        sizeof k) != M5_OK)
         return SS_E_CRYPTO;
     sha256_hash(pt, len, ph);
-    memcpy(m, s->uuid, 16);
-    put64(m + 16, gen);
-    put32(m + 24, index);
-    put16(m + 28, kind);
-    put16(m + 30, version);
-    put64(m + 32, s->keys.key_generation);
-    m[40] = s->keys.identity_class;
-    put64(m + 41, (uint64_t)len);
-    memcpy(m + 49, ph, 32);
+    memcpy(m, s->uuid, 16); /* GUARD:envid-store */
+    put64(m + 16, gen); /* GUARD:envid-generation */
+    put32(m + 24, index); /* GUARD:envid-index */
+    put16(m + 28, kind); /* GUARD:envid-kind */
+    put16(m + 30, version); /* GUARD:envid-version */
+    put64(m + 32, s->keys.key_generation); /* GUARD:envid-key-generation */
+    m[40] = s->keys.identity_class; /* GUARD:envid-class */
+    put64(m + 41, (uint64_t)len); /* GUARD:envid-length */
+    memcpy(m + 49, ph, 32); /* GUARD:envid-plaintext */
     aienos_hmac_sha256_ctx c;
     aienos_hmac_sha256_init(&c, k);
-    aienos_hmac_sha256_update(&c, (const uint8_t *)ENVID_DOMAIN, sizeof(ENVID_DOMAIN));
+    aienos_hmac_sha256_update(&c, (const uint8_t *)ENVID_DOMAIN, sizeof(ENVID_DOMAIN)); /* GUARD:envid-domain */
     aienos_hmac_sha256_update(&c, m, sizeof m);
     aienos_hmac_sha256_final(&c, out);
     aienos_wipe(k, sizeof k);

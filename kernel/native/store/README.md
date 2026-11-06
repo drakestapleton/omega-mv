@@ -110,6 +110,12 @@ envelope whose id or nonce prefix does not follow the version-2 rule.
 `AIENOS_STORE_MUTANTS`), `make freestanding` (`nm -u` closes over the sibling
 native objects), `make lib-checks`. All runs are host emulation over files.
 
+[`tests/SEALED-COVERAGE.md`](tests/SEALED-COVERAGE.md) maps the sealed store's
+rollback and nonce-safety properties (confidentiality under nonce misuse,
+authentication, replay, crash consistency, whole-image freshness) to these
+tests and mutants, including the independent envelope-id oracle and the
+undetected whole-image rollback (#32).
+
 Every `/* GUARD:name */` line in the four store sources is a mutant: `make
 mutants` deletes it and requires some store test to fail. Three Rust-parity
 checks are deliberately untagged because no input can reach them alone:

@@ -126,7 +126,10 @@ else
 endif
 
 # Mutants: remove each GUARD-tagged rule in turn. The tests must fail for
-# every mutant, or that rule is not tested.
+# every mutant, or that rule is not tested. A mutant counts as killed only
+# when a test exits 1 with its own FAIL verdict line (or, for store mutants,
+# a sanitizer report of the invalid access); a crash, a signal, any other exit
+# status, a build failure or a gate timeout is never counted as a detection.
 GUARDS = parity-a parity-b b-needs-a adjacent first-remnant a-alone-seq1
 
 mutants: torn-slot-mutants store-mutants
@@ -145,9 +148,12 @@ torn-slot-mutants: $(OUT)/t_torn_slot_test.o $(OUT)/sha256.o | $(OUT)
 	    $(CC) $(CFLAGS) -Wno-error -I. -c -o $(OUT)/mut_$$g.o $(OUT)/mut_$$g.c \
 	      && $(CC) $(CFLAGS) -Wno-error -o $(OUT)/mut_$$g $(OUT)/t_torn_slot_test.o $(OUT)/mut_$$g.o $(OUT)/sha256.o \
 	      || { echo "mutant $$g: does not compile" > $(OUT)/mut_$$g.msg; echo 1 > $(OUT)/mut_$$g.fail; exit 0; }; \
-	    if ./$(OUT)/mut_$$g --rules-only > $(OUT)/mut_$$g.log 2>&1; then \
+	    ./$(OUT)/mut_$$g --rules-only > $(OUT)/mut_$$g.log 2>&1; rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
 	      echo "mutant $$g: SURVIVED (FAIL)" > $(OUT)/mut_$$g.msg; echo 1 > $(OUT)/mut_$$g.fail; \
-	    else echo "mutant $$g: killed" > $(OUT)/mut_$$g.msg; : > $(OUT)/mut_$$g.killed; fi \
+	    elif [ $$rc -eq 1 ] && grep -q '^TORN_SLOT_RULES: FAIL' $(OUT)/mut_$$g.log; then \
+	      echo "mutant $$g: killed" > $(OUT)/mut_$$g.msg; : > $(OUT)/mut_$$g.killed; \
+	    else echo "mutant $$g: exit $$rc without a FAIL verdict, not a detection (FAIL)" > $(OUT)/mut_$$g.msg; echo 1 > $(OUT)/mut_$$g.fail; fi \
 	  ) & \
 	done; \
 	wait; \
@@ -182,9 +188,17 @@ store-mutants: $(STORE_OBJS) $(TEST_OBJS) $(DEP_OBJS) $(OUT)/torn_slot.o $(HOST_
 	    dead=0; by=""; \
 	    for t in $$order; do \
 	      $(CC) $(CFLAGS) $(MUTANT_SANFLAGS) -o $$d/$$t $(OUT)/t_$$t.o $$d/m.o $$objs $(OUT)/torn_slot.o $(DEP_OBJS) $(HOST_OBJS) || { dead=2; break; }; \
-	      if ! ./$$d/$$t $$d > $$d/$$g.log 2>&1; then dead=1; by="$$t"; break; fi; \
+	      ./$$d/$$t $$d > $$d/$$g.log 2>&1; rc=$$?; \
+	      if [ $$rc -ne 0 ]; then \
+	        if [ $$rc -eq 1 ] && grep -q '^STORE_[A-Z0-9_]*: FAIL$$' $$d/$$g.log; then dead=1; by="$$t"; \
+	        elif [ $$rc -eq 1 ] && grep -q 'runtime error:' $$d/$$g.log; then dead=1; by="$$t (sanitizer)"; \
+	        else dead=3; by="$$t exit $$rc"; fi; \
+	        break; \
+	      fi; \
 	    done; \
 	    if [ $$dead -eq 1 ]; then echo "mutant $$g ($$f): killed by $$by" > $$d/msg; : > $$d/killed; \
+	    elif [ $$dead -eq 3 ]; then echo "mutant $$g ($$f): $$by without a FAIL verdict, not a detection (FAIL)" > $$d/msg; echo 1 > $$d/fail; \
+	    elif [ $$dead -eq 2 ]; then echo "mutant $$g ($$f): does not link (FAIL)" > $$d/msg; echo 1 > $$d/fail; \
 	    else echo "mutant $$g ($$f): SURVIVED (FAIL)" > $$d/msg; echo 1 > $$d/fail; fi \
 	  ) & \
 	done; \
