@@ -9,9 +9,10 @@
 # 5. controls: a wrong register, a wrong table bit and an out-of-range number are caught;
 # 6. reference only: nvdisasm -b SM121 reads each instruction form back; its name is compared with the name
 #    the C encoder gives it (names.tsv). Any difference is listed, never hidden.
-# Results: evidence/SEED-0/sm121/.
+# Results: build/seed/r6/evidence/. The recorded receipt evidence/SEED-0/sm121/ is only read: the results are
+# compared with it at the end (seed/check/receipt.sh), never written over it.
 set -eu
-R=seed/sm121; B=build/seed/r6; E=evidence/SEED-0/sm121; O=$B/out
+R=seed/sm121; B=build/seed/r6; E=$B/evidence; REC=evidence/SEED-0/sm121; O=$B/out
 ASM=seed/rung2/asm2.bin; TAB=$R/sm121.tbl
 NVD=${NVDISASM:-/usr/local/cuda/bin/nvdisasm}
 mkdir -p "$E" "$O/k"
@@ -110,5 +111,7 @@ else
 fi
 cp "$O/kernels.tsv" "$E/kernels.tsv"; sort "$O/notes.tsv" | awk -F'\t' '{ c[$3]++ } END { for (k in c) print c[k] "\t" k }' | sort -rn > "$E/notes-summary.tsv"
 say "notes (what the C encoder silently ignores or drops): $(wc -l < "$E/notes-summary.tsv") kinds, $E/notes-summary.tsv"
+# the recorded receipt is compared, never rewritten; the verdict below is the checks' alone
+say "$(sh seed/check/receipt.sh "$E" "$REC" || true)"
 [ $fail = 0 ] && say "GATE6 PASS" || say "GATE6 FAIL"
 exit $fail

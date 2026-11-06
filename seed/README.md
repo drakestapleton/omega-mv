@@ -112,7 +112,8 @@ it came from.
 - How it builds code: every name gets its own register for as long as it exists. The C path keeps every
   value in memory and loads and stores it around each step (that is its documented design, OSC-1 design
   section 7, "no register allocation"), so a difference in word counts below measures that choice.
-- Checks (`rung3/gate3.sh`, results in `evidence/SEED-0/rung3/`):
+- Checks (`rung3/gate3.sh`, results in `build/seed/r3/evidence/`, compared with the recorded receipt
+  `evidence/SEED-0/rung3/`, never written over it):
   - asm2 builds om3 twice to the same bytes; objdump (the referee) reads every one of the 1,486
     instructions back to the name, registers, numbers and jump targets written in `om3.s`:
     0 disagreements (`rung3/om3.audit`); five planted mistakes in the text are each caught;
@@ -176,7 +177,8 @@ it came from.
     overflow, division by zero traps, a bad index traps, running out of stack traps; the spec has no
     "undefined" in it (the gate checks with a search);
   - no automatic conversions: mixing two types in one operation is refused.
-- Checks (`rung4/gate4.sh`, results in `evidence/SEED-0/rung4/`), 217 cases, all pass:
+- Checks (`rung4/gate4.sh`, results in `build/seed/r4/evidence/`, compared with the recorded receipt
+  `evidence/SEED-0/rung4/`, never written over it), 217 cases, all pass:
   - asm2 rebuilds om4 to the same bytes; objdump (the referee) reads all 3,170 instructions back to
     what `om4.s` says (0 disagreements); five planted mistakes in the text are each caught;
   - the 10 practice tasks: om4 makes exactly the same machine words as om3, and the same results as the
@@ -215,7 +217,8 @@ it came from.
   fingerprint, constants, the SHA-256 code from byte 384, its table at byte 1224) is written out by hand
   in the same file. `atlas/table5.s2` adds 28 instruction lines, each naming its manual section.
 - Built by asm2, with no GNU assembler and no linker: `atlas/atlas.bin`, 1,480 bytes.
-- Checks (`atlas/gate5.sh`, results in `evidence/SEED-0/rung5/`):
+- Checks (`atlas/gate5.sh`, results in `build/seed/r5/evidence/`, compared with the recorded receipt
+  `evidence/SEED-0/rung5/`, never written over it):
   - asm2 builds it twice to the same bytes, and it is byte for byte the audited Atlas image
     (sha256 f7802501...a5): no difference, so the manual had nothing to settle;
   - objdump (the referee) reads all 263 instructions back to what `atlas.s2` says: 0 disagreements;
