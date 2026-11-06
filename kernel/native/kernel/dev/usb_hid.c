@@ -253,7 +253,7 @@ void ck_recovery_identity(const char *commit, uint8_t out[32])
     sha256_update(&c, (const uint8_t *)dom, sizeof dom);
     size_t n = 0;
     if (commit)
-        while (commit[n] && n < 64) n++;
+        while (n < 64 && commit[n]) n++;
     sha256_update(&c, (const uint8_t *)(commit ? commit : ""), n);
     sha256_final(&c, out);
 }
