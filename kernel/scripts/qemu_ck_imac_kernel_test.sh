@@ -22,7 +22,8 @@
 # SATA disk, and boots it twice in QEMU q35 with OVMF: "-cpu max" and "-cpu qemu64"
 # (two CPU models; the kernel drives the local APIC in xAPIC mode on both). Each run
 # must leave boot services, switch to the kernel's own page tables, prove the guard
-# page, measure the TSC against the HPET, take 20 local APIC timer interrupts, print
+# page and an unmapped page 0 (a NULL read and write fault, #487), measure the TSC
+# against the HPET, take 20 local APIC timer interrupts, print
 # start the three other cores (-smp 4) drawing the night sky of the startup, find both SATA disks behind
 # the q35 AHCI controller and an NVMe disk with its own GPT and read them without
 # writing (the ESP, and a data disk with a GPT whose AIENOS partition the kernel
@@ -127,6 +128,7 @@ run() { # name, -cpu model, expected APIC mode
     chk "${name}: own page tables" "${txt}" '^paging: root=0x[0-9a-f]+ firmware_cr3=0x[0-9a-f]+ switched=yes top_gib=[0-9]+ pages_2m_wb=[1-9][0-9]* pages_2m_wc=[1-9][0-9]* pages_2m_uc=[1-9][0-9]* pt_frames=[0-9]+ fb=wc pat1=wc$'
     chk "${name}: heap" "${txt}" '^memory: frame_ranges=[1-9][0-9]* free_bytes=[1-9][0-9]* .* heap_test=ok$'
     chk "${name}: guard page fault contained" "${txt}" '^guard_page: ok fault=contained \(#PF cr2=0x[0-9a-f]+ error=0x[0-9a-f]+, not present\)$'
+    chk "${name}: NULL read and write fault contained" "${txt}" '^null_page: ok read=fault write=fault \(#PF cr2=0x0 error=0x[0-9a-f]+,0x[0-9a-f]+, not present\)$'
     chk "${name}: TSC timed by the HPET" "${txt}" '^timebase: hpet period_fs=[1-9][0-9]* tsc_hz=[1-9][0-9]*$'
     chk "${name}: APIC mode ${mode}" "${txt}" "^apic: mode=${mode} id=0 "
     chk "${name}: MADT four CPUs" "${txt}" '^madt: cpus=4 ioapics=1 ioapic_lines_masked=[1-9][0-9]*$'

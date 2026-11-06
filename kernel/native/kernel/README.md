@@ -177,8 +177,9 @@ The first cut of the C kernel core on x86_64, for the owner's 2017 iMac
 CHANDOF3 record, checked by `core/handoff_check.c`; `x86/kmain_x86.c` loads its
 own GDT, TSS and IDT (`x86/trap.S`), builds its own identity page tables (2 MiB
 pages: RAM write-back, everything else uncached, the framebuffer write-combining,
-a 4 KiB guard page under the stack), proves the guard page faults and the fault
-is contained, measures the TSC against the HPET, runs the local APIC timer
+a 4 KiB guard page under the stack, physical page 0 not mapped so a NULL
+dereference faults), proves the guard page and NULL reads and writes fault and the faults
+are contained, measures the TSC against the HPET, runs the local APIC timer
 (xAPIC) for 20 interrupts at 100 Hz, starts every other core the MADT lists
 (INIT-SIPI-SIPI into the `x86/smp_x86.S` trampoline below 1 MiB; each core loads
 the kernel's tables, turns interrupts on, checks in and draws or halts), then walks PCI (`x86/pci_x86.c`, MCFG

@@ -835,11 +835,12 @@ static int in_range(uint64_t p, const char *lo, const char *hi)
 }
 
 /* One 4 KiB page of a split 2 MiB page (cache bits from the 2 MiB entry):
- * the stack guard unmapped, code RX, the PE header and read-only data R+NX,
- * everything else RW+NX (the trampoline page included until smp_start). */
+ * physical page 0 and the stack guard unmapped (a NULL dereference faults,
+ * #487), code RX, the PE header and read-only data R+NX, everything else
+ * RW+NX (the trampoline page included until smp_start). */
 static uint64_t leaf_4k(uint64_t p, uint64_t cache)
 {
-    if (p == (uint64_t)(uintptr_t)kstack)
+    if (p == 0 || p == (uint64_t)(uintptr_t)kstack)
         return 0;
     if (in_range(p, __text_start, __text_end))
         return p | PTE_P | TEXT_W | cache;
@@ -949,6 +950,7 @@ static void mm_build(void)
     for (uint64_t a = (uint64_t)(uintptr_t)__image_base & ~((2ull << 20) - 1); a < (uint64_t)(uintptr_t)__image_end;
          a += 2ull << 20)
         split_2m(a);
+    split_2m(0); /* page 0 not present */
     if (tramp_pa)
         split_2m(tramp_pa);
     for (uint64_t g = 0; g < top >> 30; g++)
@@ -1661,6 +1663,38 @@ static __attribute__((noreturn)) void kernel_main(void *arg)
     else
         ck_panic("guard_page: FAIL hit=%d cr2=0x%llx error=0x%llx", probe.hit, (unsigned long long)probe.cr2,
                  (unsigned long long)probe.err);
+    /* Physical page 0 is not mapped (#487): a NULL read and a NULL write each
+     * fault (not present), and the fault is contained. */
+    uint64_t null_err[2] = {0, 0};
+    int null_ok[2] = {0, 0};
+    for (int w = 0; w < 2; w++) {
+        probe.hit = 0;
+        probe.armed = 1;
+        if (w)
+            __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
+                             "mov %%rax, %0\n\t"
+                             "movb $0, (%1)\n"
+                             "1:"
+                             : "=m"(probe.resume)
+                             : "r"((uint64_t)0)
+                             : "rax", "memory");
+        else
+            __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
+                             "mov %%rax, %0\n\t"
+                             "movb (%1), %%al\n"
+                             "1:"
+                             : "=m"(probe.resume)
+                             : "r"((uint64_t)0)
+                             : "rax", "memory");
+        probe.armed = 0;
+        null_err[w] = probe.err;
+        null_ok[w] = probe.hit && probe.cr2 == 0 && (probe.err & 0x1b) == (w ? 0x02u : 0x00u);
+    }
+    if (null_ok[0] && null_ok[1])
+        ck_printf("null_page: ok read=fault write=fault (#PF cr2=0x0 error=0x%llx,0x%llx, not present)\n",
+                  (unsigned long long)null_err[0], (unsigned long long)null_err[1]);
+    else
+        ck_panic("null_page: FAIL read=%s write=%s", null_ok[0] ? "fault" : "ALLOWED", null_ok[1] ? "fault" : "ALLOWED");
     wx_probes();
 
     if (!tsc_hz)
