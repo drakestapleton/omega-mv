@@ -23,9 +23,16 @@ bootstrap and test orchestration remain disclosed development tools.
 | `cpufence` | Statement, keyword 199: a standalone host CPU publication barrier, AArch64 `DSB SY`, x86-64 `MFENCE`. It orders ordinary stores, for example `mapwrite` or plain array stores, before a later `mapset` doorbell or flag. A `mapget`/`mapset` access already carries its own barriers. See OMEGESE §10, "Host CPU ordering words". Proof: `seed/host/cpufence.sh`. |
 | `cpurelax` | Statement, keyword 200: spin-wait hint for a bounded `mapget` poll loop, AArch64 `YIELD`, x86-64 `PAUSE`. It gives no ordering. Proof: `seed/host/cpufence.sh`. |
 
-All words except `cpufence` and `cpurelax` require program mode; those two are also accepted in function mode. A mapping handle is a long. `mapaddr` explicitly
+`cpufence` and `cpurelax` are accepted in every function unit. An OM-2 function unit
+(first line `om2`, no `fn main`) may also use `devctl`, `mapnew`, `mapdrop`, `mapread`,
+`mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget` and `mapset`; there the mapping table
+is not part of an image but entry 31 of the caller's runtime table (`LDR` from
+`[x7, #248]`): a zero-filled 4096-byte block (128 slots of 32 bytes) that the caller owns,
+shares across its units and serializes access to. `maphold` and `mapbind` require program
+mode (error 9 in function mode), as do these words in OM-1 units (gate
+`seed/omc/om2/fnhost/fnhost.cases`). A mapping handle is a long. `mapaddr` explicitly
 exports its address as ulong; access still requires the live owned handle.
-Each program has a private fixed 128-slot table. Each slot records address,
+Each program (or function-mode caller) has a private fixed 128-slot table. Each slot records address,
 length, generation and access. Exhaustion returns -24 without calling mmap.
 Mappings are between 1 byte and 64 GiB each. This bounds each extent, not the
 total physical memory the OS permits. Closing a file descriptor does not close

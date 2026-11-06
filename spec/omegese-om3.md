@@ -21,9 +21,16 @@ not stated here.
 - An OM-2 function unit (first line `om2`, no `fn main`) may use the host words `fopen`, `fclose`,
   `fstat`, `stat`, `lstat`, `getuid`, `geteuid`, `getgid` and `getegid` (OMEGESE.md section 10) on
   AArch64, with their program-mode meaning and machine code.
+- The same units may use the clocks `monons`, `realns` and `sleepns` and the device words `devctl`,
+  `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget` and `mapset`
+  (`seed/host/MAPPING.md`). In function mode the mapping words find their 4096-byte table (128 slots
+  of 32 bytes) through entry 31 of the caller's runtime table (x7 + 248) instead of an image global;
+  the caller supplies it zero-filled, shares it across its units and serializes calls that use it. A
+  caller that supplies no table at entry 31 gets its status 34 stub on the first mapping word.
+  `maphold` and `mapbind` stay program-mode words.
 - Every other host word in function mode, any host word in an OM-1 function unit, and any host word for
   another target is error 9.
 - These words do not form a sandbox: a caller that embeds such a unit grants it the file and identity
-  view of its own process, so the omega-bridge refuses a unit that names one unless the caller opts in.
+  view (and, for the device words, the ioctl and mapping view) of its own process, so the omega-bridge refuses a unit that names one unless the caller opts in.
 - Gate: `seed/omc/om2/fnhost/fnhost.cases` with the mutants in `seed/omc/om2/fnhost/mutants.cases`,
   run by `seed/host/check.sh`.

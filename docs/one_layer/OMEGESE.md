@@ -924,10 +924,16 @@ itself byte for byte. The original subset retains its machine code. The new
 words are reserved and require program mode (error 9 in function mode), with one
 exception: an OM-2 function unit (first line `om2`, no `fn main`) may use the file
 and identity subset `fopen`, `fclose`, `fstat`, `stat`, `lstat`, `getuid`,
-`geteuid`, `getgid` and `getegid` on the AArch64 target. Each of these is an
-inline `svc` with its arguments saved and restored around it; none reads argv,
-the x28 stack floor or a global, and none writes x7 or x19-x28, so a unit called
-through the omega-bridge native ABI keeps its frame. Every other host word, every OM-1 function unit and every
+`geteuid`, `getgid` and `getegid`, the clocks `monons`, `realns` and `sleepns`, and
+the device subset `devctl`, `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `devcall`,
+`uvmctl`, `mapaddr`, `mapget` and `mapset` (`seed/host/MAPPING.md`) on the AArch64
+target. Each of these is an inline `svc` with its arguments saved and restored around
+it; none reads argv, the x28 stack floor or a global, and none writes x7 or x19-x28,
+so a unit called through the omega-bridge native ABI keeps its frame. In function
+mode the mapping words take their 128-slot, 4096-byte table from entry 31 of the
+caller's runtime table (`LDR` from `[x7, #248]`); the caller supplies it zero-filled
+and serializes calls that use it. `maphold` and `mapbind` (fixed-address
+reservations), every other host word, every OM-1 function unit and every
 other target stay error 9 (PROPOSED contract `spec/omegese-om3.md` section 1, gate
 `seed/omc/om2/fnhost/fnhost.cases`).
 
