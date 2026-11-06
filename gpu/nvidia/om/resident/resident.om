@@ -1,0 +1,464 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Resident descriptor-driven persistent kernel. Only thread zero per CTA works.
+const NONE ulong 65535
+const ALL ulong 18446744073709551615
+const LO32 ulong 4294967295
+const YIELD ulong 8192
+const NOPC ulong 1032192
+const KFIX ulong 0
+const KPRED ulong 1
+const KVAR ulong 2
+const KUVAR ulong 3
+const KSTORE ulong 4
+const KSYNC ulong 5
+const KEXIT ulong 6
+const KBRA ulong 7
+const KRAW ulong 8
+const MOVI ulong 2
+const S2R ulong 3
+const LDC64 ulong 5
+const LDCU64 ulong 7
+const IMAD ulong 8
+const IMADW ulong 9
+const IADD3 ulong 14
+const ISGEU ulong 28
+const FADD ulong 30
+const FMUL ulong 32
+const EXIT ulong 45
+const BRA ulong 46
+
+fn cw st ulong wb ulong rb ulong wt ulong to ulong
+ret or or shl st 9 shl wb 14 or shl rb 17 shl wt 20
+end
+
+fn fld r ulong to ulong
+if eq r NONE
+ret ALL
+end
+ret and r 1023
+end
+
+fn rsub r ulong to ulong
+if eq r NONE
+ret 0
+end
+ret shr r 10
+end
+
+fn r4 d ulong a ulong b ulong c ulong to ulong
+ret or or d shl a 16 or shl b 32 shl c 48
+end
+
+fn okk op ulong k ulong fl ulong ur ulong to ulong
+ret or or op shl k 8 or shl fl 16 shl ur 40
+end
+
+fn sb v ulong s ulong to ulong
+ret or v shl s 10
+end
+
+fn p2 lo ulong hi ulong to ulong
+ret or lo shl hi 16
+end
+
+const PW1 ulong 4294967296
+const PW2 ulong 8589934592
+const PW4 ulong 17179869184
+
+note control word of one record kind: returns control | next pending wait mask << 32
+fn kc k ulong fl ulong pend ulong imm ulong to ulong
+if eq k KPRED
+ret cw 14 7 7 pend
+end
+if eq k KVAR
+ret or or cw 4 0 7 pend YIELD PW1
+end
+if eq k KUVAR
+ret or or cw 4 2 7 pend YIELD PW4
+end
+if eq k KSTORE
+ret or or cw 4 7 1 pend YIELD PW2
+end
+if or eq k KEXIT eq k KBRA
+if ne and fl 2 0
+ret or cw 5 7 7 pend shl pend 32
+end
+ret cw 5 7 7 pend
+end
+if eq k KRAW
+ret or shr imm 32 shl pend 32
+end
+ret cw 6 7 7 pend
+end
+
+note operand fields 1..4 and their subregisters (record word 7 bits 16..47)
+fn wops ins edit ulong 8192 b ulong rg ulong to void
+d = and rg 65535
+s1 = and shr rg 16 65535
+s2 = and shr rg 32 65535
+s3 = shr rg 48
+put ins add b 1 fld d
+put ins add b 2 fld s1
+put ins add b 3 fld s2
+put ins add b 4 fld s3
+f1 = or shl rsub d 16 shl rsub s1 24
+f2 = or shl rsub s2 32 shl rsub s3 40
+put ins add b 7 or f1 f2
+end
+
+note record words 5..7: ureg, imm | control << 32, flags (x = control | pending << 32)
+fn wtail ins edit ulong 8192 b ulong ok ulong imm ulong x ulong to void
+ur = and shr ok 40 65535
+uv = ALL
+if ne ur NONE
+uv = ur
+end
+put ins add b 5 uv
+c = and x LO32
+put ins add b 6 or and imm LO32 shl c 32
+w7 = get ins add b 7
+put ins add b 7 or w7 and shr ok 16 7
+end
+
+note one record: ok = op | kind << 8 | flags << 16 | ureg << 40; rg = r4 operands; imm low 32 bits
+note (a raw record carries its control word in imm bits 32..63)
+fn emit ins edit ulong 8192 m edit ulong 512 ok ulong rg ulong imm ulong to void
+n = get m 0
+if ge n 1024
+put m 4 1
+ret
+end
+k = and shr ok 8 255
+if gt k KRAW
+put m 4 2
+ret
+end
+x = kc k and shr ok 16 255 get m 3 imm
+b = mul n 8
+put ins b and ok 255
+wops ins b rg
+wtail ins b ok imm x
+put m 0 add n 1
+put m 3 shr x 32
+end
+
+fn nv m edit ulong 512 kind ulong to ulong
+v = get m 1
+if ge v 256
+put m 4 3
+ret 0
+end
+put m add 64 v kind
+put m 1 add v 1
+ret v
+end
+
+fn nu m edit ulong 512 kind ulong to ulong
+u = get m 2
+if ge u 32
+put m 4 3
+ret 0
+end
+put m add 320 u kind
+put m 2 add u 1
+ret u
+end
+
+note ---- instruction helpers
+
+fn ef ins edit ulong 8192 m edit ulong 512 op ulong rg ulong imm ulong to void
+emit ins m okk op KFIX 0 NONE rg imm
+end
+
+
+note P0 = a >= b (unsigned)
+fn isge ins edit ulong 8192 m edit ulong 512 a ulong b ulong to void
+emit ins m okk ISGEU KPRED 0 NONE r4 NONE a b NONE 0
+end
+
+fn exitp ins edit ulong 8192 m edit ulong 512 to void
+emit ins m okk EXIT KEXIT 2 NONE r4 NONE NONE NONE NONE 0
+end
+
+fn tail ins edit ulong 8192 m edit ulong 512 to void
+emit ins m okk EXIT KEXIT 0 NONE r4 NONE NONE NONE NONE 0
+emit ins m okk BRA KRAW 0 NONE r4 NONE NONE NONE NONE shl NOPC 32
+end
+
+
+note @P0 BRA forward; returns the record index for patch
+fn bfwd ins edit ulong 8192 m edit ulong 512 to ulong
+at = get m 0
+emit ins m okk BRA KBRA 2 NONE r4 NONE NONE NONE NONE 1
+ret at
+end
+
+fn patch ins edit ulong 8192 m edit ulong 512 at ulong to void
+b = add mul at 8 6
+x = get ins b
+put ins b or and x 18446744069414584320 sub get m 0 at
+end
+
+
+note Descriptor: op,a,b,out,rows,cols,0,0; offsets in f32 elements.
+note No input may overlap its output. Descriptors are immutable for the launch.
+fn spanok off ulong count ulong size ulong to bool
+if gt count size
+ret false
+end
+ret le off sub size count
+end
+
+fn disjoint a ulong na ulong b ulong nb ulong to bool
+ret or le add a na b le add b nb a
+end
+
+fn descok d view ulong 512 at ulong size ulong to bool
+op = get d at
+a = get d add at 1
+b = get d add at 2
+out = get d add at 3
+rows = get d add at 4
+cols = get d add at 5
+if or or lt op 1 gt op 5 or eq rows 0 gt rows 32
+ret false
+end
+if or eq cols 0 gt cols 32
+ret false
+end
+if or ne get d add at 6 0 ne get d add at 7 0
+ret false
+end
+na = rows
+nb = rows
+if eq op 1
+na = mul rows cols
+nb = cols
+else
+if eq op 4
+if ne rows 1
+ret false
+end
+na = cols
+else
+if ne cols 1
+ret false
+end
+end
+end
+if or not spanok a na size not spanok out rows size
+ret false
+end
+if not disjoint a na out rows
+ret false
+end
+if le op 3
+if or not spanok b nb size not disjoint b nb out rows
+ret false
+end
+end
+ret true
+end
+
+fn resident_chk d view ulong 512 n ulong size ulong ctas ulong to ulong
+if or or eq n 0 gt n 64 or eq size 0 gt size 65536
+ret 1
+end
+if or eq ctas 0 gt ctas 2
+ret 1
+end
+for i ulong n
+if not descok d mul i 8 size
+ret 1
+end
+end
+ret 0
+end
+
+note Fixed vreg plan. 0..7 pairs; 8..30 scalars, kept live across all loops.
+fn mov ins edit ulong 8192 m edit ulong 512 d ulong x ulong to void
+ef ins m MOVI r4 d NONE NONE NONE x
+end
+fn cp ins edit ulong 8192 m edit ulong 512 d ulong a ulong to void
+ef ins m IADD3 r4 d a NONE NONE 0
+end
+fn plus ins edit ulong 8192 m edit ulong 512 d ulong a ulong b ulong to void
+ef ins m IADD3 r4 d a b NONE 0
+end
+fn wide ins edit ulong 8192 m edit ulong 512 d ulong a ulong base ulong to void
+ef ins m IMADW r4 d a NONE base 4
+end
+fn load ins edit ulong 8192 m edit ulong 512 d ulong addr ulong off ulong to void
+emit ins m okk 11 KVAR 0 0 r4 d addr NONE NONE off
+end
+fn strong ins edit ulong 8192 m edit ulong 512 d ulong addr ulong to void
+emit ins m okk 20 KVAR 0 0 r4 d addr NONE NONE 0
+end
+fn atomic ins edit ulong 8192 m edit ulong 512 op ulong d ulong addr ulong v ulong to void
+emit ins m okk op KVAR 0 0 r4 d addr v NONE 0
+end
+fn jump ins edit ulong 8192 m edit ulong 512 to ulong
+at = get m 0
+emit ins m okk BRA KBRA 0 NONE r4 NONE NONE NONE NONE 1
+ret at
+end
+fn back ins edit ulong 8192 m edit ulong 512 at ulong flags ulong to void
+emit ins m okk BRA KBRA flags NONE r4 NONE NONE NONE NONE and sub at get m 0 LO32
+end
+fn geimm ins edit ulong 8192 m edit ulong 512 a ulong v ulong to void
+mov ins m 29 v
+isge ins m a 29
+end
+
+fn prologue ins edit ulong 8192 m edit ulong 512 n ulong ctas ulong to void
+for v ulong 31
+kind = ulong 1
+if lt v 8
+kind = 2
+end
+w = nv m kind
+mov ins m w 0
+if lt v 8
+mov ins m sb w 1 0
+end
+end
+u = nu m 2
+emit ins m okk LDCU64 KUVAR 1 NONE r4 u NONE NONE NONE 856
+for v ulong 3
+emit ins m okk LDC64 KVAR 0 NONE r4 v NONE NONE NONE add 896 mul v 8
+end
+mov ins m 22 1
+ef ins m IMADW r4 3 22 NONE 2 4
+mov ins m 24 ctas
+mov ins m 25 n
+ef ins m S2R r4 8 NONE NONE NONE 33
+geimm ins m 8 1
+exitp ins m
+ef ins m S2R r4 8 NONE NONE NONE 37
+end
+
+note Each CTA owns rows cta, cta+ctas,... . Serial k fixes f32 order.
+fn dotbody ins edit ulong 8192 m edit ulong 512 mat bool to void
+mov ins m 11 0
+mov ins m 18 0
+at = get m 0
+if mat
+ef ins m IMAD r4 21 10 17 11 0
+else
+cp ins m 21 11
+end
+plus ins m 21 21 13
+wide ins m 5 21 1
+strong ins m 19 5
+if mat
+plus ins m 21 14 11
+wide ins m 6 21 1
+strong ins m 20 6
+ef ins m FMUL r4 19 19 20 NONE 0
+end
+ef ins m FADD r4 18 18 19 NONE 0
+plus ins m 11 11 22
+isge ins m 11 17
+back ins m at 6
+end
+
+fn elbody ins edit ulong 8192 m edit ulong 512 op ulong to void
+plus ins m 21 13 10
+wide ins m 5 21 1
+strong ins m 18 5
+if ne op 5
+plus ins m 21 14 10
+wide ins m 6 21 1
+strong ins m 20 6
+alu = FADD
+if eq op 3
+alu = FMUL
+end
+ef ins m alu r4 18 18 20 NONE 0
+end
+end
+
+fn work ins edit ulong 8192 m edit ulong 512 to void
+cp ins m 10 8
+rowtop = get m 0
+isge ins m 10 16
+done = bfwd ins m
+ends = new ulong 5 0
+for op ulong 5
+geimm ins m 12 add op 2
+skip = bfwd ins m
+if eq op 0
+dotbody ins m true
+else
+if eq op 3
+dotbody ins m false
+else
+elbody ins m add op 1
+end
+end
+put ends op jump ins m
+patch ins m skip
+end
+for op ulong 5
+patch ins m get ends op
+end
+plus ins m 21 15 10
+wide ins m 7 21 1
+emit ins m okk 22 KSTORE 0 0 r4 NONE 7 18 NONE 0
+plus ins m 10 10 24
+back ins m rowtop 0
+patch ins m done
+end
+
+note Sense-reversing grid barrier: release stores, count arrivals, last resets
+note count before publishing next generation; strong loads poll generation.
+fn gridbar ins edit ulong 8192 m edit ulong 512 to void
+emit ins m okk 23 KSYNC 0 NONE r4 NONE NONE NONE NONE 0
+atomic ins m 26 27 2 22
+ef ins m IMAD r4 29 24 NONE NONE 1
+mov ins m 30 4294967295
+plus ins m 29 29 30
+isge ins m 27 29
+last = bfwd ins m
+poll = get m 0
+strong ins m 28 3
+isge ins m 28 26
+back ins m poll 6
+finish = jump ins m
+patch ins m last
+atomic ins m 27 27 2 23
+emit ins m okk 23 KSYNC 0 NONE r4 NONE NONE NONE NONE 0
+atomic ins m 27 27 3 26
+patch ins m finish
+emit ins m okk 23 KSYNC 0 NONE r4 NONE NONE NONE NONE 0
+end
+
+fn resident kind ulong n ulong size ulong ctas ulong ins edit ulong 8192 m edit ulong 512 to ulong
+for i ulong 512
+put m i 0
+end
+if or ne kind 0 or eq n 0 gt n 64
+ret 1
+end
+if or or eq size 0 gt size 65536 or eq ctas 0 gt ctas 2
+ret 1
+end
+prologue ins m n ctas
+outer = get m 0
+ef ins m IMADW r4 4 9 NONE 0 32
+for j ulong 6
+load ins m add 12 j 4 mul j 4
+end
+work ins m
+plus ins m 26 9 22
+gridbar ins m
+plus ins m 9 9 22
+isge ins m 9 25
+back ins m outer 6
+note Read every fixed vreg after the loop so the allocator cannot alias branch arms.
+for v ulong 31
+cp ins m v v
+end
+tail ins m
+ret get m 4
+end
