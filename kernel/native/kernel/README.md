@@ -382,9 +382,20 @@ disks are up an audit of every page table leaf must find nothing writable and
 executable, only the code executable, and NXE and WP on every core
 (`wx_audit: ok ...`). The QEMU test also builds two TEST-ONLY mutants
 (`make imac-kernel IMACKERN_WX_MUTANT=no_nx` or `=text_writable`) and fails
-unless their probes panic. W^X is not process isolation: everything here still
-runs in ring 0 in one address space, any kernel code can change the page
-tables, and learned or generated code must never be given kernel authority.
+unless their probes panic. None of this holds from the first instruction: W^X,
+NX and WP are enforced only once `mm_build` (`x86/kmain_x86.c`) sets EFER.NXE,
+loads the kernel's own tables into CR3 and sets CR0.WP. Until that CR3 load the
+kernel runs on the firmware's page tables, which may map memory writable and
+executable at once. That stretch runs the relocation and bss clearing in
+`../boot/efi_entry_x86_64.S`, the UEFI stub `x86/efi_x86.c` (RSDP and GOP
+lookup, the final memory map, ExitBootServices), and then in
+`ck_x86_kernel_entry` `tables_load` (GDT, TSS, IDT), the CHANDOF3 handoff check
+(`core/handoff_check.c`) and `mm_build` itself. The #426 review found no
+untrusted input handled in that stretch. What permissions Apple's firmware
+tables really give is not checked on the iMac. W^X is not process isolation:
+everything here still runs in ring 0 in one address space, any kernel code can
+change the page tables, and learned or generated code must never be given
+kernel authority.
 QEMU only; not yet run on the iMac.
 
 The Spark's Realtek RTL8127 10 GbE (10ec:8127, segment 7) has a driver core in
