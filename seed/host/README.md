@@ -141,6 +141,36 @@ Keyword pack verification used WolframLanguageEvaluator:
 `Table[{s,FromDigits[Reverse[ToCharacterCode[s]],256]},{s,{"peercred","pollfds","sendmsg"}}]`
 returned `{{"peercred",7234314147887146352},{"pollfds",32480013390212976},{"sendmsg",29118836274783603}}`.
 
+### Typed VFIO IRQ and eventfd additions
+
+`eventfd` (keyword223) and `vfioirq` (224) extend the driver-pinned
+`397e67040fb74853c6814097fe02ae4e1ebd6f66` AArch64 compiler profile.
+The exact acquisition, invalidation, bounded payload and masking contracts are
+in [MAPPING.md](MAPPING.md#typed-irq-and-eventfd-extension). No hosted x86 VFIO
+path exists at this pin. This work does not add an arbitrary syscall.
+
+```sh
+taskset -c 10-14 nice -n 10 sh seed/omega-from-seed.sh
+taskset -c 10-14 nice -n 10 sh seed/host/irq.sh
+taskset -c 10-14 nice -n 10 sh seed/omc/gate18.sh
+```
+
+`irq.sh` also runs from the normal host gate. It compiles positive cases,
+ten native compiler refusals, real nonblocking eventfd read/write/poll/close
+behavior, a GCC UAPI byte-layout differential, fifteen runtime refusals, and
+wrong-word compiler mutants. A ptrace-only fixture supplies an acquired-kind
+stand-in while every real IRQ ioctl reaches an ordinary memfd and returns
+ENOTTY. It also exercises fd numbers above1024 and a full128-slot table without
+opening or closing a real VFIO resource. The C fixture and Python mutant runner
+are independent verification tools, never linked into product code.
+The QEMU tier is user-mode, VFIO-less, and cannot establish physical delivery.
+Real device interrupt behavior remains NOT_RUN pending an authorized window.
+
+WolframLanguageEvaluator query
+`{FromDigits[Reverse[ToCharacterCode["eventfd"]],256],FromDigits[Reverse[ToCharacterCode["vfioirq"]],256],BitOr[524288,2048],20+4*64}`
+returned `{28260147925448293,31932469534615158,526336,276}`:
+the keyword packs, CLOEXEC|NONBLOCK flags, and bounded IRQ record bytes.
+
 
 ## Connected peer metadata
 

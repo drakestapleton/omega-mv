@@ -89,6 +89,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 | Claude Opus 5.5 (via omp) | ORIG-4 shadow advice (#731): `native/orig4/shadow.om` advisor, pin file, in-process tests, host glue, gate `omega-orig4-shadow` and `spec/shadow-advice-v0.md` |
 | Claude Opus 5.5 | irwasm OSC IR v7 backend in seeded Omega (regions, f32/f64, RLOAD/RSTORE/BITCAST/RINIT, saturating float-to-int, exact-page memory, `osc.v7.abi`), `v7run.js` read-only executor, v7 run cases and gate section with RGBX, out-of-bounds and bounds-check mutant controls |
 | Claude Opus 5.5 | Seeded-Omega meaning hash and semantic diff (seed/semhash, M1): local/param alpha-normalisation, Merkle callee hashes, canon output checked by compile(canon(x)) == compile(x), negative controls |
+| Codex (GPT-6.1 Sol) | Typed seeded-Omega VFIO IRQ/eventfd host words, descriptor-kind lifecycle guards, bootstrap fixpoint, GCC/ptrace/QEMU-user verification and compiler mutants (physical IRQ delivery NOT_RUN) |
 
 This table starts with the numeric work on this branch. Earlier work in this repository is not yet attributed here; add rows only for work that can be traced to a model.
 
