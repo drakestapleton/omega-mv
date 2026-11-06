@@ -1132,6 +1132,10 @@ foreign-language compiler or runtime is on the new implementation path.
 The proposed device/memory extension adds checked `devctl`, `mapnew`,
 `mapdrop`, `mapread` and `mapwrite` to this same compiler. Its exact type,
 ownership, range and refusal contract is [seed/host/MAPPING.md](../../seed/host/MAPPING.md).
+The draft `devctl` boundary also admits five exact aien-gpu ABI1 request
+numbers, not arbitrary type-A ioctls; changing their direction or encoded
+payload size is refused. See the pinned UAPI and Wolfram-derived matrix there.
+Drake must approve this trust-surface extension before merge.
 It adds process-local mapped resources while the compiler's own storage remains
 fixed pools. GPU launch and model execution are separate, still-unqualified gates.
 

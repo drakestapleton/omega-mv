@@ -8,7 +8,7 @@ bootstrap and test orchestration remain disclosed development tools.
 
 | Expression | Result and contract |
 | --- | --- |
-| `devctl fd request A off n` | Signed Linux ioctl result. `fd` is int; `request` is a literal uint; `A` is writable bytes; offsets/counts are ulong. Exact encoded size, checked range. Accepts FIONREAD or encoded read/write NVRM F requests, matching the reviewed L605 device boundary. |
+| `devctl fd request A off n` | Signed Linux ioctl result. `fd` is int; `request` is a literal uint; `A` is writable bytes; offsets/counts are ulong. Exact encoded size, checked range. Accepts FIONREAD, the existing encoded read/write NVRM F requests, or the five exact aien-gpu ABI1 A requests below. |
 | `mapnew fd offset bytes access mode` | Positive long handle or negative Linux errno. fd is int, offset/bytes ulong, access/mode literal ints. Access 1 means read, 3 read/write. Modes 1/2 mean shared/private file; 33/34 shared/private anonymous. Anonymous mappings require fd -1 and offset zero. |
 | `mapdrop handle` | Unmap the entire owned mapping. Zero on success or negative errno. Retires the slot on success; the next mapping gets a different generation. |
 | `mapread handle offset A off n` | Copy n bytes from the mapping into writable byte array A. Return n as long. |
@@ -22,6 +22,57 @@ bootstrap and test orchestration remain disclosed development tools.
 | `mapbind handle fd offset access` | Bind a shared file/device mapping to the entire owned reservation, with literal access1 or3. No existing data mapping may be replaced. Return long0 or errno. Failed bind with successful cleanup retires the handle. Function-mode double failure quarantines it for cleanup only (below). |
 | `cpufence` | Statement, keyword 199: a standalone host CPU publication barrier, AArch64 `DSB SY`, x86-64 `MFENCE`. It orders ordinary stores, for example `mapwrite` or plain array stores, before a later `mapset` doorbell or flag. A `mapget`/`mapset` access already carries its own barriers. See OMEGESE §10, "Host CPU ordering words". Proof: `seed/host/cpufence.sh`. |
 | `cpurelax` | Statement, keyword 200: spin-wait hint for a bounded `mapget` poll loop, AArch64 `YIELD`, x86-64 `PAUSE`. It gives no ordering. Proof: `seed/host/cpufence.sh`. |
+
+### Draft aien-gpu ABI1 ioctl admission
+
+**Trust-surface extension: Drake must approve this contract before merge.** The
+shared AArch64/x86-Linux `devctl` allowlist additionally admits exactly:
+
+| Request | Full Linux number | Direction | Writable payload bytes |
+| --- | --- | --- | --- |
+| `AGPU_IOCTL_INFO` | `0x80704110` (`2154840336`) | READ | 112 |
+| `AGPU_IOCTL_MEM_ALLOC` | `0xc0304121` (`3224387873`) | READ/WRITE | 48 |
+| `AGPU_IOCTL_MEM_FREE` | `0xc0184122` (`3222815010`) | READ/WRITE | 24 |
+| `AGPU_IOCTL_CHAN_CREATE` | `0xc0484123` (`3225960739`) | READ/WRITE | 72 |
+| `AGPU_IOCTL_CHAN_DESTROY` | `0xc0184124` (`3222815012`) | READ/WRITE | 24 |
+
+Source: `aien-dev/aien-gpu`, the ABI1 UAPI imported in CUDApp at
+`third_party/aien-gpu-abi1/aien_gpu_uapi.h`, last changed by
+`200015e6011d3c517803968fcccab52554c671be`, file SHA-256
+`1071e2a1338d258a654dc96f8c6d637db0e06fb4c47329cd73dc69fdf443eda7`.
+Linux `asm-generic/ioctl.h` defines direction at bit30, type at bit8,
+number at bit0 and size at bit16. READ=2 and WRITE=1. The aligned struct
+layouts and `_IOC` encoding are recomputed through Wolfram; the exact
+queries, results, UAPI pin and refusal matrix are recorded in
+`aien-ioctl-matrix.json`.
+
+Equality is over the **whole request**, not its type/number alone. Nonliteral
+requests, changed encoded sizes/directions/types, neighbours, `BOOT`,
+`ARENA_READ` and `RM_INIT` remain compiler error9 unless independently admitted
+by the unchanged FIONREAD/NVRM boundary. Even an admitted request traps3 when
+the writable view count is shorter or longer than its exact encoded size.
+An exact-length call reaches ioctl and returns the signed Linux result.
+The driver and caller still validate device identity, ABI version, reserved
+fields, flags, handles, address values and state. Admission is not a payload
+validator or authorization to open a GPU.
+
+CPU-only qualification is the handwritten Omega `aien-ioctl.om`: five exact
+requests, shorter/longer views, thirty encoded refusals and nonliteral
+refusals; native AArch64 execution, x86-Linux execution under QEMU, and
+AArch64 function-mode admission/refusal. Every executed ioctl uses fd-1,
+so no driver or device is opened. Native AArch64 expects EBADF (-9).
+QEMU 8.2.2 intercepts these unknown x86 requests before checking fd and
+returns ENOTTY (-25); the fixture requires that exact emulated result,
+not an EBADF/ENOTTY alternative. Its trace must show the five exact request
+numbers, no ioctl on short/long refusal, and an ioctl after the x86 guard
+mutant. This qualifies emitted admission and length guards, not x86 kernel
+or driver admission. Native x86, hardware and real driver integration are
+NOT_RUN. Four compiler mutants widen or narrow the allowlist or remove either
+backend's exact-length guard. A mutation counts as killed only at its intended
+admission or short-length assertion, never for an unrelated child/compiler failure.
+
+
+### Function and program mapping contexts
 
 `cpufence` and `cpurelax` are accepted in every function unit. An OM-2 function unit
 (first line `om2`, no `fn main`) may also use `devctl`, `mapnew`, `mapdrop`, `mapread`,

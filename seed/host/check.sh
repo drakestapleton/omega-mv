@@ -138,6 +138,9 @@ build/seed/host/gate
 sh seed/host/negative.sh
 sh seed/host/regression.sh
 sh seed/host/cpufence.sh
+seed/out/omc < seed/host/aien-ioctl.om > "$run/aien-ioctl"
+chmod +x "$run/aien-ioctl"
+"$run/aien-ioctl" "$(pwd)/seed/out/omc" "$(command -v qemu-x86_64)" "$run/aien-ioctl-cases"
 if readelf -l -d seed/out/omc | grep -Eq 'INTERP|NEEDED'; then
     echo 'FAIL unexpected compiler runtime dependency' >&2
     exit 1
