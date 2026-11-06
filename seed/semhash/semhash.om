@@ -2,7 +2,7 @@ note SPDX-License-Identifier: Apache-2.0
 note seed/semhash/semhash.om: per-function meaning hash, canonical form and semantic diff for
 note Omega units, written in seeded Omega. Built on top of om/sha256/sha256-om2.om (see README.md
 note for the build line); this file has no om2 line of its own and reuses none of that file's names.
-note Modes: hash (default), canon, diff A B, keywords. Exit 0 ok, 1 diff found a difference,
+note Modes: hash (default), canon, diff A B, keywords, dups. Exit 0 ok, 1 diff found a difference,
 note 2 usage, 3 refusal (CR, capacity, malformed), 90+ internal.
 note Keyword tables. tkw1 is the genkw.awk word:code lists (OM-1 and host words), tkw2 the OM-2-only words of
 note omc.om fn kw2, tctx the contextual OM-2 names, tspc the profile and special words this tool needs.
@@ -28,11 +28,18 @@ text tent "ENTRY CHANGED "
 text texp "EXPORTS CHANGED\n"
 text tdsame "DIFF SAME\n"
 text tdchg "DIFF CHANGED n="
+text tdup "DUP "
+text tdn " n="
+text tdups "DUPS groups="
+text tdfns " fns="
+text tdrec " records="
+text tdskp " skipped="
 text mhash "hash"
 text mcanon "canon"
 text mdiff "diff"
 text mkw "keywords"
-text eusage "usage: semhash [hash|canon|keywords] < unit.om | semhash diff A.om B.om\n"
+text mdups "dups"
+text eusage "usage: semhash [hash|canon|keywords|dups] < unit.om | semhash diff A.om B.om\n"
 text ecr "semhash: refused: CR byte in input\n"
 text ebig "semhash: refused: input over 8388608 bytes\n"
 text ecap "semhash: refused: capacity exceeded\n"
@@ -2053,6 +2060,232 @@ ob_byte 10
 ret 1
 end
 
+note dups mode: stdin holds "PATH FN name hex line=N..." records (hash-mode output with a path
+note prefixed). Functions with the same 64-digit hash are grouped; "SKIP " lines are echoed and counted.
+note Per record: line start, the space after PATH, the space after name, the line end, a
+note 16-digit key, and the group id (0: not grouped yet). gqn: record count, SKIP count.
+global gqs ulong 262144
+global gqp ulong 262144
+global gqr ulong 262144
+global gqe ulong 262144
+global gqk ulong 262144
+global gqg ulong 262144
+global gqn ulong 2
+text tskip "SKIP "
+
+fn dp_hexv c uchar to ulong
+v = ulong c
+if and ge v 48 le v 57
+ret sub v 48
+end
+if and ge v 97 le v 102
+ret sub v 87
+end
+ret 16
+end
+
+note first space in s..e (e excluded), or e when there is none
+fn dp_sp s ulong e ulong to ulong
+p = s
+for a ulong 8388610
+if ge p e
+ret e
+end
+if eq get gin p 32
+ret p
+end
+p = add p 1
+end
+ret e
+end
+
+note a FN record s..e (e excluded): returns the space after name, or 0 when the line is not one
+fn dp_rec s ulong e ulong to ulong
+p = dp_sp s e
+if eq p s
+ret 0
+end
+if gt add p 4 e
+ret 0
+end
+if ne get gin add p 1 70
+ret 0
+end
+if ne get gin add p 2 78
+ret 0
+end
+if ne get gin add p 3 32
+ret 0
+end
+r = dp_sp add p 4 e
+if eq r add p 4
+ret 0
+end
+if gt add r 65 e
+ret 0
+end
+for i ulong 64
+if eq dp_hexv get gin add add r 1 i 16
+ret 0
+end
+end
+if lt add r 65 e
+if ne get gin add r 65 32
+ret 0
+end
+end
+ret r
+end
+
+fn dp_skip s ulong e ulong to bool
+if lt sub e s len tskip
+ret false
+end
+for i ulong len tskip
+if ne get gin add s i get tskip i
+ret false
+end
+end
+ret true
+end
+
+fn dp_heq a ulong b ulong to bool
+for i ulong 64
+if ne get gin add a i get gin add b i
+ret false
+end
+end
+ret true
+end
+
+fn ob_span a ulong b ulong to void
+for i ulong sub b a
+ob_byte get gin add a i
+end
+end
+
+note store one record of line s..e whose name ends at the space r
+fn dp_put s ulong e ulong r ulong to void
+nr = get gqn 0
+if ge nr 262144
+rf_die ecap
+end
+k = ulong 0
+for i ulong 16
+k = or shl k 4 dp_hexv get gin add add r 1 i
+end
+put gqs nr s
+put gqp nr dp_sp s e
+put gqr nr r
+put gqe nr e
+put gqk nr k
+put gqg nr 0
+put gqn 0 add nr 1
+end
+
+fn dp_parse to void
+n = get ginn 0
+if gt n 8388608
+rf_die ebig
+end
+put gqn 0 0
+put gqn 1 0
+s = ulong 0
+for a ulong 8388610
+if ge s n
+break
+end
+e = s
+for b ulong 8388610
+if ge e n
+break
+end
+if eq get gin e 10
+break
+end
+e = add e 1
+end
+if dp_skip s e
+put gqn 1 add get gqn 1 1
+ob_span s e
+ob_byte 10
+end
+r = dp_rec s e
+if ne r 0
+dp_put s e r
+end
+s = add e 1
+end
+end
+
+note "  PATH name line=N..." for record j
+fn dp_out j ulong to void
+ob_byte 32
+ob_byte 32
+ob_span get gqs j get gqp j
+ob_byte 32
+ob_span add get gqp j 4 get gqr j
+ob_span add get gqr j 65 get gqe j
+ob_byte 10
+end
+
+note mark every later ungrouped record with record i's hash as group g; returns how many
+fn dp_mark i ulong g ulong to ulong
+nr = get gqn 0
+ki = get gqk i
+hi = add get gqr i 1
+cnt = ulong 0
+for t ulong sub nr add i 1
+j = add add i 1 t
+if eq get gqk j ki
+if eq get gqg j 0
+if dp_heq hi add get gqr j 1
+put gqg j g
+cnt = add cnt 1
+end
+end
+end
+end
+ret cnt
+end
+
+fn md_dups to void
+dp_parse
+nr = get gqn 0
+ng = ulong 0
+nf = ulong 0
+for i ulong nr
+if eq get gqg i 0
+cnt = dp_mark i add ng 1
+if gt cnt 0
+ng = add ng 1
+put gqg i ng
+nf = add nf add cnt 1
+hi = add get gqr i 1
+ob_str tdup
+ob_span hi add hi 64
+ob_str tdn
+ob_dec add cnt 1
+ob_byte 10
+for t ulong sub nr i
+if eq get gqg add i t ng
+dp_out add i t
+end
+end
+end
+end
+end
+ob_str tdups
+ob_dec ng
+ob_str tdfns
+ob_dec nf
+ob_str tdrec
+ob_dec nr
+ob_str tdskp
+ob_dec get gqn 1
+ob_byte 10
+end
+
 fn ar_eq a view uchar * n ulong t view uchar * to bool
 if ne n len t
 ret false
@@ -2097,6 +2330,12 @@ end
 if ar_eq pb n mcanon
 in_stdin
 md_canon
+ob_flush
+ret 0
+end
+if ar_eq pb n mdups
+in_stdin
+md_dups
 ob_flush
 ret 0
 end
