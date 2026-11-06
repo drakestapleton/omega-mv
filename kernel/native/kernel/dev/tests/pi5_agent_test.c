@@ -95,7 +95,10 @@ static void stub_good(int model)
     memcpy(G.head, gold_head, sizeof gold_head);
     for (int i = 0; i < 32; i++) {
         unsigned v;
-        sscanf(CK_AGENT_GOLDEN_MODEL_SHA256 + 2 * i, "%2x", &v);
+        if (sscanf(&CK_AGENT_GOLDEN_MODEL_SHA256[2 * i], "%2x", &v) != 1) {
+            fprintf(stderr, "pi5_agent_test: CK_AGENT_GOLDEN_MODEL_SHA256 is not 64 hex digits (byte %d)\n", i);
+            exit(2);
+        }
         G.sha[i] = (uint8_t)v;
     }
 }
