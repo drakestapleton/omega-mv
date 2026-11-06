@@ -27,8 +27,17 @@ sh seed/equiv/gate-irequiv.sh
 - Exit codes: 0 PASS, 1 FAIL, 2 usage, 3 unknown function, 4 signature, 5 domain over 24 bits,
   6 fuel, 7 trap during `dump`, 10 sampled agreement, 20-28 the IR reader's refusals.
 
-Lines 43-496 are the reader and validator of `seed/wasm/irwasm.om`, copied verbatim; the gate
-fails if the copy drifts from irwasm or irspirv. Fixtures: `hexv` (js_hexv from seed/json/json.om,
+Lines 43-496 are the OSC IR v1 reader and validator, shared byte for byte with
+`seed/spirv/irspirv.om` (the same lines there). `seed/wasm/irwasm.om` copied the same reader and
+then extended it for IR v7 (regions, f32/f64, RLOAD/RSTORE/BITCAST/RINIT; #818). Its lines 65-843
+must equal irequiv's range with the POSIX sed edits in `irwasm-v7.sed` applied (`N a\` inserts
+after range line N, `N c\` replaces it). Any change on either side that the recorded edits do not
+cover fails the gate as `reader drift`. A deliberate irwasm reader change updates `irwasm-v7.sed`
+in the same commit. The gate also builds irwasm and requires both readers to give the same
+verdict on every v1 unit it uses: they accept the same units and refuse bad magic (20),
+version (21), truncation (22) and trailing bytes (27) with the same status
+(`READERS units=26 agree=26`). It also requires irequiv to refuse a version-7 header as VERSION.
+Fixtures: `hexv` (js_hexv from seed/json/json.om,
 hhexv from seed/net/http.om), `clamp` (dev01 clamp_add), `bitrev` (dev09 bitrev8), `rot` (r8 from
 seed/omc/om2/s1/rot.om), `pop16`, and `wide` (sampling and fuel). Each names its source and its
 deliberate mutants.
