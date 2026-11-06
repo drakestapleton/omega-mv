@@ -1,10 +1,12 @@
 #!/bin/sh
 # gate4.sh -- the checks of rung 4 (seed/README.md). Run from the repo root:  sh seed/rung4/gate4.sh
 # Needs build/omegese/omegese and build/omega_emit/omega_emit (the C path, built by make through
-# quiet-build), cc for the reference runner and gcc for the C twins of the program tests. Oracles only:
-# none of them writes a byte of seed/; om4.bin is made by asm2 alone. Results: evidence/SEED-0/rung4/.
+# quiet-build), cc for the reference runner and committed expected outputs for the program tests. Oracles only:
+# none of them writes a byte of seed/; om4.bin is made by asm2 alone. Results: build/seed/r4/evidence/. The
+# recorded receipt evidence/SEED-0/rung4/ (and seed/rung4/om4.audit) is only read: the results are compared
+# with it at the end (seed/check/receipt.sh), never written over it.
 set -eu
-R=seed/rung4; B=build/seed/r4; E=evidence/SEED-0/rung4; X=$R/tests
+R=seed/rung4; B=build/seed/r4; E=$B/evidence; REC=evidence/SEED-0/rung4; X=$R/tests
 T=tests/one_layer/exp445/dev/tasks/cases; O=tests/one_layer/omegese/dev
 TAB="seed/rung2/table.s2 seed/rung3/table3.s2 $R/table4.s2"
 mkdir -p "$B" "$E"
@@ -22,8 +24,8 @@ size=$(stat -c %s $R/om4.bin); fsz=$(od -An -tu4 -j96 -N4 $R/om4.bin | tr -d ' '
 sha256sum $R/om4.bin | tee "$E/om4.sha256" >> "$E/gate4.log"
 
 # 2. every instruction of om4 decodes (objdump, reference) to its name, registers, numbers, label
-if sh seed/check/audit2.sh $R/om4.s $R/om4.bin > $R/om4.audit; then :; fi
-tail -1 $R/om4.audit | tee -a "$E/gate4.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
+if sh seed/check/audit2.sh $R/om4.s $R/om4.bin > $E/om4.audit; then :; fi
+tail -1 $E/om4.audit | tee -a "$E/gate4.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
 for c in 's/^  movz.x x25 0x181 1$/  movz.x x26 0x181 1/' 's/^  b.hs BO_SDIV$/  b.hs BO_RET/' \
          's/^  ldr.x.r x12 sp x11$/  ldr.x.r x12 sp x10/' 's/^  ubfm.x x11 x11 1 63$/  ubfm.x x11 x11 2 63/' \
          's/^  movz.x x0 0x63ff 0$/  movz.x x0 0x63fe 0/'; do
@@ -72,19 +74,18 @@ for f in fm1 fm2 fm3 fm4 fm5 fm6 fm7 fm8 fm9; do
 done
 cat "$tab" >> "$E/gate4.log"
 
-# 6. program mode (hand-laid ELF, no linker) against gcc-built C twins (gcc = oracle, named here):
+# 6. program mode (hand-laid ELF, no linker) against committed expected outputs:
 #    recursive fib, a 1000-entry sort, echo stdin -> stdout, byte copy (reversed)
 for p in fib sort echo bytecopy; do $R/om4.bin < $X/$p.om > $B/$p; chmod +x $B/$p; done
-head -c 50000 /dev/urandom > $B/in.bin
-for p in fib sort bytecopy; do gcc -O1 -o $B/$p.ref $X/$p.c; done
-./$B/fib > $B/fib.out; ./$B/fib.ref > $B/fib.ref.out
-cmp -s $B/fib.out $B/fib.ref.out && say "PASS fib (recursion): 26 lines = gcc twin" || bad "fib differs from its gcc twin"
-./$B/sort > $B/sort.out; ./$B/sort.ref > $B/sort.ref.out
-cmp -s $B/sort.out $B/sort.ref.out && say "PASS sort 1000: checksum, sorted count, first, last = gcc twin ($(tr '\n' ' ' < $B/sort.out))" || bad "sort differs"
+cp $X/in.bin $B/in.bin
+./$B/fib > $B/fib.out
+cmp -s $B/fib.out $X/fib.want && say "PASS fib (recursion): 26 lines = expected output" || bad "fib differs from expected output"
+./$B/sort > $B/sort.out
+cmp -s $B/sort.out $X/sort.want && say "PASS sort 1000: checksum, sorted count, first, last = expected output ($(tr '\n' ' ' < $B/sort.out))" || bad "sort differs"
 ./$B/echo < $B/in.bin > $B/echo.out
-cmp -s $B/in.bin $B/echo.out && say "PASS echo: 50000 random bytes stdin -> stdout unchanged" || bad "echo"
-./$B/bytecopy < $B/in.bin > $B/bc.out; ./$B/bytecopy.ref < $B/in.bin > $B/bc.ref.out
-cmp -s $B/bc.out $B/bc.ref.out && say "PASS byte copy: 50000 bytes reversed = gcc twin" || bad "bytecopy"
+cmp -s $B/in.bin $B/echo.out && say "PASS echo: 50000 fixture bytes stdin -> stdout unchanged" || bad "echo"
+./$B/bytecopy < $B/in.bin > $B/bc.out
+cmp -s $B/bc.out $X/bytecopy.want && say "PASS byte copy: 50000 bytes reversed = expected output" || bad "bytecopy"
 cases=$((cases + 4))
 for p in fib sort echo bytecopy; do cp $B/$p $E/$p.elf; done
 #    program-mode traps and exit: status 100 + trap code, or the exit value
@@ -170,6 +171,22 @@ else bad "r5b_fwd_fm: forward call did not land (see $B/r5b_fwd_fm.dis)"; fi
 
 cases=$((cases + 3))
 
+# 7b. function table capacity (OMEGESE 9.6): 4096 functions accepted, the 4097th error 14. The unit is a
+#     function-mode chain (g_k returns g_(k-1)), so the call graph check also runs at full size. Control:
+#     an om4 whose limit is one lower must refuse the 4096-function unit.
+fnchain() { awk -v n=$1 'BEGIN{for(i=0;i<n;i++){printf "fn g%d to int\n", i; if(i==0) print "ret 7"; else printf "ret g%d\n", i-1; print "end"}}'; }
+fnchain 4096 > $B/fn4096.om; fnchain 4097 > $B/fn4097.om
+set +e; $R/om4.bin < $B/fn4096.om > $B/fn4096.bin 2> $B/fn4096.err; r1=$?
+$R/om4.bin < $B/fn4097.om > $B/fn4097.bin 2> $B/fn4097.err; r2=$?; set -e
+[ "$r1" = 0 ] && say "PASS 4096 functions accepted" || bad "4096 functions: exit $r1 ($(cat $B/fn4096.err))"
+[ "$r2" = 14 ] && grep -q 'line 12289: error 14' $B/fn4097.err && say "PASS 4097th function (line 12289) error 14" || bad "4097 functions: exit $r2 ($(cat $B/fn4097.err))"
+sed 's/^  cmp.x.i x10 4095$/  cmp.x.i x10 4094/' $R/om4.s > $B/cap.s
+cmp -s $B/cap.s $R/om4.s && bad "capacity control edit did nothing"
+cat $TAB $B/cap.s | seed/rung2/asm2.bin > $B/cap.bin; chmod +x $B/cap.bin
+set +e; $B/cap.bin < $B/fn4096.om > /dev/null 2>&1; r3=$?; set -e
+[ "$r3" = 14 ] && say "PASS capacity control: om4 with limit 4095 refuses 4096 functions (error 14)" || bad "capacity control not caught: exit $r3"
+cases=$((cases + 3))
+
 # 8. negative control on the corpus: an om4 with one word changed (signed division made unsigned) must
 #    change a result
 sed 's/^  movz.x x0 0x0c00 0$/  movz.x x0 0x0800 0/' $R/om4.s > $B/mut.s
@@ -193,5 +210,7 @@ if [ "$nf" -gt 0 ]; then
   cases=$((cases + 1))
 fi
 say "cases run: $cases"
+# the recorded receipt is compared, never rewritten; the verdict below is the checks' alone
+say "$(sh seed/check/receipt.sh "$E" "$REC" $R/om4.audit || true)"
 [ $fail = 0 ] && say "GATE4 PASS" || say "GATE4 FAIL"
 exit $fail

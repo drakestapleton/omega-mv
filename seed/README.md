@@ -10,11 +10,22 @@ decision or an external store) is `docs/one_layer/OM_COMPLETION.md`.
 
 The scalar OSC IR backends are `wasm/irwasm.om` (WebAssembly MVP) and
 `spirv/irspirv.om` (SPIR-V 1.0 OpenCL Kernel). Both are compiled by seeded omc.
+IR mode casts (`TYPE value`) read the operand at its own type and convert it, the same as the
+AArch64 path, so `ret ulong sub c 48` with `c` a `uchar` compiles. A bare number in the cast is
+range-checked against the cast's type (error 8) and a bool converts to or from a number only by
+comparison (error 9). `seed/omc/gate-ir.sh` pins 21 cast units against the C oracle plus 6 cast
+refusals; reverting the operand read to the cast's type makes the gate fail.
+
 See [SPIR-V usage, CPU parity gate and OpenCL demo](../docs/SPIRV.md).
 
 To rebuild omc from the 408-byte seed on your own AArch64 Linux machine and check every rung against
 published hashes without touching tracked files, run `sh seed/challenge/run.sh`
 (see [the seed-chain bootstrap challenge](challenge/CHALLENGE.md)).
+
+At commit `e5b32567` (2026-10-27) the compiler source `omc/omc.om` is 12,040 lines and 208,168 bytes
+(sha256 `7703da00055fc0c7a91fcae43071df76a3f277dbe867cb284a3bdff3bedb7e1b`), and `out/omc` is
+325,524 bytes. The line, function and byte counts given in each rung section below were recorded when
+that rung landed and are not current sizes.
 
 Think of it as a ladder. Each rung is a small program, written in the language the rung below understands,
 and built by the rung below. Every rung must rebuild itself to the exact same bytes, which proves it reads
@@ -32,8 +43,8 @@ it came from.
 - What it does: reads text, turns every 8 hex digits into one 32-bit word, writes the words out. It skips
   comments (`#` to the end of the line) and spaces, and stops with an error on anything else.
 - `rung0/seed0.bin`: the program, 408 bytes.
-- The one outside tool: the very first `seed0.bin` was made by `rung0/load0.sh`, a 30-line shell script
-  that uses only the shell's own `printf`. After that first build, seed-0 builds itself.
+- The one outside tool: the very first `seed0.bin` was made by `rung0/load0.sh`, a 24-line (1,048-byte)
+  shell script that uses only the shell's own `printf`. After that first build, seed-0 builds itself.
 - Checks (`rung0/gate0.sh`, results in `evidence/SEED-0/rung0/`):
   - seed-0 reading its own text produces itself, byte for byte;
   - every one of the 72 instructions is read back by two independent decoders (our own, in
@@ -101,7 +112,8 @@ it came from.
 - How it builds code: every name gets its own register for as long as it exists. The C path keeps every
   value in memory and loads and stores it around each step (that is its documented design, OSC-1 design
   section 7, "no register allocation"), so a difference in word counts below measures that choice.
-- Checks (`rung3/gate3.sh`, results in `evidence/SEED-0/rung3/`):
+- Checks (`rung3/gate3.sh`, results in `build/seed/r3/evidence/`, compared with the recorded receipt
+  `evidence/SEED-0/rung3/`, never written over it):
   - asm2 builds om3 twice to the same bytes; objdump (the referee) reads every one of the 1,486
     instructions back to the name, registers, numbers and jump targets written in `om3.s`:
     0 disagreements (`rung3/om3.audit`); five planted mistakes in the text are each caught;
@@ -136,6 +148,10 @@ it came from.
   about 4,000 lines in asm2's language, built by asm2 (14,224 bytes, `rung4/om4.bin`); `rung4/table4.s2`
   adds 3 instruction lines for om4's own use, each naming its manual section; `rung4/mk4.sh` writes the
   file's own size into its header (asm2 cannot add up sizes).
+- Function table: 4096 entries of 128 bytes at 0x19f0000, past the call records, so om4 holds the same
+  4096 functions as omc (the 4097th is error 14, `gate4.sh` section 7b). Through om4 `d0da40e4` the
+  table had 512 entries at 0x1840000, and `omc.om` itself had to stay within them. The move changes
+  five instruction words and the `p_memsz` word, not the file size; the omc that om4 births is byte-identical.
 - What it adds, and why each one is needed (every new word is used by the Omega compiler of rung R5 or
   by the test programs):
   - many functions, and a names pass so a call may name any function in the unit, earlier or
@@ -165,7 +181,8 @@ it came from.
     overflow, division by zero traps, a bad index traps, running out of stack traps; the spec has no
     "undefined" in it (the gate checks with a search);
   - no automatic conversions: mixing two types in one operation is refused.
-- Checks (`rung4/gate4.sh`, results in `evidence/SEED-0/rung4/`), 217 cases, all pass:
+- Checks (`rung4/gate4.sh`, results in `build/seed/r4/evidence/`, compared with the recorded receipt
+  `evidence/SEED-0/rung4/`, never written over it), 217 cases, all pass:
   - asm2 rebuilds om4 to the same bytes; objdump (the referee) reads all 3,170 instructions back to
     what `om4.s` says (0 disagreements); five planted mistakes in the text are each caught;
   - the 10 practice tasks: om4 makes exactly the same machine words as om3, and the same results as the
@@ -173,8 +190,8 @@ it came from.
   - 9 new programs in the old calling form that the C path can also express (signed divide and
     remainder at their limits, signed shifts, calls, computed loop counts, local arrays, a bad index):
     om4 and the C path give the same result or the same trap on all 69 inputs;
-  - 4 whole programs against twins written in C and built by gcc (gcc as the referee only): recursive
-    Fibonacci, sorting 1,000 numbers, echo of 50,000 random bytes, a byte copy that reverses its input:
+  - 4 whole programs against committed expected outputs (no C twin at runtime): recursive
+    Fibonacci, sorting 1,000 numbers, echo of 50,000 fixture bytes, a byte copy that reverses its input:
     same output every time;
   - 14 whole programs that must stop with a given status or value (among them 2^64 - 1 and 2^63 read as
     ulong numbers, fixed after the independent interpreter L412 found om4 refused them): divide by zero, bad index, read past the end, loop
@@ -204,7 +221,8 @@ it came from.
   fingerprint, constants, the SHA-256 code from byte 384, its table at byte 1224) is written out by hand
   in the same file. `atlas/table5.s2` adds 28 instruction lines, each naming its manual section.
 - Built by asm2, with no GNU assembler and no linker: `atlas/atlas.bin`, 1,480 bytes.
-- Checks (`atlas/gate5.sh`, results in `evidence/SEED-0/rung5/`):
+- Checks (`atlas/gate5.sh`, results in `build/seed/r5/evidence/`, compared with the recorded receipt
+  `evidence/SEED-0/rung5/`, never written over it):
   - asm2 builds it twice to the same bytes, and it is byte for byte the audited Atlas image
     (sha256 f7802501...a5): no difference, so the manual had nothing to settle;
   - objdump (the referee) reads all 263 instructions back to what `atlas.s2` says: 0 disagreements;
@@ -290,6 +308,14 @@ it came from.
 - Current size reporting measures the complete compiler only. Compiling incomplete source prefixes
   is not a valid per-function measurement in a compiler with forward references; that old diagnostic
   was removed. All parent, C-referee, wrong-word-mutant, fuzz and refusal checks remain mandatory.
+- The branch-range gate is seeded `.om`, including its coordinator, generator, source mutator
+  and decoder-output checker. See `seed/qualification/security673/README.md` for reconstruction.
+  The compiler accepts the exact forward maximum and refuses larger conditional branches
+  before emitting an executable. Direct probes of the actual encoder cover both signed extrema
+  and misalignment; a local-array fixture exercises the current backward caller. GNU objdump
+  independently decodes accepted forward branches and catches a deliberately weakened limit.
+  Malformed-output controls and supervisor failures are separate from compiler correctness.
+  Corrected evidence is in `evidence/SECURITY-673/correction1/`; earlier evidence is historical.
 - Limits, said plainly: omc has om4's limits, because it copies om4 (names up to 8 characters, 16
   registers per function, values nested up to 1,024 deep, 8 MiB of input).
 
@@ -323,6 +349,9 @@ both islands with no id shared (struct 85; host words 100 to 131).
 - `seed/host/check.sh` passes every host case and the 70 original corpus fixtures. The om4/omc
   corpus leaves out `seed/omc/tests/struct/`: om4's refusal there is the documented om4-only limit
   (decision 32), and gate6 owns that check.
+  Correction (2026-10-26): the selector at `ec07d25d` actually retains 62 cases;
+  `seed/host/original-fixtures.tsv` now fixes their paths and expected parent
+  statuses. The former content filters must not silently shrink qualification.
 - `seed/host/tests/structfile.om` is one program that builds a struct, creates and writes a file
   through the native host words, closes and unlinks it, and returns a struct field; `gate.sh` runs it.
 
@@ -405,6 +434,13 @@ converter now keeps a normalized 64-bit significand, a binary exponent and one s
   values, values just below the overflow boundary, and values that underflow to zero.
 - `gate8` now has 23 cases: the two literal fixtures cover large and subnormal values, and
   `neg_overflow2`/`neg_overflow3` check that a literal which rounds to infinity is refused.
+- Correction (#1024, #1026): the per-digit `fmul10`/`fdiv10` steps truncated at every factor of ten,
+  so some literals came out one ulp low (6816.702656e-27 gave 0x3B207B55A6D4A12F, not ...130;
+  2.4703282292062328e-324 gave 0, not 0x1). `fbits` now forms the exact quotient of two integers in
+  40 32-bit limbs (`fbmul`, `fbpow`, `fbsub`) and rounds once. `gate8 lit_round` checks 512 literals
+  against `seed/omc/float-lits.py`'s exact rational oracle, and `float-lits.py diff OMC N SEED` is
+  the randomized differential (1,000,000 literals, seed 1024: 0 mismatches). An integer literal under
+  a float type, formerly stored as raw bits, is now error 7 (`gate8 neg_int_*`).
 
 ## Rung R12: layout queries (done)
 
@@ -660,9 +696,11 @@ the length to X1.
 
 ## Rung R30: refusal-code conformance gate (done)
 
-`seed/omc/gate15.sh` pins the compiler's refusal table: one minimal program per code 3..23, each of
-which must exit with exactly that code and print `error N`, plus a valid control. Codes 1 and 2 are
-I/O errors on the compiler's own input/output, not language inputs, and are excluded.
+`seed/omc/gate15.sh` pins the compiler's refusal table. At R30 that was one minimal program per code
+3..23, each of which had to exit with exactly that code and print `error N`, plus a valid control.
+Since #797 the codes live in one registry, `seed/omc/error-codes.reg`, and gate15 covers every emitted
+code 1..25 and 27..30 (33 cases, each checked against its exact `omc: line L: error C`) and runs the
+`seed/omc/codereg.om` drift check with three negative controls; see OMEGESE §9.14.
 
 - The cases are: 3 unknown name, 4 line ends early, 5 extra words, 6 bad number, 7 type mismatch,
   8 out of range, 9 word not allowed, 10 duplicate name, 11 ambiguous literal, 12 register pool,
@@ -983,6 +1021,50 @@ and emit a plan for the corresponding invalid audit input; compiler failures
 or unrelated runtime failures are not accepted as control evidence.
 These checks qualify host parsing only. They do not access or qualify a GPU,
 alter the empirical scheduling model, or rewrite historical evidence.
+
+## Local trace segment (omega-mv #608)
+
+`seed/trace/segment.om` is a library unit (no `main`) for a local, append-only trace segment: a
+16-byte header and 64-byte records, each with its sequence number and a CRC-32. It can scan a segment
+read-only, and its recovery keeps the valid prefix and quarantines the damaged file as `<segment>.bad`.
+Run `sh seed/trace/gate.sh` (or `tests/gates/run.sh trace`) from the repository root on an
+AArch64 Linux host. The gate checks `seed/out/omc` against its recorded SHA-256, then requires the 71 checks
+in `seed/trace/segment-test.om` to print exactly `seed/trace/expected.txt`. It also requires four source
+mutants to fail their own checks: CRC comparison removed, torn tail ignored, append alignment guard
+weakened, and create with O_TRUNC in place of O_EXCL. `seed/trace/README.md` describes the format.
+
+`seed/trace/tracecli.om` is the offline read-only CLI for that format (omega-mv #610): `version`,
+`verify`, `show`, `events`, `stats`, `export`, `compare` and `list`. Nothing is written except stdout.
+Run `sh seed/trace/cli-gate.sh` (or `tests/gates/run.sh tracecli`) from the repository root on an
+AArch64 Linux host. The gate checks `seed/out/omc` against its recorded SHA-256, pins the generated
+fixture SHA-256 values and the golden stdout, refuses a mode-0000 segment, and requires four source
+mutants to fail their own checks. One of those is a literal scan of the read-only open flags (`32768`;
+a change to `32770`, which is `O_RDWR|O_NOFOLLOW`, must fail the scan). `seed/trace/README.md`
+describes the format and the CLI.
+
+## Candidate scalar `fma` and exact literals
+
+`fma a b c` (keyword 227) is explicit AArch64 scalar FMADD for three equal f32/f64 types.
+It rounds once, unlike separate `mul` and `add`. x86linux/x86efi refuse it with error 9
+rather than silently substituting non-fused arithmetic. See OMEGESE section 9.9 for NaNs,
+signed zero, literal rounding and refusal rules.
+
+The exact-limb decimal converter and 512-literal fixture are reused from the core of draft
+#1027 (`681d6f487ac3c237e0b8d73c287e0a8f232b1434`, fixing #1024 and #1026), applied to
+main `5287336a50b4b75a357bfc330f599cc604209e40`. They are not an independent second fix.
+`evidence/SEED-0/fma-exact-literals/oracle.wl` records a mounted Wolfram evaluation that
+independently checks all 512 expected patterns and the f32/f64 fused counterexamples.
+The inherited Python oracle is not needed for this qualification.
+
+Run the seed fixpoint, then `sh seed/omc/gate8.sh` and `sh seed/omc/gate-fma.sh`.
+The latter compiles a seeded exact-once source mutator, rejects an absent mutation site,
+and requires detection of FMSUB, unfused multiply/add, discarded decimal remainder and
+ties-down mutants. `seed/host/check.sh` includes both gates.
+
+This is an additive candidate profile, not a production compiler-pin refresh. Per integration
+ownership, the bridge's e5b32567 profile and active generated-unit/gate pins remain frozen.
+Adoption requires a separately authorized batch reseed, generated-unit regeneration and
+full pin refresh; this draft must not be treated as installed or independently merge-ready.
 
 ## How the checks stay honest
 
