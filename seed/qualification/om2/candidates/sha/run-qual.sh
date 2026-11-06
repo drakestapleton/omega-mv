@@ -3,13 +3,14 @@
 # OM-2 qualification L836 (#748), phaseB/sha-f5d14cb2: independent qualification of the OM-2 SHA unit
 # (aien-dev/om2/sha-compact @ f5d14cb2, om/sha256/sha256-om2.om) compiled by the S4 omc and bound by
 # omega-bridge feat/slice-abi @ 3bb8b8a9. Tasks 1, 2, 4, 5 of candidates/sha/RESULTS.txt; task 3 is
-# candidates/sha/mutants/run-mutants.sh. Writes one log per item into EVID; scratch in S.
+# candidates/sha/mutants/run-mutants.sh. Writes one log per item into EVID; scratch in S. EVID defaults to
+# build/om2-qual/sha/evidence: a rerun never writes over the recorded receipt evidence/phaseB/sha-f5d14cb2.
 # Usage (repository root): sh seed/qualification/om2/candidates/sha/run-qual.sh [EVID [S]]
 set -u
 ROOT=$(pwd)
 Q=$ROOT/seed/qualification/om2
 OR=$Q/oracle/sha
-EVID=${1:-$Q/evidence/phaseB/sha-f5d14cb2}
+EVID=${1:-$ROOT/build/om2-qual/sha/evidence}
 S=${2:-$ROOT/build/om2-qual/sha/run}
 UNIT=/tmp/zl/qsha/om/sha256/sha256-om2.om
 OMC2=/tmp/zl/omc-f6a6492f
