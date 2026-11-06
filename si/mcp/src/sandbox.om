@@ -1,15 +1,19 @@
 note omega-mcp: per-call temporary directory, the sandboxed spawn and the in-sandbox reaper.
 note
 note One compile or run:
-note  1. the parent opens the stage's stdin/stdout/stderr files in the 0700 temp dir and three close-on-exec
+note  1. the parent creates the stage's stdin/stdout/stderr files in the 0700 temp dir and three close-on-exec
 note     pipes (status, block, info), then forks child A;
-note  2. A moves them to fds 0..5 and execs /usr/bin/bwrap (no shell, empty environment) with every namespace
-note     unshared, a cleared environment, a read-only root holding only this executable (/r) and the program
-note     (/p), a 16 MiB tmpfs /w, and --block-fd 4 / --info-fd 5;
+note  2. execprog closes every descriptor at or above 3 (omega-mv OMEGESE.md, Path and process boundaries),
+note     so A moves the block, info and status pipes to fds 0, 1 and 2 and execs /usr/bin/bwrap (no shell,
+note     empty environment) with every namespace unshared, a cleared environment, a read-only root holding
+note     only this executable (/r), the program (/p) and the three stage files (/i read-only, /o and /e
+note     writable), a 16 MiB tmpfs /w, and --block-fd 0 / --info-fd 1;
 note  3. the parent reads the sandbox pid 1 from the info fd, runs /usr/bin/prlimit --pid on it (cpu, as,
 note     fsize, nproc, nofile, core) and only then writes the byte that lets bwrap continue;
-note  4. inside, /r reap /p forks, the child execs /p with fds >= 3 closed, and the reaper writes the raw
-note     wait status to fd 3 (the status pipe) as 'X' + 4 bytes ('E' + errno when exec failed);
+note  4. inside, /r reap /p forks; the child opens /i, /o and /e onto fds 0..2 and execs /p (execprog closes
+note     fds >= 3, the status pipe among them), and the reaper writes the raw wait status to fd 2 (the
+note     status pipe) as 'X' + 4 bytes ('E' + errno when the stage files could not be opened or fork failed;
+note     a failed exec leaves only fds 0..2, so the child reports it on /e and exits 127);
 note  5. the parent polls the status pipe and waitpid(WNOHANG) against a monons deadline and kills bwrap
 note     with SIGKILL when the wall clock runs out (--die-with-parent tears the namespaces down).
 
@@ -25,15 +29,20 @@ text a_ce "--clearenv"
 text a_bf "--block-fd"
 text a_if "--info-fd"
 text a_rob "--ro-bind"
+text a_bind "--bind"
 text a_size "--size"
 text a_tmpfs "--tmpfs"
 text a_chdir "--chdir"
 text a_rro "--remount-ro"
-text a_4 "4"
-text a_5 "5"
+text a_0 "0"
+text a_1 "1"
 text a_r "/r"
 text a_p "/p"
 text a_w "/w"
+text a_i "/i"
+text a_o "/o"
+text a_e "/e"
+text k_xf "omega-mcp reaper: exec of the program failed, errno "
 text a_root "/"
 text a_16m "16777216"
 text a_reap "reap"
@@ -149,9 +158,9 @@ pk_arg a_dwp
 pk_arg a_ns
 pk_arg a_ce
 pk_arg a_bf
-pk_arg a_4
+pk_arg a_0
 pk_arg a_if
-pk_arg a_5
+pk_arg a_1
 pk_arg a_rob
 pk_beg
 pk_sx
@@ -169,6 +178,15 @@ pk_t f_bin
 end
 pk_end
 pk_arg a_p
+pk_arg a_rob
+pk_stage f_src f_in md
+pk_arg a_i
+pk_arg a_bind
+pk_stage f_bin f_out md
+pk_arg a_o
+pk_arg a_bind
+pk_stage f_cerr f_err md
+pk_arg a_e
 pk_arg a_size
 pk_arg a_16m
 pk_arg a_tmpfs
@@ -180,6 +198,20 @@ pk_arg a_root
 pk_arg a_r
 pk_arg a_reap
 pk_arg a_p
+end
+
+note pk_stage: one packed temp-dir path, tdir/c for the compile stage (md 0) or tdir/r for the run stage
+fn pk_stage c view uchar * r view uchar * md ulong to void
+pk_beg
+pk_tdir
+pk_b 47
+if eq md 0
+pk_t c
+end
+if ne md 0
+pk_t r
+end
+pk_end
 end
 
 note pk_noiso: the isolation-off control (--test-only-no-isolation). The program runs directly on the
@@ -258,21 +290,25 @@ fn fdof slot ulong to int
 ret int get gv slot
 end
 
+note childgo: isolation off, the stage files become fds 0..2 of the program itself; otherwise the block,
+note info and status pipes become fds 0..2 of bwrap (execprog closes everything at or above 3)
 fn childgo to void
-z = dupfd fdof gfin 100 524288
-z = dupfd fdof gfout 101 524288
-z = dupfd fdof gferr 102 524288
-z = dupfd fdof gsw 103 524288
-z = dupfd fdof gbr 104 524288
-z = dupfd fdof giw 105 524288
+a = gbr
+b = giw
+c = gsw
+if ne get gv gnoiso 0
+a = gfin
+b = gfout
+c = gferr
+end
+z = dupfd fdof a 100 524288
+z = dupfd fdof b 101 524288
+z = dupfd fdof c 102 524288
 z = dupfd 100 0 0
 z = dupfd 101 1 0
 z = dupfd 102 2 0
-z = dupfd 103 3 0
-z = dupfd 104 4 0
-z = dupfd 105 5 0
 if ne get gv gnoiso 0
-c = chdir tdir 0 get gv gtdl
+q = chdir tdir 0 get gv gtdl
 end
 r = execprog pk 0 get gv gpkl
 exit 127
@@ -568,7 +604,7 @@ reapkid ulong n
 end
 if lt pid 0
 note exec of the program never happened: 'E' + errno 0
-w = write 3 one 0 5
+w = write 2 one 0 5
 ret 0
 end
 for i ulong 999999
@@ -583,17 +619,27 @@ end
 for i ulong 4
 put rec add i 1 get wst i
 end
-w = write 3 rec 0 5
+w = write 2 rec 0 5
 ret 0
 end
 
+note reapkid: fds 0 and 1 arrive closed (bwrap closes its block and info fds), fd 2 is the status pipe.
+note Each stage file is staged at 60..62 first (the sandbox runs under --nofile=64), so an open that lands
+note on 0 or 1 is never dup3'd onto itself; the status pipe is staged at 63 for reapfail.
 fn reapkid n ulong to void
-z = dupfd 3 9 524288
-for f ulong 61
-if ne f 6
-c = fclose int add f 3
+z = dupfd 2 63 524288
+if lt z 0
+exit 127
 end
-end
+a = fopen a_i 0 len a_i ofrd 0
+reapstage a 60
+b = fopen a_o 0 len a_o ofwr 0
+reapstage b 61
+c = fopen a_e 0 len a_e ofwr 0
+reapstage c 62
+reapstage long dupfd 60 0 0 0
+reapstage long dupfd 61 1 0 1
+reapstage long dupfd 62 2 0 2
 pk_reset
 pk_beg
 for i ulong n
@@ -601,11 +647,52 @@ pk_b get pa i
 end
 pk_end
 r = execprog pk 0 get gv gpkl
+reapxf r
+end
+
+note reapxf: execprog failed after closing fds >= 3, so the errno goes to the program's stderr (/e)
+fn reapxf r long to void
+v = ulong neg r
+d = new uchar 20 0
+k = ulong 0
+for i ulong 20
+put d sub 19 i uchar add 48 rem v 10
+k = add k 1
+v = div v 10
+if eq v 0
+break
+end
+end
+w = write 2 k_xf 0 len k_xf
+w = write 2 d sub 20 k k
+put d 0 10
+w = write 2 d 0 1
+exit 127
+end
+
+note reapstage: move an open stage file r to fd t (or check that a final dup3 landed on t); 'E' + errno
+note when it failed
+fn reapstage r long t int to void
+if ge r 0
+if eq r long t
+ret
+end
+z = dupfd int r t 524288
+if ge z 0
+ret
+end
+reapfail long z
+end
+reapfail r
+end
+
+note reapfail: a stage file did not open; 'E' + errno on the status pipe (staged at fd 63), nothing ran
+fn reapfail r long to void
 e = new uchar 5 69
 v = ulong neg r
 for i ulong 4
 put e add i 1 uchar and shr v mul i 8 255
 end
-w = write 9 e 0 5
+w = write 63 e 0 5
 exit 127
 end
