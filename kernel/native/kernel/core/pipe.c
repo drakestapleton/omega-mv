@@ -548,17 +548,58 @@ static const uint8_t op_args[] = { [CK_PIPE_OP_CREATE] = 0, [CK_PIPE_OP_READ] = 
 #define OP_MAX CK_PIPE_OP_DUP
 
 #ifndef CK_PIPE_MUTANT_SKIP_SLICE
-/* 1 when [s, s+len) lies in [lo, hi). len 0 passes. Otherwise no s+len add: a wrapping length fails. */
+/* 1 when [s, s+len) lies in [lo, hi) and hi is at most the user-VA top. len 0 passes. Otherwise no s+len add: a
+ * wrapping length fails. */
 static int slice_ok(const void *s, size_t len, uintptr_t lo, uintptr_t hi)
 {
     uintptr_t b = (uintptr_t)s;
     if (len == 0)
         return 1;
+#ifndef CK_PIPE_MUTANT_NO_USER_TOP
+    if (hi > CK_PIPE_USER_TOP)
+        return 0;
+#endif
     if (lo >= hi || b < lo || b >= hi)
         return 0;
     return len <= hi - b;
 }
 #endif
+
+#ifndef CK_PIPE_MUTANT_NO_BOUNCE
+/* Copy between the caller's slice and the kernel bounce buffer. Never called with the pool lock held. */
+static void slice_copy(uint8_t *d, const uint8_t *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        d[i] = s[i];
+}
+#endif
+
+/* READ / WRITE through the bounce buffer: the slice is only touched here, before ck_stream_write takes the lock or
+ * after ck_stream_read dropped it. At most CK_PIPE_BOUNCE bytes per call. */
+static unsigned slice_rw(struct ck_pipe_pool *p, struct ck_cap_table *caller, struct ck_handle h, unsigned op,
+                         uint8_t *slice, size_t slice_len, unsigned flags, size_t *n)
+{
+#ifdef CK_PIPE_MUTANT_NO_BOUNCE
+    /* TEST-ONLY (make pipe-bounce-mutant): the ring copy reads and writes the slice under the lock. test_pipe must
+     * fail. */
+    return op == CK_PIPE_OP_READ ? ck_stream_read(p, caller, h, slice, slice_len, flags, n)
+                                 : ck_stream_write(p, caller, h, slice, slice_len, flags, n);
+#else
+    uint8_t bounce[CK_PIPE_BOUNCE];
+    size_t len = slice_len < CK_PIPE_BOUNCE ? slice_len : CK_PIPE_BOUNCE;
+    unsigned e;
+    if (op == CK_PIPE_OP_WRITE) {
+        slice_copy(bounce, slice, len);
+        e = ck_stream_write(p, caller, h, len ? bounce : 0, len, flags, n);
+    } else {
+        e = ck_stream_read(p, caller, h, len ? bounce : 0, len, flags, n);
+        if (e == OSH_E_OK && *n)
+            slice_copy(slice, bounce, *n);
+    }
+    snap_zero(bounce, len); /* pipe bytes do not stay on the kernel stack */
+    return e;
+#endif
+}
 
 unsigned ck_pipe_dispatch(struct ck_pipe_pool *p, struct ck_cap_table *caller, struct ck_cap_table *peer,
                           const uint64_t *frame, size_t ncells, uint8_t *slice, size_t slice_len,
@@ -615,8 +656,7 @@ unsigned ck_pipe_dispatch(struct ck_pipe_pool *p, struct ck_cap_table *caller, s
             break;
         }
 #endif
-        e = op == CK_PIPE_OP_READ ? ck_stream_read(p, caller, h, slice, slice_len, (unsigned)frame[5], &n)
-                                  : ck_stream_write(p, caller, h, slice, slice_len, (unsigned)frame[5], &n);
+        e = slice_rw(p, caller, h, op, slice, slice_len, (unsigned)frame[5], &n);
         r.value = n;
         break;
     case CK_PIPE_OP_CLOSE:

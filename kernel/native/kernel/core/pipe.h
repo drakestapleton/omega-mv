@@ -39,8 +39,9 @@
  * A blocking call returns as soon as it moved at least one byte (partial I/O; the caller loops). The kernel's hook
  * yields to the scheduler; the host test simulates it. Without a wait hook a blocking call returns WOULD_BLOCK.
  * A blocking write copies the bytes it may commit into a kernel buffer before it parks (at most CK_PIPE_WRITE_SNAP
- * of them) and the retry reads that buffer, not the caller memory. A write that does not park copies once, under
- * the pool lock, straight into the ring.
+ * of them) and the retry reads that buffer, not the caller memory. A direct ck_stream_write that does not park
+ * copies once, under the pool lock, straight into the ring; ck_pipe_dispatch never hands it caller memory (see the
+ * user-window note below).
  *
  * Locking. One ticket lock covers the pool (every pipe, the ref counts, the ring, the stats, the live count).
  * core/smp.c is the kernel's SMP primitive and it synchronises with __atomic_*; there is no separate spinlock
@@ -55,14 +56,19 @@
  * ck_pipe_pool_init is single-threaded, before the pool is shared.
  *
  * User window. ck_pipe_dispatch rejects a read or a write whose slice lies outside [user_lo, user_hi) with
- * INVALID_ARG, before anything reads or writes the slice. A length of 0 passes. Otherwise the base must sit in
+ * INVALID_ARG, before anything reads or writes the slice. A length of 0 passes. Otherwise user_hi must be at most
+ * CK_PIPE_USER_TOP (the window ends at or below the top of user VA: TTBR1 space starts at 0xFFFF000000000000 on
+ * ARM64; the x86 canonical lower half ends at 0x0000800000000000 with 4-level paging), the base must sit in
  * [user_lo, user_hi) and the length must be <= user_hi - base. The check never adds base and length, so a length
  * that would wrap the address space fails. ck_stream_read and ck_stream_write do not repeat it; a direct caller
  * passes a kernel buffer it already owns.
- * The syscall layer still has two duties. It must assert, on each architecture, that user_hi is below the user-VA
- * top: below TTBR1 (0xFFFF000000000000) on ARM64, and below the canonical upper half on x86. It must copy the
- * slice in and out through a kernel bounce buffer outside the pool lock, so a user fault never runs while the
- * ticket lock is held.
+ * Bounce. ck_pipe_dispatch never touches the caller's slice while the pool lock is held. A write copies at most
+ * CK_PIPE_BOUNCE bytes of the slice into a kernel stack buffer before it calls ck_stream_write; a read reads at
+ * most CK_PIPE_BOUNCE bytes into that buffer through ck_stream_read and copies them out to the slice after the
+ * lock is dropped. A longer slice moves a partial count (section 8.1 allows partial I/O; the caller loops). A
+ * fault on the slice therefore never runs inside the ticket lock. The copy is still a plain load/store loop: the
+ * syscall layer, once there is one, supplies fault recovery around it. A read whose copy-out faults has already
+ * consumed those bytes from the ring.
  *
  * Memory: a fixed pool of CK_PIPE_POOL_PIPES pipes with CK_PIPE_CAPACITY bytes each, all static; nothing grows.
  * Pure logic, no hardware: host-tested in tests/test_pipe.c (fixtures in tests/fixtures/pipe/, plus host threads
@@ -109,6 +115,20 @@ enum ck_pipe_op {
  * secondary-core stack (core/smp.c). A longer blocking write returns a partial count and the caller loops. */
 #define CK_PIPE_WRITE_SNAP 1024u
 _Static_assert(CK_PIPE_WRITE_SNAP >= 1u && CK_PIPE_WRITE_SNAP <= 4096u, "snapshot must fit a secondary stack");
+/* Bytes ck_pipe_dispatch moves per READ or WRITE call through its kernel bounce buffer. It sits on the stack next to
+ * a blocking write's snapshot, so the two together stay under 4 KiB (same secondary-stack budget as above). */
+#define CK_PIPE_BOUNCE 1024u
+_Static_assert(CK_PIPE_BOUNCE >= 1u && CK_PIPE_BOUNCE + CK_PIPE_WRITE_SNAP <= 4096u, "bounce + snapshot must fit");
+
+/* Top of user VA (exclusive): a dispatch window must end at or below it. The x86 value assumes 4-level paging;
+ * x86/kmain_x86.c panics if firmware runs 5-level paging (CR4.LA57). */
+#if defined(__aarch64__)
+#define CK_PIPE_USER_TOP ((uintptr_t)0xFFFF000000000000ull) /* TTBR1 (kernel) space starts here */
+#elif defined(__x86_64__)
+#define CK_PIPE_USER_TOP ((uintptr_t)0x0000800000000000ull) /* end of the canonical lower half, 4-level paging */
+#else
+#error "pipe.h: no user-VA top for this architecture"
+#endif
 
 /* Rights a create gives each end beyond its data right, and the only rights a dup may carry. */
 #define CK_PIPE_CTL_RIGHTS (CK_R_DERIVE | CK_R_GRANT | CK_R_REVOKE)
@@ -202,8 +222,9 @@ unsigned ck_pipe_release_table(struct ck_pipe_pool *p, struct ck_cap_table *t);
  * than 4 cells, bad magic or nonzero reserved -> INVALID_ARG; abi_version not CK_PIPE_ABI_VERSION or an unknown op
  * -> NOT_SUPPORTED; wrong cell count, a generation-0 handle or unknown flag bits -> INVALID_ARG.
  * Result: {error, value} as in section 8; PIPE_CREATE also fills value2 (the write end). value2 is UNVERIFIED.
- * READ and WRITE then require slice[0, slice_len) inside [user_lo, user_hi), user_hi exclusive. A length of 0
- * passes. Any other slice is INVALID_ARG before the buffer is touched (see the user-window note above).
+ * READ and WRITE then require slice[0, slice_len) inside [user_lo, user_hi), user_hi exclusive and at most
+ * CK_PIPE_USER_TOP. A length of 0 passes. Any other slice is INVALID_ARG before the buffer is touched (see the
+ * user-window note above). At most CK_PIPE_BOUNCE bytes move per call, through a kernel bounce buffer.
  * user_lo and user_hi are the caller's window; kernel self-tests pass the bounds of their own buffer. */
 struct ck_pipe_ret {
     uint32_t error;

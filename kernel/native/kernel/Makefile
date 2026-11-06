@@ -1581,6 +1581,25 @@ pipe-slice-mutant: $(OUT)/host/test_pipe_slice_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (user slice not checked): PASSED, test does not catch it"; exit 1; \
 	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (user slice not checked): FAILS as required"; fi
 
+# TEST-ONLY mutants for #494. pipe-bounce-mutant: ck_pipe_dispatch hands the caller's slice to the ring copy, which
+# touches it under the pool lock. pipe-top-mutant: a window ending above CK_PIPE_USER_TOP is accepted. test_pipe must
+# FAIL against each.
+$(OUT)/host/test_pipe_bounce_mutant: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(PIPE_DEF) -DCK_PIPE_MUTANT_NO_BOUNCE -o $@ $< $(PIPE_SRCS)
+
+pipe-bounce-mutant: $(OUT)/host/test_pipe_bounce_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (slice copied under the lock): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (slice copied under the lock): FAILS as required"; fi
+
+$(OUT)/host/test_pipe_top_mutant: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(PIPE_DEF) -DCK_PIPE_MUTANT_NO_USER_TOP -o $@ $< $(PIPE_SRCS)
+
+pipe-top-mutant: $(OUT)/host/test_pipe_top_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (user-VA top not checked): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (user-VA top not checked): FAILS as required"; fi
+
 # N3 context assembly + approval binding (core/context.c, core/context_proposal.c, aienos#329): pure logic over
 # the argus SHA-256. Own rule (needs sha256.c). The mutant skips the foreign-binding check: test_context must
 # FAIL against it (red before green); "make test" fails if the test stops catching it. Host only (context.c
@@ -1712,8 +1731,8 @@ smmu-l2-mutants: $(OUT)/host/test_smmu
 	else echo "mutant flag refused under CK_HARDWARE_STAGING"; fi; \
 	if [ $$fail = 0 ]; then echo "CK_SMMU_L2_MUTANTS: PASS"; else echo "CK_SMMU_L2_MUTANTS: FAIL"; exit 1; fi
 
-test: $(addprefix $(OUT)/host/,$(TESTS)) osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check
-	@fail=0; for t in $(filter-out osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check,$^); do $$t || fail=1; done; \
+test: $(addprefix $(OUT)/host/,$(TESTS)) osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check
+	@fail=0; for t in $(filter-out osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check,$^); do $$t || fail=1; done; \
 	if [ $$fail = 0 ]; then echo "CK_CORE_HOST: PASS"; else echo "CK_CORE_HOST: FAIL"; exit 1; fi
 
 sanitize: $(addprefix $(OUT)/host-san/,$(TESTS))

@@ -883,6 +883,10 @@ scheduler; BROKEN_PIPE with no reader; a write after revoke refused with 0 bytes
 read succeeding afterwards; a closed handle STALE after its slot is reused; an unknown op and another ABI version NOT_SUPPORTED;
 cancel INTERRUPTED once with no byte moved. Host test `test_pipe` (the 20-case corpus in `tests/fixtures/pipe/` plus the
 scheduler transfers, also under ASan+UBSan); a mutant that skips the write-right check must fail it (`make pipe-mutant`).
+`ck_pipe_dispatch` copies the caller's slice through a kernel bounce buffer (at most `CK_PIPE_BOUNCE` = 1024 bytes per call) and
+never touches it with the pool lock held; a window ending above `CK_PIPE_USER_TOP` is INVALID_ARG (aienux#494). Host
+`test_pipe` puts the slice on a page that faults on first touch and checks the ticket lock is free at the fault; the mutants
+`make pipe-bounce-mutant` (slice copied under the lock) and `make pipe-top-mutant` (top not checked) must fail it.
 Limits: (1) the kernel's wait hook yields cooperatively to the scheduler inside one kernel thread; the QEMU image does not
 context-switch a blocked pipe op onto another core. Host `test_pipe` does, with pthreads: concurrent read/write, close while
 the peer is parked (including the window after the waiter is published and before `wait` runs), and create/close on a shared

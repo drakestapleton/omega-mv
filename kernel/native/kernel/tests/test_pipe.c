@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 #include "ck_test.h"
@@ -1174,6 +1175,104 @@ static void test_slice_window(void)
     CHECK(sigaction(SIGBUS, &old_bus, 0) == 0);
 }
 
+/* #494: ck_pipe_dispatch touches the slice only outside the pool lock. The slice sits on a page that faults on the
+ * first access; the handler records whether the ticket lock was held at that moment, then opens the page so the
+ * access retries. Before the bounce buffer, the ring copy faulted inside the lock. */
+static volatile sig_atomic_t bounce_faults, bounce_held;
+static uint8_t *bounce_page;
+static size_t bounce_pagesz;
+
+static void bounce_fault(int sig)
+{
+    (void)sig;
+    bounce_faults++;
+    if (__atomic_load_n(&pool.lock_ticket, __ATOMIC_RELAXED) != __atomic_load_n(&pool.lock_serving, __ATOMIC_RELAXED))
+        bounce_held = 1;
+    if (mprotect(bounce_page, bounce_pagesz, PROT_READ | PROT_WRITE) != 0)
+        _Exit(2);
+}
+
+static void bounce_arm(int prot)
+{
+    bounce_faults = 0;
+    bounce_held = 0;
+    CHECK(mprotect(bounce_page, bounce_pagesz, prot) == 0);
+}
+
+static void test_slice_bounce(void)
+{
+    fresh_tables();
+    ck_pipe_pool_init(&pool, 0);
+    long ps = sysconf(_SC_PAGESIZE);
+    CHECK(ps >= (long)CK_PIPE_BOUNCE + 8);
+    bounce_pagesz = (size_t)ps;
+    void *pg = mmap(0, bounce_pagesz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(pg != MAP_FAILED);
+    if (pg == MAP_FAILED)
+        return;
+    bounce_page = pg;
+    struct sigaction sa, old_segv, old_bus;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = bounce_fault;
+    sigemptyset(&sa.sa_mask);
+    CHECK(sigaction(SIGSEGV, &sa, &old_segv) == 0);
+    CHECK(sigaction(SIGBUS, &sa, &old_bus) == 0);
+
+    struct ck_pipe_ret ret;
+    uint64_t create[4] = { CK_PIPE_FRAME_MAGIC, CK_PIPE_ABI_VERSION, CK_PIPE_OP_CREATE, 0 };
+    CHECK(ck_pipe_dispatch(&pool, &ta, &tb, create, 4, 0, 0, 0, 0, &ret) == OSH_E_OK);
+    uint64_t rd = ret.value, wr = ret.value2;
+    uintptr_t lo = (uintptr_t)bounce_page, hi = lo + bounce_pagesz;
+
+    /* WRITE: the slice is read before the lock is taken. */
+    memcpy(bounce_page, "bounce", 6);
+    bounce_arm(PROT_NONE);
+    CHECK(frame_rw(1, wr, bounce_page, 6, lo, hi, &ret) == OSH_E_OK && ret.value == 6);
+    CHECK(bounce_faults == 1 && bounce_held == 0);
+    CHECK(pool.pipes[0].len == 6);
+
+    /* READ: the slice is written after the lock is dropped. */
+    memset(bounce_page, 0, 16);
+    bounce_arm(PROT_READ);
+    CHECK(frame_rw(0, rd, bounce_page, 16, lo, hi, &ret) == OSH_E_OK && ret.value == 6);
+    CHECK(bounce_faults == 1 && bounce_held == 0);
+    CHECK(!memcmp(bounce_page, "bounce", 6) && pool.pipes[0].len == 0);
+
+    /* A slice longer than the bounce buffer moves CK_PIPE_BOUNCE bytes; the caller loops for the rest. */
+    bounce_arm(PROT_READ | PROT_WRITE);
+    for (size_t i = 0; i < CK_PIPE_BOUNCE + 7; i++)
+        bounce_page[i] = (uint8_t)(i * 7u + 1u);
+    CHECK(frame_rw(1, wr, bounce_page, CK_PIPE_BOUNCE + 7, lo, hi, &ret) == OSH_E_OK && ret.value == CK_PIPE_BOUNCE);
+    CHECK(frame_rw(1, wr, bounce_page + CK_PIPE_BOUNCE, 7, lo, hi, &ret) == OSH_E_OK && ret.value == 7);
+    CHECK(pool.pipes[0].len == CK_PIPE_BOUNCE + 7);
+    uint8_t back[CK_PIPE_BOUNCE + 7];
+    CHECK(frame_rw(0, rd, back, sizeof back, (uintptr_t)back, (uintptr_t)back + sizeof back, &ret) == OSH_E_OK &&
+          ret.value == CK_PIPE_BOUNCE);
+    CHECK(frame_rw(0, rd, back + CK_PIPE_BOUNCE, 7, (uintptr_t)back, (uintptr_t)back + sizeof back, &ret) ==
+              OSH_E_OK &&
+          ret.value == 7);
+    CHECK(!memcmp(back, bounce_page, sizeof back) && pool.pipes[0].len == 0);
+
+    /* A window that ends above the user-VA top is refused before the slice is touched, for both directions. */
+    bounce_arm(PROT_NONE);
+    CHECK(frame_rw(1, wr, bounce_page, 4, lo, CK_PIPE_USER_TOP + 1, &ret) == OSH_E_INVALID_ARG && ret.value == 0);
+    CHECK(frame_rw(0, rd, bounce_page, 4, lo, CK_PIPE_USER_TOP + 1, &ret) == OSH_E_INVALID_ARG && ret.value == 0);
+    CHECK(frame_rw(1, wr, bounce_page, 4, lo, UINTPTR_MAX, &ret) == OSH_E_INVALID_ARG && ret.value == 0);
+    CHECK(bounce_faults == 0 && pool.pipes[0].len == 0);
+    /* The top itself is a legal exclusive end. */
+    bounce_arm(PROT_READ | PROT_WRITE);
+    CHECK(frame_rw(1, wr, bounce_page, 4, lo, CK_PIPE_USER_TOP, &ret) == OSH_E_OK && ret.value == 4);
+
+    uint64_t cl[5] = { CK_PIPE_FRAME_MAGIC, CK_PIPE_ABI_VERSION, CK_PIPE_OP_CLOSE, 0, rd };
+    CHECK(ck_pipe_dispatch(&pool, &ta, &tb, cl, 5, 0, 0, 0, 0, &ret) == OSH_E_OK);
+    cl[4] = wr;
+    CHECK(ck_pipe_dispatch(&pool, &ta, &tb, cl, 5, 0, 0, 0, 0, &ret) == OSH_E_OK);
+    CHECK(all_empty());
+    CHECK(sigaction(SIGSEGV, &old_segv, 0) == 0);
+    CHECK(sigaction(SIGBUS, &old_bus, 0) == 0);
+    CHECK(munmap(bounce_page, bounce_pagesz) == 0);
+}
+
 int main(int argc, char **argv)
 {
     _Static_assert(CK_PIPE_CAPACITY >= 65536u, "section 8.5 minimum");
@@ -1185,6 +1284,7 @@ int main(int argc, char **argv)
     test_epoch_and_forgery();
     test_dispatch();
     test_slice_window();
+    test_slice_bounce();
     test_release_count();
     test_toctou_snapshot();
     CHECK(pthread_mutex_init(&host.mu, 0) == 0);
