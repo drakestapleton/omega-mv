@@ -22,12 +22,19 @@ not stated here.
   `fstat`, `stat`, `lstat`, `getuid`, `geteuid`, `getgid` and `getegid` (OMEGESE.md section 10) on
   AArch64, with their program-mode meaning and machine code.
 - The same units may use the clocks `monons`, `realns` and `sleepns` and the device words `devctl`,
-  `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget` and `mapset`
-  (`seed/host/MAPPING.md`). In function mode the mapping words find their 4096-byte table (128 slots
-  of 32 bytes) through entry 31 of the caller's runtime table (x7 + 248) instead of an image global;
-  the caller supplies it zero-filled, shares it across its units and serializes calls that use it. A
-  caller that supplies no table at entry 31 gets its status 34 stub on the first mapping word.
-  `maphold` and `mapbind` stay program-mode words.
+  `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget`,
+  `mapset`, `maphold` and `mapbind` (`seed/host/MAPPING.md`). Function-mode entry31
+  is a data pointer to a32-byte capacity/generation header followed by1..4098
+  32-byte owned slots; handles have13 low slot bits. The bridge supplies an
+  explicit context with disjoint generation ranges and serializes its calls.
+  Fixed bind can replace only the whole owned PROT_NONE reservation; failure
+  unmaps/retires the token, not a promise to preserve the reservation. An absent
+  table pointer may fault: it is not a status34 function stub.
+- **Context ABI revision is DRAFT and requires Drake approval before merge.**
+  It supersedes the unmerged#1040 raw128-slot function-mode format, not an
+  accepted frozen OM-2 feature. The bridge must reject incompatible mapping
+  compiler/runtime fingerprints. Program-mode raw128 slots/eight slot bits,
+  frozen C2 manifest, pure and file/identity units stay unchanged.
 - Every other host word in function mode, any host word in an OM-1 function unit, and any host word for
   another target is error 9.
 - These words do not form a sandbox: a caller that embeds such a unit grants it the file and identity

@@ -25,15 +25,46 @@ bootstrap and test orchestration remain disclosed development tools.
 
 `cpufence` and `cpurelax` are accepted in every function unit. An OM-2 function unit
 (first line `om2`, no `fn main`) may also use `devctl`, `mapnew`, `mapdrop`, `mapread`,
-`mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget` and `mapset`; there the mapping table
-is not part of an image but entry 31 of the caller's runtime table (`LDR` from
-`[x7, #248]`): a zero-filled 4096-byte block (128 slots of 32 bytes) that the caller owns,
-shares across its units and serializes access to. `maphold` and `mapbind` require program
-mode (error 9 in function mode), as do these words in OM-1 units (gate
-`seed/omc/om2/fnhost/fnhost.cases`). A mapping handle is a long. `mapaddr` explicitly
-exports its address as ulong; access still requires the live owned handle.
-Each program (or function-mode caller) has a private fixed 128-slot table. Each slot records address,
-length, generation and access. Exhaustion returns -24 without calling mmap.
+`mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget`, `mapset`, `maphold` and `mapbind`.
+These words remain error9 in OM-1 function units and other targets (gate
+`seed/omc/om2/fnhost/fnhost.cases`). A handle is a long; `mapaddr` exposes only its
+owned live address, not general integer-pointer access.
+
+**Program mode remains unchanged:** its private raw128-slot table uses32-byte
+slots (address, length, generation, access) and eight low handle bits for slot+1.
+The129th live mapping returns-24 without calling mmap.
+
+**Function-mode context ABI (draft, Drake approval required before merge):**
+entry31 of the caller's runtime table (`LDR` from `[x7,#248]`) is a data pointer
+to four u64 header words: capacity, generation base, generation limit, zero-reserved;
+then capacity32-byte slots. Capacity is1..4098. Handles use13 low bits for slot+1
+and50 generation bits; each slot starts at the caller's generation base and is
+incremented only on successful allocation, never beyond the header's limit.
+Slot exhaustion returns-24 without mmap. A caller must initialize the table,
+keep it alive and serialize accesses. Missing/invalid pointers are not checked
+stub calls and can fault; entry31 must really point at this format.
+
+The bridge gives each explicit context a distinct nonreused24-bit ID and26-bit
+per-slot generations: base=`id<<26`, limit=`((id+1)<<26)-1`. This prevents a
+foreign-context handle from aliasing a local generation. Default contextID1 has
+128 slots. Explicit contexts admit4098:4096 C NVRM allocation mappings, one
+usermode mapping and one transient slot. GPU channel VA bookkeeping uses no
+CPU mmap reservation. WolframLanguageEvaluator:
+`{4096+1+1,2^13-1,2^26-1,2^24-1,2^50-1,32+4098*32}`
+-> `{4098,8191,67108863,16777215,1125899906842623,131168}`.
+The last value is the table byte size. Context creation/destruction and read-only
+dispatch-table publication are the bridge compatibility ABI, not new Omega words.
+The caller quiesces all users/waiters before destruction, which refuses live
+slots; it also serializes whole multi-call transactions in a context.
+
+`mapbind` replaces only the whole live PROT_NONE reservation in this selected
+table. A failed bind attempts to unmap it and retires the token: Linux may leave
+a gap after MAP_FIXED failure, so reservation preservation is not promised.
+No external munmap/mremap/fixed replacement may interfere with owned ranges.
+This format supersedes the unmerged raw128-slot function-mode draft in#1040;
+mixing those compiler/runtime formats is unsupported and the bridge rejects a
+mapping unit with an incompatible compiler fingerprint. Program-mode tables
+and handles are not changed by this context extension.
 Mappings are between 1 byte and 64 GiB each. This bounds each extent, not the
 total physical memory the OS permits. Closing a file descriptor does not close
 its mapping. Close the mapping explicitly before reclaiming its backing object.
