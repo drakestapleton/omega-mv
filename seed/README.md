@@ -148,6 +148,10 @@ it came from.
   about 4,000 lines in asm2's language, built by asm2 (14,224 bytes, `rung4/om4.bin`); `rung4/table4.s2`
   adds 3 instruction lines for om4's own use, each naming its manual section; `rung4/mk4.sh` writes the
   file's own size into its header (asm2 cannot add up sizes).
+- Function table: 4096 entries of 128 bytes at 0x19f0000, past the call records, so om4 holds the same
+  4096 functions as omc (the 4097th is error 14, `gate4.sh` section 7b). Through om4 `d0da40e4` the
+  table had 512 entries at 0x1840000, and `omc.om` itself had to stay within them. The move changes
+  five instruction words and the `p_memsz` word, not the file size; the omc that om4 births is byte-identical.
 - What it adds, and why each one is needed (every new word is used by the Omega compiler of rung R5 or
   by the test programs):
   - many functions, and a names pass so a call may name any function in the unit, earlier or
@@ -430,6 +434,13 @@ converter now keeps a normalized 64-bit significand, a binary exponent and one s
   values, values just below the overflow boundary, and values that underflow to zero.
 - `gate8` now has 23 cases: the two literal fixtures cover large and subnormal values, and
   `neg_overflow2`/`neg_overflow3` check that a literal which rounds to infinity is refused.
+- Correction (#1024, #1026): the per-digit `fmul10`/`fdiv10` steps truncated at every factor of ten,
+  so some literals came out one ulp low (6816.702656e-27 gave 0x3B207B55A6D4A12F, not ...130;
+  2.4703282292062328e-324 gave 0, not 0x1). `fbits` now forms the exact quotient of two integers in
+  40 32-bit limbs (`fbmul`, `fbpow`, `fbsub`) and rounds once. `gate8 lit_round` checks 512 literals
+  against `seed/omc/float-lits.py`'s exact rational oracle, and `float-lits.py diff OMC N SEED` is
+  the randomized differential (1,000,000 literals, seed 1024: 0 mismatches). An integer literal under
+  a float type, formerly stored as raw bits, is now error 7 (`gate8 neg_int_*`).
 
 ## Rung R12: layout queries (done)
 
@@ -1030,6 +1041,30 @@ fixture SHA-256 values and the golden stdout, refuses a mode-0000 segment, and r
 mutants to fail their own checks. One of those is a literal scan of the read-only open flags (`32768`;
 a change to `32770`, which is `O_RDWR|O_NOFOLLOW`, must fail the scan). `seed/trace/README.md`
 describes the format and the CLI.
+
+## Candidate scalar `fma` and exact literals
+
+`fma a b c` (keyword 227) is explicit AArch64 scalar FMADD for three equal f32/f64 types.
+It rounds once, unlike separate `mul` and `add`. x86linux/x86efi refuse it with error 9
+rather than silently substituting non-fused arithmetic. See OMEGESE section 9.9 for NaNs,
+signed zero, literal rounding and refusal rules.
+
+The exact-limb decimal converter and 512-literal fixture are reused from the core of draft
+#1027 (`681d6f487ac3c237e0b8d73c287e0a8f232b1434`, fixing #1024 and #1026), applied to
+main `5287336a50b4b75a357bfc330f599cc604209e40`. They are not an independent second fix.
+`evidence/SEED-0/fma-exact-literals/oracle.wl` records a mounted Wolfram evaluation that
+independently checks all 512 expected patterns and the f32/f64 fused counterexamples.
+The inherited Python oracle is not needed for this qualification.
+
+Run the seed fixpoint, then `sh seed/omc/gate8.sh` and `sh seed/omc/gate-fma.sh`.
+The latter compiles a seeded exact-once source mutator, rejects an absent mutation site,
+and requires detection of FMSUB, unfused multiply/add, discarded decimal remainder and
+ties-down mutants. `seed/host/check.sh` includes both gates.
+
+This is an additive candidate profile, not a production compiler-pin refresh. Per integration
+ownership, the bridge's e5b32567 profile and active generated-unit/gate pins remain frozen.
+Adoption requires a separately authorized batch reseed, generated-unit regeneration and
+full pin refresh; this draft must not be treated as installed or independently merge-ready.
 
 ## How the checks stay honest
 

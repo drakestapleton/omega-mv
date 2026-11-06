@@ -479,7 +479,7 @@ def bare_calls(root, rel, source):
                     "evidence":{"source_sha256":sha,"source_spec":REVIEWED_SOURCES[sha],
                                 "signature":line.decode(),"input_authority":recorded or
                                 "explicit original loaded-data predicates/conversion boundary and zero vectors; native differential only",
-                                "abi":"docs/osc/OSC-1-DESIGN.md section 7; omc param/xpro/xunit"}}
+                                "abi":"docs/osc/OSC-1-DESIGN.md section 7; omc param/xpro/s_eof export emission"}}
             # A recorded input list is not an independent result oracle. The
             # original rung4 conductor compares the OSC/C referee, including
             # traps; absent a result table retain native differential evidence.
