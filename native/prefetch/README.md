@@ -93,13 +93,17 @@ bytes. Each child has a30-second deadline. Scratch and child outputs remain
 available for inspection; the shell creates a separate directory on each run.
 
 The required compiler is this branch's seeded `seed/out/omc`, executable
-`b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3`, built from
-`seed/omc/omc.om` `5419943aad39c6205bb673c1ddb1be874b1877163cc2f143c07a742cf347456c`
+`5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`, built from
+`seed/omc/omc.om` `2c0fc44bdd607f9e84315e15c7c7ea263a5f0b6d83aa3f446fa6ed975e8ef34c`
 (both pinned in `compiler.sha256`). The original qualification used the corrected
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
 executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
-then b4f45121, then 3ad9f10f) and the gate was rerun. Each of these compilers emits the same
-classifier bytes (b527a20c). The entry refuses with 3 for any other compiler. It
+then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea) and the gate was rerun (no rerun is
+recorded for b1d9cff6). The compilers
+through 3ad9f10f emit the same classifier bytes (b527a20c, pinned in `classify.sha256`). The
+hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6 and 5f90edea emit 5dd5bb47, so the
+chip entry refuses a classifier built with the current pin until `classify.sha256` is requalified
+(the host gate above passes 53/53 with 5f90edea). The entry refuses with 3 for any other compiler. It
 does not fetch code, accept an arbitrary environment compiler, silently select an
 older profile, or waive missing prerequisites.
 
