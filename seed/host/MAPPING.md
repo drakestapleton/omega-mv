@@ -86,6 +86,10 @@ a memfd stand-in; the device path is exercised only in the QEMU bench of
 aien-dev/omega-gpu-driver, not on hardware. Both words are AArch64 only: a
 `target x86linux` program that uses either is refused with error 25, because the
 x86 backend has no VFIO lowering.
+`vfioctl` is keyword id 201 and `vfiomap` is 179. Id 178 belongs to `efi` under
+`target x86efi`, and the expression parser treats id 178 as `efi` on every target.
+W0 shape (decided 2026-11-06 in PR #878): W0a, sysfs-only bring-up with no VFIO
+device reset or FLR request.
 
 Kernel constants/layouts are from Linux asm-generic/unistd.h, mman-common.h and
 linux/mman.h. AArch64 encodings use seed/rung2/table.s2. The device request rule
