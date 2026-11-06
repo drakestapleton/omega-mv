@@ -176,8 +176,9 @@ void ck_xhci_release(void)
          * confined (ck_xhci_live stays 1) and a later release retries. */
         int urc = ck_dma_unconfine(x->stream_id);
         if (urc == 0) x->confined = 0;
-        ck_printf("smmu: xhci stream 0x%x %s (rc=%d)\n", x->stream_id,
-                  urc == 0 ? "returned to abort" : "abort FAILED, stays confined", urc);
+        ck_printf("smmu: xhci stream 0x%x %s (rc=%d%s%s)\n", x->stream_id,
+                  urc == 0 ? "returned to abort" : "abort FAILED, stays confined", urc, urc ? ": " : "",
+                  urc ? ck_dma_unconfine_why(urc) : "");
     }
 }
 

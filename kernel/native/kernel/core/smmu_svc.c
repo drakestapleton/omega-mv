@@ -347,8 +347,10 @@ int ck_dma_unconfine(uint32_t stream_id)
 {
     int slot = 0, amb;
     struct inst *in = holder(stream_id, &slot, &amb);
+    if (amb)
+        return CK_SMMU_AMBIGUOUS; /* fail closed: neither holder is aborted */
     if (!in)
-        return CK_SMMU_EARG; /* not confined, or confined on two SMMUs */
+        return CK_SMMU_EARG;      /* not confined */
     if (ck_smmu_abort_ste(&in->regs, &in->t, stream_id, CK_SMMU_DEFAULT_SPINS))
         return CK_SMMU_FAILED;
     in->used[slot] = 0;

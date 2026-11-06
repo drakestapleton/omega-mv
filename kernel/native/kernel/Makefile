@@ -1512,6 +1512,7 @@ TESTS := test_fmt test_frames test_pt test_acpi test_acpi_dev test_heap test_smm
 	test_continuity_subject test_continuity_subject_provision test_lifecycle test_console_rx test_klog test_klog_slot test_pi5 test_pi5_marker test_pi5_rng test_cpufeat test_dma_window test_pi5_pcie test_pi5_net test_pi5_gem test_unlock_req test_context test_agent_cmd test_artifact_card test_pipe test_allen_gate \
 	test_netboot_text test_gb10_gsp_boot
 TESTS += test_gpu_sim test_gsp_mmio
+TESTS += test_smmu_svc
 HCFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -Werror -I$(KDIR)/core -I$(KDIR)/mm -I$(KDIR)/tests -I$(BOOT)
 SANFLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 
@@ -2991,6 +2992,17 @@ dma-window-mutants:
 	  if $(OUT)/host/test_dma_window_mut_$$m >/dev/null; then echo "MUTANT SURVIVED: $$m"; fail=1; else echo "mutant killed: $$m"; fi; \
 	done; test $$fail -eq 0
 .PHONY: test-dma-window dma-window-mutants
+
+# SMMU DMA service refusals (core/smmu_svc.c, #480): the test includes the service source to lay out its static
+# instance table, and stubs the platform hooks itself. Host only.
+SMMU_SVC_SRCS := $(KDIR)/core/fmt.c $(KDIR)/core/acpi.c $(KDIR)/core/smmu.c $(KDIR)/mm/frames.c $(KDIR)/mm/pt.c $(KDIR)/mm/heap.c
+SMMU_SVC_DEPS := $(KDIR)/tests/test_smmu_svc.c $(KDIR)/core/smmu_svc.c $(SMMU_SVC_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+$(OUT)/host/test_smmu_svc: $(SMMU_SVC_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/include -o $@ $< $(SMMU_SVC_SRCS)
+$(OUT)/host-san/test_smmu_svc: $(SMMU_SVC_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/include -o $@ $< $(SMMU_SVC_SRCS)
 
 # AIENOS-GB10 cut D, host side: GPU page tables, allocator and channel over a simulated GB10
 # (gpu/gpu_sim.c). Host test only, not linked into any image (dependency map: kernel-side D code waits for #163/B).

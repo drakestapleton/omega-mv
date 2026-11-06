@@ -130,6 +130,7 @@ void ck_irq_cpu_enable(int on);
 #define CK_SMMU_NOSTREAM (-3)
 #define CK_SMMU_EARG (-4)
 #define CK_SMMU_OTHER (-5) /* the stream belongs to an SMMUv3 node the IORT parser did not keep (beyond CK_IORT_MAX_SMMUS) */
+#define CK_SMMU_AMBIGUOUS (-6) /* ck_dma_unconfine: the stream id is confined on two SMMUs; nothing is aborted (#480) */
 #define CK_DMA_MAX_STREAMS 8
 struct ck_dma_confinement {
     uint64_t smmu_base;
@@ -179,10 +180,19 @@ struct ck_acpi_scan_info {
 int ck_acpi_platform_devices(const char *const *ids, unsigned nids, struct ck_platform_dev *out, unsigned max,
                              struct ck_acpi_scan_info *info);
 /* Return a confined stream to abort (after the device's bus mastering is
- * off). 0 ok, CK_SMMU_EARG if not confined (or, stream ids being per SMMU,
- * confined on two SMMUs at once: ambiguous), CK_SMMU_FAILED on a command
- * timeout. */
+ * off). 0 ok, CK_SMMU_EARG if not confined, CK_SMMU_AMBIGUOUS if (stream ids
+ * being per SMMU) it is confined on two SMMUs at once (fail closed: both stay
+ * confined), CK_SMMU_FAILED on a command timeout. */
 int ck_dma_unconfine(uint32_t stream_id);
+/* Console text for a non-zero ck_dma_unconfine result, so a caller's message
+ * tells "nothing to release" apart from an inconsistent SMMU state (#480). */
+static inline const char *ck_dma_unconfine_why(int rc)
+{
+    return rc == CK_SMMU_EARG        ? "not confined in the SMMU service"
+           : rc == CK_SMMU_AMBIGUOUS ? "AMBIGUOUS: stream id confined on two SMMUs"
+           : rc == CK_SMMU_FAILED    ? "abort command failed"
+                                     : "unexpected result";
+}
 /* Drain the event queue of every SMMU brought up. Returns how many records
  * named `stream_id` (others are dropped); *first gets the first of them.
  * -1 if no SMMU is up. */

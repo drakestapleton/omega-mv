@@ -124,8 +124,9 @@ void ck_net_release(void)
          * confined (ck_net_live stays 1) and a later release retries. */
         int urc = ck_dma_unconfine(n->stream_id);
         if (urc == 0) n->confined = 0;
-        ck_printf("smmu: virtio_net stream 0x%x %s (rc=%d)\n", n->stream_id,
-                  urc == 0 ? "returned to abort" : "abort FAILED, stays confined", urc);
+        ck_printf("smmu: virtio_net stream 0x%x %s (rc=%d%s%s)\n", n->stream_id,
+                  urc == 0 ? "returned to abort" : "abort FAILED, stays confined", urc, urc ? ": " : "",
+                  urc ? ck_dma_unconfine_why(urc) : "");
     }
 }
 

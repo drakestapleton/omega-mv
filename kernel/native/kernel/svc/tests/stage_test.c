@@ -886,6 +886,7 @@ static void test_nvme_bind_discovery(void)
     ck_host_capture_stop();
     x = ck_host_capture_text();
     CHECK(has(x, "dma_gate: nvme bus master revoked\n") && has(x, "abort FAILED, stays confined (rc="));
+    CHECK(has(x, "abort FAILED, stays confined (rc=-2: abort command failed)\n")); /* #480: the reason is named */
     CHECK(!has(x, "returned to abort"));
     CHECK(has(x, "nvme: bind refused, already owned by seg 0003 01:00.0 (bound=0 bm_on=0 confined=1)"));
     /* #489: a reset quiesce while the abort is still refused retries the release; the stream stays confined,
