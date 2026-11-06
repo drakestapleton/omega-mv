@@ -22,7 +22,7 @@ mutants = [
     ('action-allowlist', 'mimmed 4043309056 31 4 17\ntrapc 1 3', 'mimmed 4043309056 31 4 17\nnote removed action refusal', '7'),
     ('event-count-condition', 'patch19 event get oc 0\nmimmed 4043309056 31 5 0\ntrapc 0 3', 'patch19 event get oc 0\nmimmed 4043309056 31 5 0\ntrapc 1 3', '0'),
     ('disable-start', 'mimmed 4043309056 31 6 0\ntrapc 1 3\ndisdone', 'mimmed 4043309056 31 6 0\nnote removed disable start refusal\ndisdone', '<'),
-    ('close-invalidation', 'if eq c 100\nhload x 0 10\nfdforget', 'if eq c 100\nhload x 0 10\nnote removed close invalidation', '6'),
+    ('close-invalidation', 'if and ne get progmode 0 0 eq c 100\nhload x 0 10\nfdforget', 'if and ne get progmode 0 0 eq c 100\nhload x 0 10\nnote removed close invalidation', '6'),
     ('dup-invalidation', 'hload x 1 10\nfdforget\npatch19 baddup', 'hload x 1 10\nnote removed dup invalidation\npatch19 baddup', ';'),
     ('payload-loop', 'mimmed 3506438144 5 5 1\nmimmed 4043309056 31 5 0\nagain = mbranch 1', 'mimmed 3506438144 5 5 1\nmimmed 4043309056 31 5 0\nagain = mbranch 0', 'A'),
     ('cloexec', 'matconst 1 526336\nhsys 19', 'matconst 1 2048\nhsys 19', '0'),
@@ -37,13 +37,13 @@ for name, old, new, mode in mutants:
     if result.returncode:
         raise SystemExit(f'INVALID {name}: compiler build rc={result.returncode} {result.stderr!r}')
     compiler.write_bytes(result.stdout)
-    compiler.chmod(0o755)
+    compiler.chmod(0o700)
     result = subprocess.run([str(compiler)], input=fixture, capture_output=True, timeout=30)
     if result.returncode:
         raise SystemExit(f'INVALID {name}: fixture build rc={result.returncode} {result.stderr!r}')
     binary = work / (name + '.elf')
     binary.write_bytes(result.stdout)
-    binary.chmod(0o755)
+    binary.chmod(0o700)
     expected = '0' if mode == '0' else '103'
     result = subprocess.run([str(oracle), str(binary), mode, expected, '0'], capture_output=True, timeout=10)
     (work / (name + '.log')).write_bytes(result.stdout + result.stderr)

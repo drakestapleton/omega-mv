@@ -1152,6 +1152,12 @@ owned mapping handle, never an address),
 `vfiomap` (read-only shared map of exactly one reported VFIO region) and `vfiomapw`
 (the same map read/write, for device registers). Its exact type,
 ownership, range and refusal contract is [seed/host/MAPPING.md](../../seed/host/MAPPING.md).
+The VFIO/event words use keywords228..232 respectively as `vfioctl`,
+`vfiomap`, `vfiomapw`, `eventfd`, `vfioirq`. They are AArch64
+program-mode words; function mode refuses them, and hosted x86 VFIO
+is not implemented. Descriptor-kind tracking remains program-local:
+existing OM-2 unit `fclose`/`dupfd` emission does not access that
+standalone-program table.
 The draft `devctl` boundary also admits five exact aien-gpu ABI1 request
 numbers, not arbitrary type-A ioctls; changing their direction or encoded
 payload size is refused. See the pinned UAPI and Wolfram-derived matrix there.

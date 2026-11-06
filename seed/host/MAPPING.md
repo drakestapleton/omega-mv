@@ -190,9 +190,14 @@ the bus (SBR); the allowlist cannot prevent that kernel behaviour.
 
 ### Typed IRQ and eventfd extension
 
-This profile extends compiler base `397e67040fb74853c6814097fe02ae4e1ebd6f66`
-(the driver pin). It emits AArch64 Linux syscalls directly. That source revision
-has no hosted x86 VFIO lowering; this extension does not imply x86 support.
+The original profile extended compiler base
+`397e67040fb74853c6814097fe02ae4e1ebd6f66` (the historical driver pin).
+Current-main integration assigns `vfioctl`228, `vfiomap`229,
+`vfiomapw`230, `eventfd`231 and `vfioirq`232, preserving the existing
+efi/qty/peername/fma words. It emits AArch64 Linux syscalls directly.
+These additions are program-mode only; hosted x86 VFIO and function-mode
+VFIO are not implemented. Neither hardware IRQ delivery nor a driver-pin
+compatibility claim follows from host qualification.
 
 `vfioirq GET_IRQ_INFO` requires exactly16 bytes and an argsz field equal to16.
 The caller supplies flags/index/count bytes; Linux validates the IRQ index and
@@ -331,3 +336,15 @@ The current-main landing rebuild of #1050 preserves every stack head, including
 The full native-host qualification and `tests/gates/run.sh om-units` pass with
 that compiler on Linux AArch64 under a device-hidden bwrap sandbox. This updates
 active compiler-consumer pins, not frozen bridge profiles or hardware evidence.
+
+The subsequent #1045 VFIO integration births compiler
+`b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3`
+from source
+`5419943aad39c6205bb673c1ddb1be874b1877163cc2f143c07a742cf347456c`.
+Its508 source functions fit the unchanged512-function om4 seed;
+single-caller helper consolidation, not a seed-capacity change, provides the
+space. Descriptor-kind bookkeeping is restricted to program mode, retaining
+the existing function-mode host-word byte contracts. The full native-host
+gate passes under the device-hidden sandbox, including the IRQ runtime
+oracle and compiler mutants. This is host qualification, not hardware IRQ
+delivery or authorization to repin a downstream driver's compiler.

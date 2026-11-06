@@ -150,11 +150,15 @@ returned `{{"peercred",7234314147887146352},{"pollfds",32480013390212976},{"send
 
 ### Typed VFIO IRQ and eventfd additions
 
-`eventfd` (keyword223) and `vfioirq` (224) extend the driver-pinned
-`397e67040fb74853c6814097fe02ae4e1ebd6f66` AArch64 compiler profile.
-The exact acquisition, invalidation, bounded payload and masking contracts are
-in [MAPPING.md](MAPPING.md#typed-irq-and-eventfd-extension). No hosted x86 VFIO
-path exists at this pin. This work does not add an arbitrary syscall.
+The current-main VFIO extension uses `vfioctl`228, `vfiomap`229,
+`vfiomapw`230, `eventfd`231 and `vfioirq`232. These do not collide with
+x86efi's scoped `efi`178, `qty`223, `peername`224 or `fma`227.
+The original extension used driver-pinned base
+`397e67040fb74853c6814097fe02ae4e1ebd6f66`; that historical pin is not
+rewritten. The exact acquisition, invalidation, bounded payload and masking
+contracts are in [MAPPING.md](MAPPING.md#typed-irq-and-eventfd-extension).
+These VFIO words are AArch64 program-mode only: function mode refuses them,
+and no hosted x86 VFIO implementation or arbitrary syscall is added.
 
 ```sh
 taskset -c 10-14 nice -n 10 sh seed/omega-from-seed.sh

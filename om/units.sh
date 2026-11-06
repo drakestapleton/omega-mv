@@ -23,7 +23,7 @@
 # OMEGA_UNITS (the unit list, repo-relative or absolute) and OMEGA_UNITS_DEST (output directory, default src)
 # override the defaults; mk/om-encoder.mk uses them to build mutant encoders beside the real binding.
 set -eu
-OMC_PIN=96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763
+OMC_PIN=b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3
 NATIVE_PIN=2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # One generated library for all units: the bindings share one ABI runtime (ombr_enter).

@@ -19,7 +19,7 @@ PYTHON=${PYTHON:-$(command -v python3 || true)}
 [ -n "$IREE_RUN" ] && [ -x "$IREE_RUN" ] || notrun 'requires iree-run-module oracle'
 [ -n "$PYTHON" ] && "$PYTHON" -c 'import jax, jaxlib, numpy' 2>/dev/null || notrun 'requires jaxlib PJRT CPU oracle'
 OMC=seed/out/omc
-pin=96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763
+pin=b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3
 [ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
 rm -rf "$B"
 mkdir -p "$B"
