@@ -466,7 +466,9 @@ The runner, reducer, corpus builder and custodian scripts are specified by their
   unchanged; conditions and the decision rule are unchanged. The OMEGESE section 3 grammar and section 4
   lowering lines for `while`/`for ... bound N` now describe omc; the reader's `omegese emit` still accepts
   `while ... bound` 1..1000000 only. `GEN_PROTOCOL_V1.md` re-hashed for this line. `make
-  test-gen-protocol` re-run on main d3d1b1bc.
+  test-gen-protocol` re-run on main d3d1b1bc. Merging main f0cc9d6a moved `OMEGESE.md` again, to
+  `99872d93...`: #1022 (x86efi `efi` OP 0..14, sections 4 and 9) and `f4bf80f8`'s irequiv reader note
+  (section 11). Neither touches section 5 or the reader chain, so it is re-pinned under this same line.
 - **v1, `pack_dev.sh` re-hashed for umask-independent member modes (before any held-out task; revision
   stays 1, as in train r3 and #946):** the dev pack stored each member with its on-disk mode, which
   depends on the checkout umask. Under umask 0002 (the Spark) files are 0664 and directories 0775 and
