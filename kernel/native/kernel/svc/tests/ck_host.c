@@ -226,7 +226,13 @@ int ck_acpi_platform_devices(const char *const *ids, unsigned nids, struct ck_pl
     if (out && max) *out = host_plat;
     return 1;
 }
-void ck_mb(void) { __sync_synchronize(); }
+void (*ck_host_mb_hook)(void);
+void (*ck_host_udelay_hook)(void);
+void ck_mb(void)
+{
+    __sync_synchronize();
+    if (ck_host_mb_hook) ck_host_mb_hook();
+}
 const void *ck_acpi_find(const char sig[4])
 {
     if (memcmp(sig, "MCFG", 4) == 0) return ck_host_mcfg;
@@ -238,7 +244,11 @@ uint64_t ck_time_us(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
-void ck_udelay(uint32_t us) { (void)us; }
+void ck_udelay(uint32_t us)
+{
+    (void)us;
+    if (ck_host_udelay_hook) ck_host_udelay_hook();
+}
 const char *ck_commit(void) { return "host-test-commit"; }
 unsigned ck_exception_level(void) { return 1; }
 uint64_t ck_conventional_memory_kb(void) { return 42; }

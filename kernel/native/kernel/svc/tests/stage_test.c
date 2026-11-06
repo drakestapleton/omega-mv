@@ -15,14 +15,13 @@
  */
 
 /* stage_test.c -- host tests for the Lane 18 boot stages (devices,
- * security, Store). Hosted test code: libc, pthreads, disk_file. Host
+ * security, Store). Hosted test code: libc, disk_file. Host
  * results qualify nothing physical; they check the logic only. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
-#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include "ck.h"
@@ -2730,9 +2729,10 @@ static void test_cortex_journal(void)
 }
 
 /* A tiny xHCI: HCRST completes and Run/Stop clears HCH, so the keyboard phase
- * can reach "no device" instead of a register or reset timeout. Host only. */
-static uint8_t *volatile xhci_watch_bar[2];
-static volatile int xhci_watch_on;
+ * can reach "no device" instead of a register or reset timeout. Host only.
+ * It steps once per driver poll wait (ck_host_udelay_hook), on the driver's
+ * own thread, so no result depends on scheduling (#490). */
+static uint8_t *xhci_model_bar[2];
 static uint32_t xhci_ld32(volatile uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -2744,28 +2744,25 @@ static void xhci_st32(volatile uint8_t *p, uint32_t v)
     p[2] = (uint8_t)(v >> 16);
     p[3] = (uint8_t)(v >> 24);
 }
-static void *xhci_watch(void *arg)
+static unsigned xhci_model_steps;
+static void xhci_step(void)
 {
-    (void)arg;
-    while (xhci_watch_on) {
-        for (int i = 0; i < 2; i++) {
-            volatile uint8_t *bar = xhci_watch_bar[i];
-            if (!bar) continue;
-            uint32_t op = xhci_ld32(bar) & 0xffu;
-            if (op + 8u > 0x4000u) continue;
-            uint32_t cmd = xhci_ld32(bar + op), sts = xhci_ld32(bar + op + 4);
-            if (cmd & 2u) { /* HCRST: complete, leave the controller halted */
-                xhci_st32(bar + op, cmd & ~2u);
-                xhci_st32(bar + op + 4, (sts & ~0x800u) | 1u);
-            } else if (cmd & 1u) { /* RS: running */
-                if (sts & 1u) xhci_st32(bar + op + 4, sts & ~1u);
-            } else if (!(sts & 1u)) {
-                xhci_st32(bar + op + 4, sts | 1u);
-            }
+    xhci_model_steps++;
+    for (int i = 0; i < 2; i++) {
+        volatile uint8_t *bar = xhci_model_bar[i];
+        if (!bar) continue;
+        uint32_t op = xhci_ld32(bar) & 0xffu;
+        if (op + 8u > 0x4000u) continue;
+        uint32_t cmd = xhci_ld32(bar + op), sts = xhci_ld32(bar + op + 4);
+        if (cmd & 2u) { /* HCRST: complete, leave the controller halted */
+            xhci_st32(bar + op, cmd & ~2u);
+            xhci_st32(bar + op + 4, (sts & ~0x800u) | 1u);
+        } else if (cmd & 1u) { /* RS: running */
+            if (sts & 1u) xhci_st32(bar + op + 4, sts & ~1u);
+        } else if (!(sts & 1u)) {
+            xhci_st32(bar + op + 4, sts | 1u);
         }
-        usleep(20);
     }
-    return 0;
 }
 
 /* Failed DMA release. Host shim only: nothing here is a real xHCI or SMMU.
@@ -2824,13 +2821,10 @@ static void test_xhci_release_refused(void)
     ck_host_confine_named_rc = 0;
     ck_host_unconfine_fail = 1;
     ck_host_unconfine_allow = 1; /* PCI abort succeeds; the platform abort is the one refused */
-    pthread_t watch;
-    int watching = 0;
-    xhci_watch_bar[0] = bar;
-    xhci_watch_bar[1] = pbar;
-    xhci_watch_on = 1;
-    watching = pthread_create(&watch, 0, xhci_watch, 0) == 0;
-    CHECK(watching);
+    xhci_model_bar[0] = bar;
+    xhci_model_bar[1] = pbar;
+    xhci_model_steps = 0;
+    ck_host_udelay_hook = xhci_step;
     grants = ck_host_confine_calls;
     ck_host_capture_start();
     rc = ck_xhci_fence(&s);
@@ -2841,6 +2835,7 @@ static void test_xhci_release_refused(void)
     CHECK(strcmp(ck_xhci_state(), "release-failed") == 0);
     CHECK(ck_xhci_live() == 1);
     CHECK(ck_host_confine_calls == grants + 2); /* PCI requester, then the ACPI name */
+    CHECK(xhci_model_steps > 0);                /* the driver's polls drove the model */
     CHECK(has(x, "abort FAILED, stays confined"));
     CHECK(has(x, "trying 1 ACPI platform controller"));
     grants = ck_host_confine_calls;
@@ -2853,11 +2848,6 @@ static void test_xhci_release_refused(void)
     /* A platform controller that is denied never holds a stream. The PCI
      * fence already succeeded, so that error stays CK_XHCI_OK / "fenced". */
     printf("  [xHCI platform fallback denied, host, not hardware]\n");
-    if (watching) {
-        xhci_watch_on = 0;
-        pthread_join(watch, 0);
-        watching = 0;
-    }
     memset(bar, 0, sizeof bar);
     put32(bar + 0x00, 0x01000020u);
     put32(bar + 0x10, 0x1u);
@@ -2868,9 +2858,6 @@ static void test_xhci_release_refused(void)
     memset(pbar, 0, sizeof pbar);
     put32(pbar + 0x00, 0x10u);
     put32(pbar + 0x14, 1u);
-    xhci_watch_on = 1;
-    watching = pthread_create(&watch, 0, xhci_watch, 0) == 0;
-    CHECK(watching);
     ck_host_confine_named_rc = CK_SMMU_ABSENT;
     ck_host_capture_start();
     rc = ck_xhci_fence(&s);
@@ -2878,11 +2865,8 @@ static void test_xhci_release_refused(void)
     x = ck_host_capture_text();
     CHECK(rc == CK_XHCI_OK && strcmp(ck_xhci_state(), "fenced") == 0 && ck_xhci_live() == 0);
     CHECK(has(x, "denied (NoSmmu)"));
-    if (watching) {
-        xhci_watch_on = 0;
-        pthread_join(watch, 0);
-    }
-    xhci_watch_bar[0] = xhci_watch_bar[1] = 0;
+    ck_host_udelay_hook = 0;
+    xhci_model_bar[0] = xhci_model_bar[1] = 0;
     ck_host_plat_clear();
     CHECK(ck_xhci_host_forget() == 0);
     ck_host_try_map_ok = 0;
@@ -2950,6 +2934,135 @@ static void test_net_release_refused(void)
     ck_host_confine_rc = CK_SMMU_ABSENT;
 }
 
+/* #490 (1): a capability window outside its BAR (net_bind.c, the map_window failure after the grant). With the
+ * abort refused the bind must report CK_NET_E_SMMU and stay live; with the abort accepted CK_NET_E_ARG and released. */
+static void test_net_window_map_fail(void)
+{
+    printf("  [virtio-net window map failure, host, not hardware]\n");
+    static uint8_t cfg[4096];
+    static uint8_t bar[0x4000] __attribute__((aligned(4096)));
+    static pci_func vf;
+    memset(cfg, 0, sizeof cfg);
+    memset(bar, 0, sizeof bar);
+    memset(&vf, 0, sizeof vf);
+    vf.vendor = 0x1af4;
+    vf.device = 0x1041;
+    vf.cfg = cfg;
+    vf.bar[4].addr = (uint64_t)(uintptr_t)bar;
+    vf.bar[4].size = sizeof bar;
+    virtio_pci_caps caps;
+    memset(&caps, 0, sizeof caps);
+    caps.common_cfg = (virtio_pci_region){1, 4, 0, 0x1000};
+    caps.isr_cfg = (virtio_pci_region){1, 4, 0x1000, 0x1000};
+    caps.device_cfg = (virtio_pci_region){1, 4, 0x2000, 0x1000};
+    caps.notify_cfg = (virtio_pci_region){1, 4, 0x3800, 0x1000}; /* ends 0x800 past the BAR */
+    caps.has_notify_off_multiplier = 1;
+    caps.notify_off_multiplier = 4;
+    ck_host_confine_rc = 0;
+    ck_host_unconfine_fail = 1;
+    unsigned grants = ck_host_confine_calls;
+    ck_host_capture_start();
+    int rc = ck_net_bind_selftest(&vf, &caps);
+    ck_host_capture_stop();
+    const char *x = ck_host_capture_text();
+    CHECK(rc == CK_NET_E_SMMU);
+    CHECK(ck_net_live() == 1);
+    CHECK(ck_host_confine_calls == grants + 1);
+    CHECK(has(x, "virtio_net: not bound (capability window 1 outside its BAR)\n"));
+    CHECK(has(x, "abort FAILED, stays confined") && !has(x, "returned to abort"));
+    CHECK(!has(x, "bus master on"));                                 /* the device never got bus mastering */
+    CHECK((pci_r16(cfg, 4) & 0x4u) == 0);
+    ck_host_unconfine_fail = 0;
+    ck_net_release();
+    CHECK(ck_net_live() == 0);
+    ck_host_capture_start();
+    rc = ck_net_bind_selftest(&vf, &caps);
+    ck_host_capture_stop();
+    CHECK(rc == CK_NET_E_ARG && ck_net_live() == 0);
+    CHECK(has(ck_host_capture_text(), "outside its BAR") && has(ck_host_capture_text(), "returned to abort"));
+    ck_host_confine_rc = CK_SMMU_ABSENT;
+}
+
+/* A virtio common-config window in plain memory, with the one register the selftest needs per queue: queue_enable
+ * follows queue_select, and a device reset (status 0) clears it. It steps after every driver register write
+ * (ck_host_mb_hook), on the driver's thread. device_feature reads the same word for both selects. */
+static volatile uint8_t *vnet_model_cc;
+static uint16_t vnet_model_sel, vnet_model_en[2];
+static void vnet_step(void)
+{
+    volatile uint8_t *cc = vnet_model_cc;
+    if (!cc) return;
+    uint16_t sel = (uint16_t)(cc[0x16] | (cc[0x17] << 8)) & 1u;
+    if (sel != vnet_model_sel) {
+        vnet_model_en[vnet_model_sel] = (uint16_t)(cc[0x1c] | (cc[0x1d] << 8));
+        cc[0x1c] = (uint8_t)vnet_model_en[sel];
+        cc[0x1d] = (uint8_t)(vnet_model_en[sel] >> 8);
+        vnet_model_sel = sel;
+    }
+    if (cc[0x14] == 0) vnet_model_en[0] = vnet_model_en[1] = 0, cc[0x1c] = cc[0x1d] = 0;
+}
+
+/* #490 (2): the final release of a selftest that got past init. VERSION_1 and ACCESS_PLATFORM are offered, MAC is
+ * not, so init succeeds and the selftest ends at "no MAC" before the final release. With that abort refused the
+ * result must be CK_NET_E_SMMU, not the selftest's own CK_NET_E_INIT, and the stream stays confined. */
+static void test_net_final_release_refused(void)
+{
+    printf("  [virtio-net final release refused, host, not hardware]\n");
+    static uint8_t cfg[4096];
+    static uint8_t bar[0x4000] __attribute__((aligned(4096)));
+    static pci_func vf;
+    memset(cfg, 0, sizeof cfg);
+    memset(bar, 0, sizeof bar);
+    memset(&vf, 0, sizeof vf);
+    bar[4] = 0x3;                                                    /* device_feature: bits 0,1 / 32,33 */
+    bar[0x12] = 2;                                                   /* num_queues */
+    bar[0x18] = 0x10;                                                /* queue_size 16 */
+    vnet_model_cc = bar;
+    vnet_model_sel = 0;
+    vnet_model_en[0] = vnet_model_en[1] = 0;
+    ck_host_mb_hook = vnet_step;
+    vf.vendor = 0x1af4;
+    vf.device = 0x1041;
+    vf.cfg = cfg;
+    vf.bar[4].addr = (uint64_t)(uintptr_t)bar;
+    vf.bar[4].size = sizeof bar;
+    virtio_pci_caps caps;
+    memset(&caps, 0, sizeof caps);
+    caps.common_cfg = (virtio_pci_region){1, 4, 0, 0x1000};
+    caps.isr_cfg = (virtio_pci_region){1, 4, 0x1000, 0x1000};
+    caps.device_cfg = (virtio_pci_region){1, 4, 0x2000, 0x1000};
+    caps.notify_cfg = (virtio_pci_region){1, 4, 0x3000, 0x1000};
+    caps.has_notify_off_multiplier = 1;
+    caps.notify_off_multiplier = 4;
+    ck_host_confine_rc = 0;
+    ck_host_unconfine_fail = 1;
+    ck_host_capture_start();
+    int rc = ck_net_bind_selftest(&vf, &caps);
+    ck_host_capture_stop();
+    const char *x = ck_host_capture_text();
+    printf("  virtio-net final release rc=%d live=%d\n", rc, ck_net_live());
+    CHECK(has(x, "access_platform=yes"));                            /* init passed: the final release is reached */
+    CHECK(has(x, "net: selftest FAIL (rc=-"));
+    CHECK(rc == CK_NET_E_SMMU);
+    CHECK(ck_net_live() == 1);
+    CHECK(has(x, "abort FAILED, stays confined") && !has(x, "returned to abort"));
+    CHECK((pci_r16(cfg, 4) & 0x4u) == 0);                            /* bus master revoked */
+    ck_host_unconfine_fail = 0;
+    ck_host_capture_start();
+    rc = ck_net_bind_selftest(&vf, &caps);                           /* still live: refused before any grant */
+    ck_net_release();
+    ck_host_capture_stop();
+    CHECK(rc == CK_NET_E_ARG && ck_net_live() == 0);
+    ck_host_capture_start();
+    rc = ck_net_bind_selftest(&vf, &caps);                           /* abort accepted: the selftest's own result */
+    ck_host_capture_stop();
+    CHECK(rc == CK_NET_E_INIT && ck_net_live() == 0);
+    CHECK(has(ck_host_capture_text(), "returned to abort"));
+    ck_host_mb_hook = 0;
+    vnet_model_cc = 0;
+    ck_host_confine_rc = CK_SMMU_ABSENT;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2984,6 +3097,8 @@ int main(void)
     test_xhci_fence();
     test_xhci_release_refused();
     test_net_release_refused();
+    test_net_window_map_fail();
+    test_net_final_release_refused();
     test_usb_hid();
     printf("CK_STAGE_HOST: %s checks=%d failures=%d\n", failures ? "FAIL" : "PASS", checks, failures);
     return failures ? 1 : 0;

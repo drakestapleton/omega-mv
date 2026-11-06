@@ -30,6 +30,10 @@ extern unsigned ck_host_unconfine_allow;       /* with unconfine_fail: this many
 extern unsigned ck_host_confine_calls, ck_host_unconfine_calls;
 extern uint32_t ck_host_confine_segment, ck_host_confine_rid;
 extern uint64_t ck_host_confine_phys, ck_host_confine_len;
+/* Device models step here, on the caller's thread, so a register poll sees the model's answer without timing:
+ * the mb hook runs after every ck_mb (drivers fence each register write with it), the udelay hook on every poll wait. */
+extern void (*ck_host_mb_hook)(void);
+extern void (*ck_host_udelay_hook)(void);
 void ck_host_mmio_reset(void);            /* forget every recorded mapping and the counter */
 /* One ACPI platform device the next ck_acpi_platform_devices scan can return.
  * Cleared: the scan reports no DSDT, as on an unconfigured host. */
