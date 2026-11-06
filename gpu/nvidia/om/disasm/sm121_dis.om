@@ -1,0 +1,1276 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note sm121_dis.om: Omega's own sm_121 instruction decoder, one 128-bit word to nvdisasm's text.
+note It is the row-for-row successor of omega_sm121_disasm in src/omega_sm121_disasm.c, which stays compiled
+note only behind CUDAPP_MIGRATION_PENDING_C_DISASM as the differential oracle (make CUDAPP_DISASM=c|diff).
+note
+note Input w: 0 lo (bits 0..63 of the word)  1 hi (bits 64..127)  2 pc (the word's byte offset)  3 unused.
+note Output o: the text, without a terminator. Result: the text's byte count, plus KUNK when no row
+note matches (the text is then ?? 0x and the word in hex, as the C writes it).
+note Layout of a word, the rows and the operand codes are those of the C file: a row is an opcode with its
+note fixed bits (lov, hiv) and a format; each % code names the bits it reads, every other bit of lo and of
+note hi 0..40 outside the guard (lo 12..15) must equal the row's value. The first row that matches wins.
+note The tables are rebuilt in local arrays on every call: pl is a pool of 64-byte slots (slot s is bytes
+note 64 s .. 64 s + 63, little-endian in words, a zero byte ends the text), slots 0..62 the row formats,
+note 64..115 the other names; rl holds lov and hiv of row i at 2 i and 2 i + 1.
+note Float immediates are printed the shortest way that reads back exactly, like the C's %.*g loop with
+note sscanf, computed here in exact integer arithmetic (16 limbs of 32 bits) instead of with floats.
+note Every constant is the decimal form of the C file's hex or text (conversions by Wolfram,
+note evidence/CUDAPP-OM-DISASM/wolfram-constants.txt).
+
+const PW ulong 1024
+const RW ulong 126
+const NROWS ulong 63
+const ON ulong 256
+const KUNK ulong 65536
+const HIMASK ulong 2199023255551
+const GUARD ulong 61440
+const M32 ulong 4294967295
+const T31 ulong 2147483648
+const HI32 ulong 18446744069414584320
+const T63 ulong 9223372036854775808
+const T23 ulong 8388608
+const FRAC ulong 8388607
+const EXPALL ulong 2139095040
+const T55 ulong 36028797018963968
+const HI56 ulong 18374686479671623680
+const HI24 ulong 18446744073692774400
+const BRALO ulong 18446744056546394112
+const BRAHI ulong 262143
+const IMADLO ulong 2084
+const IMADHI ulong 126747136
+const S_SR ulong 64
+const S_ICMP ulong 73
+const S_FCMP ulong 81
+const S_MSIZE ulong 97
+const S_IMAD ulong 105
+const S_QNAN ulong 109
+const S_INF ulong 110
+const S_UNK ulong 111
+const S_C0X ulong 112
+const S_B0X ulong 113
+const S_U32 ulong 114
+const S_SRN ulong 115
+
+fn bits v ulong at ulong n ulong to ulong
+ret and shr v at sub shl ulong 1 n 1
+end
+
+fn mask at ulong n ulong to ulong
+ret shl sub shl ulong 1 n 1 at
+end
+
+note one byte of text at p; gives p + 1 (p at ON traps 3: the C shell reports -2)
+fn och o edit uchar ON p ulong c ulong to ulong
+put o p uchar c
+ret add p 1
+end
+
+note byte k of pool slot s
+fn pbyte pl view ulong PW s ulong k ulong to ulong
+ret and shr get pl add mul s 8 shr k 3 shl and k 7 3 255
+end
+
+note the text of pool slot s at p
+fn ps o edit uchar ON p ulong pl view ulong PW s ulong to ulong
+q = p
+for k ulong 64
+b = pbyte pl s k
+if eq b 0
+break
+end
+q = och o q b
+end
+ret q
+end
+
+note %u
+fn pdec o edit uchar ON p ulong v ulong to ulong
+d = ulong 1
+while ge div v d 10 bound 20
+d = mul d 10
+end
+q = p
+while gt d 0 bound 21
+q = och o q add 48 rem div v d 10
+d = div d 10
+end
+ret q
+end
+
+fn hexch o edit uchar ON p ulong h ulong to ulong
+if lt h 10
+ret och o p add 48 h
+end
+ret och o p add 87 h
+end
+
+note %llx
+fn phex o edit uchar ON p ulong v ulong to ulong
+n = ulong 1
+while lt n 16 bound 16
+if eq shr v mul n 4 0
+break
+end
+n = add n 1
+end
+q = p
+for i ulong n
+q = hexch o q and shr v mul sub sub n 1 i 4 15
+end
+ret q
+end
+
+note %016llx
+fn phex16 o edit uchar ON p ulong v ulong to ulong
+q = p
+for i ulong 16
+q = hexch o q and shr v mul sub 15 i 4 15
+end
+ret q
+end
+
+note 0x%llx
+fn p0x o edit uchar ON p ulong v ulong to ulong
+q = och o p 48
+q = och o q 120
+ret phex o q v
+end
+
+note hex_s: v is a 64-bit two's complement value
+fn phexs o edit uchar ON p ulong v ulong to ulong
+if ge v T63
+q = och o p 45
+ret p0x o q sub 0 v
+end
+ret p0x o p v
+end
+
+note (int64_t)(int32_t) of the low 32 bits, as 64-bit two's complement
+fn sx32 v ulong to ulong
+x = and v M32
+if ge x T31
+ret or x HI32
+end
+ret x
+end
+
+note reg: u 1 prints the uniform prefix UR
+fn preg o edit uchar ON p ulong u ulong r ulong to ulong
+q = p
+if eq u 1
+q = och o q 85
+end
+q = och o q 82
+if eq r 255
+ret och o q 90
+end
+ret pdec o q r
+end
+
+fn ppred o edit uchar ON p ulong v ulong ng ulong to ulong
+q = p
+if eq ng 1
+q = och o q 33
+end
+q = och o q 80
+if eq v 7
+ret och o q 84
+end
+ret pdec o q v
+end
+
+note an operand field: 16777216 (present) + 65536 hi + 256 at + n
+fn fenc h ulong at ulong n ulong to ulong
+ret or or 16777216 shl h 16 or shl at 8 n
+end
+
+note the FIELDS table of the C file; 0 for a code without a field
+fn fld c ulong to ulong
+if or eq c 100 eq c 68
+ret fenc 0 16 8
+end
+if eq c 121
+ret fenc 0 16 4
+end
+if or eq c 97 eq c 65
+ret fenc 0 24 8
+end
+if or eq c 98 eq c 66
+ret fenc 0 32 8
+end
+if or eq c 99 eq c 67
+ret fenc 1 0 8
+end
+if or or eq c 105 eq c 115 or or eq c 102 eq c 106 eq c 89
+ret fenc 0 32 32
+end
+if eq c 75
+ret fenc 0 38 21
+end
+if eq c 85
+ret fenc 0 37 22
+end
+if eq c 111
+ret fenc 0 40 24
+end
+if eq c 80
+ret fenc 1 17 3
+end
+if eq c 81
+ret fenc 1 20 3
+end
+if eq c 82
+ret fenc 1 23 4
+end
+if or eq c 108 eq c 83
+ret fenc 1 8 8
+end
+if eq c 104
+ret fenc 0 53 5
+end
+if eq c 109
+ret fenc 0 40 13
+end
+if eq c 71
+ret fenc 1 12 3
+end
+if eq c 103
+ret fenc 1 12 4
+end
+if eq c 90
+ret fenc 1 9 1
+end
+if eq c 122
+ret fenc 1 9 3
+end
+if eq c 78
+ret fenc 1 8 1
+end
+if eq c 77
+ret fenc 0 63 1
+end
+ret 0
+end
+
+note the bits field f reads, as a mask of its half
+fn fmsk f ulong to ulong
+ret mask and shr f 8 255 and f 255
+end
+
+note the value of operand code c
+fn fval c ulong lo ulong hi ulong to ulong
+f = fld c
+if eq f 0
+ret 0
+end
+if eq and shr f 16 1 1
+ret bits hi and shr f 8 255 and f 255
+end
+ret bits lo and shr f 8 255 and f 255
+end
+
+note fields_mask: the bits row s's format reads, lo into mk 0 and hi into mk 1
+fn fmk pl view ulong PW s ulong mk edit ulong 2 to void
+put mk 0 0
+put mk 1 0
+k = ulong 0
+while lt k 64 bound 64
+b = pbyte pl s k
+if eq b 0
+break
+end
+k = add k 1
+if ne b 37
+continue
+end
+c = pbyte pl s k
+k = add k 1
+if eq c 84
+put mk 0 or get mk 0 BRALO
+put mk 1 or get mk 1 BRAHI
+continue
+end
+f = fld c
+if ne f 0
+if eq and shr f 16 1 1
+put mk 1 or get mk 1 fmsk f
+else
+put mk 0 or get mk 0 fmsk f
+end
+end
+end
+end
+
+
+note bignums for the float text: 16 limbs of 32 bits, limb 0 lowest
+fn bset a edit ulong 16 v ulong to void
+for i ulong 16
+put a i 0
+end
+put a 0 and v M32
+put a 1 shr v 32
+end
+
+fn bmul a edit ulong 16 m ulong to void
+c = ulong 0
+for i ulong 16
+t = add mul get a i m c
+put a i and t M32
+c = shr t 32
+end
+end
+
+fn bmuln a edit ulong 16 m ulong k ulong to void
+for i ulong k
+bmul a m
+end
+end
+
+note a = a / 10; gives the remainder
+fn bdiv10 a edit ulong 16 to ulong
+r = ulong 0
+for j ulong 16
+i = sub 15 j
+t = or shl r 32 get a i
+put a i div t 10
+r = rem t 10
+end
+ret r
+end
+
+fn bzero a edit ulong 16 to ulong
+for i ulong 16
+if ne get a i 0
+ret 0
+end
+end
+ret 1
+end
+
+note 0 when a < b, 1 when equal, 2 when a > b
+fn bcmp a edit ulong 16 b edit ulong 16 to ulong
+for j ulong 16
+i = sub 15 j
+x = get a i
+y = get b i
+if lt x y
+ret 0
+end
+if gt x y
+ret 2
+end
+end
+ret 1
+end
+
+note the decimal digits of a, least significant first; gives their count (a becomes 0)
+fn bdig a edit ulong 16 dg edit uchar 128 to ulong
+n = ulong 0
+while eq bzero a 0 bound 128
+put dg n uchar bdiv10 a
+n = add n 1
+end
+ret n
+end
+
+fn pw10 k ulong to ulong
+r = ulong 1
+for i ulong k
+r = mul r 10
+end
+ret r
+end
+
+note digit k from the top of the nd digits (0 past the end)
+fn dtop dg edit uchar 128 nd ulong k ulong to ulong
+if ge k nd
+ret 0
+end
+ret ulong get dg sub sub nd 1 k
+end
+
+note the first n digits, rounded to nearest with ties to even (glibc printf); 10^n after a carry
+fn rnd dg edit uchar 128 nd ulong n ulong to ulong
+r = ulong 0
+for k ulong n
+r = add mul r 10 dtop dg nd k
+end
+if le nd n
+ret r
+end
+f = dtop dg nd n
+st = gt f 5
+if eq f 5
+z = ulong 0
+for j ulong sub nd add n 1
+if ne dtop dg nd add add n 1 j 0
+z = ulong 1
+end
+end
+if eq z 1
+st = true
+else
+st = eq and r 1 1
+end
+end
+if st
+r = add r 1
+end
+ret r
+end
+
+note 4 r 10^t against l 2^e, the midpoint l 2^(e - 2) of a float: 0 below, 1 equal, 2 above
+fn mcmp x edit ulong 16 y edit ulong 16 r ulong t long l ulong e long to ulong
+bset x mul r 4
+bset y l
+if ge t 0
+bmuln x 5 ulong t
+else
+bmuln y 5 ulong neg t
+end
+d = sub t e
+if ge d 0
+bmuln x 2 ulong d
+else
+bmuln y 2 ulong neg d
+end
+ret bcmp x y
+end
+
+note inside the rounding interval: above the low midpoint and below the high one, either one included when m is even
+fn inside lc ulong hc ulong ev bool to ulong
+lo = or eq lc 2 and ev eq lc 1
+hi = or eq hc 0 and ev eq hc 1
+if and lo hi
+ret 1
+end
+ret 0
+end
+
+note does r 10^t read back (sscanf, round to nearest even) as the float m 2^e? 1 yes, 0 no
+fn rtok x edit ulong 16 y edit ulong 16 r ulong t long m ulong e long to ulong
+ev = eq and m 1 0
+hc = mcmp x y r t add mul m 4 2 e
+lw = sub mul m 4 2
+if and eq m T23 gt e -149
+lw = sub mul m 4 1
+end
+lc = mcmp x y r t lw e
+ret inside lc hc ev
+end
+
+note digit i from the top of the n-digit number r
+fn rdig r ulong n ulong i ulong to ulong
+ret rem div r pw10 sub sub n 1 i 10
+end
+
+note how many of r's n digits remain once trailing zeros go (at least 1)
+fn sig r ulong n ulong to ulong
+s = n
+while and gt s 1 eq rdig r n sub s 1 0 bound 20
+s = sub s 1
+end
+ret s
+end
+
+note %.*g of the n-digit r times 10^(x - n + 1), x the decimal exponent of its first digit
+fn pgfmt o edit uchar ON q ulong r ulong n ulong x long to ulong
+s = sig r n
+p = q
+if or lt x -4 ge x long n
+p = och o p add 48 rdig r n 0
+if gt s 1
+p = och o p 46
+for i ulong sub s 1
+p = och o p add 48 rdig r n add i 1
+end
+end
+p = och o p 101
+ax = x
+if lt x 0
+p = och o p 45
+ax = neg x
+else
+p = och o p 43
+end
+if lt ax 10
+p = och o p 48
+end
+ret pdec o p ulong ax
+end
+if lt x 0
+p = och o p 48
+p = och o p 46
+for j ulong sub ulong neg x 1
+p = och o p 48
+end
+for k ulong s
+p = och o p add 48 rdig r n k
+end
+ret p
+end
+ix = add ulong x 1
+for i2 ulong ix
+p = och o p add 48 rdig r n i2
+end
+if gt s ix
+p = och o p 46
+for j2 ulong sub s ix
+p = och o p add 48 rdig r n add ix j2
+end
+end
+ret p
+end
+
+note sv: 0 digit count, 1 m, 2 e + 1000, 3 decimal exponent of the first digit + 1000,
+note 4 the exponent of the rounded value + 1000, 5 the rounded value
+note precision n: round, then test the read back; 1 when it reads back exactly
+fn ftry a edit ulong 16 b edit ulong 16 dg edit uchar 128 sv edit ulong 8 n ulong to ulong
+r = rnd dg get sv 0 n
+x = sub long get sv 3 1000
+if eq r pw10 n
+r = div r 10
+x = add x 1
+end
+put sv 4 ulong add x 1000
+put sv 5 r
+t = add sub x long n 1
+ret rtok a b r t get sv 1 sub long get sv 2 1000
+end
+
+note the shortest precision 1.. that reads back exactly; float32 always reads back at 9 digits
+fn fsrch a edit ulong 16 b edit ulong 16 dg edit uchar 128 sv edit ulong 8 to ulong
+for i ulong 9
+n = add i 1
+if eq ftry a b dg sv n 1
+ret n
+end
+end
+note omega-bridge bc11b30b does not lower trap; 9 digits always read back for binary32, and sv holds the 9-digit value here
+ret 9
+end
+
+note the exact decimal digits of a finite nonzero float into dg and sv; sv 1 = 0 for a zero
+fn fdig a edit ulong 16 dg edit uchar 128 sv edit ulong 8 u ulong to void
+e8 = and shr u 23 255
+m = and u FRAC
+e = long -149
+if ne e8 0
+m = or m T23
+e = sub long e8 150
+end
+put sv 1 m
+if eq m 0
+ret
+end
+bset a m
+off = long 0
+if ge e 0
+bmuln a 2 ulong e
+else
+bmuln a 5 ulong neg e
+off = e
+end
+put sv 0 bdig a dg
+put sv 2 ulong add e 1000
+put sv 3 ulong add add sub long get sv 0 1 off 1000
+end
+
+note a finite float m 2^e: its exact decimal digits, the search, then the text
+fn fdec o edit uchar ON q ulong a edit ulong 16 b edit ulong 16 dg edit uchar 128 u ulong to ulong
+sv = new ulong 8 0
+fdig a dg sv u
+if eq get sv 1 0
+ret och o q 48
+end
+n = fsrch a b dg sv
+ret pgfmt o q get sv 5 n sub long get sv 4 1000
+end
+
+note %f: the C's fimm, INF and QNAN by name with a sign, else the shortest %.*g that reads back
+fn fimm o edit uchar ON p ulong pl view ulong PW u ulong to ulong
+a = new ulong 16 0
+b = new ulong 16 0
+dg = new uchar 128 0
+q = p
+if eq and u EXPALL EXPALL
+if ne shr u 31 0
+q = och o q 45
+else
+q = och o q 43
+end
+if ne and u FRAC 0
+ret ps o q pl S_QNAN
+end
+ret ps o q pl S_INF
+end
+if ne shr u 31 0
+q = och o q 45
+end
+ret fdec o q a b dg u
+end
+
+note c[0x%x][0x%x]: bank lo 54..58, offset from lo at to 53
+fn pcb o edit uchar ON p ulong pl view ulong PW lo ulong at ulong to ulong
+q = ps o p pl S_C0X
+q = phex o q bits lo 54 5
+q = ps o q pl S_B0X
+q = phex o q bits lo at sub 54 at
+ret och o q 93
+end
+
+note the SR table of the C file
+fn psr o edit uchar ON p ulong pl view ulong PW v ulong to ulong
+if and ge v 33 le v 35
+ret ps o p pl add S_SR sub v 33
+end
+if and ge v 37 le v 39
+ret ps o p pl add S_SR sub v 34
+end
+if eq v 0
+ret ps o p pl add S_SR 6
+end
+if eq v 80
+ret ps o p pl add S_SR 7
+end
+if eq v 81
+ret ps o p pl add S_SR 8
+end
+q = ps o p pl S_SRN
+ret pdec o q v
+end
+
+note BRA: 4-byte units, lo 16..23, lo 34..63 and hi 0..17, 56-bit signed; pc + 16 + 4 units
+fn pbra o edit uchar ON p ulong w view ulong 4 to ulong
+lo = get w 0
+u = or or bits lo 16 8 shl bits lo 34 30 8 shl bits get w 1 0 18 38
+if ne and u T55 0
+u = or u HI56
+end
+ret p0x o p add add get w 2 16 mul u 4
+end
+
+note %o: signed 24 bits, printed only when not zero, as + and hex_s
+fn poff o edit uchar ON p ulong v ulong to ulong
+if eq v 0
+ret p
+end
+s = v
+if ge v T23
+s = or v HI24
+end
+q = och o p 43
+ret phexs o q s
+end
+
+note the operand codes with a register, number or predicate
+fn rnum o edit uchar ON p ulong w view ulong 4 c ulong v ulong to ulong
+if or or eq c 100 eq c 97 or eq c 98 eq c 99
+ret preg o p 0 v
+end
+if or or eq c 68 eq c 65 or eq c 66 eq c 67
+ret preg o p 1 v
+end
+if or or eq c 105 eq c 108 or eq c 104 eq c 109
+ret p0x o p v
+end
+if or eq c 115 eq c 106
+ret phexs o p sx32 v
+end
+if eq c 111
+ret poff o p v
+end
+if eq c 89
+ret p0x o p add add get w 2 16 sx32 v
+end
+if eq c 121
+q = och o p 66
+ret pdec o q v
+end
+if or eq c 80 eq c 81
+ret ppred o p v 0
+end
+if eq c 82
+ret ppred o p and v 7 and shr v 3 1
+end
+if eq c 84
+ret pbra o p w
+end
+note no row format names another field code; omega-bridge bc11b30b does not lower trap, so an unknown code writes nothing
+ret p
+end
+
+note one operand code; an unknown code traps 9 (the C's ok = 0: the shell reports -2)
+fn rcode o edit uchar ON p ulong pl view ulong PW w view ulong 4 c ulong to ulong
+v = fval c get w 0 get w 1
+if eq c 102
+ret fimm o p pl v
+end
+if eq c 75
+ret pcb o p pl get w 0 38
+end
+if eq c 85
+ret pcb o p pl get w 0 37
+end
+if eq c 83
+ret psr o p pl v
+end
+if eq c 71
+ret ps o p pl add S_ICMP v
+end
+if eq c 103
+ret ps o p pl add S_FCMP v
+end
+if eq c 122
+ret ps o p pl add S_MSIZE v
+end
+if eq c 90
+if eq v 0
+ret ps o p pl S_U32
+end
+ret p
+end
+if or eq c 78 eq c 77
+if ne v 0
+ret och o p 45
+end
+ret p
+end
+ret rnum o p w c v
+end
+
+note render: row s's format for the word w
+fn rend o edit uchar ON p ulong pl view ulong PW w view ulong 4 s ulong to ulong
+q = p
+k = ulong 0
+while lt k 64 bound 64
+b = pbyte pl s k
+if eq b 0
+break
+end
+if ne b 37
+q = och o q b
+k = add k 1
+continue
+end
+q = rcode o q pl w pbyte pl s add k 1
+k = add k 2
+end
+ret q
+end
+
+fn ctz v ulong to ulong
+n = ulong 0
+while eq and shr v n 1 0 bound 32
+n = add n 1
+end
+ret n
+end
+
+note the IMAD name of an immediate multiply: nvdisasm names the special cases (C imad_imm)
+fn imadnm imm ulong c ulong to ulong
+if eq imm 0
+ret add S_IMAD 1
+end
+if eq imm 1
+if eq c 255
+ret add S_IMAD 1
+end
+ret add S_IMAD 2
+end
+if and eq c 255 eq and imm sub imm 1 0
+n = ctz imm
+if or eq n 16 eq n 31
+ret S_IMAD
+end
+ret add S_IMAD 3
+end
+ret S_IMAD
+end
+
+note IMAD with an immediate; gives p when the word is another instruction
+fn imad o edit uchar ON p ulong pl view ulong PW lob ulong hib ulong to ulong
+if or ne and lob 4095 IMADLO ne and hib not ulong 255 IMADHI
+ret p
+end
+imm = bits lob 32 32
+c = and hib 255
+q = ps o p pl imadnm imm c
+q = och o q 32
+q = preg o q 0 bits lob 16 8
+q = och o q 44
+q = och o q 32
+q = preg o q 0 bits lob 24 8
+q = och o q 44
+q = och o q 32
+q = phexs o q sx32 imm
+q = och o q 44
+q = och o q 32
+ret preg o q 0 c
+end
+
+note every bit a row's format does not read (mk), outside the guard, equals the row's fixed value
+fn rowok lob ulong hib ulong lov ulong hiv ulong mk edit ulong 2 to ulong
+lom = not or get mk 0 GUARD
+him = and HIMASK not get mk 1
+if and eq and lob lom and lov lom eq and hib him and hiv him
+ret 1
+end
+ret 0
+end
+
+note the first row whose opcode and fixed bits match, or NROWS
+fn mrow rl view ulong RW pl view ulong PW lob ulong hib ulong to ulong
+mk = new ulong 2 0
+for i ulong NROWS
+lov = get rl mul 2 i
+if ne and lob 4095 and lov 4095
+continue
+end
+fmk pl i mk
+if eq rowok lob hib lov get rl add mul 2 i 1 mk 1
+ret i
+end
+end
+ret NROWS
+end
+
+note ?? 0x%016llx%016llx, hi then lo
+fn unk o edit uchar ON pl view ulong PW w view ulong 4 to ulong
+q = ps o 0 pl S_UNK
+q = phex16 o q get w 1
+q = phex16 o q get w 0
+ret add q KUNK
+end
+
+note the guard: @, the predicate and a space unless it is PT without negation
+fn guard o edit uchar ON lo ulong to ulong
+g = bits lo 12 3
+gn = bits lo 15 1
+if and eq g 7 eq gn 0
+ret 0
+end
+q = och o 0 64
+q = ppred o q g gn
+ret och o q 32
+end
+
+note the row formats and the other names (Wolfram ToCharacterCode, 8 bytes per word, little-endian)
+fn pinit pl edit ulong PW to void
+put pl 0 2318338018808057677
+put pl 1 26917
+put pl 8 2318338018808057677
+put pl 9 25125
+put pl 16 2318338018808057677
+put pl 17 25125
+put pl 24 2318338018807788115
+put pl 25 21285
+put pl 32 2318338018806809676
+put pl 33 19237
+put pl 40 2675195585967113292
+put pl 41 322745412708
+put pl 48 3189715256884806732
+put pl 49 5580064
+put pl 56 2320539280629515340
+put pl 57 93617941922853
+put pl 64 3198722455854206281
+put pl 65 3198159505500218656
+put pl 66 6497568
+put pl 72 3198722455854206281
+put pl 73 3189152306245477664
+put pl 74 6497568
+put pl 80 4920559924104219977
+put pl 81 7216209377912761925
+put pl 82 7576497323101200428
+put pl 83 1663377452
+put pl 88 3335276362595388745
+put pl 89 2318338018805691221
+put pl 90 2318335819782054181
+put pl 91 25381
+put pl 96 7216209382491832649
+put pl 97 6075391272087986220
+put pl 98 2318334721041702956
+put pl 99 7144151758890421541
+put pl 104 7216209382491832649
+put pl 105 6075391272087986220
+put pl 106 2318334721041702956
+put pl 107 109011104723749
+put pl 112 6076847033519460172
+put pl 113 3197878030523704608
+put pl 114 3198440980476994848
+put pl 115 23121768204739872
+put pl 120 6076847033519460172
+put pl 121 3197878030523704608
+put pl 122 3198440980477453600
+put pl 123 23121768204739872
+put pl 128 3698913599453284435
+put pl 129 3198722455938543154
+put pl 130 3200129830337193248
+put pl 131 6497568
+put pl 136 3698913599453284435
+put pl 137 3198722455938543154
+put pl 138 3198159505500218656
+put pl 139 6497568
+put pl 144 3698913573683480659
+put pl 145 7000036570848108594
+put pl 146 7144151758890410028
+put pl 152 3698913573683480659
+put pl 153 7000036570848108594
+put pl 154 7144151759007850540
+put pl 160 5126554673377268553
+put pl 161 2675213281549769253
+put pl 162 2675186905684913232
+put pl 163 2675186978699357281
+put pl 164 82
+put pl 168 5126554673377268553
+put pl 169 2675213281549769253
+put pl 170 2675186905684913232
+put pl 171 2675187013059095649
+put pl 172 82
+put pl 176 5126554673377268553
+put pl 177 2675213281549769253
+put pl 178 2675186905684913232
+put pl 179 2675186841260403809
+put pl 180 82
+put pl 184 2318338018807399763
+put pl 185 2318335819782054181
+put pl 186 21029
+put pl 192 2318338018807399763
+put pl 193 2318343516363448613
+put pl 194 21029
+put pl 200 3198722455854399814
+put pl 201 27625367831389472
+put pl 208 3198722455854399814
+put pl 209 7072108406061999392
+put pl 216 3198722455989734726
+put pl 217 27625367831389472
+put pl 224 3198722455804659270
+put pl 225 3198159505500218656
+put pl 226 6497568
+put pl 232 7216209541557275974
+put pl 233 7072094164835704876
+put pl 234 1378164780
+put pl 240 7432397682590962502
+put pl 241 3193092956320842030
+put pl 242 3197878030522459424
+put pl 243 23121768204084512
+put pl 248 3617312090437857865
+put pl 249 3198722455551300910
+put pl 250 6432032
+put pl 256 3617312090437857865
+put pl 257 3198722455551300398
+put pl 258 6432032
+put pl 264 3328779515522003526
+put pl 265 6074843813981278804
+put pl 266 7072094164886036570
+put pl 272 6071225231052517958
+put pl 273 4984998065855154502
+put pl 274 3328779451096059188
+put pl 275 6864120659606454608
+put pl 276 2324806583807264077
+put pl 277 2318334720270427173
+put pl 278 109011104719397
+put pl 280 3550598122910921286
+put pl 281 4706312403745648182
+put pl 282 7216209446867782467
+put pl 283 7072094164835704876
+put pl 288 4050478989600181576
+put pl 289 4768804251234088497
+put pl 290 2318338018805952838
+put pl 291 2318335819782054181
+put pl 292 25381
+put pl 296 4050478989600181576
+put pl 297 2675193374460229169
+put pl 298 2675186974404389988
+put pl 299 425824627810
+put pl 304 4050478989600181585
+put pl 305 4984977033347871283
+put pl 306 3696668340873547060
+put pl 307 3197878030523704608
+put pl 308 27906842808165664
+put pl 312 3627725565148419405
+put pl 313 27625367831586080
+put pl 320 5783556705426494797
+put pl 321 27625367831586080
+put pl 328 5860117899091793229
+put pl 329 27625367831586080
+put pl 336 3622948187125732685
+put pl 337 27625367831586080
+put pl 344 2340223935431787596
+put pl 345 7166182912787506213
+put pl 346 3341993472822486363
+put pl 347 401296667702
+put pl 352 2340223935431791699
+put pl 353 6720256143407670628
+put pl 354 8008864919659291995
+put pl 355 421529660509
+put pl 360 6076251196916974668
+put pl 361 6005923036305182546
+put pl 362 8315162376355980576
+put pl 363 7000101651917134691
+put pl 364 102731946931758
+put pl 368 5570159188791215180
+put pl 369 2675231981938036553
+put pl 370 6585233959454518372
+put pl 371 3904164740051321381
+put pl 372 1567565108
+put pl 376 6076251196916978771
+put pl 377 6005923036305182546
+put pl 378 4838373857375380512
+put pl 379 2680827251018521437
+put pl 380 107911593090415
+put pl 384 3334121982912320577
+put pl 385 5715723593321825345
+put pl 386 5773706365401712462
+put pl 387 7214815411678751828
+put pl 388 6583492058011628389
+put pl 389 2318330387017654565
+put pl 390 25125
+put pl 392 2318338018807858252
+put pl 393 26249900243101019
+put pl 400 3125820689686418515
+put pl 401 27625367831135013
+put pl 408 7216209686915400780
+put pl 409 6732641067110965292
+put pl 416 4696781901632718157
+put pl 417 91643112737868
+put pl 424 6291322170098731091
+put pl 425 7216209352696275022
+put pl 426 7504439729063272492
+put pl 427 1831149612
+put pl 432 5496153161867872339
+put pl 433 7216209352696275033
+put pl 434 7504439729063272492
+put pl 435 1831149612
+put pl 440 5263182
+put pl 448 1414092869
+put pl 456 92518431674946
+put pl 464 4847370932954813250
+put pl 465 5639992527027588687
+put pl 466 6423575818897006676
+put pl 472 4995105803319464770
+put pl 473 4992049169717677891
+put pl 474 520313918542
+put pl 480 4849912062518903106
+put pl 481 4782631786775921710
+put pl 482 2325913809262432076
+put pl 483 3176496
+put pl 488 3694691337732637000
+put pl 489 5921424460092874802
+put pl 490 3479081711208246362
+put pl 491 3164255
+put pl 496 3329903151980884550
+put pl 497 2318338018805691206
+put pl 498 25125
+put pl 512 6354091206005183059
+put pl 520 6426148800043110995
+put pl 528 6498206394081038931
+put pl 536 4920535898042356307
+put pl 537 22574
+put pl 544 4920535898042356307
+put pl 545 22830
+put pl 552 4920535898042356307
+put pl 553 23086
+put pl 560 5279712180522930771
+put pl 561 68
+put pl 568 5423265565250638419
+put pl 569 20300
+put pl 576 5423265565250638419
+put pl 577 18760
+put pl 584 70
+put pl 592 21580
+put pl 600 20805
+put pl 608 17740
+put pl 616 21575
+put pl 624 17742
+put pl 632 17735
+put pl 640 84
+put pl 648 70
+put pl 656 21580
+put pl 664 20805
+put pl 672 17740
+put pl 680 21575
+put pl 688 17742
+put pl 696 17735
+put pl 704 5068110
+put pl 712 5128526
+put pl 720 5592140
+put pl 728 5591365
+put pl 736 5588300
+put pl 744 5592135
+put pl 752 5588302
+put pl 760 5588295
+put pl 768 84
+put pl 776 3691822
+put pl 784 3691310
+put pl 792 909202734
+put pl 800 909202222
+put pl 816 3421742
+put pl 824 942813486
+put pl 832 61788224640302
+put pl 840 1145130313
+put pl 848 6219274471530909001
+put pl 856 4918292731127745865
+put pl 857 68
+put pl 864 5496734803384421705
+put pl 872 1312902737
+put pl 880 4607561
+put pl 888 516203495231
+put pl 896 2016435043
+put pl 904 2016435037
+put pl 912 842224942
+put pl 920 21075
+end
+
+note lov and hiv of each row (Wolfram FromDigits of the C file's hex)
+fn rinit rl edit ulong RW to void
+put rl 0 30722
+put rl 1 3840
+put rl 2 4278219266
+put rl 3 3840
+put rl 4 29186
+put rl 5 3840
+put rl 6 31001
+put rl 7 0
+put rl 8 4278221698
+put rl 9 2048
+put rl 10 4278221698
+put rl 11 2560
+put rl 12 4278220716
+put rl 13 134219776
+put rl 14 4278220716
+put rl 15 134220288
+put rl 16 29220
+put rl 17 126747136
+put rl 18 31780
+put rl 19 260964864
+put rl 20 30757
+put rl 21 126746624
+put rl 22 29223
+put rl 23 126746624
+put rl 24 29200
+put rl 25 134209536
+put rl 26 30736
+put rl 27 134209536
+put rl 28 29202
+put rl 29 917504
+put rl 30 30738
+put rl 31 917504
+put rl 32 30745
+put rl 33 71168
+put rl 34 29209
+put rl 35 71168
+put rl 36 29209
+put rl 37 1536
+put rl 38 30745
+put rl 39 1536
+put rl 40 29196
+put rl 41 112
+put rl 42 30732
+put rl 43 112
+put rl 44 31756
+put rl 45 134217840
+put rl 46 29191
+put rl 47 0
+put rl 48 30727
+put rl 49 0
+put rl 50 29217
+put rl 51 0
+put rl 52 9223372036854805025
+put rl 53 0
+put rl 54 29216
+put rl 55 4194304
+put rl 56 29219
+put rl 57 0
+put rl 58 29193
+put rl 59 0
+put rl 60 29195
+put rl 61 0
+put rl 62 29253
+put rl 63 2101248
+put rl 64 29253
+put rl 65 2102272
+put rl 66 29445
+put rl 67 2158592
+put rl 68 29246
+put rl 69 75526144
+put rl 70 29246
+put rl 71 4351
+put rl 72 29244
+put rl 73 268288
+put rl 74 29244
+put rl 75 6144
+put rl 76 29306
+put rl 77 11264
+put rl 78 29448
+put rl 79 2048
+put rl 80 29448
+put rl 81 4096
+put rl 82 29448
+put rl 83 5120
+put rl 84 29448
+put rl 85 3072
+put rl 86 31105
+put rl 87 203297024
+put rl 88 31110
+put rl 89 202379520
+put rl 90 31105
+put rl 91 203380992
+put rl 92 31105
+put rl 93 203364608
+put rl 94 31110
+put rl 95 202463488
+put rl 96 9223372036854806952
+put rl 97 136270080
+put rl 98 31108
+put rl 99 134219776
+put rl 100 31112
+put rl 101 134219776
+put rl 102 31108
+put rl 103 0
+put rl 104 31122
+put rl 105 45056
+put rl 106 576460752303456137
+put rl 107 917504
+put rl 108 864691128455167881
+put rl 109 917504
+put rl 110 31000
+put rl 111 0
+put rl 112 31053
+put rl 113 58720256
+put rl 114 31047
+put rl 115 58720256
+put rl 116 31045
+put rl 117 58720768
+put rl 118 31041
+put rl 119 58720768
+put rl 120 31517
+put rl 121 65536
+put rl 122 2305843013491913264
+put rl 123 16640
+put rl 124 29444
+put rl 125 2099200
+end
+
+note the entry, last in the unit: w is lo, hi, pc, 0; o gets the text without a NUL;
+note the result is the text length, plus KUNK when no row matched
+fn sm121_dis w view ulong 4 o edit uchar ON to ulong
+note omega-bridge bc11b30b takes only a literal new length: 1024 is PW, 126 is RW
+pl = new ulong 1024 0
+rl = new ulong 126 0
+pinit pl
+rinit rl
+p = guard o get w 0
+lob = and get w 0 not GUARD
+hib = and get w 1 HIMASK
+q = imad o p pl lob hib
+if gt q p
+ret q
+end
+i = mrow rl pl lob hib
+if lt i NROWS
+ret rend o p pl w i
+end
+ret unk o pl w
+end
+
