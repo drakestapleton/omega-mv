@@ -2,7 +2,9 @@
 # L524 bounded host qualification; no GPU/service/window changes.
 set -eu
 cd "$(dirname "$0")/../.."
-E=evidence/SEED-0/ir-trap
+# Results: build/seed/ir-trap/evidence/. The recorded receipt evidence/SEED-0/ir-trap/ is only read: the results
+# are compared with it at the end (seed/check/receipt.sh), never written over it.
+E=build/seed/ir-trap/evidence; REC=evidence/SEED-0/ir-trap
 mkdir -p "$E" build/seed/ir-trap
 run() {
   name=$1; shift
@@ -35,4 +37,5 @@ cmp seed/out/omc build/seed/ir-trap/stage3
 readelf -h seed/out/omc > "$E/elf-header.txt"
 readelf -d seed/out/omc > "$E/elf-dynamic.txt"
 sha256sum seed/rung0/seed0.hex seed/rung0/seed0.bin seed/rung4/om4.bin seed/omc/omc.om seed/out/omc > "$E/lineage.sha256"
+sh seed/check/receipt.sh "$E" "$REC" || true
 printf 'QUALIFIED host trap repair; whole R6 remains experimental; full Gate5 section7 timing NOT_RUN\nRC=0\n'

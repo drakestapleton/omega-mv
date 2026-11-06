@@ -17,7 +17,7 @@ Porting Omega means answering two questions that are easy to mix up:
 2. **Operating system and driver.** Does this file need Linux, the NVIDIA open driver, or a C library?
 
 The table `docs/runtime/portability_table.tsv` answers both, one row per `src/omega_gpu_*`, `src/omega_blackwell_*` and
-`src/omega_bw_*` file (128 rows):
+`src/omega_bw_*` file (132 rows):
 
 | Column | Values | Meaning |
 |---|---|---|
@@ -28,8 +28,10 @@ The table `docs/runtime/portability_table.tsv` answers both, one row per `src/om
 Totals over the source tree based on omega-mv main 62d1d0d6 (the 102 rows reviewed on a8ffd2b9 plus 21 rows for the
 files that landed on main after it), plus 5 rows added when the trains joined this table with later work
 (`src/omega_bw_hazard.{c,h}`, omega-mv#554, landed by train r1 #971; `src/omega_gpu_fp8_slots.{c,h}` and
-`src/omega_gpu_fp8_internal.h`, #961, in train r2): 118 files are `CHIP_SPECIFIC` and 10 are `PORTABLE`. By
-`os_binding`: 13 `FREESTANDING_PROVEN`, 95 `NO_HOSTED_INCLUDE`, 17 `HOSTED_LIBC`, 3 `LINUX_DRIVER`. The small `PORTABLE`
+`src/omega_gpu_fp8_internal.h`, #961, in train r2), plus 4 rows for the trainer's bf16 GEMM
+(`src/omega_blackwell_codegen_tgemm.{c,h}` and `src/omega_gpu_tgemm_api.{c,h}`, landed by train r5 #996 without rows,
+omega-mv#596): 122 files are `CHIP_SPECIFIC` and 10 are `PORTABLE`. By `os_binding`: 13 `FREESTANDING_PROVEN`, 99
+`NO_HOSTED_INCLUDE`, 17 `HOSTED_LIBC`, 3 `LINUX_DRIVER`. The small `PORTABLE`
 count is the honest result: almost everything in `src/omega_gpu_*` launches a Blackwell kernel. Command to recount:
 section 7.
 
