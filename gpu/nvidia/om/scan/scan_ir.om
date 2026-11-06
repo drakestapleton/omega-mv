@@ -1,0 +1,679 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note scan_ir.om: the CUDA++ scan and radix-sort kernels (row C3 of docs/OMEGA.md) for the GB10 (sm_121), emitted as
+note BlackwellIR records. Kinds 0..4 reproduce the C generator gen() of src/omega_gpu_scan.c record for record
+note (the C stays as the migration-pending differential oracle, CUDAPP_MIGRATION_PENDING_C_SCAN):
+note kind 0/1/2 one reduction level (sum/max/min, f32), 3 one f32 tile-scan level, 4 the f32 carry pass,
+note 5 one u32 tile-scan level, 6 the u32 carry pass, 7 radix-sort digit histogram, 8 radix-sort scatter of keys,
+note 9 radix-sort scatter of key-value pairs (values in the second half of the buffer).
+note Arguments at constant bank 0x380: in u64, out u64, tot u64, len, tiles, warps, shift (kinds 7..9).
+note Record (8 ulong): op, dst, src1, src2, src3 (vreg or 2^64-1 for none), ureg, imm | control << 32,
+note uniform | p0 << 1. Control words follow src/omega_bw_em.h (emit kinds, region, tail; no pair schedule).
+note Meta: 0 records, 1 vregs, 2 uvregs, 3 pending wait mask, 4 error, 5 closed loops, 6 open loops,
+note 8..11 open loop starts, 16 + 2L / 17 + 2L closed loop L start / end, 64 + v vreg kind, 320 + u uvreg kind.
+note Mutants (red checks, argument a): 1 the reduction skips d = 1, 2 the tile scans skip d = 16, 3 the carry adds
+note S[tile] instead of S[tile - 1], 4 the scatter rank counts the element itself, 5 the scatter ranks in lane
+note order instead of position order (unstable), 6 the histogram scan skips d = 16.
+
+const NONE ulong 65535
+const ALL ulong 18446744073709551615
+const LO32 ulong 4294967295
+const YIELD ulong 8192
+const NOPC ulong 1032192
+const PADSUM ulong 2147483648
+const PADMM ulong 2143289344
+const KFIX ulong 0
+const KPRED ulong 1
+const KVAR ulong 2
+const KVARM ulong 3
+const KUVAR ulong 4
+const KSTORE ulong 5
+const KEXIT ulong 6
+const KBRA ulong 7
+const KBSSY ulong 8
+const KBSYNC ulong 9
+const KRAW ulong 10
+const MOVRZ ulong 1
+const MOVI ulong 2
+const S2R ulong 3
+const LDC ulong 4
+const LDC64 ulong 5
+const LDCU64 ulong 7
+const IMAD ulong 8
+const IMADW ulong 9
+const LDG ulong 11
+const STG ulong 12
+const IADD3 ulong 14
+const SHFR ulong 17
+const LAND ulong 18
+const ISGEU ulong 28
+const FADD ulong 30
+const FMIN ulong 36
+const FMAX ulong 37
+const SHFLD ulong 42
+const EXIT ulong 45
+const BRA ulong 46
+const LUT ulong 51
+const SHFLU ulong 52
+const BSSY ulong 54
+const BSYNC ulong 55
+
+note virtual registers, in the allocation order of gen() (uvreg 0 is the global memory descriptor)
+const UD ulong 0
+const PIN ulong 0
+const POUT ulong 1
+const PTOT ulong 2
+const LEN ulong 3
+const TILES ulong 4
+const WARPS ulong 5
+const TID ulong 6
+const CTA ulong 7
+const LANE ulong 8
+const GW ulong 9
+const ONE ulong 10
+const TILE ulong 11
+const EL ulong 12
+const V ulong 13
+const T ulong 14
+const A64 ulong 15
+const B64 ulong 16
+const RL ulong 17
+const NZ ulong 18
+const C31 ulong 19
+const M1 ulong 20
+const OFF ulong 21
+const TM1 ulong 22
+const MASK ulong 23
+note the sort kernels' further registers (after the five masks)
+const SH ulong 28
+const CJ1 ulong 29
+const CJ2 ulong 30
+const C3 ulong 31
+const KEY ulong 32
+const DIG ulong 33
+const D3 ulong 34
+const VAL ulong 35
+const Q ulong 36
+const X ulong 37
+const R0 ulong 38
+const MQ0 ulong 42
+const ACC ulong 46
+const VV ulong 47
+const DST ulong 48
+
+note ---- record building
+
+fn cw st ulong wb ulong rb ulong wt ulong to ulong
+ret or or shl st 9 shl wb 14 or shl rb 17 shl wt 20
+end
+
+fn fld r ulong to ulong
+if eq r NONE
+ret ALL
+end
+ret r
+end
+
+fn r4 d ulong a ulong b ulong c ulong to ulong
+ret or or d shl a 16 or shl b 32 shl c 48
+end
+
+fn okk op ulong k ulong fl ulong ur ulong to ulong
+ret or or op shl k 8 or shl fl 16 shl ur 40
+end
+
+note control word of one record kind (src/omega_bw_em.h emit): returns control | next pending mask << 32
+fn kc k ulong fl ulong pend ulong imm ulong to ulong
+if eq k KPRED
+ret cw 14 7 7 pend
+end
+if eq k KVAR
+ret or or cw 4 0 1 pend YIELD shl ulong 3 32
+end
+if eq k KVARM
+ret or or cw 4 0 1 and pend 2 YIELD shl or pend 3 32
+end
+if eq k KUVAR
+ret or or cw 4 2 7 pend YIELD shl ulong 4 32
+end
+if eq k KSTORE
+ret or or cw 4 7 1 pend YIELD shl ulong 2 32
+end
+if or eq k KEXIT eq k KBRA
+if ne and fl 2 0
+ret or cw 5 7 7 pend shl pend 32
+end
+ret cw 5 7 7 pend
+end
+if eq k KBSSY
+ret or cw 1 7 7 pend YIELD
+end
+if eq k KBSYNC
+ret or cw 5 7 7 pend YIELD
+end
+if eq k KRAW
+ret or shr imm 32 shl pend 32
+end
+ret cw 6 7 7 pend
+end
+
+note one record: ok = op | kind << 8 | flags << 16 | ureg << 40; rg = r4 operands; imm low 32 bits
+note (a raw record carries its control word in imm bits 32..63)
+note record words 0..5 at b: op and the operand fields of rg, ureg from ok
+fn wops ins edit ulong 8192 b ulong ok ulong rg ulong to void
+put ins b and ok 255
+put ins add b 1 fld and rg 65535
+put ins add b 2 fld and shr rg 16 65535
+put ins add b 3 fld and shr rg 32 65535
+put ins add b 4 fld shr rg 48
+put ins add b 5 fld and shr ok 40 65535
+end
+
+fn emit ins edit ulong 8192 m edit ulong 512 ok ulong rg ulong imm ulong to void
+n = get m 0
+if ge n 1024
+put m 4 1
+ret
+end
+x = and shr ok 8 255
+if gt x KRAW
+put m 4 2
+ret
+end
+x = kc x and shr ok 16 255 get m 3 imm
+put m 0 add n 1
+n = mul n 8
+wops ins n ok rg
+put ins add n 6 or and imm LO32 shl and x LO32 32
+put ins add n 7 and shr ok 16 7
+put m 3 shr x 32
+end
+
+fn nv m edit ulong 512 kind ulong to void
+v = get m 1
+if ge v 256
+put m 4 3
+ret
+end
+put m add 64 v kind
+put m 1 add v 1
+end
+
+note ---- instruction helpers (the names of src/omega_bw_em.h)
+
+fn fix ins edit ulong 8192 m edit ulong 512 op ulong rg ulong imm ulong to void
+emit ins m okk op KFIX 0 NONE rg imm
+end
+
+fn movi ins edit ulong 8192 m edit ulong 512 d ulong imm ulong to void
+fix ins m MOVI r4 d NONE NONE NONE imm
+end
+
+fn movrz ins edit ulong 8192 m edit ulong 512 d ulong to void
+fix ins m MOVRZ r4 d NONE NONE NONE 0
+end
+
+note d = a * imm + c
+fn imadi ins edit ulong 8192 m edit ulong 512 d ulong a ulong imm ulong c ulong to void
+fix ins m IMAD r4 d a NONE c imm
+end
+
+note d = a * b + c
+fn imadr ins edit ulong 8192 m edit ulong 512 d ulong a ulong b ulong c ulong to void
+fix ins m IMAD r4 d a b c 0
+end
+
+note d:d+1 = a * imm + c:c+1
+fn imadw ins edit ulong 8192 m edit ulong 512 d ulong a ulong imm ulong c ulong to void
+fix ins m IMADW r4 d a NONE c imm
+end
+
+fn shri ins edit ulong 8192 m edit ulong 512 d ulong a ulong imm ulong to void
+fix ins m SHFR r4 d a NONE NONE imm
+end
+
+fn andi ins edit ulong 8192 m edit ulong 512 d ulong a ulong imm ulong to void
+fix ins m LAND r4 d a NONE NONE imm
+end
+
+note d = a << b (b a register below 32)
+fn shlr ins edit ulong 8192 m edit ulong 512 d ulong a ulong b ulong to void
+fix ins m SHFLU r4 d a b NONE 0
+end
+
+note LOP3(a, b, c, lut) with a = 0xF0, b = 0xCC, c = 0xAA; rg = r4 d a b c (a function takes at most 6 parameters)
+fn lop3 ins edit ulong 8192 m edit ulong 512 rg ulong f ulong to void
+fix ins m LUT rg f
+end
+
+note d = a op b for the fixed two-operand ops (IADD3, FADD, FMNMX)
+fn two ins edit ulong 8192 m edit ulong 512 op ulong d ulong a ulong b ulong to void
+fix ins m op r4 d a b NONE 0
+end
+
+note the variable-latency reads: op LDC, LDC64, S2R (imm offset or special register)
+fn vimm ins edit ulong 8192 m edit ulong 512 op ulong d ulong imm ulong to void
+emit ins m okk op KVAR 0 NONE r4 d NONE NONE NONE imm
+end
+
+fn ldcu64 ins edit ulong 8192 m edit ulong 512 imm ulong to void
+emit ins m okk LDCU64 KUVAR 1 NONE r4 UD NONE NONE NONE imm
+end
+
+note d = global u32 at a:a+1; first 1 starts a load group, 0 joins it
+fn ldg32 ins edit ulong 8192 m edit ulong 512 d ulong a ulong first ulong to void
+k = KVARM
+if ne first 0
+k = KVAR
+end
+emit ins m okk LDG k 0 UD r4 d a NONE NONE 0
+end
+
+fn stg ins edit ulong 8192 m edit ulong 512 a ulong imm ulong v ulong to void
+emit ins m okk STG KSTORE 0 UD r4 NONE a v NONE imm
+end
+
+fn shfl ins edit ulong 8192 m edit ulong 512 d ulong a ulong off ulong to void
+emit ins m okk SHFLD KVAR 0 NONE r4 d a NONE NONE off
+end
+
+note P0 = a >= b (unsigned)
+fn isetp ins edit ulong 8192 m edit ulong 512 a ulong b ulong to void
+emit ins m okk ISGEU KPRED 0 NONE r4 NONE a b NONE 0
+end
+
+note ---- branches, regions and loops
+
+note @P0 BRA forward; returns its record index for patch
+fn bfwd ins edit ulong 8192 m edit ulong 512 to ulong
+at = get m 0
+emit ins m okk BRA KBRA 2 NONE r4 NONE NONE NONE NONE 1
+ret at
+end
+
+fn patch ins edit ulong 8192 at ulong tgt ulong to void
+b = add mul at 8 6
+x = get ins b
+put ins b or and x 18446744069414584320 and sub tgt at LO32
+end
+
+note a region the lanes with P0 set skip (BSSY, @P0 BRA); returns bssy | bra << 16
+fn rbeg ins edit ulong 8192 m edit ulong 512 to ulong
+at = get m 0
+emit ins m okk BSSY KBSSY 0 NONE r4 NONE NONE NONE NONE 2
+b = bfwd ins m
+ret or at shl b 16
+end
+
+fn rend ins edit ulong 8192 m edit ulong 512 r ulong to void
+at = get m 0
+emit ins m okk BSYNC KBSYNC 0 NONE r4 NONE NONE NONE NONE 0
+patch ins shr r 16 at
+patch ins and r 65535 add at 1
+end
+
+fn bra ins edit ulong 8192 m edit ulong 512 top ulong to void
+emit ins m okk BRA KBRA 0 NONE r4 NONE NONE NONE NONE and sub top get m 0 LO32
+end
+
+fn tail ins edit ulong 8192 m edit ulong 512 to void
+emit ins m okk EXIT KEXIT 0 NONE r4 NONE NONE NONE NONE 0
+emit ins m okk BRA KRAW 0 NONE r4 NONE NONE NONE NONE shl NOPC 32
+end
+
+fn lbeg m edit ulong 512 to void
+d = get m 6
+if ge d 4
+put m 4 4
+ret
+end
+put m add 8 d get m 0
+put m 6 add d 1
+end
+
+fn lend m edit ulong 512 to void
+d = get m 6
+nl = get m 5
+if or eq d 0 ge nl 24
+put m 4 5
+ret
+end
+d1 = sub d 1
+put m add 16 mul nl 2 get m add 8 d1
+put m add 17 mul nl 2 sub get m 0 1
+put m 5 add nl 1
+put m 6 d1
+end
+
+note ---- the kernels
+
+fn istile k ulong to bool
+ret or eq k 3 eq k 5
+end
+
+fn issort k ulong to bool
+ret ge k 7
+end
+
+note the registers of gen(), then (sort) SH .. DST
+fn regs m edit ulong 512 k ulong to void
+u = get m 2
+put m add 320 u 2
+put m 2 add u 1
+nv m 2
+nv m 2
+nv m 2
+for i ulong 12
+nv m 1
+end
+nv m 2
+nv m 2
+for i ulong 6
+nv m 1
+end
+if or istile k issort k
+for i ulong 5
+nv m 1
+end
+end
+if issort k
+for i ulong 21
+nv m 1
+end
+end
+end
+
+fn prolog ins edit ulong 8192 m edit ulong 512 k ulong to void
+ldcu64 ins m 856
+vimm ins m LDC64 PIN 896
+if ne k 7
+vimm ins m LDC64 POUT 904
+end
+if or istile k issort k
+vimm ins m LDC64 PTOT 912
+end
+vimm ins m LDC LEN 920
+vimm ins m LDC TILES 924
+vimm ins m LDC WARPS 928
+if issort k
+vimm ins m LDC SH 932
+end
+vimm ins m S2R TID 33
+vimm ins m S2R CTA 37
+movi ins m ONE 1
+movi ins m M1 LO32
+if or eq k 5 eq k 6
+movi ins m NZ 0
+else
+movi ins m NZ PADSUM
+end
+andi ins m LANE TID 31
+shri ins m T TID 5
+imadi ins m GW CTA 8 T
+if or eq k 4 eq k 6
+imadi ins m TILE GW 1 ONE
+else
+imadi ins m TILE GW 1 NONE
+end
+if or istile k issort k
+movi ins m C31 31
+lop3 ins m r4 RL LANE C31 NONE 60
+for s ulong 5
+movi ins m T shl 1 s
+two ins m IADD3 add MASK s LANE T
+shri ins m add MASK s add MASK s 5
+imadi ins m add MASK s add MASK s 1 M1
+end
+end
+if issort k
+movi ins m CJ1 1
+movi ins m CJ2 2
+movi ins m C3 3
+end
+end
+
+fn red ins edit ulong 8192 m edit ulong 512 k ulong mut ulong to void
+imadi ins m EL TILE 32 LANE
+if eq k 0
+movi ins m V PADSUM
+else
+movi ins m V PADMM
+end
+isetp ins m EL LEN
+r = rbeg ins m
+imadw ins m A64 EL 4 PIN
+ldg32 ins m V A64 1
+rend ins m r
+op = FADD
+if eq k 1
+op = FMAX
+end
+if eq k 2
+op = FMIN
+end
+d = ulong 16
+for i ulong 5
+if or ne mut 1 ne d 1
+shfl ins m T V d
+two ins m op V V T
+end
+d = shr d 1
+end
+isetp ins m LANE ONE
+r = rbeg ins m
+imadw ins m A64 TILE 4 POUT
+stg ins m A64 0 V
+rend ins m r
+end
+
+fn tilek ins edit ulong 8192 m edit ulong 512 k ulong mut ulong to void
+op = FADD
+pad = PADSUM
+if eq k 5
+op = IADD3
+pad = ulong 0
+end
+imadi ins m EL TILE 32 RL
+movi ins m V pad
+isetp ins m EL LEN
+r = rbeg ins m
+imadw ins m A64 EL 4 PIN
+ldg32 ins m V A64 1
+rend ins m r
+for s ulong 5
+if or ne mut 2 ne s 4
+shfl ins m T V shl 1 s
+lop3 ins m r4 T T add MASK s NZ 226
+two ins m op V T V
+end
+end
+isetp ins m EL LEN
+r = rbeg ins m
+imadw ins m A64 EL 4 POUT
+stg ins m A64 0 V
+rend ins m r
+isetp ins m LANE ONE
+r = rbeg ins m
+imadw ins m A64 TILE 4 PTOT
+stg ins m A64 0 V
+rend ins m r
+end
+
+fn addk ins edit ulong 8192 m edit ulong 512 k ulong mut ulong to void
+op = FADD
+if eq k 6
+op = IADD3
+end
+imadi ins m EL TILE 32 LANE
+isetp ins m EL LEN
+r = rbeg ins m
+if eq mut 3
+imadi ins m TM1 TILE 1 NONE
+else
+imadi ins m TM1 TILE 1 M1
+end
+imadw ins m B64 TM1 4 POUT
+imadw ins m A64 EL 4 PIN
+ldg32 ins m OFF B64 1
+ldg32 ins m V A64 0
+two ins m op V OFF V
+stg ins m A64 0 V
+rend ins m r
+end
+
+note the digit of KEY (bits shift..shift+3 counted from the top: (KEY << SH) >> 28), its byte one-hot VAL in the
+note counter word Q = digit >> 2, and MQj = all ones when Q == j: (((Q ^ j) + 3) >> 2) - 1
+fn digit ins edit ulong 8192 m edit ulong 512 to void
+shlr ins m X KEY SH
+shri ins m DIG X 28
+andi ins m D3 DIG 3
+imadi ins m X D3 8 NONE
+shlr ins m VAL ONE X
+shri ins m Q DIG 2
+for j ulong 4
+if eq j 0
+two ins m IADD3 X Q C3
+else
+lop3 ins m r4 X Q add CJ1 sub j 1 NONE 60
+two ins m IADD3 X X C3
+end
+shri ins m X X 2
+imadi ins m add MQ0 j X 1 M1
+lop3 ins m r4 add R0 j VAL add MQ0 j NONE 192
+end
+end
+
+note per lane: the four counter words R0..R3 (16 digit counters of 8 bits) summed over the tile positions up to
+note this lane's (an inclusive scan in reversed lanes, as the tile scan); lane 0 ends with the tile's totals
+fn count ins edit ulong 8192 m edit ulong 512 k ulong mut ulong to void
+if and ne k 7 eq mut 5
+imadi ins m EL TILE 32 LANE
+else
+imadi ins m EL TILE 32 RL
+end
+for j ulong 4
+movrz ins m add R0 j
+end
+isetp ins m EL LEN
+r = rbeg ins m
+imadw ins m A64 EL 4 PIN
+ldg32 ins m KEY A64 1
+digit ins m
+rend ins m r
+for s ulong 5
+if or or ne k 7 ne mut 6 ne s 4
+for j ulong 4
+shfl ins m T add R0 j shl 1 s
+lop3 ins m r4 T T add MASK s NONE 192
+two ins m IADD3 add R0 j T add R0 j
+end
+end
+end
+end
+
+note lane 0 stores the 16 tile counts digit-major: cnt[1 + dig * tiles + tile] (cnt = PTOT)
+fn hist ins edit ulong 8192 m edit ulong 512 to void
+isetp ins m LANE ONE
+r = rbeg ins m
+for dg ulong 16
+src = add R0 shr dg 2
+b = mul and dg 3 8
+if eq b 0
+andi ins m X src 255
+else
+shri ins m X src b
+andi ins m X X 255
+end
+imadi ins m DST TILES dg TILE
+imadw ins m A64 DST 4 PTOT
+stg ins m A64 4 X
+end
+rend ins m r
+end
+
+note out[cnt[dig * tiles + tile] + rank] = key, rank = the earlier keys of the tile with the same digit
+fn scat ins edit ulong 8192 m edit ulong 512 k ulong mut ulong to void
+isetp ins m EL LEN
+r = rbeg ins m
+lop3 ins m r4 ACC R0 MQ0 NONE 192
+for j ulong 3
+lop3 ins m r4 ACC add R0 add j 1 add MQ0 add j 1 ACC 234
+end
+lop3 ins m r4 X D3 C3 NONE 60
+imadi ins m X X 8 NONE
+shlr ins m X ACC X
+shri ins m X X 24
+if eq mut 4
+imadi ins m X X 1 NONE
+else
+imadi ins m X X 1 M1
+end
+imadr ins m DST DIG TILES TILE
+imadw ins m A64 DST 4 PTOT
+if eq k 9
+two ins m IADD3 T EL LEN
+imadw ins m B64 T 4 PIN
+end
+ldg32 ins m DST A64 1
+if eq k 9
+ldg32 ins m VV B64 0
+end
+two ins m IADD3 DST DST X
+imadw ins m A64 DST 4 POUT
+stg ins m A64 0 KEY
+if eq k 9
+two ins m IADD3 T DST LEN
+imadw ins m B64 T 4 POUT
+stg ins m B64 0 VV
+end
+rend ins m r
+end
+
+fn kern ins edit ulong 8192 m edit ulong 512 k ulong mut ulong to void
+regs m k
+prolog ins m k
+top = get m 0
+lbeg m
+isetp ins m TILE TILES
+done = bfwd ins m
+if le k 2
+red ins m k mut
+end
+if istile k
+tilek ins m k mut
+end
+if or eq k 4 eq k 6
+addk ins m k mut
+end
+if issort k
+count ins m k mut
+if eq k 7
+hist ins m
+else
+scat ins m k mut
+end
+end
+two ins m IADD3 TILE TILE WARPS
+bra ins m top
+lend m
+patch ins done get m 0
+tail ins m
+end
+
+note ---- entry: kind 0..9, a mutant 0..6 (b, c 0). Returns 0 built, 1 refused arguments, 2 emitter error
+note (meta 4 holds the code).
+fn scan_ir kind ulong a ulong b ulong c ulong ins edit ulong 8192 meta edit ulong 512 to ulong
+for i ulong 512
+put meta i 0
+end
+if or or gt kind 9 gt a 6 or ne b 0 ne c 0
+ret 1
+end
+kern ins meta kind a
+if ne get meta 4 0
+ret 2
+end
+if ne get meta 6 0
+ret 2
+end
+ret 0
+end
