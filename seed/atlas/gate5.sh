@@ -7,10 +7,11 @@
 #    planted mistakes are caught;
 # 4. the existing Atlas M1 gates (run_m1_gates.sh, not edited) run in QEMU on a scratch copy of the
 #    Atlas folder whose atlas.bin is the one asm2 made. The Atlas folder itself is never written.
-# Results: evidence/SEED-0/rung5/.
+# Results: build/seed/r5/evidence/. The recorded receipt evidence/SEED-0/rung5/ (and seed/atlas/atlas.audit) is
+# only read: the results are compared with it at the end (seed/check/receipt.sh), never written over it.
 set -eu
 A=${1:-$HOME/workspace/atlas}
-R=seed/atlas; B=build/seed/r5; E=evidence/SEED-0/rung5
+R=seed/atlas; B=build/seed/r5; E=$B/evidence; REC=evidence/SEED-0/rung5
 PIN=f7802501b410a0c19eff7b8fca8865c9ba9c96bfa4f8065ca8f508b67748b9a5
 mkdir -p "$B" "$E"
 fail=0
@@ -29,8 +30,8 @@ if [ -f "$A/atlas.bin" ]; then
   cmp $R/atlas.bin "$A/atlas.bin" > "$E/cmp.txt" 2>&1 && say "PASS byte-identical to $A/atlas.bin" || bad "bytes differ: $(head -1 $E/cmp.txt)"
 fi
 echo "$sha  seed/atlas/atlas.bin" > "$E/atlas.sha256"
-if sh seed/check/audit2.sh $R/atlas.s2 $R/atlas.bin > $R/atlas.audit; then :; fi
-tail -1 $R/atlas.audit | tee -a "$E/gate5.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
+if sh seed/check/audit2.sh $R/atlas.s2 $R/atlas.bin > $E/atlas.audit; then :; fi
+tail -1 $E/atlas.audit | tee -a "$E/gate5.log" | grep -q 'mismatch=0$' && say "PASS audit (objdump reference run)" || bad "audit"
 for c in 's/^  and.x.bm x20 x20 1 58 57 /  and.x.bm x20 x20 1 58 56 /' 's/^  ldp.w w13 w11 sp 25$/  ldp.w w13 w11 sp 26/' \
          's/^  adrp x13 0 0 /  adrp x13 1 0 /' 's/^  ldr.x.lit x19 L_40200000$/  ldr.x.lit x19 L_401fe100/' \
          's/^  extr.w w2 w3 w3 19$/  extr.w w2 w3 w2 19/'; do
@@ -50,5 +51,7 @@ set -e
 say "run_m1_gates.sh exit $rc on the asm2-made atlas.bin (log: $E/m1-gates.log)"
 [ $rc = 0 ] || bad "Atlas M1 gates"
 say "scratch copy left at $S"
+# the recorded receipt is compared, never rewritten; the verdict below is the checks' alone
+say "$(sh seed/check/receipt.sh "$E" "$REC" $R/atlas.audit || true)"
 [ $fail = 0 ] && say "GATE5 PASS" || say "GATE5 FAIL"
 exit $fail
