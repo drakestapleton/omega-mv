@@ -25,7 +25,7 @@ OUT=$1
 MUT=""
 if [ "${2:-}" = --mutant ]; then MUT=${3:-}; fi
 OMC=seed/out/omc
-PIN=3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194
+PIN=96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763
 UNITS="c2glob c2sha c2out c2dec c2chk c2ins c2cfg c2gpu c2race c2own c2main"
 GUARD='if eq and get cxm p get cxm q ulong 0'
 

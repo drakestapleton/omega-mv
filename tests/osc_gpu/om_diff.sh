@@ -11,7 +11,7 @@
 # Prints OMDIFF PASS n=N same=N diff=0, or OMDIFF FAIL ... and exits 1.
 set -u
 OMC=$1; ORA=$2; TEST=$3; IRD=$4; WORK=$5
-OMC_SHA=3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194
+OMC_SHA=96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763
 got=$(sha256sum "$OMC" | cut -d' ' -f1)
 [ "$got" = "$OMC_SHA" ] || { echo "OMDIFF FAIL: $OMC has sha256 $got, not the pinned seed $OMC_SHA"; exit 1; }
 rm -rf "$WORK"; mkdir -p "$WORK/var" "$WORK/bad" "$WORK/emb" "$WORK/om"
