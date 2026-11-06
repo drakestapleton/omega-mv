@@ -460,6 +460,14 @@ and a call to it is error 3): `r = efi OP ARG A OFF N`, OP a literal 0..14 (a li
 EFI_STATUS `2^63 | (100 + T)`. See [the x86efi design and evidence](../X86-EFI.md) for
 the operations, the efi 12 file contract and qualification status.
 
+An initial line `target aarch64efi` selects the ARM64 PE32+ UEFI application
+backend. It accepts whole programs, preserves AAPCS64 firmware state, and
+refuses Linux host words and bare units with error 25. The target-scoped
+`efi OP ARG A OFF N` interface supports the operations documented in
+[ARM64 EFI](../ARM64-EFI.md), including event wait OP 15. The same document
+specifies the AArch64-only ordered binary64 `vmadd2` and `vdot4` statements;
+they use separate multiply and add instructions, with checked array ranges.
+
 ### 9.2 Functions and calls
 
 - `fn` may appear many times. A names pass reads every signature before any code is written, so a call

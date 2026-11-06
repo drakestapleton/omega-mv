@@ -806,8 +806,8 @@ def stage_live(omc, work, lib_src, log):
 
 
 LIVE_MUTANTS = [
-    ("head deadline never armed", "put cs HDL add ulong monons get cs HHDLV", "put cs HDL 0"),
-    ("hclose leaks the descriptor", "ret fclose int get cs HFD", "ret 0"),
+    ("head deadline never armed", "put cs HDL add ulong htclock get cs HHDLV", "put cs HDL 0"),
+    ("hclose leaks the descriptor", "ret htclose int get cs HFD", "ret 0"),
     ("SSE data CR not a line break", "if eq get v q 13", "if eq get v q 14"),
     ("chunk-size digit mask", "put io add b i hhexd and x 15", "put io add b i hhexd and x 7"),
     ("F1 no body deadline after the head", "put cs HDL hbdl cs", "put cs HDL 0"),
@@ -1484,6 +1484,7 @@ def main():
         print("NOT_RUN: no compiler at %s" % omc)
         return 3
     http_src = open(LIB, "rb").read()
+    assert http_src == open(os.path.join(NET, "http-core.om"), "rb").read() + open(os.path.join(NET, "http-linux.om"), "rb").read(), "stale HTTP compatibility unit"
     notls_src = open(NOTLS, "rb").read()
     lib_src = http_src + notls_src
     work = keep or tempfile.mkdtemp(prefix="http-check-")

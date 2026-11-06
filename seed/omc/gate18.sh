@@ -3,7 +3,7 @@
 # must reproduce the committed keyword chain: every literal pack/id pair, plus the two computed entries
 # readlnk (133) and sockopt (134). This catches list drift and awk precision regressions (packs above
 # 2^53 are printed with decimal string arithmetic, not doubles). The one target-scoped entry, efi (178)
-# under `target x86efi` only, is not generated; it must appear exactly once in its fixed form.
+# under the two EFI targets only, is not generated; its complete condition is checked below.
 set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$R"
@@ -18,14 +18,15 @@ awk -f seed/omc/genkw.awk > "$T/gen"
 awk '
     /^fn kw /{inkw=1; next}
     inkw && /^if eq w /{p=$4; next}
-    inkw && /^if and eq w /{p=$5 " target=" $NF; next}
+    inkw && /^if and eq w /{p=$5 " scoped"; next}
     inkw && /^ret /{
         if ($2 == 0) { inkw=0; exit }
         if ($2 != 133 && $2 != 134) print $2, p
     }
 ' seed/omc/omc.om | sort -n > "$T/all.pairs"
 [ "$(grep -c '^178 ' "$T/all.pairs")" = 1 ] || bad "committed chain must hold efi (178) exactly once"
-grep -qx '178 6907493 target=2' "$T/all.pairs" || bad "efi (178) must be scoped to x86efi (xtarget 2)"
+grep -qx '178 6907493 scoped' "$T/all.pairs" || bad "efi (178) must remain target-scoped"
+grep -qx 'if and eq w 6907493 or eq get xtarget 0 2 ne get atarget 0 0' seed/omc/omc.om || bad "efi (178) must be scoped to x86efi or aarch64efi only"
 grep -v '^178 ' "$T/all.pairs" > "$T/chain.pairs"
 
 awk '
@@ -38,7 +39,7 @@ cmp -s "$T/chain.pairs" "$T/gen.pairs" || {
     bad "generated keyword packs differ from the committed chain"
 }
 n=$(wc -l < "$T/gen.pairs")
-[ "$n" = 168 ] || bad "compared $n literal pairs, wanted 168"
+[ "$n" = 170 ] || bad "compared $n literal pairs, wanted 170"
 
 grep -q '^ret 133$' seed/omc/omc.om || bad "committed chain lacks readlnk (133)"
 grep -q '^ret 134$' seed/omc/omc.om || bad "committed chain lacks sockopt (134)"
@@ -49,5 +50,5 @@ grep -q 'peername:224' seed/omc/genkw.awk || bad "generator lacks peername:224"
 grep -q '^ret 227$' seed/omc/omc.om || bad "committed chain lacks fma (227)"
 grep -q 'fma:227' seed/omc/genkw.awk || bad "generator lacks fma:227"
 
-printf 'PASS gate18 168 literal packs, both computed entries and the x86efi-scoped efi entry match the committed chain\n'
+printf 'PASS gate18 170 literal packs, both computed entries and the two-target EFI entry match the committed chain\n'
 exit 0
