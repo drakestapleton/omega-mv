@@ -11,6 +11,7 @@ sh seed/omega-from-seed.sh
 sh seed/omc/gate-ir.sh
 sh seed/omc/gate7.sh
 sh seed/omc/gate8.sh
+sh seed/omc/gate-fma.sh
 sh seed/omc/gate9.sh
 sh seed/omc/gate10.sh
 sh seed/omc/gate11.sh
