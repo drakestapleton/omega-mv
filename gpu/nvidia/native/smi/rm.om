@@ -1,0 +1,220 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note rm.om: cudapp-smi resource-manager queries and main. Appended after smi.om and native/nvrm/context.om.
+note The --rm path opens /dev/nvidiactl and /dev/nvidia0 through nvstart and issues only read-only
+note subdevice controls (no memory allocation, no channel, no mapping), then frees every handle.
+note Control layouts: NVIDIA open-gpu-kernel-modules tag 580.173.02 (commit 20e4e6e1),
+note src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h and ctrl2080thermal.h; see native/smi/README.md.
+note   545259792 NV2080_CTRL_CMD_GPU_GET_NAME_STRING 0x20800110, 132-byte params
+note   545259917 NV2080_CTRL_CMD_GPU_GET_PIDS 0x2080018d, 3812-byte params
+note   545259918 NV2080_CTRL_CMD_GPU_GET_PID_INFO 0x2080018e, 14408-byte params
+note   545260819 NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2 0x20800513, 1432-byte params
+note Exit codes added by this unit (stdout stays empty; the context is closed before the refusal):
+note   30 resource-manager open failed (nvstart)
+note   31 a resource-manager control failed
+note   32 malformed control reply
+note   33 teardown failed (nvstop)
+note   34 --rm needs exactly one GPU in ROOT/proc/driver/nvidia/gpus
+
+text trmop "resource-manager open failed"
+text trmct "resource-manager control failed"
+text trmbad "malformed resource-manager reply"
+text trmtd "resource-manager teardown failed"
+text trmone "--rm needs exactly one GPU"
+text kapp "compute_app."
+text kumem ".used_memory="
+text kumemb ".used_memory_bytes="
+text kapps "compute_apps="
+
+note Closes the context, then refuses; a teardown failure takes precedence.
+fn rmfail code int msg view uchar * to void
+if not nvstop
+refuse 33 trmtd
+end
+refuse code msg
+end
+
+fn rmctl cmd uint n ulong to void
+if not nvctrl get nvobj 2 cmd n
+rmfail 31 trmct
+end
+end
+
+note Product name: flags 0 selects ASCII; the name must be zero-terminated printable ASCII.
+fn rmname to void
+npzero
+rmctl 545259792 132
+if ne npget 0 0
+rmfail 32 trmbad
+end
+n = ulong 0
+while and lt n 64 ne get nvpar add 4 n 0 bound 65
+c = get nvpar add 4 n
+if or lt c 32 gt c 126
+rmfail 32 trmbad
+end
+n = add n 1
+end
+if or eq n 0 eq n 64
+rmfail 32 trmbad
+end
+og 0 kname
+for i ulong n
+oc get nvpar add 4 i
+end
+onl
+end
+
+note One thermal instruction at list slot k: opcode at +8, operands at +12 and +16.
+fn thins k ulong op uint a uint b uint to void
+o = add 24 mul k 44
+npput add o 8 op
+npput add o 12 a
+npput add o 16 b
+end
+
+fn thrun n ulong to void
+npput 0 1
+npput 4 0
+npput 8 44
+npput 12 0
+npput 20 uint n
+rmctl 545260819 1432
+for k ulong n
+o = add 24 mul k 44
+if or ne npget add o 4 1 ne npget o 0
+rmfail 32 trmbad
+end
+end
+end
+
+note GPU temperature: the first sensor whose target has type GPU (1). Without such a sensor the
+note field is [N/A]. More than 32 instructions in the second pass is a malformed reply.
+fn rmtemp to void
+npzero
+thins 0 256 0 0
+thins 1 1280 0 0
+thrun 2
+nt = ulong npget 36
+ns = ulong npget 80
+if gt add nt mul ns 2 32
+rmfail 32 trmbad
+end
+npzero
+for t ulong nt
+thins t 257 uint t 0
+end
+for s ulong ns
+thins add nt mul s 2 1312 uint s 0
+thins add add nt mul s 2 1 5376 uint s 0
+end
+thrun add nt mul ns 2
+og 0 ktemp
+for s ulong ns
+tg = npget add add 24 mul add nt mul s 2 44 16
+if ge ulong tg nt
+rmfail 32 trmbad
+end
+if eq npget add add 24 mul ulong tg 44 16 1
+v = npget add add 24 mul add add nt mul s 2 1 44 16
+if ge v 2147483648
+oc 45
+odec ulong sub 0 v
+else
+odec ulong v
+end
+onl
+ret
+end
+end
+ona
+end
+
+note Compute processes: GET_PIDS by the compute class returns PIDs with GPU contexts, then
+note GET_PID_INFO index 0 (video memory usage) gives memPrivate bytes per PID.
+fn rmpids to void
+npzero
+npput 0 0
+npput 4 get nvcls 0
+rmctl 545259917 3812
+n = ulong npget 8
+if gt n 200
+rmfail 32 trmbad
+end
+p = new uint 200 0
+for i ulong n
+put p i npget add 12 mul i 4
+end
+npzero
+npput 0 uint n
+for i ulong n
+npput add 8 mul i 72 get p i
+npput add 12 mul i 72 0
+end
+if gt n 0
+rmctl 545259918 14408
+end
+for i ulong n
+o = add 8 mul i 72
+if ne npget o get p i
+rmfail 32 trmbad
+end
+og 0 kapp
+odec i
+ot kpid
+odec ulong get p i
+onl
+if ne npget add o 8 0
+og 0 kapp
+odec i
+ot kumemb
+ona
+og 0 kapp
+odec i
+ot kumem
+ona
+continue
+end
+m = npg64 add o 16
+og 0 kapp
+odec i
+ot kumemb
+odec m
+onl
+og 0 kapp
+odec i
+ot kumem
+odec shr m 20
+onl
+end
+og 0 kapps
+odec n
+onl
+end
+
+fn rmrun to void
+if ne get gst 6 1
+refuse 34 trmone
+end
+if not nvstart
+if not nvstop
+refuse 33 trmtd
+end
+refuse 30 trmop
+end
+rmname
+rmtemp
+rmpids
+if not nvstop
+refuse 33 trmtd
+end
+end
+
+fn main to int
+args
+report
+if ne get gst 9 0
+rmrun
+end
+oflush
+ret 0
+end
