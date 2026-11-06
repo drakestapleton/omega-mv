@@ -934,7 +934,10 @@ mode entry31 points at a32-byte header followed by1..4098 owned32-byte mapping
 slots. The header supplies capacity and nonwrapping generation limits; handles
 have13 low slot bits. The bridge selects an explicit context and serializes
 its calls. Fixed bind replaces only an entire live PROT_NONE reservation in
-that table, and failed bind retires its token. Program mode retains its raw128
+that table. Failed bind retires its token on successful cleanup; a cleanup
+failure traps3 and leaves an inaccessible, un-rebindable owner for mapdrop only
+(mapaddr may inspect it). The bridge refuses destroy while it is live.
+Program mode retains its raw128
 slots and eight slot bits. Every other host word, every OM-1 function unit and
 other targets stay error9. This context-format contract is a draft requiring
 Drake approval before merge (PROPOSED `spec/omegese-om3.md` section1, gate

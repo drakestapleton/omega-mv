@@ -28,8 +28,10 @@ not stated here.
   32-byte owned slots; handles have13 low slot bits. The bridge supplies an
   explicit context with disjoint generation ranges and serializes its calls.
   Fixed bind can replace only the whole owned PROT_NONE reservation; failure
-  unmaps/retires the token, not a promise to preserve the reservation. An absent
-  table pointer may fault: it is not a status34 function stub.
+  unmaps/retires the token if cleanup succeeds. Cleanup failure traps3 with a
+  quarantined owner: bind/read/write refuse; mapaddr/drop remain available,
+  and destroy stays busy until drop succeeds. Neither outcome promises to
+  preserve a reservation. An absent table pointer may fault, not status34.
 - **Context ABI revision is DRAFT and requires Drake approval before merge.**
   It supersedes the unmerged#1040 raw128-slot function-mode format, not an
   accepted frozen OM-2 feature. The bridge must reject incompatible mapping

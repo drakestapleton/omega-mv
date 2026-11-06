@@ -19,7 +19,7 @@ bootstrap and test orchestration remain disclosed development tools.
 | `mapget handle offset width` | Aligned uint32 or uint64 load, returned as ulong; width is literal int4 or8. Exactly one load, bracketed by DSB SY. Requires readable memory. |
 | `mapset handle offset width value` | Aligned uint32 or uint64 store from ulong, returning long0; width is literal int4 or8. A uint32 store refuses truncation. Exactly one store, bracketed by DSB SY. Requires writable memory. |
 | `maphold address bytes` | Reserve an unused, page-aligned span with PROT_NONE and MAP_FIXED_NOREPLACE. Address is at least64KiB and the whole span is below1TiB. Return an owned handle or errno. A kernel that ignores NOREPLACE is detected by checking the returned address; an unexpected result is unmapped and returns -95. |
-| `mapbind handle fd offset access` | Bind a shared file/device mapping to the entire owned reservation, with literal access1 or3. No existing data mapping may be replaced. Return long0 or errno. A failed bind unmaps the span and retires the handle. |
+| `mapbind handle fd offset access` | Bind a shared file/device mapping to the entire owned reservation, with literal access1 or3. No existing data mapping may be replaced. Return long0 or errno. Failed bind with successful cleanup retires the handle. Function-mode double failure quarantines it for cleanup only (below). |
 | `cpufence` | Statement, keyword 199: a standalone host CPU publication barrier, AArch64 `DSB SY`, x86-64 `MFENCE`. It orders ordinary stores, for example `mapwrite` or plain array stores, before a later `mapset` doorbell or flag. A `mapget`/`mapset` access already carries its own barriers. See OMEGESE §10, "Host CPU ordering words". Proof: `seed/host/cpufence.sh`. |
 | `cpurelax` | Statement, keyword 200: spin-wait hint for a bounded `mapget` poll loop, AArch64 `YIELD`, x86-64 `PAUSE`. It gives no ordering. Proof: `seed/host/cpufence.sh`. |
 
@@ -58,8 +58,13 @@ The caller quiesces all users/waiters before destruction, which refuses live
 slots; it also serializes whole multi-call transactions in a context.
 
 `mapbind` replaces only the whole live PROT_NONE reservation in this selected
-table. A failed bind attempts to unmap it and retires the token: Linux may leave
-a gap after MAP_FIXED failure, so reservation preservation is not promised.
+table. Before cleanup, function mode changes access to4 (quarantined): bind,
+read and write are refused but `mapaddr` and `mapdrop` retain ownership for
+cleanup. If cleanup munmap fails, trap3 leaves that quarantined owner live and
+the bridge returns nonzero status with outputs unchanged. Destroy must return36
+until a later `mapdrop` succeeds. If cleanup succeeds, the slot is fully retired
+and the original mmap errno is returned normally. Linux may leave a gap after
+MAP_FIXED failure: reservation preservation is not promised in either case.
 No external munmap/mremap/fixed replacement may interfere with owned ranges.
 This format supersedes the unmerged raw128-slot function-mode draft in#1040;
 mixing those compiler/runtime formats is unsupported and the bridge rejects a
