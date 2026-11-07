@@ -1,14 +1,16 @@
 note SPDX-License-Identifier: Apache-2.0
 note hive-task: the pure transition rules of the hive forge task authority (issue #925, DRA-288).
 note This file is the source of truth. crates/spark-hive/src/store.rs is the named host adapter:
-note each mutation is one conditional UPDATE whose WHERE clause states these rules. drive.om in
-note this directory checks the hand cases, then drives the real spark-cockpit-rs binary over HTTP
-note and compares every transition of the table with this program, and shows mutants are caught.
+note each mutation is one conditional UPDATE whose WHERE clause states these rules, stepped to
+note completion so a failed commit is reported, and a command record is written in the same
+note IMMEDIATE transaction as the change it answers. drive.om in this directory checks the hand
+note cases, then drives the real spark-cockpit-rs binary over HTTP, compares every transition of
+note the table with this program, and shows mutants are caught.
 note
 note Input on stdin, ASCII decimal numbers separated by spaces, tabs or newlines, ten per case:
 note   op st gen rgen amatch art verdict now exp ttl
 note op: 1 claim, 2 renew (heartbeat), 3 submit, 4 verify, 5 reap (expired lease back to open),
-note   6 classify a database failure (st holds the SQLite primary result code).
+note   6 classify a database failure (st holds the SQLite primary result code), 7 command id.
 note st: current state, 0 open, 1 claimed, 2 submitted, 3 verified, 4 failed; any other value is an
 note   unknown state and every operation refuses it.
 note gen: current generation (attempt number); rgen: generation named by the request.
@@ -23,8 +25,27 @@ note   6 generation exhausted, 7 artifact or generation mismatch, 8 ttl out of r
 note   9 database busy or locked: nothing changed and the request may be retried,
 note   10 any other database failure: not retryable.
 note   (1 is task not found, decided by the adapter when no row exists.)
+note The adapter answers 2..7 with HTTP 409 refused and 8 with 400 invalid: it checks the ttl
+note before it reads the database, and its WHERE clause repeats the bound.
 note On a refusal next_state = st and next_gen = gen. Only an allowed claim changes the generation,
 note to gen + 1, and a claim is refused once gen reaches GMAX, so generations never wrap.
+note
+note Op 7 decides a write that may carry a caller-chosen command id, so a retried request is
+note answered once. Its fields reuse the ten slots:
+note   7 prior idlen bad dig has 0 0 0 sdec
+note has: 1 when the request carries a command id (an empty one counts), else 0.
+note idlen: id length in bytes; bad: id bytes outside A-Z a-z 0-9 . _ : -
+note prior: 1 when a record already holds this id (looked up only for a well-formed id).
+note dig: 1 when that record's request digest equals this request's digest. The digest covers the
+note   operation, the task id and every normalized request field.
+note sdec: the decision of ops 1..6 for the request itself (0..10, 1 task not found).
+note Output "dec rec chg". dec: 0 proceed with the operation (its answer is sdec), 11 replay: answer
+note   with the recorded result, 12 command conflict: the id was used for another request,
+note   13 bad command id (must be 1 to CMDMAX bytes of the set above).
+note rec: 1 when the id holds a record after the request. Only an allowed outcome is recorded, so a
+note   refusal, a busy database or a failure is decided again when retried with the same id.
+note chg: 1 when the operation's transition is applied; a replay or a conflict changes nothing.
+note
 note Exit: 0 ok, 2 read error, 3 input over 16 MiB, 5 bad or missing number, 6 field out of range,
 note 9 write error.
 const OPEN ulong 0
@@ -38,6 +59,7 @@ const OSUBMIT ulong 3
 const OVERIFY ulong 4
 const OREAP ulong 5
 const ODBERR ulong 6
+const OCMD ulong 7
 const ALLOW ulong 0
 const BADSTATE ulong 2
 const HELD ulong 3
@@ -48,6 +70,11 @@ const MISMATCH ulong 7
 const BADTTL ulong 8
 const RETRY ulong 9
 const DBFAIL ulong 10
+const REPLAY ulong 11
+const CONFLICT ulong 12
+const BADCMD ulong 13
+note CMDMAX: longest command id in bytes.
+const CMDMAX ulong 128
 note SQLite primary result codes SQLITE_BUSY and SQLITE_LOCKED.
 const SQBUSY ulong 5
 const SQLOCK ulong 6
@@ -176,7 +203,71 @@ end
 ret DBFAIL
 end
 
-note decide: the decision for the case in cs (op already checked to be 1..6).
+note dcmd: the command id rule. No id: proceed as before. A malformed id is refused before the
+note database is opened. A ttl out of range is bad input, answered before the database is opened.
+note A busy or failed database answers before the record can be read, so its answer is the
+note failure and nothing changes. A new id proceeds; a known id replays its record for the same
+note request and is a conflict for any other request.
+note Fields of cs under op 7: 1 prior, 2 idlen, 3 bad, 4 dig, 5 has, 9 sdec.
+fn dcmd to ulong
+has = get cs 5
+idl = get cs 2
+bad = get cs 3
+prior = get cs 1
+dig = get cs 4
+sdec = get cs 9
+if ne has 1
+ret ALLOW
+end
+if or eq idl 0 gt idl CMDMAX
+ret BADCMD
+end
+if ne bad 0
+ret BADCMD
+end
+if eq sdec BADTTL
+ret ALLOW
+end
+if ge sdec RETRY
+ret ALLOW
+end
+if eq prior 0
+ret ALLOW
+end
+if eq dig 1
+ret REPLAY
+end
+ret CONFLICT
+end
+
+note crec: does the id hold a record after the request? A replay or a conflict keeps the earlier
+note record; a new id is recorded only when the operation itself is allowed, and a refusal or a
+note database failure leaves the records as they were.
+fn crec has ulong dc ulong sdec ulong prior ulong to ulong
+if or eq dc REPLAY eq dc CONFLICT
+ret 1
+end
+if ne dc ALLOW
+ret 0
+end
+if ne has 1
+ret 0
+end
+if ne sdec ALLOW
+ret prior
+end
+ret 1
+end
+
+note cchg: the operation's transition runs only when the command proceeds and it is allowed.
+fn cchg dc ulong sdec ulong to ulong
+if and eq dc ALLOW eq sdec ALLOW
+ret 1
+end
+ret 0
+end
+
+note decide: the decision for the case in cs (op already checked to be 1..7).
 fn decide to ulong
 op = get cs 0
 st = get cs 1
@@ -192,6 +283,9 @@ end
 if eq op ODBERR
 ret ddberr st
 end
+if eq op OCMD
+ret dcmd
+end
 if eq op OVERIFY
 ret dverify st gen get cs 3 get cs 5
 end
@@ -202,13 +296,34 @@ end
 ret dlease st fen now exp
 end
 
-note valid: fields in range; st and the times may hold any value.
+note valid: fields in range; st and the times may hold any value except under op 7, where prior
+note is 0 or 1 and sdec a decision of ops 1..6.
 fn valid to bool
 op = get cs 0
-ok = and ge op OCLAIM le op ODBERR
+ok = and ge op OCLAIM le op OCMD
 ok = and ok and le get cs 2 GMAX le get cs 3 GMAX
 ok = and ok and le get cs 4 1 le get cs 5 1
-ret and ok le get cs 6 1
+ok = and ok le get cs 6 1
+if eq op OCMD
+ok = and ok and le get cs 1 1 le get cs 9 DBFAIL
+end
+ret ok
+end
+
+note second, third: the last two output fields, next_state next_gen, or rec chg under op 7.
+fn second dc ulong to ulong
+op = get cs 0
+if eq op OCMD
+ret crec get cs 5 dc get cs 9 get cs 1
+end
+ret nextst op get cs 1 get cs 6 dc
+end
+
+fn third dc ulong to ulong
+if eq get cs 0 OCMD
+ret cchg dc get cs 9
+end
+ret nextgen get cs 0 get cs 2 dc
 end
 
 note slurp: read all of stdin into inb. Each inner pass adds at least one byte or ends, so
@@ -341,9 +456,9 @@ end
 dc = decide
 putd dc
 badd uchar 32
-putd nextst get cs 0 get cs 1 get cs 6 dc
+putd second dc
 badd uchar 32
-putd nextgen get cs 0 get cs 2 dc
+putd third dc
 badd uchar 10
 if gt get ow 0 65000
 r = flush

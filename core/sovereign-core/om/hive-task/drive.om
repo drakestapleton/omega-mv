@@ -13,18 +13,24 @@ note Modes:
 note   cases    runs RULES once per line of cases.tsv and compares stdout and exit status.
 note   http     starts COCKPIT on an ephemeral loopback port with a scratch database and drives
 note            /api/hive/forge/* over HTTP: T1 to T3, stale attempts, expired leases, generation
-note            exhaustion, ttl range, artifact binding, a held write lock, and 400 claim races
-note            between two cockpit processes sharing one database file.
+note            exhaustion, ttl range (400 invalid), bad JSON bodies (400 invalid), artifact
+note            binding, a held write lock, 400 claim races between two cockpit processes sharing
+note            one database file, command-id replay (same body, no second change, 409
+note            command_conflict on a different payload, across both processes and under a race),
+note            and a commit that cannot complete (the cockpit must not answer 200 for it).
 note   table    seeds every combination of state, generation, fence, artifact, verdict, lease and
 note            ttl for each operation, applies it through the API, and checks that RULES predicts
-note            each outcome and next state; then shows that mutants of task.om fail the checks.
+note            each outcome and next state; op 7 does the same for command ids (prior record,
+note            same or different payload, id length and characters, task state); then shows
+note            that mutants of task.om fail the checks.
 note   migrate  makes a database with MAIN, opens it with COCKPIT and checks the migration.
 note Output: one line per check, "PASS name ..." or "FAIL name ...", then a SUMMARY line. Exit 0
 note only when nothing failed.
 note Host programs on this test path only, never shipped: /usr/bin/sqlite3 (3.45.1) seeds rows the
-note API cannot create (any status, a generation near 2^53, an expired lease) and holds a write lock
-note for the busy case. /usr/bin/env is a temporary bridge in cockexec, because execprog starts a
-note program with an empty environment.
+note API cannot create (any status, a generation near 2^53, an expired lease), holds a write lock
+note for the busy case and a read lock on a rollback-journal database for the commit case.
+note /usr/bin/env is a temporary bridge in cockexec, because execprog starts a program with an
+note empty environment.
 om2
 const NONE ulong 18446744073709551615
 const GMAX ulong 9007199254740991
@@ -50,6 +56,9 @@ const RTID ulong 18
 const RAID ulong 19
 const RART ulong 20
 const RMUT ulong 21
+const RCMD ulong 22
+const RSAVE ulong 23
+const RROW ulong 24
 note g slots
 const GTOP ulong 0
 const GNREC ulong 1
@@ -74,6 +83,11 @@ const GLBUSY ulong 34
 const GLOTH ulong 35
 const GRECL ulong 36
 const GRALW ulong 37
+const GCMD ulong 38
+const GP4 ulong 40
+const GQ ulong 42
+const GH ulong 45
+const GK0 ulong 48
 global m uchar 12582912
 global g ulong 64
 global al ulong 8
@@ -83,6 +97,7 @@ global lm ulong 32
 global tc ulong 8
 global tv ulong 8
 global tr ulong 512
+global tk ulong 256
 text dq "\""
 text tusage "usage: drive MODE RULES COCKPIT SCRATCH DIR OMC MAIN\n"
 text tderr "DRIVER ERROR "
@@ -112,6 +127,7 @@ text ftin "/table.in"
 text ftobs "/table.obs"
 text fhttpdb "/http.db"
 text fmigdb "/migrate.db"
+text fcomdb "/commit.db"
 text ftbl "/table-"
 text fdbs ".db"
 text envbin "/usr/bin/env"
@@ -170,6 +186,11 @@ text jtrue "true"
 text jfalse "false"
 text jnotes ",\"notes\":\"n-core925\"}"
 text cbr "}"
+text jcmd ",\"command_id\":\""
+text jrcmd "{\"command_id\":\""
+text jrend "\"}"
+text jbadm "{\"task_id\":\"s9\",\"ttl_secs\":300}"
+text jbadj "{\"task_id\":"
 text jcreate "{\"project\":\"scn\",\"module\":\"m\",\"ring\":0,\"title\":\"t\",\"description\":\"d\",\"parent_comb_id\":null}"
 text kaid "\"attempt_id\":\""
 text kgen "\"generation\":"
@@ -187,6 +208,8 @@ text vsub "\"submitted\""
 text vver "\"verified\""
 text vbusy "\"busy\""
 text vrefus "\"refused\""
+text vcmdc "\"command_conflict\""
+text vinval "\"invalid\""
 text vsha2 "\"sha256:s2\""
 text vsha3 "\"sha256:s3\""
 text vbr "\"b-core925\""
@@ -213,6 +236,24 @@ text ts6 "s6"
 text ts7 "s7"
 text ts8 "s8"
 text ts9 "s9"
+text ts10 "s10"
+text ts11 "s11"
+text ts12 "s12"
+text ts13 "s13"
+text ts14 "s14"
+text tc1 "c1"
+text cidc1 "core925-c1"
+text cidh1 "core925-h1"
+text cidu1 "core925-u1"
+text cidv1 "core925-v1"
+text cidr1 "core925-r1"
+text cidx1 "core925-x1"
+text cidb1 "core925-b1"
+text cidk1 "core925-k1"
+text cidbad "core925/1"
+text cidq "core925-q"
+text cidp "core925-p"
+text tslx "/x"
 text tm1 "m1"
 text tm2 "m2"
 text tm3 "m3"
@@ -251,13 +292,33 @@ text n_xa "exhaust_setup_seed_generations"
 text n_xb "claim_at_max_generation_refused"
 text n_xc "claim_reaches_max_generation_exactly"
 text n_xd "heartbeat_at_max_generation_accepted"
-text n_ta "claim_ttl_zero_refused"
-text n_tb "claim_ttl_over_one_day_refused"
+text n_ta "claim_ttl_zero_invalid_400"
+text n_tb "claim_ttl_over_one_day_invalid_400"
 text n_tc "claim_ttl_one_day_accepted"
-text n_td "heartbeat_ttl_zero_refused"
+text n_td "heartbeat_ttl_zero_invalid_400"
+text n_ja "json_missing_field_400_invalid"
+text n_jb "json_malformed_400_invalid"
 text n_ba "busy_setup_sqlite3_holds_write_lock"
 text n_bb "busy_claim_refused_503_retryable"
-text n_bc "busy_retry_after_release_granted"
+text n_bc "busy_retry_same_command_id_granted"
+text n_ra "replay_setup_claim_with_command_id"
+text n_rb "replay_identical_claim_same_body"
+text n_rc "replay_identical_claim_row_unchanged"
+text n_rd "replay_different_payload_409_command_conflict"
+text n_re "replay_heartbeat_identical_no_lease_extension"
+text n_rf "replay_submit_identical_same_body"
+text n_rg "replay_verify_identical_same_body"
+text n_rh "replay_reclaim_identical_no_second_sweep"
+text n_ri "command_id_too_long_400"
+text n_rj "command_id_128_bytes_valid"
+text n_rk "command_id_bad_char_400"
+text n_rl "replay_after_refusal_decided_again"
+text n_rm "command_record_written_once"
+text n_rx "replay_across_two_cockpits_same_body"
+text n_ry "replay_across_two_cockpits_conflict_409"
+text n_rr "replay_race_two_cockpits_one_record"
+text n_cf "commit_unsafe_db_refused_at_start_row_unchanged"
+text n_cfa "commit_setup_rollback_journal_and_reader"
 text n_race "race_two_cockpits_single_grant"
 text n_ma "migrate_setup_main_claim"
 text n_mb "migrate_setup_main_submit"
@@ -267,13 +328,42 @@ text n_me "migrate_rows_backfilled"
 text n_mf "migrate_backfilled_lease_held"
 text n_mg "migrate_open_claim_generation_1"
 text n_mh "migrate_legacy_submitted_reworkable"
+text n_mi "migrate_command_table_present"
+text n_mj "migrate_reopen_idempotent"
 text n_tab "table_crosscheck"
 text n_trec "table_reap_count_matches"
-text n_nr "NOT_RUN command_id_replay: the forge API has no command id yet (#925 acceptance 2, deferred)\n"
 text tbusyw " waited_ms="
 text tbsql ".timeout 0\nBEGIN IMMEDIATE;\nSELECT 'held';\n"
 text tbheld "held"
 text tbrb "ROLLBACK;\n"
+text tbsql2 ".timeout 0\nBEGIN;\nSELECT 'held' FROM sqlite_master LIMIT 1;\n"
+text tdelj "PRAGMA journal_mode = DELETE;\n"
+text tdelw "delete\n"
+text tcomq "SELECT status || ' ' || generation FROM forge_tasks WHERE id = 'c1';\n"
+text tcopen "open 0\n"
+text tcom1 " served="
+text tcom2 " claim="
+text trow10 "SELECT generation || '|' || attempt_id || '|' || COALESCE(lease_expires_ms, 0) || '|' || status FROM forge_tasks WHERE id = 's10';\n"
+text texp1 "UPDATE forge_tasks SET status = 'claimed', claimed_by = 'w', attempt_id = 'a', generation = 1, lease_expires_ms = 1 WHERE id = '"
+text tqend "';\n"
+text tss13 "SELECT status FROM forge_tasks WHERE id = 's13';\n"
+text tclnl "claimed\n"
+text tcnt "SELECT (SELECT count(*) FROM forge_commands WHERE command_id IN ('core925-c1', 'core925-x1', 'core925-b1')) || ' ' || (SELECT count(*) FROM forge_commands WHERE command_id = 'core925/1' OR length(command_id) > 128);\n"
+text tcntw "3 0\n"
+text trq2 "SELECT (SELECT count(*) FROM forge_tasks WHERE id GLOB 'q[0-9]*' AND status = 'claimed' AND generation = 1) || ' ' || (SELECT count(*) FROM forge_commands WHERE command_id GLOB 'core925-q[0-9]*');\n"
+text t4040 "40 40\n"
+text trr1 " trials=40 same_body="
+text trr2 " one_busy="
+text trr3 " other="
+text tcmdt "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'forge_commands';\n"
+text t1nl "1\n"
+text tcmdg "CREATE TABLE IF NOT EXISTS forge_commands (command_id TEXT PRIMARY KEY);\n"
+text tkupd1 "UPDATE forge_tasks SET status = 'verified', generation = 1 WHERE id = 'k"
+text td1 "SELECT COALESCE((SELECT status FROM forge_tasks WHERE id = 'k"
+text td2 "'), 'none') || '|' || COALESCE((SELECT generation FROM forge_tasks WHERE id = 'k"
+text td3 "'), 0) || '|' || (SELECT count(*) FROM forge_commands WHERE command_id = '"
+text td4 "');\n"
+text tz3 " 0 0 0 "
 text tsx6 "UPDATE forge_tasks SET generation = 9007199254740991 WHERE id = 's6';\nUPDATE forge_tasks SET generation = 9007199254740990 WHERE id = 's7';\n"
 text tss5 "SELECT status FROM forge_tasks WHERE id = 's5';\n"
 text tsubnl "submitted\n"
@@ -339,6 +429,20 @@ text mtfal "if false"
 text mf15 "if or eq code SQBUSY eq code SQLOCK"
 text mt15 "if eq code SQBUSY"
 text mf16 "if ne st CLAIMED"
+text mf17 "if eq dig 1"
+text mf18 "if eq prior 0"
+text mf19 "if eq sdec BADTTL"
+text mf20 "if ge sdec RETRY"
+text mf21 "if or eq idl 0 gt idl CMDMAX"
+text mt21 "if eq idl 0"
+text mf22 "if ne bad 0"
+text mf23 "if ne sdec ALLOW"
+text mf24 "ret prior"
+text mt24 "ret 0"
+text mf25 "if and eq dc ALLOW eq sdec ALLOW"
+text mt25 "if eq dc ALLOW"
+text mf26 "if ne has 1"
+text mf27 "if or eq dc REPLAY eq dc CONFLICT"
 
 note ---- arena regions: m holds every buffer; region r spans bs[r] up to lm[r], cursor cu[r].
 fn setreg r ulong sz ulong to void
@@ -376,6 +480,9 @@ setreg RTID 256
 setreg RAID 256
 setreg RART 256
 setreg RMUT 262144
+setreg RCMD 512
+setreg RSAVE 131072
+setreg RROW 4096
 end
 
 fn rsz r ulong to void
@@ -1131,6 +1238,11 @@ rsz RBODY
 ap RBODY jtid
 apr RBODY RTID
 ap RBODY dq
+if eq get g GCMD 1
+ap RBODY jcmd
+apr RBODY RCMD
+ap RBODY dq
+end
 end
 
 fn bagent a view uchar * to void
@@ -1213,6 +1325,74 @@ bver gn vd vf
 ret hpost 0 pver
 end
 
+note ---- command ids: while g[GCMD] is 1 every body carries "command_id": RCMD.
+fn setcmd t view uchar * to void
+rsz RCMD
+ap RCMD t
+put g GCMD 1
+end
+
+fn nocmd to void
+put g GCMD 0
+end
+
+fn tpad n ulong to void
+while lt rln RCMD n bound 256
+pb RCMD 97
+end
+end
+
+fn reclaimc to ulong
+rsz RBODY
+ap RBODY jrcmd
+apr RBODY RCMD
+ap RBODY jrend
+ret hpost 0 prec
+end
+
+note bsave keeps the body of the last response; bsame compares the last response's body with it.
+fn bsave to void
+b = get g GBODY
+rsz RSAVE
+apm RSAVE b sub get cu RRESP b
+end
+
+fn bsame to bool
+b = get g GBODY
+n = sub get cu RRESP b
+if ne n rln RSAVE
+ret false
+end
+ret same b get bs RSAVE n
+end
+
+note rowsave keeps generation, attempt, lease and status of s10; rowsame compares them again.
+note A schema without those columns (main) fails rowsame rather than stopping the driver.
+fn rowq to bool
+rsz RSQL
+ap RSQL sqhd
+ap RSQL trow10
+ret eq sqlrun 0
+end
+
+fn rowsave to void
+ok = rowq
+rsz RROW
+if ok
+apr RROW RFILE
+end
+end
+
+fn rowsame to bool
+if not rowq
+ret false
+end
+if ne rln RFILE rln RROW
+ret false
+end
+ret same get bs RFILE get bs RROW rln RROW
+end
+
 note ---- cockpit processes
 fn freeport to ulong
 a = new uchar 16 0
@@ -1264,7 +1444,9 @@ cockenv prt
 xarg bin
 end
 
-fn cockup slot ulong bin ulong to void
+note cockst starts cockpit binary argv[bin] as process slot and waits until it serves; false when
+note the process exits first or does not serve within 60 s.
+fn cockst slot ulong bin ulong to bool
 prt = freeport
 put g add GPORTA slot prt
 cockexec bin prt
@@ -1278,20 +1460,24 @@ pid = spawn -1 lf lf
 c = fclose lf
 ck gt pid 0 flog
 put g add GPIDA slot ulong pid
-ok = false
 i = ulong 0
 while lt i 600 bound 600
 if not alive pid
-break
+put g add GPIDA slot 0
+ret false
 end
 code = hgetp slot ptasks
 if eq code 200
-ok = true
-break
+ret true
 end
 z = sleepns 100000000
 i = add i 1
 end
+ret false
+end
+
+fn cockup slot ulong bin ulong to void
+ok = cockst slot bin
 ck ok flog
 end
 
@@ -1437,15 +1623,27 @@ end
 fn sttl to void
 settid ts9
 c1 = claim 0 agw9 0 0
-rep eq c1 409 n_ta
+rep and eq c1 400 jis kcode vinval n_ta
 c2 = claim 0 agw9 86401 0
-rep eq c2 409 n_tb
+rep and eq c2 400 jis kcode vinval n_tb
 c3 = claim 0 agw9 86400 0
 gn = gen0 jnum kgen
 rep eq c3 200 n_tc
 aidset 0
 c4 = hbeat agw9 gn 0
-rep eq c4 409 n_td
+rep and eq c4 400 jis kcode vinval n_td
+end
+
+note sjson: a claim body without agent_id, and a body that is not JSON, answer 400 invalid.
+fn sjson to void
+rsz RBODY
+ap RBODY jbadm
+c1 = hpost 0 pclaim
+rep and eq c1 400 jis kcode vinval n_ja
+rsz RBODY
+ap RBODY jbadj
+c2 = hpost 0 pclaim
+rep and eq c2 400 jis kcode vinval n_jb
 end
 
 fn le32 a view uchar * o ulong to int
@@ -1487,8 +1685,9 @@ sp ROUT
 rep ok n_bb
 end
 
-note sbusy: sqlite3 holds BEGIN IMMEDIATE on the database while the cockpit claims.
-fn sbusy to void
+note holdon: sqlite3 on RDB runs script t and keeps its transaction open; true once it printed
+note "held". holdoff rolls it back and reaps the process.
+fn holdon t view uchar * to bool
 pi = new uchar 8 0
 po = new uchar 8 0
 ck eq pipefds pi 0 8 524288 0 tbheld
@@ -1502,16 +1701,125 @@ z = fclose le32 pi 0
 z = fclose le32 po 4
 wi = le32 pi 4
 ro = le32 po 0
-z = write wi tbsql 0 len tbsql
-put g GLAST 0
-rep bheld ro n_ba
-bclaim
+put g GH ulong pid
+put g add GH 1 ulong wi
+put g add GH 2 ulong ro
+z = write wi t 0 len t
+ret bheld ro
+end
+
+fn holdoff to void
+wi = int get g add GH 1
 z = write wi tbrb 0 len tbrb
 z = fclose wi
-z = reap pid
-z = fclose ro
+z = reap int get g GH
+z = fclose int get g add GH 2
+end
+
+note sbusy: sqlite3 holds BEGIN IMMEDIATE on the database while the cockpit claims with a
+note command id; the busy answer is not recorded, so the same id is granted after the release.
+fn sbusy to void
+ok = holdon tbsql
+put g GLAST 0
+rep ok n_ba
+setcmd cidb1
+bclaim
+holdoff
 c = claim 0 agw9 300 0
+nocmd
 rep eq c 200 n_bc
+end
+
+note sreplay: claim, heartbeat, submit and verify of s10, each sent twice with one command id.
+fn sreplay to void
+settid ts10
+setcmd cidc1
+c1 = claim 0 agw2 300 0
+gn = gen0 jnum kgen
+rep eq c1 200 n_ra
+bsave
+rowsave
+c2 = claim 0 agw2 300 1
+rep and eq c2 200 bsame n_rb
+rep rowsame n_rc
+c3 = claim 0 agw2 301 1
+rep and eq c3 409 jis kcode vcmdc n_rd
+aidset 0
+sreplay2 gn
+end
+
+fn sreplay2 gn ulong to void
+setcmd cidh1
+c1 = hbeat agw2 gn 300
+bsave
+rowsave
+z = sleepns 20000000
+c2 = hbeat agw2 gn 300
+rep and and eq c1 200 eq c2 200 and bsame rowsame n_re
+setart asha2
+setcmd cidu1
+c3 = submit agw2 gn
+bsave
+c4 = submit agw2 gn
+rep and and eq c3 200 eq c4 200 bsame n_rf
+setcmd cidv1
+c5 = verify gn 1 true
+bsave
+c6 = verify gn 1 true
+rep and and eq c5 200 eq c6 200 bsame n_rg
+nocmd
+end
+
+note scmdid: id length 128 is accepted (verified s10 refuses the claim), 129 and a bad byte are
+note 400 invalid; then a refused claim is not recorded, so its id is decided again later.
+fn scmdid to void
+settid ts10
+rsz RCMD
+ap RCMD cidp
+tpad 128
+put g GCMD 1
+c1 = claim 0 agw2 300 0
+rep and eq c1 409 jis kcode vrefus n_rj
+settid ts11
+tpad 129
+c2 = claim 0 agw2 300 0
+rep and eq c2 400 jis kcode vinval n_ri
+setcmd cidbad
+c3 = claim 0 agw2 300 0
+rep and eq c3 400 jis kcode vinval n_rk
+nocmd
+c4 = claim 0 agw3 1 0
+setcmd cidx1
+c5 = claim 0 agw2 300 1
+z = sleepns 1500000000
+c6 = claim 0 agw2 300 1
+nocmd
+rep and and eq c4 200 eq c5 409 eq c6 200 n_rl
+end
+
+fn sexp t view uchar * to bool
+rsz RSQL
+ap RSQL sqhd
+ap RSQL texp1
+ap RSQL t
+ap RSQL tqend
+ret eq sqlrun 0
+end
+
+note srecl: a reclaim sweep with a command id, replayed after another lease expired, must not
+note sweep again; then every recorded id is in forge_commands exactly once.
+fn srecl to void
+ok1 = sexp ts12
+setcmd cidr1
+c1 = reclaimc
+bsave
+ok2 = sexp ts13
+c2 = reclaimc
+nocmd
+ok3 = sqlis tss13 tclnl
+rep and and ok1 ok2 and and eq c1 200 eq c2 200 and bsame ok3 n_rh
+put g GLAST 0
+rep sqlis tcnt tcntw n_rm
 end
 
 fn rtally ca ulong cb ulong to void
@@ -1613,6 +1921,131 @@ ok = and and eq get g add GRZ 2 0 eq get g GLOTH 0 and eq r 0 eq dbc grants
 rep ok n_race
 end
 
+note scross: one command id sent to both cockpit processes replays the first answer.
+fn scross to void
+settid ts14
+setcmd cidk1
+c1 = claim 0 agw3 300 0
+bsave
+c2 = claim 1 agw3 300 1
+rep and and eq c1 200 eq c2 200 bsame n_rx
+c3 = claim 1 agw3 301 1
+rep and eq c3 409 jis kcode vcmdc n_ry
+nocmd
+end
+
+fn rqtally ca ulong cb ulong to void
+if and eq ca 200 eq cb 200
+if bsame
+inc GQ
+ret
+end
+inc add GQ 2
+ret
+end
+if or and eq ca 200 eq cb 503 and eq ca 503 eq cb 200
+inc add GQ 1
+ret
+end
+inc add GQ 2
+end
+
+note sreprace: 40 trials; both cockpit processes get the identical claim with one command id at
+note once. Each trial must answer the same body twice (or 200 and 503), with one record per id.
+fn sreprace to void
+rsz RSQL
+ap RSQL sqhd
+ap RSQL sqbeg
+for i ulong 40
+ap RSQL sqi1
+pb RSQL 113
+apd RSQL i
+ap RSQL sqi2
+end
+ap RSQL sqcom
+ck eq sqlrun 0 n_rr
+for j ulong 40
+rqtrial j
+end
+nocmd
+put g GLAST 0
+say trr1
+apd ROUT get g GQ
+say trr2
+apd ROUT get g add GQ 1
+say trr3
+apd ROUT get g add GQ 2
+sp ROUT
+rep and eq get g add GQ 2 0 sqlis trq2 t4040 n_rr
+end
+
+fn rqtrial i ulong to void
+rsz RTID
+pb RTID 113
+apd RTID i
+rsz RCMD
+ap RCMD cidq
+apd RCMD i
+put g GCMD 1
+bopen
+bagent agra
+bttl 300
+hbuild RREQ true pclaim
+hbuild RREQ2 true pclaim
+fa = hconn get g GPORTA
+fb = hconn get g add GPORTA 1
+if eq and i 1 0
+oa = hput fa RREQ
+ob = hput fb RREQ2
+else
+ob = hput fb RREQ2
+oa = hput fa RREQ
+end
+ca = hrecv fa
+bsave
+cb = hrecv fb
+rqtally ca cb
+end
+
+note scommit: a rollback-journal database with a reader holding its lock, so no commit can
+note finish. The cockpit must refuse to serve it (the branch requires WAL mode and exits), and
+note the task row must be unchanged. A cockpit that serves fails, whatever its claim answers.
+fn scommit to void
+rsz RDB
+apa RDB 4
+ap RDB fcomdb
+cockup 0 3
+rsz RSQL
+ap RSQL sqhd
+sqtask tc1
+ck eq sqlrun 0 sqi1
+cockdn 0
+ok1 = sqlis tdelj tdelw
+ok2 = holdon tbsql2
+put g GLAST 0
+rep and ok1 ok2 n_cfa
+srv = cockst 0 3
+code = ulong 0
+if srv
+settid tc1
+code = claim 0 agw2 300 0
+end
+holdoff
+cockdn 0
+ok3 = sqlis tcomq tcopen
+say tcom1
+if srv
+pb ROUT 49
+else
+pb ROUT 48
+end
+say tcom2
+apd ROUT code
+sp ROUT
+put g GLAST code
+rep and and ok1 ok2 and not srv ok3 n_cf
+end
+
 fn shttp to void
 rsz RDB
 apa RDB 4
@@ -1629,6 +2062,11 @@ sqtask ts6
 sqtask ts7
 sqtask ts8
 sqtask ts9
+sqtask ts10
+sqtask ts11
+sqtask ts12
+sqtask ts13
+sqtask ts14
 ck eq sqlrun 0 sqi1
 screate
 st1
@@ -1638,13 +2076,17 @@ sstale
 sexpire
 sexhaust
 sttl
+sjson
 sbusy
+sreplay
+scmdid
+srecl
 srace
+scross
+sreprace
 cockdn 1
 cockdn 0
-say n_nr
-flush
-inc GNRUN
+scommit
 end
 
 note ---- migrate mode
@@ -1692,6 +2134,12 @@ rep and eq c5 200 eq jnum kgen 1 n_mg
 settid tm3
 c6 = claim 0 agnew 300 0
 rep eq c6 200 n_mh
+cockdn 0
+put g GLAST 0
+rep sqlis tcmdt t1nl n_mi
+cockup 0 3
+put g GLAST 0
+rep and sqlis tcols t21 sqlis tcmdt t1nl n_mj
 cockdn 0
 end
 
@@ -1979,7 +2427,7 @@ end
 end
 
 note tdump: one observation line per row, "refused next_state next_generation"; refused is 0
-note for HTTP 200, 1 for 409, 2 for anything else. A reap is observed by its row alone.
+note for HTTP 200, 1 for 409, 3 for 400, 2 for anything else. A reap is observed by its row alone.
 fn tdump op ulong j0 ulong j1 ulong to void
 rsz RSQL
 ap RSQL sqhd
@@ -2023,6 +2471,9 @@ end
 if eq c 409
 ret 1
 end
+if eq c 400
+ret 3
+end
 ret 2
 end
 
@@ -2054,17 +2505,297 @@ put g GROW add k0 sub j1 j0
 cockdn 0
 end
 
-note trowck: tv holds rules decision, state, generation, then observed refused, state, generation.
-fn trowck i ulong verbose bool bad ulong to bool
-for j ulong 3
-put tv j nxt GP1
+note ---- table op 7: command ids. Row j has dims P = j%2 (a prior request with the id),
+note I = (j/2)%5 (no id, short id, 128 bytes, 129 bytes, a '/'), M = (j/10)%2 (the prior request
+note was the identical claim of k<k>, or a claim of the decoy y<k>), T = j/20 (k<k> open,
+note verified, absent). The rules line is "7 prior idlen bad M has 0 0 0 sdec" and the observed
+note line is "http records changed".
+fn cdim j ulong d ulong to ulong
+if eq d 0
+ret rem j 2
 end
-for j2 ulong 3
-put tv add j2 3 nxt GP2
+if eq d 1
+ret rem div j 2 5
+end
+if eq d 2
+ret rem div j 10 2
+end
+ret div j 20
+end
+
+fn tcid j ulong k ulong to void
+iv = cdim j 1
+rsz RCMD
+put g GCMD 0
+if eq iv 0
+ret
+end
+put g GCMD 1
+pb RCMD 99
+apd RCMD k
+if eq iv 4
+ap RCMD tslx
+end
+if eq iv 2
+tpad 128
+end
+if eq iv 3
+tpad 129
+end
+end
+
+fn tcrow j ulong k ulong to void
+tt = cdim j 3
+ap RSQL sqi1
+pb RSQL 121
+apd RSQL k
+ap RSQL sqi2
+if eq tt 2
+ret
+end
+ap RSQL sqi1
+pb RSQL 107
+apd RSQL k
+ap RSQL sqi2
+if eq tt 1
+ap RSQL tkupd1
+apd RSQL k
+ap RSQL tqend
+end
+end
+
+fn tcseed k0 ulong to void
+rsz RSQL
+ap RSQL sqhd
+ap RSQL tcmdg
+ap RSQL sqbeg
+for j ulong 60
+tcrow j add k0 j
+end
+ap RSQL sqcom
+end
+
+fn tcclaim to ulong
+bopen
+bagent agentc
+bttl 300
+ret hpost 0 pclaim
+end
+
+fn tcph1 j ulong k ulong to void
+if or eq cdim j 0 0 eq cdim j 1 0
+ret
+end
+tcid j k
+rsz RTID
+if eq cdim j 2 1
+pb RTID 107
+else
+pb RTID 121
+end
+apd RTID k
+c = tcclaim
+end
+
+fn tcreq j ulong k ulong to void
+tcid j k
+rsz RTID
+pb RTID 107
+apd RTID k
+put tk add mul j 4 3 tcclaim
+end
+
+fn tcq k ulong to void
+ap RSQL td1
+apd RSQL k
+ap RSQL td2
+apd RSQL k
+ap RSQL td3
+if eq get g GCMD 1
+apr RSQL RCMD
+end
+ap RSQL td4
+end
+
+note tsd: the status code of stcode as the state decision of op 7 (open 0, claimed by a live
+note lease 3 HELD, verified 2 BADSTATE, absent 1 NOTFOUND).
+fn tsd s ulong to ulong
+if eq s 0
+ret 0
+end
+if eq s 1
+ret 3
+end
+if eq s 3
+ret 2
+end
+ret 1
+end
+
+fn tcin j ulong s1 ulong c1 ulong to void
+tcid j add get g GK0 j
+iv = cdim j 1
+has = ulong 1
+if eq iv 0
+has = 0
+end
+bad = ulong 0
+if eq iv 4
+bad = 1
+end
+apd RTIN 7
+sp RTIN
+apd RTIN c1
+sp RTIN
+apd RTIN rln RCMD
+sp RTIN
+apd RTIN bad
+sp RTIN
+apd RTIN cdim j 2
+sp RTIN
+apd RTIN has
+ap RTIN tz3
+apd RTIN tsd s1
+nlr RTIN
+end
+
+fn tcobs j ulong sc ulong gn ulong cn ulong to void
+o = mul j 4
+s1 = get tk o
+chg = ulong 0
+if or ne sc s1 ne gn get tk add o 1
+chg = 1
+end
+apd RTOBS get tk add o 3
+sp RTOBS
+apd RTOBS cn
+sp RTOBS
+apd RTOBS chg
+nlr RTOBS
+tcin j s1 get tk add o 2
+end
+
+fn tcline j ulong p ulong q ulong ph ulong to void
+a = findc p q 124
+b = findc add a 1 q 124
+sc = stcode p a
+gn = pnum add a 1 b
+cn = pnum add b 1 q
+if eq ph 0
+o = mul j 4
+put tk o sc
+put tk add o 1 gn
+put tk add o 2 cn
+ret
+end
+tcobs j sc gn cn
+end
+
+fn tcdump ph ulong to void
+k0 = get g GK0
+rsz RSQL
+ap RSQL sqhd
+for j ulong 60
+tcid j add k0 j
+tcq add k0 j
+end
+ck eq sqlrun 0 td1
+p = get bs RFILE
+e = get cu RFILE
+for j2 ulong 60
+ck lt p e td1
+q = findc p e 10
+tcline j2 p q ph
+p = add q 1
+end
+end
+
+fn tcmd to void
+ch = get g GTCH
+inc GTCH
+rsz RDB
+apa RDB 4
+ap RDB ftbl
+apd RDB ch
+ap RDB fdbs
+cockup 0 3
+k0 = get g GROW
+put g GK0 k0
+tcseed k0
+ck eq sqlrun 0 tcmdg
+for j ulong 60
+tcph1 j add k0 j
+end
+tcdump 0
+for j2 ulong 60
+tcreq j2 add k0 j2
+end
+tcdump 1
+put g GROW add k0 60
+nocmd
+cockdn 0
+end
+
+fn httpof dec ulong sdec ulong to ulong
+if eq dec 11
+ret 200
+end
+if eq dec 12
+ret 409
+end
+if eq dec 13
+ret 400
+end
+if eq sdec 0
+ret 200
+end
+if eq sdec 1
+ret 404
+end
+if eq sdec 8
+ret 400
+end
+if eq sdec 9
+ret 503
+end
+if eq sdec 10
+ret 500
+end
+ret 409
+end
+
+note tfield: number idx (from 0) of the rules input line at tp..tq.
+fn tfield tp ulong tq ulong idx ulong to ulong
+put g GP4 tp
+put g add GP4 1 tq
+v = ulong 0
+r = ulong 0
+while le r idx bound 16
+v = nxt GP4
+r = add r 1
+end
+ret v
+end
+
+note trowok: op 7 compares HTTP status, record count and change; the other ops compare the
+note refusal class (0 granted, 3 invalid 400, 1 refused), next state and next generation.
+fn trowok tp ulong tq ulong to bool
+if eq tfield tp tq 0 7
+ex = httpof get tv 0 tfield tp tq 9
+if ne ex get tv 3
+ret false
+end
+if ne get tv 1 get tv 4
+ret false
+end
+ret eq get tv 2 get tv 5
 end
 ra = ulong 1
 if eq get tv 0 0
 ra = 0
+end
+if eq get tv 0 8
+ra = 3
 end
 ok = eq ra get tv 3
 if ne get tv 1 get tv 4
@@ -2073,9 +2804,21 @@ end
 if ne get tv 2 get tv 5
 ok = false
 end
+ret ok
+end
+
+note trowck: tv holds the 3 rules outputs, then the 3 observed values of the row.
+fn trowck i ulong verbose bool bad ulong to bool
+for j ulong 3
+put tv j nxt GP1
+end
+for j2 ulong 3
+put tv add j2 3 nxt GP2
+end
 tp = get g GP3
 tq = findc tp get g add GP3 1 10
 put g GP3 add tq 1
+ok = trowok tp tq
 if and not ok and verbose lt bad 40
 trowpr i tp tq
 end
@@ -2226,6 +2969,18 @@ mutant mf14 mtfal 1
 mutant mf15 mt15 1
 mutant mf16 mtfal 1
 mutant mf16 mtfal 2
+mutant mf17 mtfal 1
+mutant mf18 mtfal 1
+mutant mf19 mtfal 1
+mutant mf20 mtfal 1
+mutant mf21 mt21 1
+mutant mf22 mtfal 1
+mutant mf23 mtfal 1
+mutant mf24 mt24 1
+mutant mf25 mt25 1
+mutant mf26 mtfal 1
+mutant mf26 mtfal 2
+mutant mf27 mtfal 1
 end
 
 fn stable to void
@@ -2243,6 +2998,7 @@ tchunk op j0 j1
 j0 = j1
 end
 end
+tcmd
 psc ftin
 ck wfile RTIN ftin
 psc ftobs
