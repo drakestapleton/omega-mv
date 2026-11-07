@@ -111,6 +111,8 @@ def fresh(port, cid, opn, tgt, *args):
     (a stale command is not recorded, so the same id may be posted again)."""
     for k in range(20):
         rc, s = view(port)
+        if s is None:
+            return rc, None
         rc, a = cmd(port, cid, opn, tgt, s, *args)
         if not (a and a['status'] == 'stale'):
             return rc, a
