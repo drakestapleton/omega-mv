@@ -60,8 +60,11 @@ fib38), so any future codegen A/B reports an aligned control.
      re-extended (`UBFM`/`SBFM`), so 64-bit compares are exact and ΩIR's modulo-2^w results hold;
    - const: MOVZ, MOVN, or MOVZ + MOVK on the nonzero halfwords; add sub mul and or xor neg not; div (SDIV/UDIV gives
      ΩIR's divisor-0 and MIN/-1 results); rem = `a - (a/b) b` via MSUB, then CSEL to 0 when b = 0;
-   - shl shr: LSLV/LSRV/ASRV at 64 and (W form) 32 bits, amount masked for 8 and 16; rotl rotr at 32 and 64 (RORV W/X,
-     rotl by the negated amount); min max: CMP + CSEL; eq..ge: CMP + CSET; select: CMP c, #0 + CSEL;
+   - shl shr: LSLV/LSRV/ASRV at 64 and (W form) 32 bits, amount masked for 8 and 16; rotl rotr (RORV W/X, rotl by the
+     negated amount) at 32 and 64 bits, and at 8 and 16 bits on a copy in x16 that repeats the value across 32 bits
+     (ORR with itself shifted by the width, twice for u8; the width divides 32, so the low bits of the 32-bit rotation
+     are the narrow rotation by the amount modulo the width), then re-extended; min max: CMP + CSEL; eq..ge: CMP + CSET;
+     select: CMP c, #0 + CSEL;
      integer conv and bitcast: move + re-extend;
    - br: block arguments as one parallel move, `B` omitted on fall-through; cbr: CBNZ/CBZ (+ B);
      call: arguments 8.. stored to the outgoing slots `[sp, 8j]` (through x16 from a spill slot), arguments 0..7 to
@@ -157,7 +160,7 @@ BLR, SVC, ADR and the FP set.
    float elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass that
    proves them (IR.md s15).
 3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
-4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, host words beyond
+4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), host words beyond
    read, write, monons, realns, cpufence and cpurelax (sleepns 120 has no ngrun reference: ngrun's host words are
    read, write, monons, realns, cpufence, cpurelax).
 
@@ -212,13 +215,19 @@ BLR, SVC, ADR and the FP set.
   above 9223372036, the add overflowing) and the failed-call path cannot be reached by a live clock; they are checked
   by reading the encoded sequence (objdump) against omc's hclock, not by a fixture.
 
-  Twenty-four mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
+  `r-rot` (u8 181 and u16 46531 rotated left and right by 12 amounts each, many past the width; every result printed
+  and folded into the exit status; Wolfram on two rows: rotl/rotr u8 by 23 = da/6b, u16 by 2731 = 1dae/b876) and
+  `r-s12` (ngrand seed 12 shrunk by `ngrand shrink` to the `rotr u8` that a64 refused, kept as found) cover narrow
+  rotations.
+
+  Twenty-six mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
   frame size, 16-byte entry alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half
   zero fill, write count, u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending, a wrong
   trap code for chk.divovf, stack parameters read from the first incoming slot, stack arguments stored one slot low,
   a slice's length taken from its offset, slice block arguments keeping the target's length, slice offsets not
-  scaled by the element size, monons selecting on GE, fill stores unscaled, realns on the monotonic clock) must each
-  change at least one fixture's status (against its expectation or ngrun's) or alignment.
+  scaled by the element size, monons selecting on GE, fill stores unscaled, realns on the monotonic clock, the u8 and
+  the u16 rotate copies shifted wrong) must each change at least one fixture's status (against its expectation or
+  ngrun's) or alignment.
 - Front phase of `rgate.om` (rgate step 6; branch ng/slice-m1, where ng.units holds ir, front, a64, main): for each
   source of rgate's list `tfr` (ng-ir's 14 integer `x-*.om` run pairs and ng-front's nine integer bench kernels
   arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul at full size) ng reads `@ng front-ir` and the
@@ -231,6 +240,13 @@ BLR, SVC, ADR and the FP set.
   `tests/front/fib39.om` must be sound and must differ in stdout (Wolfram: Fibonacci[39] = 63245986, Fibonacci[40] =
   102334155), so a comparison that cannot see a different result fails the gate. Mutants run on the mkir and ngrun
   phases only.
+- Random phase of `rgate.om` (rgate step 7, D9; branch ng/a64-rand, which merges ng-ir's ng/ir-rand): ngrand (ng-ir's
+  generator, `seed/ng/ngrand.om`) writes a unit valid by construction for each seed 1..1000 (helpers with narrow
+  parameters, every value op and check, memory under chk.bounds, calls, diamonds, counted loops, traps and exits);
+  each goes through the ngrun-fixture checks above, with ngrand's status in place of ngas's. A refusal by ng fails
+  the seed: before the narrow rotations, 147 of seeds 1..1000 were refused (all `rotr`/`rotl` on u8 or u16) and none
+  gave a wrong result. Negative control: ngrun's run of seed 1 against the `@ng a64` ELF of seed 2 must be sound
+  and differ. Mutants do not run this phase (a 1..200 hunt with mutant 1 gave 29 wrong seeds, outside rgate).
 - ΩIR gap met by sort and chacha: a call argument must have exactly the parameter's type (IR.md row 64), so Omega
   passing an `edit` array or slice to a `view` parameter has no ΩIR form while `view` maps to access 0. The fixtures
   type such parameters as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
