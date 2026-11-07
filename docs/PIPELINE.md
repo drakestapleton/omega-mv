@@ -6,7 +6,7 @@ Source snapshot: `ec07d25d5506d33567adbd4d9b518177b7933bad` (2026-10-26).
 
 ## Pull request checks
 
-`AIEN Checks` runs on pull requests and pushes to `main`. It verifies crumbs and,
+`AIEN Checks` runs on pull requests and pushes to `main` (no crumb step since DRA-97) and,
 for repositories enrolled by `.aien/verify.pub` at the base ref, runs the portable
 smoke set selected from the base ref. It does not fetch a signed Spark bundle for
 every pull request. Hosted checks are advisory, not Alpha qualification.

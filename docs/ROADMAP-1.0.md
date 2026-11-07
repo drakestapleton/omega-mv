@@ -137,7 +137,7 @@ Acceptance:
 - #775 fixed with a fixture (empty text to `view uchar *` returns `len` 0) and a mutant that restores the
   defect and is killed.
 - #789 resolved (merged or superseded) so a missing IR oracle can never yield a qualification PASS.
-- `crumb verify .` OK with the tool pinned in `crumb.lock`.
+- (Retired, DRA-97, 2026-11-07: Crumbs left the active workflow, so `crumb verify .` is no longer a 1.0 criterion.)
 
 ### RM2. Executable contracts
 
