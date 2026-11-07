@@ -19,7 +19,7 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 Current pin after the execenv 233 host word (branch `hive/execprog-env`, 2026-11-07): committed
 `seed/out/omc` SHA-256
-`cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a`, compiler
+`ee5fc83e357c7285e20ae9246d8129cdf8833b74f7205242e17fa62382334dfa`, compiler
 source SHA-256 `062c9649af6a1d499b911e5b2f39b5419d7b75047616fe59fbcdc25f7b7b5b73`.
 The previous pin, after the x86efi anchor fix (#1054, merged as
 `3e3dc205d`), was
@@ -162,7 +162,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a \
+    ee5fc83e357c7285e20ae9246d8129cdf8833b74f7205242e17fa62382334dfa \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -392,7 +392,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc ee5fc83e357c7285e20ae9246d8129cdf8833b74f7205242e17fa62382334dfa neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch

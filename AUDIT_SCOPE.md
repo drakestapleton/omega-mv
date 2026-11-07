@@ -23,7 +23,7 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a`,
+   `ee5fc83e357c7285e20ae9246d8129cdf8833b74f7205242e17fa62382334dfa`,
    from `seed/omc/omc.om` `062c9649af6a1d499b911e5b2f39b5419d7b75047616fe59fbcdc25f7b7b5b73`; the execenv 233
    host word, branch `hive/execprog-env`). The earlier audit pins `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`
    (PR #1054, main 3e3dc205), `b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3`
