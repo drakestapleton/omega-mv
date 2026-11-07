@@ -8,8 +8,8 @@ compiler=${OMEGA_COMPILER:-"$root/build/allen-toolchain/seed/out/omc"}
  echo 'pinned compiler missing; follow native/omega/allen/README.md' >&2
  exit 69
 }
-# Pin: omega-mv 81ab1900, tag allen-omc-pin-81ab1900 (#981 head on unmerged #980 on #977): register slots, live-slot calls, the efi 11 file word, const/bitcast and the site tables.
-[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = 9995f8534e0e54470194d57f163421add779cf1994062f8d9a417d0a39f2b075 ] || {
+# Pin: omega-mv b8bd1d03 (local branch fix/imac-net-L974-snp on 81ab1900; compiler change pending its own review): register slots, live-slot calls, the efi 11 file word, const/bitcast, the site tables and the efi 8 link keep. AArch64 output is byte-identical to 81ab1900.
+[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = 2eeab5147deb8320cb1bc7f86a5f3de534955ff89f76be2832155348706e0164 ] || {
  echo 'compiler digest differs from the qualified pin' >&2
  exit 65
 }

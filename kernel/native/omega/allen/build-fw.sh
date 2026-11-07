@@ -8,9 +8,10 @@ root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 A=$root/native/omega/allen
 compiler=${OMEGA_COMPILER:-"$root/build/allen-toolchain/seed/out/omc"}
 [ -f "$compiler" ] && [ -x "$compiler" ] || { echo 'pinned compiler missing; follow native/omega/allen/README.md' >&2; exit 69; }
-# Pin: omega-mv 81ab1900, tag allen-omc-pin-81ab1900 (#981 head on unmerged #980 on #977): register slots, live-slot calls,
-# the efi 11 file word, const/bitcast and the 65536-entry site tables the firmware unit needs.
-[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = 9995f8534e0e54470194d57f163421add779cf1994062f8d9a417d0a39f2b075 ] || {
+# Pin: omega-mv b8bd1d03 (local branch fix/imac-net-L974-snp on 81ab1900, tag allen-omc-pin-81ab1900; compiler change
+# pending its own review): register slots, live-slot calls, the efi 11 file word, const/bitcast, the 65536-entry site
+# tables the firmware unit needs, and efi 8 keeping a no-link adapter initialized with its scan report in efi 0.
+[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = 2eeab5147deb8320cb1bc7f86a5f3de534955ff89f76be2832155348706e0164 ] || {
  echo 'compiler digest differs from the qualified pin' >&2
  exit 65
 }
