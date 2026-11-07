@@ -370,3 +370,17 @@ decoded by a second `hpack`/`xhpack` pass; no function was added (508 of 512).
 Every one of the 1357 tracked `.om` files compiles to the same bytes, exit
 status and diagnostics under `5f90edea` and `cfd96b48`, so no existing unit's
 emission changes. Gate: `seed/host/execenv/execenv.cases`.
+
+The prlimit 235 host word (branch `seed/prlimit-host-word`, PROPOSED pending
+review) births compiler
+`3c2817a556143012a4914019a1e214a467d3d52a4deaa65a4e77f8f20b012079`
+from source
+`9e7b892192d2dd18c551f81d2b9b3a68c86722cfb07c503c2892047897cd7edd`.
+`prlimit pid res A off n` is Linux `prlimit64`: AArch64 syscall 261 (`hprlim`,
+x0 pid, x1 res, x2 new, x3 old) and x86-64 syscall 302 (`xhprlim`, rdi pid,
+rsi res, rdx new, r10 old). `n` 16 passes new = NULL and old = &A[off]; `n` 32
+passes new = &A[off] and old = &A[off+16]; any other `n` sets -22 and skips the
+SVC/`syscall`. Two functions were added (510 of 512). Every one of the 1439
+tracked `.om` files compiles to the same bytes, exit status and diagnostics
+under `cfd96b48` and `3c2817a5`, so no existing unit's emission changes. Gate:
+`seed/host/prlimit/prlimit.cases`.

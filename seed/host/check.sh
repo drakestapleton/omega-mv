@@ -127,6 +127,9 @@ echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # execenv 233: exact child environment (AArch64 and x86linux), printenv ORACLE, execprog negative
 # control, function-mode and contract refusals, and 4 omc.om mutants killed (seed/host/execenv/).
 "$B/gate" seed/out/omc "$pin" seed/host/execenv/execenv.cases "$run/execenv"
+# prlimit 235: rlimit read/set/effect against /proc/self/limits (AArch64 and x86linux), RLIMIT_AS kept
+# across execprog, refusals, and 6 omc.om mutants killed (seed/host/prlimit/).
+"$B/gate" seed/out/omc "$pin" seed/host/prlimit/prlimit.cases "$run/prlimit"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2
