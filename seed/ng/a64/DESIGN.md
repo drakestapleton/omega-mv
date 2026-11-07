@@ -7,7 +7,9 @@ Code: `seed/ng/src/a64.om` (unit of `seed/ng/ng.units`, between `ir.om` and `mai
 
 ## 1. Job
 
-`ng` modes owned by this unit (`a6_mode`, called from `main.om` before the unknown-mode exit):
+`ng` modes owned by this unit. `main.om` reads the mode line apart and asks `a6_mode m` (through `ng_mlb`, since
+an earlier unit cannot name main's globals) before its unknown-mode exit; it then reads the payload into `i_in` from
+offset 0 with ir-copy's limit and refusals, and calls `a6_run`, which runs the mode and exits:
 
 | first line | payload | output |
 |---|---|---|
