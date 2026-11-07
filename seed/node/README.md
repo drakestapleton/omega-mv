@@ -962,10 +962,12 @@ an earlier incarnation. Dependency readiness is restored: a publication
 that makes waiting jobs ready leaves a readiness record, and a job it made
 ready is ready again after recovery.
 
-Replay is exact at drained points: after `jn_drain`, which runs first in
-every journal append and in every `auth_step`. Decisions and readiness wait
-in the volatile ring until then. A dispatch decision is drained before the
-START of any job it assigned, so no job runs on an undrained decision. A
+Replay is exact at drained points: after a successful `jn_drain`, which runs
+first in every journal append and in every `auth_step`. Decisions and
+readiness wait in the volatile ring until then. For authority-mediated
+actions, the dispatch decision is drained durably before START and before
+the action grant; assignment, worker wakeup and the worker's work before
+its grant may happen before that drain. A
 publication's readiness is not durable when `sched_publish` returns: a crash
 before the next drain loses it, and the published artifact with it (the pool
 is not journaled either), so recovery is as if the publication had not
@@ -1057,7 +1059,7 @@ fails the recovery (31).
 The gate runs four cases (policy 1 and 2, crash after 3 and after 6 of 10
 dispatch events) and four special checks:
 - R, a reference creator, runs all events on journal a; C runs the first k on journal b and dies; C2 recovers journal b and runs the rest. Before event 1 the creator publishes the topic job 7001 waits on, so 7001 is ready by publication across the crash. C2's state right after recovery equals R's after event k (cursor, reserved job, slots, ids and bypass counts of ready jobs, needs, estimates, uncertainties and topics of every unfinished job, policy words with the ticket lifetime 777, capacities, bypass sum, job 7001's state and bypass count), and C plus C2 make the same decisions as R, event by event. C3 recovers journal b once more and equals R's final state. Each case also proves it tests something: a bypass count, a nonzero cursor and job 7001 ready at the boundary, a reservation during the run, a final cursor different from the boundary's.
-- Mid-event crash: C' dies right after a dispatch and its PAUSE record, before any job runs. C2' has that event's cursor and reservation and the bypass counts of the jobs it did not assign; the jobs it assigned are ready again.
+- Mid-event crash: C' dies right after a dispatch and its PAUSE record, before the creator collects or releases the jobs it assigned (the replay workers are not stopped from finishing them). C2' has that event's cursor and reservation and the bypass counts of the jobs it did not assign; the jobs it assigned are ready again.
 - Records refused: a FAIR that repeats the last event, a FAIR naming a free slot, an OPEN written under another `SPVER`, an ADMIT into a held slot (23), a FAIR assigning and bypassing one slot (24), a FAIR assigning a waiting job (26), a readiness record for a ready job (27; a valid one at the last event is accepted), a FAIR reserving a cancelled job (25), a first FAIR that both assigns and readies (28: refused, nothing changes).
 - Failed journal: revoke, pause, cancel, admission, policy, capacities and goal each return their refusal and change nothing; a full ring stops dispatch (44) and publication (47).
 - Fence range (29): recovery refuses fence 2^24 + 1, which a 24-bit mask would fold onto incarnation 1, and leaves the scheduler unincarnated; fence 2^24 - 1 is then accepted.
