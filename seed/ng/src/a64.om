@@ -1,0 +1,3166 @@
+note a64: the Omega NG AArch64 back end (lane ng-a64), one unit of the ng compiler (DECISIONS.md D1b): ng is the
+note concatenation listed in seed/ng/ng.units, so this file has no fn main; its functions are a6_*, its globals a_*.
+note Design: seed/ng/a64/DESIGN.md. Instruction bits: Arm ARM DDI 0487 M.d, section named at each form (the source
+note of seed/rung2/table.s2). Input is the payload main read into i_in (ir.om) from offset 0, a_inlen bytes; main's
+note hooks are a6_mode m (does the mode line name a mode of this unit) and a6_run (run it). `@ng a64-enc` takes an
+note encoder case list (seed/ng/a64/tests/enc.cases after its mode line) and writes one little-endian word per case.
+note OM-2 (hex words) comes from the unit's first line, at the top of ir.om.
+
+note ---- input and output pools ----
+global a_inlen ulong 1
+global a_code uchar 16777216
+global a_cn ulong 1
+
+note a_emsg: line 0 the prefix, line k the class of refusal k (a6_die c k n)
+text a_emsg "a64:\n input unreadable\n input too large\n output failed\n bad encoder case at line\n unsupported\n immediate out of range\n branch out of range\n IR refused (exit status = IR.md s11 class) at payload byte\n reserved operand value\n"
+
+note ---- fatal refusal: one stderr line `a64: <message>[ <n>]` and exit code c (nothing on stdout) ----
+fn a6_lst k ulong to ulong
+note byte offset of line k of a_emsg
+i = ulong 0
+j = ulong 0
+while and lt j k lt i len a_emsg bound 4096
+if eq get a_emsg i 10
+j = add j 1
+end
+i = add i 1
+end
+ret i
+end
+
+global a_nbuf uchar 24
+
+fn a6_pnum v ulong to void
+p = ulong 23
+put a_nbuf 23 10
+x = v
+go = true
+while go bound 24
+p = sub p 1
+put a_nbuf p uchar add rem x 10 48
+x = div x 10
+if eq x 0
+go = false
+end
+end
+p = sub p 1
+put a_nbuf p 32
+w = write 2 a_nbuf p sub 24 p
+end
+
+fn a6_die c ulong k ulong n ulong to void
+w = write 2 a_emsg 0 4
+o = a6_lst k
+e = sub a6_lst add k 1 1
+w2 = write 2 a_emsg o sub e o
+if ne n 18446744073709551615
+a6_pnum n
+else
+w3 = write 2 a_emsg 4 1
+end
+exit int c
+end
+
+note ---- output: little-endian words into a_code, then all of a_code to stdout ----
+fn a6_emitw w ulong to void
+o = get a_cn 0
+if gt add o 4 len a_code
+a6_die 4 3 18446744073709551615
+end
+put a_code o uchar and w 255
+put a_code add o 1 uchar and shr w 8 255
+put a_code add o 2 uchar and shr w 16 255
+put a_code add o 3 uchar and shr w 24 255
+put a_cn 0 add o 4
+end
+
+fn a6_flush to void
+p = ulong 0
+n = get a_cn 0
+while lt p n bound 100000000
+k = write 1 a_code p sub n p
+if le k 0
+a6_die 4 3 18446744073709551615
+end
+p = add p ulong k
+end
+end
+
+note ======== encoder: one 32-bit A64 instruction word per form ========
+note A form is a row of the table set by a6_init: base word (the encoding diagram with every operand field 0,
+note Arm ARM DDI 0487 M.d section in the note above each group) and an operand kind. a6_enc f a b c d e builds the
+note word from up to five operands. Register numbers are 0..31 (31 is ZR or SP as the form says). An operand that
+note does not fit its field is refused (a6_die 6 or 7), never masked; so is an in-field value whose encoding the
+note form reserves (a6_die 9, a6_rsv). The names in a_fnam are the names the encoder case list
+note (seed/ng/a64/tests/enc.cases) uses, in form id order.
+note Kinds: 1 R3 (d n m sh amt): base | d | n<<5 | m<<16 | sh<<22 | amt<<10; 2 R4 (d n m a): | a<<10;
+note 3 EXT (d n m opt amt): | opt<<13 | amt<<10; 4 IMM12 (d n imm sh): | imm<<10 | sh<<22; 5 LOGI (d n value);
+note 6 MOVW (d imm16 hw): | imm<<5 | hw<<21; 7 BFM (d n immr imms); 8 CSEL (d n m cond): | cond<<12;
+note 9 LDST (t n imm12); 10 LDSR (t n m s): register offset LSL, s = scaled; 11 PAIR (t t2 n off): signed
+note byte offset /8 at bit 15; 12 B26 (words); 13 BCOND (cond words); 14 CB (t words); 15 TB (t bit words);
+note 16 BR (n); 17 SVC (imm16); 18 ADR (d bytes); 19 R2 (d n); 20 FCMP (n m); 21 EXTR (d n m lsb).
+note Signed operands (distances, pair offsets) are two's complement ulongs.
+
+global a_fbase ulong 256
+global a_fkind uchar 256
+global a_nform ulong 1
+
+text a_fnam "addx addw subx subw addsx addsw subsx subsw andx andw orrx orrw eorx eorw andsx bicx ornx mulx mulw smulh umulh sdivx udivx sdivw udivw lslvx lsrvx asrvx rorvx lslvw lsrvw asrvw maddx msubx addxe subsxe addxi addwi subxi subwi addsxi subsxi subswi addswi andxi orrxi eorxi andsxi andwi orrwi eorwi movzx movnx movkx movzw movnw ubfmx sbfmx ubfmw sbfmw extrx cselx csincx csinvx csnegx strb ldrb ldrsbx strh ldrh ldrshx strw ldrw ldrsw strx ldrx strs ldrs strd ldrd strbr ldrbr ldrsbxr strhr ldrhr ldrshxr strwr ldrwr ldrswr strxr ldrxr strsr ldrsr strdr ldrdr stpx ldpx stpxpre ldpxpre stpxpost ldpxpost stpd ldpd b bl bcond cbzx cbnzx cbzw cbnzw tbz tbnz ret br blr svc adr faddd fsubd fmuld fdivd fmaxd fmind fmaxnmd fminnmd fadds fsubs fmuls fdivs fmaxs fmins fmaxnms fminnms fsqrtd fabsd fnegd fmovd fsqrts fabss fnegs fmovs fcmpd fcmps fmaddd fmadds fcvtds fcvtsd fmovxd fmovdx fmovws fmovsw scvtfdx ucvtfdx scvtfsx ucvtfsx fcvtzsxd fcvtzuxd fcvtzsxs fcvtzuxs rorvw"
+
+fn a6_fset i ulong b ulong k ulong to void
+put a_fbase i b
+put a_fkind i uchar k
+if ge i get a_nform 0
+put a_nform 0 add i 1
+end
+end
+
+note form ids used by the selector (index into a_fnam)
+const a_addx ulong 0
+const a_addw ulong 1
+const a_subx ulong 2
+const a_subw ulong 3
+const a_addsx ulong 4
+const a_subsx ulong 6
+const a_subsw ulong 7
+const a_andx ulong 8
+const a_orrx ulong 10
+const a_eorx ulong 12
+const a_andsx ulong 14
+const a_ornx ulong 16
+const a_mulx ulong 17
+const a_mulw ulong 18
+const a_smulh ulong 19
+const a_umulh ulong 20
+const a_sdivx ulong 21
+const a_udivx ulong 22
+const a_udivw ulong 24
+const a_lslvx ulong 25
+const a_lsrvx ulong 26
+const a_asrvx ulong 27
+const a_lslvw ulong 29
+const a_maddx ulong 32
+const a_msubx ulong 33
+const a_subsxe ulong 35
+const a_addxi ulong 36
+const a_subxi ulong 38
+const a_addsxi ulong 40
+const a_subsxi ulong 41
+const a_andxi ulong 44
+const a_orrxi ulong 45
+const a_eorxi ulong 46
+const a_movzx ulong 51
+const a_movnx ulong 52
+const a_movkx ulong 53
+const a_ubfmx ulong 56
+const a_sbfmx ulong 57
+const a_cselx ulong 61
+const a_csincx ulong 62
+const a_strb ulong 65
+const a_ldrb ulong 66
+const a_strx ulong 74
+const a_ldrx ulong 75
+const a_strd ulong 78
+const a_ldrd ulong 79
+const a_strbr ulong 80
+const a_ldrbr ulong 81
+const a_ldrxr ulong 90
+const a_stpx ulong 95
+const a_ldpx ulong 96
+const a_stpxpr ulong 97
+const a_ldpxpo ulong 100
+const a_stpd ulong 101
+const a_ldpd ulong 102
+const a_b ulong 103
+const a_bl ulong 104
+const a_bcond ulong 105
+const a_cbzx ulong 106
+const a_cbnzx ulong 107
+const a_ret ulong 112
+const a_svc ulong 115
+const a_adr ulong 116
+const a_fmovd ulong 136
+const a_fcmpd ulong 141
+const a_fmovxd ulong 147
+const a_fmovdx ulong 148
+
+note the form table. Sections: C6.2.6 ADD, C6.2.458 SUB, C6.2.8 ADDS, C6.2.465 SUBS, C6.2.15 AND, C6.2.302 ORR,
+note C6.2.156 EOR, C6.2.17 ANDS, C6.2.32 BIC, C6.2.300 ORN (shifted register; 32-bit forms clear bit 31)
+fn a6_formdp to void
+a6_fset 0 0x8b000000 1
+a6_fset 1 0x0b000000 1
+a6_fset 2 0xcb000000 1
+a6_fset 3 0x4b000000 1
+a6_fset 4 0xab000000 1
+a6_fset 5 0x2b000000 1
+a6_fset 6 0xeb000000 1
+a6_fset 7 0x6b000000 1
+a6_fset 8 0x8a000000 1
+a6_fset 9 0x0a000000 1
+a6_fset 10 0xaa000000 1
+a6_fset 11 0x2a000000 1
+a6_fset 12 0xca000000 1
+a6_fset 13 0x4a000000 1
+a6_fset 14 0xea000000 1
+a6_fset 15 0x8a200000 1
+a6_fset 16 0xaa200000 1
+note C6.2.293 MUL (MADD Ra=31), C6.2.370 SMULH, C6.2.505 UMULH, C6.2.366 SDIV, C6.2.490 UDIV, C6.2.271 LSLV,
+note C6.2.274 LSRV, C6.2.21 ASRV, C6.2.343 RORV
+a6_fset 17 0x9b007c00 1
+a6_fset 18 0x1b007c00 1
+a6_fset 19 0x9b407c00 1
+a6_fset 20 0x9bc07c00 1
+a6_fset 21 0x9ac00c00 1
+a6_fset 22 0x9ac00800 1
+a6_fset 23 0x1ac00c00 1
+a6_fset 24 0x1ac00800 1
+a6_fset 25 0x9ac02000 1
+a6_fset 26 0x9ac02400 1
+a6_fset 27 0x9ac02800 1
+a6_fset 28 0x9ac02c00 1
+a6_fset 29 0x1ac02000 1
+a6_fset 30 0x1ac02400 1
+a6_fset 31 0x1ac02800 1
+note C6.2.275 MADD, C6.2.291 MSUB
+a6_fset 32 0x9b000000 2
+a6_fset 33 0x9b008000 2
+note C6.2.4 ADD (extended register), C6.2.463 SUBS (extended register)
+a6_fset 34 0x8b200000 3
+a6_fset 35 0xeb200000 3
+note C6.2.5 ADD, C6.2.457 SUB, C6.2.7 ADDS, C6.2.464 SUBS (immediate)
+a6_fset 36 0x91000000 4
+a6_fset 37 0x11000000 4
+a6_fset 38 0xd1000000 4
+a6_fset 39 0x51000000 4
+a6_fset 40 0xb1000000 4
+a6_fset 41 0xf1000000 4
+a6_fset 42 0x71000000 4
+a6_fset 43 0x31000000 4
+note C6.2.14 AND, C6.2.301 ORR, C6.2.155 EOR, C6.2.16 ANDS (immediate)
+a6_fset 44 0x92000000 5
+a6_fset 45 0xb2000000 5
+a6_fset 46 0xd2000000 5
+a6_fset 47 0xf2000000 5
+a6_fset 48 0x12000000 5
+a6_fset 49 0x32000000 5
+a6_fset 50 0x52000000 5
+note C6.2.285 MOVZ, C6.2.284 MOVN, C6.2.283 MOVK
+a6_fset 51 0xd2800000 6
+a6_fset 52 0x92800000 6
+a6_fset 53 0xf2800000 6
+a6_fset 54 0x52800000 6
+a6_fset 55 0x12800000 6
+note C6.2.488 UBFM, C6.2.355 SBFM, C6.2.162 EXTR
+a6_fset 56 0xd3400000 7
+a6_fset 57 0x93400000 7
+a6_fset 58 0x53000000 7
+a6_fset 59 0x13000000 7
+a6_fset 60 0x93c00000 21
+note C6.2.115 CSEL, C6.2.117 CSINC, C6.2.118 CSINV, C6.2.119 CSNEG
+a6_fset 61 0x9a800000 8
+a6_fset 62 0x9a800400 8
+a6_fset 63 0xda800000 8
+a6_fset 64 0xda800400 8
+end
+
+note loads and stores: C6.2.417 STRB, C6.2.220 LDRB, C6.2.224 LDRSB, C6.2.419 STRH, C6.2.222 LDRH, C6.2.226
+note LDRSH, C6.2.415 STR, C6.2.216 LDR, C6.2.228 LDRSW, C7.2.331 STR (SIMD&FP), C7.2.191 LDR (SIMD&FP); unsigned
+note offset (kind 9) then the same bases as register offset (kind 10)
+fn a6_formls to void
+a6_fset 65 0x39000000 9
+a6_fset 66 0x39400000 9
+a6_fset 67 0x39800000 9
+a6_fset 68 0x79000000 9
+a6_fset 69 0x79400000 9
+a6_fset 70 0x79800000 9
+a6_fset 71 0xb9000000 9
+a6_fset 72 0xb9400000 9
+a6_fset 73 0xb9800000 9
+a6_fset 74 0xf9000000 9
+a6_fset 75 0xf9400000 9
+a6_fset 76 0xbd000000 9
+a6_fset 77 0xbd400000 9
+a6_fset 78 0xfd000000 9
+a6_fset 79 0xfd400000 9
+i = ulong 0
+while lt i 15 bound 15
+a6_fset add 80 i get a_fbase add 65 i 10
+i = add i 1
+end
+note C6.2.414 STP, C6.2.213 LDP (64-bit: signed offset, pre-index, post-index); C7.2.330 STP, C7.2.190 LDP (D)
+a6_fset 95 0xa9000000 11
+a6_fset 96 0xa9400000 11
+a6_fset 97 0xa9800000 11
+a6_fset 98 0xa9c00000 11
+a6_fset 99 0xa8800000 11
+a6_fset 100 0xa8c00000 11
+a6_fset 101 0x6d000000 11
+a6_fset 102 0x6d400000 11
+note C6.2.35 B, C6.2.43 BL, C6.2.34 B.cond, C6.2.78 CBZ, C6.2.77 CBNZ, C6.2.481 TBZ, C6.2.480 TBNZ,
+note C6.2.338 RET, C6.2.46 BR, C6.2.44 BLR, C6.2.466 SVC, C6.2.11 ADR
+a6_fset 103 0x14000000 12
+a6_fset 104 0x94000000 12
+a6_fset 105 0x54000000 13
+a6_fset 106 0xb4000000 14
+a6_fset 107 0xb5000000 14
+a6_fset 108 0x34000000 14
+a6_fset 109 0x35000000 14
+a6_fset 110 0x36000000 15
+a6_fset 111 0x37000000 15
+a6_fset 112 0xd65f0000 16
+a6_fset 113 0xd61f0000 16
+a6_fset 114 0xd63f0000 16
+a6_fset 115 0xd4000001 17
+a6_fset 116 0x10000000 18
+end
+
+note scalar floating point (ftype bits 22..23: 00 single, 01 double): C7.2.50 FADD, C7.2.161 FSUB, C7.2.133 FMUL,
+note C7.2.98 FDIV, C7.2.111 FMAX, C7.2.121 FMIN, C7.2.113 FMAXNM, C7.2.123 FMINNM; C7.2.157 FSQRT, C7.2.46 FABS,
+note C7.2.139 FNEG, C7.2.129 FMOV (register); C7.2.66 FCMP; C7.2.105 FMADD; C7.2.69 FCVT; C7.2.131 FMOV
+note (general); C7.2.236 SCVTF, C7.2.355 UCVTF, C7.2.92 FCVTZS, C7.2.96 FCVTZU (scalar, integer)
+fn a6_formfp to void
+a6_fset 117 0x1e602800 1
+a6_fset 118 0x1e603800 1
+a6_fset 119 0x1e600800 1
+a6_fset 120 0x1e601800 1
+a6_fset 121 0x1e604800 1
+a6_fset 122 0x1e605800 1
+a6_fset 123 0x1e606800 1
+a6_fset 124 0x1e607800 1
+a6_fset 125 0x1e202800 1
+a6_fset 126 0x1e203800 1
+a6_fset 127 0x1e200800 1
+a6_fset 128 0x1e201800 1
+a6_fset 129 0x1e204800 1
+a6_fset 130 0x1e205800 1
+a6_fset 131 0x1e206800 1
+a6_fset 132 0x1e207800 1
+a6_fset 133 0x1e61c000 19
+a6_fset 134 0x1e60c000 19
+a6_fset 135 0x1e614000 19
+a6_fset 136 0x1e604000 19
+a6_fset 137 0x1e21c000 19
+a6_fset 138 0x1e20c000 19
+a6_fset 139 0x1e214000 19
+a6_fset 140 0x1e204000 19
+a6_fset 141 0x1e602000 20
+a6_fset 142 0x1e202000 20
+a6_fset 143 0x1f400000 2
+a6_fset 144 0x1f000000 2
+a6_fset 145 0x1e22c000 19
+a6_fset 146 0x1e624000 19
+a6_fset 147 0x9e660000 19
+a6_fset 148 0x9e670000 19
+a6_fset 149 0x1e260000 19
+a6_fset 150 0x1e270000 19
+a6_fset 151 0x9e620000 19
+a6_fset 152 0x9e630000 19
+a6_fset 153 0x9e220000 19
+a6_fset 154 0x9e230000 19
+a6_fset 155 0x9e780000 19
+a6_fset 156 0x9e790000 19
+a6_fset 157 0x9e380000 19
+a6_fset 158 0x9e390000 19
+note C6.2.302 RORV, 32-bit variant (sf 0): w rotate right by the low 5 bits of m (u32 rotations)
+a6_fset 159 0x1ac02c00 1
+end
+
+fn a6_init to void
+a6_formdp
+a6_formls
+a6_formfp
+end
+
+fn a6_fld v ulong w ulong to ulong
+if ge v shl ulong 1 w
+a6_die 5 6 v
+end
+ret v
+end
+
+note a6_dsig: a signed distance d (two's complement ulong) that must fit w bits, masked to w bits (a6_die 7 if not)
+fn a6_dsig d ulong w ulong to ulong
+h = shl ulong 1 sub w 1
+if ne shr d 63 0
+if lt d sub 0 h
+a6_die 5 7 d
+end
+else
+if ge d h
+a6_die 5 7 d
+end
+end
+ret and d sub shl ulong 1 w 1
+end
+
+note ---- bitmask immediates (DDI 0487 M.d J1 shared pseudocode DecodeBitMasks, run backwards): a6_bmenc v w
+note returns N << 12 | immr << 6 | imms for the w-bit (32 or 64) value v, or 65536 when v has no encoding ----
+fn a6_rotl x ulong r ulong e ulong to ulong
+note rotate the low e bits of x left by r (0 <= r < e <= 64)
+if eq r 0
+ret x
+end
+m = ulong 18446744073709551615
+if lt e 64
+m = sub shl ulong 1 e 1
+end
+ret and or shl x r shr x sub e r m
+end
+
+note a6_bmsz: the smallest element size e (2..64) whose pattern repeats through all of x
+fn a6_bmsz x ulong to ulong
+e = ulong 64
+go = true
+while and go gt e 2 bound 6
+h = shr e 1
+m = sub shl ulong 1 h 1
+if eq and x m and shr x h m
+e = h
+else
+go = false
+end
+end
+ret e
+end
+
+fn a6_popc x ulong e ulong to ulong
+k = ulong 0
+i = ulong 0
+while lt i e bound 64
+k = add k and shr x i 1
+i = add i 1
+end
+ret k
+end
+
+fn a6_bmenc v ulong w ulong to ulong
+x = v
+if eq w 32
+x = and v 0xffffffff
+x = or x shl x 32
+end
+if or eq x 0 eq x 18446744073709551615
+ret 65536
+end
+e = a6_bmsz x
+if and eq w 32 eq e 64
+ret 65536
+end
+m = ulong 18446744073709551615
+if lt e 64
+m = sub shl ulong 1 e 1
+end
+el = and x m
+k = a6_popc el e
+ones = sub shl ulong 1 k 1
+r = ulong 0
+found = e
+while lt r e bound 64
+if eq a6_rotl el r e ones
+found = r
+r = e
+else
+r = add r 1
+end
+end
+if eq found e
+ret 65536
+end
+ret a6_bmpk e found k
+end
+
+note a6_bmpk: N:immr:imms for element size e, rotation r, k ones
+fn a6_bmpk e ulong r ulong k ulong to ulong
+if eq e 64
+ret or or shl ulong 1 12 shl r 6 sub k 1
+end
+pre = and 0x3f not sub shl e 1 1
+ret or shl r 6 or pre sub k 1
+end
+
+note a6_poff: a signed byte offset (multiple of 8, -512 .. 504) as the 7-bit imm7 field
+fn a6_poff off ulong to ulong
+if ne and off 7 0
+a6_die 5 6 off
+end
+q = shr off 3
+if ne shr off 63 0
+q = or q 0xe000000000000000
+if lt q 0xffffffffffffffc0
+a6_die 5 6 off
+end
+else
+if gt q 63
+a6_die 5 6 off
+end
+end
+ret and q 127
+end
+
+note a6_rdn: base | d | n << 5 (both 5-bit fields)
+fn a6_rdn b ulong d ulong n ulong to ulong
+ret or or b a6_fld d 5 shl a6_fld n 5 5
+end
+
+fn a6_enca k ulong b ulong x ulong y ulong z ulong u ulong to ulong
+note kinds 1..10 (a6_enc splits the table so each part stays small)
+if eq k 1
+ret or or a6_rdn b x y shl a6_fld z 5 16 shl a6_fld u 6 10
+end
+if eq k 4
+ret or or a6_rdn b x y shl a6_fld z 12 10 shl a6_fld u 1 22
+end
+if eq k 5
+c = a6_bmenc z shl ulong 32 shr b 31
+if eq c 65536
+a6_die 5 6 z
+end
+ret or a6_rdn b x y shl c 10
+end
+if eq k 6
+ret or or or b a6_fld x 5 shl a6_fld y 16 5 shl a6_fld z 2 21
+end
+if eq k 7
+ret or or a6_rdn b x y shl a6_fld z 6 16 shl a6_fld u 6 10
+end
+if eq k 9
+ret or a6_rdn b x y shl a6_fld z 12 10
+end
+if eq k 10
+ret or or a6_rdn or sub b 0x01000000 0x00206800 x y shl a6_fld z 5 16 shl a6_fld u 1 12
+end
+a6_die 5 5 k
+ret 0
+end
+
+note a6_encbr: kinds 12..18 (branches, BR, SVC, ADR)
+fn a6_encbr k ulong bs ulong a ulong b ulong c ulong to ulong
+if eq k 12
+ret or bs a6_dsig a 26
+end
+if eq k 13
+ret or or bs shl a6_dsig b 19 5 a6_fld a 4
+end
+if eq k 14
+ret or or bs shl a6_dsig b 19 5 a6_fld a 5
+end
+if eq k 15
+x = or or bs shl shr a6_fld b 6 5 31 shl and b 31 19
+ret or or x shl a6_dsig c 14 5 a6_fld a 5
+end
+if eq k 16
+ret or bs shl a6_fld a 5 5
+end
+if eq k 17
+ret or bs shl a6_fld a 16 5
+end
+y = a6_dsig b 21
+lo = shl and y 3 29
+hi = shl shr y 2 5
+ret or or or bs lo hi a6_fld a 5
+end
+
+note a6_rsv k bs c d e: refuse (a6_die 5 9) in-field operand values whose encoding Arm ARM DDI 0487 M.d leaves
+note UNDEFINED or unallocated. A 32-bit form (sf, bit 31 of the base, clear) takes shift amounts, BFM immr and imms
+note and EXTR lsb 0..31 and MOVZ/MOVN hw 0..1. Kind 1 shifted register: logical (base bits 28..24 = 01010, C6.2.14)
+note takes sh 0..3; add/sub (01011, C6.2.5) reserves sh 3; every other kind-1 form (multiply, two-source, float)
+note has opcode bits where sh and amt go, so both must be 0. Operands as a6_enc passes them: kind 1 sh d, amt e;
+note kind 6 hw c; kind 7 immr c, imms d; kind 21 lsb d.
+fn a6_rsv k ulong bs ulong c ulong d ulong e ulong to void
+w32 = eq shr bs 31 0
+if eq k 1
+cl = and shr bs 24 31
+if and ne cl 10 ne cl 11
+if ne or d e 0
+a6_die 5 9 or d e
+end
+end
+if and eq cl 11 eq d 3
+a6_die 5 9 d
+end
+if and w32 ge e 32
+a6_die 5 9 e
+end
+end
+if and and w32 eq k 6 ge c 2
+a6_die 5 9 c
+end
+if and and w32 or eq k 7 eq k 21 ge d 32
+a6_die 5 9 d
+end
+if and and w32 eq k 7 ge c 32
+a6_die 5 9 c
+end
+end
+
+note a6_enc f a b c d e: the instruction word of form f with operands a..e (unused operands 0)
+fn a6_enc f ulong a ulong b ulong c ulong d ulong e ulong to ulong
+if ge f get a_nform 0
+a6_die 5 5 f
+end
+k = ulong get a_fkind f
+bs = get a_fbase f
+a6_rsv k bs c d e
+if eq k 1
+x = a6_enca 1 bs a b c e
+ret or x shl a6_fld d 2 22
+end
+if eq k 3
+x = or a6_rdn bs a b shl a6_fld c 5 16
+ret or or x shl a6_fld d 3 13 shl a6_fld e 3 10
+end
+if eq k 2
+ret or or a6_rdn bs a b shl a6_fld c 5 16 shl a6_fld d 5 10
+end
+if eq k 8
+ret or or a6_rdn bs a b shl a6_fld c 5 16 shl a6_fld d 4 12
+end
+if eq k 11
+ret or or a6_rdn bs a c shl a6_fld b 5 10 shl a6_poff d 15
+end
+if and ge k 12 le k 18
+ret a6_encbr k bs a b c
+end
+if eq k 19
+ret a6_rdn bs a b
+end
+if eq k 20
+ret or or bs shl a6_fld a 5 5 shl a6_fld b 5 16
+end
+if eq k 21
+ret or or a6_rdn bs a b shl a6_fld c 5 16 shl a6_fld d 6 10
+end
+ret a6_enca k bs a b c d
+end
+
+note a6_ew: emit the word of form f
+fn a6_ew f ulong a ulong b ulong c ulong d ulong e ulong to void
+a6_emitw a6_enc f a b c d e
+end
+
+note ======== in-band mode `a64 enc`: one word per case line `NAME a b c d e | expected` ========
+note Lines that are blank or start with `;` are skipped. Operands are decimal (a leading - makes the two's
+note complement) or lowercase 0x hex. A line that names no form or has a bad operand is refused (a6_die 5 4 line).
+global a_cv ulong 8
+
+fn a6_isws c ulong to bool
+ret or eq c 32 eq c 9
+end
+
+note a6_samew: a_fnam[i .. i+n) equals i_in[s .. s+n)
+fn a6_samew i ulong s ulong n ulong to bool
+q = ulong 0
+while lt q n bound 64
+if ne get a_fnam add i q get i_in add s q
+ret false
+end
+q = add q 1
+end
+ret true
+end
+
+note a6_innm: byte j of a_fnam exists and is part of a name (and/or are eager, so the bound is tested here)
+fn a6_innm j ulong to bool
+if ge j len a_fnam
+ret false
+end
+ret ne get a_fnam j 32
+end
+
+note a6_fname: the form id whose name in a_fnam equals i_in[s .. s+n), or a_nform when there is none
+fn a6_fname s ulong n ulong to ulong
+i = ulong 0
+id = ulong 0
+ln = len a_fnam
+while lt i ln bound 4096
+j = i
+while a6_innm j bound 64
+j = add j 1
+end
+if eq sub j i n
+if a6_samew i s n
+ret id
+end
+end
+id = add id 1
+i = add j 1
+end
+ret get a_nform 0
+end
+
+note a6_numtk: the number at i_in[s .. e), into a_cv[7]; false if malformed
+fn a6_numtk s ulong e ulong to bool
+p = s
+ng = false
+if eq get i_in p 45
+ng = true
+p = add p 1
+end
+if ge p e
+ret false
+end
+v = ulong 0
+hex = false
+if lt add p 1 e
+if and eq get i_in p 48 eq get i_in add p 1 120
+hex = true
+p = add p 2
+end
+end
+while lt p e bound 64
+c = ulong get i_in p
+dg = ulong 99
+if and ge c 48 le c 57
+dg = sub c 48
+end
+if and hex and ge c 97 le c 102
+dg = sub c 87
+end
+if and hex ge dg 16
+ret false
+end
+if ge dg 10
+if not hex
+ret false
+end
+end
+if hex
+v = or shl v 4 dg
+else
+v = add mul v 10 dg
+end
+p = add p 1
+end
+if ng
+v = sub 0 v
+end
+put a_cv 7 v
+ret true
+end
+
+note a6_skipws: the first byte at or after p (before e) that is not a blank
+fn a6_skipws p ulong e ulong to ulong
+q = p
+while and lt q e a6_isws ulong get i_in q bound 100000
+q = add q 1
+end
+ret q
+end
+
+note a6_tokend: the end of the operand token at p (a blank, `|` or e)
+fn a6_tokend p ulong e ulong to ulong
+q = p
+while lt q e bound 64
+c = ulong get i_in q
+if or a6_isws c eq c 124
+ret q
+end
+q = add q 1
+end
+ret q
+end
+
+note a6_encln: one case line i_in[s .. e) (line number ln): the word for it
+fn a6_encln s ulong e ulong ln ulong to void
+p = a6_tokend s e
+f = a6_fname s sub p s
+if ge f get a_nform 0
+a6_die 5 4 ln
+end
+k = ulong 0
+while lt k 5 bound 5
+put a_cv k 0
+k = add k 1
+end
+k = ulong 0
+go = true
+while go bound 16
+p = a6_skipws p e
+if or ge p e eq get i_in p 124
+go = false
+else
+q = a6_tokend p e
+if or ge k 5 not a6_numtk p q
+a6_die 5 4 ln
+end
+put a_cv k get a_cv 7
+k = add k 1
+p = q
+end
+end
+a6_ewcv f
+end
+
+note a6_ewcv: emit form f with the operands in a_cv[0..4]
+fn a6_ewcv f ulong to void
+a = get a_cv 0
+b = get a_cv 1
+c = get a_cv 2
+d = get a_cv 3
+e = get a_cv 4
+a6_ew f a b c d e
+end
+
+note a6_enctest: one word per case line of the payload; ln numbers lines as in the case file, whose line 1 is the
+note mode line main read apart
+fn a6_enctest to void
+n = get a_inlen 0
+p = ulong 0
+ln = ulong 1
+while lt p n bound 1000000
+ln = add ln 1
+s = p
+while and lt p n ne get i_in p 10 bound 100000
+p = add p 1
+end
+q = s
+while and lt q p a6_isws ulong get i_in q bound 100000
+q = add q 1
+end
+if lt q p
+if ne get i_in q 59
+a6_encln q p ln
+end
+end
+p = add p 1
+end
+a6_flush
+exit 0
+end
+
+
+note ======== back end: ΩIR tables (ir.om) -> AArch64 ELF (seed/ng/a64/DESIGN.md) ========
+note Slice scope: integer scalar functions and exports (the bench-kernel subset grows from here). Allocated registers:
+note x0..x14 (caller-saved) and x19..x27 (callee-saved); scratch x15, x16, x17; x28 holds the stack floor (omc's map:
+note stack 0x10000000..0x10800000, sp starts at the top); x18, x29 unused; x30 link. Arguments x0..x7, result x0.
+note A narrow integer lives in its register extended to 64 bits by its type (zero: u8..u32, sign: i8..i32), so 64-bit
+note compares are exact and arithmetic followed by re-extension gives ΩIR's modulo 2^w result (IR.md s7.3).
+note Positions: function parameters are defined at 0; block x starts at a_bst[x] (its parameters are defined there),
+note op o is at a_opos[o] (its operands are read there, its result is defined at a_opos[o] + 1).
+note An interval is one range [a_vs, a_ve] per value, widened over every block where the value is live in or out.
+
+const a_maxv ulong 262144
+const a_maxb ulong 65536
+const a_maxw ulong 2097152
+const a_maxp ulong 4194304
+
+global a_vh ulong 262144
+global a_vs ulong 262144
+global a_ve ulong 262144
+global a_vx uchar 262144
+global a_vr uchar 262144
+global a_vsl ulong 262144
+global a_vnx ulong 262144
+global a_bh ulong 65536
+global a_bst ulong 65536
+global a_ben ulong 65536
+global a_bpc ulong 65536
+global a_opos ulong 4194305
+global a_ccnt ulong 4194305
+global a_phd ulong 4194305
+global a_lin ulong 2097152
+global a_lout ulong 2097152
+global a_luse ulong 2097152
+global a_ldef ulong 2097152
+note a_fs (per function): 0 values, 1 blocks, 2 bitset words per block, 3 positions, 4 spill slots, 5 callee-saved
+note mask, 6 has a call, 7 frame bytes, 8 function, 9 liveness changed, 10 trap codes used (mask), 11 saved count,
+note 12 fixups, 13 current block index, 14 E tail sites (0: no accumulator), 15 code offset of the E loop head
+global a_fs ulong 16
+note a_sform: 0 save pairs (STP/LDP, variant A), 1 separate STR/LDR (variant B); `@ng a64 split` selects 1
+global a_sform ulong 1
+global a_ract ulong 32
+global a_svl ulong 16
+global a_xpc ulong 262144
+global a_xfm ulong 262144
+global a_xa ulong 262144
+global a_xl ulong 262144
+global a_cpc ulong 1048576
+global a_cft ulong 1048576
+global a_ncl ulong 1
+global a_fpc ulong 65537
+global a_tpc ulong 16
+global a_mvd ulong 64
+global a_mvs ulong 64
+global a_mvn ulong 1
+note E loop shape: tail call sites (call ops), accumulator wire and type
+global a_tco ulong 64
+global a_taw ulong 1
+global a_tat ulong 1
+note memory: alloca ops of the function with their frame offset and zero-filled size (16-byte multiple); global
+note handle -> absolute address (class 0 in the RW pool from 0x10800000, class 1 in the code image); pool bytes
+global a_alo ulong 64
+global a_aof ulong 64
+global a_asz ulong 64
+global a_anum ulong 1
+global a_gad ulong 65537
+global a_gtot ulong 1
+
+const a_rorvx ulong 28
+const a_lsrvw ulong 30
+const a_asrvw ulong 31
+const a_rorvw ulong 159
+const a_tbnz ulong 111
+const a_lsbx ulong 82
+const a_strhr ulong 83
+const a_ldrhr ulong 84
+const a_lshx ulong 85
+const a_strwr ulong 86
+const a_ldrwr ulong 87
+const a_lsw ulong 88
+const a_strxr ulong 89
+const a_stpxpo ulong 99
+
+note ---- small accessors ----
+fn a6_wi v ulong to ulong
+ret ulong get i_vno v
+end
+
+fn a6_istk v ulong to bool
+ret eq get i_vty v 20
+end
+
+fn a6_arg o ulong k ulong to ulong
+ret ulong get i_arg add ulong get i_oa0 o k
+end
+
+fn a6_bix b ulong to ulong
+ret ulong get i_bix b
+end
+
+fn a6_vty v ulong to ulong
+ret ulong get i_vty v
+end
+
+fn a6_unsup k ulong to void
+a6_die 5 5 k
+end
+
+note bit width of an integer type id (bool 1); 0 for anything else
+fn a6_wid t ulong to ulong
+if or eq t 2 eq t 6
+ret 8
+end
+if or eq t 3 eq t 7
+ret 16
+end
+if or eq t 4 eq t 8
+ret 32
+end
+if or eq t 5 eq t 9
+ret 64
+end
+if eq t 1
+ret 1
+end
+ret 0
+end
+
+fn a6_sgn t ulong to bool
+ret and ge t 6 le t 9
+end
+
+note the value types this slice handles: bool and the integers
+fn a6_isint t ulong to bool
+ret and ge t 1 le t 9
+end
+
+note ---- bit sets: k 0 live-in, 1 live-out, 2 upward-exposed uses, 3 definitions; block x, value w ----
+fn a6_lget k ulong i ulong to ulong
+if eq k 0
+ret get a_lin i
+end
+if eq k 1
+ret get a_lout i
+end
+if eq k 2
+ret get a_luse i
+end
+ret get a_ldef i
+end
+
+fn a6_lset k ulong i ulong v ulong to void
+if eq k 0
+put a_lin i v
+end
+if eq k 1
+put a_lout i v
+end
+if eq k 2
+put a_luse i v
+end
+if eq k 3
+put a_ldef i v
+end
+end
+
+fn a6_bit k ulong x ulong w ulong to bool
+i = add mul x get a_fs 2 shr w 6
+ret ne and shr a6_lget k i and w 63 1 0
+end
+
+fn a6_bset k ulong x ulong w ulong to void
+i = add mul x get a_fs 2 shr w 6
+a6_lset k i or a6_lget k i shl ulong 1 and w 63
+end
+
+note ---- wires, layout, calls ----
+note a6_wmap f: a_vh[wire] = value handle for every value of f (the order of ir_num)
+fn a6_wmap f ulong to void
+v = ulong get i_ftk f
+put a_vh a6_wi v v
+v = ulong get i_fp1 f
+while ne v 0 bound 65
+put a_vh a6_wi v v
+v = ulong get i_vnx v
+end
+b = ulong get i_fb1 f
+while ne b 0 bound 65537
+a6_wmb b
+b = ulong get i_bnx b
+end
+end
+
+fn a6_wmb b ulong to void
+v = ulong get i_bp1 b
+while ne v 0 bound 65
+put a_vh a6_wi v v
+v = ulong get i_vnx v
+end
+o = ulong get i_bo1 b
+while ne o 0 bound 4194305
+t = ulong get i_otk o
+if ne t 0
+put a_vh a6_wi t t
+end
+r = ulong get i_ors o
+if ne r 0
+put a_vh a6_wi r r
+end
+o = ulong get i_onx o
+end
+end
+
+note a6_lay f: block index tables and positions (a_fs 1 blocks, 3 positions)
+fn a6_lay f ulong to void
+nb = ulong 0
+p = ulong 2
+b = ulong get i_fb1 f
+while ne b 0 bound 65537
+put a_bh nb b
+put a_bst nb p
+p = add p 2
+o = ulong get i_bo1 b
+while ne o 0 bound 4194305
+if ge p sub a_maxp 4
+a6_unsup p
+end
+put a_opos o p
+p = add p 2
+o = ulong get i_onx o
+end
+put a_ben nb sub p 1
+nb = add nb 1
+b = ulong get i_bnx b
+end
+put a_fs 1 nb
+put a_fs 3 p
+end
+
+note a6_ccalls: a_ccnt[q] = the number of calls and host words at positions < q, for q in 0..positions; a_fs 6 =
+note any call (x30 is saved). A host word's SVC clobbers x0 only, but its arguments go to x0..x2, so values live
+note across it take callee-saved registers like values live across a call.
+fn a6_ccalls to void
+np = get a_fs 3
+q = ulong 0
+while le q np bound 4194305
+put a_ccnt q 0
+q = add q 1
+end
+put a_fs 6 0
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+if and eq get i_oop o 64 not a6_istc o
+put a_ccnt get a_opos o 1
+put a_fs 6 1
+end
+if eq get i_oop o 110
+put a_ccnt get a_opos o 1
+end
+o = ulong get i_onx o
+end
+x = add x 1
+end
+a6_cpre np
+end
+
+fn a6_cpre np ulong to void
+run = ulong 0
+q = ulong 0
+while le q np bound 4194305
+t = get a_ccnt q
+put a_ccnt q run
+run = add run t
+q = add q 1
+end
+end
+
+note ---- liveness (SSA with block parameters) ----
+fn a6_lzero to void
+n = mul get a_fs 1 get a_fs 2
+i = ulong 0
+while lt i n bound 2097152
+put a_lin i 0
+put a_lout i 0
+put a_luse i 0
+put a_ldef i 0
+i = add i 1
+end
+end
+
+note a6_lgen: per block the uses not defined earlier in it (2) and its definitions (3)
+fn a6_lgen to void
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+b = get a_bh x
+v = ulong get i_bp1 b
+while ne v 0 bound 65
+if not a6_istk v
+a6_bset 3 x a6_wi v
+end
+v = ulong get i_vnx v
+end
+o = ulong get i_bo1 b
+while ne o 0 bound 4194305
+a6_lgo x o
+o = ulong get i_onx o
+end
+x = add x 1
+end
+end
+
+fn a6_lgo x ulong o ulong to void
+op = get i_oop o
+n = ulong get i_ona o
+k = ulong 0
+while lt k n bound 1048576
+if eq ir_okd uint op k 0
+v = a6_arg o k
+if not a6_istk v
+w = a6_wi v
+if not a6_bit 3 x w
+a6_bset 2 x w
+end
+end
+end
+k = add k 1
+end
+r = ulong get i_ors o
+if ne r 0
+if not a6_istk r
+a6_bset 3 x a6_wi r
+end
+end
+end
+
+note word i of the union of the live-in sets of block b's successors (terminator t)
+fn a6_succw t ulong i ulong to ulong
+op = get i_oop t
+lw = get a_fs 2
+if eq op 60
+s = a6_bix a6_arg t 0
+ret get a_lin add mul s lw i
+end
+if eq op 61
+s1 = a6_bix a6_arg t 2
+s2 = a6_bix a6_arg t 3
+ret or get a_lin add mul s1 lw i get a_lin add mul s2 lw i
+end
+ret 0
+end
+
+fn a6_lblk x ulong to void
+lw = get a_fs 2
+t = ulong get i_bot get a_bh x
+i = ulong 0
+while lt i lw bound 4096
+j = add mul x lw i
+so = a6_succw t i
+put a_lout j so
+nin = or get a_luse j and so not get a_ldef j
+if ne nin get a_lin j
+put a_lin j nin
+put a_fs 9 1
+end
+i = add i 1
+end
+end
+
+fn a6_lflow to void
+go = true
+while go bound 100000
+put a_fs 9 0
+x = get a_fs 1
+while gt x 0 bound 65537
+x = sub x 1
+a6_lblk x
+end
+go = ne get a_fs 9 0
+end
+end
+
+note ---- intervals ----
+fn a6_dpos v ulong to ulong
+k = get i_vk v
+if le k 1
+ret 0
+end
+if eq k 2
+ret get a_bst a6_bix ulong get i_vo v
+end
+ret add get a_opos ulong get i_vo v 1
+end
+
+fn a6_ivinit to void
+w = ulong 0
+while lt w get a_fs 0 bound 262144
+v = get a_vh w
+put a_vsl w 0
+put a_vx w 0
+if a6_istk v
+put a_vr w 254
+put a_vs w 0
+put a_ve w 0
+else
+p = a6_dpos v
+put a_vr w 255
+put a_vs w p
+put a_ve w p
+end
+w = add w 1
+end
+end
+
+fn a6_ext w ulong p ulong to void
+if lt p get a_vs w
+put a_vs w p
+end
+if gt p get a_ve w
+put a_ve w p
+end
+end
+
+note a6_ivuse: every non-token operand use extends its value to the op's position
+fn a6_ivuse to void
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+a6_ivop o
+o = ulong get i_onx o
+end
+x = add x 1
+end
+end
+
+fn a6_ivop o ulong to void
+op = get i_oop o
+n = ulong get i_ona o
+p = get a_opos o
+k = ulong 0
+while lt k n bound 1048576
+if eq ir_okd uint op k 0
+v = a6_arg o k
+if not a6_istk v
+a6_ext a6_wi v p
+end
+end
+k = add k 1
+end
+end
+
+note a6_ivlive: live-in values cover their block's start, live-out values its end
+fn a6_ivlive to void
+x = ulong 0
+lw = get a_fs 2
+while lt x get a_fs 1 bound 65536
+i = ulong 0
+while lt i lw bound 4096
+a6_ivw x i get a_lin add mul x lw i get a_bst x
+a6_ivw x i get a_lout add mul x lw i get a_ben x
+i = add i 1
+end
+x = add x 1
+end
+end
+
+fn a6_ivw x ulong i ulong m ulong p ulong to void
+if eq m 0
+ret
+end
+j = ulong 0
+while lt j 64 bound 64
+if ne and shr m j 1 0
+a6_ext add shl i 6 j p
+end
+j = add j 1
+end
+end
+
+note a6_ivcross: a_vx[w] = 1 when a call sits strictly inside w's interval
+fn a6_ivcross to void
+w = ulong 0
+while lt w get a_fs 0 bound 262144
+s = get a_vs w
+e = get a_ve w
+if and eq get a_vr w 255 gt e add s 1
+if gt get a_ccnt e get a_ccnt add s 1
+put a_vx w 1
+end
+end
+w = add w 1
+end
+end
+
+note ---- linear scan (Poletto and Sarkar), intervals in start order ----
+fn a6_scan to void
+np = get a_fs 3
+q = ulong 0
+while le q np bound 4194305
+put a_phd q 0
+q = add q 1
+end
+w = get a_fs 0
+while gt w 0 bound 262145
+w = sub w 1
+if ne get a_vr w 254
+s = get a_vs w
+put a_vnx w get a_phd s
+put a_phd s add w 1
+end
+end
+r = ulong 0
+while lt r 32 bound 32
+put a_ract r 0
+r = add r 1
+end
+put a_fs 4 0
+put a_fs 5 0
+q = ulong 0
+while le q np bound 4194305
+h = get a_phd q
+while ne h 0 bound 262145
+a6_alloc sub h 1
+h = get a_vnx sub h 1
+end
+q = add q 1
+end
+end
+
+fn a6_expire s ulong to void
+r = ulong 0
+while lt r 32 bound 32
+a = get a_ract r
+if ne a 0
+if lt get a_ve sub a 1 s
+put a_ract r 0
+end
+end
+r = add r 1
+end
+end
+
+note a6_free x: a free register, caller-saved first unless the interval crosses a call (x); 255 if none
+fn a6_free x bool to ulong
+if not x
+r = ulong 0
+while lt r 15 bound 15
+if eq get a_ract r 0
+ret r
+end
+r = add r 1
+end
+end
+r = ulong 19
+while lt r 28 bound 9
+if eq get a_ract r 0
+ret r
+end
+r = add r 1
+end
+ret 255
+end
+
+fn a6_give w ulong r ulong to void
+put a_vr w uchar r
+put a_ract r add w 1
+if ge r 19
+put a_fs 5 or get a_fs 5 shl ulong 1 r
+end
+end
+
+fn a6_slot w ulong to void
+n = get a_fs 4
+put a_vsl w add n 1
+put a_fs 4 add n 1
+end
+
+fn a6_alloc w ulong to void
+a6_expire get a_vs w
+x = ne get a_vx w 0
+r = a6_free x
+if ne r 255
+a6_give w r
+ret
+end
+a6_spill w x
+end
+
+note a6_spill w x: w found no free register of its class (x: callee-saved only). The active interval of that class
+note ending last keeps its register when it ends no later than w (w gets a stack slot); otherwise it moves to a
+note stack slot and w takes its register.
+fn a6_spill w ulong x bool to void
+best = ulong 255
+bend = ulong 0
+r = ulong 0
+while lt r 28 bound 28
+if a6_okreg r x
+a = get a_ract r
+if ne a 0
+e = get a_ve sub a 1
+if or eq best 255 gt e bend
+best = r
+bend = e
+end
+end
+end
+r = add r 1
+end
+if and ne best 255 gt bend get a_ve w
+v = sub get a_ract best 1
+put a_vr v 255
+a6_slot v
+a6_give w best
+ret
+end
+a6_slot w
+end
+
+fn a6_okreg r ulong x bool to bool
+if and ge r 19 le r 27
+ret true
+end
+ret and not x lt r 15
+end
+
+note ---- frame: spill slots at [sp, 8k], then the saved registers (callee-saved in use, x30 if any call), both
+note below 4096 bytes; then the alloca areas (16-byte aligned); the whole frame below 2^24 ----
+fn a6_frame to void
+n = ulong 0
+r = ulong 19
+while lt r 28 bound 9
+if ne and shr get a_fs 5 r 1 0
+put a_svl n r
+n = add n 1
+end
+r = add r 1
+end
+if ne get a_fs 6 0
+put a_svl n 30
+n = add n 1
+end
+put a_fs 11 n
+f = mul 8 add get a_fs 4 n
+f = and add f 15 not ulong 15
+if gt f 4095
+a6_unsup f
+end
+f = a6_alay f
+if ge f 16777216
+a6_unsup f
+end
+put a_fs 7 f
+end
+
+note a6_alay b: give every alloca of the function an area from frame offset b up; returns the frame size
+fn a6_alay b ulong to ulong
+put a_anum 0 0
+f = b
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+if eq get i_oop o 50
+f = a6_alo1 o f
+end
+o = ulong get i_onx o
+end
+x = add x 1
+end
+ret f
+end
+
+fn a6_alo1 o ulong f ulong to ulong
+k = get a_anum 0
+if ge k len a_alo
+a6_unsup 50
+end
+t = ulong get i_oty o
+if ne get i_tk t 4
+a6_unsup t
+end
+s = ir_tsize get i_t1 t
+s = and add s 15 not ulong 15
+if ge s 16777216
+a6_unsup s
+end
+put a_alo k o
+put a_aof k f
+put a_asz k s
+put a_anum 0 add k 1
+ret add f s
+end
+
+note a6_saves st: store (st) or reload the saved registers, as pairs (a_sform 0) or one by one (1)
+fn a6_saves st bool to void
+n = get a_fs 11
+base = mul 8 get a_fs 4
+pair = and eq get a_sform 0 0 le add base mul 8 n 504
+j = ulong 0
+if pair
+while lt add j 1 n bound 16
+a6_pr st get a_svl j get a_svl add j 1 add base mul 8 j
+j = add j 2
+end
+end
+while lt j n bound 16
+a6_sr st get a_svl j add shr base 3 j
+j = add j 1
+end
+end
+
+fn a6_pr st bool r1 ulong r2 ulong off ulong to void
+if st
+a6_ew a_stpx r1 r2 31 off 0
+else
+a6_ew a_ldpx r1 r2 31 off 0
+end
+end
+
+fn a6_sr st bool r ulong k ulong to void
+if st
+a6_ew a_strx r 31 k 0 0
+else
+a6_ew a_ldrx r 31 k 0 0
+end
+end
+
+note prologue: sub sp; cmp sp, x28; b.lo trap 6 (before the first store: no write below the floor); saves
+fn a6_pro to void
+f = get a_fs 7
+if eq f 0
+ret
+end
+a6_spadj true f
+a6_ew a_subsxe 31 31 28 3 0
+a6_fx a_bcond 3 1006
+a6_saves true
+end
+
+fn a6_epi to void
+f = get a_fs 7
+if ne f 0
+a6_saves false
+a6_spadj false f
+end
+a6_ew a_ret 30 0 0 0 0
+end
+
+note a6_spadj s f: SP = SP - f (s) or SP + f, f < 2^24, as #hi, LSL 12 and #lo
+fn a6_spadj s bool f ulong to void
+h = shr f 12
+l = and f 4095
+if s
+if ne h 0
+a6_ew a_subxi 31 31 h 1 0
+end
+if ne l 0
+a6_ew a_subxi 31 31 l 0 0
+end
+ret
+end
+if ne h 0
+a6_ew a_addxi 31 31 h 1 0
+end
+if ne l 0
+a6_ew a_addxi 31 31 l 0 0
+end
+end
+
+note ---- branch fixups: label < 1000 is a block index, 1000 + c the trap stub of code c ----
+fn a6_fx f ulong a ulong l ulong to void
+n = get a_fs 12
+if ge n len a_xpc
+a6_unsup n
+end
+put a_xpc n get a_cn 0
+put a_xfm n f
+put a_xa n a
+put a_xl n l
+put a_fs 12 add n 1
+if ge l 1000
+put a_fs 10 or get a_fs 10 shl ulong 1 sub l 1000
+end
+a6_emitw 0
+end
+
+note distance in words from pc to t, two's complement
+fn a6_wd pc ulong t ulong to ulong
+if ge t pc
+ret div sub t pc 4
+end
+ret sub 0 div sub pc t 4
+end
+
+fn a6_putw pc ulong w ulong to void
+put a_code pc uchar and w 255
+put a_code add pc 1 uchar and shr w 8 255
+put a_code add pc 2 uchar and shr w 16 255
+put a_code add pc 3 uchar and shr w 24 255
+end
+
+fn a6_fixb to void
+i = ulong 0
+while lt i get a_fs 12 bound 262144
+l = get a_xl i
+t = ulong 0
+if ge l 1000
+t = get a_tpc sub l 1000
+else
+t = get a_bpc l
+end
+a6_fix1 i t
+i = add i 1
+end
+end
+
+fn a6_fix1 i ulong t ulong to void
+pc = get a_xpc i
+f = get a_xfm i
+d = a6_wd pc t
+if eq f a_b
+a6_putw pc a6_enc f d 0 0 0 0
+else
+a6_putw pc a6_enc f get a_xa i d 0 0 0
+end
+end
+
+note trap tail (omc's: add x0, x1, #100; mov x8, #93; svc #0) and one stub per used code: mov x1, #c; b tail
+fn a6_tstubs to void
+m = get a_fs 10
+if eq m 0
+ret
+end
+t = get a_cn 0
+a6_ew a_addxi 0 1 100 0 0
+a6_ew a_movzx 8 93 0 0 0
+a6_ew a_svc 0 0 0 0 0
+c = ulong 1
+while lt c 15 bound 14
+if ne and shr m c 1 0
+put a_tpc c get a_cn 0
+a6_ew a_movzx 1 c 0 0 0
+a6_ew a_b a6_wd get a_cn 0 t 0 0 0 0
+end
+c = add c 1
+end
+end
+
+note ---- values in registers: operands, results, constants, canonical extension ----
+note a6_src v s: a register holding value v (its own, or scratch s loaded from its slot)
+fn a6_src v ulong s ulong to ulong
+w = a6_wi v
+r = ulong get a_vr w
+if lt r 32
+ret r
+end
+a6_ew a_ldrx s 31 sub get a_vsl w 1 0 0
+ret s
+end
+
+fn a6_dst v ulong to ulong
+r = ulong get a_vr a6_wi v
+if lt r 32
+ret r
+end
+ret 16
+end
+
+fn a6_fin v ulong r ulong to void
+w = a6_wi v
+if ge ulong get a_vr w 32
+a6_ew a_strx r 31 sub get a_vsl w 1 0 0
+end
+end
+
+note move location of value v: its register, or 64 + its slot
+fn a6_loc v ulong to ulong
+w = a6_wi v
+r = ulong get a_vr w
+if lt r 32
+ret r
+end
+ret add 64 sub get a_vsl w 1
+end
+
+fn a6_movi r ulong v ulong to void
+if lt v 65536
+a6_ew a_movzx r v 0 0 0
+ret
+end
+if lt not v 65536
+a6_ew a_movnx r not v 0 0 0
+ret
+end
+first = true
+h = ulong 0
+while lt h 4 bound 4
+c = and shr v mul h 16 65535
+if ne c 0
+if first
+a6_ew a_movzx r c h 0 0
+first = false
+else
+a6_ew a_movkx r c h 0 0
+end
+end
+h = add h 1
+end
+end
+
+note a6_canon r t: re-extend register r to type t (zero for u8..u32, sign for i8..i32)
+fn a6_canon r ulong t ulong to void
+w = a6_wid t
+if or ge w 64 le w 1
+ret
+end
+if a6_sgn t
+a6_ew a_sbfmx r r 0 sub w 1 0
+else
+a6_ew a_ubfmx r r 0 sub w 1 0
+end
+end
+
+fn a6_mov d ulong s ulong to void
+if ne d s
+a6_ew a_orrx d 31 s 0 0
+end
+end
+
+note ---- parallel moves (block arguments, call arguments, entry parameters); x15 breaks a cycle ----
+fn a6_mvclr to void
+put a_mvn 0 0
+end
+
+fn a6_mvadd d ulong s ulong to void
+n = get a_mvn 0
+if ge n len a_mvd
+a6_unsup n
+end
+if ne d s
+put a_mvd n d
+put a_mvs n s
+put a_mvn 0 add n 1
+end
+end
+
+fn a6_mv1 d ulong s ulong to void
+if and lt d 32 lt s 32
+a6_mov d s
+ret
+end
+if lt d 32
+a6_ew a_ldrx d 31 sub s 64 0 0
+ret
+end
+if lt s 32
+a6_ew a_strx s 31 sub d 64 0 0
+ret
+end
+a6_ew a_ldrx 16 31 sub s 64 0 0
+a6_ew a_strx 16 31 sub d 64 0 0
+end
+
+note a6_isrc l: some pending move reads location l
+fn a6_isrc l ulong to bool
+i = ulong 0
+while lt i get a_mvn 0 bound 64
+if and ne get a_mvd i 999 eq get a_mvs i l
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn a6_pmove to void
+left = get a_mvn 0
+while gt left 0 bound 4096
+prog = false
+i = ulong 0
+while lt i get a_mvn 0 bound 64
+d = get a_mvd i
+if ne d 999
+if not a6_isrc d
+a6_mv1 d get a_mvs i
+put a_mvd i 999
+left = sub left 1
+prog = true
+end
+end
+i = add i 1
+end
+if not prog
+a6_mvbrk
+end
+end
+end
+
+fn a6_mvbrk to void
+i = ulong 0
+while eq get a_mvd i 999 bound 64
+i = add i 1
+end
+s = get a_mvs i
+a6_mv1 15 s
+j = ulong 0
+while lt j get a_mvn 0 bound 64
+if and ne get a_mvd j 999 eq get a_mvs j s
+put a_mvs j 15
+end
+j = add j 1
+end
+end
+
+note ---- selection ----
+fn a6_sel o ulong x ulong to void
+op = ulong get i_oop o
+if eq op 1
+a6_sconst o
+ret
+end
+if and ge op 10 le op 19
+a6_sarith o op
+ret
+end
+if and ge op 20 le op 25
+a6_sshift o op
+ret
+end
+if and ge op 30 le op 35
+a6_scmp o op
+ret
+end
+if and ge op 2 le op 37
+a6_smisc o op
+ret
+end
+if and ge op 60 le op 66
+a6_sterm o op x
+ret
+end
+if and ge op 70 le op 82
+a6_schk o op
+ret
+end
+if and ge op 42 le op 59
+a6_smem o op
+ret
+end
+if eq op 110
+a6_shost o
+ret
+end
+if and ge op 90 le op 93
+ret
+end
+a6_unsup op
+end
+
+note ---- memory (IR.md s7.5): a REF is the address of its object in one register; only REF to ARRAY of bool or
+note integers, and only these ops: load, store, alloca, gaddr, len. Coverage (s8) is ngcheck's: an access here
+note follows the check that covers it ----
+fn a6_smem o ulong op ulong to void
+if eq op 42
+a6_sload o
+ret
+end
+if eq op 43
+a6_sstore o
+ret
+end
+if eq op 50
+a6_salloc o
+ret
+end
+r = ulong get i_ors o
+d = a6_dst r
+if eq op 52
+a6_movi d get a_gad get i_oim o
+a6_fin r d
+ret
+end
+if eq op 53
+a6_movi d a6_alen a6_arg o 0
+a6_fin r d
+ret
+end
+a6_unsup op
+end
+
+note a6_alen v: the element count of the ARRAY that REF v refers to
+fn a6_alen v ulong to ulong
+t = a6_vty v
+if ne get i_tk t 4
+a6_unsup t
+end
+a = ulong get i_t1 t
+if ne get i_tk a 2
+a6_unsup a
+end
+e = ulong get i_t1 a
+if not a6_isint e
+a6_unsup e
+end
+ret ulong get i_t2 a
+end
+
+note load: LDR (register offset, scaled by the element size); the signed narrow types sign-extend (canonical form)
+fn a6_ldf t ulong to ulong
+if or eq t 1 eq t 2
+ret a_ldrbr
+end
+if eq t 6
+ret a_lsbx
+end
+if eq t 3
+ret a_ldrhr
+end
+if eq t 7
+ret a_lshx
+end
+if eq t 4
+ret a_ldrwr
+end
+if eq t 8
+ret a_lsw
+end
+ret a_ldrxr
+end
+
+fn a6_stf t ulong to ulong
+if or eq t 1 or eq t 2 eq t 6
+ret a_strbr
+end
+if or eq t 3 eq t 7
+ret a_strhr
+end
+if or eq t 4 eq t 8
+ret a_strwr
+end
+ret a_strxr
+end
+
+note the S bit of a register-offset access: 0 for one-byte elements, else scale the index by the size
+fn a6_sh1 t ulong to ulong
+if or eq t 1 eq a6_wid t 8
+ret 0
+end
+ret 1
+end
+
+fn a6_aref v ulong to void
+n = a6_alen v
+end
+
+fn a6_sload o ulong to void
+t = a6_rty o
+a6_aref a6_arg o 1
+b = a6_src a6_arg o 1 16
+i = a6_src a6_arg o 2 17
+r = ulong get i_ors o
+d = a6_dst r
+a6_ew a6_ldf t d b i a6_sh1 t 0
+a6_fin r d
+end
+
+fn a6_sstore o ulong to void
+v = a6_arg o 3
+t = a6_vty v
+if not a6_isint t
+a6_unsup t
+end
+a6_aref a6_arg o 1
+b = a6_src a6_arg o 1 16
+i = a6_src a6_arg o 2 17
+x = a6_src v 15
+a6_ew a6_stf t x b i a6_sh1 t 0
+end
+
+note alloca: the address of the op's frame area, then zero it 16 bytes per STP XZR, XZR (every logical invocation:
+note the op runs on each pass of an E loop as well)
+fn a6_salloc o ulong to void
+k = ulong 0
+while ne get a_alo k o bound 64
+k = add k 1
+end
+f = get a_aof k
+r = ulong get i_ors o
+d = a6_dst r
+h = shr f 12
+b = ulong 31
+if ne h 0
+a6_ew a_addxi d 31 h 1 0
+b = d
+end
+a6_ew a_addxi d b and f 4095 0 0
+a6_fin r d
+a6_mov 16 d
+a6_movi 17 shr get a_asz k 4
+a6_ew a_stpxpo 31 31 16 16 0
+a6_ew a_subsxi 17 17 1 0 0
+a6_ew a_bcond 1 sub ulong 0 2 0 0 0
+end
+
+note ---- host words (IR.md s7.11): read 53 and write 54, as Linux SVC 63 and 64 (x0 fd, x1 address, x2 count,
+note x8 number; the kernel returns the count or minus errno in x0 and preserves every other register) ----
+fn a6_shost o ulong to void
+w = get i_oim o
+nr = ulong 64
+if eq w 53
+nr = 63
+end
+if and ne w 53 ne w 54
+a6_unsup w
+end
+a = a6_arg o 2
+a6_aref a
+b = a6_src a 16
+f = a6_src a6_arg o 3 17
+a6_ew a_addx 17 b f 0 0
+a6_mvclr
+a6_mvadd 0 a6_loc a6_arg o 1
+a6_mvadd 1 17
+a6_mvadd 2 a6_loc a6_arg o 4
+a6_pmove
+a6_ew a_movzx 8 nr 0 0 0
+a6_ew a_svc 0 0 0 0 0
+r = ulong get i_ors o
+if ne r 0
+a6_mvfrom r 0
+end
+end
+
+fn a6_rty o ulong to ulong
+t = ulong get i_oty o
+if not a6_isint t
+a6_unsup t
+end
+ret t
+end
+
+fn a6_sconst o ulong to void
+r = ulong get i_ors o
+t = a6_rty o
+d = a6_dst r
+a6_movi d get i_oim o
+a6_fin r d
+end
+
+note result of an op whose operands are already in registers a, b: computed into d, extended, stored
+fn a6_sarith o ulong op ulong to void
+r = ulong get i_ors o
+t = a6_rty o
+a = a6_src a6_arg o 0 16
+b = ulong 31
+if and ne op 15 ne op 19
+b = a6_src a6_arg o 1 17
+end
+d = a6_dst r
+a6_ar2 op t d a b
+a6_canon d t
+a6_fin r d
+end
+
+fn a6_ar2 op ulong t ulong d ulong a ulong b ulong to void
+if eq op 10
+a6_ew a_addx d a b 0 0
+end
+if eq op 11
+a6_ew a_subx d a b 0 0
+end
+if eq op 12
+a6_ew a_mulx d a b 0 0
+end
+if eq op 13
+a6_div d a b t
+end
+if eq op 14
+a6_rem d a b t
+end
+if eq op 15
+a6_ew a_subx d 31 a 0 0
+end
+if eq op 16
+a6_ew a_andx d a b 0 0
+end
+if eq op 17
+a6_ew a_orrx d a b 0 0
+end
+if eq op 18
+a6_ew a_eorx d a b 0 0
+end
+if eq op 19
+a6_not d a t
+end
+end
+
+fn a6_not d ulong a ulong t ulong to void
+if eq t 1
+a6_ew a_eorxi d a 1 0 0
+else
+a6_ew a_ornx d 31 a 0 0
+end
+end
+
+fn a6_div d ulong a ulong b ulong t ulong to void
+if a6_sgn t
+a6_ew a_sdivx d a b 0 0
+else
+a6_ew a_udivx d a b 0 0
+end
+end
+
+note rem: a - (a / b) * b, and 0 when b = 0 (IR.md s7.3); the flags are set before d may overwrite a or b
+fn a6_rem d ulong a ulong b ulong t ulong to void
+a6_div 15 a b t
+a6_ew a_subsxi 31 b 0 0 0
+a6_ew a_msubx d 15 b a 0
+a6_ew a_cselx d 31 d 0 0
+end
+
+note shl shr rotl rotr (amount modulo the width) and min max
+fn a6_sshift o ulong op ulong to void
+r = ulong get i_ors o
+t = a6_rty o
+a = a6_src a6_arg o 0 16
+b = a6_src a6_arg o 1 17
+d = a6_dst r
+if ge op 24
+a6_ew a_subsx 31 a b 0 0
+a6_ew a_cselx d a b a6_mmc op t 0
+else
+a6_sh2 op t d a b
+end
+a6_canon d t
+a6_fin r d
+end
+
+note condition for min (24) / max (25): a selected when a < b / a > b
+fn a6_mmc op ulong t ulong to ulong
+s = a6_sgn t
+if eq op 24
+if s
+ret 11
+end
+ret 3
+end
+if s
+ret 12
+end
+ret 8
+end
+
+fn a6_sh2 op ulong t ulong d ulong a ulong b ulong to void
+w = a6_wid t
+if ge op 22
+a6_rot op t d a b
+ret
+end
+if and lt w 32 gt w 1
+a6_ew a_andxi 15 b sub w 1 0 0
+b = 15
+end
+if eq w 32
+a6_sh32 op t d a b
+ret
+end
+if eq op 20
+a6_ew a_lslvx d a b 0 0
+ret
+end
+if a6_sgn t
+a6_ew a_asrvx d a b 0 0
+else
+a6_ew a_lsrvx d a b 0 0
+end
+end
+
+fn a6_sh32 op ulong t ulong d ulong a ulong b ulong to void
+if eq op 20
+a6_ew a_lslvw d a b 0 0
+ret
+end
+if a6_sgn t
+a6_ew a_asrvw d a b 0 0
+else
+a6_ew a_lsrvw d a b 0 0
+end
+end
+
+note rotl = rotr by the negated amount (RORV takes it modulo the width); u8/u16 rotations are not in the slice
+fn a6_rot op ulong t ulong d ulong a ulong b ulong to void
+w = a6_wid t
+if a6_sgn t
+a6_unsup t
+end
+if lt w 32
+a6_unsup t
+end
+n = b
+if eq op 22
+a6_ew a_subx 15 31 b 0 0
+n = 15
+end
+if eq w 64
+a6_ew a_rorvx d a n 0 0
+else
+a6_ew a_rorvw d a n 0 0
+end
+end
+
+note compare: cmp a, b; cset d, cond (cset = csinc d, xzr, xzr, inverted cond)
+fn a6_scmp o ulong op ulong to void
+r = ulong get i_ors o
+v = a6_arg o 0
+t = a6_vty v
+if not a6_isint t
+a6_unsup t
+end
+a = a6_src v 16
+b = a6_src a6_arg o 1 17
+d = a6_dst r
+a6_ew a_subsx 31 a b 0 0
+a6_ew a_csincx d 31 31 xor a6_cc op t 1 0
+a6_fin r d
+end
+
+fn a6_cc op ulong t ulong to ulong
+if eq op 30
+ret 0
+end
+if eq op 31
+ret 1
+end
+s = a6_sgn t
+if eq op 32
+if s
+ret 11
+end
+ret 3
+end
+if eq op 33
+if s
+ret 13
+end
+ret 9
+end
+if eq op 34
+if s
+ret 12
+end
+ret 8
+end
+if s
+ret 10
+end
+ret 2
+end
+
+note select (2), conv (36, integer to integer), bitcast (37, integer to integer)
+fn a6_smisc o ulong op ulong to void
+r = ulong get i_ors o
+t = a6_rty o
+if eq op 2
+c = a6_src a6_arg o 0 16
+a = a6_src a6_arg o 1 17
+b = a6_src a6_arg o 2 15
+d = a6_dst r
+a6_ew a_subsxi 31 c 0 0 0
+a6_ew a_cselx d a b 1 0
+a6_fin r d
+ret
+end
+if or eq op 36 eq op 37
+v = a6_arg o 0
+if not a6_isint a6_vty v
+a6_unsup op
+end
+a = a6_src v 16
+d = a6_dst r
+a6_mov d a
+a6_canon d t
+a6_fin r d
+ret
+end
+a6_unsup op
+end
+
+note ---- terminators, calls, exit ----
+fn a6_sterm o ulong op ulong x ulong to void
+if eq op 60
+a6_sbr o x
+end
+if eq op 61
+a6_scbr o x
+end
+if eq op 62
+a6_epi
+end
+if eq op 63
+a6_mvto 0 a6_arg o 1
+if ne get a_fs 14 0
+a6_tsum 0 0
+end
+a6_epi
+end
+if eq op 64
+a6_scall o
+end
+if eq op 65
+a6_fx a_b 0 add 1000 get i_oim o
+end
+if eq op 66
+a6_mvto 0 a6_arg o 1
+a6_ew a_movzx 8 93 0 0 0
+a6_ew a_svc 0 0 0 0 0
+end
+end
+
+note a6_mvto r v: register r = value v
+fn a6_mvto r ulong v ulong to void
+l = a6_loc v
+if lt l 32
+a6_mov r l
+else
+a6_ew a_ldrx r 31 sub l 64 0 0
+end
+end
+
+note br: the values after the token go to the target's parameters after its token, as one parallel move
+fn a6_sbr o ulong x ulong to void
+t = a6_arg o 0
+a6_mvclr
+p = ulong get i_vnx get i_bp1 t
+k = ulong 2
+while ne p 0 bound 65
+a6_mvadd a6_loc p a6_loc a6_arg o k
+p = ulong get i_vnx p
+k = add k 1
+end
+a6_pmove
+ti = a6_bix t
+if ne ti add x 1
+a6_fx a_b 0 ti
+end
+end
+
+fn a6_scbr o ulong x ulong to void
+c = a6_src a6_arg o 1 16
+bt = a6_bix a6_arg o 2
+bf = a6_bix a6_arg o 3
+if eq bt add x 1
+a6_fx a_cbzx c bf
+ret
+end
+a6_fx a_cbnzx c bt
+if ne bf add x 1
+a6_fx a_b 0 bf
+end
+end
+
+note call: arguments to x0..x7 (one parallel move), BL (fixed up when every function is placed), result from x0
+fn a6_scall o ulong to void
+n = sub ulong get i_ona o 2
+if gt n 8
+a6_unsup n
+end
+a6_mvclr
+k = ulong 0
+while lt k n bound 8
+a6_mvadd k a6_loc a6_arg o add k 2
+k = add k 1
+end
+a6_pmove
+c = get a_ncl 0
+if ge c len a_cpc
+a6_unsup c
+end
+put a_cpc c get a_cn 0
+put a_cft c a6_arg o 1
+put a_ncl 0 add c 1
+a6_emitw 0
+r = ulong get i_ors o
+if ne r 0
+a6_mvfrom r 0
+end
+end
+
+note a6_mvfrom v r: value v = register r
+fn a6_mvfrom v ulong r ulong to void
+l = a6_loc v
+if lt l 32
+a6_mov l r
+else
+a6_ew a_strx r 31 sub l 64 0 0
+end
+end
+
+note ---- checks (IR.md s7.9): compare, then branch to the stub of the op's trap code ----
+fn a6_schk o ulong op ulong to void
+c = ulong get i_oim o
+if le op 73
+a6_cova o op c
+ret
+end
+if eq op 74
+a6_fx a_cbzx a6_src a6_arg o 1 16 add 1000 c
+ret
+end
+if eq op 75
+a6_cdivo o c
+ret
+end
+if eq op 76
+a6_cshl o c
+ret
+end
+if eq op 77
+a6_cshift o c
+ret
+end
+if eq op 78
+a6_cconv o c
+ret
+end
+if eq op 81
+a6_ew a_subsx 31 a6_src a6_arg o 1 16 a6_src a6_arg o 2 17 0 0
+a6_fx a_bcond 2 add 1000 c
+ret
+end
+if eq op 82
+a6_fx a_cbzx a6_src a6_arg o 1 16 add 1000 c
+ret
+end
+if eq op 79
+a6_cbnd o c
+ret
+end
+if eq op 80
+a6_cslc o c
+ret
+end
+a6_unsup op
+end
+
+note chk.bounds r i e: trap when i + e > len r or e = 0. A constant e (the covering form of every load and store,
+note s8) is one compare of i with len - e (B.HI: unsigned, exact, no add that could wrap); e = 0 or e > len always
+note traps; any other e computes len - e first (B.LO on a borrow)
+fn a6_cbnd o ulong c ulong to void
+l = a6_alen a6_arg o 1
+v = a6_arg o 3
+i = a6_src a6_arg o 2 16
+if a6_iscon v
+e = get i_oim get i_vo v
+if or eq e 0 gt e l
+a6_fx a_b 0 add 1000 c
+ret
+end
+a6_cmpk i sub l e
+a6_fx a_bcond 8 add 1000 c
+ret
+end
+e = a6_src v 17
+a6_fx a_cbzx e add 1000 c
+a6_movi 15 l
+a6_ew a_subsx 15 15 e 0 0
+a6_fx a_bcond 3 add 1000 c
+a6_ew a_subsx 31 i 15 0 0
+a6_fx a_bcond 8 add 1000 c
+end
+
+note chk.slice r off n: trap when off > len r or n > len r - off
+fn a6_cslc o ulong c ulong to void
+l = a6_alen a6_arg o 1
+f = a6_src a6_arg o 2 16
+n = a6_src a6_arg o 3 17
+a6_cmpk f l
+a6_fx a_bcond 8 add 1000 c
+a6_movi 15 l
+a6_ew a_subx 15 15 f 0 0
+a6_ew a_subsx 31 n 15 0 0
+a6_fx a_bcond 8 add 1000 c
+end
+
+note a6_cmpk r k: CMP Xr, #k (k <= 4095) or by x15
+fn a6_cmpk r ulong k ulong to void
+if le k 4095
+a6_ew a_subsxi 31 r k 0 0
+ret
+end
+a6_movi 15 k
+a6_ew a_subsx 31 r 15 0 0
+end
+
+note a6_iscon v: v is the result of a const op
+fn a6_iscon v ulong to bool
+if ne get i_vk v 4
+ret false
+end
+ret eq get i_oop get i_vo v 1
+end
+
+note chk.add sub mul neg: 64-bit by flags (V signed, C unsigned) or the high product; narrower types compute the exact
+note result in 64 bits (x15) and trap when re-extending it changes it
+fn a6_cova o ulong op ulong c ulong to void
+v = a6_arg o 1
+t = a6_vty v
+if not a6_isint t
+a6_unsup t
+end
+a = a6_src v 16
+b = ulong 31
+if ne op 73
+b = a6_src a6_arg o 2 17
+end
+if eq a6_wid t 64
+a6_cov64 op t a b c
+ret
+end
+if eq op 70
+a6_ew a_addx 15 a b 0 0
+end
+if eq op 71
+a6_ew a_subx 15 a b 0 0
+end
+if eq op 72
+a6_ew a_mulx 15 a b 0 0
+end
+if eq op 73
+a6_ew a_subx 15 31 a 0 0
+end
+a6_cext t c
+end
+
+note a6_cext t c: trap c unless x15 equals its own extension to t (x16 is free: the operands were read)
+fn a6_cext t ulong c ulong to void
+a6_mov 16 15
+a6_canon 16 t
+a6_ew a_subsx 31 15 16 0 0
+a6_fx a_bcond 1 add 1000 c
+end
+
+fn a6_cov64 op ulong t ulong a ulong b ulong c ulong to void
+s = a6_sgn t
+l = add 1000 c
+if eq op 72
+a6_cmul64 s a b l
+ret
+end
+if eq op 70
+a6_ew a_addsx 31 a b 0 0
+end
+if eq op 71
+a6_ew a_subsx 31 a b 0 0
+end
+if eq op 73
+a6_ew a_subsx 31 31 a 0 0
+end
+if s
+a6_fx a_bcond 6 l
+ret
+end
+if eq op 70
+a6_fx a_bcond 2 l
+end
+if eq op 71
+a6_fx a_bcond 3 l
+end
+if eq op 73
+a6_fx a_bcond 1 l
+end
+end
+
+note signed: the high half must be the sign of the low half; unsigned: the high half must be 0
+fn a6_cmul64 s bool a ulong b ulong l ulong to void
+if s
+a6_ew a_mulx 15 a b 0 0
+a6_ew a_smulh 16 a b 0 0
+a6_ew a_subsx 31 16 15 2 63
+a6_fx a_bcond 1 l
+else
+a6_ew a_umulh 15 a b 0 0
+a6_fx a_cbnzx 15 l
+end
+end
+
+note chk.divovf a b: trap when a = MIN and b = -1 of a's type: ((b + 1) | (a ^ MIN)) = 0
+fn a6_cdivo o ulong c ulong to void
+v = a6_arg o 1
+t = a6_vty v
+a = a6_src v 16
+b = a6_src a6_arg o 2 17
+a6_ew a_addxi 15 b 1 0 0
+a6_movi 17 sub ulong 0 shl ulong 1 sub a6_wid t 1
+a6_ew a_eorx 17 a 17 0 0
+a6_ew a_orrx 15 15 17 0 0
+a6_fx a_cbzx 15 add 1000 c
+end
+
+note chk.shl a b (signed, b already < width): 64-bit: (a << b) >> b must be a; narrower: a << b must survive extension
+fn a6_cshl o ulong c ulong to void
+v = a6_arg o 1
+t = a6_vty v
+a = a6_src v 16
+b = a6_src a6_arg o 2 17
+a6_ew a_lslvx 15 a b 0 0
+if eq a6_wid t 64
+a6_ew a_asrvx 17 15 b 0 0
+a6_ew a_subsx 31 17 a 0 0
+a6_fx a_bcond 1 add 1000 c
+ret
+end
+a6_cext t c
+end
+
+note chk.shift b: trap unless 0 <= b < width (unsigned compare of the extended value)
+fn a6_cshift o ulong c ulong to void
+v = a6_arg o 1
+t = a6_vty v
+b = a6_src v 16
+a6_ew a_subsxi 31 b a6_wid t 0 0
+a6_fx a_bcond 2 add 1000 c
+end
+
+note chk.conv to integer type ty from integer v (float sources are not in the slice)
+fn a6_cconv o ulong c ulong to void
+d = ulong get i_oty o
+v = a6_arg o 1
+s = a6_vty v
+if or not a6_isint s not a6_isint d
+a6_unsup s
+end
+a = a6_src v 16
+l = add 1000 c
+wd = a6_wid d
+if eq wd 64
+if and a6_sgn s eq d 5
+a6_ew a_subsxi 31 a 0 0 0
+a6_fx a_bcond 11 l
+end
+if and eq s 5 eq d 9
+a6_ew a_subsxi 31 a 0 0 0
+a6_fx a_bcond 11 l
+end
+ret
+end
+if eq s 5
+a6_movi 15 sub shl ulong 1 wd 1
+if a6_sgn d
+a6_movi 15 sub shl ulong 1 sub wd 1 1
+end
+a6_ew a_subsx 31 a 15 0 0
+a6_fx a_bcond 8 l
+ret
+end
+a6_mov 15 a
+a6_cext d c
+end
+
+note ---- E loop shape (D13) ----
+note A block ending `r = call f(...); s = add a r` (or `add r a`) `; retv s` inside f itself, with r and s used once
+note each, becomes `acc = acc + a; f's parameters = the call's arguments; B head`: no call, no add, no retv. Every other
+note `retv x` of f returns acc + x. acc (wire a_taw, type a_tat) is 0 at the head, which follows the entry parameter
+note moves. Integer add is modulo 2^w (IR.md s7.3), hence associative and commutative, so every result is exact.
+note A checked add (chk.add on r) is a second use of r and keeps the call. Stack depth falls, and trap 6 is not
+note semantic (IR.md s7.9, D9).
+fn a6_tre f ulong to void
+put a_fs 14 0
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+a6_tblk f get a_bh x
+x = add x 1
+end
+end
+
+fn a6_tblk f ulong b ulong to void
+c = ulong 0
+m = ulong 0
+l = ulong 0
+o = ulong get i_bo1 b
+while ne o 0 bound 4194305
+c = m
+m = l
+l = o
+o = ulong get i_onx o
+end
+if eq c 0
+ret
+end
+if not a6_tpat f c m l
+ret
+end
+n = get a_fs 14
+if ge n len a_tco
+ret
+end
+put a_tco n c
+put a_fs 14 add n 1
+put a_tat 0 ulong get i_oty m
+end
+
+note a6_tpat f c m l: the last three ops of a block are the E shape (call c to f, add m, retv l)
+fn a6_tpat f ulong c ulong m ulong l ulong to bool
+if ne get i_oop c 64
+ret false
+end
+if ne get i_oop m 10
+ret false
+end
+if ne get i_oop l 63
+ret false
+end
+r = ulong get i_ors c
+s = ulong get i_ors m
+if eq r 0
+ret false
+end
+if ne a6_arg c 1 f
+ret false
+end
+if ne a6_arg l 1 s
+ret false
+end
+if not or eq a6_arg m 0 r eq a6_arg m 1 r
+ret false
+end
+if ne a6_uses r 1
+ret false
+end
+if ne a6_uses s 1
+ret false
+end
+ret a6_isint ulong get i_oty m
+end
+
+note a6_uses v: the number of value operands in the function that are v
+fn a6_uses v ulong to ulong
+c = ulong 0
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+op = get i_oop o
+n = ulong get i_ona o
+k = ulong 0
+while lt k n bound 1048576
+if eq ir_okd uint op k 0
+if eq a6_arg o k v
+c = add c 1
+end
+end
+k = add k 1
+end
+o = ulong get i_onx o
+end
+x = add x 1
+end
+ret c
+end
+
+fn a6_istc o ulong to bool
+i = ulong 0
+while lt i get a_fs 14 bound 64
+if eq get a_tco i o
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note a6_tacc: the accumulator is one more wire, defined at 0 and live to the end (it crosses every call in f)
+fn a6_tacc to void
+if eq get a_fs 14 0
+ret
+end
+w = get a_fs 0
+if ge w a_maxv
+a6_unsup w
+end
+put a_taw 0 w
+put a_vh w 0
+put a_vsl w 0
+put a_vx w 0
+put a_vr w 255
+put a_vs w 0
+put a_ve w get a_fs 3
+put a_fs 0 add w 1
+end
+
+fn a6_accl to ulong
+w = get a_taw 0
+r = ulong get a_vr w
+if lt r 32
+ret r
+end
+ret add 64 sub get a_vsl w 1
+end
+
+note a6_tsum d a: register d = acc + register a, re-extended to the accumulator's type (acc from its slot via x17)
+fn a6_tsum d ulong a ulong to void
+l = a6_accl
+c = l
+if ge l 32
+a6_ew a_ldrx 17 31 sub l 64 0 0
+c = ulong 17
+end
+a6_ew a_addx d c a 0 0
+a6_canon d get a_tat 0
+end
+
+note a6_stail o: the tail site at call o (the add and retv after it emit nothing)
+fn a6_stail o ulong to void
+m = ulong get i_onx o
+r = ulong get i_ors o
+v = a6_arg m 0
+if eq v r
+v = a6_arg m 1
+end
+a = a6_src v 16
+l = a6_accl
+if lt l 32
+a6_tsum l a
+else
+a6_tsum 17 a
+a6_ew a_strx 17 31 sub l 64 0 0
+end
+a6_mvclr
+p = ulong get i_fp1 get a_fs 8
+k = ulong 2
+while ne p 0 bound 65
+a6_mvadd a6_loc p a6_loc a6_arg o k
+p = ulong get i_vnx p
+k = add k 1
+end
+a6_pmove
+a6_ew a_b a6_wd get a_cn 0 get a_fs 15 0 0 0 0
+end
+
+note ---- one function ----
+fn a6_func f ulong to void
+if eq get i_fk f 1
+a6_unsup 1
+end
+nv = ulong ir_num uint f
+if gt nv a_maxv
+a6_unsup nv
+end
+put a_fs 0 nv
+put a_fs 8 f
+a6_wmap f
+a6_lay f
+a6_tre f
+lw = shr add nv 63 6
+put a_fs 2 lw
+if gt mul get a_fs 1 lw a_maxw
+a6_unsup lw
+end
+a6_ccalls
+a6_lzero
+a6_lgen
+a6_lflow
+a6_ivinit
+a6_ivuse
+a6_ivlive
+a6_tacc
+a6_ivcross
+a6_scan
+a6_frame
+a6_fbody f
+end
+
+note a6_al64: pad the code with NOP (C6.2.238, never executed: the previous function ends in RET or its trap stubs)
+note to a 64-byte boundary. Text file offset k loads at 0x400000 + k, so this aligns the virtual address (D13).
+fn a6_al64 to void
+while ne and get a_cn 0 63 0 bound 16
+a6_emitw 0xd503201f
+end
+end
+
+fn a6_fbody f ulong to void
+a6_al64
+put a_fpc f get a_cn 0
+put a_fs 12 0
+put a_fs 10 0
+a6_pro
+a6_mvclr
+p = ulong get i_fp1 f
+k = ulong 0
+while ne p 0 bound 65
+if ge k 8
+a6_unsup k
+end
+a6_mvadd a6_loc p k
+p = ulong get i_vnx p
+k = add k 1
+end
+a6_pmove
+if ne get a_fs 14 0
+l = a6_accl
+if lt l 32
+a6_ew a_movzx l 0 0 0 0
+else
+a6_ew a_strx 31 31 sub l 64 0 0
+end
+put a_fs 15 get a_cn 0
+end
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+put a_bpc x get a_cn 0
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+if a6_istc o
+a6_stail o
+o = ulong 0
+else
+a6_sel o x
+o = ulong get i_onx o
+end
+end
+x = add x 1
+end
+a6_tstubs
+a6_fixb
+end
+
+note ---- module: ELF (omc's map), _start, functions, call fixups ----
+note entry (D11): the single export (kind 2) with no parameters and result i32
+fn a6_isent f ulong to bool
+if ne get i_fk f 2
+ret false
+end
+ret and eq get i_fnp f 0 eq get i_frs f 8
+end
+
+fn a6_entry to ulong
+n = get i_n 3
+e = ulong 0
+f = ulong 1
+while le f n bound 65537
+if a6_isent f
+if ne e 0
+a6_unsup f
+end
+e = f
+end
+f = add f 1
+end
+if eq e 0
+a6_unsup 0
+end
+ret e
+end
+
+fn a6_comp to void
+put a_cn 0 176
+put a_ncl 0 0
+e = a6_entry
+a6_ew a_movzx 28 4096 1 0 0
+a6_ew a_movzx 16 4224 1 0 0
+a6_ew a_addxi 31 16 0 0 0
+put a_cpc 0 get a_cn 0
+put a_cft 0 e
+put a_ncl 0 1
+a6_emitw 0
+a6_ew a_movzx 8 93 0 0 0
+a6_ew a_svc 0 0 0 0 0
+a6_glay
+n = get i_n 3
+f = ulong 1
+while le f n bound 65537
+a6_func f
+f = add f 1
+end
+i = ulong 0
+while lt i get a_ncl 0 bound 1048576
+pc = get a_cpc i
+a6_putw pc a6_enc a_bl a6_wd pc get a_fpc get a_cft i 0 0 0 0
+i = add i 1
+end
+a6_elf get a_cn 0
+end
+
+fn a6_pn o ulong v ulong k ulong to void
+i = ulong 0
+while lt i k bound 8
+put a_code add o i uchar and shr v shl i 3 255
+i = add i 1
+end
+end
+
+note ELF64 header and two PT_LOAD headers: text R+X at 0x400000 (file offset 0), RW pool at 0x10000000: the 8 MiB
+note stack, then the class-0 globals (zero-filled, no file bytes)
+fn a6_elf n ulong to void
+i = ulong 0
+while lt i 176 bound 176
+put a_code i 0
+i = add i 1
+end
+a6_pn 0 0x00010102464c457f 8
+a6_pn 16 0x00b70002 4
+a6_pn 20 1 4
+a6_pn 24 0x4000b0 8
+a6_pn 32 64 8
+a6_pn 52 0x00380040 4
+a6_pn 56 2 2
+a6_pn 64 0x500000001 8
+a6_pn 80 0x400000 8
+a6_pn 88 0x400000 8
+a6_pn 96 n 8
+a6_pn 104 n 8
+a6_pn 112 4096 8
+a6_pn 120 0x600000001 8
+a6_pn 136 0x10000000 8
+a6_pn 144 0x10000000 8
+a6_pn 160 add 0x800000 and add get a_gtot 0 4095 not ulong 4095 8
+a6_pn 168 4096 8
+end
+
+note a6_glay: class-0 globals in the RW pool from 0x10800000 (16-byte aligned, as omc), at most 1 GiB; class-1
+note globals' bytes into the code image here (between the start code and the first function), padded to a word
+fn a6_glay to void
+n = get i_n 2
+p = ulong 0
+g = ulong 1
+while le g n bound 65537
+s = ir_tsize get i_gty g
+if eq get i_gcl g 1
+put a_gad g add 0x400000 get a_cn 0
+a6_gdat g s
+else
+put a_gad g add 0x10800000 p
+p = and add add p s 15 not ulong 15
+end
+if gt p 1073741824
+a6_unsup p
+end
+g = add g 1
+end
+put a_gtot 0 p
+end
+
+fn a6_gdat g ulong s ulong to void
+c = get a_cn 0
+if gt add c add s 3 len a_code
+a6_die 4 3 18446744073709551615
+end
+d = get i_gd0 g
+k = ulong 0
+while lt k s bound 1073741824
+put a_code add c k get i_gdat add d k
+k = add k 1
+end
+while ne and k 3 0 bound 4
+put a_code add c k 0
+k = add k 1
+end
+put a_cn 0 add c k
+end
+
+note the mode lines of this unit: 0 `@ng a64-enc` (encoder test), 1 `@ng a64` (compile, save pairs), 2 `@ng a64 split`
+note (compile, separate saves)
+text a_tmag "@ng a64-enc"
+text a_tmg1 "@ng a64"
+text a_tmg2 "@ng a64 split"
+fn a6_tlen k ulong to ulong
+if eq k 0
+ret len a_tmag
+end
+if eq k 1
+ret len a_tmg1
+end
+ret len a_tmg2
+end
+
+fn a6_tch k ulong i ulong to ulong
+if eq k 0
+ret ulong get a_tmag i
+end
+if eq k 1
+ret ulong get a_tmg1 i
+end
+ret ulong get a_tmg2 i
+end
+
+note a6_isln k m: the mode line (length m, main's ng_mlb) is exactly mode line k
+fn a6_isln k ulong m ulong to bool
+n = a6_tlen k
+if ne m n
+ret false
+end
+i = ulong 0
+while lt i n bound 16
+if ne ng_mlb i a6_tch k i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note a6_mode m: main's hook before it reads the payload: the mode the mode line (length m) names, 0 `@ng a64-enc`,
+note 1 `@ng a64`, 2 `@ng a64 split`; 255 when it is not a mode of this unit
+fn a6_mode m ulong to ulong
+k = ulong 0
+while lt k 3 bound 3
+if a6_isln k m
+ret k
+end
+k = add k 1
+end
+ret 255
+end
+
+note a6_run a n: run mode a (a6_mode) on the payload i_in[0, n) main read; exits
+fn a6_run a ulong n ulong to void
+put a_inlen 0 n
+a6_init
+if eq a 0
+a6_enctest
+end
+put a_sform 0 sub a 1
+a6_build n
+end
+
+note a6_build n: read the ΩIR module in i_in[0, n), compile it, write the ELF to stdout, exit 0
+fn a6_build n ulong to void
+c = ir_read 0 n
+if ne c 0
+a6_die c 8 ir_badat
+end
+a6_comp
+a6_flush
+exit 0
+end

@@ -1,0 +1,250 @@
+note fibhb: the D8 plan-breaker experiment (DECISIONS.md D8). Built as the concatenation seed/ng/src/ir.om (for its
+note input pool i_in) + seed/ng/src/a64.om + this file; it is a standalone experiment tool, not a mode of ng.
+note Input: the line `a64 fib V` (V one of A B D E) and then an omc-built AArch64 ELF whose program contains seed omc's
+note code for the bench function
+note   fn fib n ulong to ulong / if lt n 2 / ret n / end / a = fib sub n 1 / b = fib sub n 2 / ret add a b / end
+note (~/handoffs/OmegaFast/bench/fib.om and OMC-EFF-1 kernels/fib.om). Output: the same ELF with only that function
+note replaced by hand-built code made of encoder words. Every other byte (main, putnum, the trap tail) is omc's, so
+note the difference measured is the code of fib alone. Every variant keeps omc's stack check (CMP SP,X28; B.LO to
+note omc's own trap-6 stub) before its first store, and builds no frame on the leaf path (n < 2).
+note   A  the allocator's intended convention: liveness-driven saves into one callee-saved register. x19 holds n
+note      across the first call and fib(n-1) across the second (the live ranges do not overlap, so linear scan gives
+note      them one register); one 16-byte frame, STP x19,x30 / LDP x19,x30,[sp],#16. Per non-leaf call 1 STP, 1 LDP.
+note   B  A with the pair split into STR/STR and LDR/LDR (separates pairing from save count).
+note   E  A plus the second call turned into a loop (fib(n) = sum over k of fib(n-1-2k), plus the final n < 2 term),
+note      the shape gcc -O2 13.3 emits; not a save-convention change: it measures what call elimination is worth.
+note      Wrapping ulong add is associative, so the result is exact; recursion depth is unchanged (the first call
+note      chain still descends n-1, n-2, ...), so trap 6 still fires on deep inputs.
+note   D  A placed at the first 64-byte boundary at or after s+4, with `b` to it at s (main's one call takes the
+note      hop; the recursive calls BL the aligned copy directly). Separates code placement from convention.
+note omc's fib (seed/omc/omc.om@943d9555 save/restore 4985/5050): per non-leaf call 9 stores and 7 loads, two frames.
+note Exit 5 with `a64: unsupported N` when the first line is wrong, the input does not contain omc's fib exactly once
+note (N = the number of matches), or its stack check does not reach a trap-6 stub.
+
+global a_fpat ulong 6
+global a_elen ulong 1
+
+fn a6_rdw o ulong to ulong
+b0 = ulong get a_code o
+b1 = ulong get a_code add o 1
+b2 = ulong get a_code add o 2
+b3 = ulong get a_code add o 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+note the first six words of omc's fib: cmp x0,#2; b.cs +8; ret; sub x2,x0,#1; sub sp,sp,#32; cmp sp,x28
+fn a6_fpini to void
+put a_fpat 0 0xf100081f
+put a_fpat 1 0x54000042
+put a_fpat 2 0xd65f03c0
+put a_fpat 3 0xd1000402
+put a_fpat 4 0xd10083ff
+put a_fpat 5 0xeb3c63ff
+end
+
+note a6_fibat: omc's 35-word fib starts at byte s (first six words, then add x0,x1,x2; ret at +132, +136)
+fn a6_fibat s ulong to bool
+i = ulong 0
+while lt i 6 bound 6
+if ne a6_rdw add s shl i 2 get a_fpat i
+ret false
+end
+i = add i 1
+end
+if ne a6_rdw add s 132 0x8b020020
+ret false
+end
+ret eq a6_rdw add s 136 0xd65f03c0
+end
+
+fn a6_fibfnd to ulong
+n = get a_elen 0
+s = ulong 176
+hit = n
+cnt = ulong 0
+while le add s 140 n bound 4000000
+if a6_fibat s
+hit = s
+cnt = add cnt 1
+end
+s = add s 4
+end
+if ne cnt 1
+a6_die 5 5 cnt
+end
+ret hit
+end
+
+note a6_bctgt: the byte target of the B.cond word w at byte pc (die 5 unless it is B.LO/B.CC)
+fn a6_bctgt w ulong pc ulong to ulong
+if ne and w 0xff00001f 0x54000003
+a6_die 5 5 w
+end
+imm = and shr w 5 0x7ffff
+if ne and imm 0x40000 0
+ret sub pc shl sub 0x80000 imm 2
+end
+ret add pc shl imm 2
+end
+
+note a6_wdist: the distance in words from the next emitted word (a_cn) to byte t, two's complement
+fn a6_wdist t ulong to ulong
+h = get a_cn 0
+if ge t h
+ret shr sub t h 2
+end
+ret sub 0 shr sub h t 2
+end
+
+note a6_fibpro: at byte s, the leaf test and a checked frame of fr bytes (cmp x0,#2; b.hs +8; ret;
+note sub sp,sp,#fr; cmp sp,x28; b.lo trap6)
+fn a6_fibpro s ulong t6 ulong fr ulong to void
+put a_cn 0 s
+a6_ew a_subsxi 31 0 2 0 0
+a6_ew a_bcond 2 2 0 0 0
+a6_ew a_ret 30 0 0 0 0
+a6_ew a_subxi 31 31 fr 0 0
+a6_ew a_subsxe 31 31 28 3 0
+a6_ew a_bcond 3 a6_wdist t6 0 0 0
+end
+
+note a6_fibmid: the two calls with x19 live across each (shared by A and B)
+fn a6_fibmid s ulong to void
+a6_ew a_orrx 19 31 0 0 0
+a6_ew a_subxi 0 0 1 0 0
+a6_ew a_bl a6_wdist s 0 0 0 0
+a6_ew a_subxi 1 19 2 0 0
+a6_ew a_orrx 19 31 0 0 0
+a6_ew a_orrx 0 31 1 0 0
+a6_ew a_bl a6_wdist s 0 0 0 0
+a6_ew a_addx 0 19 0 0 0
+end
+
+fn a6_fiba s ulong t6 ulong to void
+a6_fibpro s t6 16
+a6_ew a_stpx 19 30 31 0 0
+a6_fibmid s
+a6_ew a_ldpxpo 19 30 31 16 0
+a6_ew a_ret 30 0 0 0 0
+end
+
+fn a6_fibb s ulong t6 ulong to void
+a6_fibpro s t6 16
+a6_ew a_strx 19 31 0 0 0
+a6_ew a_strx 30 31 1 0 0
+a6_fibmid s
+a6_ew a_ldrx 19 31 0 0 0
+a6_ew a_ldrx 30 31 1 0 0
+a6_ew a_addxi 31 31 16 0 0
+a6_ew a_ret 30 0 0 0 0
+end
+
+note D: B to a, NOP fill, then A at a (a = the 64-byte boundary at or after s+4; A is 68 bytes)
+fn a6_fibd s ulong t6 ulong to void
+a = and add s 67 0xffffffffffffffc0
+if gt add a 68 add s 140
+a6_die 5 5 a
+end
+put a_cn 0 s
+a6_ew a_b a6_wdist a 0 0 0 0
+while lt get a_cn 0 a bound 16
+a6_emitw 0xd503201f
+end
+a6_fiba a t6
+end
+
+note E: x19 = n (counts down by 2), x20 = the sum of fib(n-1), fib(n-3), ...; the loop runs while x19 >= 2
+fn a6_fibe s ulong t6 ulong to void
+a6_fibpro s t6 32
+a6_ew a_stpx 19 20 31 0 0
+a6_ew a_strx 30 31 2 0 0
+a6_ew a_orrx 19 31 0 0 0
+a6_ew a_movzx 20 0 0 0 0
+lp = get a_cn 0
+a6_ew a_subxi 0 19 1 0 0
+a6_ew a_bl a6_wdist s 0 0 0 0
+a6_ew a_addx 20 20 0 0 0
+a6_ew a_subxi 19 19 2 0 0
+a6_ew a_subsxi 31 19 2 0 0
+a6_ew a_bcond 2 a6_wdist lp 0 0 0
+a6_ew a_addx 0 20 19 0 0
+a6_ew a_ldrx 30 31 2 0 0
+a6_ew a_ldpxpo 19 20 31 32 0
+a6_ew a_ret 30 0 0 0 0
+end
+
+note a6_fibhd: the first line is `a64 fib V` (10 bytes with the newline); returns V
+fn a6_fibhd to ulong
+if lt get a_inlen 0 10
+a6_die 5 5 0
+end
+ok = and and eq get i_in 0 97 eq get i_in 1 54 eq get i_in 2 52
+ok2 = and and eq get i_in 3 32 eq get i_in 4 102 eq get i_in 5 105
+ok3 = and and eq get i_in 6 98 eq get i_in 7 32 eq get i_in 9 10
+if not and and ok ok2 ok3
+a6_die 5 5 0
+end
+ret ulong get i_in 8
+end
+
+note a6_fbin: all of stdin into i_in, its length into a_inlen (die 3 class 2 when it does not fit, 2 class 1 on error)
+fn a6_fbin to void
+n = ulong 0
+go = true
+while go bound 1000000
+if ge n len i_in
+a6_die 3 2 18446744073709551615
+end
+k = read 0 i_in n sub len i_in n
+if lt k 0
+a6_die 2 1 18446744073709551615
+end
+if eq k 0
+go = false
+else
+n = add n ulong k
+end
+end
+put a_inlen 0 n
+end
+
+fn main to int
+a6_init
+a6_fpini
+a6_fbin
+v = a6_fibhd
+n = sub get a_inlen 0 10
+i = ulong 0
+while lt i n bound 16777216
+put a_code i get i_in add i 10
+i = add i 1
+end
+put a_elen 0 n
+s = a6_fibfnd
+t6 = a6_bctgt a6_rdw add s 24 add s 24
+if ne a6_rdw t6 0xd28000c1
+a6_die 5 5 t6
+end
+if not or or eq v 65 eq v 66 or eq v 68 eq v 69
+a6_die 5 5 v
+end
+if eq v 65
+a6_fiba s t6
+end
+if eq v 66
+a6_fibb s t6
+end
+if eq v 68
+a6_fibd s t6
+end
+if eq v 69
+a6_fibe s t6
+end
+note the rest of omc's 140 bytes is unreachable: NOP (C6.2.296, 0xd503201f)
+while lt get a_cn 0 add s 140 bound 35
+a6_emitw 0xd503201f
+end
+put a_cn 0 n
+a6_flush
+ret 0
+end

@@ -1,0 +1,1113 @@
+note mkir: ΩIR fixtures for the ng-a64 gates, built with ir.om's builder (seed/ng/IR.md s14). Built as the
+note concatenation seed/ng/src/ir.om + this file. Input: one line naming the fixture; output: its ΩIR binary (ir_wr).
+note Program entry (D11): the single export (kind 2) with no parameters and result i32; its result is the exit status.
+note main's `int` is lowered as IR.md s13 says: chk.conv i32 (trap 5), then conv.
+note   fib   fn fib n u64 -> u64 (n < 2: n, else fib(n-1) + fib(n-2)), the bench kernel; main returns i32 fib(25)
+note   deep  i32 fib(100000000): the recursion passes the stack floor, trap 6 (exit 106)
+note   press pr(7) + pq(9), low byte: pr keeps 28 values live across a call (9 callee-saved registers: spills),
+note         pq keeps 40 values live with no call (24 registers: spills)
+note   rot   a loop whose block parameters rotate as a 3-cycle (x, y, z) <- (y, z, x), s <- 31 s + x; 1000 passes
+note   ck    ck(5, 7) then ck(2147483000, 1000), ck = chk.add then add on i32: trap 1 (exit 101)
+note   ar    u32 rotl rotr shl max add mul select shr, u8 wrap, i32 shr div rem min sub, folded into u64; low byte
+note   tsum  fn ts n u64 -> u64 (n < 1: n, else ts(n-1) + n, call result first), main returns i32 of ts(1000000) & 255
+note         (ts(1000000) = 500000500000 does not fit i32: without the & 255 its chk.conv traps 5). ng's E loop shape
+note         removes the recursion (status 32); omc recurses a million deep and traps 6 (106)
+note   mem   global src u8[300] filled by fill(REF src) (src[i] = 7 i & 255); one chk.bounds with a computed e; local
+note         b u64[600] (alloca, zero-filled, frame above 4095 bytes); b[i + 300] = src[i] + i; s = sum b[i] (i + 1);
+note         chk.slice and write of the 3-byte text "ok\n" to fd 1; status (s + write's count) & 255
+note   oob   global g u64[10]; for i < 11: g[i] = i, each covered by chk.bounds: trap 3 at i = 10 (exit 103)
+note   zf    fn z -> u64: local a u64[4] (alloca), v = a[3], a[3] = 77, return v; main returns z() + z(): the
+note         second call reuses the first one's stack bytes, so only the zero fill makes it 0 (status 0, not 77)
+note   wid   one global ARRAY of 2 per element type i8 u16 i16 u32 i32; element 1 = -100, 60000, -30000, 4000000000,
+note         -2000000000; each loaded back, converted to i64 and summed (2000029900), plus 1 per loaded value equal
+note         (eq at its own type, which a non-canonical load fails) to the stored constant: status 209
+note   bcopy the bench kernel ~/handoffs/OmegaFast/bench/bcopy.om lowered by IR.md s13: two global u8[65536], 8000
+note         reversed xor copies, write 1 dst 0 65536; status 0, stdout 65536 bytes (Wolfram SHA-256 483bf6a6..7315)
+note   sort  the bench kernel bench/sort.om lowered by IR.md s13 (five functions, REF parameters, alloca, while
+note         loops, putnum's write at a variable offset); status 0, stdout 2128411481385469, 0, 118, 3999832 (Wolfram)
+note   lv    fn lv n u64 -> u64: v_k = n (2k + 3) + k^2 + 1 for k < 20, all live (no call) across chk.add v_0 v_1,
+note         chk.mul v_2 v_3 and chk.bounds of n & 7 in a global u64[8] (the checks use scratch x15, which the
+note         allocator must never hand out); s = n, s = (5 s) xor v_k in order; main returns lv(9) & 255
+note The omc reference program of fixture N is seed/ng/a64/tests/ref/N.om (the same computation in Omega).
+note Exit 2 for an unknown fixture name.
+text m_names "fib\ndeep\npress\nrot\nck\nar\ntsum\nmem\noob\nzf\nwid\nbcopy\nsort\nlv\n"
+global m_v uint 64
+
+fn m_k1 b uint ty uint v ulong to uint
+o = ir_op b 1 ty v 0
+ret ir_res o
+end
+
+note m_bin b op ty x y: a two-operand op with no token, its result
+fn m_bin b uint op uint ty uint x uint y uint to uint
+o = ir_op b op ty 0 2
+ir_set o 0 x
+ir_set o 1 y
+ret ir_res o
+end
+
+fn m_un b uint op uint ty uint x uint to uint
+o = ir_op b op ty 0 1
+ir_set o 0 x
+ret ir_res o
+end
+
+note m_call b t f ty a: call f (one argument a) on token t; the op handle (its token ir_otok, result ir_res)
+fn m_call b uint t uint f uint ty uint a uint to uint
+o = ir_op b 64 ty 0 3
+ir_set o 0 t
+ir_set o 1 f
+ir_set o 2 a
+ret o
+end
+
+note m_calln b t f ty n: call f with the n arguments m_v[50 .. 50 + n)
+fn m_calln b uint t uint f uint ty uint n uint to uint
+o = ir_op b 64 ty 0 add n 2
+ir_set o 0 t
+ir_set o 1 f
+k = uint 0
+while lt k n bound 8
+ir_set o add k 2 get m_v add k 50
+k = add k 1
+end
+ret o
+end
+
+fn m_retv b uint t uint v uint to void
+o = ir_op b 63 0 0 2
+ir_set o 0 t
+ir_set o 1 v
+end
+
+note m_chk2 b t op code x y: a two-operand check on token t; the token it defines
+fn m_chk2 b uint t uint op uint code ulong x uint y uint to uint
+o = ir_op b op 0 code 3
+ir_set o 0 t
+ir_set o 1 x
+ir_set o 2 y
+ret ir_otok o
+end
+
+note m_br5 b t tk: br to t with token tk and the five values m_v[56 .. 61)
+fn m_br5 b uint t uint tk uint to void
+o = ir_op b 60 0 0 7
+ir_set o 0 t
+ir_set o 1 tk
+k = uint 0
+while lt k 5 bound 5
+ir_set o add k 2 get m_v add k 56
+k = add k 1
+end
+end
+
+note m_mlow b t s: retv i32 (conv) of s & 255 on token t
+fn m_mlow b uint t uint s uint to void
+c = m_k1 b 5 255
+a = m_bin b 16 5 s c
+m_retv b t m_un b 36 8 a
+end
+
+fn m_fib to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b0 = ir_blk f
+bl = ir_blk f
+br = ir_blk f
+c2 = m_k1 b0 5 2
+cm = m_bin b0 32 1 n c2
+o = ir_op b0 61 0 0 4
+ir_set o 0 ir_ftok f
+ir_set o 1 cm
+ir_set o 2 bl
+ir_set o 3 br
+m_retv bl ir_btok bl n
+c1 = m_k1 br 5 1
+s1 = m_bin br 11 5 n c1
+k1 = m_call br ir_btok br f 5 s1
+s2 = m_bin br 11 5 n c2
+k2 = m_call br ir_otok k1 f 5 s2
+a = m_bin br 10 5 ir_res k1 ir_res k2
+m_retv br ir_otok k2 a
+ret f
+end
+
+note m_main f x m: export main: Omega `int` of f(x) (m 1: of f(x) & 255), chk.conv i32 5 then conv (IR.md s13)
+fn m_main f uint x ulong m ulong to void
+g = ir_fnew 2 0 8
+b0 = ir_blk g
+c = m_k1 b0 5 x
+k = m_call b0 ir_ftok g f 5 c
+v = ir_res k
+if eq m 1
+v = m_bin b0 16 5 v m_k1 b0 5 255
+end
+o = ir_op b0 78 8 5 2
+ir_set o 0 ir_otok k
+ir_set o 1 v
+m_retv b0 ir_otok o m_un b0 36 8 v
+end
+
+note pr n: v_k = n (2k + 3) + k^2 + 1 for k < 28, all live across s = fib(10); then s = 3 s + v_k in order
+fn m_pr g uint to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b = ir_blk f
+k = ulong 0
+while lt k 28 bound 28
+m = m_bin b 12 5 n m_k1 b 5 add mul k 2 3
+put m_v k m_bin b 10 5 m m_k1 b 5 add mul k k 1
+k = add k 1
+end
+o = m_call b ir_ftok f g 5 m_k1 b 5 10
+s = ir_res o
+c3 = m_k1 b 5 3
+k = 0
+while lt k 28 bound 28
+s = m_bin b 10 5 m_bin b 12 5 s c3 get m_v k
+k = add k 1
+end
+m_retv b ir_otok o s
+ret f
+end
+
+note pq n: v_k = n (5k + 7) + 11k + 13 for k < 40, all live at once; then s = n, s = (5 s) xor v_k in order
+fn m_pq to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b = ir_blk f
+k = ulong 0
+while lt k 40 bound 40
+m = m_bin b 12 5 n m_k1 b 5 add mul k 5 7
+put m_v k m_bin b 10 5 m m_k1 b 5 add mul k 11 13
+k = add k 1
+end
+c5 = m_k1 b 5 5
+s = n
+k = 0
+while lt k 40 bound 40
+s = m_bin b 18 5 m_bin b 12 5 s c5 get m_v k
+k = add k 1
+end
+m_retv b ir_ftok f s
+ret f
+end
+
+fn m_press to void
+fb = m_fib
+pr = m_pr fb
+pq = m_pq
+g = ir_fnew 2 0 8
+b = ir_blk g
+o1 = m_call b ir_ftok g pr 5 m_k1 b 5 7
+o2 = m_call b ir_otok o1 pq 5 m_k1 b 5 9
+s = m_bin b 10 5 ir_res o1 ir_res o2
+m_mlow b ir_otok o2 s
+end
+
+note rot n: b1(i, x, y, z, s) = (0, 1, 2, 3, 0); while i < n: b1(i + 1, y, z, x, 31 s + x); result s
+fn m_rot to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b0 = ir_blk f
+b1 = ir_blk f
+b2 = ir_blk f
+b3 = ir_blk f
+i = ir_bpar b1 5
+x = ir_bpar b1 5
+y = ir_bpar b1 5
+z = ir_bpar b1 5
+s = ir_bpar b1 5
+c0 = m_k1 b0 5 0
+put m_v 56 c0
+put m_v 57 m_k1 b0 5 1
+put m_v 58 m_k1 b0 5 2
+put m_v 59 m_k1 b0 5 3
+put m_v 60 c0
+m_br5 b0 b1 ir_ftok f
+m_rotc b1 b2 b3 i n
+s2 = m_bin b2 10 5 m_bin b2 12 5 s m_k1 b2 5 31 x
+put m_v 56 m_bin b2 10 5 i m_k1 b2 5 1
+put m_v 57 y
+put m_v 58 z
+put m_v 59 x
+put m_v 60 s2
+m_br5 b2 b1 ir_btok b2
+m_retv b3 ir_btok b3 s
+ret f
+end
+
+fn m_rotc b1 uint b2 uint b3 uint i uint n uint to void
+c = m_bin b1 32 1 i n
+o = ir_op b1 61 0 0 4
+ir_set o 0 ir_btok b1
+ir_set o 1 c
+ir_set o 2 b2
+ir_set o 3 b3
+end
+
+fn m_rotm to void
+r = m_rot
+g = ir_fnew 2 0 8
+b = ir_blk g
+o = m_call b ir_ftok g r 5 m_k1 b 5 1000
+m_mlow b ir_otok o ir_res o
+end
+
+note ck a b (i32): chk.add a b, then a + b
+fn m_ckf to uint
+f = ir_fnew 0 0 8
+a = ir_fpar f 8
+bb = ir_fpar f 8
+b = ir_blk f
+t = m_chk2 b ir_ftok f 70 1 a bb
+m_retv b t m_bin b 10 8 a bb
+ret f
+end
+
+fn m_ck to void
+cf = m_ckf
+g = ir_fnew 2 0 8
+b = ir_blk g
+put m_v 50 m_k1 b 8 5
+put m_v 51 m_k1 b 8 7
+o1 = m_calln b ir_ftok g cf 8 2
+put m_v 50 m_k1 b 8 2147483000
+put m_v 51 m_k1 b 8 1000
+o2 = m_calln b ir_otok o1 cf 8 2
+m_retv b ir_otok o2 m_bin b 10 8 ir_res o1 ir_res o2
+end
+
+note ar a b (u32) c d (i32) -> u64: m_v[0 .. 14) as in the header, s = 1000003 s + u64 v_k in order
+fn m_ar1 b uint a uint bb uint c uint d uint to void
+put m_v 0 m_bin b 22 4 a m_k1 b 4 7
+put m_v 1 m_bin b 23 4 bb m_k1 b 4 13
+put m_v 2 m_bin b 20 4 a m_k1 b 4 9
+put m_v 3 m_bin b 25 4 a bb
+put m_v 4 m_bin b 10 4 a bb
+put m_v 5 m_bin b 12 4 a bb
+cl = m_bin b 32 1 c d
+o = ir_op b 2 4 0 3
+ir_set o 0 cl
+ir_set o 1 a
+ir_set o 2 bb
+put m_v 6 ir_res o
+x8 = m_un b 36 2 a
+y8 = m_bin b 10 2 x8 m_k1 b 2 200
+put m_v 7 m_un b 36 4 y8
+put m_v 8 m_bin b 21 4 bb m_k1 b 4 5
+end
+
+note i32 results are moved into 0 .. 2^31 by adding 2^30, so the reference never converts a negative value
+fn m_ar2 b uint c uint d uint to void
+off = m_k1 b 8 1073741824
+put m_v 9 m_bin b 10 8 m_bin b 21 8 c m_k1 b 8 3 off
+put m_v 10 m_bin b 10 8 m_bin b 13 8 c d off
+put m_v 11 m_bin b 10 8 m_bin b 14 8 c d off
+put m_v 12 m_bin b 10 8 m_bin b 24 8 c d off
+put m_v 13 m_bin b 10 8 m_bin b 11 8 c d off
+end
+
+fn m_arf to uint
+f = ir_fnew 0 0 5
+a = ir_fpar f 4
+bb = ir_fpar f 4
+c = ir_fpar f 8
+d = ir_fpar f 8
+b = ir_blk f
+m_ar1 b a bb c d
+m_ar2 b c d
+s = m_k1 b 5 0
+kk = m_k1 b 5 1000003
+k = ulong 0
+while lt k 14 bound 14
+s = m_bin b 10 5 m_bin b 12 5 s kk m_un b 36 5 get m_v k
+k = add k 1
+end
+m_retv b ir_ftok f s
+ret f
+end
+
+fn m_ar to void
+af = m_arf
+g = ir_fnew 2 0 8
+b = ir_blk g
+put m_v 50 m_k1 b 4 2654435769
+put m_v 51 m_k1 b 4 2135587861
+put m_v 52 m_k1 b 8 sub ulong 0 1000003
+put m_v 53 m_k1 b 8 77
+o = m_calln b ir_ftok g af 5 4
+m_mlow b ir_otok o ir_res o
+end
+
+note m_sel n: the index in m_names of the first input line, 99 if none
+fn m_sel n ulong to ulong
+e = m_lend n
+k = ulong 0
+p = ulong 0
+while lt p len m_names bound 64
+q = m_nend p
+if m_eq p q e
+ret k
+end
+p = add q 1
+k = add k 1
+end
+ret 99
+end
+
+fn m_lend n ulong to ulong
+e = ulong 0
+while lt e n bound 64
+if eq get i_in e 10
+ret e
+end
+e = add e 1
+end
+ret e
+end
+
+fn m_nend p ulong to ulong
+q = p
+while ne get m_names q 10 bound 64
+q = add q 1
+end
+ret q
+end
+
+fn m_eq p ulong q ulong e ulong to bool
+if ne sub q p e
+ret false
+end
+i = ulong 0
+while lt i e bound 64
+if ne get i_in i get m_names add p i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn m_fibm x ulong to void
+f = m_fib
+m_main f x 0
+end
+
+note m_lvc b t n r g: on token t, chk.add v_0 v_1, chk.mul v_2 v_3 (trap 1) and chk.bounds of n & 7 with count 1 in
+note global g (reference type r); the token after them
+fn m_lvc b uint t uint n uint r uint g uint to uint
+t1 = m_chk2 b t 70 1 get m_v 0 get m_v 1
+t2 = m_chk2 b t1 72 1 get m_v 2 get m_v 3
+o = ir_op b 52 r ulong g 0
+i = m_bin b 16 5 n m_k1 b 5 7
+ret ir_otok m_e3 b 79 t2 ir_res o i m_k1 b 5 1
+end
+
+note lv: see the header; m_lvf r g the function (global g: u64[8], reference type r), m_lv main
+fn m_lvf r uint g uint to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b = ir_blk f
+k = ulong 0
+while lt k 20 bound 20
+m = m_bin b 12 5 n m_k1 b 5 add mul k 2 3
+put m_v k m_bin b 10 5 m m_k1 b 5 add mul k k 1
+k = add k 1
+end
+t = m_lvc b ir_ftok f n r g
+c5 = m_k1 b 5 5
+s = n
+k = 0
+while lt k 20 bound 20
+s = m_bin b 18 5 m_bin b 12 5 s c5 get m_v k
+k = add k 1
+end
+m_retv b t s
+ret f
+end
+
+fn m_lv to void
+a = ir_tarr 5 8
+r = ir_tref a 1 0
+f = m_lvf r ir_glob a 0
+g = ir_fnew 2 0 8
+b = ir_blk g
+o = m_call b ir_ftok g f 5 m_k1 b 5 9
+m_mlow b ir_otok o ir_res o
+end
+
+note ts: the E loop shape with the call result as the add's first operand and no other call
+fn m_ts to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b0 = ir_blk f
+bl = ir_blk f
+br = ir_blk f
+c1 = m_k1 b0 5 1
+cm = m_bin b0 32 1 n c1
+o = ir_op b0 61 0 0 4
+ir_set o 0 ir_ftok f
+ir_set o 1 cm
+ir_set o 2 bl
+ir_set o 3 br
+m_retv bl ir_btok bl n
+c2 = m_k1 br 5 1
+s1 = m_bin br 11 5 n c2
+k = m_call br ir_btok br f 5 s1
+a = m_bin br 10 5 ir_res k n
+m_retv br ir_otok k a
+ret f
+end
+
+note m_brn b t tk n: br to t with token tk and the n values m_v[56 .. 56 + n)
+fn m_brn b uint t uint tk uint n uint to void
+o = ir_op b 60 0 0 add n 2
+ir_set o 0 t
+ir_set o 1 tk
+k = uint 0
+while lt k n bound 8
+ir_set o add k 2 get m_v add k 56
+k = add k 1
+end
+end
+
+note m_e3 b op t x y z: an op on token t with three operands, ty 0: store (imm 0), chk.bounds or chk.slice (imm 3,
+note their trap code); the op handle (omc allows six parameters)
+fn m_e3 b uint op uint t uint x uint y uint z uint to uint
+im = ulong 0
+if ge op 79
+im = 3
+end
+o = ir_op b op 0 im 4
+ir_set o 0 t
+ir_set o 1 x
+ir_set o 2 y
+ir_set o 3 z
+ret o
+end
+
+note m_ld b ty t r i: load element i of r reading token t; its result
+fn m_ld b uint ty uint t uint r uint i uint to uint
+o = ir_op b 42 ty 0 3
+ir_set o 0 t
+ir_set o 1 r
+ir_set o 2 i
+ret ir_res o
+end
+
+note m_lh b0 t f n np: a counted loop of f entered from b0 on token t: header h with np u64 parameters (the counter
+note first, initial values m_v[56 ..)), body and exit blocks; h runs the body while counter < n. m_v 0 h, 1 body,
+note 2 exit, 3 .. 3 + np the parameters
+fn m_lh b0 uint t uint f uint n ulong np uint to void
+h = ir_blk f
+put m_v 0 h
+put m_v 1 ir_blk f
+put m_v 2 ir_blk f
+k = uint 0
+while lt k np bound 8
+put m_v add k 3 ir_bpar h 5
+k = add k 1
+end
+m_brn b0 h t np
+c = m_bin h 32 1 get m_v 3 m_k1 h 5 n
+o = ir_op h 61 0 0 4
+ir_set o 0 ir_btok h
+ir_set o 1 c
+ir_set o 2 get m_v 1
+ir_set o 3 get m_v 2
+end
+
+note fill a: a[i] = 7 i & 255 for i < 300 (a REF u8[300], access 1)
+fn m_mfil r uint to uint
+f = ir_fnew 0 0 0
+a = ir_fpar f r
+b0 = ir_blk f
+put m_v 56 m_k1 b0 5 0
+m_lh b0 ir_ftok f f 300 1
+b = get m_v 1
+i = get m_v 3
+e1 = m_k1 b 5 1
+t1 = ir_otok m_e3 b 79 ir_btok b a i e1
+v = m_un b 36 2 m_bin b 16 5 m_bin b 12 5 i m_k1 b 5 7 m_k1 b 5 255
+t2 = ir_otok m_e3 b 43 t1 a i v
+put m_v 56 m_bin b 10 5 i e1
+m_brn b get m_v 0 t2 1
+x = get m_v 2
+o = ir_op x 62 0 0 1
+ir_set o 0 ir_btok x
+ret f
+end
+
+note mem loop 1: b[i + 300] = src[i] + i for i < 300; the exit block
+fn m_ml1 b0 uint t uint f uint ga uint bv uint to uint
+put m_v 56 m_k1 b0 5 0
+m_lh b0 t f 300 1
+b = get m_v 1
+i = get m_v 3
+e1 = m_k1 b 5 1
+t1 = ir_otok m_e3 b 79 ir_btok b ga i e1
+x = m_un b 36 5 m_ld b 2 t1 ga i
+j = m_bin b 10 5 i m_k1 b 5 300
+t2 = ir_otok m_e3 b 79 t1 bv j e1
+t3 = ir_otok m_e3 b 43 t2 bv j m_bin b 10 5 x i
+put m_v 56 m_bin b 10 5 i e1
+m_brn b get m_v 0 t3 1
+ret get m_v 2
+end
+
+note mem loop 2: s = s + b[i] (i + 1) for i < 600; the exit block (s is m_v 4)
+fn m_ml2 b0 uint f uint bv uint to uint
+put m_v 56 m_k1 b0 5 0
+put m_v 57 m_k1 b0 5 0
+m_lh b0 ir_btok b0 f 600 2
+b = get m_v 1
+i = get m_v 3
+e1 = m_k1 b 5 1
+t1 = ir_otok m_e3 b 79 ir_btok b bv i e1
+y = m_bin b 12 5 m_ld b 5 t1 bv i m_bin b 10 5 i e1
+put m_v 57 m_bin b 10 5 get m_v 4 y
+put m_v 56 m_bin b 10 5 i e1
+m_brn b get m_v 0 t1 2
+ret get m_v 2
+end
+
+note mem exit: chk.slice and write 1 msg 0 3, then status (s + count) & 255
+fn m_mx x uint s uint rm uint gm uint to void
+o = ir_op x 52 rm ulong gm 0
+r = ir_res o
+c0 = m_k1 x 5 0
+c3 = m_k1 x 5 3
+fd = m_k1 x 8 1
+t1 = ir_otok m_e3 x 80 ir_btok x r c0 c3
+h = ir_op x 110 9 54 5
+ir_set h 0 t1
+ir_set h 1 fd
+ir_set h 2 r
+ir_set h 3 c0
+ir_set h 4 c3
+w = m_un x 36 5 ir_res h
+m_mlow x ir_otok h m_bin x 10 5 s w
+end
+
+fn m_mem to void
+a3 = ir_tarr 2 300
+r3 = ir_tref a3 1 0
+g = ir_glob a3 0
+am = ir_tarr 2 3
+gm = ir_glob am 1
+ir_gbyt gm 111
+ir_gbyt gm 107
+ir_gbyt gm 10
+rb = ir_tref ir_tarr 5 600 1 0
+fl = m_mfil r3
+put m_v 10 ir_tref am 0 0
+put m_v 11 gm
+m_mm1 r3 g rb fl
+end
+
+note mem main, entry block: src's address, fill(src), chk.bounds src 298 (1 + 1), alloca b; then m_mm2
+fn m_mm1 r3 uint g uint rb uint fl uint to void
+m = ir_fnew 2 0 8
+b0 = ir_blk m
+o = ir_op b0 52 r3 ulong g 0
+ga = ir_res o
+k = m_call b0 ir_ftok m fl 0 ga
+c1 = m_k1 b0 5 1
+i = m_k1 b0 5 298
+e = m_bin b0 10 5 c1 c1
+t = ir_otok m_e3 b0 79 ir_otok k ga i e
+al = ir_op b0 50 rb 0 1
+ir_set al 0 t
+m_mm2 m b0 ga al
+end
+
+fn m_mm2 m uint b0 uint ga uint al uint to void
+x1 = m_ml1 b0 ir_otok al m ga ir_res al
+x2 = m_ml2 x1 m ir_res al
+m_mx x2 get m_v 4 get m_v 10 get m_v 11
+end
+
+note z: v = a[3] of a fresh local u64[4], then a[3] = 77; returns v
+fn m_zf1 to uint
+f = ir_fnew 0 0 5
+b = ir_blk f
+al = ir_op b 50 ir_tref ir_tarr 5 4 1 0 0 1
+ir_set al 0 ir_ftok f
+a = ir_res al
+c3 = m_k1 b 5 3
+e1 = m_k1 b 5 1
+c77 = m_k1 b 5 77
+t1 = ir_otok m_e3 b 79 ir_otok al a c3 e1
+v = m_ld b 5 t1 a c3
+t2 = ir_otok m_e3 b 43 t1 a c3 c77
+m_retv b t2 v
+ret f
+end
+
+fn m_zf to void
+z = m_zf1
+m = ir_fnew 2 0 8
+b = ir_blk m
+k1 = m_calln b ir_ftok m z 5 0
+k2 = m_calln b ir_otok k1 z 5 0
+m_mlow b ir_otok k2 m_bin b 10 5 ir_res k1 ir_res k2
+end
+
+note wid step: a global ty[2], element 1 = v (stored, then loaded back); s + (i64 of the load) + (load == v);
+note token in/out m_v 12
+fn m_wd1 b uint ty uint v ulong s uint to uint
+r = ir_tref ir_tarr ty 2 1 0
+o = ir_op b 52 r ulong ir_glob ir_tarr ty 2 0 0
+g = ir_res o
+c1 = m_k1 b 5 1
+cv = m_k1 b ty v
+t1 = ir_otok m_e3 b 79 get m_v 12 g c1 c1
+t2 = ir_otok m_e3 b 43 t1 g c1 cv
+put m_v 12 t2
+l = m_ld b ty t2 g c1
+x = m_bin b 10 9 m_un b 36 9 l m_b01 b m_bin b 30 1 l cv
+ret m_bin b 10 9 s x
+end
+
+note m_b01 b c: select c, i64 1, i64 0
+fn m_b01 b uint c uint to uint
+k1 = m_k1 b 9 1
+k0 = m_k1 b 9 0
+o = ir_op b 2 9 0 3
+ir_set o 0 c
+ir_set o 1 k1
+ir_set o 2 k0
+ret ir_res o
+end
+
+fn m_wid to void
+m = ir_fnew 2 0 8
+b = ir_blk m
+put m_v 12 ir_ftok m
+s = m_k1 b 9 0
+s = m_wd1 b 6 18446744073709551516 s
+s = m_wd1 b 3 60000 s
+s = m_wd1 b 7 18446744073709521616 s
+s = m_wd1 b 4 4000000000 s
+s = m_wd1 b 8 18446744071709551616 s
+m_mlow b get m_v 12 m_un b 36 5 s
+end
+
+fn m_oob to void
+a = ir_tarr 5 10
+r = ir_tref a 1 0
+g = ir_glob a 0
+m = ir_fnew 2 0 8
+b0 = ir_blk m
+o = ir_op b0 52 r ulong g 0
+ga = ir_res o
+put m_v 56 m_k1 b0 5 0
+m_lh b0 ir_ftok m m 11 1
+b = get m_v 1
+i = get m_v 3
+t1 = ir_otok m_e3 b 79 ir_btok b ga i m_k1 b 5 1
+t2 = ir_otok m_e3 b 43 t1 ga i i
+put m_v 56 m_bin b 10 5 i m_k1 b 5 1
+m_brn b get m_v 0 t2 1
+x = get m_v 2
+m_mlow x ir_btok x m_k1 x 5 0
+end
+
+note m_cc8 b t v: chk.conv u8 (trap 5) of v on token t; the token it defines
+fn m_cc8 b uint t uint v uint to uint
+o = ir_op b 78 2 5 2
+ir_set o 0 t
+ir_set o 1 v
+ret ir_otok o
+end
+
+note bcopy fill loop: src[i] = u8 (7 i & 255) for i < 65536 (src's address m_v 20); the exit block
+fn m_bc1 b0 uint m uint to uint
+put m_v 56 m_k1 b0 5 0
+m_lh b0 ir_ftok m m 65536 1
+b = get m_v 1
+i = get m_v 3
+e1 = m_k1 b 5 1
+gs = get m_v 20
+v = m_bin b 16 5 m_bin b 12 5 i m_k1 b 5 7 m_k1 b 5 255
+t1 = m_cc8 b ir_btok b v
+c = m_un b 36 2 v
+t2 = ir_otok m_e3 b 79 t1 gs i e1
+t3 = ir_otok m_e3 b 43 t2 gs i c
+put m_v 56 m_bin b 10 5 i e1
+m_brn b get m_v 0 t3 1
+ret get m_v 2
+end
+
+note bcopy rounds: for r < 8000, k = u8 (r & 255), then the inner loop; the exit block
+fn m_bc2 x1 uint m uint to uint
+put m_v 56 m_k1 x1 5 0
+m_lh x1 ir_btok x1 m 8000 1
+h2 = get m_v 0
+b2 = get m_v 1
+x2 = get m_v 2
+r = get m_v 3
+v = m_bin b2 16 5 r m_k1 b2 5 255
+t1 = m_cc8 b2 ir_btok b2 v
+k = m_un b2 36 2 v
+x3 = m_bc3 b2 t1 m k
+put m_v 56 m_bin x3 10 5 r m_k1 x3 5 1
+m_brn x3 h2 ir_btok x3 1
+ret x2
+end
+
+note bcopy inner loop: dst[65535 - i] = src[i] xor k for i < 65536 (dst's address m_v 21); the exit block
+fn m_bc3 b2 uint t uint m uint k uint to uint
+put m_v 56 m_k1 b2 5 0
+m_lh b2 t m 65536 1
+b = get m_v 1
+i = get m_v 3
+e1 = m_k1 b 5 1
+gs = get m_v 20
+gd = get m_v 21
+t1 = ir_otok m_e3 b 79 ir_btok b gs i e1
+y = m_bin b 18 2 m_ld b 2 t1 gs i k
+j = m_bin b 11 5 m_k1 b 5 65535 i
+t2 = ir_otok m_e3 b 79 t1 gd j e1
+t3 = ir_otok m_e3 b 43 t2 gd j y
+put m_v 56 m_bin b 10 5 i e1
+m_brn b get m_v 0 t3 1
+ret get m_v 2
+end
+
+note bcopy: the bench kernel bench/bcopy.om lowered by IR.md s13; write 1 dst 0 65536, status 0
+fn m_bcp to void
+a = ir_tarr 2 65536
+r = ir_tref a 1 0
+gs = ir_glob a 0
+gd = ir_glob a 0
+m = ir_fnew 2 0 8
+b0 = ir_blk m
+put m_v 20 ir_res ir_op b0 52 r ulong gs 0
+put m_v 21 ir_res ir_op b0 52 r ulong gd 0
+x = m_bc2 m_bc1 b0 m m
+g = get m_v 21
+c0 = m_k1 x 5 0
+n = m_k1 x 5 65536
+fd = m_k1 x 8 1
+t1 = ir_otok m_e3 x 80 ir_btok x g c0 n
+h = ir_op x 110 9 54 5
+ir_set h 0 t1
+ir_set h 1 fd
+ir_set h 2 g
+ir_set h 3 c0
+ir_set h 4 n
+m_retv x ir_otok h m_k1 x 8 0
+end
+
+note ---- sort: the bench kernel bench/sort.om lowered by IR.md s13. sorted's `view` parameter is REF access 1
+note here: ΩIR call arguments must equal the parameter types (IR.md row 64, ngcheck ck_tcall), so an `edit` array
+note cannot be passed to an access-0 parameter. m_v 30 31 isort's outer header and exit, 32 33 its while
+note parameters k and moving, 40 41 putnum's out address and last p, 42 43 the putnum and sorted functions
+
+note m_cdz b t y: chk.divz (trap 2) of y on token t; the token it defines
+fn m_cdz b uint t uint y uint to uint
+o = ir_op b 74 0 2 2
+ir_set o 0 t
+ir_set o 1 y
+ret ir_otok o
+end
+
+fn m_cbr b uint t uint c uint bt uint bf uint to void
+o = ir_op b 61 0 0 4
+ir_set o 0 t
+ir_set o 1 c
+ir_set o 2 bt
+ir_set o 3 bf
+end
+
+note m_bd b t r i: chk.bounds r i 1 on token t; the token it defines
+fn m_bd b uint t uint r uint i uint to uint
+e1 = m_k1 b 5 1
+ret ir_otok m_e3 b 79 t r i e1
+end
+
+note gen a: x = 12345; for i < 40000: x = (1103515245 x + 12345) rem 2^31, a[i] = x rem 4000000
+fn m_sgen r uint to uint
+f = ir_fnew 0 0 0
+a = ir_fpar f r
+b0 = ir_blk f
+put m_v 56 m_k1 b0 5 0
+put m_v 57 m_k1 b0 5 12345
+m_lh b0 ir_ftok f f 40000 2
+b = get m_v 1
+i = get m_v 3
+d = m_k1 b 5 2147483648
+t = m_cdz b ir_btok b d
+y = m_bin b 14 5 m_bin b 10 5 m_bin b 12 5 get m_v 4 m_k1 b 5 1103515245 m_k1 b 5 12345 d
+d = m_k1 b 5 4000000
+t = m_cdz b t d
+v = m_bin b 14 5 y d
+t = m_bd b t a i
+t = ir_otok m_e3 b 43 t a i v
+put m_v 56 m_bin b 10 5 i m_k1 b 5 1
+put m_v 57 y
+m_brn b get m_v 0 t 2
+b0 = get m_v 2
+o = ir_op b0 62 0 0 1
+ir_set o 0 ir_btok b0
+ret f
+end
+
+note isort a: for j < 40000: v = a[j], k = j, moving = true; while moving and k > 0 (and is eager): p = a[k - 1];
+note if p > v: a[k] = p, k = k - 1, else moving = false; after the while a[k] = v
+fn m_sis r uint to uint
+f = ir_fnew 0 0 0
+a = ir_fpar f r
+b0 = ir_blk f
+put m_v 56 m_k1 b0 5 0
+m_lh b0 ir_ftok f f 40000 1
+put m_v 30 get m_v 0
+put m_v 31 get m_v 2
+b = get m_v 1
+j = get m_v 3
+t = m_bd b ir_btok b a j
+v = m_ld b 5 t a j
+w = ir_blk f
+put m_v 32 ir_bpar w 5
+put m_v 33 ir_bpar w 1
+put m_v 56 j
+put m_v 57 m_k1 b 1 1
+m_brn b w t 2
+x = m_sw w f a v
+k = get m_v 32
+t = m_bd x ir_btok x a k
+t = ir_otok m_e3 x 43 t a k v
+put m_v 56 m_bin x 10 5 j m_k1 x 5 1
+m_brn x get m_v 30 t 1
+x = get m_v 31
+o = ir_op x 62 0 0 1
+ir_set o 0 ir_btok x
+ret f
+end
+
+note isort's while: header w (k, moving), body wb loads p = a[k - 1] and branches on p > v; the exit block
+fn m_sw w uint f uint a uint v uint to uint
+k = get m_v 32
+wb = ir_blk f
+wx = ir_blk f
+c = m_bin w 16 1 get m_v 33 m_bin w 34 1 k m_k1 w 5 0
+m_cbr w ir_btok w c wb wx
+k1 = m_bin wb 11 5 k m_k1 wb 5 1
+t = m_bd wb ir_btok wb a k1
+p = m_ld wb 5 t a k1
+tb = ir_blk f
+fb = ir_blk f
+m_cbr wb t m_bin wb 34 1 p v tb fb
+t = m_bd tb ir_btok tb a k
+t = ir_otok m_e3 tb 43 t a k p
+put m_v 56 k1
+put m_v 57 m_k1 tb 1 1
+m_brn tb w t 2
+put m_v 56 k
+put m_v 57 m_k1 fb 1 0
+m_brn fb w ir_btok fb 2
+ret wx
+end
+
+note putnum v: out[31] = 10, p = 31, x = v; while x > 9: p = p - 1, out[p] = u8 (x rem 10 + 48), x = x div 10;
+note p = p - 1, out[p] = u8 (x + 48); write 1 out p (32 - p)
+fn m_spn g uint ro uint to uint
+f = ir_fnew 0 0 0
+v = ir_fpar f 5
+b0 = ir_blk f
+go = ir_res ir_op b0 52 ro ulong g 0
+put m_v 40 go
+c31 = m_k1 b0 5 31
+c10 = m_k1 b0 2 10
+t = m_bd b0 ir_ftok f go c31
+t = ir_otok m_e3 b0 43 t go c31 c10
+w = ir_blk f
+p = ir_bpar w 5
+x = ir_bpar w 5
+put m_v 56 c31
+put m_v 57 v
+m_brn b0 w t 2
+wb = ir_blk f
+wx = ir_blk f
+m_cbr w ir_btok w m_bin w 34 1 x m_k1 w 5 9 wb wx
+m_pnb wb w p x
+m_pnx wx p x
+ret f
+end
+
+note m_pnd b t p y: p1 = p - 1 (m_v 41), chk.conv u8 y, out[p1] = u8 y; the token
+fn m_pnd b uint t uint p uint y uint to uint
+go = get m_v 40
+p1 = m_bin b 11 5 p m_k1 b 5 1
+put m_v 41 p1
+t = m_cc8 b t y
+c = m_un b 36 2 y
+t = m_bd b t go p1
+ret ir_otok m_e3 b 43 t go p1 c
+end
+
+fn m_pnb wb uint w uint p uint x uint to void
+d = m_k1 wb 5 10
+t = m_cdz wb ir_btok wb d
+y = m_bin wb 10 5 m_bin wb 14 5 x d m_k1 wb 5 48
+t = m_pnd wb t p y
+t = m_cdz wb t d
+put m_v 57 m_bin wb 13 5 x d
+put m_v 56 get m_v 41
+m_brn wb w t 2
+end
+
+fn m_pnx x uint p uint v uint to void
+y = m_bin x 10 5 v m_k1 x 5 48
+t = m_pnd x ir_btok x p y
+go = get m_v 40
+p1 = get m_v 41
+n = m_bin x 11 5 m_k1 x 5 32 p1
+t = ir_otok m_e3 x 80 t go p1 n
+fd = m_k1 x 8 1
+h = ir_op x 110 9 54 5
+ir_set h 0 t
+ir_set h 1 fd
+ir_set h 2 go
+ir_set h 3 p1
+ir_set h 4 n
+o = ir_op x 62 0 0 1
+ir_set o 0 ir_otok h
+end
+
+note sorted a: the count of i < 39999 with a[i] > a[i + 1]
+fn m_sst r uint to uint
+f = ir_fnew 0 0 5
+a = ir_fpar f r
+b0 = ir_blk f
+put m_v 56 m_k1 b0 5 0
+put m_v 57 m_k1 b0 5 0
+m_lh b0 ir_ftok f f 39999 2
+b = get m_v 1
+i = get m_v 3
+bad = get m_v 4
+h = get m_v 0
+x = get m_v 2
+t = m_bd b ir_btok b a i
+u = m_ld b 5 t a i
+i1 = m_bin b 10 5 i m_k1 b 5 1
+t = m_bd b t a i1
+tb = ir_blk f
+fb = ir_blk f
+m_cbr b t m_bin b 34 1 u m_ld b 5 t a i1 tb fb
+put m_v 56 i1
+put m_v 57 m_bin tb 10 5 bad m_k1 tb 5 1
+m_brn tb h ir_btok tb 2
+put m_v 57 bad
+m_brn fb h ir_btok fb 2
+m_retv x ir_btok x bad
+ret f
+end
+
+fn m_sort to void
+r = ir_tref ir_tarr 5 40000 1 0
+ao = ir_tarr 2 32
+put m_v 42 m_spn ir_glob ao 0 ir_tref ao 1 0
+gn = m_sgen r
+is = m_sis r
+put m_v 43 m_sst r
+m_smn r gn is
+end
+
+note sort main: a = new u64[40000] (alloca, zero-filled), gen a, isort a, s = sum a[i] (i + 1); then m_smx
+fn m_smn r uint gn uint is uint to void
+m = ir_fnew 2 0 8
+b0 = ir_blk m
+al = ir_op b0 50 r 0 1
+ir_set al 0 ir_ftok m
+a = ir_res al
+k = m_call b0 ir_otok al gn 0 a
+k = m_call b0 ir_otok k is 0 a
+put m_v 56 m_k1 b0 5 0
+put m_v 57 m_k1 b0 5 0
+m_lh b0 ir_otok k m 40000 2
+b = get m_v 1
+i = get m_v 3
+t = m_bd b ir_btok b a i
+put m_v 57 m_bin b 10 5 get m_v 4 m_bin b 12 5 m_ld b 5 t a i m_bin b 10 5 i m_k1 b 5 1
+put m_v 56 m_bin b 10 5 i m_k1 b 5 1
+m_brn b get m_v 0 t 2
+m_smx get m_v 2 a get m_v 4
+end
+
+note sort main exit: putnum s, putnum sorted a, putnum a[0], putnum a[39999]; status 0
+fn m_smx x uint a uint s uint to void
+pn = get m_v 42
+k = m_call x ir_btok x pn 0 s
+c = m_call x ir_otok k get m_v 43 5 a
+k = m_call x ir_otok c pn 0 ir_res c
+z = m_k1 x 5 0
+t = m_bd x ir_otok k a z
+k = m_call x t pn 0 m_ld x 5 t a z
+z = m_k1 x 5 39999
+t = m_bd x ir_otok k a z
+k = m_call x t pn 0 m_ld x 5 t a z
+m_retv x ir_otok k m_k1 x 8 0
+end
+
+fn main to int
+n = read 0 i_in 0 64
+if le n 0
+ret 2
+end
+ir_init
+s = m_sel ulong n
+if eq s 0
+m_fibm 25
+end
+if eq s 1
+m_fibm 100000000
+end
+if eq s 2
+m_press
+end
+if eq s 3
+m_rotm
+end
+if eq s 4
+m_ck
+end
+if eq s 5
+m_ar
+end
+if eq s 6
+m_main m_ts 1000000 1
+end
+if eq s 7
+m_mem
+end
+if eq s 8
+m_oob
+end
+if eq s 9
+m_zf
+end
+if eq s 10
+m_wid
+end
+if eq s 11
+m_bcp
+end
+if eq s 12
+m_sort
+end
+if eq s 13
+m_lv
+end
+if gt s 13
+ret 2
+end
+m = ir_wr
+k = write 1 i_out 0 m
+if ne k long m
+ret 27
+end
+ret 0
+end
