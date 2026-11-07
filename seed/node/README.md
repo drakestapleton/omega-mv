@@ -1288,3 +1288,131 @@ cancelled through `auth_cancel` after MS milliseconds.
 | cancelled read as UNKNOWN | 197 |
 | missing file read as read | 178 |
 | prompt limit raised to 4000 | 203 |
+
+### Live coding workflow under the durable scheduler (DRA-399)
+
+`live-test.om` runs the coding workflow above for real on native Linux
+AArch64: `ollm serve` with the own round40 model, `code-main`, `code-test`,
+`tool` and `infer`. The scheduler is the journal v2 one with the default
+policy that `sched_new` sets (policy 1). The driver only starts the programs
+and checks what they did; it implements none of their logic. It replaces the
+DRA-290 shell and Python harness (`inner.sh`, `crash.sh`, `prep.py`, `cmp.py`,
+`jread.py`).
+
+```sh
+{ printf 'om2\n'; cat seed/json/json.om om/tls/sha2.om seed/node/live-test.om; } \
+  | seed/out/omc > build/node/live-test        # omc exit status must be 0
+bwrap --dev-bind / / --unshare-net --die-with-parent -- \
+  build/node/live-test BASE NODE OLLM MODELDIR OMC40 SEL [serve=0] [parts=fcr]
+```
+
+- **Paths.** All paths are absolute, and BASE must not exist yet.
+  - NODE holds `infer`, `tool`, `code-main` and `code-test`.
+  - MODELDIR holds `model.ck` and `merges.bin`.
+  - OMC40 is the compiler the objectives are checked with (omega-mv e5b32567).
+  - SEL is round40's `final-selected.json`.
+- **Server.** The model server listens on 127.0.0.1:18399, inside the network namespace.
+- **Negative control.** `serve=0` starts no server.
+- **Parts.** `parts=` selects the full run (f), the cancellation (c) and the crash and restart (r). A part left out is `NOT_RUN`.
+- **Exit status.** 0 only when every check passed, 1 otherwise, 2 for a usage error.
+- **Output.** One `PASS|FAIL|NOT_RUN name detail` line per check, then `LIVE checks N pass P fail F not_run R`. The checks are backed by these evidence lines:
+  - `HASH`: sha256 and size of every pinned input, every node program and the driver itself (`/proc/self/exe`).
+  - `SEL`: the four round40 rows used.
+  - `PREP`: the prepared objective files.
+  - `SERVE`: server pid and readiness.
+  - `RUN`: program exit and milliseconds.
+  - `REVIEW`, `SNAP`.
+  - `JOP`: one line per journaled operation.
+
+Objectives: the four round40 loop rows `item76666` (logic fault),
+`item83423` (missing file), `item82342` (syntax fault) and `item85188`
+(correct already). Each row's broken file is written into `root/jobs` and
+compared byte for byte with the selection's `broken` text. Each scenario
+(`BASE/full`, `BASE/cancel`, `BASE/crash`) has its own root, work
+directory, journal and server.
+
+| Check | Passes when |
+| --- | --- |
+| prereq-hashes | model, merges, ollm, the objectives' compiler and the selection match their pinned sha256; every node program is hashed |
+| selection | the four rows parse from SEL and their broken files are prepared |
+| full-workflow | `code-main` with all four objectives exits 0 with `CWSUM pass=4 fail=0` and every `CWO i PASS 1`; no node process remains 15 s later and the server's process group is gone |
+| full-journal | the journal reads back intact: every OPEN under SPVER 3, fences increasing, no POLICY record (the default policy was never changed), one OPEN, every operation started exactly once and done, nothing open, objective identity `OMNC`, 4, issue 290 |
+| round40-transcript | every `CWP` prompt and every `CWR` model reply equals round40's recorded turn byte for byte, in order, and each objective took round40's number of turns (5, 2, 5, 3) |
+| review-outputs | an independent `tool check` (OMC40) of each objective's final file: the three files equal the selection's correct text and give `Tests passed.`; the missing-file objective's file is still absent and gives `File not found.` |
+| cancel-mid-inference | `code-test cancel 20000` on objective 0 exits 1 with `CWO 0 FAIL 19` after one cancel event, the server logs the dropped request as `C 499`, no node process remains and the server group is gone |
+| cancel-journal | the journal checks above with one objective, plus at least one CANCEL record |
+| crash-restart | run 1 of objective 0 is SIGKILLed (status 137) while an `infer` child is running the first inference after the replace landed. Only the creator is killed; its workers and the inference are left to the node's own cleanup, and no node process may remain 15 s later. The file on disk is then the correct text. Run 2 restarts on the same root, work and journal and must exit 0 with `CWO 0 PASS`, leaving nothing behind |
+| crash-journal | the journal checks above with two OPENs, plus at least one operation settled by the restart (`auth_recover`) |
+| no-leak | at the end no process whose program is under NODE remains |
+
+bwrap shares the host's process namespace, so the NODE process count sees every process on the host whose program lies under NODE. Keep monitors and other tools out of NODE. In the first DRA-399 full run, the core sampler lived in `build/node`, and that alone failed full-workflow and no-leak.
+
+`live-cpu.om` is the core-contamination sampler that goes with these runs. Every 10 s it reads `/proc/*/task/*/stat` (read-only) until the file STOP exists. It prints one line per sample: `CPU <realns> cwo <c> run89 <r> own <o> foreign <f>`, followed by ` pid/tid:comm` for each foreign thread.
+
+- `run89` counts threads in state R whose last processor (stat field 39) is 8 or 9.
+- `own` counts those whose program is under `/tmp/wtlive/build/node/` or is the pinned ollm.
+- `cwo` counts the `CWO ` lines in WATCH, which marks the objective boundaries.
+
+```sh
+{ printf 'om2\n'; cat seed/node/live-cpu.om; } | seed/out/omc > build/lt399/live-cpu
+taskset -c 0 nice -n 19 build/lt399/live-cpu PART/end.txt PART/run/<scenario>/run.out > PART/cpu.log
+```
+
+#### Results, 2026-11-07 (EXERCISED; not QUALIFIED)
+
+All runs were on native AArch64, CPU only (spark-b87b, Linux 7.0.0-1019-nvidia). Each ran under `flock pool-8-9.lock taskset -c 8-9 nice -n 10 bwrap --unshare-net`. Core 9 is the X925 timing core.
+
+Run directory: `~/handoffs/hive/sched/live399/20261107T085509Z/<part>/`, holding `cmd.sh`, `live.out`, `live.rc`, `cpu.log`, `ps-ollm.txt` and the scenario's `run/`.
+
+Hashes (`HASH` lines; full list in `start.txt` and `start-addendum.txt`):
+- Node programs at aa2abf84: infer 8cc5fb30…, tool a1bdecb0…, code-main 7a1c14c0…, code-test 1b270fba….
+- Compilers: in-tree omc 5f90edea…, and the objectives' compiler 2c824805… (omega-mv e5b32567).
+- Model inputs: ollm f99fce9f…, model.ck 7c7b5b52…, merges.bin 73a29baf…, and the round40 selection 2017a902….
+- Drivers: live-test 1b30b1de… before the slot fix and 25c9a30a… after it; live-cpu 5b638039….
+
+| Part | live-test | Checks pass/fail/not_run | Result |
+| --- | --- | --- | --- |
+| neg (`serve=0`, c) | 1b30b1de | 3/2/6 | cancel-mid-inference and cancel-journal FAIL with no server, as required |
+| f | 1b30b1de | 5/2/4 | FAIL. The sampler ran from `build/node`, which failed no-leak and full-workflow. code-main exited 0 with `CWSUM pass=4 fail=0` in 1790389 ms. full-journal, transcript and review PASS. |
+| c | 1b30b1de | 5/0/6 | PASS: `CWO 0 FAIL 19` at 20049 ms, server `C 499`, 7 journal records with 1 CANCEL |
+| r | 1b30b1de | 5/0/6 | PASS. Run 1 was SIGKILLed (137) during the first inference after the replace, and the file on disk was correct. Run 2 exited 0 with `CWO 0 PASS 1 6` in 244394 ms. Journal: 80 records, 2 OPENs, 13 operations each started once, 1 settled by the restart. |
+| f2 | 1b30b1de | 6/1/4 | FAIL from the driver slot collision (CWSUM count in lcw 60 = objective 3's CWE slot; 18 `CWE 3` lines read as 19). code-main exited 0 with `CWSUM pass=4 fail=0` in 1645009 ms. full-journal (174 records), transcript, review and no-leak PASS. |
+| f3 | 25c9a30a | 3/4/4 | FAIL. code-main hit its fixed 3600 s deadline (exit 62, 3600078 ms) with o0 and o1 PASS (5 and 2 turns, as in round40) and o2 and o3 unfinished, so journal, transcript and review fail as consequences. no-leak PASS. |
+| c2 | 25c9a30a | 5/0/6 | PASS: `CWO 0 FAIL 19` at 20090 ms, server `C 499`, 7 journal records with 1 CANCEL |
+| r2 | 25c9a30a | 5/0/6 | PASS, on a contended host. Run 1 was SIGKILLed (137) during the first inference after the replace, and the file on disk was correct. Run 2 issued no second replace and exited 0 with o0 PASS in 590011 ms. Journal: 80 records, 2 OPENs, 13 operations each started once, 1 settled by the restart. |
+| f4 | — | — | NOT_RUN: waiting on a quiet host |
+
+Each part exits 1 whenever a check is NOT_RUN (`lt_end`), so the check table, not the exit status, is the verdict.
+
+The fixed driver has not yet seen a full four-objective run end. f3 shows the fixed CWSUM count only up to 2/2.
+
+**Contamination.** `live-cpu` takes one sample every 10 s and counts the samples in which a foreign thread was running on core 8 or 9. Data lines only; the closing `CPU done samples N` line is not a sample:
+- f: 7 of 106 samples. The sampler started at 09:08:31Z, about 12 minutes after f did (08:56:00Z), so the start of f was not sampled.
+- c: none in 4 samples.
+- r: 7 of 73 samples (4 of them `grep`).
+- f2: 22 of 155 samples (11 of them `grep`).
+- f3: 95 of 349 samples (46 of them `grep`). The `grep` threads came from many pids and cannot be attributed after the fact; the others included `kcompactd0`, `git`, `python3` and `kswapd0`.
+- c2: 5 of 5 samples (4 of them `grep`).
+- r2: 51 of 185 samples (9 of them `grep`).
+
+The sampler ran on core 5 for f, c and the start of r, and on core 0 from 09:35:59Z (partway through r) onward. The `cpu.NOTE` files record the core-0 use as unapproved; the Manager approved it in cycle 16 (BOARD 2026-11-07T11:19:33Z).
+
+f3, c2 and r2 ran on a contended host. Their wall times are recorded but are not measurements of the workflow.
+
+f3's turns took 2 to 5 times longer than f2's at equal token counts (for example 644695 ms against 279335). ollm stayed alone on core 9, the load average was 22 on 20 cores, and other lanes' ollm serve, train and gtrain processes were running on other cores (`f3/NOTE`, `ps-ollm.txt`). Shared memory bandwidth is the likely cause, but it was not measured.
+
+These timings are not speed evidence.
+
+**Against DRA-290's harness** (same programs, model and objectives):
+
+| Run | DRA-290 | This run |
+| --- | --- | --- |
+| full | exit 0 in 1632430 ms | exit 0 in 1790389 ms (f) and 1645009 ms (f2); f3 hit the 3600 s deadline (contended) |
+| cancel | `C 499 … 22072` | 20049 ms (c) and 20090 ms (c2) |
+| crash run 2 | 295826 ms | 244394 ms (r) and 590011 ms (r2, contended) |
+
+**Limits:**
+- One server, CPU only.
+- DEPLOYED.json's runtime_sha256 926c30fa… does not match the ollm used here (f99fce9f…), so this is not the deployed runtime (DRA-292).
+- Only policy 1 ran live. The FIFO and goal-aware live arms are NOT_RUN.
+
