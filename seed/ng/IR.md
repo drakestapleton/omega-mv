@@ -841,7 +841,9 @@ payload after it fills `i_in` from offset 0 and may be the full 16777216 bytes o
 reads the ΩIR binary payload and writes it back (reader/writer round trip). A refusal prints `ng:
 refused class C at OFFSET`, offset in the payload, empty stdout, and exits C: a payload over
 16777216 bytes is class 23 at 16777216, an unreadable one class 27; an unknown mode is `ng:
-unknown mode` and exit 2. Stage lanes add their modes (`@ng dump-ir <stage>` after the front end or
+unknown mode` and exit 2. `@ng opt` reads the payload like `@ng ir-copy`, runs the optimizer of
+`src/opt.om` (s15.1) and writes the result; `@ng opt-count` runs the same passes and prints one line
+of counts instead of the unit. Stage lanes add their modes (`@ng dump-ir <stage>` after the front end or
 a pass, `@ng ingest-ir <stage>` before a back end) beside their code.
 
 ## 15. What a pass may do to a check (D7)
@@ -857,3 +859,31 @@ zero-trip mutants guards the third. A pass removes a check in exactly two ways:
    original loop, checks intact, runs when the guard fails.
 
 Every pass that does either has mutants that attack trap order and zero-trip hoisting (D9).
+
+### 15.1 Loop-invariant code motion and rotation (`src/opt.om`, D16)
+
+`src/opt.om` (unit order ir, opt, main; functions `op_*`) rewrites the `ir.om` tables in place,
+per function:
+
+1. **Preheaders.** A natural loop is a header h with a back edge u -> h where h dominates u
+   (Cooper, Harvey and Kennedy dominators over reverse postorder); its blocks reach a latch without
+   passing h. When h has exactly one predecessor outside the loop and it ends in `br h`, that block
+   is the preheader; otherwise a new block with h's parameter types, ending in `br h` with them, is
+   placed before h and every outside predecessor (`br` or `cbr`) branches to it instead.
+2. **LICM**, innermost loop first. An op moves to the end of the preheader when it is class P
+   (s6.4), defines a value, is not `shared`, and every operand is defined outside the loop. P ops
+   are total (s7.3: division by zero gives 0), so running one on a path where the loop runs zero
+   times changes nothing. Checks, loads, stores, calls, host words, facts and terminators never
+   move: they carry the token chain, and that is where coverage (s8) and trap order (above) live.
+   An op equal to one already in the preheader (op, type, imm, operands) is dropped and its uses
+   take the earlier value.
+3. **ROT.** When the header ends in `cbr` with one target inside the loop and one outside, and the
+   one latch ends in `br h`, the header is placed right after the latch. Block order changes no
+   value (uses are judged by dominance, s6.2); it is the layout a back end emits, so the back
+   branch falls through into the test and a pass of the loop takes one conditional branch.
+
+The gate runs every O/L fixture and every Q seed through `@ng opt`: ngcheck's whole ACCEPT line on
+the output, the text round trip, ngrun before and after equal, and a second run that finds nothing
+to move. Its mutants hoist a load past the loop's stores and checks past their guard (both refused
+by ngcheck: the hoisted op keeps an in-loop token, s6.4) and merge preheader ops of different imm
+(a run differs).
