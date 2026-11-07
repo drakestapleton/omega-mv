@@ -107,4 +107,7 @@ The live `nvidia.ko` is not replaced by this commit.
 
 ## Status
 
-See the handoff ~/handoffs/2026-10-21-own-gpu-driver.md and the ledger line L332 for the live state.
+Hardware status of every rung, with receipts: [HARDWARE_GATES.md](HARDWARE_GATES.md) (rows AX-GSP-C and
+OGD-*). Nothing in this page has run on the GB10; every physical row there is NOT_RUN or
+MISSING_IMPLEMENTATION. The historical handoff ~/handoffs/2026-10-21-own-gpu-driver.md and ledger line
+L332 are operator-local and are not evidence.
