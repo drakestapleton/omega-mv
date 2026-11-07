@@ -9,21 +9,30 @@ note    that reach a latch without passing h) gets one block outside it that is 
 note    the existing one when h has exactly one outside predecessor and it ends in `br h`; otherwise a new block,
 note    placed before h, with h's parameter types, ending in `br h` with them, which every outside predecessor
 note    branches to instead (same arguments).
-note 2. LICM, innermost loop first. An op of the loop (blocks in reverse postorder, ops in order) moves to the end
+note 2. BCE (IR.md s15 item 1, origin 1 of the pass table below). A `chk.bounds r i e` is deleted when e is a
+note    const >= 1, r a REF to an ARRAY of count L, and i < X is known where the check runs, with X - 1 + e <= L:
+note    i is a const (X = i + 1), or a block on the check's dominator path has one predecessor, which ends in
+note    a `cbr` on `lt`/`le`/`gt`/`ge` of i and a const (either edge, read accordingly), so that block runs
+note    only after the test said i < X. The check is replaced in place by `fact.inbounds 1 r i e`, which keeps
+note    every access covered (s8). A `chk.divz` of a nonzero const is deleted. Uses of a deleted check's
+note    output token take its input token, so the chain stays linear (s6.4).
+note 3. LICM, innermost loop first. An op of the loop (blocks in reverse postorder, ops in order) moves to the end
 note    of the preheader, before its `br`, when its class is P (IR.md s6.4: no token; every P op is total, s7.3, so
 note    it may run on a path where it did not), it defines a value, it is not `shared` (block 0 only), and every
 note    operand is defined outside the loop. Checks, loads, stores, calls, host words, facts and terminators never
 note    move: the token chain and coverage (s6.4, s8, s15) fix their places. An op equal to one already in the
 note    preheader (op, type, imm and operands) is dropped and its uses take the earlier value.
-note 3. ROT. A loop whose header ends in `cbr` with one target in the loop and one outside, and whose one latch
+note 4. ROT. A loop whose header ends in `cbr` with one target in the loop and one outside, and whose one latch
 note    ends in `br h`, gets its header placed right after that latch. The block order is the layout a back end
 note    emits (a64 falls through to the next block and branches on one side of a `cbr`), so the back branch falls
 note    through into the test and the loop is tested at the bottom: one conditional branch per pass. Block order
 note    changes no value: uses are judged by dominance (s6.2).
+note Pass table (fact origins, IR.md s7.10): 1 BCE.
 note `@ng opt-count` runs the same passes and prints one line instead of the unit:
-note "opt fns=F loops=L inloop=A->B hoisted=H merged=M rotated=R preheaders=P": L natural loops (by header),
-note A and B the ops in loop blocks before and after (static, terminators included; a block counts once however
-note deeply it nests), H moves of an op out of a loop (an op leaving two nested loops counts twice; M of them
+note "opt fns=F loops=L inloop=A->B bce=C hoisted=H merged=M rotated=R preheaders=P": L natural loops (by header),
+note A and B the executing ops in loop blocks before and after (static, terminators included, facts not; a block
+note counts once however
+note deeply it nests), C checks deleted by BCE, H moves of an op out of a loop (an op leaving two nested loops counts twice; M of them
 note dropped as equal to one already in the preheader), R headers placed after their latch, P preheader blocks
 note added.
 note
@@ -46,9 +55,10 @@ global o_po uint 1048577
 global o_hd uint 1048577
 global o_hz ulong 1048577
 note o_n: 0 blocks of the function, 1 loop stamp, 2 headers, 3 hoisted, 4 merged, 5 rotated, 6 preheaders added,
-note 7 loops, 8 in-loop ops before, 9 after, 10 blocks reached, 11 current function, 12 output error (27)
+note 7 loops, 8 in-loop ops before, 9 after, 10 blocks reached, 11 current function, 12 output error (27),
+note 13 checks deleted
 global o_n ulong 16
-text o_msg "opt fns= loops= inloop=-> hoisted= merged= rotated= preheaders=\n"
+text o_msg "opt fns= loops= inloop=-> bce= hoisted= merged= rotated= preheaders=\n"
 global o_dig uchar 24
 note ---- control flow ----------------------------------------------------------------------------
 note successors of block b: br has one (slot 0), cbr two (slots 2, 3), other terminators none
@@ -590,7 +600,191 @@ end
 end
 ret true
 end
-note ---- 3. ROT ----------------------------------------------------------------------------------
+note ---- 2. BCE ----------------------------------------------------------------------------------
+fn op_bce f uint to void
+op_ana f
+for j ulong get o_n 0 bound 1048577
+b = get o_bl j
+if ne get o_rn b 0
+op_bceb b
+end
+end
+end
+fn op_bceb b uint to void
+o = get i_bo1 b
+while ne o 0 bound 4194305
+nx = get i_onx o
+op = get i_oop o
+if eq op 79
+if op_inb o b
+op_drop b o true
+end
+end
+if eq op 74
+if ne op_cv ir_arg o 1 0
+op_drop b o false
+end
+end
+o = nx
+end
+end
+note value v is defined by a `const`
+fn op_isc v uint to bool
+if ne get i_vk v 4
+ret false
+end
+ret eq get i_oop get i_vo v 1
+end
+note the bits of const v, 0 when v is not a const
+fn op_cv v uint to ulong
+if not op_isc v
+ret 0
+end
+ret get i_oim get i_vo v
+end
+note element count of the ARRAY that REF value r refers to, 0 when r is not a REF to an ARRAY
+fn op_alen r uint to ulong
+t = get i_vty r
+if lt t 32
+ret 0
+end
+if ne get i_tk t 4
+ret 0
+end
+a = get i_t1 t
+if lt a 32
+ret 0
+end
+if ne get i_tk a 2
+ret 0
+end
+ret ulong get i_t2 a
+end
+note chk.bounds o (tok, r, i, e) in block b cannot fail
+fn op_inb o uint b uint to bool
+e = op_cv ir_arg o 3
+if eq e 0
+ret false
+end
+l = op_alen ir_arg o 1
+if lt l e
+ret false
+end
+x = op_ub ir_arg o 2 b
+if eq x 0
+ret false
+end
+ret le x add sub l e 1
+end
+note the least X with v < X known in block b from a const or the tests on b's dominator path; 0 none
+fn op_ub v uint b uint to ulong
+if op_isc v
+c = op_cv v
+if eq c 18446744073709551615
+ret 0
+end
+ret add c 1
+end
+x = ulong 0
+d = b
+while true bound 1048577
+y = op_edge v d
+if ne y 0
+if or eq x 0 lt y x
+x = y
+end
+end
+p = get o_id d
+if eq p d
+ret x
+end
+d = p
+end
+ret x
+end
+note the bound X with v < X that block d's one incoming edge proves, else 0: d has one predecessor, it
+note ends in `cbr` with d as exactly one target, and the condition compares v with a const
+fn op_edge v uint d uint to ulong
+if ne get o_pc d 1
+ret 0
+end
+t = get i_bot op_pred d 0
+if ne get i_oop t 61
+ret 0
+end
+if eq ir_arg t 2 ir_arg t 3
+ret 0
+end
+c = ir_arg t 1
+if ne get i_vk c 4
+ret 0
+end
+q = get i_vo c
+op = ulong get i_oop q
+if or lt op 32 gt op 35
+ret 0
+end
+if eq ir_arg t 2 d
+ret op_cmpx q op 0 v
+end
+ret op_cmpx q op 1 v
+end
+note compare q `a OP b` (32 lt, 33 le, 34 gt, 35 ge) seen true (n 0) or false (n 1, the negation 67 - OP):
+note the X with v < X when the relation bounds v above by a const; 0 otherwise
+fn op_cmpx q uint op ulong n ulong v uint to ulong
+k = op
+if eq n 1
+k = sub 67 op
+end
+s = ir_arg q 0
+w = ir_arg q 1
+if ge k 34
+s = ir_arg q 1
+w = ir_arg q 0
+end
+if ne s v
+ret 0
+end
+if not op_isc w
+ret 0
+end
+c = op_cv w
+if or eq k 32 eq k 34
+ret c
+end
+if eq c 18446744073709551615
+ret 0
+end
+ret add c 1
+end
+note delete check o of block b: uses of its output token take its input token; with fk, a
+note `fact.inbounds 1` on its (r, i, e) takes its place
+fn op_drop b uint o uint fk bool to void
+if fk
+x = ir_op b 92 0 1 3
+op_unl b x
+op_insb b x o
+ir_set x 0 ir_arg o 1
+ir_set x 1 ir_arg o 2
+ir_set x 2 ir_arg o 3
+end
+op_repl uint get o_n 11 ir_otok o ir_arg o 0
+op_unl b o
+put o_n 13 add get o_n 13 1
+end
+note put op x into block b right before op o
+fn op_insb b uint x uint o uint to void
+q = op_oprv b o
+put i_onx x o
+if eq q 0
+put i_bo1 b x
+else
+put i_onx q x
+end
+put i_ob x b
+put i_bno b add get i_bno b 1
+end
+note ---- 4. ROT ----------------------------------------------------------------------------------
 fn op_rot f uint to void
 op_ana f
 op_hdrs
@@ -656,8 +850,21 @@ c = ulong 0
 for j ulong get o_n 0 bound 1048577
 b = get o_bl j
 if ne get o_in b 0
-c = add c ulong get i_bno b
+c = add c op_nex b
 end
+end
+ret c
+end
+note executing ops of block b (facts 90..93 do not run)
+fn op_nex b uint to ulong
+c = ulong 0
+o = get i_bo1 b
+while ne o 0 bound 4194305
+op = get i_oop o
+if or lt op 90 gt op 93
+c = add c 1
+end
+o = get i_onx o
 end
 ret c
 end
@@ -671,7 +878,7 @@ end
 end
 note optimize every function of the unit read into the ir.om tables
 fn op_run to void
-for j ulong 13
+for j ulong 16
 put o_n j 0
 end
 for i ulong get i_n 3 bound 65536
@@ -687,6 +894,7 @@ go = true
 while go bound 65536
 go = op_pre f
 end
+op_bce f
 op_licm f
 op_rot f
 put o_n 9 add get o_n 9 op_cnt f 1
@@ -701,15 +909,17 @@ op_say 15 23
 op_num get o_n 8
 op_say 23 25
 op_num get o_n 9
-op_say 25 34
+op_say 25 30
+op_num get o_n 13
+op_say 30 39
 op_num get o_n 3
-op_say 34 42
+op_say 39 47
 op_num get o_n 4
-op_say 42 51
+op_say 47 56
 op_num get o_n 5
-op_say 51 63
+op_say 56 68
 op_num get o_n 6
-op_say 63 64
+op_say 68 69
 ret int get o_n 12
 end
 fn op_say a ulong b ulong to void

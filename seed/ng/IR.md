@@ -862,7 +862,7 @@ zero-trip mutants guards the third. A pass removes a check in exactly two ways:
 
 Every pass that does either has mutants that attack trap order and zero-trip hoisting (D9).
 
-### 15.1 Loop-invariant code motion and rotation (`src/opt.om`, D16)
+### 15.1 Loop-invariant code motion, bounds-check elimination and rotation (`src/opt.om`, D16)
 
 `src/opt.om` (unit order ir, opt, main; functions `op_*`) rewrites the `ir.om` tables in place,
 per function:
@@ -872,14 +872,22 @@ per function:
    passing h. When h has exactly one predecessor outside the loop and it ends in `br h`, that block
    is the preheader; otherwise a new block with h's parameter types, ending in `br h` with them, is
    placed before h and every outside predecessor (`br` or `cbr`) branches to it instead.
-2. **LICM**, innermost loop first. An op moves to the end of the preheader when it is class P
+2. **BCE** (pass origin 1, item 1 of s15). A `chk.bounds r i e` is replaced in place by
+   `fact.inbounds 1 r i e` when e is a const >= 1, r is a REF to an ARRAY of count L, and i < X is
+   known where the check runs with X - 1 + e <= L: i is a const (X = i + 1), or a block on the
+   check's dominator path has one predecessor, ending in a `cbr` on `lt`/`le`/`gt`/`ge` of i and a
+   const, so that block runs only after the test proved i < X. A `chk.divz` of a nonzero const is
+   deleted. Uses of a deleted check's output token take its input token. ngcheck judges the fact's
+   placement, not its truth (s7.10); the gate's BCE mutant (X - 1 + e <= L + 1) makes the
+   boundary fixture `o-bce1` (L = 4, i < 5) write past the array, and the run differs.
+3. **LICM**, innermost loop first. An op moves to the end of the preheader when it is class P
    (s6.4), defines a value, is not `shared`, and every operand is defined outside the loop. P ops
    are total (s7.3: division by zero gives 0), so running one on a path where the loop runs zero
    times changes nothing. Checks, loads, stores, calls, host words, facts and terminators never
    move: they carry the token chain, and that is where coverage (s8) and trap order (above) live.
    An op equal to one already in the preheader (op, type, imm, operands) is dropped and its uses
    take the earlier value.
-3. **ROT.** When the header ends in `cbr` with one target inside the loop and one outside, and the
+4. **ROT.** When the header ends in `cbr` with one target inside the loop and one outside, and the
    one latch ends in `br h`, the header is placed right after the latch. Block order changes no
    value (uses are judged by dominance, s6.2); it is the layout a back end emits, so the back
    branch falls through into the test and a pass of the loop takes one conditional branch.
@@ -887,5 +895,5 @@ per function:
 The gate runs every O/L fixture and every Q seed through `@ng opt`: ngcheck's whole ACCEPT line on
 the output, the text round trip, ngrun before and after equal, and a second run that finds nothing
 to move. Its mutants hoist a load past the loop's stores and checks past their guard (both refused
-by ngcheck: the hoisted op keeps an in-loop token, s6.4) and merge preheader ops of different imm
-(a run differs).
+by ngcheck: the hoisted op keeps an in-loop token, s6.4), merge preheader ops of different imm
+(a run differs) and let BCE delete a check one element past its proof (a run differs).

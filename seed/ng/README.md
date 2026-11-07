@@ -22,8 +22,8 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `IR.md` | ΩIR v1: binary format, types, ops, token chain, coverage rule, refusal classes, text form, limits. |
 | `hostwords.tsv` | Normative host word table (`id word args class`) the `host` op is checked against. |
 | `src/ir.om` | First unit of the `ng` program (om2): ΩIR tables, builder, the one binary reader and writer (IR.md s14). |
-| `src/opt.om` | Unit after ir.om: the ΩIR optimizer (IR.md s15.1). Per function: preheaders, loop-invariant code motion of class P ops (checks, memory and calls stay on the token chain), loop rotation (header after its latch). |
-| `src/main.om` | Last unit: `ng` driver. `@ng ir-copy` reads a unit and writes it back byte for byte; `@ng opt` writes it optimized; `@ng opt-count` prints `opt fns= loops= inloop=A->B hoisted= merged= rotated= preheaders=` (A, B: ops in loop blocks before and after). |
+| `src/opt.om` | Unit after ir.om: the ΩIR optimizer (IR.md s15.1). Per function: preheaders, bounds-check elimination (a `chk.bounds` proved by a const index or a dominating compare-and-branch becomes `fact.inbounds` origin 1; a `chk.divz` of a nonzero const goes), loop-invariant code motion of class P ops (checks, memory and calls stay on the token chain), loop rotation (header after its latch). |
+| `src/main.om` | Last unit: `ng` driver. `@ng ir-copy` reads a unit and writes it back byte for byte; `@ng opt` writes it optimized; `@ng opt-count` prints `opt fns= loops= inloop=A->B bce= hoisted= merged= rotated= preheaders=` (A, B: executing ops in loop blocks before and after; bce: checks deleted). |
 | `ng.units` | The ordered unit list of `ng`, each with its sha256 pin. |
 | `ngbuild.om` | `ngbuild build OMC UNITS OUT` checks every pin, concatenates and compiles; `ngbuild sums UNITS` prints fresh pins. |
 | `sha256.om` | FIPS 180-4 SHA-256 shared by ngbuild, ngcheck and the gate. |
@@ -70,9 +70,9 @@ changed, the class name shifted), nine mutants of ngrun (`chk.fuel` one pass lat
 giving a, u64 `chk.add` and `chk.mul` never failing, `chk.shl` without its negative bound, the signed
 conv lower bound at -2^(w-1), `chk.bounds` passing e = 0, narrow `neg` left uncanonical, the depth
 cap at 70000), a mutant ngrand (a
-random check's new token not made current) and three of opt.om (a load hoisted past the loop's
+random check's new token not made current) and four of opt.om (a load hoisted past the loop's
 stores and checks hoisted past their guard, both refused by ngcheck; preheader merging that
-ignores imm, a run differs) must each fail their named check at least once (the
+ignores imm and BCE accepting an index one past its proof, a run differs) must each fail their named check at least once (the
 ngrand mutant: ngcheck refuses TOKEN); each mutant's pattern must occur exactly once in its source.
 Under a mutant, Q runs 100 seeds and `L` cases are skipped. Last line `NGIRGATE PASS cases=N`,
 exit 0; otherwise one `FAIL` line per failure and exit 1.
