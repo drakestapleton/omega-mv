@@ -617,25 +617,30 @@ om4 refuses them, so they are omc-only like structs. Checked by `seed/omc/gate7.
 
 ### 9.9 Floating point (omc only, gate8)
 
-The words are `bitcast`, `fsqrt`, `fabs`, `fmin` and `fmax`, not `bits`, `sqrt`, `abs`, `min` and
+The words are `bitcast`, `fsqrt`, `fabs`, `fmin`, `fmax` and `fma`, not `bits`, `sqrt`, `abs`, `min` and
 `max`: the benchmark corpus uses those shorter spellings as ordinary identifiers, and a keyword may
 not take a name that existing `.om` code already uses. gate11 pins both halves of that rule.
 
 `f32` and `f64` are IEEE-754 binary32 and binary64. A float value is its bit pattern held in an
-ordinary integer register; arithmetic moves it to v0/v1, runs one scalar FP instruction, and moves it
-back. FPCR is never written: round to nearest even, subnormals kept, no fused operations, one rounding
-per operator. There is no implicit conversion: mixing f32 and f64, or float and integer, without a
-conversion is error 7.
+ordinary integer register or its SIMD twin; arithmetic runs one scalar FP instruction.
+FPCR is never written: under the Linux default it is round to nearest even with subnormals kept.
+Ordinary `mul` then `add` stay separate operations and round separately; only explicit `fma` fuses.
+There is no implicit conversion: mixing f32 and f64, or float and integer, without a conversion
+is error 7.
 
 - Literals: `digits.digits[(e|E)[+|-]digits][f32|f64]`; a digit must be present on both sides of the
   dot, and a leading `-` negates. A literal with no suffix takes its type from context exactly as an
-  integer literal does; where no context gives a float type it is error 11. The decimal text is
-  converted exactly to the target type, keeping a 64-bit significand, a binary exponent and one
-  sticky bit, then rounding once to nearest even: 0.1f64 is 0x3FB999999999999A. The full binary32 and
-  binary64 range is covered, including subnormals (5e-324, 1e-45) and signed zero. A literal that
-  rounds to infinity is refused (error 8); one below the smallest subnormal underflows to signed
+  integer literal does; where no context gives a float type it is error 11. An integer literal where
+  a float is expected (assignment, `ret`, argument, `put`, `new` fill) is error 7; write `f64 1` or
+  `1.0`. The decimal text is converted exactly: digits times a power of ten is held as an exact
+  quotient of two integers, long division gives a 64-bit significand and the remainder gives the
+  sticky bit, then the value is rounded once to nearest even: 0.1f64 is 0x3FB999999999999A and
+  6816.702656e-27 is 0x3B207B55A6D4A130. The full binary32 and binary64 range is covered, including
+  subnormals (5e-324, 1e-45; 2.4703282292062328e-324 is 0x1) and signed zero. A literal that
+  rounds to infinity is refused (error 8); one at or below half the smallest subnormal rounds to signed
   zero. The significant digits must still fit in 2^63-1 (error 8 beyond that). (gate8 f64_bits,
-  f32_bits, neg_ambiguous, neg_dot, neg_overflow, neg_overflow2, neg_overflow3)
+  f32_bits, lit_round, neg_int_*, neg_ambiguous, neg_dot, neg_overflow, neg_overflow2,
+  neg_overflow3; `seed/omc/float-lits.py diff OMC N SEED` is the randomized differential)
 - Operators: `+ - * /` and unary `neg`; comparisons `eq ne lt le gt ge`. Bit operators, shifts and
   `rem` on a float are error 7. IEEE results: division by zero and overflow give infinity, 0/0 gives
   NaN, and no float operation traps. NaN compares false everywhere except `ne`, which is true. -0.0
@@ -644,6 +649,15 @@ conversion is error 7.
   type and follow FMINNM/FMAXNM (IEEE minNum/maxNum: one quiet NaN returns the other operand; -0.0
   orders below +0.0). A bare integer operand is error 7 and an unresolved literal is error 11.
   (gate8 intrinsics, neg_intr_*)
+- `fma a b c` multiplies `a` by `b` and adds `c` with **one rounding of the exact combined result**.
+  All three operands must have the same explicit f32 or f64 type (error 7 otherwise; an unresolved
+  decimal literal is error 11). AArch64 emits one scalar FMADD; its IEEE/Arm FPMulAdd behavior follows
+  FPCR, including subnormals, infinities, signed zero, quieting signaling NaNs and invalid operations
+  such as zero times infinity. NaN payload selection is Arm's rule, not a host-library rule.
+  In particular `(1+2^-52)*(1-2^-52)-1` is `-2^-104` for f64 rather than the zero from separately
+  rounded multiply and add. x86linux and x86efi refuse `fma` with error 9: their SSE2 baseline does
+  not provide a fused instruction, and no unfused fallback is permitted. IR mode refuses float
+  words with error 3. (gate8 fma, neg_fma_*; gate-fma wrong-opcode, unfused and rounding mutants)
 - Conversions `<type> value` handle int<->float, f32<->f64 and float->int. Int to float is SCVTF/UCVTF
   (round to nearest even); float to int is FCVTZS/FCVTZU (truncate, saturate, NaN -> 0); f32<->f64 is
   FCVT. `bitcast T value` reinterprets a value of the same width (f32/i32/u32, f64/i64/u64, and
@@ -933,7 +947,27 @@ cannot be read). In IR mode (section 11) the same codes apply; a contract line (
 Implemented by the Omega-written compiler in `seed/omc/omc.om`. The original
 om4 parent builds this extended compiler; the extended compiler reproduces
 itself byte for byte. The original subset retains its machine code. The new
-words are reserved and require program mode (error 9 in function mode).
+words are reserved and require program mode (error 9 in function mode), with one
+exception: an OM-2 function unit (first line `om2`, no `fn main`) may use the file
+and identity subset `fopen`, `fclose`, `fstat`, `stat`, `lstat`, `getuid`,
+`geteuid`, `getgid` and `getegid`, the clocks `monons`, `realns` and `sleepns`, and
+the device subset `devctl`, `mapnew`, `mapdrop`, `mapread`, `mapwrite`, `devcall`,
+`uvmctl`, `mapaddr`, `mapget`, `mapset`, `maphold` and `mapbind` (`seed/host/MAPPING.md`) on the AArch64
+target. Each of these is an inline `svc` with its arguments saved and restored around
+it; none reads argv, the x28 stack floor or a global, and none writes x7 or x19-x28,
+so a unit called through the omega-bridge native ABI keeps its frame. In function
+mode entry31 points at a32-byte header followed by1..4098 owned32-byte mapping
+slots. The header supplies capacity and nonwrapping generation limits; handles
+have13 low slot bits. The bridge selects an explicit context and serializes
+its calls. Fixed bind replaces only an entire live PROT_NONE reservation in
+that table. Failed bind retires its token on successful cleanup; a cleanup
+failure traps3 and leaves an inaccessible, un-rebindable owner for mapdrop only
+(mapaddr may inspect it). The bridge refuses destroy while it is live.
+Program mode retains its raw128
+slots and eight slot bits. Every other host word, every OM-1 function unit and
+other targets stay error9. This context-format contract is a draft requiring
+Drake approval before merge (PROPOSED `spec/omegese-om3.md` section1, gate
+`seed/omc/om2/fnhost/fnhost.cases`).
 
 All results below have type `long`. Successful kernel results are nonnegative;
 failures return minus the Linux error number. Programs must check errors.
@@ -1122,10 +1156,42 @@ loader and shell test coordinator do not implement these operations. No
 foreign-language compiler or runtime is on the new implementation path.
 
 The proposed device/memory extension adds checked `devctl`, `mapnew`,
-`mapdrop`, `mapread` and `mapwrite` to this same compiler. Its exact type,
+`mapdrop`, `mapread` and `mapwrite` to this same compiler, plus the VFIO words
+`vfioctl` (literal allowlisted request, exact size, `argsz` forced; IOMMU_MAP_DMA takes an
+owned mapping handle, never an address),
+`eventfd` (uint initial value, CLOEXEC|NONBLOCK, existing read/write/poll/close),
+`vfioirq` (acquired-device/eventfd kinds, exact argsz, bounded IRQ forms),
+`vfiomap` (read-only shared map of exactly one reported VFIO region) and `vfiomapw`
+(the same map read/write, for device registers). Its exact type,
 ownership, range and refusal contract is [seed/host/MAPPING.md](../../seed/host/MAPPING.md).
+The VFIO/event words use keywords228..232 respectively as `vfioctl`,
+`vfiomap`, `vfiomapw`, `eventfd`, `vfioirq`. They are AArch64
+program-mode words; function mode refuses them, and hosted x86 VFIO
+is not implemented. Descriptor-kind tracking remains program-local:
+existing OM-2 unit `fclose`/`dupfd` emission does not access that
+standalone-program table.
+The draft `devctl` boundary also admits five exact aien-gpu ABI1 request
+numbers, not arbitrary type-A ioctls; changing their direction or encoded
+payload size is refused. See the pinned UAPI and Wolfram-derived matrix there.
+Drake must approve this trust-surface extension before merge.
 It adds process-local mapped resources while the compiler's own storage remains
 fixed pools. GPU launch and model execution are separate, still-unqualified gates.
+
+#### `devcall` (keyword 171)
+
+`devcall fd request H hoff 32 P poff n` returns `long`, the ioctl result or
+negative Linux errno. `fd` is `int`, `request` a literal `uint` RM_ALLOC or
+RM_CONTROL request, `H` and `P` writable `uchar` arrays, and `hoff`, `poff`
+and `n` are `ulong`. The header span must be exactly 32 bytes and the
+parameter span at most 1048576 bytes (inclusive, the RM default copy-in cap).
+Both slices must fit their arrays, must not overlap, and the header's caller
+pointer bytes must be zero; violations trap 3 (exit 103).
+The checked parameter span is bound directly, not copied onto the stack;
+only a private 32-byte header is stack-backed. See
+[`MAPPING.md`](../../seed/host/MAPPING.md) for the ABI and upstream cap source.
+`seed/host/tests/devcall.om` checks harmless memfd ioctls at 16384, 55888
+and 1048576 bytes, and refusal at 1048577 bytes. `devctl` retains its
+request-encoded size limit.
 
 ### Host CPU ordering words (#939)
 
