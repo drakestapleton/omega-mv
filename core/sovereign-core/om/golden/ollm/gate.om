@@ -1,0 +1,954 @@
+note SPDX-License-Identifier: Apache-2.0
+note om/golden/ollm/gate.om: golden-token record and comparator for the own Omega LLM (DRA-52,
+note Core #853). Every judgment of the gate is made here; gate.sh and record.sh only sequence.
+note Build (om/golden/build.sh does this):
+note   { printf 'om2\n'; cat om/vendor/json.om om/vendor/sha256.om om/golden/ollm/gate.om; } | omc
+note Modes:
+note   gate rec CPUOUT CK MERGES PROMPTS MAXTOK FLOOR_E9 DRIFT_E9 ENGINE SOURCE HOST UTC LABEL
+note     turns a gdec.om gtcpu run (CPUOUT) into one aien-golden-ollm/1 record on stdout. The
+note     checkpoint, merges and prompt file are hashed here. Prompt k keeps its leading steps whose
+note     top-1 margin is at least FLOOR_E9 (10^-9 logit units); the first step below the floor and
+note     everything after it are dropped, and a generated id 0 is kept and ends the prompt. Each prompt
+note     must keep at least RMIN steps (exit 5 ambiguous otherwise).
+note   gate cmp REF CANDOUT CK MERGES PROMPTS
+note     compares a gdec.om gtgpu run with the record: the three files must hash to the record's
+note     identities (exit 3 NOTCOMPARABLE otherwise). For every kept step the candidate id must
+note     equal the reference id (DIVERGE) and its top-1 logit must be within DRIFT_E9 of the
+note     reference's (DRIFT). Prints MATCH, DIVERGE or DRIFT per prompt and a summary line.
+note Exit: 0 written or every prompt matches, 1 a DIVERGE or DRIFT, 2 usage or bad argument,
+note 3 not comparable, 4 file or format refusal, 5 ambiguous prompt (rec). Formats: README.md.
+
+const KMAX ulong 64
+const SMAX ulong 4096
+const RMIN ulong 4
+const BUFCAP ulong 4194304
+
+global gb uchar 4194304
+global gbn ulong 1
+global gcur ulong 1
+global gw ulong 2
+global gpa uchar 4352
+global gh uchar 65536
+global gsha uchar 192
+global go uchar 65536
+global gon ulong 1
+global gid ulong 262144
+global gtop long 262144
+global gmar long 262144
+global gcnt ulong 64
+global gend ulong 64
+global grid ulong 262144
+global grtop long 262144
+global grn ulong 64
+global ghd ulong 16
+global gstr uchar 1024
+global gstl ulong 8
+global gsum ulong 8
+global gmd long 2
+
+text tmrec "rec"
+text tmcmp "cmp"
+text tpre "golden-ollm: refused "
+text tuse "usage: gate rec CPUOUT CK MERGES PROMPTS MAXTOK FLOOR_E9 DRIFT_E9 ENGINE SOURCE HOST UTC LABEL | gate cmp REF CANDOUT CK MERGES PROMPTS"
+text tio "io"
+text tbig "too-large"
+text tfmt "format"
+text tamb "ambiguous-prompt"
+text tbarg "bad-argument"
+text tschema "aien-golden-ollm/1"
+text tk0 "label"
+text tk1 "ckpt_sha256"
+text tk2 "merges_sha256"
+text tk3 "prompts_sha256"
+text tk4 "prompts"
+text tk5 "max_tokens"
+text tk6 "margin_floor_e9"
+text tk7 "drift_bound_e9"
+text tk8 "ref_decoder"
+text tk9 "ref_engine_sha256"
+text tk10 "ref_source"
+text tk11 "host_id"
+text tk12 "utc"
+text tgtcpu "gtcpu"
+text tend "end"
+text tgte "GTE"
+text tcpu "cpu"
+text tgpu "gpu"
+text treal "REAL"
+text tfake "FAKE"
+text tsyn "SYNTHETIC"
+text tnc "NOTCOMPARABLE "
+text tmatch "MATCH "
+text tdiv "DIVERGE "
+text tdrift "DRIFT "
+text tsumm "golden-ollm cmp prompts="
+text tn " n="
+text tmd " maxdrift_e9="
+text tix " index="
+text tref " ref="
+text tcand " cand="
+text tcend "end"
+text ts1 " compared="
+text ts2 " match="
+text ts3 " diverge="
+text ts4 " drift="
+
+note ---- output
+
+fn oflsh to void
+n = get gon 0
+p = ulong 0
+while lt p n bound 65537
+w = write 1 go p sub n p
+if le w 0
+exit 4
+end
+p = add p ulong w
+end
+put gon 0 0
+end
+
+fn oc c ulong to void
+n = get gon 0
+if ge n 65536
+oflsh
+n = ulong 0
+end
+put go n uchar and c 255
+put gon 0 add n 1
+end
+
+fn ot t view uchar * to void
+for i ulong len t
+oc ulong get t i
+end
+end
+
+fn ou v ulong to void
+d = new uchar 24 0
+n = ulong 0
+x = v
+while true bound 21
+put d n uchar add rem x 10 48
+n = add n 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong n
+oc ulong get d sub sub n 1 i
+end
+end
+
+fn ol v long to void
+if lt v 0
+oc 45
+if eq v -9223372036854775808
+ou 9223372036854775808
+else
+ou ulong neg v
+end
+else
+ou ulong v
+end
+end
+
+fn osp to void
+oc 32
+end
+
+fn onl to void
+oc 10
+end
+
+note refusal: message on stderr, exit code
+fn die code int why view uchar * to void
+oflsh
+w = write 2 tpre 0 len tpre
+w = write 2 why 0 len why
+m = new uchar 1 10
+w = write 2 m 0 1
+exit code
+end
+
+fn usage to void
+oflsh
+w = write 2 tuse 0 len tuse
+m = new uchar 1 10
+w = write 2 m 0 1
+exit 2
+end
+
+note ---- arguments and files
+
+note argv[i] into gpa; returns its length or exits 2
+fn arg i ulong to ulong
+r = argread i gpa 0 4096
+if or le r 0 gt r 4096
+usage
+end
+ret ulong r
+end
+
+note the whole file named by argv[i] into gb[0 .. gbn); exits 4 on I/O or when it exceeds BUFCAP
+fn fload i ulong to void
+n = arg i
+fd = fopen gpa 0 n 0 0
+if lt fd 0
+die 4 tio
+end
+t = ulong 0
+while true bound 999999
+if ge t BUFCAP
+die 4 tbig
+end
+k = read int fd gb t sub BUFCAP t
+if lt k 0
+die 4 tio
+end
+if eq k 0
+break
+end
+t = add t ulong k
+end
+c = fclose int fd
+put gbn 0 t
+put gcur 0 0
+end
+
+note sha256 of the file named by argv[i] into gsha[slot 64 ..)
+fn fhash i ulong slot ulong to void
+n = arg i
+fd = fopen gpa 0 n 0 0
+if lt fd 0
+die 4 tio
+end
+hreset
+while true bound 999999
+k = read int fd gh 0 65536
+if lt k 0
+die 4 tio
+end
+if eq k 0
+break
+end
+for j ulong ulong k
+b = hpush get gh j
+end
+end
+c = fclose int fd
+if not hfinal
+die 4 tio
+end
+for j ulong 64
+put gsha add mul slot 64 j get hd j
+end
+end
+
+note ---- line and word scanning over gb[gcur ..)
+
+note next word: gw = (start, length); words end at a space or a line end; returns false at a line end
+note or the end of the buffer (no word)
+fn word to bool
+c = get gcur 0
+n = get gbn 0
+if ge c n
+ret false
+end
+if eq get gb c 10
+ret false
+end
+s = c
+while lt c n bound 999999
+x = get gb c
+if or eq x 32 eq x 10
+break
+end
+c = add c 1
+end
+put gw 0 s
+put gw 1 sub c s
+if eq get gw 1 0
+die 4 tfmt
+end
+if lt c n
+if eq get gb c 32
+c = add c 1
+end
+end
+put gcur 0 c
+ret true
+end
+
+note the line must end here: consumes the newline, exits 4 otherwise
+fn eol to void
+c = get gcur 0
+if ge c get gbn 0
+die 4 tfmt
+end
+if ne get gb c 10
+die 4 tfmt
+end
+put gcur 0 add c 1
+end
+
+fn wneed to void
+if not word
+die 4 tfmt
+end
+end
+
+note the current word equals t
+fn wis t view uchar * to bool
+if ne get gw 1 len t
+ret false
+end
+s = get gw 0
+for i ulong len t
+if ne get gb add s i get t i
+ret false
+end
+end
+ret true
+end
+
+fn wexp t view uchar * to void
+wneed
+if not wis t
+die 4 tfmt
+end
+end
+
+note the current word as an unsigned decimal of 1 .. 19 digits
+fn wu to ulong
+n = get gw 1
+if gt n 19
+die 4 tfmt
+end
+s = get gw 0
+v = ulong 0
+for i ulong n
+x = get gb add s i
+if or lt x 48 gt x 57
+die 4 tfmt
+end
+v = add mul v 10 ulong sub x 48
+end
+ret v
+end
+
+fn wl to long
+s = get gw 0
+if eq get gb s 45
+put gw 0 add s 1
+put gw 1 sub get gw 1 1
+if eq get gw 1 0
+die 4 tfmt
+end
+v = wu
+if gt v 9223372036854775807
+die 4 tfmt
+end
+ret neg long v
+end
+v = wu
+if gt v 9223372036854775807
+die 4 tfmt
+end
+ret long v
+end
+
+fn nu to ulong
+wneed
+ret wu
+end
+
+fn nl to long
+wneed
+ret wl
+end
+
+note the current word is 64 lowercase hex and equals gsha[slot 64 ..) when chk; copies it there
+note otherwise
+fn whex slot ulong chk bool to bool
+if ne get gw 1 64
+die 4 tfmt
+end
+s = get gw 0
+ok = true
+for i ulong 64
+x = get gb add s i
+if not or and ge x 48 le x 57 and ge x 97 le x 102
+die 4 tfmt
+end
+o = add mul slot 64 i
+if chk
+if ne get gsha o x
+ok = false
+end
+else
+put gsha o x
+end
+end
+ret ok
+end
+
+note the argument i as a decimal: 1 .. 19 digits
+fn argu i ulong to ulong
+n = arg i
+if gt n 19
+die 2 tbarg
+end
+v = ulong 0
+for j ulong n
+x = get gpa j
+if or lt x 48 gt x 57
+die 2 tbarg
+end
+v = add mul v 10 ulong sub x 48
+end
+ret v
+end
+
+fn idch x uchar to bool
+if and ge x 48 le x 57
+ret true
+end
+if and ge x 65 le x 90
+ret true
+end
+if and ge x 97 le x 122
+ret true
+end
+if or or eq x 46 eq x 95 or eq x 47 eq x 64
+ret true
+end
+ret or or eq x 58 eq x 43 eq x 45
+end
+
+note the argument i must be 1 .. 128 of [A-Za-z0-9._/@:+-]; copied into gstr[slot 128 ..), length
+note gstl[slot]
+fn argid i ulong slot ulong to void
+n = arg i
+if gt n 128
+die 2 tbarg
+end
+for j ulong n
+x = get gpa j
+if not idch x
+die 2 tbarg
+end
+put gstr add mul slot 128 j x
+end
+put gstl slot n
+end
+
+fn ostr slot ulong to void
+for j ulong get gstl slot
+oc ulong get gstr add mul slot 128 j
+end
+end
+
+fn osha slot ulong to void
+for j ulong 64
+oc ulong get gsha add mul slot 64 j
+end
+end
+
+note ---- gdec.om output: T k s id top1 margin lines, then GTE cpu|gpu K steps ns
+
+note parse gb as a gdec run of the decoder named t; fills gid/gtop/gmar, gcnt, gend; returns K
+fn dparse t view uchar * to ulong
+for k ulong KMAX
+put gcnt k 0
+put gend k 0
+end
+steps = ulong 0
+while true bound 262146
+wneed
+if wis tgte
+break
+end
+if or ne get gw 1 1 ne get gb get gw 0 84
+die 4 tfmt
+end
+dline
+steps = add steps 1
+end
+wexp t
+kk = nu
+st = nu
+ns = nu
+eol
+if lt get gcur 0 get gbn 0
+die 4 tfmt
+end
+if or or eq kk 0 gt kk KMAX ne st steps
+die 4 tfmt
+end
+for k ulong KMAX
+if and ge k kk ne get gcnt k 0
+die 4 tfmt
+end
+end
+ret kk
+end
+
+note one T line after its T word: steps of prompt k must arrive in order 0, 1, ..; nothing after an
+note id 0
+fn dline to void
+k = nu
+s = nu
+if or ge k KMAX ge s SMAX
+die 4 tfmt
+end
+if or ne s get gcnt k ne get gend k 0
+die 4 tfmt
+end
+o = add mul k SMAX s
+c = nu
+put gid o c
+put gtop o nl
+put gmar o nl
+eol
+put gcnt k add s 1
+if eq c 0
+put gend k 1
+end
+end
+
+note ---- rec
+
+fn reckey t view uchar * to void
+ot t
+osp
+end
+
+fn reclab to void
+n = arg 13
+for j ulong n
+oc ulong get gpa j
+end
+end
+
+note kept steps of prompt k under floor f: leading steps with margin >= f; an id 0 ends it
+fn keep k ulong f long to ulong
+n = ulong 0
+for s ulong get gcnt k
+o = add mul k SMAX s
+if lt get gmar o f
+break
+end
+n = add n 1
+if eq get gid o 0
+break
+end
+end
+ret n
+end
+
+fn recrow tag ulong k ulong n ulong which ulong to void
+oc tag
+osp
+ou k
+osp
+ou n
+for s ulong n
+o = add mul k SMAX s
+osp
+if eq which 0
+ou get gid o
+end
+if eq which 1
+ol get gtop o
+end
+if eq which 2
+ol get gmar o
+end
+end
+onl
+end
+
+fn rec to void
+if ne ulong argcnt 14
+usage
+end
+mx = argu 6
+fl = argu 7
+dr = argu 8
+if or or eq mx 0 gt mx SMAX or eq fl 0 eq dr 0
+die 2 tbarg
+end
+if or gt fl 1000000000000 gt dr 1000000000000
+die 2 tbarg
+end
+argid 9 0
+argid 10 1
+argid 11 2
+argid 12 3
+ok = or or argis 13 treal argis 13 tfake argis 13 tsyn
+if not ok
+die 2 tbarg
+end
+fload 2
+kk = dparse tcpu
+for k ulong kk
+if lt get gcnt k mx
+if eq get gend k 0
+die 4 tfmt
+end
+end
+if gt get gcnt k mx
+die 4 tfmt
+end
+end
+fhash 3 0
+fhash 4 1
+fhash 5 2
+for k ulong kk
+if lt keep k long fl RMIN
+die 5 tamb
+end
+end
+recout kk mx fl dr
+end
+
+fn recout kk ulong mx ulong fl ulong dr ulong to void
+ot tschema
+onl
+reckey tk0
+reclab
+onl
+reckey tk1
+osha 0
+onl
+reckey tk2
+osha 1
+onl
+reckey tk3
+osha 2
+onl
+reckey tk4
+ou kk
+onl
+reckey tk5
+ou mx
+onl
+reckey tk6
+ou fl
+onl
+reckey tk7
+ou dr
+onl
+reckey tk8
+ot tgtcpu
+onl
+recid tk9 0
+recid tk10 1
+recid tk11 2
+recid tk12 3
+for k ulong kk
+n = keep k long fl
+recrow 80 k n 0
+recrow 76 k n 1
+recrow 77 k n 2
+end
+ot tend
+onl
+oflsh
+end
+
+fn recid t view uchar * slot ulong to void
+reckey t
+ostr slot
+onl
+end
+
+note ---- cmp
+
+note one header line KEY VALUE; hex slots are compared with the hashed files
+fn hkey t view uchar * to void
+wexp t
+wneed
+end
+
+fn hsha t view uchar * slot ulong to bool
+hkey t
+ok = whex slot true
+eol
+ret ok
+end
+
+note record line TAG k n v0 .. v(n-1); which 0 ids into grid, 1 top1 into grtop, 2 margins (each
+note must meet the record's floor). As rec writes it: RMIN <= n <= max_tokens (<= SMAX).
+fn rrow tag ulong k ulong which ulong to void
+wneed
+if or ne get gw 1 1 ne ulong get gb get gw 0 tag
+die 4 tfmt
+end
+if ne nu k
+die 4 tfmt
+end
+n = nu
+if or lt n RMIN gt n get ghd 1
+die 4 tfmt
+end
+if eq which 0
+put grn k n
+end
+if ne n get grn k
+die 4 tfmt
+end
+for s ulong n
+o = add mul k SMAX s
+if eq which 0
+put grid o nu
+end
+if eq which 1
+put grtop o nl
+end
+if eq which 2
+if lt nl long get ghd 2
+die 4 tfmt
+end
+end
+end
+eol
+end
+
+fn hshas t view uchar * slot ulong to void
+put ghd add 4 slot 0
+if hsha t slot
+put ghd add 4 slot 1
+end
+end
+
+note parse the record in gb against the file hashes in gsha slots 0..2: ghd[4 + slot] = 1 when the
+note record's checkpoint, merges or prompts hash equals the file's; ghd 1 max_tokens, 2 floor,
+note 3 drift bound; returns K
+fn rparse to ulong
+wexp tschema
+eol
+hkey tk0
+if not or or wis treal wis tfake wis tsyn
+die 4 tfmt
+end
+eol
+hshas tk1 0
+hshas tk2 1
+hshas tk3 2
+hkey tk4
+kk = wu
+eol
+hkey tk5
+put ghd 1 wu
+eol
+hkey tk6
+put ghd 2 wu
+eol
+hkey tk7
+put ghd 3 wu
+eol
+mtk = get ghd 1
+if or or eq mtk 0 gt mtk SMAX or eq get ghd 2 0 eq get ghd 3 0
+die 4 tfmt
+end
+if or gt get ghd 2 1000000000000 gt get ghd 3 1000000000000
+die 4 tfmt
+end
+hkey tk8
+if not wis tgtcpu
+die 4 tfmt
+end
+eol
+rskip tk9
+rskip tk10
+rskip tk11
+rskip tk12
+if or eq kk 0 gt kk KMAX
+die 4 tfmt
+end
+for k ulong kk
+rrow 80 k 0
+rrow 76 k 1
+rrow 77 k 2
+end
+wexp tend
+eol
+if lt get gcur 0 get gbn 0
+die 4 tfmt
+end
+ret kk
+end
+
+fn rskip t view uchar * to void
+hkey t
+eol
+end
+
+fn onc t view uchar * to void
+ot tnc
+ot t
+onl
+oflsh
+exit 3
+end
+
+fn absd a long b long to ulong
+if gt a b
+ret ulong sub a b
+end
+ret ulong sub b a
+end
+
+note compare prompt k; prints its verdict; returns 0 match, 1 diverge, 2 drift
+fn cmpk k ulong dr ulong to ulong
+n = get grn k
+mxd = ulong 0
+for s ulong n
+o = add mul k SMAX s
+if ge s get gcnt k
+cdiv k s get grid o false 0
+ret 1
+end
+if ne get gid o get grid o
+cdiv k s get grid o true get gid o
+ret 1
+end
+d = absd get gtop o get grtop o
+if gt d dr
+cdrift k s get grtop o get gtop o
+ret 2
+end
+if gt d mxd
+mxd = d
+end
+end
+ot tmatch
+ou k
+ot tn
+ou n
+ot tmd
+ou mxd
+onl
+if gt mxd get gsum 4
+put gsum 4 mxd
+end
+ret 0
+end
+
+
+fn cdiv k ulong s ulong r ulong has bool c ulong to void
+ot tdiv
+ou k
+ot tix
+ou s
+ot tref
+ou r
+ot tcand
+if has
+ou c
+else
+ot tcend
+end
+onl
+end
+
+fn cdrift k ulong s ulong r long c long to void
+ot tdrift
+ou k
+ot tix
+ou s
+ot tref
+ol r
+ot tcand
+ol c
+onl
+end
+
+
+fn cmp to void
+if ne ulong argcnt 7
+usage
+end
+fhash 4 0
+fhash 5 1
+fhash 6 2
+fload 2
+kk = rparse
+dr = get ghd 3
+if eq get ghd 4 0
+onc tk1
+end
+if eq get ghd 5 0
+onc tk2
+end
+if eq get ghd 6 0
+onc tk3
+end
+fload 3
+ck = dparse tgpu
+if ne ck kk
+onc tk4
+end
+for i ulong 8
+put gsum i 0
+end
+for k ulong kk
+v = cmpk k dr
+put gsum v add get gsum v 1
+put gsum 3 add get gsum 3 get grn k
+end
+csum kk
+end
+
+fn csum kk ulong to void
+ot tsumm
+ou kk
+ot ts1
+ou get gsum 3
+ot ts2
+ou get gsum 0
+ot ts3
+ou get gsum 1
+ot ts4
+ou get gsum 2
+ot tmd
+ou get gsum 4
+onl
+oflsh
+if ne get gsum 0 kk
+exit 1
+end
+exit 0
+end
+
+fn argis i ulong t view uchar * to bool
+r = argread i gpa 0 4096
+if ne r long len t
+ret false
+end
+for j ulong len t
+if ne get gpa j get t j
+ret false
+end
+end
+ret true
+end
+
+fn main to int
+if lt ulong argcnt 2
+usage
+end
+if argis 1 tmrec
+rec
+ret 0
+end
+if argis 1 tmcmp
+cmp
+ret 0
+end
+usage
+ret 2
+end
