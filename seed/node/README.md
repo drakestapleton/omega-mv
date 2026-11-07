@@ -668,6 +668,64 @@ journal (`nd_jstart`) and the listening check (`nd_lsn`, from
 `/proc/net/tcp` and `/proc/net/tcp6`). Its header documents the path slots
 and limits.
 
+### Qualification runner
+
+`tests/qual.om` replaces the out-of-repo DRA-292 qualification shell conductor.
+It composes with SHA-256 and the driver library, invokes only this checkout's
+`seed/out/omc` for builds, and ignores the ambient `OMC` variable. Run from the
+checkout root, under the operator-approved CPU-pool wrapper, with a fresh
+evidence directory outside the source tree:
+
+```
+{ printf 'om2\n'; cat om/tls/sha2.om seed/json/json.om seed/node/tests/drv.om seed/node/tests/qual.om; } | ~/work/omega-node-run.sh env -u OMC nice -n 19 seed/out/omc > build/node/qual
+{ printf 'om2\n'; cat om/tls/sha2.om seed/node/release.om; } | ~/work/omega-node-run.sh env -u OMC nice -n 19 seed/out/omc > build/node/release
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/tool-replay.om; } | ~/work/omega-node-run.sh env -u OMC nice -n 19 seed/out/omc > build/node/tool-replay
+chmod +x build/node/qual build/node/release build/node/tool-replay
+env -u OMC ~/work/omega-node-run.sh build/node/qual /tmp/node-qualification
+```
+
+Do not execute a compiler's output when that compilation failed. `HOME` locates
+`work/omega-node-e5b3/seed/out/omc`, `handoffs/tool-omega-20261104/round40`, and
+`.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean`. The round40 compiler is
+an input to tool-adapter checks, never the compiler of the qualification driver
+or the Node programs. `build/node/release` and `build/node/tool-replay` must
+already exist. Optional seeded `build/node/view-accept` and
+`build/node/release-accept` are invoked directly; when absent, acceptance and
+every corresponding mutant are `NOT_RUN`, never silently run by Python. Mutant
+mutation and compilation still run and fail independently if invalid.
+
+The conductor writes `platform.txt`, `hashes.txt`, `results.txt`, compiler
+diagnostics, program outputs and binary hashes. It checks gate composition,
+build reproducibility, the old `79894168` reader, code/view/release/journal
+mutants, tool replay and controls, the agent check, and the Lean RESULT model.
+Mutation replaces whole lines (with optional function scope); the Lean mutant
+replaces its exact proposition substring. A missing mutation is a failure.
+Source hashes and clean git status are checked again at the end. Exit 0 means
+every check passed; exit 1 means one or more failures; exit 3 means no failure
+but one or more `NOT_RUN` (a skipped step is never reported as a pass; the shell
+conductor it replaces always exited 0); exit 2 means the conductor could not
+prepare/read/write its inputs or evidence. `NOT_RUN` is preserved in the
+results and receipt.
+`platform.txt` records both the hexadecimal affinity mask and `Cpus_allowed_list`.
+Evidence from a dirty worktree cannot be promoted to a clean receipt.
+
+SHA-256, copying, composition, mutation, process deadlines, process discovery,
+result parsing and evidence writing are seeded Omega. The retained host tools
+are read-only git 2.43.0 (`rev-parse`, `status`, `ls-files`, and per-file
+`git show 79894168:PATH`, not `tar`), Lean 4.35.0 as a proof oracle,
+GNU coreutils 9.4 `uname` for platform identification and `nice` for CPU
+priority, and Python 3.12.3 solely for `seed/agent/tests/check.py`. The agent
+driver's Omega successor is tracked in omega-mv#1071; its result explicitly
+says it is still a Python driver. The slow-compiler adversarial fixture is also
+seeded Omega (a sleeping child and parent, killed by the tool adapter's deadline).
+No GPU or live model service is opened; there is no crumb-verification stage.
+
+The additive `drv.om` helper `dv_spawnio PK FI FO FE` accepts an already-packed
+argv and three open descriptors. It creates a child process group; the caller
+retains and closes the descriptors. `dv_spawn PK OUT ERR` now shares one output
+file offset when `OUT` and `ERR` name the same path. Both still return the child
+PID (or fork error), with child exits 126 for descriptor setup and 127 for exec.
+
 ### Receipts
 
 `tests/receipt.om` is the evidence receipt writer, the seeded Omega replacement
