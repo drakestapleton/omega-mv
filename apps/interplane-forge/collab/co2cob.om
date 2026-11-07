@@ -1,0 +1,925 @@
+note collab/co2cob.om (ForgePatches): load one Radicle patch or issue COB from git storage and replay it.
+note Layout (heartwood, rad 1.10.3 on spark): refs/namespaces/<nid>/refs/cobs/xyz.radicle.patch/<id>
+note (and xyz.radicle.issue) point at the newest change commit. A change commit's tree holds the
+note blobs 0, 1, ... (one JSON action each) and manifest. The COB id is the root change commit, and
+note a revision id is the id of the change that created it. Parents of a change are earlier changes,
+note then related repo commits and the identity root; only changes descend from the root change, so
+note `git log --ancestry-path <tips> ^<root>` lists exactly the later changes, oldest first with
+note --reverse --topo-order. `git grep -a -z -e ^ <changes>` prints every action blob as one line
+note `<change>:<n>\0<json>`. Read only, argv execs only (fkgit + fexec), never the rad CLI.
+note Limits: 1024 refs, 512 changes, 64 revisions, 16 merges, 64 reviews, 512 comments per COB;
+note anything past a limit is not shown. Concurrent changes replay in git topological order.
+text tcfer "for-each-ref"
+text tcsort "--sort=-committerdate"
+text tcfmtr "--format=%(objectname) %(refname:lstrip=-1)"
+text tcpatref "refs/namespaces/*/refs/cobs/xyz.radicle.patch/*"
+text tcissref "refs/namespaces/*/refs/cobs/xyz.radicle.issue/*"
+text tclog "log"
+text tcnowalk "--no-walk"
+text tcfmtl "--format=%H %at %ae"
+text tcanc "--ancestry-path"
+text tctopo "--topo-order"
+text tcrevers "--reverse"
+text tcgrep "grep"
+text tcopta "-a"
+text tcoptz "-z"
+text tcnocol "--no-color"
+text tcnoln "--no-line-number"
+text tcopte "-e"
+text tccaret "^"
+text tcdd "--"
+text tcty "type"
+text tcrevis "revision"
+text tcedit "edit"
+text tclife "lifecycle"
+text tcmerge "merge"
+text tcreview "review"
+text tcrcom "revision.comment"
+text tcredit "revision.edit"
+text tcrred "revision.redact"
+text tclabel "label"
+text tcassign "assign"
+text tccomm "comment"
+text tccedit "comment.edit"
+text tccred "comment.redact"
+text tcbase "base"
+text tcoid "oid"
+text tcdesc "description"
+text tctitle "title"
+text tcstate "state"
+text tcstatus "status"
+text tcreason "reason"
+text tccommit "commit"
+text tcverd "verdict"
+text tcsumm "summary"
+text tcbody "body"
+text tclabels "labels"
+text tcassn "assignees"
+text tcid "id"
+text tcdraft "draft"
+text tcarch "archived"
+text tcclosed "closed"
+text tcaccept "accept"
+text tcreject "reject"
+text tcrevd "/home/drakestapleton/handoffs/hive/manager/reviews/"
+text tcvsuf ".verdict.txt"
+note refs of the current repo: tip and COB id per ref; gcui lists the first ref of each distinct id
+global gcfo uchar 40960
+global gcfi uchar 40960
+global gcfn ulong 1
+global gcui ulong 1024
+global gcun ulong 1
+note the COB being loaded, and a requested id prefix
+global gcid uchar 40
+global gcrq uchar 40
+global gcrql ulong 1
+note changes: id, author time, author NID (the part of the author email after @)
+global gcch uchar 20480
+global gccts ulong 512
+global gccau uchar 32768
+global gccal ulong 512
+global gccn ulong 1
+note model slots gcm: 0,1 title (pool off,len) 2 lifecycle (0 open 1 draft 2 archived/closed)
+note 3,4 labels 5,6 assignees 7,8 close reason 9 kind (1 patch 2 issue) 10 actions not understood
+global gcm ulong 16
+note revisions: id, base, head oid, creating change, description (off,len), redacted, verdict line
+global gcrv uchar 2560
+global gcrb uchar 2560
+global gcro uchar 2560
+global gcrt ulong 64
+global gcrd ulong 128
+global gcrx ulong 64
+global gcrvd uchar 16384
+global gcrvl ulong 64
+global gcrn ulong 1
+note merges: revision index, merge commit, change
+global gcmr ulong 16
+global gcmc uchar 640
+global gcmt ulong 16
+global gcmn ulong 1
+note reviews: revision index, verdict (0 none 1 accept 2 reject), summary (off,len), change
+global gcwr ulong 64
+global gcwv ulong 64
+global gcws ulong 128
+global gcwt ulong 64
+global gcwn ulong 1
+note comments: revision index (9999 = none: an issue comment), body (off,len), change, redacted
+global gcqr ulong 512
+global gcqs ulong 1024
+global gcqt ulong 512
+global gcqx ulong 512
+global gcqn ulong 1
+note one git grep chunk: per output line the content range, change index and blob number
+global gcxa ulong 4096
+global gcxb ulong 4096
+global gcxc ulong 4096
+global gcxk ulong 4096
+global gcxn ulong 1
+note verdict file path and first bytes
+global gcvp uchar 512
+global gcvpl ulong 1
+global gcvb uchar 512
+note ---- small scanners over fxo
+fn coeol p ulong n ulong to ulong
+q = p
+while lt q n bound 16777216
+if eq get fxo q 10
+ret q
+end
+q = add q 1
+end
+ret n
+end
+fn cofindb a ulong b ulong c uchar to ulong
+q = a
+while lt q b bound 16777216
+if eq get fxo q c
+ret q
+end
+q = add q 1
+end
+ret b
+end
+fn cohexr a ulong n ulong to bool
+for i ulong n
+if cohexc get fxo add a i
+continue
+end
+ret false
+end
+ret true
+end
+fn codec a ulong b ulong to ulong
+v = ulong 0
+for i ulong sub b a
+c = get fxo add a i
+if and ge c 48 le c 57
+v = add mul v 10 sub ulong c 48
+end
+end
+ret v
+end
+note conum: fxo[a,b) as a decimal of 1..4 digits, 9999 otherwise (the manifest blob)
+fn conum a ulong b ulong to ulong
+if or le b a gt sub b a 4
+ret ulong 9999
+end
+v = ulong 0
+for i ulong sub b a
+c = get fxo add a i
+if or lt c 48 gt c 57
+ret ulong 9999
+end
+v = add mul v 10 sub ulong c 48
+end
+ret v
+end
+note ---- refs: corefs kd (1 patch, 2 issue) fills gcfo/gcfi and the distinct ids gcui
+fn corefs kd ulong to bool
+put gcfn 0 0
+put gcun 0 0
+fkgit
+fka tcfer
+fka tcsort
+fka tcfmtr
+if eq kd 1
+fka tcpatref
+else
+fka tcissref
+end
+x = fexec 10000000000
+if ne x 0
+ret false
+end
+n = get fxol 0
+p = ulong 0
+while lt p n bound 16777216
+q = coeol p n
+corefln p q
+p = add q 1
+end
+ret true
+end
+fn corefln a ulong b ulong to void
+if ne sub b a 81
+ret
+end
+if ne get fxo add a 40 32
+ret
+end
+if eq cohexr a 40 false
+ret
+end
+if eq cohexr add a 41 40 false
+ret
+end
+i = get gcfn 0
+if ge i 1024
+ret
+end
+for k ulong 40
+put gcfo add mul i 40 k get fxo add a k
+put gcfi add mul i 40 k get fxo add a add 41 k
+end
+put gcfn 0 add i 1
+if eq coseen i false
+u = get gcun 0
+put gcui u i
+put gcun 0 add u 1
+end
+end
+note coseen: ref i carries an id already listed in gcui
+fn coseen i ulong to bool
+for j ulong get gcun 0
+if cofieq get gcui j i
+ret true
+end
+end
+ret false
+end
+fn cofieq x ulong y ulong to bool
+for k ulong 40
+if ne get gcfi add mul x 40 k get gcfi add mul y 40 k
+ret false
+end
+end
+ret true
+end
+note coresolve: the distinct id that starts with gcrq[0,gcrql) (4..40 hex), into gcid; false when none or ambiguous
+fn coresolve to bool
+m = ulong 0
+w = ulong 0
+for j ulong get gcun 0
+if corqpre get gcui j
+m = add m 1
+w = get gcui j
+end
+end
+if ne m 1
+ret false
+end
+for k ulong 40
+put gcid k get gcfi add mul w 40 k
+end
+ret true
+end
+fn corqpre i ulong to bool
+n = get gcrql 0
+if or lt n 4 gt n 40
+ret false
+end
+for k ulong n
+if ne get gcfi add mul i 40 k get gcrq k
+ret false
+end
+end
+ret true
+end
+note coidref: copy the id of ref i into gcid
+fn coidref i ulong to void
+for k ulong 40
+put gcid k get gcfi add mul i 40 k
+end
+end
+note ---- argv pieces
+fn cokid ng bool to void
+fkopen
+if ng
+fkc 94
+end
+for k ulong 40
+fkc get gcid k
+end
+end
+fn cokch ci ulong to void
+fkopen
+for k ulong 40
+fkc get gcch add mul ci 40 k
+end
+end
+fn cokpos to void
+for j ulong get gcfn 0
+if cotipis j
+fkopen
+for k ulong 40
+fkc get gcfo add mul j 40 k
+end
+end
+end
+end
+fn cotipis j ulong to bool
+for k ulong 40
+if ne get gcfi add mul j 40 k get gcid k
+ret false
+end
+end
+ret true
+end
+note ---- change list from `git log --format=%H %at %ae`
+fn colog to void
+n = get fxol 0
+p = ulong 0
+while lt p n bound 16777216
+q = coeol p n
+coline p q
+p = add q 1
+end
+end
+fn coline a ulong b ulong to void
+if lt sub b a 44
+ret
+end
+if ne get fxo add a 40 32
+ret
+end
+if eq cohexr a 40 false
+ret
+end
+ci = get gccn 0
+if ge ci 512
+ret
+end
+for k ulong 40
+put gcch add mul ci 40 k get fxo add a k
+end
+sp = cofindb add a 41 b 32
+put gccts ci codec add a 41 sp
+coauset ci add sp 1 b
+put gccn 0 add ci 1
+end
+fn coauat a ulong b ulong to ulong
+s = a
+k = a
+while lt k b bound 16777216
+if eq get fxo k 64
+s = add k 1
+end
+k = add k 1
+end
+ret s
+end
+fn coauset ci ulong a ulong b ulong to void
+s = coauat a b
+m = ulong 0
+if gt b s
+m = sub b s
+end
+if gt m 64
+m = ulong 64
+end
+o = mul ci 64
+for i ulong m
+put gccau add o i get fxo add s i
+end
+put gccal ci m
+end
+note cochid: change ci is the requested COB id
+fn cochid ci ulong to bool
+for k ulong 40
+if ne get gcch add mul ci 40 k get gcid k
+ret false
+end
+end
+ret true
+end
+note ---- load and replay
+fn coreset to void
+put gccn 0 0
+put gcpl 0 0
+put gcrn 0 0
+put gcmn 0 0
+put gcwn 0 0
+put gcqn 0 0
+put gcxn 0 0
+for i ulong 16
+put gcm i 0
+end
+end
+note coload kd: load the COB gcid (kind 1 patch, 2 issue; corefs kd must have run); false when absent
+fn coload kd ulong to bool
+coreset
+put gcm 9 kd
+fkgit
+fka tclog
+fka tcnowalk
+fka tcfmtl
+cokid false
+x = fexec 10000000000
+if ne x 0
+ret false
+end
+colog
+if ne get gccn 0 1
+ret false
+end
+if eq cochid 0 false
+ret false
+end
+fkgit
+fka tclog
+fka tcanc
+fka tctopo
+fka tcrevers
+fka tcfmtl
+cokpos
+cokid true
+x = fexec 10000000000
+if ne x 0
+ret false
+end
+colog
+coreplay
+for r ulong get gcrn 0
+covlook r
+end
+ret true
+end
+fn coreplay to void
+n = get gccn 0
+s = ulong 0
+while lt s n bound 64
+e = add s 32
+if gt e n
+e = n
+end
+cogrep s e
+s = e
+end
+end
+fn cogrep s ulong e ulong to void
+fkgit
+fka tcgrep
+fka tcopta
+fka tcoptz
+fka tcnocol
+fka tcnoln
+fka tcopte
+fka tccaret
+for i ulong sub e s
+cokch add s i
+end
+fka tcdd
+x = fexec 10000000000
+if ne x 0
+ret
+end
+coidx s e
+for i ulong sub e s
+coapch add s i
+end
+end
+fn coidx s ulong e ulong to void
+put gcxn 0 0
+n = get fxol 0
+p = ulong 0
+while lt p n bound 16777216
+q = coeol p n
+coxln p q s e
+p = add q 1
+end
+end
+fn coxln a ulong b ulong s ulong e ulong to void
+z = cofindb a b 0
+if ge z b
+ret
+end
+if lt sub z a 42
+ret
+end
+if ne get fxo add a 40 58
+ret
+end
+ci = cochin a s e
+if ge ci e
+ret
+end
+k = conum add a 41 z
+if gt k 4095
+ret
+end
+j = get gcxn 0
+if ge j 4096
+ret
+end
+put gcxa j add z 1
+put gcxb j b
+put gcxc j ci
+put gcxk j k
+put gcxn 0 add j 1
+end
+note cochin: the change in [s,e) whose id is fxo[a,a+40), else e
+fn cochin a ulong s ulong e ulong to ulong
+for i ulong sub e s
+if cochat add s i a
+ret add s i
+end
+end
+ret e
+end
+fn cochat ci ulong a ulong to bool
+for k ulong 40
+if ne get gcch add mul ci 40 k get fxo add a k
+ret false
+end
+end
+ret true
+end
+note coapch: apply the action blobs 0, 1, 2, ... of change ci in order
+fn coapch ci ulong to void
+for k ulong 4096
+j = cofindx ci k
+if ge j 4096
+ret
+end
+coap ci get gcxa j get gcxb j
+end
+end
+fn cofindx ci ulong k ulong to ulong
+for j ulong get gcxn 0
+if and eq get gcxc j ci eq get gcxk j k
+ret j
+end
+end
+ret ulong 4096
+end
+fn coap ci ulong a ulong e ulong to void
+t = cokey a e tcty
+if ge t e
+ret
+end
+if eq get gcm 9 1
+copatap ci a e t
+ret
+end
+coissap ci a e t
+end
+fn coskip to void
+put gcm 10 add get gcm 10 1
+end
+fn copatap ci ulong a ulong e ulong t ulong to void
+if coseq t e tcrevis
+coarev ci a e
+ret
+end
+if coseq t e tcedit
+coatitle a e
+ret
+end
+if coseq t e tclife
+coalife a e
+ret
+end
+if coseq t e tcmerge
+coamerge ci a e
+ret
+end
+if coseq t e tcreview
+coareview ci a e
+ret
+end
+if coseq t e tcrcom
+coarcom ci a e
+ret
+end
+copatap2 ci a e t
+end
+fn copatap2 ci ulong a ulong e ulong t ulong to void
+if coseq t e tcredit
+coaredit a e
+ret
+end
+if coseq t e tcrred
+coarred a e
+ret
+end
+if coseq t e tclabel
+coalabel a e
+ret
+end
+if coseq t e tcassign
+coassign a e
+ret
+end
+coskip
+end
+fn coissap ci ulong a ulong e ulong t ulong to void
+if coseq t e tccomm
+coacom ci a e 9999
+ret
+end
+if coseq t e tcedit
+coatitle a e
+ret
+end
+if coseq t e tclife
+coalife a e
+ret
+end
+if coseq t e tccedit
+coacedit a e
+ret
+end
+if coseq t e tccred
+coacred a e
+ret
+end
+if coseq t e tclabel
+coalabel a e
+ret
+end
+if coseq t e tcassign
+coassign a e
+ret
+end
+coskip
+end
+note ---- actions
+fn coarev ci ulong a ulong e ulong to void
+r = get gcrn 0
+if ge r 64
+ret
+end
+p = cokey a e tcoid
+b = cokey a e tcbase
+if eq cohexat p e false
+coskip
+ret
+end
+if eq cohexat b e false
+coskip
+ret
+end
+corevcp mul r 40 add p 1 add b 1 mul ci 40
+put gcrt r ci
+put gcrx r 0
+put gcrvl r 0
+codescset r a e
+put gcrn 0 add r 1
+end
+note corevcp: copy head, base and change id of a new revision (o = r*40, p/b at the hex, c = ci*40)
+fn corevcp o ulong p ulong b ulong c ulong to void
+for k ulong 40
+put gcro add o k get fxo add p k
+put gcrb add o k get fxo add b k
+put gcrv add o k get gcch add c k
+end
+end
+fn codescset r ulong a ulong e ulong to void
+d = cokey a e tcdesc
+s = get gcpl 0
+l = cospool d e
+put gcrd mul r 2 s
+put gcrd add mul r 2 1 l
+end
+fn coatitle a ulong e ulong to void
+p = cokey a e tctitle
+if ge p e
+ret
+end
+s = get gcpl 0
+l = cospool p e
+put gcm 0 s
+put gcm 1 l
+end
+fn coalife a ulong e ulong to void
+st = cokey a e tcstate
+if ge st e
+ret
+end
+q = cokey st e tcstatus
+if coseq q e tcdraft
+put gcm 2 1
+ret
+end
+if or coseq q e tcarch coseq q e tcclosed
+put gcm 2 2
+r = cokey st e tcreason
+s = get gcpl 0
+l = cospool r e
+put gcm 7 s
+put gcm 8 l
+ret
+end
+put gcm 2 0
+end
+note corevix: the revision whose id is the string at p, 9999 when unknown
+fn corevix p ulong e ulong to ulong
+if eq cohexat p e false
+ret ulong 9999
+end
+for r ulong get gcrn 0
+if corevat r add p 1
+ret r
+end
+end
+ret ulong 9999
+end
+fn corevat r ulong a ulong to bool
+for k ulong 40
+if ne get gcrv add mul r 40 k get fxo add a k
+ret false
+end
+end
+ret true
+end
+fn coamerge ci ulong a ulong e ulong to void
+m = get gcmn 0
+if ge m 16
+ret
+end
+ri = corevix cokey a e tcrevis e
+c = cokey a e tccommit
+if or gt ri 63 eq cohexat c e false
+coskip
+ret
+end
+for k ulong 40
+put gcmc add mul m 40 k get fxo add c add k 1
+end
+put gcmr m ri
+put gcmt m ci
+put gcmn 0 add m 1
+end
+fn coareview ci ulong a ulong e ulong to void
+w = get gcwn 0
+if ge w 64
+ret
+end
+put gcwr w corevix cokey a e tcrevis e
+v = cokey a e tcverd
+put gcwv w 0
+if coseq v e tcaccept
+put gcwv w 1
+end
+if coseq v e tcreject
+put gcwv w 2
+end
+p = cokey a e tcsumm
+s = get gcpl 0
+l = cospool p e
+put gcws mul w 2 s
+put gcws add mul w 2 1 l
+put gcwt w ci
+put gcwn 0 add w 1
+end
+fn coarcom ci ulong a ulong e ulong to void
+coacom ci a e corevix cokey a e tcrevis e
+end
+fn coacom ci ulong a ulong e ulong ri ulong to void
+q = get gcqn 0
+if ge q 512
+ret
+end
+p = cokey a e tcbody
+s = get gcpl 0
+l = cospool p e
+put gcqr q ri
+put gcqs mul q 2 s
+put gcqs add mul q 2 1 l
+put gcqt q ci
+put gcqx q 0
+put gcqn 0 add q 1
+end
+fn coaredit a ulong e ulong to void
+ri = corevix cokey a e tcrevis e
+if gt ri 63
+coskip
+ret
+end
+codescset ri a e
+end
+fn coarred a ulong e ulong to void
+ri = corevix cokey a e tcrevis e
+if lt ri 64
+put gcrx ri 1
+end
+end
+fn coalabel a ulong e ulong to void
+p = cokey a e tclabels
+s = get gcpl 0
+l = coslist p e
+put gcm 3 s
+put gcm 4 l
+end
+fn coassign a ulong e ulong to void
+p = cokey a e tcassn
+s = get gcpl 0
+l = coslist p e
+put gcm 5 s
+put gcm 6 l
+end
+note cocomix: the comment created by the change whose id is the string at p, 9999 when unknown
+fn cocomix p ulong e ulong to ulong
+if eq cohexat p e false
+ret ulong 9999
+end
+for q ulong get gcqn 0
+if cochat get gcqt q add p 1
+ret q
+end
+end
+ret ulong 9999
+end
+fn coacedit a ulong e ulong to void
+q = cocomix cokey a e tcid e
+if gt q 511
+coskip
+ret
+end
+p = cokey a e tcbody
+s = get gcpl 0
+l = cospool p e
+put gcqs mul q 2 s
+put gcqs add mul q 2 1 l
+end
+fn coacred a ulong e ulong to void
+q = cocomix cokey a e tcid e
+if lt q 512
+put gcqx q 1
+end
+end
+note costate: 0 open 1 draft 2 closed (archived) 3 merged
+fn costate to ulong
+if gt get gcmn 0 0
+ret ulong 3
+end
+ret get gcm 2
+end
+note ---- linked verdicts: ~/handoffs/hive/manager/reviews/<repo>-<head sha8>.verdict.txt, first line
+fn covpc c uchar to void
+n = get gcvpl 0
+if lt n 511
+put gcvp n c
+put gcvpl 0 add n 1
+end
+end
+fn covpt t view uchar * to void
+for i ulong len t
+covpc get t i
+end
+end
+note corepok: the repo name is a plain file-name word ([A-Za-z0-9._-], not starting with a dot)
+fn corepok to bool
+n = get frepol 0
+if or eq n 0 gt n 100
+ret false
+end
+if eq get frepo 0 46
+ret false
+end
+for i ulong n
+if eq coname get frepo i false
+ret false
+end
+end
+ret true
+end
+fn coname c uchar to bool
+if or and ge c 48 le c 57 and ge c 97 le c 122
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+ret or or eq c 46 eq c 45 eq c 95
+end
+fn covlook r ulong to void
+put gcrvl r 0
+if eq corepok false
+ret
+end
+put gcvpl 0 0
+covpt tcrevd
+for i ulong get frepol 0
+covpc get frepo i
+end
+covpc 45
+for k ulong 8
+covpc get gcro add mul r 40 k
+end
+covpt tcvsuf
+fd = fopen gcvp 0 get gcvpl 0 557056 0
+if lt fd 0
+ret
+end
+nr = read int fd gcvb 0 512
+x = fclose int fd
+if le nr 0
+ret
+end
+covcopy r ulong nr
+end
+fn covcopy r ulong n ulong to void
+m = ulong 0
+for i ulong n
+c = get gcvb i
+if or eq c 10 eq c 13
+break
+end
+if lt m 256
+put gcrvd add mul r 256 m c
+m = add m 1
+end
+end
+put gcrvl r m
+end
