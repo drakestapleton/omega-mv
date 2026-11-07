@@ -1,0 +1,357 @@
+note SPDX-License-Identifier: Apache-2.0
+note hive-task: the pure transition rules of the hive forge task authority (issue #925, DRA-288).
+note This file is the source of truth. crates/spark-hive/src/store.rs is the named host adapter:
+note each mutation is one conditional UPDATE whose WHERE clause states these rules. drive.om in
+note this directory checks the hand cases, then drives the real spark-cockpit-rs binary over HTTP
+note and compares every transition of the table with this program, and shows mutants are caught.
+note
+note Input on stdin, ASCII decimal numbers separated by spaces, tabs or newlines, ten per case:
+note   op st gen rgen amatch art verdict now exp ttl
+note op: 1 claim, 2 renew (heartbeat), 3 submit, 4 verify, 5 reap (expired lease back to open),
+note   6 classify a database failure (st holds the SQLite primary result code).
+note st: current state, 0 open, 1 claimed, 2 submitted, 3 verified, 4 failed; any other value is an
+note   unknown state and every operation refuses it.
+note gen: current generation (attempt number); rgen: generation named by the request.
+note amatch: 1 when the request names the current attempt token and holder, else 0.
+note art: 1 when verify names the exact artifact recorded at submit, else 0.
+note verdict: verify outcome, 1 pass, 0 fail.
+note now, exp: milliseconds since 1970; the lease is live while now < exp.
+note ttl: requested lease length in seconds (claim and renew).
+note Output: one line per case, "dec next_state next_gen".
+note dec: 0 allow, 2 bad state, 3 held by a live lease, 4 stale attempt, 5 lease expired,
+note   6 generation exhausted, 7 artifact or generation mismatch, 8 ttl out of range,
+note   9 database busy or locked: nothing changed and the request may be retried,
+note   10 any other database failure: not retryable.
+note   (1 is task not found, decided by the adapter when no row exists.)
+note On a refusal next_state = st and next_gen = gen. Only an allowed claim changes the generation,
+note to gen + 1, and a claim is refused once gen reaches GMAX, so generations never wrap.
+note Exit: 0 ok, 2 read error, 3 input over 16 MiB, 5 bad or missing number, 6 field out of range,
+note 9 write error.
+const OPEN ulong 0
+const CLAIMED ulong 1
+const SUBMTD ulong 2
+const VERIFD ulong 3
+const FAILED ulong 4
+const OCLAIM ulong 1
+const ORENEW ulong 2
+const OSUBMIT ulong 3
+const OVERIFY ulong 4
+const OREAP ulong 5
+const ODBERR ulong 6
+const ALLOW ulong 0
+const BADSTATE ulong 2
+const HELD ulong 3
+const STALE ulong 4
+const EXPIRED ulong 5
+const EXHAUST ulong 6
+const MISMATCH ulong 7
+const BADTTL ulong 8
+const RETRY ulong 9
+const DBFAIL ulong 10
+note SQLite primary result codes SQLITE_BUSY and SQLITE_LOCKED.
+const SQBUSY ulong 5
+const SQLOCK ulong 6
+note GMAX = 2^53 - 1, the largest generation a JSON client reads exactly.
+const GMAX ulong 9007199254740991
+const MAXTTL ulong 86400
+global inb uchar 16777216
+note hd: 0 parse position, 1 input length.
+global hd ulong 2
+note cs: the current case, fields in input order.
+global cs ulong 10
+global ob uchar 65536
+global ow ulong 1
+
+note live: the lease is unexpired at now.
+fn live now ulong exp ulong to bool
+ret lt now exp
+end
+
+note ttlok: a lease length the authority grants, 1 second to 1 day.
+fn ttlok ttl ulong to bool
+ret and ge ttl 1 le ttl MAXTTL
+end
+
+note fenced: the request names the current attempt, by generation and attempt token.
+fn fenced gen ulong rgen ulong am ulong to bool
+ret and eq rgen gen eq am 1
+end
+
+note dclaim: claim from open or failed, or take over a claimed task whose lease has expired.
+fn dclaim st ulong gen ulong now ulong exp ulong ttl ulong to ulong
+if not ttlok ttl
+ret BADTTL
+end
+el = or eq st OPEN eq st FAILED
+if eq st CLAIMED
+if live now exp
+ret HELD
+end
+el = true
+end
+if not el
+ret BADSTATE
+end
+if ge gen GMAX
+ret EXHAUST
+end
+ret ALLOW
+end
+
+note dlease: renew and submit act only for the current attempt of a claimed task, before expiry.
+fn dlease st ulong fen bool now ulong exp ulong to ulong
+if ne st CLAIMED
+ret BADSTATE
+end
+if not fen
+ret STALE
+end
+if not live now exp
+ret EXPIRED
+end
+ret ALLOW
+end
+
+note drenew: dlease plus a lease length in range.
+fn drenew st ulong fen bool now ulong exp ulong ttl ulong to ulong
+if not ttlok ttl
+ret BADTTL
+end
+ret dlease st fen now exp
+end
+
+note dverify: verify only a submitted task, naming its generation and exact artifact.
+fn dverify st ulong gen ulong rgen ulong art ulong to ulong
+if ne st SUBMTD
+ret BADSTATE
+end
+if or ne rgen gen ne art 1
+ret MISMATCH
+end
+ret ALLOW
+end
+
+note dreap: only a claimed task whose lease has expired goes back to open.
+fn dreap st ulong now ulong exp ulong to ulong
+if ne st CLAIMED
+ret BADSTATE
+end
+if live now exp
+ret HELD
+end
+ret ALLOW
+end
+
+fn nextst op ulong st ulong vd ulong dec ulong to ulong
+if ne dec ALLOW
+ret st
+end
+if or eq op OCLAIM eq op ORENEW
+ret CLAIMED
+end
+if eq op OSUBMIT
+ret SUBMTD
+end
+if eq op OVERIFY
+if eq vd 1
+ret VERIFD
+end
+ret FAILED
+end
+ret OPEN
+end
+
+fn nextgen op ulong gen ulong dec ulong to ulong
+if and eq dec ALLOW eq op OCLAIM
+ret add gen 1
+end
+ret gen
+end
+
+note ddberr: SQLite busy or locked means the statement changed nothing and may be retried.
+fn ddberr code ulong to ulong
+if or eq code SQBUSY eq code SQLOCK
+ret RETRY
+end
+ret DBFAIL
+end
+
+note decide: the decision for the case in cs (op already checked to be 1..6).
+fn decide to ulong
+op = get cs 0
+st = get cs 1
+gen = get cs 2
+now = get cs 7
+exp = get cs 8
+if eq op OCLAIM
+ret dclaim st gen now exp get cs 9
+end
+if eq op OREAP
+ret dreap st now exp
+end
+if eq op ODBERR
+ret ddberr st
+end
+if eq op OVERIFY
+ret dverify st gen get cs 3 get cs 5
+end
+fen = fenced gen get cs 3 get cs 4
+if eq op ORENEW
+ret drenew st fen now exp get cs 9
+end
+ret dlease st fen now exp
+end
+
+note valid: fields in range; st and the times may hold any value.
+fn valid to bool
+op = get cs 0
+ok = and ge op OCLAIM le op ODBERR
+ok = and ok and le get cs 2 GMAX le get cs 3 GMAX
+ok = and ok and le get cs 4 1 le get cs 5 1
+ret and ok le get cs 6 1
+end
+
+note slurp: read all of stdin into inb. Each inner pass adds at least one byte or ends, so
+note 64 outer passes of 999999 cover the 16777216-byte buffer.
+fn slurp to int
+n = ulong 0
+for r ulong 64
+while lt n len inb bound 999999
+k = read 0 inb n sub len inb n
+if lt k 0
+ret 2
+end
+if eq k 0
+put hd 1 n
+ret 0
+end
+n = add n ulong k
+end
+end
+ret 3
+end
+
+fn isws c uchar to bool
+ret or or eq c 32 eq c 10 or eq c 9 eq c 13
+end
+
+note skip: advance the parse position past white space; return the new position. 17 passes of
+note 999999 bytes cover the 16777216-byte buffer.
+fn skip to ulong
+p = get hd 0
+n = get hd 1
+for r ulong 17
+k = ulong 0
+while and lt p n lt k 999999 bound 999999
+if not isws get inb p
+put hd 0 p
+ret p
+end
+p = add p 1
+k = add k 1
+end
+end
+put hd 0 p
+ret p
+end
+
+note num: next decimal number of at most 19 digits (below 2^64, so no wrap); exit 5 otherwise.
+fn num to ulong
+p = skip
+n = get hd 1
+v = ulong 0
+d = ulong 0
+while lt p n bound 20
+c = get inb p
+if or lt c 48 gt c 57
+break
+end
+if eq d 19
+exit 5
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+d = add d 1
+end
+if eq d 0
+exit 5
+end
+if lt p n
+if not isws get inb p
+exit 5
+end
+end
+put hd 0 p
+ret v
+end
+
+fn flush to int
+o = ulong 0
+w = get ow 0
+while lt o w bound 65537
+k = write 1 ob o sub w o
+if le k 0
+ret 9
+end
+o = add o ulong k
+end
+put ow 0 0
+ret 0
+end
+
+fn badd c uchar to void
+w = get ow 0
+if ge w len ob
+exit 9
+end
+put ob w c
+put ow 0 add w 1
+end
+
+fn putd v ulong to void
+p = ulong 1
+while le p div v 10 bound 20
+p = mul p 10
+end
+while ne p 0 bound 21
+badd uchar add div v p 48
+v = rem v p
+p = div p 10
+end
+end
+
+fn main to int
+r = slurp
+if ne r 0
+ret r
+end
+note every case takes at least 20 bytes, so a 16 MiB input holds fewer than 838861 cases.
+more = true
+while more bound 999999
+p = skip
+if ge p get hd 1
+more = false
+else
+for i ulong 10
+put cs i num
+end
+if not valid
+ret 6
+end
+dc = decide
+putd dc
+badd uchar 32
+putd nextst get cs 0 get cs 1 get cs 6 dc
+badd uchar 32
+putd nextgen get cs 0 get cs 2 dc
+badd uchar 10
+if gt get ow 0 65000
+r = flush
+if ne r 0
+ret r
+end
+end
+end
+end
+ret flush
+end
