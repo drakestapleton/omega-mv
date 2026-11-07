@@ -99,10 +99,10 @@ ngrun and compares exit status and stdout (stderr is free: the kernels time them
 `refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
 `seed/ng/tests/ir`, two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
-`cases/`. ngrun interprets (90-470x native) and has no step cap yet, so ten kernels run as reduced
-copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md`; each under 25 ms native); matmul,
-chacha and x25519 run verbatim; the verbatim kernels (`kernels/`, `kernels/PROVENANCE.md`) stay for the
-a64-vs-omc comparison.
+`cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
+copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
+queen) and matmul verbatim. The full-size kernels stay verbatim in `kernels/` (`kernels/PROVENANCE.md`):
+full size is covered natively by ng-a64's rgate front phase (the a64 ELF against omc, exit and stdout).
 Every child the gate starts is killed after 600 s: that case prints `NOT_RUN` and counts in `notrun=`, never
 as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `for` latch adds 2;
 `and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped) must fail a run case,

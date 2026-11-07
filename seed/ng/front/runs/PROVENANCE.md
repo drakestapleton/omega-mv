@@ -19,6 +19,8 @@ all under 25.
 | sort-s.om | sort.om | 5000 numbers (was 40000; 39999 -> 4999); first note line added |
 | linear-s.om | linear.om | 2 passes (was 40) |
 | sha-s.om | sha.om | 1 update of the 1 MiB buffer (was 64); first note line added |
+| chacha-s.om | chacha.om | 1 pass over the 1 MiB buffer (was 64); first note line added |
+| x25519-s.om | x25519.om | 20 chained base-point multiplications (was 2000); first note line added |
 
 Written for gate-front-ir (not copies): `p-part.om` (unsized `view`/`edit` parameters, `part` into them, `len` of
 a slice; its last `part` is one element too long and traps 3, exit 103) and `p-partok.om` (the same with that
@@ -37,6 +39,8 @@ sha256 (sha256sum):
 eec1b9f555507fbb276cefb3ac0d447e8a9bbb65ca5224e75af044f066231623  sieve-s.om
 9d3e32bec4292de304a1d9bd79876bb5f9cf7c3886e57d19424e80a9fbea3a7b  sort-s.om
 42a63cefe625a0fd30e7a1360f01ca6e5fd4bfc3e92f6079851c2db154556062  sha-s.om
+f8e05a153dfa18bb824751a41437af58fa37092f59f3f026eaff9daa5047f020  chacha-s.om
+acb875cb7c77d7f12e728727071b18c7ca2b9a01989735c9e2cd5a054a5fd2be  x25519-s.om
 5c19c71da2d76d8e10cc29cae8694b508ba5c026572d7ecf5cdfdc574e1e10b8  p-part.om
 75a757d55c8548ab2c75cc7f44b78124783b6c87e06d24751fccdf6f43a4cc9d  p-partok.om
 ```
