@@ -87,6 +87,29 @@ scripts_verdict() {
   [ "$script_fail" = 0 ]
 }
 
+# The seeded Omega compiler native/disk pins (omega-mv 397e6704, sha256 bcfa5828...). AIEN_OMC
+# wins when it has the pinned hash; otherwise the committed compiler at the pin is taken from
+# the sibling checkout ../omega-mv (as crumb-verify takes its tool from ../aien-architecture).
+# Neither available: exit 3, never a pass.
+OMC_PIN_COMMIT=397e67040fb74853c6814097fe02ae4e1ebd6f66
+OMC_PIN_SHA256=bcfa582892afca8f65e551fe56867d918d86e84540c7381be8fa9ef18d0cf0f6
+pinned_omc() {
+  local h=""
+  if [ -n "${AIEN_OMC:-}" ] && [ -r "$AIEN_OMC" ]; then h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1); fi
+  if [ "$h" != "$OMC_PIN_SHA256" ]; then
+    if [ -d ../omega-mv ] && git -C ../omega-mv show "$OMC_PIN_COMMIT:seed/out/omc" > "$TMP/omc" 2>/dev/null; then
+      chmod +x "$TMP/omc"; export AIEN_OMC="$TMP/omc"
+      h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1)
+    fi
+  fi
+  if [ "$h" != "$OMC_PIN_SHA256" ]; then
+    echo "run.sh: no omc with sha256 $OMC_PIN_SHA256 (set AIEN_OMC, or check out aien-dev/omega-mv beside this tree)" >&2
+    obs omc_pinned false
+    exit 3
+  fi
+  obs omc_pinned true
+}
+
 case "$step" in
   # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07): Crumbs are off the active
   # workflow, so no gate checks crumb freshness. The .crumb files and crumb.lock stay as history.
@@ -180,6 +203,23 @@ case "$step" in
     bash scripts/qemu_ck_b7b_probe_test.sh --self-test
     bash scripts/qemu_ck_b7b_probe_test.sh
     bash scripts/qemu_ck_b7b_probe_test.sh --positive
+    # #469 SMMU stream-ownership fault check: real out-of-window NVMe DMA must raise an event
+    # with the decoded SID/address, the canary page stays intact, the recovery read succeeds.
+    bash scripts/qemu_ck_b7b_probe_test.sh --events
+    ;;
+  # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register and
+  # two planted-bad copies. Needs the seeded compiler pinned by native/disk (omc bcfa5828).
+  hw-gates)
+    pinned_omc
+    sh tools/hwgates/gate.sh
+    ;;
+  # Bounded read-only NVMe protocol in seeded Omega (#472): 37 host cases, 7 guard mutants,
+  # 10 disposable-QEMU cases. Physical NVMe stays NOT_RUN.
+  omega-nvme)
+    pinned_omc
+    must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
+      -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
+    scripts_verdict
     ;;
   # native-suites.yml matrix
   native-net)        native_suite net "test sanitize mutants" 'AIENOS_NET_SECURE_TESTS: PASS|NET_SANITIZE: PASS|NET_SECURE_MUTANTS: [0-9]+/[0-9]+ killed' ;;
