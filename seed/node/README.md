@@ -420,11 +420,13 @@ scheduler, which sees every job as one worker and no resource.
 
 A request is one ulong of four 16-bit counts: kind 0 CPU slots, 1 memory MiB,
 2 inference slots, 3 caller-defined. Capacities default to 65535 of each, so
-callers that declare nothing (`sched_admit`) are never refused or held back
-for resources. A job takes its whole need when it is assigned and gives it
-back when its worker reports done (even while its result waits for review
-room) or is reaped. Every job also needs one idle live worker. A capacity is
-never set below the current use or below one admitted job's need.
+callers that declare nothing (`sched_admit`) always pass their own fit check
+and are never refused for resources; under policy 0 they can still wait
+behind a resource-blocked head. A job takes its whole need when it is
+assigned and gives it back when its worker reports done (even while its
+result waits for review room) or is reaped. Every job also needs one idle
+live worker. A capacity is never set below the current use or below one
+admitted job's need.
 
 One behaviour changes for every caller: DRA-287 assigned ready jobs in slot
 order, which is an accident of which slot was free; selection now follows a
