@@ -169,7 +169,7 @@ outside declared effect functions). The fixes add these codes:
 `dispatch-fault-gate.om` is `action.om`, `store.om`, then `dispatch.om` with the lines
 `err = actlost r`, `err = actrecon r s` and `err = writerec r` calling `factlost`, `factrecon` and
 `fwriterec`, then `dispatch-fault-test.om`, which replaces `lock.om` with a counting double.
-`seed/profile/check.sh` regenerates it with `sed`, compares, runs it, and runs the same injection over
+`seed/profile/check.om` regenerates it with the same line replacements, compares, runs it, and runs the same injection over
 the frozen pre-fix `seed/profile/cases/dispatch-943d955.om`. The pre-fix module fails cases 2, 3, 4, 5, 7
 and 8 (79, 77, 78, 79, 77, 78). Cases 0, 1, 6 and 9 (0, 60, 76, 77 normal path) are regressions that the
 old code also passed. This is fault injection at the call results, not a qualification of real disk or
