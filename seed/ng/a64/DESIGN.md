@@ -23,7 +23,9 @@ tables and leaves semantic rules to ngcheck).
 Observable behaviour must equal seed omc on the same source (D5): exit status and trap code. Instruction bytes,
 register choice and frame layout are free.
 
-The save form stays a switch (`a_sform`) until ng-bench's clean v2 A725 round decides the default (D8 amended).
+D13 (clean v2 rounds): the default is form A (`@ng a64`, STP/LDP pairs); form B stays behind the `a_sform` switch
+(`@ng a64 split`). Every function entry is aligned to 64 bytes: on A725 placement explained A's loss (D/A 0.816 on
+fib38), so any future codegen A/B reports an aligned control.
 
 ## 2. Pipeline (per function, `a6_func`)
 
@@ -70,6 +72,7 @@ The save form stays a switch (`a_sform`) until ng-bench's clean v2 A725 round de
 10. **ELF** (`a6_elf`): omc's map: 176-byte header, two PT_LOAD (text R+X at 0x400000 from file offset 0; RW
     0x10000000, memsz 8 MiB), entry 0x4000b0: `MOVZ X28, #0x1000, LSL 16; MOVZ X16, #0x1080, LSL 16; MOV SP, X16;
     BL main; MOVZ X8, #93; SVC #0`. Program entry (D11): the single export with no parameters and result i32.
+    Each function starts on a 64-byte boundary (`a6_al64`: NOP padding after the previous function's trap stubs).
 
 ## 3. Registers
 
@@ -110,9 +113,10 @@ BLR, SVC, ADR and the FP set.
   objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases.
 - `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck and ng. For every fixture (fib, deep, press, rot,
   ck, ar) ngcheck must accept the ΩIR, and `@ng a64`, `@ng a64 split` and the omc build of `tests/ref/N.om` must
-  all exit with the expected status (computed with Wolfram, or the check's trap code). Six allocator mutants
-  (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves, frame size) must
-  each change at least one fixture's status.
+  all exit with the expected status (computed with Wolfram, or the check's trap code), and every BL target in the
+  `@ng a64` ELF must be a multiple of 64. Seven mutants (spill reload slot, call clobber, live-out range,
+  parallel-move ordering, callee-saved saves, frame size, 16-byte entry alignment) must each change at least one
+  fixture's status or alignment.
 
 ## 7. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
 
