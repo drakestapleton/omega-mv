@@ -956,15 +956,27 @@ hold after the restart. The key of a class 3 effect must be created by the
 effect itself, atomically and last. Scheduling state not restored: reservation
 tickets (a recovered reservation starts a new ticket), policy 0's ready order
 (`sjrdy`: recovered ready jobs are stamped in admission order) and proposals
-(they are stale after a restart by the incarnation). Dependency readiness is
-restored: a publication that makes waiting jobs ready leaves a readiness
-record, and a job it made ready is ready again after recovery. Replay is exact
-at quiescent points (no job running); a crash inside a dispatch event
+(they are stale after a restart by the incarnation). The incarnation is the
+fence itself: a fence past 2^24 - 1 fails recovery (31) instead of reusing
+an earlier incarnation. Dependency readiness is restored: a publication
+that makes waiting jobs ready leaves a readiness record, and a job it made
+ready is ready again after recovery.
+
+Replay is exact at drained points: after `jn_drain`, which runs first in
+every journal append and in every `auth_step`. Decisions and readiness wait
+in the volatile ring until then. A dispatch decision is drained before the
+START of any job it assigned, so no job runs on an undrained decision. A
+publication's readiness is not durable when `sched_publish` returns: a crash
+before the next drain loses it, and the published artifact with it (the pool
+is not journaled either), so recovery is as if the publication had not
+happened: a job waiting on it waits until it is published again. A crash inside a dispatch event
 recovers that event's cursor, reservation and the bypass counts of the jobs
 it did not assign, and the jobs it assigned are admitted again with bypass
 count 0. The dispatch event count is restored to the last journaled
-decision's; events that changed nothing leave no record. The count only
-stamps replay records, so later records still follow the last durable one.
+decision's; events that changed nothing leave no record. The count stamps
+replay records, so later records still follow the last durable one, and it
+ages admission tickets; tickets are not restored, so every ticket after a
+recovery is aged from the restored count.
 
 ### Acceptance and controls
 
@@ -1028,13 +1040,15 @@ the cursor; `jn_drain` writes one FAIR with empty bitmaps for it when the
 cursor or the reservation differs from the last FAIR.
 
 Replay refuses (25) any record that contradicts the tables, and nothing
-changes: an ADMIT into a slot another unreleased job holds; a decision FAIR
-that does not follow the last event (a readiness record may share it); a
-cursor outside the table; a slot both assigned and bypassed; an assigned,
-bypassed or reserved slot that does not hold a live ready job (live: admitted,
-not released, not cancelled; ready: no deps, or made ready by an earlier
-readiness record); a slot made ready that does not hold a live waiting job;
-a reservation on a job the same record assigned. Recovery then readmits each
+changes: an ADMIT into a slot another unreleased job holds; a FAIR that both
+decides (assigns or bypasses) and makes ready, the first FAIR of a journal
+included; a decision FAIR that does not follow the last event (a readiness
+record may share it); a cursor outside the table; a slot both assigned and
+bypassed; an assigned, bypassed or reserved slot that does not hold a live
+ready job (live: admitted, not released, not cancelled; ready: no deps, or
+made ready by an earlier readiness record); a slot made ready that does not
+hold a live waiting job; a reservation on a job the same record assigned.
+Recovery then readmits each
 unfinished job into its recorded slot (never another), makes it ready again
 if a publication had, and restores its bypass count and goal. Any of these
 the scheduler refuses, and a reservation that does not name a ready job,
@@ -1044,15 +1058,18 @@ The gate runs four cases (policy 1 and 2, crash after 3 and after 6 of 10
 dispatch events) and four special checks:
 - R, a reference creator, runs all events on journal a; C runs the first k on journal b and dies; C2 recovers journal b and runs the rest. Before event 1 the creator publishes the topic job 7001 waits on, so 7001 is ready by publication across the crash. C2's state right after recovery equals R's after event k (cursor, reserved job, slots, ids and bypass counts of ready jobs, needs, estimates, uncertainties and topics of every unfinished job, policy words with the ticket lifetime 777, capacities, bypass sum, job 7001's state and bypass count), and C plus C2 make the same decisions as R, event by event. C3 recovers journal b once more and equals R's final state. Each case also proves it tests something: a bypass count, a nonzero cursor and job 7001 ready at the boundary, a reservation during the run, a final cursor different from the boundary's.
 - Mid-event crash: C' dies right after a dispatch and its PAUSE record, before any job runs. C2' has that event's cursor and reservation and the bypass counts of the jobs it did not assign; the jobs it assigned are ready again.
-- Records refused: a FAIR that repeats the last event, a FAIR naming a free slot, an OPEN written under another `SPVER`, an ADMIT into a held slot (23), a FAIR assigning and bypassing one slot (24), a FAIR assigning a waiting job (26), a readiness record for a ready job (27; a valid one at the last event is accepted), a FAIR reserving a cancelled job (25).
+- Records refused: a FAIR that repeats the last event, a FAIR naming a free slot, an OPEN written under another `SPVER`, an ADMIT into a held slot (23), a FAIR assigning and bypassing one slot (24), a FAIR assigning a waiting job (26), a readiness record for a ready job (27; a valid one at the last event is accepted), a FAIR reserving a cancelled job (25), a first FAIR that both assigns and readies (28: refused, nothing changes).
 - Failed journal: revoke, pause, cancel, admission, policy, capacities and goal each return their refusal and change nothing; a full ring stops dispatch (44) and publication (47).
+- Fence range (29): recovery refuses fence 2^24 + 1, which a 24-bit mask would fold onto incarnation 1, and leaves the scheduler unincarnated; fence 2^24 - 1 is then accepted.
+
+`code.om` (omega-node's, BOARD note): the inference cancel hook checks `auth_cancel`'s result before converting it, so a refusing journal leaves the job running and the hook armed (it retries); restart cleanup exits 55. `code-test unit` covers the hook with a refusing journal. `journal-test.om` cases 16 and 17 journal the CANCEL and RELEASE (16) and the RELEASE (17) that their synthetic frees used to skip, which the held-slot refusal now requires.
 
 | Change | Expected exit (derived from the check it trips) |
 | --- | --- |
 | `journal.om`: ADMIT records request 0 | 53: the needs fold differs at the boundary |
 | `journal.om`: POLICY words not restored | 53 |
 | `journal.om`: capacities not restored | 53: `sched_new`'s 65535 per kind, the capacities word differs |
-| `journal.om`: readmission takes the lowest free slot instead of the recorded one | 53: jobs move to lower slots |
+| `journal.om`: readmission takes the lowest free slot instead of the recorded one | 20: the reserved job moves from recorded slot 2 to slot 0; C2's first dispatch assigns slot 0, free in the journal, its FAIR is refused and the PAUSE after it fails (53 derived before review r2) |
 | `journal.om`: FAIR bypass counts not replayed | 53 |
 | `sched.om`: `sched_frestore` leaves the cursor at 0 | 53 |
 | `journal.om`: POLICY restored with ticket lifetime 1000 instead of the recorded 777 | 53: the policy word differs |
@@ -1077,6 +1094,9 @@ dispatch events) and four special checks:
 | `auth.om`: cancel ignores a refused CANCEL | 42 |
 | `sched.om`: dispatch ignores a full ring | 44 |
 | `sched.om`: publication ignores a full ring | 44: the readiness record is written past the ring and traps (103) in the ring child, which the parent reports as 44 |
+| `journal.om`: the shape check below the first-record exception (the r1 code) | 28 |
+| `journal.om`: recovery masks the fence to 24 bits (the r1 code) | 29: 2^24 + 1 becomes incarnation 1 and is accepted |
+| `code.om`: the cancel hook converts `auth_cancel`'s result before checking it (the r1 code) | 105 (`code-test unit`): -5 traps the conversion (CAST) |
 
 ## Local inference and the coding workflow (DRA-290)
 
