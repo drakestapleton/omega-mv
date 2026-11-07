@@ -317,6 +317,11 @@ def cases(port):
           prep=lambda w: os.mkdir(os.path.join(w, "out"))),
         C("run-echo", [sse_calls([("run_command", '{"argv":["/bin/echo","hi","there"]}')]), sse_text("ran")],
           S + ["--allow-cmd", "/bin/echo"], 0, [last_tool_has("hi there\n"), last_tool_has("[exit status 0]")]),
+        # end of file is not exit: a child that closes its output and exits later (as /bin/echo
+        # does, closing stdout before it exits) must be reaped, not killed with its group
+        C("cmd-closes-output-early", [sse_calls([("run_command", '{"argv":["/bin/sh","-c","echo hi; exec >&- 2>&-; sleep 0.3; exit 3"]}')]), sse_text("ok")],
+          S + ["--allow-cmd", "/bin/sh", "--cmd-timeout", "10"], 0,
+          [last_tool_has("hi\n"), last_tool_has("[exit status 3]")]),
         C("run-exit-code", [sse_calls([("run_command", '{"argv":["/bin/false"]}')]), sse_text("ran")],
           S + ["--allow-cmd", "/bin/false"], 0, [last_tool_has("[exit status 1]")]),
         C("fetch", [sse_calls([("http_fetch", '{"url":"http://%s/page"}' % fetch)]), sse_text("fetched")],
@@ -426,6 +431,7 @@ MUTANTS = [
     ("no-done-accepted", "if eq get gst SFIN 0\nagerr enodone\nret 6", "if eq get gst SFIN 7\nagerr enodone\nret 6"),
     ("exit-kills-child-only", "r = killpid neg pid 9", "r = killpid pid 9"),
     ("timeout-kills-child-only", "r = killpid neg int pid 9\nif eq get gnum 23 0", "r = killpid int pid 9\nif eq get gnum 23 0"),
+    ("eof-taken-as-exit", "if eq n 0\nret agwaitc dl\nend", "if eq n 0\nret false\nend"),
 ]
 
 

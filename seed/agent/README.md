@@ -186,12 +186,16 @@ kernel-chosen 127.0.0.1 port. It then runs 32 conversations:
 - a command whose background grandchild must die when it exits (the call returns in under
   5 s with a 10 s `--cmd-timeout`), and a timed-out command whose child and grandchild must
   both die; both scan `/proc` for survivors
+- a command that closes its output, sleeps 0.3 s and exits 3 must report `[exit status 3]`:
+  end of file is not exit (`/bin/echo` closes stdout before it exits), so the group's SIGKILL
+  must not overtake a child that is still finishing
 - session reload, a corrupt session line, no key, two stdin lines, connection refused
 
-Negative controls follow. Two wrong expectations must fail. Eight source mutants must each be
+Negative controls follow. Two wrong expectations must fail. Nine source mutants must each be
 caught: allowlist bypass, `..` allowed, symlink followed, fetch allowlist bypass, write flag
-ignored, end of stream without `[DONE]` accepted, and SIGKILL to the direct child only (not its
-group) after it exits or at the deadline. Output: `AGENT-CHECK PASS cases=34 mutants=8`.
+ignored, end of stream without `[DONE]` accepted, SIGKILL to the direct child only (not its
+group) after it exits or at the deadline, and end of file taken as the child's exit. Output:
+`AGENT-CHECK PASS cases=35 mutants=9`.
 Exit 0 means PASS, 1 FAIL, and 3 NOT_RUN (no compiler).
 
 ## Host dependencies
