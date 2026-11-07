@@ -26,7 +26,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENT = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(AGENT))
-SOURCES = ["seed/json/json.om", "seed/json/jsonw.om", "seed/net/http.om", "seed/net/notls.om", "seed/agent/agent.om"]
+SOURCES = ["seed/json/json.om", "seed/json/jsonw.om", "seed/net/http.om", "seed/net/notls.om", "seed/agent/path.om", "seed/agent/agent.om"]
 KEY = "sk-omagent-test-7f3a9c41d2e8b605"
 LOG = []
 
@@ -430,12 +430,15 @@ MUTANTS = [
 
 
 def run_mutants(omc, port, base):
-    src0 = open(os.path.join(AGENT, "agent.om")).read()
+    texts = [open(os.path.join(ROOT, s)).read() for s in SOURCES]
+    own = [i for i, s in enumerate(SOURCES) if s.startswith("seed/agent/")]
     killed = 0
     for name, a, b in MUTANTS:
-        if src0.count(a) != 1:
-            raise RuntimeError("mutant %s: anchor found %d times" % (name, src0.count(a)))
-        src = b"om2\n" + b"".join(open(os.path.join(ROOT, s), "rb").read() for s in SOURCES[:-1]) + src0.replace(a, b).encode()
+        n = sum(texts[i].count(a) for i in own)
+        if n != 1:
+            raise RuntimeError("mutant %s: anchor found %d times" % (name, n))
+        mt = [t.replace(a, b) if i in own else t for i, t in enumerate(texts)]
+        src = ("om2\n" + "".join(mt)).encode()
         p = subprocess.run([omc], input=src, capture_output=True)
         if p.returncode != 0:
             raise RuntimeError("mutant %s does not compile" % name)

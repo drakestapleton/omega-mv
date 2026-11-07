@@ -2,13 +2,15 @@
 
 omagent is an agent harness in the style of HKUDS/nanobot (MIT), written in seeded Omega.
 Only nanobot's architecture was reused. None of its code was copied. The program is one
-static ARM64 Linux executable (188,268 bytes with omc 2c824805) built from four sources:
+static ARM64 Linux executable (191,608 bytes with omc 5f90edea) built from six sources:
 
 ```sh
-{ printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om seed/net/http.om seed/net/notls.om seed/agent/agent.om; } \
+{ printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om seed/net/http.om seed/net/notls.om seed/agent/path.om seed/agent/agent.om; } \
   | seed/out/omc > omagent && chmod +x omagent
 ```
 
+`seed/agent/path.om` holds the workspace path rule (`agpathok`); the Omega Node tool adapter
+`seed/node/tool.om` composes the same file, so both refuse the same paths.
 The only compiler needed is the pinned `seed/out/omc`. Every implementation byte is compiled
 from `.om`. Python appears only in the test referee `tests/check.py`, which also plays the mock
 model server.
@@ -303,4 +305,4 @@ operator handoff `OmegaBot/eqbench2/` (the first, flawed run is in `OmegaBot/eqb
 
 - TLS model endpoints and fetches: NOT_RUN (refused by design in this build).
 - Real model servers (vLLM, llama.cpp, MAX): NOT_RUN. Only the scripted mock was used.
-- One request at a time; no parallel tool calls; no process-group kill; the TOCTOU limit above.
+- One request at a time; no parallel tool calls; the TOCTOU limit above.

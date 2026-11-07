@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority and journal
+# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority, journal and coding workflow
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -17,9 +17,13 @@ Source fragments, concatenated in this order before one program with `fn main`:
 | `seed/authority/action.om` | the existing action records the authority layer commits through |
 | `journal.om` | durable journal of every authority transition, fencing, restart recovery (DRA-289) |
 | `auth.om` | typed proposals, one commit owner, cancellation of real child tools, operator controls (DRA-288) |
+| `gram.om` | the round40 repair grammar, shared by the tool and the creator (DRA-290) |
+| `code.om` | the coding workflow: own-model turns, typed tool jobs, review (DRA-290) |
 
-The component is not yet connected to the live hive. A dashboard and a real
-model-backed coding workflow remain implementation work (DRA-290 to DRA-292). The
+Two child programs serve the workflow as tools: `infer.om` (one model turn
+against a local `ollm serve`) and `tool.om` (read, check, replace inside one
+root). The component is not yet connected to the live hive. The operator
+view and Spark qualification remain implementation work (DRA-291, DRA-292). The
 [Linear project](https://linear.app/drake-stapleton/project/omega-node-shared-memory-hive-runtime-37058a1eac4b)
 tracks that integration. This is a component contract, not a whole-system master plan.
 
@@ -579,3 +583,140 @@ RELEASE per job, sink lines, keys):
 | `journal.om`: objective check removed | 151 |
 | `journal.om`: version and record-size check removed | 154 |
 | `auth.om`: `auth_recover` does not restore pause | 161 |
+
+## Local inference and the coding workflow (DRA-290)
+
+Status: IMPLEMENTED in `infer.om`, `tool.om`, `gram.om` and `code.om`,
+exercised on native Linux AArch64 by `code-test.om`, the round40 replay
+`tests/tool-replay.py`, the tool controls and live runs of the own Omega
+model (round40 checkpoint served by aien-train `ollm serve`, DRA-119, inside a
+private network namespace). Evidence is in the DRA-290 pull request. Not
+QUALIFIED on the Spark and not DEPLOYED.
+
+All four are OM-2 programs (`printf 'om2\n'` before the sources):
+
+```sh
+L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/journal.om seed/node/auth.om"
+{ printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om seed/net/http.om seed/net/notls.om seed/node/infer.om; } | seed/out/omc > build/node/infer
+{ printf 'om2\n'; cat seed/agent/path.om seed/node/gram.om seed/node/tool.om; } | seed/out/omc > build/node/tool
+{ printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-main.om; } | seed/out/omc > build/node/code-main
+{ printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-test.om; } | seed/out/omc > build/node/code-test
+chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test
+build/node/code-test unit build/node/cu   # "code checks=54 fail=0", exit 0
+python3 seed/node/tests/tool-replay.py build/node/tool OMC40 ROUND40 build/node/replay   # pass=108 fail=0
+```
+
+A failed compile leaves an empty output file that exits 0 when run; check
+omc's exit status. `OMC40` is the compiler the round40 model was trained and
+evaluated with (sha256 `2c82480596bb…`, omega-mv `e5b32567`): its error text is
+part of the prompt, so the check tool must use it. `ROUND40` is the round40
+run directory holding `repair.py` and `final-selected.json`.
+
+### Programs
+
+`omnode-code INFER TOOL OMC ROOT WORK JDIR PORT OBJ...` runs 1..4 objectives
+`KIND,K,N,A,PATH,TASK` (KIND `add`, `mul` or `loop`) against the files under
+ROOT, with the journal in JDIR and compile scratch in `WORK/o<i>`. The creator
+holds every objective's state and alone decides; two workers run the granted
+jobs, each job one child process in its own process group (`auth_wtool`):
+
+| Job | Child | Input (packed argv published on the objective's topic) |
+| --- | --- | --- |
+| 1 inference | `infer PORT 160 900 PROMPT` | the prompt of `repair.py` for the current state |
+| 2 read | `tool read ROOT PATH` | |
+| 3 check, 5 review | `tool check ROOT PATH WORK/o<i> OMC KIND K N A` | |
+| 4 replace | `tool replace ROOT PATH OLD NEW` | old and new as the model gave them |
+
+`infer` (exit 2 usage, 3 prompt, 4 connect, 5 deadline, 6 HTTP status, 7
+malformed response, 8 busy) connects only to 127.0.0.1, refuses port 18091,
+and posts one greedy, non-streamed `/v1/completions` request (aien-train
+#76). The server takes one request at a time and keeps generating a few
+seconds after a cancelled client is gone, so a 503 is asked again every
+second within the deadline; exit 8 means busy until under 2 s were left.
+Its record `OMNI1 kind fin ptok ctok plen olen nlen tlen` is followed by
+path, old, new and the raw model text; kind 9 is text that is not a protocol
+action. No other provider exists: there is no remote or fallback path, so
+offline-local is the only mode.
+
+`tool` returns `OMNT1 status olen clen`, the observation and the file. Paths
+pass `agpathok` (`seed/agent/path.om`, shared with omagent) and a final
+symbolic link is refused; replace writes a temporary file, syncs, renames and
+syncs the directory; check follows `repair.py compile_test` with the test
+programs run under `execpure`, 10 s for omc and 2 s per test, killing the
+whole process group on timeout.
+
+Policy (as `repair.py jobs_run`): at most 7 model turns; read_file only when
+unread, omega_check only when read or edited, replace_text only when failed,
+`Tests passed.` only when the last check passed, `File not found.` only when
+the read found nothing; the path must be the objective's. Before a replace is
+granted, the creator checks that old occurs exactly once in the source the
+model was shown and that the result stays in the repair grammar (`gr_src`).
+Every record is checked against its header lengths and the 3968-byte output
+page. A check must return exactly the source the creator holds, a replace
+exactly the candidate it computed. `Tests passed.` starts a review job, a
+fresh check of the saved file, and only its pass is a PASS. Anything else
+ends the objective as FAIL with its reason; nothing is retried or repaired.
+
+| Result | Meaning |
+| --- | --- |
+| 1 | PASS |
+| 10, 11 | action not valid in its state; wrong path |
+| 12 | 7 turns used |
+| 13 | edit refused (old not exactly once, result outside the grammar, or the tool refused it) |
+| 14 | `Tests passed.` without a passing check |
+| 15 | the file checked or saved differs from the workflow's source or candidate |
+| 16, 17 | inference or tool exited nonzero (no fallback) |
+| 18 | malformed record |
+| 19 | cancelled (operator `auth_cancel`, or the authority's cancel verdict) |
+| 20 | prompt over 3800 bytes |
+| 21 | outcome UNKNOWN (a worker or child lost) |
+| 22, 23 | job input lost; refused by the authority |
+
+Output: `CWP i turn n` and `CWR i turn n` lines, each followed by n bytes
+(the prompt; the model text) and a newline; `CWE i job event value` job
+events (1 issued, 2 model action kind, 3 tool status, 4 outcome word, 5
+cancel); `CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
+every objective passed, 1 otherwise, 2 usage, 62 out of time, 30 + a journal
+refusal.
+
+Restart: the journal's objective identity is the objective arguments' FNV-1a
+64. On a restart `auth_recover` settles what the last creator left (an
+in-flight replace is UNKNOWN and never rerun); the creator cancels recovered
+jobs that still wait for input (pool contents are not journaled), and each
+objective resumes from the durable file in state unread with its performed
+model turns counted against its 7 and its job ids continuing.
+
+Limits: one inference at a time (one local server); 64 action records per
+creator process bound a run to about 4 objectives; lines are split on `\n`
+only, so a `\r` makes a line fall outside the grammar where Python's
+`splitlines` would split it.
+
+### Acceptance and controls
+
+`code-test unit` (54 checks, no child process) feeds crafted model and tool
+records to the creator: the round40 prompts byte for byte; every action in
+every state; wrong path; old text absent, twice, many times; an edit outside
+the grammar; `Tests passed.` unverified or after an edit; `File not found.`
+when not missing; header and length faults; tool content that differs from
+the source or candidate; outcome words for exit 4, 5 and 8, a killed child,
+cancellation, UNKNOWN and a lost input; the turn limit; an over-long prompt.
+`code-test cancel MS ...` is `omnode-code` with objective 0's first inference
+cancelled through `auth_cancel` after MS milliseconds.
+
+| Change to `code.om` | Expected exit |
+| --- | --- |
+| path not compared | 154 |
+| old text not required exactly once | 103 (trap) |
+| grammar of the result not checked | 162 |
+| `Tests passed.` accepted unverified | 168 |
+| checked content not compared | 181 |
+| child exit status ignored | 192 |
+| 8 turns allowed | 202 |
+| saved content not compared | 186 |
+| `File not found.` accepted in any state | 171 |
+| replace accepted in any state | 157 |
+| goal text changed | 151 |
+| record length not checked against the page | 174 |
+| cancelled read as UNKNOWN | 197 |
+| missing file read as read | 178 |
+| prompt limit raised to 4000 | 203 |
