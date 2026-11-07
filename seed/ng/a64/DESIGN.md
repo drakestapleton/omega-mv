@@ -67,6 +67,14 @@ fib38), so any future codegen A/B reports an aligned control.
      (unsigned CMP with the width); chk.conv between integers; chk.fuel CMP + B.HS; chk.true CBZ. Facts emit nothing.
 8. **Parallel moves** (`a6_pmove`): a move fires when no pending move reads its destination; when all are blocked
    (a cycle), one source goes to x15 and its readers read x15. Slot-to-slot moves go through x16.
+8a. **E loop shape** (`a6_tre`, D13): a block ending `r = call f(...); s = add a r` (either operand order)
+   `; retv s` in f itself, with r and s used once each, becomes `acc = acc + a; parameters = arguments (parallel
+   move); B head`, and every other `retv x` of f returns `acc + x`. acc is one extra wire defined at 0 and live to
+   the end (callee-saved when f still calls); it is 0 at the head, right after the entry parameter moves. The tail
+   call is not counted as a call. Integer add is modulo 2^w, so the result is exact; a signed add carries
+   `chk.add` on r (a second use) and keeps its call. Stack depth falls, which IR.md s7.9 / D9 allow (trap 6 is
+   compared only when both compilers trap). Fib keeps its first call and loses the second (0.35x omc on X925 for
+   the hand-built form, D13); ts(n) = ts(n-1) + n becomes a frameless loop.
 9. **Traps**: each function ends with omc's tail `ADD X0, X1, #100; MOVZ X8, #93; SVC #0` and one stub per used code,
    `MOVZ X1, #code; B tail`, so the exit status is 100 + code as with omc.
 10. **ELF** (`a6_elf`): omc's map: 176-byte header, two PT_LOAD (text R+X at 0x400000 from file offset 0; RW
@@ -101,7 +109,8 @@ BLR, SVC, ADR and the FP set.
 
 ## 5. Not in the slice yet (PROPOSED, in order)
 
-1. E loop shape (second recursive call to a loop), then shrink-wrapping (saves only on paths that need them) — D8.
+1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
+   in a callee-saved register across its loop).
 2. Memory ops (load, store, alloca, globals, slices, chk.bounds, chk.slice) and host words (inline `SVC`).
 3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
 4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, > 8 arguments,
@@ -112,11 +121,12 @@ BLR, SVC, ADR and the FP set.
 - `gate.om` (encoder): builds ng from `ng.units`, runs `@ng a64-enc` on `tests/enc.cases`, disassembles with GNU
   objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases.
 - `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck and ng. For every fixture (fib, deep, press, rot,
-  ck, ar) ngcheck must accept the ΩIR, and `@ng a64`, `@ng a64 split` and the omc build of `tests/ref/N.om` must
-  all exit with the expected status (computed with Wolfram, or the check's trap code), and every BL target in the
-  `@ng a64` ELF must be a multiple of 64. Seven mutants (spill reload slot, call clobber, live-out range,
-  parallel-move ordering, callee-saved saves, frame size, 16-byte entry alignment) must each change at least one
-  fixture's status or alignment.
+  ck, ar, tsum) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must exit with the expected status
+  (computed with Wolfram, or the check's trap code), the omc build of `tests/ref/N.om` with its omc expectation
+  (the same, except tsum: omc traps 6 a million calls deep, ng's loop does not; BEYOND_OMC), and every BL target in
+  the `@ng a64` ELF must be a multiple of 64. Nine mutants (spill reload slot, call clobber, live-out range,
+  parallel-move ordering, callee-saved saves, frame size, 16-byte entry alignment, E never matching, E accumulating
+  the wrong value) must each change at least one fixture's status or alignment.
 
 ## 7. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
 
