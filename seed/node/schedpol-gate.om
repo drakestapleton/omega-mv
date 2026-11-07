@@ -1383,9 +1383,11 @@ note Creator: may id be admitted now? Room is the smaller of the admission
 note headroom and the free table slots (a job in review or UNKNOWN holds
 note its slot). While tickets are held only the first holder may enter;
 note with none, anyone may while there is room. A refused caller gets or
-note keeps a ticket. Asking again changes nothing else, and a true answer
-note guarantees the slot for the next sched_admitr (single creator), so a
-note caller may ask before journaling (as jn_admit does).
+note keeps a ticket; every ask by a holder, refused or not, refreshes its
+note ticket's last-asked event, and a caller with room and no ticket gets
+note none. A true answer guarantees the slot for the next sched_admitr
+note (single creator), so a caller may ask before journaling (as jn_admit
+note does).
 fn sched_room id ulong to bool
 sp_tkpack 64
 t = sp_tkpos id
@@ -1412,6 +1414,7 @@ if eq get scpol 6 0
 ret true
 end
 if eq t 0
+put stts 0 get scst 2
 ret true
 end
 end
@@ -1494,7 +1497,11 @@ ret long j
 end
 
 note Creator: job j (waiting, ready or running) gets a lease of ns from its
-note next assignment, or from now when it runs; 0 removes it. 0, or -3.
+note next assignment, or from now when it runs; 0 removes it. 0; -3 for a
+note slot that is not waiting, ready or running; -7 for ns above 2^50 (about
+note 13 days). Both refusals change nothing. The bound keeps every deadline
+note (the monotonic clock, below 2^63, plus ns) representable: it never
+note wraps into the past or onto 0, the no-deadline value.
 fn sched_lease j ulong ns ulong to long
 if ge j 64
 ret neg long 3
@@ -1502,6 +1509,9 @@ end
 s = get sjst j
 if or lt s 1 gt s 3
 ret neg long 3
+end
+if gt ns 1125899906842624
+ret neg long 7
 end
 put sjlse j ns
 if eq s 3
@@ -3129,6 +3139,86 @@ pt_drain c 3 3000 199
 pt_down c 199
 end
 
+note Phase M: lease bounds (2^50 ns, about 13 days). Waiting job w refuses
+note 2^50 + 1 and 2^64 - 1 (-7) with its lease unchanged (200, 201) and
+note accepts 2^50 (202). Job r, leased 2^50 before it is assigned, runs with
+note a deadline ahead of the clock and nothing overdue (203); running, it
+note refuses both too large values with lease and deadline unchanged (204,
+note 205) and accepts a renewal of 2^49 measured from now: the new deadline
+note lies between clock + 2^49 read just before and just after the call
+note (206), and nothing is overdue; it then completes (207).
+fn pt_lbound to void
+c = pt_setup 1 8 8 pt_req 2 1024 1 8 200
+mx = ulong 1125899906842624
+w = pt_admit 220050 1 0 200
+pt_ok eq sched_lease w add mx 1 neg long 7 200
+pt_ok eq get sjlse w 0 200
+pt_ok eq sched_lease w sub ulong 0 1 neg long 7 201
+pt_ok eq get sjlse w 0 201
+pt_ok eq sched_lease w mx 0 202
+pt_ok eq get sjlse w mx 202
+r = pt_admit 230600 0 pt_req 1 0 0 0 203
+pt_ok eq sched_lease r mx 0 203
+pt_ok pt_until c r 3 3 2000 203 203
+d = get sjdue r
+pt_ok gt d ulong monons 203
+pt_ok eq sched_overdue 64 203
+pt_ok eq sched_lease r sub ulong 0 1 neg long 7 204
+pt_ok and eq get sjdue r d eq get sjlse r mx 204
+pt_ok eq sched_lease r add mx 1 neg long 7 205
+pt_ok and eq get sjdue r d eq get sjlse r mx 205
+w = ulong monons
+pt_ok eq sched_lease r div mx 2 0 206
+t2 = ulong monons
+pt_ok ge get sjdue r add w div mx 2 206
+pt_ok le get sjdue r add t2 div mx 2 206
+pt_ok eq sched_overdue 64 206
+pt_drain c 1 3000 207
+pt_down c 207
+end
+
+note Phase N: every ask renews a ticket, a successful one too. Admission
+note limit 1, ticket lifetime 2. o waits on a topic nobody publishes and
+note fills the limit; X is refused at event e and holds a ticket. o is
+note cancelled; at event e + 1 X asks and is told yes, which renews its
+note ticket (210). At e + 3 the ticket still holds (asked at e + 1, lifetime
+note 2), so newcomer Y is refused (211); at e + 4 it lapses, exactly one
+note lapse is counted and Y, now first, is admitted (212).
+fn pt_renew to void
+c = pt_setup 1 1 8 pt_req 2 1024 1 8 210
+pt_ok eq sched_policy sched_stat 24 64 64 sched_stat 27 2 0 210
+o = pt_admit 240050 1 0 210
+pt_ok eq sched_admitr 250050 0 0 0 neg long 2 210
+pt_ok eq sched_cancel o 1 210
+k = sched_dispatch c
+pt_ok sched_room 250050 210
+k = sched_dispatch c
+k = sched_dispatch c
+pt_ok eq sched_admitr 260050 0 0 0 neg long 2 211
+l0 = sched_stat 11
+k = sched_dispatch c
+pt_ok ge sched_admitr 260050 0 0 0 0 212
+pt_ok eq sched_stat 11 add l0 1 212
+pt_drain c 1 3000 212
+pt_down c 212
+end
+
+note Phase U: the dispatch budget binds. Four idle workers, dispatch budget
+note 2, six ready 1-CPU jobs and 4 CPU: one dispatch assigns exactly 2
+note (220); all six then complete (221).
+fn pt_budget to void
+c = pt_setup 4 16 16 pt_req 4 1024 1 8 220
+pt_ok eq sched_policy sched_stat 24 64 2 sched_stat 27 1000 0 220
+for i ulong 6
+j = pt_admit add 270100 mul i 10000 0 pt_req 1 0 0 0 220
+end
+a0 = sched_stat 4
+k = sched_dispatch c
+pt_ok and eq k 2 eq sub sched_stat 4 a0 2 220
+pt_drain c 6 5000 221
+pt_down c 221
+end
+
 fn pt_mode to void
 a = new uchar 16 0
 if ne argcnt 2
@@ -3578,6 +3668,9 @@ pt_propres
 pt_incx
 pt_incl
 pt_key
+pt_lbound
+pt_renew
+pt_budget
 if ne write 1 pok 0 len pok long len pok
 ret 100
 end
