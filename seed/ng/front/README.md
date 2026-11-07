@@ -27,15 +27,19 @@ record of how it was derived, not a way to rebuild it. The gate checks the resul
 
 omc refusals that come from its AArch64 code generator are not language rules: error 12 (16-register
 expression pool), 14 for trap sites, 24 (branch displacement range). ng accepts such units; they are
-`beyond` rows in `declared.txt`, and the gate requires omc to exit 12, 14, 24 or 25 there and ng to
-exit 0. Whether ng then compiles them correctly needs an independent referee (expected output or a C
-twin): NOT_RUN until ng emits code. The value slots of `fe_alloc` keep omc's pool numbering without
-the cap (slots past 16 share a number); ΩIR values replace them.
+`beyond` rows in `declared.txt` (`NAME beyond K REASON`), and the gate requires omc to exit exactly K
+and ng to exit 0. Whether ng then compiles them correctly needs an independent referee (expected output
+or a C twin): NOT_RUN until ng emits code. The value slots of `fe_alloc` keep omc's pool numbering
+without the cap (slots past 16 share a number); ΩIR values replace them.
 
-Units ng does not take exit 64 and are `scope` rows: x86/EFI targets (D8) and IR v1 units (first line
-`ir`). om2 fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text. Input of 8388608
-bytes or more is error 14 as in omc (cases `size_*`); the one input edge that is main.om's: a stdin
-read error is `ng: refused class 27` (omc: error 1).
+Units ng does not take exit 64 and are `scope` rows (`NAME scope K REASON`, omc must exit K): x86/EFI
+targets (D8) and IR v1 units (first line `ir`). A bound of ng's own that omc never reaches because
+another omc limit refuses first is an `ngonly` row (`NAME ngonly K REASON`): both must exit K, and
+their stderr lines differ. The one today is ng's 524288-entry call table (`calls_524289`; omc stops at
+its 8192-entry trap-site table, so `calls_524288` is a beyond row). Each K is omc's exit as measured
+with the pinned omc. om2 fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
+Input of 8388608 bytes or more is error 14 as in omc (cases `size_*`); the one input edge that is
+main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 
 ## Gate
 
@@ -50,10 +54,14 @@ checks their sha256 pins); `in:front-check.in` puts the mode line `@ng front-che
 on ng's stdin, while omc reads the case alone. A wrong mode line makes every case FAIL.
 
 Cases: `cases-front.txt` (f64 rem/and/or/xor, the gate15 refusal cases error-codes.reg names, omc.om,
-the ng-front tools and each ng unit alone), `cases-om2.txt` (every .om under seed/omc/om2),
-`cases-tests.txt` (seed/omc/tests), and the frozen C2 manifest (5876 units). Mutants (`mutants/`):
-m_scope (s_end forgets to restore the name table), m_fltop (f64 accepts rem/and/or/xor), m_fmtcr
-(om2 fmt misses a CR); each must be KILLED.
+the ng-front tools and each ng unit alone, the input-size and call-table edges, and `diag_big`, an om2
+`diag` unit whose 96955 stderr bytes are compared in full: omc and ng each write stderr to their own
+descriptor and the gate compares the two in 65536-byte chunks), `cases-om2.txt` (every .om under
+seed/omc/om2), `cases-tests.txt` (seed/omc/tests), and the frozen C2 manifest (5876 units). Mutants
+(`mutants/`): m_scope (s_end forgets to restore the name table), m_fltop (f64 accepts rem/and/or/xor),
+m_fmtcr (om2 fmt misses a CR), m_sitebyte (one site-record byte past 65536 corrupted), m_callcap (the
+call table takes one call more); each must be KILLED.
 
-CI (`.github/workflows/ng-front-arm64.yml`): NOT_RUN (GitHub Actions blocked). Host runs are recorded
+CI (`.github/workflows/ng-front-arm64.yml`) also checks that the gate's checker (`SCRATCH/fecheck`) is
+byte-for-byte the ng that `ngbuild` built. CI: NOT_RUN (GitHub Actions blocked). Host runs are recorded
 in the lane's READY files.
