@@ -5,7 +5,12 @@ note unit's main renamed to wbmain). Bootstrap, from the aien-train checkout:
 note   OMC < tools/omegallm/wdrive/wbuild.om > wbuild && chmod +x wbuild
 note Usage: wbuild OUTBIN PART...   (environment OMC = the pinned omc, CORE = taskset core, default 0)
 note A PART is FILE, appended as is, or FILE@NAME, appended with its one line `fn main to int`
-note renamed to `fn NAME to int` (exit 4 unless that line occurs exactly once). Composition:
+note renamed to `fn NAME to int` (exit 4 unless that line occurs exactly once). Either may end in
+note =HEX64 (FILE=HEX64, FILE@NAME=HEX64): 64 lowercase hex digits, the file's pinned sha256. The bytes
+note read are hashed each time the part is read, before they are used; a mismatch prints
+note PART_PIN_MISMATCH FILE <sha256> on stderr and exits 3 before anything is compiled. A PART with an
+note `=` whose text after the last `=` is not 64 lowercase hex digits prints PART_PIN_BAD PART and
+note exits 2. Composition:
 note when any part has a line `om2`, the output starts with one line `om2`, then every
 note `layout ... end` block of every part in order, then the parts without their `om2` lines and
 note layout blocks. Every line starting `export fn ` is written as `fn ` (the output is a program,
@@ -15,9 +20,10 @@ note sed main rename) as tools/omegallm/wprobe/build.sh did.
 note Writes OUTBIN-all.om, runs `taskset -c CORE nice -n 19 OMC < OUTBIN-all.om > OUTBIN.tmp`,
 note sets mode 0775, renames OUTBIN.tmp to OUTBIN and prints
 note   BUILD_OK <sha256 OUTBIN> OUTBIN source_sha256 <sha256 OUTBIN-all.om> omc <sha256 OMC>
-note Exits: 0 built, 1 omc refused the unit (stderr BUILD_FAIL omc rc=N, OUTBIN.tmp removed), 2 usage,
-note 3 OMC is not the pinned compiler (stderr OMC_PIN_MISMATCH <sha256>), 4 main count in a renamed
-note part is not 1, 61 a part over 8 MiB, 70 I/O.
+note Exits: 0 built, 1 omc refused the unit (stderr BUILD_FAIL omc rc=N, OUTBIN.tmp removed), 2 usage
+note or a malformed pin, 3 OMC is not the pinned compiler (stderr OMC_PIN_MISMATCH <sha256>) or a part
+note does not match its pin (PART_PIN_MISMATCH), 4 main count in a renamed part is not 1, 61 a part
+note over 8 MiB, 70 I/O.
 note The SHA-256 below is omega-mv e5b32567 om/sha256/sha256-om2.om (sha256 dbf002dd6aa36585632b9d01d
 note 98ac3f0bd2fa0f0475082940de53638847994bb), composed as aien-train-wpatch tools/omegallm/wpatch/
 note build.sh composes it: the layout shactx first, `export fn` made `fn`, private names renamed
@@ -735,6 +741,31 @@ end
 ret true
 end
 
+note SHA-256 of wdsrc[0, wdsn) into wdd (a global cannot be passed, so it goes through a local copy)
+fn wdmsha to void
+b = new uchar 65536 0
+c = new uchar 104 0
+d = new uchar 32 0
+sha256_init c
+n = get wdsn 0
+o = ulong 0
+while lt o n bound 999999
+k = sub n o
+if gt k 65536
+k = ulong 65536
+end
+for j ulong k
+put b j get wdsrc add o j
+end
+sha256_update c part b 0 k
+o = add o k
+end
+sha256_final c d
+for i ulong 32
+put wdd i get d i
+end
+end
+
 note copy everything readable from descriptor fi to descriptor fo
 fn wdcopyfd fi int fo int to void
 b = new uchar 65536 0
@@ -962,8 +993,10 @@ text wbtpinm "OMC_PIN_MISMATCH "
 text wbtmc "MAIN_COUNT "
 text wbtwant ", want 1 in "
 text wbtrd "cannot read "
+text wbtpbad "PART_PIN_BAD "
+text wbtpmis "PART_PIN_MISMATCH "
 text wbtexp "export fn "
-text wbtuse "usage: OMC=omc [CORE=n] wbuild OUTBIN PART... (PART is FILE or FILE@NAME)\n"
+text wbtuse "usage: OMC=omc [CORE=n] wbuild OUTBIN PART... (PART is FILE[@NAME][=SHA256HEX])\n"
 
 fn wbusage to void
 wdoclr
@@ -1109,9 +1142,66 @@ end
 ret mains
 end
 
-note argument i is FILE or FILE@NAME: load FILE, set the rename, run pass
+note wbpinx/wbpinn: the current part's pin (64 lowercase hex digits), wbpinn 0 when it has none
+global wbpinx uchar 64
+global wbpinn ulong 1
+
+note wdab[0, n) holds a PART. When it has an `=`, the text after the last `=` must be 64 lowercase
+note hex digits (else stderr PART_PIN_BAD PART, exit 2); it becomes the pin and the PART ends at the
+note `=`. Returns the PART's length without the pin.
+fn wbpinparse n ulong to ulong
+q = n
+for j ulong n
+if eq get wdab j 61
+q = j
+end
+end
+put wbpinn 0 0
+if eq q n
+ret n
+end
+ok = eq sub sub n q 1 64
+if ok
+for k ulong 64
+v = get wdab add add q 1 k
+if not or and ge v 48 le v 57 and ge v 97 le v 102
+ok = false
+end
+put wbpinx k v
+end
+end
+if not ok
+wdoclr
+wdot wbtpbad
+for j2 ulong n
+wdoc ulong get wdab j2
+end
+wdot wbtnl
+wdoflush 2
+exit 2
+end
+put wbpinn 0 64
+ret q
+end
+
+note true when the hex of wdd equals the pin wbpinx
+fn wbpineq to bool
+for i ulong 32
+v = ulong get wdd i
+if ne get wbpinx mul i 2 get wdhex shr v 4
+ret false
+end
+if ne get wbpinx add mul i 2 1 get wdhex and v 15
+ret false
+end
+end
+ret true
+end
+
+note argument i is FILE, FILE@NAME, FILE=HEX64 or FILE@NAME=HEX64: load FILE, check its pin, set the
+note rename, run pass
 fn wbpart i ulong pass ulong to void
-n = wdarg i
+n = wbpinparse wdarg i
 ap = n
 for j ulong n
 if eq get wdab j 64
@@ -1141,6 +1231,19 @@ wdop
 wdot wbtnl
 wdoflush 2
 exit 70
+end
+if gt get wbpinn 0 0
+wdmsha
+if not wbpineq
+wdoclr
+wdot wbtpmis
+wdop
+wdoc 32
+wdohex
+wdot wbtnl
+wdoflush 2
+exit 3
+end
 end
 c = wblines pass
 if and eq pass 0 gt get wbrnn 0 0
