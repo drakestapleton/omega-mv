@@ -830,7 +830,7 @@ global a_luse ulong 2097152
 global a_ldef ulong 2097152
 note a_fs (per function): 0 values, 1 blocks, 2 bitset words per block, 3 positions, 4 spill slots, 5 callee-saved
 note mask, 6 has a call, 7 frame bytes, 8 function, 9 liveness changed, 10 trap codes used (mask), 11 saved count,
-note 12 fixups, 13 current block index
+note 12 fixups, 13 current block index, 14 E tail sites (0: no accumulator), 15 code offset of the E loop head
 global a_fs ulong 16
 note a_sform: 0 save pairs (STP/LDP, variant A), 1 separate STR/LDR (variant B); `@ng a64 split` selects 1
 global a_sform ulong 1
@@ -848,6 +848,10 @@ global a_tpc ulong 16
 global a_mvd ulong 64
 global a_mvs ulong 64
 global a_mvn ulong 1
+note E loop shape: tail call sites (call ops), accumulator wire and type
+global a_tco ulong 64
+global a_taw ulong 1
+global a_tat ulong 1
 
 const a_rorvx ulong 28
 const a_lsrvw ulong 30
@@ -1024,7 +1028,7 @@ x = ulong 0
 while lt x get a_fs 1 bound 65536
 o = ulong get i_bo1 get a_bh x
 while ne o 0 bound 4194305
-if eq get i_oop o 64
+if and eq get i_oop o 64 not a6_istc o
 put a_ccnt get a_opos o 1
 put a_fs 6 1
 end
@@ -2023,6 +2027,9 @@ a6_epi
 end
 if eq op 63
 a6_mvto 0 a6_arg o 1
+if ne get a_fs 14 0
+a6_tsum 0 0
+end
 a6_epi
 end
 if eq op 64
@@ -2313,6 +2320,186 @@ a6_mov 15 a
 a6_cext d c
 end
 
+note ---- E loop shape (D13) ----
+note A block ending `r = call f(...); s = add a r` (or `add r a`) `; retv s` inside f itself, with r and s used once
+note each, becomes `acc = acc + a; f's parameters = the call's arguments; B head`: no call, no add, no retv. Every other
+note `retv x` of f returns acc + x. acc (wire a_taw, type a_tat) is 0 at the head, which follows the entry parameter
+note moves. Integer add is modulo 2^w (IR.md s7.3), hence associative and commutative, so every result is exact.
+note A checked add (chk.add on r) is a second use of r and keeps the call. Stack depth falls, and trap 6 is not
+note semantic (IR.md s7.9, D9).
+fn a6_tre f ulong to void
+put a_fs 14 0
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+a6_tblk f get a_bh x
+x = add x 1
+end
+end
+
+fn a6_tblk f ulong b ulong to void
+c = ulong 0
+m = ulong 0
+l = ulong 0
+o = ulong get i_bo1 b
+while ne o 0 bound 4194305
+c = m
+m = l
+l = o
+o = ulong get i_onx o
+end
+if eq c 0
+ret
+end
+if not a6_tpat f c m l
+ret
+end
+n = get a_fs 14
+if ge n len a_tco
+ret
+end
+put a_tco n c
+put a_fs 14 add n 1
+put a_tat 0 ulong get i_oty m
+end
+
+note a6_tpat f c m l: the last three ops of a block are the E shape (call c to f, add m, retv l)
+fn a6_tpat f ulong c ulong m ulong l ulong to bool
+if ne get i_oop c 64
+ret false
+end
+if ne get i_oop m 10
+ret false
+end
+if ne get i_oop l 63
+ret false
+end
+r = ulong get i_ors c
+s = ulong get i_ors m
+if eq r 0
+ret false
+end
+if ne a6_arg c 1 f
+ret false
+end
+if ne a6_arg l 1 s
+ret false
+end
+if not or eq a6_arg m 0 r eq a6_arg m 1 r
+ret false
+end
+if ne a6_uses r 1
+ret false
+end
+if ne a6_uses s 1
+ret false
+end
+ret a6_isint ulong get i_oty m
+end
+
+note a6_uses v: the number of value operands in the function that are v
+fn a6_uses v ulong to ulong
+c = ulong 0
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+op = get i_oop o
+n = ulong get i_ona o
+k = ulong 0
+while lt k n bound 1048576
+if eq ir_okd uint op k 0
+if eq a6_arg o k v
+c = add c 1
+end
+end
+k = add k 1
+end
+o = ulong get i_onx o
+end
+x = add x 1
+end
+ret c
+end
+
+fn a6_istc o ulong to bool
+i = ulong 0
+while lt i get a_fs 14 bound 64
+if eq get a_tco i o
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note a6_tacc: the accumulator is one more wire, defined at 0 and live to the end (it crosses every call in f)
+fn a6_tacc to void
+if eq get a_fs 14 0
+ret
+end
+w = get a_fs 0
+if ge w a_maxv
+a6_unsup w
+end
+put a_taw 0 w
+put a_vh w 0
+put a_vsl w 0
+put a_vx w 0
+put a_vr w 255
+put a_vs w 0
+put a_ve w get a_fs 3
+put a_fs 0 add w 1
+end
+
+fn a6_accl to ulong
+w = get a_taw 0
+r = ulong get a_vr w
+if lt r 32
+ret r
+end
+ret add 64 sub get a_vsl w 1
+end
+
+note a6_tsum d a: register d = acc + register a, re-extended to the accumulator's type (acc from its slot via x17)
+fn a6_tsum d ulong a ulong to void
+l = a6_accl
+c = l
+if ge l 32
+a6_ew a_ldrx 17 31 sub l 64 0 0
+c = ulong 17
+end
+a6_ew a_addx d c a 0 0
+a6_canon d get a_tat 0
+end
+
+note a6_stail o: the tail site at call o (the add and retv after it emit nothing)
+fn a6_stail o ulong to void
+m = ulong get i_onx o
+r = ulong get i_ors o
+v = a6_arg m 0
+if eq v r
+v = a6_arg m 1
+end
+a = a6_src v 16
+l = a6_accl
+if lt l 32
+a6_tsum l a
+else
+a6_tsum 17 a
+a6_ew a_strx 17 31 sub l 64 0 0
+end
+a6_mvclr
+p = ulong get i_fp1 get a_fs 8
+k = ulong 2
+while ne p 0 bound 65
+a6_mvadd a6_loc p a6_loc a6_arg o k
+p = ulong get i_vnx p
+k = add k 1
+end
+a6_pmove
+a6_ew a_b a6_wd get a_cn 0 get a_fs 15 0 0 0 0
+end
+
 note ---- one function ----
 fn a6_func f ulong to void
 if eq get i_fk f 1
@@ -2326,6 +2513,7 @@ put a_fs 0 nv
 put a_fs 8 f
 a6_wmap f
 a6_lay f
+a6_tre f
 lw = shr add nv 63 6
 put a_fs 2 lw
 if gt mul get a_fs 1 lw a_maxw
@@ -2338,6 +2526,7 @@ a6_lflow
 a6_ivinit
 a6_ivuse
 a6_ivlive
+a6_tacc
 a6_ivcross
 a6_scan
 a6_frame
@@ -2370,13 +2559,27 @@ p = ulong get i_vnx p
 k = add k 1
 end
 a6_pmove
+if ne get a_fs 14 0
+l = a6_accl
+if lt l 32
+a6_ew a_movzx l 0 0 0 0
+else
+a6_ew a_strx 31 31 sub l 64 0 0
+end
+put a_fs 15 get a_cn 0
+end
 x = ulong 0
 while lt x get a_fs 1 bound 65536
 put a_bpc x get a_cn 0
 o = ulong get i_bo1 get a_bh x
 while ne o 0 bound 4194305
+if a6_istc o
+a6_stail o
+o = ulong 0
+else
 a6_sel o x
 o = ulong get i_onx o
+end
 end
 x = add x 1
 end
