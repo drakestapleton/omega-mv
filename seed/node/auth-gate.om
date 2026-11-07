@@ -1030,17 +1030,21 @@ note Goal-aware ranking (policy 2): sjpro the topics a job declares its
 note completion publishes, sjest its declared work estimate in ms, sjunc
 note that estimate's uncertainty in ms, sjval its unblock value in jobs as
 note last scored. scgv: 0 graph version, 1 version last scored, 2 proposed
-note job slot + 1 (0 none), 3 version the proposal named. The graph version
-note is the scheduler's incarnation (sched_incarnate) times 2^40 plus the
-note bumps since, so schedulers of different incarnations never share a
-note version. Within one scheduler every change of a slot's occupant
-note (admission, cancellation, becoming ready) bumps it, so a proposal
-note whose version is current still names the job it was made for.
+note job slot + 1 (0 none), 3 version the proposal named, 4 proposal state
+note (0 no incarnation yet: proposals refused; 1 accepting; 2 the version
+note is exhausted: proposals refused for the rest of this scheduler). The
+note graph version is the scheduler's incarnation (sched_incarnate, once)
+note times 2^40 plus the bumps since, never more than 2^40 - 1 of them: the
+note bump that would carry into the next incarnation's range exhausts the
+note version instead, so schedulers of different incarnations never share a
+note version. Within one scheduler every admission of a job, cancellation
+note of a waiting or ready one and readiness bumps it, so a proposal whose
+note version is current still names the job it was made for.
 global sjpro ulong 64
 global sjest ulong 64
 global sjunc ulong 64
 global sjval ulong 64
-global scgv ulong 4
+global scgv ulong 5
 note Goal counters (sched_stat 32..39): 0 rescores, 1 jobs scored, 2 graph
 note version bumps, 3 proposals accepted, 4 proposals stale, 5 proposals
 note refused, 6 slots read by value traversal, 7 proposals used.
@@ -1102,7 +1106,7 @@ end
 for i ulong 8
 put scgst i 0
 end
-for i ulong 4
+for i ulong 5
 put scgv i 0
 end
 put scpol 0 1
@@ -1186,7 +1190,8 @@ end
 
 note Creator: counter i of scst, capacity (i 16..19) or use (i 20..23) of a
 note kind, policy word (i 24..31), goal counter (i 32..39), graph version
-note (i 40).
+note (i 40), proposal state (i 41: 0 no incarnation, 1 accepting, 2
+note exhausted).
 fn sched_stat i ulong to ulong
 if lt i 16
 ret get scst i
@@ -1205,6 +1210,9 @@ ret get scgst sub i 32
 end
 if eq i 40
 ret get scgv 0
+end
+if eq i 41
+ret get scgv 4
 end
 ret 0
 end
@@ -1627,10 +1635,16 @@ note ready, a waiting job is admitted, a waiting or ready job is cancelled,
 note or a declaration changes. Bumps the graph version, which makes any
 note proposal stale (rejected when next used). Nothing is rescored here:
 note the next policy-2 pick rescores once, however many bumps came before
-note it (coalesced).
+note it (coalesced). At 2^40 - 1 bumps the version stays and is exhausted
+note (scgv 4 = 2): from then on proposals are refused and every pick
+note rescores.
 fn sp_bump to void
-put scgv 0 add get scgv 0 1
 put scgst 2 add get scgst 2 1
+if eq and get scgv 0 1099511627775 1099511627775
+put scgv 4 2
+ret
+end
+put scgv 0 add get scgv 0 1
 end
 
 note Unblock value of ready job j, in jobs: the waiting jobs whose deps meet
@@ -1672,10 +1686,11 @@ ret n
 end
 
 note Recompute the unblock value of every ready job when the graph version
-note moved since the last scoring; otherwise nothing.
+note moved since the last scoring, or always once it is exhausted;
+note otherwise nothing.
 fn sp_rescore to void
 v = get scgv 0
-if eq get scgv 1 v
+if and eq get scgv 1 v ne get scgv 4 2
 ret
 end
 for j ulong 64
@@ -1690,8 +1705,9 @@ put scgst 6 add get scgst 6 64
 end
 
 note The proposed job, when the proposal is for the current graph version
-note and the job is still ready and fits beside the reservation (rq); it is
-note used once. Otherwise the proposal is dropped as stale: 64.
+note (and that version is not exhausted) and the job is still ready and fits
+note beside the reservation (rq); it is used once. Otherwise the proposal
+note is dropped as stale: 64.
 fn sp_proposal rq ulong to ulong
 p = get scgv 2
 if eq p 0
@@ -1700,7 +1716,7 @@ end
 put scgv 2 0
 put scst 3 add get scst 3 1
 j = sub p 1
-if eq get scgv 3 get scgv 0
+if and eq get scgv 3 get scgv 0 eq get scgv 4 1
 if eq get sjst j 2
 if sp_fits get sjneed j rq
 put scgst 7 add get scgst 7 1
@@ -1739,39 +1755,51 @@ end
 note Creator, right after sched_new: incarnation n (1..2^24 - 1), distinct
 note for every scheduler that may receive proposals meant for another (the
 note journal fence, DRA-398). The graph version becomes n * 2^40, which no
-note scheduler of another incarnation reaches, and any proposal is dropped.
-note 0 or -7.
+note scheduler of another incarnation reaches, any proposal is dropped and
+note proposals are accepted from now on. Once per scheduler: 0, or -7 (n
+note out of range, or already set or exhausted).
 fn sched_incarnate n ulong to long
 if or eq n 0 ge n 16777216
+ret neg long 7
+end
+if ne get scgv 4 0
 ret neg long 7
 end
 put scgv 0 shl n 40
 put scgv 1 get scgv 0
 put scgv 2 0
+put scgv 4 1
 ret 0
 end
 
 note Creator, policy 2: propose the ready job whose id is id for the next
 note pick, computed at graph version v (an outside planner, or an
 note operator). The proposal names the job, not its slot. Reservations and
-note feasibility still come first: it is checked again when used. 0; -9
-note stale (v is not the current version); -3 no ready job has that id;
-note -8 it does not fit beside the reservation; -7 not policy 2.
+note feasibility still come first: it is checked again when used. 0; -6 no
+note incarnation set or the version exhausted; -9 stale (v is not the
+note current version); -3 no ready job, or more than one, has that id; -8
+note it does not fit beside the reservation; -7 not policy 2.
 fn sched_propose id ulong v ulong to long
 if ne get scpol 0 2
 ret neg long 7
+end
+if ne get scgv 4 1
+put scgst 5 add get scgst 5 1
+ret neg long 6
 end
 if ne v get scgv 0
 put scgst 4 add get scgst 4 1
 ret neg long 9
 end
 j = ulong 64
+n = ulong 0
 for k ulong 64
 if and eq get sjst k 2 eq get sjid k id
 j = k
+n = add n 1
 end
 end
-if ge j 64
+if ne n 1
 put scgst 5 add get scgst 5 1
 ret neg long 3
 end

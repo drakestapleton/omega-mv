@@ -664,28 +664,33 @@ for other workers and no model is called.
 Proposals. `sched_propose id v` lets an outside planner or an operator put
 the ready job whose id is `id` first, computed at graph version `v`
 (`sched_version`). The proposal names the job, not its table slot. It is
-refused when `v` is not current (-9, counted stale), when no ready job has
-that id (-3) or when the job does not fit beside the reservation (-8). It
-is used once, at the next pick, after the reservation, and only if the
-version is still `v`, the job is still ready and it still fits; otherwise
-it is dropped and counted stale. Within one scheduler every change of a
-slot's occupant bumps the version, so a current version still names the
-job it was made for. Across schedulers the version carries the
-incarnation: `sched_incarnate n` (right after `sched_new`, n in
-1..2^24 - 1, distinct per scheduler; DRA-398 uses the journal fence) makes
-the version n × 2^40 plus the bumps since, which no scheduler of another
-incarnation reaches.
+refused until the scheduler has an incarnation and once its version is
+exhausted (-6), when `v` is not current (-9, counted stale), when no ready
+job or more than one has that id (-3) or when the job does not fit beside
+the reservation (-8). It is used once, at the next pick, after the
+reservation, and only if the version is still `v` and not exhausted, the
+job is still ready and it still fits; otherwise it is dropped and counted
+stale. Within one scheduler every admission, cancellation of a waiting or
+ready job and readiness bumps the version, so a job that leaves the ready
+state and a new occupant of its slot are both seen. Across schedulers the
+version carries the incarnation: `sched_incarnate n` (once, right after
+`sched_new`, n in 1..2^24 - 1, distinct per scheduler; DRA-398 uses the
+journal fence) makes the version n × 2^40 plus the bumps since. The bump
+that would reach 2^40 does not carry into the next incarnation's range: the
+version stays and is exhausted, proposals are refused for the rest of that
+scheduler and every pick rescores, since the version no longer tells
+whether the inputs moved.
 
 | Function | Contract |
 | --- | --- |
 | `sched_goal j pro est unc` | Declare topics, estimate (ms) and its uncertainty (ms) for a waiting or ready job; 0 or -3. |
 | `sched_version` | The graph version. It moves on admission, a job becoming ready, cancellation and `sched_goal`, and on nothing else (not on completions, releases, lease expiry, `sched_cap` or `sched_policy`); it versions the inputs of ranking and proposals, not the whole scheduler state. |
-| `sched_incarnate n` | Set the incarnation (1..2^24 - 1); the version becomes n × 2^40 and a pending proposal is dropped; 0 or -7. |
-| `sched_propose id v` | Propose the ready job with id `id` at version v; 0, -9 stale, -3 no ready job has that id, -8 does not fit beside the reservation, -7 not policy 2. |
-| `sched_stat 32..40` | Rescorings, jobs scored, version bumps, proposals accepted, stale, refused, value slot reads, proposals used; 40 the graph version. |
+| `sched_incarnate n` | Set the incarnation (1..2^24 - 1), once: the version becomes n × 2^40, a pending proposal is dropped and proposals are accepted; 0, or -7 (out of range, already set, or exhausted). |
+| `sched_propose id v` | Propose the ready job with id `id` at version v; 0, -6 no incarnation or exhausted, -9 stale, -3 no ready job or more than one has that id, -8 does not fit beside the reservation, -7 not policy 2. |
+| `sched_stat 32..41` | Rescorings, jobs scored, version bumps, proposals accepted, stale, refused, value slot reads, proposals used; 40 the graph version; 41 the proposal state (0 no incarnation, 1 accepting, 2 exhausted). |
 
 `schedpol-gate goal` runs every phase under policy 2 (exit 0). Phases G, H,
-P, I, R2 and K set policy 2 themselves and run after W in the default and
+P, I, R2, X and K set policy 2 themselves and run after W in the default and
 `goal` modes; the `fifo` and `noreserve` controls stop at their earlier
 expected failures (11 and 61), so they never reach these phases. Every
 dispatch a phase causes outside a creator step (resume, publication) is
@@ -698,6 +703,7 @@ bracketed by the same step bounds.
 | P | a stale proposal is refused and counted; one naming an id with no ready job is refused; a current one is used over a higher-ranked job; one made stale by a later change is rejected at use and counted; -7 outside policy 2 | 170..178 |
 | I | scheduler 1 (incarnation 1) hands out a version for job a in slot 0; scheduler 2 (incarnation 2) puts job b in slot 0 with as many bumps: the old version is stale, a's id names no job, b's proposal is accepted, incarnation 0 is refused | 184, 185 |
 | R2 | 5 CPU, bypass budget 1: with B (4 CPU) reserved, x (2 CPU) is refused beside it; cancelling B clears the reservation and x is accepted; an event with no idle worker reserves B2 and keeps the proposal; at the next pick x no longer fits beside B2, so the proposal is dropped and counted stale and x stays ready; once B2 fits, y (1 CPU) is accepted beside it and at the next event B2 runs first, then y is used, and x, bypassed by y, becomes the reservation | 186..189, 179 |
+| X | no incarnation: a proposal is refused; a second incarnation is refused; after the first a proposal is accepted and used. At the last revision of incarnation 5 a proposal is accepted, the next bump exhausts the version instead of reaching incarnation 6, proposals are refused, the pending one is dropped at use and every pick rescores. Two ready jobs sharing an id: a proposal naming it is refused | 120..127 |
 | K | the key on two slots: value before estimate before age; outside policy 2 age only | 180..183 |
 
 | Change to `sched.om` | Expected exit (derived from the check it trips) |
@@ -713,6 +719,12 @@ bracketed by the same step bounds.
 | estimate ignored in the key | 181 |
 | incarnation ignored (`sched_incarnate` leaves the version at 0) | 184: both schedulers reach version 1, so the old version is current |
 | proposal fit not rechecked at use (`sp_proposal`) | 189: x is used beside B2 |
+| proposals accepted without an incarnation (state check removed in `sched_propose`) | 120 |
+| incarnation set twice (once check removed in `sched_incarnate`) | 121 |
+| version carries into the next incarnation (saturation removed in `sp_bump`) | 123: the version moves to 6 × 2^40 |
+| exhausted version not checked at use (`sp_proposal`) | 125: the pending proposal still names the stuck version and is used |
+| exhausted version trusted by `sp_rescore` | 126: the second pick does not rescore |
+| an id shared by two ready jobs accepted (`sched_propose` takes the last) | 127 |
 
 ## Proposals, authority and cancellation (DRA-288)
 
