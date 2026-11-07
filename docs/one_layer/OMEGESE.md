@@ -1045,6 +1045,7 @@ Non-byte arrays and mismatched scalar types are error 7.
 | `dupfd fd target flags` | Duplicate onto a chosen descriptor using `dup3`. |
 | `execprog A off n` | Replace the process using a packed argument list. Only returns on failure. |
 | `execpure A off n` | Keyword id 198, AArch64 only (x86 emission refuses with error 25). As `execprog`, then pin the executable as descriptor 3 and apply the fixed strict stdio profile below before `execveat(AT_EMPTY_PATH)`. Only returns on failure, with the first failing step's negative errno. |
+| `execenv A off n B off m` | Keyword id 233, AArch64 and x86linux. As `execprog A off n`, but the child's environment is exactly packet B (u16 count 1..64, nonempty u16-length records, 2..4096 bytes, no embedded zero, no trailing bytes) instead of an empty one. Both packets are checked (trap 3) before descriptors above 2 close. Only returns on failure, with a negative errno; refused in function mode (error 9) and in contracts (error 30). Gate: `seed/host/execenv/`. |
 | `argcnt` | Return argument count, including the executable name. |
 | `argread index A off capacity` | Copy argument bytes without a terminator; return byte length. An invalid index traps 3. Insufficient capacity returns -105 without changing the slice. |
 | `envcnt` | Return the number of entries in the process environment (the `envp` the kernel supplied). |
