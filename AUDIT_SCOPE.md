@@ -23,9 +23,10 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`,
-   from `seed/omc/omc.om` `2c0fc44bdd607f9e84315e15c7c7ea263a5f0b6d83aa3f446fa6ed975e8ef34c`; the x86efi
-   anchor fix, branch `hive/omega-mv-x86efi-semhash`). The earlier audit pins `b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3`
+   `a0b21072586bc8ce19b0ca14642b978a7a5a232f6f686ef72430e1206803049b`,
+   from `seed/omc/omc.om` `256caefe0c4d55badac8ac2f22ef4e8bd8bc867f635267662902765b4c1db339`; the opt-in
+   bounds-check erasure om2 bce, DRA-189, branch `hive/t_6ff77933-bce`). The earlier audit pins
+   `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df` (x86efi anchor fix), `b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3`
    (PR #1045, main 8dc0fc5c), `96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763`
    (PR #1050, main 49d79616), `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`
    (PR #1015, main d3d1b1bc) and `be8c51301307555254fc59e351d281aae1aa096d91521777e33a41c8b446448a` (main 9920aab1) are historical.

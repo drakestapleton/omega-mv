@@ -731,7 +731,7 @@ section lists what omc implements of it. Fixtures, expected results and compiled
 meaning and, for the C2 manifest, its exact output bytes or error.
 
 - **Opt-in.** Leading blank lines and `note` lines are skipped; when the next line is exactly `om2`,
-  `om2 diag` or `om2 fmt` (no other bytes on it) the unit is OM-2. Any other line leaves the unit OM-1,
+  `om2 diag` or `om2 fmt` (no other bytes on it; `om2 bce` and `om2 diag bce` below) the unit is OM-2. Any other line leaves the unit OM-1,
   where the `om2` line itself is error 16 as before. The words of this section are reserved only in an
   OM-2 unit: `rotr rotl unroll inline fresh abstract seal open holds layout field at little big part out
   export ops dit scrub`. Using one as a name there is error 16; an OM-1 unit keeps them as ordinary names.
@@ -791,6 +791,14 @@ meaning and, for the C2 manifest, its exact output bytes or error.
 - **Trap sites.** With `om2 diag`, an accepted unit's stderr gets one `omc-site 1 line=N iter=k` record
   per runtime trap site, in emission order: N the source line, k the counters of the open unrolled loops
   outer to inner joined by `.`, or `-`. stdout is unchanged.
+- **Bounds-check erasure `bce` (rule `forbnd`, DRA-189).** The lead line `om2 bce` (or `om2 diag bce`)
+  lets omc omit the run-time check (trap 3) of an index into a sized array when the index is the counter
+  `i` of an enclosing `for i ulong K` loop, K is a number (literal, const, or `len NAME`) with
+  `1 <= K <= len`, the loop is not `unroll`, and no line of its body starts with `i`. Every other index
+  keeps its check; the x86 target keeps every check. With `om2 diag bce` each omitted check writes
+  `omc-check 1 erased line=N rule=forbnd kind=bounds ctr=C count=K arr=A len=L` and is absent from the
+  `omc-site` records. Without `bce` the output bytes are unchanged. Proof over an explicit model, the
+  certificate checker and the trusted computing base: `seed/omc/om2/bce/README.md`.
 - **External layout.** `layout NAME SIZE`, then one line `field F T [COUNT] at OFF little|big` per field
   (note lines allowed), then `end`, at top level before the first `fn`. NAME and F at most 8 bytes and not
   OM-2 words; NAME is a new name (error 10), F unique in its layout (error 10); T an integer type

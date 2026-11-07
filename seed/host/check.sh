@@ -110,6 +110,20 @@ grep -qx 'OM2GATE FAIL cases=10 pass=2 fail=8 invalid=0 not_run=0' "$run/bndmut.
 [ "$(grep -c '^VERDICT ctl-bnd-[a-z]*-g0-run PASS ' "$run/bndmut.log")" = 2 ]
 [ "$(grep -c '^VERDICT bnd-[a-z]*-[a-z0-9-]* FAIL ' "$run/bndmut.log")" = 8 ]
 echo 'PASS expression boundaries (47 cases) and 2 operand mutants killed'
+# OM-2 opt-in for-counter bounds-check erasure (DRA-189, rule forbnd): semantics, fallback, records, mutants.
+"$B/gate" seed/out/omc "$pin" seed/omc/om2/bce/bce.cases "$run/bce" > "$run/bce.log" || { cat "$run/bce.log"; exit 1; }
+grep -qx 'OM2GATE PASS cases=59 pass=59 fail=0 invalid=0 not_run=0' "$run/bce.log"
+if "$B/gate" seed/out/omc "$pin" seed/omc/om2/bce/mutants.cases "$run/bcemut" > "$run/bcemut.log"; then
+    echo 'FAIL bounds-check erasure mutant survived' >&2
+    exit 1
+else
+    status=$?
+    [ "$status" = 1 ] || { cat "$run/bcemut.log"; exit 1; }
+fi
+grep -qx 'OM2GATE FAIL cases=18 pass=9 fail=9 invalid=0 not_run=0' "$run/bcemut.log"
+[ "$(grep -c -E '^VERDICT ctl-(bce|ck)-[a-z]* PASS ' "$run/bcemut.log")" = 9 ]
+[ "$(grep -c -E '^VERDICT (bce|ck)-[a-z]* FAIL ' "$run/bcemut.log")" = 9 ]
+echo 'PASS for-counter bounds-check erasure and certificate checker (59 cases), 6 omc.om and 3 checker mutants killed'
 # OM-2 function-mode host words: admitted subset, context tables and x86 syscall/fence mutants.
 "$B/gate" seed/out/omc "$pin" seed/omc/om2/fnhost/fnhost.cases "$run/fnhost" > "$run/fnhost.log" || { cat "$run/fnhost.log"; exit 1; }
 grep -qx 'OM2GATE PASS cases=21 pass=21 fail=0 invalid=0 not_run=0' "$run/fnhost.log"

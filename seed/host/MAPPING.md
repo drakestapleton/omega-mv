@@ -360,3 +360,12 @@ caller's R14 at snapshot offset 152, carries the anchor in firmware-preserved
 R14 across the call, loads ARG last and restores R13 and R14 from the snapshot
 tail. `tests/x86efi/run.sh` under QEMU/OVMF goes from 4/25 to 25/25; this is
 emulated, not hardware evidence.
+
+The opt-in for-counter bounds-check erasure (DRA-189) births compiler
+`a0b21072586bc8ce19b0ca14642b978a7a5a232f6f686ef72430e1206803049b`
+from source
+`256caefe0c4d55badac8ac2f22ef4e8bd8bc867f635267662902765b4c1db339`.
+Rule `forbnd` applies only under the lead words `om2 bce` or `om2 diag bce`; every
+other unit compiles to the bytes 5f90edea gives (1334 corpus units compared). The
+rule, its Lean proof, certificate checker, gate and benchmark are in
+`seed/omc/om2/bce/README.md`. Host words and their lowering are unchanged.
