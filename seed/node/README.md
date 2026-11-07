@@ -13,7 +13,7 @@ Source fragments, concatenated in this order before one program with `fn main`:
 | `transport.om` | one arena: 64 immutable records, topic scan, eventfd hints, stop flag (#1055) |
 | `pool.om` | K arenas reused by epoch, reader holds, fail-closed rollover (DRA-286) |
 | `super.om` | forked workers, death detection, reaping, creator-loss detection, bounded stop (DRA-286) |
-| `sched.om` | subscriptions, dependency wake-ups, bounded admission and review, job loss handling (DRA-287) |
+| `sched.om` | subscriptions, dependency wake-ups, bounded admission and review, job loss handling (DRA-287); resource requests and the selection policy (P-DRA-14) |
 | `seed/authority/action.om` | the existing action records the authority layer commits through |
 | `journal.om` | durable journal of every authority transition, fencing, restart recovery (DRA-289) |
 | `auth.om` | typed proposals, one commit owner, cancellation of real child tools, operator controls (DRA-288) |
@@ -362,7 +362,110 @@ The gate covers the following phases:
 | `sched.om`: `put sjst j 6` to `put sjst j 2` (UNKNOWN job rerun) | 83 |
 | `sched.om`: delete `sc_set w 64 get scseq w` (dead worker's assignment not retired) | 92 |
 | `sched.om`: `put sjst j 1` to `put sjst j 2` (dependencies ignored) | 68 |
-| `super.om`: `iv = interval` to `iv = 0`, run with `idle` (workers spin) | 138 |
+| `super.om`: `iv = interval` to `iv = long 0`, run with `idle` (workers spin) | 138 |
+
+## Resource-aware selection (P-DRA-14)
+
+Owner: the adaptive scheduling lane, [P-DRA-14](https://linear.app/drake-stapleton/project/aien-adaptive-scheduling-feasible-work-and-fair-progress-f20e588c68cd)
+(DRA-395 to DRA-399). It owns selection policy, fairness, reservation and
+ranking in `sched.om` and `schedpol-test.om`; transport, pool, supervision,
+authority, journal and the workflow stay with their DRA-286..290 owners.
+There is one scheduler: these are policies of `sched_dispatch`, not a second
+dispatcher.
+
+Status (DRA-395): IMPLEMENTED: resource requests, capacity admission and
+policy 0, FIFO head-of-line, which reproduces the reference pump. The
+regression below fails on purpose until DRA-396 adds fair fitting.
+
+```sh
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/node/schedpol-test.om > build/node/schedpol-composed.om
+cmp build/node/schedpol-composed.om seed/node/schedpol-gate.om
+seed/out/omc < seed/node/schedpol-gate.om > build/node/schedpol-gate
+chmod +x build/node/schedpol-gate
+timeout 120 build/node/schedpol-gate     # DRA-395: exit 11, the blocked head
+```
+
+### Reference pump and ownership
+
+aien-dev/aien-sovereign-core-mv at `dffdbd195edcbe1ec3bd2fa255355b15c530f31e`,
+`crates/spark-harness/src/scheduler/core.rs` (blob `32c3f431b58c`) `Core::pump`
+fills a bounded ready queue in task-id order (lines 584-596), then dispatches
+from its head while `PermitPool::try_acquire` succeeds (598-602); the first
+head that does not fit ends the pump. A request over the limits is refused at
+registration (`ExceedsCapacity`, 654-655 with `permits.rs` 51-54).
+
+That pump is reference-only, not deployed and not yet superseded:
+- `scheduler/mod.rs` (blob `001db62c4f4a`) says it is opt-in (`ProvisionalConfig::enabled` false by default) and that no spark-harness API or MCP tool uses it.
+- Its only consumer in that repository is the optional `aien-runtime` feature `provisional-prep` and that crate's tests.
+- The installed `~/.local/bin/spark-harness` on the Spark (sha256 `9fe2941155ca…`, built 2026-09-18) offers `test`, `mcp`, `validate` and `eval` and contains no provisional-scheduler code; no spark-harness process runs.
+
+`sched.om` becomes the forward owner when this stack merges and DRA-292
+deploys it. Until then neither scheduler dispatches live hive work.
+
+Call graph of the Omega side (one creator calls everything):
+
+| Entry | Callers |
+| --- | --- |
+| `sched_dispatch` | `sched_step` (`code.om` `cw_drive`, tests), `sched_publish` (`code.om` `cw_issue`), `sched_pause` (`auth_pause`) |
+| `sched_admit`, `sched_admitr` | `jn_admit` (`journal.om`, from `cw_issue`), the readmission in `jn_recover` |
+| `sched_collect`, `sched_lost` | `sched_step`, `sched_stop` |
+| `sched_cancel`, `sched_review` | `auth_cancel`, `jn_release` |
+| `sched_wjob`, `sched_wdone` | the worker loops (`code.om` `cw_worker`, `cw_job`) |
+
+The coding workflow keeps one inference in flight itself (`cw_plan`), always
+starting with the lowest-numbered objective that needs a turn, above the
+scheduler, which sees every job as one worker and no resource.
+
+### Resources and policy 0
+
+A request is one ulong of four 16-bit counts: kind 0 CPU slots, 1 memory MiB,
+2 inference slots, 3 caller-defined. Capacities default to 65535 of each, so
+callers that declare nothing (`sched_admit`) behave as before. A job takes its
+whole need when it is assigned and gives it back when its worker reports done
+(even while its result waits for review room) or is reaped. Every job also
+needs one idle live worker.
+
+Policy 0 serves the ready job that became ready first, if it fits; when it
+does not, nothing is assigned. This is the reference pump with an unbounded
+queue: in both, a head that does not fit holds back every later job. The
+differences are deliberate and do not change that outcome: ready order is the
+order of becoming ready (the pump appends newly eligible tasks in id order),
+and the bounded window of the pump is not modelled because only its head can
+be dispatched.
+
+| Function | Contract |
+| --- | --- |
+| `sched_admitr id deps flags req` | `sched_admit` with a resource request; -8 when a kind exceeds its capacity (counted, never queued). |
+| `sched_cap caps` | Set every capacity; -8 and no change when an admitted job would no longer fit. |
+| `sched_policy p win db by` | Policy (0 only, for now), candidate window 1..64 slots, dispatch budget 1..64 per event, bypass budget 1..65535; -7 out of range. |
+| `sched_stat i` | Counters 0..15, capacity 16..19, use 20..23, policy words 24..29. |
+
+Admission order (`sjarr`) and ready order (`sjrdy`) are logical counters, so
+selection never reads the clock.
+
+### Regression and controls
+
+`schedpol-test.om` checks after every creator step that each kind's use is at
+most its capacity and equals the needs of the running jobs that hold it.
+
+| Phase | Scenario | Exit when it fails |
+| --- | --- | --- |
+| C | requests over CPU, memory or inference capacity refused (-8) and counted; lowering a capacity below an admitted need refused | 31..41 |
+| D | 12 jobs with mixed needs on 3 workers, capacity 4 CPU, 1024 MiB, 1 inference: each runs once, all resources free at the end | 42..48 |
+| F | ready order: a job made ready by a later publication is served after one ready earlier | 50..57 |
+| A | blocked head: a (3 CPU) runs, b (2 CPU) cannot fit, c (1 CPU) fits | 11: c stays idle behind b |
+| B | queue exclusion of the pump: a runs, b and d (2 CPU) wait, e (1 CPU) fits | 21: e stays idle |
+
+At DRA-395 the gate passes C, D and F and stops at A with exit 11, the same
+head-of-line block the Rust pump shows in
+`~/handoffs/hive/sched/rust-repro/REPORT.md`.
+
+| Change to `sched.om` | Expected exit |
+| --- | --- |
+| `if not sp_feas req` to `if false` (impossible requests admitted) | 31 |
+| `sp_give j` deleted from `sched_collect` (resources never returned) | 44 |
+| `if gt sp_need req k a` to `if false` in `sp_fits` (capacity ignored) | 44 |
+| `sp_ready j` in `sched_publish` to `put sjst j 2` (ready order not stamped) | 54 |
 
 ## Proposals, authority and cancellation (DRA-288)
 

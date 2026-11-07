@@ -12,7 +12,19 @@ note before its done seq. Each word has one writer; the creator writes a
 note worker word only after it has reaped that worker.
 note Job states: 0 free, 1 waiting for deps, 2 ready, 3 running, 4 in review,
 note 6 UNKNOWN (its worker died mid-job and the job is not safe to rerun).
+note
+note Resources and selection policy (P-DRA-14, DRA-395). A request is one
+note ulong of four 16-bit counts, kind k at bits 16k..16k+15: kind 0 CPU
+note slots, 1 memory MiB, 2 inference slots, 3 caller-defined. scap holds
+note the configured capacity of each kind, suse the sum of the needs of the
+note jobs that hold resources (sjheld 1). A job takes its whole need when it
+note is assigned and gives it back when its worker reports done or is reaped,
+note never in part. Every job also needs one idle live worker.
+note sjarr: admission order (waiting age; kept across reruns). sjrdy: order
+note in which the job last became ready. sjbyp: times it was bypassed.
+note Decisions read only these logical counters, never the clock.
 const SJCAP ulong 64
+const SPVER ulong 1
 global scmap long 2
 global sclim ulong 2
 global sjst ulong 64
@@ -22,10 +34,26 @@ global sjw ulong 64
 global sjatt ulong 64
 global sjfl ulong 64
 global sjout ulong 64
+global sjneed ulong 64
+global sjheld ulong 64
+global sjarr ulong 64
+global sjrdy ulong 64
+global sjbyp ulong 64
 global scbusy ulong 64
 global scseq ulong 64
 global swcur ulong 2
 global scpause ulong 1
+global scap ulong 4
+global suse ulong 4
+note Policy words: 0 policy (0 FIFO head-of-line), 1 candidate window in
+note slots, 2 dispatch budget per event, 3 bypass budget, 4 cursor,
+note 5 reserved job slot + 1 (0 none).
+global scpol ulong 8
+note Counters (sched_stat): 0 admissions, 1 ready stamps, 2 dispatch events,
+note 3 slots examined, 4 jobs assigned, 5 bypasses, 6 reservations made,
+note 7 impossible requests refused, 8 head-of-line stops, 9 reserved jobs
+note assigned.
+global scst ulong 16
 
 fn sc_cell w ulong off ulong to ulong
 ret mapget get scmap 0 add mul w 128 off 8
@@ -63,10 +91,153 @@ put sclim 0 a
 put sclim 1 rl
 for j ulong 64
 put sjst j 0
+put sjheld j 0
 put scbusy j 0
 put scseq j 0
 end
+for k ulong 4
+put scap k 65535
+put suse k 0
+end
+for i ulong 16
+put scst i 0
+end
+put scpol 0 0
+put scpol 1 64
+put scpol 2 64
+put scpol 3 4
+put scpol 4 0
+put scpol 5 0
 put scpause 0 0
+ret 0
+end
+
+note Count of kind k (0..3) in packed request req.
+fn sp_need req ulong k ulong to ulong
+ret and shr req mul k 16 65535
+end
+
+note Free capacity of kind k; 0 while a lowered capacity is below the use.
+fn sp_free k ulong to ulong
+if gt get suse k get scap k
+ret 0
+end
+ret sub get scap k get suse k
+end
+
+note Does req fit in the free capacity once the reserved request res has
+note what it still lacks? Of each kind, res keeps min(free, its need); res 0
+note is no reservation. This keeps the reserved job's attainable capacity
+note from ever shrinking (the drain).
+fn sp_fits req ulong res ulong to bool
+for k ulong 4
+f = sp_free k
+r = sp_need res k
+a = ulong 0
+if gt f r
+a = sub f r
+end
+if gt sp_need req k a
+ret false
+end
+end
+ret true
+end
+
+note Could req ever run, with the configured capacity all free?
+fn sp_feas req ulong to bool
+for k ulong 4
+if gt sp_need req k get scap k
+ret false
+end
+end
+ret true
+end
+
+note Job j takes its whole need.
+fn sp_take j ulong to void
+for k ulong 4
+put suse k add get suse k sp_need get sjneed j k
+end
+put sjheld j 1
+end
+
+note Job j gives back its need, if it holds it.
+fn sp_give j ulong to void
+if eq get sjheld j 0
+ret
+end
+for k ulong 4
+put suse k sub get suse k sp_need get sjneed j k
+end
+put sjheld j 0
+end
+
+note Job j becomes ready, stamped with the next ready order.
+fn sp_ready j ulong to void
+put sjst j 2
+put sjrdy j get scst 1
+put scst 1 add get scst 1 1
+end
+
+note Creator: counter i of scst, capacity (i 16..19) or use (i 20..23) of a
+note kind, or policy word (i 24..29).
+fn sched_stat i ulong to ulong
+if lt i 16
+ret get scst i
+end
+if lt i 20
+ret get scap sub i 16
+end
+if lt i 24
+ret get suse sub i 20
+end
+if lt i 30
+ret get scpol sub i 24
+end
+ret 0
+end
+
+note Creator: set the capacity of every kind from caps (packed like a
+note request). 0, or -8 when an admitted job needs more than the new
+note capacity of a kind (nothing changes).
+fn sched_cap caps ulong to long
+for j ulong 64
+s = get sjst j
+if and ge s 1 le s 3
+for k ulong 4
+if gt sp_need get sjneed j k sp_need caps k
+ret neg long 8
+end
+end
+end
+end
+for k ulong 4
+put scap k sp_need caps k
+end
+ret 0
+end
+
+note Creator: policy p (0 FIFO head-of-line), candidate window win slots
+note (1..64), dispatch budget db jobs per event (1..64), bypass budget by
+note (1..65535). The cursor and any reservation are kept. 0 or -7.
+fn sched_policy p ulong win ulong db ulong by ulong to long
+if gt p 0
+ret neg long 7
+end
+if or eq win 0 gt win 64
+ret neg long 7
+end
+if or eq db 0 gt db 64
+ret neg long 7
+end
+if or eq by 0 gt by 65535
+ret neg long 7
+end
+put scpol 0 p
+put scpol 1 win
+put scpol 2 db
+put scpol 3 by
 ret 0
 end
 
@@ -91,11 +262,17 @@ end
 ret n
 end
 
-note Creator: admit job id. deps 0 makes it ready at once; otherwise it waits
-note for a publication whose topics meet deps. flags bit 0: safe to rerun
-note after its worker dies. Returns the job slot, or -2 when admitted work
-note (waiting, ready, running) is at its limit: refused, not queued.
-fn sched_admit id ulong deps ulong flags ulong to long
+note Creator: admit job id needing req (packed resources). deps 0 makes it
+note ready at once; otherwise it waits for a publication whose topics meet
+note deps. flags bit 0: safe to rerun after its worker dies. Returns the job
+note slot; -8 when req exceeds the configured capacity of a kind (it could
+note never run); -2 when admitted work (waiting, ready, running) is at its
+note limit: refused, not queued.
+fn sched_admitr id ulong deps ulong flags ulong req ulong to long
+if not sp_feas req
+put scst 7 add get scst 7 1
+ret neg long 8
+end
 if ge sched_count 1 3 get sclim 0
 ret neg long 2
 end
@@ -107,8 +284,13 @@ put sjfl j flags
 put sjatt j 0
 put sjout j 0
 put sjw j 0
+put sjneed j req
+put sjheld j 0
+put sjbyp j 0
+put sjarr j get scst 0
+put scst 0 add get scst 0 1
 if eq deps 0
-put sjst j 2
+sp_ready j
 else
 put sjst j 1
 end
@@ -116,6 +298,11 @@ ret long j
 end
 end
 ret neg long 2
+end
+
+note Creator: sched_admitr with no resource need beyond one worker.
+fn sched_admit id ulong deps ulong flags ulong to long
+ret sched_admitr id deps flags 0
 end
 
 note Creator: worker w is woken by publications whose topics meet topics.
@@ -132,43 +319,98 @@ sc_set w 40 ulong monons
 r = sup_wake w
 end
 
-note Creator: give ready jobs to idle live workers, lowest slot first. A
-note worker is idle when the creator has collected its last assignment.
-note The job id and the input epoch and version are written before the seq.
-note Returns the number assigned.
-fn sched_dispatch c long to ulong
-if ne get scpause 0 0
-ret 0
-end
-n = mapget c 48 8
-k = ulong 0
-for j ulong 64
-if eq get sjst j 2
+note Lowest idle live worker below n, or 64 when none. A worker is idle when
+note the creator has collected its last assignment.
+fn sp_idle n ulong to ulong
 for w ulong n bound 64
 if and gt get swpid w 0 eq get scbusy w 0
+ret w
+end
+end
+ret 64
+end
+
+note Assign job j to idle worker w: it takes its need; the job id and the
+note input epoch and version are written before the seq, then the wake.
+fn sp_start c long j ulong w ulong to void
 q = add get scseq w 1
 put scseq w q
 put scbusy w add j 1
 put sjst j 3
 put sjw j w
 put sjatt j add get sjatt j 1
+put sjbyp j 0
+sp_take j
+if eq get scpol 5 add j 1
+put scpol 5 0
+put scst 9 add get scst 9 1
+end
 sc_set w 8 get sjid j
 sc_set w 16 pool_epoch c
 sc_set w 24 node_count pool_current c
 sc_set w 0 q
 sc_wake w
-k = add k 1
+put scst 4 add get scst 4 1
+end
+
+note Policy 0, FIFO head-of-line, the semantics of the reference pump
+note (aien-sovereign-core-mv spark-harness scheduler/core.rs Core::pump):
+note the head is the ready job that became ready first; it is chosen when it
+note fits, and when it does not fit nothing is chosen, so a head that does
+note not fit holds back every later job. Returns the slot or 64.
+fn sp_fifo to ulong
+h = ulong 64
+for j ulong 64
+if eq get sjst j 2
+if eq h 64
+h = j
+else
+if lt get sjrdy j get sjrdy h
+h = j
+end
+end
+end
+end
+put scst 3 add get scst 3 64
+if eq h 64
+ret 64
+end
+if sp_fits get sjneed h 0
+ret h
+end
+put scst 8 add get scst 8 1
+ret 64
+end
+
+note Creator: assign ready jobs to idle live workers under the policy, at
+note most the dispatch budget per call. Returns the number assigned.
+fn sched_dispatch c long to ulong
+if ne get scpause 0 0
+ret 0
+end
+n = mapget c 48 8
+k = ulong 0
+put scst 2 add get scst 2 1
+for i ulong get scpol 2 bound 64
+w = sp_idle n
+if ge w 64
 break
 end
+j = sp_fifo
+if ge j 64
+break
 end
-end
+sp_start c j w
+k = add k 1
 end
 ret k
 end
 
 note Creator: move finished jobs into review while review has room. A worker
 note whose result is waiting for room keeps it and gets no new job, so a
-note full review queue stops assignment instead of dropping work.
+note full review queue stops assignment instead of dropping work. A job
+note gives back its resources as soon as its worker reported done, even
+note while its result waits for room.
 fn sched_collect c long to ulong
 n = mapget c 48 8
 k = ulong 0
@@ -176,10 +418,11 @@ for w ulong n bound 64
 b = get scbusy w
 if gt b 0
 if eq sc_cell w 64 get scseq w
-if ge sched_count 4 4 get sclim 1
-ret k
-end
 j = sub b 1
+sp_give j
+if ge sched_count 4 4 get sclim 1
+continue
+end
 put sjst j 4
 put sjout j sc_cell w 72
 put scbusy w 0
@@ -211,8 +454,9 @@ end
 j = sub b 1
 sc_set w 64 get scseq w
 put scbusy w 0
+sp_give j
 if ne and get sjfl j 1 0
-put sjst j 2
+sp_ready j
 else
 put sjst j 6
 end
@@ -251,7 +495,7 @@ end
 for j ulong 64
 if eq get sjst j 1
 if ne and get sjdep j topics 0
-put sjst j 2
+sp_ready j
 end
 end
 end

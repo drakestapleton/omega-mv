@@ -1,0 +1,319 @@
+note Concatenate after transport.om, pool.om, super.om and sched.om. CPU-only
+note acceptance of the resource-aware selection policy (P-DRA-14) with real
+note forked workers: impossible requests, the capacity invariant under churn,
+note ready order, and the head-of-line scenarios of the reference pump
+note (aien-sovereign-core-mv spark-harness scheduler/core.rs Core::pump).
+note After every creator step the test checks that no kind is used beyond its
+note capacity and that the use equals the needs of the jobs holding them.
+note No GPU, model or network.
+text pok "PASS node schedpol\n"
+text pst "schedpol events="
+text pex " examined="
+text pas " assigned="
+text phol " hol_stops="
+text pbyp " bypasses="
+text pres " reservations="
+text pnl "\n"
+global ptc long 1
+
+fn pt_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn pt_num v ulong to void
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 d k sub 20 k
+end
+
+note Packed request: cpu slots, memory MiB, inference slots, kind 3.
+fn pt_req cpu ulong mem ulong inf ulong x ulong to ulong
+ret or or cpu shl mem 16 or shl inf 32 shl x 48
+end
+
+note Worker: run assignment q for the milliseconds in the low four decimal
+note digits of its job id, then report outcome id+1 and 8 bytes. 0 done,
+note 2 stopped, 3 creator gone, 4 wait error, 5 report refused.
+fn pt_run c long w ulong q ulong to int
+buf = new uchar 4096 0
+id = sc_cell w 8
+dl = add ulong monons mul rem id 10000 1000000
+for t ulong 1000000
+now = ulong monons
+if ge now dl
+break
+end
+r = sched_wwait c w long sub dl now
+if eq r 2
+ret 2
+end
+if eq r 3
+ret 3
+end
+if lt r 0
+ret 4
+end
+end
+if ne sched_wdone w q add id 1 buf 8 0
+ret 5
+end
+ret 0
+end
+
+fn pt_worker w ulong to int
+c = get ptc 0
+for it ulong 1000000000
+q = sched_wjob w
+if gt q 0
+r = pt_run c w q
+if eq r 2
+ret 0
+end
+if ne r 0
+ret add 60 r
+end
+continue
+end
+r = sched_wwait c w neg long 1
+if eq r 2
+ret 0
+end
+if eq r 3
+ret 41
+end
+if lt r 0
+ret 43
+end
+end
+ret 45
+end
+
+fn pt_spawn c long w ulong to bool
+p = sup_spawn c w
+if eq p 0
+exit pt_worker w
+end
+ret gt p 0
+end
+
+note Fresh pool for w workers (spawned), admission limit a, review limit rl,
+note capacities caps. Exits with code on any refusal.
+fn pt_setup w ulong a ulong rl ulong caps ulong code int to long
+c = pool_new 4 w
+pt_ok gt c 0 code
+put ptc 0 c
+pt_ok eq sup_init c 0 code
+pt_ok eq sched_new c a rl 0 code
+pt_ok eq sched_cap caps 0 code
+for i ulong w bound 64
+pt_ok pt_spawn c i code
+end
+ret c
+end
+
+fn pt_down c long code int to void
+pt_ok ge sched_stop c 2000000000 0 code
+sup_closeall
+pt_ok eq sched_free 0 code
+pt_ok eq pool_free c 0 code
+end
+
+note The capacity invariant: of each kind the use is at most the capacity
+note and equals the sum of the needs of the jobs that hold resources; only
+note a running job holds them.
+fn pt_inv code int to void
+for k ulong 4
+s = ulong 0
+for j ulong 64
+if eq get sjheld j 1
+pt_ok eq get sjst j 3 code
+s = add s sp_need get sjneed j k
+end
+end
+pt_ok eq get suse k s code
+pt_ok le get suse k get scap k code
+end
+end
+
+note One creator step of up to 10 ms, then the invariant.
+fn pt_step c long code int to void
+r = sched_step c 10000000
+pt_ok ge r 0 code
+pt_inv code
+end
+
+note Step until job j is in a state in lo..hi, up to ms. True when reached.
+fn pt_until c long j ulong lo ulong hi ulong ms ulong code int to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+s = get sjst j
+if and ge s lo le s hi
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+pt_step c code
+end
+ret false
+end
+
+note Review every job in review whose outcome is its id + 1.
+fn pt_review code int to ulong
+n = ulong 0
+for j ulong 64
+if eq get sjst j 4
+pt_ok eq sched_review j long add get sjid j 1 code
+n = add n 1
+end
+end
+ret n
+end
+
+note Step and review until n jobs were reviewed, up to ms.
+fn pt_drain c long n ulong ms ulong code int to void
+dl = add ulong monons mul ms 1000000
+k = ulong 0
+for t ulong 1000000
+k = add k pt_review code
+if ge k n
+ret
+end
+pt_ok lt ulong monons dl code
+pt_step c code
+end
+exit code
+end
+
+fn pt_admit id ulong deps ulong req ulong code int to ulong
+j = sched_admitr id deps 0 req
+pt_ok ge j 0 code
+ret ulong j
+end
+
+note Phase C: a request beyond the capacity of any kind is refused (-8) and
+note counted; lowering a capacity below an admitted job's need is refused
+note and changes nothing.
+fn pt_impossible to void
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 30
+pt_ok eq sched_admitr 1 0 0 pt_req 5 0 0 0 neg long 8 31
+pt_ok eq sched_admitr 2 0 0 pt_req 1 1025 0 0 neg long 8 32
+pt_ok eq sched_admitr 3 0 0 pt_req 0 0 2 0 neg long 8 33
+pt_ok eq sched_stat 7 3 34
+a = pt_admit 4 0 pt_req 3 0 0 0 35
+pt_ok eq sched_cap pt_req 2 1024 1 8 neg long 8 36
+pt_ok eq sched_stat 16 4 37
+pt_ok eq sched_cancel a 1 38
+pt_ok eq sched_cap pt_req 2 1024 1 8 0 39
+pt_ok eq sched_stat 16 2 40
+pt_down c 41
+end
+
+note Phase D: 12 jobs with mixed CPU, memory and inference needs on three
+note workers, capacities 4 CPU, 1024 MiB, 1 inference slot. Every job runs
+note once and returns its outcome; the invariant holds at every step and
+note every resource is free at the end.
+fn pt_churn to void
+c = pt_setup 3 16 8 pt_req 4 1024 1 0 42
+for i ulong 12
+cpu = add rem i 3 1
+mem = mul add rem i 6 1 100
+inf = rem i 2
+id = add mul add i 1 10000 add 30 mul rem i 4 15
+j = pt_admit id 0 pt_req cpu mem inf 0 43
+end
+pt_drain c 12 10000 44
+for k ulong 4
+pt_ok eq get suse k 0 45
+end
+pt_ok eq sched_count 1 6 0 46
+pt_ok eq sched_stat 4 12 47
+pt_down c 48
+end
+
+note Phase F: ready order. With one worker, x is admitted first waiting on
+note topic 8 and y second ready at once; then topic 8 is published. FIFO
+note (policy 0) serves the job that became ready first, y.
+fn pt_order to void
+buf = new uchar 4096 0
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 50
+x = pt_admit 60050 8 0 51
+y = pt_admit 70050 0 0 52
+pt_ok gt sched_publish c 8 buf 16 0 53
+pt_ok eq get sjst y 3 54
+pt_ok eq get sjst x 2 55
+pt_drain c 2 3000 56
+pt_down c 57
+end
+
+note Phase A: the blocked head. a (3 CPU, 800 ms) runs; then b (2 CPU,
+note cannot fit) and c (1 CPU, fits) arrive with no dependency. The target
+note behaviour: c runs while a still runs and b waits. 11 means c stayed
+note idle behind b although a CPU was free: the head-of-line block.
+fn pt_blocked to void
+c = pt_setup 3 8 8 pt_req 4 1024 1 8 10
+a = pt_admit 10800 0 pt_req 3 0 0 0 10
+pt_ok pt_until c a 3 3 2000 10 10
+b = pt_admit 20050 0 pt_req 2 0 0 0 10
+x = pt_admit 30050 0 pt_req 1 0 0 0 10
+pt_ok pt_until c x 3 4 400 10 11
+pt_ok eq get sjst a 3 12
+pt_ok eq get sjst b 2 13
+pt_drain c 3 5000 14
+pt_down c 15
+end
+
+note Phase B: bounded-queue exclusion of the reference pump (queue of two):
+note a (3 CPU, 800 ms) runs, b and d (2 CPU each) cannot fit, e (1 CPU)
+note fits. The target: e runs while a still runs. 21 means e stayed idle.
+fn pt_exclude to void
+c = pt_setup 3 8 8 pt_req 4 1024 1 8 20
+a = pt_admit 10800 0 pt_req 3 0 0 0 20
+pt_ok pt_until c a 3 3 2000 20 20
+b = pt_admit 20050 0 pt_req 2 0 0 0 20
+d = pt_admit 40050 0 pt_req 2 0 0 0 20
+e = pt_admit 50050 0 pt_req 1 0 0 0 20
+pt_ok pt_until c e 3 4 400 20 21
+pt_ok eq get sjst a 3 22
+pt_drain c 4 5000 23
+pt_down c 24
+end
+
+fn pt_stats to void
+r = write 1 pst 0 len pst
+pt_num sched_stat 2
+r = write 1 pex 0 len pex
+pt_num sched_stat 3
+r = write 1 pas 0 len pas
+pt_num sched_stat 4
+r = write 1 phol 0 len phol
+pt_num sched_stat 8
+r = write 1 pbyp 0 len pbyp
+pt_num sched_stat 5
+r = write 1 pres 0 len pres
+pt_num sched_stat 6
+r = write 1 pnl 0 1
+end
+
+fn main to int
+pt_impossible
+pt_churn
+pt_order
+pt_blocked
+pt_exclude
+if ne write 1 pok 0 len pok long len pok
+ret 100
+end
+ret 0
+end
