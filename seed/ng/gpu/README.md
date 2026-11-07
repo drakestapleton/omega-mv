@@ -17,7 +17,7 @@ What is here today: the conformance gate of the encoder ng consumes.
 | `tests/slice.*` | 52 frames (every 64th of 3265, plus the last) of CUDApp's sm121dis corpus producers. |
 | `tests/ldg.*` | The bw_hazard_test program (310 insns) with two LDG.E +0x40 loads (CUDApp#373). |
 | `tests/badmagic.*`, `tests/trunc.*` | Malformed input: exit 2 / exit 3 with one stderr line. |
-| `tests/m1..m4.{from,to}` | Encoder mutants (CUDApp mk/om-encoder.mk OM_ENC_MUTANTS 1..4), applied by `subst`. |
+| `tests/m1..m4.{from,to}` | Encoder mutants, applied by `subst`: CUDApp mk/om-encoder.mk OM_ENC_MUTANTS 1..3 and OM_ENC_LDG_RED's first edit (the pre-fix LDG.E line). |
 
 Run from the repository root, with CUDApp at the lock's commit in `../CUDApp`:
 
@@ -30,7 +30,9 @@ Final line `OM2GATE PASS cases=12 pass=12 ...`.
 Inputs were captured from CUDApp's real C builders (`tests/test_omega_codegen_freestanding.c --golden/--dump` and
 `tools/sm121dis/corpus.sh` producers, CUDApp b774723f) through a link-time wrap of `omega_bw_enc_sm121` that appends
 each call's arguments and result to a file. The wrap and the C-oracle replayer are referee instruments, kept outside
-this repository (CUDApp `evidence/ldg-offset-20261107/ngcap.c`, `encref.c`); nothing here builds or runs C. Expected
+every repository (history: CUDApp `b056bf7e:evidence/ldg-offset-20261107/{ngcap.c,encref.c}`; removed from CUDApp at
+its desk review; on the Spark at `~/handoffs/hive-ng/gpu/evidence/ldg-offset-20261107-instruments/`); nothing here
+builds or runs C. Expected
 outputs: golden and dump are the bytes on which CUDApp's `.om` encoder and its C oracle agreed; slice and ldg are the C
 oracle's bytes, which the pinned `.om` encoder reproduces and CUDApp main b774723f's does not (LDG.E offset defect).
 
