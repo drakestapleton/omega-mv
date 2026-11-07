@@ -1,18 +1,14 @@
 note social/40auth.om: sessions, CSRF, and sign-in with a Radicle key (challenge + ssh-keygen -Y verify).
-note Cookies: forge_session=<64 hex token> (the log stores only sha256(token)); forge_pre=<32 hex>
-note binds the sign-in form to this browser. Both HttpOnly, Secure, SameSite=Lax, Path=<base>.
+note Cookies: __Host-forge_session=<64 hex token> (the log stores only sha256(token)); __Host-forge_pre=<32 hex>
+note binds the sign-in form to this browser. Both HttpOnly, Secure, SameSite=Lax, Path=/, no Domain (the
+note __Host- prefix), under either base: the browser then refuses the name from a subdomain or over http.
 note ---- Set-Cookie builder (fsck)
 fn soscct t view uchar * to void
 for i ulong len t bound 512
 fscc get t i
 end
 end
-fn soscbase to void
-for i ulong get fbasel 0 bound 64
-fscc get fbase i
-end
-end
-note sosckset: "<name>=<value>; Max-Age=<age>; HttpOnly; Secure; SameSite=Lax; Path=<base>"
+note sosckset: "<name>=<value>; Max-Age=<age>; HttpOnly; Secure; SameSite=Lax; Path=/"
 fn sosckset nm view uchar * v view uchar * age ulong to void
 put fsckl 0 0
 soscct nm
@@ -22,7 +18,6 @@ d = new uchar 20 0
 k = sodec age d
 soscct part d 0 k
 soscct tsckatt
-soscbase
 end
 note ---- cookies
 note sockget: value of cookie nm (prefix "name=") in fck into o; returns its length, 0 when absent or too long
@@ -176,30 +171,57 @@ put b i get fcsrf i
 end
 ret soeqct a b
 end
-note ---- per-IP limiter for sign-in attempts (in memory; the server is sequential)
+note ---- sign-in limiters (in memory; the server is sequential). The hash is keyed with social.key so a
+note client cannot aim its keys at someone else's slot.
 fn soiphash salt ulong to ulong
 h = xor ulong 14695981039346656037 salt
+for i ulong 8
+h = xor h ulong get gskey i
+h = mul h 1099511628211
+end
 for i ulong get fipl 0 bound 64
 h = xor h ulong get fip i
 h = mul h 1099511628211
 end
 ret h
 end
-note soiplim: count one attempt for (salt, IP) in this minute; false when over lim
+note soiplim: count one attempt for key (salt, IP) in this minute; false when over lim. A key looks at 8
+note slots from its hash and reuses only slots of an earlier minute, so it never evicts another key's live
+note count; with no room it is refused (fail closed).
 fn soiplim salt ulong lim ulong to bool
 h = soiphash salt
-s = and h 4095
 m = div get gsnow 0 60
-if or ne get gsipk s h ne get gsipm s m
-put gsipk s h
-put gsipm s m
-put gsipc s 0
-end
-c = add get gsipc s 1
-put gsipc s c
+s = and h 4095
+for j ulong 8
+k = and add s j 4095
+if and eq get gsipk k h eq get gsipm k m
+c = add get gsipc k 1
+put gsipc k c
 ret le c lim
 end
-note sovlim: at most 60 signature checks per minute in total (bounds ssh-keygen spawns)
+end
+for j ulong 8
+k = and add s j 4095
+if ne get gsipm k m
+put gsipk k h
+put gsipm k m
+put gsipc k 1
+ret le 1 lim
+end
+end
+ret false
+end
+note sodidh: salt for the per-(DID, IP) limiter (FNV-1a of the z... key)
+fn sodidh z view uchar * to ulong
+h = ulong 1469598103934665603
+for i ulong len z bound 64
+h = xor h ulong get z i
+h = mul h 1099511628211
+end
+ret or h 2
+end
+note sovlim: a site-wide backstop of 600 signature checks per minute (bounds ssh-keygen spawns); the
+note per-IP (10/min) and per-(DID, IP) (5/min) limits come first, so one client cannot reach it alone
 fn sovlim to bool
 m = div get gsnow 0 60
 if ne get gsvm 0 m
@@ -208,7 +230,38 @@ put gsvc 0 0
 end
 c = add get gsvc 0 1
 put gsvc 0 c
-ret le c 60
+ret le c 600
+end
+note ---- retired challenges: a nonce is spent by its first signature check, pass or fail. Ring of 16384
+note (nonce key, time); at most 600 checks a minute for 16 minutes is 9600, so a live entry is never
+note overwritten. In memory only: a successful nonce is also in the log (session event).
+fn sonrh nh view uchar * to ulong
+h = xor ulong 14695981039346656037 3
+for i ulong 8
+h = xor h ulong get gskey i
+h = mul h 1099511628211
+end
+for i ulong len nh bound 64
+h = xor h ulong get nh i
+h = mul h 1099511628211
+end
+ret h
+end
+fn sonret nh view uchar * to bool
+h = sonrh nh
+t = get gsnow 0
+for i ulong 16384
+if and eq get gsrnh i h le t add get gsrnt i 960
+ret true
+end
+end
+ret false
+end
+fn sonretire nh view uchar * to void
+i = get gsrni 0
+put gsrnh i sonrh nh
+put gsrnt i get gsnow 0
+put gsrni 0 and add i 1 16383
 end
 note ---- body fields
 note sobval: body field nm into o (at most len o); returns the length or -1 when absent or too long
@@ -381,7 +434,11 @@ ret 0
 end
 ret v
 end
+note sononused: the nonce is spent (retired by a check this run, or used by a session in the log)
 fn sononused nh view uchar * to bool
+if sonret nh
+ret true
+end
 sokclr
 sokt tsnonp
 sokt nh
@@ -409,9 +466,13 @@ end
 if not sodidpk part z 0 zl pk
 ret soerr 400 tsmdid
 end
+if not soiplim sodidh part z 0 zl 5
+ret soerr 429 tsmrate
+end
 if not sovlim
 ret soerr 429 tsmrate
 end
+sonretire nh
 v = soverify nh ts pk
 if lt v 0
 ret soerr ulong neg v tsmsig

@@ -58,6 +58,7 @@ global gdasn uchar 128
 global gdasnl ulong 1
 global gdwant uchar 128
 global gdwantl ulong 1
+global gdcold ulong 2
 text tdarch "/archive/"
 text tdheads "refs/heads/"
 text tdtags "refs/tags/"
@@ -89,6 +90,8 @@ text tdpref "--prefix="
 text tdfer "for-each-ref"
 text tdcnt1 "--count=1"
 text tdcont "--contains"
+text tdpts "--points-at"
+text tdfmtr "--format=%(refname)"
 text tdfmtx "--format=x"
 text tdsortd "--sort=-creatordate"
 text tdcnt5 "--count=500"
@@ -146,7 +149,7 @@ text tdtr1 "<tr><td><a href=\""
 text tdtd "</td><td>"
 text tdtdc "</td><td><code>"
 text tdtrx "</code></td></tr>\n"
-text tdna "</td><td>-</td><td>not available</td></tr>\n"
+text tdnb "</td><td>-</td><td>checksum computed on first download</td></tr>\n"
 text tdsrc " source"
 text tdarht "/archive/refs/tags/"
 text tdarhh "/archive/refs/heads/"
@@ -528,14 +531,19 @@ fka tdcatf
 fka tdeblob
 dlksha
 end
-note dlensure: gdf exists (a hit touches its ctime) or is generated now (what 1 archive, 2 blob)
+note dlensure: gdf exists (a hit touches its ctime) or is generated now (what 1 archive, 2 blob);
+note either way its .sha256 sidecar is written once; -7 = the site-wide cold-build cap is full
 fn dlensure what ulong to long
 if dlexists
 x = chmod gdf 0 get gdfl 0 384
+hs = dlsum
 ret 0
 end
 if not dlmkdir
 ret -2
+end
+if not dlcold
+ret -7
 end
 if eq what 1
 dlkarch
@@ -546,11 +554,43 @@ r = dlgenx
 if lt r 0
 ret r
 end
+gs = dlsum
 dlevict
 if not dlexists
 ret -5
 end
 ret 0
+end
+note dlcold: take a cold-build slot; at most 2 builds start in any 60 s, site-wide (gdcold: start times)
+fn dlcold to bool
+t = ulong monons
+for i ulong 2
+s = get gdcold i
+if or eq s 0 ge sub t s 60000000000
+put gdcold i t
+ret true
+end
+end
+ret false
+end
+note dlretry: whole seconds until the older slot frees, at least 1
+fn dlretry to ulong
+t = ulong monons
+a = get gdcold 0
+b = get gdcold 1
+if lt b a
+a = b
+end
+e = sub t a
+if ge e 60000000000
+ret 1
+end
+ret add div sub 60000000000 e 1000000000 1
+end
+note dlbusy: 503 with Retry-After (the server's error page; fretry is the contract's header field)
+fn dlbusy to long
+put fretry 0 dlretry
+ret 503
 end
 note ---- LRU eviction over <tfdata>archives/*/*
 fn dlevict to void
@@ -717,19 +757,26 @@ end
 end
 ret true
 end
-fn dlsum to bool
+note dlsumrd: the SHA-256 of gdf from its .sha256 sidecar into gdhex, never computed (gdp = sidecar)
+fn dlsumrd to bool
 dlpb
 dlpf
 dlpt tdsum
 fd = fopen gdp 0 get gdpl 0 524288 0
-if ge fd 0
+if lt fd 0
+ret false
+end
 r = read int fd gdhex 0 64
 x = fclose int fd
-if eq r 64
-if dlhex64
+if ne r 64
+ret false
+end
+ret dlhex64
+end
+note dlsum: the sidecar's SHA-256, or compute it over gdf in Omega and write the sidecar
+fn dlsum to bool
+if dlsumrd
 ret true
-end
-end
 end
 if not dlsha256f
 ret false
@@ -790,14 +837,17 @@ ret false
 end
 ret dlsha40
 end
-note dlreach: gdsha is reachable from a canonical head or tag (root or delegate namespace)
-fn dlreach to bool
+note dlrch0 / dlrch1: reachability from a canonical head or tag (root or delegate namespace):
+note dlrch0 starts the for-each-ref --contains argv, the caller adds one commit id, dlrch1 adds the
+note ref patterns and runs it; shared with browse (brreach)
+fn dlrch0 to void
 fkgit
 fka tdfer
 fka tdcnt1
 fka tdfmtx
 fka tdcont
-dlksha
+end
+fn dlrch1 to bool
 fka tdrh0
 fka tdrt0
 dlkns tdsrh0
@@ -817,7 +867,7 @@ end
 end
 ret true
 end
-note dlresolve: gdref of kind gdkind (1 head, 2 tag, 3 sha or any ref) to a commit in gdsha
+note dlresolve: gdref of kind gdkind (1 head, 2 tag, 3 any head or tag name) to a commit in gdsha
 fn dlresolve to bool
 k = get gdkind 0
 if eq k 1
@@ -831,11 +881,6 @@ if dlrevp 3
 ret true
 end
 ret dlrevp 4
-end
-if dlallhex
-if dlrevp 0
-ret dlreach
-end
 end
 if dlrevp 1
 ret true
@@ -984,6 +1029,11 @@ c = dlparse
 if ne c 0
 ret long c
 end
+if eq get gdkind 0 3
+if dlallhex
+ret dlarsha
+end
+end
 if not dlresolve
 ret 404
 end
@@ -991,6 +1041,101 @@ if eq get gdfmt 0 1
 ret dlarch2 tdezip tdctz
 end
 ret dlarch2 tdetgz tdctg
+end
+note dlarsha: /archive/<7..40 hex>: 302 to the archive of a head or tag at exactly that commit, else
+note 404 (no archive is built for any other commit)
+fn dlarsha to long
+if not dlrevp 0
+ret 404
+end
+if not dlpts
+ret 404
+end
+put fkind 0 2
+flocb
+for i ulong get fownl 0
+flocc get fown i
+end
+flocc 47
+for i ulong get frepol 0
+flocc get frepo i
+end
+if eq get gdkind 0 1
+floct tdarhh
+else
+floct tdarht
+end
+for i ulong get gdrefl 0
+flocc get gdref i
+end
+if eq get gdfmt 0 1
+floct tdzip
+else
+floct tdtgz
+end
+ret 302
+end
+note dlpts: the first canonical head (else tag) that points at gdsha, peeled, into gdkind / gdref
+note (refname order puts refs/heads and refs/namespaces/<nid>/refs/heads before any tag)
+fn dlpts to bool
+fkgit
+fka tdfer
+fka tdcnt1
+fka tdfmtr
+fka tdpts
+dlksha
+fka tdrh0
+fka tdrt0
+dlkns tdsrh0
+dlkns tdsrt0
+r = fexec 20000000000
+if ne r 0
+ret false
+end
+a = ulong 0
+if dlxat 0 tdns
+if not dlxat len tdns tfnid
+ret false
+end
+a = add len tdns len tfnid
+put gdkind 0 1
+if dlxat a tdsrh
+ret dlptsn add a len tdsrh
+end
+put gdkind 0 2
+if dlxat a tdsrt
+ret dlptsn add a len tdsrt
+end
+ret false
+end
+put gdkind 0 1
+if dlxat 0 tdheads
+ret dlptsn len tdheads
+end
+put gdkind 0 2
+if dlxat 0 tdtags
+ret dlptsn len tdtags
+end
+ret false
+end
+note dlptsn: the ref name in fxo from a to the newline into gdref, checked by dlrefok
+fn dlptsn a ulong to bool
+n = get fxol 0
+e = a
+for i ulong sub n a
+if eq get fxo add a i 10
+break
+end
+e = add e 1
+end
+if or le e a gt sub e a 200
+ret false
+end
+for i ulong sub e a
+put gdref i get fxo add a i
+end
+put gdrefl 0 sub e a
+ret dlrefok
 end
 fn dlarch2 ext view uchar * ct view uchar * to long
 dlprefix
@@ -1002,6 +1147,9 @@ put fkind 0 1
 ret 304
 end
 r = dlensure 1
+if eq r -7
+ret dlbusy
+end
 if lt r 0
 ret 500
 end
@@ -1350,19 +1498,13 @@ fput tdtgz
 end
 fput tdsrc
 fput tdax
-dlsumcells 1
+dlsumcells
 end
-note dlsumcells: ensure gdf (what 1 archive, 2 blob), then the size and SHA-256 cells
-fn dlsumcells what ulong to void
-r = dlensure what
-if lt r 0
-fput tdna
-ret
-end
-if not dlsum
-fput tdna
-ret
-end
+note dlsumcells: the size and SHA-256 cells of gdf (archive or blob) only when it is already built
+note with its sidecar; rendering a page never builds or hashes anything
+fn dlsumcells to void
+if dlexists
+if dlsumrd
 fput tdtd
 fnum get gdsize 0
 fput tdtdc
@@ -1370,6 +1512,10 @@ for i ulong 64
 fputc get gdhex i
 end
 fput tdtrx
+ret
+end
+end
+fput tdnb
 end
 note ---- release-assets/ of a tag (the commit in gdsha)
 note dllsa: git ls-tree -l -z <commit> -- release-assets/ into gdan / gdab / gdasz / gdanm / gdanl
@@ -1520,7 +1666,28 @@ end
 fput tdax
 dlabsha k
 dlfblob
-dlsumcells 2
+dlsumcells
+end
+note dlblobf: (browse /raw/ over 8 MiB) blob id s[0,40) into the blob cache and ffile; 0 ok, -1 not a
+note lowercase hex id, else dlensure's code (-7 = cold-build cap full: answer with dlbusy)
+fn dlblobf s view uchar * to long
+if lt len s 40
+ret -1
+end
+for i ulong 40
+c = get s i
+if not dlishex c
+ret -1
+end
+put gdsha i c
+end
+dlfblob
+r = dlensure 2
+if lt r 0
+ret r
+end
+dlsetfile
+ret 0
 end
 note ---- /releases pages
 fn dlrtitle t view uchar * to void
@@ -1719,6 +1886,9 @@ put fkind 0 1
 ret 304
 end
 r = dlensure 2
+if eq r -7
+ret dlbusy
+end
 if lt r 0
 ret 500
 end
