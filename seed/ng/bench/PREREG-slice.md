@@ -23,6 +23,8 @@ starts; written to `idle-start.txt` (and `idle-end.txt` after the round):
    gtrain4, ollm-mut-*);
 3. `nvidia-smi --query-compute-apps` is recorded (not a condition: the long-running tool-model servers hold GPU
    memory while idle).
+A status command that fails or prints output without its known section headers (`quiet lock holders:`,
+`gb10 lock holders:`, `waiting line (--wait):`) counts as not idle (amended before any timing row, after review).
 
 If the check fails inside the lock, the lock is released at once and the driver checks again every 60 s. It never
 pauses, signals or asks anyone else's job to stop.
