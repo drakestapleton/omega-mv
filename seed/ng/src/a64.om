@@ -1,0 +1,826 @@
+note a64: the Omega NG AArch64 back end (lane ng-a64), one unit of the ng compiler (DECISIONS.md D1b): ng is the
+note concatenation listed in seed/ng/ng.units, so this file has no fn main; its functions are a6_*, its globals a_*.
+note Design: seed/ng/a64/DESIGN.md. Instruction bits: Arm ARM DDI 0487 M.d, section named at each form (the source
+note of seed/rung2/table.s2). Input is main's i_in (ir.om), a_inlen bytes. a6_mode n is main's hook: in-band mode
+note `@ng a64-enc` (first input line) takes an encoder case list (seed/ng/a64/tests/enc.cases) and writes one
+note little-endian word per case (gate: seed/ng/a64/gate.om); any other first line returns 255 (not this unit's mode).
+note OM-2 (hex words) comes from the unit's first line, at the top of ir.om.
+
+note ---- input and output pools ----
+global a_inlen ulong 1
+global a_code uchar 16777216
+global a_cn ulong 1
+
+note a_emsg: line 0 the prefix, line k the class of refusal k (a6_die c k n)
+text a_emsg "a64:\n input unreadable\n input too large\n output failed\n bad encoder case at line\n unsupported\n immediate out of range\n branch out of range\n"
+
+note ---- fatal refusal: one stderr line `nga64: <class>[ <n>]` and exit code c (nothing on stdout) ----
+fn a6_lst k ulong to ulong
+note byte offset of line k of a_emsg
+i = ulong 0
+j = ulong 0
+while and lt j k lt i len a_emsg bound 4096
+if eq get a_emsg i 10
+j = add j 1
+end
+i = add i 1
+end
+ret i
+end
+
+global a_nbuf uchar 24
+
+fn a6_pnum v ulong to void
+p = ulong 23
+put a_nbuf 23 10
+x = v
+go = true
+while go bound 24
+p = sub p 1
+put a_nbuf p uchar add rem x 10 48
+x = div x 10
+if eq x 0
+go = false
+end
+end
+p = sub p 1
+put a_nbuf p 32
+w = write 2 a_nbuf p sub 24 p
+end
+
+fn a6_die c ulong k ulong n ulong to void
+w = write 2 a_emsg 0 4
+o = a6_lst k
+e = sub a6_lst add k 1 1
+w2 = write 2 a_emsg o sub e o
+if ne n 18446744073709551615
+a6_pnum n
+else
+w3 = write 2 a_emsg 4 1
+end
+exit int c
+end
+
+note ---- output: little-endian words into a_code, then all of a_code to stdout ----
+fn a6_emitw w ulong to void
+o = get a_cn 0
+if gt add o 4 len a_code
+a6_die 4 3 18446744073709551615
+end
+put a_code o uchar and w 255
+put a_code add o 1 uchar and shr w 8 255
+put a_code add o 2 uchar and shr w 16 255
+put a_code add o 3 uchar and shr w 24 255
+put a_cn 0 add o 4
+end
+
+fn a6_flush to void
+p = ulong 0
+n = get a_cn 0
+while lt p n bound 100000000
+k = write 1 a_code p sub n p
+if le k 0
+a6_die 4 3 18446744073709551615
+end
+p = add p ulong k
+end
+end
+
+note ======== encoder: one 32-bit A64 instruction word per form ========
+note A form is a row of the table set by a6_init: base word (the encoding diagram with every operand field 0,
+note Arm ARM DDI 0487 M.d section in the note above each group) and an operand kind. a6_enc f a b c d e builds the
+note word from up to five operands. Register numbers are 0..31 (31 is ZR or SP as the form says). An operand
+note that does not fit its field is refused (a6_die 6 or 7), never masked. The names in a_fnam are the names the
+note encoder case list (seed/ng/a64/tests/a6_enc.cases) uses, in form id order.
+note Kinds: 1 R3 (d n m sh amt): base | d | n<<5 | m<<16 | sh<<22 | amt<<10; 2 R4 (d n m a): | a<<10;
+note 3 EXT (d n m opt amt): | opt<<13 | amt<<10; 4 IMM12 (d n imm sh): | imm<<10 | sh<<22; 5 LOGI (d n value);
+note 6 MOVW (d imm16 hw): | imm<<5 | hw<<21; 7 BFM (d n immr imms); 8 CSEL (d n m cond): | cond<<12;
+note 9 LDST (t n imm12); 10 LDSR (t n m s): register offset LSL, s = scaled; 11 PAIR (t t2 n off): signed
+note byte offset /8 at bit 15; 12 B26 (words); 13 BCOND (cond words); 14 CB (t words); 15 TB (t bit words);
+note 16 BR (n); 17 SVC (imm16); 18 ADR (d bytes); 19 R2 (d n); 20 FCMP (n m); 21 EXTR (d n m lsb).
+note Signed operands (distances, pair offsets) are two's complement ulongs.
+
+global a_fbase ulong 256
+global a_fkind uchar 256
+global a_nform ulong 1
+
+text a_fnam "addx addw subx subw addsx addsw subsx subsw andx andw orrx orrw eorx eorw andsx bicx ornx mulx mulw smulh umulh sdivx udivx sdivw udivw lslvx lsrvx asrvx rorvx lslvw lsrvw asrvw maddx msubx addxe subsxe addxi addwi subxi subwi addsxi subsxi subswi addswi andxi orrxi eorxi andsxi andwi orrwi eorwi movzx movnx movkx movzw movnw ubfmx sbfmx ubfmw sbfmw extrx cselx csincx csinvx csnegx strb ldrb ldrsbx strh ldrh ldrshx strw ldrw ldrsw strx ldrx strs ldrs strd ldrd strbr ldrbr ldrsbxr strhr ldrhr ldrshxr strwr ldrwr ldrswr strxr ldrxr strsr ldrsr strdr ldrdr stpx ldpx stpxpre ldpxpre stpxpost ldpxpost stpd ldpd b bl bcond cbzx cbnzx cbzw cbnzw tbz tbnz ret br blr svc adr faddd fsubd fmuld fdivd fmaxd fmind fmaxnmd fminnmd fadds fsubs fmuls fdivs fmaxs fmins fmaxnms fminnms fsqrtd fabsd fnegd fmovd fsqrts fabss fnegs fmovs fcmpd fcmps fmaddd fmadds fcvtds fcvtsd fmovxd fmovdx fmovws fmovsw scvtfdx ucvtfdx scvtfsx ucvtfsx fcvtzsxd fcvtzuxd fcvtzsxs fcvtzuxs"
+
+fn a6_fset i ulong b ulong k ulong to void
+put a_fbase i b
+put a_fkind i uchar k
+if ge i get a_nform 0
+put a_nform 0 add i 1
+end
+end
+
+note form ids used by the selector (index into a_fnam)
+const a_addx ulong 0
+const a_addw ulong 1
+const a_subx ulong 2
+const a_subw ulong 3
+const a_addsx ulong 4
+const a_subsx ulong 6
+const a_subsw ulong 7
+const a_andx ulong 8
+const a_orrx ulong 10
+const a_eorx ulong 12
+const a_andsx ulong 14
+const a_ornx ulong 16
+const a_mulx ulong 17
+const a_mulw ulong 18
+const a_smulh ulong 19
+const a_umulh ulong 20
+const a_sdivx ulong 21
+const a_udivx ulong 22
+const a_udivw ulong 24
+const a_lslvx ulong 25
+const a_lsrvx ulong 26
+const a_asrvx ulong 27
+const a_lslvw ulong 29
+const a_maddx ulong 32
+const a_msubx ulong 33
+const a_subsxe ulong 35
+const a_addxi ulong 36
+const a_subxi ulong 38
+const a_addsxi ulong 40
+const a_subsxi ulong 41
+const a_andxi ulong 44
+const a_orrxi ulong 45
+const a_eorxi ulong 46
+const a_movzx ulong 51
+const a_movnx ulong 52
+const a_movkx ulong 53
+const a_ubfmx ulong 56
+const a_sbfmx ulong 57
+const a_cselx ulong 61
+const a_csincx ulong 62
+const a_strb ulong 65
+const a_ldrb ulong 66
+const a_strx ulong 74
+const a_ldrx ulong 75
+const a_strd ulong 78
+const a_ldrd ulong 79
+const a_strbr ulong 80
+const a_ldrbr ulong 81
+const a_ldrxr ulong 90
+const a_stpx ulong 95
+const a_ldpx ulong 96
+const a_stpxpr ulong 97
+const a_ldpxpo ulong 100
+const a_stpd ulong 101
+const a_ldpd ulong 102
+const a_b ulong 103
+const a_bl ulong 104
+const a_bcond ulong 105
+const a_cbzx ulong 106
+const a_cbnzx ulong 107
+const a_ret ulong 112
+const a_svc ulong 115
+const a_adr ulong 116
+const a_fmovd ulong 136
+const a_fcmpd ulong 141
+const a_fmovxd ulong 147
+const a_fmovdx ulong 148
+
+note the form table. Sections: C6.2.6 ADD, C6.2.458 SUB, C6.2.8 ADDS, C6.2.465 SUBS, C6.2.15 AND, C6.2.302 ORR,
+note C6.2.156 EOR, C6.2.17 ANDS, C6.2.32 BIC, C6.2.300 ORN (shifted register; 32-bit forms clear bit 31)
+fn a6_formdp to void
+a6_fset 0 0x8b000000 1
+a6_fset 1 0x0b000000 1
+a6_fset 2 0xcb000000 1
+a6_fset 3 0x4b000000 1
+a6_fset 4 0xab000000 1
+a6_fset 5 0x2b000000 1
+a6_fset 6 0xeb000000 1
+a6_fset 7 0x6b000000 1
+a6_fset 8 0x8a000000 1
+a6_fset 9 0x0a000000 1
+a6_fset 10 0xaa000000 1
+a6_fset 11 0x2a000000 1
+a6_fset 12 0xca000000 1
+a6_fset 13 0x4a000000 1
+a6_fset 14 0xea000000 1
+a6_fset 15 0x8a200000 1
+a6_fset 16 0xaa200000 1
+note C6.2.293 MUL (MADD Ra=31), C6.2.370 SMULH, C6.2.505 UMULH, C6.2.366 SDIV, C6.2.490 UDIV, C6.2.271 LSLV,
+note C6.2.274 LSRV, C6.2.21 ASRV, C6.2.343 RORV
+a6_fset 17 0x9b007c00 1
+a6_fset 18 0x1b007c00 1
+a6_fset 19 0x9b407c00 1
+a6_fset 20 0x9bc07c00 1
+a6_fset 21 0x9ac00c00 1
+a6_fset 22 0x9ac00800 1
+a6_fset 23 0x1ac00c00 1
+a6_fset 24 0x1ac00800 1
+a6_fset 25 0x9ac02000 1
+a6_fset 26 0x9ac02400 1
+a6_fset 27 0x9ac02800 1
+a6_fset 28 0x9ac02c00 1
+a6_fset 29 0x1ac02000 1
+a6_fset 30 0x1ac02400 1
+a6_fset 31 0x1ac02800 1
+note C6.2.275 MADD, C6.2.291 MSUB
+a6_fset 32 0x9b000000 2
+a6_fset 33 0x9b008000 2
+note C6.2.4 ADD (extended register), C6.2.463 SUBS (extended register)
+a6_fset 34 0x8b200000 3
+a6_fset 35 0xeb200000 3
+note C6.2.5 ADD, C6.2.457 SUB, C6.2.7 ADDS, C6.2.464 SUBS (immediate)
+a6_fset 36 0x91000000 4
+a6_fset 37 0x11000000 4
+a6_fset 38 0xd1000000 4
+a6_fset 39 0x51000000 4
+a6_fset 40 0xb1000000 4
+a6_fset 41 0xf1000000 4
+a6_fset 42 0x71000000 4
+a6_fset 43 0x31000000 4
+note C6.2.14 AND, C6.2.301 ORR, C6.2.155 EOR, C6.2.16 ANDS (immediate)
+a6_fset 44 0x92000000 5
+a6_fset 45 0xb2000000 5
+a6_fset 46 0xd2000000 5
+a6_fset 47 0xf2000000 5
+a6_fset 48 0x12000000 5
+a6_fset 49 0x32000000 5
+a6_fset 50 0x52000000 5
+note C6.2.285 MOVZ, C6.2.284 MOVN, C6.2.283 MOVK
+a6_fset 51 0xd2800000 6
+a6_fset 52 0x92800000 6
+a6_fset 53 0xf2800000 6
+a6_fset 54 0x52800000 6
+a6_fset 55 0x12800000 6
+note C6.2.488 UBFM, C6.2.355 SBFM, C6.2.162 EXTR
+a6_fset 56 0xd3400000 7
+a6_fset 57 0x93400000 7
+a6_fset 58 0x53000000 7
+a6_fset 59 0x13000000 7
+a6_fset 60 0x93c00000 21
+note C6.2.115 CSEL, C6.2.117 CSINC, C6.2.118 CSINV, C6.2.119 CSNEG
+a6_fset 61 0x9a800000 8
+a6_fset 62 0x9a800400 8
+a6_fset 63 0xda800000 8
+a6_fset 64 0xda800400 8
+end
+
+note loads and stores: C6.2.417 STRB, C6.2.220 LDRB, C6.2.224 LDRSB, C6.2.419 STRH, C6.2.222 LDRH, C6.2.226
+note LDRSH, C6.2.415 STR, C6.2.216 LDR, C6.2.228 LDRSW, C7.2.331 STR (SIMD&FP), C7.2.191 LDR (SIMD&FP); unsigned
+note offset (kind 9) then the same bases as register offset (kind 10)
+fn a6_formls to void
+a6_fset 65 0x39000000 9
+a6_fset 66 0x39400000 9
+a6_fset 67 0x39800000 9
+a6_fset 68 0x79000000 9
+a6_fset 69 0x79400000 9
+a6_fset 70 0x79800000 9
+a6_fset 71 0xb9000000 9
+a6_fset 72 0xb9400000 9
+a6_fset 73 0xb9800000 9
+a6_fset 74 0xf9000000 9
+a6_fset 75 0xf9400000 9
+a6_fset 76 0xbd000000 9
+a6_fset 77 0xbd400000 9
+a6_fset 78 0xfd000000 9
+a6_fset 79 0xfd400000 9
+i = ulong 0
+while lt i 15 bound 15
+a6_fset add 80 i get a_fbase add 65 i 10
+i = add i 1
+end
+note C6.2.414 STP, C6.2.213 LDP (64-bit: signed offset, pre-index, post-index); C7.2.330 STP, C7.2.190 LDP (D)
+a6_fset 95 0xa9000000 11
+a6_fset 96 0xa9400000 11
+a6_fset 97 0xa9800000 11
+a6_fset 98 0xa9c00000 11
+a6_fset 99 0xa8800000 11
+a6_fset 100 0xa8c00000 11
+a6_fset 101 0x6d000000 11
+a6_fset 102 0x6d400000 11
+note C6.2.35 B, C6.2.43 BL, C6.2.34 B.cond, C6.2.78 CBZ, C6.2.77 CBNZ, C6.2.481 TBZ, C6.2.480 TBNZ,
+note C6.2.338 RET, C6.2.46 BR, C6.2.44 BLR, C6.2.466 SVC, C6.2.11 ADR
+a6_fset 103 0x14000000 12
+a6_fset 104 0x94000000 12
+a6_fset 105 0x54000000 13
+a6_fset 106 0xb4000000 14
+a6_fset 107 0xb5000000 14
+a6_fset 108 0x34000000 14
+a6_fset 109 0x35000000 14
+a6_fset 110 0x36000000 15
+a6_fset 111 0x37000000 15
+a6_fset 112 0xd65f0000 16
+a6_fset 113 0xd61f0000 16
+a6_fset 114 0xd63f0000 16
+a6_fset 115 0xd4000001 17
+a6_fset 116 0x10000000 18
+end
+
+note scalar floating point (ftype bits 22..23: 00 single, 01 double): C7.2.50 FADD, C7.2.161 FSUB, C7.2.133 FMUL,
+note C7.2.98 FDIV, C7.2.111 FMAX, C7.2.121 FMIN, C7.2.113 FMAXNM, C7.2.123 FMINNM; C7.2.157 FSQRT, C7.2.46 FABS,
+note C7.2.139 FNEG, C7.2.129 FMOV (register); C7.2.66 FCMP; C7.2.105 FMADD; C7.2.69 FCVT; C7.2.131 FMOV
+note (general); C7.2.236 SCVTF, C7.2.355 UCVTF, C7.2.92 FCVTZS, C7.2.96 FCVTZU (scalar, integer)
+fn a6_formfp to void
+a6_fset 117 0x1e602800 1
+a6_fset 118 0x1e603800 1
+a6_fset 119 0x1e600800 1
+a6_fset 120 0x1e601800 1
+a6_fset 121 0x1e604800 1
+a6_fset 122 0x1e605800 1
+a6_fset 123 0x1e606800 1
+a6_fset 124 0x1e607800 1
+a6_fset 125 0x1e202800 1
+a6_fset 126 0x1e203800 1
+a6_fset 127 0x1e200800 1
+a6_fset 128 0x1e201800 1
+a6_fset 129 0x1e204800 1
+a6_fset 130 0x1e205800 1
+a6_fset 131 0x1e206800 1
+a6_fset 132 0x1e207800 1
+a6_fset 133 0x1e61c000 19
+a6_fset 134 0x1e60c000 19
+a6_fset 135 0x1e614000 19
+a6_fset 136 0x1e604000 19
+a6_fset 137 0x1e21c000 19
+a6_fset 138 0x1e20c000 19
+a6_fset 139 0x1e214000 19
+a6_fset 140 0x1e204000 19
+a6_fset 141 0x1e602000 20
+a6_fset 142 0x1e202000 20
+a6_fset 143 0x1f400000 2
+a6_fset 144 0x1f000000 2
+a6_fset 145 0x1e22c000 19
+a6_fset 146 0x1e624000 19
+a6_fset 147 0x9e660000 19
+a6_fset 148 0x9e670000 19
+a6_fset 149 0x1e260000 19
+a6_fset 150 0x1e270000 19
+a6_fset 151 0x9e620000 19
+a6_fset 152 0x9e630000 19
+a6_fset 153 0x9e220000 19
+a6_fset 154 0x9e230000 19
+a6_fset 155 0x9e780000 19
+a6_fset 156 0x9e790000 19
+a6_fset 157 0x9e380000 19
+a6_fset 158 0x9e390000 19
+end
+
+fn a6_init to void
+a6_formdp
+a6_formls
+a6_formfp
+end
+
+fn a6_fld v ulong w ulong to ulong
+if ge v shl ulong 1 w
+a6_die 5 6 v
+end
+ret v
+end
+
+note a6_dsig: a signed distance d (two's complement ulong) that must fit w bits, masked to w bits (a6_die 7 if not)
+fn a6_dsig d ulong w ulong to ulong
+h = shl ulong 1 sub w 1
+if ne shr d 63 0
+if lt d sub 0 h
+a6_die 5 7 d
+end
+else
+if ge d h
+a6_die 5 7 d
+end
+end
+ret and d sub shl ulong 1 w 1
+end
+
+note ---- bitmask immediates (DDI 0487 M.d J1 shared pseudocode DecodeBitMasks, run backwards): a6_bmenc v w
+note returns N << 12 | immr << 6 | imms for the w-bit (32 or 64) value v, or 65536 when v has no encoding ----
+fn a6_rotl x ulong r ulong e ulong to ulong
+note rotate the low e bits of x left by r (0 <= r < e <= 64)
+if eq r 0
+ret x
+end
+m = ulong 18446744073709551615
+if lt e 64
+m = sub shl ulong 1 e 1
+end
+ret and or shl x r shr x sub e r m
+end
+
+note a6_bmsz: the smallest element size e (2..64) whose pattern repeats through all of x
+fn a6_bmsz x ulong to ulong
+e = ulong 64
+go = true
+while and go gt e 2 bound 6
+h = shr e 1
+m = sub shl ulong 1 h 1
+if eq and x m and shr x h m
+e = h
+else
+go = false
+end
+end
+ret e
+end
+
+fn a6_popc x ulong e ulong to ulong
+k = ulong 0
+i = ulong 0
+while lt i e bound 64
+k = add k and shr x i 1
+i = add i 1
+end
+ret k
+end
+
+fn a6_bmenc v ulong w ulong to ulong
+x = v
+if eq w 32
+x = and v 0xffffffff
+x = or x shl x 32
+end
+if or eq x 0 eq x 18446744073709551615
+ret 65536
+end
+e = a6_bmsz x
+if and eq w 32 eq e 64
+ret 65536
+end
+m = ulong 18446744073709551615
+if lt e 64
+m = sub shl ulong 1 e 1
+end
+el = and x m
+k = a6_popc el e
+ones = sub shl ulong 1 k 1
+r = ulong 0
+found = e
+while lt r e bound 64
+if eq a6_rotl el r e ones
+found = r
+r = e
+else
+r = add r 1
+end
+end
+if eq found e
+ret 65536
+end
+ret a6_bmpk e found k
+end
+
+note a6_bmpk: N:immr:imms for element size e, rotation r, k ones
+fn a6_bmpk e ulong r ulong k ulong to ulong
+if eq e 64
+ret or or shl ulong 1 12 shl r 6 sub k 1
+end
+pre = and 0x3f not sub shl e 1 1
+ret or shl r 6 or pre sub k 1
+end
+
+note a6_poff: a signed byte offset (multiple of 8, -512 .. 504) as the 7-bit imm7 field
+fn a6_poff off ulong to ulong
+if ne and off 7 0
+a6_die 5 6 off
+end
+q = shr off 3
+if ne shr off 63 0
+q = or q 0xe000000000000000
+if lt q 0xffffffffffffffc0
+a6_die 5 6 off
+end
+else
+if gt q 63
+a6_die 5 6 off
+end
+end
+ret and q 127
+end
+
+note a6_rdn: base | d | n << 5 (both 5-bit fields)
+fn a6_rdn b ulong d ulong n ulong to ulong
+ret or or b a6_fld d 5 shl a6_fld n 5 5
+end
+
+fn a6_enca k ulong b ulong x ulong y ulong z ulong u ulong to ulong
+note kinds 1..10 (a6_enc splits the table so each part stays small)
+if eq k 1
+ret or or a6_rdn b x y shl a6_fld z 5 16 shl a6_fld u 6 10
+end
+if eq k 4
+ret or or a6_rdn b x y shl a6_fld z 12 10 shl a6_fld u 1 22
+end
+if eq k 5
+c = a6_bmenc z shl ulong 32 shr b 31
+if eq c 65536
+a6_die 5 6 z
+end
+ret or a6_rdn b x y shl c 10
+end
+if eq k 6
+ret or or or b a6_fld x 5 shl a6_fld y 16 5 shl a6_fld z 2 21
+end
+if eq k 7
+ret or or a6_rdn b x y shl a6_fld z 6 16 shl a6_fld u 6 10
+end
+if eq k 9
+ret or a6_rdn b x y shl a6_fld z 12 10
+end
+if eq k 10
+ret or or a6_rdn or sub b 0x01000000 0x00206800 x y shl a6_fld z 5 16 shl a6_fld u 1 12
+end
+a6_die 5 5 k
+ret 0
+end
+
+note a6_encbr: kinds 12..18 (branches, BR, SVC, ADR)
+fn a6_encbr k ulong bs ulong a ulong b ulong c ulong to ulong
+if eq k 12
+ret or bs a6_dsig a 26
+end
+if eq k 13
+ret or or bs shl a6_dsig b 19 5 a6_fld a 4
+end
+if eq k 14
+ret or or bs shl a6_dsig b 19 5 a6_fld a 5
+end
+if eq k 15
+x = or or bs shl shr a6_fld b 6 5 31 shl and b 31 19
+ret or or x shl a6_dsig c 14 5 a6_fld a 5
+end
+if eq k 16
+ret or bs shl a6_fld a 5 5
+end
+if eq k 17
+ret or bs shl a6_fld a 16 5
+end
+y = a6_dsig b 21
+lo = shl and y 3 29
+hi = shl shr y 2 5
+ret or or or bs lo hi a6_fld a 5
+end
+
+note a6_enc f a b c d e: the instruction word of form f with operands a..e (unused operands 0)
+fn a6_enc f ulong a ulong b ulong c ulong d ulong e ulong to ulong
+if ge f get a_nform 0
+a6_die 5 5 f
+end
+k = ulong get a_fkind f
+bs = get a_fbase f
+if eq k 1
+x = a6_enca 1 bs a b c e
+ret or x shl a6_fld d 2 22
+end
+if eq k 3
+x = or a6_rdn bs a b shl a6_fld c 5 16
+ret or or x shl a6_fld d 3 13 shl a6_fld e 3 10
+end
+if eq k 2
+ret or or a6_rdn bs a b shl a6_fld c 5 16 shl a6_fld d 5 10
+end
+if eq k 8
+ret or or a6_rdn bs a b shl a6_fld c 5 16 shl a6_fld d 4 12
+end
+if eq k 11
+ret or or a6_rdn bs a c shl a6_fld b 5 10 shl a6_poff d 15
+end
+if and ge k 12 le k 18
+ret a6_encbr k bs a b c
+end
+if eq k 19
+ret a6_rdn bs a b
+end
+if eq k 20
+ret or or bs shl a6_fld a 5 5 shl a6_fld b 5 16
+end
+if eq k 21
+ret or or a6_rdn bs a b shl a6_fld c 5 16 shl a6_fld d 6 10
+end
+ret a6_enca k bs a b c d
+end
+
+note a6_ew: emit the word of form f
+fn a6_ew f ulong a ulong b ulong c ulong d ulong e ulong to void
+a6_emitw a6_enc f a b c d e
+end
+
+note ======== in-band mode `a64 enc`: one word per case line `NAME a b c d e | expected` ========
+note Lines that are blank or start with `;` are skipped. Operands are decimal (a leading - makes the two's
+note complement) or lowercase 0x hex. A line that names no form or has a bad operand is refused (a6_die 5 4 line).
+global a_cv ulong 8
+
+fn a6_isws c ulong to bool
+ret or eq c 32 eq c 9
+end
+
+note a6_samew: a_fnam[i .. i+n) equals i_in[s .. s+n)
+fn a6_samew i ulong s ulong n ulong to bool
+q = ulong 0
+while lt q n bound 64
+if ne get a_fnam add i q get i_in add s q
+ret false
+end
+q = add q 1
+end
+ret true
+end
+
+note a6_innm: byte j of a_fnam exists and is part of a name (and/or are eager, so the bound is tested here)
+fn a6_innm j ulong to bool
+if ge j len a_fnam
+ret false
+end
+ret ne get a_fnam j 32
+end
+
+note a6_fname: the form id whose name in a_fnam equals i_in[s .. s+n), or a_nform when there is none
+fn a6_fname s ulong n ulong to ulong
+i = ulong 0
+id = ulong 0
+ln = len a_fnam
+while lt i ln bound 4096
+j = i
+while a6_innm j bound 64
+j = add j 1
+end
+if eq sub j i n
+if a6_samew i s n
+ret id
+end
+end
+id = add id 1
+i = add j 1
+end
+ret get a_nform 0
+end
+
+note a6_numtk: the number at i_in[s .. e), into a_cv[7]; false if malformed
+fn a6_numtk s ulong e ulong to bool
+p = s
+ng = false
+if eq get i_in p 45
+ng = true
+p = add p 1
+end
+if ge p e
+ret false
+end
+v = ulong 0
+hex = false
+if lt add p 1 e
+if and eq get i_in p 48 eq get i_in add p 1 120
+hex = true
+p = add p 2
+end
+end
+while lt p e bound 64
+c = ulong get i_in p
+dg = ulong 99
+if and ge c 48 le c 57
+dg = sub c 48
+end
+if and hex and ge c 97 le c 102
+dg = sub c 87
+end
+if and hex ge dg 16
+ret false
+end
+if ge dg 10
+if not hex
+ret false
+end
+end
+if hex
+v = or shl v 4 dg
+else
+v = add mul v 10 dg
+end
+p = add p 1
+end
+if ng
+v = sub 0 v
+end
+put a_cv 7 v
+ret true
+end
+
+note a6_skipws: the first byte at or after p (before e) that is not a blank
+fn a6_skipws p ulong e ulong to ulong
+q = p
+while and lt q e a6_isws ulong get i_in q bound 100000
+q = add q 1
+end
+ret q
+end
+
+note a6_tokend: the end of the operand token at p (a blank, `|` or e)
+fn a6_tokend p ulong e ulong to ulong
+q = p
+while lt q e bound 64
+c = ulong get i_in q
+if or a6_isws c eq c 124
+ret q
+end
+q = add q 1
+end
+ret q
+end
+
+note a6_encln: one case line i_in[s .. e) (line number ln): the word for it
+fn a6_encln s ulong e ulong ln ulong to void
+p = a6_tokend s e
+f = a6_fname s sub p s
+if ge f get a_nform 0
+a6_die 5 4 ln
+end
+k = ulong 0
+while lt k 5 bound 5
+put a_cv k 0
+k = add k 1
+end
+k = ulong 0
+go = true
+while go bound 16
+p = a6_skipws p e
+if or ge p e eq get i_in p 124
+go = false
+else
+q = a6_tokend p e
+if or ge k 5 not a6_numtk p q
+a6_die 5 4 ln
+end
+put a_cv k get a_cv 7
+k = add k 1
+p = q
+end
+end
+a6_ewcv f
+end
+
+note a6_ewcv: emit form f with the operands in a_cv[0..4]
+fn a6_ewcv f ulong to void
+a = get a_cv 0
+b = get a_cv 1
+c = get a_cv 2
+d = get a_cv 3
+e = get a_cv 4
+a6_ew f a b c d e
+end
+
+fn a6_enctest to void
+n = get a_inlen 0
+p = ulong 0
+ln = ulong 1
+while and lt p n ne get i_in p 10 bound 4096
+p = add p 1
+end
+while lt p n bound 1000000
+p = add p 1
+ln = add ln 1
+s = p
+while and lt p n ne get i_in p 10 bound 100000
+p = add p 1
+end
+q = s
+while and lt q p a6_isws ulong get i_in q bound 100000
+q = add q 1
+end
+if lt q p
+if ne get i_in q 59
+a6_encln q p ln
+end
+end
+end
+a6_flush
+exit 0
+end
+
+note a6_istest: the first line is exactly `@ng a64-enc`
+text a_tmag "@ng a64-enc"
+fn a6_istest to bool
+n = len a_tmag
+if lt get a_inlen 0 n
+ret false
+end
+i = ulong 0
+while lt i n bound 16
+if ne get i_in i get a_tmag i
+ret false
+end
+i = add i 1
+end
+if gt get a_inlen 0 n
+if ne get i_in n 10
+ret false
+end
+end
+ret true
+end
+
+note a6_mode n: main's hook, with the input in i_in[0, n). A mode of this unit runs and exits; any other first
+note line returns 255.
+fn a6_mode n ulong to ulong
+put a_inlen 0 n
+if a6_istest
+a6_init
+a6_enctest
+end
+ret 255
+end
