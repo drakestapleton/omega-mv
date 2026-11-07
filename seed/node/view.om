@@ -1,0 +1,704 @@
+note seed/node/view.om -- the Omega Node operator view (DRA-291). OM-2.
+note Compose after seed/net/http.om, transport.om, pool.om, super.om,
+note sched.om, seed/authority/action.om, journal.om and auth.om, before the
+note program that drives the creator (code.om).
+note One shared page (32768 bytes) carries the creator's state to a view
+note process it forks, and operator commands back. The view process only
+note reads state and posts commands; the creator alone decides them,
+note through the authority and the journal, and then acknowledges them.
+note Page words: 0 magic, 1 layout 1, 2 snapshot seqlock (odd while the
+note creator writes), 3 version (events so far, this incarnation), 4
+note incarnation (the journal fence), 5 creator pid, 6 stop, 7 view port,
+note 8 requests served, 9 view pid.
+note Snapshot words, written by the creator under the seqlock:
+note 16..21 authority: generation, paused, journal seq, journal failed,
+note fence, version of the last pause change; 32..39 queue: waiting,
+note ready, running, in review, UNKNOWN, admission limit, review limit,
+note admissions refused while full; 44..46 commands committed, refused,
+note last id; 48 workers, then 4 words each at 64+4w: pid (0 none),
+note incarnation, control seq acknowledged, paused as seen; 96 uncertain
+note jobs (outcome UNKNOWN), their ids at 97..112; 128 objectives, then 16
+note words each at 136+16i (set by the driver); 200..205 limits.
+note Events: a ring of 256 at word 1024, 4 words each: version, type |
+note target << 8 | x << 16, a, b. Types: 1 job (x what, a job id, b
+note value), 2 objective result (a result, b turns), 3 command (x op, a
+note id, b status), 4 pause (a 1 paused 0 resumed), 5 worker (x slot, a
+note pid, b 1 started 0 lost), 6 admission refused (a job id), 7 uncertain
+note (a job id).
+note Mailbox at word 2048: 0 state (0 free, 1 posted, 2 acknowledged), 1
+note command id, 2 op, 3 target, 4 view version the command was based on,
+note 5..8 arguments, 9 status, 10 version, 11 journal seq, 12 incarnation.
+note Ops: 1 pause, 2 resume, 3 cancel objective, 4 budget objective a
+note (model turns), 5 redirect objective to kind a, K b, N c, A d.
+note Status: 0 committed, 1 stale, 2 invalid, 3 refused, 4 duplicate (the
+note id was committed before; the version is the original one).
+const VWBYTES ulong 32768
+const VWMAG ulong 1330466390
+const VWRING ulong 1024
+const VWBOX ulong 2048
+text vwjson "application/json"
+text vwctype "Content-Type"
+text vwpview "/view"
+text vwpcmd "/cmd"
+text vwphlth "/health"
+text vwget "GET"
+text vwpost "POST"
+text vwkhd "{\"layout\":1,\"incarnation\":"
+text vwkver ",\"version\":"
+text vwksnap ",\"kind\":\"snapshot\""
+text vwkdel ",\"kind\":\"delta\",\"since\":"
+text vwkev ",\"events\":["
+text vwkauth ",\"authority\":"
+text vwnauth "generation,paused,journal_seq,journal_failed,fence,version,"
+text vwkq ",\"queue\":"
+text vwnq "waiting,ready,running,review,unknown,limit,review_limit,refused,"
+text vwkc ",\"commands\":"
+text vwnc "committed,refused,last_id,"
+text vwkw ",\"workers\":["
+text vwnw "pid,incarnation,ack,paused,"
+text vwku "],\"uncertain\":["
+text vwko "],\"objectives\":["
+text vwno "kind,k,n,a,state,turns,budget,phase,job,result,version,redirect,cancel,seq,"
+text vwkl "],\"limits\":"
+text vwnl "max_turns,deadline_s,max_tokens,max_objectives,action_slots,ring,"
+text vwkid "{\"id\":"
+text vwkst ",\"status\":\""
+text vwkst2 "\",\"version\":"
+text vwkjs ",\"journal_seq\":"
+text vwkinc ",\"incarnation\":"
+text vwsts "committed,stale,invalid,refused,duplicate,busy,pending,"
+text vwhlth "{\"ok\":true}"
+text vwqsin "since"
+text vwqinc "inc"
+text vwqid "id"
+text vwqop "op"
+text vwqtg "target"
+text vwqver "ver"
+text vwqa "a"
+text vwqb "b"
+text vwqc "c"
+text vwqd "d"
+global vwmap long 1
+global vwver ulong 1
+global vwcnt ulong 4
+
+note ======== the page (without vw_new every write is dropped and reads are 0,
+note so the driver also runs without a view)
+
+fn vw_g o ulong to ulong
+if le get vwmap 0 0
+ret 0
+end
+ret mapget get vwmap 0 mul o 8 8
+end
+
+fn vw_s o ulong v ulong to void
+if le get vwmap 0 0
+ret
+end
+r = mapset get vwmap 0 mul o 8 8 v
+end
+
+note Creator, before it forks anything: map the page for incarnation inc.
+note 0 or a mapping errno.
+fn vw_new inc ulong to long
+h = mapnew neg int 1 0 VWBYTES 3 33
+if le h 0
+ret h
+end
+put vwmap 0 h
+put vwver 0 0
+for i ulong 4
+put vwcnt i 0
+end
+vw_s 1 1
+vw_s 4 inc
+vw_s 5 ulong getpid
+vw_s 0 VWMAG
+ret 0
+end
+
+note Creator: append an event; its version. Words first, version last.
+fn vw_ev ty ulong t ulong x ulong a ulong b ulong to ulong
+v = add get vwver 0 1
+o = add VWRING mul and v 255 4
+vw_s add o 1 or or ty shl t 8 shl x 16
+vw_s add o 2 a
+vw_s add o 3 b
+vw_s o v
+put vwver 0 v
+vw_s 3 v
+ret v
+end
+
+fn vw_ver to ulong
+ret get vwver 0
+end
+
+note Creator: count c (0 admissions refused, 1 commands committed, 2
+note commands refused, 3 last command id).
+fn vw_cnt c ulong v ulong to void
+put vwcnt c v
+end
+
+fn vw_cget c ulong to ulong
+ret get vwcnt c
+end
+
+fn vw_begin to void
+vw_s 2 or vw_g 2 1
+end
+
+fn vw_end to void
+vw_s 2 add vw_g 2 1
+end
+
+note Creator, between vw_begin and vw_end: the generic sections.
+fn vw_gen c long to void
+vw_s 16 get augen 0
+vw_s 17 get scpause 0
+vw_s 18 get jseq 0
+vw_s 19 get jbad 0
+vw_s 20 get jfence 0
+for s ulong 4
+vw_s add 32 s sched_count add s 1 add s 1
+end
+vw_s 36 sched_count 6 6
+vw_s 37 get sclim 0
+vw_s 38 get sclim 1
+vw_s 39 get vwcnt 0
+vw_s 44 get vwcnt 1
+vw_s 45 get vwcnt 2
+vw_s 46 get vwcnt 3
+n = mapget c 48 8
+vw_s 48 n
+for w ulong n bound 8
+o = add 64 mul w 4
+vw_s o ulong get swpid w
+vw_s add o 1 get auinc w
+vw_s add o 2 auth_wctl w
+vw_s add o 3 au_cell w 104
+end
+vw_unc
+end
+
+note Uncertain jobs: UNKNOWN in the scheduler, or released by the journal
+note with outcome UNKNOWN (a class 1 effect whose fate nobody knows).
+fn vw_unc to void
+k = ulong 0
+for j ulong 64
+if and eq get sjst j 6 lt k 16
+vw_s add 97 k get sjid j
+k = add k 1
+end
+end
+for e ulong 256
+b = mul e 8
+if and and ne get jjob b 0 ne get jjob add b 4 0 lt k 16
+if eq and get jjob add b 5 255 0
+vw_s add 97 k get jjob add b 1
+k = add k 1
+end
+end
+end
+vw_s 96 k
+end
+
+note Creator: the posted command into d (id, op, target, version, a..d);
+note false when none is posted.
+fn vw_take d edit ulong 8 to bool
+if ne vw_g VWBOX 1
+ret false
+end
+for i ulong 8
+put d i vw_g add VWBOX add 1 i
+end
+ret true
+end
+
+note Creator: acknowledge the posted command.
+fn vw_ack st ulong v ulong js ulong to void
+vw_s add VWBOX 9 st
+vw_s add VWBOX 10 v
+vw_s add VWBOX 11 js
+vw_s add VWBOX 12 vw_g 4
+vw_s VWBOX 2
+end
+
+note Creator: fork the view process on 127.0.0.1:port. Its pid (it writes
+note the bound port to word 7 once listening), or a negative errno. The
+note child is not a worker: it drops the creator's life-pipe write end (so
+note workers still see the creator's death) and the journal descriptors.
+fn vw_spawn port ulong to long
+pid = fork
+if eq pid 0
+r = fclose get swpar 1
+r = fclose get jfd 0
+r = fclose get jlk 0
+exit vw_serve port
+end
+if gt pid 0
+vw_s 9 ulong pid
+end
+ret pid
+end
+
+note Creator: stop the view process and reap it.
+fn vw_stop to void
+pid = vw_g 9
+if eq pid 0
+ret
+end
+vw_s 6 1
+st = new uchar 8 0
+for t ulong 300
+r = waitpid int pid st 0 4 1
+if eq r long pid
+vw_s 9 0
+ret
+end
+x = sleepns 10000000
+end
+r = killpid int pid 9
+r = waitpid int pid st 0 4 0
+vw_s 9 0
+end
+
+note ======== the view process
+
+note Serve until the creator stops or is gone: 0, or 2 when the port
+note cannot be bound.
+fn vw_serve port ulong to int
+cs = new ulong 320 0
+io = new uchar 131072 0
+ob = new uchar 32768 0
+a = new uchar 16 0
+r = haddr4 a 2130706433 port
+lf = hlisten a 16
+if lt lf 0
+ret 2
+end
+vw_s 7 hport a
+me = vw_g 5
+for t ulong 1000000000
+if or ne vw_g 6 0 ne ulong getppid me
+break
+end
+c = haccept int lf 200000000
+if ge c 0
+vw_one int c cs io ob
+end
+end
+x = fclose int lf
+ret 0
+end
+
+note One request on connection fd, then close it.
+fn vw_one fd int cs edit ulong 320 io edit uchar 131072 ob edit uchar 32768 to void
+r = hinit cs io fd 1
+if lt r 0
+x = hclose cs
+ret
+end
+hsettmo cs 2000000000 2000000000
+hsetbdl cs 2000000000
+r = hreqrd cs io
+if le r 0
+if lt r 0
+x = hreject cs io r
+end
+x = hclose cs
+ret
+end
+vw_s 8 add vw_g 8 1
+r = vw_route cs io ob
+x = hclose cs
+end
+
+fn vw_route cs edit ulong 320 io edit uchar 131072 ob edit uchar 32768 to long
+if hispath cs io vwpview
+if hismeth cs io vwget
+n = vw_view cs io ob
+ret vw_send cs io ob n 200
+end
+ret hrsperr cs io 405
+end
+if hispath cs io vwpcmd
+if hismeth cs io vwpost
+ret vw_post cs io ob
+end
+ret hrsperr cs io 405
+end
+if hispath cs io vwphlth
+n = vw_cat ob 0 vwhlth
+ret vw_send cs io ob n 200
+end
+ret hrsperr cs io 404
+end
+
+fn vw_send cs edit ulong 320 io edit uchar 131072 ob view uchar 32768 n ulong code ulong to long
+put cs HKEEP 0
+r = hrspst cs io code
+r = hfe r hhname cs io vwctype
+r = hfe r hhval cs io vwjson
+r = hfe r hhend cs io 0 n
+r = hfe r hput cs io view part ob 0 n
+ret hfe r hwfin cs io
+end
+
+note Query parameter key of the request target as a decimal; all ones
+note when absent or not a number of 1..19 digits.
+fn vw_qnum cs edit ulong 320 io view uchar 131072 key view uchar * to ulong
+t = get cs HTOFF
+n = get cs HTLEN
+q = ulong 0
+for i ulong n
+if eq get io add t i 63
+q = add i 1
+break
+end
+end
+if eq q 0
+ret not ulong 0
+end
+p = q
+for it ulong 64
+if ge p n
+break
+end
+e = vw_seg io t p n
+if vw_keq io add t p key
+ret vw_qdec io add add t p add len key 1 sub sub e p add len key 1
+end
+p = add e 1
+end
+ret not ulong 0
+end
+
+note End of the query segment starting at p (index of '&' or n).
+fn vw_seg io view uchar 131072 t ulong p ulong n ulong to ulong
+for i ulong sub n p
+if eq get io add t add p i 38
+ret add p i
+end
+end
+ret n
+end
+
+note key= at io[o].
+fn vw_keq io view uchar 131072 o ulong key view uchar * to bool
+for i ulong len key
+if ne get io add o i get key i
+ret false
+end
+end
+ret eq get io add o len key 61
+end
+
+fn vw_qdec io view uchar 131072 o ulong m ulong to ulong
+if or eq m 0 gt m 19
+ret not ulong 0
+end
+v = ulong 0
+for i ulong m
+c = ulong get io add o i
+if or lt c 48 gt c 57
+ret not ulong 0
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+
+note ======== JSON
+
+fn vw_cat o edit uchar 32768 p ulong a view uchar * to ulong
+for i ulong len a
+if lt add p i 32768
+put o add p i get a i
+end
+end
+ret hmin add p len a 32768
+end
+
+fn vw_dec o edit uchar 32768 p ulong v ulong to ulong
+d = new uchar 20 0
+k = ulong 20
+x = v
+for it ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+q = p
+for i ulong sub 20 k
+if lt q 32768
+put o q get d add k i
+end
+q = add q 1
+end
+ret hmin q 32768
+end
+
+fn vw_ch o edit uchar 32768 p ulong c ulong to ulong
+if lt p 32768
+put o p uchar c
+end
+ret hmin add p 1 32768
+end
+
+note "name": for the k-th comma-terminated name in names.
+fn vw_key o edit uchar 32768 p ulong names view uchar * k ulong to ulong
+s = ulong 0
+m = ulong 0
+for i ulong len names
+if eq get names i 44
+if eq m k
+q = vw_ch o p 34
+q = vw_cat o q view part names s sub i s
+q = vw_ch o q 34
+ret vw_ch o q 58
+end
+m = add m 1
+s = add i 1
+end
+end
+ret p
+end
+
+note {"name":s[b],...}, one member per comma-terminated name.
+fn vw_obj o edit uchar 32768 p ulong names view uchar * s view ulong 1024 b ulong to ulong
+n = ulong 0
+for i ulong len names
+if eq get names i 44
+n = add n 1
+end
+end
+q = vw_ch o p 123
+for k ulong n
+if gt k 0
+q = vw_ch o q 44
+end
+q = vw_key o q names k
+q = vw_dec o q get s add b k
+end
+ret vw_ch o q 125
+end
+
+note A stable copy of words 0..1023 (retries while the creator writes).
+fn vw_load s edit ulong 1024 to bool
+for t ulong 1000
+a = vw_g 2
+if eq and a 1 0
+for i ulong 1024
+put s i vw_g i
+end
+if eq vw_g 2 a
+ret true
+end
+end
+x = sleepns 100000
+end
+ret false
+end
+
+note The view: a delta since the client's version when the client holds
+note this incarnation and every event since it is still in the ring, else
+note a snapshot. The length.
+fn vw_view cs edit ulong 320 io view uchar 131072 ob edit uchar 32768 to ulong
+s = new ulong 1024 0
+sv = vw_qnum cs io vwqsin
+ic = vw_qnum cs io vwqinc
+x = vw_load s
+v = get s 3
+p = vw_cat ob 0 vwkhd
+p = vw_dec ob p get s 4
+p = vw_cat ob p vwkver
+p = vw_dec ob p v
+if and and eq ic get s 4 le sv v le sub v sv 255
+ret vw_delta ob p sv v
+end
+ret vw_snap ob p s
+end
+
+fn vw_delta ob edit uchar 32768 p0 ulong sv ulong v ulong to ulong
+p = vw_cat ob p0 vwkdel
+p = vw_dec ob p sv
+p = vw_cat ob p vwkev
+for k ulong sub v sv
+e = add sv add k 1
+o = add VWRING mul and e 255 4
+if gt k 0
+p = vw_ch ob p 44
+end
+p = vw_evj ob p o e
+end
+p = vw_ch ob p 93
+ret vw_ch ob p 125
+end
+
+note [version,type,target,x,a,b] of the event at word o.
+fn vw_evj ob edit uchar 32768 p0 ulong o ulong e ulong to ulong
+w = vw_g add o 1
+p = vw_ch ob p0 91
+p = vw_dec ob p vw_g o
+p = vw_ch ob p 44
+p = vw_dec ob p and w 255
+p = vw_ch ob p 44
+p = vw_dec ob p and shr w 8 255
+p = vw_ch ob p 44
+p = vw_dec ob p shr w 16
+p = vw_ch ob p 44
+p = vw_dec ob p vw_g add o 2
+p = vw_ch ob p 44
+p = vw_dec ob p vw_g add o 3
+ret vw_ch ob p 93
+end
+
+fn vw_snap ob edit uchar 32768 p0 ulong s view ulong 1024 to ulong
+p = vw_cat ob p0 vwksnap
+p = vw_cat ob p vwkauth
+p = vw_obj ob p vwnauth s 16
+p = vw_cat ob p vwkq
+p = vw_obj ob p vwnq s 32
+p = vw_cat ob p vwkc
+p = vw_obj ob p vwnc s 44
+p = vw_cat ob p vwkw
+for w ulong get s 48 bound 8
+if gt w 0
+p = vw_ch ob p 44
+end
+p = vw_obj ob p vwnw s add 64 mul w 4
+end
+p = vw_cat ob p vwku
+for k ulong get s 96 bound 16
+if gt k 0
+p = vw_ch ob p 44
+end
+p = vw_dec ob p get s add 97 k
+end
+p = vw_cat ob p vwko
+for i ulong get s 128 bound 4
+if gt i 0
+p = vw_ch ob p 44
+end
+p = vw_obj ob p vwno s add 136 mul i 16
+end
+p = vw_cat ob p vwkl
+p = vw_obj ob p vwnl s 200
+ret vw_ch ob p 125
+end
+
+note ======== commands
+
+note POST /cmd?id=&op=&target=&inc=&ver=&a=&b=&c=&d=: post it to the creator
+note and wait up to 5 s for the acknowledgement. A command made for another
+note incarnation (inc) is stale without reaching the creator, since its ver
+note counts another incarnation's events. 503 while another command is
+note posted and not yet taken, 504 when no acknowledgement came in time
+note (the command may still commit: post it again with the same id).
+fn vw_post cs edit ulong 320 io edit uchar 131072 ob edit uchar 32768 to long
+d = new ulong 8 0
+id = vw_qnum cs io vwqid
+put d 0 vw_qnum cs io vwqop
+put d 1 vw_qnum cs io vwqtg
+put d 2 vw_qnum cs io vwqver
+put d 3 vw_qnum cs io vwqa
+put d 4 vw_qnum cs io vwqb
+put d 5 vw_qnum cs io vwqc
+put d 6 vw_qnum cs io vwqd
+if or eq id 0 eq id not ulong 0
+ret hrsperr cs io 400
+end
+st = ulong 1
+bx = false
+if eq vw_qnum cs io vwqinc vw_g 4
+st = vw_box id d
+bx = lt st 5
+end
+n = vw_ackj ob id st bx
+ret vw_send cs io ob n vw_code st
+end
+
+note Post command id with d[0..6] = op, target, version, a..d; the status
+note (0..4 from the creator, 5 busy, 6 pending).
+fn vw_box id ulong d view ulong 8 to ulong
+b = vw_g VWBOX
+if eq b 1
+ret 5
+end
+vw_s add VWBOX 1 id
+for i ulong 7
+vw_s add VWBOX add 2 i get d i
+end
+vw_s VWBOX 1
+for t ulong 5000
+if eq vw_g VWBOX 2
+st = vw_g add VWBOX 9
+vw_s VWBOX 0
+ret st
+end
+x = sleepns 1000000
+end
+ret 6
+end
+
+fn vw_code st ulong to ulong
+if or eq st 0 eq st 4
+ret 200
+end
+if eq st 1
+ret 409
+end
+if eq st 2
+ret 400
+end
+if eq st 3
+ret 500
+end
+if eq st 5
+ret 503
+end
+ret 504
+end
+
+note The acknowledgement: the creator's version and journal seq when bx,
+note else the current version (the view's own verdict) and 0.
+fn vw_ackj ob edit uchar 32768 id ulong st ulong bx bool to ulong
+p = vw_cat ob 0 vwkid
+p = vw_dec ob p id
+p = vw_cat ob p vwkst
+p = vw_name ob p vwsts st
+p = vw_cat ob p vwkst2
+v = vw_g 3
+js = ulong 0
+if bx
+v = vw_g add VWBOX 10
+js = vw_g add VWBOX 11
+end
+p = vw_dec ob p v
+p = vw_cat ob p vwkjs
+p = vw_dec ob p js
+p = vw_cat ob p vwkinc
+p = vw_dec ob p vw_g 4
+ret vw_ch ob p 125
+end
+
+note The k-th comma-terminated name of names, unquoted.
+fn vw_name o edit uchar 32768 p ulong names view uchar * k ulong to ulong
+s = ulong 0
+m = ulong 0
+for i ulong len names
+if eq get names i 44
+if eq m k
+ret vw_cat o p view part names s sub i s
+end
+m = add m 1
+s = add i 1
+end
+end
+ret p
+end

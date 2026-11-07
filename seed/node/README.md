@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority, journal and coding workflow
+# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority, journal, coding workflow, operator view and release
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -720,33 +720,207 @@ RELEASE per job, sink lines, keys):
 
 Status: IMPLEMENTED in `infer.om`, `tool.om`, `gram.om` and `code.om`,
 exercised on native Linux AArch64 by `code-test.om`, the round40 replay
-`tests/tool-replay.py`, the tool controls and live runs of the own Omega
-model (round40 checkpoint served by aien-train `ollm serve`, DRA-119, inside a
-private network namespace). Evidence is in the DRA-290 pull request. Not
-QUALIFIED on the Spark and not DEPLOYED.
+`tests/tool-replay.om` (seeded Omega; it replaced `tests/tool-replay.py` with
+the same check lines, summary and exit status), the tool controls and live runs
+of the own Omega model (round40 checkpoint served by aien-train `ollm serve`,
+DRA-119, inside a private network namespace). Evidence is in the DRA-290 pull
+request. Not QUALIFIED on the Spark and not DEPLOYED.
 
-All four are OM-2 programs (`printf 'om2\n'` before the sources):
+All six are OM-2 programs (`printf 'om2\n'` before the sources):
 
 ```sh
 L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/journal.om seed/node/auth.om"
 { printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om seed/net/http.om seed/net/notls.om seed/node/infer.om; } | seed/out/omc > build/node/infer
 { printf 'om2\n'; cat seed/agent/path.om seed/node/gram.om seed/node/tool.om; } | seed/out/omc > build/node/tool
-{ printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-main.om; } | seed/out/omc > build/node/code-main
-{ printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-test.om; } | seed/out/omc > build/node/code-test
-chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test
-build/node/code-test unit build/node/cu   # "code checks=54 fail=0", exit 0
-python3 seed/node/tests/tool-replay.py build/node/tool OMC40 ROUND40 build/node/replay   # pass=108 fail=0
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om $L seed/node/view.om seed/node/gram.om seed/node/code.om seed/node/code-main.om; } | seed/out/omc > build/node/code-main
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om $L seed/node/view.om seed/node/gram.om seed/node/code.om seed/node/code-test.om; } | seed/out/omc > build/node/code-test
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/tool-replay.om; } | seed/out/omc > build/node/tool-replay
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/drv-test.om; } | seed/out/omc > build/node/drv-test
+chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test build/node/tool-replay build/node/drv-test
+build/node/code-test unit build/node/cu   # "code checks=57 fail=0", exit 0
+build/node/drv-test /tmp/dvt   # "DRV-TEST pass=40 fail=0 not_run=0", exit 0
+build/node/tool-replay build/node/tool OMC40 ROUND40 build/node/replay   # "TOOL-REPLAY runs=108 pass=108 fail=0 actions=417", exit 0
 ```
 
 A failed compile leaves an empty output file that exits 0 when run; check
 omc's exit status. `OMC40` is the compiler the round40 model was trained and
-evaluated with (sha256 `2c82480596bb…`, omega-mv `e5b32567`): its error text is
-part of the prompt, so the check tool must use it. `ROUND40` is the round40
-run directory holding `repair.py` and `final-selected.json`.
+evaluated with (sha256 `2c82480596bb…`, omega-mv `e5b32567`; on the Spark
+`~/work/omega-node-e5b3/seed/out/omc`): its error text is part of the prompt,
+so the check tool must use it. `ROUND40` is the round40 run directory holding
+`repair.py` and `final-selected.json`.
+
+### Test drivers
+
+The drivers are seeded Omega built by this checkout's `seed/out/omc`; no
+system program is executed. `tool-replay` runs only TOOL (with OMC as its
+argument), with stderr to `/dev/null`; `drv-test` runs only its own binary as
+the child; `view-accept` runs only BUILD's `code-main` or `code-test`, `op`
+and `fake-serve` (the node runs BUILD's `infer` and `tool`); `view-prep` runs
+nothing.
+
+`tool-replay TOOL OMC ROUND40 OUTDIR` replays every recorded round40 run
+through TOOL in `OUTDIR/<job.id>` and checks that each rebuilt `repair.py`
+prompt equals the next recorded prompt byte for byte. It prints a `MISMATCH`
+line (with `want` and `got` in Python repr) or an `ERROR` line per failing step,
+then `TOOL-REPLAY runs=R pass=P fail=F actions=A`. It exits 0 when no run
+failed, 1 otherwise, and 2 for bad usage or an unreadable fixture. Unlike the
+Python driver, it fails a run instead of crashing on a malformed fixture field,
+a tool timeout or a malformed `OMNT1` record, and it refuses a job id that is
+empty, `.`, `..` or holds `/`. The file header lists its buffer limits.
+
+`tests/drv.om` is the driver library both share (prefix `dv`, composed after
+`seed/json/json.om`):
+
+| Group | Functions |
+| --- | --- |
+| results | `dv_pass`, `dv_fail`, `dv_nrun NAME DETAIL` print `PASS\|FAIL\|NOT_RUN NAME[ DETAIL]` and count; `dv_count KIND` |
+| output, formatting | `dv_out`, `dv_err`; `dv_cat`, `dv_byte`, `dv_fmtu`, `dv_fmtl` append at an offset and return the new end |
+| bytes | `dv_eq`, `dv_at`, `dv_find`, `dv_atou` (`dvnone` = not a number) |
+| arguments | `dv_argc`, `dv_arg I BUF` (length, -22 no such argument, -105 buffer too short) |
+| files | `dv_slurp` (-27 does not fit), `dv_spit`, `dv_apnd`, `dv_isdir`, `dv_mkdirp`, `dv_rmrf` (no symbolic link followed), `dv_join` and `dv_dirn` (`os.path.join`, `os.path.dirname`) |
+| processes | `dv_pkinit`, `dv_pkadd` build a packed argv; `dv_spawn PK OUT ERR` runs it in its own process group (exit 126 files, 127 exec; when OUT and ERR name the same file both streams share one descriptor), `dv_spawna PK OUT` the same with both streams appended to OUT, `dv_spawnio PK IN OUT ERR` with three descriptors the caller already opened (126 for a negative or failed one), `dv_exec` the child side of the first two; `dv_poll`, `dv_reap`, `dv_wait PID DEADLINE` (-110 after killing the group), `dv_kill`, `dv_killg`; status is the exit code or 256 + signal |
+| ports | `dv_port`: a free 127.0.0.1 port, never 18091 or 18300 |
+| JSON | `dv_jload` (file to tape), `dv_jkey` (the last duplicate wins), `dv_jidx`, `dv_jlen`, `dv_jisl`, `dv_jnum`, `dv_jstr` (UTF-8, surrogate pairs joined), `dv_jsteq` |
+
+`drv-test SCRATCHDIR` checks these functions in `SCRATCHDIR/drv-test.d`
+(removed before and after) and prints `DRV-TEST pass=P fail=F not_run=N`; it
+exits 1 on any failure, 2 for bad usage. A `drv.om` whose `dv_dirn` keeps a
+repeated separator and whose status drops the 256 for a signal gives `FAIL
+drv.dirn`, `FAIL drv.kill-reap` and exit 1; one whose `dv_spawna` opens OUT
+without append gives `FAIL drv.spawn-append`; one whose `dv_spawn` opens ERR
+again when it names OUT's file (`if not dv_eq fo fe` made `if true`) gives
+`FAIL drv.spawn-shared` (`DRV-TEST pass=39 fail=1`).
+
+`tests/nodedrv.om` (prefix `nd`, composed after `drv.om`) holds what the
+DRA-291 drivers share: the fixture (`nd_prep`: broken files, objective lines,
+`expect.json` and fake-serve's map from the round40 runs), node and
+fake-serve processes (`nd_fake`, `nd_node`, `nd_poll`, `nd_fin`, `nd_sig`,
+`nd_reap`, `nd_clean`), `omnode-op` calls with their JSON answers (`nd_view`,
+`nd_viewd`, `nd_cmd`, `nd_fresh`, `nd_tk`, `nd_ti`, `nd_status`, `nd_dj`),
+output lines (`nd_outl`, `nd_hasl`, `nd_hasp`, `nd_pfxl`, `nd_lastl`), the
+journal (`nd_jstart`) and the listening check (`nd_lsn`, from
+`/proc/net/tcp` and `/proc/net/tcp6`). Its header documents the path slots
+and limits.
+
+### Qualification runner
+
+`tests/qual.om` replaces the out-of-repo DRA-292 qualification shell conductor.
+It composes with SHA-256 and the driver library, invokes only this checkout's
+`seed/out/omc` for builds, and ignores the ambient `OMC` variable. Run from the
+checkout root, under the operator-approved CPU-pool wrapper, with a fresh
+evidence directory outside the source tree:
+
+```
+{ printf 'om2\n'; cat om/tls/sha2.om seed/json/json.om seed/node/tests/drv.om seed/node/tests/qual.om; } | ~/work/omega-node-run.sh env -u OMC nice -n 19 seed/out/omc > build/node/qual
+{ printf 'om2\n'; cat om/tls/sha2.om seed/node/release.om; } | ~/work/omega-node-run.sh env -u OMC nice -n 19 seed/out/omc > build/node/release
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/tool-replay.om; } | ~/work/omega-node-run.sh env -u OMC nice -n 19 seed/out/omc > build/node/tool-replay
+chmod +x build/node/qual build/node/release build/node/tool-replay
+env -u OMC ~/work/omega-node-run.sh build/node/qual /tmp/node-qualification
+```
+
+Do not execute a compiler's output when that compilation failed. `HOME` locates
+`work/omega-node-e5b3/seed/out/omc`, `handoffs/tool-omega-20261104/round40`, and
+`.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean`. The round40 compiler is
+an input to tool-adapter checks, never the compiler of the qualification driver
+or the Node programs. `build/node/release` and `build/node/tool-replay` must
+already exist. Optional seeded `build/node/view-accept` and
+`build/node/release-accept` are invoked directly; when absent, acceptance and
+every corresponding mutant are `NOT_RUN`, never silently run by Python. Mutant
+mutation and compilation still run and fail independently if invalid.
+
+The conductor writes `platform.txt`, `hashes.txt`, `results.txt`, compiler
+diagnostics, program outputs and binary hashes. It checks gate composition,
+build reproducibility, the old `79894168` reader, code/view/release/journal
+mutants, tool replay and controls, the agent check, and the Lean RESULT model.
+Mutation replaces whole lines (with optional function scope); the Lean mutant
+replaces its exact proposition substring. A missing mutation is a failure.
+Source hashes and clean git status are checked again at the end. Exit 0 means
+every check passed; exit 1 means one or more failures; exit 3 means no failure
+but one or more `NOT_RUN` (a skipped step is never reported as a pass; the shell
+conductor it replaces always exited 0); exit 2 means the conductor could not
+prepare/read/write its inputs or evidence. `NOT_RUN` is preserved in the
+results and receipt.
+`platform.txt` records both the hexadecimal affinity mask and `Cpus_allowed_list`.
+Evidence from a dirty worktree cannot be promoted to a clean receipt.
+
+SHA-256, copying, composition, mutation, process deadlines, process discovery,
+result parsing and evidence writing are seeded Omega. The retained host tools
+are read-only git 2.43.0 (`rev-parse`, `status`, `ls-files`, and per-file
+`git show 79894168:PATH`, not `tar`), Lean 4.35.0 as a proof oracle,
+GNU coreutils 9.4 `uname` for platform identification and `nice` for CPU
+priority, and Python 3.12.3 solely for `seed/agent/tests/check.py`. The agent
+driver's Omega successor is tracked in omega-mv#1071; its result explicitly
+says it is still a Python driver. The slow-compiler adversarial fixture is also
+seeded Omega (a sleeping child and parent, killed by the tool adapter's deadline).
+No GPU or live model service is opened; there is no crumb-verification stage.
+
+The additive `drv.om` helper `dv_spawnio PK FI FO FE` accepts an already-packed
+argv and three open descriptors. It creates a child process group; the caller
+retains and closes the descriptors. `dv_spawn PK OUT ERR` now shares one output
+file offset when `OUT` and `ERR` name the same path. Both still return the child
+PID (or fork error), with child exits 126 for descriptor setup and 127 for exec.
+
+### Receipts
+
+`tests/receipt.om` is the evidence receipt writer, the seeded Omega replacement
+for the out-of-repo `omega-node-receipt.py` (prefix `rc`, composed after
+`drv.om`). Build it with this checkout's compiler:
+
+```
+{ printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om om/tls/sha2.om \
+  seed/node/tests/drv.om seed/node/tests/receipt.om; } > /tmp/receipt.full.om
+seed/out/omc < /tmp/receipt.full.om > receipt
+```
+
+`receipt EV REPO SUB ISSUE SCRIPT [EXECUTION]` reads `EV/platform.txt`,
+`EV/hashes.txt`, `EV/results.txt`, `EV/NAME.out` and `EV/NAME.sha` for every
+`PASS NAME compile=0 …` check line, and the last existing of
+`EV/repeat-stress.txt` and `EV/repeat-idle.txt` for a `PASS NAME-repeat P/R`
+line. It writes the receipt to `REPO/evidence/SUB/receipt.<sha256>.json`, where
+the hash is the sha256 of the file's bytes. The file is created exclusively,
+with mode 0644. The program then prints the path. The record has the Python
+writer's keys in the Python writer's order: `issue`, `source_commit`,
+`source_tree`, `platform`, `cpu_affinity_mask_hex`, `execution`,
+`timestamp_utc`, `independent_review` (false), `native_aarch64` (`NOT_RUN` when
+a results line is NOT_RUN, else `PASS`), `executed_verdict`, `not_run`,
+`spark_gate_judge`, `live_hive`, `script`, `hashes`, `checks`, `results`, then
+`repeat` (null or one object) or `repeats` (a list).
+
+It refuses, with exit 1 and the Python message on stderr, in these cases:
+
+- `platform.txt` holds no `head H tree T dirty=0`
+  (`refused: evidence run was not on a clean tree`).
+- A results line is FAIL, including `FAIL count N` with N not 0
+  (`refused: results contain FAIL: LINE`).
+- The target already exists (`refused: exists PATH`).
+
+It also exits 1 for an unreadable or symbolically linked input, a file over its
+buffer, invalid UTF-8 or a JSON writer refusal. It exits 2 for bad usage: fewer
+than 5 arguments, or an argument over 4096 bytes. The Python writer raises
+there.
+
+The limits are:
+
+- `platform.txt`: 65536 bytes.
+- `hashes.txt`: 262144 bytes.
+- `results.txt`: 524288 bytes.
+- Each `.out`, `.sha` and repeat file: 983040 bytes.
+- The JSON: 2 MiB.
+- Each path: 4095 bytes.
+
+It differs from the Python writer in these ways:
+
+- The JSON is compact, not indented, and ends with a newline. Non-ASCII text is
+  written as raw UTF-8, not as `\uXXXX` escapes. The parsed values are equal,
+  but the file name differs because it hashes different bytes.
+- `\w`, `\d` and whitespace are ASCII only. A byte of 0x80 or above counts as a
+  word byte in a FAIL or NOT_RUN prefix, so such a prefix fails closed.
+- The timestamp is truncated to microseconds.
+- The FAIL scan runs before any `.out` file is read.
 
 ### Programs
 
-`omnode-code INFER TOOL OMC ROOT WORK JDIR PORT OBJ...` runs 1..4 objectives
+`omnode-code INFER TOOL OMC ROOT WORK JDIR PORT VIEW OBJ...` runs 1..4 objectives
 `KIND,K,N,A,PATH,TASK` (KIND `add`, `mul` or `loop`) against the files under
 ROOT, with the journal in JDIR and compile scratch in `WORK/o<i>`. The creator
 holds every objective's state and alone decides; two workers run the granted
@@ -807,7 +981,8 @@ ends the objective as FAIL with its reason; nothing is retried or repaired.
 Output: `CWP i turn n` and `CWR i turn n` lines, each followed by n bytes
 (the prompt; the model text) and a newline; `CWE i job event value` job
 events (1 issued, 2 model action kind, 3 tool status, 4 outcome word, 5
-cancel); `CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
+cancel);
+`CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
 every objective passed, 1 otherwise, 2 usage, 62 out of time, 30 + a journal
 refusal.
 
@@ -825,13 +1000,15 @@ only, so a `\r` makes a line fall outside the grammar where Python's
 
 ### Acceptance and controls
 
-`code-test unit` (54 checks, no child process) feeds crafted model and tool
+`code-test unit` (57 checks, no child process) feeds crafted model and tool
 records to the creator: the round40 prompts byte for byte; every action in
 every state; wrong path; old text absent, twice, many times; an edit outside
 the grammar; `Tests passed.` unverified or after an edit; `File not found.`
 when not missing; header and length faults; tool content that differs from
 the source or candidate; outcome words for exit 4, 5 and 8, a killed child,
-cancellation, UNKNOWN and a lost input; the turn limit; an over-long prompt.
+cancellation, UNKNOWN and a lost input; the turn limit; an over-long prompt;
+a full admission queue (DRA-291: a refused inference waits for its next turn,
+a refused tool job ends the objective 23, both counted).
 `code-test cancel MS ...` is `omnode-code` with objective 0's first inference
 cancelled through `auth_cancel` after MS milliseconds.
 
@@ -852,3 +1029,314 @@ cancelled through `auth_cancel` after MS milliseconds.
 | cancelled read as UNKNOWN | 197 |
 | missing file read as read | 178 |
 | prompt limit raised to 4000 | 203 |
+| refused tool job left waiting (DRA-291) | 206 |
+
+## Operator view and commands (DRA-291)
+
+Status: IMPLEMENTED in `view.om`, `op.om` and `code.om` (with OPER records in
+`journal.om`), exercised on native Linux AArch64 by `tests/view-accept.om`,
+which drives the real `omnode-code` and `omnode-infer` through `omnode-op`
+only, against `tests/fake-serve.om`, a server that answers with the recorded
+round40 model turns. Not QUALIFIED on the Spark and not DEPLOYED.
+
+```sh
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om seed/node/op.om; } | seed/out/omc > build/node/op
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om seed/node/tests/fake-serve.om; } | seed/out/omc > build/node/fake-serve
+chmod +x build/node/op build/node/fake-serve
+D="seed/json/json.om seed/node/tests/drv.om seed/node/tests/nodedrv.om"
+{ printf 'om2\n'; cat $D seed/node/tests/view-prep.om; } | seed/out/omc > build/node/view-prep
+{ printf 'om2\n'; cat $D seed/node/tests/view-accept.om; } | seed/out/omc > build/node/view-accept
+chmod +x build/node/view-prep build/node/view-accept
+build/node/view-accept $PWD/build/node OMC40 ROUND40 build/node/accept   # VIEWSUM pass=46 fail=0, exit 0
+```
+
+### Model
+
+The creator alone holds and changes state. Before its workers start it maps
+one shared page (32768 bytes, `vw_new`) and, when VIEW is not 0, forks the
+view process (`vw_spawn`): an `.om` HTTP server on 127.0.0.1 built on
+`seed/net/http.om`. The view process only reads the page and posts commands
+into its mailbox; it drops the creator's life-pipe write end and the journal
+descriptors, and exits when the creator sets the stop word or is gone (its
+parent pid changes). Workers never see it.
+
+Every creator loop writes a snapshot under a seqlock and appends one event
+per change to a ring of 256 events; the version counts the events of this
+incarnation, and the incarnation is the journal's fence. Event types: 1 job
+(what, id, value; the same values as the `CWE` lines), 2 objective result,
+3 command, 4 pause, 5 worker, 6 admission refused, 7 uncertain effect.
+
+| Request | Answer |
+| --- | --- |
+| `GET /view` | snapshot: authority (generation, paused, journal seq and failure, fence, version of the last pause change), queue (waiting, ready, running, review, unknown, limit, review limit, admissions refused), commands (committed, refused, last id), workers (pid, incarnation, control acknowledged, paused), uncertain job ids, objectives (kind, K, N, A, state, turns, budget, phase, job in flight, result, version of the last change, redirect and cancel pending, next job seq), limits |
+| `GET /view?since=S&inc=I` | delta `[version, type, target, x, a, b]` for every event after S when I is this incarnation and the ring still holds them; otherwise a snapshot (a client resyncs from it) |
+| `POST /cmd?id=&op=&target=&inc=&ver=&a=&b=&c=&d=` | acknowledgement `{id, status, version, journal_seq, incarnation}` |
+| `GET /health` | `{"ok":true}` |
+
+Polling, not streaming: one request per connection keeps the single-threaded
+view process answering commands while a client is slow or gone.
+
+### Commands
+
+Ops: 1 pause, 2 resume, 3 cancel objective, 4 set its turn budget to a
+(0..7), 5 redirect it to kind a (1..3), K b, N c, A d (each 0..99).
+`omnode-op PORT cmd ID OP TARGET INC VER [A..D]` posts one; `ID` is the
+operator's command id, `INC`/`VER` the incarnation and version of the view
+the decision was made on.
+
+| Status | HTTP | When |
+| --- | --- | --- |
+| committed | 200 | durable in the journal and acted on |
+| duplicate | 200 | the id was committed before (also by an earlier incarnation); the original version is returned, nothing runs again |
+| stale | 409 | another incarnation, or the target changed after VER (the pause state for 1 and 2, the objective for 3..5) |
+| invalid | 400 | unknown op or target, out-of-range argument, a finished objective, pausing when paused |
+| refused | 500 | the journal refused the record |
+| busy | 503 | another command is posted and not yet taken |
+| pending | 504 | no acknowledgement in 5 s: post the same id again |
+
+The creator takes one command per loop. Pause and resume go through
+`auth_pause` (which journals PAUSE and tells every worker), then OPER is
+appended and synced; the objective commands append OPER first and then act:
+cancel ends the objective with 19 at once when nothing is in flight, else
+its job is cancelled through `auth_cancel` and the objective ends 19 when
+the job's result arrives; redirect sets the goal and starts over from
+unread the same way; budget takes effect at the next turn (out of turns
+ends 12). A committed command's acknowledgement carries the version of its
+own command event. At a restart the OPER table is replayed in order after
+the objectives resume (pause comes back from the PAUSE record), so a
+cancelled objective stays cancelled and a budget or goal stays set.
+
+At the admission limit only inferences are refused: a tool job is issued
+after its objective's previous job left the queue, so it takes that job's
+place. A refused inference is asked for again at the next turn; a tool job
+the authority refuses anyway ends its objective with 23 instead of leaving
+it waiting unseen. The view counts the refusals.
+
+An effect whose worker died while the job was assigned is shown at once as
+uncertain (snapshot and event 7) and its objective ends 21. The scheduler
+cannot tell whether the tool started; the next incarnation's recovery
+settles it from the journal: a START without a DONE stays UNKNOWN for good
+(and stays listed), no START proves the effect never ran (the job is
+cancelled and no longer listed).
+
+### Acceptance and controls
+
+`view-accept BUILD OMC ROUND40 OUTDIR [SCENARIO...]` (46 checks; scenario
+names select a subset; exit 0 when nothing failed, 1 otherwise, 2 for usage)
+prepares each scenario in `OUTDIR/<scenario>` (`cmds` for commands) with
+`nd_prep` (also available alone as `view-prep ROUND40 BASE ID[,ID...]
+[WRONG]`, whose output is byte-identical to the Python original it replaces)
+and prints answers in its details as the compact JSON `omnode-op` printed. It
+runs nine scenarios, each a real
+`omnode-code` (or `omnode-code-test overload LIMIT` / `uncertain`, the same
+program with a test hook) and the fake server: the full four-objective run
+followed only through deltas across a 1.5 s disconnect (no version gaps; the
+job events equal the `CWE` lines); resync to a snapshot for another
+incarnation or an impossible `since`; stale, invalid, other-incarnation,
+committed and duplicate commands (a duplicate pause carries the pause's
+original version, though the pause moved the view on before its ack); pause
+holding grants for 4 s and resume;
+cancel and redirect of an objective whose inference is in flight; a budget
+of 2 turns; admission limit 1 with refusals visible, a command committed and
+the run completing; a worker killed while assigned a replace; the creator
+killed with SIGKILL (the view exits with it, the next incarnation replays
+both commands, answers the old id as duplicate with its original version,
+and old clients resync). `omnode-op` usage errors exit 2.
+
+Each change below is built into its own copy of the programs and run on one
+scenario; the named check must fail. The same copy with no change runs every
+scenario first and must pass all of them, else the mutant runs are void.
+
+| Change | Check that fails |
+| --- | --- |
+| staleness not checked | `cmd-stale-409` |
+| committed ids not looked up | `cmd-duplicate-ack` |
+| OPER not replayed at restart | `crash-oper-replayed` |
+| no uncertain event | `uncertain-event` |
+| delta starts one event late | `resync-delta-from-0` |
+| incarnation not checked | `cmd-other-incarnation` |
+| pause recorded but not applied | `cmd-paused-holds` |
+| redirect ignored when the cancelled job returns | `redirect-run-passes` |
+| budget ignored | `budget-ends-12` |
+| refusals not counted | `overload-refusals-visible` |
+| acknowledgement carries the version current after acting | `cmd-pause-duplicate-version` |
+| view process outlives its creator | `crash-view-exits-with-creator` |
+
+## Release lifecycle and durable results (DRA-292)
+
+Status: IMPLEMENTED in `release.om` (the lifecycle program `release`),
+`journal.om` (RESULT records), `code.om`, `auth.om` and `op.om`; exercised on
+native Linux AArch64 by `tests/release-accept.om` in `fake` mode, which answers with the
+recorded round40 turns only. The same driver in `live` mode runs every
+scenario against the own model (aien-train `ollm serve`, or `gserve` on the
+GB10 inside an authorized window); a fake run is host regression, not model
+qualification. Not QUALIFIED and not DEPLOYED.
+
+```sh
+# from the checkout root: release compiles itself first, then the six programs
+{ printf 'om2\n'; cat om/tls/sha2.om seed/node/release.om; } | seed/out/omc > build/node/release
+chmod +x build/node/release
+build/node/release build build/node            # BUILD_OK name bytes sha256, six programs
+{ printf 'om2\n'; cat om/tls/sha2.om seed/json/json.om seed/node/tests/drv.om seed/node/tests/nodedrv.om \
+  seed/node/tests/release-accept.om; } | seed/out/omc > build/node/release-accept
+chmod +x build/node/release-accept
+build/node/release-accept fake $PWD/build/node OLDBIN OMC40 ROUND40 /tmp/rel [SCENARIO...]
+OLLM=/abs/path/ollm VERB=serve CK=... MERGES=... PORT=18294 \
+  build/node/release-accept live $PWD/build/node OLDBIN OMC40 ROUND40 /tmp/rel
+```
+
+The acceptance driver runs `BUILD/release`, so BUILD must hold it. BUILD,
+OLDBIN, OMC40, ROUND40 and OUT are absolute paths. Keep OUT short: the node's
+`jn_open` refuses a journal directory longer than 100 bytes (error 26, the
+node exits 56 with nothing on stderr), and the deepest one the driver uses is
+`OUT/compat/journal`. The scenarios are `full lifecycle restart conflict
+worker uncertain cancel commands down authority journal memory`; naming none
+runs all twelve.
+
+OLDBIN holds `infer`, `tool` and `code-main` built from the DRA-290 tree
+(git 79894168), the reader before OPER and RESULT.
+
+### Lifecycle
+
+`release` (`release.om` composed after `om/tls/sha2.om` for SHA-256) is the
+whole lifecycle; no shell remains. Errors are one `release: MESSAGE` line on
+stderr with exit 2 for usage, an unknown command or port 18091, 3 for a
+process in the wrong state, 1 for any other failure.
+
+| Command | Effect |
+| --- | --- |
+| `build OUT` | from the checkout root (refuses, 2, without `seed/out/omc`): compose and compile the six programs with this checkout's `seed/out/omc`; two builds are byte-identical |
+| `serve STATE PORT OLLM VERB CK MERGES` | start the own-model server; waits for its PORT line |
+| `start STATE BIN OMC PORT VIEW` | start `omnode-code` on STATE (`root/`, `work/`, `journal/`, `objs.txt`); BIN must be a directory; refuses (3) while `node.pid` is alive |
+| `health STATE` | the model's `GET /health` and the node's view; 0 when both answer |
+| `stop STATE` | pause (op 1), wait until nothing runs or is in review (at most 900 s), SIGTERM; `view-at-stop.json` |
+| `restore STATE` | start again on the same journal (incarnation + 1), then resume (op 2) |
+| `unserve STATE` | stop the model server |
+| `snapshot STATE SNAP` | copy `root/`, `work/` and `journal/` into SNAP (each must not exist there); refuses (3) while `node.pid` is alive |
+| `rollback STATE SNAP` | replace STATE's `root/`, `work/` and `journal/` with SNAP's copies (all three must exist first); refuses (3) while `node.pid` is alive |
+
+`snapshot` and `rollback` copy directories, regular files (bytes, permission
+bits, each file synced) and symbolic links (as links, never followed); any
+other file type, or a tree deeper than 64, fails (1) naming the directory and
+the errno. They print `snapshot SNAP files F dirs D links L bytes B` (or
+`rollback STATE ...`).
+
+Every program `release` starts gets an empty environment and no PATH search
+(`execprog`): OLLM, BIN and OMC are paths. Host tools it runs that are not
+compiled by `build`: the own-model server OLLM (serve) and `seed/out/omc`
+(build). It needs no `sh`, `date`, `sha256sum`, `grep`, `cp` or `tail`.
+
+The journal's lock is the one active authority: a second `omnode-code` on
+the same journal exits 50 (30 + 20, fenced) and changes nothing.
+
+Cutover: `stop`, `snapshot`, `restore` with the new BIN. Reversal: `stop`,
+`rollback`, `start` with the old BIN. A reader refuses record types newer
+than it knows (24, exit 54) before writing anything, so the DRA-290 build
+refuses a journal that holds OPER (9) or RESULT (10) and leaves it
+unchanged; rolling back therefore needs the snapshot taken before the new
+build ran. `journal-rollback-from-snapshot` runs exactly this through
+`release snapshot` and `release rollback`.
+
+### Durable results
+
+When an objective ends, `cw_end` appends RESULT (type 10: word 3 the
+objective, 4 the result, 5 its turns) before the result is printed. On a
+restart an objective with a RESULT is reported again (`CWO` with the same
+result and turns) and never resumed: a failure is final, as in DRA-290,
+and an objective that ended UNKNOWN (21) cannot issue its effect again. The
+journal refuses a second RESULT for an objective, result 0 and an index
+past 63 (25) before writing. A result the journal refused is still printed;
+that objective resumes after a restart.
+
+An inference worker that dies while it holds a job: inference is class 2
+(no external effect), so `au_lost` records it not performed (DONE how 6),
+as recovery does at a restart, and the objective asks again; only class 1
+and 3 effects stay UNKNOWN. The uncertain-effect test hook kills a worker
+only after the job's START is durable: a job is assigned before its
+worker's proposal is decided and journaled, and the first acceptance run
+killed one holding ADMIT only. That window depends on worker timing, so no
+mutant of the guard is killed deterministically; `uncertain-start-durable`
+fails whenever it is hit.
+
+### Acceptance and controls
+
+`release-accept.om` runs twelve scenarios on the real programs: the full
+four-objective run (prompts and model texts equal the recording, one START
+per operation, independent review, results durable across a rerun with no
+model request), the lifecycle (start, health, stop with jobs ready, restore,
+finish), the creator killed after a replace (no second effect), a conflicting
+write after the read (15, the other write kept), a dead inference worker
+(rerun), an uncertain replace (21, final after restart), cancel of a running
+inference, stale, burst and duplicate commands, the server down (16), a
+second authority, journal compatibility in both directions, and address-space
+caps. Each prints MEASURED latency and seconds; the memory scenario prints
+MEASURED `memory-peak-kB` (VmHWM and VmPeak of `code-main`, `infer` and
+`tool`, sampled from `/proc` every 5 ms) and fails `memory-peak-measured`
+when no `code-main` sample was read. `memory-caps-fail-closed-then-pass` is
+NOT_RUN until a reviewed `prlimit` host word exists (omega-mv
+`seed/prlimit-host-word`); no host tool stands in for it. The driver prints
+`PASS|FAIL|NOT_RUN NAME DETAIL` per check and `RELSUM pass=P fail=F
+not_run=N mode=MODE`; a node output it needs that is missing, unreadable or
+over capacity fails the next check, naming it.
+
+A resumed objective reads the file it edited before the restart, a prompt no
+recording holds: in fake mode the three checks that need it
+(`restart-resumed-completes`, `journal-forward-completes`,
+`journal-rollback-completes`) are NOT_RUN, naming the prompt; any other end
+fails them. Live mode answers it and requires PASS. The driver exits 0 only
+when every check passed, 3 when none failed but some were NOT_RUN, 1 when
+one failed.
+
+Mutants, each one line, run once against the scenario named (outputs under a
+short OUT):
+
+| Change | Check that fails |
+| --- | --- |
+| RESULT not journaled (`code.om`: `x = jn_result i r cw_g i 7` → `x = ulong 0`) | `full-results-durable` (`CWO 0 FAIL 16 7`) |
+| journaled RESULT not reported at restart (`code.om`: `if ne jn_res i 0` → `if false`) | `full-results-durable` |
+| lost inference left UNKNOWN (`auth.om`: the class-2 test in `au_lost` → `if false`) | `worker-death-rerun` (`CWO 0 FAIL 23 1`), `worker-death-turns-equal-recorded` |
+| rollback leaves the new journal out (`release.om` `rl_rollb`: `rl_cp1 3 2 rljour` → `x = ulong 0`) | `journal-rollback-from-snapshot` (`opens=1`) |
+| second RESULT accepted (journal.om) | journal gate case 16 (exit 173) |
+| second RESULT accepted (Lean model) | `second_refused`, `apply_keeps` no longer prove |
+
+`proofs/Result.lean` models `jn_rapply`, the restart decision of `cw_run` and
+`au_lost` in Lean 4 core (checked with Lean 4.35.0; every theorem depends on
+`propext` only): an applied RESULT is never replaced, a second one for the
+objective is refused, every later replay keeps it so the objective is never
+resumed, and only a class-2 lost action is recorded not performed. The proof
+covers the model; its correspondence to the `.om` code is by reading.
+
+### Release gate
+
+`tests/release-gate.om` checks in Omega that `release stop` makes a durable
+pause before it drains and stops the node. It is composed after the JSON
+reader and the driver library and needs a release build (`release build`):
+
+```
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/release-gate.om; } | seed/out/omc > release-gate
+release-gate BUILD OMC40 OUT
+```
+
+BUILD, OMC40 and OUT are absolute. The gate removes and recreates
+`OUT/release-gate.d` and keeps it afterwards. It holds the state with two
+objectives and an empty root, an empty fake-serve map, so every model request
+gets 404 after 4000 ms and the objective ends 16, and the start and stop output.
+The gate starts `fake-serve` and then runs `release start`. It waits for the
+first `CWE` job event in `run.out`, while objective 0's inference is in flight
+and objective 1 has not run yet. Then it runs `release stop` and checks:
+
+| Check | Passes when |
+| --- | --- |
+| `stop-rc` | the stop exits 0 (the detail shows its first stderr line) |
+| `stop-journal-pause` | the journal holds a PAUSE with word 3 = 1, then an OPER of op 1 and no START after it |
+| `stop-view-paused` | `view-at-stop.json` has `authority.paused` 1 and `queue.running` 0 |
+| `stop-node-gone` | the pid in `node.pid` no longer exists |
+
+It prints `PASS|FAIL NAME DETAIL` for each check, then `RELGATE pass=P fail=F`.
+It exits 0 when nothing failed, 1 when a check failed, and 2 for bad usage. At
+the end it sends SIGKILL to the node's process group and to `fake-serve`. On the
+real build all four checks pass in about 4 s. The mutant control is a `stop`
+that skips the pause (`if ne rl_post rlone 0` replaced by `if false`). Against
+it the gate fails `stop-rc` (`release: the node exited while stopping`),
+`stop-journal-pause` (`pause_at=none`) and `stop-view-paused`
+(`view-at-stop.json` missing, -2), and exits 1.
