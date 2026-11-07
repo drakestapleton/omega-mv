@@ -23,8 +23,9 @@ Ranked by expected geometric-mean gain over the 13 baseline kernels (1.10 means 
 faster when that one pass is added and nothing else changes). Every arm is judged against the same-round A/A copy
 `ngA` (a byte-identical copy of omc timed in the same blocks), and each rung against the rung below it.
 "Measured" uses only timed hand arms and the cited fib round; "with MODELED" adds the sha and chacha estimates of
-section 5. Both rounds ran beside GPU training and CPU model jobs (section 2); the A/A controls pass on all 9
-cases on both cores, so neither round is marked CONTAMINATED under the queen's rule.
+section 5. Both rounds ran beside GPU training and CPU model jobs (section 2). The A/A controls pass on all 9
+cases on both cores, so neither round is marked CONTAMINATED under the queen's rule; that does not clear them of
+memory-bandwidth contention, which slows both A/A copies alike (section 2). The rounds are not contention-cleared.
 
 | rank | X925 (core 9) | gain measured | with MODELED | A725 (core 11) | gain measured | with MODELED |
 |---|---|---|---|---|---|---|
@@ -90,8 +91,10 @@ sha and chacha are straight-line after omc's `unroll`; their executed instructio
 
 The rounds shared the machine with GPU training legs (ownmodel own1-leg23, leg24, leg25: `ollm-gb10 gtrain4`),
 CPU model jobs (wsp `ollm train`, ownmodel-gates6 `ollm serve` on ports 18291/18292, wsp `wpolicy`), listed per
-round with times and sources in `evidence/20261107T1155Z-payoff/OVERLAP.md`. None ran on the timed core (every
-contamination row has no foreign runnable task on core 9 or 11), but they share memory bandwidth and the
+round with times and sources in `evidence/20261107T1155Z-payoff/OVERLAP.md`. They were seen only on other cores
+in the cluster snapshots at round start and end. The per-block scans (one before and one after each case in each
+block, not continuous) found a foreign runnable task on the timed core itself 3 times on X925 and 12 times on A725;
+those 3 and 11 (block, case) pairs were dropped as contaminated. All of the jobs share memory bandwidth and the
 system-level cache, which ngbench's per-core scan cannot see; the A725 round also had a CPU-bound `ollm` on core 19
 of its own cluster.
 
@@ -112,7 +115,9 @@ median lies in [0.99, 1.01]):
 | sieve | 0.9997 [0.9969, 1.0019] | 0.9989 [0.9948, 1.0056] |
 | linear | 0.9995 [0.9985, 1.0004] | 0.9996 [0.9851, 1.0060] |
 
-All 18 pass, so neither round is CONTAMINATED. A second check: omc/gcc -O2 in this round over the same ratio in
+All 18 pass, so neither round is CONTAMINATED under the rule. This check has a blind spot: ngA and omc are the same
+bytes, so a load that steals memory bandwidth slows both equally and the A/A ratio stays at 1. Contention can
+still bias steps between arms that use memory differently. A second check: omc/gcc -O2 in this round over the same ratio in
 the baseline round (20261107T0830Z, clean medians), Wolfram geometric mean 0.9878 on X925 and 0.9943 on A725:
 
 | kernel | X925 this/baseline | A725 this/baseline |
@@ -131,8 +136,8 @@ The largest moves are bcopy (0.964 on X925, 0.980 on A725) and sieve on X925 (0.
 move the most memory, and gcc's arm lost ground against omc's, which fits bandwidth contention slowing the faster
 arm more. The pass step factors are taken within one round and one block, so this shift does not enter them
 directly, but bcopy's VEC factor and the X925 bcopy steps (whose intervals are wide: LICM+ROT [0.674, 0.793], BCE
-[0.665, 0.780]) are the numbers most exposed to it. A rerun on an idle GPU line would settle them; it is not
-required by the rule because A/A passed.
+[0.665, 0.780]) are the numbers most exposed to it. The bcopy and sieve shifts are evidence that contention was
+present. A rerun of the top ranks with the GPU line and the ollm jobs idle would settle how much it moved them.
 
 ## 3. Measured step factors
 
@@ -249,7 +254,8 @@ The A725 fib38 CALL factor above 1 is a placement effect (ngD, the same code wit
 ## 7. Validity
 
 - Rows: X925 3196 and A725 3196, all `ok`, no `fail`, no `refused`; rc 0 on both rounds.
-- A/A: 18 of 18 pass (section 2). Neighbouring jobs: `OVERLAP.md`.
+- A/A: 18 of 18 pass (section 2); A/A cannot detect contention that slows both copies alike, so the rounds are
+  not contention-cleared. Neighbouring jobs: `OVERLAP.md`.
 - Contamination scan: 3 (block, case) pairs flagged on X925 and 11 on A725; clean n is 29 to 31 for every case,
   above the 21 the verdict needs.
 - Records: `x925/` and `a725/` hold start and end time, load, the cluster's processes at start and end, MIDR

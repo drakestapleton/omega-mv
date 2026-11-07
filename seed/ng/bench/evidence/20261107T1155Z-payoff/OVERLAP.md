@@ -2,9 +2,13 @@
 
 Sources: `~/handoffs/BOARD.md` window lines (quoted times), `ps -eo pid,lstart` at about 12:18Z (start times,
 local time UTC-6 converted to Z), and the rounds' own `cluster-start.txt` / `cluster-end.txt` (processes on the
-timed core's cluster, with CPU number and %CPU, taken inside the lock just before and after the round). None of
-these jobs ran on the timed core itself (core 9 / core 11: `core_foreign_runnable=0` in every Y row); what they share
-with the round is the memory system (DRAM bandwidth, the system-level cache) and, for some, the cluster.
+timed core's cluster, with CPU number and %CPU, taken inside the lock just before and after the round). In those
+snapshots these jobs were only on other cores. The per-block Y scans (before and after each case, not continuous)
+found a foreign runnable task on the timed core 3 times on X925 and 12 times on A725 (`core_foreign_runnable=1`);
+those (block, case) pairs are flagged in the K rows and dropped. What the jobs share with the round is the memory
+system (DRAM bandwidth, the system-level cache) and, for some, the cluster. The X925 snapshot PIDs differ between
+start and end because leg24 (2046461) ended at 12:11:24Z and leg25 (2631089) began, and the gates6 serve
+processes were restarted (sched, BOARD 12:15:53Z).
 
 ## A725 round, core 11, 11:54:55Z to 12:09:06Z
 
