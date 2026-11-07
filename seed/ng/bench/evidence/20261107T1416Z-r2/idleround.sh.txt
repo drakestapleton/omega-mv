@@ -1,0 +1,63 @@
+#!/bin/bash
+# ng-bench idle-gated round driver (scratch; copied into evidence as idleround.sh.txt).
+# idleround.sh CORE LOCK LO HI OUTDIR TAG FIXDIR BLOCKS WARM "ARMS" "CASES"
+# Waits until the machine is idle (PREREG-slice.md: no spark-window window held or waiting, no process whose comm
+# starts with ollm), takes LOCK, re-checks, runs ngbench v3 pinned to CORE, records, releases. Never stops others.
+set -u
+core=$1; lock=$2; lo=$3; hi=$4; E=$5; tag=$6; fix=$7; blocks=$8; warm=$9; arms=${10}; cases=${11}
+NB=/tmp/ngb/sl/ngbench3.run
+board() { flock ~/handoffs/BOARD.md.lock -c "echo \"$(date -u +%FT%TZ) ng-bench -> omp-queen-ng: $1\" >> ~/handoffs/BOARD.md"; }
+idlecheck() { # writes the evidence of one check to $1; exit 0 when idle
+  local f=$1 sw swrc fmt nwin nwait nollm
+  sw=$(spark-window status 2>&1); swrc=$?
+  # fail closed: the status command must succeed and print its known section headers, else not idle
+  fmt=0
+  printf '%s\n' "$sw" | grep -q '^quiet lock holders:' && printf '%s\n' "$sw" | grep -q '^gb10 lock holders:' &&
+    printf '%s\n' "$sw" | grep -q '^waiting line (--wait):' && fmt=1
+  nwin=$(printf '%s\n' "$sw" | grep -c '^window ')
+  nwait=$(printf '%s\n' "$sw" | awk '/^waiting line/ {w=1; next} w && NF {n++} END {print n+0}')
+  nollm=0; : > $f.ollm
+  for p in /proc/[0-9]*; do c=$(cat $p/comm 2>/dev/null) || continue; case $c in ollm*) nollm=$((nollm+1)); echo "${p#/proc/} $c" >> $f.ollm;; esac; done
+  { date -u +%FT%TZ; echo "status_rc=$swrc status_format_ok=$fmt windows=$nwin waiting=$nwait ollm=$nollm"; echo "--- spark-window status"; printf '%s\n' "$sw";
+    echo "--- ollm processes"; cat $f.ollm; echo "--- nvidia-smi compute apps";
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1; } > $f
+  rm -f $f.ollm
+  [ $swrc -eq 0 ] && [ $fmt -eq 1 ] && [ $nwin -eq 0 ] && [ $nwait -eq 0 ] && [ $nollm -eq 0 ]
+}
+mkdir -p $E
+date -u +%FT%TZ > $E/lock-request.txt
+said=0
+# optional hold (queen order): when HOLD_PAT is set, this lock is not requested until a BOARD line after line
+# HOLD_LINE matches HOLD_PAT (e.g. the owner's END line of a measurement on these cores); the match is recorded.
+holdok() {
+  [ -z "${HOLD_PAT:-}" ] && return 0
+  tail -n +$((HOLD_LINE + 1)) ~/handoffs/BOARD.md | grep -E "$HOLD_PAT" | grep -viE "${HOLD_NOT:-^$}" | head -1 > $E/hold-release.txt
+  [ -s $E/hold-release.txt ] && return 0
+  rm -f $E/hold-release.txt; return 1
+}
+while true; do
+  if holdok && idlecheck $E/idle-poll.txt; then
+    exec 9> $lock
+    flock -x -w 3600 9 || { exec 9>&-; continue; }
+    if holdok && idlecheck $E/idle-start.txt; then break; fi
+    flock -u 9; exec 9>&-
+  fi
+  if [ $said -eq 0 ]; then
+    if holdok; then why=$(sed -n 2p $E/idle-poll.txt); else why="queen hold on $(basename $lock) until a BOARD line matching '$HOLD_PAT'"; fi
+    board "WAITING before $tag on core $core (PREREG-slice.md idle condition): $why. Checks every 60 s; stops nobody."; said=1
+  fi
+  sleep 60
+done
+rm -f $E/idle-poll.txt
+board "LOCK HELD $(basename $lock) core $core: $tag (ngbench v3, $blocks+$warm blocks), machine idle at start."
+date -u +%FT%TZ > $E/start.txt; cat /proc/loadavg >> $E/start.txt
+ps -eo pid,psr,pcpu,stat,comm | awk -v lo=$lo -v hi=$hi 'NR==1 || ($2>=lo && $2<=hi)' > $E/cluster-start.txt
+cat /sys/devices/system/cpu/cpu$core/regs/identification/midr_el1 > $E/midr.txt 2>&1
+sha256sum $NB > $E/ngbench.sha256
+cd $fix && taskset -c $core nice -n 10 $NB run $blocks $warm $fix $arms -- $cases > $E/rows.txt 2> $E/stderr.txt
+echo $? > $E/rc.txt
+date -u +%FT%TZ > $E/end.txt; cat /proc/loadavg >> $E/end.txt
+ps -eo pid,psr,pcpu,stat,comm | awk -v lo=$lo -v hi=$hi 'NR==1 || ($2>=lo && $2<=hi)' > $E/cluster-end.txt
+idlecheck $E/idle-end.txt; echo "idle_at_end=$?" >> $E/idle-end.txt
+flock -u 9; exec 9>&-
+board "RELEASED $(basename $lock) core $core: $tag done, rc=$(cat $E/rc.txt), $(grep '^S ' $E/rows.txt), busy blocks $(grep -c 'busy=1' $E/rows.txt)."
