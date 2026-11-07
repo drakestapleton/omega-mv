@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport, epoch pool, worker supervision and scheduling
+# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling and authority
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -322,7 +322,9 @@ several posts coalesce into one wake.
 | `sched_step c interval` | Creator loop: wait for an ack or death, take acks, retire reaped workers' jobs (`sched_lost`), collect, dispatch. |
 | `sched_dispatch c`, `sched_collect c` | Assign ready jobs to idle live workers; move finished results into review while there is room. |
 | `sched_lost c w` | After a reap: a rerunnable job is ready again (attempt + 1); any other job becomes UNKNOWN and is never run again. A finished result is still collected. |
-| `sched_review j`, `sched_settle j` | Accept a reviewed result (returns its outcome) or release an UNKNOWN job whose outcome was settled elsewhere. DRA-288 replaces this with the authority commit. |
+| `sched_review j`, `sched_settle j` | Accept a reviewed result (returns its outcome) or release an UNKNOWN job whose outcome was settled elsewhere. Effects are committed by `auth.om` (DRA-288); review only releases the job. |
+| `sched_pause c on` | Pause (no job is assigned) or resume and dispatch. Returns the number dispatched. |
+| `sched_cancel j` | 1 waiting or ready job freed, 2 running (the caller must tell its worker), 3 already in review, 4 UNKNOWN, -3 no such job. |
 | `sched_stop c interval` | `sup_stop`, then retire every reaped worker's job. |
 | `sched_wjob w`, `sched_wdone w q outcome src n`, `sched_wwait c w interval`, `sched_wscan c w` | Worker side: the pending assignment, the finish report (result, then outcome, then done seq, then ack), a wait that records wake latency, and a scan of subscribed versions in the held epoch. |
 
@@ -355,3 +357,105 @@ The gate covers the following phases:
 | `sched.om`: delete `sc_set w 64 get scseq w` (dead worker's assignment not retired) | 92 |
 | `sched.om`: `put sjst j 1` to `put sjst j 2` (dependencies ignored) | 68 |
 | `super.om`: `iv = interval` to `iv = 0`, run with `idle` (workers spin) | 138 |
+
+## Proposals, authority and cancellation (DRA-288)
+
+Status: IMPLEMENTED in `auth.om`, exercised by `auth-gate.om` and the controls
+below on native Linux AArch64, with real forked workers running real child
+tools (`/bin/sh`). Evidence is in the DRA-288 pull request.
+
+```sh
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/auth.om seed/node/auth-test.om > build/node/auth-composed.om
+cmp build/node/auth-composed.om seed/node/auth-gate.om
+seed/out/omc < seed/node/auth-gate.om > build/node/auth-gate
+chmod +x build/node/auth-gate
+timeout 120 build/node/auth-gate         # ends "PASS node authority"
+```
+
+### Model
+
+A worker proposes; the creator alone decides and commits. Every effect is one
+action record of `seed/authority/action.om`, keyed by its operation identity:
+`actstart` when the creator grants it, `actrecon` with the worker's reported
+outcome, `actlost` when the worker dies with it in flight. A performed
+operation is never started again, and an UNKNOWN one is never retried (verdict
+7); `actstart` enforces both, and the attempt limit (verdict 8).
+
+A proposal (words 0..15 of the worker's 4096-byte proposal page) is typed
+(version 1, kind 1) and carries the job id and assignment seq, the worker
+slot and incarnation, the input epoch and version it read, the authority
+generation it holds, the 4-word operation identity and the effect class
+(1 external effect, 2 none). The creator refuses it, in this order, when it
+is malformed (1), not the worker's current assignment (2), from another
+incarnation of the slot (3), stale (4: the input differs from the assignment,
+the epoch was rolled, or a newer version was published on one of the job's
+dependency topics), under a revoked generation (5), or for a job being
+cancelled (6). A refused job finishes with outcome 16 + verdict.
+
+A granted tool runs as the leader of its own process group (both sides call
+`setpgid`), stdin on `/dev/null`, output into the proposal page from byte 128.
+Cancellation of its job, authority revocation, stop or creator loss make the
+worker SIGKILL the whole group. The outcome comes from the wait status alone:
+a tool that exited is performed (2), even if a cancel raced its exit; a killed
+tool with an external effect is UNKNOWN (0); a killed class 2 tool is not
+performed (1). Group members left behind are killed either way. If the worker
+dies, the creator kills the tool group named in the worker's cell and records
+the action UNKNOWN.
+
+Control reaches a worker through its own control eventfd, in addition to the
+wake and stop eventfds, so a worker waiting for a decision or running a tool
+handles it at once. Each control carries a seq the worker acknowledges, with
+the paused flag it saw. Pause stops both assignment and decisions; running
+tools go on. Revocation moves the generation on: pending proposals under the
+old one are refused, running granted tools are cancelled, and a report already
+made is still recorded as made.
+
+Control page cell of worker w (128 bytes at 128w). Creator words: 0 control
+seq, 8 cancel target (assignment seq), 16 decided proposal seq, 24 verdict,
+32 generation at the decision. Worker words: 64 control ack, 72 proposal seq,
+80 report seq, 88 outcome, 96 tool wait status, 104 paused as seen, 112 tool
+process group, 120 tool output bytes. Words 8192 and 8200 mirror the
+generation and the paused flag.
+
+| Function | Contract |
+| --- | --- |
+| `auth_new c`, `auth_free` | Creator, after `sup_init` and before any spawn: map the control and proposal pages and one control eventfd per slot; generation 1. |
+| `auth_spawn c w` | `sup_spawn` with a new incarnation of slot w. |
+| `auth_step c` | After `sched_step`: record reports, close the actions of reaped workers (`actlost`, tool group killed), decide pending proposals unless paused. |
+| `auth_revoke c`, `auth_pause c on`, `auth_cancel c j` | The operator controls: new generation; pause or resume; cancel a job (`sched_cancel`, then the worker's control for a running one). |
+| `auth_act op i`, `auth_cell w off`, `auth_wout w dst` | Read an action record word, a control cell word, a worker's tool output. |
+| `auth_propose w q op class`, `auth_wdecide c w q interval` | Worker: propose, then wait for the verdict while handling control. |
+| `auth_wtool c w q pk pn class`, `auth_wreport w q outcome` | Worker: run the granted tool (packed argv as `execprog`), report its outcome. |
+| `auth_wwait c w x interval`, `auth_wctl w` | Worker wait on wake, stop, creator loss, control and optionally fd x; the control handler (ack, paused, cancel target). |
+
+Limits: action records live in creator memory only, so a creator restart
+loses them (DRA-289 adds the journal). Between a worker's death and the
+creator's `auth_step` the tool's group id could in principle be reused; the
+window is one creator step. At most 64 action records are live.
+
+### Acceptance and controls
+
+Job id = kind × 1000 + operation number. The gate covers the following
+phases:
+- A: a granted operation runs once and is performed; the same operation in a new job is refused (7) and its tool does not run again.
+- B: a proposal is refused as stale (4) after a newer version on its dependency topic or an epoch roll; a newer version on another topic does not make it stale.
+- C: forged incarnation, job id and version are refused (3, 2, 1) and no tool runs.
+- D: revocation before the decision refuses (5). Revocation during a tool kills its grandchild and records UNKNOWN; the operation is then refused (7). Revocation after the tool reported still records performed.
+- E: cancel before start frees the job with no action record. Cancel during a tool kills its grandchild and records UNKNOWN. Cancel in review changes nothing. A cancel 200 ms after the tool's own process exited, while its grandchild still held the output, records performed and still kills the grandchild.
+- F: a worker killed mid-tool: the creator kills the tool's group and the action and job are UNKNOWN.
+- G: pause is acknowledged by every worker within 1 s; while paused a pending proposal stays undecided and a ready job is not assigned; resume performs both.
+
+| Change | Expected exit |
+| --- | --- |
+| `auth.om`: delete both `setpgid` calls (no process group) | 58 |
+| `auth.om`: `r = killpid neg int pid 9` to `r = killpid int pid 9` (direct kill only) | 58 |
+| `auth.om`: a killed tool always reports UNKNOWN (`if k` / `ret 0` before `ret au_outcome st class`) | 85 |
+| `auth.om`: `ret ne node_next h au_pw w 7 t 0` to `ret false` (newer input ignored) | 27 |
+| `auth.om`: `if ne au_pw w 8 get augen 0` compares the proposal with itself (generation ignored) | 52 |
+| `auth.om`: `if ne au_pw w 5 get auinc w` compares the proposal with itself (incarnation ignored) | 40 |
+| `auth.om`: in `au_commit`, `k = au_find op` to `k = neg long 1` (duplicate performed) | 17 |
+| `auth.om`: delete `au_ctl w au_cell w 16` in `auth_revoke` (running tools not cancelled) | 55 |
+| `auth.om`: delete `au_ctl w sc_cell w 0` in `auth_cancel` (worker never told) | 75 |
+| `auth.om`: delete `x = killpid neg int p 9` in `au_lost` (dead worker's tool left running) | 96 |
+| `auth.om`: decide proposals while paused | 120 |
+| `sched.om`: `if ne get scpause 0 0` to `if false` (assign while paused) | 121 |
