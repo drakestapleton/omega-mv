@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority, journal, coding workflow and operator view
+# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority, journal, coding workflow, operator view and release
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -845,3 +845,90 @@ scenario first and must pass all of them, else the mutant runs are void.
 | refusals not counted | `overload-refusals-visible` |
 | acknowledgement carries the version current after acting | `cmd-pause-duplicate-version` |
 | view process outlives its creator | `crash-view-exits-with-creator` |
+
+## Release lifecycle and durable results (DRA-292)
+
+Status: IMPLEMENTED in `release.sh`, `journal.om` (RESULT records), `code.om`,
+`auth.om` and `op.om`; exercised on native Linux AArch64 by
+`tests/release-accept.py fake`, which answers with the recorded round40 turns
+only. The same driver in `live` mode runs every scenario against the own
+model (aien-train `ollm serve`, or `gserve` on the GB10 inside an authorized
+window); a fake run is host regression, not model qualification. Not
+QUALIFIED and not DEPLOYED.
+
+```sh
+seed/node/release.sh build build/node            # BUILD_OK name bytes sha256, six programs
+python3 seed/node/tests/release-accept.py fake $PWD/build/node OLDBIN OMC40 ROUND40 build/node/rel
+OLLM=... VERB=serve CK=... MERGES=... PORT=18294 \
+  python3 seed/node/tests/release-accept.py live $PWD/build/node OLDBIN OMC40 ROUND40 build/node/rel
+```
+
+OLDBIN holds `infer`, `tool` and `code-main` built from the DRA-290 tree
+(git 79894168), the reader before OPER and RESULT.
+
+### Lifecycle
+
+| Command | Effect |
+| --- | --- |
+| `build OUT` | compose and compile the six programs with this checkout's `seed/out/omc`; two builds are byte-identical |
+| `serve STATE PORT OLLM VERB CK MERGES` | start the own-model server; waits for its PORT line |
+| `start STATE BIN OMC PORT VIEW` | start `omnode-code` on STATE (`root/`, `work/`, `journal/`, `objs.txt`); refuses (3) while `node.pid` is alive |
+| `health STATE` | the model's `GET /health` and the node's view; 0 when both answer |
+| `stop STATE` | pause (op 1), wait until nothing runs or is in review (at most 900 s), SIGTERM; `view-at-stop.json` |
+| `restore STATE` | start again on the same journal (incarnation + 1), then resume (op 2) |
+| `unserve STATE` | stop the model server |
+
+The journal's lock is the one active authority: a second `omnode-code` on
+the same journal exits 50 (30 + 20, fenced) and changes nothing.
+
+Cutover: `stop`, copy `root/`, `work/` and `journal/`, `restore` with the new
+BIN. Reversal: `stop`, put the copy back, `start` with the old BIN. A reader
+refuses record types newer than it knows (24, exit 54) before writing
+anything, so the DRA-290 build refuses a journal that holds OPER (9) or
+RESULT (10) and leaves it unchanged; rolling back therefore needs the copy
+taken before the new build ran.
+
+### Durable results
+
+When an objective ends, `cw_end` appends RESULT (type 10: word 3 the
+objective, 4 the result, 5 its turns) before the result is printed. On a
+restart an objective with a RESULT is reported again (`CWO` with the same
+result and turns) and never resumed: a failure is final, as in DRA-290,
+and an objective that ended UNKNOWN (21) cannot issue its effect again. The
+journal refuses a second RESULT for an objective, result 0 and an index
+past 63 (25) before writing. A result the journal refused is still printed;
+that objective resumes after a restart.
+
+An inference worker that dies while it holds a job: inference is class 2
+(no external effect), so `au_lost` records it not performed (DONE how 6),
+as recovery does at a restart, and the objective asks again; only class 1
+and 3 effects stay UNKNOWN. The uncertain-effect test hook kills a worker
+only after the job's START is durable.
+
+### Acceptance and controls
+
+`release-accept.py` runs twelve scenarios on the real programs: the full
+four-objective run (prompts and model texts equal the recording, one START
+per operation, independent review, results durable across a rerun with no
+model request), the lifecycle (start, health, stop with jobs ready, restore,
+finish), the creator killed after a replace (no second effect), a conflicting
+write after the read (15, the other write kept), a dead inference worker
+(rerun), an uncertain replace (21, final after restart), cancel of a running
+inference, stale, burst and duplicate commands, the server down (16), a
+second authority, journal compatibility in both directions, and address-space
+caps from the measured peak (each failing cap explicit with a consistent
+journal, then a passing one). Each prints MEASURED latency, RSS and seconds.
+
+A resumed objective reads the file it edited before the restart, a prompt no
+recording holds: in fake mode the three checks that need it
+(`restart-resumed-completes`, `journal-forward-completes`,
+`journal-rollback-completes`) are NOT_RUN, naming the prompt; any other end
+fails them. Live mode answers it and requires PASS.
+
+| Change | Check that fails |
+| --- | --- |
+| RESULT not journaled | `full-results-durable` |
+| journaled RESULT not reported at restart | `full-results-durable` |
+| lost inference left UNKNOWN | `worker-death-rerun` |
+| uncertain hook before START is durable | `uncertain-start-durable` |
+| second RESULT accepted (journal.om) | journal gate case 16 (exit 173) |
