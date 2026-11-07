@@ -72,7 +72,8 @@ fib38), so any future codegen A/B reports an aligned control.
      against the sign of the low half or UMULH = 0, narrower types by computing the exact 64-bit result and comparing
      it with its own re-extension; chk.divz CBZ; chk.divovf `((b + 1) | (a ^ MIN)) = 0`; chk.shl; chk.shift
      (unsigned CMP with the width); chk.conv between integers; chk.fuel CMP + B.HS; chk.true CBZ. Facts emit nothing.
-   - memory (IR.md s7.5), REF to ARRAY of bool or integers only: a REF is one register holding the object's address.
+   - memory (IR.md s7.5), REF to ARRAY of bool or integers (SLICE values below): a REF is one register holding the
+     object's address.
      load/store: LDR/STR register offset, index scaled by the element size (LDRB/LDRH/LDR W/LDR X; LDRSB/LDRSH/
      LDRSW for i8/i16/i32 keep the canonical sign extension); gaddr: the global's absolute address (MOVZ + MOVK);
      len: the ARRAY count from the type; alloca: `ADD Xd, SP, #area`, then `STP XZR, XZR, [X16], #16` per 16 bytes
@@ -80,6 +81,16 @@ fib38), so any future codegen A/B reports an aligned control.
      covering form, s8) is `CMP Xi, #(len - e); B.HI trap` (exact, no add that could wrap), e = 0 or e > len a
      plain `B trap`; any other e `CBZ`, `len - e` by SUBS (`B.LO`), then CMP + B.HI. chk.slice r off n: `off > len`
      or `n > len - off`, each CMP + B.HI. The back end trusts ngcheck's coverage (an access follows its check).
+   - SLICE values (IR.md s4.2 kind 5) of bool or integer elements: two wires. The value's own wire holds the
+     address of element 0; a length wire (`a6_shw`, made after liveness with the value's interval, so the scan
+     allocates it like any value: register, callee-saved when it crosses a call, or a slot) holds the count. A move
+     of a slice moves both (`a6_mvv`: block arguments, E-tail parameters); a call passes a slice as two machine
+     arguments, address then count (`a6_xcall`, `a6_xpar`, `a6_xcnt`), so a slice may straddle x7 and the first
+     stack slot. `slice r off n` (r a REF to ARRAY or a SLICE): `ADD X16, Xr, Xoff, LSL #log2(size)` and `X15 = n`
+     before either result wire is written (both may reuse operand registers); `len` of a SLICE reads the length
+     wire; load and store use the address wire like a REF. chk.bounds on a SLICE: `CBZ e`, `SUBS X15, len, e` +
+     `B.LO` (e > len), CMP i + `B.HI`; chk.slice on a SLICE: CMP off, len + `B.HI`, `X15 = len - off`, CMP n +
+     `B.HI`. A slice result of any op but `slice` (select, call) and `retv` of a slice are refused (exit 5).
    - host words read (53) and write (54) (IR.md s7.11): `X17 = A + off`, then x0 fd, x1 X17, x2 n as one parallel
      move, `MOVZ X8, #63/64; SVC #0`, result (count or minus errno) from x0. The SVC preserves every register but x0;
      the arguments use x0..x2, so a host word counts as a call for allocation (values live across it take x19..x27)
@@ -136,10 +147,9 @@ BLR, SVC, ADR and the FP set.
 
 1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
    in a callee-saved register across its loop).
-2. Memory beyond the slice: SLICE values (`slice`, `len` of a SLICE; two words per value; the ChaCha20, SHA-256 and
-   X25519 bench kernels pass `view uchar *` and need them), STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`,
-   `vstore`), `fill`, `atom`, `atomcas`, float elements. Bounds checks hoisted out of loops by a pass that proves
-   them (IR.md s15).
+2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `fill`, `atom`,
+   `atomcas`, float elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass that
+   proves them (IR.md s15).
 3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
 4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, host words beyond
    read, write, cpufence and cpurelax.
@@ -148,9 +158,9 @@ BLR, SVC, ADR and the FP set.
 
 - `gate.om` (encoder): builds ng from `ng.units`, runs `@ng a64-enc` on `tests/enc.cases`, disassembles with GNU
   objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases.
-- `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck, ngas, ngrun and ng. For every mkir fixture (fib, deep, press, rot,
-  ck, ar, tsum, mem, oob, zf, wid, bcopy, sort) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must
-  exit with the expected status (computed with Wolfram, or the check's trap code), the omc build of
+- `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck, ngas, ngrun and ng. For every mkir fixture (fib,
+  deep, press, rot, ck, ar, tsum, mem, oob, zf, wid, bcopy, sort) ngcheck must accept the ΩIR, `@ng a64` and
+  `@ng a64 split` must exit with the expected status (computed with Wolfram, or the check's trap code), the omc build of
   `tests/ref/N.om` with its omc expectation (the same, except tsum: omc traps 6 a million calls deep, ng's loop does
   not; BEYOND_OMC), the split and omc runs must print exactly the bytes the `@ng a64` run printed, and every BL
   target in the `@ng a64` ELF must be a multiple of 64. bcopy and sort are the bench kernels
@@ -173,16 +183,29 @@ BLR, SVC, ADR and the FP set.
   3550e837), and the bench kernels as text: `b-fib` (fib 27 and the bench's decimal printer; 196418), `b-bcopy` and
   `b-sort` (ngdis of mkir's bcopy and sort, scaled to 8 rounds and 400 elements so ngrun finishes inside rgate's
   30 s child limit; Wolfram for sort: 214018279158 0 2818 3982316). The full-size kernels stay in the mkir set
-  against omc.
+  against omc. `b-chacha` is the ChaCha20 bench (`~/handoffs/OmegaFast/bench/chacha.om` over `om/tls/chacha.om`,
+  `chacha20_xor` and everything below it) lowered by hand to ΩIR with SLICE parameters, inline functions inlined and
+  unrolled loops unrolled, scaled to a 300-byte buffer (four whole blocks and a 44-byte tail) and 3 rounds. Besides
+  ngrun, omc's build of `om2` + `om/tls/chacha.om` + the bench driver with those two numbers changed writes the same
+  300 bytes (checked once by hand, 2026-11-07; not part of rgate). The `s-*` fixtures cover SLICE values: `s-slice`
+  (slices of a REF and of a slice, u8, u32 and u64 elements, `len`, a shrinking slice carried as a loop block
+  parameter, slices straddling x7 and the stack in an 11-parameter call, fourteen slices live across calls so their
+  length wires spill, a host write from a slice) and `s-tb`, `s-te`, `s-ts`, `s-ts2` (chk.bounds index = len,
+  constant e > len, chk.slice n > len - off and off > len on slices with a run-time length, each after a passing
+  call at the boundary). SHA-256 and X25519 are not lowered by hand: their sources use only ops covered here
+  (integer arithmetic with div/rem, not, rotr at 32 and 64 bits, shifts, arrays and u8/u64 slices); they run end to
+  end once ng-front emits ΩIR.
 
-  Eighteen mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
+  Twenty-one mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
   frame size, 16-byte entry alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half
   zero fill, write count, u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending, a wrong
-  trap code for chk.divovf, stack parameters read from the first incoming slot, stack arguments stored one slot low)
-  must each change at least one fixture's status (against its expectation or ngrun's) or alignment.
-- ΩIR gap met by sort: a call argument must have exactly the parameter's type (IR.md row 64), so Omega passing an
-  `edit` array to a `view` parameter has no ΩIR form while `view` maps to REF access 0. The fixture types sorted's
-  parameter as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
+  trap code for chk.divovf, stack parameters read from the first incoming slot, stack arguments stored one slot low,
+  a slice's length taken from its offset, slice block arguments keeping the target's length, slice offsets not
+  scaled by the element size) must each change at least one fixture's status (against its expectation or ngrun's)
+  or alignment.
+- ΩIR gap met by sort and chacha: a call argument must have exactly the parameter's type (IR.md row 64), so Omega
+  passing an `edit` array or slice to a `view` parameter has no ΩIR form while `view` maps to access 0. The fixtures
+  type such parameters as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
 
 ## 7. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
 
