@@ -17,16 +17,23 @@ text phol " hol_stops="
 text pbyp " bypasses="
 text pres " reservations="
 text pnl "\n"
+text ptr "schedpol goal trace "
+text psp " "
 text pw1 "schedpol hol witness head="
 text pw2 " fits_behind="
 text pw3 " free_cpu="
 text pw4 " idle_worker="
 global ptc long 1
-note Mode: 0 default policy, 1 fifo, 2 noreserve.
+note Mode: 0 default policy, 1 fifo, 2 noreserve, 3 goal (policy 2).
 global ptm ulong 1
 note pt_step snapshot: event count, candidate reads, maintenance reads,
 note assigned, before the step.
 global ptb ulong 4
+note Phase G trace: ids in review order.
+global ptt ulong 16
+global ptn ulong 1
+note Value-read bound baseline: stats 38, 32, 33 at the last check.
+global ptv ulong 3
 
 fn pt_ok ok bool code int to void
 if not ok
@@ -128,11 +135,17 @@ put ptc 0 c
 pt_ok eq sup_init c 0 code
 pt_ok eq sched_new c a rl 0 code
 pt_ok eq sched_cap caps 0 code
+put ptv 0 sched_stat 38
+put ptv 1 sched_stat 32
+put ptv 2 sched_stat 33
 if eq get ptm 0 1
 pt_ok eq sched_policy 0 64 64 4 1000 0 code
 end
 if eq get ptm 0 2
 pt_ok eq sched_policy 1 64 64 65535 1000 0 code
+end
+if eq get ptm 0 3
+pt_ok eq sched_policy 2 64 64 4 1000 0 code
 end
 for i ulong w bound 64
 pt_ok pt_spawn c i code
@@ -176,11 +189,12 @@ end
 note One creator step of up to 10 ms, then the invariant and the scan
 note bounds since the last step. An event makes at most one pick more than
 note it assigns, so candidate reads are at most (assigned + events) x
-note (window + 1), the reserved probe included, or x 64 under FIFO (policy
-note 0), 9; maintenance reads at most 64 per event, 14; the cursor moved by
-note exactly the window per window scan, mod 64, 15. The last is the
-note traversal witness: window scans cover consecutive windows, so
-note ceil(64/win) of them examine every slot.
+note (window + 1), the reserved probe included, plus one proposal probe per
+note pick under policy 2, or x 64 under FIFO (policy 0), 9; maintenance reads
+note at most 64 per event, 14; the cursor moved by exactly the window per
+note window scan, mod 64, 15 (the traversal witness: window scans cover
+note consecutive windows, so ceil(64/win) of them examine every slot); value
+note reads at most 64 per rescoring plus 128 per job scored, 8.
 fn pt_step c long code int to void
 put ptb 0 sched_stat 2
 put ptb 1 sched_stat 3
@@ -195,17 +209,31 @@ w = add sched_stat 25 1
 if eq sched_stat 24 0
 w = ulong 64
 end
+if eq sched_stat 24 2
+w = add w 1
+end
 ev = sub sched_stat 2 get ptb 0
 lim = mul add sub sched_stat 4 get ptb 3 ev w
 pt_ok le sub sched_stat 3 get ptb 1 lim 9
 pt_ok le sub sched_stat 13 get ptb 2 mul ev 64 14
 pt_cursor u0 s0
+pt_vbound
 end
 
 note The cursor moved by the window once per window scan since (u0, s0).
 fn pt_cursor u0 ulong s0 ulong to void
 d = mul sched_stat 25 sub sched_stat 14 s0
 pt_ok eq sched_stat 28 rem add u0 d 64 15
+end
+
+note The value-read bound since the last call (phase checks, exit 8).
+fn pt_vbound to void
+v = sched_stat 38
+lim = add mul sub sched_stat 32 get ptv 1 64 mul sub sched_stat 33 get ptv 2 128
+pt_ok le sub v get ptv 0 lim 8
+put ptv 0 v
+put ptv 1 sched_stat 32
+put ptv 2 sched_stat 33
 end
 
 note Step until job j is in a state in lo..hi, up to ms. True when reached.
@@ -737,11 +765,231 @@ ret
 end
 n = argread 1 a 0 16
 if eq n 4
+if eq get a 0 102
 put ptm 0 1
+end
+if eq get a 0 103
+put ptm 0 3
+end
 end
 if eq n 9
 put ptm 0 2
 end
+end
+
+note Step, then review every job in review in slot order, appending its id
+note to the trace and publishing the topics it declared (as the workflow
+note does after accepting a result).
+fn pt_gstep c long buf edit uchar 4096 code int to void
+pt_step c code
+for j ulong 64
+if eq get sjst j 4
+p = get sjpro j
+n = get ptn 0
+if lt n 16
+put ptt n get sjid j
+end
+put ptn 0 add n 1
+pt_ok eq sched_review j long add get sjid j 1 code
+if ne p 0
+pt_ok gt sched_publish c p buf 16 0 code
+end
+end
+end
+end
+
+fn pt_gadmit id ulong deps ulong pro ulong code int to ulong
+j = pt_admit id deps pt_req 1 0 0 0 code
+if ne pro 0
+pt_ok eq sched_goal j pro 50 10 0 code
+end
+ret j
+end
+
+note One run of the goal workload, one worker, policy 2, bypass budget 4,
+note admitted while paused: x (no value), z (unblocks d: value 1), a
+note (unblocks b, which unblocks c: value 2), f (unblocks g1..g3: value 3).
+note A decision is made when the worker frees, before the finished job's
+note topics are published. Order: f a z b x d c g1 g2 g3. f and a first
+note (useful work); x, bypassed in 4 events, is reserved and runs 5th.
+fn pt_grun code int to void
+buf = new uchar 4096 0
+c = pt_setup 1 16 16 pt_req 1 1024 1 8 code
+pt_ok eq sched_policy 2 64 64 4 1000 0 code
+k = sched_pause c true
+put ptn 0 0
+j = pt_gadmit 220050 0 0 code
+j = pt_gadmit 230050 0 128 code
+j = pt_gadmit 240050 128 0 code
+j = pt_gadmit 250050 0 32 code
+j = pt_gadmit 260050 32 64 code
+j = pt_gadmit 270050 64 0 code
+j = pt_gadmit 280050 0 256 code
+for i ulong 3
+j = pt_gadmit add 290050 mul i 10000 256 0 code
+end
+k = sched_pause c false
+dl = add ulong monons 5000000000
+for t ulong 1000000
+if ge get ptn 0 10
+break
+end
+pt_ok lt ulong monons dl code
+pt_gstep c buf code
+end
+pt_down c code
+end
+
+note Phase G: goal-aware ranking. The goal workload runs twice; both traces
+note must equal the expected order (151 first run, 152 second): repeated
+note identical inputs, identical decisions.
+fn pt_goal to void
+ex = new ulong 10 0
+put ex 0 280050
+put ex 1 250050
+put ex 2 230050
+put ex 3 260050
+put ex 4 220050
+put ex 5 240050
+put ex 6 270050
+put ex 7 290050
+put ex 8 300050
+put ex 9 310050
+for r ulong 2
+code = int add 151 r
+pt_grun 150
+pt_ok eq get ptn 0 10 code
+for i ulong 10
+if ne get ptt i get ex i
+pt_trace
+exit code
+end
+end
+end
+end
+
+fn pt_trace to void
+r = write 1 ptr 0 len ptr
+for i ulong get ptn 0 bound 16
+pt_num get ptt i
+r = write 1 psp 0 1
+end
+r = write 1 pnl 0 1
+end
+
+note Phase H: rescoring. Policy 2, paused: one ready job r and two jobs
+note waiting on topic 512, then r declares topic 512: four graph changes,
+note no rescoring (160). The first pick rescores once for all four (161).
+note r completing and being reviewed with nothing published changes no
+note value: no rescoring (162). Publishing 512 readies both waiting jobs:
+note two changes, one more rescoring at the next pick (163). The work of
+note every rescoring is bounded (checked at each step, exit 8). Cancelling
+note a waiting job is one more change (165).
+fn pt_rescores to void
+buf = new uchar 4096 0
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 160
+pt_ok eq sched_policy 2 64 64 4 1000 0 160
+k = sched_pause c true
+r = pt_admit 320050 0 pt_req 1 0 0 0 160
+w1 = pt_admit 330050 512 pt_req 1 0 0 0 160
+w2 = pt_admit 340050 512 pt_req 1 0 0 0 160
+pt_ok eq sched_goal r 512 50 10 0 160
+pt_ok eq sched_stat 34 4 160
+pt_ok eq sched_stat 32 0 160
+k = sched_pause c false
+pt_ok eq sched_stat 32 1 161
+pt_ok eq get sjval r 2 161
+pt_drain c 1 2000 162
+pt_ok eq sched_stat 32 1 162
+pt_ok eq sched_stat 34 4 162
+pt_ok gt sched_publish c 512 buf 16 0 163
+pt_ok eq sched_stat 34 6 163
+pt_ok eq sched_stat 32 2 163
+pt_drain c 2 2000 164
+pt_ok eq sched_stat 32 2 165
+w3 = pt_admit 345050 4096 pt_req 1 0 0 0 165
+b0 = sched_stat 34
+pt_ok eq sched_cancel w3 1 165
+pt_ok eq sched_stat 34 add b0 1 165
+pt_down c 166
+end
+
+note Phase K: the policy-2 key on two free slots, a and b. Larger unblock
+note value first, even when b is older and cheaper (180); equal values:
+note smaller estimate first, even when b is older (181); equal values and
+note estimates: older admission first (182); outside policy 2 only the
+note admission age counts (183).
+fn pt_key to void
+a = ulong 60
+b = ulong 61
+put sjval a 2
+put sjval b 1
+put sjest a 90
+put sjest b 10
+put sjarr a 9
+put sjarr b 8
+pt_ok sp_better true a b 180
+pt_ok not sp_better true b a 180
+put sjval b 2
+put sjest a 10
+put sjest b 90
+pt_ok sp_better true a b 181
+pt_ok not sp_better true b a 181
+put sjest b 10
+pt_ok sp_better true b a 182
+pt_ok not sp_better true a b 182
+put sjval a 5
+put sjest b 1
+pt_ok sp_better false b a 183
+pt_ok not sp_better false a b 183
+for i ulong 2
+put sjval add a i 0
+put sjest add a i 0
+put sjarr add a i 0
+end
+end
+
+note Phase P: proposals. Policy 2, paused. p1 (value 0) and p2 (value 1)
+note are ready. A proposal naming an older graph version is refused (170)
+note and counted (171); one for a free slot is refused (172); p1 at the
+note current version is accepted (173) and used over the higher ranked p2
+note (174). A proposal made stale by a later change is rejected when next
+note used and counted: p3 runs by rank, after p2 (175, 176). Outside policy
+note 2: -7 (177).
+fn pt_proposals to void
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 170
+pt_ok eq sched_policy 2 64 64 4 1000 0 170
+k = sched_pause c true
+p1 = pt_admit 350050 0 pt_req 1 0 0 0 170
+p2 = pt_admit 360050 0 pt_req 1 0 0 0 170
+q = pt_admit 370050 1024 pt_req 1 0 0 0 170
+pt_ok eq sched_goal p2 1024 50 10 0 170
+v = sched_version
+p3 = pt_admit 380050 0 pt_req 1 0 0 0 170
+pt_ok eq sched_propose p1 v neg long 9 170
+pt_ok eq sched_stat 36 1 171
+v = sched_version
+pt_ok eq sched_propose 63 v neg long 3 172
+pt_ok eq sched_propose p1 v 0 173
+k = sched_pause c false
+pt_ok eq get sjst p1 3 174
+pt_ok eq sched_stat 39 1 174
+k = sched_pause c true
+v = sched_version
+pt_ok eq sched_propose p3 v 0 175
+p4 = pt_admit 390050 2048 pt_req 1 0 0 0 175
+pt_ok eq sched_goal p3 0 10 1 0 175
+k = sched_pause c false
+pt_ok pt_until c p2 3 4 2000 175 175
+pt_ok eq get sjst p3 2 176
+pt_ok eq sched_stat 39 1 176
+pt_ok eq sched_stat 36 2 176
+pt_ok eq sched_cancel p4 1 176
+pt_ok eq sched_cancel q 1 176
+pt_drain c 3 3000 176
+pt_ok eq sched_policy 1 64 64 4 1000 0 177
+pt_ok eq sched_propose p1 sched_version neg long 7 177
+pt_down c 178
 end
 
 fn pt_stats to void
@@ -784,6 +1032,10 @@ pt_window
 pt_torder
 pt_slots
 pt_live
+pt_goal
+pt_rescores
+pt_proposals
+pt_key
 if ne write 1 pok 0 len pok long len pok
 ret 100
 end

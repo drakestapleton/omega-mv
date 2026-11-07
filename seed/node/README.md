@@ -376,8 +376,9 @@ dispatcher.
 Status: IMPLEMENTED: resource requests, capacity admission and policy 0, FIFO
 head-of-line, which reproduces the stop rule of the reference pump (DRA-395);
 policy 1, fair fitting with reservation, admission tickets and leases, the
-default (DRA-396). The head-of-line regression fails under policy 0 and
-passes under policy 1.
+default (DRA-396); policy 2, goal-aware ranking with coalesced rescoring and
+versioned proposals (DRA-397). The head-of-line regression fails under policy
+0 and passes under policies 1 and 2.
 
 ```sh
 cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/node/schedpol-test.om > build/node/schedpol-composed.om
@@ -385,6 +386,7 @@ cmp build/node/schedpol-composed.om seed/node/schedpol-gate.om
 seed/out/omc < seed/node/schedpol-gate.om > build/node/schedpol-gate
 chmod +x build/node/schedpol-gate
 timeout 300 build/node/schedpol-gate            # policy 1: exit 0
+timeout 300 build/node/schedpol-gate goal       # policy 2: exit 0
 timeout 300 build/node/schedpol-gate fifo       # policy 0: exit 11, the blocked head
 timeout 300 build/node/schedpol-gate noreserve  # no reservation: exit 61, starvation
 ```
@@ -453,8 +455,8 @@ exclusion is therefore evidenced for Rust only.
 | --- | --- |
 | `sched_admitr id deps flags req` | `sched_admit` with a resource request; -8 when a kind exceeds its capacity (counted, never queued). |
 | `sched_cap caps` | Set every capacity; -8 and no change when a kind would fall below its use or below one admitted job's need. |
-| `sched_policy p win db by ttl` | Policy 0 or 1, candidate window 1..64 slots, dispatch budget 1..64 per event, bypass budget 1..65535, ticket lifetime 1..1000000 dispatch events; -7 out of range. |
-| `sched_stat i` | Counters 0..15 (10 tickets issued, 11 tickets lapsed, 12 leases overdue), capacity 16..19, use 20..23, policy words 24..31 (policy, window, budget, bypass budget, cursor, reserved slot + 1, tickets held, ticket lifetime). |
+| `sched_policy p win db by ttl` | Policy 0, 1 or 2, candidate window 1..64 slots, dispatch budget 1..64 per event, bypass budget 1..65535, ticket lifetime 1..1000000 dispatch events; -7 out of range. |
+| `sched_stat i` | Counters 0..15 (10 tickets issued, 11 tickets lapsed, 12 leases overdue), capacity 16..19, use 20..23, policy words 24..31 (policy, window, budget, bypass budget, cursor, reserved slot + 1, tickets held, ticket lifetime), goal counters 32..40 (DRA-397). |
 
 Admission order (`sjarr`) and ready order (`sjrdy`) are logical counters, so
 selection never reads the clock.
@@ -622,6 +624,79 @@ journaled once (174..177).
 | `jn_admit` skips the room check (`journal.om`) | 173 (`journal-gate`): case 16 journals ADMIT for the refused id, so its later admission is refused as a duplicate |
 | the same, with case 16 not run | 175 (`journal-gate`): case 17's refused admission grows the journal |
 | FIFO counts 3 per slot read (`sp_fifo`), run with `fifo` | 9: the first FIFO pick reads more than 64 per pick allows |
+
+### Policy 2: goal-aware ranking and replanning (DRA-397)
+
+Policy 2 is policy 1 with a different order among the examined jobs that
+fit. The reservation, the hold-back, feasibility and the bypass budget come
+first, unchanged, so ranking cannot starve old work: a job ranked low is
+bypassed, reaches the bypass budget and is reserved like under policy 1.
+Authority checks stay where they are (`sched_pause`, `auth.om`). Policy 1
+stays the default until DRA-399's matched comparison shows otherwise.
+
+Inputs: `sched_goal j pro est unc` declares, for a waiting or ready job, the
+topics its completion will publish (`pro`), its work estimate in ms (`est`,
+declared, or derived by the caller from its own measurements) and that
+estimate's uncertainty in ms (`unc`, recorded, not used to rank). They are
+estimates: they order ready jobs and nothing else. Nothing is learned.
+
+Key, in order: larger unblock value, smaller estimate, older admission
+(`sjarr`, unique, so there are no ties). The unblock value of a ready job,
+in jobs, is the number of waiting jobs whose deps meet its declared topics
+(depth 1) plus the waiting jobs whose deps meet the topics those declare
+(depth 2), each counted once. Lookahead stops at depth 2: at most 128 slot
+reads per job scored plus 64 per rescoring (the pass that finds ready
+jobs), counted in `sched_stat 38` and checked at every step (exit 8). A
+proposal adds one candidate read per pick, so under policy 2 a pick reads
+at most `win` + 2 slots (exit 9).
+
+Replanning. Every committed change that can alter a value bumps the graph
+version: a job becomes ready (admission, publication, rerun after a worker
+death), a waiting job is admitted, a waiting or ready job is cancelled, a
+declaration changes. Values are recomputed only at a policy-2 pick whose
+version differs from the last scoring, once however many bumps came before
+it. Bumps therefore coalesce and none is lost, because the version is a
+counter, not a flag. Completions, failures, resource releases and lease
+expiry replan without rescoring: every step collects, then dispatches with
+the current values, and none of those events changes a value. No step waits
+for other workers and no model is called.
+
+Proposals. `sched_propose j v` lets an outside planner or an operator put
+ready job j first, computed at graph version `v` (`sched_version`). It is
+refused when `v` is not current (-9, counted stale), when j is not ready
+(-3) or when j does not fit beside the reservation (-8). It is used once, at
+the next pick, after the reservation, and only if the version is still `v`,
+j is still ready and it still fits; otherwise it is dropped and counted
+stale.
+
+| Function | Contract |
+| --- | --- |
+| `sched_goal j pro est unc` | Declare topics, estimate (ms) and its uncertainty (ms) for a waiting or ready job; 0 or -3. |
+| `sched_version` | The current graph version. |
+| `sched_propose j v` | Propose ready job j at version v; 0, -9 stale, -3 not ready, -8 does not fit beside the reservation, -7 not policy 2. |
+| `sched_stat 32..40` | Rescorings, jobs scored, version bumps, proposals accepted, stale, refused, value slot reads, proposals used; 40 the graph version. |
+
+`schedpol-gate goal` runs every phase under policy 2 (exit 0). Phases G, H,
+P and K set policy 2 themselves and run in every mode after W.
+
+| Phase | Scenario | Exit when it fails |
+| --- | --- | --- |
+| G | one worker, bypass budget 4, ten jobs admitted while paused: x (value 0), z (unblocks d: 1), a (unblocks b, which unblocks c: 2), f (unblocks g1..g3: 3); decisions made before each finished job publishes. Order f a z b x d c g1 g2 g3: useful work first, x reserved after four bypasses. Run twice: identical decisions | 150, 151 first run, 152 second |
+| H | four graph changes while paused, one rescoring at the first pick; a completion with nothing published, no rescoring; a publication readying two jobs, one rescoring; cancelling a waiting job is one change | 160..166 |
+| P | a stale proposal is refused and counted; one for a free slot is refused; a current one is used over a higher-ranked job; one made stale by a later change is rejected at use and counted; -7 outside policy 2 | 170..178 |
+| K | the key on two slots: value before estimate before age; outside policy 2 age only | 180..183 |
+
+| Change to `sched.om` | Expected exit (derived from the check it trips) |
+| --- | --- |
+| goal off (`if goal` to `if false` in `sp_better`) | 151: x runs first |
+| depth 2 ignored (its count never incremented in `sp_value`) | 151: a and z tie, z older runs second |
+| rescore every pick (version check removed in `sp_rescore`) | 162 |
+| becoming ready does not bump (`sp_bump` removed from `sp_ready`) | 151: b keeps value 0, x runs fourth |
+| waiting admission does not bump | 160 |
+| cancellation does not bump | 165 |
+| proposal version unchecked at `sched_propose` | 170 |
+| proposal version unchecked at use (`sp_proposal`) | 176 |
+| estimate ignored in the key | 181 |
 
 ## Proposals, authority and cancellation (DRA-288)
 

@@ -974,8 +974,21 @@ note lasts until dispatch resumes.
 note Leases: a running job with a lease is reported once by sched_overdue
 note after its lease passes; the authority then cancels or kills it, which
 note releases its resources.
+note
+note Policy 2, goal-aware fair fitting (DRA-397): policy 1 with a different
+note order among the examined jobs that fit: larger unblock value first (the
+note waiting jobs, to depth 2, that the job's declared topics would make
+note ready), then smaller declared estimate, then older admission. The
+note reservation, the hold-back, feasibility and the bypass budget are
+note those of policy 1 and come first, so ranking cannot starve old work.
+note Values are rescored only when the graph version moved (a job became
+note ready, a waiting job was admitted, a job was cancelled, a declaration
+note changed), once per pick however many changes came before it.
+note Completions, releases and lease expiry replan (every step dispatches)
+note without rescoring. A proposal names the graph version it was computed
+note at and is rejected when that version is no longer current.
 const SJCAP ulong 64
-const SPVER ulong 2
+const SPVER ulong 3
 global scmap long 2
 global sclim ulong 2
 global sjst ulong 64
@@ -1011,6 +1024,20 @@ note made, 7 impossible requests refused, 8 head-of-line stops, 9 reserved
 note jobs assigned, 10 tickets issued, 11 tickets lapsed, 12 leases overdue,
 note 13 maintenance slot reads, 14 window scans.
 global scst ulong 16
+note Goal-aware ranking (policy 2): sjpro the topics a job declares its
+note completion publishes, sjest its declared work estimate in ms, sjunc
+note that estimate's uncertainty in ms, sjval its unblock value in jobs as
+note last scored. scgv: 0 graph version, 1 version last scored, 2 proposed
+note job slot + 1 (0 none), 3 version the proposal named.
+global sjpro ulong 64
+global sjest ulong 64
+global sjunc ulong 64
+global sjval ulong 64
+global scgv ulong 4
+note Goal counters (sched_stat 32..39): 0 rescores, 1 jobs scored, 2 graph
+note version bumps, 3 proposals accepted, 4 proposals stale, 5 proposals
+note refused, 6 slots read by value traversal, 7 proposals used.
+global scgst ulong 8
 
 fn sc_cell w ulong off ulong to ulong
 ret mapget get scmap 0 add mul w 128 off 8
@@ -1051,6 +1078,10 @@ put sjst j 0
 put sjheld j 0
 put sjlse j 0
 put sjdue j 0
+put sjpro j 0
+put sjest j 0
+put sjunc j 0
+put sjval j 0
 put scbusy j 0
 put scseq j 0
 end
@@ -1060,6 +1091,12 @@ put suse k 0
 end
 for i ulong 16
 put scst i 0
+end
+for i ulong 8
+put scgst i 0
+end
+for i ulong 4
+put scgv i 0
 end
 put scpol 0 1
 put scpol 1 64
@@ -1137,10 +1174,12 @@ fn sp_ready j ulong to void
 put sjst j 2
 put sjrdy j get scst 1
 put scst 1 add get scst 1 1
+sp_bump
 end
 
 note Creator: counter i of scst, capacity (i 16..19) or use (i 20..23) of a
-note kind, or policy word (i 24..31).
+note kind, policy word (i 24..31), goal counter (i 32..39), graph version
+note (i 40).
 fn sched_stat i ulong to ulong
 if lt i 16
 ret get scst i
@@ -1153,6 +1192,12 @@ ret get suse sub i 20
 end
 if lt i 32
 ret get scpol sub i 24
+end
+if lt i 40
+ret get scgst sub i 32
+end
+if eq i 40
+ret get scgv 0
 end
 ret 0
 end
@@ -1183,12 +1228,13 @@ end
 ret 0
 end
 
-note Creator: policy p (0 FIFO head-of-line, 1 fair fitting), candidate
-note window win slots (1..64), dispatch budget db jobs per event (1..64),
-note bypass budget by (1..65535), ticket lifetime ttl dispatch events
-note (1..1000000). The cursor and any reservation are kept. 0 or -7.
+note Creator: policy p (0 FIFO head-of-line, 1 fair fitting, 2 goal-aware
+note fair fitting), candidate window win slots (1..64), dispatch budget db
+note jobs per event (1..64), bypass budget by (1..65535), ticket lifetime
+note ttl dispatch events (1..1000000). The cursor and any reservation are
+note kept. 0 or -7.
 fn sched_policy p ulong win ulong db ulong by ulong ttl ulong to long
-if gt p 1
+if gt p 2
 ret neg long 7
 end
 if or eq win 0 gt win 64
@@ -1349,10 +1395,15 @@ put sjlse j 0
 put sjdue j 0
 put sjarr j get scst 0
 put scst 0 add get scst 0 1
+put sjpro j 0
+put sjest j 0
+put sjunc j 0
+put sjval j 0
 if eq deps 0
 sp_ready j
 else
 put sjst j 1
+sp_bump
 end
 ret long j
 end
@@ -1513,6 +1564,14 @@ else
 put scpol 5 0
 end
 end
+goal = eq get scpol 0 2
+if goal
+sp_rescore
+pj = sp_proposal rq
+if lt pj 64
+ret pj
+end
+end
 win = get scpol 1
 cur = get scpol 4
 b = ulong 64
@@ -1525,7 +1584,7 @@ if sp_fits get sjneed j rq
 if eq b 64
 b = j
 else
-if lt get sjarr j get sjarr b
+if sp_better goal j b
 b = j
 end
 end
@@ -1534,6 +1593,176 @@ end
 end
 put scpol 4 rem add cur win 64
 ret b
+end
+
+note Ranking key, both of ready jobs a and b: is a better? Policy 1: older
+note admission. Policy 2: larger unblock value, then smaller declared
+note estimate, then older admission (admission orders are unique, so there
+note is never a tie).
+fn sp_better goal bool a ulong b ulong to bool
+if goal
+va = get sjval a
+vb = get sjval b
+if ne va vb
+ret gt va vb
+end
+ea = get sjest a
+eb = get sjest b
+if ne ea eb
+ret lt ea eb
+end
+end
+ret lt get sjarr a get sjarr b
+end
+
+note A committed change that can alter an unblock value: a job becomes
+note ready, a waiting job is admitted, a waiting or ready job is cancelled,
+note or a declaration changes. Bumps the graph version, which makes any
+note proposal stale (rejected when next used). Nothing is rescored here:
+note the next policy-2 pick rescores once, however many bumps came before
+note it (coalesced).
+fn sp_bump to void
+put scgv 0 add get scgv 0 1
+put scgst 2 add get scgst 2 1
+end
+
+note Unblock value of ready job j, in jobs: the waiting jobs whose deps meet
+note the topics j declares it unblocks (depth 1), plus the waiting jobs whose
+note deps meet the topics those declare (depth 2), each counted once. Reads
+note at most 128 slots.
+fn sp_value j ulong to ulong
+pro = get sjpro j
+if eq pro 0
+ret 0
+end
+n = ulong 0
+m = ulong 0
+p2 = ulong 0
+for k ulong 64
+if eq get sjst k 1
+if ne and get sjdep k pro 0
+m = or m shl ulong 1 k
+p2 = or p2 get sjpro k
+n = add n 1
+end
+end
+end
+put scgst 6 add get scgst 6 64
+if eq p2 0
+ret n
+end
+for k ulong 64
+if eq get sjst k 1
+if eq and shr m k 1 0
+if ne and get sjdep k p2 0
+n = add n 1
+end
+end
+end
+end
+put scgst 6 add get scgst 6 64
+ret n
+end
+
+note Recompute the unblock value of every ready job when the graph version
+note moved since the last scoring; otherwise nothing.
+fn sp_rescore to void
+v = get scgv 0
+if eq get scgv 1 v
+ret
+end
+for j ulong 64
+if eq get sjst j 2
+put sjval j sp_value j
+put scgst 1 add get scgst 1 1
+end
+end
+put scgv 1 v
+put scgst 0 add get scgst 0 1
+put scgst 6 add get scgst 6 64
+end
+
+note The proposed job, when the proposal is for the current graph version
+note and the job is still ready and fits beside the reservation (rq); it is
+note used once. Otherwise the proposal is dropped as stale: 64.
+fn sp_proposal rq ulong to ulong
+p = get scgv 2
+if eq p 0
+ret 64
+end
+put scgv 2 0
+put scst 3 add get scst 3 1
+j = sub p 1
+if eq get scgv 3 get scgv 0
+if eq get sjst j 2
+if sp_fits get sjneed j rq
+put scgst 7 add get scgst 7 1
+ret j
+end
+end
+end
+put scgst 4 add get scgst 4 1
+ret 64
+end
+
+note Creator: declare what job j (waiting or ready) is expected to unblock
+note and cost: pro, the topics its completion will publish; est, the work
+note estimate in ms (declared, or derived by the caller from measurements);
+note unc, its uncertainty in ms (recorded, not used to rank). 0, or -3.
+fn sched_goal j ulong pro ulong est ulong unc ulong to long
+if ge j 64
+ret neg long 3
+end
+s = get sjst j
+if or eq s 0 gt s 2
+ret neg long 3
+end
+put sjpro j pro
+put sjest j est
+put sjunc j unc
+sp_bump
+ret 0
+end
+
+note Creator: the graph version that proposals must name.
+fn sched_version to ulong
+ret get scgv 0
+end
+
+note Creator, policy 2: propose ready job j for the next pick, computed at
+note graph version v (an outside planner, or an operator). Reservations and
+note feasibility still come first: it is checked again when used. 0; -9
+note stale (v is not the current version); -3 j not ready; -8 j does not
+note fit beside the reservation; -7 not policy 2.
+fn sched_propose j ulong v ulong to long
+if ne get scpol 0 2
+ret neg long 7
+end
+if ne v get scgv 0
+put scgst 4 add get scgst 4 1
+ret neg long 9
+end
+if ge j 64
+put scgst 5 add get scgst 5 1
+ret neg long 3
+end
+if ne get sjst j 2
+put scgst 5 add get scgst 5 1
+ret neg long 3
+end
+rq = ulong 0
+r = get scpol 5
+if gt r 0
+rq = get sjneed sub r 1
+end
+if not sp_fits get sjneed j rq
+put scgst 5 add get scgst 5 1
+ret neg long 8
+end
+put scgv 2 add j 1
+put scgv 3 v
+put scgst 3 add get scgst 3 1
+ret 0
 end
 
 note After a fair dispatch event in which ya - 1 was the youngest admission
@@ -1580,7 +1809,7 @@ end
 n = mapget c 48 8
 k = ulong 0
 ya = ulong 0
-fair = eq get scpol 0 1
+fair = ge get scpol 0 1
 put scst 2 add get scst 2 1
 for i ulong get scpol 2 bound 64
 w = sp_idle n
@@ -1762,6 +1991,7 @@ end
 s = get sjst j
 if or eq s 1 eq s 2
 put sjst j 0
+sp_bump
 if eq get scpol 5 add j 1
 put scpol 5 0
 end
