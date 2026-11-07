@@ -148,25 +148,33 @@ requires the same exit and stdout from both, then times N alternating runs of ea
 `kemu` (the real SASS emulator `seed/kflow/kemu.om` on `sm121/resadd.c.bin radd 7`, which reports
 `result=MATCH` in both arms), and compile time of kemu's source with and without `bce`.
 
-Receipt (Spark GB10, Cortex-X925 core 8 and core 9 in two runs, `nice -n 10`, N = 200 per arm,
-omc a0b21072; medians in ms, change B vs A; arithmetic by Wolfram):
+Receipt (`receipt-core8.txt`, `receipt-core9.txt`: Spark GB10, Cortex-X925 core 8 and core 9 in two
+runs, `nice -n 10`, N = 200 per arm, omc a0b21072, the committed bench.om, git head 7694ccba; medians
+in ms, change B vs A; arithmetic by Wolfram):
 
 | workload | A om2 (core 8) | B om2 bce (core 8) | change (core 8) | change (core 9) |
 | --- | --- | --- | --- | --- |
-| mb-sum | 24.725 | 21.260 | -14.01% | -14.02% |
-| mb-axpy | 52.833 | 42.314 | -19.91% | -19.91% |
-| mb-ctl (control) | 42.281 | 42.291 | +0.02% | +0.02% |
-| kemu radd | 1.115 | 0.995 | -10.75% | -10.20% |
+| mb-sum | 24.747 | 21.285 | -13.99% | -14.02% |
+| mb-axpy | 52.856 | 42.339 | -19.90% | -19.90% |
+| mb-ctl (control) | 42.328 | 42.334 | +0.01% | +0.03% |
+| kemu radd | 1.142 | 1.030 | -9.80% | -10.13% |
+
+An earlier pair of runs of the same artifacts (bench.om before its exit-code guard was narrowed to
+126 / 127) gave -14.01 / -14.02, -19.91 / -19.91, +0.02 / +0.02 and -10.75 / -10.20%.
 
 Artifact sizes (bytes, A / B): mb-sum 388 / 356, mb-axpy 516 / 436, mb-ctl 420 / 408, kemu
 36768 / 36420. Every workload's one-time initialization loop `for i ulong 4096` / `put a i ...` is
 erased in B, mb-ctl's too; mb-ctl's timed loop (count in a variable) is not, so its B arm runs the
-same timed code as A and the +0.02% is the noise floor of the method.
+same timed code as A and its +0.01 to +0.03% is the noise floor of the method.
 
-Compile time of kemu's source: 1.0926 ms without `bce`, 1.1066 ms with it on core 8 (+1.28%);
-1.1041 / 1.1151 ms on core 9 (+0.99%) (pooled medians of both arms, each run includes process start).
-Verification cost (`receipt-verify.txt`): `bcecheck` on kemu's 24 records 3.13 ms; the Lean check of
-`OmegaBce.lean` with `lean` 1.91 s (median of 5 per arm). The proof is checked once per change of
+Allocations and bytes copied: not measured (NOT_RUN as a metric). The rule removes only
+compare-and-branch instructions and allocates or copies nothing; the arms differ in those
+instructions (the artifact sizes above), not in their arrays.
+
+Compile time of kemu's source: 1.1126 ms without `bce`, 1.1261 ms with it on core 8 (+1.22%);
+1.1087 / 1.1191 ms on core 9 (+0.94%) (pooled medians of both arms, each run includes process start).
+Verification cost (`receipt-verify.txt`): `bcecheck` on kemu's 24 records 3.15 ms; the Lean check of
+`OmegaBce.lean` with plain `lean` 2.06 s (median of 5 per arm). The proof is checked once per change of
 the rule, not per compile; the checker runs once per certified build.
 
 Without the proof: the erasure runs at the same speed with or without the Lean model (the proof costs
@@ -183,6 +191,21 @@ units and admits all 60 records. kemu alone: 24 of 464 sites (5.17%). The other 
 rule does not cover (this receipt does not classify them by reason); the run-time share in a hot
 loop is what the benchmark measures.
 
+## Binding (what the evidence is about, by hash)
+
+| object | sha256 |
+| --- | --- |
+| `seed/out/omc` (the compiler that implements the rule) | `a0b21072586bc8ce19b0ca14642b978a7a5a232f6f686ef72430e1206803049b` |
+| `seed/omc/omc.om` (its source; fixpoint by `seed/omega-from-seed.sh`) | `256caefe0c4d55badac8ac2f22ef4e8bd8bc867f635267662902765b4c1db339` |
+| `lean/OmegaBce.lean` (model, transformation, theorems) | `c4672908114e1e65aa4d8f49b8ac96cdd77559407001ea306f86a71c2d3e5d7c` |
+| `bcecheck.om` (certificate checker) | `fa44170342af1275e548159a15a17573cb94d99fa5d5a2e48e3b52bcff495c98` |
+
+Lean toolchain `leanprover/lean4:v4.35.0`. The file has no imports (core Lean only, no Mathlib); it
+checks with plain `lean FILE`. The benchmark receipts carry their own omc, kemu.om, bench.om and git head hashes
+(`meta.txt` lines). The proof is development-time only: nothing of Lean runs in omc or in a compiled
+program, and a unit whose premises are not met keeps its checks (the rule falls back, it never
+refuses).
+
 ## Reproduce
 
 ```sh
@@ -190,7 +213,7 @@ sh seed/omega-from-seed.sh                       # omc fixpoint a0b21072
 sh seed/host/check.sh                            # includes the bce gate and mutants
 flock -o POOL taskset -c CORE nice -n 10 sh seed/omc/om2/bce/bench/run.sh OUT 200
 sh seed/omc/om2/bce/bench/profile.sh seed/out/omc OUT2
-sh seed/omc/om2/bce/lean/negctl.sh LEAN_PROJECT OUT3   # a Lean 4 + Mathlib project (lake)
+sh seed/omc/om2/bce/lean/negctl.sh LEAN_PROJECT OUT3   # a lake project on Lean v4.35.0
 ```
 
 Agent: t_6ff77933 (Hermes worker, claude-opus-5-5, anthropic)

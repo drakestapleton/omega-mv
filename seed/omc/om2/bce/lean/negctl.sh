@@ -2,7 +2,7 @@ set -u
 # Lean negative controls for rule forbnd (DRA-189): mutate the rule in the model and require the
 # unchanged proof to FAIL to check; then check the original (0 errors).
 #   sh seed/omc/om2/bce/lean/negctl.sh LEAN_PROJECT OUT
-# LEAN_PROJECT: a lake project with Lean 4 and Mathlib (the model imports Mathlib); OUT: a new directory.
+# LEAN_PROJECT: any lake project on Lean v4.35.0 (the model has no imports); OUT: a new directory.
 S=$(cd "$(dirname "$0")" && pwd)/OmegaBce.lean
 P=$1; O=$2
 [ -e "$O" ] && { echo "OUT exists: $O" >&2; exit 91; }
