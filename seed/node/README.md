@@ -1142,15 +1142,85 @@ Each run prints `bench S P R` followed by these fields:
 - **reservations:** those made, and those that were contested;
 - **verified jobs:** jobs reviewed with the expected outcome;
 - **VmHWM:** the creator's peak resident memory;
-- **waits:** ready to started, per job, in microseconds.
+- **waits:** ready to started, in microseconds. There is one value for each start whose job was sampled ready at least once, so a job that a rework returns to ready contributes again.
 
-A wait is measured at the sample after the step that dispatched the job, so its resolution is one creator step (at most 1 ms of polling plus the sampling). Every run checks:
+A wait is measured at the sample after the step that dispatched the job, so its resolution is one creator step (at most 1 ms of polling plus the sampling). A job that becomes ready and starts within a single creator step or publication is never sampled ready and gets no value: its wait is below that resolution. The number of such starts is the jobs plus the reworks minus the waits printed. The statistics count each of them as a wait of 0.
+
+Every run checks:
 - the capacity invariant (exit 70);
 - that a new reservation goes to the oldest ready job at the bypass budget (71);
 - that every job is reviewed once with its expected outcome within 20 s (72);
 - setup (73..77).
 
 Statistics are computed with Wolfram from the raw lines; the queries are quoted with the results.
+
+#### Results, 2026-11-07 (MEASURED on a synthetic workload; not speed evidence)
+
+There are two runs of the same binary: bench-gate sha256 `8bd6c1a7…`, built at bd57beaa with omc 5f90edea. Both ran under `flock pool-8-9.lock taskset -c 8-9 nice -n 10`; core 9 is the X925 timing core.
+- **Receipt `evidence/node-schedpol/receipt.323ef72e….json`** (`schedrcpt.om`, cases-399): bench-gate PASS, and mutants 70/71/72 killed. The receipt keeps only the last 4000 bytes of stdout (repetition 4), so it is not the source of the statistics.
+- **Rerun for the statistics**, 11:52:14Z to 11:57:19Z, exit 0, 120 lines, `PASS node bench`. The raw output is filed as `bench.8f28e6a5….txt` with `bench.8f28e6a5….meta.json` (commit, binary, command, times, load), in `~/handoffs/hive/sched/bench399/` next to `stats.wl`, `stats.tsv` and `relative.tsv`.
+
+The load average was 11 to 13. `live-cpu` (core 0) sampled from 11:54:00Z to 11:57:20Z: 2 of 21 samples had a foreign running thread on 8/9, none of them the bench's. The first 106 s were not sampled.
+
+Medians over 5 repetitions, with makespan in ms, idle eligible capacity in worker-ms and dispatch time in ns per call. Waits (ms) pool every start of the 5 repetitions.
+
+Two wait columns are given, because the zero rule was defined after the output had been seen:
+- **wait (0 rule):** unsampled starts (the "unsampled" column) count as 0;
+- **sampled:** recorded waits only.
+
+They differ only where there are unsampled starts. p95 is Wolfram's default `Quantile[w, 95/100]` (inverse empirical CDF).
+
+| S | Arm | Makespan (min..max) | Idle | ns/dispatch | Rework | Reservations (contested) | Starts / unsampled | Wait median, p95, max (0 rule) | Sampled median, p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | FIFO | 1506.9 (1504.1..1507.6) | 601.3 | 305.7 | 0 | 0 | 40 / 0 | 1002.8, 1305.8, 1306.9 | same |
+| 1 | fair | 1305.7 (1303.5..1329.3) | 200.4 | 319.1 | 0 | 4 (0) | 40 / 0 | 501.4, 1104.8, 1105.0 | same |
+| 1 | goal | 1504.3 (1305.4..1508.1) | 0.04 | 341.2 | 0 | 7 (2) | 40 / 0 | 401.5, 1006.4, 1307.0 | same |
+| 1 | ORACLE | 1506.4 (1505.0..1507.7) | 0.03 | 364.2 | 0 | 8 (4) | 40 / 0 | 301.7, 1205.3, 1307.1 | same |
+| 2 | FIFO | 2108.1 (2106.9..2155.1) | 0.02 | 240.3 | 0 | 0 | 70 / 25 | 150.5, 1203.7, 1238.4 | 602.3, 1204.0 |
+| 2 | fair | 2109.4 (2107.5..2110.6) | 0.02 | 296.0 | 0 | 0 | 70 / 25 | 150.4, 1204.8, 1206.3 | 602.3, 1205.3 |
+| 2 | goal | 1807.7 (1805.4..1811.7) | 0.03 | 315.7 | 0 | 24 (14) | 70 / 10 | 376.1, 1205.7, 1206.7 | 451.8, 1205.7 |
+| 2 | ORACLE | 1807.2 (1806.1..1807.7) | 0.02 | 295.9 | 0 | 12 (8) | 70 / 5 | 300.3, 1205.6, 1206.7 | 301.4, 1205.6 |
+| 3 | FIFO | 1606.7 (1606.4..1610.9) | 0.02 | 222.8 | 0 | 0 | 65 / 10 | 300.7, 902.8, 903.5 | 301.7, 903.1 |
+| 3 | fair | 1606.7 (1606.0..1609.7) | 0.02 | 288.2 | 0 | 0 | 65 / 10 | 301.1, 902.8, 904.2 | 301.6, 903.5 |
+| 3 | goal | 1606.1 (1605.3..1606.6) | 0.02 | 337.8 | 0 | 25 (10) | 65 / 0 | 602.4, 1304.5, 1304.9 | same |
+| 3 | ORACLE | 1605.5 (1604.0..1610.3) | 0.02 | 332.0 | 0 | 20 (15) | 65 / 0 | 602.1, 1303.8, 1306.9 | same |
+| 4 | FIFO | 4016.6 (4013.9..4017.5) | 1807.2 | 281.5 | 0 | 0 | 120 / 0 | 1431.0, 2764.3, 3065.4 | same |
+| 4 | fair | 3514.9 (3414.1..3517.2) | 202.1 | 319.2 | 0 | 5 (0) | 120 / 0 | 981.0, 2461.3, 2564.9 | same |
+| 4 | goal | 3613.5 (3612.3..3715.2) | 594.9 | 347.7 | 0 | 42 (13) | 120 / 0 | 856.4, 2560.6, 2710.9 | same |
+| 4 | ORACLE | 3616.5 (3614.9..3622.1) | 110.3 | 329.1 | 0 | 45 (22) | 120 / 0 | 752.4, 2413.1, 2669.8 | same |
+| 5 | FIFO | 3012.6 (3011.7..3014.0) | 0.02 | 263.5 | 0 | 0 | 150 / 0 | 601.4, 602.7, 603.8 | same |
+| 5 | fair | 3012.7 (3011.5..3013.8) | 0.04 | 304.3 | 0 | 0 | 150 / 0 | 601.3, 602.6, 602.9 | same |
+| 5 | goal | 3013.3 (3011.4..3014.0) | 0.03 | 328.8 | 0 | 50 (5) | 150 / 0 | 399.7, 1103.0, 1109.0 | same |
+| 5 | ORACLE | 3013.7 (3011.5..3020.8) | 0.04 | 316.5 | 0 | 40 (0) | 150 / 0 | 502.2, 1003.6, 1004.4 | same |
+| 6 | FIFO | 3465.1 (3463.3..3466.2) | 301.1 | 222.2 | 5 | 0 | 65 / 0 | 1305.7, 2861.3, 2863.5 | same |
+| 6 | fair | 3466.2 (3463.4..3467.1) | 0.02 | 247.8 | 5 | 0 | 65 / 0 | 1205.3, 3213.0, 3216.0 | same |
+| 6 | goal | 3618.3 (3367.0..3664.3) | 0.02 | 283.2 | 5 | 19 (9) | 65 / 0 | 1255.4, 3159.8, 3213.8 | same |
+| 6 | ORACLE | 3464.6 (3464.2..3479.5) | 0.02 | 243.8 | 5 | 16 (6) | 65 / 0 | 1004.4, 3013.6, 3027.5 | same |
+
+In every run all jobs were reviewed with the expected outcome, and the creator's VmHWM was at most 416 KB. Scenario 6's one rework per run is the job running on the killed worker.
+
+Median makespan relative to FIFO (`Round[100 (m[[s, p]]/m[[s, 1]] - 1), 0.1]`):
+
+| Scenario | Fair | Goal-aware | ORACLE |
+| --- | --- | --- | --- |
+| 1 blocked head | −13.4 % | −0.2 % | 0 % |
+| 2 long chain | +0.1 % | −14.2 % | −14.3 % |
+| 3 fan-out | 0 % | 0 % | −0.1 % |
+| 4 sustained arrivals | −12.5 % | −10.0 % | −10.0 % |
+| 5 queue pressure | 0 % | 0 % | 0 % |
+| 6 worker failure | 0 % | +4.4 % | 0 % |
+
+What these traces show, within their limits (sleep workers, 2 workers, 5 repetitions, one host):
+- **Fair fitting (policy 1, the default).** It removes most of FIFO's idle eligible capacity in the blocked-head and sustained-arrival scenarios (601 to 200 and 1807 to 202 worker-ms) and shortens them by 13.4 % and 12.5 %. Their median waits fall from 1003 to 501 ms and from 1431 to 981 ms. It never lengthens a makespan by more than 0.1 %.
+- **Goal-aware (policy 2).**
+  - It is the only policy that shortens the long chain (−14.2 %), matching the ORACLE arm.
+  - In fan-out its median wait rises from 301 to 602 ms at an unchanged makespan.
+  - Under queue pressure its median wait falls from 601 to 400 ms but its p95 rises from 603 to 1103 ms.
+  - In worker failure its median makespan is 4.4 % longer, with a 3367..3664 ms spread across repetitions.
+  - In the blocked head its 5 makespans spread from 1305 to 1508 ms.
+- **Dispatch cost.** It is 222 to 364 ns per call in every arm; policy 2 costs more per call than FIFO in every scenario.
+
+The live workflow ran policy 1 only, so no live comparison exists between the arms.
 
 ## Local inference and the coding workflow (DRA-290)
 
