@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| Codex (OpenAI, ChatGPT Work Mode) | Implemented `seed/node` bounded shared-memory artifact transport in seeded Omega: immutable publication, topic cursors, per-worker eventfd hints, stop priority, and forked-process acceptance with negative controls. Native AArch64 qualification remains pending. |
 | Grok 4.7 (via Cursor Agent) | Merged main `fd3751b31` (#1020, carrying #1045 and #1050) into #1052. The only conflict was the generated root `.crumb` (child `last_commit` stamps, the `tests` digest, and the root digest). Recompiled with the crumb.lock tool (`d0f0b95d`); `crumb verify .` current. The #525/#962 pins were left as committed: `src/checker2/c2_check.c`, `src/compiler/osc_ir.c` and `src/compiler/osc_ir.h` still hash to the SHA-256s in `ACCEPTED`. |
 | Claude Opus 5.5 (via omp) | #1020 (actions/cache-4.3.0 ->6.1.0): merged main `d3d1b1bc` and recompiled the root crumb with the crumb.lock tool (`d0f0b95d`). The root crumb's source tree covers `.github/workflows/`, so the bump alone left it stale and `AIEN Checks` failed at `crumb verify .` (`1 of 188 crumbs stale`). |
 | Claude Opus 5.5 (via omp) | #1018 (actions/upload-artifact-4 ->7): merged main `d3d1b1bc` and recompiled the root crumb with the crumb.lock tool (`d0f0b95d`). The root crumb's source tree covers `.github/workflows/`, so the bump alone left it stale and `AIEN Checks` failed at `crumb verify .` (`1 of 188 crumbs stale`). |

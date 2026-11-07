@@ -1,0 +1,225 @@
+note Omega Node transport, concatenate with a program-mode consumer.
+note Trusted forked processes only. This is transport, not write authority.
+note One publisher PID, 64 immutable records per arena lifetime, no slot reuse.
+note Layout: 4096 byte header then 64 slots of 4160 bytes.
+note Header u64: magic, ABI, published count, stop, publisher PID.
+note Slot u64: version, length, topic mask; payload begins at offset 64.
+const NCAP ulong 64
+const NBYTES ulong 270336
+const NMAGIC ulong 1313817669
+
+fn node_new to long
+h = mapnew neg int 1 0 NBYTES 3 33
+if le h 0
+ret h
+end
+r = mapset h 8 8 1
+r = mapset h 32 8 ulong getpid
+r = mapset h 0 8 NMAGIC
+ret h
+end
+
+fn node_valid h long to bool
+ret and eq mapget h 0 8 NMAGIC eq mapget h 8 8 1
+end
+
+fn node_offset v ulong to ulong
+ret add 4096 mul sub v 1 4160
+end
+
+note Return version, or -1 stopped, -2 full, -3 length, -4 topic,
+note -5 invalid header, -6 wrong publisher. Refusals do not publish.
+fn node_publish h long topics ulong src view uchar 4096 n ulong to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+if ne mapget h 24 8 0
+ret neg long 1
+end
+if gt n 4096
+ret neg long 3
+end
+if eq topics 0
+ret neg long 4
+end
+v = mapget h 16 8
+if gt v NCAP
+ret neg long 5
+end
+if eq v NCAP
+ret neg long 2
+end
+v = add v 1
+off = node_offset v
+r = mapwrite h add off 64 src 0 n
+r = mapset h add off 8 8 n
+r = mapset h add off 16 8 topics
+note mapset has barriers before and after its aligned store.
+r = mapset h off 8 v
+r = mapset h 16 8 v
+ret long v
+end
+
+note Header and record checks precede copying. No partial publication is read.
+note Returns payload length, -5 invalid header/record, -7 unavailable version.
+fn node_read h long v ulong dst edit uchar 4096 to long
+if not node_valid h
+ret neg long 5
+end
+if or eq v 0 gt v NCAP
+ret neg long 7
+end
+latest = mapget h 16 8
+if gt latest NCAP
+ret neg long 5
+end
+if gt v latest
+ret neg long 7
+end
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+n = mapget h add off 8 8
+if gt n 4096
+ret neg long 5
+end
+ret mapread h add off 64 dst 0 n
+end
+
+note Return the next matching version after cursor, zero if caught up,
+note or negative refusal. Caller advances its cursor through returned versions.
+fn node_next h long cursor ulong topics ulong to long
+if not node_valid h
+ret neg long 5
+end
+if or gt cursor NCAP eq topics 0
+ret neg long 7
+end
+latest = mapget h 16 8
+if or gt latest NCAP gt cursor latest
+ret neg long 5
+end
+v = cursor
+note At most NCAP published slots can be examined.
+while lt v latest bound 64
+v = add v 1
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+if ne and mapget h add off 16 8 topics 0
+ret long v
+end
+end
+ret 0
+end
+
+fn node_stop h long to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+ret mapset h 24 8 1
+end
+
+note One nonblocking eventfd per consumer. Saturation means already readable.
+note Interrupted operations retry at most 64 times, then return EINTR.
+fn node_notify fd int to long
+buf = new uchar 8 0
+put buf 0 1
+for i ulong 64
+r = write fd buf 0 8
+if eq r 8
+ret 0
+end
+if eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_drain fd int to long
+buf = new uchar 8 0
+for i ulong 64
+r = read fd buf 0 8
+if or eq r 8 eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_pollfd p edit uchar 16 off ulong fd int to void
+for i ulong 4
+put p add off i uchar and shr uint fd uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Returns 2 stop, 1 wake, 0 timeout or negative errno.
+note Control takes priority when both descriptors are ready.
+note EINTR returns to caller so it can recompute its monotonic deadline.
+fn node_wait h long wake int stop int interval long to long
+p = new uchar 16 0
+if not node_valid h
+ret neg long 5
+end
+if or lt wake 0 lt stop 0
+ret neg long 9
+end
+if eq wake stop
+ret neg long 22
+end
+if ne mapget h 24 8 0
+ret 2
+end
+node_pollfd p 0 wake
+node_pollfd p 8 stop
+r = pollfds p 0 16 interval
+if lt r 0
+ret r
+end
+if ne mapget h 24 8 0
+ret 2
+end
+if ne and get p 14 56 0
+ret neg long 5
+end
+if ne and get p 14 1 0
+r = node_drain stop
+if lt r 0
+ret r
+end
+ret 2
+end
+if ne and get p 6 56 0
+ret neg long 5
+end
+if ne and get p 6 1 0
+r = node_drain wake
+if lt r 0
+ret r
+end
+ret 1
+end
+ret 0
+end

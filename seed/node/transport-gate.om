@@ -1,0 +1,509 @@
+note Omega Node transport, concatenate with a program-mode consumer.
+note Trusted forked processes only. This is transport, not write authority.
+note One publisher PID, 64 immutable records per arena lifetime, no slot reuse.
+note Layout: 4096 byte header then 64 slots of 4160 bytes.
+note Header u64: magic, ABI, published count, stop, publisher PID.
+note Slot u64: version, length, topic mask; payload begins at offset 64.
+const NCAP ulong 64
+const NBYTES ulong 270336
+const NMAGIC ulong 1313817669
+
+fn node_new to long
+h = mapnew neg int 1 0 NBYTES 3 33
+if le h 0
+ret h
+end
+r = mapset h 8 8 1
+r = mapset h 32 8 ulong getpid
+r = mapset h 0 8 NMAGIC
+ret h
+end
+
+fn node_valid h long to bool
+ret and eq mapget h 0 8 NMAGIC eq mapget h 8 8 1
+end
+
+fn node_offset v ulong to ulong
+ret add 4096 mul sub v 1 4160
+end
+
+note Return version, or -1 stopped, -2 full, -3 length, -4 topic,
+note -5 invalid header, -6 wrong publisher. Refusals do not publish.
+fn node_publish h long topics ulong src view uchar 4096 n ulong to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+if ne mapget h 24 8 0
+ret neg long 1
+end
+if gt n 4096
+ret neg long 3
+end
+if eq topics 0
+ret neg long 4
+end
+v = mapget h 16 8
+if gt v NCAP
+ret neg long 5
+end
+if eq v NCAP
+ret neg long 2
+end
+v = add v 1
+off = node_offset v
+r = mapwrite h add off 64 src 0 n
+r = mapset h add off 8 8 n
+r = mapset h add off 16 8 topics
+note mapset has barriers before and after its aligned store.
+r = mapset h off 8 v
+r = mapset h 16 8 v
+ret long v
+end
+
+note Header and record checks precede copying. No partial publication is read.
+note Returns payload length, -5 invalid header/record, -7 unavailable version.
+fn node_read h long v ulong dst edit uchar 4096 to long
+if not node_valid h
+ret neg long 5
+end
+if or eq v 0 gt v NCAP
+ret neg long 7
+end
+latest = mapget h 16 8
+if gt latest NCAP
+ret neg long 5
+end
+if gt v latest
+ret neg long 7
+end
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+n = mapget h add off 8 8
+if gt n 4096
+ret neg long 5
+end
+ret mapread h add off 64 dst 0 n
+end
+
+note Return the next matching version after cursor, zero if caught up,
+note or negative refusal. Caller advances its cursor through returned versions.
+fn node_next h long cursor ulong topics ulong to long
+if not node_valid h
+ret neg long 5
+end
+if or gt cursor NCAP eq topics 0
+ret neg long 7
+end
+latest = mapget h 16 8
+if or gt latest NCAP gt cursor latest
+ret neg long 5
+end
+v = cursor
+note At most NCAP published slots can be examined.
+while lt v latest bound 64
+v = add v 1
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+if ne and mapget h add off 16 8 topics 0
+ret long v
+end
+end
+ret 0
+end
+
+fn node_stop h long to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+ret mapset h 24 8 1
+end
+
+note One nonblocking eventfd per consumer. Saturation means already readable.
+note Interrupted operations retry at most 64 times, then return EINTR.
+fn node_notify fd int to long
+buf = new uchar 8 0
+put buf 0 1
+for i ulong 64
+r = write fd buf 0 8
+if eq r 8
+ret 0
+end
+if eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_drain fd int to long
+buf = new uchar 8 0
+for i ulong 64
+r = read fd buf 0 8
+if or eq r 8 eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_pollfd p edit uchar 16 off ulong fd int to void
+for i ulong 4
+put p add off i uchar and shr uint fd uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Returns 2 stop, 1 wake, 0 timeout or negative errno.
+note Control takes priority when both descriptors are ready.
+note EINTR returns to caller so it can recompute its monotonic deadline.
+fn node_wait h long wake int stop int interval long to long
+p = new uchar 16 0
+if not node_valid h
+ret neg long 5
+end
+if or lt wake 0 lt stop 0
+ret neg long 9
+end
+if eq wake stop
+ret neg long 22
+end
+if ne mapget h 24 8 0
+ret 2
+end
+node_pollfd p 0 wake
+node_pollfd p 8 stop
+r = pollfds p 0 16 interval
+if lt r 0
+ret r
+end
+if ne mapget h 24 8 0
+ret 2
+end
+if ne and get p 14 56 0
+ret neg long 5
+end
+if ne and get p 14 1 0
+r = node_drain stop
+if lt r 0
+ret r
+end
+ret 2
+end
+if ne and get p 6 56 0
+ret neg long 5
+end
+if ne and get p 6 1 0
+r = node_drain wake
+if lt r 0
+ret r
+end
+ret 1
+end
+ret 0
+end
+note Concatenate after transport.om. CPU-only process and transport acceptance.
+text nok "PASS node transport\n"
+global nh long 1
+global nf int 6
+global np long 2
+global ns uchar 4
+
+fn node_check ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn node_refusals to void
+src = new uchar 4096 42
+dst = new uchar 4096 99
+h = node_new
+node_check gt h 0 10
+node_check eq node_next h 0 1 0 11
+node_check eq node_next h 1 1 neg long 5 12
+node_check eq node_read h 1 dst neg long 7 13
+node_check eq get dst 0 99 14
+node_check eq node_publish h 1 src 4097 neg long 3 15
+node_check eq node_publish h 0 src 1 neg long 4 16
+node_check eq mapget h 16 8 0 17
+node_check eq node_publish h 1 src 0 1 18
+node_check eq node_read h 1 dst 0 19
+node_check eq get dst 0 99 20
+node_check eq node_next h 0 2 0 21
+node_check eq node_next h 0 1 1 22
+node_check eq node_read h 0 dst neg long 7 23
+node_check eq node_read h 65 dst neg long 7 24
+node_check eq node_next h 65 1 neg long 7 25
+node_check eq node_next h 0 0 neg long 7 26
+node_check eq node_stop h 0 27
+node_check eq node_publish h 1 src 1 neg long 1 28
+node_check eq mapget h 16 8 1 29
+node_check eq mapdrop h 0 30
+end
+
+fn node_faults to void
+src = new uchar 4096 42
+dst = new uchar 4096 99
+h = node_new
+node_check gt h 0 31
+node_check eq node_publish h 1 src 1 1 32
+r = mapset h 4096 8 9
+node_check eq node_read h 1 dst neg long 5 33
+node_check eq node_next h 0 1 neg long 5 34
+node_check eq get dst 0 99 35
+r = mapset h 4096 8 1
+r = mapset h 4104 8 4097
+node_check eq node_read h 1 dst neg long 5 36
+r = mapset h 16 8 65
+node_check eq node_read h 1 dst neg long 5 37
+node_check eq node_next h 0 1 neg long 5 38
+r = mapset h 0 8 0
+node_check eq node_read h 1 dst neg long 5 39
+node_check eq node_publish h 1 src 1 neg long 5 40
+node_check eq node_stop h neg long 5 41
+node_check eq mapdrop h 0 42
+end
+
+fn node_wait_checks to void
+h = node_new
+node_check gt h 0 43
+w = eventfd uint 0
+s = eventfd uint 0
+node_check ge w 0 44
+node_check ge s 0 45
+node_check eq node_wait h int w int s 0 0 46
+node_check eq node_wait h int w int w 0 neg long 22 47
+node_check eq node_wait h neg int 1 int s 0 neg long 9 48
+node_check eq node_notify int w 0 49
+node_check eq node_notify int w 0 50
+node_check eq node_wait h int w int s 0 1 51
+node_check eq node_wait h int w int s 0 0 52
+node_check eq node_notify int s 0 53
+node_check eq node_notify int w 0 54
+node_check eq node_wait h int w int s 0 2 55
+node_check eq node_stop h 0 56
+node_check eq node_wait h int w int s 0 2 57
+node_check eq fclose int w 0 58
+node_check eq fclose int s 0 59
+node_check eq node_notify int w neg long 9 60
+node_check eq mapdrop h 0 61
+end
+
+fn node_worker idx ulong to int
+buf = new uchar 4096 0
+h = get nh 0
+if ne node_publish h 1 buf 1 neg long 6
+ret 70
+end
+if ne node_stop h neg long 6
+ret 71
+end
+cursor = ulong 0
+count = ulong 0
+topic = add idx 1
+r = node_wait h get nf idx get nf add idx 2 5000000000
+if ne r 1
+ret 72
+end
+note A single wake must let each worker discover every matching version.
+for k ulong 64
+v = node_next h cursor topic
+if eq v 0
+break
+end
+if lt v 0
+ret 73
+end
+cursor = ulong v
+if ne node_read h cursor buf 4096
+ret 74
+end
+for j ulong 4096
+if ne get buf j uchar cursor
+ret 75
+end
+end
+count = add count 1
+end
+if ne count 32
+ret 76
+end
+if ne node_notify get nf add idx 4 0
+ret 77
+end
+note Parent signals stop only after both independent acknowledgements.
+while true bound 64
+r = node_wait h get nf idx get nf add idx 2 5000000000
+if eq r 2
+ret 0
+end
+if ne r 1
+ret 78
+end
+end
+ret 79
+end
+
+fn node_publish_batch to bool
+buf = new uchar 4096 0
+h = get nh 0
+for k ulong 64
+v = add k 1
+for j ulong 4096
+put buf j uchar v
+end
+if ne node_publish h add rem v 2 1 buf 4096 long v
+ret false
+end
+end
+if ne node_publish h 1 buf 1 neg long 2
+ret false
+end
+if ne mapget h 16 8 64
+ret false
+end
+note The first version still has its original bytes after arena exhaustion.
+if ne node_read h 1 buf 4096
+ret false
+end
+for j ulong 4096
+if ne get buf j 1
+ret false
+end
+end
+ret true
+end
+
+fn node_processes to int
+put nh 0 node_new
+if le get nh 0 0
+ret 80
+end
+for i ulong 6
+put nf i neg int 1
+end
+result = int 0
+for i ulong 6
+fd = eventfd uint 0
+if lt fd 0
+result = 81
+break
+end
+put nf i int fd
+end
+if eq result 0
+for i ulong 2
+pid = fork
+if eq pid 0
+exit node_worker i
+end
+if lt pid 0
+result = 82
+break
+end
+put np i pid
+end
+end
+if eq result 0
+if not node_publish_batch
+result = 83
+end
+end
+if eq result 0
+for i ulong 2
+if ne node_notify get nf i 0
+result = 84
+end
+end
+end
+if eq result 0
+for i ulong 2
+r = waitio get nf add i 4 1 5000000000
+if ne r 1
+result = 85
+end
+end
+end
+if eq node_stop get nh 0 0
+for i ulong 2
+if ge get nf add i 2 0
+r = node_notify get nf add i 2
+end
+end
+else
+result = 86
+end
+for i ulong 2
+if gt get np i 0
+note Bounded nonblocking reap, then SIGKILL the exact child if still live.
+done = false
+for j ulong 100
+r = waitpid int get np i ns 0 4 1
+if eq r get np i
+done = true
+if or ne get ns 0 0 ne get ns 1 0
+result = 87
+end
+break
+end
+if ne r 0
+result = 88
+break
+end
+r = sleepns 10000000
+end
+if not done
+r = killpid int get np i 9
+r = waitpid int get np i ns 0 4 0
+result = 89
+end
+end
+end
+for i ulong 6
+if ge get nf i 0
+if ne fclose get nf i 0
+result = 90
+end
+end
+end
+if ne mapdrop get nh 0 0
+result = 91
+end
+ret result
+end
+
+fn main to int
+node_refusals
+node_faults
+node_wait_checks
+r = node_processes
+if ne r 0
+ret r
+end
+if ne write 1 nok 0 len nok long len nok
+ret 92
+end
+ret 0
+end
