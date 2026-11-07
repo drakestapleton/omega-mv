@@ -588,12 +588,13 @@ RELEASE per job, sink lines, keys):
 
 Status: IMPLEMENTED in `infer.om`, `tool.om`, `gram.om` and `code.om`,
 exercised on native Linux AArch64 by `code-test.om`, the round40 replay
-`tests/tool-replay.py`, the tool controls and live runs of the own Omega
-model (round40 checkpoint served by aien-train `ollm serve`, DRA-119, inside a
-private network namespace). Evidence is in the DRA-290 pull request. Not
-QUALIFIED on the Spark and not DEPLOYED.
+`tests/tool-replay.om` (seeded Omega; it replaced `tests/tool-replay.py` with
+the same check lines, summary and exit status), the tool controls and live runs
+of the own Omega model (round40 checkpoint served by aien-train `ollm serve`,
+DRA-119, inside a private network namespace). Evidence is in the DRA-290 pull
+request. Not QUALIFIED on the Spark and not DEPLOYED.
 
-All four are OM-2 programs (`printf 'om2\n'` before the sources):
+All six are OM-2 programs (`printf 'om2\n'` before the sources):
 
 ```sh
 L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/journal.om seed/node/auth.om"
@@ -601,16 +602,57 @@ L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.o
 { printf 'om2\n'; cat seed/agent/path.om seed/node/gram.om seed/node/tool.om; } | seed/out/omc > build/node/tool
 { printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-main.om; } | seed/out/omc > build/node/code-main
 { printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-test.om; } | seed/out/omc > build/node/code-test
-chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/tool-replay.om; } | seed/out/omc > build/node/tool-replay
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/drv-test.om; } | seed/out/omc > build/node/drv-test
+chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test build/node/tool-replay build/node/drv-test
 build/node/code-test unit build/node/cu   # "code checks=54 fail=0", exit 0
-python3 seed/node/tests/tool-replay.py build/node/tool OMC40 ROUND40 build/node/replay   # pass=108 fail=0
+build/node/drv-test /tmp/dvt   # "DRV-TEST pass=36 fail=0 not_run=0", exit 0
+build/node/tool-replay build/node/tool OMC40 ROUND40 build/node/replay   # "TOOL-REPLAY runs=108 pass=108 fail=0 actions=417", exit 0
 ```
 
 A failed compile leaves an empty output file that exits 0 when run; check
 omc's exit status. `OMC40` is the compiler the round40 model was trained and
-evaluated with (sha256 `2c82480596bb…`, omega-mv `e5b32567`): its error text is
-part of the prompt, so the check tool must use it. `ROUND40` is the round40
-run directory holding `repair.py` and `final-selected.json`.
+evaluated with (sha256 `2c82480596bb…`, omega-mv `e5b32567`; on the Spark
+`~/work/omega-node-e5b3/seed/out/omc`): its error text is part of the prompt,
+so the check tool must use it. `ROUND40` is the round40 run directory holding
+`repair.py` and `final-selected.json`.
+
+### Test drivers
+
+The drivers are seeded Omega built by this checkout's `seed/out/omc`; no
+system program is executed. `tool-replay` runs only TOOL (with OMC as its
+argument), with stderr to `/dev/null`; `drv-test` runs only its own binary as
+the child.
+
+`tool-replay TOOL OMC ROUND40 OUTDIR` replays every recorded round40 run
+through TOOL in `OUTDIR/<job.id>` and checks that each rebuilt `repair.py`
+prompt equals the next recorded prompt byte for byte. It prints a `MISMATCH`
+line (with `want` and `got` in Python repr) or an `ERROR` line per failing step,
+then `TOOL-REPLAY runs=R pass=P fail=F actions=A`. It exits 0 when no run
+failed, 1 otherwise, and 2 for bad usage or an unreadable fixture. Unlike the
+Python driver, it fails a run instead of crashing on a malformed fixture field,
+a tool timeout or a malformed `OMNT1` record, and it refuses a job id that is
+empty, `.`, `..` or holds `/`. The file header lists its buffer limits.
+
+`tests/drv.om` is the driver library both share (prefix `dv`, composed after
+`seed/json/json.om`):
+
+| Group | Functions |
+| --- | --- |
+| results | `dv_pass`, `dv_fail`, `dv_nrun NAME DETAIL` print `PASS\|FAIL\|NOT_RUN NAME[ DETAIL]` and count; `dv_count KIND` |
+| output, formatting | `dv_out`, `dv_err`; `dv_cat`, `dv_byte`, `dv_fmtu`, `dv_fmtl` append at an offset and return the new end |
+| bytes | `dv_eq`, `dv_at`, `dv_find`, `dv_atou` (`dvnone` = not a number) |
+| arguments | `dv_argc`, `dv_arg I BUF` (length, -22 no such argument, -105 buffer too short) |
+| files | `dv_slurp` (-27 does not fit), `dv_spit`, `dv_apnd`, `dv_isdir`, `dv_mkdirp`, `dv_rmrf` (no symbolic link followed), `dv_join` and `dv_dirn` (`os.path.join`, `os.path.dirname`) |
+| processes | `dv_pkinit`, `dv_pkadd` build a packed argv; `dv_spawn PK OUT ERR` runs it in its own process group (exit 126 files, 127 exec); `dv_poll`, `dv_reap`, `dv_wait PID DEADLINE` (-110 after killing the group), `dv_kill`, `dv_killg`; status is the exit code or 256 + signal |
+| ports | `dv_port`: a free 127.0.0.1 port, never 18091 or 18300 |
+| JSON | `dv_jload` (file to tape), `dv_jkey` (the last duplicate wins), `dv_jidx`, `dv_jlen`, `dv_jisl`, `dv_jnum`, `dv_jstr` (UTF-8, surrogate pairs joined), `dv_jsteq` |
+
+`drv-test SCRATCHDIR` checks these functions in `SCRATCHDIR/drv-test.d`
+(removed before and after) and prints `DRV-TEST pass=P fail=F not_run=N`; it
+exits 1 on any failure, 2 for bad usage. A `drv.om` whose `dv_dirn` keeps a
+repeated separator and whose status drops the 256 for a signal gives `FAIL
+drv.dirn`, `FAIL drv.kill-reap` and exit 1.
 
 ### Programs
 
