@@ -45,12 +45,14 @@ read error is `ng: refused class 27` (omc: error 1).
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
     gate-front seed/out/omc 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df \
-      seed/ng/src/ir.om+seed/ng/src/front.om+seed/ng/src/main.om+in:seed/ng/front/front-check.in \
+      units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt
 
-The source is the units of `ng.units` in order (CI also builds ng through `ngbuild build`, which
-checks their sha256 pins); `in:front-check.in` puts the mode line `@ng front-check` before each case
+The source is `units:seed/ng/ng.units`: the units that list names, concatenated in its order, so a
+stage lane's unit (src/a64.om on the slice branches) comes with the list and no gate command changes
+(CI also builds ng through `ngbuild build`, which checks their sha256 pins; this gate does not);
+`in:front-check.in` puts the mode line `@ng front-check` before each case
 on ng's stdin, while omc reads the case alone. A wrong mode line makes every case FAIL.
 
 Cases: `cases-front.txt` (f64 rem/and/or/xor, the gate15 refusal cases error-codes.reg names, omc.om,
