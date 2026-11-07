@@ -1,0 +1,731 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note native/abft evaluator driver. Owns inputs, the ground-truth record gref, the nonce stream, the
+note tolerances and admission. Each attempt forks a candidate child whose only channel back is a memfd
+note plus its exit status; the evaluator kills it at the frozen deadline and always reaps it.
+note Output columns are printed first (COLUMNS lines); docs/abft/CONTRACT.md section 8 decodes them.
+text MFN "abftout"
+text TCASE "CASE"
+text TSCH "SCHED"
+text TWIT "WITNESS"
+text TTAL "TALLY"
+text TRES "RESOURCES"
+text TPLAN "PLAN"
+text TGATE "GATE"
+text THDR "COLUMNS PLAN version rows S deadline_ns retries first last\nCOLUMNS CASE row rep att dt m n k w pol tgt site fault sub p1 p2 seed nonce exit sig bytes corrupt struct dig full abft samp adm verdict t_cand t_ref t_full t_abft t_samp t_dig sched steps\nCOLUMNS SCHED row status reason pol tgt site control distinct reps round_robin\nCOLUMNS TALLY row cases corrupt full_tp full_fn full_fp full_tn abft_tp abft_fn abft_fp abft_tn samp_tp samp_fn samp_fp samp_tn dig_tp dig_fn dig_fp dig_tn struct_tp struct_fn struct_fp struct_tn adm_tp adm_fn adm_fp adm_tn accept recovered rejected sched_status timeouts reps\nCOLUMNS WITNESS row partner reps same orig_det red_det verdict\nCOLUMNS RESOURCES forks reaped timeouts kills fd_errors wait_errors fd_first fd_last\nCOLUMNS GATE id pass observed expected\n"
+const CEXIT ulong 0
+const CSIG ulong 1
+const CBYT ulong 2
+const CCOR ulong 3
+const CSTR ulong 4
+const CDIG ulong 5
+const CFUL ulong 6
+const CABF ulong 7
+const CSAM ulong 8
+const CADM ulong 9
+const CTC ulong 10
+const CTR ulong 11
+const CTF ulong 12
+const CTA ulong 13
+const CTS ulong 14
+const CTD ulong 15
+const CSH ulong 16
+const CSTP ulong 17
+const CNON ulong 18
+const CVER ulong 19
+global gx uchar 262160
+global gst uchar 4
+global gnon uchar 8
+global gab uchar 32
+global gdig ulong 1
+global gcs ulong 32
+global gtl ulong 32
+global gtr ulong 2048
+global ghs ulong 256
+global gres ulong 8
+global kq ulong 16
+global gwp ulong 256
+global gwc ulong 256
+global gwn ulong 4
+global gexit ulong 64
+fn cs i ulong to ulong
+ret get gcs i
+end
+fn css i ulong v ulong to void
+put gcs i v
+end
+fn pget r ulong f ulong to ulong
+ret get pl add mul r 16 f
+end
+fn rinc i ulong to void
+put gres i add get gres i 1
+end
+fn tinc i ulong to void
+put gtl i add get gtl i 1
+end
+fn bv b bool to ulong
+if b
+ret 1
+end
+ret 0
+end
+fn ptxt0 to void
+for i ulong len TCASE
+ochar get TCASE i
+end
+end
+fn ptxt1 to void
+for i ulong len TSCH
+ochar get TSCH i
+end
+end
+fn ptxt2 to void
+for i ulong len TWIT
+ochar get TWIT i
+end
+end
+fn ptxt3 to void
+for i ulong len TTAL
+ochar get TTAL i
+end
+end
+fn ptxt4 to void
+for i ulong len TRES
+ochar get TRES i
+end
+end
+fn ptxt5 to void
+for i ulong len TPLAN
+ochar get TPLAN i
+end
+end
+fn ptxt6 to void
+for i ulong len TGATE
+ochar get TGATE i
+end
+end
+fn ptxth to void
+for i ulong len THDR
+ochar get THDR i
+end
+end
+fn bfgen to ulong
+s = and rnext 0 1
+e = add 120 rbelow 0 8
+m = rbelow 0 128
+ret or or shl s 15 shl e 7 m
+end
+fn gval to ulong
+if eq get gd 0 0
+ret and rnext 0 MASK
+end
+ret bfgen
+end
+note Inputs from stream 0 seeded by (row seed, rep); evaluator-owned, never candidate-chosen.
+fn gen rep ulong to void
+rseed 0 add mul kf KSEED 1000003 rep
+put gd 0 kf KDT
+put gd 1 kf KM
+put gd 2 kf KN
+put gd 3 kf KK
+for e ulong mul dm dk
+put ga e gval
+end
+for e ulong mul dk dn
+put gb e gval
+end
+end
+note Ground-truth record: the same tiled algorithm, fault free, one worker, round robin, in the
+note evaluator process. Used only to label corrupt/clean; no checker or admission reads it.
+fn cref to void
+for f ulong 16
+put kq f get kp f
+end
+put kp KFLT 0
+put kp KW 1
+put kp KPOL 0
+put kat 0 0
+s = crun
+if eq s 0
+trap 11
+end
+for e ulong mul dm dn
+put gref e get cc e
+end
+for f ulong 16
+put kp f get kq f
+end
+end
+fn cpack e ulong v ulong to void
+for b ulong 4
+put gx add mul e 4 b uchar and shr v mul b 8 255
+end
+end
+fn cpack8 o ulong v ulong to void
+for b ulong 8
+put gx add o b uchar and shr v mul b 8 255
+end
+end
+note Child: the candidate. Writes M*N little-endian u32 words, its schedule hash and step count.
+fn cchild fd int to void
+s = crun
+mn = mul kf KM kf KN
+for e ulong mn
+cpack e get cc e
+end
+nb = mul mn 4
+cpack8 nb get csh 0
+cpack8 add nb 8 s
+w = pwrite fd gx 0 add nb 16 0
+if ne w long add nb 16
+exit 70
+end
+exit 0
+end
+fn reap pid long to void
+dl = add now get pcfg 1
+r = long 0
+while true bound 999999
+r = waitpid int pid gst 0 4 1
+if ne r 0
+break
+end
+if gt now dl
+k = killpid int pid 9
+if ne k 0
+rinc 5
+end
+rinc 2
+rinc 3
+tinc 30
+r = waitpid int pid gst 0 4 0
+break
+end
+z = sleepns 100000
+if lt z 0
+rinc 5
+end
+end
+if lt r 0
+rinc 5
+else
+rinc 1
+end
+css CSIG and ulong get gst 0 127
+css CEXIT ulong get gst 1
+end
+fn word e ulong to ulong
+v = ulong 0
+for b ulong 4
+v = or v shl ulong get gx add mul e 4 b mul b 8
+end
+ret v
+end
+fn word8 o ulong to ulong
+v = ulong 0
+for b ulong 8
+v = or v shl ulong get gx add o b mul b 8
+end
+ret v
+end
+fn collect fd int to void
+mn = mul dm dn
+nb = mul mn 4
+for e ulong mn
+put gobs e 0
+end
+r = pread fd gx 0 add nb 16 0
+c = fclose fd
+if ne c 0
+rinc 4
+end
+if lt r 0
+css CBYT 0
+ret
+end
+css CBYT ulong r
+if ne ulong r add nb 16
+ret
+end
+for e ulong mn
+put gobs e word e
+end
+css CSH word8 nb
+css CSTP word8 add nb 8
+end
+fn okout to bool
+if ne cs CEXIT 0
+ret false
+end
+if ne cs CSIG 0
+ret false
+end
+ret eq cs CBYT add mul mul dm dn 4 16
+end
+fn truth to ulong
+if not okout
+ret 1
+end
+for e ulong mul dm dn
+if ne get gobs e get gref e
+ret 1
+end
+end
+ret 0
+end
+fn nonce to ulong
+r = random gnon 0 8 0
+if ne r 8
+trap 12
+end
+v = ulong 0
+for b ulong 8
+v = or v shl ulong get gnon b mul b 8
+end
+ret v
+end
+note Detectors. Timed with now (monons); check time is reported separately, never inside t_cand.
+fn detect to void
+t = now
+css CDIG bv ne cdig get gdig 0
+css CTD sub now t
+css CSTR bv not okout
+if not okout
+css CFUL 2
+css CABF 2
+css CSAM 2
+ret
+end
+if gt cnonfin 0
+css CSTR 1
+end
+n = nonce
+css CNON n
+rseed 1 n
+t = now
+css CFUL bv gt cfull 0
+css CTF sub now t
+t = now
+css CABF bv gt cabft 0
+css CTA sub now t
+t = now
+css CSAM bv gt csamp get pcfg 0 0
+css CTS sub now t
+end
+fn admit to ulong
+if eq cs CSTR 1
+ret 1
+end
+if eq cs CDIG 1
+ret 1
+end
+if eq cs CFUL 1
+ret 1
+end
+ret bv eq cs CABF 1
+end
+fn attempt att ulong to void
+for i ulong 32
+if ne i CTR
+css i 0
+end
+end
+put kat 0 att
+fd = memfd MFN 0 len MFN 0
+if lt fd 0
+trap 13
+end
+t = now
+pid = fork
+if eq pid 0
+cchild int fd
+end
+if lt pid 0
+trap 14
+end
+rinc 0
+reap pid
+css CTC sub now t
+collect int fd
+css CCOR truth
+detect
+css CADM admit
+end
+fn tadd b ulong d ulong c ulong to void
+if eq d 2
+ret
+end
+if eq c 1
+if eq d 1
+tinc b
+else
+tinc add b 1
+end
+else
+if eq d 1
+tinc add b 2
+else
+tinc add b 3
+end
+end
+end
+fn tcase to void
+tinc 0
+c = cs CCOR
+if eq c 1
+tinc 1
+end
+if eq cs CEXIT 103
+put gexit kf 0 add get gexit kf 0 1
+end
+tadd 2 cs CFUL c
+tadd 6 cs CABF c
+tadd 10 cs CSAM c
+tadd 14 cs CDIG c
+tadd 18 cs CSTR c
+tadd 22 cs CADM c
+end
+fn pcase r ulong rep ulong att ulong to void
+ptxt0
+onum add r 1
+onum rep
+onum att
+for f ulong 13
+onum kf add f 1
+end
+onum cs CNON
+for q ulong 10
+onum cs q
+end
+onum cs CVER
+for q ulong 6
+onum cs add CTC q
+end
+onum cs CSH
+onum cs CSTP
+onl
+end
+fn hseen h ulong to void
+n = get gwn 2
+for q ulong n
+if eq get ghs q h
+ret
+end
+end
+if lt n 256
+put ghs n h
+put gwn 2 add n 1
+end
+end
+fn odig2 to ulong
+h = ulong 14695981039346656037
+for e ulong mul dm dn
+h = fnvw h get gobs e
+end
+ret h
+end
+note One rep: fresh inputs, digest, ground truth, optional common-mode corruption, then up to
+note 1 + retries attempts. Verdict 0 ACCEPT, 1 RECOVERED, 2 REJECTED, 4 retry follows.
+fn runrep r ulong rep ulong to void
+gen rep
+put krep 0 rep
+put gdig 0 cdig
+t = now
+cref
+css CTR sub now t
+if eq kf KFLT 7
+p = kf KP1
+put ga p xor get ga p shl ulong 1 kf KP2
+end
+last = get pcfg 2
+for att ulong add last 1
+attempt att
+if eq att 0
+hseen cs CSH
+put gwc rep odig2
+if eq cs CADM 1
+put gwn 1 add get gwn 1 1
+end
+end
+if eq cs CADM 0
+css CVER bv gt att 0
+else
+if eq att last
+css CVER 2
+else
+css CVER 4
+end
+end
+tcase
+pcase r rep att
+if ne cs CVER 4
+tinc add 26 cs CVER
+break
+end
+end
+for e ulong mul dm dn
+put gprev e get gref e
+end
+end
+fn psched r ulong st ulong rsn ulong to void
+ptxt1
+onum add r 1
+onum st
+onum rsn
+onum kf KPOL
+onum kf KTGT
+onum kf KSITE
+onum shr and kf KFLG 2 1
+onum get gwn 2
+onum get kp 14
+onum bv eq kf KPOL 0
+onl
+end
+fn ptally r ulong to void
+ptxt3
+onum add r 1
+for q ulong 32
+onum get gtl q
+end
+onl
+for q ulong 32
+put gtr add mul r 32 q get gtl q
+end
+end
+note CUDApp#56: a row flagged bit3 is the reduced-concurrency partner of the row before it (same
+note seed). OR-RR: fault-free output digests equal rep by rep. OC-RC: verdict 1 means the original
+note concurrency detected a fault the reduced run never showed, a counterexample to using it as proof.
+fn pwit r ulong to void
+reps = get kp 14
+same = ulong 0
+for q ulong reps
+if eq get gwp q get gwc q
+same = add same 1
+end
+end
+od = get gwn 0
+rd = get gwn 1
+v = ulong 0
+if ne same reps
+v = 2
+end
+if and gt od 0 eq rd 0
+v = 1
+end
+ptxt2
+onum add r 1
+onum r
+onum reps
+onum same
+onum od
+onum rd
+onum v
+onl
+put gwn 3 add mul v 1000 same
+end
+fn runrow r ulong to void
+for f ulong 16
+put kp f pget r f
+end
+put kat 0 0
+for q ulong 32
+put gtl q 0
+end
+put gwn 2 0
+put gwn 1 0
+put gtl 31 get kp 14
+rsn = sreason
+st = sstatus rsn
+put gtl 29 st
+if ne st 0
+psched r st rsn
+ptally r
+ret
+end
+gen 1000000
+cref
+for e ulong mul dm dn
+put gprev e get gref e
+end
+for rep ulong get kp 14
+runrep r rep
+end
+psched r st rsn
+ptally r
+if eq and kf KFLG 8 8
+pwit r
+end
+for q ulong 256
+put gwp q get gwc q
+end
+put gwn 0 get gwn 1
+oflush
+end
+fn tl id ulong i ulong to ulong
+ret get gtr add mul sub id 1 32 i
+end
+fn pgate id ulong ok bool obs ulong exp ulong to bool
+ptxt6
+onum id
+onum bv ok
+onum obs
+onum exp
+onl
+ret ok
+end
+note Gates (docs/abft/CONTRACT.md section 9). Declared admission misses: rows 11 and 17
+note (f32 mantissa flips below the P1 rounding bound). Only meaningful over the full plan.
+fn gfp to ulong
+s = ulong 0
+for r ulong get pn 0
+for d ulong 6
+s = add s tl add r 1 add 4 mul d 4
+end
+end
+ret s
+end
+fn gfn to ulong
+s = ulong 0
+for r ulong get pn 0
+id = add r 1
+if and ne id 11 ne id 17
+s = add s tl id 23
+end
+end
+ret s
+end
+fn gsched to ulong
+bad = ulong 0
+for r ulong get pn 0
+id = add r 1
+e = ulong 0
+if eq id 37
+e = 65
+end
+if or eq id 38 eq id 39
+e = 69
+end
+if ne tl id 29 e
+bad = add bad 1
+end
+end
+ret bad
+end
+fn gates to ulong
+fail = ulong 0
+v = gfp
+if not pgate 1 eq v 0 v 0
+fail = add fail 1
+end
+v = gfn
+if not pgate 2 eq v 0 v 0
+fail = add fail 1
+end
+v = gsched
+if not pgate 3 eq v 0 v 0
+fail = add fail 1
+end
+v = add tl 43 27 tl 44 28
+if not pgate 4 eq v add tl 43 31 tl 44 31 v add tl 43 31 tl 44 31
+fail = add fail 1
+end
+ret add fail gates2
+end
+fn gates2 to ulong
+fail = ulong 0
+ok = and eq get gres 0 get gres 1 eq get gres 6 get gres 7
+ok = and ok eq add get gres 4 get gres 5 0
+if not pgate 5 ok sub get gres 0 get gres 1 0
+fail = add fail 1
+end
+v = tl 36 30
+if not pgate 6 eq v mul 2 tl 36 31 v mul 2 tl 36 31
+fail = add fail 1
+end
+v = add tl 40 7 tl 40 2
+if not pgate 7 eq v mul 2 tl 40 1 v mul 2 tl 40 1
+fail = add fail 1
+end
+note Gate 8 (revised after the first sandbox run, see CONTRACT.md section 9): the digest catches every
+note corrupt case, and full/checksum detect only the cases the structural check flags as nonfinite.
+s = tl 42 18
+c = tl 42 1
+ok = and eq tl 42 14 c and eq add tl 42 3 s c eq add tl 42 7 s c
+v = add add tl 42 14 tl 42 3 tl 42 7
+if not pgate 8 ok v sub mul 3 c mul 2 s
+fail = add fail 1
+end
+v = get gwn 3
+if not pgate 9 eq v tl 51 31 v tl 51 31
+fail = add fail 1
+end
+note Gate 10 (added after the first sandbox run): every row 26 attempt ends in Omega trap 3 (exit 103).
+v = get gexit 26
+if not pgate 10 eq v tl 26 0 v tl 26 0
+fail = add fail 1
+end
+ret fail
+end
+fn argnum i ulong d ulong to ulong
+if le ulong argcnt i
+ret d
+end
+n = argread i gab 0 32
+if le n 0
+ret d
+end
+v = ulong 0
+for q ulong ulong n
+c = ulong get gab q
+if or lt c 48 gt c 57
+exit 64
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+fn fdprobe to ulong
+fd = memfd MFN 0 len MFN 0
+if lt fd 0
+trap 13
+end
+c = fclose int fd
+if ne c 0
+rinc 4
+end
+ret ulong fd
+end
+fn main to int
+pfill
+put gres 6 fdprobe
+first = argnum 1 1
+last = argnum 2 get pn 0
+if or or eq first 0 gt first last gt last get pn 0
+exit 64
+end
+ptxth
+ptxt5
+onum get pcfg 3
+onum get pn 0
+onum get pcfg 0
+onum get pcfg 1
+onum get pcfg 2
+onum first
+onum last
+onl
+oflush
+for r ulong sub add last 1 first
+runrow add sub first 1 r
+end
+put gres 7 fdprobe
+ptxt4
+for q ulong 8
+onum get gres q
+end
+onl
+fail = ulong 0
+if and eq first 1 eq last get pn 0
+fail = gates
+end
+oflush
+ret int fail
+end
