@@ -1234,3 +1234,73 @@ cancelled through `auth_cancel` after MS milliseconds.
 | cancelled read as UNKNOWN | 197 |
 | missing file read as read | 178 |
 | prompt limit raised to 4000 | 203 |
+
+### Live coding workflow under the durable scheduler (DRA-399)
+
+`live-test.om` runs the coding workflow above for real on native Linux
+AArch64: `ollm serve` with the own round40 model, `code-main`, `code-test`,
+`tool` and `infer`. The scheduler is the journal v2 one with the default
+policy that `sched_new` sets (policy 1). The driver only starts the programs
+and checks what they did; it implements none of their logic. It replaces the
+DRA-290 shell and Python harness (`inner.sh`, `crash.sh`, `prep.py`, `cmp.py`,
+`jread.py`).
+
+```sh
+{ printf 'om2\n'; cat seed/json/json.om om/tls/sha2.om seed/node/live-test.om; } \
+  | seed/out/omc > build/node/live-test        # omc exit status must be 0
+bwrap --dev-bind / / --unshare-net --die-with-parent -- \
+  build/node/live-test BASE NODE OLLM MODELDIR OMC40 SEL [serve=0] [parts=fcr]
+```
+
+- **Paths.** All paths are absolute, and BASE must not exist yet.
+  - NODE holds `infer`, `tool`, `code-main` and `code-test`.
+  - MODELDIR holds `model.ck` and `merges.bin`.
+  - OMC40 is the compiler the objectives are checked with (omega-mv e5b32567).
+  - SEL is round40's `final-selected.json`.
+- **Server.** The model server listens on 127.0.0.1:18399, inside the network namespace.
+- **Negative control.** `serve=0` starts no server.
+- **Parts.** `parts=` selects the full run (f), the cancellation (c) and the crash and restart (r). A part left out is `NOT_RUN`.
+- **Exit status.** 0 only when every check passed, 1 otherwise, 2 for a usage error.
+- **Output.** One `PASS|FAIL|NOT_RUN name detail` line per check, then `LIVE checks N pass P fail F not_run R`. The checks are backed by these evidence lines:
+  - `HASH`: sha256 and size of every pinned input, every node program and the driver itself (`/proc/self/exe`).
+  - `SEL`: the four round40 rows used.
+  - `PREP`: the prepared objective files.
+  - `SERVE`: server pid and readiness.
+  - `RUN`: program exit and milliseconds.
+  - `REVIEW`, `SNAP`.
+  - `JOP`: one line per journaled operation.
+
+Objectives: the four round40 loop rows `item76666` (logic fault),
+`item83423` (missing file), `item82342` (syntax fault) and `item85188`
+(correct already). Each row's broken file is written into `root/jobs` and
+compared byte for byte with the selection's `broken` text. Each scenario
+(`BASE/full`, `BASE/cancel`, `BASE/crash`) has its own root, work
+directory, journal and server.
+
+| Check | Passes when |
+| --- | --- |
+| prereq-hashes | model, merges, ollm, the objectives' compiler and the selection match their pinned sha256; every node program is hashed |
+| selection | the four rows parse from SEL and their broken files are prepared |
+| full-workflow | `code-main` with all four objectives exits 0 with `CWSUM pass=4 fail=0` and every `CWO i PASS 1`; no node process remains 15 s later and the server's process group is gone |
+| full-journal | the journal reads back intact: every OPEN under SPVER 3, fences increasing, no POLICY record (the default policy was never changed), one OPEN, every operation started exactly once and done, nothing open, objective identity `OMNC`, 4, issue 290 |
+| round40-transcript | every `CWP` prompt and every `CWR` model reply equals round40's recorded turn byte for byte, in order, and each objective took round40's number of turns (5, 2, 5, 3) |
+| review-outputs | an independent `tool check` (OMC40) of each objective's final file: the three files equal the selection's correct text and give `Tests passed.`; the missing-file objective's file is still absent and gives `File not found.` |
+| cancel-mid-inference | `code-test cancel 20000` on objective 0 exits 1 with `CWO 0 FAIL 19` after one cancel event, the server logs the dropped request as `C 499`, no node process remains and the server group is gone |
+| cancel-journal | the journal checks above with one objective, plus at least one CANCEL record |
+| crash-restart | run 1 of objective 0 is SIGKILLed (status 137) while an `infer` child is running the first inference after the replace landed. Only the creator is killed; its workers and the inference are left to the node's own cleanup, and no node process may remain 15 s later. The file on disk is then the correct text. Run 2 restarts on the same root, work and journal and must exit 0 with `CWO 0 PASS`, leaving nothing behind |
+| crash-journal | the journal checks above with two OPENs, plus at least one operation settled by the restart (`auth_recover`) |
+| no-leak | at the end no process whose program is under NODE remains |
+
+bwrap shares the host's process namespace, so the NODE process count sees every process on the host whose program lies under NODE. Keep monitors and other tools out of NODE. In the first DRA-399 full run, the core sampler lived in `build/node`, and that alone failed full-workflow and no-leak.
+
+`live-cpu.om` is the core-contamination sampler that goes with these runs. Every 10 s it reads `/proc/*/task/*/stat` (read-only) until the file STOP exists. It prints one line per sample: `CPU <realns> cwo <c> run89 <r> own <o> foreign <f>`, followed by ` pid/tid:comm` for each foreign thread.
+
+- `run89` counts threads in state R whose last processor (stat field 39) is 8 or 9.
+- `own` counts those whose program is under `/tmp/wtlive/build/node/` or is the pinned ollm.
+- `cwo` counts the `CWO ` lines in WATCH, which marks the objective boundaries.
+
+```sh
+{ printf 'om2\n'; cat seed/node/live-cpu.om; } | seed/out/omc > build/lt399/live-cpu
+taskset -c 0 nice -n 19 build/lt399/live-cpu PART/end.txt PART/run/<scenario>/run.out > PART/cpu.log
+```
+
