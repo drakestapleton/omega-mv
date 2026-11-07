@@ -1855,8 +1855,10 @@ end
 ret false
 end
 
-note agspawn: fork and run the packed argv with stdout and stderr on a close-on-exec pipe and stdin
-note on /dev/null; returns the child pid (the pipe's read end in gnum 22) or a negative errno
+note agspawn: fork and run the packed argv as the leader of a new process group, stdout and
+note stderr on a close-on-exec pipe and stdin on /dev/null. Both sides call setpgid, so the group
+note exists before either goes on (as in seed/node/auth.om au_fork). Returns the child pid (the
+note pipe's read end in gnum 22) or a negative errno
 fn agspawn pk view uchar 4096 pn ulong to long
 pf = new uchar 8 0
 r = pipefds pf 0 8 524288
@@ -1868,6 +1870,7 @@ wfd = int or ulong get pf 4 shl ulong get pf 5 8
 dn = fopen cdevnull 0 len cdevnull 524288 0
 pid = fork
 if eq pid 0
+r = setpgid 0 0
 r = dupfd wfd 1 0
 r = dupfd wfd 2 0
 if ge dn 0
@@ -1884,24 +1887,51 @@ if lt pid 0
 r = fclose rfd
 ret pid
 end
+r = setpgid int pid int pid
 put gnum 22 ulong rfd
 ret pid
 end
 
+note agreap: reap the direct child without blocking; once it is gone (status in gnum 24, gnum 23
+note = 1) SIGKILL the rest of its process group, so a grandchild cannot outlive the tool call
+fn agreap pid int to void
+ws = new uchar 4 0
+if ne get gnum 23 0
+ret
+end
+g = waitpid pid ws 0 4 1
+if eq g long pid
+put gnum 23 1
+put gnum 24 or ulong get ws 0 shl ulong get ws 1 8
+r = killpid neg pid 9
+end
+end
+
+note agslice: the next wait in ns, the time left to deadline dl at most 50 ms
+fn agslice dl ulong now ulong to long
+if gt sub dl now 50000000
+ret 50000000
+end
+ret long sub dl now
+end
+
 note agdrain: read the child's output into gres (at most 64 KiB kept) until end of file or the
-note --cmd-timeout deadline; true on timeout
+note --cmd-timeout deadline; true on timeout. It waits in 50 ms slices and calls agreap between
+note them (child pid in gnum 25), so after the child exits its group dies and end of file arrives
 fn agdrain rfd int to bool
 buf = new uchar 4096 0
 put gnum QRES 0
+put gnum 23 0
 dl = add ulong monons get gnum QCTMO
 for it ulong 999999
 now = ulong monons
 if ge now dl
 ret true
 end
-wv = waitio rfd 1 long sub dl now
+wv = waitio rfd 1 agslice dl now
 if eq wv 0
-ret true
+agreap int get gnum 25
+continue
 end
 n = read rfd buf 0 4096
 if eq n 0
@@ -1923,7 +1953,9 @@ end
 ret true
 end
 
-note agexec: run the packed argv, collect its output, kill it (SIGKILL) at the deadline, reap it
+note agexec: run the packed argv, collect its output and reap it. At the --cmd-timeout deadline
+note the child's whole process group gets SIGKILL; when the child exits first, agdrain kills the
+note group's remaining members, so no tool grandchild outlives the call either way
 fn agexec pk view uchar 4096 pn ulong to void
 ws = new uchar 4 0
 pid = agspawn pk pn
@@ -1933,11 +1965,13 @@ ret
 end
 rfd = int get gnum 22
 put gnum QTST 0
+put gnum 25 ulong pid
 tmo = agdrain rfd
-if tmo
-r = killpid int pid 9
-end
+r = killpid neg int pid 9
+if eq get gnum 23 0
 r = waitpid int pid ws 0 4 0
+put gnum 24 or ulong get ws 0 shl ulong get ws 1 8
+end
 r = fclose rfd
 if ge get gnum QRES QRESC
 agradd rtrunc
@@ -1949,7 +1983,7 @@ agrnum div get gnum QCTMO 1000000000
 agradd rsec
 ret
 end
-wst = or ulong get ws 0 shl ulong get ws 1 8
+wst = get gnum 24
 if ne and wst 127 0
 put gnum QTST 2
 agradd rsig
