@@ -1069,3 +1069,38 @@ one failed.
 objective is refused, every later replay keeps it so the objective is never
 resumed, and only a class-2 lost action is recorded not performed. The proof
 covers the model; its correspondence to the `.om` code is by reading.
+
+### Release gate
+
+`tests/release-gate.om` checks in Omega that `release stop` makes a durable
+pause before it drains and stops the node. It is composed after the JSON
+reader and the driver library and needs a release build (`release build`):
+
+```
+{ printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/release-gate.om; } | seed/out/omc > release-gate
+release-gate BUILD OMC40 OUT
+```
+
+BUILD, OMC40 and OUT are absolute. The gate removes and recreates
+`OUT/release-gate.d` and keeps it afterwards. It holds the state with two
+objectives and an empty root, an empty fake-serve map, so every model request
+gets 404 after 4000 ms and the objective ends 16, and the start and stop output.
+The gate starts `fake-serve` and then runs `release start`. It waits for the
+first `CWE` job event in `run.out`, while objective 0's inference is in flight
+and objective 1 has not run yet. Then it runs `release stop` and checks:
+
+| Check | Passes when |
+| --- | --- |
+| `stop-rc` | the stop exits 0 (the detail shows its first stderr line) |
+| `stop-journal-pause` | the journal holds a PAUSE with word 3 = 1, then an OPER of op 1 and no START after it |
+| `stop-view-paused` | `view-at-stop.json` has `authority.paused` 1 and `queue.running` 0 |
+| `stop-node-gone` | the pid in `node.pid` no longer exists |
+
+It prints `PASS|FAIL NAME DETAIL` for each check, then `RELGATE pass=P fail=F`.
+It exits 0 when nothing failed, 1 when a check failed, and 2 for bad usage. At
+the end it sends SIGKILL to the node's process group and to `fake-serve`. On the
+real build all four checks pass in about 4 s. The mutant control is a `stop`
+that skips the pause (`if ne rl_post rlone 0` replaced by `if false`). Against
+it the gate fails `stop-rc` (`release: the node exited while stopping`),
+`stop-journal-pause` (`pause_at=none`) and `stop-view-paused`
+(`view-at-stop.json` missing, -2), and exits 1.
