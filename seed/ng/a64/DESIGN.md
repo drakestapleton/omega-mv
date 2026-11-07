@@ -139,16 +139,22 @@ BLR, SVC, ADR and the FP set.
 - `gate.om` (encoder): builds ng from `ng.units`, runs `@ng a64-enc` on `tests/enc.cases`, disassembles with GNU
   objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases.
 - `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck and ng. For every fixture (fib, deep, press, rot,
-  ck, ar, tsum, mem, oob, zf, wid) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must exit with the
-  expected status (computed with Wolfram, or the check's trap code), the omc build of `tests/ref/N.om` with its omc
-  expectation (the same, except tsum: omc traps 6 a million calls deep, ng's loop does not; BEYOND_OMC), and every
-  BL target in the `@ng a64` ELF must be a multiple of 64. Fifteen mutants (spill reload slot, call clobber,
-  live-out range, parallel-move ordering, callee-saved saves, frame size, 16-byte entry alignment, E never matching,
-  E accumulating the wrong value, chk.bounds off by e, half zero fill, write count, u64 loads one byte, large frame
-  without its LSL 12 part, i8 loads zero-extending) must each change at least one fixture's status or alignment.
-  The memory fixtures store and load every integer element width (u8 u64 in mem, i8 u16 i16 u32 i32 in wid); wid
-  compares each loaded value at its own type, because a conversion re-extends from its source type and would hide a
-  non-canonical load (rgate's first form of mutants 13 and 15 escaped that way).
+  ck, ar, tsum, mem, oob, zf, wid, bcopy, sort) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must
+  exit with the expected status (computed with Wolfram, or the check's trap code), the omc build of
+  `tests/ref/N.om` with its omc expectation (the same, except tsum: omc traps 6 a million calls deep, ng's loop does
+  not; BEYOND_OMC), the split and omc runs must print exactly the bytes the `@ng a64` run printed, and every BL
+  target in the `@ng a64` ELF must be a multiple of 64. bcopy and sort are the bench kernels
+  (`~/handoffs/OmegaFast/bench/`) lowered by hand per IR.md s13, with the bench source itself as the omc reference;
+  their output is also checked against Wolfram (bcopy's SHA-256, sort's four numbers). Fifteen mutants (spill
+  reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves, frame size, 16-byte entry
+  alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half zero fill, write count,
+  u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending) must each change at least one
+  fixture's status or alignment. The memory fixtures store and load every integer element width (u8 u64 in mem,
+  i8 u16 i16 u32 i32 in wid); wid compares each loaded value at its own type, because a conversion re-extends from
+  its source type and would hide a non-canonical load (rgate's first form of mutants 13 and 15 escaped that way).
+- ΩIR gap met by sort: a call argument must have exactly the parameter's type (IR.md row 64), so Omega passing an
+  `edit` array to a `view` parameter has no ΩIR form while `view` maps to REF access 0. The fixture types sorted's
+  parameter as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
 
 ## 7. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
 
