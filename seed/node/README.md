@@ -373,16 +373,20 @@ authority, journal and the workflow stay with their DRA-286..290 owners.
 There is one scheduler: these are policies of `sched_dispatch`, not a second
 dispatcher.
 
-Status (DRA-395): IMPLEMENTED: resource requests, capacity admission and
-policy 0, FIFO head-of-line, which reproduces the stop rule of the reference
-pump. The regression below fails on purpose until DRA-396 adds fair fitting.
+Status: IMPLEMENTED: resource requests, capacity admission and policy 0, FIFO
+head-of-line, which reproduces the stop rule of the reference pump (DRA-395);
+policy 1, fair fitting with reservation, admission tickets and leases, the
+default (DRA-396). The head-of-line regression fails under policy 0 and
+passes under policy 1.
 
 ```sh
 cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/node/schedpol-test.om > build/node/schedpol-composed.om
 cmp build/node/schedpol-composed.om seed/node/schedpol-gate.om
 seed/out/omc < seed/node/schedpol-gate.om > build/node/schedpol-gate
 chmod +x build/node/schedpol-gate
-timeout 120 build/node/schedpol-gate     # DRA-395: exit 11, the blocked head
+timeout 300 build/node/schedpol-gate            # policy 1: exit 0
+timeout 300 build/node/schedpol-gate fifo       # policy 0: exit 11, the blocked head
+timeout 300 build/node/schedpol-gate noreserve  # no reservation: exit 61, starvation
 ```
 
 ### Reference pump and ownership
@@ -449,8 +453,8 @@ exclusion is therefore evidenced for Rust only.
 | --- | --- |
 | `sched_admitr id deps flags req` | `sched_admit` with a resource request; -8 when a kind exceeds its capacity (counted, never queued). |
 | `sched_cap caps` | Set every capacity; -8 and no change when a kind would fall below its use or below one admitted job's need. |
-| `sched_policy p win db by` | Policy (0 only, for now), candidate window 1..64 slots, dispatch budget 1..64 per event, bypass budget 1..65535; -7 out of range. |
-| `sched_stat i` | Counters 0..15, capacity 16..19, use 20..23, policy words 24..29. |
+| `sched_policy p win db by ttl` | Policy 0 or 1, candidate window 1..64 slots, dispatch budget 1..64 per event, bypass budget 1..65535, ticket lifetime 1..1000000 dispatch events; -7 out of range. |
+| `sched_stat i` | Counters 0..15 (10 tickets issued, 11 tickets lapsed, 12 leases overdue), capacity 16..19, use 20..23, policy words 24..31 (policy, window, budget, bypass budget, cursor, reserved slot + 1, tickets held, ticket lifetime). |
 
 Admission order (`sjarr`) and ready order (`sjrdy`) are logical counters, so
 selection never reads the clock.
@@ -466,7 +470,7 @@ that every running job whose worker has not reported done holds its need.
 | C | requests over CPU, memory or inference capacity refused (-8) and counted; lowering a capacity below an admitted need, or below the use of two running jobs that each fit it alone, refused with nothing changed | 30..41, 130..134 |
 | D | 12 jobs with mixed needs on 3 workers, capacity 4 CPU, 1024 MiB, 1 inference: each runs once, all resources free at the end | 42..48 |
 | V | review limit 1: both 1-CPU jobs finish, one result waits for review room, yet both CPUs are free and a 2-CPU job runs | 120..126 |
-| F | ready order: a job made ready by a later publication is served after one ready earlier | 50..57 |
+| F | order between a job admitted first but made ready later by a publication (x) and one ready earlier (y): policy 0 serves y (ready order), policy 1 serves x (admission age) | 50..57 |
 | A | blocked head: a (3 CPU) runs, b (2 CPU) cannot fit, c (1 CPU) fits | 11 with the witness line |
 | B | a second head-of-line case after the pump's queue-of-two scenario: a runs, b and d (2 CPU) wait, e (1 CPU) fits | 21 with the witness line |
 
@@ -476,7 +480,7 @@ and unfinished and holds its need, that the head is ready and does not fit,
 that the job behind it is ready and fits, that a live worker is idle and that
 dispatch stopped at the head; then it prints the witness and the phase
 returns 11 (21). Both phases always run; the first failure is the exit.
-At DRA-395 the gate passes C, D, V and F and exits 11:
+Under policy 0 (`fifo`) the gate passes C, D, V and F and exits 11:
 
 ```
 schedpol hol witness head=20050 fits_behind=30050 free_cpu=1 idle_worker=1 hol_stops=40
@@ -494,7 +498,87 @@ command, output) is kept in `evidence/node-schedpol/rust-reference.*.json`.
 | `sp_give j` deleted from `sched_collect` (resources never returned) | 133 |
 | `sp_give j` moved after the review-room check in `sched_collect` (release waits for review) | 122 |
 | `if gt sp_need req k a` to `if false` in `sp_fits` (capacity ignored) | 44 |
-| `sp_ready j` in `sched_publish` to `put sjst j 2` (ready order not stamped) | 54 |
+| `sp_ready j` in `sched_publish` to `put sjst j 2` (ready order not stamped; a policy-0 property, run with `fifo`) | 54 |
+
+### Policy 1: fair fitting with reservation (DRA-396)
+
+Policy 1 is the default; policy 0 stays as the FIFO baseline for the
+DRA-399 comparison. Both are arms of one `sched_dispatch`.
+
+Each pick reads at most `win` slots (default 64), starting at a cursor that
+persists across dispatch events and moves on by `win` after each event, so
+every slot is examined within ceil(64/`win`) events. Among the examined ready
+jobs the pick takes the one admitted first (`sjarr`: unique, so no ties) that
+fits. At most `db` jobs are assigned per event. Waiting age is the admission
+order, kept when a rerunnable job goes back to ready after its worker died.
+Under policy 1 phase F serves the job admitted first.
+
+A ready job admitted before the youngest job assigned in an event was
+bypassed once. With no reservation, the oldest ready job at the bypass
+budget `by` (default 4) is reserved. The reserved job is offered first;
+while it does not fit, every other pick may use, of each kind, only the free
+capacity beyond what the reserved job needs. Of each kind,
+min(free, reserved need) therefore never falls, and the reserved job runs as
+soon as running work has released enough. Assignment or cancellation of the
+reserved job ends the reservation.
+
+Liveness rests on these assumptions: every running job ends (completes, or
+its lease is enforced by the authority); at least one worker stays live;
+dispatch runs after releases (every `sched_step` collects, then dispatches);
+no request exceeds capacity (refused at admission, -8). Under them a reserved
+job runs once the jobs running at its reservation have finished, and each
+ready job is examined within ceil(64/`win`) events. There is one
+reservation at a time, and it goes to the oldest job at the bypass budget.
+A job at the budget therefore waits only for the reservations of jobs
+admitted before it, a finite set; later arrivals never take the reservation
+first. Workers are not a resource kind: the reserved job is offered first at
+every pick, so it takes the first idle worker once it fits.
+
+Admission tickets. `sched_room id` refuses at the admission limit and gives
+the refused caller a ticket; once below the limit, ticket holders enter in
+ticket order before anyone new. `sched_admitr` and `jn_admit` (before it
+journals ADMIT) ask it. A ticket not asked about for `ttl` dispatch events
+(default 1000) lapses, so a caller that went away cannot hold the line; at
+most 64 tickets are held, and a caller refused with the line full holds none.
+
+Leases. `sched_lease j ns` gives a job a lease counted from its assignment;
+`sched_overdue` reports a running job past its lease whose worker has not
+reported done, once. The authority then cancels or kills it, and the release
+follows from the worker's report or the reap. The lease is a clock reading
+used for reporting only; selection reads logical counters.
+
+| Function | Contract |
+| --- | --- |
+| `sched_room id` | May id be admitted now; a refused caller gets or keeps a ticket. |
+| `sched_lease j ns` | Lease for a waiting, ready or running job, from its next assignment; 0 removes it; -3 otherwise. |
+| `sched_overdue` | Slot of a running, unfinished job past its lease, reported once; 64 when none. |
+
+`schedpol-gate` takes one optional argument: `fifo` runs every phase under
+policy 0, `noreserve` sets the bypass budget to 65535 (no reservation in
+practice). Each step also checks the scan bound: the slots examined since the
+last step are at most events × `db` × `win` (64 per pick under policy 0),
+exit 9.
+
+| Phase | Scenario | Exit when it fails |
+| --- | --- | --- |
+| S | three workers, 4 CPU; 1-CPU jobs start staggered and each one finishing is replaced, so the CPUs are never all free at once; big (4 CPU) arrives: it is reserved and runs | 61 never ran (the `noreserve` control), 62..66 |
+| Q | admission limit 2: X then Y refused hold tickets; with room for one, Y is refused and X admitted; Y enters later; a ticket not asked about lapses | 70..80 |
+| L | 200 ms lease on a 3 s job not safe to rerun: reported once, after the lease; worker killed, job UNKNOWN, CPU free. A rerunnable job killed the same way keeps its admission age and completes | 81..89, 140..145 |
+| R | the reserved job is cancelled: freed with no effect, reservation cleared | 90..97 |
+| W | window 4, budget 2, 12 ready jobs in slots 0..11: every pick reads at most 4 slots and all 12 run | 9, 101..103 |
+
+Phases S to W run after A and B, so under `fifo` the gate stops at 11.
+
+| Change to `sched.om` | Expected exit |
+| --- | --- |
+| cursor never moves (`put scpol 4 …` deleted from `sp_after`) | 101 |
+| tickets ignored (`n = get scpol 6` to `n = ulong 0` in `sched_room`) | 75 |
+| no hold-back for the reserved job (`rq = get sjneed rj` to `rq = ulong 0`) | 61 |
+| never reserve (`put scpol 5 add o 1` deleted) | 61 |
+| lease never reported (`if ge now d` to `if false`) | 82 |
+| cancel keeps the reservation | 94 |
+| window ignored (`for i ulong win` to `for i ulong 64` in `sp_fair`) | 9 |
+| tickets never lapse | 80 |
 
 ## Proposals, authority and cancellation (DRA-288)
 

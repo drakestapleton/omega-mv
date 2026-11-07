@@ -949,8 +949,28 @@ note never in part. Every job also needs one idle live worker.
 note sjarr: admission order (waiting age; kept across reruns). sjrdy: order
 note in which the job last became ready. sjbyp: times it was bypassed.
 note Decisions read only these logical counters, never the clock.
+note
+note Policy 1, fair fitting (DRA-396): each pick examines at most win slots
+note from a persistent cursor (which moves on by win per dispatch event, so
+note every slot is examined within ceil(64/win) events) and takes the oldest
+note admitted ready job that fits. A ready job older than a job assigned in
+note the same event was bypassed; once the oldest such job reaches the
+note bypass budget it is reserved: it is offered first, and no other job may
+note use, of any kind, the capacity it still lacks (others may use only
+note free capacity beyond its need). Neither the free capacity it can reach
+note nor its age ever shrinks, so it runs once running work releases enough
+note (liveness assumes: every running job ends, by completion or by its
+note lease, at least one worker stays live, and dispatch runs after
+note releases). Requests over capacity are refused at admission.
+note Admission tickets: a caller refused at the admission limit holds a
+note ticket; when room returns, ticket holders enter in ticket order before
+note anyone new, so a full table cannot exclude a caller that keeps asking.
+note A ticket not asked about for ttl dispatch events lapses.
+note Leases: a running job with a lease is reported once by sched_overdue
+note after its lease passes; the authority then cancels or kills it, which
+note releases its resources.
 const SJCAP ulong 64
-const SPVER ulong 1
+const SPVER ulong 2
 global scmap long 2
 global sclim ulong 2
 global sjst ulong 64
@@ -965,20 +985,25 @@ global sjheld ulong 64
 global sjarr ulong 64
 global sjrdy ulong 64
 global sjbyp ulong 64
+global sjlse ulong 64
+global sjdue ulong 64
+global sttk ulong 64
+global stts ulong 64
 global scbusy ulong 64
 global scseq ulong 64
 global swcur ulong 2
 global scpause ulong 1
 global scap ulong 4
 global suse ulong 4
-note Policy words: 0 policy (0 FIFO head-of-line), 1 candidate window in
-note slots, 2 dispatch budget per event, 3 bypass budget, 4 cursor,
-note 5 reserved job slot + 1 (0 none).
+note Policy words: 0 policy (0 FIFO head-of-line, 1 fair fitting), 1
+note candidate window in slots, 2 dispatch budget per event, 3 bypass
+note budget, 4 cursor, 5 reserved job slot + 1 (0 none), 6 tickets held,
+note 7 ticket lifetime in dispatch events.
 global scpol ulong 8
 note Counters (sched_stat): 0 admissions, 1 ready stamps, 2 dispatch events,
 note 3 slots examined, 4 jobs assigned, 5 bypasses, 6 reservations made,
 note 7 impossible requests refused, 8 head-of-line stops, 9 reserved jobs
-note assigned.
+note assigned, 10 tickets issued, 11 tickets lapsed, 12 leases overdue.
 global scst ulong 16
 
 fn sc_cell w ulong off ulong to ulong
@@ -1018,6 +1043,8 @@ put sclim 1 rl
 for j ulong 64
 put sjst j 0
 put sjheld j 0
+put sjlse j 0
+put sjdue j 0
 put scbusy j 0
 put scseq j 0
 end
@@ -1028,12 +1055,14 @@ end
 for i ulong 16
 put scst i 0
 end
-put scpol 0 0
+put scpol 0 1
 put scpol 1 64
 put scpol 2 64
 put scpol 3 4
 put scpol 4 0
 put scpol 5 0
+put scpol 6 0
+put scpol 7 1000
 put scpause 0 0
 ret 0
 end
@@ -1105,7 +1134,7 @@ put scst 1 add get scst 1 1
 end
 
 note Creator: counter i of scst, capacity (i 16..19) or use (i 20..23) of a
-note kind, or policy word (i 24..29).
+note kind, or policy word (i 24..31).
 fn sched_stat i ulong to ulong
 if lt i 16
 ret get scst i
@@ -1116,7 +1145,7 @@ end
 if lt i 24
 ret get suse sub i 20
 end
-if lt i 30
+if lt i 32
 ret get scpol sub i 24
 end
 ret 0
@@ -1148,11 +1177,12 @@ end
 ret 0
 end
 
-note Creator: policy p (0 FIFO head-of-line), candidate window win slots
-note (1..64), dispatch budget db jobs per event (1..64), bypass budget by
-note (1..65535). The cursor and any reservation are kept. 0 or -7.
-fn sched_policy p ulong win ulong db ulong by ulong to long
-if gt p 0
+note Creator: policy p (0 FIFO head-of-line, 1 fair fitting), candidate
+note window win slots (1..64), dispatch budget db jobs per event (1..64),
+note bypass budget by (1..65535), ticket lifetime ttl dispatch events
+note (1..1000000). The cursor and any reservation are kept. 0 or -7.
+fn sched_policy p ulong win ulong db ulong by ulong ttl ulong to long
+if gt p 1
 ret neg long 7
 end
 if or eq win 0 gt win 64
@@ -1164,10 +1194,14 @@ end
 if or eq by 0 gt by 65535
 ret neg long 7
 end
+if or eq ttl 0 gt ttl 1000000
+ret neg long 7
+end
 put scpol 0 p
 put scpol 1 win
 put scpol 2 db
 put scpol 3 by
+put scpol 7 ttl
 ret 0
 end
 
@@ -1192,22 +1226,99 @@ end
 ret n
 end
 
+note Position of id's admission ticket, or 64.
+fn sp_tkpos id ulong to ulong
+for t ulong get scpol 6 bound 64
+if eq get sttk t id
+ret t
+end
+end
+ret 64
+end
+
+note Compact the tickets in order, dropping ticket d (64: none) and every
+note ticket not asked about for the ticket lifetime.
+fn sp_tkpack d ulong to void
+k = ulong 0
+for t ulong get scpol 6 bound 64
+if ne t d
+if lt add get stts t get scpol 7 get scst 2
+put scst 11 add get scst 11 1
+else
+put sttk k get sttk t
+put stts k get stts t
+k = add k 1
+end
+end
+end
+put scpol 6 k
+end
+
+note Refresh ticket t, or give id a ticket at the end when it has none and
+note the line has room (a caller refused with the line full holds none).
+fn sp_tkhold id ulong t ulong to void
+if lt t 64
+put stts t get scst 2
+ret
+end
+n = get scpol 6
+if lt n 64
+put sttk n id
+put stts n get scst 2
+put scpol 6 add n 1
+put scst 10 add get scst 10 1
+end
+end
+
+note Creator: may id be admitted now? Not at the admission limit; below it,
+note ticket holders come first in ticket order, then anyone new. A refused
+note caller gets or keeps a ticket. Asking again changes nothing else, so a
+note caller may ask before sched_admitr (as jn_admit does).
+fn sched_room id ulong to bool
+sp_tkpack 64
+t = sp_tkpos id
+if ge sched_count 1 3 get sclim 0
+sp_tkhold id t
+ret false
+end
+n = get scpol 6
+if eq n 0
+ret true
+end
+room = sub get sclim 0 sched_count 1 3
+if lt t 64
+if lt t room
+ret true
+end
+else
+if gt room n
+ret true
+end
+end
+sp_tkhold id t
+ret false
+end
+
 note Creator: admit job id needing req (packed resources). deps 0 makes it
 note ready at once; otherwise it waits for a publication whose topics meet
 note deps. flags bit 0: safe to rerun after its worker dies. Returns the job
 note slot; -8 when req exceeds the configured capacity of a kind (it could
-note never run); -2 when admitted work (waiting, ready, running) is at its
-note limit: refused, not queued.
+note never run); -2 when sched_room refuses: at the admission limit, or
+note ticket holders ahead; the caller keeps a ticket and asks again.
 fn sched_admitr id ulong deps ulong flags ulong req ulong to long
 if not sp_feas req
 put scst 7 add get scst 7 1
 ret neg long 8
 end
-if ge sched_count 1 3 get sclim 0
+if not sched_room id
 ret neg long 2
 end
 for j ulong 64
 if eq get sjst j 0
+t = sp_tkpos id
+if lt t 64
+sp_tkpack t
+end
 put sjid j id
 put sjdep j deps
 put sjfl j flags
@@ -1217,6 +1328,8 @@ put sjw j 0
 put sjneed j req
 put sjheld j 0
 put sjbyp j 0
+put sjlse j 0
+put sjdue j 0
 put sjarr j get scst 0
 put scst 0 add get scst 0 1
 if eq deps 0
@@ -1228,6 +1341,50 @@ ret long j
 end
 end
 ret neg long 2
+end
+
+note Creator: job j (waiting, ready or running) gets a lease of ns from its
+note next assignment, or from now when it runs; 0 removes it. 0, or -3.
+fn sched_lease j ulong ns ulong to long
+if ge j 64
+ret neg long 3
+end
+s = get sjst j
+if or lt s 1 gt s 3
+ret neg long 3
+end
+put sjlse j ns
+if eq s 3
+put sjdue j 0
+if gt ns 0
+put sjdue j add ulong monons ns
+end
+end
+ret 0
+end
+
+note Creator: a running job past its lease whose worker has not reported
+note done, reported once (its deadline is cleared): its slot, or 64. The
+note authority cancels or kills it; the release follows from the worker's
+note report or reap.
+fn sched_overdue to ulong
+now = ulong monons
+for j ulong 64
+if eq get sjst j 3
+d = get sjdue j
+if gt d 0
+if ge now d
+w = get sjw j
+if ne sc_cell w 64 get scseq w
+put sjdue j 0
+put scst 12 add get scst 12 1
+ret j
+end
+end
+end
+end
+end
+ret 64
 end
 
 note Creator: sched_admitr with no resource need beyond one worker.
@@ -1270,6 +1427,10 @@ put sjst j 3
 put sjw j w
 put sjatt j add get sjatt j 1
 put sjbyp j 0
+put sjdue j 0
+if gt get sjlse j 0
+put sjdue j add ulong monons get sjlse j
+end
 sp_take j
 if eq get scpol 5 add j 1
 put scpol 5 0
@@ -1293,6 +1454,7 @@ note not fit holds back every later job. Returns the slot or 64.
 fn sp_fifo to ulong
 h = ulong 64
 for j ulong 64
+put scst 3 add get scst 3 1
 if eq get sjst j 2
 if eq h 64
 h = j
@@ -1303,7 +1465,6 @@ end
 end
 end
 end
-put scst 3 add get scst 3 64
 if eq h 64
 ret 64
 end
@@ -1314,6 +1475,83 @@ put scst 8 add get scst 8 1
 ret 64
 end
 
+note Policy 1, fair fitting: the reserved job first when it fits; else the
+note oldest admitted ready job, among win slots from the cursor, that fits
+note without the capacity the reserved job still lacks. Returns the slot or
+note 64. Work per pick is bounded by win.
+fn sp_fair to ulong
+rq = ulong 0
+r = get scpol 5
+if gt r 0
+rj = sub r 1
+if eq get sjst rj 2
+if sp_fits get sjneed rj 0
+ret rj
+end
+rq = get sjneed rj
+else
+put scpol 5 0
+end
+end
+win = get scpol 1
+cur = get scpol 4
+b = ulong 64
+for i ulong win bound 64
+put scst 3 add get scst 3 1
+j = rem add cur i 64
+if eq get sjst j 2
+if sp_fits get sjneed j rq
+if eq b 64
+b = j
+else
+if lt get sjarr j get sjarr b
+b = j
+end
+end
+end
+end
+end
+ret b
+end
+
+note After a fair dispatch event in which ya - 1 was the youngest admission
+note assigned (ya 0: none): every ready job admitted before it was bypassed
+note once; with no reservation, the oldest job at the bypass budget is
+note reserved. The cursor moves on by the window.
+fn sp_after ya ulong to void
+if gt ya 0
+for j ulong 64
+if eq get sjst j 2
+if lt add get sjarr j 1 ya
+put sjbyp j add get sjbyp j 1
+put scst 5 add get scst 5 1
+end
+end
+end
+end
+if eq get scpol 5 0
+o = ulong 64
+for j ulong 64
+if eq get sjst j 2
+if ge get sjbyp j get scpol 3
+if eq o 64
+o = j
+else
+if lt get sjarr j get sjarr o
+o = j
+end
+end
+end
+end
+end
+if lt o 64
+put scpol 5 add o 1
+put scst 6 add get scst 6 1
+end
+end
+put scpol 4 rem add get scpol 4 get scpol 1 64
+end
+
 note Creator: assign ready jobs to idle live workers under the policy, at
 note most the dispatch budget per call. Returns the number assigned.
 fn sched_dispatch c long to ulong
@@ -1322,18 +1560,31 @@ ret 0
 end
 n = mapget c 48 8
 k = ulong 0
+ya = ulong 0
+fair = eq get scpol 0 1
 put scst 2 add get scst 2 1
 for i ulong get scpol 2 bound 64
 w = sp_idle n
 if ge w 64
 break
 end
+j = ulong 64
+if fair
+j = sp_fair
+else
 j = sp_fifo
+end
 if ge j 64
 break
 end
+if gt add get sjarr j 1 ya
+ya = add get sjarr j 1
+end
 sp_start c j w
 k = add k 1
+end
+if fair
+sp_after ya
 end
 ret k
 end
@@ -1492,6 +1743,9 @@ end
 s = get sjst j
 if or eq s 1 eq s 2
 put sjst j 0
+if eq get scpol 5 add j 1
+put scpol 5 0
+end
 ret 1
 end
 if eq s 3
@@ -2454,11 +2708,12 @@ end
 ret 0
 end
 
-note Admit job id durably: ADMIT is appended before sched_admit. -2 at the
-note admission limit, -4 an id already in the journal, -5 the journal
-note refused, else sched_admit's slot.
+note Admit job id durably: ADMIT is appended before sched_admit. -2 when
+note sched_room refuses (admission limit, or ticket holders ahead), -4 an
+note id already in the journal, -5 the journal refused, else sched_admit's
+note slot.
 fn jn_admit id ulong deps ulong flags ulong to long
-if ge sched_count 1 3 get sclim 0
+if not sched_room id
 ret neg long 2
 end
 if ge jn_jfind id 0
