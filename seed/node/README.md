@@ -852,7 +852,11 @@ events (1 issued, 2 model action kind, 3 tool status, 4 outcome word, 5
 cancel);
 `CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
 every objective passed, 1 otherwise, 2 usage, 62 out of time, 30 + a journal
-refusal.
+refusal (50..57), 50..56 a setup failure (pool, supervisor, scheduler,
+authority, worker spawn, view page, view process). The two ranges overlap, so
+every such exit first writes `code-main: CAUSE, exit N` on stderr; a journal
+directory over 100 bytes, for example, gives `code-main: journal refused
+(...), exit 56`.
 
 Restart: the journal's objective identity is the objective arguments' FNV-1a
 64. On a restart `auth_recover` settles what the last creator left (an
@@ -1055,8 +1059,8 @@ OLLM=/abs/path/ollm VERB=serve CK=... MERGES=... PORT=18294 \
 
 The acceptance driver runs `BUILD/release`, so BUILD must hold it. BUILD,
 OLDBIN, OMC40, ROUND40 and OUT are absolute paths. Keep OUT short: the node's
-`jn_open` refuses a journal directory longer than 100 bytes (error 26, the
-node exits 56 with nothing on stderr), and the deepest one the driver uses is
+`jn_open` refuses a journal directory longer than 100 bytes (error 26; the
+node exits 56 with `code-main: journal refused (...), exit 56` on stderr), and the deepest one the driver uses is
 `OUT/compat/journal`. The scenarios are `full lifecycle restart conflict
 worker uncertain cancel commands down authority journal memory`; naming none
 runs all twelve.
