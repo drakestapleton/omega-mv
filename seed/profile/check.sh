@@ -1,0 +1,66 @@
+#!/bin/sh
+# Qualification for seed/profile (DRA-419 critical source profile) and the profiled authority modules.
+# The checker and the conductor are seeded Omega; this coordinator only compiles, runs and compares.
+# Exit 0 PASS, 1 FAIL, 3 NOT_RUN (wrong compiler).
+set -u
+cd "$(dirname "$0")/../.."
+OMC=seed/out/omc
+PIN=$(sed -n 's/^OMC_PIN=//p' om/units.sh)
+[ -x "$OMC" ] || { echo "NOT_RUN profile: no omc at $OMC"; exit 3; }
+[ "$(sha256sum < "$OMC" | cut -c1-64)" = "$PIN" ] || { echo "NOT_RUN profile: omc is not the pinned compiler $PIN"; exit 3; }
+B=build/seed/profile
+rm -rf "$B"; mkdir -p "$B"
+fails=0
+ok() { printf 'ok   %s\n' "$*"; }
+bad() { fails=$((fails + 1)); printf 'FAIL %s\n' "$*"; }
+echo "omc $PIN"
+"$OMC" < seed/qualification/om2/gate.om > "$B/gate" || { echo "FAIL gate.om does not compile"; exit 1; }
+chmod +x "$B/gate"
+"$OMC" < seed/profile/profile.om > "$B/profile" || { echo "FAIL profile.om does not compile"; exit 1; }
+chmod +x "$B/profile"
+echo "profile sha256 $(sha256sum < "$B/profile" | cut -c1-64)"
+
+# 1. Rule fixtures, real-module pre-fix controls, capacity and stop rows.
+"$B/gate" "$OMC" "$PIN" seed/profile/profile.cases "$B/cases" > "$B/cases.log"
+grep -qx 'OM2GATE PASS cases=44 pass=44 fail=0 invalid=0 not_run=0' "$B/cases.log" \
+    && ok "profile cases (44)" || { bad "profile cases"; grep -v ' PASS ' "$B/cases.log" | grep '^VERDICT'; }
+
+# 2. One profile.om mutant per rule: every control PASS, every kill row FAIL.
+"$B/gate" "$OMC" "$PIN" seed/profile/mutants.cases "$B/mutants" > "$B/mutants.log"
+st=$?
+if [ "$st" = 1 ] && grep -qx 'OM2GATE FAIL cases=16 pass=8 fail=8 invalid=0 not_run=0' "$B/mutants.log" \
+    && [ "$(grep -c '^VERDICT ctl-[a-z0-9-]* PASS ' "$B/mutants.log")" = 8 ] \
+    && [ "$(grep -c '^VERDICT m-[a-z0-9-]* FAIL ' "$B/mutants.log")" = 8 ]; then
+    ok "8 profile.om mutants killed, 8 controls pass"
+else bad "profile mutants (gate exit $st)"; tail -1 "$B/mutants.log"; fi
+
+# 3. The profiled modules pass the profile as one unit (dispatch is the consumer of lock and store).
+A=seed/authority
+"$B/profile" $A/action.om $A/store.om $A/lock.om $A/dispatch.om > "$B/unit.txt"
+[ $? = 0 ] && grep -qx 'PROFILE-PASS' "$B/unit.txt" && ok "authority unit profile" || bad "authority unit: $(cat "$B/unit.txt")"
+
+# 4. The authority gates are the committed module text plus the test, and their regression tests pass.
+same() { # same GATE PART...
+    g=$1; shift
+    (cd $A && cat "$@") | cmp -s - "$A/$g.om" && ok "$g.om = $*" || bad "$g.om is stale against $*"
+}
+same dispatch-gate action.om store.om lock.om dispatch.om dispatch-test.om
+same lock-gate lock.om lock-test.om
+same store-gate store.om store-test.om
+same dispatch-order-gate action.om store.om dispatch.om dispatch-order-test.om
+same store-exact-gate store.om store-exact-test.om
+# store-cleanup-gate routes the store descriptor calls through the test's failure injectors.
+sed -e 's/fopen spath/cfopen/' -e 's/write int fd sb/cwrite int fd/' -e 's/fsync int fd/cfsync int fd/' \
+    -e 's/fclose int fd/cfclose int fd/' -e 's/renames spkt/crenames/' $A/store.om | cat - $A/store-cleanup-test.om \
+    | cmp -s - $A/store-cleanup-gate.om && ok "store-cleanup-gate.om = injected store.om store-cleanup-test.om" \
+    || bad "store-cleanup-gate.om is stale against store.om store-cleanup-test.om"
+for g in dispatch-gate lock-gate store-gate dispatch-order-gate store-exact-gate store-cleanup-gate; do
+    "$OMC" < $A/$g.om > "$B/$g" || { bad "$g does not compile"; continue; }
+    chmod +x "$B/$g"
+    "$B/$g" < /dev/null > "$B/$g.out" 2>&1
+    st=$?
+    [ $st = 0 ] && ok "$g exit 0: $(tail -1 "$B/$g.out")" || bad "$g exit $st: $(tail -1 "$B/$g.out")"
+done
+
+if [ $fails = 0 ]; then echo "PROFILE CHECK PASS"; exit 0; fi
+echo "PROFILE CHECK FAIL failed=$fails"; exit 1
