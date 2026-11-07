@@ -1,0 +1,856 @@
+note seed/node/tests/drv.om: the Omega Node test-driver library (Drake's directive 2026-11-07:
+note test drivers are seeded Omega). An OM-2 fragment, program mode, composed after json.om:
+note   { printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om DRIVER.om; } | seed/out/omc
+note Names: functions dv_*, constants, texts and the one global dv*. The dv_j* helpers call json.om.
+note Errors are negative Linux errno values unless a contract says otherwise: -2 ENOENT,
+note -5 EIO, -17 EEXIST, -20 ENOTDIR, -22 EINVAL, -27 EFBIG, -36 ENAMETOOLONG, -40 ELOOP,
+note -98 EADDRINUSE, -110 ETIMEDOUT. A path is a byte slice of 1..4095 bytes (the host-word limit).
+note Host words: argcnt argread fopen read write fclose fstat stat lstat makedir rmdir unlink
+note getdnts fork setpgid dupfd execprog waitpid killpid monons sleepns socknew bind sockname.
+
+const dvnone ulong 18446744073709551615
+const dvtcap ulong 262160
+const dvpmax ulong 4095
+
+note dvcnt: result-line counters, [0] PASS, [1] FAIL, [2] NOT_RUN.
+global dvcnt ulong 4
+
+text dvpass "PASS "
+text dvfail "FAIL "
+text dvnrun "NOT_RUN "
+text dvsp " "
+text dvnl "\n"
+text dvnull "/dev/null"
+
+note ======== output, numbers, bytes
+
+note dv_wall fd b: write all of b to fd; 0, the negative write error, or -5 when write returns 0.
+fn dv_wall fd int b view uchar * to long
+p = ulong 0
+n = len b
+while lt p n bound 16777217
+k = write fd b p sub n p
+if lt k 0
+ret k
+end
+if eq k 0
+ret neg long 5
+end
+p = add p ulong k
+end
+ret 0
+end
+
+note dv_out b: dv_wall on standard output. dv_err b: dv_wall on standard error.
+fn dv_out b view uchar * to long
+ret dv_wall 1 b
+end
+
+fn dv_err b view uchar * to long
+ret dv_wall 2 b
+end
+
+note dv_cat o p b: b copied into o at p; the new end p + len b, or dvnone (o unchanged) when it
+note does not fit or p is already dvnone. Appenders chain: p = dv_cat o p x, then p = dv_byte o p c.
+fn dv_cat o edit uchar * p ulong b view uchar * to ulong
+if gt p len o
+ret dvnone
+end
+if gt len b sub len o p
+ret dvnone
+end
+i = ulong 0
+while lt i len b bound 16777217
+put o add p i get b i
+i = add i 1
+end
+ret add p len b
+end
+
+note dv_byte o p c: the byte c stored at o[p]; p + 1, or dvnone when it does not fit.
+fn dv_byte o edit uchar * p ulong c uchar to ulong
+if ge p len o
+ret dvnone
+end
+put o p c
+ret add p 1
+end
+
+note dv_fmtu o p v: the decimal digits of v appended at o[p] (dv_cat rules); the new end or dvnone.
+fn dv_fmtu o edit uchar * p ulong v ulong to ulong
+d = new uchar 24 0
+k = ulong 0
+x = v
+for i ulong 24
+put d k uchar add 48 rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+if gt p len o
+ret dvnone
+end
+if gt k sub len o p
+ret dvnone
+end
+for j ulong k
+put o add p j get d sub sub k j 1
+end
+ret add p k
+end
+
+note dv_fmtl o p v: as dv_fmtu for a signed v: a '-' and the digits of its magnitude when negative.
+fn dv_fmtl o edit uchar * p ulong v long to ulong
+if ge v 0
+ret dv_fmtu o p ulong v
+end
+q = dv_byte o p 45
+ret dv_fmtu o q add ulong neg add v 1 1
+end
+
+note dv_atou b: the unsigned decimal in b (1..20 digits, nothing else); dvnone when b is empty,
+note has another byte, or the value is not below dvnone.
+fn dv_atou b view uchar * to ulong
+n = len b
+if or eq n 0 gt n 20
+ret dvnone
+end
+v = ulong 0
+i = ulong 0
+while lt i n bound 21
+c = ulong get b i
+if or lt c 48 gt c 57
+ret dvnone
+end
+d = sub c 48
+if gt v div sub sub dvnone 1 d 10
+ret dvnone
+end
+v = add mul v 10 d
+i = add i 1
+end
+ret v
+end
+
+note dv_at b i k: whether the bytes of k occur in b at index i (true for an empty k with i <= len b).
+fn dv_at b view uchar * i ulong k view uchar * to bool
+if gt i len b
+ret false
+end
+if gt len k sub len b i
+ret false
+end
+j = ulong 0
+while lt j len k bound 16777217
+if ne get b add i j get k j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+note dv_eq a b: whether a and b are the same bytes.
+fn dv_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+ret dv_at a 0 b
+end
+
+note dv_find b k fr: the first index i >= fr where k occurs in b, or dvnone.
+fn dv_find b view uchar * k view uchar * fr ulong to ulong
+nb = len b
+if gt fr nb
+ret dvnone
+end
+if gt len k sub nb fr
+ret dvnone
+end
+lim = sub nb len k
+i = fr
+while le i lim bound 16777217
+if dv_at b i k
+ret i
+end
+i = add i 1
+end
+ret dvnone
+end
+
+note ======== result lines
+
+note dv_result kind nm det: print "WORD nm det" and a newline on standard output, WORD by kind
+note (0 PASS, 1 FAIL, 2 NOT_RUN; any other kind prints and counts as FAIL); no space and no
+note detail when det is empty. Counts the line in dvcnt. dv_pass, dv_fail, dv_nrun: the three kinds.
+fn dv_result kind ulong nm view uchar * det view uchar * to void
+k = kind
+if gt k 2
+k = 1
+end
+x = long 0
+if eq k 0
+x = dv_out dvpass
+end
+if eq k 1
+x = dv_out dvfail
+end
+if eq k 2
+x = dv_out dvnrun
+end
+x = dv_out nm
+if gt len det 0
+x = dv_out dvsp
+x = dv_out det
+end
+x = dv_out dvnl
+put dvcnt k add get dvcnt k 1
+end
+
+fn dv_pass nm view uchar * det view uchar * to void
+dv_result 0 nm det
+end
+
+fn dv_fail nm view uchar * det view uchar * to void
+dv_result 1 nm det
+end
+
+fn dv_nrun nm view uchar * det view uchar * to void
+dv_result 2 nm det
+end
+
+note dv_count kind: the number of result lines of kind 0 PASS, 1 FAIL, 2 NOT_RUN printed so far.
+fn dv_count kind ulong to ulong
+if gt kind 2
+ret 0
+end
+ret get dvcnt kind
+end
+
+note ======== arguments
+
+note dv_argc: the argument count, argument 0 (the program) included.
+fn dv_argc to ulong
+ret ulong argcnt
+end
+
+note dv_arg i b: argument i copied to b[0, ..); its length, -105 when b is too short, -22 when
+note i >= dv_argc.
+fn dv_arg i ulong b edit uchar * to long
+if ge i dv_argc
+ret neg long 22
+end
+ret argread i b 0 len b
+end
+
+note ======== files and directories
+
+note dv_slurp pa b: the whole file pa read into b[0, ..) (read-only, no final symbolic link); its
+note length; -27 when it does not fit in b; or the negative open or read error.
+fn dv_slurp pa view uchar * b edit uchar * to long
+t = new uchar 1 0
+fd = fopen pa 0 len pa 557056 0
+if lt fd 0
+ret fd
+end
+n = ulong 0
+r = long 0
+while lt n len b bound 16777217
+k = read int fd b n sub len b n
+if lt k 0
+r = k
+break
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+if and eq r 0 eq n len b
+k = read int fd t 0 1
+if ne k 0
+r = neg long 27
+end
+if lt k 0
+r = k
+end
+end
+x = fclose int fd
+if lt r 0
+ret r
+end
+ret long n
+end
+
+note dv_wfile pa b fl: open pa with fopen flags fl (mode 0644 before umask), write all of b, close;
+note 0 or the negative error.
+fn dv_wfile pa view uchar * b view uchar * fl int to long
+fd = fopen pa 0 len pa fl 420
+if lt fd 0
+ret fd
+end
+r = dv_wall int fd b
+x = fclose int fd
+if lt r 0
+ret r
+end
+if lt x 0
+ret x
+end
+ret 0
+end
+
+note dv_spit pa b: b as the whole file pa (created or truncated; no final symbolic link); 0 or an
+note error. dv_apnd pa b: b appended to pa (created when missing; no final symbolic link).
+fn dv_spit pa view uchar * b view uchar * to long
+ret dv_wfile pa b 557633
+end
+
+fn dv_apnd pa view uchar * b view uchar * to long
+ret dv_wfile pa b 558145
+end
+
+note dv_isdir pa: 0 when pa is a directory (a final symbolic link followed), -20 when it is
+note another kind, or the stat error.
+fn dv_isdir pa view uchar * to long
+st = new uchar 128 0
+if or eq len pa 0 gt len pa dvpmax
+ret neg long 22
+end
+r = stat pa 0 len pa st 0 128
+if lt r 0
+ret r
+end
+md = or ulong get st 16 shl ulong get st 17 8
+if eq and md 61440 16384
+ret 0
+end
+ret neg long 20
+end
+
+note dv_mkdirp pa: create directory pa and its missing parents (mode 0777 before umask, as
+note os.makedirs; existing ones are kept); 0 when pa is a directory afterwards, -20 when it exists
+note as another kind, -22 for an empty or over-long path, or the first other makedir error.
+fn dv_mkdirp pa view uchar * to long
+n = len pa
+if or eq n 0 gt n dvpmax
+ret neg long 22
+end
+i = ulong 1
+while lt i n bound 4096
+if eq get pa i 47
+if ne get pa sub i 1 47
+r = makedir pa 0 i 511
+if and lt r 0 ne r -17
+ret r
+end
+end
+end
+i = add i 1
+end
+r = makedir pa 0 n 511
+if and lt r 0 ne r -17
+ret r
+end
+ret dv_isdir pa
+end
+
+note dv_rmrf pa: remove pa and everything below it (rm -rf: a symbolic link is removed, never
+note followed); 0 when pa no longer exists, -22 for an empty or over-long path, -40 below 64
+note directory levels, or the first unlink, rmdir, open or getdents error.
+fn dv_rmrf pa view uchar * to long
+pb = new uchar 4096 0
+n = len pa
+if or eq n 0 gt n dvpmax
+ret neg long 22
+end
+for i ulong n
+put pb i get pa i
+end
+ret dv_rmr pb n 64
+end
+
+note dv_rmr pb n dep: remove the path pb[0, n) and, when it is a directory, its entries at most
+note dep levels down. pb[n, ..) is scratch for the entry paths.
+fn dv_rmr pb edit uchar 4096 n ulong dep ulong to long
+st = new uchar 128 0
+r = lstat pb 0 n st 0 128
+if eq r -2
+ret 0
+end
+if lt r 0
+ret r
+end
+md = and or ulong get st 16 shl ulong get st 17 8 61440
+if ne md 16384
+ret unlink pb 0 n
+end
+if eq dep 0
+ret neg long 40
+end
+r = dv_rments pb n dep
+if lt r 0
+ret r
+end
+ret rmdir pb 0 n
+end
+
+note dv_rments pb n dep: empty directory pb[0, n): read one getdents64 batch, close the directory,
+note remove the batch's entries, repeat until a batch has none. Each pass removes an entry or ends.
+fn dv_rments pb edit uchar 4096 n ulong dep ulong to long
+db = new uchar 4096 0
+while true bound 16777216
+fd = fopen pb 0 n 573440 0
+if lt fd 0
+ret fd
+end
+k = getdnts int fd db 0 4096
+x = fclose int fd
+if lt k 0
+ret k
+end
+c = dv_rment pb n dep db ulong k
+if le c 0
+ret c
+end
+end
+ret neg long 40
+end
+
+note dv_rment pb n dep db k: remove the entries of the getdents64 batch db[0, k) below pb[0, n)
+note ("." and ".." skipped); the number removed or an error (-5 for a malformed record).
+fn dv_rment pb edit uchar 4096 n ulong dep ulong db view uchar 4096 k ulong to long
+p = ulong 0
+c = long 0
+while lt add p 19 k bound 4096
+rl = or ulong get db add p 16 shl ulong get db add p 17 8
+if or lt rl 20 gt add p rl k
+ret neg long 5
+end
+r = dv_rm1 pb n dep db add p 19 add p rl
+if lt r 0
+ret r
+end
+c = add c r
+p = add p rl
+end
+ret c
+end
+
+note dv_rm1 pb n dep db s e: remove the entry whose zero-terminated name starts at db[s] (record
+note end e) below pb[0, n); 1 when removed, 0 for "." and "..", or an error.
+fn dv_rm1 pb edit uchar 4096 n ulong dep ulong db view uchar 4096 s ulong e ulong to long
+m = ulong 0
+while lt add s m e bound 4096
+if eq get db add s m 0
+break
+end
+m = add m 1
+end
+if eq m 0
+ret neg long 5
+end
+if eq get db s 46
+if eq m 1
+ret 0
+end
+if eq m 2
+if eq get db add s 1 46
+ret 0
+end
+end
+end
+if gt add add n 1 m dvpmax
+ret neg long 36
+end
+put pb n 47
+for i ulong m
+put pb add add n 1 i get db add s i
+end
+r = dv_rmr pb add add n 1 m sub dep 1
+if lt r 0
+ret r
+end
+ret 1
+end
+
+note dv_join o a b: os.path.join(a, b) written to o[0, ..): b when it starts with '/', else a, a
+note '/' unless a is empty or ends with '/', then b; the length, or dvnone when o is too short.
+fn dv_join o edit uchar * a view uchar * b view uchar * to ulong
+if gt len b 0
+if eq get b 0 47
+ret dv_cat o 0 b
+end
+end
+p = dv_cat o 0 a
+na = len a
+if gt na 0
+if ne get a sub na 1 47
+p = dv_byte o p 47
+end
+end
+ret dv_cat o p b
+end
+
+note dv_dirn p: the length of os.path.dirname(p): p up to its last '/', trailing slashes removed
+note unless that prefix is all slashes; 0 when p has no '/'.
+fn dv_dirn p view uchar * to ulong
+i = len p
+while gt i 0 bound 16777217
+if eq get p sub i 1 47
+break
+end
+i = sub i 1
+end
+h = i
+while gt h 0 bound 16777217
+if ne get p sub h 1 47
+ret h
+end
+h = sub h 1
+end
+ret i
+end
+
+note ======== processes
+
+note dv_pkinit pk: start an empty execprog packed list in pk (count 0); the end offset 2.
+fn dv_pkinit pk edit uchar * to ulong
+put pk 0 0
+put pk 1 0
+ret 2
+end
+
+note dv_pkadd pk p a: append argument a to the packed list pk[0, p) (dv_pkinit started it); the
+note new end, or dvnone when a holds a zero byte, the list would pass 64 arguments or 4096 bytes
+note (execprog's limits), pk is too short, or p is dvnone. Argument 0 is the program path.
+fn dv_pkadd pk edit uchar * p ulong a view uchar * to ulong
+if gt p len pk
+ret dvnone
+end
+c = or ulong get pk 0 shl ulong get pk 1 8
+na = len a
+e = add add p 2 na
+if or ge c 64 or gt e 4096 gt e len pk
+ret dvnone
+end
+for j ulong na
+if eq get a j 0
+ret dvnone
+end
+end
+put pk p uchar and na 255
+put pk add p 1 uchar shr na 8
+for i ulong na
+put pk add add p 2 i get a i
+end
+c = add c 1
+put pk 0 uchar and c 255
+put pk 1 uchar shr c 8
+ret e
+end
+
+note dv_exec pk f1 f2: the child side of dv_spawn and dv_spawna, after fork: a new process group
+note whose id is its pid, stdin /dev/null, stdout descriptor f1 and stderr f2, then execprog pk.
+note Exits 126 when f1 or f2 is negative (its file could not be opened) and 127 when execprog fails.
+fn dv_exec pk view uchar * f1 long f2 long to void
+r = setpgid 0 0
+fi = fopen dvnull 0 len dvnull 524288 0
+if or or lt fi 0 lt f1 0 lt f2 0
+exit 126
+end
+r = dupfd int fi 0 0
+r = dupfd int f1 1 0
+r = dupfd int f2 2 0
+r = execprog pk 0 len pk
+exit 127
+end
+
+note dv_spawn pk fo fe: run the packed list pk (exactly as dv_pkadd built it; execprog: no PATH
+note search, empty environment, descriptors >= 3 closed) in a new process group whose id is its
+note pid, stdin /dev/null, stdout to file fo and stderr to file fe (each created or truncated,
+note mode 0644 before umask; /dev/null is allowed). The pid, or the negative fork error. The child
+note exits 126 when it cannot open its files and 127 when execprog fails.
+note When fo and fe are equal stderr shares stdout's file offset.
+fn dv_spawn pk view uchar * fo view uchar * fe view uchar * to long
+pid = fork
+if eq pid 0
+f1 = fopen fo 0 len fo 557633 420
+f2 = f1
+if not dv_eq fo fe
+f2 = fopen fe 0 len fe 557633 420
+end
+dv_exec pk f1 f2
+exit 127
+end
+if lt pid 0
+ret pid
+end
+x = setpgid int pid int pid
+ret pid
+end
+
+note dv_spawna pk fo: dv_spawn with stdout and stderr both appended to file fo (created when
+note missing, mode 0644 before umask; two descriptors opened for append, so neither stream
+note overwrites the other or what fo held).
+fn dv_spawna pk view uchar * fo view uchar * to long
+pid = fork
+if eq pid 0
+f1 = fopen fo 0 len fo 558145 420
+f2 = fopen fo 0 len fo 558145 420
+dv_exec pk f1 f2
+exit 127
+end
+if lt pid 0
+ret pid
+end
+x = setpgid int pid int pid
+ret pid
+end
+
+note dv_spawnio: spawn with already-open stdin/stdout/stderr descriptors. The caller retains
+note ownership of all three descriptors and may close them after this function returns.
+note A negative descriptor or failed dup returns child exit 126. The child owns a process group.
+fn dv_spawnio pk view uchar * fi long fo long fe long to long
+pid = fork
+if eq pid 0
+r = setpgid 0 0
+if or lt fi 0 or lt fo 0 lt fe 0
+exit 126
+end
+if lt dupfd int fi 0 0 0
+exit 126
+end
+if lt dupfd int fo 1 0 0
+exit 126
+end
+if lt dupfd int fe 2 0 0
+exit 126
+end
+r = execprog pk 0 len pk
+exit 127
+end
+if gt pid 0
+r = setpgid int pid int pid
+end
+ret pid
+end
+
+note dv_wstat ws: a four-byte wait status decoded: the exit code 0..255, or 256 + the signal.
+fn dv_wstat ws view uchar 4 to long
+s = ulong and get ws 0 127
+if eq s 0
+ret long get ws 1
+end
+ret long add 256 s
+end
+
+note dv_poll pid: reap child pid if it has finished, without blocking: its dv_wstat status; -1
+note while it runs; or the negative waitpid error (-10 when it is no unreaped child of ours).
+fn dv_poll pid long to long
+ws = new uchar 4 0
+g = waitpid int pid ws 0 4 1
+if eq g 0
+ret neg long 1
+end
+if lt g 0
+ret g
+end
+ret dv_wstat ws
+end
+
+note dv_reap pid: wait for child pid without a deadline; its dv_wstat status or the waitpid error.
+fn dv_reap pid long to long
+ws = new uchar 4 0
+g = waitpid int pid ws 0 4 0
+if lt g 0
+ret g
+end
+ret dv_wstat ws
+end
+
+note dv_wait pid dl: wait at most dl nanoseconds (monotonic clock, polled every 0.2 ms) for child
+note pid: its dv_wstat status; at the deadline its process group and pid get SIGKILL, it is
+note reaped, and the result is -110; or the negative waitpid error.
+fn dv_wait pid long dl ulong to long
+t0 = ulong monons
+while true bound 9223372036854775807
+r = dv_poll pid
+if ne r -1
+ret r
+end
+if ge sub ulong monons t0 dl
+x = dv_killg pid 9
+x = dv_kill pid 9
+x = dv_reap pid
+ret neg long 110
+end
+x = sleepns 200000
+end
+ret neg long 110
+end
+
+note dv_kill pid sig: send signal sig to process pid; dv_killg pid sig: to process group pid.
+note 0 or the negative error; -22 for pid <= 0 (never the caller's group or every process).
+fn dv_kill pid long sig int to long
+if le pid 0
+ret neg long 22
+end
+ret killpid int pid sig
+end
+
+fn dv_killg pid long sig int to long
+if le pid 0
+ret neg long 22
+end
+ret killpid neg int pid sig
+end
+
+note ======== loopback port
+
+note dv_port: a free loopback TCP port: bind 127.0.0.1:0, read the kernel's choice (sockname),
+note close. Never 18091 or 18300 (the live model servers; such a choice is retried, at most 16
+note tries, then -98). Another process may take the port before the caller binds it. The port, or
+note the negative socket error.
+fn dv_port to long
+a = new uchar 16 0
+for it ulong 16
+r = dv_port1 a
+if lt r 0
+ret r
+end
+if and ne r 18091 ne r 18300
+ret r
+end
+end
+ret neg long 98
+end
+
+note dv_port1 a: one bind to 127.0.0.1:0 with the address in a; the port or a negative error.
+fn dv_port1 a edit uchar 16 to long
+for i ulong 16
+put a i 0
+end
+put a 0 2
+put a 4 127
+put a 7 1
+fd = socknew 2 524289 0
+if lt fd 0
+ret fd
+end
+r = bind int fd a 0 16
+k = sockname int fd a 0 16
+x = fclose int fd
+if lt r 0
+ret r
+end
+if lt k 0
+ret k
+end
+if ne k 16
+ret neg long 22
+end
+ret long or shl ulong get a 2 8 ulong get a 3
+end
+
+note ======== JSON (seed/json/json.om); a tape here is a uint array of dvtcap cells (65536 tokens)
+
+note dv_jload pa src tape: read the JSON file pa into src (at most json.om's 983040 bytes) and
+note parse it onto tape (nesting at most 1024); the token count (token 0 is the root value); a
+note negative dv_slurp error (-27 when over the limit); or -(1000 + c) for json.om refusal code c.
+fn dv_jload pa view uchar * src edit uchar * tape edit uint dvtcap to long
+n = dv_slurp pa src
+if lt n 0
+ret n
+end
+if gt ulong n jsmaxn
+ret neg long 27
+end
+r = js_init tape jsmaxn 1024
+if lt r 0
+ret sub r 1000
+end
+t = js_parse src tape ulong n
+if lt t 0
+ret sub t 1000
+end
+ret t
+end
+
+note dv_jkey src tape t key: the value token of the member of object token t whose decoded name is
+note the bytes of key (the last one when repeated, as Python's json), or jsnone (also when t is no
+note object).
+fn dv_jkey src view uchar * tape view uint dvtcap t ulong key view uchar * to ulong
+if ne js_type tape t jsobj
+ret jsnone
+end
+v = jsnone
+k = js_first tape t
+while ne k jsnone bound 16777216
+if js_streq src js_off tape k key
+v = add k 1
+end
+k = js_mnext tape k
+end
+ret v
+end
+
+note dv_jidx tape t i: element i of array token t, or jsnone. dv_jlen tape t: the member or element
+note count of an object or array token t, 0 otherwise. To walk an array use js_first and js_enext.
+fn dv_jidx tape view uint dvtcap t ulong i ulong to ulong
+if ne js_type tape t jsarr
+ret jsnone
+end
+e = js_first tape t
+c = ulong 0
+while ne e jsnone bound 16777216
+if eq c i
+ret e
+end
+c = add c 1
+e = js_enext tape e
+end
+ret jsnone
+end
+
+fn dv_jlen tape view uint dvtcap t ulong to ulong
+ret js_nkids tape t
+end
+
+note dv_jisl src tape t: whether token t is a number that is an integer in the signed 64-bit range.
+note dv_jnum src tape t: that integer (0 when dv_jisl is false).
+fn dv_jisl src view uchar * tape view uint dvtcap t ulong to bool
+if ne js_type tape t jsnum
+ret false
+end
+ret js_isl src js_off tape t
+end
+
+fn dv_jnum src view uchar * tape view uint dvtcap t ulong to long
+if not dv_jisl src tape t
+ret 0
+end
+ret js_tol src js_off tape t
+end
+
+note dv_jstr src tape t ob: the string or key token t decoded into ob[0, ..) (every escape, \uXXXX
+note and surrogate pairs to UTF-8); the byte count; -13 when t is no string or ob is too short; or
+note minus another json.om code.
+fn dv_jstr src view uchar * tape view uint dvtcap t ulong ob edit uchar * to long
+ty = js_type tape t
+if and ne ty jsstr ne ty jskey
+ret neg long jsearg
+end
+ret js_sget src js_off tape t ob
+end
+
+note dv_jsteq src tape t key: whether string or key token t decodes to exactly the bytes of key.
+fn dv_jsteq src view uchar * tape view uint dvtcap t ulong key view uchar * to bool
+ty = js_type tape t
+if and ne ty jsstr ne ty jskey
+ret false
+end
+ret js_streq src js_off tape t key
+end

@@ -1,0 +1,1235 @@
+note receipt.om: the evidence receipt writer, the seeded Omega replacement for omega-node-receipt.py.
+note receipt EV REPO SUB ISSUE SCRIPT [EXECUTION] reads EV/platform.txt, EV/hashes.txt,
+note EV/results.txt, EV/NAME.out and EV/NAME.sha for every PASS check line, and EV/repeat-stress.txt
+note or EV/repeat-idle.txt for a repeat line, then writes the receipt JSON (compact, same keys in the
+note same order as the Python writer) to REPO/evidence/SUB/receipt.<sha256 of the bytes>.json, created
+note exclusively, and prints that path. Refusals (exit 1, message on stderr): a platform.txt without
+note "head H tree T dirty=0", a results line that is FAIL (or "FAIL count N", N not 0), and an
+note existing target. Exit 2: bad usage (fewer than 5 arguments, an argument over 4096 bytes).
+note Exit 1 also for an unreadable file, a file over its buffer, invalid UTF-8 or a JSON writer refusal.
+note Composition (prefix rc, after drv.om):
+note { printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om om/tls/sha2.om seed/node/tests/drv.om seed/node/tests/receipt.om; } | seed/out/omc
+note Buffers: platform.txt 65536 bytes, hashes.txt 262144, results.txt 524288, every NAME.out,
+note NAME.sha and repeat file 983040, the JSON 2097152, every path 4095.
+note Files are read as Python text mode reads them: \r\n and \r become \n, invalid UTF-8 is refused.
+
+const rcav ulong 1024
+const rcpl ulong 33792
+const rcpls ulong 65536
+const rchs ulong 99328
+const rchss ulong 262144
+const rcrs ulong 361472
+const rcrss ulong 524288
+const rcfb ulong 885760
+const rcfbs ulong 983040
+
+text rcusage "usage: receipt EVIDENCE_DIR REPO SUBDIR ISSUE SCRIPT [EXECUTION]\n"
+text rcdirty "refused: evidence run was not on a clean tree\n"
+text rcfailm "refused: results contain FAIL: "
+text rcexist "refused: exists "
+text rcrderr "receipt: cannot read "
+text rcwrerr "receipt: cannot write "
+text rcerrno " (error "
+text rcclose ")\n"
+text rcjserr "receipt: JSON writer refusal "
+text rcnl "\n"
+text rcfplat "platform.txt"
+text rcfhash "hashes.txt"
+text rcfres "results.txt"
+text rcfstr "repeat-stress.txt"
+text rcfidl "repeat-idle.txt"
+text rcsout ".out"
+text rcssha ".sha"
+text rcevid "evidence"
+text rcrcp "receipt."
+text rcjson ".json"
+text rcpass "PASS "
+text rcnrun "NOT_RUN "
+text rcfail "FAIL "
+text rccnt "count "
+text rcfcnt "FAIL count "
+text rcfc0 "FAIL count 0"
+text rcpfx ": "
+text rccomp " compile=0 exit="
+text rcwant " want="
+text rcms " ms="
+text rcbin " bin="
+text rcleak " leaked_tools="
+text rcstdo " stdout="
+text rcrept "-repeat"
+text rcsp " "
+text rcsl "/"
+text rchead "head "
+text rctree " tree "
+text rcdrt " dirty="
+text rchost "host "
+text rccpus "cpus "
+text rctz "+00:00"
+text rcexec "NATIVE Linux AArch64 host CPU (DGX Spark host, no GPU opened)"
+text rcsuf " (compile with seed/out/omc, run under timeout; mutants are one-line sed edits of a disposable copy)"
+text rkissue "issue"
+text rkscom "source_commit"
+text rkstree "source_tree"
+text rkplat "platform"
+text rkcpu "cpu_affinity_mask_hex"
+text rkexec "execution"
+text rkts "timestamp_utc"
+text rkind "independent_review"
+text rknat "native_aarch64"
+text rkexv "executed_verdict"
+text rknotr "not_run"
+text rkspark "spark_gate_judge"
+text rklive "live_hive"
+text rkscr "script"
+text rkhash "hashes"
+text rkchk "checks"
+text rkres "results"
+text rkrep "repeat"
+text rkreps "repeats"
+text rkcase "case"
+text rkcomp "compile_exit"
+text rkwant "expected_exit"
+text rkrun "run_exit"
+text rkwall "wall_ms"
+text rkstdo "stdout"
+text rkbin "binary_sha256"
+text rkverd "verdict"
+text rkleak "leaked_tool_processes_after_run"
+text rkleaks "leaked_tool_processes_after_runs"
+text rkgate "gate"
+text rkruns "runs"
+text rkpassd "passed"
+text rkprl "per_run_lines"
+text rvpass "PASS"
+text rvnrun "NOT_RUN"
+text rvnodep "NOT_DEPLOYED"
+
+note The work array m (1868800 bytes): cells 0..127 (8 bytes each, little endian) hold state, the
+note regions at rcav (arguments, 6 x 4096), rcpl, rchs, rcrs, rcfb hold the files. Cells: 2(i-1) and
+note 2(i-1)+1 the offset and length of argument i; 14 the argument count; 16, 17, 18 the lengths of
+note platform, hashes and results; 20..23 head and tree; 24 NOT_RUN lines; 25 repeat lines; 28 the
+note line mode; 30..39 a check line; 40..47 a repeat line; 50..57 a hashes line.
+fn rc_g m view uchar 1868800 k ulong to ulong
+v = ulong 0
+b = mul k 8
+i = ulong 0
+while lt i 8 bound 9
+v = or v shl ulong get m add b i mul i 8
+i = add i 1
+end
+ret v
+end
+
+fn rc_p m edit uchar 1868800 k ulong v ulong to void
+b = mul k 8
+i = ulong 0
+while lt i 8 bound 9
+put m add b i uchar and shr v mul i 8 255
+i = add i 1
+end
+end
+
+note Python str.isspace for ASCII: 9..13, 28..32.
+fn rc_isws c uchar to bool
+if and ge c 9 le c 13
+ret true
+end
+ret and ge c 28 le c 32
+end
+
+fn rc_isd c uchar to bool
+ret and ge c 48 le c 57
+end
+
+note rc_isw: the ASCII \w class [A-Za-z0-9_].
+fn rc_isw c uchar to bool
+if rc_isd c
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 97 le c 122
+ret true
+end
+ret eq c 95
+end
+
+note rc_cls c k: class 0 \S, 1 \d, 2 \w, 3 [\w-] with every byte >= 128 counted as a word byte
+note (so a non-ASCII result prefix is never missed: a FAIL is refused, a NOT_RUN is recorded).
+fn rc_cls c uchar k ulong to bool
+if eq k 0
+ret not rc_isws c
+end
+if eq k 1
+ret rc_isd c
+end
+if eq k 2
+ret rc_isw c
+end
+if rc_isw c
+ret true
+end
+ret or eq c 45 ge c 128
+end
+
+note rc_run1 m i e k: the end of the longest run (at least 1) of class k in m[i..e); dvnone if none.
+fn rc_run1 m view uchar 1868800 i ulong e ulong k ulong to ulong
+if ge i e
+ret dvnone
+end
+q = i
+while lt q e bound 16777217
+if not rc_cls get m q k
+break
+end
+q = add q 1
+end
+if eq q i
+ret dvnone
+end
+ret q
+end
+
+note rc_lit m i e t: i + len t when t occurs at i inside m[..e); dvnone otherwise (or for i dvnone).
+fn rc_lit m view uchar 1868800 i ulong e ulong t view uchar * to ulong
+if gt i e
+ret dvnone
+end
+if dv_at part m 0 e i t
+ret add i len t
+end
+ret dvnone
+end
+
+note rc_kw m i e t: t at i, not followed by "count " (the (?!count ) of the Python patterns).
+fn rc_kw m view uchar 1868800 i ulong e ulong t view uchar * to bool
+q = rc_lit m i e t
+if eq q dvnone
+ret false
+end
+ret eq rc_lit m q e rccnt dvnone
+end
+
+note rc_kwp m p e t: re.match(r"(?:[\w-]+: )?T(?!count )") on the line m[p..e).
+fn rc_kwp m view uchar 1868800 p ulong e ulong t view uchar * to bool
+q = rc_run1 m p e 3
+if ne q dvnone
+r = rc_lit m q e rcpfx
+if ne r dvnone
+if rc_kw m r e t
+ret true
+end
+end
+end
+ret rc_kw m p e t
+end
+
+fn rc_isfail m view uchar 1868800 p ulong e ulong to bool
+if rc_kwp m p e rcfail
+ret true
+end
+if eq rc_lit m p e rcfcnt dvnone
+ret false
+end
+if eq sub e p 12
+if ne rc_lit m p e rcfc0 dvnone
+ret false
+end
+end
+ret true
+end
+
+note rc_eol m p e: the index of the next \n in m[p..e), or e.
+fn rc_eol m view uchar 1868800 p ulong e ulong to ulong
+q = p
+while lt q e bound 16777217
+if eq get m q 10
+break
+end
+q = add q 1
+end
+ret q
+end
+
+note rc_brk m i e: the length of a str.splitlines break at i (\n \v \f \x1c \x1d \x1e, U+0085,
+note U+2028, U+2029; \r is gone after rc_unl), 0 when there is none.
+fn rc_brk m view uchar 1868800 i ulong e ulong to ulong
+c = get m i
+if and ge c 10 le c 13
+ret 1
+end
+if and ge c 28 le c 30
+ret 1
+end
+if eq c 194
+if lt add i 1 e
+if eq get m add i 1 133
+ret 2
+end
+end
+end
+if eq c 226
+if lt add i 2 e
+if eq get m add i 1 128
+d = get m add i 2
+if or eq d 168 eq d 169
+ret 3
+end
+end
+end
+end
+ret 0
+end
+
+fn rc_sleol m view uchar 1868800 p ulong e ulong to ulong
+q = p
+while lt q e bound 16777217
+if ne rc_brk m q e 0
+break
+end
+q = add q 1
+end
+ret q
+end
+
+note rc_slst m b e k: the start of str.splitlines line k of m[b..e), dvnone when there are fewer lines.
+fn rc_slst m view uchar 1868800 b ulong e ulong k ulong to ulong
+p = b
+j = ulong 0
+while lt j k bound 16777217
+if ge p e
+ret dvnone
+end
+q = rc_sleol m p e
+if ge q e
+ret dvnone
+end
+p = add q rc_brk m q e
+j = add j 1
+end
+if ge p e
+ret dvnone
+end
+ret p
+end
+
+note rc_unl m o n: Python universal newlines in place (\r\n and \r become \n); the new length.
+fn rc_unl m edit uchar 1868800 o ulong n ulong to ulong
+i = o
+j = o
+e = add o n
+while lt i e bound 16777217
+c = get m i
+if eq c 13
+c = uchar 10
+if lt add i 1 e
+if eq get m add i 1 10
+i = add i 1
+end
+end
+end
+put m j c
+j = add j 1
+i = add i 1
+end
+ret sub j o
+end
+
+note rc_u8ok m o n: m[o..o+n) is well-formed UTF-8 (Python's strict decoder).
+fn rc_u8ok m view uchar 1868800 o ulong n ulong to bool
+s = ulong 0
+i = o
+e = add o n
+while lt i e bound 16777217
+c = get m i
+if or ne s 0 ge c 128
+s = js_u8st s c
+if eq s 9
+ret false
+end
+end
+i = add i 1
+end
+ret eq s 0
+end
+
+note rc_join pb m ao an t: os.path.join(m[ao..ao+an), t) into pb; its length or dvnone.
+fn rc_join pb edit uchar 8192 m view uchar 1868800 ao ulong an ulong t view uchar * to ulong
+if gt len t 0
+if eq get t 0 47
+ret dv_cat pb 0 t
+end
+end
+p = dv_cat pb 0 part m ao an
+if gt an 0
+if ne get m sub add ao an 1 47
+p = dv_byte pb p 47
+end
+end
+ret dv_cat pb p t
+end
+
+note rc_jt pb m ai t: os.path.join(argument ai, t) into pb.
+fn rc_jt pb edit uchar 8192 m view uchar 1868800 ai ulong t view uchar * to ulong
+k = mul sub ai 1 2
+ret rc_join pb m rc_g m k rc_g m add k 1 t
+end
+
+note rc_fpath pb m sfx: os.path.join(EV, NAME + sfx) for the check line in cells 30, 31.
+fn rc_fpath pb edit uchar 8192 m view uchar 1868800 sfx view uchar * to ulong
+no = rc_g m 30
+nn = rc_g m 31
+if gt nn 0
+if eq get m no 47
+p = dv_cat pb 0 part m no nn
+ret dv_cat pb p sfx
+end
+end
+ao = rc_g m 0
+an = rc_g m 1
+p = dv_cat pb 0 part m ao an
+if gt an 0
+if ne get m sub add ao an 1 47
+p = dv_byte pb p 47
+end
+end
+p = dv_cat pb p part m rc_g m 30 rc_g m 31
+ret dv_cat pb p sfx
+end
+
+note rc_ld m pb n reg cap: read the file named pb[0..n) into m[reg..reg+cap) as Python text mode
+note does; its length, or minus an errno (-27 too big, -36 bad path, -84 invalid UTF-8).
+fn rc_ld m edit uchar 1868800 pb view uchar 8192 n ulong reg ulong cap ulong to long
+if or eq n 0 gt n 4095
+ret neg long 36
+end
+r = dv_slurp part pb 0 n part m reg cap
+if lt r 0
+ret r
+end
+k = rc_unl m reg ulong r
+if not rc_u8ok m reg k
+ret neg long 84
+end
+ret long k
+end
+
+fn rc_ioerr pb view uchar 8192 n ulong r long to long
+t = new uchar 4400 0
+k = n
+if gt k 4095
+k = 0
+end
+p = dv_cat t 0 rcrderr
+p = dv_cat t p part pb 0 k
+p = dv_cat t p rcerrno
+p = dv_fmtl t p r
+p = dv_cat t p rcclose
+x = dv_err part t 0 p
+ret 1
+end
+
+fn rc_s ob edit uchar * t view uchar * to void
+js_wsbuf ob t 0 len t
+end
+
+fn rc_sm ob edit uchar * m view uchar 1868800 o ulong n ulong to void
+js_wsbuf ob m o n
+end
+
+note rc_num ob m o n: the decimal digits m[o..o+n) as a JSON number, leading zeros dropped (int()).
+fn rc_num ob edit uchar * m view uchar 1868800 o ulong n ulong to void
+a = o
+k = n
+while gt k 1 bound 16777217
+if ne get m a 48
+break
+end
+a = add a 1
+k = sub k 1
+end
+js_wnumb ob m a k
+end
+
+fn rc_args m edit uchar 1868800 to ulong
+c = dv_argc
+if lt c 6
+ret 2
+end
+na = sub c 1
+rc_p m 14 na
+if gt na 6
+na = 6
+end
+i = ulong 1
+while le i na bound 7
+o = add rcav mul sub i 1 4096
+r = argread i m o 4096
+if lt r 0
+ret 2
+end
+rc_p m mul sub i 1 2 o
+rc_p m add mul sub i 1 2 1 ulong r
+i = add i 1
+end
+ret 0
+end
+
+note rc_head m b e: re.search(r"head (\w+) tree (\w+) dirty=(\d+)") in m[b..e): 0 found with
+note dirty "0" (head and tree in cells 20..23), 1 found otherwise, 2 not found.
+fn rc_head m edit uchar 1868800 b ulong e ulong to ulong
+i = b
+while lt i e bound 16777217
+q = rc_lit m i e rchead
+q1 = rc_run1 m q e 2
+q2 = rc_lit m q1 e rctree
+q3 = rc_run1 m q2 e 2
+q4 = rc_lit m q3 e rcdrt
+q5 = rc_run1 m q4 e 1
+if ne q5 dvnone
+rc_p m 20 q
+rc_p m 21 sub q1 q
+rc_p m 22 q2
+rc_p m 23 sub q3 q2
+if eq q5 add q4 1
+if eq get m q4 48
+ret 0
+end
+end
+ret 1
+end
+i = add i 1
+end
+ret 2
+end
+
+note rc_chk m p e: the PASS check pattern of the Python writer on m[p..e); groups in cells 30..39.
+fn rc_chk m edit uchar 1868800 p ulong e ulong to bool
+q = rc_lit m p e rcpass
+a = q
+q = rc_run1 m q e 0
+rc_p m 30 a
+rc_p m 31 sub q a
+q = rc_lit m q e rccomp
+a = q
+q = rc_run1 m q e 1
+rc_p m 32 a
+rc_p m 33 sub q a
+q = rc_lit m q e rcwant
+a = q
+q = rc_run1 m q e 0
+rc_p m 34 a
+rc_p m 35 sub q a
+q = rc_lit m q e rcms
+a = q
+q = rc_run1 m q e 1
+rc_p m 36 a
+rc_p m 37 sub q a
+q = rc_lit m q e rcbin
+q = rc_run1 m q e 2
+rc_p m 39 0
+if eq q dvnone
+ret false
+end
+r = rc_lit m q e rcleak
+s = rc_run1 m r e 1
+t = rc_lit m s e rcstdo
+if ne t dvnone
+rc_p m 38 r
+rc_p m 39 sub s r
+ret true
+end
+ret ne rc_lit m q e rcstdo dvnone
+end
+
+note rc_rep m p e: the PASS repeat pattern (a prefix match); groups in cells 40..47.
+fn rc_rep m edit uchar 1868800 p ulong e ulong to bool
+q = rc_lit m p e rcpass
+a = q
+q = rc_run1 m q e 0
+if eq q dvnone
+ret false
+end
+if lt sub q a 8
+ret false
+end
+if not dv_at part m 0 q sub q 7 rcrept
+ret false
+end
+rc_p m 40 a
+rc_p m 41 sub sub q a 7
+q = rc_lit m q e rcsp
+a = q
+q = rc_run1 m q e 1
+rc_p m 42 a
+rc_p m 43 sub q a
+q = rc_lit m q e rcsl
+a = q
+q = rc_run1 m q e 1
+if eq q dvnone
+ret false
+end
+rc_p m 44 a
+rc_p m 45 sub q a
+rc_p m 47 0
+r = rc_lit m q e rcleak
+s = rc_run1 m r e 1
+if ne s dvnone
+rc_p m 46 r
+rc_p m 47 sub s r
+end
+ret true
+end
+
+note rc_fval ob m pb n strip: the text of the file pb[0..n) as a JSON string (str.strip() when
+note strip); 0, or 1 after the error is printed.
+fn rc_fval ob edit uchar * m edit uchar 1868800 pb view uchar 8192 n ulong strip bool to long
+r = rc_ld m pb n rcfb rcfbs
+if lt r 0
+ret rc_ioerr pb n r
+end
+o = rcfb
+k = ulong r
+if strip
+while gt k 0 bound 16777217
+if not rc_isws get m o
+break
+end
+o = add o 1
+k = sub k 1
+end
+while gt k 0 bound 16777217
+if not rc_isws get m sub add o k 1
+break
+end
+k = sub k 1
+end
+end
+rc_sm ob m o k
+ret 0
+end
+
+fn rc_chkw ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 p ulong e ulong to long
+if not rc_chk m p e
+ret 0
+end
+js_wobj ob
+rc_s ob rkcase
+rc_sm ob m rc_g m 30 rc_g m 31
+rc_s ob rkcomp
+js_wulong ob 0
+rc_s ob rkwant
+rc_sm ob m rc_g m 34 rc_g m 35
+rc_s ob rkrun
+rc_num ob m rc_g m 32 rc_g m 33
+rc_s ob rkwall
+rc_num ob m rc_g m 36 rc_g m 37
+rc_s ob rkstdo
+n = rc_fpath pb m rcsout
+r = rc_fval ob m pb n false
+if ne r 0
+ret r
+end
+rc_s ob rkbin
+n = rc_fpath pb m rcssha
+r = rc_fval ob m pb n true
+if ne r 0
+ret r
+end
+rc_s ob rkverd
+rc_s ob rvpass
+if ne rc_g m 39 0
+rc_s ob rkleak
+rc_num ob m rc_g m 38 rc_g m 39
+end
+js_wobje ob
+ret 0
+end
+
+fn rc_absent r long to bool
+ret or eq r -2 eq r -20
+end
+
+note rc_rlines ob m pb: per_run_lines, the str.splitlines of the last existing of
+note EV/repeat-stress.txt and EV/repeat-idle.txt (both read, in that order, like the Python loop).
+fn rc_rlines ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 to long
+n = rc_jt pb m 1 rcfstr
+r1 = rc_ld m pb n rcfb rcfbs
+if lt r1 0
+if not rc_absent r1
+ret rc_ioerr pb n r1
+end
+end
+n = rc_jt pb m 1 rcfidl
+r2 = rc_ld m pb n rcfb rcfbs
+if lt r2 0
+if not rc_absent r2
+ret rc_ioerr pb n r2
+end
+r2 = r1
+end
+js_warr ob
+if gt r2 0
+e = add rcfb ulong r2
+p = rcfb
+while lt p e bound 16777217
+q = rc_sleol m p e
+rc_sm ob m p sub q p
+if ge q e
+break
+end
+p = add q rc_brk m q e
+end
+end
+js_warre ob
+ret 0
+end
+
+fn rc_repw ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 to long
+js_wobj ob
+rc_s ob rkgate
+rc_sm ob m rc_g m 40 rc_g m 41
+rc_s ob rkruns
+rc_num ob m rc_g m 44 rc_g m 45
+rc_s ob rkpassd
+rc_num ob m rc_g m 42 rc_g m 43
+rc_s ob rkprl
+r = rc_rlines ob m pb
+if ne r 0
+ret r
+end
+if ne rc_g m 47 0
+rc_s ob rkleaks
+rc_num ob m rc_g m 46 rc_g m 47
+end
+js_wobje ob
+ret 0
+end
+
+note rc_line ob m pb p e: one results line m[p..e) in the mode of cell 28: 0 count NOT_RUN,
+note 1 write NOT_RUN, 2 write the line, 3 write a check, 4 count repeats, 5 write a repeat,
+note 6 refuse a FAIL. 0, or the exit status.
+fn rc_line ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 p ulong e ulong to long
+md = rc_g m 28
+if eq md 0
+if rc_kwp m p e rcnrun
+rc_p m 24 add rc_g m 24 1
+end
+ret 0
+end
+if eq md 1
+if rc_kwp m p e rcnrun
+rc_sm ob m p sub e p
+end
+ret 0
+end
+if eq md 2
+rc_sm ob m p sub e p
+ret 0
+end
+if eq md 3
+ret rc_chkw ob m pb p e
+end
+if eq md 4
+if rc_rep m p e
+rc_p m 25 add rc_g m 25 1
+end
+ret 0
+end
+if eq md 5
+if rc_rep m p e
+ret rc_repw ob m pb
+end
+ret 0
+end
+if rc_isfail m p e
+x = dv_err rcfailm
+x = dv_err part m p sub e p
+x = dv_err rcnl
+ret 1
+end
+ret 0
+end
+
+note rc_each ob m pb md: rc_line in mode md over every results line (Python file iteration).
+fn rc_each ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 md ulong to long
+rc_p m 28 md
+p = rcrs
+e = add p rc_g m 18
+while lt p e bound 16777217
+q = rc_eol m p e
+r = rc_line ob m pb p q
+if ne r 0
+ret r
+end
+p = add q 1
+end
+ret 0
+end
+
+note rc_hparse m p e: line.split() of m[p..e) is two parts, the first 64 characters long; parts in
+note cells 50..53.
+fn rc_hparse m edit uchar 1868800 p ulong e ulong to bool
+a = p
+while lt a e bound 16777217
+if not rc_isws get m a
+break
+end
+a = add a 1
+end
+b = rc_run1 m a e 0
+if eq b dvnone
+ret false
+end
+c = b
+while lt c e bound 16777217
+if not rc_isws get m c
+break
+end
+c = add c 1
+end
+d = rc_run1 m c e 0
+if eq d dvnone
+ret false
+end
+f = d
+while lt f e bound 16777217
+if not rc_isws get m f
+ret false
+end
+f = add f 1
+end
+k = ulong 0
+i = a
+while lt i b bound 16777217
+if ne and get m i 192 128
+k = add k 1
+end
+i = add i 1
+end
+if ne k 64
+ret false
+end
+rc_p m 50 a
+rc_p m 51 sub b a
+rc_p m 52 c
+rc_p m 53 sub d c
+ret true
+end
+
+note rc_hkey m: the parsed key (cells 52, 53) equals the key held in cells 56, 57.
+fn rc_hkey m view uchar 1868800 to bool
+n = rc_g m 53
+if ne n rc_g m 57
+ret false
+end
+a = rc_g m 52
+b = rc_g m 56
+i = ulong 0
+while lt i n bound 16777217
+if ne get m add a i get m add b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note rc_hseen m b p: an earlier line of m[b..p) has the key of cells 56, 57.
+fn rc_hseen m edit uchar 1868800 b ulong p ulong to bool
+x = b
+while lt x p bound 16777217
+y = rc_eol m x p
+if rc_hparse m x y
+if rc_hkey m
+ret true
+end
+end
+x = add y 1
+end
+ret false
+end
+
+note rc_hlast m q e: the value of the last line after q with the key of cells 56, 57 into cells 54, 55.
+fn rc_hlast m edit uchar 1868800 q ulong e ulong to void
+x = add q 1
+while lt x e bound 16777217
+y = rc_eol m x e
+if rc_hparse m x y
+if rc_hkey m
+rc_p m 54 rc_g m 50
+rc_p m 55 rc_g m 51
+end
+end
+x = add y 1
+end
+end
+
+note rc_hash ob m: the hashes object, keys in first-seen order with the last value (a Python dict).
+fn rc_hash ob edit uchar * m edit uchar 1868800 to void
+js_wobj ob
+b = rchs
+e = add b rc_g m 17
+p = b
+while lt p e bound 16777217
+q = rc_eol m p e
+if rc_hparse m p q
+rc_p m 56 rc_g m 52
+rc_p m 57 rc_g m 53
+rc_p m 54 rc_g m 50
+rc_p m 55 rc_g m 51
+if not rc_hseen m b p
+rc_hlast m q e
+rc_sm ob m rc_g m 56 rc_g m 57
+rc_sm ob m rc_g m 54 rc_g m 55
+end
+end
+p = add q 1
+end
+js_wobje ob
+end
+
+note rc_civ dn: the civil date of day dn after 1970-01-01 as y * 10000 + month * 100 + day
+note (H. Hinnant's days-to-civil).
+fn rc_civ dn ulong to ulong
+z = add dn 719468
+era = div z 146097
+doe = sub z mul era 146097
+yoe = div sub add sub doe div doe 1460 div doe 36524 div doe 146096 365
+y = add yoe mul era 400
+doy = sub doe sub add mul 365 yoe div yoe 4 div yoe 100
+mp = div add mul 5 doy 2 153
+d = add sub doy div add mul 153 mp 2 5 1
+mo = sub mp 9
+if lt mp 10
+mo = add mp 3
+end
+if le mo 2
+y = add y 1
+end
+ret add add mul y 10000 mul mo 100 d
+end
+
+fn rc_pad t edit uchar * p ulong v ulong w ulong to ulong
+x = v
+i = w
+while gt i 0 bound 21
+i = sub i 1
+put t add p i uchar add 48 rem x 10
+x = div x 10
+end
+ret add p w
+end
+
+note rc_ts ob: datetime.now(timezone.utc).isoformat() of the realtime clock, microseconds truncated.
+fn rc_ts ob edit uchar * to void
+t = new uchar 40 0
+tn = realns
+sc = ulong div tn 1000000000
+us = ulong div rem tn 1000000000 1000
+dt = rc_civ div sc 86400
+sd = rem sc 86400
+p = rc_pad t 0 div dt 10000 4
+p = dv_byte t p 45
+p = rc_pad t p rem div dt 100 100 2
+p = dv_byte t p 45
+p = rc_pad t p rem dt 100 2
+p = dv_byte t p 84
+p = rc_pad t p div sd 3600 2
+p = dv_byte t p 58
+p = rc_pad t p rem div sd 60 60 2
+p = dv_byte t p 58
+p = rc_pad t p rem sd 60 2
+if ne us 0
+p = dv_byte t p 46
+p = rc_pad t p us 6
+end
+p = dv_cat t p rctz
+js_wsbuf ob t 0 p
+end
+
+note rc_plat ob m: platform (line 0 less "host ") and cpu_affinity_mask_hex (line 2 less "cpus ").
+fn rc_plat ob edit uchar * m edit uchar 1868800 to void
+b = rcpl
+e = add b rc_g m 16
+s = rc_slst m b e 0
+q = rc_sleol m s e
+if ne rc_lit m s q rchost dvnone
+s = add s 5
+end
+rc_s ob rkplat
+rc_sm ob m s sub q s
+rc_s ob rkcpu
+s = rc_slst m b e 2
+if eq s dvnone
+rc_sm ob m 0 0
+ret
+end
+q = rc_sleol m s e
+if ne rc_lit m s q rccpus dvnone
+s = add s 5
+end
+rc_sm ob m s sub q s
+end
+
+fn rc_wsbm ob edit uchar * m view uchar 1868800 o ulong n ulong to void
+i = ulong 0
+while lt i n bound 16777217
+js_wsb ob get m add o i
+i = add i 1
+end
+end
+
+fn rc_head1 ob edit uchar * m edit uchar 1868800 to void
+js_wobj ob
+rc_s ob rkissue
+rc_sm ob m rc_g m 6 rc_g m 7
+rc_s ob rkscom
+rc_sm ob m rc_g m 20 rc_g m 21
+rc_s ob rkstree
+rc_sm ob m rc_g m 22 rc_g m 23
+rc_plat ob m
+rc_s ob rkexec
+if gt rc_g m 14 5
+rc_sm ob m rc_g m 10 rc_g m 11
+else
+rc_s ob rcexec
+end
+rc_s ob rkts
+rc_ts ob
+rc_s ob rkind
+js_wbool ob false
+rc_s ob rknat
+if gt rc_g m 24 0
+rc_s ob rvnrun
+else
+rc_s ob rvpass
+end
+rc_s ob rkexv
+rc_s ob rvpass
+end
+
+fn rc_head2 ob edit uchar * m edit uchar 1868800 to void
+rc_s ob rkspark
+rc_s ob rvnrun
+rc_s ob rklive
+rc_s ob rvnodep
+rc_s ob rkscr
+js_wsbeg ob
+rc_wsbm ob m rc_g m 8 rc_g m 9
+if le rc_g m 14 5
+i = ulong 0
+while lt i len rcsuf bound 1024
+js_wsb ob get rcsuf i
+i = add i 1
+end
+end
+js_wsend ob
+rc_s ob rkhash
+rc_hash ob m
+end
+
+note rc_load m pb ai t reg cap: read EV/t; its length, or 1 after the error is printed (cell 19 = 1).
+fn rc_load m edit uchar 1868800 pb edit uchar 8192 t view uchar * reg ulong cap ulong to ulong
+n = rc_jt pb m 1 t
+r = rc_ld m pb n reg cap
+if lt r 0
+x = rc_ioerr pb n r
+rc_p m 19 1
+ret 0
+end
+ret ulong r
+end
+
+fn rc_read ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 to long
+n = rc_load m pb rcfplat rcpl rcpls
+if ne rc_g m 19 0
+ret 1
+end
+rc_p m 16 n
+if ne rc_head m rcpl add rcpl n 0
+x = dv_err rcdirty
+ret 1
+end
+n = rc_load m pb rcfhash rchs rchss
+if ne rc_g m 19 0
+ret 1
+end
+rc_p m 17 n
+n = rc_load m pb rcfres rcrs rcrss
+if ne rc_g m 19 0
+ret 1
+end
+rc_p m 18 n
+ret rc_each ob m pb 6
+end
+
+fn rc_body ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 to long
+r = rc_each ob m pb 0
+rc_head1 ob m
+rc_s ob rknotr
+js_warr ob
+r = rc_each ob m pb 1
+js_warre ob
+rc_head2 ob m
+rc_s ob rkchk
+js_warr ob
+r = rc_each ob m pb 3
+if ne r 0
+ret r
+end
+js_warre ob
+rc_s ob rkres
+js_warr ob
+r = rc_each ob m pb 2
+js_warre ob
+r = rc_each ob m pb 4
+c = rc_g m 25
+if eq c 0
+rc_s ob rkrep
+js_wnull ob
+end
+if eq c 1
+rc_s ob rkrep
+r = rc_each ob m pb 5
+end
+if gt c 1
+rc_s ob rkreps
+js_warr ob
+r = rc_each ob m pb 5
+js_warre ob
+end
+if ne r 0
+ret r
+end
+js_wobje ob
+ret 0
+end
+
+fn rc_hex o edit uchar 128 p ulong d view uchar 32 to ulong
+q = p
+i = ulong 0
+while lt i 32 bound 33
+c = get d i
+h = shr c 4
+l = and c 15
+put o q add h 48
+if gt h 9
+put o q add h 87
+end
+put o add q 1 add l 48
+if gt l 9
+put o add q 1 add l 87
+end
+q = add q 2
+i = add i 1
+end
+ret q
+end
+
+note rc_name fnm ob n: "receipt.<sha256 hex of ob[1040..1040+n)>.json" into fnm; its length.
+fn rc_name fnm edit uchar 128 ob view uchar * n ulong to ulong
+dg = new uchar 32 0
+x = sha2_digest 256 part ob 1040 n dg
+p = dv_cat fnm 0 rcrcp
+p = rc_hex fnm p dg
+ret dv_cat fnm p rcjson
+end
+
+note rc_dir d1 m pb: os.path.join(REPO, "evidence", SUB) into d1; its length, dvnone when too long.
+fn rc_dir d1 edit uchar 8192 m view uchar 1868800 pb edit uchar 8192 to ulong
+k = rc_jt pb m 2 rcevid
+if gt k 4095
+ret dvnone
+end
+a = rc_g m 4
+b = rc_g m 5
+nd = dv_join d1 part pb 0 k part m a b
+if gt nd 4095
+ret dvnone
+end
+ret nd
+end
+
+fn rc_tgt pb edit uchar 8192 d1 view uchar 8192 nd ulong fnm view uchar 128 p ulong to ulong
+ret dv_join pb part d1 0 nd part fnm 0 p
+end
+
+note rc_save ob m pb n: write the n JSON bytes and "\n" to REPO/evidence/SUB/receipt.<sha256>.json.
+fn rc_save ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 n ulong to long
+d1 = new uchar 8192 0
+fnm = new uchar 128 0
+p = rc_name fnm ob n
+nd = rc_dir d1 m pb
+if eq nd dvnone
+ret rc_ioerr pb 0 -36
+end
+r = dv_mkdirp part d1 0 nd
+if lt r 0
+k = dv_cat pb 0 part d1 0 nd
+x = dv_err rcwrerr
+ret rc_ioerr pb k r
+end
+k = rc_tgt pb d1 nd fnm p
+if gt k 4095
+ret rc_ioerr pb 0 -36
+end
+r = dv_wfile part pb 0 k part ob 1040 n 524481
+if eq r -17
+x = dv_err rcexist
+x = dv_err part pb 0 k
+x = dv_err rcnl
+ret 1
+end
+if lt r 0
+x = dv_err rcwrerr
+ret rc_ioerr pb k r
+end
+x = dv_out part pb 0 k
+x = dv_out rcnl
+ret 0
+end
+
+fn rc_fin ob edit uchar * m edit uchar 1868800 pb edit uchar 8192 to long
+t = new uchar 64 0
+n = js_wdone ob
+if lt n 0
+p = dv_cat t 0 rcjserr
+p = dv_fmtl t p n
+p = dv_cat t p rcnl
+x = dv_err part t 0 p
+ret 1
+end
+k = ulong n
+q = add 1040 k
+if ge q len ob
+p = dv_cat t 0 rcjserr
+p = dv_fmtl t p -21
+p = dv_cat t p rcnl
+x = dv_err part t 0 p
+ret 1
+end
+put ob q 10
+ret rc_save ob m pb add k 1
+end
+
+fn main to int
+ob = new uchar 2098192 0
+m = new uchar 1868800 0
+pb = new uchar 8192 0
+if ne rc_args m 0
+x = dv_err rcusage
+ret 2
+end
+x = js_winit ob
+r = rc_read ob m pb
+if ne r 0
+ret int r
+end
+r = rc_body ob m pb
+if ne r 0
+ret int r
+end
+ret int rc_fin ob m pb
+end
