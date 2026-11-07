@@ -2356,6 +2356,16 @@ note 5 RELEASE  3 job id, 4 outcome (the job's outcome; 300 cancelled)
 note 6 REVOKE   3 new generation
 note 7 PAUSE    3 1 paused, 0 resumed
 note 8 CANCEL   3 job id
+note 9 OPER     an operator command the creator committed (DRA-291): 3
+note                command id (never 0, never repeated), 4 op, 5 target,
+note                6..9 arguments, 10 view version it was acknowledged at.
+note                Kept in order in a table of 128 for the creator to replay;
+note                a reader without type 9 refuses it as unknown (24).
+note 10 RESULT    the result an objective ended with (DRA-292): 3 objective
+note                index (< 64), 4 result (1 PASS, else the failure; not 0),
+note                5 model turns performed. At most one per objective; a
+note                restart reports it and never resumes that objective. A
+note                reader without type 10 refuses it as unknown (24).
 note Order: a transition is appended and fdatasync'd before anything acts on
 note it or publishes it. An append whose write or sync fails marks the journal
 note failed and every later append is refused, so nothing is acted on that
@@ -2389,6 +2399,9 @@ global jpath uchar 160
 global jact ulong 1024
 global jjob ulong 2048
 global jstat ulong 8
+global jopr ulong 1024
+global jnop ulong 1
+global jres ulong 128
 
 note Fault injection for the recovery tests: exit 77 at point p when armed.
 fn jn_hit p ulong to void
@@ -2482,6 +2495,13 @@ put jact i 0
 end
 for i ulong 2048
 put jjob i 0
+end
+for i ulong 1024
+put jopr i 0
+end
+put jnop 0 0
+for i ulong 128
+put jres i 0
 end
 for i ulong 8
 put jstat i 0
@@ -2661,7 +2681,56 @@ if eq t 7
 put jstat 2 get r 3
 ret 0
 end
+if eq t 9
+ret jn_oapply r
+end
+if eq t 10
+ret jn_rapply r
+end
 ret 24
+end
+
+note OPER into the operator table: 25 for command id 0, an id already
+note there, or a full table. Entry k: 0 id, 1 op, 2 target, 3..6 arguments,
+note 7 view version.
+fn jn_oapply r view ulong 16 to ulong
+n = get jnop 0
+if or eq get r 3 0 ge n 128
+ret 25
+end
+if ge jn_ofind get r 3 0
+ret 25
+end
+for w ulong 8
+put jopr add mul n 8 w get r add 3 w
+end
+put jnop 0 add n 1
+ret 0
+end
+
+note RESULT into the result table (2 words per objective: result, turns):
+note 25 for an index past 63, result 0, or an objective that has one.
+fn jn_rapply r view ulong 16 to ulong
+i = get r 3
+if or ge i 64 eq get r 4 0
+ret 25
+end
+if ne get jres mul i 2 0
+ret 25
+end
+put jres mul i 2 get r 4
+put jres add mul i 2 1 get r 5
+ret 0
+end
+
+note Operator table index of command id, -1 when absent.
+fn jn_ofind id ulong to long
+for k ulong get jnop 0 bound 128
+if eq get jopr mul k 8 id
+ret long k
+end
+end
+ret neg long 1
 end
 
 fn jn_le64 b view uchar 128 off ulong to ulong
@@ -3124,6 +3193,60 @@ note Action table entry k word i (k < 64, i < 16).
 fn jn_act k ulong i ulong to ulong
 ret get jact add mul and k 63 16 and i 15
 end
+
+note Commit operator command id: OPER (op, target t, arguments a[0..3],
+note view version v) appended and synced. 0, 25 refused, or a write error.
+fn jn_oper id ulong op ulong t ulong a view ulong 4 v ulong to ulong
+r = new ulong 16 0
+put r 0 9
+put r 3 id
+put r 4 op
+put r 5 t
+for i ulong 4
+put r add 6 i get a i
+end
+put r 10 v
+ret jn_append r
+end
+
+note Operator commands in the journal, and word w of the k-th (as jn_oapply).
+fn jn_nops to ulong
+ret get jnop 0
+end
+
+fn jn_opw k ulong w ulong to ulong
+ret get jopr add mul and k 127 8 and w 7
+end
+
+note Commit that objective i ended with result r after t model turns: RESULT
+note appended and synced. 0, 25 refused, or a write error.
+fn jn_result i ulong r ulong t ulong to ulong
+x = new ulong 16 0
+put x 0 10
+put x 3 i
+put x 4 r
+put x 5 t
+ret jn_append x
+end
+
+note The result objective i ended with in the journal (0 none), and its
+note model turns.
+fn jn_res i ulong to ulong
+ret get jres mul and i 63 2
+end
+
+fn jn_rturn i ulong to ulong
+ret get jres add mul and i 63 2 1
+end
+
+note True when job id has a durable START (an operation was granted to it).
+fn jn_started id ulong to bool
+k = jn_jfind id
+if lt k 0
+ret false
+end
+ret ne get jjob add mul ulong k 8 7 0
+end
 note Omega Node proposals, authority and cancellation (DRA-288). Concatenate
 note after transport.om, pool.om, super.om, sched.om and
 note seed/authority/action.om, before one program with fn main.
@@ -3133,7 +3256,9 @@ note assignment seq, the worker slot and incarnation, the input epoch and
 note version it read, and the authority generation it holds. Every effect is
 note one action record of seed/authority/action.om per operation identity:
 note started with actstart, closed with actrecon or actlost. A performed
-note operation is never started again and an UNKNOWN one is never retried.
+note operation is never started again and an UNKNOWN one is never retried;
+note one with no external effect (class 2) whose worker died is closed as
+note not performed, so it may run again.
 note Control page (16384 bytes), cell of worker w at 128*w. Creator writes
 note 0 control seq, 8 cancel target (assignment seq, 0 none), 16 decided
 note proposal seq, 24 verdict, 32 generation at the decision. Worker
@@ -3815,7 +3940,10 @@ e = au_recon sub b 1 au_cell w 88
 end
 
 note Creator, after worker w was reaped: kill the process group of a tool
-note it left running and make its in-flight action UNKNOWN (actlost).
+note it left running and close its in-flight action. One of class 2 (no
+note external effect) is not performed (DONE how 6, as jn_settle closes it
+note at a restart), so its rerunnable job may start again; any other is
+note UNKNOWN (actlost, DONE how 2) and never runs again (DRA-292).
 fn au_lost w ulong to void
 r = new ulong 32 0
 p = au_cell w 112
@@ -3827,11 +3955,19 @@ b = get aujob w
 if eq b 0
 ret
 end
+k = sub b 1
+if eq get aurec add mul k 32 20 2
+if ne au_jdone b 1 w 6 0
+ret
+end
+put aujob w 0
+e = au_recon k 1
+ret
+end
 if ne au_jdone b 0 w 2 0
 ret
 end
 put aujob w 0
-k = sub b 1
 au_load k r
 e = actlost r
 au_save k r
@@ -4804,68 +4940,92 @@ jt_common 1001 2 1 160
 jt_ok eq jt_cnt 7 0 2 166
 end
 
-note Case 16, admission at the limit (P-DRA-14, DRA-396): with admission
-note limit 2 full, a duplicate id is refused as a duplicate (-4) and takes
-note no ticket (170, 171); a new id is refused and takes one (172); once a
-note slot frees, the duplicate asking again does not hold it up: the ticket
-note holder enters (173). Nothing is spawned; the journal is real.
+note Case 16, RESULT (type 10, DRA-292): an objective's result survives a
+note reopen; a second result for it, result 0 and an index past 63 are
+note refused with 25 before any write, so the file holds exactly one RESULT.
 fn jt_c16 to void
 jt_clean
+jt_ok eq jt_open 9 0 0 170
+jt_ok eq jn_result 3 15 4 0 171
+jt_ok eq jn_res 3 15 172
+jt_ok eq jn_result 3 1 2 25 173
+jt_ok eq jn_result 5 0 2 25 174
+jt_ok eq jn_result 64 1 2 25 175
+jt_ok eq jn_res 5 0 176
+jn_close
+jt_ok eq jt_open 9 0 0 177
+jt_ok eq jn_res 3 15 178
+jt_ok eq jn_rturn 3 4 179
+jt_ok eq jn_result 3 15 4 25 180
+jn_close
+jt_ok jt_load 9 181
+jt_ok eq jt_cnt 10 0 1 182
+jt_ok eq jt_cnt 10 3 1 183
+jt_ok eq jt_cnt 1 0 2 184
+end
+
+note Case 17, admission at the limit (P-DRA-14, DRA-396): with admission
+note limit 2 full, a duplicate id is refused as a duplicate (-4) and takes
+note no ticket (185, 186); a new id is refused and takes one (187); once a
+note slot frees, the duplicate asking again does not hold it up: the ticket
+note holder enters (188). Nothing is spawned; the journal is real.
+fn jt_c17 to void
+jt_clean
 c = pool_new 2 2
-jt_ok gt c 0 170
-jt_ok eq sup_init c 0 170
-jt_ok eq sched_new c 2 8 0 170
-jt_ok eq jt_open 1 3000 0 170
+jt_ok gt c 0 185
+jt_ok eq sup_init c 0 185
+jt_ok eq sched_new c 2 8 0 185
+jt_ok eq jt_open 1 3000 0 185
 a = jn_admit 7001 0 0
-jt_ok ge a 0 170
-jt_ok ge jn_admit 7002 0 0 0 170
-jt_ok eq jn_admit 7001 0 0 neg long 4 170
-jt_ok eq sched_stat 30 0 171
-jt_ok eq jn_admit 7003 0 0 neg long 2 172
-jt_ok eq sched_stat 30 1 172
-jt_ok eq sched_cancel ulong a 1 173
-jt_ok eq jn_admit 7001 0 0 neg long 4 173
-jt_ok ge jn_admit 7003 0 0 0 173
+jt_ok ge a 0 185
+jt_ok ge jn_admit 7002 0 0 0 185
+jt_ok eq jn_admit 7001 0 0 neg long 4 185
+jt_ok eq sched_stat 30 0 186
+jt_ok eq jn_admit 7003 0 0 neg long 2 187
+jt_ok eq sched_stat 30 1 187
+jt_ok eq sched_cancel ulong a 1 188
+jt_ok eq jn_admit 7001 0 0 neg long 4 188
+jt_ok ge jn_admit 7003 0 0 0 188
 jn_close
 jt_clean
 end
 
-note Case 17, a full table below the admission limit (P-DRA-14, DRA-396):
+note Case 18, a full table below the admission limit (P-DRA-14, DRA-396):
 note limit 64, 64 jobs admitted and then put in UNKNOWN directly, the state
 note a worker loss leaves a job not safe to rerun in (synthetic occupancy:
 note nothing is spawned, no recovery runs), so no job is active and no slot
 note is free. A new id is refused with a ticket, the journal does not grow
-note and no ADMIT for it reaches the journal (174, 175, the last checked by
+note and no ADMIT for it reaches the journal (189, 190, the last checked by
 note the independent reader). Settling one job frees its slot and the same
-note id is admitted and journaled once (176, 177).
-fn jt_c17 to void
+note id is admitted and journaled once (191, 192).
+fn jt_c18 to void
 jt_clean
 c = pool_new 2 2
-jt_ok gt c 0 174
-jt_ok eq sup_init c 0 174
-jt_ok eq sched_new c 64 64 0 174
-jt_ok eq jt_open 1 3000 0 174
+jt_ok gt c 0 189
+jt_ok eq sup_init c 0 189
+jt_ok eq sched_new c 64 64 0 189
+jt_ok eq jt_open 1 3000 0 189
 for i ulong 64
-jt_ok ge jn_admit add 8001 i 0 0 0 174
+jt_ok ge jn_admit add 8001 i 0 0 0 189
 end
 for j ulong 64
 put sjst j 6
 end
-jt_ok eq sched_count 0 0 0 174
+jt_ok eq sched_count 0 0 0 189
 q = get jseq 0
-jt_ok eq jn_admit 9001 0 0 neg long 2 174
-jt_ok eq sched_stat 30 1 174
-jt_ok eq get jseq 0 q 175
-jt_ok not jn_known 9001 175
-jt_ok jt_load 1 175
-jt_ok eq jt_cnt 2 0 64 175
-jt_ok eq jt_cnt 2 9001 0 175
-jt_ok eq sched_settle 5 0 176
-jt_ok ge jn_admit 9001 0 0 0 176
-jt_ok jn_known 9001 177
-jt_ok jt_load 1 177
-jt_ok eq jt_cnt 2 9001 1 177
-jt_ok eq jt_cnt 2 0 65 177
+jt_ok eq jn_admit 9001 0 0 neg long 2 189
+jt_ok eq sched_stat 30 1 189
+jt_ok eq get jseq 0 q 190
+jt_ok not jn_known 9001 190
+jt_ok jt_load 1 190
+jt_ok eq jt_cnt 2 0 64 190
+jt_ok eq jt_cnt 2 9001 0 190
+jt_ok eq sched_settle 5 0 191
+jt_ok ge jn_admit 9001 0 0 0 191
+jt_ok jn_known 9001 192
+jt_ok jt_load 1 192
+jt_ok eq jt_cnt 2 9001 1 192
+jt_ok eq jt_cnt 2 0 65 192
 jn_close
 jt_clean
 end
@@ -4890,6 +5050,7 @@ jt_c12
 jt_c15
 jt_c16
 jt_c17
+jt_c18
 if ne write 1 jtok 0 len jtok long len jtok
 ret 100
 end
