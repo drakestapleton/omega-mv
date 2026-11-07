@@ -678,8 +678,8 @@ state and a new occupant of its slot are both seen. Across schedulers the
 version carries the incarnation: `sched_incarnate n` (once, after
 `sched_new`, n in 1..2^24 - 1, distinct per scheduler; DRA-398 uses the
 journal fence) makes the version n × 2^40 plus the bumps since. The last
-scoring stays below that, so jobs admitted or declared before the
-incarnation (recovery readmits first) are rescored at the next ranking pass.
+scoring stays below that, so jobs admitted or declared before a late
+incarnation are rescored at the next ranking pass.
 The bump that would reach 2^40 does not carry into the next incarnation's
 range: the version stays and is exhausted, proposals are refused for the
 rest of that scheduler and every ranking pass rescores, since the version no
@@ -730,7 +730,7 @@ bracketed by the same step bounds.
 | exhausted version not checked at use (`sp_proposal`) | 125: the pending proposal still names the stuck version and is used |
 | exhausted version trusted by `sp_rescore` | 126: the second pick does not rescore |
 | an id shared by two ready jobs accepted (`sched_propose` takes the last) | 127 |
-| incarnation marks the values scored (`sched_incarnate` sets the last scoring to the new version) | 128: the values stay 0 and the older unrelated job runs |
+| incarnation marks the values scored (`sched_incarnate` sets the last scoring to the new version) | 128: the values stay 0, so the key falls to the estimate and the unrelated job (no estimate) runs |
 
 ## Proposals, authority and cancellation (DRA-288)
 
