@@ -1518,6 +1518,793 @@ put r 1 4
 end
 ret 0
 end
+note Omega Node durable journal and restart recovery (DRA-289). Concatenate
+note after transport.om, pool.om, super.om, sched.om and
+note seed/authority/action.om, before auth.om, which journals through it.
+note While no journal is open every append succeeds without writing, so the
+note authority layer also runs memory-only.
+note File DIR/journal: a 64-byte header, then 128-byte records. Header words:
+note 0 magic, 1 format version 1, 2 record size 128, 3..6 objective identity,
+note 7 FNV-1a 64 of words 0..6. Record words: 0 type, 1 seq (1, 2, 3, ...
+note with no gap), 2 fence, 3..14 payload, 15 FNV-1a 64 of words 0..14.
+note Types and payloads:
+note 1 OPEN     3 pid, 4 authority generation of the new creator
+note 2 ADMIT    3 job id, 4 dependency topics, 5 flags
+note 3 START    3..6 operation identity, 7 class, 8 job id, 9 attempt, 10 gen
+note 4 DONE     3..6 operation identity, 7 outcome (0 UNKNOWN, 1 not
+note                performed, 2 performed), 8 job id, 9 how (1 reported,
+note                2 worker lost, 3 in flight at restart, 4 key present,
+note                5 key absent, 6 no external effect)
+note 5 RELEASE  3 job id, 4 outcome (the job's outcome; 300 cancelled)
+note 6 REVOKE   3 new generation
+note 7 PAUSE    3 1 paused, 0 resumed
+note 8 CANCEL   3 job id
+note Order: a transition is appended and fdatasync'd before anything acts on
+note it or publishes it. An append whose write or sync fails marks the journal
+note failed and every later append is refused, so nothing is acted on that
+note might not be durable.
+note Fencing: DIR/lock is held with flock(LOCK_EX) for the creator's life. It
+note is opened close-on-exec, so tools never hold it, but forked workers do:
+note a new creator cannot open the journal until every worker of the old one
+note has exited. Each open appends OPEN with the next fence number, and every
+note record carries the fence of the creator that wrote it.
+note Torn tail: a partial last record, or a last full record whose checksum or
+note seq is wrong, was never acknowledged and is cut off. A bad record that is
+note not the last is corruption: the open is refused and nothing is changed.
+note Compatibility: a header whose magic, version, record size or checksum
+note differs is refused (21), never reinterpreted; an objective identity that
+note differs is refused (22).
+text jnjour "/journal"
+text jnlock "/lock"
+text jnkey "/k."
+global jon ulong 1
+global jbad ulong 1
+global jfd int 1
+global jlk int 1
+global jseq ulong 1
+global jsz ulong 1
+global jfence ulong 1
+global jgen ulong 1
+global jcrash ulong 1
+global jdir uchar 128
+global jdn ulong 1
+global jpath uchar 160
+global jact ulong 1024
+global jjob ulong 2048
+global jstat ulong 8
+
+note Fault injection for the recovery tests: exit 77 at point p when armed.
+fn jn_hit p ulong to void
+if and gt p 0 eq get jcrash 0 p
+exit 77
+end
+end
+
+fn jn_sum r view ulong 16 n ulong to ulong
+h = ulong 14695981039346656037
+for i ulong n bound 16
+v = get r i
+for b ulong 8
+h = mul xor h and shr v mul b 8 255 1099511628211
+end
+end
+ret h
+end
+
+fn jn_enc r view ulong 16 b edit uchar 128 to void
+for i ulong 16
+v = get r i
+for k ulong 8
+put b add mul i 8 k uchar and shr v mul k 8 255
+end
+end
+end
+
+fn jn_dec b view uchar 128 r edit ulong 16 to void
+for i ulong 16
+v = ulong 0
+for k ulong 8
+v = or v shl ulong get b add mul i 8 k mul k 8
+end
+put r i v
+end
+end
+
+note DIR plus name k (0 journal, 1 lock, 2 key prefix) in jpath; the length.
+fn jn_name k ulong to ulong
+n = get jdn 0
+for i ulong n bound 128
+put jpath i get jdir i
+end
+m = len jnjour
+if eq k 1
+m = len jnlock
+end
+if eq k 2
+m = len jnkey
+end
+for i ulong m bound 16
+b = get jnkey 0
+if eq k 0
+b = get jnjour i
+end
+if eq k 1
+b = get jnlock i
+end
+if eq k 2
+b = get jnkey i
+end
+put jpath add n i b
+end
+ret add n m
+end
+
+note The key path DIR/k.<v> of an idempotent effect; the length.
+fn jn_keyp v ulong to ulong
+n = jn_name 2
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong sub 20 k bound 20
+put jpath add n i get d add k i
+end
+ret add n sub 20 k
+end
+
+fn jn_reset to void
+for i ulong 1024
+put jact i 0
+end
+for i ulong 2048
+put jjob i 0
+end
+for i ulong 8
+put jstat i 0
+end
+put jon 0 0
+put jbad 0 0
+put jseq 0 0
+put jsz 0 0
+put jfence 0 0
+put jgen 0 0
+end
+
+note Action table, 64 entries of 16 words: 0 used, 1..4 operation identity,
+note 5 class, 6 state (as action.om: 1 ready, 2 in flight, 3 UNKNOWN,
+note 4 performed), 7 attempt, 8 gen, 9 job id. -1 when absent.
+fn jn_afind r view ulong 16 to long
+for k ulong 64
+b = mul k 16
+if ne get jact b 0
+m = true
+for i ulong 4
+if ne get jact add b add 1 i get r add 3 i
+m = false
+end
+end
+if m
+ret long k
+end
+end
+end
+ret neg long 1
+end
+
+note Job table, 256 entries of 8 words: 0 used, 1 job id, 2 deps, 3 flags,
+note 4 released, 5 outcome, 6 cancelled, 7 action entry + 1 of its last START.
+fn jn_jfind id ulong to long
+for k ulong 256
+if and ne get jjob mul k 8 0 eq get jjob add mul k 8 1 id
+ret long k
+end
+end
+ret neg long 1
+end
+
+fn jn_jnew id ulong to long
+for k ulong 256
+b = mul k 8
+if eq get jjob b 0
+for i ulong 8
+put jjob add b i 0
+end
+put jjob b 1
+put jjob add b 1 id
+ret long k
+end
+end
+ret neg long 1
+end
+
+fn jn_maxg g ulong to void
+if gt g get jgen 0
+put jgen 0 g
+end
+end
+
+fn jn_astart r view ulong 16 to ulong
+k = jn_afind r
+if lt k 0
+for i ulong 64
+if eq get jact mul i 16 0
+k = long i
+break
+end
+end
+end
+if lt k 0
+ret 25
+end
+b = mul ulong k 16
+if ne get jact b 0
+if ne get jact add b 6 1
+ret 25
+end
+end
+put jact b 1
+for i ulong 4
+put jact add b add 1 i get r add 3 i
+end
+put jact add b 5 get r 7
+put jact add b 6 2
+put jact add b 7 get r 9
+put jact add b 8 get r 10
+put jact add b 9 get r 8
+jn_maxg get r 10
+j = jn_jfind get r 8
+if ge j 0
+put jjob add mul ulong j 8 7 add ulong k 1
+end
+ret 0
+end
+
+fn jn_adone r view ulong 16 to ulong
+k = jn_afind r
+if lt k 0
+ret 25
+end
+b = mul ulong k 16
+s = get jact add b 6
+if not or eq s 2 eq s 3
+ret 25
+end
+o = get r 7
+if gt o 2
+ret 25
+end
+v = ulong 3
+if eq o 1
+v = 1
+end
+if eq o 2
+v = 4
+end
+put jact add b 6 v
+ret 0
+end
+
+note Apply one durable record to the recovery tables; 0, 24 unknown type or
+note 25 a transition the tables refuse (START of a performed operation, a
+note DONE without a START, a second ADMIT or RELEASE).
+fn jn_apply r view ulong 16 to ulong
+t = get r 0
+if eq t 1
+put jfence 0 get r 2
+jn_maxg get r 4
+ret 0
+end
+if eq t 2
+if ge jn_jfind get r 3 0
+ret 25
+end
+j = jn_jnew get r 3
+if lt j 0
+ret 25
+end
+put jjob add mul ulong j 8 2 get r 4
+put jjob add mul ulong j 8 3 get r 5
+ret 0
+end
+if eq t 3
+ret jn_astart r
+end
+if eq t 4
+ret jn_adone r
+end
+if or eq t 5 eq t 8
+j = jn_jfind get r 3
+if lt j 0
+ret 25
+end
+b = mul ulong j 8
+if eq t 8
+put jjob add b 6 1
+ret 0
+end
+if ne get jjob add b 4 0
+ret 25
+end
+put jjob add b 4 1
+put jjob add b 5 get r 4
+ret 0
+end
+if eq t 6
+jn_maxg get r 3
+ret 0
+end
+if eq t 7
+put jstat 2 get r 3
+ret 0
+end
+ret 24
+end
+
+fn jn_le64 b view uchar 128 off ulong to ulong
+v = ulong 0
+for k ulong 8
+v = or v shl ulong get b add off k mul k 8
+end
+ret v
+end
+
+note Make DIR's entry for a new journal durable.
+fn jn_dsync to ulong
+fd = fopen jdir 0 get jdn 0 540672 0
+if lt fd 0
+ret 27
+end
+r = fsync int fd
+x = fclose int fd
+if ne r 0
+ret 27
+end
+ret 0
+end
+
+note Create the header of an empty journal, or check an existing one.
+fn jn_head fd int obj view ulong 4 to ulong
+st = new uchar 128 0
+h = new ulong 16 0
+b = new uchar 128 0
+if ne fstat fd st 0 128 0
+ret 27
+end
+size = jn_le64 st 48
+if lt size 64
+if ne ftrunc fd 0 0
+ret 27
+end
+put h 0 5786624599
+put h 1 1
+put h 2 128
+for i ulong 4
+put h add 3 i get obj i
+end
+put h 7 jn_sum h 7
+jn_enc h b
+if ne pwrite fd b 0 64 0 64
+ret 27
+end
+if ne fsync fd 0
+ret 27
+end
+put jsz 0 64
+ret jn_dsync
+end
+if ne pread fd b 0 64 0 64
+ret 27
+end
+jn_dec b h
+s = jn_sum h 7
+if or ne get h 0 5786624599 ne get h 7 s
+ret 21
+end
+if or ne get h 1 1 ne get h 2 128
+ret 21
+end
+for i ulong 4
+if ne get h add 3 i get obj i
+ret 22
+end
+end
+put jsz 0 size
+ret 0
+end
+
+fn jn_cut fd int off ulong to ulong
+if ne ftrunc fd long off 0
+ret 27
+end
+if ne fdsync fd 0
+ret 27
+end
+put jstat 0 add get jstat 0 sub get jsz 0 off
+put jsz 0 off
+ret 0
+end
+
+note Record i into r: 0 well formed (checksum and seq), 1 not, 27 I/O.
+fn jn_rd fd int i ulong r edit ulong 16 to ulong
+b = new uchar 128 0
+off = long add 64 mul i 128
+if ne pread fd b 0 128 off 128
+ret 27
+end
+jn_dec b r
+s = jn_sum r 15
+if ne get r 15 s
+ret 1
+end
+if ne get r 1 add i 1
+ret 1
+end
+ret 0
+end
+
+note Read every record into the tables; cut a torn tail; refuse corruption.
+fn jn_scan fd int to ulong
+r = new ulong 16 0
+n = div sub get jsz 0 64 128
+rm = rem sub get jsz 0 64 128
+for i ulong n bound 10000000
+g = jn_rd fd i r
+if eq g 27
+ret 27
+end
+if eq g 1
+if and eq add i 1 n eq rm 0
+ret jn_cut fd add 64 mul i 128
+end
+ret 23
+end
+e = jn_apply r
+if ne e 0
+ret e
+end
+put jseq 0 add i 1
+put jstat 1 add i 1
+end
+if gt rm 0
+ret jn_cut fd add 64 mul n 128
+end
+ret 0
+end
+
+note Append record r (caller sets word 0 and the payload) and make it
+note durable. The tables check and take the transition first (jn_apply
+note changes nothing when it refuses), so a refused transition is never
+note written. 0, a table refusal, 28 write, 29 sync, 30 failed earlier.
+note After 28 or 29 the journal is failed: the transition may or may not be
+note durable, so the caller must not act on it, and nothing more is written.
+note Without an open journal: 0.
+fn jn_append r edit ulong 16 to ulong
+if eq get jon 0 0
+ret 0
+end
+if ne get jbad 0 0
+ret 30
+end
+b = new uchar 128 0
+fd = get jfd 0
+put r 1 add get jseq 0 1
+put r 2 get jfence 0
+put r 15 jn_sum r 15
+e = jn_apply r
+if ne e 0
+ret e
+end
+jn_enc r b
+off = long add 64 mul get jseq 0 128
+if and eq get jcrash 0 6 eq get r 0 4
+x = pwrite fd b 0 60 off
+exit 77
+end
+if ne pwrite fd b 0 128 off 128
+put jbad 0 1
+ret 28
+end
+if ne fdsync fd 0
+put jbad 0 1
+ret 29
+end
+put jseq 0 add get jseq 0 1
+put jsz 0 add get jsz 0 128
+ret 0
+end
+
+fn jn_rec t ulong a ulong b ulong c ulong to ulong
+r = new ulong 16 0
+put r 0 t
+put r 3 a
+put r 4 b
+put r 5 c
+ret jn_append r
+end
+
+note Open (or create) the journal in directory dir (dn bytes) for objective
+note obj, waiting up to ms for the lock. 0, 20 fenced (another creator or
+note its workers hold the lock), 21 incompatible, 22 other objective, 23
+note corrupt, 24/25 refused record, 26 path too long, 27 I/O error.
+fn jn_open dir view uchar 128 dn ulong obj view ulong 4 ms ulong to ulong
+if or eq dn 0 gt dn 100
+ret 26
+end
+jn_reset
+for i ulong dn bound 128
+put jdir i get dir i
+end
+put jdn 0 dn
+r = makedir jdir 0 dn 448
+if and lt r 0 ne r neg long 17
+ret 27
+end
+n = jn_name 1
+lk = fopen jpath 0 n 524354 384
+if lt lk 0
+ret 27
+end
+got = false
+for t ulong add ms 1 bound 100000
+f = flock int lk 6
+if eq f 0
+got = true
+break
+end
+if ne f neg long 11
+break
+end
+x = sleepns 1000000
+end
+if not got
+x = fclose int lk
+ret 20
+end
+put jlk 0 int lk
+e = jn_load obj
+if ne e 0
+x = fclose int lk
+ret e
+end
+ret 0
+end
+
+fn jn_load obj view ulong 4 to ulong
+n = jn_name 0
+fd = fopen jpath 0 n 524354 384
+if lt fd 0
+ret 27
+end
+e = jn_head int fd obj
+if eq e 0
+e = jn_scan int fd
+end
+if ne e 0
+x = fclose int fd
+ret e
+end
+put jfd 0 int fd
+put jon 0 1
+put jfence 0 add get jfence 0 1
+put jgen 0 add get jgen 0 1
+ret jn_rec 1 ulong getpid get jgen 0 0
+end
+
+note Close the journal and release the lock (other holders: forked workers).
+fn jn_close to void
+if ne get jon 0 0
+x = fclose get jfd 0
+x = fclose get jlk 0
+end
+put jon 0 0
+end
+
+note Probe the key of an idempotent operation: 1 present, 0 absent, 2 error.
+fn jn_probe v ulong to ulong
+st = new uchar 128 0
+n = jn_keyp v
+r = stat jpath 0 n st 0 128
+if eq r 0
+ret 1
+end
+if eq r neg long 2
+ret 0
+end
+ret 2
+end
+
+note Close every START left in flight by a crash with a DONE. Class 3 (an
+note idempotent effect whose key DIR/k.<op word 0> is created atomically by
+note the effect) is decided by its key; class 2 (no external effect) was not
+note performed; anything else is UNKNOWN and is never run again.
+fn jn_settle to ulong
+r = new ulong 16 0
+for k ulong 64
+b = mul k 16
+if and ne get jact b 0 eq get jact add b 6 2
+for i ulong 4
+put r add 3 i get jact add b add 1 i
+end
+put r 0 4
+put r 8 get jact add b 9
+cl = get jact add b 5
+put r 7 0
+put r 9 3
+if eq cl 2
+put r 7 1
+put r 9 6
+end
+if eq cl 3
+p = jn_probe get r 3
+if eq p 2
+ret 27
+end
+put r 7 add 1 p
+put r 9 sub 5 p
+end
+e = jn_append r
+if ne e 0
+ret e
+end
+put jstat 3 add get jstat 3 1
+end
+end
+ret 0
+end
+
+note Creator, after jn_open and sched_new: settle in-flight operations, then
+note for each admitted job not yet released: a performed or UNKNOWN last
+note operation releases it with that outcome (it never runs again); a
+note cancelled job is released as cancelled; any other is admitted again.
+note 0 or an error.
+fn jn_recover c long to ulong
+e = jn_settle
+if ne e 0
+ret e
+end
+for k ulong 256
+b = mul k 8
+if and ne get jjob b 0 eq get jjob add b 4 0
+o = ulong 999
+a = get jjob add b 7
+if gt a 0
+s = get jact add mul sub a 1 16 6
+if eq s 4
+o = 2
+end
+if eq s 3
+o = 0
+end
+end
+if and eq o 999 ne get jjob add b 6 0
+o = 300
+end
+if eq o 999
+x = sched_admit get jjob add b 1 get jjob add b 2 get jjob add b 3
+if lt x 0
+ret 31
+end
+put jstat 5 add get jstat 5 1
+else
+e = jn_rec 5 get jjob add b 1 o 0
+if ne e 0
+ret e
+end
+put jstat 4 add get jstat 4 1
+end
+end
+end
+ret 0
+end
+
+note Admit job id durably: ADMIT is appended before sched_admit. -2 at the
+note admission limit, -4 an id already in the journal, -5 the journal
+note refused, else sched_admit's slot.
+fn jn_admit id ulong deps ulong flags ulong to long
+if ge sched_count 1 3 get sclim 0
+ret neg long 2
+end
+if ge jn_jfind id 0
+ret neg long 4
+end
+if ne jn_rec 2 id deps flags 0
+ret neg long 5
+end
+jn_hit 1
+ret sched_admit id deps flags
+end
+
+note Release reviewed job slot j durably: RELEASE before sched_review. -5
+note while its operation's DONE is not yet durable or on refusal.
+fn jn_release j ulong to long
+id = get sjid j
+k = jn_jfind id
+if ge k 0
+a = get jjob add mul ulong k 8 7
+if gt a 0
+if eq get jact add mul sub a 1 16 6 2
+ret neg long 5
+end
+end
+end
+if ne jn_rec 5 id get sjout j 0 0
+ret neg long 5
+end
+jn_hit 5
+ret sched_review j
+end
+
+fn jn_start op view ulong 4 cl ulong id ulong at ulong g ulong to ulong
+r = new ulong 16 0
+put r 0 3
+for i ulong 4
+put r add 3 i get op i
+end
+put r 7 cl
+put r 8 id
+put r 9 at
+put r 10 g
+ret jn_append r
+end
+
+fn jn_done op view ulong 4 o ulong id ulong how ulong to ulong
+r = new ulong 16 0
+put r 0 4
+for i ulong 4
+put r add 3 i get op i
+end
+put r 7 o
+put r 8 id
+put r 9 how
+ret jn_append r
+end
+
+note Getters: whether job id is in the journal, released, its outcome; a
+note recovery counter (0 torn bytes cut, 1 records read, 2 paused, 3 settled,
+note 4 released at recovery, 5 admitted again); the fence; the generation.
+fn jn_known id ulong to bool
+ret ge jn_jfind id 0
+end
+
+fn jn_done_j id ulong to bool
+k = jn_jfind id
+if lt k 0
+ret false
+end
+ret ne get jjob add mul ulong k 8 4 0
+end
+
+fn jn_jout id ulong to ulong
+k = jn_jfind id
+if lt k 0
+ret 999
+end
+ret get jjob add mul ulong k 8 5
+end
+
+fn jn_stat i ulong to ulong
+ret get jstat and i 7
+end
+
+fn jn_fence to ulong
+ret get jfence 0
+end
+
+fn jn_gen to ulong
+ret get jgen 0
+end
+
+note Action table entry k word i (k < 64, i < 16).
+fn jn_act k ulong i ulong to ulong
+ret get jact add mul and k 63 16 and i 15
+end
 note Omega Node proposals, authority and cancellation (DRA-288). Concatenate
 note after transport.om, pool.om, super.om, sched.om and
 note seed/authority/action.om, before one program with fn main.
@@ -1538,8 +2325,9 @@ note the authority generation and 8200 the paused flag.
 note Proposal page: 4096 bytes per worker at 4096*w. Words 0..15: 0 version
 note 1, 1 kind 1, 2 job id, 3 assignment seq, 4 slot, 5 incarnation, 6 input
 note epoch, 7 input version, 8 generation, 9..12 operation identity, 13 class
-note (1 external effect, 2 no external effect), 14 and 15 zero. Bytes
-note 128..4095 hold the running tool's output.
+note (1 external effect, 2 no external effect, 3 idempotent external effect
+note whose completion is visible as a key, see journal.om), 14 and 15 zero.
+note Bytes 128..4095 hold the running tool's output.
 note Verdicts: 0 granted, 1 malformed, 2 not the worker's assignment, 3 other
 note incarnation, 4 stale input, 5 stale authority, 6 cancelled, 7 already
 note performed or UNKNOWN, 8 attempt limit, 9 refused by the action contract.
@@ -1725,7 +2513,7 @@ ret 0
 end
 
 note Worker w: propose the effect of assignment q with operation identity
-note op and class (1 external effect, 2 none). The words go first, then the
+note op and class (1 external effect, 2 none, 3 keyed idempotent). The words go first, then the
 note proposal seq, then an ack to the creator. 0 or the ack refusal.
 fn auth_propose w ulong q ulong op view ulong 4 class ulong to long
 if ge w 64
@@ -2089,7 +2877,7 @@ if or ne au_pw w 0 1 ne au_pw w 1 1
 ret 1
 end
 cl = au_pw w 13
-if or eq cl 0 gt cl 2
+if or eq cl 0 gt cl 3
 ret 1
 end
 if or ne au_pw w 14 0 ne au_pw w 15 0
@@ -2124,16 +2912,49 @@ end
 ret 0
 end
 
+note Creator: decide worker w's pending proposal. A grant is journaled
+note (START, made durable) before the verdict is published; if the journal
+note refuses, the action is closed as not performed and the verdict is 9.
 fn au_decide c long w ulong to void
 q = au_cell w 72
 v = au_valid c w
 if eq v 0
 v = au_commit w
 end
+if eq v 0
+if ne au_jstart w 0
+e = au_recon sub get aujob w 1 1
+put aujob w 0
+v = 9
+end
+end
+if eq v 0
+jn_hit 2
+end
 au_set w 24 v
 au_set w 32 get augen 0
 au_set w 16 q
 r = sup_wake w
+end
+
+fn au_jstart w ulong to ulong
+op = new ulong 4 0
+k = sub get aujob w 1
+for i ulong 4
+put op i au_pw w add 9 i
+end
+b = mul k 32
+ret jn_start op au_pw w 13 au_pw w 2 get aurec add b 2 get aurec add b 4
+end
+
+note Journal DONE for the action in slot b-1 of worker w's job.
+fn au_jdone b ulong o ulong w ulong how ulong to ulong
+op = new ulong 4 0
+k = sub b 1
+for i ulong 4
+put op i get aurec add mul k 32 add 8 i
+end
+ret jn_done op o au_pw w 2 how
 end
 
 note Creator: apply receipt outcome o to action slot k (actrecon). An
@@ -2155,12 +2976,21 @@ au_save k r
 ret e
 end
 
+note Creator: record worker w's report. DONE is made durable before the
+note action record changes; if the journal refuses, the report stays
+note unrecorded and is tried again at the next step.
 fn au_record w ulong to void
-put aured w au_cell w 80
 b = get aujob w
 if eq b 0
+put aured w au_cell w 80
 ret
 end
+jn_hit 3
+if ne au_jdone b au_cell w 88 w 1 0
+ret
+end
+jn_hit 4
+put aured w au_cell w 80
 put aujob w 0
 e = au_recon sub b 1 au_cell w 88
 end
@@ -2176,6 +3006,9 @@ au_set w 112 0
 end
 b = get aujob w
 if eq b 0
+ret
+end
+if ne au_jdone b 0 w 2 0
 ret
 end
 put aujob w 0
@@ -2214,6 +3047,7 @@ note recorded as reported: performed if it had already exited, UNKNOWN if
 note it was killed. Returns the new generation.
 fn auth_revoke c long to ulong
 g = add get augen 0 1
+x = jn_rec 6 g 0 0
 put augen 0 g
 r = mapset get aumap 0 8192 8 g
 n = mapget c 48 8
@@ -2233,6 +3067,7 @@ v = ulong 0
 if on
 v = 1
 end
+x = jn_rec 7 v 0 0
 r = mapset get aumap 0 8200 8 v
 n = mapget c 48 8
 for w ulong n bound 64
@@ -2246,14 +3081,54 @@ end
 note Creator: cancel job j. 1 freed before it started (no effect), 2 its
 note worker was told to cancel and the outcome comes from its report (a
 note pending proposal is refused with 6), 3 already finished, 4 UNKNOWN,
-note -3 no such job.
+note -3 no such job. CANCEL is journaled first; a job freed before it
+note started is also released (outcome 300).
 fn auth_cancel c long j ulong to long
+id = get sjid j
+x = jn_rec 8 id 0 0
 s = sched_cancel j
+if eq s 1
+x = jn_rec 5 id 300 0
+end
 if eq s 2
 w = get sjw j
 au_ctl w sc_cell w 0
 end
 ret s
+end
+
+note Creator, after auth_new, jn_open and sched_new, before any spawn:
+note settle and release from the journal (jn_recover), then install every
+note journaled action into the action records, move the generation past
+note every journaled one and restore the paused flag. 0 or an error.
+fn auth_recover c long to ulong
+e = jn_recover c
+if ne e 0
+ret e
+end
+op = new ulong 4 0
+for k ulong 64
+if ne jn_act k 0 0
+for i ulong 4
+put op i jn_act k add 1 i
+end
+s = au_alloc op jn_act k 5
+if lt s 0
+ret 32
+end
+b = mul ulong s 32
+put aurec add b 1 jn_act k 6
+put aurec add b 2 jn_act k 7
+put aurec add b 4 jn_act k 8
+end
+end
+put augen 0 jn_gen
+r = mapset get aumap 0 8192 8 jn_gen
+if ne jn_stat 2 0
+r = mapset get aumap 0 8200 8 1
+x = sched_pause c true
+end
+ret 0
 end
 
 note Creator: word i (0..31) of the action record for op, or -1 if none.

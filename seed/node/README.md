@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling and authority
+# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority and journal
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -6,7 +6,7 @@ processes. Runtime consumers can share artifact storage and wake only interested
 workers. The existing `seed/agent/agent.om` is the coding-agent consumer to evaluate
 for integration; this change does not replace its model or tool dispatcher.
 
-Four source fragments, concatenated in this order before one program with `fn main`:
+Source fragments, concatenated in this order before one program with `fn main`:
 
 | Fragment | Adds |
 | --- | --- |
@@ -14,10 +14,12 @@ Four source fragments, concatenated in this order before one program with `fn ma
 | `pool.om` | K arenas reused by epoch, reader holds, fail-closed rollover (DRA-286) |
 | `super.om` | forked workers, death detection, reaping, creator-loss detection, bounded stop (DRA-286) |
 | `sched.om` | subscriptions, dependency wake-ups, bounded admission and review, job loss handling (DRA-287) |
+| `seed/authority/action.om` | the existing action records the authority layer commits through |
+| `journal.om` | durable journal of every authority transition, fencing, restart recovery (DRA-289) |
+| `auth.om` | typed proposals, one commit owner, cancellation of real child tools, operator controls (DRA-288) |
 
-The component is not yet connected to the live hive. Authority integration,
-persistent recovery, a dashboard and a real model-backed coding workflow remain
-implementation work (DRA-288 to DRA-292). The
+The component is not yet connected to the live hive. A dashboard and a real
+model-backed coding workflow remain implementation work (DRA-290 to DRA-292). The
 [Linear project](https://linear.app/drake-stapleton/project/omega-node-shared-memory-hive-runtime-37058a1eac4b)
 tracks that integration. This is a component contract, not a whole-system master plan.
 
@@ -365,7 +367,7 @@ below on native Linux AArch64, with real forked workers running real child
 tools (`/bin/sh`). Evidence is in the DRA-288 pull request.
 
 ```sh
-cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/auth.om seed/node/auth-test.om > build/node/auth-composed.om
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/journal.om seed/node/auth.om seed/node/auth-test.om > build/node/auth-composed.om
 cmp build/node/auth-composed.om seed/node/auth-gate.om
 seed/out/omc < seed/node/auth-gate.om > build/node/auth-gate
 chmod +x build/node/auth-gate
@@ -428,8 +430,8 @@ generation and the paused flag.
 | `auth_wtool c w q pk pn class`, `auth_wreport w q outcome` | Worker: run the granted tool (packed argv as `execprog`), report its outcome. |
 | `auth_wwait c w x interval`, `auth_wctl w` | Worker wait on wake, stop, creator loss, control and optionally fd x; the control handler (ack, paused, cancel target). |
 
-Limits: action records live in creator memory only, so a creator restart
-loses them (DRA-289 adds the journal). Between a worker's death and the
+Limits: without an open journal (the DRA-288 gate) action records live in
+creator memory only; `journal.om` makes them durable (DRA-289). Between a worker's death and the
 creator's `auth_step` the tool's group id could in principle be reused; the
 window is one creator step. At most 64 action records are live.
 
@@ -459,3 +461,121 @@ phases:
 | `auth.om`: delete `x = killpid neg int p 9` in `au_lost` (dead worker's tool left running) | 96 |
 | `auth.om`: decide proposals while paused | 120 |
 | `sched.om`: `if ne get scpause 0 0` to `if false` (assign while paused) | 121 |
+
+## Durable journal and restart recovery (DRA-289)
+
+Status: IMPLEMENTED in `journal.om` and `auth.om`, exercised by
+`journal-gate.om` and the controls below on native Linux AArch64: a conductor
+forks real creators (with real workers and `/bin/sh` tools), crashes them at
+every boundary and restarts them. Evidence is in the DRA-289 pull request.
+
+```sh
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/journal.om seed/node/auth.om seed/node/journal-test.om > build/node/journal-composed.om
+cmp build/node/journal-composed.om seed/node/journal-gate.om
+seed/out/omc < seed/node/journal-gate.om > build/node/journal-gate
+chmod +x build/node/journal-gate
+rm -rf build/node/jt
+timeout 120 build/node/journal-gate      # ends "PASS node journal"; uses build/node/jt
+```
+
+### Journal
+
+`DIR/journal` is a 64-byte header and then 128-byte records, little endian
+64-bit words. Header: magic, format version 1, record size 128, the 4-word
+objective identity, FNV-1a 64 of words 0..6. Record: type, seq (1, 2, 3, ...
+without gaps), fence, 12 payload words, FNV-1a 64 of words 0..14.
+
+| Type | Payload | Appended by |
+| --- | --- | --- |
+| 1 OPEN | pid, authority generation | `jn_open`, every creator incarnation |
+| 2 ADMIT | job id, dependency topics, flags | `jn_admit`, before `sched_admit` |
+| 3 START | operation identity, class, job id, attempt, generation | `au_decide`, after `actstart`, before the grant is published |
+| 4 DONE | operation identity, outcome, job id, how (1 reported, 2 worker lost, 3 in flight at restart, 4 key present, 5 key absent, 6 no external effect) | `au_record`, `au_lost`, recovery |
+| 5 RELEASE | job id, outcome (300 cancelled) | `jn_release`, before `sched_review`; `auth_cancel` |
+| 6 REVOKE | new generation | `auth_revoke` |
+| 7 PAUSE | 1 paused, 0 resumed | `auth_pause` |
+| 8 CANCEL | job id | `auth_cancel`, before the worker is told |
+
+Order: the in-memory tables first check the transition (a refused one is
+never written), then the record is written with `pwrite` and made durable
+with `fdatasync`, and only then does anything act on it or publish it: a
+grant reaches the worker after its START is durable, a job is reviewed after
+its RELEASE is durable, and a job is not released while its operation's DONE
+is not durable. A write or sync failure marks the journal failed and every
+later append is refused (30), so the creator never acts on a transition that
+might not be durable. A new journal's directory entry is synced
+(`jn_dsync`).
+
+Fencing: `DIR/lock` is held with `flock(LOCK_EX)` for the creator's life. It
+is opened close-on-exec, so tools never inherit it; forked workers do, so a
+new creator cannot open the journal until every worker of the old one has
+exited (refused with 20 after the wait). Each open appends OPEN with the next
+fence number and every record carries the fence of the creator that wrote it,
+so each incarnation's records are attributable. The pid lock in
+`seed/authority/lock.om` was not reused: it reclaims stale locks by pid, which
+races, and has a fixed path.
+
+Torn tail: a partial last record, or a last full record whose checksum or seq
+is wrong, was never acknowledged and is cut off (`ftruncate` plus sync). A bad
+record before the last one is corruption: the open is refused (23) and the
+file is not changed.
+
+Compatibility: a header whose magic, version, record size or checksum differs
+is refused (21), never reinterpreted; a different objective identity is
+refused (22). A future format must change the version.
+
+### Recovery
+
+`jn_open` reads the journal into the recovery tables; `auth_recover` (after
+`sched_new` and `auth_new`, before spawning workers) settles and readmits:
+- A START with no DONE was in flight at the crash. Class 3 (an idempotent effect whose key `DIR/k.<op>` the effect itself creates atomically, for example with `ln`) is decided by the key: present is performed, absent is not performed and the job runs again. Class 2 (no external effect) is not performed. Class 1 is UNKNOWN and is never run again. Each gets a DONE.
+- An admitted job not yet released: a performed or UNKNOWN last operation releases it with that outcome; a cancelled job is released as cancelled; any other job is admitted again with its dependency topics.
+- The action records (state, attempt, generation), the authority generation (above every journaled one) and the pause state are restored, so a performed or UNKNOWN operation is refused if proposed again and a paused objective stays paused.
+- A restart that finds nothing in flight adds only its OPEN.
+
+A crash between START and publishing the grant leaves a class 1 operation
+UNKNOWN even though its tool never ran. That is the pessimistic side: an
+effect is never repeated without proof that it did not happen.
+
+| Function | Contract |
+| --- | --- |
+| `jn_open dir dn obj ms`, `jn_close` | Creator: take the lock (wait up to ms), create or check the header, cut a torn tail, read every record, append OPEN; release. |
+| `auth_recover c` | Settle, release or readmit, restore authority and pause. |
+| `jn_admit id deps flags`, `jn_release j` | Durable admission and release around `sched_admit` and `sched_review`. |
+| `jn_known id`, `jn_done_j id`, `jn_jout id`, `jn_stat i`, `jn_fence`, `jn_gen`, `jn_act k i` | Recovered state. |
+
+Limits: no checkpoint or compaction yet; recovery replays the whole journal
+and the tables hold 64 operations and 256 jobs. Inputs published to the pool
+are not journaled, so a recovered job reads whatever its dependency topics
+hold after the restart. The key of a class 3 effect must be created by the
+effect itself, atomically and last.
+
+### Acceptance and controls
+
+The gate runs, each in a fresh `build/node/jt`, and checks with its own
+reader (header, checksums, contiguous seq, fences, START/DONE pairing, one
+RELEASE per job, sink lines, keys):
+- 0 baseline: a class 1 and a class 3 job each performed once.
+- 1 crash after ADMIT: the admitted job is readmitted, the other admitted; both performed once.
+- 2 crash after START, before the grant: class 1 UNKNOWN, its tool never ran; two more restarts add only OPEN records.
+- 3 the same for class 3: key absent, run again (attempt 2), performed once.
+- 4, 5 crash after the tool reported, before DONE: class 1 UNKNOWN with the effect once; class 3 performed by its key.
+- 6, 7 crash after DONE, and after RELEASE: released once, nothing run again.
+- 8 crash in the middle of writing DONE (60 bytes on disk): the tail is cut, UNKNOWN.
+- 9, 10 SIGKILL of the creator while a slow tool runs: the workers kill it; class 3 runs again and performs once, class 1 is UNKNOWN with no effect.
+- 11 a second creator while the first runs is fenced (20) and changes nothing.
+- 12 another objective (22), another format version (21), a corrupt middle record (23): refused, journal unchanged.
+- 15 a paused objective stays paused across a restart until resumed.
+
+| Change | Expected exit |
+| --- | --- |
+| `journal.om`: cut any bad record as a torn tail (`if true`) | 157 |
+| `journal.om`: in `jn_settle`, class 1 in flight becomes not performed (replayed) | 33 |
+| `journal.om`: in `jn_settle`, class 3 not probed | 43 |
+| `journal.om`: `jn_probe` always reports the key absent | 66 |
+| `auth.om`: the reported outcome is not journaled | 10 |
+| `journal.om`: no `flock` (no fencing) | 141 |
+| `journal.om`: `jn_recover` skips `jn_settle` (the restart never releases the job) | 35 |
+| `journal.om`: objective check removed | 151 |
+| `journal.om`: version and record-size check removed | 154 |
+| `auth.om`: `auth_recover` does not restore pause | 161 |

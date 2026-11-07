@@ -18,8 +18,9 @@ note the authority generation and 8200 the paused flag.
 note Proposal page: 4096 bytes per worker at 4096*w. Words 0..15: 0 version
 note 1, 1 kind 1, 2 job id, 3 assignment seq, 4 slot, 5 incarnation, 6 input
 note epoch, 7 input version, 8 generation, 9..12 operation identity, 13 class
-note (1 external effect, 2 no external effect), 14 and 15 zero. Bytes
-note 128..4095 hold the running tool's output.
+note (1 external effect, 2 no external effect, 3 idempotent external effect
+note whose completion is visible as a key, see journal.om), 14 and 15 zero.
+note Bytes 128..4095 hold the running tool's output.
 note Verdicts: 0 granted, 1 malformed, 2 not the worker's assignment, 3 other
 note incarnation, 4 stale input, 5 stale authority, 6 cancelled, 7 already
 note performed or UNKNOWN, 8 attempt limit, 9 refused by the action contract.
@@ -205,7 +206,7 @@ ret 0
 end
 
 note Worker w: propose the effect of assignment q with operation identity
-note op and class (1 external effect, 2 none). The words go first, then the
+note op and class (1 external effect, 2 none, 3 keyed idempotent). The words go first, then the
 note proposal seq, then an ack to the creator. 0 or the ack refusal.
 fn auth_propose w ulong q ulong op view ulong 4 class ulong to long
 if ge w 64
@@ -569,7 +570,7 @@ if or ne au_pw w 0 1 ne au_pw w 1 1
 ret 1
 end
 cl = au_pw w 13
-if or eq cl 0 gt cl 2
+if or eq cl 0 gt cl 3
 ret 1
 end
 if or ne au_pw w 14 0 ne au_pw w 15 0
@@ -604,16 +605,49 @@ end
 ret 0
 end
 
+note Creator: decide worker w's pending proposal. A grant is journaled
+note (START, made durable) before the verdict is published; if the journal
+note refuses, the action is closed as not performed and the verdict is 9.
 fn au_decide c long w ulong to void
 q = au_cell w 72
 v = au_valid c w
 if eq v 0
 v = au_commit w
 end
+if eq v 0
+if ne au_jstart w 0
+e = au_recon sub get aujob w 1 1
+put aujob w 0
+v = 9
+end
+end
+if eq v 0
+jn_hit 2
+end
 au_set w 24 v
 au_set w 32 get augen 0
 au_set w 16 q
 r = sup_wake w
+end
+
+fn au_jstart w ulong to ulong
+op = new ulong 4 0
+k = sub get aujob w 1
+for i ulong 4
+put op i au_pw w add 9 i
+end
+b = mul k 32
+ret jn_start op au_pw w 13 au_pw w 2 get aurec add b 2 get aurec add b 4
+end
+
+note Journal DONE for the action in slot b-1 of worker w's job.
+fn au_jdone b ulong o ulong w ulong how ulong to ulong
+op = new ulong 4 0
+k = sub b 1
+for i ulong 4
+put op i get aurec add mul k 32 add 8 i
+end
+ret jn_done op o au_pw w 2 how
 end
 
 note Creator: apply receipt outcome o to action slot k (actrecon). An
@@ -635,12 +669,21 @@ au_save k r
 ret e
 end
 
+note Creator: record worker w's report. DONE is made durable before the
+note action record changes; if the journal refuses, the report stays
+note unrecorded and is tried again at the next step.
 fn au_record w ulong to void
-put aured w au_cell w 80
 b = get aujob w
 if eq b 0
+put aured w au_cell w 80
 ret
 end
+jn_hit 3
+if ne au_jdone b au_cell w 88 w 1 0
+ret
+end
+jn_hit 4
+put aured w au_cell w 80
 put aujob w 0
 e = au_recon sub b 1 au_cell w 88
 end
@@ -656,6 +699,9 @@ au_set w 112 0
 end
 b = get aujob w
 if eq b 0
+ret
+end
+if ne au_jdone b 0 w 2 0
 ret
 end
 put aujob w 0
@@ -694,6 +740,7 @@ note recorded as reported: performed if it had already exited, UNKNOWN if
 note it was killed. Returns the new generation.
 fn auth_revoke c long to ulong
 g = add get augen 0 1
+x = jn_rec 6 g 0 0
 put augen 0 g
 r = mapset get aumap 0 8192 8 g
 n = mapget c 48 8
@@ -713,6 +760,7 @@ v = ulong 0
 if on
 v = 1
 end
+x = jn_rec 7 v 0 0
 r = mapset get aumap 0 8200 8 v
 n = mapget c 48 8
 for w ulong n bound 64
@@ -726,14 +774,54 @@ end
 note Creator: cancel job j. 1 freed before it started (no effect), 2 its
 note worker was told to cancel and the outcome comes from its report (a
 note pending proposal is refused with 6), 3 already finished, 4 UNKNOWN,
-note -3 no such job.
+note -3 no such job. CANCEL is journaled first; a job freed before it
+note started is also released (outcome 300).
 fn auth_cancel c long j ulong to long
+id = get sjid j
+x = jn_rec 8 id 0 0
 s = sched_cancel j
+if eq s 1
+x = jn_rec 5 id 300 0
+end
 if eq s 2
 w = get sjw j
 au_ctl w sc_cell w 0
 end
 ret s
+end
+
+note Creator, after auth_new, jn_open and sched_new, before any spawn:
+note settle and release from the journal (jn_recover), then install every
+note journaled action into the action records, move the generation past
+note every journaled one and restore the paused flag. 0 or an error.
+fn auth_recover c long to ulong
+e = jn_recover c
+if ne e 0
+ret e
+end
+op = new ulong 4 0
+for k ulong 64
+if ne jn_act k 0 0
+for i ulong 4
+put op i jn_act k add 1 i
+end
+s = au_alloc op jn_act k 5
+if lt s 0
+ret 32
+end
+b = mul ulong s 32
+put aurec add b 1 jn_act k 6
+put aurec add b 2 jn_act k 7
+put aurec add b 4 jn_act k 8
+end
+end
+put augen 0 jn_gen
+r = mapset get aumap 0 8192 8 jn_gen
+if ne jn_stat 2 0
+r = mapset get aumap 0 8200 8 1
+x = sched_pause c true
+end
+ret 0
 end
 
 note Creator: word i (0..31) of the action record for op, or -1 if none.

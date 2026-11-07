@@ -1,0 +1,852 @@
+note Concatenate after transport.om, pool.om, super.om, sched.om,
+note seed/authority/action.om, journal.om and auth.om. CPU-only acceptance of
+note DRA-289: a conductor forks a creator, makes it crash at each durable and
+note effect boundary (exit 77 at jcrash points 1..6, or SIGKILL while a tool
+note runs), restarts it, and then checks the journal, the effects and the
+note recovered outcomes with its own reader (jt_load, not jn_scan).
+note Journal directory build/node/jt, relative to the repository root.
+note Job id kind*1000 + op. Tools (/bin/sh -c), all writing under the
+note directory: kind 1 appends "<op>" to sink; kind 2 sleeps 1 s first;
+note kind 3 is idempotent: it creates key k.<op> with ln (never replaces)
+note and appends "<op>" only when it did; kind 4 appends "s<op>", sleeps
+note 1 s, then acts as kind 3. Kinds 1 and 2 are class 1 (external effect),
+note kinds 3 and 4 class 3 (idempotent, decided by the key at recovery).
+text jtsh "/bin/sh"
+text jtdc "-c"
+text jtt2 "echo "
+text jtt3 " >> build/node/jt/sink"
+text jtt4 "sleep 1; "
+text jtt5 " > build/node/jt/t."
+text jtt6 " && ln build/node/jt/t."
+text jtt7 " build/node/jt/k."
+text jtt8 " && echo "
+text jtt9 "; rm -f build/node/jt/t."
+text jtts "echo s"
+text jtdir "build/node/jt"
+text jtfj "build/node/jt/journal"
+text jtfl "build/node/jt/lock"
+text jtfs "build/node/jt/sink"
+text jtfk "build/node/jt/k."
+text jtft "build/node/jt/t."
+text jtok "PASS node journal\n"
+global jtm long 1
+global jtr ulong 4096
+global jtn ulong 1
+global jtb uchar 65536
+global jtp uchar 64
+
+fn jt_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn jt_tlen k ulong to ulong
+if eq k 0
+ret len jtsh
+end
+if eq k 1
+ret len jtdc
+end
+if eq k 2
+ret len jtt2
+end
+if eq k 3
+ret len jtt3
+end
+if eq k 4
+ret len jtt4
+end
+if eq k 5
+ret len jtt5
+end
+if eq k 6
+ret len jtt6
+end
+if eq k 7
+ret len jtt7
+end
+if eq k 8
+ret len jtt8
+end
+if eq k 9
+ret len jtt9
+end
+ret len jtts
+end
+
+fn jt_tb k ulong i ulong to uchar
+if eq k 0
+ret get jtsh i
+end
+if eq k 1
+ret get jtdc i
+end
+if eq k 2
+ret get jtt2 i
+end
+if eq k 3
+ret get jtt3 i
+end
+if eq k 4
+ret get jtt4 i
+end
+if eq k 5
+ret get jtt5 i
+end
+if eq k 6
+ret get jtt6 i
+end
+if eq k 7
+ret get jtt7 i
+end
+if eq k 8
+ret get jtt8 i
+end
+if eq k 9
+ret get jtt9 i
+end
+ret get jtts i
+end
+
+note Append text k to s at n; the new length.
+fn jt_add s edit uchar 1024 n ulong k ulong to ulong
+m = jt_tlen k
+for i ulong m bound 64
+put s add n i jt_tb k i
+end
+ret add n m
+end
+
+note Append the decimal v to s at n; the new length.
+fn jt_num s edit uchar 1024 n ulong v ulong to ulong
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong sub 20 k bound 20
+put s add n i get d add k i
+end
+ret add n sub 20 k
+end
+
+note The idempotent part: echo N > t.N && ln t.N k.N && echo N >> sink; rm -f t.N
+fn jt_keyed s edit uchar 1024 n ulong op ulong to ulong
+m = jt_add s n 2
+m = jt_num s m op
+m = jt_add s m 5
+m = jt_num s m op
+m = jt_add s m 6
+m = jt_num s m op
+m = jt_add s m 7
+m = jt_num s m op
+m = jt_add s m 8
+m = jt_num s m op
+m = jt_add s m 3
+m = jt_add s m 9
+ret jt_num s m op
+end
+
+fn jt_script kind ulong op ulong s edit uchar 1024 to ulong
+n = ulong 0
+if eq kind 4
+n = jt_add s n 10
+n = jt_num s n op
+n = jt_add s n 3
+put s n 59
+put s add n 1 32
+n = add n 2
+end
+if or eq kind 2 eq kind 4
+n = jt_add s n 4
+end
+if ge kind 3
+ret jt_keyed s n op
+end
+n = jt_add s n 2
+n = jt_num s n op
+ret jt_add s n 3
+end
+
+note Packed argv: /bin/sh -c <script>.
+fn jt_pack kind ulong op ulong pk edit uchar 4096 to ulong
+s = new uchar 1024 0
+m = jt_script kind op s
+put pk 0 3
+put pk 1 0
+w = ulong 2
+for a ulong 2
+k = jt_tlen a
+put pk w uchar k
+put pk add w 1 0
+for i ulong k bound 16
+put pk add add w 2 i jt_tb a i
+end
+w = add add w 2 k
+end
+put pk w uchar and m 255
+put pk add w 1 uchar shr m 8
+for i ulong m bound 1024
+put pk add add w 2 i get s i
+end
+ret add add w 2 m
+end
+
+fn jt_job c long w ulong q ulong to void
+op = new ulong 4 0
+pk = new uchar 4096 0
+out = new uchar 4096 0
+id = sc_cell w 8
+kind = div id 1000
+cl = ulong 1
+if ge kind 3
+cl = 3
+end
+put op 0 rem id 1000
+put op 1 7
+put op 2 1
+put op 3 1
+r = auth_propose w q op cl
+v = auth_wdecide c w q 30000000000
+if ne v 0
+r = sched_wdone w q add 16 ulong v out 0
+ret
+end
+pn = jt_pack kind rem id 1000 pk
+o = auth_wtool c w q pk pn cl
+r = auth_wreport w q ulong o
+r = sched_wdone w q ulong o out 0
+end
+
+fn jt_worker c long w ulong to int
+for it ulong 1000000000
+q = sched_wjob w
+if gt q 0
+jt_job c w q
+end
+r = auth_wwait c w neg int 1 1000000000
+if or eq r 2 eq r 3
+ret 0
+end
+if eq r 4
+t = auth_wctl w
+end
+if lt r 0
+ret 45
+end
+end
+ret 46
+end
+
+note Job set js: its i-th job id, 0 past the end.
+fn jt_jobid js ulong i ulong to ulong
+if eq js 1
+if eq i 0
+ret 1001
+end
+end
+if eq js 2
+if eq i 0
+ret 3002
+end
+end
+if eq js 3
+if eq i 0
+ret 1001
+end
+if eq i 1
+ret 3002
+end
+end
+if eq js 4
+if eq i 0
+ret 4003
+end
+end
+if eq js 5
+if eq i 0
+ret 2004
+end
+end
+ret 0
+end
+
+fn jt_open ob ulong ms ulong to ulong
+d = new uchar 128 0
+o = new ulong 4 0
+n = len jtdir
+for i ulong n bound 128
+put d i get jtdir i
+end
+put o 0 ob
+put o 1 7
+put o 2 7
+put o 3 7
+ret jn_open d n o ms
+end
+
+note Creator steps until every job of set js is released, up to 20 s.
+fn jt_drive c long js ulong to int
+dl = add ulong monons 20000000000
+for t ulong 100000000
+r = sched_step c 5000000
+k = auth_step c
+for j ulong 64
+if eq get sjst j 4
+x = jn_release j
+end
+end
+all = true
+for i ulong 8
+id = jt_jobid js i
+if and gt id 0 not jn_done_j id
+all = false
+end
+end
+if all
+ret 0
+end
+if ge ulong monons dl
+ret 62
+end
+end
+ret 62
+end
+
+note Creator process: open the journal (lock wait 3 s, 100 ms when fl bit 4),
+note recover, spawn two workers, admit the jobs of set js the journal does
+note not know, run to completion. fl bit 1: pause, then exit cleanly. fl bit
+note 2: check that the journaled pause survived the restart, then resume.
+note Exit 77 at crash point cp; journal refusals exit with their code.
+fn jt_run cp ulong js ulong ob ulong fl ulong to int
+c = pool_new 4 2
+jt_ok gt c 0 50
+jt_ok eq sup_init c 0 51
+jt_ok eq sched_new c 8 8 0 52
+jt_ok eq auth_new c 0 53
+ms = ulong 3000
+if ne and fl 4 0
+ms = 100
+end
+e = jt_open ob ms
+if ne e 0
+ret int e
+end
+put jcrash 0 cp
+e = auth_recover c
+if ne e 0
+ret int add 33 e
+end
+for w ulong 2
+p = auth_spawn c w
+if eq p 0
+exit jt_worker c w
+end
+jt_ok gt p 0 54
+end
+for i ulong 8
+id = jt_jobid js i
+if and gt id 0 not jn_known id
+jt_ok ge jn_admit id 0 0 0 55
+end
+end
+if ne and fl 1 0
+k = auth_pause c true
+jn_close
+ret 0
+end
+if ne and fl 2 0
+for t ulong 60
+r = sched_step c 5000000
+k = auth_step c
+end
+jt_ok eq sched_count 3 3 0 61
+jt_ok eq get scpause 0 1 61
+k = auth_pause c false
+end
+e = ulong jt_drive c js
+if ne e 0
+ret int e
+end
+r = sched_stop c 2000000000
+sup_closeall
+jn_close
+ret 0
+end
+
+fn jt_fork cp ulong js ulong ob ulong fl ulong to long
+p = fork
+if eq p 0
+exit jt_run cp js ob fl
+end
+ret p
+end
+
+fn jt_reap p long to ulong
+ws = new uchar 4 0
+g = waitpid int p ws 0 4 0
+if le g 0
+ret 999
+end
+if ne and get ws 0 127 0
+ret add 128 ulong and get ws 0 127
+end
+ret ulong get ws 1
+end
+
+fn jt_runc cp ulong js ulong ob ulong fl ulong to ulong
+ret jt_reap jt_fork cp js ob fl
+end
+
+note Path prefix k (0 journal, 1 lock, 2 sink, 3 key prefix, 4 temp
+note prefix), with the decimal v appended for 3 and 4, in jtp; the length.
+fn jt_path k ulong v ulong to ulong
+s = new uchar 1024 0
+n = ulong 0
+if eq k 0
+n = len jtfj
+for i ulong n bound 64
+put s i get jtfj i
+end
+end
+if eq k 1
+n = len jtfl
+for i ulong n bound 64
+put s i get jtfl i
+end
+end
+if eq k 2
+n = len jtfs
+for i ulong n bound 64
+put s i get jtfs i
+end
+end
+if eq k 3
+n = len jtfk
+for i ulong n bound 64
+put s i get jtfk i
+end
+end
+if eq k 4
+n = len jtft
+for i ulong n bound 64
+put s i get jtft i
+end
+end
+if ge k 3
+n = jt_num s n v
+end
+for i ulong n bound 64
+put jtp i get s i
+end
+ret n
+end
+
+fn jt_clean to void
+for k ulong 3
+n = jt_path k 0
+r = unlink jtp 0 n
+end
+for v ulong 5
+for k ulong 2
+n = jt_path add k 3 v
+r = unlink jtp 0 n
+end
+end
+end
+
+fn jt_exists k ulong v ulong to bool
+st = new uchar 128 0
+n = jt_path k v
+ret eq stat jtp 0 n st 0 128 0
+end
+
+note Read file k (0 journal, 2 sink) into jtb; the byte count.
+fn jt_slurp k ulong to ulong
+n = jt_path k 0
+fd = fopen jtp 0 n 524288 0
+if lt fd 0
+ret 0
+end
+t = ulong 0
+for i ulong 4096
+g = read int fd jtb t sub 65536 t
+if le g 0
+break
+end
+t = add t ulong g
+end
+r = fclose int fd
+ret t
+end
+
+fn jt_w o ulong to ulong
+v = ulong 0
+for k ulong 8
+v = or v shl ulong get jtb add o k mul k 8
+end
+ret v
+end
+
+note Independent reader: the journal is well formed for objective ob: exact
+note size, header, every record's checksum and seq, each OPEN raises the
+note fence by one and every other record carries the current fence.
+note Records go to jtr, count in jtn.
+fn jt_load ob ulong to bool
+r = new ulong 16 0
+sz = jt_slurp 0
+if or lt sz 64 ne rem sub sz 64 128 0
+ret false
+end
+for i ulong 8
+put r i jt_w mul i 8
+end
+if or ne get r 0 5786624599 or ne get r 3 ob ne get r 7 jn_sum r 7
+ret false
+end
+n = div sub sz 64 128
+if gt n 256
+ret false
+end
+fe = ulong 0
+for i ulong n bound 256
+for k ulong 16
+put r k jt_w add add 64 mul i 128 mul k 8
+put jtr add mul i 16 k get r k
+end
+s = jn_sum r 15
+if or ne get r 15 s ne get r 1 add i 1
+ret false
+end
+if eq get r 0 1
+if ne get r 2 add fe 1
+ret false
+end
+fe = get r 2
+end
+if ne get r 2 fe
+ret false
+end
+end
+put jtn 0 n
+ret true
+end
+
+fn jt_rw i ulong k ulong to ulong
+ret get jtr add mul i 16 k
+end
+
+note Records of type t whose word 3 is v (all when v is 0).
+fn jt_cnt t ulong v ulong to ulong
+n = ulong 0
+for i ulong get jtn 0 bound 256
+if and eq jt_rw i 0 t or eq v 0 eq jt_rw i 3 v
+n = add n 1
+end
+end
+ret n
+end
+
+note Per operation: a START only when none is open and no DONE said
+note performed or UNKNOWN; every START closed by exactly one DONE.
+fn jt_order op ulong to bool
+open = false
+shut = false
+for i ulong get jtn 0 bound 256
+t = jt_rw i 0
+if and eq jt_rw i 3 op or eq t 3 eq t 4
+if eq t 3
+if or open shut
+ret false
+end
+open = true
+else
+if not open
+ret false
+end
+open = false
+o = jt_rw i 7
+if or eq o 0 eq o 2
+shut = true
+end
+end
+end
+end
+ret not open
+end
+
+note Outcome of the only RELEASE of job id; 999 when there is none, 998
+note when there are several.
+fn jt_rel id ulong to ulong
+o = ulong 999
+for i ulong get jtn 0 bound 256
+if and eq jt_rw i 0 5 eq jt_rw i 3 id
+if ne o 999
+ret 998
+end
+o = jt_rw i 4
+end
+end
+ret o
+end
+
+fn jt_lineq st ulong m ulong t view uchar 1024 to bool
+for k ulong m bound 64
+if ne get jtb add st k get t k
+ret false
+end
+end
+ret true
+end
+
+note Lines of the sink equal to the decimal v (prefixed "s" when s).
+fn jt_sink v ulong s bool to ulong
+t = new uchar 1024 0
+m = ulong 0
+if s
+put t 0 115
+m = 1
+end
+m = jt_num t m v
+sz = jt_slurp 2
+n = ulong 0
+st = ulong 0
+for i ulong sz bound 65536
+if eq get jtb i 10
+if and eq sub i st m jt_lineq st m t
+n = add n 1
+end
+st = add i 1
+end
+end
+ret n
+end
+
+note Checks shared by every case for operation op of job id: a well-formed
+note journal for objective 1, ordered transitions, one RELEASE with outcome
+note o, s sink lines. Exit base+1..base+4.
+fn jt_common id ulong o ulong s ulong base int to void
+jt_ok jt_load 1 add base 1
+jt_ok jt_order rem id 1000 add base 2
+jt_ok eq jt_rel id o add base 3
+jt_ok eq jt_sink rem id 1000 false s add base 4
+end
+
+note Run once with crash point cp (exit 77), then restart to completion.
+fn jt_crash cp ulong js ulong base int to void
+jt_clean
+jt_ok eq jt_runc cp js 1 0 77 base
+jt_ok eq jt_runc 0 js 1 0 0 add base 5
+end
+
+note Case 0, baseline: both jobs performed once; the key exists.
+fn jt_c0 to void
+jt_clean
+jt_ok eq jt_runc 0 3 1 0 0 10
+jt_common 1001 2 1 10
+jt_common 3002 2 1 15
+jt_ok jt_exists 3 2 19
+end
+
+note Case 1, crash after ADMIT is durable: the admitted job is admitted again
+note and the unadmitted one admitted; each performed once.
+fn jt_c1 to void
+jt_crash 1 3 20
+jt_common 1001 2 1 20
+jt_ok eq jt_cnt 2 1001 1 26
+jt_ok eq jt_cnt 3 1 1 27
+jt_ok eq jt_rel 3002 2 28
+jt_ok eq jt_sink 2 false 1 29
+end
+
+note Case 2, crash after START is durable, before the grant is published:
+note class 1 is UNKNOWN, never run, and two more restarts add no transition.
+fn jt_c2 to void
+jt_crash 2 1 30
+jt_common 1001 0 0 30
+x = get jtn 0
+o = jt_cnt 1 0
+jt_ok eq jt_runc 0 1 1 0 0 36
+jt_ok eq jt_runc 0 1 1 0 0 36
+jt_ok jt_load 1 37
+jt_ok eq sub get jtn 0 jt_cnt 1 0 sub x o 38
+jt_ok eq jt_cnt 1 0 add o 2 39
+end
+
+note Case 3, the same crash for class 3: the key is absent, so not performed;
+note run again (attempt 2) and performed once.
+fn jt_c3 to void
+jt_crash 2 2 40
+jt_common 3002 2 1 40
+jt_ok eq jt_cnt 3 2 2 46
+jt_ok jt_exists 3 2 47
+end
+
+note Case 4, crash after the report, before DONE: class 1 performed but
+note UNKNOWN, never run again.
+fn jt_c4 to void
+jt_crash 3 1 50
+jt_common 1001 0 1 50
+jt_ok eq jt_cnt 3 1 1 56
+end
+
+note Case 5, the same for class 3: the key is present, so performed.
+fn jt_c5 to void
+jt_crash 3 2 60
+jt_common 3002 2 1 60
+jt_ok eq jt_cnt 3 2 1 66
+end
+
+note Case 6, crash after DONE, before RELEASE: released as performed.
+fn jt_c6 to void
+jt_crash 4 1 70
+jt_common 1001 2 1 70
+jt_ok eq jt_cnt 3 1 1 76
+end
+
+note Case 7, crash after RELEASE: nothing left to do.
+fn jt_c7 to void
+jt_crash 5 1 80
+jt_common 1001 2 1 80
+jt_ok eq jt_cnt 4 1 1 86
+end
+
+note Case 8, a torn DONE: 60 bytes of it on disk after the crash; the
+note restart cuts them and the operation is UNKNOWN.
+fn jt_c8 to void
+jt_clean
+jt_ok eq jt_runc 6 1 1 0 77 90
+sz = jt_slurp 0
+jt_ok eq rem sub sz 64 128 60 96
+jt_ok eq jt_runc 0 1 1 0 0 95
+jt_common 1001 0 1 90
+end
+
+note Wait until the journal holds a START, up to ms.
+fn jt_started ms ulong to bool
+for t ulong ms bound 100000
+if jt_load 1
+if gt jt_cnt 3 0 0
+ret true
+end
+end
+r = sleepns 1000000
+end
+ret false
+end
+
+note Cases 9 and 10, SIGKILL of the creator while a slow tool runs. Its
+note workers kill the tool. Class 3: run again and performed once (two tool
+note starts). Class 1: UNKNOWN, no effect, never run again.
+fn jt_c9 to void
+jt_clean
+p = jt_fork 0 4 1 0
+jt_ok jt_started 5000 120
+r = sleepns 100000000
+jt_ok eq killpid int p 9 0 120
+jt_ok eq jt_reap p 137 120
+jt_ok eq jt_runc 0 4 1 0 0 125
+jt_common 4003 2 1 120
+jt_ok eq jt_cnt 3 3 2 126
+jt_ok eq jt_sink 3 true 2 127
+jt_ok jt_exists 3 3 128
+end
+
+fn jt_c10 to void
+jt_clean
+p = jt_fork 0 5 1 0
+jt_ok jt_started 5000 130
+r = sleepns 100000000
+jt_ok eq killpid int p 9 0 130
+jt_ok eq jt_reap p 137 130
+jt_ok eq jt_runc 0 5 1 0 0 135
+jt_common 2004 0 0 130
+jt_ok eq jt_cnt 3 4 1 136
+end
+
+note Case 11, fencing: while a creator runs a tool, a second creator on the
+note same directory is refused (20) and the journal is unchanged.
+fn jt_c11 to void
+jt_clean
+p = jt_fork 0 4 1 0
+jt_ok jt_started 5000 140
+a = jt_slurp 0
+jt_ok eq jt_runc 0 4 1 4 20 141
+jt_ok eq jt_slurp 0 a 142
+jt_ok eq jt_reap p 0 143
+jt_common 4003 2 1 140
+end
+
+note Cases 12 to 14 on a finished baseline directory: another objective
+note (22), a header from another format version (21) and a corrupt record
+note before the last (23) are refused, and the journal is unchanged.
+fn jt_c12 to void
+b = new uchar 128 0
+h = new ulong 16 0
+jt_clean
+jt_ok eq jt_runc 0 1 1 0 0 150
+a = jt_slurp 0
+jt_ok eq jt_runc 0 1 2 0 22 151
+jt_ok eq jt_slurp 0 a 152
+n = jt_path 0 0
+fd = fopen jtp 0 n 524290 0
+jt_ok ge fd 0 153
+jt_ok eq pread int fd b 0 64 0 64 153
+jn_dec b h
+put h 1 2
+put h 7 jn_sum h 7
+jn_enc h b
+jt_ok eq pwrite int fd b 0 64 0 64 153
+jt_ok eq jt_runc 0 1 1 0 21 154
+jt_ok eq jt_slurp 0 a 155
+put h 1 1
+put h 7 jn_sum h 7
+jn_enc h b
+jt_ok eq pwrite int fd b 0 64 0 64 156
+jt_ok eq pread int fd b 0 1 212 1 156
+put b 0 uchar xor get b 0 1
+jt_ok eq pwrite int fd b 0 1 212 1 156
+r = fclose int fd
+jt_ok eq jt_runc 0 1 1 0 23 157
+jt_ok eq jt_slurp 0 a 158
+end
+
+note Case 15, pause survives a restart: no job starts until resumed.
+fn jt_c15 to void
+jt_clean
+jt_ok eq jt_runc 0 1 1 1 0 160
+jt_ok eq jt_runc 0 1 1 2 0 161
+jt_common 1001 2 1 160
+jt_ok eq jt_cnt 7 0 2 166
+end
+
+fn main to int
+m = mapnew neg int 1 0 4096 3 33
+jt_ok gt m 0 9
+put jtm 0 m
+jt_c0
+jt_c1
+jt_c2
+jt_c3
+jt_c4
+jt_c5
+jt_c6
+jt_c7
+jt_c8
+jt_c9
+jt_c10
+jt_c11
+jt_c12
+jt_c15
+if ne write 1 jtok 0 len jtok long len jtok
+ret 100
+end
+ret 0
+end
