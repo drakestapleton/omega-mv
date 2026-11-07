@@ -75,9 +75,10 @@ note budget, 4 cursor, 5 reserved job slot + 1 (0 none), 6 tickets held,
 note 7 ticket lifetime in dispatch events.
 global scpol ulong 8
 note Counters (sched_stat): 0 admissions, 1 ready stamps, 2 dispatch events,
-note 3 slots examined, 4 jobs assigned, 5 bypasses, 6 reservations made,
-note 7 impossible requests refused, 8 head-of-line stops, 9 reserved jobs
-note assigned, 10 tickets issued, 11 tickets lapsed, 12 leases overdue.
+note 3 candidate slot reads, 4 jobs assigned, 5 bypasses, 6 reservations
+note made, 7 impossible requests refused, 8 head-of-line stops, 9 reserved
+note jobs assigned, 10 tickets issued, 11 tickets lapsed, 12 leases overdue,
+note 13 maintenance slot reads, 14 window scans.
 global scst ulong 16
 
 fn sc_cell w ulong off ulong to ulong
@@ -344,28 +345,29 @@ put scst 10 add get scst 10 1
 end
 end
 
-note Creator: may id be admitted now? Not at the admission limit; below it,
-note ticket holders come first in ticket order, then anyone new. A refused
-note caller gets or keeps a ticket. Asking again changes nothing else, so a
-note caller may ask before sched_admitr (as jn_admit does).
+note Creator: may id be admitted now? Room is the smaller of the admission
+note headroom and the free table slots (a job in review or UNKNOWN holds
+note its slot). While tickets are held only the first holder may enter;
+note with none, anyone may while there is room. A refused caller gets or
+note keeps a ticket. Asking again changes nothing else, and a true answer
+note guarantees the slot for the next sched_admitr (single creator), so a
+note caller may ask before journaling (as jn_admit does).
 fn sched_room id ulong to bool
 sp_tkpack 64
 t = sp_tkpos id
-if ge sched_count 1 3 get sclim 0
-sp_tkhold id t
-ret false
-end
-n = get scpol 6
-if eq n 0
-ret true
-end
+room = ulong 0
+if lt sched_count 1 3 get sclim 0
 room = sub get sclim 0 sched_count 1 3
-if lt t 64
-if lt t room
+end
+fs = sched_count 0 0
+if lt fs room
+room = fs
+end
+if gt room 0
+if eq get scpol 6 0
 ret true
 end
-else
-if gt room n
+if eq t 0
 ret true
 end
 end
@@ -552,12 +554,14 @@ end
 note Policy 1, fair fitting: the reserved job first when it fits; else the
 note oldest admitted ready job, among win slots from the cursor, that fits
 note without the capacity the reserved job still lacks. Returns the slot or
-note 64. Work per pick is bounded by win.
+note 64. Every slot read counts (counter 3: the reserved probe and the
+note window), at most win + 1 per pick; counter 14 counts window scans.
 fn sp_fair to ulong
 rq = ulong 0
 r = get scpol 5
 if gt r 0
 rj = sub r 1
+put scst 3 add get scst 3 1
 if eq get sjst rj 2
 if sp_fits get sjneed rj 0
 ret rj
@@ -570,6 +574,7 @@ end
 win = get scpol 1
 cur = get scpol 4
 b = ulong 64
+put scst 14 add get scst 14 1
 for i ulong win bound 64
 put scst 3 add get scst 3 1
 j = rem add cur i 64
@@ -591,22 +596,21 @@ end
 note After a fair dispatch event in which ya - 1 was the youngest admission
 note assigned (ya 0: none): every ready job admitted before it was bypassed
 note once; with no reservation, the oldest job at the bypass budget is
-note reserved. The cursor moves on by the window.
-fn sp_after ya ulong to void
-if gt ya 0
+note reserved. One pass over the table (64 maintenance reads, counter 13).
+note The cursor moves on by the window only when a window was scanned in
+note the event (sc), so no window is skipped unexamined.
+fn sp_after ya ulong sc bool to void
+o = ulong 64
+nores = eq get scpol 5 0
 for j ulong 64
 if eq get sjst j 2
+if gt ya 0
 if lt add get sjarr j 1 ya
 put sjbyp j add get sjbyp j 1
 put scst 5 add get scst 5 1
 end
 end
-end
-end
-if eq get scpol 5 0
-o = ulong 64
-for j ulong 64
-if eq get sjst j 2
+if nores
 if ge get sjbyp j get scpol 3
 if eq o 64
 o = j
@@ -618,12 +622,15 @@ end
 end
 end
 end
+end
+put scst 13 add get scst 13 64
 if lt o 64
 put scpol 5 add o 1
 put scst 6 add get scst 6 1
 end
-end
+if sc
 put scpol 4 rem add get scpol 4 get scpol 1 64
+end
 end
 
 note Creator: assign ready jobs to idle live workers under the policy, at
@@ -637,6 +644,7 @@ k = ulong 0
 ya = ulong 0
 fair = eq get scpol 0 1
 put scst 2 add get scst 2 1
+s0 = get scst 14
 for i ulong get scpol 2 bound 64
 w = sp_idle n
 if ge w 64
@@ -658,7 +666,7 @@ sp_start c j w
 k = add k 1
 end
 if fair
-sp_after ya
+sp_after ya gt get scst 14 s0
 end
 ret k
 end
