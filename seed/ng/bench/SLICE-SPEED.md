@@ -40,8 +40,12 @@ next measurement, as section 1 of `PAYOFF.md` did for omc.
 ## Conditions
 
 X925 core 9 under `pool-8-9.lock`, 2026-11-07T17:18:15Z to 17:25:22Z; A725 core 11 under `pool-10-11.lock`,
-18:42:07Z to 18:57:47Z (after omp-queen-spark's INF-4 END line, per the queen's hold). ngbench v3
-(sha256 2a01e610...0f30), 31 measured blocks after 1 warm-up, 5 arms x 9 cases, 2 runs per arm per block.
+18:42:07Z to 18:57:47Z. The A725 rounds waited for the queen's pool-10-11 hold; it was released by omp-queen-spark's
+14:48:10Z line "INF-4 END (not run: window not opened within 6 min, rc 124); sched may start" (`hold-release.txt`):
+INF-4 ended without running, so nothing of it was disturbed. ngbench v3 (sha256 2a01e610...0f30), 31 measured
+blocks after 1 warm-up (blocks 0 to 31 all present in `rows.txt`), 5 arms x 9 cases, 2 runs per arm per block. The
+PREREG's duration estimate (about 52 min on the X925) was sized from a core-1 single shot; core 9 ran the kernels
+much faster (arith omc 120 ms per run against 497 ms in that shot), so the X925 round took 7 min.
 
 - Idle condition held at start (in-lock recheck) and at end on both cores (`idle-start.txt`, `idle-end.txt`), and
   the per-case busy count was 0 in every block-case pair (288 per core).

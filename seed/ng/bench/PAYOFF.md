@@ -53,7 +53,8 @@ blocks 31 of 31 on X925, at least 30 of 31 on A725, 6 pairs dropped for a foreig
 Other CPU jobs did run on the machine (load 7.8 to 14.2 at the X925 start and end, 4.3 and 4.2 for the A725;
 `cluster-*.txt`); the busy count does not see them.
 
-Result: every one of the 40 step factors' R2 interval overlaps its first-round interval on both cores, and the
+Result: on both cores every one of the 40 step factors' R2 interval overlaps its first-round interval (30 of the
+40 R2 medians lie inside the first-round interval; the 10 that do not are listed in `STEP-COMPARE.md`), and the
 ranking order is unchanged on both cores. The first round's ranking stands.
 
 | rank | X925 (core 9) | gain measured | with MODELED | A725 (core 11) | gain measured | with MODELED |
@@ -68,11 +69,13 @@ ranking order is unchanged on both cores. The first round's ranking stands.
 | 8 | IFC | 1.0086 | 1.0086 | IFC | 1.0216 | 1.0216 |
 | 9 | ISEL | 1.0074 | 1.0074 | INL | 1.0161 | 1.0161 |
 
-All passes together: 2.0695 (X925) and 2.1436 (A725); the residual gap to gcc -O2 is then 1.375 and 1.362
+All passes together, measured and MODELED factors combined (hand-edit upper bounds, not NG output): 2.0695 (X925)
+and 2.1436 (A725); the residual gap to gcc -O2 is then 1.375 and 1.362
 (WolframLanguageEvaluator: `{N[2.846/2.0695054771976467, 4], N[2.920/2.143593256476995, 4]}` ->
-`{1.3752077640566664, 1.3621987245840814}`). Two verdicts moved on the A725: LICM+ROT on arith is now NO
-DIFFERENCE (1.0044, interval 0.9913 to 1.0169; it was SLOWER); BCE on linear stays SLOWER. Each R1/R2 step factor
-pair with its interval is in
+`{1.3752077640566664, 1.3621987245840814}`). Measured factors only: 2.0597 (X925) and 2.0881 (A725), first round
+2.0524 and 2.0925 (`wolfram-allmeasured-*`, the rank query ending in `N[gm[Flatten[Table[meas[P], {P, passes}]]]]`).
+One verdict moved, on the A725: LICM+ROT on arith is now NO DIFFERENCE (1.0044, interval 0.9913 to 1.0169; it was
+SLOWER); BCE on linear stays SLOWER. Each R1/R2 step factor pair with its interval is in
 `evidence/20261107T1416Z-r2/STEP-COMPARE.md`.
 
 The contention sign of the first round is gone on the X925: omc/gcc -O2 over the baseline round is 1.0036 by

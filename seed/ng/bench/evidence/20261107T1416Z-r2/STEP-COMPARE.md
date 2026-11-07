@@ -26,3 +26,20 @@ run on R1's `rows.txt`, and it reproduces R1's published values, e.g. BCE bcopy 
 | CALL | leafcall | 0.3634 [0.3618, 0.3653] | 0.3627 [0.3622, 0.3633] | yes | 0.4655 [0.4635, 0.4673] | 0.4650 [0.4624, 0.4666] | yes |
 | INL | leafcall | 0.8369 [0.8320, 0.8456] | 0.8407 [0.8335, 0.8450] | yes | 0.8173 [0.8146, 0.8206] | 0.8120 [0.8089, 0.8155] | yes |
 | ISEL | linear | 0.9077 [0.9047, 0.9092] | 0.9082 [0.9076, 0.9091] | yes | 0.7249 [0.7225, 0.7356] | 0.7356 [0.7305, 0.7363] | yes |
+
+## R2 median inside the R1 interval
+
+30 of the 40 R2 medians lie inside their R1 interval; all 40 intervals overlap. The 10 medians outside (all with overlapping intervals):
+
+| core | pass | kernel | R2 median | R1 median [r(10), r(22)] |
+|---|---|---|---|---|
+| x925 | LICM+ROT | bcopy | 0.6736 | 0.6846 [0.6739, 0.7932] |
+| x925 | LICM+ROT | sieve | 0.7744 | 0.7826 [0.7777, 0.7888] |
+| x925 | BCE | sort | 0.9793 | 0.9809 [0.9796, 0.9817] |
+| x925 | VEC | bcopy | 0.0619 | 0.0632 [0.0623, 0.0648] |
+| a725 | LICM+ROT | arith | 1.0044 | 1.0175 [1.0094, 1.0405] |
+| a725 | LICM+ROT | sieve | 0.6838 | 0.6774 [0.6693, 0.6801] |
+| a725 | BCE | sort | 0.7031 | 0.6993 [0.6974, 0.7023] |
+| a725 | BCE | matmul | 0.8749 | 0.8812 [0.8768, 0.8847] |
+| a725 | VEC | bcopy | 0.1004 | 0.0964 [0.0955, 0.0979] |
+| a725 | INL | leafcall | 0.8120 | 0.8173 [0.8146, 0.8206] |
