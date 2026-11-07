@@ -33,7 +33,7 @@ fib38), so any future codegen A/B reports an aligned control.
    Kernels (kind 1) are refused.
 2. **Layout** (`a6_lay`): blocks in ΩIR order. Positions: function parameters are defined at 0; block x starts at
    `a_bst[x]` (its parameters are defined there); op o sits at an even `a_opos[o]`, reads its operands there and
-   defines its result at `a_opos[o] + 1`. `a_ccnt[q]` = calls at positions below q.
+   defines its result at `a_opos[o] + 1`. `a_ccnt[q]` = calls and host words at positions below q.
 3. **Liveness** (`a6_lgen`, `a6_lflow`): per block bitsets of upward-exposed uses, definitions, live-in and live-out,
    iterated backwards to a fixed point. Successors: `br` slot 0, `cbr` slots 2 and 3. Tokens get no location.
 4. **Intervals** (`a6_ivinit`, `a6_ivuse`, `a6_ivlive`): one range `[start, end]` per value from its definition and
@@ -45,10 +45,12 @@ fib38), so any future codegen A/B reports an aligned control.
    after the current one (it moves to a stack slot); otherwise the current interval gets a slot. Slots are 8 bytes at
    `[sp, 8k]`. A spilled value is loaded into x16/x17/x15 before each use and stored after its definition. There is no
    limit on live values but the frame size.
-6. **Frame** (`a6_frame`, `a6_pro`, `a6_epi`): F = round16(8 x (slots + callee-saved registers used + x30 if the
-   function calls)), F <= 4095. Prologue `SUB SP, SP, #F; CMP SP, X28; B.LO trap6` (before any store, omc's
-   stack-floor rule), then the saves above the slots. Epilogue: reloads, `ADD SP, SP, #F`, `RET`. A function with
-   F = 0 has no frame code. Save form A uses pairs while the save area ends at or below byte 504, else form B.
+6. **Frame** (`a6_frame`, `a6_alay`, `a6_pro`, `a6_epi`): round16(8 x (slots + callee-saved registers used + x30 if
+   the function calls)) <= 4095, then one 16-byte aligned area per `alloca` (its type's size rounded to 16); the
+   frame F < 2^24. Prologue `SUB SP, SP, #F` (as `#hi, LSL 12` and `#lo` when F > 4095), `CMP SP, X28; B.LO trap6`
+   (before any store, omc's stack-floor rule), then the saves above the slots. Epilogue: reloads, `ADD SP` the same
+   way, `RET`. A function with F = 0 has no frame code. Save form A uses pairs while the save area ends at or below
+   byte 504, else form B.
 7. **Selection** (`a6_sel`), one op at a time, operands read before the result register is written (the result may
    reuse an operand's register):
    - narrow integers live extended to 64 bits by their type (zero u8..u32, sign i8..i32); arithmetic results are
@@ -65,6 +67,18 @@ fib38), so any future codegen A/B reports an aligned control.
      against the sign of the low half or UMULH = 0, narrower types by computing the exact 64-bit result and comparing
      it with its own re-extension; chk.divz CBZ; chk.divovf `((b + 1) | (a ^ MIN)) = 0`; chk.shl; chk.shift
      (unsigned CMP with the width); chk.conv between integers; chk.fuel CMP + B.HS; chk.true CBZ. Facts emit nothing.
+   - memory (IR.md s7.5), REF to ARRAY of bool or integers only: a REF is one register holding the object's address.
+     load/store: LDR/STR register offset, index scaled by the element size (LDRB/LDRH/LDR W/LDR X; LDRSB/LDRSH/
+     LDRSW for i8/i16/i32 keep the canonical sign extension); gaddr: the global's absolute address (MOVZ + MOVK);
+     len: the ARRAY count from the type; alloca: `ADD Xd, SP, #area`, then `STP XZR, XZR, [X16], #16` per 16 bytes
+     (zero-filled at the op, so on every pass of an E loop as well). chk.bounds r i e: a constant e (every access's
+     covering form, s8) is `CMP Xi, #(len - e); B.HI trap` (exact, no add that could wrap), e = 0 or e > len a
+     plain `B trap`; any other e `CBZ`, `len - e` by SUBS (`B.LO`), then CMP + B.HI. chk.slice r off n: `off > len`
+     or `n > len - off`, each CMP + B.HI. The back end trusts ngcheck's coverage (an access follows its check).
+   - host words read (53) and write (54) (IR.md s7.11): `X17 = A + off`, then x0 fd, x1 X17, x2 n as one parallel
+     move, `MOVZ X8, #63/64; SVC #0`, result (count or minus errno) from x0. The SVC preserves every register but x0;
+     the arguments use x0..x2, so a host word counts as a call for allocation (values live across it take x19..x27)
+     without saving x30. Every other host word is refused (exit 5, `a64: unsupported` with the word id).
 8. **Parallel moves** (`a6_pmove`): a move fires when no pending move reads its destination; when all are blocked
    (a cycle), one source goes to x15 and its readers read x15. Slot-to-slot moves go through x16.
 8a. **E loop shape** (`a6_tre`, D13): a block ending `r = call f(...); s = add a r` (either operand order)
@@ -77,10 +91,13 @@ fib38), so any future codegen A/B reports an aligned control.
    the hand-built form, D13); ts(n) = ts(n-1) + n becomes a frameless loop.
 9. **Traps**: each function ends with omc's tail `ADD X0, X1, #100; MOVZ X8, #93; SVC #0` and one stub per used code,
    `MOVZ X1, #code; B tail`, so the exit status is 100 + code as with omc.
-10. **ELF** (`a6_elf`): omc's map: 176-byte header, two PT_LOAD (text R+X at 0x400000 from file offset 0; RW
-    0x10000000, memsz 8 MiB), entry 0x4000b0: `MOVZ X28, #0x1000, LSL 16; MOVZ X16, #0x1080, LSL 16; MOV SP, X16;
-    BL main; MOVZ X8, #93; SVC #0`. Program entry (D11): the single export with no parameters and result i32.
-    Each function starts on a 64-byte boundary (`a6_al64`: NOP padding after the previous function's trap stubs).
+10. **ELF** (`a6_elf`, `a6_glay`): omc's map: 176-byte header, two PT_LOAD (text R+X at 0x400000 from file offset 0;
+    RW 0x10000000, memsz 8 MiB of stack + the class-0 globals rounded up to 4096), entry 0x4000b0: `MOVZ X28,
+    #0x1000, LSL 16; MOVZ X16, #0x1080, LSL 16; MOV SP, X16; BL main; MOVZ X8, #93; SVC #0`. Class-0 globals sit in
+    the RW pool from 0x10800000 (16-byte aligned, zero-filled by the loader, at most 1 GiB), class-1 globals' bytes
+    right after that start code in the text image (word-padded), as omc. Program entry (D11): the single export with
+    no parameters and result i32. Each function starts on a 64-byte boundary (`a6_al64`: NOP padding after the
+    previous function's trap stubs or the class-1 bytes).
 
 ## 3. Registers
 
@@ -111,22 +128,27 @@ BLR, SVC, ADR and the FP set.
 
 1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
    in a callee-saved register across its loop).
-2. Memory ops (load, store, alloca, globals, slices, chk.bounds, chk.slice) and host words (inline `SVC`).
+2. Memory beyond the slice: SLICE values (`slice`, `len` of a SLICE; two words per value), STRUCT fields (`fload`,
+   `fstore`, `fref`), VEC (`vload`, `vstore`), `fill`, `atom`, `atomcas`, float elements; host words other than read
+   and write. Bounds checks hoisted out of loops by a pass that proves them (IR.md s15).
 3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
-4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, > 8 arguments,
-   frames over 4095 bytes.
+4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, > 8 arguments.
 
 ## 6. Gates (run from the omega-mv root on core 1)
 
 - `gate.om` (encoder): builds ng from `ng.units`, runs `@ng a64-enc` on `tests/enc.cases`, disassembles with GNU
   objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases.
 - `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck and ng. For every fixture (fib, deep, press, rot,
-  ck, ar, tsum) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must exit with the expected status
-  (computed with Wolfram, or the check's trap code), the omc build of `tests/ref/N.om` with its omc expectation
-  (the same, except tsum: omc traps 6 a million calls deep, ng's loop does not; BEYOND_OMC), and every BL target in
-  the `@ng a64` ELF must be a multiple of 64. Nine mutants (spill reload slot, call clobber, live-out range,
-  parallel-move ordering, callee-saved saves, frame size, 16-byte entry alignment, E never matching, E accumulating
-  the wrong value) must each change at least one fixture's status or alignment.
+  ck, ar, tsum, mem, oob, zf, wid) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must exit with the
+  expected status (computed with Wolfram, or the check's trap code), the omc build of `tests/ref/N.om` with its omc
+  expectation (the same, except tsum: omc traps 6 a million calls deep, ng's loop does not; BEYOND_OMC), and every
+  BL target in the `@ng a64` ELF must be a multiple of 64. Fifteen mutants (spill reload slot, call clobber,
+  live-out range, parallel-move ordering, callee-saved saves, frame size, 16-byte entry alignment, E never matching,
+  E accumulating the wrong value, chk.bounds off by e, half zero fill, write count, u64 loads one byte, large frame
+  without its LSL 12 part, i8 loads zero-extending) must each change at least one fixture's status or alignment.
+  The memory fixtures store and load every integer element width (u8 u64 in mem, i8 u16 i16 u32 i32 in wid); wid
+  compares each loaded value at its own type, because a conversion re-extends from its source type and would hide a
+  non-canonical load (rgate's first form of mutants 13 and 15 escaped that way).
 
 ## 7. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
 
