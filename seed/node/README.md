@@ -572,13 +572,16 @@ used for reporting only; selection reads logical counters.
 
 `schedpol-gate` takes one optional argument: `fifo` runs every phase under
 policy 0, `noreserve` sets the bypass budget to 65535 (no reservation in
-practice). Each step also checks the bounds since the last step: candidate
-reads at most events × `db` × (`win` + 1), the reserved probe included, or
-64 per pick under policy 0, exit 9; maintenance reads at most 64 per event,
-exit 14; the cursor moved by exactly `win` per window scan (mod 64), exit 15.
-The last is the traversal witness, checked at every step of every phase.
-These checks read the scheduler's own counters, so they bound the work the
-counters record; they are not an independent trace of memory reads.
+practice). Each step also checks the bounds since the last step. An event
+makes at most one pick more than it assigns, so candidate reads are at most
+(assigned + events) × (`win` + 1), the reserved probe included, or × 64
+under policy 0, exit 9; maintenance reads at most 64 per event, exit 14; the
+cursor moved by exactly `win` per window scan (mod 64), exit 15. The cursor
+check is the traversal witness. It runs at every step of every phase and
+around the dispatches that publication (phase F) and resume (phase Z) cause
+outside a step. These checks read the scheduler's own counters, so they
+bound the work the counters record; they are not an independent trace of
+which slots were read.
 
 | Phase | Scenario | Exit when it fails |
 | --- | --- | --- |
@@ -594,10 +597,12 @@ counters record; they are not an independent trace of memory reads.
 Phases S to Z run after A and B, so under `fifo` the gate stops at 11.
 `journal-gate` case 16 checks `jn_admit` at the admission limit: a duplicate
 id is refused as a duplicate and takes no ticket (170..173). Case 17 checks
-a full table below the limit: 64 jobs left UNKNOWN (as recovery leaves
-them; set directly, nothing is spawned), a new id is refused with a ticket,
-the independent journal reader finds no ADMIT for it, and after one slot is
-settled the same id is admitted and journaled once (174..177).
+a full table below the limit: 64 jobs put in UNKNOWN directly (synthetic
+occupancy, the state a worker loss leaves a job not safe to rerun in;
+nothing is spawned and no recovery runs). A new id is refused with a
+ticket, the journal does not grow, and the independent journal reader finds
+no ADMIT for it; after one slot is settled the same id is admitted and
+journaled once (174..177).
 
 | Change | Expected exit (derived from the check it trips) |
 | --- | --- |
@@ -614,7 +619,9 @@ settled the same id is admitted and journaled once (174..177).
 | window ignored (`for i ulong win` to `for i ulong 64` in `sp_fair`) | 9 |
 | tickets never lapse | 80 |
 | `jn_admit` asks for room before the duplicate check (`journal.om`) | 170 (`journal-gate`) |
-| `jn_admit` skips the room check (`journal.om`) | 173 (`journal-gate`): case 16 journals ADMIT for the refused id, so its later admission is refused as a duplicate; case 17 would stop at 175 |
+| `jn_admit` skips the room check (`journal.om`) | 173 (`journal-gate`): case 16 journals ADMIT for the refused id, so its later admission is refused as a duplicate |
+| the same, with case 16 not run | 175 (`journal-gate`): case 17's refused admission grows the journal |
+| FIFO counts 3 per slot read (`sp_fifo`), run with `fifo` | 9: the first FIFO pick reads more than 64 per pick allows |
 
 ## Proposals, authority and cancellation (DRA-288)
 
