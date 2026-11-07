@@ -17,7 +17,7 @@
 # tests/gates/run.sh: the one entry point for the local verification gates of aienos.
 # Every step runs the SAME command as the hosted job it replaced. #427 removed those workflows
 # (ck-kernel.yml, native-suites.yml, crypto-boundary.yml, infer-crate.yml, crumb.yml, ci.yml). The
-# only hosted runs left are crumb verify and the portable smoke set in the advisory AIEN Checks job
+# only hosted run left is the portable smoke set in the advisory AIEN Checks job
 # (aien-verification.yml); the workflow names below say where each command came from.
 # Manifests under tests/gates/ name this script plus one step word, so no manifest needs shell
 # expansion (ADR 0028 P6).
@@ -88,20 +88,8 @@ scripts_verdict() {
 }
 
 case "$step" in
-  crumb-verify)
-    # The removed hosted crumb.yml built the crumb tool from the aien-architecture commit in crumb.lock.
-    # Same here, from the sibling checkout ../aien-architecture into a temp dir outside the
-    # tree, so a newer crumb on PATH can never change the verdict.
-    if [ ! -d ../aien-architecture ]; then
-      echo "run.sh: ../aien-architecture is missing; check out aien-dev/aien-architecture beside this tree (the tool is built at crumb.lock)" >&2
-      exit 3
-    fi
-    pin=$(tr -d '[:space:]' < crumb.lock)
-    git -C ../aien-architecture archive "$pin" tools/crumb | tar -x -C "$TMP"
-    make -s -C "$TMP/tools/crumb" crumb
-    obs crumb_tool_commit "\"$pin\""
-    "$TMP/tools/crumb/crumb" verify .
-    ;;
+  # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07): Crumbs are off the active
+  # workflow, so no gate checks crumb freshness. The .crumb files and crumb.lock stay as history.
   # ck-kernel.yml, host steps (ubuntu-24.04-arm there, AArch64 here)
   ck-host-tests)
     make -C native/kernel test sanitize

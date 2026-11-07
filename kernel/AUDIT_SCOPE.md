@@ -71,7 +71,7 @@ C kernel: gcc, binutils, make and a shell. Emulator gates: `qemu-system-aarch64`
 Rust version is unknown from the repository. Cargo builds offline from `vendor/` (`.cargo/config.toml`).
 
 Pins: `omega.lock` names omega commit `362c9ab50c8ecc3012dd2e3ac20329865ba80982` and the sha256 of
-the vendored `native/kernel/third_party/omega/rx_cortex.c` and `rx_cortex.h`; `crumb.lock` names
+the vendored `native/kernel/third_party/omega/rx_cortex.c` and `rx_cortex.h`; `crumb.lock` (history only since DRA-97, 2026-11-07; no gate reads it) names
 `d0f0b95d344b4c6628c3d868346932fd247ce168`.
 
 ## Run every test
@@ -89,7 +89,7 @@ tests/gates/run.sh crypto-boundary
 tests/gates/run.sh zero-disk-secrets
 ```
 
-Every gate is `tests/gates/run.sh <step>`; steps include `crumb-verify`, `ck-host-tests`,
+Every gate is `tests/gates/run.sh <step>`; steps include `ck-host-tests`,
 `ck-stage-tests`, `ck-gate-selftest`, `ck-hold-selftest`, `ck-owner-keys`, `ck-qemu-gates`,
 `ck-qemu-external` (fails unless `ALLEN_MODEL`, `LOCAL_MODEL_WEIGHTS` and `LOCAL_MODEL_TOKENIZER` are given),
 `ck-b7b-probe`, `native-net`, `native-sig`, `native-crypto`, `native-m5`, `native-disk`,
