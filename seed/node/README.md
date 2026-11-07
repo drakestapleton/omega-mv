@@ -505,11 +505,12 @@ command, output) is kept in `evidence/node-schedpol/rust-reference.*.json`.
 Policy 1 is the default; policy 0 stays as the FIFO baseline for the
 DRA-399 comparison. Both are arms of one `sched_dispatch`.
 
-Each pick reads the reserved slot, if any, and at most `win` slots (default
-64) starting at a cursor that persists across dispatch events. The cursor
-moves on by `win` after each event in which a window was scanned (none is
-scanned when no worker is idle, or when the reserved job took the only
-pick), so every slot is examined within ceil(64/`win`) window scans. Among
+Each pick reads the reserved slot, if any, and otherwise scans at most
+`win` slots (default 64) from a cursor that persists across picks and
+dispatch events. After every window scan the cursor moves on by `win`, so
+consecutive scans cover consecutive windows, also when one event picks
+several times, and every slot is examined within ceil(64/`win`) window
+scans. A pick that takes the reserved job scans no window. Among
 the examined ready jobs the pick takes the one admitted first (`sjarr`:
 unique, so no ties) that fits. At most `db` jobs are assigned per event.
 After each event one pass over the table counts bypasses and picks a
@@ -549,10 +550,13 @@ refuses without room and gives the refused caller a ticket. While tickets
 are held only the first holder may enter, whatever the room; a new caller
 takes a ticket behind them. `sched_admitr` asks it; so does `jn_admit`,
 after its duplicate check and before it journals ADMIT, and a true answer
-guarantees the slot (one creator). A ticket not asked about for `ttl`
-dispatch events (default 1000) lapses, so a caller that went away holds the
-line for at most that long; at most 64 tickets are held, and a caller
-refused with the line full holds none.
+guarantees the slot (one creator, no other admission in between). A ticket
+not asked about for more than `ttl` dispatch events (default 1000) lapses:
+asked at event e, it survives while e + `ttl` is at least the current event
+count. A caller that went away therefore blocks later holders for at most
+`ttl` events; a paused dispatch counts no events, so that block lasts until
+dispatch resumes. At most 64 tickets are held, and a caller refused with
+the line full holds none.
 
 Leases. `sched_lease j ns` gives a job a lease counted from its assignment;
 `sched_overdue` reports a running job past its lease whose worker has not
@@ -569,10 +573,11 @@ used for reporting only; selection reads logical counters.
 `schedpol-gate` takes one optional argument: `fifo` runs every phase under
 policy 0, `noreserve` sets the bypass budget to 65535 (no reservation in
 practice). Each step also checks the bounds since the last step: candidate
-reads at most events × `db` × (`win` + 1), the reserved probe included (64
-per pick under policy 0), exit 9; maintenance reads at most 64 per event,
-exit 14; the cursor unchanged unless a window was scanned, exit 15. These
-checks read the scheduler's own counters, so they bound the work the
+reads at most events × `db` × (`win` + 1), the reserved probe included, or
+64 per pick under policy 0, exit 9; maintenance reads at most 64 per event,
+exit 14; the cursor moved by exactly `win` per window scan (mod 64), exit 15.
+The last is the traversal witness, checked at every step of every phase.
+These checks read the scheduler's own counters, so they bound the work the
 counters record; they are not an independent trace of memory reads.
 
 | Phase | Scenario | Exit when it fails |
@@ -581,22 +586,26 @@ counters record; they are not an independent trace of memory reads.
 | Q | admission limit 2: X then Y refused hold tickets; with room for one, Y is refused and X admitted; Y enters later; a ticket not asked about lapses, so a new caller enters | 70..80 |
 | L | 200 ms lease on a 3 s job not safe to rerun: the deadline is at least 200 ms after admission and the report comes at or after it, once; worker killed, job UNKNOWN, CPU free. A rerunnable job killed the same way keeps its admission age and completes | 81..89, 140..145 |
 | R | the reserved job is cancelled: freed with no effect, reservation cleared | 90..97 |
-| W | window 4, budget 2, 12 ready jobs in slots 0..11: every pick reads at most 5 slots and all 12 run | 9, 101..103 |
-| T | limit 3 and three ticket holders; with two openings the second holder and a new caller are refused, the first two holders enter in order; with three, the new caller (now a holder) waits for the holder ahead | 104..109 |
+| W | window 4, budget 2, two workers (an event may pick twice), 12 ready jobs in slots 0..11: every pick reads at most 5 slots, every scan moves the cursor on by 4, and all 12 run | 9, 15, 101..103 |
+| T | limit 3 held by two short jobs and one waiting on a topic nobody publishes, three ticket holders; with exactly two openings the second holder and a new caller are refused, the first two holders enter in order; the waiting job is cancelled, and with three openings the new caller (now a holder) waits for the holder ahead | 104..109 |
 | X | every slot holds a job in review, admission limit not reached: a new caller is refused and holds a ticket; one review frees one slot, which goes to the first holder | 190..194 |
-| Z | review limit 1 and full; a reserved job stays ready with all CPU free while the workers hold finished results; reviewing lets it run | 195..199 |
+| Z | review limit 1 and full; a reserved job is ready at every step for 600 ms while the workers hold finished results, and all CPU is free at the end of that interval; reviewing lets it run | 195..199 |
 
 Phases S to Z run after A and B, so under `fifo` the gate stops at 11.
 `journal-gate` case 16 checks `jn_admit` at the admission limit: a duplicate
-id is refused as a duplicate and takes no ticket (170..173).
+id is refused as a duplicate and takes no ticket (170..173). Case 17 checks
+a full table below the limit: 64 jobs left UNKNOWN (as recovery leaves
+them; set directly, nothing is spawned), a new id is refused with a ticket,
+the independent journal reader finds no ADMIT for it, and after one slot is
+settled the same id is admitted and journaled once (174..177).
 
 | Change | Expected exit (derived from the check it trips) |
 | --- | --- |
-| cursor never moves (`put scpol 4 …` deleted from `sp_after`) | 101: slots beyond the first window never run in W |
-| cursor moves in every event (`if sc` to `if true` in `sp_after`) | 15 |
+| cursor never moves (`put scpol 4 …` deleted from `sp_fair`) | 15: the first window scan in W leaves the cursor where it was |
+| cursor moves by 1 instead of `win` (`rem add cur win 64` to `rem add cur 1 64`) | 15 |
 | tickets ignored (`if eq get scpol 6 0` to `if true` in `sched_room`) | 75 |
 | holders below the room may enter (`if eq t 0` to `if lt t room`) | 105 |
-| room ignores free slots (`fs = sched_count 0 0` to `fs = ulong 64`) | 191 |
+| room ignores free slots (`if lt fs room` to `if false`) | 191 |
 | no hold-back for the reserved job (`rq = get sjneed rj` to `rq = ulong 0`) | 61 |
 | never reserve (`put scpol 5 add o 1` deleted) | 61 |
 | lease never reported (`if ge now d` to `if false`) | 82 |
@@ -605,6 +614,7 @@ id is refused as a duplicate and takes no ticket (170..173).
 | window ignored (`for i ulong win` to `for i ulong 64` in `sp_fair`) | 9 |
 | tickets never lapse | 80 |
 | `jn_admit` asks for room before the duplicate check (`journal.om`) | 170 (`journal-gate`) |
+| `jn_admit` skips the room check (`journal.om`) | 173 (`journal-gate`): case 16 journals ADMIT for the refused id, so its later admission is refused as a duplicate; case 17 would stop at 175 |
 
 ## Proposals, authority and cancellation (DRA-288)
 

@@ -949,23 +949,28 @@ note never in part. Every job also needs one idle live worker.
 note sjarr: admission order (waiting age; kept across reruns). sjrdy: order
 note in which the job last became ready. sjbyp: times it was bypassed.
 note Decisions read only these logical counters, never the clock.
-note
-note Policy 1, fair fitting (DRA-396): each pick examines at most win slots
-note from a persistent cursor (which moves on by win per dispatch event, so
-note every slot is examined within ceil(64/win) events) and takes the oldest
-note admitted ready job that fits. A ready job older than a job assigned in
+note Policy 1, fair fitting (DRA-396): a pick first probes the reserved job;
+note otherwise it scans a window of win slots from a persistent cursor and
+note takes the oldest admitted ready job that fits. The cursor moves on by
+note win after every window scan, so every slot is examined within
+note ceil(64/win) window scans. A ready job older than a job assigned in
 note the same event was bypassed; once the oldest such job reaches the
 note bypass budget it is reserved: it is offered first, and no other job may
 note use, of any kind, the capacity it still lacks (others may use only
 note free capacity beyond its need). Neither the free capacity it can reach
 note nor its age ever shrinks, so it runs once running work releases enough
 note (liveness assumes: every running job ends, by completion or by its
-note lease, at least one worker stays live, and dispatch runs after
-note releases). Requests over capacity are refused at admission.
-note Admission tickets: a caller refused at the admission limit holds a
-note ticket; when room returns, ticket holders enter in ticket order before
-note anyone new, so a full table cannot exclude a caller that keeps asking.
-note A ticket not asked about for ttl dispatch events lapses.
+note lease, at least one worker stays live, results in review are reviewed,
+note and dispatch is not paused). Requests over capacity are refused at
+note admission.
+note Admission: room is the smaller of the admission headroom and the free
+note table slots. A refused caller holds a ticket; while tickets are held
+note only the first holder may enter, so holders enter in ticket order
+note before anyone new. A ticket not asked about for more than ttl dispatch
+note events lapses (asked at event e, it survives while e + ttl is at least
+note the current event count). An absent head blocks later holders until
+note its ticket lapses; a paused dispatch counts no events, so the block
+note lasts until dispatch resumes.
 note Leases: a running job with a lease is reported once by sched_overdue
 note after its lease passes; the authority then cancels or kills it, which
 note releases its resources.
@@ -1281,11 +1286,21 @@ note caller may ask before journaling (as jn_admit does).
 fn sched_room id ulong to bool
 sp_tkpack 64
 t = sp_tkpos id
-room = ulong 0
-if lt sched_count 1 3 get sclim 0
-room = sub get sclim 0 sched_count 1 3
+a = ulong 0
+fs = ulong 0
+for j ulong 64
+s = get sjst j
+if eq s 0
+fs = add fs 1
 end
-fs = sched_count 0 0
+if and ge s 1 le s 3
+a = add a 1
+end
+end
+room = ulong 0
+if lt a get sclim 0
+room = sub get sclim 0 a
+end
 if lt fs room
 room = fs
 end
@@ -1479,9 +1494,10 @@ end
 
 note Policy 1, fair fitting: the reserved job first when it fits; else the
 note oldest admitted ready job, among win slots from the cursor, that fits
-note without the capacity the reserved job still lacks. Returns the slot or
-note 64. Every slot read counts (counter 3: the reserved probe and the
-note window), at most win + 1 per pick; counter 14 counts window scans.
+note without the capacity the reserved job still lacks; the cursor then
+note moves on by win. Returns the slot or 64. Every slot read counts
+note (counter 3: the reserved probe and the window), at most win + 1 per
+note pick; counter 14 counts window scans.
 fn sp_fair to ulong
 rq = ulong 0
 r = get scpol 5
@@ -1516,6 +1532,7 @@ end
 end
 end
 end
+put scpol 4 rem add cur win 64
 ret b
 end
 
@@ -1523,9 +1540,7 @@ note After a fair dispatch event in which ya - 1 was the youngest admission
 note assigned (ya 0: none): every ready job admitted before it was bypassed
 note once; with no reservation, the oldest job at the bypass budget is
 note reserved. One pass over the table (64 maintenance reads, counter 13).
-note The cursor moves on by the window only when a window was scanned in
-note the event (sc), so no window is skipped unexamined.
-fn sp_after ya ulong sc bool to void
+fn sp_after ya ulong to void
 o = ulong 64
 nores = eq get scpol 5 0
 for j ulong 64
@@ -1554,9 +1569,6 @@ if lt o 64
 put scpol 5 add o 1
 put scst 6 add get scst 6 1
 end
-if sc
-put scpol 4 rem add get scpol 4 get scpol 1 64
-end
 end
 
 note Creator: assign ready jobs to idle live workers under the policy, at
@@ -1570,7 +1582,6 @@ k = ulong 0
 ya = ulong 0
 fair = eq get scpol 0 1
 put scst 2 add get scst 2 1
-s0 = get scst 14
 for i ulong get scpol 2 bound 64
 w = sp_idle n
 if ge w 64
@@ -1592,7 +1603,7 @@ sp_start c j w
 k = add k 1
 end
 if fair
-sp_after ya gt get scst 14 s0
+sp_after ya
 end
 ret k
 end
@@ -2041,9 +2052,11 @@ end
 
 note One creator step of up to 10 ms, then the invariant and the scan
 note bounds since the last step: candidate reads at most events x budget x
-note (window + 1), the reserved probe included (FIFO, policy 0, reads at
-note most 64 per pick), 9; maintenance reads at most 64 per event, 14; the
-note cursor moves only in events that scanned a window, 15.
+note (window + 1), the reserved probe included, or 64 per pick under FIFO
+note (policy 0), 9; maintenance reads at most 64 per event, 14; the cursor
+note moved by exactly the window per window scan, mod 64, 15. The last is
+note the traversal witness: window scans cover consecutive windows, so
+note ceil(64/win) of them examine every slot.
 fn pt_step c long code int to void
 e0 = sched_stat 2
 x0 = sched_stat 3
@@ -2053,17 +2066,21 @@ u0 = sched_stat 28
 r = sched_step c 10000000
 pt_ok ge r 0 code
 pt_inv code
-w = sched_stat 25
+w = add sched_stat 25 1
 if eq sched_stat 24 0
 w = ulong 64
 end
 ev = sub sched_stat 2 e0
-lim = mul mul ev sched_stat 26 add w 1
+lim = mul mul ev sched_stat 26 w
 pt_ok le sub sched_stat 3 x0 lim 9
 pt_ok le sub sched_stat 13 m0 mul ev 64 14
-if eq sched_stat 14 s0
-pt_ok eq sched_stat 28 u0 15
+pt_cursor u0 s0
 end
+
+note The cursor moved by the window once per window scan since (u0, s0).
+fn pt_cursor u0 ulong s0 ulong to void
+d = mul sched_stat 25 sub sched_stat 14 s0
+pt_ok eq sched_stat 28 rem add u0 d 64 15
 end
 
 note Step until job j is in a state in lo..hi, up to ms. True when reached.
@@ -2470,10 +2487,11 @@ pt_ok eq get suse 0 0 96
 pt_down c 97
 end
 
-note Phase W: bounded candidate work. Window 4 slots, dispatch budget 2:
-note 12 ready jobs fill slots 0..11, beyond any one window. Each pick reads
-note at most 4 slots (checked at every step, exit 9) and the cursor still
-note reaches every slot, so all 12 run. 101 means some never did.
+note Phase W: bounded candidate work. Window 4 slots, dispatch budget 2,
+note two workers, so an event may pick twice: 12 ready jobs fill slots
+note 0..11, beyond any one window. Each pick reads at most 5 slots (the
+note reserved probe and the window, exit 9), every window scan moves the
+note cursor on by 4 (15), and all 12 run. 101 means some never did.
 fn pt_window to void
 c = pt_setup 2 16 16 pt_req 4 1024 1 8 101
 pt_ok eq sched_policy sched_stat 24 4 2 sched_stat 27 1000 0 101
@@ -2486,16 +2504,17 @@ pt_down c 103
 end
 
 note Phase T: ticket order with several openings. Limit 3 held by p1, p2
-note (400 ms) and p3 (900 ms); X, Y, Z are refused in that order and hold
-note tickets (104). With two openings, Y asking first is refused (105), and
+note (400 ms) and p3, which waits on a topic nobody publishes; X, Y, Z are
+note refused in that order and hold tickets (104). p1 and p2 are reviewed,
+note so there are exactly two openings: Y asking first is refused (105), and
 note so is a new caller W, who takes a ticket behind Z (106); X enters
-note (107), then Y (108). With three openings, W asking first is refused,
-note then Z and W enter (109).
+note (107), then Y (108). p3 is cancelled and X and Y are reviewed, so there
+note are three openings: W asking first is refused, then Z and W enter (109).
 fn pt_torder to void
 c = pt_setup 3 3 8 pt_req 4 1024 1 8 104
 p = pt_admit 400400 0 0 104
 p = pt_admit 410400 0 0 104
-p = pt_admit 420900 0 0 104
+p3 = pt_admit 420050 4096 0 104
 pt_ok eq sched_admitr 430050 0 0 0 neg long 2 104
 pt_ok eq sched_admitr 440050 0 0 0 neg long 2 104
 pt_ok eq sched_admitr 450050 0 0 0 neg long 2 104
@@ -2506,7 +2525,8 @@ pt_ok eq sched_admitr 460050 0 0 0 neg long 2 106
 pt_ok eq sched_stat 30 4 106
 pt_ok ge sched_admitr 430050 0 0 0 0 107
 pt_ok ge sched_admitr 440050 0 0 0 0 108
-pt_drain c 3 3000 108
+pt_ok eq sched_cancel p3 1 108
+pt_drain c 2 3000 108
 pt_ok eq sched_admitr 460050 0 0 0 neg long 2 109
 pt_ok ge sched_admitr 450050 0 0 0 0 109
 pt_ok ge sched_admitr 460050 0 0 0 0 109
@@ -2550,9 +2570,9 @@ note Phase Z: reserved progress needs review progress. Review limit 1, two
 note workers, 2 CPU, bypass budget 1. p finishes and waits in review,
 note unreviewed. a (1 CPU) and x (1 CPU) run past b (2 CPU), so b is
 note reserved (196). a and x finish; their workers keep the results, since
-note review is full, so for 600 ms b stays ready with all CPU free (197,
-note 198). Reviewing p lets a into review, frees its worker, and b runs
-note (199).
+note review is full, so b is ready at every step for 600 ms (197) and all
+note CPU is free at the end of that interval (198). Reviewing p lets a into
+note review, frees its worker, and b runs (199).
 fn pt_live to void
 c = pt_setup 2 8 1 pt_req 2 1024 1 8 195
 pt_ok eq sched_policy sched_stat 24 64 64 1 1000 0 195
@@ -2570,8 +2590,8 @@ if ge ulong monons dl
 break
 end
 pt_step c 197
-end
 pt_ok eq get sjst b 2 197
+end
 pt_ok eq get suse 0 0 198
 pt_ok eq sched_review p long add get sjid p 1 199
 pt_ok pt_until c b 3 4 2000 199 199

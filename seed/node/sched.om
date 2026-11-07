@@ -23,23 +23,28 @@ note never in part. Every job also needs one idle live worker.
 note sjarr: admission order (waiting age; kept across reruns). sjrdy: order
 note in which the job last became ready. sjbyp: times it was bypassed.
 note Decisions read only these logical counters, never the clock.
-note
-note Policy 1, fair fitting (DRA-396): each pick examines at most win slots
-note from a persistent cursor (which moves on by win per dispatch event, so
-note every slot is examined within ceil(64/win) events) and takes the oldest
-note admitted ready job that fits. A ready job older than a job assigned in
+note Policy 1, fair fitting (DRA-396): a pick first probes the reserved job;
+note otherwise it scans a window of win slots from a persistent cursor and
+note takes the oldest admitted ready job that fits. The cursor moves on by
+note win after every window scan, so every slot is examined within
+note ceil(64/win) window scans. A ready job older than a job assigned in
 note the same event was bypassed; once the oldest such job reaches the
 note bypass budget it is reserved: it is offered first, and no other job may
 note use, of any kind, the capacity it still lacks (others may use only
 note free capacity beyond its need). Neither the free capacity it can reach
 note nor its age ever shrinks, so it runs once running work releases enough
 note (liveness assumes: every running job ends, by completion or by its
-note lease, at least one worker stays live, and dispatch runs after
-note releases). Requests over capacity are refused at admission.
-note Admission tickets: a caller refused at the admission limit holds a
-note ticket; when room returns, ticket holders enter in ticket order before
-note anyone new, so a full table cannot exclude a caller that keeps asking.
-note A ticket not asked about for ttl dispatch events lapses.
+note lease, at least one worker stays live, results in review are reviewed,
+note and dispatch is not paused). Requests over capacity are refused at
+note admission.
+note Admission: room is the smaller of the admission headroom and the free
+note table slots. A refused caller holds a ticket; while tickets are held
+note only the first holder may enter, so holders enter in ticket order
+note before anyone new. A ticket not asked about for more than ttl dispatch
+note events lapses (asked at event e, it survives while e + ttl is at least
+note the current event count). An absent head blocks later holders until
+note its ticket lapses; a paused dispatch counts no events, so the block
+note lasts until dispatch resumes.
 note Leases: a running job with a lease is reported once by sched_overdue
 note after its lease passes; the authority then cancels or kills it, which
 note releases its resources.
@@ -355,11 +360,21 @@ note caller may ask before journaling (as jn_admit does).
 fn sched_room id ulong to bool
 sp_tkpack 64
 t = sp_tkpos id
-room = ulong 0
-if lt sched_count 1 3 get sclim 0
-room = sub get sclim 0 sched_count 1 3
+a = ulong 0
+fs = ulong 0
+for j ulong 64
+s = get sjst j
+if eq s 0
+fs = add fs 1
 end
-fs = sched_count 0 0
+if and ge s 1 le s 3
+a = add a 1
+end
+end
+room = ulong 0
+if lt a get sclim 0
+room = sub get sclim 0 a
+end
 if lt fs room
 room = fs
 end
@@ -553,9 +568,10 @@ end
 
 note Policy 1, fair fitting: the reserved job first when it fits; else the
 note oldest admitted ready job, among win slots from the cursor, that fits
-note without the capacity the reserved job still lacks. Returns the slot or
-note 64. Every slot read counts (counter 3: the reserved probe and the
-note window), at most win + 1 per pick; counter 14 counts window scans.
+note without the capacity the reserved job still lacks; the cursor then
+note moves on by win. Returns the slot or 64. Every slot read counts
+note (counter 3: the reserved probe and the window), at most win + 1 per
+note pick; counter 14 counts window scans.
 fn sp_fair to ulong
 rq = ulong 0
 r = get scpol 5
@@ -590,6 +606,7 @@ end
 end
 end
 end
+put scpol 4 rem add cur win 64
 ret b
 end
 
@@ -597,9 +614,7 @@ note After a fair dispatch event in which ya - 1 was the youngest admission
 note assigned (ya 0: none): every ready job admitted before it was bypassed
 note once; with no reservation, the oldest job at the bypass budget is
 note reserved. One pass over the table (64 maintenance reads, counter 13).
-note The cursor moves on by the window only when a window was scanned in
-note the event (sc), so no window is skipped unexamined.
-fn sp_after ya ulong sc bool to void
+fn sp_after ya ulong to void
 o = ulong 64
 nores = eq get scpol 5 0
 for j ulong 64
@@ -628,9 +643,6 @@ if lt o 64
 put scpol 5 add o 1
 put scst 6 add get scst 6 1
 end
-if sc
-put scpol 4 rem add get scpol 4 get scpol 1 64
-end
 end
 
 note Creator: assign ready jobs to idle live workers under the policy, at
@@ -644,7 +656,6 @@ k = ulong 0
 ya = ulong 0
 fair = eq get scpol 0 1
 put scst 2 add get scst 2 1
-s0 = get scst 14
 for i ulong get scpol 2 bound 64
 w = sp_idle n
 if ge w 64
@@ -666,7 +677,7 @@ sp_start c j w
 k = add k 1
 end
 if fair
-sp_after ya gt get scst 14 s0
+sp_after ya
 end
 ret k
 end

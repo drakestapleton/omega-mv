@@ -172,9 +172,11 @@ end
 
 note One creator step of up to 10 ms, then the invariant and the scan
 note bounds since the last step: candidate reads at most events x budget x
-note (window + 1), the reserved probe included (FIFO, policy 0, reads at
-note most 64 per pick), 9; maintenance reads at most 64 per event, 14; the
-note cursor moves only in events that scanned a window, 15.
+note (window + 1), the reserved probe included, or 64 per pick under FIFO
+note (policy 0), 9; maintenance reads at most 64 per event, 14; the cursor
+note moved by exactly the window per window scan, mod 64, 15. The last is
+note the traversal witness: window scans cover consecutive windows, so
+note ceil(64/win) of them examine every slot.
 fn pt_step c long code int to void
 e0 = sched_stat 2
 x0 = sched_stat 3
@@ -184,17 +186,21 @@ u0 = sched_stat 28
 r = sched_step c 10000000
 pt_ok ge r 0 code
 pt_inv code
-w = sched_stat 25
+w = add sched_stat 25 1
 if eq sched_stat 24 0
 w = ulong 64
 end
 ev = sub sched_stat 2 e0
-lim = mul mul ev sched_stat 26 add w 1
+lim = mul mul ev sched_stat 26 w
 pt_ok le sub sched_stat 3 x0 lim 9
 pt_ok le sub sched_stat 13 m0 mul ev 64 14
-if eq sched_stat 14 s0
-pt_ok eq sched_stat 28 u0 15
+pt_cursor u0 s0
 end
+
+note The cursor moved by the window once per window scan since (u0, s0).
+fn pt_cursor u0 ulong s0 ulong to void
+d = mul sched_stat 25 sub sched_stat 14 s0
+pt_ok eq sched_stat 28 rem add u0 d 64 15
 end
 
 note Step until job j is in a state in lo..hi, up to ms. True when reached.
@@ -601,10 +607,11 @@ pt_ok eq get suse 0 0 96
 pt_down c 97
 end
 
-note Phase W: bounded candidate work. Window 4 slots, dispatch budget 2:
-note 12 ready jobs fill slots 0..11, beyond any one window. Each pick reads
-note at most 4 slots (checked at every step, exit 9) and the cursor still
-note reaches every slot, so all 12 run. 101 means some never did.
+note Phase W: bounded candidate work. Window 4 slots, dispatch budget 2,
+note two workers, so an event may pick twice: 12 ready jobs fill slots
+note 0..11, beyond any one window. Each pick reads at most 5 slots (the
+note reserved probe and the window, exit 9), every window scan moves the
+note cursor on by 4 (15), and all 12 run. 101 means some never did.
 fn pt_window to void
 c = pt_setup 2 16 16 pt_req 4 1024 1 8 101
 pt_ok eq sched_policy sched_stat 24 4 2 sched_stat 27 1000 0 101
@@ -617,16 +624,17 @@ pt_down c 103
 end
 
 note Phase T: ticket order with several openings. Limit 3 held by p1, p2
-note (400 ms) and p3 (900 ms); X, Y, Z are refused in that order and hold
-note tickets (104). With two openings, Y asking first is refused (105), and
+note (400 ms) and p3, which waits on a topic nobody publishes; X, Y, Z are
+note refused in that order and hold tickets (104). p1 and p2 are reviewed,
+note so there are exactly two openings: Y asking first is refused (105), and
 note so is a new caller W, who takes a ticket behind Z (106); X enters
-note (107), then Y (108). With three openings, W asking first is refused,
-note then Z and W enter (109).
+note (107), then Y (108). p3 is cancelled and X and Y are reviewed, so there
+note are three openings: W asking first is refused, then Z and W enter (109).
 fn pt_torder to void
 c = pt_setup 3 3 8 pt_req 4 1024 1 8 104
 p = pt_admit 400400 0 0 104
 p = pt_admit 410400 0 0 104
-p = pt_admit 420900 0 0 104
+p3 = pt_admit 420050 4096 0 104
 pt_ok eq sched_admitr 430050 0 0 0 neg long 2 104
 pt_ok eq sched_admitr 440050 0 0 0 neg long 2 104
 pt_ok eq sched_admitr 450050 0 0 0 neg long 2 104
@@ -637,7 +645,8 @@ pt_ok eq sched_admitr 460050 0 0 0 neg long 2 106
 pt_ok eq sched_stat 30 4 106
 pt_ok ge sched_admitr 430050 0 0 0 0 107
 pt_ok ge sched_admitr 440050 0 0 0 0 108
-pt_drain c 3 3000 108
+pt_ok eq sched_cancel p3 1 108
+pt_drain c 2 3000 108
 pt_ok eq sched_admitr 460050 0 0 0 neg long 2 109
 pt_ok ge sched_admitr 450050 0 0 0 0 109
 pt_ok ge sched_admitr 460050 0 0 0 0 109
@@ -681,9 +690,9 @@ note Phase Z: reserved progress needs review progress. Review limit 1, two
 note workers, 2 CPU, bypass budget 1. p finishes and waits in review,
 note unreviewed. a (1 CPU) and x (1 CPU) run past b (2 CPU), so b is
 note reserved (196). a and x finish; their workers keep the results, since
-note review is full, so for 600 ms b stays ready with all CPU free (197,
-note 198). Reviewing p lets a into review, frees its worker, and b runs
-note (199).
+note review is full, so b is ready at every step for 600 ms (197) and all
+note CPU is free at the end of that interval (198). Reviewing p lets a into
+note review, frees its worker, and b runs (199).
 fn pt_live to void
 c = pt_setup 2 8 1 pt_req 2 1024 1 8 195
 pt_ok eq sched_policy sched_stat 24 64 64 1 1000 0 195
@@ -701,8 +710,8 @@ if ge ulong monons dl
 break
 end
 pt_step c 197
-end
 pt_ok eq get sjst b 2 197
+end
 pt_ok eq get suse 0 0 198
 pt_ok eq sched_review p long add get sjid p 1 199
 pt_ok pt_until c b 3 4 2000 199 199
