@@ -233,9 +233,9 @@ while newer epochs are published in other arenas.
 | `sup_spawn c w` | Creator: fork worker w. 0 in the child, the PID in the creator, -16 if slot w is live, -7 bad slot, or an errno. |
 | `sup_wwait c w interval` | Worker: 3 creator gone, 2 stop, 1 wake hint (drained; rescan state), 0 timeout, or an errno. Creator loss outranks stop, stop outranks work. |
 | `sup_ack w`, `sup_wake w`, `sup_take fd` | Post an ack, post a wake hint, read and reset an eventfd counter. |
-| `sup_poll c interval` | Creator: wait for acks and deaths; reap every worker whose life pipe hung up. Returns the number reaped. |
+| `sup_poll c interval`, `sup_pollx c interval acks` | Creator: wait for deaths and, unless `acks` is false, acks (left pending for `sup_take`). Reap every worker whose life pipe hung up. Returns the number reaped, or the first reap or poll error. |
 | `sup_reap c w` | Creator: reap the exact PID (SIGKILL after about 1 s if it has not exited), then close its life pipe, clear its hold and mark it reaped. A `waitpid` error releases nothing. |
-| `sup_stop c interval` | Creator: set stop, post every live worker's stop eventfd, reap until all exit or the interval ends, then SIGKILL and reap the rest. Returns how many were killed. |
+| `sup_stop c interval` | Creator: set stop, post every live worker's stop eventfd, and reap until all exit or the interval ends. That wait ignores acks, so a pending ack cannot turn it into a spin that kills before the deadline. Then SIGKILL and reap the rest. Returns how many were killed. |
 | `sup_live c`, `sup_closeall` | Live worker count; close every descriptor this module opened. |
 
 Death is detected without scanning PIDs. Each worker alone holds the write end
@@ -262,6 +262,7 @@ unchanged other fragments and test, compiled and run with the same timeout:
 | `pool.om`: delete `r = mapset c hw 8 e` (hold never stored) | 24; with `stress`, 129, 130 or 133 |
 | `super.om`: delete `r = fclose wr` (creator keeps a worker's life end) | 72 |
 | `pool.om`: `if ne mapget c 16 8 e` to `if false` (no epoch recheck) | 144 |
+| `super.om`: `sup_stop` waits with `acks` true (pending ack spins the wait) | 90 |
 
 The recheck control is deterministic because the gate runs the protocol steps
 in the losing order (`pool_hold` after `pool_roll` and `pool_pick`). The same
