@@ -40,6 +40,10 @@ global f_om2pos ulong 1
 global f_chkmod ulong 1
 global f_chkln ulong 1
 global f_lbase ulong 1
+note f_lcur0: where the body pass starts (after the om2 and check leads); f_lmode 1 when main asked for
+note @ng front-ir: the accepted unit is then lowered (fe_lout) where the check pass would exit 0
+global f_lcur0 ulong 1
+global f_lmode ulong 1
 global f_sbase ulong 1
 global f_tka ulong 1
 global f_tkb ulong 1
@@ -7387,6 +7391,9 @@ note ======== the end of the input: the output ========
 note writeout: the unit was accepted; the om2 diag trap-site records to stderr, then exit 0.
 note From omc.om@943d9555 writeout (10591-10624) without the machine-code output.
 fn fe_writeout st ulong to void
+if ne get f_lmode 0 0
+exit fe_lout
+end
 if eq get f_chkmod 0 1
 put f_mc 0 0
 fe_mputw 7594244768023276911 8
@@ -9910,6 +9917,7 @@ end
 fe_prescan
 fe_namescan
 put f_line 0 1
+put f_lcur0 0 get f_cur 0
 done = false
 while not done
 m = ulong 0
@@ -10106,3 +10114,1481 @@ end
 
 
 
+note ======== @ng front-ir: lower a unit fe_check accepted to ΩIR (seed/ng/IR.md s13) ========
+note A second walk over the source with the same tokenizer, after fe_check has proved the unit valid, so
+note every refusal keeps omc's code and this walk never refuses. Values are SSA: a name holds its current
+note value handle; a join block (if merge, loop head, loop latch, break target) takes the token and every
+note scalar name in scope as block parameters, and each br passes the current ones. cbr targets take only
+note the token and see the dominating values. A construct this walk does not lower exits 64 with
+note "ng: front-ir: line N: not lowered" (scope, not a refusal).
+note Names: f_lnk 0 scalar (f_lnv its value), 1 local or parameter array (f_lnv its REF), 2 global array
+note (f_lnv the IR global), 3 constant (f_lnc its canonical bits), 4 text (f_lnv the IR global, class 1).
+note f_lnt is the omc type (element type for arrays), f_lnc the length for arrays. A hidden loop counter
+note has name word 0, which no lookup asks for.
+note An array parameter (view or edit) is a REF with access 1: ΩIR v1 has no op that narrows a REF's access,
+note and a local array (access 1) is passed to view parameters; the view rule itself is fe_check's error 20.
+global f_lnw ulong 8192
+global f_lnk uchar 8192
+global f_lnt ulong 8192
+global f_lnv uint 8192
+global f_lnc ulong 8192
+global f_lnn ulong 1
+global f_lntop ulong 1
+global f_lfn uint 1
+global f_lbk uint 1
+global f_ltk uint 1
+global f_lcret ulong 1
+global f_lrv uint 1
+global f_lrt ulong 1
+global f_lrk ulong 1
+global f_lrb ulong 1
+global f_lat ulong 1
+global f_lal ulong 1
+note block stack: kind (1 if, 2 if after else, 3 while, 4 for), names at open n0, names with the loop's own
+note n1, join, head, false or exit block, break join, latch, snapshot base
+global f_lsk uchar 1024
+global f_lsn ulong 1024
+global f_lsm ulong 1024
+global f_lsj uint 1024
+global f_lsh uint 1024
+global f_lsx uint 1024
+global f_lse uint 1024
+global f_lsl uint 1024
+global f_lss ulong 1024
+global f_lsd ulong 1
+global f_lsv uint 1048576
+global f_lsp ulong 1
+global f_laq uint 8192
+global f_lah ulong 1
+global f_lan ulong 1
+global f_lca uint 65536
+global f_lcp ulong 1
+global f_lqw ulong 1
+global f_lqt ulong 1
+global f_lqm ulong 1
+global f_lqb ulong 1
+global f_lqv uint 1
+global f_lqn ulong 1
+text f_lmsg "ng: front-ir: line : not lowered\n"
+
+note lno: outside what this walk lowers: one stderr line, exit 64
+fn fe_lno to void
+put f_mc 0 0
+for j ulong 19
+fe_mputb get f_lmsg j
+end
+fe_mputn add get f_line 0 get f_lbase 0
+for j ulong 14
+fe_mputb get f_lmsg add j 19
+end
+w = write 2 f_msg 0 get f_mc 0
+exit int 64
+end
+
+note lty: omc type -> ΩIR type id (bool .. long 1..9 unchanged, f32 13, f64 14, void 0)
+fn fe_lty t ulong to uint
+if eq t 10
+ret 13
+end
+if eq t 11
+ret 14
+end
+if eq t 12
+ret 0
+end
+if or eq t 0 gt t 9
+fe_lno
+end
+ret uint t
+end
+
+fn fe_lsg t ulong to bool
+ret and ge t 6 le t 9
+end
+
+note lcan: canonical const bits of v for type t (IR.md s7.1)
+fn fe_lcan t ulong v ulong to ulong
+if ne fe_isfloat t 0
+ret v
+end
+w = fe_twid t
+if ge w 64
+ret v
+end
+m = sub shl ulong 1 w 1
+x = and v m
+if fe_lsg t
+if ne and shr x sub w 1 1 0
+x = or x not m
+end
+end
+ret x
+end
+
+note lref: REF (access a, space 0) to ARRAY of n elements of omc type t
+fn fe_lref t ulong n ulong a uint to uint
+ret ir_tref ir_tarr fe_lty t uint n a 0
+end
+
+note lop: op in the current block; operand 0 is the current token when the op carries one, and an E op
+note makes its new token current
+fn fe_lop op uint ty uint imm ulong n uint to uint
+if eq get f_lbk 0 0
+fe_lno
+end
+o = ir_op get f_lbk 0 op ty imm n
+if ne ir_htok op 0
+ir_set o 0 get f_ltk 0
+end
+if eq get i_rtk op 1
+put f_ltk 0 ir_otok o
+end
+ret o
+end
+
+fn fe_lcst t ulong v ulong to uint
+o = fe_lop 1 fe_lty t fe_lcan t v 0
+ret ir_res o
+end
+
+fn fe_lp1 op uint t ulong imm ulong a uint to uint
+o = fe_lop op fe_lty t imm 1
+ir_set o 0 a
+ret ir_res o
+end
+
+fn fe_lp2 op uint t ulong a uint b uint to uint
+o = fe_lop op fe_lty t 0 2
+ir_set o 0 a
+ir_set o 1 b
+ret ir_res o
+end
+
+fn fe_lck1 op uint code ulong a uint to void
+o = fe_lop op 0 code 2
+ir_set o 1 a
+end
+
+fn fe_lck2 op uint code ulong a uint b uint to void
+o = fe_lop op 0 code 3
+ir_set o 1 a
+ir_set o 2 b
+end
+
+note lck3: chk.bounds / chk.slice (trap 3) on r, a, b
+fn fe_lck3 op uint r uint a uint b uint to void
+o = fe_lop op 0 3 4
+ir_set o 1 r
+ir_set o 2 a
+ir_set o 3 b
+end
+
+fn fe_lval v uint t ulong to void
+put f_lrv 0 v
+put f_lrt 0 t
+put f_lrk 0 0
+end
+
+note ---- names ----
+fn fe_ladd w ulong k ulong t ulong v uint c ulong to void
+n = get f_lnn 0
+if ge n 8192
+fe_lno
+end
+put f_lnw n w
+put f_lnk n uchar k
+put f_lnt n t
+put f_lnv n v
+put f_lnc n c
+put f_lnn 0 add n 1
+end
+
+fn fe_lfind w ulong to ulong
+i = get f_lnn 0
+while gt i 0 bound 8193
+i = sub i 1
+if eq get f_lnw i w
+ret add i 1
+end
+end
+ret 0
+end
+
+note ltyw: a scalar type word (uchar .. long, f32, f64) -> omc type
+fn fe_ltyw to ulong
+fe_tok
+if or ne get f_tk 0 1 gt get f_tl 0 8
+fe_lno
+end
+c = fe_kw get f_tw 0
+if eq c 88
+ret 10
+end
+if eq c 89
+ret 11
+end
+if or lt c 2 gt c 9
+fe_lno
+end
+ret c
+end
+
+note llen: a length, bound or trap code: a number or an integer constant name
+fn fe_llen to ulong
+fe_tok
+if eq get f_tk 0 2
+ret get f_tw 0
+end
+if and eq get f_tk 0 1 le get f_tl 0 8
+x = fe_lfind get f_tw 0
+if ne x 0
+if eq get f_lnk sub x 1 3
+ret get f_lnc sub x 1
+end
+end
+end
+fe_lno
+ret 0
+end
+
+note ---- blocks and joins ----
+note ljoin: a new block taking the token and every scalar name in [0, n0)
+fn fe_ljoin n0 ulong to uint
+b = ir_blk get f_lfn 0
+for i ulong n0 bound 8192
+if eq get f_lnk i 0
+v = ir_bpar b fe_lty get f_lnt i
+end
+end
+if gt get i_bnp b 64
+fe_lno
+end
+ret b
+end
+
+note lbr: br from the current block to b with the token and the scalar names in [0, n0); the path ends
+fn fe_lbr b uint n0 ulong to void
+m = uint 0
+for i ulong n0 bound 8192
+if eq get f_lnk i 0
+m = add m 1
+end
+end
+o = fe_lop 60 0 0 add m 2
+ir_set o 0 b
+ir_set o 1 get f_ltk 0
+k = uint 2
+for i ulong n0 bound 8192
+if eq get f_lnk i 0
+ir_set o k get f_lnv i
+k = add k 1
+end
+end
+put f_lbk 0 0
+end
+
+note lbind: the scalar names in [0, n0) take b's parameters after its token
+fn fe_lbind b uint n0 ulong to void
+v = get i_vnx ir_btok b
+for i ulong n0 bound 8192
+if eq get f_lnk i 0
+put f_lnv i v
+v = get i_vnx v
+end
+end
+end
+
+fn fe_lgo b uint to void
+put f_lbk 0 b
+put f_ltk 0 ir_btok b
+end
+
+fn fe_lenter b uint n0 ulong to void
+fe_lgo b
+fe_lbind b n0
+end
+
+fn fe_lpush n0 ulong to void
+p = get f_lsp 0
+if gt add p n0 1048576
+fe_lno
+end
+for i ulong n0 bound 8192
+put f_lsv add p i get f_lnv i
+end
+put f_lsp 0 add p n0
+end
+
+fn fe_lrest p ulong n0 ulong to void
+for i ulong n0 bound 8192
+put f_lnv i get f_lsv add p i
+end
+end
+
+fn fe_lpshb k ulong n0 ulong n1 ulong h uint x uint to void
+d = get f_lsd 0
+if ge d 1024
+fe_lno
+end
+put f_lsk d uchar k
+put f_lsn d n0
+put f_lsm d n1
+put f_lsh d h
+put f_lsx d x
+put f_lsj d 0
+put f_lse d 0
+put f_lsl d 0
+put f_lss d get f_lsp 0
+put f_lsd 0 add d 1
+end
+
+fn fe_lgetj d ulong to uint
+if eq get f_lsj d 0
+put f_lsj d fe_ljoin get f_lsn d
+end
+ret get f_lsj d
+end
+
+fn fe_lgete d ulong to uint
+if eq get f_lse d 0
+put f_lse d fe_ljoin get f_lsn d
+end
+ret get f_lse d
+end
+
+fn fe_lgetl d ulong to uint
+if eq get f_lsl d 0
+put f_lsl d fe_ljoin get f_lsm d
+end
+ret get f_lsl d
+end
+
+note lloop: the innermost open loop
+fn fe_lloop to ulong
+d = get f_lsd 0
+while gt d 0 bound 1025
+d = sub d 1
+if ge get f_lsk d 3
+ret d
+end
+end
+fe_lno
+ret 0
+end
+
+note ---- values: the result is f_lrv (handle), f_lrt (omc type), f_lrk (0 a value, 1 an untyped integer
+note literal with bits f_lrb, 2 an untyped float literal with its packed span f_lrb) ----
+fn fe_lfix e ulong to void
+if eq e 0
+ret
+end
+k = get f_lrk 0
+if eq k 1
+fe_lval fe_lcst e get f_lrb 0 e
+end
+if eq k 2
+fe_lval fe_lcst e fe_fspan e get f_lrb 0 e
+end
+end
+
+fn fe_lx e ulong to void
+fe_tok
+fe_lxt e
+end
+
+note lxt: a value whose first token is read; e the expected type (0 none), which an untyped literal takes
+fn fe_lxt e ulong to void
+put f_lrk 0 0
+k = get f_tk 0
+if eq k 2
+put f_lrk 0 1
+put f_lrb 0 get f_tw 0
+put f_lrt 0 0
+fe_lfix e
+ret
+end
+if eq k 5
+fe_fparse get f_ts 0 get f_tl 0
+if eq get f_fsuf 0 0
+put f_lrk 0 2
+put f_lrb 0 add mul get f_ts 0 16777216 get f_tl 0
+put f_lrt 0 0
+fe_lfix e
+ret
+end
+t = ulong 10
+if eq get f_fsuf 0 2
+t = ulong 11
+end
+fe_lval fe_lcst t fe_fbits t t
+ret
+end
+if ne k 1
+fe_lno
+end
+if gt get f_tl 0 8
+fe_lcall fe_findfn get f_tw 0 get f_tl 0 get f_ts 0
+ret
+end
+fe_lword e fe_kw get f_tw 0
+end
+
+fn fe_lword e ulong c ulong to void
+if eq c 0
+fe_lname1
+ret
+end
+if and ge c 33 le c 48
+fe_lbin c
+ret
+end
+if or eq c 59 eq c 60
+fe_lbin c
+ret
+end
+if or eq c 91 eq c 92
+fe_lx 0
+if ne get f_lrk 0 0
+fe_lno
+end
+t = get f_lrt 0
+fe_lval fe_lp1 uint add 26 sub c 91 t 0 get f_lrv 0 t
+ret
+end
+if or eq c 49 eq c 50
+fe_lx e
+fe_lun c
+ret
+end
+if eq c 51
+fe_lget
+ret
+end
+if eq c 52
+x = fe_lanm
+fe_lval fe_lcst 5 get f_lal 0 5
+ret
+end
+if or eq c 53 eq c 54
+fe_lio c
+ret
+end
+if or eq c 55 eq c 56
+v = ulong 0
+if eq c 55
+v = ulong 1
+end
+fe_lval fe_lcst 1 v 1
+ret
+end
+if or eq c 109 eq c 130
+o = fe_lop 110 9 c 1
+fe_lval ir_res o 9
+ret
+end
+if or eq c 88 eq c 89
+fe_lfcv c
+ret
+end
+if le sub c 1 8
+fe_licv c
+ret
+end
+if eq c 90
+fe_lbc
+ret
+end
+if eq c 74
+fe_lx e
+fe_tok
+ret
+end
+fe_lno
+end
+
+note lname1: a short name as a value: a scalar, a constant, or a call
+fn fe_lname1 to void
+w = get f_tw 0
+x = fe_lfind w
+if ne x 0
+i = sub x 1
+k = get f_lnk i
+if eq k 0
+fe_lval get f_lnv i get f_lnt i
+ret
+end
+if eq k 3
+fe_lval fe_lcst get f_lnt i get f_lnc i get f_lnt i
+ret
+end
+fe_lno
+end
+fe_lcall fe_findfn w 0 0
+end
+
+fn fe_lun c ulong to void
+t = get f_lrt 0
+a = get f_lrv 0
+if ne get f_lrk 0 0
+fe_lno
+end
+if eq c 50
+fe_lval fe_lp1 19 t 0 a t
+ret
+end
+if fe_lsg t
+fe_lck1 73 1 a
+end
+fe_lval fe_lp1 15 t 0 a t
+end
+
+fn fe_llit t ulong k ulong b ulong to uint
+if eq k 1
+ret fe_lcst t b
+end
+ret fe_lcst t fe_fspan t b
+end
+
+fn fe_lbin c ulong to void
+fe_lx 0
+ak = get f_lrk 0
+av = get f_lrv 0
+aty = get f_lrt 0
+ab = get f_lrb 0
+fe_lx 0
+bk = get f_lrk 0
+bv = get f_lrv 0
+bt = get f_lrt 0
+if ne ak 0
+aty = bt
+av = fe_llit aty ak ab
+end
+if ne bk 0
+bt = aty
+bv = fe_llit bt bk get f_lrb 0
+end
+if ne aty bt
+fe_lno
+end
+fe_lbop c aty av bv
+end
+
+note lbop: binary op c (add 33 .. ge 48, rotr 59, rotl 60) on a and b of omc type t, with the checks of
+note IR.md s13; a rotate checks its amount like a shift (omc.om rotate: trap 7 at or past the width)
+fn fe_lbop c ulong t ulong a uint b uint to void
+s = fe_lsg t
+if ge c 59
+if s
+fe_lno
+end
+fe_lck1 77 7 b
+fe_lval fe_lp2 uint sub 82 c t a b t
+ret
+end
+if ge c 43
+fe_lval fe_lp2 uint add sub c 43 30 1 a b 1
+ret
+end
+if le c 35
+if s
+fe_lck2 uint add sub c 33 70 1 a b
+end
+fe_lval fe_lp2 uint add sub c 33 10 t a b t
+ret
+end
+if le c 37
+if eq fe_isfloat t 0
+fe_lck1 74 2 b
+if and s eq c 36
+fe_lck2 75 1 a b
+end
+end
+fe_lval fe_lp2 uint add sub c 36 13 t a b t
+ret
+end
+if le c 40
+fe_lval fe_lp2 uint add sub c 38 16 t a b t
+ret
+end
+fe_lck1 77 7 b
+if and s eq c 41
+fe_lck2 76 1 a b
+end
+fe_lval fe_lp2 uint add sub c 41 20 t a b t
+end
+
+note lanm: an array name token -> its name index; f_lat its element type, f_lal its length
+fn fe_lanm to ulong
+fe_tok
+if or ne get f_tk 0 1 gt get f_tl 0 8
+fe_lno
+end
+x = fe_lfind get f_tw 0
+if eq x 0
+fe_lno
+end
+i = sub x 1
+k = get f_lnk i
+if or eq k 0 eq k 3
+fe_lno
+end
+put f_lat 0 get f_lnt i
+put f_lal 0 get f_lnc i
+ret i
+end
+
+note laref: an array name token -> its REF value (a global's from gaddr)
+fn fe_laref to uint
+i = fe_lanm
+k = get f_lnk i
+if eq k 1
+ret get f_lnv i
+end
+a = uint 1
+if eq k 4
+a = uint 0
+end
+o = fe_lop 52 fe_lref get f_lnt i get f_lnc i a ulong get f_lnv i 0
+ret ir_res o
+end
+
+note lidx: the current value as a u64 index (a narrower or signed one converted; a negative one then fails
+note the bounds check, as omc's unsigned compare)
+fn fe_lidx to uint
+t = get f_lrt 0
+v = get f_lrv 0
+if eq t 5
+ret v
+end
+if or eq t 1 ge t 10
+fe_lno
+end
+ret fe_lp1 36 5 0 v
+end
+
+fn fe_lget to void
+r = fe_laref
+t = get f_lat 0
+fe_lx 5
+i = fe_lidx
+fe_lck3 79 r i fe_lcst 5 1
+o = fe_lop 42 fe_lty t 0 3
+ir_set o 1 r
+ir_set o 2 i
+fe_lval ir_res o t
+end
+
+note lio: read / write fd A off n: chk.slice on (A, off, n), then host (IR.md s7.11)
+fn fe_lio c ulong to void
+fe_lx 8
+fd = get f_lrv 0
+r = fe_laref
+fe_lx 5
+off = get f_lrv 0
+fe_lx 5
+n = get f_lrv 0
+fe_lck3 80 r off n
+o = fe_lop 110 9 c 5
+ir_set o 1 fd
+ir_set o 2 r
+ir_set o 3 off
+ir_set o 4 n
+fe_lval ir_res o 9
+end
+
+note lcf: an int-to-int or float-to-int conversion from s to d can leave the destination (trap 5)
+fn fe_lcf s ulong d ulong to bool
+if ne fe_isfloat s 0
+ret true
+end
+ws = fe_twid s
+wd = fe_twid d
+a = fe_lsg s
+b = fe_lsg d
+if and a not b
+ret true
+end
+if and not a b
+ret le wd ws
+end
+ret lt wd ws
+end
+
+note lcv: the current value converted to omc type dt (chk.conv when it can fail, then conv)
+fn fe_lcv dt ulong to void
+st = get f_lrt 0
+v = get f_lrv 0
+if eq st dt
+ret
+end
+if or eq st 1 eq dt 1
+fe_lno
+end
+if eq fe_isfloat dt 0
+if fe_lcf st dt
+o = fe_lop 78 fe_lty dt 5 2
+ir_set o 1 v
+end
+end
+fe_lval fe_lp1 36 dt 0 v dt
+end
+
+fn fe_licv c ulong to void
+fe_tok
+if eq get f_tk 0 2
+fe_lval fe_lcst c get f_tw 0 c
+ret
+end
+fe_lxt 0
+if ne get f_lrk 0 0
+fe_lno
+end
+fe_lcv c
+end
+
+note lfcv: f32 v / f64 v; an untyped integer literal is a long first, as fe_rdval
+fn fe_lfcv c ulong to void
+t = ulong 10
+if eq c 89
+t = ulong 11
+end
+fe_lx 0
+k = get f_lrk 0
+if eq k 2
+fe_lval fe_lcst t fe_fspan t get f_lrb 0 t
+ret
+end
+if eq k 1
+fe_lval fe_lcst 9 get f_lrb 0 9
+end
+fe_lcv t
+end
+
+fn fe_lbc to void
+tt = fe_ltyw
+fe_lx 0
+if ne get f_lrk 0 0
+fe_lno
+end
+if ne get f_lrt 0 tt
+fe_lval fe_lp1 37 tt 0 get f_lrv 0 tt
+end
+end
+
+note lcall: call of function f (index + 1 = its ΩIR handle); the arguments are read first
+fn fe_lcall f ulong to void
+if eq f 0
+fe_lno
+end
+j = sub f 1
+np = ulong get f_fn_np j
+bs = get f_lcp 0
+if gt add bs np 65536
+fe_lno
+end
+put f_lcp 0 add bs np
+for p ulong np bound 6
+q = add mul j 6 p
+if eq get f_fn_pk q 0
+fe_lx ulong get f_fn_pt q
+put f_lca add bs p get f_lrv 0
+else
+put f_lca add bs p fe_laref
+end
+end
+rt = ulong get f_fn_ret j
+o = fe_lop 64 fe_lty rt 0 uint add np 2
+ir_set o 1 uint f
+for p ulong np bound 6
+ir_set o uint add p 2 get f_lca add bs p
+end
+put f_lcp 0 bs
+fe_lval ir_res o rt
+end
+
+note ---- statements ----
+note lfns: one ΩIR function per unit function, in order (handle = index + 1); main is the export
+fn fe_lfns to void
+mw = or or or ulong 109 shl ulong 97 8 shl ulong 105 16 shl ulong 110 24
+mf = fe_findfn mw 4 0
+if eq mf 0
+fe_lno
+end
+if or ne get f_fn_np sub mf 1 0 ne get f_fn_ret sub mf 1 8
+fe_lno
+end
+for j ulong get f_nf 0 bound 4096
+k = uint 0
+if eq add j 1 mf
+k = uint 2
+end
+fe_lfpar j ir_fnew k 0 fe_lty ulong get f_fn_ret j
+end
+end
+
+note lfpar: the parameters of unit function j (index) on ΩIR function f
+fn fe_lfpar j ulong f uint to void
+for p ulong ulong get f_fn_np j bound 6
+q = add mul j 6 p
+pk = get f_fn_pk q
+t = ulong get f_fn_pt q
+if eq pk 0
+v = ir_fpar f fe_lty t
+else
+if or gt pk 3 eq get f_fn_pl q 0
+fe_lno
+end
+v = ir_fpar f fe_lref t get f_fn_pl q 1
+end
+end
+end
+
+note lout: lower the accepted unit, write the ΩIR binary (ir_wr) to stdout; the exit status (27 when
+note stdout fails)
+fn fe_lout to int
+if eq get f_progmo 0 0
+fe_lno
+end
+if or ne get f_om2m 0 0 ne get f_chkmod 0 0
+fe_lno
+end
+ir_init
+put f_lnn 0 0
+put f_lntop 0 0
+put f_lfn 0 0
+put f_lbk 0 0
+put f_lsd 0 0
+put f_lsp 0 0
+put f_lcp 0 0
+put f_lan 0 0
+put f_lah 0 0
+fe_lfns
+put f_cur 0 get f_lcur0 0
+put f_line 0 1
+done = false
+while not done
+m = ulong 0
+while and not done lt m 999999
+if ne fe_lstmt 0
+done = true
+end
+m = add m 1
+end
+end
+n = ir_wr
+o = ulong 0
+while lt o n bound 16777217
+k = write 1 i_out o sub n o
+if le k 0
+ret 27
+end
+o = add o ulong k
+end
+ret 0
+end
+
+fn fe_lstmt to ulong
+fe_tok
+k = get f_tk 0
+if eq k 0
+ret 0
+end
+if eq k 3
+ret 1
+end
+if ne k 1
+fe_lno
+end
+if and ne get f_om2 0 0 eq get f_line 0 get f_om2ln 0
+fe_skipnl
+ret 0
+end
+if gt get f_tl 0 8
+fe_lcall fe_findfn get f_tw 0 get f_tl 0 get f_ts 0
+fe_eol
+ret 0
+end
+w = get f_tw 0
+c = fe_kw w
+if eq c 83
+fe_skipnl
+ret 0
+end
+if eq c 64
+fe_lfn
+ret 0
+end
+if eq get f_lfn 0 0
+fe_ltop c
+ret 0
+end
+if eq c 66
+fe_lend
+ret 0
+end
+if eq c 68
+fe_lelse
+ret 0
+end
+if eq c 0
+fe_lname w
+ret 0
+end
+fe_lkw c
+ret 0
+end
+
+fn fe_lkw c ulong to void
+if eq c 67
+fe_lif
+ret
+end
+if eq c 69
+fe_lwhile
+ret
+end
+if eq c 71
+fe_lfor
+ret
+end
+if eq c 72
+fe_lret
+ret
+end
+if eq c 80
+fe_lput
+ret
+end
+if eq c 82
+fe_lx 8
+v = get f_lrv 0
+o = fe_lop 66 0 0 2
+ir_set o 1 v
+put f_lbk 0 0
+fe_eol
+ret
+end
+if eq c 86
+d = fe_lloop
+fe_lbr fe_lgete d get f_lsn d
+fe_eol
+ret
+end
+if eq c 87
+n = fe_llen
+o = fe_lop 65 0 n 1
+put f_lbk 0 0
+fe_eol
+ret
+end
+if eq c 97
+d = fe_lloop
+if eq get f_lsk d 4
+fe_lbr fe_lgetl d get f_lsm d
+else
+fe_lbr get f_lsh d get f_lsm d
+end
+fe_eol
+ret
+end
+fe_lno
+end
+
+note ltop: global, text and const lines
+fn fe_ltop c ulong to void
+if eq c 78
+fe_tok
+w = get f_tw 0
+t = fe_ltyw
+n = fe_llen
+g = ir_glob ir_tarr fe_lty t uint n 0
+fe_ladd w 2 t g n
+else
+if eq c 79
+fe_ltext
+else
+if eq c 152
+fe_lconst
+else
+fe_lno
+end
+end
+end
+put f_lntop 0 get f_lnn 0
+fe_eol
+end
+
+note ltxb: decode the text bytes [p0, e) (escapes as fe_s_text), appended to global g when g is not 0; count
+fn fe_ltxb p0 ulong e ulong g uint to ulong
+p = p0
+n = ulong 0
+while lt p e bound 16777216
+b = get f_inp p
+p = add p 1
+if eq b 92
+b = get f_inp p
+p = add p 1
+if eq b 110
+b = uchar 10
+end
+if eq b 116
+b = uchar 9
+end
+end
+if ne g 0
+ir_gbyt g uint b
+end
+n = add n 1
+end
+ret n
+end
+
+fn fe_ltext to void
+fe_tok
+w = get f_tw 0
+fe_tok
+p = get f_tw 0
+e = add p get f_tl 0
+n = fe_ltxb p e 0
+if eq n 0
+fe_lno
+end
+g = ir_glob ir_tarr 2 uint n 1
+x = fe_ltxb p e g
+fe_ladd w 4 2 g n
+end
+
+fn fe_lconst to void
+fe_tok
+w = get f_tw 0
+t = fe_ltyw
+fe_tok
+v = get f_tw 0
+if eq get f_tk 0 5
+v = fe_fspan t add mul get f_ts 0 16777216 get f_tl 0
+end
+fe_ladd w 3 t 0 fe_lcan t v
+end
+
+note lfn: fn line: entry block, parameters bound to their names, then the function's allocas (lalc)
+fn fe_lfn to void
+fe_tok
+f = fe_findfn get f_tw 0 get f_tl 0 get f_ts 0
+j = sub f 1
+put f_lfn 0 uint f
+put f_lnn 0 get f_lntop 0
+put f_lsd 0 0
+put f_lsp 0 0
+put f_lcret 0 ulong get f_fn_ret j
+b = ir_blk uint f
+put f_lbk 0 b
+put f_ltk 0 ir_ftok uint f
+v = get i_fp1 uint f
+for p ulong ulong get f_fn_np j bound 6
+fe_tok
+pw = get f_tw 0
+q = add mul j 6 p
+if eq get f_fn_pk q 0
+fe_tok
+fe_ladd pw 0 ulong get f_fn_pt q v 0
+else
+fe_tok
+t = fe_ltyw
+fe_tok
+fe_ladd pw 1 t v get f_fn_pl q
+end
+v = get i_vnx v
+end
+fe_tok
+if or gt get f_tl 0 8 ne fe_kw get f_tw 0 65
+fe_lno
+end
+fe_tok
+fe_eol
+fe_lalc
+end
+
+note lalc: every `NAME = new T N v` of the function's outermost block, read ahead from the current
+note place, becomes an alloca in the entry block (IR.md s7.5: entry block only), queued in source order
+fn fe_lalc to void
+sc = get f_cur 0
+sl = get f_line 0
+put f_lan 0 0
+put f_lah 0 0
+dp = ulong 0
+go = true
+while go bound 16777216
+fe_tok
+k = get f_tk 0
+if eq k 3
+go = false
+end
+if eq k 1
+if le get f_tl 0 8
+c = fe_kw get f_tw 0
+if or or eq c 67 eq c 69 eq c 71
+dp = add dp 1
+end
+if eq c 66
+if eq dp 0
+go = false
+else
+dp = sub dp 1
+end
+end
+if and eq c 0 eq dp 0
+fe_lalc1
+end
+end
+fe_skipnl
+end
+end
+put f_cur 0 sc
+put f_line 0 sl
+end
+
+fn fe_lalc1 to void
+fe_tok
+if or ne get f_tk 0 1 gt get f_tl 0 8
+ret
+end
+if eq fe_kw get f_tw 0 73
+fe_tok
+if or ne get f_tk 0 1 gt get f_tl 0 8
+ret
+end
+end
+if ne fe_kw get f_tw 0 84
+ret
+end
+t = fe_ltyw
+n = fe_llen
+a = get f_lan 0
+if ge a 8192
+fe_lno
+end
+o = fe_lop 50 fe_lref t n 1 0 1
+put f_laq a ir_res o
+put f_lan 0 add a 1
+end
+
+note lname: a line starting with a short name: a void call, or name [=] value (new or existing scalar,
+note or a new array)
+fn fe_lname w ulong to void
+x = fe_lfind w
+if eq x 0
+f = fe_findfn w get f_tl 0 0
+if ne f 0
+fe_lcall f
+fe_eol
+ret
+end
+end
+fe_tok
+if and eq get f_tk 0 1 le get f_tl 0 8
+if eq fe_kw get f_tw 0 73
+fe_tok
+end
+end
+if ne x 0
+i = sub x 1
+if ne get f_lnk i 0
+fe_lno
+end
+fe_lxt get f_lnt i
+put f_lnv i get f_lrv 0
+fe_eol
+ret
+end
+if and eq get f_tk 0 1 le get f_tl 0 8
+if eq fe_kw get f_tw 0 84
+fe_lnew w
+fe_eol
+ret
+end
+end
+fe_lxt 0
+if ne get f_lrk 0 0
+fe_lno
+end
+fe_ladd w 0 get f_lrt 0 get f_lrv 0 0
+fe_eol
+end
+
+fn fe_lnew w ulong to void
+t = fe_ltyw
+n = fe_llen
+fe_lx t
+h = get f_lah 0
+if ge h get f_lan 0
+fe_lno
+end
+r = get f_laq h
+put f_lah 0 add h 1
+o = fe_lop 51 0 0 3
+ir_set o 1 r
+ir_set o 2 get f_lrv 0
+fe_ladd w 1 t r n
+end
+
+fn fe_lput to void
+r = fe_laref
+t = get f_lat 0
+fe_lx 5
+i = get f_lrv 0
+it = get f_lrt 0
+fe_lx t
+v = get f_lrv 0
+put f_lrv 0 i
+put f_lrt 0 it
+ix = fe_lidx
+fe_lck3 79 r ix fe_lcst 5 1
+o = fe_lop 43 0 0 4
+ir_set o 1 r
+ir_set o 2 ix
+ir_set o 3 v
+fe_eol
+end
+
+fn fe_lret to void
+t = get f_lcret 0
+if eq t 12
+o = fe_lop 62 0 0 1
+else
+fe_lx t
+v = get f_lrv 0
+o2 = fe_lop 63 0 0 2
+ir_set o2 1 v
+end
+put f_lbk 0 0
+fe_eol
+end
+
+note lfend: the end of a function: a void one that reaches it returns
+fn fe_lfend to void
+if ne get f_lbk 0 0
+if ne get f_lcret 0 12
+fe_lno
+end
+o = fe_lop 62 0 0 1
+end
+if ne get f_lah 0 get f_lan 0
+fe_lno
+end
+put f_lfn 0 0
+put f_lbk 0 0
+put f_lnn 0 get f_lntop 0
+end
+
+fn fe_lif to void
+fe_lx 1
+c = get f_lrv 0
+tb = ir_blk get f_lfn 0
+fb = ir_blk get f_lfn 0
+o = fe_lop 61 0 0 4
+ir_set o 1 c
+ir_set o 2 tb
+ir_set o 3 fb
+n0 = get f_lnn 0
+fe_lpshb 1 n0 n0 0 fb
+fe_lpush n0
+fe_lgo tb
+fe_eol
+end
+
+fn fe_lelse to void
+d = sub get f_lsd 0 1
+n0 = get f_lsn d
+if ne get f_lbk 0 0
+fe_lbr fe_lgetj d n0
+end
+fe_lrest get f_lss d n0
+put f_lnn 0 n0
+fe_lgo get f_lsx d
+put f_lsk d 2
+fe_eol
+end
+
+fn fe_lend to void
+dd = get f_lsd 0
+if eq dd 0
+fe_lfend
+fe_eol
+ret
+end
+d = sub dd 1
+k = get f_lsk d
+n0 = get f_lsn d
+if ge k 3
+fe_lendl d
+else
+if ne get f_lbk 0 0
+fe_lbr fe_lgetj d n0
+end
+if eq k 1
+fe_lrest get f_lss d n0
+put f_lnn 0 n0
+fe_lgo get f_lsx d
+fe_lbr fe_lgetj d n0
+end
+put f_lnn 0 n0
+j = get f_lsj d
+if ne j 0
+fe_lenter j n0
+end
+end
+put f_lsp 0 get f_lss d
+put f_lsd 0 d
+fe_eol
+end
+
+note lbnd: the rest of a loop line: nothing (bound df) or bound N
+fn fe_lbnd df ulong to ulong
+fe_tok
+if eq get f_tk 0 0
+ret df
+end
+if and eq get f_tk 0 1 le get f_tl 0 8
+if eq fe_kw get f_tw 0 70
+n = fe_llen
+if eq n 0
+fe_lno
+end
+fe_eol
+ret n
+end
+end
+fe_lno
+ret 0
+end
+
+note lhead: in the loop head h (condition c computed): cbr to the body or the exit; in the body the fuel
+note check on the hidden counter (the last name, when nb is not 0) and its increment
+fn fe_lhead n0 ulong n1 ulong h uint c uint nb ulong k ulong to void
+b = ir_blk get f_lfn 0
+x = ir_blk get f_lfn 0
+o = fe_lop 61 0 0 4
+ir_set o 1 c
+ir_set o 2 b
+ir_set o 3 x
+fe_lgo b
+if ne nb 0
+s = sub n1 1
+kv = get f_lnv s
+fe_lck2 81 4 kv fe_lcst 5 nb
+put f_lnv s fe_lp2 10 5 kv fe_lcst 5 1
+end
+fe_lpshb k n0 n1 h x
+end
+
+fn fe_lwhile to void
+n0 = get f_lnn 0
+fe_ladd 0 0 5 fe_lcst 5 0 0
+n1 = get f_lnn 0
+h = fe_ljoin n1
+fe_lbr h n1
+fe_lenter h n1
+fe_lx 1
+c = get f_lrv 0
+nb = fe_lbnd 1000000
+fe_lhead n0 n1 h c nb 3
+end
+
+note lfor: for i T K [bound N]: K a number or constant (no fuel unless bound), a scalar name (read again
+note in every pass) or another value (read once here); fuel 1000000 by default for the last two
+fn fe_lfor to void
+fe_tok
+put f_lqw 0 get f_tw 0
+put f_lqt 0 fe_ltyw
+t = get f_lqt 0
+fe_tok
+put f_lqm 0 0
+k = get f_tk 0
+if eq k 2
+put f_lqb 0 fe_lcan t get f_tw 0
+else
+x = ulong 0
+if and eq k 1 le get f_tl 0 8
+x = fe_lfind get f_tw 0
+end
+if ne x 0
+if eq get f_lnk sub x 1 3
+put f_lqb 0 get f_lnc sub x 1
+else
+if eq get f_lnk sub x 1 0
+put f_lqm 0 1
+put f_lqb 0 sub x 1
+else
+fe_lno
+end
+end
+else
+fe_lxt t
+put f_lqm 0 2
+put f_lqv 0 get f_lrv 0
+end
+end
+df = ulong 0
+if ne get f_lqm 0 0
+df = ulong 1000000
+end
+put f_lqn 0 fe_lbnd df
+fe_lfor2
+end
+
+fn fe_lfor2 to void
+t = get f_lqt 0
+nb = get f_lqn 0
+n0 = get f_lnn 0
+fe_ladd get f_lqw 0 0 t fe_lcst t 0 0
+if ne nb 0
+fe_ladd 0 0 5 fe_lcst 5 0 0
+end
+n1 = get f_lnn 0
+h = fe_ljoin n1
+fe_lbr h n1
+fe_lenter h n1
+m = get f_lqm 0
+kv = get f_lqv 0
+if eq m 0
+kv = fe_lcst t get f_lqb 0
+end
+if eq m 1
+kv = get f_lnv get f_lqb 0
+end
+c = fe_lp2 32 1 get f_lnv n0 kv
+fe_lhead n0 n1 h c nb 4
+end
+
+note lendl: a loop's end: the back edge (through the latch for a for, which adds 1 to i), then the exit
+note block, which joins the break target when there is one
+fn fe_lendl d ulong to void
+n0 = get f_lsn d
+n1 = get f_lsm d
+h = get f_lsh d
+if eq get f_lsk d 4
+if ne get f_lbk 0 0
+fe_lbr fe_lgetl d n1
+end
+l = get f_lsl d
+if ne l 0
+fe_lenter l n1
+iv = get f_lnv n0
+t = get f_lnt n0
+put f_lnv n0 fe_lp2 10 t iv fe_lcst t 1
+fe_lbr h n1
+end
+else
+if ne get f_lbk 0 0
+fe_lbr h n1
+end
+end
+fe_lgo get f_lsx d
+fe_lbind h n0
+put f_lnn 0 n0
+e = get f_lse d
+if ne e 0
+fe_lbr e n0
+fe_lenter e n0
+end
+end

@@ -10,7 +10,7 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 
 | Directory | Lane | Role |
 |---|---|---|
-| `front/`, `src/front.om` | ng-front | Omega source to ΩIR; every language refusal of omc. |
+| `front/`, `src/front.om` | ng-front | Omega source to ΩIR (`@ng front-ir`, gate `front/gate-front-ir.om`); every language refusal of omc (`@ng front-check`, gate `front/gate-front.om`). |
 | `a64/`, `src/a64.om` | ng-a64 | ΩIR to AArch64. |
 | `gpu/`, `src/gpu.om` | ng-gpu | Encoder conformance gate over the CUDApp units pinned in `cudapp.lock` (D10); `gpu.om` lands in `src/`. |
 | `bench/` | ng-bench | A/B timing harness against omc and gcc -O2. |
@@ -22,7 +22,7 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `IR.md` | ΩIR v1: binary format, types, ops, token chain, coverage rule, refusal classes, text form, limits. |
 | `hostwords.tsv` | Normative host word table (`id word args class`) the `host` op is checked against. |
 | `src/ir.om` | First unit of the `ng` program (om2): ΩIR tables, builder, the one binary reader and writer (IR.md s14). |
-| `src/main.om` | Last unit: `ng` driver; mode `@ng ir-copy` reads a unit and writes it back byte for byte. |
+| `src/main.om` | Last unit: `ng` driver; mode `@ng ir-copy` reads a unit and writes it back byte for byte; `@ng front-check` and `@ng front-ir` run `src/front.om` (front/README.md). |
 | `ng.units` | The ordered unit list of `ng`, each with its sha256 pin. |
 | `ngbuild.om` | `ngbuild build OMC UNITS OUT` checks every pin, concatenates and compiles; `ngbuild sums UNITS` prints fresh pins. |
 | `sha256.om` | FIPS 180-4 SHA-256 shared by ngbuild, ngcheck and the gate. |

@@ -2,10 +2,14 @@
 
 `seed/ng/src/front.om` is the ng front end: the lexer, parser and language checks of
 `seed/omc/omc.om` @943d9555 with every machine-code path removed. It is a unit of `seed/ng/ng.units`
-(after `ir.om`, so it is OM-2 code) and runs as the ng mode `@ng front-check` (`src/main.om`): the
-payload is an Omega unit, and ng must refuse exactly what omc refuses, on the same line with the same
-error code, and accept what omc accepts (DECISIONS D5, D6, D9). It writes no program yet; ΩIR
-emission through `src/ir.om` is the next step.
+(after `ir.om`, so it is OM-2 code) and runs as two ng modes (`src/main.om`). In both the payload is an
+Omega unit, and ng must refuse exactly what omc refuses, on the same line with the same error code,
+and accept what omc accepts (DECISIONS D5, D6, D9):
+
+- `@ng front-check` checks only and writes nothing.
+- `@ng front-ir` checks the same way (the same refusals, through `fe_check`), then lowers the unit it
+  accepted to ΩIR with the `ir_*` builders of `src/ir.om` and writes the binary unit to stdout
+  (`fe_lout`, the section "@ng front-ir" at the end of front.om).
 
 ## How front.om was made (provenance, not a build step)
 
@@ -57,3 +61,36 @@ m_scope (s_end forgets to restore the name table), m_fltop (f64 accepts rem/and/
 
 CI (`.github/workflows/ng-front-arm64.yml`): NOT_RUN (GitHub Actions blocked). Host runs are recorded
 in the lane's READY files.
+
+## @ng front-ir (M1)
+
+The lowering is a second walk over the source after `fe_check` accepted it, reusing the front end's
+tokenizer, number parser and function table. Each Omega function becomes an ΩIR function (handle =
+front index + 1); `fn main to int` is the program entry (kind 2, IR.md D11). Values are SSA: a join
+(if merge, loop head, `for` latch, `break` target) is a block whose parameters are the token and every
+scalar name in scope; branch targets are fresh blocks that take only the token. The checks omc makes at
+run time become ΩIR check ops (IR.md s13): signed add/sub/mul overflow, div/rem by zero and signed
+minimum div -1, shift and rotate amounts, signed shl and neg, `get`/`put` bounds, `read`/`write` slices,
+failing conversions, and `while` fuel (1000000 passes, or its `bound`). Local and global arrays are
+`alloca`/`gaddr` references; texts are class 1 globals.
+
+What it does not lower exits 64 with `ng: front-ir: line N: not lowered` (no output): units without
+`fn main to int` (ΩIR needs a program entry; omc writes no executable for them either), mixed-type
+shifts, and every construct outside the M1 subset (read from code: the `fe_lno` call sites).
+Array parameters are `REF` with access 1 even for `view`, since ΩIR v1 has no op that narrows access;
+PROPOSED for ng-ir: a `view` op from an access-1 to an access-0 reference.
+
+Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
+
+    cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
+    gate-front-ir seed/out/omc 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df \
+      SCRATCH seed/ng/front/cases-front-ir.txt
+
+It builds ng, ngcheck and ngrun with the pinned omc, then for each `run` case compiles the unit with
+omc and runs it, lowers it with ng, requires ngcheck ACCEPT, runs the ΩIR with ngrun and compares exit
+status and stdout (stderr is free: the kernels time themselves there); for each `refuse` case ng's exit
+and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of `seed/ng/tests/ir`, the ten
+ng-bench kernels (`kernels/`, verbatim copies, `kernels/PROVENANCE.md`) and 30 refusal units of
+`cases/`. Negative controls: two lowering mutants (the `for` latch adds 2; `and`/`or`/`xor` shifted to
+the next op) must fail a run case, `@ng front-check` mode must fail the first run case (no ΩIR) and
+`@ng ir-copy` mode the first refusal case. Last line `FRONTIRGATE PASS|FAIL ...`, exit 0 or 1.
