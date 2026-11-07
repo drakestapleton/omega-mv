@@ -68,7 +68,8 @@ note 32 read end of the spawn pipe, 33 name length, 34 out dir length, 35 author
 note 36 first --neg argument, 37 index of "--", 38 OMC entry length (0: unset),
 note 39 RAD_HOME entry length (0: unset), 40 temp dir length, 41 JSON output, 42 storage length,
 note 43 SHA-256 bytes buffered, 44 SHA-256 total bytes, 45 started ns, 46 finished ns,
-note 47 gate rc, 48 negctl rc.
+note 47 gate rc, 48 negctl rc, 49 and 50 gate log write and read fd, 51 and 52 negctl log write
+note and read fd, 53 out files this gate run created.
 note kna and knb hold the normalized reviewer and author for the self-review check.
 text tverd "VERDICT "
 text tvw "VERDICT"
@@ -180,7 +181,8 @@ text tgdir "/gate"
 text tndir "/neg"
 text tglog ".gate.log"
 text tnlog ".negctl.log"
-text trtmp ".tmp"
+text ttgl "/gate.log"
+text ttnl "/negctl.log"
 text tdevnull "/dev/null"
 text ttree "tree="
 text tridk "rid="
@@ -206,7 +208,7 @@ text teargs "forge: bad gate arguments (a newline in an argument, a command that
 text tename "forge: bad repository name\n"
 text teclone "forge: fresh clone failed\n"
 text tetmp "forge: cannot create the temp dir\n"
-text teout "forge: cannot write the receipt or a log\n"
+text teout "forge: cannot write the receipt or a log (out dir missing, or an out file already exists)\n"
 text teomc "forge: OMC is set but cannot be read\n"
 text tebadh "forge: bad head\n"
 text terun "forge: cannot run the gate command\n"
@@ -1821,13 +1823,9 @@ i = add i 1
 end
 end
 
-note shfile: SHA-256 of the file at m[kp..kp+pn) as hex at m[dst..dst+64); false when unreadable
-fn shfile pn ulong dst ulong to bool
-fl = fopen m kp pn 524288 0
-if lt fl 0
-ret false
-end
-fd = int fl
+note shfd: SHA-256 of what is left to read on fd as hex at m[dst..dst+64), also copying every chunk
+note to fd wf when wf >= 0; false on a read error or a short write
+fn shfd fd int wf long dst ulong to bool
 shinit
 c = true
 ok = true
@@ -1845,15 +1843,32 @@ while lt i ulong r bound 65536
 shbyte get m add kbuf i
 i = add i 1
 end
+if ge wf 0
+w = write int wf m kbuf ulong r
+if ne w r
+ok = false
+c = false
 end
 end
 end
-x = fclose fd
+end
+end
 if eq ok false
 ret false
 end
 shfin dst
 ret true
+end
+
+note shfile: SHA-256 of the file at m[kp..kp+pn) as hex at m[dst..dst+64); false when unreadable
+fn shfile pn ulong dst ulong to bool
+fl = fopen m kp pn 524288 0
+if lt fl 0
+ret false
+end
+ok = shfd int fl long -1 dst
+x = fclose int fl
+ret ok
 end
 
 fn o2 v ulong to void
@@ -2319,33 +2334,80 @@ n = add n 9
 ret add n tcpy add kp n t
 end
 
-note otpath: opath t with ".tmp" appended
-fn otpath t view uchar * to ulong
-n = opath t
-ret add n tcpy add kp n trtmp
+note tmpath: m[kp..) = temp dir + t; return its length
+fn tmpath t view uchar * to ulong
+n = get g 40
+cpy kp kt n
+ret add n tcpy add kp n t
 end
 
-note gmklog: create the temporary log for suffix t; 32961 = O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW
-note (aarch64 values), so a file or symlink already at the .tmp path is refused, never followed
-fn gmklog t view uchar * to bool
-n = otpath t
-fl = fopen m kp n 32961 420
+note gmklog: create the log temp dir + t with 557249 = O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,
+note mode 0600, open it again with 557056 = O_RDONLY|O_NOFOLLOW|O_CLOEXEC, and require both fds to
+note be the same file (st_dev, st_ino). Write fd to g s, read fd to g s+1: the command writes through
+note the first and forge hashes and copies through the second, so a name swapped later changes
+note nothing. Flag values are aarch64 Linux, the only target the pinned omc emits.
+fn gmklog t view uchar * s ulong to bool
+n = tmpath t
+fl = fopen m kp n 557249 384
 if lt fl 0
 ret false
 end
-x = fclose int fl
+rl = fopen m kp n 557056 0
+if lt rl 0
+ret false
+end
+if ne fstat int fl m kbuf 128 0
+ret false
+end
+if ne fstat int rl m add kbuf 128 128 0
+ret false
+end
+if eq eqr kbuf add kbuf 128 16 false
+ret false
+end
+put g s ulong fl
+put g add s 1 ulong rl
 ret true
 end
 
-note gmv: rename the temporary file for suffix t into place (an older one is replaced)
-fn gmv t view uchar * to bool
-n = otpath t
-pkinit
-pkadd kp n
+note gfree: true when nothing (file or symlink) is at the out path for suffix t yet; forge never
+note replaces an out file, and the O_EXCL create at the end refuses one that appears meanwhile
+fn gfree t view uchar * to bool
 n = opath t
-pkadd kp n
-r = renames m ke pkdone 0
-ret eq r 0
+r = lstat m kp n m kbuf 128
+ret lt r 0
+end
+
+note gcopy: create the out file for suffix t (557249, mode 0644 before umask), then hash the log
+note behind read fd g s into dst while copying it there; g 53 counts the out files created
+fn gcopy t view uchar * s ulong dst ulong to bool
+n = opath t
+fl = fopen m kp n 557249 420
+if lt fl 0
+ret false
+end
+put g 53 add get g 53 1
+ok = shfd int get g s long fl dst
+x = fclose int fl
+ret ok
+end
+
+note gunl: remove the out files this run created, in creation order (gate log, negctl log, receipt)
+fn gunl to void
+c = get g 53
+if gt c 0
+n = opath tglog
+x = unlink m kp n
+end
+if gt c 1
+n = opath tnlog
+x = unlink m kp n
+end
+if gt c 2
+n = opath trsuf
+x = unlink m kp n
+end
+put g 53 0
 end
 
 note pkarg: append argument i to the exec packet
@@ -2365,9 +2427,9 @@ put g 31 add get g 31 1
 end
 
 note grun: run arguments a0..a1 through /usr/bin/env (HOME, PATH and OMC when set) in the clone
-note m[kc..kc+dn), stdin /dev/null, stdout and stderr to the log m[kp..kp+ln); return the exit
-note status (128 + signal for a killed command) or a negative errno
-fn grun a0 ulong a1 ulong dn ulong ln ulong to long
+note m[kc..kc+dn), stdin /dev/null, stdout and stderr on the open log fd lf (duplicated, never
+note reopened by name); return the exit status (128 + signal for a killed command) or a negative errno
+fn grun a0 ulong a1 ulong dn ulong lf ulong to long
 envpk
 if gt get g 38 0
 pkadd kom get g 38
@@ -2385,12 +2447,14 @@ r = chdir m kc dn
 if lt r 0
 exit 126
 end
-lf = fopen m kp ln 32769 0
-if lt lf 0
+y = dupfd int lf 1 0
+if lt y 0
 exit 126
 end
-y = dupfd int lf 1 0
 y = dupfd int lf 2 0
+if lt y 0
+exit 126
+end
 nf = fopen tdevnull 0 len tdevnull 0 0
 if lt nf 0
 exit 126
@@ -2428,7 +2492,7 @@ i = add i 1
 end
 end
 
-note gwrite: build the receipt in the output line and write it to the temporary receipt file
+note gwrite: build the receipt in the output line and create the out receipt with O_EXCL
 fn gwrite gr ulong nr ulong t0 ulong t1 ulong to bool
 put g 0 0
 otext trch
@@ -2480,11 +2544,12 @@ put g 0 0
 if ge w rcap
 ret false
 end
-n = otpath trsuf
-fl = fopen m kp n 32961 420
+n = opath trsuf
+fl = fopen m kp n 557249 420
 if lt fl 0
 ret false
 end
+put g 53 add get g 53 1
 r = write int fl m kw w
 x = fclose int fl
 if lt r 0
@@ -2493,9 +2558,23 @@ end
 ret eq ulong r w
 end
 
-note gboth: clone twice, run the gate and the negative control, hash the logs, write the receipt
-note and move logs then receipt into place. Return 0, or 1 clone failed, 2 write failed, 3 run failed.
+note gboth: check the out dir and that no out name is taken, clone twice, run the gate and the
+note negative control with their logs in the 0700 temp dir, then create the out logs and the
+note receipt with O_EXCL from the open log fds; on a failure remove the out files this run created.
+note Return 0, or 1 clone failed, 2 write failed, 3 run failed.
 fn gboth to int
+if ne faccess m kod get g 34 3 0
+ret 2
+end
+if eq gfree tglog false
+ret 2
+end
+if eq gfree tnlog false
+ret 2
+end
+if eq gfree trsuf false
+ret 2
+end
 dn = cdir tgdir
 if eq gclone dn false
 ret 1
@@ -2507,44 +2586,35 @@ dn = cdir tndir
 if eq gclone dn false
 ret 1
 end
-if eq gmklog tglog false
+if eq gmklog ttgl 49 false
 ret 2
 end
-if eq gmklog tnlog false
+if eq gmklog ttnl 51 false
 ret 2
 end
 t0 = ulong realns
 dn = cdir tgdir
-ln = otpath tglog
-gr = grun add get g 37 1 ulong argcnt dn ln
+gr = grun add get g 37 1 ulong argcnt dn get g 49
 if lt gr 0
 ret 3
 end
 dn = cdir tndir
-ln = otpath tnlog
-nr = grun get g 36 get g 37 dn ln
+nr = grun get g 36 get g 37 dn get g 51
 if lt nr 0
 ret 3
 end
 t1 = ulong realns
-ln = otpath tglog
-if eq shfile ln kgs false
+put g 53 0
+if eq gcopy tglog 50 kgs false
+gunl
 ret 2
 end
-ln = otpath tnlog
-if eq shfile ln kns false
+if eq gcopy tnlog 52 kns false
+gunl
 ret 2
 end
 if eq gwrite ulong gr ulong nr t0 t1 false
-ret 2
-end
-if eq gmv tglog false
-ret 2
-end
-if eq gmv tnlog false
-ret 2
-end
-if eq gmv trsuf false
+gunl
 ret 2
 end
 put g 47 ulong gr
