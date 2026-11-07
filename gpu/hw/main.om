@@ -5,16 +5,26 @@ note Usage (MAN is the manifest; every command checks it first and refuses a mal
 note   hwman check MAN                          schema and rule check; prints CHECK rows families admitted
 note   hwman doctor MAN                         one TARGET line per row
 note   hwman admit MAN OP [TARGET]              admission: TARGET (or the first admitted row offering
-note                                            OP) must exist, offer OP, be admitted, have a runner this
-note                                            program drives, and have its device node present
+note                                            OP) must exist, offer OP, be admitted and have its
+note                                            device node present
 note   hwman run MAN TARGET OP ARG GEN STATE [EXPECT]
 note   hwman fault MAN TARGET KIND GEN STATE    send a malformed frame (tpm: badsize, badcc); passes only
-note                                            when the kernel or the device refuses it
+note                                            on the one expected refusal: badsize kernel errno -22,
+note                                            badcc rc 0x000b0143 (TPM2_RC_COMMAND_CODE from the
+note                                            kernel resource manager layer, see tpm.om)
+note check binds every hwman- runner to the closed table in core.om (TRUN: family, route, operations),
+note so check, admit and run all use that one table.
 note STATE is the handle file "<generation> <target>\n" (created empty = generation 0); claim takes an
-note exclusive non-blocking flock on it; GEN must equal the stored generation; a submitted operation
-note advances it, so a replayed GEN is stale. EXPECT is the independent oracle value (decimal).
-note Exit: 0 PASS, 2 usage, 3 manifest refused, 4 unknown target, 5 unsupported op, 6 not admitted or
-note wrong authority, 7 stale generation or handle, 8 wrong device, 9 busy, 10 offline, 11 timeout,
+note exclusive non-blocking flock on it; GEN must equal the stored generation. Before submission byte 0
+note becomes 'x' (synced); release then writes and syncs bytes 1.., then byte 0, then syncs again.
+note Any failed or short write, or failed sync, refuses with 74 instead of PASS; the handle is then
+note unreadable (exit 7), or after only the last sync failed holds the advanced record: never an
+note earlier generation. A replayed GEN is stale. timeout_ms is overrun detection, not cancellation:
+note CPU compares the elapsed time after the operation returns; TPM bounds the wait for the response
+note (waitio) and refuses, but the command already sent is not cancelled in the chip.
+note EXPECT is the independent oracle value (decimal).
+note Exit: 0 PASS, 2 usage, 3 manifest refused, 4 unknown target, 5 unsupported op, 6 not admitted,
+note 7 stale generation or handle, 8 wrong device, 9 busy, 10 offline, 11 timeout,
 note 12 oracle mismatch, 13 device error, 14 invalid argument, 74 I/O. Traps exit 100 + code.
 
 text MUSE "usage: hwman check MAN | doctor MAN | admit MAN OP [TARGET] | run MAN TARGET OP ARG GEN STATE [EXPECT] | fault MAN TARGET KIND GEN STATE\n"
@@ -25,8 +35,9 @@ text MRUN "run"
 text MFAULT "fault"
 text MRCPU "hwman-cpu"
 text MRTPM "hwman-tpm"
-text MNATIVE "NATIVE_ISA"
-text MDIRECT "DIRECT_DEVICE"
+text ORC " rc="
+text OSTWR "state_write_failed state="
+text OFRES "unexpected_fault_result kind="
 text MYES "YES"
 text OADM " admit="
 text OCHECK "CHECK rows="
@@ -43,14 +54,13 @@ text OUNKNOWN "unknown_target target="
 text OUNSUP "unsupported_op target="
 text ONOADM "not_admitted target="
 text ONOTGT "no_admitted_target op="
-text OWAUTH "wrong_authority target="
+text OSTWRONG "wrong_handle target="
 text OOFFLINE "offline target="
 text OERR " errno="
 text OINVAL "invalid_argument arg="
 text OBUSY "busy state="
 text OSTALE "stale_generation have="
 text OSTCORR "state_unreadable state="
-text OSTWRONG "wrong_handle target="
 text OSTATEQ " state="
 text OWANT " want="
 text OUNPIN "wrong_device unpinned cpus_allowed_list"
@@ -87,8 +97,7 @@ text OPASS "PASS"
 text OFAULT "FAULT target="
 text OKIND " kind="
 text OLAYK " layer=kernel errno="
-text OLAYT " layer=tpm rc="
-text OACCEPT "FAIL device accepted a malformed frame kind="
+text OLAYT " layer=tpmrm rc="
 text OBADK "unsupported_fault kind="
 text ODASH "-"
 
@@ -107,15 +116,11 @@ oflush
 ret code
 end
 
-note row r is split; does this program drive its runner over its route
-fn ourrunner to bool
-if feq CRUNNER MRCPU
-ret feq CROUTE MNATIVE
-end
-if feq CRUNNER MRTPM
-ret feq CROUTE MDIRECT
-end
-ret false
+note the STATE argument s could not be made durable: refuse with I/O, no PASS
+fn stfail s ulong to int
+c = refuse XIO OSTWR
+oarg s
+ret rend c
 end
 
 note the row's device node exists (faccess F_OK); 0 or -errno
@@ -151,15 +156,7 @@ ot OBLOCK
 ofield CBLOCK
 ret rend c
 end
-if not ourrunner
-c = refuse XAUTH OWAUTH
-ofield CID
-ot ORUNNER
-ofield CRUNNER
-ot OROUTE
-ofield CROUTE
-ret rend c
-end
+note a runner outside the closed table is a manifest refusal in check (exit 3)
 e = nodeok
 if lt e 0
 c = refuse XOFFLINE OOFFLINE
@@ -241,7 +238,7 @@ ret rend XOK
 end
 for r ulong get gst 3
 q = rowat get grow r
-if and and flisthas COPS 3 feq CADMIT MYES ourrunner
+if and flisthas COPS 3 feq CADMIT MYES
 if ge nodeok 0
 oadmit
 ot OOP
@@ -381,8 +378,24 @@ put gst 15 ulong have
 ret fd
 end
 
-note release: when bump, store "<generation+1> <id>\n"; then unlock and close
-fn release fd int bump bool to void
+note inflight: before submission byte 0 of the handle becomes 'x' and is synced, so the handle no
+note longer parses (state_unreadable, exit 7) until release completes; true when both succeeded
+fn inflight fd int to bool
+put gtmp 0 120
+w = pwrite fd gtmp 0 1 0
+if ne w 1
+ret false
+end
+s = fsync fd
+ret eq s 0
+end
+
+note release: when bump, write "<generation+1> <id>\n" over the in-flight handle, bytes 1.. first and
+note synced, then byte 0 and synced, so a failed, short or unsynced write leaves byte 0 'x' and the
+note handle refused. The generation only grows, so the record never shrinks and needs no truncation.
+note Unlocks and closes; returns XOK, or XIO when a write was short or failed or a sync failed.
+fn release fd int bump bool to int
+code = XOK
 if bump
 k = tmpdec add get gst 15 1
 for i ulong k
@@ -395,12 +408,24 @@ for j ulong l
 put gstate add add k 1 j get gman add o j
 end
 put gstate add add k 1 l 10
-t = ftrunc fd 0
-w = pwrite fd gstate 0 add add k 2 l 0
+m = add add k 1 l
+w = pwrite fd gstate 1 m 1
 s = fsync fd
+ok = and eq w long m eq s 0
+if ok
+w = pwrite fd gstate 0 1 0
+s = fsync fd
+ok = and eq w 1 eq s 0
+end
+if not ok
+code = XIO
+end
 end
 u = flock fd 8
 c = fclose fd
+if ne code XOK
+ret code
+end
 ot OSTEP
 ot SREL
 ot OGEN
@@ -410,6 +435,7 @@ else
 odec get gst 15
 end
 oc 10
+ret XOK
 end
 
 fn oreceipt a ulong o ulong to void
@@ -503,7 +529,7 @@ ret int sub 0 fd
 end
 n = argdec 5
 if or lt n 1 gt n long CPUMAXN
-release int fd false
+x = release int fd false
 c = refuse XINVAL OINVAL
 oarg 5
 ret rend c
@@ -513,13 +539,17 @@ ot SPREP
 ot OARG
 odec ulong n
 oc 10
+if not inflight int fd
+x = release int fd false
+ret stfail 7
+end
 tmo = mul ulong fdec CTMO 1000000
 t0 = monons
 v = cpuop 4 ulong n
 t1 = monons
 el = ulong sub t1 t0
 if eq get gst 9 1
-release int fd false
+x = release int fd false
 c = refuse XUNSUP OUNSUP
 ofield CID
 ot OOP
@@ -558,7 +588,10 @@ odec el
 ot OBUDGET
 odec tmo
 oc 10
-release int fd true
+rl = release int fd true
+if ne rl XOK
+ret stfail 7
+end
 oreceipt 5 4
 ot OCPU
 odec ulong pin
@@ -698,7 +731,7 @@ end
 isprops = argeq 4 TPMPROPS
 n = tpmarg isprops
 if lt n 0
-release int sf false
+x = release int sf false
 closefd int fd
 c = refuse XINVAL OINVAL
 oarg 5
@@ -709,6 +742,11 @@ ot SPREP
 ot OARG
 odec ulong n
 oc 10
+if not inflight int sf
+closefd int fd
+x = release int sf false
+ret stfail 7
+end
 tmo = long mul ulong fdec CTMO 1000000
 t0 = monons
 r = long 0
@@ -723,6 +761,11 @@ ot SSUB
 ot OELAP
 odec el
 oc 10
+ot OSTEP
+ot SCOMP
+ot ORC
+osdec r
+oc 10
 closefd int fd
 ot OSTEP
 ot SQUI
@@ -731,7 +774,10 @@ odec el
 ot OBUDGET
 odec ulong tmo
 oc 10
-release int sf true
+rl = release int sf true
+if ne rl XOK
+ret stfail 7
+end
 oreceipt 5 4
 if and eq r 0 le el ulong tmo
 tpmout isprops ulong n
@@ -778,22 +824,38 @@ if lt sf 0
 cl = fclose int fd
 ret int sub 0 sf
 end
-tmo = long mul ulong fdec CTMO 1000000
-r = tpmfault int fd 4 tmo
+if not inflight int sf
 cl = fclose int fd
-release int sf true
-if eq get gst 9 1
-c = refuse XUNSUP OBADK
-oarg 4
-ret rend c
+x = release int sf false
+ret stfail 5
 end
-if eq r 0
-ot OACCEPT
-oarg 4
-ret rend XDEVERR
+tmo = long mul ulong fdec CTMO 1000000
+t0 = monons
+r = tpmfault int fd 4 tmo
+el = ulong sub monons t0
+cl = fclose int fd
+rl = release int sf true
+if ne rl XOK
+ret stfail 5
 end
 if eq r TPMETIME
 c = refuse XTIMEOUT OTIME
+odec el
+ot OBUDGET
+odec ulong tmo
+ret rend c
+end
+want = long 0xb0143
+if argeq 4 TPMBSZ
+want = long -22
+end
+if ne r want
+c = refuse XDEVERR OFRES
+oarg 4
+ot ORES
+osdec r
+ot OWANT
+osdec want
 ret rend c
 end
 ot OFAULT
@@ -805,7 +867,7 @@ ot OLAYK
 osdec r
 else
 ot OLAYT
-ohx ulong r 3
+ohx ulong r 8
 end
 ot OOUT
 ot OPASS
@@ -820,6 +882,17 @@ end
 g = gate 3 4
 if ne g XOK
 ret g
+end
+okop = argin 4 TOPTPM
+if feq CRUNNER MRCPU
+okop = argin 4 TOPCPU
+end
+if not okop
+c = refuse XUNSUP OUNSUP
+ofield CID
+ot OOP
+oarg 4
+ret rend c
 end
 if feq CRUNNER MRCPU
 ret runcpu
