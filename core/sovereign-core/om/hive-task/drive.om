@@ -17,7 +17,9 @@ note            exhaustion, ttl range (400 invalid), bad JSON bodies (400 invali
 note            binding, a held write lock, 400 claim races between two cockpit processes sharing
 note            one database file, command-id replay (same body, no second change, 409
 note            command_conflict on a different payload, across both processes and under a race),
-note            and a commit that cannot complete (the cockpit must not answer 200 for it).
+note            a write lock held for 2 s, past a 1 s ttl, while a claim, heartbeat or submit waits
+note            (the lease must be judged by the clock after the lock is granted), and a commit
+note            that cannot complete (the cockpit must not answer 200 for it).
 note   table    seeds every combination of state, generation, fence, artifact, verdict, lease and
 note            ttl for each operation, applies it through the API, and checks that RULES predicts
 note            each outcome and next state; op 7 does the same for command ids (prior record,
@@ -241,6 +243,11 @@ text ts11 "s11"
 text ts12 "s12"
 text ts13 "s13"
 text ts14 "s14"
+text ts15 "s15"
+text ts16 "s16"
+text ts17 "s17"
+text ts18 "s18"
+text ts19 "s19"
 text tc1 "c1"
 text cidc1 "core925-c1"
 text cidh1 "core925-h1"
@@ -253,6 +260,8 @@ text cidk1 "core925-k1"
 text cidbad "core925/1"
 text cidq "core925-q"
 text cidp "core925-p"
+text cidl1 "core925-l1"
+text cidl2 "core925-l2"
 text tslx "/x"
 text tm1 "m1"
 text tm2 "m2"
@@ -320,6 +329,12 @@ text n_rr "replay_race_two_cockpits_one_record"
 text n_cf "commit_unsafe_db_refused_at_start_row_unchanged"
 text n_cfa "commit_setup_rollback_journal_and_reader"
 text n_race "race_two_cockpits_single_grant"
+text n_lk1 "lock_setup_hold_and_send"
+text n_lk2 "lock_claim_ttl_crossed_lease_live_at_grant"
+text n_lk3 "lock_claim_cmd_ttl_crossed_lease_live_at_grant"
+text n_lk4 "lock_heartbeat_expired_while_waiting_refused_row_unchanged"
+text n_lk5 "lock_heartbeat_cmd_expired_while_waiting_refused_not_recorded"
+text n_lk6 "lock_submit_expired_while_waiting_refused_row_unchanged"
 text n_ma "migrate_setup_main_claim"
 text n_mb "migrate_setup_main_submit"
 text n_mc "migrate_old_schema_13_columns"
@@ -351,6 +366,11 @@ text tclnl "claimed\n"
 text tcnt "SELECT (SELECT count(*) FROM forge_commands WHERE command_id IN ('core925-c1', 'core925-x1', 'core925-b1')) || ' ' || (SELECT count(*) FROM forge_commands WHERE command_id = 'core925/1' OR length(command_id) > 128);\n"
 text tcntw "3 0\n"
 text trq2 "SELECT (SELECT count(*) FROM forge_tasks WHERE id GLOB 'q[0-9]*' AND status = 'claimed' AND generation = 1) || ' ' || (SELECT count(*) FROM forge_commands WHERE command_id GLOB 'core925-q[0-9]*');\n"
+text tlive "SELECT CASE WHEN status = 'claimed' AND lease_expires_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) THEN 'live' ELSE 'dead' END FROM forge_tasks WHERE id = '"
+text tlivew "live\n"
+text trowa "SELECT generation || '|' || attempt_id || '|' || COALESCE(lease_expires_ms, 0) || '|' || status FROM forge_tasks WHERE id = '"
+text tlkcnt "SELECT count(*) FROM forge_commands WHERE command_id = 'core925-l2';\n"
+text tlkcntw "0\n"
 text t4040 "40 40\n"
 text trr1 " trials=40 same_body="
 text trr2 " one_busy="
@@ -1917,7 +1937,7 @@ apd ROUT get g GLOTH
 say trace7
 apd ROUT dbc
 sp ROUT
-ok = and and eq get g add GRZ 2 0 eq get g GLOTH 0 and eq r 0 eq dbc grants
+ok = and and eq get g add GRZ 1 400 eq get g GLOTH 0 and eq r 0 eq dbc grants
 rep ok n_race
 end
 
@@ -2007,6 +2027,129 @@ cb = hrecv fb
 rqtally ca cb
 end
 
+note slock: sqlite3 holds BEGIN IMMEDIATE while one request waits in the cockpit's busy handler
+note for 2 s, longer than the 1 s ttl, then releases it. A claim must get a lease that is still
+note live after it is granted; a heartbeat or submit whose lease ran out during the wait must be
+note refused with the row unchanged, and its command id is not recorded, so a retry is refused too.
+fn slock to void
+slkc ts15 n_lk2
+setcmd cidl1
+slkc ts16 n_lk3
+nocmd
+slkh
+slkhc
+slks
+end
+
+note lockreq: POST RBODY to path on cockpit 0 while sqlite3 holds the write lock for 2 s.
+fn lockreq path view uchar * to ulong
+ok = holdon tbsql
+ck ok n_lk1
+hbuild RREQ true path
+fd = hconn get g GPORTA
+ck ge fd 0 n_lk1
+ok2 = hput fd RREQ
+ck ok2 n_lk1
+z = sleepns 2000000000
+holdoff
+ret hrecv fd
+end
+
+fn sqtid pre view uchar * want view uchar * to bool
+rsz RSQL
+ap RSQL sqhd
+ap RSQL pre
+apr RSQL RTID
+ap RSQL tqend
+r = sqlrun
+ret and eq r 0 rtext RFILE want
+end
+
+fn rowqt to bool
+rsz RSQL
+ap RSQL sqhd
+ap RSQL trowa
+apr RSQL RTID
+ap RSQL tqend
+ret eq sqlrun 0
+end
+
+fn rowsavt to void
+ok = rowqt
+rsz RROW
+if ok
+apr RROW RFILE
+end
+end
+
+fn rowsamet to bool
+if not rowqt
+ret false
+end
+if ne rln RFILE rln RROW
+ret false
+end
+ret same get bs RFILE get bs RROW rln RROW
+end
+
+fn slkc t view uchar * name view uchar * to void
+settid t
+bopen
+bagent agw2
+bttl 1
+c = lockreq pclaim
+rep and eq c 200 sqtid tlive tlivew name
+end
+
+note lkclaim: a fresh 1 s lease on task t for w2, its fence kept in RAID and the row saved;
+note NONE when the claim is not granted.
+fn lkclaim t view uchar * to ulong
+settid t
+c = claim 0 agw2 1 0
+if ne c 200
+ret NONE
+end
+gn = gen0 jnum kgen
+aidset 0
+rowsavt
+ret gn
+end
+
+fn slkh to void
+gn = lkclaim ts17
+bopen
+bagent agw2
+bfence gn
+bttl 300
+c = lockreq phb
+rep and and ne gn NONE eq c 409 rowsamet n_lk4
+end
+
+fn slkhc to void
+gn = lkclaim ts18
+setcmd cidl2
+bopen
+bagent agw2
+bfence gn
+bttl 300
+c1 = lockreq phb
+c2 = hpost 0 phb
+nocmd
+ok = sqlis tlkcnt tlkcntw
+rep and and and ne gn NONE eq c1 409 and eq c2 409 rowsamet ok n_lk5
+end
+
+fn slks to void
+gn = lkclaim ts19
+setart asha2
+bopen
+bagent agw2
+bfence gn
+bsub
+c = lockreq psub
+rep and and ne gn NONE eq c 409 rowsamet n_lk6
+end
+
 note scommit: a rollback-journal database with a reader holding its lock, so no commit can
 note finish. The cockpit must refuse to serve it (the branch requires WAL mode and exits), and
 note the task row must be unchanged. A cockpit that serves fails, whatever its claim answers.
@@ -2067,6 +2210,11 @@ sqtask ts11
 sqtask ts12
 sqtask ts13
 sqtask ts14
+sqtask ts15
+sqtask ts16
+sqtask ts17
+sqtask ts18
+sqtask ts19
 ck eq sqlrun 0 sqi1
 screate
 st1
@@ -2084,6 +2232,7 @@ srecl
 srace
 scross
 sreprace
+slock
 cockdn 1
 cockdn 0
 scommit
