@@ -1,0 +1,854 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note main.om: hwman unit 4, commands and the target lifecycle
+note   discover -> claim -> prepare -> submit -> complete -> quiesce -> release
+note Usage (MAN is the manifest; every command checks it first and refuses a malformed one, exit 3):
+note   hwman check MAN                          schema and rule check; prints CHECK rows families admitted
+note   hwman doctor MAN                         one TARGET line per row
+note   hwman admit MAN OP [TARGET]              admission: TARGET (or the first admitted row offering
+note                                            OP) must exist, offer OP, be admitted, have a runner this
+note                                            program drives, and have its device node present
+note   hwman run MAN TARGET OP ARG GEN STATE [EXPECT]
+note   hwman fault MAN TARGET KIND GEN STATE    send a malformed frame (tpm: badsize, badcc); passes only
+note                                            when the kernel or the device refuses it
+note STATE is the handle file "<generation> <target>\n" (created empty = generation 0); claim takes an
+note exclusive non-blocking flock on it; GEN must equal the stored generation; a submitted operation
+note advances it, so a replayed GEN is stale. EXPECT is the independent oracle value (decimal).
+note Exit: 0 PASS, 2 usage, 3 manifest refused, 4 unknown target, 5 unsupported op, 6 not admitted or
+note wrong authority, 7 stale generation or handle, 8 wrong device, 9 busy, 10 offline, 11 timeout,
+note 12 oracle mismatch, 13 device error, 14 invalid argument, 74 I/O. Traps exit 100 + code.
+
+text MUSE "usage: hwman check MAN | doctor MAN | admit MAN OP [TARGET] | run MAN TARGET OP ARG GEN STATE [EXPECT] | fault MAN TARGET KIND GEN STATE\n"
+text MCHECK "check"
+text MDOCTOR "doctor"
+text MADMIT "admit"
+text MRUN "run"
+text MFAULT "fault"
+text MRCPU "hwman-cpu"
+text MRTPM "hwman-tpm"
+text MNATIVE "NATIVE_ISA"
+text MDIRECT "DIRECT_DEVICE"
+text MYES "YES"
+text OADM " admit="
+text OCHECK "CHECK rows="
+text OFAMS " families=21 admitted="
+text OTARGET "TARGET "
+text OADMIT "ADMIT target="
+text ORUNNER " runner="
+text OROUTE " route="
+text OOP " op="
+text OSTATUS " status="
+text OBLOCK " blocker="
+text OFAM " family="
+text OUNKNOWN "unknown_target target="
+text OUNSUP "unsupported_op target="
+text ONOADM "not_admitted target="
+text ONOTGT "no_admitted_target op="
+text OWAUTH "wrong_authority target="
+text OOFFLINE "offline target="
+text OERR " errno="
+text OINVAL "invalid_argument arg="
+text OBUSY "busy state="
+text OSTALE "stale_generation have="
+text OSTCORR "state_unreadable state="
+text OSTWRONG "wrong_handle target="
+text OSTATEQ " state="
+text OWANT " want="
+text OUNPIN "wrong_device unpinned cpus_allowed_list"
+text OMOVED "wrong_device processor="
+text OPIN " pinned="
+text OMIDR "wrong_device midr="
+text OEXPECT " manifest="
+text OMANUF "wrong_device tpm_manufacturer="
+text OTIME "timeout elapsed_ns="
+text OBUDGET " budget_ns="
+text OMISM "oracle_mismatch result="
+text ODEV "device_error rc="
+text OSTEP "STEP "
+text SDISC "discover"
+text SCLAIM "claim"
+text SPREP "prepare"
+text SSUB "submit"
+text SCOMP "complete"
+text SQUI "quiesce"
+text SREL "release"
+text OCPU " cpu="
+text OMIDREQ " midr_el1="
+text OMANEQ " tpm_manufacturer="
+text OFW " firmware="
+text OREV " revision="
+text OGEN " generation="
+text ORES " result="
+text OELAP " elapsed_ns="
+text ORECEIPT "RECEIPT target="
+text OARROW "->"
+text OARG " arg="
+text OOUT " outcome="
+text OPASS "PASS"
+text OFAULT "FAULT target="
+text OKIND " kind="
+text OLAYK " layer=kernel errno="
+text OLAYT " layer=tpm rc="
+text OACCEPT "FAIL device accepted a malformed frame kind="
+text OBADK "unsupported_fault kind="
+text ODASH "-"
+
+global gstate uchar 256
+global gtmp uchar 32
+
+fn refuse code int why view uchar * to int
+ot TREF
+ot why
+ret code
+end
+
+fn rend code int to int
+oc 10
+oflush
+ret code
+end
+
+note row r is split; does this program drive its runner over its route
+fn ourrunner to bool
+if feq CRUNNER MRCPU
+ret feq CROUTE MNATIVE
+end
+if feq CRUNNER MRTPM
+ret feq CROUTE MDIRECT
+end
+ret false
+end
+
+note the row's device node exists (faccess F_OK); 0 or -errno
+fn nodeok to long
+pclear
+pfield CNODE
+ret faccess gpath 0 get gst 5 0
+end
+
+note gate target argument t for op argument o (o = 0: no op check); leaves the row split
+fn gate t ulong o ulong to int
+r = findrow t
+if lt r 0
+c = refuse XUNKNOWN OUNKNOWN
+oarg t
+ret rend c
+end
+if gt o 0
+if not flisthas COPS o
+c = refuse XUNSUP OUNSUP
+ofield CID
+ot OOP
+oarg o
+ret rend c
+end
+end
+if not feq CADMIT MYES
+c = refuse XAUTH ONOADM
+ofield CID
+ot OSTATUS
+ofield CSTAT
+ot OBLOCK
+ofield CBLOCK
+ret rend c
+end
+if not ourrunner
+c = refuse XAUTH OWAUTH
+ofield CID
+ot ORUNNER
+ofield CRUNNER
+ot OROUTE
+ofield CROUTE
+ret rend c
+end
+e = nodeok
+if lt e 0
+c = refuse XOFFLINE OOFFLINE
+ofield CID
+ot OERR
+osdec e
+ret rend c
+end
+ret XOK
+end
+
+fn cmdcheck to int
+c = check
+if ne c XOK
+ret c
+end
+ot OCHECK
+odec get gst 3
+ot OFAMS
+odec get gst 8
+ret rend XOK
+end
+
+fn cmddoctor to int
+c = check
+if ne c XOK
+ret c
+end
+for r ulong get gst 3
+q = rowat get grow r
+ot OTARGET
+ofield CID
+ot OFAM
+ofield CFAM
+ot OROUTE
+ofield CROUTE
+ot OSTATUS
+ofield CSTAT
+ot OADM
+ofield CADMIT
+ot ORUNNER
+ofield CRUNNER
+ot OOP
+ofield COPS
+oc 10
+end
+ot OCHECK
+odec get gst 3
+ot OFAMS
+odec get gst 8
+ret rend XOK
+end
+
+fn oadmit to void
+ot OADMIT
+ofield CID
+ot OFAM
+ofield CFAM
+ot OROUTE
+ofield CROUTE
+ot ORUNNER
+ofield CRUNNER
+end
+
+fn cmdadmit to int
+c = check
+if ne c XOK
+ret c
+end
+if eq argc 5
+g = gate 4 3
+if ne g XOK
+ret g
+end
+oadmit
+ot OOP
+oarg 3
+ret rend XOK
+end
+for r ulong get gst 3
+q = rowat get grow r
+if and and flisthas COPS 3 feq CADMIT MYES ourrunner
+if ge nodeok 0
+oadmit
+ot OOP
+oarg 3
+ret rend XOK
+end
+end
+end
+c = refuse XUNSUP ONOTGT
+oarg 3
+ret rend c
+end
+
+note decimal text of v in gtmp; returns its length
+fn tmpdec v ulong to ulong
+d = new uchar 20 0
+k = ulong 0
+x = v
+while true bound 21
+put d k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong k
+put gtmp i get d sub sub k i 1
+end
+ret k
+end
+
+note parse the n handle-file bytes in gstate, "<generation> <target>\n": the generation, -1 when
+note malformed, -2 when the stored target is not the split row's id
+fn stparse n ulong to long
+i = ulong 0
+have = ulong 0
+while true bound 20
+if ge i n
+break
+end
+ch = get gstate i
+if or lt ch 48 gt ch 57
+break
+end
+have = add mul have 10 ulong sub ch 48
+i = add i 1
+end
+if or eq i 0 ge i n
+ret -1
+end
+if ne get gstate i 32
+ret -1
+end
+o = add i 1
+idl = get gfl CID
+if ne add add o idl 1 n
+ret -2
+end
+if ne get gstate add o idl 10
+ret -2
+end
+fo = get gfo CID
+for j ulong idl
+if ne get gstate add o j get gman add fo j
+ret -2
+end
+end
+ret long have
+end
+
+fn unclaim fd int to void
+u = flock fd 8
+c = fclose fd
+end
+
+note claim: open and exclusively lock STATE (argument s); check generation argument g against it.
+note Returns the descriptor (>= 0) or minus an exit class.
+fn claim s ulong g ulong to long
+want = argdec g
+if lt want 0
+c = refuse XINVAL OINVAL
+oarg g
+ret long sub 0 rend c
+end
+pclear
+parg s
+fd = fopen gpath 0 get gst 5 66 384
+if lt fd 0
+c = refuse XIO OSTCORR
+oarg s
+ret long sub 0 rend c
+end
+k = flock int fd 6
+if lt k 0
+c = refuse XBUSY OBUSY
+oarg s
+cl = fclose int fd
+ret long sub 0 rend c
+end
+n = pread int fd gstate 0 len gstate 0
+have = long 0
+if gt n 0
+have = stparse ulong n
+end
+if lt n 0
+have = long -1
+end
+if eq have -2
+unclaim int fd
+c = refuse XSTALE OSTWRONG
+ofield CID
+ot OSTATEQ
+oarg s
+ret long sub 0 rend c
+end
+if lt have 0
+unclaim int fd
+c = refuse XSTALE OSTCORR
+oarg s
+ret long sub 0 rend c
+end
+if ne have want
+unclaim int fd
+c = refuse XSTALE OSTALE
+osdec have
+ot OWANT
+osdec want
+ret long sub 0 rend c
+end
+ot OSTEP
+ot SCLAIM
+ot OGEN
+osdec have
+oc 10
+put gst 15 ulong have
+ret fd
+end
+
+note release: when bump, store "<generation+1> <id>\n"; then unlock and close
+fn release fd int bump bool to void
+if bump
+k = tmpdec add get gst 15 1
+for i ulong k
+put gstate i get gtmp i
+end
+put gstate k 32
+o = get gfo CID
+l = get gfl CID
+for j ulong l
+put gstate add add k 1 j get gman add o j
+end
+put gstate add add k 1 l 10
+t = ftrunc fd 0
+w = pwrite fd gstate 0 add add k 2 l 0
+s = fsync fd
+end
+u = flock fd 8
+c = fclose fd
+ot OSTEP
+ot SREL
+ot OGEN
+if bump
+odec add get gst 15 1
+else
+odec get gst 15
+end
+oc 10
+end
+
+fn oreceipt a ulong o ulong to void
+ot ORECEIPT
+ofield CID
+ot OFAM
+ofield CFAM
+ot OROUTE
+ofield CROUTE
+ot ORUNNER
+ofield CRUNNER
+ot OOP
+oarg o
+ot OARG
+oarg a
+ot OGEN
+odec get gst 15
+ot OARROW
+odec add get gst 15 1
+end
+
+note decimal text of v equals argument a
+fn expok a ulong v ulong to bool
+k = tmpdec v
+if ne k get gal a
+ret false
+end
+o = get gao a
+for i ulong k
+if ne get gtmp i get gav add o i
+ret false
+end
+end
+ret true
+end
+
+note CPU discovery: pinned processor, current processor and MIDR_EL1 against the manifest identity.
+note Returns the processor (MIDR in gst 10) or minus an exit class.
+fn cpudisc to long
+pin = cpupin
+if lt pin 0
+c = refuse XWRDEV OUNPIN
+ret long sub 0 rend c
+end
+cur = cpucur
+if ne cur pin
+c = refuse XWRDEV OMOVED
+osdec cur
+ot OPIN
+osdec pin
+ret long sub 0 rend c
+end
+m = cpumidr ulong pin
+if lt m 0
+c = refuse XOFFLINE OOFFLINE
+ofield CID
+ot OERR
+osdec m
+ret long sub 0 rend c
+end
+if ne m fidhex
+c = refuse XWRDEV OMIDR
+ohx ulong m 8
+ot OEXPECT
+ofield CIDENT
+ot OCPU
+osdec pin
+ret long sub 0 rend c
+end
+ot OSTEP
+ot SDISC
+ot OCPU
+osdec pin
+ot OMIDREQ
+ohx ulong m 8
+oc 10
+put gst 10 ulong m
+ret pin
+end
+
+note CPU lifecycle for argv: 2 MAN 3 TARGET 4 OP 5 ARG 6 GEN 7 STATE [8 EXPECT]
+fn runcpu to int
+pin = cpudisc
+if lt pin 0
+ret int sub 0 pin
+end
+m = get gst 10
+fd = claim 7 6
+if lt fd 0
+ret int sub 0 fd
+end
+n = argdec 5
+if or lt n 1 gt n long CPUMAXN
+release int fd false
+c = refuse XINVAL OINVAL
+oarg 5
+ret rend c
+end
+ot OSTEP
+ot SPREP
+ot OARG
+odec ulong n
+oc 10
+tmo = mul ulong fdec CTMO 1000000
+t0 = monons
+v = cpuop 4 ulong n
+t1 = monons
+el = ulong sub t1 t0
+if eq get gst 9 1
+release int fd false
+c = refuse XUNSUP OUNSUP
+ofield CID
+ot OOP
+oarg 4
+ret rend c
+end
+ot OSTEP
+ot SSUB
+ot OELAP
+odec el
+oc 10
+code = XOK
+if eq argc 9
+if not expok 8 v
+code = XMISM
+end
+end
+ot OSTEP
+ot SCOMP
+ot ORES
+odec v
+oc 10
+cur2 = cpucur
+if ne cur2 pin
+code = XWRDEV
+end
+if gt el tmo
+code = XTIMEOUT
+end
+ot OSTEP
+ot SQUI
+ot OCPU
+osdec cur2
+ot OELAP
+odec el
+ot OBUDGET
+odec tmo
+oc 10
+release int fd true
+oreceipt 5 4
+ot OCPU
+odec ulong pin
+ot OMIDREQ
+ohx ulong m 8
+ot ORES
+odec v
+ot OELAP
+odec el
+if eq code XOK
+ot OOUT
+ot OPASS
+ret rend XOK
+end
+oc 10
+if eq code XMISM
+c = refuse code OMISM
+odec v
+ot OWANT
+oarg 8
+ret rend c
+end
+if eq code XTIMEOUT
+c = refuse code OTIME
+odec el
+ot OBUDGET
+odec tmo
+ret rend c
+end
+c = refuse code OMOVED
+osdec cur2
+ot OPIN
+osdec pin
+ret rend c
+end
+
+note TPM discovery: open the node, read the fixed properties, compare the manufacturer.
+note Returns the descriptor or minus an exit class.
+fn tpmdisc to long
+fd = tpmopen
+if lt fd 0
+code = XOFFLINE
+if or eq fd -13 eq fd -1
+code = XAUTH
+end
+c = refuse code OOFFLINE
+ofield CID
+ot OERR
+osdec fd
+ret long sub 0 rend c
+end
+tmo = long mul ulong fdec CTMO 1000000
+r = tpmprops int fd tmo
+if ne r 0
+cl = fclose int fd
+code = XDEVERR
+if eq r TPMETIME
+code = XTIMEOUT
+end
+c = refuse code ODEV
+osdec r
+ret long sub 0 rend c
+end
+want = fidhex
+if ne long get gst 10 want
+cl = fclose int fd
+c = refuse XWRDEV OMANUF
+ohx get gst 10 8
+ot OEXPECT
+ofield CIDENT
+ret long sub 0 rend c
+end
+ot OSTEP
+ot SDISC
+ot OMANEQ
+ohx get gst 10 8
+ot OFW
+ohx get gst 11 8
+oc 46
+ohx get gst 12 8
+ot OREV
+odec get gst 13
+oc 10
+ret fd
+end
+note TPM result: the fixed properties, or the n random bytes in hex
+fn tpmout isprops bool n ulong to void
+if isprops
+ot OMANEQ
+ohx get gst 10 8
+ot OFW
+ohx get gst 11 8
+oc 46
+ohx get gst 12 8
+ret
+end
+ot ORES
+for i ulong n
+b = ulong get gresp add 12 i
+oc hexc shr b 4
+oc hexc and b 15
+end
+end
+
+note TPM prepare: the operand of argument 5 (props: 0; getrandom: 1..TPMMAXR), or -1
+fn tpmarg isprops bool to long
+n = argdec 5
+if lt n 0
+ret -1
+end
+if isprops
+if ne n 0
+ret -1
+end
+ret n
+end
+if or lt n 1 gt n long TPMMAXR
+ret -1
+end
+ret n
+end
+
+fn closefd fd int to void
+c = fclose fd
+end
+
+fn runtpm to int
+fd = tpmdisc
+if lt fd 0
+ret int sub 0 fd
+end
+sf = claim 7 6
+if lt sf 0
+closefd int fd
+ret int sub 0 sf
+end
+isprops = argeq 4 TPMPROPS
+n = tpmarg isprops
+if lt n 0
+release int sf false
+closefd int fd
+c = refuse XINVAL OINVAL
+oarg 5
+ret rend c
+end
+ot OSTEP
+ot SPREP
+ot OARG
+odec ulong n
+oc 10
+tmo = long mul ulong fdec CTMO 1000000
+t0 = monons
+r = long 0
+if isprops
+r = tpmprops int fd tmo
+else
+r = tpmrand int fd ulong n tmo
+end
+el = ulong sub monons t0
+ot OSTEP
+ot SSUB
+ot OELAP
+odec el
+oc 10
+closefd int fd
+ot OSTEP
+ot SQUI
+ot OELAP
+odec el
+ot OBUDGET
+odec ulong tmo
+oc 10
+release int sf true
+oreceipt 5 4
+if and eq r 0 le el ulong tmo
+tpmout isprops ulong n
+ot OELAP
+odec el
+ot OOUT
+ot OPASS
+ret rend XOK
+end
+oc 10
+if or eq r TPMETIME gt el ulong tmo
+c = refuse XTIMEOUT OTIME
+odec el
+ot OBUDGET
+odec ulong tmo
+ret rend c
+end
+c = refuse XDEVERR ODEV
+osdec r
+ret rend c
+end
+
+fn cmdfault to int
+c = check
+if ne c XOK
+ret c
+end
+g = gate 3 0
+if ne g XOK
+ret g
+end
+okk = or argeq 4 TPMBSZ argeq 4 TPMBADCC
+if not and okk feq CRUNNER MRTPM
+c = refuse XUNSUP OBADK
+oarg 4
+ret rend c
+end
+fd = tpmdisc
+if lt fd 0
+ret int sub 0 fd
+end
+sf = claim 6 5
+if lt sf 0
+cl = fclose int fd
+ret int sub 0 sf
+end
+tmo = long mul ulong fdec CTMO 1000000
+r = tpmfault int fd 4 tmo
+cl = fclose int fd
+release int sf true
+if eq get gst 9 1
+c = refuse XUNSUP OBADK
+oarg 4
+ret rend c
+end
+if eq r 0
+ot OACCEPT
+oarg 4
+ret rend XDEVERR
+end
+if eq r TPMETIME
+c = refuse XTIMEOUT OTIME
+ret rend c
+end
+ot OFAULT
+ofield CID
+ot OKIND
+oarg 4
+if lt r 0
+ot OLAYK
+osdec r
+else
+ot OLAYT
+ohx ulong r 3
+end
+ot OOUT
+ot OPASS
+ret rend XOK
+end
+
+fn cmdrun to int
+c = check
+if ne c XOK
+ret c
+end
+g = gate 3 4
+if ne g XOK
+ret g
+end
+if feq CRUNNER MRCPU
+ret runcpu
+end
+ret runtpm
+end
+
+fn main to int
+loadargs
+n = argc
+if lt n 3
+fail XUSAGE MUSE
+end
+readman 2
+if and argeq 1 MCHECK eq n 3
+ret cmdcheck
+end
+if and argeq 1 MDOCTOR eq n 3
+ret cmddoctor
+end
+if and argeq 1 MADMIT or eq n 4 eq n 5
+ret cmdadmit
+end
+if and argeq 1 MRUN or eq n 8 eq n 9
+ret cmdrun
+end
+if and argeq 1 MFAULT eq n 7
+ret cmdfault
+end
+fail XUSAGE MUSE
+ret XUSAGE
+end

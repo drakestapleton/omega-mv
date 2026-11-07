@@ -1,0 +1,196 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note tpm.om: hwman unit 3, the TPM 2.0 DIRECT_DEVICE runner (runner hwman-tpm). It writes complete
+note TPM 2.0 command frames to the kernel resource-manager node named in the row (/dev/tpmrm0) and reads
+note the response frame back; there is no TSS library. Frame layout and constants, TCG TPM 2.0 Library
+note Part 2/3, as transcribed in tpm2-tss 4.0.1 include/tss2/tss2_tpm2_types.h and Linux
+note include/linux/tpm.h:
+note   header      tag UINT16 | commandSize UINT32 | commandCode UINT32  (big-endian, 10 bytes)
+note   tag         TPM2_ST_NO_SESSIONS 0x8001
+note   GetCapability 0x0000017a: capability UINT32, property UINT32, propertyCount UINT32
+note     response: moreData BYTE, capability UINT32, count UINT32, count x (property UINT32, value UINT32)
+note     TPM2_CAP_TPM_PROPERTIES 6; TPM2_PT_FIXED 0x100; TPM2_PT_REVISION 0x102;
+note     TPM2_PT_MANUFACTURER 0x105; TPM2_PT_FIRMWARE_VERSION_1 0x10b, _2 0x10c
+note   GetRandom   0x0000017b: bytesRequested UINT16; response TPM2B_DIGEST (size UINT16, bytes)
+note   TPM2_RC_SUCCESS 0; TPM2_RC_COMMAND_CODE 0x143; TPM2_RC_COMMAND_SIZE 0x142
+note Every response is checked: responseSize equals the bytes read, tag 0x8001, then per command the
+note exact parameter layout. The response read waits at most the row's timeout_ms (waitio).
+note Operations: props (identity and firmware), getrandom N (1..32 bytes). Fault frames (fault command):
+note   badsize  a GetRandom frame whose commandSize says 13 but 12 bytes are written
+note   badcc    a 10-byte frame with commandCode 0x11e, below TPM2_CC_FIRST 0x11f (no such command)
+
+text TPMPROPS "props"
+text TPMRAND "getrandom"
+text TPMBSZ "badsize"
+text TPMBADCC "badcc"
+const TPMMAXR ulong 32
+note responses that are not TPM frames, and a response that did not arrive in time
+const TPMEFRM long -1000
+const TPMETIME long -1001
+
+global gcmd uchar 64
+global gresp uchar 4096
+
+fn tpmp16 o ulong v ulong to void
+put gcmd o uchar and shr v 8 255
+put gcmd add o 1 uchar and v 255
+end
+
+fn tpmp32 o ulong v ulong to void
+tpmp16 o shr v 16
+tpmp16 add o 2 and v 65535
+end
+
+fn tpmg16 o ulong to ulong
+ret or shl ulong get gresp o 8 ulong get gresp add o 1
+end
+
+fn tpmg32 o ulong to ulong
+ret or shl tpmg16 o 16 tpmg16 add o 2
+end
+
+fn tpmhdr size ulong cc ulong to void
+tpmp16 0 0x8001
+tpmp32 2 size
+tpmp32 6 cc
+end
+
+note open the row's device node read-write: descriptor or -errno
+fn tpmopen to long
+pclear
+pfield CNODE
+ret fopen gpath 0 get gst 5 2 0
+end
+
+note write n command bytes, wait up to tmo nanoseconds, read and frame-check the response.
+note Returns the response length; -errno when the kernel refused the write or read; TPMETIME; TPMEFRM.
+fn tpmxfer fd int n ulong tmo long to long
+w = write fd gcmd 0 n
+if lt w 0
+ret w
+end
+if ne w long n
+ret TPMEFRM
+end
+p = waitio fd 1 tmo
+if lt p 0
+ret p
+end
+if eq p 0
+ret TPMETIME
+end
+r = read fd gresp 0 len gresp
+if lt r 0
+ret r
+end
+if lt r 10
+ret TPMEFRM
+end
+if ne tpmg32 2 ulong r
+ret TPMEFRM
+end
+if ne tpmg16 0 0x8001
+ret TPMEFRM
+end
+put gst 14 tpmg32 6
+ret r
+end
+
+note TPM2_GetCapability(TPM_PROPERTIES, PT_FIXED, 64): manufacturer gst 10, firmware gst 11/12,
+note revision gst 13. Returns 0, a negative transfer result, or the TPM response code (> 0).
+fn tpmprops fd int tmo long to long
+tpmhdr 22 0x17a
+tpmp32 10 6
+tpmp32 14 0x100
+tpmp32 18 64
+r = tpmxfer fd 22 tmo
+if lt r 0
+ret r
+end
+rc = get gst 14
+if ne rc 0
+ret long rc
+end
+n = ulong r
+if lt n 19
+ret TPMEFRM
+end
+if ne tpmg32 11 6
+ret TPMEFRM
+end
+c = tpmg32 15
+if ne add 19 mul c 8 n
+ret TPMEFRM
+end
+seen = ulong 0
+for i ulong c
+p = tpmg32 add 19 mul i 8
+v = tpmg32 add 23 mul i 8
+if eq p 0x105
+put gst 10 v
+seen = or seen 1
+end
+if eq p 0x10b
+put gst 11 v
+seen = or seen 2
+end
+if eq p 0x10c
+put gst 12 v
+seen = or seen 4
+end
+if eq p 0x102
+put gst 13 v
+seen = or seen 8
+end
+end
+if ne seen 15
+ret TPMEFRM
+end
+ret 0
+end
+
+note TPM2_GetRandom(n): the n bytes are left at gresp[12..12+n). Returns 0, a negative transfer
+note result, or the TPM response code.
+fn tpmrand fd int n ulong tmo long to long
+tpmhdr 12 0x17b
+tpmp16 10 n
+r = tpmxfer fd 12 tmo
+if lt r 0
+ret r
+end
+rc = get gst 14
+if ne rc 0
+ret long rc
+end
+if ne ulong r add 12 n
+ret TPMEFRM
+end
+if ne tpmg16 10 n
+ret TPMEFRM
+end
+ret 0
+end
+
+note fault frame argument a: returns the transfer result (negative) or the TPM response code;
+note gst 9 is 1 when a names no fault frame
+fn tpmfault fd int a ulong tmo long to long
+put gst 9 0
+if argeq a TPMBSZ
+tpmhdr 13 0x17b
+tpmp16 10 16
+r = tpmxfer fd 12 tmo
+if lt r 0
+ret r
+end
+ret long get gst 14
+end
+if argeq a TPMBADCC
+tpmhdr 10 0x11e
+r = tpmxfer fd 10 tmo
+if lt r 0
+ret r
+end
+ret long get gst 14
+end
+put gst 9 1
+ret 0
+end
