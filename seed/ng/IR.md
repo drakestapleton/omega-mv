@@ -586,8 +586,9 @@ type %t34 = struct 16 u64@0:le i32@8:be
 type %t35 = ref edit host %t33
 type %t36 = slice view host u8
 type %t37 = frag a 16 8 16 f16
+type %t38 = array u8 5
 global @g0 %t33 zero
-global @g1 %t33 data 68656c6c6f
+global @g1 %t38 data 68656c6c6f
 fn @f0 flags 0 %1:i32 %2:i32 -> i32
 block ^0
 %3 = chk.add 1 %0 %1 %2
@@ -608,27 +609,42 @@ end
 
 - Header line `omegair 1`. Then the type table, the globals, the functions, in wire order.
 - Types: built-ins by name (`void bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 f16 bf16 e4m3 e5m2
-  tok`), table types `%tN` with N the type id. `vec E L`, `array E C`, `struct SIZE` then each
+  tok`), every other id (table types and unnamed or absent ids alike) as `%tN` with N the type
+  id; a named built-in is never spelled `%tN`. `vec E L`, `array E C`, `struct SIZE` then each
   field as `TYPE@OFFSET:ORDER` (`le`, `be`), `ref ACCESS SPACE T`, `slice ACCESS SPACE E`,
   `frag ROLE M N K E`; access `view`/`edit`; space `host global shared constant private`; role `a`
-  `b` `c`.
+  `b` `c`. Type line N is `type %tN = ...` with N = 32 + its index.
 - `global @gN TYPE zero` (class 0) or `global @gN TYPE data HEX` (class 1, lowercase hex of every
-  byte).
+  byte). The data length is the byte size of TYPE (a scalar's width; VEC lanes x element; ARRAY
+  count x element; STRUCT its SIZE; 0 for anything else, printed as `data` with no hex).
 - Function line: `fn` (kind 0), `kernel` (kind 1) or `export` (kind 2), `@fN`, `flags N`, kernel
   `threads X Y Z subgroup S`, each parameter as ` %N:TYPE` (value ids from 1; the entry token %0 is
   implicit), then ` -> ` and the result type.
 - `block ^N` then each parameter as ` %N:TYPE`.
 - Op line: the defined values, if any, as `%N = ` or `%T %V = ` (token then result), the mnemonic,
-  then `ty` when the row's ty column is r, o or p (`void` for an o row without a result), then imm
-  when the row has one, then the operands. imm is decimal, except `const`: signed decimal for signed
-  ints, `true`/`false` for bool, decimal for unsigned, and `0x` with exactly 2, 4, 8 or 16 lowercase
-  hex digits of the bits for floats; `gaddr` prints `@gN`. Operands: `%N` values, `^N` blocks,
-  `@fN` functions.
+  then `ty` when the row's ty column is r, o or p (`void` for ty 0), then imm when the row has one,
+  then the operands. imm is decimal, except `const` of a scalar type: signed decimal for signed
+  ints (`-0` is not canonical), `true`/`false` for bool, decimal for unsigned, and `0x` with exactly
+  2, 4, 8 or 16 lowercase hex digits of the bits for floats; `const` of a non-scalar `ty` prints
+  the imm in decimal. `gaddr` prints `@gN`. Operands: `%N` values, `^N` blocks, `@fN` functions;
+  a variadic op's `n` is the operand count minus the row's fixed operands.
 - `end` closes the function.
 
-`seed/ng/tests/ir/` holds the fixtures: canonical text, plus byte-level mutations of assembled
-fixtures for the classes text cannot spell (MAGIC, VERSION, TRUNCATED, NONCANONICAL, TRAILING,
-UNKNOWN_OP, LIMIT).
+Ids are printed as stored, in range or not, so every semantic refusal has a text fixture. What the
+text cannot spell, `ngdis` refuses with the s11 code and `ngdis: refused class C at OFFSET` on
+stderr: MAGIC, VERSION, TRUNCATED, TRAILING, UNKNOWN_OP, more than 65536 function parameters
+(LIMIT), IO, and NONCANONICAL for an enumeration outside its set (type kind, access, space, field
+order, frag role, global class, function kind), a nonzero `ty` on a row whose ty column is 0, or a
+`const` imm that is not canonical for its scalar type. `ngas` refuses non-canonical text with
+`ngas: syntax error at line N` and exit 3 (out of order or misnumbered type, global, function,
+block or value ids; the wrong number of defined values for the row and `ty`; a fixed-operand count
+that differs from the row; a `const` outside its type; a global's data length), input or output
+over 16 MiB with exit 23, unreadable input with exit 27.
+
+`seed/ng/tests/ir/` holds the fixtures: canonical text (`NAME.oir`), and the `cases` file that
+`seed/ng/gate-ir.om` runs: text cases with their ngcheck class and offset, ngas syntax refusals,
+and byte mutations of assembled fixtures for what text cannot spell (MAGIC, VERSION, TRUNCATED,
+NONCANONICAL, TRAILING, UNKNOWN_OP), each judged by ngcheck and ngdis alike.
 
 ## 11. Refusal classes and ngcheck exit codes
 

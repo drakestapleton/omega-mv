@@ -1,0 +1,71 @@
+# seed/ng: Omega NG
+
+Omega NG is the next Omega compiler (Hive NG). Source goes through a front end (`src/front.om`) into
+ΩIR, the intermediate form specified in [`IR.md`](IR.md); passes (`src/opt.om`) rewrite ΩIR; back ends
+lower it to AArch64 (`src/a64.om`) and sm_121 (`src/gpu.om`). Everything here is Omega, compiled by
+the pinned seeded compiler `seed/out/omc`.
+
+This directory is shared by the NG lanes. Lane ng-ir owns the ΩIR spec, its in-memory form and the
+tools below; the other lanes own their `src/*.om` unit and their subdirectory (`front/`, `a64/`,
+`gpu/`, `bench/`).
+
+## ΩIR files (lane ng-ir)
+
+| File | Role |
+|---|---|
+| `IR.md` | ΩIR v1: binary format, types, ops, token chain, coverage rule, refusal classes, text form, limits. |
+| `hostwords.tsv` | Normative host word table (`id word args class`) the `host` op is checked against. |
+| `src/ir.om` | First unit of the `ng` program (om2): ΩIR tables, builder, the one binary reader and writer (IR.md s14). |
+| `src/main.om` | Last unit: `ng` driver; mode `@ng ir-copy` reads a unit and writes it back byte for byte. |
+| `ng.units` | The ordered unit list of `ng`, each with its sha256 pin. |
+| `ngbuild.om` | `ngbuild build OMC UNITS OUT` checks every pin, concatenates and compiles; `ngbuild sums UNITS` prints fresh pins. |
+| `sha256.om` | FIPS 180-4 SHA-256 shared by ngbuild, ngcheck and the gate. |
+| `ngcheck.om` | The validator: binary ΩIR on stdin, `ACCEPT <sha256> fns= blocks= ops=` or `ngcheck: CLASS at OFFSET` with the class as exit code (IR.md s11). Its own reader: it shares no code with `src/ir.om`. `ngcheck --table` prints the host word table it was built with. |
+| `ngtxt.om`, `ngas.om`, `ngdis.om` | Canonical text tools (IR.md s10): `ngas` text to binary, `ngdis` binary to text. A third independent decoder of the wire format. |
+| `tests/ir/` | Text fixtures (`*.oir`) and `cases`, the expectations the gate runs. |
+| `gate-ir.om` | The ΩIR gate. |
+
+## Build and gate
+
+From the repository root (any scratch directory works):
+
+    cat seed/ng/sha256.om seed/ng/gate-ir.om | seed/out/omc > /tmp/gate-ir && chmod +x /tmp/gate-ir
+    /tmp/gate-ir seed/out/omc /tmp/ng-ir-gate
+
+The gate builds ngbuild, ngcheck, ngas and ngdis with that omc, builds `ng` through
+`ngbuild build` (so every pin in `ng.units` is checked), requires `ngcheck --table` to equal
+`hostwords.tsv`, then runs every line of `tests/ir/cases`: the text round trip
+`ngdis(ngas(t)) == t`, the ngcheck class and byte offset, the ACCEPT digest against its own SHA-256,
+`ng ir-copy` byte identity for accepted units, ngas syntax refusals, and byte mutants judged by
+ngcheck and ngdis alike. Then its negative controls: three deliberately wrong expectations must be
+caught, and a mutant ngcheck (load and store typing disabled) must fail at least one case. Last
+line `NGIRGATE PASS cases=N`, exit 0; otherwise one `FAIL` line per failure and exit 1.
+
+The tools one by one:
+
+    cat seed/ng/sha256.om seed/ng/ngcheck.om | seed/out/omc > ngcheck
+    cat seed/ng/ngtxt.om seed/ng/ngas.om | seed/out/omc > ngas
+    cat seed/ng/ngtxt.om seed/ng/ngdis.om | seed/out/omc > ngdis
+    cat seed/ng/sha256.om seed/ng/ngbuild.om | seed/out/omc > ngbuild
+    ./ngbuild build seed/out/omc seed/ng/ng.units ng
+    ./ngas < seed/ng/tests/ir/a-arith.oir | ./ngcheck
+
+After changing a unit listed in `ng.units`, refresh its pins with `./ngbuild sums seed/ng/ng.units`.
+
+CI: `.github/workflows/ng-ir-arm64.yml` births omc from the seed, requires the committed
+`seed/out/omc.sha256`, builds the gate and runs it; every run line is one invocation and all logic
+lives in the gate.
+
+## Host dependencies
+
+Every host binary that stays in an NG build, gate or bench path, with its version, what it does
+for us and its Omega replacement (Hive NG ledger `HOST-DEPS.md`, carried here). Verification
+oracles (the pinned omc, git, gh, crumb) and referees (gcc, objdump, cuobjdump, Wolfram) are exempt.
+
+| host tool | version | where | what it does | Omega replacement |
+|---|---|---|---|---|
+| cat | GNU coreutils 9.4 (`/usr/bin/cat`) | bootstrap of ngbuild, ngcheck, ngas, ngdis and the gate (`cat A B \| omc`) | concatenates two units once, before ngbuild exists | ngbuild self-builds after the first birth; proposal: commit a units file per tool and drop cat after one bootstrap |
+| taskset | util-linux 2.39.3 | Spark builds and timed runs | pins builds to core 1, timed runs to their cores | an Omega `sched_setaffinity` host word in ngbench (proposal to omega-mv) |
+| flock | util-linux 2.39.3 | Spark lane builds and bench rounds | shared and exclusive core-pool locks between agents | an Omega flock host word, or ngbench taking the lock itself (proposal) |
+| nice | GNU coreutils 9.4 (`/usr/bin/nice`) | Spark build and timing prefixes | lowers scheduling priority | a setpriority host word (proposal) |
+| sh / YAML run lines | GitHub runner | CI workflows `ng-<lane>-arm64.yml` | one-line invocations of `.om` gates | none planned: CI glue only, no logic |
