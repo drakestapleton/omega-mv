@@ -1,0 +1,486 @@
+note collab/co9form.om (ForgePatches): Phase A forms, POST handlers and the compose page.
+note POST <o>/<r>/issues/<id>/compose (comment), <o>/<r>/patches/<id>/compose (comment or review),
+note <o>/<r>/issues/new and <o>/<r>/patches/new: contract section 5 gate (signed in, else 303 to login;
+note CSRF, else 403; per-IP write limit, else 429), then the checks of docs/collab-write.md, then 303 to
+note <o>/<r>/compose/<cid>. GET compose/<cid> is the preview with the command; compose/<cid>/<file>
+note downloads the text the command reads. The shown commands hold only fixed words, hex ids and the
+note RID; every user byte reaches rad or git only through the downloaded file and "$(...)".
+text tclogin "login"
+text tcnew "new"
+text tccompw "compose"
+text tccompp "/compose/"
+text tcfbody "body"
+text tcftitle "title"
+text tcfverd "verdict"
+text tcfdraft "draft"
+text tcvcom "comment"
+text tcvacc "accept"
+text tcvrej "reject"
+text tcvrev "review"
+text tcer1 "<section class=\"box\"><h2>Not prepared</h2>\n<p class=\"bad\">"
+text tcer2 "</p>\n<p class=\"muted\">Nothing was kept. Go back to correct the text and send it again.</p></section>\n"
+text tcetoo "The text is longer than 60000 bytes."
+text tcebad "The text must be UTF-8 without control characters (tabs and line breaks are fine)."
+text tceempty "The text is empty."
+text tcettl "The title must be one line of 1 to 256 bytes of UTF-8 without control characters."
+text tcebadv "The verdict must be comment, review, accept or reject."
+text tcebadr "The revision is not a revision of this patch, or it was redacted."
+text tcfs1 "<section class=\"box\" id=\"compose\"><h2>"
+text tcfsc "Comment"
+text tcfsp "Comment or review"
+text tcfsni "New issue"
+text tcfsnp "New patch"
+text tcfs2 "</h2>\n"
+text tcfse "</section>\n"
+text tcsgn1 "<p class=\"muted\">Sign in to prepare one. <a href=\""
+text tcsgn2 "\">Sign in with your Radicle key</a></p>\n"
+text tcfo1 "<form method=\"post\" action=\""
+text tcfo2 "\">\n<input type=\"hidden\" name=\"csrf\" value=\""
+text tcfo3 "\">\n"
+text tcfrev "<input type=\"hidden\" name=\"rev\" value=\""
+text tcfttl "<p><label>Title<br><input type=\"text\" name=\"title\" maxlength=\"256\" required></label></p>\n"
+text tcfta1 "<p><label>"
+text tcftab "Text (Markdown)"
+text tcftad "Description (Markdown, optional)"
+text tcfta2 "<br><textarea name=\"body\" rows=\"10\" maxlength=\"60000\""
+text tcfreq " required"
+text tcfta3 "></textarea></label></p>\n"
+text tcfv1 "<p><label><input type=\"radio\" name=\"verdict\" value=\"comment\" checked> Comment on revision "
+text tcfv2 "</label><br>\n<label><input type=\"radio\" name=\"verdict\" value=\"review\"> Review without a verdict</label><br>\n<label><input type=\"radio\" name=\"verdict\" value=\"accept\"> Review: accept</label><br>\n<label><input type=\"radio\" name=\"verdict\" value=\"reject\"> Review: reject</label></p>\n"
+text tcfdr "<p><label><input type=\"checkbox\" name=\"draft\" value=\"1\"> Open it as a draft</label></p>\n"
+text tcfsub "<p><button type=\"submit\">Prepare</button></p>\n</form>\n"
+text tcfexp "<p class=\"meta\">The forge checks the text and gives you the command that publishes it, signed by your own Radicle key. It never writes to Radicle itself.</p>\n"
+text tcfexpp "<p class=\"meta\">The forge never takes your commits. It checks the title and description and gives you the git push that opens the patch from your clone, signed by your own Radicle key.</p>\n"
+text tcfnorev "<p class=\"muted\">Every revision of this patch is redacted; there is nothing to comment on.</p>\n"
+text tcnwl1 "<p><a href=\""
+text tcnwli "/issues/new\">Prepare a new issue</a></p>\n"
+text tcnwlp "/patches/new\">Prepare a new patch</a></p>\n"
+text tcpatn "/patches/"
+text tcissn "/issues/"
+text tcslcomp "/compose"
+text tctnwi "New issue - "
+text tctnwp "New patch - "
+text tctpub "Publish - "
+note ---- routing
+note copost k: POST under section k (1 patches, 2 issues); 405 for anything else
+fn copost k ulong to long
+o = get gcoff 0
+n = get frestl 0
+if or gt k 2 le n add o 1
+ret 405
+end
+a = add o 1
+if coseqat a n tcnew
+ret cocnew k
+end
+e = a
+while lt e n bound 128
+if eq get frest e 47
+break
+end
+e = add e 1
+end
+if ge e n
+ret 405
+end
+if eq coseqat add e 1 n tccompw false
+ret 405
+end
+if eq cocpid a e false
+ret 404
+end
+ret cocpost k
+end
+note coseqat a b t: frest[a,b) equals t
+fn coseqat a ulong b ulong t view uchar * to bool
+if ne sub b a len t
+ret false
+end
+for i ulong len t bound 64
+if ne get frest add a i get t i
+ret false
+end
+end
+ret true
+end
+note cocget: GET compose/<cid> (page) or compose/<cid>/<file> (download); 404 unless the compose is
+note live, from this session and this repo
+fn cocget to long
+a = add get gcoff 0 1
+n = get frestl 0
+if lt n add a 32
+ret 404
+end
+s = cozfind a
+if gt s 31
+ret 404
+end
+if eq n add a 32
+ret cocpage s
+end
+if ne get frest add a 32 47
+ret 404
+end
+if cofneq get gczk s add a 33 n
+ret cocdlf s
+end
+ret 404
+end
+note ---- write gate (contract section 5)
+fn cowgate to long
+if eq get fuserl 0 0
+put fkind 0 2
+flocb
+floct tclogin
+ret 303
+end
+if eq socsrfok false
+ret 403
+end
+if eq fratelim false
+ret 429
+end
+ret 0
+end
+fn coerr t view uchar * to void
+put fobl 0 0
+fput tcer1
+fput t
+fput tcer2
+end
+note cobody req: the body field, checked (cotxtok, at most 60000 bytes, at least req); -1 refused
+fn cobody req ulong to long
+r = cobfld tcfbody
+if eq r -2
+coerr tcetoo
+ret -1
+end
+if lt r 0
+r = 0
+end
+m = cotxtok ulong r true
+if lt m 0
+coerr tcebad
+ret -1
+end
+if gt m 60000
+coerr tcetoo
+ret -1
+end
+if lt m long req
+coerr tceempty
+ret -1
+end
+ret m
+end
+note cofveq t n: gcfv[0,n) equals t
+fn cofveq t view uchar * n long to bool
+if ne n long len t
+ret false
+end
+for i ulong len t bound 64
+if ne get gcfv i get t i
+ret false
+end
+end
+ret true
+end
+note coverd: verdict field: 0 comment (also when absent), 1 accept, 2 reject, 3 review, 9 invalid
+fn coverd to ulong
+r = cobfld tcfverd
+if lt r 0
+ret ulong 0
+end
+if cofveq tcvcom r
+ret ulong 0
+end
+if cofveq tcvacc r
+ret ulong 1
+end
+if cofveq tcvrej r
+ret ulong 2
+end
+if cofveq tcvrev r
+ret ulong 3
+end
+ret ulong 9
+end
+note corevf: rev field: absent, the latest unredacted revision; else the one unredacted revision whose
+note id starts with it (4..40 hex); 9999 when there is none
+fn corevf to ulong
+r = cobfld tcrevq
+if lt r 0
+ret coqrev
+end
+if or lt r 4 gt r 40
+ret ulong 9999
+end
+n = ulong r
+m = ulong 0
+w = ulong 9999
+for v ulong get gcrn 0
+if corevm v n
+m = add m 1
+w = v
+end
+end
+if ne m 1
+ret ulong 9999
+end
+if eq get gcrx w 1
+ret ulong 9999
+end
+ret w
+end
+fn corevm v ulong n ulong to bool
+for k ulong n bound 40
+if ne get gcrv add mul v 40 k get gcfv k
+ret false
+end
+end
+ret true
+end
+note ---- POST handlers
+note cocpost k: compose on an existing COB (k 1 patch, 2 issue); 404 when it is not one of this repo
+fn cocpost k ulong to long
+g = cowgate
+if ne g 0
+ret g
+end
+if eq corefs k false
+ret 500
+end
+if eq coresolve false
+ret 404
+end
+if eq coload k false
+ret 404
+end
+put gcstil 0 0
+put gcsf 0 0
+put gcsrv 0 99
+if eq k 2
+n = cobody 1
+if lt n 0
+ret 400
+end
+ret cocdone 1 ulong n
+end
+ret cocpatc
+end
+fn cocpatc to long
+v = coverd
+if gt v 3
+coerr tcebadv
+ret 400
+end
+r = corevf
+if gt r 63
+coerr tcebadr
+ret 400
+end
+put gcsrv 0 r
+q = ulong 1
+if or eq v 1 eq v 2
+q = ulong 0
+end
+n = cobody q
+if lt n 0
+ret 400
+end
+put gcsf 0 v
+if eq v 0
+ret cocdone 2 ulong n
+end
+ret cocdone 3 ulong n
+end
+note cocnew k: new issue (k 2) or new patch (k 1): title, optional description, draft (patches)
+fn cocnew k ulong to long
+g = cowgate
+if ne g 0
+ret g
+end
+r = cobfld tcftitle
+if lt r 1
+coerr tcettl
+ret 400
+end
+m = cotxtok ulong r false
+if or lt m 1 gt m 256
+coerr tcettl
+ret 400
+end
+for i ulong ulong m bound 256
+put gcsti i get gcfv i
+end
+put gcstil 0 ulong m
+f = ulong 0
+if eq k 1
+d = cobfld tcfdraft
+if eq d 1
+if eq get gcfv 0 49
+f = ulong 8
+end
+end
+end
+put gcsf 0 f
+put gcsrv 0 99
+n = cobody 0
+if lt n 0
+ret 400
+end
+if eq k 2
+ret cocdone 4 ulong n
+end
+ret cocdone 5 ulong n
+end
+fn cocdone kd ulong n ulong to long
+s = cozsave kd n
+if gt s 31
+ret 500
+end
+put fkind 0 2
+flocrepo
+floct tccompp
+for k ulong 32
+flocc get gczid add mul s 32 k
+end
+ret 303
+end
+note ---- forms
+fn cosignin to void
+fput tcsgn1
+fputb
+fput tclogin
+fput tcsgn2
+end
+fn cofopen to void
+fput tcfo1
+fputrl
+end
+fn cofcsrf to void
+fput tcfo2
+for i ulong get fcsrfl 0 bound 64
+fescc get fcsrf i
+end
+fput tcfo3
+end
+fn cofta lab view uchar * req bool to void
+fput tcfta1
+fput lab
+fput tcfta2
+if req
+fput tcfreq
+end
+fput tcfta3
+end
+note coformc k: the compose form under a patch (k 1) or issue (k 2) page
+fn coformc k ulong to void
+fput tcfs1
+if eq k 1
+fput tcfsp
+else
+fput tcfsc
+end
+fput tcfs2
+if eq get fuserl 0 0
+cosignin
+fput tcfse
+ret
+end
+r = ulong 0
+if eq k 1
+r = coqrev
+if gt r 63
+fput tcfnorev
+fput tcfse
+ret
+end
+end
+cofopen
+if eq k 1
+fput tcpatn
+else
+fput tcissn
+end
+for i ulong 40
+fputc get gcid i
+end
+fput tcslcomp
+cofcsrf
+if eq k 1
+fput tcfrev
+for i ulong 40
+fputc get gcrv add mul r 40 i
+end
+fput tcfo3
+end
+cofta tcftab true
+if eq k 1
+fput tcfv1
+fnum add r 1
+fput tcfv2
+end
+fput tcfsub
+fput tcfexp
+fput tcfse
+end
+note conewl kd: the link to the new-issue or new-patch form under a list
+fn conewl kd ulong to void
+fput tcnwl1
+fputrl
+if eq kd 1
+fput tcnwlp
+else
+fput tcnwli
+end
+end
+note conewpg kd: GET issues/new (kd 4) or patches/new (kd 5)
+fn conewpg kd ulong to long
+put ftil 0 0
+if eq kd 4
+for i ulong len tctnwi
+ftic get tctnwi i
+end
+frepohd 6
+else
+for i ulong len tctnwp
+ftic get tctnwp i
+end
+frepohd 5
+end
+ftirepo
+fput tcfs1
+if eq kd 4
+fput tcfsni
+else
+fput tcfsnp
+end
+fput tcfs2
+if eq get fuserl 0 0
+cosignin
+fput tcfse
+ret 200
+end
+cofopen
+if eq kd 4
+fput tcissn
+else
+fput tcpatn
+end
+fput tcnew
+cofcsrf
+fput tcfttl
+cofta tcftad false
+if eq kd 5
+fput tcfdr
+end
+fput tcfsub
+if eq kd 5
+fput tcfexpp
+else
+fput tcfexp
+end
+fput tcfse
+ret 200
+end
