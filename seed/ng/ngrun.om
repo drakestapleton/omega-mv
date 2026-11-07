@@ -1,0 +1,1112 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/ngrun.om: the ΩIR reference interpreter (lane ng-ir). Build:
+note   cat seed/ng/src/ir.om seed/ng/ngrun.om | seed/out/omc > ngrun
+note Usage: ngrun FILE.ir. It runs the program entry (IR.md s6.1) of a unit that ngcheck accepts, with
+note the meaning of IR.md s7, one op at a time: host words reach the real process (stdout, stderr,
+note stdin), the exit status is the entry's i32 result, `exit v` exits v, a failing check or `trap`
+note exits 100 + code. Call depth past 65535 frames, more than 4194304 live values or more than
+note 16 MiB of memory (globals plus alloca) trap 6 (IR.md s7.9: call and alloca may trap 6).
+note It is the oracle of the differential gate (D9): no optimization, nothing shared with a back end;
+note it shares only ir.om's reader, which the ΩIR gate checks byte for byte.
+note Outside the supported subset it prints one stderr line "ngrun: unsupported op N at OFFSET" (or
+note "unsupported host word N") and exits 125; OFFSET is the op's byte offset in the file.
+note Supported: const select, integer and f32/f64 arithmetic, compare, conv, bitcast (10..37), every
+note check (70..82), facts (90..93, no effect), load store atom atomcas alloca fill gaddr len slice
+note fload fstore fref on scalar elements, br cbr ret retv call trap exit, host read write monons
+note realns cpufence cpurelax. Not yet: vectors and tiles (100..106), kernels (40, 41, 44, 45, 67),
+note fma (46), fmath (28), f16/bf16/fp8, conv rounding toward zero, vload/vstore (58, 59).
+note Input that ngcheck refuses has no meaning here; ngrun reads it with ir.om and may misbehave.
+note ---- state ------------------------------------------------------------------------------------
+note r_s: 0 slot offset (slot = r_s0 + value handle), 1 current function, 2 memory top, 3 call
+note depth, 4 value stack top
+global r_s ulong 8
+global r_v ulong 4194304
+global r_w ulong 4194304
+global r_m uchar 16777216
+global r_ga ulong 65537
+global r_cf uint 65536
+global r_co uint 65536
+global r_cs ulong 65536
+global r_cm ulong 65536
+global r_ct ulong 65536
+global r_tv ulong 64
+global r_tw ulong 64
+global r_dg uchar 24
+global r_pa uchar 4096
+text r_msg "ngrun: unsupported op \n at \nngrun: unsupported host word \nngrun: refused class \nngrun: usage: ngrun FILE.ir\nngrun: cannot read input\n"
+note ---- messages ---------------------------------------------------------------------------------
+fn rn_say a ulong b ulong to void
+k = write 2 r_msg a sub b a
+end
+fn rn_num v ulong to void
+x = v
+i = ulong 24
+for j ulong 21
+i = sub i 1
+put r_dg i uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+k = write 2 r_dg i sub 24 i
+ret
+end
+end
+end
+fn rn_nl to void
+put r_dg 0 10
+k = write 2 r_dg 0 1
+end
+note an op outside the supported subset: one line, exit 125
+fn rn_uns o uint to void
+op = ulong get i_oop o
+if eq op 110
+rn_say 28 57
+rn_num get i_oim o
+else
+rn_say 0 22
+rn_num op
+end
+rn_say 23 27
+rn_num ulong get i_oof o
+rn_nl
+exit 125
+end
+note ---- values -----------------------------------------------------------------------------------
+fn rn_g h uint to ulong
+ret get r_v add get r_s 0 ulong h
+end
+fn rn_gw h uint to ulong
+ret get r_w add get r_s 0 ulong h
+end
+fn rn_p h uint x ulong to void
+put r_v add get r_s 0 ulong h x
+end
+fn rn_pw h uint x ulong to void
+put r_w add get r_s 0 ulong h x
+end
+note value and type of operand slot k of op o
+fn rn_a o uint k uint to ulong
+ret rn_g ir_arg o k
+end
+fn rn_aw o uint k uint to ulong
+ret rn_gw ir_arg o k
+end
+fn rn_at o uint k uint to uint
+ret get i_vty ir_arg o k
+end
+note set op o's result (both words)
+fn rn_r o uint x ulong to void
+h = get i_ors o
+if ne h 0
+rn_p h x
+rn_pw h 0
+end
+end
+fn rn_rw o uint y ulong to void
+h = get i_ors o
+if ne h 0
+rn_pw h y
+end
+end
+note ---- scalar types -----------------------------------------------------------------------------
+fn rn_w t uint to ulong
+if eq t 1
+ret 1
+end
+if or eq t 2 eq t 6
+ret 8
+end
+if or eq t 3 eq t 7
+ret 16
+end
+if or eq t 4 or eq t 8 eq t 13
+ret 32
+end
+ret 64
+end
+fn rn_sg t uint to bool
+ret and ge t 6 le t 9
+end
+fn rn_isi t uint to bool
+ret and ge t 2 le t 9
+end
+fn rn_isf t uint to bool
+ret or eq t 13 eq t 14
+end
+note the canonical form of x as type t: zero-extended when unsigned, sign-extended when signed
+fn rn_cn t uint x ulong to ulong
+w = rn_w t
+if eq w 64
+ret x
+end
+y = and x sub shl ulong 1 w 1
+if rn_sg t
+s = shl ulong 1 sub w 1
+ret sub xor y s s
+end
+ret y
+end
+fn rn_min t uint to ulong
+ret rn_cn t shl ulong 1 sub rn_w t 1
+end
+fn rn_lt t uint a ulong b ulong to bool
+if rn_sg t
+ret lt bitcast long a bitcast long b
+end
+ret lt a b
+end
+note ---- integer arithmetic (IR.md s7.3: total) -----------------------------------------------------
+fn rn_div t uint a ulong b ulong to ulong
+if eq b 0
+ret 0
+end
+if rn_sg t
+if and eq a rn_min t eq b sub ulong 0 1
+ret a
+end
+ret rn_cn t bitcast ulong div bitcast long a bitcast long b
+end
+ret div a b
+end
+fn rn_rem t uint a ulong b ulong to ulong
+if eq b 0
+ret 0
+end
+if rn_sg t
+if eq b sub ulong 0 1
+ret 0
+end
+ret rn_cn t bitcast ulong rem bitcast long a bitcast long b
+end
+ret rem a b
+end
+fn rn_rot t uint a ulong b ulong l bool to ulong
+w = rn_w t
+s = and b sub w 1
+if eq s 0
+ret a
+end
+if not l
+s = sub w s
+end
+ret rn_cn t or shl a s shr a sub w s
+end
+fn rn_ia op uint t uint a ulong b ulong to ulong
+if eq op 10
+ret rn_cn t add a b
+end
+if eq op 11
+ret rn_cn t sub a b
+end
+if eq op 12
+ret rn_cn t mul a b
+end
+if eq op 13
+ret rn_div t a b
+end
+if eq op 14
+ret rn_rem t a b
+end
+if eq op 15
+ret rn_cn t sub ulong 0 a
+end
+if eq op 16
+ret and a b
+end
+if eq op 17
+ret or a b
+end
+if eq op 18
+ret xor a b
+end
+if eq op 19
+ret rn_cn t not a
+end
+s = and b sub rn_w t 1
+if eq op 20
+ret rn_cn t shl a s
+end
+if eq op 21
+if rn_sg t
+ret bitcast ulong shr bitcast long a bitcast long s
+end
+ret shr a s
+end
+if eq op 22
+ret rn_rot t a b true
+end
+if eq op 23
+ret rn_rot t a b false
+end
+if eq op 24
+if rn_lt t b a
+ret b
+end
+ret a
+end
+if rn_lt t a b
+ret b
+end
+ret a
+end
+fn rn_icmp op uint t uint a ulong b ulong to bool
+if eq op 30
+ret eq a b
+end
+if eq op 31
+ret ne a b
+end
+if eq op 32
+ret rn_lt t a b
+end
+if eq op 33
+ret not rn_lt t b a
+end
+if eq op 34
+ret rn_lt t b a
+end
+ret not rn_lt t a b
+end
+note ---- floats: raw bits in the low 32 (f32) or 64 (f64) bits of a value ----------------------------
+fn rn_tof t uint a ulong to f64
+if eq t 13
+ret f64 bitcast f32 uint a
+end
+ret bitcast f64 a
+end
+fn rn_f64 op uint a ulong b ulong to ulong
+x = bitcast f64 a
+y = bitcast f64 b
+if eq op 10
+ret bitcast ulong add x y
+end
+if eq op 11
+ret bitcast ulong sub x y
+end
+if eq op 12
+ret bitcast ulong mul x y
+end
+if eq op 13
+ret bitcast ulong div x y
+end
+if eq op 26
+ret bitcast ulong fsqrt x
+end
+ret 0
+end
+fn rn_f32 op uint a ulong b ulong to ulong
+x = bitcast f32 uint a
+y = bitcast f32 uint b
+if eq op 10
+ret ulong bitcast uint add x y
+end
+if eq op 11
+ret ulong bitcast uint sub x y
+end
+if eq op 12
+ret ulong bitcast uint mul x y
+end
+if eq op 13
+ret ulong bitcast uint div x y
+end
+if eq op 26
+ret ulong bitcast uint fsqrt x
+end
+ret 0
+end
+note min and max: a NaN operand gives the other; -0 < +0 (equal values differ only in the sign bit)
+fn rn_fmm op uint t uint a ulong b ulong to ulong
+x = rn_tof t a
+y = rn_tof t b
+if ne x x
+ret b
+end
+if ne y y
+ret a
+end
+if eq op 24
+if lt x y
+ret a
+end
+if lt y x
+ret b
+end
+ret or a b
+end
+if gt x y
+ret a
+end
+if gt y x
+ret b
+end
+ret and a b
+end
+fn rn_fa op uint t uint a ulong b ulong to ulong
+sb = shl ulong 1 sub rn_w t 1
+if eq op 15
+ret xor a sb
+end
+if eq op 27
+ret and a sub sb 1
+end
+if or eq op 24 eq op 25
+ret rn_fmm op t a b
+end
+if eq t 13
+ret rn_f32 op a b
+end
+ret rn_f64 op a b
+end
+fn rn_fcmp op uint t uint a ulong b ulong to bool
+x = rn_tof t a
+y = rn_tof t b
+if eq op 30
+ret eq x y
+end
+if eq op 31
+ret ne x y
+end
+if eq op 32
+ret lt x y
+end
+if eq op 33
+ret le x y
+end
+if eq op 34
+ret gt x y
+end
+ret ge x y
+end
+fn rn_b2u c bool to ulong
+if c
+ret 1
+end
+ret 0
+end
+note ---- conv and bitcast (IR.md s7.3) -------------------------------------------------------------
+note float x to int type t: truncate toward zero, saturate, NaN 0 (omc's conversion has that meaning)
+fn rn_f2i t uint x f64 to ulong
+if eq t 2
+ret ulong uchar x
+end
+if eq t 3
+ret ulong ushort x
+end
+if eq t 4
+ret ulong uint x
+end
+if eq t 5
+ret ulong x
+end
+if eq t 6
+ret bitcast ulong long byte x
+end
+if eq t 7
+ret bitcast ulong long short x
+end
+if eq t 8
+ret bitcast ulong long int x
+end
+ret bitcast ulong long x
+end
+fn rn_i2f t uint s uint a ulong to ulong
+if eq t 14
+if rn_sg s
+ret bitcast ulong f64 bitcast long a
+end
+ret bitcast ulong f64 a
+end
+if rn_sg s
+ret ulong bitcast uint f32 bitcast long a
+end
+ret ulong bitcast uint f32 a
+end
+fn rn_conv o uint to void
+t = get i_oty o
+s = rn_at o 0
+a = rn_a o 0
+im = get i_oim o
+if and rn_isi t rn_isi s
+rn_r o rn_cn t a
+ret
+end
+if and rn_isf t ne and im 3 0
+rn_uns o
+end
+if or not or rn_isi t rn_isf t not or rn_isi s rn_isf s
+rn_uns o
+end
+if rn_isi s
+rn_r o rn_i2f t s a
+ret
+end
+x = rn_tof s a
+if rn_isi t
+rn_r o rn_f2i t x
+ret
+end
+if eq t 14
+rn_r o bitcast ulong x
+ret
+end
+y = f32 x
+inf = div 1.0f64 0.0f64
+sat = ne and im 4 0
+yi = eq fabs f64 y inf
+xf = ne fabs x inf
+if and sat and yi xf
+mx = bitcast f32 uint 2139095039
+y = mx
+if lt x 0.0f64
+y = neg mx
+end
+end
+rn_r o ulong bitcast uint y
+end
+fn rn_bcast o uint to void
+t = get i_oty o
+a = rn_a o 0
+if rn_isf t
+rn_r o and a sub shl ulong 1 sub rn_w t 1 1
+ret
+end
+rn_r o rn_cn t a
+end
+note ---- pure ops (1..37) ---------------------------------------------------------------------------
+fn rn_pure o uint op uint to void
+t = get i_oty o
+if eq op 1
+rn_r o get i_oim o
+ret
+end
+if eq op 2
+h = ir_arg o 2
+if ne rn_a o 0 0
+h = ir_arg o 1
+end
+rn_r o rn_g h
+rn_rw o rn_gw h
+ret
+end
+if eq op 36
+rn_conv o
+ret
+end
+if eq op 37
+rn_bcast o
+ret
+end
+s = rn_at o 0
+a = rn_a o 0
+b = ulong 0
+if gt get i_ona o 1
+b = rn_a o 1
+end
+if and ge op 30 le op 35
+if rn_isf s
+rn_r o rn_b2u rn_fcmp op s a b
+ret
+end
+if gt s 9
+rn_uns o
+end
+rn_r o rn_b2u rn_icmp op s a b
+ret
+end
+if or eq op 28 gt t 14
+rn_uns o
+end
+if rn_isf t
+rn_r o rn_fa op t a b
+ret
+end
+if or eq op 26 or eq op 27 gt t 9
+rn_uns o
+end
+if eq t 1
+rn_r o and rn_ia op 5 a b 1
+ret
+end
+rn_r o rn_ia op t a b
+end
+note ---- checks (70..82): IR.md s7.9 ---------------------------------------------------------------
+fn rn_ckadd t uint a ulong b ulong to bool
+r = add a b
+if lt rn_w t 64
+ret ne rn_cn t r r
+end
+if rn_sg t
+ret ne and and xor a r xor b r shl ulong 1 63 0
+end
+ret lt r a
+end
+fn rn_cksub t uint a ulong b ulong to bool
+r = sub a b
+if lt rn_w t 64
+ret ne rn_cn t r r
+end
+if rn_sg t
+ret ne and and xor a b xor a r shl ulong 1 63 0
+end
+ret lt a b
+end
+fn rn_ckmul t uint a ulong b ulong to bool
+r = mul a b
+if lt rn_w t 64
+ret ne rn_cn t r r
+end
+if eq a 0
+ret false
+end
+if not rn_sg t
+ret ne div r a b
+end
+m = shl ulong 1 63
+if eq a sub ulong 0 1
+ret eq b m
+end
+if eq b sub ulong 0 1
+ret eq a m
+end
+ret ne div bitcast long r bitcast long a bitcast long b
+end
+note the exact a x 2^b fits the signed type t when MIN >> b <= a <= MAX >> b
+fn rn_ckshl t uint a ulong b ulong to bool
+w = rn_w t
+if ge b w
+ret ne a 0
+end
+mn = bitcast long rn_min t
+mx = long 9223372036854775807
+if lt w 64
+mx = sub neg mn 1
+end
+sa = bitcast long a
+sb = bitcast long b
+if lt sa shr mn sb
+ret true
+end
+ret gt sa shr mx sb
+end
+note v (type s) outside int type t, float v truncated toward zero first, NaN outside
+fn rn_ckcv t uint s uint v ulong to bool
+w = rn_w t
+if rn_isf s
+x = rn_tof s v
+if ne x x
+ret true
+end
+hi = mul f64 shl ulong 1 sub w 1 2.0f64
+lo = f64 -1.0
+if rn_sg t
+hi = f64 shl ulong 1 sub w 1
+lo = sub neg hi 1.0
+if eq w 64
+ret or lt x neg hi ge x hi
+end
+end
+ret or le x lo ge x hi
+end
+if rn_sg s
+sv = bitcast long v
+if rn_sg t
+ret ne rn_cn t v v
+end
+if lt sv 0
+ret true
+end
+end
+if and rn_sg t eq w 64
+ret ge v shl ulong 1 63
+end
+ret ne rn_cn t v v
+end
+fn rn_len o uint k uint to ulong
+h = ir_arg o k
+rt = get i_vty h
+if eq get i_tk rt 5
+ret rn_gw h
+end
+tt = get i_t1 rt
+ret ulong get i_t2 tt
+end
+fn rn_ckfail o uint op uint to bool
+t = rn_at o 1
+a = rn_a o 1
+b = ulong 0
+if gt get i_ona o 2
+b = rn_a o 2
+end
+if eq op 70
+ret rn_ckadd t a b
+end
+if eq op 71
+ret rn_cksub t a b
+end
+if eq op 72
+ret rn_ckmul t a b
+end
+if eq op 73
+if rn_sg t
+ret eq a rn_min t
+end
+ret ne a 0
+end
+if eq op 74
+ret eq a 0
+end
+if eq op 75
+ret and eq a rn_min t eq b sub ulong 0 1
+end
+if eq op 76
+ret rn_ckshl t a b
+end
+if eq op 77
+ret ge a rn_w t
+end
+if eq op 78
+ret rn_ckcv get i_oty o t a
+end
+if eq op 81
+ret ge a b
+end
+if eq op 82
+ret eq a 0
+end
+n = rn_len o 1
+x = rn_a o 3
+if eq op 79
+ret or eq x 0 or gt b n gt x sub n b
+end
+ret or gt b n gt x sub n b
+end
+fn rn_check o uint to void
+if rn_ckfail o uint get i_oop o
+exit int add 100 get i_oim o
+end
+end
+note ---- memory ------------------------------------------------------------------------------------
+fn rn_ld p ulong n ulong be bool to ulong
+x = ulong 0
+for j ulong n bound 8
+c = ulong get r_m add p j
+if be
+x = or shl x 8 c
+else
+x = or x shl c mul j 8
+end
+end
+ret x
+end
+fn rn_st p ulong n ulong x ulong be bool to void
+for j ulong n bound 8
+s = mul j 8
+if be
+s = mul sub sub n 1 j 8
+end
+put r_m add p j uchar and shr x s 255
+end
+end
+note element type of a REF to ARRAY or a SLICE
+fn rn_elt rt uint to uint
+if eq get i_tk rt 5
+ret get i_t1 rt
+end
+ret get i_t1 get i_t1 rt
+end
+note address of element i of operand slot k of op o; refuses non-scalar elements
+fn rn_ea o uint k uint i ulong to ulong
+et = rn_elt rn_at o k
+if ge et 32
+rn_uns o
+end
+ret add rn_a o k mul i ir_tsize et
+end
+fn rn_ldv t uint p ulong be bool to ulong
+x = rn_ld p ir_tsize t be
+if rn_isi t
+ret rn_cn t x
+end
+ret x
+end
+note memory top aligned to 8, then n zero bytes; trap 6 past 16 MiB
+fn rn_alloc n ulong to ulong
+p = and add get r_s 2 7 not ulong 7
+if gt n sub 16777216 p
+exit 106
+end
+for j ulong n bound 16777216
+put r_m add p j 0
+end
+put r_s 2 add p n
+ret p
+end
+note field slot of field number k of the STRUCT that REF type rt targets
+fn rn_fld rt uint k ulong to ulong
+ret add ulong get i_t3 get i_t1 rt k
+end
+fn rn_atom o uint im ulong t uint old ulong v ulong to ulong
+f = and im 255
+if eq f 0
+ret rn_cn t add old v
+end
+if eq f 1
+ret rn_ia 24 t old v
+end
+if eq f 2
+ret rn_ia 25 t old v
+end
+if eq f 3
+ret and old v
+end
+if eq f 4
+ret or old v
+end
+if eq f 5
+ret xor old v
+end
+ret v
+end
+fn rn_mem o uint op uint to void
+if eq op 52
+rn_r o get r_ga get i_oim o
+ret
+end
+if eq op 50
+rn_r o rn_alloc ir_tsize get i_t1 get i_oty o
+ret
+end
+if eq op 53
+rn_r o rn_len o 0
+ret
+end
+if eq op 42
+p = rn_ea o 1 rn_a o 2
+rn_r o rn_ldv get i_oty o p false
+ret
+end
+if eq op 43
+p = rn_ea o 1 rn_a o 2
+rn_st p ir_tsize rn_elt rn_at o 1 rn_a o 3 false
+ret
+end
+if eq op 54
+p = rn_ea o 1 rn_a o 2
+rn_r o p
+rn_rw o rn_a o 3
+ret
+end
+if eq op 51
+n = rn_len o 1
+et = rn_elt rn_at o 1
+v = rn_a o 2
+p = rn_ea o 1 0
+for j ulong n bound 16777216
+rn_st add p mul j ir_tsize et ir_tsize et v false
+end
+ret
+end
+if or eq op 47 eq op 48
+t = get i_oty o
+if not rn_isi t
+rn_uns o
+end
+p = rn_ea o 1 rn_a o 2
+sz = ir_tsize t
+old = rn_ldv t p false
+v = rn_a o 3
+nv = rn_atom o get i_oim o t old v
+if eq op 48
+nv = old
+if eq old v
+nv = rn_a o 4
+end
+end
+rn_st p sz nv false
+rn_r o old
+ret
+end
+if and ge op 55 le op 57
+k = uint 1
+if eq op 57
+k = 0
+end
+rt = rn_at o k
+fx = rn_fld rt get i_oim o
+ft = get i_xty fx
+p = add rn_a o k ulong get i_xof fx
+be = eq get i_xor fx 1
+if eq op 57
+rn_r o p
+ret
+end
+if ge ft 32
+rn_uns o
+end
+if eq op 55
+rn_r o rn_ldv ft p be
+ret
+end
+rn_st p ir_tsize ft rn_a o 2 be
+ret
+end
+rn_uns o
+end
+note ---- host words (IR.md s7.11) --------------------------------------------------------------------
+note slot base of a host op's 3-operand buffer argument starting at slot k: address of A + off
+fn rn_buf o uint k uint to ulong
+ret add rn_a o k rn_a o add k 1
+end
+fn rn_host o uint to void
+w = get i_oim o
+if or eq w 199 eq w 200
+ret
+end
+if eq w 109
+rn_r o bitcast ulong monons
+ret
+end
+if eq w 130
+rn_r o bitcast ulong realns
+ret
+end
+if or eq w 53 eq w 54
+fd = int bitcast long rn_a o 1
+p = rn_buf o 2
+n = rn_a o 4
+k = long 0
+if eq w 54
+k = write fd r_m p n
+else
+k = read fd r_m p n
+end
+rn_r o bitcast ulong k
+ret
+end
+rn_uns o
+end
+note ---- control (60..67) ---------------------------------------------------------------------------
+note values handed to a list of parameter values starting at v (block or function parameters)
+fn rn_pars v0 uint n ulong to void
+v = v0
+for k ulong n bound 64
+if eq v 0
+ret
+end
+rn_p v get r_tv k
+rn_pw v get r_tw k
+v = get i_vnx v
+end
+end
+fn rn_take o uint k0 uint to ulong
+n = sub ulong get i_ona o ulong k0
+for k ulong n bound 64
+h = ir_arg o uint add ulong k0 k
+put r_tv k rn_g h
+put r_tw k rn_gw h
+end
+ret n
+end
+note values of function f (they are contiguous handles from its entry token)
+fn rn_nv f uint to ulong
+if lt ulong f get i_n 3
+ret sub ulong get i_ftk add f 1 ulong get i_ftk f
+end
+ret sub add get i_n 6 1 ulong get i_ftk f
+end
+note enter function f with r_tv[0..n) as its parameters; returns its first op
+fn rn_enter f uint n ulong to uint
+b = get r_s 4
+nv = rn_nv f
+if gt nv sub 4194304 b
+exit 106
+end
+put r_s 4 add b nv
+put r_s 0 sub b ulong get i_ftk f
+put r_s 1 ulong f
+rn_pars get i_fp1 f n
+ret get i_bo1 get i_fb1 f
+end
+fn rn_call o uint to uint
+n = rn_take o 2
+d = get r_s 3
+if ge d 65535
+exit 106
+end
+put r_cf d uint get r_s 1
+put r_co d o
+put r_cs d get r_s 0
+put r_cm d get r_s 2
+put r_ct d get r_s 4
+put r_s 3 add d 1
+ret rn_enter ir_arg o 1 n
+end
+fn rn_ret x ulong y ulong to uint
+d = get r_s 3
+if eq d 0
+exit int bitcast long x
+end
+d = sub d 1
+put r_s 3 d
+c = get r_co d
+put r_s 0 get r_cs d
+put r_s 1 ulong get r_cf d
+put r_s 2 get r_cm d
+put r_s 4 get r_ct d
+rn_r c x
+rn_rw c y
+ret get i_onx c
+end
+fn rn_ctl o uint op uint to uint
+if eq op 60
+b = ir_arg o 0
+n = rn_take o 1
+rn_pars get i_bp1 b n
+ret get i_bo1 b
+end
+if eq op 61
+b = ir_arg o 3
+if ne rn_a o 1 0
+b = ir_arg o 2
+end
+ret get i_bo1 b
+end
+if eq op 62
+ret rn_ret 0 0
+end
+if eq op 63
+ret rn_ret rn_a o 1 rn_aw o 1
+end
+if eq op 64
+ret rn_call o
+end
+if eq op 65
+exit int add 100 get i_oim o
+end
+if eq op 66
+exit int bitcast long rn_a o 1
+end
+rn_uns o
+ret 0
+end
+note ---- one op: returns the next op -----------------------------------------------------------------
+fn rn_step o uint to uint
+op = uint get i_oop o
+if lt op 38
+rn_pure o op
+ret get i_onx o
+end
+if and ge op 70 le op 82
+rn_check o
+ret get i_onx o
+end
+if and ge op 90 le op 93
+ret get i_onx o
+end
+if and ge op 60 le op 67
+ret rn_ctl o op
+end
+if eq op 110
+rn_host o
+ret get i_onx o
+end
+if or eq op 42 or eq op 43 or eq op 47 eq op 48
+rn_mem o op
+ret get i_onx o
+end
+if and ge op 50 le op 57
+rn_mem o op
+ret get i_onx o
+end
+rn_uns o
+ret 0
+end
+note ---- start --------------------------------------------------------------------------------------
+note globals at 8-aligned addresses from 8 (address 0 is never an object); class 1 copies its bytes
+fn rn_globs to void
+put r_s 2 8
+for g ulong get i_n 2 bound 65536
+h = add g 1
+sz = ir_tsize get i_gty h
+p = rn_alloc sz
+put r_ga h p
+if eq get i_gcl h 1
+d0 = get i_gd0 h
+for j ulong sz bound 16777216
+c = get i_gdat add d0 j
+put r_m add p j c
+end
+end
+end
+end
+note the program entry: the export with no parameters and result i32 (IR.md s6.1)
+fn rn_entry to uint
+for i ulong get i_n 3 bound 65536
+f = add i 1
+ok = and eq get i_fk f 2 eq get i_fnp f 0
+if and ok eq get i_frs f 8
+ret uint f
+end
+end
+ret 0
+end
+fn rn_load to ulong
+if lt argcnt 2
+rn_say 80 108
+exit 2
+end
+m = argread 1 r_pa 0 4096
+if or le m 0 ge m 4096
+rn_say 80 108
+exit 2
+end
+fd = fopen r_pa 0 ulong m 524288 0
+if lt fd 0
+rn_say 108 133
+exit 27
+end
+n = ulong 0
+while true bound 16777218
+if ge n len i_in
+k = read int fd r_dg 0 1
+if gt k 0
+exit 23
+end
+ret n
+end
+k = read int fd i_in n sub len i_in n
+if lt k 0
+rn_say 108 133
+exit 27
+end
+if eq k 0
+ret n
+end
+n = add n ulong k
+end
+ret n
+end
+fn main to int
+n = rn_load
+c = ir_read 0 n
+if ne c 0
+rn_say 58 79
+rn_num c
+rn_say 23 27
+rn_num ir_badat
+rn_nl
+ret int c
+end
+f = rn_entry
+if eq f 0
+rn_say 58 79
+rn_num 30
+rn_nl
+ret 30
+end
+rn_globs
+o = rn_enter f 0
+while true bound 9223372036854775807
+o = rn_step o
+end
+ret 0
+end

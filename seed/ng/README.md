@@ -28,7 +28,8 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `sha256.om` | FIPS 180-4 SHA-256 shared by ngbuild, ngcheck and the gate. |
 | `ngcheck.om` | The validator: binary ΩIR on stdin, `ACCEPT <sha256> fns= blocks= ops=` or `ngcheck: CLASS at OFFSET` with the class as exit code (IR.md s11). Its own reader: it shares no code with `src/ir.om`. `ngcheck --table` prints the host word table it was built with. |
 | `ngtxt.om`, `ngas.om`, `ngdis.om` | Canonical text tools (IR.md s10): `ngas` text to binary, `ngdis` binary to text. A third independent decoder of the wire format. |
-| `tests/ir/` | Text fixtures (`*.oir`) and `cases`, the expectations the gate runs. |
+| `ngrun.om` | The reference interpreter (IR.md s7): `ngrun FILE.ir` runs the program entry of an accepted unit; output through the real host words, exit status = the entry's result, a failing check exits 100 + code. Unsupported ops (vectors, tiles, kernels, fma, fmath, f16/bf16/fp8) print `ngrun: unsupported op N at OFFSET` and exit 125. It is the oracle back ends are diffed against (D9). Built on `src/ir.om`'s reader. |
+| `tests/ir/` | Text fixtures (`*.oir`), run pairs (`x-*.oir` + `x-*.om`) and `cases`, the expectations the gate runs. |
 | `gate-ir.om` | The ΩIR gate. |
 
 ## Build and gate
@@ -38,14 +39,16 @@ From the repository root (any scratch directory works):
     cat seed/ng/sha256.om seed/ng/gate-ir.om | seed/out/omc > /tmp/gate-ir && chmod +x /tmp/gate-ir
     /tmp/gate-ir seed/out/omc /tmp/ng-ir-gate
 
-The gate builds ngbuild, ngcheck, ngas and ngdis with that omc, builds `ng` through
+The gate builds ngbuild, ngcheck, ngas, ngdis and ngrun with that omc, builds `ng` through
 `ngbuild build` (so every pin in `ng.units` is checked), requires `ngcheck --table` to equal
 `hostwords.tsv`, then runs every line of `tests/ir/cases`: the text round trip
 `ngdis(ngas(t)) == t`, the ngcheck class and byte offset, the ACCEPT digest against its own SHA-256,
-`ng ir-copy` byte identity for accepted units, ngas syntax refusals, and byte mutants judged by
-ngcheck and ngdis alike. Then its negative controls: three deliberately wrong expectations must be
-caught, and a mutant ngcheck (load and store typing disabled) must fail at least one case. Last
-line `NGIRGATE PASS cases=N`, exit 0; otherwise one `FAIL` line per failure and exit 1.
+`ng ir-copy` byte identity for accepted units, ngas syntax refusals, byte mutants judged by
+ngcheck and ngdis alike, and run pairs: ngrun on `x-NAME.oir` against omc's build of `x-NAME.om`
+(exit status, stdout and stderr equal). Then its negative controls: three deliberately wrong
+expectations must be caught, a mutant ngcheck (load and store typing disabled) and a mutant ngrun
+(`chk.fuel` one pass late) must each fail at least one case. Last line `NGIRGATE PASS cases=N`,
+exit 0; otherwise one `FAIL` line per failure and exit 1.
 
 The tools one by one:
 
@@ -53,8 +56,10 @@ The tools one by one:
     cat seed/ng/ngtxt.om seed/ng/ngas.om | seed/out/omc > ngas
     cat seed/ng/ngtxt.om seed/ng/ngdis.om | seed/out/omc > ngdis
     cat seed/ng/sha256.om seed/ng/ngbuild.om | seed/out/omc > ngbuild
+    cat seed/ng/src/ir.om seed/ng/ngrun.om | seed/out/omc > ngrun
     ./ngbuild build seed/out/omc seed/ng/ng.units ng
     ./ngas < seed/ng/tests/ir/a-arith.oir | ./ngcheck
+    ./ngas < seed/ng/tests/ir/x-fib.oir > fib.ir && ./ngrun fib.ir; echo $?
 
 After changing a unit listed in `ng.units`, refresh its pins with `./ngbuild sums seed/ng/ng.units`.
 
