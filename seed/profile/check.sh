@@ -22,16 +22,16 @@ echo "profile sha256 $(sha256sum < "$B/profile" | cut -c1-64)"
 
 # 1. Rule fixtures, real-module pre-fix controls, capacity and stop rows.
 "$B/gate" "$OMC" "$PIN" seed/profile/profile.cases "$B/cases" > "$B/cases.log"
-grep -qx 'OM2GATE PASS cases=48 pass=48 fail=0 invalid=0 not_run=0' "$B/cases.log" \
-    && ok "profile cases (48)" || { bad "profile cases"; grep -v ' PASS ' "$B/cases.log" | grep '^VERDICT'; }
+grep -qx 'OM2GATE PASS cases=53 pass=53 fail=0 invalid=0 not_run=0' "$B/cases.log" \
+    && ok "profile cases (53)" || { bad "profile cases"; grep -v ' PASS ' "$B/cases.log" | grep '^VERDICT'; }
 
 # 2. One profile.om mutant per rule: every control PASS, every kill row FAIL.
 "$B/gate" "$OMC" "$PIN" seed/profile/mutants.cases "$B/mutants" > "$B/mutants.log"
 st=$?
-if [ "$st" = 1 ] && grep -qx 'OM2GATE FAIL cases=20 pass=10 fail=10 invalid=0 not_run=0' "$B/mutants.log" \
-    && [ "$(grep -c '^VERDICT ctl-[a-z0-9-]* PASS ' "$B/mutants.log")" = 10 ] \
-    && [ "$(grep -c '^VERDICT m-[a-z0-9-]* FAIL ' "$B/mutants.log")" = 10 ]; then
-    ok "10 profile.om mutants killed, 10 controls pass"
+if [ "$st" = 1 ] && grep -qx 'OM2GATE FAIL cases=22 pass=11 fail=11 invalid=0 not_run=0' "$B/mutants.log" \
+    && [ "$(grep -c '^VERDICT ctl-[a-z0-9-]* PASS ' "$B/mutants.log")" = 11 ] \
+    && [ "$(grep -c '^VERDICT m-[a-z0-9-]* FAIL ' "$B/mutants.log")" = 11 ]; then
+    ok "11 profile.om mutants killed, 11 controls pass"
 else bad "profile mutants (gate exit $st)"; tail -1 "$B/mutants.log"; fi
 
 # 3. The profiled modules pass the profile as one unit (dispatch is the consumer of lock and store).

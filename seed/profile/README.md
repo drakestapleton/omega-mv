@@ -36,6 +36,14 @@ static globals only.
 `bounds` mode checks B1, B2, B3, P1 and C1. It skips E1 and X1 for units that carry no p10 annotations,
 such as `seed/omc/tests/recursion/nest.om`.
 
+Assignments are recognised in both spellings that the pinned omc accepts (`s_name`/`s_assign`,
+`name [=] value`). One classifier serves B2, B3 and E1: a line assigns when its second token is `=`, or
+when its first token is not a statement keyword, a unit function or a host word. omc refuses a
+parameter, global or local named like a function (error 10) or a host word (error 16), so a leading
+function or host-word name is always a call. So `nd sub nd 1` after a guard, `depth ulong 0`, a
+`b new T N` frame allocation and an `r f 2` overwrite are checked like their `=` forms. The canonical
+B2 guard itself must still be spelled `NAME = add depth 1`; `NAME add depth 1` is refused.
+
 ## Profiled modules
 
 `seed/authority/action.om`, `store.om` and `lock.om` are profiled as one unit together with
@@ -55,10 +63,10 @@ such as `seed/omc/tests/recursion/nest.om`.
 
 ## Limits (what is not proved)
 
-- The analysis is textual and not path-sensitive. It handles the `NAME = ...` form only.
+- The analysis is textual and not path-sensitive. Assignments are classified in both omc spellings, `NAME = value` and `NAME value`.
   - It is conservative about loop back-edges: a result read only at a loop head is refused.
   - `break` and `continue` do not end a path.
-  - A callee that is not defined in the unit is not treated as a call.
+  - A callee that is not defined in the unit is not treated as a call. A line that starts with such a callee is classified as an assignment to that name, so E1 may refuse it.
 - The unit result is a claim only for the sources passed in. It makes no whole-kernel or
   whole-repository claim, and it does not cover the code behind host words.
 - `profile.om` and `gate.om` are not themselves profiled: their tables exceed B3.
@@ -67,8 +75,10 @@ such as `seed/omc/tests/recursion/nest.om`.
 
 `sh seed/profile/check.sh` runs these checks:
 
-- `profile.cases` (48 rows): one refusal fixture per rule, pre-fix controls on the real modules, and the capacity and stop rows. It also has three B2 structure fixtures that the checker at `7ae0a1df` wrongly passed: `b2-else` (stop in the else arm), `b2-arm` (guard borrowed from the sibling then-arm) and `b2-sibling` (guard in a separate earlier block). It has one positive nested control, `ok-b2-nested`.
-- `mutants.cases`: one `profile.om` mutant per rule, plus two more for B2 (`b2-else`, `b2-block`) that reintroduce those defects. Each mutant is killed, and each control passes.
+- `profile.cases` (53 rows): one refusal fixture per rule, pre-fix controls on the real modules, and the capacity and stop rows.
+  - Three B2 structure fixtures that the checker at `7ae0a1df` wrongly passed: `b2-else` (stop in the else arm), `b2-arm` (guard borrowed from the sibling then-arm) and `b2-sibling` (guard in a separate earlier block). One positive nested control, `ok-b2-nested`.
+  - Four `=`-less assignment fixtures that the checker at `795f5d0d` wrongly passed: `b2-noeq-nd` and `b2-noeq-depth` (the review probes), `e1-noeq` and `b3-noeq`. One positive non-recursive control, `ok-noeq`.
+- `mutants.cases`: one `profile.om` mutant per rule, plus three more for B2 (`b2-else`, `b2-block`, `b2-noeq`) that reintroduce those defects. Each mutant is killed, and each control passes.
 - The authority unit profile.
 - A staleness check for the seven authority gates, then compiling and running each of them.
 
