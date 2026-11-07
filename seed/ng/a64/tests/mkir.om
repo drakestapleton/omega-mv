@@ -1,10 +1,17 @@
 note mkir: ΩIR fixtures for the ng-a64 gates, built with ir.om's builder (seed/ng/IR.md s14). Built as the
 note concatenation seed/ng/src/ir.om + this file. Input: one line naming the fixture; output: its ΩIR binary (ir_wr).
-note Program entry (PROPOSED to ng-ir, IR.md s6.1): the function of kind 2 with no parameters and result i32; its
-note result is the process exit status.
+note Program entry (D11): the single export (kind 2) with no parameters and result i32; its result is the exit status.
 note   fib   fn fib n u64 -> u64 (n < 2: n, else fib(n-1) + fib(n-2)), the bench kernel; main returns i32 fib(25)
+note   deep  i32 fib(100000000): the recursion passes the stack floor, trap 6 (exit 106)
+note   press pr(7) + pq(9), low byte: pr keeps 28 values live across a call (9 callee-saved registers: spills),
+note         pq keeps 40 values live with no call (24 registers: spills)
+note   rot   a loop whose block parameters rotate as a 3-cycle (x, y, z) <- (y, z, x), s <- 31 s + x; 1000 passes
+note   ck    ck(5, 7) then ck(2147483000, 1000), ck = chk.add then add on i32: trap 1 (exit 101)
+note   ar    u32 rotl rotr shl max add mul select shr, u8 wrap, i32 shr div rem min sub, folded into u64; low byte
+note The omc reference program of fixture N is seed/ng/a64/tests/ref/N.om (the same computation in Omega).
 note Exit 2 for an unknown fixture name.
-text m_names "fib\n"
+text m_names "fib\ndeep\npress\nrot\nck\nar\n"
+global m_v uint 64
 
 fn m_k1 b uint ty uint v ulong to uint
 o = ir_op b 1 ty v 0
@@ -19,6 +26,12 @@ ir_set o 1 y
 ret ir_res o
 end
 
+fn m_un b uint op uint ty uint x uint to uint
+o = ir_op b op ty 0 1
+ir_set o 0 x
+ret ir_res o
+end
+
 note m_call b t f ty a: call f (one argument a) on token t; the op handle (its token ir_otok, result ir_res)
 fn m_call b uint t uint f uint ty uint a uint to uint
 o = ir_op b 64 ty 0 3
@@ -28,10 +41,51 @@ ir_set o 2 a
 ret o
 end
 
+note m_calln b t f ty n: call f with the n arguments m_v[50 .. 50 + n)
+fn m_calln b uint t uint f uint ty uint n uint to uint
+o = ir_op b 64 ty 0 add n 2
+ir_set o 0 t
+ir_set o 1 f
+k = uint 0
+while lt k n bound 8
+ir_set o add k 2 get m_v add k 50
+k = add k 1
+end
+ret o
+end
+
 fn m_retv b uint t uint v uint to void
 o = ir_op b 63 0 0 2
 ir_set o 0 t
 ir_set o 1 v
+end
+
+note m_chk2 b t op code x y: a two-operand check on token t; the token it defines
+fn m_chk2 b uint t uint op uint code ulong x uint y uint to uint
+o = ir_op b op 0 code 3
+ir_set o 0 t
+ir_set o 1 x
+ir_set o 2 y
+ret ir_otok o
+end
+
+note m_br5 b t tk: br to t with token tk and the five values m_v[56 .. 61)
+fn m_br5 b uint t uint tk uint to void
+o = ir_op b 60 0 0 7
+ir_set o 0 t
+ir_set o 1 tk
+k = uint 0
+while lt k 5 bound 5
+ir_set o add k 2 get m_v add k 56
+k = add k 1
+end
+end
+
+note m_mlow b t s: retv i32 (conv) of s & 255 on token t
+fn m_mlow b uint t uint s uint to void
+c = m_k1 b 5 255
+a = m_bin b 16 5 s c
+m_retv b t m_un b 36 8 a
 end
 
 fn m_fib to uint
@@ -64,23 +118,253 @@ g = ir_fnew 2 0 8
 b0 = ir_blk g
 c = m_k1 b0 5 x
 k = m_call b0 ir_ftok g f 5 c
-o = ir_op b0 36 8 0 1
-ir_set o 0 ir_res k
-m_retv b0 ir_otok k ir_res o
+m_retv b0 ir_otok k m_un b0 36 8 ir_res k
 end
 
-fn m_is k ulong n ulong to bool
-if lt n add k 1
+note pr n: v_k = n (2k + 3) + k^2 + 1 for k < 28, all live across s = fib(10); then s = 3 s + v_k in order
+fn m_pr g uint to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b = ir_blk f
+k = ulong 0
+while lt k 28 bound 28
+m = m_bin b 12 5 n m_k1 b 5 add mul k 2 3
+put m_v k m_bin b 10 5 m m_k1 b 5 add mul k k 1
+k = add k 1
+end
+o = m_call b ir_ftok f g 5 m_k1 b 5 10
+s = ir_res o
+c3 = m_k1 b 5 3
+k = 0
+while lt k 28 bound 28
+s = m_bin b 10 5 m_bin b 12 5 s c3 get m_v k
+k = add k 1
+end
+m_retv b ir_otok o s
+ret f
+end
+
+note pq n: v_k = n (5k + 7) + 11k + 13 for k < 40, all live at once; then s = n, s = (5 s) xor v_k in order
+fn m_pq to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b = ir_blk f
+k = ulong 0
+while lt k 40 bound 40
+m = m_bin b 12 5 n m_k1 b 5 add mul k 5 7
+put m_v k m_bin b 10 5 m m_k1 b 5 add mul k 11 13
+k = add k 1
+end
+c5 = m_k1 b 5 5
+s = n
+k = 0
+while lt k 40 bound 40
+s = m_bin b 18 5 m_bin b 12 5 s c5 get m_v k
+k = add k 1
+end
+m_retv b ir_ftok f s
+ret f
+end
+
+fn m_press to void
+fb = m_fib
+pr = m_pr fb
+pq = m_pq
+g = ir_fnew 2 0 8
+b = ir_blk g
+o1 = m_call b ir_ftok g pr 5 m_k1 b 5 7
+o2 = m_call b ir_otok o1 pq 5 m_k1 b 5 9
+s = m_bin b 10 5 ir_res o1 ir_res o2
+m_mlow b ir_otok o2 s
+end
+
+note rot n: b1(i, x, y, z, s) = (0, 1, 2, 3, 0); while i < n: b1(i + 1, y, z, x, 31 s + x); result s
+fn m_rot to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b0 = ir_blk f
+b1 = ir_blk f
+b2 = ir_blk f
+b3 = ir_blk f
+i = ir_bpar b1 5
+x = ir_bpar b1 5
+y = ir_bpar b1 5
+z = ir_bpar b1 5
+s = ir_bpar b1 5
+c0 = m_k1 b0 5 0
+put m_v 56 c0
+put m_v 57 m_k1 b0 5 1
+put m_v 58 m_k1 b0 5 2
+put m_v 59 m_k1 b0 5 3
+put m_v 60 c0
+m_br5 b0 b1 ir_ftok f
+m_rotc b1 b2 b3 i n
+s2 = m_bin b2 10 5 m_bin b2 12 5 s m_k1 b2 5 31 x
+put m_v 56 m_bin b2 10 5 i m_k1 b2 5 1
+put m_v 57 y
+put m_v 58 z
+put m_v 59 x
+put m_v 60 s2
+m_br5 b2 b1 ir_btok b2
+m_retv b3 ir_btok b3 s
+ret f
+end
+
+fn m_rotc b1 uint b2 uint b3 uint i uint n uint to void
+c = m_bin b1 32 1 i n
+o = ir_op b1 61 0 0 4
+ir_set o 0 ir_btok b1
+ir_set o 1 c
+ir_set o 2 b2
+ir_set o 3 b3
+end
+
+fn m_rotm to void
+r = m_rot
+g = ir_fnew 2 0 8
+b = ir_blk g
+o = m_call b ir_ftok g r 5 m_k1 b 5 1000
+m_mlow b ir_otok o ir_res o
+end
+
+note ck a b (i32): chk.add a b, then a + b
+fn m_ckf to uint
+f = ir_fnew 0 0 8
+a = ir_fpar f 8
+bb = ir_fpar f 8
+b = ir_blk f
+t = m_chk2 b ir_ftok f 70 1 a bb
+m_retv b t m_bin b 10 8 a bb
+ret f
+end
+
+fn m_ck to void
+cf = m_ckf
+g = ir_fnew 2 0 8
+b = ir_blk g
+put m_v 50 m_k1 b 8 5
+put m_v 51 m_k1 b 8 7
+o1 = m_calln b ir_ftok g cf 8 2
+put m_v 50 m_k1 b 8 2147483000
+put m_v 51 m_k1 b 8 1000
+o2 = m_calln b ir_otok o1 cf 8 2
+m_retv b ir_otok o2 m_bin b 10 8 ir_res o1 ir_res o2
+end
+
+note ar a b (u32) c d (i32) -> u64: m_v[0 .. 14) as in the header, s = 1000003 s + u64 v_k in order
+fn m_ar1 b uint a uint bb uint c uint d uint to void
+put m_v 0 m_bin b 22 4 a m_k1 b 4 7
+put m_v 1 m_bin b 23 4 bb m_k1 b 4 13
+put m_v 2 m_bin b 20 4 a m_k1 b 4 9
+put m_v 3 m_bin b 25 4 a bb
+put m_v 4 m_bin b 10 4 a bb
+put m_v 5 m_bin b 12 4 a bb
+cl = m_bin b 32 1 c d
+o = ir_op b 2 4 0 3
+ir_set o 0 cl
+ir_set o 1 a
+ir_set o 2 bb
+put m_v 6 ir_res o
+x8 = m_un b 36 2 a
+y8 = m_bin b 10 2 x8 m_k1 b 2 200
+put m_v 7 m_un b 36 4 y8
+put m_v 8 m_bin b 21 4 bb m_k1 b 4 5
+end
+
+note i32 results are moved into 0 .. 2^31 by adding 2^30, so the reference never converts a negative value
+fn m_ar2 b uint c uint d uint to void
+off = m_k1 b 8 1073741824
+put m_v 9 m_bin b 10 8 m_bin b 21 8 c m_k1 b 8 3 off
+put m_v 10 m_bin b 10 8 m_bin b 13 8 c d off
+put m_v 11 m_bin b 10 8 m_bin b 14 8 c d off
+put m_v 12 m_bin b 10 8 m_bin b 24 8 c d off
+put m_v 13 m_bin b 10 8 m_bin b 11 8 c d off
+end
+
+fn m_arf to uint
+f = ir_fnew 0 0 5
+a = ir_fpar f 4
+bb = ir_fpar f 4
+c = ir_fpar f 8
+d = ir_fpar f 8
+b = ir_blk f
+m_ar1 b a bb c d
+m_ar2 b c d
+s = m_k1 b 5 0
+kk = m_k1 b 5 1000003
+k = ulong 0
+while lt k 14 bound 14
+s = m_bin b 10 5 m_bin b 12 5 s kk m_un b 36 5 get m_v k
+k = add k 1
+end
+m_retv b ir_ftok f s
+ret f
+end
+
+fn m_ar to void
+af = m_arf
+g = ir_fnew 2 0 8
+b = ir_blk g
+put m_v 50 m_k1 b 4 2654435769
+put m_v 51 m_k1 b 4 2135587861
+put m_v 52 m_k1 b 8 sub ulong 0 1000003
+put m_v 53 m_k1 b 8 77
+o = m_calln b ir_ftok g af 5 4
+m_mlow b ir_otok o ir_res o
+end
+
+note m_sel n: the index in m_names of the first input line, 99 if none
+fn m_sel n ulong to ulong
+e = m_lend n
+k = ulong 0
+p = ulong 0
+while lt p len m_names bound 64
+q = m_nend p
+if m_eq p q e
+ret k
+end
+p = add q 1
+k = add k 1
+end
+ret 99
+end
+
+fn m_lend n ulong to ulong
+e = ulong 0
+while lt e n bound 64
+if eq get i_in e 10
+ret e
+end
+e = add e 1
+end
+ret e
+end
+
+fn m_nend p ulong to ulong
+q = p
+while ne get m_names q 10 bound 64
+q = add q 1
+end
+ret q
+end
+
+fn m_eq p ulong q ulong e ulong to bool
+if ne sub q p e
 ret false
 end
 i = ulong 0
-while lt i k bound 64
-if ne get i_in i get m_names i
+while lt i e bound 64
+if ne get i_in i get m_names add p i
 ret false
 end
 i = add i 1
 end
 ret true
+end
+
+fn m_fibm x ulong to void
+f = m_fib
+m_main f x
 end
 
 fn main to int
@@ -89,13 +373,26 @@ if le n 0
 ret 2
 end
 ir_init
-ok = false
-if m_is 3 ulong n
-f = m_fib
-m_main f 25
-ok = true
+s = m_sel ulong n
+if eq s 0
+m_fibm 25
 end
-if not ok
+if eq s 1
+m_fibm 100000000
+end
+if eq s 2
+m_press
+end
+if eq s 3
+m_rotm
+end
+if eq s 4
+m_ck
+end
+if eq s 5
+m_ar
+end
+if gt s 5
 ret 2
 end
 m = ir_wr
