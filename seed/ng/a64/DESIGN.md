@@ -107,12 +107,17 @@ fib38), so any future codegen A/B reports an aligned control.
 |---|---|
 | x0..x7 | arguments and result (x0), allocatable caller-saved |
 | x8..x14 | allocatable caller-saved |
-| x15, x16, x17 | scratch: spill reloads, check temporaries, parallel-move cycle (x15) and slot-to-slot (x16) |
+| x15, x16, x17 | scratch: spill reloads, check temporaries, parallel-move cycle (x15) and slot-to-slot (x16); never allocated (`a6_free` scans x0..x14 then x19..x27; rgate mutant 16 and fixture lv) |
 | x18 | platform register (AAPCS64 6.1.1), unused |
 | x19..x27 | allocatable callee-saved (saved in the prologue when used) |
 | x28 | stack floor 0x10000000 (omc convention, trap 6 check) |
 | x29 | unused (kept for a frame pointer) |
 | x30 | link register, saved when the function calls |
+
+`a6_okreg`'s `lt r 15` (the spill scan's register set) cannot change output on its own: only `a6_give` marks a
+register active, with a register from `a6_free` (never x15) or from the spill scan (already active), so x15 is
+never active and the scan skips it. Widening it to x15 (review mutant M-C of 8a3680b0) gave byte-identical ELFs
+for all 14 rgate fixtures in both forms (28/28); it is an equivalent mutant and is not in rgate's list.
 
 Calls between ng functions use x0..x7 for arguments (more than 8 is refused) and x0 for the result; there is no
 outside caller in program mode, so this is the only contract.
@@ -125,6 +130,12 @@ AND/ORR/EOR/ANDS/BIC/ORN (shifted register, bitmask immediate), MOVZ/MOVN/MOVK, 
 LSLV/LSRV/ASRV/RORV (X and W), UBFM/SBFM/EXTR, CSEL/CSINC/CSINV/CSNEG, loads and stores of every width (unsigned
 offset and register offset), LDP/STP (signed offset, pre-, post-index), B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, RET, BR,
 BLR, SVC, ADR and the FP set.
+
+An operand that does not fit its field is refused (exit 5, `immediate out of range` / `branch out of range`), never
+masked. `a6_rsv` also refuses in-field values whose encoding DDI 0487 M.d reserves (exit 5, `reserved operand
+value`): shift amounts, UBFM/SBFM immr and imms and EXTR lsb of 32 or more and MOVZ/MOVN hw 2..3 on 32-bit forms; sh
+3 (ROR) on ADD/SUB shifted register (logical forms take it); and any sh or amt on the kind-1 forms that have opcode
+bits there (multiply, two-source, float). The selector never asks for these; the encoder case lists pin both sides.
 
 ## 5. Not in the slice yet (PROPOSED, in order)
 
@@ -139,19 +150,26 @@ BLR, SVC, ADR and the FP set.
 ## 6. Gates (run from the omega-mv root on core 1)
 
 - `gate.om` (encoder): builds ng from `ng.units`, runs `@ng a64-enc` on `tests/enc.cases`, disassembles with GNU
-  objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases.
+  objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases. Then each
+  line of `tests/enc-refuse.cases` runs alone: ng must exit 5, write no word and print exactly the line's stderr
+  text; mutant M-A (`a6_fld` masks instead of refusing) must fail at least one of them.
 - `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck and ng. For every fixture (fib, deep, press, rot,
-  ck, ar, tsum, mem, oob, zf, wid, bcopy, sort) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must
+  ck, ar, tsum, mem, oob, zf, wid, bcopy, sort, lv) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must
   exit with the expected status (computed with Wolfram, or the check's trap code), the omc build of
   `tests/ref/N.om` with its omc expectation (the same, except tsum: omc traps 6 a million calls deep, ng's loop does
   not; BEYOND_OMC), the split and omc runs must print exactly the bytes the `@ng a64` run printed, and every BL
-  target in the `@ng a64` ELF must be a multiple of 64. bcopy and sort are the bench kernels
+  target in the `@ng a64` ELF must be a multiple of 64. mkir lowers main's `int` as IR.md s13 does (chk.conv i32
+  trap 5, then conv); tsum's main and reference take ts(1000000) & 255 first, since 500000500000 does not fit i32
+  (review P2-1 of 8a3680b0: the earlier fixture had no chk.conv and its 32 was not Omega's result). bcopy and sort
+  are the bench kernels
   (`~/handoffs/OmegaFast/bench/`) lowered by hand per IR.md s13, with the bench source itself as the omc reference;
-  their output is also checked against Wolfram (bcopy's SHA-256, sort's four numbers). Fifteen mutants (spill
+  their output is also checked against Wolfram (bcopy's SHA-256, sort's four numbers). Sixteen mutants (spill
   reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves, frame size, 16-byte entry
   alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half zero fill, write count,
-  u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending) must each change at least one
-  fixture's status or alignment. The memory fixtures store and load every integer element width (u8 u64 in mem,
+  u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending, x15 allocatable) must each
+  change at least one fixture's status or alignment. lv keeps 20 values live with no call across chk.add, chk.mul
+  and chk.bounds, so an allocator that hands out x15 loses one of them (status 89, not 165). The memory fixtures
+  store and load every integer element width (u8 u64 in mem,
   i8 u16 i16 u32 i32 in wid); wid compares each loaded value at its own type, because a conversion re-extends from
   its source type and would hide a non-canonical load (rgate's first form of mutants 13 and 15 escaped that way).
 - ΩIR gap met by sort: a call argument must have exactly the parameter's type (IR.md row 64), so Omega passing an
