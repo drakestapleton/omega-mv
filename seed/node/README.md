@@ -654,6 +654,64 @@ exits 1 on any failure, 2 for bad usage. A `drv.om` whose `dv_dirn` keeps a
 repeated separator and whose status drops the 256 for a signal gives `FAIL
 drv.dirn`, `FAIL drv.kill-reap` and exit 1.
 
+### Receipts
+
+`tests/receipt.om` is the evidence receipt writer, the seeded Omega replacement
+for the out-of-repo `omega-node-receipt.py` (prefix `rc`, composed after
+`drv.om`). Build it with this checkout's compiler:
+
+```
+{ printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om om/tls/sha2.om \
+  seed/node/tests/drv.om seed/node/tests/receipt.om; } > /tmp/receipt.full.om
+seed/out/omc < /tmp/receipt.full.om > receipt
+```
+
+`receipt EV REPO SUB ISSUE SCRIPT [EXECUTION]` reads `EV/platform.txt`,
+`EV/hashes.txt`, `EV/results.txt`, `EV/NAME.out` and `EV/NAME.sha` for every
+`PASS NAME compile=0 …` check line, and the last existing of
+`EV/repeat-stress.txt` and `EV/repeat-idle.txt` for a `PASS NAME-repeat P/R`
+line. It writes the receipt to `REPO/evidence/SUB/receipt.<sha256>.json`, where
+the hash is the sha256 of the file's bytes. The file is created exclusively,
+with mode 0644. The program then prints the path. The record has the Python
+writer's keys in the Python writer's order: `issue`, `source_commit`,
+`source_tree`, `platform`, `cpu_affinity_mask_hex`, `execution`,
+`timestamp_utc`, `independent_review` (false), `native_aarch64` (`NOT_RUN` when
+a results line is NOT_RUN, else `PASS`), `executed_verdict`, `not_run`,
+`spark_gate_judge`, `live_hive`, `script`, `hashes`, `checks`, `results`, then
+`repeat` (null or one object) or `repeats` (a list).
+
+It refuses, with exit 1 and the Python message on stderr, in these cases:
+
+- `platform.txt` holds no `head H tree T dirty=0`
+  (`refused: evidence run was not on a clean tree`).
+- A results line is FAIL, including `FAIL count N` with N not 0
+  (`refused: results contain FAIL: LINE`).
+- The target already exists (`refused: exists PATH`).
+
+It also exits 1 for an unreadable or symbolically linked input, a file over its
+buffer, invalid UTF-8 or a JSON writer refusal. It exits 2 for bad usage: fewer
+than 5 arguments, or an argument over 4096 bytes. The Python writer raises
+there.
+
+The limits are:
+
+- `platform.txt`: 65536 bytes.
+- `hashes.txt`: 262144 bytes.
+- `results.txt`: 524288 bytes.
+- Each `.out`, `.sha` and repeat file: 983040 bytes.
+- The JSON: 2 MiB.
+- Each path: 4095 bytes.
+
+It differs from the Python writer in these ways:
+
+- The JSON is compact, not indented, and ends with a newline. Non-ASCII text is
+  written as raw UTF-8, not as `\uXXXX` escapes. The parsed values are equal,
+  but the file name differs because it hashes different bytes.
+- `\w`, `\d` and whitespace are ASCII only. A byte of 0x80 or above counts as a
+  word byte in a FAIL or NOT_RUN prefix, so such a prefix fails closed.
+- The timestamp is truncated to microseconds.
+- The FAIL scan runs before any `.out` file is read.
+
 ### Programs
 
 `omnode-code INFER TOOL OMC ROOT WORK JDIR PORT VIEW OBJ...` runs 1..4 objectives
