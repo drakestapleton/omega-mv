@@ -27,7 +27,8 @@ note                7 ticket lifetime, 8 capacities (packed like a request):
 note                the whole setting; the last one wins
 note 12 GOAL    3 job id, 4 topics, 5 estimate ms, 6 uncertainty ms
 note 13 FAIR    3 dispatch event, 4 assigned slot bitmap, 5 bypassed slot
-note                bitmap, 6 cursor, 7 reserved slot + 1 (sched.om's ring)
+note                bitmap, 6 cursor, 7 reserved slot + 1, 8 slots a
+note                publication made ready (sched.om's ring)
 note A header of another version (1 included) is refused (21); an OPEN
 note written under another SPVER is refused at replay (33).
 note Order: a transition is appended and fdatasync'd before anything acts on
@@ -64,13 +65,15 @@ global jact ulong 1024
 global jjob ulong 2048
 global jstat ulong 8
 note Policy replay tables (DRA-398), per job entry k: jreq request, jslot
-note slot at admission, jbyp bypass count; jsl slot -> job entry + 1 while
-note admitted and not released; jpol 0 seen, 1..5 policy words, 6 caps;
-note jgoal per k: 0 seen, 1 topics, 2 estimate, 3 uncertainty; jfair 0 last
-note event, 1 cursor, 2 reserved job entry + 1, 3 seen.
+note slot at admission, jbyp bypass count, jrdy 1 once a publication made
+note it ready; jsl slot -> job entry + 1 while admitted and not released;
+note jpol 0 seen, 1..5 policy words, 6 caps; jgoal per k: 0 seen, 1
+note topics, 2 estimate, 3 uncertainty; jfair 0 last event, 1 cursor, 2
+note reserved job entry + 1, 3 seen.
 global jreq ulong 256
 global jslot ulong 256
 global jbyp ulong 256
+global jrdy ulong 256
 global jsl ulong 64
 global jpol ulong 8
 global jgoal ulong 1024
@@ -177,6 +180,7 @@ for i ulong 256
 put jreq i 0
 put jslot i 0
 put jbyp i 0
+put jrdy i 0
 end
 for i ulong 1024
 put jgoal i 0
@@ -370,13 +374,17 @@ end
 ret 24
 end
 
-note ADMIT into the tables: a new job entry with its request and slot.
+note ADMIT into the tables: a new job entry with its request and slot; a
+note slot another unreleased job holds is refused (25).
 fn jn_aadmit r view ulong 16 to ulong
 if ge jn_jfind get r 3 0
 ret 25
 end
 s = get r 7
 if ge s 64
+ret 25
+end
+if ne get jsl s 0
 ret 25
 end
 j = jn_jnew get r 3
@@ -389,6 +397,7 @@ put jjob add mul k 8 3 get r 5
 put jreq k get r 6
 put jslot k s
 put jbyp k 0
+put jrdy k 0
 put jsl s add k 1
 ret 0
 end
@@ -424,18 +433,28 @@ end
 ret 24
 end
 
-note FAIR into the tables: the event must follow the last one, the cursor
-note lie in the table, and every slot it names (assigned, bypassed,
-note reserved) hold an admitted job; nothing changes otherwise (25).
-note Assigned jobs' bypass counts restart at 0, bypassed ones go up by one.
+note FAIR into the tables. A decision record (word 8 zero) must follow the
+note last event; a readiness record (word 8 the slots a publication made
+note ready, nothing assigned or bypassed) may share it, since publication
+note does not count as a dispatch event. The cursor must lie in the
+note table; assigned and bypassed slots must be disjoint and hold live
+note ready jobs (no deps, or made ready by an earlier readiness record);
+note slots made ready must hold live waiting jobs; the reserved slot a live
+note ready job this record did not assign. Live: admitted, not released,
+note not cancelled. Nothing changes otherwise (25). Assigned jobs' bypass
+note counts restart at 0, bypassed ones go up by one, jobs made ready are
+note marked ready.
 fn jn_afair r view ulong 16 to ulong
-if and ne get jfair 3 0 le get r 3 get jfair 0
+am = get r 4
+bm = get r 5
+rd = get r 8
+if not jn_fevt get r 3 or am bm rd
 ret 25
 end
-if ge get r 6 64
+if or ge get r 6 64 ne and am bm 0
 ret 25
 end
-if not jn_focc or get r 4 get r 5
+if or not jn_fok or am bm 1 not jn_fok rd 2
 ret 25
 end
 rs = get r 7
@@ -444,18 +463,24 @@ ret 25
 end
 rk = ulong 0
 if gt rs 0
-rk = get jsl sub rs 1
-if eq rk 0
+if ne and shr am sub rs 1 1 0
 ret 25
 end
+if not jn_fok shl ulong 1 sub rs 1 1
+ret 25
+end
+rk = get jsl sub rs 1
 end
 for s ulong 64
-if ne and shr get r 4 s 1 0
+if ne and shr am s 1 0
 put jbyp sub get jsl s 1 0
 end
-if ne and shr get r 5 s 1 0
+if ne and shr bm s 1 0
 k = sub get jsl s 1
 put jbyp k add get jbyp k 1
+end
+if ne and shr rd s 1 0
+put jrdy sub get jsl s 1 1
 end
 end
 put jfair 0 get r 3
@@ -465,11 +490,38 @@ put jfair 3 1
 ret 0
 end
 
-note Does every slot set in bitmap m hold an admitted job?
-fn jn_focc m ulong to bool
+note Event order of a FAIR at event ev with assigned or bypassed slots ab
+note and slots made ready rd: decisions strictly after the last event,
+note readiness (ab empty) at or after it.
+fn jn_fevt ev ulong ab ulong rd ulong to bool
+if eq get jfair 3 0
+ret true
+end
+if ne rd 0
+ret and eq ab 0 ge ev get jfair 0
+end
+ret gt ev get jfair 0
+end
+
+note Does every slot set in bitmap m hold a live job that is ready (kind 1:
+note no deps, or made ready) or waiting (kind 2: deps, not made ready)?
+fn jn_fok m ulong kind ulong to bool
 for s ulong 64
 if ne and shr m s 1 0
-if eq get jsl s 0
+x = get jsl s
+if eq x 0
+ret false
+end
+k = sub x 1
+b = mul k 8
+if or ne get jjob add b 4 0 ne get jjob add b 6 0
+ret false
+end
+w = and ne get jjob add b 2 0 eq get jrdy k 0
+if and w eq kind 1
+ret false
+end
+if and not w eq kind 2
 ret false
 end
 end
@@ -644,7 +696,7 @@ for i ulong 16
 put r i 0
 end
 put r 0 13
-for i ulong 5
+for i ulong 6
 put r add 3 i sched_frw k i
 end
 e = jn_put r
@@ -942,23 +994,32 @@ end
 ret o
 end
 
-note Recovery: admit job entry k again into its recorded slot (else the
-note lowest free one), then its bypass count and goal. The slot or < 0.
+note Recovery: admit job entry k again into its recorded slot, ready again
+note when a publication had made it ready, then its bypass count and goal.
+note The slot, or < 0 when the scheduler refuses any of them (a recorded
+note slot that is taken, a bypass count on a job that is not ready).
 fn jn_readmit k ulong to long
 b = mul k 8
-id = get jjob add b 1
-x = sched_admits id get jjob add b 2 get jjob add b 3 get jreq k get jslot k
-if lt x 0
-x = sched_admitr id get jjob add b 2 get jjob add b 3 get jreq k
-end
+x = sched_admits get jjob add b 1 get jjob add b 2 get jjob add b 3 get jreq k get jslot k
 if lt x 0
 ret x
 end
 j = ulong x
-y = sched_setbyp j get jbyp k
+if ne get jrdy k 0
+if lt sched_setready j 0
+ret neg long 3
+end
+end
+if ne get jbyp k 0
+if lt sched_setbyp j get jbyp k 0
+ret neg long 3
+end
+end
 g = mul k 4
 if ne get jgoal g 0
-y = sched_goal j get jgoal add g 1 get jgoal add g 2 get jgoal add g 3
+if lt sched_goal j get jgoal add g 1 get jgoal add g 2 get jgoal add g 3 0
+ret neg long 3
+end
 end
 ret x
 end

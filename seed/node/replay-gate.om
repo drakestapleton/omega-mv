@@ -1052,15 +1052,19 @@ note refused, 6 slots read by value traversal, 7 proposals used.
 global scgst ulong 8
 note Replay ring (DRA-398). While a journal is attached (sfj 0 is 1), each
 note dispatch event that assigned a job or changed the reservation leaves a
-note record of 5 words in sfr: event count, assigned slot bitmap, bypassed
+note record of 6 words in sfr: event count, assigned slot bitmap, bypassed
 note slot bitmap (the slots whose bypass count went up), cursor, reserved
-note slot + 1. sfj 1 counts the records waiting; sfj 2 and 3 are the
+note slot + 1, and 0. A publication that makes waiting jobs ready leaves a
+note readiness record: the current event count, no assigned or bypassed
+note slot, cursor, reserved slot + 1, and the bitmap of the slots it made
+note ready. sfj 1 counts the records waiting; sfj 2 and 3 are the
 note reservation at the start of the current event and the slots it has
 note assigned so far. The journal drains them before it appends any other
 note record, so a transition is never durable before the dispatch
-note decisions that came before it. With 64 waiting, dispatch assigns
-note nothing (counter 15) until they are drained.
-global sfr ulong 320
+note decisions and readiness that came before it. With 64 waiting,
+note dispatch assigns nothing and publication is refused (counter 15)
+note until they are drained.
+global sfr ulong 384
 global sfj ulong 4
 
 fn sc_cell w ulong off ulong to ulong
@@ -1976,7 +1980,7 @@ if eq get sfj 0 0
 ret
 end
 if or ne get sfj 3 0 ne get scpol 5 get sfj 2
-sp_frpush get sfj 3 bm
+sp_frpush get sfj 3 bm 0
 end
 end
 
@@ -1986,14 +1990,16 @@ put sfj 3 or get sfj 3 shl 1 j
 end
 
 note Append one replay record (sfr): event, assigned and bypassed slot
-note bitmaps, cursor, reserved slot + 1. sched_dispatch leaves room.
-fn sp_frpush am ulong bm ulong to void
-b = mul get sfj 1 5
+note bitmaps, cursor, reserved slot + 1, slots made ready. The callers
+note leave room.
+fn sp_frpush am ulong bm ulong rd ulong to void
+b = mul get sfj 1 6
 put sfr b get scst 2
 put sfr add b 1 am
 put sfr add b 2 bm
 put sfr add b 3 get scpol 4
 put sfr add b 4 get scpol 5
+put sfr add b 5 rd
 put sfj 1 add get sfj 1 1
 end
 
@@ -2011,36 +2017,34 @@ fn sched_jattached to bool
 ret ne get sfj 0 0
 end
 
-note Journal: records waiting in the replay ring, word i (0..4) of record k,
+note Journal: records waiting in the replay ring, word i (0..5) of record k,
 note and emptying it once they are durable.
 fn sched_frn to ulong
 ret get sfj 1
 end
 fn sched_frw k ulong i ulong to ulong
-ret get sfr add mul k 5 i
+ret get sfr add mul k 6 i
 end
 fn sched_frclear to void
 put sfj 1 0
 end
 
 note Journal, recovery: the cursor and reservation after replay, and the
-note dispatch event count. The reservation names slot res - 1 and is kept
-note only when that slot holds a ready job; a cursor outside the table is
-note refused. 0 or -7.
+note dispatch event count. The reservation names slot res - 1, which must
+note hold a ready job. -7 (nothing changed) for a cursor outside the table
+note or any other reservation, else 0.
 fn sched_frestore cur ulong ev ulong res ulong to long
-if ge cur 64
+if or ge cur 64 gt res 64
 ret neg long 7
+end
+if gt res 0
+if ne get sjst sub res 1 2
+ret neg long 7
+end
 end
 put scpol 4 cur
 put scst 2 ev
-put scpol 5 0
-if gt res 0
-if le res 64
-if eq get sjst sub res 1 2
 put scpol 5 res
-end
-end
-end
 ret 0
 end
 
@@ -2053,6 +2057,19 @@ if ne get sjst j 2
 ret neg long 3
 end
 put sjbyp j n
+ret 0
+end
+
+note Journal, recovery: waiting job j was made ready by a publication
+note before the restart. 0 or -3 (j not waiting).
+fn sched_setready j ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 1
+ret neg long 3
+end
+sp_ready j
 ret 0
 end
 
@@ -2136,18 +2153,30 @@ end
 
 note Creator: publish an artifact, make waiting jobs whose deps meet topics
 note ready, wake each live worker whose interest meets topics, dispatch.
-note Returns the version, or the publish refusal with nothing woken.
+note With a journal attached the jobs made ready leave a readiness record
+note in the replay ring; when the ring is full nothing is published, -105
+note (counter 15). Returns the version, or the publish refusal with nothing
+note woken.
 fn sched_publish c long topics ulong src view uchar 4096 n ulong to long
+if and ne get sfj 0 0 ge get sfj 1 64
+put scst 15 add get scst 15 1
+ret neg long 105
+end
 v = pool_publish c topics src n
 if le v 0
 ret v
 end
+rd = ulong 0
 for j ulong 64
 if eq get sjst j 1
 if ne and get sjdep j topics 0
 sp_ready j
+rd = or rd shl 1 j
 end
 end
+end
+if and ne rd 0 ne get sfj 0 0
+sp_frpush 0 0 rd
 end
 m = mapget c 48 8
 for w ulong m bound 64
@@ -2519,7 +2548,8 @@ note                7 ticket lifetime, 8 capacities (packed like a request):
 note                the whole setting; the last one wins
 note 12 GOAL    3 job id, 4 topics, 5 estimate ms, 6 uncertainty ms
 note 13 FAIR    3 dispatch event, 4 assigned slot bitmap, 5 bypassed slot
-note                bitmap, 6 cursor, 7 reserved slot + 1 (sched.om's ring)
+note                bitmap, 6 cursor, 7 reserved slot + 1, 8 slots a
+note                publication made ready (sched.om's ring)
 note A header of another version (1 included) is refused (21); an OPEN
 note written under another SPVER is refused at replay (33).
 note Order: a transition is appended and fdatasync'd before anything acts on
@@ -2556,13 +2586,15 @@ global jact ulong 1024
 global jjob ulong 2048
 global jstat ulong 8
 note Policy replay tables (DRA-398), per job entry k: jreq request, jslot
-note slot at admission, jbyp bypass count; jsl slot -> job entry + 1 while
-note admitted and not released; jpol 0 seen, 1..5 policy words, 6 caps;
-note jgoal per k: 0 seen, 1 topics, 2 estimate, 3 uncertainty; jfair 0 last
-note event, 1 cursor, 2 reserved job entry + 1, 3 seen.
+note slot at admission, jbyp bypass count, jrdy 1 once a publication made
+note it ready; jsl slot -> job entry + 1 while admitted and not released;
+note jpol 0 seen, 1..5 policy words, 6 caps; jgoal per k: 0 seen, 1
+note topics, 2 estimate, 3 uncertainty; jfair 0 last event, 1 cursor, 2
+note reserved job entry + 1, 3 seen.
 global jreq ulong 256
 global jslot ulong 256
 global jbyp ulong 256
+global jrdy ulong 256
 global jsl ulong 64
 global jpol ulong 8
 global jgoal ulong 1024
@@ -2669,6 +2701,7 @@ for i ulong 256
 put jreq i 0
 put jslot i 0
 put jbyp i 0
+put jrdy i 0
 end
 for i ulong 1024
 put jgoal i 0
@@ -2862,13 +2895,17 @@ end
 ret 24
 end
 
-note ADMIT into the tables: a new job entry with its request and slot.
+note ADMIT into the tables: a new job entry with its request and slot; a
+note slot another unreleased job holds is refused (25).
 fn jn_aadmit r view ulong 16 to ulong
 if ge jn_jfind get r 3 0
 ret 25
 end
 s = get r 7
 if ge s 64
+ret 25
+end
+if ne get jsl s 0
 ret 25
 end
 j = jn_jnew get r 3
@@ -2881,6 +2918,7 @@ put jjob add mul k 8 3 get r 5
 put jreq k get r 6
 put jslot k s
 put jbyp k 0
+put jrdy k 0
 put jsl s add k 1
 ret 0
 end
@@ -2916,18 +2954,28 @@ end
 ret 24
 end
 
-note FAIR into the tables: the event must follow the last one, the cursor
-note lie in the table, and every slot it names (assigned, bypassed,
-note reserved) hold an admitted job; nothing changes otherwise (25).
-note Assigned jobs' bypass counts restart at 0, bypassed ones go up by one.
+note FAIR into the tables. A decision record (word 8 zero) must follow the
+note last event; a readiness record (word 8 the slots a publication made
+note ready, nothing assigned or bypassed) may share it, since publication
+note does not count as a dispatch event. The cursor must lie in the
+note table; assigned and bypassed slots must be disjoint and hold live
+note ready jobs (no deps, or made ready by an earlier readiness record);
+note slots made ready must hold live waiting jobs; the reserved slot a live
+note ready job this record did not assign. Live: admitted, not released,
+note not cancelled. Nothing changes otherwise (25). Assigned jobs' bypass
+note counts restart at 0, bypassed ones go up by one, jobs made ready are
+note marked ready.
 fn jn_afair r view ulong 16 to ulong
-if and ne get jfair 3 0 le get r 3 get jfair 0
+am = get r 4
+bm = get r 5
+rd = get r 8
+if not jn_fevt get r 3 or am bm rd
 ret 25
 end
-if ge get r 6 64
+if or ge get r 6 64 ne and am bm 0
 ret 25
 end
-if not jn_focc or get r 4 get r 5
+if or not jn_fok or am bm 1 not jn_fok rd 2
 ret 25
 end
 rs = get r 7
@@ -2936,18 +2984,24 @@ ret 25
 end
 rk = ulong 0
 if gt rs 0
-rk = get jsl sub rs 1
-if eq rk 0
+if ne and shr am sub rs 1 1 0
 ret 25
 end
+if not jn_fok shl ulong 1 sub rs 1 1
+ret 25
+end
+rk = get jsl sub rs 1
 end
 for s ulong 64
-if ne and shr get r 4 s 1 0
+if ne and shr am s 1 0
 put jbyp sub get jsl s 1 0
 end
-if ne and shr get r 5 s 1 0
+if ne and shr bm s 1 0
 k = sub get jsl s 1
 put jbyp k add get jbyp k 1
+end
+if ne and shr rd s 1 0
+put jrdy sub get jsl s 1 1
 end
 end
 put jfair 0 get r 3
@@ -2957,11 +3011,38 @@ put jfair 3 1
 ret 0
 end
 
-note Does every slot set in bitmap m hold an admitted job?
-fn jn_focc m ulong to bool
+note Event order of a FAIR at event ev with assigned or bypassed slots ab
+note and slots made ready rd: decisions strictly after the last event,
+note readiness (ab empty) at or after it.
+fn jn_fevt ev ulong ab ulong rd ulong to bool
+if eq get jfair 3 0
+ret true
+end
+if ne rd 0
+ret and eq ab 0 ge ev get jfair 0
+end
+ret gt ev get jfair 0
+end
+
+note Does every slot set in bitmap m hold a live job that is ready (kind 1:
+note no deps, or made ready) or waiting (kind 2: deps, not made ready)?
+fn jn_fok m ulong kind ulong to bool
 for s ulong 64
 if ne and shr m s 1 0
-if eq get jsl s 0
+x = get jsl s
+if eq x 0
+ret false
+end
+k = sub x 1
+b = mul k 8
+if or ne get jjob add b 4 0 ne get jjob add b 6 0
+ret false
+end
+w = and ne get jjob add b 2 0 eq get jrdy k 0
+if and w eq kind 1
+ret false
+end
+if and not w eq kind 2
 ret false
 end
 end
@@ -3136,7 +3217,7 @@ for i ulong 16
 put r i 0
 end
 put r 0 13
-for i ulong 5
+for i ulong 6
 put r add 3 i sched_frw k i
 end
 e = jn_put r
@@ -3434,23 +3515,32 @@ end
 ret o
 end
 
-note Recovery: admit job entry k again into its recorded slot (else the
-note lowest free one), then its bypass count and goal. The slot or < 0.
+note Recovery: admit job entry k again into its recorded slot, ready again
+note when a publication had made it ready, then its bypass count and goal.
+note The slot, or < 0 when the scheduler refuses any of them (a recorded
+note slot that is taken, a bypass count on a job that is not ready).
 fn jn_readmit k ulong to long
 b = mul k 8
-id = get jjob add b 1
-x = sched_admits id get jjob add b 2 get jjob add b 3 get jreq k get jslot k
-if lt x 0
-x = sched_admitr id get jjob add b 2 get jjob add b 3 get jreq k
-end
+x = sched_admits get jjob add b 1 get jjob add b 2 get jjob add b 3 get jreq k get jslot k
 if lt x 0
 ret x
 end
 j = ulong x
-y = sched_setbyp j get jbyp k
+if ne get jrdy k 0
+if lt sched_setready j 0
+ret neg long 3
+end
+end
+if ne get jbyp k 0
+if lt sched_setbyp j get jbyp k 0
+ret neg long 3
+end
+end
 g = mul k 4
 if ne get jgoal g 0
-y = sched_goal j get jgoal add g 1 get jgoal add g 2 get jgoal add g 3
+if lt sched_goal j get jgoal add g 1 get jgoal add g 2 get jgoal add g 3 0
+ret neg long 3
+end
 end
 ret x
 end
@@ -4514,17 +4604,23 @@ note dispatch once (auth_pause false, then true), then lets every assigned
 note job finish and releases them in slot order, so each event ends at a
 note quiescent point. Trace record per event (10 words): 0, 1 the ids
 note assigned, 2 cursor, 3 reserved job id, 4 fold of (slot, id, bypass
-note count) over ready jobs, 5 policy words, 6 fold of (id, need, estimate,
-note topics) over waiting and ready jobs, 7 capacities, 8 sum of the ready
-note jobs' bypass counts. C2's state right after recovery must equal R's
-note after event k (words 2..8), and the C and C2 trace must equal R's.
+note count) over ready jobs, 5 policy words (with the ticket lifetime), 6
+note fold of (id, need, estimate, uncertainty, topics) over waiting and
+note ready jobs, 7 capacities, 8 sum of the ready jobs' bypass counts, 9
+note state and bypass count of job 7001. C2's state right after recovery
+note must equal R's after event k (words 2..9), and the C and C2 trace
+note must equal R's.
 note Jobs: 14 ready jobs needing 1..3 of 4 CPU, two workers, window 4,
-note dispatch budget 2, bypass budget 2. Policy 2 adds three waiting jobs,
-note declared topics and estimates (one on a waiting job).
+note dispatch budget 2, bypass budget 2, ticket lifetime 777, and job 7001
+note (3 CPU) waiting on topic 8, which the creator publishes before event
+note 1 (39 if refused), so it is ready, by publication, across the crash.
+note Policy 2 adds three waiting jobs, declared topics, estimates and
+note uncertainties (one on a waiting job).
 note Exits: 10..22 creator checks; per case base b: b R failed, b+1 C did
 note not stop at 77, b+2 C2 failed, b+3 recovered state differs, b+4 traces
-note differ, b+5 the case would not test replay (no bypass count or a zero
-note cursor at the boundary, or no reservation in the run), b+6 C3, which
+note differ, b+5 the case would not test replay (no bypass count, a zero
+note cursor or job 7001 not ready at the boundary, or no reservation in
+note the run), b+6 C3, which
 note recovers journal b again after C2, differs from R's final state (or R's
 note final cursor equals its boundary cursor, so the check would not see
 note C2's FAIR records missing). Mid-event crash
@@ -4533,9 +4629,13 @@ note runs; C2' must see the cursor, reservation and bypass counts of the
 note jobs that were not assigned (93; 95 nothing assigned or bypassed, or
 note the event moved neither cursor nor reservation, so losing its FAIR
 note would go unseen). Records refused (96 a FAIR that repeats the last
-note event, 97 a FAIR naming a free slot, 98 an OPEN of another SPVER).
-note Failed journal (40..43): revoke, pause, cancel, admission, policy and
-note goal change nothing. 44: a full replay ring stops dispatch.
+note event, 97 a FAIR naming a free slot, 98 an OPEN of another SPVER, 23
+note an ADMIT into a held slot, 24 a FAIR assigning and bypassing one slot,
+note 26 a FAIR assigning a waiting job, 27 a readiness record for a ready
+note job (and a valid one at the last event refused), 25 a FAIR reserving
+note a cancelled job). Failed journal (40..43): revoke, pause, cancel,
+note admission, policy and goal change nothing. 44: a full replay ring
+note stops dispatch; 47: and refuses publication.
 text rpja "build/node/rpa/journal"
 text rpla "build/node/rpa/lock"
 text rpjb "build/node/rpb/journal"
@@ -4676,19 +4776,20 @@ note the waiting jobs and declarations, all journaled.
 fn rp_load c long pol ulong to void
 rp_ok ge auth_pause c true 0 17
 rp_ok eq jn_cap 4 0 17
-rp_ok eq jn_policy pol 4 2 2 1000 0 17
+rp_ok eq jn_policy pol 4 2 2 777 0 17
 for i ulong 14
 rp_ok ge jn_admitr add 5000 i 0 0 rp_cpu i 0 18
 end
+rp_ok ge jn_admitr 7001 8 0 3 0 18
 if eq pol 2
 for i ulong 3
 rp_ok ge jn_admitr add 6000 i shl 1 i 0 0 0 18
 end
 rp_ok eq jn_goal rp_slot 5003 3 40 5 0 19
-rp_ok eq jn_goal rp_slot 5008 4 60 5 0 19
+rp_ok eq jn_goal rp_slot 5008 4 60 7 0 19
 rp_ok eq jn_goal rp_slot 5005 0 10 1 0 19
-rp_ok eq jn_goal rp_slot 5011 0 20 1 0 19
-rp_ok eq jn_goal rp_slot 6000 0 30 3 0 19
+rp_ok eq jn_goal rp_slot 5011 0 20 3 0 19
+rp_ok eq jn_goal rp_slot 6000 0 30 9 0 19
 end
 end
 
@@ -4744,7 +4845,8 @@ end
 ret h
 end
 
-note Fold of (id, need, estimate, topics) over waiting and ready jobs.
+note Fold of (id, need, estimate, uncertainty, topics) over waiting and
+note ready jobs.
 fn rp_fjob to ulong
 h = ulong 1469598103934665603
 for j ulong 64
@@ -4753,10 +4855,25 @@ if and ge s 1 le s 4
 h = mul xor h get sjid j 1099511628211
 h = mul xor h get sjneed j 1099511628211
 h = mul xor h get sjest j 1099511628211
+h = mul xor h get sjunc j 1099511628211
 h = mul xor h get sjpro j 1099511628211
 end
 end
 ret h
+end
+
+note Job 7001's state and bypass count, 0 when x or y is 7001 or it is not
+note in the table.
+fn rp_dep x ulong y ulong to ulong
+if or eq x 7001 eq y 7001
+ret 0
+end
+for j ulong 64
+if and eq get sjid j 7001 ne get sjst j 0
+ret or get sjst j shl get sjbyp j 8
+end
+end
+ret 0
 end
 
 fn rp_rid to ulong
@@ -4767,16 +4884,17 @@ end
 ret get sjid sub r 1
 end
 
-note Words 2..8 of trace record e (base), x and y excluded from 4 and 8.
+note Words 2..9 of trace record e (base), x and y excluded from 4, 8, 9.
 fn rp_state base ulong e ulong x ulong y ulong to void
 rp_put base e 2 sched_stat 28
 rp_put base e 3 rp_rid
 rp_put base e 4 rp_fbyp x y false
 p = or or sched_stat 24 shl sched_stat 25 8 or shl sched_stat 26 16 shl sched_stat 27 24
-rp_put base e 5 p
+rp_put base e 5 or p shl sched_stat 31 32
 rp_put base e 6 rp_fjob
 rp_put base e 7 sched_caps
 rp_put base e 8 rp_fbyp x y true
+rp_put base e 9 rp_dep x y
 end
 
 note Resume dispatch once, pause; record the ids assigned (words 0, 1).
@@ -4799,7 +4917,12 @@ rp_put base e 0 a0
 rp_put base e 1 a1
 end
 
+note Event e; before event 1 the creator publishes topic 8 (job 7001).
 fn rp_event c long e ulong base ulong to void
+pb = new uchar 4096 0
+if eq e 1
+rp_ok gt sched_publish c 8 pb 16 0 39
+end
 rp_dispatch c e base
 rp_drive c
 rp_state base e 0 0
@@ -4925,12 +5048,12 @@ rp_cmp k en b
 end
 
 fn rp_cmp k ulong en ulong b int to void
-for i ulong 7
+for i ulong 8
 rp_ok eq rp_get 2048 0 add i 2 rp_get 0 sub k 1 add i 2 add b 3
 end
 seen = false
 for e ulong en
-for i ulong 9
+for i ulong 10
 rp_ok eq rp_get 0 e i rp_get 1024 e i add b 4
 end
 if gt rp_get 0 e 3 0
@@ -4940,7 +5063,8 @@ end
 rp_ok seen add b 5
 rp_ok gt rp_get 0 sub k 1 8 0 add b 5
 rp_ok ne rp_get 0 sub k 1 2 0 add b 5
-for i ulong 7
+rp_ok eq and rp_get 0 sub k 1 9 255 2 add b 5
+for i ulong 8
 rp_ok eq rp_get 2048 1 add i 2 rp_get 0 sub en 1 add i 2 add b 6
 end
 rp_ok ne rp_get 0 sub en 1 2 rp_get 0 sub k 1 2 add b 6
@@ -4959,7 +5083,7 @@ if eq p 0
 exit rp_mrec
 end
 rp_child rp_reap p 0 92
-for i ulong 7
+for i ulong 8
 rp_ok eq rp_get 3072 1 add i 2 rp_get 3072 0 add i 2 93
 end
 rp_ok gt rp_get 3072 0 0 0 95
@@ -4999,11 +5123,83 @@ put r 0 1
 put r 3 1
 put r 5 add SPVER 1
 rp_ok eq jn_put r 33 98
+rp_dupv
 jn_close
 ret 0
 end
 
-note A full replay ring (64 records not yet durable) refuses dispatch (44).
+note A live ready job's slot (no deps, not cancelled), or 64.
+fn rp_rslot to ulong
+for s ulong 64
+x = get jsl s
+if ne x 0
+b = mul sub x 1 8
+if and eq get jjob add b 2 0 eq get jjob add b 6 0
+ret s
+end
+end
+end
+ret 64
+end
+
+fn rp_fair r edit ulong 16 ev ulong am ulong bm ulong rs ulong rd ulong to void
+for i ulong 16
+put r i 0
+end
+put r 0 13
+put r 3 ev
+put r 4 am
+put r 5 bm
+put r 6 get jfair 1
+put r 7 rs
+put r 8 rd
+end
+
+note Contradictory records are refused (23..27); valid ones still pass.
+fn rp_dupv to void
+r = new ulong 16 0
+s = rp_rslot
+rp_ok lt s 64 23
+f = ulong 64
+for j ulong 64
+if eq get jsl j 0
+f = j
+end
+end
+rp_ok lt f 64 23
+put r 0 2
+put r 3 9100
+put r 7 s
+rp_ok eq jn_put r 25 23
+e = add get jfair 0 1
+rp_fair r e shl 1 s shl 1 s 0 0
+rp_ok eq jn_put r 25 24
+for i ulong 16
+put r i 0
+end
+put r 0 2
+put r 3 9101
+put r 4 16
+put r 7 f
+rp_ok eq jn_put r 0 26
+rp_fair r e shl 1 f 0 0 0
+rp_ok eq jn_put r 25 26
+rp_fair r get jfair 0 0 0 0 shl 1 s
+rp_ok eq jn_put r 25 27
+rp_fair r get jfair 0 0 0 0 shl 1 f
+rp_ok eq jn_put r 0 27
+for i ulong 16
+put r i 0
+end
+put r 0 8
+put r 3 get jjob add mul sub get jsl s 1 8 1
+rp_ok eq jn_put r 0 25
+rp_fair r add get jfair 0 1 0 0 add s 1 0
+rp_ok eq jn_put r 25 25
+end
+
+note A full replay ring (64 records not yet durable) refuses dispatch (44)
+note and publication (47: job 7001 stays waiting).
 fn rp_ring to int
 c = rp_setup 0
 rp_load c 1
@@ -5013,6 +5209,10 @@ x = sched_dispatch c
 rp_ok eq x 0 44
 rp_ok eq sched_stat 15 1 44
 rp_ok eq sched_stat 4 0 44
+pb = new uchar 4096 0
+rp_ok eq sched_publish c 8 pb 16 neg long 105 47
+rp_ok eq sched_stat 15 2 47
+rp_ok eq get sjst rp_slot 7001 1 47
 put sfj 1 0
 put scpause 0 1
 rp_down c

@@ -1052,15 +1052,19 @@ note refused, 6 slots read by value traversal, 7 proposals used.
 global scgst ulong 8
 note Replay ring (DRA-398). While a journal is attached (sfj 0 is 1), each
 note dispatch event that assigned a job or changed the reservation leaves a
-note record of 5 words in sfr: event count, assigned slot bitmap, bypassed
+note record of 6 words in sfr: event count, assigned slot bitmap, bypassed
 note slot bitmap (the slots whose bypass count went up), cursor, reserved
-note slot + 1. sfj 1 counts the records waiting; sfj 2 and 3 are the
+note slot + 1, and 0. A publication that makes waiting jobs ready leaves a
+note readiness record: the current event count, no assigned or bypassed
+note slot, cursor, reserved slot + 1, and the bitmap of the slots it made
+note ready. sfj 1 counts the records waiting; sfj 2 and 3 are the
 note reservation at the start of the current event and the slots it has
 note assigned so far. The journal drains them before it appends any other
 note record, so a transition is never durable before the dispatch
-note decisions that came before it. With 64 waiting, dispatch assigns
-note nothing (counter 15) until they are drained.
-global sfr ulong 320
+note decisions and readiness that came before it. With 64 waiting,
+note dispatch assigns nothing and publication is refused (counter 15)
+note until they are drained.
+global sfr ulong 384
 global sfj ulong 4
 
 fn sc_cell w ulong off ulong to ulong
@@ -1976,7 +1980,7 @@ if eq get sfj 0 0
 ret
 end
 if or ne get sfj 3 0 ne get scpol 5 get sfj 2
-sp_frpush get sfj 3 bm
+sp_frpush get sfj 3 bm 0
 end
 end
 
@@ -1986,14 +1990,16 @@ put sfj 3 or get sfj 3 shl 1 j
 end
 
 note Append one replay record (sfr): event, assigned and bypassed slot
-note bitmaps, cursor, reserved slot + 1. sched_dispatch leaves room.
-fn sp_frpush am ulong bm ulong to void
-b = mul get sfj 1 5
+note bitmaps, cursor, reserved slot + 1, slots made ready. The callers
+note leave room.
+fn sp_frpush am ulong bm ulong rd ulong to void
+b = mul get sfj 1 6
 put sfr b get scst 2
 put sfr add b 1 am
 put sfr add b 2 bm
 put sfr add b 3 get scpol 4
 put sfr add b 4 get scpol 5
+put sfr add b 5 rd
 put sfj 1 add get sfj 1 1
 end
 
@@ -2011,36 +2017,34 @@ fn sched_jattached to bool
 ret ne get sfj 0 0
 end
 
-note Journal: records waiting in the replay ring, word i (0..4) of record k,
+note Journal: records waiting in the replay ring, word i (0..5) of record k,
 note and emptying it once they are durable.
 fn sched_frn to ulong
 ret get sfj 1
 end
 fn sched_frw k ulong i ulong to ulong
-ret get sfr add mul k 5 i
+ret get sfr add mul k 6 i
 end
 fn sched_frclear to void
 put sfj 1 0
 end
 
 note Journal, recovery: the cursor and reservation after replay, and the
-note dispatch event count. The reservation names slot res - 1 and is kept
-note only when that slot holds a ready job; a cursor outside the table is
-note refused. 0 or -7.
+note dispatch event count. The reservation names slot res - 1, which must
+note hold a ready job. -7 (nothing changed) for a cursor outside the table
+note or any other reservation, else 0.
 fn sched_frestore cur ulong ev ulong res ulong to long
-if ge cur 64
+if or ge cur 64 gt res 64
 ret neg long 7
+end
+if gt res 0
+if ne get sjst sub res 1 2
+ret neg long 7
+end
 end
 put scpol 4 cur
 put scst 2 ev
-put scpol 5 0
-if gt res 0
-if le res 64
-if eq get sjst sub res 1 2
 put scpol 5 res
-end
-end
-end
 ret 0
 end
 
@@ -2053,6 +2057,19 @@ if ne get sjst j 2
 ret neg long 3
 end
 put sjbyp j n
+ret 0
+end
+
+note Journal, recovery: waiting job j was made ready by a publication
+note before the restart. 0 or -3 (j not waiting).
+fn sched_setready j ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 1
+ret neg long 3
+end
+sp_ready j
 ret 0
 end
 
@@ -2136,18 +2153,30 @@ end
 
 note Creator: publish an artifact, make waiting jobs whose deps meet topics
 note ready, wake each live worker whose interest meets topics, dispatch.
-note Returns the version, or the publish refusal with nothing woken.
+note With a journal attached the jobs made ready leave a readiness record
+note in the replay ring; when the ring is full nothing is published, -105
+note (counter 15). Returns the version, or the publish refusal with nothing
+note woken.
 fn sched_publish c long topics ulong src view uchar 4096 n ulong to long
+if and ne get sfj 0 0 ge get sfj 1 64
+put scst 15 add get scst 15 1
+ret neg long 105
+end
 v = pool_publish c topics src n
 if le v 0
 ret v
 end
+rd = ulong 0
 for j ulong 64
 if eq get sjst j 1
 if ne and get sjdep j topics 0
 sp_ready j
+rd = or rd shl 1 j
 end
 end
+end
+if and ne rd 0 ne get sfj 0 0
+sp_frpush 0 0 rd
 end
 m = mapget c 48 8
 for w ulong m bound 64

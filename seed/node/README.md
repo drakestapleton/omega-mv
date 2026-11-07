@@ -932,12 +932,16 @@ are not journaled, so a recovered job reads whatever its dependency topics
 hold after the restart. The key of a class 3 effect must be created by the
 effect itself, atomically and last. Scheduling state not restored: reservation
 tickets (a recovered reservation starts a new ticket), policy 0's ready order
-(`sjrdy`), dependency readiness (a recovered job with topics is waiting until
-they are published again) and proposals (they are stale after a restart by
-the incarnation). Replay is exact at quiescent points (no job running); a
-crash inside a dispatch event recovers that event's cursor, reservation and
-the bypass counts of the jobs it did not assign, and the jobs it assigned are
-admitted again with bypass count 0.
+(`sjrdy`: recovered ready jobs are stamped in admission order) and proposals
+(they are stale after a restart by the incarnation). Dependency readiness is
+restored: a publication that makes waiting jobs ready leaves a readiness
+record, and a job it made ready is ready again after recovery. Replay is exact
+at quiescent points (no job running); a crash inside a dispatch event
+recovers that event's cursor, reservation and the bypass counts of the jobs
+it did not assign, and the jobs it assigned are admitted again with bypass
+count 0. The dispatch event count is restored to the last journaled
+decision's; events that changed nothing leave no record. The count only
+stamps replay records, so later records still follow the last durable one.
 
 ### Acceptance and controls
 
@@ -989,41 +993,67 @@ and table slot with ADMIT, the policy words and capacities (POLICY), the goal
 declarations (GOAL). The decisions themselves are recorded as they are made:
 each dispatch event that assigns a job or moves the reservation puts one
 record (event, assigned and bypassed slot bitmaps, cursor, reserved slot) in
-`sched.om`'s 64-record replay ring, and `jn_drain` writes the ring as FAIR
+`sched.om`'s 64-record replay ring, and so does each publication that makes
+waiting jobs ready (a readiness record: the current event, no assigned or
+bypassed slot, the slots made ready). `jn_drain` writes the ring as FAIR
 records before any other record and at every `auth_step`, so no later
-transition is durable before the decision that preceded it. Dispatch refuses
-to run while the ring is full (counter 15), so a decision is never lost to a
+transition is durable before the decision or readiness that preceded it.
+Dispatch and publication refuse to run while the ring is full (counter 15;
+publication returns -105 with nothing published), so nothing is lost to a
 journal that cannot keep up. A window scan that assigned nothing moves only
 the cursor; `jn_drain` writes one FAIR with empty bitmaps for it when the
-cursor or the reservation differs from the last FAIR. Replay checks every
-FAIR (a strictly later event, only occupied slots, a reserved slot that holds
-a job) and rebuilds the bypass counts, the cursor and the reservation.
+cursor or the reservation differs from the last FAIR.
+
+Replay refuses (25) any record that contradicts the tables, and nothing
+changes: an ADMIT into a slot another unreleased job holds; a decision FAIR
+that does not follow the last event (a readiness record may share it); a
+cursor outside the table; a slot both assigned and bypassed; an assigned,
+bypassed or reserved slot that does not hold a live ready job (live: admitted,
+not released, not cancelled; ready: no deps, or made ready by an earlier
+readiness record); a slot made ready that does not hold a live waiting job;
+a reservation on a job the same record assigned. Recovery then readmits each
+unfinished job into its recorded slot (never another), makes it ready again
+if a publication had, and restores its bypass count and goal. Any of these
+the scheduler refuses, and a reservation that does not name a ready job,
+fails the recovery (31).
 
 The gate runs four cases (policy 1 and 2, crash after 3 and after 6 of 10
 dispatch events) and four special checks:
-- R, a reference creator, runs all events on journal a; C runs the first k on journal b and dies; C2 recovers journal b and runs the rest. C2's state right after recovery equals R's after event k (cursor, reserved job, slots, ids and bypass counts of ready jobs, needs and goals of every unfinished job, policy words, capacities, bypass sum), and C plus C2 make the same decisions as R, event by event. C3 recovers journal b once more and equals R's final state. Each case also proves it tests something: a bypass count and a nonzero cursor at the boundary, a reservation during the run, a final cursor different from the boundary's.
+- R, a reference creator, runs all events on journal a; C runs the first k on journal b and dies; C2 recovers journal b and runs the rest. Before event 1 the creator publishes the topic job 7001 waits on, so 7001 is ready by publication across the crash. C2's state right after recovery equals R's after event k (cursor, reserved job, slots, ids and bypass counts of ready jobs, needs, estimates, uncertainties and topics of every unfinished job, policy words with the ticket lifetime 777, capacities, bypass sum, job 7001's state and bypass count), and C plus C2 make the same decisions as R, event by event. C3 recovers journal b once more and equals R's final state. Each case also proves it tests something: a bypass count, a nonzero cursor and job 7001 ready at the boundary, a reservation during the run, a final cursor different from the boundary's.
 - Mid-event crash: C' dies right after a dispatch and its PAUSE record, before any job runs. C2' has that event's cursor and reservation and the bypass counts of the jobs it did not assign; the jobs it assigned are ready again.
-- Records refused: a FAIR that repeats the last event, a FAIR naming a free slot, an OPEN written under another `SPVER`.
-- Failed journal: revoke, pause, cancel, admission, policy, capacities and goal each return their refusal and change nothing; a full ring stops dispatch.
+- Records refused: a FAIR that repeats the last event, a FAIR naming a free slot, an OPEN written under another `SPVER`, an ADMIT into a held slot (23), a FAIR assigning and bypassing one slot (24), a FAIR assigning a waiting job (26), a readiness record for a ready job (27; a valid one at the last event is accepted), a FAIR reserving a cancelled job (25).
+- Failed journal: revoke, pause, cancel, admission, policy, capacities and goal each return their refusal and change nothing; a full ring stops dispatch (44) and publication (47).
 
 | Change | Expected exit (derived from the check it trips) |
 | --- | --- |
 | `journal.om`: ADMIT records request 0 | 53: the needs fold differs at the boundary |
 | `journal.om`: POLICY words not restored | 53 |
 | `journal.om`: capacities not restored | 53: `sched_new`'s 65535 per kind, the capacities word differs |
-| `journal.om`: readmission ignores the recorded slot | 53: jobs move to lower slots |
+| `journal.om`: readmission takes the lowest free slot instead of the recorded one | 53: jobs move to lower slots |
 | `journal.om`: FAIR bypass counts not replayed | 53 |
 | `sched.om`: `sched_frestore` leaves the cursor at 0 | 53 |
+| `journal.om`: POLICY restored with ticket lifetime 1000 instead of the recorded 777 | 53: the policy word differs |
+| `sched.om`: publication journals no readiness record | 53: C2 readmits 7001 waiting, R has it ready at the boundary |
+| `journal.om`: a replayed readiness record does not make the job ready again | 53: as above |
 | `journal.om`: GOAL not restored | 73: policy 2, the waiting job's declaration |
+| `journal.om`: GOAL restored without its uncertainty | 73 |
+| `sched.om`: recovery keeps the event count at 0 | 20: C2's first FAIR is stamped at or before the last journaled event; its next record is refused and the PAUSE fails |
 | `journal.om`: `jn_append` does not drain first | 93: the mid-event FAIR is lost |
-| `journal.om`: `jn_recover` does not attach the ring | 56: C2's decisions are never journaled, C3 differs |
+| `journal.om`: `jn_recover` does not attach the ring | 53: R and C journal no FAIR either, so C2 recovers cursor 0 and 7001 waiting (derived 56 before review r1) |
+| `journal.om`: only a journal with no FAIR attaches the ring | 56: C2's decisions are never journaled, C3 differs |
 | `journal.om`: a FAIR repeating an event accepted | 96 |
 | `journal.om`: a FAIR naming a free slot accepted | 96: the replay traps (index out of bounds) |
+| `journal.om`: ADMIT into a held slot accepted | 23 |
+| `journal.om`: a FAIR assigning and bypassing one slot accepted | 24 |
+| `journal.om`: a FAIR assigning a waiting job accepted | 26 |
+| `journal.om`: a readiness record for a ready job accepted | 27 |
+| `journal.om`: a FAIR reserving a cancelled job accepted | 25 |
 | `journal.om`: OPEN's `SPVER` not checked | 98 |
 | `auth.om`: revoke ignores a refused REVOKE | 40 |
 | `auth.om`: pause ignores a refused PAUSE | 41 |
 | `auth.om`: cancel ignores a refused CANCEL | 42 |
 | `sched.om`: dispatch ignores a full ring | 44 |
+| `sched.om`: publication ignores a full ring | 44: the readiness record is written past the ring and traps (103) in the ring child, which the parent reports as 44 |
 
 ## Local inference and the coding workflow (DRA-290)
 
