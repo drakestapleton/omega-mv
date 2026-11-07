@@ -1024,7 +1024,8 @@ note Counters (sched_stat): 0 admissions, 1 ready stamps, 2 dispatch events,
 note 3 candidate slot reads, 4 jobs assigned, 5 bypasses, 6 reservations
 note made, 7 impossible requests refused, 8 head-of-line stops, 9 reserved
 note jobs assigned, 10 tickets issued, 11 tickets lapsed, 12 leases overdue,
-note 13 maintenance slot reads, 14 window scans.
+note 13 maintenance slot reads, 14 window scans, 15 dispatch events refused
+note because the replay ring was full (DRA-398).
 global scst ulong 16
 note Goal-aware ranking (policy 2): sjpro the topics a job declares its
 note completion publishes, sjest its declared work estimate in ms, sjunc
@@ -1049,6 +1050,18 @@ note Goal counters (sched_stat 32..39): 0 rescores, 1 jobs scored, 2 graph
 note version bumps, 3 proposals accepted, 4 proposals stale, 5 proposals
 note refused, 6 slots read by value traversal, 7 proposals used.
 global scgst ulong 8
+note Replay ring (DRA-398). While a journal is attached (sfj 0 is 1), each
+note dispatch event that assigned a job or changed the reservation leaves a
+note record of 5 words in sfr: event count, assigned slot bitmap, bypassed
+note slot bitmap (the slots whose bypass count went up), cursor, reserved
+note slot + 1. sfj 1 counts the records waiting; sfj 2 and 3 are the
+note reservation at the start of the current event and the slots it has
+note assigned so far. The journal drains them before it appends any other
+note record, so a transition is never durable before the dispatch
+note decisions that came before it. With 64 waiting, dispatch assigns
+note nothing (counter 15) until they are drained.
+global sfr ulong 320
+global sfj ulong 4
 
 fn sc_cell w ulong off ulong to ulong
 ret mapget get scmap 0 add mul w 128 off 8
@@ -1100,6 +1113,7 @@ for k ulong 4
 put scap k 65535
 put suse k 0
 end
+put sfj 1 0
 for i ulong 16
 put scst i 0
 end
@@ -1217,14 +1231,13 @@ end
 ret 0
 end
 
-note Creator: set the capacity of every kind from caps (packed like a
-note request). 0, or -8 when the new capacity of a kind is below its use by
-note running jobs, or below the need of any one admitted job (nothing
-note changes).
-fn sched_cap caps ulong to long
+note Creator: would sched_cap caps be accepted? Not when the new capacity of
+note a kind is below its use by running jobs, or below the need of any one
+note admitted job.
+fn sched_capok caps ulong to bool
 for k ulong 4
 if lt sp_need caps k get suse k
-ret neg long 8
+ret false
 end
 end
 for j ulong 64
@@ -1232,10 +1245,19 @@ s = get sjst j
 if and ge s 1 le s 3
 for k ulong 4
 if gt sp_need get sjneed j k sp_need caps k
+ret false
+end
+end
+end
+end
+ret true
+end
+
+note Creator: set the capacity of every kind from caps (packed like a
+note request). 0, or -8 when sched_capok refuses (nothing changes).
+fn sched_cap caps ulong to long
+if not sched_capok caps
 ret neg long 8
-end
-end
-end
 end
 for k ulong 4
 put scap k sp_need caps k
@@ -1243,25 +1265,41 @@ end
 ret 0
 end
 
-note Creator: policy p (0 FIFO head-of-line, 1 fair fitting, 2 goal-aware
-note fair fitting), candidate window win slots (1..64), dispatch budget db
-note jobs per event (1..64), bypass budget by (1..65535), ticket lifetime
-note ttl dispatch events (1..1000000). The cursor and any reservation are
-note kept. 0 or -7.
-fn sched_policy p ulong win ulong db ulong by ulong ttl ulong to long
+note Creator: the configured capacities, packed like a request.
+fn sched_caps to ulong
+v = ulong 0
+for k ulong 4
+v = or v shl get scap k mul k 16
+end
+ret v
+end
+
+note Creator: would sched_policy accept these words? Policy p 0..2, window
+note win 1..64, dispatch budget db 1..64, bypass budget by 1..65535, ticket
+note lifetime ttl 1..1000000.
+fn sched_polok p ulong win ulong db ulong by ulong ttl ulong to bool
 if gt p 2
-ret neg long 7
+ret false
 end
 if or eq win 0 gt win 64
-ret neg long 7
+ret false
 end
 if or eq db 0 gt db 64
-ret neg long 7
+ret false
 end
 if or eq by 0 gt by 65535
-ret neg long 7
+ret false
 end
-if or eq ttl 0 gt ttl 1000000
+ret and gt ttl 0 le ttl 1000000
+end
+
+note Creator: policy p (0 FIFO head-of-line, 1 fair fitting, 2 goal-aware
+note fair fitting), candidate window win slots, dispatch budget db jobs per
+note event, bypass budget by, ticket lifetime ttl dispatch events, in the
+note ranges of sched_polok. The cursor and any reservation are kept. 0 or
+note -7.
+fn sched_policy p ulong win ulong db ulong by ulong ttl ulong to long
+if not sched_polok p win db by ttl
 ret neg long 7
 end
 put scpol 0 p
@@ -1384,6 +1422,30 @@ note slot; -8 when req exceeds the configured capacity of a kind (it could
 note never run); -2 when sched_room refuses: at the admission limit, or
 note ticket holders ahead; the caller keeps a ticket and asks again.
 fn sched_admitr id ulong deps ulong flags ulong req ulong to long
+ret sched_admits id deps flags req sched_slot
+end
+
+note Creator: the lowest free table slot (the one sched_admitr would give
+note the next job), or 64 when none is free.
+fn sched_slot to ulong
+for j ulong 64
+if eq get sjst j 0
+ret j
+end
+end
+ret 64
+end
+
+note Creator: could req ever run, with the configured capacity all free?
+fn sched_feas req ulong to bool
+ret sp_feas req
+end
+
+note Creator: sched_admitr into table slot j, which must be free: the
+note journal records the slot with the admission and recovery puts the job
+note back into it (DRA-398). Refusals as sched_admitr; -2 also when slot j
+note is not free.
+fn sched_admits id ulong deps ulong flags ulong req ulong j ulong to long
 if not sp_feas req
 put scst 7 add get scst 7 1
 ret neg long 8
@@ -1391,8 +1453,12 @@ end
 if not sched_room id
 ret neg long 2
 end
-for j ulong 64
-if eq get sjst j 0
+if ge j 64
+ret neg long 2
+end
+if ne get sjst j 0
+ret neg long 2
+end
 t = sp_tkpos id
 if lt t 64
 sp_tkpack t
@@ -1421,9 +1487,6 @@ put sjst j 1
 sp_bump
 end
 ret long j
-end
-end
-ret neg long 2
 end
 
 note Creator: job j (waiting, ready or running) gets a lease of ns from its
@@ -1823,8 +1886,10 @@ note After a fair dispatch event in which ya - 1 was the youngest admission
 note assigned (ya 0: none): every ready job admitted before it was bypassed
 note once; with no reservation, the oldest job at the bypass budget is
 note reserved. One pass over the table (64 maintenance reads, counter 13).
-fn sp_after ya ulong to void
+note Returns the bitmap of the slots bypassed.
+fn sp_after ya ulong to ulong
 o = ulong 64
+bm = ulong 0
 nores = eq get scpol 5 0
 for j ulong 64
 if eq get sjst j 2
@@ -1832,6 +1897,7 @@ if gt ya 0
 if lt add get sjarr j 1 ya
 put sjbyp j add get sjbyp j 1
 put scst 5 add get scst 5 1
+bm = or bm shl 1 j
 end
 end
 if nores
@@ -1852,17 +1918,26 @@ if lt o 64
 put scpol 5 add o 1
 put scst 6 add get scst 6 1
 end
+ret bm
 end
 
 note Creator: assign ready jobs to idle live workers under the policy, at
-note most the dispatch budget per call. Returns the number assigned.
+note most the dispatch budget per call. Returns the number assigned. With
+note a journal attached and the replay ring full, nothing is assigned
+note (counter 15) until the journal drains it.
 fn sched_dispatch c long to ulong
 if ne get scpause 0 0
+ret 0
+end
+if and ne get sfj 0 0 ge get sfj 1 64
+put scst 15 add get scst 15 1
 ret 0
 end
 n = mapget c 48 8
 k = ulong 0
 ya = ulong 0
+put sfj 2 get scpol 5
+put sfj 3 0
 fair = ge get scpol 0 1
 put scst 2 add get scst 2 1
 for i ulong get scpol 2 bound 64
@@ -1882,13 +1957,103 @@ end
 if gt add get sjarr j 1 ya
 ya = add get sjarr j 1
 end
+sp_fmark j
 sp_start c j w
 k = add k 1
 end
+bm = ulong 0
 if fair
-sp_after ya
+bm = sp_after ya
 end
+sp_frend bm
 ret k
+end
+
+note End of a dispatch event with a journal attached: one ring record when
+note it assigned a job or moved the reservation.
+fn sp_frend bm ulong to void
+if eq get sfj 0 0
+ret
+end
+if or ne get sfj 3 0 ne get scpol 5 get sfj 2
+sp_frpush get sfj 3 bm
+end
+end
+
+note The current dispatch event assigned slot j (sfj 3).
+fn sp_fmark j ulong to void
+put sfj 3 or get sfj 3 shl 1 j
+end
+
+note Append one replay record (sfr): event, assigned and bypassed slot
+note bitmaps, cursor, reserved slot + 1. sched_dispatch leaves room.
+fn sp_frpush am ulong bm ulong to void
+b = mul get sfj 1 5
+put sfr b get scst 2
+put sfr add b 1 am
+put sfr add b 2 bm
+put sfr add b 3 get scpol 4
+put sfr add b 4 get scpol 5
+put sfj 1 add get sfj 1 1
+end
+
+note Journal: attach (on) or detach the replay ring. Attaching empties it.
+note jn_recover attaches once the scheduler holds the journaled state.
+fn sched_jattach on bool to void
+put sfj 0 0
+if on
+put sfj 0 1
+end
+put sfj 1 0
+end
+
+fn sched_jattached to bool
+ret ne get sfj 0 0
+end
+
+note Journal: records waiting in the replay ring, word i (0..4) of record k,
+note and emptying it once they are durable.
+fn sched_frn to ulong
+ret get sfj 1
+end
+fn sched_frw k ulong i ulong to ulong
+ret get sfr add mul k 5 i
+end
+fn sched_frclear to void
+put sfj 1 0
+end
+
+note Journal, recovery: the cursor and reservation after replay, and the
+note dispatch event count. The reservation names slot res - 1 and is kept
+note only when that slot holds a ready job; a cursor outside the table is
+note refused. 0 or -7.
+fn sched_frestore cur ulong ev ulong res ulong to long
+if ge cur 64
+ret neg long 7
+end
+put scpol 4 cur
+put scst 2 ev
+put scpol 5 0
+if gt res 0
+if le res 64
+if eq get sjst sub res 1 2
+put scpol 5 res
+end
+end
+end
+ret 0
+end
+
+note Journal, recovery: the bypass count of ready job j. 0 or -3.
+fn sched_setbyp j ulong n ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 2
+ret neg long 3
+end
+put sjbyp j n
+ret 0
 end
 
 note Creator: move finished jobs into review while review has room. A worker

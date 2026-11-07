@@ -4,12 +4,14 @@ note seed/authority/action.om, before auth.om, which journals through it.
 note While no journal is open every append succeeds without writing, so the
 note authority layer also runs memory-only.
 note File DIR/journal: a 64-byte header, then 128-byte records. Header words:
-note 0 magic, 1 format version 1, 2 record size 128, 3..6 objective identity,
+note 0 magic, 1 format version 2, 2 record size 128, 3..6 objective identity,
 note 7 FNV-1a 64 of words 0..6. Record words: 0 type, 1 seq (1, 2, 3, ...
 note with no gap), 2 fence, 3..14 payload, 15 FNV-1a 64 of words 0..14.
 note Types and payloads:
-note 1 OPEN     3 pid, 4 authority generation of the new creator
-note 2 ADMIT    3 job id, 4 dependency topics, 5 flags
+note 1 OPEN     3 pid, 4 authority generation of the new creator, 5 the
+note                scheduler policy version SPVER it was written under
+note 2 ADMIT    3 job id, 4 dependency topics, 5 flags, 6 resource request,
+note                7 table slot
 note 3 START    3..6 operation identity, 7 class, 8 job id, 9 attempt, 10 gen
 note 4 DONE     3..6 operation identity, 7 outcome (0 UNKNOWN, 1 not
 note                performed, 2 performed), 8 job id, 9 how (1 reported,
@@ -19,6 +21,15 @@ note 5 RELEASE  3 job id, 4 outcome (the job's outcome; 300 cancelled)
 note 6 REVOKE   3 new generation
 note 7 PAUSE    3 1 paused, 0 resumed
 note 8 CANCEL   3 job id
+note 10         reserved (RESULT, DRA-292)
+note 11 POLICY  3 policy, 4 window, 5 dispatch budget, 6 bypass budget,
+note                7 ticket lifetime, 8 capacities (packed like a request):
+note                the whole setting; the last one wins
+note 12 GOAL    3 job id, 4 topics, 5 estimate ms, 6 uncertainty ms
+note 13 FAIR    3 dispatch event, 4 assigned slot bitmap, 5 bypassed slot
+note                bitmap, 6 cursor, 7 reserved slot + 1 (sched.om's ring)
+note A header of another version (1 included) is refused (21); an OPEN
+note written under another SPVER is refused at replay (33).
 note Order: a transition is appended and fdatasync'd before anything acts on
 note it or publishes it. An append whose write or sync fails marks the journal
 note failed and every later append is refused, so nothing is acted on that
@@ -52,6 +63,18 @@ global jpath uchar 160
 global jact ulong 1024
 global jjob ulong 2048
 global jstat ulong 8
+note Policy replay tables (DRA-398), per job entry k: jreq request, jslot
+note slot at admission, jbyp bypass count; jsl slot -> job entry + 1 while
+note admitted and not released; jpol 0 seen, 1..5 policy words, 6 caps;
+note jgoal per k: 0 seen, 1 topics, 2 estimate, 3 uncertainty; jfair 0 last
+note event, 1 cursor, 2 reserved job entry + 1, 3 seen.
+global jreq ulong 256
+global jslot ulong 256
+global jbyp ulong 256
+global jsl ulong 64
+global jpol ulong 8
+global jgoal ulong 1024
+global jfair ulong 4
 
 note Fault injection for the recovery tests: exit 77 at point p when armed.
 fn jn_hit p ulong to void
@@ -148,6 +171,21 @@ put jjob i 0
 end
 for i ulong 8
 put jstat i 0
+put jpol i 0
+end
+for i ulong 256
+put jreq i 0
+put jslot i 0
+put jbyp i 0
+end
+for i ulong 1024
+put jgoal i 0
+end
+for i ulong 64
+put jsl i 0
+end
+for i ulong 4
+put jfair i 0
 end
 put jon 0 0
 put jbad 0 0
@@ -271,27 +309,22 @@ put jact add b 6 v
 ret 0
 end
 
-note Apply one durable record to the recovery tables; 0, 24 unknown type or
+note Apply one durable record to the recovery tables; 0, 24 unknown type,
 note 25 a transition the tables refuse (START of a performed operation, a
-note DONE without a START, a second ADMIT or RELEASE).
+note DONE without a START, a second ADMIT or RELEASE, a policy record that
+note does not hold), 33 an OPEN of another scheduler policy version.
 fn jn_apply r view ulong 16 to ulong
 t = get r 0
 if eq t 1
+if ne get r 5 SPVER
+ret 33
+end
 put jfence 0 get r 2
 jn_maxg get r 4
 ret 0
 end
 if eq t 2
-if ge jn_jfind get r 3 0
-ret 25
-end
-j = jn_jnew get r 3
-if lt j 0
-ret 25
-end
-put jjob add mul ulong j 8 2 get r 4
-put jjob add mul ulong j 8 3 get r 5
-ret 0
+ret jn_aadmit r
 end
 if eq t 3
 ret jn_astart r
@@ -307,6 +340,9 @@ end
 b = mul ulong j 8
 if eq t 8
 put jjob add b 6 1
+if eq get jfair 2 add ulong j 1
+put jfair 2 0
+end
 ret 0
 end
 if ne get jjob add b 4 0
@@ -314,6 +350,10 @@ ret 25
 end
 put jjob add b 4 1
 put jjob add b 5 get r 4
+s = get jslot ulong j
+if eq get jsl s add ulong j 1
+put jsl s 0
+end
 ret 0
 end
 if eq t 6
@@ -324,7 +364,117 @@ if eq t 7
 put jstat 2 get r 3
 ret 0
 end
+if gt t 10
+ret jn_apol r
+end
 ret 24
+end
+
+note ADMIT into the tables: a new job entry with its request and slot.
+fn jn_aadmit r view ulong 16 to ulong
+if ge jn_jfind get r 3 0
+ret 25
+end
+s = get r 7
+if ge s 64
+ret 25
+end
+j = jn_jnew get r 3
+if lt j 0
+ret 25
+end
+k = ulong j
+put jjob add mul k 8 2 get r 4
+put jjob add mul k 8 3 get r 5
+put jreq k get r 6
+put jslot k s
+put jbyp k 0
+put jsl s add k 1
+ret 0
+end
+
+note POLICY, GOAL and FAIR into the tables (types 11..13); 24 any other.
+fn jn_apol r view ulong 16 to ulong
+t = get r 0
+if eq t 11
+if not sched_polok get r 3 get r 4 get r 5 get r 6 get r 7
+ret 25
+end
+put jpol 0 1
+for i ulong 6
+put jpol add i 1 get r add i 3
+end
+ret 0
+end
+if eq t 12
+j = jn_jfind get r 3
+if lt j 0
+ret 25
+end
+b = mul ulong j 4
+put jgoal b 1
+for i ulong 3
+put jgoal add b add i 1 get r add i 4
+end
+ret 0
+end
+if eq t 13
+ret jn_afair r
+end
+ret 24
+end
+
+note FAIR into the tables: the event must follow the last one, the cursor
+note lie in the table, and every slot it names (assigned, bypassed,
+note reserved) hold an admitted job; nothing changes otherwise (25).
+note Assigned jobs' bypass counts restart at 0, bypassed ones go up by one.
+fn jn_afair r view ulong 16 to ulong
+if and ne get jfair 3 0 le get r 3 get jfair 0
+ret 25
+end
+if ge get r 6 64
+ret 25
+end
+if not jn_focc or get r 4 get r 5
+ret 25
+end
+rs = get r 7
+if gt rs 64
+ret 25
+end
+rk = ulong 0
+if gt rs 0
+rk = get jsl sub rs 1
+if eq rk 0
+ret 25
+end
+end
+for s ulong 64
+if ne and shr get r 4 s 1 0
+put jbyp sub get jsl s 1 0
+end
+if ne and shr get r 5 s 1 0
+k = sub get jsl s 1
+put jbyp k add get jbyp k 1
+end
+end
+put jfair 0 get r 3
+put jfair 1 get r 6
+put jfair 2 rk
+put jfair 3 1
+ret 0
+end
+
+note Does every slot set in bitmap m hold an admitted job?
+fn jn_focc m ulong to bool
+for s ulong 64
+if ne and shr m s 1 0
+if eq get jsl s 0
+ret false
+end
+end
+end
+ret true
 end
 
 fn jn_le64 b view uchar 128 off ulong to ulong
@@ -363,7 +513,7 @@ if ne ftrunc fd 0 0
 ret 27
 end
 put h 0 5786624599
-put h 1 1
+put h 1 2
 put h 2 128
 for i ulong 4
 put h add 3 i get obj i
@@ -387,7 +537,7 @@ s = jn_sum h 7
 if or ne get h 0 5786624599 ne get h 7 s
 ret 21
 end
-if or ne get h 1 1 ne get h 2 128
+if or ne get h 1 2 ne get h 2 128
 ret 21
 end
 for i ulong 4
@@ -459,13 +609,73 @@ ret 0
 end
 
 note Append record r (caller sets word 0 and the payload) and make it
-note durable. The tables check and take the transition first (jn_apply
-note changes nothing when it refuses), so a refused transition is never
-note written. 0, a table refusal, 28 write, 29 sync, 30 failed earlier.
-note After 28 or 29 the journal is failed: the transition may or may not be
-note durable, so the caller must not act on it, and nothing more is written.
-note Without an open journal: 0.
+note durable, after the dispatch decisions waiting in sched.om's replay
+note ring (jn_drain), so no transition is durable before the scheduling
+note that came before it. The tables check and take the transition first
+note (jn_apply changes nothing when it refuses), so a refused transition is
+note never written. 0, a table refusal, 28 write, 29 sync, 30 failed
+note earlier. After 28 or 29 the journal is failed: the transition may or
+note may not be durable, so the caller must not act on it, and nothing more
+note is written. Without an open journal: 0.
 fn jn_append r edit ulong 16 to ulong
+e = jn_drain
+if ne e 0
+ret e
+end
+ret jn_put r
+end
+
+note Write the replay ring as FAIR records and empty it; then, when the
+note cursor or the reservation moved without a record (a window scan that
+note assigned nothing), one FAIR with empty bitmaps. 0 or as jn_put; on
+note failure the ring keeps its records and dispatch stops when it fills.
+note The ring is attached by jn_recover, once the scheduler holds the
+note journaled state; before that, or without an open journal, it is
+note emptied and nothing is written.
+fn jn_drain to ulong
+if or eq get jon 0 0 not sched_jattached
+sched_frclear
+ret 0
+end
+r = new ulong 16 0
+n = sched_frn
+for k ulong n bound 64
+for i ulong 16
+put r i 0
+end
+put r 0 13
+for i ulong 5
+put r add 3 i sched_frw k i
+end
+e = jn_put r
+if ne e 0
+ret e
+end
+end
+sched_frclear
+rk = ulong 0
+rs = sched_stat 29
+if gt rs 0
+rk = get jsl sub rs 1
+end
+if and eq sched_stat 28 get jfair 1 eq rk get jfair 2
+ret 0
+end
+if eq sched_stat 2 get jfair 0
+ret 0
+end
+for i ulong 16
+put r i 0
+end
+put r 0 13
+put r 3 sched_stat 2
+put r 6 sched_stat 28
+put r 7 rs
+ret jn_put r
+end
+
+note jn_append without the drain.
+fn jn_put r edit ulong 16 to ulong
 if eq get jon 0 0
 ret 0
 end
@@ -574,16 +784,19 @@ put jfd 0 int fd
 put jon 0 1
 put jfence 0 add get jfence 0 1
 put jgen 0 add get jgen 0 1
-ret jn_rec 1 ulong getpid get jgen 0 0
+ret jn_rec 1 ulong getpid get jgen 0 SPVER
 end
 
-note Close the journal and release the lock (other holders: forked workers).
+note Close the journal (after draining the replay ring) and release the
+note lock (other holders: forked workers).
 fn jn_close to void
 if ne get jon 0 0
+dr = jn_drain
 x = fclose get jfd 0
 x = fclose get jlk 0
 end
 put jon 0 0
+sched_jattach false
 end
 
 note Probe the key of an idempotent operation: 1 present, 0 absent, 2 error.
@@ -639,19 +852,79 @@ end
 ret 0
 end
 
-note Creator, after jn_open and sched_new: settle in-flight operations, then
-note for each admitted job not yet released: a performed or UNKNOWN last
-note operation releases it with that outcome (it never runs again); a
-note cancelled job is released as cancelled; any other is admitted again.
-note 0 or an error.
+note Recovery: the incarnation (the fence), then the last journaled policy
+note and capacities. False when the scheduler refused one.
+fn jn_rpol to bool
+if ne sched_incarnate and get jfence 0 16777215 0
+ret false
+end
+if eq get jpol 0 0
+ret true
+end
+if ne sched_cap get jpol 6 0
+ret false
+end
+p = get jpol 1
+w = get jpol 2
+d = get jpol 3
+y = get jpol 4
+ret eq sched_policy p w d y get jpol 5 0
+end
+
+note Creator, after jn_open and sched_new: settle in-flight operations,
+note set the scheduler's incarnation to the fence (proposals made for an
+note earlier creator are stale), restore the last journaled policy and
+note capacities, then for each admitted job not yet released: a performed
+note or UNKNOWN last operation releases it with that outcome (it never runs
+note again); a cancelled job is released as cancelled; any other is
+note admitted again, in admission order, into its recorded slot, with its
+note bypass count and declared goal. Last, the cursor, the dispatch event
+note count and the reservation (on the job's slot) from the last FAIR.
+note 0 or an error (31 a restore the scheduler refused).
 fn jn_recover c long to ulong
 e = jn_settle
 if ne e 0
 ret e
 end
+if not jn_rpol
+ret 31
+end
+rs = ulong 0
 for k ulong 256
 b = mul k 8
 if and ne get jjob b 0 eq get jjob add b 4 0
+o = jn_rout k
+if eq o 999
+x = jn_readmit k
+if lt x 0
+ret 31
+end
+if eq get jfair 2 add k 1
+rs = add ulong x 1
+end
+put jstat 5 add get jstat 5 1
+else
+e = jn_rec 5 get jjob add b 1 o 0
+if ne e 0
+ret e
+end
+put jstat 4 add get jstat 4 1
+end
+end
+end
+if ne get jfair 3 0
+if ne sched_frestore get jfair 1 get jfair 0 rs 0
+ret 31
+end
+end
+sched_jattach true
+ret 0
+end
+
+note Recovery: the outcome job entry k is released with (2 performed, 0
+note UNKNOWN, 300 cancelled), or 999 when it is to be admitted again.
+fn jn_rout k ulong to ulong
+b = mul k 8
 o = ulong 999
 a = get jjob add b 7
 if gt a 0
@@ -666,41 +939,125 @@ end
 if and eq o 999 ne get jjob add b 6 0
 o = 300
 end
-if eq o 999
-x = sched_admit get jjob add b 1 get jjob add b 2 get jjob add b 3
-if lt x 0
-ret 31
-end
-put jstat 5 add get jstat 5 1
-else
-e = jn_rec 5 get jjob add b 1 o 0
-if ne e 0
-ret e
-end
-put jstat 4 add get jstat 4 1
-end
-end
-end
-ret 0
+ret o
 end
 
-note Admit job id durably: ADMIT is appended before sched_admit. -4 an id
-note already in the journal (checked first, so a duplicate never takes or
-note refreshes an admission ticket), -2 when sched_room refuses (admission
-note limit, no free slot, or ticket holders ahead), -5 the journal refused,
-note else sched_admit's slot.
-fn jn_admit id ulong deps ulong flags ulong to long
+note Recovery: admit job entry k again into its recorded slot (else the
+note lowest free one), then its bypass count and goal. The slot or < 0.
+fn jn_readmit k ulong to long
+b = mul k 8
+id = get jjob add b 1
+x = sched_admits id get jjob add b 2 get jjob add b 3 get jreq k get jslot k
+if lt x 0
+x = sched_admitr id get jjob add b 2 get jjob add b 3 get jreq k
+end
+if lt x 0
+ret x
+end
+j = ulong x
+y = sched_setbyp j get jbyp k
+g = mul k 4
+if ne get jgoal g 0
+y = sched_goal j get jgoal add g 1 get jgoal add g 2 get jgoal add g 3
+end
+ret x
+end
+
+note Admit job id durably: ADMIT, with the request and the slot it will
+note take, is appended before sched_admits. -4 an id already in the journal
+note (checked first, so a duplicate never takes or refreshes an admission
+note ticket), -8 a request no capacity could ever hold, -2 when sched_room
+note refuses (admission limit, no free slot, or ticket holders ahead), -5
+note the journal refused, else the slot.
+fn jn_admitr id ulong deps ulong flags ulong req ulong to long
 if ge jn_jfind id 0
 ret neg long 4
+end
+if not sched_feas req
+ret neg long 8
 end
 if not sched_room id
 ret neg long 2
 end
-if ne jn_rec 2 id deps flags 0
+s = sched_slot
+if ge s 64
+ret neg long 2
+end
+r = new ulong 16 0
+put r 0 2
+put r 3 id
+put r 4 deps
+put r 5 flags
+put r 6 req
+put r 7 s
+if ne jn_append r 0
 ret neg long 5
 end
 jn_hit 1
-ret sched_admit id deps flags
+ret sched_admits id deps flags req s
+end
+
+note jn_admitr with no resource request.
+fn jn_admit id ulong deps ulong flags ulong to long
+ret jn_admitr id deps flags 0
+end
+
+note Creator: sched_policy, journaled first (POLICY, with the current
+note capacities). -7 refused, -5 the journal refused, else 0.
+fn jn_policy p ulong win ulong db ulong by ulong ttl ulong to long
+if not sched_polok p win db by ttl
+ret neg long 7
+end
+if ne jn_pol p win db by ttl sched_caps 0
+ret neg long 5
+end
+ret sched_policy p win db by ttl
+end
+
+note Creator: sched_cap, journaled first (POLICY, with the current policy).
+note -8 refused, -5 the journal refused, else 0.
+fn jn_cap caps ulong to long
+if not sched_capok caps
+ret neg long 8
+end
+if ne jn_pol sched_stat 24 sched_stat 25 sched_stat 26 sched_stat 27 sched_stat 31 caps 0
+ret neg long 5
+end
+ret sched_cap caps
+end
+
+fn jn_pol p ulong win ulong db ulong by ulong ttl ulong caps ulong to ulong
+r = new ulong 16 0
+put r 0 11
+put r 3 p
+put r 4 win
+put r 5 db
+put r 6 by
+put r 7 ttl
+put r 8 caps
+ret jn_append r
+end
+
+note Creator: sched_goal for job slot j (waiting or ready), journaled first
+note (GOAL). -3 no such job, -5 the journal refused, else 0.
+fn jn_goal j ulong pro ulong est ulong unc ulong to long
+if ge j 64
+ret neg long 3
+end
+s = get sjst j
+if or eq s 0 gt s 2
+ret neg long 3
+end
+r = new ulong 16 0
+put r 0 12
+put r 3 get sjid j
+put r 4 pro
+put r 5 est
+put r 6 unc
+if ne jn_append r 0
+ret neg long 5
+end
+ret sched_goal j pro est unc
 end
 
 note Release reviewed job slot j durably: RELEASE before sched_review. -5

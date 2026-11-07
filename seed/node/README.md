@@ -853,20 +853,24 @@ timeout 120 build/node/journal-gate      # ends "PASS node journal"; uses build/
 ### Journal
 
 `DIR/journal` is a 64-byte header and then 128-byte records, little endian
-64-bit words. Header: magic, format version 1, record size 128, the 4-word
+64-bit words. Header: magic, format version 2, record size 128, the 4-word
 objective identity, FNV-1a 64 of words 0..6. Record: type, seq (1, 2, 3, ...
 without gaps), fence, 12 payload words, FNV-1a 64 of words 0..14.
 
 | Type | Payload | Appended by |
 | --- | --- | --- |
-| 1 OPEN | pid, authority generation | `jn_open`, every creator incarnation |
-| 2 ADMIT | job id, dependency topics, flags | `jn_admit`, before `sched_admit` |
+| 1 OPEN | pid, authority generation, scheduler policy version (`SPVER`) | `jn_open`, every creator incarnation |
+| 2 ADMIT | job id, dependency topics, flags, resource request, table slot | `jn_admitr` (`jn_admit` with no request), before `sched_admits` |
 | 3 START | operation identity, class, job id, attempt, generation | `au_decide`, after `actstart`, before the grant is published |
 | 4 DONE | operation identity, outcome, job id, how (1 reported, 2 worker lost, 3 in flight at restart, 4 key present, 5 key absent, 6 no external effect) | `au_record`, `au_lost`, recovery |
 | 5 RELEASE | job id, outcome (300 cancelled) | `jn_release`, before `sched_review`; `auth_cancel` |
 | 6 REVOKE | new generation | `auth_revoke` |
 | 7 PAUSE | 1 paused, 0 resumed | `auth_pause` |
 | 8 CANCEL | job id | `auth_cancel`, before the worker is told |
+| 10 | reserved for RESULT (DRA-292) | |
+| 11 POLICY | policy, window, dispatch budget, bypass budget, ticket lifetime, capacities: the whole setting, the last one wins | `jn_policy`, `jn_cap`, before `sched_policy`, `sched_cap` |
+| 12 GOAL | job id, topics, estimate ms, uncertainty ms | `jn_goal`, before `sched_goal` |
+| 13 FAIR | dispatch event, assigned slot bitmap, bypassed slot bitmap, cursor, reserved slot + 1 | `jn_drain`, from `sched.om`'s replay ring |
 
 Order: the in-memory tables first check the transition (a refused one is
 never written), then the record is written with `pwrite` and made durable
@@ -893,15 +897,19 @@ record before the last one is corruption: the open is refused (23) and the
 file is not changed.
 
 Compatibility: a header whose magic, version, record size or checksum differs
-is refused (21), never reinterpreted; a different objective identity is
-refused (22). A future format must change the version.
+is refused (21), never reinterpreted (a version 1 journal from before DRA-398
+is refused); a different objective identity is refused (22). An OPEN whose
+scheduler policy version differs from this build's `SPVER` is refused (33):
+the recorded FAIR decisions belong to another selection rule. A future
+format must change the version.
 
 ### Recovery
 
 `jn_open` reads the journal into the recovery tables; `auth_recover` (after
 `sched_new` and `auth_new`, before spawning workers) settles and readmits:
 - A START with no DONE was in flight at the crash. Class 3 (an idempotent effect whose key `DIR/k.<op>` the effect itself creates atomically, for example with `ln`) is decided by the key: present is performed, absent is not performed and the job runs again. Class 2 (no external effect) is not performed. Class 1 is UNKNOWN and is never run again. Each gets a DONE.
-- An admitted job not yet released: a performed or UNKNOWN last operation releases it with that outcome; a cancelled job is released as cancelled; any other job is admitted again with its dependency topics.
+- An admitted job not yet released: a performed or UNKNOWN last operation releases it with that outcome; a cancelled job is released as cancelled; any other job is admitted again, in admission order, into the table slot its ADMIT recorded, with its dependency topics, resource request, bypass count (from the FAIR records) and declared goal (GOAL).
+- Before that, the scheduler's incarnation is set to the fence (`sched_incarnate`, so a proposal made for an earlier creator is stale) and the last POLICY is applied (capacities, then policy); after it, the cursor, the dispatch event count and the reservation (moved to the reserved job's slot) of the last FAIR are restored (`sched_frestore`), and only then is the replay ring attached.
 - The action records (state, attempt, generation), the authority generation (above every journaled one) and the pause state are restored, so a performed or UNKNOWN operation is refused if proposed again and a paused objective stays paused.
 - A restart that finds nothing in flight adds only its OPEN.
 
@@ -913,14 +921,23 @@ effect is never repeated without proof that it did not happen.
 | --- | --- |
 | `jn_open dir dn obj ms`, `jn_close` | Creator: take the lock (wait up to ms), create or check the header, cut a torn tail, read every record, append OPEN; release. |
 | `auth_recover c` | Settle, release or readmit, restore authority and pause. |
-| `jn_admit id deps flags`, `jn_release j` | Durable admission and release around `sched_admit` and `sched_review`. |
+| `jn_admitr id deps flags req`, `jn_admit id deps flags`, `jn_release j` | Durable admission (with or without a resource request) and release around `sched_admits` and `sched_review`. |
+| `jn_policy p win db by ttl`, `jn_cap req`, `jn_goal j pro est unc` | Durable policy, capacities and goal declaration: POLICY or GOAL written first, then `sched_policy`, `sched_cap`, `sched_goal`; -5 when the journal refuses (nothing changed). |
+| `jn_drain` | Write `sched.om`'s replay ring as FAIR records (also first thing in every append and in `auth_step`), so a dispatch decision is durable before any transition that follows it. |
 | `jn_known id`, `jn_done_j id`, `jn_jout id`, `jn_stat i`, `jn_fence`, `jn_gen`, `jn_act k i` | Recovered state. |
 
 Limits: no checkpoint or compaction yet; recovery replays the whole journal
 and the tables hold 64 operations and 256 jobs. Inputs published to the pool
 are not journaled, so a recovered job reads whatever its dependency topics
 hold after the restart. The key of a class 3 effect must be created by the
-effect itself, atomically and last.
+effect itself, atomically and last. Scheduling state not restored: reservation
+tickets (a recovered reservation starts a new ticket), policy 0's ready order
+(`sjrdy`), dependency readiness (a recovered job with topics is waiting until
+they are published again) and proposals (they are stale after a restart by
+the incarnation). Replay is exact at quiescent points (no job running); a
+crash inside a dispatch event recovers that event's cursor, reservation and
+the bypass counts of the jobs it did not assign, and the jobs it assigned are
+admitted again with bypass count 0.
 
 ### Acceptance and controls
 
@@ -951,6 +968,62 @@ RELEASE per job, sink lines, keys):
 | `journal.om`: objective check removed | 151 |
 | `journal.om`: version and record-size check removed | 154 |
 | `auth.om`: `auth_recover` does not restore pause | 161 |
+
+### Durable scheduling policy and deterministic replay (DRA-398)
+
+Status: IMPLEMENTED in `sched.om`, `journal.om` and `auth.om`, exercised by
+`replay-gate.om` on native Linux AArch64 (evidence in the DRA-398 pull
+request). Not wired into `tests/gates/` (that needs an operator); the receipt
+runs it.
+
+```sh
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/journal.om seed/node/auth.om seed/node/replay-test.om > build/node/replay-composed.om
+cmp build/node/replay-composed.om seed/node/replay-gate.om
+seed/out/omc < seed/node/replay-gate.om > build/node/replay-gate
+chmod +x build/node/replay-gate
+timeout 180 build/node/replay-gate       # ends "PASS node replay"; uses build/node/rpa, rpb
+```
+
+Every input of a selection decision is journaled before it acts: the request
+and table slot with ADMIT, the policy words and capacities (POLICY), the goal
+declarations (GOAL). The decisions themselves are recorded as they are made:
+each dispatch event that assigns a job or moves the reservation puts one
+record (event, assigned and bypassed slot bitmaps, cursor, reserved slot) in
+`sched.om`'s 64-record replay ring, and `jn_drain` writes the ring as FAIR
+records before any other record and at every `auth_step`, so no later
+transition is durable before the decision that preceded it. Dispatch refuses
+to run while the ring is full (counter 15), so a decision is never lost to a
+journal that cannot keep up. A window scan that assigned nothing moves only
+the cursor; `jn_drain` writes one FAIR with empty bitmaps for it when the
+cursor or the reservation differs from the last FAIR. Replay checks every
+FAIR (a strictly later event, only occupied slots, a reserved slot that holds
+a job) and rebuilds the bypass counts, the cursor and the reservation.
+
+The gate runs four cases (policy 1 and 2, crash after 3 and after 6 of 10
+dispatch events) and four special checks:
+- R, a reference creator, runs all events on journal a; C runs the first k on journal b and dies; C2 recovers journal b and runs the rest. C2's state right after recovery equals R's after event k (cursor, reserved job, slots, ids and bypass counts of ready jobs, needs and goals of every unfinished job, policy words, capacities, bypass sum), and C plus C2 make the same decisions as R, event by event. C3 recovers journal b once more and equals R's final state. Each case also proves it tests something: a bypass count and a nonzero cursor at the boundary, a reservation during the run, a final cursor different from the boundary's.
+- Mid-event crash: C' dies right after a dispatch and its PAUSE record, before any job runs. C2' has that event's cursor and reservation and the bypass counts of the jobs it did not assign; the jobs it assigned are ready again.
+- Records refused: a FAIR that repeats the last event, a FAIR naming a free slot, an OPEN written under another `SPVER`.
+- Failed journal: revoke, pause, cancel, admission, policy, capacities and goal each return their refusal and change nothing; a full ring stops dispatch.
+
+| Change | Expected exit (derived from the check it trips) |
+| --- | --- |
+| `journal.om`: ADMIT records request 0 | 53: the needs fold differs at the boundary |
+| `journal.om`: POLICY words not restored | 53 |
+| `journal.om`: capacities not restored | 53: `sched_new`'s 65535 per kind, the capacities word differs |
+| `journal.om`: readmission ignores the recorded slot | 53: jobs move to lower slots |
+| `journal.om`: FAIR bypass counts not replayed | 53 |
+| `sched.om`: `sched_frestore` leaves the cursor at 0 | 53 |
+| `journal.om`: GOAL not restored | 73: policy 2, the waiting job's declaration |
+| `journal.om`: `jn_append` does not drain first | 93: the mid-event FAIR is lost |
+| `journal.om`: `jn_recover` does not attach the ring | 56: C2's decisions are never journaled, C3 differs |
+| `journal.om`: a FAIR repeating an event accepted | 96 |
+| `journal.om`: a FAIR naming a free slot accepted | 96: the replay traps (index out of bounds) |
+| `journal.om`: OPEN's `SPVER` not checked | 98 |
+| `auth.om`: revoke ignores a refused REVOKE | 40 |
+| `auth.om`: pause ignores a refused PAUSE | 41 |
+| `auth.om`: cancel ignores a refused CANCEL | 42 |
+| `sched.om`: dispatch ignores a full ring | 44 |
 
 ## Local inference and the coding workflow (DRA-290)
 
