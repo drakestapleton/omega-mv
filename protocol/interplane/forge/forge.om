@@ -31,12 +31,15 @@ const krev ulong 672000
 const krcp ulong 676096
 const ks ulong 680192
 const kn ulong 684288
+const kna ulong 786432
+const knb ulong 851968
 note g slots: 0 output length, 1 verdict length, 2 receipt length, 3 verdict kind,
 note 4 verdict head offset, 5 reviewer offset, 6 reviewer length, 7 clone offset,
 note 8 gate_rc, 9 negctl_rc, 10 author offset, 11 author length, 12 receipt keys seen,
 note 13 command output length, 19 HOME length, 21 PATH length, 16 RID length,
 note 17 reviews dir length, 18 receipts dir length, 23 status word length,
-note 24 verdict name length, 30 packet length, 31 packet count, 32 read end of the spawn pipe
+note 24 verdict name length, 30 packet length, 31 packet count, 32 read end of the spawn pipe.
+note kna and knb hold the normalized reviewer and author for the self-review check.
 text tverd "VERDICT "
 text tvw "VERDICT"
 text tmaf "MERGE_AFTER_FIX "
@@ -107,6 +110,8 @@ text terad "forge: rad failed, exit "
 text tebad "forge: bad RID\n"
 text tehome "forge: HOME is not set\n"
 text tefld "forge: patch fields not found for "
+text ttrunc "TRUNCATED patches="
+text ttrunc2 " examined="
 
 note ---- byte helpers over m ----
 
@@ -360,7 +365,7 @@ end
 note ---- verdict ----
 
 note pverd: line 1 is exactly "VERDICT <MERGE|MERGE_AFTER_FIX|REJECT> head=<40 lowercase hex>"
-note followed by a newline, a space or the end of the file. Return 0 or 4 (VERDICT_MALFORMED).
+note followed by a newline or the end of the file. Return 0 or 4 (VERDICT_MALFORMED).
 fn pverd to int
 n = add kv get g 1
 if eq mat kv n tverd false
@@ -395,7 +400,7 @@ end
 q = add p 40
 if lt q n
 c = get m q
-if and ne c 10 ne c 32
+if ne c 10
 ret 4
 end
 end
@@ -404,7 +409,9 @@ put g 4 p
 ret scanv n
 end
 
-note scanv: no later line may start with VERDICT, and at most one line starts with reviewer=
+note scanv: no later line may start with VERDICT, and at most one line starts with reviewer=.
+note The reviewer value names a reviewer only when it holds a printable ASCII byte (33..126);
+note a control byte in it (below 32 other than tab, or 127) is malformed.
 fn scanv n ulong to int
 p = add eol kv n 1
 put g 5 0
@@ -420,12 +427,42 @@ if seen
 ret 4
 end
 seen = true
+t = txtchk add p 9 e
+if eq t 2
+ret 4
+end
+if eq t 0
 put g 5 add p 9
 put g 6 sub e add p 9
+end
 end
 p = add e 1
 end
 ret 0
+end
+
+note txtchk: m[v..e) as asserted text: 0 when it holds a byte in 33..126 and no control byte,
+note 1 when it is empty or only spaces, tabs and bytes of 128 and above, 2 on a control byte
+fn txtchk v ulong e ulong to int
+p = v
+vis = false
+while lt p e bound 65536
+c = get m p
+if and lt c 32 ne c 9
+ret 2
+end
+if eq c 127
+ret 2
+end
+if and gt c 32 lt c 127
+vis = true
+end
+p = add p 1
+end
+if vis
+ret 0
+end
+ret 1
 end
 
 note ---- gate receipt (forge-receipt v1) ----
@@ -499,7 +536,7 @@ if ne and s 8 0
 ret 10
 end
 v = add p 7
-if eq v e
+if ne txtchk v e 0
 ret 10
 end
 put g 10 v
@@ -550,19 +587,51 @@ end
 ret 0
 end
 
-note hasauth: the reviewer text contains the receipt author (the author reviewed its own work)
+note norm: copy m[src..src+n) to m[dst..) folded to ASCII lower case, with runs of spaces and tabs
+note collapsed to one space and none at either end; return the copied length
+fn norm src ulong n ulong dst ulong to ulong
+o = ulong 0
+last = ulong 32
+i = ulong 0
+while lt i n bound 65536
+c = ulong get m add src i
+if or eq c 32 eq c 9
+if ne last 32
+put m add dst o 32
+o = add o 1
+last = ulong 32
+end
+else
+if and ge c 65 le c 90
+c = add c 32
+end
+put m add dst o uchar c
+o = add o 1
+last = c
+end
+i = add i 1
+end
+if and gt o 0 eq last 32
+o = sub o 1
+end
+ret o
+end
+
+note hasauth: the normalized reviewer text contains the normalized receipt author (the author
+note reviewed its own work). An author that normalizes to nothing counts as self-review.
 fn hasauth to bool
-ro = get g 5
-rn = get g 6
-ao = get g 10
-an = get g 11
+rn = norm get g 5 get g 6 kna
+an = norm get g 10 get g 11 knb
+if eq an 0
+ret true
+end
 if gt an rn
 ret false
 end
 i = ulong 0
 lim = sub rn an
 while le i lim bound 65536
-if eqr add ro i ao an
+if eqr add kna i knb an
 ret true
 end
 i = add i 1
@@ -850,6 +919,7 @@ end
 ret s
 end
 
+note plist: copy the first icap patch ids of the list output to ki; return the number of rows listed
 fn plist to ulong
 n = add ko get g 13
 p = ko
@@ -860,8 +930,8 @@ s = rowid p e
 if ne s 0
 if lt k icap
 cpy add ki mul k 8 s 7
-k = add k 1
 end
+k = add k 1
 end
 p = add e 1
 end
@@ -1204,11 +1274,15 @@ oflush 2
 ret 2
 end
 np = plist
+nd = np
+if gt nd icap
+nd = icap
+end
 i = ulong 0
 nm = ulong 0
 nh = ulong 0
 nn = ulong 0
-while lt i np bound 512
+while lt i nd bound 512
 id = add ki mul i 8
 r = runcmd radpk 1 id 7
 if ne r 0
@@ -1254,6 +1328,15 @@ otext tsnr
 onum nn
 obyte 10
 oflush 1
+if gt np icap
+otext ttrunc
+onum np
+otext ttrunc2
+onum icap
+obyte 10
+oflush 1
+ret 2
+end
 ret 0
 end
 
