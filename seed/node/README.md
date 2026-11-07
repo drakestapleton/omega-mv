@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport
+# Omega Node shared-memory transport, epoch pool and worker supervision
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -6,9 +6,17 @@ processes. Runtime consumers can share artifact storage and wake only interested
 workers. The existing `seed/agent/agent.om` is the coding-agent consumer to evaluate
 for integration; this change does not replace its model or tool dispatcher.
 
+Three source fragments, concatenated in this order before one program with `fn main`:
+
+| Fragment | Adds |
+| --- | --- |
+| `transport.om` | one arena: 64 immutable records, topic scan, eventfd hints, stop flag (#1055) |
+| `pool.om` | K arenas reused by epoch, reader holds, fail-closed rollover (DRA-286) |
+| `super.om` | forked workers, death detection, reaping, creator-loss detection, bounded stop (DRA-286) |
+
 The component is not yet connected to the live hive. Persistent recovery,
-authority integration, worker supervision, epoch rollover, a dashboard and a real
-model-backed coding workflow remain implementation work. The
+authority integration, a dashboard and a real model-backed coding workflow remain
+implementation work (DRA-287 to DRA-292). The
 [Linear project](https://linear.app/drake-stapleton/project/omega-node-shared-memory-hive-runtime-37058a1eac4b)
 tracks that integration. This is a component contract, not a whole-system master plan.
 
@@ -66,6 +74,8 @@ timeout 30 qemu-aarch64-static build/node/transport-gate
 | `node_notify fd` | Adds a wake hint to one nonblocking eventfd; zero on success or saturation, negative error otherwise. |
 | `node_drain fd` | Consumes a coalesced hint; an already empty descriptor is harmless. |
 | `node_wait h wake stop interval` | Waits on distinct nonnegative descriptors. Returns 2 for stop, 1 for work hint, 0 for timeout, negative error otherwise. Interval is nanoseconds; negative means infinite. |
+| `node_reset h epoch` | Creator only. Drops the published count to zero, clears every record version, clears stop and records `epoch` (nonzero) at header offset 40. Only `pool.om` calls it, after proving no reader holds the arena. |
+| `node_epoch h` | The epoch recorded by the last `node_reset`; zero for a fresh arena. |
 
 All handles must be live handles from `node_new`, and descriptors must remain
 owned and open throughout the call. Invalid mapping handles trap in the compiler
@@ -113,19 +123,18 @@ scheduled within a deadline. Cancellation of running model/tool work is separate
 ## Capacity and lifetime
 
 The arena holds 64 immutable records. Full publication returns -2 without
-overwriting old data. No reference counter or slot recycling exists in this
-component. Drop mappings only after all readers finish; unmap each process's
-handle or terminate that process. Fork inherits the arena; exec does not.
+overwriting old data. Inside one epoch nothing is recycled. Drop mappings only
+after all readers finish; unmap each process's handle or terminate that process.
+Fork inherits the arena; exec does not.
 
-A long-running supervisor must explicitly close an epoch, stop admission, finish
-or cancel readers, reap workers, and create the next arena. That lifecycle is an
-integration prerequisite, not an automatic behavior of these functions. This
-bounded design keeps the first version free of ABA and unsafe reclamation paths.
+Reuse across epochs is `pool.om`'s job (next section): it resets an arena only
+after the current epoch has moved past it and no worker holds it.
 
 MODELED layout, checked with Wolfram Language:
 `{4096+64*(64+4096), Mod[64+4096,64]}` returned `{270336, 0}`.
 The first value is arena bytes; the second checks slot-stride alignment. Header
-words at offsets 0, 8, 16, 24 and 32 hold magic, ABI, count, stop and creator PID.
+words at offsets 0, 8, 16, 24, 32 and 40 hold magic, ABI, count, stop, creator PID
+and epoch.
 Record slots start at 4096 with stride 4160; version, length and topic mask are
 at slot offsets 0, 8 and 16, followed by payload at offset 64. These are ordinary
 CPU mappings, with no GPU-coherence or cross-machine shared-memory claim.
@@ -152,3 +161,110 @@ test, compile successfully, and run with the same timeout:
 These controls check observable protocol behavior. Emulation does not establish
 weak-memory correctness on physical ARM hardware. The abstract Lean model in
 omega-harness PR 206 does not prove this implementation or its memory ordering.
+
+## Epoch pool and worker supervision (DRA-286)
+
+Status: IMPLEMENTED in `pool.om` and `super.om`. Exercised by `pool-gate.om` and
+the negative controls below on native Linux AArch64. Evidence and pins are in the
+DRA-286 pull request. Not connected to the live hive.
+
+### Build and check
+
+`pool-gate.om` is the exact byte concatenation of `transport.om`, `pool.om`,
+`super.om` and `pool-test.om`:
+
+```sh
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/pool-test.om > build/node/pool-composed.om
+cmp build/node/pool-composed.om seed/node/pool-gate.om
+seed/out/omc < seed/node/pool-gate.om > build/node/pool-gate
+chmod +x build/node/pool-gate
+timeout 120 build/node/pool-gate           # all phases, ends "PASS node pool"
+timeout 90 build/node/pool-gate stress     # concurrent stress phase only
+```
+
+The gate forks real processes, uses anonymous shared mappings, pipes and
+eventfds, sends SIGKILL only to the exact PIDs it created, and opens no GPU,
+model endpoint or socket. It needs about 3 s, most of it the stalled worker's
+2 s stop deadline.
+
+### Pool contract
+
+`pool_new K W` maps K arenas (1..8) and one 4096-byte control page before any
+fork, so every worker inherits the same shared memory. Arena 0 opens epoch 1.
+Epoch numbers only grow; an arena is reused for a later epoch, never an epoch
+number.
+
+| Function | Contract |
+| --- | --- |
+| `pool_new k w` | Control handle, -7 for K outside 1..8 or W outside 1..64, or a mapping errno (all mappings made so far are dropped). |
+| `pool_acquire c w` | Worker w holds the current epoch: returns that arena, -1 stopped, -5 invalid, -7 bad worker, -8 the epoch moved 16 times running. |
+| `pool_hold c w e` | The step `pool_acquire` repeats: store hold e, read the epoch again, refuse -8 if it moved. Every refusal clears the hold. |
+| `pool_release c w` | Clears hold w. The old arena must not be read afterwards. |
+| `pool_roll c` | Creator only. Opens epoch E+1 in a free arena or one whose older epoch no worker holds, then publishes E+1. -9 when every other arena is held: nothing changes (fail closed). -1 once stopped, -6 from a non-creator. |
+| `pool_pick c`, `pool_reuse c i n` | The two steps of `pool_roll`, separate so the gate can interleave them with a worker. |
+| `pool_publish c topics src n` | Creator: publish to the current epoch; when that arena is full, roll once and publish there. |
+| `pool_current c`, `pool_epoch c` | Current arena handle and epoch. |
+| `pool_stop c`, `pool_stopped c` | Sticky stop flag on the control page; creator only. |
+| `pool_setw c w pid state`, `pool_clear c w` | Creator bookkeeping: worker PID and state (1 live, 2 reaped), and clearing a reaped worker's hold. |
+| `pool_free c` | Drop this process's mappings of the pool. |
+
+Control page u64 words: 0 magic, 8 ABI, 16 current epoch, 24 stop, 32 creator
+PID, 40 K, 48 W, 64+8k arena handle, 128+8k arena epoch (0 while free or being
+reset), 256+8w hold of worker w, 768+8w worker PID, 1280+8w worker state.
+
+Writers: the creator writes the epoch, the arena table and every arena record.
+Worker w writes only hold word w while it lives. The creator clears hold w only
+after it has reaped worker w, so a dead worker's hold never blocks reuse forever
+and a live worker's hold is never cleared under it.
+
+Reclamation is epoch-based. A worker stores its hold, then reads the current
+epoch again; the creator publishes the new epoch before it scans holds. `mapset`
+and `mapget` each put `DSB SY` on both sides of their access, so either the scan
+sees the hold or the worker's second read sees the move and it retries. An arena
+is reset only when its epoch is older than the current one and unheld. A held
+older epoch therefore stays complete and unchanged for as long as it is held,
+while newer epochs are published in other arenas.
+
+### Supervision contract
+
+| Function | Contract |
+| --- | --- |
+| `sup_init c` | Creator: one creator life pipe and wake, stop and ack eventfds for each of W slots. On failure everything it opened is closed. |
+| `sup_spawn c w` | Creator: fork worker w. 0 in the child, the PID in the creator, -16 if slot w is live, -7 bad slot, or an errno. |
+| `sup_wwait c w interval` | Worker: 3 creator gone, 2 stop, 1 wake hint (drained; rescan state), 0 timeout, or an errno. Creator loss outranks stop, stop outranks work. |
+| `sup_ack w`, `sup_wake w`, `sup_take fd` | Post an ack, post a wake hint, read and reset an eventfd counter. |
+| `sup_poll c interval` | Creator: wait for acks and deaths; reap every worker whose life pipe hung up. Returns the number reaped. |
+| `sup_reap c w` | Creator: reap the exact PID (SIGKILL after about 1 s if it has not exited), then close its life pipe, clear its hold and mark it reaped. A `waitpid` error releases nothing. |
+| `sup_stop c interval` | Creator: set stop, post every live worker's stop eventfd, reap until all exit or the interval ends, then SIGKILL and reap the rest. Returns how many were killed. |
+| `sup_live c`, `sup_closeall` | Live worker count; close every descriptor this module opened. |
+
+Death is detected without scanning PIDs. Each worker alone holds the write end
+of its close-on-exec life pipe: the creator closes its copy right after the
+fork, so later workers never inherit it. The worker's exit hangs up the
+creator's read end. In the other direction, each child closes the creator's
+life-pipe write end at once, so creator death hangs up every worker's read end
+and `sup_wwait` returns 3. Workers must not `exec` themselves: exec closes the
+life pipe and is treated as death. Tools started by a worker should fork first.
+
+### Negative controls
+
+Each control is a one-line change to a disposable copy, composed with the
+unchanged other fragments and test, compiled and run with the same timeout:
+
+| Change | Expected exit |
+| --- | --- |
+| `pool.om`: `pool_held`'s `ret true` to `ret false` (holds ignored) | 28; with `stress`, 129, 130 or 133 |
+| `transport.om`: delete `r = mapset h 16 8 0` in `node_reset` (count kept) | 34 |
+| `super.om`: delete `r = pool_clear c w` (dead worker keeps its hold) | 74 |
+| `super.om`: delete every `r = killpid int` line (no kill escalation) | 84 |
+| `super.om`: delete `r = fclose get swpar 1` (child keeps creator end) | 99 |
+| `super.om`: `if ne get p 22 0` to `if false` (creator loss ignored) | 99 |
+| `pool.om`: delete `r = mapset c hw 8 e` (hold never stored) | 24; with `stress`, 129, 130 or 133 |
+| `super.om`: delete `r = fclose wr` (creator keeps a worker's life end) | 72 |
+| `pool.om`: `if ne mapget c 16 8 e` to `if false` (no epoch recheck) | 144 |
+
+The recheck control is deterministic because the gate runs the protocol steps
+in the losing order (`pool_hold` after `pool_roll` and `pool_pick`). The same
+mutant under the timing-dependent `stress` phase exited 0 in 5 of 5 probes:
+the window needs two rolls inside one announce, so stress alone does not prove
+the recheck.
