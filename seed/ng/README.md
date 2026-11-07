@@ -41,13 +41,20 @@ From the repository root (any scratch directory works):
 
 The gate builds ngbuild, ngcheck, ngas, ngdis and ngrun with that omc, builds `ng` through
 `ngbuild build` (so every pin in `ng.units` is checked), requires `ngcheck --table` to equal
-`hostwords.tsv`, then runs every line of `tests/ir/cases`: the text round trip
-`ngdis(ngas(t)) == t`, the ngcheck class and byte offset, the ACCEPT digest against its own SHA-256,
-`ng ir-copy` byte identity for accepted units, ngas syntax refusals, byte mutants judged by
-ngcheck and ngdis alike, and run pairs: ngrun on `x-NAME.oir` against omc's build of `x-NAME.om`
-(exit status, stdout and stderr equal). Then its negative controls: three deliberately wrong
-expectations must be caught, a mutant ngcheck (load and store typing disabled) and a mutant ngrun
-(`chk.fuel` one pass late) must each fail at least one case. Last line `NGIRGATE PASS cases=N`,
+`hostwords.tsv`, and requires `ngbuild build` to refuse a units file with one wrong pin (exit 3,
+the exact mismatch line) before it compiles anything. Then it runs every line of `tests/ir/cases`:
+the text round trip `ngdis(ngas(t)) == t`; ngcheck's whole output line, either
+`ACCEPT <sha256> fns=F blocks=B ops=O` (digest by the gate's own SHA-256, counts taken from the
+fixture text) or the exact refusal line `ngcheck: CLASS at OFFSET` with empty stdout; `ng
+ir-copy` on every unit (IR.md s14: identity, or the same refusal line for structural classes);
+ngas syntax and limit refusals; byte mutants judged by ngcheck, ngdis and ng; inputs the gate
+generates at the capacities of IR.md s10 and s12 (a unit of exactly 16777216 bytes and one byte
+more, 65537 type entries, text with 65537 types, globals, functions, blocks or parameters); and
+run pairs: ngrun on `x-NAME.oir` against omc's build of `x-NAME.om` (exit status, stdout and
+stderr equal). Then its negative controls: three deliberately wrong expectations must each trip
+their named check, three mutants of ngcheck (load and store typing disabled, the witness prefix
+changed, the class name shifted) and a mutant ngrun (`chk.fuel` one pass late) must each fail
+their named check at least once. Last line `NGIRGATE PASS cases=N`,
 exit 0; otherwise one `FAIL` line per failure and exit 1.
 
 The tools one by one:
@@ -64,8 +71,9 @@ The tools one by one:
 After changing a unit listed in `ng.units`, refresh its pins with `./ngbuild sums seed/ng/ng.units`.
 
 CI: `.github/workflows/ng-ir-arm64.yml` births omc from the seed, requires the committed
-`seed/out/omc.sha256`, builds the gate and runs it; every run line is one invocation and all logic
-lives in the gate.
+`seed/out/omc.sha256`, builds the gate and runs it. Its run lines are glue only (birth, digest
+compare, `cat A B | omc`, start the gate); every check lives in the gate. It runs on any change
+under `seed/` (the compiler's bootstrap closure and the ng tree) or to the workflow.
 
 ## Host dependencies
 
