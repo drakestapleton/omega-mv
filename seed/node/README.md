@@ -606,7 +606,7 @@ L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.o
 { printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/drv-test.om; } | seed/out/omc > build/node/drv-test
 chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test build/node/tool-replay build/node/drv-test
 build/node/code-test unit build/node/cu   # "code checks=57 fail=0", exit 0
-build/node/drv-test /tmp/dvt   # "DRV-TEST pass=36 fail=0 not_run=0", exit 0
+build/node/drv-test /tmp/dvt   # "DRV-TEST pass=37 fail=0 not_run=0", exit 0
 build/node/tool-replay build/node/tool OMC40 ROUND40 build/node/replay   # "TOOL-REPLAY runs=108 pass=108 fail=0 actions=417", exit 0
 ```
 
@@ -622,7 +622,9 @@ so the check tool must use it. `ROUND40` is the round40 run directory holding
 The drivers are seeded Omega built by this checkout's `seed/out/omc`; no
 system program is executed. `tool-replay` runs only TOOL (with OMC as its
 argument), with stderr to `/dev/null`; `drv-test` runs only its own binary as
-the child.
+the child; `view-accept` runs only BUILD's `code-main` or `code-test`, `op`
+and `fake-serve` (the node runs BUILD's `infer` and `tool`); `view-prep` runs
+nothing.
 
 `tool-replay TOOL OMC ROUND40 OUTDIR` replays every recorded round40 run
 through TOOL in `OUTDIR/<job.id>` and checks that each rebuilt `repair.py`
@@ -644,7 +646,7 @@ empty, `.`, `..` or holds `/`. The file header lists its buffer limits.
 | bytes | `dv_eq`, `dv_at`, `dv_find`, `dv_atou` (`dvnone` = not a number) |
 | arguments | `dv_argc`, `dv_arg I BUF` (length, -22 no such argument, -105 buffer too short) |
 | files | `dv_slurp` (-27 does not fit), `dv_spit`, `dv_apnd`, `dv_isdir`, `dv_mkdirp`, `dv_rmrf` (no symbolic link followed), `dv_join` and `dv_dirn` (`os.path.join`, `os.path.dirname`) |
-| processes | `dv_pkinit`, `dv_pkadd` build a packed argv; `dv_spawn PK OUT ERR` runs it in its own process group (exit 126 files, 127 exec); `dv_poll`, `dv_reap`, `dv_wait PID DEADLINE` (-110 after killing the group), `dv_kill`, `dv_killg`; status is the exit code or 256 + signal |
+| processes | `dv_pkinit`, `dv_pkadd` build a packed argv; `dv_spawn PK OUT ERR` runs it in its own process group (exit 126 files, 127 exec), `dv_spawna PK OUT` the same with both streams appended to OUT, `dv_exec` their child side; `dv_poll`, `dv_reap`, `dv_wait PID DEADLINE` (-110 after killing the group), `dv_kill`, `dv_killg`; status is the exit code or 256 + signal |
 | ports | `dv_port`: a free 127.0.0.1 port, never 18091 or 18300 |
 | JSON | `dv_jload` (file to tape), `dv_jkey` (the last duplicate wins), `dv_jidx`, `dv_jlen`, `dv_jisl`, `dv_jnum`, `dv_jstr` (UTF-8, surrogate pairs joined), `dv_jsteq` |
 
@@ -652,7 +654,19 @@ empty, `.`, `..` or holds `/`. The file header lists its buffer limits.
 (removed before and after) and prints `DRV-TEST pass=P fail=F not_run=N`; it
 exits 1 on any failure, 2 for bad usage. A `drv.om` whose `dv_dirn` keeps a
 repeated separator and whose status drops the 256 for a signal gives `FAIL
-drv.dirn`, `FAIL drv.kill-reap` and exit 1.
+drv.dirn`, `FAIL drv.kill-reap` and exit 1; one whose `dv_spawna` opens OUT
+without append gives `FAIL drv.spawn-append`.
+
+`tests/nodedrv.om` (prefix `nd`, composed after `drv.om`) holds what the
+DRA-291 drivers share: the fixture (`nd_prep`: broken files, objective lines,
+`expect.json` and fake-serve's map from the round40 runs), node and
+fake-serve processes (`nd_fake`, `nd_node`, `nd_poll`, `nd_fin`, `nd_sig`,
+`nd_reap`, `nd_clean`), `omnode-op` calls with their JSON answers (`nd_view`,
+`nd_viewd`, `nd_cmd`, `nd_fresh`, `nd_tk`, `nd_ti`, `nd_status`, `nd_dj`),
+output lines (`nd_outl`, `nd_hasl`, `nd_hasp`, `nd_pfxl`, `nd_lastl`), the
+journal (`nd_jstart`) and the listening check (`nd_lsn`, from
+`/proc/net/tcp` and `/proc/net/tcp6`). Its header documents the path slots
+and limits.
 
 ### Programs
 
@@ -770,7 +784,7 @@ cancelled through `auth_cancel` after MS milliseconds.
 ## Operator view and commands (DRA-291)
 
 Status: IMPLEMENTED in `view.om`, `op.om` and `code.om` (with OPER records in
-`journal.om`), exercised on native Linux AArch64 by `tests/view-accept.py`,
+`journal.om`), exercised on native Linux AArch64 by `tests/view-accept.om`,
 which drives the real `omnode-code` and `omnode-infer` through `omnode-op`
 only, against `tests/fake-serve.om`, a server that answers with the recorded
 round40 model turns. Not QUALIFIED on the Spark and not DEPLOYED.
@@ -779,7 +793,11 @@ round40 model turns. Not QUALIFIED on the Spark and not DEPLOYED.
 { printf 'om2\n'; cat seed/net/http.om seed/net/notls.om seed/node/op.om; } | seed/out/omc > build/node/op
 { printf 'om2\n'; cat seed/net/http.om seed/net/notls.om seed/node/tests/fake-serve.om; } | seed/out/omc > build/node/fake-serve
 chmod +x build/node/op build/node/fake-serve
-python3 seed/node/tests/view-accept.py $PWD/build/node OMC40 ROUND40 build/node/accept   # VIEWSUM pass=46 fail=0
+D="seed/json/json.om seed/node/tests/drv.om seed/node/tests/nodedrv.om"
+{ printf 'om2\n'; cat $D seed/node/tests/view-prep.om; } | seed/out/omc > build/node/view-prep
+{ printf 'om2\n'; cat $D seed/node/tests/view-accept.om; } | seed/out/omc > build/node/view-accept
+chmod +x build/node/view-prep build/node/view-accept
+build/node/view-accept $PWD/build/node OMC40 ROUND40 build/node/accept   # VIEWSUM pass=46 fail=0, exit 0
 ```
 
 ### Model
@@ -853,7 +871,13 @@ cancelled and no longer listed).
 
 ### Acceptance and controls
 
-`view-accept.py` (46 checks) runs nine scenarios, each a real
+`view-accept BUILD OMC ROUND40 OUTDIR [SCENARIO...]` (46 checks; scenario
+names select a subset; exit 0 when nothing failed, 1 otherwise, 2 for usage)
+prepares each scenario in `OUTDIR/<scenario>` (`cmds` for commands) with
+`nd_prep` (also available alone as `view-prep ROUND40 BASE ID[,ID...]
+[WRONG]`, whose output is byte-identical to the Python original it replaces)
+and prints answers in its details as the compact JSON `omnode-op` printed. It
+runs nine scenarios, each a real
 `omnode-code` (or `omnode-code-test overload LIMIT` / `uncertain`, the same
 program with a test hook) and the fake server: the full four-objective run
 followed only through deltas across a 1.5 s disconnect (no version gaps; the
