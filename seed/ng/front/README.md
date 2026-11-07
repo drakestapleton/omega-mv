@@ -88,11 +88,16 @@ Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
     gate-front-ir seed/out/omc 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
-It builds ng, ngcheck and ngrun with the pinned omc, then for each `run` case compiles the unit with
-omc and runs it, lowers it with ng, requires ngcheck ACCEPT, runs the ΩIR with ngrun and compares exit
-status and stdout (stderr is free: the kernels time themselves there); for each `refuse` case ng's exit
-and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of `seed/ng/tests/ir`, the ten
-ng-bench kernels (`kernels/`, verbatim copies, `kernels/PROVENANCE.md`) and 30 refusal units of
-`cases/`. Negative controls: two lowering mutants (the `for` latch adds 2; `and`/`or`/`xor` shifted to
-the next op) must fail a run case, `@ng front-check` mode must fail the first run case (no ΩIR) and
-`@ng ir-copy` mode the first refusal case. Last line `FRONTIRGATE PASS|FAIL ...`, exit 0 or 1.
+It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
+case compiles the unit with omc and runs it, lowers it with ng, requires ngcheck ACCEPT, runs the ΩIR with
+ngrun and compares exit status and stdout (stderr is free: the kernels time themselves there); for each
+`refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
+`seed/ng/tests/ir`, the ten ng-bench kernels and 30 refusal units of `cases/`. ngrun interprets (90-470x
+native) and has no step cap yet, so nine kernels run as reduced copies (`runs/`, loop counts and sizes
+only, `runs/PROVENANCE.md`; each under 25 ms native) and matmul verbatim; the verbatim kernels
+(`kernels/`, `kernels/PROVENANCE.md`) stay for the a64-vs-omc comparison. Every child the gate starts is
+killed after 600 s: that case prints `NOT_RUN` and counts in `notrun=`, never as ok, FAIL, a kill or a trip.
+Negative controls: two lowering mutants (the `for` latch adds 2; `and`/`or`/`xor` shifted to the next op)
+must fail a run case, `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode
+the first refusal case. Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN:
+no failure but U > 0, never PASS).
