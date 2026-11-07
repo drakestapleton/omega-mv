@@ -6,8 +6,14 @@ lower it to AArch64 (`src/a64.om`) and sm_121 (`src/gpu.om`). Everything here is
 the pinned seeded compiler `seed/out/omc`.
 
 This directory is shared by the NG lanes. Lane ng-ir owns the ΩIR spec, its in-memory form and the
-tools below; the other lanes own their `src/*.om` unit and their subdirectory (`front/`, `a64/`,
-`gpu/`, `bench/`).
+tools below; the other lanes own their `src/*.om` unit and their subdirectory:
+
+| Directory | Lane | Role |
+|---|---|---|
+| `front/`, `src/front.om` | ng-front | Omega source to ΩIR; every language refusal of omc. |
+| `a64/`, `src/a64.om` | ng-a64 | ΩIR to AArch64. |
+| `gpu/`, `src/gpu.om` | ng-gpu | Encoder conformance gate over the CUDApp units pinned in `cudapp.lock` (D10); `gpu.om` lands in `src/`. |
+| `bench/` | ng-bench | A/B timing harness against omc and gcc -O2. |
 
 ## ΩIR files (lane ng-ir)
 

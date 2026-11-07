@@ -361,6 +361,14 @@ its loads reading 0, every loop being fuel-bounded; another: the barrier counts 
 kernel write is visible to the caller after `launch`. Inside a kernel the token orders a thread's
 own checks and effects; it orders nothing between threads (only `sync` and atomics do).
 
+`src/gpu.om` (ng-gpu, PROPOSED, `~/handoffs/hive-ng/gpu/IR-GPU-DRAFT.md`) takes the second way: a
+trapping thread does a device-scope 64-bit unsigned atomic min of `(linear id << 4) | code` into
+one per-launch trap word (initialised to all ones, CPU-visible and uncached) and exits; the host
+reads the word after the launch, so the lowest linear id wins as above. Exited threads release
+barriers (PTX ISA 9.4, `exit`; that `BAR.SYNC` on GB10 does the same is untested until ng-gpu's
+chip check). Its target-descriptor limits: fewer than 2^60 threads per launch, and an encoder with
+a 64-bit atomic min.
+
 ### 7.8 Vectors and tiles (100..106)
 
 | op | name | ty | imm | operands | meaning |
