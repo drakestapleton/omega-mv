@@ -54,13 +54,31 @@ sed -e 's/fopen spath/cfopen/' -e 's/write int fd sb/cwrite int fd/' -e 's/fsync
     -e 's/fclose int fd/cfclose int fd/' -e 's/renames spkt/crenames/' $A/store.om | cat - $A/store-cleanup-test.om \
     | cmp -s - $A/store-cleanup-gate.om && ok "store-cleanup-gate.om = injected store.om store-cleanup-test.om" \
     || bad "store-cleanup-gate.om is stale against store.om store-cleanup-test.om"
-for g in dispatch-gate lock-gate store-gate dispatch-order-gate store-exact-gate store-cleanup-gate; do
+# dispatch-fault-gate routes dispatch's actlost, actrecon and writerec results through the test's injectors.
+finject() { sed -e 's/^err = actlost r$/err = factlost r/' -e 's/^err = actrecon r s$/err = factrecon r s/' \
+    -e 's/^err = writerec r$/err = fwriterec r/' "$1" | cat $A/action.om $A/store.om - $A/dispatch-fault-test.om; }
+finject $A/dispatch.om | cmp -s - $A/dispatch-fault-gate.om && ok "dispatch-fault-gate.om = injected dispatch.om" \
+    || bad "dispatch-fault-gate.om is stale against action.om store.om dispatch.om dispatch-fault-test.om"
+for g in dispatch-gate lock-gate store-gate dispatch-order-gate store-exact-gate store-cleanup-gate dispatch-fault-gate; do
     "$OMC" < $A/$g.om > "$B/$g" || { bad "$g does not compile"; continue; }
     chmod +x "$B/$g"
     "$B/$g" < /dev/null > "$B/$g.out" 2>&1
     st=$?
     [ $st = 0 ] && ok "$g exit 0: $(tail -1 "$B/$g.out")" || bad "$g exit $st: $(tail -1 "$B/$g.out")"
 done
+
+# 5. Negative controls: the pre-fix modules of main 943d955 fail the new regression tests.
+# The old lock test run may signal its own process group, so it runs in a new session.
+cat seed/profile/cases/lock-943d955.om $A/lock-test.om | "$OMC" > "$B/lock-old" && chmod +x "$B/lock-old"
+setsid -w "$B/lock-old" < /dev/null > "$B/lock-old.out" 2>&1
+st=$?
+[ $st = 1 ] && ok "pre-fix lock.om refused by lock-test (exit 1)" || bad "pre-fix lock.om: lock-test exit $st"
+finject seed/profile/cases/dispatch-943d955.om | "$OMC" > "$B/fault-old" && chmod +x "$B/fault-old"
+setsid -w "$B/fault-old" < /dev/null > "$B/fault-old.out" 2>&1
+st=$?
+got=$(grep -o 'case [0-9]' "$B/fault-old.out" | tr -d 'case ' | tr -d '\n')
+[ $st = 1 ] && [ "$got" = 234578 ] && ok "pre-fix dispatch.om fails fault cases 2 3 4 5 7 8 (79 77 78 79 77 78)" \
+    || bad "pre-fix dispatch.om: fault gate exit $st cases '$got'"
 
 if [ $fails = 0 ]; then echo "PROFILE CHECK PASS"; exit 0; fi
 echo "PROFILE CHECK FAIL failed=$fails"; exit 1
