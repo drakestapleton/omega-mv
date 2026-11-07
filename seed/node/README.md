@@ -1450,11 +1450,11 @@ Hashes (`HASH` lines; full list in `start.txt` and `start-addendum.txt`):
 | f3 | 25c9a30a | 3/4/4 | FAIL. code-main hit its fixed 3600 s deadline (exit 62, 3600078 ms) with o0 and o1 PASS (5 and 2 turns, as in round40) and o2 and o3 unfinished, so journal, transcript and review fail as consequences. no-leak PASS. |
 | c2 | 25c9a30a | 5/0/6 | PASS: `CWO 0 FAIL 19` at 20090 ms, server `C 499`, 7 journal records with 1 CANCEL |
 | r2 | 25c9a30a | 5/0/6 | PASS, on a contended host. Run 1 was SIGKILLed (137) during the first inference after the replace, and the file on disk was correct. Run 2 issued no second replace and exited 0 with o0 PASS in 590011 ms. Journal: 80 records, 2 OPENs, 13 operations each started once, 1 settled by the restart. |
-| f4 | 25c9a30a | 7/0/4 | PASS, in the quiet slot granted by Manager cycle 24 (13:56:50Z-14:21:48Z, pool-8-9, no spark-window). The start check inside the lock passed: load1 9.64, and no ollm/train process running (ownmodel's eval was stopped). code-main exited 0 with `CWSUM pass=4 fail=0`, o0..o3 PASS in 5/2/5/3 turns. full-journal: 174 records, 29 operations each started once, 0 bad. Transcript, review and no-leak PASS. Contamination: ownmodel's eval ran 13:58:31Z-14:00:29Z, resumed on a false END line from my script, then re-paused. The sampler found a foreign thread on 8/9 in 10 of 150 samples, all short host processes, none ollm or train. Not shown in the table: an earlier launch at 13:56:12Z was refused at once ("BASE must not exist": the driver script had created BASE) and ran no inference. Its record is kept; attempt 1 at 12:15:29Z was NOT_RUN (load 10.45, 4 ollm processes). |
+| f4 | 25c9a30a | 7/0/4 | PASS, in the quiet slot granted by Manager cycle 24 (13:56:50Z-14:21:48Z, pool-8-9, no spark-window). The start check inside the lock passed: load1 9.64, and no ollm/train process running (ownmodel's eval was stopped). code-main exited 0 with `CWSUM pass=4 fail=0`, o0..o3 PASS in 5/2/5/3 turns. full-journal: 174 records, 29 operations each started once, 0 bad. Transcript, review and no-leak PASS. Partly contended: ownmodel's eval ran 13:58:31Z-14:00:29Z, resumed on a false END line from my script, then re-paused. The sampler found a foreign thread on 8/9 in 10 of 150 samples: brief runnable threads of host processes, none ollm or train (listed under Contamination). Not shown in the table: an earlier launch at 13:56:12Z was refused at once ("BASE must not exist": the driver script had created BASE) and ran no inference. Its record is kept; attempt 1 at 12:15:29Z was NOT_RUN (load 10.45, 4 ollm processes). |
 
 Each part exits 1 whenever a check is NOT_RUN (`lt_end`), so the check table, not the exit status, is the verdict.
 
-The fixed driver has not yet seen a full four-objective run end. f3 shows the fixed CWSUM count only up to 2/2.
+f4 is the fixed driver's first full four-objective run to end (CWSUM 4/0).
 
 **Contamination.** `live-cpu` takes one sample every 10 s and counts the samples in which a foreign thread was running on core 8 or 9. Data lines only; the closing `CPU done samples N` line is not a sample:
 - f: 7 of 106 samples. The sampler started at 09:08:31Z, about 12 minutes after f did (08:56:00Z), so the start of f was not sampled.
@@ -1464,10 +1464,11 @@ The fixed driver has not yet seen a full four-objective run end. f3 shows the fi
 - f3: 95 of 349 samples (46 of them `grep`). The `grep` threads came from many pids and cannot be attributed after the fact; the others included `kcompactd0`, `git`, `python3` and `kswapd0`.
 - c2: 5 of 5 samples (4 of them `grep`).
 - r2: 51 of 185 samples (9 of them `grep`).
+- f4: 10 of 150 samples, each a briefly runnable thread of a host process, some of them long-lived daemons: `mi-scavenger` and `agent-archive` twice each; `tailscaled`, `tokio-rt-worker`, `pi-fs-worker`, `python`, `omp`, `git` and `find` once each (one sample held both `tailscaled` and `mi-scavenger`). None was ollm or train.
 
 The sampler ran on core 5 for f, c and the start of r, and on core 0 from 09:35:59Z (partway through r) onward. The `cpu.NOTE` files record the core-0 use as unapproved; the Manager approved it in cycle 16 (BOARD 2026-11-07T11:19:33Z).
 
-f3, c2 and r2 ran on a contended host. Their wall times are recorded but are not measurements of the workflow.
+f3, c2 and r2 ran on a contended host, and f4 on a partly contended one (ownmodel's eval 13:58:31Z-14:00:29Z; load1 9.64 at the start and 17.59 at the end). Their wall times are recorded but are not measurements of the workflow.
 
 f3's turns took 2 to 5 times longer than f2's at equal token counts (for example 644695 ms against 279335). ollm stayed alone on core 9, the load average was 22 on 20 cores, and other lanes' ollm serve, train and gtrain processes were running on other cores (`f3/NOTE`, `ps-ollm.txt`). Shared memory bandwidth is the likely cause, but it was not measured.
 
@@ -1477,7 +1478,7 @@ These timings are not speed evidence.
 
 | Run | DRA-290 | This run |
 | --- | --- | --- |
-| full | exit 0 in 1632430 ms | exit 0 in 1790389 ms (f) and 1645009 ms (f2); f3 hit the 3600 s deadline (contended) |
+| full | exit 0 in 1632430 ms | exit 0 in 1790389 ms (f), 1645009 ms (f2) and 1492808 ms (f4, partly contended); f3 hit the 3600 s deadline (contended) |
 | cancel | `C 499 … 22072` | 20049 ms (c) and 20090 ms (c2) |
 | crash run 2 | 295826 ms | 244394 ms (r) and 590011 ms (r2, contended) |
 
