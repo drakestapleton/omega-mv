@@ -1,0 +1,1857 @@
+note Omega Node transport, concatenate with a program-mode consumer.
+note Trusted forked processes only. This is transport, not write authority.
+note One publisher PID, 64 immutable records per epoch; reuse only via node_reset.
+note Layout: 4096 byte header then 64 slots of 4160 bytes.
+note Header u64: magic, ABI, published count, stop, publisher PID, epoch.
+note Slot u64: version, length, topic mask; payload begins at offset 64.
+const NCAP ulong 64
+const NBYTES ulong 270336
+const NMAGIC ulong 1313817669
+
+fn node_new to long
+h = mapnew neg int 1 0 NBYTES 3 33
+if le h 0
+ret h
+end
+r = mapset h 8 8 1
+r = mapset h 32 8 ulong getpid
+r = mapset h 0 8 NMAGIC
+ret h
+end
+
+fn node_valid h long to bool
+ret and eq mapget h 0 8 NMAGIC eq mapget h 8 8 1
+end
+
+fn node_offset v ulong to ulong
+ret add 4096 mul sub v 1 4160
+end
+
+note Return version, or -1 stopped, -2 full, -3 length, -4 topic,
+note -5 invalid header, -6 wrong publisher. Refusals do not publish.
+fn node_publish h long topics ulong src view uchar 4096 n ulong to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+if ne mapget h 24 8 0
+ret neg long 1
+end
+if gt n 4096
+ret neg long 3
+end
+if eq topics 0
+ret neg long 4
+end
+v = mapget h 16 8
+if gt v NCAP
+ret neg long 5
+end
+if eq v NCAP
+ret neg long 2
+end
+v = add v 1
+off = node_offset v
+r = mapwrite h add off 64 src 0 n
+r = mapset h add off 8 8 n
+r = mapset h add off 16 8 topics
+note mapset has barriers before and after its aligned store.
+r = mapset h off 8 v
+r = mapset h 16 8 v
+ret long v
+end
+
+note Header and record checks precede copying. No partial publication is read.
+note Returns payload length, -5 invalid header/record, -7 unavailable version.
+fn node_read h long v ulong dst edit uchar 4096 to long
+if not node_valid h
+ret neg long 5
+end
+if or eq v 0 gt v NCAP
+ret neg long 7
+end
+latest = mapget h 16 8
+if gt latest NCAP
+ret neg long 5
+end
+if gt v latest
+ret neg long 7
+end
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+n = mapget h add off 8 8
+if gt n 4096
+ret neg long 5
+end
+ret mapread h add off 64 dst 0 n
+end
+
+note Return the next matching version after cursor, zero if caught up,
+note or negative refusal. Caller advances its cursor through returned versions.
+fn node_next h long cursor ulong topics ulong to long
+if not node_valid h
+ret neg long 5
+end
+if or gt cursor NCAP eq topics 0
+ret neg long 7
+end
+latest = mapget h 16 8
+if or gt latest NCAP gt cursor latest
+ret neg long 5
+end
+v = cursor
+note At most NCAP published slots can be examined.
+while lt v latest bound 64
+v = add v 1
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+if ne and mapget h add off 16 8 topics 0
+ret long v
+end
+end
+ret 0
+end
+
+fn node_stop h long to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+ret mapset h 24 8 1
+end
+
+note Creator only. Retire every record so a pool can reuse the arena for a new
+note epoch. The caller must first prove no reader holds the old epoch (pool.om).
+note The count drops to zero before any record version is cleared.
+fn node_reset h long epoch ulong to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+if eq epoch 0
+ret neg long 7
+end
+r = mapset h 16 8 0
+for i ulong NCAP
+r = mapset h node_offset add i 1 8 0
+end
+r = mapset h 24 8 0
+r = mapset h 40 8 epoch
+ret 0
+end
+
+fn node_epoch h long to ulong
+ret mapget h 40 8
+end
+
+note The latest published version of the arena's current epoch (0 when empty).
+fn node_count h long to ulong
+ret mapget h 16 8
+end
+
+note One nonblocking eventfd per consumer. Saturation means already readable.
+note Interrupted operations retry at most 64 times, then return EINTR.
+fn node_notify fd int to long
+buf = new uchar 8 0
+put buf 0 1
+for i ulong 64
+r = write fd buf 0 8
+if eq r 8
+ret 0
+end
+if eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_drain fd int to long
+buf = new uchar 8 0
+for i ulong 64
+r = read fd buf 0 8
+if or eq r 8 eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_pollfd p edit uchar 16 off ulong fd int to void
+for i ulong 4
+put p add off i uchar and shr uint fd uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Returns 2 stop, 1 wake, 0 timeout or negative errno.
+note Control takes priority when both descriptors are ready.
+note EINTR returns to caller so it can recompute its monotonic deadline.
+fn node_wait h long wake int stop int interval long to long
+p = new uchar 16 0
+if not node_valid h
+ret neg long 5
+end
+if or lt wake 0 lt stop 0
+ret neg long 9
+end
+if eq wake stop
+ret neg long 22
+end
+if ne mapget h 24 8 0
+ret 2
+end
+node_pollfd p 0 wake
+node_pollfd p 8 stop
+r = pollfds p 0 16 interval
+if lt r 0
+ret r
+end
+if ne mapget h 24 8 0
+ret 2
+end
+if ne and get p 14 56 0
+ret neg long 5
+end
+if ne and get p 14 1 0
+r = node_drain stop
+if lt r 0
+ret r
+end
+ret 2
+end
+if ne and get p 6 56 0
+ret neg long 5
+end
+if ne and get p 6 1 0
+r = node_drain wake
+if lt r 0
+ret r
+end
+ret 1
+end
+ret 0
+end
+note Omega Node epoch pool. Concatenate after transport.om, before super.om.
+note K arenas (1..8) and one control page are mapped before any worker fork,
+note so every forked worker inherits the same shared mappings.
+note Single writer: the creator writes the current epoch, the arena table and
+note every arena record. Worker w alone writes hold word w while it lives;
+note the creator clears hold w only after it has reaped worker w.
+note Control u64: 0 magic, 8 ABI, 16 current epoch, 24 stop, 32 creator PID,
+note 40 arena count K, 48 worker slots W, 64+8k arena handle k,
+note 128+8k epoch of arena k (0 free), 256+8w hold of worker w (0 none),
+note 768+8w worker PID, 1280+8w worker state (0 empty, 1 live, 2 reaped).
+const PMAGIC ulong 1347374924
+const PCAP ulong 8
+const PWCAP ulong 64
+const PBYTES ulong 4096
+
+fn pool_valid c long to bool
+ret and eq mapget c 0 8 PMAGIC eq mapget c 8 8 1
+end
+
+fn pool_mine c long to bool
+ret eq mapget c 32 8 ulong getpid
+end
+
+fn pool_arena c long k ulong to long
+ret long mapget c add 64 mul k 8 8
+end
+
+note Drop the first n arenas and the control page of a pool being refused.
+fn pool_unwind c long n ulong to long
+for i ulong n bound 8
+r = mapdrop pool_arena c i
+end
+ret mapdrop c
+end
+
+note Return the control handle, or -7 bad size, or a negative mapping errno.
+note Arena 0 starts as epoch 1. Call before forking any worker.
+fn pool_new k ulong w ulong to long
+if or eq k 0 gt k PCAP
+ret neg long 7
+end
+if or eq w 0 gt w PWCAP
+ret neg long 7
+end
+c = mapnew neg int 1 0 PBYTES 3 33
+if le c 0
+ret c
+end
+r = mapset c 32 8 ulong getpid
+r = mapset c 40 8 k
+r = mapset c 48 8 w
+for i ulong k bound 8
+h = node_new
+if le h 0
+r = pool_unwind c i
+ret h
+end
+r = mapset c add 64 mul i 8 8 ulong h
+end
+r = node_reset pool_arena c 0 1
+r = mapset c 128 8 1
+r = mapset c 16 8 1
+r = mapset c 8 8 1
+r = mapset c 0 8 PMAGIC
+ret c
+end
+
+note Arena index holding epoch e, or -5 when no arena holds it.
+fn pool_slot c long e ulong to long
+k = mapget c 40 8
+if gt k PCAP
+ret neg long 5
+end
+for i ulong k bound 8
+if eq mapget c add 128 mul i 8 8 e
+ret long i
+end
+end
+ret neg long 5
+end
+
+note Creator: the arena of the current epoch, or a negative refusal.
+fn pool_current c long to long
+if not pool_valid c
+ret neg long 5
+end
+k = pool_slot c mapget c 16 8
+if lt k 0
+ret k
+end
+ret pool_arena c ulong k
+end
+
+fn pool_epoch c long to ulong
+ret mapget c 16 8
+end
+
+note Worker step: store hold e for worker w, then read the epoch again. mapset
+note and mapget fence both sides, so a creator that moved the epoch before it
+note scanned holds either sees this hold or this read sees the move. Returns
+note the arena of e, -8 when the epoch moved, or -5 when no arena holds e.
+note Every refusal clears the hold.
+fn pool_hold c long w ulong e ulong to long
+if ge w mapget c 48 8
+ret neg long 7
+end
+hw = add 256 mul w 8
+r = mapset c hw 8 e
+if ne mapget c 16 8 e
+r = mapset c hw 8 0
+ret neg long 8
+end
+k = pool_slot c e
+if lt k 0
+r = mapset c hw 8 0
+ret k
+end
+h = pool_arena c ulong k
+if ne node_epoch h e
+r = mapset c hw 8 0
+ret neg long 5
+end
+ret h
+end
+
+note Worker w holds the current epoch and returns its arena. Returns -1
+note stopped, -5 invalid, -7 bad worker, -8 the epoch kept moving.
+fn pool_acquire c long w ulong to long
+if not pool_valid c
+ret neg long 5
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+for t ulong 16
+if ne mapget c 24 8 0
+r = mapset c add 256 mul w 8 8 0
+ret neg long 1
+end
+h = pool_hold c w mapget c 16 8
+if ne h neg long 8
+ret h
+end
+end
+ret neg long 8
+end
+
+note Worker w gives up its hold. Its old arena must not be read afterwards.
+fn pool_release c long w ulong to long
+if ge w mapget c 48 8
+ret neg long 7
+end
+ret mapset c add 256 mul w 8 8 0
+end
+
+fn pool_held c long e ulong to bool
+n = mapget c 48 8
+for w ulong n bound 64
+if eq mapget c add 256 mul w 8 8 e
+ret true
+end
+end
+ret false
+end
+
+note Creator step: retire arena i and open epoch n in it, then publish n.
+fn pool_reuse c long i ulong n ulong to long
+off = add 128 mul i 8
+r = mapset c off 8 0
+r = node_reset pool_arena c i n
+if lt r 0
+ret r
+end
+r = mapset c off 8 n
+r = mapset c 16 8 n
+ret long n
+end
+
+note Creator step: an arena that is free or whose older epoch no worker holds,
+note or -9. Call only after the current epoch has moved past that arena.
+fn pool_pick c long to long
+e = mapget c 16 8
+k = mapget c 40 8
+for i ulong k bound 8
+ek = mapget c add 128 mul i 8 8
+if ne ek e
+if or eq ek 0 not pool_held c ek
+ret long i
+end
+end
+end
+ret neg long 9
+end
+
+note Creator: open the next epoch in a free or unheld arena and make it current.
+note Returns the new epoch, -1 stopped, -5 invalid, -6 not creator, or -9 when
+note every other arena is still held: the pool fails closed, nothing changes.
+fn pool_roll c long to long
+if not pool_valid c
+ret neg long 5
+end
+if not pool_mine c
+ret neg long 6
+end
+if ne mapget c 24 8 0
+ret neg long 1
+end
+k = pool_pick c
+if lt k 0
+ret k
+end
+ret pool_reuse c ulong k add mapget c 16 8 1
+end
+
+note Creator: publish to the current epoch; when it is full, roll once and retry.
+note Returns the version, or the refusal of the publish or of the roll.
+fn pool_publish c long topics ulong src view uchar 4096 n ulong to long
+h = pool_current c
+if lt h 0
+ret h
+end
+v = node_publish h topics src n
+if ne v neg long 2
+ret v
+end
+r = pool_roll c
+if lt r 0
+ret r
+end
+h = pool_current c
+if lt h 0
+ret h
+end
+ret node_publish h topics src n
+end
+
+fn pool_stop c long to long
+if not pool_valid c
+ret neg long 5
+end
+if not pool_mine c
+ret neg long 6
+end
+ret mapset c 24 8 1
+end
+
+fn pool_stopped c long to bool
+ret ne mapget c 24 8 0
+end
+
+note Creator: record worker w's PID and state for observers.
+fn pool_setw c long w ulong pid ulong st ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+r = mapset c add 768 mul w 8 8 pid
+ret mapset c add 1280 mul w 8 8 st
+end
+
+note Creator: clear hold w. Only after worker w has been reaped.
+fn pool_clear c long w ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+ret mapset c add 256 mul w 8 8 0
+end
+
+note Drop every mapping of the pool in this process. Other processes keep
+note their own inherited mappings until they drop them or exit.
+fn pool_free c long to long
+ret pool_unwind c mapget c 40 8
+end
+note Omega Node worker supervision. Concatenate after transport.om and pool.om.
+note The creator forks trusted workers from its own binary: sup_spawn returns 0
+note in the child, which runs its worker function and exits with its result.
+note Death is seen without polling PIDs. Worker w alone holds the write end of
+note its close-on-exec life pipe, so its exit hangs up the creator's read end.
+note Every worker holds the read end of the creator's life pipe, whose only
+note writer is the creator, so creator death hangs up every worker.
+note Per worker: wake, stop and ack eventfds, kept across respawns.
+note Workers must not exec: exec closes the life pipe and reads as death.
+global swpid long 64
+global swwake int 64
+global swstop int 64
+global swack int 64
+global swlife int 64
+global swst ulong 64
+global swpw ulong 64
+global swpar int 2
+global swme ulong 1
+global swws uchar 4
+global swpf uchar 8
+global swpoll uchar 1024
+
+fn sup_fd off ulong to int
+v = ulong get swpf off
+v = or v shl ulong get swpf add off 1 8
+v = or v shl ulong get swpf add off 2 16
+v = or v shl ulong get swpf add off 3 24
+ret int v
+end
+
+note Poll record j at swpoll offset off; a negative fd is stored as itself
+note (bit pattern) so the kernel ignores that record.
+fn sup_gpfd off ulong fd int to void
+u = bitcast uint fd
+for i ulong 4
+put swpoll add off i uchar and shr u uint mul i 8 255
+end
+put swpoll add off 4 1
+put swpoll add off 5 0
+put swpoll add off 6 0
+put swpoll add off 7 0
+end
+
+fn sup_lpfd p edit uchar 24 off ulong fd int to void
+for i ulong 4
+put p add off i uchar and shr uint fd uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Read and reset an eventfd counter: the number of hints since the last
+note take, 0 when none is pending, or a negative errno.
+fn sup_take fd int to long
+buf = new uchar 8 0
+for i ulong 64
+r = read fd buf 0 8
+if eq r 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get buf j mul j 8
+end
+ret long and v 9223372036854775807
+end
+if eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn sup_closeall to void
+for i ulong 64
+if ge get swwake i 0
+r = fclose get swwake i
+end
+if ge get swstop i 0
+r = fclose get swstop i
+end
+if ge get swack i 0
+r = fclose get swack i
+end
+if ge get swlife i 0
+r = fclose get swlife i
+end
+put swwake i neg int 1
+put swstop i neg int 1
+put swack i neg int 1
+put swlife i neg int 1
+end
+for i ulong 2
+if ge get swpar i 0
+r = fclose get swpar i
+end
+put swpar i neg int 1
+end
+end
+
+note Creator: create the creator life pipe and three eventfds per worker slot.
+note Call once after pool_new and before sup_spawn. 0 or a negative errno;
+note a failure closes everything this call opened.
+fn sup_init c long to long
+if not pool_mine c
+ret neg long 6
+end
+for i ulong 64
+put swpid i 0
+put swst i 0
+put swwake i neg int 1
+put swstop i neg int 1
+put swack i neg int 1
+put swlife i neg int 1
+end
+put swme 0 0
+put swpar 0 neg int 1
+put swpar 1 neg int 1
+r = pipefds swpf 0 8 524288
+if lt r 0
+ret r
+end
+put swpar 0 sup_fd 0
+put swpar 1 sup_fd 4
+n = mapget c 48 8
+for i ulong n bound 64
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swwake i int a
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swstop i int a
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swack i int a
+end
+ret 0
+end
+
+note Creator: fork worker w. Returns 0 in the child, the child PID in the
+note creator, -7 bad slot, -16 slot still live, or a negative errno. The
+note child keeps only its own life write end; the creator keeps the read end.
+fn sup_spawn c long w ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+if ne get swpid w 0
+ret neg long 16
+end
+r = pipefds swpf 0 8 524288
+if lt r 0
+ret r
+end
+rd = sup_fd 0
+wr = sup_fd 4
+pid = fork
+if eq pid 0
+r = fclose get swpar 1
+put swpar 1 neg int 1
+r = fclose rd
+put swlife w wr
+put swme 0 add w 1
+ret 0
+end
+r = fclose wr
+if lt pid 0
+r = fclose rd
+ret pid
+end
+put swpid w pid
+put swlife w rd
+r = pool_setw c w ulong pid 1
+ret pid
+end
+
+note Worker: 3 creator gone, 2 stop, 1 wake hint, 0 timeout, negative errno.
+note Creator loss outranks stop, which outranks work. A set stop flag makes
+note the poll nonblocking. Hints are drained; rescan shared state after 1.
+fn sup_wwait c long w ulong interval long to long
+p = new uchar 24 0
+if ge w 64
+ret neg long 7
+end
+iv = interval
+if pool_stopped c
+iv = 0
+end
+sup_lpfd p 0 get swwake w
+sup_lpfd p 8 get swstop w
+sup_lpfd p 16 get swpar 0
+r = pollfds p 0 24 iv
+if lt r 0
+ret r
+end
+if ne get p 22 0
+ret 3
+end
+if pool_stopped c
+ret 2
+end
+if ne and get p 14 56 0
+ret neg long 5
+end
+if ne and get p 14 1 0
+r = node_drain get swstop w
+ret 2
+end
+if ne and get p 6 56 0
+ret neg long 5
+end
+if ne and get p 6 1 0
+r = node_drain get swwake w
+if lt r 0
+ret r
+end
+ret 1
+end
+ret 0
+end
+
+note Worker or creator: post a hint on worker w's ack eventfd.
+fn sup_ack w ulong to long
+if ge w 64
+ret neg long 7
+end
+ret node_notify get swack w
+end
+
+note Creator: wake worker w with a work hint.
+fn sup_wake w ulong to long
+if ge w 64
+ret neg long 7
+end
+if le get swpid w 0
+ret neg long 3
+end
+ret node_notify get swwake w
+end
+
+fn sup_live c long to ulong
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+if gt get swpid w 0
+k = add k 1
+end
+end
+ret k
+end
+
+note Creator: reap worker w, then release what it held. A worker that has not
+note exited within about one second gets SIGKILL first. Only after the exact
+note PID is reaped are its hold, PID and life pipe released. Returns the raw
+note wait status, -3 no live worker, or the waitpid errno (nothing released).
+fn sup_reap c long w ulong to long
+if ge w 64
+ret neg long 7
+end
+pid = get swpid w
+if le pid 0
+ret neg long 3
+end
+done = false
+for t ulong 100
+r = waitpid int pid swws 0 4 1
+if eq r pid
+done = true
+break
+end
+if ne r 0
+ret r
+end
+r = sleepns 10000000
+end
+if not done
+r = killpid int pid 9
+r = waitpid int pid swws 0 4 0
+if ne r pid
+ret r
+end
+end
+st = ulong get swws 0
+st = or st shl ulong get swws 1 8
+put swst w st
+r = fclose get swlife w
+put swlife w neg int 1
+put swpid w 0
+r = pool_clear c w
+r = pool_setw c w 0 2
+ret long st
+end
+
+note Creator: wait up to interval ns for deaths and, when acks is true, acks.
+note Ack counts are left pending for sup_take. Every worker whose life pipe
+note hung up is reaped. Returns the number reaped, or a negative errno.
+fn sup_pollx c long interval long acks bool to long
+n = mapget c 48 8
+m = ulong 0
+for w ulong n bound 64
+if gt get swpid w 0
+o = mul m 16
+if acks
+sup_gpfd o get swack w
+else
+sup_gpfd o neg int 1
+end
+sup_gpfd add o 8 get swlife w
+put swpw m w
+m = add m 1
+end
+end
+if eq m 0
+ret 0
+end
+r = pollfds swpoll 0 mul m 16 interval
+if lt r 0
+ret r
+end
+dead = long 0
+for j ulong m bound 64
+o = add mul j 16 14
+if ne get swpoll o 0
+r = sup_reap c get swpw j
+if lt r 0
+ret r
+end
+dead = add dead 1
+end
+end
+ret dead
+end
+
+note Creator: wait up to interval ns for acks and deaths (see sup_pollx).
+fn sup_poll c long interval long to long
+ret sup_pollx c interval true
+end
+
+note Creator: stop admission, post every live worker's stop eventfd, then reap
+note until all have exited or interval ns pass; survivors get SIGKILL and are
+note reaped. Returns how many had to be killed, or a refusal.
+fn sup_stop c long interval long to long
+r = pool_stop c
+if lt r 0
+ret r
+end
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+r = node_notify get swstop w
+end
+end
+dl = add monons interval
+for t ulong 100000
+if eq sup_live c 0
+ret 0
+end
+now = monons
+if ge now dl
+break
+end
+r = sup_pollx c sub dl now false
+if lt r 0
+if ne r neg long 4
+break
+end
+end
+end
+killed = long 0
+for w ulong n bound 64
+if gt get swpid w 0
+r = killpid int get swpid w 9
+r = sup_reap c w
+killed = add killed 1
+end
+end
+ret killed
+end
+note Omega Node cooperative scheduling (DRA-287). Concatenate after
+note transport.om, pool.om and super.om, before one program with fn main.
+note One creator admits, assigns, collects and reviews jobs. Workers never
+note write each other's state, and no step waits for every worker.
+note Scheduling page: one 128-byte cell per worker w at 128*w.
+note Creator writes 0 assigned seq, 8 job id, 16 input epoch, 24 input
+note version, 32 interest topics, 40 wake stamp (monons at the last post).
+note Worker writes 64 done seq, 72 outcome, 80 wakes, 88 last wake latency
+note ns, 96 largest wake latency ns.
+note Outbox: worker w's result bytes at 4096*w of a second mapping, written
+note before its done seq. Each word has one writer; the creator writes a
+note worker word only after it has reaped that worker.
+note Job states: 0 free, 1 waiting for deps, 2 ready, 3 running, 4 in review,
+note 6 UNKNOWN (its worker died mid-job and the job is not safe to rerun).
+const SJCAP ulong 64
+global scmap long 2
+global sclim ulong 2
+global sjst ulong 64
+global sjdep ulong 64
+global sjid ulong 64
+global sjw ulong 64
+global sjatt ulong 64
+global sjfl ulong 64
+global sjout ulong 64
+global scbusy ulong 64
+global scseq ulong 64
+global swcur ulong 2
+
+fn sc_cell w ulong off ulong to ulong
+ret mapget get scmap 0 add mul w 128 off 8
+end
+
+fn sc_set w ulong off ulong v ulong to void
+r = mapset get scmap 0 add mul w 128 off 8 v
+end
+
+note Creator, before any fork: map the scheduling page and the outboxes and
+note set the limits on admitted (a) and in-review (rl) jobs, each 1..64.
+note Returns 0, -6 not creator, -7 bad limit, or a mapping errno.
+fn sched_new c long a ulong rl ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if or eq a 0 gt a SJCAP
+ret neg long 7
+end
+if or eq rl 0 gt rl SJCAP
+ret neg long 7
+end
+s = mapnew neg int 1 0 8192 3 33
+if le s 0
+ret s
+end
+o = mapnew neg int 1 0 262144 3 33
+if le o 0
+r = mapdrop s
+ret o
+end
+put scmap 0 s
+put scmap 1 o
+put sclim 0 a
+put sclim 1 rl
+for j ulong 64
+put sjst j 0
+put scbusy j 0
+put scseq j 0
+end
+ret 0
+end
+
+note Creator: drop this process's scheduling mappings.
+fn sched_free to long
+r = mapdrop get scmap 1
+if lt r 0
+ret r
+end
+ret mapdrop get scmap 0
+end
+
+note Jobs whose state is in lo..hi.
+fn sched_count lo ulong hi ulong to ulong
+n = ulong 0
+for j ulong 64
+s = get sjst j
+if and ge s lo le s hi
+n = add n 1
+end
+end
+ret n
+end
+
+note Creator: admit job id. deps 0 makes it ready at once; otherwise it waits
+note for a publication whose topics meet deps. flags bit 0: safe to rerun
+note after its worker dies. Returns the job slot, or -2 when admitted work
+note (waiting, ready, running) is at its limit: refused, not queued.
+fn sched_admit id ulong deps ulong flags ulong to long
+if ge sched_count 1 3 get sclim 0
+ret neg long 2
+end
+for j ulong 64
+if eq get sjst j 0
+put sjid j id
+put sjdep j deps
+put sjfl j flags
+put sjatt j 0
+put sjout j 0
+put sjw j 0
+if eq deps 0
+put sjst j 2
+else
+put sjst j 1
+end
+ret long j
+end
+end
+ret neg long 2
+end
+
+note Creator: worker w is woken by publications whose topics meet topics.
+fn sched_want w ulong topics ulong to long
+if ge w 64
+ret neg long 7
+end
+sc_set w 32 topics
+ret 0
+end
+
+fn sc_wake w ulong to void
+sc_set w 40 ulong monons
+r = sup_wake w
+end
+
+note Creator: give ready jobs to idle live workers, lowest slot first. A
+note worker is idle when the creator has collected its last assignment.
+note The job id and the input epoch and version are written before the seq.
+note Returns the number assigned.
+fn sched_dispatch c long to ulong
+n = mapget c 48 8
+k = ulong 0
+for j ulong 64
+if eq get sjst j 2
+for w ulong n bound 64
+if and gt get swpid w 0 eq get scbusy w 0
+q = add get scseq w 1
+put scseq w q
+put scbusy w add j 1
+put sjst j 3
+put sjw j w
+put sjatt j add get sjatt j 1
+sc_set w 8 get sjid j
+sc_set w 16 pool_epoch c
+sc_set w 24 node_count pool_current c
+sc_set w 0 q
+sc_wake w
+k = add k 1
+break
+end
+end
+end
+end
+ret k
+end
+
+note Creator: move finished jobs into review while review has room. A worker
+note whose result is waiting for room keeps it and gets no new job, so a
+note full review queue stops assignment instead of dropping work.
+fn sched_collect c long to ulong
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+b = get scbusy w
+if gt b 0
+if eq sc_cell w 64 get scseq w
+if ge sched_count 4 4 get sclim 1
+ret k
+end
+j = sub b 1
+put sjst j 4
+put sjout j sc_cell w 72
+put scbusy w 0
+k = add k 1
+end
+end
+end
+ret k
+end
+
+note Creator, after worker w was reaped: retire its unfinished assignment.
+note A rerunnable job is ready again; any other becomes UNKNOWN (6), since
+note it may have had effects. A finished result is left for sched_collect.
+note Returns 1 when an assignment was retired, 0 when none, -16 still live.
+fn sched_lost c long w ulong to long
+if ge w 64
+ret neg long 7
+end
+if gt get swpid w 0
+ret neg long 16
+end
+b = get scbusy w
+if eq b 0
+ret 0
+end
+if eq sc_cell w 64 get scseq w
+ret 0
+end
+j = sub b 1
+sc_set w 64 get scseq w
+put scbusy w 0
+if ne and get sjfl j 1 0
+put sjst j 2
+else
+put sjst j 6
+end
+ret 1
+end
+
+note Creator loop step: wait up to interval ns for an ack or a death, take
+note acks, retire the jobs of reaped workers, collect, then dispatch.
+note Returns the number of workers reaped, or a negative errno.
+fn sched_step c long interval long to long
+d = sup_poll c interval
+if lt d 0
+ret d
+end
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+r = sup_take get swack w
+else
+r = sched_lost c w
+end
+end
+k = sched_collect c
+k = sched_dispatch c
+ret d
+end
+
+note Creator: publish an artifact, make waiting jobs whose deps meet topics
+note ready, wake each live worker whose interest meets topics, dispatch.
+note Returns the version, or the publish refusal with nothing woken.
+fn sched_publish c long topics ulong src view uchar 4096 n ulong to long
+v = pool_publish c topics src n
+if le v 0
+ret v
+end
+for j ulong 64
+if eq get sjst j 1
+if ne and get sjdep j topics 0
+put sjst j 2
+end
+end
+end
+m = mapget c 48 8
+for w ulong m bound 64
+if gt get swpid w 0
+if ne and sc_cell w 32 topics 0
+sc_wake w
+end
+end
+end
+k = sched_dispatch c
+ret v
+end
+
+note Creator: accept the result of job j in review and free its slot.
+note Returns its outcome, or -3 when j is not in review.
+fn sched_review j ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 4
+ret neg long 3
+end
+put sjst j 0
+ret long get sjout j
+end
+
+note Creator: free an UNKNOWN job once its outcome has been settled
+note elsewhere. Returns 0, or -3 when j is not UNKNOWN.
+fn sched_settle j ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 6
+ret neg long 3
+end
+put sjst j 0
+ret 0
+end
+
+note Creator: stop every worker within interval ns (sup_stop), retire the
+note assignments of the reaped workers, collect finished results.
+note Returns how many workers had to be killed, or a refusal.
+fn sched_stop c long interval long to long
+k = sup_stop c interval
+if lt k 0
+ret k
+end
+n = mapget c 48 8
+for w ulong n bound 64
+r = sched_lost c w
+end
+m = sched_collect c
+ret k
+end
+
+note Worker w: the assignment seq when a job is waiting, else 0. Job id,
+note input epoch and input version are words 8, 16 and 24 of its cell.
+fn sched_wjob w ulong to ulong
+q = sc_cell w 0
+if gt q sc_cell w 64
+ret q
+end
+ret 0
+end
+
+note Worker w: finish assignment q with outcome and the first n (at most
+note 4096) bytes of src. Bytes and outcome are written before the done seq;
+note then the creator gets an ack. 0, -7 bad n, or the ack refusal.
+fn sched_wdone w ulong q ulong outcome ulong src view uchar 4096 n ulong to long
+if gt n 4096
+ret neg long 7
+end
+if gt n 0
+r = mapwrite get scmap 1 mul w 4096 src 0 n
+end
+sc_set w 72 outcome
+sc_set w 64 q
+ret sup_ack w
+end
+
+note Creator: copy worker w's last result bytes into dst.
+fn sched_result w ulong dst edit uchar 4096 to long
+ret mapread get scmap 1 mul w 4096 dst 0 4096
+end
+
+note Worker w: sup_wwait that records its wakes and wake latency.
+fn sched_wwait c long w ulong interval long to long
+r = sup_wwait c w interval
+if eq r 1
+now = ulong monons
+st = sc_cell w 40
+lat = ulong 0
+if gt now st
+lat = sub now st
+end
+sc_set w 80 add sc_cell w 80 1
+sc_set w 88 lat
+if gt lat sc_cell w 96
+sc_set w 96 lat
+end
+end
+ret r
+end
+
+note Worker w: count the versions of the current epoch that meet its
+note interest and are newer than its cursor, moving the cursor past them.
+note A new epoch restarts the cursor at 0. A worker with no interest scans
+note nothing. Returns the count or a refusal.
+fn sched_wscan c long w ulong to long
+t = sc_cell w 32
+if eq t 0
+ret 0
+end
+h = pool_acquire c w
+if le h 0
+ret h
+end
+e = mapget c add 256 mul w 8 8
+if ne get swcur 0 e
+put swcur 0 e
+put swcur 1 0
+end
+k = long 0
+for i ulong 65
+v = node_next h get swcur 1 t
+if lt v 0
+r = pool_release c w
+ret v
+end
+if eq v 0
+break
+end
+put swcur 1 ulong v
+k = add k 1
+end
+r = pool_release c w
+ret k
+end
+note Concatenate after transport.om, pool.om, super.om and sched.om. CPU-only
+note acceptance of DRA-287 with real forked workers: irrelevant changes,
+note coalesced hints, no lost wake-up, no barrier behind a slow worker, full
+note admission and review queues, dead workers, stop under load, idle CPU and
+note wake latency. No GPU, model or network.
+text sok "PASS node sched\n"
+text sidle "idle ticks workers="
+text screat " creator="
+text swake " wake rounds="
+text smean " mean_us="
+text smax " max_us="
+text snl "\n"
+text sproc "/proc/"
+text sstat "/stat"
+global stc long 1
+global stm long 1
+
+fn st_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn st_num v ulong to void
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 d k sub 20 k
+end
+
+note Write "/proc/<pid>/stat" into p; returns its length.
+fn st_path pid ulong p edit uchar 64 to ulong
+d = new uchar 20 0
+for i ulong 6
+put p i get sproc i
+end
+x = pid
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+n = ulong 6
+for i ulong sub 20 k bound 20
+put p n get d add k i
+n = add n 1
+end
+for i ulong 5
+put p n get sstat i
+n = add n 1
+end
+ret n
+end
+
+note Sum of fields 14 and 15 (utime, stime) of a /proc stat line of got bytes.
+fn st_parse b view uchar 1024 got ulong to ulong
+rp = ulong 0
+for i ulong got bound 1023
+if eq get b i 41
+rp = i
+end
+end
+field = ulong 2
+t = ulong 0
+v = ulong 0
+for i ulong sub got rp bound 1023
+c = get b add rp i
+if eq c 32
+if or eq field 14 eq field 15
+t = add t v
+end
+field = add field 1
+v = 0
+else
+if and ge c 48 le c 57
+v = add mul v 10 sub ulong c 48
+end
+end
+end
+ret t
+end
+
+note utime + stime of process pid in clock ticks, from /proc/pid/stat.
+fn st_ticks pid ulong to ulong
+p = new uchar 64 0
+b = new uchar 1024 0
+n = st_path pid p
+fd = fopen p 0 n 524288 0
+if lt fd 0
+exit 150
+end
+got = read int fd b 0 1023
+r = fclose int fd
+if le got 0
+exit 151
+end
+ret st_parse b ulong got
+end
+
+note Worker: run the job of assignment q cooperatively for the number of
+note milliseconds in the low four decimal digits of its id, then report
+note outcome id+1 and 64 bytes of the id's low byte. 0 done, 2 stopped,
+note 3 creator gone, 4 wait error, 5 report refused.
+fn st_run c long w ulong q ulong to int
+buf = new uchar 4096 0
+id = sc_cell w 8
+dl = add ulong monons mul rem id 10000 1000000
+for t ulong 1000000
+now = ulong monons
+if ge now dl
+break
+end
+r = sched_wwait c w long sub dl now
+if eq r 2
+ret 2
+end
+if eq r 3
+ret 3
+end
+if lt r 0
+ret 4
+end
+end
+for j ulong 64
+put buf j uchar and id 255
+end
+if ne sched_wdone w q add id 1 buf 64 0
+ret 5
+end
+ret 0
+end
+
+note Worker loop: run an assigned job, else scan the subscribed versions,
+note record how many it has seen, and wait without a deadline. A worker with
+note its lazy flag set sleeps 300 ms before each wait, so hints pile up.
+fn st_worker w ulong to int
+c = get stc 0
+m = get stm 0
+seen = ulong 0
+for it ulong 1000000000
+q = sched_wjob w
+if gt q 0
+r = st_run c w q
+if eq r 2
+ret 0
+end
+if ne r 0
+ret add 60 r
+end
+continue
+end
+k = sched_wscan c w
+if eq k neg long 1
+ret 0
+end
+if lt k 0
+ret 59
+end
+seen = add seen ulong k
+r = mapset m add 64 mul w 8 8 seen
+if ne mapget m add 600 mul w 8 8 0
+r = sleepns 300000000
+end
+r = sched_wwait c w neg long 1
+if eq r 2
+ret 0
+end
+if eq r 3
+ret 41
+end
+if lt r 0
+ret 43
+end
+end
+ret 45
+end
+
+fn st_spawn c long w ulong to bool
+p = sup_spawn c w
+if eq p 0
+exit st_worker w
+end
+ret gt p 0
+end
+
+note Fresh pool of 4 arenas for w workers with limits a and rl, plus the test
+note page. Exits with code on any refusal.
+fn st_setup w ulong a ulong rl ulong code int to long
+c = pool_new 4 w
+st_ok gt c 0 code
+put stc 0 c
+m = mapnew neg int 1 0 4096 3 33
+st_ok gt m 0 code
+put stm 0 m
+st_ok eq sup_init c 0 code
+st_ok eq sched_new c a rl 0 code
+ret c
+end
+
+fn st_down c long code int to void
+st_ok ge sched_stop c 2000000000 0 code
+sup_closeall
+st_ok eq sched_free 0 code
+st_ok eq pool_free c 0 code
+st_ok eq mapdrop get stm 0 0 code
+end
+
+note Step the creator until at least n jobs are in state st, up to ms.
+fn st_until c long st ulong n ulong ms ulong to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+if ge sched_count st st n
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+r = sched_step c 10000000
+end
+ret false
+end
+
+note Wait up to ms for worker w's seen count to reach n.
+fn st_seen w ulong n ulong ms ulong to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+if ge mapget get stm 0 add 64 mul w 8 8 n
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+r = sleepns 1000000
+end
+ret false
+end
+
+note Phase A: interests w0 topic 1, w1 topic 2, w2 topic 1 and lazy. Topic 4
+note publications wake nobody. One topic 1 publication wakes w2; the next 29
+note land while it sleeps and reach it in exactly one more wake. w0 sees all
+note 30, w1 is never woken.
+fn st_hints to void
+buf = new uchar 4096 0
+c = st_setup 3 8 8 10
+m = get stm 0
+st_ok eq sched_want 0 1 0 11
+st_ok eq sched_want 1 2 0 12
+st_ok eq sched_want 2 1 0 13
+r = mapset m 616 8 1
+for w ulong 3
+st_ok st_spawn c w 14
+end
+r = sleepns 100000000
+for i ulong 20
+st_ok gt sched_publish c 4 buf 16 0 15
+end
+r = sleepns 500000000
+for w ulong 3
+st_ok eq sc_cell w 80 0 16
+st_ok eq mapget m add 64 mul w 8 8 0 17
+end
+st_ok gt sched_publish c 1 buf 16 0 18
+st_ok st_seen 2 1 3000 19
+for i ulong 29
+st_ok gt sched_publish c 1 buf 16 0 29
+end
+st_ok st_seen 0 30 3000 44
+st_ok st_seen 2 30 3000 20
+r = sleepns 400000000
+st_ok eq mapget m 64 8 30 21
+st_ok eq mapget m 80 8 30 22
+st_ok eq mapget m 72 8 0 23
+st_ok eq sc_cell 1 80 0 24
+st_ok eq sc_cell 2 80 2 25
+st_ok ge sc_cell 0 80 1 26
+st_ok le sc_cell 0 80 30 27
+st_down c 28
+end
+
+fn st_admit id ulong deps ulong fl ulong code int to ulong
+j = sched_admit id deps fl
+st_ok ge j 0 code
+ret ulong j
+end
+
+note Phase B: one slow job and six fast ones on three workers. The fast jobs
+note finish and are reviewed while the slow one still runs (no barrier).
+fn st_nobar to void
+buf = new uchar 4096 0
+c = st_setup 3 8 8 30
+for w ulong 3
+st_ok st_spawn c w 31
+end
+s = st_admit 11500 0 0 32
+for i ulong 6
+j = st_admit add mul add i 2 10000 20 0 0 33
+end
+st_ok st_until c 4 6 5000 34
+st_ok eq get sjst s 3 35
+for j ulong 64
+if and eq get sjst j 4 ne j s
+st_ok eq sched_review j long add get sjid j 1 36
+end
+end
+st_ok eq sched_count 1 4 1 37
+st_ok st_until c 4 1 5000 38
+w = get sjw s
+st_ok eq sched_review s 11501 39
+st_ok eq sched_result w buf 4096 40
+st_ok eq get buf 63 236 41
+st_ok eq sched_count 1 6 0 42
+st_down c 43
+end
+
+note Phase C: admission refuses past 8 and review holds at 2. Workers keep
+note finished results instead of taking more work; reviewing drains it all.
+fn st_full to void
+c = st_setup 3 8 2 45
+for w ulong 3
+st_ok st_spawn c w 46
+end
+for i ulong 8
+j = st_admit add mul add i 1 10000 20 0 0 47
+end
+st_ok eq sched_admit 99020 0 0 neg long 2 48
+st_ok st_until c 4 2 5000 49
+r = sleepns 300000000
+for t ulong 20
+r = sched_step c 10000000
+end
+st_ok eq sched_count 4 4 2 50
+st_ok eq sched_count 3 3 3 51
+st_ok eq sched_count 2 2 3 52
+for w ulong 3
+st_ok eq sc_cell w 64 get scseq w 53
+end
+note Jobs in review no longer count as admitted: 3 held results + 3 ready.
+st_ok eq sched_count 1 3 6 54
+n = ulong 0
+for t ulong 400
+for j ulong 64
+if eq get sjst j 4
+st_ok eq sched_review j long add get sjid j 1 55
+n = add n 1
+end
+end
+if eq n 8
+break
+end
+r = sched_step c 10000000
+end
+st_ok eq n 8 56
+st_ok ge sched_admit 99020 0 0 0 57
+st_down c 58
+end
+
+note Phase D: a job that waits on topic 8 starts only after a topic 8
+note publication; topic 16 does not start it.
+fn st_deps to void
+buf = new uchar 4096 0
+c = st_setup 2 8 8 65
+for w ulong 2
+st_ok st_spawn c w 66
+end
+j = st_admit 10020 8 0 67
+st_ok eq get sjst j 1 68
+st_ok gt sched_publish c 16 buf 16 0 69
+st_ok not st_until c 4 1 300 70
+st_ok eq get sjst j 1 71
+st_ok gt sched_publish c 8 buf 16 0 72
+st_ok st_until c 4 1 3000 73
+st_ok eq sched_review j 10021 74
+st_down c 75
+end
+
+note Phase E: kill two workers mid-job. The rerunnable job runs again on the
+note third worker; the other becomes UNKNOWN and is never run again.
+note Respawned workers find their old assignment retired.
+fn st_dead to void
+c = st_setup 3 8 8 76
+for w ulong 3
+st_ok st_spawn c w 77
+end
+x = st_admit 11500 0 0 78
+y = st_admit 21500 0 1 79
+st_ok st_until c 3 2 2000 80
+wx = get sjw x
+wy = get sjw y
+st_ok eq killpid int get swpid wx 9 0 81
+st_ok eq killpid int get swpid wy 9 0 82
+st_ok st_until c 6 1 3000 83
+st_ok eq get sjatt x 1 84
+st_ok st_until c 4 1 5000 85
+st_ok eq get sjatt y 2 86
+st_ok eq sched_review y 21501 87
+st_ok eq get sjst x 6 88
+st_ok eq sched_review x neg long 3 89
+st_ok st_spawn c wx 90
+st_ok st_spawn c wy 91
+st_ok eq sc_cell wx 64 get scseq wx 92
+st_ok eq sc_cell wy 64 get scseq wy 93
+for t ulong 30
+r = sched_step c 10000000
+end
+st_ok eq get sjst x 6 94
+st_ok eq sched_settle x 0 95
+st_ok eq sched_count 1 6 0 96
+st_down c 97
+end
+
+note Phase F: stop with eight long jobs admitted and three running. Every
+note worker leaves cooperatively well inside the deadline; the three running
+note jobs become UNKNOWN; the five never started stay ready.
+fn st_stop to void
+c = st_setup 3 8 8 115
+for w ulong 3
+st_ok st_spawn c w 116
+end
+for i ulong 8
+j = st_admit add mul add i 1 10000 5000 0 0 117
+end
+st_ok st_until c 3 3 2000 118
+t0 = ulong monons
+st_ok eq sched_stop c 2000000000 0 119
+st_ok lt sub ulong monons t0 1000000000 120
+st_ok eq sup_live c 0 121
+st_ok eq sched_count 6 6 3 122
+st_ok eq sched_count 2 2 5 123
+for w ulong 3
+st_ok eq get swst w 0 124
+end
+sup_closeall
+st_ok eq sched_free 0 125
+st_ok eq pool_free c 0 126
+st_ok eq mapdrop get stm 0 0 127
+end
+
+note CPU ticks used by both workers (word 1000) and the creator (1008) of the
+note test page while the creator waits 2 s with nothing to do.
+fn st_idlecpu c long to void
+m = get stm 0
+p0 = ulong get swpid 0
+p1 = ulong get swpid 1
+me = ulong getpid
+a0 = add st_ticks p0 st_ticks p1
+a1 = st_ticks me
+r = sched_step c 2000000000
+b0 = add st_ticks p0 st_ticks p1
+b1 = st_ticks me
+r = mapset m 1000 8 sub b0 a0
+r = mapset m 1008 8 sub b1 a1
+end
+
+note 200 rounds of one topic 1 publication, each seen by both workers before
+note the next. Returns the sum of the per-round wake latencies in ns.
+fn st_rounds c long to ulong
+buf = new uchar 4096 0
+sum = ulong 0
+for i ulong 200
+st_ok gt sched_publish c 1 buf 16 0 134
+for w ulong 2
+st_ok st_seen w add i 1 2000 135
+sum = add sum sc_cell w 88
+end
+end
+ret sum
+end
+
+note Phase G: two idle workers block while the creator idles 2 s; then 200
+note publication rounds wake each worker exactly once per round (no lost and
+note no extra wake-ups).
+fn st_idle to void
+c = st_setup 2 8 8 130
+m = get stm 0
+st_ok eq sched_want 0 1 0 131
+st_ok eq sched_want 1 1 0 132
+for w ulong 2
+st_ok st_spawn c w 133
+end
+r = sleepns 200000000
+st_idlecpu c
+st_ok le mapget m 1000 8 2 138
+st_ok le mapget m 1008 8 2 139
+sum = st_rounds c
+st_ok eq sc_cell 0 80 200 136
+st_ok eq sc_cell 1 80 200 137
+r = write 1 sidle 0 len sidle
+st_num mapget m 1000 8
+r = write 1 screat 0 len screat
+st_num mapget m 1008 8
+r = write 1 swake 0 len swake
+st_num 200
+r = write 1 smean 0 len smean
+st_num div sum 400000
+r = write 1 smax 0 len smax
+mx = sc_cell 0 96
+if gt sc_cell 1 96 mx
+mx = sc_cell 1 96
+end
+st_num div mx 1000
+r = write 1 snl 0 1
+st_down c 140
+end
+
+fn st_isarg to bool
+a = new uchar 16 0
+if ne argcnt 2
+ret false
+end
+ret eq argread 1 a 0 16 4
+end
+
+note With one 4-byte argument ("idle"), run only phase G.
+fn main to int
+if st_isarg
+st_idle
+ret 0
+end
+st_hints
+st_nobar
+st_full
+st_deps
+st_dead
+st_stop
+st_idle
+if ne write 1 sok 0 len sok long len sok
+ret 100
+end
+ret 0
+end

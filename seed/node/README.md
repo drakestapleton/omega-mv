@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport, epoch pool and worker supervision
+# Omega Node shared-memory transport, epoch pool, worker supervision and scheduling
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -6,17 +6,18 @@ processes. Runtime consumers can share artifact storage and wake only interested
 workers. The existing `seed/agent/agent.om` is the coding-agent consumer to evaluate
 for integration; this change does not replace its model or tool dispatcher.
 
-Three source fragments, concatenated in this order before one program with `fn main`:
+Four source fragments, concatenated in this order before one program with `fn main`:
 
 | Fragment | Adds |
 | --- | --- |
 | `transport.om` | one arena: 64 immutable records, topic scan, eventfd hints, stop flag (#1055) |
 | `pool.om` | K arenas reused by epoch, reader holds, fail-closed rollover (DRA-286) |
 | `super.om` | forked workers, death detection, reaping, creator-loss detection, bounded stop (DRA-286) |
+| `sched.om` | subscriptions, dependency wake-ups, bounded admission and review, job loss handling (DRA-287) |
 
-The component is not yet connected to the live hive. Persistent recovery,
-authority integration, a dashboard and a real model-backed coding workflow remain
-implementation work (DRA-287 to DRA-292). The
+The component is not yet connected to the live hive. Authority integration,
+persistent recovery, a dashboard and a real model-backed coding workflow remain
+implementation work (DRA-288 to DRA-292). The
 [Linear project](https://linear.app/drake-stapleton/project/omega-node-shared-memory-hive-runtime-37058a1eac4b)
 tracks that integration. This is a component contract, not a whole-system master plan.
 
@@ -269,3 +270,88 @@ in the losing order (`pool_hold` after `pool_roll` and `pool_pick`). The same
 mutant under the timing-dependent `stress` phase exited 0 in 5 of 5 probes:
 the window needs two rolls inside one announce, so stress alone does not prove
 the recheck.
+
+## Cooperative scheduling (DRA-287)
+
+Status: IMPLEMENTED in `sched.om`, exercised by `sched-gate.om` and the
+controls below on native Linux AArch64. Evidence is in the DRA-287 pull request.
+
+```sh
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/node/sched-test.om > build/node/sched-composed.om
+cmp build/node/sched-composed.om seed/node/sched-gate.om
+seed/out/omc < seed/node/sched-gate.om > build/node/sched-gate
+chmod +x build/node/sched-gate
+timeout 120 build/node/sched-gate        # all phases; prints idle and wake figures, ends "PASS node sched"
+timeout 60 build/node/sched-gate idle    # the idle and wake phase only
+```
+
+### Model
+
+One creator owns admission, assignment, collection and review. Workers write
+only their own cell. No step waits for every worker, so a slow or dead worker
+holds only its own job.
+
+A job moves through these states: 1 waiting for a dependency topic, 2 ready,
+3 running on one worker, 4 in review, then free. A job can also become 6
+UNKNOWN: its worker died mid-job and the job is not marked safe to rerun.
+Admitted work (states 1 to 3) and work in review (4) have separate limits.
+`sched_admit` refuses with -2 at the admission limit; nothing is queued behind
+the refusal. When review is full, a finished worker keeps its result and gets
+no new job, so assignment stops instead of dropping work.
+
+Scheduling page cell of worker w (128 bytes at 128w). Creator words: 0 assigned
+seq, 8 job id, 16 input epoch, 24 input version (`node_count`), 32 interest
+topics, 40 wake stamp. Worker words: 64 done seq, 72 outcome, 80 wakes,
+88 last wake latency, 96 largest wake latency. Result bytes go in a
+4096-byte outbox per worker. The worker writes them and the outcome before its
+done seq. The creator writes a worker word (done seq) only after reaping that
+worker, to retire its assignment.
+
+Wake-ups are hints. The creator publishes or assigns first and posts the wake
+second. The worker's wait drains the hint, then the worker re-reads its cell
+and rescans before it waits again. A post that lands after the drain leaves the
+eventfd readable, so the next wait returns at once: no wake-up is lost, and
+several posts coalesce into one wake.
+
+| Function | Contract |
+| --- | --- |
+| `sched_new c a rl` | Creator, before fork: map the scheduling page and outboxes; admission limit a and review limit rl, each 1..64. |
+| `sched_admit id deps flags` | Slot, or -2 at the admission limit. deps 0: ready now; otherwise waiting for a publication whose topics meet deps. flags bit 0: safe to rerun after worker death. |
+| `sched_want w topics` | Creator: publications meeting `topics` wake worker w. |
+| `sched_publish c topics src n` | `pool_publish`, then waiting jobs whose deps meet topics become ready, subscribed live workers are woken, and ready jobs are dispatched. |
+| `sched_step c interval` | Creator loop: wait for an ack or death, take acks, retire reaped workers' jobs (`sched_lost`), collect, dispatch. |
+| `sched_dispatch c`, `sched_collect c` | Assign ready jobs to idle live workers; move finished results into review while there is room. |
+| `sched_lost c w` | After a reap: a rerunnable job is ready again (attempt + 1); any other job becomes UNKNOWN and is never run again. A finished result is still collected. |
+| `sched_review j`, `sched_settle j` | Accept a reviewed result (returns its outcome) or release an UNKNOWN job whose outcome was settled elsewhere. DRA-288 replaces this with the authority commit. |
+| `sched_stop c interval` | `sup_stop`, then retire every reaped worker's job. |
+| `sched_wjob w`, `sched_wdone w q outcome src n`, `sched_wwait c w interval`, `sched_wscan c w` | Worker side: the pending assignment, the finish report (result, then outcome, then done seq, then ack), a wait that records wake latency, and a scan of subscribed versions in the held epoch. |
+
+A worker's scan cursor follows the current epoch. If an epoch it never held is
+reclaimed, the worker never receives the versions published in it. Consumers
+that need every version must be assigned work rather than relying on
+subscriptions alone.
+
+### Acceptance and controls
+
+The gate covers the following phases:
+- Irrelevant topics wake nobody.
+- 30 relevant publications reach two subscribers in full; a lazy subscriber needs exactly 2 wakes.
+- Six fast jobs finish and are reviewed while a slow job still runs.
+- Admission refuses the 9th job and review holds at 2.
+- A dependency topic starts a waiting job and another topic does not.
+- Two workers are killed mid-job. The rerunnable job runs again elsewhere (attempt 2); the other becomes UNKNOWN.
+- Stop under load: 8 admitted and 3 running jobs; everything finishes in under 1 s with 3 UNKNOWN and 5 still ready.
+- Idle CPU and wake-ups:
+  - Two idle workers and the creator use at most 2 clock ticks while the creator waits 2 s.
+  - In 200 publication rounds, each worker wakes exactly once per round.
+
+| Change | Expected exit |
+| --- | --- |
+| `sched.om`: `if ne and sc_cell w 32 topics 0` to `if true` (interest ignored) | 16 |
+| `sched.om`: delete the `sc_wake w` after `sc_set w 0 q` (no wake on assignment) | 34 |
+| `sched.om`: `if ge sched_count 4 4 get sclim 1` to `if false` (review unbounded) | 50 |
+| `sched.om`: `if ge sched_count 1 3 get sclim 0` to `if false` (admission unbounded) | 48 |
+| `sched.om`: `put sjst j 6` to `put sjst j 2` (UNKNOWN job rerun) | 83 |
+| `sched.om`: delete `sc_set w 64 get scseq w` (dead worker's assignment not retired) | 92 |
+| `sched.om`: `put sjst j 1` to `put sjst j 2` (dependencies ignored) | 68 |
+| `super.om`: `iv = interval` to `iv = 0`, run with `idle` (workers spin) | 138 |
