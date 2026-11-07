@@ -606,7 +606,7 @@ L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.o
 { printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/drv-test.om; } | seed/out/omc > build/node/drv-test
 chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test build/node/tool-replay build/node/drv-test
 build/node/code-test unit build/node/cu   # "code checks=57 fail=0", exit 0
-build/node/drv-test /tmp/dvt   # "DRV-TEST pass=37 fail=0 not_run=0", exit 0
+build/node/drv-test /tmp/dvt   # "DRV-TEST pass=40 fail=0 not_run=0", exit 0
 build/node/tool-replay build/node/tool OMC40 ROUND40 build/node/replay   # "TOOL-REPLAY runs=108 pass=108 fail=0 actions=417", exit 0
 ```
 
@@ -646,7 +646,7 @@ empty, `.`, `..` or holds `/`. The file header lists its buffer limits.
 | bytes | `dv_eq`, `dv_at`, `dv_find`, `dv_atou` (`dvnone` = not a number) |
 | arguments | `dv_argc`, `dv_arg I BUF` (length, -22 no such argument, -105 buffer too short) |
 | files | `dv_slurp` (-27 does not fit), `dv_spit`, `dv_apnd`, `dv_isdir`, `dv_mkdirp`, `dv_rmrf` (no symbolic link followed), `dv_join` and `dv_dirn` (`os.path.join`, `os.path.dirname`) |
-| processes | `dv_pkinit`, `dv_pkadd` build a packed argv; `dv_spawn PK OUT ERR` runs it in its own process group (exit 126 files, 127 exec), `dv_spawna PK OUT` the same with both streams appended to OUT, `dv_exec` their child side; `dv_poll`, `dv_reap`, `dv_wait PID DEADLINE` (-110 after killing the group), `dv_kill`, `dv_killg`; status is the exit code or 256 + signal |
+| processes | `dv_pkinit`, `dv_pkadd` build a packed argv; `dv_spawn PK OUT ERR` runs it in its own process group (exit 126 files, 127 exec; when OUT and ERR name the same file both streams share one descriptor), `dv_spawna PK OUT` the same with both streams appended to OUT, `dv_spawnio PK IN OUT ERR` with three descriptors the caller already opened (126 for a negative or failed one), `dv_exec` the child side of the first two; `dv_poll`, `dv_reap`, `dv_wait PID DEADLINE` (-110 after killing the group), `dv_kill`, `dv_killg`; status is the exit code or 256 + signal |
 | ports | `dv_port`: a free 127.0.0.1 port, never 18091 or 18300 |
 | JSON | `dv_jload` (file to tape), `dv_jkey` (the last duplicate wins), `dv_jidx`, `dv_jlen`, `dv_jisl`, `dv_jnum`, `dv_jstr` (UTF-8, surrogate pairs joined), `dv_jsteq` |
 
@@ -655,7 +655,9 @@ empty, `.`, `..` or holds `/`. The file header lists its buffer limits.
 exits 1 on any failure, 2 for bad usage. A `drv.om` whose `dv_dirn` keeps a
 repeated separator and whose status drops the 256 for a signal gives `FAIL
 drv.dirn`, `FAIL drv.kill-reap` and exit 1; one whose `dv_spawna` opens OUT
-without append gives `FAIL drv.spawn-append`.
+without append gives `FAIL drv.spawn-append`; one whose `dv_spawn` opens ERR
+again when it names OUT's file (`if not dv_eq fo fe` made `if true`) gives
+`FAIL drv.spawn-shared` (`DRV-TEST pass=39 fail=1`).
 
 `tests/nodedrv.om` (prefix `nd`, composed after `drv.om`) holds what the
 DRA-291 drivers share: the fixture (`nd_prep`: broken files, objective lines,
