@@ -26,7 +26,7 @@ static globals only.
 | id | rule |
 |---|---|
 | B1 | `while` needs `bound N`. A `for` count must be a literal, a `const`, `len X` of a declared array, or carry `bound N`. N must be at most 8192. |
-| B2 | Recursion is admitted only in qualified form. Every function on a cycle takes `depth` as its first parameter, never assigns it and has no `new`. Each in-cycle call passes `depth` unchanged, or passes `NAME` after the canonical guard `NAME = add depth 1` / `if gt NAME LIM` (LIM at most 64) / an optional line / `ret`, `exit` or `trap` / `end`, with no reassignment of NAME before the call. An entry from outside the cycle passes a literal or a `const` of at most 64. The omc/DRA-311 leaf-removal analysis then runs over the remaining edges, and any surviving node is refused. |
+| B2 | Recursion is admitted only in qualified form. Every function on a cycle takes `depth` as its first parameter, never assigns it and has no `new`. Each in-cycle call passes `depth` unchanged, or passes `NAME` after the canonical guard `NAME = add depth 1` / `if gt NAME LIM` (LIM at most 64) / an optional call to a unit function / `ret`, `exit` or `trap` / `end`, with no reassignment of NAME before the call. The stop must close the guard's then-block: an `else` or any other structural line in the guard is refused. The assignment and the call must be in the same block instance. No line between them may leave that block or start its `else` arm; equal nesting depth alone does not count. An entry from outside the cycle passes a literal or a `const` of at most 64. The omc/DRA-311 leaf-removal analysis then runs over the remaining edges, and any surviving node is refused. |
 | B3 | Each `global` and each `new` is at most 65536 elements. All globals together are at most 65536 bytes. The `new` bytes per function, and across the whole unit, are each at most 65536. |
 | E1 | The result of a call or host word assigned to a name must be read on the straight-line continuation before the name is reassigned or the function returns. The exemption is `note p10 allow E1 <reason>` on the line before. |
 | X1 | Host words (the effects table) appear only in functions marked `note p10 effect` on the line before `fn`. |
@@ -67,9 +67,9 @@ such as `seed/omc/tests/recursion/nest.om`.
 
 `sh seed/profile/check.sh` runs these checks:
 
-- `profile.cases` (44 rows): one refusal fixture per rule, pre-fix controls on the real modules, and the capacity and stop rows.
-- `mutants.cases`: one `profile.om` mutant per rule, each killed, with each control passing.
+- `profile.cases` (48 rows): one refusal fixture per rule, pre-fix controls on the real modules, and the capacity and stop rows. It also has three B2 structure fixtures that the checker at `7ae0a1df` wrongly passed: `b2-else` (stop in the else arm), `b2-arm` (guard borrowed from the sibling then-arm) and `b2-sibling` (guard in a separate earlier block). It has one positive nested control, `ok-b2-nested`.
+- `mutants.cases`: one `profile.om` mutant per rule, plus two more for B2 (`b2-else`, `b2-block`) that reintroduce those defects. Each mutant is killed, and each control passes.
 - The authority unit profile.
-- A staleness check for the six authority gates, then compiling and running each of them.
+- A staleness check for the seven authority gates, then compiling and running each of them.
 
 `.github/workflows/om-profile-arm64.yml` runs the checks on pull requests, on pushes to main, and weekly.

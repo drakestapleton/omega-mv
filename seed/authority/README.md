@@ -161,7 +161,7 @@ outside declared effect functions). The fixes add these codes:
 | --- | --- | --- |
 | 43 | `lacq` | more than 1000 tries requested; refused before any attempt (the retry loop is bounded by 1000) |
 | 40 | `ltry` | the owner pid file could not be read (`lerr` set by `lread`: 32 open, 33 close, 34 short read). `lread` used to return 32..34 as the pid itself, so a live owner with pid 32 looked like a read error |
-| 76 | `dispatch` | reconcile (`actrecon`) refused the receipt; the unknown record was written |
+| 76 | `dispatch` | reconcile (`actrecon`) refused the receipt; the current (still in-flight) record is persisted unchanged by the following record write |
 | 77 | `dispatch` | the post-effect record write failed, on the reconcile, lost-generation or normal path (lost-generation and reconcile write errors were dropped before) |
 | 78 | `dispatch` | the lock release failed and no earlier failure is set (post-effect release errors were dropped before) |
 | 79 | `dispatch` | `actlost` refused to mark the record unknown after a generation change (the error was overwritten before) |
