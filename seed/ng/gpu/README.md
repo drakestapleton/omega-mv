@@ -11,7 +11,8 @@ What is here today: the conformance gate of the encoder ng consumes.
 | File | Role |
 |---|---|
 | `encrun.om` | Program-mode harness composed after the pinned encoder: NGBWENC1 frames in, result frames out (format in its header). |
-| `gate.cases` | Case list for `seed/qualification/om2/gate.om`: compiled-bytes pin of the encoder, 4 fixture sets, 3 refusals, 4 mutants. |
+| `pinsum.om` | SHA-256 filter (stdin to 64 hex digits and a newline), composed after the plain-function form of `om/sha256/sha256-om2.om`; the lock-* cases use it. |
+| `gate.cases` | Case list for `seed/qualification/om2/gate.om`: 6 lock pins, compiled-bytes pin of the encoder, 4 fixture sets, 3 refusals, 4 mutants. |
 | `tests/golden.*` | 145 single-instruction encodes of CUDApp's golden fixtures (140 accepted, 5 refused). |
 | `tests/dump.*` | 14 fixture programs of CUDApp's codegen dump. |
 | `tests/slice.*` | 52 frames (every 64th of 3265, plus the last) of CUDApp's sm121dis corpus producers. |
@@ -24,7 +25,14 @@ Run from the repository root, with CUDApp at the lock's commit in `../CUDApp`:
     seed/out/omc < seed/qualification/om2/gate.om > /tmp/gate && chmod +x /tmp/gate
     /tmp/gate seed/out/omc "$(cut -c1-64 seed/out/omc.sha256)" seed/ng/gpu/gate.cases /tmp/ng-gpu-gate
 
-Final line `OM2GATE PASS cases=12 pass=12 ...`.
+Final line `OM2GATE PASS cases=18 pass=18 ...`.
+
+The lock is enforced by the gate: the `lock-*` run cases hash each file ng composes from `../CUDApp` (the five rows
+of `seed/ng/cudapp.lock`) and the lock file itself with `pinsum.om` and compare the digest with the pinned one. A
+different file makes its case FAIL and the gate exit 1, naming the row; a missing file is INVALID (exit 3). A wrong
+file is FAIL rather than INVALID because the shared `seed/qualification/om2/gate.om` has no input-identity case
+kind; adding one is a separate proposal for the OM-2 owner (the gate's binary hash is replayed by historical
+records such as security673/relational). A lock edit needs the matching `lock-*` rows in gate.cases.
 
 ## Fixture provenance
 Inputs were captured from CUDApp's real C builders (`tests/test_omega_codegen_freestanding.c --golden/--dump` and
@@ -37,5 +45,6 @@ outputs: golden and dump are the bytes on which CUDApp's `.om` encoder and its C
 oracle's bytes, which the pinned `.om` encoder reproduces and CUDApp b774723f's (before #373) does not (LDG.E offset defect).
 
 ## Status
-HOST_TESTED (Linux AArch64): 12/12 PASS against the pinned encoder (CUDApp 1988c50e); against CUDApp b774723f's
-encoder (before #373) the pin, slice and ldg cases FAIL, as they must. No GPU involved.
+HOST_TESTED (Linux AArch64, core 1): 18/18 PASS with CUDApp at the lock commit 1988c50e; with CUDApp 1818e9d2 (only
+bw_alloc.om differs) lock-bw_alloc FAILs and the gate exits 1; against CUDApp b774723f's encoder (before #373) the
+pin, slice and ldg cases FAIL as well. No GPU involved.
