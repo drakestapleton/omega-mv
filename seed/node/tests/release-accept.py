@@ -5,11 +5,12 @@ Usage: release-accept.py MODE BUILD OLDBIN OMC ROUND40 OUT [SCENARIO...]
 
 MODE fake: the model is fake-serve answering the recorded round40 turns (any
 host, seconds). MODE live: the own model through `ollm VERB` on 127.0.0.1:PORT,
-started once by release.sh serve; run the whole driver inside a private
+started once by `release serve`; run the whole driver inside a private
 network namespace (bwrap --unshare-net), and with VERB gserve only inside an
 authorized GB10 window. Environment for live: OLLM, VERB (serve|gserve), CK,
 MERGES, PORT (default 18294, never 18091).
-BUILD holds the programs release.sh build makes; OLDBIN the DRA-290 build
+BUILD holds the programs `release build` makes, and `release` itself (compiled
+from seed/node/release.om, README "Release lifecycle"); OLDBIN the DRA-290 build
 (code-main without the operator view) for the journal compatibility checks;
 OMC the compiler whose messages round40's prompts carry; ROUND40 repair.py and
 final-selected.json. Prints one PASS/FAIL/NOT_RUN line per check, MEASURED lines,
@@ -22,7 +23,7 @@ MODE = sys.argv[1]
 BUILD, OLDBIN, OMC, R, OUT = (os.path.abspath(a) for a in sys.argv[2:7])
 ONLY = sys.argv[7:]
 HERE = os.path.dirname(os.path.abspath(__file__))
-RELEASE = os.path.join(os.path.dirname(HERE), 'release.sh')
+RELEASE = os.path.join(BUILD, 'release')
 LIVE = MODE == 'live'
 PORT = int(os.environ.get('PORT', '18294'))
 assert MODE in ('fake', 'live') and PORT != 18091
@@ -67,7 +68,7 @@ def wait_for(f, t, step=0.02):
 
 
 def sh(*a, timeout=1200):
-    p = subprocess.run(['sh', RELEASE, *map(str, a)], capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run([RELEASE, *map(str, a)], capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -372,7 +373,7 @@ def t_full():
         f'rc={rc2} {n2.lines()} new_records={new} model_requests={len(m2.lines())}')
 
 
-# ---- 2. release.sh lifecycle: start, health, stop with work outstanding, restore, finish
+# ---- 2. release lifecycle: start, health, stop with work outstanding, restore, finish
 def t_lifecycle():
     base, objs, ex = prep('lifecycle', ['76666', '83423'])
     m = Model(base, 1500)
@@ -598,8 +599,9 @@ def t_journal():
     old.p.send_signal(signal.SIGKILL)
     old.wait()
     snap = base + '/snapshot'
-    for d in ('root', 'work', 'journal'):
-        shutil.copytree(f'{base}/{d}', f'{snap}/{d}')
+    rc, o = sh('snapshot', base, snap)
+    if rc:
+        raise RuntimeError(o)
     new = Node(base, objs, m.port, tag='forward')
     rcf = new.wait()
     j = journal(base)
@@ -619,9 +621,9 @@ def t_journal():
     res(rcb != 0 and not back.lines() and open(base + '/journal/journal', 'rb').read() == before,
         'journal-rollback-refuses-result', f"old rc={rcb} (30 + 24 unknown record type) unchanged=True")
     # cutover reversal: the state copied before the new build ran, under the old build again
-    for d in ('root', 'work', 'journal'):
-        shutil.rmtree(f'{base}/{d}')
-        shutil.copytree(f'{snap}/{d}', f'{base}/{d}')
+    rc, o = sh('rollback', base, snap)
+    if rc:
+        raise RuntimeError(o)
     back2 = Node(base, objs, m.port, bindir=OLDBIN, view=False, tag='rollback2')
     rcb2 = back2.wait()
     j3 = journal(base)

@@ -848,45 +848,69 @@ scenario first and must pass all of them, else the mutant runs are void.
 
 ## Release lifecycle and durable results (DRA-292)
 
-Status: IMPLEMENTED in `release.sh`, `journal.om` (RESULT records), `code.om`,
-`auth.om` and `op.om`; exercised on native Linux AArch64 by
-`tests/release-accept.py fake`, which answers with the recorded round40 turns
-only. The same driver in `live` mode runs every scenario against the own
-model (aien-train `ollm serve`, or `gserve` on the GB10 inside an authorized
-window); a fake run is host regression, not model qualification. Not
-QUALIFIED and not DEPLOYED.
+Status: IMPLEMENTED in `release.om` (the lifecycle program `release`),
+`journal.om` (RESULT records), `code.om`, `auth.om` and `op.om`; exercised on
+native Linux AArch64 by `tests/release-accept.py fake`, which answers with the
+recorded round40 turns only. The same driver in `live` mode runs every
+scenario against the own model (aien-train `ollm serve`, or `gserve` on the
+GB10 inside an authorized window); a fake run is host regression, not model
+qualification. Not QUALIFIED and not DEPLOYED.
 
 ```sh
-seed/node/release.sh build build/node            # BUILD_OK name bytes sha256, six programs
+# from the checkout root: release compiles itself first, then the six programs
+{ printf 'om2\n'; cat om/tls/sha2.om seed/node/release.om; } | seed/out/omc > build/node/release
+chmod +x build/node/release
+build/node/release build build/node            # BUILD_OK name bytes sha256, six programs
 python3 seed/node/tests/release-accept.py fake $PWD/build/node OLDBIN OMC40 ROUND40 build/node/rel
-OLLM=... VERB=serve CK=... MERGES=... PORT=18294 \
+OLLM=/abs/path/ollm VERB=serve CK=... MERGES=... PORT=18294 \
   python3 seed/node/tests/release-accept.py live $PWD/build/node OLDBIN OMC40 ROUND40 build/node/rel
 ```
+
+The acceptance driver runs `BUILD/release`, so BUILD must hold it.
 
 OLDBIN holds `infer`, `tool` and `code-main` built from the DRA-290 tree
 (git 79894168), the reader before OPER and RESULT.
 
 ### Lifecycle
 
+`release` (`release.om` composed after `om/tls/sha2.om` for SHA-256) is the
+whole lifecycle; no shell remains. Errors are one `release: MESSAGE` line on
+stderr with exit 2 for usage, an unknown command or port 18091, 3 for a
+process in the wrong state, 1 for any other failure.
+
 | Command | Effect |
 | --- | --- |
-| `build OUT` | compose and compile the six programs with this checkout's `seed/out/omc`; two builds are byte-identical |
+| `build OUT` | from the checkout root (refuses, 2, without `seed/out/omc`): compose and compile the six programs with this checkout's `seed/out/omc`; two builds are byte-identical |
 | `serve STATE PORT OLLM VERB CK MERGES` | start the own-model server; waits for its PORT line |
-| `start STATE BIN OMC PORT VIEW` | start `omnode-code` on STATE (`root/`, `work/`, `journal/`, `objs.txt`); refuses (3) while `node.pid` is alive |
+| `start STATE BIN OMC PORT VIEW` | start `omnode-code` on STATE (`root/`, `work/`, `journal/`, `objs.txt`); BIN must be a directory; refuses (3) while `node.pid` is alive |
 | `health STATE` | the model's `GET /health` and the node's view; 0 when both answer |
 | `stop STATE` | pause (op 1), wait until nothing runs or is in review (at most 900 s), SIGTERM; `view-at-stop.json` |
 | `restore STATE` | start again on the same journal (incarnation + 1), then resume (op 2) |
 | `unserve STATE` | stop the model server |
+| `snapshot STATE SNAP` | copy `root/`, `work/` and `journal/` into SNAP (each must not exist there); refuses (3) while `node.pid` is alive |
+| `rollback STATE SNAP` | replace STATE's `root/`, `work/` and `journal/` with SNAP's copies (all three must exist first); refuses (3) while `node.pid` is alive |
+
+`snapshot` and `rollback` copy directories, regular files (bytes, permission
+bits, each file synced) and symbolic links (as links, never followed); any
+other file type, or a tree deeper than 64, fails (1) naming the directory and
+the errno. They print `snapshot SNAP files F dirs D links L bytes B` (or
+`rollback STATE ...`).
+
+Every program `release` starts gets an empty environment and no PATH search
+(`execprog`): OLLM, BIN and OMC are paths. Host tools it runs that are not
+compiled by `build`: the own-model server OLLM (serve) and `seed/out/omc`
+(build). It needs no `sh`, `date`, `sha256sum`, `grep`, `cp` or `tail`.
 
 The journal's lock is the one active authority: a second `omnode-code` on
 the same journal exits 50 (30 + 20, fenced) and changes nothing.
 
-Cutover: `stop`, copy `root/`, `work/` and `journal/`, `restore` with the new
-BIN. Reversal: `stop`, put the copy back, `start` with the old BIN. A reader
-refuses record types newer than it knows (24, exit 54) before writing
-anything, so the DRA-290 build refuses a journal that holds OPER (9) or
-RESULT (10) and leaves it unchanged; rolling back therefore needs the copy
-taken before the new build ran.
+Cutover: `stop`, `snapshot`, `restore` with the new BIN. Reversal: `stop`,
+`rollback`, `start` with the old BIN. A reader refuses record types newer
+than it knows (24, exit 54) before writing anything, so the DRA-290 build
+refuses a journal that holds OPER (9) or RESULT (10) and leaves it
+unchanged; rolling back therefore needs the snapshot taken before the new
+build ran. `journal-rollback-from-snapshot` runs exactly this through
+`release snapshot` and `release rollback`.
 
 ### Durable results
 
