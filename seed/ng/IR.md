@@ -3,8 +3,8 @@
 ```text
 Document:   seed/ng/IR.md (ΩIR wire version 9, tag omega.ng.ir.v1)
 Status:     PROPOSED draft v0.1 (ng-ir lane, Hive NG M0). Witness: seed/ng/ngcheck.om (own reader).
-            Text tools: seed/ng/ngas.om, ngdis.om. Reference interpreter: seed/ng/ngrun.om. In-memory
-            form and the one ng reader/writer: seed/ng/src/ir.om (s14).
+            Text tools: seed/ng/ngas.om, ngdis.om. Reference interpreter: seed/ng/ngrun.om. Random
+            programs: seed/ng/ngrand.om. In-memory form and the one ng reader/writer: seed/ng/src/ir.om (s14).
 Decisions:  Hive NG D1b, D2 + D2b + D2c, D3, D7, D10, D11 (2026-11-07).
 Family:     spec/one-layer-format.md (OSC binary IR). Versions 1..8 are untouched by this document.
 Pin:        omega-mv 943d955531b9d4d9f70deb41756c0b46441dd5e0, omc sha256 5f90edea…6df.
@@ -683,6 +683,16 @@ document's semantics: `seed/ng/ngrun.om`, the reference interpreter of s7, runs 
 compiles and runs the Omega, and exit status, stdout and stderr must be equal, traps at the exact
 boundaries included (overflow at 2^63, fuel at exactly 1e6 passes, index == len, MIN div -1,
 shift by the width, a conversion one past the range).
+Random programs (`seed/ng/ngrand.om`, the D9 differential source for back ends): `ngrand SEED`
+writes a unit built with `src/ir.om` from a byte tape that SEED fills; every tape gives a unit
+ngcheck accepts (typed SSA, one token chain, checks with their codes, diamonds joined by block
+parameters, counted loops under `chk.fuel`, calls to lower helpers, i64 memory under `chk.bounds`,
+host write), and byte 0 is always the smallest choice, so `ngrand shrink SEED STATUS OUT CMD...`
+minimizes a unit by deleting and zeroing tape bytes while the predicate CMD exits STATUS. The gate
+runs seeds 1..1000 (ngcheck's whole ACCEPT line, `ngas(ngdis(b)) == b`, ngrun ends cleanly), one
+shrink with ngrun as the predicate, and a mutant ngrand that drops one token edge, which ngcheck
+must refuse TOKEN. ngrun has no second oracle on these units: a back end diffing against ngrun is
+the differential, and its disagreements judge both.
 
 ## 11. Refusal classes and ngcheck exit codes
 
