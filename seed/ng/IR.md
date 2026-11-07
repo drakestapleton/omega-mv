@@ -319,6 +319,17 @@ subgroup, 1 block, 2 device, 3 system); bits 16..23 order (0 relaxed, 1 acquire-
 nearest even. In a function (not a kernel) the only thread is the caller, so an atomic is its plain
 read-modify-write.
 
+**STRUCT elements are storage-only (v1).** An ARRAY or SLICE may have STRUCT elements (s4.2), and
+`alloca`, `gaddr`, `len` and `slice` take such storage, but no value is ever a STRUCT or an ARRAY
+(value types are scalar, VEC, REF, SLICE or FRAG). So `load`, `store`, `atom`, `atomcas`, `fill`,
+`vload` and `vstore` need a scalar (or, for `load`/`store`, VEC) element and refuse a STRUCT element
+with TYPE at the op, and no op yields a REF to one element. Fields are reached only through a REF to
+the STRUCT itself (`gaddr`, `alloca`, or `fref` of an enclosing STRUCT) with `fload`, `fstore` and
+`fref`; per-record data is laid out as a STRUCT of ARRAY fields: `fref` to the field's ARRAY, then
+`load`/`store` element i under its `chk.bounds`. Omega has no arrays of structs (a struct is one
+`new` object), so the front end needs no other route; an element-reference op is a later
+extension. Fixtures: `r-struct-elem.oir` (TYPE), `k-soa.oir` (accepted).
+
 ### 7.6 Control (60..66)
 
 | op | name | ty | imm | operands | meaning |
@@ -564,8 +575,9 @@ uncovered access is UNCHECKED.
 1. Every id names an existing object of the right kind: type, global, function, block, value (REF).
 2. Types per row (TYPE); writes need access 1; CONSTANT space is read-only; `tok` only where s4.1
    allows it.
-3. Block 0 has no parameters and is not a branch target (REF); other blocks start with one `tok`
-   parameter (BLOCK_ARITY). `alloca` and `shared` only in block 0 (EFFECT).
+3. Block 0 has no parameters (BLOCK_ARITY, at the block's offset) and is not a branch target
+   (REF); other blocks start with one `tok` parameter (BLOCK_ARITY). `alloca` and `shared` only in
+   block 0 (EFFECT).
 4. Every block reachable; SSA dominance (s6.2).
 5. Terminators (s7.1); `br` arity and types; `cbr` targets with exactly the token parameter.
 6. `retv` only in non-void functions with the result type; `ret` only in void ones.
@@ -640,19 +652,31 @@ end
 
 Ids are printed as stored, in range or not, so every semantic refusal has a text fixture. What the
 text cannot spell, `ngdis` refuses with the s11 code and `ngdis: refused class C at OFFSET` on
-stderr: MAGIC, VERSION, TRUNCATED, TRAILING, UNKNOWN_OP, more than 65536 function parameters
-(LIMIT), IO, and NONCANONICAL for an enumeration outside its set (type kind, access, space, field
-order, frag role, global class, function kind), a nonzero `ty` on a row whose ty column is 0, or a
-`const` imm that is not canonical for its scalar type. `ngas` refuses non-canonical text with
-`ngas: syntax error at line N` and exit 3 (out of order or misnumbered type, global, function,
-block or value ids; the wrong number of defined values for the row and `ty`; a fixed-operand count
-that differs from the row; a `const` outside its type; a global's data length), input or output
-over 16 MiB with exit 23, unreadable input with exit 27.
+stderr: MAGIC, VERSION, TRUNCATED, TRAILING, UNKNOWN_OP, LIMIT (below), IO, and NONCANONICAL for an
+enumeration outside its set (type kind, access, space, field order, frag role, global class,
+function kind), a nonzero `ty` on a row whose ty column is 0, or a `const` imm that is not canonical
+for its scalar type. Its text is complete only on exit 0: a refusal found before 1 MiB of text
+leaves stdout empty, one found later leaves the text already written. `ngas` refuses
+non-canonical text with `ngas: syntax error at line N` and exit 3 (out of order or misnumbered type,
+global, function, block or value ids; the wrong number of defined values for the row and `ty`; a
+fixed-operand count that differs from the row; a `const` outside its type; a global's data length),
+input or output over 16 MiB with exit 23, unreadable input with exit 27.
+
+**Text tool capacities.** Both text tools hold what the text can spell, so their limits are the
+table sizes, not ngcheck's semantic limits: input over 16777216 bytes is LIMIT (ngdis reads one
+byte past the buffer: more input is `ngdis: refused class 23 at 16777216`, a read error class 27 at
+the bytes read); more than 65536 types, globals, functions, blocks in one function, or parameters
+of one function or block is LIMIT, `ngdis: refused class 23 at` the count's offset, checked before
+the entries, and `ngas: limit at line N` (the line of the first item over) with exit 23. The
+parameter limit stays 65536 in the text tools so that ngcheck's 64-parameter LIMIT keeps a text
+fixture.
 
 `seed/ng/tests/ir/` holds the fixtures: canonical text (`NAME.oir`), and the `cases` file that
 `seed/ng/gate-ir.om` runs: text cases with their ngcheck class and offset, ngas syntax refusals,
-and byte mutations of assembled fixtures for what text cannot spell (MAGIC, VERSION, TRUNCATED,
-NONCANONICAL, TRAILING, UNKNOWN_OP), each judged by ngcheck and ngdis alike.
+byte mutations of assembled fixtures for what text cannot spell (MAGIC, VERSION, TRUNCATED,
+NONCANONICAL, TRAILING, UNKNOWN_OP, counts over s12), each judged by ngcheck and ngdis alike and by
+`ng ir-copy` as s14 states, and inputs the gate generates at the capacities (16777216 bytes and one
+more, 65537 types, globals, functions, blocks and parameters).
 
 ## 11. Refusal classes and ngcheck exit codes
 
@@ -682,7 +706,7 @@ function faults at the function record's.
 | 16 | TYPE | an operand, result or parameter type breaks its row |
 | 17 | USE_BEFORE_DEF | a value used before its definition in the same block, or an id past the function's values |
 | 18 | DOMINANCE | a value used in a block its definition does not dominate |
-| 19 | BLOCK_ARITY | `br` arguments differ from the target's parameters; a `cbr` target with other than the token parameter; a non-entry block without its token parameter |
+| 19 | BLOCK_ARITY | `br` arguments differ from the target's parameters; a `cbr` target with other than the token parameter; a non-entry block without its token parameter; an entry block (block 0) with parameters |
 | 20 | UNTERMINATED | a block without a terminator at its end, or a terminator before its end |
 | 21 | CHECK_CODE | a check without its exact trap code, or `trap`/`chk.true` code outside 1..14 |
 | 22 | EFFECT | an op in a function kind or block that does not allow it (s9 rules 3 and 7), an unknown host word |
@@ -711,7 +735,8 @@ function faults at the function record's.
 | `call`/`host`/`launch` arguments | 64 |
 
 A count above its limit is LIMIT (exit 23) at the count's offset, checked before reading what it
-counts. ngcheck, `src/ir.om` and the text tools share these numbers.
+counts. ngcheck and `src/ir.om` share these numbers; the text tools use the capacities of s10
+(65536 for every table, parameters included), which are never below them.
 
 ## 13. Mapping from Omega (for `src/front.om`)
 
@@ -784,17 +809,24 @@ or a refusal class of s11, with `ir_badat` the absolute offset in `i_in`. It ref
 to build sound tables (classes 10..15, 23, and REF/USE_BEFORE_DEF/BLOCK_ARITY/UNTERMINATED/TYPE
 where an id, a count or a global's data size cannot be resolved) and leaves every semantic rule to
 ngcheck. `ir_wr` writes the tables to `i_out` and returns the byte count. `ir_wr` after `ir_read`
-reproduces the input bytes exactly for every unit `ir_read` accepts; the gate checks it on every
-fixture. In the tables a `gaddr` imm is the global's handle (the writer subtracts 1, the reader
-adds 1); every other imm is the wire value.
+reproduces the input bytes exactly for every unit `ir_read` accepts. The gate runs `ng ir-copy` on
+every fixture unit, every byte mutation and the generated binaries (full, over, types): where
+ngcheck refuses with a structural class (MAGIC, VERSION, TRUNCATED, TRAILING, UNKNOWN_OP, LIMIT,
+IO) ng must print the same class and offset with empty stdout; otherwise ng must give the bytes back
+exactly or, where ngcheck refuses, refuse with a class of s11 and empty stdout. In the tables a
+`gaddr` imm is the global's handle (the writer subtracts 1, the reader adds 1); every other imm is
+the wire value.
 
 Register budget: omc gives a function 16 registers, and each global array read in one expression
 costs one. Keep table reads to two or three per statement (the `ir_*` code shows the pattern).
 
-`main.om` dispatches on the first input line: `@ng ir-copy` reads the ΩIR binary that follows
-and writes it back (reader/writer round trip; a refusal prints `ng: refused class C at OFFSET`,
-offset in the ΩIR bytes, and exits C); stage lanes add their modes (`@ng dump-ir <stage>` after
-the front end or a pass, `@ng ingest-ir <stage>` before a back end) beside their code.
+`main.om` reads the first input line (the mode, at most 63 bytes and its newline) apart, so the
+payload after it fills `i_in` from offset 0 and may be the full 16777216 bytes of s12. `@ng ir-copy`
+reads the ΩIR binary payload and writes it back (reader/writer round trip). A refusal prints `ng:
+refused class C at OFFSET`, offset in the payload, empty stdout, and exits C: a payload over
+16777216 bytes is class 23 at 16777216, an unreadable one class 27; an unknown mode is `ng:
+unknown mode` and exit 2. Stage lanes add their modes (`@ng dump-ir <stage>` after the front end or
+a pass, `@ng ingest-ir <stage>` before a back end) beside their code.
 
 ## 15. What a pass may do to a check (D7)
 
