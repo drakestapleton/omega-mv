@@ -1,102 +1,122 @@
-# nga64: ΩIR to AArch64 Linux ELF (design, ng-a64 lane)
+# ng a64: ΩIR to AArch64 Linux ELF (design, ng-a64 lane)
 
-Status: PROPOSED design, implementation in progress on branch `ng/a64-m1`. Pin: omega-mv `943d9555`, built by
-`seed/out/omc` sha256 `5f90edea…`. The facts about seed omc it relies on are in
+Status: IMPLEMENTED and HOST_TESTED for the integer slice below (gates in section 6); the rest is PROPOSED.
+Code: `seed/ng/src/a64.om` (unit of `seed/ng/ng.units`, between `ir.om` and `main.om`; functions `a6_*`, globals
+`a_*`). Built by `seed/out/omc` (sha256 `5f90edea…`, omega-mv `943d9555`). Facts about seed omc it copies are in
 `~/handoffs/hive-ng/a64/REALITY.md` (file:line at `943d9555`).
 
 ## 1. Job
 
-`nga64 < unit.oir > prog` reads one ΩIR unit (binary, `seed/ng/IR.md`) on stdin and writes a static AArch64 Linux
-ELF executable on stdout. Exit 0 on success; a refusal exits with a nonzero code and one stderr line
-`nga64: <class> at <offset>`, nothing on stdout. It is one `.om` unit compiled by seed omc.
+`ng` modes owned by this unit (`a6_mode`, called from `main.om` before the unknown-mode exit):
 
-Observable behaviour must equal seed omc on the same source (D5): stdout and stderr bytes, exit status, trap code.
-Instruction bytes, register choice and frame layout are free.
+| first line | payload | output |
+|---|---|---|
+| `@ng a64` | binary ΩIR (`seed/ng/IR.md`) | static AArch64 Linux ELF on stdout; saves as STP/LDP pairs (form A) |
+| `@ng a64 split` | binary ΩIR | the same with separate STR/LDR saves (form B) |
+| `@ng a64-enc` | encoder case list (`tests/enc.cases`) | one 4-byte word per case |
 
-## 2. Pipeline inside nga64
+Exit 0 on success. A refusal writes one stderr line `a64: <class> <n>` and exits with the class: the ΩIR reader's
+class (s11) for a refused unit (message `refused IR class, at byte` and `ir_badat`), 5 for `unsupported` (an op,
+type or limit outside the slice). The input is trusted to have passed `ngcheck` (IR.md s14: `ir_read` builds sound
+tables and leaves semantic rules to ngcheck).
 
-1. **Read**: strict ΩIR reader into flat global tables (functions, blocks, block parameters, ops, operands). The reader
-   trusts nothing; `ngcheck` is the validator, but nga64 still refuses what it cannot lower (exit 3, class `UNSUPPORTED`).
-2. **Select**: each ΩIR op becomes one or more MIR instructions over virtual registers (vregs). MIR is a
-   one-to-one picture of A64 instructions (opcode, def vreg, use vregs, immediate, condition), so the allocator and
-   the encoder see exactly what will run. Known fusions:
-   - `add`/`sub`/`neg` followed by its overflow check on the same operands: `ADDS`/`SUBS` + `B.VS` (i64) or `B.CS`/`B.CC` (qty).
-   - compare feeding a branch: `CMP` + `B.cond` (no `CSET`); compare feeding a value: `CSET`.
-   - constant operands: ADD/SUB imm12 (optionally `LSL #12`), logical bitmask immediates, shift immediates.
-   - bounds check + load: `CMP idx, len; B.HS trap3; LDR Xd, [base, idx, LSL #s]`.
-   Narrow integer types keep omc's canonical form (zero/sign extended to 64 bits) so comparisons and stores stay
-   correct; checks on narrow types follow omc's sequences (REALITY.md rows add/mul/div/shift).
-3. **Order**: blocks in ΩIR order (the front end emits a dominator-compatible order); fall-through edges remove `B`.
-4. **Liveness**: backward dataflow over blocks with one bitset per block (live-in/live-out), iterated to a fixed point.
-   Block parameters are defined at block entry; the edge arguments are uses at the end of the predecessor.
-5. **Intervals**: every MIR instruction gets an even position (2i; odd positions are reserved for split moves).
-   A vreg's interval is `[first def, last use]`, widened to cover every block where it is live-in or live-out
-   (one range per vreg; holes are ignored in v1). Each interval records whether it crosses a call.
-6. **Linear scan** (Poletto & Sarkar, 1999) over intervals sorted by start, with two register classes:
-   - GPR allocatable: x0..x15 (caller-saved), x19..x27 (callee-saved). 25 registers.
-   - FP allocatable: v0..v7, v18..v31 (caller-saved), v8..v15 (callee-saved, low 64 bits). 30 registers.
-   - An interval that crosses a call takes only callee-saved registers. Hints: a vreg that is a call argument or
-     result prefers x0..x7/v0..v7 at that call; a block parameter prefers the register of its incoming argument.
-   - When none is free, spill the interval (active or current) whose end is farthest; its home is an 8-byte stack
-     slot. A spilled vreg is reloaded into a scratch register before each use and stored after each def (spill
-     everywhere). **This retires error 12**: there is no limit on live values except stack size.
-7. **Rewrite**: replace vregs by physical registers; insert spill loads/stores; resolve block-parameter moves on each
-   edge as a parallel move (cycles broken through x16 / v16); a critical edge gets its own move block.
-8. **Frame**: `SUB SP` by frame size (spill slots + local arrays + saved callee-saved registers + x30 if the function
-   calls), `CMP SP, X28; B.LO trap6` (omc's stack-floor rule), callee-saved and x30 saved with `STP` pairs,
-   restored with `LDP` before `RET`. A leaf with no callee-saved use and no spill has no frame at all.
-9. **Emit**: encoder functions (section 4) write words into the code buffer; branches are patched after layout.
-   Every function shares one trap tail per program: `B.cond` to per-code stubs `MOVZ X1,#code; B tail`,
-   tail `ADD X0, X1, #100; MOVZ X8, #93; SVC #0` (omc `finish`, REALITY.md), so exit status 100+code is identical.
-10. **ELF**: omc's layout (REALITY.md): 176-byte header, code at 0x400000 entry 0x4000b0, RW pool at 0x10000000
-    (8 MiB stack, X28 floor = 0x10000000, SP = 0x10800000), globals from 0x10800000, texts in the code image.
+Observable behaviour must equal seed omc on the same source (D5): exit status and trap code. Instruction bytes,
+register choice and frame layout are free.
 
-## 3. Registers reserved (documented, never allocated)
+The save form stays a switch (`a_sform`) until ng-bench's clean v2 A725 round decides the default (D8 amended).
+
+## 2. Pipeline (per function, `a6_func`)
+
+1. **Read**: `ir_read` into ir.om's tables; `ir_num f` numbers the values (wire ids index every per-value array).
+   Kernels (kind 1) are refused.
+2. **Layout** (`a6_lay`): blocks in ΩIR order. Positions: function parameters are defined at 0; block x starts at
+   `a_bst[x]` (its parameters are defined there); op o sits at an even `a_opos[o]`, reads its operands there and
+   defines its result at `a_opos[o] + 1`. `a_ccnt[q]` = calls at positions below q.
+3. **Liveness** (`a6_lgen`, `a6_lflow`): per block bitsets of upward-exposed uses, definitions, live-in and live-out,
+   iterated backwards to a fixed point. Successors: `br` slot 0, `cbr` slots 2 and 3. Tokens get no location.
+4. **Intervals** (`a6_ivinit`, `a6_ivuse`, `a6_ivlive`): one range `[start, end]` per value from its definition and
+   uses, widened to the start of every block where it is live-in and the end of every block where it is live-out.
+   A value crosses a call when a call position lies strictly inside its range (`a_ccnt[end] > a_ccnt[start+1]`).
+5. **Linear scan** (Poletto and Sarkar 1999, `a6_scan`): intervals in start order (bucket by start). Allocatable:
+   x0..x14 (caller-saved, preferred) and x19..x27 (callee-saved); an interval crossing a call takes only x19..x27.
+   With no free register, the active interval of the allowed class that ends last gives up its register if it ends
+   after the current one (it moves to a stack slot); otherwise the current interval gets a slot. Slots are 8 bytes at
+   `[sp, 8k]`. A spilled value is loaded into x16/x17/x15 before each use and stored after its definition. There is no
+   limit on live values but the frame size.
+6. **Frame** (`a6_frame`, `a6_pro`, `a6_epi`): F = round16(8 x (slots + callee-saved registers used + x30 if the
+   function calls)), F <= 4095. Prologue `SUB SP, SP, #F; CMP SP, X28; B.LO trap6` (before any store, omc's
+   stack-floor rule), then the saves above the slots. Epilogue: reloads, `ADD SP, SP, #F`, `RET`. A function with
+   F = 0 has no frame code. Save form A uses pairs while the save area ends at or below byte 504, else form B.
+7. **Selection** (`a6_sel`), one op at a time, operands read before the result register is written (the result may
+   reuse an operand's register):
+   - narrow integers live extended to 64 bits by their type (zero u8..u32, sign i8..i32); arithmetic results are
+     re-extended (`UBFM`/`SBFM`), so 64-bit compares are exact and ΩIR's modulo-2^w results hold;
+   - const: MOVZ, MOVN, or MOVZ + MOVK on the nonzero halfwords; add sub mul and or xor neg not; div (SDIV/UDIV gives
+     ΩIR's divisor-0 and MIN/-1 results); rem = `a - (a/b) b` via MSUB, then CSEL to 0 when b = 0;
+   - shl shr: LSLV/LSRV/ASRV at 64 and (W form) 32 bits, amount masked for 8 and 16; rotl rotr at 32 and 64 (RORV W/X,
+     rotl by the negated amount); min max: CMP + CSEL; eq..ge: CMP + CSET; select: CMP c, #0 + CSEL;
+     integer conv and bitcast: move + re-extend;
+   - br: block arguments as one parallel move, `B` omitted on fall-through; cbr: CBNZ/CBZ (+ B);
+     call: arguments to x0..x7 as one parallel move, BL (patched when every function is placed), result from x0;
+     ret retv; trap: B to the stub; exit: `MOVZ X8, #93; SVC #0`;
+   - checks: chk.add/sub/neg 64-bit by flags (B.VS signed; B.HS / B.LO / B.NE unsigned), chk.mul 64-bit by SMULH
+     against the sign of the low half or UMULH = 0, narrower types by computing the exact 64-bit result and comparing
+     it with its own re-extension; chk.divz CBZ; chk.divovf `((b + 1) | (a ^ MIN)) = 0`; chk.shl; chk.shift
+     (unsigned CMP with the width); chk.conv between integers; chk.fuel CMP + B.HS; chk.true CBZ. Facts emit nothing.
+8. **Parallel moves** (`a6_pmove`): a move fires when no pending move reads its destination; when all are blocked
+   (a cycle), one source goes to x15 and its readers read x15. Slot-to-slot moves go through x16.
+9. **Traps**: each function ends with omc's tail `ADD X0, X1, #100; MOVZ X8, #93; SVC #0` and one stub per used code,
+   `MOVZ X1, #code; B tail`, so the exit status is 100 + code as with omc.
+10. **ELF** (`a6_elf`): omc's map: 176-byte header, two PT_LOAD (text R+X at 0x400000 from file offset 0; RW
+    0x10000000, memsz 8 MiB), entry 0x4000b0: `MOVZ X28, #0x1000, LSL 16; MOVZ X16, #0x1080, LSL 16; MOV SP, X16;
+    BL main; MOVZ X8, #93; SVC #0`. Program entry (D11): the single export with no parameters and result i32.
+
+## 3. Registers
 
 | Register | Use |
 |---|---|
-| x16, x17 | scratch: spill reloads, large immediates and offsets, parallel-move cycle breaking |
-| x18 | platform register (AAPCS64 6.1.1), left alone |
+| x0..x7 | arguments and result (x0), allocatable caller-saved |
+| x8..x14 | allocatable caller-saved |
+| x15, x16, x17 | scratch: spill reloads, check temporaries, parallel-move cycle (x15) and slot-to-slot (x16) |
+| x18 | platform register (AAPCS64 6.1.1), unused |
+| x19..x27 | allocatable callee-saved (saved in the prologue when used) |
 | x28 | stack floor 0x10000000 (omc convention, trap 6 check) |
-| x29 | reserved as frame pointer (kept free so that backtraces stay possible; may become allocatable after A/B) |
-| x30 | link register |
-| SP | stack |
-| v16, v17 | FP scratch (spill reloads, parallel-move cycles) |
+| x29 | unused (kept for a frame pointer) |
+| x30 | link register, saved when the function calls |
 
-Calls between nga64 functions use x0..x7 / v0..v7 for arguments and x0 / v0 for the result (AAPCS64 shape,
-`~/docs/arm-cores/aapcs64-2025Q4.txt` 6.4). There is no outside caller in program mode, so the only contract is the
-one nga64 makes with itself; host words are inline `SVC #0` sequences that clobber x0..x8 only (Linux arm64 syscall ABI:
-number in x8, arguments x0..x5, result x0).
+Calls between ng functions use x0..x7 for arguments (more than 8 is refused) and x0 for the result; there is no
+outside caller in program mode, so this is the only contract.
 
 ## 4. Encoder layer
 
-One function per instruction form, `fn eNAME operands to ulong` returning the 32-bit word; `emit` appends it. Every
-form cites its DDI 0487 M.d section (the same source as `seed/rung2/table.s2`). Forms (v1): ADD/SUB/ADDS/SUBS
-(shifted register, immediate, extended register), AND/ORR/EOR/ANDS (shifted register, bitmask immediate),
-MOVZ/MOVN/MOVK, MADD/MSUB/SMULH/UMULH/SDIV/UDIV, LSLV/LSRV/ASRV/RORV, UBFM/SBFM/EXTR, CSEL/CSINC/CSNEG,
-LDR/STR/LDRB/LDRH/LDRSB/LDRSH/LDRSW/STRB/STRH (unsigned offset and register offset), LDP/STP (signed offset,
-pre-index, post-index), B, BL, B.cond, CBZ, CBNZ, TBZ, TBNZ, RET, BR, BLR, SVC, ADR, and the FP set FADD/FSUB/FMUL/FDIV/
-FSQRT/FABS/FNEG/FMIN/FMAX/FCMP/FMOV/SCVTF/UCVTF/FCVTZS/FCVTZU/FCVT and LDR/STR S/D.
+`a6_enc f a b c d e` builds the word of form f (160 forms, base word + operand kind, each group citing its DDI 0487
+M.d section); `a6_ew` appends it. Forms: ADD/SUB/ADDS/SUBS (shifted register, immediate, extended register),
+AND/ORR/EOR/ANDS/BIC/ORN (shifted register, bitmask immediate), MOVZ/MOVN/MOVK, MUL/MADD/MSUB/SMULH/UMULH/SDIV/UDIV,
+LSLV/LSRV/ASRV/RORV (X and W), UBFM/SBFM/EXTR, CSEL/CSINC/CSINV/CSNEG, loads and stores of every width (unsigned
+offset and register offset), LDP/STP (signed offset, pre-, post-index), B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, RET, BR,
+BLR, SVC, ADR and the FP set.
 
-Constants: MOVZ/MOVN + MOVK (fewest halfwords), or ORR from XZR with a bitmask immediate when that is one word.
+## 5. Not in the slice yet (PROPOSED, in order)
 
-**Encoder gate** (`seed/ng/a64/gate-enc.om`): `nga64` run with the test magic writes one word per case; the gate
-disassembles them with GNU objdump (referee, never builder) and compares each line with the hand-written expected
-text in the case table. Negative control: a mutant encoder with one wrong bit must fail the gate.
+1. E loop shape (second recursive call to a loop), then shrink-wrapping (saves only on paths that need them) — D8.
+2. Memory ops (load, store, alloca, globals, slices, chk.bounds, chk.slice) and host words (inline `SVC`).
+3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
+4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, > 8 arguments,
+   frames over 4095 bytes.
 
-## 5. Gates
+## 6. Gates (run from the omega-mv root on core 1)
 
-- `gate-enc.om`: encoder forms vs objdump (above), with a wrong-bit mutant.
-- `gate-ra.om`: generated high-pressure functions (more simultaneously live values than the 25 GPRs and 30 FP
-  registers, values live across calls, loops with block parameters) compiled by nga64 from ΩIR and by seed omc from the
-  equivalent Omega source where omc can compile it; stdout and exit must match. The spill path is counted (nga64 prints
-  spill statistics on stderr in test mode) and must be nonzero. Negative controls: an allocator mutant that ignores
-  call clobbers, and one that drops a spill store, must both fail.
-- `gate-diff.om` (with ng-front): `ngfront | nga64` vs seed omc on `examples/` and the OmegaFast bench kernels.
+- `gate.om` (encoder): builds ng from `ng.units`, runs `@ng a64-enc` on `tests/enc.cases`, disassembles with GNU
+  objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases.
+- `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck and ng. For every fixture (fib, deep, press, rot,
+  ck, ar) ngcheck must accept the ΩIR, and `@ng a64`, `@ng a64 split` and the omc build of `tests/ref/N.om` must
+  all exit with the expected status (computed with Wolfram, or the check's trap code). Six allocator mutants
+  (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves, frame size) must
+  each change at least one fixture's status.
 
-## 6. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
+## 7. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
 
 - ALU basic (ADD, AND, …): latency 1, throughput 8 per cycle; flag-setting ADDS: latency 1, throughput 4 (p15).
 - B: throughput 2 per cycle; CBZ/CBNZ/TBZ: throughput 2 (p15).
 - LDP: latency 4; STP: throughput 2 (p19-20).
-v1 does no instruction scheduling; it prefers fused compare-and-branch, LDP/STP for frames, and fewer instructions.
+The slice does no instruction scheduling.
