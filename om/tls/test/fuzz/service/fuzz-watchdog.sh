@@ -5,6 +5,9 @@
 # trigger has cleared, and stops the unit on the disk or size caps. Reads the same markers as
 # ~/.local/bin/quiet-build / quiet-measure / spark-window / quietlock; never takes a lock itself
 # (held locks are read from /proc/locks), never sends anything to 127.0.0.1:18091 (ss only).
+# The port trigger is off by default: it paused fuzzing while the 35B on :18091 was down (restart/test),
+# and the 35B is retired (Drake 2026-11-06, DRA-162), so :18091 unbound is the normal state. Opt in
+# with FUZZ_GUARD_PORT=<port> to pause whenever that port is not listening.
 #   fuzz-watchdog.sh check     one evaluation: prints "clear", "pause REASON" or "stop REASON";
 #                              exit 0 / 1 / 2
 #   fuzz-watchdog.sh run       loop every FUZZ_WATCH_S (10) s; STATUS + append-only LOG
@@ -31,7 +34,7 @@ EQ=${FUZZ_EQ_GLOB:-}
 Q27=${FUZZ_Q27_MARKERS:-}
 SWEEP=${FUZZ_SWEEP_PATTERN:-}
 QLBIN=${FUZZ_QUIETLOCK:-$H/.local/bin/quietlock}
-PORT=${FUZZ_GUARD_PORT:-18091}
+PORT=${FUZZ_GUARD_PORT:-}
 # 20-core host whose load1 ran 16.1-30.2 during the TlsProof bench (2026-10-26); the 2 niced workers stay on cpus 10-11.
 LOADMAX=${FUZZ_LOAD_MAX:-16}
 DISKMIN=${FUZZ_DISK_MIN_GIB:-150}
@@ -58,7 +61,7 @@ reason() {
   for f in $EQ; do held "$f" && { echo "pause bench lock $f held"; return; }; done
   for f in $Q27; do [ -e "$f" ] && { echo "pause Q27 GPU window ($f)"; return; }; done
   [ -n "$SWEEP" ] && pgrep -f "$SWEEP" >/dev/null 2>&1 && { echo "pause sweep running ($(pgrep -af "$SWEEP" | head -1 | cut -c1-80))"; return; }
-  [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ] || { echo "pause 127.0.0.1:$PORT not listening"; return; }
+  [ -z "$PORT" ] || [ -n "$(ss -ltnH "sport = :$PORT" 2>/dev/null)" ] || { echo "pause 127.0.0.1:$PORT not listening"; return; }
   l=$(cut -d' ' -f1 /proc/loadavg)
   awk -v l="$l" -v m="$LOADMAX" 'BEGIN{exit !(l>m)}' && { echo "pause load1 $l > $LOADMAX"; return; }
   echo clear
