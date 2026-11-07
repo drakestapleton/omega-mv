@@ -94,8 +94,14 @@ fib38), so any future codegen A/B reports an aligned control.
    - host words read (53) and write (54) (IR.md s7.11): `X17 = A + off`, then x0 fd, x1 X17, x2 n as one parallel
      move, `MOVZ X8, #63/64; SVC #0`, result (count or minus errno) from x0. The SVC preserves every register but x0;
      the arguments use x0..x2, so a host word counts as a call for allocation (values live across it take x19..x27)
-     without saving x30. cpufence (199) is `DSB SY` and cpurelax (200) `YIELD`, omc's words. Every other host word is
-     refused (exit 5, `a64: unsupported` with the word id).
+     without saving x30. cpufence (199) is `DSB SY` and cpurelax (200) `YIELD`, omc's words. monons (109) is omc's
+     hclock (`a6_hclk`): `SUB SP, #16` with the stack-floor check (trap 6), `STP XZR, XZR, [SP]`, SVC 113
+     clock_gettime(CLOCK_MONOTONIC) into that area, `sec > 9223372036` B.HI trap 1, `sec * 10^9 + nsec` by MUL and
+     ADDS (B.VS trap 1), then `CMP X0, #0; CSEL X0, X0, X2, LT` returns minus errno for a failed call where omc
+     branches (the zeroed area makes the failed path compute 0 without trapping). Every other host word is refused
+     (exit 5, `a64: unsupported` with the word id).
+   - fill r v (51) on a REF to ARRAY (count from the type) or a SLICE (count from its length wire): `X15 = count;
+     CBZ X15, done; loop: SUBS X15, X15, #1; STR v, [base, X15, LSL #size]; B.NE loop` (last element first).
 8. **Parallel moves** (`a6_pmove`): a move fires when no pending move reads its destination; when all are blocked
    (a cycle), one source goes to x15 and its readers read x15. Slot-to-slot moves go through x16.
 8a. **E loop shape** (`a6_tre`, D13): a block ending `r = call f(...); s = add a r` (either operand order)
@@ -147,12 +153,12 @@ BLR, SVC, ADR and the FP set.
 
 1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
    in a callee-saved register across its loop).
-2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `fill`, `atom`,
-   `atomcas`, float elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass that
+2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `atom`, `atomcas`,
+   float elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass that
    proves them (IR.md s15).
 3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
 4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, host words beyond
-   read, write, cpufence and cpurelax.
+   read, write, monons, cpufence and cpurelax (realns 130 and sleepns 120 have no ngrun reference yet).
 
 ## 6. Gates (run from the omega-mv root on core 1)
 
@@ -194,15 +200,25 @@ BLR, SVC, ADR and the FP set.
   constant e > len, chk.slice n > len - off and off > len on slices with a run-time length, each after a passing
   call at the boundary). SHA-256 and X25519 are not lowered by hand: their sources use only ops covered here
   (integer arithmetic with div/rem, not, rotr at 32 and 64 bits, shifts, arrays and u8/u64 slices); they run end to
-  end once ng-front emits ΩIR.
+  end once ng-front lowers them. `h-mono` (two monons reads around a loop; exit 7 when the first reading exceeds
+  10^9, the second is not smaller and they differ by less than 10^12 ns, whatever the clock says) is ng-front's
+  `@ng front-ir` output for an Omega source, as ngdis text; omc's build of the source exits 7 as well. `f-fill`
+  (the same route: u32, u8, u64, u16 arrays filled with nonzero values; Wolfram: 37*5 + 64*65535 + 3*9 + 200 =
+  4194652) and `f-fills` (a run-time-length u32 slice filled through a call, a zero-length slice, five read-backs;
+  Wolfram: 30) cover fill.
 
-  Twenty-one mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
+  Twenty-three mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
   frame size, 16-byte entry alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half
   zero fill, write count, u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending, a wrong
   trap code for chk.divovf, stack parameters read from the first incoming slot, stack arguments stored one slot low,
   a slice's length taken from its offset, slice block arguments keeping the target's length, slice offsets not
-  scaled by the element size) must each change at least one fixture's status (against its expectation or ngrun's)
-  or alignment.
+  scaled by the element size, monons selecting on GE, fill stores unscaled) must each change at least one fixture's
+  status (against its expectation or ngrun's) or alignment.
+- Front to back differential (not part of rgate; ng-front's front-ir is on another branch): ng-front's `@ng
+  front-ir` (omega-mv ng/front-m3 3353ad67) lowers each `run` case of its `cases-front-ir.txt`; ngcheck accepts all
+  25; `@ng a64` and `@ng a64 split` of that ΩIR give omc's exit status and stdout for the 14 integer `x-*` pairs and
+  the nine integer bench kernels arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul (full size; the
+  kernels' elapsed time goes to stderr, not compared). x-float and linear are refused (floats). Checked 2026-11-07.
 - ΩIR gap met by sort and chacha: a call argument must have exactly the parameter's type (IR.md row 64), so Omega
   passing an `edit` array or slice to a `view` parameter has no ΩIR form while `view` maps to access 0. The fixtures
   type such parameters as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
