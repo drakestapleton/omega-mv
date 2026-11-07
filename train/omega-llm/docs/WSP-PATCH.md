@@ -190,15 +190,15 @@ composition diff, exact identities, small acceptance and round40 rollback; its
 `pure-omega/` directory holds the receipts for the Omega build and test drivers.
 All product transformations and hashing are Omega, and so are the build driver
 `wpbuild.om` and the test driver `wpcheck.om` (see the wpatch README for how to
-run them). The build driver runs these pinned host build tools: the compiler,
-dash 0.5.12-6ubuntu5 as `/bin/sh` for the repository's existing ollm build script
-`tests/omegallm/build.sh`, `/usr/bin/env`, git 2.43.0, GNU sha256sum 9.4, GNU
-diffutils 3.10, taskset util-linux 2.39.3 and GNU nice 9.4. None of them edits
-checkpoints or composes wpatch source; source composition and SHA vendoring are
-done in Omega. The Omega replacement for the ollm build script belongs to the
-ollm lane. Python 3.12.3 with hashlib/struct/mmap appears only as the ORACLE
-`wporacle.py`, a digest calculator called by wpcheck; it never decides a result.
-No new host library enters the product runtime.
+run them). The build driver composes the aarch64 ollm source itself and checks
+the three vendored net sources with the vendored Omega SHA-256, so it no longer
+runs `tests/omegallm/build.sh` or a shell. It runs these pinned host build tools:
+the compiler, git 2.43.0, GNU sha256sum 9.4 (only for the compiler and SHA source
+pins), GNU diffutils 3.10, taskset util-linux 2.39.3 and GNU nice 9.4. None of
+them edits checkpoints or composes source; source composition and SHA vendoring
+are done in Omega. Python 3.12.3 with hashlib/struct/mmap appears only as the
+ORACLE `wporacle.py`, a digest calculator called by wpcheck; it never decides a
+result. No new host library enters the product runtime.
 
 WolframLanguageEvaluator checks used during implementation:
 
