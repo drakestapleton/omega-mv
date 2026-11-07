@@ -1098,6 +1098,58 @@ dispatch events) and four special checks:
 | `journal.om`: recovery masks the fence to 24 bits (the r1 code) | 29: 2^24 + 1 becomes incarnation 1 and is accepted |
 | `code.om`: the cancel hook converts `auth_cancel`'s result before checking it (the r1 code) | 105 (`code-test unit`): -5 traps the conversion (CAST) |
 
+### Policy comparison on real workers (DRA-399)
+
+`bench-test.om` runs the same pinned workloads under four arms: policy 0
+(FIFO), 1 (fair fitting, the default), 2 (goal-aware) and arm 3, policy 2
+given the true durations as estimates. Arm 3 is an ORACLE upper bound, not
+a policy result. The workers are real forked processes on the host's wall
+clock. A worker sleeps for the milliseconds in the low four decimal digits
+of its job id, then reports the outcome id + 1. The creator loop is
+`sched_step` with the dispatch timed. After every step and every
+publication it samples the job table, reviews finished jobs and publishes
+what each declared. Every arm sees the same jobs, requests, durations,
+declarations, workers (2) and capacities (4 CPU). Each job declares its
+topics with `sched_goal`. Its declared estimate is the duration times 1/2,
+1, 3/2 or 2, chosen by a fixed hash of its id, with the estimate itself as
+the declared uncertainty, so policy 2 is never told the duration. Only arm
+3 declares the true duration.
+
+```sh
+cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/node/bench-test.om > build/node/bench-composed.om
+cmp build/node/bench-composed.om seed/node/bench-gate.om
+seed/out/omc < seed/node/bench-gate.om > build/node/bench-gate && chmod +x build/node/bench-gate
+build/node/bench-gate > bench.txt   # 120 runs (6 scenarios x 4 arms x 5), ends "PASS node bench"
+```
+
+| Scenario | Workload |
+| --- | --- |
+| 1 blocked head | h (2 CPU, 600 ms), then H (4 CPU, 300 ms), then six 1-CPU jobs of 200 ms |
+| 2 long chain | eight 1-CPU fillers of 300 ms, then a chain of six 150 ms jobs, each waiting on the topic the previous one publishes |
+| 3 fan-out | six 1-CPU fillers of 300 ms, then a 100 ms root publishing a topic six 200 ms jobs wait on |
+| 4 sustained arrivals | 24 jobs of 100..400 ms needing 1..3 CPU, four every 150 ms |
+| 5 queue pressure | 30 jobs of 100..300 ms needing 1..2 CPU offered at once against an admission limit of 8 (tickets) |
+| 6 worker failure | 12 rerunnable jobs of 150..450 ms needing 1..3 CPU; worker 0 is SIGKILLed 250 ms in while busy and not replaced |
+
+Each run prints `bench S P R` followed by these fields:
+- **makespan:** from the first admission to the last review;
+- **idle eligible capacity:** the integral over time of min(idle live workers, ready jobs that fit the free capacity), in worker-microseconds;
+- **dispatch time:** nanoseconds inside `sched_dispatch` from the creator loop (dispatches inside publication and resume are not timed), and the number of those calls;
+- **scheduler counters:** events, candidate reads, maintenance reads, value reads;
+- **reworked jobs:** jobs that returned to ready after starting;
+- **reservations:** those made, and those that were contested;
+- **verified jobs:** jobs reviewed with the expected outcome;
+- **VmHWM:** the creator's peak resident memory;
+- **waits:** ready to started, per job, in microseconds.
+
+A wait is measured at the sample after the step that dispatched the job, so its resolution is one creator step (at most 1 ms of polling plus the sampling). Every run checks:
+- the capacity invariant (exit 70);
+- that a new reservation goes to the oldest ready job at the bypass budget (71);
+- that every job is reviewed once with its expected outcome within 20 s (72);
+- setup (73..77).
+
+Statistics are computed with Wolfram from the raw lines; the queries are quoted with the results.
+
 ## Local inference and the coding workflow (DRA-290)
 
 Status: IMPLEMENTED in `infer.om`, `tool.om`, `gram.om` and `code.om`,

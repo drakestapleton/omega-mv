@@ -1,0 +1,2963 @@
+note Omega Node transport, concatenate with a program-mode consumer.
+note Trusted forked processes only. This is transport, not write authority.
+note One publisher PID, 64 immutable records per epoch; reuse only via node_reset.
+note Layout: 4096 byte header then 64 slots of 4160 bytes.
+note Header u64: magic, ABI, published count, stop, publisher PID, epoch.
+note Slot u64: version, length, topic mask; payload begins at offset 64.
+const NCAP ulong 64
+const NBYTES ulong 270336
+const NMAGIC ulong 1313817669
+
+fn node_new to long
+h = mapnew neg int 1 0 NBYTES 3 33
+if le h 0
+ret h
+end
+r = mapset h 8 8 1
+r = mapset h 32 8 ulong getpid
+r = mapset h 0 8 NMAGIC
+ret h
+end
+
+fn node_valid h long to bool
+ret and eq mapget h 0 8 NMAGIC eq mapget h 8 8 1
+end
+
+fn node_offset v ulong to ulong
+ret add 4096 mul sub v 1 4160
+end
+
+note Return version, or -1 stopped, -2 full, -3 length, -4 topic,
+note -5 invalid header, -6 wrong publisher. Refusals do not publish.
+fn node_publish h long topics ulong src view uchar 4096 n ulong to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+if ne mapget h 24 8 0
+ret neg long 1
+end
+if gt n 4096
+ret neg long 3
+end
+if eq topics 0
+ret neg long 4
+end
+v = mapget h 16 8
+if gt v NCAP
+ret neg long 5
+end
+if eq v NCAP
+ret neg long 2
+end
+v = add v 1
+off = node_offset v
+r = mapwrite h add off 64 src 0 n
+r = mapset h add off 8 8 n
+r = mapset h add off 16 8 topics
+note mapset has barriers before and after its aligned store.
+r = mapset h off 8 v
+r = mapset h 16 8 v
+ret long v
+end
+
+note Header and record checks precede copying. No partial publication is read.
+note Returns payload length, -5 invalid header/record, -7 unavailable version.
+fn node_read h long v ulong dst edit uchar 4096 to long
+if not node_valid h
+ret neg long 5
+end
+if or eq v 0 gt v NCAP
+ret neg long 7
+end
+latest = mapget h 16 8
+if gt latest NCAP
+ret neg long 5
+end
+if gt v latest
+ret neg long 7
+end
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+n = mapget h add off 8 8
+if gt n 4096
+ret neg long 5
+end
+ret mapread h add off 64 dst 0 n
+end
+
+note Return the next matching version after cursor, zero if caught up,
+note or negative refusal. Caller advances its cursor through returned versions.
+fn node_next h long cursor ulong topics ulong to long
+if not node_valid h
+ret neg long 5
+end
+if or gt cursor NCAP eq topics 0
+ret neg long 7
+end
+latest = mapget h 16 8
+if or gt latest NCAP gt cursor latest
+ret neg long 5
+end
+v = cursor
+note At most NCAP published slots can be examined.
+while lt v latest bound 64
+v = add v 1
+off = node_offset v
+if ne mapget h off 8 v
+ret neg long 5
+end
+if ne and mapget h add off 16 8 topics 0
+ret long v
+end
+end
+ret 0
+end
+
+fn node_stop h long to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+ret mapset h 24 8 1
+end
+
+note Creator only. Retire every record so a pool can reuse the arena for a new
+note epoch. The caller must first prove no reader holds the old epoch (pool.om).
+note The count drops to zero before any record version is cleared.
+fn node_reset h long epoch ulong to long
+if not node_valid h
+ret neg long 5
+end
+if ne mapget h 32 8 ulong getpid
+ret neg long 6
+end
+if eq epoch 0
+ret neg long 7
+end
+r = mapset h 16 8 0
+for i ulong NCAP
+r = mapset h node_offset add i 1 8 0
+end
+r = mapset h 24 8 0
+r = mapset h 40 8 epoch
+ret 0
+end
+
+fn node_epoch h long to ulong
+ret mapget h 40 8
+end
+
+note The latest published version of the arena's current epoch (0 when empty).
+fn node_count h long to ulong
+ret mapget h 16 8
+end
+
+note One nonblocking eventfd per consumer. Saturation means already readable.
+note Interrupted operations retry at most 64 times, then return EINTR.
+fn node_notify fd int to long
+buf = new uchar 8 0
+put buf 0 1
+for i ulong 64
+r = write fd buf 0 8
+if eq r 8
+ret 0
+end
+if eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_drain fd int to long
+buf = new uchar 8 0
+for i ulong 64
+r = read fd buf 0 8
+if or eq r 8 eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn node_pollfd p edit uchar 16 off ulong fd int to void
+for i ulong 4
+put p add off i uchar and shr uint fd uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Returns 2 stop, 1 wake, 0 timeout or negative errno.
+note Control takes priority when both descriptors are ready.
+note EINTR returns to caller so it can recompute its monotonic deadline.
+fn node_wait h long wake int stop int interval long to long
+p = new uchar 16 0
+if not node_valid h
+ret neg long 5
+end
+if or lt wake 0 lt stop 0
+ret neg long 9
+end
+if eq wake stop
+ret neg long 22
+end
+if ne mapget h 24 8 0
+ret 2
+end
+node_pollfd p 0 wake
+node_pollfd p 8 stop
+r = pollfds p 0 16 interval
+if lt r 0
+ret r
+end
+if ne mapget h 24 8 0
+ret 2
+end
+if ne and get p 14 56 0
+ret neg long 5
+end
+if ne and get p 14 1 0
+r = node_drain stop
+if lt r 0
+ret r
+end
+ret 2
+end
+if ne and get p 6 56 0
+ret neg long 5
+end
+if ne and get p 6 1 0
+r = node_drain wake
+if lt r 0
+ret r
+end
+ret 1
+end
+ret 0
+end
+note Omega Node epoch pool. Concatenate after transport.om, before super.om.
+note K arenas (1..8) and one control page are mapped before any worker fork,
+note so every forked worker inherits the same shared mappings.
+note Single writer: the creator writes the current epoch, the arena table and
+note every arena record. Worker w alone writes hold word w while it lives;
+note the creator clears hold w only after it has reaped worker w.
+note Control u64: 0 magic, 8 ABI, 16 current epoch, 24 stop, 32 creator PID,
+note 40 arena count K, 48 worker slots W, 64+8k arena handle k,
+note 128+8k epoch of arena k (0 free), 256+8w hold of worker w (0 none),
+note 768+8w worker PID, 1280+8w worker state (0 empty, 1 live, 2 reaped).
+const PMAGIC ulong 1347374924
+const PCAP ulong 8
+const PWCAP ulong 64
+const PBYTES ulong 4096
+
+fn pool_valid c long to bool
+ret and eq mapget c 0 8 PMAGIC eq mapget c 8 8 1
+end
+
+fn pool_mine c long to bool
+ret eq mapget c 32 8 ulong getpid
+end
+
+fn pool_arena c long k ulong to long
+ret long mapget c add 64 mul k 8 8
+end
+
+note Drop the first n arenas and the control page of a pool being refused.
+fn pool_unwind c long n ulong to long
+for i ulong n bound 8
+r = mapdrop pool_arena c i
+end
+ret mapdrop c
+end
+
+note Return the control handle, or -7 bad size, or a negative mapping errno.
+note Arena 0 starts as epoch 1. Call before forking any worker.
+fn pool_new k ulong w ulong to long
+if or eq k 0 gt k PCAP
+ret neg long 7
+end
+if or eq w 0 gt w PWCAP
+ret neg long 7
+end
+c = mapnew neg int 1 0 PBYTES 3 33
+if le c 0
+ret c
+end
+r = mapset c 32 8 ulong getpid
+r = mapset c 40 8 k
+r = mapset c 48 8 w
+for i ulong k bound 8
+h = node_new
+if le h 0
+r = pool_unwind c i
+ret h
+end
+r = mapset c add 64 mul i 8 8 ulong h
+end
+r = node_reset pool_arena c 0 1
+r = mapset c 128 8 1
+r = mapset c 16 8 1
+r = mapset c 8 8 1
+r = mapset c 0 8 PMAGIC
+ret c
+end
+
+note Arena index holding epoch e, or -5 when no arena holds it.
+fn pool_slot c long e ulong to long
+k = mapget c 40 8
+if gt k PCAP
+ret neg long 5
+end
+for i ulong k bound 8
+if eq mapget c add 128 mul i 8 8 e
+ret long i
+end
+end
+ret neg long 5
+end
+
+note Creator: the arena of the current epoch, or a negative refusal.
+fn pool_current c long to long
+if not pool_valid c
+ret neg long 5
+end
+k = pool_slot c mapget c 16 8
+if lt k 0
+ret k
+end
+ret pool_arena c ulong k
+end
+
+fn pool_epoch c long to ulong
+ret mapget c 16 8
+end
+
+note Worker step: store hold e for worker w, then read the epoch again. mapset
+note and mapget fence both sides, so a creator that moved the epoch before it
+note scanned holds either sees this hold or this read sees the move. Returns
+note the arena of e, -8 when the epoch moved, or -5 when no arena holds e.
+note Every refusal clears the hold.
+fn pool_hold c long w ulong e ulong to long
+if ge w mapget c 48 8
+ret neg long 7
+end
+hw = add 256 mul w 8
+r = mapset c hw 8 e
+if ne mapget c 16 8 e
+r = mapset c hw 8 0
+ret neg long 8
+end
+k = pool_slot c e
+if lt k 0
+r = mapset c hw 8 0
+ret k
+end
+h = pool_arena c ulong k
+if ne node_epoch h e
+r = mapset c hw 8 0
+ret neg long 5
+end
+ret h
+end
+
+note Worker w holds the current epoch and returns its arena. Returns -1
+note stopped, -5 invalid, -7 bad worker, -8 the epoch kept moving.
+fn pool_acquire c long w ulong to long
+if not pool_valid c
+ret neg long 5
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+for t ulong 16
+if ne mapget c 24 8 0
+r = mapset c add 256 mul w 8 8 0
+ret neg long 1
+end
+h = pool_hold c w mapget c 16 8
+if ne h neg long 8
+ret h
+end
+end
+ret neg long 8
+end
+
+note Worker w gives up its hold. Its old arena must not be read afterwards.
+fn pool_release c long w ulong to long
+if ge w mapget c 48 8
+ret neg long 7
+end
+ret mapset c add 256 mul w 8 8 0
+end
+
+fn pool_held c long e ulong to bool
+n = mapget c 48 8
+for w ulong n bound 64
+if eq mapget c add 256 mul w 8 8 e
+ret true
+end
+end
+ret false
+end
+
+note Creator step: retire arena i and open epoch n in it, then publish n.
+fn pool_reuse c long i ulong n ulong to long
+off = add 128 mul i 8
+r = mapset c off 8 0
+r = node_reset pool_arena c i n
+if lt r 0
+ret r
+end
+r = mapset c off 8 n
+r = mapset c 16 8 n
+ret long n
+end
+
+note Creator step: an arena that is free or whose older epoch no worker holds,
+note or -9. Call only after the current epoch has moved past that arena.
+fn pool_pick c long to long
+e = mapget c 16 8
+k = mapget c 40 8
+for i ulong k bound 8
+ek = mapget c add 128 mul i 8 8
+if ne ek e
+if or eq ek 0 not pool_held c ek
+ret long i
+end
+end
+end
+ret neg long 9
+end
+
+note Creator: open the next epoch in a free or unheld arena and make it current.
+note Returns the new epoch, -1 stopped, -5 invalid, -6 not creator, or -9 when
+note every other arena is still held: the pool fails closed, nothing changes.
+fn pool_roll c long to long
+if not pool_valid c
+ret neg long 5
+end
+if not pool_mine c
+ret neg long 6
+end
+if ne mapget c 24 8 0
+ret neg long 1
+end
+k = pool_pick c
+if lt k 0
+ret k
+end
+ret pool_reuse c ulong k add mapget c 16 8 1
+end
+
+note Creator: publish to the current epoch; when it is full, roll once and retry.
+note Returns the version, or the refusal of the publish or of the roll.
+fn pool_publish c long topics ulong src view uchar 4096 n ulong to long
+h = pool_current c
+if lt h 0
+ret h
+end
+v = node_publish h topics src n
+if ne v neg long 2
+ret v
+end
+r = pool_roll c
+if lt r 0
+ret r
+end
+h = pool_current c
+if lt h 0
+ret h
+end
+ret node_publish h topics src n
+end
+
+fn pool_stop c long to long
+if not pool_valid c
+ret neg long 5
+end
+if not pool_mine c
+ret neg long 6
+end
+ret mapset c 24 8 1
+end
+
+fn pool_stopped c long to bool
+ret ne mapget c 24 8 0
+end
+
+note Creator: record worker w's PID and state for observers.
+fn pool_setw c long w ulong pid ulong st ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+r = mapset c add 768 mul w 8 8 pid
+ret mapset c add 1280 mul w 8 8 st
+end
+
+note Creator: clear hold w. Only after worker w has been reaped.
+fn pool_clear c long w ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+ret mapset c add 256 mul w 8 8 0
+end
+
+note Drop every mapping of the pool in this process. Other processes keep
+note their own inherited mappings until they drop them or exit.
+fn pool_free c long to long
+ret pool_unwind c mapget c 40 8
+end
+note Omega Node worker supervision. Concatenate after transport.om and pool.om.
+note The creator forks trusted workers from its own binary: sup_spawn returns 0
+note in the child, which runs its worker function and exits with its result.
+note Death is seen without polling PIDs. Worker w alone holds the write end of
+note its close-on-exec life pipe, so its exit hangs up the creator's read end.
+note Every worker holds the read end of the creator's life pipe, whose only
+note writer is the creator, so creator death hangs up every worker.
+note Per worker: wake, stop and ack eventfds, kept across respawns.
+note Workers must not exec: exec closes the life pipe and reads as death.
+global swpid long 64
+global swwake int 64
+global swstop int 64
+global swack int 64
+global swlife int 64
+global swst ulong 64
+global swpw ulong 64
+global swpar int 2
+global swme ulong 1
+global swws uchar 4
+global swpf uchar 8
+global swpoll uchar 1024
+
+fn sup_fd off ulong to int
+v = ulong get swpf off
+v = or v shl ulong get swpf add off 1 8
+v = or v shl ulong get swpf add off 2 16
+v = or v shl ulong get swpf add off 3 24
+ret int v
+end
+
+note Poll record j at swpoll offset off; a negative fd is stored as itself
+note (bit pattern) so the kernel ignores that record.
+fn sup_gpfd off ulong fd int to void
+u = bitcast uint fd
+for i ulong 4
+put swpoll add off i uchar and shr u uint mul i 8 255
+end
+put swpoll add off 4 1
+put swpoll add off 5 0
+put swpoll add off 6 0
+put swpoll add off 7 0
+end
+
+fn sup_lpfd p edit uchar 24 off ulong fd int to void
+for i ulong 4
+put p add off i uchar and shr uint fd uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Read and reset an eventfd counter: the number of hints since the last
+note take, 0 when none is pending, or a negative errno.
+fn sup_take fd int to long
+buf = new uchar 8 0
+for i ulong 64
+r = read fd buf 0 8
+if eq r 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get buf j mul j 8
+end
+ret long and v 9223372036854775807
+end
+if eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn sup_closeall to void
+for i ulong 64
+if ge get swwake i 0
+r = fclose get swwake i
+end
+if ge get swstop i 0
+r = fclose get swstop i
+end
+if ge get swack i 0
+r = fclose get swack i
+end
+if ge get swlife i 0
+r = fclose get swlife i
+end
+put swwake i neg int 1
+put swstop i neg int 1
+put swack i neg int 1
+put swlife i neg int 1
+end
+for i ulong 2
+if ge get swpar i 0
+r = fclose get swpar i
+end
+put swpar i neg int 1
+end
+end
+
+note Creator: create the creator life pipe and three eventfds per worker slot.
+note Call once after pool_new and before sup_spawn. 0 or a negative errno;
+note a failure closes everything this call opened.
+fn sup_init c long to long
+if not pool_mine c
+ret neg long 6
+end
+for i ulong 64
+put swpid i 0
+put swst i 0
+put swwake i neg int 1
+put swstop i neg int 1
+put swack i neg int 1
+put swlife i neg int 1
+end
+put swme 0 0
+put swpar 0 neg int 1
+put swpar 1 neg int 1
+r = pipefds swpf 0 8 524288
+if lt r 0
+ret r
+end
+put swpar 0 sup_fd 0
+put swpar 1 sup_fd 4
+n = mapget c 48 8
+for i ulong n bound 64
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swwake i int a
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swstop i int a
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swack i int a
+end
+ret 0
+end
+
+note Creator: fork worker w. Returns 0 in the child, the child PID in the
+note creator, -7 bad slot, -16 slot still live, or a negative errno. The
+note child keeps only its own life write end; the creator keeps the read end.
+fn sup_spawn c long w ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+if ne get swpid w 0
+ret neg long 16
+end
+r = pipefds swpf 0 8 524288
+if lt r 0
+ret r
+end
+rd = sup_fd 0
+wr = sup_fd 4
+pid = fork
+if eq pid 0
+r = fclose get swpar 1
+put swpar 1 neg int 1
+r = fclose rd
+put swlife w wr
+put swme 0 add w 1
+ret 0
+end
+r = fclose wr
+if lt pid 0
+r = fclose rd
+ret pid
+end
+put swpid w pid
+put swlife w rd
+r = pool_setw c w ulong pid 1
+ret pid
+end
+
+note Worker: 3 creator gone, 2 stop, 1 wake hint, 0 timeout, negative errno.
+note Creator loss outranks stop, which outranks work. A set stop flag makes
+note the poll nonblocking. Hints are drained; rescan shared state after 1.
+fn sup_wwait c long w ulong interval long to long
+p = new uchar 24 0
+if ge w 64
+ret neg long 7
+end
+iv = interval
+if pool_stopped c
+iv = 0
+end
+sup_lpfd p 0 get swwake w
+sup_lpfd p 8 get swstop w
+sup_lpfd p 16 get swpar 0
+r = pollfds p 0 24 iv
+if lt r 0
+ret r
+end
+if ne get p 22 0
+ret 3
+end
+if pool_stopped c
+ret 2
+end
+if ne and get p 14 56 0
+ret neg long 5
+end
+if ne and get p 14 1 0
+r = node_drain get swstop w
+ret 2
+end
+if ne and get p 6 56 0
+ret neg long 5
+end
+if ne and get p 6 1 0
+r = node_drain get swwake w
+if lt r 0
+ret r
+end
+ret 1
+end
+ret 0
+end
+
+note Worker or creator: post a hint on worker w's ack eventfd.
+fn sup_ack w ulong to long
+if ge w 64
+ret neg long 7
+end
+ret node_notify get swack w
+end
+
+note Creator: wake worker w with a work hint.
+fn sup_wake w ulong to long
+if ge w 64
+ret neg long 7
+end
+if le get swpid w 0
+ret neg long 3
+end
+ret node_notify get swwake w
+end
+
+fn sup_live c long to ulong
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+if gt get swpid w 0
+k = add k 1
+end
+end
+ret k
+end
+
+note Creator: reap worker w, then release what it held. A worker that has not
+note exited within about one second gets SIGKILL first. Only after the exact
+note PID is reaped are its hold, PID and life pipe released. Returns the raw
+note wait status, -3 no live worker, or the waitpid errno (nothing released).
+fn sup_reap c long w ulong to long
+if ge w 64
+ret neg long 7
+end
+pid = get swpid w
+if le pid 0
+ret neg long 3
+end
+done = false
+for t ulong 100
+r = waitpid int pid swws 0 4 1
+if eq r pid
+done = true
+break
+end
+if ne r 0
+ret r
+end
+r = sleepns 10000000
+end
+if not done
+r = killpid int pid 9
+r = waitpid int pid swws 0 4 0
+if ne r pid
+ret r
+end
+end
+st = ulong get swws 0
+st = or st shl ulong get swws 1 8
+put swst w st
+r = fclose get swlife w
+put swlife w neg int 1
+put swpid w 0
+r = pool_clear c w
+r = pool_setw c w 0 2
+ret long st
+end
+
+note Creator: wait up to interval ns for deaths and, when acks is true, acks.
+note Ack counts are left pending for sup_take. Every worker whose life pipe
+note hung up is reaped. Returns the number reaped, or a negative errno.
+fn sup_pollx c long interval long acks bool to long
+n = mapget c 48 8
+m = ulong 0
+for w ulong n bound 64
+if gt get swpid w 0
+o = mul m 16
+if acks
+sup_gpfd o get swack w
+else
+sup_gpfd o neg int 1
+end
+sup_gpfd add o 8 get swlife w
+put swpw m w
+m = add m 1
+end
+end
+if eq m 0
+ret 0
+end
+r = pollfds swpoll 0 mul m 16 interval
+if lt r 0
+ret r
+end
+dead = long 0
+for j ulong m bound 64
+o = add mul j 16 14
+if ne get swpoll o 0
+r = sup_reap c get swpw j
+if lt r 0
+ret r
+end
+dead = add dead 1
+end
+end
+ret dead
+end
+
+note Creator: wait up to interval ns for acks and deaths (see sup_pollx).
+fn sup_poll c long interval long to long
+ret sup_pollx c interval true
+end
+
+note Creator: stop admission, post every live worker's stop eventfd, then reap
+note until all have exited or interval ns pass; survivors get SIGKILL and are
+note reaped. Returns how many had to be killed, or a refusal.
+fn sup_stop c long interval long to long
+r = pool_stop c
+if lt r 0
+ret r
+end
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+r = node_notify get swstop w
+end
+end
+dl = add monons interval
+for t ulong 100000
+if eq sup_live c 0
+ret 0
+end
+now = monons
+if ge now dl
+break
+end
+r = sup_pollx c sub dl now false
+if lt r 0
+if ne r neg long 4
+break
+end
+end
+end
+killed = long 0
+for w ulong n bound 64
+if gt get swpid w 0
+r = killpid int get swpid w 9
+r = sup_reap c w
+killed = add killed 1
+end
+end
+ret killed
+end
+note Omega Node cooperative scheduling (DRA-287). Concatenate after
+note transport.om, pool.om and super.om, before one program with fn main.
+note One creator admits, assigns, collects and reviews jobs. Workers never
+note write each other's state, and no step waits for every worker.
+note Scheduling page: one 128-byte cell per worker w at 128*w.
+note Creator writes 0 assigned seq, 8 job id, 16 input epoch, 24 input
+note version, 32 interest topics, 40 wake stamp (monons at the last post).
+note Worker writes 64 done seq, 72 outcome, 80 wakes, 88 last wake latency
+note ns, 96 largest wake latency ns.
+note Outbox: worker w's result bytes at 4096*w of a second mapping, written
+note before its done seq. Each word has one writer; the creator writes a
+note worker word only after it has reaped that worker.
+note Job states: 0 free, 1 waiting for deps, 2 ready, 3 running, 4 in review,
+note 6 UNKNOWN (its worker died mid-job and the job is not safe to rerun).
+note
+note Resources and selection policy (P-DRA-14, DRA-395). A request is one
+note ulong of four 16-bit counts, kind k at bits 16k..16k+15: kind 0 CPU
+note slots, 1 memory MiB, 2 inference slots, 3 caller-defined. scap holds
+note the configured capacity of each kind, suse the sum of the needs of the
+note jobs that hold resources (sjheld 1). A job takes its whole need when it
+note is assigned and gives it back when its worker reports done or is reaped,
+note never in part. Every job also needs one idle live worker.
+note sjarr: admission order (waiting age; kept across reruns). sjrdy: order
+note in which the job last became ready. sjbyp: times it was bypassed.
+note Decisions read only these logical counters, never the clock.
+note Policy 1, fair fitting (DRA-396): a pick first probes the reserved job;
+note otherwise it scans a window of win slots from a persistent cursor and
+note takes the oldest admitted ready job that fits. The cursor moves on by
+note win after every window scan, so every slot is examined within
+note ceil(64/win) window scans. A ready job older than a job assigned in
+note the same event was bypassed; once the oldest such job reaches the
+note bypass budget it is reserved: it is offered first, and no other job may
+note use, of any kind, the capacity it still lacks (others may use only
+note free capacity beyond its need). Neither the free capacity it can reach
+note nor its age ever shrinks, so it runs once running work releases enough
+note (liveness assumes: every running job ends, by completion or by its
+note lease, at least one worker stays live, results in review are reviewed,
+note and dispatch is not paused). Requests over capacity are refused at
+note admission.
+note Admission: room is the smaller of the admission headroom and the free
+note table slots. A refused caller holds a ticket; while tickets are held
+note only the first holder may enter, so holders enter in ticket order
+note before anyone new. A ticket not asked about for more than ttl dispatch
+note events lapses (asked at event e, it survives while e + ttl is at least
+note the current event count). An absent head blocks later holders until
+note its ticket lapses; a paused dispatch counts no events, so the block
+note lasts until dispatch resumes.
+note Leases: a running job with a lease is reported once by sched_overdue
+note after its lease passes; the authority then cancels or kills it, which
+note releases its resources.
+note
+note Policy 2, goal-aware fair fitting (DRA-397): policy 1 with a different
+note order among the examined jobs that fit: larger unblock value first (the
+note waiting jobs, to depth 2, that the job's declared topics would make
+note ready), then smaller declared estimate, then older admission. The
+note reservation, the hold-back, feasibility and the bypass budget are
+note those of policy 1 and come first, so ranking cannot starve old work.
+note Values are rescored only when the graph version moved (a job became
+note ready, a waiting job was admitted, a job was cancelled, a declaration
+note changed), once per pick however many changes came before it.
+note Completions, releases and lease expiry replan (every step dispatches)
+note without rescoring. A proposal names a job by id and the graph version
+note it was computed at, and is rejected when that version is no longer
+note current; the version carries the scheduler's incarnation, so a
+note proposal made for another scheduler is never current here.
+const SJCAP ulong 64
+const SPVER ulong 3
+global scmap long 2
+global sclim ulong 2
+global sjst ulong 64
+global sjdep ulong 64
+global sjid ulong 64
+global sjw ulong 64
+global sjatt ulong 64
+global sjfl ulong 64
+global sjout ulong 64
+global sjneed ulong 64
+global sjheld ulong 64
+global sjarr ulong 64
+global sjrdy ulong 64
+global sjbyp ulong 64
+global sjlse ulong 64
+global sjdue ulong 64
+global sttk ulong 64
+global stts ulong 64
+global scbusy ulong 64
+global scseq ulong 64
+global swcur ulong 2
+global scpause ulong 1
+global scap ulong 4
+global suse ulong 4
+note Policy words: 0 policy (0 FIFO head-of-line, 1 fair fitting), 1
+note candidate window in slots, 2 dispatch budget per event, 3 bypass
+note budget, 4 cursor, 5 reserved job slot + 1 (0 none), 6 tickets held,
+note 7 ticket lifetime in dispatch events.
+global scpol ulong 8
+note Counters (sched_stat): 0 admissions, 1 ready stamps, 2 dispatch events,
+note 3 candidate slot reads, 4 jobs assigned, 5 bypasses, 6 reservations
+note made, 7 impossible requests refused, 8 head-of-line stops, 9 reserved
+note jobs assigned, 10 tickets issued, 11 tickets lapsed, 12 leases overdue,
+note 13 maintenance slot reads, 14 window scans, 15 dispatch events refused
+note because the replay ring was full (DRA-398).
+global scst ulong 16
+note Goal-aware ranking (policy 2): sjpro the topics a job declares its
+note completion publishes, sjest its declared work estimate in ms, sjunc
+note that estimate's uncertainty in ms, sjval its unblock value in jobs as
+note last scored. scgv: 0 graph version, 1 version last scored, 2 proposed
+note job slot + 1 (0 none), 3 version the proposal named, 4 proposal state
+note (0 no incarnation yet: proposals refused; 1 accepting; 2 the version
+note is exhausted: proposals refused for the rest of this scheduler). The
+note graph version is the scheduler's incarnation (sched_incarnate, once)
+note times 2^40 plus the bumps since, never more than 2^40 - 1 of them: the
+note bump that would carry into the next incarnation's range exhausts the
+note version instead, so schedulers of different incarnations never share a
+note version. Within one scheduler every admission of a job, cancellation
+note of a waiting or ready one and readiness bumps it, so a proposal whose
+note version is current still names the job it was made for.
+global sjpro ulong 64
+global sjest ulong 64
+global sjunc ulong 64
+global sjval ulong 64
+global scgv ulong 5
+note Goal counters (sched_stat 32..39): 0 rescores, 1 jobs scored, 2 graph
+note version bumps, 3 proposals accepted, 4 proposals stale, 5 proposals
+note refused, 6 slots read by value traversal, 7 proposals used.
+global scgst ulong 8
+note Replay ring (DRA-398). While a journal is attached (sfj 0 is 1), each
+note dispatch event that assigned a job or changed the reservation leaves a
+note record of 6 words in sfr: event count, assigned slot bitmap, bypassed
+note slot bitmap (the slots whose bypass count went up), cursor, reserved
+note slot + 1, and 0. A publication that makes waiting jobs ready leaves a
+note readiness record: the current event count, no assigned or bypassed
+note slot, cursor, reserved slot + 1, and the bitmap of the slots it made
+note ready. sfj 1 counts the records waiting; sfj 2 and 3 are the
+note reservation at the start of the current event and the slots it has
+note assigned so far. The journal drains them before it appends any other
+note record, so a transition is never durable before the dispatch
+note decisions and readiness that came before it. With 64 waiting,
+note dispatch assigns nothing and publication is refused (counter 15)
+note until they are drained.
+global sfr ulong 384
+global sfj ulong 4
+
+fn sc_cell w ulong off ulong to ulong
+ret mapget get scmap 0 add mul w 128 off 8
+end
+
+fn sc_set w ulong off ulong v ulong to void
+r = mapset get scmap 0 add mul w 128 off 8 v
+end
+
+note Creator, before any fork: map the scheduling page and the outboxes and
+note set the limits on admitted (a) and in-review (rl) jobs, each 1..64.
+note Returns 0, -6 not creator, -7 bad limit, or a mapping errno.
+fn sched_new c long a ulong rl ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if or eq a 0 gt a SJCAP
+ret neg long 7
+end
+if or eq rl 0 gt rl SJCAP
+ret neg long 7
+end
+s = mapnew neg int 1 0 8192 3 33
+if le s 0
+ret s
+end
+o = mapnew neg int 1 0 262144 3 33
+if le o 0
+r = mapdrop s
+ret o
+end
+put scmap 0 s
+put scmap 1 o
+put sclim 0 a
+put sclim 1 rl
+for j ulong 64
+put sjst j 0
+put sjheld j 0
+put sjlse j 0
+put sjdue j 0
+put sjpro j 0
+put sjest j 0
+put sjunc j 0
+put sjval j 0
+put scbusy j 0
+put scseq j 0
+end
+for k ulong 4
+put scap k 65535
+put suse k 0
+end
+put sfj 1 0
+for i ulong 16
+put scst i 0
+end
+for i ulong 8
+put scgst i 0
+end
+for i ulong 5
+put scgv i 0
+end
+put scpol 0 1
+put scpol 1 64
+put scpol 2 64
+put scpol 3 4
+put scpol 4 0
+put scpol 5 0
+put scpol 6 0
+put scpol 7 1000
+put scpause 0 0
+ret 0
+end
+
+note Count of kind k (0..3) in packed request req.
+fn sp_need req ulong k ulong to ulong
+ret and shr req mul k 16 65535
+end
+
+note Free capacity of kind k. sched_cap never sets a capacity below the
+note use, so this cannot underflow.
+fn sp_free k ulong to ulong
+ret sub get scap k get suse k
+end
+
+note Does req fit in the free capacity once the reserved request res has
+note what it still lacks? Of each kind, res keeps min(free, its need); res 0
+note is no reservation. This keeps the reserved job's attainable capacity
+note from ever shrinking (the drain).
+fn sp_fits req ulong res ulong to bool
+for k ulong 4
+f = sp_free k
+r = sp_need res k
+a = ulong 0
+if gt f r
+a = sub f r
+end
+if gt sp_need req k a
+ret false
+end
+end
+ret true
+end
+
+note Could req ever run, with the configured capacity all free?
+fn sp_feas req ulong to bool
+for k ulong 4
+if gt sp_need req k get scap k
+ret false
+end
+end
+ret true
+end
+
+note Job j takes its whole need.
+fn sp_take j ulong to void
+for k ulong 4
+put suse k add get suse k sp_need get sjneed j k
+end
+put sjheld j 1
+end
+
+note Job j gives back its need, if it holds it.
+fn sp_give j ulong to void
+if eq get sjheld j 0
+ret
+end
+for k ulong 4
+put suse k sub get suse k sp_need get sjneed j k
+end
+put sjheld j 0
+end
+
+note Job j becomes ready, stamped with the next ready order.
+fn sp_ready j ulong to void
+put sjst j 2
+put sjrdy j get scst 1
+put scst 1 add get scst 1 1
+sp_bump
+end
+
+note Creator: counter i of scst, capacity (i 16..19) or use (i 20..23) of a
+note kind, policy word (i 24..31), goal counter (i 32..39), graph version
+note (i 40), proposal state (i 41: 0 no incarnation, 1 accepting, 2
+note exhausted).
+fn sched_stat i ulong to ulong
+if lt i 16
+ret get scst i
+end
+if lt i 20
+ret get scap sub i 16
+end
+if lt i 24
+ret get suse sub i 20
+end
+if lt i 32
+ret get scpol sub i 24
+end
+if lt i 40
+ret get scgst sub i 32
+end
+if eq i 40
+ret get scgv 0
+end
+if eq i 41
+ret get scgv 4
+end
+ret 0
+end
+
+note Creator: would sched_cap caps be accepted? Not when the new capacity of
+note a kind is below its use by running jobs, or below the need of any one
+note admitted job.
+fn sched_capok caps ulong to bool
+for k ulong 4
+if lt sp_need caps k get suse k
+ret false
+end
+end
+for j ulong 64
+s = get sjst j
+if and ge s 1 le s 3
+for k ulong 4
+if gt sp_need get sjneed j k sp_need caps k
+ret false
+end
+end
+end
+end
+ret true
+end
+
+note Creator: set the capacity of every kind from caps (packed like a
+note request). 0, or -8 when sched_capok refuses (nothing changes).
+fn sched_cap caps ulong to long
+if not sched_capok caps
+ret neg long 8
+end
+for k ulong 4
+put scap k sp_need caps k
+end
+ret 0
+end
+
+note Creator: the configured capacities, packed like a request.
+fn sched_caps to ulong
+v = ulong 0
+for k ulong 4
+v = or v shl get scap k mul k 16
+end
+ret v
+end
+
+note Creator: would sched_policy accept these words? Policy p 0..2, window
+note win 1..64, dispatch budget db 1..64, bypass budget by 1..65535, ticket
+note lifetime ttl 1..1000000.
+fn sched_polok p ulong win ulong db ulong by ulong ttl ulong to bool
+if gt p 2
+ret false
+end
+if or eq win 0 gt win 64
+ret false
+end
+if or eq db 0 gt db 64
+ret false
+end
+if or eq by 0 gt by 65535
+ret false
+end
+ret and gt ttl 0 le ttl 1000000
+end
+
+note Creator: policy p (0 FIFO head-of-line, 1 fair fitting, 2 goal-aware
+note fair fitting), candidate window win slots, dispatch budget db jobs per
+note event, bypass budget by, ticket lifetime ttl dispatch events, in the
+note ranges of sched_polok. The cursor and any reservation are kept. 0 or
+note -7.
+fn sched_policy p ulong win ulong db ulong by ulong ttl ulong to long
+if not sched_polok p win db by ttl
+ret neg long 7
+end
+put scpol 0 p
+put scpol 1 win
+put scpol 2 db
+put scpol 3 by
+put scpol 7 ttl
+ret 0
+end
+
+note Creator: drop this process's scheduling mappings.
+fn sched_free to long
+r = mapdrop get scmap 1
+if lt r 0
+ret r
+end
+ret mapdrop get scmap 0
+end
+
+note Jobs whose state is in lo..hi.
+fn sched_count lo ulong hi ulong to ulong
+n = ulong 0
+for j ulong 64
+s = get sjst j
+if and ge s lo le s hi
+n = add n 1
+end
+end
+ret n
+end
+
+note Position of id's admission ticket, or 64.
+fn sp_tkpos id ulong to ulong
+for t ulong get scpol 6 bound 64
+if eq get sttk t id
+ret t
+end
+end
+ret 64
+end
+
+note Compact the tickets in order, dropping ticket d (64: none) and every
+note ticket not asked about for the ticket lifetime.
+fn sp_tkpack d ulong to void
+k = ulong 0
+for t ulong get scpol 6 bound 64
+if ne t d
+if lt add get stts t get scpol 7 get scst 2
+put scst 11 add get scst 11 1
+else
+put sttk k get sttk t
+put stts k get stts t
+k = add k 1
+end
+end
+end
+put scpol 6 k
+end
+
+note Refresh ticket t, or give id a ticket at the end when it has none and
+note the line has room (a caller refused with the line full holds none).
+fn sp_tkhold id ulong t ulong to void
+if lt t 64
+put stts t get scst 2
+ret
+end
+n = get scpol 6
+if lt n 64
+put sttk n id
+put stts n get scst 2
+put scpol 6 add n 1
+put scst 10 add get scst 10 1
+end
+end
+
+note Creator: may id be admitted now? Room is the smaller of the admission
+note headroom and the free table slots (a job in review or UNKNOWN holds
+note its slot). While tickets are held only the first holder may enter;
+note with none, anyone may while there is room. A refused caller gets or
+note keeps a ticket; every ask by a holder, refused or not, refreshes its
+note ticket's last-asked event, and a caller with room and no ticket gets
+note none. A true answer guarantees the slot for the next sched_admitr
+note (single creator), so a caller may ask before journaling (as jn_admit
+note does).
+fn sched_room id ulong to bool
+sp_tkpack 64
+t = sp_tkpos id
+a = ulong 0
+fs = ulong 0
+for j ulong 64
+s = get sjst j
+if eq s 0
+fs = add fs 1
+end
+if and ge s 1 le s 3
+a = add a 1
+end
+end
+room = ulong 0
+if lt a get sclim 0
+room = sub get sclim 0 a
+end
+if lt fs room
+room = fs
+end
+if gt room 0
+if eq get scpol 6 0
+ret true
+end
+if eq t 0
+put stts 0 get scst 2
+ret true
+end
+end
+sp_tkhold id t
+ret false
+end
+
+note Creator: admit job id needing req (packed resources). deps 0 makes it
+note ready at once; otherwise it waits for a publication whose topics meet
+note deps. flags bit 0: safe to rerun after its worker dies. Returns the job
+note slot; -8 when req exceeds the configured capacity of a kind (it could
+note never run); -2 when sched_room refuses: at the admission limit, or
+note ticket holders ahead; the caller keeps a ticket and asks again.
+fn sched_admitr id ulong deps ulong flags ulong req ulong to long
+ret sched_admits id deps flags req sched_slot
+end
+
+note Creator: the lowest free table slot (the one sched_admitr would give
+note the next job), or 64 when none is free.
+fn sched_slot to ulong
+for j ulong 64
+if eq get sjst j 0
+ret j
+end
+end
+ret 64
+end
+
+note Creator: could req ever run, with the configured capacity all free?
+fn sched_feas req ulong to bool
+ret sp_feas req
+end
+
+note Creator: sched_admitr into table slot j, which must be free: the
+note journal records the slot with the admission and recovery puts the job
+note back into it (DRA-398). Refusals as sched_admitr; -2 also when slot j
+note is not free.
+fn sched_admits id ulong deps ulong flags ulong req ulong j ulong to long
+if not sp_feas req
+put scst 7 add get scst 7 1
+ret neg long 8
+end
+if not sched_room id
+ret neg long 2
+end
+if ge j 64
+ret neg long 2
+end
+if ne get sjst j 0
+ret neg long 2
+end
+t = sp_tkpos id
+if lt t 64
+sp_tkpack t
+end
+put sjid j id
+put sjdep j deps
+put sjfl j flags
+put sjatt j 0
+put sjout j 0
+put sjw j 0
+put sjneed j req
+put sjheld j 0
+put sjbyp j 0
+put sjlse j 0
+put sjdue j 0
+put sjarr j get scst 0
+put scst 0 add get scst 0 1
+put sjpro j 0
+put sjest j 0
+put sjunc j 0
+put sjval j 0
+if eq deps 0
+sp_ready j
+else
+put sjst j 1
+sp_bump
+end
+ret long j
+end
+
+note Creator: job j (waiting, ready or running) gets a lease of ns from its
+note next assignment, or from now when it runs; 0 removes it. 0; -3 for a
+note slot that is not waiting, ready or running; -7 for ns above 2^50 (about
+note 13 days). Both refusals change nothing. The bound keeps every deadline
+note (the monotonic clock, below 2^63, plus ns) representable: it never
+note wraps into the past or onto 0, the no-deadline value.
+fn sched_lease j ulong ns ulong to long
+if ge j 64
+ret neg long 3
+end
+s = get sjst j
+if or lt s 1 gt s 3
+ret neg long 3
+end
+if gt ns 1125899906842624
+ret neg long 7
+end
+put sjlse j ns
+if eq s 3
+put sjdue j 0
+if gt ns 0
+put sjdue j add ulong monons ns
+end
+end
+ret 0
+end
+
+note Creator: a running job past its lease whose worker has not reported
+note done, reported once (its deadline is cleared): its slot, or 64. The
+note authority cancels or kills it; the release follows from the worker's
+note report or reap.
+fn sched_overdue to ulong
+now = ulong monons
+for j ulong 64
+if eq get sjst j 3
+d = get sjdue j
+if gt d 0
+if ge now d
+w = get sjw j
+if ne sc_cell w 64 get scseq w
+put sjdue j 0
+put scst 12 add get scst 12 1
+ret j
+end
+end
+end
+end
+end
+ret 64
+end
+
+note Creator: sched_admitr with no resource need beyond one worker.
+fn sched_admit id ulong deps ulong flags ulong to long
+ret sched_admitr id deps flags 0
+end
+
+note Creator: worker w is woken by publications whose topics meet topics.
+fn sched_want w ulong topics ulong to long
+if ge w 64
+ret neg long 7
+end
+sc_set w 32 topics
+ret 0
+end
+
+fn sc_wake w ulong to void
+sc_set w 40 ulong monons
+r = sup_wake w
+end
+
+note Lowest idle live worker below n, or 64 when none. A worker is idle when
+note the creator has collected its last assignment.
+fn sp_idle n ulong to ulong
+for w ulong n bound 64
+if and gt get swpid w 0 eq get scbusy w 0
+ret w
+end
+end
+ret 64
+end
+
+note Assign job j to idle worker w: it takes its need; the job id and the
+note input epoch and version are written before the seq, then the wake.
+fn sp_start c long j ulong w ulong to void
+q = add get scseq w 1
+put scseq w q
+put scbusy w add j 1
+put sjst j 3
+put sjw j w
+put sjatt j add get sjatt j 1
+put sjbyp j 0
+put sjdue j 0
+if gt get sjlse j 0
+put sjdue j add ulong monons get sjlse j
+end
+sp_take j
+if eq get scpol 5 add j 1
+put scpol 5 0
+put scst 9 add get scst 9 1
+end
+sc_set w 8 get sjid j
+sc_set w 16 pool_epoch c
+sc_set w 24 node_count pool_current c
+sc_set w 0 q
+sc_wake w
+put scst 4 add get scst 4 1
+end
+
+note Policy 0, FIFO head-of-line: the stop rule of the reference pump
+note (aien-sovereign-core-mv spark-harness scheduler/core.rs Core::pump,
+note 598-602), not its queue: the head here is the ready job that became
+note ready first (the pump batches newly eligible tasks in task-id order
+note into a bounded queue). The head is chosen when it fits, and when it
+note does not fit nothing is chosen, so a head that does
+note not fit holds back every later job. Returns the slot or 64.
+fn sp_fifo to ulong
+h = ulong 64
+for j ulong 64
+put scst 3 add get scst 3 1
+if eq get sjst j 2
+if eq h 64
+h = j
+else
+if lt get sjrdy j get sjrdy h
+h = j
+end
+end
+end
+end
+if eq h 64
+ret 64
+end
+if sp_fits get sjneed h 0
+ret h
+end
+put scst 8 add get scst 8 1
+ret 64
+end
+
+note Policy 1, fair fitting: the reserved job first when it fits; else the
+note oldest admitted ready job, among win slots from the cursor, that fits
+note without the capacity the reserved job still lacks; the cursor then
+note moves on by win. Returns the slot or 64. Every slot read counts
+note (counter 3: the reserved probe and the window), at most win + 1 per
+note pick; counter 14 counts window scans.
+fn sp_fair to ulong
+rq = ulong 0
+r = get scpol 5
+if gt r 0
+rj = sub r 1
+put scst 3 add get scst 3 1
+if eq get sjst rj 2
+if sp_fits get sjneed rj 0
+ret rj
+end
+rq = get sjneed rj
+else
+put scpol 5 0
+end
+end
+goal = eq get scpol 0 2
+if goal
+sp_rescore
+pj = sp_proposal rq
+if lt pj 64
+ret pj
+end
+end
+win = get scpol 1
+cur = get scpol 4
+b = ulong 64
+put scst 14 add get scst 14 1
+for i ulong win bound 64
+put scst 3 add get scst 3 1
+j = rem add cur i 64
+if eq get sjst j 2
+if sp_fits get sjneed j rq
+if eq b 64
+b = j
+else
+if sp_better goal j b
+b = j
+end
+end
+end
+end
+end
+put scpol 4 rem add cur win 64
+ret b
+end
+
+note Ranking key, both of ready jobs a and b: is a better? Policy 1: older
+note admission. Policy 2: larger unblock value, then smaller declared
+note estimate, then older admission (admission orders are unique, so there
+note is never a tie).
+fn sp_better goal bool a ulong b ulong to bool
+if goal
+va = get sjval a
+vb = get sjval b
+if ne va vb
+ret gt va vb
+end
+ea = get sjest a
+eb = get sjest b
+if ne ea eb
+ret lt ea eb
+end
+end
+ret lt get sjarr a get sjarr b
+end
+
+note A committed change that can alter an unblock value: a job becomes
+note ready, a waiting job is admitted, a waiting or ready job is cancelled,
+note or a declaration changes. Bumps the graph version, which makes any
+note proposal stale (rejected when next used). Nothing is rescored here:
+note the next policy-2 pick rescores once, however many bumps came before
+note it (coalesced). At 2^40 - 1 bumps the version stays and is exhausted
+note (scgv 4 = 2): from then on proposals are refused and every pick
+note rescores.
+fn sp_bump to void
+put scgst 2 add get scgst 2 1
+if eq and get scgv 0 1099511627775 1099511627775
+put scgv 4 2
+ret
+end
+put scgv 0 add get scgv 0 1
+end
+
+note Unblock value of ready job j, in jobs: the waiting jobs whose deps meet
+note the topics j declares it unblocks (depth 1), plus the waiting jobs whose
+note deps meet the topics those declare (depth 2), each counted once. Reads
+note at most 128 slots.
+fn sp_value j ulong to ulong
+pro = get sjpro j
+if eq pro 0
+ret 0
+end
+n = ulong 0
+m = ulong 0
+p2 = ulong 0
+for k ulong 64
+if eq get sjst k 1
+if ne and get sjdep k pro 0
+m = or m shl ulong 1 k
+p2 = or p2 get sjpro k
+n = add n 1
+end
+end
+end
+put scgst 6 add get scgst 6 64
+if eq p2 0
+ret n
+end
+for k ulong 64
+if eq get sjst k 1
+if eq and shr m k 1 0
+if ne and get sjdep k p2 0
+n = add n 1
+end
+end
+end
+end
+put scgst 6 add get scgst 6 64
+ret n
+end
+
+note Recompute the unblock value of every ready job when the graph version
+note moved since the last scoring, or always once it is exhausted;
+note otherwise nothing.
+fn sp_rescore to void
+v = get scgv 0
+if and eq get scgv 1 v ne get scgv 4 2
+ret
+end
+for j ulong 64
+if eq get sjst j 2
+put sjval j sp_value j
+put scgst 1 add get scgst 1 1
+end
+end
+put scgv 1 v
+put scgst 0 add get scgst 0 1
+put scgst 6 add get scgst 6 64
+end
+
+note The proposed job, when the proposal is for the current graph version
+note (and that version is not exhausted) and the job is still ready and fits
+note beside the reservation (rq); it is used once. Otherwise the proposal
+note is dropped as stale: 64.
+fn sp_proposal rq ulong to ulong
+p = get scgv 2
+if eq p 0
+ret 64
+end
+put scgv 2 0
+put scst 3 add get scst 3 1
+j = sub p 1
+if and eq get scgv 3 get scgv 0 eq get scgv 4 1
+if eq get sjst j 2
+if sp_fits get sjneed j rq
+put scgst 7 add get scgst 7 1
+ret j
+end
+end
+end
+put scgst 4 add get scgst 4 1
+ret 64
+end
+
+note Creator: declare what job j (waiting or ready) is expected to unblock
+note and cost: pro, the topics its completion will publish; est, the work
+note estimate in ms (declared, or derived by the caller from measurements);
+note unc, its uncertainty in ms (recorded, not used to rank). 0, or -3.
+fn sched_goal j ulong pro ulong est ulong unc ulong to long
+if ge j 64
+ret neg long 3
+end
+s = get sjst j
+if or eq s 0 gt s 2
+ret neg long 3
+end
+put sjpro j pro
+put sjest j est
+put sjunc j unc
+sp_bump
+ret 0
+end
+
+note Creator: the graph version that proposals must name.
+fn sched_version to ulong
+ret get scgv 0
+end
+
+note Creator, after sched_new: incarnation n (1..2^24 - 1), distinct
+note for every scheduler that may receive proposals meant for another (the
+note journal fence, DRA-398). The graph version becomes n * 2^40, which no
+note scheduler of another incarnation reaches, any proposal is dropped and
+note proposals are accepted from now on. The last scoring stays below n *
+note 2^40, so the next ranking pass rescores whatever was admitted or
+note declared before, whenever the incarnation comes. Once per
+note scheduler: 0, or -7 (n out of range, or already set or exhausted).
+fn sched_incarnate n ulong to long
+if or eq n 0 ge n 16777216
+ret neg long 7
+end
+if ne get scgv 4 0
+ret neg long 7
+end
+put scgv 0 shl n 40
+put scgv 2 0
+put scgv 4 1
+ret 0
+end
+
+note Creator, policy 2: propose the ready job whose id is id for the next
+note pick, computed at graph version v (an outside planner, or an
+note operator). The proposal names the job, not its slot. Reservations and
+note feasibility still come first: it is checked again when used. 0; -6 no
+note incarnation set or the version exhausted; -9 stale (v is not the
+note current version); -3 no ready job, or more than one, has that id; -8
+note it does not fit beside the reservation; -7 not policy 2.
+fn sched_propose id ulong v ulong to long
+if ne get scpol 0 2
+ret neg long 7
+end
+if ne get scgv 4 1
+put scgst 5 add get scgst 5 1
+ret neg long 6
+end
+if ne v get scgv 0
+put scgst 4 add get scgst 4 1
+ret neg long 9
+end
+j = ulong 64
+n = ulong 0
+for k ulong 64
+if and eq get sjst k 2 eq get sjid k id
+j = k
+n = add n 1
+end
+end
+if ne n 1
+put scgst 5 add get scgst 5 1
+ret neg long 3
+end
+rq = ulong 0
+r = get scpol 5
+if gt r 0
+rq = get sjneed sub r 1
+end
+if not sp_fits get sjneed j rq
+put scgst 5 add get scgst 5 1
+ret neg long 8
+end
+put scgv 2 add j 1
+put scgv 3 v
+put scgst 3 add get scgst 3 1
+ret 0
+end
+
+note After a fair dispatch event in which ya - 1 was the youngest admission
+note assigned (ya 0: none): every ready job admitted before it was bypassed
+note once; with no reservation, the oldest job at the bypass budget is
+note reserved. One pass over the table (64 maintenance reads, counter 13).
+note Returns the bitmap of the slots bypassed.
+fn sp_after ya ulong to ulong
+o = ulong 64
+bm = ulong 0
+nores = eq get scpol 5 0
+for j ulong 64
+if eq get sjst j 2
+if gt ya 0
+if lt add get sjarr j 1 ya
+put sjbyp j add get sjbyp j 1
+put scst 5 add get scst 5 1
+bm = or bm shl 1 j
+end
+end
+if nores
+if ge get sjbyp j get scpol 3
+if eq o 64
+o = j
+else
+if lt get sjarr j get sjarr o
+o = j
+end
+end
+end
+end
+end
+end
+put scst 13 add get scst 13 64
+if lt o 64
+put scpol 5 add o 1
+put scst 6 add get scst 6 1
+end
+ret bm
+end
+
+note Creator: assign ready jobs to idle live workers under the policy, at
+note most the dispatch budget per call. Returns the number assigned. With
+note a journal attached and the replay ring full, nothing is assigned
+note (counter 15) until the journal drains it.
+fn sched_dispatch c long to ulong
+if ne get scpause 0 0
+ret 0
+end
+if and ne get sfj 0 0 ge get sfj 1 64
+put scst 15 add get scst 15 1
+ret 0
+end
+n = mapget c 48 8
+k = ulong 0
+ya = ulong 0
+put sfj 2 get scpol 5
+put sfj 3 0
+fair = ge get scpol 0 1
+put scst 2 add get scst 2 1
+for i ulong get scpol 2 bound 64
+w = sp_idle n
+if ge w 64
+break
+end
+j = ulong 64
+if fair
+j = sp_fair
+else
+j = sp_fifo
+end
+if ge j 64
+break
+end
+if gt add get sjarr j 1 ya
+ya = add get sjarr j 1
+end
+sp_fmark j
+sp_start c j w
+k = add k 1
+end
+bm = ulong 0
+if fair
+bm = sp_after ya
+end
+sp_frend bm
+ret k
+end
+
+note End of a dispatch event with a journal attached: one ring record when
+note it assigned a job or moved the reservation.
+fn sp_frend bm ulong to void
+if eq get sfj 0 0
+ret
+end
+if or ne get sfj 3 0 ne get scpol 5 get sfj 2
+sp_frpush get sfj 3 bm 0
+end
+end
+
+note The current dispatch event assigned slot j (sfj 3).
+fn sp_fmark j ulong to void
+put sfj 3 or get sfj 3 shl 1 j
+end
+
+note Append one replay record (sfr): event, assigned and bypassed slot
+note bitmaps, cursor, reserved slot + 1, slots made ready. The callers
+note leave room.
+fn sp_frpush am ulong bm ulong rd ulong to void
+b = mul get sfj 1 6
+put sfr b get scst 2
+put sfr add b 1 am
+put sfr add b 2 bm
+put sfr add b 3 get scpol 4
+put sfr add b 4 get scpol 5
+put sfr add b 5 rd
+put sfj 1 add get sfj 1 1
+end
+
+note Journal: attach (on) or detach the replay ring. Attaching empties it.
+note jn_recover attaches once the scheduler holds the journaled state.
+fn sched_jattach on bool to void
+put sfj 0 0
+if on
+put sfj 0 1
+end
+put sfj 1 0
+end
+
+fn sched_jattached to bool
+ret ne get sfj 0 0
+end
+
+note Journal: records waiting in the replay ring, word i (0..5) of record k,
+note and emptying it once they are durable.
+fn sched_frn to ulong
+ret get sfj 1
+end
+fn sched_frw k ulong i ulong to ulong
+ret get sfr add mul k 6 i
+end
+fn sched_frclear to void
+put sfj 1 0
+end
+
+note Journal, recovery: the cursor and reservation after replay, and the
+note dispatch event count. The reservation names slot res - 1, which must
+note hold a ready job. -7 (nothing changed) for a cursor outside the table
+note or any other reservation, else 0.
+fn sched_frestore cur ulong ev ulong res ulong to long
+if or ge cur 64 gt res 64
+ret neg long 7
+end
+if gt res 0
+if ne get sjst sub res 1 2
+ret neg long 7
+end
+end
+put scpol 4 cur
+put scst 2 ev
+put scpol 5 res
+ret 0
+end
+
+note Journal, recovery: the bypass count of ready job j. 0 or -3.
+fn sched_setbyp j ulong n ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 2
+ret neg long 3
+end
+put sjbyp j n
+ret 0
+end
+
+note Journal, recovery: waiting job j was made ready by a publication
+note before the restart. 0 or -3 (j not waiting).
+fn sched_setready j ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 1
+ret neg long 3
+end
+sp_ready j
+ret 0
+end
+
+note Creator: move finished jobs into review while review has room. A worker
+note whose result is waiting for room keeps it and gets no new job, so a
+note full review queue stops assignment instead of dropping work. A job
+note gives back its resources as soon as its worker reported done, even
+note while its result waits for room.
+fn sched_collect c long to ulong
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+b = get scbusy w
+if gt b 0
+if eq sc_cell w 64 get scseq w
+j = sub b 1
+sp_give j
+if ge sched_count 4 4 get sclim 1
+continue
+end
+put sjst j 4
+put sjout j sc_cell w 72
+put scbusy w 0
+k = add k 1
+end
+end
+end
+ret k
+end
+
+note Creator, after worker w was reaped: retire its unfinished assignment.
+note A rerunnable job is ready again; any other becomes UNKNOWN (6), since
+note it may have had effects. A finished result is left for sched_collect.
+note Returns 1 when an assignment was retired, 0 when none, -16 still live.
+fn sched_lost c long w ulong to long
+if ge w 64
+ret neg long 7
+end
+if gt get swpid w 0
+ret neg long 16
+end
+b = get scbusy w
+if eq b 0
+ret 0
+end
+if eq sc_cell w 64 get scseq w
+ret 0
+end
+j = sub b 1
+sc_set w 64 get scseq w
+put scbusy w 0
+sp_give j
+if ne and get sjfl j 1 0
+sp_ready j
+else
+put sjst j 6
+end
+ret 1
+end
+
+note Creator loop step: wait up to interval ns for an ack or a death, take
+note acks, retire the jobs of reaped workers, collect, then dispatch.
+note Returns the number of workers reaped, or a negative errno.
+fn sched_step c long interval long to long
+d = sup_poll c interval
+if lt d 0
+ret d
+end
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+r = sup_take get swack w
+else
+r = sched_lost c w
+end
+end
+k = sched_collect c
+k = sched_dispatch c
+ret d
+end
+
+note Creator: publish an artifact, make waiting jobs whose deps meet topics
+note ready, wake each live worker whose interest meets topics, dispatch.
+note With a journal attached the jobs made ready leave a readiness record
+note in the replay ring; when the ring is full nothing is published, -105
+note (counter 15). Returns the version, or the publish refusal with nothing
+note woken.
+fn sched_publish c long topics ulong src view uchar 4096 n ulong to long
+if and ne get sfj 0 0 ge get sfj 1 64
+put scst 15 add get scst 15 1
+ret neg long 105
+end
+v = pool_publish c topics src n
+if le v 0
+ret v
+end
+rd = ulong 0
+for j ulong 64
+if eq get sjst j 1
+if ne and get sjdep j topics 0
+sp_ready j
+rd = or rd shl 1 j
+end
+end
+end
+if and ne rd 0 ne get sfj 0 0
+sp_frpush 0 0 rd
+end
+m = mapget c 48 8
+for w ulong m bound 64
+if gt get swpid w 0
+if ne and sc_cell w 32 topics 0
+sc_wake w
+end
+end
+end
+k = sched_dispatch c
+ret v
+end
+
+note Creator: accept the result of job j in review and free its slot.
+note Returns its outcome, or -3 when j is not in review.
+fn sched_review j ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 4
+ret neg long 3
+end
+put sjst j 0
+ret long get sjout j
+end
+
+note Creator: free an UNKNOWN job once its outcome has been settled
+note elsewhere. Returns 0, or -3 when j is not UNKNOWN.
+fn sched_settle j ulong to long
+if ge j 64
+ret neg long 3
+end
+if ne get sjst j 6
+ret neg long 3
+end
+put sjst j 0
+ret 0
+end
+
+note Creator: while paused (on true) no job is assigned; running jobs go on
+note and finished results are still collected. Resuming dispatches at once.
+note Returns the number assigned on resume, else 0.
+fn sched_pause c long on bool to ulong
+if on
+put scpause 0 1
+ret 0
+end
+put scpause 0 0
+ret sched_dispatch c
+end
+
+note Creator: cancel job j. A waiting or ready job never started, so it is
+note freed with no effect: 1. A running job needs its worker: 2, and the
+note outcome comes from the worker. A job in review already finished: 3,
+note nothing is cancelled. UNKNOWN stays UNKNOWN: 4. -3 free or bad slot.
+fn sched_cancel j ulong to long
+if ge j 64
+ret neg long 3
+end
+s = get sjst j
+if or eq s 1 eq s 2
+put sjst j 0
+sp_bump
+if eq get scpol 5 add j 1
+put scpol 5 0
+end
+ret 1
+end
+if eq s 3
+ret 2
+end
+if eq s 4
+ret 3
+end
+if eq s 6
+ret 4
+end
+ret neg long 3
+end
+
+note Creator: stop every worker within interval ns (sup_stop), retire the
+note assignments of the reaped workers, collect finished results.
+note Returns how many workers had to be killed, or a refusal.
+fn sched_stop c long interval long to long
+k = sup_stop c interval
+if lt k 0
+ret k
+end
+n = mapget c 48 8
+for w ulong n bound 64
+r = sched_lost c w
+end
+m = sched_collect c
+ret k
+end
+
+note Worker w: the assignment seq when a job is waiting, else 0. Job id,
+note input epoch and input version are words 8, 16 and 24 of its cell.
+fn sched_wjob w ulong to ulong
+q = sc_cell w 0
+if gt q sc_cell w 64
+ret q
+end
+ret 0
+end
+
+note Worker w: finish assignment q with outcome and the first n (at most
+note 4096) bytes of src. Bytes and outcome are written before the done seq;
+note then the creator gets an ack. 0, -7 bad n, or the ack refusal.
+fn sched_wdone w ulong q ulong outcome ulong src view uchar 4096 n ulong to long
+if gt n 4096
+ret neg long 7
+end
+if gt n 0
+r = mapwrite get scmap 1 mul w 4096 src 0 n
+end
+sc_set w 72 outcome
+sc_set w 64 q
+ret sup_ack w
+end
+
+note Creator: copy worker w's last result bytes into dst.
+fn sched_result w ulong dst edit uchar 4096 to long
+ret mapread get scmap 1 mul w 4096 dst 0 4096
+end
+
+note Worker w: sup_wwait that records its wakes and wake latency.
+fn sched_wwait c long w ulong interval long to long
+r = sup_wwait c w interval
+if eq r 1
+now = ulong monons
+st = sc_cell w 40
+lat = ulong 0
+if gt now st
+lat = sub now st
+end
+sc_set w 80 add sc_cell w 80 1
+sc_set w 88 lat
+if gt lat sc_cell w 96
+sc_set w 96 lat
+end
+end
+ret r
+end
+
+note Worker w: count the versions of the current epoch that meet its
+note interest and are newer than its cursor, moving the cursor past them.
+note A new epoch restarts the cursor at 0. A worker with no interest scans
+note nothing. Returns the count or a refusal.
+fn sched_wscan c long w ulong to long
+t = sc_cell w 32
+if eq t 0
+ret 0
+end
+h = pool_acquire c w
+if le h 0
+ret h
+end
+e = mapget c add 256 mul w 8 8
+if ne get swcur 0 e
+put swcur 0 e
+put swcur 1 0
+end
+k = long 0
+for i ulong 65
+v = node_next h get swcur 1 t
+if lt v 0
+r = pool_release c w
+ret v
+end
+if eq v 0
+break
+end
+put swcur 1 ulong v
+k = add k 1
+end
+r = pool_release c w
+ret k
+end
+note Omega Node scheduling comparison (DRA-399). Concatenate after
+note transport.om, pool.om, super.om and sched.om. Runs pinned workloads
+note under arm 0 (FIFO), 1 (fair fitting), 2 (goal-aware, declared estimates
+note within a factor of 2 of the duration) and 3 (goal-aware given the true
+note durations: ORACLE, an upper bound, not a policy result) with real
+note forked workers that sleep for the milliseconds in the low four decimal
+note digits of their job id, on the host's wall clock. Usage: bench-gate
+note (five repetitions of every scenario and arm). Prints one line per run:
+note bench S P R mk_us idle_us dsp_ns dsp_n ev cand maint vread rework res cont ok hwm_kb : waits_us...
+note S scenario 1..6 (blocked head, long chain, fan-out, sustained arrivals,
+note queue pressure, worker failure), P arm (0..3), R repetition; mk makespan
+note (first admission to last review); idle the integral of min(idle live
+note workers, ready jobs that fit the free capacity) over time, in
+note worker-microseconds; dsp time inside sched_dispatch from the creator
+note loop and its calls; ev, cand, maint, vread the scheduler's counters
+note (events, candidate reads, maintenance reads, value reads); rework the
+note jobs that went back to ready after starting; res the reservations made
+note (sched_stat 6); cont the new reservations seen while another ready job
+note was also at the bypass budget (where check 71 can tell oldest from any);
+note ok the jobs reviewed with
+note the expected outcome; hwm_kb the creator's VmHWM; waits from ready to
+note started, per job, in microseconds (sampled after every creator step
+note and every publication). Every policy sees the same jobs, requests,
+note durations, declarations, workers and capacities. Checked in every run:
+note the capacity invariant (exit 70), a new reservation goes to the oldest
+note ready job at the bypass budget (71), every job is reviewed once with
+note its expected outcome before the deadline (72), setup (73..79).
+text bnok "PASS node bench\n"
+text bnhd "bench "
+text bnsp " "
+text bnco " :"
+text bnnl "\n"
+text bnst "/proc/self/status"
+text bnhw "VmHWM:"
+global bnc long 1
+note Run metrics: 0 t0, 1 last review, 2 idle sum ns, 3 last sample, 4
+note dispatch ns, 5 dispatch calls, 6 reviewed, 7 verified, 8 reworks, 9
+note jobs in the scenario, 10 next queue entry, 11 killed, 12 reservation
+note last seen + 1, 13 idle-eligible workers at the last sample, 14 policy,
+note 15 bypass budget, 16 contested reservations.
+global bnm ulong 20
+note Per slot: ready since (ns, 0 not ready), started flag.
+global bnr ulong 64
+global bns ulong 64
+note Waits of this run (us) and their count.
+global bnwt ulong 256
+global bnwn ulong 1
+note Scenario queue: id, deps, request, flags, arrival ms, topics published.
+global bnqi ulong 64
+global bnqd ulong 64
+global bnqr ulong 64
+global bnqf ulong 64
+global bnqt ulong 64
+global bnqp ulong 64
+global bnqn ulong 1
+note 1: arm 3, policy 2 given the true durations as estimates (ORACLE).
+global bne ulong 1
+
+fn bn_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn bn_num v ulong to void
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 d k sub 20 k
+end
+
+fn bn_sp v ulong to void
+r = write 1 bnsp 0 1
+bn_num v
+end
+
+fn bn_req cpu ulong to ulong
+ret cpu
+end
+
+fn bn_run c long w ulong q ulong to int
+buf = new uchar 4096 0
+id = sc_cell w 8
+dl = add ulong monons mul rem id 10000 1000000
+for t ulong 1000000
+now = ulong monons
+if ge now dl
+break
+end
+r = sched_wwait c w long sub dl now
+if eq r 2
+ret 2
+end
+if eq r 3
+ret 3
+end
+if lt r 0
+ret 4
+end
+end
+if ne sched_wdone w q add id 1 buf 8 0
+ret 5
+end
+ret 0
+end
+
+fn bn_worker w ulong to int
+c = get bnc 0
+for it ulong 1000000000
+q = sched_wjob w
+if gt q 0
+r = bn_run c w q
+if eq r 2
+ret 0
+end
+if ne r 0
+ret add 60 r
+end
+continue
+end
+r = sched_wwait c w neg long 1
+if eq r 2
+ret 0
+end
+if eq r 3
+ret 41
+end
+if lt r 0
+ret 43
+end
+end
+ret 45
+end
+
+note Queue entry: job id (duration in its low four digits), deps, CPU,
+note flags, arrival ms after the start, topics its completion publishes.
+fn bn_q id ulong deps ulong cpu ulong fl ulong at ulong pro ulong to void
+n = get bnqn 0
+put bnqi n id
+put bnqd n deps
+put bnqr n cpu
+put bnqf n fl
+put bnqt n at
+put bnqp n pro
+put bnqn 0 add n 1
+end
+
+note Declared work estimate of job id in ms. Policy 2 is not told the
+note duration: the estimate is the duration times 1/2, 1, 3/2 or 2, chosen
+note by a multiplicative hash of the id (fixed, so every run and repetition
+note declares the same values). Arm 3 (ORACLE) declares the true duration.
+fn bn_est id ulong to ulong
+d = rem id 10000
+if ne get bne 0 0
+ret d
+end
+k = rem div mul id 2654435761 65536 4
+ret div mul d add k 1 2
+end
+
+note Scenario s into the queue; returns (workers, admission limit).
+fn bn_load s ulong to ulong
+put bnqn 0 0
+if eq s 1
+bn_q 10600 0 2 0 0 0
+bn_q 20300 0 4 0 0 0
+for i ulong 6
+bn_q add 30200 mul i 10000 0 1 0 0 0
+end
+ret 64
+end
+if eq s 2
+for i ulong 8
+bn_q add 100300 mul i 10000 0 1 0 0 0
+end
+bn_q 200150 0 1 0 0 2
+for i ulong 5
+bn_q add 210150 mul i 10000 shl ulong 2 i 1 0 0 shl ulong 4 i
+end
+ret 64
+end
+if eq s 3
+for i ulong 6
+bn_q add 300300 mul i 10000 0 1 0 0 0
+end
+bn_q 400100 0 1 0 0 1024
+for i ulong 6
+bn_q add 410200 mul i 10000 1024 1 0 0 0
+end
+ret 64
+end
+if eq s 4
+bn_s4
+ret 64
+end
+if eq s 5
+bn_s5
+ret 8
+end
+bn_s6
+ret 64
+end
+
+note Sustained arrivals: 24 jobs of 100..400 ms needing 1..3 CPU, four
+note every 150 ms.
+fn bn_s4 to void
+for i ulong 24
+d = add 100 mul rem mul i 7 4 100
+id = add add 500000 mul i 10000 d
+at = mul div i 4 150
+bn_q id 0 add 1 rem i 3 0 at 0
+end
+end
+
+note Queue pressure: 30 jobs of 100..300 ms needing 1..2 CPU offered at
+note once against an admission limit of 8.
+fn bn_s5 to void
+for i ulong 30
+d = add 100 mul rem mul i 5 3 100
+id = add add 600000 mul i 10000 d
+bn_q id 0 add 1 rem i 2 0 0 0
+end
+end
+
+note Worker failure: 12 rerunnable jobs of 150..450 ms needing 1..3 CPU;
+note worker 0 is killed 250 ms in while busy.
+fn bn_s6 to void
+for i ulong 12
+d = add 150 mul rem mul i 7 4 100
+id = add add 700000 mul i 10000 d
+bn_q id 0 add 1 rem i 3 1 0 0
+end
+end
+
+note Admit the queue entries that have arrived, in order; a refusal for
+note room (-2, a ticket) stops until the next call.
+fn bn_admit now ulong to void
+for k ulong 64
+i = get bnm 10
+if ge i get bnqn 0
+ret
+end
+if lt sub now get bnm 0 mul get bnqt i 1000000
+ret
+end
+j = sched_admitr get bnqi i get bnqd i get bnqf i bn_req get bnqr i
+if eq j neg long 2
+ret
+end
+bn_ok ge j 0 74
+e = bn_est get bnqi i
+r = sched_goal ulong j get bnqp i e e
+put bnm 10 add i 1
+end
+end
+
+note Topics job id publishes on completion.
+fn bn_pro id ulong to ulong
+for i ulong get bnqn 0 bound 64
+if eq get bnqi i id
+ret get bnqp i
+end
+end
+ret 0
+end
+
+fn bn_inv to void
+for k ulong 4
+s = ulong 0
+for j ulong 64
+if eq get sjheld j 1
+s = add s sp_need get sjneed j k
+end
+end
+bn_ok eq get suse k s 70
+bn_ok le get suse k get scap k 70
+end
+end
+
+note A reservation that appeared since the last sample goes to the oldest
+note ready job at the bypass budget: no older ready job is at the budget.
+note Another ready job at the budget makes it contested (bnm 16).
+fn bn_fair to void
+r = sched_stat 29
+if or eq r 0 eq r get bnm 12
+put bnm 12 r
+ret
+end
+put bnm 12 r
+a = get sjarr sub r 1
+n = ulong 0
+for j ulong 64
+if and eq get sjst j 2 ne j sub r 1
+if ge get sjbyp j get bnm 15
+n = add n 1
+end
+if lt get sjarr j a
+bn_ok lt get sjbyp j get bnm 15 71
+end
+end
+end
+if gt n 0
+put bnm 16 add get bnm 16 1
+end
+end
+
+note Sample after a creator step or publication: waits, reworks, the idle
+note eligible integral, the invariants.
+fn bn_sample to void
+now = ulong monons
+put bnm 2 add get bnm 2 mul get bnm 13 sub now get bnm 3
+put bnm 3 now
+nf = ulong 0
+for j ulong 64
+s = get sjst j
+if eq s 2
+if ne get bns j 0
+put bns j 0
+put bnm 8 add get bnm 8 1
+end
+if eq get bnr j 0
+put bnr j now
+end
+if sp_fits get sjneed j 0
+nf = add nf 1
+end
+end
+if and ge s 3 ne get bnr j 0
+bn_wait sub now get bnr j
+put bnr j 0
+put bns j 1
+end
+end
+put bnm 13 bn_min nf bn_idle
+bn_inv
+if ge get bnm 14 1
+bn_fair
+end
+end
+
+fn bn_wait ns ulong to void
+n = get bnwn 0
+if lt n 256
+put bnwt n div ns 1000
+put bnwn 0 add n 1
+end
+end
+
+fn bn_min a ulong b ulong to ulong
+if lt a b
+ret a
+end
+ret b
+end
+
+fn bn_idle to ulong
+c = get bnc 0
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+if and gt get swpid w 0 eq get scbusy w 0
+k = add k 1
+end
+end
+ret k
+end
+
+note sched_step with the dispatch timed.
+fn bn_step c long to void
+d = sup_poll c 1000000
+bn_ok ge d 0 75
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+r = sup_take get swack w
+else
+r = sched_lost c w
+end
+end
+k = sched_collect c
+t = ulong monons
+k = sched_dispatch c
+put bnm 4 add get bnm 4 sub ulong monons t
+put bnm 5 add get bnm 5 1
+end
+
+note Review finished jobs (outcome id + 1 is verified work); publish what
+note each declared.
+fn bn_review c long to void
+buf = new uchar 4096 0
+for j ulong 64
+if eq get sjst j 4
+id = get sjid j
+o = sched_review j
+if eq o long add id 1
+put bnm 7 add get bnm 7 1
+end
+put bnm 6 add get bnm 6 1
+put bnm 1 ulong monons
+put bns j 0
+put bnr j 0
+p = bn_pro id
+if ne p 0
+v = sched_publish c p buf 8
+bn_ok gt v 0 76
+bn_sample
+end
+end
+end
+end
+
+fn bn_hwm to ulong
+b = new uchar 4096 0
+fd = fopen bnst 0 len bnst 0 0
+if lt fd 0
+ret 0
+end
+r = pread int fd b 0 4096 long 0
+x = fclose int fd
+if le r 0
+ret 0
+end
+n = ulong r
+h = len bnhw
+for i ulong 4000
+if gt add i h n
+ret 0
+end
+m = true
+for k ulong h bound 8
+if ne get b add i k get bnhw k
+m = false
+end
+end
+if m
+ret bn_digits b add i h n
+end
+end
+ret 0
+end
+
+fn bn_digits b view uchar 4096 i ulong n ulong to ulong
+v = ulong 0
+for k ulong 32
+p = add i k
+if ge p n
+ret v
+end
+ch = get b p
+if and ge ch 48 le ch 57
+v = add mul v 10 sub ulong ch 48
+else
+if gt v 0
+ret v
+end
+end
+end
+ret v
+end
+
+fn bn_reset pol ulong by ulong to void
+for i ulong 20
+put bnm i 0
+end
+for j ulong 64
+put bnr j 0
+put bns j 0
+end
+put bnwn 0 0
+put bnm 14 pol
+put bnm 15 by
+end
+
+note One run of scenario s under arm a (policy 0, 1, 2; arm 3 is policy 2
+note with ORACLE estimates); prints its line.
+fn bn_one s ulong a ulong rep ulong to void
+pol = a
+put bne 0 0
+if eq a 3
+pol = 2
+put bne 0 1
+end
+lim = bn_load s
+c = pool_new 4 2
+bn_ok gt c 0 73
+put bnc 0 c
+bn_ok eq sup_init c 0 73
+bn_ok eq sched_new c lim 64 0 73
+bn_ok eq sched_cap bn_req 4 0 73
+bn_ok eq sched_policy pol 64 64 4 1000 0 73
+bn_reset a 4
+put bnm 9 get bnqn 0
+for w ulong 2
+p = sup_spawn c w
+if eq p 0
+exit bn_worker w
+end
+bn_ok gt p 0 73
+end
+k = sched_pause c true
+put bnm 0 ulong monons
+put bnm 3 get bnm 0
+bn_admit get bnm 0
+bn_sample
+k = sched_pause c false
+bn_loop c s
+bn_ok eq get bnm 6 get bnm 9 72
+bn_ok eq get bnm 7 get bnm 9 72
+bn_print s a rep
+bn_ok ge sched_stop c 2000000000 0 77
+sup_closeall
+bn_ok eq sched_free 0 77
+bn_ok eq pool_free c 0 77
+end
+
+fn bn_loop c long s ulong to void
+dl = add ulong monons 20000000000
+for t ulong 100000000
+bn_sample
+if ge get bnm 6 get bnm 9
+ret
+end
+bn_ok lt ulong monons dl 72
+if and eq s 6 eq get bnm 11 0
+if ge sub ulong monons get bnm 0 250000000
+bn_kill c
+end
+end
+bn_admit ulong monons
+bn_step c
+bn_sample
+bn_review c
+end
+end
+
+note Scenario 6: SIGKILL the busy worker 0 once.
+fn bn_kill c long to void
+if eq get scbusy 0 0
+ret
+end
+r = killpid int get swpid 0 9
+put bnm 11 1
+end
+
+fn bn_print s ulong pol ulong rep ulong to void
+r = write 1 bnhd 0 len bnhd
+bn_num s
+bn_sp pol
+bn_sp rep
+bn_sp div sub get bnm 1 get bnm 0 1000
+bn_sp div get bnm 2 1000
+bn_sp get bnm 4
+bn_sp get bnm 5
+bn_sp sched_stat 2
+bn_sp sched_stat 3
+bn_sp sched_stat 13
+bn_sp sched_stat 38
+bn_sp get bnm 8
+bn_sp sched_stat 6
+bn_sp get bnm 16
+bn_sp get bnm 7
+bn_sp bn_hwm
+r = write 1 bnco 0 len bnco
+for i ulong get bnwn 0 bound 256
+bn_sp get bnwt i
+end
+r = write 1 bnnl 0 1
+end
+
+fn bn_reps to ulong
+ret 5
+end
+
+fn main to int
+n = bn_reps
+for rep ulong n bound 100
+for s ulong 6
+for pol ulong 4
+bn_one add s 1 pol rep
+end
+end
+end
+if ne write 1 bnok 0 len bnok long len bnok
+ret 100
+end
+ret 0
+end
