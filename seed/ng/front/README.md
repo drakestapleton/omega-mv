@@ -79,8 +79,13 @@ failing conversions, and `while` fuel (1000000 passes, or its `bound`). Local an
 What it does not lower exits 64 with `ng: front-ir: line N: not lowered` (no output): units without
 `fn main to int` (ΩIR needs a program entry; omc writes no executable for them either), mixed-type
 shifts, and every construct outside the M1 subset (read from code: the `fe_lno` call sites).
-Array parameters are `REF` with access 1 even for `view`, since ΩIR v1 has no op that narrows access;
-PROPOSED for ng-ir: a `view` op from an access-1 to an access-0 reference.
+Sized array parameters are `REF` with access 1 even for `view`, since ΩIR v1 has no op that narrows a
+REF's access (so a text passed to a sized `view` parameter is not lowered); PROPOSED for ng-ir: a `view`
+op from an access-1 to an access-0 reference. Unsized (`*`) parameters are `SLICE`s of their own access
+(0 `view`, 1 `edit`); `len` of one is the `len` op. An argument for one is the caller's slice when the
+access matches, else `slice` over the whole array, and `part A o k` is `chk.slice` (trap 3, omc's two
+part checks in one) then `slice`. `unroll` loops lower as plain `for` loops and `inline` functions as
+calls: both are omc code-shape choices with the same results.
 
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
@@ -92,12 +97,15 @@ It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinne
 case compiles the unit with omc and runs it, lowers it with ng, requires ngcheck ACCEPT, runs the ΩIR with
 ngrun and compares exit status and stdout (stderr is free: the kernels time themselves there); for each
 `refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
-`seed/ng/tests/ir`, the ten ng-bench kernels and 30 refusal units of `cases/`. ngrun interprets (90-470x
-native) and has no step cap yet, so nine kernels run as reduced copies (`runs/`, loop counts and sizes
-only, `runs/PROVENANCE.md`; each under 25 ms native) and matmul verbatim; the verbatim kernels
-(`kernels/`, `kernels/PROVENANCE.md`) stay for the a64-vs-omc comparison. Every child the gate starts is
-killed after 600 s: that case prints `NOT_RUN` and counts in `notrun=`, never as ok, FAIL, a kill or a trip.
-Negative controls: two lowering mutants (the `for` latch adds 2; `and`/`or`/`xor` shifted to the next op)
-must fail a run case, `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode
-the first refusal case. Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN:
-no failure but U > 0, never PASS).
+`seed/ng/tests/ir`, two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
+thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
+`cases/`. ngrun interprets (90-470x native) and has no step cap yet, so ten kernels run as reduced
+copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md`; each under 25 ms native); matmul,
+chacha and x25519 run verbatim; the verbatim kernels (`kernels/`, `kernels/PROVENANCE.md`) stay for the
+a64-vs-omc comparison.
+Every child the gate starts is killed after 600 s: that case prints `NOT_RUN` and counts in `notrun=`, never
+as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `for` latch adds 2;
+`and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped) must fail a run case,
+`@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
+Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
+never PASS).
