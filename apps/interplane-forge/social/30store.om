@@ -1,0 +1,926 @@
+note social/30store.om: the social store. ~/forge-data/social.log is the only source of truth:
+note one JSON event per line, {"seq":N,"ts":S,"did":"did:key:z…","action":A,"target":T,"prev":H}
+note where H = hex sha256 of the previous line's bytes (64 zeros for line 1). social.head holds
+note "<seq> <hex sha256 of line seq>\n" and is replaced (rename) after every append, so a changed,
+note dropped or truncated line anywhere is detected by soload, which then disables social (fail closed).
+note Memory: string intern pool (ids 1..), relation set (kind, actor, target), counts, accounts,
+note names, sessions, used nonces, per-DID write counter. All rebuilt from the log at start / SIGHUP.
+note ---- key buffer gskb and the intern pool
+fn sokclr to void
+put gskbl 0 0
+put gskov 0 0
+end
+fn sokc c uchar to void
+n = get gskbl 0
+if ge n len gskb
+put gskov 0 1
+ret
+end
+put gskb n c
+put gskbl 0 add n 1
+end
+fn sokt t view uchar * to void
+for i ulong len t bound 512
+sokc get t i
+end
+end
+note sokid: append the bytes of string id
+fn sokid id ulong to void
+o = get gsso id
+for i ulong get gssl id bound 4096
+sokc get gsstr add o i
+end
+end
+fn sokhash to ulong
+h = ulong 14695981039346656037
+for i ulong get gskbl 0 bound 512
+h = xor h ulong get gskb i
+h = mul h 1099511628211
+end
+ret h
+end
+fn sokeq id ulong to bool
+if ne get gssl id get gskbl 0
+ret false
+end
+o = get gsso id
+for i ulong get gskbl 0 bound 512
+if ne get gsstr add o i get gskb i
+ret false
+end
+end
+ret true
+end
+fn soslot to ulong
+m = sub len gssh 1
+s = and sokhash m
+for it ulong len gssh
+id = get gssh s
+if eq id 0
+ret s
+end
+if sokeq id
+ret s
+end
+s = and add s 1 m
+end
+ret len gssh
+end
+note sofind: id of the string in gskb, 0 when absent
+fn sofind to ulong
+if ne get gskov 0 0
+ret 0
+end
+s = soslot
+if ge s len gssh
+ret 0
+end
+ret get gssh s
+end
+note sointern: id of the string in gskb, created when absent; 0 when the pool is full
+fn sointern to ulong
+if ne get gskov 0 0
+ret 0
+end
+s = soslot
+if ge s len gssh
+ret 0
+end
+id = get gssh s
+if ne id 0
+ret id
+end
+id = get gsns 0
+kl = get gskbl 0
+o = get gsstrl 0
+if or ge id len gsso gt add o kl len gsstr
+ret 0
+end
+for i ulong kl bound 512
+put gsstr add o i get gskb i
+end
+put gsso id o
+put gssl id kl
+put gsstrl 0 add o kl
+put gsns 0 add id 1
+put gssh s id
+ret id
+end
+note sokpre: gskb starts with t
+fn sokpre t view uchar * to bool
+if lt get gskbl 0 len t
+ret false
+end
+for i ulong len t bound 512
+if ne get gskb i get t i
+ret false
+end
+end
+ret true
+end
+note ---- relations: kind 1 star, 2 fav, 3 watch, 4 follow; actor and target are string ids
+fn sorkey kind ulong a ulong b ulong to ulong
+ret or or shl kind 48 shl a 24 b
+end
+fn sorslot k ulong to ulong
+m = sub len gsrk 1
+s = and shr mul k 11400714819323198485 40 m
+for it ulong len gsrk
+v = get gsrk s
+if or eq v 0 eq v k
+ret s
+end
+s = and add s 1 m
+end
+ret len gsrk
+end
+fn soron kind ulong a ulong b ulong to bool
+k = sorkey kind a b
+s = sorslot k
+if ge s len gsrk
+ret false
+end
+ret and eq get gsrk s k ne get gsrv s 0
+end
+note soset: set the relation; true when it changed (counts follow)
+fn soset kind ulong a ulong b ulong on bool to bool
+k = sorkey kind a b
+s = sorslot k
+if ge s len gsrk
+ret false
+end
+cur = and eq get gsrk s k ne get gsrv s 0
+if and cur on
+ret false
+end
+if and not cur not on
+ret false
+end
+put gsrk s k
+v = uchar 0
+if on
+v = uchar 1
+end
+put gsrv s v
+sobump kind a b on
+ret true
+end
+fn soinc v ulong on bool to ulong
+if on
+ret add v 1
+end
+if eq v 0
+ret v
+end
+ret sub v 1
+end
+fn sobump kind ulong a ulong b ulong on bool to void
+if eq kind 1
+put gscst b soinc get gscst b on
+end
+if eq kind 2
+put gscfv b soinc get gscfv b on
+end
+if eq kind 3
+put gscwt b soinc get gscwt b on
+end
+if eq kind 4
+put gscfl b soinc get gscfl b on
+put gscfg a soinc get gscfg a on
+end
+end
+note ---- strict line parser over ln (cursor gspc, failure flag gsbad)
+fn sofail to void
+put gsbad 0 1
+end
+fn solit ln view uchar * t view uchar * to void
+p = get gspc 0
+if gt add p len t len ln
+sofail
+ret
+end
+for i ulong len t bound 64
+if ne get ln add p i get t i
+sofail
+ret
+end
+end
+put gspc 0 add p len t
+end
+fn sonum ln view uchar * to ulong
+p = get gspc 0
+v = ulong 0
+k = ulong 0
+for it ulong 16
+if ge add p k len ln
+break
+end
+c = get ln add p k
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+k = add k 1
+end
+if or eq k 0 gt k 15
+sofail
+end
+if and gt k 1 eq get ln p 48
+sofail
+end
+put gspc 0 add p k
+ret v
+end
+fn sostrc c uchar to bool
+if and ge c 97 le c 122
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 48 le c 58
+ret true
+end
+ret or or eq c 45 eq c 46 or eq c 95 eq c 47
+end
+note sostr: append the string at the cursor (charset [A-Za-z0-9:._/-]) to gskb up to the closing quote
+fn sostr ln view uchar * to ulong
+p = get gspc 0
+k = ulong 0
+for it ulong 400
+if ge add p k len ln
+sofail
+ret k
+end
+c = get ln add p k
+if eq c 34
+break
+end
+if not sostrc c
+sofail
+ret k
+end
+sokc c
+k = add k 1
+end
+put gspc 0 add p k
+ret k
+end
+note soact: action code of the bytes at the cursor (1..12), 0 when unknown
+fn soact ln view uchar * to ulong
+a = ulong 0
+a = sotrya ln a tsastar 1
+a = sotrya ln a tsaunst 2
+a = sotrya ln a tsafav 3
+a = sotrya ln a tsaunfv 4
+a = sotrya ln a tsawat 5
+a = sotrya ln a tsaunwt 6
+a = sotrya ln a tsafol 7
+a = sotrya ln a tsaunfl 8
+a = sotrya ln a tsaccnt 9
+a = sotrya ln a tsaname 10
+a = sotrya ln a tsasess 11
+a = sotrya ln a tsalogo 12
+if eq a 0
+sofail
+ret 0
+end
+put gspc 0 add get gspc 0 soatx a false
+ret a
+end
+fn sotrya ln view uchar * a ulong t view uchar * code ulong to ulong
+if ne a 0
+ret a
+end
+p = get gspc 0
+if gt add p add len t 1 len ln
+ret a
+end
+for i ulong len t bound 16
+if ne get ln add p i get t i
+ret a
+end
+end
+if ne get ln add p len t 34
+ret a
+end
+ret code
+end
+note soatx: length of action a's name; when w, also append it to the log line
+fn soatx a ulong w bool to ulong
+if eq a 1
+ret soatw tsastar w
+end
+if eq a 2
+ret soatw tsaunst w
+end
+if eq a 3
+ret soatw tsafav w
+end
+if eq a 4
+ret soatw tsaunfv w
+end
+if eq a 5
+ret soatw tsawat w
+end
+if eq a 6
+ret soatw tsaunwt w
+end
+if eq a 7
+ret soatw tsafol w
+end
+if eq a 8
+ret soatw tsaunfl w
+end
+if eq a 9
+ret soatw tsaccnt w
+end
+if eq a 10
+ret soatw tsaname w
+end
+if eq a 11
+ret soatw tsasess w
+end
+ret soatw tsalogo w
+end
+fn soatw t view uchar * w bool to ulong
+if w
+solt t
+end
+ret len t
+end
+note soprevok: the 64 hex chars at the cursor equal hex(gsprev)
+fn soprevok ln view uchar * to void
+p = get gspc 0
+if gt add p 64 len ln
+sofail
+ret
+end
+for i ulong 32
+b = ulong get gsprev i
+if ne get ln add p mul i 2 sohexc shr b 4
+sofail
+end
+if ne get ln add add p mul i 2 1 sohexc and b 15
+sofail
+end
+end
+put gspc 0 add p 64
+end
+note soapply: parse and apply one line (no newline); false = corrupt (state may be partly applied)
+fn soapply ln view uchar * to bool
+put gsbad 0 0
+put gspc 0 0
+solit ln tsl1
+seq = sonum ln
+solit ln tsl2
+ts = sonum ln
+solit ln tsl3
+sokclr
+sokt tsdidp
+dl = sostr ln
+if or lt dl 40 gt dl 60
+sofail
+end
+did = sointern
+solit ln tsl4
+a = soact ln
+solit ln tsl5
+sokclr
+tl = sostr ln
+solit ln tsl6
+soprevok ln
+solit ln tsl7
+if or ne get gspc 0 len ln ne seq add get gsseq 0 1
+sofail
+end
+if or eq did 0 ne get gsbad 0 0
+ret false
+end
+if not soevent a did ts
+ret false
+end
+sochain ln seq
+ret true
+end
+fn sochain ln view uchar * seq ulong to void
+c = new ulong 40 0
+h = new uchar 32 0
+sha256_init c
+sha256_update c ln
+sha256_final c h
+for i ulong 32
+put gsprv2 i get gsprev i
+put gsprev i get h i
+end
+put gsseq 0 seq
+end
+note soevent: apply action a by did at ts with the target in gskb
+fn soevent a ulong did ulong ts ulong to bool
+soratev did ts
+if le a 6
+if not sokpre tsradp
+ret false
+end
+t = sointern
+if eq t 0
+ret false
+end
+x = soset add div sub a 1 2 1 did t eq rem a 2 1
+ret true
+end
+if le a 8
+if not sokpre tsdidp
+ret false
+end
+t = sointern
+if or eq t 0 eq t did
+ret false
+end
+x = soset 4 did t eq a 7
+ret true
+end
+if eq a 9
+ret soevacc did
+end
+if eq a 10
+ret soevname did
+end
+if eq a 11
+ret soevsess did ts
+end
+ret soevlogo did
+end
+fn soevacc did ulong to bool
+if ne get gskbl 0 0
+ret false
+end
+put gsacc did 1
+ret true
+end
+fn soevname did ulong to bool
+if not sonameok
+ret false
+end
+n = sointern
+if eq n 0
+ret false
+end
+o = get gsnmo n
+if and ne o 0 ne o did
+ret false
+end
+old = get gsnm did
+if ne old 0
+put gsnmo old 0
+end
+put gsnm did n
+put gsnmo n did
+ret true
+end
+note sonameok: gskb is a valid display name [a-z0-9-]{1,39}, no leading/trailing '-'
+fn sonameok to bool
+n = get gskbl 0
+if or eq n 0 gt n 39
+ret false
+end
+if or eq get gskb 0 45 eq get gskb sub n 1 45
+ret false
+end
+for i ulong n bound 64
+c = get gskb i
+ok = or and ge c 97 le c 122 and ge c 48 le c 57
+if not or ok eq c 45
+ret false
+end
+end
+ret true
+end
+note session target "<64 hex session hash>.<32 hex nonce>"
+fn soevsess did ulong ts ulong to bool
+if ne get gskbl 0 97
+ret false
+end
+if ne get gskb 64 46
+ret false
+end
+nb = new uchar 34 0
+put nb 0 110
+put nb 1 58
+for i ulong 32
+put nb add i 2 get gskb add i 65
+end
+put gskbl 0 64
+s = sointern
+sokclr
+sokt nb
+n = sointern
+if or eq s 0 eq n 0
+ret false
+end
+put gssd s did
+put gsse s add ts 2592000
+put gsnu n 1
+ret true
+end
+fn soevlogo did ulong to bool
+if ne get gskbl 0 64
+ret false
+end
+s = sofind
+if ne s 0
+if eq get gssd s did
+put gssd s 0
+end
+end
+ret true
+end
+note ---- per-DID write counter (rebuilt from the log; 30 writes per minute)
+fn soratev did ulong ts ulong to void
+m = div ts 60
+if eq get gsrlm did m
+put gsrlc did add get gsrlc did 1
+ret
+end
+put gsrlm did m
+put gsrlc did 1
+end
+fn sordok did ulong to bool
+m = div get gsnow 0 60
+if ne get gsrlm did m
+ret true
+end
+ret lt get gsrlc did 30
+end
+note ---- reset and replay
+fn soreset to void
+for i ulong len gssh
+put gssh i 0
+end
+for i ulong len gsrk
+put gsrk i 0
+put gsrv i 0
+end
+for i ulong len gsso
+soclrid i
+end
+put gsns 0 1
+put gsstrl 0 0
+put gsseq 0 0
+for i ulong 32
+put gsprev i 0
+put gsprv2 i 0
+end
+end
+fn soclrid i ulong to void
+put gscst i 0
+put gscfv i 0
+put gscwt i 0
+put gscfl i 0
+put gscfg i 0
+put gsacc i 0
+put gsnm i 0
+put gsnmo i 0
+put gssd i 0
+put gsse i 0
+put gsnu i 0
+put gsrlm i 0
+put gsrlc i 0
+end
+note soreplay: 0 when every line parses and chains; else -(line number); -1000000-errno on read error
+fn soreplay to long
+sopdd
+sopt tslog
+fd = fopen gspth 0 get gspthl 0 524288 0
+if eq fd -2
+ret 0
+end
+if lt fd 0
+ret sub -1000000 fd
+end
+ln = new uchar 1024 0
+n = ulong 0
+line = ulong 0
+for it ulong 1000000
+r = read int fd gsrb 0 len gsrb
+if lt r 0
+x = fclose int fd
+ret sub -1000000 r
+end
+if eq r 0
+break
+end
+for i ulong ulong r
+c = get gsrb i
+if eq c 10
+line = add line 1
+if not soapply part ln 0 n
+x = fclose int fd
+ret neg long line
+end
+n = ulong 0
+else
+if ge n 1023
+x = fclose int fd
+ret neg long add line 1
+end
+put ln n c
+n = add n 1
+end
+end
+end
+x = fclose int fd
+if ne n 0
+ret neg long add line 1
+end
+ret 0
+end
+note sohdchk: social.head agrees with the log (absent head = "0 <zeros>"); the head may lag by
+note one line (crash between append and head rename) and is then rewritten
+fn sohdchk to bool
+sopdd
+sopt tshead
+fd = fopen gspth 0 get gspthl 0 524288 0
+hs = ulong 0
+hl = long 0
+hd = new uchar 128 0
+if ge fd 0
+hl = read int fd gshd 0 len gshd
+x = fclose int fd
+if or lt hl 66 gt hl 90
+ret false
+end
+end
+if lt fd 0
+if ne fd -2
+ret false
+end
+end
+if ge fd 0
+put gspc 0 0
+put gsbad 0 0
+note hd: a local copy, since a global is never a function argument
+for i ulong ulong hl
+put hd i get gshd i
+end
+hs = sonum part hd 0 ulong hl
+if ne get gsbad 0 0
+ret false
+end
+end
+ret sohdcmp hs ulong hl
+end
+fn sohdcmp hs ulong hl ulong to bool
+s = get gsseq 0
+p = get gspc 0
+if eq hs s
+if eq s 0
+ret true
+end
+ret sohdhex p hl 0
+end
+if ne add hs 1 s
+ret false
+end
+if ne hs 0
+if not sohdhex p hl 1
+ret false
+end
+end
+ret sohdput
+end
+note sohdhex: gshd[p] is ' ', then 64 hex of gsprev (w 0) or gsprv2 (w 1), then '\n' at the end
+fn sohdhex p ulong hl ulong w ulong to bool
+if ne hl add p 66
+ret false
+end
+if or ne get gshd p 32 ne get gshd add p 65 10
+ret false
+end
+d = new uchar 32 0
+for i ulong 32
+v = get gsprev i
+if eq w 1
+v = get gsprv2 i
+end
+put d i v
+end
+x = new uchar 64 0
+sohex d x
+for i ulong 64
+if ne get gshd add add p 1 i get x i
+ret false
+end
+end
+ret true
+end
+note sohdput: write social.head.tmp then rename over social.head
+fn sohdput to bool
+d = new uchar 96 0
+n = sodec get gsseq 0 d
+put d n 32
+x = new uchar 64 0
+soprevhx x
+for i ulong 64
+put d add add n 1 i get x i
+end
+put d add n 65 10
+sopdd
+sopt tshtmp
+r = unlink gspth 0 get gspthl 0
+if not sowfile part d 0 add n 66
+ret false
+end
+soavb
+soavpth
+sopdd
+sopt tshead
+soavpth
+r = renames gspk 0 get gspkl 0 0
+ret eq r 0
+end
+note soprevhx: 64 lowercase hex chars of gsprev into x
+fn soprevhx x edit uchar * to void
+for i ulong 32
+b = ulong get gsprev i
+put x mul i 2 sohexc shr b 4
+put x add mul i 2 1 sohexc and b 15
+end
+end
+note sodec: decimal of v into d at 0; returns the length
+fn sodec v ulong d edit uchar * to ulong
+t = new uchar 20 0
+k = ulong 0
+x = v
+for it ulong 20
+put t k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong k
+put d i get t sub sub k 1 i
+end
+ret k
+end
+note ---- appending one event (single writer; flock guards against a second instance)
+fn solc c uchar to void
+n = get gslnl 0
+if lt n len gsln
+put gsln n c
+put gslnl 0 add n 1
+end
+end
+fn solt t view uchar * to void
+for i ulong len t bound 512
+solc get t i
+end
+end
+fn solnum v ulong to void
+d = new uchar 20 0
+k = sodec v d
+for i ulong k
+solc get d i
+end
+end
+note soemit: append event a by string id did (a "did:key:" string) with the target in gskb
+fn soemit a ulong did ulong to bool
+if eq get gsok 0 0
+ret false
+end
+put gslnl 0 0
+solt tsl1
+solnum add get gsseq 0 1
+solt tsl2
+solnum get gsnow 0
+solt tsl3
+o = get gsso did
+for i ulong sub get gssl did len tsdidp bound 64
+solc get gsstr add add o len tsdidp i
+end
+solt tsl4
+x = soatx a true
+solt tsl5
+for i ulong get gskbl 0 bound 512
+solc get gskb i
+end
+solt tsl6
+hx = new uchar 64 0
+soprevhx hx
+solt hx
+solt tsl7
+ret soemitw
+end
+fn soemitw to bool
+n = get gslnl 0
+if ge n sub len gsln 1
+ret false
+end
+ln = new uchar 1024 0
+for i ulong n
+put ln i get gsln i
+end
+put gsln n 10
+sopdd
+sopt tslog
+fd = fopen gspth 0 get gspthl 0 525377 384
+if lt fd 0
+ret false
+end
+l = flock int fd 2
+w = write int fd gsln 0 add n 1
+s = fdsync int fd
+u = flock int fd 8
+x = fclose int fd
+if ne w long add n 1
+put gsok 0 0
+ret false
+end
+if not soapply part ln 0 n
+put gsok 0 0
+ret false
+end
+if not sohdput
+put gsok 0 0
+ret false
+end
+ret true
+end
+note ---- load (start and SIGHUP)
+fn sokeyld to bool
+k = new uchar 32 0
+sopdd
+sopt tskeyf
+fd = fopen gspth 0 get gspthl 0 524288 0
+if eq fd -2
+if not sorand k
+ret false
+end
+if not sowfile k
+ret false
+end
+fd = fopen gspth 0 get gspthl 0 524288 0
+end
+if lt fd 0
+ret false
+end
+r = read int fd gskey 0 32
+x = fclose int fd
+ret eq r 32
+end
+fn soownb to void
+sokclr
+sokt tsdidp
+sokt tfnid
+d = sointern
+put gsown 0 d
+sokclr
+sokt tfowner
+n = sointern
+put gsnm d n
+put gsnmo n d
+end
+note soload: 0 = loaded and verified (social on); <0 = social disabled (log tamper or I/O error)
+fn soload to long
+put gsok 0 0
+sodirset
+sopclr
+for i ulong sub get gsddl 0 1 bound 512
+sopc get gsdd i
+end
+r = makedir gspth 0 get gspthl 0 448
+sopdd
+sopt tstmpd
+r = makedir gspth 0 get gspthl 0 448
+if not sokeyld
+flog tsekey
+ret -1
+end
+soreset
+soownb
+e = soreplay
+if ne e 0
+soreplerr e
+ret e
+end
+if not sohdchk
+flog tsehead
+ret -2
+end
+put gsok 0 1
+ret 0
+end
+fn soreplerr e long to void
+d = new uchar 64 0
+for i ulong len tsetamp
+put d i get tsetamp i
+end
+v = ulong 0
+if lt e 0
+v = ulong neg e
+end
+n = sodec v part d len tsetamp 20
+flog part d 0 add len tsetamp n
+end
