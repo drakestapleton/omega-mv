@@ -23,16 +23,17 @@ Program mode only: function mode is error 9, a contract clause error 30,
 ## Gate
 
 `prlimit.cases`, run by the OM-2 conductor from `seed/host/check.sh`:
-`OM2GATE PASS cases=14`.
+`OM2GATE PASS cases=15`.
 
-- `fixture`: `prlimit.om` on AArch64, all 15 checks against `/proc/self/limits`
+- `fixture`: `prlimit.om` on AArch64, all 16 checks against `/proc/self/limits`
   (read, set soft NOFILE 40, EMFILE at fd 40, restore, -22 for bad `n` and
   resource, -3 ESRCH, -1 EPERM on pid 1 unless root, RLIMIT_AS read, trap 3 on
-  both slice shapes, RLIMIT_AS 1 GiB seen after `execprog`, a 128 MiB image
-  killed under a 64 MiB cap, the same image running uncapped).
-- `x86-fixture`: `x86-target.om+prlimit.om` with argument `noas` (checks 1-12;
-  qemu-user ignores RLIMIT_AS writes). It runs through binfmt qemu-x86_64:
-  emulator evidence, not hardware qualification.
+  both slice shapes, read and set at the unaligned offset 9, RLIMIT_AS 1 GiB
+  seen after `execprog`, a 128 MiB image killed under a 64 MiB cap, the same
+  image running uncapped).
+- `x86-fixture`: `x86-target.om+prlimit.om` with argument `noas` (checks 1-12
+  and 16; qemu-user ignores RLIMIT_AS writes). It runs through binfmt
+  qemu-x86_64: emulator evidence, not hardware qualification.
 - refusals: `fnmode.om` (9), `contract.om` (30), `textarr.om` (20),
   `longpid.om` (7), `efi-target.om+read16.om` (25), x86 `fnmode.om` (9).
 - mutants: each `mutants/NAME.from` occurs once in `seed/omc/omc.om` and is
@@ -47,3 +48,4 @@ Program mode only: function mode is error 9, a contract clause error 30,
 | x86-sysno | `xhcall 302` to 97 (getrlimit) | 1 |
 | x86-swap | n 32 passes rdx = A+16 | 3 |
 | x86-nguard | the n == 32 test always taken | 7 |
+| a64-nooff | `off` not added to the base (kernel gets &A[0]) | 16 |
