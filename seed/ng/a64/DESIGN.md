@@ -219,12 +219,18 @@ BLR, SVC, ADR and the FP set.
   a slice's length taken from its offset, slice block arguments keeping the target's length, slice offsets not
   scaled by the element size, monons selecting on GE, fill stores unscaled, realns on the monotonic clock) must each
   change at least one fixture's status (against its expectation or ngrun's) or alignment.
-- Front to back differential (not part of rgate; ng-front's front-ir is on another branch): ng-front's `@ng
-  front-ir` (omega-mv ng/front-m3 3353ad67) lowers each `run` case of its `cases-front-ir.txt`; ngcheck accepts all
-  25; `@ng a64` and `@ng a64 split` of that ΩIR give omc's exit status and stdout for the 14 integer `x-*` pairs and
-  the nine integer bench kernels arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul (full size; each
-  prints a 9 to 41 byte checksum line, byte-identical; the kernels' elapsed time goes to stderr, not compared).
-  x-float and linear are refused (floats). Checked 2026-11-07.
+- Front phase of `rgate.om` (rgate step 6; branch ng/slice-m1, where ng.units holds ir, front, a64, main): for each
+  source of rgate's list `tfr` (ng-ir's 14 integer `x-*.om` run pairs and ng-front's nine integer bench kernels
+  arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul at full size) ng reads `@ng front-ir` and the
+  source and must exit 0, ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` of it must both run with omc's
+  exit status, stdout byte for byte (each kernel prints a 9 to 41 byte checksum line) and stderr byte for byte,
+  except that when omc's stderr is one line of decimal digits (OMC-EFF-2: the kernel's elapsed nanoseconds,
+  different every run) ng's must be one such line too; BL targets must be multiples of 64. x-float and the linear
+  kernel (list `tfz`, f64) must pass front-ir and ngcheck and be refused by both a64 forms (exit 5): counted as
+  refused, never as compared (floats are M4). Negative control (list `tfd`): fib40's ng path against omc's build of
+  `tests/front/fib39.om` must be sound and must differ in stdout (Wolfram: Fibonacci[39] = 63245986, Fibonacci[40] =
+  102334155), so a comparison that cannot see a different result fails the gate. Mutants run on the mkir and ngrun
+  phases only.
 - ΩIR gap met by sort and chacha: a call argument must have exactly the parameter's type (IR.md row 64), so Omega
   passing an `edit` array or slice to a `view` parameter has no ΩIR form while `view` maps to access 0. The fixtures
   type such parameters as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
