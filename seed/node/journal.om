@@ -4,12 +4,15 @@ note seed/authority/action.om, before auth.om, which journals through it.
 note While no journal is open every append succeeds without writing, so the
 note authority layer also runs memory-only.
 note File DIR/journal: a 64-byte header, then 128-byte records. Header words:
-note 0 magic, 1 format version 2, 2 record size 128, 3..6 objective identity,
+note 0 magic, 1 format version (2 for a file this build creates; 1 for one
+note a format-1 creator made, read and continued, see FORMAT), 2 record
+note size 128, 3..6 objective identity,
 note 7 FNV-1a 64 of words 0..6. Record words: 0 type, 1 seq (1, 2, 3, ...
 note with no gap), 2 fence, 3..14 payload, 15 FNV-1a 64 of words 0..14.
 note Types and payloads:
 note 1 OPEN     3 pid, 4 authority generation of the new creator, 5 the
-note                scheduler policy version SPVER it was written under
+note                scheduler policy version SPVER it was written under (0
+note                from a format-1 creator)
 note 2 ADMIT    3 job id, 4 dependency topics, 5 flags, 6 resource request,
 note                7 table slot
 note 3 START    3..6 operation identity, 7 class, 8 job id, 9 attempt, 10 gen
@@ -21,7 +24,16 @@ note 5 RELEASE  3 job id, 4 outcome (the job's outcome; 300 cancelled)
 note 6 REVOKE   3 new generation
 note 7 PAUSE    3 1 paused, 0 resumed
 note 8 CANCEL   3 job id
-note 10         reserved (RESULT, DRA-292)
+note 9 OPER     an operator command the creator committed (DRA-291): 3
+note                command id (never 0, never repeated), 4 op, 5 target,
+note                6..9 arguments, 10 view version it was acknowledged at.
+note                Kept in order in a table of 128 for the creator to replay;
+note                a reader without type 9 refuses it as unknown (24).
+note 10 RESULT    the result an objective ended with (DRA-292): 3 objective
+note                index (< 64), 4 result (1 PASS, else the failure; not 0),
+note                5 model turns performed. At most one per objective; a
+note                restart reports it and never resumes that objective. A
+note                reader without type 10 refuses it as unknown (24).
 note 11 POLICY  3 policy, 4 window, 5 dispatch budget, 6 bypass budget,
 note                7 ticket lifetime, 8 capacities (packed like a request):
 note                the whole setting; the last one wins
@@ -29,8 +41,19 @@ note 12 GOAL    3 job id, 4 topics, 5 estimate ms, 6 uncertainty ms
 note 13 FAIR    3 dispatch event, 4 assigned slot bitmap, 5 bypassed slot
 note                bitmap, 6 cursor, 7 reserved slot + 1, 8 slots a
 note                publication made ready (sched.om's ring)
-note A header of another version (1 included) is refused (21); an OPEN
-note written under another SPVER is refused at replay (33).
+note 14 FORMAT  3 the format version the records after it follow (2). In
+note                a version-1 file the first creator of this format writes
+note                it once, before its OPEN, so a format-1 reader refuses
+note                the file from then on (an unknown type, 24) instead of
+note                continuing it.
+note A header of another version is refused (21). Records keep the format
+note of the incarnation that wrote them: in a version-1 file, an OPEN with
+note word 5 zero starts a format-1 incarnation, whose ADMITs carry no
+note request or slot (request 0, the lowest slot no unreleased job holds)
+note and which may hold no POLICY, GOAL or FAIR (25). An OPEN of another
+note SPVER, a format-1 OPEN after FORMAT or in a version-2 file, an OPEN of
+note this format before FORMAT in a version-1 file, and a FORMAT anywhere
+note else are refused at replay (33).
 note Order: a transition is appended and fdatasync'd before anything acts on
 note it or publishes it. An append whose write or sync fails marks the journal
 note failed and every later append is refused, so nothing is acted on that
@@ -43,9 +66,10 @@ note record carries the fence of the creator that wrote it.
 note Torn tail: a partial last record, or a last full record whose checksum or
 note seq is wrong, was never acknowledged and is cut off. A bad record that is
 note not the last is corruption: the open is refused and nothing is changed.
-note Compatibility: a header whose magic, version, record size or checksum
-note differs is refused (21), never reinterpreted; an objective identity that
-note differs is refused (22).
+note Compatibility: a header whose magic, record size or checksum differs,
+note or whose version is neither 1 nor 2, is refused (21), never
+note reinterpreted; an objective identity that differs is refused (22). A
+note version-1 file keeps its header when this build continues it.
 text jnjour "/journal"
 text jnlock "/lock"
 text jnkey "/k."
@@ -64,6 +88,10 @@ global jpath uchar 160
 global jact ulong 1024
 global jjob ulong 2048
 global jstat ulong 8
+note jfmt: 0 the open file's header version, 1 1 once its records follow
+note this format (a version-2 file, or FORMAT seen), 2 1 while replaying a
+note format-1 incarnation.
+global jfmt ulong 3
 note Policy replay tables (DRA-398), per job entry k: jreq request, jslot
 note slot at admission, jbyp bypass count, jrdy 1 once a publication made
 note it ready; jsl slot -> job entry + 1 while admitted and not released;
@@ -78,6 +106,9 @@ global jsl ulong 64
 global jpol ulong 8
 global jgoal ulong 1024
 global jfair ulong 4
+global jopr ulong 1024
+global jnop ulong 1
+global jres ulong 128
 
 note Fault injection for the recovery tests: exit 77 at point p when armed.
 fn jn_hit p ulong to void
@@ -172,6 +203,13 @@ end
 for i ulong 2048
 put jjob i 0
 end
+for i ulong 1024
+put jopr i 0
+end
+put jnop 0 0
+for i ulong 128
+put jres i 0
+end
 for i ulong 8
 put jstat i 0
 put jpol i 0
@@ -190,6 +228,9 @@ put jsl i 0
 end
 for i ulong 4
 put jfair i 0
+end
+for i ulong 3
+put jfmt i 0
 end
 put jon 0 0
 put jbad 0 0
@@ -316,12 +357,14 @@ end
 note Apply one durable record to the recovery tables; 0, 24 unknown type,
 note 25 a transition the tables refuse (START of a performed operation, a
 note DONE without a START, a second ADMIT or RELEASE, a policy record that
-note does not hold), 33 an OPEN of another scheduler policy version.
+note does not hold, a POLICY, GOAL or FAIR in a format-1 incarnation), 33 an
+note OPEN or FORMAT the file's format does not allow (see FORMAT above).
 fn jn_apply r view ulong 16 to ulong
 t = get r 0
 if eq t 1
-if ne get r 5 SPVER
-ret 33
+e = jn_aopen r
+if ne e 0
+ret e
 end
 put jfence 0 get r 2
 jn_maxg get r 4
@@ -368,19 +411,38 @@ if eq t 7
 put jstat 2 get r 3
 ret 0
 end
+if eq t 9
+ret jn_oapply r
+end
+if eq t 10
+ret jn_rapply r
+end
+if eq t 14
+ret jn_afmt r
+end
 if gt t 10
+if and le t 13 ne get jfmt 2 0
+ret 25
+end
 ret jn_apol r
 end
 ret 24
 end
 
 note ADMIT into the tables: a new job entry with its request and slot; a
-note slot another unreleased job holds is refused (25).
+note slot another unreleased job holds is refused (25). A format-1 ADMIT
+note records neither: request 0, the lowest slot no unreleased job holds
+note (25 when none is free).
 fn jn_aadmit r view ulong 16 to ulong
 if ge jn_jfind get r 3 0
 ret 25
 end
 s = get r 7
+q = get r 6
+if ne get jfmt 2 0
+s = jn_lfree
+q = ulong 0
+end
 if ge s 64
 ret 25
 end
@@ -394,11 +456,50 @@ end
 k = ulong j
 put jjob add mul k 8 2 get r 4
 put jjob add mul k 8 3 get r 5
-put jreq k get r 6
+put jreq k q
 put jslot k s
 put jbyp k 0
 put jrdy k 0
 put jsl s add k 1
+ret 0
+end
+
+note The lowest slot no unreleased job holds in the replay table; 64 none.
+fn jn_lfree to ulong
+for s ulong 64
+if eq get jsl s 0
+ret s
+end
+end
+ret 64
+end
+
+note OPEN's format: word 5 SPVER once the file's records follow this format;
+note 0 (a format-1 creator) only in a version-1 file before FORMAT. 33 else.
+fn jn_aopen r view ulong 16 to ulong
+if eq get r 5 SPVER
+if eq get jfmt 1 0
+ret 33
+end
+put jfmt 2 0
+ret 0
+end
+if or ne get r 5 0 ne get jfmt 1 0
+ret 33
+end
+put jfmt 2 1
+ret 0
+end
+
+note FORMAT: only in a version-1 file, once, naming format 2. 33 else.
+fn jn_afmt r view ulong 16 to ulong
+if or ne get jfmt 0 1 ne get jfmt 1 0
+ret 33
+end
+if ne get r 3 2
+ret 33
+end
+put jfmt 1 1
 ret 0
 end
 
@@ -533,6 +634,49 @@ end
 ret true
 end
 
+note OPER into the operator table: 25 for command id 0, an id already
+note there, or a full table. Entry k: 0 id, 1 op, 2 target, 3..6 arguments,
+note 7 view version.
+fn jn_oapply r view ulong 16 to ulong
+n = get jnop 0
+if or eq get r 3 0 ge n 128
+ret 25
+end
+if ge jn_ofind get r 3 0
+ret 25
+end
+for w ulong 8
+put jopr add mul n 8 w get r add 3 w
+end
+put jnop 0 add n 1
+ret 0
+end
+
+note RESULT into the result table (2 words per objective: result, turns):
+note 25 for an index past 63, result 0, or an objective that has one.
+fn jn_rapply r view ulong 16 to ulong
+i = get r 3
+if or ge i 64 eq get r 4 0
+ret 25
+end
+if ne get jres mul i 2 0
+ret 25
+end
+put jres mul i 2 get r 4
+put jres add mul i 2 1 get r 5
+ret 0
+end
+
+note Operator table index of command id, -1 when absent.
+fn jn_ofind id ulong to long
+for k ulong get jnop 0 bound 128
+if eq get jopr mul k 8 id
+ret long k
+end
+end
+ret neg long 1
+end
+
 fn jn_le64 b view uchar 128 off ulong to ulong
 v = ulong 0
 for k ulong 8
@@ -570,6 +714,8 @@ ret 27
 end
 put h 0 5786624599
 put h 1 2
+put jfmt 0 2
+put jfmt 1 1
 put h 2 128
 for i ulong 4
 put h add 3 i get obj i
@@ -593,8 +739,15 @@ s = jn_sum h 7
 if or ne get h 0 5786624599 ne get h 7 s
 ret 21
 end
-if or ne get h 1 2 ne get h 2 128
+if ne get h 2 128
 ret 21
+end
+if and ne get h 1 1 ne get h 1 2
+ret 21
+end
+put jfmt 0 get h 1
+if eq get h 1 2
+put jfmt 1 1
 end
 for i ulong 4
 if ne get h add 3 i get obj i
@@ -838,6 +991,12 @@ ret e
 end
 put jfd 0 int fd
 put jon 0 1
+if eq get jfmt 1 0
+e = jn_rec 14 2 0 0
+if ne e 0
+ret e
+end
+end
 put jfence 0 add get jfence 0 1
 put jgen 0 add get jgen 0 1
 ret jn_rec 1 ulong getpid get jgen 0 SPVER
@@ -1210,4 +1369,58 @@ end
 note Action table entry k word i (k < 64, i < 16).
 fn jn_act k ulong i ulong to ulong
 ret get jact add mul and k 63 16 and i 15
+end
+
+note Commit operator command id: OPER (op, target t, arguments a[0..3],
+note view version v) appended and synced. 0, 25 refused, or a write error.
+fn jn_oper id ulong op ulong t ulong a view ulong 4 v ulong to ulong
+r = new ulong 16 0
+put r 0 9
+put r 3 id
+put r 4 op
+put r 5 t
+for i ulong 4
+put r add 6 i get a i
+end
+put r 10 v
+ret jn_append r
+end
+
+note Operator commands in the journal, and word w of the k-th (as jn_oapply).
+fn jn_nops to ulong
+ret get jnop 0
+end
+
+fn jn_opw k ulong w ulong to ulong
+ret get jopr add mul and k 127 8 and w 7
+end
+
+note Commit that objective i ended with result r after t model turns: RESULT
+note appended and synced. 0, 25 refused, or a write error.
+fn jn_result i ulong r ulong t ulong to ulong
+x = new ulong 16 0
+put x 0 10
+put x 3 i
+put x 4 r
+put x 5 t
+ret jn_append x
+end
+
+note The result objective i ended with in the journal (0 none), and its
+note model turns.
+fn jn_res i ulong to ulong
+ret get jres mul and i 63 2
+end
+
+fn jn_rturn i ulong to ulong
+ret get jres add mul and i 63 2 1
+end
+
+note True when job id has a durable START (an operation was granted to it).
+fn jn_started id ulong to bool
+k = jn_jfind id
+if lt k 0
+ret false
+end
+ret ne get jjob add mul ulong k 8 7 0
 end
