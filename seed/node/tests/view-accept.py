@@ -205,17 +205,17 @@ def t_commands():
     rc, s0 = view(vp)
     wait_for(lambda: view(vp)[1]['objectives'][0]['version'] > s0['version'], 10)
     rc, a = cmd(vp, 11, 4, 0, s0, 6)
-    res(rc == 1 and a['status'] == 'stale', 'cmd-stale-409', f'rc={rc} {a}')
+    res(rc == 1 and a and a['status'] == 'stale', 'cmd-stale-409', f'rc={rc} {a}')
     rc, a = fresh(vp, 12, 4, 0, 9)
-    res(rc == 1 and a['status'] == 'invalid', 'cmd-invalid-budget', f'rc={rc} {a}')
+    res(rc == 1 and a and a['status'] == 'invalid', 'cmd-invalid-budget', f'rc={rc} {a}')
     rc, s1 = view(vp)
     # version 0 and op 9: only the view's incarnation check answers stale; were the command
     # passed on, the creator would answer invalid (op out of range) whatever the version is now
     rc, a = op(vp, 'cmd', 13, 9, 0, s1['incarnation'] + 1, 0, 6)
-    res(rc == 1 and a['status'] == 'stale', 'cmd-other-incarnation', f'rc={rc} {a}')
+    res(rc == 1 and a and a['status'] == 'stale', 'cmd-other-incarnation', f'rc={rc} {a}')
     cid = 14
     rc, a = fresh(vp, cid, 4, 0, 6)
-    res(rc == 0 and a['status'] == 'committed', 'cmd-budget-committed', f'id={cid} {a}')
+    res(rc == 0 and a and a['status'] == 'committed', 'cmd-budget-committed', f'id={cid} {a}')
     rc, s2 = view(vp)
     res(s2['objectives'][0]['budget'] == 6 and s2['commands']['last_id'] == cid,
         'cmd-budget-visible', f"budget={s2['objectives'][0]['budget']} last={s2['commands']['last_id']}")
@@ -225,7 +225,7 @@ def t_commands():
     # pause: committed through the authority; no new grants while paused
     rc, sp = view(vp)
     rc, a = cmd(vp, 40, 1, 0, sp)
-    res(rc == 0 and a['status'] == 'committed', 'cmd-pause', f'{a}')
+    res(rc == 0 and a and a['status'] == 'committed', 'cmd-pause', f'{a}')
     # a pause emits a second event before its ack, so an ack carrying the version current
     # after acting (not the one its OPER record holds) differs from the duplicate's
     rc, ad = cmd(vp, 40, 1, 0, sp)
@@ -233,7 +233,7 @@ def t_commands():
         'cmd-pause-duplicate-version', f"{ad} original={a['version']}")
     rc, s3 = view(vp)
     rc, a = cmd(vp, 41, 1, 0, s3)
-    res(rc == 1 and a['status'] == 'invalid', 'cmd-pause-again-invalid', f'{a}')
+    res(rc == 1 and a and a['status'] == 'invalid', 'cmd-pause-again-invalid', f'{a}')
     time.sleep(4)
     rc, s4 = view(vp)
     if s4 is None:
@@ -244,7 +244,7 @@ def t_commands():
             all(w['paused'] == 1 for w in s4['workers']),
             'cmd-paused-holds', f"auth={s4['authority']} queue={q}")
         rc, a = cmd(vp, 42, 2, 0, s4)
-        res(rc == 0 and a['status'] == 'committed', 'cmd-resume', f'{a}')
+        res(rc == 0 and a and a['status'] == 'committed', 'cmd-resume', f'{a}')
     rc = finish(p, 120)
     fs.kill()
     out = lines(base)
@@ -259,7 +259,7 @@ def t_cancel():
     wait_for(lambda: view(vp)[1]['objectives'][0]['phase'] == 1, 10)
     rc, a = fresh(vp, 60, 3, 0)
     t = time.time()
-    res(rc == 0 and a['status'] == 'committed', 'cancel-committed', f'{a}')
+    res(rc == 0 and a and a['status'] == 'committed', 'cancel-committed', f'{a}')
     wait_for(lambda: any(l.startswith('CWO 0 ') for l in lines(base)), 10)
     dt = time.time() - t
     rc = finish(p, 120)
@@ -278,12 +278,12 @@ def t_redirect():
     kn, K, N, A = ex['recs'][0]['obj'].split(',')
     k_, K, N, A = KINDS[kn], int(K), int(N), int(A)
     rc, a = fresh(vp, 80, 5, 0, k_, K, N, A)
-    res(rc == 0 and a['status'] == 'committed', 'redirect-committed', f'{a}')
+    res(rc == 0 and a and a['status'] == 'committed', 'redirect-committed', f'{a}')
     rc, s = view(vp)
     o = s['objectives'][0]
     res((o['a'], o['k'], o['n']) == (A, K, N), 'redirect-visible', f'{o}')
     rc, a = fresh(vp, 99, 5, 0, 4, K, N, A)
-    res(rc == 1 and a['status'] == 'invalid', 'redirect-invalid-kind', f'{a}')
+    res(rc == 1 and a and a['status'] == 'invalid', 'redirect-invalid-kind', f'{a}')
     rc = finish(p, 120)
     fs.kill()
     out = lines(base)
@@ -298,7 +298,7 @@ def t_budget():
     fs, fp = fake(base, 700)
     p, vp, ok = node(base, objs, fp)
     rc, a = fresh(vp, 120, 4, 0, 2)
-    res(rc == 0 and a['status'] == 'committed', 'budget-committed', f'{a}')
+    res(rc == 0 and a and a['status'] == 'committed', 'budget-committed', f'{a}')
     rc = finish(p, 120)
     fs.kill()
     out = lines(base)
@@ -404,9 +404,9 @@ def t_crash():
     res(rc == 0 and d['kind'] == 'snapshot', 'crash-old-client-resyncs', f"kind={d['kind']}")
     cid, a0 = sorted(ids.items())[0]
     rc, a = op(vp2, 'cmd', cid, 3, 1, s['incarnation'], s['version'])
-    res(rc == 0 and a['status'] == 'duplicate' and a['version'] == a0['version'], 'crash-duplicate-after-restart', f'{a}')
+    res(rc == 0 and a and a['status'] == 'duplicate' and a['version'] == a0['version'], 'crash-duplicate-after-restart', f'{a}')
     rc, a = cmd(vp2, cid + 1000, 3, 1, s)
-    res(rc == 1 and a['status'] == 'invalid', 'crash-cancel-finished-invalid', f'{a}')
+    res(rc == 1 and a and a['status'] == 'invalid', 'crash-cancel-finished-invalid', f'{a}')
     rc = finish(p, 120)
     fs.kill()
     out = lines(base, 'run2')

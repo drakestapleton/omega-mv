@@ -13,7 +13,8 @@ BUILD holds the programs release.sh build makes; OLDBIN the DRA-290 build
 (code-main without the operator view) for the journal compatibility checks;
 OMC the compiler whose messages round40's prompts carry; ROUND40 repair.py and
 final-selected.json. Prints one PASS/FAIL/NOT_RUN line per check, MEASURED lines,
-and "RELSUM pass=P fail=F not_run=N mode=..."; exits 0 when nothing failed.
+and "RELSUM pass=P fail=F not_run=N mode=..."; exits 0 when every check passed,
+1 when one failed, 3 when none failed but some were NOT_RUN.
 """
 import collections, hashlib, json, os, shutil, signal, socket, struct, subprocess, sys, threading, time
 
@@ -719,4 +720,4 @@ if LIVE:
 MODEL = ('live own model ' + os.environ.get('VERB', 'serve')) if LIVE else \
     'fake (recorded answers only: host regression, not model qualification)'
 print(f'RELSUM pass={NP[0]} fail={NP[1]} not_run={NP[2]} mode={MODEL}', flush=True)
-sys.exit(1 if NP[1] else 0)
+sys.exit(1 if NP[1] else 3 if NP[2] else 0)  # 3: nothing failed, something was NOT_RUN (not a pass)

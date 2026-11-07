@@ -903,7 +903,11 @@ An inference worker that dies while it holds a job: inference is class 2
 (no external effect), so `au_lost` records it not performed (DONE how 6),
 as recovery does at a restart, and the objective asks again; only class 1
 and 3 effects stay UNKNOWN. The uncertain-effect test hook kills a worker
-only after the job's START is durable.
+only after the job's START is durable: a job is assigned before its
+worker's proposal is decided and journaled, and the first acceptance run
+killed one holding ADMIT only. That window depends on worker timing, so no
+mutant of the guard is killed deterministically; `uncertain-start-durable`
+fails whenever it is hit.
 
 ### Acceptance and controls
 
@@ -923,12 +927,21 @@ A resumed objective reads the file it edited before the restart, a prompt no
 recording holds: in fake mode the three checks that need it
 (`restart-resumed-completes`, `journal-forward-completes`,
 `journal-rollback-completes`) are NOT_RUN, naming the prompt; any other end
-fails them. Live mode answers it and requires PASS.
+fails them. Live mode answers it and requires PASS. The driver exits 0 only
+when every check passed, 3 when none failed but some were NOT_RUN, 1 when
+one failed.
 
 | Change | Check that fails |
 | --- | --- |
 | RESULT not journaled | `full-results-durable` |
 | journaled RESULT not reported at restart | `full-results-durable` |
 | lost inference left UNKNOWN | `worker-death-rerun` |
-| uncertain hook before START is durable | `uncertain-start-durable` |
 | second RESULT accepted (journal.om) | journal gate case 16 (exit 173) |
+| second RESULT accepted (Lean model) | `second_refused`, `apply_keeps` no longer prove |
+
+`proofs/Result.lean` models `jn_rapply`, the restart decision of `cw_run` and
+`au_lost` in Lean 4 core (checked with Lean 4.35.0; every theorem depends on
+`propext` only): an applied RESULT is never replaced, a second one for the
+objective is refused, every later replay keeps it so the objective is never
+resumed, and only a class-2 lost action is recorded not performed. The proof
+covers the model; its correspondence to the `.om` code is by reading.
