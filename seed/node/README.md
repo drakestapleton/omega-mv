@@ -374,8 +374,8 @@ There is one scheduler: these are policies of `sched_dispatch`, not a second
 dispatcher.
 
 Status (DRA-395): IMPLEMENTED: resource requests, capacity admission and
-policy 0, FIFO head-of-line, which reproduces the reference pump. The
-regression below fails on purpose until DRA-396 adds fair fitting.
+policy 0, FIFO head-of-line, which reproduces the stop rule of the reference
+pump. The regression below fails on purpose until DRA-396 adds fair fitting.
 
 ```sh
 cat seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/node/schedpol-test.om > build/node/schedpol-composed.om
@@ -420,23 +420,33 @@ scheduler, which sees every job as one worker and no resource.
 
 A request is one ulong of four 16-bit counts: kind 0 CPU slots, 1 memory MiB,
 2 inference slots, 3 caller-defined. Capacities default to 65535 of each, so
-callers that declare nothing (`sched_admit`) behave as before. A job takes its
-whole need when it is assigned and gives it back when its worker reports done
-(even while its result waits for review room) or is reaped. Every job also
-needs one idle live worker.
+callers that declare nothing (`sched_admit`) are never refused or held back
+for resources. A job takes its whole need when it is assigned and gives it
+back when its worker reports done (even while its result waits for review
+room) or is reaped. Every job also needs one idle live worker. A capacity is
+never set below the current use or below one admitted job's need.
+
+One behaviour changes for every caller: DRA-287 assigned ready jobs in slot
+order, which is an accident of which slot was free; selection now follows a
+policy. Phase F below is the case that differs: a job admitted first into a
+lower slot but made ready later by a publication used to be assigned first;
+under policy 0 the job that became ready first is. No consumer in this
+directory depends on slot order (the DRA-287, DRA-288, DRA-289 gates and the
+DRA-290 unit checks pass unchanged).
 
 Policy 0 serves the ready job that became ready first, if it fits; when it
-does not, nothing is assigned. This is the reference pump with an unbounded
-queue: in both, a head that does not fit holds back every later job. The
-differences are deliberate and do not change that outcome: ready order is the
-order of becoming ready (the pump appends newly eligible tasks in id order),
-and the bounded window of the pump is not modelled because only its head can
-be dispatched.
+does not, nothing is assigned. That is the stop rule of the reference pump
+(598-602): a head that does not fit holds back every later job. Its queue is
+not reproduced. The pump batches newly eligible tasks in task-id order into
+a queue of `queue_capacity`, so an eligible task can be left outside it
+(scenario b of the Rust reproduction); here every admitted job is in the
+table and ready order is the order of becoming ready. The bounded-queue
+exclusion is therefore evidenced for Rust only.
 
 | Function | Contract |
 | --- | --- |
 | `sched_admitr id deps flags req` | `sched_admit` with a resource request; -8 when a kind exceeds its capacity (counted, never queued). |
-| `sched_cap caps` | Set every capacity; -8 and no change when an admitted job would no longer fit. |
+| `sched_cap caps` | Set every capacity; -8 and no change when a kind would fall below its use or below one admitted job's need. |
 | `sched_policy p win db by` | Policy (0 only, for now), candidate window 1..64 slots, dispatch budget 1..64 per event, bypass budget 1..65535; -7 out of range. |
 | `sched_stat i` | Counters 0..15, capacity 16..19, use 20..23, policy words 24..29. |
 
@@ -446,24 +456,41 @@ selection never reads the clock.
 ### Regression and controls
 
 `schedpol-test.om` checks after every creator step that each kind's use is at
-most its capacity and equals the needs of the running jobs that hold it.
+most its capacity and equals the needs of the running jobs that hold it, and
+that every running job whose worker has not reported done holds its need.
 
 | Phase | Scenario | Exit when it fails |
 | --- | --- | --- |
-| C | requests over CPU, memory or inference capacity refused (-8) and counted; lowering a capacity below an admitted need refused | 31..41 |
+| C | requests over CPU, memory or inference capacity refused (-8) and counted; lowering a capacity below an admitted need, or below the use of two running jobs that each fit it alone, refused with nothing changed | 30..41, 130..134 |
 | D | 12 jobs with mixed needs on 3 workers, capacity 4 CPU, 1024 MiB, 1 inference: each runs once, all resources free at the end | 42..48 |
+| V | review limit 1: both 1-CPU jobs finish, one result waits for review room, yet both CPUs are free and a 2-CPU job runs | 120..126 |
 | F | ready order: a job made ready by a later publication is served after one ready earlier | 50..57 |
-| A | blocked head: a (3 CPU) runs, b (2 CPU) cannot fit, c (1 CPU) fits | 11: c stays idle behind b |
-| B | queue exclusion of the pump: a runs, b and d (2 CPU) wait, e (1 CPU) fits | 21: e stays idle |
+| A | blocked head: a (3 CPU) runs, b (2 CPU) cannot fit, c (1 CPU) fits | 11 with the witness line |
+| B | a second head-of-line case after the pump's queue-of-two scenario: a runs, b and d (2 CPU) wait, e (1 CPU) fits | 21 with the witness line |
 
-At DRA-395 the gate passes C, D and F and stops at A with exit 11, the same
-head-of-line block the Rust pump shows in
-`~/handoffs/hive/sched/rust-repro/REPORT.md`.
+A and B do not fail on a timeout alone. When the fitting job has not run
+within 400 ms, the test checks, with no step in between, that a is running
+and unfinished and holds its need, that the head is ready and does not fit,
+that the job behind it is ready and fits, that a live worker is idle and that
+dispatch stopped at the head; then it prints the witness and the phase
+returns 11 (21). Both phases always run; the first failure is the exit.
+At DRA-395 the gate passes C, D, V and F and exits 11:
+
+```
+schedpol hol witness head=20050 fits_behind=30050 free_cpu=1 idle_worker=1 hol_stops=40
+schedpol hol witness head=20050 fits_behind=50050 free_cpu=1 idle_worker=1 hol_stops=40
+```
+
+This is the block the Rust pump shows; its reproduction (test source,
+command, output) is kept in `evidence/node-schedpol/rust-reference.*.json`.
 
 | Change to `sched.om` | Expected exit |
 | --- | --- |
 | `if not sp_feas req` to `if false` (impossible requests admitted) | 31 |
-| `sp_give j` deleted from `sched_collect` (resources never returned) | 44 |
+| the `lt sp_need caps k get suse k` check of `sched_cap` made `if false` (capacity below use accepted) | 131 |
+| `sp_take j` deleted from `sp_start` (running jobs hold nothing) | 130 |
+| `sp_give j` deleted from `sched_collect` (resources never returned) | 133 |
+| `sp_give j` moved after the review-room check in `sched_collect` (release waits for review) | 122 |
 | `if gt sp_need req k a` to `if false` in `sp_fits` (capacity ignored) | 44 |
 | `sp_ready j` in `sched_publish` to `put sjst j 2` (ready order not stamped) | 54 |
 

@@ -14,6 +14,10 @@ text phol " hol_stops="
 text pbyp " bypasses="
 text pres " reservations="
 text pnl "\n"
+text pw1 "schedpol hol witness head="
+text pw2 " fits_behind="
+text pw3 " free_cpu="
+text pw4 " idle_worker="
 global ptc long 1
 
 fn pt_ok ok bool code int to void
@@ -131,8 +135,17 @@ end
 
 note The capacity invariant: of each kind the use is at most the capacity
 note and equals the sum of the needs of the jobs that hold resources; only
-note a running job holds them.
+note a running job holds them, and every running job whose worker has not
+note reported done holds them.
 fn pt_inv code int to void
+for j ulong 64
+if eq get sjst j 3
+w = get sjw j
+if ne sc_cell w 64 get scseq w
+pt_ok eq get sjheld j 1 code
+end
+end
+end
 for k ulong 4
 s = ulong 0
 for j ulong 64
@@ -203,10 +216,11 @@ ret ulong j
 end
 
 note Phase C: a request beyond the capacity of any kind is refused (-8) and
-note counted; lowering a capacity below an admitted job's need is refused
-note and changes nothing.
+note counted; lowering a capacity below an admitted job's need, or below
+note the use of two running jobs that each fit it alone, is refused and
+note changes nothing.
 fn pt_impossible to void
-c = pt_setup 1 8 8 pt_req 4 1024 1 8 30
+c = pt_setup 2 8 8 pt_req 4 1024 1 8 30
 pt_ok eq sched_admitr 1 0 0 pt_req 5 0 0 0 neg long 8 31
 pt_ok eq sched_admitr 2 0 0 pt_req 1 1025 0 0 neg long 8 32
 pt_ok eq sched_admitr 3 0 0 pt_req 0 0 2 0 neg long 8 33
@@ -217,6 +231,15 @@ pt_ok eq sched_stat 16 4 37
 pt_ok eq sched_cancel a 1 38
 pt_ok eq sched_cap pt_req 2 1024 1 8 0 39
 pt_ok eq sched_stat 16 2 40
+pt_ok eq sched_cap pt_req 4 1024 1 8 0 130
+p = pt_admit 130400 0 pt_req 2 0 0 0 130
+q = pt_admit 140400 0 pt_req 2 0 0 0 130
+pt_ok pt_until c p 3 3 2000 130 130
+pt_ok pt_until c q 3 3 2000 130 130
+pt_ok eq sched_cap pt_req 3 1024 1 8 neg long 8 131
+pt_ok eq sched_stat 16 4 132
+pt_drain c 2 3000 133
+pt_ok eq sched_cap pt_req 3 1024 1 8 0 134
 pt_down c 41
 end
 
@@ -242,6 +265,45 @@ pt_ok eq sched_stat 4 12 47
 pt_down c 48
 end
 
+note Some running job whose worker has reported done (its result waits
+note for review room).
+fn pt_held to bool
+for j ulong 64
+if eq get sjst j 3
+w = get sjw j
+if eq sc_cell w 64 get scseq w
+ret true
+end
+end
+end
+ret false
+end
+
+note Phase V: release while review is full. Review limit 1, two workers,
+note 2 CPU: j1 and j2 (1 CPU, 50 ms) both finish; one enters review, the
+note other's result waits for room, yet both CPUs are free at once and j3
+note (2 CPU) runs before anything is reviewed.
+fn pt_release to void
+c = pt_setup 2 8 1 pt_req 2 1024 1 8 120
+j1 = pt_admit 150050 0 pt_req 1 0 0 0 120
+j2 = pt_admit 160050 0 pt_req 1 0 0 0 120
+dl = add ulong monons 2000000000
+for t ulong 1000000
+if eq sched_count 4 4 1
+if pt_held
+break
+end
+end
+pt_ok lt ulong monons dl 121
+pt_step c 121
+end
+pt_ok eq get suse 0 0 122
+j3 = pt_admit 170050 0 pt_req 2 0 0 0 123
+pt_ok pt_until c j3 3 4 2000 123 124
+pt_drain c 3 3000 125
+pt_down c 126
+end
+
 note Phase F: ready order. With one worker, x is admitted first waiting on
 note topic 8 and y second ready at once; then topic 8 is published. FIFO
 note (policy 0) serves the job that became ready first, y.
@@ -257,37 +319,83 @@ pt_drain c 2 3000 56
 pt_down c 57
 end
 
+note Witness of a head-of-line block, read with no step in between: a runs
+note unfinished holding its need, the head h is ready and does not fit, x
+note is ready and fits, a live worker is idle, and dispatch stopped at the
+note head at least once since h0 (codes code..code+4 when not).
+fn pt_witness c long a ulong h ulong x ulong h0 ulong code int to void
+w = get sjw a
+pt_ok eq get sjst a 3 code
+pt_ok ne sc_cell w 64 get scseq w code
+pt_ok eq get sjheld a 1 code
+pt_ok eq get sjst h 2 add code 1
+pt_ok not sp_fits get sjneed h 0 add code 1
+pt_ok eq get sjst x 2 add code 2
+pt_ok sp_fits get sjneed x 0 add code 2
+i = sp_idle mapget c 48 8
+pt_ok lt i 64 add code 3
+pt_ok gt sched_stat 8 h0 add code 4
+r = write 1 pw1 0 len pw1
+pt_num get sjid h
+r = write 1 pw2 0 len pw2
+pt_num get sjid x
+r = write 1 pw3 0 len pw3
+pt_num sp_free 0
+r = write 1 pw4 0 len pw4
+pt_num i
+r = write 1 phol 0 len phol
+pt_num sub sched_stat 8 h0
+r = write 1 pnl 0 1
+end
+
 note Phase A: the blocked head. a (3 CPU, 800 ms) runs; then b (2 CPU,
-note cannot fit) and c (1 CPU, fits) arrive with no dependency. The target
-note behaviour: c runs while a still runs and b waits. 11 means c stayed
-note idle behind b although a CPU was free: the head-of-line block.
-fn pt_blocked to void
+note cannot fit) and c (1 CPU, fits) arrive with no dependency. The target:
+note c runs while a still runs and b waits (0). When c has not run within
+note 400 ms, the witness is checked and printed and the phase returns 11:
+note c stayed idle behind b although a CPU and a worker were free.
+fn pt_blocked to int
 c = pt_setup 3 8 8 pt_req 4 1024 1 8 10
 a = pt_admit 10800 0 pt_req 3 0 0 0 10
 pt_ok pt_until c a 3 3 2000 10 10
 b = pt_admit 20050 0 pt_req 2 0 0 0 10
 x = pt_admit 30050 0 pt_req 1 0 0 0 10
-pt_ok pt_until c x 3 4 400 10 11
+h0 = sched_stat 8
+v = int 0
+if pt_until c x 3 4 400 10
 pt_ok eq get sjst a 3 12
 pt_ok eq get sjst b 2 13
-pt_drain c 3 5000 14
-pt_down c 15
+else
+pt_witness c a b x h0 12
+v = int 11
+end
+pt_drain c 3 5000 17
+pt_down c 18
+ret v
 end
 
-note Phase B: bounded-queue exclusion of the reference pump (queue of two):
-note a (3 CPU, 800 ms) runs, b and d (2 CPU each) cannot fit, e (1 CPU)
-note fits. The target: e runs while a still runs. 21 means e stayed idle.
-fn pt_exclude to void
+note Phase B: a second head-of-line case, after the pump's queue-of-two
+note scenario (the bounded queue itself is not modelled: every admitted
+note job is in the table). a (3 CPU, 800 ms) runs, b and d (2 CPU) cannot
+note fit, e (1 CPU) fits. Target: e runs while a still runs (0); else the
+note witness and 21.
+fn pt_exclude to int
 c = pt_setup 3 8 8 pt_req 4 1024 1 8 20
 a = pt_admit 10800 0 pt_req 3 0 0 0 20
 pt_ok pt_until c a 3 3 2000 20 20
 b = pt_admit 20050 0 pt_req 2 0 0 0 20
 d = pt_admit 40050 0 pt_req 2 0 0 0 20
 e = pt_admit 50050 0 pt_req 1 0 0 0 20
-pt_ok pt_until c e 3 4 400 20 21
+h0 = sched_stat 8
+v = int 0
+if pt_until c e 3 4 400 20
 pt_ok eq get sjst a 3 22
-pt_drain c 4 5000 23
-pt_down c 24
+else
+pt_witness c a b e h0 22
+v = int 21
+end
+pt_drain c 4 5000 27
+pt_down c 28
+ret v
 end
 
 fn pt_stats to void
@@ -306,12 +414,21 @@ pt_num sched_stat 6
 r = write 1 pnl 0 1
 end
 
+note The regression phases A and B return their verdict, so both run and
+note print their witness; the first failing one is the exit status.
 fn main to int
 pt_impossible
 pt_churn
+pt_release
 pt_order
-pt_blocked
-pt_exclude
+ra = pt_blocked
+rb = pt_exclude
+if ne ra 0
+ret ra
+end
+if ne rb 0
+ret rb
+end
 if ne write 1 pok 0 len pok long len pok
 ret 100
 end
