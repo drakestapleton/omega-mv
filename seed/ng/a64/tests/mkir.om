@@ -1,6 +1,7 @@
 note mkir: ΩIR fixtures for the ng-a64 gates, built with ir.om's builder (seed/ng/IR.md s14). Built as the
 note concatenation seed/ng/src/ir.om + this file. Input: one line naming the fixture; output: its ΩIR binary (ir_wr).
 note Program entry (D11): the single export (kind 2) with no parameters and result i32; its result is the exit status.
+note main's `int` is lowered as IR.md s13 says: chk.conv i32 (trap 5), then conv.
 note   fib   fn fib n u64 -> u64 (n < 2: n, else fib(n-1) + fib(n-2)), the bench kernel; main returns i32 fib(25)
 note   deep  i32 fib(100000000): the recursion passes the stack floor, trap 6 (exit 106)
 note   press pr(7) + pq(9), low byte: pr keeps 28 values live across a call (9 callee-saved registers: spills),
@@ -8,8 +9,9 @@ note         pq keeps 40 values live with no call (24 registers: spills)
 note   rot   a loop whose block parameters rotate as a 3-cycle (x, y, z) <- (y, z, x), s <- 31 s + x; 1000 passes
 note   ck    ck(5, 7) then ck(2147483000, 1000), ck = chk.add then add on i32: trap 1 (exit 101)
 note   ar    u32 rotl rotr shl max add mul select shr, u8 wrap, i32 shr div rem min sub, folded into u64; low byte
-note   tsum  fn ts n u64 -> u64 (n < 1: n, else ts(n-1) + n, call result first), main returns i32 ts(1000000):
-note         ng's E loop shape removes the recursion (status 32); omc recurses a million deep and traps 6 (106)
+note   tsum  fn ts n u64 -> u64 (n < 1: n, else ts(n-1) + n, call result first), main returns i32 of ts(1000000) & 255
+note         (ts(1000000) = 500000500000 does not fit i32: without the & 255 its chk.conv traps 5). ng's E loop shape
+note         removes the recursion (status 32); omc recurses a million deep and traps 6 (106)
 note   mem   global src u8[300] filled by fill(REF src) (src[i] = 7 i & 255); one chk.bounds with a computed e; local
 note         b u64[600] (alloca, zero-filled, frame above 4095 bytes); b[i + 300] = src[i] + i; s = sum b[i] (i + 1);
 note         chk.slice and write of the 3-byte text "ok\n" to fd 1; status (s + write's count) & 255
@@ -23,9 +25,12 @@ note   bcopy the bench kernel ~/handoffs/OmegaFast/bench/bcopy.om lowered by IR.
 note         reversed xor copies, write 1 dst 0 65536; status 0, stdout 65536 bytes (Wolfram SHA-256 483bf6a6..7315)
 note   sort  the bench kernel bench/sort.om lowered by IR.md s13 (five functions, REF parameters, alloca, while
 note         loops, putnum's write at a variable offset); status 0, stdout 2128411481385469, 0, 118, 3999832 (Wolfram)
+note   lv    fn lv n u64 -> u64: v_k = n (2k + 3) + k^2 + 1 for k < 20, all live (no call) across chk.add v_0 v_1,
+note         chk.mul v_2 v_3 and chk.bounds of n & 7 in a global u64[8] (the checks use scratch x15, which the
+note         allocator must never hand out); s = n, s = (5 s) xor v_k in order; main returns lv(9) & 255
 note The omc reference program of fixture N is seed/ng/a64/tests/ref/N.om (the same computation in Omega).
 note Exit 2 for an unknown fixture name.
-text m_names "fib\ndeep\npress\nrot\nck\nar\ntsum\nmem\noob\nzf\nwid\nbcopy\nsort\n"
+text m_names "fib\ndeep\npress\nrot\nck\nar\ntsum\nmem\noob\nzf\nwid\nbcopy\nsort\nlv\n"
 global m_v uint 64
 
 fn m_k1 b uint ty uint v ulong to uint
@@ -127,13 +132,20 @@ m_retv br ir_otok k2 a
 ret f
 end
 
-note m_main f x: export main: i32 (conv) of f(x)
-fn m_main f uint x ulong to void
+note m_main f x m: export main: Omega `int` of f(x) (m 1: of f(x) & 255), chk.conv i32 5 then conv (IR.md s13)
+fn m_main f uint x ulong m ulong to void
 g = ir_fnew 2 0 8
 b0 = ir_blk g
 c = m_k1 b0 5 x
 k = m_call b0 ir_ftok g f 5 c
-m_retv b0 ir_otok k m_un b0 36 8 ir_res k
+v = ir_res k
+if eq m 1
+v = m_bin b0 16 5 v m_k1 b0 5 255
+end
+o = ir_op b0 78 8 5 2
+ir_set o 0 ir_otok k
+ir_set o 1 v
+m_retv b0 ir_otok o m_un b0 36 8 v
 end
 
 note pr n: v_k = n (2k + 3) + k^2 + 1 for k < 28, all live across s = fib(10); then s = 3 s + v_k in order
@@ -379,7 +391,50 @@ end
 
 fn m_fibm x ulong to void
 f = m_fib
-m_main f x
+m_main f x 0
+end
+
+note m_lvc b t n r g: on token t, chk.add v_0 v_1, chk.mul v_2 v_3 (trap 1) and chk.bounds of n & 7 with count 1 in
+note global g (reference type r); the token after them
+fn m_lvc b uint t uint n uint r uint g uint to uint
+t1 = m_chk2 b t 70 1 get m_v 0 get m_v 1
+t2 = m_chk2 b t1 72 1 get m_v 2 get m_v 3
+o = ir_op b 52 r ulong g 0
+i = m_bin b 16 5 n m_k1 b 5 7
+ret ir_otok m_e3 b 79 t2 ir_res o i m_k1 b 5 1
+end
+
+note lv: see the header; m_lvf r g the function (global g: u64[8], reference type r), m_lv main
+fn m_lvf r uint g uint to uint
+f = ir_fnew 0 0 5
+n = ir_fpar f 5
+b = ir_blk f
+k = ulong 0
+while lt k 20 bound 20
+m = m_bin b 12 5 n m_k1 b 5 add mul k 2 3
+put m_v k m_bin b 10 5 m m_k1 b 5 add mul k k 1
+k = add k 1
+end
+t = m_lvc b ir_ftok f n r g
+c5 = m_k1 b 5 5
+s = n
+k = 0
+while lt k 20 bound 20
+s = m_bin b 18 5 m_bin b 12 5 s c5 get m_v k
+k = add k 1
+end
+m_retv b t s
+ret f
+end
+
+fn m_lv to void
+a = ir_tarr 5 8
+r = ir_tref a 1 0
+f = m_lvf r ir_glob a 0
+g = ir_fnew 2 0 8
+b = ir_blk g
+o = m_call b ir_ftok g f 5 m_k1 b 5 9
+m_mlow b ir_otok o ir_res o
 end
 
 note ts: the E loop shape with the call result as the add's first operand and no other call
@@ -1023,7 +1078,7 @@ if eq s 5
 m_ar
 end
 if eq s 6
-m_main m_ts 1000000
+m_main m_ts 1000000 1
 end
 if eq s 7
 m_mem
@@ -1043,7 +1098,10 @@ end
 if eq s 12
 m_sort
 end
-if gt s 12
+if eq s 13
+m_lv
+end
+if gt s 13
 ret 2
 end
 m = ir_wr
