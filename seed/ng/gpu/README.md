@@ -34,8 +34,8 @@ every repository (history: CUDApp `b056bf7e:evidence/ldg-offset-20261107/{ngcap.
 its desk review; on the Spark at `~/handoffs/hive-ng/gpu/evidence/ldg-offset-20261107-instruments/`); nothing here
 builds or runs C. Expected
 outputs: golden and dump are the bytes on which CUDApp's `.om` encoder and its C oracle agreed; slice and ldg are the C
-oracle's bytes, which the pinned `.om` encoder reproduces and CUDApp main b774723f's does not (LDG.E offset defect).
+oracle's bytes, which the pinned `.om` encoder reproduces and CUDApp b774723f's (before #373) does not (LDG.E offset defect).
 
 ## Status
-HOST_TESTED (Linux AArch64): 12/12 PASS against the pinned encoder; against CUDApp main b774723f's encoder the pin,
-slice and ldg cases FAIL, as they must. No GPU involved.
+HOST_TESTED (Linux AArch64): 12/12 PASS against the pinned encoder (CUDApp 1988c50e); against CUDApp b774723f's
+encoder (before #373) the pin, slice and ldg cases FAIL, as they must. No GPU involved.
