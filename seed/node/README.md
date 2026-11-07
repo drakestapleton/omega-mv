@@ -974,7 +974,7 @@ scenario first and must pass all of them, else the mutant runs are void.
 
 Status: IMPLEMENTED in `release.om` (the lifecycle program `release`),
 `journal.om` (RESULT records), `code.om`, `auth.om` and `op.om`; exercised on
-native Linux AArch64 by `tests/release-accept.py fake`, which answers with the
+native Linux AArch64 by `tests/release-accept.om` in `fake` mode, which answers with the
 recorded round40 turns only. The same driver in `live` mode runs every
 scenario against the own model (aien-train `ollm serve`, or `gserve` on the
 GB10 inside an authorized window); a fake run is host regression, not model
@@ -985,12 +985,21 @@ qualification. Not QUALIFIED and not DEPLOYED.
 { printf 'om2\n'; cat om/tls/sha2.om seed/node/release.om; } | seed/out/omc > build/node/release
 chmod +x build/node/release
 build/node/release build build/node            # BUILD_OK name bytes sha256, six programs
-python3 seed/node/tests/release-accept.py fake $PWD/build/node OLDBIN OMC40 ROUND40 build/node/rel
+{ printf 'om2\n'; cat om/tls/sha2.om seed/json/json.om seed/node/tests/drv.om seed/node/tests/nodedrv.om \
+  seed/node/tests/release-accept.om; } | seed/out/omc > build/node/release-accept
+chmod +x build/node/release-accept
+build/node/release-accept fake $PWD/build/node OLDBIN OMC40 ROUND40 /tmp/rel [SCENARIO...]
 OLLM=/abs/path/ollm VERB=serve CK=... MERGES=... PORT=18294 \
-  python3 seed/node/tests/release-accept.py live $PWD/build/node OLDBIN OMC40 ROUND40 build/node/rel
+  build/node/release-accept live $PWD/build/node OLDBIN OMC40 ROUND40 /tmp/rel
 ```
 
-The acceptance driver runs `BUILD/release`, so BUILD must hold it.
+The acceptance driver runs `BUILD/release`, so BUILD must hold it. BUILD,
+OLDBIN, OMC40, ROUND40 and OUT are absolute paths. Keep OUT short: the node's
+`jn_open` refuses a journal directory longer than 100 bytes (error 26, the
+node exits 56 with nothing on stderr), and the deepest one the driver uses is
+`OUT/compat/journal`. The scenarios are `full lifecycle restart conflict
+worker uncertain cancel commands down authority journal memory`; naming none
+runs all twelve.
 
 OLDBIN holds `infer`, `tool` and `code-main` built from the DRA-290 tree
 (git 79894168), the reader before OPER and RESULT.
@@ -1059,7 +1068,7 @@ fails whenever it is hit.
 
 ### Acceptance and controls
 
-`release-accept.py` runs twelve scenarios on the real programs: the full
+`release-accept.om` runs twelve scenarios on the real programs: the full
 four-objective run (prompts and model texts equal the recording, one START
 per operation, independent review, results durable across a rerun with no
 model request), the lifecycle (start, health, stop with jobs ready, restore,
@@ -1068,8 +1077,15 @@ write after the read (15, the other write kept), a dead inference worker
 (rerun), an uncertain replace (21, final after restart), cancel of a running
 inference, stale, burst and duplicate commands, the server down (16), a
 second authority, journal compatibility in both directions, and address-space
-caps from the measured peak (each failing cap explicit with a consistent
-journal, then a passing one). Each prints MEASURED latency, RSS and seconds.
+caps. Each prints MEASURED latency and seconds; the memory scenario prints
+MEASURED `memory-peak-kB` (VmHWM and VmPeak of `code-main`, `infer` and
+`tool`, sampled from `/proc` every 5 ms) and fails `memory-peak-measured`
+when no `code-main` sample was read. `memory-caps-fail-closed-then-pass` is
+NOT_RUN until a reviewed `prlimit` host word exists (omega-mv
+`seed/prlimit-host-word`); no host tool stands in for it. The driver prints
+`PASS|FAIL|NOT_RUN NAME DETAIL` per check and `RELSUM pass=P fail=F
+not_run=N mode=MODE`; a node output it needs that is missing, unreadable or
+over capacity fails the next check, naming it.
 
 A resumed objective reads the file it edited before the restart, a prompt no
 recording holds: in fake mode the three checks that need it
@@ -1079,11 +1095,15 @@ fails them. Live mode answers it and requires PASS. The driver exits 0 only
 when every check passed, 3 when none failed but some were NOT_RUN, 1 when
 one failed.
 
+Mutants, each one line, run once against the scenario named (outputs under a
+short OUT):
+
 | Change | Check that fails |
 | --- | --- |
-| RESULT not journaled | `full-results-durable` |
-| journaled RESULT not reported at restart | `full-results-durable` |
-| lost inference left UNKNOWN | `worker-death-rerun` |
+| RESULT not journaled (`code.om`: `x = jn_result i r cw_g i 7` → `x = ulong 0`) | `full-results-durable` (`CWO 0 FAIL 16 7`) |
+| journaled RESULT not reported at restart (`code.om`: `if ne jn_res i 0` → `if false`) | `full-results-durable` |
+| lost inference left UNKNOWN (`auth.om`: the class-2 test in `au_lost` → `if false`) | `worker-death-rerun` (`CWO 0 FAIL 23 1`), `worker-death-turns-equal-recorded` |
+| rollback leaves the new journal out (`release.om` `rl_rollb`: `rl_cp1 3 2 rljour` → `x = ulong 0`) | `journal-rollback-from-snapshot` (`opens=1`) |
 | second RESULT accepted (journal.om) | journal gate case 16 (exit 173) |
 | second RESULT accepted (Lean model) | `second_refused`, `apply_keeps` no longer prove |
 
