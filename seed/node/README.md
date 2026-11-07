@@ -1,4 +1,4 @@
-# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority, journal and coding workflow
+# Omega Node shared-memory transport, epoch pool, worker supervision, scheduling, authority, journal, coding workflow and operator view
 
 This is the first implementation component of [Omega Node](https://github.com/aien-dev/omega-harness/issues/205).
 It provides a bounded, single-publisher artifact log for trusted forked Omega
@@ -599,10 +599,10 @@ All four are OM-2 programs (`printf 'om2\n'` before the sources):
 L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.om seed/authority/action.om seed/node/journal.om seed/node/auth.om"
 { printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om seed/net/http.om seed/net/notls.om seed/node/infer.om; } | seed/out/omc > build/node/infer
 { printf 'om2\n'; cat seed/agent/path.om seed/node/gram.om seed/node/tool.om; } | seed/out/omc > build/node/tool
-{ printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-main.om; } | seed/out/omc > build/node/code-main
-{ printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-test.om; } | seed/out/omc > build/node/code-test
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om $L seed/node/view.om seed/node/gram.om seed/node/code.om seed/node/code-main.om; } | seed/out/omc > build/node/code-main
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om $L seed/node/view.om seed/node/gram.om seed/node/code.om seed/node/code-test.om; } | seed/out/omc > build/node/code-test
 chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test
-build/node/code-test unit build/node/cu   # "code checks=54 fail=0", exit 0
+build/node/code-test unit build/node/cu   # "code checks=57 fail=0", exit 0
 python3 seed/node/tests/tool-replay.py build/node/tool OMC40 ROUND40 build/node/replay   # pass=108 fail=0
 ```
 
@@ -614,7 +614,7 @@ run directory holding `repair.py` and `final-selected.json`.
 
 ### Programs
 
-`omnode-code INFER TOOL OMC ROOT WORK JDIR PORT OBJ...` runs 1..4 objectives
+`omnode-code INFER TOOL OMC ROOT WORK JDIR PORT VIEW OBJ...` runs 1..4 objectives
 `KIND,K,N,A,PATH,TASK` (KIND `add`, `mul` or `loop`) against the files under
 ROOT, with the journal in JDIR and compile scratch in `WORK/o<i>`. The creator
 holds every objective's state and alone decides; two workers run the granted
@@ -675,7 +675,8 @@ ends the objective as FAIL with its reason; nothing is retried or repaired.
 Output: `CWP i turn n` and `CWR i turn n` lines, each followed by n bytes
 (the prompt; the model text) and a newline; `CWE i job event value` job
 events (1 issued, 2 model action kind, 3 tool status, 4 outcome word, 5
-cancel); `CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
+cancel);
+`CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
 every objective passed, 1 otherwise, 2 usage, 62 out of time, 30 + a journal
 refusal.
 
@@ -693,13 +694,15 @@ only, so a `\r` makes a line fall outside the grammar where Python's
 
 ### Acceptance and controls
 
-`code-test unit` (54 checks, no child process) feeds crafted model and tool
+`code-test unit` (57 checks, no child process) feeds crafted model and tool
 records to the creator: the round40 prompts byte for byte; every action in
 every state; wrong path; old text absent, twice, many times; an edit outside
 the grammar; `Tests passed.` unverified or after an edit; `File not found.`
 when not missing; header and length faults; tool content that differs from
 the source or candidate; outcome words for exit 4, 5 and 8, a killed child,
-cancellation, UNKNOWN and a lost input; the turn limit; an over-long prompt.
+cancellation, UNKNOWN and a lost input; the turn limit; an over-long prompt;
+a full admission queue (DRA-291: a refused inference waits for its next turn,
+a refused tool job ends the objective 23, both counted).
 `code-test cancel MS ...` is `omnode-code` with objective 0's first inference
 cancelled through `auth_cancel` after MS milliseconds.
 
@@ -720,3 +723,125 @@ cancelled through `auth_cancel` after MS milliseconds.
 | cancelled read as UNKNOWN | 197 |
 | missing file read as read | 178 |
 | prompt limit raised to 4000 | 203 |
+| refused tool job left waiting (DRA-291) | 206 |
+
+## Operator view and commands (DRA-291)
+
+Status: IMPLEMENTED in `view.om`, `op.om` and `code.om` (with OPER records in
+`journal.om`), exercised on native Linux AArch64 by `tests/view-accept.py`,
+which drives the real `omnode-code` and `omnode-infer` through `omnode-op`
+only, against `tests/fake-serve.om`, a server that answers with the recorded
+round40 model turns. Not QUALIFIED on the Spark and not DEPLOYED.
+
+```sh
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om seed/node/op.om; } | seed/out/omc > build/node/op
+{ printf 'om2\n'; cat seed/net/http.om seed/net/notls.om seed/node/tests/fake-serve.om; } | seed/out/omc > build/node/fake-serve
+chmod +x build/node/op build/node/fake-serve
+python3 seed/node/tests/view-accept.py $PWD/build/node OMC40 ROUND40 build/node/accept   # VIEWSUM pass=46 fail=0
+```
+
+### Model
+
+The creator alone holds and changes state. Before its workers start it maps
+one shared page (32768 bytes, `vw_new`) and, when VIEW is not 0, forks the
+view process (`vw_spawn`): an `.om` HTTP server on 127.0.0.1 built on
+`seed/net/http.om`. The view process only reads the page and posts commands
+into its mailbox; it drops the creator's life-pipe write end and the journal
+descriptors, and exits when the creator sets the stop word or is gone (its
+parent pid changes). Workers never see it.
+
+Every creator loop writes a snapshot under a seqlock and appends one event
+per change to a ring of 256 events; the version counts the events of this
+incarnation, and the incarnation is the journal's fence. Event types: 1 job
+(what, id, value; the same values as the `CWE` lines), 2 objective result,
+3 command, 4 pause, 5 worker, 6 admission refused, 7 uncertain effect.
+
+| Request | Answer |
+| --- | --- |
+| `GET /view` | snapshot: authority (generation, paused, journal seq and failure, fence, version of the last pause change), queue (waiting, ready, running, review, unknown, limit, review limit, admissions refused), commands (committed, refused, last id), workers (pid, incarnation, control acknowledged, paused), uncertain job ids, objectives (kind, K, N, A, state, turns, budget, phase, job in flight, result, version of the last change, redirect and cancel pending, next job seq), limits |
+| `GET /view?since=S&inc=I` | delta `[version, type, target, x, a, b]` for every event after S when I is this incarnation and the ring still holds them; otherwise a snapshot (a client resyncs from it) |
+| `POST /cmd?id=&op=&target=&inc=&ver=&a=&b=&c=&d=` | acknowledgement `{id, status, version, journal_seq, incarnation}` |
+| `GET /health` | `{"ok":true}` |
+
+Polling, not streaming: one request per connection keeps the single-threaded
+view process answering commands while a client is slow or gone.
+
+### Commands
+
+Ops: 1 pause, 2 resume, 3 cancel objective, 4 set its turn budget to a
+(0..7), 5 redirect it to kind a (1..3), K b, N c, A d (each 0..99).
+`omnode-op PORT cmd ID OP TARGET INC VER [A..D]` posts one; `ID` is the
+operator's command id, `INC`/`VER` the incarnation and version of the view
+the decision was made on.
+
+| Status | HTTP | When |
+| --- | --- | --- |
+| committed | 200 | durable in the journal and acted on |
+| duplicate | 200 | the id was committed before (also by an earlier incarnation); the original version is returned, nothing runs again |
+| stale | 409 | another incarnation, or the target changed after VER (the pause state for 1 and 2, the objective for 3..5) |
+| invalid | 400 | unknown op or target, out-of-range argument, a finished objective, pausing when paused |
+| refused | 500 | the journal refused the record |
+| busy | 503 | another command is posted and not yet taken |
+| pending | 504 | no acknowledgement in 5 s: post the same id again |
+
+The creator takes one command per loop. Pause and resume go through
+`auth_pause` (which journals PAUSE and tells every worker), then OPER is
+appended and synced; the objective commands append OPER first and then act:
+cancel ends the objective with 19 at once when nothing is in flight, else
+its job is cancelled through `auth_cancel` and the objective ends 19 when
+the job's result arrives; redirect sets the goal and starts over from
+unread the same way; budget takes effect at the next turn (out of turns
+ends 12). A committed command's acknowledgement carries the version of its
+own command event. At a restart the OPER table is replayed in order after
+the objectives resume (pause comes back from the PAUSE record), so a
+cancelled objective stays cancelled and a budget or goal stays set.
+
+At the admission limit only inferences are refused: a tool job is issued
+after its objective's previous job left the queue, so it takes that job's
+place. A refused inference is asked for again at the next turn; a tool job
+the authority refuses anyway ends its objective with 23 instead of leaving
+it waiting unseen. The view counts the refusals.
+
+An effect whose worker died while the job was assigned is shown at once as
+uncertain (snapshot and event 7) and its objective ends 21. The scheduler
+cannot tell whether the tool started; the next incarnation's recovery
+settles it from the journal: a START without a DONE stays UNKNOWN for good
+(and stays listed), no START proves the effect never ran (the job is
+cancelled and no longer listed).
+
+### Acceptance and controls
+
+`view-accept.py` (46 checks) runs nine scenarios, each a real
+`omnode-code` (or `omnode-code-test overload LIMIT` / `uncertain`, the same
+program with a test hook) and the fake server: the full four-objective run
+followed only through deltas across a 1.5 s disconnect (no version gaps; the
+job events equal the `CWE` lines); resync to a snapshot for another
+incarnation or an impossible `since`; stale, invalid, other-incarnation,
+committed and duplicate commands (a duplicate pause carries the pause's
+original version, though the pause moved the view on before its ack); pause
+holding grants for 4 s and resume;
+cancel and redirect of an objective whose inference is in flight; a budget
+of 2 turns; admission limit 1 with refusals visible, a command committed and
+the run completing; a worker killed while assigned a replace; the creator
+killed with SIGKILL (the view exits with it, the next incarnation replays
+both commands, answers the old id as duplicate with its original version,
+and old clients resync). `omnode-op` usage errors exit 2.
+
+Each change below is built into its own copy of the programs and run on one
+scenario; the named check must fail. The same copy with no change runs every
+scenario first and must pass all of them, else the mutant runs are void.
+
+| Change | Check that fails |
+| --- | --- |
+| staleness not checked | `cmd-stale-409` |
+| committed ids not looked up | `cmd-duplicate-ack` |
+| OPER not replayed at restart | `crash-oper-replayed` |
+| no uncertain event | `uncertain-event` |
+| delta starts one event late | `resync-delta-from-0` |
+| incarnation not checked | `cmd-other-incarnation` |
+| pause recorded but not applied | `cmd-paused-holds` |
+| redirect ignored when the cancelled job returns | `redirect-run-passes` |
+| budget ignored | `budget-ends-12` |
+| refusals not counted | `overload-refusals-visible` |
+| acknowledgement carries the version current after acting | `cmd-pause-duplicate-version` |
+| view process outlives its creator | `crash-view-exits-with-creator` |

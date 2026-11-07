@@ -1,9 +1,11 @@
 note seed/node/code.om -- the Omega Node coding workflow (DRA-290): the
 note round40 repair protocol (read, check, edit, check again, answer) driven
 note by the own Omega model through the Node's scheduler, authority and
-note journal. OM-2. Compose after transport.om, pool.om, super.om, sched.om,
-note seed/authority/action.om, journal.om, auth.om, seed/node/gram.om, and
-note before one program with fn main (code-main.om or code-test.om).
+note journal, under live operator control (DRA-291). OM-2. Compose after
+note seed/net/http.om, seed/net/notls.om, transport.om, pool.om, super.om,
+note sched.om, seed/authority/action.om, journal.om, auth.om, view.om,
+note seed/node/gram.om, and before one program with fn main (code-main.om
+note or code-test.om).
 note Processes. The creator holds every objective's state; it alone reads
 note model output and decides. Two workers run granted jobs, each one child
 note process in its own process group (auth_wtool): omnode-infer for a model
@@ -33,9 +35,21 @@ note 22 job input lost, 23 refused by the authority.
 note Restart: the journal releases what the last creator left (auth_recover);
 note jobs still waiting for input are cancelled; each objective resumes from
 note the durable workspace in state unread, with the model turns already
-note performed counted against its 7 and its job ids continuing.
+note performed counted against its budget and its job ids continuing; the
+note committed operator commands are then applied again in order.
+note Operator (DRA-291): the creator writes a snapshot of its state and an
+note event per change to view.om's page every loop, and takes one posted
+note command per loop. A command is checked against the version the
+note operator saw (stale when its target changed since), committed in the
+note journal (OPER; pause and resume first through auth_pause), then acted
+note on and acknowledged: pause and resume, cancel an objective (its job in
+note flight is cancelled through the authority and the objective ends 19),
+note set its turn budget (0..7; out of turns ends 12), or redirect it to
+note another goal (its job in flight is cancelled and it starts over from
+note unread). A tool job the authority refuses ends its objective with 23.
 note Events on stdout, one line each: CWP (prompt) and CWR (model text) are
-note followed by their bytes and a newline; CWE job events; CWO results.
+note followed by their bytes and a newline; CWE job events; CWO results;
+note CWV the operator view's port once it listens.
 const CWOBJ ulong 4
 text cwtask "Task: "
 text cwfile "\nFile: "
@@ -83,7 +97,7 @@ global cwcf uchar 8192
 global cwcl ulong 8
 global cwno ulong 1
 global cwos uchar 2048
-global cwob ulong 64
+global cwob ulong 128
 global cwsrc uchar 16384
 global cwobs uchar 4096
 global cwcan uchar 16384
@@ -91,19 +105,27 @@ global cwinf ulong 1
 global cwgot ulong 64
 global cwt0 ulong 4
 global cwtk ulong 2
+global cwpv ulong 1
+global cwql ulong 1
+global cwtu ulong 1
+text cwcwv "CWV "
+note Objective words shown in the view's rows, as characters '0' + word.
+text cwvw "012367@9:<ABC;"
 
-note ======== objective words: cwob[16 i + w]: 0 kind (1 add, 2 mul, 3 loop),
+note ======== objective words: cwob[32 i + w]: 0 kind (1 add, 2 mul, 3 loop),
 note 1 K, 2 N, 3 A, 4 path length, 5 task length, 6 state (0 unread, 1 read,
 note 2 failed, 3 edited, 4 checked, 5 missing), 7 model turns, 8 verified,
-note 9 phase (0 needs a turn, 1 inference, 2 tool, 3 review, 4 finished),
-note 10 job in flight, 11 next job seq, 12 result, 13 source length, 14
-note observation length, 15 candidate length.
+note 9 phase (0 needs a turn, 1 inference, 2 tool, 3 review, 4 finished), 10
+note job in flight, 11 next job seq, 12 result, 13 source length, 14
+note observation length, 15 candidate length, 16 turn budget (7 unless the
+note operator set one), 17 view version of its last change, 18 redirect
+note waiting for the job in flight, 19 operator cancel.
 fn cw_g i ulong w ulong to ulong
-ret get cwob add mul i 16 w
+ret get cwob add mul i 32 w
 end
 
 fn cw_s i ulong w ulong v ulong to void
-put cwob add mul i 16 w v
+put cwob add mul i 32 w v
 end
 
 note ======== bytes
@@ -354,6 +376,7 @@ p = cw_cat o p cwsp
 p = cw_dec o p v
 p = cw_cat o p cwnl
 cw_out o p
+cw_s i 17 vw_ev 1 i what id v
 end
 
 note A framed transcript record: tag i turn n, newline, the bytes, newline.
@@ -395,6 +418,7 @@ p = cw_cat o p cwsp
 p = cw_dec o p cw_g i 7
 p = cw_cat o p cwnl
 cw_out o p
+cw_s i 17 vw_ev 2 i 0 r cw_g i 7
 end
 
 note ======== creator: issuing jobs
@@ -402,7 +426,11 @@ note ======== creator: issuing jobs
 note Admit job kind (1 inference, 2 read, 3 check, 4 replace, 5 review) of
 note objective i with input pk[0, pn), then publish the input on the
 note objective's topic, which makes the job ready. The job id, or 0 when it
-note could not be admitted now (the caller tries again at its next step).
+note was not admitted. A refused inference is asked for again at the next
+note step (admission refusals are counted for the view). A refused tool job
+note ends the objective with 23: it cannot be a full queue (a tool job is
+note issued only after its objective's previous job left the queue, so it
+note takes that job's place), and nothing is left waiting unseen.
 fn cw_issue c long i ulong kind ulong pk view uchar 4096 pn ulong to ulong
 s = cw_g i 11
 if ge s 99
@@ -417,6 +445,12 @@ end
 t = shl ulong 1 i
 j = jn_admit id t fl
 if lt j 0
+if eq j neg long 2
+vw_cnt 0 add vw_cget 0 1
+end
+if ne kind 1
+cw_end i 23
+end
 ret 0
 end
 cw_s i 11 add s 1
@@ -817,6 +851,12 @@ put cwinf 0 0
 end
 cw_ev i id 4 o
 f = cw_fate o kind
+if eq f 21
+x = vw_ev 7 i 0 id 0
+end
+if cw_oper i
+ret
+end
 if ne f 0
 cw_end i f
 ret
@@ -888,14 +928,45 @@ cw_s i 10 0
 if eq rem id 10 1
 put cwinf 0 0
 end
+x = vw_ev 7 i 0 id 0
+if not cw_oper i
 cw_end i 21
 end
+end
+end
+
+note After objective i's job in flight finished or was lost: an operator
+note cancel ends it (19); a redirect waiting for the job takes effect. True
+note when one of them applied.
+fn cw_oper i ulong to bool
+if ne cw_g i 19 0
+cw_end i 19
+ret true
+end
+if ne cw_g i 18 0
+cw_redo i
+ret true
+end
+ret false
+end
+
+note Objective i starts over from unread with its new goal (a redirect):
+note turns, budget and job ids continue.
+fn cw_redo i ulong to void
+cw_s i 18 0
+cw_s i 6 0
+cw_s i 8 0
+cw_s i 9 0
+cw_s i 13 0
+cw_s i 14 0
+cw_s i 15 0
 end
 
 note ======== creator: planning
 
 note Start a turn for one objective that needs one (one inference in flight
-note at a time); the test hook cwtk cancels an inference after ms.
+note at a time); the test hook cwtk cancels an inference after ms. An
+note objective out of its turn budget ends with 12.
 fn cw_plan c long to void
 cw_hook c
 if gt get cwinf 0 0
@@ -903,7 +974,7 @@ ret
 end
 for i ulong get cwno 0 bound 4
 if and eq cw_g i 9 0 eq cw_g i 12 0
-if ge cw_g i 7 7
+if ge cw_g i 7 cw_g i 16
 cw_end i 12
 else
 cw_turn c i
@@ -914,6 +985,9 @@ end
 end
 
 fn cw_hook c long to void
+if ne get cwtu 0 0
+cw_hooku
+end
 k = get cwtk 0
 if eq k 0
 ret
@@ -934,6 +1008,18 @@ end
 end
 end
 
+note Test hook cwtu: SIGKILL the worker that was granted a replace, once;
+note whether the edit happened is then unknown to the creator.
+fn cw_hooku to void
+for j ulong 64
+if and eq get sjst j 3 eq rem get sjid j 10 4
+x = killpid int get swpid get sjw j 9
+put cwtu 0 0
+ret
+end
+end
+end
+
 fn cw_left to ulong
 n = ulong 0
 for i ulong get cwno 0 bound 4
@@ -950,7 +1036,9 @@ for t ulong 1000000000
 r = sched_step c 5000000
 cw_coll c
 k = auth_step c
+cw_cmd c
 cw_plan c
+cw_vsnap c
 if eq cw_left 0
 ret 0
 end
@@ -959,6 +1047,197 @@ ret 62
 end
 end
 ret 62
+end
+
+note ======== creator: operator view and commands (DRA-291, seed/node/view.om)
+
+note The snapshot: generic sections, then the objectives and the limits.
+fn cw_vsnap c long to void
+vw_begin
+vw_gen c
+vw_s 21 get cwpv 0
+vw_s 128 get cwno 0
+for i ulong get cwno 0 bound 4
+o = add 136 mul i 16
+for w ulong 14
+vw_s add o w cw_g i sub ulong get cwvw w 48
+end
+end
+vw_s 200 7
+vw_s 201 900
+vw_s 202 160
+vw_s 203 CWOBJ
+vw_s 204 64
+vw_s 205 256
+vw_end
+end
+
+note One posted command: a committed id is acknowledged again as a
+note duplicate; otherwise it is checked against the state the operator saw
+note (stale, invalid), committed (OPER durable, then acted on), and
+note acknowledged.
+fn cw_cmd c long to void
+d = new ulong 8 0
+if not vw_take d
+ret
+end
+k = jn_ofind get d 0
+if ge k 0
+vw_ack 4 jn_opw ulong k 7 get jseq 0
+ret
+end
+st = cw_cchk d
+if eq st 0
+st = cw_exec c d
+end
+if eq st 0
+vw_cnt 1 add vw_cget 1 1
+vw_cnt 3 get d 0
+vw_ack 0 jn_opw ulong jn_ofind get d 0 7 get jseq 0
+ret
+end
+vw_cnt 2 add vw_cget 2 1
+vw_ack st vw_ver get jseq 0
+end
+
+note 0 when command d (id, op, target, version, a..d) may run now; 1 stale
+note (what it targets changed after the version the operator saw, or the
+note version is not of this incarnation), 2 invalid.
+fn cw_cchk d view ulong 8 to ulong
+op = get d 1
+t = get d 2
+if eq get d 3 not ulong 0
+ret 2
+end
+if gt get d 3 vw_ver
+ret 1
+end
+if or eq op 1 eq op 2
+if gt get cwpv 0 get d 3
+ret 1
+end
+if eq get scpause 0 sub 2 op
+ret 2
+end
+ret 0
+end
+if or or lt op 3 gt op 5 ge t get cwno 0
+ret 2
+end
+if gt cw_g t 17 get d 3
+ret 1
+end
+if eq cw_g t 9 4
+ret 2
+end
+if and eq op 4 gt get d 4 7
+ret 2
+end
+if eq op 5
+ret cw_rchk d
+end
+ret 0
+end
+
+fn cw_rchk d view ulong 8 to ulong
+if or lt get d 4 1 gt get d 4 3
+ret 2
+end
+for m ulong 3
+if gt get d add 5 m 99
+ret 2
+end
+end
+ret 0
+end
+
+note Commit command d: pause and resume go through auth_pause (which
+note journals PAUSE) and are then recorded; objective commands are recorded
+note (OPER durable) and then applied. 0, or 3 refused.
+fn cw_exec c long d view ulong 8 to ulong
+a = new ulong 4 0
+for m ulong 4
+put a m get d add 4 m
+end
+op = get d 1
+v = add vw_ver 1
+if le op 2
+x = auth_pause c eq op 1
+if ne get jbad 0 0
+ret 3
+end
+end
+if ne jn_oper get d 0 op get d 2 a v 0
+ret 3
+end
+x = vw_ev 3 get d 2 op get d 0 0
+if le op 2
+put cwpv 0 vw_ev 4 0 0 sub 2 op 0
+ret 0
+end
+cw_apply c get d 2 op a
+ret 0
+end
+
+note Apply objective command op to objective i (also when the journal is
+note replayed at a restart, when nothing is in flight).
+fn cw_apply c long i ulong op ulong a view ulong 4 to void
+if eq op 4
+cw_s i 16 get a 0
+cw_s i 17 vw_ver
+ret
+end
+if eq op 5
+for m ulong 4
+cw_s i m get a m
+end
+end
+if eq cw_g i 10 0
+if eq op 3
+cw_end i 19
+else
+cw_redo i
+end
+cw_s i 17 vw_ver
+ret
+end
+if eq op 3
+cw_s i 19 1
+else
+cw_s i 18 1
+end
+cw_s i 17 vw_ver
+cw_stop c cw_g i 10
+end
+
+note Cancel job id through the authority wherever it is (waiting, ready or
+note running); its result then reaches cw_oper.
+fn cw_stop c long id ulong to void
+for j ulong 64
+s = get sjst j
+if and eq get sjid j id and ge s 1 le s 3
+x = auth_cancel c j
+end
+end
+end
+
+note At a restart: the committed operator commands again, in order.
+fn cw_replay c long to void
+a = new ulong 4 0
+for k ulong jn_nops bound 128
+for m ulong 4
+put a m jn_opw k add 3 m
+end
+op = jn_opw k 1
+i = jn_opw k 2
+if and ge op 3 lt i get cwno 0
+if ne cw_g i 9 4
+cw_apply c i op a
+end
+end
+vw_cnt 1 add vw_cget 1 1
+vw_cnt 3 jn_opw k 0
+end
 end
 
 note ======== worker
@@ -1062,6 +1341,7 @@ note Objective argument "KIND,K,N,A,PATH,TASK" (KIND add, mul or loop) into
 note slot i. false when malformed.
 fn cw_parse i ulong a view uchar * to bool
 f = new ulong 8 0
+cw_s i 16 7
 k = ulong 0
 for j ulong len a
 if and lt k 5 eq get a j 44
@@ -1198,23 +1478,27 @@ x = makedir t 0 n 448
 end
 end
 
-note omnode-code INFER TOOL OMC ROOT WORK JDIR PORT OBJ... from argument
-note k on (1..4 objectives; all paths absolute). Exit 0 all passed, 1 some
+note omnode-code INFER TOOL OMC ROOT WORK JDIR PORT VIEW OBJ... from
+note argument k on (1..4 objectives; all paths absolute; VIEW the operator
+note view's port on 127.0.0.1, 0 for none). Exit 0 all passed, 1 some
 note failed, 2 usage, 62 out of time, 30 + journal refusal, 50.. setup.
 fn cw_main k ulong dls ulong to int
 b = new uchar 1024 0
 c = ulong argcnt
-if or lt c add k 8 gt c add k 11
+if or lt c add k 9 gt c add k 12
 ret 2
 end
-for a ulong 7
+for a ulong 8
 if not cw_carg add k a a
 ret 2
 end
 end
-put cwno 0 sub c add k 7
+if gt cw_cnum 7 65535
+ret 2
+end
+put cwno 0 sub c add k 8
 for i ulong get cwno 0 bound 4
-m = argread add add k 7 i b 0 1024
+m = argread add add k 8 i b 0 1024
 if lt m 1
 ret 2
 end
@@ -1225,6 +1509,23 @@ end
 ret cw_run k dls
 end
 
+note Config slot k as a decimal of 1..5 digits; 99999999 otherwise.
+fn cw_cnum k ulong to ulong
+n = get cwcl k
+if or eq n 0 gt n 5
+ret 99999999
+end
+v = ulong 0
+for j ulong n
+d = ulong get cwcf add mul k 1024 j
+if or lt d 48 gt d 57
+ret 99999999
+end
+v = add mul v 10 sub d 48
+end
+ret v
+end
+
 fn cw_run k ulong dls ulong to int
 c = pool_new 4 2
 if le c 0
@@ -1233,13 +1534,17 @@ end
 if ne sup_init c 0
 ret 51
 end
-if ne sched_new c 8 8 0
+ql = get cwql 0
+if eq ql 0
+ql = 8
+end
+if ne sched_new c ql 8 0
 ret 52
 end
 if ne auth_new c 0
 ret 53
 end
-e = cw_jopen add k 7 get cwno 0
+e = cw_jopen add k 8 get cwno 0
 if ne e 0
 ret int add 30 e
 end
@@ -1253,9 +1558,13 @@ if or eq s 1 eq s 2
 x = auth_cancel c j
 end
 end
+if ne vw_new jn_fence 0
+ret 55
+end
 for i ulong get cwno 0 bound 4
 cw_resume i
 end
+cw_replay c
 cw_dirs
 for w ulong 2
 p = auth_spawn c w
@@ -1266,11 +1575,41 @@ if le p 0
 ret 54
 end
 end
+if not cw_view c
+ret 56
+end
 r = cw_drive c add ulong monons mul dls 1000000000
+vw_stop
 x = sched_stop c 2000000000
 sup_closeall
 jn_close
 ret cw_sum r
+end
+
+note Start the view process when VIEW is not 0 and print CWV port once it
+note listens; false when it could not.
+fn cw_view c long to bool
+o = new uchar 4096 0
+pt = cw_cnum 7
+if eq pt 0
+ret true
+end
+cw_vsnap c
+if le vw_spawn pt 0
+ret false
+end
+for t ulong 3000
+if ne vw_g 7 0
+p = cw_cat o 0 cwcwv
+p = cw_dec o p vw_g 7
+p = cw_cat o p cwnl
+cw_out o p
+ret true
+end
+x = sleepns 1000000
+end
+vw_stop
+ret false
 end
 
 fn cw_sum r int to int
