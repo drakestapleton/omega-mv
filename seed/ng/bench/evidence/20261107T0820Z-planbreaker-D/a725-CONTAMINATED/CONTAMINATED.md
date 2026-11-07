@@ -1,0 +1,1 @@
+CONTAMINATED (omp-queen-ng, Manager 08:21Z): an unpinned rustc ran on cores 10 and 12 at about 08:18Z, inside this round (core 11, 08:16:47-08:19:55). Rows kept, not used for any verdict. Rerun: ../a725 with ngbench v2 contamination rows (PREREG-contamination.md).
