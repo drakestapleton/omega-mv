@@ -376,7 +376,12 @@ Public traffic terminates TLS at the hub's nginx; authorized internal services u
 on loopback or over the WireGuard tailnet. This transport arrangement is not a claim that
 Omega implements certificate verification or that plaintext is suitable on arbitrary networks.
 
-**TLS 1.3 client: PROPOSED, separate OmegaTLS lane.** Implement record framing, handshake,
+**TLS 1.3 client: IMPLEMENTED and EXERCISED on the host as `om/tls/`** (merged in
+[PR #813](https://github.com/aien-dev/omega-mv/pull/813), 2026-10-26; status and units in
+`om/tls/README.md`). Not deployed. Its first consumer, `seed/net/https.om`, composes it with
+`seed/net/http.om` ([#949](https://github.com/aien-dev/omega-mv/pull/949), landed through merge train
+[#979](https://github.com/aien-dev/omega-mv/pull/979), closing [#913](https://github.com/aien-dev/omega-mv/issues/913)). The cutover gates below apply to each
+consumer separately. The contract the client is held to: record framing, handshake,
 transcript hashes, key schedule, authenticated encryption, signature verification, and bounded
 X.509 verification in `.om`. The minimum contract verifies a chain to an explicitly configured
 trust store, hostname, validity interval and certificate constraints, and fails closed on every
