@@ -532,7 +532,11 @@ its lease is enforced by the authority); at least one worker stays live;
 results in review are eventually reviewed, so a worker holding a finished
 result while review is full is eventually freed (phase Z shows the reserved
 job waiting on review, then running); dispatch is eventually unpaused and
-runs after releases (every `sched_step` collects, then dispatches); no
+keeps getting opportunities while ready jobs remain (every `sched_step`
+collects, then dispatches, so the creator loop must keep stepping, also
+after a window scan that found nothing and with no running job left to
+release anything); a job that is safe to rerun is not lost to worker deaths
+forever (each attempt ending is not enough: some attempt must settle); no
 request exceeds capacity (refused at admission, -8). Under them a reserved
 job runs once the jobs running at its reservation have finished and a
 worker is free, and each ready job is examined within ceil(64/`win`) window
@@ -541,7 +545,9 @@ the bypass budget. A job at the budget therefore waits only for the
 reservations of jobs admitted before it, a finite set; later arrivals never
 take the reservation first. Workers are not a resource kind: the reserved
 job is offered first at every pick, so it takes the first idle worker once
-it fits.
+it fits. This is an argument from the source under the stated assumptions;
+the phases exercise the supplied finite workloads (phase S among them) and
+are not a proof for arbitrary workloads.
 
 Admission tickets. Room is the smaller of the admission headroom and the free
 table slots: a job in review or UNKNOWN keeps its slot, so a table full of
@@ -550,15 +556,24 @@ refuses without room and gives the refused caller a ticket. While tickets
 are held only the first holder may enter, whatever the room; a new caller
 takes a ticket behind them. `sched_admitr` asks it; so does `jn_admit`,
 after its duplicate check and before it journals ADMIT, and a true answer
-guarantees the slot (one creator, no other admission in between). A ticket
-not asked about for more than `ttl` dispatch events (default 1000) lapses:
-asked at event e, it survives while e + `ttl` is at least the current event
-count. A caller that went away therefore blocks later holders for at most
-`ttl` events; a paused dispatch counts no events, so that block lasts until
+guarantees the slot (one creator, no other admission in between). Every
+ask by a ticket holder renews its ticket, whether it is refused or told
+yes (a caller with room and no ticket gets none). A ticket not asked about
+for more than `ttl` dispatch events (default 1000) lapses: asked at event
+e, it survives while e + `ttl` is at least the current event count. A
+caller that went away therefore blocks later holders for at most `ttl`
+events; a paused dispatch counts no events, so that block lasts until
 dispatch resumes. At most 64 tickets are held, and a caller refused with
 the line full holds none.
 
-Leases. `sched_lease j ns` gives a job a lease counted from its assignment;
+Leases. `sched_lease j ns` gives a waiting or ready job a lease counted from
+its next assignment; on a running job it replaces the lease, measured from
+now. `ns` is at most 2^50 ns (about 13 days; Wolfram
+`UnitConvert[Quantity[2^50,"Nanoseconds"],"Days"]` -> 13.03 days): a larger
+value is refused (-7) and nothing changes. The monotonic clock is below
+2^63, so every deadline, clock plus `ns`, stays below 2^63 + 2^50 < 2^64:
+it never wraps into the past or onto 0, the no-deadline value. Assignment
+and reassignment use the stored, already checked duration.
 `sched_overdue` reports a running job past its lease whose worker has not
 reported done, once. The authority then cancels or kills it, and the release
 follows from the worker's report or the reap. The lease is a clock reading
@@ -566,8 +581,8 @@ used for reporting only; selection reads logical counters.
 
 | Function | Contract |
 | --- | --- |
-| `sched_room id` | May id be admitted now: room is min(admission headroom, free slots); while tickets are held only the first holder may enter. A refused caller gets or keeps a ticket. |
-| `sched_lease j ns` | Lease for a waiting, ready or running job, from its next assignment; 0 removes it; -3 otherwise. |
+| `sched_room id` | May id be admitted now: room is min(admission headroom, free slots); while tickets are held only the first holder may enter. A refused caller gets or keeps a ticket; every ask by a holder renews its ticket. |
+| `sched_lease j ns` | Lease for a waiting, ready or running job, from its next assignment (running: from now); 0 removes it; -3 for a slot not waiting, ready or running; -7 for ns above 2^50; a refusal changes nothing. |
 | `sched_overdue` | Slot of a running, unfinished job past its lease, reported once; 64 when none. |
 
 `schedpol-gate` takes one optional argument: `fifo` runs every phase under
@@ -593,8 +608,11 @@ which slots were read.
 | T | limit 3 held by two short jobs and one waiting on a topic nobody publishes, three ticket holders; with exactly two openings the second holder and a new caller are refused, the first two holders enter in order; the waiting job is cancelled, and with three openings the new caller (now a holder) waits for the holder ahead | 104..109 |
 | X | every slot holds a job in review, admission limit not reached: a new caller is refused and holds a ticket; one review frees one slot, which goes to the first holder | 190..194 |
 | Z | review limit 1 and full; a reserved job is ready at every step for 600 ms while the workers hold finished results, and all CPU is free at the end of that interval; reviewing lets it run | 195..199 |
+| M | lease bounds: 2^50 + 1 and 2^64 - 1 refused (-7) on a waiting and on a running job with lease and deadline unchanged; 2^50 accepted on both, the running job's deadline ahead of the clock and nothing overdue; a running renewal to 2^49 puts the deadline between clock + 2^49 read just before and just after the call; the job completes | 200..207 |
+| N | admission limit 1, ticket lifetime 2: X, refused at event e, asks at e + 1 and is told yes; at e + 3 its renewed ticket still holds and newcomer Y is refused; at e + 4 it lapses (one lapse) and Y is admitted | 210..212 |
+| U | four idle workers, dispatch budget 2, six ready 1-CPU jobs on 4 CPU: one dispatch assigns exactly 2; all six complete | 220, 221 |
 
-Phases S to Z run after A and B, so under `fifo` the gate stops at 11.
+Phases S to U run after A and B, so under `fifo` the gate stops at 11.
 `journal-gate` case 16 checks `jn_admit` at the admission limit: a duplicate
 id is refused as a duplicate and takes no ticket (170..173). Case 17 checks
 a full table below the limit: 64 jobs put in UNKNOWN directly (synthetic
@@ -622,6 +640,11 @@ journaled once (174..177).
 | `jn_admit` skips the room check (`journal.om`) | 173 (`journal-gate`): case 16 journals ADMIT for the refused id, so its later admission is refused as a duplicate |
 | the same, with case 16 not run | 175 (`journal-gate`): case 17's refused admission grows the journal |
 | FIFO counts 3 per slot read (`sp_fifo`), run with `fifo` | 9: the first FIFO pick reads more than 64 per pick allows |
+| lease duration unbounded (the 2^50 check deleted from `sched_lease`) | 200: 2^50 + 1 is accepted on waiting job w |
+| lease stored before the bound check | 200: the refusal returns -7 but w's lease is no longer 0 |
+| running renewal is a no-op (the `if eq s 3` deadline block deleted from `sched_lease`) | 206: the deadline stays near assignment + 2^50, above clock + 2^49 |
+| a successful ask does not renew the head holder's ticket | 211: X's ticket lapses at e + 3 and newcomer Y is admitted |
+| dispatch budget ignored (`for i ulong get scpol 2` to `for i ulong 64`) | 220: one dispatch assigns 4 |
 
 ## Proposals, authority and cancellation (DRA-288)
 
