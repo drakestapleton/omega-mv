@@ -77,9 +77,9 @@ immutable: never modify, rename or delete an existing file there.
 ## Build from source at a pin
 
 AArch64 Linux with `gcc`, `make` and `sh`. Some gates need sibling checkouts (`../physics` at
-`physics.lock` `048e5f5e881b092733baaf65d0ace46abda7f908`, `../aienos`, `../aien-architecture`,
+`physics.lock` `048e5f5e881b092733baaf65d0ace46abda7f908`, `../aienos`,
 `../omega-bridge` at `431fff0a95f84c0a8bf9d3383f94d7e1f02d913e`); a missing sibling exits 3.
-`crumb.lock`: `d0f0b95d344b4c6628c3d868346932fd247ce168`.
+`crumb.lock` (history only since DRA-97, 2026-11-07; no gate reads it): `d0f0b95d344b4c6628c3d868346932fd247ce168`.
 
 ```sh
 git clone https://github.com/aien-dev/omega-mv.git omega
@@ -97,7 +97,6 @@ Expected digest: the value in `seed/out/omc.sha256`.
 tests/gates/run.sh seed
 tests/gates/run.sh evidence-immutable
 tests/gates/run.sh zero-disk-secrets
-tests/gates/run.sh crumb-verify
 tests/gates/run.sh om-units
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-compiler-quick
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-numeric-cpu
@@ -105,7 +104,7 @@ make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-realize
 ```
 
 - Every gate name in `tests/gates/*.gate` is a `run.sh` argument; the Spark runs the touched
-  gates plus `.aien/always` (`CRUMB-VERIFY`, `OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`).
+  gates plus `.aien/always` (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`).
 - `evidence-immutable` prints `evidence/: additions only`; `zero-disk-secrets` prints
   `Zero plaintext .env files verified.`
 - Some older milestone gate scripts rewrite their receipts in place; run on a throwaway checkout.
