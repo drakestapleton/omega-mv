@@ -731,14 +731,22 @@ front end refuses earlier):
 | `ir_res o`, `ir_otok o`, `ir_arg o k` | the op's result value, defined token, operand k |
 | `ir_num f` | fill `i_vno` for f by s6.2; returns f's value count |
 
-**Reader and writer**: `ir_read n` parses `i_in[0..n)` into empty tables and returns 0 or a
-refusal class of s11 (it checks the encoding, classes 10..15 and 23, and leaves the rest to
-ngcheck); `ir_wr` writes the tables to `i_out` and returns the byte count. `ir_wr` after `ir_read`
-reproduces the input bytes exactly for every canonical unit; the gate checks it on every fixture.
+**Reader and writer**: `ir_read off stop` parses `i_in[off..stop)` into empty tables and returns 0
+or a refusal class of s11, with `ir_badat` the absolute offset in `i_in`. It refuses what it needs
+to build sound tables (classes 10..15, 23, and REF/USE_BEFORE_DEF/BLOCK_ARITY/UNTERMINATED/TYPE
+where an id, a count or a global's data size cannot be resolved) and leaves every semantic rule to
+ngcheck. `ir_wr` writes the tables to `i_out` and returns the byte count. `ir_wr` after `ir_read`
+reproduces the input bytes exactly for every unit `ir_read` accepts; the gate checks it on every
+fixture. In the tables a `gaddr` imm is the global's handle (the writer subtracts 1, the reader
+adds 1); every other imm is the wire value.
 
-`main.om` dispatches on the first input line: `@ng ir-copy` reads the ΩIR binary that follows,
-and writes it back (reader/writer round trip); stage lanes add their modes (`@ng dump-ir <stage>`
-after the front end or a pass, `@ng ingest-ir <stage>` before a back end) beside their code.
+Register budget: omc gives a function 16 registers, and each global array read in one expression
+costs one. Keep table reads to two or three per statement (the `ir_*` code shows the pattern).
+
+`main.om` dispatches on the first input line: `@ng ir-copy` reads the ΩIR binary that follows
+and writes it back (reader/writer round trip; a refusal prints `ng: refused class C at OFFSET`,
+offset in the ΩIR bytes, and exits C); stage lanes add their modes (`@ng dump-ir <stage>` after
+the front end or a pass, `@ng ingest-ir <stage>` before a back end) beside their code.
 
 ## 15. What a pass may do to a check (D7)
 
