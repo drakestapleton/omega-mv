@@ -5,7 +5,7 @@ Document:   seed/ng/IR.md (ΩIR wire version 9, tag omega.ng.ir.v1)
 Status:     PROPOSED draft v0.1 (ng-ir lane, Hive NG M0). Witness: seed/ng/ngcheck.om (own reader).
             Text tools: seed/ng/ngas.om, ngdis.om. In-memory form and the one ng reader/writer:
             seed/ng/src/ir.om (s14).
-Decisions:  Hive NG D1b, D2 + D2b + D2c, D3, D7, D10 (2026-11-07).
+Decisions:  Hive NG D1b, D2 + D2b + D2c, D3, D7, D10, D11 (2026-11-07).
 Family:     spec/one-layer-format.md (OSC binary IR). Versions 1..8 are untouched by this document.
 Pin:        omega-mv 943d955531b9d4d9f70deb41756c0b46441dd5e0, omc sha256 5f90edea…6df.
 ```
@@ -141,6 +141,11 @@ one parameter, and its parameter 0 has type `tok` (s6.4); no other parameter is 
 
 Any function may call any non-kernel function, including itself and later ones. A kernel's result
 is void; a kernel calls no function and no function calls a kernel except through `launch` (s7.7).
+
+**Program entry (D11).** A unit is a program: exactly one function has kind 2 (export), no
+parameters and result i32. It is the process entry (Omega `fn main to int`), and its result is the
+exit status. Other exports (with parameters or another result) are entries a host calls in
+function mode. A unit with no such function, or with several, is refused ENTRY (exit 30).
 
 ### 6.2 Values (SSA)
 
@@ -562,6 +567,7 @@ uncovered access is UNCHECKED.
 8. The token chain (TOKEN, s6.4), check codes (CHECK_CODE), coverage (UNCHECKED), facts (FACT).
 9. Canonical fields (NONCANONICAL): reserved bits, `const` imm form, duplicate types, `ty` not 0
    where the row says 0, flags, `order` of a non-scalar field, enumerations.
+10. Exactly one program entry (ENTRY, s6.1).
 
 ## 10. Canonical text form (D3)
 
@@ -592,6 +598,11 @@ kernel @f1 flags 0 threads 256 1 1 subgroup 32 -> void
 block ^0
 %1 = gpu.id u32 0
 ret %0
+end
+export @f2 flags 0 -> i32
+block ^0
+%1 = const i32 0
+retv %0 %1
 end
 ```
 
@@ -624,7 +635,17 @@ UNKNOWN_OP, LIMIT).
 `ngcheck` reads binary ΩIR on stdin. Accept: exit 0 and one stdout line
 `ACCEPT <sha256 hex> fns=N blocks=N ops=N`. Refusal: no stdout, exit code below, and one stderr
 line `ngcheck: <CLASS> at <byte offset>` (offset of the field, op or record at fault, decimal).
-Checks run front to back while reading (classes 10..15, 23), then per function in order.
+The first fault ends the run. Phase 1 reads the unit front to back and checks every rule that needs
+only the record at hand: header, type table and globals completely (a type-table or global fault
+is reported at its entry's offset), function and block headers, op rows and every count against
+s12 (at the count's offset); then the program entry (ENTRY: at the function count when there is
+none, at the second entry's record otherwise). Phase 2 checks each function in order: terminators
+(UNTERMINATED), branch targets and their arity (REF, BLOCK_ARITY), reachability (UNREACHABLE),
+then each op in block and op order: operand ids, definitions and the token (REF, USE_BEFORE_DEF,
+DOMINANCE, TOKEN), its `ty` against the row, placement (EFFECT), codes and origins (CHECK_CODE,
+NONCANONICAL), typing (TYPE, and BLOCK_ARITY for `br` argument types), then coverage and facts
+(UNCHECKED, FACT). Op faults are reported at the op's offset, block faults at the block's,
+function faults at the function record's.
 
 | exit | class | meaning |
 |---|---|---|
@@ -648,6 +669,7 @@ Checks run front to back while reading (classes 10..15, 23), then per function i
 | 27 | IO | standard input could not be read |
 | 28 | TOKEN | a token used outside operand 0 of an E, R or T op, an E or T op not using the current token, a reader using a token after the current one |
 | 29 | FACT | an origin 0 fact without its dominating check (s7.10) |
+| 30 | ENTRY | no program entry, or more than one (s6.1, D11) |
 
 ## 12. Limits (implementation limits of the v1 tools)
 
@@ -689,6 +711,8 @@ counts. ngcheck, `src/ir.om` and the text tools share these numbers.
 ## 14. In-memory ΩIR: `seed/ng/src/ir.om` (D1b)
 
 `ir.om` holds ΩIR in global tables and owns the one binary reader and writer of the `ng` binary.
+Its first code line is `om2` (D11), so the whole `ng` unit is om2: every lane file compiles as
+part of an om2 unit (`at` is reserved there, error 16).
 Stages build and read these tables directly; nothing is serialized between stages. Names follow
 D1b: functions `ir_*`, globals `i_*` (at most 8 bytes). Other lanes read the tables and call the
 `ir_*` functions; they never write a table directly.
