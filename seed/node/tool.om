@@ -7,6 +7,7 @@ note Usage:
 note   omnode-tool read ROOT PATH
 note   omnode-tool replace ROOT PATH OLD NEW
 note   omnode-tool check ROOT PATH WORK OMC KIND K N A
+note   omnode-tool checkc ROOT PATH WORK OMC KIND K N A RESOLVE CATALOG LOCK
 note ROOT is the workspace; PATH must pass omagent's path rule (agpathok,
 note seed/agent/path.om) inside it, and the file is opened without following
 note a final symbolic link. Files are at most 3800 bytes.
@@ -29,6 +30,16 @@ note execpure (Landlock, no new privileges, CPU, file, process and memory
 note ceilings, seccomp; at most 2 s wall clock, then SIGKILL), and its exit
 note status must equal the goal (KIND 1 add x+K, 2 mul x*K, 3 loop x+K*N)
 note with no output. The content returned is the file as checked.
+note checkc (catalog mode, SemC DRA-323; RESOLVE, CATALOG, LOCK absolute)
+note is check on a compact source: every compile first writes the source
+note to k.om and runs RESOLVE build CATALOG LOCK k.om c.map (execprog, 10 s,
+note stdout the unit c.om), then omc compiles c.om. A resolver refusal is
+note the observation as the resolver printed it (RESOLVE_<NAME> line N
+note ...); an omc message on unit line N is mapped through c.map: omc: line
+note C: error K for compact line C, omc: catalog NAME line L: error K for a
+note line of catalog entry NAME. The grammar admits catalog call lines
+note (gram.om grcat) and the loop goal is also met when the compact calls
+note an entry whose emitted lines in c.om contain a for line.
 text tnew ".omnode-new"
 text trec "OMNT1 "
 text oread "Read succeeded."
@@ -55,6 +66,19 @@ text fbin "c.bin"
 text ferr "c.err"
 text fout "c.out"
 text fnull "/dev/null"
+text ccheckc "checkc"
+text ckom "k.om"
+text cmap "c.map"
+text cbuild "build"
+text cpre "omc: line "
+text ccatp "omc: catalog "
+text cline " line "
+text cnul "0"
+text cfor "for "
+note Catalog mode: RESOLVE, CATALOG, LOCK at tlrv 0, 1024, 2048; their
+note lengths at tlrl[0..2]; tlrl[3] = 1 in catalog mode.
+global tlrv uchar 3072
+global tlrl ulong 4
 
 note ======== records
 
@@ -464,6 +488,12 @@ end
 
 note The child's stdin (k 0) or stdout (k 1) for mode md, opened.
 fn tl_fd md ulong k ulong to long
+if eq md 2
+if eq k 0
+ret fopen fnull 0 len fnull 524288 0
+end
+ret fopen fsrc 0 len fsrc 524865 448
+end
 if eq md 0
 if eq k 0
 ret fopen fsrc 0 len fsrc 524288 0
@@ -479,6 +509,8 @@ end
 note Run the packed argv pk[0, pn) in its own process group. md 0 (the
 note compiler): stdin c.om, stdout c.bin, execprog, 10 s. md 1 (a test):
 note stdin /dev/null, stdout c.out, execpure, 2 s (round40's timeout).
+note md 2 (the resolver, catalog mode): stdin /dev/null, stdout c.om,
+note execprog, 10 s.
 note stderr to c.err. The wait status, or 65535 when it did not finish
 note (its group is killed).
 fn tl_run pk view uchar 4096 pn ulong md ulong to ulong
@@ -556,12 +588,21 @@ end
 
 note Compile src[0, n) to c.bin in the current (WORK) directory with omc
 note path oc. 0 compiled, 1 refused by omc (message in c.err), 2 failed.
+note In catalog mode src is the compact source and is resolved first.
 fn tl_omc oc view uchar * src view uchar * n ulong to ulong
-pk = new uchar 4096 0
-none = new uchar 1 0
+if eq get tlrl 3 1
+ret tl_omcc oc src n
+end
 if ne tl_spit fsrc src n 0
 ret 2
 end
+ret tl_cc oc
+end
+
+note Compile c.om with omc path oc: as tl_omc.
+fn tl_cc oc view uchar * to ulong
+pk = new uchar 4096 0
+none = new uchar 1 0
 pn = tl_pack pk oc view part none 0 0
 ws = tl_run pk pn 0
 if eq ws 0
@@ -575,6 +616,278 @@ if or eq c 120 eq c 121
 ret 2
 end
 ret 1
+end
+
+note Append argument a to the packed list pk at p; the new end.
+fn tl_pka pk edit uchar 4096 p ulong a view uchar * to ulong
+na = len a
+put pk p uchar and na 255
+put pk add p 1 uchar shr na 8
+for i ulong na
+put pk add add p 2 i get a i
+end
+ret add add p 2 na
+end
+
+note Catalog mode: the compact src[0, n) to k.om, RESOLVE build CATALOG
+note LOCK k.om c.map into c.om, then omc. A resolver refusal leaves its
+note one line in c.err (1); a resolver trap (exit 100..) or a run failure
+note is 2; an omc refusal is mapped to compact or catalog lines (1).
+fn tl_omcc oc view uchar * src view uchar * n ulong to ulong
+pk = new uchar 4096 0
+v = new uchar 3072 0
+for i ulong 3072
+put v i get tlrv i
+end
+if ne tl_spit ckom src n 0
+ret 2
+end
+put pk 0 6
+put pk 1 0
+p = tl_pka pk 2 view part v 0 get tlrl 0
+p = tl_pka pk p cbuild
+p = tl_pka pk p view part v 1024 get tlrl 1
+p = tl_pka pk p view part v 2048 get tlrl 2
+p = tl_pka pk p ckom
+p = tl_pka pk p cmap
+ws = tl_run pk p 2
+if ne ws 0
+if ne and ws 127 0
+ret 2
+end
+c = and shr ws 8 255
+if or or eq c 120 eq c 121 ge c 100
+ret 2
+end
+ret 1
+end
+r = tl_cc oc
+if eq r 1
+tl_cmap
+end
+ret r
+end
+
+note An omc message omc: line N: error K... in c.err mapped through c.map
+note (one line per unit line: C c, E NAME l or R om2) and written back:
+note omc: line c: error K..., omc: catalog NAME line l: error K..., or
+note omc: line 0: error K... for the inserted om2 line. Anything else
+note stays as omc printed it.
+fn tl_cmap to void
+b = new uchar 4096 0
+mp = new uchar 4096 0
+h = new ulong 16 0
+n = tl_slurp ferr b
+mn = tl_slurp cmap mp
+if or lt n 0 lt mn 0
+ret
+end
+if not tl_cpar b ulong n h
+ret
+end
+if not tl_mline mp ulong mn get h 0 h
+ret
+end
+tl_cmw b mp h
+end
+
+note The mapped message for map line mp[h3, h4) and rest b[h1, h2) to c.err.
+fn tl_cmw b view uchar 4096 mp view uchar 4096 h view ulong 16 to void
+o = new uchar 4096 0
+s = get h 3
+z = get h 4
+tg = get mp s
+w = ulong 0
+if eq tg 67
+w = tl_cat o 0 cpre len cpre
+w = tl_cpy o w mp add s 2 z
+end
+if eq tg 69
+sp = tl_sp mp add s 2 z
+if ge sp z
+ret
+end
+w = tl_cat o 0 ccatp len ccatp
+w = tl_cpy o w mp add s 2 sp
+w = tl_cat o w cline len cline
+w = tl_cpy o w mp add sp 1 z
+end
+if eq tg 82
+w = tl_cat o 0 cpre len cpre
+w = tl_cat o w cnul len cnul
+end
+if eq w 0
+ret
+end
+w = tl_cpy o w b get h 1 get h 2
+x = tl_spit ferr view part o 0 w w
+end
+
+note Append b[a, z) to o at p; the new end.
+fn tl_cpy o edit uchar 4096 p ulong b view uchar 4096 a ulong z ulong to ulong
+for i ulong sub z a
+put o add p i get b add a i
+end
+ret add p sub z a
+end
+
+note omc: line N then the rest of the trimmed message b[0, n): h[0] = N,
+note h[1] the start of the rest, h[2] its end. false when not that form.
+fn tl_cpar b view uchar 4096 n ulong h edit ulong 16 to bool
+tl_trim b n h
+a = get h 0
+e = get h 1
+if lt sub e a 12
+ret false
+end
+for i ulong len cpre
+if ne get b add a i get cpre i
+ret false
+end
+end
+p = add a len cpre
+v = ulong 0
+nd = ulong 0
+for j ulong 12
+if ge p e
+break
+end
+c = get b p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 sub ulong c 48
+p = add p 1
+nd = add nd 1
+end
+if eq nd 0
+ret false
+end
+put h 0 v
+put h 1 p
+put h 2 e
+ret true
+end
+
+note Line ln (from 1) of mp[0, mn) into h[3], h[4]; false when there is
+note none or it is shorter than 3 bytes.
+fn tl_mline mp view uchar 4096 mn ulong ln ulong h edit ulong 16 to bool
+s = ulong 0
+k = ulong 1
+for t ulong mn
+if eq k ln
+break
+end
+if eq get mp t 10
+k = add k 1
+s = add t 1
+end
+end
+if or ne k ln ge s mn
+ret false
+end
+z = gr_eol mp s mn
+if lt sub z s 3
+ret false
+end
+put h 3 s
+put h 4 z
+ret true
+end
+
+note The first space in b[a, z), or z.
+fn tl_sp b view uchar 4096 a ulong z ulong to ulong
+p = a
+for i ulong sub z a
+if eq get b p 32
+ret p
+end
+p = add p 1
+end
+ret z
+end
+
+note Catalog loop rule: b's catalog call line ret NAME x ... names an entry
+note whose lines in the unit c.om (c.map E NAME) include a for line.
+fn tl_cloop b view uchar 4096 n ulong to bool
+h = new ulong 16 0
+tl_trim b n h
+a = get h 0
+for it ulong add n 1
+if gt a get h 1
+ret false
+end
+z = gr_eol b a get h 1
+k = gr_ccall b a z
+if gt k 0
+ret tl_cscan view part b add a 4 k
+end
+a = add z 1
+end
+ret false
+end
+
+note Some line of c.om that starts with for (after white space) has the
+note map line E nm in c.map.
+fn tl_cscan nm view uchar * to bool
+u = new uchar 4096 0
+mp = new uchar 4096 0
+un = tl_slurp fsrc u
+mn = tl_slurp cmap mp
+if or lt un 0 lt mn 0
+ret false
+end
+ua = ulong 0
+ma = ulong 0
+for j ulong 4096
+if or ge ua ulong un ge ma ulong mn
+ret false
+end
+uz = gr_eol u ua ulong un
+mz = gr_eol mp ma ulong mn
+if and tl_isfor u ua uz tl_ment mp ma mz nm
+ret true
+end
+ua = add uz 1
+ma = add mz 1
+end
+ret false
+end
+
+fn tl_isfor u view uchar 4096 a ulong z ulong to bool
+p = a
+for i ulong sub z a
+if gt get u p 32
+break
+end
+p = add p 1
+end
+if gt add p 4 z
+ret false
+end
+for j ulong 4
+if ne get u add p j get cfor j
+ret false
+end
+end
+ret true
+end
+
+note Map line mp[a, z) is E nm followed by a space.
+fn tl_ment mp view uchar 4096 a ulong z ulong nm view uchar * to bool
+k = len nm
+if lt sub z a add k 3
+ret false
+end
+if or ne get mp a 69 ne get mp add a 1 32
+ret false
+end
+for i ulong k
+if ne get mp add add a 2 i get nm i
+ret false
+end
+end
+ret eq get mp add add a 2 k 32
 end
 
 note The wait status ws of a test run as the round40 return code: the exit
@@ -721,7 +1034,12 @@ if ne sub get m 4 get m 3 add len grcal tl_nd get m 8
 ret tl_rec 6 omain b n
 end
 if eq sh 4
+if ne get tlrl 3 1
 ret tl_rec 6 oloop b n
+end
+if not tl_cloop b n
+ret tl_rec 6 oloop b n
+end
 end
 for i ulong 4
 x = tl_input get m 8 i
@@ -830,6 +1148,12 @@ end
 if and heq2 view part d 4096 ulong cn ccheck eq c 10
 ret tl_check d
 end
+if and heq2 view part d 4096 ulong cn ccheckc eq c 13
+if not tl_cargs
+ret 2
+end
+ret tl_check d
+end
 pn = tl_arg 3 d 0
 if lt pn 0
 ret 2
@@ -841,6 +1165,21 @@ if and heq2 view part d 4096 ulong cn crepl eq c 6
 ret tl_rmain d ulong pn
 end
 ret 2
+end
+
+note checkc: RESOLVE, CATALOG, LOCK (arguments 10..12) into tlrv; catalog
+note mode on for the check and for the grammar.
+fn tl_cargs to bool
+for k ulong 3
+n = argread add 10 k tlrv mul k 1024 1000
+if lt n 1
+ret false
+end
+put tlrl k ulong n
+end
+put tlrl 3 1
+put grcat 0 1
+ret true
 end
 
 note replace ROOT PATH OLD NEW, with PATH at d[0, pn).
