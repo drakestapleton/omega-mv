@@ -10,8 +10,12 @@ OB=${OB:-$HOME/work/omega-node-e5b3/seed/out/omc}
 OUT=${1:-/tmp/semcat-gate}
 T=$here/tests
 CAT=$here/catalog.om
-rm -rf "$OUT"
-mkdir -p "$OUT"
+# Reserve a fresh directory; never remove or reuse retained evidence.
+if ! mkdir -- "$OUT"; then
+  printf '%s\n' "ERROR: output directory must be new with an existing parent: $OUT" >&2
+  exit 2
+fi
+# Output directory reserved.
 fails=0
 checks=0
 ok() { checks=$((checks + 1)); echo "PASS $*"; }
