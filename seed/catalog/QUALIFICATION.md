@@ -105,7 +105,9 @@ this model, its tokenizer and existing adapter. Result FAIL (malformed generated
 code, SyntaxError), HTTP 200, normal EOS, 465 prompt and 15 completion tokens,
 9895 ms adapter time, 9898 ms server time, 13.02 s total with 3.018455582 s cold
 startup. Fixed limits: request 180 s, overall 240 s; neither timeout fired.
-Temperature zero, seed one, no repairs. No substitution, GPU or training.
+Temperature zero, seed one, no repairs. This was traced, nonquiet CPU execution
+overlapping another model workload; it is not uncontended throughput evidence.
+No substitution, GPU or training.
 The raw request and response are retained in the private evidence handoff.
 This was an existing Python coding task, not proof of Omega catalog integration.
 The model's earlier completed DRA-124 coding suite was also 0/28.

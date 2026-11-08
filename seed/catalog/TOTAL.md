@@ -43,7 +43,8 @@ this argument and the catalog identity.
 seed/catalog/check-total.sh NEW_OUTPUT_DIRECTORY
 ```
 
-The gate builds the resolver with the pinned compiler, checks locked identity,
+The gate builds the resolver with the selected compiler and records its SHA256,
+checks locked identity,
 compiles ordinary and inline units, compares full-width results against direct
 long multiplication/addition for every uchar n and signed-int extrema, and
 checks byte-identical source/map/accounting reproduction. A re-locked wrong
