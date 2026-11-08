@@ -1,6 +1,8 @@
 # hunt.py REPO SITES_TSV OUT: one-token mutations of small accepted programs; keep each one that reaches
 # an unreached omc error site (proved by that site's mutant compiler exiting 97). Test harness only (python3 -I),
-# never part of an Omega build. SITES_TSV is seed/omc/sitecov.sh's build/seed/sitecov/sites.tsv. Found
+# never part of an Omega build. SEEDS=DIR seeds from DIR instead of the tracked programs (how the IR-mode
+# fixtures were found: tests/one_layer/omegese/dev/*.omegese with an "ir" line first, plus two small IR
+# programs). SITES_TSV is seed/omc/sitecov.sh's build/seed/sitecov/sites.tsv. Found
 # files still need a refuse line in sites.cases and a sitecov.sh rerun; target lines must stay first.
 import os, subprocess, sys, random
 from concurrent.futures import ThreadPoolExecutor
@@ -28,11 +30,17 @@ def run(exe, data):
     except subprocess.TimeoutExpired:
         return -1
 seeds = []
-for f in subprocess.run(["git", "-C", repo, "ls-files", "*.om"], capture_output=True, text=True).stdout.split():
+sd = os.environ.get("SEEDS")  # optional directory of seed programs, e.g. the dev IR programs with "ir" first
+names = sorted(os.path.join(sd, f) for f in os.listdir(sd)) if sd else \
+    subprocess.run(["git", "-C", repo, "ls-files", "*.om"], capture_output=True, text=True).stdout.split()
+for f in names:
     t = open(os.path.join(repo, f), "rb").read()
     if t.count(b"\n") <= 40 and run(omc, t) == 0:
         seeds.append((f, t.decode("utf-8", "replace")))
 vocab = "ulong long uchar uint bool f64 f32 int 0 1 -1 255 256 65536 4294967296 1.5f64 1.5f32 \"a\" x a b s if end ret get put len new seal open view edit add sub eq lt not neg min max and shl rotr part fork trap 5 9999999 abcdefghij".split()
+if sd:  # the IR-mode search also used these words and 20 picks per token
+    vocab = "short ushort not xor or mul div rem shr for while bound true false g f y z 100 1000 15 64".split() + vocab
+k = 20 if sd else 12
 rnd = random.Random(20261108)
 found = {}
 print("seeds", len(seeds), "unreached", sum(len(v) for v in un.values()), flush=True)
@@ -44,7 +52,7 @@ def cands():
             if not l.strip() or toks[0] == "note":
                 continue
             for j in range(len(toks)):
-                for v in rnd.sample(vocab, 12):
+                for v in rnd.sample(vocab, k):
                     nt = list(toks); nt[j] = v
                     nl = list(lines); nl[i] = " ".join(nt)
                     yield f, "\n".join(nl).encode()
