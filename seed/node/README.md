@@ -1116,7 +1116,7 @@ L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.o
 { printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-main.om; } | seed/out/omc > build/node/code-main
 { printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-test.om; } | seed/out/omc > build/node/code-test
 chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test
-build/node/code-test unit build/node/cu   # "code checks=54 fail=0", exit 0
+build/node/code-test unit build/node/cu   # "code checks=61 fail=0", exit 0
 python3 seed/node/tests/tool-replay.py build/node/tool OMC40 ROUND40 build/node/replay   # pass=108 fail=0
 ```
 
@@ -1207,13 +1207,15 @@ only, so a `\r` makes a line fall outside the grammar where Python's
 
 ### Acceptance and controls
 
-`code-test unit` (54 checks, no child process) feeds crafted model and tool
+`code-test unit` (61 checks, no child process) feeds crafted model and tool
 records to the creator: the round40 prompts byte for byte; every action in
 every state; wrong path; old text absent, twice, many times; an edit outside
 the grammar; `Tests passed.` unverified or after an edit; `File not found.`
 when not missing; header and length faults; tool content that differs from
 the source or candidate; outcome words for exit 4, 5 and 8, a killed child,
-cancellation, UNKNOWN and a lost input; the turn limit; an over-long prompt.
+cancellation, UNKNOWN and a lost input; the turn limit; an over-long prompt;
+catalog mode: the compact call line in the grammar only there, and the card
+in the prompt.
 `code-test cancel MS ...` is `omnode-code` with objective 0's first inference
 cancelled through `auth_cancel` after MS milliseconds.
 
@@ -1234,6 +1236,40 @@ cancelled through `auth_cancel` after MS milliseconds.
 | cancelled read as UNKNOWN | 197 |
 | missing file read as read | 178 |
 | prompt limit raised to 4000 | 203 |
+
+### Catalog mode (SemC, DRA-323)
+
+Status: IMPLEMENTED in `gram.om`, `tool.om`, `code.om`, `code-cat.om` and
+`code-cat-main.om`; plain mode is unchanged (`code-test unit`, the round40
+tool replay 108/108 with the catalog-mode `tool`). The resolver and the
+catalog are `seed/catalog/` (`~/handoffs/semc/CONTRACT.md`).
+
+```sh
+{ printf 'om2\n'; cat $L seed/node/gram.om seed/node/code.om seed/node/code-cat.om seed/node/code-cat-main.om; } | seed/out/omc > build/node/code-cat-main
+chmod +x build/node/code-cat-main
+```
+
+`omnode-code-cat INFER TOOL OMC ROOT WORK JDIR PORT RESOLVE CATALOG LOCK CARD OBJ...`
+is `omnode-code` on compact job files. CARD is `none`, `sig` (the signature
+lines of the card) or `full`. Before the first objective it runs
+`RESOLVE card CATALOG LOCK` once (stdout to `WORK/card.txt`, stderr to
+`WORK/card.err`) and prints `CWK variant bytes` followed by the card bytes the
+prompt carries between `Goal:` and `State:` as `Catalog:` lines. Every check
+and review job passes the same RESOLVE, CATALOG and LOCK to
+`tool checkc ROOT PATH WORK OMC KIND K N A RESOLVE CATALOG LOCK`, so the card the
+model sees and the entries the build links come from one lock. Exit 56: the
+card run failed; 57: card over 1000 bytes.
+
+`checkc` writes the compact source (after the test substitution) to `k.om`,
+runs `RESOLVE build CATALOG LOCK k.om c.map` into `c.om`, then omc. A resolver
+refusal is the tool result as the resolver printed it
+(`RESOLVE_<NAME> line N ...`); a resolver trap or signal is tool failure 2.
+An omc message `omc: line N: error K ...` is mapped through `c.map`: a compact
+line `C c` gives `omc: line c: ...`, a catalog line `E NAME l` gives
+`omc: catalog NAME line l: ...`, the inserted `om2` line gives `omc: line 0: ...`.
+The loop rule holds when the compact source has a `for` line or a linked entry
+contributes one. In catalog mode the repair grammar also admits
+`ret NAME x D...` (a lowercase catalog name, x, 1..4 arguments of 1..2 digits).
 
 ### Live coding workflow under the durable scheduler (DRA-399)
 
