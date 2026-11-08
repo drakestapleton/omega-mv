@@ -104,15 +104,25 @@ Each lock line is `NAME SP IDENTITY [SP inline]`, at most 32 lines. A lock has n
     locked entry or to a parameter or local of one;
   - a binding (fn-line word, `for` variable, `NAME =`) equal to a locked entry.
 - **Unlocked use.** A catalog name the source uses but neither locks nor defines is
-  `RESOLVE_UNLOCKED` at the compact line.
+  `RESOLVE_UNLOCKED` at the compact line. Any compact word equal to a catalog entry name counts as a
+  use, also where omc would read it as a local name: lock it or rename the local.
+- **om2 header.** The resolver reads the first line that is neither blank nor a note line, compared
+  as a whole line from column 0, the way omc does (`om2lead`, `cp_mode`, `chk_mode`). These are om2
+  headers: `om2`, `om2 diag`, `om2 debug`, `om2 release`, `om2 diag debug`, `om2 diag release`. A
+  `check` or `next` line (compiler A) is followed by its om2 header on the next such line.
 - **om2 insertion.** Inline entries require OM-2. When an inline entry is locked and the source has
-  no `om2`/`om2 diag` header line, the resolver writes `om2` as unit line 1 (map `R om2`).
+  no om2 header, the resolver writes `om2` as unit line 1 (map `R om2`).
 - **Mode refusals** (`RESOLVE_MODE`):
   - an `ir` header with an inline entry;
   - an `om2 fmt` header with any entry;
   - a `target` header line with an inline entry and no om2 (where om2 belongs next to target is
     not decided);
-  - an OM-2 reserved word in a source that would become OM-2 because of an insertion.
+  - a `check` or `next` line with an inline entry and no om2 header after it;
+  - in a source that would become OM-2 because of an insertion, a word that means something else
+    in OM-2: the OM-2 keyword table of omc (`kw2`), the contract words `requires`, `ensures` and
+    `invariant`, the unsized-view `*`, and a hex literal (`0x...`, error 6 in OM-1). On a `text`
+    line only `text` and the name are read, not the literal. So one compact source either behaves
+    the same with lock B and lock C or is refused with lock C.
 
 ## Map and accounting
 
@@ -126,7 +136,7 @@ Each lock line is `NAME SP IDENTITY [SP inline]`, at most 32 lines. A lock has n
 ## Refusals
 
 A refusal is one stderr line `RESOLVE_<NAME> line <N> <catalog|lock|compact|unit|map> <detail>` and
-exit status:
+exit status. The detail is cut at 1000 bytes; the line feed is always written.
 
 | name | exit |
 |---|---|
@@ -167,8 +177,10 @@ A CR byte in any input is `RESOLVE_SYNTAX`.
 2. Checks the identity against `sha256sum`.
 3. Resolves the four f4 programs (items 76666, 83423, 82342 and 85188) for arms B and C. Each
    resolve runs twice and the outputs are compared with `cmp`. The units from both resolver
-   builds are compared, and the map is checked.
-4. Compiles arms A, B and C with both compilers and compares their exit values (82, 86, 78, 78).
+   builds are compared, and the map is checked: a catalog fn line carries ` inline` exactly when
+   the lock marks the entry inline, and the unit's ` inline` lines equal the lock's.
+4. Compiles arms A, B and C with both compilers and compares their exit values with the Wolfram
+   constants `Mod[{70+4*3, 71+5*3, 72+1*6, 70+2*4}, 256] -> {82, 86, 78, 78}`.
 5. Runs every row of `tests/expected.tsv` through native drivers (`tests/drive.om`,
    `tests/dmain.om`):
    - f4 rows on arms A, B and C;
@@ -177,14 +189,18 @@ A CR byte in any input is `RESOLVE_SYNTAX`.
    The rows include the int overflow boundaries, n = 0, n = 1000000 and n = 1000001 (trap 4).
 6. Resolves a two-entry dependency closure (`tests/two.cat.om`, exit 94), which checks that the
    dependency comes first. Also checks that a compact source that already starts with `om2` keeps
-   its own header.
+   its own header, that every om2 header form in `tests/hdr/` is kept (exit 82 on both compilers;
+   `checkom2` is resolved only), that `requires` as an OM-1 name runs with lock B
+   (`tests/requires.compact.om`, `0+4*3 -> 12`), and that OM-2 words inside a text literal are not
+   refused (`tests/textok.compact.om`).
 7. Checks the wrong-constant mutant (`tests/neg/wrongk.cat.om`):
    - with the old lock it is refused (`RESOLVE_IDENTITY`);
-   - re-locked, it builds, and the table and irequiv both detect it.
+   - re-locked, every step exits 0 and writes bytes, the table detects some rows but not all, and
+     irequiv detects it.
 8. irequiv `check` on the resolved `ir` unit (`tests/ir.compact.om`): hand loop vs catalog call
    over three ushort windows of x (top, bottom and middle of int), 65536 inputs each.
-9. Runs 19 refusal controls (exit status, first four diagnostic words, empty stdout, no map) and
-   the usage refusal.
+9. Runs 25 refusal controls (exit status, first four diagnostic words, empty stdout, no map), the
+   usage refusal, and a diagnostic longer than its cap (still one line).
 
 `expected.tsv` was written by this Wolfram query (the evaluator's output saved unchanged), with
 `lo=-2^31; hi=2^31-1`:
