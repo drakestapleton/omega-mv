@@ -122,8 +122,8 @@ speed() {
 }
 
 case "$step" in
-  # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07) and the crumb files are removed
-  # (2026-11-08); FOLDERS.md keeps their written notes.
+  # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07). Crumb files were removed
+  # (2026-11-08) except two already under evidence/, which stay (additions-only). FOLDERS.md keeps the notes.
   # pr-smoke.yml
   base)
     physics_pin; set -o pipefail

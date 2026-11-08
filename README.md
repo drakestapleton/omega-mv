@@ -115,4 +115,4 @@ Open a pull request with the exact command you ran and its output. Receipts are 
 
 ## Folder notes
 
-[FOLDERS.md](FOLDERS.md) says what each folder is for and the rules it keeps. It holds the written notes from the crumb files this repo used to carry; the crumb files themselves were removed on 2026-11-08 (Drake: "get rid of crumbs", "keep the parts that worked"). Git history is the record of who changed what.
+[FOLDERS.md](FOLDERS.md) says what each folder is for and the rules it keeps. It holds the written notes from the crumb files this repo used to carry. Those crumb files were removed on 2026-11-08 (Drake: "get rid of crumbs", "keep the parts that worked"), except `evidence/hosted-x86-aien-abi1/.crumb` and `evidence/physics0/learner/.crumb`, which stay because existing evidence is never deleted. Git history is the record of who changed what.

@@ -3,6 +3,7 @@
 These notes were kept from the retired crumb files (Drake, 2026-11-08: "get rid of crumbs",
 "keep the parts that worked"). They are plain notes: nothing generates or checks them. If a change
 makes a note wrong, fix the note in the same change. Folders with no written note are not listed.
+Two crumb files already under evidence/ stay, because existing evidence is never deleted; their notes are still listed here.
 
 ## `bench/inference_cost/`
 

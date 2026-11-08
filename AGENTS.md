@@ -64,7 +64,7 @@ Gates whose manifest lists `gb10` under `requires:` (for example the `*-silicon`
 - Receipts are content-addressed (`<name>.<sha256>.json`), name the exact commit and refuse a dirty tree. A rerun adds a file; it never replaces one.
 - Some older milestone gate scripts rewrite their receipts in place. Do not run them on a clean checkout you mean to keep; prefer the `make test-*` targets and `tests/gates/run.sh`.
 - No systemd. Offline, in-house builds.
-- Crumbs are gone (removed 2026-11-08, Drake: "get rid of crumbs"). `FOLDERS.md` keeps each folder's written purpose and rules as plain notes; if your change makes one wrong, fix it in the same change.
+- Crumbs are gone (removed 2026-11-08, Drake: "get rid of crumbs"), except two files already under `evidence/`, which stay because that tree is additions-only. `FOLDERS.md` keeps each folder's written purpose and rules as plain notes; if your change makes one wrong, fix it in the same change.
 - Credit work in `CONTRIBUTORS.md` in the same commit as the work.
 
 ## Safety and approvals
