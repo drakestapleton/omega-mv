@@ -12,7 +12,12 @@ OUT=$1
 REPS=$2
 T=$here/tests
 CAT=$here/catalog.om
-mkdir -p "$OUT"
+# Reserve a fresh directory; never remove or reuse retained evidence.
+if ! mkdir -- "$OUT"; then
+  printf '%s\n' "ERROR: output directory must be new with an existing parent: $OUT" >&2
+  exit 2
+fi
+# Output directory reserved.
 { sed 's/^export fn /fn /' "$root/om/sha256/sha256-om2.om"; cat "$here/resolve.om"; } > "$OUT/resolve-full.om"
 "$OA" < "$OUT/resolve-full.om" > "$OUT/resolve"; chmod +x "$OUT/resolve"
 R=$OUT/resolve
