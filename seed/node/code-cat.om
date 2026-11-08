@@ -9,11 +9,11 @@ note card variant the prompt shows: none, sig (the signature line of each
 note entry) or full (signature, card note, example). At start the creator
 note runs RESOLVE sig CATALOG LOCK for sig, otherwise card (stdout WORK/card.txt, stderr
 note WORK/card.err) and takes the variant's lines from that output; the
-note same CATALOG and LOCK paths go to every checkc job. Keep their bytes
-note immutable for the run; startup digests are not enforced. The card is printed once as
+note CATALOG and LOCK are first copied to private read-only snapshots outside ROOT.
+note Their paths feed both the card and every checkc job. The card is printed once as
 note CWK variant length, newline, its bytes, newline. Exit codes as
 note omnode-code, plus 56 the card could not be made, 57 the card is over
-note 1000 bytes.
+note 1000 bytes; 58 unsafe workspace layout or failed snapshot.
 text cccard "card"
 text ccsign "sig"
 text ccfile "/card.txt"
@@ -157,6 +157,194 @@ cw_out t n
 cw_out cwnl 1
 end
 
+note Private snapshot paths. Root and work must be absolute directories with
+note no links, dot components or trailing slash. Work must be outside root.
+text ccsdir "/.catalog-"
+text ccscat "/catalog.om"
+text ccslock "/lock"
+
+fn cc_dpart p view uchar * s ulong i ulong to bool
+st = new uchar 128 0
+m = sub i s
+if eq m 0
+ret false
+end
+if and eq m 1 eq get p s 46
+ret false
+end
+if and eq m 2 and eq get p s 46 eq get p add s 1 46
+ret false
+end
+r = lstat p 0 i st 0 128
+md = or ulong get st 16 shl ulong get st 17 8
+if or lt r 0 ne and md 61440 16384
+ret false
+end
+ret true
+end
+
+fn cc_dir p view uchar * to bool
+n = len p
+if or lt n 2 ne get p 0 47
+ret false
+end
+s = ulong 1
+for i ulong add n 1
+if eq i 0
+continue
+end
+c = uchar 47
+if lt i n
+c = get p i
+if or lt c 32 eq c 127
+ret false
+end
+end
+if ne c 47
+continue
+end
+if not cc_dpart p s i
+ret false
+end
+s = add i 1
+end
+ret true
+end
+
+note Both validated paths have no aliases through dot components or symlinks.
+fn cc_outside root view uchar * work view uchar * to bool
+if lt len work len root
+ret true
+end
+for i ulong len root
+if ne get root i get work i
+ret true
+end
+end
+if eq len work len root
+ret false
+end
+ret ne get work len root 47
+end
+
+note Bounded regular input read, private exclusive read-only output. Failure
+note leaves diagnostics in the private directory and never reuses old bytes.
+fn cc_readcopy src view uchar * b edit uchar 262145 cap ulong to long
+st = new uchar 128 0
+fd = fopen src 0 len src 559104 0
+if lt fd 0
+ret neg long 1
+end
+r = fstat int fd st 0 128
+md = or ulong get st 16 shl ulong get st 17 8
+if or lt r 0 ne and md 61440 32768
+x = fclose int fd
+ret neg long 1
+end
+n = ulong 0
+for it ulong 262146
+k = read int fd b n sub add cap 1 n
+if lt k 0
+x = fclose int fd
+ret neg long 1
+end
+if eq k 0
+break
+end
+n = add n ulong k
+if gt n cap
+x = fclose int fd
+ret neg long 1
+end
+end
+x = fclose int fd
+if ne x 0
+ret neg long 1
+end
+ret long n
+end
+
+fn cc_writecopy dst view uchar * b view uchar 262145 n ulong to bool
+outfd = fopen dst 0 len dst 557249 256
+if lt outfd 0
+ret false
+end
+p = ulong 0
+for it ulong 262146
+if eq p n
+break
+end
+k = write int outfd b p sub n p
+if le k 0
+x = fclose int outfd
+ret false
+end
+p = add p ulong k
+end
+r = fsync int outfd
+x = fclose int outfd
+ret and eq r 0 eq x 0
+end
+
+fn cc_copy src view uchar * dst view uchar * cap ulong to bool
+b = new uchar 262145 0
+n = cc_readcopy src b cap
+if lt n 0
+ret false
+end
+ret cc_writecopy dst b ulong n
+end
+
+fn cc_store k ulong p view uchar * to void
+for i ulong len p
+put cwcf add mul k 1024 i get p i
+end
+put cwcl k len p
+end
+
+note Snapshot before card generation. The same replaced slots feed every
+note checkc. Typed model tools can only edit ROOT, never this sibling path.
+note Hostile same-UID mutation and concurrent directory swaps are not covered.
+fn cc_snapfile dir view uchar * name view uchar * slot ulong cap ulong to bool
+dst = new uchar 4096 0
+src = new uchar 4096 0
+dn = cw_cat dst 0 dir
+dn = cw_cat dst dn name
+sn = cw_ld src add 10 slot 0
+if not cc_copy view part src 0 sn view part dst 0 dn cap
+ret false
+end
+cc_store slot view part dst 0 dn
+ret true
+end
+
+fn cc_snapshot to bool
+root = new uchar 4096 0
+work = new uchar 4096 0
+dir = new uchar 4096 0
+rn = cw_ld root 13 0
+wn = cw_ld work 14 0
+if or not cc_dir view part root 0 rn not cc_dir view part work 0 wn
+ret false
+end
+if not cc_outside view part root 0 rn view part work 0 wn
+ret false
+end
+dn = cw_cat dir 0 view part work 0 wn
+dn = cw_cat dir dn ccsdir
+dn = cw_dec dir dn ulong getpid
+if gt dn 980
+ret false
+end
+if ne makedir dir 0 dn 448 0
+ret false
+end
+if not cc_snapfile view part dir 0 dn ccscat 8 262144
+ret false
+end
+ret cc_snapfile view part dir 0 dn ccslock 9 8192
+end
+
 note omnode-code-cat from argument k (see above).
 fn cw_cmain k ulong dls ulong to int
 b = new uchar 1024 0
@@ -185,6 +373,9 @@ end
 if not cw_parse i view part b 0 ulong m
 ret 2
 end
+end
+if not cc_snapshot
+ret 58
 end
 if ne cc_run 0
 ret 56

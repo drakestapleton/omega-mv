@@ -1251,15 +1251,25 @@ chmod +x build/node/code-cat-main
 
 `omnode-code-cat INFER TOOL OMC ROOT WORK JDIR PORT RESOLVE CATALOG LOCK CARD OBJ...`
 is `omnode-code` on compact job files. CARD is `none`, `sig` (the signature
-lines returned by `RESOLVE sig CATALOG LOCK`) or `full`. Before the first objective it runs
+lines returned by `RESOLVE sig CATALOG LOCK`) or `full`. Before the first objective,
+it copies CATALOG and LOCK into an exclusive `WORK/.catalog-PID/` directory
+(mode 0700), with read-only files (0400). Config then holds only these snapshot
+paths, for both the card and every check/review. It runs
 `RESOLVE sig CATALOG LOCK` for `sig`, otherwise `RESOLVE card CATALOG LOCK`, once (stdout to `WORK/card.txt`, stderr to
 `WORK/card.err`) and prints `CWK variant bytes` followed by the card bytes the
 prompt carries between `Goal:` and `State:` as `Catalog:` lines. Every check
 and review job passes the same RESOLVE, CATALOG and LOCK to
 `tool checkc ROOT PATH WORK OMC KIND K N A RESOLVE CATALOG LOCK`, so the card the
-model sees and the entries the build links use the same paths. Keep catalog and lock
-immutable for the run: this interface does not bind startup hashes to later checks. Exit 56: the
-card run failed; 57: card over 1000 bytes.
+model sees and the entries the build links use the same snapshot bytes. Exit 56: the
+card run failed; 57: card over 1000 bytes; 58: unsafe layout or snapshot failure.
+
+ROOT and WORK must be existing absolute directories with no symbolic-link
+prefixes, dot/empty components or trailing slash; WORK must be outside ROOT.
+Catalog and lock inputs must be regular files, at most 262144 and 8192 bytes.
+Snapshots are kept for inspection; a preexisting snapshot directory is refused.
+The typed model tools cannot reach them through ROOT. This protects against
+replacement or edits of the original files after startup. It does not protect
+against a hostile same-UID operator, concurrent directory swaps or bind-mount aliases.
 
 `checkc` writes the compact source (after the test substitution) to `k.om`,
 runs `RESOLVE build CATALOG LOCK k.om c.map` into `c.om`, then omc. A resolver
@@ -1281,6 +1291,14 @@ With no arguments it checks signature preservation, no-card and full-card select
 With `RESOLVE CATALOG LOCK WORK` it also executes the resolver and checks the four
 signatures in `tests/card-mixed.om` (entries with zero, one and two notes).
 Build the fixture lock with `RESOLVE ids CATALOG > LOCK`.
+
+`code-cat-snapshot-test.om` composes after `code-cat.om` in place of the main.
+It takes `RESOLVE CATALOG LOCK ROOT WORK`, snapshots the inputs, prints the two
+private paths and waits for one stdin byte. A referee can replace both original
+files with a different valid catalog/lock pair, then send a byte. The probe
+requires an unchanged signature card; checkc on the printed paths must still
+compile the original semantics. Unsafe layouts and oversized/nonregular
+inputs must exit 58 before any model invocation.
 
 Accounting must include each complete `CWP` prompt and `CWR` response, including
 failed and repair turns. The startup `CWK` record is not the total documentation
