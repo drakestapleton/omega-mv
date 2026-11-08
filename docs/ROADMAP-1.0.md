@@ -285,9 +285,13 @@ namespace. gate15 refuses 33 minimal programs at their exact `omc: line L: error
 `seed/omc/codereg.om`, which fails on a site without a row, a row without a site, an OMEGESE §9.14 /
 §11.1 row that differs from the registry, or a registry case that did not refuse. Machine records
 exist only in OM-2 `diag` mode (#655 owns incremental feedback). Site coverage (2026-11-08): `seed/omc/sitecov.sh`
-changes one `fail N` site at a time to code 97 and replays every refused tracked input; 239 of 583 sites are
-reached (195 before the 46 fixtures in `seed/omc/sites`), and `seed/host/check.sh` fails if that falls below
-`seed/omc/sitecov.floor`. The 344 unreached sites (list in its `sites.tsv`) are the fixture backlog.
+changes one `fail N` site at a time to code 97 and replays every refused tracked input; 292 of 583 sites are
+reached (195 before the 100 fixtures in `seed/omc/sites`), and `seed/host/check.sh` fails if that falls below
+`seed/omc/sitecov.floor`. The 291 unreached sites (list in its `sites.tsv`) are the fixture backlog.
+Finding while writing them: error 4 ("the line ends where a word or value is needed") names the line AFTER
+the short line whenever a newline follows it (`fn main to int` + `x =` + newline reports line 3; without the
+final newline, line 2), in OM-1, OM-2 and IR mode alike; gate15 `e4_line_ends` pins the late number.
+Proposal (not applied, it changes pinned compiler output): report the line of the last token read.
 
 Acceptance:
 - A code registry in the language doc: every code, its meaning, the obligation, and one minimal
