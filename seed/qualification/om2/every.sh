@@ -1,6 +1,6 @@
 #!/bin/sh
 # every.sh -- run seed/qualification/om2/gate.om over EVERY seed/omc/om2/*/*.cases file (ROADMAP-1.0 RM1)
-# and the error-site fixtures seed/omc/sites/*.cases (RM8),
+# and the error-site fixtures seed/omc/sites/*.cases (RM8), plus the qualification files listed below,
 # so a regression in any OM-2 stage is visible to seed/host/check.sh, not only s5.
 # A case file must PASS with fail=0 invalid=0 not_run=0. A mutant file (*mutants.cases) must make the
 # gate exit 1 with every ctl-* case PASS, every other case FAIL (the mutant was caught) and none
@@ -49,6 +49,23 @@ for c in seed/omc/om2/*/*.cases seed/omc/sites/*.cases; do
     n=$(run "$c" "$t") || bad "$c: $n (log $B/$t.log)"
     case "$c" in *mutants.cases) muts=$((muts + n)) ;; *) cases=$((cases + n)) ;; esac
     files=$((files + 1))
+    printf 'PASS %s (%s)\n' "$c" "$n"
+done
+# Qualification files that pass on the committed compiler (2 s together). The other files under
+# seed/qualification are left out on purpose: pinned.cases run against the OM-1 reference omc 734f0a39,
+# mutant and selftest fail/controls files are designed failures run by their own drivers, candidate
+# files with NOT_RUN rows need tools this host check does not have, and security673 bindings.cases
+# stays out until derive-wrong-image's stored evidence/run3/embed.bin (2184 bytes, 2026-10-30) is
+# re-derived by its owner: today's omc emits 2308 bytes for embed.om, so that pin is stale.
+for c in seed/qualification/om2/baseline/guard.cases seed/qualification/om2/baseline/language.cases \
+    seed/qualification/om2/baseline/sha256.cases seed/qualification/om2/baseline/transform.cases \
+    seed/qualification/om2/sec/s4fuel/candidate.cases seed/qualification/om2/selftest/pass.cases \
+    seed/qualification/security673/relational/consumer.cases \
+    seed/qualification/security673/relational/l4-tripwire.cases \
+    seed/qualification/security673/relational/qualification.cases; do
+    t=$(echo "$c" | tr / _)
+    n=$(run "$c" "$t") || bad "$c: $n (log $B/$t.log)"
+    cases=$((cases + n)); files=$((files + 1))
     printf 'PASS %s (%s)\n' "$c" "$n"
 done
 [ "$files" -gt 0 ] || bad "no case files"

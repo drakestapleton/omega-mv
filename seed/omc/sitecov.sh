@@ -9,6 +9,8 @@
 # at the first site it reaches, so one that exits with another code cannot reach this one.
 # Sound for "reached" (the mutant's own exit proves it); a site listed as unreached may still be
 # reachable by a program the repository does not contain.
+# Lines whose code is a name (fail code in nfail/unkfail, fail eolc in lenval) are not sites: nfail and
+# unkfail callers are counted as their own lines, but lenval's end-of-line refusal (16 or 4) is not counted.
 # Usage: sh seed/omc/sitecov.sh [check] [OUT_DIR]   (from the repository root; default build/seed/sitecov)
 # With "check", it also fails when fewer sites are reached than seed/omc/sitecov.floor records, so a
 # deleted fixture or a site moved out of reach is seen; raise the floor when new fixtures land.
