@@ -1,8 +1,8 @@
 #!/bin/sh
 # gate.sh -- seed/text/text.om against an independent oracle (gen.py, Python, test harness only).
 # Builds txdrv (om2 + text.om + txdrv.om) with seed/out/omc, generates the fixed and seeded random cases,
-# and requires every answer to equal Python's. Then seven mutants of text.om, each removing or bending
-# one rule, must each produce at least one wrong answer. Prints TEXTGATE PASS rows=N mutants=7.
+# and requires every answer to equal Python's. Then eleven mutants of text.om, each removing or bending
+# one rule, must each produce at least one wrong answer. Prints TEXTGATE PASS rows=N mutants=11.
 set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 cd "$R"
@@ -52,4 +52,8 @@ mutant "needle at the very end missed" 's/stop = add sub hn m 1/stop = sub hn m/
 mutant "shorter prefix sorts last" 's/if lt len a len b\nret int -1/if lt len a len b\nret int 1/'
 mutant "-2^63 refused" 's/if gt x 9223372036854775808/if ge x 9223372036854775808/'
 mutant "truncated sequence accepted" 's/if ne st 0\nret lead\nend\nret stop/ret stop/'
+mutant "3-byte lead keeps too few bits" 's/cp = ulong and c 15/cp = ulong and c 7/'
+mutant "U+D800 encoded" 's/if and ge cp 55296/if and ge cp 55297/'
+mutant "3-byte lead written as 4-byte" 's/lead = 224/lead = 240/'
+mutant "U+07FF sized as 3 bytes" 's/if lt cp 2048/if lt cp 2047/'
 printf 'TEXTGATE PASS rows=%s mutants=%s\n' "$rows" "$m"

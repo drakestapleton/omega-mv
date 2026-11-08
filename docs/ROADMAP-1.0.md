@@ -222,7 +222,7 @@ Acceptance:
 Current: `text NAME "bytes"` read-only literals (program mode only), `uchar` arrays, explicit lengths,
 no terminators. OM-2 unsized views (`view uchar *`) and `part` give checked slices; this resolves the
 "open arrays" blocker of `OM_COMPLETION.md` item 4 for parameters. There is no UTF-8 handling, no
-number/text conversion, no formatting word, no comparison or search library (`seed/text`, standalone gate, now covers compare, search, fields, integer parse/format and UTF-8 validation). #775 is a defect in this
+number/text conversion, no formatting word, no comparison or search library (`seed/text`, standalone gate, now covers compare, search, fields, integer parse/format, UTF-8 validation and code point decode/encode). #775 is a defect in this
 path. Consumers that need more: #788 (TLS/HTTP/JSON proposal), omega-bridge text constants
 (unsupported by its converters).
 

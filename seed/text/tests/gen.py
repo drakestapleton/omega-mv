@@ -111,6 +111,32 @@ def u8_case(o, b):
     o.add(b"U" + s(b), f"U {u8(b)}")
 
 
+def dec(b):
+    for k in range(1, min(4, len(b)) + 1):
+        try:
+            t = b[:k].decode("utf-8")
+        except UnicodeDecodeError as e:
+            if e.start > 0 or e.reason != "unexpected end of data":
+                return None
+            continue
+        return ord(t), k
+    return None
+
+
+def dec_case(o, b):
+    r = dec(b)
+    o.add(b"P" + s(b), "P n" if r is None else f"P {r[0]} {r[1]}")
+
+
+def enc_case(o, cp, cap):
+    if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+        line = "Q R"
+    else:
+        e = chr(cp).encode("utf-8")
+        line = "Q E" if len(e) > cap else "Q " + e.hex()
+    o.add(b"Q" + n(cp) + n(cap), line)
+
+
 def main(d):
     rnd = random.Random(20261108)
     o = Out(d)
@@ -194,6 +220,32 @@ def main(d):
             b = b[:rnd.randrange(len(b))]
         u8_case(o, bytes(b))
     u8_case(o, ("é" * 100_000).encode() + b"\xed\xa0\x80")
+    # code points: decode every 1- and 2-byte string, every 3-byte string led by E0, E1, ED, EF,
+    # sampled 4-byte strings and random mixes; encode edges, the surrogate band, a stride of all
+    # code points, values past 10FFFF, and every room size 0..4.
+    for a in range(256):
+        dec_case(o, bytes([a]))
+        for b2 in range(256):
+            dec_case(o, bytes([a, b2]))
+    for a in (0xE0, 0xE1, 0xE8, 0xED, 0xEF):
+        for b2 in range(256):
+            for c in range(256):
+                dec_case(o, bytes([a, b2, c]))
+    for a in range(0xF0, 0xF8):
+        for b2 in range(0x80, 0xC0):
+            for c in third:
+                for e in third:
+                    dec_case(o, bytes([a, b2, c, e]) + b"x")
+    for _ in range(20000):
+        cps = [rnd.randrange(0x110000) for _ in range(rnd.randrange(1, 3))]
+        bb = "".join(chr(x) for x in cps if not 0xD800 <= x <= 0xDFFF).encode() or b"a"
+        dec_case(o, bb[:rnd.randrange(1, len(bb) + 1)])
+    edges = [0, 0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000, 0x10FFFF, 0x110000, 1 << 32, U64]
+    for cp in edges + list(range(0xD700, 0xE100)) + list(range(0, 0x110000, 7)):
+        enc_case(o, cp, 4)
+    for cp in edges:
+        for cap in range(5):
+            enc_case(o, cp, cap)
     o.flush()
     print(f"cases files={o.k}")
 
