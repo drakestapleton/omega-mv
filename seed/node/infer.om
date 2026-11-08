@@ -1,9 +1,17 @@
+note Optional explicit system role: --chat-system PORT MAXTOK DEADLINE_S USER SYSTEM.
+note Both strings are supplied by the caller, nonempty and at most 3800 bytes; no default instructions.
 note Omega Node inference adapter (DRA-290): one bounded completion from the
 note own model's ollm serve (aien-train, DRA-119) over loopback, turned into a
 note versioned typed record. Composition, OM-2:
 note { printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om
 note seed/net/http.om seed/net/notls.om seed/node/infer.om; } | omc
 note Usage: omnode-infer PORT MAXTOK DEADLINE_S PROMPT [TESTOUT]
+note Current own-model chat API: omnode-infer --chat PORT MAXTOK DEADLINE_S PROMPT.
+note Chat uses one user message with the exact prompt, temperature 0, seed 1;
+note no implicit system prompt, tool schemas or history. Content is returned
+note unchanged in the OMNI1 raw field. Source-return callers may use kind 9
+note as a candidate, subject to independent resolver/compiler/verifier checks.
+note Chat never accepts TESTOUT or silently falls back to raw completions.
 note It connects only to 127.0.0.1 (offline-local: no other host, no TLS, no
 note credential) and refuses port 18091. POST /v1/completions with the prompt
 note as the whole template, greedy (top_p 0), seed 1, stream false. TESTOUT
@@ -28,6 +36,19 @@ note head, on stdout), 7 malformed response, 8 server busy (503) until less
 note than 2 s of the deadline is left: a busy server (one request at a time,
 note for example still stopping a cancelled one) is asked again every second.
 text ipath "/v1/completions"
+text ichpath "/v1/chat/completions"
+text ichflag "--chat"
+text isflag "--chat-system"
+text isrole "system"
+global iasystem ulong 1
+text ichobj "chat.completion"
+text kmsgs "messages"
+text kmsg "message"
+text krole "role"
+text kcontent "content"
+text iuser "user"
+text ktemp "temperature"
+global iachat ulong 1
 text imeth "POST"
 text ihost "Host"
 text ihostv "127.0.0.1"
@@ -138,8 +159,12 @@ x = js_winit ob
 js_wobj ob
 js_wsbuf ob kmodel 0 len kmodel
 js_wsbuf ob vollm 0 len vollm
+if eq get iachat 0 1
+ia_chbody ob pr pn
+else
 js_wsbuf ob kprompt 0 len kprompt
 js_wsbuf ob pr 0 pn
+end
 js_wsbuf ob kmaxt 0 len kmaxt
 js_wulong ob mt
 js_wsbuf ob ktopp 0 len ktopp
@@ -148,7 +173,7 @@ js_wsbuf ob kseed 0 len kseed
 js_wulong ob 1
 js_wsbuf ob kstream 0 len kstream
 js_wbool ob false
-if gt argcnt 5
+if and eq get iachat 0 0 gt argcnt 5
 tn = argread 5 tb 0 4096
 if lt tn 0
 ret neg long 1
@@ -158,6 +183,31 @@ js_wsbuf ob tb 0 ulong tn
 end
 js_wobje ob
 ret js_wdone ob
+end
+
+note Chat transport only; caller supplies all visible instructions in pr.
+fn ia_chbody ob edit uchar 16384 pr view uchar 4096 pn ulong to void
+sb = new uchar 4096 0
+js_wsbuf ob kmsgs 0 len kmsgs
+js_warr ob
+if eq get iasystem 0 1
+sn = argread 6 sb 0 3800
+js_wobj ob
+js_wsbuf ob krole 0 len krole
+js_wsbuf ob isrole 0 len isrole
+js_wsbuf ob kcontent 0 len kcontent
+js_wsbuf ob sb 0 ulong sn
+js_wobje ob
+end
+js_wobj ob
+js_wsbuf ob krole 0 len krole
+js_wsbuf ob iuser 0 len iuser
+js_wsbuf ob kcontent 0 len kcontent
+js_wsbuf ob pr 0 pn
+js_wobje ob
+js_warre ob
+js_wsbuf ob ktemp 0 len ktemp
+js_wulong ob 0
 end
 
 note Connect, send the request, read the status. The status, or negative.
@@ -172,7 +222,11 @@ r = hinit cs io int fd 0
 hsettmo cs dl dl
 hsetbdl cs dl
 r = hreqst cs io imeth
+if eq get iachat 0 1
+r = hfe r hreqtg cs io ichpath
+else
 r = hfe r hreqtg cs io ipath
+end
 r = hfe r hhname cs io ihost
 r = hfe r hhval cs io ihostv
 r = hfe r hhname cs io ictype
@@ -247,6 +301,24 @@ put m 3 ulong ct
 ret true
 end
 
+fn ia_objok rb view uchar 16384 tp view uint 65536 ob ulong to bool
+if eq get iachat 0 1
+ret js_streq rb js_off tp ob ichobj
+end
+ret js_streq rb js_off tp ob vtcomp
+end
+
+fn ia_text rb view uchar 16384 tp view uint 65536 choice ulong to ulong
+if eq get iachat 0 0
+ret ia_mem rb tp choice ktext
+end
+msg = ia_mem rb tp choice kmsg
+if eq msg jsnone
+ret jsnone
+end
+ret ia_mem rb tp msg kcontent
+end
+
 note The response body rb[0, rn): the text into tx, and m[0] text length,
 note m[1] fin, m[2] prompt tokens, m[3] completion tokens. 0 or 7.
 fn ia_resp rb view uchar 16384 rn ulong tx edit uchar 8192 m edit ulong 8 to ulong
@@ -260,7 +332,7 @@ ob = ia_mem rb tp 0 kobj
 if or eq ob jsnone ne js_type tp ob 6
 ret 7
 end
-if not js_streq rb js_off tp ob vtcomp
+if not ia_objok rb tp ob
 ret 7
 end
 ch = ia_mem rb tp 0 kchoi
@@ -271,7 +343,7 @@ c0 = js_first tp ch
 if eq c0 jsnone
 ret 7
 end
-t = ia_mem rb tp c0 ktext
+t = ia_text rb tp c0
 if or eq t jsnone ne js_type tp t 6
 ret 7
 end
@@ -496,7 +568,7 @@ end
 note The prompt (argument 4) into pr; its length, or -1 when it is empty,
 note over 3800 bytes or holds a NUL byte.
 fn ia_prompt pr edit uchar 4096 to long
-n = argread 4 pr 0 3800
+n = argread add 4 get iachat 0 pr 0 3800
 if lt n 1
 ret neg long 1
 end
@@ -511,12 +583,58 @@ end
 note Arguments PORT MAXTOK DEADLINE_S into a[0..2]; false when one is out of
 note range (port 1..65535 but never 18091, 1..256 tokens, 1..3600 s).
 fn ia_args a edit ulong 4 to bool
+sb = new uchar 4096 0
+flag = new uchar 16 0
+fl = argread 1 flag 0 16
+put iachat 0 0
+put iasystem 0 0
+if eq fl long len isflag
+same = true
+for i ulong len isflag
+if ne get flag i get isflag i
+same = false
+end
+end
+if same
+put iachat 0 1
+put iasystem 0 1
+end
+end
+if eq fl long len ichflag
+same = true
+for i ulong len ichflag
+if ne get flag i get ichflag i
+same = false
+end
+end
+if same
+put iachat 0 1
+end
+end
+shift = get iachat 0
+if eq shift 1
+if ne ulong argcnt add 6 get iasystem 0
+ret false
+end
+if eq get iasystem 0 1
+sn = argread 6 sb 0 3800
+if lt sn 1
+ret false
+end
+for i ulong ulong sn
+if eq get sb i 0
+ret false
+end
+end
+end
+else
 if or lt argcnt 5 gt argcnt 6
 ret false
 end
-port = ia_num 1
-mt = ia_num 2
-ds = ia_num 3
+end
+port = ia_num add 1 shift
+mt = ia_num add 2 shift
+ds = ia_num add 3 shift
 if or or lt port 1 gt port 65535 eq port 18091
 ret false
 end
