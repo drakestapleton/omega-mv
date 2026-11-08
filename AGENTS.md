@@ -31,7 +31,7 @@ Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) 
 
 ## Configuration
 
-- `physics.lock`, `aienos.lock`, `argus.lock`: commits of the sibling sources the full build and some gates pin. `crumb.lock`: the aien-architecture commit the retired `crumb-verify` step built the crumb tool from; kept as history (DRA-97, 2026-11-07), no gate reads it. `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
+- `physics.lock`, `aienos.lock`, `argus.lock`: commits of the sibling sources the full build and some gates pin. `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
 - `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0` on `make` builds the host suites without a physics checkout.
 - `OUT_DIR`: per-step build directory; `tests/gates/run.sh` sets it to `build/step-<name>`.
 - `.aien/always` lists the gates every commit must pass (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`); `.aien/verify.pub` is the Spark judge's public key.
@@ -64,7 +64,7 @@ Gates whose manifest lists `gb10` under `requires:` (for example the `*-silicon`
 - Receipts are content-addressed (`<name>.<sha256>.json`), name the exact commit and refuse a dirty tree. A rerun adds a file; it never replaces one.
 - Some older milestone gate scripts rewrite their receipts in place. Do not run them on a clean checkout you mean to keep; prefer the `make test-*` targets and `tests/gates/run.sh`.
 - No systemd. Offline, in-house builds.
-- Crumbs are retired from the active workflow (DRA-97, 2026-11-07): no gate or workflow checks them, and reading, writing or refreshing a `.crumb` is not a step of any change. The `.crumb` files and `.crumbignore` stay as history.
+- Crumbs are gone (removed 2026-11-08, Drake: "get rid of crumbs"). `FOLDERS.md` keeps each folder's written purpose and rules as plain notes; if your change makes one wrong, fix it in the same change.
 - Credit work in `CONTRIBUTORS.md` in the same commit as the work.
 
 ## Safety and approvals
@@ -85,5 +85,4 @@ Gates whose manifest lists `gb10` under `requires:` (for example the `*-silicon`
 - `docs/migration/C-TO-OM-INVENTORY.md`: remaining C to replace.
 - `docs/PIPELINE.md`: how a pull request is tested on the Spark.
 - `CONTRIBUTORS.md`: who built what.
-- Crumb Protocol: https://github.com/aien-spark/aien-architecture/blob/main/docs/CRUMB_PROTOCOL.md
 - The kernel Omega is meant to run on, Aienux: https://github.com/aien-dev/aienux

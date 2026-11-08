@@ -113,7 +113,6 @@ For the documented method and a systems-software case study, see Gregory M. Kurt
 
 Open a pull request with the exact command you ran and its output. Receipts are content-addressed, name the exact commit and refuse a dirty tree. Do not edit existing evidence in place. External review is expected before merge. See [CONTRIBUTORS.md](CONTRIBUTORS.md). Contact: aien@aienos.com.
 
-## Crumbs
+## Folder notes
 
-This repo used the Crumb Protocol (RFC-0001): each directory carries a `.crumb` file (what the directory is for, its rules, and a backfilled history). Crumbs are retired from the active workflow (DRA-97, 2026-11-07): no gate or workflow checks them, and reading, writing or refreshing a crumb is not a step of any change. The `.crumb` files stay as history.
-Backfilled history (marked as such, not live whispers) is in `docs/crumbs/BACKFILL.md`.
+[FOLDERS.md](FOLDERS.md) says what each folder is for and the rules it keeps. It holds the written notes from the crumb files this repo used to carry; the crumb files themselves were removed on 2026-11-08 (Drake: "get rid of crumbs", "keep the parts that worked"). Git history is the record of who changed what.

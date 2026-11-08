@@ -122,8 +122,8 @@ speed() {
 }
 
 case "$step" in
-  # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07): Crumbs are off the active
-  # workflow, so no gate checks crumb freshness. The .crumb files and crumb.lock stay as history.
+  # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07) and the crumb files are removed
+  # (2026-11-08); FOLDERS.md keeps their written notes.
   # pr-smoke.yml
   base)
     physics_pin; set -o pipefail
