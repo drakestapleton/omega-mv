@@ -1251,13 +1251,14 @@ chmod +x build/node/code-cat-main
 
 `omnode-code-cat INFER TOOL OMC ROOT WORK JDIR PORT RESOLVE CATALOG LOCK CARD OBJ...`
 is `omnode-code` on compact job files. CARD is `none`, `sig` (the signature
-lines of the card) or `full`. Before the first objective it runs
-`RESOLVE card CATALOG LOCK` once (stdout to `WORK/card.txt`, stderr to
+lines returned by `RESOLVE sig CATALOG LOCK`) or `full`. Before the first objective it runs
+`RESOLVE sig CATALOG LOCK` for `sig`, otherwise `RESOLVE card CATALOG LOCK`, once (stdout to `WORK/card.txt`, stderr to
 `WORK/card.err`) and prints `CWK variant bytes` followed by the card bytes the
 prompt carries between `Goal:` and `State:` as `Catalog:` lines. Every check
 and review job passes the same RESOLVE, CATALOG and LOCK to
 `tool checkc ROOT PATH WORK OMC KIND K N A RESOLVE CATALOG LOCK`, so the card the
-model sees and the entries the build links come from one lock. Exit 56: the
+model sees and the entries the build links use the same paths. Keep catalog and lock
+immutable for the run: this interface does not bind startup hashes to later checks. Exit 56: the
 card run failed; 57: card over 1000 bytes.
 
 `checkc` writes the compact source (after the test substitution) to `k.om`,
@@ -1270,6 +1271,21 @@ line `C c` gives `omc: line c: ...`, a catalog line `E NAME l` gives
 The loop rule holds when the compact source has a `for` line or a linked entry
 contributes one. In catalog mode the repair grammar also admits
 `ret NAME x D...` (a lowercase catalog name, x, 1..4 arguments of 1..2 digits).
+
+Signature selection does not infer record boundaries from human-readable card lines.
+The resolver supplies signatures directly, including entries without card notes.
+A resolver without the `sig` command fails startup rather than silently showing a partial card.
+
+`code-cat-test.om` composes after `code-cat.om` in place of `code-cat-main.om`.
+With no arguments it checks signature preservation, no-card and full-card selection.
+With `RESOLVE CATALOG LOCK WORK` it also executes the resolver and checks the four
+signatures in `tests/card-mixed.om` (entries with zero, one and two notes).
+Build the fixture lock with `RESOLVE ids CATALOG > LOCK`.
+
+Accounting must include each complete `CWP` prompt and `CWR` response, including
+failed and repair turns. The startup `CWK` record is not the total documentation
+cost: the selected card repeats in every prompt. Use the pinned model tokenizer
+or served prompt/generation counts, not byte counts as token estimates.
 
 ### Live coding workflow under the durable scheduler (DRA-399)
 
