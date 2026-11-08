@@ -35,7 +35,7 @@ names = sorted(os.path.join(sd, f) for f in os.listdir(sd)) if sd else \
     subprocess.run(["git", "-C", repo, "ls-files", "*.om"], capture_output=True, text=True).stdout.split()
 for f in names:
     t = open(os.path.join(repo, f), "rb").read()
-    if t.count(b"\n") <= 40 and run(omc, t) == 0:
+    if (sd or t.count(b"\n") <= 40) and run(omc, t) == 0:  # a SEEDS directory is taken whole
         seeds.append((f, t.decode("utf-8", "replace")))
 vocab = "ulong long uchar uint bool f64 f32 int 0 1 -1 255 256 65536 4294967296 1.5f64 1.5f32 \"a\" x a b s if end ret get put len new seal open view edit add sub eq lt not neg min max and shl rotr part fork trap 5 9999999 abcdefghij".split()
 if sd:  # the IR-mode search also used these words and 20 picks per token
