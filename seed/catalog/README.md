@@ -28,6 +28,7 @@ changes. Both compilers build the resolver: `seed/out/omc` and the f4 workflow p
 ```
 resolve build CATALOG LOCK COMPACT MAP    unit on stdout, map written to MAP, one ACCT line on stderr
 resolve card CATALOG LOCK                 per lock line: signature, card text, "e.g. " example
+resolve sig CATALOG LOCK                  signatures only, with identical lock/admission checks
 resolve ids CATALOG                       "NAME IDENTITY" per entry
 ```
 
@@ -233,3 +234,30 @@ What irequiv cannot cover:
 
 Arms: A is the hand program, B the compact source with `tests/lock.b`, C the compact source with
 `tests/lock.c`. Programs: the four f4 items and `big` (n = 1000000). Run it under the CPU pool lock.
+
+## Integration qualification (L994)
+
+`total.om` supplies the total first operation `add_steps(int,int,uchar)->long`.
+The original `catalog.om` remains the frozen, partial `add_times` compatibility
+experiment: neither its dictionary nor its recorded timings were silently changed.
+See [TOTAL.md](TOTAL.md) for the exact totality boundary and arithmetic checks,
+and [QUALIFICATION.md](QUALIFICATION.md) for measured failures and release limits.
+
+Catalog function, parameter and local names cannot be OM2 reserved names, even
+when selected for ordinary calls. This conservative restriction keeps one lock
+usable in either compilation mode. The lexical admission check is an effects
+filter, not a type checker. A successful resolver invocation is not acceptance:
+compile the complete unit with pinned omc, then execute the independent checks.
+For example, an integer function returning `true` resolves but omc rejects it.
+
+An explicit `target ...` followed by an explicit accepted OM2 header is preserved
+for both modes; target without OM2 is still refused when automatic promotion
+would be required. x86linux output is cross-compiled in the total gate, not
+reported as a native x86 run. I/O write failures report RESOLVE_IO; an actual
+I/O failure can leave a partial output file and must never be treated as a unit.
+Use a new output directory. Gate and measurement tools refuse existing paths.
+
+Signature consumers must invoke `sig`; card records contain one to three lines,
+so selecting every third line is invalid. Keep catalog and lock in a private
+per-run snapshot outside the model's writable workspace. One path is not an
+immutable identity, and changing both files during a session invalidates it.
