@@ -141,3 +141,5 @@ Update this table in the same commit as the work it credits.
 | Claude Opus 5.5 (EffectsClosure, omp subagent of omega-node) | Brought `seed/effects` current with keywords 227-232: table rows `eventfd` (fd, eventfd2 19), `vfioctl`/`vfioirq` (device, ioctl 29) and `vfiomap`/`vfiomapw` (device, mmap 222) with probes; `fma` excluded from closure as non-host arithmetic with a no-syscall probe, like `cpufence`/`cpurelax`. `seed/effects/check.sh` FAIL 2/50 -> PASS 50/50; compiler unchanged. |
 
 | Claude Opus 5.5 (SemCat/SemFix) and Codex (L994) | Deterministic seeded catalog resolver and negative controls; Codex integrated existing work, added total add_steps with scoped arithmetic bounds, signature-only cards, reserved-name and I/O diagnostics fixes, and independent validation. No model speedup claimed. |
+
+Codex (OpenAI): reused the standalone Omega inference client and added explicit, bounded system-role chat input for the second catalog experiment; targeted request/refusal controls, no model/runtime/compiler optimization claim.
