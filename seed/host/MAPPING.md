@@ -370,3 +370,15 @@ decoded by a second `hpack`/`xhpack` pass; no function was added (508 of 512).
 Every one of the 1357 tracked `.om` files compiles to the same bytes, exit
 status and diagnostics under `5f90edea` and `cfd96b48`, so no existing unit's
 emission changes. Gate: `seed/host/execenv/execenv.cases`.
+
+Names of up to 63 bytes (branch `omc/long-names`, OMEGESE.md 9.2) birth compiler
+`3e46f1d9bdfd9c00ebdd1abb615d038d6db998e596b58482a6bdcc131f9af5c6`
+from source
+`4da2fd20f0c40d1d7aa85ddbd45a70cc5c35c5feaa925d34907b1a3ca7bc7416`.
+No host word changes and no function was added (508 of 512). Each of the 1485
+tracked `.om` files was compiled alone for AArch64 and for `target x86linux`
+under `cfd96b48` and `3e46f1d9`: 2948 of the 2970 compiles give the same bytes,
+exit status and diagnostics; the other 22 are 11 files that were error 13 under
+`cfd96b48` and are fragments or tests of that refusal (refused either way, or
+`seed/omc/om2/s1/bad-kw-field.om`, now `kw-long-field.om`, accepted).
+Gate: `seed/omc/gate-longnames.sh`.

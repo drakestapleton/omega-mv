@@ -23,6 +23,8 @@ sh seed/omc/gate16.sh
 sh seed/omc/gate17.sh
 sh seed/omc/gate18.sh
 sh seed/omc/gate-recursion.sh
+# names of up to 63 bytes; status 3 (NOT_RUN) only for its x86 runs when qemu-x86_64 is absent, printed by the gate
+sh seed/omc/gate-longnames.sh || { r=$?; [ $r = 3 ] || exit $r; }
 # Executable contracts use the existing fail-closed Omega conductor.
 B=build/seed/contracts
 mkdir -p "$B"

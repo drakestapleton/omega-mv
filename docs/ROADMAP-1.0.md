@@ -97,8 +97,10 @@ feature anyone may want", and it never means hardware qualification beyond the t
    (`omc-diag 1 ...`) only in OM-2 units.
 6. **Capacity and naming limits block real programs.** omc holds 4096 functions per unit; om4, which
    must compile `omc.om`, held 512 (raised to 4096 by the `feat/om4-fn-table` draft), 16 registers with no spilling (error 12),
-   6 parameter slots, 8-character local names (error 13). These are implementation limits, not language
-   rules, and each needs a decision before 1.0 freezes them.
+   6 parameter slots. These are implementation limits, not language rules, and each needs a decision
+   before 1.0 freezes them. Names are decided (Drake, 2026-11-08: long names belong in the final
+   language): omc takes names of up to 63 characters for every declared name except abstract, layout,
+   layout-field and IR-mode names, which stay at 8 (OMEGESE.md 9.2, `seed/omc/gate-longnames.sh`).
 7. **A second target is merged as a draft, not qualified.** FR-9 (#923) integrates the historical
    `7eca2ac3f` backend into canonical base `6999fa9e6`; [X86-LINUX.md](X86-LINUX.md) records
    the design and actual unsupported paths. Its full fixture differential last ran EMULATED (QEMU) at
