@@ -19,6 +19,41 @@ x86linux total output is cross-compiled only. No iMac full suite was run; the
 unchanged compiler's full suite is not rerun for this additive catalog change.
 The required evidence-immutability and zero-disk-secret checks are separate.
 
+## Total-operation example (MEASURED on Spark AArch64 host CPU)
+
+`tests/total-explicit.om` and `tests/total-example.om` both return 82. All 200
+executions per arm were checked. These are one host microbenchmark batch, not
+model inference runs or a statistically qualified latency experiment.
+
+| Arm | source | lock | dictionary | full card | unit | executable |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A explicit existing helper | 151 | 0 | 0 | 0 | 151 | 376 |
+| B ordinary catalog | 58 | 75 | 226 | 148 | 161 | 376 |
+| C inline catalog | 58 | 82 | 226 | 148 | 172 | 416 |
+
+All sizes are bytes. B's source+lock+dictionary is 359 bytes, or 507 with one
+full card; C is 366, or 514 with one full card. A hypothetical batch of M builds
+charges the dictionary once and source+lock per build; documentation must be
+charged on every actual model request that contains it. No amortized inference
+benefit is inferred from this storage formula. The resolver executable, source
+and SHA256 implementation are additional preparation dependencies, pinned in
+its receipt. Building the composed resolver took 20.454971 ms in this run
+(process cold start, filesystem cache uncontrolled, not machine-cold).
+
+Means per invocation, in microseconds, from sums over 200 executions:
+
+| Arm | resolve | compile | execute |
+| --- | ---: | ---: | ---: |
+| A | 0 | 559.404865 | 163.4986 |
+| B | 547.280895 | 586.854485 | 159.97947 |
+| C | 579.571495 | 519.838795 | 161.634675 |
+
+The measured sums include process and shell-loop overhead. No variance estimate
+or causal runtime win is claimed. Raw sums and byte counts are in the appended
+content-addressed receipt. Wolfram query for these means:
+`N[{{0,111880973,32699720},{109456179,117370897,31995894},
+{115914299,103967759,32326935}}/200/1000,7]`.
+
 ## Historical frozen add_times experiment (MEASURED)
 
 These measurements belong to existing SemCat/SemAgent artifacts, not to total.om.
