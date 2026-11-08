@@ -127,10 +127,12 @@ must come with a negative control that fails.
 Current: OM-2 and irwasm are MERGED with author-run evidence only; spec missing from main; #775 fixed (#904, see Known gaps item 3);
 #789 open (fail-closed seed/secret gates). `seed/host/check.sh` runs every `seed/omc/om2/*/*.cases` file through
 `seed/qualification/om2/every.sh` (case files PASS, mutant files catch every mutant, two negative controls),
-plus the error-site fixtures and the nine qualification files that pass on the committed compiler (baseline
-guard/language/sha256/transform, sec/s4fuel candidate, selftest pass, security673 relational consumer,
-l4-tripwire, qualification); host run 2026-11-08 at omc `cfd96b48`: `OM2EVERY PASS files=26 cases=1055
-mutants=75`. Found while adding them: security673 `bindings.cases` `derive-wrong-image` fails (stdout differs
+plus the error-site fixtures and thirteen qualification files that pass on the committed compiler (baseline
+guard/language/sha256/transform, the sec s0s2/s3s4/s4fuel/s5s7 and leak candidate files, selftest pass,
+security673 relational consumer, l4-tripwire, qualification); the candidate files may skip only their declared
+`notrun` cases (54, mostly waiting on the omega-bridge ABI v2 generator and the OM-2 SHA unit), and an undeclared
+NOT_RUN is refused (third negative control); host run 2026-11-08 at omc `cfd96b48`: `OM2EVERY PASS files=30
+cases=1554 skipped_declared=54 mutants=75`. Found while adding them: security673 `bindings.cases` `derive-wrong-image` fails (stdout differs
 at byte 96): its stored `evidence/run3/embed.bin` is 2184 bytes from 2026-10-30, today's omc emits 2308 for
 `embed.om`, so that pin is stale and needs re-deriving by its owner; the file stays out of `every.sh` until then. The `OMEGA-SEED` manifest
 item below is still open.
