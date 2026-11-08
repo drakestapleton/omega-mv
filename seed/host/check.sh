@@ -45,6 +45,8 @@ grep -qx 'OM2GATE FAIL cases=16 pass=7 fail=9 invalid=0 not_run=0' "$run/s5mut.l
 [ "$(grep -c '^VERDICT ctl-[a-z-]* PASS ' "$run/s5mut.log")" = 7 ]
 [ "$(grep -c '^VERDICT m-[a-z0-9]* FAIL ' "$run/s5mut.log")" = 9 ]
 echo 'PASS dit/scrub (21 cases) and 9 omc.om mutants detected'
+# Every OM-2 case and mutant file (s1..s5, bnd, fnhost, hex), with two negative controls (ROADMAP-1.0 RM1).
+sh seed/qualification/om2/every.sh
 if "$B/gate" seed/out/omc "$pin" seed/omc/contracts/mutant.cases "$run/mutant" > "$run/mutant.log"; then
     echo 'FAIL contract-enforcement mutant survived' >&2
     exit 1

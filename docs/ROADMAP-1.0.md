@@ -85,7 +85,9 @@ feature anyone may want", and it never means hardware qualification beyond the t
 3. **Open compiler defect #775.** An empty `text` passed to `view uchar *` reports the following text's
    bytes (reported count 32 instead of 0, reported on `e623d440` and stated to share main's code).
    Not reproduced in this audit (no builds were run). It is a memory-safety boundary: the callee
-   reads bytes it was not given.
+   reads bytes it was not given. Update 2026-11-08: fixed on main by #904 (`e2662fff`, 2026-10-28) with
+   fixtures `s4-v-text-empty*` and the mutant `m-textlen` in `seed/omc/om2/s4`; both pass at omc `cfd96b48`
+   and now run in `seed/host/check.sh` through `seed/qualification/om2/every.sh`.
 4. **Stale status text.** `README.md` line 5 says the seeded compiler is in candidate branches (line
    27 of the same file says it is on main since #696). `OM2-TUTORIAL.md` says the OM-2 stack is draft and
    main compiles OM-1 only. `OM_COMPLETION.md` (2026-10-23) quotes a 7,208-line compiler. `seed/host/README.md`
@@ -122,8 +124,11 @@ must come with a negative control that fails.
 
 ### RM1. Ground truth and gate coverage
 
-Current: OM-2 and irwasm are MERGED with author-run evidence only; spec missing from main; #775 open;
-#789 open (fail-closed seed/secret gates).
+Current: OM-2 and irwasm are MERGED with author-run evidence only; spec missing from main; #775 fixed (#904, see Known gaps item 3);
+#789 open (fail-closed seed/secret gates). `seed/host/check.sh` runs every `seed/omc/om2/*/*.cases` file through
+`seed/qualification/om2/every.sh` (case files PASS, mutant files catch every mutant, two negative controls);
+host run 2026-11-08 at omc `cfd96b48`: `OM2EVERY PASS files=16 cases=347 mutants=75`. The `OMEGA-SEED` manifest
+item below is still open.
 
 Gap: a single gate run cannot currently show that every merged compiler path still works.
 
