@@ -284,7 +284,10 @@ namespace. gate15 refuses 33 minimal programs at their exact `omc: line L: error
 1..25 and 27..30, 24 with its accept side, 30 including IR-mode contract lines from #791) and runs
 `seed/omc/codereg.om`, which fails on a site without a row, a row without a site, an OMEGESE §9.14 /
 §11.1 row that differs from the registry, or a registry case that did not refuse. Machine records
-exist only in OM-2 `diag` mode (#655 owns incremental feedback).
+exist only in OM-2 `diag` mode (#655 owns incremental feedback). Site coverage (2026-11-08): `seed/omc/sitecov.sh`
+changes one `fail N` site at a time to code 97 and replays every refused tracked input; 239 of 583 sites are
+reached (195 before the 46 fixtures in `seed/omc/sites`), and `seed/host/check.sh` fails if that falls below
+`seed/omc/sitecov.floor`. The 344 unreached sites (list in its `sites.tsv`) are the fixture backlog.
 
 Acceptance:
 - A code registry in the language doc: every code, its meaning, the obligation, and one minimal

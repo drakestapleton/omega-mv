@@ -1,5 +1,6 @@
 #!/bin/sh
-# every.sh -- run seed/qualification/om2/gate.om over EVERY seed/omc/om2/*/*.cases file (ROADMAP-1.0 RM1),
+# every.sh -- run seed/qualification/om2/gate.om over EVERY seed/omc/om2/*/*.cases file (ROADMAP-1.0 RM1)
+# and the error-site fixtures seed/omc/sites/*.cases (RM8),
 # so a regression in any OM-2 stage is visible to seed/host/check.sh, not only s5.
 # A case file must PASS with fail=0 invalid=0 not_run=0. A mutant file (*mutants.cases) must make the
 # gate exit 1 with every ctl-* case PASS, every other case FAIL (the mutant was caught) and none
@@ -43,7 +44,7 @@ run() {
     judge "$1" "$B/$2.log" "$st" && echo "$n"
 }
 files=0 cases=0 muts=0
-for c in seed/omc/om2/*/*.cases; do
+for c in seed/omc/om2/*/*.cases seed/omc/sites/*.cases; do
     t=$(echo "$c" | tr / _)
     n=$(run "$c" "$t") || bad "$c: $n (log $B/$t.log)"
     case "$c" in *mutants.cases) muts=$((muts + n)) ;; *) cases=$((cases + n)) ;; esac
