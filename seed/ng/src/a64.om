@@ -851,6 +851,11 @@ global a_vx uchar 262144
 global a_vr uchar 262144
 global a_vsl ulong 262144
 global a_vnx ulong 262144
+note a_vln[w] = the length wire of slice value wire w, plus 1 (0: not a slice); a_mal the machine argument list of
+note one call or of the function's parameters (a6_xcall, a6_xpar), a_man its length
+global a_vln ulong 262144
+global a_mal ulong 136
+global a_man ulong 1
 global a_bh ulong 65536
 global a_bst ulong 65536
 global a_ben ulong 65536
@@ -1345,7 +1350,7 @@ while lt r 32 bound 32
 put a_ract r 0
 r = add r 1
 end
-put a_fs 4 0
+put a_fs 4 a6_outm
 put a_fs 5 0
 q = ulong 0
 while le q np bound 4194305
@@ -1706,12 +1711,134 @@ end
 
 note move location of value v: its register, or 64 + its slot
 fn a6_loc v ulong to ulong
-w = a6_wi v
+ret a6_wloc a6_wi v
+end
+
+fn a6_wloc w ulong to ulong
 r = ulong get a_vr w
 if lt r 32
 ret r
 end
 ret add 64 sub get a_vsl w 1
+end
+
+note ---- SLICE values (IR.md s4.2 kind 5): two wires. The value's own wire holds the address of element 0; its length
+note wire (a6_shw: same interval, allocated like any wire) holds the element count. Every move of a slice moves both:
+note block arguments (a6_mvv), call arguments and parameters (two machine argument positions, a6_xv) ----
+fn a6_issl v ulong to bool
+ret eq get i_tk a6_vty v 5
+end
+
+fn a6_lw v ulong to ulong
+ret sub get a_vln a6_wi v 1
+end
+
+note a6_lsrc v s: a register holding slice v's element count (its length wire's own, or scratch s loaded from its slot)
+fn a6_lsrc v ulong s ulong to ulong
+l = a6_wloc a6_lw v
+if lt l 32
+ret l
+end
+a6_ew a_ldrx s 31 sub l 64 0 0
+ret s
+end
+
+note a6_mvv d s: value d = value s in the pending parallel move (both wires of a slice)
+fn a6_mvv d ulong s ulong to void
+a6_mvadd a6_loc d a6_loc s
+if a6_issl d
+a6_mvadd a6_wloc a6_lw d a6_wloc a6_lw s
+end
+end
+
+note a6_xv v: append v's machine arguments (one location, two for a slice) to a_mal
+fn a6_xv v ulong to void
+n = get a_man 0
+if ge add n 2 len a_mal
+a6_unsup n
+end
+put a_mal n a6_loc v
+n = add n 1
+if a6_issl v
+put a_mal n a6_wloc a6_lw v
+n = add n 1
+end
+put a_man 0 n
+end
+
+note a6_xcall o: the locations of call o's machine arguments in a_mal; their count
+fn a6_xcall o ulong to ulong
+put a_man 0 0
+n = sub ulong get i_ona o 2
+k = ulong 0
+while lt k n bound 65
+a6_xv a6_arg o add k 2
+k = add k 1
+end
+ret get a_man 0
+end
+
+note a6_xpar f: the locations of f's machine parameters in a_mal; their count
+fn a6_xpar f ulong to ulong
+put a_man 0 0
+p = ulong get i_fp1 f
+while ne p 0 bound 65
+a6_xv p
+p = ulong get i_vnx p
+end
+ret get a_man 0
+end
+
+note a6_xcnt o: the number of machine arguments of call o (before allocation: a6_outm sizes the frame with it)
+fn a6_xcnt o ulong to ulong
+n = sub ulong get i_ona o 2
+m = n
+k = ulong 0
+while lt k n bound 65
+if a6_issl a6_arg o add k 2
+m = add m 1
+end
+k = add k 1
+end
+ret m
+end
+
+note a6_shw: one length wire per slice value, with the value's interval (after a6_ivlive)
+fn a6_shw to void
+n = get a_fs 0
+w = ulong 0
+while lt w n bound 262144
+put a_vln w 0
+w = add w 1
+end
+w = ulong 0
+while lt w n bound 262144
+if a6_wsl get a_vh w
+m = get a_fs 0
+if ge m a_maxv
+a6_unsup m
+end
+put a_vln w add m 1
+put a_vh m 0
+put a_vsl m 0
+put a_vx m 0
+put a_vr m 255
+put a_vs m get a_vs w
+put a_ve m get a_ve w
+put a_fs 0 add m 1
+end
+w = add w 1
+end
+end
+
+fn a6_wsl v ulong to bool
+if eq v 0
+ret false
+end
+if a6_istk v
+ret false
+end
+ret a6_issl v
 end
 
 fn a6_movi r ulong v ulong to void
@@ -1846,6 +1973,12 @@ end
 note ---- selection ----
 fn a6_sel o ulong x ulong to void
 op = ulong get i_oop o
+r = ulong get i_ors o
+if ne r 0
+if and ne op 54 a6_issl r
+a6_unsup op
+end
+end
 if eq op 1
 a6_sconst o
 ret
@@ -1888,9 +2021,9 @@ end
 a6_unsup op
 end
 
-note ---- memory (IR.md s7.5): a REF is the address of its object in one register; only REF to ARRAY of bool or
-note integers, and only these ops: load, store, alloca, gaddr, len. Coverage (s8) is ngcheck's: an access here
-note follows the check that covers it ----
+note ---- memory (IR.md s7.5): a REF is the address of its object in one register, a SLICE its address and count wires;
+note only REF to ARRAY or SLICE of bool or integers, and only these ops: load, store, alloca, gaddr, len, slice, fill.
+note Coverage (s8) is ngcheck's: an access here follows the check that covers it ----
 fn a6_smem o ulong op ulong to void
 if eq op 42
 a6_sload o
@@ -1912,11 +2045,48 @@ a6_fin r d
 ret
 end
 if eq op 53
+if a6_issl a6_arg o 0
+a6_mov d a6_lsrc a6_arg o 0 17
+else
 a6_movi d a6_alen a6_arg o 0
+end
 a6_fin r d
 ret
 end
+if eq op 54
+a6_sslc o
+ret
+end
+if eq op 51
+a6_sfill o
+ret
+end
 a6_unsup op
+end
+
+note fill tok r v (op 51): every element of r (a REF to an ARRAY, count from the type, or a SLICE, count from its length
+note wire) = v, as X15 = count; CBZ X15 past the loop; loop: SUBS X15, X15, #1; STR v, [base, X15, LSL #size];
+note B.NE loop (stores run from the last element down to element 0; r and v stay in their registers)
+fn a6_sfill o ulong to void
+v = a6_arg o 2
+t = a6_vty v
+if not a6_isint t
+a6_unsup t
+end
+a = a6_arg o 1
+a6_aref a
+b = a6_src a 16
+x = a6_src v 17
+if a6_issl a
+c = a6_lsrc a 15
+a6_mov 15 c
+else
+a6_movi 15 a6_alen a
+end
+a6_ew a_cbzx 15 4 0 0 0
+a6_ew a_subsxi 15 15 1 0 0
+a6_ew a6_stf t x b 15 a6_sh1 t 0
+a6_ew a_bcond 1 sub ulong 0 2 0 0 0
 end
 
 note a6_alen v: the element count of the ARRAY that REF v refers to
@@ -1980,8 +2150,58 @@ end
 ret 1
 end
 
+note a6_aref v: v is a REF to an ARRAY or a SLICE of bool or integer elements (refused otherwise)
 fn a6_aref v ulong to void
+if a6_issl v
+e = ulong get i_t1 a6_vty v
+if not a6_isint e
+a6_unsup e
+end
+ret
+end
 n = a6_alen v
+end
+
+note a6_lsz t: log2 of the byte size of element type t (bool and the integers)
+fn a6_lsz t ulong to ulong
+w = a6_wid t
+if le w 8
+ret 0
+end
+if eq w 16
+ret 1
+end
+if eq w 32
+ret 2
+end
+ret 3
+end
+
+note slice r off n: x16 = address of element off (b + off << log2 size), x15 = n (operands read before either result
+note wire is written: both may reuse operand registers), then the value's wire and its length wire
+fn a6_sslc o ulong to void
+r = ulong get i_ors o
+e = ulong get i_t1 a6_vty r
+if not a6_isint e
+a6_unsup e
+end
+a6_aref a6_arg o 1
+b = a6_src a6_arg o 1 16
+f = a6_src a6_arg o 2 17
+a6_ew a_addx 16 b f 0 a6_lsz e
+n = a6_src a6_arg o 3 17
+a6_mov 15 n
+d = a6_dst r
+if ne d 16
+a6_mov d 16
+end
+a6_fin r d
+l = a6_wloc a6_lw r
+if lt l 32
+a6_mov l 15
+else
+a6_ew a_strx 15 31 sub l 64 0 0
+end
 end
 
 fn a6_sload o ulong to void
@@ -2034,9 +2254,23 @@ a6_ew a_bcond 1 sub ulong 0 2 0 0 0
 end
 
 note ---- host words (IR.md s7.11): read 53 and write 54, as Linux SVC 63 and 64 (x0 fd, x1 address, x2 count,
-note x8 number; the kernel returns the count or minus errno in x0 and preserves every other register) ----
+note x8 number; the kernel returns the count or minus errno in x0 and preserves every other register); cpufence 199
+note as DSB SY (d5033f9f) and cpurelax 200 as YIELD (d503203f), omc's words (omc.om cpufence/cpurelax notes); monons
+note 109 and realns 130 as omc's hclock (a6_hclk below) ----
 fn a6_shost o ulong to void
 w = get i_oim o
+if eq w 199
+a6_emitw 0xd5033f9f
+ret
+end
+if eq w 200
+a6_emitw 0xd503203f
+ret
+end
+if or eq w 109 eq w 130
+a6_hclk o w
+ret
+end
 nr = ulong 64
 if eq w 53
 nr = 63
@@ -2056,6 +2290,42 @@ a6_mvadd 2 a6_loc a6_arg o 4
 a6_pmove
 a6_ew a_movzx 8 nr 0 0 0
 a6_ew a_svc 0 0 0 0 0
+r = ulong get i_ors o
+if ne r 0
+a6_mvfrom r 0
+end
+end
+
+note monons 109 and realns 130 as omc's hclock: SVC 113 clock_gettime(CLOCK_MONOTONIC 1 / CLOCK_REALTIME 0) into a
+note 16-byte area below SP (stack floor checked, trap 6), result sec * 10^9 + nsec with omc's traps (sec above
+note 9223372036: B.HI trap 1; the add: B.VS trap 1); a failed call returns x0 (minus errno). The area is zeroed first,
+note so a failed call reads 0 and 0 and cannot trap; CSEL LT then picks x0, which omc reaches by a branch. x0..x3, x8
+note are scratch (a host word counts as a call for allocation).
+fn a6_hclk o ulong w ulong to void
+ck = ulong 1
+if eq w 130
+ck = ulong 0
+end
+a6_ew a_subxi 31 31 16 0 0
+a6_ew a_subsxe 31 31 28 3 0
+a6_fx a_bcond 3 1006
+a6_ew a_stpx 31 31 31 0 0
+a6_ew a_movzx 0 ck 0 0 0
+a6_ew a_addxi 1 31 0 0 0
+a6_ew a_movzx 8 113 0 0 0
+a6_ew a_svc 0 0 0 0 0
+a6_ew a_ldrx 1 31 0 0 0
+a6_ew a_ldrx 2 31 1 0 0
+a6_movi 3 9223372036
+a6_ew a_subsx 31 1 3 0 0
+a6_fx a_bcond 8 1001
+a6_movi 3 1000000000
+a6_ew a_mulx 1 1 3 0 0
+a6_ew a_addsx 2 1 2 0 0
+a6_fx a_bcond 6 1001
+a6_ew a_subsxi 31 0 0 0 0
+a6_ew a_cselx 0 0 2 11 0
+a6_ew a_addxi 31 31 16 0 0
 r = ulong get i_ors o
 if ne r 0
 a6_mvfrom r 0
@@ -2329,6 +2599,9 @@ if eq op 62
 a6_epi
 end
 if eq op 63
+if a6_issl a6_arg o 1
+a6_unsup 5
+end
 a6_mvto 0 a6_arg o 1
 if ne get a_fs 14 0
 a6_tsum 0 0
@@ -2365,7 +2638,7 @@ a6_mvclr
 p = ulong get i_vnx get i_bp1 t
 k = ulong 2
 while ne p 0 bound 65
-a6_mvadd a6_loc p a6_loc a6_arg o k
+a6_mvv p a6_arg o k
 p = ulong get i_vnx p
 k = add k 1
 end
@@ -2390,16 +2663,25 @@ a6_fx a_b 0 bf
 end
 end
 
-note call: arguments to x0..x7 (one parallel move), BL (fixed up when every function is placed), result from x0
+note call: arguments 8.. to the outgoing area [sp, 8j] (the first a6_outm slots of the frame), arguments 0..7 to
+note x0..x7 (one parallel move), BL (fixed up when every function is placed), result from x0
 fn a6_scall o ulong to void
-n = sub ulong get i_ona o 2
-if gt n 8
-a6_unsup n
+n = a6_xcall o
+k = ulong 8
+while lt k n bound 137
+l = get a_mal k
+if lt l 32
+a6_ew a_strx l 31 sub k 8 0 0
+else
+a6_ew a_ldrx 16 31 sub l 64 0 0
+a6_ew a_strx 16 31 sub k 8 0 0
+end
+k = add k 1
 end
 a6_mvclr
 k = ulong 0
-while lt k n bound 8
-a6_mvadd k a6_loc a6_arg o add k 2
+while and lt k n lt k 8 bound 8
+a6_mvadd k get a_mal k
 k = add k 1
 end
 a6_pmove
@@ -2474,10 +2756,38 @@ end
 a6_unsup op
 end
 
+note chk.bounds on a SLICE r: trap when e = 0, e > len r (B.LO on the borrow of len - e) or i > len r - e
+fn a6_cbsl o ulong c ulong to void
+i = a6_src a6_arg o 2 16
+e = a6_src a6_arg o 3 17
+a6_fx a_cbzx e add 1000 c
+l = a6_lsrc a6_arg o 1 15
+a6_ew a_subsx 15 l e 0 0
+a6_fx a_bcond 3 add 1000 c
+a6_ew a_subsx 31 i 15 0 0
+a6_fx a_bcond 8 add 1000 c
+end
+
+note chk.slice on a SLICE r: trap when off > len r or n > len r - off
+fn a6_csls o ulong c ulong to void
+f = a6_src a6_arg o 2 16
+n = a6_src a6_arg o 3 17
+l = a6_lsrc a6_arg o 1 15
+a6_ew a_subsx 31 f l 0 0
+a6_fx a_bcond 8 add 1000 c
+a6_ew a_subx 15 l f 0 0
+a6_ew a_subsx 31 n 15 0 0
+a6_fx a_bcond 8 add 1000 c
+end
+
 note chk.bounds r i e: trap when i + e > len r or e = 0. A constant e (the covering form of every load and store,
 note s8) is one compare of i with len - e (B.HI: unsigned, exact, no add that could wrap); e = 0 or e > len always
 note traps; any other e computes len - e first (B.LO on a borrow)
 fn a6_cbnd o ulong c ulong to void
+if a6_issl a6_arg o 1
+a6_cbsl o c
+ret
+end
 l = a6_alen a6_arg o 1
 v = a6_arg o 3
 i = a6_src a6_arg o 2 16
@@ -2502,6 +2812,10 @@ end
 
 note chk.slice r off n: trap when off > len r or n > len r - off
 fn a6_cslc o ulong c ulong to void
+if a6_issl a6_arg o 1
+a6_csls o c
+ret
+end
 l = a6_alen a6_arg o 1
 f = a6_src a6_arg o 2 16
 n = a6_src a6_arg o 3 17
@@ -2860,7 +3174,7 @@ a6_mvclr
 p = ulong get i_fp1 get a_fs 8
 k = ulong 2
 while ne p 0 bound 65
-a6_mvadd a6_loc p a6_loc a6_arg o k
+a6_mvv p a6_arg o k
 p = ulong get i_vnx p
 k = add k 1
 end
@@ -2895,6 +3209,7 @@ a6_ivinit
 a6_ivuse
 a6_ivlive
 a6_tacc
+a6_shw
 a6_ivcross
 a6_scan
 a6_frame
@@ -2909,6 +3224,49 @@ a6_emitw 0xd503201f
 end
 end
 
+note a6_outm: the outgoing argument slots of the function, the most arguments past the eighth of any of its calls;
+note they are frame slots 0.. (spill slots follow), so the callee finds argument 8+j at its [sp + frame + 8j]
+fn a6_outm to ulong
+m = ulong 0
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+if eq get i_oop o 64
+n = a6_xcnt o
+if gt n add m 8
+m = sub n 8
+end
+end
+o = ulong get i_onx o
+end
+x = add x 1
+end
+ret m
+end
+
+note a6_inpar n: machine parameters 8.. of the n in a_mal (a6_xpar) from the caller's outgoing area through x17 = sp +
+note frame
+fn a6_inpar n ulong to void
+if le n 8
+ret
+end
+f = get a_fs 7
+a6_ew a_addxi 17 31 shr f 12 1 0
+a6_ew a_addxi 17 17 and f 4095 0 0
+j = ulong 0
+while lt add j 8 n bound 129
+d = get a_mal add j 8
+if lt d 32
+a6_ew a_ldrx d 17 j 0 0
+else
+a6_ew a_ldrx 16 17 j 0 0
+a6_ew a_strx 16 31 sub d 64 0 0
+end
+j = add j 1
+end
+end
+
 fn a6_fbody f ulong to void
 a6_al64
 put a_fpc f get a_cn 0
@@ -2916,17 +3274,14 @@ put a_fs 12 0
 put a_fs 10 0
 a6_pro
 a6_mvclr
-p = ulong get i_fp1 f
+n = a6_xpar f
 k = ulong 0
-while ne p 0 bound 65
-if ge k 8
-a6_unsup k
-end
-a6_mvadd a6_loc p k
-p = ulong get i_vnx p
+while and lt k n lt k 8 bound 9
+a6_mvadd get a_mal k k
 k = add k 1
 end
 a6_pmove
+a6_inpar n
 if ne get a_fs 14 0
 l = a6_accl
 if lt l 32
