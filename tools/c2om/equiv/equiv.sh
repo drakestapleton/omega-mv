@@ -58,13 +58,7 @@ say "C oracle     $C_COMMIT = $csha ($C_FILES), $(gcc --version | head -1)"
 
 # 3. second oracle: the spec-only interpreter, pinned
 rsha=$(git rev-parse "$REF_COMMIT^{commit}")
-if [ ! -x "$B/../omega_ref-$rsha/omega_ref" ]; then
-  if [ -d "$B/../omega_ref-$rsha.src" ]; then find "$B/../omega_ref-$rsha.src" -depth -delete; fi; mkdir -p "$B/../omega_ref-$rsha.src" "$B/../omega_ref-$rsha"
-  git archive "$rsha" tools/omega_ref | tar -x -C "$B/../omega_ref-$rsha.src"
-  quiet-build gcc -std=gnu11 -O2 -Wall -o "$B/../omega_ref-$rsha/omega_ref" "$B/../omega_ref-$rsha.src/tools/omega_ref/omega_ref.c" \
-    > "$B/refbuild.out" 2>&1 || fail "omega_ref build: $(tail -3 "$B/refbuild.out")"
-fi
-REF=$B/../omega_ref-$rsha/omega_ref
+REF=$(tools/c2om/omega-ref.sh "$B/.." "$rsha" 2> "$B/refbuild.out") || fail "omega_ref build: $(tail -3 "$B/refbuild.out")"
 say "interpreter  tools/omega_ref at $rsha"
 
 # 4. the Omega build, by omc only
