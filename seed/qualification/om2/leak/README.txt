@@ -125,21 +125,27 @@ line. The three rules (every other store, and every UNKNOWN or UNHANDLED reached
    export or to dead code). Sound only together with the all-exports obligation, printed as PUBLIC-OBLIGATION
    whenever A > 0: the declaration is true at the entry of every call, by induction over call sequences, only
    if every export that can write the declared range is scanned with the same declaration and none reports
-   PUBLIC-MEM-REVOKED. One run scans one entry. sha-exports.sh runs every export of the SHA artifact and
-   prints MET or NOT_MET. The pair e14-unreached.om / e14-other-export.om is one set of functions with the
-   entry swapped: the store is excused from f and revokes from g. An export that takes no pointer to the
-   declared object (SHA hash) is outside the obligation: it can reach that object only through a pointer the
-   caller aliases to it, the same caller assertion as pub itself.
- 2 stack-below-entry-sp. R is the SP at entry of the scanned export. Token 8 is an UPPER bound u on an address
-   relative to R (address <= R+u): the SP starts at u=0, SUB/ADD SP move it, ADD Xd,SP,#imm and sums with
-   constants or value ranges propagate it through registers, spill slots, call arguments and returns, and
-   joins keep the larger bound (at most 250 widenings, then unknown). A store is excused when
-   u + displacement + index high + size <= 0, so its last byte is below R. This is the same separation the
-   existing SP+immediate spill exemption uses (memory below the entry SP is not caller memory: a live caller
-   object there would be overwritten by signal frames and by the callee's own frames), applied to pointers
-   computed from SP. It is NOT the A1 array-bounds invariant: no array length
-   is assumed for a pointer passed between functions or for a layout field. A callee that writes beyond the
-   array the caller passed reaches R or higher and revokes (e14-stack-over.S: one byte past, SP+16 = R).
+   PUBLIC-MEM-REVOKED. One run scans one entry; which exports belong to the obligation is decided by the
+   driver, not by the scanner. sha-exports.sh runs every export of the SHA artifact and prints MET or NOT_MET.
+   The pair e14-unreached.om / e14-other-export.om is one set of functions with the entry swapped: the store
+   is excused from f and revokes from g. sha-exports.sh leaves `hash` out of the obligation because it takes no
+   pointer to ctx: it could write the declared field only through an `out` pointer the caller aliased to ctx.
+   That exclusion is an ASSUMPTION of the same kind as the one final needs (PROPOSAL-E14-final-out.txt): it is
+   not proved by the scanner and stays open until L835 / Drake decide.
+ 2 stack-below-entry-sp. R is the SP at entry of the scanned export. Token 8 is an INTERVAL l..u on an address
+   relative to R (address in R+l .. R+u, 24-bit signed bounds, deeper than 8 MiB is unknown). The SP starts at
+   [0,0]; SUB/ADD SP move it; ADD Xd,SP,#imm and sums with constants or value ranges move the interval through
+   registers, spill slots, call arguments and returns; joins keep the hull (at most 250 widenings, then
+   unknown). rvsplo takes Lmin, the lowest SP lower bound over every reached word (unknown if any reached word
+   has no SP interval). A store is excused only when BOTH u + displacement + index high + size <= 0 (its last
+   byte is below R) AND l + displacement + index low >= Lmin (its first byte is in memory the SP register has
+   covered during the walk). That is exactly the memory the existing SP+immediate spill exemption trusts
+   (slotok: between the SP and the function's entry SP), generalised from SP+immediate addressing to pointers
+   computed from SP. Without the lower bound, a pointer such as SP - 0x2aaa00000000 would be excused although
+   it is a heap address (L1039 review P1; e14-stack-far.S, e14-stack-far2.S). It is NOT the A1 array-bounds
+   invariant: no array length is assumed for a pointer passed between functions or for a layout field. A
+   callee that writes beyond the array the caller passed reaches R or higher (e14-stack-over.S: SP+16 = R) or
+   below the lowest SP (e14-stack-below.S: SP-1) and revokes.
  3 bounded-offset. The address is an exact entry-slot token plus displacement plus an index register whose
    value range lo..hi is known (token 9, 24-bit bounds). Ranges come from constants, known-zero masks (AND
    with a mask), sums of ranges and constants, and a dominating check: CMP Xn,#imm or CMP Xn,Xm (64 bit)
@@ -152,19 +158,22 @@ Not added: any disjointness between different entry slots. The 32 digest bytes t
 its `out` pointer still revoke pub:0:32:8 (PROPOSAL-E14-final-out.txt names the trust change that would be
 needed). e14 also stops treating ADD Xd,SP,Xm,ext as a constant (Rn 31 is SP there, in both modes).
 E14 fixtures (leak/fixtures, expected reports in leak/expected, gate rows in leak.cases and candidate.cases):
-e14-stack.om stack positive; e14-stack-edge.S last byte of a 16-byte array (SP+15) positive; e14-stack-over.S
-SP+16 negative; e14-bounded.om c[40+(i&63)] positive; e14-bounded-low.om c[i&127] negative; e14-refine.om
-dominating check then c[40+i] positive; e14-refine-edge.om check i<32 then c[i] positive at the edge;
-e14-refine-low.om c[33+i] negative; e14-unreached.om / e14-other-export.om; e14-flag-ok.S positive and
-e14-stale-reg.S / e14-stale-flags.S negatives; pub-secret.bin and pub-unknown.bin rescanned with e14 still
-revoke. The .S fixtures are hand-assembled with GNU as 2.42 (aarch64-linux-gnu-as, objcopy -O binary -j
-.text; oracle only; not part of the delivered closure) because omc type-checks array sizes across calls and
-cannot express a callee that outruns the caller's array. E14 expected reports were produced by this scanner
-and then checked against objdump 2.42 offsets (oracle/leak/xcheck.py AGREE for every one) and against the
-premises written in each fixture's header; they are not hand-derived from construction like the E13 set.
-Mutants (leak/mutants, exact once, killed by the named fixture): e14nostack/e14edge (stack bound removed or
-off by one byte) by e14-stack-over, e14noreach by e14-other-export, e14nolow by e14-bounded-low, e14off1 by
-e14-refine-edge, e14norefine by e14-refine, e14noclearreg/e14noclearflags by e14-stale-reg/-flags.
+e14-stack.om stack positive; e14-stack-edge.S last byte of a 16-byte array (SP+15) positive; e14-stack-low.S
+first byte [SP] positive; e14-stack-over.S SP+16 negative; e14-stack-below.S SP-1 negative; e14-stack-far.S
+and e14-stack-far2.S SP minus a huge or an 8 MiB constant negative; e14-bounded.om c[40+(i&63)] positive;
+e14-bounded-low.om c[i&127] negative; e14-refine.om dominating check then c[40+i] positive; e14-refine-edge.om
+check i<32 then c[i] positive at the edge; e14-refine-low.om c[33+i] negative; e14-unreached.om /
+e14-other-export.om; e14-flag-ok.S positive and e14-stale-reg.S / e14-stale-flags.S negatives; pub-secret.bin
+and pub-unknown.bin rescanned with e14 still revoke. The .S fixtures are hand-assembled with GNU as 2.42
+(aarch64-linux-gnu-as, objcopy -O binary -j .text; oracle only; not part of the delivered closure) because
+omc type-checks array sizes across calls and cannot express a callee that outruns the caller's array. E14
+expected reports were produced by this scanner and then checked against objdump 2.42 offsets
+(oracle/leak/xcheck.py AGREE for every one) and against the premises written in each fixture's header; they
+are not hand-derived from construction like the E13 set.
+Mutants (leak/mutants, exact once, killed by the named fixture): e14nostack/e14edge (stack upper bound removed
+or off by one byte) by e14-stack-over, e14nolow8 (stack lower bound removed) by e14-stack-far2/-below (e14-stack-far.S is refused earlier: -0x2aaa00000000 does not fit the 24-bit stack interval),
+e14noreach by e14-other-export, e14nolow by e14-bounded-low, e14off1 by e14-refine-edge, e14norefine by
+e14-refine, e14noclearreg/e14noclearflags by e14-stale-reg/-flags.
 
 Cases/evidence (all paths relative to seed/qualification/om2)
 leak/leak.cases runs now under 734f0a39; leak/candidate.cases runs common cases under a candidate and

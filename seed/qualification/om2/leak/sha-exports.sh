@@ -11,7 +11,9 @@
 # signatures: init x0=c; update x0=c x1=d.ptr x2=d.len; final x0=c x1=out; hash x0=d.ptr x1=d.len x2=out.
 # pub:0:32:8 is the E11 declaration of `field count ulong at 32` for the exports that take c (init, update,
 # final). hash takes no context. The all-exports obligation printed by e14 is met only when no export that
-# takes c reports PUBLIC-MEM-REVOKED.
+# takes c reports PUBLIC-MEM-REVOKED. hash is left out of the obligation as an ASSUMPTION (its `out` digest
+# could only reach ctx if the caller aliased it; the binding refuses that): not proved by the scanner, see
+# PROPOSAL-E14-final-out.txt.
 set -u
 S=$1
 A=$2
