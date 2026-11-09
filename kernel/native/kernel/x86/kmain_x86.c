@@ -1189,7 +1189,10 @@ static void courier_step(void)
             for (unsigned i = 0; text[i] && said_n + 1 < sizeof said; i++)
                 said[said_n++] = text[i];
             said[said_n] = 0;
-            ck_allen_ui_said(0, said, ck_rdtsc());
+            if (part >= 2)
+                ck_allen_ui_said_more(said, ck_rdtsc());
+            else
+                ck_allen_ui_said(0, said, ck_rdtsc());
         }
         if (total && part >= total) { /* the last part: the answer is whole */
             if (!said_n) {
