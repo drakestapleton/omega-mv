@@ -758,6 +758,111 @@ bracketed by the same step bounds.
 | an id shared by two ready jobs accepted (`sched_propose` takes the last) | 127 |
 | incarnation marks the values scored (`sched_incarnate` sets the last scoring to the new version) | 128: the values stay 0, so the key falls to the estimate and the unrelated job (no estimate) runs |
 
+### Receipt driver (schedrcpt.om)
+
+`schedrcpt.om` produces the scheduler-policy receipts. It is a seeded Omega
+program: `json.om` is appended for the JSON reader, and the SHA-256 functions
+are copied from `om/sha256/sha256-om2.om` (lines 21-317 at 7f4e1a44). Build it
+with the in-tree compiler:
+
+```
+mkdir -p build/node
+cat seed/node/schedrcpt.om seed/json/json.om | seed/out/omc > build/node/schedrcpt
+chmod 755 build/node/schedrcpt
+```
+
+With omc 5f90edea this gives a driver binary of sha256 `ece552af...`, the
+`script.binary_sha256` in every receipt under `evidence/node-schedpol/` written
+since the driver replaced the Python one.
+
+The case files are in `seed/node/schedrcpt-cases/`, one per issue:
+`cases-395n.json` (DRA-395) through `cases-399n.json` (DRA-399). Each receipt
+embeds the case file it ran (`script.cases`) and its sha256
+(`script.cases_sha256`). The receipts of the stack's current heads name these
+files' hashes; older receipts in `evidence/node-schedpol/` ran earlier
+versions of the cases, which they carry in full. To rerun a receipt, check out
+the commit it names into a clean worktree and run, from that worktree's root:
+
+```
+DRIVER_TREE/build/node/schedrcpt DRIVER_TREE/seed/node/schedrcpt-cases/cases-398n.json evidence/node-schedpol --write
+```
+
+Run it from the root of the checkout under test. That checkout may differ from
+the one holding the driver:
+
+```
+DRIVER_TREE/build/node/schedrcpt CASES.json OUTDIR_REL [--write]
+```
+
+The driver finds its source, `DRIVER_TREE/seed/node/schedrcpt.om`, from
+argv[0], so the path must end in `build/node/schedrcpt`. It refuses before
+compiling anything in three cases:
+
+- **Dirty tree:** `git status --porcelain` shows a change outside `build/`.
+  Exit 3.
+- **Bad mutation:** a mutation names a file that is not one of the case's
+  fragments, or its pattern does not occur exactly once. Exit 4.
+- **Gate mismatch:** a gate case without mutations is not the exact
+  concatenation of its `compose` list. Exit 5.
+
+Otherwise the driver creates `build/node` in the checkout under test (the
+build step above; gates keep their journals and work directories below it,
+and `jn_open` creates only the last directory of its path), compiles each
+case, runs it `repeat` times and prints one line per case: `PASS|FAIL CASE
+expect=N got=CODE`, or `FAIL CASE expect=N compile=E` when the case does not
+compile. It then writes the receipt and exits with 0 if every case passed and
+1 if any failed. Usage and I/O errors exit 2, as does a failure to create
+`build/node`.
+
+- With `--write`, the receipt goes to `OUTDIR_REL/receipt.<sha256>.json`; the
+  driver refuses to overwrite an existing file and prints the path.
+- Without `--write`, it goes to `/tmp/sched-receipt-<sha256>.json`.
+
+The case-file format, the checks and the receipt layout follow the earlier
+Python driver `receipt.py` (kept outside this repository, in the sched lane's
+hand-off folder). That driver produced the DRA-395/396 and DRA-397 r1
+receipts; this program replaces it. The Python driver is kept only as an
+ORACLE for cross-checks and is not part of the build or receipt path. The
+receipt differs from the Python driver's output in these ways:
+
+- **Script fields:** `script.path` is `seed/node/schedrcpt.om`, and
+  `script.binary_sha256` records the driver binary.
+- **Numbers:** numbers copied from the case file keep their written form, so
+  `2.50` stays `2.50` where Python writes `2.5`.
+- **Output tails:** `stdout` (4000) and `stderr` (2000) are measured in bytes,
+  and the cut moves forward to a UTF-8 boundary. Python counts characters
+  after decoding.
+- **Process handling:** a gate runs with stdin on `/dev/null` in its own
+  process group. That group is killed at the timeout and again after the gate
+  exits.
+- **Work directory:** `/tmp/schedrcpt-<random>` is removed at the end and on
+  every refusal.
+- **Build directory:** the driver creates `build/node` in the checkout under
+  test; the Python driver did not.
+- **Compile failures:** the driver prints a `FAIL ... compile=E` line; the
+  Python driver printed nothing for such a case, though both count it as a
+  FAIL.
+
+Limits; exceeding any of them exits 2:
+
+| Item | Limit |
+| --- | --- |
+| Case file | 983039 bytes |
+| Each composed source, fragment and the receipt | 16 MiB |
+| Entries in each list | 2048 |
+| Each string | 64 KiB |
+| `repeat` | 65536 |
+| Strings held at once (case values, output tails) | 65536 strings, 4 MiB in total |
+
+If the driver itself is killed (SIGTERM or SIGKILL), the gate running at that
+moment keeps running in its own process group, and the work directory stays.
+Kill that group (`pkill -f /tmp/schedrcpt-<id>/`) and remove the directory.
+The driver cannot clean up itself: seeded Omega has no host word for
+`sigaction` or `prctl(PR_SET_PDEATHSIG)`. Proposed extension: a host word
+`pdeathsig sig` (prctl option 1), called in the forked child before
+`execprog`, so the kernel signals each gate when the driver dies. Observed on
+2026-11-07, when a DRA-398 receipt run was stopped by hand.
+
 ## Proposals, authority and cancellation (DRA-288)
 
 Status: IMPLEMENTED in `auth.om`, exercised by `auth-gate.om` and the controls
