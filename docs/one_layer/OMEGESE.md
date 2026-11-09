@@ -655,9 +655,11 @@ is error 7.
   FPCR, including subnormals, infinities, signed zero, quieting signaling NaNs and invalid operations
   such as zero times infinity. NaN payload selection is Arm's rule, not a host-library rule.
   In particular `(1+2^-52)*(1-2^-52)-1` is `-2^-104` for f64 rather than the zero from separately
-  rounded multiply and add. x86linux and x86efi refuse `fma` with error 9: their SSE2 baseline does
-  not provide a fused instruction, and no unfused fallback is permitted. IR mode refuses float
-  words with error 3. (gate8 fma, neg_fma_*; gate-fma wrong-opcode, unfused and rounding mutants)
+  rounded multiply and add. x86linux and x86efi refuse a well-typed `fma` with error 9: their SSE2
+  baseline does not provide a fused instruction, and no unfused fallback is permitted. The operands
+  are typed first, so errors 7 and 11 have the same line and code on every target. IR mode refuses
+  float words with error 3. (gate8 fma, neg_fma_* on AArch64, x86linux and x86efi; gate-fma
+  wrong-opcode, unfused and rounding mutants)
 - Conversions `<type> value` handle int<->float, f32<->f64 and float->int. Int to float is SCVTF/UCVTF
   (round to nearest even); float to int is FCVTZS/FCVTZU (truncate, saturate, NaN -> 0); f32<->f64 is
   FCVT. `bitcast T value` reinterprets a value of the same width (f32/i32/u32, f64/i64/u64, and

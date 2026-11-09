@@ -371,16 +371,31 @@ Every one of the 1357 tracked `.om` files compiles to the same bytes, exit
 status and diagnostics under `5f90edea` and `cfd96b48`, so no existing unit's
 emission changes. Gate: `seed/host/execenv/execenv.cases`.
 
-The prlimit 235 host word (branch `seed/prlimit-host-word`, PROPOSED pending
-review) births compiler
-`3c2817a556143012a4914019a1e214a467d3d52a4deaa65a4e77f8f20b012079`
+x86 types `fma` operands before its error 9 (branch `fix/x86-fma-order`,
+OMEGESE.md 9.9) births compiler
+`0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f`
 from source
-`9e7b892192d2dd18c551f81d2b9b3a68c86722cfb07c503c2892047897cd7edd`.
+`7d8026837cfcafe53222228f076e4dab58279ae78a4b008440e6262f5b3c91ab`.
+No host word changes and no function was added (508 of 512). Each of the 1485
+tracked `.om` files was compiled alone for AArch64 and for `target x86linux`
+under `cfd96b48` and `0f2de851`: 2962 of the 2970 compiles give the same bytes,
+exit status and diagnostics; the other 8 are the x86 compiles of the ill-typed
+`seed/omc/tests/float/neg_fma_*` refusals, error 9 before and now the AArch64
+error 7 or 11. Gate: `seed/omc/gate8.sh` (`refuse_x86`).
+
+The prlimit 235 host word (branch `seed/prlimit-host-word`, PROPOSED pending
+review; first born as `3c2817a5` on rad main `da8b7e66`, then merged with rad
+main `408c76b7`) births compiler
+`6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`
+from source
+`7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`.
 `prlimit pid res A off n` is Linux `prlimit64`: AArch64 syscall 261 (`hprlim`,
 x0 pid, x1 res, x2 new, x3 old) and x86-64 syscall 302 (`xhprlim`, rdi pid,
 rsi res, rdx new, r10 old). `n` 16 passes new = NULL and old = &A[off]; `n` 32
 passes new = &A[off] and old = &A[off+16]; any other `n` sets -22 and skips the
-SVC/`syscall`. Two functions were added (510 of 512). Every one of the 1439
-tracked `.om` files compiles to the same bytes, exit status and diagnostics
-under `cfd96b48` and `3c2817a5`, so no existing unit's emission changes. Gate:
+SVC/`syscall`. Two functions were added (510 of 512). Each of the 1496 tracked
+`.om` files was compiled alone for AArch64 and for `target x86linux` under
+`0f2de851` and `6d1b1cf5`: 2980 of the 2992 compiles give the same bytes, exit
+status and diagnostics; the other 12 are the AArch64 and x86 compiles of the six
+`seed/host/prlimit/` sources, which use the new word (error 3 before). Gate:
 `seed/host/prlimit/prlimit.cases`.

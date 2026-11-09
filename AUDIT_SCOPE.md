@@ -23,10 +23,12 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `3c2817a556143012a4914019a1e214a467d3d52a4deaa65a4e77f8f20b012079`,
-   from `seed/omc/omc.om` `9e7b892192d2dd18c551f81d2b9b3a68c86722cfb07c503c2892047897cd7edd`; the prlimit 235
-   host word, branch `seed/prlimit-host-word`). The earlier audit pins `cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a`
-   (execenv 233, rad main da8b7e66), `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`
+   `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`,
+   from `seed/omc/omc.om` `7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`; the prlimit 235
+   host word, branch `seed/prlimit-host-word`, on rad main 408c76b7). The earlier audit pins
+   `0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f` (x86 types `fma` operands before its
+   error 9, branch `fix/x86-fma-order`), `cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a`
+   (the execenv 233 host word, branch `hive/execprog-env`), `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`
    (PR #1054, main 3e3dc205), `b1d9cff6d765d85159e14d8346ed946704e32e9ca39554fb22a7c3f23fe0cca3`
    (PR #1045, main 8dc0fc5c), `96eda108a064e419a6cda9112d3bf56ab64f2265fb04f8bb62c08a0786569763`
    (PR #1050, main 49d79616), `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`
@@ -78,9 +80,9 @@ immutable: never modify, rename or delete an existing file there.
 ## Build from source at a pin
 
 AArch64 Linux with `gcc`, `make` and `sh`. Some gates need sibling checkouts (`../physics` at
-`physics.lock` `048e5f5e881b092733baaf65d0ace46abda7f908`, `../aienos`, `../aien-architecture`,
+`physics.lock` `048e5f5e881b092733baaf65d0ace46abda7f908`, `../aienos`,
 `../omega-bridge` at `431fff0a95f84c0a8bf9d3383f94d7e1f02d913e`); a missing sibling exits 3.
-`crumb.lock`: `d0f0b95d344b4c6628c3d868346932fd247ce168`.
+`crumb.lock` (history only since DRA-97, 2026-11-07; no gate reads it): `d0f0b95d344b4c6628c3d868346932fd247ce168`.
 
 ```sh
 git clone https://github.com/aien-dev/omega-mv.git omega
@@ -98,7 +100,6 @@ Expected digest: the value in `seed/out/omc.sha256`.
 tests/gates/run.sh seed
 tests/gates/run.sh evidence-immutable
 tests/gates/run.sh zero-disk-secrets
-tests/gates/run.sh crumb-verify
 tests/gates/run.sh om-units
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-compiler-quick
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-numeric-cpu
@@ -106,7 +107,7 @@ make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-realize
 ```
 
 - Every gate name in `tests/gates/*.gate` is a `run.sh` argument; the Spark runs the touched
-  gates plus `.aien/always` (`CRUMB-VERIFY`, `OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`).
+  gates plus `.aien/always` (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`).
 - `evidence-immutable` prints `evidence/: additions only`; `zero-disk-secrets` prints
   `Zero plaintext .env files verified.`
 - Some older milestone gate scripts rewrite their receipts in place; run on a throwaway checkout.
