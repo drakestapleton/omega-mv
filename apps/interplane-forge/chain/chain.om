@@ -27,7 +27,8 @@ note zero); 3 utc (a real date and time, never earlier than the record before); 
 note 5 prev; 6 line longer than 1,023 bytes; 7 last line has no line feed; 8 kind, actor or subject
 note breaks its rule (kind 1..24 bytes of A-Z 0-9 _, actor 1..64 bytes, subject 1..128 bytes).
 note page verifies the ledger first and writes nothing when it does not verify (exit 2). OUT is
-note written as OUT.tmp and renamed, so a reader never sees half a page.
+note written as OUT.tmp (created exclusively) and renamed, so a reader never sees half a page. A
+note page name, or its .tmp, that is the ledger or the fed file is refused (exit 1).
 note Commands are matched as whole words: add, verify, check, feed, page.
 global gl uchar 1024
 global gll ulong 1
@@ -985,6 +986,12 @@ r = fsame sf fd
 if ne r 0
 ret r
 end
+if eq argcnt 7
+r = pprep 6
+if ne r 0
+ret r
+end
+end
 put gs 5 1
 put gs 6 0
 if not vfy fd
@@ -1001,14 +1008,14 @@ end
 if ne r 0
 ret r
 end
-y = fclose fd
 if eq argcnt 7
 pbuild
-w = pfile 6
+w = pfile
 if ne w 0
 ret w
 end
 end
+y = fclose fd
 ret say
 end
 note ---- page
@@ -1082,9 +1089,11 @@ pt q06
 pt q07
 pt q08
 end
-note pput: the page into the file named go[0, n), mode 0644; true when all of it is written and synced
+note pput: the page into the new file named go[0, n), mode 0644, created exclusively (O_WRONLY,
+note O_CREAT, O_EXCL: never through a link, never into a file that is already there); true when all
+note of it is written and synced
 fn pput n ulong to bool
-fd = int fopen go 0 n 577 420
+fd = int fopen go 0 n 193 420
 if lt fd 0
 ret false
 end
@@ -1106,10 +1115,57 @@ end
 r = fclose fd
 ret good
 end
-note pfile: the page built by pbuild into the file named by argument idx (at most 1,000 bytes),
-note written as <name>.tmp and renamed. go holds <name>.tmp; w holds the two names as the list
-note renames takes: count 2, then each name as a 2-byte length and its bytes. 0, or the exit code.
-fn pfile idx ulong to int
+note peq: the first 16 bytes of two stat records (st_dev, st_ino) are equal
+fn peq a view uchar 128 b view uchar 128 to bool
+for i ulong 16
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+note pid: s holds the lstat of a name; 1 when it is the entry or the file argument idx names (by
+note lstat or by stat), 0 when not, 3 when argument idx cannot be read or does not exist
+fn pid s view uchar 128 idx ulong to int
+m = argread idx ga 0 4095
+if lt m 1
+ret 3
+end
+t = new uchar 128 0
+if lt stat ga 0 ulong m t 0 128 0
+ret 3
+end
+if peq s t
+ret 1
+end
+if lt lstat ga 0 ulong m t 0 128 0
+ret 3
+end
+if peq s t
+ret 1
+end
+ret 0
+end
+note pguard: 0 when the name go[0, n) does not exist or is neither the ledger (argument 2) nor, in
+note feed, the fed file (argument 3); otherwise the exit code. Renaming the page over the ledger, or
+note removing a stale <name>.tmp that is the ledger, would destroy it.
+fn pguard n ulong to int
+s = new uchar 128 0
+if lt lstat go 0 n s 0 128 0
+ret 0
+end
+r = pid s 2
+if ne r 0
+ret r
+end
+if eq argcnt 7
+ret pid s 3
+end
+ret 0
+end
+note pprep: argument idx (1..1,000 bytes) into go as <name>.tmp, its length in gs 7, and both names
+note through pguard. Runs before anything is written. 0, or the exit code.
+fn pprep idx ulong to int
 n = argread idx ga 0 4095
 if or lt n 1 gt n 1000
 ret 1
@@ -1121,11 +1177,26 @@ end
 for j ulong 4
 put go add l j get ttmp j
 end
-if not pput add l 4
+put gs 7 l
+r = pguard l
+if ne r 0
+ret r
+end
+ret pguard add l 4
+end
+note pfile: the page built by pbuild into the name pprep prepared, written as <name>.tmp and
+note renamed. A stale <name>.tmp is removed first (the name only, never what it points to); on any
+note failure the .tmp is removed again. w holds the two names as the list renames takes: count 2,
+note then each name as a 2-byte length and its bytes. 0, or the exit code.
+fn pfile to int
+l = get gs 7
+t = add l 4
+u = unlink go 0 t
+if not pput t
+u = unlink go 0 t
 ret 3
 end
 w = new uchar 2100 0
-t = add l 4
 put w 0 2
 put w 1 0
 put w 2 uchar rem t 256
@@ -1137,9 +1208,10 @@ b = add 4 t
 put w b uchar rem l 256
 put w add b 1 uchar div l 256
 for c ulong l bound 1000
-put w add add b 2 c get ga c
+put w add add b 2 c get go c
 end
 if ne renames w 0 add add b 2 l 0 0
+u = unlink go 0 t
 ret 3
 end
 ret 0
@@ -1148,6 +1220,14 @@ fn cpage to int
 fd = ropen 0
 if lt fd 0
 ret 3
+end
+note the same exclusive lock add and feed take: one page writer per ledger, and never mid-append
+if ne flock fd 2 0
+ret 3
+end
+p = pprep 3
+if ne p 0
+ret p
 end
 good = vfy fd
 r = fclose fd
@@ -1158,7 +1238,7 @@ if ne get gs 1 0
 ret say
 end
 pbuild
-w = pfile 3
+w = pfile
 if ne w 0
 ret w
 end
