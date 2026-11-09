@@ -20,8 +20,9 @@ git clone --no-checkout SOURCE build/tls/reuse/src/DIR && git -C build/tls/reuse
 ```
 
 A missing checkout makes its rows NOT_RUN (the `cwd` is absent); a checkout at another commit or
-with local changes fails the `*-head` and `*-clean` rows, and every later row of that repository
-is NOT_RUN through `after`.
+with local changes makes the `*-head` or `*-clean` row INVALID (`evidence-missing`: the expected
+commit or the empty status is not in its log), and every later row of that repository is NOT_RUN
+through `after`. The verdict is then INVALID, never PASS.
 
 ## Rows
 
