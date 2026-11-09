@@ -55,7 +55,7 @@ main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 
 The source is `units:seed/ng/ng.units`: the units that list names, concatenated in its order, so a
 stage lane's unit (src/a64.om on the slice branches) comes with the list and no gate command changes
-(CI also builds ng through `ngbuild build`, which checks their sha256 pins; this gate does not);
+(`ngbuild build`, below, checks their sha256 pins; this gate does not);
 `in:front-check.in` puts the mode line `@ng front-check` before each case
 on ng's stdin, while omc reads the case alone. A wrong mode line makes every case FAIL.
 
@@ -68,9 +68,14 @@ seed/omc/om2), `cases-tests.txt` (seed/omc/tests), and the frozen C2 manifest (5
 m_fmtcr (om2 fmt misses a CR), m_sitebyte (one site-record byte past 65536 corrupted), m_callcap (the
 call table takes one call more); each must be KILLED.
 
-CI (`.github/workflows/ng-front-arm64.yml`) also checks that the gate's checker (`SCRATCH/fecheck`) is
-byte-for-byte the ng that `ngbuild` built. CI: NOT_RUN (GitHub Actions blocked). Host runs are recorded
-in the lane's READY files.
+The gate runs on the Spark; there is no GitHub workflow for it. Build ng through its pins and check that
+the gate's checker (`SCRATCH/fecheck`) is byte-for-byte that ng:
+
+    cat seed/ng/sha256.om seed/ng/ngbuild.om | seed/out/omc > ngbuild
+    ngbuild build seed/out/omc seed/ng/ng.units ng
+    cmp ng SCRATCH/fecheck
+
+Host runs are recorded in the lane's READY files.
 
 ## @ng front-ir (M1)
 
