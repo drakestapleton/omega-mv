@@ -3,7 +3,7 @@
 # Builds txdrv (om2 + text.om + txdrv.om) with seed/out/omc, generates the fixed and seeded random cases,
 # and requires every answer to equal Python's. Then eleven mutants of text.om, each removing or bending
 # one rule, must each produce at least one wrong answer. Prints TEXTGATE PASS rows=N mutants=11.
-# Exit 0 PASS, 1 FAIL, 3 NOT_RUN (no python3, or python3 older than 3.11).
+# Exit 0 PASS, 1 FAIL, 3 NOT_RUN (no python3, python3 older than 3.11, or interrupted by HUP, INT or TERM).
 set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 cd "$R"
@@ -15,7 +15,8 @@ command -v python3 >/dev/null || notrun 'requires python3 (read-only oracle)'
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || notrun 'requires python3 >= 3.11'
 mkdir -p build/seed/text
 T=$(mktemp -d build/seed/text/run.XXXXXX)
-trap 'rm -rf "$T"' EXIT HUP INT TERM
+trap 'rm -rf "$T"' EXIT
+trap 'notrun interrupted' HUP INT TERM
 python3 -I seed/text/tests/gen.py "$T" > "$T/gen.log"
 
 build() { # build TEXT.om OUT
@@ -24,17 +25,19 @@ build() { # build TEXT.om OUT
     chmod +x "$2"
 }
 # runall DRIVER: 0 when every cases file gives exactly its want file; on 1, k names the first file that does not
+# and st is the driver's exit status on it (0: it ran and its answers differ; 100+N: trap N)
 runall() {
     for c in "$T"/cases-*.bin; do
         k=${c##*/cases-}; k=${k%.bin}
-        "$1" < "$c" > "$T/got.txt" 2>/dev/null || return 1
+        st=0; "$1" < "$c" > "$T/got.txt" 2>/dev/null || st=$?
+        [ "$st" -eq 0 ] || return 1
         cmp -s "$T/got.txt" "$T/want-$k.txt" || return 1
     done
     return 0
 }
 
 build seed/text/text.om "$T/txdrv"
-runall "$T/txdrv" || { trap - EXIT HUP INT TERM; bad "text.om disagrees with the oracle: compare $T/got.txt with $T/want-$k.txt (input $T/cases-$k.bin; $T kept)"; }
+runall "$T/txdrv" || { trap - EXIT HUP INT TERM; bad "text.om disagrees with the oracle on $T/cases-$k.bin: driver exit $st; compare $T/got.txt with $T/want-$k.txt ($T kept)"; }
 rows=$(cat "$T"/want-*.txt | wc -l)
 printf 'PASS %s cases equal the oracle (%s)\n' "$rows" "$(cat "$T/gen.log")"
 
