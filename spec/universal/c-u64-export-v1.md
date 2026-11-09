@@ -1,6 +1,7 @@
 # C17 uint64 exporter v1 (#622 C export lane)
 
-Status: author-tested (TESTED), not QUALIFIED. Implements `spec/universal/translation-v1.md` section 6
+Status: TESTED, and independent #623 validation (G1 and G2) PASS on host AArch64 at main `1e3ecbba`
+(2026-11-09, `evidence/UNIVERSAL-622/export-L608/`). Not QUALIFIED: exact-head CI is NOT_RUN. Implements `spec/universal/translation-v1.md` section 6
 (contract sha256 `063f1d630e31925876454129c0024539bea0c7eb17f7187bc0e7ef56790de86e`) and the C export
 family extension of `spec/universal/translation-compose-v1.md` section 2 (sha256
 `51a7cc444e50fd114a6d2e2272d645333cec1ea92603a60cd9dde06fc7d4c3a0`). It changes no existing format, the
@@ -97,4 +98,13 @@ semantic-only envelope and from `R(U_A, C)`, identical), `U_B = c-import(src_B)`
 `N(strip(U_B)) = N(strip(U_A))`, and rustc (`--edition 2021 -O -C overflow-checks=on`) or python3 on
 the original, cc on `src_B` and the reference model on `U_A` agree on the vectors above. Roots not
 given are reported NOT_RUN. The native realization leg of compose section 4.1 item 2 is not run here.
-Independent validation (#623) is a separate gate.
+Independent validation (#623) is a separate gate; its G1 and G2 runs at `1e3ecbba` PASS
+(`evidence/UNIVERSAL-622/export-L608/g1-validate-summary.json`, `g2-compose-summary.json`).
+
+Independent corpus (L608, not the exporter's author): `make -f mk/c-u64-export.mk test-c-export-corpus`
+runs `tests/universal/translation/c_export_corpus.py` on `c_export_corpus.json` through the public commands
+only: 24 C and 3 Python positives disjoint from F1/F2 with hand-written expected text (form, semantic-only
+equality, cc compile and vectors against the compiled original or python3, re-import identity, export
+fixpoint) and 15 refusal rows, including every truncation and every bit-0/bit-7 flip checked against
+`sa decode`. `make -f mk/c-u64-export.mk test-c-export-corpus-mutants` must kill four one-line exporter
+mutants. Source review: `evidence/UNIVERSAL-622/export-L608/review.md`.

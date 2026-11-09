@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Independent C export round-trip corpus (#622 C export lane, ledger L608).
 
+ORACLE test code: host verification only, outside the build and production path (no exporter logic).
+
 Written from spec/universal/c-u64-export-v1.md and source-aware-v1.md only; the exporter, importer and
 codec are exercised through their public commands (tools/adapters/c-import, python-import, c-export,
 tools/source-aware/sa). The corpus (c_export_corpus.json, C export lane path; fixtures-*.json belong to the

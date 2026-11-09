@@ -1,4 +1,5 @@
 #!/bin/bash
+# ORACLE test code (host verification only, outside the build and production path).
 # Negative controls for the L608 C export corpus. Each mutant changes exactly one line of the exporter in a
 # scratch worktree of HEAD, rebuilds with the unchanged pinned build, and c_export_corpus.py must FAIL (exit 1).
 # Needs SA_SEED_REPO (as mk/c-u64-export.mk) and an existing build/L574 toolchain in this checkout, which is
