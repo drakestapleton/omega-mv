@@ -1,8 +1,8 @@
 #758 relational comparison slice, SC1 revision2
 
 Current contract: ced61decef1ff4efbf5bc81598db648aa810be434e373e9bc1563dbcb4523496.
-Current records: CURRENT-BINDINGS.json (run4), evidence/run5/RUN5.txt (review fixes), FROZEN-R2.txt,
-SC1-L.txt, SHA256SUMS.
+Current records: CURRENT-BINDINGS.json (run4), evidence/run5/RUN5.txt (review fixes),
+evidence/run6/RUN6.txt (wrong-image binding re-derived on omc 6d1b1cf5), FROZEN-R2.txt, SC1-L.txt, SHA256SUMS.
 BINDINGS.json, CONSUMER-BINDINGS.json and FROZEN.txt are HISTORICAL DRAFT records for commit
 4883943fd993401a3701d95f9c5fa031a6c887ea, not current-source qualifications. Their old L1-L8 IDs
 and draft8bc52 contract are not SC1 revision2 IDs. Historical run1/run2/run3 evidence and the
@@ -65,8 +65,10 @@ This repairs the original narrow test, which only covered differences1/129 and l
 Whole raw compare32 remains776bytes/194 instructions. Existing scanner reports64 public-index
 loads, zero branches, zero UNKNOWN/UNHANDLED: PASS for its architectural model. Current native
 paired harness is separately hashed in CURRENT-BINDINGS.json. The wrong-image containment test
-now searches the2184-byte embed executable, larger than776, and fails hits!=1 with assertion61;
-it no longer tests only the an>bn early refusal. embed.om is mechanical byte containment only.
+now searches the embed executable, larger than776, and fails hits!=1 with assertion61; it no longer
+tests only the an>bn early refusal. embed.om is mechanical byte containment only. That executable was
+2184 bytes (evidence/run3, omc up to 96eda108) and is 2308 bytes since omc b1d9cff6 added the fclose
+descriptor-table scan (evidence/run6/embed.bin, RUN6.txt); bindings.cases names run6.
 
 Before scans, qualification.cases re-compiles EVERY recorded raw control and compares emitted
 bytes directly against the exact scanner-input file. It also re-derives paired/native mutation

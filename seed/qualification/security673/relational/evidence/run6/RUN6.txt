@@ -1,0 +1,64 @@
+#758 relational suite, run6: wrong-image binding re-derived on the current seed omc (L1032), 2026-11-09
+
+Host: Linux aarch64 (DGX Spark CPU, flock pool-8-9, taskset -c 8-9, nice -n 19), no GPU.
+Base: omega-mv Radicle main 1e3ecbba779ee84e2de70ec231e83533a9c61f45.
+Compiler: seed/out/omc sha256 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8.
+`sh seed/omega-from-seed.sh` in a `git archive 1e3ecbba` tree with seed/out/omc removed: RC=0, born omc
+6d1b1cf5... byte-identical to the committed one. Gate: seed/qualification/om2/gate.om built by it,
+sha256 49914d72313d9b0e3693dc52119658c81d6f955af29d24551275b5e4f7936caf.
+
+Problem
+-------
+On main, `tests/gates/run.sh security758` exited 1: bindings.cases 15/16, the one FAIL being
+derive-wrong-image "stdout differs at byte 96" (before-run-sh-security758.log). The pinned
+evidence/run3/embed.bin (2184 B, sha256 0f65c747...fe50, 2026-10-30) is no longer what omc emits for
+embed.om; omc now emits 2308 B.
+
+Cause (omc-history.txt)
+-----------------------
+embed.om was compiled with the tracked seed/out/omc of every commit touching it since 2026-10-29.
+All omc up to e59a0060 (96eda108) emit the run3 bytes. The first that differs is merge 2de46b77
+(omc b1d9cff6, "Merge current main into #1045 and fit VFIO within unchanged om4 capacity"); both of
+its parents (96eda108 and 3ad9f10f) still emit the run3 bytes. Every later omc, through cfd96b48 and
+6d1b1cf5, emits the same 2308 bytes (sha256 6b48d0a7...c31f). The disassembly difference is
+exactly 31 added instructions after the fclose call (scan of the 128-entry VFIO descriptor-kind
+table at 0x10800000 for kinds 1 and 2, clearing a matching entry: fdforget) and a bss size
+0x800000 -> 0x800800 (the 2048-byte fdtab pool). That merge made descriptor tracking program-local
+("VFIO descriptor-kind state exists only in standalone programs", seed/omc/omc.om). embed.om is a
+standalone program that calls fclose, so the new bytes are the intended emission, not a change in
+embed.om. Every other derive-*/raw-pin/checker-pin case still matches its recorded bytes.
+
+Change
+------
+- evidence/run6/embed.bin: `seed/out/omc < embed.om`, exit 0, empty stderr (embed.cerr), 2308 B,
+  sha256 6b48d0a7e2c2f17ec7a26122011bfcbfd187a8024d12b8cdceac77d7aae0c31f. The seed-born omc emits the
+  same bytes. embed.src is the embed.om that was compiled (identical to run3/embed.src).
+- bindings.cases derive-wrong-image and embed-wrong-image-assert61 now name evidence/run6/embed.bin.
+  The wrong-image candidate (2308 B > 776 raw) does not contain compare32 exactly once and still fails
+  the containment search with assertion 61.
+- Historical run3 files are unchanged and stay in SHA256SUMS. No compiler, scanner, gate or consumer
+  source changed.
+
+Results (logs in this directory)
+--------------------------------
+qualification.cases     exit0 OM2GATE PASS cases=56 pass=56
+bindings.cases          exit0 OM2GATE PASS cases=16 pass=16
+consumer.cases          exit0 OM2GATE PASS cases=4 pass=4
+binding-negative.cases  exit1 OM2GATE FAIL cases=2 pass=0 fail=2 (wrong-source-bytes, wrong-checker-bytes; intended)
+l4-tripwire.cases       exit0 OM2GATE PASS cases=2 pass=2 (known L4 false negative still holds; not a qualification)
+tests/gates/run.sh security758: exit0 (run-sh-security758.log).
+
+Negative controls
+-----------------
+NC0 old binding (main as found): run.sh exit1, derive-wrong-image FAIL at byte 96
+    (before-run-sh-security758.log).
+NC1 one byte of run6/embed.bin overwritten (offset 2000, 0xfe -> 0x00), working tree only and restored
+    (sha back to 6b48d0a7...): run.sh exit1 "SECURITY758 FAIL bindings.cases exit=1 expected=0",
+    derive-wrong-image FAIL "stdout differs at byte 2000" (nc1-bytemut-run-sh.log, nc1-bytemut-bindings.log).
+NC2 the pre-drift compiler (tracked omc of e59a0060, sha256 96eda108...9763) run through the same
+    gate on the new bindings.cases: exit1, 15/16, derive-wrong-image FAIL at byte 96
+    (nc2-predrift-omc-bindings.log). The binding is specific to the current compiler.
+
+Scope: L4-L7 blockers in README.txt are unchanged. Observation for the omc owner, not changed here:
+every standalone program that calls fclose now carries the 124-byte descriptor-table scan and a
+2048-byte table, whether or not it uses a VFIO word.
