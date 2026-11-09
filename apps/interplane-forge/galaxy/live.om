@@ -1,0 +1,634 @@
+note live.om: the page that keeps itself current. Composed after page.om.
+note It connects to the factory's public Now stream (127.0.0.1:4748, server-sent events), keeps the
+note figures the page shows, and rewrites index.html in the working directory when they change,
+note at most once every 30 s. No timer: the stream is the change signal. On a lost connection it
+note waits 5 s and connects again. With any argument it reads the stream bytes from stdin instead,
+note publishes on every event and exits at end of input (the gate uses this).
+note Files in the working directory: stars.tsv (optional R and M lines, at most 32,768 bytes),
+note index.html and galaxy.css (each written to a .tmp name, synced, then renamed over the old one).
+note vnum: 0 generated, 1 delivered, 2 gpu watts, 3 review queue, 4 approved, 5 dirty, 6 last publish ns,
+note 7 published once, 8 line too long, 9 replay mode, 10+j jobs in work of station j, 20+j delivered in 24 h
+global vrx uchar 65536
+global vln uchar 1048576
+global vlnl ulong 1
+global vnum ulong 32
+global vnm uchar 640
+global vnl ulong 10
+global vsx uchar 32768
+global vad uchar 16
+global vrq uchar 64
+global vpl uchar 64
+text vkgen "generated"
+text vktot "totals"
+text vkdon "done"
+text vkmac "machine"
+text vkgpu "gpu_w"
+text vksta "stations"
+text vkid "id"
+text vknam "name"
+text vkmov "moving"
+text vkd24 "done24"
+text vkque "queue"
+text vkapp "approved"
+text vi0 "intake"
+text vi1 "command"
+text vi2 "aegis"
+text vi3 "omega"
+text vi4 "cuda"
+text vi5 "kernel"
+text vi6 "mill"
+text vi7 "core"
+text vi8 "si"
+text vi9 "dock"
+text vget "GET /now/stream HTTP/1.0"
+text vfidx "index.html"
+text vftmp "index.html.tmp"
+text vfcss "galaxy.css"
+text vfctm "galaxy.css.tmp"
+text vfsta "stars.tsv"
+text vla "K\tasof\t"
+text vlb " UTC\nK\tdelivered\t"
+text vlc "\nK\tverdicts\t"
+text vld "\nK\tapproved\t"
+text vle "\nK\twaiting\t"
+text vlf "\nK\tgpuw\t"
+note ---- JSON scanning over the current line vln; every index stays inside 0..vlnl
+fn vws p ulong to ulong
+lim = get vlnl 0
+i = p
+while lt i lim bound 1048576
+if gt get vln i 32
+ret i
+end
+i = add i 1
+end
+ret lim
+end
+note vstr: p is at an opening quote; the index after the closing quote
+fn vstr p ulong to ulong
+lim = get vlnl 0
+i = add p 1
+while lt i lim bound 1048576
+c = get vln i
+if eq c 92
+i = add i 2
+else
+if eq c 34
+ret add i 1
+end
+i = add i 1
+end
+end
+ret lim
+end
+note vskip: the index after the JSON value that starts at p
+fn vskip p ulong to ulong
+lim = get vlnl 0
+if ge p lim
+ret lim
+end
+c = get vln p
+if eq c 34
+ret vstr p
+end
+if or eq c 123 eq c 91
+d = ulong 0
+i = p
+while lt i lim bound 1048576
+b = get vln i
+if eq b 34
+i = vstr i
+else
+if or eq b 123 eq b 91
+d = add d 1
+end
+if or eq b 125 eq b 93
+d = sub d 1
+if eq d 0
+ret add i 1
+end
+end
+i = add i 1
+end
+end
+ret lim
+end
+j = p
+while lt j lim bound 1048576
+s = get vln j
+if or or eq s 44 eq s 125 or eq s 93 le s 32
+ret j
+end
+j = add j 1
+end
+ret lim
+end
+fn vkeq a ulong b ulong t view uchar * to bool
+n = len t
+if lt b a
+ret false
+end
+if ne sub b a n
+ret false
+end
+i = ulong 0
+while lt i n bound 64
+if ne get vln add a i get t i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+note vkey: p is at the brace of an object; the start of the value of key t, or vlnl
+fn vkey p ulong t view uchar * to ulong
+lim = get vlnl 0
+if ge p lim
+ret lim
+end
+if ne get vln p 123
+ret lim
+end
+i = vws add p 1
+while lt i lim bound 1048576
+if ne get vln i 34
+ret lim
+end
+ke = vstr i
+v = vws ke
+if ge v lim
+ret lim
+end
+v = vws add v 1
+if vkeq add i 1 sub ke 1 t
+ret v
+end
+i = vws vskip v
+if ge i lim
+ret lim
+end
+if ne get vln i 44
+ret lim
+end
+i = vws add i 1
+end
+ret lim
+end
+note vstat: p is at the bracket of the stations array; the start of the object whose id is t, or vlnl
+fn vstat p ulong t view uchar * to ulong
+lim = get vlnl 0
+if ge p lim
+ret lim
+end
+if ne get vln p 91
+ret lim
+end
+i = vws add p 1
+while lt i lim bound 1048576
+if ne get vln i 123
+ret lim
+end
+v = vkey i vkid
+if lt v lim
+if eq get vln v 34
+e = vstr v
+if vkeq add v 1 sub e 1 t
+ret i
+end
+end
+end
+i = vws vskip i
+if ge i lim
+ret lim
+end
+if ne get vln i 44
+ret lim
+end
+i = vws add i 1
+end
+ret lim
+end
+fn vdig p ulong to ulong
+lim = get vlnl 0
+i = p
+while lt i lim bound 1048576
+c = get vln i
+if or lt c 48 gt c 57
+ret i
+end
+i = add i 1
+end
+ret lim
+end
+fn vint p ulong to ulong
+e = vdig p
+v = ulong 0
+i = p
+while lt i e bound 1048576
+v = add mul v 10 ulong sub get vln i 48
+i = add i 1
+end
+ret v
+end
+note vround: a JSON number to the nearest whole number, halves up
+fn vround p ulong to ulong
+lim = get vlnl 0
+v = vint p
+e = vdig p
+if lt add e 1 lim
+if eq get vln e 46
+d = get vln add e 1
+if ge d 53
+if le d 57
+v = add v 1
+end
+end
+end
+end
+ret v
+end
+note vname: p is the value of "name"; slot j keeps at most 63 printable bytes, an escape becomes "?"
+fn vname p ulong j ulong to void
+lim = get vlnl 0
+if ge p lim
+ret
+end
+if ne get vln p 34
+ret
+end
+e = vstr p
+i = add p 1
+n = ulong 0
+while lt add i 1 e bound 1048576
+c = get vln i
+if eq c 92
+c = uchar 63
+i = add i 1
+end
+if lt n 63
+if ge c 32
+put vnm add mul j 64 n c
+n = add n 1
+end
+end
+i = add i 1
+end
+put vnl j n
+end
+fn vone a ulong j ulong t view uchar * to void
+lim = get vlnl 0
+s = vstat a t
+if ge s lim
+ret
+end
+vname vkey s vknam j
+m = vkey s vkmov
+if lt m lim
+put vnum add 10 j vint m
+end
+d = vkey s vkd24
+if lt d lim
+put vnum add 20 j vint d
+end
+if eq j 2
+q = vkey s vkque
+if lt q lim
+put vnum 3 vint q
+end
+put vnum 4 0
+p = vkey s vkapp
+if lt p lim
+put vnum 4 vint p
+end
+end
+end
+note vevent: the line is "data: {...}"; each top-level key it carries replaces what was kept
+fn vevent to void
+lim = get vlnl 0
+o = vws 5
+g = vkey o vkgen
+if lt g lim
+put vnum 0 vint g
+end
+t = vkey o vktot
+if lt t lim
+d = vkey t vkdon
+if lt d lim
+put vnum 1 vint d
+end
+end
+m = vkey o vkmac
+if lt m lim
+w = vkey m vkgpu
+if lt w lim
+put vnum 2 vround w
+end
+end
+s = vkey o vksta
+if lt s lim
+vone s 0 vi0
+vone s 1 vi1
+vone s 2 vi2
+vone s 3 vi3
+vone s 4 vi4
+vone s 5 vi5
+vone s 6 vi6
+vone s 7 vi7
+vone s 8 vi8
+vone s 9 vi9
+end
+put vnum 5 1
+end
+note ---- the feed, written into the page generator's input buffer ib
+fn via t view uchar * to void
+n = len t
+o = get ibl 0
+i = ulong 0
+while lt i n bound 65536
+put ib add o i get t i
+i = add i 1
+end
+put ibl 0 add o n
+end
+fn viab c uchar to void
+o = get ibl 0
+put ib o c
+put ibl 0 add o 1
+end
+fn vian v ulong to void
+d = new uchar 20 0
+n = ulong 0
+x = v
+if eq x 0
+viab 48
+end
+while gt x 0 bound 20
+put d n uchar add 48 rem x 10
+x = div x 10
+n = add n 1
+end
+while gt n 0 bound 20
+n = sub n 1
+viab get d n
+end
+end
+fn via2 v ulong to void
+viab uchar add 48 rem div v 10 10
+viab uchar add 48 rem v 10
+end
+note vymd: days since 1970-01-01 as YYYY-MM-DD (proleptic Gregorian; the gate checks it against date -u)
+fn vymd days ulong to void
+z = add days 719468
+era = div z 146097
+doe = sub z mul era 146097
+t = sub doe div doe 1460
+t = add t div doe 36524
+t = sub t div doe 146096
+yoe = div t 365
+y = add yoe mul era 400
+doy = sub doe sub add mul 365 yoe div yoe 4 div yoe 100
+mp = div add mul 5 doy 2 153
+d = add sub doy div add mul 153 mp 2 5 1
+m = add mp 3
+if ge mp 10
+m = sub mp 9
+end
+if le m 2
+y = add y 1
+end
+vian y
+viab 45
+via2 m
+viab 45
+via2 d
+end
+fn vdate s ulong to void
+r = rem s 86400
+vymd div s 86400
+viab 32
+via2 div r 3600
+viab 58
+via2 div rem r 3600 60
+end
+fn vcell j ulong to void
+n = get vnl j
+if gt n 0
+viab 83
+viab 9
+i = ulong 0
+while lt i n bound 64
+viab get vnm add mul j 64 i
+i = add i 1
+end
+viab 9
+vian get vnum add 10 j
+viab 9
+vian get vnum add 20 j
+viab 10
+end
+end
+fn vstars to void
+fd = int fopen vfsta 0 len vfsta 0 0
+if lt fd 0
+ret
+end
+n = ulong 0
+k = long 1
+while gt k 0 bound 32769
+k = read fd vsx n sub 32768 n
+if gt k 0
+n = add n ulong k
+end
+end
+r = fclose fd
+o = get ibl 0
+i = ulong 0
+while lt i n bound 32768
+put ib add o i get vsx i
+i = add i 1
+end
+put ibl 0 add o n
+end
+fn vfeed to void
+put ibl 0 0
+via vla
+vdate get vnum 0
+via vlb
+vian get vnum 1
+via vlc
+vian get vnum 22
+via vld
+vian get vnum 4
+via vle
+vian get vnum 3
+via vlf
+vian get vnum 2
+viab 10
+j = ulong 0
+while lt j 10 bound 10
+vcell j
+j = add j 1
+end
+vstars
+end
+note ---- files: write the output buffer ob to tmp, sync, rename over fin
+fn vren a view uchar * b view uchar * to bool
+la = len a
+lb = len b
+put vpl 0 2
+put vpl 1 0
+put vpl 2 uchar la
+put vpl 3 0
+i = ulong 0
+while lt i la bound 28
+put vpl add 4 i get a i
+i = add i 1
+end
+o = add 4 la
+put vpl o uchar lb
+put vpl add o 1 0
+k = ulong 0
+while lt k lb bound 28
+put vpl add add o 2 k get b k
+k = add k 1
+end
+ret eq renames vpl 0 add add o 2 lb 0 0
+end
+fn vwrite tmp view uchar * fin view uchar * to bool
+fd = int fopen tmp 0 len tmp 577 420
+if lt fd 0
+ret false
+end
+n = get obl 0
+o = ulong 0
+ok = true
+while lt o n bound 1048576
+k = write fd ob o sub n o
+if le k 0
+ok = false
+o = n
+else
+o = add o ulong k
+end
+end
+r = fsync fd
+r = fclose fd
+if not ok
+ret false
+end
+ret vren tmp fin
+end
+fn vpub to void
+vfeed
+put obl 0 0
+page
+if vwrite vftmp vfidx
+put vnum 5 0
+put vnum 7 1
+end
+put vnum 6 ulong monons
+end
+note vmaybe: publish when something changed, the stations are known, and 30 s have passed (or first time)
+fn vmaybe to void
+if eq get vnum 5 0
+ret
+end
+if eq get vnl 0 0
+ret
+end
+if eq get vnum 9 1
+vpub
+ret
+end
+if eq get vnum 7 0
+vpub
+ret
+end
+now = ulong monons
+if ge sub now get vnum 6 30000000000
+vpub
+end
+end
+fn vline to void
+n = get vlnl 0
+if eq get vnum 8 0
+if ge n 6
+if eq get vln 0 100
+if eq get vln 1 97
+if eq get vln 4 58
+vevent
+vmaybe
+end
+end
+end
+end
+end
+put vlnl 0 0
+put vnum 8 0
+end
+fn vbytes n ulong to void
+i = ulong 0
+while lt i n bound 65536
+c = get vrx i
+if eq c 10
+vline
+else
+m = get vlnl 0
+if lt m 1048575
+put vln m c
+put vlnl 0 add m 1
+else
+put vnum 8 1
+end
+end
+i = add i 1
+end
+end
+fn vpump fd int to void
+k = long 1
+while gt k 0 bound 9223372036854775807
+k = read fd vrx 0 65536
+if gt k 0
+vbytes ulong k
+end
+end
+end
+fn main to int
+put vad 0 2
+put vad 2 18
+put vad 3 140
+put vad 4 127
+put vad 7 1
+put obl 0 0
+css
+ok = vwrite vfctm vfcss
+if gt argcnt 1
+put vnum 9 1
+vpump 0
+ret 0
+end
+n = len vget
+i = ulong 0
+while lt i n bound 60
+put vrq i get vget i
+i = add i 1
+end
+put vrq n 13
+put vrq add n 1 10
+put vrq add n 2 13
+put vrq add n 3 10
+while true bound 9223372036854775807
+s = int socknew 2 1 0
+if ge s 0
+if eq connect s vad 0 16 0
+if gt send s vrq 0 add n 4 0 0
+put vlnl 0 0
+vpump s
+end
+end
+r = fclose s
+end
+z = sleepns 5000000000
+end
+ret 0
+end
