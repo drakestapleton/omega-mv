@@ -22,6 +22,8 @@
 #     adversarial warm/white, enlarged-disc and missing-being controls.
 #  7. Native Milky Way samples and compact catalogue/twinkle point footprints;
 #     coarse-grid, static-bloom and dynamic-bloom controls must be rejected.
+#  8. A streamed answer: each later fragment joins the letters already showing
+#     and never blanks them (scripts/ck_allen_ui_stream_test.sh, L853).
 # Pictures of each state land in target/native-kernel-allen-ui/ for a person
 # to look at. Hosted only. Ends with "AIENOS_ALLEN_UI: PASS" or
 # "AIENOS_ALLEN_UI: FAIL <why>".
@@ -53,4 +55,5 @@ $CC -std=gnu11 -O2 -Wall -Wextra -Werror -I $K/svc -o "$W/place" $K/svc/tests/al
 "$W/place" || fail "place checks"
 sh scripts/ck_mind_phases_test.sh || fail "mind phase checks"
 sh scripts/ck_sky_sharpness_test.sh || fail "native sky sharpness checks"
+sh scripts/ck_allen_ui_stream_test.sh || fail "streamed answer restarts"
 echo "AIENOS_ALLEN_UI: PASS"

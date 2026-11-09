@@ -284,8 +284,13 @@ coordinates independently of dirty clips; all changing star-twinkle footprints
 are invalidated. Full-frame and incremental draws must therefore remain
 byte-identical, including through sustained thinking and speaking transitions.
 
-`scripts/ck_allen_ui_test.sh` also runs `ck_mind_phases_test.sh` and
-`ck_sky_sharpness_test.sh`. The mind fixture checks interior warm/white light,
+`scripts/ck_allen_ui_test.sh` also runs `ck_mind_phases_test.sh`,
+`ck_sky_sharpness_test.sh` and `ck_allen_ui_stream_test.sh`. The stream
+fixture replays an answer that arrives in parts: each later part must keep
+the letters already showing (never blank them) while partial redraw equals a
+full one; a non-continuation, a part after the words have gone, and a part
+of a reply not yet taken must start fresh. The old whole-reply call and a
+refusing join must fail it. The mind fixture checks interior warm/white light,
 point footprints and visibility on black and the identical galaxy across
 replayed activity histories, as well as the unchanged outside annulus.
 Warm/white, enlarged-point, hidden-being and exterior-halo controls must fail.
@@ -471,7 +476,10 @@ writes the job himself (`svc/allen_intent.c`): what is wanted (make, explain,
 do or chat, read off the line's first words), who he is, whose computer it is,
 and the shape the answer must take (a few short plain sentences in his voice,
 no lists, no headings), then keeps thinking until the answer comes back and
-says it as his own; after 30 s without one he says no answer came. The courier
+says it as his own; after 30 s without one he says no answer came. An answer
+that comes in parts while the model is still writing joins the words already
+on screen (`ck_allen_ui_said_more`): the letters shown stay and only the new
+ones type in after them. The courier
 is one line each way on a wire (`svc/courier.h`). On this kernel the wire is
 the second serial port (`x86/courier_x86.c`: COM2 at 0x2f8, a polled 16550 at
 115200 8N1; a `HELLO` call is answered with `HI`, so it does not matter which

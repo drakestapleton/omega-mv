@@ -49,6 +49,11 @@ void ck_allen_ui_said(const char *line, const char *reply, uint64_t now);
 /* A line was entered and the answer is coming from further off: the line
  * rises into him and his geometry keeps moving until ck_allen_ui_said(NULL, reply) brings the words. */
 void ck_allen_ui_think(const char *line, uint64_t now);
+/* More of the words already on screen: reply is the whole text so far, the
+ * earlier call's words with the new ones after them. What is showing stays,
+ * and the new letters follow. If it is not those words, or they are gone, it
+ * is a fresh reply. */
+void ck_allen_ui_said_more(const char *reply, uint64_t now);
 /* The name Allen goes by, for the bar's "Speak to ..." hint ("Allen" until called). */
 void ck_allen_ui_named(const char *name);
 /* Draws a frame when one is due (at most 60 a second) and returns 1, else

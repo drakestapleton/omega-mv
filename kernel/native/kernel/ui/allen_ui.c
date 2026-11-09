@@ -72,6 +72,7 @@ static const int32_t sky_region_dec_udeg[SKY_NREGIONS] = {
 #define BORN_MS (CK_NIGHT_MERGE_MS + 300u) /* Allen starts to gather */
 #define FORMED_MS (BORN_MS + CK_MIND_FORM_MS)
 #define LETTER_MS 35u
+#define SLIDE_MS 400u /* a line that grows while it is centred glides to its new place */
 #define BAR_REST_MS 9000u /* the bar fades this long after the last thing happened */
 #define DUSK_MS 2800u /* the stars fade, Allen folds to a light line, then the line closes */
 #define DAWN_MS 900u  /* waking: the sky comes back, calmly */
@@ -98,6 +99,9 @@ struct words {
     uint32_t from;        /* the first letter's start, ms */
     uint32_t done;        /* the last letter settled */
     uint32_t fade;        /* fading from here (0: not yet) */
+    uint32_t at[TEXT_MAX]; /* when each letter starts, ms: more words join without the first ones starting over */
+    int32_t x0[LINES_MAX]; /* where each line was before the last join: it slides to x over SLIDE_MS */
+    uint32_t slide_t;
     ck_rect box;
 };
 
@@ -113,6 +117,7 @@ static struct {
     unsigned input_len;
     char line[TEXT_MAX], reply[TEXT_MAX];
     int has_line;
+    int more; /* the words are the last ones with more at the end: they join, they do not start over */
     int think; /* the line went in but the answer is still coming: he thinks until it does */
     const char *footer;
     unsigned n, ne, total, links;
@@ -325,7 +330,56 @@ static void lay_out(struct words *w)
     w->box = w->lines ? (ck_rect){x0 - S(8), top - S(34), x1 - x0 + S(16), (int32_t)w->lines * line_h() + S(30)}
                       : (ck_rect){0, 0, 0, 0};
     unsigned last = w->lines ? w->st[w->lines - 1] + w->ln[w->lines - 1] : 0;
-    w->done = w->from + last * LETTER_MS + 700;
+    w->done = (last ? w->at[last - 1] + LETTER_MS : w->from) + 700;
+}
+
+/* where line li starts at t: a line that grew since the last join glides from where it was */
+static int32_t line_x(const struct words *w, unsigned li, uint32_t t)
+{
+    int32_t k = 256 - (int32_t)ck_smooth(ck_prog(t, w->slide_t, w->slide_t + SLIDE_MS));
+    return w->x[li] + (int32_t)((int64_t)(w->x0[li] - w->x[li]) * k >> 8);
+}
+
+/* the letters from i on start one after another from t0 */
+static void time_letters(struct words *w, unsigned i, uint32_t t0)
+{
+    for (; i < w->len; i++)
+        w->at[i] = t0, t0 += LETTER_MS;
+}
+
+/* More of the words already up (or about to be). 0: these are not those words,
+ * and the caller starts them over. */
+static int join_words(const char *reply, uint32_t t)
+{
+    struct words *w = ui.speak_t ? &ui.next : &ui.now;
+    unsigned n = copy_len(reply);
+    if (!w->len || (w == &ui.now && w->fade) || n < w->len || n >= TEXT_MAX)
+        return 0;
+    for (unsigned i = 0; i < w->len; i++)
+        if (w->text[i] != reply[i])
+            return 0;
+    if (w == &ui.next) { /* still waiting to speak: it speaks all of it when it does */
+        w->len = copy(w->text, reply, TEXT_MAX);
+        return 1;
+    }
+    unsigned old = w->len, old_lines = w->lines;
+    uint32_t start = (uint32_t)ck_max((int32_t)t, (int32_t)(w->at[old - 1] + LETTER_MS));
+    int32_t was[LINES_MAX];
+    for (unsigned i = 0; i < old_lines; i++)
+        was[i] = line_x(w, i, t);
+    w->len = copy(w->text, reply, TEXT_MAX);
+    time_letters(w, old, start);
+    lay_out(w);
+    for (unsigned i = 0; i < LINES_MAX; i++)
+        w->x0[i] = i < old_lines ? was[i] : w->x[i];
+    w->slide_t = t;
+    for (unsigned i = 0; i < old_lines && i < w->lines; i++) { /* a gliding line draws all the way from x0 */
+        int32_t lw = (int32_t)ck_af_measure(&ui.voice, w->text + w->st[i], w->ln[i]);
+        w->box = ck_union(w->box, (ck_rect){w->x0[i] - S(8), w->box.y, lw + S(16), w->box.h});
+    }
+    if (ui.mind.mode != CK_MIND_SPEAK)
+        ck_mind_mode(&ui.mind, CK_MIND_SPEAK, t);
+    return 1;
 }
 
 /* how long words stay once said: time to read them */
@@ -348,11 +402,11 @@ static void draw_words(const struct words *w, const ck_rect *r, uint32_t t)
         return;
     int32_t top = words_top();
     for (unsigned li = 0; li < w->lines; li++) {
-        uint64_t pen = (uint64_t)w->x[li] * 256;
+        uint64_t pen = (uint64_t)line_x(w, li, t) * 256;
         int32_t y = top + (int32_t)li * line_h();
         for (unsigned j = 0; j < w->ln[li]; j++) {
             unsigned i = w->st[li] + j;
-            uint32_t at = w->from + i * LETTER_MS;
+            uint32_t at = w->at[i];
             if (t <= at) /* not yet: but keep the pen moving so the line stays centred */
                 break;
             uint32_t age = t - at, a = ck_smooth(ck_prog(age, 0, 260));
@@ -1093,35 +1147,40 @@ static void take_notes(uint32_t t)
     }
     if (note.said_gen != ui.seen_said) {
         ui.seen_said = note.said_gen;
-        if (note.has_line) {
-            ui.guest_len = copy(ui.guest, note.line, TEXT_MAX);
-            ui.guest_x = ui.bar.x + S(30);
-            ui.guest_t = t;
-            ck_allen_canvas_clear(&stage, t); /* a new line: what was shown for the last one goes */
-        }
-        /* what is on screen fades; Allen thinks, then speaks. With no reply
-         * yet he keeps thinking (the water turns) until it comes. */
-        if (ui.now.len && !ui.now.fade)
-            ui.now.fade = t;
-        ui.next = (struct words){0};
-        if (note.think) {
-            ui.speak_t = 0;
-            ui.thinking = 1;
+        if (note.more && join_words(note.reply, t)) {
+            ui.quiet_t = t; /* more of the words on screen: they go on, nothing starts over */
         } else {
-            ui.next.len = copy(ui.next.text, note.reply, TEXT_MAX);
-            uint32_t think = ui.thinking ? 400u : note.has_line ? 900u + ck_min((int32_t)ui.next.len * 6, 700) : 500u;
-            ui.speak_t = ck_max((int32_t)(t + think), (int32_t)FORMED_MS + 300);
-            ui.thinking = 0;
+            if (note.has_line) {
+                ui.guest_len = copy(ui.guest, note.line, TEXT_MAX);
+                ui.guest_x = ui.bar.x + S(30);
+                ui.guest_t = t;
+                ck_allen_canvas_clear(&stage, t); /* a new line: what was shown for the last one goes */
+            }
+            /* what is on screen fades; Allen thinks, then speaks. With no reply
+             * yet he keeps thinking (the water turns) until it comes. */
+            if (ui.now.len && !ui.now.fade)
+                ui.now.fade = t;
+            ui.next = (struct words){0};
+            if (note.think) {
+                ui.speak_t = 0;
+                ui.thinking = 1;
+            } else {
+                ui.next.len = copy(ui.next.text, note.reply, TEXT_MAX);
+                uint32_t think =
+                    ui.thinking ? 400u : note.has_line ? 900u + ck_min((int32_t)ui.next.len * 6, 700) : 500u;
+                ui.speak_t = ck_max((int32_t)(t + think), (int32_t)FORMED_MS + 300);
+                ui.thinking = 0;
+            }
+            ui.input_len = 0;
+            if (note.input_gen != note.said_input_gen) { /* typed after the words came, in the same frame */
+                ui.input_len = note.input_len;
+                for (unsigned i = 0; i < ui.input_len; i++)
+                    ui.input[i] = note.input[i];
+            }
+            ui.input_moved = 1;
+            ui.quiet_t = t;
+            ck_mind_mode(&ui.mind, CK_MIND_THINK, t);
         }
-        ui.input_len = 0;
-        if (note.input_gen != note.said_input_gen) { /* typed after the words came, in the same frame */
-            ui.input_len = note.input_len;
-            for (unsigned i = 0; i < ui.input_len; i++)
-                ui.input[i] = note.input[i];
-        }
-        ui.input_moved = 1;
-        ui.quiet_t = t;
-        ck_mind_mode(&ui.mind, CK_MIND_THINK, t);
     }
     if (note.panel_gen != ui.seen_panel) {
         ui.seen_panel = note.panel_gen;
@@ -1274,19 +1333,22 @@ static void advance(uint32_t t)
     if (ui.speak_t && t >= ui.speak_t) {
         ui.now = ui.next;
         ui.now.from = ui.speak_t;
+        time_letters(&ui.now, 0, ui.now.from);
         lay_out(&ui.now);
+        for (unsigned i = 0; i < LINES_MAX; i++)
+            ui.now.x0[i] = ui.now.x[i];
         ui.speak_t = 0;
         ck_mind_mode(&ui.mind, CK_MIND_SPEAK, t);
     }
     struct words *w = &ui.now;
     if (w->len && t >= w->from && prev < w->done) {
         for (unsigned i = 0; i < w->len; i++) {
-            uint32_t at = w->from + i * LETTER_MS;
+            uint32_t at = w->at[i];
             if (at > prev && at <= t && w->text[i] != ' ' && (i == 0 || w->text[i - 1] == ' '))
                 ck_mind_word(&ui.mind, t), ck_flow_word(&ui.flow, t), ui.word_t = t;
         }
     }
-    uint32_t last_letter = w->len ? w->from + w->len * LETTER_MS : 0;
+    uint32_t last_letter = w->len ? w->at[w->len - 1] + LETTER_MS : 0;
     int speaking = w->len && t >= w->from && t < last_letter + 300;
     ui.level = speaking ? ck_exp_neg((t - ui.word_t) * 256 / 200) >> 8 : 0;
     ck_mind_voice(&ui.mind, ui.level);
@@ -1587,6 +1649,7 @@ void ck_allen_ui_said(const char *line, const char *reply, uint64_t now)
     lock();
     note.has_line = line != 0;
     note.think = reply == 0;
+    note.more = 0;
     copy(note.line, line, TEXT_MAX);
     copy(note.reply, reply ? reply : "", TEXT_MAX);
     note.said_input_gen = note.input_gen;
@@ -1595,6 +1658,22 @@ void ck_allen_ui_said(const char *line, const char *reply, uint64_t now)
 }
 
 void ck_allen_ui_think(const char *line, uint64_t now) { ck_allen_ui_said(line, 0, now); }
+
+void ck_allen_ui_said_more(const char *reply, uint64_t now)
+{
+    (void)now;
+    lock();
+    if (note.said_gen == ui.seen_said) { /* the window has the words so far: these go on from them */
+        note.has_line = 0;
+        copy(note.line, 0, TEXT_MAX);
+        note.more = 1;
+    } /* else the last call has not been taken yet: it stays what it was, with these words */
+    note.think = 0;
+    copy(note.reply, reply ? reply : "", TEXT_MAX);
+    note.said_input_gen = note.input_gen;
+    note.said_gen++;
+    unlock();
+}
 
 void ck_allen_ui_map(unsigned n, const uint8_t *ea, const uint8_t *eb, unsigned ne, int lit, const char *label,
                      unsigned total, unsigned links)
@@ -1636,6 +1715,7 @@ void ck_allen_ui_scene(const char *scene, unsigned len, uint64_t now)
     ck_scene_parse(scene, len, &s, 0);
     lock();
     note.has_line = 0;
+    note.more = 0;
     note.think = 0;
     copy(note.reply, ck_scene_say(&s), TEXT_MAX);
     note.said_gen++;
