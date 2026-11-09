@@ -32,7 +32,7 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `ngrun.om` | The reference interpreter (IR.md s7): `ngrun FILE.ir` runs the program entry of an accepted unit; output through the real host words, exit status = the entry's result, a failing check exits 100 + code. Unsupported ops (vectors, tiles, kernels, fma, fmath, f16/bf16/fp8) print `ngrun: unsupported op N at OFFSET` and exit 125. Its own limits stay off the trap exits 100..114: `ngrun FILE.ir STEPS` stops after STEPS executed ops (default 2^36, about an hour) with `ngrun: step limit at OFFSET` and exit 124, and an element outside the object its REF or SLICE names (reachable only from input ngcheck refuses) gives `ngrun: access outside storage at OFFSET` and exit 126. Its exit status is an IR result only for a unit ngcheck accepts; on refused input it means nothing. Back ends diff their output against it (D9). It reads through `src/ir.om`, the reader `ng` itself uses, so a diff against ngrun alone cannot see a reader fault both share: that is what the gate's run pairs are for, which judge ngrun against omc's build of the same program in Omega (no shared code). Exercised: `sub` operands swapped in both the reader and the writer of `ir.om` pass every round-trip and ir-copy case and are caught by the run pairs `x-fib` and `x-float`. The gate also mutates ngrun nine ways (fuel one pass late; rem MIN/-1, u64 `chk.add` and `chk.mul`, `chk.shl` negative side, signed conv lower bound, `chk.bounds` with e = 0, narrow `neg`, depth cap): each is caught by a run pair or an N case (`n-*.oir`, ngrun alone, for the semantics Omega cannot state). |
 | `ngrand.om` | Random programs, valid by construction (IR.md s10): `ngrand SEED` writes a binary unit (helpers, diamonds, counted loops, calls, checks with their codes, i64 memory, host write) built with `src/ir.om`; `ngrand tape FILE` replays a choice tape; `ngrand shrink SEED STATUS OUT CMD [ARG...]` deletes and zeroes tape bytes while `CMD ARG... OUT` exits STATUS and leaves the smallest unit in OUT and its tape in OUT.tape (the predicate runs at most 20001 times). The D9 differential source: a back end runs the same units as ngrun and the outputs must agree. |
 | `tests/ir/` | Text fixtures (`*.oir`), run pairs (`x-*.oir` + `x-*.om`) and `cases`, the expectations the gate runs. |
-| `tests/opt/` | Optimizer fixtures (`O`/`L` lines of `tests/ir/cases`): ng-front's 23 lowered run units and five by hand (`o-pre2`, `o-zero`, `o-bce0`, `o-bce1`, and `o-shfl`, a kernel loop whose invariant `shfl` must not leave the loop). |
+| `tests/opt/` | Optimizer fixtures (`O`/`L` lines of `tests/ir/cases`): ng-front's 23 lowered run units and six by hand (`o-pre2`, `o-zero`, `o-bce0`, `o-bce1`, and the kernel loops `o-shfl` and `o-mma`, whose invariant `shfl` and `mma` must not leave the loop). |
 | `gate-ir.om` | The ΩIR gate. |
 
 ## Build and gate
@@ -71,9 +71,10 @@ changed, the class name shifted), ten mutants of ngrun (`chk.fuel` one pass late
 giving a, u64 `chk.add` and `chk.mul` never failing, `chk.shl` without its negative bound, the signed
 conv lower bound at -2^(w-1), `chk.bounds` passing e = 0, narrow `neg` left uncanonical, the depth
 cap at 70000, the step limit one op late: `n-loop2` then names 87, not 116), a mutant ngrand (a
-random check's new token not made current) and four of opt.om (a load hoisted past the loop's
+random check's new token not made current) and five of opt.om (a load hoisted past the loop's
 stores and checks hoisted past their guard, both refused by ngcheck; preheader merging that
-ignores imm and BCE accepting an index one past its proof, a run differs) must each fail their named check at least once (the
+ignores imm and BCE accepting an index one past its proof, a run differs; LICM moving a convergent
+`shfl`, the pinned `o-shfl` row differs) must each fail their named check at least once (the
 ngrand mutant: ngcheck refuses TOKEN); each mutant's pattern must occur exactly once in its source.
 Under a mutant, Q runs 100 seeds and `L` cases are skipped. Last line `NGIRGATE PASS cases=N`,
 exit 0; otherwise one `FAIL` line per failure and exit 1.

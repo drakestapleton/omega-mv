@@ -883,8 +883,10 @@ per function:
    placement, not its truth (s7.10); the gate's BCE mutant (X - 1 + e <= L + 1) makes the
    boundary fixture `o-bce1` (L = 4, i < 5) write past the array, and the run differs.
 3. **LICM**, innermost loop first. An op moves to the end of the preheader when it is class P
-   (s6.4), defines a value, is not `shared`, is not convergent (`shfl`, `mma`: s7.12 forbids moving
-   them into or out of a branch, and the loop body is the branch of the header's test), and every
+   (s6.4), defines a value, is not `shared`, is not convergent (`sync`, `shfl`, `mmald`, `mmast`,
+   `mma`, refused by number: s7.12 forbids moving them into or out of a branch, and the loop body
+   is the branch of the header's test; the gate's convergent mutant drops `shfl` from that list
+   and the pinned `o-shfl` row differs), and every
    operand is defined outside the loop. P ops
    are total (s7.3: division by zero gives 0), so running one on a path where the loop runs zero
    times changes nothing. Checks, loads, stores, calls, host words, facts and terminators never
