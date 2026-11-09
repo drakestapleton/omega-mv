@@ -287,6 +287,40 @@ static unsigned cool_added(const struct pic *p, uint32_t *sky, uint32_t x0, uint
         }
     return visible;
 }
+/* The starfield round Allen must stay the quiet sky: pixels of the ring
+ * ri < |p - (cx, cy)| <= ro, outside the words box and above the bar, that
+ * differ from the bare night (base + lights, no shimmer) by more than tol in
+ * any channel. The retired water ink (ck_flow_draw in compose) laid a blue
+ * aura here, banded on the physical iMac (L852); this counts its return. */
+static unsigned ring_lit(const struct pic *p, uint32_t *sky, uint32_t cx, uint32_t cy, uint32_t ri, uint32_t ro,
+                         uint32_t wy, uint32_t wh, uint32_t by, int tol)
+{
+    uint32_t x0 = cx - ro, y0 = cy - ro;
+    ck_canvas cv = {sky, (int32_t)p->pitch, bare_night.h};
+    ck_rect area = {(int32_t)x0, (int32_t)y0, (int32_t)(2 * ro + 1), (int32_t)(2 * ro + 1)};
+    ck_night_at(&bare_night, (uint32_t)((now_us - 16000) / 1000));
+    ck_night_base(&bare_night, &cv, &area);
+    ck_night_lights(&bare_night, &cv, &area, 0, 0);
+    unsigned n = 0;
+    uint32_t W = p->pitch;
+    for (uint32_t y = y0; y <= cy + ro; y++)
+        for (uint32_t x = x0; x <= cx + ro; x++) {
+            int64_t dx = (int64_t)x - cx, dy = (int64_t)y - cy, d2 = dx * dx + dy * dy;
+            if (d2 <= (int64_t)ri * ri || d2 > (int64_t)ro * ro || y + 40 >= by)
+                continue;
+            if (y >= wy && y < wy + wh && x >= W / 4 && x < W * 3 / 4)
+                continue;
+            uint32_t c = p->px[(size_t)y * W + x], d = sky[(size_t)y * W + x];
+            for (int s = 0; s < 24; s += 8) {
+                int e = (int)(c >> s & 255) - (int)(d >> s & 255);
+                if (e > tol || e < -tol) {
+                    n++;
+                    break;
+                }
+            }
+        }
+    return n;
+}
 
 static volatile int helpers_run;
 static void *helper(void *arg)
@@ -1012,6 +1046,9 @@ int main(int argc, char **argv)
     CHECK(cool_added(&P, sky, cx - R, cy - R, 2 * R, 2 * R) > 5000,
           "allen: formed, a visible cool network over the actual sky");
     uint32_t bx = W / 2 - 720, by = H - 300, bw = 1440, bh = 108;
+    /* L852: the starfield round him is the quiet sky, with no water-ink aura */
+    CHECK(ring_lit(&P, sky, cx, cy, R * 5 / 4, 3 * R, cy + 500 - 90, 5 * 80 + 60, by, 0) == 0,
+          "allen: formed, the stars round him are the bare sky (no ink aura)");
     CHECK(added(&P, sky, 0, by - 40, W, H - by + 40) < 400, "allen: no bar before he is awake");
     CHECK(stale(fb, copy, W, W, H) < 40, "allen: drawn whole as he turns");
     if (dir) {
@@ -1080,7 +1117,17 @@ int main(int argc, char **argv)
                     changed += fb[(size_t)y * W + x] != copy[(size_t)y * W + x];
         CHECK(changed == 0, "talk: side sky stays identical to quiet stars, with no voice glare or fog");
     }
+    {
+        unsigned lit = ring_lit(&P, sky, cx, cy, R * 5 / 4, 3 * R, wy, wh, by, 0);
+        printf("note: L852 ring round Allen while he speaks: %u pixels off the bare sky\n", lit);
+        CHECK(lit == 0, "talk: speaking pushes no ink aura over the stars round him");
+    }
     run_to(said + 2600);
+    {
+        unsigned lit = ring_lit(&P, sky, cx, cy, R * 5 / 4, 3 * R, wy, wh, by, 0);
+        printf("note: L852 ring round Allen under his answer: %u pixels off the bare sky\n", lit);
+        CHECK(lit == 0, "talk: his answer leaves the stars round him as the bare sky");
+    }
     CHECK(added(&P, sky, W / 4, wy, W / 2, wh) > 3000, "talk: Allen's answer appears under him");
     CHECK(count(&P, bx, by, bw, bh, BRIGHT) < 500, "talk: the bar is cleared for the next line");
     if (dir) {
@@ -1100,6 +1147,11 @@ int main(int argc, char **argv)
             run_to(pending + checkpoints[i]);
             CHECKF(stale(fb, copy, W, W, H) < 40,
                   "talk: sustained thinking leaves no stale light at checkpoint %u", checkpoints[i]);
+            /* the typed line's motes fly from the bar up into him (draw_guest:
+             * guest_area, from cy - S(40) = cy - 80 down at 4K, wider than the
+             * ring): skip that path, check the sky above him */
+            CHECKF(ring_lit(&P, sky, cx, cy, R * 5 / 4, 3 * R, cy - 80, by - (cy - 80), by, 0) == 0,
+                   "talk: thinking streams no ink aura over the stars round him at checkpoint %u", checkpoints[i]);
         }
     }
     ck_allen_ui_said(0, "The rendering fixture is answering.", now_us);
