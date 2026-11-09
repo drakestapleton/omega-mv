@@ -224,7 +224,7 @@ def main(d):
             b = b[:rnd.randrange(len(b))]
         u8_case(o, bytes(b))
     u8_case(o, ("é" * 100_000).encode() + b"\xed\xa0\x80")
-    # code points: decode every 1- and 2-byte string, every 3-byte string led by E0, E1, ED, EF,
+    # code points: decode every 1- and 2-byte string, every 3-byte string led by E0, E1, E8, ED, EF,
     # sampled 4-byte strings and random mixes; encode edges, the surrogate band, a stride of all
     # code points, values past 10FFFF, and every room size 0..4.
     for a in range(256):

@@ -3,6 +3,7 @@
 # Builds txdrv (om2 + text.om + txdrv.om) with seed/out/omc, generates the fixed and seeded random cases,
 # and requires every answer to equal Python's. Then eleven mutants of text.om, each removing or bending
 # one rule, must each produce at least one wrong answer. Prints TEXTGATE PASS rows=N mutants=11.
+# Exit 0 PASS, 1 FAIL, 3 NOT_RUN (no python3, or python3 older than 3.11).
 set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 cd "$R"

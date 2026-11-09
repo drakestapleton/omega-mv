@@ -41,7 +41,7 @@ EF, sampled 4-byte strings, random mixes); encoding against `chr(cp).encode()` f
 point, the whole D700..E100 band, edges past 10FFFF and every room size 0..4. Eleven mutants (decimal
 overflow boundary, surrogates, overlong E0 forms, needle at the end, prefix order, -2^63, truncated
 sequence, 3-byte decode mask, U+D800 encoded, 3-byte lead byte, U+07FF length) must each give a wrong
-answer. Host run 2026-11-08 at omc `cfd96b48`: `TEXTGATE PASS rows=1840870 mutants=11`. Like `seed/json`, the gate is standalone (it needs Python) and is not in `seed/host/check.sh`.
+answer. Host run 2026-11-08 at omc `cfd96b48`: `TEXTGATE PASS rows=1840870 mutants=11`. Like `seed/json`, the gate is standalone (it needs Python) and is not in `seed/host/check.sh`. Exit status: 0 PASS, 1 FAIL, 3 NOT_RUN (no `python3`, or one older than 3.11).
 
 Not here yet: number text for floats (see `seed/json/jsonf.om`),
 and text in function mode (RM5's ABI item).
