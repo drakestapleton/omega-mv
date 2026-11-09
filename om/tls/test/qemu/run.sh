@@ -11,7 +11,7 @@
 #          (the image under /boot is root-only).
 # Environment: ACCEL=tcg (default, -cpu max: every guest instruction is emulated) or ACCEL=kvm
 #          (-cpu host -enable-kvm); TIMEOUT (seconds, default 600) bounds the guest run;
-#          QEMU_CPUS (taskset list, default 0-19) pins QEMU and the servers.
+#          QEMU_CPUS (taskset list, default every online CPU) pins QEMU and the servers.
 # What runs where:
 #   host   builds client.om (test/tls/client.om after every om/tls unit, om/tls/build.sh) and a
 #          key-schedule mutant of it, makes a throwaway PKI with the openssl CLI, and starts one
@@ -46,11 +46,11 @@ tcg) qaccel="-cpu max" ;;
 kvm) qaccel="-cpu host -enable-kvm" ;;
 *) echo "SETUP FAIL: ACCEL=$accel (tcg or kvm)"; exit 2 ;;
 esac
-cpus=${QEMU_CPUS:-0-19}
+cpus=${QEMU_CPUS:-0-$(($(nproc) - 1))}
 out="$root/build/tls/qemu"
 rm -rf "$out"; mkdir -p "$out"; cd "$out" || exit 2
 q() { "$@" > /dev/null 2>&1 || { echo "SETUP FAIL: $*"; exit 2; }; }
-for t in openssl busybox zstd cpio gzip qemu-system-aarch64 ss; do command -v $t > /dev/null || { echo "SETUP FAIL: $t not found"; exit 2; }; done
+for t in openssl busybox zstd cpio gzip qemu-system-aarch64 ss file taskset timeout sha256sum od nproc; do command -v $t > /dev/null || { echo "SETUP FAIL: $t not found"; exit 2; }; done
 bb=$(command -v busybox)
 file -L "$bb" | grep -q 'statically linked' || { echo "SETUP FAIL: $bb is not static"; exit 2; }
 
@@ -139,7 +139,8 @@ nextport() { # a free 127.0.0.1 TCP port
 }
 pids=
 cleanup() { for p in $pids; do kill "$p" 2> /dev/null; done; }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 : > cmds
 while IFS='|' read -r name bin opts expect cert chain sargs; do
   if [ "$chain" = - ]; then ch=""; else ch="-cert_chain $chain"; fi
@@ -177,7 +178,7 @@ echo "=== net: $nic $(cat /sys/class/net/$nic/address) driver $(basename $(readl
 for b in client mclient; do echo "=== sha256 $(sha256sum /$b)"; done
 while IFS='|' read -r name bin port opts; do
   echo "=== row $name"
-  /$bin localhost "$port" get 10.0.2.2 /root.pem / "$opts" > /tmp/o 2> /tmp/e
+  timeout 120 /$bin localhost "$port" get 10.0.2.2 /root.pem / "$opts" > /tmp/o 2> /tmp/e
   rc=$?
   grep -E '^HTTP/1.0 |^New, |^Shared groups: |^ *Protocol *: ' /tmp/o | sed 's/^/out: /'
   sed 's/^/err: /' /tmp/e
@@ -191,12 +192,16 @@ chmod +x ir/init
 
 # ---- boot ----
 echo "### qemu-system-aarch64 $(qemu-system-aarch64 --version | head -n 1) accel $accel"
+echo "### server $(openssl version)"
 start=$(date +%s)
 # shellcheck disable=SC2086
 taskset -c "$cpus" timeout "${TIMEOUT:-600}" qemu-system-aarch64 -M virt $qaccel -smp 2 -m 1G \
   -nographic -no-reboot -kernel "$kernel" -initrd initrd -append 'console=ttyAMA0 rdinit=/init panic=-1 quiet' \
   -netdev user,id=n0 -device virtio-net-pci,netdev=n0 > guest.log 2>&1
 qrc=$?
+# stop any server whose row did not connect (-naccept 1 ends the others by themselves), so every
+# server log is complete before it is judged
+for p in $pids; do kill "$p" 2> /dev/null; done; wait 2> /dev/null; pids=
 echo "guest exit $qrc after $(($(date +%s) - start)) s (log $out/guest.log)"
 tr -d '\r' < guest.log > g.log
 
@@ -232,8 +237,6 @@ while IFS='|' read -r name bin opts expect cert chain sargs; do
   [ $v = PASS ] && ok=$((ok + 1)) || fail=1
   printf '%s %-18s expect %-52s got %s\n' "$v" "$name" "$expect" "$got"
 done < rows
-# stop any server whose row did not connect (-naccept 1 ends the others by themselves)
-for p in $pids; do kill "$p" 2> /dev/null; done; wait 2> /dev/null; pids=
 if [ $fail = 0 ]; then echo "TLS-QEMU PASS rows=$ok/$rows accel=$accel kernel=$kv client=$(echo "$csha" | cut -c1-16)"
 else echo "TLS-QEMU FAIL rows=$ok/$rows accel=$accel"; fi
 exit $fail
