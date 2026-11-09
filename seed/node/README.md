@@ -1085,7 +1085,7 @@ process in the wrong state, 1 for any other failure.
 | `start STATE BIN OMC PORT VIEW` | start `omnode-code` on STATE (`root/`, `work/`, `journal/`, `objs.txt`); BIN must be a directory; refuses (3) while `node.pid` is alive |
 | `health STATE` | the model's `GET /health` and the node's view; 0 when both answer |
 | `stop STATE` | pause (op 1), wait until nothing runs or is in review (at most 900 s), SIGTERM; `view-at-stop.json` |
-| `restore STATE` | start again on the same journal (incarnation + 1), then resume (op 2) |
+| `restore STATE` | start again on the same journal (incarnation + 1), then resume (op 2); reports the first view whose `journal_seq` has reached the resume ack's (the creator publishes its snapshot after the commit), up to 5 s, else exits 1 |
 | `unserve STATE` | stop the model server |
 | `snapshot STATE SNAP` | copy `root/`, `work/` and `journal/` into SNAP (each must not exist there); refuses (3) while `node.pid` is alive |
 | `rollback STATE SNAP` | replace STATE's `root/`, `work/` and `journal/` with SNAP's copies (all three must exist first); refuses (3) while `node.pid` is alive |
