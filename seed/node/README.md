@@ -591,8 +591,9 @@ used for reporting only; selection reads logical counters.
 policy 0, `noreserve` sets the bypass budget to 65535 (no reservation in
 practice). Each step also checks the bounds since the last step. An event
 makes at most one pick more than it assigns, so candidate reads are at most
-(assigned + events) × (`win` + 1), the reserved probe included, or × 64
-under policy 0, exit 9; maintenance reads at most 64 per event, exit 14; the
+(assigned + events) × (`win` + 1), the reserved probe included, × (`win` + 2)
+under policy 2 (one proposal probe per pick), or × 64 under policy 0, exit 9;
+maintenance reads at most 64 per event, exit 14; the
 cursor moved by exactly `win` per window scan (mod 64), exit 15. The cursor
 check is the traversal witness. It runs at every step of every phase and
 around the dispatches that publication (phase F) and resume (phase Z) cause
