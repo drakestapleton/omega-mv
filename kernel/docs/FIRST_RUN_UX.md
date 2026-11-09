@@ -14,7 +14,7 @@ before the person sees it moving, and how to undo each part.
    for an AI service), each asked once and only when needed.
 2. **Nothing manual that the machine can discover.** No device lists to tick, no driver names, no disk layouts, no
    model file paths, no port numbers.
-3. **Plain words.** No product names of our own parts on the screen (no "Aienux", "Interplane", "Store", "contract",
+3. **Plain words.** No product names of my own parts on the screen (no "Aienux", "Interplane", "Store", "contract",
    "kernel"). Hardware is named by what it does first ("Graphics", "Screen", "Network"), then its maker's name.
    No marketing words: no "blazing", "seamless", "revolutionary", "magic". No exclamation marks.
 4. **One thing at a time, in the middle of the screen.** Allen's look (night sky, Allen as light in the centre, one
@@ -42,11 +42,11 @@ per screen as **Native:** and **In a window:**.
 
 ## 2. The screens, in order
 
-### Screen 1. Power on (not ours)
+### Screen 1. Power on (not mine)
 
 - **Native:** the computer's own maker logo for as long as its firmware takes (observed on the iMac: 13.5 s from
-  power on to our first instruction, iMac report `boot_time` line, aienos_commit 0930240). We cannot shorten this;
-  we never add to it.
+  power on to my first instruction, iMac report `boot_time` line, aienos_commit 0930240). I cannot shorten this;
+  I never add to it.
 - **In a window:** the runner window opens black, already the size of the screen it will be. No runner logo, no
   console text.
 - **Words:** none.
@@ -272,7 +272,7 @@ meet and measure; they are not measurements. Each build reports its observed tim
 
 | Step | Shows motion within | Says what it is waiting on after | Observed so far |
 |---|---|---|---|
-| Our first pixel after the firmware hands over (screen 2) | 1 s | (no words on this screen) | iMac: night on screen 15260 ms after power on, firmware 13548 ms of that (report, 0930240) |
+| My first pixel after the firmware hands over (screen 2) | 1 s | (no words on this screen) | iMac: night on screen 15260 ms after power on, firmware 13548 ms of that (report, 0930240) |
 | The night itself | plays 15.2 s, fixed | n/a | same clock on every machine (section 5) |
 | Allen arrives after the night | immediately (it eases out of the merger light) | 5 s: "Still starting. [The disk is slow to answer.]" | not measured on the PC/VM yet |
 | Each answer to a choice | 0.1 s (the choice lights up) | 2 s | not measured |

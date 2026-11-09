@@ -1,4 +1,4 @@
-# Allen's presence: what the sources say, and what we built from them
+# Allen's presence: what the sources say, and what I built from them
 
 Research note for the Allen window in the test-computer kernel
 (`native/kernel/ui/`), written against primary sources. Each claim names the
@@ -181,7 +181,7 @@ diffuse, project, advect, project, then the density step diffuse, advect.
 `ui/flow.c` is that solver in 16.16 fixed point (the kernel has no floating
 point in the drawing path), on a 64 by 36 grid with a one-cell border, ten
 relaxation sweeps, stepped every 16 ms with catch-up and a cap of eight
-steps per frame. Three things are ours, not Stam's: the forces (an idle
+steps per frame. Three things are mine, not Stam's: the forces (an idle
 turn with a breath, a thinking vortex that deepens over four seconds, a
 listening current from the bar up to Allen, rings when words come), the ink
 sources (a trickle from the heart, a ring round him while he thinks, motes

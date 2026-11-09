@@ -806,7 +806,7 @@ end, with no large stack buffer. A full fence precedes every writePtr publish
    and refuses params that would spill past the first slot (more than 3,984 bytes).
    `GSP_RM_CONTROL` does count its params (rpc.c:10978-10984: `sizeof(*rpc_params) +
    paramsSize`). [UNKNOWN] whether GSP-RM would also accept a length that includes the alloc
-   params; we keep the driver's form.
+   params; I keep the driver's form.
 6. **`GET_GSP_STATIC_INFO` request** [SOURCE]: zero-filled, `length = 32 +
    sizeof(GspStaticConfigInfo)`, refused by the driver above `maxRpcSize`
    (rpc.c `rpcGetGspStaticInfo_v14_00`). `sizeof(GspStaticConfigInfo)` could not be computed:
@@ -815,7 +815,7 @@ end, with no large stack buffer. A full fence precedes every writePtr publish
 
 ### 14.3 The object chain to a usable channel [OBSERVED on Linux, INFERRED for native]
 
-What our working Linux path asks the driver for, in order (physics `nvrm/nvrm.c` at e95e3ed,
+What my working Linux path asks the driver for, in order (physics `nvrm/nvrm.c` at e95e3ed,
 the layer every chip result on this box went through): `NV01_ROOT_CLIENT`;
 `NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2`; `NV01_DEVICE_0`; `NV20_SUBDEVICE_0`;
 `NV01_MEMORY_VIRTUAL`; `NV0080_CTRL_CMD_GPU_GET_CLASSLIST` (twice: count, then list);

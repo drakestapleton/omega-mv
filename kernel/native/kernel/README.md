@@ -1229,7 +1229,7 @@ The iMac light-line build uses catalogue point stars on black: no flow-ink overl
 ## GB10 GPU memory (simulated)
 
 `gpu/` holds the part of a native GB10 GPU driver that the Linux NVIDIA
-driver (RM and UVM) does for us today: GPU page tables, the GPU TLB
+driver (RM and UVM) does for me today: GPU page tables, the GPU TLB
 invalidate, GPU-visible buffers, and the memory and doorbell of one compute
 channel. It is cut D of `docs/GB10_NATIVE_DEPENDENCY_MAP.md`, host side only.
 

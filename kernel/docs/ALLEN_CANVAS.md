@@ -133,7 +133,7 @@ same file the same way. The live test asks the model one question at a time and 
 
 All on the Spark (GB10 host CPU, one core, 3840 x 2160), evidence in `evidence/allen-canvas/`.
 
-- **Real model replies** (Qwen3.8-27B FP8 on our own server, 127.0.0.1:18091, temperature 0.3, ten questions
+- **Real model replies** (Qwen3.8-27B FP8 on my own server, 127.0.0.1:18091, temperature 0.3, ten questions
   in `questions.txt`, raw replies kept as written): round 1, prompt v1: **10 of 10 parsed cleanly** and 10 of
   10 used the canvas (`round-1/parse-report.txt`). Round 2, prompt v2 (one more rule: watch or play means a
   video line, see means a picture line): **3 of 4 clean**; the fourth wrote two say lines (the second is

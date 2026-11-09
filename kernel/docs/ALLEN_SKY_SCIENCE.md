@@ -249,7 +249,7 @@ PRL 116, 061102, table I; abstract).
 **Bent light (real physics).** A point mass moves the image of a star seen at
 angle theta from it, to where the star really is, beta = theta - E^2/theta. The
 code does exactly that (`warp()` in `night.c`), with the pull of both holes
-added. Two weak points, both ours:
+added. Two weak points, both mine:
 - The pull is eased to zero between 2.2 E and 4.4 E so the bent region has no
   edge. The real pull has no edge: it falls as 1/theta and never stops. What the
   picture leaves out is 27.3 design px at 2.2 E and 13.6 px at 4.4 E (E is 60 px).

@@ -1,6 +1,6 @@
 # Contributing to Aienux
 
-Thank you for considering it. Aienux (the AienOS kernel) is experimental and pre-alpha; we welcome
+Thank you for considering it. Aienux (the AienOS kernel) is experimental and pre-alpha; I welcome
 contributions of code, review, design and testing.
 
 ## Find something to work on

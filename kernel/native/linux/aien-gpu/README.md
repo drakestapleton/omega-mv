@@ -1,6 +1,6 @@
-# aien-gpu: Linux host shim for our own GB10 GPU driver
+# aien-gpu: Linux host shim for my own GB10 GPU driver
 
-Part of ledger L332 (docs/GPU_DRIVER.md). A Linux kernel module that will host our GB10 driver core
+Part of ledger L332 (docs/GPU_DRIVER.md). A Linux kernel module that will host my GB10 driver core
 (native/kernel/gpu) in place of NVIDIA's nvidia.ko and nvidia-uvm.ko.
 
 Today it binds the GB10 only when loaded with `allow_bind=1` (never while nvidia.ko owns the GPU), reads two identity

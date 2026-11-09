@@ -366,7 +366,7 @@ Every word a person reads goes through the humanizer skill. Allen is a person sp
 
 - Short sentences, everyday words. Say what Allen is doing, then stop.
 - Name hardware by what it does, then its maker ("Graphics: NVIDIA GeForce RTX 4070").
-- Never on screen: our own part names (Aienux, Interplane, Store, kernel, contract, driver ABI), error codes,
+- Never on screen: my own part names (Aienux, Interplane, Store, kernel, contract, driver ABI), error codes,
   file paths, port numbers.
 - No marketing words (seamless, powerful, blazing, magic, effortless, stunning), no exclamation marks, no
   "Great!", no "Oops", no emoji.

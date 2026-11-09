@@ -132,7 +132,7 @@ builder invocation or claim the 2026-09-25 boot receipt qualifies this image.
 
 ## Step 5. Decide where the recovery key lives (decision for you)
 
-**Where we are.** After Step 4 builds and qualifies the signed recovery
+**Where things stand.** After Step 4 builds and qualifies the signed recovery
 image, it can open encrypted storage. It needs the *spare* (a locked copy of the storage
 password, already kept on the Spark at
 `~/.config/atlas/offline-spares/atlas-private-storage.passfile.age`) and the

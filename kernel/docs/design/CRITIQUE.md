@@ -1,4 +1,4 @@
-# Allen against 54 design systems: what we take, what we refuse
+# Allen against 54 design systems: what I take, what I refuse
 
 Read 2026-10-20 from the 54 DESIGN.md templates in the `popular-web-designs` skill. Every value below is
 quoted from those files (three readers, one third each; seven quotes spot-checked by grep, all found). Allen's
@@ -14,7 +14,7 @@ screen is one night sky with one light in it, so most of what these systems do t
    "If you can see the shadow, it's too strong." Allen's choices use a 1 px glow ring at 10 %, lit at 45 %.
 3. **Muted text is a colour, never a lower alpha.** Superhuman, x.ai and Composio fade secondary text with
    alpha. Allen measured that: the kernel's hint at 150/256 alpha falls to 3.26:1 on night (floor 4.5). So
-   hint and faint are solid colours (7.73:1 and 6.02:1). This is the one place we go against the majority.
+   hint and faint are solid colours (7.73:1 and 6.02:1). This is the one place I go against the majority.
 4. **One weight family, hierarchy by size.** Mistral ("Hierarchy comes from size and color, never weight")
    and Runway use one face for every role. Allen has one stroke face at three sizes.
 5. **Pills for actions, rounded rectangles for choices.** Apple (980 px), Revolut and Ollama (9999 px) keep
