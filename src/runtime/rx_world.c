@@ -1223,8 +1223,9 @@ static bool covered(const RxWorld *w, const RxReactionDesc *d, RxObjRef o, uint3
     return false;
 }
 
-/* Collect triggers + reads into one deduplicated dependency list. */
-static uint32_t gather_deps(const RxReactionDesc *d, RxDep out[RX_MAX_DEPS]) {
+/* Collect triggers + reads into one deduplicated dependency list of at most
+ * `cap` entries; returns how many it kept. */
+static uint32_t merge_deps(const RxReactionDesc *d, RxDep *out, uint32_t cap) {
     uint32_t n = 0;
     for (uint32_t pass = 0; pass < 2; pass++) {
         uint32_t cnt = pass ? d->n_reads : d->n_triggers;
@@ -1236,10 +1237,17 @@ static uint32_t gather_deps(const RxReactionDesc *d, RxDep out[RX_MAX_DEPS]) {
                     out[j].mask |= src[i].mask;
                     break;
                 }
-            if (j == n && n < RX_MAX_DEPS) out[n++] = src[i];
+            if (j == n && n < cap) out[n++] = src[i];
         }
     }
     return n;
+}
+
+/* rx_world_add_reaction refuses a reaction whose distinct triggers + reads
+ * exceed RX_MAX_INPUTS, so for a registered reaction nothing is dropped here
+ * (omega #527: a dropped ninth input made omega.select fail silently). */
+static uint32_t gather_deps(const RxReactionDesc *d, RxDep out[RX_MAX_INPUTS]) {
+    return merge_deps(d, out, RX_MAX_INPUTS);
 }
 
 /* ---- publication -------------------------------------------------------- */
@@ -1463,7 +1471,7 @@ static bool upstream_running(const RxWorld *w, uint32_t rid) {
     (void)rid;
     return false;
 #else
-    RxDep deps[RX_MAX_DEPS];
+    RxDep deps[RX_MAX_INPUTS];
     uint32_t n = gather_deps(&w->reactions[rid].desc, deps);
     for (uint32_t j = 0; j < w->n_reactions; j++) {
         if (j == rid) continue;
@@ -1711,7 +1719,7 @@ static void run_one(RxWorld *w, uint32_t rid, uint32_t worker) {
     r->activations++;
     r->episode_activations++;
 
-    RxDep deps[RX_MAX_DEPS];
+    RxDep deps[RX_MAX_INPUTS];
     uint32_t n_deps = gather_deps(d, deps);
 
     /* Semantic readiness: required inputs exist. */
@@ -2297,6 +2305,9 @@ int rx_world_add_reaction(RxWorld *w, const RxReactionDesc *d, uint32_t *out_id)
         d->n_triggers > RX_MAX_DEPS || d->n_reads > RX_MAX_DEPS ||
         d->n_writes > RX_MAX_WRITES || d->n_caps > RX_MAX_CAPS)
         return RX_ERR_ARG;
+    /* Every distinct input must fit the activation snapshot (gather_deps). */
+    RxDep all_deps[2 * RX_MAX_DEPS];
+    if (merge_deps(d, all_deps, 2 * RX_MAX_DEPS) > RX_MAX_INPUTS) return RX_ERR_ARG;
     /* The seat reads one object and writes field 0 of a different one. */
     /* A seat still has one data input. R8 may add one capability-slot wake
      * so a blocked seat can resume when a real grant appears. That wake is

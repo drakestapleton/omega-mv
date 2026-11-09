@@ -367,6 +367,9 @@ int r15_start_with(R15Rig *r, R15Config config, const uint32_t *fixture_subjects
     RxOmegaConfig oc;
     rx_omega_default_config(&oc);
     oc.hot_calls = 64; oc.hot_ns = 200000; oc.margin_pct = 10;
+    /* omega #527 repro: a smaller margin makes Omega's first, unrequested search pick a
+     * candidate that no authority promotes (R15_OMEGA_MARGIN_PCT=0 does it every run). */
+    if (getenv("R15_OMEGA_MARGIN_PCT")) oc.margin_pct = (uint32_t)strtoul(getenv("R15_OMEGA_MARGIN_PCT"), NULL, 10);
     if (g_cost_model) {
         oc.cost_ns = model_cost;
         oc.cost_ctx = r;
@@ -433,7 +436,8 @@ int r15_start_with(R15Rig *r, R15Config config, const uint32_t *fixture_subjects
     if (rx_omega_require_evidence(&r->omega, r->aien.o.experiment_belief, omega_belief) != RX_OK)
         return -1;
     if (rx_omega_serve_from(&r->omega, r->living.o.inforce, mint(r, RX_OMEGA_SUBJ_SERVE,
-            RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R)) != RX_OK) return -1;
+            RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R),
+            mint(r, RX_OMEGA_SUBJ_OMEGA, RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R)) != RX_OK) return -1;
     if (rx_omega_register(&r->omega, &omega) != RX_OK) return -1;
     r->stage = 4;
 

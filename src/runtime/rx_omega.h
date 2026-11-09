@@ -69,7 +69,8 @@ enum {
  * demand:    0 regime calls, 1 regime ns, 2 window seq, 3 window mean ns,
  *            4 M, 5 N, 6 realization in use (id word 0), 7 calls all regimes
  * search:    0 epoch, 1 M, 2 N, 3 window mean ns, 4 regime calls, 5 regime ns,
- *            6 last inquiry sequence taken up (R11)
+ *            6 last inquiry sequence taken up (R11),
+ *            7 inquiry that opened this epoch (0 = Omega's own watch; #527)
  * candidate: 0 epoch, 1 kind, 2..5 realization id, 6 code bytes, 7 state
  * verdict:   0 epoch, 1 state, 2 checks, 3 failures, 4 id word 0, 5 reason
  * measure:   0 epoch, 1 state, 2 candidate ps/call, 3 reference ps/call,
@@ -182,7 +183,8 @@ typedef struct RxOmegaFaculty {
      * selection is then only eligible; what is in force is decided by
      * whoever writes this record (in R13: the promotion authority). */
     RxObjRef serve_record;
-    RxCapRef serve_record_cap;
+    RxCapRef serve_record_cap;         /* held by the serve subject */
+    RxCapRef select_record_cap;        /* held by the Omega subject (#527) */
     int serve_from_record;
     uint32_t r_synth[RX_OMEGA_SLOTS], r_verify[RX_OMEGA_SLOTS], r_measure[RX_OMEGA_SLOTS];
     struct { struct RxOmegaFaculty *f; uint32_t k; } slot[RX_OMEGA_SLOTS];
@@ -210,9 +212,19 @@ int rx_omega_require_evidence(RxOmegaFaculty *f, RxObjRef evidence, RxCapRef rea
 
 /* R13. Call after create_objects and before register. Production reads the
  * realization in force from `record` (fields 0 epoch, 1..4 realization id,
- * 6 regime) with `read_cap`, held by the serve subject. R10 and R11 never
- * call this; production then follows the selection as before. */
-int rx_omega_serve_from(RxOmegaFaculty *f, RxObjRef record, RxCapRef read_cap);
+ * 6 regime) with `read_cap`, held by the serve subject; omega.select reads it
+ * with `select_read_cap`, held by the Omega subject. R10 and R11 never call
+ * this; production then follows the selection as before.
+ *
+ * With a record in charge, a search nobody asked for (opened by omega.watch,
+ * search field 7 == 0) still synthesizes, verifies and measures, but its
+ * selection names what production runs: the record's realization for the
+ * regime, else the reference. No authority promotes an unrequested finding,
+ * and a selection production never adopts would leave AIEN waiting for the
+ * switch forever (omega #527). An inquiry (a plan taken up by
+ * omega.reconsider) selects by measurement as always. */
+int rx_omega_serve_from(RxOmegaFaculty *f, RxObjRef record, RxCapRef read_cap,
+                        RxCapRef select_read_cap);
 
 /* Identity of these bytes as an Omega matvec realization on this machine,
  * computed the way the synthesizer names them. 0 on success. */

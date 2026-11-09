@@ -501,6 +501,8 @@ static int start(Rig *r, int mode) {
     RxOmegaConfig oc;
     rx_omega_default_config(&oc);
     oc.hot_calls = 64; oc.hot_ns = 200000; oc.margin_pct = 10;
+    /* omega #527 repro: see rx_r15_rig.c; R13_OMEGA_MARGIN_PCT=0 flips the first selection every run. */
+    if (getenv("R13_OMEGA_MARGIN_PCT")) oc.margin_pct = (uint32_t)strtoul(getenv("R13_OMEGA_MARGIN_PCT"), NULL, 10);
     if (mode == FAILED_VERIFICATION) oc.defect = RX_OMEGA_DEFECT_CRASH;
     if (rx_omega_create_objects(&r->omega, &r->w, &oc) != RX_OK) return -1;
     r->omega.keys = &r->keys.omega;
@@ -569,7 +571,8 @@ static int start(Rig *r, int mode) {
     /* Production runs what the promotion authority put in force, not what
      * Omega merely selected. */
     if (rx_omega_serve_from(&r->omega, r->living.o.inforce, mint(r, RX_OMEGA_SUBJ_SERVE,
-            RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R)) != RX_OK) return -1;
+            RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R),
+            mint(r, RX_OMEGA_SUBJ_OMEGA, RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R)) != RX_OK) return -1;
     if (rx_omega_register(&r->omega, &omega) != RX_OK) return -1;
     g_stage = 4;
 

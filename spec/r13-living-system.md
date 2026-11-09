@@ -43,7 +43,7 @@ admission, the seat's claim ring, and R9's generation state.
 |---|---|---|
 | `rx_living.{c,h}` | five reactions and six objects in the caller's world | the experiment, its evidence, the R9 draft, the promotion, the in-force record |
 | `rx_aien.c` | `aien.experiment` (opt-in); goal branch of `aien.plan` first; `aien.assess` keeps a confirmed cost from another core class as the expected value while status stays UNKNOWN | AIEN must read physical evidence; a goal must be able to cause the plan when the body has moved to an unexplored core class |
-| `rx_omega.c` | `rx_omega_require_evidence` (opt-in): a later selection waits for AIEN's belief for its epoch. `rx_omega_serve_from` (opt-in): production reads the in-force record. `rx_omega_identity_of` | Omega reacts to the evidence; a selection is only eligible until promoted; the durable bytes must rebuild the identity |
+| `rx_omega.c` | `rx_omega_require_evidence` (opt-in): a later selection waits for AIEN's belief for its epoch. `rx_omega_serve_from` (opt-in): production reads the in-force record, and a search Omega opened itself (not an inquiry) selects what production runs, since no authority promotes it (omega #527). `rx_omega_identity_of` | Omega reacts to the evidence; a selection is only eligible until promoted; the durable bytes must rebuild the identity |
 | `rx_world.c` | a seat descriptor may carry one more trigger when it is its own R8 capability slot | defect, below |
 
 R10 and R11 never call the opt-in functions. The two `rx_aien.c` goal changes

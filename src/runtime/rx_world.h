@@ -50,9 +50,13 @@
 #define RX_MAX_OBJECTS      256u
 #define RX_MAX_FIELDS       8u
 #define RX_MAX_REACTIONS    1024u
-#define RX_MAX_DEPS         8u
+#define RX_MAX_DEPS         8u    /* triggers, and separately reads, per reaction */
+/* Distinct inputs (triggers + reads) of one activation: its snapshot and causal
+ * record. omega.select under record-governed production with the test defect slot
+ * needs 9: 5 measures + evidence (triggers), search + selection + record (#527). */
+#define RX_MAX_INPUTS       9u
 #define RX_MAX_WRITES       8u
-#define RX_MAX_CAPS         8u
+#define RX_MAX_CAPS         9u    /* omega.select as above needs 9 distinct resources (#527) */
 #define RX_MAX_MUTATIONS    16u
 #define RX_MAX_SUBS         1024u  /* subscriptions per object */
 /* Causal-log capacity for long living-body episodes: 2^25 records (about
@@ -60,7 +64,7 @@
 #define RX_CRUMBS_LONG_EPISODE (1ull << 25)
 #define RX_MAX_WORKERS      16u
 #define RX_MAX_BINDERS      4u     /* commit binders per World (COMPOSITION-2) */
-#define RX_MAX_PARENTS      (RX_MAX_DEPS * RX_MAX_FIELDS + 1u)
+#define RX_MAX_PARENTS      (RX_MAX_INPUTS * RX_MAX_FIELDS + 1u)
 #define RX_PRIORITY_CLASSES 7u
 #define RX_DEFERRED_INITIAL 64u
 
@@ -231,7 +235,7 @@ typedef struct {
 
 typedef struct RxCtx {
     uint32_t n_in;
-    RxSnapshotDep in[RX_MAX_DEPS];
+    RxSnapshotDep in[RX_MAX_INPUTS];
     uint32_t n_out;
     RxMutation out[RX_MAX_MUTATIONS];
     void *user;
@@ -362,7 +366,7 @@ typedef struct {
     uint64_t wake_cause;        /* crumb that last woke this activation */
     uint64_t coalesced_wakes;   /* extra wakes folded into this activation */
     uint32_t n_inputs;
-    struct { RxObjRef obj; uint64_t version; uint64_t mask; } inputs[RX_MAX_DEPS];
+    struct { RxObjRef obj; uint64_t version; uint64_t mask; } inputs[RX_MAX_INPUTS];
     uint32_t n_caps;
     RxCapRef caps[RX_MAX_CAPS];
     uint32_t cap_issuer[RX_MAX_CAPS]; /* authority provenance; 0 if unknown */

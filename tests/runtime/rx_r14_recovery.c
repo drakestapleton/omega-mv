@@ -477,7 +477,8 @@ static int start(Rig *r, const Opts *opt) {
     if (rx_omega_require_evidence(&r->omega, r->aien.o.experiment_belief, omega_belief) != RX_OK)
         return -1;
     if (rx_omega_serve_from(&r->omega, r->living.o.inforce, mint(r, RX_OMEGA_SUBJ_SERVE,
-            RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R)) != RX_OK) return -1;
+            RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R),
+            mint(r, RX_OMEGA_SUBJ_OMEGA, RX_LIVING_RES_BASE + RX_LIVING_RES_INFORCE, R)) != RX_OK) return -1;
     if (rx_omega_register(&r->omega, &omega) != RX_OK) return -1;
     g_stage = 4;
 

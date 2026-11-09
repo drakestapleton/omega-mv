@@ -294,6 +294,7 @@ static int fn_watch(RxCtx *c) {
     put(c, f->o.search, 3, dem->field[3]);
     put(c, f->o.search, 4, dem->field[0]);
     put(c, f->o.search, 5, dem->field[1]);
+    put(c, f->o.search, 7, 0);                     /* opened by watch, not by an inquiry (#527) */
     return 0;
 }
 
@@ -725,10 +726,34 @@ static int fn_select(RxCtx *c) {
         if (m->field[2] * 100u > m->field[3] * (100u - f->cfg.margin_pct)) continue;
         if (!best || m->field[2] < best->field[2]) best = m;
     }
+    uint64_t regime = rx_omega_regime(s->field[1], s->field[2]);
+    uint64_t id[4] = {0, 0, 0, 0}, ps = ref_ps;
+    if (f->serve_from_record && s->field[7] == 0) {
+        /* omega #527: nobody asked for this search, so no authority will
+         * promote what it measured, and production keeps its record. Name
+         * what production runs (the record's realization for this regime,
+         * else the reference) so AIEN believes about the cost it actually
+         * observes; the measurements stay published in the measure objects. */
+        const RxSnapshotDep *rec = in_of(c, f->serve_record);
+        if (!rec) return -1;
+        best = NULL;
+        if (rec->field[0] != 0 && rec->field[6] == regime && rec->field[1] != 0) {
+            for (uint32_t i = 0; i < 4; i++) id[i] = rec->field[1 + i];
+            ps = rec->field[5];
+            for (uint32_t k = 0; k < f->cfg.n_slots; k++) {
+                const RxSnapshotDep *m = in_of(c, f->o.measure[k]);
+                if (m->field[1] == RX_OMEGA_MEASURED && m->field[4] == id[0] && m->field[5] == id[1] &&
+                    m->field[6] == id[2] && m->field[7] == id[3]) { ps = m->field[2]; break; }
+            }
+        }
+    } else if (best) {
+        for (uint32_t i = 0; i < 4; i++) id[i] = best->field[4 + i];
+        ps = best->field[2];
+    }
     put(c, f->o.selection, 0, epoch);
-    for (uint32_t i = 0; i < 4; i++) put(c, f->o.selection, 1 + i, best ? best->field[4 + i] : 0);
-    put(c, f->o.selection, 5, best ? best->field[2] : ref_ps);
-    put(c, f->o.selection, 6, rx_omega_regime(s->field[1], s->field[2]));
+    for (uint32_t i = 0; i < 4; i++) put(c, f->o.selection, 1 + i, id[i]);
+    put(c, f->o.selection, 5, ps);
+    put(c, f->o.selection, 6, regime);
     put(c, f->o.selection, 7, best ? best->field[3] : ref_ps);
     return 0;
 }
@@ -757,6 +782,7 @@ static int fn_reconsider(RxCtx *c) {
     put(c, f->o.search, 1, M);
     put(c, f->o.search, 2, N);
     put(c, f->o.search, 6, seq);
+    put(c, f->o.search, 7, seq);                   /* this epoch answers the inquiry (#527) */
     return 0;
 }
 
@@ -928,6 +954,11 @@ int rx_omega_register(RxOmegaFaculty *f, const RxOmegaCaps *caps) {
     rd(&b, w, f->o.search);
     rd(&b, w, f->o.selection);
     wr(&b, w, f->o.selection);
+    if (f->serve_from_record) {                    /* #527: what production runs */
+        b.d.reads[b.d.n_reads++] = (RxDep){ f->serve_record, RX_ALL_FIELDS };
+        b.d.caps[b.d.n_caps++] = (RxCapNeed){ f->select_record_cap,
+            w->objects[f->serve_record.id].resource, RX_RIGHT_READ };
+    }
     if ((rc = rx_world_add_reaction_keyed(w, f->keys, &b.d, &f->r_select)) != RX_OK) return rc;
     return RX_OK;
 }
@@ -977,12 +1008,14 @@ void rx_omega_destroy(RxOmegaFaculty *f) {
     pthread_mutex_destroy(&f->mu);
 }
 
-int rx_omega_serve_from(RxOmegaFaculty *f, RxObjRef record, RxCapRef read_cap) {
+int rx_omega_serve_from(RxOmegaFaculty *f, RxObjRef record, RxCapRef read_cap,
+                        RxCapRef select_read_cap) {
     if (!f || !f->w || record.id >= RX_MAX_OBJECTS || !f->w->objects[record.id].live ||
         f->w->objects[record.id].generation != record.generation ||
-        read_cap.cap_id == UINT32_MAX) return RX_ERR_ARG;
+        read_cap.cap_id == UINT32_MAX || select_read_cap.cap_id == UINT32_MAX) return RX_ERR_ARG;
     f->serve_record = record;
     f->serve_record_cap = read_cap;
+    f->select_record_cap = select_read_cap;
     f->serve_from_record = 1;
     return RX_OK;
 }
