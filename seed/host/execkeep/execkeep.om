@@ -1,0 +1,330 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/host/execkeep/execkeep.om: fixture for execkeep (keyword 238), program mode. Run by the OM-2
+note conductor through seed/host/execkeep/execkeep.cases from the repository root, without arguments.
+note A forked child F opens a lock file (no O_CLOEXEC), places it on descriptor K, puts /dev/null on
+note K-1 (when K > 3) and K+1, takes a shared flock on K and runs execkeep [argv0, "keep", path, K]
+note with the environment ["A=1"] keeping K. The new image (child mode "keep") requires: flock K
+note LOCK_EX|LOCK_NB (6) converts the inherited lock (0), K-1 and K+1 are closed (flock 8 gives -9), a
+note grandchild that opens the path anew sees LOCK_EX|LOCK_NB refused with -11 (the lock is held), and
+note the environment is exactly "A=1". Child exits: 21 K closed, 22 K-1 open, 23 K+1 open, 24 the lock
+note not held, 25 environment wrong, 26 bad arguments.
+note Checks (parent exit = number of the first failed check, 0 when all hold):
+note 1 K 9 (the quiet-build lock descriptor): the new image proves every rule above (F exit 0).
+note 2 K 3 (the first close_range is skipped): the same, with K+1 4 closed.
+note 3 negative control: the same F through execenv: the new image finds K closed (exit 21).
+note 4 a missing program returns -2 (ENOENT) to F after both close_range calls: K-1 and K+1 are then
+note   closed in F and K still open (flock K 8 gives 0).
+note 5 fd 2, fd 0 and fd -1 trap 3 (exit 103) before any descriptor closes.
+note 6 an environment packet of 1025 records traps 3 (exit 103).
+om2
+text cmkeep "keep"
+text one "A=1"
+text pre "/tmp/omega-execkeep-"
+text suf ".lock"
+text devnull "/dev/null"
+text missing "/nonexistent/omega-execkeep-missing"
+global path uchar 128
+global argv uchar 4096
+global envp uchar 16
+global bad uchar 8192
+global buf uchar 4096
+global status uchar 4
+
+fn reap pid long to ulong
+r = waitpid int pid status 0 len status 0
+if ne r pid
+ret 1000
+end
+if ne get status 0 0
+ret add 2000 ulong and get status 0 127
+end
+ret ulong get status 1
+end
+
+note Decimal digits of v at buf[p..); returns the end position.
+fn digits p ulong v ulong to ulong
+d = ulong 1
+while le mul d 10 v
+d = mul d 10
+end
+q = p
+while gt d 0
+put buf q uchar add 48 rem div v d 10
+q = add q 1
+d = div d 10
+end
+ret q
+end
+
+note path = "/tmp/omega-execkeep-<pid>.lock"; returns its length.
+fn mkpath to ulong
+for i ulong len pre
+put buf i get pre i
+end
+e = digits len pre ulong getpid
+for j ulong len suf
+put buf add e j get suf j
+end
+n = add e len suf
+for k ulong n
+put path k get buf k
+end
+ret n
+end
+
+note Append one u16-length record buf[0..n) to argv at pos; returns the new end.
+fn rec pos ulong n ulong to ulong
+put argv pos uchar and n 255
+put argv add pos 1 uchar shr n 8
+for i ulong n
+put argv add add pos 2 i get buf i
+end
+ret add add pos 2 n
+end
+
+note argv packet [argv0, "keep", path, K]; returns its length.
+fn mkargv pn ulong k ulong to ulong
+n = argread 0 buf 0 len buf
+if le n 0
+exit 90
+end
+put argv 0 4
+put argv 1 0
+pos = rec 2 ulong n
+for i ulong len cmkeep
+put buf i get cmkeep i
+end
+pos = rec pos len cmkeep
+for j ulong pn
+put buf j get path j
+end
+pos = rec pos pn
+e = digits 0 k
+ret rec pos e
+end
+
+note 1 when argv[i] equals s.
+fn argis i ulong s view uchar * to ulong
+n = argread i buf 0 len buf
+if ne n long len s
+ret 0
+end
+for j ulong len s
+if ne get buf j get s j
+ret 0
+end
+end
+ret 1
+end
+
+note The new image: argv [argv0, "keep", path, K].
+fn child to int
+n = argread 2 path 0 len path
+if le n 0
+ret 26
+end
+m = argread 3 buf 0 len buf
+if le m 0
+ret 26
+end
+k = ulong 0
+for i ulong ulong m
+k = add mul k 10 sub ulong get buf i 48
+end
+if lt k 3
+ret 26
+end
+if ne flock int k 6 0
+ret 21
+end
+if gt k 3
+if ne flock int sub k 1 8 neg long 9
+ret 22
+end
+end
+if ne flock int add k 1 8 neg long 9
+ret 23
+end
+pid = fork
+if lt pid 0
+ret 24
+end
+if eq pid 0
+fd = fopen path 0 ulong n 2 0
+if lt fd 0
+exit 1
+end
+if eq flock int fd 6 neg long 11
+exit 0
+end
+exit 2
+end
+if ne reap pid 0
+ret 24
+end
+if ne envcnt 1
+ret 25
+end
+r = envread 0 buf 0 len buf
+if ne r long len one
+ret 25
+end
+for j ulong len one
+if ne get buf j get one j
+ret 25
+end
+end
+ret 0
+end
+
+note Open fresh on descriptor k (dup3 when the kernel chose another): w 0 is path[0..pn), else /dev/null.
+fn putfd w ulong pn ulong k ulong flags ulong to ulong
+fd = long 0
+if eq w 0
+fd = fopen path 0 pn int flags 384
+else
+fd = fopen devnull 0 len devnull int flags 384
+end
+if lt fd 0
+ret 0
+end
+if ne ulong fd k
+d = dupfd int fd int k 0
+c = fclose int fd
+if ne d long k
+ret 0
+end
+end
+ret 1
+end
+
+note F: lock file on k (shared flock), /dev/null on k-1 (k > 3) and k+1, then mode 0 execkeep,
+note mode 1 execenv, mode 2 execkeep of a missing program (then checks the descriptors itself).
+note Returns F's exit (that of the new image after a successful exec).
+fn runf mode ulong k ulong pn ulong to ulong
+an = mkargv pn k
+put envp 0 1
+put envp 1 0
+put envp 2 uchar len one
+put envp 3 0
+for i ulong len one
+put envp add i 4 get one i
+end
+en = add len one 4
+pid = fork
+if lt pid 0
+ret 1001
+end
+if eq pid 0
+if eq putfd 0 pn k 66 0
+exit 91
+end
+if gt k 3
+if eq putfd 1 0 sub k 1 0 0
+exit 92
+end
+end
+if eq putfd 1 0 add k 1 0 0
+exit 93
+end
+if ne flock int k 1 0
+exit 94
+end
+if eq mode 0
+r = execkeep argv 0 an envp 0 en int k
+exit 97
+end
+if eq mode 1
+r = execenv argv 0 an envp 0 en
+exit 97
+end
+for j ulong len missing
+put bad add j 4 get missing j
+end
+put bad 0 1
+put bad 1 0
+put bad 2 uchar len missing
+put bad 3 0
+r = execkeep bad 0 add len missing 4 envp 0 en int k
+if ne r neg long 2
+exit 81
+end
+if ne flock int sub k 1 8 neg long 9
+exit 82
+end
+if ne flock int add k 1 8 neg long 9
+exit 83
+end
+if ne flock int k 8 0
+exit 84
+end
+exit 0
+end
+ret reap pid
+end
+
+note A forked child runs execkeep with keep descriptor fd (an int) and the environment packet
+note bad[0..bn); returns its exit (103 for trap 3).
+fn trapkid fd int bn ulong to ulong
+an = mkargv 1 9
+pid = fork
+if lt pid 0
+ret 1001
+end
+if eq pid 0
+r = execkeep argv 0 an bad 0 bn fd
+exit 98
+end
+ret reap pid
+end
+
+fn main to int
+if eq argcnt 4
+if eq argis 1 cmkeep 1
+ret child
+end
+ret 36
+end
+if ne argcnt 1
+ret 36
+end
+pn = mkpath
+if ne runf 0 9 pn 0
+ret 1
+end
+if ne runf 0 3 pn 0
+ret 2
+end
+if ne runf 1 9 pn 21
+ret 3
+end
+if ne runf 2 9 pn 0
+ret 4
+end
+put bad 0 1
+put bad 1 0
+put bad 2 3
+put bad 3 0
+put bad 4 65
+put bad 5 61
+put bad 6 49
+if or ne trapkid 2 7 103 or ne trapkid 0 7 103 ne trapkid neg int 1 7 103
+ret 5
+end
+put bad 0 1
+put bad 1 4
+pos = ulong 2
+for i ulong 1025
+put bad pos 3
+put bad add pos 1 0
+put bad add pos 2 uchar add 65 shr i 5
+put bad add pos 3 uchar add 65 and i 31
+put bad add pos 4 61
+pos = add pos 5
+end
+if ne trapkid 9 pos 103
+ret 6
+end
+c = unlink path 0 pn
+ret 0
+end

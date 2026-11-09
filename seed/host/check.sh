@@ -126,11 +126,21 @@ grep -qx 'OM2GATE FAIL cases=24 pass=12 fail=12 invalid=0 not_run=0' "$run/fnhos
 [ "$(grep -c '^VERDICT fn-[a-z0-9]* FAIL ' "$run/fnhostmut.log")" = 12 ]
 echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # execenv 233: exact child environment (AArch64 and x86linux), printenv ORACLE, execprog negative
-# control, function-mode and contract refusals, and 4 omc.om mutants killed (seed/host/execenv/).
+# control, 1024-record and 131072-byte packets (execprog keeps 64/4096), function-mode and contract
+# refusals, and 8 omc.om mutants killed (seed/host/execenv/).
 "$B/gate" seed/out/omc "$pin" seed/host/execenv/execenv.cases "$run/execenv"
 # prlimit 235: rlimit read/set/effect against /proc/self/limits (AArch64 and x86linux), RLIMIT_AS kept
 # across execprog, refusals, and 7 omc.om mutants killed (seed/host/prlimit/).
 "$B/gate" seed/out/omc "$pin" seed/host/prlimit/prlimit.cases "$run/prlimit"
+# setprio 234: nice read back from a zombie child's /proc/<pid>/stat (AArch64 and x86linux), EACCES/EPERM,
+# EINVAL, ESRCH, refusals, and 2 omc.om mutants killed (seed/host/setprio/).
+"$B/gate" seed/out/omc "$pin" seed/host/setprio/setprio.cases "$run/setprio"
+# setaff 237: a one-CPU mask read back from a zombie child's Cpus_allowed_list (AArch64 and x86linux),
+# empty mask -22, n and slice traps, refusals, and 6 omc.om mutants killed (seed/host/setaff/).
+"$B/gate" seed/out/omc "$pin" seed/host/setaff/setaff.cases "$run/setaff"
+# execkeep 238: a flock on descriptor K held across exec while K-1 and K+1 close (AArch64 and x86linux),
+# execenv negative control, fd < 3 trap, refusals, and 6 omc.om mutants killed (seed/host/execkeep/).
+"$B/gate" seed/out/omc "$pin" seed/host/execkeep/execkeep.cases "$run/execkeep"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2

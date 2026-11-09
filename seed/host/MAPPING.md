@@ -399,3 +399,29 @@ SVC/`syscall`. Two functions were added (510 of 512). Each of the 1496 tracked
 status and diagnostics; the other 12 are the AArch64 and x86 compiles of the six
 `seed/host/prlimit/` sources, which use the new word (error 3 before). Gate:
 `seed/host/prlimit/prlimit.cases`.
+
+The execenv packet caps and the setprio 234, setaff 237 and execkeep 238 host
+words (branch `hive/t_3e396ac5-execenv-cap` on rad main `1e3ecbba`, PROPOSED
+pending review; keyword 236 is left to the open `realset` patch) birth compiler
+`d791dfd2af2d507dbb2f956ed6bbaacb963960c0d15fea12202fa629eaf893d7`
+from source
+`c844796167aa3347320da87be69a3cf4dc59e01ea7bb5e33e662084f13395da4`.
+`execenv` (both packets) now admits 1..1024 records and up to 131072 bytes
+(stack 0x48000: argv strings at SP, argv pointers at SP+0x20000, env strings at
+SP+0x24000, env pointers at SP+0x44000; x86 the same layout); `execprog` and
+`execpure` keep 64 records and 4096 bytes and emit the same bytes as before.
+`execkeep A off n B off m fd` is `execenv` that keeps descriptor `fd`: `fd` < 3
+traps 3 before any close, then close_range(3, fd-1, UNSHARE) (skipped for fd 3)
+and close_range(fd+1, ~0U, UNSHARE); either failure returns its errno without
+executing. `setprio which who prio` is Linux setpriority (AArch64 140, x86-64
+141); `setaff pid A off n` is Linux sched_setaffinity (`hsetaff`, AArch64 122;
+`xhsetaff`, x86-64 203), slice checked first, then n 1..1024 (trap 3). Two
+functions were added (512 of 512). Each of the 1651 tracked `.om` files was
+compiled alone for AArch64 and for `target x86linux` under `6d1b1cf5` and
+`d791dfd2`: 3266 of the 3302 compiles give the same bytes, exit status and
+diagnostics; the other 36 are the 32 compiles of the 16 new
+`seed/host/{setprio,setaff,execkeep}/` sources (error 3 before) and the 4
+compiles of `seed/host/execenv/{execenv,oracle}.om`, whose `execenv` code
+changed. The 52 other tracked sources that use `execprog` or `execpure` are
+byte-identical. Gates: `seed/host/{execenv,setprio,setaff,execkeep}/*.cases`
+(x86linux through qemu-x86_64 user emulation; native x86 NOT_RUN).

@@ -1,0 +1,350 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/host/setaff/setaff.om: fixture for setaff (keyword 237), program mode. Run by the OM-2
+note conductor through seed/host/setaff/setaff.cases from the repository root. Kernel truth is the
+note Cpus_allowed_list line of /proc/<child>/status, read by the parent while the child is a zombie.
+note Masks are 128 bytes (1024 CPUs; bit c of byte c/8 is CPU c) unless a check says otherwise.
+note Checks (parent exit = number of the first failed check, 0 when all hold):
+note 1 control: a child that does nothing shows the inherited list; k = its first CPU.
+note 2 a child runs setaff 0 {k}: 0, and its list is exactly "k".
+note 3 an all-zero mask returns -22 (EINVAL); the parent's list is unchanged (checked through a child).
+note 4 n 0 traps 3 (child exit 103).
+note 5 n 1025 traps 3, with A[off..off+1025) inside the 2048-byte array.
+note 6 n 1024 is accepted: 0 and the list "k".
+note 7 a slice past the array end (off 1960, n 128) traps 3.
+note 8 the offset reaches the kernel: the mask {k} at A[7..135) gives 0 and the list "k".
+note 9 a read-only view parameter is accepted: 0 and the list "k".
+note 10 pid 1 (owned by root) returns -1 (EPERM) unless euid 0.
+note 11 pid 2147483647 returns -3 (ESRCH).
+om2
+text ppre "/proc/"
+text psst "/stat"
+text pstatus "/status"
+text key "Cpus_allowed_list:"
+text unused "A"
+global path uchar 64
+global st uchar 4096
+global fv long 2
+global status uchar 4
+
+note "/proc/<pid>/<tail>" into path; returns its length. Another process's /proc entry is read, never
+note /proc/self: qemu-user, which runs the x86linux build, fakes the caller's own stat and status.
+fn mkpath pid ulong tail view uchar * to ulong
+for i ulong len ppre
+put path i get ppre i
+end
+p = len ppre
+d = ulong 1
+while le mul d 10 pid
+d = mul d 10
+end
+while gt d 0
+put path p uchar add 48 rem div pid d 10
+p = add p 1
+d = div d 10
+end
+for j ulong len tail
+put path add p j get tail j
+end
+ret add p len tail
+end
+
+note Read /proc/<pid>/<tail> into st; returns its length (0 on failure).
+fn slurp pid ulong tail view uchar * to ulong
+n = mkpath pid tail
+fd = fopen path 0 n 524288 0
+if lt fd 0
+ret 0
+end
+m = read int fd st 0 len st
+c = fclose int fd
+if le m 0
+ret 0
+end
+ret ulong m
+end
+
+note /proc/<pid>/stat: fv[0] = the state letter (field 3), fv[1] = nice (field 19); 1 on success.
+fn readstat pid ulong to ulong
+k = slurp pid psst
+if eq k 0
+ret 0
+end
+rp = ulong 0
+for i ulong k
+if eq get st i 41
+rp = i
+end
+end
+p = add rp 2
+if ge p k
+ret 0
+end
+put fv 0 long get st p
+tok = ulong 0
+q = p
+while lt q k
+if eq tok 16
+break
+end
+if eq get st q 32
+tok = add tok 1
+end
+q = add q 1
+end
+if ne tok 16
+ret 0
+end
+ng = ulong 0
+if eq get st q 45
+ng = 1
+q = add q 1
+end
+v = long 0
+while lt q k
+d = get st q
+if or lt d 48 gt d 57
+break
+end
+v = add mul v 10 long sub d 48
+q = add q 1
+end
+if eq ng 1
+v = neg v
+end
+put fv 1 v
+ret 1
+end
+
+note Wait (without reaping) until pid is a zombie, then leave its stat in fv; 1 on success.
+fn zombie pid ulong to ulong
+for t ulong 400000
+if eq readstat pid 1
+if eq get fv 0 90
+ret 1
+end
+end
+end
+ret 0
+end
+
+fn reap pid long to ulong
+r = waitpid int pid status 0 len status 0
+if ne r pid
+ret 1000
+end
+if ne get status 0 0
+ret add 2000 ulong and get status 0 127
+end
+ret ulong get status 1
+end
+global m uchar 2048
+global first ulong 2
+
+note The Cpus_allowed_list of /proc/<pid>/status: first[0] = its first CPU, first[1] = 1 when the
+note list is exactly that one CPU; 1 on success.
+fn cpus pid ulong to ulong
+k = slurp pid pstatus
+if eq k 0
+ret 0
+end
+kl = len key
+i = ulong 0
+while le add i kl k
+hit = ulong 1
+for j ulong kl
+if ne get st add i j get key j
+hit = 0
+break
+end
+end
+if eq hit 1
+q = add i kl
+while lt q k
+if ne get st q 9
+break
+end
+q = add q 1
+end
+v = ulong 0
+s = q
+while lt q k
+d = ulong get st q
+if or lt d 48 gt d 57
+break
+end
+v = add mul v 10 sub d 48
+q = add q 1
+end
+if or eq q s ge q k
+ret 0
+end
+put first 0 v
+put first 1 0
+if eq get st q 10
+put first 1 1
+end
+ret 1
+end
+i = add i 1
+end
+ret 0
+end
+
+fn clear to void
+for i ulong len m
+put m i 0
+end
+end
+
+fn setbit off ulong c ulong to void
+put m add off shr c 3 uchar shl 1 and c 7
+end
+
+note A forked child calls setaff 0 m off n and exits 0 when it returns 0 (1 otherwise); returns
+note 1 when the zombie's list is exactly CPU k and the child exit was 0, else the child exit + 10.
+fn single off ulong n ulong k ulong to ulong
+pid = fork
+if lt pid 0
+ret 1001
+end
+if eq pid 0
+r = setaff 0 m off n
+if ne r 0
+exit 1
+end
+exit 0
+end
+if eq zombie ulong pid 0
+ret 1002
+end
+ok = cpus ulong pid
+x = reap pid
+if ne x 0
+ret add x 10
+end
+if or eq ok 0 or ne get first 0 k ne get first 1 1
+ret 0
+end
+ret 1
+end
+
+note The same through a read-only view parameter.
+fn viewkid v view uchar * k ulong to ulong
+pid = fork
+if lt pid 0
+ret 1001
+end
+if eq pid 0
+r = setaff 0 v 0 128
+if ne r 0
+exit 1
+end
+exit 0
+end
+if eq zombie ulong pid 0
+ret 1002
+end
+ok = cpus ulong pid
+x = reap pid
+if ne x 0
+ret add x 10
+end
+if or eq ok 0 or ne get first 0 k ne get first 1 1
+ret 0
+end
+ret 1
+end
+
+note A forked child calls setaff 0 m off n; returns its exit (103 for trap 3).
+fn trapkid off ulong n ulong to ulong
+pid = fork
+if lt pid 0
+ret 1001
+end
+if eq pid 0
+r = setaff 0 m off n
+exit 98
+end
+ret reap pid
+end
+
+note The inherited list of a child that does nothing: first CPU and whether it is a single CPU.
+fn control to ulong
+pid = fork
+if lt pid 0
+ret 0
+end
+if eq pid 0
+exit 0
+end
+if eq zombie ulong pid 0
+ret 0
+end
+ok = cpus ulong pid
+if ne reap pid 0
+ret 0
+end
+ret ok
+end
+
+fn main to int
+if eq argcnt 99
+note never runs: a text slice is accepted by the compiler (setaff only reads A).
+r = setaff 0 unused 0 len unused
+ret int r
+end
+if eq control 0
+ret 1
+end
+k = get first 0
+one = get first 1
+clear
+setbit 0 k
+if ne single 0 128 k 1
+ret 2
+end
+clear
+r = setaff 0 m 0 128
+if ne r neg long 22
+ret 3
+end
+if or eq control 0 or ne get first 0 k ne get first 1 one
+ret 3
+end
+if ne trapkid 0 0 103
+ret 4
+end
+if ne trapkid 0 1025 103
+ret 5
+end
+clear
+setbit 0 k
+if ne single 0 1024 k 1
+ret 6
+end
+if ne trapkid 1960 128 103
+ret 7
+end
+clear
+setbit 7 k
+if ne single 7 128 k 1
+ret 8
+end
+note A global cannot be an argument (error 19), so the view check gets a local mask.
+lm = new uchar 128 0
+put lm shr k 3 uchar shl 1 and k 7
+if ne viewkid lm k 1
+ret 9
+end
+if ne geteuid 0
+r = setaff 1 m 0 128
+if ne r neg long 1
+ret 10
+end
+end
+r = setaff 2147483647 m 0 128
+if ne r neg long 3
+ret 11
+end
+ret 0
+end
