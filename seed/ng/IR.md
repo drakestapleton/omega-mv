@@ -3,8 +3,8 @@
 ```text
 Document:   seed/ng/IR.md (ΩIR wire version 9, tag omega.ng.ir.v1)
 Status:     PROPOSED draft v0.1 (ng-ir lane, Hive NG M0). Witness: seed/ng/ngcheck.om (own reader).
-            Text tools: seed/ng/ngas.om, ngdis.om. In-memory form and the one ng reader/writer:
-            seed/ng/src/ir.om (s14).
+            Text tools: seed/ng/ngas.om, ngdis.om. Reference interpreter: seed/ng/ngrun.om. In-memory
+            form and the one ng reader/writer: seed/ng/src/ir.om (s14).
 Decisions:  Hive NG D1b, D2 + D2b + D2c, D3, D7, D10, D11 (2026-11-07).
 Family:     spec/one-layer-format.md (OSC binary IR). Versions 1..8 are untouched by this document.
 Pin:        omega-mv 943d955531b9d4d9f70deb41756c0b46441dd5e0, omc sha256 5f90edea…6df.
@@ -677,6 +677,12 @@ byte mutations of assembled fixtures for what text cannot spell (MAGIC, VERSION,
 NONCANONICAL, TRAILING, UNKNOWN_OP, counts over s12), each judged by ngcheck and ngdis alike and by
 `ng ir-copy` as s14 states, and inputs the gate generates at the capacities (16777216 bytes and one
 more, 65537 types, globals, functions, blocks and parameters).
+Run pairs
+(`x-NAME.oir` with `x-NAME.om`, the same program in Omega) are the D9 differential of this
+document's semantics: `seed/ng/ngrun.om`, the reference interpreter of s7, runs the ΩIR, omc
+compiles and runs the Omega, and exit status, stdout and stderr must be equal, traps at the exact
+boundaries included (overflow at 2^63, fuel at exactly 1e6 passes, index == len, MIN div -1,
+shift by the width, a conversion one past the range).
 
 ## 11. Refusal classes and ngcheck exit codes
 
