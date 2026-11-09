@@ -581,3 +581,17 @@ stage revisions `a5927895`, `7fb62f3a`, `ad220c05` and `f6a6492f`. A Radicle
 clone of main did not contain them, so each replay failed as "historical
 compiler source identity mismatch". An `ours` merge of `f6a6492f` (tree
 unchanged) makes all four reachable from main.
+
+Full `qualify-x86.py` runs on 2026-11-09 (QEMU 10.0.14 rebuilt from the pinned
+archive, binary sha256 not the pinned `QEMU_ORACLE_SHA256`; omega-bridge copy with
+its x86 pins set to the measured omc): main `1e3ecbba` with omc `6d1b1cf5` gave
+15772 PASS, 37 FAIL, 31 NOT_RUN, 30 MISSING_IMPLEMENTATION, 24 BLOCKED and 311
+EXCLUDED; `1c83b85d` with omc `c809d3c7` gave 15797 PASS, 41 FAIL, 31 NOT_RUN,
+12 MISSING_IMPLEMENTATION, 24 BLOCKED and 320 EXCLUDED. The only status changes
+are the 18 scrub rows (MISSING_IMPLEMENTATION to PASS), the new s5 rows, and the
+four new x86 mutants, reported FAIL until their entries were added to the
+expected-kill table in `qualify-x86.py` (an s5-only rerun then reports all four PASS).
+Both verdicts stay FAIL: 36 C2 rows drift from their frozen bytes on the default
+target (FINDING-c2-undeclared), `uvmctl` loses its emulator-artifact
+classification under the unpinned QEMU binary, and dit, fma, execpure and the
+eventfd/VFIO words remain unimplemented on x86. Native x86 remains NOT_RUN.
