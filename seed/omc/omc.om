@@ -835,7 +835,7 @@ put tkb 0 get inlen 0
 put tk 0 3
 end
 
-note ======== keyword lookup (original om4 KWTAB plus native host words 100..177, flock 197 and execpure 198) ========
+note ======== keyword lookup (original om4 KWTAB plus native host words 100..177, flock 197, execpure 198 and execenv 233) ========
 note genkw.awk describes the original om4 table only; retain the native host extension on regeneration.
 note efi (178) is a keyword only under `target x86efi`; gate18 checks that scoped entry separately.
 fn kw w ulong to ulong
@@ -1363,6 +1363,9 @@ ret 224
 end
 if eq w 6384998
 ret 227
+end
+if eq w 33335428990204005
+ret 233
 end
 if eq get om2 0 0
 ret 0
@@ -4496,10 +4499,6 @@ note The addend is Ra, bits 14..10; multiplicands Rn, Rm are bits 9..5, 20..16.
 fn ffma dst ulong to void
 o = get fpo 0
 put fpo 0 0
-note x86's baseline is SSE2, not FMA3. No unfused fallback is permitted.
-if or ne get irmode 0 0 ne get xtarget 0 0
-fail 9
-end
 put fpw 0 1
 rdval 0 0 255 0
 if eq get rk 0 6
@@ -4528,6 +4527,12 @@ fail 11
 end
 if ne get rt 0 at
 fail 7
+end
+note x86's baseline is SSE2, not FMA3. No unfused fallback is permitted. The operands are typed
+note first, so an ill-typed fma gets the same error 7 or 11 on every target; only a well-typed one
+note is refused here.
+if or ne get irmode 0 0 ne get xtarget 0 0
+fail 9
 end
 va = fvop ak av at 0
 vb = fvop bk bv at 1
@@ -6386,12 +6391,29 @@ end
 note A packed argument list is u16 count followed by count (u16 length, bytes) records.
 note Byte order is little-endian. The packet is at most 4096 bytes and 64 records.
 note The decoder constructs kernel pointers only in private stack memory.
+note execenv 233 (execenv A off n B off m) decodes a second packet, the environment, with the same
+note rules except that every record must be nonempty. Its base and length are loaded into x14/x15
+note before SPSUB (save-area reads are SP-relative) and both packets are checked before any fd closes.
+note Stack: argv strings SP, argv pointers SP+4096, env strings SP+8192, env pointers SP+12288.
 fn hpack c ulong dst ulong x ulong to void
 errs = new ulong 16 0
 tbl = new ulong 27 0
 e = harray x 0
 if eq c 125
 harg x 2 8
+end
+if eq c 233
+put fr add x 23 e
+put fr add x 24 get fr add x 21
+put fr add x 25 get fr add x 22
+e = harray x 0
+put fr add x 26 e
+put fr add x 27 get fr add x 21
+put fr add x 28 get fr add x 22
+put fr add x 20 get fr add x 23
+put fr add x 21 get fr add x 24
+put fr add x 22 get fr add x 25
+e = get fr add x 23
 end
 save
 basearg 4 e
@@ -6406,8 +6428,30 @@ trapc 3 3
 if eq c 125
 hload x 2 14
 end
-spsub 8192
+note stack is 8192 bytes per packet: one packet pass, or two for execenv (the pass bound is stack >> 13).
+stack = ulong 8192
+if eq c 233
+note x14 = env base + off (ADD), x15 = env length; length 2..4096 (CMP x15,x16 B.HI; CMP x15,#2 B.LO).
+basearg 14 get fr add x 26
+loadarg 16 1 get fr add x 27
+e3 2332033024 14 14 16
+loadarg 15 1 get fr add x 28
+matconst 16 4096
+e3 3942645760 31 15 16
+trapc 8 3
+emit 4043311615
+trapc 3 3
+stack = ulong 16384
+end
+spsub stack
 stkchk
+pass = ulong 0
+while lt pass shr stack 13
+if eq pass 1
+note MOV x4,x14; MOV x5,x15 (ORR with XZR): the environment packet.
+e3 2852126720 4 31 14
+e3 2852126720 5 31 15
+end
 emit 2034237574
 emit 2432698500
 emit 3506440357
@@ -6421,8 +6465,14 @@ emit 4043311327
 trapc 1 3
 end
 matconst 9 0
+if eq pass 0
 emit 2432697322
 emit 2436892651
+else
+note ADD x10,SP,#2,LSL12; ADD x11,SP,#3,LSL12: env strings and env pointers.
+emit 2436893674
+emit 2436894699
+end
 outer = get oc 0
 e3 3942645760 31 9 6
 done = get oc 0
@@ -6434,14 +6484,20 @@ emit 2432698500
 emit 3506440357
 e3 3942645760 31 12 5
 trapc 8 3
-note A program path and both rename paths must be nonempty.
-if or eq c 124 eq c 198
+note A program path and both rename paths must be nonempty; every environment record is nonempty.
+note (Nested conditions keep om4 within its 16 live registers.)
+if eq pass 0
+if or or eq c 124 eq c 198 eq c 233
 emit 4043309375
 notfirst = get oc 0
 emit 1409286145
 emit 4043309471
 trapc 0 3
 patch19 notfirst get oc 0
+else
+emit 4043309471
+trapc 0 3
+end
 else
 emit 4043309471
 trapc 0 3
@@ -6470,7 +6526,9 @@ patch19 done get oc 0
 emit 4043309247
 trapc 1 3
 emit 4177527167
-if or eq c 124 eq c 198
+pass = add pass 1
+end
+if or or eq c 124 eq c 198 eq c 233
 note Exec admits only the caller-assigned standard streams. Linux close_range with UNSHARE
 note closes every descriptor >=3 in a private table. Failure returns without executing a child;
 note no guessed descriptor ceiling or permissive fallback. This is not filesystem isolation.
@@ -6664,7 +6722,13 @@ patch26 outer get oc 0
 else
 emit 2432697312
 emit 2436892641
+if eq c 233
+note ADD x2,SP,#3,LSL12: envp is the private environment pointer list.
+emit 2436894690
+else
+note MOV x2,x11: envp is the argv list's NULL terminator, an empty environment.
 e3 2852126720 2 31 11
+end
 hsys 221
 end
 patch19 done get oc 0
@@ -6695,7 +6759,7 @@ hsys 36
 end
 end
 end
-spadd 8192
+spadd stack
 hreturn dst x
 end
 
@@ -7823,8 +7887,9 @@ if eq c 197
 hscalar c dst x
 ret
 end
-note execpure 198 is dispatched here, before the ge c 173 mapped-memory range below would claim it.
-if eq c 198
+note execpure 198 and execenv 233 are dispatched here, before the ge c 173 mapped-memory range below
+note would claim them.
+if or eq c 198 eq c 233
 hpack c dst x
 ret
 end
@@ -8500,7 +8565,7 @@ if eq c 224
 hostval c dst
 ret
 end
-if and ge c 228 le c 232
+if or and ge c 228 le c 232 eq c 233
 hostval c dst
 ret
 end
@@ -15522,14 +15587,42 @@ xrr 137 6 4
 xhcall 46
 xhdone dst x 80
 end
+note execenv 233 on x86-64: as on AArch64, a second pass decodes the environment packet (every record
+note nonempty) into env strings at RSP+8192 and env pointers at RSP+12288; both checks precede close_range.
 fn xhpack c ulong dst ulong x ulong to void
 e = harray x 0
 if eq c 125
 harg x 2 8
 end
+if eq c 233
+put fr add x 23 e
+put fr add x 24 get fr add x 21
+put fr add x 25 get fr add x 22
+e = harray x 0
+put fr add x 26 e
+put fr add x 27 get fr add x 21
+put fr add x 28 get fr add x 22
+put fr add x 20 get fr add x 23
+put fr add x 21 get fr add x 24
+put fr add x 22 get fr add x 25
+e = get fr add x 23
+end
 xhbegin
+note stack is 8192 bytes per packet; the pass bound is stack >> 13 (two passes for execenv).
+stack = ulong 8192
+if eq c 233
+stack = ulong 16384
+end
+pass = ulong 0
+while lt pass shr stack 13
+if eq pass 0
 xhb 6 e get fr add x 21
 xhs 2 get fr add x 22
+else
+note The slot snapshot is RBX-relative, so the environment slice is read after the RSP move.
+xhb 6 get fr add x 26 get fr add x 27
+xhs 2 get fr add x 28
+end
 xhcmp 2 4096
 xtrap 8 3
 xhcmp 2 2
@@ -15541,13 +15634,18 @@ xrr 133 8 8
 xtrap 0 3
 xhcmp 8 64
 xtrap 8 3
-if ne c 124
+if or or eq c 125 eq c 141 eq c 142
 xhcmp 8 2
 xtrap 1 3
 end
-xsp 1 8192
+if eq pass 0
+xsp 1 stack
 xrr 137 10 4
 xmem 141 13 4 4096
+else
+xmem 141 10 4 8192
+xmem 141 13 4 12288
+end
 ximm 9 0
 outer = get oc 0
 xrr 57 9 8
@@ -15559,7 +15657,7 @@ xhadd 6 2
 xhsub 2 2
 xrr 57 1 2
 xtrap 8 3
-if eq c 124
+if and eq pass 0 or eq c 124 eq c 233
 xrr 133 9 9
 notfirst = xbranch 1
 xrr 133 1 1
@@ -15596,7 +15694,9 @@ xrr 133 2 2
 xtrap 1 3
 ximm 0 0
 xmem 137 0 13 0
-if eq c 124
+pass = add pass 1
+end
+if or eq c 124 eq c 233
 note As on AArch64: close_range(3, ~0U, CLOSE_RANGE_UNSHARE) first; a nonzero result skips execve
 note and returns that kernel error. RDI/RSI/RDX are reloaded after the call; R13 holds the argv end.
 ximm 7 3
@@ -15607,7 +15707,11 @@ xrr 133 0 0
 p = xbranch 1
 xmem 139 7 4 4096
 xmem 141 6 4 4096
+if eq c 233
+xmem 141 2 4 12288
+else
 xrr 137 2 13
+end
 xhcall 59
 xpatch p get oc 0
 else
@@ -15630,7 +15734,7 @@ xhcall 266
 end
 end
 end
-xhdone dst x 8192
+xhdone dst x stack
 end
 note Hosted handles use the entry31 context header and 13 slot bits; programs retain raw128 slots.
 fn xhmcheck to void
@@ -16251,7 +16355,7 @@ if or or or eq c 121 eq c 122 eq c 136 eq c 137
 xhargs c dst x
 ret
 end
-if or or or eq c 124 eq c 125 eq c 141 eq c 142
+if or or or or eq c 124 eq c 125 eq c 141 eq c 142 eq c 233
 xhpack c dst x
 ret
 end

@@ -19,6 +19,7 @@ sh seed/omc/gate12.sh
 sh seed/omc/gate13.sh
 sh seed/omc/gate14.sh
 sh seed/omc/gate15.sh
+sh seed/explain/gate.sh
 sh seed/omc/gate16.sh
 sh seed/omc/gate17.sh
 sh seed/omc/gate18.sh
@@ -124,6 +125,9 @@ grep -qx 'OM2GATE FAIL cases=24 pass=12 fail=12 invalid=0 not_run=0' "$run/fnhos
 [ "$(grep -c '^VERDICT ctl-fn-[a-z0-9]* PASS ' "$run/fnhostmut.log")" = 12 ]
 [ "$(grep -c '^VERDICT fn-[a-z0-9]* FAIL ' "$run/fnhostmut.log")" = 12 ]
 echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
+# execenv 233: exact child environment (AArch64 and x86linux), printenv ORACLE, execprog negative
+# control, function-mode and contract refusals, and 4 omc.om mutants killed (seed/host/execenv/).
+"$B/gate" seed/out/omc "$pin" seed/host/execenv/execenv.cases "$run/execenv"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2

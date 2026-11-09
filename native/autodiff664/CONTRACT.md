@@ -82,26 +82,40 @@ The compiler of PR #1022 (`efi 14`) is
 (`seed/omc/omc.om` `0effe37afc4ddd0507151c9f2afa34b3e6774eae7006cbecd8c59f11bc386db7`).
 On 2026-11-04 the tape suite passed against it the same way (DGX Spark, Linux aarch64, core 9):
 `TAPE_SUITE_PASS NATIVE_TAPE_PASS checks=302`, all three compiled mutants failed with status 1.
+On 2026-11-07, with the signed-zero padding checks and the fourth mutant added (DRA-14
+follow-up), the suite passed against the reseeded compiler
+`cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a` (main `6efc4572`, DGX Spark,
+Linux aarch64, cores 10-11): `TAPE_SUITE_PASS NATIVE_TAPE_PASS checks=351`, all four compiled
+mutants failed with status 1. `tape.om` is unchanged (sha256 `1b4ed431…8bde`).
 
 ```sh
 OMC=<pinned omc> OUT=<scratch> sh tests/autodiff664/run-tape.sh
-# TAPE_SUITE_PASS NATIVE_TAPE_PASS checks=302
+# TAPE_SUITE_PASS NATIVE_TAPE_PASS checks=351
 ```
 
-- `tests/autodiff664/tape-test.om` (302 checks). Expected values come from
+- `tests/autodiff664/tape-test.om` (351 checks). Expected values come from
   separate code paths in the test: a test-local E1 tile, a sequential sum,
-  IEEE identities (`x·x` grad is `x + x`, SUB grad is `neg s`) and the f64
-  widening control. No expected value is a hand-entered constant. `torder`
+  IEEE identities (`x·x` grad is `x + x`, SUB grad is `neg s`, a sum of −0
+  values is −0) and the f64 widening control. No expected value is a
+  hand-entered constant. `torder`
   requires at least one input where the tree sum differs from the sequential
-  sum, and requires the tape to follow the tree on every input. Deviation from
+  sum, and requires the tape to follow the tree on every input. `tnzsum`,
+  `tnzmm` and `tnzbc` (49 checks) feed all −0 inputs to `tpsum` on both axes,
+  to the matmul forward and both matmul backward reductions, and to the
+  broadcast backward reduction, and require the bits `0x80000000`: a +0 pad
+  would turn every one of them into +0. Random inputs cannot see the pad value.
+  Deviation from
   the plan: these are not Wolfram-computed literal bit patterns. A rounding
   mistake shared by the tape and the test-local tile would pass here. That case
   is covered elsewhere: by the C M21 fixture replay below, and by the
   exact-rational Wolfram oracle on the full training step in aien-train
   `tests/adtrain/gradient.wl`, which gave 58/58 exact.
-- `tests/autodiff664/mutate.om`: three compiled source mutants of `tape.om`
-  (SUB sign dropped, MUL operand swapped to `value(in0)`, RELU tie `gt`→`ge`).
-  Each compiles with rc 0 and makes the test exit 1, at checks 212, 66 and 171.
+- `tests/autodiff664/mutate.om`: four compiled source mutants of `tape.om`
+  (SUB sign dropped, MUL operand swapped to `value(in0)`, RELU tie `gt`→`ge`,
+  E1 pad +0 instead of −0 in `e1tree`).
+  Each compiles with rc 0 and makes the test exit 1, at checks 212, 66, 171 and 305.
+  The pad mutant passed the earlier 302-check test (found by the DRA-14 replay,
+  aien-train `tests/adtrain/replay/padprobe.om`).
 - `tests/test_omega_ad_fixture.c` (`make test-autodiff-fixture FIXTURE=…`)
   replays one MLP step written by the native trainer (aien-train
   `tests/adtrain`, mode D) on the C M21 tape over the M20 CPU table.
