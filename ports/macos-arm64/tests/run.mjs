@@ -9,7 +9,7 @@ const root = path.resolve(new URL('..', import.meta.url).pathname);
 const build = path.join(root, 'build');
 const evidence = path.join(build, 'qualification');
 fs.mkdirSync(evidence, { recursive: true });
-const compiler = '/home/drakestapleton/handoffs/omega-developer-gaps/shared/omc-191b776e';
+const compiler = process.env.L615_OMC || '/home/drakestapleton/handoffs/omega-developer-gaps/shared/omc-191b776e';
 const compilerHash = '191b776ef98821597c3e30655da6d680a9b66edbc9ceaca3c39c61ea6df098e9';
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
 const pins = [], results = [];

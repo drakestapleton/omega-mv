@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 const root = path.resolve(new URL('..', import.meta.url).pathname);
-const compiler = '/home/drakestapleton/handoffs/omega-developer-gaps/shared/omc-191b776e';
+const compiler = process.env.L615_OMC || '/home/drakestapleton/handoffs/omega-developer-gaps/shared/omc-191b776e';
 const expectedHash = '191b776ef98821597c3e30655da6d680a9b66edbc9ceaca3c39c61ea6df098e9';
 function run(cmd, args) {
   const r = spawnSync(cmd, args, { timeout: 90000, maxBuffer: 1024*1024 });
