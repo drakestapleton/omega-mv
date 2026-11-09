@@ -132,6 +132,43 @@ has a 16-register allocation pool. The abandoned implementation violated both;
 the continuation shortens two local names and separates record/pair checks to
 fit the existing compiler. The compiler itself is unchanged.
 
+## Native executor (`src/learning/benchmark/run.om`)
+
+Added at L775 run 298 (2026-11-09) on omega-mv main `1e3ecbba`. Compose
+`core.om`, `run.om`, then the caller. `rlaunch idx limit` runs argv[idx] as a
+fresh child: empty stdin pipe, stdout pipe, then `execpure` (the strict profile
+in `docs/one_layer/OMEGESE.md`: Landlock, seccomp read/write/exit only,
+`prlimit` ceilings, empty environment). There is no `execprog` fallback. The
+supervisor adds what `execpure` leaves to it: a wall deadline in nanoseconds and
+a 256-byte output cap. `RObs` returns the `lobserve` status (0 completed,
+4 timeout, 5 resource, 6 operational), exit code, captured bytes and elapsed
+nanoseconds; `rkeep 0|1` copies the bytes into `LWant`/`LGot`.
+
+| Condition | Status |
+|---|---|
+| Deadline passed | child killed (signal 9), reaped, 4 |
+| More than 256 stdout bytes | child killed, reaped, 5 |
+| Child ended by a signal (CPU limit, seccomp kill) | 5 |
+| Missing argument, absent path, pipe or fork failure | 6, nothing launched |
+| Normal exit | 0, with its exit code; `lobserve` judges code and bytes |
+
+`tests/learning/benchmark/run-test.om` runs real children: the L776 oracle
+(expected bytes), the observable (0), the saturating mutant (7), an empty
+writer (9), a 10^12-step loop (4 at 500 ms), the division trap (8), a
+4096-byte writer (5), an absent path (6) and a fork attempt (9: the strict
+profile refuses `fork`). It then charges all eight attempts with their measured
+judge time and the 128 MiB address-space ceiling as peak bytes (energy
+unknown): pass@1 is 1 of 8, and a run with one task never attempted cannot
+finish (30). Five compiled mutants of `run.om` (deadline ignored, timeout
+reported complete, cap removed, absent path launched, `execprog` instead of
+`execpure`) each fail the check of the case they falsify. The process words
+need the main seed compiler; the older `191b776e` pin refuses them (error 3).
+Evidence: `evidence/LEARNING-652/benchmark/L775-run298/`.
+
+Not covered: compiling candidates, measuring compiler/executable identities
+(`LPin` is still caller-supplied), the signal branch with a real signal, peak
+memory and energy measurement, and protected-split custody.
+
 ## Qualification and limits
 
 The native component test executes 185 checks. Exact-identity bypass and
@@ -143,13 +180,12 @@ mutant exits zero but differs in value, and this component refuses it with
 wrong-value code 7. This is bounded host-native testing, not formal proof,
 general native translation equivalence or physical GPU evidence.
 
-The native benchmark runner, protected split custody, calibrated abstention,
-model/direct-search/retrieval arms, sample-size freeze, learning, persistence
-and full-cost comparison are NOT_RUN. The existing compiler lacks a qualified
-native process/isolation/file seam for this consumer. Shell commands, `cat`,
-`timeout`, `readelf`, `sha256sum` and `/usr/bin/time` are disclosed external
-development orchestration, not a shipped native runner. The component does not
-replace a production consumer, so no existing code or dependency is deleted.
+Protected split custody, calibrated abstention, model/direct-search/retrieval
+arms, sample-size freeze, learning, persistence and full-cost comparison are
+NOT_RUN. Candidate compilation and identity measurement are not part of the
+executor above. The replay scripts (`cat`, `timeout`, `readelf`, `sha256sum`)
+are disclosed development orchestration. The component does not replace a
+production consumer, so no existing code or dependency is deleted.
 
 No model or tokenizer was consumed in these tests; their experiment identities
 remain NOT_RUN, rather than invented. Raw compiler failures and runtime failures
