@@ -12,9 +12,9 @@ own measurements, not a reproduction of the published figures. This note qualifi
 | LOGS | https://github.com/RikiyaT/lm_understand-logs, folder `exp8_math/` (sparse clone at `~/work/wsp/refs/lm_understand-logs`) | commit `4d09ba6d6a7e891dd8063974dfe81b3d78e3494f` |
 | HF | https://huggingface.co/RikiyaT/Qwen3.5-0.8B-weight-space-programming (README and file listing only, read through the HF tree API and the raw README) | revision `d1671a178705bcab7644806d23c535517f35723b` |
 
-Rules we kept while reading. No weight file was downloaded or run (no `.safetensors`, `.bin` or `.gguf`).
+Rules I kept while reading. No weight file was downloaded or run (no `.safetensors`, `.bin` or `.gguf`).
 The HF listing shows one weight file, `model.safetensors-00001-of-00001.safetensors`, 1,746,943,032 bytes,
-LFS sha256 `fd1e42acdd118ac1b300d37500fd2885e75f5a09de3a33010d802bf7f737b553`; we record it and did not fetch it.
+LFS sha256 `fd1e42acdd118ac1b300d37500fd2885e75f5a09de3a33010d802bf7f737b553`; I record it and did not fetch it.
 Derived numbers were computed with the Wolfram Language evaluator; each one is quoted with its query.
 
 ## 1. What weight-space programming is
@@ -25,7 +25,7 @@ it does not fit weights to a loss, and it does not write a training loop. It may
 behaviour through a small, counted budget of forward passes.
 
 BLOG reports eight experiments. This note covers Experiment 8 only (make Qwen3.5-0.8B better at math)
-and its Gemma 3 270M follow-up, because that is the one that resembles our DRA-187 question: can a
+and its Gemma 3 270M follow-up, because that is the one that resembles my DRA-187 question: can a
 targeted, gradient-free edit fix a demonstrated failure of a language model without harming the rest.
 
 ### 1.1 The harness (LOGS `exp8_math/README.md`)
@@ -98,7 +98,7 @@ All rows published, not reproduced here.
 | p25c | 25 | zero columns 1792:2048 of `layers.15.self_attn.o_proj.weight` (switches off attention head 7 of layer 15) | 262,144 |
 | p50c | 50 | the top-64 alpha 6 repetition-direction removal on `layers.15` and `layers.19` `mlp.down_proj.weight` | 130,188 of 131,072 touched |
 
-Correction to our brief: the brief said "released checkpoints p10c/p25c/p50c". HF releases only the p50c
+Correction to my brief: the brief said "released checkpoints p10c/p25c/p50c". HF releases only the p50c
 model. p10c and p25c are published as exact edit diffs in LOGS (`runs/<run>/edit/`), not as checkpoints.
 
 Wolfram checks for the edit sizes:
@@ -137,7 +137,7 @@ Wolfram checks for the edit sizes:
 Sampling for every Qwen row: vLLM, chat template with thinking on, temperature 0.6, top_p 0.95, top_k 20,
 presence penalty 1.5, at most 32,768 new tokens, seed 0. Samples per problem: MATH-500 4, GSM8K 2, IFEval 2,
 AMC23 16, Minerva 4, OlympiadBench 4, GPQA Diamond 4, MMLU-Pro (fixed 1,000) 1. Sources: BLOG table, LOGS
-`eval/<run>/merged.json`, `eval/RESULTS_excerpt.md`. We re-read the four `merged.json` files and they match BLOG.
+`eval/<run>/merged.json`, `eval/RESULTS_excerpt.md`. I re-read the four `merged.json` files and they match BLOG.
 
 | Qwen3.5-0.8B | MATH-500 % | GSM8K % | IFEval % | MATH-500 hit token limit % | Label |
 |---|---|---|---|---|---|
@@ -182,10 +182,10 @@ Wolfram check of the paired statistic: with
 
 - HF independent re-run of the p50c checkpoint by a third party (akhaliq, 2026-11-02, H200, vLLM 0.33.0):
   MATH-500 51.0%, 31.6% at the token limit; a 25-problem base smoke test gave 5.0%. Published, not reproduced here.
-  Wolfram `51.0-48.1` -> 2.9 pp above BLOG's figure. We make no claim about its cause: no uncertainty analysis
+  Wolfram `51.0-48.1` -> 2.9 pp above BLOG's figure. I make no claim about its cause: no uncertainty analysis
   was done, and the re-run is not the same checkpoint file. The HF card says BLOG evaluated a text-only export,
   while the re-run used the full multimodal release; the card states the language-model tensors are
-  hash-identical and text prompts do not use the vision tower, which we did not check.
+  hash-identical and text prompts do not use the vision tower, which I did not check.
 - Smaller budgets: p10c's own paired check on 512 practice problems was +3.71 pp (SE 1.79), described by the editor
   as "modest"; p25c's on 768 practice problems was +8.33 pp (SE 1.43). Published, not reproduced here.
 - Other runs in `RESULTS_excerpt.md`, not in BLOG: 0 and 5 passes made no edit; prompt v4 at 10 passes submitted
@@ -199,7 +199,7 @@ Wolfram check of the paired statistic: with
 
 DEMONSTRATED = shown with controls in the source. CONDITIONAL = shown only in their setting (one model,
 one failure mode, practice problems rather than test, agent-driven search). SPECULATIVE = a generalisation
-the sources do not test. Every figure in this table is published, not reproduced here; the classes are our reading.
+the sources do not test. Every figure in this table is published, not reproduced here; the classes are my reading.
 
 | # | Claim | Class | Basis and limits |
 |---|---|---|---|
@@ -218,9 +218,9 @@ the sources do not test. Every figure in this table is published, not reproduced
 
 ## 4. Reproduction status
 
-**Qwen3.5-0.8B reproduction: NOT_RUN by Drake's no-outside-models rule (2026-11-07). The method, not the model, is proposed for adaptation to our own Omega checkpoints under DRA-187.**
+**Qwen3.5-0.8B reproduction: NOT_RUN by Drake's no-outside-models rule (2026-11-07). The method, not the model, is proposed for adaptation to my own Omega checkpoints under DRA-187.**
 
-Our target is the round40 own tool model (`~/.local/share/omega-tool-model/round40/model.ck`, sha256
+My target is the round40 own tool model (`~/.local/share/omega-tool-model/round40/model.ck`, sha256
 `7c7b5b5260f2d9453b6076b64e7f23e88341d96498584f2dfaa229c31ad2e346`, read in place only): V 4096, T 256,
 D 384, H 12, F 1536, L 8, P 15,833,472 parameters, OLLMCK02 layout (CONTRACT-V1 section 6). Probes are `.om`
 units built by `tools/omegallm/wdrive/wbuild.om` from pinned source parts; patches are written and checked
@@ -228,7 +228,7 @@ by `wpatch`, a separate `.om` program (`tools/omegallm/wpatch/`). All run on CPU
 as an independent checker (labelled ORACLE).
 
 Layout note for the mapping. Qwen stores `down_proj` as `[out, in]`, so one MLP neuron's write vector is a
-column. Our checkpoint stores `w2[F][D]` with `y = x . W`, so the same vector is a **row** of `w2`
+column. My checkpoint stores `w2[F][D]` with `y = x . W`, so the same vector is a **row** of `w2`
 (384 values). The Omega form of the p50c edit is `w2'[j] = w2[j] - alpha * (w2[j] . u) * u` for the selected
 rows `j`, and nothing else.
 
@@ -268,15 +268,15 @@ Where the run did a step differently from this plan, the row says so.
 
 1. **Selection on the practice set.** In the source, every candidate (alpha 1, 2, 3, top-64 at alpha 4 and 6) was
    chosen on practice problems from GSM8K and MATH train, and the editor read many outputs. Only the final
-   1,152 problems were reserved. For us: the locked held-out split must be written and hashed before the first
+   1,152 problems were reserved. For me: the locked held-out split must be written and hashed before the first
    probe, and no probe may read it.
 2. **Sampling variance.** Each benchmark checkpoint was scored once (4 or 2 samples per problem); the third-party
    re-run differs by 2.9 pp on MATH-500. LOGS notes that separate generation passes have batching-dependent random
-   numbers, so only within-pass pairs are valid comparisons. For us: pair original and edited on the same prompts
+   numbers, so only within-pass pairs are valid comparisons. For me: pair original and edited on the same prompts
    and seeds, report paired SE, and repeat the final check.
 3. **Benchmark contamination.** MATH-500 is drawn from the MATH test split and GSM8K test is public; the base
    model may have seen either during pretraining. Loop removal does not depend on this, but the absolute scores
-   might. For us: deduplicate held-out items against training text by normalized SHA-256, as in
+   might. For me: deduplicate held-out items against training text by normalized SHA-256, as in
    `WEIGHT-EDIT.md`, and say that exact matching misses near duplicates.
 4. **Model size.** round40 has 15,833,472 parameters. Wolfram `N[100*15833472/(8*10^8)]` -> 1.979 (percent of
    0.8 billion) and `N[8*10^8/15833472]` -> 50.53 (times smaller). A small model may not hold a single clean
@@ -287,21 +287,21 @@ Where the run did a step differently from this plan, the row says so.
    threshold. Wolfram, with `w=3/2; delta=5/2^26`: `N[delta/w]` -> 4.97e-8, below `N[2^-24]` -> 5.96e-8, yet
    f32(w + delta) = 12582913/8388608 = w + 2^-23, so that small edit survives; conversely a larger edit can round
    back to the original f32 value. For comparison, the source's bf16 cast erased 884 of 131,072 touched entries.
-   For us: compare f32(edited) with f32(base) entry by entry, score the f32-rounded file, not the f64 one, and
+   For me: compare f32(edited) with f32(base) entry by entry, score the f32-rounded file, not the f64 one, and
    report how many edited entries survive.
 6. **Retention measurement.** The source has no dedicated retention suite; its "other skills" evidence is
-   benchmark gains that may themselves come from fewer loops. For us: retention gets its own pre-registered tasks
+   benchmark gains that may themselves come from fewer loops. For me: retention gets its own pre-registered tasks
    and threshold, and a loss on them rejects the edit even if the target metric improves.
 7. **The failure must exist.** The method fixed a failure that dominated the base model (93.0% of MATH-500
    answers cut). If round40 has no single dominant failure, a large gain is not expected and should not be
    reported from a small or post-hoc subset.
-8. **Agent-driven search.** The published edit came from a long, adaptive search by one editor model. Our search
-   is designed in advance and run by our own tools, so it is not the same procedure; differences in outcome may
+8. **Agent-driven search.** The published edit came from a long, adaptive search by one editor model. My search
+   is designed in advance and run by my own tools, so it is not the same procedure; differences in outcome may
    come from the search, not the weights.
-9. **Optimizer state.** As `WEIGHT-EDIT.md` already says for our checkpoints, an edited copy keeps Adam moments
+9. **Optimizer state.** As `WEIGHT-EDIT.md` already says for my checkpoints, an edited copy keeps Adam moments
    that do not describe the edited weights; edited checkpoints are for inference until a policy exists.
 10. **New failure modes.** The source edit added one: 51 edited answers ended in whitespace degeneration against
-    0 for the original (section 2.1). For us: count new failure types in the edited model, not only fewer old ones.
+    0 for the original (section 2.1). For me: count new failure types in the edited model, not only fewer old ones.
 
 ## 6. What this note does not do
 
