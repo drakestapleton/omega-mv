@@ -141,6 +141,10 @@ echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # execkeep 238: a flock on descriptor K held across exec while K-1 and K+1 close (AArch64 and x86linux),
 # execenv negative control, fd < 3 trap, refusals, and 6 omc.om mutants killed (seed/host/execkeep/).
 "$B/gate" seed/out/omc "$pin" seed/host/execkeep/execkeep.cases "$run/execkeep"
+# utimens 239: atime/mtime read back through stat and lstat (AArch64 and x86linux), UTIME_NOW/UTIME_OMIT,
+# AT_SYMLINK_NOFOLLOW on a link, errno rows, path traps, refusals, and 6 omc.om mutants killed
+# (seed/host/utimens/).
+"$B/gate" seed/out/omc "$pin" seed/host/utimens/utimens.cases "$run/utimens"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2

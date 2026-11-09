@@ -416,7 +416,7 @@ and close_range(fd+1, ~0U, UNSHARE); either failure returns its errno without
 executing. `setprio which who prio` is Linux setpriority (AArch64 140, x86-64
 141); `setaff pid A off n` is Linux sched_setaffinity (`hsetaff`, AArch64 122;
 `xhsetaff`, x86-64 203), slice checked first, then n 1..1024 (trap 3). Two
-functions were added (512 of 512). Each of the 1651 tracked `.om` files was
+functions were added (512 in all; om4 holds 4096). Each of the 1651 tracked `.om` files was
 compiled alone for AArch64 and for `target x86linux` under `6d1b1cf5` and
 `d791dfd2`: 3266 of the 3302 compiles give the same bytes, exit status and
 diagnostics; the other 36 are the 32 compiles of the 16 new
@@ -425,3 +425,21 @@ compiles of `seed/host/execenv/{execenv,oracle}.om`, whose `execenv` code
 changed. The 52 other tracked sources that use `execprog` or `execpure` are
 byte-identical. Gates: `seed/host/{execenv,setprio,setaff,execkeep}/*.cases`
 (x86linux through qemu-x86_64 user emulation; native x86 NOT_RUN).
+
+The utimens 239 host word (same branch, PROPOSED pending review) births compiler
+`9c57c9dd02c43dee907788804694bd3bd16cd7026f9cbad1a8da2e4a2009dbd0`
+from source
+`fbfa6088dfd2a9d086ca9d96f66a818ebcfa588f5b368540e0b19592516df6ef`.
+`utimens A off n as ans ms mns flags` is Linux utimensat(AT_FDCWD, path,
+{{as, ans}, {ms, mns}}, flags) (`hutimens`, AArch64 88: the path is copied by
+`hpathcp`/`hcopy`, the two timespecs are stored with two STPs in a 32-byte stack
+area, x2 = SP, x3 = flags; `xhutimens`, x86-64 280: rsi = path, the timespecs at
+RSP, rdx = RSP, rdi = -100, r10 = flags). The path slice is checked (trap 3);
+n above 4095 or an embedded zero traps 3; `UTIME_NOW`, `UTIME_OMIT` and flags pass
+through. Two functions were added (514 in all). Each of the 1659 tracked `.om`
+files was compiled alone for AArch64 and for `target x86linux` under `d791dfd2`
+and `9c57c9dd`: 3306 of the 3318 compiles give the same bytes, exit status and
+diagnostics; the other 12 are the AArch64 and x86 compiles of the six
+`seed/host/utimens/` sources, which use the new word (error 3 before). Gate:
+`seed/host/utimens/utimens.cases` (x86linux through qemu-x86_64 user emulation;
+native x86 NOT_RUN).

@@ -19,8 +19,8 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 Current pin after the execenv packet caps and the setprio 234, setaff 237 and execkeep 238 host words (branch `hive/t_3e396ac5-execenv-cap` on rad main `1e3ecbba`, 2026-11-09): committed
 `seed/out/omc` SHA-256
-`d791dfd2af2d507dbb2f956ed6bbaacb963960c0d15fea12202fa629eaf893d7`, compiler
-source SHA-256 `c844796167aa3347320da87be69a3cf4dc59e01ea7bb5e33e662084f13395da4`.
+`9c57c9dd02c43dee907788804694bd3bd16cd7026f9cbad1a8da2e4a2009dbd0`, compiler
+source SHA-256 `fbfa6088dfd2a9d086ca9d96f66a818ebcfa588f5b368540e0b19592516df6ef`.
 The previous pin, after the prlimit 235 host word (rad main `1e3ecbba`), was
 `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8` (source
 `7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`); before that, after x86 types `fma` operands before its error 9 (branch `fix/x86-fma-order`, 2026-11-08), was
@@ -169,7 +169,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    d791dfd2af2d507dbb2f956ed6bbaacb963960c0d15fea12202fa629eaf893d7 \
+    9c57c9dd02c43dee907788804694bd3bd16cd7026f9cbad1a8da2e4a2009dbd0 \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -399,7 +399,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc d791dfd2af2d507dbb2f956ed6bbaacb963960c0d15fea12202fa629eaf893d7 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc 9c57c9dd02c43dee907788804694bd3bd16cd7026f9cbad1a8da2e4a2009dbd0 neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch
