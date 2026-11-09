@@ -32,7 +32,7 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `ngrun.om` | The reference interpreter (IR.md s7): `ngrun FILE.ir` runs the program entry of an accepted unit; output through the real host words, exit status = the entry's result, a failing check exits 100 + code. Unsupported ops (vectors, tiles, kernels, fma, fmath, f16/bf16/fp8) print `ngrun: unsupported op N at OFFSET` and exit 125. Its own limits stay off the trap exits 100..114: `ngrun FILE.ir STEPS` stops after STEPS executed ops (default 2^36, about an hour) with `ngrun: step limit at OFFSET` and exit 124, and an element outside the object its REF or SLICE names (reachable only from input ngcheck refuses) gives `ngrun: access outside storage at OFFSET` and exit 126. Its exit status is an IR result only for a unit ngcheck accepts; on refused input it means nothing. Back ends diff their output against it (D9). It reads through `src/ir.om`, the reader `ng` itself uses, so a diff against ngrun alone cannot see a reader fault both share: that is what the gate's run pairs are for, which judge ngrun against omc's build of the same program in Omega (no shared code). Exercised: `sub` operands swapped in both the reader and the writer of `ir.om` pass every round-trip and ir-copy case and are caught by the run pairs `x-fib` and `x-float`. The gate also mutates ngrun nine ways (fuel one pass late; rem MIN/-1, u64 `chk.add` and `chk.mul`, `chk.shl` negative side, signed conv lower bound, `chk.bounds` with e = 0, narrow `neg`, depth cap): each is caught by a run pair or an N case (`n-*.oir`, ngrun alone, for the semantics Omega cannot state). |
 | `ngrand.om` | Random programs, valid by construction (IR.md s10): `ngrand SEED` writes a binary unit (helpers, diamonds, counted loops, calls, checks with their codes, i64 memory, host write) built with `src/ir.om`; `ngrand tape FILE` replays a choice tape; `ngrand shrink SEED STATUS OUT CMD [ARG...]` deletes and zeroes tape bytes while `CMD ARG... OUT` exits STATUS and leaves the smallest unit in OUT and its tape in OUT.tape. The D9 differential source: a back end runs the same units as ngrun and the outputs must agree. |
 | `tests/ir/` | Text fixtures (`*.oir`), run pairs (`x-*.oir` + `x-*.om`) and `cases`, the expectations the gate runs. |
-| `tests/opt/` | Optimizer fixtures (`O`/`L` lines of `tests/ir/cases`): ng-front's 23 lowered run units and two by hand. |
+| `tests/opt/` | Optimizer fixtures (`O`/`L` lines of `tests/ir/cases`): ng-front's 23 lowered run units and five by hand (`o-pre2`, `o-zero`, `o-bce0`, `o-bce1`, and `o-shfl`, a kernel loop whose invariant `shfl` must not leave the loop). |
 | `gate-ir.om` | The ΩIR gate. |
 
 ## Build and gate
@@ -61,7 +61,8 @@ stdout bytes, 64..95 by `exit` or 101..114 by a trap, empty stderr); one shrink 
 the predicate (accepted, still trapping, smaller, its tape replays it); and the optimizer on every
 random seed and every `tests/opt/` fixture (`@ng opt` exit 0, ngcheck's whole ACCEPT line on the
 output, its text round trip, ngrun before and after equal, a second `@ng opt-count` finding nothing
-to move; a row `ok O NAME fns=.. inloop=A->B ...` per fixture). The `L` fixtures are the long
+to move; a row `ok O NAME fns=.. inloop=A->B ...` per fixture, which must equal the row written on
+its `O`/`L` line, so a pass that stops doing its work fails). The `L` fixtures are the long
 kernels (ngrun takes 25 s to several minutes each on the Spark, twice), which makes a full gate run
 take tens of minutes. Then its negative controls:
 three deliberately wrong expectations must each trip

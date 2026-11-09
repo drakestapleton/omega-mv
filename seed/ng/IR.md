@@ -871,7 +871,9 @@ per function:
    (Cooper, Harvey and Kennedy dominators over reverse postorder); its blocks reach a latch without
    passing h. When h has exactly one predecessor outside the loop and it ends in `br h`, that block
    is the preheader; otherwise a new block with h's parameter types, ending in `br h` with them, is
-   placed before h and every outside predecessor (`br` or `cbr`) branches to it instead.
+   placed before h and every outside predecessor (`br` or `cbr`) branches to it instead. A new block
+   is added only within the limits of s12 (blocks, ops and values per function and per unit); a loop
+   that would need one past them keeps none, and LICM leaves that loop alone.
 2. **BCE** (pass origin 1, item 1 of s15). A `chk.bounds r i e` is replaced in place by
    `fact.inbounds 1 r i e` when e is a const >= 1, r is a REF to an ARRAY of count L, and i < X is
    known where the check runs with X - 1 + e <= L: i is a const (X = i + 1), or a block on the
@@ -881,7 +883,9 @@ per function:
    placement, not its truth (s7.10); the gate's BCE mutant (X - 1 + e <= L + 1) makes the
    boundary fixture `o-bce1` (L = 4, i < 5) write past the array, and the run differs.
 3. **LICM**, innermost loop first. An op moves to the end of the preheader when it is class P
-   (s6.4), defines a value, is not `shared`, and every operand is defined outside the loop. P ops
+   (s6.4), defines a value, is not `shared`, is not convergent (`shfl`, `mma`: s7.12 forbids moving
+   them into or out of a branch, and the loop body is the branch of the header's test), and every
+   operand is defined outside the loop. P ops
    are total (s7.3: division by zero gives 0), so running one on a path where the loop runs zero
    times changes nothing. Checks, loads, stores, calls, host words, facts and terminators never
    move: they carry the token chain, and that is where coverage (s8) and trap order (above) live.
@@ -894,6 +898,8 @@ per function:
 
 The gate runs every O/L fixture and every Q seed through `@ng opt`: ngcheck's whole ACCEPT line on
 the output, the text round trip, ngrun before and after equal, and a second run that finds nothing
-to move. Its mutants hoist a load past the loop's stores and checks past their guard (both refused
+to move; each O/L line also pins the `@ng opt-count` row of its input (`o-shfl`: a kernel loop whose
+invariant `shfl` stays put).
+Its mutants hoist a load past the loop's stores and checks past their guard (both refused
 by ngcheck: the hoisted op keeps an in-loop token, s6.4), merge preheader ops of different imm
 (a run differs) and let BCE delete a check one element past its proof (a run differs).
