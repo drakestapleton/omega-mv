@@ -59,10 +59,10 @@ stdout bytes, 64..95 by `exit` or 101..114 by a trap, empty stderr); and one shr
 the predicate (accepted, still trapping, smaller, its tape replays it). Then its negative controls:
 three deliberately wrong expectations must each trip
 their named check, three mutants of ngcheck (load and store typing disabled, the witness prefix
-changed, the class name shifted), nine mutants of ngrun (`chk.fuel` one pass late, rem MIN/-1
+changed, the class name shifted), ten mutants of ngrun (`chk.fuel` one pass late, rem MIN/-1
 giving a, u64 `chk.add` and `chk.mul` never failing, `chk.shl` without its negative bound, the signed
 conv lower bound at -2^(w-1), `chk.bounds` passing e = 0, narrow `neg` left uncanonical, the depth
-cap at 70000) and a mutant ngrand (a
+cap at 70000, the step limit one op late: `n-loop2` then names 87, not 116) and a mutant ngrand (a
 random check's new token not made current) must each fail their named check at least once (the
 ngrand mutant: ngcheck refuses TOKEN). Last line `NGIRGATE PASS cases=N`,
 exit 0; otherwise one `FAIL` line per failure and exit 1.
