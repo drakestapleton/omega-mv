@@ -223,40 +223,45 @@ the sources do not test. Every figure in this table is published, not reproduced
 Our target is the round40 own tool model (`~/.local/share/omega-tool-model/round40/model.ck`, sha256
 `7c7b5b5260f2d9453b6076b64e7f23e88341d96498584f2dfaa229c31ad2e346`, read in place only): V 4096, T 256,
 D 384, H 12, F 1536, L 8, P 15,833,472 parameters, OLLMCK02 layout (CONTRACT-V1 section 6). All probes and edits
-are `.om` units built on `tests/omegallm/build.sh`, run on CPU. Python is allowed only as an independent checker.
+are `.om` units built by `tools/omegallm/wdrive/wbuild` from pinned source parts, run on CPU. Python is allowed
+only as an independent checker (labelled ORACLE).
 
 Layout note for the mapping. Qwen stores `down_proj` as `[out, in]`, so one MLP neuron's write vector is a
 column. Our checkpoint stores `w2[F][D]` with `y = x . W`, so the same vector is a **row** of `w2`
 (384 values). The Omega form of the p50c edit is `w2'[j] = w2[j] - alpha * (w2[j] . u) * u` for the selected
 rows `j`, and nothing else.
 
+Statuses below are from the DRA-187 run (aien-train `evidence/OMEGALLM/wsp-dra187-20261107/`, `RESULT.md`).
+Where the run did a step differently from this plan, the row says so.
+
 | Published step | Omega equivalent (DRA-187) | Status |
 |---|---|---|
-| Behavioural contrast on practice problems | CPU `.om` generation probe on round40 over a tuning split; classify failures (loop, wrong answer, malformed tool call) and pick one demonstrated failure | PENDING |
-| Matched productive vs failing contexts | `.om` teacher-forced probe on matched pairs that share a prefix and diverge; record per-layer residual outputs and per-token log-probs in f64 | PENDING |
-| Direction | Unit difference-of-means direction per candidate layer, computed in `.om` | PENDING |
-| Locating MLP writers | Score each of the 1,536 `w2` rows per layer by its write onto the direction; choose rows on the tuning split only | PENDING |
-| The edit | `.om` checked patch: OLLMCK02 in, new file out, base sha256, edit parameters and seed, delta and undo artifact; refuse `wte`, `gf` and whole-tensor rescales, mirroring the published `frozen` list | PENDING |
-| Dose-response | Several alpha values, teacher-forced branch log-prob change and paired generation | PENDING |
-| Layer isolation | Each site alone vs together | PENDING |
-| Norm-matched random control | Orthogonal random direction with the same per-tensor Frobenius change as the chosen edit (the final one, not an earlier dose) | PENDING |
-| Paired confirmation | Locked held-out split, never used for selection, paired original vs edited, pre-registered gain threshold | PENDING |
-| Decoding-adjustment comparator | Same failure attacked without weight changes (for example a repetition or presence penalty at inference), same held-out split | PENDING |
-| Fine-tune comparator | Ordinary fine-tuning of round40 with the Omega trainer on the same tuning data and a matched compute budget | PENDING |
-| Retention | Unrelated held-out tasks and general loss on the published evaluation set, original vs edited | PENDING |
-| Deployment check | Edited weights rounded f64 to f32 as the GPU runtime does; count edited entries that round back to the original | PENDING |
-| Restore | Byte-identical restore of the base checkpoint from the undo artifact | PENDING |
+| Behavioural contrast on practice problems | CPU `.om` generation probe on round40 over a tuning split; classify failures (loop, wrong answer, malformed tool call) and pick one demonstrated failure | MEASURED: long numeric ID truncation, splits D (diagnosis), S (selection), H (held-out), G (generality) |
+| Matched productive vs failing contexts | `.om` teacher-forced probe on matched pairs that share a prefix and diverge; record per-layer residual outputs and per-token log-probs in f64 | DONE DIFFERENTLY: teacher-forced logit-gap decomposition into head and neuron parts on D failure rows (`wprobe probe`), not matched pairs |
+| Direction | Unit difference-of-means direction per candidate layer, computed in `.om` | NOT_RUN: the search scaled ranked heads (E1) and neurons (E2) instead (PREREG section 4) |
+| Locating MLP writers | Score each of the 1,536 `w2` rows per layer by its write onto the direction; choose rows on the tuning split only | MEASURED in that form: `w2` rows ranked by most negative mean part on D failure rows only |
+| The edit | `.om` checked patch: OLLMCK02 in, new file out, base sha256, edit parameters and seed, delta and undo artifact | MEASURED: `wpatch` patch `ca6dbf9a`, 12,288 changed weights, Adam state kept (policy 0) |
+| Dose-response | Several alpha values, teacher-forced branch log-prob change and paired generation | MEASURED on S by generation only: head scales 1.10 to 2.00, neuron scales 0.75 to 0, 1 to 32 units |
+| Layer isolation | Each site alone vs together | NOT_RUN |
+| Norm-matched random control | Orthogonal random direction with the same per-tensor Frobenius change as the chosen edit (the final one, not an earlier dose) | MEASURED: 3 seeds of random neurons in the same layers, size within 0.12%; they fix 1, 0 and 0 held-out IDs (PASS) |
+| Paired confirmation | Locked held-out split, never used for selection, paired original vs edited, pre-registered gain threshold | MEASURED, FAIL: +10.9 points against a 25-point bar (21 fixed, 0 broken, exact one-sided McNemar p 4.8e-7) |
+| Decoding-adjustment comparator | Same failure attacked without weight changes (for example a repetition or presence penalty at inference), same held-out split | MEASURED: penalty on `.` after a digit, +6.25 points |
+| Fine-tune comparator | Ordinary fine-tuning of round40 with the Omega trainer on the same tuning data and a matched compute budget | MEASURED with the existing round41 C2 checkpoints (not matched compute): +40.1 and +43.75 points |
+| Retention | Unrelated held-out tasks and general loss on the published evaluation set, original vs edited | NOT_RUN: the outcome was fixed by the gain gate. Short IDs on H: 94 of 96 against 96 (locality FAIL) |
+| Deployment check | Edited weights rounded f64 to f32 as the GPU runtime does; count edited entries that round back to the original | MEASURED: 12,288 of 12,288 survive; f32 and f64 outputs byte-identical on H |
+| Restore | Byte-identical restore of the base checkpoint from the undo artifact | MEASURED, PASS: `wpatch revert` gives sha256 `7c7b5b52…e346` |
 
-### 4.1 Omega result so far (2026-11-07)
+### 4.1 Omega result (2026-11-07): REJECT
 
 - Target chosen: long numeric ID truncation in the first `read_file` path written by the round40 tool model.
-- Mechanism, MEASURED on the diagnosis split D (186 records, base model, `wprobe probe`, scored by `rank.py`):
+- Mechanism, MEASURED on the diagnosis split D (186 records, base model, `wprobe probe`):
   59 failure rows are digit-copy failures, and their mean logit gap is -7.06. Copy heads 6.6, 7.11, 6.11 and 7.0
   find the right digit (largest mean positive head parts), and a number-length prior written by the MLPs
   outvotes them.
-- Pre-registration: aien-train branch `wsp/dra187-repair`, commit `d329de73`
-  (`evidence/OMEGALLM/wsp-dra187-20261107/PREREG.md`).
-- All outcomes (edit, controls, comparators, retention, restore): PENDING.
+- Pre-registration: aien-train `evidence/OMEGALLM/wsp-dra187-20261107/PREREG.md` (first committed as `d329de73`,
+  splits frozen before any search); the edit was frozen in `FREEZE.md` before any held-out record.
+- Outcome: REJECT. The selected edit (32 `w2` rows scaled to 0.75) lifts held-out 6-digit IDs from 8 to 29 of
+  64 and fixes no 7- or 8-digit ID, below the 25-point gain bar, and breaks 2 of 96 short IDs.
 
 ## 5. Risks and threats to validity
 
