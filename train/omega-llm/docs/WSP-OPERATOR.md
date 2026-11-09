@@ -1,6 +1,8 @@
 # Operator guide: checked weight edits for the Omega LLM
 
-Status: tools IMPLEMENTED and EXERCISED on CPU. No edited checkpoint is deployed anywhere.
+Status: tools IMPLEMENTED and EXERCISED on CPU. No edited checkpoint is deployed anywhere. `wpatch` is a
+separate program that arrives in its own change (`tools/omegallm/wpatch/`, with `docs/omegallm/WSP-PATCH.md`);
+until that change is on main, steps 1 and 5 to 9 below cannot be run from this repository.
 
 This guide is for the person who looks after the model. It covers the life of one weight edit: find it,
 write it as a checked patch, check it, apply it, verify it, tie it to the program that will run it, roll it
@@ -13,7 +15,7 @@ Two Omega tools do the work:
 - `wpatch` (`tools/omegallm/wpatch/`) turns "base checkpoint plus edited checkpoint" into a small sealed
   patch file, and checks, applies and reverses it exactly.
 
-Build both first (each README has the one-line build). Heavy commands take a pool core:
+Build both first (each README has the one-line build; `wpatch` needs its own change, see Status). Heavy commands take a pool core:
 `flock -w 3600 -o ~/handoffs/hive/queen/pool-19.lock taskset -c 19 nice -n 10 <command>`.
 
 ## 1. Inspect
