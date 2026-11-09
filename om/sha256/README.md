@@ -37,10 +37,12 @@ whose outputs `freest` and `fapic` generate `src/omega_om_units_fs.c`.
 
 ## Evidence
 
-Qualified by L836 (om2/qualification 478bdecd, candidates/sha/RESULTS.txt): 158 vectors, E3/section 7
-receipts, 17/17 unit mutants killed, dynamic traces 28/28 identical. The static leakage scan of
-update/final is NOT_RUN; no constant-time claim is made. Throughput against the replaced C is in the
-cutover PR, measured with `parity/bench.c` and `parity/small.c`.
+Qualified by L836 (#752 `725ca839`, `seed/qualification/om2/candidates/sha/RESULTS.txt`): 158 vectors,
+E3/section 7 receipts, 17/17 unit mutants killed, dynamic traces 28/28 identical. The static leakage scan
+of update/final is NOT_RUN; no constant-time claim is made. The paired measurement against the OM-1
+baseline under `spec/omegese-om2-measure.md` is in `om2-evidence/s4/measure/` (RESULTS.txt and its dated
+addendum); `docs/omegese-om2-status.md` section 6 gives the verdict. `parity/bench.c` and
+`parity/small.c` time this unit against the replaced C.
 
 ## Building the generated binding
 
