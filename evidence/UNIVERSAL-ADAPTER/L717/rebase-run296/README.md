@@ -50,7 +50,7 @@ A mutant is killed when any of suite, rights or read exits nonzero.
 | cancel-ignored | `ubcpr` ignores cancelled descriptors | suite 1 |
 | cancel-rights | scheduled cancellation without source WRITE | rights 1 |
 | cancel-late | checkpoint cancellation keeps copying | suite 1 |
-| bytes-estimated | bytes counted as requested `n`, not copied | suite 1 |
+| bytes-estimated | bytes counter also charged requested `n` up front (estimated work counted on top of copied bytes) | suite 1 |
 | peak-not-tracked | peak never updated | suite 1 |
 | peak-tracks-current | peak overwritten by current owned bytes | suite 1 |
 | read-range-ok | `ubread` accepts out-of-range offsets | read 1 |
