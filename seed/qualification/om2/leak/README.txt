@@ -139,9 +139,9 @@ line. The three rules (every other store, and every UNKNOWN or UNHANDLED reached
    unknown). rvsplo takes Lmin, the lowest SP lower bound over every reached word (unknown if any reached word
    has no SP interval). A store is excused only when BOTH u + displacement + index high + size <= 0 (its last
    byte is below R) AND l + displacement + index low >= Lmin (its first byte is in memory the SP register has
-   covered during the walk). That is exactly the memory the existing SP+immediate spill exemption trusts
-   (slotok: between the SP and the function's entry SP), generalised from SP+immediate addressing to pointers
-   computed from SP. Without the lower bound, a pointer such as SP - 0x2aaa00000000 would be excused although
+   covered during the walk). That is the same stack region the existing SP+immediate spill exemption trusts
+   (slotok: between the SP and the function's entry SP), taken over the whole walk (the lowest reached SP)
+   instead of per word, and applied to pointers computed from SP as well as to SP+immediate addressing. Without the lower bound, a pointer such as SP - 0x2aaa00000000 would be excused although
    it is a heap address (L1039 review P1; e14-stack-far.S, e14-stack-far2.S). It is NOT the A1 array-bounds
    invariant: no array length is assumed for a pointer passed between functions or for a layout field. A
    callee that writes beyond the array the caller passed reaches R or higher (e14-stack-over.S: SP+16 = R) or
