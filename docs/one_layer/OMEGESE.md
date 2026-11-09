@@ -1025,6 +1025,7 @@ Non-byte arrays and mismatched scalar types are error 7.
 | `monons` | Monotonic nanoseconds, suitable for elapsed-time measurement. |
 | `realns` | Realtime nanoseconds since the Unix epoch, suitable for timestamps. |
 | `sleepns interval` | Sleep for nonnegative nanoseconds. Negative intervals trap 3. Interruptions return the kernel error. |
+| `realset ns` | Keyword id 236, AArch64 and x86linux, program mode only: set the realtime (wall) clock to `ns` nanoseconds since the Unix epoch with Linux `clock_settime(CLOCK_REALTIME)` (syscall 112 / 227). `ns` is `long`; a negative value traps 3 before any kernel call. Returns 0, -1 (EPERM) without `CAP_SYS_TIME`, or -22 (EINVAL) at or past the kernel's settable limit (second 8277292036). Gate: `seed/host/realset/`. |
 | `socknew domain kind protocol` | Create a socket. |
 | `bind fd A off n` | Bind the socket to the address bytes in the slice. |
 | `connect fd A off n` | Connect using the address bytes in the slice. |

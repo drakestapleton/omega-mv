@@ -399,3 +399,19 @@ SVC/`syscall`. Two functions were added (510 of 512). Each of the 1496 tracked
 status and diagnostics; the other 12 are the AArch64 and x86 compiles of the six
 `seed/host/prlimit/` sources, which use the new word (error 3 before). Gate:
 `seed/host/prlimit/prlimit.cases`.
+
+The realset 236 host word (branch `seed/realset-host-word` on rad main
+`1e3ecbba`, ledger L236) births compiler
+`02200396c6bf4833e0ae21d9adc94abd410444b7cff80fd4cb33b9f2a4e9c1c7`
+from source
+`fc7975e9a5d33e88bf07de43f668ad9d9d6eda0941db56148d25b008ae0b3552`.
+`realset ns` is Linux `clock_settime(CLOCK_REALTIME)`: AArch64 syscall 112
+(inline in `hostval`, before the `ge c 173` mapped-memory range; x0 0, x1 SP)
+and x86-64 syscall 227 (`xhtime`, shared with `sleepns`; RDI 0, RSI RSP). The
+timespec at SP is `{ns / 1e9, ns mod 1e9}` as for `sleepns`; a negative `ns`
+traps 3. No function was added (510 of 512). Every one of the 1629 tracked
+`.om` files was compiled alone for AArch64 and for `target x86linux` under
+`6d1b1cf5` and `02200396`: all 3258 compiles give the same bytes, exit status
+and diagnostics, so no existing unit's emission changes; the five new
+`seed/host/realset/` sources that use the word were error 3 before. Gate:
+`seed/host/realset/realset.cases`.

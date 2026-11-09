@@ -131,6 +131,10 @@ echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # prlimit 235: rlimit read/set/effect against /proc/self/limits (AArch64 and x86linux), RLIMIT_AS kept
 # across execprog, refusals, and 7 omc.om mutants killed (seed/host/prlimit/).
 "$B/gate" seed/out/omc "$pin" seed/host/prlimit/prlimit.cases "$run/prlimit"
+# realset 236: clock_settime(CLOCK_REALTIME) as an unprivileged user (EPERM for a valid timespec, EINVAL at
+# the settod limit, so the second/nanosecond split, clock id and syscall number are observable without
+# changing the host clock), AArch64 and x86linux, refusals, and 7 omc.om mutants killed (seed/host/realset/).
+"$B/gate" seed/out/omc "$pin" seed/host/realset/realset.cases "$run/realset"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2
