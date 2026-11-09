@@ -861,7 +861,9 @@ meaning and, for the C2 manifest, its exact output bytes or error.
 #### 9.13.1 Secret hygiene: `dit` and `scrub` (program mode)
 
 Two value words for code that handles secrets. Both are OM-2 only (reserved as above), program mode only
-(error 9 in function mode), AArch64 only (error 25 under `target x86linux`), and give a long. They are
+(error 9 in function mode), and give a long. `scrub` is AArch64 and x86linux; `dit` is AArch64 only (error 25
+under `target x86linux`: x86 has no user-mode data-independent-timing control, Intel's DOITM is a ring-0
+MSR bit). Both are error 25 under `target x86efi`. They are
 value-only words: they stand where an expression is read (`k = scrub 16`, an argument, an operand); a bare
 statement `scrub 16` or `dit 1` reads the word as a statement name and is error 16 (keyword used as a
 name). IR mode never reaches them: `ir` together with `om2` is already error 16 in either header order,
@@ -898,6 +900,16 @@ locals, a held float operand and a float call argument back after scrub (`m-twin
   expression and of an enclosing call) and their live twins; NZCV, FPCR, FPSR, the SVE P registers and
   FFR; memory above SP, the live frames. The result register is set
   to 0 last.
+- **`scrub n` on x86linux** keeps the same contract (n checks, trap 3 and trap 6 before any store, the
+  bytes `[RSP - n, RSP)` zeroed from RSP - n upward, gives 0). Words (Intel SDM vol 2): `TEST RAX, 15`,
+  `JNE` trap 3; `CMP RAX, R11` with R11 = 1048576, `JA` trap 3; `RDX = RSP - n`, `CMP RDX, R15` (the owned
+  stack floor), `JB` trap 6; the loop stores RCX = 0 at `[RDX]` and `[RDX+8]` and adds 16 until RDX reaches
+  RSP. x86 language values live in RBP frame slots above RSP and floats stay in those slots, so every
+  scratch register is dead: `XOR` RAX, RCX, RDX, RSI, RDI, R8-R11 and `XORPS` XMM0-XMM15. Not touched: RSP,
+  RBP, RBX and R13 (saved by the host helpers), R12, R14, R15, MXCSR. `s5-scrub-x86-emit` and
+  `s5-scrub-x86-femit` pin the x86 output; `m-x86stp`, `m-x86floor`, `m-x86gpr` and `m-x86xmm` are detected
+  by it. Runtime parity of every `scrub-*.om` fixture under qemu-x86_64 is FR-9's `seed/omc/qualify-x86.py`
+  (EMULATED, not native x86).
 
 ### 9.14 Compiler error codes (omc, registry `seed/omc/error-codes.reg`)
 
