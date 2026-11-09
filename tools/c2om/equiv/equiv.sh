@@ -3,11 +3,11 @@
 #
 # For one artifact:
 #   1. the C oracle is built by gcc (through quiet-build make) from a PINNED commit, in a scratch tree;
-#   2. the Omega replacement is built ONLY by the seed-born omc (tools/c2om/seed-omc.sh, built from
-#      seed0.hex); its sha256 goes into the evidence;
+#   2. the Omega replacement is built ONLY by the seed-born omc (tools/c2om/seed-omc.sh, which runs
+#      seed/omega-from-seed.sh); its sha256 goes into the evidence;
 #   3. every case runs on both, each in its own empty directory: stdout, stderr, exit code and every
 #      file the case names must be the same bytes;
-#   4. second oracle: the spec-only interpreter tools/omega_ref (origin/seed/omega-ref, pinned) runs the
+#   4. second oracle: the spec-only interpreter tools/omega_ref (seed/omega-ref@3bc7d9fa, pinned) runs the
 #      same Omega source; its stdout and exit code must equal the omc build's;
 #   5. negative control: the conf's one-word MUTANT of the Omega source must still compile and must make
 #      at least one case differ (else the harness is blind and the gate fails).
@@ -26,7 +26,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 [ $# -eq 1 ] || { echo "usage: $0 <artifact.conf>" >&2; exit 2; }
 CONF=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-OUT_FILES=; REF_COMMIT=${REF_COMMIT:-origin/seed/omega-ref}
+OUT_FILES=; REF_COMMIT=${REF_COMMIT:-3bc7d9faa589379280226d24f35886da0aca493a}
 # shellcheck disable=SC1090
 . "$CONF"
 cd "$ROOT"
@@ -43,11 +43,11 @@ OMC_DIR=$ROOT/build/c2om/seed
 tools/c2om/seed-omc.sh "$OMC_DIR" > "$B/seed-omc.out" 2>&1 || fail "seed omc build: $(tail -1 "$B/seed-omc.out")"
 OMC=$OMC_DIR/omc; OMC_SHA=$(cat "$OMC_DIR/omc.sha256")
 say "artifact     $NAME"
-say "omc sha256   $OMC_SHA (built from seed/rung0/seed0.hex by tools/c2om/seed-omc.sh; fixpoint checked)"
+say "omc sha256   $OMC_SHA (born by seed/omega-from-seed.sh via tools/c2om/seed-omc.sh; fixpoint checked)"
 
 # 2. C oracle from the pinned commit, built by gcc through quiet-build make
 csha=$(git rev-parse "$C_COMMIT^{commit}")
-rm -rf "$B/csrc"; mkdir -p "$B/csrc"
+if [ -d "$B/csrc" ]; then find "$B/csrc" -depth -delete; fi; mkdir -p "$B/csrc"
 # shellcheck disable=SC2086
 git archive "$csha" $C_FILES | tar -x -C "$B/csrc"
 printf 'OUT := %s\nCC ?= gcc\nall:\n%s\n' "$B" "$(printf '%s\n' "$C_BUILD" | sed 's/^/\t/')" > "$B/csrc/oracle.mk"
@@ -59,7 +59,7 @@ say "C oracle     $C_COMMIT = $csha ($C_FILES), $(gcc --version | head -1)"
 # 3. second oracle: the spec-only interpreter, pinned
 rsha=$(git rev-parse "$REF_COMMIT^{commit}")
 if [ ! -x "$B/../omega_ref-$rsha/omega_ref" ]; then
-  rm -rf "$B/../omega_ref-$rsha.src"; mkdir -p "$B/../omega_ref-$rsha.src" "$B/../omega_ref-$rsha"
+  if [ -d "$B/../omega_ref-$rsha.src" ]; then find "$B/../omega_ref-$rsha.src" -depth -delete; fi; mkdir -p "$B/../omega_ref-$rsha.src" "$B/../omega_ref-$rsha"
   git archive "$rsha" tools/omega_ref | tar -x -C "$B/../omega_ref-$rsha.src"
   quiet-build gcc -std=gnu11 -O2 -Wall -o "$B/../omega_ref-$rsha/omega_ref" "$B/../omega_ref-$rsha.src/tools/omega_ref/omega_ref.c" \
     > "$B/refbuild.out" 2>&1 || fail "omega_ref build: $(tail -3 "$B/refbuild.out")"
@@ -77,7 +77,7 @@ say "Omega        $OM_SRC sha256 $(sha256sum "$OM_SRC" | cut -c1-16) -> $(wc -c 
 # one run: <bin-or-'ref'> <dir> <stdin> <args...>
 run1() {
   local bin=$1 d=$2 in=$3; shift 3
-  rm -rf "$d"; mkdir -p "$d"
+  if [ -d "$d" ]; then find "$d" -depth -delete; fi; mkdir -p "$d"
   [ "$in" = - ] && in=/dev/null
   set +e
   if [ "$bin" = ref ]; then (cd "$d" && timeout 120 "$REF" run "$ROOT/$OM_SRC" "$@" < "$in" > ../$(basename "$d").out 2> ../$(basename "$d").err)
@@ -115,7 +115,7 @@ while IFS=$'\t' read -r id in args; do
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$(cat "$B/run/c.rc")" "$(cat "$B/run/o.rc")" "$(cat "$B/run/r.rc")" \
     "$(wc -c < "$B/run/o.out")" "$co" "$or" >> "$TSV"
   if [ $co = yes ] && [ $or = yes ]; then pass=$((pass+1))
-  else say "DIFF case $id: C = omc $co, omc = interpreter $or"; cmp "$B/run/c.out" "$B/run/o.out" 2>&1 | head -2 | tee -a "$LOG"; fi
+  else say "DIFF case $id: C = omc $co, omc = interpreter $or"; { cmp "$B/run/c.out" "$B/run/o.out" 2>&1 || true; } | head -2 | tee -a "$LOG"; fi
 done < "$CASES"
 say "cases        written $written, run $run, identical on C, omc and interpreter $pass"
 
