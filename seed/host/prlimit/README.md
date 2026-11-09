@@ -15,6 +15,8 @@
 - `n` 32 sets: the new pair is read from `A[off..off+16)`, the old pair is
   written to `A[off+16..off+32)`.
 - any other `n`: -22 with no kernel call.
+- with `n` 32 the kernel itself also returns -22 (EINVAL) when the new soft
+  value is above the new hard value; that -22 does not mean a bad `n`.
 
 Program mode only: function mode is error 9, a contract clause error 30,
 `target x86efi` error 25. Limits are inherited by `fork` and kept across
