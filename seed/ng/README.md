@@ -63,8 +63,10 @@ random seed and every `tests/opt/` fixture (`@ng opt` exit 0, ngcheck's whole AC
 output, its text round trip, ngrun before and after equal, a second `@ng opt-count` finding nothing
 to move; a row `ok O NAME fns=.. inloop=A->B ...` per fixture, which must equal the row written on
 its `O`/`L` line, so a pass that stops doing its work fails). The `L` fixtures are the long
-kernels (ngrun takes 25 s to several minutes each on the Spark, twice), which makes a full gate run
-take tens of minutes. Then its negative controls:
+kernels (ngrun takes 25 s to several minutes each on the Spark, twice: about 19 min of ngrun per pass
+on an idle Spark core, sum of the measured per-kernel runs), which makes a full gate run take about 40
+minutes (2353 s at 854d8152 on core 11). The workflow `.github/workflows/ng-ir-arm64.yml` keeps main's
+30-minute timeout, so a CI run of this gate would be cut off; the gate is run on the Spark. Then its negative controls:
 three deliberately wrong expectations must each trip
 their named check, three mutants of ngcheck (load and store typing disabled, the witness prefix
 changed, the class name shifted), ten mutants of ngrun (`chk.fuel` one pass late, rem MIN/-1
