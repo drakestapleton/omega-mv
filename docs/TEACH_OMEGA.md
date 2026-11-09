@@ -12,9 +12,8 @@ sets the goal: replace convention-dependent C/assembly with explicit machine
 semantics, reproducible compilation, and separate semantic, runtime, wire and
 device layouts. The later seed work makes compiler ancestry inspectable: explicit
 instruction words build small translators, then a compiler written in Omega.
-See the existing [seed-birth walkthrough](https://github.com/aien-dev/omega-mv/blob/b30ba6cf729eb9295c7f8883cfff0519b90a63e1/docs/SEED_BIRTH.md)
-and its [recorded replay](https://github.com/aien-dev/omega-mv/blob/b30ba6cf729eb9295c7f8883cfff0519b90a63e1/evidence/seed-birth-20261022/README.md).
-Those are development-branch documents, not files already integrated on `main`.
+See the [seed-birth walkthrough](SEED_BIRTH.md)
+and its [recorded replay](../evidence/seed-birth-20261022/README.md).
 
 Published Arm instruction and ELF formats are upstream specifications, not
 Omega inventions. The seed notes attribute them. Existing Linux, the shell and
