@@ -27,14 +27,14 @@ sh seed/omega-from-seed.sh   # or: make omega-from-seed
 
 `omega-from-seed.sh` grows the compiler from `seed/rung0/seed0.hex` (the one outside step is `seed/rung0/load0.sh`, POSIX `printf`), has omc rebuild itself twice to identical bytes, and leaves it at `seed/out/omc` with its sha256 beside it. No C is on that path.
 
-Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) and `../aienos` for the pinned FORGE and kernel sources, `../aien-architecture` for the crumb tool, `../omega-bridge` for `om-units`, `../aien-train` for `orig4-shadow`. A step whose sibling is missing exits 3 with a message.
+Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) and `../aienos` for the pinned FORGE and kernel sources, `../omega-bridge` for `om-units`, `../aien-train` for `orig4-shadow`. A step whose sibling is missing exits 3 with a message.
 
 ## Configuration
 
-- `physics.lock`, `aienos.lock`, `argus.lock`: commits of the sibling sources the full build and some gates pin. `crumb.lock`: the aien-architecture commit the crumb tool is built from. `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
+- `physics.lock`, `aienos.lock`, `argus.lock`: commits of the sibling sources the full build and some gates pin. `crumb.lock`: the aien-architecture commit the retired `crumb-verify` step built the crumb tool from; kept as history (DRA-97, 2026-11-07), no gate reads it. `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
 - `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0` on `make` builds the host suites without a physics checkout.
 - `OUT_DIR`: per-step build directory; `tests/gates/run.sh` sets it to `build/step-<name>`.
-- `.aien/always` lists the gates every commit must pass (`CRUMB-VERIFY`, `OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`); `.aien/verify.pub` is the Spark judge's public key.
+- `.aien/always` lists the gates every commit must pass (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`); `.aien/verify.pub` is the Spark judge's public key.
 - `AIEN_OMEGA_FP8_GROUPED_WAVE=1` and `AIEN_OMEGA_FP8_GROUPED_CTAS=n` change the GB10 FP8 grouped expert launch (off by default; see `README.md`).
 
 ## Usage
@@ -51,7 +51,6 @@ make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-compiler-quick  # legacy
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-numeric-cpu     # E1 CPU numerics
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-realize
 tests/gates/run.sh zero-disk-secrets                                    # no plaintext .env files
-tests/gates/run.sh crumb-verify                                         # crumbs match the tool pinned in crumb.lock (needs ../aien-architecture)
 ```
 
 The `make test-*` targets are C/legacy compatibility checks, not commands for the seeded compiler; do not mix compiler binaries or relabel old receipts. The full omegatool build (`make`) links the physics repository at the commit in `physics.lock`.
@@ -65,7 +64,7 @@ Gates whose manifest lists `gb10` under `requires:` (for example the `*-silicon`
 - Receipts are content-addressed (`<name>.<sha256>.json`), name the exact commit and refuse a dirty tree. A rerun adds a file; it never replaces one.
 - Some older milestone gate scripts rewrite their receipts in place. Do not run them on a clean checkout you mean to keep; prefer the `make test-*` targets and `tests/gates/run.sh`.
 - No systemd. Offline, in-house builds.
-- Crumbs: read a directory's `.crumb` before editing it. `crumb verify .` must pass; it fails when committed crumbs differ from what the pinned compiler writes. `.crumbignore` keeps the compiler out of `evidence/` and `build/`. Live coordination goes in `.crumb.local`, never committed.
+- Crumbs are retired from the active workflow (DRA-97, 2026-11-07): no gate or workflow checks them, and reading, writing or refreshing a `.crumb` is not a step of any change. The `.crumb` files and `.crumbignore` stay as history.
 - Credit work in `CONTRIBUTORS.md` in the same commit as the work.
 
 ## Safety and approvals

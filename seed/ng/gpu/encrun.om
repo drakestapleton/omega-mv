@@ -1,0 +1,159 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/gpu/encrun.om: conformance harness for the sm_121 encoder ng consumes (Hive NG lane ng-gpu, D10).
+note Not an encoder: it composes AFTER CUDApp's om/encoder/bw_enc_sm121.om at the sha in seed/ng/cudapp.lock:
+note   cat ../CUDApp/om/encoder/bw_enc_sm121.om seed/ng/gpu/encrun.om | seed/out/omc > encrun
+note Program mode, AArch64 Linux. stdin is a stream of NGBWENC1 frames, stdout one result frame per input frame.
+note Input frame (every word a 64-bit little-endian unsigned):
+note   8 bytes "NGBWENC1" | n | pad | 288 words phys | n*8 words ins (none when n > 1024)
+note   phys and ins are exactly the arrays bw_enc_sm121 takes (see its header): 8 words per solved BlackwellIR
+note   instruction, vreg 0..255 then uvreg 256..287 physical registers. ins words past n*8 are zero, as the
+note   CUDApp C caller zeroes them. pad 1: NOP-pad to a multiple of 8, at least 32 instructions.
+note Output frame: one word r (the bytes encoded; 0 = refused) then the r code bytes.
+note Exit: 0 after a whole number of frames; 2 bad magic; 3 truncated frame; 4 read error; 5 write error,
+note each with one stderr line. Output written before an error stays written.
+
+text g_emag "NGBWENC1"
+text g_em2 "encrun: bad frame magic\n"
+text g_em3 "encrun: truncated frame\n"
+text g_em4 "encrun: read error\n"
+text g_em5 "encrun: write error\n"
+
+fn gp_efail c ulong to int
+if eq c 2
+k = write 2 g_em2 0 len g_em2
+end
+if eq c 3
+k = write 2 g_em3 0 len g_em3
+end
+if eq c 4
+k = write 2 g_em4 0 len g_em4
+end
+if eq c 5
+k = write 2 g_em5 0 len g_em5
+end
+ret int c
+end
+
+note exactly n bytes of stdin into b from 0: n, fewer only at the end of input, -1 on a read error
+fn gp_eread b edit uchar 65536 n ulong to long
+got = ulong 0
+note every pass consumes at least one byte of at most 65536
+while lt got n bound 65537
+k = read 0 b got sub n got
+if lt k 0
+ret -1
+end
+if eq k 0
+ret long got
+end
+got = add got ulong k
+end
+ret long got
+end
+
+note all n bytes of b to stdout: 0, or 1 on a write error or a zero-length write
+fn gp_ewrite b view uchar 16392 n ulong to ulong
+wr = ulong 0
+while lt wr n bound 16393
+k = write 1 b wr sub n wr
+if le k 0
+ret 1
+end
+wr = add wr ulong k
+end
+ret 0
+end
+
+fn gp_ele b view uchar 65536 off ulong to ulong
+w = ulong 0
+for i ulong 8
+w = or w shl ulong get b add off i mul i 8
+end
+ret w
+end
+
+note one frame body after the 24 header bytes into phys and ins; gives 0, or the exit code
+fn gp_eframe ib edit uchar 65536 n ulong ins edit ulong 8192 phys edit ulong 288 to ulong
+k = gp_eread ib 2304
+if lt k 0
+ret 4
+end
+if ne k 2304
+ret 3
+end
+for i ulong 288
+put phys i gp_ele ib mul i 8
+end
+for i ulong 8192
+put ins i 0
+end
+rows = n
+if gt n 1024
+rows = 0
+end
+if gt rows 0
+nb = mul rows 64
+k = gp_eread ib nb
+if lt k 0
+ret 4
+end
+if ne ulong k nb
+ret 3
+end
+for i ulong mul rows 8
+put ins i gp_ele ib mul i 8
+end
+end
+ret 0
+end
+
+note encode one frame and write its result frame; gives 0, or the exit code
+fn gp_eout ins view ulong 8192 phys view ulong 288 n ulong pad ulong ob edit uchar 16392 to ulong
+code = new uchar 16384 0
+r = bw_enc_sm121 ins phys n pad code
+for i ulong 8
+put ob i uchar and shr r mul i 8 255
+end
+for i ulong r
+put ob add i 8 get code i
+end
+if ne gp_ewrite ob add r 8 0
+ret 5
+end
+ret 0
+end
+
+fn main to int
+ib = new uchar 65536 0
+ins = new ulong 8192 0
+phys = new ulong 288 0
+ob = new uchar 16392 0
+note at most 1000000 frames: each frame is at least 2328 bytes
+while true bound 1000000
+k = gp_eread ib 24
+if lt k 0
+ret gp_efail 4
+end
+if eq k 0
+ret 0
+end
+if ne k 24
+ret gp_efail 3
+end
+for i ulong 8
+if ne get ib i get g_emag i
+ret gp_efail 2
+end
+end
+n = gp_ele ib 8
+pad = gp_ele ib 16
+c = gp_eframe ib n ins phys
+if eq c 0
+c = gp_eout ins phys n pad ob
+end
+if ne c 0
+ret gp_efail c
+end
+end
+ret 0
+end

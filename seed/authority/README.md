@@ -14,7 +14,8 @@ dispatcher are the next phase; the C owner remains active until every consumer i
 | `store.om` | durable 32-word record and generation file: temp write, fsync, atomic rename, exact 256-byte read; torn/short files refused |
 | `dispatch.om` | persists in-flight, runs /bin/true and a static execpure effect, records performed/unknown, and marks unknown if the generation changes during the effect |
 | `lock.om` | cross-process O_EXCL pid lock with bounded retry and stale-pid reclaim; serializes read-check-persist, not the effect |
-| `lock-test.om` | exclusive acquire, busy refusal, release, forked waiter, stale-pid reclaim and failed-release reporting |
+| `lock-test.om` | exclusive acquire, busy refusal, release, forked waiter, stale-pid reclaim, failed-release reporting, a live owner with pid 32 (not a read error) and the retry-bound refusal (43) |
+| `dispatch-fault-test.om` | injected actlost, actrecon, record-write and release failures; checks dispatch codes 76..79 and that the lock is released on every path |
 | `*-test.om` | transition and store checks; no provider simulation |
 | `*-gate.om` | source + test concatenation for the current single-file compiler |
 
@@ -43,10 +44,11 @@ Expected output and exit:
 | reuse | `reuse checks=074 000` | 0 |
 | store | `store checks=077 000` | 0 |
 | dispatch | `dispatch checks=037 000` | 0 |
-| lock | `lock checks=8 fails=0` | 0 |
+| lock | `lock checks=10 fails=0` | 0 |
 | dispatch-order | `dispatch order checks=3 fails=0` | 0 |
 | store-exact | `store exact checks=4 fails=0` | 0 |
 | store-cleanup | `store cleanup cases=18 fails=0` | 0 |
+| dispatch-fault | `dispatch fault checks=10 fails=0` | 0 |
 
 The authority gates and the standalone lock gate are run by
 `seed/qualification/security673/gate669.om` as part of the security qualification; the dispatcher
@@ -146,9 +148,32 @@ an absent path). The lock gate checks ordinary release, directory refusal and
 missing-path refusal. Its directory fixture is removed with `rmdir`; run gates
 only in disposable test working directories, never against an active store.
 
-The pre-effect dispatcher release check returns 78 on this failure. Other dispatcher
-cleanup and final-release sites still ignore the release result; this change does not
-claim those paths report it, nor does it redesign stale-lock reclamation.
+The pre-effect dispatcher release check returns 78 on this failure. Since DRA-419 every later
+release goes through `dfinish`, which releases and keeps an earlier failure code, or returns 78
+when the release is the only failure. This change does not redesign stale-lock reclamation.
+
+## Return codes added by the DRA-419 critical profile
+
+`seed/profile/profile.om` refused the pre-fix modules (dropped results, unbounded loops, host words
+outside declared effect functions). The fixes add these codes:
+
+| Code | Function | Meaning |
+| --- | --- | --- |
+| 43 | `lacq` | more than 1000 tries requested; refused before any attempt (the retry loop is bounded by 1000) |
+| 40 | `ltry` | the owner pid file could not be read (`lerr` set by `lread`: 32 open, 33 close, 34 short read). `lread` used to return 32..34 as the pid itself, so a live owner with pid 32 looked like a read error |
+| 76 | `dispatch` | reconcile (`actrecon`) refused the receipt; the current (still in-flight) record is persisted unchanged by the following record write |
+| 77 | `dispatch` | the post-effect record write failed, on the reconcile, lost-generation or normal path (lost-generation and reconcile write errors were dropped before) |
+| 78 | `dispatch` | the lock release failed and no earlier failure is set (post-effect release errors were dropped before) |
+| 79 | `dispatch` | `actlost` refused to mark the record unknown after a generation change (the error was overwritten before) |
+
+`dispatch-fault-gate.om` is `action.om`, `store.om`, then `dispatch.om` with the lines
+`err = actlost r`, `err = actrecon r s` and `err = writerec r` calling `factlost`, `factrecon` and
+`fwriterec`, then `dispatch-fault-test.om`, which replaces `lock.om` with a counting double.
+`seed/profile/check.om` regenerates it with the same line replacements, compares, runs it, and runs the same injection over
+the frozen pre-fix `seed/profile/cases/dispatch-943d955.om`. The pre-fix module fails cases 2, 3, 4, 5, 7
+and 8 (79, 77, 78, 79, 77, 78). Cases 0, 1, 6 and 9 (0, 60, 76, 77 normal path) are regressions that the
+old code also passed. This is fault injection at the call results, not a qualification of real disk or
+lock failure, and it is not yet in `gate669`.
 
 Native run (2026-10-31, Linux AArch64, seed/out/omc 7a8b84fc): `lock checks=8 fails=0`, exit 0.
 Negative control with `lock.om` from main 1db94162 (`lrm` returns 0 on unlink failure): no pass

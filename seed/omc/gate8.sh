@@ -52,6 +52,26 @@ refuse() { # name expect-error
     say "PASS $1 error $2"
 }
 
+# The same unit under each x86 target (FR-9 rows neg_fma_*): x86 refuses fma (error 9: no FMA3, no
+# unfused fallback) only after typing its operands, so an ill-typed fma gets AArch64's exact
+# refusal there, one line later for the prepended target line. Run after refuse NAME.
+refuse_x86() { # name expect-error
+    al=$(sed -n "s/^omc: line \([0-9]*\): error $2\$/\1/p" "$B/$1.err")
+    [ -n "$al" ] || bad "$1: no AArch64 diagnostic for error $2"
+    for tg in x86linux x86efi; do
+        n=$((n+1))
+        { printf 'target %s\n' "$tg"; cat "$T/$1.om"; } > "$B/$1.$tg.om"
+        set +e
+        "$S" < "$B/$1.$tg.om" > "$B/$1.$tg.bin" 2> "$B/$1.$tg.err"
+        crc=$?
+        set -e
+        [ "$crc" = "$2" ] || bad "$1 ($tg): compiler exit $crc, wanted $2 ($(cat "$B/$1.$tg.err"))"
+        printf 'omc: line %s: error %s\n' "$((al+1))" "$2" | cmp -s - "$B/$1.$tg.err" \
+            || bad "$1 ($tg): diagnostic $(cat "$B/$1.$tg.err"), wanted line $((al+1)) error $2"
+        say "PASS $1 $tg error $2"
+    done
+}
+
 run_ok f64_bits
 run_ok f32_bits
 run_ok arith
@@ -72,6 +92,14 @@ refuse neg_fma_mix3 7
 refuse neg_fma_ambig 11
 refuse neg_fma_ambig2 11
 refuse neg_fma_ambig3 11
+refuse_x86 neg_fma_int 7
+refuse_x86 neg_fma_int2 7
+refuse_x86 neg_fma_int3 7
+refuse_x86 neg_fma_mix2 7
+refuse_x86 neg_fma_mix3 7
+refuse_x86 neg_fma_ambig 11
+refuse_x86 neg_fma_ambig2 11
+refuse_x86 neg_fma_ambig3 11
 refuse neg_fma_x86 9
 refuse neg_fma_x86efi 9
 refuse neg_fma_ir 3

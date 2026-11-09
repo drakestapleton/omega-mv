@@ -1,0 +1,1 @@
+ABORTED by ng-bench at 08:21:28Z (kill of ngbench, rc 143) after 442 T rows: the round started 08:19:56Z, inside the 08:18Z contention window reported by the Manager, and ngbench v1 records no per-block contamination rows. Rows kept, not used for any verdict. Rerun: ../a725 with ngbench v2 (PREREG-contamination.md).

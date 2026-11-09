@@ -137,7 +137,7 @@ Acceptance:
 - #775 fixed with a fixture (empty text to `view uchar *` returns `len` 0) and a mutant that restores the
   defect and is killed.
 - #789 resolved (merged or superseded) so a missing IR oracle can never yield a qualification PASS.
-- `crumb verify .` OK with the tool pinned in `crumb.lock`.
+- (Retired, DRA-97, 2026-11-07: Crumbs left the active workflow, so `crumb verify .` is no longer a 1.0 criterion.)
 
 ### RM2. Executable contracts
 
@@ -279,7 +279,7 @@ namespace. gate15 refuses 33 minimal programs at their exact `omc: line L: error
 1..25 and 27..30, 24 with its accept side, 30 including IR-mode contract lines from #791) and runs
 `seed/omc/codereg.om`, which fails on a site without a row, a row without a site, an OMEGESE §9.14 /
 §11.1 row that differs from the registry, or a registry case that did not refuse. Machine records
-exist only in OM-2 `diag` mode (#655 owns incremental feedback).
+exist only in OM-2 `diag` mode (#655 owns incremental feedback). `seed/explain` (gate in `seed/host/check.sh`) prints the registry meaning and the refused source line for every code without changing omc's output.
 
 Acceptance:
 - A code registry in the language doc: every code, its meaning, the obligation, and one minimal
