@@ -39,9 +39,13 @@ memory-bandwidth contention, which slows both A/A copies alike (section 2). The 
 | 8 | IFC | 1.0086 | 1.0086 | IFC | 1.0210 | 1.0210 |
 | 9 | ISEL | 1.0075 | 1.0075 | INL | 1.0156 | 1.0156 |
 
-All passes together: 2.062 (X925) and 2.149 (A725). The baseline gap omc/gcc -O2 was 2.846 and 2.920, so the
-nine passes, done perfectly, close about half the gap in time terms and leave omc 1.380 (X925) and 1.359 (A725)
-times slower than gcc -O2 by geometric mean (Wolfram, `wolfram-summary-*`).
+All passes together, measured and MODELED factors combined: 2.062 (X925) and 2.149 (A725). The baseline gap
+omc/gcc -O2 was 2.846 and 2.920, so the nine passes, done perfectly, close about half the gap in time terms and
+leave omc 1.380 (X925) and 1.359 (A725) times slower than gcc -O2 by geometric mean (Wolfram, `wolfram-summary-*`).
+Measured factors only (sha and chacha at 1): 2.052 (X925) and 2.092 (A725), residual gap 1.387 and 1.395
+(WolframLanguageEvaluator: the `wolfram-rank-ngA-query.wl` definitions, then
+`N[gm[Flatten[Table[meas[P], {P, passes}]]]]` -> 2.052417168399068 (X925), 2.0924839475506367 (A725);
+`{N[2.846/2.052417168399068, 4], N[2.920/2.0924839475506367, 4]}` -> `{1.387, 1.395}`).
 
 What it means for NG:
 
@@ -93,8 +97,9 @@ The rounds shared the machine with GPU training legs (ownmodel own1-leg23, leg24
 CPU model jobs (wsp `ollm train`, ownmodel-gates6 `ollm serve` on ports 18291/18292, wsp `wpolicy`), listed per
 round with times and sources in `evidence/20261107T1155Z-payoff/OVERLAP.md`. They were seen only on other cores
 in the cluster snapshots at round start and end. The per-block scans (one before and one after each case in each
-block, not continuous) found a foreign runnable task on the timed core itself 3 times on X925 and 12 times on A725;
-those 3 and 11 (block, case) pairs were dropped as contaminated. All of the jobs share memory bandwidth and the
+block, not continuous) found a foreign runnable task on the timed core 3 times on X925 and 12 times on A725;
+those flag 3 and 11 (block, case) pairs, of which 2 and 9 fall in measured blocks (the others are warm-up blocks
+0 to 2, never in the statistics) and were dropped as contaminated. All of the jobs share memory bandwidth and the
 system-level cache, which ngbench's per-core scan cannot see; the A725 round also had a CPU-bound `ollm` on core 19
 of its own cluster.
 
@@ -256,8 +261,8 @@ The A725 fib38 CALL factor above 1 is a placement effect (ngD, the same code wit
 - Rows: X925 3196 and A725 3196, all `ok`, no `fail`, no `refused`; rc 0 on both rounds.
 - A/A: 18 of 18 pass (section 2); A/A cannot detect contention that slows both copies alike, so the rounds are
   not contention-cleared. Neighbouring jobs: `OVERLAP.md`.
-- Contamination scan: 3 (block, case) pairs flagged on X925 and 11 on A725; clean n is 29 to 31 for every case,
-  above the 21 the verdict needs.
+- Contamination scan: 3 (block, case) pairs flagged on X925 and 11 on A725 (2 and 9 of them in measured blocks);
+  clean n is 29 to 31 for every case, above the 21 the verdict needs.
 - Records: `x925/` and `a725/` hold start and end time, load, the cluster's processes at start and end, MIDR
   (X925 0x410fd851, A725 0x410fd871), the exact command (`command.txt`, `round.sh.txt`), raw rows, stderr.
 - X925 ran 12:09:07Z to 12:15:29Z under pool-8-9.lock (after bench399 released it); A725 ran 11:54:55Z to
