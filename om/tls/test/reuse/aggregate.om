@@ -1,0 +1,1409 @@
+note SPDX-License-Identifier: Apache-2.0
+note aggregate.om: OMEGA-CRYPTO-REUSE-1 gate 3 and checker2 rows (issue #639), contract
+note CRYPTO-REUSE-AGGREGATE 1. Built as `om2`, om/tls/sha2.om, aggregate.om; run from the repository root:
+note   aggregate run PLAN             runs every row, prints the receipt on stdout
+note   aggregate check PLAN RECEIPT   re-hashes and re-classifies the evidence, compares the receipt
+note A plan is line oriented ("#" lines and blank lines ignored), each line "KEY VALUE" or "KEY":
+note   row NAME control|mutant   start a row; NAME of a-z 0-9 "-", unique
+note   cwd PATH                  directory the command runs in (default "."); absent: NOT_RUN
+note   in PATH                   stdin file (default /dev/null); absent: NOT_RUN
+note   out PATH                  stdout goes to PATH (truncated) and its sha256 is bound; the log then
+note                             holds stderr only
+note   time SECONDS              deadline 1..86400, default 600
+note   after NAME                an earlier row that must be PASS, else this row is NOT_RUN unrun
+note   exit N                    the expected status (control: success; mutant: the killing failure),
+note                             0..123, required
+note   arg WORD                  argv in order, at least one, at most 128
+note   need PREFIX               every one must begin some log line (at most 32); in need and pass the
+note                             byte "#" matches the longest run of one or more decimal digits
+note   pass PREFIX               mutant only, 1..8: lines that, with status 0, show the selected test
+note                             ran and passed (a survivor)
+note   empty                     control only: the log must be empty
+note   want CLASS                expected class (default PASS); only self-test plans use another
+note   file PATH                 a fixture whose sha256 the receipt binds, at most 8
+note   end                       run the row
+note Each row runs as `/usr/bin/timeout -k 10 TIME /usr/bin/env -C CWD ARG...` with exactly the
+note runner's own environment (at most 64 entries and 4096 bytes, else the run is INVALID; agg.sh
+note starts the runner under `env -i` with a fixed set and binds it with a row that prints it), stdout
+note and stderr in build/tls/reuse/agg/NAME.log (created exclusively: a log left
+note from an earlier run is refused). Classes, first match wins:
+note   NOT_RUN  after row not PASS, cwd or stdin absent (the command is not started)
+note   INVALID  a bound fixture absent, a signal, status >= 124 (deadline 124/137, env or exec failure
+note            125/126/127), a log over 8 MiB
+note   control  PASS status == exit, every need present, empty log when `empty`
+note            INVALID status == exit but evidence missing (zero tests selected, missing summary)
+note            FAIL any other status
+note   mutant   PASS (killed) status == exit and every need present (the intended assertion failed)
+note            FAIL (survived) status 0 and every pass line present
+note            INVALID anything else (unrelated failure, build error, zero tests, skipped test)
+note Receipt (stdout of run, compared byte for byte by check):
+note   CRYPTO-REUSE-AGGREGATE 1
+note   plan sha256 HEX
+note   file PATH sha256 HEX|-                                   per `file`, before its row
+note   row NAME KIND status S|- signal G|- log HEX|- out HEX|- class C reason R
+note   verdict V rows N pass P fail F invalid I notrun M unexpected X
+note V is PASS when every class equals its want; otherwise, over the rows whose class differs from
+note their want, FAIL when one of them is PASS or FAIL, else INVALID when one is INVALID, else
+note NOT_RUN. No rows is INVALID. Exit: 0 PASS, 1 FAIL, 3 INVALID (also a malformed plan or an I/O
+note failure of the runner), 4 NOT_RUN; check: 2 REFUSED when the regenerated receipt differs (a log,
+note out file, fixture or the plan changed or is missing, a class, count or verdict was edited),
+note otherwise the verdict's exit. check trusts only the status and signal numbers of the receipt (no
+note signature binds them); every other field is recomputed from the files.
+
+const PLMAX ulong 262144
+const OBMAX ulong 1048576
+const BIG ulong 4611686018427387904
+
+text kw_row "row"
+text kw_cwd "cwd"
+text kw_in "in"
+text kw_out "out"
+text kw_time "time"
+text kw_after "after"
+text kw_exit "exit"
+text kw_arg "arg"
+text kw_need "need"
+text kw_pass "pass"
+text kw_empty "empty"
+text kw_want "want"
+text kw_file "file"
+text kw_end "end"
+text kwctl "control"
+text kwmut "mutant"
+text kw_run "run"
+text kw_check "check"
+text c_pass "PASS"
+text c_fail "FAIL"
+text c_inv "INVALID"
+text c_notrun "NOT_RUN"
+text t_hdr "CRYPTO-REUSE-AGGREGATE 1\nplan sha256 "
+text t_file "file "
+text t_sha " sha256 "
+text t_row "row "
+text t_sp " "
+text t_status " status "
+text t_signal " signal "
+text t_log " log "
+text t_out " out "
+text t_class " class "
+text t_reason " reason "
+text t_dash "-"
+text t_nl "\n"
+text t_verd "verdict "
+text t_rows " rows "
+text t_npass " pass "
+text t_nfail " fail "
+text t_ninv " invalid "
+text t_nnr " notrun "
+text t_unexp " unexpected "
+text p_tmo "/usr/bin/timeout"
+text p_k "-k"
+text p_10 "10"
+text p_env "/usr/bin/env"
+text p_C "-C"
+text p_dot "."
+text p_null "/dev/null"
+text p_logdir "build/tls/reuse/agg/"
+text p_logext ".log"
+text r_ok "ok"
+text r_killed "killed"
+text r_surv "survived"
+text r_after "after-not-pass"
+text r_cwd "cwd-missing"
+text r_in "in-missing"
+text r_fix "fixture-missing"
+text r_signal "signal"
+text r_infra "deadline-or-exec"
+text r_big "log-too-large"
+text r_exit "exit-mismatch"
+text r_evid "evidence-missing"
+text r_off "not-intended-failure"
+text m_usage "usage: aggregate run PLAN | aggregate check PLAN RECEIPT\n"
+text m_plan "aggregate: malformed plan, line "
+text m_io "aggregate: I/O failure\n"
+text m_stale "aggregate: cannot create the log (left from an earlier run?)\n"
+text m_env "aggregate: environment over 64 entries or 4096 bytes\n"
+text m_refuse "REFUSED the receipt does not match the plan and evidence\n"
+text m_chkok "CHECK OK "
+
+global pl uchar 262144
+global pln ulong 1
+global rb uchar 1048576
+global rbn ulong 1
+global ob uchar 1048576
+global obn ulong 1
+global lb uchar 8388608
+global lbn ulong 1
+global lbig ulong 1
+global pb uchar 4096
+global pbn ulong 1
+global av uchar 65536
+global avn ulong 1
+global avc ulong 1
+global ev uchar 4096
+global evn ulong 1
+global st uchar 4
+global hx uchar 64
+global dg uchar 32
+global rf ulong 24
+global ra ulong 256
+global rn ulong 64
+global rp ulong 16
+global rl ulong 16
+global tn ulong 1024
+global tc ulong 512
+global tk ulong 1
+global cn ulong 8
+global md ulong 1
+global ln ulong 1
+global rz ulong 1
+global xs ulong 4
+
+note rf: 0 name off, 1 name len, 2 kind (0 control, 1 mutant), 3/4 cwd, 5/6 in, 7/8 out, 9 time,
+note 10/11 after, 12 exit, 13 exit given, 14 empty, 15 want (1 PASS, 2 FAIL, 3 INVALID, 4 NOT_RUN),
+note 16 args, 17 needs, 18 passes, 19 files, 20 inside a row
+note xs: 0 status, 1 signal, 2 ran (1) or not (0)
+
+fn decs v ulong to ulong
+x = v
+n = ulong 0
+while true bound 22
+put dg n uchar add 48 rem x 10
+n = add n 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong div n 2
+a = get dg i
+put dg i get dg sub sub n i 1
+put dg sub sub n i 1 a
+end
+ret n
+end
+
+fn ioerr to void
+r = write 2 m_io 0 len m_io
+exit 3
+end
+
+fn die to void
+r = write 2 m_plan 0 len m_plan
+n = decs get ln 0
+r = write 2 dg 0 n
+r = write 2 t_nl 0 1
+exit 3
+end
+
+fn ot t view uchar * to void
+o = get obn 0
+n = len t
+if gt add o n OBMAX
+ioerr
+end
+for i ulong n
+put ob add o i get t i
+end
+put obn 0 add o n
+end
+
+fn opl s ulong n ulong to void
+o = get obn 0
+if gt add o n OBMAX
+ioerr
+end
+for i ulong n
+put ob add o i get pl add s i
+end
+put obn 0 add o n
+end
+
+fn odec v ulong to void
+n = decs v
+o = get obn 0
+if gt add o n OBMAX
+ioerr
+end
+for i ulong n
+put ob add o i get dg i
+end
+put obn 0 add o n
+end
+
+fn ohx to void
+o = get obn 0
+if gt add o 64 OBMAX
+ioerr
+end
+for i ulong 64
+put ob add o i get hx i
+end
+put obn 0 add o 64
+end
+
+fn ocls c ulong to void
+if eq c 1
+ot c_pass
+end
+if eq c 2
+ot c_fail
+end
+if eq c 3
+ot c_inv
+end
+if eq c 4
+ot c_notrun
+end
+end
+
+fn hexo o view uchar * to void
+for i ulong 32
+b = get o i
+hi = shr b 4
+lo = and b 15
+ch = add hi 48
+if gt hi 9
+ch = add hi 87
+end
+cl = add lo 48
+if gt lo 9
+cl = add lo 87
+end
+put hx mul i 2 ch
+put hx add mul i 2 1 cl
+end
+end
+
+note true when plan bytes s..s+n equal text t
+fn peq s ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n
+if ne get pl add s i get t i
+ret false
+end
+end
+ret true
+end
+
+fn ppeq a ulong an ulong b ulong bn ulong to bool
+if ne an bn
+ret false
+end
+for i ulong an
+if ne get pl add a i get pl add b i
+ret false
+end
+end
+ret true
+end
+
+note canonical decimal 0..999999999 from plan bytes, else malformed
+fn pdec s ulong n ulong to ulong
+if or eq n 0 gt n 9
+die
+end
+if and gt n 1 eq get pl s 48
+die
+end
+v = ulong 0
+for i ulong n
+b = ulong get pl add s i
+if or lt b 48 gt b 57
+die
+end
+v = add mul v 10 sub b 48
+end
+ret v
+end
+
+fn ppath s ulong n ulong to void
+if or eq n 0 ge n len pb
+die
+end
+for i ulong n
+b = get pl add s i
+if eq b 0
+die
+end
+put pb i b
+end
+put pbn 0 n
+end
+
+fn tpath t view uchar * to void
+for i ulong len t
+put pb i get t i
+end
+put pbn 0 len t
+end
+
+fn lpath to void
+tpath p_logdir
+p = get pbn 0
+s = get rf 0
+n = get rf 1
+for i ulong n
+put pb add p i get pl add s i
+end
+p = add p n
+for i ulong len p_logext
+put pb add p i get p_logext i
+end
+put pbn 0 add p len p_logext
+end
+
+note copy a chunk of k bytes to lb at t (bytes past the 8 MiB buffer are dropped)
+fn lcopy a view uchar * t ulong k ulong to void
+for i ulong k
+if lt add t i len lb
+put lb add t i get a i
+end
+end
+end
+
+note absorb all of fd into c (and lb when load); the byte count, or BIG on a read error
+fn absorb f int c edit ulong * load bool to ulong
+a = new uchar 16384 0
+t = ulong 0
+while true bound 1000000000
+r = read f a 0 len a
+if lt r 0
+ret BIG
+end
+if eq r 0
+ret t
+end
+k = ulong r
+sha256_update c part a 0 k
+if load
+lcopy a t k
+end
+t = add t k
+end
+ret BIG
+end
+
+note sha256 of the file at pb into hx; with load the bytes also go to lb (lbig when over 8 MiB)
+fn hfile load bool to bool
+c = new ulong 40 0
+o = new uchar 32 0
+fd = fopen pb 0 get pbn 0 524288 0
+if lt fd 0
+ret false
+end
+f = int fd
+sha256_init c
+t = absorb f c load
+r = fclose f
+if eq t BIG
+ret false
+end
+sha256_final c o
+hexo o
+if load
+put lbig 0 0
+put lbn 0 t
+if gt t len lb
+put lbig 0 1
+put lbn 0 len lb
+end
+end
+ret true
+end
+
+fn isdig b uchar to bool
+ret and ge b 48 le b 57
+end
+
+note true when the log line starting at p begins with pattern s..s+n ("#" = a run of digits)
+fn lineat p ulong s ulong n ulong to bool
+m = get lbn 0
+q = p
+i = ulong 0
+while lt i n bound 1000000
+c = get pl add s i
+if ge q m
+ret false
+end
+if eq c 35
+dg0 = isdig get lb q
+if not dg0
+ret false
+end
+while lt q m bound 100000000
+if not isdig get lb q
+break
+end
+q = add q 1
+end
+else
+b = get lb q
+if or eq b 10 ne b c
+ret false
+end
+q = add q 1
+end
+i = add i 1
+end
+ret true
+end
+
+fn lmatch s ulong n ulong to bool
+m = get lbn 0
+p = ulong 0
+while lt p m bound 100000000
+if lineat p s n
+ret true
+end
+while lt p m bound 100000000
+b = get lb p
+p = add p 1
+if eq b 10
+break
+end
+end
+end
+ret false
+end
+
+fn aput t view uchar * to void
+p = get avn 0
+n = len t
+if gt add add p n 2 len av
+die
+end
+put av p uchar and n 255
+put av add p 1 uchar shr n 8
+for i ulong n
+put av add add p 2 i get t i
+end
+put avn 0 add add p 2 n
+put avc 0 add get avc 0 1
+end
+
+fn aplan s ulong n ulong to void
+p = get avn 0
+if gt add add p n 2 len av
+die
+end
+put av p uchar and n 255
+put av add p 1 uchar shr n 8
+for i ulong n
+put av add add p 2 i get pl add s i
+end
+put avn 0 add add p 2 n
+put avc 0 add get avc 0 1
+end
+
+fn adec v ulong to void
+n = decs v
+p = get avn 0
+put av p uchar n
+put av add p 1 uchar 0
+for i ulong n
+put av add add p 2 i get dg i
+end
+put avn 0 add add p 2 n
+put avc 0 add get avc 0 1
+end
+
+fn enverr to void
+r = write 2 m_env 0 len m_env
+exit 3
+end
+
+note the runner's environment as an execenv packet in ev (u16 count, u16-length records), evn bytes;
+note evn 0 when the environment is empty (execprog then supplies an empty one)
+fn epack to void
+c = ulong envcnt
+put evn 0 0
+if eq c 0
+ret
+end
+if gt c 64
+enverr
+end
+put ev 0 uchar and c 255
+put ev 1 uchar shr c 8
+p = ulong 2
+for i ulong c
+if gt add p 3 len ev
+enverr
+end
+k = envread i ev add p 2 sub sub len ev p 2
+if le k 0
+enverr
+end
+n = ulong k
+put ev p uchar and n 255
+put ev add p 1 uchar shr n 8
+p = add add p 2 n
+end
+put evn 0 p
+end
+
+fn redirect src int dst int to void
+if ne src dst
+if ne dupfd src dst 0 long dst
+exit 127
+end
+end
+end
+
+note run the current row: sets xs
+fn arun to void
+put avn 0 2
+put avc 0 0
+aput p_tmo
+aput p_k
+aput p_10
+adec get rf 9
+aput p_env
+aput p_C
+if eq get rf 4 0
+aput p_dot
+else
+aplan get rf 3 get rf 4
+end
+for j ulong get rf 16
+aplan get ra mul j 2 get ra add mul j 2 1
+end
+put av 0 uchar and get avc 0 255
+put av 1 uchar shr get avc 0 8
+if eq get rf 6 0
+tpath p_null
+else
+ppath get rf 5 get rf 6
+end
+fi = fopen pb 0 get pbn 0 524288 0
+if lt fi 0
+ioerr
+end
+lpath
+fl = fopen pb 0 get pbn 0 524481 420
+if lt fl 0
+r = write 2 m_stale 0 len m_stale
+exit 3
+end
+fw = fl
+if ne get rf 8 0
+ppath get rf 7 get rf 8
+fw = fopen pb 0 get pbn 0 524865 420
+if lt fw 0
+ioerr
+end
+end
+pid = fork
+if lt pid 0
+ioerr
+end
+if eq pid 0
+redirect int fi 0
+redirect int fw 1
+redirect int fl 2
+if eq get evn 0 0
+r = execprog av 0 get avn 0
+else
+r = execenv av 0 get avn 0 ev 0 get evn 0
+end
+exit 127
+end
+r = fclose int fi
+r = fclose int fl
+if ne get rf 8 0
+r = fclose int fw
+end
+p = int pid
+r = waitpid p st 0 len st 0
+if ne r long p
+ioerr
+end
+put xs 0 ulong get st 1
+put xs 1 ulong and get st 0 127
+put xs 2 1
+end
+
+note true when the receipt line at p starts with "row NAME "
+fn rbrow p ulong to bool
+m = get rbn 0
+s = get rf 0
+n = get rf 1
+if gt add add p n 5 m
+ret false
+end
+for i ulong 4
+if ne get rb add p i get t_row i
+ret false
+end
+end
+for i ulong n
+if ne get rb add add p 4 i get pl add s i
+ret false
+end
+end
+ret eq get rb add add p 4 n 32
+end
+
+note the receipt's status/signal token starting at q: ends at the next space; sets xs slot k;
+note returns the position after the token and its space; "-" sets xs 2 to 0
+fn rtok q ulong k ulong to ulong
+m = get rbn 0
+v = ulong 0
+d = ulong 0
+p = q
+while lt p m bound 30
+b = ulong get rb p
+if eq b 32
+break
+end
+if eq b 45
+put xs 2 0
+else
+if or lt b 48 gt b 57
+put rz 0 1
+ret m
+end
+v = add mul v 10 sub b 48
+end
+d = add d 1
+p = add p 1
+end
+if or eq d 0 ge p m
+put rz 0 1
+ret m
+end
+put xs k v
+ret add p 1
+end
+
+note skip w space-separated tokens from q
+fn rskip q ulong w ulong to ulong
+m = get rbn 0
+p = q
+for j ulong w
+while lt p m bound 100000
+b = get rb p
+p = add p 1
+if eq b 32
+break
+end
+end
+end
+ret p
+end
+
+note check mode: the status and signal of the current row from the receipt (sets xs; rz on failure)
+fn rrow to void
+m = get rbn 0
+put xs 2 1
+p = ulong 0
+while lt p m bound 1048577
+if rbrow p
+q = rskip p 4
+q = rtok q 0
+q = rskip q 1
+q = rtok q 1
+ret
+end
+while lt p m bound 1048577
+b = get rb p
+p = add p 1
+if eq b 10
+break
+end
+end
+end
+put rz 0 1
+put xs 2 0
+end
+
+fn isdir to bool
+fd = fopen pb 0 get pbn 0 540672 0
+if lt fd 0
+ret false
+end
+r = fclose int fd
+ret true
+end
+
+fn isfile to bool
+fd = fopen pb 0 get pbn 0 524288 0
+if lt fd 0
+ret false
+end
+r = fclose int fd
+ret true
+end
+
+note (gate, below: 0 when after/cwd/in allow the row to run, else the NOT_RUN reason 1 after, 2 cwd, 3 in)
+note the class of the earlier row named by after; malformed plan when there is none
+fn aftercls to ulong
+a = get rf 10
+an = get rf 11
+for j ulong get tk 0
+k = mul j 2
+if ppeq get tn k get tn add k 1 a an
+ret get tc j
+end
+end
+die
+ret 0
+end
+
+fn gate to ulong
+an = get rf 11
+if ne an 0
+w = aftercls
+if ne w 1
+ret 1
+end
+end
+if ne get rf 4 0
+ppath get rf 3 get rf 4
+if not isdir
+ret 2
+end
+end
+if ne get rf 6 0
+ppath get rf 5 get rf 6
+if not isfile
+ret 3
+end
+end
+ret 0
+end
+
+fn allneed to bool
+for j ulong get rf 17
+if not lmatch get rn mul j 2 get rn add mul j 2 1
+ret false
+end
+end
+ret true
+end
+
+fn allpass to bool
+if eq get rf 18 0
+ret false
+end
+for j ulong get rf 18
+if not lmatch get rp mul j 2 get rp add mul j 2 1
+ret false
+end
+end
+ret true
+end
+
+fn oreason r ulong to void
+if eq r 1
+ot r_ok
+end
+if eq r 2
+ot r_killed
+end
+if eq r 3
+ot r_surv
+end
+if eq r 4
+ot r_after
+end
+if eq r 5
+ot r_cwd
+end
+if eq r 6
+ot r_in
+end
+if eq r 7
+ot r_fix
+end
+if eq r 8
+ot r_signal
+end
+if eq r 9
+ot r_infra
+end
+if eq r 10
+ot r_big
+end
+if eq r 11
+ot r_exit
+end
+if eq r 12
+ot r_evid
+end
+if eq r 13
+ot r_off
+end
+end
+
+note class * 16 + reason of a row that ran (xs, lb loaded); fx: a bound fixture is absent
+fn classify fx ulong to ulong
+s = get xs 0
+if ne fx 0
+ret add ulong 48 7
+end
+if ne get xs 1 0
+ret add ulong 48 8
+end
+if ge s 124
+ret add ulong 48 9
+end
+if ne get lbig 0 0
+ret add ulong 48 10
+end
+if eq get rf 2 0
+if ne s get rf 12
+ret add ulong 32 11
+end
+if not allneed
+ret add ulong 48 12
+end
+if and ne get rf 14 0 ne get lbn 0 0
+ret add ulong 48 12
+end
+ret add ulong 16 1
+end
+if and eq s get rf 12 allneed
+ret add ulong 16 2
+end
+if and eq s 0 allpass
+ret add ulong 32 3
+end
+ret add ulong 48 13
+end
+
+fn rowend to void
+if or eq get rf 16 0 eq get rf 13 0
+die
+end
+if ge get rf 12 124
+die
+end
+if eq get rf 2 1
+if or eq get rf 17 0 eq get rf 18 0
+die
+end
+if ne get rf 14 0
+die
+end
+else
+if ne get rf 18 0
+die
+end
+end
+k = get tk 0
+if ge k 512
+die
+end
+for j ulong k
+if ppeq get tn mul j 2 get tn add mul j 2 1 get rf 0 get rf 1
+die
+end
+end
+fx = ulong 0
+for j ulong get rf 19
+s = get rl mul j 2
+n = get rl add mul j 2 1
+ppath s n
+ot t_file
+opl s n
+ot t_sha
+if hfile false
+ohx
+else
+ot t_dash
+fx = 1
+end
+ot t_nl
+end
+g = gate
+put xs 2 0
+if eq get md 0 0
+if eq g 0
+arun
+end
+else
+if eq g 0
+rrow
+if eq get xs 2 0
+put rz 0 1
+end
+else
+put xs 2 0
+end
+end
+ot t_row
+opl get rf 0 get rf 1
+ot t_sp
+if eq get rf 2 0
+ot kwctl
+else
+ot kwmut
+end
+ot t_status
+cr = ulong 0
+if eq get xs 2 0
+ot t_dash
+ot t_signal
+ot t_dash
+ot t_log
+ot t_dash
+ot t_out
+ot t_dash
+cr = add 64 add g 3
+else
+odec get xs 0
+ot t_signal
+odec get xs 1
+ot t_log
+lpath
+if hfile true
+ohx
+else
+if eq get md 0 0
+ioerr
+end
+put rz 0 1
+ot t_dash
+end
+ot t_out
+if eq get rf 8 0
+ot t_dash
+else
+ppath get rf 7 get rf 8
+if hfile false
+ohx
+else
+if eq get md 0 0
+ioerr
+end
+put rz 0 1
+ot t_dash
+end
+end
+cr = classify fx
+end
+c = shr cr 4
+ot t_class
+ocls c
+ot t_reason
+oreason and cr 15
+ot t_nl
+put tn mul k 2 get rf 0
+put tn add mul k 2 1 get rf 1
+put tc k c
+put tk 0 add k 1
+put cn c add get cn c 1
+w = get rf 15
+if ne c w
+if le c 2
+put cn 5 add get cn 5 1
+end
+if eq c 3
+put cn 6 add get cn 6 1
+end
+if eq c 4
+put cn 7 add get cn 7 1
+end
+end
+end
+
+fn clsof s ulong n ulong to ulong
+if peq s n c_pass
+ret 1
+end
+if peq s n c_fail
+ret 2
+end
+if peq s n c_inv
+ret 3
+end
+if peq s n c_notrun
+ret 4
+end
+die
+ret 0
+end
+
+fn namech b uchar to bool
+if or isdig b eq b 45
+ret true
+end
+ret and ge b 97 le b 122
+end
+
+note "row NAME KIND" value v..e: reset the row fields
+fn prow v ulong e ulong to void
+for j ulong 24
+put rf j 0
+end
+put rf 9 600
+put rf 15 1
+put rf 20 1
+q = v
+while lt q e bound 262145
+if eq get pl q 32
+break
+end
+if not namech get pl q
+die
+end
+q = add q 1
+end
+if or eq q v ge q e
+die
+end
+put rf 0 v
+put rf 1 sub q v
+t = add q 1
+if peq t sub e t kwctl
+put rf 2 0
+ret
+end
+if peq t sub e t kwmut
+put rf 2 1
+ret
+end
+die
+end
+
+note one plan line s..e (no newline)
+fn pline s ulong e ulong to void
+if eq s e
+ret
+end
+if eq get pl s 35
+ret
+end
+k = s
+while lt k e bound 262145
+if eq get pl k 32
+break
+end
+k = add k 1
+end
+kn = sub k s
+v = add k 1
+vn = ulong 0
+if lt k e
+vn = sub e v
+if eq vn 0
+die
+end
+end
+inrow = get rf 20
+if peq s kn kw_row
+if or ne inrow 0 eq vn 0
+die
+end
+prow v e
+ret
+end
+if eq inrow 0
+die
+end
+if peq s kn kw_end
+if ne vn 0
+die
+end
+rowend
+put rf 20 0
+ret
+end
+if peq s kn kw_empty
+if ne vn 0
+die
+end
+put rf 14 1
+ret
+end
+if eq vn 0
+die
+end
+if peq s kn kw_cwd
+if ne get rf 4 0
+die
+end
+put rf 3 v
+put rf 4 vn
+ret
+end
+if peq s kn kw_in
+if ne get rf 6 0
+die
+end
+put rf 5 v
+put rf 6 vn
+ret
+end
+if peq s kn kw_out
+if ne get rf 8 0
+die
+end
+put rf 7 v
+put rf 8 vn
+ret
+end
+if peq s kn kw_after
+if ne get rf 11 0
+die
+end
+put rf 10 v
+put rf 11 vn
+ret
+end
+if peq s kn kw_time
+x = pdec v vn
+if or eq x 0 gt x 86400
+die
+end
+put rf 9 x
+ret
+end
+if peq s kn kw_exit
+if ne get rf 13 0
+die
+end
+put rf 12 pdec v vn
+put rf 13 1
+ret
+end
+if peq s kn kw_want
+put rf 15 clsof v vn
+ret
+end
+if peq s kn kw_arg
+j = get rf 16
+if ge j 128
+die
+end
+put ra mul j 2 v
+put ra add mul j 2 1 vn
+put rf 16 add j 1
+ret
+end
+if peq s kn kw_need
+j = get rf 17
+if ge j 32
+die
+end
+put rn mul j 2 v
+put rn add mul j 2 1 vn
+put rf 17 add j 1
+ret
+end
+if peq s kn kw_pass
+j = get rf 18
+if ge j 8
+die
+end
+put rp mul j 2 v
+put rp add mul j 2 1 vn
+put rf 18 add j 1
+ret
+end
+if peq s kn kw_file
+j = get rf 19
+if ge j 8
+die
+end
+put rl mul j 2 v
+put rl add mul j 2 1 vn
+put rf 19 add j 1
+ret
+end
+die
+end
+
+note read the file at pb into pl (plan) or rb (receipt)
+fn slurp which ulong to void
+fd = fopen pb 0 get pbn 0 524288 0
+if lt fd 0
+ioerr
+end
+f = int fd
+t = ulong 0
+r = long 0
+while true bound 1048578
+if eq which 0
+if ge t len pl
+ioerr
+end
+r = read f pl t sub len pl t
+else
+if ge t len rb
+ioerr
+end
+r = read f rb t sub len rb t
+end
+if lt r 0
+ioerr
+end
+if eq r 0
+break
+end
+t = add t ulong r
+end
+r = fclose f
+if eq which 0
+put pln 0 t
+else
+put rbn 0 t
+end
+end
+
+fn argpath i ulong to void
+if ge long i long argcnt
+r = write 2 m_usage 0 len m_usage
+exit 3
+end
+n = argread i pb 0 len pb
+if or le n 0 ge n long len pb
+r = write 2 m_usage 0 len m_usage
+exit 3
+end
+put pbn 0 ulong n
+end
+
+fn pbis t view uchar * to bool
+if ne get pbn 0 len t
+ret false
+end
+for i ulong len t
+if ne get pb i get t i
+ret false
+end
+end
+ret true
+end
+
+note check mode: the regenerated receipt must equal the given one byte for byte
+fn same to bool
+if or ne get rz 0 0 ne get obn 0 get rbn 0
+ret false
+end
+for i ulong get obn 0
+if ne get ob i get rb i
+ret false
+end
+end
+ret true
+end
+
+fn ckfin code int to int
+if not same
+r = write 1 m_refuse 0 len m_refuse
+ret 2
+end
+r = write 1 m_chkok 0 len m_chkok
+o = get obn 0
+q = sub o 1
+while gt q 0 bound 1048577
+if eq get ob sub q 1 10
+break
+end
+q = sub q 1
+end
+r = write 1 ob q sub o q
+ret code
+end
+
+fn main to int
+argpath 1
+if pbis kw_run
+put md 0 0
+epack
+else
+if pbis kw_check
+put md 0 1
+else
+r = write 2 m_usage 0 len m_usage
+ret 3
+end
+end
+argpath 2
+slurp 0
+if not hfile false
+ioerr
+end
+ot t_hdr
+ohx
+ot t_nl
+if eq get md 0 1
+argpath 3
+slurp 1
+end
+m = get pln 0
+p = ulong 0
+put ln 0 1
+while lt p m bound 262145
+e = p
+while lt e m bound 262145
+if eq get pl e 10
+break
+end
+e = add e 1
+end
+if ge e m
+die
+end
+pline p e
+p = add e 1
+put ln 0 add get ln 0 1
+end
+if ne get rf 20 0
+die
+end
+v = ulong 1
+if eq get tk 0 0
+v = 3
+else
+if ne get cn 5 0
+v = 2
+else
+if ne get cn 6 0
+v = 3
+else
+if ne get cn 7 0
+v = 4
+end
+end
+end
+end
+ot t_verd
+ocls v
+ot t_rows
+odec get tk 0
+ot t_npass
+odec get cn 1
+ot t_nfail
+odec get cn 2
+ot t_ninv
+odec get cn 3
+ot t_nnr
+odec get cn 4
+ot t_unexp
+odec add add get cn 5 get cn 6 get cn 7
+ot t_nl
+code = int 0
+if eq v 2
+code = 1
+end
+if eq v 3
+code = 3
+end
+if eq v 4
+code = 4
+end
+if eq get md 0 0
+r = write 1 ob 0 get obn 0
+if ne r long get obn 0
+ioerr
+end
+ret code
+end
+ret ckfin code
+end
