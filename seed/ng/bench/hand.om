@@ -1,0 +1,882 @@
+note hand: builds the hand-edited arm binaries of the M3 payoff map (seed/ng/bench/PREREG-payoff.md) and
+note checks them against objdump. Built by seed/out/omc from this file alone. Lane ng-bench.
+note
+note A SPEC is an encoder case file of seed/ng/src/a64.om (ng mode `@ng a64-enc`, ng-a64 lane): line 1 is
+note `@ng a64-enc`, every case line `FORM operands | expected disassembly` becomes one instruction word, and
+note lines starting with `;` are comments to the encoder. hand reads directives from those comment lines:
+note   ; @at ADDR             the next word goes to virtual address ADDR (0x hex, 4-aligned, >= 0x4000b0)
+note   ; @old ADDR W ..       the input ELF must hold the words W .. at ADDR, ADDR+4, .. (else exit 1)
+note   ; @word W | TEXT       one literal word W at the cursor (forms the encoder lacks: REV, SIMD)
+note   ; @nop ADDR            NOP words from the cursor up to (not including) ADDR
+note Every other comment line is ignored. A word written at or past the end of the input file grows the
+note file (the write must start exactly at the end: no holes) and program header 0 (offset 0, vaddr
+note 0x400000, the code segment of omc's layout) gets the new p_filesz and p_memsz.
+note
+note hand splice SPEC WORDS IN OUT
+note     WORDS: the encoder's output for SPEC (one little-endian word per case line, in order). OUT = IN
+note     with every word of SPEC written. stderr "hand: OK case=N word=N nop=N grow=N size=N".
+note hand check SPEC
+note     stdin: `objdump -D -b binary -m aarch64 --adjust-vma=0x400000 OUT`. For every word SPEC writes,
+note     objdump's text at its address must equal the SPEC's expected text (NOP fills expect `nop`).
+note     Comparison: blanks collapsed, objdump's `//` comment dropped, `@+N` / `@-N` in the expected text
+note     means the word's own address plus / minus N bytes, printed as objdump prints it (0x, lowercase).
+note     stdout "hand: check OK words=N".
+note Exit 0 ok; 1 a check failed (named on stderr: old word, word count, expected text, hole, header);
+note 2 usage; 3 a file unreadable, too large or not writable; 4 a SPEC line malformed (line number).
+note A 0x number of more than 16 hex digits, or an `@+N` / `@-N` of more than 19 decimal digits, is a malformed
+note line (exit 4); before bay 10's fix they ran out of their loop bound (trap 4, exit 104). That fix changed the
+note binary from f352309b (the PREREG-payoff pin that built the round's arms) to db7f7808; all 20 arms it splices
+note are byte-identical to payoff-manifest.sha256.
+om2
+text tusage "usage: hand splice SPEC WORDS IN OUT | hand check SPEC < objdump-text\n"
+text tok "hand: OK case="
+text tword " word="
+text tnop " nop="
+text tgrow " grow="
+text tsize " size="
+text tchk "hand: check OK words="
+text tbad "hand: SPEC line "
+text tmal " malformed\n"
+text tunr "hand: cannot read or write argument "
+text told "hand: old word differs at "
+text tcnt "hand: WORDS holds a different number of words than SPEC has case lines\n"
+text thole "hand: write leaves a hole or runs past 4 MiB at "
+text thdr "hand: program header 0 is not omc's code segment\n"
+text tmis "hand: check differs at "
+text tobj " objdump: "
+text texp " expected: "
+text tnoexp "hand: no expected text for the word at "
+text tnodis "hand: objdump has no line for "
+text tnl "\n"
+text tnopt "nop"
+global hsp uchar 1048576
+global hwd uchar 1048576
+global hel uchar 4194304
+global hob uchar 16777216
+global hix ulong 1048576
+global hpb uchar 4096
+global hln uchar 4096
+global hlnn ulong 1
+global hta uchar 512
+global htb uchar 512
+global hst ulong 24
+note hst: 0 SPEC length, 1 WORDS length, 2 ELF length, 3 cursor address, 4 case words taken, 5 literal
+note words, 6 NOP words, 7 grown bytes, 8 line number, 9 parse position, 10 parsed value, 11 objdump
+note length, 12 words checked, 13 mode (1 splice, 2 check), 14 ELF length before growth, 15 hta length,
+note 16 htb length, 17 position of the expected text (0: none)
+
+note ---- output line
+fn ltext t view uchar * to void
+n = get hlnn 0
+if gt add n len t 4096
+trap 9
+end
+for i ulong len t
+put hln add n i get t i
+end
+put hlnn 0 add n len t
+end
+fn lbyte c uchar to void
+n = get hlnn 0
+if lt n 4096
+put hln n c
+put hlnn 0 add n 1
+end
+end
+fn lnum v ulong to void
+d = new uchar 24 0
+p = ulong 24
+x = v
+while gt x 9
+p = sub p 1
+put d p uchar add rem x 10 48
+x = div x 10
+end
+p = sub p 1
+put d p uchar add x 48
+for i ulong sub 24 p
+lbyte get d add p i
+end
+end
+fn hexc v ulong to uchar
+if lt v 10
+ret uchar add v 48
+end
+ret uchar add v 87
+end
+note lhex: 0x and the lowercase hex digits of v without leading zeros, the way objdump prints addresses
+fn lhex v ulong to void
+lbyte 48
+lbyte 120
+s = ulong 60
+going = true
+while and going gt s 0
+if eq and shr v s 15 0
+s = sub s 4
+else
+going = false
+end
+end
+k = add div s 4 1
+for i ulong k
+sh = sub s mul i 4
+lbyte hexc and shr v sh 15
+end
+end
+fn lflush fd int to void
+w = write fd hln 0 get hlnn 0
+put hlnn 0 0
+end
+fn lline to void
+ltext tbad
+lnum get hst 8
+ltext tmal
+lflush 2
+exit 4
+end
+
+fn lnoarg idx ulong to void
+ltext tunr
+lnum idx
+ltext tnl
+lflush 2
+exit 3
+end
+
+note ---- files: buffer selector 1 hsp (SPEC), 2 hwd (WORDS), 3 hel (ELF), 4 hob (objdump text); globals
+note cannot be passed (error 19), so the reads go through these selectors
+fn bcap sel ulong to ulong
+if eq sel 1
+ret len hsp
+end
+if eq sel 2
+ret len hwd
+end
+if eq sel 3
+ret len hel
+end
+ret len hob
+end
+fn rdpart fd int sel ulong n ulong to long
+m = sub bcap sel n
+if eq sel 1
+ret read fd hsp n m
+end
+if eq sel 2
+ret read fd hwd n m
+end
+if eq sel 3
+ret read fd hel n m
+end
+ret read fd hob n m
+end
+note rdfd: everything from fd into buffer sel; its size, or exit 3 (argument idx named) when it fills
+note the buffer completely
+fn rdfd fd int sel ulong idx ulong to ulong
+n = ulong 0
+going = true
+while going bound 100000
+k = rdpart fd sel n
+if le k 0
+going = false
+else
+n = add n ulong k
+if eq n bcap sel
+lnoarg idx
+end
+end
+end
+ret n
+end
+note rdarg: the file named by argument idx into buffer sel
+fn rdarg idx ulong sel ulong to ulong
+r = argread idx hpb 0 4096
+if le r 0
+exit 2
+end
+fd = int fopen hpb 0 ulong r 0 0
+if lt fd 0
+lnoarg idx
+end
+n = rdfd fd sel idx
+c = fclose fd
+ret n
+end
+
+note ---- little-endian fields of the ELF
+fn elw o ulong to ulong
+b0 = ulong get hel o
+b1 = ulong get hel add o 1
+b2 = ulong get hel add o 2
+b3 = ulong get hel add o 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+fn elq o ulong to ulong
+ret or elw o shl elw add o 4 32
+end
+fn elput o ulong v ulong to void
+for i ulong 4
+put hel add o i uchar and shr v mul i 8 255
+end
+end
+fn elputq o ulong v ulong to void
+elput o and v 4294967295
+elput add o 4 shr v 32
+end
+fn wdw k ulong to ulong
+o = mul k 4
+b0 = ulong get hwd o
+b1 = ulong get hwd add o 1
+b2 = ulong get hwd add o 2
+b3 = ulong get hwd add o 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+note ---- SPEC scanning: positions in hsp; hst 9 is the parse position
+fn isblank c uchar to bool
+ret or eq c 32 eq c 9
+end
+fn skipb e ulong to void
+p = get hst 9
+going = true
+while and going lt p e bound 1048576
+if isblank get hsp p
+p = add p 1
+else
+going = false
+end
+end
+put hst 9 p
+end
+fn hexv c uchar to ulong
+if and ge c 48 le c 57
+ret sub ulong c 48
+end
+if and ge c 97 le c 102
+ret sub ulong c 87
+end
+ret 99
+end
+note phex: a 0x number at the parse position (blanks skipped first) into hst 10; false when there is none
+fn phex e ulong to bool
+skipb e
+p = get hst 9
+if ge add p 2 e
+ret false
+end
+if or ne get hsp p 48 ne get hsp add p 1 120
+ret false
+end
+p = add p 2
+v = ulong 0
+k = ulong 0
+going = true
+while and going and lt p e le k 16 bound 64
+d = hexv get hsp p
+if gt d 15
+going = false
+else
+v = or shl v 4 d
+k = add k 1
+p = add p 1
+end
+end
+if or eq k 0 gt k 16
+ret false
+end
+put hst 9 p
+put hst 10 v
+ret true
+end
+note kw: the SPEC holds the bytes of t at p
+fn kw p ulong e ulong t view uchar * to bool
+if gt add p len t e
+ret false
+end
+for i ulong len t
+if ne get hsp add p i get t i
+ret false
+end
+end
+ret true
+end
+note bar: position just after the first `|` in [s, e), or 0
+fn bar s ulong e ulong to ulong
+for i ulong sub e s
+if eq get hsp add s i 124
+ret add add s i 1
+end
+end
+ret 0
+end
+
+note ---- one word at the cursor
+fn putword w ulong to void
+a = get hst 3
+if or lt a 0x4000b0 ne and a 3 0
+lline
+end
+o = sub a 0x400000
+n = get hst 2
+if ge o n
+if or ne o n gt add o 4 4194304
+ltext thole
+lhex a
+ltext tnl
+lflush 2
+exit 1
+end
+put hst 2 add n 4
+put hst 7 add get hst 7 4
+end
+elput o w
+put hst 3 add a 4
+end
+
+note ---- normalised texts: hta from objdump, htb from the SPEC (blanks collapsed, ends trimmed)
+fn ta c uchar to void
+n = get hst 15
+if eq c 32
+if eq n 0
+ret
+end
+if eq get hta sub n 1 32
+ret
+end
+end
+if lt n 512
+put hta n c
+put hst 15 add n 1
+end
+end
+fn tb c uchar to void
+n = get hst 16
+if eq c 32
+if eq n 0
+ret
+end
+if eq get htb sub n 1 32
+ret
+end
+end
+if lt n 512
+put htb n c
+put hst 16 add n 1
+end
+end
+fn trim to void
+n = get hst 15
+if gt n 0
+if eq get hta sub n 1 32
+put hst 15 sub n 1
+end
+end
+m = get hst 16
+if gt m 0
+if eq get htb sub m 1 32
+put hst 16 sub m 1
+end
+end
+end
+note nobj: objdump's line at hob[p ..] (p just after `ADDR:`): skip the tab, the word and its tab, then the
+note instruction text up to the newline or `//`
+fn nobj p0 ulong to void
+put hst 15 0
+n = get hst 11
+p = p0
+tabs = ulong 0
+while and lt p n lt tabs 2 bound 64
+c = get hob p
+if eq c 10
+tabs = 9
+else
+if eq c 9
+tabs = add tabs 1
+end
+p = add p 1
+end
+end
+going = true
+while and going lt p n bound 4096
+c = get hob p
+if eq c 10
+going = false
+else
+if eq c 47
+if lt add p 1 n
+if eq get hob add p 1 47
+going = false
+end
+end
+end
+end
+if going
+if eq c 9
+ta 32
+else
+ta c
+end
+p = add p 1
+end
+end
+trim
+end
+fn nfix t view uchar * to void
+put hst 16 0
+for i ulong len t
+tb get t i
+end
+trim
+end
+note nexp: the SPEC's expected text from q to the end of the line, `@+N` / `@-N` resolved against a
+fn nexp q ulong a ulong to void
+put hst 16 0
+n = get hst 0
+p = q
+going = true
+while and going lt p n bound 4096
+c = get hsp p
+if eq c 10
+going = false
+else
+if and eq c 64 lt add p 1 n
+p = nrel p n a
+else
+if eq c 9
+tb 32
+else
+tb c
+end
+p = add p 1
+end
+end
+end
+nfix2
+end
+fn nfix2 to void
+m = get hst 16
+if gt m 0
+if eq get htb sub m 1 32
+put hst 16 sub m 1
+end
+end
+s = ulong 0
+while and lt s get hst 16 eq get htb s 32 bound 512
+s = add s 1
+end
+if gt s 0
+k = sub get hst 16 s
+for i ulong k
+put htb i get htb add i s
+end
+put hst 16 k
+end
+end
+note nrel: `@+N` or `@-N` at p; writes the target as 0x hex into htb; returns the position after N
+fn nrel p0 ulong n ulong a ulong to ulong
+sg = get hsp add p0 1
+p = add p0 2
+v = ulong 0
+k = ulong 0
+going = true
+while and going and lt p n le k 19 bound 24
+c = get hsp p
+if and ge c 48 le c 57
+v = add mul v 10 sub ulong c 48
+k = add k 1
+p = add p 1
+else
+going = false
+end
+end
+if gt k 19
+lline
+end
+t = add a v
+if eq sg 45
+t = sub a v
+else
+if ne sg 43
+lline
+end
+end
+put hlnn 0 0
+lhex t
+for i ulong get hlnn 0
+tb get hln i
+end
+put hlnn 0 0
+ret p
+end
+
+note tsame: hta equals htb
+fn tsame to bool
+n = get hst 15
+if ne n get hst 16
+ret false
+end
+for i ulong n
+if ne get hta i get htb i
+ret false
+end
+end
+ret true
+end
+note in check mode: compare objdump's text at the cursor with the expected text at q (isnop: `nop`;
+note else q 0 means the line has no expected text, an error), step the cursor
+fn chkword q ulong isnop bool to void
+a = get hst 3
+if or lt a 0x400000 ne and a 3 0
+lline
+end
+k = div sub a 0x400000 4
+if ge k 1048576
+lline
+end
+if and eq q 0 not isnop
+ltext tnoexp
+lhex a
+ltext tnl
+lflush 2
+exit 1
+end
+ix = get hix k
+if eq ix 0
+ltext tnodis
+lhex a
+ltext tnl
+lflush 2
+exit 1
+end
+nobj sub ix 1
+if isnop
+nfix tnopt
+else
+nexp q a
+end
+if not tsame
+ltext tmis
+lhex a
+ltext tobj
+for i ulong get hst 15
+lbyte get hta i
+end
+ltext texp
+for i ulong get hst 16
+lbyte get htb i
+end
+ltext tnl
+lflush 2
+exit 1
+end
+put hst 12 add get hst 12 1
+put hst 3 add a 4
+end
+
+note ---- objdump index: hix[(addr - 0x400000) / 4] = 1 + position just after `ADDR:`
+fn objix to void
+n = get hst 11
+p = ulong 0
+while lt p n bound 20000000
+s = p
+while and lt p n eq get hob p 32 bound 64
+p = add p 1
+end
+v = ulong 0
+k = ulong 0
+going = true
+while and going lt p n bound 24
+d = hexv get hob p
+if gt d 15
+going = false
+else
+v = or shl v 4 d
+k = add k 1
+p = add p 1
+end
+end
+if and gt k 0 lt p n
+if eq get hob p 58
+if and ge v 0x400000 lt v 0x800000
+if eq and v 3 0
+put hix div sub v 0x400000 4 add p 2
+end
+end
+end
+end
+while and lt p n ne get hob p 10 bound 4096
+p = add p 1
+end
+p = add p 1
+if eq p s
+p = add p 1
+end
+end
+end
+
+fn caseline s ulong e ulong to void
+k = get hst 4
+put hst 4 add k 1
+if eq get hst 13 1
+if gt mul add k 1 4 get hst 1
+ltext tcnt
+lflush 2
+exit 1
+end
+putword wdw k
+else
+chkword bar s e false
+end
+end
+fn dold e ulong to void
+if not phex e
+lline
+end
+a = get hst 10
+if eq get hst 13 2
+ret
+end
+going = true
+while going bound 4096
+if phex e
+w = get hst 10
+o = sub a 0x400000
+if or lt a 0x400000 gt add o 4 get hst 14
+lline
+end
+if ne elw o w
+ltext told
+lhex a
+ltext tnl
+lflush 2
+exit 1
+end
+a = add a 4
+else
+going = false
+end
+end
+end
+fn dword e ulong to void
+s = get hst 9
+if not phex e
+lline
+end
+w = get hst 10
+if gt w 4294967295
+lline
+end
+put hst 5 add get hst 5 1
+if eq get hst 13 1
+putword w
+else
+chkword bar s e false
+end
+end
+fn dnop e ulong to void
+if not phex e
+lline
+end
+t = get hst 10
+a = get hst 3
+if or lt t a ne and t 3 0
+lline
+end
+k = div sub t a 4
+for i ulong k
+put hst 6 add get hst 6 1
+if eq get hst 13 1
+putword 0xd503201f
+else
+chkword 0 true
+end
+end
+end
+text tat "at"
+text tolds "old"
+text twd "word"
+text tnps "nop"
+fn directive e ulong to void
+p = get hst 9
+if kw p e tolds
+put hst 9 add p 3
+dold e
+ret
+end
+if kw p e tat
+put hst 9 add p 2
+if not phex e
+lline
+end
+put hst 3 get hst 10
+ret
+end
+if kw p e twd
+put hst 9 add p 4
+dword e
+ret
+end
+if kw p e tnps
+put hst 9 add p 3
+dnop e
+ret
+end
+lline
+end
+note ---- the SPEC walk, shared by splice (mode 1) and check (mode 2)
+fn walk to void
+n = get hst 0
+p = ulong 0
+ln = ulong 0
+while lt p n bound 1048576
+s = p
+while and lt p n ne get hsp p 10 bound 1048576
+p = add p 1
+end
+e = p
+p = add p 1
+ln = add ln 1
+put hst 8 ln
+oneline s e
+end
+end
+fn oneline s ulong e ulong to void
+put hst 9 s
+skipb e
+q = get hst 9
+if ge q e
+ret
+end
+c = get hsp q
+if eq c 64
+ret
+end
+if eq c 59
+put hst 9 add q 1
+skipb e
+r = get hst 9
+if lt r e
+if eq get hsp r 64
+put hst 9 add r 1
+directive e
+end
+end
+ret
+end
+caseline s e
+end
+
+fn usage to void
+w = write 2 tusage 0 len tusage
+exit 2
+end
+fn dosplice to int
+if ne argcnt 6
+usage
+end
+put hst 13 1
+put hst 0 rdarg 2 1
+put hst 1 rdarg 3 2
+n = rdarg 4 3
+put hst 2 n
+put hst 14 n
+if lt n 0x100
+ltext thdr
+lflush 2
+exit 1
+end
+if or ne elq 0x48 0 ne elq 0x50 0x400000
+ltext thdr
+lflush 2
+exit 1
+end
+if ne elq 0x60 n
+ltext thdr
+lflush 2
+exit 1
+end
+walk
+if ne mul get hst 4 4 get hst 1
+ltext tcnt
+lflush 2
+exit 1
+end
+m = get hst 2
+if ne m n
+elputq 0x60 m
+elputq 0x68 m
+end
+r = argread 5 hpb 0 4096
+if le r 0
+exit 2
+end
+fd = int fopen hpb 0 ulong r 577 493
+if lt fd 0
+lnoarg 5
+end
+w = write fd hel 0 m
+c = fclose fd
+if ne w long m
+lnoarg 5
+end
+ltext tok
+lnum get hst 4
+ltext tword
+lnum get hst 5
+ltext tnop
+lnum get hst 6
+ltext tgrow
+lnum get hst 7
+ltext tsize
+lnum m
+ltext tnl
+lflush 2
+ret 0
+end
+fn docheck to int
+if ne argcnt 3
+usage
+end
+put hst 13 2
+put hst 0 rdarg 2 1
+put hst 11 rdfd int 0 4 0
+objix
+walk
+ltext tchk
+lnum get hst 12
+ltext tnl
+lflush 1
+ret 0
+end
+text tsplice "splice"
+text tcheck "check"
+fn main to int
+if lt argcnt 3
+usage
+end
+r = argread 1 hpb 0 4096
+if eq r 6
+ok = true
+for i ulong 6
+if ne get hpb i get tsplice i
+ok = false
+end
+end
+if ok
+ret dosplice
+end
+end
+if eq r 5
+ok = true
+for i ulong 5
+if ne get hpb i get tcheck i
+ok = false
+end
+end
+if ok
+ret docheck
+end
+end
+usage
+ret 2
+end
