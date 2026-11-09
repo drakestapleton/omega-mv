@@ -115,6 +115,5 @@ Open a pull request with the exact command you ran and its output. Receipts are 
 
 ## Crumbs
 
-This repo uses the Crumb Protocol (RFC-0001). Each directory carries a `.crumb` file (what the directory is for, its rules, and a backfilled history). Live coordination between agents goes in `.crumb.local`, which is never committed.
-Before editing a directory, read its `.crumb`. Rules and the `crumb` tool: https://github.com/aien-dev/aien-architecture-mv/blob/main/docs/CRUMB_PROTOCOL.md
+This repo used the Crumb Protocol (RFC-0001): each directory carries a `.crumb` file (what the directory is for, its rules, and a backfilled history). Crumbs are retired from the active workflow (DRA-97, 2026-11-07): no gate or workflow checks them, and reading, writing or refreshing a crumb is not a step of any change. The `.crumb` files stay as history.
 Backfilled history (marked as such, not live whispers) is in `docs/crumbs/BACKFILL.md`.

@@ -61,7 +61,7 @@ unchanged:
 ## Build and run
 
 ```
-OMC=/path/to/seed/out/omc   # pinned: sha256 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df
+OMC=/path/to/seed/out/omc   # pinned: sha256 0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f
 $OMC < om/receipt/receipt.om > receipt && chmod +x receipt
 python3 om/receipt/parity/corpus.py /tmp/corp && ./receipt < /tmp/corp/rust.bin
 ```
