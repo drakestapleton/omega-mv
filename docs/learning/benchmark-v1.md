@@ -159,13 +159,19 @@ candidate that exits with the same code. Before each fork the supervisor draws
 `dupfd` or `execpure` fails. Exit 122 with exactly those 16 bytes is status 6.
 The candidate image never sees the nonce, so it cannot forge an operational
 result. Kill and reap happen only while the child is unreaped, so a reused pid
-is never signalled.
+is never signalled. The deadline covers collection as well: a child that was
+reaped but whose output had not reached end of file when the deadline passed is
+reported as a timeout.
 
 Under the strict profile a candidate cannot sleep or block (seccomp allows no
 sleep; stdin is at end of file), so it can outlive the deadline only by using
 CPU. The profile's CPU limit ends such a child near 1 s even without the kill;
 `run-test` therefore requires a timeout to be charged more than the deadline
-and less than 0.9 s.
+and less than 0.9 s, and the timed-out child to be reaped by the supervisor.
+The supervisor polls in steps of at most 1 ms inside a `while` loop, whose
+implicit 1000000-pass guard would trap (exit 104) a launch running for at least
+about 1000 s; that bound is inferred from the guard, not run. Nothing is scored
+in that case.
 
 `tests/learning/benchmark/run-test.om` runs real children: the L776 oracle
 (expected bytes), the observable (0), the saturating mutant (7), an empty
@@ -173,16 +179,17 @@ writer (9), a 10^12-step loop (4 at 500 ms), the division trap (8), a
 4096-byte writer (5), an absent path (6), a fork attempt (9: the strict profile
 refuses `fork`), exactly 256 bytes (7: allowed, wrong length), the oracle bytes
 in two writes about 3 ms apart (0), a stdin reader run with a non-empty
-supervisor stdin (9), a non-executable file and a directory (6). The same spin
-with a 3 s deadline dies by SIGXCPU (signal 24, status 5). It then charges the
-thirteen attempts with their measured judge time and the 128 MiB
-address-space ceiling as peak bytes: that peak is the declared bound, not a
-measurement, and energy is unknown. pass@1 is 2 of 13, and a run with one task
-never attempted cannot finish (30). Twelve compiled one-line mutants of
-`run.om` each fail the check of the case they falsify; a thirteenth (absent
-path launched) is equivalent, because the nonce still reports 6. The process
-words need the main seed compiler; the older `191b776e` pin refuses them
-(error 3). Evidence: `evidence/LEARNING-652/benchmark/L775-run298/`.
+supervisor stdin (9), a non-executable file and a directory (6), and a forgery
+attempt that writes 16 bytes and exits 122 (8: completed, judged on its exit
+code). The same spin with a 10 s deadline dies by SIGXCPU (signal 24,
+status 5). It then charges the fourteen attempts with their measured judge time
+and the 128 MiB address-space ceiling as peak bytes: that peak is the declared
+bound, not a measurement, and energy is unknown. pass@1 is 2 of 14, and a run
+with one task never attempted cannot finish (30). Fifteen compiled one-line
+mutants of `run.om` each fail the check of the case they falsify; a sixteenth
+(absent path launched) is equivalent, because the nonce still reports 6. The
+process words need the main seed compiler; the older `191b776e` pin refuses
+them (error 3). Evidence: `evidence/LEARNING-652/benchmark/L775-run298/`.
 
 Not covered: compiling candidates, measuring compiler/executable identities
 (`LPin` is still caller-supplied), a seccomp-kill signal (SIGSYS) fixture, peak
