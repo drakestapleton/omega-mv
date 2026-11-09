@@ -83,7 +83,7 @@ admission or short-length assertion, never for an unrelated child/compiler failu
 (first line `om2`, no `fn main`) may also use `devctl`, `mapnew`, `mapdrop`, `mapread`,
 `mapwrite`, `devcall`, `uvmctl`, `mapaddr`, `mapget`, `mapset`, `maphold` and `mapbind`.
 These words are supported on AArch64 Linux and `target x86linux`; they remain
-error9 in OM-1 function units and other targets (gate
+error 9 in OM-1 function units (a function unit under `target x86efi` is error 25; gate
 `seed/omc/om2/fnhost/fnhost.cases`). A handle is a long; `mapaddr` exposes only its
 owned live address, not general integer-pointer access.
 

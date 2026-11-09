@@ -6,9 +6,10 @@ additive to `spec/omegese-om2.md`, its errata and `docs/one_layer/OMEGESE.md`, w
 everything not stated here.
 
 Coordinator review (#599 language-evolution coordinator L835, card t_d732a0bb, run 349, 2026-11-09, base
-omega-mv main `1e3ecbba`): section 0 C2 corrected, every claim of section 1 checked against
-`seed/omc/omc.om` and the gate `seed/omc/om2/fnhost/` (verdicts in `docs/omegese-om3-review.md`). The
-context ABI revision in section 1 is not reviewed into force: it still needs Drake's decision.
+omega-mv main `1e3ecbba`): section 0 C2 corrected, every compiler-side claim of section 1 checked against
+`seed/omc/omc.om` and the gate `seed/omc/om2/fnhost/` (verdicts in `docs/omegese-om3-review.md`); the
+bridge-side sentences are NOT_RUN. The context ABI revision in section 1 is not reviewed into force: it
+still needs Drake's decision.
 
 ## 0. Opt-in and compatibility
 
