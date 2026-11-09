@@ -12,7 +12,7 @@ No GPU, model, tokenizer, network or protected data.
   branch tips (400 files, all additive). Generated `.crumb` changes were dropped: crumbs are retired
   (DRA-97) and main keeps its own `.crumb` files; `dd28ebc0` (crumb-only) became empty and was skipped.
 - New in this run: `src/learning/benchmark/run.om` (native executor), `tests/learning/benchmark/run-test.om`,
-  seven candidate fixtures in `tests/learning/benchmark/cand/`, thirteen executor mutants in `mutants/`,
+  eight candidate fixtures in `tests/learning/benchmark/cand/`, sixteen executor mutants in `mutants/`,
   `replay.sh` and the contract section in `docs/learning/benchmark-v1.md`.
 
 ## Compilers (born here, `compilers/`)
@@ -25,7 +25,7 @@ No GPU, model, tokenizer, network or protected data.
 ## Results (`seed-6d1b1cf5/results.tsv`, `pin-191b776e/results.tsv`, raw stdout/stderr/exits beside them)
 
 Command: `sh evidence/LEARNING-652/benchmark/L775-run298/replay.sh OMC OUTDIR` from the repository
-root (`EXEC=0` for the component pin). Seed: 51 rows, fail 0. Pin: 38 rows, fail 0.
+root (`EXEC=0` for the component pin). Seed: 55 rows, fail 0. Pin: 39 rows, fail 0.
 
 | Group | Both compilers |
 |---|---|
@@ -44,7 +44,7 @@ production is `4c43fcd5`, the ELF the L782 disposition recorded.
 ### Native executor (main seed omc only)
 
 `run-test` = `core.om` + `run.om` + `run-test.om`, run from the output `bin/` directory with
-fourteen arguments and stdin from the non-empty `good.bin`: exit 0, `BENCHMARK_RUN_PASS`. Its own
+fifteen arguments and stdin from the non-empty `good.bin`: exit 0, `BENCHMARK_RUN_PASS`. Its own
 observation rows (`seed-6d1b1cf5/run-test.stdout`: argv index, status, exit code, bytes, elapsed ns,
 `lobserve` result):
 
@@ -53,24 +53,26 @@ observation rows (`seed-6d1b1cf5/run-test.stdout`: argv index, status, exit code
 | 2 | observable | 0 | 0 | 128 | 1.4 ms | 0 correct |
 | 3 | saturating | 0 | 0 | 128 | 1.4 ms | 7 wrong value |
 | 4 | empty | 0 | 0 | 0 | 1.4 ms | 9 empty |
-| 5 | spin (10^12 steps), deadline 0.5 s | 4 | 0 | 0 | 500.4 ms | 4 timeout |
-| 6 | trap-div | 0 | 102 | 0 | 1.3 ms | 8 trap mismatch |
+| 5 | spin (10^12 steps), deadline 0.5 s | 4 | 0 | 0 | 500.5 ms | 4 timeout |
+| 6 | trap-div | 0 | 102 | 0 | 1.6 ms | 8 trap mismatch |
 | 7 | flood (4096 bytes) | 5 | 0 | 0 | 0.5 ms | 5 resource |
 | 8 | absent path | 6 | 0 | 0 | 0 | 6 operational |
 | 9 | escape (fork) | 0 | 0 | 0 | 1.4 ms | 9 (fork refused by the strict profile) |
 | 10 | exactly 256 bytes | 0 | 0 | 256 | 1.3 ms | 7 (allowed, wrong length) |
-| 11 | oracle bytes in two writes | 0 | 0 | 128 | 4.0 ms | 0 correct |
-| 12 | stdin reader | 0 | 0 | 0 | 1.2 ms | 9 (saw end of file, not `good.bin`) |
+| 11 | oracle bytes in two writes | 0 | 0 | 128 | 3.8 ms | 0 correct |
+| 12 | stdin reader | 0 | 0 | 0 | 1.3 ms | 9 (saw end of file, not `good.bin`) |
 | 13 | non-executable file (`cand-empty.om`) | 6 | 0 | 0 | 1.3 ms | 6 (launch nonce) |
-| 14 | directory `.` | 6 | 0 | 0 | 1.3 ms | 6 (launch nonce) |
-| 5 | spin, deadline 3 s | 5 | 24 | 0 | 1107.2 ms | 5 (SIGXCPU from the profile) |
+| 14 | directory `.` | 6 | 0 | 0 | 1.4 ms | 6 (launch nonce) |
+| 15 | forgery: 16 bytes, exit 122 | 0 | 122 | 16 | 1.4 ms | 8 (not operational) |
+| 5 | spin, deadline 10 s | 5 | 24 | 0 | 1078.9 ms | 5 (SIGXCPU from the profile) |
 
-Accounting over the thirteen 0.5 s attempts: `lbegin 13 1` → 0, thirteen `lattempt` → 0,
-`lfinish` → 0, attempts 13, pass@1 2, budgeted pass 2, energy-unknown 13. The same tasks with one
+Accounting over the fourteen 0.5 s attempts: `lbegin 14 1` → 0, fourteen `lattempt` → 0,
+`lfinish` → 0, attempts 14, pass@1 2, budgeted pass 2, energy-unknown 14. The same tasks with one
 never attempted: `lfinish` → 30, completed flag 0. The timeout row must be charged more than the
-0.5 s deadline and less than 0.9 s. A first spin fixture used a bare `while true`; its implicit loop
-bound trapped 104 after 1.5 ms (observed), so it was replaced with nested fixed loops. A second
-seed replay gave identical exits and binaries (only timing-bearing stdout differs).
+0.5 s deadline and less than 0.9 s, and its child must have been reaped by the supervisor. A first
+spin fixture used a bare `while true`; its implicit loop bound trapped 104 after 1.5 ms (observed),
+so it was replaced with nested fixed loops. A second seed replay gave identical exits and binaries
+(only timing-bearing stdout differs).
 
 Mutants (`mutants/`, each one changed or inserted line of `run.om` plus a leading `note`):
 
@@ -86,8 +88,11 @@ Mutants (`mutants/`, each one changed or inserted line of `run.om` plus a leadin
 | `first-read-eof` (first chunk taken as the end) | 53 | split write must assemble (0) |
 | `stdin-inherited` (supervisor stdin passed on) | 54 | stdin reader must see end of file (9) |
 | `nonce-ignored` (launch nonce never recognised) | 55 | non-executable must be 6 |
-| `no-kill` (signal 0 instead of SIGKILL) | 58 | timeout must end before 0.9 s |
-| `signal-completed` (signal reported as completed) | 59 | SIGXCPU spin must be 5 |
+| `nonce-constant` (nonce never drawn, zero bytes) | 57 | forgery must stay 8 |
+| `nonce-uncompared` (nonce bytes never compared) | 57 | forgery must stay 8 |
+| `no-kill` (signal 0 instead of SIGKILL) | 59 | timeout must end before 0.9 s |
+| `kill-abandoned` (timed-out child neither killed nor reaped) | 60 | timed-out child must be reaped |
+| `signal-completed` (signal reported as completed) | 61 | SIGXCPU spin must be 5 |
 | `missing-launched` (absent path launched) | 0 | equivalent: the nonce still reports 6 |
 
 With the component pin `cand-escape` and `run-test` are refused with compiler error 3 (unknown name):
@@ -95,11 +100,14 @@ the process words postdate that pin. Nothing is launched.
 
 ### Review
 
-Independent reviewer L775RunReview (first round, at `6378a0ca`) reproduced every row and the
-cherry-pick identity, and asked for changes: a launch refused inside the child was scored as a
-completed exit 122 (fixed with the launch nonce), the kill was not proven (CPU limit masked it; fixed
-with the 0.9 s bound and the `no-kill` mutant), a reaped pid could be signalled (fixed: kill only
-while unreaped), and four mutants survived (now fixtures and killed mutants above).
+Independent reviewer L775RunReview. Round 1 at `6378a0ca`: reproduced every row and the cherry-pick
+identity (400/400 blobs), VERDICT CHANGES: a launch refused inside the child was scored as a
+completed exit 122 (fixed with the launch nonce), the kill was masked by the CPU limit (0.9 s bound,
+`no-kill`), a reaped pid could be signalled (kill only while unreaped), four mutants survived (now
+fixtures). Round 2 at `363d0957`: VERDICT MERGE, three LOW items, all fixed here: abandoned child
+undetected (reap check, `kill-abandoned`), no forgery fixture (`cand/forge.om`, `nonce-constant`,
+`nonce-uncompared`), CPU-limit spin deadline raised from 3 s to 10 s so a starved child still dies
+by SIGXCPU before the wall deadline.
 
 ## Limits
 
