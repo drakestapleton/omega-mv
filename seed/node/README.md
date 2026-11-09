@@ -1622,8 +1622,9 @@ cancel);
 `CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
 every objective passed, 1 otherwise, 2 usage, 62 out of time, 30 + a journal
 refusal (50..57), 30 + a restart-recovery refusal (54..62: 24/25 refused
-record, 27 I/O, 28 write, 29 sync, 30 journal failed earlier, 31 job not
-admitted again, 32 action record not restored), 50..56 a setup failure (pool,
+record, 27 I/O, 28 write, 29 sync, 30 journal failed earlier, 31 the scheduler
+refused a restore: the incarnation, the capacities or policy, a job admitted
+again, or the last FAIR; 32 action record not restored), 50..56 a setup failure (pool,
 supervisor, scheduler, authority, worker spawn, view page, view process), 57 a
 restart cleanup that could not cancel a job the last creator left waiting or
 ready (the journal refused its CANCEL, or the RELEASE after a cancel that freed
