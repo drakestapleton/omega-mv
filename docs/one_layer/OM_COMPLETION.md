@@ -77,5 +77,5 @@ cannot emit them, so there is no reference unit to verify against.
 ## 4. Next concrete step
 
 No self-contained compiler feature remains for the supported scalar subset. Next work requires a
-decision (FR-2/3/6/7/8, decisions 24/37) or a shared target-extension model (IR arrays,
+decision (FR-3/6/8, FR-2/7 for OM-1 units only, decisions 24/37) or a shared target-extension model (IR arrays,
 structs, floats); FR-9 is merged as a draft (#923) described above, not a completed second target.
