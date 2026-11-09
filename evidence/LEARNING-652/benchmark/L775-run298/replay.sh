@@ -82,7 +82,7 @@ case_ admit-reviewer-probe 0 0 $A/independent-combined.om
 # Run 298: native executor over real child processes under execpure. The process words
 # (argcnt, fork, execpure, waitpid, pipefds, waitio, killpid) postdate the 191b776e pin:
 # with EXEC=0 that compiler must refuse them (error 3, unknown name) and nothing runs.
-for f in empty spin flood; do case_ cand-$f 0 - $B/cand/$f.om; done
+for f in empty spin flood c256 split stdin; do case_ cand-$f 0 - $B/cand/$f.om; done
 if [ "${EXEC:-1}" = 0 ]; then
 	case_ cand-escape 3 - $B/cand/escape.om
 	case_ run-test 3 - $C src/learning/benchmark/run.om $B/run-test.om
@@ -94,12 +94,20 @@ M=evidence/LEARNING-652/benchmark/L775-run298/mutants
 for src in src/learning/benchmark/run.om $M/*.om; do
 	n=run-test; want=0
 	case $src in $M/*) n=mut-$(basename "$src" .om)
-		# exit 40+k: check k is the one observation the mutant falsifies (run-test.om order)
+		# exit 40+k: check k is the one observation the mutant falsifies (run-test.om order:
+		# checks 1-3 oracle, 4+c candidate c = argv c+2, 17/18 timeout bounds, 19 CPU-limit spin)
 		case $n in
+		mut-missing-launched) want=0;;                   # equivalent: nonce still reports 6
 		mut-timeout-completed|mut-no-deadline) want=47;;  # spin must be timeout 4
-		mut-no-output-cap) want=49;;                     # flood must be resource 5
-		mut-missing-launched) want=50;;                  # absent path must be operational 6
+		mut-status-byte0) want=48;;                      # trap-div must keep code 102
+		mut-no-output-cap|mut-cap-257) want=49;;         # flood must be resource 5
 		mut-no-isolation) want=51;;                      # escape must be empty 9, not code 9
+		mut-cap-255) want=52;;                           # exactly 256 bytes is allowed (7)
+		mut-first-read-eof) want=53;;                    # two writes must assemble (0)
+		mut-stdin-inherited) want=54;;                   # stdin must be the empty pipe (9)
+		mut-nonce-ignored) want=55;;                     # non-executable must be operational 6
+		mut-no-kill) want=58;;                           # timeout must end before the CPU limit
+		mut-signal-completed) want=59;;                  # SIGXCPU must be resource 5
 		*) want=unlisted;;
 		esac;;
 	esac
@@ -108,8 +116,9 @@ for src in src/learning/benchmark/run.om $M/*.om; do
 	if [ "$c" = 0 ]; then
 		elfok "$OUT/bin/$n" && e=ok || e=bad
 		chmod +x "$OUT/bin/$n"
-		( cd "$OUT/bin" && timeout 20 ./$n ./oracle ./observable ./neg-observable-saturating \
+		( cd "$OUT/bin" && timeout 30 ./$n ./oracle ./observable ./neg-observable-saturating \
 			./cand-empty ./cand-spin ./profile-trap-div ./cand-flood ./no-such-candidate ./cand-escape \
+			./cand-c256 ./cand-split ./cand-stdin ./cand-empty.om . < ../good.bin \
 			> ../$n.stdout 2> ../$n.stderr; echo $? > ../$n.run.exit )
 		r=$(cat "$OUT/$n.run.exit")
 	fi
