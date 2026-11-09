@@ -12,9 +12,14 @@ pool lock `pool-8-9`. Nothing in this directory replaces an earlier receipt.
   evidence file is byte-identical to `e1c05afe` (`source.sha256` 16/16, `raw.sha256` 51/51),
   except: the five `.crumb` files and the candidate's root/`native/.crumb` edits are not
   carried (crumbs are retired for new work), and `REPLAY.md` gains the build composition of
-  `qualify-final`, which the original record omitted.
+  `qualify-final`, which the original record omitted, and stdin/stdout wording.
+- New test `tests/budget.om` (not in the original `source.sha256`): independent review of
+  `ee8ef46b` found that `tests/pack.om` reads its expected costs from `packcost` itself, so
+  changing `ret 502` to `ret 501` in `src/pack.om` passed every check. The new test compares
+  `packcost` with the literal receipts 255/263/502/502.
 - `tests/gates/run.sh native` now also exercises this module; `native/` was already an input of
   `tests/gates/omega-native.gate`, so changes here previously mapped to a gate that did not test them.
+  Each retrieval failure prints a `run.sh: retrieval FAIL:` line naming the failed check.
 
 ## Results
 
@@ -27,16 +32,19 @@ pool lock `pool-8-9`. Nothing in this directory replaces an earlier receipt.
 | Three recorded guard-removal mutants | compile; exit 1 with 4 / 3 / 1 failed checks | `replay.out` |
 | New tamper controls: one text byte, one revision digit, one raw compiler-record byte | refused with codes 8, 3 and exit 9; no evidence bytes | `replay.out` |
 | Main compiler `seed/out/omc` `0f2de851…` | same seven executables, byte for byte; same results | `replay-main-omc.out` |
-| Export compiler rebuilt from seed at L408 `43f86be2` | `bcf3abc7…aeaf9d54be`, matches pin; regenerated `corpus-t1/t2.response` byte-identical | recovery record |
+| Export compiler rebuilt from seed at L408 `43f86be2` (`sh seed/omega-from-seed.sh`) | `bcf3abc7…aeaf9d54be`, matches pin; `seed/out/omc < evidence/SEED-0/definitions/corpus-tN.request` gives exit 0 and bytes equal to `corpus-t1/t2.response` | not stored; rerun from that commit |
 | Pinned Xerj `v1.0.0-rc.98` (`2ca1d9c1…`), fresh private node, auth on | bulk 200; scoped read 200; out-of-scope 403 (absent and existing index); scoped write 403; no key 401; corrupted key 401; admin write 201 / read 200; no-match 200 | `http.tsv`, `external.out`, `*.response` |
 | Fresh scoped search through the unchanged native replay | verified and packed; equals `packet-3.json` | `search.packet` |
 | Independent tokenizer oracle on the pinned `tokenizer.json` | 255 / 263 / 502 / 502 tokens, equal to the recorded receipts | `tokenizer-oracle.out` |
-| `tests/gates/run.sh native` | exit 0, `RETRIEVAL PASS checks=41 mutants=3/3 …` | `gate-native.out` |
-| Same gate with the identity mutant applied to `src/verify.om` | exit 1 | `gate-native-negative.out` |
+| `tests/gates/run.sh native` (verifier, pack, budget, mutants, replay, scope) | exit 0, `RETRIEVAL PASS checks=41 pack budget mutants=3/3 …` | `gate-native.out` |
+| Same gate, `src/pack.om` `ret 502` changed to `ret 501` | exit 1, `tests/budget.om exit 3` | `gate-native-negative-budget.out` |
+| Same gate, identity mutant applied to `src/verify.om` | exit 1, `{"checks":41,"failures":4}` | `gate-native-negative-identity.out` |
 
 The private Xerj node used loopback port 19280 and a temporary data directory, both removed
 afterwards. Its keys were never written outside that directory. The tokenizer oracle is a
-measuring instrument (Hugging Face `tokenizers` 0.23.3), not part of the build.
+measuring instrument (Hugging Face `tokenizers` 0.23.3, Python), not part of the build; the
+original receipts came from a reference build linking the Rust `tokenizers` crate 0.21.4
+(`tokenizer-build.log`). The two versions give the same four counts.
 
 ## Still NOT_RUN
 

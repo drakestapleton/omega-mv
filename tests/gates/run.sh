@@ -485,24 +485,33 @@ case "$step" in
       ret=native/retrieval; rv="$nat/retrieval"; mkdir -p "$rv"
       retsrc() { cat $ret/vendor/sha256.om $ret/vendor/json.om $ret/src/pins.om $ret/src/codec.om "$1" \
         $ret/src/request.om $ret/src/packet.om $ret/src/pack.om "$2"; }
+      retfail() { echo "run.sh: retrieval FAIL: $*" >&2; exit 1; }
+      retbuild() { native_build "$1" "$2" || retfail "omc could not build $1"; }
       retsrc $ret/src/verify.om $ret/tests/verify.om > "$rv/verify.om"
-      native_build "$rv/verify.om" "$rv/verify.elf"
-      [ "$("$rv/verify.elf")" = '{"checks":41,"failures":0}' ]
+      retbuild "$rv/verify.om" "$rv/verify.elf"
+      out=$("$rv/verify.elf") || retfail "verifier suite exit $?: $out"
+      [ "$out" = '{"checks":41,"failures":0}' ] || retfail "verifier suite printed $out"
+      for t in pack budget; do
+        retsrc $ret/src/verify.om $ret/tests/$t.om > "$rv/$t.om"
+        retbuild "$rv/$t.om" "$rv/$t.elf"
+        "$rv/$t.elf" > /dev/null || retfail "tests/$t.om exit $?"
+      done
       for m in identity authority scope; do
         cp $ret/src/verify.om "$rv/verify-$m.om"
-        patch -s "$rv/verify-$m.om" < $ret/evidence/mutant-$m.diff
+        patch -s "$rv/verify-$m.om" < $ret/evidence/mutant-$m.diff || retfail "mutant $m diff did not apply"
         retsrc "$rv/verify-$m.om" $ret/tests/verify.om > "$rv/mutant.om"
-        native_build "$rv/mutant.om" "$rv/mutant.elf"
+        retbuild "$rv/mutant.om" "$rv/mutant.elf"
         rc=0; "$rv/mutant.elf" > /dev/null 2>&1 || rc=$?
-        [ "$rc" = 1 ] || { echo "run.sh: retrieval mutant $m was not rejected (exit $rc, need 1)" >&2; exit 1; }
+        [ "$rc" = 1 ] || retfail "mutant $m was not rejected (exit $rc, need 1)"
         echo "retrieval mutant $m: exit 1 as required"
       done
       retsrc $ret/src/verify.om $ret/tests/replay.om > "$rv/replay.om"
-      native_build "$rv/replay.om" "$rv/replay.elf"
-      "$rv/replay.elf" < $ret/evidence/search.response | cmp - $ret/evidence/packet-3.json
+      retbuild "$rv/replay.om" "$rv/replay.elf"
+      "$rv/replay.elf" < $ret/evidence/search.response | cmp - $ret/evidence/packet-3.json \
+        || retfail "replay of search.response differs from packet-3.json"
       rc=0; "$rv/replay.elf" < $ret/evidence/scope.response > "$rv/scope.out" || rc=$?
-      [ "$rc" = 10 ] && [ ! -s "$rv/scope.out" ] || { echo "run.sh: retrieval scope refusal exit $rc" >&2; exit 1; }
-      echo "RETRIEVAL PASS checks=41 mutants=3/3 packet-3 exact scope-refusal 10"
+      [ "$rc" = 10 ] && [ ! -s "$rv/scope.out" ] || retfail "scope refusal exit $rc"
+      echo "RETRIEVAL PASS checks=41 pack budget mutants=3/3 packet-3 exact scope-refusal 10"
     fi
     ;;
   *) echo "run.sh: unknown step '$step'" >&2; exit 2 ;;
