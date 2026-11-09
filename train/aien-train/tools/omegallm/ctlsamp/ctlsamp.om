@@ -126,6 +126,9 @@ global uf uchar 8
 global ofd long 1
 global rfd long 1
 global rseq ulong 1
+global dlg long 1
+global lgp long 1
+global ivg long 1
 
 note ---- output buffer ----
 fn oc c uchar to void
@@ -222,16 +225,56 @@ ret
 end
 odec m d
 end
-note a JSON string from fb[s..e) (ostr) or cb[s..e) (ostrg), escaping quote and backslash
+note one byte of a JSON string, escaped the way Python json.dumps escapes ASCII: quote,
+note backslash, \b \t \n \f \r, other bytes below 32 as \u00XX
+fn ochr c uchar to void
+if or eq c 34 eq c 92
+oc uchar 92
+oc c
+ret
+end
+if ge c 32
+oc c
+ret
+end
+oc uchar 92
+if eq c 8
+oc uchar 98
+ret
+end
+if eq c 9
+oc uchar 116
+ret
+end
+if eq c 10
+oc uchar 110
+ret
+end
+if eq c 12
+oc uchar 102
+ret
+end
+if eq c 13
+oc uchar 114
+ret
+end
+oc uchar 117
+oc uchar 48
+oc uchar 48
+oc add 48 shr c 4
+h = and c 15
+if lt h 10
+oc add 48 h
+else
+oc add 87 h
+end
+end
+note a JSON string from fb[s..e) (ostr) or cb[s..e) (ostrg)
 fn ostr s ulong e ulong to void
 oc uchar 34
 i = s
 while lt i e bound 65536
-c = get fb i
-if or eq c 34 eq c 92
-oc uchar 92
-end
-oc c
+ochr get fb i
 i = add i 1
 end
 oc uchar 34
@@ -240,11 +283,7 @@ fn ostrg base ulong e ulong to void
 oc uchar 34
 i = base
 while lt i e bound 16384
-c = get cb i
-if or eq c 34 eq c 92
-oc uchar 92
-end
-oc c
+ochr get cb i
 i = add i 1
 end
 oc uchar 34
@@ -882,6 +921,7 @@ note into sk and dropped, so a child that writes more never blocks on a full pip
 note count is capped below the compiler bound; reaching it counts as the deadline.
 fn drain slot ulong rd int base ulong to ulong
 dl = add monons 4000000000
+put dlg 0 dl
 n = ulong 0
 it = ulong 0
 while lt it 999998 bound 999999
@@ -910,16 +950,33 @@ end
 end
 ret add n 16384
 end
+note after end of file the child may still run (it closed stdout and lingers): poll
+note waitpid without blocking until the drain deadline, then kill it like a timeout.
 fn reap slot ulong pid long to void
 n = get cl slot
-if ge n 16384
+tmo = ge n 16384
+if tmo
 put cl slot sub n 16384
+else
+w = long 0
+while eq w 0 bound 999999
+w = waitpid int pid wst 0 4 1
+if eq w 0
+if le sub get dlg 0 monons 0
+tmo = true
+w = long 1
+else
+r = sleepns 1000000
+end
+end
+end
+end
+if tmo
 r = killpid int pid 9
 r = waitpid int pid wst 0 4 0
 put cs slot -1000
 ret
 end
-r = waitpid int pid wst 0 4 0
 sig = and get wst 0 127
 if ne sig 0
 put cs slot neg long sig
@@ -1210,6 +1267,10 @@ n = argread ulong i ab 0 len ab
 if le n 0
 ret long -1
 end
+note at most 12 digits, so the decimal value below cannot overflow long (trap 1)
+if gt n 12
+ret long -1
+end
 v = long 0
 for j ulong ulong n
 c = get ab j
@@ -1273,6 +1334,16 @@ readpsi 2 ppi
 readtz
 readmem
 pkgpu
+note never two nvidia-smi launches closer than interval_s, whatever the /proc reads above cost:
+note wait here until one interval has passed since the previous launch, then record this one.
+g = get lgp 0
+if gt g 0
+w = sub add g get ivg 0 monons
+if gt w 0
+r = sleepns w
+end
+end
+put lgp 0 monons
 runcmd 0 0
 rawlog tgpu get cl 0 1
 pkups
@@ -1314,14 +1385,19 @@ put rseq 0 0
 readstat
 savestat
 iv = mul ival 1000000000
+put ivg 0 iv
 nx = add monons iv
 seq = ulong 0
+note The next sample starts one interval after this one started, never sooner. A slow sample
+note (children at their 4 s deadline) is not followed by catch-up samples, so two nvidia-smi
+note reads are always at least interval_s apart. A fixed grid would fire late samples back to
+note back (measured 2026-11-09: gaps of 0.101 s and 0.131 s after a 10.5 s sample).
 while lt seq ulong cnt bound 999999
 left = sub nx monons
 if gt left 0
 r = sleepns left
 end
-nx = add nx iv
+nx = add monons iv
 sample seq
 seq = add seq 1
 end
