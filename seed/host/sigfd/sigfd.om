@@ -1,0 +1,221 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/host/sigfd/sigfd.om: fixture for sigmask (keyword 241) and sigfd (keyword 242), program mode.
+note Run by the OM-2 conductor through seed/host/sigfd/sigfd.cases from the repository root, without
+note arguments. Every check is behavioral (signal delivered or held, signalfd read); the
+note /proc/self/status SigBlk readback is the companion fixture sigblk.om. set = SIGTERM only:
+note byte 1 = 64 (bit 14, signal 15).
+note Checks (parent exit = number of the first failed check, 0 when all hold):
+note 1 sigmask 0 (SIG_BLOCK) set 0 8 returns 0.
+note 2 sigfd set 8 8 (the same set at offset 8) returns a descriptor in 3..9.
+note 3 a read of 128 bytes with nothing pending returns -11 (EAGAIN: SFD_NONBLOCK).
+note 4 killpid self 15 returns 0 and this process survives (TERM held); the read returns 128 bytes with
+note   ssi_signo (first 4 bytes LE) 15; a second read returns -11 (consumed).
+note 5 inheritance across fork: a child sends itself TERM, survives, and reads 15 from the shared sigfd.
+note 6 unblock: a child sends itself TERM (held), then sigmask 1 (SIG_UNBLOCK) delivers it: the child
+note   dies by signal 15.
+note 7 cleared before exec: a child unblocks TERM and execx's this program keeping the sigfd descriptor;
+note   the new image finds it closed (SFD_CLOEXEC; exit 41) and dies by TERM sent to itself (exit 42 if
+note   it survives).
+note 8 negative control for 7: the same child without the unblock: the new image also finds the sigfd
+note   closed and survives its own TERM (the mask crosses exec), so it exits 42.
+note 9 sigmask how 3 returns -22 (EINVAL).
+note 10 sigmask n 16, sigfd n 7 and sigfd at offset 60 of a 64-byte array each trap 3 (exit 103).
+note 11 sigmask 1 set: TERM unblocked again in the parent (0, nothing pending).
+om2
+text cms "s"
+text marker "omega-sigfd"
+global set uchar 64
+global argv uchar 4096
+global envp uchar 16
+global buf uchar 4096
+global info uchar 128
+global keep uchar 4
+global status uchar 4
+
+fn reap pid long to ulong
+r = waitpid int pid status 0 len status 0
+if ne r pid
+ret 1000
+end
+if ne get status 0 0
+ret add 2000 ulong and get status 0 127
+end
+ret ulong get status 1
+end
+
+note Read 128 bytes from fd s; returns 15 for one TERM record, 11 for EAGAIN, else 99.
+fn rdsig s int to ulong
+r = read s info 0 128
+if eq r neg long 11
+ret 11
+end
+if ne r 128
+ret 99
+end
+if ne get info 0 15
+ret 99
+end
+if or ne get info 1 0 ne get info 2 0
+ret 99
+end
+if ne get info 3 0
+ret 99
+end
+ret 15
+end
+
+note Append one u16-length record buf[0..n) to argv at pos; returns the new end.
+fn rec pos ulong n ulong to ulong
+put argv pos uchar and n 255
+put argv add pos 1 uchar shr n 8
+for i ulong n
+put argv add add pos 2 i get buf i
+end
+ret add add pos 2 n
+end
+
+note argv packet [path, marker, "s", digit of s]; environment ["A=1"]; keep [s]. Returns argv length.
+fn mkexec s ulong to ulong
+put argv 0 4
+put argv 1 0
+n = argread 0 buf 0 len buf
+if le n 0
+exit 90
+end
+pos = rec 2 ulong n
+for i ulong len marker
+put buf i get marker i
+end
+pos = rec pos len marker
+put buf 0 get cms 0
+pos = rec pos 1
+put buf 0 uchar add 48 s
+put envp 0 1
+put envp 1 0
+put envp 2 3
+put envp 3 0
+put envp 4 65
+put envp 5 61
+put envp 6 49
+put keep 0 uchar s
+ret rec pos 1
+end
+
+note The new image: argv [marker, "s", digit]. The sigfd descriptor must be closed, then TERM to self.
+fn child to int
+n = argread 2 buf 0 len buf
+if ne n 1
+ret 26
+end
+s = int sub get buf 0 48
+if ne flock s 8 neg long 9
+ret 41
+end
+k = killpid int getpid 15
+ret 42
+end
+
+note A forked child: mode 0 TERM to self then read the shared sigfd s; mode 1 TERM to self then unblock;
+note mode 2 unblock then execx; mode 3 execx without unblock. Returns its exit (2015: died by TERM).
+fn kid mode ulong s int to ulong
+an = mkexec ulong s
+pid = fork
+if lt pid 0
+ret 1001
+end
+if eq pid 0
+if eq mode 0
+k = killpid int getpid 15
+if ne rdsig s 15
+exit 51
+end
+exit 0
+end
+if eq mode 1
+k = killpid int getpid 15
+u = sigmask 1 set 0 8
+exit 52
+end
+if eq mode 2
+u = sigmask 1 set 0 8
+if ne u 0
+exit 53
+end
+end
+r = execx argv 0 an envp 0 7 keep 0 1
+exit 54
+end
+ret reap pid
+end
+
+note A forked child runs sigmask (w 0, n bytes at off) or sigfd (w 1); returns its exit (103 for trap 3).
+fn trapkid w ulong off ulong n ulong to ulong
+pid = fork
+if lt pid 0
+ret 1001
+end
+if eq pid 0
+if eq w 0
+r = sigmask 0 set off n
+else
+r = sigfd set off n
+end
+exit 98
+end
+ret reap pid
+end
+
+fn main to int
+if eq argcnt 3
+if eq argread 1 buf 0 len buf 1
+if eq get buf 0 get cms 0
+ret child
+end
+end
+ret 36
+end
+if ne argcnt 1
+ret 36
+end
+put set 1 64
+put set 9 64
+if ne sigmask 0 set 0 8 0
+ret 1
+end
+s = sigfd set 8 8
+if or lt s 3 gt s 9
+ret 2
+end
+fd = int s
+if ne rdsig fd 11
+ret 3
+end
+if ne killpid int getpid 15 0
+ret 4
+end
+if or ne rdsig fd 15 ne rdsig fd 11
+ret 4
+end
+if ne kid 0 fd 0
+ret 5
+end
+if ne kid 1 fd 2015
+ret 6
+end
+if ne kid 2 fd 2015
+ret 7
+end
+if ne kid 3 fd 42
+ret 8
+end
+if ne sigmask 3 set 0 8 neg long 22
+ret 9
+end
+if or or ne trapkid 0 0 16 103 ne trapkid 1 0 7 103 ne trapkid 1 60 8 103
+ret 10
+end
+if ne sigmask 1 set 0 8 0
+ret 11
+end
+ret 0
+end

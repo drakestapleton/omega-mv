@@ -443,3 +443,27 @@ diagnostics; the other 12 are the AArch64 and x86 compiles of the six
 `seed/host/utimens/` sources, which use the new word (error 3 before). Gate:
 `seed/host/utimens/utimens.cases` (x86linux through qemu-x86_64 user emulation;
 native x86 NOT_RUN).
+
+The execx 240, sigmask 241 and sigfd 242 host words (same branch, PROPOSED
+pending review) birth compiler
+`3a9bd7e1325c952b5667c6ff1f82c4808b32372bd8e6aa7f39fb7ffb3c3934aa`
+from source
+`1e9b1d22f7d195d7f8df2999d50fca548b43541da12bb70eb9852f6eb1e7c10d`.
+`execx A off n B off m K off k` shares the `execenv`/`execkeep` path: the keep
+slice is checked (trap 3), k above 64 traps 3, both packets are packed with the
+execenv limits and an argv packet of one record traps 3, all before any close;
+then `close_range(lo, d-1, CLOSE_RANGE_UNSHARE)` over each gap between kept
+descriptors from 3 (skipped when empty) and `close_range(lo, ~0U, ...)` after
+the last, then execve with the first record as the path and argv from the
+second record. `sigmask how A off n` (`hsig`, AArch64 135; `xhsig`, x86-64 14)
+is rt_sigprocmask(how, set, NULL, 8); `sigfd A off n` (AArch64 74, x86-64 289)
+is signalfd4(-1, set, 8, SFD_NONBLOCK|SFD_CLOEXEC = 526336). Both check the
+slice (trap 3) and n = 8 (else trap 3). Two functions were added (516 in all).
+Each of the 1676 tracked `.om` files was compiled alone for AArch64 and for
+`target x86linux` under `9c57c9dd` and `3a9bd7e1`: 3326 of the 3352 compiles
+give the same bytes, exit status and diagnostics; the other 26 are the AArch64
+and x86 compiles of the 13 new `seed/host/{execx,sigfd}/` sources that use the
+new words (error 3 before). The `execenv`, `execkeep`, `execprog` and `execpure`
+sources are byte-identical. Gates: `seed/host/execx/execx.cases` and
+`seed/host/sigfd/sigfd.cases` (x86linux through qemu-x86_64 user emulation;
+native x86 NOT_RUN).

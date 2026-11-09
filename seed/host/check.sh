@@ -145,6 +145,15 @@ echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # AT_SYMLINK_NOFOLLOW on a link, errno rows, path traps, refusals, and 6 omc.om mutants killed
 # (seed/host/utimens/).
 "$B/gate" seed/out/omc "$pin" seed/host/utimens/utimens.cases "$run/utimens"
+# execx 240: argv[0] preserved apart from the path, a keep list (unordered, empty, first-close skipped,
+# below-3 byte and duplicate) kept while every other descriptor from 3 closes (AArch64 and x86linux),
+# ENOENT after the closes, k/argv/env traps, refusals, and 8 omc.om mutants killed (seed/host/execx/).
+"$B/gate" seed/out/omc "$pin" seed/host/execx/execx.cases "$run/execx"
+# sigmask 241 and sigfd 242: TERM held, read back through a nonblocking signalfd (signo 15, -11 when
+# empty), mask inherited across fork and cleared by SIG_UNBLOCK before exec, SigBlk readback (AArch64
+# and x86linux under qemu), SFD_CLOEXEC, n traps, refusals, and 6 omc.om mutants killed
+# (seed/host/sigfd/).
+"$B/gate" seed/out/omc "$pin" seed/host/sigfd/sigfd.cases "$run/sigfd"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2

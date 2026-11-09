@@ -835,7 +835,7 @@ put tkb 0 get inlen 0
 put tk 0 3
 end
 
-note ======== keyword lookup (original om4 KWTAB plus native host words 100..177, flock 197, execpure 198, execenv 233, setprio 234, prlimit 235, setaff 237, execkeep 238 and utimens 239) ========
+note ======== keyword lookup (original om4 KWTAB plus native host words 100..177, flock 197, execpure 198, execenv 233, setprio 234, prlimit 235, setaff 237, execkeep 238, utimens 239, execx 240, sigmask 241 and sigfd 242) ========
 note genkw.awk describes the original om4 table only; retain the native host extension on regeneration.
 note efi (178) is a keyword only under `target x86efi`; gate18 checks that scoped entry separately.
 fn kw w ulong to ulong
@@ -1024,6 +1024,15 @@ ret 238
 end
 if eq w 32491004228105333
 ret 239
+end
+if eq w 517063669861
+ret 240
+end
+if eq w 30244684792555891
+ret 241
+end
+if eq w 431214782835
+ret 242
 end
 if eq w 461229747302
 ret 197
@@ -6423,7 +6432,7 @@ e = harray x 0
 if eq c 125
 harg x 2 8
 end
-if or eq c 233 eq c 238
+if ge c 233
 put fr add x 23 e
 put fr add x 24 get fr add x 21
 put fr add x 25 get fr add x 22
@@ -6438,6 +6447,17 @@ e = get fr add x 23
 if eq c 238
 harg x 2 8
 end
+if eq c 240
+note execx: the keep list K is the third slice; its frame slots move to x+29..x+31 and A's return.
+e = harray x 0
+put fr add x 29 e
+put fr add x 30 get fr add x 21
+put fr add x 31 get fr add x 22
+put fr add x 20 get fr add x 23
+put fr add x 21 get fr add x 24
+put fr add x 22 get fr add x 25
+e = get fr add x 23
+end
 end
 save
 basearg 4 e
@@ -6446,7 +6466,7 @@ e3 2332033024 4 4 16
 loadarg 5 1 get fr add x 22
 note Packet limits: 131072 bytes and 1024 records for execenv and execkeep, else 4096 and 64 (inline
 note constants, not names: om4 has 16 live registers for this function).
-if or eq c 233 eq c 238
+if ge c 233
 matconst 16 131072
 else
 matconst 16 4096
@@ -6461,7 +6481,7 @@ end
 note stack is 8192 bytes for one packet pass; execenv and execkeep make two passes over 0x48000 bytes
 note (the pass bound is 1 + (stack >> 18), so no extra name holds it).
 stack = ulong 8192
-if or eq c 233 eq c 238
+if ge c 233
 note x14 = env base + off (ADD), x15 = env length; length 2..131072 (CMP x15,x16 B.HI; CMP x15,#2 B.LO).
 basearg 14 get fr add x 26
 loadarg 16 1 get fr add x 27
@@ -6481,6 +6501,16 @@ hload x 2 3
 emit 1895828607
 trapc 11 3
 end
+if eq c 240
+note execx: x17 = K base + off and x3 = k, read before SPSUB (x7 is the runtime, never written); k
+note above 64 traps 3 (CMP x3,#64; B.HI) before any descriptor closes.
+basearg 17 get fr add x 29
+loadarg 16 1 get fr add x 30
+e3 2332033024 17 17 16
+loadarg 3 1 get fr add x 31
+mimmed 4043309056 31 3 64
+trapc 8 3
+end
 spsub stack
 stkchk
 pass = ulong 0
@@ -6495,7 +6525,7 @@ emit 2432698500
 emit 3506440357
 emit 4043309279
 trapc 0 3
-if or eq c 233 eq c 238
+if ge c 233
 note record limit 1024
 matconst 16 1024
 else
@@ -6507,10 +6537,17 @@ if or or eq c 125 eq c 141 eq c 142
 emit 4043311327
 trapc 1 3
 end
+if eq c 240
+if eq pass 0
+note execx: the argv packet holds the path and at least argv[0] (CMP x6,#2; B.LO trap 3).
+emit 4043311327
+trapc 3 3
+end
+end
 matconst 9 0
 if eq pass 0
 emit 2432697322
-if or eq c 233 eq c 238
+if ge c 233
 note ADD x11,SP,#0x20,LSL12: argv pointers above the 131072-byte argv strings.
 emit 2436924395
 else
@@ -6534,7 +6571,8 @@ e3 3942645760 31 12 5
 trapc 8 3
 note A program path and both rename paths must be nonempty; every environment record is nonempty.
 note (Nested conditions keep om4 within its 16 live registers. hpack's c is one of 124, 125, 141, 142,
-note 198, 233 and 238, so "124 or at least 198" is execprog, execpure, execenv and execkeep.)
+note 198, 233, 238 and 240, so "124 or at least 198" is execprog, execpure, execenv, execkeep and execx,
+note and "at least 233" is the 131072-byte two-packet words execenv, execkeep and execx.)
 if eq pass 0
 if or eq c 124 ge c 198
 emit 4043309375
@@ -6602,15 +6640,62 @@ hsys 436
 emit 4043309087
 patch19 notfirst get oc 0
 else
+if eq c 240
+note execx 240 keeps the descriptors listed in K (x17 base, x3 count k <= 64): x12 = lo, from 3; each
+note round x13 = the least K byte >= lo (256 if none; LDRB w10,[x17,x9] for x9 < k), then
+note close_range(lo, x13-1, UNSHARE) unless x13 == lo, and lo = x13+1; when none is left,
+note close_range(lo, ~0U, UNSHARE). Bytes below 3 never match (lo >= 3), so fds 0..2 are untouched. A
+note failed middle call's B.NE lands on the B.NE at done below, as execkeep's first call does. An empty
+note K is exactly execenv's single close_range(3, ~0U). Branch sites live in errs (execpure's only).
+matconst 12 3
+put errs 0 get oc 0
+matconst 13 256
+matconst 9 0
+put errs 1 get oc 0
+e3 3942645760 31 9 3
+put errs 2 mbranch 2
+e3 945842176 10 17 9
+mimmed 2432696320 9 9 1
+e3 3942645760 31 10 12
+patch19 mbranch 3 get errs 1
+e3 3942645760 31 10 13
+patch19 mbranch 2 get errs 1
+e3 2852126720 13 31 10
+back get errs 1
+patch19 get errs 2 get oc 0
+mimmed 4043309056 31 13 256
+put errs 3 mbranch 0
+e3 3942645760 31 13 12
+put errs 4 mbranch 0
+e3 2852126720 0 31 12
+mimmed 3506438144 1 13 1
+matconst 2 2
+hsys 436
+emit 4043309087
+put errs 5 mbranch 1
+patch19 get errs 4 get oc 0
+mimmed 2432696320 12 13 1
+back get errs 0
+patch19 get errs 3 get oc 0
+e3 2852126720 0 31 12
+matconst 1 4294967295
+matconst 2 2
+hsys 436
+emit 4043309087
+else
 matconst 0 3
 matconst 1 4294967295
 matconst 2 2
 hsys 436
 emit 4043309087
 end
+end
 note outer and done are dead after the packet scan; they are reused for the two branch sites here.
 done = get oc 0
 emit 1409286145
+if eq c 240
+patch19 get errs 5 done
+end
 if eq c 198
 note execpure strict stdio profile: Linux UAPI layouts in 640 private guest stack bytes, never an
 note exposed native pointer. sock_filter is u16 code,u8 jt,u8 jf,u32 k; sock_fprog has its length at
@@ -6792,10 +6877,15 @@ spadd 640
 patch26 outer get oc 0
 else
 emit 2432697312
-if or eq c 233 eq c 238
+if ge c 233
 note ADD x1,SP,#0x20,LSL12; ADD x2,SP,#0x44,LSL12: argv and the private environment pointer list.
 emit 2436924385
 emit 2436961250
+if eq c 240
+note execx: x1 = &argv pointer 1 (ADD x1,x1,#8): argv[0] is the second record; x0 = SP is the
+note string of pointer 0, the path.
+mimmed 2432696320 1 1 8
+end
 else
 emit 2436892641
 note MOV x2,x11: envp is the argv list's NULL terminator, an empty environment.
@@ -7079,6 +7169,38 @@ emit 2432697314
 hsys 88
 spadd 32
 spadd 4096
+hreturn dst x
+end
+
+note sigmask how A off n (keyword 241): Linux rt_sigprocmask(how, &A[off], NULL, 8), ARM64 135; how is int
+note (0 BLOCK, 1 UNBLOCK, 2 SETMASK; others reach the kernel, -22). sigfd A off n (keyword 242): Linux
+note signalfd4(-1, &A[off], 8, SFD_NONBLOCK|SFD_CLOEXEC = 526336), ARM64 74; the result is the new
+note descriptor, read with read (128-byte signalfd_siginfo, ssi_signo the first 4 bytes LE; -11 when
+note nothing is pending). For both, A is a byte slice (readonly view or text allowed) checked like every
+note host slice (trap 3), then n must be 8, the kernel sigset size (CMP x2,#8; B.NE trap 3); the set is
+note the 8 bytes at A[off] little-endian, bit s-1 for signal s. The result is 0/fd or minus errno.
+fn hsig c ulong dst ulong x ulong to void
+if eq c 241
+harg x 2 8
+end
+e = harray x 0
+save
+loadarg 2 1 get fr add x 22
+mimmed 4043309056 31 2 8
+trapc 1 3
+basearg 1 e
+loadarg 16 1 get fr add x 21
+e3 2332033024 1 1 16
+if eq c 241
+hload x 2 0
+matconst 2 0
+matconst 3 8
+hsys 135
+else
+matconst 0 18446744073709551615
+matconst 3 526336
+hsys 74
+end
 hreturn dst x
 end
 
@@ -8056,9 +8178,9 @@ if or eq c 197 eq c 234
 hscalar c dst x
 ret
 end
-note execpure 198 and execenv 233 are dispatched here, before the ge c 173 mapped-memory range below
-note would claim them.
-if or or eq c 198 eq c 233 eq c 238
+note execpure 198, execenv 233, execkeep 238 and execx 240 are dispatched here, before the ge c 173
+note mapped-memory range below would claim them.
+if or or or eq c 198 eq c 233 eq c 238 eq c 240
 hpack c dst x
 ret
 end
@@ -8076,6 +8198,10 @@ ret
 end
 if eq c 239
 hutimens dst x
+ret
+end
+if or eq c 241 eq c 242
+hsig c dst x
 ret
 end
 if eq c 221
@@ -8746,8 +8872,8 @@ if eq c 224
 hostval c dst
 ret
 end
-note Host words 228..239 (236 is not a keyword here).
-if and and ge c 228 le c 239 ne c 236
+note Host words 228..242 (236 is not a keyword here).
+if and and ge c 228 le c 242 ne c 236
 hostval c dst
 ret
 end
@@ -15757,6 +15883,31 @@ end
 xhcall 280
 xhdone dst x 4128
 end
+note sigmask (241) on x86-64: rt_sigprocmask 14, RDI how, RSI &A[off], RDX NULL, R10 8. sigfd (242):
+note signalfd4 289, RDI -1, RSI &A[off], RDX 8, R10 SFD_NONBLOCK|SFD_CLOEXEC 526336. n must be 8
+note (CMP RDX,8; JNE trap 3) after the slice check, as on AArch64.
+fn xhsig c ulong dst ulong x ulong to void
+if eq c 241
+harg x 2 8
+end
+e = harray x 0
+xhbegin
+xhs 2 get fr add x 22
+xhcmp 2 8
+xtrap 1 3
+xhb 6 e get fr add x 21
+if eq c 241
+xha x 2 7
+ximm 2 0
+ximm 10 8
+xhcall 14
+else
+ximm 7 18446744073709551615
+ximm 10 526336
+xhcall 289
+end
+xhdone dst x 0
+end
 
 fn xhsock c ulong dst ulong x ulong to void
 ok = new ulong 6 0
@@ -15853,13 +16004,14 @@ xhdone dst x 80
 end
 note execenv 233 on x86-64: as on AArch64, a second pass decodes the environment packet (every record
 note nonempty); both checks precede close_range. execenv packets are 131072 bytes and 1024 records at
-note most: argv pointers RSP+0x20000, env strings RSP+0x24000, env pointers RSP+0x44000.
+note most: argv pointers RSP+0x20000, env strings RSP+0x24000, env pointers RSP+0x44000. execkeep 238
+note and execx 240 share that layout ("at least 233"); execx's argv starts at pointer 1 (RSP+0x20008).
 fn xhpack c ulong dst ulong x ulong to void
 e = harray x 0
 if eq c 125
 harg x 2 8
 end
-if or eq c 233 eq c 238
+if ge c 233
 put fr add x 23 e
 put fr add x 24 get fr add x 21
 put fr add x 25 get fr add x 22
@@ -15874,6 +16026,17 @@ e = get fr add x 23
 if eq c 238
 harg x 2 8
 end
+if eq c 240
+note execx: the keep list K is the third slice; its frame slots move to x+29..x+31 and A's return.
+e = harray x 0
+put fr add x 29 e
+put fr add x 30 get fr add x 21
+put fr add x 31 get fr add x 22
+put fr add x 20 get fr add x 23
+put fr add x 21 get fr add x 24
+put fr add x 22 get fr add x 25
+e = get fr add x 23
+end
 end
 xhbegin
 if eq c 238
@@ -15882,11 +16045,17 @@ xha x 2 6
 xb 131 254 3
 xtrap 11 3
 end
+if eq c 240
+note execx: k above 64 traps 3 (CMP RDX,64; JA) before any descriptor closes.
+xhs 2 get fr add x 31
+xhcmp 2 64
+xtrap 8 3
+end
 note stack is 8192 bytes for one packet pass; execenv and execkeep make two passes over 0x48000 bytes
 note (the pass bound is 1 + (stack >> 18)). Byte and record limits and the argv pointer offset are
 note inline constants (131072/1024/0x20000 for execenv and execkeep, else 4096/64/4096), not names.
 stack = ulong 8192
-if or eq c 233 eq c 238
+if ge c 233
 stack = ulong 294912
 end
 pass = ulong 0
@@ -15923,6 +16092,11 @@ xtrap 8 3
 if or or eq c 125 eq c 141 eq c 142
 xhcmp 8 2
 xtrap 1 3
+end
+if and eq c 240 eq pass 0
+note execx: the argv packet holds the path and at least argv[0] (CMP R8,2; JB trap 3).
+xhcmp 8 2
+xtrap 3 3
 end
 if eq pass 0
 xsp 1 stack
@@ -16011,21 +16185,79 @@ xhcall 436
 xrr 133 0 0
 xpatch notfirst get oc 0
 else
+if eq c 240
+note execx keeps the descriptors listed in K, as on AArch64: R13 = K base + off (from the RBX slot
+note snapshot), R8 = lo from 3; each round R10 = the least K byte >= lo (256 if none; MOVZX EAX over
+note R9 = i < k, RCX = k reread each round since SYSCALL clobbers it), then close_range(lo, R10-1,
+note UNSHARE) unless R10 == lo, and lo = R10+1; when none is left, close_range(lo, ~0U, UNSHARE). A
+note failed middle call's JNE lands on the final TEST RAX,RAX, which reaches the JNE at p below.
+xhb 13 get fr add x 29 get fr add x 30
+ximm 8 3
+outer = get oc 0
+ximm 10 256
+ximm 9 0
+xhs 1 get fr add x 31
+inner = get oc 0
+xrr 57 9 1
+done = xbranch 2
+xrr 137 0 13
+xrr 1 0 9
+xhraw 0 0 0 1
+xhadd 9 1
+xrr 57 0 8
+p = xbranch 3
+xpatch p inner
+xrr 57 0 10
+p = xbranch 2
+xpatch p inner
+xrr 137 10 0
+p = xbranch 14
+xpatch p inner
+xpatch done get oc 0
+xhcmp 10 256
+endstr = xbranch 0
+xrr 57 10 8
+notfirst = xbranch 0
+xrr 137 7 8
+xrr 137 6 10
+xhsub 6 1
+ximm 2 2
+xhcall 436
+xrr 133 0 0
+last = xbranch 1
+xpatch notfirst get oc 0
+xrr 137 8 10
+xhadd 8 1
+p = xbranch 14
+xpatch p outer
+xpatch endstr get oc 0
+xrr 137 7 8
+ximm 6 4294967295
+ximm 2 2
+xhcall 436
+xpatch last get oc 0
+xrr 133 0 0
+else
 ximm 7 3
 ximm 6 4294967295
 ximm 2 2
 xhcall 436
 xrr 133 0 0
 end
+end
 p = xbranch 1
 if gt stack 8192
 xmem 139 7 4 131072
+if eq c 240
+xmem 141 6 4 131080
+else
 xmem 141 6 4 131072
+end
 else
 xmem 139 7 4 4096
 xmem 141 6 4 4096
 end
-if or eq c 233 eq c 238
+if ge c 233
 xmem 141 2 4 278528
 else
 xrr 137 2 13
@@ -16607,6 +16839,10 @@ if eq c 239
 xhutimens dst x
 ret
 end
+if or eq c 241 eq c 242
+xhsig c dst x
+ret
+end
 if or eq c 220 eq c 222
 xhsock c dst x
 ret
@@ -16685,7 +16921,7 @@ if or or or eq c 121 eq c 122 eq c 136 eq c 137
 xhargs c dst x
 ret
 end
-if or or or or eq c 124 eq c 125 eq c 141 eq c 142 or eq c 233 eq c 238
+if or or or or eq c 124 eq c 125 eq c 141 eq c 142 or or eq c 233 eq c 238 eq c 240
 xhpack c dst x
 ret
 end
