@@ -1631,12 +1631,12 @@ bwrap shares the host's process namespace, so the NODE process count sees every 
 `live-cpu.om` is the core-contamination sampler that goes with these runs. Every 10 s it reads `/proc/*/task/*/stat` (read-only) until the file STOP exists. It prints one line per sample: `CPU <realns> cwo <c> run89 <r> own <o> foreign <f>`, followed by ` pid/tid:comm` for each foreign thread.
 
 - `run89` counts threads in state R whose last processor (stat field 39) is 8 or 9.
-- `own` counts those whose program is under `/tmp/wtlive/build/node/` or is the pinned ollm.
+- `own` counts those whose program is under OWNDIR (a directory prefix ending in `/`; the 2026-11-07 runs used `/tmp/wtlive/build/node/`) or is exactly OLLM, the pinned ollm. Both are arguments, so no machine path is compiled in; the 2026-11-07 binary `5b638039…` had both compiled in and took two arguments.
 - `cwo` counts the `CWO ` lines in WATCH, which marks the objective boundaries.
 
 ```sh
 { printf 'om2\n'; cat seed/node/live-cpu.om; } | seed/out/omc > build/lt399/live-cpu
-taskset -c 0 nice -n 19 build/lt399/live-cpu PART/end.txt PART/run/<scenario>/run.out > PART/cpu.log
+taskset -c 0 nice -n 19 build/lt399/live-cpu PART/end.txt PART/run/<scenario>/run.out OWNDIR OLLM > PART/cpu.log
 ```
 
 #### Results, 2026-11-07 (EXERCISED; not QUALIFIED)
