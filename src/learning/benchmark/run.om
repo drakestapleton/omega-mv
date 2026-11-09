@@ -3,12 +3,16 @@ note Each launch: fresh child, empty stdin, stdout pipe, execpure strict profile
 note The supervisor here adds the wall deadline and the 256-byte output cap execpure leaves to it.
 note RObs: 0 status (lobserve 0 completed,4 timeout,5 resource,6 operational), 1 exit code,
 note 2 bytes captured, 3 elapsed ns. Identity measurement and compilation are not done here.
+note Launch failure inside the child (dup or execpure refused, e.g. not an executable) writes
+note a fresh 16-byte random nonce to the stdout pipe and exits 122. Only this launch's
+note supervisor knows the nonce, so a candidate cannot forge status 6.
 global RPkt uchar 4096
 global RSt uchar 128
 global RFd uchar 16
 global RWs uchar 4
 global RBuf uchar 257
 global RObs ulong 4
+global RNon uchar 16
 
 fn rfd at ulong to int
 x = ulong 0
@@ -41,16 +45,31 @@ put RObs 2 0
 ret status
 end
 
-note Child side: never returns. Exit 120..123 only when setup fails before execpure.
+note Child side: never returns.
 fn rchild inrd int outwr int n ulong to void
 if ne dupfd inrd 0 0 0
-exit 120
+w = write outwr RNon 0 16
+exit 122
 end
 if ne dupfd outwr 1 0 1
-exit 121
+w = write outwr RNon 0 16
+exit 122
 end
 r = execpure RPkt 0 add 4 n
+w = write 1 RNon 0 16
 exit 122
+end
+
+fn rlfail to bool
+if or ne get RObs 1 122 ne get RObs 2 16
+ret false
+end
+for i ulong 16
+if ne get RBuf i get RNon i
+ret false
+end
+end
+ret true
 end
 
 note RV: 0 pid, 1 stdout read end, 2 start ns, 3 bytes captured, 4 eof, 5 reaped.
@@ -60,10 +79,12 @@ fn rused to ulong
 ret sub ulong monons get RV 2
 end
 
-note Kill, reap and close; record elapsed and the given status.
+note Kill (only while unreaped), reap and close; record elapsed and the given status.
 fn rstop status ulong to ulong
+if eq get RV 5 0
 r = killpid int get RV 0 9
 r = waitpid int get RV 0 RWs 0 4 0
+end
 r = fclose int get RV 1
 put RObs 3 rused
 ret rfail status
@@ -76,6 +97,9 @@ if eq n 0
 ret 6
 end
 if lt stat RPkt 4 n RSt 0 len RSt 0
+ret 6
+end
+if ne random RNon 0 16 0 16
 ret 6
 end
 if ne pipefds RFd 0 8 0 0
@@ -131,7 +155,8 @@ end
 ret 255
 end
 
-note Exit status after reaping: a signal is resource (5), else completed with its code.
+note Exit status after reaping: a signal is resource (5); the launch nonce is operational (6);
+note else completed with its exit code.
 fn rdone to ulong
 r = fclose int get RV 1
 put RObs 3 rused
@@ -144,6 +169,12 @@ ret 5
 end
 put RObs 0 0
 put RObs 1 ulong get RWs 1
+if rlfail
+t = get RObs 3
+s = rfail 6
+put RObs 3 t
+ret 6
+end
 ret 0
 end
 

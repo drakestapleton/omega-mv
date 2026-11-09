@@ -138,35 +138,54 @@ Added at L775 run 298 (2026-11-09) on omega-mv main `1e3ecbba`. Compose
 `core.om`, `run.om`, then the caller. `rlaunch idx limit` runs argv[idx] as a
 fresh child: empty stdin pipe, stdout pipe, then `execpure` (the strict profile
 in `docs/one_layer/OMEGESE.md`: Landlock, seccomp read/write/exit only,
-`prlimit` ceilings, empty environment). There is no `execprog` fallback. The
-supervisor adds what `execpure` leaves to it: a wall deadline in nanoseconds and
-a 256-byte output cap. `RObs` returns the `lobserve` status (0 completed,
-4 timeout, 5 resource, 6 operational), exit code, captured bytes and elapsed
-nanoseconds; `rkeep 0|1` copies the bytes into `LWant`/`LGot`.
+`prlimit` ceilings including a 1 s soft CPU limit, empty environment). There is
+no `execprog` fallback. The supervisor adds what `execpure` leaves to it: a wall
+deadline in nanoseconds and a 256-byte output cap. `RObs` returns the `lobserve`
+status (0 completed, 4 timeout, 5 resource, 6 operational), exit code, captured
+bytes and elapsed nanoseconds; `rkeep 0|1` copies the bytes into `LWant`/`LGot`.
 
 | Condition | Status |
 |---|---|
 | Deadline passed | child killed (signal 9), reaped, 4 |
 | More than 256 stdout bytes | child killed, reaped, 5 |
 | Child ended by a signal (CPU limit, seccomp kill) | 5 |
-| Missing argument, absent path, pipe or fork failure | 6, nothing launched |
+| Missing argument, absent path, nonce, pipe or fork failure | 6, nothing launched |
+| Launch refused in the child (not executable, directory, profile refused) | 6 |
 | Normal exit | 0, with its exit code; `lobserve` judges code and bytes |
+
+A launch refused inside the child cannot be told apart by exit code from a
+candidate that exits with the same code. Before each fork the supervisor draws
+16 random bytes; the child writes them to the stdout pipe and exits 122 when
+`dupfd` or `execpure` fails. Exit 122 with exactly those 16 bytes is status 6.
+The candidate image never sees the nonce, so it cannot forge an operational
+result. Kill and reap happen only while the child is unreaped, so a reused pid
+is never signalled.
+
+Under the strict profile a candidate cannot sleep or block (seccomp allows no
+sleep; stdin is at end of file), so it can outlive the deadline only by using
+CPU. The profile's CPU limit ends such a child near 1 s even without the kill;
+`run-test` therefore requires a timeout to be charged more than the deadline
+and less than 0.9 s.
 
 `tests/learning/benchmark/run-test.om` runs real children: the L776 oracle
 (expected bytes), the observable (0), the saturating mutant (7), an empty
 writer (9), a 10^12-step loop (4 at 500 ms), the division trap (8), a
-4096-byte writer (5), an absent path (6) and a fork attempt (9: the strict
-profile refuses `fork`). It then charges all eight attempts with their measured
-judge time and the 128 MiB address-space ceiling as peak bytes (energy
-unknown): pass@1 is 1 of 8, and a run with one task never attempted cannot
-finish (30). Five compiled mutants of `run.om` (deadline ignored, timeout
-reported complete, cap removed, absent path launched, `execprog` instead of
-`execpure`) each fail the check of the case they falsify. The process words
-need the main seed compiler; the older `191b776e` pin refuses them (error 3).
-Evidence: `evidence/LEARNING-652/benchmark/L775-run298/`.
+4096-byte writer (5), an absent path (6), a fork attempt (9: the strict profile
+refuses `fork`), exactly 256 bytes (7: allowed, wrong length), the oracle bytes
+in two writes about 3 ms apart (0), a stdin reader run with a non-empty
+supervisor stdin (9), a non-executable file and a directory (6). The same spin
+with a 3 s deadline dies by SIGXCPU (signal 24, status 5). It then charges the
+thirteen attempts with their measured judge time and the 128 MiB
+address-space ceiling as peak bytes: that peak is the declared bound, not a
+measurement, and energy is unknown. pass@1 is 2 of 13, and a run with one task
+never attempted cannot finish (30). Twelve compiled one-line mutants of
+`run.om` each fail the check of the case they falsify; a thirteenth (absent
+path launched) is equivalent, because the nonce still reports 6. The process
+words need the main seed compiler; the older `191b776e` pin refuses them
+(error 3). Evidence: `evidence/LEARNING-652/benchmark/L775-run298/`.
 
 Not covered: compiling candidates, measuring compiler/executable identities
-(`LPin` is still caller-supplied), the signal branch with a real signal, peak
+(`LPin` is still caller-supplied), a seccomp-kill signal (SIGSYS) fixture, peak
 memory and energy measurement, and protected-split custody.
 
 ## Qualification and limits
