@@ -326,6 +326,7 @@ Not covered, or covered only partly:
 | `sh om/tls/build.sh OMC om/tls/test/tls/timing.om build/tls/timing` then `nice -n 19 taskset -c CPU build/tls/timing WHAT N` | dudect samples (`CLASS NANOSECONDS` lines), statistics outside; see `THREAT_MODEL.md` |
 | `sh om/tls/build.sh OMC om/tls/test/bench/bench.om build/tls/bench` then `build/tls/bench h\|g\|b\|d PORT N PATH STOREFILE` (HTTPS benchmark client against a local server for TLS name `bench.test`; modes in the file header) | one `S NANOSECONDS BYTES` line per sample. Compiles at omc `be8c5130` (2026-10-31; no arguments prints usage, exit 2). HISTORICAL, MEASURED 2026-10-26 on cpu 16 (X925) on a loaded host, not rerun: get1k median 42.2 ms without `TCP_NODELAY` and 3.53 ms with it (TlsProof frozen protocol, `~/handoffs/TlsProof/bench/RESULTS.md`) |
 | `sh om/tls/test/acvp/run.sh OMC` (NIST ACVP-Server sample vectors, pinned `975de31e`; not a CAVP certificate) | `ACVP PASS algos=21 tests=7623 not_applicable=7299 not_run=NONE` (observed 2026-10-31 on the train r6 tree, omc `be8c5130`, with `mlkem.om`, `sha3.om` and `test/drbg` in this tree; 20 of 20 vector-set negative controls FAIL as required, plus the tls.om native key-schedule subset `PASS tests=25`). Before ML-KEM and the DRBG suite reached main: `ACVP PARTIAL algos=18 tests=7543 not_applicable=7139 not_run=ML-KEM,hmacDRBG` (exit 3, omc `62775d2a`) |
+| `sh om/tls/test/qemu/run.sh OMC KERNEL` (`ACCEL=tcg` default, or `kvm`; KERNEL = the host's arm64 Ubuntu image, modules under `/lib/modules/KV`) | `TLS-QEMU PASS rows=8/8 accel=tcg kernel=7.0.0-1019-nvidia client=f7c4d4adf77be3bb` and the same with `accel=kvm` (observed 2026-11-09 on omega-mv `1e3ecbba`, omc `seed/out/omc` `6d1b1cf5`, QEMU 8.2.2, OpenSSL 3.0.13; ledger L233) |
 
 How the suites are built:
 
@@ -351,6 +352,18 @@ How the suites are built:
     raw.githubusercontent.com (RSA, rsa_pss_rsae) and mail.gandi.net on 465 and on 587 with
     STARTTLS. Parity means the fetched bytes are compared with Python `ssl` for read-only GETs
     (bodies up to 680548 bytes) and for an EHLO/QUIT dialogue.
+  - `test/qemu/run.sh` (ledger L233) runs `client.om` inside a QEMU `virt` aarch64 guest (the host's
+    Ubuntu kernel, a busybox initramfs, virtio-net with QEMU user networking, the clock from the
+    guest's PL031 RTC) against `openssl s_server` on host 127.0.0.1, which the guest reaches only
+    through QEMU at 10.0.2.2. Accepted rows need the server's own `-www` page to report
+    `New, TLSv1.3, Cipher is ...` and the shared group: the RFC 8446 section 9.1 set
+    (secp256r1, TLS_AES_128_GCM_SHA256, ecdsa_secp256r1_sha256, approved-only mode), X25519 with
+    ChaCha20-Poly1305, an RSA leaf (rsa_pss_rsae) and a real HelloRetryRequest (two ClientHellos
+    in the server's `-msg` log). Refusal rows: wrong name, unknown issuer, a TLS 1.2-only server.
+    A key-schedule mutant (`c hs traffie`) must draw the server's bad_record_mac alert (20). The
+    guest prints the sha256 of each binary it runs and the judge requires the host build's. Two
+    harness controls were run once by hand (2026-11-09): the real client in the mutant row fails
+    that row (`got rc=0`), and `-netdev user,restrict=on` fails every row with exit 3.
 
 The interop refusal table (`build/tls/tls/interop-table.txt`):
 
