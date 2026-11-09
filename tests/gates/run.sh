@@ -122,21 +122,8 @@ speed() {
 }
 
 case "$step" in
-  crumb-verify)
-    # Hosted crumb.yml builds the crumb tool from the aien-architecture commit in crumb.lock.
-    # Same here, from the sibling checkout ../aien-architecture into a temp dir outside the
-    # tree, so a newer crumb on PATH can never change the verdict.
-    if [ ! -d ../aien-architecture ]; then
-      echo "run.sh: ../aien-architecture is missing; the hosted job checks out aien-dev/aien-architecture at crumb.lock" >&2
-      exit 3
-    fi
-    tool="$(mktemp -d /tmp/omega-crumb-tool.XXXXXX)"
-    trap 'rm -rf "$tool" "$STEP_MARK"' EXIT
-    git -C ../aien-architecture archive "$(lock crumb.lock)" tools/crumb | tar -x -C "$tool"
-    make -s -C "$tool/tools/crumb" crumb
-    obs crumb_tool_commit "\"$(lock crumb.lock)\""
-    "$tool/tools/crumb/crumb" verify .
-    ;;
+  # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07): Crumbs are off the active
+  # workflow, so no gate checks crumb freshness. The .crumb files and crumb.lock stay as history.
   # pr-smoke.yml
   base)
     physics_pin; set -o pipefail

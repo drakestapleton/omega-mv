@@ -1045,9 +1045,10 @@ describes the format and the CLI.
 ## Candidate scalar `fma` and exact literals
 
 `fma a b c` (keyword 227) is explicit AArch64 scalar FMADD for three equal f32/f64 types.
-It rounds once, unlike separate `mul` and `add`. x86linux/x86efi refuse it with error 9
-rather than silently substituting non-fused arithmetic. See OMEGESE section 9.9 for NaNs,
-signed zero, literal rounding and refusal rules.
+It rounds once, unlike separate `mul` and `add`. x86linux/x86efi refuse a well-typed `fma`
+with error 9 rather than silently substituting non-fused arithmetic; operand errors 7 and 11
+come first, as on AArch64. See OMEGESE section 9.9 for NaNs, signed zero, literal rounding
+and refusal rules.
 
 The exact-limb decimal converter and 512-literal fixture are reused from the core of draft
 #1027 (`681d6f487ac3c237e0b8d73c287e0a8f232b1434`, fixing #1024 and #1026), applied to
