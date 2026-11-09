@@ -142,7 +142,8 @@ CONDUCTOR_FAILURES = {
     "seed/qualification/om2/baseline/transform.cases": "",
     # Headers fix ctl PASS / kill FAIL in advance (s5: "ctl-* PASS, m-* FAIL";
     # bnd: "pass=2 fail=8"; hex: "pass=3 fail=5"); seed/host/check.sh runs each.
-    "seed/omc/om2/s5/s5-mutants.cases": "m-msr m-stp m-live m-tst m-zpool m-zvec m-movz16 m-twinall m-twinnone",
+    "seed/omc/om2/s5/s5-mutants.cases": "m-msr m-stp m-live m-tst m-zpool m-zvec m-movz16 m-twinall m-twinnone "
+        "m-x86stp m-x86floor m-x86gpr m-x86xmm",
     "seed/omc/om2/bnd/mutants.cases":
         "bnd-extra-om1-left-typed bnd-extra-om2-left-typed bnd-extra-om1-left-assign bnd-extra-om2-left-assign "
         "bnd-missing-om1-short-next bnd-missing-om2-short-next bnd-missing-om1-short-bare bnd-missing-om2-short-bare",
