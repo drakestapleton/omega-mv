@@ -20,6 +20,10 @@ pool lock `pool-8-9`. Nothing in this directory replaces an earlier receipt.
 - `tests/gates/run.sh native` now also exercises this module; `native/` was already an input of
   `tests/gates/omega-native.gate`, so changes here previously mapped to a gate that did not test them.
   Each retrieval failure prints a `run.sh: retrieval FAIL:` line naming the failed check.
+- Rebased onto Radicle main `1b128ae2d496981a0ac277363a43b88cff70b579` after the review: the
+  239 intervening main commits change nothing under `native/`, `tests/gates/` or `seed/out/omc`
+  (`git range-diff`: both commits identical). The native gate on the rebased tree: exit 0, same
+  `RETRIEVAL PASS` line (`gate-native-rebased.out`).
 
 ## Results
 
