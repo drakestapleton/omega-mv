@@ -561,3 +561,23 @@ is not exhaustive instruction-template proof. The oracle includes an invalid
 opcode control and a valid-but-wrong-immediate control; they must be rejected,
 not merely disassembled. Both controls were exercised and caught. The complete
 differential verdict was FAIL, not a qualification claim.
+
+### `scrub` on x86linux and the S1-S4 authorities (L801, 2026-11)
+
+`scrub n` now lowers under `target x86linux` (OMEGESE 9.13.1 gives the x86
+words). `dit` stays AArch64 only: x86 has no user-mode data-independent-timing
+control (Intel DOITM is a ring-0 MSR bit), so `dit` remains error 25 on both x86
+targets and its six FR-9 rows stay MISSING_IMPLEMENTATION by specification.
+x86efi still refuses `scrub` with error 25. On the default target all 1631
+tracked `.om` files compile to the same bytes, stderr and exit with the old and
+the new omc. Under QEMU 10.0.14 every runnable `scrub-*.om` fixture exits the
+same on x86 as on AArch64 (mem 0, ctl 10, live 0, odd 103, big 103, floor 106,
+flive 0, emit 0, femit 0); with the zeroing stores mutated away, `scrub-mem`
+exits 10 on x86, and with the floor check mutated away, `scrub-floor` crashes
+(139) instead of trap 6.
+
+`HISTORICAL_COMPILERS` replays the S1-S4 manifests with the compiler source of
+stage revisions `a5927895`, `7fb62f3a`, `ad220c05` and `f6a6492f`. A Radicle
+clone of main did not contain them, so each replay failed as "historical
+compiler source identity mismatch". An `ours` merge of `f6a6492f` (tree
+unchanged) makes all four reachable from main.
