@@ -113,6 +113,59 @@ pub-outside-store.om proves a secret store at byte40 does not poison public [32,
 pub-secret-zero/one concatenate with the same function and execute exits0/1, showing different paths.
 Dynamic traces and the OM-2 SHA artifact remain NOT_RUN here.
 
+E14 precision rules (L1039, opt-in argument e14; without e14 every statement above holds unchanged)
+  build/om2-qual/leakscan [xN | pub:SLOT:OFF:LEN ...] e14 < ARTIFACT     (e14 in any argument position)
+E13 revokes a declaration on any poisoning store in the whole artifact. With e14 the walk is the same, but
+a poisoning store is excused when exactly one of three rules proves it cannot touch the declaration. Each
+excused store is printed as PUBLIC-EXCUSED @N RULE and counted on the line
+  E14 excused unreached=A stack=B bounded=C
+A store that no rule excuses revokes exactly as in E13 (PUBLIC-MEM-REVOKED). Output without e14 has neither
+line. The three rules (every other store, and every UNKNOWN or UNHANDLED reached word, still revokes):
+ 1 unreached-from-entry. The word has no state: no execution of THIS entry reaches it (it belongs to another
+   export or to dead code). Sound only together with the all-exports obligation, printed as PUBLIC-OBLIGATION
+   whenever A > 0: the declaration is true at the entry of every call, by induction over call sequences, only
+   if every export that can write the declared range is scanned with the same declaration and none reports
+   PUBLIC-MEM-REVOKED. One run scans one entry. sha-exports.sh runs every export of the SHA artifact and
+   prints MET or NOT_MET. The pair e14-unreached.om / e14-other-export.om is one set of functions with the
+   entry swapped: the store is excused from f and revokes from g. An export that takes no pointer to the
+   declared object (SHA hash) is outside the obligation: it can reach that object only through a pointer the
+   caller aliases to it, the same caller assertion as pub itself.
+ 2 stack-below-entry-sp. R is the SP at entry of the scanned export. Token 8 is an UPPER bound u on an address
+   relative to R (address <= R+u): the SP starts at u=0, SUB/ADD SP move it, ADD Xd,SP,#imm and sums with
+   constants or value ranges propagate it through registers, spill slots, call arguments and returns, and
+   joins keep the larger bound (at most 250 widenings, then unknown). A store is excused when
+   u + displacement + index high + size <= 0, so its last byte is below R. This is the same separation the
+   existing SP+immediate spill exemption uses (memory below the entry SP is not caller memory: a live caller
+   object there would be overwritten by signal frames and by the callee's own frames), applied to pointers
+   computed from SP. It is NOT the A1 array-bounds invariant: no array length
+   is assumed for a pointer passed between functions or for a layout field. A callee that writes beyond the
+   array the caller passed reaches R or higher and revokes (e14-stack-over.S: one byte past, SP+16 = R).
+ 3 bounded-offset. The address is an exact entry-slot token plus displacement plus an index register whose
+   value range lo..hi is known (token 9, 24-bit bounds). Ranges come from constants, known-zero masks (AND
+   with a mask), sums of ranges and constants, and a dominating check: CMP Xn,#imm or CMP Xn,Xm (64 bit)
+   followed by B.CS/B.CC/B.HI/B.LS narrows Xn on each edge (the usual put/get bounds check, B.CS to the trap
+   stub). The flag source is dropped when the flags or Xn (or Xm) are written before the branch, at BL,
+   and unless both paths agree at a join. The store is excused for a declaration when its highest start
+   offset + size <= the declaration's offset, or its lowest start offset >= the declaration's end, in the
+   same entry slot. An unknown or overlapping range, a pre/post-index store, or another slot revokes.
+Not added: any disjointness between different entry slots. The 32 digest bytes that final stores through
+its `out` pointer still revoke pub:0:32:8 (PROPOSAL-E14-final-out.txt names the trust change that would be
+needed). e14 also stops treating ADD Xd,SP,Xm,ext as a constant (Rn 31 is SP there, in both modes).
+E14 fixtures (leak/fixtures, expected reports in leak/expected, gate rows in leak.cases and candidate.cases):
+e14-stack.om stack positive; e14-stack-edge.S last byte of a 16-byte array (SP+15) positive; e14-stack-over.S
+SP+16 negative; e14-bounded.om c[40+(i&63)] positive; e14-bounded-low.om c[i&127] negative; e14-refine.om
+dominating check then c[40+i] positive; e14-refine-edge.om check i<32 then c[i] positive at the edge;
+e14-refine-low.om c[33+i] negative; e14-unreached.om / e14-other-export.om; e14-flag-ok.S positive and
+e14-stale-reg.S / e14-stale-flags.S negatives; pub-secret.bin and pub-unknown.bin rescanned with e14 still
+revoke. The .S fixtures are hand-assembled with GNU as 2.42 (aarch64-linux-gnu-as, objcopy -O binary -j
+.text; oracle only; not part of the delivered closure) because omc type-checks array sizes across calls and
+cannot express a callee that outruns the caller's array. E14 expected reports were produced by this scanner
+and then checked against objdump 2.42 offsets (oracle/leak/xcheck.py AGREE for every one) and against the
+premises written in each fixture's header; they are not hand-derived from construction like the E13 set.
+Mutants (leak/mutants, exact once, killed by the named fixture): e14nostack/e14edge (stack bound removed or
+off by one byte) by e14-stack-over, e14noreach by e14-other-export, e14nolow by e14-bounded-low, e14off1 by
+e14-refine-edge, e14norefine by e14-refine, e14noclearreg/e14noclearflags by e14-stale-reg/-flags.
+
 Cases/evidence (all paths relative to seed/qualification/om2)
 leak/leak.cases runs now under 734f0a39; leak/candidate.cases runs common cases under a candidate and
 compiles s1-rot.om. Binary input identities are in leak.cases; expected reports are hand-derived from
@@ -132,3 +185,12 @@ norevoke/pub-secret: exit0 false PASS when the E13 store scan is omitted; must d
 Native-reachability controls pin the earlier false-PASS defect. Candidate compiler leak mutants
 must produce a new MANUAL branch, data-index, UNKNOWN or UNHANDLED item; they are never accepted
 as PASS. Removing unroll is not a leak mutant (constant-bound loop branches remain public).
+
+E14 evidence (leak/evidence-e14, 2026-11-09, omc seed/out/omc 6d1b1cf5): identity.txt (scanner and artifact
+hashes), gate-*-baseline-main.log (this directory's cases at main before the change), gate-*-patched.log (after),
+default-mode-compare.txt (old and new scanner byte-identical on every fixture, the SHA exports and the SHA
+artifact under no argument, pub:0:32:8, x0 and pub:1:0:16 x2), sha-exports/ (four export reports, objdump
+cross-checks, summary.txt with the all-exports obligation). Pre-existing at main, unchanged by E14: row
+s1-rot-refused FAILS (omc 6d1b1cf5 accepts the OM-2 opt-in on line 1 that omc 734f0a39 refused; the row
+belongs to the compiler lane's pin, not to the scanner). Replay (repository root, under the pool lock):
+  sh seed/qualification/om2/leak/sha-exports.sh build/om2-qual/leakscan-e14 build/om2-qual/sha.bin OUTDIR
