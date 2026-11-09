@@ -7,7 +7,7 @@ set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 cd "$R"
 S=seed/out/omc
-notrun() { printf 'NOT_RUN text gate: %s\n' "$*"; exit 0; }
+notrun() { printf 'NOT_RUN text gate: %s\n' "$*"; exit 3; }
 bad() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 [ -x "$S" ] || bad "$S missing; run sh seed/omega-from-seed.sh first"
 command -v python3 >/dev/null || notrun 'requires python3 (read-only oracle)'

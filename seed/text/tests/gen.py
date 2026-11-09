@@ -177,6 +177,10 @@ def main(d):
     for t in edges:
         for op in "DHI":
             parse_case(o, t, op)
+    for a in range(256):
+        for op in "DHI":
+            parse_case(o, bytes([a]), op)
+            parse_case(o, bytes([a]) + b"1", op)
     for _ in range(4000):
         k = rnd.randrange(1, 23)
         t = bytes(rnd.choice(b"0123456789abcdefABCDEF-+ ") if rnd.random() < 0.05 else rnd.choice(b"0123456789") for _ in range(k))
