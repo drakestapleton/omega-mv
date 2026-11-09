@@ -27,6 +27,19 @@ SILICON -> ATLAS -> PHYSICS/FORGE -> OMEGA -> AIEN        (full picture: aien-ar
 
 Omega was decided by Drake on 2026-09-29 to be both the reaction runtime and the compiler for Omega Systems Core ([decision record](docs/adr/OMEGA-SYSTEMS-CORE-0000.md), frozen). This retires the earlier "not a compiler" wording.
 
+## How I built Omega from its seed
+
+[Read the step-by-step walkthrough](docs/SEED_BIRTH.md): source, build ancestry, checks, limits and reproduction commands. I directed this work with AI coding agents; the source and commit history record their assistance. I do not claim that I invented bootstrapping or personally typed every instruction.
+
+1. Write explicit AArch64 instruction words and an ELF header in [`seed/rung0/seed0.hex`](seed/rung0/seed0.hex).
+2. Use a small shell loader ([`load0.sh`](seed/rung0/load0.sh), shell `printf` and `tr`) to write the first executable bytes. No C compiler, assembler or linker is invoked. The host shell and utilities remain named dependencies.
+3. Run that 408-byte seed on its own source and require byte-identical output.
+4. Build `hex1` to add labels, then `asm2` to add instruction names.
+5. Build `om3` and `om4` to grow the systems-language subset needed to implement a compiler.
+6. Compile the Omega-written [`seed/omc/omc.om`](seed/omc/omc.om), then make that compiler compile itself twice and require matching compiler bytes, real programs and refusal tests.
+
+The walkthrough is pinned to commit `29b12760` (2026-10-22), whose compiler SHA-256 is `191b776e…98e9`; [fresh root and full-chain replay evidence](evidence/seed-birth-20261022/). The same chain, grown since then, is what `sh seed/omega-from-seed.sh` builds on `main` today. A self-hosting fixed point is not by itself a proof of correctness or of independence from every host tool. Optional C output is an outward compatibility bridge, not the foundation of the seeded language.
+
 ## Current state
 
 Research-grade, with a staged Alpha qualification programme in progress. An Alpha plan or an open PR is not a qualified release. Plainly:
