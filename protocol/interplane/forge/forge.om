@@ -4,8 +4,9 @@ note forge decide [--json] HEAD VERDICT RECEIPT prints "MERGE OK" and exits 0, o
 note exits 1 (with --json, one forge-decision/1 JSON object instead).
 note forge status RID [REVIEWS [RECEIPTS]] lists the live Radicle patches of RID and decides each
 note patch that has a verdict file.
-note forge gate RID HEAD [--name N] [--out DIR] --author A --neg ARGV.. -- ARGV.. runs a gate and its
-note negative control, each in its own fresh clone at the exact head, and writes the gate receipt.
+note forge gate RID HEAD [--name N] [--out DIR] [--timeout S] --author A --neg ARGV.. -- ARGV.. runs a
+note gate and its negative control, each in its own fresh clone at the exact head and process group,
+note each killed with its group after S seconds (default 1800), and writes the gate receipt.
 note Spec: docs/FORGE.md. Formats: forge/README.md. Every check fails closed.
 global m uchar 1048576
 global g ulong 64
@@ -69,7 +70,7 @@ note 36 first --neg argument, 37 index of "--", 38 OMC entry length (0: unset),
 note 39 RAD_HOME entry length (0: unset), 40 temp dir length, 41 JSON output, 42 storage length,
 note 43 SHA-256 bytes buffered, 44 SHA-256 total bytes, 45 started ns, 46 finished ns,
 note 47 gate rc, 48 negctl rc, 49 and 50 gate log write and read fd, 51 and 52 negctl log write
-note and read fd, 53 out files this gate run created.
+note and read fd, 53 out files this gate run created, 54 gate timeout in seconds, 55 --timeout seen.
 note kna and knb hold the normalized reviewer and author for the self-review check.
 text tverd "VERDICT "
 text tvw "VERDICT"
@@ -106,7 +107,8 @@ text tgfail "GATE_FAIL"
 text tnpass "NEGCTL_PASSED"
 text tself "SELF_REVIEW"
 text tvamb "VERDICT_AMBIGUOUS"
-text thelp "usage: forge decide [--json] <patch-head> <verdict-file> <gate-receipt>\n       forge status <RID> [reviews-dir [receipts-dir]]\n       forge gate <RID> <head> [--name N] [--out DIR] --author A --neg ARGV.. -- ARGV..\n"
+text tgtmo "GATE_TIMEOUT"
+text thelp "usage: forge decide [--json] <patch-head> <verdict-file> <gate-receipt>\n       forge status <RID> [reviews-dir [receipts-dir]]\n       forge gate <RID> <head> [--name N] [--out DIR] [--timeout S] --author A --neg ARGV.. -- ARGV..\n"
 text thome "HOME="
 text tpath "PATH="
 text tdpath "PATH=/usr/local/bin:/usr/bin:/bin"
@@ -151,6 +153,7 @@ text tfname "--name"
 text tfout "--out"
 text tfauth "--author"
 text tfneg "--neg"
+text tftmo "--timeout"
 text tdd "--"
 text tomce "OMC="
 text tradh "RAD_HOME="
@@ -212,6 +215,9 @@ text teout "forge: cannot write the receipt or a log (out dir missing, or an out
 text teomc "forge: OMC is set but cannot be read\n"
 text tebadh "forge: bad head\n"
 text terun "forge: cannot run the gate command\n"
+text tetmo "forge: bad --timeout (whole seconds, 1 to 86400)\n"
+text ttmo1 "forge: timeout after "
+text ttmo2 " s, process group killed with SIGKILL, exit status recorded as 124\n"
 text tamb "ambiguous"
 text tiso "0000-00-00T00:00:00Z"
 text trpfx "rad:"
@@ -444,6 +450,9 @@ otext tvamb
 end
 if eq c 17
 otext tramb
+end
+if eq c 18
+otext tgtmo
 end
 end
 
@@ -966,6 +975,9 @@ ret c
 end
 if eq eqr get g 7 kh 40 false
 ret 12
+end
+if or eq get g 8 124 eq get g 9 124
+ret 18
 end
 if ne get g 8 0
 ret 13
@@ -1986,7 +1998,30 @@ end
 ret le t 1025
 end
 
-note gopt: the option at argument i and its value; return 0, or 1 usage, 4 bad author, 5 bad name
+note gtmo: the --timeout value at argument j: 1 to 5 decimal digits, 1 to 86400 seconds; 0 when bad
+fn gtmo j ulong to ulong
+n = argread j m kbuf 8
+if or lt n 1 gt n 5
+ret 0
+end
+v = ulong 0
+i = ulong 0
+while lt i ulong n bound 8
+c = get m add kbuf i
+if or lt c 48 gt c 57
+ret 0
+end
+v = add mul v 10 ulong sub c 48
+i = add i 1
+end
+if gt v 86400
+ret 0
+end
+ret v
+end
+
+note gopt: the option at argument i and its value; return 0, or 1 usage, 4 bad author, 5 bad name,
+note 6 bad timeout
 fn gopt i ulong to int
 j = add i 1
 if argis i tfname
@@ -2025,6 +2060,18 @@ end
 put g 35 ulong n
 ret 0
 end
+if argis i tftmo
+if gt get g 55 0
+ret 1
+end
+v = gtmo j
+if eq v 0
+ret 6
+end
+put g 54 v
+put g 55 1
+ret 0
+end
 ret 1
 end
 
@@ -2041,8 +2088,8 @@ end
 ret 0
 end
 
-note gargs: parse "gate RID HEAD [--name N] [--out DIR] --author A --neg ARGV.. -- ARGV..".
-note Return 0, or 1 usage, 2 bad head, 3 bad RID, 4 bad arguments, 5 bad name.
+note gargs: parse "gate RID HEAD [--name N] [--out DIR] [--timeout S] --author A --neg ARGV.. -- ARGV..".
+note Return 0, or 1 usage, 2 bad head, 3 bad RID, 4 bad arguments, 5 bad name, 6 bad timeout.
 fn gargs to int
 a = ulong argcnt
 if lt a 10
@@ -2069,6 +2116,8 @@ end
 put g 33 0
 put g 34 0
 put g 35 0
+put g 54 1800
+put g 55 0
 i = ulong 4
 c = true
 while c bound 64
@@ -2427,8 +2476,8 @@ put g 31 add get g 31 1
 end
 
 note grun: run arguments a0..a1 through /usr/bin/env (HOME, PATH and OMC when set) in the clone
-note m[kc..kc+dn), stdin /dev/null, stdout and stderr on the open log fd lf (duplicated, never
-note reopened by name); return the exit status (128 + signal for a killed command) or a negative errno
+note m[kc..kc+dn), in a new process group, stdin /dev/null, stdout and stderr on the open log fd lf
+note (duplicated, never reopened by name); return gwait's result for the child
 fn grun a0 ulong a1 ulong dn ulong lf ulong to long
 envpk
 if gt get g 38 0
@@ -2440,9 +2489,12 @@ pkarg i
 i = add i 1
 end
 pn = pkdone
-st = new uchar 4 0
 pid = fork
 if eq pid 0
+r = setpgid 0 0
+if lt r 0
+exit 126
+end
 r = chdir m kc dn
 if lt r 0
 exit 126
@@ -2466,7 +2518,44 @@ end
 if lt pid 0
 ret pid
 end
+ret gwait pid lf
+end
+
+note gtmlog: append the timeout line to the log fd lf, so it is in the hashed log
+fn gtmlog lf ulong to void
+put g 0 0
+otext ttmo1
+onum get g 54
+otext ttmo2
+oflush int lf
+end
+
+note gwait: put the child pid in its own process group (the child does the same before chdir, so
+note there is no race), then poll it every 100 ms until it exits or g 54 seconds have passed. At the
+note deadline send SIGKILL to the whole group (kill of -pid), reap the child, append the timeout
+note line to the log fd lf and return 124. Otherwise return the exit status (128 + signal for a
+note killed command) or a negative errno. A process that leaves the group (setsid, setpgid)
+note escapes the group kill.
+fn gwait pid long lf ulong to long
+st = new uchar 4 0
+x = setpgid int pid int pid
+dl = add monons mul long get g 54 1000000000
+w = long 0
+while eq w 0 bound 999999
+w = waitpid int pid st 0 4 1
+if eq w 0
+if ge monons dl
+x = killpid int neg pid 9
 w = waitpid int pid st 0 4 0
+if lt w 0
+ret w
+end
+gtmlog lf
+ret 124
+end
+x = sleepns 100000000
+end
+end
 if lt w 0
 ret w
 end
@@ -2622,8 +2711,8 @@ put g 48 ulong nr
 ret 0
 end
 
-note cgate: exit 0 when the gate passed and its negative control failed, 1 when the receipt
-note records anything else (it would HOLD), 2 on an error (no receipt written)
+note cgate: exit 0 when the gate passed and its negative control failed without timing out, 1 when
+note the receipt records anything else (it would HOLD), 2 on an error (no receipt written)
 fn cgate to int
 r = gargs
 if eq r 1
@@ -2640,6 +2729,9 @@ ret serr teargs
 end
 if eq r 5
 ret serr tename
+end
+if eq r 6
+ret serr tetmo
 end
 r = genv
 if eq r 1
@@ -2679,7 +2771,7 @@ n = opath trsuf
 ocopy kp n
 obyte 10
 oflush 1
-if and eq get g 47 0 ne get g 48 0
+if and eq get g 47 0 and ne get g 48 0 ne get g 48 124
 ret 0
 end
 ret 1
