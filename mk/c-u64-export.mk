@@ -3,9 +3,14 @@
 # checkouts with the #626 / #627 adapters already built (their make targets); empty = that leg NOT_RUN.
 C_EXPORT_RUST_ROOT ?=
 C_EXPORT_PYTHON_ROOT ?=
-.PHONY: c-u64-export test-c-export
+.PHONY: c-u64-export test-c-export test-c-export-corpus
 c-u64-export:
 	python3 tools/adapters/build-c-export.py
 test-c-export: c-u64-export
 	python3 tools/adapters/build-c-import.py
 	python3 tests/universal/translation/c_export_selftest.py --rust-root '$(C_EXPORT_RUST_ROOT)' --python-root '$(C_EXPORT_PYTHON_ROOT)' --out build/L622/selftest-$$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+# Independent corpus (L608): fixtures-c-export-corpus.json through the public commands only.
+test-c-export-corpus: c-u64-export
+	python3 tools/adapters/build-c-import.py
+	python3 tools/adapters/build-python-import.py
+	python3 tests/universal/translation/c_export_corpus.py --out build/L622/corpus-$$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
