@@ -1516,12 +1516,16 @@ events (1 issued, 2 model action kind, 3 tool status, 4 outcome word, 5
 cancel);
 `CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
 every objective passed, 1 otherwise, 2 usage, 62 out of time, 30 + a journal
-refusal (50..57), 50..56 a setup failure (pool, supervisor, scheduler,
-authority, worker spawn, view page, view process), 57 a restart cleanup that
-could not cancel a job the last creator left waiting or ready. The ranges
-overlap, so every such exit first writes `code-main: CAUSE, exit N` on stderr;
-a journal directory over 100 bytes, for example, gives `code-main: journal
-refused (...), exit 56`.
+refusal (50..57), 30 + a restart-recovery refusal (54..62: 24/25 refused
+record, 27 I/O, 28 write, 29 sync, 30 journal failed earlier, 31 job not
+admitted again, 32 action record not restored), 50..56 a setup failure (pool,
+supervisor, scheduler, authority, worker spawn, view page, view process), 57 a
+restart cleanup that could not cancel a job the last creator left waiting or
+ready. The ranges overlap, and 62 is also out of time, so every journal,
+recovery, setup or cleanup exit first writes `code-main: CAUSE, exit N` on
+stderr (out of time writes none; it ends with `CWSUM` on stdout); a journal
+directory over 100 bytes, for example, gives `code-main: journal refused
+(...), exit 56`.
 
 Restart: the journal's objective identity is the objective arguments' FNV-1a
 64. On a restart `auth_recover` settles what the last creator left (an
@@ -1877,7 +1881,7 @@ process in the wrong state, 1 for any other failure.
 | `start STATE BIN OMC PORT VIEW` | start `omnode-code` on STATE (`root/`, `work/`, `journal/`, `objs.txt`); BIN must be a directory; refuses (3) while `node.pid` is alive |
 | `health STATE` | the model's `GET /health` and the node's view; 0 when both answer |
 | `stop STATE` | pause (op 1), wait until nothing runs or is in review (at most 900 s), SIGTERM; `view-at-stop.json` |
-| `restore STATE` | start again on the same journal (incarnation + 1), then resume (op 2) |
+| `restore STATE` | start again on the same journal (incarnation + 1), then resume (op 2); reports the first view whose `journal_seq` has reached the resume ack's (the creator publishes its snapshot after the commit), up to 5 s, else exits 1 |
 | `unserve STATE` | stop the model server |
 | `snapshot STATE SNAP` | copy `root/`, `work/` and `journal/` into SNAP (each must not exist there); refuses (3) while `node.pid` is alive |
 | `rollback STATE SNAP` | replace STATE's `root/`, `work/` and `journal/` with SNAP's copies (all three must exist first); refuses (3) while `node.pid` is alive |
