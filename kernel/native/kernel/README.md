@@ -1036,7 +1036,7 @@ a FAIL to report, not to retry.
 2. `ck_kernel_entry` (firmware EL, firmware MMU): vectors, PSCI conduit
    from the FADT (HVC or SMC, default SMC), own page tables, stack, heap,
    DMA pool.
-3. `ck_enter_el1`: EL2 -> EL1h with the MMU already on our tables.
+3. `ck_enter_el1`: EL2 -> EL1h with the MMU already on the kernel's tables.
 4. EL1: `mmu: enabled`, `mmu_switch: ...` read back from the registers,
    heap check, guard-page self test, GICv3 or GICv2 from the MADT, 200 ms timer window
    (INTID 30, 10 ms period; on a starved emulator the window keeps counting up to 5 s until five ticks arrived, and each interval is measured from IRQ entry, so a host stall cannot produce a short interval), `kernel: alive`, `kernel_el: EL1h`.
