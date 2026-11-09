@@ -467,3 +467,27 @@ new words (error 3 before). The `execenv`, `execkeep`, `execprog` and `execpure`
 sources are byte-identical. Gates: `seed/host/execx/execx.cases` and
 `seed/host/sigfd/sigfd.cases` (x86linux through qemu-x86_64 user emulation;
 native x86 NOT_RUN).
+
+The 2 MiB packets (same branch, PROPOSED pending review) birth compiler
+`704126aa89bd9bff71f07f880007a3cea4eba5dbca34391862336591db803cac`
+from source
+`6a5f1c0b2583adb76186bec9ad428d6f107950be47c9cfbe3ecdf95974ca0213`.
+A tools/ops caller handing 1100 command words to `execx` trapped 3 at the
+1024-record cap. `execenv`, `execkeep` and `execx` packets (argv and
+environment) now admit 1..32768 records and up to 2097152 bytes each; 32769
+records or 2097153 bytes still trap 3 before any close. The decoder frame is
+0x482000 bytes of the 8 MiB stack pool (argv strings at SP, argv pointers at
+SP+0x200000, env strings at SP+0x241000, env pointers at SP+0x441000; x86 the
+same displacements). A string is still at most 65535 bytes (u16 length), and the
+kernel's ARG_MAX (min(RLIMIT_STACK/4, 6 MiB) for strings and pointers together)
+applies after the checks: callers passing more than about 2 MiB raise
+RLIMIT_STACK first (`prlimit 0 3 ...`) or receive -7. `execprog` and `execpure`
+keep 64 records and 4096 bytes. Each of the 1677 tracked `.om` files was compiled
+alone for AArch64 and for `target x86linux` under `3a9bd7e1` and `704126aa`:
+3336 of the 3354 compiles give the same bytes, exit status and diagnostics; the
+other 18 are the AArch64 and x86 compiles of the 9 sources that use `execenv`,
+`execkeep` or `execx` (`seed/host/{execenv,execkeep,execx,sigfd}/`). The 53
+other `execprog`/`execpure` users are byte-identical. Gates: the execenv,
+execkeep and execx cases, with the new `echo` case (`/bin/echo` with 2002 argv
+records; under `3a9bd7e1` it exits 103) (x86linux through qemu-x86_64 user
+emulation; native x86 NOT_RUN).

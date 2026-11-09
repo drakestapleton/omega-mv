@@ -23,11 +23,12 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `3a9bd7e1325c952b5667c6ff1f82c4808b32372bd8e6aa7f39fb7ffb3c3934aa`,
-   from `seed/omc/omc.om` `1e9b1d22f7d195d7f8df2999d50fca548b43541da12bb70eb9852f6eb1e7c10d`; the execenv
-   1024-record/131072-byte packets and the setprio 234, setaff 237, execkeep 238, utimens 239, execx 240,
+   `704126aa89bd9bff71f07f880007a3cea4eba5dbca34391862336591db803cac`,
+   from `seed/omc/omc.om` `6a5f1c0b2583adb76186bec9ad428d6f107950be47c9cfbe3ecdf95974ca0213`; the execenv
+   32768-record/2097152-byte packets (execenv, execkeep, execx) and the setprio 234, setaff 237, execkeep 238, utimens 239, execx 240,
    sigmask 241 and sigfd 242 host words, branch `hive/t_3e396ac5-execenv-cap` on rad main 1e3ecbba). The
-   earlier audit pins `9c57c9dd02c43dee907788804694bd3bd16cd7026f9cbad1a8da2e4a2009dbd0` (the same branch
+   earlier audit pins `3a9bd7e1325c952b5667c6ff1f82c4808b32372bd8e6aa7f39fb7ffb3c3934aa` (the same branch
+   with 1024-record/131072-byte packets), `9c57c9dd02c43dee907788804694bd3bd16cd7026f9cbad1a8da2e4a2009dbd0` (the same branch
    without execx, sigmask and sigfd), `d791dfd2af2d507dbb2f956ed6bbaacb963960c0d15fea12202fa629eaf893d7` (the same branch without utimens 239),
    `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8` (the prlimit 235 host word, rad main 1e3ecbba),
    `0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f` (x86 types `fma` operands before its

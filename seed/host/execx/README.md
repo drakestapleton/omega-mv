@@ -11,7 +11,7 @@ in K. It returns only on failure, with the negative errno.
 | `B`, `off`, `m` | packet | environment packet (every record nonempty) |
 | `K`, `off`, `k` | uchar slice | descriptors kept open, one byte each, `k` 0..64 |
 
-Packets use the execenv limits: 1..1024 records, at most 131072 bytes each.
+Packets use the execenv limits: 1..32768 records, at most 2097152 bytes each.
 The keep list is checked like every host slice (trap 3), then `k` above 64 traps
 3, then both packets (trap 3; an argv packet of a single record traps 3) — all
 before any descriptor closes. Descriptors 0..2 are never touched; K bytes below
@@ -36,9 +36,15 @@ Program mode only: function mode is error 9, a contract clause error 30,
   is exactly `A=1`, for keep lists [7, 5] (two kept, the rest closed), [] (all
   closed, as execenv), [3] (the first close skipped) and [9, 1, 9]. A missing
   program returns -2 after the closes (4 and 6 closed, 5 kept); a 65-byte keep
-  list, an argv packet without `argv[0]` and 1025 environment records trap 3.
-- `x86-fixture`: `x86-target.om+execx.om` through binfmt qemu-x86_64: emulator
-  evidence, not hardware qualification.
+  list, an argv packet without `argv[0]` and 32769 environment records trap 3.
+  Argv packets of 32769 records or 2097153 bytes trap 3; argv packets of 32768
+  records and of 2097152 bytes reach the kernel (the missing program `a`
+  returns -2, or -7 E2BIG under the default 8 MiB stack limit).
+- `echo`: `echo.om` execx's `/bin/echo` with `argv[0]` `echo` and the 2000
+  arguments 1..2000 (2002 argv records, above the earlier 1024-record cap);
+  stdout must equal `echo.want` (`seq -s ' ' 1 2000`), exit 0.
+- `x86-fixture`, `x86-echo`: the same sources with `x86-target.om` through
+  binfmt qemu-x86_64: emulator evidence, not hardware qualification.
 - refusals: `fnmode.om` (9, AArch64 and x86linux), `contract.om` (30),
   `intkeep.om` (7), `efi-target.om+use.om` (25).
 - mutants:

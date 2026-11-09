@@ -126,7 +126,7 @@ grep -qx 'OM2GATE FAIL cases=24 pass=12 fail=12 invalid=0 not_run=0' "$run/fnhos
 [ "$(grep -c '^VERDICT fn-[a-z0-9]* FAIL ' "$run/fnhostmut.log")" = 12 ]
 echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # execenv 233: exact child environment (AArch64 and x86linux), printenv ORACLE, execprog negative
-# control, 1024-record and 131072-byte packets (execprog keeps 64/4096), function-mode and contract
+# control, 32768-record and 2097152-byte packets (execprog keeps 64/4096), function-mode and contract
 # refusals, and 8 omc.om mutants killed (seed/host/execenv/).
 "$B/gate" seed/out/omc "$pin" seed/host/execenv/execenv.cases "$run/execenv"
 # prlimit 235: rlimit read/set/effect against /proc/self/limits (AArch64 and x86linux), RLIMIT_AS kept
@@ -147,7 +147,8 @@ echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 "$B/gate" seed/out/omc "$pin" seed/host/utimens/utimens.cases "$run/utimens"
 # execx 240: argv[0] preserved apart from the path, a keep list (unordered, empty, first-close skipped,
 # below-3 byte and duplicate) kept while every other descriptor from 3 closes (AArch64 and x86linux),
-# ENOENT after the closes, k/argv/env traps, refusals, and 8 omc.om mutants killed (seed/host/execx/).
+# ENOENT after the closes, k/argv/env traps at 32769 records and 2097153 bytes, /bin/echo with 2000
+# arguments, refusals, and 8 omc.om mutants killed (seed/host/execx/).
 "$B/gate" seed/out/omc "$pin" seed/host/execx/execx.cases "$run/execx"
 # sigmask 241 and sigfd 242: TERM held, read back through a nonblocking signalfd (signo 15, -11 when
 # empty), mask inherited across fork and cleared by SIG_UNBLOCK before exec, SigBlk readback (AArch64

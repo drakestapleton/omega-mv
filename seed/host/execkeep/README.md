@@ -1,7 +1,7 @@
 # execkeep (keyword 238)
 
 `execkeep A off n B off m fd` returns `long`: it is `execenv A off n B off m`
-(same packets, limits and checks: 1..1024 records, at most 131072 bytes each)
+(same packets, limits and checks: 1..32768 records, at most 2097152 bytes each)
 except that descriptor `fd` stays open across the exec.
 
 | operand | type | meaning |
@@ -32,7 +32,7 @@ Program mode only: function mode is error 9, a contract clause error 30,
   is held across exec), and the environment is exactly `A=1`. K 9 and K 3 (the
   skipped first close); the same through `execenv` finds K closed (negative
   control); a missing program returns -2 after both closes (K-1, K+1 closed,
-  K open); fd 2, 0 and -1 trap 3; 1025 environment records trap 3.
+  K open); fd 2, 0 and -1 trap 3; 32769 environment records trap 3.
 - `x86-fixture`: `x86-target.om+execkeep.om` through binfmt qemu-x86_64:
   emulator evidence, not hardware qualification.
 - refusals: `fnmode.om` (9, AArch64 and x86linux), `contract.om` (30),
