@@ -10,7 +10,7 @@
 #   OMEGA_OMC     seed-born omc, sha256 pinned below (exit 3 NOT_RUN without it)
 #   OMEGA_BRIDGE  optional: an aien-dev/omega-bridge checkout whose src/native.om matches the pin
 set -eu
-OMC_PIN=5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df
+OMC_PIN=0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f
 NATIVE_PIN=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
 P=$(cd "$(dirname "$0")" && pwd)
 OM=$P/../gpumath.om

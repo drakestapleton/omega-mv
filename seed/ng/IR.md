@@ -682,7 +682,9 @@ Run pairs
 document's semantics: `seed/ng/ngrun.om`, the reference interpreter of s7, runs the ΩIR, omc
 compiles and runs the Omega, and exit status, stdout and stderr must be equal, traps at the exact
 boundaries included (overflow at 2^63, fuel at exactly 1e6 passes, index == len, MIN div -1,
-shift by the width, a conversion one past the range).
+shift by the width, a conversion one past the range and one at the bottom of it, a signed shift
+left that reaches the minimum). What Omega cannot state (u64 checked add and mul, `chk.bounds` with
+e = 0, wrapping narrow `neg`, the trap 6 depth) the gate checks on ngrun alone (N cases).
 Random programs (`seed/ng/ngrand.om`, the D9 differential source for back ends): `ngrand SEED`
 writes a unit built with `src/ir.om` from a byte tape that SEED fills; every tape gives a unit
 ngcheck accepts (typed SSA, one token chain, checks with their codes, diamonds joined by block

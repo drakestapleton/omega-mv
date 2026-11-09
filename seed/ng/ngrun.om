@@ -1,7 +1,7 @@
 note SPDX-License-Identifier: Apache-2.0
 note seed/ng/ngrun.om: the ΩIR reference interpreter (lane ng-ir). Build:
 note   cat seed/ng/src/ir.om seed/ng/ngrun.om | seed/out/omc > ngrun
-note Usage: ngrun FILE.ir. It runs the program entry (IR.md s6.1) of a unit that ngcheck accepts, with
+note Usage: ngrun FILE.ir [STEPS]. It runs the program entry (IR.md s6.1) of a unit that ngcheck accepts, with
 note the meaning of IR.md s7, one op at a time: host words reach the real process (stdout, stderr,
 note stdin), the exit status is the entry's i32 result, `exit v` exits v, a failing check or `trap`
 note exits 100 + code. Call depth past 65535 frames, more than 4194304 live values or more than
@@ -17,10 +17,16 @@ note check (70..82), facts (90..93, no effect), load store atom atomcas alloca f
 note fload fstore fref on scalar elements, br cbr ret retv call trap exit, host read write monons
 note realns cpufence cpurelax. Not yet: vectors and tiles (100..106), kernels (40, 41, 44, 45, 67),
 note fma (46), fmath (28), f16/bf16/fp8, conv rounding toward zero, vload/vstore (58, 59).
-note Input that ngcheck refuses has no meaning here; ngrun reads it with ir.om and may misbehave.
+note Its own limits never exit 100..114 (those are the IR's traps): after STEPS executed ops (default 2^36 =
+note 68719476736, about an hour on the Spark, above the 7.8e9 of the sort kernel; a loop without chk.fuel
+note may run forever) it prints "ngrun: step limit at OFFSET" (the next
+note op) and exits 124; an access whose element lies outside the object its REF or SLICE names (only an
+note input ngcheck refuses, UNCHECKED, can reach one) prints "ngrun: access outside storage at OFFSET" and
+note exits 126. Other input that ngcheck refuses has no meaning here: ngrun reads it with ir.om and its
+note exit status is not an IR result; judge a run only on a unit ngcheck accepts.
 note ---- state ------------------------------------------------------------------------------------
 note r_s: 0 slot offset (slot = r_s0 + value handle), 1 current function, 2 memory top, 3 call
-note depth, 4 value stack top
+note depth, 4 value stack top, 5 step budget, 6 steps run
 global r_s ulong 8
 global r_v ulong 4194304
 global r_w ulong 4194304
@@ -35,7 +41,7 @@ global r_tv ulong 64
 global r_tw ulong 64
 global r_dg uchar 24
 global r_pa uchar 4096
-text r_msg "ngrun: unsupported op \n at \nngrun: unsupported host word \nngrun: refused class \nngrun: usage: ngrun FILE.ir\nngrun: cannot read input\n"
+text r_msg "ngrun: unsupported op \n at \nngrun: unsupported host word \nngrun: refused class \nngrun: usage: ngrun FILE.ir [STEPS]\nngrun: cannot read input\nngrun: step limit at \nngrun: access outside storage at \n"
 note ---- messages ---------------------------------------------------------------------------------
 fn rn_say a ulong b ulong to void
 k = write 2 r_msg a sub b a
@@ -56,6 +62,27 @@ end
 fn rn_nl to void
 put r_dg 0 10
 k = write 2 r_dg 0 1
+end
+note one stderr line, message r_msg[a, b) then the offset of op o
+fn rn_lim a ulong b ulong o uint to void
+rn_say a b
+rn_num ulong get i_oof o
+rn_nl
+end
+note an access outside its object (input ngcheck refuses): one line, exit 126
+fn rn_oob o uint to void
+rn_lim 163 196 o
+exit 126
+end
+note elements [off, off + n) of operand slot k lie inside its object, else rn_oob
+fn rn_ext o uint k uint off ulong n ulong to void
+l = rn_len o k
+if gt off l
+rn_oob o
+end
+if gt n sub l off
+rn_oob o
+end
 end
 note an op outside the supported subset: one line, exit 125
 fn rn_uns o uint to void
@@ -715,8 +742,16 @@ ret get i_t1 rt
 end
 ret get i_t1 get i_t1 rt
 end
-note address of element i of operand slot k of op o; refuses non-scalar elements
+note address of element i of operand slot k of op o; refuses non-scalar elements and an i outside the
+note object (rn_oob)
 fn rn_ea o uint k uint i ulong to ulong
+if ge i rn_len o k
+rn_oob o
+end
+ret rn_eau o k i
+end
+note element i's address without the extent test (i may be the object's end)
+fn rn_eau o uint k uint i ulong to ulong
 et = rn_elt rn_at o k
 if ge et 32
 rn_uns o
@@ -792,7 +827,8 @@ rn_st p ir_tsize rn_elt rn_at o 1 rn_a o 3 false
 ret
 end
 if eq op 54
-p = rn_ea o 1 rn_a o 2
+rn_ext o 1 rn_a o 2 rn_a o 3
+p = rn_eau o 1 rn_a o 2
 rn_r o p
 rn_rw o rn_a o 3
 ret
@@ -801,7 +837,7 @@ if eq op 51
 n = rn_len o 1
 et = rn_elt rn_at o 1
 v = rn_a o 2
-p = rn_ea o 1 0
+p = rn_eau o 1 0
 for j ulong n bound 16777216
 rn_st add p mul j ir_tsize et ir_tsize et v false
 end
@@ -873,6 +909,7 @@ ret
 end
 if or eq w 53 eq w 54
 fd = int bitcast long rn_a o 1
+rn_ext o 2 rn_a o 3 rn_a o 4
 p = rn_buf o 2
 n = rn_a o 4
 k = long 0
@@ -1051,19 +1088,41 @@ end
 end
 ret 0
 end
-fn rn_load to ulong
-if lt argcnt 2
-rn_say 80 108
+note the STEPS argument: 1 to 19 decimal digits, else usage and exit 2
+fn rn_steps to ulong
+m = argread 2 r_pa 0 4096
+if or le m 0 gt m 19
+rn_say 80 116
 exit 2
+end
+x = ulong 0
+for j ulong ulong m bound 19
+c = ulong get r_pa j
+if or lt c 48 gt c 57
+rn_say 80 116
+exit 2
+end
+x = add mul x 10 sub c 48
+end
+ret x
+end
+fn rn_load to ulong
+if or lt argcnt 2 gt argcnt 3
+rn_say 80 116
+exit 2
+end
+put r_s 5 68719476736
+if eq argcnt 3
+put r_s 5 rn_steps
 end
 m = argread 1 r_pa 0 4096
 if or le m 0 ge m 4096
-rn_say 80 108
+rn_say 80 116
 exit 2
 end
 fd = fopen r_pa 0 ulong m 524288 0
 if lt fd 0
-rn_say 108 133
+rn_say 116 141
 exit 27
 end
 n = ulong 0
@@ -1071,7 +1130,7 @@ while true bound 16777218
 if ge n len i_in
 k = read int fd r_dg 0 1
 if lt k 0
-rn_say 108 133
+rn_say 116 141
 exit 27
 end
 if gt k 0
@@ -1086,7 +1145,7 @@ ret n
 end
 k = read int fd i_in n sub len i_in n
 if lt k 0
-rn_say 108 133
+rn_say 116 141
 exit 27
 end
 if eq k 0
@@ -1117,6 +1176,11 @@ end
 rn_globs
 o = rn_enter f 0
 while true bound 9223372036854775807
+if ge get r_s 6 get r_s 5
+rn_lim 141 162 o
+exit 124
+end
+put r_s 6 add get r_s 6 1
 o = rn_step o
 end
 ret 0
