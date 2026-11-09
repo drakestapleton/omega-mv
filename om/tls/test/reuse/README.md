@@ -64,8 +64,11 @@ input and stdout file). `receipt.om` re-hashes each file with the Omega SHA-256 
 (an implementation independent of the `sha256sum` that wrote the facts), classifies every row from
 the stdout file itself and prints the verdict. Three numbers per row are trusted as `run.sh`
 recorded them: the build exit, the compiler stderr byte count (the stderr file is not in the
-receipt) and the program exit. The verifier-mutant meta-gate (below) is decided in `run.sh` by an
-exact comparison of the failed control numbers. The contract is written out at the top of
+receipt) and the program exit. The `source` and `dirty` lines are also trusted as recorded: the
+verifier requires each exactly once but does not compare them with the checkout, so a receipt whose
+`source` names another commit, or whose `dirty 0` reads `dirty 1`, still verifies (a changed row
+file, class or verdict is refused). The verifier-mutant meta-gate (below) is decided in `run.sh` by
+an exact comparison of the failed control numbers. The contract is written out at the top of
 `receipt.om`.
 
 ## Coverage matrix
