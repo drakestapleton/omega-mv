@@ -275,8 +275,8 @@ Not covered, or covered only partly:
 
 - **CPU timing.** omc emits plain AArch64. The constant-time claims rely on MUL, ADD, EOR, AND,
   ORR and the shifts having data-independent timing. PSTATE.DIT is not set: `tls_hwdit` reports
-  whether the kernel advertises FEAT_DIT (HWCAP bit 24), and `msr DIT, #1` needs a compiler word
-  that omc does not have yet (proposal in `THREAT_MODEL.md`).
+  whether the kernel advertises FEAT_DIT (HWCAP bit 24). omc has had the OM-2 program-mode word
+  `dit` since `23678743` (OMEGESE.md §9.13.1), but this library does not use it yet.
 - **Record padding.** The inner-plaintext padding is stripped by a backward scan, so its time
   reveals the padding length. RFC 8446 section 5.4 accepts this.
 - **Lengths and outcomes.** Message lengths, record counts and whether a tag check failed are

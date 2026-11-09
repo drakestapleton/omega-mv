@@ -1,5 +1,5 @@
 #!/bin/sh
-# Candidate-only AArch64 FMADD and exact-literal negative controls. No production pin is changed.
+# AArch64 FMADD and exact-literal negative controls, run by seed/host/check.sh (OMEGA-SEED). No production pin is changed.
 # Requires the settled source's seed fixpoint in seed/out/omc. All transforms and compilers are seeded .om.
 set -eu
 cd "$(dirname "$0")/../.."

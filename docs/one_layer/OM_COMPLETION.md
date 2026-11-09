@@ -52,8 +52,9 @@ cannot emit them, so there is no reference unit to verify against.
 
 **Decision-bound language/ecosystem work.**
 
-4. **Generic byte/string utilities.** Array parameters carry an exact length; a standard library
-   needs open arrays or a max-length convention (language decision).
+4. **Generic byte/string utilities.** OM-1 array parameters carry an exact length. OM-2 units take
+   arrays of any length through unsized `view T *` / `edit T *` parameters (OMEGESE.md §9.13); the
+   standard library itself is still open.
 5. **`sync` naming.** The benchmark corpus uses `sync` as an identifier four times; any new keyword
    must pass the corpus collision audit (rung R13).
 
@@ -62,12 +63,12 @@ cannot emit them, so there is no reference unit to verify against.
 | FR / decision | Gap | Why it is blocked |
 |---|---|---|
 | FR-1 file I/O | complete for the exposed set (open/read/write/seek/stat/link/chmod/chown/truncate/memfd) | no blocker for this subset |
-| FR-2 packed structs | structs are 8-byte cells; packed u8/u16/u32/u64 fields are not expressible | needs a layout syntax and alignment rule (decision) |
+| FR-2 packed structs | OM-1 structs are 8-byte cells. OM-2 `layout NAME SIZE` / `field F T [N] at OFF little\|big` gives packed integer fields with explicit byte order (OMEGESE.md §9.13; refusal error 29 gated by `gate15.sh` `e29_layout_past`) | no packed layout in OM-1 units; the OM-2 run cases (`seed/omc/om2/s3/s3.cases`) are not in OMEGA-SEED |
 | FR-3 imports by digest | no `import`; units concatenate | requires the OSC content-addressed unit store (external) |
 | FR-4 floats | implemented end to end for AArch64 (types, literals, arithmetic, arrays, pools, structs) | IR floats are spec-blocked: OSC-1 scalar tags are integer-only |
 | FR-5 mmap/ioctl | implemented for AArch64 program mode as handle-checked words `devctl devcall uvmctl mapnew mapdrop mapread mapwrite mapaddr mapget mapset maphold mapbind` (ids 166..177, `seed/omc/genkw.awk`; contracts in [`seed/host/MAPPING.md`](../../seed/host/MAPPING.md), tests `seed/host/tests/{mapio,devcall,memcheck,reserve}.om` run by `seed/host/gate.om`) | access through a raw integer address stays refused: `mapaddr` exports a ulong but access requires the live owned handle; no GPU launcher or model execution (MAPPING.md) |
 | FR-6 threads/atomics | absent | decision 37 (disjoint threads) has no chosen design |
-| FR-7 shared objects/C ABI | absent | needs an ABI contract (calling convention, symbols, relocation) |
+| FR-7 shared objects/C ABI | OM-2 `export fn` gives multi-entry function-mode units (OMEGESE.md §9.13); foreign callers bind them through the omega-bridge native ABI (`om/units.sh`; omega-bridge `docs/NATIVE-ABI.md`: v1 for OM-1 units, v2 for OM-2 units) | no ELF shared objects, symbol tables or relocations; units link only as generated C bindings |
 | FR-8 kernel words | absent | needs a target kernel interface, not a compiler change |
 | FR-9 x86-64 | DRAFT, merged as #923 from historical backend `7eca2ac3f` on canonical base `6999fa9e6`; see [design and unsupported paths](../X86-LINUX.md) | full existing fixture differential last ran EMULATED (QEMU) at source `62d1d0d6` (`seed/qualification/x86-linux/20261030-main-62d1d0d6.json`): 15182 PASS, 0 FAIL, 2 NOT_RUN (QEMU invalid-fd ioctl artifacts), 222 EXCLUDED, aggregate verdict FAIL because NOT_RUN is not PASS; the same run's objdump invalid-encoding and valid-wrong-encoding controls PASS; native x86 NOT_RUN; default AArch64 byte preservation is not separately recorded in that receipt; no completion or qualification claim |
 | decision 24 | no heap, no free | Drake's rule; any allocation model would reverse it |
