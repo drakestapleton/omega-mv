@@ -1,7 +1,7 @@
 # seed/: a compiler chain born from nothing
 
 Drake's question: C was built from B, B from something older. If every old tool added mistakes or waste,
-we would inherit all of it. So this folder grows a toolchain from a few hundred hand-written bytes, step by
+I would inherit all of it. So this folder grows a toolchain from a few hundred hand-written bytes, step by
 step, with the existing C compiler and the GNU tools used only as a referee that checks the answers, never
 as a builder.
 
@@ -47,11 +47,11 @@ it came from.
   shell script that uses only the shell's own `printf`. After that first build, seed-0 builds itself.
 - Checks (`rung0/gate0.sh`, results in `evidence/SEED-0/rung0/`):
   - seed-0 reading its own text produces itself, byte for byte;
-  - every one of the 72 instructions is read back by two independent decoders (our own, in
+  - every one of the 72 instructions is read back by two independent decoders (my own, in
     `src/aarch64_decoder.c`, and GNU objdump), and both agree with the name written beside it:
     0 disagreements (`rung0/seed0.audit`, every word listed);
   - controls: a wrong name is caught; a bad character and a half-written word are refused.
-  - Limit, said plainly: our own decoder does not know the "system call" instruction (SVC, 3 of the 72
+  - Limit, said plainly: my own decoder does not know the "system call" instruction (SVC, 3 of the 72
     words) and does not read the immediate number of the compare instructions; for those, objdump and
     the hand decode in the comment are the checks.
 
@@ -207,7 +207,7 @@ it came from.
 - Limits, said plainly: variable names are at most 8 characters; a function may use at most 16
   registers for its names and working values (om4 stops with error 12 beyond that). `omegese next` (the
   C tool that lists the legal next words) does not know the new words, so the next-word check for them
-  is our own (decision 22, gate4 section 10, `check/nextfuzz.sh`): 20 random programs using every new
+  is my own (decision 22, gate4 section 10, `check/nextfuzz.sh`): 20 random programs using every new
   word are generated (`check/nextgen.awk`) and all accepted; then each is cut after every word and has
   each word swapped for a wrong one, 4,860 inputs, and om4 answers every one with its result or an error
   number, never a crash.

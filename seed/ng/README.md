@@ -78,7 +78,7 @@ under `seed/` (the compiler's bootstrap closure and the ng tree) or to the workf
 ## Host dependencies
 
 Every host binary that stays in an NG build, gate or bench path, with its version, what it does
-for us and its Omega replacement (Hive NG ledger `HOST-DEPS.md`, carried here). Verification
+for me and its Omega replacement (Hive NG ledger `HOST-DEPS.md`, carried here). Verification
 oracles (the pinned omc, git, gh, crumb) and referees (gcc, objdump, cuobjdump, Wolfram) are exempt.
 
 | host tool | version | where | what it does | Omega replacement |

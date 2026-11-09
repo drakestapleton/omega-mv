@@ -19,7 +19,7 @@ Papers: [Omega](https://doi.org/10.5281/zenodo.23547810), [The Token Is the Inst
 
 ### Why GitHub still shows C
 
-GitHub's language bar measures recognized source bytes on the default branch; it is not the project's language specification or a migration-completion verdict. GitHub Linguist does not currently recognize Omega/`.om`, and the active C files here have not yet been replaced and removed. We do not label handwritten C as generated/vendor code, rename it to `.om`, or assign an unrelated language to change that statistic. See the inventory above for the actual remaining work. Native GitHub recognition requires support in [Linguist](https://github.com/github-linguist/linguist/blob/main/CONTRIBUTING.md#adding-a-language).
+GitHub's language bar measures recognized source bytes on the default branch; it is not the project's language specification or a migration-completion verdict. GitHub Linguist does not currently recognize Omega/`.om`, and the active C files here have not yet been replaced and removed. I do not label handwritten C as generated/vendor code, rename it to `.om`, or assign an unrelated language to change that statistic. See the inventory above for the actual remaining work. Native GitHub recognition requires support in [Linguist](https://github.com/github-linguist/linguist/blob/main/CONTRIBUTING.md#adding-a-language).
 
 ```text
 SILICON -> ATLAS -> PHYSICS/FORGE -> OMEGA -> AIEN        (full picture: aien-architecture)
