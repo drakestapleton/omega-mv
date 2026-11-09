@@ -51,6 +51,7 @@ global fzoff ulong 4
 global fzinit ulong 4
 global fzsnc ulong 4
 global fzsj ulong 4
+global fzspen ulong 4
 global fzz0 ulong 1
 global fzfail ulong 1
 note fzcnt / fzpnd: committed / pending counts, index k*64 + repo, k 0 git fetch 1 upload-pack 2 archive 3 release asset
@@ -59,6 +60,8 @@ global fzpnd ulong 256
 global fznev ulong 1
 global fzjb uchar 65536
 global fzjbl ulong 1
+note fzjend: journal byte offset after the last committed cursor; any later bytes are abandoned.
+global fzjend ulong 1
 global fzhome uchar 64
 global fzhomel ulong 1
 global fzsd ulong 64
@@ -524,31 +527,37 @@ fzev 3 i ep
 end
 end
 note ---- journal lines: "e <k> <epoch> <rid>", "s <src> <epoch>", "k <src> <ino> <off>"
-fn fzjl a ulong e ulong to void
+fn fzjl a ulong e ulong to bool
 if lt sub e a 5
-ret
+ret false
 end
 c = fzb a
 if eq c 101
 fzjle a e
-ret
+ret false
 end
 s = ulong sub fzb add a 2 48
 if gt s 2
-ret
+ret false
 end
 if eq c 115
-put fzsnc s fznum add a 4 e
-put fzsj s 1
-ret
+put fzspen s fznum add a 4 e
+ret false
 end
 if eq c 107
 p = fzsp add a 4 e
 put fzino s fznum add a 4 e
 put fzoff s fznum add p 1 e
 put fzinit s 1
-fzcommit
+if ne get fzspen s 0
+put fzsnc s get fzspen s
+put fzsj s 1
+put fzspen s 0
 end
+fzcommit
+ret true
+end
+ret false
 end
 fn fzjle a ulong e ulong to void
 k = fzkix fzb add a 2
@@ -583,6 +592,9 @@ fn fzdrop to void
 for j ulong 256
 put fzpnd j 0
 end
+for s ulong 4
+put fzspen s 0
+end
 put fznev 0 0
 put fzjbl 0 0
 end
@@ -599,7 +611,6 @@ if eq s 2
 fzl2 a e
 ret
 end
-fzjl a e
 end
 note ---- paths, stat, journal write
 fn fzpath s ulong rot ulong to void
@@ -658,6 +669,32 @@ fzjc 32
 fzjn ofs
 fzjc 10
 end
+note fzjopen: discard a torn suffix before appending, including a short write in this process.
+note Refuse a journal that shrank below its committed end; never extend it with invented bytes.
+fn fzjopen to long
+fzpath 3 0
+fd = fopen fpth 0 get fpthl 0 525377 384
+if lt fd 0
+ret fd
+end
+sz = fseek int fd 0 2
+if lt sz 0
+x = fclose int fd
+ret -1
+end
+if lt ulong sz get fzjend 0
+x = fclose int fd
+ret -1
+end
+if gt ulong sz get fzjend 0
+r = ftrunc int fd long get fzjend 0
+if lt r 0
+x = fclose int fd
+ret -1
+end
+end
+ret fd
+end
 note fzflush: write the pending batch and its cursor in one append; commit only when it is all written
 fn fzflush s ulong ino ulong ofs ulong to bool
 if eq get fznev 0 0
@@ -665,8 +702,7 @@ put fzjbl 0 0
 ret true
 end
 fzjk s ino ofs
-fzpath 3 0
-fd = fopen fpth 0 get fpthl 0 525377 384
+fd = fzjopen
 if lt fd 0
 fzdrop
 ret false
@@ -678,6 +714,7 @@ if ne w long n
 fzdrop
 ret false
 end
+put fzjend 0 add get fzjend 0 n
 if eq get fzsnc s 0
 put fzsj s 0
 else
@@ -699,8 +736,14 @@ e = fzch a n 10
 if ge e n
 break
 end
-fzline s a e
 used = add e 1
+if eq s 3
+if fzjl a e
+put fzjend 0 add pos used
+end
+else
+fzline s a e
+end
 a = used
 if gt get fzjbl 0 60000
 if ne s 3
@@ -825,6 +868,7 @@ for j ulong 256
 put fzcnt j 0
 end
 fzdrop
+put fzjend 0 0
 for s ulong 4
 put fzino s 0
 put fzoff s 0
