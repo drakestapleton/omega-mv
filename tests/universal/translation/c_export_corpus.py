@@ -3,7 +3,8 @@
 
 Written from spec/universal/c-u64-export-v1.md and source-aware-v1.md only; the exporter, importer and
 codec are exercised through their public commands (tools/adapters/c-import, python-import, c-export,
-tools/source-aware/sa). The corpus (fixtures-c-export-corpus.json) is disjoint from F1, the
+tools/source-aware/sa). The corpus (c_export_corpus.json, C export lane path; fixtures-*.json belong to the
+#624 coordinator) is disjoint from F1, the
 c_import_controls boundaries and the F2 fixtures, and every expected export text is written by hand.
 
 Per positive case (C source, or Python source for the cross-member leg):
@@ -276,7 +277,7 @@ def main():
         return 3
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
-    corpus = json.loads((Path(__file__).resolve().parent / 'fixtures-c-export-corpus.json').read_text())
+    corpus = json.loads((Path(__file__).resolve().parent / 'c_export_corpus.json').read_text())
     with tempfile.TemporaryDirectory(prefix='c-export-corpus-') as t:
         ctx = argparse.Namespace(work=Path(t), cc=a.cc, observations=0)
         recs = [positive(ctx, c, 'c') for c in corpus['c_positives']]
