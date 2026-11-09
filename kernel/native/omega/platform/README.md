@@ -149,7 +149,7 @@ reload or deployment was performed. No write callback is changed. A later kernel
 integrator must run kernel build/thermal review and topology/resume tests before
 shipping; signed sysfs formatting alone would conceal rather than fix the bug.
 
-`kernel-repro.py` builds the exact original get_* functions with small C
+`kernel-repro.sh` builds the exact original get_* functions with small C
 reference structs, applies the actual proposed patch in a disposable directory,
 checks all enum speeds and boundaries, and requires red/green controls in both
 directions. This host oracle does not execute a PCIe transaction.
@@ -174,16 +174,22 @@ for any future physical integration, not bypassed by a passing host fixture.
 Host-only acceptance, after writers have finished:
 
 ```
-python3 native/omega/platform/gate.py /absolute/pinned/omc EXPECTED_SHA256 /absolute/receipts/readback
-python3 native/omega/platform/kernel-repro.py /absolute/receipts/kernel-repro
+sh native/omega/platform/gate.sh /absolute/pinned/omc EXPECTED_SHA256 /absolute/receipts/readback
+sh native/omega/platform/kernel-repro.sh /absolute/receipts/kernel-repro
 ```
 
 Qualification compiler source `1fe5976d398646b17acabbf6d9dfae96b017e439`, committed
 `seed/out/omc` SHA256
 `d6290c7663c2b4bafb59eb3fdf812476e977f4c144def71095c6248ef9b96b84`.
 This does not change Aienux's omega.lock runtime-vendor pin. Conductor/oracle
-programs use Python, cc and patch only for verification; production behavior
-is seeded Omega. Compiler failure does not count as a killed mutant.
+programs use POSIX sh, awk, cc and patch only for verification; production
+behavior is seeded Omega. Compiler failure does not count as a killed mutant.
+The two conductors replaced the original Python ones (`gate.py`,
+`kernel-repro.py`) under the repository's no-Python guard; on the same inputs
+they write byte-identical generated programs, binaries, outputs and
+`results.json` (the fixture reader is stricter: hex values must be written
+`0x...`, strings may not contain escapes, duplicate keys are refused, and all
+five fields are required on all 21 registers of every CPU).
 
 Observed acceptance: both commands exited 0. The readback gate passed all 247
 descriptor reads (twenty CPUs times twelve selected descriptors, plus seven
