@@ -19,6 +19,7 @@ sh seed/omc/gate12.sh
 sh seed/omc/gate13.sh
 sh seed/omc/gate14.sh
 sh seed/omc/gate15.sh
+sh seed/explain/gate.sh
 sh seed/omc/gate16.sh
 sh seed/omc/gate17.sh
 sh seed/omc/gate18.sh

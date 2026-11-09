@@ -1,0 +1,434 @@
+note explain: run the seeded compiler on one source file and, when it refuses the file, say in words why.
+note Usage: explain OMC SRC OUT. OMC is the compiler (seed/out/omc), SRC the .om file, OUT the program
+note file to write. The compiler's own stderr line "omc: line L: error C" is read from a pipe and shown as
+note "SRC:L: error C: MEANING" and then the source line itself; any later lines (an om2 diag record)
+note follow unchanged. The exit status is the compiler's own code, so scripts that test it keep working.
+note explain adds 64 (usage), 65 (a file could not be opened or the compiler could not be started) and
+note 66 (the compiler was stopped by a signal).
+note The compiler and its exact diagnostic line are unchanged (gate15, gate5 and OM-2 match it byte for byte).
+note MEANS is generated from seed/omc/error-codes.reg by seed/explain/gate.sh table: never edit it by hand;
+note the gate fails when it differs from the registry. Line i of MEANS is omc code i (1..30).
+om2
+text means "the compiler's standard input could not be read\nthe compiler's standard output could not be written\nunknown name or field, or a word this mode does not provide\nthe line ends where a word or value is needed\nextra words after a complete statement\nmalformed number or token\ntype mismatch\nnumber out of range for its type or place\nword or declaration in a place that does not allow it\nduplicate name\nbare number without a type from its context\nregister pool exhausted\nname too long (8 bytes, 63 for a function)\ncapacity exceeded (names, functions, sites, nesting, input or output)\nmissing end\nsyntax: unknown or misplaced word\nline after ret, break, continue, trap or exit in the same block\na function with a result can reach its end\nglobal passed as an argument, or one array twice in a call\nwrite to a view or a text\nconstant index outside the array\nmalformed text literal\nsize capacity\nAArch64 branch displacement out of range\nunknown target, an AArch64-only path on another target, or an x86efi refusal (bare unit, Linux host word, efi OP literal outside 0..14)\nno emitting site\nfresh element read before it is definitely written, or fresh array passed on\nabstract type: seal outside its constructor, or an unsupported holds\nexternal layout out of bounds or misplaced\ncontract syntax misplaced or not supported here (IR mode included)\n"
+text usage "usage: explain OMC SRC OUT\n"
+text nofile "explain: cannot open "
+text norun "explain: the compiler could not be started\n"
+text sigmsg "explain: the compiler was stopped by signal "
+text oddmsg "explain: the compiler's message is not in the form omc: line L: error C\n"
+text okmsg ": compiled, program written to "
+text pre "omc: line "
+text mid ": error "
+text eofmsg "(end of file)"
+text more " ..."
+global pk uchar 4096
+global spath uchar 4096
+global spn ulong 1
+global opath uchar 4096
+global opn ulong 1
+global src uchar 8388608
+global srcn ulong 1
+global ebuf uchar 4096
+global en ulong 1
+global junk uchar 4096
+global obuf uchar 16384
+global oc ulong 1
+global fds uchar 8
+global st uchar 4
+global gl ulong 1
+global gc ulong 1
+global gr ulong 1
+
+note ---- output: one buffer, flushed whole to a descriptor ----
+fn oputb b uchar to void
+m = get oc 0
+if lt m len obuf
+put obuf m b
+put oc 0 add m 1
+end
+end
+
+fn oputt t view uchar * to void
+for i ulong len t
+oputb get t i
+end
+end
+
+fn oputn v ulong to void
+d = new uchar 20 0
+i = ulong 0
+x = v
+put d 0 uchar add rem x 10 48
+x = div x 10
+i = add i 1
+while gt x 0 bound 20
+put d i uchar add rem x 10 48
+x = div x 10
+i = add i 1
+end
+j = i
+while gt j 0 bound 20
+j = sub j 1
+oputb get d j
+end
+end
+
+fn osrc to void
+for i ulong get spn 0
+oputb get spath i
+end
+end
+
+fn oout to void
+for i ulong get opn 0
+oputb get opath i
+end
+end
+
+note oflush: every pass writes at least one byte of at most len obuf, so len obuf passes suffice.
+fn oflush fd int to void
+off = ulong 0
+n = get oc 0
+while lt off n bound 16384
+w = write fd obuf off sub n off
+if le w 0
+put oc 0 0
+ret
+end
+off = add off ulong w
+end
+put oc 0 0
+end
+
+fn quit t view uchar * code int to void
+oputt t
+oflush 2
+exit code
+end
+
+note ---- arguments ----
+note mkpk: the exec packet for argv[1]: u16 count 1, u16 length, the path bytes (OMEGESE section 10).
+fn mkpk to ulong
+n = argread 1 pk 4 4092
+if le n 0
+ret 0
+end
+put pk 0 1
+put pk 1 0
+put pk 2 uchar and n 255
+put pk 3 uchar shr n 8
+ret add ulong n 4
+end
+
+fn args to void
+if ne argcnt 4
+quit usage 64
+end
+n = argread 2 spath 0 len spath
+if le n 0
+quit usage 64
+end
+put spn 0 ulong n
+n = argread 3 opath 0 len opath
+if le n 0
+quit usage 64
+end
+put opn 0 ulong n
+end
+
+fn cantopen p ulong to void
+oputt nofile
+if eq p 1
+osrc
+else
+oout
+end
+oputb 10
+oflush 2
+exit 65
+end
+
+note ---- source text, read only to show the refused line ----
+note readsrc: a regular file returns every requested byte until its end, so passes stay far below the
+note bound; a source larger than the buffer is shown only as far as it was read.
+fn readsrc to void
+fd = fopen spath 0 get spn 0 0 0
+if lt fd 0
+cantopen 1
+end
+off = ulong 0
+k = long 1
+while and gt k 0 lt off len src bound 999999
+k = read int fd src off sub len src off
+if gt k 0
+off = add off ulong k
+end
+end
+put srcn 0 off
+r = fclose int fd
+end
+
+fn fdword o ulong to int
+x = ulong 0
+for i ulong 4
+v = ulong get fds add o i
+x = or x shl v mul i 8
+end
+ret int x
+end
+
+note ---- run the compiler: stdin SRC, stdout OUT, stderr into a pipe ----
+fn compile pl ulong to void
+sfd = fopen spath 0 get spn 0 0 0
+if lt sfd 0
+cantopen 1
+end
+ofd = fopen opath 0 get opn 0 577 448
+if lt ofd 0
+cantopen 2
+end
+r = pipefds fds 0 len fds 524288
+if ne r 0
+quit norun 65
+end
+rd = fdword 0
+wr = fdword 4
+pid = fork
+if lt pid 0
+quit norun 65
+end
+if eq pid 0
+q = dupfd int sfd 0 0
+q = dupfd int ofd 1 0
+q = dupfd wr 2 0
+q = execprog pk 0 pl
+w = write int 2 norun ulong 0 len norun
+exit int 99
+end
+r = fclose int sfd
+r = fclose int ofd
+r = fclose wr
+drain rd
+r = fclose rd
+r = waitpid int pid st 0 len st 0
+if ne r pid
+quit norun 65
+end
+end
+
+note drain: keep the first len ebuf bytes, read and drop the rest so the child never blocks on a full pipe.
+fn drain rd int to void
+off = ulong 0
+k = long 1
+while gt k 0 bound 999999
+if lt off len ebuf
+k = read rd ebuf off sub len ebuf off
+if gt k 0
+off = add off ulong k
+end
+else
+k = read rd junk 0 len junk
+end
+end
+put en 0 off
+end
+
+note ---- read "omc: line L: error C" ----
+fn digits p0 ulong to ulong
+v = ulong 0
+p = p0
+while and lt p get en 0 lt p add p0 20 bound 20
+c = get ebuf p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+end
+put gl 0 p
+ret v
+end
+
+fn hasat t view uchar * p0 ulong to bool
+if gt add p0 len t get en 0
+ret false
+end
+for i ulong len t
+if ne get ebuf add p0 i get t i
+ret false
+end
+end
+ret true
+end
+
+fn parse to bool
+if not hasat pre 0
+ret false
+end
+s = len pre
+l = digits s
+e = get gl 0
+if or eq e s not hasat mid e
+ret false
+end
+s = add e len mid
+c = digits s
+e = get gl 0
+if eq e s
+ret false
+end
+if ne e get en 0
+if ne get ebuf e 10
+ret false
+end
+end
+put gr 0 add e 1
+put gl 0 l
+put gc 0 c
+ret true
+end
+
+note ---- explain ----
+fn omean c ulong to void
+n = ulong 1
+for i ulong len means
+b = get means i
+if eq b 10
+n = add n 1
+else
+if eq n c
+oputb b
+end
+end
+end
+end
+
+note lstart: offset of the first byte of line l (1-based), or srcn when the file has no such line.
+fn lstart l ulong to ulong
+n = ulong 1
+i = ulong 0
+m = get srcn 0
+while and lt i m lt n l bound 8388608
+if eq get src i 10
+n = add n 1
+end
+i = add i 1
+end
+if lt n l
+ret m
+end
+ret i
+end
+
+fn oline l ulong to void
+for i ulong 4
+oputb 32
+end
+oputn l
+oputb 32
+oputb 124
+oputb 32
+s = lstart l
+m = get srcn 0
+if ge s m
+oputt eofmsg
+oputb 10
+ret
+end
+i = s
+while and lt i m lt sub i s 160 bound 160
+b = get src i
+if eq b 10
+break
+end
+oputb b
+i = add i 1
+end
+if and lt i m ne get src i 10
+oputt more
+end
+oputb 10
+end
+
+fn isnorun to bool
+if ne get en 0 len norun
+ret false
+end
+ret hasat norun 0
+end
+
+note rest: the lines after the human line (an om2 diag record), passed through unchanged.
+fn rest to void
+i = get gr 0
+while lt i get en 0 bound 4096
+oputb get ebuf i
+i = add i 1
+end
+end
+
+fn raw to void
+for i ulong get en 0
+oputb get ebuf i
+end
+n = get en 0
+if gt n 0
+if ne get ebuf sub n 1 10
+oputb 10
+end
+end
+end
+
+fn main to int
+args
+pl = mkpk
+if eq pl 0
+quit usage 64
+end
+readsrc
+compile pl
+sig = and get st 0 127
+if ne sig 0
+oputt sigmsg
+oputn ulong sig
+oputb 10
+oflush 2
+ret 66
+end
+code = get st 1
+if and eq code 99 isnorun
+quit norun 65
+end
+if eq code 0
+raw
+osrc
+oputt okmsg
+oout
+oputb 10
+oflush 1
+ret 0
+end
+if not parse
+raw
+oputt oddmsg
+oflush 2
+ret int code
+end
+if or ne get gc 0 ulong code gt get gc 0 30
+raw
+oputt oddmsg
+oflush 2
+ret int code
+end
+osrc
+oputb 58
+oputn get gl 0
+oputt mid
+oputn get gc 0
+oputb 58
+oputb 32
+omean get gc 0
+oputb 10
+oline get gl 0
+rest
+oflush 2
+ret int code
+end
