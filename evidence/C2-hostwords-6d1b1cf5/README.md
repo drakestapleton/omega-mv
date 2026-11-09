@@ -13,6 +13,8 @@ Base: omega-mv rad main `1e3ecbba779ee84e2de70ec231e83533a9c61f45`. Pinned compi
 - With the layered contract, omc 6d1b1cf5 passes every C2 manifest (`logs/layered-c2-6d1b1cf5.log`): frozen 5876/5876,
   capacity 3/3, batch2 3/3, fpvreg 8/8, closerange 4/4, hostwords 29/29. The committed manifests are not edited; `scripts/layer.sh` builds
   the layered copies in a scratch directory. The conductor is `seed/qualification/om2/gate.om` built by the same compiler (sha256 49914d72...).
+- Clean replay from `git archive f11ba3475` (this delta and code change; the next commit adds only this log and README line): seed/out/omc removed,
+  `sh seed/omega-from-seed.sh` rc 0, born omc 6d1b1cf5 equals the pin, same six results (`logs/clean-replay-f11ba3475.log`).
 - Negative control for the delta: omc be8c5130 (main 474197e4) on the same layered manifests fails hostwords 0/29, frozen 5847/5876
   (29 failures), batch2 1/3, closerange 0/4 (`logs/layered-c2-negative-be8c5130.log`).
 
