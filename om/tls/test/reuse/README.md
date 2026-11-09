@@ -13,7 +13,7 @@ sh om/tls/test/reuse/run.sh seed/out/omc
 
 `seed/host/check.sh` runs the same command. Exit: 0 PASS, 1 FAIL, 2 REFUSED, 3 INVALID (also when
 the verifier itself traps or is killed), 4 NOT_RUN. The last line on success is
-`REUSE PASS receipt=build/tls/reuse/receipt.txt sha256=<hex> controls=45 verifier-mutants=12/12`.
+`REUSE PASS receipt=build/tls/reuse/receipt.txt sha256=<hex> controls=47 verifier-mutants=13/13`.
 To re-check a stored receipt against the tree and its evidence files:
 
 ```
@@ -28,7 +28,7 @@ build/tls/reuse/verify < build/tls/reuse/receipt.txt
 | `vectors.txt` | the fixture: synthetic plaintexts, keys, nonces and the expected XOR (computed with Wolfram) |
 | `receipt.om` | receipt contract version 1 and the verifier: parsing, re-hashing, classification, verdict |
 | `verify.om` | the verifier program (`om2`, `om/tls/sha2.om`, `receipt.om`, `verify.om`) |
-| `controls.om` | 44 negative controls of the verifier and a last rerun of the untouched receipt (control 99) that proves every edited evidence file was restored (`om2`, `om/tls/sha2.om`, `receipt.om`, `controls.om`) |
+| `controls.om` | 46 negative controls of the verifier and a last rerun of the untouched receipt (control 99) that proves every edited evidence file was restored (`om2`, `om/tls/sha2.om`, `receipt.om`, `controls.om`) |
 | `run.sh` | orchestration: builds, runs each case under `env -i` and a 60 s deadline, writes facts; decides the verifier-mutant meta-gate |
 
 For the driver rows `run.sh` only records facts (exit codes, byte counts, sha256 of every unit,
@@ -51,7 +51,7 @@ exact comparison of the failed control numbers. The contract is written out at t
 | Gate 3: Aienux sealed-store rollback and nonce safety (aienux #445) | Aienux's own tests | outside this repository; NOT_RUN here |
 | Gate 3: Sovereign Core sealed KV nonce source and recovery (aien-sovereign-core-mv #708) | Sovereign Core's own tests | outside this repository; NOT_RUN here |
 | Gate 4: a named negative mutant per protection, observed failing assertion, control run | six driver mutants, each bound to the exact set of checks it must fail | EXERCISED, host |
-| Gate 4: build error, crash, timeout, missing executable or skipped test is INVALID or NOT_RUN | `receipt.om` classes; controls 13, 14, 16, 17, 19, 24-26, 38-40, 43 | EXERCISED, host |
+| Gate 4: build error, crash, timeout, missing executable or skipped test is INVALID or NOT_RUN | `receipt.om` classes; controls 13, 14, 16, 17, 19, 24-26, 38-40, 43, 45, 46 | EXERCISED, host |
 | Versioned fixture and receipt format | `CRYPTO-REUSE-RECEIPT 1` in `receipt.om` | IMPLEMENTED, EXERCISED |
 | Bind source commit, dirty state, compiler pin, binary, fixture digest, command, environment, expected and observed result, mutant identity, logs, checker version | `source`, `dirty`, `omc`, `driver`, `fixture`, `runner`, `env`, `row`, `checker` lines | IMPLEMENTED, EXERCISED |
 | Tampering, mismatched pins, stale inputs and missing evidence refused | controls 3-12, 27-37, 41, 42, 44 | EXERCISED, host |
@@ -83,6 +83,7 @@ listed controls; a survivor is FAIL, anything else INVALID, a missing site NOT_R
 | `any-failure-kills` | any failing mutant counts as caught | 18 |
 | `exit-not-checked` | a caught mutant need not exit 1 | 38 |
 | `repeated-check-counted` | a repeated `MISMATCH check N` line is accepted | 40 |
+| `log-leading-zero` | `MISMATCH check 06` is read as check 6 | 45 |
 | `verdict-claim-ignored` | a claimed verdict is not compared | 3 |
 | `class-claim-ignored` | a claimed class is not compared | 4 |
 | `fixture-not-rehashed` | the fixture is not compared | 7 |

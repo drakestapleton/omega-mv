@@ -150,6 +150,7 @@ vmut() { # $1 name, $2 receipt.om site (exactly once), $3 replacement, $4 the co
 }
 vmut log-hash-skipped 'ok = and ok rc_hrow i eout get qrw add b 6' 'ok = and ok true' '5 6'
 vmut any-failure-kills 'if and okk eq fset rc_want i' 'if okk' '18'
+vmut log-leading-zero 'if and gt sub e p 1 eq get qlb p 48' 'if false' '45'
 vmut exit-not-checked 'okk = and and eq ex 1 gt f 0 eq f m' 'okk = and gt f 0 eq f m' '38'
 vmut repeated-check-counted 'if ne and get qgs 17 bit 0' 'if false' '40'
 vmut verdict-claim-ignored 'rc_refuse 17' 'ret' '3'
