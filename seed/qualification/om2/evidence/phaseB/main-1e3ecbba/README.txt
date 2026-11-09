@@ -12,7 +12,8 @@ Comparison with the last recorded per-slice run (evidence/phaseB/s4-f6a6492f, S4
   s0s2 (sections 0-2)      161 PASS 0 FAIL 2 NOT_RUN   per-case verdicts identical
   s3s4 (sections 3-4)      202 PASS 0 FAIL 3 NOT_RUN   identical
   s4fuel (E14/E16)         8/8 PASS                    identical
-  s5s7 (sections 5-7)      99 PASS 0 FAIL 48 NOT_RUN   identical (48 = ABI-driver, OM-2 SHA and 2^64-1 rows)
+  s5s7 (sections 5-7)      99 PASS 0 FAIL 48 NOT_RUN   identical to s4-f6a6492f/s5s7-with-e17.log (147 rows;
+                                                       48 = ABI-driver, OM-2 SHA and 2^64-1 rows)
   S1 rotate mutants        26/26 PASS                  identical after the rol-reg-as-ror re-anchor
   S1 lexer/fmt/diag        6 PASS, 15 FAIL             identical (each FAIL is a killed mutant row)
   S2 mutants               9 PASS, 8 FAIL              identical (unroll+1 refused 21; fold-div0 survives
