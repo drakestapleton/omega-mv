@@ -19,9 +19,10 @@ and the Omega compiler's source (`seed/omc/`) were not read while writing it.** 
 only: the gate4 test list and test programs (`seed/rung4/gate4.sh`, `seed/rung4/tests/`), the referee
 runner's output format (`seed/check/runner.c`) and om3's refusal numbers (`seed/rung3/gate3.sh`).
 
-It is written in C. That is allowed here because it is an oracle: it sits outside the seed chain and
-never makes a byte of it, the same way gcc is used only as a referee in gate4. Nothing in `seed/`
-depends on it.
+**ORACLE.** `omega_ref.c` and `omega_next.c` are written in C. That is allowed here only because they are
+an independent oracle (pure-Omega directive of 2026-11-07, rule 4): they sit outside the seed chain, never
+make a byte of it and are never shipped, the same way gcc is used only as a referee in gate4. Nothing in
+`seed/` depends on them.
 
 ## How to use it
 
@@ -39,16 +40,37 @@ The gates read om4.bin, gate4.sh and the gate4 tests from `$SEED/rung4` and omc.
 
     SEED=/path/to/seed EVID=evidence/OMEGA-REF-SYNC sh tools/omega_ref/gate_ref.sh
 
-Point SEED at the seed tree of the compiler under test. On this branch `seed/` is still the tree from
-before the names pass (9.2: every signature read before any code, so a call may name a function written
-later); the sync of 2026-10-24 ran every gate with SEED at a checkout of `seed/omc-unified` (omc.om
-18d7e80b, om4.bin d0da40e4), logs in `evidence/OMEGA-REF-SYNC/`. The omc.om under this branch's own
-`seed/omc` (1e5542bc) is no longer a program of the current language: the current om4 and the interpreter
-both refuse it at line 908 with error 10 (a parameter named `cond` while a function `cond` exists, 9.2), so
-a default run of `gate_ddc.sh` here fails for that reason, not for a mismatch. `gate_ddc.sh` also takes `OMC_REF`
-(the branch to fetch omc.om and om4.bin from when `$SEED/omc/omc.om` is missing, default
-`origin/seed/omc-unified`) and `DDC_FLIP=<offset>`, which inverts one byte of stage 2 on purpose so the
-whole gate must end in FAIL (its negative control, run by hand).
+Point SEED at the seed tree of the compiler under test; the default `seed` is this tree's own. Since the
+sync of 2026-11-09 this tool is based on main, so the default run checks main's om4 and omc.om (below).
+The sync of 2026-10-24 ran every gate with SEED at a checkout of `seed/omc-unified` (omc.om 18d7e80b,
+om4.bin d0da40e4), logs in `evidence/OMEGA-REF-SYNC/`. `gate_ddc.sh` also takes `OMC_REF` (the branch to
+fetch omc.om and om4.bin from when `$SEED/omc/omc.om` is missing, default `origin/seed/omc-unified`) and
+`DDC_FLIP=<offset>`, which inverts one byte of stage 2 on purpose so the whole gate must end in FAIL (its
+negative control, run by hand). gate_ref.sh feeds the twins gate4's committed stdin fixture
+(`$SEED/rung4/tests/in.bin`) when the seed has one and then checks the twins' output against gate4's
+`fib.want`, `sort.want` and `bytecopy.want` (a `t_*.want` stays an exit status), and links the referee
+runner with `src/omega_om_units.c` as gate4 does since the SHA-256 cutover (#747).
+
+## Sync of 2026-11-09 (L423): main e63768a9
+
+All four gates with the default `SEED=seed` at omega-mv main e63768a9 (om4.bin bfc1cfd1, omc.om 7d802683,
+18,982 lines), logs in `evidence/OMEGA-REF-SYNC2/`. The interpreter needed no change for the language
+of this omc.om; the gate scripts needed the two seed-layout changes above.
+
+- gate_ref: 213 cases written, 213 run, all equal; GATE_REF PASS, RC=0. Negative control (signed div made
+  unsigned) caught on fm1; a copy of the seed with one byte added to fib.want makes the gate FAIL, RC=1.
+- probe_ref: 144 probes, PROBE_REF PASS, RC=0, with the same 4 known om4 differences (G5 lead_zero and
+  minus_zero, G8 rw_ulong, G18 regs17).
+- gate_next: fuzz over 41 files, 87,340 word prefixes and 200,547 cut words, one parse each; 800 of 800
+  mutants give om4's verdict and number; the 4 grammar negative controls are caught; GATE_NEXT PASS, RC=0.
+- gate_ddc: interp(omc.om, omc.om) = stage1(omc.om), 660,980 bytes, sha256 0f2de85153b0...ba6b02f, which
+  is the committed `seed/out/omc.sha256`; stage3 = stage2; GATE_DDC PASS, RC=0. `DDC_FLIP=100` ends in
+  GATE_DDC FAIL, RC=1 (`evidence/OMEGA-REF-SYNC2/ddc-flip-control/`).
+
+FR-12 (the spec-gap fixes in om4 and omc) is not on this main: om4 and omc both still accept `fn main to
+bool` (G4), `ret 07` and `ret -0` (G5), a tab (G13), a carriage return (G15) and writing the loop name in a
+`for` body (G17); only omc's G8 refusal (read/write on a non-uchar array, error 7) is in. When FR-12 lands,
+the interpreter must follow it and these gates rerun at that omc (ledger L423).
 
 ## The check (`tools/omega_ref/gate_ref.sh`)
 

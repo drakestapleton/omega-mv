@@ -19,7 +19,7 @@ sh tools/omega_ref/build.sh
 I=build/omega_ref/omega_ref
 [ -x build/omegese/omegese ] && [ -x build/omega_emit/omega_emit ] || { bad "C path tools not built"; exit 1; }
 quiet-build cc -O1 -Isrc -Isrc/compiler -o $B/runner $SEED/check/runner.c \
-  $(ls src/compiler/*.c | grep -v oscc_main.c) src/sha256.c
+  $(ls src/compiler/*.c | grep -v oscc_main.c) src/omega_om_units.c
 
 # 1. function mode: the 10 dev tasks and fm1-9. om4's words run by the referee runner; the interpreter
 #    calls the entry itself. Every input line is a case: value and raw x0, or the trap number.
@@ -47,8 +47,9 @@ for f in fm1 fm2 fm3 fm4 fm5 fm6 fm7 fm8 fm9; do
 done
 
 # 2. program mode: the 4 twins and the 9 trap/exit programs. Same stdin for both; exit status and every
-#    output byte must be equal.
-head -c 50000 /dev/urandom > $B/in.bin
+#    output byte must be equal. The stdin is gate4's committed fixture when the seed has one (then the
+#    twins' .want files are their expected output bytes, as gate4 reads them), else 50000 random bytes.
+if [ -f $X/in.bin ]; then cp $X/in.bin $B/in.bin; else head -c 50000 /dev/urandom > $B/in.bin; fi
 pmode() { # prog stdin
   p=$1; in=$2; written=$((written + 1)); run=$((run + 1))
   $R/om4.bin < $X/$p.om > $B/$p.elf; chmod +x $B/$p.elf
@@ -59,7 +60,11 @@ pmode() { # prog stdin
   if [ $rc1 = $rc2 ] && cmp -s $B/$p.om4.out $B/$p.ref.out; then
     say "PASS $p: exit $rc1, $(wc -c < $B/$p.ref.out) output bytes, interpreter = om4 ELF"
   else bad "$p: om4 ELF exit $rc1 ($(wc -c < $B/$p.om4.out) B), interpreter exit $rc2 ($(wc -c < $B/$p.ref.out) B)"; fi
-  [ -f $X/$p.want ] && { [ "$rc2" = "$(cat $X/$p.want)" ] || bad "$p: interpreter exit $rc2, the gate wants $(cat $X/$p.want)"; }
+  # A t_*.want holds the exit status; a twin's .want holds its expected output (gate4 section 5).
+  case $p in
+    t_*) [ -f $X/$p.want ] && { [ "$rc2" = "$(cat $X/$p.want)" ] || bad "$p: interpreter exit $rc2, the gate wants $(cat $X/$p.want)"; } ;;
+    *) [ -f $X/$p.want ] && [ $p != echo ] && { cmp -s $B/$p.ref.out $X/$p.want || bad "$p: interpreter output differs from gate4's $p.want"; } ;;
+  esac
   return 0
 }
 for p in fib sort echo bytecopy; do pmode $p $B/in.bin; done
