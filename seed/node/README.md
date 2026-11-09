@@ -1607,7 +1607,7 @@ ends the objective as FAIL with its reason; nothing is retried or repaired.
 | 12 | 7 turns used |
 | 13 | edit refused (old not exactly once, result outside the grammar, or the tool refused it) |
 | 14 | `Tests passed.` without a passing check |
-| 15 | the file checked or saved differs from the workflow's source or candidate |
+| 15 | the file checked or saved differs from the workflow's source or candidate, or the review (the fresh check of the saved file after `Tests passed.`) did not pass, which includes a test run killed at the tool's 2 s wall clock |
 | 16, 17 | inference or tool exited nonzero (no fallback) |
 | 18 | malformed record |
 | 19 | cancelled (operator `auth_cancel`, or the authority's cancel verdict) |
