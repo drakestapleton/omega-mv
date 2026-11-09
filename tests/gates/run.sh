@@ -696,6 +696,9 @@ case "$step" in
                       # SHA-256 is checked. The metadata test must pass and each recorded ECOSYSTEM663 mutant must
                       # exit 1; with native/autodiff664 present, its tape suite (test + 3 compiled mutants) and the
                       # C M21 fixture replay (CPU table, value-exact, mutant-sign control must FAIL) run too.
+                      # With native/retrieval present (L779), its 41-check verifier must pass, its three recorded
+                      # guard-removal mutants must exit 1, and the offline replay must reproduce packet-3.json
+                      # byte for byte and refuse the out-of-scope response with exit 10 and no evidence bytes.
     sha256sum -c seed/out/omc.sha256
     OMC="$ROOT/seed/out/omc"
     obs omc_sha256 "\"$(sha256sum < "$OMC" | cut -c1-64)\""
@@ -714,6 +717,29 @@ case "$step" in
     if [ -d native/autodiff664 ]; then
       OMC="$OMC" OUT="$ROOT/$nat/tape" sh tests/autodiff664/run-tape.sh
       make $NOPHYS test-autodiff-fixture FIXTURE=tests/fixtures/autodiff664/adtrain.fix
+    fi
+    if [ -d native/retrieval ]; then
+      ret=native/retrieval; rv="$nat/retrieval"; mkdir -p "$rv"
+      retsrc() { cat $ret/vendor/sha256.om $ret/vendor/json.om $ret/src/pins.om $ret/src/codec.om "$1" \
+        $ret/src/request.om $ret/src/packet.om $ret/src/pack.om "$2"; }
+      retsrc $ret/src/verify.om $ret/tests/verify.om > "$rv/verify.om"
+      native_build "$rv/verify.om" "$rv/verify.elf"
+      [ "$("$rv/verify.elf")" = '{"checks":41,"failures":0}' ]
+      for m in identity authority scope; do
+        cp $ret/src/verify.om "$rv/verify-$m.om"
+        patch -s "$rv/verify-$m.om" < $ret/evidence/mutant-$m.diff
+        retsrc "$rv/verify-$m.om" $ret/tests/verify.om > "$rv/mutant.om"
+        native_build "$rv/mutant.om" "$rv/mutant.elf"
+        rc=0; "$rv/mutant.elf" > /dev/null 2>&1 || rc=$?
+        [ "$rc" = 1 ] || { echo "run.sh: retrieval mutant $m was not rejected (exit $rc, need 1)" >&2; exit 1; }
+        echo "retrieval mutant $m: exit 1 as required"
+      done
+      retsrc $ret/src/verify.om $ret/tests/replay.om > "$rv/replay.om"
+      native_build "$rv/replay.om" "$rv/replay.elf"
+      "$rv/replay.elf" < $ret/evidence/search.response | cmp - $ret/evidence/packet-3.json
+      rc=0; "$rv/replay.elf" < $ret/evidence/scope.response > "$rv/scope.out" || rc=$?
+      [ "$rc" = 10 ] && [ ! -s "$rv/scope.out" ] || { echo "run.sh: retrieval scope refusal exit $rc" >&2; exit 1; }
+      echo "RETRIEVAL PASS checks=41 mutants=3/3 packet-3 exact scope-refusal 10"
     fi
     ;;
   trinary)            # T-002 trit/codebook signal tools (tools/trit, tools/codebook), host only, no device. Built by the
