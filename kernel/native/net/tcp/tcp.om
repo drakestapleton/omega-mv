@@ -1,0 +1,1356 @@
+note tcp.om: native TCP over IPv4 and ARP for native/net (ledger L232). Seeded Omega.
+note RFC 9293 TCP, RFC 6298 RTO, RFC 5681 and RFC 6582 congestion control with
+note NewReno recovery, RFC 5961 RST/SYN/ACK hardening, RFC 826 ARP, RFC 791 IPv4.
+note One connection block (Tcb) plus one passive port. No heap: fixed rings.
+note Frames are Ethernet II without FCS, at most 2048 bytes, in Trx (input) and
+note Ttx (output). The embedding unit defines fn tlinkout n ulong to void, which
+note transmits Ttx[0..n). The caller supplies monotonic milliseconds to tstep.
+note Application bytes cross Tapp: twrite copies Tapp[0..n) into the send ring,
+note tread copies received in-order bytes into Tapp[0..n).
+note Limits: no IPv4 options are sent; received options are skipped; fragments
+note are refused; no window scaling, SACK or timestamps; receive window 65535.
+note ARP is unauthenticated (RFC 826): a frame that claims an address is believed.
+global Trx uchar 2048
+global Ttx uchar 2048
+global Tmac uchar 6
+global Tapp uchar 65536
+global Tsbuf uchar 65536
+global Trbuf uchar 65536
+global Trmap uchar 65536
+note Tcf: 0 now ms, 1 own IPv4, 2 gateway, 3 netmask, 4 next IPv4 id, 5 PRNG state,
+note 6 gateway ARP due, 7 window being sent, 8 2MSL ms, 9 own MSS, 10 minimum RTO,
+note 11 ARP rotation, 12 address being resolved, 13 maximum retries.
+global Tcf ulong 16
+note Tarp: four entries of ip, mac (48 bits), valid.
+global Tarp ulong 12
+note Tpk (parsed input): 0 frame length, 4 source, 5 destination, 6 TCP offset,
+note 7 TCP length, 8 seq, 9 ack, 10 flags, 11 data offset, 12 data length,
+note 13 window, 14 header length.
+global Tpk ulong 16
+global Tcb ulong 48
+note Tst counters: 0 frames, 1 bad ethernet, 2 arp, 3 bad ip header, 4 bad ip sum,
+note 5 fragment, 6 not ours, 7 bad tcp length/offset, 8 bad tcp sum, 9 reset sent,
+note 10 unacceptable seq, 11 rst challenged, 12 syn challenged, 13 ack too new,
+note 14 ack too old, 15 bad options, 16 timeouts, 17 fast retransmits,
+note 18 segments sent, 19 bytes delivered, 20 duplicate or outside bytes,
+note 21 bytes stored, 22 arp requests, 23 unresolved drops, 24 resets accepted,
+note 25 duplicate acks, 26 other protocol, 27 martian source, 28 other ethertype,
+note 29 data refused by state, 30 transmit errors, 31 data beyond FIN.
+global Tst ulong 32
+const kST ulong 0
+const kLP ulong 1
+const kRP ulong 2
+const kRIP ulong 3
+const kISS ulong 4
+const kUNA ulong 5
+const kNXT ulong 6
+const kSWN ulong 7
+const kWL1 ulong 8
+const kWL2 ulong 9
+const kMAX ulong 10
+const kIRS ulong 11
+const kRNX ulong 12
+const kMSS ulong 13
+const kCWN ulong 14
+const kSST ulong 15
+const kDUP ulong 16
+const kRTO ulong 17
+const kSRT ulong 18
+const kRVR ulong 19
+const kRSQ ulong 20
+const kRAT ulong 21
+const kRTX ulong 22
+const kTRY ulong 23
+const kSCN ulong 24
+const kSHD ulong 25
+const kFWN ulong 26
+const kFSN ulong 27
+const kFSQ ulong 28
+const kPFN ulong 29
+const kRHD ulong 30
+const kRCN ulong 31
+const kACK ulong 32
+const kTWA ulong 33
+const kPRS ulong 34
+const kERR ulong 35
+const kREC ulong 36
+const kOFQ ulong 37
+const kOFF ulong 38
+const kSYA ulong 39
+const kLAD ulong 40
+const kFRX ulong 41
+const kEST ulong 42
+note kPAS: the block came from LISTEN, so a reset in syn-received returns to LISTEN.
+const kPAS ulong 43
+note States: 0 closed, 1 listen, 2 syn-sent, 3 syn-received, 4 established,
+note 5 fin-wait-1, 6 fin-wait-2, 7 close-wait, 8 closing, 9 last-ack, 10 time-wait.
+note kERR: 0 none, 1 reset by peer, 2 refused, 3 retransmission limit.
+const tNOMAC ulong 281474976710656
+const tBCAST ulong 281474976710655
+fn tstat k ulong to void
+put Tst k add get Tst k 1
+end
+fn tr16 p ulong to ulong
+ret add shl ulong get Trx p 8 ulong get Trx add p 1
+end
+fn tr32 p ulong to ulong
+ret add shl tr16 p 16 tr16 add p 2
+end
+fn tw16 p ulong v ulong to void
+put Ttx p uchar and shr v 8 255
+put Ttx add p 1 uchar and v 255
+end
+fn tw32 p ulong v ulong to void
+tw16 p and shr v 16 65535
+tw16 add p 2 and v 65535
+end
+fn trmac p ulong to ulong
+ret add shl tr16 p 32 tr32 add p 2
+end
+fn twmac p ulong m ulong to void
+tw16 p and shr m 32 65535
+tw32 add p 2 and m 4294967295
+end
+fn tmymac to ulong
+v = ulong 0
+for i ulong 6
+v = add shl v 8 ulong get Tmac i
+end
+ret v
+end
+note Sequence arithmetic modulo 2^32.
+fn sadd a ulong b ulong to ulong
+ret and add a b 4294967295
+end
+fn sdif a ulong b ulong to ulong
+ret and sub add a 4294967296 and b 4294967295 4294967295
+end
+fn slt a ulong b ulong to bool
+ret gt sdif a b 2147483647
+end
+fn sle a ulong b ulong to bool
+ret not slt b a
+end
+fn umin a ulong b ulong to ulong
+if lt a b
+ret a
+end
+ret b
+end
+fn umax a ulong b ulong to ulong
+if gt a b
+ret a
+end
+ret b
+end
+fn tsumr p ulong n ulong to ulong
+s = ulong 0
+while ge n 2 bound 1024
+s = add s tr16 p
+p = add p 2
+n = sub n 2
+end
+if eq n 1
+s = add s shl ulong get Trx p 8
+end
+ret s
+end
+fn tsumt p ulong n ulong to ulong
+s = ulong 0
+while ge n 2 bound 1024
+s = add s shl ulong get Ttx p 8
+s = add s ulong get Ttx add p 1
+p = add p 2
+n = sub n 2
+end
+if eq n 1
+s = add s shl ulong get Ttx p 8
+end
+ret s
+end
+fn tfold s ulong to ulong
+while gt s 65535 bound 8
+s = add and s 65535 shr s 16
+end
+ret xor s 65535
+end
+fn tpsum a ulong b ulong n ulong to ulong
+s = add shr a 16 and a 65535
+s = add s shr b 16
+s = add s and b 65535
+ret add add s 6 n
+end
+fn trnd to ulong
+x = get Tcf 5
+if eq x 0
+x = ulong 88172645463325252
+end
+x = xor x shl x 13
+x = xor x shr x 7
+x = xor x shl x 17
+put Tcf 5 x
+ret x
+end
+note Unicast, routable source: not 0/8, 127/8, multicast, limited or subnet broadcast.
+fn tipok ip ulong to bool
+x = shr ip 24
+if or eq x 0 eq x 127
+ret false
+end
+if ge x 224
+ret false
+end
+h = and not get Tcf 3 4294967295
+if eq and ip h h
+ret false
+end
+ret ne ip get Tcf 1
+end
+fn tnhop ip ulong to ulong
+m = get Tcf 3
+if eq and ip m and get Tcf 1 m
+ret ip
+end
+ret get Tcf 2
+end
+fn tarpget ip ulong to ulong
+for k ulong 4
+b = mul k 3
+if eq get Tarp b ip
+if ne get Tarp add b 2 0
+ret get Tarp add b 1
+end
+end
+end
+ret tNOMAC
+end
+note Refresh an entry; insert only when force (the frame was addressed to us or answers our request).
+fn tarpset ip ulong mac ulong force bool to void
+for k ulong 4
+b = mul k 3
+if eq get Tarp b ip
+if ne get Tarp add b 2 0
+put Tarp add b 1 mac
+ret
+end
+end
+end
+if not force
+ret
+end
+for k ulong 4
+b = mul k 3
+if eq get Tarp add b 2 0
+put Tarp b ip
+put Tarp add b 1 mac
+put Tarp add b 2 1
+ret
+end
+end
+r = and get Tcf 11 3
+put Tcf 11 add get Tcf 11 1
+b = mul r 3
+put Tarp b ip
+put Tarp add b 1 mac
+put Tarp add b 2 1
+end
+fn teth dst ulong typ ulong to void
+twmac 0 dst
+twmac 6 tmymac
+tw16 12 typ
+end
+fn tpad n ulong to ulong
+if ge n 60
+ret n
+end
+for i ulong sub 60 n bound 60
+put Ttx add n i 0
+end
+ret 60
+end
+fn tarpmsg op ulong tha ulong tpa ulong to void
+tw16 14 1
+tw16 16 2048
+put Ttx 18 6
+put Ttx 19 4
+tw16 20 op
+twmac 22 tmymac
+tw32 28 get Tcf 1
+twmac 32 tha
+tw32 38 tpa
+tlinkout tpad 42
+end
+fn tarpreq ip ulong to void
+teth tBCAST 2054
+put Tcf 12 ip
+tstat 22
+tarpmsg 1 0 ip
+end
+fn tarpin n ulong to void
+tstat 2
+if lt n 42
+ret
+end
+if ne tr16 14 1
+ret
+end
+if ne tr16 16 2048
+ret
+end
+if ne tr16 18 1540
+ret
+end
+op = tr16 20
+sha = trmac 22
+spa = tr32 28
+tpa = tr32 38
+if not tipok spa
+tstat 27
+ret
+end
+if ne and shr sha 40 1 0
+tstat 27
+ret
+end
+if eq tpa get Tcf 1
+tarpset spa sha true
+if eq op 1
+teth sha 2054
+tarpmsg 2 sha spa
+end
+ret
+end
+if eq op 2
+if eq spa get Tcf 12
+tarpset spa sha true
+ret
+end
+end
+tarpset spa sha false
+end
+note Ttx[34..34+n) holds a TCP segment whose checksum field is zero. Adds the
+note IPv4 header, the TCP checksum and Ethernet, then transmits; with no
+note next-hop address it sends an ARP request instead and drops the segment.
+fn tipsend dst ulong n ulong to void
+nh = tnhop dst
+mac = tarpget nh
+if eq mac tNOMAC
+tstat 23
+tarpreq nh
+ret
+end
+me = get Tcf 1
+s = tpsum me dst n
+tw16 50 tfold add s tsumt 34 n
+put Ttx 14 69
+put Ttx 15 0
+tw16 16 add 20 n
+tw16 18 and get Tcf 4 65535
+put Tcf 4 add get Tcf 4 1
+tw16 20 16384
+put Ttx 22 64
+put Ttx 23 6
+tw16 24 0
+tw32 26 me
+tw32 30 dst
+tw16 24 tfold tsumt 14 20
+teth mac 2048
+tstat 18
+tlinkout tpad add 34 n
+end
+fn thdr lp ulong rp ulong seq ulong ack ulong flags ulong opt ulong to void
+tw16 34 lp
+tw16 36 rp
+tw32 38 seq
+tw32 42 ack
+put Ttx 46 uchar shl add 5 shr opt 2 4
+put Ttx 47 uchar and flags 255
+tw16 48 get Tcf 7
+tw16 50 0
+tw16 52 0
+if eq opt 4
+put Ttx 54 2
+put Ttx 55 4
+tw16 56 get Tcf 9
+end
+end
+fn trwnd to ulong
+ret sub 65535 get Tcb kRCN
+end
+note Send one segment of the connection: n data bytes from the send ring at seq.
+fn tsend seq ulong flags ulong n ulong to void
+opt = ulong 0
+if ne and flags 2 0
+opt = ulong 4
+end
+tsetwin
+thdr get Tcb kLP get Tcb kRP seq tackval flags flags opt
+tcopy add 54 opt add get Tcb kSHD sdif seq get Tcb kUNA n
+tipsend get Tcb kRIP add add 20 opt n
+end
+fn tsetwin to void
+w = trwnd
+put Tcf 7 w
+put Tcb kLAD w
+end
+fn tackval flags ulong to ulong
+if eq and flags 16 0
+ret 0
+end
+put Tcb kACK 0
+ret get Tcb kRNX
+end
+fn tcopy h ulong b ulong n ulong to void
+for i ulong n bound 1460
+put Ttx add h i get Tsbuf and add b i 65535
+end
+end
+note RFC 9293 3.10.7.1: answer a segment that has no connection.
+fn trstout to void
+f = get Tpk 10
+if ne and f 4 0
+ret
+end
+p = get Tpk 6
+put Tcf 7 0
+if ne and f 16 0
+thdr tr16 add p 2 tr16 p get Tpk 9 0 4 0
+else
+n = get Tpk 12
+if ne and f 2 0
+n = add n 1
+end
+if ne and f 1 0
+n = add n 1
+end
+thdr tr16 add p 2 tr16 p 0 sadd get Tpk 8 n 20 0
+end
+tstat 9
+tipsend get Tpk 4 20
+end
+fn tclear to void
+for i ulong 48
+put Tcb i 0
+end
+for i ulong 65536
+put Trmap i 0
+end
+end
+fn tinit to void
+tclear
+put Tcf 6 0
+if eq get Tcf 9 0
+put Tcf 9 1460
+end
+note Data segments are copied with a 1460-byte bound (tcopy, tstore).
+put Tcf 9 umin get Tcf 9 1460
+if eq get Tcf 10 0
+put Tcf 10 200
+end
+if eq get Tcf 8 0
+put Tcf 8 1000
+end
+if eq get Tcf 13 0
+put Tcf 13 12
+end
+end
+fn tfresh lp ulong to void
+tclear
+put Tcb kLP lp
+put Tcb kMSS 536
+put Tcb kRTO 1000
+put Tcb kSST 262144
+put Tcb kCWN 5360
+end
+fn tsetiss to void
+i = and trnd 4294967295
+put Tcb kISS i
+put Tcb kUNA i
+put Tcb kNXT sadd i 1
+put Tcb kMAX sadd i 1
+end
+fn tarm to void
+put Tcb kRTX add get Tcf 0 get Tcb kRTO
+end
+fn tlisten port ulong to void
+tfresh port
+put Tcb kST 1
+end
+fn tconnect ip ulong rport ulong lport ulong to void
+tfresh lport
+put Tcb kRIP ip
+put Tcb kRP rport
+tsetiss
+put Tcb kST 2
+tsend get Tcb kISS 2 0
+tarm
+put Tcb kRSQ sadd get Tcb kISS 1
+put Tcb kRAT umax get Tcf 0 1
+end
+fn tdrop code ulong to void
+if eq get Tcb kERR 0
+put Tcb kERR code
+end
+put Tcb kST 0
+put Tcb kRTX 0
+put Tcb kPRS 0
+end
+fn tclose to void
+s = get Tcb kST
+if le s 2
+tdrop 0
+ret
+end
+put Tcb kFWN 1
+end
+note SYN options: maximum segment size; others skipped; malformed lists refuse the SYN.
+fn topts to bool
+p = add get Tpk 6 20
+e = get Tpk 11
+m = ulong 536
+while lt p e bound 40
+k = get Trx p
+if eq k 0
+break
+end
+if eq k 1
+p = add p 1
+continue
+end
+if ge add p 1 e
+ret false
+end
+o = ulong get Trx add p 1
+if lt o 2
+ret false
+end
+if gt add p o e
+ret false
+end
+if eq k 2
+if ne o 4
+ret false
+end
+m = tr16 add p 2
+end
+p = add p o
+end
+m = umax m 64
+m = umin m get Tcf 9
+put Tcb kMSS m
+put Tcb kCWN mul 10 m
+ret true
+end
+fn tlistin to void
+f = get Tpk 10
+if ne and f 4 0
+ret
+end
+if ne and f 16 0
+trstout
+ret
+end
+if eq and f 2 0
+ret
+end
+if ne and f 1 0
+ret
+end
+if not topts
+tstat 15
+ret
+end
+p = get Tpk 6
+put Tcb kRP tr16 p
+put Tcb kRIP get Tpk 4
+put Tcb kIRS get Tpk 8
+put Tcb kRNX sadd get Tpk 8 1
+put Tcb kSWN get Tpk 13
+put Tcb kWL1 get Tpk 8
+tsetiss
+put Tcb kWL2 get Tcb kISS
+put Tcb kST 3
+put Tcb kPAS 1
+tsend get Tcb kISS 18 0
+tarm
+put Tcb kRSQ sadd get Tcb kISS 1
+put Tcb kRAT umax get Tcf 0 1
+end
+fn tsample r ulong to void
+r = umin r 60000
+if eq get Tcb kSRT 0
+put Tcb kSRT umax mul r 8 1
+put Tcb kRVR mul r 2
+else
+s = div get Tcb kSRT 8
+d = sub r s
+if lt r s
+d = sub s r
+end
+v = get Tcb kRVR
+put Tcb kRVR add sub v div v 4 d
+w = get Tcb kSRT
+put Tcb kSRT umax add sub w div w 8 r 1
+end
+o = add div get Tcb kSRT 8 umax get Tcb kRVR 1
+o = umax o get Tcf 10
+put Tcb kRTO umin o 60000
+end
+fn tgrow n ulong to void
+c = get Tcb kCWN
+m = get Tcb kMSS
+if lt c get Tcb kSST
+c = add c umin n m
+else
+c = add c umax div mul m m c 1
+end
+put Tcb kCWN umin c 262144
+end
+note Retransmit one segment at the oldest unacknowledged sequence (data, else FIN).
+fn tretx1 to void
+n = umin get Tcb kSCN get Tcb kMSS
+u = get Tcb kUNA
+if gt n 0
+tsend u 24 n
+ret
+end
+if ne get Tcb kFSN 0
+if eq u get Tcb kFSQ
+tsend u 17 0
+end
+end
+end
+fn tnewack ack ulong to void
+n = sdif ack get Tcb kUNA
+if eq get Tcb kSYA 0
+put Tcb kSYA 1
+put Tcb kUNA sadd get Tcb kUNA 1
+n = sub n 1
+end
+d = umin n get Tcb kSCN
+put Tcb kSHD and add get Tcb kSHD d 65535
+put Tcb kSCN sub get Tcb kSCN d
+put Tcb kUNA sadd get Tcb kUNA d
+if gt sub n d 0
+put Tcb kUNA sadd get Tcb kUNA sub n d
+end
+if slt get Tcb kNXT get Tcb kUNA
+put Tcb kNXT get Tcb kUNA
+end
+if ne get Tcb kRAT 0
+if sle get Tcb kRSQ ack
+tsample sub get Tcf 0 get Tcb kRAT
+put Tcb kRAT 0
+end
+end
+if ne get Tcb kFRX 0
+if sle get Tcb kREC ack
+put Tcb kFRX 0
+put Tcb kCWN get Tcb kSST
+else
+tretx1
+c = sub get Tcb kCWN umin d get Tcb kCWN
+put Tcb kCWN add c get Tcb kMSS
+end
+else
+tgrow d
+end
+put Tcb kDUP 0
+put Tcb kTRY 0
+if eq get Tcb kUNA get Tcb kMAX
+put Tcb kRTX 0
+else
+tarm
+end
+end
+fn tdupchk to void
+if ne get Tpk 12 0
+ret
+end
+if ne and get Tpk 10 3 0
+ret
+end
+if ne get Tpk 13 get Tcb kSWN
+ret
+end
+if eq get Tcb kUNA get Tcb kMAX
+ret
+end
+tstat 25
+k = add get Tcb kDUP 1
+put Tcb kDUP k
+m = get Tcb kMSS
+if eq k 3
+if eq get Tcb kFRX 0
+f = sdif get Tcb kMAX get Tcb kUNA
+put Tcb kSST umax div f 2 mul 2 m
+put Tcb kREC get Tcb kMAX
+put Tcb kFRX 1
+put Tcb kRAT 0
+tstat 17
+tretx1
+put Tcb kCWN add get Tcb kSST mul 3 m
+end
+ret
+end
+if gt k 3
+if ne get Tcb kFRX 0
+put Tcb kCWN umin add get Tcb kCWN m 262144
+end
+end
+end
+fn twinupd to void
+s = get Tpk 8
+a = get Tpk 9
+w1 = get Tcb kWL1
+if or slt w1 s and eq w1 s sle get Tcb kWL2 a
+put Tcb kSWN get Tpk 13
+put Tcb kWL1 s
+put Tcb kWL2 a
+end
+end
+fn tfinacked to bool
+if eq get Tcb kFSN 0
+ret false
+end
+ret eq get Tcb kUNA sadd get Tcb kFSQ 1
+end
+fn ttimewait to void
+put Tcb kST 10
+put Tcb kRTX 0
+put Tcb kTWA add get Tcf 0 get Tcf 8
+end
+note ACK processing (RFC 9293 3.10.7.4 fifth check, RFC 5961 section 5).
+fn tackin to bool
+st = get Tcb kST
+a = get Tpk 9
+u = get Tcb kUNA
+x = get Tcb kMAX
+if eq st 3
+if or sle a u slt x a
+trstout
+ret false
+end
+put Tcb kST 4
+put Tcb kEST 1
+end
+if slt x a
+put Tcb kACK 1
+tstat 13
+ret false
+end
+if slt a sdif u 65535
+put Tcb kACK 1
+tstat 14
+ret false
+end
+if slt u a
+tnewack a
+else
+if eq a u
+tdupchk
+end
+end
+twinupd
+st = get Tcb kST
+if eq st 5
+if tfinacked
+put Tcb kST 6
+end
+end
+if eq st 8
+if tfinacked
+ttimewait
+end
+end
+if eq st 9
+if tfinacked
+tdrop 0
+ret false
+end
+end
+ret true
+end
+fn tinwin s ulong b ulong w ulong to bool
+ret lt sdif s b w
+end
+note First check of RFC 9293 3.10.7.4. A zero window admits only seq = RCV.NXT.
+fn tseqok to bool
+s = get Tpk 8
+n = get Tpk 12
+f = get Tpk 10
+if ne and f 2 0
+n = add n 1
+end
+if ne and f 1 0
+n = add n 1
+end
+w = trwnd
+r = get Tcb kRNX
+if eq w 0
+ret eq s r
+end
+if eq n 0
+ret tinwin s r w
+end
+if tinwin s r w
+ret true
+end
+ret tinwin sadd s sub n 1 r w
+end
+fn tfinacc to void
+put Tcb kOFF 0
+put Tcb kPFN 1
+put Tcb kRNX sadd get Tcb kRNX 1
+put Tcb kACK 1
+st = get Tcb kST
+if eq st 4
+put Tcb kST 7
+ret
+end
+if eq st 5
+if tfinacked
+ttimewait
+else
+put Tcb kST 8
+end
+ret
+end
+if eq st 6
+ttimewait
+end
+end
+fn tdrain to void
+r = get Tcb kRNX
+c = get Tcb kRCN
+b = and add get Tcb kRHD c 65535
+k = ulong 0
+while lt c 65535 bound 65536
+if eq get Trmap b 0
+break
+end
+put Trmap b 0
+c = add c 1
+k = add k 1
+r = sadd r 1
+b = and add b 1 65535
+end
+put Tcb kRCN c
+put Tcb kRNX r
+put Tst 19 add get Tst 19 k
+if ne get Tcb kOFF 0
+if eq get Tcb kOFQ r
+tfinacc
+end
+end
+end
+fn tdata to void
+st = get Tcb kST
+if or lt st 4 gt st 6
+tstat 29
+ret
+end
+if ne get Tcb kPFN 0
+tstat 29
+ret
+end
+r = get Tcb kRNX
+w = trwnd
+if ne get Tcb kOFF 0
+w = umin w sdif get Tcb kOFQ r
+end
+tstore sdif get Tpk 8 r get Tpk 11 w get Tpk 12
+put Tcb kACK 1
+tdrain
+end
+note Store payload bytes whose offset from RCV.NXT is below w; the first copy wins.
+fn tstore d0 ulong o ulong w ulong n ulong to void
+b = and add get Tcb kRHD get Tcb kRCN 65535
+for i ulong n bound 2048
+d = and add d0 i 4294967295
+if lt d w
+q = and add b d 65535
+if eq get Trmap q 0
+put Trbuf q get Trx add o i
+put Trmap q 1
+tstat 21
+else
+tstat 20
+end
+else
+tstat 20
+end
+end
+end
+fn tfinin to void
+st = get Tcb kST
+if ne get Tcb kPFN 0
+put Tcb kACK 1
+ret
+end
+if or lt st 4 gt st 6
+ret
+end
+f = sadd get Tpk 8 get Tpk 12
+r = get Tcb kRNX
+if ne get Tcb kOFF 0
+if ne f get Tcb kOFQ
+tstat 31
+ret
+end
+end
+if ge sdif f r trwnd
+put Tcb kACK 1
+ret
+end
+put Tcb kOFF 1
+put Tcb kOFQ f
+put Tcb kACK 1
+if eq f r
+tfinacc
+end
+end
+fn tsynsent to void
+f = get Tpk 10
+a = get Tpk 9
+ha = ne and f 16 0
+if ha
+if or sle a get Tcb kISS slt get Tcb kNXT a
+if eq and f 4 0
+trstout
+end
+ret
+end
+end
+if ne and f 4 0
+if ha
+tdrop 2
+end
+ret
+end
+if eq and f 2 0
+ret
+end
+if not topts
+tstat 15
+ret
+end
+s = get Tpk 8
+put Tcb kIRS s
+put Tcb kRNX sadd s 1
+put Tcb kWL1 s
+put Tcb kWL2 a
+put Tcb kSWN get Tpk 13
+if ha
+put Tcb kUNA a
+put Tcb kSYA 1
+put Tcb kST 4
+put Tcb kEST 1
+put Tcb kACK 1
+put Tcb kRTX 0
+put Tcb kTRY 0
+if ne get Tcb kRAT 0
+tsample sub get Tcf 0 get Tcb kRAT
+put Tcb kRAT 0
+end
+ret
+end
+put Tcb kST 3
+tsend get Tcb kISS 18 0
+tarm
+end
+note A duplicate SYN in syn-received is an unacceptable segment and gets the plain
+note ACK of RFC 9293 3.10.7.4; a lost SYN-ACK is recovered by its retransmit timer.
+fn tconn to void
+st = get Tcb kST
+if eq st 2
+tsynsent
+ret
+end
+f = get Tpk 10
+s = get Tpk 8
+if not tseqok
+if eq and f 4 0
+put Tcb kACK 1
+end
+tstat 10
+note RFC 9293 3.10.7.4: with a zero receive window, still process a valid ACK.
+if eq trwnd 0
+if eq and f 22 16
+b = tackin
+end
+end
+note A retransmitted FIN in TIME-WAIT restarts the 2MSL timer (RFC 9293 3.10.7.4).
+if eq st 10
+if eq and f 5 1
+put Tcb kTWA add get Tcf 0 get Tcf 8
+end
+end
+ret
+end
+note RST: TIME-WAIT ignores it (RFC 1337); CLOSING and LAST-ACK close without an
+note error (RFC 9293 3.10.7.4); a passive syn-received block returns to LISTEN
+note and an active one reports refused.
+if ne and f 4 0
+if eq st 10
+ret
+end
+if eq s get Tcb kRNX
+tstat 24
+if and eq st 3 ne get Tcb kPAS 0
+tlisten get Tcb kLP
+ret
+end
+if or eq st 8 eq st 9
+tdrop 0
+ret
+end
+if eq st 3
+tdrop 2
+ret
+end
+tdrop 1
+ret
+end
+put Tcb kACK 1
+tstat 11
+ret
+end
+if ne and f 2 0
+put Tcb kACK 1
+tstat 12
+ret
+end
+if eq and f 16 0
+ret
+end
+if not tackin
+ret
+end
+if gt get Tpk 12 0
+tdata
+end
+if ne and f 1 0
+tfinin
+end
+end
+fn ttcpin to void
+p = get Tpk 6
+l = get Tpk 7
+if lt l 20
+tstat 7
+ret
+end
+s = tpsum get Tpk 4 get Tpk 5 l
+if ne tfold add s tsumr p l 0
+tstat 8
+ret
+end
+h = mul ulong shr get Trx add p 12 4 4
+if or lt h 20 gt h l
+tstat 7
+ret
+end
+put Tpk 8 tr32 add p 4
+put Tpk 9 tr32 add p 8
+put Tpk 10 ulong get Trx add p 13
+put Tpk 11 add p h
+put Tpk 12 sub l h
+put Tpk 13 tr16 add p 14
+put Tpk 14 h
+sp = tr16 p
+dp = tr16 add p 2
+if or eq sp 0 eq dp 0
+tstat 7
+ret
+end
+st = get Tcb kST
+if gt st 1
+if eq dp get Tcb kLP
+if eq sp get Tcb kRP
+if eq get Tpk 4 get Tcb kRIP
+tconn
+ret
+end
+end
+end
+end
+if eq st 1
+if eq dp get Tcb kLP
+tlistin
+ret
+end
+end
+trstout
+end
+fn tipin n ulong to void
+if lt n 34
+tstat 3
+ret
+end
+v = ulong get Trx 14
+h = mul and v 15 4
+if or ne shr v 4 4 lt h 20
+tstat 3
+ret
+end
+t = tr16 16
+if or lt t h gt t sub n 14
+tstat 3
+ret
+end
+if ne tfold tsumr 14 h 0
+tstat 4
+ret
+end
+if ne and tr16 20 16383 0
+tstat 5
+ret
+end
+if ne tr32 30 get Tcf 1
+tstat 6
+ret
+end
+src = tr32 26
+if not tipok src
+tstat 27
+ret
+end
+if ne get Trx 23 6
+tstat 26
+ret
+end
+put Tpk 4 src
+put Tpk 5 tr32 30
+put Tpk 6 add 14 h
+put Tpk 7 sub t h
+ttcpin
+end
+fn tinput n ulong to void
+tstat 0
+if or lt n 14 gt n 2048
+tstat 1
+ret
+end
+d = trmac 0
+if ne d tmymac
+if ne d tBCAST
+tstat 1
+ret
+end
+end
+y = tr16 12
+put Tpk 0 n
+if eq y 2054
+tarpin n
+ret
+end
+if eq y 2048
+tipin n
+ret
+end
+tstat 28
+end
+note Unsent data bytes in the send ring.
+fn tavail to ulong
+e = sadd get Tcb kUNA get Tcb kSCN
+n = get Tcb kNXT
+if slt n e
+ret sdif e n
+end
+ret 0
+end
+fn tcansend to bool
+s = get Tcb kST
+if or eq s 4 eq s 5
+ret true
+end
+if or eq s 7 eq s 8
+ret true
+end
+ret eq s 9
+end
+fn tpush to void
+if not tcansend
+ret
+end
+l = umin get Tcb kCWN get Tcb kSWN
+while true bound 64
+v = tavail
+if gt v 0
+f = sdif get Tcb kNXT get Tcb kUNA
+if ge f l
+ret
+end
+n = umin umin v get Tcb kMSS sub l f
+x = get Tcb kNXT
+tsend x 24 n
+if sle get Tcb kMAX x
+if eq get Tcb kRAT 0
+put Tcb kRSQ sadd x n
+put Tcb kRAT umax get Tcf 0 1
+end
+end
+put Tcb kNXT sadd x n
+if slt get Tcb kMAX get Tcb kNXT
+put Tcb kMAX get Tcb kNXT
+end
+if eq get Tcb kRTX 0
+tarm
+end
+continue
+end
+tpushfin
+ret
+end
+end
+fn tpushfin to void
+if eq get Tcb kFWN 0
+ret
+end
+x = get Tcb kNXT
+if ne x sadd get Tcb kUNA get Tcb kSCN
+ret
+end
+if ne get Tcb kFSN 0
+if ne x get Tcb kFSQ
+ret
+end
+end
+tsend x 17 0
+put Tcb kFSQ x
+put Tcb kFSN 1
+put Tcb kNXT sadd x 1
+if slt get Tcb kMAX get Tcb kNXT
+put Tcb kMAX get Tcb kNXT
+end
+if eq get Tcb kRTX 0
+tarm
+end
+s = get Tcb kST
+if eq s 4
+put Tcb kST 5
+end
+if eq s 7
+put Tcb kST 9
+end
+end
+fn ttimeout to void
+put Tcb kTRY add get Tcb kTRY 1
+if gt get Tcb kTRY get Tcf 13
+tdrop 3
+ret
+end
+tstat 16
+put Tcb kRTO umin mul get Tcb kRTO 2 60000
+put Tcb kRAT 0
+st = get Tcb kST
+if eq st 2
+tsend get Tcb kISS 2 0
+tarm
+ret
+end
+if eq st 3
+tsend get Tcb kISS 18 0
+tarm
+ret
+end
+m = get Tcb kMSS
+f = sdif get Tcb kNXT get Tcb kUNA
+put Tcb kSST umax div f 2 mul 2 m
+put Tcb kCWN m
+put Tcb kFRX 0
+put Tcb kDUP 0
+put Tcb kNXT get Tcb kUNA
+tarm
+end
+note Zero-window probe: a segment one below SND.UNA forces an ACK with the current window.
+fn tpersist to void
+if ne get Tcb kSWN 0
+ret
+end
+if not tcansend
+ret
+end
+if eq tavail 0
+ret
+end
+if ne get Tcb kUNA get Tcb kMAX
+ret
+end
+n = get Tcf 0
+if lt n get Tcb kPRS
+ret
+end
+put Tcb kPRS add n umax get Tcb kRTO 500
+tsend sdif get Tcb kUNA 1 16 0
+end
+fn tstep now ulong to void
+put Tcf 0 now
+g = get Tcf 2
+if eq tarpget g tNOMAC
+if ge now get Tcf 6
+put Tcf 6 add now 500
+tarpreq g
+end
+end
+st = get Tcb kST
+if eq st 10
+if ne get Tcb kACK 0
+tsend get Tcb kNXT 16 0
+end
+if ge now get Tcb kTWA
+tdrop 0
+end
+ret
+end
+if lt st 2
+ret
+end
+r = get Tcb kRTX
+if ne r 0
+if ge now r
+ttimeout
+end
+end
+tpersist
+tpush
+if ne get Tcb kACK 0
+if ge get Tcb kST 3
+tsend get Tcb kNXT 16 0
+end
+end
+end
+note Application interface. twrite queues Tapp[0..n) and returns the count taken.
+fn twrite n ulong to ulong
+s = get Tcb kST
+if or lt s 2 gt s 7
+ret 0
+end
+if or eq s 5 eq s 6
+ret 0
+end
+if ne get Tcb kFWN 0
+ret 0
+end
+n = umin n sub 65535 get Tcb kSCN
+b = add get Tcb kSHD get Tcb kSCN
+for i ulong n bound 65536
+put Tsbuf and add b i 65535 get Tapp i
+end
+put Tcb kSCN add get Tcb kSCN n
+ret n
+end
+fn tread cap ulong to ulong
+n = umin get Tcb kRCN umin cap 65536
+b = get Tcb kRHD
+for i ulong n bound 65536
+put Tapp i get Trbuf and add b i 65535
+end
+put Tcb kRHD and add b n 65535
+put Tcb kRCN sub get Tcb kRCN n
+if ge trwnd add get Tcb kLAD get Tcf 9
+put Tcb kACK 1
+end
+ret n
+end

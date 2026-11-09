@@ -14,6 +14,7 @@ control-transport stub. No Rust, no Python, no heap, no outside library.
 | `aienos_sec.{h,c}` | M6-B: mutually authenticated secure control transport over the M6-A UDP framing. **TEST identities only.** The wire format is specified in the header. |
 | `aienos_rtl8127.{h,c}` | L198: driver core for the Spark's Realtek RTL8127 10 GbE (10ec:8127), polled, one DMA region, TX no-close, RX type 1, interrupts masked. Realtek publishes no datasheet (DOCS SILENT); written from Realtek's Linux r8127 v11.014.00. Tested only against a chip model (`tests/rtl8127_test.c`); never run on the chip. Details and the UNKNOWN list: `docs/SPARK_RTL8127.md`. |
 | `aienos_report.{h,c}` | L198: a boot report as UDP broadcast datagrams (the iMac wire format, tag as a parameter; the Spark uses `AIENUX-SPARK-REPORT`). |
+| `tcp/` | L232: native TCP over IPv4/ARP in seeded Omega (`tcp.om`), with a QEMU gate under loss, reordering and hostile injection, and a hosted hostile corpus. See `tcp/README.md`. QEMU only; not bound into the kernel NIC path. |
 
 ## Tests (`make test`, `make sanitize`)
 
@@ -50,7 +51,8 @@ control-transport stub. No Rust, no Python, no heap, no outside library.
   secure transport below exists as hosted code but runs on TEST keys only. The stub refuses every identity kind except TEST, whose key is
   derived from a public label and so protects nothing against an attacker.
 - Physical NIC qualification: the Machine 1 wave after TRUST-1 Gate 7.
-- DHCP, NDP/IPv6, TCP, fragment reassembly: not in the reference; later M6 work.
+- DHCP, NDP/IPv6, fragment reassembly: not in the reference; later M6 work.
+  TCP now exists in Omega under `tcp/` (L232), exercised in QEMU only.
 - The ARP cache stores whatever reply the caller marks solicited; gating
   spoofed replies is the caller's job (same as the reference).
 
