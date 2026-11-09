@@ -37,12 +37,12 @@ whose outputs `freest` and `fapic` generate `src/omega_om_units_fs.c`.
 
 ## Evidence
 
-Qualified by L836 (#752 `725ca839`, `seed/qualification/om2/candidates/sha/RESULTS.txt`): 158 vectors,
-E3/section 7 receipts, 17/17 unit mutants killed, dynamic traces 28/28 identical. The static leakage scan
-of update/final is NOT_RUN; no constant-time claim is made. The paired measurement against the OM-1
-baseline under `spec/omegese-om2-measure.md` is in `om2-evidence/s4/measure/` (RESULTS.txt and its dated
-addendum); `docs/omegese-om2-status.md` section 6 gives the verdict. `parity/bench.c` and
-`parity/small.c` time this unit against the replaced C.
+Checked by L836 (#752 `725ca839`, `seed/qualification/om2/candidates/sha/RESULTS.txt`): OVERALL NOT_RUN,
+no FAIL. 158 vectors, E3/section 7 receipts, 17/17 unit mutants killed, dynamic traces 28/28 identical.
+The static leakage scan of update/final is NOT_RUN; no constant-time claim is made. The paired
+measurement against the OM-1 baseline under `spec/omegese-om2-measure.md` is in `om2-evidence/s4/measure/`
+(RESULTS.txt and its dated addendum); `docs/omegese-om2-status.md` section 6 gives the verdict.
+`parity/bench.c` and `parity/small.c` time this unit against the replaced C.
 
 ## Building the generated binding
 
