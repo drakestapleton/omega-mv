@@ -33,7 +33,10 @@ self-test, then joins the plans into `build/tls/reuse/aggregate.plan`, runs ever
 `build/tls/reuse/aggregate.txt` (contract `CRYPTO-REUSE-AGGREGATE 1`, written out at the top of
 `aggregate.om`) and requires `aggregate check` to accept it: check recomputes the receipt from the
 plan, logs, outputs and fixtures and compares it byte for byte. Its exit is the plan's verdict (0
-PASS, 1 FAIL, 2 REFUSED, 3 INVALID, 4 NOT_RUN). On a shared host, hold the CPU pool lock for the
+PASS, 1 FAIL, 2 REFUSED, 3 INVALID, 4 NOT_RUN). A runner that stops before printing a verdict (an
+I/O failure, a malformed plan) is INVALID (3), with its stderr kept in `build/tls/reuse/aggregate.err`
+and printed as the reason; the receipt file is removed before every run, so an earlier run's receipt
+is never left in its place. On a shared host, hold the CPU pool lock for the
 whole run (on the Spark: `flock ~/handoffs/hive/queen/pool-8-9.lock taskset -c 8-9 nice -n 19`);
 rows take no lock themselves. The gate 3 rows need the other repositories checked out under
 `build/tls/reuse/src/` (`agg/README.md`); a missing checkout makes its rows NOT_RUN, never PASS.
@@ -50,8 +53,8 @@ rows take no lock themselves. The gate 3 rows need the other repositories checke
 | `run.sh` | orchestration: builds, runs each case under `env -i` and a 60 s deadline, writes facts; decides the verifier-mutant meta-gate |
 | `aggregate.om` | the plan runner: runs each row under a deadline, hashes logs, outputs and fixtures, classifies every row and prints the aggregate receipt; `check` mode recomputes it from the files (`om2`, `om/tls/sha2.om`, `aggregate.om`) |
 | `fixture.om` | a test program for the runner's self-test: prints its arguments as lines and exits with the first |
-| `selftest.plan` | 27 rows, one per classification branch of `aggregate.om`, each with its wanted class |
-| `agg.sh` | orchestration: builds the runner, runs the self-test, 8 tamper controls, 5 malformed-plan refusals and the runner mutants, then the given plans, always under `env -i HOME PATH LC_ALL=C` |
+| `selftest.plan` | 31 rows, one per classification branch of `aggregate.om`, each with its wanted class |
+| `agg.sh` | orchestration: builds the runner, runs the self-test, 8 tamper controls, 6 refusals (5 malformed plans, 1 stale log) and the runner mutants, then the given plans, always under `env -i HOME PATH LC_ALL=C` |
 | `prov.plan` | provenance rows: commit, clean tree, compiler pin, the environment every row receives, runner sources |
 | `c2/` | the checker2 obligations: four IR units, `c2.plan`, `README.md` |
 | `agg/` | the gate 3 adapter plan for the three other repositories, their mutant patches, `README.md` |
@@ -72,10 +75,10 @@ exact comparison of the failed control numbers. The contract is written out at t
 | Gate 1: (P1 xor K) xor (P2 xor K) = P1 xor P2, independent expected bytes, broken detector | `driver.om` checks 1-3; mutants `detector-always-reuse`, `wrong-expected-xor` | EXERCISED, host |
 | Gate 2: payload XOR disclosure for a repeated key and nonce in ChaCha20-Poly1305 and AES-GCM, tags excluded | checks 4-19; mutants `tags-in-detector`, `nonce-not-distinct`, `tamper-not-applied` | EXERCISED, host |
 | Gate 2: AES-GCM-SIV tested separately (published vectors in `om/tls/test/gcmsiv/`, repeated-input cases here) | checks 20-27; mutant `siv-as-other-mode` | EXERCISED, host |
-| Gate 3: Open Humanity replay cache, contributory X25519, transport boundaries (open-humanity #29, #30, #31) | `agg/gate3.plan`: `oh-control` (28 + 89 tests) and eight mutants `oh-replay-clear` … `oh-write-resume`, each killed at its named test; pin d929a34 with the `oh-lockfix.diff` lock fixture (`agg/README.md`) | EXERCISED, host; transcript binding has no Open Humanity test, so no mutant covers it |
+| Gate 3: Open Humanity replay cache, contributory X25519, transport boundaries (open-humanity #29, #30, #31) | `agg/gate3.plan`: `oh-control` (28 + 89 tests) and eight mutants `oh-replay-clear` … `oh-write-resume`, each killed only by one failure of its named test at its named panic location, with exactly one test run (`once`, counts); pin d929a34 with the `oh-lockfix.diff` lock fixture (`agg/README.md`) | EXERCISED, host; transcript binding has no Open Humanity test, so no mutant covers it |
 | Gate 3: Aienux sealed-store rollback and nonce safety (aienux #445) | `ux-store-control`, `ux-crypto-control`, mutant `ux-v1-predictable-envid` | EXERCISED, host; `STORE_RUST_CROSSCHECK` NOT_RUN in aienux itself |
 | Gate 3: Sovereign Core sealed KV nonce source and recovery (aien-sovereign-core-mv #708) | `sc-control`, mutants `sc-m1-entropy-error-dropped`, `sc-m2-aad-shortened`, `sc-m3-aad-removed` | EXERCISED, host |
-| Gate 3 and checker2 aggregate result | `aggregate.om`, receipt `CRYPTO-REUSE-AGGREGATE 1`, `agg.sh`; self-test of every class, 8 tamper controls, 5 malformed-plan refusals, 17 runner mutants | IMPLEMENTED, EXERCISED |
+| Gate 3 and checker2 aggregate result | `aggregate.om`, receipt `CRYPTO-REUSE-AGGREGATE 1`, `agg.sh`; self-test of every class, 8 tamper controls, 6 refusals, 20 runner mutants | IMPLEMENTED, EXERCISED |
 | Gate 4: a named negative mutant per protection, observed failing assertion, control run | six driver mutants, each bound to the exact set of checks it must fail | EXERCISED, host |
 | Gate 4: build error, crash, timeout, missing executable or skipped test is INVALID or NOT_RUN | `receipt.om` classes; controls 13, 14, 16, 17, 19, 24-26, 38-40, 43, 45, 46 | EXERCISED, host |
 | Versioned fixture and receipt format | `CRYPTO-REUSE-RECEIPT 1` in `receipt.om` | IMPLEMENTED, EXERCISED |
@@ -123,9 +126,11 @@ listed controls; a survivor is FAIL, anything else INVALID, a missing site NOT_R
 
 `selftest.plan` gives every classification branch of `aggregate.om` a row with its wanted class.
 The three findings of the L698 review each have rows: an unrelated failure that prints the
-intended marker in the middle of a line (`mut-unrelated`, `ctl-midline`), a missing executable
-(`ctl-missing-exe`, `mut-missing-exe`) and zero selected or skipped tests (`ctl-zero-tests`,
-`mut-zero`, `mut-ignored`). `agg.sh` then edits copies and requires `aggregate check` to refuse
+intended marker in the middle of a line (`mut-unrelated`, `ctl-midline`) or prints a verbatim copy
+of the intended panic line and then panics elsewhere (`mut-forged`: two panic lines, so `once
+thread '` fails), a missing executable (`ctl-missing-exe`, `mut-missing-exe`) and zero selected or
+skipped tests (`ctl-zero-tests`, `mut-zero`, `mut-ignored`). `once` itself has `ctl-once-ok`,
+`ctl-once-none` and `ctl-once-twice`. `agg.sh` then edits copies and requires `aggregate check` to refuse
 each one: a log byte (`t-log`), a class word (`t-class`), the verdict word (`t-verdict`), a deleted
 row line (`t-row`), a removed log (`t-nolog`), a changed bound fixture (`t-fixture`), a changed
 plan (`t-plan`) and a status number (`t-status`). A tamper that leaves the bytes unchanged is
@@ -135,7 +140,14 @@ reported as a harness error, never as refused. Five malformed plans must stop bo
 mutant expecting exit 0 (`r-mutexit0`), an argument packet over 4096 bytes (`r-bytes`) and a
 repeated row name (`r-dup`). The packet size is computed while parsing, so both modes accept the
 same plans; on the Spark a 4034-byte argument after `echo` makes a packet of exactly 4096 bytes and
-runs, 4035 bytes is refused.
+runs, 4035 bytes is refused. Stale results (`r-stale`): a second `run` of the self-test plan over
+the first run's logs must stop at its first row with exit 3, the line `aggregate: cannot create the
+log (left from an earlier run?)` and an empty stdout, so no row is ever classified from an earlier
+run's log.
+
+What `once` does not cover: a test that forges the whole harness output (its own `test ... FAILED`,
+panic line and summary) and then ends the process itself with the expected status prints no second
+panic line. The mutants change product code, not the tests, so this needs a changed test.
 
 ### Runner mutants
 
@@ -162,3 +174,6 @@ NOT_RUN.
 | `name-unbounded` | a row name may exceed 200 bytes | `r-name` |
 | `mutant-exit0-accepted` | a mutant may expect exit 0 (killed and survived then share a status) | `r-mutexit0` |
 | `packet-unchecked-in-plan` | the parser skips the packet size (run still stops in `arun`, check does not) | `r-bytes` |
+| `control-once-skipped` | a control passes without its `once` counts | `ctl-once-none`, `ctl-once-twice` |
+| `mutant-once-skipped` | a mutant is killed with a second panic next to the intended one | `mut-forged` |
+| `stale-log-overwritten` | the log is opened with truncation instead of exclusively | `r-stale` |

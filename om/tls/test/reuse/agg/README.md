@@ -39,6 +39,14 @@ PASS, and a rerun with the warm caches settles it.
 - Mutants, each applied from a sha-bound diff in `mutants/`, then restored with `git apply -R` of
   the same diff and checked clean. The restore depends on the apply row, so an INVALID mutant is
   still restored.
+- A cargo mutant is killed only when its log shows exactly one test binary run (`running 1 test`,
+  one `running ` line), that test FAILED with the summary `0 passed; 1 failed; 0 ignored`, and
+  exactly one panic line (`once thread '`), which is the named test's panic at the named file, line
+  and column with its assertion message. A survivor must show `running 1 test`, the test `... ok`
+  and `1 passed; 0 failed; 0 ignored`. So an ignored or unselected test is INVALID, never a
+  survivor, and a printed copy of the intended panic line next to an unrelated panic is INVALID,
+  never a kill (L698 F1/F3, L713). The aienux mutant is a C program's report, not a Rust panic: its
+  `need` lines name the exact failing check lines, but no `once` line applies to it.
 
 | Mutant | Protection | Killing assertion |
 | --- | --- | --- |

@@ -13,13 +13,17 @@
 #    and five malformed plans must stop both `run` and `check` with exit 3 at their exact line,
 #    before their command runs: r-args (58 args), r-name (a 201-byte name), r-mutexit0 (a mutant
 #    expecting exit 0), r-bytes (an argument packet over 4096 bytes), r-dup (a repeated row name);
+#    and r-stale: a second `run` over the first run's logs must stop before any row with exit 3,
+#    the stale-log message and no receipt, so an earlier run's evidence is never this run's;
 # 3. runner mutants: each one-line change of aggregate.om must build and change exactly the named
 #    self-test rows (class and reason), tamper and refusal controls; a survivor is FAIL, a build
 #    failure or another set INVALID, a site that does not occur exactly once NOT_RUN;
 # 4. with PLANs: joins them in order into build/tls/reuse/aggregate.plan (row names are unique across
-#    them), runs it from a fresh build/tls/reuse/agg/ into build/tls/reuse/aggregate.txt, and
-#    `aggregate check` (which recomputes the receipt from the plan and files and compares it byte for
-#    byte) must accept it. Hold the host's CPU pool lock for the whole run; rows take no lock.
+#    them), runs it from a fresh build/tls/reuse/agg/ into build/tls/reuse/aggregate.txt (the runner's
+#    stderr in build/tls/reuse/aggregate.err), and `aggregate check` (which recomputes the receipt
+#    from the plan and files and compares it byte for byte) must accept it. A runner that stops
+#    before printing a verdict (I/O failure, malformed plan) is INVALID (3) with its stderr as the
+#    reason, never REFUSED. Hold the host's CPU pool lock for the whole run; rows take no lock.
 # Exit: 0 PASS, 1 FAIL, 2 REFUSED, 3 INVALID, 4 NOT_RUN (with PLAN: the plan's verdict).
 set -u
 OMC=${1:?usage: sh om/tls/test/reuse/agg.sh OMC [PLAN...]}
@@ -103,6 +107,10 @@ selftest() {
   # repeated r-dup row (the first r-dup row runs in run mode; the repeat never does)
   malformed r-args 60 "$1"; malformed r-name 1 "$1"; malformed r-mutexit0 6 "$1"
   malformed r-bytes 5 "$1"; malformed r-dup 8 "$1"
+  agg "$1" run "$D/selftest.plan" > "$S/stale.out" 2> "$S/stale.err"; a=$?
+  [ "$a" -eq 3 ] && [ ! -s "$S/stale.out" ] \
+    && grep -qx 'aggregate: cannot create the log (left from an earlier run?)' "$S/stale.err" \
+    || printf 'r-stale\n'
   return $rc
 }
 
@@ -152,17 +160,24 @@ vmut args-unbounded 'if ge j 57' 'if false' 'r-args'
 vmut name-unbounded 'if gt sub q v 200' 'if false' 'r-name'
 vmut mutant-exit0-accepted 'if and eq get rf 2 1 eq get rf 12 0' 'if false' 'r-mutexit0'
 vmut packet-unchecked-in-plan 'if gt pksize len av' 'if false' 'r-bytes'
+vmut control-once-skipped 'if not allonce' 'if false' 'ctl-once-none ctl-once-twice'
+vmut mutant-once-skipped 'if allonce' 'if true' 'mut-forged'
+vmut stale-log-overwritten 'fl = fopen pb 0 get pbn 0 524481 420' 'fl = fopen pb 0 get pbn 0 524865 420' 'r-stale'
 if [ "$vsurv" -ne 0 ]; then say "AGG FAIL: a runner mutant survived"; exit 1; fi
 if [ "$vinv" -ne 0 ]; then say "AGG INVALID: a runner mutant was not validly caught"; exit 3; fi
 if [ "$vnr" -ne 0 ]; then say "AGG NOT_RUN: a runner mutant site is missing"; exit 4; fi
-say "AGG SELFTEST PASS rows=$nrows tamper=8 refusals=5 runner-mutants=$vok/$vall receipt sha256=$(hash "$S/base.rcpt")"
+say "AGG SELFTEST PASS rows=$nrows tamper=8 refusals=6 runner-mutants=$vok/$vall receipt sha256=$(hash "$S/base.rcpt")"
 [ "$#" -gt 0 ] || exit 0
 
 P=$B/aggregate.plan
 cat "$@" > "$P" || { say "AGG NOT_RUN: a plan file is missing"; exit 4; }
 for f in "$@"; do say "plan $f sha256=$(hash "$f")"; done
 fresh
-agg "$B/aggregate" run "$P" > "$B/aggregate.txt"; v=$?
+rm -f "$B/aggregate.txt" "$B/aggregate.err"
+agg "$B/aggregate" run "$P" > "$B/aggregate.txt" 2> "$B/aggregate.err"; v=$?
+if ! grep -q '^verdict ' "$B/aggregate.txt"; then
+  say "AGG INVALID: the runner stopped with exit $v before a verdict: $(cat "$B/aggregate.err")"; exit 3
+fi
 "$B/aggregate" check "$P" "$B/aggregate.txt" > "$S/plan.check"; v2=$?
 if [ "$v2" -ne "$v" ] || ! grep -q '^CHECK OK verdict ' "$S/plan.check"; then
   say "AGG REFUSED: the receipt does not verify (run $v, check $v2): $(cat "$S/plan.check")"; exit 2
