@@ -306,6 +306,9 @@ in this document.
 - sched defaults (65535 per kind) make `sched_cap` actions inert until real capacities are set.
 - `spark-sensors` already calls nvidia-smi about every 2 s, faster than the 5 s rule this lane
   follows; any controller should reuse that log instead of adding a second poller.
+  ctlsamp's own 30 minute acceptance runs (evidence `gate-om-sched-20261109/`) did add a second
+  5 s `nvidia-smi` poller beside spark-sensors for their duration; they test the sampler, not a
+  controller input path.
 - UPS load is integer % of a whole UPS with unknown other loads; it is not energy evidence.
 - The trace in section 5 is one 30 minute window on a loaded machine; it is not representative
   of idle or GPU-exclusive periods, and R0 never acts on it.
