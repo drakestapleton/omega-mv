@@ -31,7 +31,7 @@ feature anyone may want", and it never means hardware qualification beyond the t
 
 | 1.0 includes | 1.0 explicitly excludes unless a recorded decision adds it |
 |---|---|
-| One frozen source profile (`OM-1.0`, section RM11) that is a superset of today's OM-1 and OM-2 | Shared-memory threads and atomics (FR-6, decision 37 undecided) |
+| One frozen source profile (`OM-1.0`, section RM11) that is a superset of today's OM-1 and OM-2 | Shared-memory threads and atomics (FR-6; decision 37 in [LANGUAGES.md](research/LANGUAGES.md) is ACCEPTED and allows shared writable memory only between checker-proven disjoint parts; no thread design is chosen) |
 | Executable contracts checked by the compiler or at run time (RM2) | General constant-time or speculative-constant-time guarantees (OM-2 spec section 8) |
 | A measured, reproducible efficiency baseline and at least one qualified optimization (RM3) | Packed C-compatible structs beyond `layout` (FR-2) |
 | A decided allocation model (RM4), byte/text facilities (RM5), modules (RM6) | Kernel words (FR-8) and a full GPU programming model |

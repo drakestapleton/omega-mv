@@ -3,7 +3,10 @@
 Status: study, 2026-10-22 (UTC), ledger L409. Extends the B-to-C study (~/handoffs/2026-10-19-b-to-c-archives.md, ledger
 L141), which produced decisions 16 to 24 in docs/PROGRAM.md (branch doc/program). Decision 25 on that branch is
 already taken (competitors are baselines; the target is the physical limit), so the decisions proposed here start at
-26. Every new decision is PROPOSED: docs/PROGRAM.md says Drake decides when a proposed decision becomes a decision.
+26. Every new decision started as PROPOSED: docs/PROGRAM.md says Drake decides when a proposed decision becomes a
+decision. Decision status (ledger L415, 2026-11-09): decisions 26 to 33 and 35 to 45 are ACCEPTED, per the L409
+verdict record (ledger L409: 19 ACCEPTED, 34 to L414; PR desk note 2026-10-22T03:12Z). Decision 34 stays PROPOSED
+until experiment L414 (GPU kernel words per tile against per thread, measured) decides it.
 Companion design: docs/research/COMPATIBILITY.md (how every language calls Omega and Omega calls them).
 
 Outside claims carry [n]; the sources at the end list each page with the sentence copied from it. Each quoted
@@ -648,7 +651,8 @@ libraries lack need expert-written kernels [342].
 **How it talks.** The host side is ordinary C++ built by the system compiler [343].
 
 **For Omega.** Omega already writes the GB10's own machine code with no PTX and no NVIDIA compiler (docs/OMEGA.md
-section 2). Take the tile model (decision 34) and treat libraries as part of the language's reach (decision 35).
+section 2). Take the tile model (decision 34, PROPOSED until experiment L414 decides it) and treat libraries as part of
+the language's reach (decision 35).
 
 #### OpenCL
 
@@ -691,8 +695,8 @@ zero-copy where possible [374, 375]. Its stated aim: faster to write than CUDA, 
 **Costs.** Tiles cannot be freely sliced [377]; scheduling across the chip stays with the programmer [378, 379]. At
 its 2021 release it ran only on NVIDIA GPUs [380].
 
-**For Omega.** The tile model for Omegese GPU words (decision 34), with work across the chip scheduled by the motor's
-static table (docs/OMEGA.md section 6).
+**For Omega.** The tile model for Omegese GPU words (decision 34, PROPOSED until experiment L414 decides it), with work
+across the chip scheduled by the motor's static table (docs/OMEGA.md section 6).
 
 #### Mojo
 
@@ -719,9 +723,10 @@ own array type [398]. For Omega: arrays as values with shape (decision 17), and 
 ## Part 2. The lessons in one table
 
 Each row: the lesson, the languages that show it, the evidence, and what Omega does, as a numbered decision in the
-same format as decisions 16 to 25. Every decision from 26 on is PROPOSED until Drake accepts it (docs/PROGRAM.md,
-"What Drake does"). "Already true" means Omega follows the lesson today; the gate named is the existing test that
-proves it, with its file. "New" means nothing enforces it yet; the gate named is the one to build.
+same format as decisions 16 to 25. Decisions 26 to 33 and 35 to 45 are ACCEPTED (ledger L415, from the L409 verdict
+record); decision 34 is PROPOSED until experiment L414 decides it. "Already true" means Omega follows the lesson
+today; the gate named is the existing test that proves it, with its file. "New" means nothing enforces it yet; the
+gate named is the one to build.
 
 | # | lesson | languages that show it | evidence | Omega's decision, and why | gate |
 |---|---|---|---|---|---|
@@ -733,7 +738,7 @@ proves it, with its file. "New" means nothing enforces it yet; the gate named is
 | 31 | a foreign door left out of the language definition becomes one door per compiler | Standard ML, Haskell | the Standard ML definition said nothing about foreign code, so such programs do not move between compilers [103]; Haskell's standard foreign interface had to settle on C as the lowest common denominator [119] | **Yes.** The C-ABI door, its rules and the interface description are part of the Omega specification, not a feature of omc | New: COMPATIBILITY.md rung C0 (the rules table in the spec) |
 | 32 | optional features and dialects mean nobody can rely on anything | Lisp, BASIC, OpenCL, Lua, Ada | Lisp's dialects [16]; BASIC's incompatible implementations [44, 45]; OpenCL 3.0 made everything after 1.2 optional [346, 347]; Lua's missing module policy [203]; Ada validated every compiler and refused subsets [87] | **Yes, one specification, no optional parts.** A back end that cannot do a feature refuses the program with a named error; it never accepts a dialect. checker2 is the one judge for every compiler, seed-born or C-built | Already true: checker2 refuses by named class and issues receipts (src/checker2); the handover gate in docs/PROGRAM.md requires two compilers to agree bit for bit |
 | 33 | handing source text to the machine's driver multiplies compilers and bugs; a small checked binary form travels | GLSL, SPIR-V, HLSL, CUDA, Java, Pascal, Julia | hundreds of driver bugs from shader text [351, 352, 354]; SPIR-V and DXIL as binary contracts [355, 356, 362]; PTX stable across generations [328]; Java bytecode [208]; Pascal-P [48]; Julia's compile-on-first-use delays [313] | **Yes, already true.** What reaches the machine is Omega's checked binary IR, compiled ahead of time and signed by a receipt before it runs. No source text and no compiler inside a driver or at run time | Already true: strict IR decoder with mutant tests (`make test-osc-ir-decode`, Makefile:112; refusal classes C2-DECODE-*) |
-| 34 | per-thread GPU code is hard to write well; tile code moves the hard parts into the compiler | CUDA, Triton, Mojo, APL | NVIDIA added a tile mode where the thread index disappears [336, 337], which we read as a sign that per-thread code is hard to write well; Triton's compiler handles coalescing, shared memory and tensor cores [369, 370]; Mojo is still per thread [392]; Iverson on whole-array notation [397] | **Yes.** Omegese GPU words (bar C1 of docs/OMEGA.md) are written per tile; omc owns thread indices, coalescing and shared memory. The costs Triton names stay visible: tiles of fixed shape [377], and scheduling across the chip, which Omega gives to the motor's static schedule | New: bar C1 kernels written with no thread-index word; checker proves tile bounds |
+| 34 | per-thread GPU code is hard to write well; tile code moves the hard parts into the compiler | CUDA, Triton, Mojo, APL | NVIDIA added a tile mode where the thread index disappears [336, 337], which we read as a sign that per-thread code is hard to write well; Triton's compiler handles coalescing, shared memory and tensor cores [369, 370]; Mojo is still per thread [392]; Iverson on whole-array notation [397] | **PROPOSED, experiment L414 decides: yes.** Omegese GPU words (bar C1 of docs/OMEGA.md) are written per tile; omc owns thread indices, coalescing and shared memory. The costs Triton names stay visible: tiles of fixed shape [377], and scheduling across the chip, which Omega gives to the motor's static schedule | New: bar C1 kernels written with no thread-index word; checker proves tile bounds |
 | 35 | languages spread through their libraries and the array formats they share | CUDA, PHP, Python, NumPy, Triton | cuDNN and cuBLAS carried CUDA into AI [331, 332]; PHP won on its ecosystem [237, 239]; NumPy and the buffer protocol pulled science onto Python [163, 166]; DLPack passes arrays between frameworks, zero-copy where possible [403, 374, 375] | **Yes.** Omega's libraries (GEMM, attention, reductions) are part of the deliverable, and arrays cross the door in DLPack's layout so every array library can hand them over (COMPATIBILITY.md section 3.3) | New: bar C3 of docs/OMEGA.md; rung C6 |
 | 36 | packaging that arrives late or loose costs a decade | Haskell, Lua, Python, Go, Rust | Haskell's package system began in 2004 and took more than fifteen years to become important [116, 117]; Lua had no module policy [203]; Python needed PEP 517 to end one gatekeeper for every build system [174]; Go's minimum version selection [260]; Cargo builds and fetches in one tool [277] | **Yes.** One tool builds and fetches; a dependency is named by the digest of its checked unit (decision 21), so there is no version guessing at all | Already true in design: decision 21's gate, imports resolve by digest (OSC-VC1). New: the tool |
 | 37 | a global lock or shared mutable memory caps parallel speed; isolation scales | Python, Ruby, OCaml, Erlang, Go | Python's GIL blocks multi-core use, and removing it costs single-thread speed and binary compatibility [169, 170, 171]; Ruby gives each Ractor its own lock [188]; OCaml removed its global lock only in 2022 [107]; Erlang's share-nothing processes [123, 125]; Go drew users with concurrency [262] | **Yes.** No global lock. Parallel work shares no writable memory unless the checker proves the parts disjoint (decision 18 applied to threads); at the door each thread brings its own workspace (COMPATIBILITY.md section 4) | Already true for calls: C2-CALL-ALIAS (src/checker2/c2_check.c:338). New: rung C7 |
