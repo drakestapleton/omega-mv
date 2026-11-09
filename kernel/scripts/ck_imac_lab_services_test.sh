@@ -63,6 +63,31 @@ grep -q 'left alone' "${W}/stop.out" || fail "stop did not say it left the pid a
 [[ ! -e "${state}/serve.pid" ]] || fail "stale pid file kept"
 pass "stop leaves the unrelated process alive and drops the stale pid file"
 
+# 1b. stale pid files left from before a reboot cannot make start skip a daemon: serve names a live
+# process of the right program name whose .id is from another boot, listen and bsdp name the
+# unrelated process. start must launch all three and leave both foreign processes alone.
+reset_state
+mkdir -p "${W}/other"
+cp "${W}/stubsrc/stub" "${W}/other/ck_imac_netboot"
+"${W}/other/ck_imac_netboot" &
+ipid=$!
+extra+=("${ipid}")
+until [[ "$(tr '\0' ' ' <"/proc/${ipid}/cmdline")" == "${W}/other/ck_imac_netboot "* ]]; do sleep 0.05; done # exec done
+echo "${ipid}" >"${state}/serve.pid"
+echo "00000000-0000-0000-0000-000000000000 $(proc_ticks "${ipid}")" >"${state}/serve.id"
+for s in listen bsdp; do echo "${upid}" >"${state}/${s}.pid"; done
+start >"${W}/start0.out"
+grep -q 'already running' "${W}/start0.out" && fail "start skipped a daemon on a stale pid file: $(grep 'already running' "${W}/start0.out")"
+for s in serve listen bsdp; do
+    p="$(pid_of "${s}")"
+    [[ "${p}" != "${ipid}" && "${p}" != "${upid}" ]] || fail "start kept the stale pid ${p} for ${s}"
+    alive "${s}" || fail "start did not leave an owned ${s} running"
+done
+stop >/dev/null
+gone "${ipid}" && fail "stop killed the same-named process from another boot"
+gone "${upid}" && fail "stop killed the unrelated process"
+pass "stale pid files cannot make start skip a daemon, and the foreign processes survive start and stop"
+
 # 2. a started set of daemons is recognised, a second start adds nothing, a deleted binary still counts
 start >"${W}/start1.out"
 declare -A pid1
