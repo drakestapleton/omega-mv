@@ -1,0 +1,881 @@
+note Omega Node proposals, authority and cancellation (DRA-288). Concatenate
+note after transport.om, pool.om, super.om, sched.om and
+note seed/authority/action.om, before one program with fn main.
+note A worker proposes and the creator alone decides and commits. A proposal
+note is typed and bound to its operation identity, the job id and
+note assignment seq, the worker slot and incarnation, the input epoch and
+note version it read, and the authority generation it holds. Every effect is
+note one action record of seed/authority/action.om per operation identity:
+note started with actstart, closed with actrecon or actlost. A performed
+note operation is never started again and an UNKNOWN one is never retried;
+note one with no external effect (class 2) whose worker died is closed as
+note not performed, so it may run again.
+note Control page (16384 bytes), cell of worker w at 128*w. Creator writes
+note 0 control seq, 8 cancel target (assignment seq, 0 none), 16 decided
+note proposal seq, 24 verdict, 32 generation at the decision. Worker
+note writes 64 control ack seq, 72 proposal seq, 80 report seq, 88 report
+note outcome, 96 tool wait status, 104 paused as last seen, 112 running tool
+note pid (its process group), 120 tool output bytes held. Word 8192 mirrors
+note the authority generation and 8200 the paused flag.
+note Proposal page: 4096 bytes per worker at 4096*w. Words 0..15: 0 version
+note 1, 1 kind 1, 2 job id, 3 assignment seq, 4 slot, 5 incarnation, 6 input
+note epoch, 7 input version, 8 generation, 9..12 operation identity, 13 class
+note (1 external effect, 2 no external effect, 3 idempotent external effect
+note whose completion is visible as a key, see journal.om), 14 and 15 zero.
+note Bytes 128..4095 hold the running tool's output.
+note Verdicts: 0 granted, 1 malformed, 2 not the worker's assignment, 3 other
+note incarnation, 4 stale input, 5 stale authority, 6 cancelled, 7 already
+note performed or UNKNOWN, 8 attempt limit, 9 refused by the action contract.
+note Outcomes, as action.om receipts: 0 UNKNOWN, 1 not performed, 2 performed.
+text audevnul "/dev/null"
+global aumap long 2
+global auctl int 64
+global auinc ulong 64
+global augen ulong 1
+global aurec ulong 2048
+global auuse ulong 64
+global aujob ulong 64
+global aured ulong 64
+global aupf uchar 8
+global aufd int 1
+
+fn au_cell w ulong off ulong to ulong
+ret mapget get aumap 0 add mul w 128 off 8
+end
+
+fn au_set w ulong off ulong v ulong to void
+r = mapset get aumap 0 add mul w 128 off 8 v
+end
+
+fn au_pw w ulong i ulong to ulong
+ret mapget get aumap 1 add mul w 4096 mul i 8 8
+end
+
+fn au_spw w ulong i ulong v ulong to void
+r = mapset get aumap 1 add mul w 4096 mul i 8 8 v
+end
+
+fn au_pfd off ulong to int
+v = ulong get aupf off
+v = or v shl ulong get aupf add off 1 8
+v = or v shl ulong get aupf add off 2 16
+v = or v shl ulong get aupf add off 3 24
+ret int v
+end
+
+note Poll record at off; a negative fd keeps its bit pattern, so the kernel
+note ignores that record.
+fn au_lpfd p edit uchar 40 off ulong fd int to void
+u = bitcast uint fd
+for i ulong 4
+put p add off i uchar and shr u uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Creator, after sup_init and before any spawn: map the control and
+note proposal pages, one control eventfd per worker slot, generation 1.
+note 0, -6 not creator, or a negative errno.
+fn auth_new c long to long
+if not pool_mine c
+ret neg long 6
+end
+a = mapnew neg int 1 0 16384 3 33
+if le a 0
+ret a
+end
+b = mapnew neg int 1 0 262144 3 33
+if le b 0
+r = mapdrop a
+ret b
+end
+put aumap 0 a
+put aumap 1 b
+for i ulong 64
+put auctl i neg int 1
+put auinc i 0
+put auuse i 0
+put aujob i 0
+put aured i 0
+end
+n = mapget c 48 8
+for i ulong n bound 64
+e = eventfd uint 0
+if lt e 0
+x = auth_free
+ret e
+end
+put auctl i int e
+end
+put augen 0 1
+r = mapset a 8192 8 1
+r = mapset a 8200 8 0
+ret 0
+end
+
+note Creator: close the control eventfds and drop both pages.
+fn auth_free to long
+for i ulong 64
+if ge get auctl i 0
+r = fclose get auctl i
+end
+put auctl i neg int 1
+end
+r = mapdrop get aumap 1
+if lt r 0
+ret r
+end
+ret mapdrop get aumap 0
+end
+
+note Creator: start a new incarnation of worker slot w (sup_spawn). The child
+note inherits its incarnation number. 0 in the child, else as sup_spawn.
+fn auth_spawn c long w ulong to long
+if ge w 64
+ret neg long 7
+end
+if ne get swpid w 0
+ret neg long 16
+end
+put auinc w add get auinc w 1
+ret sup_spawn c w
+end
+
+note Creator: post control to worker w. A nonzero target asks it to cancel
+note that assignment. The state words go first, then the seq, then the hint.
+fn au_ctl w ulong target ulong to void
+if gt target 0
+au_set w 8 target
+end
+au_set w 0 add au_cell w 0 1
+r = node_notify get auctl w
+end
+
+note Worker w: bounded control handler. Records the paused flag it saw and
+note acknowledges the control seq; returns the cancel target (0 none).
+fn auth_wctl w ulong to ulong
+s = au_cell w 0
+au_set w 104 mapget get aumap 0 8200 8
+au_set w 64 s
+ret au_cell w 8
+end
+
+note Worker w: wait up to interval ns. 3 creator gone, 2 stop, 4 control,
+note 5 descriptor x readable or hung up (x negative: none), 1 work hint,
+note 0 timeout, or a negative errno. Creator loss outranks stop, stop
+note outranks control, control outranks output and work. Control and work
+note hints are drained; reread the shared state after any return.
+fn auth_wwait c long w ulong x int interval long to long
+p = new uchar 40 0
+if ge w 64
+ret neg long 7
+end
+iv = interval
+if pool_stopped c
+iv = long 0
+end
+au_lpfd p 0 get swwake w
+au_lpfd p 8 get swstop w
+au_lpfd p 16 get swpar 0
+au_lpfd p 24 get auctl w
+au_lpfd p 32 x
+r = pollfds p 0 40 iv
+if lt r 0
+ret r
+end
+if ne get p 22 0
+ret 3
+end
+if pool_stopped c
+ret 2
+end
+if ne and get p 14 1 0
+r = node_drain get swstop w
+ret 2
+end
+if ne get p 30 0
+r = node_drain get auctl w
+ret 4
+end
+if ne get p 38 0
+ret 5
+end
+if ne and get p 6 1 0
+r = node_drain get swwake w
+ret 1
+end
+ret 0
+end
+
+note Worker w: propose the effect of assignment q with operation identity
+note op and class (1 external effect, 2 none, 3 keyed idempotent). The words go first, then the
+note proposal seq, then an ack to the creator. 0 or the ack refusal.
+fn auth_propose w ulong q ulong op view ulong 4 class ulong to long
+if ge w 64
+ret neg long 7
+end
+au_spw w 0 1
+au_spw w 1 1
+au_spw w 2 sc_cell w 8
+au_spw w 3 q
+au_spw w 4 w
+au_spw w 5 get auinc w
+au_spw w 6 sc_cell w 16
+au_spw w 7 sc_cell w 24
+au_spw w 8 mapget get aumap 0 8192 8
+for i ulong 4
+au_spw w add 9 i get op i
+end
+au_spw w 13 class
+au_spw w 14 0
+au_spw w 15 0
+au_set w 72 q
+ret sup_ack w
+end
+
+note Worker w: wait up to interval ns for the decision on proposal q,
+note handling control meanwhile. The verdict (0 granted), 102 stop, 103
+note creator gone, 110 no decision yet, or a negative errno.
+fn auth_wdecide c long w ulong q ulong interval long to long
+dl = add ulong monons ulong interval
+for it ulong 100000000
+if eq au_cell w 16 q
+ret long au_cell w 24
+end
+now = ulong monons
+if ge now dl
+ret 110
+end
+r = auth_wwait c w neg int 1 long sub dl now
+if lt r 0
+ret r
+end
+if or eq r 2 eq r 3
+ret add 100 r
+end
+if eq r 4
+t = auth_wctl w
+end
+end
+ret 110
+end
+
+note Worker w: fork the packed argv pk (pn bytes) as the leader of a new
+note process group, stdin on /dev/null, stdout and stderr on a pipe whose
+note read end is left in aufd. Both sides call setpgid, so the group exists
+note before either side goes on. The pid, or a negative errno.
+fn au_fork w ulong pk view uchar 4096 pn ulong to long
+r = pipefds aupf 0 8 524288
+if lt r 0
+ret r
+end
+rfd = au_pfd 0
+wfd = au_pfd 4
+dn = fopen audevnul 0 len audevnul 524288 0
+pid = fork
+if eq pid 0
+r = setpgid 0 0
+r = dupfd wfd 1 0
+r = dupfd wfd 2 0
+if ge dn 0
+r = dupfd int dn 0 0
+end
+r = execprog pk 0 pn
+exit 127
+end
+r = fclose wfd
+if ge dn 0
+r = fclose int dn
+end
+if lt pid 0
+r = fclose rfd
+ret pid
+end
+r = setpgid int pid int pid
+au_set w 120 0
+au_set w 112 ulong pid
+put aufd 0 rfd
+ret pid
+end
+
+note Worker w: move available tool output into its proposal page from byte
+note 128 (bytes past 4096 are dropped). false at end of file or on error.
+fn au_out w ulong rfd int to bool
+buf = new uchar 4096 0
+n = read rfd buf 0 4096
+if eq n 0
+ret false
+end
+if lt n 0
+ret or eq n neg long 4 eq n neg long 11
+end
+k = au_cell w 120
+m = ulong n
+if gt add k m 3968
+m = sub 3968 k
+end
+if gt m 0
+h = get aumap 1
+off = add mul w 4096 add 128 k
+r = mapwrite h off buf 0 m
+au_set w 120 add k m
+end
+ret true
+end
+
+note Outcome of a reaped tool from its wait status: it exited, so it ran
+note (2); it was killed or crashed, so an external effect is UNKNOWN (0) and
+note a class 2 tool had none (1).
+fn au_outcome st ulong class ulong to long
+if eq and st 127 0
+ret 2
+end
+if eq class 2
+ret 1
+end
+ret 0
+end
+
+note Worker w: finish tool pid of assignment q. Without kill, wait for its
+note exit while still obeying control. With kill, a tool that has already
+note exited is not cancelled; otherwise SIGKILL its whole group. Its wait
+note status alone decides the outcome, never the fact that a kill was sent.
+note Group members left behind are killed either way.
+fn au_end c long w ulong q ulong pid long class ulong kill bool to long
+ws = new uchar 4 0
+k = kill
+g = long 0
+if not k
+for it ulong 100000000
+g = waitpid int pid ws 0 4 1
+if ne g 0
+break
+end
+r = auth_wwait c w neg int 1 5000000
+if eq r 4
+if eq auth_wctl w q
+k = true
+break
+end
+end
+if or eq r 2 eq r 3
+k = true
+break
+end
+end
+end
+if k
+g = waitpid int pid ws 0 4 1
+end
+if eq g 0
+r = killpid neg int pid 9
+if lt r 0
+r = killpid int pid 9
+end
+g = waitpid int pid ws 0 4 0
+else
+r = killpid neg int pid 9
+end
+r = fclose get aufd 0
+put aufd 0 neg int 1
+au_set w 112 0
+if lt g 0
+au_set w 96 65535
+ret 0
+end
+st = or ulong get ws 0 shl ulong get ws 1 8
+au_set w 96 st
+ret au_outcome st class
+end
+
+note Worker w: run the granted tool pk of assignment q (see au_fork). Its
+note output goes to the proposal page; cancellation of q, stop or creator
+note loss kill its process group. Returns the outcome: 1 when q was
+note cancelled before the tool started or the fork failed, else from
+note au_end. The wait status is in cell word 96.
+fn auth_wtool c long w ulong q ulong pk view uchar 4096 pn ulong class ulong to long
+if eq auth_wctl w q
+ret 1
+end
+pid = au_fork w pk pn
+if le pid 0
+ret 1
+end
+rfd = get aufd 0
+for it ulong 100000000
+r = auth_wwait c w rfd 1000000000
+if eq r 5
+if not au_out w rfd
+ret au_end c w q pid class false
+end
+end
+if eq r 4
+if eq auth_wctl w q
+ret au_end c w q pid class true
+end
+end
+if or eq r 2 eq r 3
+ret au_end c w q pid class true
+end
+if lt r 0
+ret au_end c w q pid class true
+end
+end
+ret au_end c w q pid class true
+end
+
+note Worker w: report the outcome of the granted tool of assignment q.
+fn auth_wreport w ulong q ulong outcome ulong to long
+au_set w 88 outcome
+au_set w 80 q
+ret sup_ack w
+end
+
+note Creator: the action slot whose operation identity is op, or -1.
+fn au_find op view ulong 4 to long
+for k ulong 64
+if ne get auuse k 0
+m = true
+for i ulong 4
+if ne get aurec add mul k 32 add 8 i get op i
+m = false
+end
+end
+if m
+ret long k
+end
+end
+end
+ret neg long 1
+end
+
+note Creator: a new ready action record for op and class in a free slot,
+note bound to the current generation; -1 when all 64 are in use.
+note Identities: operation and request op, scope node, provider class,
+note policy 1, grant 1. Attempt limit 3, epoch 1, no expiry in practice.
+fn au_alloc op view ulong 4 class ulong to long
+for k ulong 64
+if eq get auuse k 0
+b = mul k 32
+for i ulong 32
+put aurec add b i 0
+end
+put aurec b 1
+put aurec add b 1 1
+put aurec add b 3 3
+put aurec add b 4 get augen 0
+put aurec add b 5 1
+put aurec add b 6 9223372036854775807
+for i ulong 4
+put aurec add b add 8 i get op i
+put aurec add b add 12 i get op i
+end
+put aurec add b 16 1313817669
+put aurec add b 20 class
+put aurec add b 24 1
+put aurec add b 28 1
+put auuse k 1
+ret long k
+end
+end
+ret neg long 1
+end
+
+fn au_load k ulong r edit ulong 32 to void
+for i ulong 32
+put r i get aurec add mul k 32 i
+end
+end
+
+fn au_save k ulong r view ulong 32 to void
+for i ulong 32
+put aurec add mul k 32 i get r i
+end
+end
+
+note Creator: commit the start of the operation proposed by worker w.
+note A ready record moves to the current generation; actstart checks the
+note state, the attempt limit and the credential. The verdict.
+fn au_commit w ulong to ulong
+op = new ulong 4 0
+r = new ulong 32 0
+cr = new ulong 32 0
+for i ulong 4
+put op i au_pw w add 9 i
+end
+k = au_find op
+if lt k 0
+k = au_alloc op au_pw w 13
+if lt k 0
+ret 9
+end
+end
+au_load ulong k r
+if and eq get r 1 1 ne get r 4 get augen 0
+put r 4 get augen 0
+end
+for i ulong 32
+put cr i get r i
+end
+put cr 1 1
+put cr 2 1
+put cr 3 0
+put cr 4 get augen 0
+put cr 6 0
+put cr 7 0
+e = actstart r cr
+if eq e 0
+au_save ulong k r
+put aujob w add ulong k 1
+ret 0
+end
+if or eq e 21 eq e 22
+ret 7
+end
+if eq e 23
+ret 8
+end
+if eq e 31
+ret 5
+end
+ret 9
+end
+
+note Creator: a proposal is stale when the input it read is not the
+note assignment's, its epoch is no longer current, or a newer version on the
+note job's dependency topics has been published since.
+fn au_stale c long w ulong j ulong to bool
+if ne au_pw w 6 sc_cell w 16
+ret true
+end
+if ne au_pw w 7 sc_cell w 24
+ret true
+end
+if ne au_pw w 6 pool_epoch c
+ret true
+end
+t = get sjdep j
+if eq t 0
+ret false
+end
+h = pool_current c
+if le h 0
+ret true
+end
+ret ne node_next h au_pw w 7 t 0
+end
+
+note Creator: check the pending proposal of worker w; the verdict.
+fn au_valid c long w ulong to ulong
+q = au_cell w 72
+if or ne au_pw w 0 1 ne au_pw w 1 1
+ret 1
+end
+cl = au_pw w 13
+if or eq cl 0 gt cl 3
+ret 1
+end
+if or ne au_pw w 14 0 ne au_pw w 15 0
+ret 1
+end
+b = get scbusy w
+if eq b 0
+ret 2
+end
+j = sub b 1
+if ne get sjst j 3
+ret 2
+end
+if or ne au_pw w 3 q ne q sc_cell w 0
+ret 2
+end
+if or ne au_pw w 2 get sjid j ne au_pw w 4 w
+ret 2
+end
+if ne au_pw w 5 get auinc w
+ret 3
+end
+if au_stale c w j
+ret 4
+end
+if ne au_pw w 8 get augen 0
+ret 5
+end
+if eq au_cell w 8 q
+ret 6
+end
+ret 0
+end
+
+note Creator: decide worker w's pending proposal. A grant is journaled
+note (START, made durable) before the verdict is published; if the journal
+note refuses, the action is closed as not performed and the verdict is 9.
+fn au_decide c long w ulong to void
+q = au_cell w 72
+v = au_valid c w
+if eq v 0
+v = au_commit w
+end
+if eq v 0
+if ne au_jstart w 0
+e = au_recon sub get aujob w 1 1
+put aujob w 0
+v = 9
+end
+end
+if eq v 0
+jn_hit 2
+end
+au_set w 24 v
+au_set w 32 get augen 0
+au_set w 16 q
+r = sup_wake w
+end
+
+fn au_jstart w ulong to ulong
+op = new ulong 4 0
+k = sub get aujob w 1
+for i ulong 4
+put op i au_pw w add 9 i
+end
+b = mul k 32
+ret jn_start op au_pw w 13 au_pw w 2 get aurec add b 2 get aurec add b 4
+end
+
+note Journal DONE for the action in slot b-1 of worker w's job.
+fn au_jdone b ulong o ulong w ulong how ulong to ulong
+op = new ulong 4 0
+k = sub b 1
+for i ulong 4
+put op i get aurec add mul k 32 add 8 i
+end
+ret jn_done op o au_pw w 2 how
+end
+
+note Creator: apply receipt outcome o to action slot k (actrecon). An
+note outcome of 0 leaves the action UNKNOWN.
+fn au_recon k ulong o ulong to ulong
+r = new ulong 32 0
+s = new ulong 32 0
+au_load k r
+for i ulong 32
+put s i get r i
+end
+put s 0 1
+put s 1 o
+put s 3 1
+put s 6 0
+put s 7 0
+e = actrecon r s
+au_save k r
+ret e
+end
+
+note Creator: record worker w's report. DONE is made durable before the
+note action record changes; if the journal refuses, the report stays
+note unrecorded and is tried again at the next step.
+fn au_record w ulong to void
+b = get aujob w
+if eq b 0
+put aured w au_cell w 80
+ret
+end
+jn_hit 3
+if ne au_jdone b au_cell w 88 w 1 0
+ret
+end
+jn_hit 4
+put aured w au_cell w 80
+put aujob w 0
+e = au_recon sub b 1 au_cell w 88
+end
+
+note Creator, after worker w was reaped: kill the process group of a tool
+note it left running and close its in-flight action. One of class 2 (no
+note external effect) is not performed (DONE how 6, as jn_settle closes it
+note at a restart), so its rerunnable job may start again; any other is
+note UNKNOWN (actlost, DONE how 2) and never runs again (DRA-292).
+fn au_lost w ulong to void
+r = new ulong 32 0
+p = au_cell w 112
+if gt p 0
+x = killpid neg int p 9
+au_set w 112 0
+end
+b = get aujob w
+if eq b 0
+ret
+end
+k = sub b 1
+if eq get aurec add mul k 32 20 2
+if ne au_jdone b 1 w 6 0
+ret
+end
+put aujob w 0
+e = au_recon k 1
+ret
+end
+if ne au_jdone b 0 w 2 0
+ret
+end
+put aujob w 0
+au_load k r
+e = actlost r
+au_save k r
+end
+
+note Creator, after sched_step: make the dispatch decisions so far durable
+note (jn_drain), record tool reports, close the actions of reaped workers,
+note and decide pending proposals unless paused. Returns the number of
+note proposals decided.
+fn auth_step c long to ulong
+dr = jn_drain
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+if gt au_cell w 80 get aured w
+au_record w
+end
+if gt get swpid w 0
+if and eq get scpause 0 0 gt au_cell w 72 au_cell w 16
+au_decide c w
+k = add k 1
+end
+else
+au_lost w
+end
+end
+ret k
+end
+
+note Creator: revoke the current authority. The generation moves on, so a
+note pending or later proposal made under the old one is refused (5), and
+note every granted tool still running is told to cancel. Its outcome is
+note recorded as reported: performed if it had already exited, UNKNOWN if
+note it was killed. Returns the new generation, or 0 with nothing changed
+note when the journal refused REVOKE.
+fn auth_revoke c long to ulong
+g = add get augen 0 1
+if ne jn_rec 6 g 0 0 0
+ret 0
+end
+put augen 0 g
+r = mapset get aumap 0 8192 8 g
+n = mapget c 48 8
+for w ulong n bound 64
+if and gt get swpid w 0 gt get aujob w 0
+au_ctl w au_cell w 16
+end
+end
+ret g
+end
+
+note Creator: pause (on true) or resume. While paused no job is assigned and
+note no proposal is decided; running tools go on. Every live worker gets a
+note control notification and acknowledges it. Returns sched_pause's count,
+note or -5 with nothing changed when the journal refused PAUSE.
+fn auth_pause c long on bool to long
+v = ulong 0
+if on
+v = 1
+end
+if ne jn_rec 7 v 0 0 0
+ret neg long 5
+end
+r = mapset get aumap 0 8200 8 v
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+au_ctl w 0
+end
+end
+ret long sched_pause c on
+end
+
+note Creator: cancel job j. 1 freed before it started (no effect), 2 its
+note worker was told to cancel and the outcome comes from its report (a
+note pending proposal is refused with 6), 3 already finished, 4 UNKNOWN,
+note -3 no such job. CANCEL is journaled first; a job freed before it
+note started is also released (outcome 300). -5 when the journal refused
+note CANCEL (nothing changed) or that RELEASE (the job is freed, and the
+note journal, now failed, releases it as cancelled at recovery).
+fn auth_cancel c long j ulong to long
+if ge j 64
+ret neg long 3
+end
+id = get sjid j
+if ne jn_rec 8 id 0 0 0
+ret neg long 5
+end
+s = sched_cancel j
+if eq s 1
+if ne jn_rec 5 id 300 0 0
+ret neg long 5
+end
+end
+if eq s 2
+w = get sjw j
+au_ctl w sc_cell w 0
+end
+ret s
+end
+
+note Creator, after auth_new, jn_open and sched_new, before any spawn:
+note settle and release from the journal (jn_recover), then install every
+note journaled action into the action records, move the generation past
+note every journaled one and restore the paused flag. 0 or an error.
+fn auth_recover c long to ulong
+e = jn_recover c
+if ne e 0
+ret e
+end
+op = new ulong 4 0
+for k ulong 64
+if ne jn_act k 0 0
+for i ulong 4
+put op i jn_act k add 1 i
+end
+s = au_alloc op jn_act k 5
+if lt s 0
+ret 32
+end
+b = mul ulong s 32
+put aurec add b 1 jn_act k 6
+put aurec add b 2 jn_act k 7
+put aurec add b 4 jn_act k 8
+end
+end
+put augen 0 jn_gen
+r = mapset get aumap 0 8192 8 jn_gen
+if ne jn_stat 2 0
+r = mapset get aumap 0 8200 8 1
+x = sched_pause c true
+end
+ret 0
+end
+
+note Creator: word i (0..31) of the action record for op, or -1 if none.
+fn auth_act op view ulong 4 i ulong to long
+k = au_find op
+if or lt k 0 gt i 31
+ret neg long 1
+end
+ret long get aurec add mul ulong k 32 i
+end
+
+note Worker w's control or proposal cell word, for the creator's view.
+fn auth_cell w ulong off ulong to ulong
+ret au_cell w off
+end
+
+note Copy up to 3968 bytes of worker w's tool output into dst; the count.
+fn auth_wout w ulong dst edit uchar 4096 to ulong
+n = au_cell w 120
+if gt n 3968
+n = 3968
+end
+if gt n 0
+r = mapread get aumap 1 add mul w 4096 128 dst 0 n
+end
+ret n
+end

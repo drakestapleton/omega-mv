@@ -1,0 +1,875 @@
+note Omega Node tool adapter (DRA-290): the typed coding tools of the
+note round40 repair protocol, one bounded process per granted tool. OM-2:
+note { printf 'om2\n'; cat seed/agent/path.om seed/node/gram.om seed/node/tool.om; } | omc
+note The Node's authority runs it in its own process group (auth_wtool), so
+note cancellation kills it and every compiler or test run it started.
+note Usage:
+note   omnode-tool read ROOT PATH
+note   omnode-tool replace ROOT PATH OLD NEW
+note   omnode-tool check ROOT PATH WORK OMC KIND K N A
+note ROOT is the workspace; PATH must pass omagent's path rule (agpathok,
+note seed/agent/path.om) inside it, and the file is opened without following
+note a final symbolic link. Files are at most 3800 bytes.
+note Record on stdout, exit 0: one line OMNT1 status olen clen, then the
+note observation and the file content back to back. Status: 0 done (Read
+note succeeded., Edit saved., Tests passed.), 1 File not found., 2 path
+note refused, 3 file over 3800 bytes, 4 I/O error, 5 replace refused (old
+note must occur exactly once, 1..40 bytes; new 0..40), 6 check failed (the
+note observation says why). Exit 2: usage.
+note replace writes the new content to PATH.omnode-new, syncs it, renames it
+note over PATH and syncs the directory: Edit saved. means durable.
+note check follows round40 repair.py compile_test: a source that is empty
+note or over 600 bytes is refused; it is compiled with OMC (compile only);
+note a compiler error is returned as omc printed it, trimmed; then every
+note line must be in the bounded repair grammar, calc and main must appear
+note once each, main must keep ret calc int A, and a loop goal needs its
+note for loop. Then for each input of A, 0, 3, 7 (distinct, in order) the
+note candidate with ret calc int replaced is compiled in WORK and run with
+note execpure (Landlock, no new privileges, CPU, file, process and memory
+note ceilings, seccomp; at most 2 s wall clock, then SIGKILL), and its exit
+note status must equal the goal (KIND 1 add x+K, 2 mul x*K, 3 loop x+K*N)
+note with no output. The content returned is the file as checked.
+text tnew ".omnode-new"
+text trec "OMNT1 "
+text oread "Read succeeded."
+text onf "File not found."
+text oedit "Edit saved."
+text opass "Tests passed."
+text orefu "Refused unsupported source."
+text ofns "Required functions missing."
+text omain "main must preserve the requested input."
+text oloop "Required loop missing."
+text otf1 "Test failed: calc("
+text otf2 ") expected "
+text otf3 ", got "
+text otf4 "."
+text orepl "Old text must occur exactly once."
+text opath "Path refused."
+text obig "File is over 3800 bytes."
+text oio "I/O error."
+text cread "read"
+text crepl "replace"
+text ccheck "check"
+text fsrc "c.om"
+text fbin "c.bin"
+text ferr "c.err"
+text fout "c.out"
+text fnull "/dev/null"
+
+note ======== records
+
+fn tl_out o view uchar * n ulong to void
+p = ulong 0
+for it ulong 4096
+if ge p n
+ret
+end
+r = write 1 o p sub n p
+if le r 0
+ret
+end
+p = add p ulong r
+end
+end
+
+note The number of decimal digits of v.
+fn tl_nd v ulong to ulong
+if lt v 10
+ret 1
+end
+ret add 1 tl_nd div v 10
+end
+
+note Append the decimal v to o at p; the new end.
+fn tl_dec o edit uchar * p ulong v ulong to ulong
+d = new uchar 24 0
+k = ulong 0
+x = v
+for i ulong 24
+put d k uchar add 48 rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for j ulong k
+put o add p j get d sub sub k j 1
+end
+ret add p k
+end
+
+fn tl_cat o edit uchar * p ulong a view uchar * n ulong to ulong
+for i ulong n
+put o add p i get a i
+end
+ret add p n
+end
+
+note The record: status st, observation ob[0, on), content cb[0, cn).
+fn tl_rec st ulong ob view uchar * cb view uchar * cn ulong to int
+o = new uchar 8192 0
+p = tl_cat o 0 trec len trec
+p = tl_dec o p st
+put o p 32
+p = tl_dec o add p 1 len ob
+put o p 32
+p = tl_dec o add p 1 cn
+put o p 10
+p = tl_cat o add p 1 ob len ob
+p = tl_cat o p cb cn
+tl_out o p
+ret 0
+end
+
+note ======== files
+
+note Read path pa into b; the length, -2 not found, -3 over 3800 bytes,
+note -4 another error (not a regular file included).
+fn tl_slurp pa view uchar * b edit uchar 4096 to long
+st = new uchar 128 0
+fd = fopen pa 0 len pa 557056 0
+if eq fd -2
+ret neg long 2
+end
+if lt fd 0
+ret neg long 4
+end
+r = fstat int fd st 0 128
+md = or ulong get st 16 shl ulong get st 17 8
+if or lt r 0 ne and md 61440 32768
+x = fclose int fd
+ret neg long 4
+end
+n = ulong 0
+for it ulong 4096
+if ge n 4096
+break
+end
+k = read int fd b n sub 4096 n
+if le k 0
+break
+end
+n = add n ulong k
+end
+x = fclose int fd
+if gt n 3800
+ret neg long 3
+end
+ret long n
+end
+
+note Write b[0, n) to the new file pa (truncated, no final symbolic link)
+note and sync it. 0 or negative.
+fn tl_spit pa view uchar * b view uchar * n ulong to long
+fd = fopen pa 0 len pa 557633 420
+if lt fd 0
+ret fd
+end
+p = ulong 0
+for it ulong 4096
+if ge p n
+break
+end
+k = write int fd b p sub n p
+if le k 0
+x = fclose int fd
+ret neg long 5
+end
+p = add p ulong k
+end
+r = fsync int fd
+x = fclose int fd
+ret r
+end
+
+note Rename a over b (packed list), then sync the directory of b.
+fn tl_mv a view uchar * b view uchar * to long
+pk = new uchar 4096 0
+na = len a
+nb = len b
+put pk 0 2
+put pk 2 uchar and na 255
+put pk 3 uchar shr na 8
+for i ulong na
+put pk add 4 i get a i
+end
+o = add 4 na
+put pk o uchar and nb 255
+put pk add o 1 uchar shr nb 8
+for j ulong nb
+put pk add add o 2 j get b j
+end
+r = renames pk 0 add add o 2 nb 0
+if lt r 0
+ret r
+end
+s = ulong 0
+for k ulong nb
+if eq get b k 47
+s = k
+end
+end
+dn = new uchar 4096 0
+dl = ulong 1
+put dn 0 46
+if gt s 0
+for m ulong s
+put dn m get b m
+end
+dl = s
+end
+fd = fopen dn 0 dl 540672 0
+if lt fd 0
+ret fd
+end
+r = fsync int fd
+x = fclose int fd
+ret r
+end
+
+note ======== read and replace
+
+fn tl_read pa view uchar * to int
+b = new uchar 4096 0
+if not agpathok pa
+ret tl_rec 2 opath b 0
+end
+n = tl_slurp pa b
+if eq n -2
+ret tl_rec 1 onf b 0
+end
+if eq n -3
+ret tl_rec 3 obig b 0
+end
+if lt n 0
+ret tl_rec 4 oio b 0
+end
+ret tl_rec 0 oread b ulong n
+end
+
+note true when a occurs in b at offset i (b holds at least i + len a bytes).
+fn tl_at b view uchar 4096 i ulong a view uchar * to bool
+for j ulong len a
+if ne get b add i j get a j
+ret false
+end
+end
+ret true
+end
+
+note Occurrences of a in b[0, bn), counted without overlap.
+fn tl_count b view uchar 4096 bn ulong a view uchar * to ulong
+an = len a
+c = ulong 0
+i = ulong 0
+for it ulong add bn 1
+if gt add i an bn
+ret c
+end
+if tl_at b i a
+c = add c 1
+i = add i an
+else
+i = add i 1
+end
+end
+ret c
+end
+
+note The offset of the first occurrence of a in b[0, bn) (one is known).
+fn tl_find b view uchar 4096 bn ulong a view uchar * to ulong
+for i ulong bn
+if tl_at b i a
+ret i
+end
+end
+ret bn
+end
+
+note Copy b[s, n) to d at p; the new end.
+fn tl_tail d edit uchar 4096 p ulong b view uchar 4096 s ulong n ulong to ulong
+for i ulong sub n s
+put d add p i get b add s i
+end
+ret add p sub n s
+end
+
+note Durably replace pa with d[0, dn): PATH.omnode-new written and synced,
+note renamed over pa, directory synced. 0 or negative.
+fn tl_save pa view uchar * d view uchar 4096 dn ulong to long
+tn = new uchar 4096 0
+q = tl_cat tn 0 pa len pa
+q = tl_cat tn q tnew len tnew
+r = tl_spit view part tn 0 q d dn
+if eq r 0
+r = tl_mv view part tn 0 q pa
+end
+if lt r 0
+x = unlink tn 0 q
+end
+ret r
+end
+
+note replace with PATH at d[0, L0), OLD at aw[0, L1), NEW at aw[1024, L2).
+fn tl_repl d view uchar 8192 aw view uchar 2048 l view ulong 4 to int
+b = new uchar 4096 0
+o = new uchar 4096 0
+if not agpathok view part d 0 get l 0
+ret tl_rec 2 opath b 0
+end
+if or or eq get l 1 0 gt get l 1 40 gt get l 2 40
+ret tl_rec 5 orepl b 0
+end
+n = tl_slurp view part d 0 get l 0 b
+if eq n -2
+ret tl_rec 1 onf b 0
+end
+if eq n -3
+ret tl_rec 3 obig b 0
+end
+if lt n 0
+ret tl_rec 4 oio b 0
+end
+if ne tl_count b ulong n view part aw 0 get l 1 1
+ret tl_rec 5 orepl b ulong n
+end
+p = tl_edit b ulong n aw l o
+if gt p 3800
+ret tl_rec 3 obig b ulong n
+end
+if lt tl_save view part d 0 get l 0 o p 0
+ret tl_rec 4 oio b ulong n
+end
+ret tl_rec 0 oedit o p
+end
+
+note b[0, n) with its one OLD replaced by NEW into o; the length.
+fn tl_edit b view uchar 4096 n ulong aw view uchar 2048 l view ulong 4 o edit uchar 4096 to ulong
+i = tl_find b n view part aw 0 get l 1
+p = tl_cat o 0 b i
+p = tl_cat o p view part aw 1024 get l 2 get l 2
+ret tl_tail o p b add i get l 1 n
+end
+
+note ======== check
+
+note The trimmed span of b[0, n) (ASCII white space) into m[0], m[1].
+fn tl_trim b view uchar 4096 n ulong m edit ulong 16 to void
+s = ulong 0
+for i ulong n
+if gt get b s 32
+break
+end
+s = add s 1
+end
+e = n
+for j ulong sub n s
+if gt get b sub e 1 32
+break
+end
+e = sub e 1
+end
+put m 0 s
+put m 1 e
+end
+
+note Grammar and structure of b[0, n): 0 good, else the refusal (1
+note unsupported, 2 functions, 3 main input, 4 loop). The value of the one
+note ret calc int line goes to m[2], its line start to m[3], end to m[4].
+fn tl_shape b view uchar 4096 n ulong kind ulong m edit ulong 16 to ulong
+tl_trim b n m
+for q ulong 4
+put m add 10 q 0
+end
+a = get m 0
+for it ulong add n 1
+if gt a get m 1
+break
+end
+z = gr_eol b a get m 1
+if not tl_tally b a z m
+ret 1
+end
+a = add z 1
+end
+if or ne get m 10 1 ne get m 11 1
+ret 2
+end
+if ne get m 12 1
+ret 3
+end
+if and eq kind 3 eq get m 13 0
+ret 4
+end
+ret 0
+end
+
+note Count line b[a, z) into m: 10 calc, 11 main, 12 ret calc int (value
+note to m[2], span to m[3], m[4]), 13 for loops. false outside the grammar.
+fn tl_tally b view uchar 4096 a ulong z ulong m edit ulong 16 to bool
+if not gr_gram b a z
+ret false
+end
+if gr_lin b a z 0 0
+put m 10 add get m 10 1
+end
+if gr_lin b a z 1 0
+put m 11 add get m 11 1
+end
+if gr_lin b a z 9 1
+put m 13 add get m 13 1
+end
+if gr_lin b a z 5 2
+put m 12 add get m 12 1
+put m 2 tl_num b add a len grcal z
+put m 3 a
+put m 4 z
+end
+ret true
+end
+
+fn tl_num b view uchar 4096 a ulong e ulong to ulong
+v = ulong 0
+for i ulong sub e a
+v = add mul v 10 sub ulong get b add a i 48
+end
+ret v
+end
+
+note ======== processes
+
+note Wait for pid up to dl ns; kill its group at the deadline. The wait
+note status word (exit code in byte 1, signal in byte 0's low 7 bits).
+fn tl_wait pid long dl ulong to ulong
+ws = new uchar 4 0
+t0 = ulong monons
+for it ulong 100000
+g = waitpid int pid ws 0 4 1
+if gt g 0
+ret or ulong get ws 0 shl ulong get ws 1 8
+end
+if lt g 0
+ret 65535
+end
+if ge sub ulong monons t0 dl
+x = killpid neg int pid 9
+g = waitpid int pid ws 0 4 0
+ret 65535
+end
+x = sleepns 1000000
+end
+ret 65535
+end
+
+note The child's stdin (k 0) or stdout (k 1) for mode md, opened.
+fn tl_fd md ulong k ulong to long
+if eq md 0
+if eq k 0
+ret fopen fsrc 0 len fsrc 524288 0
+end
+ret fopen fbin 0 len fbin 524865 448
+end
+if eq k 0
+ret fopen fnull 0 len fnull 524288 0
+end
+ret fopen fout 0 len fout 524865 448
+end
+
+note Run the packed argv pk[0, pn) in its own process group. md 0 (the
+note compiler): stdin c.om, stdout c.bin, execprog, 10 s. md 1 (a test):
+note stdin /dev/null, stdout c.out, execpure, 2 s (round40's timeout).
+note stderr to c.err. The wait status, or 65535 when it did not finish
+note (its group is killed).
+fn tl_run pk view uchar 4096 pn ulong md ulong to ulong
+pid = fork
+if eq pid 0
+r = setpgid 0 0
+fi = tl_fd md 0
+fo = tl_fd md 1
+fe = fopen ferr 0 len ferr 524865 448
+if or or lt fi 0 lt fo 0 lt fe 0
+exit 120
+end
+r = dupfd int fi 0 0
+r = dupfd int fo 1 0
+r = dupfd int fe 2 0
+if eq md 1
+r = execpure pk 0 pn
+else
+r = execprog pk 0 pn
+end
+exit 121
+end
+if lt pid 0
+ret 65535
+end
+r = setpgid int pid int pid
+if eq md 1
+ret tl_wait pid 2000000000
+end
+ret tl_wait pid 10000000000
+end
+
+note Pack one or two arguments into pk; the length.
+fn tl_pack pk edit uchar 4096 a view uchar * b view uchar * to ulong
+na = len a
+nb = len b
+c = ulong 1
+if gt nb 0
+c = 2
+end
+put pk 0 uchar c
+put pk 1 0
+put pk 2 uchar and na 255
+put pk 3 uchar shr na 8
+for i ulong na
+put pk add 4 i get a i
+end
+o = add 4 na
+if eq c 1
+ret o
+end
+put pk o uchar and nb 255
+put pk add o 1 uchar shr nb 8
+for j ulong nb
+put pk add add o 2 j get b j
+end
+ret add add o 2 nb
+end
+
+note The trimmed compiler message of file c.err into ob; its length.
+fn tl_cerr ob edit uchar 4096 to ulong
+b = new uchar 4096 0
+m = new ulong 16 0
+n = tl_slurp ferr b
+if lt n 0
+ret 0
+end
+tl_trim b ulong n m
+k = sub get m 1 get m 0
+for i ulong k
+put ob i get b add get m 0 i
+end
+ret k
+end
+
+note Compile src[0, n) to c.bin in the current (WORK) directory with omc
+note path oc. 0 compiled, 1 refused by omc (message in c.err), 2 failed.
+fn tl_omc oc view uchar * src view uchar * n ulong to ulong
+pk = new uchar 4096 0
+none = new uchar 1 0
+if ne tl_spit fsrc src n 0
+ret 2
+end
+pn = tl_pack pk oc view part none 0 0
+ws = tl_run pk pn 0
+if eq ws 0
+ret 0
+end
+if ne and ws 127 0
+ret 2
+end
+c = and shr ws 8 255
+if or eq c 120 eq c 121
+ret 2
+end
+ret 1
+end
+
+note The wait status ws of a test run as the round40 return code: the exit
+note code, or minus the signal.
+fn tl_code ws ulong to long
+if eq ws 65535
+ret neg long 9
+end
+if ne and ws 127 0
+ret neg long and ws 127
+end
+ret long and shr ws 8 255
+end
+
+note Test failed: calc(x) expected w, got g. into ob; its length.
+fn tl_tfail ob edit uchar 4096 x ulong w ulong g long to ulong
+p = tl_cat ob 0 otf1 len otf1
+p = tl_dec ob p x
+p = tl_cat ob p otf2 len otf2
+p = tl_dec ob p w
+p = tl_cat ob p otf3 len otf3
+v = ulong 0
+if lt g 0
+put ob p 45
+p = add p 1
+v = ulong neg g
+else
+v = ulong g
+end
+p = tl_dec ob p v
+ret tl_cat ob p otf4 len otf4
+end
+
+note The goal for input x of kind m[5] (1 add, 2 mul, 3 loop), K m[6], N m[7].
+fn tl_want m view ulong 16 x ulong to ulong
+if eq get m 5 1
+ret add x get m 6
+end
+if eq get m 5 2
+ret mul x get m 6
+end
+ret add x mul get m 6 get m 7
+end
+
+note true when the file c.out is empty.
+fn tl_quiet to bool
+st = new uchar 128 0
+r = stat fout 0 len fout st 0 128
+if lt r 0
+ret false
+end
+for i ulong 8
+if ne get st add 48 i 0
+ret false
+end
+end
+ret true
+end
+
+note Run c.bin for input m[9]: 0 passed, else the observation's length in ob.
+fn tl_exec m view ulong 16 ob edit uchar 4096 to ulong
+pk = new uchar 4096 0
+none = new uchar 1 0
+pn = tl_pack pk fbin view part none 0 0
+g = tl_code tl_run pk pn 1
+x = get m 9
+w = tl_want m x
+if and eq g long w tl_quiet
+ret 0
+end
+ret tl_tfail ob x w g
+end
+
+note One test: the candidate b with input x = m[9] (ret calc int line
+note m[3]..m[4]) compiled and run. 0 passed, else the length of the
+note observation in ob, or 4096 for an I/O failure.
+fn tl_test oc view uchar * b view uchar 4096 n ulong m view ulong 16 ob edit uchar 4096 to ulong
+c = new uchar 4096 0
+p = tl_cat c 0 b get m 3
+p = tl_cat c p grcal len grcal
+p = tl_dec c p get m 9
+p = tl_tail c p b get m 4 n
+r = tl_omc oc view part c 0 p p
+if eq r 1
+ret tl_cerr ob
+end
+if ne r 0
+ret 4096
+end
+ret tl_exec m ob
+end
+
+note Inputs A, 0, 3, 7 without repeats, in that order: the i-th, or 999.
+fn tl_input a ulong i ulong to ulong
+v = new ulong 4 0
+put v 0 a
+put v 1 0
+put v 2 3
+put v 3 7
+k = ulong 0
+for j ulong 4
+dup = false
+for q ulong j
+if eq get v q get v j
+dup = true
+end
+end
+if not dup
+if eq k i
+ret get v j
+end
+k = add k 1
+end
+end
+ret 999
+end
+
+note The check of b[0, n) (m[5..8] = kind, K, N, A) in WORK; the record.
+fn tl_check2 oc view uchar * b view uchar 4096 n ulong m edit ulong 16 to int
+ob = new uchar 4096 0
+if or eq n 0 gt n 600
+ret tl_rec 6 orefu b n
+end
+r = tl_omc oc b n
+if eq r 1
+k = tl_cerr ob
+ret tl_rec 6 view part ob 0 k b n
+end
+if ne r 0
+ret tl_rec 4 oio b n
+end
+sh = tl_shape b n get m 5 m
+if eq sh 1
+ret tl_rec 6 orefu b n
+end
+if eq sh 2
+ret tl_rec 6 ofns b n
+end
+if or eq sh 3 ne get m 2 get m 8
+ret tl_rec 6 omain b n
+end
+note round40 wants the line to read exactly ret calc int A (no leading 0).
+if ne sub get m 4 get m 3 add len grcal tl_nd get m 8
+ret tl_rec 6 omain b n
+end
+if eq sh 4
+ret tl_rec 6 oloop b n
+end
+for i ulong 4
+x = tl_input get m 8 i
+if eq x 999
+break
+end
+put m 9 x
+t = tl_test oc b n m ob
+if eq t 4096
+ret tl_rec 4 oio b n
+end
+if ne t 0
+ret tl_rec 6 view part ob 0 t b n
+end
+end
+ret tl_rec 0 opass b n
+end
+
+note Argument i into a fresh slice of d at offset o (at most 1024 bytes);
+note its length, or -1.
+fn tl_arg i ulong d edit uchar 8192 o ulong to long
+ret argread i d o 1024
+end
+
+fn tl_cnum i ulong to ulong
+b = new uchar 16 0
+n = argread i b 0 16
+if or lt n 1 gt n 3
+ret 999
+end
+v = ulong 0
+for j ulong ulong n
+c = ulong get b j
+if or lt c 48 gt c 57
+ret 999
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+
+note check ROOT PATH WORK OMC KIND K N A, after chdir ROOT.
+fn tl_check d edit uchar 8192 to int
+b = new uchar 4096 0
+m = new ulong 16 0
+put m 5 tl_cnum 6
+put m 6 tl_cnum 7
+put m 7 tl_cnum 8
+put m 8 tl_cnum 9
+if or or lt get m 5 1 gt get m 5 3 or gt get m 6 99 gt get m 7 99
+ret 2
+end
+if gt get m 8 99
+ret 2
+end
+on = tl_arg 5 d 0
+pn = tl_arg 3 d 1024
+wn = tl_arg 4 d 2048
+if or or lt on 1 lt pn 1 lt wn 1
+ret 2
+end
+put m 14 ulong on
+put m 15 ulong pn
+ret tl_chk1 d ulong wn m b
+end
+
+note check, with OMC at d[0, m14), PATH at d[1024, m15), WORK at d[2048, wn).
+fn tl_chk1 d edit uchar 8192 wn ulong m edit ulong 16 b edit uchar 4096 to int
+if not agpathok view part d 1024 get m 15
+ret tl_rec 2 opath b 0
+end
+n = tl_slurp view part d 1024 get m 15 b
+if eq n -2
+ret tl_rec 1 onf b 0
+end
+if eq n -3
+ret tl_rec 3 obig b 0
+end
+if lt n 0
+ret tl_rec 4 oio b 0
+end
+r = chdir d 2048 wn
+if lt r 0
+ret tl_rec 4 oio b 0
+end
+ret tl_check2 view part d 0 get m 14 b ulong n m
+end
+
+fn tl_main to int
+d = new uchar 8192 0
+c = argcnt
+if lt c 4
+ret 2
+end
+cn = tl_arg 1 d 4096
+if lt cn 1
+ret 2
+end
+rn = tl_arg 2 d 5120
+if lt rn 1
+ret 2
+end
+if lt chdir d 5120 ulong rn 0
+ret 2
+end
+if and heq2 view part d 4096 ulong cn ccheck eq c 10
+ret tl_check d
+end
+pn = tl_arg 3 d 0
+if lt pn 0
+ret 2
+end
+if and heq2 view part d 4096 ulong cn cread eq c 4
+ret tl_read view part d 0 ulong pn
+end
+if and heq2 view part d 4096 ulong cn crepl eq c 6
+ret tl_rmain d ulong pn
+end
+ret 2
+end
+
+note replace ROOT PATH OLD NEW, with PATH at d[0, pn).
+fn tl_rmain d edit uchar 8192 pn ulong to int
+aw = new uchar 2048 0
+l = new ulong 4 0
+an = argread 4 aw 0 1024
+wn = argread 5 aw 1024 1024
+if or lt an 0 lt wn 0
+ret 2
+end
+put l 0 pn
+put l 1 ulong an
+put l 2 ulong wn
+ret tl_repl d aw l
+end
+
+fn heq2 a view uchar * t view uchar * to bool
+if ne len a len t
+ret false
+end
+for i ulong len a
+if ne get a i get t i
+ret false
+end
+end
+ret true
+end
+
+fn main to int
+ret tl_main
+end

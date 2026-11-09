@@ -370,3 +370,15 @@ decoded by a second `hpack`/`xhpack` pass; no function was added (508 of 512).
 Every one of the 1357 tracked `.om` files compiles to the same bytes, exit
 status and diagnostics under `5f90edea` and `cfd96b48`, so no existing unit's
 emission changes. Gate: `seed/host/execenv/execenv.cases`.
+
+x86 types `fma` operands before its error 9 (branch `fix/x86-fma-order`,
+OMEGESE.md 9.9) births compiler
+`0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f`
+from source
+`7d8026837cfcafe53222228f076e4dab58279ae78a4b008440e6262f5b3c91ab`.
+No host word changes and no function was added (508 of 512). Each of the 1485
+tracked `.om` files was compiled alone for AArch64 and for `target x86linux`
+under `cfd96b48` and `0f2de851`: 2962 of the 2970 compiles give the same bytes,
+exit status and diagnostics; the other 8 are the x86 compiles of the ill-typed
+`seed/omc/tests/float/neg_fma_*` refusals, error 9 before and now the AArch64
+error 7 or 11. Gate: `seed/omc/gate8.sh` (`refuse_x86`).

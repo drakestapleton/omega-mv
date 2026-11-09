@@ -47,12 +47,13 @@ fib38), so any future codegen A/B reports an aligned control.
    after the current one (it moves to a stack slot); otherwise the current interval gets a slot. Slots are 8 bytes at
    `[sp, 8k]`. A spilled value is loaded into x16/x17/x15 before each use and stored after its definition. There is no
    limit on live values but the frame size.
-6. **Frame** (`a6_frame`, `a6_alay`, `a6_pro`, `a6_epi`): round16(8 x (slots + callee-saved registers used + x30 if
-   the function calls)) <= 4095, then one 16-byte aligned area per `alloca` (its type's size rounded to 16); the
-   frame F < 2^24. Prologue `SUB SP, SP, #F` (as `#hi, LSL 12` and `#lo` when F > 4095), `CMP SP, X28; B.LO trap6`
-   (before any store, omc's stack-floor rule), then the saves above the slots. Epilogue: reloads, `ADD SP` the same
-   way, `RET`. A function with F = 0 has no frame code. Save form A uses pairs while the save area ends at or below
-   byte 504, else form B.
+6. **Frame** (`a6_frame`, `a6_alay`, `a6_pro`, `a6_epi`): round16(8 x (outgoing slots + spill slots + callee-saved
+   registers used + x30 if the function calls)) <= 4095, then one 16-byte aligned area per `alloca` (its type's size
+   rounded to 16); the frame F < 2^24. The outgoing slots (`a6_outm`: the most arguments past the eighth of any call in
+   the function) are slots 0.., the spill slots follow them. Prologue `SUB SP, SP, #F` (as `#hi, LSL 12` and `#lo`
+   when F > 4095), `CMP SP, X28; B.LO trap6` (before any store, omc's stack-floor rule), then the saves above the
+   slots. Epilogue: reloads, `ADD SP` the same way, `RET`. A function with F = 0 has no frame code. Save form A uses
+   pairs while the save area ends at or below byte 504, else form B.
 7. **Selection** (`a6_sel`), one op at a time, operands read before the result register is written (the result may
    reuse an operand's register):
    - narrow integers live extended to 64 bits by their type (zero u8..u32, sign i8..i32); arithmetic results are
@@ -63,13 +64,16 @@ fib38), so any future codegen A/B reports an aligned control.
      rotl by the negated amount); min max: CMP + CSEL; eq..ge: CMP + CSET; select: CMP c, #0 + CSEL;
      integer conv and bitcast: move + re-extend;
    - br: block arguments as one parallel move, `B` omitted on fall-through; cbr: CBNZ/CBZ (+ B);
-     call: arguments to x0..x7 as one parallel move, BL (patched when every function is placed), result from x0;
+     call: arguments 8.. stored to the outgoing slots `[sp, 8j]` (through x16 from a spill slot), arguments 0..7 to
+     x0..x7 as one parallel move, BL (patched when every function is placed), result from x0; SP never moves inside a
+     function, so the frame's stack check covers the outgoing area;
      ret retv; trap: B to the stub; exit: `MOVZ X8, #93; SVC #0`;
    - checks: chk.add/sub/neg 64-bit by flags (B.VS signed; B.HS / B.LO / B.NE unsigned), chk.mul 64-bit by SMULH
      against the sign of the low half or UMULH = 0, narrower types by computing the exact 64-bit result and comparing
      it with its own re-extension; chk.divz CBZ; chk.divovf `((b + 1) | (a ^ MIN)) = 0`; chk.shl; chk.shift
      (unsigned CMP with the width); chk.conv between integers; chk.fuel CMP + B.HS; chk.true CBZ. Facts emit nothing.
-   - memory (IR.md s7.5), REF to ARRAY of bool or integers only: a REF is one register holding the object's address.
+   - memory (IR.md s7.5), REF to ARRAY of bool or integers (SLICE values below): a REF is one register holding the
+     object's address.
      load/store: LDR/STR register offset, index scaled by the element size (LDRB/LDRH/LDR W/LDR X; LDRSB/LDRSH/
      LDRSW for i8/i16/i32 keep the canonical sign extension); gaddr: the global's absolute address (MOVZ + MOVK);
      len: the ARRAY count from the type; alloca: `ADD Xd, SP, #area`, then `STP XZR, XZR, [X16], #16` per 16 bytes
@@ -77,10 +81,27 @@ fib38), so any future codegen A/B reports an aligned control.
      covering form, s8) is `CMP Xi, #(len - e); B.HI trap` (exact, no add that could wrap), e = 0 or e > len a
      plain `B trap`; any other e `CBZ`, `len - e` by SUBS (`B.LO`), then CMP + B.HI. chk.slice r off n: `off > len`
      or `n > len - off`, each CMP + B.HI. The back end trusts ngcheck's coverage (an access follows its check).
+   - SLICE values (IR.md s4.2 kind 5) of bool or integer elements: two wires. The value's own wire holds the
+     address of element 0; a length wire (`a6_shw`, made after liveness with the value's interval, so the scan
+     allocates it like any value: register, callee-saved when it crosses a call, or a slot) holds the count. A move
+     of a slice moves both (`a6_mvv`: block arguments, E-tail parameters); a call passes a slice as two machine
+     arguments, address then count (`a6_xcall`, `a6_xpar`, `a6_xcnt`), so a slice may straddle x7 and the first
+     stack slot. `slice r off n` (r a REF to ARRAY or a SLICE): `ADD X16, Xr, Xoff, LSL #log2(size)` and `X15 = n`
+     before either result wire is written (both may reuse operand registers); `len` of a SLICE reads the length
+     wire; load and store use the address wire like a REF. chk.bounds on a SLICE: `CBZ e`, `SUBS X15, len, e` +
+     `B.LO` (e > len), CMP i + `B.HI`; chk.slice on a SLICE: CMP off, len + `B.HI`, `X15 = len - off`, CMP n +
+     `B.HI`. A slice result of any op but `slice` (select, call) and `retv` of a slice are refused (exit 5).
    - host words read (53) and write (54) (IR.md s7.11): `X17 = A + off`, then x0 fd, x1 X17, x2 n as one parallel
      move, `MOVZ X8, #63/64; SVC #0`, result (count or minus errno) from x0. The SVC preserves every register but x0;
      the arguments use x0..x2, so a host word counts as a call for allocation (values live across it take x19..x27)
-     without saving x30. Every other host word is refused (exit 5, `a64: unsupported` with the word id).
+     without saving x30. cpufence (199) is `DSB SY` and cpurelax (200) `YIELD`, omc's words. monons (109) and realns
+     (130) are omc's hclock (`a6_hclk`, clock id 1 or 0 as omc's): `SUB SP, #16` with the stack-floor check (trap 6),
+     `STP XZR, XZR, [SP]`, SVC 113 clock_gettime into that area, `sec > 9223372036` B.HI trap 1, `sec * 10^9 + nsec`
+     by MUL and ADDS (B.VS trap 1), then `CMP X0, #0; CSEL X0, X0, X2, LT` returns minus errno for a failed call where
+     omc branches (the zeroed area makes the failed path compute 0 without trapping). Every other host word is refused
+     (exit 5, `a64: unsupported` with the word id).
+   - fill r v (51) on a REF to ARRAY (count from the type) or a SLICE (count from its length wire): `X15 = count;
+     CBZ X15, done; loop: SUBS X15, X15, #1; STR v, [base, X15, LSL #size]; B.NE loop` (last element first).
 8. **Parallel moves** (`a6_pmove`): a move fires when no pending move reads its destination; when all are blocked
    (a cycle), one source goes to x15 and its readers read x15. Slot-to-slot moves go through x16.
 8a. **E loop shape** (`a6_tre`, D13): a block ending `r = call f(...); s = add a r` (either operand order)
@@ -117,10 +138,13 @@ fib38), so any future codegen A/B reports an aligned control.
 `a6_okreg`'s `lt r 15` (the spill scan's register set) cannot change output on its own: only `a6_give` marks a
 register active, with a register from `a6_free` (never x15) or from the spill scan (already active), so x15 is
 never active and the scan skips it. Widening it to x15 (review mutant M-C of 8a3680b0) gave byte-identical ELFs
-for all 14 rgate fixtures in both forms (28/28); it is an equivalent mutant and is not in rgate's list.
+for all 14 mkir fixtures in both forms (28/28, on ng/a64-m1-fix); it is an equivalent mutant and is not in rgate's
+list.
 
-Calls between ng functions use x0..x7 for arguments (more than 8 is refused) and x0 for the result; there is no
-outside caller in program mode, so this is the only contract.
+Calls between ng functions use x0..x7 for arguments 0..7, the caller's outgoing slots `[sp, 8j]` for argument 8 + j
+(at most 64 arguments, IR.md s12), and x0 for the result. The callee reads argument 8 + j at `[sp + F + 8j]` after its
+prologue (x17 = SP + F, then `LDR`, `a6_inpar`), once the x0..x7 parameters are in place. There is no outside caller
+in program mode, so this is the only contract.
 
 ## 4. Encoder layer
 
@@ -141,11 +165,13 @@ bits there (multiply, two-source, float). The selector never asks for these; the
 
 1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
    in a callee-saved register across its loop).
-2. Memory beyond the slice: SLICE values (`slice`, `len` of a SLICE; two words per value), STRUCT fields (`fload`,
-   `fstore`, `fref`), VEC (`vload`, `vstore`), `fill`, `atom`, `atomcas`, float elements; host words other than read
-   and write. Bounds checks hoisted out of loops by a pass that proves them (IR.md s15).
+2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `atom`, `atomcas`,
+   float elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass that
+   proves them (IR.md s15).
 3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
-4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, > 8 arguments.
+4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), u8/u16 rotations, host words beyond
+   read, write, monons, realns, cpufence and cpurelax (sleepns 120 has no ngrun reference: ngrun's host words are
+   read, write, monons, realns, cpufence, cpurelax).
 
 ## 6. Gates (run from the omega-mv root on core 1)
 
@@ -153,9 +179,9 @@ bits there (multiply, two-source, float). The selector never asks for these; the
   objdump (referee) and compares each case's text. Negative control: a wrong-bit mutant must fail cases. Then each
   line of `tests/enc-refuse.cases` runs alone: ng must exit 5, write no word and print exactly the line's stderr
   text; mutant M-A (`a6_fld` masks instead of refusing) must fail at least one of them.
-- `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck and ng. For every fixture (fib, deep, press, rot,
-  ck, ar, tsum, mem, oob, zf, wid, bcopy, sort, lv) ngcheck must accept the ΩIR, `@ng a64` and `@ng a64 split` must
-  exit with the expected status (computed with Wolfram, or the check's trap code), the omc build of
+- `rgate.om` (back end): builds mkir (`tests/mkir.om`), ngcheck, ngas, ngrun and ng. For every mkir fixture (fib,
+  deep, press, rot, ck, ar, tsum, mem, oob, zf, wid, bcopy, sort, lv) ngcheck must accept the ΩIR, `@ng a64` and
+  `@ng a64 split` must exit with the expected status (computed with Wolfram, or the check's trap code), the omc build of
   `tests/ref/N.om` with its omc expectation (the same, except tsum: omc traps 6 a million calls deep, ng's loop does
   not; BEYOND_OMC), the split and omc runs must print exactly the bytes the `@ng a64` run printed, and every BL
   target in the `@ng a64` ELF must be a multiple of 64. mkir lowers main's `int` as IR.md s13 does (chk.conv i32
@@ -163,18 +189,63 @@ bits there (multiply, two-source, float). The selector never asks for these; the
   (review P2-1 of 8a3680b0: the earlier fixture had no chk.conv and its 32 was not Omega's result). bcopy and sort
   are the bench kernels
   (`~/handoffs/OmegaFast/bench/`) lowered by hand per IR.md s13, with the bench source itself as the omc reference;
-  their output is also checked against Wolfram (bcopy's SHA-256, sort's four numbers). Sixteen mutants (spill
-  reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves, frame size, 16-byte entry
-  alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half zero fill, write count,
-  u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending, x15 allocatable) must each
-  change at least one fixture's status or alignment. lv keeps 20 values live with no call across chk.add, chk.mul
-  and chk.bounds, so an allocator that hands out x15 loses one of them (status 89, not 165). The memory fixtures
-  store and load every integer element width (u8 u64 in mem,
-  i8 u16 i16 u32 i32 in wid); wid compares each loaded value at its own type, because a conversion re-extends from
-  its source type and would hide a non-canonical load (rgate's first form of mutants 13 and 15 escaped that way).
-- ΩIR gap met by sort: a call argument must have exactly the parameter's type (IR.md row 64), so Omega passing an
-  `edit` array to a `view` parameter has no ΩIR form while `view` maps to REF access 0. The fixture types sorted's
-  parameter as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
+  their output is also checked against Wolfram (bcopy's SHA-256, sort's four numbers). The memory fixtures store and
+  load every integer element width (u8 u64 in mem, i8 u16 i16 u32 i32 in wid); wid compares each loaded value at its
+  own type, because a conversion re-extends from its source type and would hide a non-canonical load (rgate's first
+  form of mutants 13 and 15 escaped that way). lv keeps 20 values live with no call across chk.add, chk.mul and
+  chk.bounds, so an allocator that hands out x15 loses one of them (status 89, not 165).
+
+  Then the ngrun fixtures (D9): ΩIR text assembled by ngas, accepted by ngcheck and run by ngrun (ng-ir's reference
+  interpreter, IR.md s7); both ng forms must give ngrun's exit status (a program's, never 125) and its stdout and
+  stderr byte for byte. They are ng-ir's run pairs (`seed/ng/tests/ir/x-*.oir` but x-float, each already judged
+  against omc by ng-ir's gate) and `tests/oir/`: `c-OP-TYPE` for every check op 70..82 on narrow and 64-bit types
+  (a call at the boundary that must pass, its 8 result bytes written, then one past it that must trap with the op's
+  code; chk.true with codes 1, 9, 10, 13), `wide` (20-, 10- and 9-parameter functions: stack arguments, a callee
+  that calls with stack arguments, an unused parameter, u8 and i32 among them, values live across calls; Wolfram:
+  a99d319d002e6e04 and 599bcde54693cac2), `mem2` (a class-1 data global read through a view, zero globals of u8, i64,
+  u16, i32 stored and reloaded in block-parameter loops, an FNV-style checksum; Wolfram ff234afefa35d586), `eloop`
+  (D13 item 4: two E-shaped self calls, 50000 and 60000 deep for ngrun, one wrapping in u32; Wolfram 4a81de28 and
+  3550e837), and the bench kernels as text: `b-fib` (fib 27 and the bench's decimal printer; 196418), `b-bcopy` and
+  `b-sort` (ngdis of mkir's bcopy and sort, scaled to 8 rounds and 400 elements so ngrun finishes inside rgate's
+  30 s child limit; Wolfram for sort: 214018279158 0 2818 3982316). The full-size kernels stay in the mkir set
+  against omc. `b-chacha` is the ChaCha20 bench (`~/handoffs/OmegaFast/bench/chacha.om` over `om/tls/chacha.om`,
+  `chacha20_xor` and everything below it) lowered by hand to ΩIR with SLICE parameters, inline functions inlined and
+  unrolled loops unrolled, scaled to a 300-byte buffer (four whole blocks and a 44-byte tail) and 3 rounds. Besides
+  ngrun, omc's build of `om2` + `om/tls/chacha.om` + the bench driver with those two numbers changed writes the same
+  300 bytes (checked once by hand, 2026-11-07; not part of rgate). The `s-*` fixtures cover SLICE values: `s-slice`
+  (slices of a REF and of a slice, u8, u32 and u64 elements, `len`, a shrinking slice carried as a loop block
+  parameter, slices straddling x7 and the stack in an 11-parameter call, fourteen slices live across calls so their
+  length wires spill, a host write from a slice) and `s-tb`, `s-te`, `s-ts`, `s-ts2` (chk.bounds index = len,
+  constant e > len, chk.slice n > len - off and off > len on slices with a run-time length, each after a passing
+  call at the boundary). SHA-256 and X25519 are not lowered by hand: their sources use only ops covered here
+  (integer arithmetic with div/rem, not, rotr at 32 and 64 bits, shifts, arrays and u8/u64 slices); they run end to
+  end once ng-front lowers them. `h-mono` (two monons reads around a loop; exit 7 when the first reading exceeds
+  10^9, the second is not smaller and they differ by less than 10^12 ns, whatever the clock says) is ng-front's
+  `@ng front-ir` output for an Omega source, as ngdis text; omc's build of the source exits 7 as well. `f-fill`
+  (the same route: u32, u8, u64, u16 arrays filled with nonzero values; Wolfram: 37*5 + 64*65535 + 3*9 + 200 =
+  4194652) and `f-fills` (a run-time-length u32 slice filled through a call, a zero-length slice, five read-backs;
+  Wolfram: 30) cover fill. `h-real` (front-generated the same way: realns between 2023-11-14 and 2100-01-01 in
+  nanoseconds, above monons, not decreasing; Wolfram: UnixTime of those dates times 10^9 = 1700000000000000000 and
+  4102444800000000000; exit 9) covers realns, and fails if it reads the monotonic clock. The clock traps (seconds
+  above 9223372036, the add overflowing) and the failed-call path cannot be reached by a live clock; they are checked
+  by reading the encoded sequence (objdump) against omc's hclock, not by a fixture.
+
+  Twenty-five mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
+  frame size, 16-byte entry alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half
+  zero fill, write count, u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending, a wrong
+  trap code for chk.divovf, stack parameters read from the first incoming slot, stack arguments stored one slot low,
+  a slice's length taken from its offset, slice block arguments keeping the target's length, slice offsets not
+  scaled by the element size, monons selecting on GE, fill stores unscaled, realns on the monotonic clock, x15
+  allocatable) must each change at least one fixture's status (against its expectation or ngrun's) or alignment.
+- Front to back differential (not part of rgate; ng-front's front-ir is on another branch): ng-front's `@ng
+  front-ir` (omega-mv ng/front-m3 3353ad67) lowers each `run` case of its `cases-front-ir.txt`; ngcheck accepts all
+  25; `@ng a64` and `@ng a64 split` of that ΩIR give omc's exit status and stdout for the 14 integer `x-*` pairs and
+  the nine integer bench kernels arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul (full size; each
+  prints a 9 to 41 byte checksum line, byte-identical; the kernels' elapsed time goes to stderr, not compared).
+  x-float and linear are refused (floats). Checked 2026-11-07.
+- ΩIR gap met by sort and chacha: a call argument must have exactly the parameter's type (IR.md row 64), so Omega
+  passing an `edit` array or slice to a `view` parameter has no ΩIR form while `view` maps to access 0. The fixtures
+  type such parameters as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
 
 ## 7. Scheduling facts used (Cortex-X925 Software Optimization Guide, `~/docs/arm-cores`)
 

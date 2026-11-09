@@ -1,0 +1,609 @@
+note Omega Node inference adapter (DRA-290): one bounded completion from the
+note own model's ollm serve (aien-train, DRA-119) over loopback, turned into a
+note versioned typed record. Composition, OM-2:
+note { printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om
+note seed/net/http.om seed/net/notls.om seed/node/infer.om; } | omc
+note Usage: omnode-infer PORT MAXTOK DEADLINE_S PROMPT [TESTOUT]
+note It connects only to 127.0.0.1 (offline-local: no other host, no TLS, no
+note credential) and refuses port 18091. POST /v1/completions with the prompt
+note as the whole template, greedy (top_p 0), seed 1, stream false. TESTOUT
+note is sent as ollm_test_output, which only a server started with test=1
+note honours; the Node's workflow never passes it.
+note The whole exchange (connect, request, generation, response) has one
+note deadline. A caller cancels by killing the process group; the server
+note sees the connection close and stops generating.
+note Record on stdout, exit 0: one line
+note OMNI1 kind fin ptok ctok plen olen nlen tlen
+note then the path, old, new and raw text bytes back to back. kind: 1
+note read_file, 2 omega_check, 3 replace_text, 4 the answer Tests passed.,
+note 5 the answer File not found., 9 the text is not a protocol action (the
+note model's turn is returned, never repaired). fin: 1 stop, 2 length, 0
+note other. The action is the text before the first newline-Done., trimmed,
+note as the round40 repair protocol reads it: a JSON object of exactly
+note {tool,path} for read_file and omega_check, or {tool,path,old,new} for
+note replace_text; path 1..128 bytes, old 1..40, new 0..40, no NUL byte.
+note Other exits: 2 usage, 3 prompt (1..3800 bytes, no NUL), 4 connect, 5
+note deadline, 6 HTTP status other than 200 (OMNE1 status, then the body
+note head, on stdout), 7 malformed response, 8 server busy (503) until less
+note than 2 s of the deadline is left: a busy server (one request at a time,
+note for example still stopping a cancelled one) is asked again every second.
+text ipath "/v1/completions"
+text imeth "POST"
+text ihost "Host"
+text ihostv "127.0.0.1"
+text ictype "Content-Type"
+text ijson "application/json"
+text kmodel "model"
+text vollm "ollm"
+text kprompt "prompt"
+text kmaxt "max_tokens"
+text ktopp "top_p"
+text kseed "seed"
+text kstream "stream"
+text ktout "ollm_test_output"
+text kobj "object"
+text vtcomp "text_completion"
+text kchoi "choices"
+text ktext "text"
+text kfin "finish_reason"
+text kusage "usage"
+text kpt "prompt_tokens"
+text kct "completion_tokens"
+text vstop "stop"
+text vlen "length"
+text ktool "tool"
+text kpath "path"
+text kold "old"
+text knew "new"
+text tread "read_file"
+text tcheck "omega_check"
+text trepl "replace_text"
+text apass "Tests passed."
+text amiss "File not found."
+text tdone "\nDone."
+text irec "OMNI1 "
+text ierr "OMNE1 "
+
+note The decimal value of a[0, n), or -1 when it is not 1..9 digits.
+fn ia_dec a view uchar * n ulong to long
+if or eq n 0 gt n 9
+ret neg long 1
+end
+v = ulong 0
+for i ulong n
+c = ulong get a i
+if or lt c 48 gt c 57
+ret neg long 1
+end
+v = add mul v 10 sub c 48
+end
+ret long v
+end
+
+note Argument i as a number, -1 when it is not one.
+fn ia_num i ulong to long
+b = new uchar 16 0
+n = argread i b 0 16
+if lt n 0
+ret neg long 1
+end
+ret ia_dec b ulong n
+end
+
+note Append the decimal v to o at p; the new end.
+fn ia_put o edit uchar 8192 p ulong v ulong to ulong
+d = new uchar 24 0
+k = ulong 0
+x = v
+for i ulong 24
+put d k uchar add 48 rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for j ulong k
+put o add p j get d sub sub k j 1
+end
+ret add p k
+end
+
+note Append a[0, n) to o at p; the new end.
+fn ia_cat o edit uchar 8192 p ulong a view uchar * s ulong n ulong to ulong
+for i ulong n
+put o add p i get a add s i
+end
+ret add p n
+end
+
+fn ia_out o view uchar 8192 n ulong to void
+p = ulong 0
+for it ulong 64
+if ge p n
+ret
+end
+r = write 1 o p sub n p
+if le r 0
+ret
+end
+p = add p ulong r
+end
+end
+
+note The request body into ob (jsonw); its length, or a negative refusal.
+fn ia_body ob edit uchar 16384 pr view uchar 4096 pn ulong mt ulong to long
+tb = new uchar 4096 0
+x = js_winit ob
+js_wobj ob
+js_wsbuf ob kmodel 0 len kmodel
+js_wsbuf ob vollm 0 len vollm
+js_wsbuf ob kprompt 0 len kprompt
+js_wsbuf ob pr 0 pn
+js_wsbuf ob kmaxt 0 len kmaxt
+js_wulong ob mt
+js_wsbuf ob ktopp 0 len ktopp
+js_wulong ob 0
+js_wsbuf ob kseed 0 len kseed
+js_wulong ob 1
+js_wsbuf ob kstream 0 len kstream
+js_wbool ob false
+if gt argcnt 5
+tn = argread 5 tb 0 4096
+if lt tn 0
+ret neg long 1
+end
+js_wsbuf ob ktout 0 len ktout
+js_wsbuf ob tb 0 ulong tn
+end
+js_wobje ob
+ret js_wdone ob
+end
+
+note Connect, send the request, read the status. The status, or negative.
+fn ia_send cs edit ulong 320 io edit uchar 131072 ob view uchar 16384 bn ulong port ulong dl long to long
+a = new uchar 16 0
+r = haddr4 a 2130706433 port
+fd = hdial a 5000000000
+if lt fd 0
+ret neg long 1000
+end
+r = hinit cs io int fd 0
+hsettmo cs dl dl
+hsetbdl cs dl
+r = hreqst cs io imeth
+r = hfe r hreqtg cs io ipath
+r = hfe r hhname cs io ihost
+r = hfe r hhval cs io ihostv
+r = hfe r hhname cs io ictype
+r = hfe r hhval cs io ijson
+r = hfe r hhend cs io 0 bn
+r = hfe r hput cs io view part ob 1040 bn
+r = hfe r hwfin cs io
+if lt r 0
+ret r
+end
+ret hrsprd cs io
+end
+
+note Member key in object o of the parsed src, its value token or jsnone.
+fn ia_mem src view uchar * tp view uint 65536 o ulong key view uchar * to ulong
+if ne js_type tp o 1
+ret jsnone
+end
+k = js_first tp o
+for it ulong js_nkids tp o
+if eq k jsnone
+break
+end
+if js_streq src js_off tp k key
+ret add k 1
+end
+k = js_mnext tp k
+end
+ret jsnone
+end
+
+note An unsigned member of object o, or -1.
+fn ia_umem src view uchar 16384 tp view uint 65536 o ulong key view uchar * to long
+v = ia_mem src tp o key
+if eq v jsnone
+ret neg long 1
+end
+if or ne js_type tp v 7 not js_isu src js_off tp v
+ret neg long 1
+end
+ret long js_tou src js_off tp v
+end
+
+note fin from token v: 1 stop, 2 length, 0 other.
+fn ia_fin src view uchar 16384 tp view uint 65536 v ulong to ulong
+if eq v jsnone
+ret 0
+end
+if ne js_type tp v 6
+ret 0
+end
+if js_streq src js_off tp v vstop
+ret 1
+end
+if js_streq src js_off tp v vlen
+ret 2
+end
+ret 0
+end
+
+note Usage of the parsed response into m[2] prompt and m[3] completion
+note tokens; false when either is missing.
+fn ia_use rb view uchar 16384 tp view uint 65536 m edit ulong 8 to bool
+us = ia_mem rb tp 0 kusage
+pt = ia_umem rb tp us kpt
+ct = ia_umem rb tp us kct
+if or lt pt 0 lt ct 0
+ret false
+end
+put m 2 ulong pt
+put m 3 ulong ct
+ret true
+end
+
+note The response body rb[0, rn): the text into tx, and m[0] text length,
+note m[1] fin, m[2] prompt tokens, m[3] completion tokens. 0 or 7.
+fn ia_resp rb view uchar 16384 rn ulong tx edit uchar 8192 m edit ulong 8 to ulong
+tp = new uint 65536 0
+x = js_init tp 16384 16
+r = js_parse rb tp rn
+if lt r 0
+ret 7
+end
+ob = ia_mem rb tp 0 kobj
+if or eq ob jsnone ne js_type tp ob 6
+ret 7
+end
+if not js_streq rb js_off tp ob vtcomp
+ret 7
+end
+ch = ia_mem rb tp 0 kchoi
+if or eq ch jsnone ne js_type tp ch 3
+ret 7
+end
+c0 = js_first tp ch
+if eq c0 jsnone
+ret 7
+end
+t = ia_mem rb tp c0 ktext
+if or eq t jsnone ne js_type tp t 6
+ret 7
+end
+n = js_sget rb js_off tp t tx
+if lt n 0
+ret 7
+end
+put m 0 ulong n
+put m 1 ia_fin rb tp ia_mem rb tp c0 kfin
+if not ia_use rb tp m
+ret 7
+end
+ret 0
+end
+
+note true when tx[i, n) starts with a newline then Done.
+fn ia_done tx view uchar 8192 i ulong n ulong to bool
+if gt add i 6 n
+ret false
+end
+for j ulong 6
+if ne get tx add i j get tdone j
+ret false
+end
+end
+ret true
+end
+
+note The action text of tx[0, n): before the first newline-Done., trimmed of
+note ASCII white space. Its start in m[4] and length in m[5].
+fn ia_trim tx view uchar 8192 n ulong m edit ulong 8 to void
+e = n
+for i ulong n
+if ia_done tx i n
+e = i
+break
+end
+end
+s = ulong 0
+for j ulong e
+if gt get tx s 32
+break
+end
+s = add s 1
+end
+for k ulong sub e s
+if gt get tx sub e 1 32
+break
+end
+e = sub e 1
+end
+put m 4 s
+put m 5 sub e s
+end
+
+note true when tx[s, s + n) equals text t.
+fn ia_is tx view uchar 8192 s ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n
+if ne get tx add s i get t i
+ret false
+end
+end
+ret true
+end
+
+note Field f of the action object o (0 path at d[0], at most 128 bytes; 1
+note old at d[128], 40; 2 new at d[192], 40), a string decoded into d with
+note no NUL byte. Its length, or -1.
+fn ia_sfld src view uchar 8192 tp view uint 65536 o ulong f ulong d edit uchar 8192 to long
+v = ulong jsnone
+fo = ulong 0
+mx = ulong 128
+if eq f 0
+v = ia_mem src tp o kpath
+end
+if eq f 1
+v = ia_mem src tp o kold
+fo = 128
+mx = 40
+end
+if eq f 2
+v = ia_mem src tp o knew
+fo = 192
+mx = 40
+end
+if eq v jsnone
+ret neg long 1
+end
+if ne js_type tp v 6
+ret neg long 1
+end
+n = js_sget src js_off tp v part d fo mx
+if lt n 0
+ret neg long 1
+end
+for i ulong ulong n
+if eq get d add fo i 0
+ret neg long 1
+end
+end
+ret n
+end
+
+note Classify the action at a[0, an): kind (1..3, 9), the fields into d at
+note 0 (path), 128 (old), 192 (new) with lengths in m[1..3].
+fn ia_json a view uchar 8192 an ulong d edit uchar 8192 m edit ulong 8 to ulong
+tp = new uint 65536 0
+x = js_init tp 8192 4
+r = js_parse a tp an
+if lt r 0
+ret 9
+end
+if ne js_type tp 0 1
+ret 9
+end
+tv = ia_mem a tp 0 ktool
+if or eq tv jsnone ne js_type tp tv 6
+ret 9
+end
+k = ulong 9
+nk = ulong 2
+if js_streq a js_off tp tv tread
+k = 1
+end
+if js_streq a js_off tp tv tcheck
+k = 2
+end
+if js_streq a js_off tp tv trepl
+k = 3
+nk = 4
+end
+if or eq k 9 ne js_nkids tp 0 nk
+ret 9
+end
+pl = ia_sfld a tp 0 0 d
+if lt pl 1
+ret 9
+end
+put m 1 ulong pl
+if ne k 3
+ret k
+end
+ol = ia_sfld a tp 0 1 d
+nl = ia_sfld a tp 0 2 d
+if or lt ol 1 lt nl 0
+ret 9
+end
+put m 2 ulong ol
+put m 3 ulong nl
+ret 3
+end
+
+note Write the record for text tx[0, m0) with response fields m to stdout.
+fn ia_emit tx view uchar 8192 m edit ulong 8 to void
+o = new uchar 8192 0
+d = new uchar 8192 0
+a = new uchar 8192 0
+ia_trim tx get m 0 m
+s = get m 4
+n = get m 5
+for i ulong n
+put a i get tx add s i
+end
+ac = new ulong 8 0
+k = ulong 9
+if ia_is tx s n apass
+k = 4
+end
+if ia_is tx s n amiss
+k = 5
+end
+if eq k 9
+k = ia_json a n d ac
+end
+p = ia_cat o 0 irec 0 len irec
+p = ia_put o p k
+put o p 32
+p = ia_put o add p 1 get m 1
+put o p 32
+p = ia_put o add p 1 get m 2
+put o p 32
+p = ia_put o add p 1 get m 3
+put o p 32
+p = ia_put o add p 1 get ac 1
+put o p 32
+p = ia_put o add p 1 get ac 2
+put o p 32
+p = ia_put o add p 1 get ac 3
+put o p 32
+p = ia_put o add p 1 get m 0
+put o p 10
+p = ia_cat o add p 1 d 0 get ac 1
+p = ia_cat o p d 128 get ac 2
+p = ia_cat o p d 192 get ac 3
+p = ia_cat o p tx 0 get m 0
+ia_out o p
+end
+
+note An HTTP error: OMNE1 status, then up to 512 bytes of the body.
+fn ia_herr cs edit ulong 320 io edit uchar 131072 st long to int
+o = new uchar 8192 0
+b = new uchar 512 0
+n = hbodyrd cs io b
+p = ia_cat o 0 ierr 0 len ierr
+p = ia_put o p ulong st
+put o p 10
+p = add p 1
+if gt n 0
+p = ia_cat o p b 0 ulong n
+end
+ia_out o p
+x = hclose cs
+if eq st 503
+ret 8
+end
+ret 6
+end
+
+note The prompt (argument 4) into pr; its length, or -1 when it is empty,
+note over 3800 bytes or holds a NUL byte.
+fn ia_prompt pr edit uchar 4096 to long
+n = argread 4 pr 0 3800
+if lt n 1
+ret neg long 1
+end
+for i ulong ulong n
+if eq get pr i 0
+ret neg long 1
+end
+end
+ret n
+end
+
+note Arguments PORT MAXTOK DEADLINE_S into a[0..2]; false when one is out of
+note range (port 1..65535 but never 18091, 1..256 tokens, 1..3600 s).
+fn ia_args a edit ulong 4 to bool
+if or lt argcnt 5 gt argcnt 6
+ret false
+end
+port = ia_num 1
+mt = ia_num 2
+ds = ia_num 3
+if or or lt port 1 gt port 65535 eq port 18091
+ret false
+end
+if or lt mt 1 gt mt 256
+ret false
+end
+if or lt ds 1 gt ds 3600
+ret false
+end
+put a 0 ulong port
+put a 1 ulong mt
+put a 2 ulong ds
+ret true
+end
+
+note After the status st: the record, or the exit code of a failure.
+fn ia_recv cs edit ulong 320 io edit uchar 131072 st long to int
+rb = new uchar 16384 0
+tx = new uchar 8192 0
+m = new ulong 8 0
+if eq st neg long 1000
+ret 4
+end
+if eq st HETIME
+x = hclose cs
+ret 5
+end
+if lt st 0
+x = hclose cs
+ret 4
+end
+if ne st 200
+ret ia_herr cs io st
+end
+rn = hbodyall cs io rb
+x = hclose cs
+if eq rn HETIME
+ret 5
+end
+if lt rn 0
+ret 7
+end
+e = ia_resp rb ulong rn tx m
+if ne e 0
+ret 7
+end
+ia_emit tx m
+ret 0
+end
+
+fn ia_main to int
+cs = new ulong 320 0
+io = new uchar 131072 0
+pr = new uchar 4096 0
+ob = new uchar 16384 0
+a = new ulong 4 0
+if not ia_args a
+ret 2
+end
+pn = ia_prompt pr
+if lt pn 1
+ret 3
+end
+bn = ia_body ob pr ulong pn get a 1
+if lt bn 0
+ret 3
+end
+ret ia_ask cs io ob ulong bn get a 0 long mul get a 2 1000000000
+end
+
+note The exchange within dl ns from now; a 503 is asked again every second
+note while at least 2 s are left. The record, or the exit code of a failure.
+fn ia_ask cs edit ulong 320 io edit uchar 131072 ob view uchar 16384 bn ulong po ulong dl long to int
+t0 = monons
+st = ia_send cs io ob bn po dl
+for it ulong 3600
+left = sub dl long sub monons t0
+if or ne st 503 lt left 2000000000
+ret ia_recv cs io st
+end
+x = hclose cs
+r = sleepns 1000000000
+st = ia_send cs io ob bn po sub left 1000000000
+end
+ret ia_recv cs io st
+end
+
+fn main to int
+ret ia_main
+end

@@ -1,0 +1,278 @@
+note Omega Node epoch pool. Concatenate after transport.om, before super.om.
+note K arenas (1..8) and one control page are mapped before any worker fork,
+note so every forked worker inherits the same shared mappings.
+note Single writer: the creator writes the current epoch, the arena table and
+note every arena record. Worker w alone writes hold word w while it lives;
+note the creator clears hold w only after it has reaped worker w.
+note Control u64: 0 magic, 8 ABI, 16 current epoch, 24 stop, 32 creator PID,
+note 40 arena count K, 48 worker slots W, 64+8k arena handle k,
+note 128+8k epoch of arena k (0 free), 256+8w hold of worker w (0 none),
+note 768+8w worker PID, 1280+8w worker state (0 empty, 1 live, 2 reaped).
+const PMAGIC ulong 1347374924
+const PCAP ulong 8
+const PWCAP ulong 64
+const PBYTES ulong 4096
+
+fn pool_valid c long to bool
+ret and eq mapget c 0 8 PMAGIC eq mapget c 8 8 1
+end
+
+fn pool_mine c long to bool
+ret eq mapget c 32 8 ulong getpid
+end
+
+fn pool_arena c long k ulong to long
+ret long mapget c add 64 mul k 8 8
+end
+
+note Drop the first n arenas and the control page of a pool being refused.
+fn pool_unwind c long n ulong to long
+for i ulong n bound 8
+r = mapdrop pool_arena c i
+end
+ret mapdrop c
+end
+
+note Return the control handle, or -7 bad size, or a negative mapping errno.
+note Arena 0 starts as epoch 1. Call before forking any worker.
+fn pool_new k ulong w ulong to long
+if or eq k 0 gt k PCAP
+ret neg long 7
+end
+if or eq w 0 gt w PWCAP
+ret neg long 7
+end
+c = mapnew neg int 1 0 PBYTES 3 33
+if le c 0
+ret c
+end
+r = mapset c 32 8 ulong getpid
+r = mapset c 40 8 k
+r = mapset c 48 8 w
+for i ulong k bound 8
+h = node_new
+if le h 0
+r = pool_unwind c i
+ret h
+end
+r = mapset c add 64 mul i 8 8 ulong h
+end
+r = node_reset pool_arena c 0 1
+r = mapset c 128 8 1
+r = mapset c 16 8 1
+r = mapset c 8 8 1
+r = mapset c 0 8 PMAGIC
+ret c
+end
+
+note Arena index holding epoch e, or -5 when no arena holds it.
+fn pool_slot c long e ulong to long
+k = mapget c 40 8
+if gt k PCAP
+ret neg long 5
+end
+for i ulong k bound 8
+if eq mapget c add 128 mul i 8 8 e
+ret long i
+end
+end
+ret neg long 5
+end
+
+note Creator: the arena of the current epoch, or a negative refusal.
+fn pool_current c long to long
+if not pool_valid c
+ret neg long 5
+end
+k = pool_slot c mapget c 16 8
+if lt k 0
+ret k
+end
+ret pool_arena c ulong k
+end
+
+fn pool_epoch c long to ulong
+ret mapget c 16 8
+end
+
+note Worker step: store hold e for worker w, then read the epoch again. mapset
+note and mapget fence both sides, so a creator that moved the epoch before it
+note scanned holds either sees this hold or this read sees the move. Returns
+note the arena of e, -8 when the epoch moved, or -5 when no arena holds e.
+note Every refusal clears the hold.
+fn pool_hold c long w ulong e ulong to long
+if ge w mapget c 48 8
+ret neg long 7
+end
+hw = add 256 mul w 8
+r = mapset c hw 8 e
+if ne mapget c 16 8 e
+r = mapset c hw 8 0
+ret neg long 8
+end
+k = pool_slot c e
+if lt k 0
+r = mapset c hw 8 0
+ret k
+end
+h = pool_arena c ulong k
+if ne node_epoch h e
+r = mapset c hw 8 0
+ret neg long 5
+end
+ret h
+end
+
+note Worker w holds the current epoch and returns its arena. Returns -1
+note stopped, -5 invalid, -7 bad worker, -8 the epoch kept moving.
+fn pool_acquire c long w ulong to long
+if not pool_valid c
+ret neg long 5
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+for t ulong 16
+if ne mapget c 24 8 0
+r = mapset c add 256 mul w 8 8 0
+ret neg long 1
+end
+h = pool_hold c w mapget c 16 8
+if ne h neg long 8
+ret h
+end
+end
+ret neg long 8
+end
+
+note Worker w gives up its hold. Its old arena must not be read afterwards.
+fn pool_release c long w ulong to long
+if ge w mapget c 48 8
+ret neg long 7
+end
+ret mapset c add 256 mul w 8 8 0
+end
+
+fn pool_held c long e ulong to bool
+n = mapget c 48 8
+for w ulong n bound 64
+if eq mapget c add 256 mul w 8 8 e
+ret true
+end
+end
+ret false
+end
+
+note Creator step: retire arena i and open epoch n in it, then publish n.
+fn pool_reuse c long i ulong n ulong to long
+off = add 128 mul i 8
+r = mapset c off 8 0
+r = node_reset pool_arena c i n
+if lt r 0
+ret r
+end
+r = mapset c off 8 n
+r = mapset c 16 8 n
+ret long n
+end
+
+note Creator step: an arena that is free or whose older epoch no worker holds,
+note or -9. Call only after the current epoch has moved past that arena.
+fn pool_pick c long to long
+e = mapget c 16 8
+k = mapget c 40 8
+for i ulong k bound 8
+ek = mapget c add 128 mul i 8 8
+if ne ek e
+if or eq ek 0 not pool_held c ek
+ret long i
+end
+end
+end
+ret neg long 9
+end
+
+note Creator: open the next epoch in a free or unheld arena and make it current.
+note Returns the new epoch, -1 stopped, -5 invalid, -6 not creator, or -9 when
+note every other arena is still held: the pool fails closed, nothing changes.
+fn pool_roll c long to long
+if not pool_valid c
+ret neg long 5
+end
+if not pool_mine c
+ret neg long 6
+end
+if ne mapget c 24 8 0
+ret neg long 1
+end
+k = pool_pick c
+if lt k 0
+ret k
+end
+ret pool_reuse c ulong k add mapget c 16 8 1
+end
+
+note Creator: publish to the current epoch; when it is full, roll once and retry.
+note Returns the version, or the refusal of the publish or of the roll.
+fn pool_publish c long topics ulong src view uchar 4096 n ulong to long
+h = pool_current c
+if lt h 0
+ret h
+end
+v = node_publish h topics src n
+if ne v neg long 2
+ret v
+end
+r = pool_roll c
+if lt r 0
+ret r
+end
+h = pool_current c
+if lt h 0
+ret h
+end
+ret node_publish h topics src n
+end
+
+fn pool_stop c long to long
+if not pool_valid c
+ret neg long 5
+end
+if not pool_mine c
+ret neg long 6
+end
+ret mapset c 24 8 1
+end
+
+fn pool_stopped c long to bool
+ret ne mapget c 24 8 0
+end
+
+note Creator: record worker w's PID and state for observers.
+fn pool_setw c long w ulong pid ulong st ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+r = mapset c add 768 mul w 8 8 pid
+ret mapset c add 1280 mul w 8 8 st
+end
+
+note Creator: clear hold w. Only after worker w has been reaped.
+fn pool_clear c long w ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+ret mapset c add 256 mul w 8 8 0
+end
+
+note Drop every mapping of the pool in this process. Other processes keep
+note their own inherited mappings until they drop them or exit.
+fn pool_free c long to long
+ret pool_unwind c mapget c 40 8
+end

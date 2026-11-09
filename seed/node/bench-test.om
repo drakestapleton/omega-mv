@@ -1,0 +1,595 @@
+note Omega Node scheduling comparison (DRA-399). Concatenate after
+note transport.om, pool.om, super.om and sched.om. Runs pinned workloads
+note under arm 0 (FIFO), 1 (fair fitting), 2 (goal-aware, declared estimates
+note within a factor of 2 of the duration) and 3 (goal-aware given the true
+note durations: ORACLE, an upper bound, not a policy result) with real
+note forked workers that sleep for the milliseconds in the low four decimal
+note digits of their job id, on the host's wall clock. Usage: bench-gate
+note (five repetitions of every scenario and arm). Prints one line per run:
+note bench S P R mk_us idle_us dsp_ns dsp_n ev cand maint vread rework res cont ok hwm_kb : waits_us...
+note S scenario 1..6 (blocked head, long chain, fan-out, sustained arrivals,
+note queue pressure, worker failure), P arm (0..3), R repetition; mk makespan
+note (first admission to last review); idle the integral of min(idle live
+note workers, ready jobs that fit the free capacity) over time, in
+note worker-microseconds; dsp time inside sched_dispatch from the creator
+note loop and its calls; ev, cand, maint, vread the scheduler's counters
+note (events, candidate reads, maintenance reads, value reads); rework the
+note jobs that went back to ready after starting; res the reservations made
+note (sched_stat 6); cont the new reservations seen while another ready job
+note was also at the bypass budget (where check 71 can tell oldest from any);
+note ok the jobs reviewed with
+note the expected outcome; hwm_kb the creator's VmHWM; waits from ready to
+note started, per job, in microseconds (sampled after every creator step
+note and every publication). Every policy sees the same jobs, requests,
+note durations, declarations, workers and capacities. Checked in every run:
+note the capacity invariant (exit 70), a new reservation goes to the oldest
+note ready job at the bypass budget (71), every job is reviewed once with
+note its expected outcome before the deadline (72), setup (73..79).
+text bnok "PASS node bench\n"
+text bnhd "bench "
+text bnsp " "
+text bnco " :"
+text bnnl "\n"
+text bnst "/proc/self/status"
+text bnhw "VmHWM:"
+global bnc long 1
+note Run metrics: 0 t0, 1 last review, 2 idle sum ns, 3 last sample, 4
+note dispatch ns, 5 dispatch calls, 6 reviewed, 7 verified, 8 reworks, 9
+note jobs in the scenario, 10 next queue entry, 11 killed, 12 reservation
+note last seen + 1, 13 idle-eligible workers at the last sample, 14 policy,
+note 15 bypass budget, 16 contested reservations.
+global bnm ulong 20
+note Per slot: ready since (ns, 0 not ready), started flag.
+global bnr ulong 64
+global bns ulong 64
+note Waits of this run (us) and their count.
+global bnwt ulong 256
+global bnwn ulong 1
+note Scenario queue: id, deps, request, flags, arrival ms, topics published.
+global bnqi ulong 64
+global bnqd ulong 64
+global bnqr ulong 64
+global bnqf ulong 64
+global bnqt ulong 64
+global bnqp ulong 64
+global bnqn ulong 1
+note 1: arm 3, policy 2 given the true durations as estimates (ORACLE).
+global bne ulong 1
+
+fn bn_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn bn_num v ulong to void
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 d k sub 20 k
+end
+
+fn bn_sp v ulong to void
+r = write 1 bnsp 0 1
+bn_num v
+end
+
+fn bn_req cpu ulong to ulong
+ret cpu
+end
+
+fn bn_run c long w ulong q ulong to int
+buf = new uchar 4096 0
+id = sc_cell w 8
+dl = add ulong monons mul rem id 10000 1000000
+for t ulong 1000000
+now = ulong monons
+if ge now dl
+break
+end
+r = sched_wwait c w long sub dl now
+if eq r 2
+ret 2
+end
+if eq r 3
+ret 3
+end
+if lt r 0
+ret 4
+end
+end
+if ne sched_wdone w q add id 1 buf 8 0
+ret 5
+end
+ret 0
+end
+
+fn bn_worker w ulong to int
+c = get bnc 0
+for it ulong 1000000000
+q = sched_wjob w
+if gt q 0
+r = bn_run c w q
+if eq r 2
+ret 0
+end
+if ne r 0
+ret add 60 r
+end
+continue
+end
+r = sched_wwait c w neg long 1
+if eq r 2
+ret 0
+end
+if eq r 3
+ret 41
+end
+if lt r 0
+ret 43
+end
+end
+ret 45
+end
+
+note Queue entry: job id (duration in its low four digits), deps, CPU,
+note flags, arrival ms after the start, topics its completion publishes.
+fn bn_q id ulong deps ulong cpu ulong fl ulong at ulong pro ulong to void
+n = get bnqn 0
+put bnqi n id
+put bnqd n deps
+put bnqr n cpu
+put bnqf n fl
+put bnqt n at
+put bnqp n pro
+put bnqn 0 add n 1
+end
+
+note Declared work estimate of job id in ms. Policy 2 is not told the
+note duration: the estimate is the duration times 1/2, 1, 3/2 or 2, chosen
+note by a multiplicative hash of the id (fixed, so every run and repetition
+note declares the same values). Arm 3 (ORACLE) declares the true duration.
+fn bn_est id ulong to ulong
+d = rem id 10000
+if ne get bne 0 0
+ret d
+end
+k = rem div mul id 2654435761 65536 4
+ret div mul d add k 1 2
+end
+
+note Scenario s into the queue; returns (workers, admission limit).
+fn bn_load s ulong to ulong
+put bnqn 0 0
+if eq s 1
+bn_q 10600 0 2 0 0 0
+bn_q 20300 0 4 0 0 0
+for i ulong 6
+bn_q add 30200 mul i 10000 0 1 0 0 0
+end
+ret 64
+end
+if eq s 2
+for i ulong 8
+bn_q add 100300 mul i 10000 0 1 0 0 0
+end
+bn_q 200150 0 1 0 0 2
+for i ulong 5
+bn_q add 210150 mul i 10000 shl ulong 2 i 1 0 0 shl ulong 4 i
+end
+ret 64
+end
+if eq s 3
+for i ulong 6
+bn_q add 300300 mul i 10000 0 1 0 0 0
+end
+bn_q 400100 0 1 0 0 1024
+for i ulong 6
+bn_q add 410200 mul i 10000 1024 1 0 0 0
+end
+ret 64
+end
+if eq s 4
+bn_s4
+ret 64
+end
+if eq s 5
+bn_s5
+ret 8
+end
+bn_s6
+ret 64
+end
+
+note Sustained arrivals: 24 jobs of 100..400 ms needing 1..3 CPU, four
+note every 150 ms.
+fn bn_s4 to void
+for i ulong 24
+d = add 100 mul rem mul i 7 4 100
+id = add add 500000 mul i 10000 d
+at = mul div i 4 150
+bn_q id 0 add 1 rem i 3 0 at 0
+end
+end
+
+note Queue pressure: 30 jobs of 100..300 ms needing 1..2 CPU offered at
+note once against an admission limit of 8.
+fn bn_s5 to void
+for i ulong 30
+d = add 100 mul rem mul i 5 3 100
+id = add add 600000 mul i 10000 d
+bn_q id 0 add 1 rem i 2 0 0 0
+end
+end
+
+note Worker failure: 12 rerunnable jobs of 150..450 ms needing 1..3 CPU;
+note worker 0 is killed 250 ms in while busy.
+fn bn_s6 to void
+for i ulong 12
+d = add 150 mul rem mul i 7 4 100
+id = add add 700000 mul i 10000 d
+bn_q id 0 add 1 rem i 3 1 0 0
+end
+end
+
+note Admit the queue entries that have arrived, in order; a refusal for
+note room (-2, a ticket) stops until the next call.
+fn bn_admit now ulong to void
+for k ulong 64
+i = get bnm 10
+if ge i get bnqn 0
+ret
+end
+if lt sub now get bnm 0 mul get bnqt i 1000000
+ret
+end
+j = sched_admitr get bnqi i get bnqd i get bnqf i bn_req get bnqr i
+if eq j neg long 2
+ret
+end
+bn_ok ge j 0 74
+e = bn_est get bnqi i
+r = sched_goal ulong j get bnqp i e e
+put bnm 10 add i 1
+end
+end
+
+note Topics job id publishes on completion.
+fn bn_pro id ulong to ulong
+for i ulong get bnqn 0 bound 64
+if eq get bnqi i id
+ret get bnqp i
+end
+end
+ret 0
+end
+
+fn bn_inv to void
+for k ulong 4
+s = ulong 0
+for j ulong 64
+if eq get sjheld j 1
+s = add s sp_need get sjneed j k
+end
+end
+bn_ok eq get suse k s 70
+bn_ok le get suse k get scap k 70
+end
+end
+
+note A reservation that appeared since the last sample goes to the oldest
+note ready job at the bypass budget: no older ready job is at the budget.
+note Another ready job at the budget makes it contested (bnm 16).
+fn bn_fair to void
+r = sched_stat 29
+if or eq r 0 eq r get bnm 12
+put bnm 12 r
+ret
+end
+put bnm 12 r
+a = get sjarr sub r 1
+n = ulong 0
+for j ulong 64
+if and eq get sjst j 2 ne j sub r 1
+if ge get sjbyp j get bnm 15
+n = add n 1
+end
+if lt get sjarr j a
+bn_ok lt get sjbyp j get bnm 15 71
+end
+end
+end
+if gt n 0
+put bnm 16 add get bnm 16 1
+end
+end
+
+note Sample after a creator step or publication: waits, reworks, the idle
+note eligible integral, the invariants.
+fn bn_sample to void
+now = ulong monons
+put bnm 2 add get bnm 2 mul get bnm 13 sub now get bnm 3
+put bnm 3 now
+nf = ulong 0
+for j ulong 64
+s = get sjst j
+if eq s 2
+if ne get bns j 0
+put bns j 0
+put bnm 8 add get bnm 8 1
+end
+if eq get bnr j 0
+put bnr j now
+end
+if sp_fits get sjneed j 0
+nf = add nf 1
+end
+end
+if and ge s 3 ne get bnr j 0
+bn_wait sub now get bnr j
+put bnr j 0
+put bns j 1
+end
+end
+put bnm 13 bn_min nf bn_idle
+bn_inv
+if ge get bnm 14 1
+bn_fair
+end
+end
+
+fn bn_wait ns ulong to void
+n = get bnwn 0
+if lt n 256
+put bnwt n div ns 1000
+put bnwn 0 add n 1
+end
+end
+
+fn bn_min a ulong b ulong to ulong
+if lt a b
+ret a
+end
+ret b
+end
+
+fn bn_idle to ulong
+c = get bnc 0
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+if and gt get swpid w 0 eq get scbusy w 0
+k = add k 1
+end
+end
+ret k
+end
+
+note sched_step with the dispatch timed.
+fn bn_step c long to void
+d = sup_poll c 1000000
+bn_ok ge d 0 75
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+r = sup_take get swack w
+else
+r = sched_lost c w
+end
+end
+k = sched_collect c
+t = ulong monons
+k = sched_dispatch c
+put bnm 4 add get bnm 4 sub ulong monons t
+put bnm 5 add get bnm 5 1
+end
+
+note Review finished jobs (outcome id + 1 is verified work); publish what
+note each declared.
+fn bn_review c long to void
+buf = new uchar 4096 0
+for j ulong 64
+if eq get sjst j 4
+id = get sjid j
+o = sched_review j
+if eq o long add id 1
+put bnm 7 add get bnm 7 1
+end
+put bnm 6 add get bnm 6 1
+put bnm 1 ulong monons
+put bns j 0
+put bnr j 0
+p = bn_pro id
+if ne p 0
+v = sched_publish c p buf 8
+bn_ok gt v 0 76
+bn_sample
+end
+end
+end
+end
+
+fn bn_hwm to ulong
+b = new uchar 4096 0
+fd = fopen bnst 0 len bnst 0 0
+if lt fd 0
+ret 0
+end
+r = pread int fd b 0 4096 long 0
+x = fclose int fd
+if le r 0
+ret 0
+end
+n = ulong r
+h = len bnhw
+for i ulong 4000
+if gt add i h n
+ret 0
+end
+m = true
+for k ulong h bound 8
+if ne get b add i k get bnhw k
+m = false
+end
+end
+if m
+ret bn_digits b add i h n
+end
+end
+ret 0
+end
+
+fn bn_digits b view uchar 4096 i ulong n ulong to ulong
+v = ulong 0
+for k ulong 32
+p = add i k
+if ge p n
+ret v
+end
+ch = get b p
+if and ge ch 48 le ch 57
+v = add mul v 10 sub ulong ch 48
+else
+if gt v 0
+ret v
+end
+end
+end
+ret v
+end
+
+fn bn_reset pol ulong by ulong to void
+for i ulong 20
+put bnm i 0
+end
+for j ulong 64
+put bnr j 0
+put bns j 0
+end
+put bnwn 0 0
+put bnm 14 pol
+put bnm 15 by
+end
+
+note One run of scenario s under arm a (policy 0, 1, 2; arm 3 is policy 2
+note with ORACLE estimates); prints its line.
+fn bn_one s ulong a ulong rep ulong to void
+pol = a
+put bne 0 0
+if eq a 3
+pol = 2
+put bne 0 1
+end
+lim = bn_load s
+c = pool_new 4 2
+bn_ok gt c 0 73
+put bnc 0 c
+bn_ok eq sup_init c 0 73
+bn_ok eq sched_new c lim 64 0 73
+bn_ok eq sched_cap bn_req 4 0 73
+bn_ok eq sched_policy pol 64 64 4 1000 0 73
+bn_reset a 4
+put bnm 9 get bnqn 0
+for w ulong 2
+p = sup_spawn c w
+if eq p 0
+exit bn_worker w
+end
+bn_ok gt p 0 73
+end
+k = sched_pause c true
+put bnm 0 ulong monons
+put bnm 3 get bnm 0
+bn_admit get bnm 0
+bn_sample
+k = sched_pause c false
+bn_loop c s
+bn_ok eq get bnm 6 get bnm 9 72
+bn_ok eq get bnm 7 get bnm 9 72
+bn_print s a rep
+bn_ok ge sched_stop c 2000000000 0 77
+sup_closeall
+bn_ok eq sched_free 0 77
+bn_ok eq pool_free c 0 77
+end
+
+fn bn_loop c long s ulong to void
+dl = add ulong monons 20000000000
+for t ulong 100000000
+bn_sample
+if ge get bnm 6 get bnm 9
+ret
+end
+bn_ok lt ulong monons dl 72
+if and eq s 6 eq get bnm 11 0
+if ge sub ulong monons get bnm 0 250000000
+bn_kill c
+end
+end
+bn_admit ulong monons
+bn_step c
+bn_sample
+bn_review c
+end
+end
+
+note Scenario 6: SIGKILL the busy worker 0 once.
+fn bn_kill c long to void
+if eq get scbusy 0 0
+ret
+end
+r = killpid int get swpid 0 9
+put bnm 11 1
+end
+
+fn bn_print s ulong pol ulong rep ulong to void
+r = write 1 bnhd 0 len bnhd
+bn_num s
+bn_sp pol
+bn_sp rep
+bn_sp div sub get bnm 1 get bnm 0 1000
+bn_sp div get bnm 2 1000
+bn_sp get bnm 4
+bn_sp get bnm 5
+bn_sp sched_stat 2
+bn_sp sched_stat 3
+bn_sp sched_stat 13
+bn_sp sched_stat 38
+bn_sp get bnm 8
+bn_sp sched_stat 6
+bn_sp get bnm 16
+bn_sp get bnm 7
+bn_sp bn_hwm
+r = write 1 bnco 0 len bnco
+for i ulong get bnwn 0 bound 256
+bn_sp get bnwt i
+end
+r = write 1 bnnl 0 1
+end
+
+fn bn_reps to ulong
+ret 5
+end
+
+fn main to int
+n = bn_reps
+for rep ulong n bound 100
+for s ulong 6
+for pol ulong 4
+bn_one add s 1 pol rep
+end
+end
+end
+if ne write 1 bnok 0 len bnok long len bnok
+ret 100
+end
+ret 0
+end

@@ -9,6 +9,18 @@ Two crumb files already under evidence/ stay, because existing evidence is never
 
 Held-out inference-cost benchmark: evaluate verified programs produced per unit of inference cost
 
+## `bench/omc_efficiency/`
+
+OMC-EFF fixed efficiency protocol for the seeded Omega compiler (PROTOCOL.md; PROTOCOL-2.md in-process runtime metric; PROTOCOL-3.md OM-2 source profile; PROTOCOL-4.md Omega drivers and corrected control and exit checks): seven scalar kernels with C twins and committed OM-2 variants, Wolfram-computed expected outputs, the Omega measurement conductor, its coordinator and its self-test
+
+Rules:
+
+- PROTOCOL.md, PROTOCOL-2.md, PROTOCOL-3.md and PROTOCOL-4.md are frozen at their commits; any change to cases, arms, rounds, seeds, metrics or rules is a new protocol version, never an edit
+- want/*.out values are computed by Wolfram independently of both compilers; never regenerate them from a compiler's output
+- the conductor computes no statistics and never reruns a case to select a result
+- kernels/om2/CASE.om is kernels/CASE.om plus one om2 line and out spelled obuf, checked by run.om and never generated at run time
+- the drivers are Omega (conductor.om, run.om, selftest.om); a control counts as detected only on a valid run whose output differs, and run exits 1 when any conductor invocation fails
+
 ## `bench/prime_race/`
 
 AIEN Prime Drag Race implementation side: the shared protocol helper (command line, timed loop, report, canonical bitmap export) and the conventional CPU baseline sieve that other entries are checked and compared against
@@ -165,9 +177,46 @@ Rules:
 
 Omega NG: the next Omega compiler (Hive NG). Its intermediate form ΩIR (IR.md) with validator, text tools and gate; the ng compiler units (src/, ng.units, ngbuild)
 
+## `seed/ng/front/`
+
+ng-front tools and evidence: the differential gate gate-front.om (front.om against the pinned omc: same refusal line and code, BEYOND_OMC and scope classes, mutants), the ΩIR emission gate gate-front-ir.om (@ng front-ir output through ngcheck and ngrun against the omc binary), the renamer and pruner that made src/front.om from omc.om@943d9555, case lists, fixtures and kernel copies
+
+Rules:
+
+- Every tool here is seeded .om compiled by the pinned seed/out/omc (sha256 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df); no shell, C or Python
+- gate-front and gate-front-ir refuse (INVALID) unless the oracle omc matches the given sha256; they never edit seed/omc/omc.om
+- gate-front-ir passes only when every run case agrees (ngcheck ACCEPT; ngrun equal to the omc binary on exit status and stdout), every refuse case keeps omc's exit and stderr, and every lowering mutant and mode control fails a case
+- declared.txt holds only beyond (omc refused with 12, 14, 24 or 25 for a code generator limit, D6) and scope (x86/EFI, IR v1, om2 fmt: exit 64) rows, each with its reason; a declared row no case uses is a FAIL
+- Every mutant in mutants.txt must be KILLED by a real case failure; a SURVIVED mutant fails the gate
+- No committed copy of the whole omc.om: src/front.om carries only the front end, with no machine code emission
+
+## `seed/ng/front/cases/`
+
+ng-front fixture programs for gate-front: f64 rem/and/or/xor refusals and the gate15 refusal cases that error-codes.reg names (D9)
+
+## `seed/ng/front/kernels/`
+
+ng-front copies of the ten ng-bench kernels, the run cases of gate-front-ir (omc binary against ngrun on ng's @ng front-ir output)
+
+Rules:
+
+- Each .om is a verbatim copy of the ng-bench kernel of the same name; its sha256 is listed in PROVENANCE.md and equals ng-bench's PROVENANCE.md; a changed kernel is a new name
+
+## `seed/ng/front/mutants/`
+
+ng-front mutant pairs for gate-front: NAME.from text that occurs exactly once in src/front.om and the NAME.to text that replaces it; each mutant must be KILLED
+
+## `seed/ng/src/`
+
+The ng compiler units listed in ../ng.units and built into the one ng binary (D1b): ir.om (ΩIR in memory, ng-ir), front.om (Omega source checks, ng-front), main.om (modes, ng-ir)
+
 ## `seed/nki/`
 
 Seeded Omega OSC IR v1 elementwise scalar to AWS NKI (nki.isa) kernel emitter with NKI CPU simulator interop-oracle verification
+
+## `seed/node/`
+
+Bounded shared-memory artifact transport for cooperative Omega workers
 
 ## `seed/omc/contracts/`
 

@@ -1,0 +1,392 @@
+note Omega Node worker supervision. Concatenate after transport.om and pool.om.
+note The creator forks trusted workers from its own binary: sup_spawn returns 0
+note in the child, which runs its worker function and exits with its result.
+note Death is seen without polling PIDs. Worker w alone holds the write end of
+note its close-on-exec life pipe, so its exit hangs up the creator's read end.
+note Every worker holds the read end of the creator's life pipe, whose only
+note writer is the creator, so creator death hangs up every worker.
+note Per worker: wake, stop and ack eventfds, kept across respawns.
+note Workers must not exec: exec closes the life pipe and reads as death.
+global swpid long 64
+global swwake int 64
+global swstop int 64
+global swack int 64
+global swlife int 64
+global swst ulong 64
+global swpw ulong 64
+global swpar int 2
+global swme ulong 1
+global swws uchar 4
+global swpf uchar 8
+global swpoll uchar 1024
+
+fn sup_fd off ulong to int
+v = ulong get swpf off
+v = or v shl ulong get swpf add off 1 8
+v = or v shl ulong get swpf add off 2 16
+v = or v shl ulong get swpf add off 3 24
+ret int v
+end
+
+note Poll record j at swpoll offset off; a negative fd is stored as itself
+note (bit pattern) so the kernel ignores that record.
+fn sup_gpfd off ulong fd int to void
+u = bitcast uint fd
+for i ulong 4
+put swpoll add off i uchar and shr u uint mul i 8 255
+end
+put swpoll add off 4 1
+put swpoll add off 5 0
+put swpoll add off 6 0
+put swpoll add off 7 0
+end
+
+fn sup_lpfd p edit uchar 24 off ulong fd int to void
+for i ulong 4
+put p add off i uchar and shr uint fd uint mul i 8 255
+end
+put p add off 4 1
+end
+
+note Read and reset an eventfd counter: the number of hints since the last
+note take, 0 when none is pending, or a negative errno.
+fn sup_take fd int to long
+buf = new uchar 8 0
+for i ulong 64
+r = read fd buf 0 8
+if eq r 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get buf j mul j 8
+end
+ret long and v 9223372036854775807
+end
+if eq r neg long 11
+ret 0
+end
+if ne r neg long 4
+if lt r 0
+ret r
+end
+ret neg long 5
+end
+end
+ret neg long 4
+end
+
+fn sup_closeall to void
+for i ulong 64
+if ge get swwake i 0
+r = fclose get swwake i
+end
+if ge get swstop i 0
+r = fclose get swstop i
+end
+if ge get swack i 0
+r = fclose get swack i
+end
+if ge get swlife i 0
+r = fclose get swlife i
+end
+put swwake i neg int 1
+put swstop i neg int 1
+put swack i neg int 1
+put swlife i neg int 1
+end
+for i ulong 2
+if ge get swpar i 0
+r = fclose get swpar i
+end
+put swpar i neg int 1
+end
+end
+
+note Creator: create the creator life pipe and three eventfds per worker slot.
+note Call once after pool_new and before sup_spawn. 0 or a negative errno;
+note a failure closes everything this call opened.
+fn sup_init c long to long
+if not pool_mine c
+ret neg long 6
+end
+for i ulong 64
+put swpid i 0
+put swst i 0
+put swwake i neg int 1
+put swstop i neg int 1
+put swack i neg int 1
+put swlife i neg int 1
+end
+put swme 0 0
+put swpar 0 neg int 1
+put swpar 1 neg int 1
+r = pipefds swpf 0 8 524288
+if lt r 0
+ret r
+end
+put swpar 0 sup_fd 0
+put swpar 1 sup_fd 4
+n = mapget c 48 8
+for i ulong n bound 64
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swwake i int a
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swstop i int a
+a = eventfd uint 0
+if lt a 0
+sup_closeall
+ret a
+end
+put swack i int a
+end
+ret 0
+end
+
+note Creator: fork worker w. Returns 0 in the child, the child PID in the
+note creator, -7 bad slot, -16 slot still live, or a negative errno. The
+note child keeps only its own life write end; the creator keeps the read end.
+fn sup_spawn c long w ulong to long
+if not pool_mine c
+ret neg long 6
+end
+if ge w mapget c 48 8
+ret neg long 7
+end
+if ne get swpid w 0
+ret neg long 16
+end
+r = pipefds swpf 0 8 524288
+if lt r 0
+ret r
+end
+rd = sup_fd 0
+wr = sup_fd 4
+pid = fork
+if eq pid 0
+r = fclose get swpar 1
+put swpar 1 neg int 1
+r = fclose rd
+put swlife w wr
+put swme 0 add w 1
+ret 0
+end
+r = fclose wr
+if lt pid 0
+r = fclose rd
+ret pid
+end
+put swpid w pid
+put swlife w rd
+r = pool_setw c w ulong pid 1
+ret pid
+end
+
+note Worker: 3 creator gone, 2 stop, 1 wake hint, 0 timeout, negative errno.
+note Creator loss outranks stop, which outranks work. A set stop flag makes
+note the poll nonblocking. Hints are drained; rescan shared state after 1.
+fn sup_wwait c long w ulong interval long to long
+p = new uchar 24 0
+if ge w 64
+ret neg long 7
+end
+iv = interval
+if pool_stopped c
+iv = 0
+end
+sup_lpfd p 0 get swwake w
+sup_lpfd p 8 get swstop w
+sup_lpfd p 16 get swpar 0
+r = pollfds p 0 24 iv
+if lt r 0
+ret r
+end
+if ne get p 22 0
+ret 3
+end
+if pool_stopped c
+ret 2
+end
+if ne and get p 14 56 0
+ret neg long 5
+end
+if ne and get p 14 1 0
+r = node_drain get swstop w
+ret 2
+end
+if ne and get p 6 56 0
+ret neg long 5
+end
+if ne and get p 6 1 0
+r = node_drain get swwake w
+if lt r 0
+ret r
+end
+ret 1
+end
+ret 0
+end
+
+note Worker or creator: post a hint on worker w's ack eventfd.
+fn sup_ack w ulong to long
+if ge w 64
+ret neg long 7
+end
+ret node_notify get swack w
+end
+
+note Creator: wake worker w with a work hint.
+fn sup_wake w ulong to long
+if ge w 64
+ret neg long 7
+end
+if le get swpid w 0
+ret neg long 3
+end
+ret node_notify get swwake w
+end
+
+fn sup_live c long to ulong
+n = mapget c 48 8
+k = ulong 0
+for w ulong n bound 64
+if gt get swpid w 0
+k = add k 1
+end
+end
+ret k
+end
+
+note Creator: reap worker w, then release what it held. A worker that has not
+note exited within about one second gets SIGKILL first. Only after the exact
+note PID is reaped are its hold, PID and life pipe released. Returns the raw
+note wait status, -3 no live worker, or the waitpid errno (nothing released).
+fn sup_reap c long w ulong to long
+if ge w 64
+ret neg long 7
+end
+pid = get swpid w
+if le pid 0
+ret neg long 3
+end
+done = false
+for t ulong 100
+r = waitpid int pid swws 0 4 1
+if eq r pid
+done = true
+break
+end
+if ne r 0
+ret r
+end
+r = sleepns 10000000
+end
+if not done
+r = killpid int pid 9
+r = waitpid int pid swws 0 4 0
+if ne r pid
+ret r
+end
+end
+st = ulong get swws 0
+st = or st shl ulong get swws 1 8
+put swst w st
+r = fclose get swlife w
+put swlife w neg int 1
+put swpid w 0
+r = pool_clear c w
+r = pool_setw c w 0 2
+ret long st
+end
+
+note Creator: wait up to interval ns for deaths and, when acks is true, acks.
+note Ack counts are left pending for sup_take. Every worker whose life pipe
+note hung up is reaped. Returns the number reaped, or a negative errno.
+fn sup_pollx c long interval long acks bool to long
+n = mapget c 48 8
+m = ulong 0
+for w ulong n bound 64
+if gt get swpid w 0
+o = mul m 16
+if acks
+sup_gpfd o get swack w
+else
+sup_gpfd o neg int 1
+end
+sup_gpfd add o 8 get swlife w
+put swpw m w
+m = add m 1
+end
+end
+if eq m 0
+ret 0
+end
+r = pollfds swpoll 0 mul m 16 interval
+if lt r 0
+ret r
+end
+dead = long 0
+for j ulong m bound 64
+o = add mul j 16 14
+if ne get swpoll o 0
+r = sup_reap c get swpw j
+if lt r 0
+ret r
+end
+dead = add dead 1
+end
+end
+ret dead
+end
+
+note Creator: wait up to interval ns for acks and deaths (see sup_pollx).
+fn sup_poll c long interval long to long
+ret sup_pollx c interval true
+end
+
+note Creator: stop admission, post every live worker's stop eventfd, then reap
+note until all have exited or interval ns pass; survivors get SIGKILL and are
+note reaped. Returns how many had to be killed, or a refusal.
+fn sup_stop c long interval long to long
+r = pool_stop c
+if lt r 0
+ret r
+end
+n = mapget c 48 8
+for w ulong n bound 64
+if gt get swpid w 0
+r = node_notify get swstop w
+end
+end
+dl = add monons interval
+for t ulong 100000
+if eq sup_live c 0
+ret 0
+end
+now = monons
+if ge now dl
+break
+end
+r = sup_pollx c sub dl now false
+if lt r 0
+if ne r neg long 4
+break
+end
+end
+end
+killed = long 0
+for w ulong n bound 64
+if gt get swpid w 0
+r = killpid int get swpid w 9
+r = sup_reap c w
+killed = add killed 1
+end
+end
+ret killed
+end
