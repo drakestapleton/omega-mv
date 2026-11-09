@@ -19,13 +19,16 @@ and feeding them to that compiler on stdin:
 
 The compiler writes the executable to stdout. Check compiler exit0 before
 making the output executable. Running it produces **41 checks,0 failures**,
-exit0. Replace the final input with `tests/request.om`, `tests/pack.om` or
-`tests/replay.om` to build those respective tests. The request test emits
-`request.json` and exits0. The pack test exits0 after checking all four packet
+exit0. Replace the final input with `tests/request.om`, `tests/pack.om`,
+`tests/budget.om` or `tests/replay.om` to build those respective tests. The
+request test writes the bytes of `request.json` to stdout and exits0. The pack
+test exits0 after checking all four packet
 shapes, exact budgets, one-token-short refusals, whole-record drops, a changed
-tokenizer pin and a changed serialized packet.
+tokenizer pin and a changed serialized packet. Its budgets are read from
+`packcost`; the budget test (added 2026-11-09) checks those costs against the
+literal receipts 255/263/502/502 and exits0.
 
-The replay consumes `search.response`, emits `replay.packet`, exits0, and is
+The replay reads `search.response` on stdin, writes `replay.packet` to stdout, exits0, and is
 byte-identical to `packet-3.json`. `nomatch.response` produces the explicit
 `replay.nomatch` outcome and exit0. `scope.response` exits10 with no evidence
 bytes (`replay.refusal` is empty).
