@@ -222,9 +222,10 @@ the sources do not test. Every figure in this table is published, not reproduced
 
 Our target is the round40 own tool model (`~/.local/share/omega-tool-model/round40/model.ck`, sha256
 `7c7b5b5260f2d9453b6076b64e7f23e88341d96498584f2dfaa229c31ad2e346`, read in place only): V 4096, T 256,
-D 384, H 12, F 1536, L 8, P 15,833,472 parameters, OLLMCK02 layout (CONTRACT-V1 section 6). All probes and edits
-are `.om` units built by `tools/omegallm/wdrive/wbuild.om` from pinned source parts, run on CPU. Python is allowed
-only as an independent checker (labelled ORACLE).
+D 384, H 12, F 1536, L 8, P 15,833,472 parameters, OLLMCK02 layout (CONTRACT-V1 section 6). Probes are `.om`
+units built by `tools/omegallm/wdrive/wbuild.om` from pinned source parts; patches are written and checked
+by `wpatch`, a separate `.om` program (`tools/omegallm/wpatch/`). All run on CPU. Python is allowed only
+as an independent checker (labelled ORACLE).
 
 Layout note for the mapping. Qwen stores `down_proj` as `[out, in]`, so one MLP neuron's write vector is a
 column. Our checkpoint stores `w2[F][D]` with `y = x . W`, so the same vector is a **row** of `w2`
@@ -239,9 +240,9 @@ Where the run did a step differently from this plan, the row says so.
 | Behavioural contrast on practice problems | CPU `.om` generation probe on round40 over a tuning split; classify failures (loop, wrong answer, malformed tool call) and pick one demonstrated failure | MEASURED: long numeric ID truncation, splits D (diagnosis), S (selection), H (held-out), G (generality) |
 | Matched productive vs failing contexts | `.om` teacher-forced probe on matched pairs that share a prefix and diverge; record per-layer residual outputs and per-token log-probs in f64 | DONE DIFFERENTLY: teacher-forced logit-gap decomposition into head and neuron parts on D failure rows (`wprobe probe`), not matched pairs |
 | Direction | Unit difference-of-means direction per candidate layer, computed in `.om` | NOT_RUN: the search scaled ranked heads (E1) and neurons (E2) instead (PREREG section 4) |
-| Locating MLP writers | Score each of the 1,536 `w2` rows per layer by its write onto the direction; choose rows on the tuning split only | DONE DIFFERENTLY: `w2` rows ranked by most negative mean part on D failure rows, not by a write onto a direction and not chosen on the tuning split |
+| Locating MLP writers | Score each of the 1,536 `w2` rows per layer by its write onto the direction; choose rows on the tuning split only | DONE DIFFERENTLY: `w2` rows ranked by their most negative mean part on D failure rows, not by a write onto a direction; how many rows and what scale were then chosen on S, before any H record was scored |
 | The edit | `.om` checked patch: OLLMCK02 in, new file out, base sha256, edit parameters and seed, delta and undo artifact | MEASURED: `wpatch` patch `ca6dbf9a`, 12,288 changed weights, Adam state kept (policy 0) |
-| Dose-response | Several alpha values, teacher-forced branch log-prob change and paired generation | MEASURED on S by generation only: head scales 1.10, 1.25, 1.50, 1.75, 2.00 (counts 1 to 4); neuron scales 0.75, 0.50, 0.25, 0 (counts 4, 8, 16, 32) |
+| Dose-response | Several alpha values, teacher-forced branch log-prob change and paired generation | MEASURED on S by generation only, full grid: 1 to 4 heads at each scale 1.10, 1.25, 1.50, 1.75, 2.00 (20 arms) and 4, 8, 16 or 32 neurons at each scale 0.75, 0.50, 0.25, 0 (16 arms); selected 32 neurons at 0.75 |
 | Layer isolation | Each site alone vs together | NOT_RUN |
 | Norm-matched random control | Orthogonal random direction with the same per-tensor Frobenius change as the chosen edit (the final one, not an earlier dose) | DONE DIFFERENTLY: random neurons in the same layers, not an orthogonal direction. 3 seeds, size within 0.12%; they fix 1, 0 and 0 held-out IDs (PASS) |
 | Paired confirmation | Locked held-out split, never used for selection, paired original vs edited, pre-registered gain threshold | MEASURED, FAIL: +10.9 points against a 25-point bar (21 fixed, 0 broken, exact one-sided McNemar p 4.77e-7) |
