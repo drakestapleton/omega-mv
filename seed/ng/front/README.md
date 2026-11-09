@@ -110,8 +110,11 @@ after 1000000 passes), two slice cases (`runs/p-part.om`, its `part` traps 3, an
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
 `cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
-queen) and matmul verbatim. The full-size kernels stay verbatim in `kernels/` (`kernels/PROVENANCE.md`):
-full size is covered natively by ng-a64's rgate front phase (the a64 ELF against omc, exit and stdout).
+queen) and matmul verbatim. The full-size kernels stay verbatim in `kernels/` (`kernels/PROVENANCE.md`).
+No standing gate compares all of them at full size: ng-a64's rgate front phase (ng/slice-m1, list `tfr`)
+runs only the nine integer kernels (arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul)
+natively against omc; linear (f64, rgate list `tfz`) is refused by a64, and sha, chacha and x25519 are in
+no rgate list. Full size for those four is one-off ngrun-vs-omc evidence recorded with the hand-off, not a gate.
 Every child the gate starts is killed after 600 s: that case prints `NOT_RUN` and counts in `notrun=`, never
 as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `for` latch adds 2;
 `and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped) must fail a run case,
