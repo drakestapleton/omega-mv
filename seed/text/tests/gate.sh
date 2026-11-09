@@ -23,7 +23,7 @@ build() { # build TEXT.om OUT
     "$S" < "$T/drv.om" > "$2" 2> "$T/build.err" || bad "omc refused the driver with $1: $(cat "$T/build.err")"
     chmod +x "$2"
 }
-# runall DRIVER: 0 when every cases file gives exactly its want file
+# runall DRIVER: 0 when every cases file gives exactly its want file; on 1, k names the first file that does not
 runall() {
     for c in "$T"/cases-*.bin; do
         k=${c##*/cases-}; k=${k%.bin}
@@ -34,7 +34,7 @@ runall() {
 }
 
 build seed/text/text.om "$T/txdrv"
-runall "$T/txdrv" || bad "text.om disagrees with the oracle (first file: compare $T/got.txt with its want file)"
+runall "$T/txdrv" || { trap - EXIT HUP INT TERM; bad "text.om disagrees with the oracle: compare $T/got.txt with $T/want-$k.txt (input $T/cases-$k.bin; $T kept)"; }
 rows=$(cat "$T"/want-*.txt | wc -l)
 printf 'PASS %s cases equal the oracle (%s)\n' "$rows" "$(cat "$T/gen.log")"
 
