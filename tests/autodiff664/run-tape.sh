@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-only
-# Build and run the native tape test and its three compiled mutants.
+# Build and run the native tape test and its four compiled mutants.
 #   OMC=<pinned seed/out/omc> OUT=<scratch dir> sh tests/autodiff664/run-tape.sh
 # Host build glue only: concatenation and process exits. All logic is in .om.
 set -u
@@ -30,7 +30,7 @@ echo $? > "$OUT/tape-test.rc"
 grep -q '^NATIVE_TAPE_PASS checks=' "$OUT/tape-test.stdout" || fail tape-test-output
 
 build "$ROOT/tests/autodiff664/mutate.om" "$OUT/mutate.elf" mutate || fail mutate-compile
-for mode in 0 1 2; do
+for mode in 0 1 2 3; do
     { printf '%s' "$mode"; cat "$TAPE"; } | "$OUT/mutate.elf" > "$OUT/mutant$mode.tape.om"
     echo $? > "$OUT/mutant$mode.mutate.rc"
     [ "$(cat "$OUT/mutant$mode.mutate.rc")" = 0 ] || fail "mutant$mode-inject"

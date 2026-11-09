@@ -31,38 +31,51 @@ record of how it was derived, not a way to rebuild it. The gate checks the resul
 
 omc refusals that come from its AArch64 code generator are not language rules: error 12 (16-register
 expression pool), 14 for trap sites, 24 (branch displacement range). ng accepts such units; they are
-`beyond` rows in `declared.txt`, and the gate requires omc to exit 12, 14, 24 or 25 there and ng to
-exit 0. Whether ng then compiles them correctly needs an independent referee (expected output or a C
-twin): NOT_RUN until ng emits code. The value slots of `fe_alloc` keep omc's pool numbering without
-the cap (slots past 16 share a number); ΩIR values replace them.
+`beyond` rows in `declared.txt` (`NAME beyond K REASON`), and the gate requires omc to exit exactly K
+and ng to exit 0. Whether ng then compiles them correctly needs an independent referee (expected output
+or a C twin): NOT_RUN until ng emits code. The value slots of `fe_alloc` keep omc's pool numbering
+without the cap (slots past 16 share a number); ΩIR values replace them.
 
-Units ng does not take exit 64 and are `scope` rows: x86/EFI targets (D8) and IR v1 units (first line
-`ir`). om2 fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text. Input of 8388608
-bytes or more is error 14 as in omc (cases `size_*`); the one input edge that is main.om's: a stdin
-read error is `ng: refused class 27` (omc: error 1).
+Units ng does not take exit 64 and are `scope` rows (`NAME scope K REASON`, omc must exit K): x86/EFI
+targets (D8) and IR v1 units (first line `ir`). A bound of ng's own that omc never reaches because
+another omc limit refuses first is an `ngonly` row (`NAME ngonly K REASON`): both must exit K, and
+their stderr lines differ. The one today is ng's 524288-entry call table (`calls_524289`; omc stops at
+its 8192-entry trap-site table, so `calls_524288` is a beyond row). Each K is omc's exit as measured
+with the pinned omc. om2 fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
+Input of 8388608 bytes or more is error 14 as in omc (cases `size_*`); the one input edge that is
+main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df \
+    gate-front seed/out/omc 0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt
 
 The source is `units:seed/ng/ng.units`: the units that list names, concatenated in its order, so a
 stage lane's unit (src/a64.om on the slice branches) comes with the list and no gate command changes
-(CI also builds ng through `ngbuild build`, which checks their sha256 pins; this gate does not);
+(`ngbuild build`, below, checks their sha256 pins; this gate does not);
 `in:front-check.in` puts the mode line `@ng front-check` before each case
 on ng's stdin, while omc reads the case alone. A wrong mode line makes every case FAIL.
 
 Cases: `cases-front.txt` (f64 rem/and/or/xor, the gate15 refusal cases error-codes.reg names, omc.om,
-the ng-front tools and each ng unit alone), `cases-om2.txt` (every .om under seed/omc/om2),
-`cases-tests.txt` (seed/omc/tests), and the frozen C2 manifest (5876 units). Mutants (`mutants/`):
-m_scope (s_end forgets to restore the name table), m_fltop (f64 accepts rem/and/or/xor), m_fmtcr
-(om2 fmt misses a CR); each must be KILLED.
+the ng-front tools and each ng unit alone, the input-size and call-table edges, and `diag_big`, an om2
+`diag` unit whose 96955 stderr bytes are compared in full: omc and ng each write stderr to their own
+descriptor and the gate compares the two in 65536-byte chunks), `cases-om2.txt` (every .om under
+seed/omc/om2), `cases-tests.txt` (seed/omc/tests), and the frozen C2 manifest (5876 units). Mutants
+(`mutants/`): m_scope (s_end forgets to restore the name table), m_fltop (f64 accepts rem/and/or/xor),
+m_fmtcr (om2 fmt misses a CR), m_sitebyte (one site-record byte past 65536 corrupted), m_callcap (the
+call table takes one call more); each must be KILLED.
 
-CI (`.github/workflows/ng-front-arm64.yml`): NOT_RUN (GitHub Actions blocked). Host runs are recorded
-in the lane's READY files.
+The gate runs on the Spark; there is no GitHub workflow for it. Build ng through its pins and check that
+the gate's checker (`SCRATCH/fecheck`) is byte-for-byte that ng:
+
+    cat seed/ng/sha256.om seed/ng/ngbuild.om | seed/out/omc > ngbuild
+    ngbuild build seed/out/omc seed/ng/ng.units ng
+    cmp ng SCRATCH/fecheck
+
+Host runs are recorded in the lane's READY files.
 
 ## @ng front-ir (M1)
 
@@ -79,20 +92,37 @@ failing conversions, and `while` fuel (1000000 passes, or its `bound`). Local an
 What it does not lower exits 64 with `ng: front-ir: line N: not lowered` (no output): units without
 `fn main to int` (ΩIR needs a program entry; omc writes no executable for them either), mixed-type
 shifts, and every construct outside the M1 subset (read from code: the `fe_lno` call sites).
-Array parameters are `REF` with access 1 even for `view`, since ΩIR v1 has no op that narrows access;
-PROPOSED for ng-ir: a `view` op from an access-1 to an access-0 reference.
+Sized array parameters are `REF` with access 1 even for `view`, since ΩIR v1 has no op that narrows a
+REF's access (so a text passed to a sized `view` parameter is not lowered); PROPOSED for ng-ir: a `view`
+op from an access-1 to an access-0 reference. Unsized (`*`) parameters are `SLICE`s of their own access
+(0 `view`, 1 `edit`); `len` of one is the `len` op. An argument for one is the caller's slice when the
+access matches, else `slice` over the whole array, and `part A o k` is `chk.slice` (trap 3, omc's two
+part checks in one) then `slice`. `unroll` loops lower as plain `for` loops and `inline` functions as
+calls: both are omc code-shape choices with the same results.
 
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc 5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df \
+    gate-front-ir seed/out/omc 0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
-It builds ng, ngcheck and ngrun with the pinned omc, then for each `run` case compiles the unit with
-omc and runs it, lowers it with ng, requires ngcheck ACCEPT, runs the ΩIR with ngrun and compares exit
-status and stdout (stderr is free: the kernels time themselves there); for each `refuse` case ng's exit
-and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of `seed/ng/tests/ir`, the ten
-ng-bench kernels (`kernels/`, verbatim copies, `kernels/PROVENANCE.md`) and 30 refusal units of
-`cases/`. Negative controls: two lowering mutants (the `for` latch adds 2; `and`/`or`/`xor` shifted to
-the next op) must fail a run case, `@ng front-check` mode must fail the first run case (no ΩIR) and
-`@ng ir-copy` mode the first refusal case. Last line `FRONTIRGATE PASS|FAIL ...`, exit 0 or 1.
+It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
+case compiles the unit with omc and runs it, lowers it with ng, requires ngcheck ACCEPT, runs the ΩIR with
+ngrun and compares exit status and stdout (stderr is free: the kernels time themselves there); for each
+`refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
+`seed/ng/tests/ir`, two default-fuel run units of `cases/` (`fuel_while`, `fuel_for`: no bound, trap 4
+after 1000000 passes), two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
+thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
+`cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
+copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
+queen) and matmul verbatim. The full-size kernels stay verbatim in `kernels/` (`kernels/PROVENANCE.md`).
+No standing gate compares all of them at full size: ng-a64's rgate front phase (ng/slice-m1, list `tfr`)
+runs only the nine integer kernels (arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul)
+natively against omc; linear (f64, rgate list `tfz`) is refused by a64, and sha, chacha and x25519 are in
+no rgate list. Full size for those four is one-off ngrun-vs-omc evidence recorded with the hand-off, not a gate.
+Every child the gate starts is killed after 600 s: that case prints `NOT_RUN` and counts in `notrun=`, never
+as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `for` latch adds 2;
+`and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped) must fail a run case,
+`@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
+Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
+never PASS).
