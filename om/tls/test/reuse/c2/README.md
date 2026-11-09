@@ -2,10 +2,11 @@
 
 Issue #639. These are four seeded-Omega IR units (`ir` mode of `seed/out/omc`) plus `c2.plan`, which holds the rows
 for the gate-3 runner `om/tls/test/reuse/aggregate.om` (contract CRYPTO-REUSE-AGGREGATE 1). Run it from the
-repository root:
+repository root through the orchestration script, which builds the runner, prepares `build/tls/reuse/agg/` and
+checks the receipt:
 
 ```
-aggregate run om/tls/test/reuse/c2/c2.plan
+sh om/tls/test/reuse/agg.sh seed/out/omc om/tls/test/reuse/c2/c2.plan
 ```
 
 ## What checker2 proves here

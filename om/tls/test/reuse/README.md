@@ -31,10 +31,12 @@ sh om/tls/test/reuse/agg.sh seed/out/omc om/tls/test/reuse/prov.plan \
 Without plan arguments it only runs the runner's own self-test. With them it first runs the
 self-test, then joins the plans into `build/tls/reuse/aggregate.plan`, runs every row, writes
 `build/tls/reuse/aggregate.txt` (contract `CRYPTO-REUSE-AGGREGATE 1`, written out at the top of
-`aggregate.om`) and requires `aggregate check` to regenerate it byte for byte. Its exit is the
-plan's verdict (0 PASS, 1 FAIL, 2 REFUSED, 3 INVALID, 4 NOT_RUN). The gate 3 rows need the other
-repositories checked out under `build/tls/reuse/src/` (`agg/README.md`); a missing checkout makes
-its rows NOT_RUN, never PASS.
+`aggregate.om`) and requires `aggregate check` to accept it: check recomputes the receipt from the
+plan, logs, outputs and fixtures and compares it byte for byte. Its exit is the plan's verdict (0
+PASS, 1 FAIL, 2 REFUSED, 3 INVALID, 4 NOT_RUN). On a shared host, hold the CPU pool lock for the
+whole run (on the Spark: `flock ~/handoffs/hive/queen/pool-8-9.lock taskset -c 8-9 nice -n 19`);
+rows take no lock themselves. The gate 3 rows need the other repositories checked out under
+`build/tls/reuse/src/` (`agg/README.md`); a missing checkout makes its rows NOT_RUN, never PASS.
 
 ## Files
 
@@ -49,7 +51,7 @@ its rows NOT_RUN, never PASS.
 | `aggregate.om` | the plan runner: runs each row under a deadline, hashes logs, outputs and fixtures, classifies every row and prints the aggregate receipt; `check` mode recomputes it from the files (`om2`, `om/tls/sha2.om`, `aggregate.om`) |
 | `fixture.om` | a test program for the runner's self-test: prints its arguments as lines and exits with the first |
 | `selftest.plan` | 27 rows, one per classification branch of `aggregate.om`, each with its wanted class |
-| `agg.sh` | orchestration: builds the runner, runs the self-test, 8 tamper controls and the runner mutants, then the given plans, always under `env -i HOME PATH LC_ALL=C` |
+| `agg.sh` | orchestration: builds the runner, runs the self-test, 8 tamper controls, 5 malformed-plan refusals and the runner mutants, then the given plans, always under `env -i HOME PATH LC_ALL=C` |
 | `prov.plan` | provenance rows: commit, clean tree, compiler pin, the environment every row receives, runner sources |
 | `c2/` | the checker2 obligations: four IR units, `c2.plan`, `README.md` |
 | `agg/` | the gate 3 adapter plan for the three other repositories, their mutant patches, `README.md` |
@@ -73,7 +75,7 @@ exact comparison of the failed control numbers. The contract is written out at t
 | Gate 3: Open Humanity replay cache, contributory X25519, transport boundaries (open-humanity #29, #30, #31) | `agg/gate3.plan`: `oh-control` (28 + 89 tests) and eight mutants `oh-replay-clear` … `oh-write-resume`, each killed at its named test; pin d929a34 with the `oh-lockfix.diff` lock fixture (`agg/README.md`) | EXERCISED, host; transcript binding has no Open Humanity test, so no mutant covers it |
 | Gate 3: Aienux sealed-store rollback and nonce safety (aienux #445) | `ux-store-control`, `ux-crypto-control`, mutant `ux-v1-predictable-envid` | EXERCISED, host; `STORE_RUST_CROSSCHECK` NOT_RUN in aienux itself |
 | Gate 3: Sovereign Core sealed KV nonce source and recovery (aien-sovereign-core-mv #708) | `sc-control`, mutants `sc-m1-entropy-error-dropped`, `sc-m2-aad-shortened`, `sc-m3-aad-removed` | EXERCISED, host |
-| Gate 3 and checker2 aggregate result | `aggregate.om`, receipt `CRYPTO-REUSE-AGGREGATE 1`, `agg.sh`; self-test of every class, 8 tamper controls, 13 runner mutants | IMPLEMENTED, EXERCISED |
+| Gate 3 and checker2 aggregate result | `aggregate.om`, receipt `CRYPTO-REUSE-AGGREGATE 1`, `agg.sh`; self-test of every class, 8 tamper controls, 5 malformed-plan refusals, 17 runner mutants | IMPLEMENTED, EXERCISED |
 | Gate 4: a named negative mutant per protection, observed failing assertion, control run | six driver mutants, each bound to the exact set of checks it must fail | EXERCISED, host |
 | Gate 4: build error, crash, timeout, missing executable or skipped test is INVALID or NOT_RUN | `receipt.om` classes; controls 13, 14, 16, 17, 19, 24-26, 38-40, 43, 45, 46 | EXERCISED, host |
 | Versioned fixture and receipt format | `CRYPTO-REUSE-RECEIPT 1` in `receipt.om` | IMPLEMENTED, EXERCISED |
@@ -127,12 +129,18 @@ intended marker in the middle of a line (`mut-unrelated`, `ctl-midline`), a miss
 each one: a log byte (`t-log`), a class word (`t-class`), the verdict word (`t-verdict`), a deleted
 row line (`t-row`), a removed log (`t-nolog`), a changed bound fixture (`t-fixture`), a changed
 plan (`t-plan`) and a status number (`t-status`). A tamper that leaves the bytes unchanged is
-reported as a harness error, never as refused.
+reported as a harness error, never as refused. Five malformed plans must stop both `run` and
+`check` with exit 3 at their exact plan line, before their command runs: 58 arguments (`r-args`;
+`execenv` takes at most 64 entries and the runner adds 7), a 201-byte row name (`r-name`), a
+mutant expecting exit 0 (`r-mutexit0`), an argument packet over 4096 bytes (`r-bytes`) and a
+repeated row name (`r-dup`). The packet size is computed while parsing, so both modes accept the
+same plans; on the Spark a 4034-byte argument after `echo` makes a packet of exactly 4096 bytes and
+runs, 4035 bytes is refused.
 
 ### Runner mutants
 
 One changed line of `aggregate.om`. Each must build and change exactly the listed self-test rows
-(class or reason) and tamper controls; a survivor is FAIL, any other set INVALID, a missing site
+(class or reason), tamper and refusal controls; a survivor is FAIL, any other set INVALID, a missing site
 NOT_RUN.
 
 | Mutant | Change | Rows and controls |
@@ -150,3 +158,7 @@ NOT_RUN.
 | `survivor-killed` | a survivor counts as killed | `mut-survived` |
 | `receipt-bytes-unchecked` | check compares only the receipt length | `t-log`, `t-class`, `t-verdict`, `t-fixture`, `t-plan` |
 | `env-not-passed` | rows get an empty environment (`execprog`) instead of the runner's | `ctl-env` |
+| `args-unbounded` | a row may have more than 57 arguments (the child then traps in `execenv`) | `r-args` |
+| `name-unbounded` | a row name may exceed 200 bytes | `r-name` |
+| `mutant-exit0-accepted` | a mutant may expect exit 0 (killed and survived then share a status) | `r-mutexit0` |
+| `packet-unchecked-in-plan` | the parser skips the packet size (run still stops in `arun`, check does not) | `r-bytes` |

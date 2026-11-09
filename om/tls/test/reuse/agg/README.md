@@ -25,6 +25,13 @@ is NOT_RUN through `after`.
 
 ## Rows
 
+Deadlines are at least three times the durations measured on the Spark from a cold build (for example
+`oh-control` 30.5 s with `time 180`, `ux-store-control` 116 s with `time 360`, `sc-control` 76 s
+with `time 240`). Cargo keeps its build caches in `build/tls/reuse/target-oh` and
+`build/tls/reuse/target-sc` (`CARGO_TARGET_DIR`), which `agg.sh` does not remove, so later runs are
+faster. A first run on a slower host can pass a deadline; that row is INVALID (status 124), never
+PASS, and a rerun with the warm caches settles it.
+
 - Toolchain: `rustc 1.98.1`, `cargo 1.98.1`, `cc 13.3.0` exact version lines.
 - Controls: `oh-control` (beacon-core and oh-core unit tests, 15 named tests and both totals),
   `ux-store-control` and `ux-crypto-control` (`make test mutants` in `native/store` and

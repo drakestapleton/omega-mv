@@ -10,12 +10,16 @@
 #    check` must accept that receipt and refuse (exit 2) each tampered copy: t-log (a log byte),
 #    t-class and t-verdict (one word of the receipt), t-row (a row line deleted), t-nolog (a log
 #    removed), t-fixture (a bound fixture changed), t-plan (the plan changed), t-status (a status);
+#    and five malformed plans must stop both `run` and `check` with exit 3 at their exact line,
+#    before their command runs: r-args (58 args), r-name (a 201-byte name), r-mutexit0 (a mutant
+#    expecting exit 0), r-bytes (an argument packet over 4096 bytes), r-dup (a repeated row name);
 # 3. runner mutants: each one-line change of aggregate.om must build and change exactly the named
-#    self-test rows (class and reason) and tamper controls; a survivor is FAIL, a build failure or
-#    another set INVALID, a site that does not occur exactly once NOT_RUN;
+#    self-test rows (class and reason), tamper and refusal controls; a survivor is FAIL, a build
+#    failure or another set INVALID, a site that does not occur exactly once NOT_RUN;
 # 4. with PLANs: joins them in order into build/tls/reuse/aggregate.plan (row names are unique across
 #    them), runs it from a fresh build/tls/reuse/agg/ into build/tls/reuse/aggregate.txt, and
-#    `aggregate check` must reproduce that receipt byte for byte.
+#    `aggregate check` (which recomputes the receipt from the plan and files and compares it byte for
+#    byte) must accept it. Hold the host's CPU pool lock for the whole run; rows take no lock.
 # Exit: 0 PASS, 1 FAIL, 2 REFUSED, 3 INVALID, 4 NOT_RUN (with PLAN: the plan's verdict).
 set -u
 OMC=${1:?usage: sh om/tls/test/reuse/agg.sh OMC [PLAN...]}
@@ -44,6 +48,22 @@ refused() { # $1 runner, $2 plan, $3 receipt: 0 when check refuses
   "$1" check "$2" "$3" > "$S/t.out" 2>&1
   [ $? -eq 2 ] && grep -q '^REFUSED ' "$S/t.out"
 }
+
+# malformed NAME LINE RUNNER: `run` and `check` (receipt /dev/null) of $S/NAME.plan must both stop
+# with exit 3 and "aggregate: malformed plan, line LINE", so before the refused row's command runs;
+# prints NAME when either did not
+malformed() {
+  agg "$3" run "$S/$1.plan" > "$S/m.out" 2>&1; a=$?
+  agg "$3" check "$S/$1.plan" /dev/null > "$S/c.out" 2>&1; c=$?
+  [ "$a" -eq 3 ] && [ "$c" -eq 3 ] && grep -qx "aggregate: malformed plan, line $2" "$S/m.out" \
+    && grep -qx "aggregate: malformed plan, line $2" "$S/c.out" || printf '%s\n' "$1"
+}
+rep() { i=0; while [ "$i" -lt "$1" ]; do printf '%s\n' "$2"; i=$((i + 1)); done; }
+{ printf 'row r-args control\nexit 0\narg true\n'; rep 57 'arg x'; printf 'end\n'; } > "$S/r-args.plan"
+{ printf 'row r-name-%s control\nexit 0\narg true\nend\n' "$(rep 194 a | tr -d '\n')"; } > "$S/r-name.plan"
+printf 'row r-mutexit0 mutant\nexit 0\narg true\nneed x\npass y\nend\n' > "$S/r-mutexit0.plan"
+{ printf 'row r-bytes control\nexit 0\narg echo\narg '; rep 4100 a | tr -d '\n'; printf '\nend\n'; } > "$S/r-bytes.plan"
+printf 'row r-dup control\nexit 0\narg true\nend\nrow r-dup control\nexit 0\narg true\nend\n' > "$S/r-dup.plan"
 
 # tamper NAME RUNNER PLAN COPY: COPY must differ from the receipt and be refused; prints NAME when it
 # was accepted and NAME-noop when the tamper changed nothing (a harness error, never a pass)
@@ -79,6 +99,10 @@ selftest() {
   { cat "$D/selftest.plan"; printf '# changed\n'; } > "$S/t.plan"
   refused "$1" "$S/t.plan" "$r" || printf 't-plan\n'
   flip 'row mut-killed ' 5 101 0 > "$S/t.rcpt"; tamper t-status "$1" "$D/selftest.plan" "$S/t.rcpt"
+  # refusal lines: the 58th arg; the row line; and the `end` line for r-mutexit0, r-bytes and the
+  # repeated r-dup row (the first r-dup row runs in run mode; the repeat never does)
+  malformed r-args 60 "$1"; malformed r-name 1 "$1"; malformed r-mutexit0 6 "$1"
+  malformed r-bytes 5 "$1"; malformed r-dup 8 "$1"
   return $rc
 }
 
@@ -124,10 +148,14 @@ vmut big-log-accepted 'if ne get lbig 0 0' 'if false' 'ctl-big-log'
 vmut survivor-killed 'ret add ulong 32 3' 'ret add ulong 16 2' 'mut-survived'
 vmut receipt-bytes-unchecked 'if ne get ob i get rb i' 'if false' 't-log t-class t-verdict t-fixture t-plan'
 vmut env-not-passed 'if eq get evn 0 0' 'if true' 'ctl-env'
+vmut args-unbounded 'if ge j 57' 'if false' 'r-args'
+vmut name-unbounded 'if gt sub q v 200' 'if false' 'r-name'
+vmut mutant-exit0-accepted 'if and eq get rf 2 1 eq get rf 12 0' 'if false' 'r-mutexit0'
+vmut packet-unchecked-in-plan 'if gt pksize len av' 'if false' 'r-bytes'
 if [ "$vsurv" -ne 0 ]; then say "AGG FAIL: a runner mutant survived"; exit 1; fi
 if [ "$vinv" -ne 0 ]; then say "AGG INVALID: a runner mutant was not validly caught"; exit 3; fi
 if [ "$vnr" -ne 0 ]; then say "AGG NOT_RUN: a runner mutant site is missing"; exit 4; fi
-say "AGG SELFTEST PASS rows=$nrows tamper=8 runner-mutants=$vok/$vall receipt sha256=$(hash "$S/base.rcpt")"
+say "AGG SELFTEST PASS rows=$nrows tamper=8 refusals=5 runner-mutants=$vok/$vall receipt sha256=$(hash "$S/base.rcpt")"
 [ "$#" -gt 0 ] || exit 0
 
 P=$B/aggregate.plan
