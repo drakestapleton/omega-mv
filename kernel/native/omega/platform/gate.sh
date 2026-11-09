@@ -16,6 +16,8 @@
 # results.json into OUT_DIR.
 set -eu
 export LC_ALL=C
+# cd prints the directory when CDPATH supplies it, which would corrupt $(cd ...).
+unset CDPATH
 
 die() { printf 'PLATFORM READBACK FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -41,11 +43,12 @@ for f in "$source" "$unit" "$fixture"; do
 done
 
 # Descriptor-parity program from the fixture. The reader is a small
-# recursive-descent JSON parser: strings without escapes, objects, arrays,
-# numbers and literals. It requires exactly 20 CPUs with exactly 21 registers
-# each, every register an object whose space, bits, offset, address and access
-# fields are strings (no duplicate keys anywhere), hex values written 0x...,
-# a known address space, offset 0 and the access width implied by the space.
+# recursive-descent JSON parser: strings without escapes or control characters,
+# objects, arrays, JSON numbers and the literals true, false and null. It
+# requires a cpus array of exactly 20 objects, each with a registers array of
+# exactly 21 objects whose space, bits, offset, address and access fields are
+# strings (no duplicate keys anywhere), hex values written 0x..., a known
+# address space, offset 0 and the access width implied by the space.
 parity=$out/descriptor-parity.checks
 count=$out/descriptor-parity.count
 awk -v countfile="$count" '
@@ -68,6 +71,7 @@ function tokenize(    n, p, q, c) {
       q = p + 1
       while (q <= n && substr(text, q, 1) != "\"") {
         if (substr(text, q, 1) == "\\") fail("escaped strings are not supported")
+        if (substr(text, q, 1) ~ /[\001-\037]/) fail("control character in a string")
         q++
       }
       if (q > n) fail("unterminated string")
@@ -77,6 +81,7 @@ function tokenize(    n, p, q, c) {
     while (q <= n && substr(text, q, 1) ~ /[-+.0-9A-Za-z]/) q++
     if (q == p) fail("unexpected character " c)
     tt[++nt] = "v"; tv[nt] = substr(text, p, q - p); p = q
+    if (tv[nt] !~ /^(true|false|null|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?)$/) fail("not a JSON value: " tv[nt])
   }
 }
 function want(t) { if (P > nt || tt[P] != t) fail("expected " t " at token " P); P++ }
@@ -84,6 +89,14 @@ function want(t) { if (P > nt || tt[P] != t) fail("expected " t " at token " P);
 function value(d,    t, key, idx, seen) {
   if (P > nt) fail("unexpected end of input")
   t = tt[P]
+  # Every cpus and registers element must be an object, so a stray scalar
+  # cannot pad or shape the counts below.
+  if (path[1] == "cpus") {
+    if (d == 1 && t != "[") fail("cpus is not an array")
+    if (d == 2 && t != "{") fail("cpu " path[2] " is not an object")
+    if (d == 3 && path[3] == "registers" && t != "[") fail("cpu " path[2] ": registers is not an array")
+    if (d == 4 && path[3] == "registers" && t != "{") fail("cpu " path[2] " register " path[4] " is not an object")
+  }
   if (t == "s" || t == "v") {
     if (d == 5 && path[1] == "cpus" && path[3] == "registers") {
       if (t != "s") fail("register field " path[5] " is not a string")

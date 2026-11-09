@@ -188,7 +188,8 @@ The two conductors replaced the original Python ones (`gate.py`,
 `kernel-repro.py`) under the repository's no-Python guard; on the same inputs
 they write byte-identical generated programs, binaries, outputs and
 `results.json` (the fixture reader is stricter: hex values must be written
-`0x...`, strings may not contain escapes, and duplicate keys are refused).
+`0x...`, strings may not contain escapes, duplicate keys are refused, and all
+five fields are required on all 21 registers of every CPU).
 
 Observed acceptance: both commands exited 0. The readback gate passed all 247
 descriptor reads (twenty CPUs times twelve selected descriptors, plus seven

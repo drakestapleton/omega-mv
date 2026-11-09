@@ -17,6 +17,8 @@
 # and results.json into OUT_DIR.
 set -eu
 export LC_ALL=C
+# cd prints the directory when CDPATH supplies it, which would corrupt $(cd ...).
+unset CDPATH
 
 die() { printf 'PCIE COOLING REPRO FAIL: %s\n' "$*" >&2; exit 1; }
 
