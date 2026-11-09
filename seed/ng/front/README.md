@@ -105,7 +105,8 @@ It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinne
 case compiles the unit with omc and runs it, lowers it with ng, requires ngcheck ACCEPT, runs the ΩIR with
 ngrun and compares exit status and stdout (stderr is free: the kernels time themselves there); for each
 `refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
-`seed/ng/tests/ir`, two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
+`seed/ng/tests/ir`, two default-fuel run units of `cases/` (`fuel_while`, `fuel_for`: no bound, trap 4
+after 1000000 passes), two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
 `cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
