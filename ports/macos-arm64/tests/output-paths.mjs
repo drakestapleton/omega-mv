@@ -52,7 +52,9 @@ test('target still creates and replaces the requested regular file',()=>{
   const out=path.join(temp,'regular.macho');
   for(let i=0;i<2;i++){
     const r=run('sh',[path.join(modulePath,'target.sh'),input,out]);assert.equal(r.status,0,r.stderr.toString());
-    assert.ok(fs.statSync(out).isFile());assert.equal(fs.readFileSync(out).readUInt32LE(0),0xfeedfacf);
+    const fd=fs.openSync(out,'r');
+    try{assert.ok(fs.fstatSync(fd).isFile());const magic=Buffer.alloc(4);assert.equal(fs.readSync(fd,magic,0,4,0),4);assert.equal(magic.readUInt32LE(0),0xfeedfacf);}
+    finally{fs.closeSync(fd);}
   }
 });
 test('build still replaces the requested adapter with identical seed-built bytes',()=>{
