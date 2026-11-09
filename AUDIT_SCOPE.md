@@ -23,9 +23,11 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`,
-   from `seed/omc/omc.om` `7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`; the prlimit 235
-   host word, branch `seed/prlimit-host-word`, on rad main 408c76b7). The earlier audit pins
+   `1a66545a7836fdc6f52bbdc64dfd6d7b29060d8dac4f0840615dc7894fbdc1d1`,
+   from `seed/omc/omc.om` `9e116c0250c684fa7453bf79911f96229b76c28f26418771af2ce24ec41aa544`; mapget/mapset
+   width 1 and 2, branch `hive/t_82f66d3d-map-narrow`, on rad main 1e3ecbba). The earlier audit pins
+   `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8` (the prlimit 235 host word, branch
+   `seed/prlimit-host-word`, on rad main 408c76b7),
    `0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f` (x86 types `fma` operands before its
    error 9, branch `fix/x86-fma-order`), `cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a`
    (the execenv 233 host word, branch `hive/execprog-env`), `5f90edea61bac241398df5036990d899361a5acd9decb37954ce088ec0f6f6df`

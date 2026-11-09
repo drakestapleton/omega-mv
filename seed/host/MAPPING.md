@@ -21,8 +21,8 @@ bootstrap and test orchestration remain disclosed development tools.
 | `eventfd initial` | `initial` is uint. Creates Linux eventfd2 with CLOEXEC and NONBLOCK, no semaphore mode; returns long fd or negative errno. Use existing `read`/`write` with exactly eight bytes, `waitio`/`pollfds` for readiness, and `fclose` for close. |
 | `vfioirq fd request A off n` | `fd` is int acquired by successful `vfioctl GROUP_GET_DEVICE_FD`; request is literal uint15213 (GET_IRQ_INFO) or15214 (SET_IRQS). A is writable uchar bytes, offsets/counts ulong. Checks exact caller-supplied argsz and the bounded IRQ contract below. Returns signed Linux ioctl result. |
 | `mapaddr handle` | The owned live mapping's base address as ulong, for driver address serialization. Does not permit access through an arbitrary integer address. Works on reservations. |
-| `mapget handle offset width` | Aligned uint32 or uint64 load, returned as ulong; width is literal int4 or8. Exactly one load, bracketed by DSB SY on AArch64 or MFENCE on x86-64. Requires readable memory. |
-| `mapset handle offset width value` | Aligned uint32 or uint64 store from ulong, returning long0; width is literal int4 or8. A uint32 store refuses truncation. Exactly one store, bracketed by DSB SY on AArch64 or MFENCE on x86-64. Requires writable memory. |
+| `mapget handle offset width` | Aligned uint8, uint16, uint32 or uint64 load, zero-extended and returned as ulong; width is literal int 1, 2, 4 or 8. Exactly one load (AArch64 LDRB/LDRH/LDR, x86-64 MOVZX/MOV), bracketed by DSB SY on AArch64 or MFENCE on x86-64. Requires readable memory. |
+| `mapset handle offset width value` | Aligned uint8, uint16, uint32 or uint64 store from ulong, returning long0; width is literal int 1, 2, 4 or 8. A narrow store refuses truncation (a value above 255, 65535 or 4294967295 traps 3). Exactly one store (AArch64 STRB/STRH/STR, x86-64 MOV of that size), bracketed by DSB SY on AArch64 or MFENCE on x86-64, so a 1- or 2-byte device register is written without touching its neighbours. Requires writable memory. |
 | `maphold address bytes` | Reserve an unused, page-aligned span with PROT_NONE and MAP_FIXED_NOREPLACE. Address is at least64KiB and the whole span is below1TiB. Return an owned handle or errno. A kernel that ignores NOREPLACE is detected by checking the returned address; an unexpected result is unmapped and returns -95. |
 | `mapbind handle fd offset access` | Bind a shared file/device mapping to the entire owned reservation, with literal access1 or3. No existing data mapping may be replaced. Return long0 or errno. Failed bind with successful cleanup retires the handle. Function-mode double failure quarantines it for cleanup only (below). |
 | `cpufence` | Statement, keyword 199: a standalone host CPU publication barrier, AArch64 `DSB SY`, x86-64 `MFENCE`. It orders ordinary stores, for example `mapwrite` or plain array stores, before a later `mapset` doorbell or flag. A `mapget`/`mapset` access already carries its own barriers. See OMEGESE §10, "Host CPU ordering words". Proof: `seed/host/cpufence.sh`. |
@@ -399,3 +399,25 @@ SVC/`syscall`. Two functions were added (510 of 512). Each of the 1496 tracked
 status and diagnostics; the other 12 are the AArch64 and x86 compiles of the six
 `seed/host/prlimit/` sources, which use the new word (error 3 before). Gate:
 `seed/host/prlimit/prlimit.cases`.
+
+mapget/mapset width 1 and 2 (branch `hive/t_82f66d3d-map-narrow` on rad main
+`1e3ecbba`, 2026-11-09, PROPOSED pending review) births compiler
+`1a66545a7836fdc6f52bbdc64dfd6d7b29060d8dac4f0840615dc7894fbdc1d1` from source
+`9e116c0250c684fa7453bf79911f96229b76c28f26418771af2ce24ec41aa544`. Byte and
+halfword device registers (for example RTL8127 ChipCmd 0x37, Cfg9346 0x50, the
+16-bit interrupt registers) need a single access of their own size: a 4-byte
+store would also overwrite the neighbouring registers. `mmapio` (AArch64) emits
+LDRB/LDRH/STRB/STRH with unsigned offset 0 (Arm DDI0487M.d C6.2.220, 222, 417,
+419: 0x39400000, 0x79400000, 0x39000000, 0x79000000) and `xhmmio` (x86-64)
+MOVZX r32, byte/word and MOV r/m8, MOV r/m16 (0x66 prefix) through the existing
+`xhraw`/`xhput`. The handle, bounds (offset + width within the mapping), alignment
+(offset mod width = 0) and access checks are the unchanged 4/8-byte ones; the
+truncation limit is 255, 65535 or 4294967295 by width. Any other width, or a
+non-literal width, stays error 9. No function was added (510 of 512). Each of
+the 1629 tracked `.om` files was compiled alone for AArch64 and for
+`target x86linux` under `6d1b1cf5` and `1a66545a`: all 3258 compiles give the
+same bytes, exit status and diagnostics. Gate:
+`seed/host/mapnarrow/mapnarrow.cases` (fake device file: a shared memfd mapping
+read back through `pread`/`pwrite`; AArch64 native and x86linux under qemu-user,
+refusals, function-mode admission, 12 omc.om mutants killed). Host and emulator
+evidence only; no PCI device, VFIO group or chip was touched.
