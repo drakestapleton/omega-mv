@@ -590,11 +590,16 @@ def conductor_case(path, name, line, alternate, compiler_subst):
 
 
 def current_c2_contract(fields):
-    """Use the already accepted deltas, retaining the frozen replay separately."""
+    """Use the already accepted deltas, retaining the frozen replay separately.
+
+    The deltas are listed oldest first and the latest one that declares a row wins:
+    a later compiler may change the bytes a newer delta already declared."""
+    found = (fields, None)
     for relative in ("seed/qualification/om2/manifest-c2-capacity.txt",
                      "seed/qualification/om2/manifest-c2-batch2.txt",
                      "seed/qualification/om2/manifest-c2-fpvreg.txt",
-                     "seed/qualification/om2/manifest-c2-closerange.txt"):
+                     "seed/qualification/om2/manifest-c2-closerange.txt",
+                     "seed/qualification/om2/manifest-c2-hostwords.txt"):
         path = ROOT / relative
         for line in path.read_text().splitlines():
             replacement = line.split()
@@ -602,9 +607,9 @@ def current_c2_contract(fields):
                 continue
             if replacement[1:3] != fields[1:3]:
                 raise Failure("current C2 delta changed the frozen operation or input")
-            return replacement, {"path": relative, "sha256": digest(path.read_bytes()),
-                                 "frozen_row": " ".join(fields), "current_row": line}
-    return fields, None
+            found = (replacement, {"path": relative, "sha256": digest(path.read_bytes()),
+                                   "frozen_row": " ".join(fields), "current_row": line})
+    return found
 
 
 def cases(files, record):
