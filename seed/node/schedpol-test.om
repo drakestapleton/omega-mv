@@ -1,0 +1,1314 @@
+note Concatenate after transport.om, pool.om, super.om and sched.om. CPU-only
+note acceptance of the resource-aware selection policy (P-DRA-14) with real
+note forked workers: impossible requests, the capacity invariant under churn,
+note ready order, the head-of-line scenarios of the reference pump
+note (aien-sovereign-core-mv spark-harness scheduler/core.rs Core::pump),
+note starvation under repeated small arrivals, admission tickets, lease
+note expiry and cancellation of a reserved job.
+note After every creator step the test checks that no kind is used beyond its
+note capacity and that the use equals the needs of the jobs holding them.
+note Argument "fifo" runs policy 0, "noreserve" policy 1 with the bypass
+note budget out of reach: the negative controls. No GPU, model or network.
+text pok "PASS node schedpol\n"
+text pst "schedpol events="
+text pex " examined="
+text pas " assigned="
+text phol " hol_stops="
+text pbyp " bypasses="
+text pres " reservations="
+text pnl "\n"
+text ptr "schedpol goal trace "
+text psp " "
+text pw1 "schedpol hol witness head="
+text pw2 " fits_behind="
+text pw3 " free_cpu="
+text pw4 " idle_worker="
+global ptc long 1
+note Mode: 0 default policy, 1 fifo, 2 noreserve, 3 goal (policy 2).
+global ptm ulong 1
+note Step-bound snapshot (pt_snap): event count, candidate reads,
+note maintenance reads, assigned, cursor, window scans.
+global ptb ulong 6
+note Phase G trace: ids in review order.
+global ptt ulong 16
+global ptn ulong 1
+note Value-read bound baseline: stats 38, 32, 33 at the last check.
+global ptv ulong 3
+
+fn pt_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn pt_num v ulong to void
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 d k sub 20 k
+end
+
+note Packed request: cpu slots, memory MiB, inference slots, kind 3.
+fn pt_req cpu ulong mem ulong inf ulong x ulong to ulong
+ret or or cpu shl mem 16 or shl inf 32 shl x 48
+end
+
+note Worker: run assignment q for the milliseconds in the low four decimal
+note digits of its job id, then report outcome id+1 and 8 bytes. 0 done,
+note 2 stopped, 3 creator gone, 4 wait error, 5 report refused.
+fn pt_run c long w ulong q ulong to int
+buf = new uchar 4096 0
+id = sc_cell w 8
+dl = add ulong monons mul rem id 10000 1000000
+for t ulong 1000000
+now = ulong monons
+if ge now dl
+break
+end
+r = sched_wwait c w long sub dl now
+if eq r 2
+ret 2
+end
+if eq r 3
+ret 3
+end
+if lt r 0
+ret 4
+end
+end
+if ne sched_wdone w q add id 1 buf 8 0
+ret 5
+end
+ret 0
+end
+
+fn pt_worker w ulong to int
+c = get ptc 0
+for it ulong 1000000000
+q = sched_wjob w
+if gt q 0
+r = pt_run c w q
+if eq r 2
+ret 0
+end
+if ne r 0
+ret add 60 r
+end
+continue
+end
+r = sched_wwait c w neg long 1
+if eq r 2
+ret 0
+end
+if eq r 3
+ret 41
+end
+if lt r 0
+ret 43
+end
+end
+ret 45
+end
+
+fn pt_spawn c long w ulong to bool
+p = sup_spawn c w
+if eq p 0
+exit pt_worker w
+end
+ret gt p 0
+end
+
+note Fresh pool for w workers (spawned), admission limit a, review limit rl,
+note capacities caps. Exits with code on any refusal.
+fn pt_setup w ulong a ulong rl ulong caps ulong code int to long
+c = pool_new 4 w
+pt_ok gt c 0 code
+put ptc 0 c
+pt_ok eq sup_init c 0 code
+pt_ok eq sched_new c a rl 0 code
+pt_ok eq sched_cap caps 0 code
+put ptv 0 sched_stat 38
+put ptv 1 sched_stat 32
+put ptv 2 sched_stat 33
+if eq get ptm 0 1
+pt_ok eq sched_policy 0 64 64 4 1000 0 code
+end
+if eq get ptm 0 2
+pt_ok eq sched_policy 1 64 64 65535 1000 0 code
+end
+if eq get ptm 0 3
+pt_ok eq sched_policy 2 64 64 4 1000 0 code
+end
+for i ulong w bound 64
+pt_ok pt_spawn c i code
+end
+ret c
+end
+
+fn pt_down c long code int to void
+pt_ok ge sched_stop c 2000000000 0 code
+sup_closeall
+pt_ok eq sched_free 0 code
+pt_ok eq pool_free c 0 code
+end
+
+note The capacity invariant: of each kind the use is at most the capacity
+note and equals the sum of the needs of the jobs that hold resources; only
+note a running job holds them, and every running job whose worker has not
+note reported done holds them.
+fn pt_inv code int to void
+for j ulong 64
+if eq get sjst j 3
+w = get sjw j
+if ne sc_cell w 64 get scseq w
+pt_ok eq get sjheld j 1 code
+end
+end
+end
+for k ulong 4
+s = ulong 0
+for j ulong 64
+if eq get sjheld j 1
+pt_ok eq get sjst j 3 code
+s = add s sp_need get sjneed j k
+end
+end
+pt_ok eq get suse k s code
+pt_ok le get suse k get scap k code
+end
+end
+
+note One creator step of up to 10 ms, then the invariant and the scan
+note bounds since the last step. An event makes at most one pick more than
+note it assigns, so candidate reads are at most (assigned + events) x
+note (window + 1), the reserved probe included, plus one proposal probe per
+note pick under policy 2, or x 64 under FIFO (policy 0), 9; maintenance reads
+note at most 64 per event, 14; the cursor moved by exactly the window per
+note window scan, mod 64, 15 (the traversal witness: window scans cover
+note consecutive windows, so ceil(64/win) of them examine every slot); value
+note reads at most 64 per rescoring plus 128 per job scored, 8.
+fn pt_step c long code int to void
+pt_snap
+r = sched_step c 10000000
+pt_ok ge r 0 code
+pt_inv code
+pt_check
+end
+
+note Snapshot the counters the step bounds compare against (ptb).
+fn pt_snap to void
+put ptb 0 sched_stat 2
+put ptb 1 sched_stat 3
+put ptb 2 sched_stat 13
+put ptb 3 sched_stat 4
+put ptb 4 sched_stat 28
+put ptb 5 sched_stat 14
+end
+
+note The bounds since pt_snap (exits 9, 14, 15, 8).
+fn pt_check to void
+w = add sched_stat 25 1
+if eq sched_stat 24 0
+w = ulong 64
+end
+if eq sched_stat 24 2
+w = add w 1
+end
+ev = sub sched_stat 2 get ptb 0
+lim = mul add sub sched_stat 4 get ptb 3 ev w
+pt_ok le sub sched_stat 3 get ptb 1 lim 9
+pt_ok le sub sched_stat 13 get ptb 2 mul ev 64 14
+pt_cursor get ptb 4 get ptb 5
+pt_vbound
+end
+
+note Resume dispatch (it dispatches at once) inside the step bounds.
+fn pt_resume c long to void
+pt_snap
+k = sched_pause c false
+pt_check
+end
+
+note The cursor moved by the window once per window scan since (u0, s0).
+fn pt_cursor u0 ulong s0 ulong to void
+d = mul sched_stat 25 sub sched_stat 14 s0
+pt_ok eq sched_stat 28 rem add u0 d 64 15
+end
+
+note The value-read bound since the last call (phase checks, exit 8).
+fn pt_vbound to void
+v = sched_stat 38
+lim = add mul sub sched_stat 32 get ptv 1 64 mul sub sched_stat 33 get ptv 2 128
+pt_ok le sub v get ptv 0 lim 8
+put ptv 0 v
+put ptv 1 sched_stat 32
+put ptv 2 sched_stat 33
+end
+
+note Step until job j is in a state in lo..hi, up to ms. True when reached.
+fn pt_until c long j ulong lo ulong hi ulong ms ulong code int to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+s = get sjst j
+if and ge s lo le s hi
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+pt_step c code
+end
+ret false
+end
+
+note Review every job in review whose outcome is its id + 1.
+fn pt_review code int to ulong
+n = ulong 0
+for j ulong 64
+if eq get sjst j 4
+pt_ok eq sched_review j long add get sjid j 1 code
+n = add n 1
+end
+end
+ret n
+end
+
+note Step and review until n jobs were reviewed, up to ms.
+fn pt_drain c long n ulong ms ulong code int to void
+dl = add ulong monons mul ms 1000000
+k = ulong 0
+for t ulong 1000000
+k = add k pt_review code
+if ge k n
+ret
+end
+pt_ok lt ulong monons dl code
+pt_step c code
+end
+exit code
+end
+
+fn pt_admit id ulong deps ulong req ulong code int to ulong
+j = sched_admitr id deps 0 req
+pt_ok ge j 0 code
+ret ulong j
+end
+
+note Phase C: a request beyond the capacity of any kind is refused (-8) and
+note counted; lowering a capacity below an admitted job's need, or below
+note the use of two running jobs that each fit it alone, is refused and
+note changes nothing.
+fn pt_impossible to void
+c = pt_setup 2 8 8 pt_req 4 1024 1 8 30
+pt_ok eq sched_admitr 1 0 0 pt_req 5 0 0 0 neg long 8 31
+pt_ok eq sched_admitr 2 0 0 pt_req 1 1025 0 0 neg long 8 32
+pt_ok eq sched_admitr 3 0 0 pt_req 0 0 2 0 neg long 8 33
+pt_ok eq sched_stat 7 3 34
+a = pt_admit 4 0 pt_req 3 0 0 0 35
+pt_ok eq sched_cap pt_req 2 1024 1 8 neg long 8 36
+pt_ok eq sched_stat 16 4 37
+pt_ok eq sched_cancel a 1 38
+pt_ok eq sched_cap pt_req 2 1024 1 8 0 39
+pt_ok eq sched_stat 16 2 40
+pt_ok eq sched_cap pt_req 4 1024 1 8 0 130
+p = pt_admit 130400 0 pt_req 2 0 0 0 130
+q = pt_admit 140400 0 pt_req 2 0 0 0 130
+pt_ok pt_until c p 3 3 2000 130 130
+pt_ok pt_until c q 3 3 2000 130 130
+pt_ok eq sched_cap pt_req 3 1024 1 8 neg long 8 131
+pt_ok eq sched_stat 16 4 132
+pt_drain c 2 3000 133
+pt_ok eq sched_cap pt_req 3 1024 1 8 0 134
+pt_down c 41
+end
+
+note Phase D: 12 jobs with mixed CPU, memory and inference needs on three
+note workers, capacities 4 CPU, 1024 MiB, 1 inference slot. Every job runs
+note once and returns its outcome; the invariant holds at every step and
+note every resource is free at the end.
+fn pt_churn to void
+c = pt_setup 3 16 8 pt_req 4 1024 1 0 42
+for i ulong 12
+cpu = add rem i 3 1
+mem = mul add rem i 6 1 100
+inf = rem i 2
+id = add mul add i 1 10000 add 30 mul rem i 4 15
+j = pt_admit id 0 pt_req cpu mem inf 0 43
+end
+pt_drain c 12 10000 44
+for k ulong 4
+pt_ok eq get suse k 0 45
+end
+pt_ok eq sched_count 1 6 0 46
+pt_ok eq sched_stat 4 12 47
+pt_down c 48
+end
+
+note Some running job whose worker has reported done (its result waits
+note for review room).
+fn pt_held to bool
+for j ulong 64
+if eq get sjst j 3
+w = get sjw j
+if eq sc_cell w 64 get scseq w
+ret true
+end
+end
+end
+ret false
+end
+
+note Phase V: release while review is full. Review limit 1, two workers,
+note 2 CPU: j1 and j2 (1 CPU, 50 ms) both finish; one enters review, the
+note other's result waits for room, yet both CPUs are free at once and j3
+note (2 CPU) runs before anything is reviewed.
+fn pt_release to void
+c = pt_setup 2 8 1 pt_req 2 1024 1 8 120
+j1 = pt_admit 150050 0 pt_req 1 0 0 0 120
+j2 = pt_admit 160050 0 pt_req 1 0 0 0 120
+dl = add ulong monons 2000000000
+for t ulong 1000000
+if eq sched_count 4 4 1
+if pt_held
+break
+end
+end
+pt_ok lt ulong monons dl 121
+pt_step c 121
+end
+note The done report may land after the last collect: one more step
+note collects it (review stays full, so nothing else changes).
+pt_step c 121
+pt_ok eq get suse 0 0 122
+j3 = pt_admit 170050 0 pt_req 2 0 0 0 123
+pt_ok pt_until c j3 3 4 2000 123 124
+pt_drain c 3 3000 125
+pt_down c 126
+end
+
+note Phase F: ready order. With one worker, x is admitted first waiting on
+note topic 8 and y second ready at once; then topic 8 is published. FIFO
+note (policy 0) serves the job that became ready first, y; fair fitting
+note serves the job admitted first, x (waiting age counts from admission).
+fn pt_order to void
+buf = new uchar 4096 0
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 50
+x = pt_admit 60050 8 0 51
+y = pt_admit 70050 0 0 52
+pt_snap
+pt_ok gt sched_publish c 8 buf 16 0 53
+pt_check
+if eq sched_stat 24 0
+pt_ok eq get sjst y 3 54
+pt_ok eq get sjst x 2 55
+else
+pt_ok eq get sjst x 3 54
+pt_ok eq get sjst y 2 55
+end
+pt_drain c 2 3000 56
+pt_down c 57
+end
+
+note Witness of a head-of-line block, read with no step in between: a runs
+note unfinished holding its need, the head h is ready and does not fit, x
+note is ready and fits, a live worker is idle, and dispatch stopped at the
+note head at least once since h0 (codes code..code+4 when not).
+fn pt_witness c long a ulong h ulong x ulong h0 ulong code int to void
+w = get sjw a
+pt_ok eq get sjst a 3 code
+pt_ok ne sc_cell w 64 get scseq w code
+pt_ok eq get sjheld a 1 code
+pt_ok eq get sjst h 2 add code 1
+pt_ok not sp_fits get sjneed h 0 add code 1
+pt_ok eq get sjst x 2 add code 2
+pt_ok sp_fits get sjneed x 0 add code 2
+i = sp_idle mapget c 48 8
+pt_ok lt i 64 add code 3
+pt_ok gt sched_stat 8 h0 add code 4
+r = write 1 pw1 0 len pw1
+pt_num get sjid h
+r = write 1 pw2 0 len pw2
+pt_num get sjid x
+r = write 1 pw3 0 len pw3
+pt_num sp_free 0
+r = write 1 pw4 0 len pw4
+pt_num i
+r = write 1 phol 0 len phol
+pt_num sub sched_stat 8 h0
+r = write 1 pnl 0 1
+end
+
+note Phase A: the blocked head. a (3 CPU, 800 ms) runs; then b (2 CPU,
+note cannot fit) and c (1 CPU, fits) arrive with no dependency. The target:
+note c runs while a still runs and b waits (0). When c has not run within
+note 400 ms, the witness is checked and printed and the phase returns 11:
+note c stayed idle behind b although a CPU and a worker were free.
+fn pt_blocked to int
+c = pt_setup 3 8 8 pt_req 4 1024 1 8 10
+a = pt_admit 10800 0 pt_req 3 0 0 0 10
+pt_ok pt_until c a 3 3 2000 10 10
+b = pt_admit 20050 0 pt_req 2 0 0 0 10
+x = pt_admit 30050 0 pt_req 1 0 0 0 10
+h0 = sched_stat 8
+v = int 0
+if pt_until c x 3 4 400 10
+pt_ok eq get sjst a 3 12
+pt_ok eq get sjst b 2 13
+else
+pt_witness c a b x h0 12
+v = int 11
+end
+pt_drain c 3 5000 17
+pt_down c 18
+ret v
+end
+
+note Phase B: a second head-of-line case, after the pump's queue-of-two
+note scenario (the bounded queue itself is not modelled: every admitted
+note job is in the table). a (3 CPU, 800 ms) runs, b and d (2 CPU) cannot
+note fit, e (1 CPU) fits. Target: e runs while a still runs (0); else the
+note witness and 21.
+fn pt_exclude to int
+c = pt_setup 3 8 8 pt_req 4 1024 1 8 20
+a = pt_admit 10800 0 pt_req 3 0 0 0 20
+pt_ok pt_until c a 3 3 2000 20 20
+b = pt_admit 20050 0 pt_req 2 0 0 0 20
+d = pt_admit 40050 0 pt_req 2 0 0 0 20
+e = pt_admit 50050 0 pt_req 1 0 0 0 20
+h0 = sched_stat 8
+v = int 0
+if pt_until c e 3 4 400 20
+pt_ok eq get sjst a 3 22
+else
+pt_witness c a b e h0 22
+v = int 21
+end
+pt_drain c 4 5000 27
+pt_down c 28
+ret v
+end
+
+note Phase S: starvation under repeated small arrivals. Three workers, 4
+note CPU. Small jobs (1 CPU) start staggered (100, 200, 300 ms), and each
+note that finishes is replaced by one of 300 ms, so the small jobs never
+note all end together; big (4 CPU, 50 ms) needs every CPU free. The target:
+note big runs within 4 s. 61 means it never did: the small jobs kept the
+note CPU partly busy (the "noreserve" control).
+fn pt_starve to void
+c = pt_setup 3 16 8 pt_req 4 1024 1 8 60
+for i ulong 3
+j = pt_admit mul add i 1 100100 0 pt_req 1 0 0 0 60
+end
+s = ulong 4
+g = pt_admit 90050 0 pt_req 4 0 0 0 60
+dl = add ulong monons 4000000000
+ok = false
+for t ulong 1000000
+if ge get sjst g 3
+ok = true
+break
+end
+if ge ulong monons dl
+break
+end
+if lt sched_count 1 3 4
+j = pt_admit add mul s 100000 300 0 pt_req 1 0 0 0 60
+s = add s 1
+end
+pt_step c 60
+n = pt_review 60
+end
+pt_ok ok 61
+pt_ok ge sched_stat 6 1 62
+pt_ok ge sched_stat 9 1 63
+pt_drain c sched_count 1 4 5000 64
+pt_stats
+pt_ok eq get suse 0 0 65
+pt_down c 66
+end
+
+note Phase Q: admission tickets. Limit 2: p1 (400 ms) and p2 (900 ms) fill
+note it; X then Y are refused and hold tickets in that order. When p1 is
+note reviewed there is room for one: Y asking first is refused (75), X is
+note admitted (76); Y enters once more room returns (78). A ticket not
+note asked about for the lifetime (20 events) lapses, so a new caller is
+note admitted although the old holder never came back (80). The wait for
+note the lapse reviews whatever finishes, 140900 included when it outlasts
+note that job's 900 ms, so the last drain waits for the jobs still
+note outstanding, not a fixed two: a fixed two timed out (80) whenever the
+note loop had already reviewed 140900.
+fn pt_tickets to void
+c = pt_setup 2 2 8 pt_req 4 1024 1 8 70
+pt_ok eq sched_policy sched_stat 24 64 64 sched_stat 27 1000 0 70
+p1 = pt_admit 100400 0 0 70
+p2 = pt_admit 110900 0 0 70
+pt_ok eq sched_admitr 120050 0 0 0 neg long 2 71
+pt_ok eq sched_admitr 130050 0 0 0 neg long 2 72
+pt_ok eq sched_stat 30 2 73
+pt_drain c 1 3000 74
+pt_ok eq sched_admitr 130050 0 0 0 neg long 2 75
+pt_ok ge sched_admitr 120050 0 0 0 0 76
+pt_drain c 2 3000 77
+pt_ok ge sched_admitr 130050 0 0 0 0 78
+pt_ok eq sched_policy sched_stat 24 64 64 sched_stat 27 20 0 79
+f = pt_admit 140900 0 0 79
+pt_ok eq sched_admitr 150050 0 0 0 neg long 2 79
+e0 = sched_stat 2
+dl = add ulong monons 3000000000
+for t ulong 1000000
+if le sched_count 1 3 1
+if gt sched_stat 2 add e0 21
+break
+end
+end
+pt_ok lt ulong monons dl 79
+pt_step c 79
+n = pt_review 79
+end
+pt_ok ge sched_admitr 160050 0 0 0 0 80
+pt_ok ge sched_stat 11 1 80
+pt_drain c sched_count 1 4 3000 80
+pt_down c 80
+end
+
+note Step until sched_overdue reports a job, up to 2 s: its slot, or 64.
+fn pt_waitod c long code int to ulong
+t0 = ulong monons
+for t ulong 1000000
+o = sched_overdue
+if lt o 64
+ret o
+end
+if gt sub ulong monons t0 2000000000
+ret 64
+end
+pt_step c code
+end
+ret 64
+end
+
+note Phase L: lease expiry. h (2 of 2 CPU, 3 s, not safe to rerun) has a
+note 200 ms lease: its deadline is at least 200 ms after h was admitted, and
+note sched_overdue reports it once, at or after that deadline (83); the
+note creator kills its worker; h becomes UNKNOWN and its CPU is free.
+note h2 (2 CPU, 400 ms, safe to rerun, 100 ms lease) is killed the same
+note way: it is ready or running again with its admission age kept, and
+note completes. Then a new 2-CPU job runs.
+fn pt_lease to void
+c = pt_setup 3 8 8 pt_req 2 1024 1 8 81
+t0 = ulong monons
+h = pt_admit 173000 0 pt_req 2 0 0 0 81
+pt_ok eq sched_lease h 200000000 0 81
+pt_ok pt_until c h 3 3 2000 81 81
+due = get sjdue h
+pt_ok ge due add t0 200000000 83
+o = pt_waitod c 82
+pt_ok eq o h 82
+pt_ok ge ulong monons due 83
+pt_ok eq sched_overdue 64 84
+r = killpid int get swpid get sjw h 9
+pt_ok pt_until c h 6 6 2000 85 85
+pt_ok eq get suse 0 0 86
+pt_ok eq sched_settle h 0 87
+x = sched_admitr 180400 0 1 pt_req 2 0 0 0
+pt_ok ge x 0 140
+h2 = ulong x
+pt_ok eq sched_lease h2 100000000 0 140
+pt_ok pt_until c h2 3 3 2000 140 140
+ar = get sjarr h2
+pt_ok eq pt_waitod c 141 h2 141
+w = get sjw h2
+r = killpid int get swpid w 9
+dl = add ulong monons 2000000000
+for t ulong 1000000
+if eq get swpid w 0
+break
+end
+pt_ok lt ulong monons dl 142
+pt_step c 142
+end
+pt_ok eq get sjarr h2 ar 143
+s = get sjst h2
+pt_ok and ge s 2 le s 3 144
+pt_drain c 1 3000 145
+z = pt_admit 190050 0 pt_req 2 0 0 0 88
+pt_drain c 1 3000 88
+pt_down c 89
+end
+
+note Phase R: cancellation of a reserved job. Bypass budget 1: a (1 of 2
+note CPU) runs, b (2 CPU) waits, x (1 CPU) runs past it, so b is reserved.
+note Cancelling b frees it with no effect and clears the reservation.
+fn pt_rcancel to void
+c = pt_setup 2 8 8 pt_req 2 1024 1 8 90
+pt_ok eq sched_policy sched_stat 24 64 64 1 1000 0 90
+a = pt_admit 190600 0 pt_req 1 0 0 0 90
+pt_ok pt_until c a 3 3 2000 90 90
+b = pt_admit 200050 0 pt_req 2 0 0 0 90
+x = pt_admit 210050 0 pt_req 1 0 0 0 90
+pt_ok pt_until c x 3 4 400 90 91
+pt_ok eq sched_stat 29 add b 1 92
+pt_ok eq sched_cancel b 1 93
+pt_ok eq sched_stat 29 0 94
+pt_drain c 2 3000 95
+pt_ok eq get suse 0 0 96
+pt_down c 97
+end
+
+note Phase W: bounded candidate work. Window 4 slots, dispatch budget 2,
+note two workers, so an event may pick twice: 12 ready jobs fill slots
+note 0..11, beyond any one window. Each pick reads at most 5 slots (the
+note reserved probe and the window, exit 9), every window scan moves the
+note cursor on by 4 (15), and all 12 run. 101 means some never did.
+fn pt_window to void
+c = pt_setup 2 16 16 pt_req 4 1024 1 8 101
+pt_ok eq sched_policy sched_stat 24 4 2 sched_stat 27 1000 0 101
+for i ulong 12
+j = pt_admit add mul add i 1 10000 30 0 0 101
+end
+pt_drain c 12 5000 101
+pt_ok eq sched_stat 4 12 102
+pt_down c 103
+end
+
+note Phase T: ticket order with several openings. Limit 3 held by p1, p2
+note (400 ms) and p3, which waits on a topic nobody publishes; X, Y, Z are
+note refused in that order and hold tickets (104). p1 and p2 are reviewed,
+note so there are exactly two openings: Y asking first is refused (105), and
+note so is a new caller W, who takes a ticket behind Z (106); X enters
+note (107), then Y (108). p3 is cancelled and X and Y are reviewed, so there
+note are three openings: W asking first is refused, then Z and W enter (109).
+fn pt_torder to void
+c = pt_setup 3 3 8 pt_req 4 1024 1 8 104
+p = pt_admit 400400 0 0 104
+p = pt_admit 410400 0 0 104
+p3 = pt_admit 420050 4096 0 104
+pt_ok eq sched_admitr 430050 0 0 0 neg long 2 104
+pt_ok eq sched_admitr 440050 0 0 0 neg long 2 104
+pt_ok eq sched_admitr 450050 0 0 0 neg long 2 104
+pt_ok eq sched_stat 30 3 104
+pt_drain c 2 3000 104
+pt_ok eq sched_admitr 440050 0 0 0 neg long 2 105
+pt_ok eq sched_admitr 460050 0 0 0 neg long 2 106
+pt_ok eq sched_stat 30 4 106
+pt_ok ge sched_admitr 430050 0 0 0 0 107
+pt_ok ge sched_admitr 440050 0 0 0 0 108
+pt_ok eq sched_cancel p3 1 108
+pt_drain c 2 3000 108
+pt_ok eq sched_admitr 460050 0 0 0 neg long 2 109
+pt_ok ge sched_admitr 450050 0 0 0 0 109
+pt_ok ge sched_admitr 460050 0 0 0 0 109
+pt_drain c 2 3000 109
+pt_down c 109
+end
+
+note Phase X: the table, not the admission limit, is full. Admission limit
+note and review limit 64; 64 jobs finish and wait in review, so none is
+note admitted, waiting, ready or running. A new caller is refused and takes
+note a ticket (190, 191), as is a second (192). One review frees one slot:
+note the second holder is refused, the first enters (193, 194).
+fn pt_slots to void
+c = pt_setup 3 64 64 pt_req 4 1024 1 8 190
+for i ulong 64
+j = pt_admit add 500001 mul i 10000 0 0 190
+end
+dl = add ulong monons 5000000000
+for t ulong 1000000
+if eq sched_count 4 4 64
+break
+end
+pt_ok lt ulong monons dl 190
+pt_step c 190
+end
+pt_ok not sched_room 600050 191
+pt_ok eq sched_stat 30 1 191
+pt_ok eq sched_admitr 600050 0 0 0 neg long 2 192
+pt_ok eq sched_admitr 610050 0 0 0 neg long 2 192
+pt_ok eq sched_stat 30 2 192
+pt_ok eq sched_review 0 long add get sjid 0 1 193
+pt_ok eq sched_admitr 610050 0 0 0 neg long 2 193
+pt_ok ge sched_admitr 600050 0 0 0 0 194
+n = pt_review 194
+pt_ok ge sched_admitr 610050 0 0 0 0 194
+pt_drain c 2 3000 194
+pt_down c 194
+end
+
+note Phase Z: reserved progress needs review progress. Review limit 1, two
+note workers, 2 CPU, bypass budget 1. p finishes and waits in review,
+note unreviewed. a (1 CPU) and x (1 CPU) run past b (2 CPU), so b is
+note reserved (196). a and x finish; their workers keep the results, since
+note review is full, so b is ready at every step for 600 ms (197) and all
+note CPU is free at the end of that interval (198). Reviewing p lets a into
+note review, frees its worker, and b runs (199).
+fn pt_live to void
+c = pt_setup 2 8 1 pt_req 2 1024 1 8 195
+pt_ok eq sched_policy sched_stat 24 64 64 1 1000 0 195
+p = pt_admit 470050 0 pt_req 1 0 0 0 195
+pt_ok pt_until c p 4 4 2000 195 195
+k = sched_pause c true
+a = pt_admit 480050 0 pt_req 1 0 0 0 195
+b = pt_admit 490050 0 pt_req 2 0 0 0 195
+x = pt_admit 510050 0 pt_req 1 0 0 0 195
+pt_resume c
+pt_ok eq sched_stat 29 add b 1 196
+dl = add ulong monons 600000000
+for t ulong 1000000
+if ge ulong monons dl
+break
+end
+pt_step c 197
+pt_ok eq get sjst b 2 197
+end
+pt_ok eq get suse 0 0 198
+pt_ok eq sched_review p long add get sjid p 1 199
+pt_ok pt_until c b 3 4 2000 199 199
+pt_drain c 3 3000 199
+pt_down c 199
+end
+
+note Phase M: lease bounds (2^50 ns, about 13 days). Waiting job w refuses
+note 2^50 + 1 and 2^64 - 1 (-7) with its lease unchanged (200, 201) and
+note accepts 2^50 (202). Job r, leased 2^50 before it is assigned, runs with
+note a deadline ahead of the clock and nothing overdue (203); running, it
+note refuses both too large values with lease and deadline unchanged (204,
+note 205) and accepts a renewal of 2^49 measured from now: the new deadline
+note lies between clock + 2^49 read just before and just after the call
+note (206), and nothing is overdue; it then completes (207).
+fn pt_lbound to void
+c = pt_setup 1 8 8 pt_req 2 1024 1 8 200
+mx = ulong 1125899906842624
+w = pt_admit 220050 1 0 200
+pt_ok eq sched_lease w add mx 1 neg long 7 200
+pt_ok eq get sjlse w 0 200
+pt_ok eq sched_lease w sub ulong 0 1 neg long 7 201
+pt_ok eq get sjlse w 0 201
+pt_ok eq sched_lease w mx 0 202
+pt_ok eq get sjlse w mx 202
+r = pt_admit 230600 0 pt_req 1 0 0 0 203
+pt_ok eq sched_lease r mx 0 203
+pt_ok pt_until c r 3 3 2000 203 203
+d = get sjdue r
+pt_ok gt d ulong monons 203
+pt_ok eq sched_overdue 64 203
+pt_ok eq sched_lease r sub ulong 0 1 neg long 7 204
+pt_ok and eq get sjdue r d eq get sjlse r mx 204
+pt_ok eq sched_lease r add mx 1 neg long 7 205
+pt_ok and eq get sjdue r d eq get sjlse r mx 205
+w = ulong monons
+pt_ok eq sched_lease r div mx 2 0 206
+t2 = ulong monons
+pt_ok ge get sjdue r add w div mx 2 206
+pt_ok le get sjdue r add t2 div mx 2 206
+pt_ok eq sched_overdue 64 206
+pt_drain c 1 3000 207
+pt_down c 207
+end
+
+note Phase N: every ask renews a ticket, a successful one too. Admission
+note limit 1, ticket lifetime 2. o waits on a topic nobody publishes and
+note fills the limit; X is refused at event e and holds a ticket. o is
+note cancelled; at event e + 1 X asks and is told yes, which renews its
+note ticket (210). At e + 3 the ticket still holds (asked at e + 1, lifetime
+note 2), so newcomer Y is refused (211); at e + 4 it lapses, exactly one
+note lapse is counted and Y, now first, is admitted (212).
+fn pt_renew to void
+c = pt_setup 1 1 8 pt_req 2 1024 1 8 210
+pt_ok eq sched_policy sched_stat 24 64 64 sched_stat 27 2 0 210
+o = pt_admit 240050 1 0 210
+pt_ok eq sched_admitr 250050 0 0 0 neg long 2 210
+pt_ok eq sched_cancel o 1 210
+k = sched_dispatch c
+pt_ok sched_room 250050 210
+k = sched_dispatch c
+k = sched_dispatch c
+pt_ok eq sched_admitr 260050 0 0 0 neg long 2 211
+l0 = sched_stat 11
+k = sched_dispatch c
+pt_ok ge sched_admitr 260050 0 0 0 0 212
+pt_ok eq sched_stat 11 add l0 1 212
+pt_drain c 1 3000 212
+pt_down c 212
+end
+
+note Phase U: the dispatch budget binds. Four idle workers, dispatch budget
+note 2, six ready 1-CPU jobs and 4 CPU: one dispatch assigns exactly 2
+note (220); all six then complete (221).
+fn pt_budget to void
+c = pt_setup 4 16 16 pt_req 4 1024 1 8 220
+pt_ok eq sched_policy sched_stat 24 64 2 sched_stat 27 1000 0 220
+for i ulong 6
+j = pt_admit add 270100 mul i 10000 0 pt_req 1 0 0 0 220
+end
+a0 = sched_stat 4
+k = sched_dispatch c
+pt_ok and eq k 2 eq sub sched_stat 4 a0 2 220
+pt_drain c 6 5000 221
+pt_down c 221
+end
+
+fn pt_mode to void
+a = new uchar 16 0
+if ne argcnt 2
+ret
+end
+n = argread 1 a 0 16
+if eq n 4
+if eq get a 0 102
+put ptm 0 1
+end
+if eq get a 0 103
+put ptm 0 3
+end
+end
+if eq n 9
+put ptm 0 2
+end
+end
+
+note Step, then review every job in review in slot order, appending its id
+note to the trace and publishing the topics it declared (as the workflow
+note does after accepting a result).
+fn pt_gstep c long buf edit uchar 4096 code int to void
+pt_step c code
+for j ulong 64
+if eq get sjst j 4
+p = get sjpro j
+n = get ptn 0
+if lt n 16
+put ptt n get sjid j
+end
+put ptn 0 add n 1
+pt_ok eq sched_review j long add get sjid j 1 code
+if ne p 0
+pt_snap
+pt_ok gt sched_publish c p buf 16 0 code
+pt_check
+end
+end
+end
+end
+
+fn pt_gadmit id ulong deps ulong pro ulong code int to ulong
+j = pt_admit id deps pt_req 1 0 0 0 code
+if ne pro 0
+pt_ok eq sched_goal j pro 50 10 0 code
+end
+ret j
+end
+
+note One run of the goal workload, one worker, policy 2, bypass budget 4,
+note admitted while paused: x (no value), z (unblocks d: value 1), a
+note (unblocks b, which unblocks c: value 2), f (unblocks g1..g3: value 3).
+note A decision is made when the worker frees, before the finished job's
+note topics are published. Order: f a z b x d c g1 g2 g3. f and a first
+note (useful work); x, bypassed in 4 events, is reserved and runs 5th.
+fn pt_grun code int to void
+buf = new uchar 4096 0
+c = pt_setup 1 16 16 pt_req 1 1024 1 8 code
+pt_ok eq sched_policy 2 64 64 4 1000 0 code
+k = sched_pause c true
+put ptn 0 0
+j = pt_gadmit 220050 0 0 code
+j = pt_gadmit 230050 0 128 code
+j = pt_gadmit 240050 128 0 code
+j = pt_gadmit 250050 0 32 code
+j = pt_gadmit 260050 32 64 code
+j = pt_gadmit 270050 64 0 code
+j = pt_gadmit 280050 0 256 code
+for i ulong 3
+j = pt_gadmit add 290050 mul i 10000 256 0 code
+end
+pt_resume c
+dl = add ulong monons 5000000000
+for t ulong 1000000
+if ge get ptn 0 10
+break
+end
+pt_ok lt ulong monons dl code
+pt_gstep c buf code
+end
+pt_down c code
+end
+
+note Phase G: goal-aware ranking. The goal workload runs twice; both traces
+note must equal the expected order (151 first run, 152 second): repeated
+note identical inputs, identical decisions.
+fn pt_goal to void
+ex = new ulong 10 0
+put ex 0 280050
+put ex 1 250050
+put ex 2 230050
+put ex 3 260050
+put ex 4 220050
+put ex 5 240050
+put ex 6 270050
+put ex 7 290050
+put ex 8 300050
+put ex 9 310050
+for r ulong 2
+code = int add 151 r
+pt_grun 150
+pt_ok eq get ptn 0 10 code
+for i ulong 10
+if ne get ptt i get ex i
+pt_trace
+exit code
+end
+end
+end
+end
+
+fn pt_trace to void
+r = write 1 ptr 0 len ptr
+for i ulong get ptn 0 bound 16
+pt_num get ptt i
+r = write 1 psp 0 1
+end
+r = write 1 pnl 0 1
+end
+
+note Phase H: rescoring. Policy 2, paused: one ready job r and two jobs
+note waiting on topic 512, then r declares topic 512: four graph changes,
+note no rescoring (160). The first pick rescores once for all four (161).
+note r completing and being reviewed with nothing published changes no
+note value: no rescoring (162). Publishing 512 readies both waiting jobs:
+note two changes, one more rescoring at the next pick (163). The work of
+note every rescoring is bounded (checked at each step, exit 8). Cancelling
+note a waiting job is one more change (165).
+fn pt_rescores to void
+buf = new uchar 4096 0
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 160
+pt_ok eq sched_policy 2 64 64 4 1000 0 160
+k = sched_pause c true
+r = pt_admit 320050 0 pt_req 1 0 0 0 160
+w1 = pt_admit 330050 512 pt_req 1 0 0 0 160
+w2 = pt_admit 340050 512 pt_req 1 0 0 0 160
+pt_ok eq sched_goal r 512 50 10 0 160
+pt_ok eq sched_stat 34 4 160
+pt_ok eq sched_stat 32 0 160
+pt_resume c
+pt_ok eq sched_stat 32 1 161
+pt_ok eq get sjval r 2 161
+pt_drain c 1 2000 162
+pt_ok eq sched_stat 32 1 162
+pt_ok eq sched_stat 34 4 162
+pt_snap
+pt_ok gt sched_publish c 512 buf 16 0 163
+pt_check
+pt_ok eq sched_stat 34 6 163
+pt_ok eq sched_stat 32 2 163
+pt_drain c 2 2000 164
+pt_ok eq sched_stat 32 2 165
+w3 = pt_admit 345050 4096 pt_req 1 0 0 0 165
+b0 = sched_stat 34
+pt_ok eq sched_cancel w3 1 165
+pt_ok eq sched_stat 34 add b0 1 165
+pt_down c 166
+end
+
+note Phase K: the policy-2 key on two free slots, a and b. Larger unblock
+note value first, even when b is older and cheaper (180); equal values:
+note smaller estimate first, even when b is older (181); equal values and
+note estimates: older admission first (182); outside policy 2 only the
+note admission age counts (183).
+fn pt_key to void
+a = ulong 60
+b = ulong 61
+put sjval a 2
+put sjval b 1
+put sjest a 90
+put sjest b 10
+put sjarr a 9
+put sjarr b 8
+pt_ok sp_better true a b 180
+pt_ok not sp_better true b a 180
+put sjval b 2
+put sjest a 10
+put sjest b 90
+pt_ok sp_better true a b 181
+pt_ok not sp_better true b a 181
+put sjest b 10
+pt_ok sp_better true b a 182
+pt_ok not sp_better true a b 182
+put sjval a 5
+put sjest b 1
+pt_ok sp_better false b a 183
+pt_ok not sp_better false a b 183
+for i ulong 2
+put sjval add a i 0
+put sjest add a i 0
+put sjarr add a i 0
+end
+end
+
+note Phase P: proposals. Policy 2, paused. p1 (value 0) and p2 (value 1)
+note are ready. A proposal naming an older graph version is refused (170)
+note and counted (171); one naming an id with no ready job is refused
+note (172); p1 at the current version is accepted (173) and used over the
+note higher ranked p2 (174). A proposal made stale by a later change is
+note rejected when next used and counted: p3 runs by rank, after p2 (175,
+note 176). Outside policy 2: -7 (177).
+fn pt_proposals to void
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 170
+pt_ok eq sched_incarnate 1 0 170
+pt_ok eq sched_policy 2 64 64 4 1000 0 170
+k = sched_pause c true
+p1 = pt_admit 350050 0 pt_req 1 0 0 0 170
+p2 = pt_admit 360050 0 pt_req 1 0 0 0 170
+q = pt_admit 370050 1024 pt_req 1 0 0 0 170
+pt_ok eq sched_goal p2 1024 50 10 0 170
+v = sched_version
+p3 = pt_admit 380050 0 pt_req 1 0 0 0 170
+pt_ok eq sched_propose 350050 v neg long 9 170
+pt_ok eq sched_stat 36 1 171
+v = sched_version
+pt_ok eq sched_propose 999999 v neg long 3 172
+pt_ok eq sched_propose 350050 v 0 173
+pt_resume c
+pt_ok eq get sjst p1 3 174
+pt_ok eq sched_stat 39 1 174
+k = sched_pause c true
+v = sched_version
+pt_ok eq sched_propose 380050 v 0 175
+p4 = pt_admit 390050 2048 pt_req 1 0 0 0 175
+pt_ok eq sched_goal p3 0 10 1 0 175
+pt_resume c
+pt_ok pt_until c p2 3 4 2000 175 175
+pt_ok eq get sjst p3 2 176
+pt_ok eq sched_stat 39 1 176
+pt_ok eq sched_stat 36 2 176
+pt_ok eq sched_cancel p4 1 176
+pt_ok eq sched_cancel q 1 176
+pt_drain c 3 3000 176
+pt_ok eq sched_policy 1 64 64 4 1000 0 177
+pt_ok eq sched_propose 350050 sched_version neg long 7 177
+pt_down c 178
+end
+
+note Phase I: a proposal from an earlier scheduler. Scheduler 1
+note (incarnation 1) admits a into slot 0 and hands out the version;
+note scheduler 2 (incarnation 2) admits b into slot 0 with as many bumps.
+note There the old version is stale (184); a's id names no job even at the
+note current version, b's is accepted, and incarnation 0 is refused (185).
+fn pt_incarn to void
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 184
+pt_ok eq sched_incarnate 1 0 184
+pt_ok eq sched_policy 2 64 64 4 1000 0 184
+k = sched_pause c true
+a = pt_admit 670050 0 pt_req 1 0 0 0 184
+pt_ok eq a 0 184
+v1 = sched_version
+pt_ok eq sched_cancel a 1 184
+pt_down c 184
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 184
+pt_ok eq sched_incarnate 2 0 184
+pt_ok eq sched_policy 2 64 64 4 1000 0 184
+k = sched_pause c true
+b = pt_admit 680050 0 pt_req 1 0 0 0 184
+pt_ok eq b 0 184
+pt_ok eq sched_propose 670050 v1 neg long 9 184
+pt_ok eq sched_propose 670050 sched_version neg long 3 185
+pt_ok eq sched_propose 680050 sched_version 0 185
+pt_ok eq sched_incarnate 0 neg long 7 185
+pt_ok eq sched_cancel b 1 185
+pt_down c 185
+end
+
+note Phase R2: a proposal beside a reservation. Policy 2, bypass budget 1,
+note two workers, 5 CPU. h (2 CPU, 5 s) runs; then B and B2 (4 CPU each)
+note and s1 (1 CPU, 1.5 s) are admitted: s1 runs, B and B2 are bypassed and
+note B, the older, is reserved. x (2 CPU) is refused beside it and counted
+note (186). Cancelling B clears the reservation and x is accepted (187).
+note An event with no idle worker reserves B2 and leaves the proposal
+note pending (188). Once s1 is done, the next pick finds x no longer fits
+note beside B2: the proposal is dropped and counted stale, and x does not
+note run (189). Once h is done B2 fits; y (1 CPU) is accepted beside it,
+note and at the next event B2 runs first, then y is used; x (2 CPU, 0
+note left) stays ready and, bypassed by y, is now the reservation (179).
+fn pt_propres to void
+c = pt_setup 2 8 8 pt_req 5 1024 2 8 186
+pt_ok eq sched_incarnate 1 0 186
+pt_ok eq sched_policy 2 64 64 1 1000 0 186
+k = sched_pause c true
+h = pt_admit 625000 0 pt_req 2 0 0 0 186
+pt_resume c
+k = sched_pause c true
+pt_ok eq get sjst h 3 186
+b = pt_admit 630050 0 pt_req 4 0 0 0 186
+b2 = pt_admit 640050 0 pt_req 4 0 0 0 186
+s1 = pt_admit 651500 0 pt_req 1 0 0 0 186
+pt_resume c
+k = sched_pause c true
+pt_ok eq get sjst s1 3 186
+pt_ok eq sched_stat 29 add b 1 186
+x = pt_admit 660050 0 pt_req 2 0 0 0 186
+r0 = sched_stat 37
+pt_ok eq sched_propose 660050 sched_version neg long 8 186
+pt_ok eq sched_stat 37 add r0 1 186
+pt_ok eq sched_cancel b 1 187
+pt_ok eq sched_stat 29 0 187
+pt_ok eq sched_propose 660050 sched_version 0 187
+pt_resume c
+k = sched_pause c true
+pt_ok eq sched_stat 29 add b2 1 188
+pt_ok gt get scgv 2 0 188
+pt_ok pt_until c s1 4 4 3000 188 188
+s0 = sched_stat 36
+pt_resume c
+k = sched_pause c true
+pt_ok eq sched_stat 36 add s0 1 189
+pt_ok eq get sjst x 2 189
+pt_ok eq get scgv 2 0 189
+y = pt_admit 690050 0 pt_req 1 0 0 0 179
+pt_ok pt_until c h 4 4 6000 179 179
+pt_ok eq sched_propose 690050 sched_version 0 179
+s0 = sched_stat 39
+pt_resume c
+k = sched_pause c true
+pt_ok eq get sjst b2 3 179
+pt_ok eq get sjst y 3 179
+pt_ok eq sched_stat 39 add s0 1 179
+pt_ok eq sched_stat 29 add x 1 179
+pt_ok eq get sjst x 2 179
+pt_ok eq sched_cancel x 1 179
+pt_drain c 4 8000 179
+pt_down c 189
+end
+
+fn pt_stats to void
+r = write 1 pst 0 len pst
+pt_num sched_stat 2
+r = write 1 pex 0 len pex
+pt_num sched_stat 3
+r = write 1 pas 0 len pas
+pt_num sched_stat 4
+r = write 1 phol 0 len phol
+pt_num sched_stat 8
+r = write 1 pbyp 0 len pbyp
+pt_num sched_stat 5
+r = write 1 pres 0 len pres
+pt_num sched_stat 6
+r = write 1 pnl 0 1
+end
+
+note Phase X: proposal guards. Without an incarnation a proposal is refused
+note (120); a second incarnation is refused (121); after the first one a
+note proposal is accepted and used (122). The version is then set to the
+note last revision of incarnation 5 (2^40 - 1 bumps): a proposal made there
+note is accepted, and the next bump exhausts the version instead of
+note carrying it into incarnation 6's range (123); proposals are refused
+note (124), the pending one is dropped at use (125) and every pick rescores
+note (126). In a new scheduler, two ready jobs share an id: a proposal
+note naming it is refused (127).
+fn pt_incx to void
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 120
+pt_ok eq sched_policy 2 64 64 4 1000 0 120
+k = sched_pause c true
+a = pt_admit 710050 0 pt_req 1 0 0 0 120
+pt_ok eq sched_propose 710050 sched_version neg long 6 120
+pt_ok eq sched_stat 41 0 120
+pt_ok eq sched_incarnate 5 0 121
+pt_ok eq sched_incarnate 6 neg long 7 121
+pt_ok eq sched_propose 710050 sched_version 0 122
+pt_ok eq sp_proposal 0 a 122
+put scgv 0 add shl ulong 5 40 1099511627775
+v = sched_version
+pt_ok eq sched_propose 710050 v 0 123
+pt_ok eq sched_goal a 0 10 1 0 123
+pt_ok eq sched_version v 123
+pt_ok eq shr sched_version 40 5 123
+pt_ok eq sched_stat 41 2 123
+pt_ok eq sched_propose 710050 v neg long 6 124
+pt_ok eq sp_proposal 0 64 125
+r0 = sched_stat 32
+sp_rescore
+sp_rescore
+pt_ok eq sched_stat 32 add r0 2 126
+pt_ok eq sched_cancel a 1 126
+pt_down c 126
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 127
+pt_ok eq sched_incarnate 7 0 127
+pt_ok eq sched_policy 2 64 64 4 1000 0 127
+k = sched_pause c true
+b1 = pt_admit 720050 0 pt_req 1 0 0 0 127
+b2 = pt_admit 720050 0 pt_req 1 0 0 0 127
+pt_ok ne b1 b2 127
+pt_ok eq sched_propose 720050 sched_version neg long 3 127
+pt_ok eq sched_cancel b1 1 127
+pt_ok eq sched_cancel b2 1 127
+pt_down c 127
+end
+
+note Phase L: a late first incarnation must not mark stale values current.
+note Paused, one worker, policy 2: an older unrelated job u, a younger
+note producer p declaring topic 64 and a job d waiting on it are admitted
+note and declared, then the scheduler incarnates. At resume the one pick
+note rescores and takes p (value 1); with the values left unscored they all
+note read 0 and u (older, no estimate) would run instead (128).
+fn pt_incl to void
+c = pt_setup 1 8 8 pt_req 4 1024 1 8 128
+pt_ok eq sched_policy 2 64 64 4 1000 0 128
+k = sched_pause c true
+u = pt_admit 730300 0 pt_req 1 0 0 0 128
+p = pt_admit 740300 0 pt_req 1 0 0 0 128
+d = pt_admit 750300 64 pt_req 1 0 0 0 128
+pt_ok eq sched_goal p 64 300 0 0 128
+pt_ok eq sched_incarnate 8 0 128
+pt_resume c
+pt_ok eq get sjst p 3 128
+pt_ok eq get sjst u 2 128
+pt_ok eq sched_cancel u 1 128
+pt_ok eq sched_cancel d 1 128
+pt_drain c 1 3000 128
+pt_down c 128
+end
+
+note The regression phases A and B return their verdict, so both run and
+note print their witness; the first failing one is the exit status.
+fn main to int
+pt_mode
+pt_impossible
+pt_churn
+pt_release
+pt_order
+ra = pt_blocked
+rb = pt_exclude
+if ne ra 0
+ret ra
+end
+if ne rb 0
+ret rb
+end
+pt_starve
+pt_tickets
+pt_lease
+pt_rcancel
+pt_window
+pt_torder
+pt_slots
+pt_live
+pt_goal
+pt_rescores
+pt_proposals
+pt_incarn
+pt_propres
+pt_incx
+pt_incl
+pt_key
+pt_lbound
+pt_renew
+pt_budget
+if ne write 1 pok 0 len pok long len pok
+ret 100
+end
+ret 0
+end

@@ -2,13 +2,15 @@
 
 omagent is an agent harness in the style of HKUDS/nanobot (MIT), written in seeded Omega.
 Only nanobot's architecture was reused. None of its code was copied. The program is one
-static ARM64 Linux executable (188,268 bytes with omc 2c824805) built from four sources:
+static ARM64 Linux executable (191,608 bytes with omc 5f90edea) built from six sources:
 
 ```sh
-{ printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om seed/net/http.om seed/agent/agent.om; } \
+{ printf 'om2\n'; cat seed/json/json.om seed/json/jsonw.om seed/net/http.om seed/net/notls.om seed/agent/path.om seed/agent/agent.om; } \
   | seed/out/omc > omagent && chmod +x omagent
 ```
 
+`seed/agent/path.om` holds the workspace path rule (`agpathok`); the Omega Node tool adapter
+`seed/node/tool.om` composes the same file, so both refuse the same paths.
 The only compiler needed is the pinned `seed/out/omc`. Every implementation byte is compiled
 from `.om`. Python appears only in the test referee `tests/check.py`, which also plays the mock
 model server.
@@ -122,9 +124,13 @@ Adapters need TLS and are the natural home for omega-bridge or other universal a
 4. **Commands are bounded.**
    - Children run with an empty environment and stdin on `/dev/null`.
    - stdout and stderr go to one close-on-exec pipe, and at most 64 KiB is kept.
-   - At the `--cmd-timeout` deadline (default 10 s), the child gets SIGKILL and is reaped.
-   - Grandchildren are not killed: there are no process groups yet. One that keeps the pipe
-     open only delays omagent until the deadline.
+   - Each command runs as the leader of its own process group (`setpgid` on both sides of the
+     fork, as in `seed/node/auth.om`).
+   - When the direct child exits, omagent reaps it and SIGKILLs the rest of its group, so a
+     background grandchild cannot outlive the call or hold the pipe open; the output read then
+     ends at end of file. The call returns within about 50 ms of the child's exit.
+   - At the `--cmd-timeout` deadline (default 10 s), the whole group gets SIGKILL and the child
+     is reaped.
 5. **No secrets in logs.**
    - The API key is read from `OMAGENT_API_KEY` (or `--key-env NAME`), never from argv. It must
      be bytes 0x21..0x7e.
@@ -177,11 +183,19 @@ kernel-chosen 127.0.0.1 port. It then runs 32 conversations:
 - malformed output: a bad event, a truncated stream, an error object, a bad call index,
   HTTP 500
 - a model timeout, a command timeout and the round limit
+- a command whose background grandchild must die when it exits (the call returns in under
+  5 s with a 10 s `--cmd-timeout`), and a timed-out command whose child and grandchild must
+  both die; both scan `/proc` for survivors
+- a command that closes its output, sleeps 0.3 s and exits 3 must report `[exit status 3]`:
+  end of file is not exit (`/bin/echo` closes stdout before it exits), so the group's SIGKILL
+  must not overtake a child that is still finishing
 - session reload, a corrupt session line, no key, two stdin lines, connection refused
 
-Negative controls follow. Two wrong expectations must fail. Six source mutants must each be
+Negative controls follow. Two wrong expectations must fail. Nine source mutants must each be
 caught: allowlist bypass, `..` allowed, symlink followed, fetch allowlist bypass, write flag
-ignored, end of stream without `[DONE]` accepted. Output: `AGENT-CHECK PASS cases=32 mutants=6`.
+ignored, end of stream without `[DONE]` accepted, SIGKILL to the direct child only (not its
+group) after it exits or at the deadline, and end of file taken as the child's exit. Output:
+`AGENT-CHECK PASS cases=35 mutants=9`.
 Exit 0 means PASS, 1 FAIL, and 3 NOT_RUN (no compiler).
 
 ## Host dependencies
@@ -211,7 +225,7 @@ lines at this commit). Status: HAS (equivalent), PARTIAL (narrower), MISSING (ab
 | web fetch | `web_fetch` `agent/tools/web.py:1114` (https, redirects, extraction) | PARTIAL: plain `http://` to allowlisted HOST:PORT, raw body | `agtfetch` :2039 |
 | web search | `web_search` `web.py:367` | MISSING | |
 | workspace confinement | `restrictToWorkspace` `schema.py:401` (default off) | HAS (always on: no `..`, absolute paths or symlinks) | `agpathok` :1735 |
-| command deny-list / timeouts | built-in deny-list `shell.py` ~213-232, timeout `:97` | PARTIAL: allowlist instead of deny-list; timeout kills the child only | `agexec` :1926, `--cmd-timeout` :81 |
+| command deny-list / timeouts | built-in deny-list `shell.py` ~213-232, timeout `:97` | PARTIAL: allowlist instead of deny-list; timeout and child exit kill the whole process group | `agexec` :1957, `--cmd-timeout` :81 |
 | MCP client (stdio, SSE, streamable HTTP) | `agent/tools/mcp.py:1365,1412`, `schema.py:362` | MISSING | |
 | session history | `session/manager.py`, sessions dir | HAS (one JSONL file per `--session`) | `agsload` :1032, `agappend` :917 |
 | history compaction / consolidation | Consolidator and AutoCompact `agent/loop.py:433,443`, summaries `agent/memory.py:803-824` | PARTIAL: drops the oldest whole turns, no summaries | `agcompact` :896 |
@@ -295,4 +309,4 @@ operator handoff `OmegaBot/eqbench2/` (the first, flawed run is in `OmegaBot/eqb
 
 - TLS model endpoints and fetches: NOT_RUN (refused by design in this build).
 - Real model servers (vLLM, llama.cpp, MAX): NOT_RUN. Only the scripted mock was used.
-- One request at a time; no parallel tool calls; no process-group kill; the TOCTOU limit above.
+- One request at a time; no parallel tool calls; the TOCTOU limit above.

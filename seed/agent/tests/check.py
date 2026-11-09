@@ -26,7 +26,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENT = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(AGENT))
-SOURCES = ["seed/json/json.om", "seed/json/jsonw.om", "seed/net/http.om", "seed/agent/agent.om"]
+SOURCES = ["seed/json/json.om", "seed/json/jsonw.om", "seed/net/http.om", "seed/net/notls.om", "seed/agent/path.om", "seed/agent/agent.om"]
 KEY = "sk-omagent-test-7f3a9c41d2e8b605"
 LOG = []
 
@@ -212,6 +212,34 @@ def no_file(rel):
     return lambda o: not os.path.exists(os.path.join(o["work"], rel))
 
 
+def no_survivor(marker):
+    """No process whose argv contains marker is alive (zombies have an empty cmdline). Polls up to
+    1 s for SIGKILL delivery; any survivor found is killed so it cannot leak into later cases."""
+    def f(o):
+        found = []
+        for _ in range(20):
+            found = []
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    with open("/proc/%s/cmdline" % d, "rb") as fh:
+                        if marker.encode() in fh.read().split(b"\0"):
+                            found.append(int(d))
+                except OSError:
+                    pass
+            if not found:
+                return True
+            time.sleep(0.05)
+        for p in found:
+            try:
+                os.kill(p, 9)
+            except OSError:
+                pass
+        return False
+    return f
+
+
 def no_key_leak(o):
     blob = o["out"] + o["err"]
     sess = os.path.join(o["work"], "s.jsonl")
@@ -289,6 +317,11 @@ def cases(port):
           prep=lambda w: os.mkdir(os.path.join(w, "out"))),
         C("run-echo", [sse_calls([("run_command", '{"argv":["/bin/echo","hi","there"]}')]), sse_text("ran")],
           S + ["--allow-cmd", "/bin/echo"], 0, [last_tool_has("hi there\n"), last_tool_has("[exit status 0]")]),
+        # end of file is not exit: a child that closes its output and exits later (as /bin/echo
+        # does, closing stdout before it exits) must be reaped, not killed with its group
+        C("cmd-closes-output-early", [sse_calls([("run_command", '{"argv":["/bin/sh","-c","echo hi; exec >&- 2>&-; sleep 0.3; exit 3"]}')]), sse_text("ok")],
+          S + ["--allow-cmd", "/bin/sh", "--cmd-timeout", "10"], 0,
+          [last_tool_has("hi\n"), last_tool_has("[exit status 3]")]),
         C("run-exit-code", [sse_calls([("run_command", '{"argv":["/bin/false"]}')]), sse_text("ran")],
           S + ["--allow-cmd", "/bin/false"], 0, [last_tool_has("[exit status 1]")]),
         C("fetch", [sse_calls([("http_fetch", '{"url":"http://%s/page"}' % fetch)]), sse_text("fetched")],
@@ -332,6 +365,14 @@ def cases(port):
         C("cmd-timeout", [sse_calls([("run_command", '{"argv":["/bin/sleep","30"]}')]), sse_text("ok")],
           S + ["--allow-cmd", "/bin/sleep", "--cmd-timeout", "1"], 0,
           [last_tool_has("[killed: timeout after 1 s]"), lambda o: o["dt"] < 10]),
+        # a tool's grandchild: the call returns when the direct child exits, and the group is killed
+        C("cmd-grandchild", [sse_calls([("run_command", '{"argv":["/bin/sh","-c","sleep 31.7 & echo hi"]}')]), sse_text("ok")],
+          S + ["--allow-cmd", "/bin/sh", "--cmd-timeout", "10"], 0,
+          [last_tool_has("hi"), last_tool_has("[exit status 0]"), lambda o: o["dt"] < 5, no_survivor("31.7")]),
+        C("cmd-timeout-group", [sse_calls([("run_command", '{"argv":["/bin/sh","-c","sleep 32.3 & sleep 32.4"]}')]), sse_text("ok")],
+          S + ["--allow-cmd", "/bin/sh", "--cmd-timeout", "1"], 0,
+          [last_tool_has("[killed: timeout after 1 s]"), lambda o: o["dt"] < 10,
+           no_survivor("32.3"), no_survivor("32.4")]),
         C("round-limit", [sse_calls([("read_file", '{"path":"a"}')])] * 3, S + ["--max-rounds", "2"], 7,
           [err_has("round limit"), nposts(2)], prep=prep_file("a", "A")),
         # sessions and configuration
@@ -388,16 +429,22 @@ MUTANTS = [
     ("fetch-allowlist-bypass", "if not agallowed IFET nf view part cn 0 cl", "if eq nf 999"),
     ("write-flag-ignored", "if eq get gnum QWRITE 0", "if eq get gnum QWRITE 7"),
     ("no-done-accepted", "if eq get gst SFIN 0\nagerr enodone\nret 6", "if eq get gst SFIN 7\nagerr enodone\nret 6"),
+    ("exit-kills-child-only", "r = killpid neg pid 9", "r = killpid pid 9"),
+    ("timeout-kills-child-only", "r = killpid neg int pid 9\nif eq get gnum 23 0", "r = killpid int pid 9\nif eq get gnum 23 0"),
+    ("eof-taken-as-exit", "if eq n 0\nret agwaitc dl\nend", "if eq n 0\nret false\nend"),
 ]
 
 
 def run_mutants(omc, port, base):
-    src0 = open(os.path.join(AGENT, "agent.om")).read()
+    texts = [open(os.path.join(ROOT, s)).read() for s in SOURCES]
+    own = [i for i, s in enumerate(SOURCES) if s.startswith("seed/agent/")]
     killed = 0
     for name, a, b in MUTANTS:
-        if src0.count(a) != 1:
-            raise RuntimeError("mutant %s: anchor found %d times" % (name, src0.count(a)))
-        src = b"om2\n" + b"".join(open(os.path.join(ROOT, s), "rb").read() for s in SOURCES[:3]) + src0.replace(a, b).encode()
+        n = sum(texts[i].count(a) for i in own)
+        if n != 1:
+            raise RuntimeError("mutant %s: anchor found %d times" % (name, n))
+        mt = [t.replace(a, b) if i in own else t for i, t in enumerate(texts)]
+        src = ("om2\n" + "".join(mt)).encode()
         p = subprocess.run([omc], input=src, capture_output=True)
         if p.returncode != 0:
             raise RuntimeError("mutant %s does not compile" % name)
