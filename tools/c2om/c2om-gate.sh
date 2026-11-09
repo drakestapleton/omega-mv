@@ -18,14 +18,17 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 SRC=seed/c2om/c2om.om
 CORPUS=tools/c2om/corpus
-EV=evidence/C2OM/c2om
+OUT=evidence/C2OM/c2om
 B=$ROOT/build/c2om/gate
-mkdir -p "$EV" "$B"
+clean() { if [ -d "$1" ]; then find "$1" -depth -delete; fi; mkdir -p "$1"; }
+mkdir -p "$B"
+note_ev() { echo "evidence staged in ${EV#"$ROOT"/}; $OUT is copied from it only on PASS"; }
+EV=$B/evidence
+clean "$EV"
 LOG=$EV/gate.log
 : > "$LOG"
 say() { echo "$*" | tee -a "$LOG"; }
-fail() { say "FAIL $*"; say "RESULT FAIL"; exit 1; }
-clean() { if [ -d "$1" ]; then find "$1" -depth -delete; fi; mkdir -p "$1"; }
+fail() { say "FAIL $*"; say "RESULT FAIL"; note_ev; exit 1; }
 
 MUTANTS=(
   's/^sb = add s 1$/sb = s/'
@@ -88,6 +91,23 @@ for c in "${progs[@]}"; do
 done
 say "accept        programs ${#progs[@]}, inputs ${#INPUTS[@]}: cases written $written, run $run, identical on gcc, omc and interpreter $pass"
 
+# 3b. programs past omega_ref's 512-function limit: gcc and omc only
+bw=0; bp=0
+for c in "$CORPUS"/big/*.c; do
+  n=$(basename "$c" .c); P=$B/big/$n
+  clean "$P"
+  "$B/c2om" < "$c" > "$P/t.om" 2> "$P/t.err" || fail "c2om refused $c: $(cat "$P/t.err")"
+  "$OMC" < "$P/t.om" > "$P/o.bin" 2> "$P/o.err" || fail "omc refused the translation of $c: $(cat "$P/o.err")"
+  chmod +x "$P/o.bin"
+  quiet-build gcc -std=c11 -include stdio.h -O1 -o "$P/c.bin" "$c" > "$P/gcc.out" 2>&1 || fail "gcc: $(tail -3 "$P/gcc.out")"
+  for in in "${INPUTS[@]}"; do
+    run1 "$P/c.bin" "$P/c" "$in"; run1 "$P/o.bin" "$P/o" "$in"
+    bw=$((bw+1))
+    if same "$P/c" "$P/o"; then bp=$((bp+1)); else say "DIFF $n on $(basename "$in"): gcc = omc no"; fi
+  done
+done
+say "big           programs $(ls "$CORPUS"/big/*.c | wc -l), cases $bw, identical on gcc and omc $bp (interpreter limit 512 functions)"
+
 # 4. refusal corpus
 rw=0; rp=0
 for c in "$CORPUS"/refuse/*.c; do
@@ -119,8 +139,11 @@ for m in "${MUTANTS[@]}"; do
   say "control       mutant ($m) compiles; cases that catch it: $caught of $written"
   [ $caught -gt 0 ] || fail "mutant ($m) passed every case (gate blind)"
 done
+[ $bp = "$bw" ] || fail "$((bw-bp)) of $bw big cases differ"
 
 [ $run = "$written" ] || fail "cases run $run != written $written"
 [ $pass = "$run" ] || fail "$((run-pass)) of $run accept cases differ"
 [ $rp = "$rw" ] || fail "$((rw-rp)) of $rw refusals differ"
 say "RESULT PASS"
+clean "$OUT"
+cp "$EV"/* "$OUT"/
