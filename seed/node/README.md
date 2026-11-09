@@ -1517,10 +1517,11 @@ cancel);
 `CWO i PASS|FAIL result turns`; `CWSUM pass= fail=`. Exit 0 when
 every objective passed, 1 otherwise, 2 usage, 62 out of time, 30 + a journal
 refusal (50..57), 50..56 a setup failure (pool, supervisor, scheduler,
-authority, worker spawn, view page, view process). The two ranges overlap, so
-every such exit first writes `code-main: CAUSE, exit N` on stderr; a journal
-directory over 100 bytes, for example, gives `code-main: journal refused
-(...), exit 56`.
+authority, worker spawn, view page, view process), 57 a restart cleanup that
+could not cancel a job the last creator left waiting or ready. The ranges
+overlap, so every such exit first writes `code-main: CAUSE, exit N` on stderr;
+a journal directory over 100 bytes, for example, gives `code-main: journal
+refused (...), exit 56`.
 
 Restart: the journal's objective identity is the objective arguments' FNV-1a
 64. On a restart `auth_recover` settles what the last creator left (an
