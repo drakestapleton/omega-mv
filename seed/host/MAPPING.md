@@ -419,5 +419,7 @@ the 1629 tracked `.om` files was compiled alone for AArch64 and for
 same bytes, exit status and diagnostics. Gate:
 `seed/host/mapnarrow/mapnarrow.cases` (fake device file: a shared memfd mapping
 read back through `pread`/`pwrite`; AArch64 native and x86linux under qemu-user,
-refusals, function-mode admission, 12 omc.om mutants killed). Host and emulator
-evidence only; no PCI device, VFIO group or chip was touched.
+refusals, function-mode admission with pinned bytes, 21 omc.om mutants killed:
+wrong load/store size, sign-extending loads, truncation limits, widened admission,
+width-blind bounds and alignment checks, missing x86 operand-size prefix). Host
+and emulator evidence only; no PCI device, VFIO group or chip was touched.
