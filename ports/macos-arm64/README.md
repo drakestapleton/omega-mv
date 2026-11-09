@@ -18,11 +18,20 @@ before consuming it. The target adapter verifies the entire input before writing
 The file wrapper preserves existing output on refusal. Read [CONTRACT.md](CONTRACT.md)
 for exact instruction/header/ABI/resource/refusal closure and host dependencies.
 
-Away from the Spark, set `L615_OMC` to a copy of that compiler. It is born from this
-repository's own seed at `29b12760` (`git checkout --detach 29b12760f4c962606411d6bf25032aedef063301`,
-`sh seed/omega-from-seed.sh`, then use `seed/out/omc`); `build.sh`, `tests/run.mjs` and
-`tests/output-paths.mjs` still refuse any file whose SHA256 is not
-`191b776ef98821597c3e30655da6d680a9b66edbc9ceaca3c39c61ea6df098e9`.
+Away from the Spark, set `L615_OMC` to an absolute path holding that compiler.
+It is born from this repository's own seed at `29b12760`. Build it in a separate
+worktree, because `seed/out/omc` is tracked and differs on main:
+
+```sh
+git worktree add --detach ../omega-29b12760 29b12760f4c962606411d6bf25032aedef063301
+(cd ../omega-29b12760 && sh seed/omega-from-seed.sh)
+cp ../omega-29b12760/seed/out/omc "$HOME/omc-191b776e"
+L615_OMC="$HOME/omc-191b776e" ports/macos-arm64/build.sh
+L615_OMC="$HOME/omc-191b776e" quiet-build node ports/macos-arm64/tests/run.mjs
+```
+
+`build.sh`, `tests/run.mjs` and `tests/output-paths.mjs` still refuse any file whose
+SHA256 is not `191b776ef98821597c3e30655da6d680a9b66edbc9ceaca3c39c61ea6df098e9`.
 
 Pure leaf integer/control flow is supported within the frozen instruction subset.
 The hello family is precisely [tests/hello.om](tests/hello.om), including its
