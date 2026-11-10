@@ -200,5 +200,6 @@ explicitly unsupported language boundary, not a successful contract implementati
    found input-literal error 8 rather than a semantic mismatch on the admitted cases. Large inputs
    now use Wolfram-verified power-of-two constructions within fparse mantissa limits, but those final
    spellings are NOT_RUN. Do not claim the candidate READY until all cases and negative controls pass.
-3. Host lowering is deferred in ham/NEXT.md row 20. Function-mode units, mixed shifts, the data gaps,
+3. Host lowering is deferred in the ham/NEXT.md row titled "NG front: typed lowering for all 94 current
+   host words" (that file has two rows numbered 20; cite the title, not the number). Function-mode units, mixed shifts, the data gaps,
    remaining intrinsics and hygiene words remain not lowered or unproven as itemized above.
