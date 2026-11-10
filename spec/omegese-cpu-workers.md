@@ -54,7 +54,11 @@ fixture exit 14. Set/get syscall-swap mutants must fail at exit 3. The fixture
 also pins the last inherited core and checks cpunow there (exit 17/18), so a
 cpunow that ignores the getcpu result fails even when the first inherited core
 is CPU 0; the AArch64 and x86 load-removal mutants must fail at exit 18, which
-needs an inherited mask of two or more cores (every queen pool). Caller cases
+needs an inherited mask of two or more cores (every queen pool). Under a nice 19
+pool setprio 0 0 19 is a no-op, so the priority child also asks for nice 18:
+without CAP_SYS_NICE the result must be -13 with nice still 19, and where it is
+allowed nice must read 18 and raw getprio 2 (exit 19 otherwise). The AArch64 and
+x86 mutants that hardwire the setprio operand to 19 must fail at exit 19. Caller cases
 compose the existing run.om helpers with only its main replaced: cpk1, runpk,
 child and selfpin run unchanged, then a real conductor child checks its single
 allowed core and priority. Invalid CPU 1024 is refused with exit 118.
