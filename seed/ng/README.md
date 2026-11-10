@@ -44,7 +44,8 @@ From the repository root (any scratch directory works):
 The first line is the only bootstrap invocation. The standalone Omega gate independently joins
 `sha256.om` and `ngbuild.om`, compiles the result, then has ngbuild read `ngbuild.units` and build
 itself. It requires both joined source and binary to match byte for byte. It also exercises the
-refusals below with exact exit status and diagnostic, no stdout and no created output/source.
+refusal exits 3, 4, 5, 8 and 9 below with exact exit status and diagnostic, no stdout and no
+created output/source; exits 1, 2, 6 and 7 are not gate cases.
 `ngbuild build` invokes OMC directly with `fork`, `dupfd`, `execprog` and `waitpid`, not a shell.
 No `cat` is needed by these commands. Gate negative control: append `wrong` to its arguments; the
 missing-unit expectation is inverted and the gate must end `NGBUILDGATE FAIL`, exit 1.
@@ -86,8 +87,9 @@ is reading it.
 ### Unit-list contract and exit status
 
 Each line is exactly 64 lowercase SHA-256 hex digits, one space, a nonempty path of at most 4095
-bytes (no NUL), then LF. Paths are relative to the working directory. No comments, blank lines or
-ordering metadata are accepted. Order is the line order, with no inserted byte between files.
+bytes (no NUL), then LF. A relative path resolves against the working directory; an absolute path
+is used as given. No comments, blank lines or ordering metadata are accepted. Order is the line
+order, with no inserted byte between files.
 There is no dependency graph in this format, so a cycle has no representation. At least one and
 at most 64 units, at most 65536 list bytes, and at most 8388607 joined source bytes are accepted.
 The entire list is validated before any unit is read. In `build`, paths and digest pins must be
@@ -97,18 +99,21 @@ but still refuses duplicate paths. All units and pins are checked before output 
 | Exit | Meaning |
 |---|---|
 | 0 | Built, or sums printed. |
-| 1 / 2 / 3 | OMC refused (its status is printed) / usage / pin mismatch. |
+| 1 / 2 / 3 | OMC refused (its status is printed) / usage / pin mismatch. 64 or more arguments after the program name trap 4 in the argument loop instead of the usage line: exit 104, no message. |
 | 4 / 5 | Malformed or empty list / unreadable list or unit. |
-| 6 / 7 | Cannot write output / fork or wait failure, or OMC ended by a signal. A failed exec or redirect in the child exits 127 and is reported as `ngbuild: omc exit 127`, exit 1. OUT.src and OUT are created before OMC runs, so exits 1 and 7 can leave them in place. |
+| 6 / 7 | Cannot write output / fork or wait failure, or OMC ended by a signal. A failed exec or redirect in the child exits 127 and is reported as `ngbuild: omc exit 127`, exit 1. OUT.src is written before OUT is opened and OMC runs, and stays after a successful build; exit 6 can leave OUT.src, and exits 1 and 7 can leave both. |
 | 8 / 9 | Duplicate unit / list, unit count, unit file or joined-source limit exceeded. |
 
-Exact diagnostic formats are in `ngbuild.om`; malformed-line offsets count bytes from zero.
+Exact diagnostic formats are in `ngbuild.om`; malformed-line offsets count bytes from zero. Its
+header notes still say exit 7 covers exec failures (it does not; see the table) and omit signals,
+and still call unit paths relative only; the table and contract above are correct. Those notes
+change with the next `ngbuild.om` edit, because editing them repins `ngbuild.units`.
 Regression gate: `tests/ngbuild/gate.om`, with no shared implementation with ngbuild.
 
 CI: `.github/workflows/ng-ir-arm64.yml` births omc from the seed, requires the committed
 `seed/out/omc.sha256`, builds the gate and runs it. That historical workflow's `cat` bootstrap is
 unchanged here (protected path); use the host commands above for the no-cat build. It runs on any
-change under `seed/` or to the workflow.
+pull request that changes `seed/**` or the workflow, and on every push to main.
 
 ## Host dependencies
 
