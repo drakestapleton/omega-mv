@@ -4,9 +4,11 @@
 # word, and each program with one word replaced by a word from the vocabulary (one per word place): REF
 # must answer every input with exit 0 or an error number on stderr, never a crash (a signal, exit >= 128);
 # with OTHER given, OTHER must give the same bytes, exit status and error number (prefix om4/omc aside).
+# The vocabulary's one over-long name has 64 bytes: om4 refuses names over 8 bytes and omc names over 63
+# (error 13 from both), so the 9..63-byte names omc accepts beyond om4 are not fuzzed here (gate5 section 3 lists them).
 set -eu
 N=$1; REF=$2; OTH=${3:-}; D=$(dirname "$0"); W=${NFW:-/tmp/nextfuzz.$$}; mkdir -p $W
-V="fn to end if else while bound for ret exit put get len read write new global text view edit true false note neg not add sub mul div rem and or xor shl shr eq ne lt le gt ge ( ) = bool uchar ushort uint ulong byte short int long void main 0 1 -1 255 18446744073709551615 9223372036854775808 x zz abcdefghij 123456789012345678901 1x \"s\" \"q\\\\x\""
+V="fn to end if else while bound for ret exit put get len read write new global text view edit true false note neg not add sub mul div rem and or xor shl shr eq ne lt le gt ge ( ) = bool uchar ushort uint ulong byte short int long void main 0 1 -1 255 18446744073709551615 9223372036854775808 x zz abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl 123456789012345678901 1x \"s\" \"q\\\\x\""
 acc=0; inputs=0; bad=0; codes=""
 one() { # file -> checks it
   inputs=$((inputs + 1))

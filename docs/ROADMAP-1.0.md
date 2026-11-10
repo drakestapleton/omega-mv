@@ -85,7 +85,9 @@ feature anyone may want", and it never means hardware qualification beyond the t
 3. **Open compiler defect #775.** An empty `text` passed to `view uchar *` reports the following text's
    bytes (reported count 32 instead of 0, reported on `e623d440` and stated to share main's code).
    Not reproduced in this audit (no builds were run). It is a memory-safety boundary: the callee
-   reads bytes it was not given.
+   reads bytes it was not given. Update 2026-11-08: fixed on main by #904 (`e2662fff`, 2026-10-28) with
+   fixtures `s4-v-text-empty*` and the mutant `m-textlen` in `seed/omc/om2/s4`; both pass at omc `cfd96b48`
+   and now run in `seed/host/check.sh` through `seed/qualification/om2/every.sh`.
 4. **Stale status text.** `README.md` line 5 says the seeded compiler is in candidate branches (line
    27 of the same file says it is on main since #696). `OM2-TUTORIAL.md` says the OM-2 stack is draft and
    main compiles OM-1 only. `OM_COMPLETION.md` (2026-10-23) quotes a 7,208-line compiler. `seed/host/README.md`
@@ -101,8 +103,10 @@ feature anyone may want", and it never means hardware qualification beyond the t
    27..30, with 26 unused. I have not re-derived the per-code site counts.
 6. **Capacity and naming limits block real programs.** omc holds 4096 functions per unit; om4, which
    must compile `omc.om`, held 512 (raised to 4096 by the `feat/om4-fn-table` draft), 16 registers with no spilling (error 12),
-   6 parameter slots, 8-character local names (error 13). These are implementation limits, not language
-   rules, and each needs a decision before 1.0 freezes them.
+   6 parameter slots. These are implementation limits, not language rules, and each needs a decision
+   before 1.0 freezes them. Names are decided (Drake, 2026-11-08: long names belong in the final
+   language): omc takes names of up to 63 characters for every declared name except abstract, layout,
+   layout-field and IR-mode names, which stay at 8 (OMEGESE.md 9.2, `seed/omc/gate-longnames.sh`).
 7. **A second target is merged as a draft, not qualified.** FR-9 (#923) integrates the historical
    `7eca2ac3f` backend into canonical base `6999fa9e6`; [X86-LINUX.md](X86-LINUX.md) records
    the design and actual unsupported paths. Its full fixture differential last ran EMULATED (QEMU) at
@@ -126,8 +130,18 @@ must come with a negative control that fails.
 
 ### RM1. Ground truth and gate coverage
 
-Current: OM-2 and irwasm are MERGED with author-run evidence only; spec missing from main; #775 open;
-#789 open (fail-closed seed/secret gates).
+Current: OM-2 and irwasm are MERGED with author-run evidence only; spec missing from main; #775 fixed (#904, see Known gaps item 3);
+#789 open (fail-closed seed/secret gates). `seed/host/check.sh` runs every `seed/omc/om2/*/*.cases` file through
+`seed/qualification/om2/every.sh` (case files PASS, mutant files catch every mutant, two negative controls),
+plus the error-site fixtures and thirteen qualification files that pass on the committed compiler (baseline
+guard/language/sha256/transform, the sec s0s2/s3s4/s4fuel/s5s7 and leak candidate files, selftest pass,
+security673 relational consumer, l4-tripwire, qualification); the candidate files may skip only their declared
+`notrun` cases (54, mostly waiting on the omega-bridge ABI v2 generator and the OM-2 SHA unit), and an undeclared
+NOT_RUN is refused (third negative control); host run 2026-11-08 at omc `cfd96b48`: `OM2EVERY PASS files=30
+cases=1554 skipped_declared=54 mutants=75`. Found while adding them: security673 `bindings.cases` `derive-wrong-image` fails (stdout differs
+at byte 96): its stored `evidence/run3/embed.bin` is 2184 bytes from 2026-10-30, today's omc emits 2308 for
+`embed.om`, so that pin is stale and needs re-deriving by its owner; the file stays out of `every.sh` until then. The `OMEGA-SEED` manifest
+item below is still open.
 
 Gap: a single gate run cannot currently show that every merged compiler path still works.
 
@@ -283,7 +297,14 @@ namespace. gate15 refuses 33 minimal programs at their exact `omc: line L: error
 1..25 and 27..30, 24 with its accept side, 30 including IR-mode contract lines from #791) and runs
 `seed/omc/codereg.om`, which fails on a site without a row, a row without a site, an OMEGESE §9.14 /
 §11.1 row that differs from the registry, or a registry case that did not refuse. Machine records
-exist only in OM-2 `diag` mode (#655 owns incremental feedback). `seed/explain` (gate in `seed/host/check.sh`) prints the registry meaning and the refused source line for every code without changing omc's output.
+exist only in OM-2 `diag` mode (#655 owns incremental feedback). `seed/explain` (gate in `seed/host/check.sh`) prints the registry meaning and the refused source line for every code without changing omc's output. Site coverage (2026-11-08): `seed/omc/sitecov.sh`
+changes one `fail N` site at a time to code 97 and replays every refused tracked input; 480 of 584 sites are
+reached at omc `564c5835` (195 before the fixtures in `seed/omc/sites`, now 289), and `seed/host/check.sh` fails if
+that falls below `seed/omc/sitecov.floor`. The 104 unreached sites (list in its `sites.tsv`) are the fixture backlog.
+Finding while writing them: error 4 ("the line ends where a word or value is needed") names the line AFTER
+the short line whenever a newline follows it (`fn main to int` + `x =` + newline reports line 3; without the
+final newline, line 2), in OM-1, OM-2 and IR mode alike; gate15 `e4_line_ends` pins the late number.
+Proposal (not applied, it changes pinned compiler output): report the line of the last token read.
 
 Acceptance:
 - A code registry in the language doc: every code, its meaning, the obligation, and one minimal

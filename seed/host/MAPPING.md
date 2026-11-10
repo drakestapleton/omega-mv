@@ -362,7 +362,7 @@ tail. `tests/x86efi/run.sh` under QEMU/OVMF goes from 4/25 to 25/25; this is
 emulated, not hardware evidence.
 
 The execenv 233 host word (branch `hive/execprog-env`) births compiler
-`cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a`
+`ee5fc83e357c7285e20ae9246d8129cdf8833b74f7205242e17fa62382334dfa`
 from source
 `062c9649af6a1d499b911e5b2f39b5419d7b75047616fe59fbcdc25f7b7b5b73`.
 `execenv A off n B off m` is `execprog` with a private environment packet B,
@@ -399,3 +399,14 @@ SVC/`syscall`. Two functions were added (510 of 512). Each of the 1496 tracked
 status and diagnostics; the other 12 are the AArch64 and x86 compiles of the six
 `seed/host/prlimit/` sources, which use the new word (error 3 before). Gate:
 `seed/host/prlimit/prlimit.cases`.
+Names of up to 63 bytes (branch `omc/long-names`, OMEGESE.md 9.2) birth compiler
+`3e46f1d9bdfd9c00ebdd1abb615d038d6db998e596b58482a6bdcc131f9af5c6`
+from source
+`4da2fd20f0c40d1d7aa85ddbd45a70cc5c35c5feaa925d34907b1a3ca7bc7416`.
+No host word changes and no function was added (508 of 512). Each of the 1485
+tracked `.om` files was compiled alone for AArch64 and for `target x86linux`
+under `cfd96b48` and `3e46f1d9`: 2948 of the 2970 compiles give the same bytes,
+exit status and diagnostics; the other 22 are 11 files that were error 13 under
+`cfd96b48` and are fragments or tests of that refusal (refused either way, or
+`seed/omc/om2/s1/bad-kw-field.om`, now `kw-long-field.om`, accepted).
+Gate: `seed/omc/gate-longnames.sh`.

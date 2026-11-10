@@ -37,6 +37,7 @@ while IFS='|' read -r name want src; do
     [ "$got" = "$want" ] || bad "$name: exit $got, wanted $want"
 done <<'RUN'
 basic|5|const N uint 5\nfn main to int\nret int N\nend
+long_name_ok|7|const loop_count_limit uint 7\nfn main to int\nret int loop_count_limit\nend
 negative|253|const M long -3\nfn main to int\nret int M\nend
 expression|6|const N uint 4\nfn main to int\nx = add N uint 2\nret int x\nend
 call_argument|8|const K int 7\nfn f a int to int\nret add a K\nend\nfn main to int\nret f int 1\nend
@@ -67,7 +68,7 @@ for_num_bound_exact|7|fn main to int\nx = ulong 0\nfor i ulong 7 bound 7\nx = ad
 for_max_bound|5|fn main to int\nn = ulong 5\nx = ulong 0\nfor i ulong n bound 9223372036854775807\nx = add x 1\nend\nret int x\nend
 for_default_trap|104|fn main to int\nn = ulong 2000000\nx = ulong 0\nfor i ulong n\nx = add x 1\nend\nret 0\nend
 RUN
-[ "$n" = 30 ] || bad "value table ran $n of 30 cases"
+[ "$n" = 31 ] || bad "value table ran $n of 31 cases"
 
 n=0
 while IFS='|' read -r name want src; do
@@ -86,7 +87,7 @@ duplicate|10|const N uint 5\nconst N uint 6\nfn main to int\nret 0\nend
 out_of_range|8|const N uchar 300\nfn main to int\nret 0\nend
 ir_float_const|9|ir\nconst H f64 0.1\nfn f to f64\nret H\nend
 extra_word|5|const N uint 5 6\nfn main to int\nret 0\nend
-long_name|13|const abcdefghi uint 5\nfn main to int\nret 0\nend
+long_name|13|const abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl uint 5\nfn main to int\nret 0\nend
 reserved|16|const while uint 5\nfn main to int\nret 0\nend
 missing_value|4|const N uint\nfn main to int\nret 0\nend
 inside_fn|16|fn main to int\nconst N uint 5\nret 0\nend
@@ -152,5 +153,5 @@ fm_for_default|const B ulong 1000000\nfn f a ulong to ulong\nx = ulong 0\nfor i 
 FM
 [ "$n" = 11 ] || bad "function-mode table ran $n of 11 cases"
 
-say "PASS gate16 30 constant programs, 35 refusals and 11 function-mode units"
+say "PASS gate16 31 constant programs, 35 refusals and 11 function-mode units"
 exit 0

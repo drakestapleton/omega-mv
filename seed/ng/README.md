@@ -22,7 +22,8 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `IR.md` | ΩIR v1: binary format, types, ops, token chain, coverage rule, refusal classes, text form, limits. |
 | `hostwords.tsv` | Normative host word table (`id word args class`) the `host` op is checked against. |
 | `src/ir.om` | First unit of the `ng` program (om2): ΩIR tables, builder, the one binary reader and writer (IR.md s14). |
-| `src/main.om` | Last unit: `ng` driver; mode `@ng ir-copy` reads a unit and writes it back byte for byte; `@ng front-check` and `@ng front-ir` run `src/front.om` (front/README.md). |
+| `src/opt.om` | Unit after ir.om: the ΩIR optimizer (IR.md s15.1). Per function: preheaders, PHI (a block parameter whose `br` arguments are one value besides itself becomes that value), bounds-check elimination (a `chk.bounds` proved by a const index or a dominating compare-and-branch becomes `fact.inbounds` origin 1; a `chk.divz` of a nonzero const goes), loop-invariant code motion of class P ops (checks, memory and calls stay on the token chain), PHI, BCE and LICM repeated while one of them changes something, then loop rotation (header after its latch). |
+| `src/main.om` | Last unit: `ng` driver. `@ng ir-copy` reads a unit and writes it back byte for byte; `@ng front-check` and `@ng front-ir` run `src/front.om` (front/README.md); `@ng opt` writes it optimized; `@ng opt-count` prints `opt fns= loops= inloop=A->B phi= bce= hoisted= merged= rotated= preheaders=` (A, B: executing ops in loop blocks before and after; phi: block parameters removed; bce: checks deleted; counts of later passes come before `bce=`, and the gate's fixed-point check reads the tail from `phi=` on). |
 | `ng.units` | The ordered unit list of `ng`, each with its sha256 pin. |
 | `ngbuild.om` | `ngbuild build OMC UNITS OUT` checks every pin, concatenates and compiles; `ngbuild sums UNITS` prints fresh pins. |
 | `sha256.om` | FIPS 180-4 SHA-256 shared by ngbuild, ngcheck and the gate. |
@@ -31,6 +32,7 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `ngrun.om` | The reference interpreter (IR.md s7): `ngrun FILE.ir` runs the program entry of an accepted unit; output through the real host words, exit status = the entry's result, a failing check exits 100 + code. Scalar f32/f64 bitcasts preserve all bits; every defined f32/f64 conversion mode and fused FMA are supported. Unsupported ops (vectors, tiles, kernels, fmath, f16/bf16/fp8) print `ngrun: unsupported op N at OFFSET` and exit 125. Its own limits stay off the trap exits 100..114: `ngrun FILE.ir STEPS` stops after STEPS executed ops (default 2^36, about an hour) with `ngrun: step limit at OFFSET` and exit 124, and an element outside the object its REF or SLICE names (reachable only from input ngcheck refuses) gives `ngrun: access outside storage at OFFSET` and exit 126. Its exit status is an IR result only for a unit ngcheck accepts; on refused input it means nothing. Back ends diff their output against it (D9). It reads through `src/ir.om`, the reader `ng` itself uses, so a diff against ngrun alone cannot see a reader fault both share: that is what the gate's run pairs are for, which judge ngrun against omc's build of the same program in Omega (no shared code). Exercised: `sub` operands swapped in both the reader and the writer of `ir.om` pass every round-trip and ir-copy case and are caught by the run pairs `x-fib` and `x-float`. The gate also mutates ngrun nine ways (fuel one pass late; rem MIN/-1, u64 `chk.add` and `chk.mul`, `chk.shl` negative side, signed conv lower bound, `chk.bounds` with e = 0, narrow `neg`, depth cap): each is caught by a run pair or an N case (`n-*.oir`, ngrun alone, for the semantics Omega cannot state). |
 | `ngrand.om` | Random programs, valid by construction (IR.md s10): `ngrand SEED` writes a binary unit (helpers, diamonds, counted loops, calls, checks with their codes, i64 memory, host write) built with `src/ir.om`; `ngrand tape FILE` replays a choice tape; `ngrand shrink SEED STATUS OUT CMD [ARG...]` deletes and zeroes tape bytes while `CMD ARG... OUT` exits STATUS and leaves the smallest unit in OUT and its tape in OUT.tape (the predicate runs at most 20001 times). The D9 differential source: a back end runs the same units as ngrun and the outputs must agree. |
 | `tests/ir/` | Text fixtures (`*.oir`), run pairs (`x-*.oir` + `x-*.om`) and `cases`, the expectations the gate runs. |
+| `tests/opt/` | Optimizer fixtures (`O`/`L` lines of `tests/ir/cases`): ng-front's 23 lowered run units and six by hand (`o-pre2`, `o-zero`, `o-bce0`, `o-bce1`, and the kernel loops `o-shfl` and `o-mma`, whose invariant `shfl` and `mma` must not leave the loop). |
 | `gate-ir.om` | The ΩIR gate. |
 
 ## Build and gate
@@ -58,16 +60,28 @@ run pairs: ngrun on `x-NAME.oir` against omc's build of `x-NAME.om` (exit status
 stderr equal); N cases: ngrun alone on `n-NAME.oir` with a step budget of 1000000 (exit status,
 empty stdout, the step-limit or outside-storage line); random units of ngrand for seeds 1..1000 (ngcheck's whole ACCEPT line,
 `ngas(ngdis(b)) == b`, the same bytes twice for seed 1, ngrun ending with exit 0..63 and 0 or 8
-stdout bytes, 64..95 by `exit` or 101..114 by a trap, empty stderr); and one shrink with ngrun as
-the predicate (accepted, still trapping, smaller, its tape replays it). Then its negative controls:
+stdout bytes, 64..95 by `exit` or 101..114 by a trap, empty stderr); one shrink with ngrun as
+the predicate (accepted, still trapping, smaller, its tape replays it); and the optimizer on every
+random seed and every `tests/opt/` fixture (`@ng opt` exit 0, ngcheck's whole ACCEPT line on the
+output, its text round trip, ngrun before and after equal, a second `@ng opt-count` finding nothing
+to move; a row `ok O NAME fns=.. inloop=A->B ...` per fixture, which must equal the row written on
+its `O`/`L` line, so a pass that stops doing its work fails). The `L` fixtures are the long
+kernels (ngrun takes 25 s to several minutes each on the Spark, twice: about 19 min of ngrun per pass
+on an idle Spark core, sum of the measured per-kernel runs), which makes a full gate run take about 40
+minutes (2353 s at 854d8152 on core 11). The workflow `.github/workflows/ng-ir-arm64.yml` keeps main's
+30-minute timeout, so a CI run of this gate would be cut off; the gate is run on the Spark. Then its negative controls:
 three deliberately wrong expectations must each trip
 their named check, three mutants of ngcheck (load and store typing disabled, the witness prefix
 changed, the class name shifted), ten mutants of ngrun (`chk.fuel` one pass late, rem MIN/-1
 giving a, u64 `chk.add` and `chk.mul` never failing, `chk.shl` without its negative bound, the signed
 conv lower bound at -2^(w-1), `chk.bounds` passing e = 0, narrow `neg` left uncanonical, the depth
-cap at 70000, the step limit one op late: `n-loop2` then names 87, not 116) and a mutant ngrand (a
-random check's new token not made current) must each fail their named check at least once (the
-ngrand mutant: ngcheck refuses TOKEN). Last line `NGIRGATE PASS cases=N`,
+cap at 70000, the step limit one op late: `n-loop2` then names 87, not 116), a mutant ngrand (a
+random check's new token not made current) and five of opt.om (a load hoisted past the loop's
+stores and checks hoisted past their guard, both refused by ngcheck; preheader merging that
+ignores imm and BCE accepting an index one past its proof, a run differs; LICM moving a convergent
+`shfl`, the pinned `o-shfl` row differs) must each fail their named check at least once (the
+ngrand mutant: ngcheck refuses TOKEN); each mutant's pattern must occur exactly once in its source.
+Under a mutant, Q runs 100 seeds and `L` cases are skipped. Last line `NGIRGATE PASS cases=N`,
 exit 0; otherwise one `FAIL` line per failure and exit 1.
 
 The tools one by one:
