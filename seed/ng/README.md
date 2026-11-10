@@ -118,7 +118,7 @@ but still refuses duplicate paths. All units and pins are checked before output 
 | 0 | Built, or sums printed. |
 | 1 / 2 / 3 | OMC refused (its status is printed) / usage, including any argument count other than `build`'s 4 or `sums`' 2 (checked before any argument is read) / pin mismatch. |
 | 4 / 5 | Malformed or empty list / unreadable list or unit. |
-| 6 / 7 | Cannot write output / fork or wait failure, or OMC ended by a signal (`ngbuild: fork or wait failed, or omc ended by a signal`). A failed exec or redirect in the child exits 127 and is reported as `ngbuild: omc exit 127`, exit 1. OUT.src is written before OUT is opened and OMC runs, and stays after a successful build; exit 6 can leave OUT.src, and exits 1 and 7 can leave both. |
+| 6 / 7 | Cannot write output / fork or wait failure, or OMC ended by a signal (`ngbuild: fork or wait failed, or omc ended by a signal`). A failed exec or redirect in the child exits 127 and is reported as `ngbuild: omc exit 127`, exit 1. OUT.src is written before OUT is opened and OMC runs, and stays after a successful build; exit 6 can leave OUT.src, and exits 1 and 7 can leave both. After OMC exits 0, OUT is read back for its sha256; exit 5 (`ngbuild: unreadable: OUT`) or exit 9 (`ngbuild: too large: OUT`, OUT of 16777216 bytes or more) then leaves both. |
 | 8 / 9 | Duplicate unit / list, unit count, unit file or joined-source limit exceeded. |
 
 Exact diagnostic formats are in `ngbuild.om`; malformed-line offsets count bytes from zero.
