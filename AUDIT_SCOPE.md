@@ -23,9 +23,10 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `6844d173abc85ecbc04154cce85e4e5eeec8bf7b21f4ab1c10728c55efe7dd00`,
-   from `seed/omc/omc.om` `f2def4bbc5d42afefc01b0fbca385157974249ac0ab22f9f4ff4cd87e93517e0`; OM-2 AArch64 `for` loops tested at the latch, branch
-   `ham/omc-perf-loops-5`, on Radicle main 12bdb787). The earlier audit pins
+   `0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f`,
+   from `seed/omc/omc.om` `232f89ebe688e81c289a9d0225dd06e4d8e8aaad8e489433634e7f8bf0b9b0a9`; scheduler host words cpuset/cpuget/cpunow/setprio/getprio 236..240, branch
+   `ham/om-threads-4`, stacked on `ham/omc-perf-loops-5` on Radicle main 12bdb787). The earlier audit pins
+   `6844d173abc85ecbc04154cce85e4e5eeec8bf7b21f4ab1c10728c55efe7dd00` (OM-2 AArch64 `for` loops tested at the latch, branch `ham/omc-perf-loops-5`, on Radicle main 12bdb787),
    `564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999` (names of up to 63 bytes, branch `omc/long-names` 2e20b286, merged after `pearl/exec-limits` on rad main a59a425b in `ham/omc-train`),
    `b87c8b651fc74c90357c9a6df93172aec18e89324bd9be8adb85f5142670318e` (exec argv packets at 1024 records / 65536 bytes, branch `pearl/exec-limits`, `ham/omc-train`),
    `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8` (the prlimit 235 host word, branch `seed/prlimit-host-word`, on rad main 408c76b7),
