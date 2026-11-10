@@ -94,6 +94,7 @@ fib38), so any future codegen A/B reports an aligned control.
      wire; load and store use the address wire like a REF. chk.bounds on a SLICE: `CBZ e`, `SUBS X15, len, e` +
      `B.LO` (e > len), CMP i + `B.HI`; chk.slice on a SLICE: CMP off, len + `B.HI`, `X15 = len - off`, CMP n +
      `B.HI`. A slice result of any op but `slice` (select, call) and `retv` of a slice are refused (exit 5).
+     A select fused into its compare (section 8) meets the same refusal (rgate's `u-*` refusal fixtures).
    - host words read (53) and write (54) (IR.md s7.11): `X17 = A + off`, then x0 fd, x1 X17, x2 n as one parallel
      move, `MOVZ X8, #63/64; SVC #0`, result (count or minus errno) from x0. The SVC preserves every register but x0;
      the arguments use x0..x2, so a host word counts as a call for allocation (values live across it take x19..x27)
@@ -245,7 +246,8 @@ bits there (multiply, two-source, float). The selector never asks for these; the
   a slice's length taken from its offset, slice block arguments keeping the target's length, slice offsets not
   scaled by the element size, monons selecting on GE, fill stores unscaled, realns on the monotonic clock, the u8 and
   the u16 rotate copies shifted wrong, x15 allocatable) must each change at least one fixture's status (against its
-  expectation or ngrun's), alignment, or stdout/stderr bytes; section 8 adds seven more forms.
+  expectation or ngrun's), alignment, or stdout/stderr bytes; section 8 adds seven more forms and mutant 35 (the
+  select-of-SLICE refusal never fires), which a refusal fixture must catch.
 - Front phase of `rgate.om` (rgate step 6; branch ng/slice-m1, where ng.units holds ir, front, a64, main): for each
   source of rgate's list `tfr` (ng-ir's 14 integer `x-*.om` run pairs and ng-front's nine integer bench kernels
   arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul at full size) ng reads `@ng front-ir` and the
@@ -283,6 +285,8 @@ A compare whose boolean has exactly one use by the immediately following cbr or 
 Use counts are computed once per function. Branch fall-through polarity follows the existing block order. Short branch fixup checks signed displacement ranges. If a conditional branch is too far, the function is emitted again with inverted short branches over ordinary B instructions, retaining trap stub and call fixups; the code buffer fits B range. No range is silently masked.
 
 `tests/fusion.om`, composed after `src/ir.om`, generates `tests/oir/f-fusion.oir`: every integer type and comparison in branch/select forms, true and false paths, every TBZ bit, and a far bit target. rgate includes the generated fixture and seven additional mutants for B.cond condition, CBZ, CBNZ, TBZ, TBNZ, bit packing and CSEL operand order. `tests/fusion-bench.om` records the before-timing NG benchmark protocol.
+
+Fusion emits the consumer at the compare and `a6_sel` skips it at its own turn (`a_skip`, one slot), but only after `a6_sel`'s refusals. Bay 11's review of 3ad3ef7b found the skip placed before them: a fused select of SLICE values compiled to a CSEL of the address wires alone, the result's length wire was never written, and the program ran with a wrong length (ngrun 3, ELF 7) where the unfused select is refused. The other fused consumer, cbr, has no refusal in `a6_sel`, `a6_sterm` or `a6_scbr`; the compare's own refusal (`a6_isint` on its operand type) runs before `a6_cuse`; and the consumer is the next op, so no op can redefine or slice an operand between the compare and its use. rgate's refusal fixtures `tests/oir/u-selslice-*.oir` (eq true and false, signed lt, ne against zero, a single-bit AND, the result passed to a call, and one select not fused) must assemble, pass ngcheck and run under ngrun, and both a64 forms must refuse them with exit 5 and exactly `a64: unsupported 2`. The pre-fix back end compiles six of the seven.
 
 `ngas.om` and `ngdis.om` are the canonical IR text tools, not AArch64 instruction encoders/decoders. Their unchanged compare/select/branch row encodings already cover these programs. Encoder instruction forms are in a64.om and checked against GNU objdump by gate.om. IR round trips are checked separately.
 
