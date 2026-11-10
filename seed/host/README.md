@@ -88,21 +88,25 @@ constants, to `execprog`. `packet-corpus.om` writes one packet per mode byte;
 when given one decimal argument, to `execprog` unchanged. `check.sh` runs
 `packets.cases` through the OM-2 conductor: 16 rows prove each committed fixture
 in `packets/` equals the generator output, 16 rows run the modes (4 valid
-packets, including the 64-record and the exact 4096-byte limits, and 12
-malformed ones: count 0, 65 and 65535, truncated, over-declared and 65535-byte
-records, a trailing byte, an empty first record, zero bytes inside and after the
-path, and a 4097-byte packet), and 28 rows truncate the 27-byte echo packet at
-every length. Expected exits come from the format rules in OMEGESE section 10;
-every malformed packet must trap 3 (exit 103) before any exec.
+packets, including the 1024-record and the exact 65536-byte exec limits, and 12
+malformed ones: count 0, 1025 (bare and with 1025 records) and 65535, truncated,
+over-declared and 65535-byte records, a trailing byte, an empty first record,
+zero bytes inside and after the path, and a 65537-byte packet), 28 rows truncate
+the 27-byte echo packet at every length, and 5 rows run the 1024-record,
+1025-record, 65537-byte, 65536-byte and echo packets through the x86 decoder
+(`xhpack`, the consumer composed after `seed/host/execenv/x86-target.om` and run
+through binfmt qemu-x86_64: emulator evidence). Expected exits come from the
+format rules in OMEGESE section 10; every malformed packet must trap 3 (exit
+103) before any exec.
 
 `packets-mutant.cases` builds three compilers, each without one length check of
-the decoder (`hpack` in `seed/omc/omc.om`): the 4096-byte packet bound, the
-64-record bound, and exact consumption. Each mutant executes the one packet that
+the decoder (`hpack` in `seed/omc/omc.om`): the packet byte bound, the record
+count bound, and exact consumption. Each mutant executes the one packet that
 only its check refuses, so `check.sh` requires three exact `FAIL run exit=0
 expected=103` verdicts. Removing the record-length-versus-remaining check is
 not detected by exit status: the zero-byte and exact-consumption checks still
 trap every over-declared record, so that check only bounds how far the decoder
-reads. The x86 decoder (`xhpack`) is not exercised here.
+reads.
 
 ### Bounded networking additions (#788)
 

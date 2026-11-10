@@ -22,6 +22,11 @@ freeze needs `omegese-om3.md`.
   under 734f0a39 and the OM-2 compiler. This is checked per manifest entry and is not claimed beyond
   it. omc.om itself is excluded; it must still pass the full birth (`seed/omega-from-seed.sh`: om4(omc.om)
   == omc(omc.om) == omc(omc(omc.om))).
+  A declared delta, `seed/qualification/om2/manifest-c2-*.txt`, replaces named rows whose result a later
+  reviewed change altered and states why; the frozen rows are still replayed against their pinned
+  compiler; a row a delta names is judged by the delta. One delta is a language decision rather
+  than a code change: `manifest-c2-longnames.txt` (Drake, 2026-11-08), where names of 9 to 63 bytes
+  became valid (OMEGESE.md 9.2) and 28 gate-made inputs that relied on error 13 for them changed result.
 - **C3 (om4 subset).** Because of the om4 == omc birth rule, the compiler's own source stays inside
   om4's language. omc therefore cannot read its own argv, so all modes are selected in-band (sections
   1 and 2). The compiler's identity is supplied by the harness, never self-reported.

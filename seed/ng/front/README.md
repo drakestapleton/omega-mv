@@ -26,6 +26,10 @@ and accept what omc accepts (DECISIONS D5, D6, D9):
 Since the first commit `src/front.om` is edited directly (the OM-2 renames `at`, `big`, `ops` to
 `atp`, `bigf`, `opsb`; `fe_run` split into main.om's input and `fe_check`), so the tools are the
 record of how it was derived, not a way to rebuild it. The gate checks the result.
+Long names (omc `omc/long-names` 2e20b286, omc `564c5835`) were carried over by hand at the same omc sites:
+`fe_tok2` interns a word of 9..63 bytes as the packed word 1 + 256 * index (`f_ln_*`, `f_tw8`), the 14 name
+checks omc raised from 8 to 63 bytes are raised here, and `fe_mput_name`, `fe_findfn`, `fe_newname`,
+`fe_rdval` and `fe_stmt` follow omc. Abstract, layout, layout-field and IR-mode names stay at 8 as in omc.
 
 ## What is not reproduced (D6)
 
@@ -48,7 +52,7 @@ main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 \
+    gate-front seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt
@@ -103,7 +107,7 @@ calls: both are omc code-shape choices with the same results.
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 \
+    gate-front-ir seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
 It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
@@ -139,7 +143,7 @@ an ordinary assignment that silently removes its runtime check. OM-1 names retai
 The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
 the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
 
-    gate-front seed/out/omc 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 \
+    gate-front seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
       seed/ng/front/cases-contract-scope.txt

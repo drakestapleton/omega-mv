@@ -51,7 +51,7 @@ e8_out_of_range|8|2|fn f to int\nx = int 2147483648\nret 0\nend
 e9_break_outside|9|2|fn f to int\nbreak\nret 0\nend
 e10_duplicate_param|10|1|fn f x int x int to int\nret 0\nend
 e11_ambiguous|11|2|fn f to int\nx = 5\nret 0\nend
-e13_long_variable|13|2|fn f to int\nabcdefghi = int 1\nret 0\nend
+e13_long_variable|13|2|fn f to int\nabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl = int 1\nret 0\nend
 e15_missing_end|15|3|fn f to int\nret 0
 e16_syntax|16|1|wat
 e17_after_path|17|3|fn f to int\nret 0\nret 1\nend

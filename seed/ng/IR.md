@@ -949,7 +949,9 @@ payload after it fills `i_in` from offset 0 and may be the full 16777216 bytes o
 reads the ΩIR binary payload and writes it back (reader/writer round trip). A refusal prints `ng:
 refused class C at OFFSET`, offset in the payload, empty stdout, and exits C: a payload over
 16777216 bytes is class 23 at 16777216, an unreadable one class 27; an unknown mode is `ng:
-unknown mode` and exit 2. Stage lanes add their modes (`@ng dump-ir <stage>` after the front end or
+unknown mode` and exit 2. `@ng opt` reads the payload like `@ng ir-copy`, runs the optimizer of
+`src/opt.om` (s15.1) and writes the result; `@ng opt-count` runs the same passes and prints one line
+of counts instead of the unit. Stage lanes add their modes (`@ng dump-ir <stage>` after the front end or
 a pass, `@ng ingest-ir <stage>` before a back end) beside their code.
 
 ## 15. What a pass may do to a check (D7)
@@ -965,3 +967,60 @@ zero-trip mutants guards the third. A pass removes a check in exactly two ways:
    original loop, checks intact, runs when the guard fails.
 
 Every pass that does either has mutants that attack trap order and zero-trip hoisting (D9).
+
+### 15.1 Loop-invariant code motion, bounds-check elimination and rotation (`src/opt.om`, D16)
+
+`src/opt.om` (unit order ir, opt, main; functions `op_*`) rewrites the `ir.om` tables in place,
+per function:
+
+1. **Preheaders.** A natural loop is a header h with a back edge u -> h where h dominates u
+   (Cooper, Harvey and Kennedy dominators over reverse postorder); its blocks reach a latch without
+   passing h. When h has exactly one predecessor outside the loop and it ends in `br h`, that block
+   is the preheader; otherwise a new block with h's parameter types, ending in `br h` with them, is
+   placed before h and every outside predecessor (`br` or `cbr`) branches to it instead. A new block
+   is added only within the limits of s12 (blocks, ops and values per function and per unit); a loop
+   that would need one past them keeps none, and LICM leaves that loop alone.
+1a. **PHI.** A block parameter other than the token whose arguments, over every `br` that targets
+   its block, are one value v or the parameter itself is replaced by v: its uses take v, and it
+   leaves the block's parameter list and each such `br` its argument (a block with a parameter
+   past its token is reached only by `br`, s9 rule 5). v dominates the block (s6.2): every block is
+   reachable (s9 rule 4), and on any path from block 0 the edge that first enters the block comes
+   from a predecessor the block does not dominate, so that `br` passes v, not the parameter, and v
+   dominates its end. One parameter per round, to a fixed point. A value an outer loop carries
+   unchanged through an inner loop's header is such a parameter, so LICM then sees its uses as
+   invariant. PHI, BCE and LICM repeat in that order while one of them changes something: LICM's
+   merging can give two `br` arguments one value only after PHI ran (ngrand seed 523 kept a
+   redundant parameter after one round). Fixture `o-phi` (one parameter stays, one goes); a PHI
+   that kept a parameter's first argument even where another `br` passes a different one changes
+   its run (exit 16 for 18).
+2. **BCE** (pass origin 1, item 1 of s15). A `chk.bounds r i e` is replaced in place by
+   `fact.inbounds 1 r i e` when e is a const >= 1, r is a REF to an ARRAY of count L, and i < X is
+   known where the check runs with X - 1 + e <= L: i is a const (X = i + 1), or a block on the
+   check's dominator path has one predecessor, ending in a `cbr` on `lt`/`le`/`gt`/`ge` of i and a
+   const, so that block runs only after the test proved i < X. A `chk.divz` of a nonzero const is
+   deleted. Uses of a deleted check's output token take its input token. ngcheck judges the fact's
+   placement, not its truth (s7.10); the gate's BCE mutant (X - 1 + e <= L + 1) makes the
+   boundary fixture `o-bce1` (L = 4, i < 5) write past the array, and the run differs.
+3. **LICM**, innermost loop first. An op moves to the end of the preheader when it is class P
+   (s6.4), defines a value, is not `shared`, is not convergent (`sync`, `shfl`, `mmald`, `mmast`,
+   `mma`, refused by number: s7.12 forbids moving them into or out of a branch, and the loop body
+   is the branch of the header's test; the gate's convergent mutant drops `shfl` from that list
+   and the pinned `o-shfl` row differs), and every
+   operand is defined outside the loop. P ops
+   are total (s7.3: division by zero gives 0), so running one on a path where the loop runs zero
+   times changes nothing. Checks, loads, stores, calls, host words, facts and terminators never
+   move: they carry the token chain, and that is where coverage (s8) and trap order (above) live.
+   An op equal to one already in the preheader (op, type, imm, operands) is dropped and its uses
+   take the earlier value.
+4. **ROT.** When the header ends in `cbr` with one target inside the loop and one outside, and the
+   one latch ends in `br h`, the header is placed right after the latch. Block order changes no
+   value (uses are judged by dominance, s6.2); it is the layout a back end emits, so the back
+   branch falls through into the test and a pass of the loop takes one conditional branch.
+
+The gate runs every O/L fixture and every Q seed through `@ng opt`: ngcheck's whole ACCEPT line on
+the output, the text round trip, ngrun before and after equal, and a second run that finds nothing
+to move; each O/L line also pins the `@ng opt-count` row of its input (`o-shfl`: a kernel loop whose
+invariant `shfl` stays put).
+Its mutants hoist a load past the loop's stores and checks past their guard (both refused
+by ngcheck: the hoisted op keeps an in-loop token, s6.4), merge preheader ops of different imm
+(a run differs) and let BCE delete a check one element past its proof (a run differs).
