@@ -52,7 +52,7 @@ main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc 0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f \
+    gate-front seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt
@@ -107,7 +107,7 @@ calls: both are omc code-shape choices with the same results.
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc 0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f \
+    gate-front-ir seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
 It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
@@ -143,7 +143,7 @@ an ordinary assignment that silently removes its runtime check. OM-1 names retai
 The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
 the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
 
-    gate-front seed/out/omc 0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f \
+    gate-front seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
       seed/ng/front/cases-contract-scope.txt
