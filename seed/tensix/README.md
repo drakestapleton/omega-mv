@@ -114,7 +114,7 @@ All of these checks are interop oracles, not Omega-native.
 
 ## Before a hardware receipt
 
-1. **A card.** An n150 or p150 card, or Tenstorrent cloud access. We have neither.
+1. **A card.** An n150 or p150 card, or Tenstorrent cloud access. I have neither.
 2. **The kernel driver.** tt-kmd (GPL-2.0) must be loaded to map BAR0. The same TLB and soft-reset sequence that `oracle.py` uses on ttsim then works on the card. tt-umd does this from C++.
 3. **Firmware and tile choice.** On real cards the ARC firmware and the tt-metal firmware own the tiles. A raw run must use a tile that nothing else is using and must restore soft reset afterwards. Harvested rows and columns change which NoC coordinates are Tensix tiles.
 4. **Running beyond one tile.** NoC reads and writes are needed for DRAM inputs and for using many tiles.
