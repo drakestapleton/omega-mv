@@ -30,18 +30,26 @@ comparison loop (time up to `len h * len nd`).
 ## Gate
 
 `sh seed/text/tests/gate.sh` builds `tests/txdrv.om` with the unit, runs the cases from
-`tests/gen.py` and requires every answer to equal the Python oracle (test harness only, `python3 -I`,
-never part of an Omega build): bytes comparison and order, `bytes.find`, `bytes.split`, `int()` on the
-strict forms with explicit range limits, `format()`, and `bytes.decode('utf-8')` whose error start is
-the expected index. UTF-8 coverage: every 1- and 2-byte string, every 3-byte string with lead E0..EF,
-every 4-byte string with lead F0..F4 and second byte 80..BF over a fixed sample of the last two bytes,
-and seeded random mixes; plus inputs that cross the 65536 block edge. Decoding is checked against the
-first code point Python decodes (every 1- and 2-byte string, every 3-byte string led by E0, E1, E8, ED,
-EF, sampled 4-byte strings, random mixes); encoding against `chr(cp).encode()` for every 7th code
-point, the whole D700..E100 band, edges past 10FFFF and every room size 0..4. Eleven mutants (decimal
+`tests/gen.om` and requires every answer to equal that oracle's. `gen.om` is a separate seeded Omega
+program that never calls `text.om`: byte loops for comparison, order, search and fields; strict-form
+checks plus a digit-string comparison against the range limits for integer text; Unicode table 3-7
+for UTF-8 validation, decoding and encoding. It replaced the Python oracle `tests/gen.py`: on omc
+`cfd96b48` it wrote the same 18 files byte for byte as gen.py at `b2433586` (rows=1840870), and, built
+without the 1-byte parse loop, the same files as gen.py at `965c3996` (rows=1839334), MT19937 seeded and
+drawn as CPython 3.12's `random.Random(20261108)`. UTF-8 coverage: every 1- and 2-byte string, every
+3-byte string with lead E0..EF, every 4-byte string with lead F0..F4 and second byte 80..BF over a
+fixed sample of the last two bytes, and seeded random mixes; plus inputs that cross the 65536 block
+edge. Integer text: fixed edges, every 1-byte string and every byte followed by `1` for D, H and I,
+and seeded random digit strings. Decoding is checked on every 1- and 2-byte string, every 3-byte
+string led by E0, E1, E8, ED, EF, sampled 4-byte strings and random mixes; encoding for every 7th code
+point, the whole D700..E100 band, edges past 10FFFF and every room size 0..4. Twelve mutants (decimal
 overflow boundary, surrogates, overlong E0 forms, needle at the end, prefix order, -2^63, truncated
-sequence, 3-byte decode mask, U+D800 encoded, 3-byte lead byte, U+07FF length) must each give a wrong
-answer. Host run 2026-11-08 at omc `cfd96b48`: `TEXTGATE PASS rows=1840870 mutants=11`. Like `seed/json`, the gate is standalone (it needs Python) and is not in `seed/host/check.sh`. Exit status: 0 PASS, 1 FAIL, 3 NOT_RUN (no `python3`, one older than 3.11, or the run was interrupted by HUP, INT or TERM). On a FAIL against the oracle the gate keeps its run folder and names the cases file, the driver's exit status (100+N is trap N) and the got and want files.
+sequence, 3-byte decode mask, U+D800 encoded, 3-byte lead byte, U+07FF length, backquote read as a
+hex digit) must each give a wrong answer. Host run 2026-11-10 at omc `cfd96b48`: `TEXTGATE PASS
+rows=1840870 mutants=12`. The gate is standalone and is not in `seed/host/check.sh`; its driver is
+still sh with perl for the mutant edits (migration debt). Exit status: 0 PASS, 1 FAIL, 3 NOT_RUN (the
+run was interrupted by HUP, INT or TERM). On a FAIL against the oracle the gate keeps its run folder
+and names the cases file, the driver's exit status (100+N is trap N) and the got and want files.
 
 Not here yet: number text for floats (see `seed/json/jsonf.om`),
 and text in function mode (RM5's ABI item).

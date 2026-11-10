@@ -1,9 +1,11 @@
 #!/bin/sh
-# gate.sh -- seed/text/text.om against an independent oracle (gen.py, Python, test harness only).
-# Builds txdrv (om2 + text.om + txdrv.om) with seed/out/omc, generates the fixed and seeded random cases,
-# and requires every answer to equal Python's. Then eleven mutants of text.om, each removing or bending
-# one rule, must each produce at least one wrong answer. Prints TEXTGATE PASS rows=N mutants=11.
-# Exit 0 PASS, 1 FAIL, 3 NOT_RUN (no python3, python3 older than 3.11, or interrupted by HUP, INT or TERM).
+# gate.sh -- seed/text/text.om against an independent oracle (tests/gen.om, seeded Omega).
+# Builds the case generator gen.om and txdrv (om2 + text.om + txdrv.om) with seed/out/omc, writes the
+# fixed and seeded random cases with their expected answers, and requires every answer of text.om to
+# equal the oracle's. Then twelve mutants of text.om, each removing or bending one rule, must each
+# produce at least one wrong answer. Prints TEXTGATE PASS rows=N mutants=12.
+# Exit 0 PASS, 1 FAIL, 3 NOT_RUN (interrupted by HUP, INT or TERM).
+# Migration debt: this driver is still sh, with perl for the mutant edits; it is not ported to .om yet.
 set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 cd "$R"
@@ -11,13 +13,13 @@ S=seed/out/omc
 notrun() { printf 'NOT_RUN text gate: %s\n' "$*"; exit 3; }
 bad() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 [ -x "$S" ] || bad "$S missing; run sh seed/omega-from-seed.sh first"
-command -v python3 >/dev/null || notrun 'requires python3 (read-only oracle)'
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || notrun 'requires python3 >= 3.11'
 mkdir -p build/seed/text
 T=$(mktemp -d build/seed/text/run.XXXXXX)
 trap 'rm -rf "$T"' EXIT
 trap 'notrun interrupted' HUP INT TERM
-python3 -I seed/text/tests/gen.py "$T" > "$T/gen.log"
+"$S" < seed/text/tests/gen.om > "$T/gen" 2> "$T/build.err" || bad "omc refused seed/text/tests/gen.om: $(cat "$T/build.err")"
+chmod +x "$T/gen"
+"$T/gen" "$T" > "$T/gen.log" || bad "seed/text/tests/gen.om exited $? (80: a write failed)"
 
 build() { # build TEXT.om OUT
     { printf 'om2\n'; cat "$1" seed/text/tests/txdrv.om; } > "$T/drv.om"
@@ -60,4 +62,5 @@ mutant "3-byte lead keeps too few bits" 's/cp = ulong and c 15/cp = ulong and c 
 mutant "U+D800 encoded" 's/if and ge cp 55296/if and ge cp 55297/'
 mutant "3-byte lead written as 4-byte" 's/lead = 224/lead = 240/'
 mutant "U+07FF sized as 3 bytes" 's/if lt cp 2048/if lt cp 2047/'
+mutant "backquote read as a hex digit" 's/if and ge c 97 le c 102/if and ge c 96 le c 102/'
 printf 'TEXTGATE PASS rows=%s mutants=%s\n' "$rows" "$m"
