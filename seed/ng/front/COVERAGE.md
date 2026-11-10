@@ -14,33 +14,33 @@ Counts below are MEASURED tracked-file whole-word occurrences across seed/, om/,
 including notes and negative fixtures. OM-2-only counts use the 635 files with an om2 header. Counts rank
 investigation demand, not executed use or language acceptance. The packed C2 manifest is surveyed separately.
 
-| Words or construct | Baseline lowering | Gap |
-|---|---|---|
-| bool, uchar/u8, ushort/u16, uint/u32, ulong/u64, byte/i8, short/i16, int/i32, long/i64, f32, f64, void | P | bool const/type reader; qty absent |
-| qty | N | qty values/storage/conversions/checked unsigned arithmetic |
-| add sub mul div rem and or xor eq ne lt le gt ge neg not | P | qty/abstract operands absent |
-| shl shr | P | unequal operand types exit 64 |
-| rotr rotl | P | abstract operands absent |
-| fsqrt fabs bitcast | Y | subject to operand construct coverage |
-| fmin fmax fma | N | no expression dispatcher |
-| true false = ( ) | Y | |
-| get put len new | P | scalar arrays only; structs/layout fields absent |
-| view edit part | P | sized view text arguments absent; fresh signature token absent |
-| global text const | P | empty text, bool/qty const absent |
-| struct layout field at little big sizeof offsetof | N | no declaration/storage/field/query lowering |
-| abstract ops seal open holds | N | no nominal lowering or constructor checks |
-| fn to ret end | P | main must return int; units without main absent |
-| inline for unroll while bound if else break continue trap exit | P | M1 fixtures only; signed latch wrapping was incorrect before e156056a; contracts absent |
-| requires ensures invariant result | N | no observation-point lowering |
-| fresh out export | N | fresh token; function-mode/out/export units absent |
-| note | Y | ignored |
-| own free | R | seeded parser refuses their unsupported forms |
-| dit scrub | N | no value lowering |
-| read write monons realns | Y | |
-| every other host word in table below | N | no generic host lowering |
-| om2, om2 debug/release/diag | P | fmt and some contract policies exit 64 |
-| om2 fmt | N | formatting output not reproduced |
-| target x86linux/x86efi and efi, ir units | outside D8 | existing scope refusal, not an NG CPU-front implementation claim |
+| Words or construct | Baseline IR emitted | Same behavior | Gap |
+|---|---|---|---|
+| bool, uchar/u8, ushort/u16, uint/u32, ulong/u64, byte/i8, short/i16, int/i32, long/i64, f32, f64, void | P | Fixture-scoped only; generally unproven | bool const/type reader; qty absent |
+| qty | N | NOT_RUN | qty values/storage/conversions/checked unsigned arithmetic |
+| add sub mul div rem and or xor eq ne lt le gt ge neg not | P | Fixture-scoped only; generally unproven | qty/abstract operands absent |
+| shl shr | P | Fixture-scoped only; generally unproven | unequal operand types exit 64 |
+| rotr rotl | P | Fixture-scoped only; generally unproven | abstract operands absent |
+| fsqrt fabs bitcast | Y | Fixture-scoped only; generally unproven | subject to operand construct coverage |
+| fmin fmax fma | N | NOT_RUN | no expression dispatcher |
+| true false = ( ) | Y | Fixture-scoped only; generally unproven |  |
+| get put len new | P | Fixture-scoped only; generally unproven | scalar arrays only; structs/layout fields absent |
+| view edit part | P | Fixture-scoped only; generally unproven | sized view text arguments absent; fresh signature token absent |
+| global text const | P | Fixture-scoped only; generally unproven | empty text, bool/qty const absent |
+| struct layout field at little big sizeof offsetof | N | NOT_RUN | no declaration/storage/field/query lowering |
+| abstract ops seal open holds | N | NOT_RUN | no nominal lowering or constructor checks |
+| fn to ret end | P | Fixture-scoped only; generally unproven | main must return int; units without main absent |
+| inline for unroll while bound if else break continue trap exit | P | Fixture-scoped only; generally unproven | M1 fixtures only; signed latch wrapping was incorrect before e156056a; contracts absent |
+| requires ensures invariant result | N | No: silent omission before the safety head | no observation-point lowering |
+| fresh out export | N | NOT_RUN | fresh token; function-mode/out/export units absent |
+| note | Y | Fixture-scoped only; generally unproven | ignored |
+| own free | R | NOT_RUN | seeded parser refuses their unsupported forms |
+| dit scrub | N | NOT_RUN | no value lowering |
+| read write monons realns | Y | Fixture-scoped only; generally unproven |  |
+| every other host word in table below | N | NOT_RUN | no generic host lowering |
+| om2, om2 debug/release/diag | P | Fixture-scoped only; generally unproven | fmt and some contract policies exit 64 |
+| om2 fmt | N | NOT_RUN | formatting output not reproduced |
+| target x86linux/x86efi and efi, ir units | outside D8 | NOT_RUN | existing scope refusal, not an NG CPU-front implementation claim |
 
 ## Missing group order by real source-file demand
 
