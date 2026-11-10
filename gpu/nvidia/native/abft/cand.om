@@ -1,0 +1,470 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note native/abft candidate: a tiled GEMM run by W simulated workers that share tile buffers sa/sb and
+note meet at two barriers per K tile (after loads, after compute). It runs only in a forked child; its
+note one channel back to the evaluator is the memfd bytes plus its exit status. The scheduler applies
+note the evaluator's perturbation (sched.om validated it before fork). Fault injectors are labelled
+note controls selected by the frozen plan row, never by candidate logic. Label: SIMULATED.
+note Element order is k ascending for every element under every schedule, so a fault-free run is
+note bitwise schedule independent; any schedule dependence in the output is a fault.
+const TK ulong 8
+const PLOAD ulong 0
+const PB1 ulong 1
+const PCOMP ulong 2
+const PB2 ulong 3
+const PDONE ulong 4
+const KDT ulong 1
+const KM ulong 2
+const KN ulong 3
+const KK ulong 4
+const KW ulong 5
+const KPOL ulong 6
+const KTGT ulong 7
+const KSITE ulong 8
+const KFLT ulong 9
+const KSUB ulong 10
+const KP1 ulong 11
+const KP2 ulong 12
+const KSEED ulong 13
+const KFLG ulong 15
+global kp ulong 16
+global kat ulong 1
+global krep ulong 1
+global cc ulong 65536
+global sa ulong 2048
+global sb ulong 2048
+global wph ulong 64
+global wt ulong 64
+global wu ulong 64
+global warr ulong 64
+global clast ulong 1
+global csh ulong 1
+global gprev ulong 65536
+global gref ulong 65536
+fn kf f ulong to ulong
+ret get kp f
+end
+fn fact to bool
+if eq kf KFLT 0
+ret false
+end
+if eq and kf KFLG 1 1
+ret eq get kat 0 0
+end
+ret true
+end
+fn fis f ulong s ulong to bool
+if fact
+ret and eq kf KFLT f eq kf KSUB s
+end
+ret false
+end
+fn ntiles to ulong
+ret div add kf KK sub TK 1 TK
+end
+fn ctk t ulong to ulong
+k0 = mul t TK
+tk = sub kf KK k0
+if gt tk TK
+tk = TK
+end
+if fis 4 1
+if eq t sub ntiles 1
+tk = sub tk 1
+end
+end
+ret tk
+end
+fn rowskip i ulong to bool
+if fact
+if eq kf KFLT 3
+if ge kf KSUB 2
+p1 = kf KP1
+ret and ge i p1 lt i add p1 kf KP2
+end
+end
+end
+ret false
+end
+fn cloada w ulong k0 ulong tk ulong to void
+e = w
+while lt e mul kf KM tk
+i = div e tk
+q = rem e tk
+s = add mul i kf KK add k0 q
+v = get ga s
+put sa add mul i TK q v
+e = add e kf KW
+end
+end
+fn cloadb w ulong k0 ulong tk ulong to void
+n = kf KN
+e = w
+while lt e mul tk n
+q = div e n
+j = rem e n
+s = add mul add k0 q n j
+if fis 4 2
+s = add mul j n add k0 q
+end
+v = get gb s
+put sb add mul q n j v
+e = add e kf KW
+end
+end
+fn cload w ulong t ulong to void
+k0 = mul t TK
+tk = sub kf KK k0
+if gt tk TK
+tk = TK
+end
+cloada w k0 tk
+cloadb w k0 tk
+end
+fn bfu v ulong to f32
+ret bitcast f32 uint shl and v 65535 16
+end
+fn crowf i ulong tk ulong to void
+n = kf KN
+for j ulong n
+p = add mul i n j
+acc = bitcast f32 uint get cc p
+for q ulong tk
+a = bfu get sa add mul i TK q
+b = bfu get sb add mul q n j
+acc = add acc mul a b
+end
+put cc p fbits acc
+end
+end
+fn crowx i ulong tk ulong to void
+n = kf KN
+for j ulong n
+p = add mul i n j
+acc = get cc p
+for q ulong tk
+a = get sa add mul i TK q
+b = get sb add mul q n j
+acc = and add acc mul a b MASK
+end
+put cc p acc
+end
+end
+fn crow i ulong t ulong to void
+if rowskip i
+ret
+end
+if eq kf KDT 0
+crowx i ctk t
+else
+crowf i ctk t
+end
+end
+fn bset v ulong to bool
+if fis 5 3
+ret lt v 2
+end
+ret true
+end
+fn bpass c ulong to bool
+ok = true
+for v ulong kf KW
+if bset v
+if lt get warr v c
+ok = false
+end
+end
+end
+ret ok
+end
+fn cready w ulong to bool
+ph = get wph w
+if eq ph PDONE
+ret false
+end
+t = get wt w
+if eq ph PB1
+ret bpass add mul t 2 1
+end
+if eq ph PB2
+ret bpass add mul t 2 2
+end
+ret true
+end
+fn cnext w ulong to void
+t = add get wt w 1
+put wt w t
+if eq t ntiles
+put wph w PDONE
+ret
+end
+if fis 5 4
+if eq w 0
+put wph w PDONE
+ret
+end
+end
+put wph w PLOAD
+end
+fn carrive w ulong to void
+put warr w add get warr w 1
+end
+fn cstep w ulong to void
+ph = get wph w
+t = get wt w
+if eq ph PLOAD
+cload w t
+carrive w
+put wu w 0
+if fis 5 1
+put wph w PCOMP
+else
+put wph w PB1
+end
+ret
+end
+if eq ph PB1
+put wph w PCOMP
+put wu w 0
+ret
+end
+if eq ph PB2
+cnext w
+ret
+end
+i = add w mul get wu w kf KW
+if lt i kf KM
+crow i t
+put wu w add get wu w 1
+i = add w mul get wu w kf KW
+end
+if ge i kf KM
+carrive w
+if fis 5 2
+cnext w
+else
+put wph w PB2
+end
+end
+end
+fn csite w ulong to ulong
+ph = get wph w
+if eq ph PLOAD
+ret 1
+end
+if eq ph PCOMP
+ret 2
+end
+ret 3
+end
+fn crr ex ulong to ulong
+w = kf KW
+s = get clast 0
+for q ulong w
+v = rem add add s 1 q w
+if ne v ex
+if cready v
+ret v
+end
+end
+end
+ret w
+end
+fn ccount to ulong
+c = ulong 0
+for v ulong kf KW
+if cready v
+c = add c 1
+end
+end
+ret c
+end
+fn ckth k ulong to ulong
+c = ulong 0
+for v ulong kf KW
+if cready v
+if eq c k
+ret v
+end
+c = add c 1
+end
+end
+ret kf KW
+end
+fn cpick to ulong
+w = kf KW
+n = ccount
+if eq n 0
+ret w
+end
+pol = kf KPOL
+tg = kf KTGT
+if eq pol 1
+ret ckth rbelow 2 n
+end
+if eq pol 2
+if cready tg
+ret tg
+end
+end
+if eq pol 3
+if cready tg
+if eq csite tg kf KSITE
+if gt n 1
+ret crr tg
+end
+end
+end
+end
+ret crr w
+end
+fn chang to void
+note Simulated device hang: no worker can advance; the evaluator deadline kills this process.
+for q ulong 1000000
+z = sleepns 1000000
+if lt z 0
+trap 9
+end
+end
+trap 10
+end
+fn cinit to void
+m = kf KM
+n = kf KN
+for e ulong mul m n
+put cc e 0
+end
+if fact
+if eq kf KFLT 3
+for e ulong mul m n
+i = div e n
+if and ge i kf KP1 lt i add kf KP1 kf KP2
+if eq kf KSUB 3
+put cc e get gref e
+else
+put cc e get gprev e
+end
+end
+end
+end
+end
+for w ulong kf KW
+put wph w PLOAD
+put wt w 0
+put wu w 0
+put warr w 0
+end
+put clast 0 sub kf KW 1
+put csh 0 14695981039346656037
+end
+fn cflip e ulong b ulong to void
+put cc e xor get cc e shl ulong 1 b
+end
+fn cbit c ulong to ulong
+if eq c 1
+ret add 23 rbelow 3 9
+end
+if eq c 2
+ret rbelow 3 8
+end
+ret rbelow 3 32
+end
+fn cpos to ulong
+ret rbelow 3 mul kf KM kf KN
+end
+fn cfadd e ulong d f32 to void
+put cc e fbits add bitcast f32 uint get cc e d
+end
+fn crect b ulong to void
+m = kf KM
+n = kf KN
+i1 = rbelow 3 m
+i2 = rem add add i1 1 rbelow 3 sub m 1 m
+j1 = rbelow 3 n
+j2 = rem add add j1 1 rbelow 3 sub n 1 n
+if eq b 32
+e = f32 shl ulong 1 kf KP1
+cfadd add mul i1 n j1 e
+cfadd add mul i1 n j2 neg e
+cfadd add mul i2 n j1 neg e
+cfadd add mul i2 n j2 e
+ret
+end
+cflip add mul i1 n j1 b
+cflip add mul i1 n j2 b
+cflip add mul i2 n j1 b
+cflip add mul i2 n j2 b
+end
+fn cshift to void
+m = kf KM
+n = kf KN
+i = sub m 1
+while gt i 0
+for j ulong n
+put cc add mul i n j get cc add mul sub i 1 n j
+end
+i = sub i 1
+end
+for j ulong n
+put cc j 0
+end
+end
+fn cpost to void
+if not fact
+ret
+end
+f = kf KFLT
+if eq f 1
+cflip cpos kf KP2
+end
+if eq f 2
+for q ulong kf KP1
+cflip cpos cbit kf KP2
+end
+end
+if fis 4 3
+cshift
+end
+if fis 4 4
+note Out-of-bounds store: Omega traps 3 (exit 103) before writing.
+put cc add mul kf KM kf KN 65536 0
+end
+if fis 6 1
+crect 31
+end
+if fis 6 3
+crect 32
+end
+end
+note Child entry: runs the schedule to completion, applies post-run injectors, returns step count.
+fn crun to ulong
+cinit
+note Stream 2 varies with rep and attempt (a retry is a new schedule); stream 3 varies with rep only,
+note so a persistent fault lands on the same elements again on retry.
+base = add mul kf KSEED 2654435761 mul get krep 0 7919
+rseed 2 add base mul get kat 0 104729
+rseed 3 add base 1
+steps = ulong 0
+while true bound 999999
+w = cpick
+if eq w kf KW
+if eq ccount 0
+done = true
+for v ulong kf KW
+if ne get wph v PDONE
+done = false
+end
+end
+if done
+break
+end
+chang
+end
+end
+put clast 0 w
+put csh 0 fnvw get csh 0 w
+cstep w
+steps = add steps 1
+end
+cpost
+ret steps
+end

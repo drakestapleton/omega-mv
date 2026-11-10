@@ -1,0 +1,308 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note native/abft evaluator checkers. Inputs: ga, gb (evaluator-generated), gobs (candidate bytes),
+note gd dims and the evaluator nonce stream 1. The fault-free reference gref is never read here.
+note dt 0: exact u32 products and sums mod 2^32. dt 1: bf16 inputs, f32 output, profile P1
+note (exact bf16 products, f32 sequential accumulation, |c^ - c| <= gamma_K(u) (|A||B|)_ij, u = 2^-24).
+note Checks use f64 (u' = 2^-53). Every comparison is written `not le d t` so NaN is detected.
+const UF f64 5.9604644775390625e-08
+const UD f64 1.1102230246251565e-16
+const SL f64 9.5367431640625e-07
+const MASK ulong 4294967295
+global ga ulong 65536
+global gb ulong 65536
+global gobs ulong 65536
+global gd ulong 8
+global xv f64 256
+global xh f64 256
+global xr f64 256
+global xu ulong 256
+global xq ulong 256
+global xm f64 1
+global xg f64 1
+fn dm to ulong
+ret get gd 1
+end
+fn dn to ulong
+ret get gd 2
+end
+fn dk to ulong
+ret get gd 3
+end
+fn ea i ulong k ulong to ulong
+ret get ga add mul i dk k
+end
+fn eb k ulong j ulong to ulong
+ret get gb add mul k dn j
+end
+fn ec i ulong j ulong to ulong
+ret get gobs add mul i dn j
+end
+fn gam n ulong u f64 to f64
+x = mul f64 n u
+ret div x sub 1.0 x
+end
+note Per-element bound (Wolfram-checked slack, docs/abft/CONTRACT.md section 3).
+fn gfull k ulong to f64
+ret mul add gam k UF gam k UD add 1.0 SL
+end
+note Two-sided checksum bound for one side: n is the summed output extent (N rows side, M cols side).
+fn gside n ulong k ulong to f64
+gp = gam k UF
+a = gam sub n 1 UD
+b = gam k UD
+t = add add gp mul a add 2.0 gp mul b add 1.0 a
+ret mul t add 1.0 SL
+end
+fn xmax d f64 t f64 to void
+if gt t 0.0
+put xm 0 fmax get xm 0 div d t
+end
+end
+fn fdotg i ulong j ulong to f64
+s = 0.0f64
+g = 0.0f64
+for k ulong dk
+p = mul bf ea i k bf eb k j
+s = add s p
+g = add g fabs p
+end
+put xg 0 g
+ret s
+end
+fn felem i ulong j ulong t0 f64 to bool
+s = fdotg i j
+d = fabs sub f3 ec i j s
+t = mul t0 get xg 0
+xmax d t
+ret not le d t
+end
+fn xdot i ulong j ulong to ulong
+s = ulong 0
+for k ulong dk
+s = add s mul ea i k eb k j
+end
+ret and s MASK
+end
+fn xelem i ulong j ulong to bool
+ret ne xdot i j and ec i j MASK
+end
+note Thorough mode: recompute every element.
+fn cfull to ulong
+put xm 0 0.0
+bad = ulong 0
+t0 = gfull dk
+for i ulong dm
+for j ulong dn
+if eq get gd 0 0
+if xelem i j
+bad = add bad 1
+end
+else
+if felem i j t0
+bad = add bad 1
+end
+end
+end
+end
+ret bad
+end
+note Sampled mode: S elements with replacement, positions from the evaluator nonce stream.
+fn csamp s ulong to ulong
+put xm 0 0.0
+bad = ulong 0
+t0 = gfull dk
+for q ulong s
+i = rbelow 1 dm
+j = rbelow 1 dn
+if eq get gd 0 0
+if xelem i j
+bad = add bad 1
+end
+else
+if felem i j t0
+bad = add bad 1
+end
+end
+end
+ret bad
+end
+fn fsign to f64
+if eq and rnext 1 1 0
+ret 1.0
+end
+ret -1.0
+end
+note FP right side: y = B r, rows test |A y - C r| against gside(N,K) (|A| (|B| e)).
+fn frow to ulong
+bad = ulong 0
+for j ulong dn
+put xr j fsign
+end
+for k ulong dk
+y = 0.0f64
+h = 0.0f64
+for j ulong dn
+b = bf eb k j
+y = add y mul b get xr j
+h = add h fabs b
+end
+put xv k y
+put xh k h
+end
+t0 = gside dn dk
+for i ulong dm
+if frowi i t0
+bad = add bad 1
+end
+end
+ret bad
+end
+fn frowi i ulong t0 f64 to bool
+z = 0.0f64
+g = 0.0f64
+for k ulong dk
+a = bf ea i k
+z = add z mul a get xv k
+g = add g mul fabs a get xh k
+end
+w = 0.0f64
+for j ulong dn
+w = add w mul f3 ec i j get xr j
+end
+d = fabs sub z w
+t = mul t0 g
+xmax d t
+ret not le d t
+end
+note FP left side: x = s^T A, columns test |x B - s^T C| against gside(M,K) ((e^T |A|) |B|).
+fn fcol to ulong
+bad = ulong 0
+for i ulong dm
+put xr i fsign
+end
+for k ulong dk
+x = 0.0f64
+h = 0.0f64
+for i ulong dm
+a = bf ea i k
+x = add x mul a get xr i
+h = add h fabs a
+end
+put xv k x
+put xh k h
+end
+t0 = gside dm dk
+for j ulong dn
+if fcolj j t0
+bad = add bad 1
+end
+end
+ret bad
+end
+fn fcolj j ulong t0 f64 to bool
+z = 0.0f64
+g = 0.0f64
+for k ulong dk
+b = bf eb k j
+z = add z mul get xv k b
+g = add g mul get xh k fabs b
+end
+w = 0.0f64
+for i ulong dm
+w = add w mul get xr i f3 ec i j
+end
+d = fabs sub z w
+t = mul t0 g
+xmax d t
+ret not le d t
+end
+note Exact right side: odd u32 multipliers r, y = B r mod 2^32, rows test A y = C r mod 2^32.
+fn xrow to ulong
+bad = ulong 0
+for j ulong dn
+put xu j or and rnext 1 MASK 1
+end
+for k ulong dk
+y = ulong 0
+for j ulong dn
+y = add y mul eb k j get xu j
+end
+put xq k y
+end
+for i ulong dm
+z = ulong 0
+for k ulong dk
+z = add z mul ea i k get xq k
+end
+w = ulong 0
+for j ulong dn
+w = add w mul ec i j get xu j
+end
+if ne and xor z w MASK 0
+bad = add bad 1
+end
+end
+ret bad
+end
+fn xcol to ulong
+bad = ulong 0
+for i ulong dm
+put xu i or and rnext 1 MASK 1
+end
+for k ulong dk
+x = ulong 0
+for i ulong dm
+x = add x mul get xu i ea i k
+end
+put xq k x
+end
+for j ulong dn
+z = ulong 0
+for k ulong dk
+z = add z mul get xq k eb k j
+end
+w = ulong 0
+for i ulong dm
+w = add w mul get xu i ec i j
+end
+if ne and xor z w MASK 0
+bad = add bad 1
+end
+end
+ret bad
+end
+note Checksum mode: one right and one left randomized check (failing rows plus failing columns).
+fn cabft to ulong
+put xm 0 0.0
+if eq get gd 0 0
+ret add xrow xcol
+end
+ret add frow fcol
+end
+note Common-mode guard: FNV-1a over dims and both inputs, compared with the generation-time digest.
+fn cdig to ulong
+h = ulong 14695981039346656037
+for q ulong 4
+h = fnvw h get gd q
+end
+for e ulong mul dm dk
+h = fnvw h get ga e
+end
+for e ulong mul dk dn
+h = fnvw h get gb e
+end
+ret h
+end
+note Structural: nonfinite f32 outputs (exponent all ones) counted; exact mode has none.
+fn cnonfin to ulong
+if eq get gd 0 0
+ret 0
+end
+bad = ulong 0
+for e ulong mul dm dn
+if eq and get gobs e 2139095040 2139095040
+bad = add bad 1
+end
+end
+ret bad
+end
