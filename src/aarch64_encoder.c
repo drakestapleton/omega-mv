@@ -1,3 +1,4 @@
+/* ORACLE: foreign reference, not on the gate path (seed rung 0/1/2; see seed/check/a64check.om). */
 /* SPDX-License-Identifier: Apache-2.0
  * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
  *

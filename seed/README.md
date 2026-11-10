@@ -48,7 +48,7 @@ it came from.
 - Checks (`rung0/gate0.sh`, results in `evidence/SEED-0/rung0/`):
   - seed-0 reading its own text produces itself, byte for byte;
   - every one of the 72 instructions is read back by two independent decoders (my own, in
-    `src/aarch64_decoder.c`, and GNU objdump), and both agree with the name written beside it:
+    `seed/check/a64check.om`, and GNU objdump), and both agree with the name written beside it:
     0 disagreements (`rung0/seed0.audit`, every word listed);
   - controls: a wrong name is caught; a bad character and a half-written word are refused.
   - Limit, said plainly: my own decoder does not know the "system call" instruction (SVC, 3 of the 72
@@ -1069,8 +1069,11 @@ full pin refresh; this draft must not be treated as installed or independently m
 
 ## How the checks stay honest
 
-- `check/a64check.c` and `check/audit.sh` are reference checks only. They call the repo's existing C
-  decoder and encoder and GNU objdump to compare; they never write a byte of any rung.
+- `check/a64check.om` and `check/audit.sh` are reference checks only. Rung 0 builds the Omega
+  decoder/encoder with the committed seeded `out/omc`; rungs 1 and 2 reuse it. No C compiler is
+  needed for these gates. GNU objdump remains the second independent decoder. The retained C
+  references are labelled ORACLE; none of these checks writes a byte of any rung.
+  Generated parity inputs are `omc/tests/a64-decode-cases.om` and `a64-encode-edge-cases.om`.
 - `check/audit2.sh` (GNU objdump) and `check/runner.c` (built with the C compiler) are reference checks
   for rungs 3 and 5 in the same way: one reads every instruction back, the other calls the functions
   both paths made and compares the answers. Neither writes a byte of any rung.

@@ -1,0 +1,918 @@
+om2
+note a64check.om -- REFERENCE CHECK ONLY for the seed chain (seed/README.md). It is never used to make a
+note byte of seed/. Seeded-Omega port of seed/check/a64check.c together with the two C files that program
+note links, src/aarch64_decoder.c (aarch64_decode_instruction) and src/aarch64_encoder.c (the legacy
+note emitters), so the hand-written words can be compared without a C compiler.
+note   a64check decode                    stdin: one hex word per line; stdout: the decoder's fields per word
+note   a64check encode <form> <args...>   one word from the legacy encoder for that form, as 8 hex digits
+note Parity contract with the C program (stdout, stderr and exit status byte for byte):
+note - decode reads stdin the way fgets with a 128-byte buffer does (chunks of at most 127 bytes, each
+note   ending at a newline or at the end of input) and reads each chunk the way strtoul base 16 does
+note   (leading C-locale space, a sign, an optional 0x, hex digits; overflow gives all ones), then keeps
+note   the low 32 bits. An unknown word prints op=INVALID with every field 0.
+note - encode reads each argument the way strtol base 0 does (sign, 0x hex, leading-0 octal, decimal,
+note   saturating at the long limits) and then converts it the way the C call does to the emitter's
+note   parameter type: bool, uint8_t, uint16_t, int16_t or int32_t (Aarch64Cond is read as int32_t).
+note - an out-of-range field prints "A64_LEGACY_FIELD_OUT_OF_RANGE aarch64_emit_FORM FIELD=VALUE" on
+note   stderr, like the C refuse(), and the program stops itself with SIGABRT (status 134 in sh), like abort().
+note - wrong form or argument count: "a64check: unknown form or argument count: FORM" on stderr, exit 2;
+note   anything else: the usage line on stderr, exit 2.
+note Not ported: aarch64_validate_code_buffer (a64check.c never calls it) and the "REFUSED" exit 1 path,
+note which the C program cannot reach (every emitter gets a 4-byte buffer at position 0).
+text tminl "9223372036854775808"
+text opn "INVALID ADD SUB MUL AND ORR EOR MOVZ RET B B_COND CBZ CBNZ MOVK ADR LDR STR LDRB STRB SUBS "
+text forms "add_reg sub_reg mul_reg and_reg orr_reg eor_reg subs_reg subs_imm mov_reg movz movk ret b b_cond cbz cbnz adr ldr_uoff str_uoff ldrb_uoff strb_uoff ldr_post str_post ldr_x_post str_x_post "
+text usage "usage: a64check decode | a64check encode <form> <args...>\n"
+text unk "a64check: unknown form or argument count: "
+text oor "A64_LEGACY_FIELD_OUT_OF_RANGE aarch64_emit_"
+text tdecode "decode"
+text tencode "encode"
+text hexd "0123456789abcdef"
+text tsf " sf="
+text trdq " rd="
+text trnq " rn="
+text trmq " rm="
+text timmq " imm16="
+text thwq " hw="
+text tbimq " bimm="
+text tcndq " cond="
+text topq "op="
+text trd "rd"
+text trn "rn"
+text trm "rm"
+text trt "rt"
+text tshift "shift"
+text timm26 "imm26"
+text tcond "cond"
+text timm19 "imm19"
+text timm21 "imm21"
+text tuoff "uoff"
+text tsimm9 "simm9"
+text timm12 "imm12"
+global ib uchar 65536
+global ist ulong 3
+global ob uchar 65536
+global oc ulong 1
+global lb uchar 128
+global ab uchar 131072
+global fm uchar 131072
+global fmn ulong 1
+global df ulong 9
+global av ulong 8
+
+note ---- output: one buffer, flushed to a descriptor when full and at the end ----
+note oflush: every pass writes at least one byte of at most len ob, so len ob passes suffice.
+fn oflush fd int to void
+off = ulong 0
+n = get oc 0
+while lt off n bound 65536
+w = write fd ob off sub n off
+if le w 0
+put oc 0 0
+ret
+end
+off = add off ulong w
+end
+put oc 0 0
+end
+
+fn oputb b uchar to void
+m = get oc 0
+if ge m len ob
+oflush 1
+m = get oc 0
+end
+put ob m b
+put oc 0 add m 1
+end
+
+fn oputt t view uchar * to void
+for i ulong len t
+oputb get t i
+end
+end
+
+fn oputn v ulong to void
+d = new uchar 20 0
+i = ulong 0
+x = v
+put d 0 uchar add rem x 10 48
+x = div x 10
+i = add i 1
+while gt x 0 bound 20
+put d i uchar add rem x 10 48
+x = div x 10
+i = add i 1
+end
+j = i
+while gt j 0 bound 20
+j = sub j 1
+oputb get d j
+end
+end
+
+note oputs: a signed value in decimal, as printf %lld does.
+fn oputs v long to void
+if lt v 0
+oputb 45
+if eq v -9223372036854775808
+oputt tminl
+ret
+end
+oputn ulong neg v
+ret
+end
+oputn ulong v
+end
+
+
+fn ohex8 x ulong to void
+for i ulong 8
+s = sub 28 mul i 4
+oputb get hexd and shr x s 15
+end
+end
+
+note oname: word k of opn, the C opname() table.
+fn oname k ulong to void
+w = ulong 0
+for i ulong len opn
+c = get opn i
+if eq c 32
+w = add w 1
+else
+if eq w k
+oputb c
+end
+end
+end
+end
+
+fn oputfm to void
+for i ulong get fmn 0
+oputb get fm i
+end
+end
+
+note ---- input: stdin in 64 KiB blocks ----
+fn getc to long
+p = get ist 0
+n = get ist 1
+if ge p n
+if ne get ist 2 0
+ret -1
+end
+r = read 0 ib 0 len ib
+if le r 0
+put ist 2 1
+ret -1
+end
+put ist 0 0
+put ist 1 ulong r
+p = get ist 0
+end
+c = get ib p
+put ist 0 add p 1
+ret long c
+end
+
+note rdline: one fgets chunk into lb: at most 127 bytes, ending after a newline; 0 only at end of input.
+fn rdline to ulong
+k = ulong 0
+while lt k 127 bound 128
+c = getc
+if lt c 0
+ret k
+end
+put lb k uchar c
+k = add k 1
+if eq c 10
+ret k
+end
+end
+ret k
+end
+
+note lc: byte i of the current chunk, or 0 (the C string end) past it.
+fn lc i ulong k ulong to ulong
+if lt i k
+ret ulong get lb i
+end
+ret 0
+end
+
+note ac: byte i of the current argument (length k in ab), or 0 past it.
+fn ac i ulong k ulong to ulong
+if lt i k
+ret ulong get ab i
+end
+ret 0
+end
+
+fn isspc c ulong to bool
+if eq c 32
+ret true
+end
+ret and ge c 9 le c 13
+end
+
+note dval: the value of a digit or letter in bases up to 36, 99 for anything else.
+fn dval c ulong to ulong
+if and ge c 48 le c 57
+ret sub c 48
+end
+if and ge c 97 le c 122
+ret sub c 87
+end
+if and ge c 65 le c 90
+ret sub c 55
+end
+ret 99
+end
+
+note pul: strtoul(chunk, NULL, 16) over lb[0..k).
+fn pul k ulong to ulong
+i = ulong 0
+while isspc lc i k bound 128
+i = add i 1
+end
+ng = false
+c = lc i k
+if eq c 45
+ng = true
+i = add i 1
+else
+if eq c 43
+i = add i 1
+end
+end
+if eq lc i k 48
+if eq or lc add i 1 k 32 120
+if lt dval lc add i 2 k 16
+i = add i 2
+end
+end
+end
+v = ulong 0
+ov = false
+d = dval lc i k
+while lt d 16 bound 130
+if gt v div sub 0xffffffffffffffff d 16
+ov = true
+end
+v = add mul v 16 d
+i = add i 1
+d = dval lc i k
+end
+if ov
+ret 0xffffffffffffffff
+end
+if ng
+ret neg v
+end
+ret v
+end
+
+note sl: strtol(argv[i], NULL, 0) as the bits of a long.
+fn sl i ulong to ulong
+n = argread i ab 0 len ab
+k = ulong 0
+if gt n 0
+k = ulong n
+end
+j = ulong 0
+while isspc ac j k bound 131080
+j = add j 1
+end
+ng = false
+c = ac j k
+if eq c 45
+ng = true
+j = add j 1
+else
+if eq c 43
+j = add j 1
+end
+end
+b = ulong 10
+if eq ac j k 48
+b = 8
+if eq or ac add j 1 k 32 120
+b = 16
+j = add j 2
+end
+end
+v = ulong 0
+ov = false
+d = dval ac j k
+while lt d b bound 131080
+if gt v div sub 0xffffffffffffffff d b
+ov = true
+end
+v = add mul v b d
+j = add j 1
+d = dval ac j k
+end
+if ov
+if ng
+ret 0x8000000000000000
+end
+ret 0x7fffffffffffffff
+end
+if ng
+if gt v 0x8000000000000000
+ret 0x8000000000000000
+end
+ret neg v
+end
+if gt v 0x7fffffffffffffff
+ret 0x7fffffffffffffff
+end
+ret v
+end
+
+note ---- the decoder (src/aarch64_decoder.c, same order of tests) ----
+fn f3 op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 31 1
+put df 2 and w 31
+put df 3 and shr w 5 31
+put df 4 and shr w 16 31
+end
+
+fn fcb op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 31 1
+put df 2 and w 31
+put df 7 and shr w 5 0x7ffff
+end
+
+fn fmv op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 31 1
+put df 2 and w 31
+put df 5 and shr w 5 0xffff
+put df 6 and shr w 21 3
+end
+
+fn fls op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 30 1
+put df 2 and w 31
+put df 3 and shr w 5 31
+end
+
+fn dec w ulong to void
+for i ulong 9
+put df i 0
+end
+if eq w 0xd65f03c0
+put df 0 8
+put df 3 30
+ret
+end
+if eq and w 0xfc000000 0x14000000
+put df 0 9
+put df 7 and w 0x3ffffff
+ret
+end
+if eq and w 0xff000010 0x54000000
+put df 0 10
+put df 8 and w 15
+put df 7 and shr w 5 0x7ffff
+ret
+end
+if eq and w 0x7f000000 0x34000000
+fcb 11 w
+ret
+end
+if eq and w 0x7f000000 0x35000000
+fcb 12 w
+ret
+end
+if eq and w 0x7f800000 0x52800000
+fmv 7 w
+ret
+end
+if eq and w 0x7fe07c00 0x1b007c00
+f3 3 w
+ret
+end
+dec2 w
+end
+
+fn dec2 w ulong to void
+m = and w 0x7f200000
+if eq m 0xa000000
+f3 4 w
+ret
+end
+if eq m 0x2a000000
+f3 5 w
+ret
+end
+if eq m 0x4a000000
+f3 6 w
+ret
+end
+if eq m 0xb000000
+f3 1 w
+ret
+end
+if eq m 0x4b000000
+f3 2 w
+ret
+end
+if eq and w 0x7f800000 0x72800000
+fmv 13 w
+ret
+end
+if eq and w 0x9f000000 0x10000000
+put df 0 14
+put df 2 and w 31
+ret
+end
+dec3 w
+end
+
+fn dec3 w ulong to void
+if eq and w 0xbf400000 0xb9400000
+fls 15 w
+ret
+end
+if eq and w 0xbf400000 0xb9000000
+fls 16 w
+ret
+end
+if eq and w 0xbfe00400 0xb8400400
+fls 15 w
+ret
+end
+if eq and w 0xbfe00400 0xb8000400
+fls 16 w
+ret
+end
+if eq and w 0xffc00000 0x39400000
+fls 17 w
+put df 1 0
+ret
+end
+if eq and w 0xffc00000 0x39000000
+fls 18 w
+put df 1 0
+ret
+end
+if eq and w 0x7f800000 0x71000000
+f3 19 w
+put df 4 0
+ret
+end
+if eq and w 0x7f200000 0x6b000000
+f3 19 w
+ret
+end
+end
+
+fn decline to void
+oputt topq
+oname get df 0
+oputt tsf
+oputn get df 1
+oputt trdq
+oputn get df 2
+oputt trnq
+oputn get df 3
+oputt trmq
+oputn get df 4
+oputt timmq
+oputn get df 5
+oputt thwq
+oputn get df 6
+oputt tbimq
+oputn get df 7
+oputt tcndq
+oputn get df 8
+oputb 10
+end
+
+fn decode to int
+while true bound 9223372036854775807
+k = rdline
+if eq k 0
+oflush 1
+ret 0
+end
+dec and pul k 0xffffffff
+decline
+end
+oflush 1
+ret 0
+end
+
+note ---- the legacy encoder (src/aarch64_encoder.c) ----
+note refuse: the C refuse(): one stderr line, then SIGABRT like abort().
+fn refuse f view uchar * v long to void
+put oc 0 0
+oputt oor
+oputfm
+oputb 32
+oputt f
+oputb 61
+oputs v
+oputb 10
+oflush 2
+r = killpid int getpid 6
+exit 134
+end
+
+fn creg r ulong f view uchar * to void
+if gt r 31
+refuse f long r
+end
+end
+
+note csig: CHECK_SIGNED(v, bits) on the value the C parameter holds.
+fn csig v long bits ulong f view uchar * to void
+h = long shl ulong 1 sub bits 1
+if or lt v neg h ge v h
+refuse f v
+end
+end
+
+fn cumax v ulong f view uchar * to void
+if gt v 0xfff
+refuse f long v
+end
+end
+
+fn cv8 x ulong to ulong
+ret and x 255
+end
+
+fn cv16 x ulong to ulong
+ret and x 0xffff
+end
+
+fn s16 x ulong to long
+v = and x 0xffff
+if ge v 0x8000
+ret sub long v 65536
+end
+ret long v
+end
+
+fn s32 x ulong to long
+v = and x 0xffffffff
+if ge v 0x80000000
+ret sub long v 4294967296
+end
+ret long v
+end
+
+fn bsf x ulong to ulong
+if ne x 0
+ret 1
+end
+ret 0
+end
+
+note formid: 1-based index of the form name in forms, 0 when it is not one.
+fn formid to ulong
+id = ulong 1
+st = ulong 0
+n = get fmn 0
+for i ulong len forms
+if eq get forms i 32
+if eq sub i st n
+if fmeq st
+ret id
+end
+end
+id = add id 1
+st = add i 1
+end
+end
+ret 0
+end
+
+fn fmeq st ulong to bool
+for i ulong get fmn 0
+if ne get fm i get forms add st i
+ret false
+end
+end
+ret true
+end
+
+note needc: the argc the C chain requires for form id.
+fn needc id ulong to long
+if le id 8
+ret 7
+end
+if le id 9
+ret 6
+end
+if le id 11
+ret 7
+end
+if eq id 12
+ret 3
+end
+if eq id 13
+ret 4
+end
+if eq id 14
+ret 5
+end
+if le id 16
+ret 6
+end
+if eq id 17
+ret 5
+end
+if le id 19
+ret 7
+end
+ret 6
+end
+
+fn a3base id ulong to ulong
+if eq id 1
+ret 0xb000000
+end
+if eq id 2
+ret 0x4b000000
+end
+if eq id 3
+ret 0x1b007c00
+end
+if eq id 4
+ret 0xa000000
+end
+if eq id 5
+ret 0x2a000000
+end
+if eq id 6
+ret 0x4a000000
+end
+ret 0x6b000000
+end
+
+note enc3: add_reg .. subs_reg (ids 1..7): sf rd rn rm, CHECK3.
+fn enc3 id ulong to ulong
+sf = bsf get av 3
+rd = cv8 get av 4
+rn = cv8 get av 5
+rm = cv8 get av 6
+creg rd trd
+creg rn trn
+creg rm trm
+ret or or or or shl sf 31 a3base id shl rm 16 shl rn 5 rd
+end
+
+fn encsi to ulong
+sf = bsf get av 3
+rd = cv8 get av 4
+rn = cv8 get av 5
+im = cv16 get av 6
+creg rd trd
+creg rn trn
+cumax im timm12
+ret or or or or shl sf 31 0x71000000 shl im 10 shl rn 5 rd
+end
+
+fn encmov to ulong
+sf = bsf get av 3
+rd = cv8 get av 4
+rm = cv8 get av 5
+creg rd trd
+creg rm trm
+ret or or or or shl sf 31 0x2a000000 shl rm 16 0x3e0 rd
+end
+
+fn encmz base ulong to ulong
+sf = bsf get av 3
+rd = cv8 get av 4
+im = cv16 get av 5
+s = cv8 get av 6
+creg rd trd
+mx = ulong 16
+if ne sf 0
+mx = 48
+end
+if or ne rem s 16 0 gt s mx
+refuse tshift long s
+end
+hw = and div s 16 3
+ret or or or or shl sf 31 base shl hw 21 shl im 5 rd
+end
+
+fn encb to ulong
+x = get av 3
+csig s32 x 26 timm26
+ret or 0x14000000 and x 0x3ffffff
+end
+
+fn encbc to ulong
+c = s32 get av 3
+if or lt c 0 gt c 15
+refuse tcond c
+end
+x = get av 4
+csig s32 x 19 timm19
+ret or or 0x54000000 shl and x 0x7ffff 5 and get av 3 15
+end
+
+fn enccb base ulong to ulong
+sf = bsf get av 3
+rt = cv8 get av 4
+x = get av 5
+creg rt trt
+csig s32 x 19 timm19
+ret or or or shl sf 31 base shl and x 0x7ffff 5 rt
+end
+
+fn encadr to ulong
+rd = cv8 get av 3
+x = get av 4
+creg rd trd
+csig s32 x 21 timm21
+lo = shl and x 3 29
+hi = shl and shr and x 0xffffffff 2 0x7ffff 5
+ret or or or 0x10000000 lo hi rd
+end
+
+fn encuo ld bool to ulong
+sf = bsf get av 3
+rt = cv8 get av 4
+rn = cv8 get av 5
+uo = cv16 get av 6
+creg rt trt
+creg rn trn
+sz = ulong 4
+sc = ulong 2
+if ne sf 0
+sz = 8
+sc = 3
+end
+if or ne rem uo sz 0 gt div uo sz 0xfff
+refuse tuoff long uo
+end
+base = ulong 0xb9000000
+if ne sf 0
+base = 0xf9000000
+end
+if ld
+base = or base 0x400000
+end
+ret or or or base shl and shr uo sc 0xfff 10 shl rn 5 rt
+end
+
+fn encbo base ulong to ulong
+rt = cv8 get av 3
+rn = cv8 get av 4
+uo = cv16 get av 5
+creg rt trt
+creg rn trn
+cumax uo tuoff
+ret or or or base shl and uo 0xfff 10 shl rn 5 rt
+end
+
+fn encpo base ulong to ulong
+rt = cv8 get av 3
+rn = cv8 get av 4
+x = get av 5
+creg rt trt
+creg rn trn
+csig s16 x 9 tsimm9
+ret or or or base shl and x 0x1ff 12 shl rn 5 rt
+end
+
+fn encid id ulong to ulong
+if le id 7
+ret enc3 id
+end
+if eq id 8
+ret encsi
+end
+if eq id 9
+ret encmov
+end
+if eq id 10
+ret encmz 0x52800000
+end
+if eq id 11
+ret encmz 0x72800000
+end
+if eq id 12
+ret 0xd65f03c0
+end
+if eq id 13
+ret encb
+end
+if eq id 14
+ret encbc
+end
+if eq id 15
+ret enccb 0x34000000
+end
+if eq id 16
+ret enccb 0x35000000
+end
+if eq id 17
+ret encadr
+end
+ret encid2 id
+end
+
+fn encid2 id ulong to ulong
+if eq id 18
+ret encuo true
+end
+if eq id 19
+ret encuo false
+end
+if eq id 20
+ret encbo 0x39400000
+end
+if eq id 21
+ret encbo 0x39000000
+end
+if eq id 22
+ret encpo 0xb8400400
+end
+if eq id 23
+ret encpo 0xb8000400
+end
+if eq id 24
+ret encpo 0xf8400400
+end
+ret encpo 0xf8000400
+end
+
+fn encode to int
+n = argread 2 fm 0 len fm
+if lt n 0
+n = 0
+end
+put fmn 0 ulong n
+id = formid
+c = argcnt
+if eq id 0
+oputt unk
+oputfm
+oputb 10
+oflush 2
+ret 2
+end
+if ne c needc id
+oputt unk
+oputfm
+oputb 10
+oflush 2
+ret 2
+end
+for i ulong 7
+if ge i 3
+if lt long i c
+put av i sl i
+end
+end
+end
+w = encid id
+ohex8 w
+oputb 10
+oflush 1
+ret 0
+end
+
+note argis: argument 1 equals text t.
+fn argis t view uchar * to bool
+n = argread 1 ab 0 len ab
+if ne n long len t
+ret false
+end
+for i ulong len t
+if ne get ab i get t i
+ret false
+end
+end
+ret true
+end
+
+fn main to int
+c = argcnt
+if eq c 2
+if argis tdecode
+ret decode
+end
+end
+if ge c 3
+if argis tencode
+ret encode
+end
+end
+oputt usage
+oflush 2
+ret 2
+end
