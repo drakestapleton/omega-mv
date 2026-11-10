@@ -29,7 +29,7 @@ note   Order: block b (0 .. WARM+BLOCKS-1), for every CASE: the present arms p0 
 note   b, then the same sequence reversed (A B B A for two arms), so every arm runs twice per block at
 note   mirrored positions. Blocks below WARM are warm-up, flagged warm=1.
 note Rows (stdout, one per line, space separated):
-note   H ngbench v2 blocks=B warm=W cpus=LIST core=N|unpinned clustermask=M load=LOADAVG
+note   H ngbench v3 blocks=B warm=W cpus=LIST core=N|unpinned clustermask=M load=LOADAVG
 note   A CASE ARM SHA256 BYTES | A CASE ARM absent      I CASE SHA256 BYTES (stdin file)
 note   L BLOCK LOADAVG          at every block start
 note   T BLOCK WARM CASE ARM POS WALL_NS STATUS OK INPROC_NS
@@ -43,11 +43,15 @@ note   excluded. Read between runs, never inside a timed interval.
 note   X BLOCK CASE PH PID TID COMM CPU STATE   a task last on core N (any state), or runnable (R) or in
 note                            uninterruptible sleep (D) on another CPU of the cluster; spaces in COMM
 note                            become _
-note   Y BLOCK CASE PH tasks=N cluster=N xrows=N core_foreign_runnable=N errors=N   the counts of the
-note                            scan: every task read, those last on the cluster, the X rows, the R tasks
-note                            on core N, and the task stat files that could not be parsed
-note   K BLOCK CASE start=N end=N contaminated=0|1   core_foreign_runnable of the two scans; 1 when
-note                            either is above 0
+note   Y BLOCK CASE PH tasks=N cluster=N xrows=N core_foreign_runnable=N errors=N ollm=N gpuline=N
+note                            the counts of the scan: every task read, those last on the cluster, the X
+note                            rows, the R tasks on core N, the task stat files that could not be parsed,
+note                            and (v3, PREREG-slice.md) the processes anywhere on the machine (main task,
+note                            TID = PID) whose COMM starts with "ollm" (model serve, train, gtrain4) or
+note                            with "spark-window" (a GB10/quiet window held, waited for or queried)
+note   K BLOCK CASE start=N end=N contaminated=0|1 busy=0|1   start/end: core_foreign_runnable of the
+note                            two scans; contaminated 1 when either is above 0; busy (v3) 1 when either
+note                            scan counted an ollm or spark-window process
 note   R REASON CASE ARM        refusals (also on stderr), REASON in kind label unlisted manifest
 note                            missing nowant status output changed input; label also covers a binary
 note                            that is present (open does not fail with ENOENT) but cannot be opened or
@@ -75,7 +79,7 @@ text tdd "--"
 text tsp " "
 text tsp2 "  "
 text tnl "\n"
-text tH "H ngbench v2 blocks="
+text tH "H ngbench v3 blocks="
 text twarm " warm="
 text tcpu " cpus="
 text tld " load="
@@ -123,6 +127,11 @@ text terrs " errors="
 text tkst " start="
 text tken " end="
 text tkc " contaminated="
+text tollm " ollm="
+text tgpl " gpuline="
+text tkbz " busy="
+text tpollm "ollm"
+text tpswin "spark-window"
 note gpb: the path being built; gpk: the exec packet; glb: the output line; gfb: a whole file
 note (binaries, manifest pieces, small text files); gmb: the manifest; gwx: want hex per case;
 note ghx: hex of gdg, the last digest; gpr: present flags [case*16+arm]; gpl/gord: arm order
@@ -151,9 +160,11 @@ global gcnt ulong 8
 global gdn uchar 65536
 global gdt uchar 65536
 global gtb uchar 1024
-global gsc ulong 16
+global gsc ulong 20
 note gsc: 0 timed core (99999 unpinned), 1 cluster mask, 2 own pid, 3 foreign R on the core, 4 tasks
-note read, 5 tasks on the cluster, 6 X rows, 7 parse errors, 8 state byte, 9 cpu, 10/11 comm start/end
+note read, 5 tasks on the cluster, 6 X rows, 7 parse errors, 8 state byte, 9 cpu, 10/11 comm start/end,
+note 12/13/14 block, case, phase of the scan, 15 ollm processes, 16 spark-window processes, 17/18 their
+note sum in the start / end scan
 note gcfg: 0 blocks, 1 warm, 2 DIR arg index, 3 first arm arg, 4 arm count, 5 first case arg,
 note 6 case count, 7 inproc line valid. gcnt: 0 rows, 1 ok, 2 fail, 3 refused.
 
@@ -803,10 +814,12 @@ for i ulong np
 put gord add np i get gord sub sub np 1 i
 end
 sa = scanph b c 0
+put gsc 17 add get gsc 15 get gsc 16
 for p ulong shl np 1
 dotime b c get gord p p
 end
 se = scanph b c 1
+put gsc 18 add get gsc 15 get gsc 16
 krow b c sa se
 end
 end
@@ -949,6 +962,8 @@ put gsc 4 0
 put gsc 5 0
 put gsc 6 0
 put gsc 7 0
+put gsc 15 0
+put gsc 16 0
 fd = fopen tproc 0 len tproc 0 0
 if lt fd 0
 put gsc 7 1
@@ -1083,6 +1098,14 @@ end
 taskdec pid tid
 end
 fn taskdec pid ulong tid ulong to void
+if eq pid tid
+if cpref tpollm
+put gsc 15 add get gsc 15 1
+end
+if cpref tpswin
+put gsc 16 add get gsc 16 1
+end
+end
 cpu = get gsc 9
 incl = false
 if lt cpu 64
@@ -1105,6 +1128,20 @@ end
 if and incl or eq st 82 eq st 68
 xrow pid tid
 end
+end
+note the COMM of the parsed task (gtb[gsc 10 .. gsc 11)) starts with t
+fn cpref t view uchar * to bool
+s = get gsc 10
+e = get gsc 11
+if lt sub e s len t
+ret false
+end
+for k ulong len t
+if ne get gtb add s k get t k
+ret false
+end
+end
+ret true
 end
 note gtb[0 .. n): PID (COMM) STATE ... ; COMM is up to the last ')'; field 39 (processor) is the 37th
 note space-separated field from STATE
@@ -1217,6 +1254,10 @@ lbtext tcfr
 lbnum get gsc 3
 lbtext terrs
 lbnum get gsc 7
+lbtext tollm
+lbnum get gsc 15
+lbtext tgpl
+lbnum get gsc 16
 lbflush 1
 end
 fn krow b ulong c ulong sa ulong se ulong to void
@@ -1233,6 +1274,12 @@ lbtext tken
 lbnum se
 lbtext tkc
 if or gt sa 0 gt se 0
+lbnum 1
+else
+lbnum 0
+end
+lbtext tkbz
+if or gt get gsc 17 0 gt get gsc 18 0
 lbnum 1
 else
 lbnum 0
