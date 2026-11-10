@@ -21,10 +21,10 @@ The packed C2 manifest is surveyed separately.
 | bool, uchar/u8, ushort/u16, uint/u32, ulong/u64, byte/i8, short/i16, int/i32, long/i64, f32, f64, void | P | Fixture-scoped only; generally unproven | bool const/type reader; qty absent |
 | qty | N | NOT_RUN | qty values/storage/conversions/checked unsigned arithmetic |
 | add sub mul div rem and or xor eq ne lt le gt ge neg not | P | Fixture-scoped only; generally unproven | qty/abstract operands absent |
-| shl shr | P | Fixture-scoped only; generally unproven | unequal operand types exit 64 |
+| shl shr | Y (ng-groups-4) | Fixture-scoped only (cases/sh_mix*.om); generally unproven | a bool or float amount, which omc admits, exits 64 (cases-lower-scope.txt) |
 | rotr rotl | P | Fixture-scoped only; generally unproven | abstract operands absent |
 | fsqrt fabs bitcast | Y | Fixture-scoped only; generally unproven | subject to operand construct coverage |
-| fmin fmax fma | N | NOT_RUN | no expression dispatcher |
+| fmin fmax fma | P: fma Y (ng-groups-4) | fma fixture-scoped only (cases/fma_mix.om, fused against unfused); fmin/fmax NOT_RUN | fmin/fmax exit 64 until IR.md's signaling-NaN rule lands (NgIrOracle 36edfca2) |
 | true false = ( ) | Y | Fixture-scoped only; generally unproven |  |
 | get put len new | P | Fixture-scoped only; generally unproven | scalar arrays only; structs/layout fields absent |
 | view edit part | P | Fixture-scoped only; generally unproven | sized view text arguments absent; fresh signature token absent |
@@ -48,12 +48,12 @@ The packed C2 manifest is surveyed separately.
 
 1. Host effects: fclose 134, fopen 119, argcnt 111, argread 104, fork 71, waitpid 65, sleepns 58,
    unlink 52, killpid 47, execprog 45. Lowered host clocks: monons 103, realns 14.
-2. Shift operand types: shl 259, shr 230. Baseline survey first blocker in 131 packed/current inputs.
+2. Shift operand types: shl 259, shr 230. Baseline survey first blocker in 131 packed/current inputs. (ng-groups-4 lowers integer value/amount mixes; the survey was not rerun, so the 131 is the baseline count.)
 3. Data edge cases: arrays new 445, globals 331, text 308, view 316, edit 259, const 103, qty 75;
    layout 71, field 68, struct 63; fresh 45; nominal abstract 52, holds 67, seal 49, open 34.
 4. Contracts: requires 30, ensures 18, invariant 17, result 21; header policies on each file's first om2 line:
    release 12, debug 1, diag 46 (fmt 11).
-5. Float intrinsics: fma 16, fmin 7, fmax 7; hygiene scrub 13, dit 7.
+5. Float intrinsics: fma 16, fmin 7, fmax 7; hygiene scrub 13, dit 7. (ng-groups-4 lowers fma; fmin/fmax remain.)
 6. Units: export 28, out 72 (whole-word counts include prose); function-mode IR entry requires an IR-owner change.
 
 All ordinary loop/branch forms already have lowering; they need complete fixtures, not a replacement parser.
@@ -201,5 +201,24 @@ explicitly unsupported language boundary, not a successful contract implementati
    now use Wolfram-verified power-of-two constructions within fparse mantissa limits, but those final
    spellings are NOT_RUN. Do not claim the candidate READY until all cases and negative controls pass.
 3. Host lowering is deferred in the ham/NEXT.md row titled "NG front: typed lowering for all 94 current
-   host words" (that file has two rows numbered 20; cite the title, not the number). Function-mode units, mixed shifts, the data gaps,
+   host words" (that file has two rows numbered 20; cite the title, not the number). Function-mode units, the data gaps,
    remaining intrinsics and hygiene words remain not lowered or unproven as itemized above.
+
+## ng-groups-4 (2026-11-10, branch ham/ng-front-groups-4)
+
+Two groups lowered, IMPLEMENTED and host-EXERCISED by gate-front-ir only (no QUALIFIED claim):
+
+- Mixed-type shifts. omc admits `shl`/`shr` whose integer value and amount have different types and
+  compares the amount's 64-bit register (sign- or zero-extended by its type) unsigned with the value's
+  width (`bo_schk`, trap 7). `fe_lsham` emits `conv` to u64, `lt` the width, `chk.true 7`, then `conv` to
+  the value's type (exact below the width); the existing checks of `fe_lbop` follow (signed `shl` keeps
+  `chk.shl` trap 1). Run cases `sh_mix` (ten type pairs), `sh_mix_wrap` (uchar by ulong 256: 107, never
+  a wrapped shift by 0), `sh_mix_neg` (ulong by int -1: 107), `sh_mix_width` (uint by 31 and 32: 107),
+  `sh_mix_sovf` (int 2 by uchar 30: 101). A rotate keeps one type (omc error 7, refuse case `rot_mix`).
+  A bool or float amount stays not lowered (exit 64, `cases-lower-scope.txt`).
+- fma. ΩIR `fma` (46), one rounding, three operands of one float type; `fma_mix` prints f64 and f32
+  results whose fused and unfused values differ. omc's refusals stay (`fma_lit` 11, `fma_types` 7).
+
+Still not lowered from these rows: fmin and fmax (IR.md min/max says a NaN operand gives the other,
+while OMEGESE and omc follow FMINNM/FMAXNM, where a signaling NaN gives a quiet NaN; NgIrOracle head
+36edfca2, which corrects IR.md and ngrun, is not on main).
