@@ -1,0 +1,1136 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/src/opt.om: the ΩIR optimizer of the ng compiler (Hive NG D16, M3). Owner: ng-ir lane. A unit of
+note seed/ng/ng.units after ir.om; no fn main. Functions op_*, globals o_*. It rewrites the ir.om tables in place
+note between ir_read and ir_wr (main's modes `@ng opt` and `@ng opt-count`): it moves ops between blocks and
+note blocks within a function, adds blocks and drops ops, through the same lists ir_wr walks.
+note Per function, in order:
+note 1. Preheaders. Every natural loop (header h, a back edge u -> h with h dominating u, the loop being the blocks
+note    that reach a latch without passing h) gets one block outside it that is h's only predecessor from outside:
+note    the existing one when h has exactly one outside predecessor and it ends in `br h`; otherwise a new block,
+note    placed before h, with h's parameter types, ending in `br h` with them, which every outside predecessor
+note    branches to instead (same arguments). A new block is added only within IR.md s12 (op_room); a loop
+note    that would need one past the limits keeps none, and LICM skips it.
+note 1a. PHI (after the preheaders). A block parameter other than the token whose arguments, over every `br` that
+note    targets its block, are one value v or the parameter itself is replaced by v: every use takes v, and the
+note    parameter leaves the block and the matching argument every such `br` (a block with a parameter past its
+note    token is reached by `br` only, IR.md s9 rule 5). v dominates the block (IR.md s6.2): on any path from block
+note    0 the edge that first enters the block comes from a predecessor it does not dominate, whose `br` passes v,
+note    and v dominates that `br`. One parameter per round, to a
+note    fixed point. Every value an outer loop carries unchanged through an inner loop's header is such a
+note    parameter; once it is gone LICM sees its uses as invariant and the back end moves nothing for it.
+note 2. BCE (IR.md s15 item 1, origin 1 of the pass table below). A `chk.bounds r i e` is deleted when e is a
+note    const >= 1, r a REF to an ARRAY of count L, and i < X is known where the check runs, with X - 1 + e <= L:
+note    i is a const (X = i + 1), or a block on the check's dominator path has one predecessor, which ends in
+note    a `cbr` on `lt`/`le`/`gt`/`ge` of i and a const (either edge, read accordingly), so that block runs
+note    only after the test said i < X. The check is replaced in place by `fact.inbounds 1 r i e`, which keeps
+note    every access covered (s8). A `chk.divz` of a nonzero const is deleted. Uses of a deleted check's
+note    output token take its input token, so the chain stays linear (s6.4).
+note 3. LICM, innermost loop first. An op of the loop (blocks in reverse postorder, ops in order) moves to the end
+note    of the preheader, before its `br`, when its class is P (IR.md s6.4: no token; every P op is total, s7.3, so
+note    it may run on a path where it did not), it defines a value, it is not `shared` (block 0 only) and not
+note    convergent (`sync`, `shfl`, `mmald`, `mmast`, `mma`: IR.md s7.12, never moved into or out of a branch, and a
+note    loop body is one; refused by number, whatever their class), and
+note    every operand is defined outside the loop. Checks, loads, stores, calls, host words, facts and terminators
+note    never move: the token chain and coverage (s6.4, s8, s15) fix their places. An op equal to one already in the
+note    preheader (op, type, imm and operands) is dropped and its uses take the earlier value.
+note 4. ROT. A loop whose header ends in `cbr` with one target in the loop and one outside, and whose one latch
+note    ends in `br h`, gets its header placed right after that latch. The block order is the layout a back end
+note    emits (a64 falls through to the next block and branches on one side of a `cbr`), so the back branch falls
+note    through into the test and the loop is tested at the bottom: one conditional branch per pass. Block order
+note    changes no value: uses are judged by dominance (s6.2).
+note PHI, BCE and LICM run again, in that order, while one of them changed something: LICM's merging gives two
+note `br` arguments one value, which makes a parameter redundant only after PHI ran (ngrand seed 523), so one
+note round alone left `@ng opt` short of a fixed point. ROT runs once, after the last round.
+note Pass table (fact origins, IR.md s7.10): 1 BCE.
+note `@ng opt-count` runs the same passes and prints one line instead of the unit:
+note "opt fns=F loops=L inloop=A->B phi=Q bce=C hoisted=H merged=M rotated=R preheaders=P": L natural loops (by header),
+note A and B the executing ops in loop blocks before and after (static, terminators included, facts not; a block
+note counts once however
+note deeply it nests), C checks deleted by BCE, H moves of an op out of a loop (an op leaving two nested loops counts twice; M of them
+note dropped as equal to one already in the preheader), R headers placed after their latch, P preheader blocks
+note added, Q block parameters removed by PHI. Counts of passes added after the first four (PHI and later) come
+note before " bce=", so the line still ends " bce=C hoisted=H merged=M rotated=R preheaders=P"; the gate's
+note fixed-point check reads the tail from " phi=" on (gate-ir.om q_fx), so a pass placed before PHI's count
+note must extend q_fx to be covered.
+note
+note per block handle: o_bp position in its function, o_bl block at position, o_rn reverse postorder number (from
+note 1; 0 not reached), o_ro block at rpo number, o_id immediate dominator, o_pc predecessor count, o_p0 first
+note predecessor in o_pl, o_lm loop mark (a stamp), o_sk next successor in the depth-first walk, o_in in a loop
+global o_bp uint 1048577
+global o_bl uint 1048577
+global o_rn uint 1048577
+global o_ro uint 1048578
+global o_id uint 1048577
+global o_pc uint 1048577
+global o_p0 uint 1048577
+global o_pl uint 2097154
+global o_lm uint 1048577
+global o_sk uchar 1048577
+global o_in uchar 1048577
+global o_st uint 1048577
+global o_po uint 1048577
+global o_hd uint 1048577
+global o_hz ulong 1048577
+note o_n: 0 blocks of the function, 1 loop stamp, 2 headers, 3 hoisted, 4 merged, 5 rotated, 6 preheaders added,
+note 7 loops, 8 in-loop ops before, 9 after, 10 blocks reached, 11 current function, 12 output error (27),
+note 13 checks deleted, 14 block parameters removed by PHI
+global o_n ulong 32
+text o_msg "opt fns= loops= inloop=-> phi= bce= hoisted= merged= rotated= preheaders=\n"
+note o_pv: per value, the one argument seen for that block parameter (0 none yet, 4294967295 more than one)
+global o_pv uint 8388609
+global o_dig uchar 24
+note ---- control flow ----------------------------------------------------------------------------
+note successors of block b: br has one (slot 0), cbr two (slots 2, 3), other terminators none
+fn op_nsu b uint to ulong
+t = get i_bot b
+if eq t 0
+ret 0
+end
+op = get i_oop t
+if eq op 60
+ret 1
+end
+if eq op 61
+ret 2
+end
+ret 0
+end
+fn op_su b uint k ulong to uint
+t = get i_bot b
+if eq get i_oop t 60
+ret ir_arg t 0
+end
+ret ir_arg t uint add k 2
+end
+note blocks of f in order (o_bl, o_bp), analysis fields cleared
+fn op_scan f uint to void
+b = get i_fb1 f
+k = uint 0
+while ne b 0 bound 1048577
+put o_bl k b
+put o_bp b k
+put o_rn b 0
+put o_id b 0
+put o_pc b 0
+put o_lm b 0
+k = add k 1
+b = get i_bnx b
+end
+put o_n 0 ulong k
+end
+note predecessor lists: counts, then starts, then the lists (o_pc ends as the counts again)
+fn op_preds to void
+n = get o_n 0
+for j ulong n bound 1048577
+b = get o_bl j
+for k ulong op_nsu b bound 2
+s = op_su b k
+put o_pc s add get o_pc s 1
+end
+end
+c = uint 0
+for j ulong n bound 1048577
+b = get o_bl j
+put o_p0 b c
+c = add c get o_pc b
+put o_pc b 0
+end
+for j ulong n bound 1048577
+op_pfill get o_bl j
+end
+end
+fn op_pfill b uint to void
+for k ulong op_nsu b bound 2
+s = op_su b k
+put o_pl add get o_p0 s get o_pc s b
+put o_pc s add get o_pc s 1
+end
+end
+fn op_pred b uint k ulong to uint
+ret get o_pl add ulong get o_p0 b k
+end
+note reverse postorder from the entry block: an explicit depth-first walk (o_st), postorder into o_po
+fn op_rpo to void
+e = get o_bl 0
+put o_st 0 e
+put o_sk e 0
+put o_rn e 1
+sp = ulong 1
+po = ulong 0
+while gt sp 0 bound 4194304
+b = get o_st sub sp 1
+k = ulong get o_sk b
+if lt k op_nsu b
+put o_sk b uchar add k 1
+sp = op_push b k sp
+else
+sp = sub sp 1
+put o_po po b
+po = add po 1
+end
+end
+for i ulong po bound 1048577
+b = get o_po i
+r = sub po i
+put o_rn b uint r
+put o_ro r b
+end
+put o_n 10 po
+end
+fn op_push b uint k ulong sp ulong to ulong
+s = op_su b k
+if ne get o_rn s 0
+ret sp
+end
+put o_rn s 1
+put o_sk s 0
+put o_st sp s
+ret add sp 1
+end
+note immediate dominators (Cooper, Harvey and Kennedy: iterate in reverse postorder to a fixed point)
+fn op_dom to void
+m = get o_n 10
+e = get o_ro 1
+put o_id e e
+ch = true
+while ch bound 1048577
+ch = false
+for r ulong sub m 1 bound 1048577
+b = get o_ro add r 2
+d = op_idm b
+if ne d get o_id b
+put o_id b d
+ch = true
+end
+end
+end
+end
+fn op_idm b uint to uint
+d = uint 0
+for k ulong ulong get o_pc b bound 1048577
+p = op_pred b k
+if ne get o_id p 0
+if eq d 0
+d = p
+else
+d = op_int p d
+end
+end
+end
+ret d
+end
+fn op_int a uint b uint to uint
+x = a
+y = b
+while ne x y bound 1048577
+while gt get o_rn x get o_rn y bound 1048577
+x = get o_id x
+end
+while gt get o_rn y get o_rn x bound 1048577
+y = get o_id y
+end
+end
+ret x
+end
+note block a dominates block b
+fn op_doms a uint b uint to bool
+x = b
+while true bound 1048577
+if eq x a
+ret true
+end
+y = get o_id x
+if eq y x
+ret false
+end
+x = y
+end
+ret false
+end
+fn op_ana f uint to void
+put o_n 11 ulong f
+op_scan f
+op_preds
+op_rpo
+op_dom
+end
+note ---- loops ---------------------------------------------------------------------------------
+note loop headers of the analysed function into o_hd (count o_n 2): blocks with a predecessor they dominate
+fn op_hdrs to void
+c = ulong 0
+for r ulong get o_n 10 bound 1048577
+h = get o_ro add r 1
+if op_ishd h
+put o_hd c h
+c = add c 1
+end
+end
+put o_n 2 c
+end
+fn op_ishd h uint to bool
+for k ulong ulong get o_pc h bound 1048577
+if op_doms h op_pred h k
+ret true
+end
+end
+ret false
+end
+note mark the loop of header h with a new stamp (o_lm = o_n 1): h, its latches, and every block that reaches a
+note latch without passing h; returns the number of blocks
+fn op_mark h uint to ulong
+s = uint add get o_n 1 1
+put o_n 1 ulong s
+put o_lm h s
+z = ulong 1
+sp = ulong 0
+for k ulong ulong get o_pc h bound 1048577
+p = op_pred h k
+if op_doms h p
+if ne get o_lm p s
+put o_lm p s
+put o_st sp p
+sp = add sp 1
+z = add z 1
+end
+end
+end
+while gt sp 0 bound 1048577
+sp = sub sp 1
+x = get o_st sp
+for k ulong ulong get o_pc x bound 1048577
+y = op_pred x k
+if ne get o_lm y s
+put o_lm y s
+put o_st sp y
+sp = add sp 1
+z = add z 1
+end
+end
+end
+ret z
+end
+fn op_inl b uint to bool
+ret eq ulong get o_lm b get o_n 1
+end
+note the outside predecessor of the marked loop of h that ends in `br h` when it is the only outside one, else 0
+fn op_ph h uint to uint
+p = uint 0
+c = ulong 0
+for k ulong ulong get o_pc h bound 1048577
+q = op_pred h k
+if not op_inl q
+p = q
+c = add c 1
+end
+end
+if ne c 1
+ret 0
+end
+if ne get i_oop get i_bot p 60
+ret 0
+end
+ret p
+end
+note ---- lists -----------------------------------------------------------------------------------
+note the op before o in block b (0 when o is first)
+fn op_oprv b uint o uint to uint
+p = uint 0
+x = get i_bo1 b
+while ne x o bound 4194305
+p = x
+x = get i_onx x
+end
+ret p
+end
+note take op o out of block b
+fn op_unl b uint o uint to void
+p = op_oprv b o
+if eq p 0
+put i_bo1 b get i_onx o
+else
+put i_onx p get i_onx o
+end
+if eq get i_bot b o
+put i_bot b p
+end
+put i_bno b sub get i_bno b 1
+put i_onx o 0
+end
+note put op o into block p right before its terminator
+fn op_ins p uint o uint to void
+t = get i_bot p
+q = op_oprv p t
+put i_onx o t
+if eq q 0
+put i_bo1 p o
+else
+put i_onx q o
+end
+put i_ob o p
+put i_bno p add get i_bno p 1
+end
+note the block before b in function f (0 when b is first)
+fn op_bprv f uint b uint to uint
+p = uint 0
+x = get i_fb1 f
+while ne x b bound 1048577
+p = x
+x = get i_bnx x
+end
+ret p
+end
+note move block b of f to right after block a
+fn op_bmv f uint b uint a uint to void
+p = op_bprv f b
+if eq p 0
+put i_fb1 f get i_bnx b
+else
+put i_bnx p get i_bnx b
+end
+if eq get i_fbt f b
+put i_fbt f p
+end
+put i_bnx b get i_bnx a
+put i_bnx a b
+if eq get i_fbt f a
+put i_fbt f b
+end
+end
+note every value operand of every op of f that names a takes b instead
+fn op_repl f uint a uint b uint to void
+x = get i_fb1 f
+while ne x 0 bound 1048577
+o = get i_bo1 x
+while ne o 0 bound 4194305
+op_rep1 o a b
+o = get i_onx o
+end
+x = get i_bnx x
+end
+end
+fn op_rep1 o uint a uint b uint to void
+op = uint get i_oop o
+for k ulong ulong get i_ona o bound 1024
+if eq ir_okd op k 0
+if eq ir_arg o uint k a
+ir_set o uint k b
+end
+end
+end
+end
+note ---- 1. preheaders ---------------------------------------------------------------------------
+note add one missing preheader to f; true when one was added (the analysis is then stale). A loop whose
+note preheader would break a limit of IR.md s12 (op_room) keeps none, so LICM leaves it alone.
+fn op_pre f uint to bool
+op_ana f
+op_hdrs
+for i ulong get o_n 2 bound 1048577
+h = get o_hd i
+x = op_mark h
+if eq op_ph h 0
+if op_room f h
+op_newp f h
+ret true
+end
+end
+end
+ret false
+end
+note room in f for a preheader of h (one block with h's i_bnp parameters, one `br` with that many arguments
+note and its target) under IR.md s12: 65536 blocks per function and 1048576 in the unit, 1048576 ops per
+note function and 4194304 in the unit, 2097152 values per function; and in ir.om's tables (i_vty, i_arg)
+fn op_room f uint h uint to bool
+p = ulong get i_bnp h
+if ge get i_fnb f 65536
+ret false
+end
+if ge get i_n 4 1048576
+ret false
+end
+if ge get i_n 5 4194304
+ret false
+end
+if gt add get i_n 6 p 8388608
+ret false
+end
+if gt add get i_n 7 add p 1 16777216
+ret false
+end
+c = ulong 0
+v = add ulong get i_fnp f 1
+b = get i_fb1 f
+while ne b 0 bound 1048577
+c = add c ulong get i_bno b
+v = add v op_vals b
+b = get i_bnx b
+end
+if ge c 1048576
+ret false
+end
+ret le add v p 2097152
+end
+note values block b defines: its parameters, then each op's token and result
+fn op_vals b uint to ulong
+n = ulong get i_bnp b
+o = get i_bo1 b
+while ne o 0 bound 4194305
+if ne get i_otk o 0
+n = add n 1
+end
+if ne get i_ors o 0
+n = add n 1
+end
+o = get i_onx o
+end
+ret n
+end
+note a new block n with h's parameter types, ending in `br h` with them, before h; the outside predecessors of
+note the marked loop of h branch to n instead
+fn op_newp f uint h uint to void
+n = ir_blk f
+v = get i_vnx get i_bp1 h
+while ne v 0 bound 65
+w = ir_bpar n get i_vty v
+v = get i_vnx v
+end
+o = ir_op n 60 0 0 add get i_bnp h 1
+ir_set o 0 h
+k = uint 1
+v = get i_bp1 n
+while ne v 0 bound 65
+ir_set o k v
+k = add k 1
+v = get i_vnx v
+end
+for j ulong ulong get o_pc h bound 1048577
+q = op_pred h j
+if not op_inl q
+op_redir q h n
+end
+end
+op_bmv f n op_bprv f h
+put o_n 6 add get o_n 6 1
+end
+note the terminator of block q branches to n where it branched to h
+fn op_redir q uint h uint n uint to void
+t = get i_bot q
+if eq get i_oop t 60
+if eq ir_arg t 0 h
+ir_set t 0 n
+end
+ret
+end
+for k ulong 2
+s = uint add k 2
+if eq ir_arg t s h
+ir_set t s n
+end
+end
+end
+note ---- 1a. PHI ---------------------------------------------------------------------------------
+note remove redundant block parameters of f, one per round, until none is left
+fn op_phi f uint to void
+go = true
+while go bound 2097153
+go = op_phi1 f
+end
+end
+note one round: the argument seen for every parameter past the token (o_pv), then the first parameter with
+note exactly one argument other than itself is removed; true when one was
+fn op_phi1 f uint to bool
+b = get i_fb1 f
+while ne b 0 bound 1048577
+v = get i_vnx get i_bp1 b
+while ne v 0 bound 65
+put o_pv v 0
+v = get i_vnx v
+end
+b = get i_bnx b
+end
+b = get i_fb1 f
+while ne b 0 bound 1048577
+t = get i_bot b
+if eq get i_oop t 60
+op_pvbr t
+end
+b = get i_bnx b
+end
+b = get i_fb1 f
+while ne b 0 bound 1048577
+v = get i_vnx get i_bp1 b
+while ne v 0 bound 65
+w = get o_pv v
+if and ne w 0 ne w 4294967295
+op_phirm f b v w
+ret true
+end
+v = get i_vnx v
+end
+b = get i_bnx b
+end
+ret false
+end
+note the arguments of `br` t for its target's parameters past the token (slot 0 the target, slot 1 the token)
+fn op_pvbr t uint to void
+v = get i_vnx get i_bp1 ir_arg t 0
+k = uint 2
+while ne v 0 bound 65
+op_pv1 v ir_arg t k
+k = add k 1
+v = get i_vnx v
+end
+end
+fn op_pv1 p uint a uint to void
+if eq a p
+ret
+end
+x = get o_pv p
+if eq x 0
+put o_pv p a
+ret
+end
+if ne x a
+put o_pv p 4294967295
+end
+end
+note parameter p of block b becomes w: uses take w, p leaves b's list and its slot every `br` to b
+fn op_phirm f uint b uint p uint w uint to void
+op_repl f p w
+k = uint 1
+q = uint 0
+v = get i_bp1 b
+while ne v p bound 65
+q = v
+v = get i_vnx v
+k = add k 1
+end
+put i_vnx q get i_vnx p
+if eq get i_bpt b p
+put i_bpt b q
+end
+put i_vnx p 0
+put i_bnp b sub get i_bnp b 1
+x = get i_fb1 f
+while ne x 0 bound 1048577
+t = get i_bot x
+if eq get i_oop t 60
+if eq ir_arg t 0 b
+op_adel t k
+end
+end
+x = get i_bnx x
+end
+put o_n 14 add get o_n 14 1
+end
+note drop operand slot k of op t (the later slots move down one)
+fn op_adel t uint k uint to void
+n = get i_ona t
+j = k
+while lt add j 1 n bound 1025
+ir_set t j ir_arg t add j 1
+j = add j 1
+end
+put i_ona t sub n 1
+end
+note ---- 2. LICM ---------------------------------------------------------------------------------
+fn op_licm f uint to void
+op_ana f
+op_hdrs
+c = get o_n 2
+for i ulong c bound 1048577
+put o_hz i op_mark get o_hd i
+end
+op_sort c
+for i ulong c bound 1048577
+h = get o_hd i
+x = op_mark h
+p = op_ph h
+if ne p 0
+op_lic1 p
+end
+end
+end
+note headers by loop size, smallest (innermost) first: insertion sort of o_hd by o_hz
+fn op_sort c ulong to void
+for i ulong c bound 1048577
+j = i
+while gt j 0 bound 1048577
+if le get o_hz sub j 1 get o_hz j
+j = 0
+else
+op_swap sub j 1 j
+j = sub j 1
+end
+end
+end
+end
+fn op_swap a ulong b ulong to void
+h = get o_hd a
+z = get o_hz a
+put o_hd a get o_hd b
+put o_hz a get o_hz b
+put o_hd b h
+put o_hz b z
+end
+note the marked loop's blocks in reverse postorder, each op that may move to preheader p
+fn op_lic1 p uint to void
+for r ulong get o_n 10 bound 1048577
+b = get o_ro add r 1
+if op_inl b
+op_licb b p
+end
+end
+end
+fn op_licb b uint p uint to void
+o = get i_bo1 b
+while ne o 0 bound 4194305
+nx = get i_onx o
+if op_canh o
+if op_inv o
+op_hoist o b p
+end
+end
+o = nx
+end
+end
+note op o may leave a loop: class P, defines a value, not `shared`, not convergent (IR.md s7.12: 44 sync, 45 shfl,
+note 104 mmald, 105 mmast, 106 mma; sync, mmald and mmast are not class P either, the list does not lean on that)
+fn op_canh o uint to bool
+op = uint get i_oop o
+if ne get i_rtk op 0
+ret false
+end
+if eq get i_ors o 0
+ret false
+end
+if or or eq op 44 eq op 45 or eq op 104 or eq op 105 eq op 106
+ret false
+end
+ret ne op 41
+end
+note every operand of o past its token slot is defined outside the marked loop
+fn op_inv o uint to bool
+op = uint get i_oop o
+h = ulong ir_htok op
+for k ulong ulong get i_ona o bound 1024
+if and ge k h eq ir_okd op k 0
+if op_inl op_vdb ir_arg o uint k
+ret false
+end
+end
+end
+ret true
+end
+note the block that defines value v (0 for the entry token and function parameters)
+fn op_vdb v uint to uint
+k = get i_vk v
+if le k 1
+ret 0
+end
+if eq k 2
+ret get i_vo v
+end
+ret get i_ob get i_vo v
+end
+note move op o from loop block b to preheader p, or drop it when p already computes the same value
+fn op_hoist o uint b uint p uint to void
+put o_n 3 add get o_n 3 1
+op_unl b o
+q = op_same p o
+if eq q 0
+op_ins p o
+ret
+end
+put o_n 4 add get o_n 4 1
+op_repl uint get o_n 11 ir_res o ir_res q
+end
+note an op of p before its terminator equal to o (same op, type, imm and operands, defines a value), else 0
+fn op_same p uint o uint to uint
+t = get i_bot p
+q = get i_bo1 p
+while ne q t bound 4194305
+if op_eq q o
+ret q
+end
+q = get i_onx q
+end
+ret 0
+end
+fn op_eq q uint o uint to bool
+if ne get i_oop q get i_oop o
+ret false
+end
+if ne get i_oty q get i_oty o
+ret false
+end
+if ne get i_oim q get i_oim o
+ret false
+end
+if ne get i_ona q get i_ona o
+ret false
+end
+if eq get i_ors q 0
+ret false
+end
+for k ulong ulong get i_ona o bound 1024
+if ne ir_arg q uint k ir_arg o uint k
+ret false
+end
+end
+ret true
+end
+note ---- 2. BCE ----------------------------------------------------------------------------------
+fn op_bce f uint to void
+op_ana f
+for j ulong get o_n 0 bound 1048577
+b = get o_bl j
+if ne get o_rn b 0
+op_bceb b
+end
+end
+end
+fn op_bceb b uint to void
+o = get i_bo1 b
+while ne o 0 bound 4194305
+nx = get i_onx o
+op = get i_oop o
+if eq op 79
+if op_inb o b
+op_drop b o true
+end
+end
+if eq op 74
+if ne op_cv ir_arg o 1 0
+op_drop b o false
+end
+end
+o = nx
+end
+end
+note value v is defined by a `const`
+fn op_isc v uint to bool
+if ne get i_vk v 4
+ret false
+end
+ret eq get i_oop get i_vo v 1
+end
+note the bits of const v, 0 when v is not a const
+fn op_cv v uint to ulong
+if not op_isc v
+ret 0
+end
+ret get i_oim get i_vo v
+end
+note element count of the ARRAY that REF value r refers to, 0 when r is not a REF to an ARRAY
+fn op_alen r uint to ulong
+t = get i_vty r
+if lt t 32
+ret 0
+end
+if ne get i_tk t 4
+ret 0
+end
+a = get i_t1 t
+if lt a 32
+ret 0
+end
+if ne get i_tk a 2
+ret 0
+end
+ret ulong get i_t2 a
+end
+note chk.bounds o (tok, r, i, e) in block b cannot fail
+fn op_inb o uint b uint to bool
+e = op_cv ir_arg o 3
+if eq e 0
+ret false
+end
+l = op_alen ir_arg o 1
+if lt l e
+ret false
+end
+x = op_ub ir_arg o 2 b
+if eq x 0
+ret false
+end
+ret le x add sub l e 1
+end
+note the least X with v < X known in block b from a const or the tests on b's dominator path; 0 none
+fn op_ub v uint b uint to ulong
+if op_isc v
+c = op_cv v
+if eq c 18446744073709551615
+ret 0
+end
+ret add c 1
+end
+x = ulong 0
+d = b
+while true bound 1048577
+y = op_edge v d
+if ne y 0
+if or eq x 0 lt y x
+x = y
+end
+end
+p = get o_id d
+if eq p d
+ret x
+end
+d = p
+end
+ret x
+end
+note the bound X with v < X that block d's one incoming edge proves, else 0: d has one predecessor, it
+note ends in `cbr` with d as exactly one target, and the condition compares v with a const
+fn op_edge v uint d uint to ulong
+if ne get o_pc d 1
+ret 0
+end
+t = get i_bot op_pred d 0
+if ne get i_oop t 61
+ret 0
+end
+if eq ir_arg t 2 ir_arg t 3
+ret 0
+end
+c = ir_arg t 1
+if ne get i_vk c 4
+ret 0
+end
+q = get i_vo c
+op = ulong get i_oop q
+if or lt op 32 gt op 35
+ret 0
+end
+if eq ir_arg t 2 d
+ret op_cmpx q op 0 v
+end
+ret op_cmpx q op 1 v
+end
+note compare q `a OP b` (32 lt, 33 le, 34 gt, 35 ge) seen true (n 0) or false (n 1, the negation 67 - OP):
+note the X with v < X when the relation bounds v above by a const; 0 otherwise
+fn op_cmpx q uint op ulong n ulong v uint to ulong
+k = op
+if eq n 1
+k = sub 67 op
+end
+s = ir_arg q 0
+w = ir_arg q 1
+if ge k 34
+s = ir_arg q 1
+w = ir_arg q 0
+end
+if ne s v
+ret 0
+end
+if not op_isc w
+ret 0
+end
+c = op_cv w
+if or eq k 32 eq k 34
+ret c
+end
+if eq c 18446744073709551615
+ret 0
+end
+ret add c 1
+end
+note delete check o of block b: uses of its output token take its input token; with fk, a
+note `fact.inbounds 1` on its (r, i, e) takes its place
+fn op_drop b uint o uint fk bool to void
+if fk
+x = ir_op b 92 0 1 3
+op_unl b x
+op_insb b x o
+ir_set x 0 ir_arg o 1
+ir_set x 1 ir_arg o 2
+ir_set x 2 ir_arg o 3
+end
+op_repl uint get o_n 11 ir_otok o ir_arg o 0
+op_unl b o
+put o_n 13 add get o_n 13 1
+end
+note put op x into block b right before op o
+fn op_insb b uint x uint o uint to void
+q = op_oprv b o
+put i_onx x o
+if eq q 0
+put i_bo1 b x
+else
+put i_onx q x
+end
+put i_ob x b
+put i_bno b add get i_bno b 1
+end
+note ---- 4. ROT ----------------------------------------------------------------------------------
+fn op_rot f uint to void
+op_ana f
+op_hdrs
+for i ulong get o_n 2 bound 1048577
+h = get o_hd i
+x = op_mark h
+op_rot1 f h
+end
+end
+fn op_rot1 f uint h uint to void
+t = get i_bot h
+if ne get i_oop t 61
+ret
+end
+if eq op_inl ir_arg t 2 op_inl ir_arg t 3
+ret
+end
+u = op_latch h
+if or eq u 0 eq u h
+ret
+end
+if ne get i_oop get i_bot u 60
+ret
+end
+if eq get i_bnx u h
+ret
+end
+op_bmv f h u
+put o_n 5 add get o_n 5 1
+end
+note the one predecessor of h inside its marked loop, else 0
+fn op_latch h uint to uint
+u = uint 0
+c = ulong 0
+for k ulong ulong get o_pc h bound 1048577
+q = op_pred h k
+if op_inl q
+u = q
+c = add c 1
+end
+end
+if ne c 1
+ret 0
+end
+ret u
+end
+note ---- driver and counts ------------------------------------------------------------------------
+note ops in the blocks of f that lie in a loop; adds f's loops to o_n 7 when k is 0
+fn op_cnt f uint k ulong to ulong
+op_ana f
+op_hdrs
+for j ulong get o_n 0 bound 1048577
+put o_in get o_bl j 0
+end
+for i ulong get o_n 2 bound 1048577
+x = op_mark get o_hd i
+op_inmk
+end
+if eq k 0
+put o_n 7 add get o_n 7 get o_n 2
+end
+c = ulong 0
+for j ulong get o_n 0 bound 1048577
+b = get o_bl j
+if ne get o_in b 0
+c = add c op_nex b
+end
+end
+ret c
+end
+note executing ops of block b (facts 90..93 do not run)
+fn op_nex b uint to ulong
+c = ulong 0
+o = get i_bo1 b
+while ne o 0 bound 4194305
+op = get i_oop o
+if or lt op 90 gt op 93
+c = add c 1
+end
+o = get i_onx o
+end
+ret c
+end
+fn op_inmk to void
+for j ulong get o_n 0 bound 1048577
+b = get o_bl j
+if op_inl b
+put o_in b 1
+end
+end
+end
+note optimize every function of the unit read into the ir.om tables
+fn op_run to void
+for j ulong 32
+put o_n j 0
+end
+for i ulong get i_n 3 bound 65536
+op_fn uint add i 1
+end
+end
+fn op_fn f uint to void
+if lt get i_fnb f 2
+ret
+end
+put o_n 8 add get o_n 8 op_cnt f 0
+go = true
+while go bound 65536
+go = op_pre f
+end
+note PHI, BCE and LICM again while one of them changed something: LICM's merging (op_hoist) gives two `br`
+note arguments one value, which can make a parameter redundant only after PHI ran; every productive round
+note removes a parameter or a check or moves an op out of a loop, so the rounds end
+go = true
+while go bound 1048577
+c = add add get o_n 14 get o_n 13 get o_n 3
+op_phi f
+op_bce f
+op_licm f
+go = ne c add add get o_n 14 get o_n 13 get o_n 3
+end
+op_rot f
+put o_n 9 add get o_n 9 op_cnt f 1
+end
+note the opt-count line on stdout; 27 when it cannot be written
+fn op_put to int
+op_say 0 8
+op_num get i_n 3
+op_say 8 15
+op_num get o_n 7
+op_say 15 23
+op_num get o_n 8
+op_say 23 25
+op_num get o_n 9
+op_say 25 30
+op_num get o_n 14
+op_say 30 35
+op_num get o_n 13
+op_say 35 44
+op_num get o_n 3
+op_say 44 52
+op_num get o_n 4
+op_say 52 61
+op_num get o_n 5
+op_say 61 73
+op_num get o_n 6
+op_say 73 74
+ret int get o_n 12
+end
+fn op_say a ulong b ulong to void
+k = write 1 o_msg a sub b a
+if ne k long sub b a
+put o_n 12 27
+end
+end
+fn op_num v ulong to void
+x = v
+i = ulong 24
+for j ulong 21
+i = sub i 1
+put o_dig i uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+k = write 1 o_dig i sub 24 i
+if ne k long sub 24 i
+put o_n 12 27
+end
+ret
+end
+end
+end
