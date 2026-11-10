@@ -46,7 +46,9 @@ The first line is the only bootstrap invocation. The standalone Omega gate indep
 `sha256.om` and `ngbuild.om`, compiles the result, then has ngbuild read `ngbuild.units` and build
 itself. It requires both joined source and binary to match byte for byte. It also exercises the
 refusal exits 3, 4, 5, 8 and 9 below with exact exit status and diagnostic, no stdout and no
-created output/source; exits 1, 2, 6 and 7 are not gate cases.
+created output/source; exits 1, 2, 6 and 7 are not gate cases. The 64-argument usage refusal
+cannot be a gate case: an `execprog` packed list holds at most 64 records (OMEGESE s10), so an
+Omega parent never starts ngbuild with more than 63 arguments after the program name.
 `ngbuild build` invokes OMC directly with `fork`, `dupfd`, `execprog` and `waitpid`, not a shell.
 No `cat` is needed by these commands. Gate negative control: append `wrong` to its arguments; the
 missing-unit expectation is inverted and the gate must end `NGBUILDGATE FAIL`, exit 1.
@@ -111,15 +113,12 @@ but still refuses duplicate paths. All units and pins are checked before output 
 | Exit | Meaning |
 |---|---|
 | 0 | Built, or sums printed. |
-| 1 / 2 / 3 | OMC refused (its status is printed) / usage / pin mismatch. 64 or more arguments after the program name trap 4 in the argument loop instead of the usage line: exit 104, no message. |
+| 1 / 2 / 3 | OMC refused (its status is printed) / usage, including any argument count other than `build`'s 4 or `sums`' 2 (checked before any argument is read) / pin mismatch. |
 | 4 / 5 | Malformed or empty list / unreadable list or unit. |
-| 6 / 7 | Cannot write output / fork or wait failure, or OMC ended by a signal. A failed exec or redirect in the child exits 127 and is reported as `ngbuild: omc exit 127`, exit 1. OUT.src is written before OUT is opened and OMC runs, and stays after a successful build; exit 6 can leave OUT.src, and exits 1 and 7 can leave both. |
+| 6 / 7 | Cannot write output / fork or wait failure, or OMC ended by a signal (`ngbuild: fork or wait failed, or omc ended by a signal`). A failed exec or redirect in the child exits 127 and is reported as `ngbuild: omc exit 127`, exit 1. OUT.src is written before OUT is opened and OMC runs, and stays after a successful build; exit 6 can leave OUT.src, and exits 1 and 7 can leave both. |
 | 8 / 9 | Duplicate unit / list, unit count, unit file or joined-source limit exceeded. |
 
-Exact diagnostic formats are in `ngbuild.om`; malformed-line offsets count bytes from zero. Its
-header notes still say exit 7 covers exec failures (it does not; see the table) and omit signals,
-and still call unit paths relative only; the table and contract above are correct. Those notes
-change with the next `ngbuild.om` edit, because editing them repins `ngbuild.units`.
+Exact diagnostic formats are in `ngbuild.om`; malformed-line offsets count bytes from zero.
 Regression gate: `tests/ngbuild/gate.om`, with no shared implementation with ngbuild.
 
 CI: `.github/workflows/ng-ir-arm64.yml` births omc from the seed, requires the committed
