@@ -1,0 +1,519 @@
+note seed/text/text.om: bytes, search, fields, integer text and UTF-8 in seeded Omega (ROADMAP-1.0 RM5).
+note A composable unit like seed/json: no om2 line, no global, no text, no host word. The caller puts
+note `om2` first (unsized views) and concatenates this file before its own code. Functions are tx_*,
+note constants tx*. Arrays are the caller's: OM-2 unsized views and edits (`view uchar *`), so a slice is
+note passed with `part A o k` or as an explicit offset and count where the function takes one.
+note Strict rules, stated once: decimal is [0-9]+ (leading zeros allowed, no sign, no space, no +);
+note signed decimal adds one optional leading '-'; hex is [0-9a-fA-F]+ with no 0x prefix. A value outside
+note the type is txerange, never wrapped. A slice outside its array traps 3, like the host words.
+note Loops walk at most 65536 elements per inner pass, so inputs far above the 1000000-pass loop guard
+note are handled (outer bound 999999 passes, about 65 GB).
+
+const txnone ulong 18446744073709551615
+const txeempty long -1
+const txedigit long -2
+const txerange long -3
+const txespace long -4
+
+note tx_slice: trap 3 unless o .. o+n lies inside an array of length l.
+fn tx_slice l ulong o ulong n ulong to void
+if gt o l
+trap 3
+end
+if gt n sub l o
+trap 3
+end
+end
+
+note ======== bytes ========
+note tx_same: a[ao .. ao+n) equals b[0 .. n) (both ranges already checked by the caller).
+fn tx_same a view uchar * ao ulong b view uchar * n ulong to bool
+i = ulong 0
+while lt i n bound 999999
+e = add i 65536
+if gt e n
+e = n
+end
+while lt i e bound 65536
+if ne get a add ao i get b i
+ret false
+end
+i = add i 1
+end
+end
+ret true
+end
+
+fn tx_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+ret tx_same a 0 b len a
+end
+
+note tx_cmp: unsigned byte order; a proper prefix sorts first. -1, 0 or 1.
+fn tx_cmp a view uchar * b view uchar * to int
+n = len a
+if lt len b n
+n = len b
+end
+i = ulong 0
+while lt i n bound 999999
+e = add i 65536
+if gt e n
+e = n
+end
+while lt i e bound 65536
+x = get a i
+y = get b i
+if ne x y
+if lt x y
+ret int -1
+end
+ret int 1
+end
+i = add i 1
+end
+end
+if lt len a len b
+ret int -1
+end
+if gt len a len b
+ret int 1
+end
+ret int 0
+end
+
+note ======== search and fields ========
+note tx_find: the first index at or after from where nd occurs in h, or txnone. An empty needle is found
+note at from when from <= len h. Plain left-to-right comparison: time up to len h * len nd.
+fn tx_find h view uchar * nd view uchar * from ulong to ulong
+hn = len h
+m = len nd
+if gt from hn
+ret txnone
+end
+if gt m sub hn from
+ret txnone
+end
+stop = add sub hn m 1
+i = from
+while lt i stop bound 999999
+e = add i 65536
+if gt e stop
+e = stop
+end
+while lt i e bound 65536
+if tx_same h i nd m
+ret i
+end
+i = add i 1
+end
+end
+ret txnone
+end
+
+note tx_field: the end of the field that starts at p: the first index >= p holding sep, or len s.
+note p > len s is txnone. Split: p = 0; e = tx_field s sep p; field [p, e); stop when e = len s, else p = e + 1.
+fn tx_field s view uchar * sep uchar p ulong to ulong
+n = len s
+if gt p n
+ret txnone
+end
+i = p
+while lt i n bound 999999
+e = add i 65536
+if gt e n
+e = n
+end
+while lt i e bound 65536
+if eq get s i sep
+ret i
+end
+i = add i 1
+end
+end
+ret n
+end
+
+note ======== integer text ========
+note tx_hexv: value of one hex digit, or 16 for any other byte.
+fn tx_hexv c uchar to ulong
+if and ge c 48 le c 57
+ret ulong sub c 48
+end
+if and ge c 97 le c 102
+ret ulong sub c 87
+end
+if and ge c 65 le c 70
+ret ulong sub c 55
+end
+ret 16
+end
+
+note tx_pacc: one digit d into the accumulator w: w[0] base (10 or 16), w[1] value, w[2] 1 once the value
+note passed 2^64 - 1 (later digits are still checked, so a bad byte is reported before range).
+fn tx_pacc w edit ulong * d ulong to void
+if ne get w 2 0
+ret
+end
+x = get w 1
+base = get w 0
+lim = ulong 1844674407370955161
+if eq base 16
+lim = ulong 1152921504606846975
+end
+if gt x lim
+put w 2 1
+ret
+end
+if and eq base 10 and eq x lim gt d 5
+put w 2 1
+ret
+end
+put w 1 add mul x base d
+end
+
+note tx_pnum: s[o .. o+n) in base w[0] into w[1] (w[1] and w[2] start at 0). 0, txeempty, txedigit (any
+note byte that is not a digit, reported before range) or txerange (above 2^64 - 1).
+fn tx_pnum s view uchar * o ulong n ulong w edit ulong * to long
+tx_slice len s o n
+if eq n 0
+ret txeempty
+end
+i = o
+stop = add o n
+while lt i stop bound 999999
+e = add i 65536
+if gt e stop
+e = stop
+end
+while lt i e bound 65536
+d = tx_hexv get s i
+if ge d get w 0
+ret txedigit
+end
+tx_pacc w d
+i = add i 1
+end
+end
+if ne get w 2 0
+ret txerange
+end
+ret 0
+end
+
+note tx_pdec / tx_phex: decimal or hex s[o .. o+n) into v[0]; v is unchanged on refusal.
+fn tx_pdec s view uchar * o ulong n ulong v edit ulong * to long
+w = new ulong 3 0
+put w 0 10
+r = tx_pnum s o n w
+if eq r 0
+put v 0 get w 1
+end
+ret r
+end
+
+fn tx_phex s view uchar * o ulong n ulong v edit ulong * to long
+w = new ulong 3 0
+put w 0 16
+r = tx_pnum s o n w
+if eq r 0
+put v 0 get w 1
+end
+ret r
+end
+
+note tx_negm: -x as a long for x in 1 .. 2^63 (0 gives 0), without passing through an overflow.
+fn tx_negm x ulong to long
+if eq x 0
+ret long 0
+end
+ret sub neg long sub x 1 1
+end
+
+note tx_pdeci: optional '-' then decimal, -2^63 .. 2^63 - 1, into v[0]. A lone '-' is txedigit.
+fn tx_pdeci s view uchar * o ulong n ulong v edit long * to long
+m = new ulong 1 0
+tx_slice len s o n
+if eq n 0
+ret txeempty
+end
+minus = eq get s o 45
+if minus
+o = add o 1
+n = sub n 1
+if eq n 0
+ret txedigit
+end
+end
+r = tx_pdec s o n m
+if lt r 0
+ret r
+end
+x = get m 0
+if minus
+if gt x 9223372036854775808
+ret txerange
+end
+put v 0 tx_negm x
+ret 0
+end
+if gt x 9223372036854775807
+ret txerange
+end
+put v 0 long x
+ret 0
+end
+
+note tx_ndig: the number of base-10 or base-16 digits of v (1 for zero).
+fn tx_ndig v ulong base ulong to ulong
+k = ulong 1
+x = div v base
+while gt x 0 bound 20
+k = add k 1
+x = div x base
+end
+ret k
+end
+
+note tx_fput: v as exactly k digits (k >= its digit count) at b[o ..], lowercase hex. The end offset.
+fn tx_fput v ulong base ulong k ulong b edit uchar * o ulong to long
+x = v
+j = k
+while gt j 0 bound 64
+j = sub j 1
+d = rem x base
+c = uchar add d 48
+if gt d 9
+c = uchar add d 87
+end
+put b add o j c
+x = div x base
+end
+ret long add o k
+end
+
+note tx_fdec: v in decimal at b[o ..]; the end offset, or txespace (b unchanged) when it does not fit.
+fn tx_fdec v ulong b edit uchar * o ulong to long
+k = tx_ndig v 10
+tx_slice len b o 0
+if gt k sub len b o
+ret txespace
+end
+ret tx_fput v 10 k b o
+end
+
+fn tx_fdeci v long b edit uchar * o ulong to long
+if ge v 0
+ret tx_fdec ulong v b o
+end
+m = add ulong neg add v 1 1
+k = tx_ndig m 10
+tx_slice len b o 0
+if gt add k 1 sub len b o
+ret txespace
+end
+put b o 45
+ret tx_fput m 10 k b add o 1
+end
+
+note tx_fhex: v in lowercase hex, zero-padded to at least w digits (w 0..16, more traps 3).
+fn tx_fhex v ulong w ulong b edit uchar * o ulong to long
+if gt w 16
+trap 3
+end
+k = tx_ndig v 16
+if lt k w
+k = w
+end
+tx_slice len b o 0
+if gt k sub len b o
+ret txespace
+end
+ret tx_fput v 16 k b o
+end
+
+note ======== UTF-8 ========
+note tx_u8st: RFC 3629 section 4 well-formed UTF-8, the state machine of js_u8st in seed/json/json.om.
+note State 0 expects a lead byte; 1, 2, 3 expect that many continuation bytes 80..BF; 4 after E0 expects
+note A0..BF; 5 after ED expects 80..9F; 6 after F0 expects 90..BF; 7 after F4 expects 80..8F. 9 is
+note refusal (overlong, surrogate, above U+10FFFF, stray continuation, C0, C1, F5..FF).
+fn tx_u8st s ulong c uchar to ulong
+if eq s 0
+if lt c 128
+ret 0
+end
+if lt c 194
+ret 9
+end
+if lt c 224
+ret 1
+end
+if eq c 224
+ret 4
+end
+if eq c 237
+ret 5
+end
+if lt c 240
+ret 2
+end
+if eq c 240
+ret 6
+end
+if lt c 244
+ret 3
+end
+if eq c 244
+ret 7
+end
+ret 9
+end
+lo = uchar 128
+hi = uchar 191
+if eq s 4
+lo = uchar 160
+end
+if eq s 5
+hi = uchar 159
+end
+if eq s 6
+lo = uchar 144
+end
+if eq s 7
+hi = uchar 143
+end
+if or lt c lo gt c hi
+ret 9
+end
+if eq s 1
+ret 0
+end
+if or eq s 2 or eq s 4 eq s 5
+ret 1
+end
+ret 2
+end
+
+note tx_u8ok: o + n when s[o .. o+n) is well-formed UTF-8, otherwise the index of the first byte of the
+note first ill-formed or truncated sequence (the same index a strict decoder reports as the error start).
+fn tx_u8ok s view uchar * o ulong n ulong to ulong
+tx_slice len s o n
+st = ulong 0
+lead = o
+i = o
+stop = add o n
+while lt i stop bound 999999
+e = add i 65536
+if gt e stop
+e = stop
+end
+while lt i e bound 65536
+if eq st 0
+lead = i
+end
+st = tx_u8st st get s i
+if eq st 9
+ret lead
+end
+i = add i 1
+end
+end
+if ne st 0
+ret lead
+end
+ret stop
+end
+
+note tx_u8dec: the code point that starts at s[o] within n bytes, as (cp << 3) | its byte length, or txnone
+note when that sequence is ill-formed or truncated (the same rules as tx_u8ok). n = 0 is txnone.
+fn tx_u8dec s view uchar * o ulong n ulong to ulong
+tx_slice len s o n
+if eq n 0
+ret txnone
+end
+c = get s o
+st = tx_u8st 0 c
+if eq st 9
+ret txnone
+end
+if eq st 0
+ret or shl ulong c 3 1
+end
+k = ulong 4
+cp = ulong and c 7
+if lt c 240
+k = 3
+cp = ulong and c 15
+end
+if lt c 224
+k = 2
+cp = ulong and c 31
+end
+if lt n k
+ret txnone
+end
+for i ulong sub k 1
+b = get s add add o i 1
+st = tx_u8st st b
+if eq st 9
+ret txnone
+end
+cp = or shl cp 6 ulong and b 63
+end
+ret or shl cp 3 k
+end
+
+note tx_u8len: the UTF-8 byte length of cp, or 0 for a surrogate D800..DFFF or a value above 10FFFF.
+fn tx_u8len cp ulong to ulong
+if gt cp 1114111
+ret 0
+end
+if and ge cp 55296 le cp 57343
+ret 0
+end
+if lt cp 128
+ret 1
+end
+if lt cp 2048
+ret 2
+end
+if lt cp 65536
+ret 3
+end
+ret 4
+end
+
+note tx_u8enc: cp as UTF-8 at b[o ..]: the end offset, txerange for a surrogate or a value above 10FFFF,
+note or txespace (b unchanged) when it does not fit.
+fn tx_u8enc cp ulong b edit uchar * o ulong to long
+k = tx_u8len cp
+if eq k 0
+ret txerange
+end
+tx_slice len b o 0
+if gt k sub len b o
+ret txespace
+end
+if eq k 1
+put b o uchar cp
+ret long add o 1
+end
+j = sub k 1
+x = cp
+while gt j 0 bound 3
+put b add o j uchar or 128 and x 63
+x = shr x 6
+j = sub j 1
+end
+lead = ulong 192
+if eq k 3
+lead = 224
+end
+if eq k 4
+lead = 240
+end
+put b o uchar or lead x
+ret long add o k
+end
