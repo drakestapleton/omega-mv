@@ -711,8 +711,11 @@ NaNs with payloads, minimum and maximum subnormals, minimum normals and maximum 
 and 1024 deterministic random patterns. It checks float-to-int for all eight integer widths,
 16 probes at each destination's boundaries, integer-to-float in every defined mode at integer
 range and precision boundaries, and f64-to-f32 in every defined mode. NaN conversions are
-compared by NaN classification; bitcasts and FMA compare raw bits. FMA includes two explicit
-fused-versus-unfused witnesses and the same special/random sweep. The native oracle prints
+compared by NaN classification; bitcasts and FMA compare raw bits. FMA includes three explicit
+witnesses and the same special/random sweep: two fused-versus-unfused cases and one f32 case
+(`0x3f7ff001 * 0x33800800 + 1`, exactly 1 + 2^-24 + 2^-60) where an f64 FMA narrowed to f32
+double-rounds to `0x3f800000` instead of `0x3f800001`. The oracle exits 3 unless native omc
+reproduces the exact Wolfram-checked bits of all three. The native oracle prints
 its measured check count and finite fused-versus-unfused difference count on stderr.
 `tests/ir/intcv-oracle.om` independently exercises all 16 unsigned-to-signed width pairs at
 eight boundary inputs each (128 native comparisons), including source MAX and MAX-1. Another
@@ -721,8 +724,9 @@ using an independent integer decoder of the float sign, exponent and significand
 ngrun's float comparisons. It emits
 the IR before performing the equivalent checked native conversion, so its native exit is the
 expected IR exit (0 or trap 5). The gate compares exit, stdout and stderr. Sign-bit erasure,
-RTZ refusal, unfused f32 and f64 FMA, and the former unsigned-to-signed check each have a
-separately killed interpreter mutant. These are host semantic checks, not hardware qualification
+RTZ refusal, unfused f32 and f64 FMA, f32 FMA widened to f64 then narrowed, and the former
+unsigned-to-signed check each have a separately killed interpreter mutant. These are host semantic
+checks, not hardware qualification
 of either NG back end; the integer random-IR generator still has no second independent oracle.
 
 ## 11. Refusal classes and ngcheck exit codes
