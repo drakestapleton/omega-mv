@@ -505,11 +505,19 @@ same ARGS; `envcnt`/`envread` read ngrun's own environment. `monons`, `realns`,
 defines no fixed-value clock mode, so clock results are live and a test may compare only their sign.
 `sleepns 0` executes; any other interval is refused as nondeterministic.
 File words run only with `--scratch`: ngrun creates NEW-DIR (mode 0700; it must not exist), opens it
-with O_DIRECTORY|O_NOFOLLOW and makes it the working directory. Every path must be one component
-(no `/`, no NUL, not `.` or `..`, 1..4095 bytes); opens add O_NOFOLLOW; `renames` and `link`
-packets must hold exactly two such names. Descriptors are virtual: stdin (0) may be read and
-stdout/stderr (1, 2) written; every other operation needs a descriptor created by an interpreted
-`fopen` or `memfd`. A refused word prints `ngrun: refused host class C word W at OFFSET` on stderr
+with O_DIRECTORY|O_NOFOLLOW and makes it the working directory. A path over 4095 bytes or holding a
+zero byte, and a `renames` or `link` packet that is malformed (count other than 2, a record past the
+end, trailing bytes, an empty record, a zero byte), trap 3 as the native word does, before
+any check below and with or without `--scratch`. Every path must then be one nonempty component (no
+`/`, not `.` or `..`); `renames` and `link` packets must hold exactly two such names. Opens add
+O_NOFOLLOW, and `chdir` opens the name with O_PATH|O_DIRECTORY|O_NOFOLLOW and changes directory with
+`fchdir`, so neither follows a final link. The interpreted program cannot create a link (`symlnk` is
+refused), so `stat`, `chmod`, `chown`, `truncate` and `faccess`, which follow a final link as the
+native words do, stay inside NEW-DIR unless another process writes into it while ngrun runs.
+Descriptors are virtual: stdin (0) may be read and stdout/stderr (1, 2) written, and `fclose` may
+close any of the three, as a native program may; every other operation needs a descriptor created by
+an interpreted `fopen` or `memfd`. `memfd` names no path and runs without `--scratch`. A refused word
+prints `ngrun: refused host class C word W at OFFSET` on stderr
 and exits C before any effect:
 
 | exit | class | words |
