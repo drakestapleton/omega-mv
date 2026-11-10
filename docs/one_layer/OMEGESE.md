@@ -1111,8 +1111,10 @@ Never retry `fclose` after an error: the descriptor may already be released.
 
 A packed list is a little-endian `u16` count followed by that many records,
 each a little-endian `u16` byte length and those bytes. There is no padding or
-terminator in the public format. The whole packet is at most 4096 bytes and
-the count is 1..64. Embedded zero bytes, truncated records, extra trailing
+terminator in the public format. An exec argument packet (`execprog`, `execpure`
+and the first packet of `execenv`) is at most 65536 bytes with count 1..1024;
+every other packed list (`renames`, `link`, `symlnk`, the `execenv` environment)
+is at most 4096 bytes with count 1..64. Embedded zero bytes, truncated records, extra trailing
 bytes and out-of-range counts trap 3. `execprog` uses the first record as both
 the executable path and argument zero; it must be nonempty. Other arguments
 may be empty. `renames` requires exactly two nonempty path records.

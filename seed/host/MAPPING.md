@@ -362,7 +362,7 @@ tail. `tests/x86efi/run.sh` under QEMU/OVMF goes from 4/25 to 25/25; this is
 emulated, not hardware evidence.
 
 The execenv 233 host word (branch `hive/execprog-env`) births compiler
-`cfd96b48b0460ab5557853d6856f9c741b96ac8d0d624e06198defb4cbfa0d8a`
+`ee5fc83e357c7285e20ae9246d8129cdf8833b74f7205242e17fa62382334dfa`
 from source
 `062c9649af6a1d499b911e5b2f39b5419d7b75047616fe59fbcdc25f7b7b5b73`.
 `execenv A off n B off m` is `execprog` with a private environment packet B,

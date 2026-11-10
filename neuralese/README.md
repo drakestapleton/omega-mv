@@ -17,11 +17,13 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after the prlimit 235 host word (branch `seed/prlimit-host-word` on rad main `408c76b7`, 2026-11-08): committed
+Current pin after the exec argv limits (branch `pearl/exec-limits` c8505c0d merged on rad main `a59a425b` in `ham/omc-train`, 2026-11-10): committed
 `seed/out/omc` SHA-256
-`6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`, compiler
-source SHA-256 `7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`.
-The previous pin, after x86 types `fma` operands before its error 9 (branch `fix/x86-fma-order`, 2026-11-08), was
+`b87c8b651fc74c90357c9a6df93172aec18e89324bd9be8adb85f5142670318e`, compiler
+source SHA-256 `23efffceff5e3266629529dc9b10a6e91e9774643ced18b2e4add5cc41cfdc7b`.
+The previous pin, after the prlimit 235 host word (branch `seed/prlimit-host-word` on rad main `408c76b7`, 2026-11-08), was
+`6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8` (source
+`7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`); before that, after x86 types `fma` operands before its error 9 (branch `fix/x86-fma-order`, 2026-11-08), was
 `0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f` (source
 `7d8026837cfcafe53222228f076e4dab58279ae78a4b008440e6262f5b3c91ab`); before that, after the execenv 233 host word
 (branch `hive/execprog-env`, 2026-11-07), was
@@ -167,7 +169,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 \
+    b87c8b651fc74c90357c9a6df93172aec18e89324bd9be8adb85f5142670318e \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -397,7 +399,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc b87c8b651fc74c90357c9a6df93172aec18e89324bd9be8adb85f5142670318e neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch

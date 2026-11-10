@@ -93,12 +93,12 @@ bytes. Each child has a30-second deadline. Scratch and child outputs remain
 available for inspection; the shell creates a separate directory on each run.
 
 The required compiler is this branch's seeded `seed/out/omc`, executable
-`6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`, built from
-`seed/omc/omc.om` `7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`
+`b87c8b651fc74c90357c9a6df93172aec18e89324bd9be8adb85f5142670318e`, built from
+`seed/omc/omc.om` `23efffceff5e3266629529dc9b10a6e91e9774643ced18b2e4add5cc41cfdc7b`
 (both pinned in `compiler.sha256`). The original qualification used the corrected
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
 executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
-then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea, then cfd96b48, then 0f2de851, then 6d1b1cf5) and the gate was rerun (no rerun is
+then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea, then cfd96b48, then 0f2de851, then 6d1b1cf5, then b87c8b65) and the gate was rerun (no rerun is
 recorded for b1d9cff6 or 6d1b1cf5). The compilers
 through 3ad9f10f emit the same classifier bytes (b527a20c, pinned in `classify.sha256`). The
 hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6, 5f90edea, cfd96b48, 0f2de851 and 6d1b1cf5 emit 5dd5bb47, so the

@@ -6391,13 +6391,41 @@ spadd 32
 hreturn dst x
 end
 
+note hexw: 1 for the exec words (execprog 124, execpure 198, execenv 233), whose argv packet may hold
+note 65536 bytes and 1024 records; 0 for renames, link and symlnk.
+fn hexw c ulong to ulong
+if or or eq c 124 eq c 198 eq c 233
+ret 1
+end
+ret 0
+end
+note hnpass: packet passes of hpack/xhpack: 2 for execenv (argv, then environment), else 1.
+fn hnpass c ulong to ulong
+if eq c 233
+ret 2
+end
+ret 1
+end
+note hplim: the record-count limit of packet pass p: 1024 for an exec argv packet, else 64.
+fn hplim c ulong p ulong to ulong
+if eq p 0
+if ne hexw c 0
+ret 1024
+end
+end
+ret 64
+end
+
 note A packed argument list is u16 count followed by count (u16 length, bytes) records.
-note Byte order is little-endian. The packet is at most 4096 bytes and 64 records.
-note The decoder constructs kernel pointers only in private stack memory.
+note Byte order is little-endian. An exec argv packet (execprog, execpure, execenv) is at most 65536
+note bytes and 1024 records; renames, link and symlnk packets and the execenv environment packet are
+note at most 4096 bytes and 64 records. The decoder constructs kernel pointers only in private stack memory.
 note execenv 233 (execenv A off n B off m) decodes a second packet, the environment, with the same
 note rules except that every record must be nonempty. Its base and length are loaded into x14/x15
 note before SPSUB (save-area reads are SP-relative) and both packets are checked before any fd closes.
-note Stack: argv strings SP, argv pointers SP+4096, env strings SP+8192, env pointers SP+12288.
+note Stack, exec words: argv strings SP, argv pointers SP+65536 (at most 1025 words), and for execenv
+note env strings SP+81920, env pointers SP+86016 (at most 65 words). Other words: strings SP,
+note pointers SP+4096, 8192 bytes.
 fn hpack c ulong dst ulong x ulong to void
 errs = new ulong 16 0
 tbl = new ulong 27 0
@@ -6423,7 +6451,11 @@ basearg 4 e
 loadarg 16 1 get fr add x 21
 e3 2332033024 4 4 16
 loadarg 5 1 get fr add x 22
+if ne hexw c 0
+matconst 16 65536
+else
 matconst 16 4096
+end
 e3 3942645760 31 5 16
 trapc 8 3
 emit 4043311295
@@ -6431,8 +6463,12 @@ trapc 3 3
 if eq c 125
 hload x 2 14
 end
-note stack is 8192 bytes per packet: one packet pass, or two for execenv (the pass bound is stack >> 13).
+note stack: 8192 bytes for renames, link and symlnk; 81920 for execprog and execpure; 90112 for
+note execenv, whose second pass decodes the environment packet.
 stack = ulong 8192
+if ne hexw c 0
+stack = ulong 81920
+end
 if eq c 233
 note x14 = env base + off (ADD), x15 = env length; length 2..4096 (CMP x15,x16 B.HI; CMP x15,#2 B.LO).
 basearg 14 get fr add x 26
@@ -6444,12 +6480,12 @@ e3 3942645760 31 15 16
 trapc 8 3
 emit 4043311615
 trapc 3 3
-stack = ulong 16384
+stack = ulong 90112
 end
 spsub stack
 stkchk
 pass = ulong 0
-while lt pass shr stack 13
+while lt pass hnpass c
 if eq pass 1
 note MOV x4,x14; MOV x5,x15 (ORR with XZR): the environment packet.
 e3 2852126720 4 31 14
@@ -6460,7 +6496,7 @@ emit 2432698500
 emit 3506440357
 emit 4043309279
 trapc 0 3
-matconst 16 64
+matconst 16 hplim c pass
 e3 3942645760 31 6 16
 trapc 8 3
 if or or eq c 125 eq c 141 eq c 142
@@ -6470,11 +6506,15 @@ end
 matconst 9 0
 if eq pass 0
 emit 2432697322
-emit 2436892651
+if ne hexw c 0
+emit 2436908011
 else
-note ADD x10,SP,#2,LSL12; ADD x11,SP,#3,LSL12: env strings and env pointers.
-emit 2436893674
-emit 2436894699
+emit 2436892651
+end
+else
+note ADD x10,SP,#20,LSL12; ADD x11,SP,#21,LSL12: env strings and env pointers.
+emit 2436912106
+emit 2436913131
 end
 outer = get oc 0
 e3 3942645760 31 9 6
@@ -6708,7 +6748,7 @@ e3 4181721088 11 16 0
 spadd 640
 matconst 0 3
 e3 2852126720 1 31 11
-emit 2436892642
+emit 2436908002
 e3 2852126720 3 31 11
 matconst 4 4096
 hsys 281
@@ -6724,10 +6764,10 @@ spadd 640
 patch26 outer get oc 0
 else
 emit 2432697312
-emit 2436892641
+emit 2436908001
 if eq c 233
-note ADD x2,SP,#3,LSL12: envp is the private environment pointer list.
-emit 2436894690
+note ADD x2,SP,#21,LSL12: envp is the private environment pointer list.
+emit 2436913122
 else
 note MOV x2,x11: envp is the argv list's NULL terminator, an empty environment.
 e3 2852126720 2 31 11
@@ -15654,7 +15694,9 @@ xhcall 46
 xhdone dst x 80
 end
 note execenv 233 on x86-64: as on AArch64, a second pass decodes the environment packet (every record
-note nonempty) into env strings at RSP+8192 and env pointers at RSP+12288; both checks precede close_range.
+note nonempty) into env strings at RSP+81920 and env pointers at RSP+86016; both checks precede close_range.
+note Exec argv packets (execprog, execenv) allow 65536 bytes and 1024 records, pointers at RSP+65536;
+note renames, link, symlnk and the environment packet keep 4096 bytes and 64 records.
 fn xhpack c ulong dst ulong x ulong to void
 e = harray x 0
 if eq c 125
@@ -15674,13 +15716,16 @@ put fr add x 22 get fr add x 25
 e = get fr add x 23
 end
 xhbegin
-note stack is 8192 bytes per packet; the pass bound is stack >> 13 (two passes for execenv).
+note stack: 8192 bytes for renames, link and symlnk; 81920 for execprog; 90112 for execenv (two passes).
 stack = ulong 8192
+if ne hexw c 0
+stack = ulong 81920
+end
 if eq c 233
-stack = ulong 16384
+stack = ulong 90112
 end
 pass = ulong 0
-while lt pass shr stack 13
+while lt pass hnpass c
 if eq pass 0
 xhb 6 e get fr add x 21
 xhs 2 get fr add x 22
@@ -15689,7 +15734,11 @@ note The slot snapshot is RBX-relative, so the environment slice is read after t
 xhb 6 get fr add x 26 get fr add x 27
 xhs 2 get fr add x 28
 end
+if eq hplim c pass 1024
+xhcmp 2 65536
+else
 xhcmp 2 4096
+end
 xtrap 8 3
 xhcmp 2 2
 xtrap 3 3
@@ -15698,7 +15747,7 @@ xhadd 6 2
 xhsub 2 2
 xrr 133 8 8
 xtrap 0 3
-xhcmp 8 64
+xhcmp 8 hplim c pass
 xtrap 8 3
 if or or eq c 125 eq c 141 eq c 142
 xhcmp 8 2
@@ -15707,10 +15756,14 @@ end
 if eq pass 0
 xsp 1 stack
 xrr 137 10 4
-xmem 141 13 4 4096
+if ne hexw c 0
+xmem 141 13 4 65536
 else
-xmem 141 10 4 8192
-xmem 141 13 4 12288
+xmem 141 13 4 4096
+end
+else
+xmem 141 10 4 81920
+xmem 141 13 4 86016
 end
 ximm 9 0
 outer = get oc 0
@@ -15771,10 +15824,10 @@ ximm 2 2
 xhcall 436
 xrr 133 0 0
 p = xbranch 1
-xmem 139 7 4 4096
-xmem 141 6 4 4096
+xmem 139 7 4 65536
+xmem 141 6 4 65536
 if eq c 233
-xmem 141 2 4 12288
+xmem 141 2 4 86016
 else
 xrr 137 2 13
 end
