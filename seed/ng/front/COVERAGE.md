@@ -116,7 +116,7 @@ All entries are N at baseline except read/write/monons/realns, which are Y.
 
 All 5874 packed C2 sources and 1488 tracked .om sources were sent through front-ir (7362 inputs).
 Two cyclic size-generator C2 inputs were not materialized in this survey; FRONTGATE covers them.
-The per-input result tables are uncommitted lane evidence (no hand-off names their path); their sha256 values are
+The per-input result tables are uncommitted lane evidence (hand-off READY-omega-mv-ng-front-coverage-2 names their path); their sha256 values are
 tree.tsv 1319f3cdc9a1896472a0b365ed3b50fef7dfe5b88ad7d26310436ed0199c3ea7 (1488 rows),
 c2.tsv 95d0a7b52ef52d9d9a191fcc7c30b3e9073d733c71c8565270ab39c27a395058 (5874 rows) and
 site.tsv 7c7bfa56a76cbeaec867e8894f6ebff0761b50b023dd53139824089c3fb3412f (7362 rows).
