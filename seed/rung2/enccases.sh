@@ -1,6 +1,6 @@
 #!/bin/sh
-# enccases.sh -- the rung-2 encoder comparison cases, one per line: "<C encoder form and args>|<asm2 line>".
-# Every form in src/aarch64_encoder.h, with registers and immediates at their edges. Units: the C
+# enccases.sh -- the rung-2 encoder comparison cases, one per line: "<reference encoder form and args>|<asm2 line>".
+# Every form in src/aarch64_encoder.h, with registers and immediates at their edges. Units: the reference
 # encoder takes load/store offsets in bytes; asm2's table takes the manual's imm12 (offset / access size),
 # so the asm2 line holds offset/size. movz/movk: C takes the shift (0,16,32,48), asm2 the manual's hw.
 R="0 1 7 15 30 31"
