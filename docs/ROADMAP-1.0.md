@@ -52,10 +52,10 @@ feature anyone may want", and it never means hardware qualification beyond the t
 | OM-2 normative contract | `spec/omegese-om2.md` (sha256 `245bb74e940c811ab325e6fabb33f0599ad46aaf6b9064fd2750c43980040881`), `spec/omegese-om2-errata.md` (E1..E18), `spec/omegese-om2-measure.md` | Present only on branch `om2/contract` @ `23fc7f5c9`; not an ancestor of main. Rechecked 2026-11-10 at main `a59a425b`: all three files are on main (`60c80307`), sha256 prefixes `245bb74e`, `7b8c1ea5`, `507702d0`, equal to the pins below. OMEGESE 9.13, `OM2-TUTORIAL.md`, `om/sha256/README.md` and `seed/qualification/om2/MUTANTS.md` cite it as normative. The roadmap PR adds those three files byte-identical. |
 | OSC IR output from omc | leading `ir` line; OMEGESE section 11 | MERGED, IR version 1 scalar subset only: at most 32 functions, calls to earlier functions, no `continue`, floats, structs, globals, text or host words. |
 | OSC IR versions 2..5 (structs, arenas, pools, generation heap ops `HALLOC/HGEN/HFREE`) | `spec/one-layer-format.md`, `src/compiler/osc_ir.{c,h}` | C only; omc never emits them. Version 6 with structured `requires`/`ensures` objects is draft PR #525 (C only, front end does not fill them). |
-| Legacy C OSC compiler | `src/compiler/` (33 files, 8,830 lines of `.c`; Rechecked 2026-11-10 at main `a59a425b`: 31 files, 16 `.c` with 9,118 lines and 15 `.h`) | MERGED, legacy. Still the only compiler that parses `requires`/`ensures` (`osc_parse.h`, traps 9/10 in `osc_ir.h`). Removal is #726. |
+| Legacy C OSC compiler | `src/compiler/` (33 files, 8,830 lines of `.c`; Rechecked 2026-11-10 at main `a59a425b`: 33 tracked files: 16 `.c` with 9,118 lines, 15 `.h` and 2 `.crumb`) | MERGED, legacy. Still the only compiler that parses `requires`/`ensures` (`osc_parse.h`, traps 9/10 in `osc_ir.h`). Removal is #726. |
 | C referees | `tools/omegese/omegese.c`, `tools/omega_emit/omega_emit.c`, `src/checker2/` | Referees for gate-ir only, never write omc bytes. |
 | WebAssembly back end | `seed/wasm/irwasm.om`, `seed/wasm/gate-irwasm.sh` | MERGED (#787, closes #785). EXERCISED by its authors on host with Node v24.21.0 as validation oracle. Not referenced by any `tests/gates/*.gate` or by `tests/gates/run.sh`. |
-| OM-2 qualification conductor | `seed/qualification/om2/gate.om` (4 args: `omc pinhash casesfile scratchdir`) | MERGED. Not referenced by any gate manifest or by `seed/host/check.sh`. Rechecked 2026-11-10 at main `a59a425b`: `tests/gates/omega-security758.gate` and `run.sh security758` now build and run it, but only over `seed/qualification/security673/relational`, not every OM-2 case file. |
+| OM-2 qualification conductor | `seed/qualification/om2/gate.om` (4 args: `omc pinhash casesfile scratchdir`) | MERGED. Not referenced by any gate manifest or by `seed/host/check.sh`. Rechecked 2026-11-10 at main `a59a425b`: the "not referenced" sentence no longer holds. `seed/host/check.sh` line 30 builds it and lines 34..133 run it over 15 case files: contracts, s5, security673 packets, hex, bnd, fnhost, execenv and prlimit, plus 7 mutant sets (s5, contracts, devcall, packets, hex, bnd, fnhost). `tests/gates/run.sh seed` (`OMEGA-SEED`) runs `check.sh`, and `run.sh security758` (`omega-security758.gate`) also runs it over `seed/qualification/security673/relational`. |
 | Native host words | OMEGESE section 10, `seed/host/` | MERGED, Linux AArch64 only, program mode only, no sandbox (operate with the process's permissions). |
 | Device and mapping words | `seed/host/MAPPING.md`, `seed/host/tests/{device,devcall,mapio,mapping}.om` | MERGED. No GPU launcher and no model execution (MAPPING.md first paragraph). |
 | GPU instruction encoding | `seed/sm121/` (asm2 table, `vecadd.s2`, `gate6.sh`, `chip6.sh`) | IMPLEMENTED; table lines cite the C code generator. Chip run is BLOCKED_OPERATOR. An author run exists: `evidence/SEED-0/sm121/chip/` (2026-10-20 03:02 UTC, `omega_commit 9d5d95ad dirty=3`, session PASS, 1,048,576 additions with 0 wrong, mutant all wrong), at load average 61, not an exclusive window. |
@@ -67,7 +67,7 @@ feature anyone may want", and it never means hardware qualification beyond the t
 
 | Check | Wired into | Notes |
 |---|---|---|
-| Birth fixpoint, gates 5..18, gate-ir, host gate/negative/regression | `tests/gates/run.sh seed` (`OMEGA-SEED`) | Fails if any line starts with `SKIP`, so gate-ir must run with the C oracles built. Standalone `seed/host/check.sh` still prints `SKIP gate-ir` and continues; PR #789 (open) makes it NOT_RUN/status 3. Rechecked 2026-11-10 at main `a59a425b`: `tests/gates/run.sh` line 175 exits 1 when the seed log has any line starting with `SKIP`. |
+| Birth fixpoint, gates 5..18, gate-ir, host gate/negative/regression | `tests/gates/run.sh seed` (`OMEGA-SEED`) | Fails if any line starts with `SKIP`, so gate-ir must run with the C oracles built. Standalone `seed/host/check.sh` still prints `SKIP gate-ir` and continues; PR #789 (open) makes it NOT_RUN/status 3. Rechecked 2026-11-10 at main `a59a425b`: #789 is merged (`dc83c5bec`, train r5). `seed/host/check.sh` lines 5..9 now print `NOT_RUN gate-ir` and exit 3 when the C oracles are not built, and `tests/gates/run.sh` line 175 still exits 1 on any line starting with `SKIP`. |
 | OM-2 fixtures, C2 manifest (5,876 entries), mutants | `seed/qualification/om2/gate.om` | Run by authors (tutorial guarantee matrix); no gate manifest. |
 | irwasm differential, mutant, refusals | `seed/wasm/gate-irwasm.sh` | Run by authors; no gate manifest. |
 | SHA-256 and BLAKE3 parity, binding regeneration | `tests/gates/run.sh om-units` (`OMEGA-OM-UNITS`) | Needs `../omega-bridge` at the lock. |
@@ -81,7 +81,7 @@ feature anyone may want", and it never means hardware qualification beyond the t
    files from `om2/contract` @ `23fc7f5c9`, byte-identical (sha256 recorded in RM1).
 2. **Two merged gates run nowhere automatically.** `gate-irwasm.sh` and the OM-2 `gate.om` are absent
    from every manifest, so a regression in OM-2 or irwasm is invisible to `OMEGA-SEED`. Fix is RM1 and
-   BLOCKED_OPERATOR (touches `tests/gates/`). Rechecked 2026-11-10 at main `a59a425b`: OM-2 `gate.om` runs in OMEGA-SECURITY758 over the relational suite only; `gate-irwasm.sh` is still in no manifest (`grep -l irwasm tests/gates/*.gate tests/gates/run.sh seed/host/check.sh` prints nothing).
+   BLOCKED_OPERATOR (touches `tests/gates/`). Rechecked 2026-11-10 at main `a59a425b`: OM-2 `gate.om` is no longer absent: OMEGA-SEED runs it through `seed/host/check.sh` over 15 case files, and OMEGA-SECURITY758 over the relational suite; `gate-irwasm.sh` is still in no manifest (`grep -l irwasm tests/gates/*.gate tests/gates/run.sh seed/host/check.sh` prints nothing).
 3. **Open compiler defect #775.** An empty `text` passed to `view uchar *` reports the following text's
    bytes (reported count 32 instead of 0, reported on `e623d440` and stated to share main's code).
    Not reproduced in this audit (no builds were run). It is a memory-safety boundary: the callee
@@ -92,11 +92,13 @@ feature anyone may want", and it never means hardware qualification beyond the t
    says seventy original fixtures; #789 measured 62. This PR corrects the first two and marks the third
    as a dated snapshot; the fourth is corrected inside #789. Rechecked 2026-11-10 at main `a59a425b`: `README.md` no longer says
    "candidate branch" (`grep -n -i 'candidate branch' README.md` prints nothing), and `OM_COMPLETION.md` now
-   carries a dated recheck of its compiler numbers.
+   carries a dated recheck of its compiler numbers. `docs/one_layer/OM2-TUTORIAL.md` lines 8..10 say the OM-2 stack
+   has merged and main compiles OM-1 and OM-2, and `seed/host/README.md` line 235 says 62 original fixtures.
 5. **Diagnostics are numeric and overloaded.** omc prints `omc: line N: error E`; codes 1..24 and
    27..29 exist (25 and 26 are unused). In `omc.om`, error 7 is raised from 109 sites, 16 from 72 and 9
    from 58, so one number names many different mistakes. `om2 diag` adds machine records
-   (`omc-diag 1 ...`) only in OM-2 units.
+   (`omc-diag 1 ...`) only in OM-2 units. Rechecked 2026-11-10 at main `a59a425b`: `seed/omc/error-codes.reg` lists codes 1..25 and
+   27..30, with 26 unused. I have not re-derived the per-code site counts.
 6. **Capacity and naming limits block real programs.** omc holds 4096 functions per unit; om4, which
    must compile `omc.om`, held 512 (raised to 4096 by the `feat/om4-fn-table` draft), 16 registers with no spilling (error 12),
    6 parameter slots, 8-character local names (error 13). These are implementation limits, not language
