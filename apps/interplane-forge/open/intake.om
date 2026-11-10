@@ -11,6 +11,8 @@ note           the allow file and command output
 note Queue lines (from a less trusted process, so every field is checked again):
 note   B <tab> rid <tab> did <tab> note     bring the project
 note   W <tab> rid <tab> did               withdraw it (only the key that brought it)
+note A queue read to its end past 262,144 bytes is renamed to queue.old, finished and removed, so
+note forged's 1 MiB cap on the queue is never permanent.
 note Bring: refused when the key is not in <work dir>allow, when the project is already on the shelf, when its storage folder already
 note exists on this node (a repository this node holds for another reason is never touched), when
 note the key has 8 open projects or the shelf has 200. Then rad seed --scope all --fetch (90 s);
@@ -58,7 +60,9 @@ global dsl ulong 1
 global dt uchar 16
 global dtl ulong 1
 global kb ulong 1
+global qe ulong 1
 text kq "queue"
+text kqold "queue.old"
 text klist "list.tsv"
 text kxt ".tmp"
 text kout "out"
@@ -621,20 +625,52 @@ n = sub n 1
 emb get d n
 end
 end
-note keep: every row but the current rid's into ob
+note keep: every row but the current rid's into ob. Rows that are not open (refusals, withdrawals)
+note share a budget of 65,536 bytes; the oldest of them are dropped first, so a key that is not
+note invited cannot grow the list past what lload reads (262,143 bytes) and push out the rows of
+note projects this program brought. Open rows are never dropped: at most 200, 887 bytes each.
 fn keep to void
 lim = get lbl 0
 put obl 0 0
+t = ulong 0
 s = ulong 0
 while lt s lim bound 4096
 e = leol s
 if and gt e s not lisrid s e
+if not lisopen s e
+t = add t add sub e s 1
+end
+end
+s = add e 1
+end
+drop = ulong 0
+if gt t 65536
+drop = sub t 65536
+end
+s = ulong 0
+while lt s lim bound 4096
+e = leol s
+if and gt e s not lisrid s e
+skip = false
+if gt drop 0
+if not lisopen s e
+skip = true
+d = add sub e s 1
+if gt d drop
+drop = ulong 0
+else
+drop = sub drop d
+end
+end
+end
+if not skip
 i = s
 while lt i e bound 262144
 emb get lb i
 i = add i 1
 end
 emb 10
+end
 end
 s = add e 1
 end
@@ -1012,15 +1048,10 @@ if eq kind 87
 withdraw
 end
 end
-fn qpass to bool
-n = get odl 0
-for i ulong n bound 512
-put pth i get od i
-end
-for i ulong len kq
-put pth add n i get kq i
-end
-put pthl 0 add n len kq
+note qchunk: the complete lines of one 64 KiB chunk of the queue file at pth, from the stored
+note offset. qe is 1 when the file opened and nothing was left to read.
+fn qchunk to bool
+put qe 0 0
 fd = fopen pth 0 get pthl 0 524288 0
 if lt fd 0
 ret false
@@ -1029,6 +1060,7 @@ off = getoff
 k = pread int fd qb 0 65536 long off
 x = fclose int fd
 if le k 0
+put qe 0 1
 ret false
 end
 m = ulong k
@@ -1055,6 +1087,74 @@ a = add e 1
 putoff add off a
 end
 ret did1
+end
+note qrotate: rename <open dir>queue to queue.old. forged creates a new queue at its next request,
+note so the queue never stays at forged's 1 MiB cap once this program has read it.
+fn qrotate to bool
+opath kqold
+m = get pthl 0
+for i ulong m bound 1100
+put pt2 i get pth i
+end
+opath kq
+n = get pthl 0
+put rpk 0 2
+put rpk 1 0
+put rpk 2 uchar and n 255
+put rpk 3 uchar shr n 8
+for i ulong n bound 1100
+put rpk add 4 i get pth i
+end
+o = add 4 n
+put rpk o uchar and m 255
+put rpk add o 1 uchar shr m 8
+for i ulong m bound 1100
+put rpk add add o 2 i get pt2 i
+end
+ret eq renames rpk 0 add add o 2 m 0 0
+end
+note qold: finish a rotated queue. The stored offset is one into queue.old while it exists and is
+note above 0 (a rotation happens only past 262,144 bytes); 0 means it was finished before a
+note restart, so it is only removed. Any line forged appended during the rename is read here.
+fn qold to bool
+opath kqold
+if ne faccess pth 0 get pthl 0 0 0
+ret false
+end
+if gt getoff 0
+for i ulong 4096
+opath kqold
+if not qchunk
+break
+end
+end
+end
+putoff 0
+opath kqold
+r = unlink pth 0 get pthl 0
+ret eq r 0
+end
+note qpass: one pass. A queue read to its end past 262,144 bytes is rotated; the second of sleep
+note lets a request forged opened before the rename finish its write before queue.old is read.
+fn qpass to bool
+if qold
+ret true
+end
+opath kq
+if qchunk
+ret true
+end
+if eq get qe 0 0
+ret false
+end
+if lt getoff 262144
+ret false
+end
+if not qrotate
+ret false
+end
+z = sleepns 1000000000
+ret true
 end
 note argp: argument i into its buffer; its length
 fn aput i ulong k ulong c uchar to void
