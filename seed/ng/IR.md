@@ -256,14 +256,22 @@ All operate on a scalar or on a VEC (lane by lane); the operands have type T unl
 | 21 | `shr` | int | amount modulo w; arithmetic for signed, logical for unsigned |
 | 22 | `rotl` | unsigned int | amount modulo w |
 | 23 | `rotr` | unsigned int | amount modulo w |
-| 24 | `min` | arith | int: by signedness. float: if one operand is NaN the other; -0 < +0 |
-| 25 | `max` | arith | mirror of min |
+| 24 | `min` | arith | int: by signedness. float: IEEE minNum as Omega `fmin` (AArch64 FMINNM): one quiet NaN gives the other operand; a signaling NaN in either operand gives a quiet NaN; two NaNs give a quiet NaN; min(-0, +0) and min(+0, -0) are -0 |
+| 25 | `max` | arith | float: as min, maximum (FMAXNM); max(-0, +0) and max(+0, -0) are +0 |
 | 26 | `fsqrt` | float (1 operand) | IEEE square root, correctly rounded |
 | 27 | `fabs` | float (1 operand) | clear the sign bit |
 | 28 | `fmath` | float (1 operand), imm | transcendental with accuracy class, below |
 | 30..35 | `eq ne lt le gt ge` | operands int, bool (eq, ne only) or float; ty bool, or VEC of bool with the operands' lanes | int by signedness; float IEEE ordered: any NaN gives false except `ne` |
 | 36 | `conv` | ty num; operand num of another type; imm | numeric conversion, below |
 | 37 | `bitcast` | ty and operand of equal bit width | reinterpret bits (one-layer-format s10.2 sets, extended to f16/bf16 with u16/i16 and fp8 with u8/i8) |
+
+Float `min`/`max` (contract correction 2026-11-10, NgIrOracle head 2): the earlier draft rule "a
+NaN operand gives the other" did not match the language. OMEGESE s9.9 defines `fmin`/`fmax` as
+FMINNM/FMAXNM and the seeded compiler measures so: fmin(sNaN, 1.0f32) is the quiet NaN 0x7fc00001;
+fmin(qNaN, 1.0) is 1.0; signed zeros as in the rows above. The quiet NaN's payload is unspecified,
+like every arithmetic NaN. x86-64 back ends: MINSS/MAXSS do not implement this rule (they return
+the second operand for any NaN and do not order signed zeros); they need an explicit NaN and
+zero sequence.
 
 Float arithmetic never contracts separate ops into a fused op; only `fma` is fused. A NaN produced
 by arithmetic may have any quiet-NaN payload; `const`, memory ops, `select`, `bitcast`, `neg` and
@@ -465,9 +473,10 @@ Other origin values are NONCANONICAL.
 |---|---|---|---|---|---|
 | 110 | `host` | i64, or 0 for class `cpu` | word id | n arguments | the Omega host word with that keyword id; result as OMEGESE s10: a count or minus the Linux errno |
 
-`imm` is the keyword id of `seed/omc/genkw.awk` (`read` 53, `write` 54, `fclose` 100 .. `vfioirq`
-232; `exit`, `const`, `qty`, `fma` and the x86efi word `efi` are not host words). The normative
-table is `seed/ng/hostwords.tsv` (columns `id word args class`, 92 rows, extracted from OMEGESE s10,
+`imm` is the keyword id of the pinned `seed/omc/omc.om` keyword lookup (`read` 53, `write` 54,
+`fclose` 100 through `vfioirq` 232, `execenv` 233 and `prlimit` 235; `exit`, `const`, `qty`,
+`fma` and the x86efi word `efi` are not host words). The normative
+table is `seed/ng/hostwords.tsv` (columns `id word args class`, 94 rows, extracted from OMEGESE s10,
 `seed/host/MAPPING.md` and the typing code of `seed/omc/omc.om` at the pin); `ngcheck --table`
 prints the table it compiles in and the gate requires those bytes to equal the file. Argument
 letters, one per source argument:
@@ -486,6 +495,69 @@ Every slice is covered by `chk.slice`/`fact.slice` on the same three values (s8)
 `cpu` (`cpufence`, `cpurelax`) have no result (ty 0); every other word has ty i64. `host` appears
 only in functions and exports (EFFECT). Host effects happen in program order; an optimizer never
 reorders, duplicates or removes a `host` op.
+
+**Reference interpreter host policy.** `ngrun FILE.ir [STEPS] [--scratch NEW-DIR] [-- ARGS...]`
+executes only host words whose effects are deterministic or confined, so a differential test can
+compare stdout and exit status with a native run. `argcnt` and `argread` see FILE.ir as argument 0
+and the ARGS after `--` as arguments 1.., so the count equals that of a native program given the
+same ARGS; `envcnt`/`envread` read ngrun's own environment. `monons`, `realns`,
+`getuid`, `geteuid`, `getgid`, `getegid`, `cpufence` and `cpurelax` execute natively; IR.md
+defines no fixed-value clock mode, so clock results are live and a test may compare only their sign.
+`sleepns 0` executes; a negative interval traps 3 as the native word does; any other interval is
+refused as nondeterministic.
+File words run only with `--scratch`: ngrun creates NEW-DIR (mode 0700; it must not exist), opens it
+with O_DIRECTORY|O_NOFOLLOW and makes it the working directory. A path over 4095 bytes or holding a
+zero byte, and a `renames` or `link` packet that is malformed (count other than 2, a record past the
+end, trailing bytes, an empty record, a zero byte), an empty `stat`, `lstat` or `readlnk` path, and a
+`stat`, `lstat` or `fstat` output under 128 bytes, trap 3 as the native word does, before
+any check below and with or without `--scratch`. Every path must then be one nonempty component (no
+`/`, not `.` or `..`); `renames` and `link` packets must hold exactly two such names. Opens add
+O_NOFOLLOW, and `chdir` opens the name with O_PATH|O_DIRECTORY|O_NOFOLLOW and changes directory with
+`fchdir`, so neither follows a final link. `stat`, `chmod`, `chown`, `truncate` and `faccess`, which
+follow a final link natively, open the name with O_PATH|O_NOFOLLOW, return -40 (ELOOP) when it is a
+link, and otherwise act on `/proc/self/fd/N`, the inode that open found; the kernel's EINVAL checks
+that precede the lookup (`faccess` mode outside 0..7, `truncate` length below 0) come first. So a
+link another process plants in NEW-DIR while ngrun runs is never followed. The interpreted program
+cannot create a link itself (`symlnk` is refused), so a native run and ngrun agree on every result.
+Descriptors are virtual: stdin (0) may be read and stdout/stderr (1, 2) written, and `fclose` may
+close any of the three, as a native program may; every other operation needs a descriptor created by
+an interpreted `fopen` or `memfd`. `memfd` names no path and runs without `--scratch`. A refused word
+prints `ngrun: refused host class C word W at OFFSET` on stderr
+and exits C before any effect. A word refused below whose native form traps 3 on its operands before
+any kernel call traps 3 first, as natively: `waitio` events outside 0..65535, a `peercred` output
+under 12 bytes, a `pollfds` length that is not a multiple of 8 or is over 8192, a `waitpid` output
+under 4 bytes, a `pipefds` output under 8 bytes, and an `execprog`, `execpure`, `execenv` or `symlnk`
+packet that breaks the packed-list rules of OMEGESE s10 (an exec argument packet, that of `execprog`,
+`execpure` or the first of `execenv`, is 2..65536 bytes with count 1..1024, as the pinned omc 564c5835
+lowers it; a `symlnk` packet and the `execenv` environment 2..4096 bytes with count 1..64; records inside
+the packet, no trailing bytes, no zero byte; a nonempty first record for the exec words, exactly two
+nonempty records for `symlnk`, every `execenv` environment record nonempty). The device class (117)
+is refused without this check: its native trap conditions (mapping-table and device-descriptor checks)
+are not mirrored, so a device word with such operands exits 117 where a native run traps 3.
+
+| exit | class | words |
+|---|---|---|
+| 115 | process | fork dupfd waitpid execprog execpure execenv killpid pipefds getpid getppid setsid getpgid setpgid getsid |
+| 116 | limits | prlimit |
+| 117 | device | devctl mapnew mapdrop mapread mapwrite devcall uvmctl mapaddr mapget mapset maphold mapbind vfioctl vfiomap vfiomapw eventfd vfioirq |
+| 118 | network | socknew listen accept connect bind recv send waitio sockname sockopt shutdown peercred pollfds sendmsg peername |
+| 119 | outside scratch | any path or descriptor word without `--scratch`, an absolute or multi-component path, `.`/`..`, a descriptor ngrun did not create (including pread/pwrite on 0..2) |
+| 120 | nondeterministic | random, sleepns with a positive interval |
+| 121 | unsafe filesystem | symlnk, syncfs, a blocking or shared-wait flock |
+| 122 | unclassified | a host word id with no row here (unreachable for accepted units) |
+| 123 | descriptor table | more than 256 live virtual descriptors |
+
+These exits sit above the trap range 101..114 and below 124 (step limit), 125 (unsupported op) and
+126 (access outside storage). They describe the reference interpreter, not program semantics:
+native code may execute every word.
+
+**Pending host words (not on main).** omega-mv `ham/om-threads` 652694b0 adds the affinity and
+priority words `cpuset` 236, `cpuget` 237, `cpunow` 238, `setprio` 239 and `getprio` 240. Main
+(82e536e1, omc 6d1b1cf5) does not have them, so they have no row in `hostwords.tsv` and no class
+above; ngcheck refuses a unit naming one (`ngcheck: EFFECT`, exit 22). When that head lands and reseeds omc, the same change
+adds their rows and refuses them by class: `cpuset`, `cpuget`, `setprio` and `getprio` as 115
+process (they read or change scheduling state of the process), `cpunow` as 120 nondeterministic
+(the CPU a thread runs on may change between calls).
 
 ### 7.12 Row table (the layout every reader uses)
 

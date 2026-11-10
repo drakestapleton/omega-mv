@@ -343,14 +343,32 @@ ret ulong bitcast uint fsqrt x
 end
 ret 0
 end
-note min and max: a NaN operand gives the other; -0 < +0 (equal values differ only in the sign bit)
+note min and max (IR.md s7.3, OMEGESE fmin/fmax, FMINNM/FMAXNM): one quiet NaN gives the other operand;
+note a signaling NaN in either operand gives that operand quieted (a first); two quiet NaNs give a; -0 < +0
 fn rn_fmm op uint t uint a ulong b ulong to ulong
 x = rn_tof t a
 y = rn_tof t b
-if ne x x
+q = ulong 0x0008000000000000
+if eq t 13
+q = 0x00400000
+end
+na = ne x x
+nb = ne y y
+if or na nb
+sa = and na eq and a q 0
+sb = and nb eq and b q 0
+if sa
+ret or a q
+end
+if sb
+ret or b q
+end
+if and na nb
+ret or a q
+end
+if na
 ret b
 end
-if ne y y
 ret a
 end
 if eq op 24
@@ -961,33 +979,7 @@ fn rn_buf o uint k uint to ulong
 ret add rn_a o k rn_a o add k 1
 end
 fn rn_host o uint to void
-w = get i_oim o
-if or eq w 199 eq w 200
-ret
-end
-if eq w 109
-rn_r o bitcast ulong monons
-ret
-end
-if eq w 130
-rn_r o bitcast ulong realns
-ret
-end
-if or eq w 53 eq w 54
-fd = int bitcast long rn_a o 1
-rn_ext o 2 rn_a o 3 rn_a o 4
-p = rn_buf o 2
-n = rn_a o 4
-k = long 0
-if eq w 54
-k = write fd r_m p n
-else
-k = read fd r_m p n
-end
-rn_r o bitcast ulong k
-ret
-end
-rn_uns o
+rn_safehost o
 end
 note ---- control (60..67) ---------------------------------------------------------------------------
 note values handed to a list of parameter values starting at v (block or function parameters)
@@ -1173,14 +1165,6 @@ end
 ret x
 end
 fn rn_load to ulong
-if or lt argcnt 2 gt argcnt 3
-rn_say 80 116
-exit 2
-end
-put r_s 5 68719476736
-if eq argcnt 3
-put r_s 5 rn_steps
-end
 m = argread 1 r_pa 0 4096
 if or le m 0 ge m 4096
 rn_say 80 116
@@ -1207,6 +1191,7 @@ rn_num n
 rn_nl
 exit 23
 end
+r = fclose int fd
 ret n
 end
 k = read int fd i_in n sub len i_in n
@@ -1215,6 +1200,7 @@ rn_say 116 141
 exit 27
 end
 if eq k 0
+r = fclose int fd
 ret n
 end
 n = add n ulong k
@@ -1222,6 +1208,7 @@ end
 ret n
 end
 fn main to int
+rn_opts
 n = rn_load
 c = ir_read 0 n
 if ne c 0
@@ -1239,6 +1226,7 @@ rn_num 30
 rn_nl
 ret 30
 end
+rn_setup
 rn_globs
 o = rn_enter f 0
 while true bound 9223372036854775807
@@ -1250,4 +1238,744 @@ put r_s 6 add get r_s 6 1
 o = rn_step o
 end
 ret 0
+end
+note ---- confined host-word execution ---------------------------------------------------------------
+note r_cfg: 0 scratch option argument, 1 first program argument, 2 scratch enabled.
+note Virtual descriptors expose only stdio and descriptors created by an interpreted host word.
+global r_cfg ulong 3
+global r_fd long 256
+global r_own uchar 256
+global r_root uchar 4096
+note r_pst: the stat structure of a name opened without following a link; r_pp: /proc/self/fd/N for it.
+global r_pst uchar 128
+global r_pp uchar 32
+text r_ppre "/proc/self/fd/"
+text r_hmsg "ngrun: refused host class "
+text r_hword " word "
+text r_hat " at "
+text r_help "ngrun: usage: ngrun FILE.ir [STEPS] [--scratch NEW-DIR] [-- ARGS...]\n"
+text r_opt0 "--scratch"
+text r_opt1 "--"
+fn rn_href o uint code int to void
+k = write 2 r_hmsg 0 len r_hmsg
+rn_num ulong code
+k = write 2 r_hword 0 len r_hword
+rn_num get i_oim o
+k = write 2 r_hat 0 len r_hat
+rn_num ulong get i_oof o
+rn_nl
+exit code
+end
+fn rn_usage to void
+k = write 2 r_help 0 len r_help
+exit 2
+end
+fn rn_argis idx ulong word view uchar * to bool
+n = argread idx r_pa 0 len r_pa
+if ne n long len word
+ret false
+end
+for j ulong len word bound 64
+if ne get r_pa j get word j
+ret false
+end
+end
+ret true
+end
+fn rn_opts to void
+for j ulong 256
+put r_fd j -1
+end
+put r_fd 0 0
+put r_fd 1 1
+put r_fd 2 2
+put r_s 5 68719476736
+put r_cfg 1 ulong argcnt
+if or lt argcnt 2 gt argcnt 4096
+rn_usage
+end
+i = ulong 2
+while lt i ulong argcnt bound 4096
+if rn_argis i r_opt1
+put r_cfg 1 add i 1
+ret
+end
+if rn_argis i r_opt0
+if ne get r_cfg 0 0
+rn_usage
+end
+i = add i 1
+if ge i ulong argcnt
+rn_usage
+end
+put r_cfg 0 i
+else
+if ne i 2
+rn_usage
+end
+put r_s 5 rn_steps
+end
+i = add i 1
+end
+end
+fn rn_setup to void
+idx = get r_cfg 0
+if eq idx 0
+ret
+end
+n = argread idx r_root 0 len r_root
+if or le n 0 ge n long len r_root
+rn_usage
+end
+note A fresh private directory is required. Existing trees, hard links and preplanted symlinks are not admitted.
+k = makedir r_root 0 ulong n 448
+if ne k 0
+rn_usage
+end
+note AArch64 Linux: O_DIRECTORY 16384, O_NOFOLLOW 32768, O_CLOEXEC 524288.
+flags = or int 16384 or int 32768 int 524288
+fd = fopen r_root 0 ulong n flags 0
+if lt fd 0
+rn_usage
+end
+k = fchdir int fd
+cl = fclose int fd
+if ne k 0
+rn_usage
+end
+put r_cfg 2 1
+end
+fn rn_hr o uint value long to void
+rn_r o bitcast ulong value
+end
+fn rn_fget o uint slot uint to int
+v = bitcast long rn_a o slot
+if or lt v 0 ge v 256
+ret -1
+end
+ret int get r_fd ulong v
+end
+fn rn_fadd o uint actual long to long
+if lt actual 0
+ret actual
+end
+for j ulong 256
+if lt get r_fd j 0
+put r_fd j actual
+put r_own j 1
+ret long j
+end
+end
+k = fclose int actual
+rn_href o 123
+ret 0
+end
+note A path over 4095 bytes or holding a zero byte traps 3 natively before any kernel call (OMEGESE s10),
+note with or without --scratch, so ngrun gives that trap before any confinement refusal.
+fn rn_pathspan o uint p ulong n ulong to void
+if gt n 4095
+exit 103
+end
+for i ulong n bound 4095
+if eq get r_m add p i 0
+exit 103
+end
+end
+if eq get r_cfg 2 0
+rn_href o 119
+end
+if eq n 0
+rn_href o 119
+end
+for j ulong n bound 4095
+c = get r_m add p j
+if or eq c 0 eq c 47
+rn_href o 119
+end
+end
+if eq get r_m p 46
+if eq n 1
+rn_href o 119
+end
+if eq n 2
+if eq get r_m add p 1 46
+rn_href o 119
+end
+end
+end
+end
+fn rn_path o uint slot uint to ulong
+rn_ext o slot rn_a o add slot 1 rn_a o add slot 2
+p = rn_buf o slot
+rn_pathspan o p rn_a o add slot 2
+ret p
+end
+note A packed pair contains exactly two confined component names. No symlink creation is allowed.
+note The whole packet is checked first as the native words check it (count 2, records inside the packet, no
+note trailing bytes, no empty record, no zero byte: trap 3); only then is each name confined.
+fn rn_pair o uint to ulong
+rn_ext o 1 rn_a o 2 rn_a o 3
+p = rn_buf o 1
+n = rn_a o 3
+if or lt n 6 gt n 4096
+exit 103
+end
+if ne rn_ld p 2 false 2
+exit 103
+end
+cur = add p 2
+stop = add p n
+for j ulong 2
+if gt add cur 2 stop
+exit 103
+end
+m = rn_ld cur 2 false
+cur = add cur 2
+if gt m sub stop cur
+exit 103
+end
+if eq m 0
+exit 103
+end
+for i ulong m bound 4096
+if eq get r_m add cur i 0
+exit 103
+end
+end
+cur = add cur m
+end
+if ne cur stop
+exit 103
+end
+cur = add p 2
+for j ulong 2
+m = rn_ld cur 2 false
+cur = add cur 2
+rn_pathspan o cur m
+cur = add cur m
+end
+ret p
+end
+note rn_pkt: the native packed-list check (OMEGESE s10, omc hpack) of the packet at operand slot k. Kind 0
+note (an exec argument packet: execprog, execpure, execenv's program) is 2..65536 bytes with count 1..1024,
+note as omc since the exec argv limits (ee5fc83e; pinned omc 564c5835); kinds 1 and 2 are 2..4096 bytes with
+note count 1..64 (exactly 2 for kind 1). Every record lies inside it, no bytes trail the last record and no
+note record holds a zero byte. Kind 0 needs a nonempty first record; kind 1 (symlnk) and kind 2 (execenv's
+note environment) need every record nonempty.
+note A violation traps 3, as natively, before ngrun's refusal of the word.
+fn rn_pkt o uint k uint kind ulong to void
+rn_ext o k rn_a o add k 1 rn_a o add k 2
+p = rn_buf o k
+n = rn_a o add k 2
+lim = ulong 4096
+if eq kind 0
+lim = ulong 65536
+end
+if or lt n 2 gt n lim
+exit 103
+end
+rn_pkrec p n kind
+end
+note rn_pkrec: the count and records of the packet of n bytes at p (rn_pkt); rn_pknul: no zero byte in m bytes.
+fn rn_pknul q ulong m ulong to void
+for i ulong m bound 65536
+if eq get r_m add q i 0
+exit 103
+end
+end
+end
+fn rn_pkrec p ulong n ulong kind ulong to void
+c = rn_ld p 2 false
+cl = ulong 64
+if eq kind 0
+cl = ulong 1024
+end
+if or eq c 0 gt c cl
+exit 103
+end
+if and eq kind 1 ne c 2
+exit 103
+end
+cur = add p 2
+stop = add p n
+for j ulong c bound 1024
+if gt add cur 2 stop
+exit 103
+end
+m = rn_ld cur 2 false
+cur = add cur 2
+if gt m sub stop cur
+exit 103
+end
+if eq m 0
+if or ne kind 0 eq j 0
+exit 103
+end
+end
+rn_pknul cur m
+cur = add cur m
+end
+if ne cur stop
+exit 103
+end
+end
+note rn_htrap: native trap 3 checks that precede any kernel call of a word ngrun refuses (OMEGESE s10; omc
+note hwaitio, hpeercr, hpollfds, hbuffer, hpack and the pipefds lowering): waitio events outside 0..65535,
+note a peercred output under 12 bytes, a pollfds length not a multiple of 8 or over 8192, a waitpid output
+note under 4 bytes, a pipefds output under 8 bytes and a malformed execprog, execpure, execenv or symlnk
+note packet. ngrun gives that trap before its refusal, so the program result equals the native one.
+fn rn_htrap o uint w ulong to void
+if eq w 123
+e = bitcast long rn_a o 2
+if or lt e 0 gt e 65535
+exit 103
+end
+end
+if eq w 220
+if lt rn_a o 4 12
+exit 103
+end
+end
+if eq w 221
+n = rn_a o 3
+if or ne and n 7 0 gt n 8192
+exit 103
+end
+end
+if eq w 116
+if lt rn_a o 4 4
+exit 103
+end
+end
+if eq w 128
+if lt rn_a o 3 8
+exit 103
+end
+end
+if or eq w 124 eq w 198
+rn_pkt o 1 0
+end
+if eq w 233
+rn_pkt o 1 0
+rn_pkt o 4 2
+end
+if eq w 142
+rn_pkt o 1 1
+end
+end
+fn rn_hargs o uint w ulong to void
+base = get r_cfg 1
+count = add sub ulong argcnt base 1
+if eq w 121
+rn_hr o long count
+ret
+end
+if eq w 136
+rn_hr o envcnt
+ret
+end
+rn_ext o 2 rn_a o 3 rn_a o 4
+idx = rn_a o 1
+p = rn_buf o 2
+n = rn_a o 4
+if eq w 137
+rn_hr o envread idx r_m p n
+ret
+end
+if ge idx count
+exit 103
+end
+real = ulong 1
+if ne idx 0
+real = add base sub idx 1
+end
+rn_hr o argread real r_m p n
+end
+fn rn_hio o uint w ulong to void
+fd = rn_fget o 1
+rn_ext o 2 rn_a o 3 rn_a o 4
+if lt fd 0
+rn_hr o -9
+ret
+end
+vfd = rn_a o 1
+if eq get r_own vfd 0
+if eq w 53
+if ne vfd 0
+rn_href o 119
+end
+else
+if eq w 54
+if and ne vfd 1 ne vfd 2
+rn_href o 119
+end
+else
+rn_href o 119
+end
+end
+end
+p = rn_buf o 2
+n = rn_a o 4
+if eq w 53
+rn_hr o read fd r_m p n
+ret
+end
+if eq w 54
+rn_hr o write fd r_m p n
+ret
+end
+pos = bitcast long rn_a o 5
+if eq w 161
+rn_hr o pread fd r_m p n pos
+ret
+end
+rn_hr o pwrite fd r_m p n pos
+end
+fn rn_hfd o uint w ulong to void
+if eq w 117
+note fstat traps 3 natively on an output under 128 bytes before any kernel call, so ngrun gives that
+note trap before its descriptor checks.
+if lt rn_a o 4 128
+exit 103
+end
+end
+fd = rn_fget o 1
+if lt fd 0
+rn_hr o -9
+ret
+end
+v = rn_a o 1
+if eq w 100
+put r_fd v -1
+put r_own v 0
+rn_hr o fclose fd
+ret
+end
+if eq get r_own v 0
+rn_href o 119
+end
+if eq w 101
+rn_hr o fsync fd
+ret
+end
+if eq w 156
+rn_hr o fdsync fd
+ret
+end
+if eq w 102
+mode = int bitcast long rn_a o 2
+rn_hr o fchmod fd mode
+ret
+end
+if eq w 103
+pos = bitcast long rn_a o 2
+whence = int bitcast long rn_a o 3
+rn_hr o fseek fd pos whence
+ret
+end
+if eq w 139
+rn_hr o ftrunc fd bitcast long rn_a o 2
+ret
+end
+if eq w 153
+rn_hr o fchdir fd
+ret
+end
+if eq w 197
+op = int bitcast long rn_a o 2
+if and ne op 8 eq and op 4 0
+rn_href o 121
+end
+rn_hr o flock fd op
+ret
+end
+rn_ext o 2 rn_a o 3 rn_a o 4
+p = rn_buf o 2
+n = rn_a o 4
+if eq w 113
+rn_hr o getdnts fd r_m p n
+ret
+end
+rn_hr o fstat fd r_m p n
+end
+note chmod, faccess, stat, truncate and chown follow a final link natively, so a link another process
+note plants in the scratch tree would take them outside it. ngrun opens the name O_PATH|O_NOFOLLOW|O_CLOEXEC
+note (AArch64 2097152, 32768, 524288), answers a link with -40 (ELOOP) as a NOFOLLOW open does, and gives
+note the native word /proc/self/fd/N, which names the inode that open found. rn_nofol returns that
+note descriptor or -errno; rn_ppath writes /proc/self/fd/N into r_pp and returns its length.
+fn rn_nofol p ulong n ulong to long
+flags = or int 2097152 or int 32768 int 524288
+fd = fopen r_m p n flags 0
+if lt fd 0
+ret fd
+end
+k = fstat int fd r_pst 0 len r_pst
+if lt k 0
+cl = fclose int fd
+ret k
+end
+note st_mode is bytes 16..19 of the AArch64 stat structure; S_IFMT 0xF000 and S_IFLNK 0xA000 are the
+note high nibble of byte 17.
+if eq and get r_pst 17 240 160
+cl = fclose int fd
+ret -40
+end
+ret fd
+end
+fn rn_ppath fd long to ulong
+for j ulong len r_ppre bound 16
+put r_pp j get r_ppre j
+end
+i = ulong len r_ppre
+v = ulong fd
+d = ulong 1
+while ge div v d 10 bound 20
+d = mul d 10
+end
+while gt d 0 bound 20
+put r_pp i uchar add 48 rem div v d 10
+i = add i 1
+d = div d 10
+end
+ret i
+end
+note The kernel's EINVAL checks that precede the lookup (faccess mode outside 0..7, truncate length below
+note 0) come first, as natively; then the name is opened without following a link (rn_nofol).
+fn rn_hnofol o uint w ulong p ulong n ulong to void
+a = bitcast long rn_a o 4
+if and eq w 144 or lt a 0 gt a 7
+rn_hr o -22
+ret
+end
+if and eq w 150 lt a 0
+rn_hr o -22
+ret
+end
+outp = ulong 0
+if eq w 140
+rn_ext o 4 rn_a o 5 rn_a o 6
+outp = rn_buf o 4
+end
+fd = rn_nofol p n
+if lt fd 0
+rn_hr o fd
+ret
+end
+m = rn_ppath fd
+k = long 0
+if eq w 140
+k = stat r_pp 0 m r_m outp rn_a o 6
+end
+if eq w 143
+k = chmod r_pp 0 m int a
+end
+if eq w 144
+k = faccess r_pp 0 m int a
+end
+if eq w 150
+k = truncate r_pp 0 m a
+end
+if eq w 151
+k = chown r_pp 0 m int a int bitcast long rn_a o 5
+end
+cl = fclose int fd
+rn_hr o k
+end
+fn rn_hpath o uint w ulong to void
+if or or eq w 133 eq w 140 eq w 149
+note stat, lstat and readlnk trap 3 natively on an empty path, and stat and lstat on an output under
+note 128 bytes, before any kernel call and with or without --scratch, so ngrun gives that trap first.
+if eq rn_a o 3 0
+exit 103
+end
+if and ne w 133 lt rn_a o 6 128
+exit 103
+end
+end
+p = rn_path o 1
+n = rn_a o 3
+if eq w 110
+flags = int bitcast long rn_a o 4
+mode = int bitcast long rn_a o 5
+note NOFOLLOW prevents an open through a link even if another same-user process plants one.
+flags = or flags 32768
+rn_hr o rn_fadd o fopen r_m p n flags mode
+ret
+end
+if eq w 111
+rn_hr o unlink r_m p n
+ret
+end
+if eq w 112
+mode = int bitcast long rn_a o 4
+rn_hr o makedir r_m p n mode
+ret
+end
+if eq w 126
+rn_hr o rmdir r_m p n
+ret
+end
+if eq w 138
+note chdir through an O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC descriptor (AArch64 2097152, 16384, 32768,
+note 524288): a final link another process plants is not followed, so the working directory stays inside
+note the scratch tree. Search permission is checked by fchdir as chdir checks it.
+flags = or int 2097152 or int 16384 or int 32768 int 524288
+fd = fopen r_m p n flags 0
+if lt fd 0
+rn_hr o fd
+ret
+end
+k = fchdir int fd
+cl = fclose int fd
+rn_hr o k
+ret
+end
+if or or or eq w 140 eq w 143 or eq w 144 eq w 150 eq w 151
+rn_hnofol o w p n
+ret
+end
+rn_ext o 4 rn_a o 5 rn_a o 6
+outp = rn_buf o 4
+cap = rn_a o 6
+if eq w 133
+rn_hr o readlnk r_m p n r_m outp cap
+ret
+end
+rn_hr o lstat r_m p n r_m outp cap
+end
+fn rn_safehost o uint to void
+w = get i_oim o
+rn_htrap o w
+if or eq w 199 eq w 200
+ret
+end
+if eq w 109
+rn_hr o monons
+ret
+end
+if eq w 130
+rn_hr o realns
+ret
+end
+if or or eq w 121 eq w 122 or eq w 136 eq w 137
+rn_hargs o w
+ret
+end
+if or or eq w 53 eq w 54 or eq w 161 eq w 162
+rn_hio o w
+ret
+end
+if or eq w 145 eq w 146
+if eq w 145
+rn_hr o getuid
+else
+rn_hr o geteuid
+end
+ret
+end
+if or eq w 147 eq w 148
+if eq w 147
+rn_hr o getgid
+else
+rn_hr o getegid
+end
+ret
+end
+if eq w 235
+rn_href o 116
+end
+if or and ge w 166 le w 177 and ge w 228 le w 232
+rn_href o 117
+end
+if or and ge w 104 le w 106 or eq w 114 eq w 115
+rn_href o 118
+end
+if or or eq w 118 eq w 119 or eq w 123 eq w 131
+rn_href o 118
+end
+if or eq w 134 or eq w 165 or and ge w 220 le w 222 eq w 224
+rn_href o 118
+end
+if or eq w 135 eq w 120
+if eq w 120
+note sleepns traps 3 natively on a negative interval (OMEGESE s10): a deterministic result, not a wait.
+if lt bitcast long rn_a o 1 0
+exit 103
+end
+if eq rn_a o 1 0
+rn_hr o sleepns 0
+ret
+end
+end
+rn_href o 120
+end
+if or or eq w 107 eq w 108 or eq w 116 eq w 124
+rn_href o 115
+end
+if or or eq w 127 eq w 128 or eq w 129 eq w 154
+rn_href o 115
+end
+if or and ge w 158 le w 160 or eq w 163 or eq w 198 eq w 233
+rn_href o 115
+end
+if or eq w 142 eq w 164
+rn_href o 121
+end
+if or or eq w 100 eq w 101 or eq w 102 eq w 103
+rn_hfd o w
+ret
+end
+if or or eq w 113 eq w 117 or eq w 139 eq w 153
+rn_hfd o w
+ret
+end
+if or eq w 156 eq w 197
+rn_hfd o w
+ret
+end
+if or and ge w 110 le w 112 or eq w 126 eq w 138
+rn_hpath o w
+ret
+end
+if or or eq w 133 eq w 140 or eq w 143 eq w 144
+rn_hpath o w
+ret
+end
+if or eq w 149 or eq w 150 eq w 151
+rn_hpath o w
+ret
+end
+if eq w 132
+if eq get r_cfg 2 0
+rn_href o 119
+end
+rn_ext o 1 rn_a o 2 rn_a o 3
+rn_hr o cwd r_m rn_buf o 1 rn_a o 3
+ret
+end
+if eq w 155
+if eq get r_cfg 2 0
+rn_href o 119
+end
+rn_hr o umask int bitcast long rn_a o 1
+ret
+end
+if eq w 157
+rn_ext o 1 rn_a o 2 rn_a o 3
+p = rn_buf o 1
+flags = int bitcast long rn_a o 4
+rn_hr o rn_fadd o memfd r_m p rn_a o 3 flags
+ret
+end
+if or eq w 125 eq w 141
+p = rn_pair o
+if eq w 125
+flags = int bitcast long rn_a o 4
+rn_hr o renames r_m p rn_a o 3 flags
+else
+rn_hr o link r_m p rn_a o 3
+end
+ret
+end
+rn_href o 122
 end
