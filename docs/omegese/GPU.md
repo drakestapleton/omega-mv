@@ -6,6 +6,13 @@ Tool: `tools/omegese/omegese.c`; IR: `src/compiler/osc_ir.h` (encoding version 8
 (`src/omega_blackwell_codegen.h`), launcher: `src/omega_osc_launch.c`. No second encoder.
 Tests: `make test-osc-gpu` (host simulator), `make test-osc-gpu-chip` (the GB10).
 
+CUDApp integration numbering (2026-11-10): BlackwellIR reserves opcode 64 for
+CUDApp main's ATOMG MIN. The unsigned conversion producers use 65 (I2FP_U32)
+and 66 (F2I_U32), matching the C migration oracle enum. This is the internal
+BlackwellIR numbering, not OSC IR version 8; OSC wire opcodes and version stay
+unchanged. Historical receipts are not renumbered. The CUDApp consumer must
+repin its C1 source together with the encoder change.
+
 Current-main restoration (2026-11-06): this draft integrates the historical
 `c1/chip-fix` implementation onto main `9a9263208650e0c5830807cde6e4691b6a49042e`.
 Old receipts below are historical context, not qualification of this revision.

@@ -148,7 +148,8 @@ typedef enum {
     BW_IR_ATOMG_ADD_F32_STRONG_GPU, /* ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, Rd|RZ, desc[UR][Ra.64], Rb: Rd = old, mem += Rb */
     /* Omegese kernels (L386, 2026-10-21), additive. The words are the E1 conversion words the numeric
      * suite runs on the chip (src/omega_numeric.c E1_CVT: OMEGA_NOP_I2FP_U32, OMEGA_NOP_F2U). */
-    BW_IR_I2FP_U32,     /* I2FP.F32.U32 Rd, Ra: round to nearest even; fixed latency */
+    /* Opcode 64 is reserved for CUDApp main ATOMG MIN; conversions use 65 and 66. */
+    BW_IR_I2FP_U32 = 65,     /* I2FP.F32.U32 Rd, Ra: round to nearest even; fixed latency */
     BW_IR_F2I_U32       /* F2I.U32.TRUNC.NTZ Rd, Ra: toward zero, saturating, NaN -> 0; variable latency */
 } BlackwellIROpcode;
 
