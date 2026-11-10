@@ -1,0 +1,637 @@
+note Concatenate after transport.om, pool.om, super.om, sched.om,
+note seed/authority/action.om and auth.om. CPU-only acceptance of DRA-288
+note with real forked workers running real child tools (/bin/sh): granted
+note and duplicate operations, stale input, forged proposals, revocation
+note before, during and after a tool, cancellation before, during, after and
+note racing a tool's exit, worker death mid-tool, pause and resume.
+note A job id is kind*1000 + op. Kind 1 runs "echo ok", kind 2 starts a
+note 30 s grandchild and prints its pid, kind 5 exits at once and leaves a
+note 1 s grandchild holding its output. Outcome 16+v reports verdict v.
+text tsh "/bin/sh"
+text tdc "-c"
+text tk1 "echo ok"
+text tk2 "/bin/sleep 30 & echo $!; wait"
+text tk5 "/bin/sleep 1 & exit 0"
+text sok "PASS node authority\n"
+text sproc "/proc/"
+text sstat "/stat"
+global atc long 1
+global atm long 1
+
+fn at_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+note Append text k (0 tsh, 1 tdc, 2 tk1, 3 tk2, 4 tk5) to the packed list.
+fn at_arg pk edit uchar 4096 w ulong k ulong to ulong
+m = len tsh
+if eq k 1
+m = len tdc
+end
+if eq k 2
+m = len tk1
+end
+if eq k 3
+m = len tk2
+end
+if eq k 4
+m = len tk5
+end
+put pk w uchar and m 255
+put pk add w 1 uchar shr m 8
+for j ulong m bound 64
+b = get tsh 0
+if eq k 0
+b = get tsh j
+end
+if eq k 1
+b = get tdc j
+end
+if eq k 2
+b = get tk1 j
+end
+if eq k 3
+b = get tk2 j
+end
+if eq k 4
+b = get tk5 j
+end
+put pk add add w 2 j b
+end
+ret add add w 2 m
+end
+
+note Packed argv of tool kind: /bin/sh -c <script>.
+fn at_pack kind ulong pk edit uchar 4096 to ulong
+put pk 0 3
+put pk 1 0
+w = at_arg pk 2 0
+w = at_arg pk w 1
+if eq kind 2
+ret at_arg pk w 3
+end
+if eq kind 5
+ret at_arg pk w 4
+end
+ret at_arg pk w 2
+end
+
+fn at_op op edit ulong 4 n ulong to void
+put op 0 n
+put op 1 7
+put op 2 1
+put op 3 1
+end
+
+fn at_count w ulong to void
+m = get atm 0
+a = add 512 mul w 8
+r = mapset m a 8 add mapget m a 8 1
+end
+
+note Worker: propose the job's operation, wait for the decision, run the
+note tool when granted, report. Tool runs are counted in test word 512+8w.
+fn at_job c long w ulong q ulong to void
+op = new ulong 4 0
+pk = new uchar 4096 0
+out = new uchar 4096 0
+id = sc_cell w 8
+at_op op rem id 1000
+r = auth_propose w q op 1
+v = auth_wdecide c w q 30000000000
+if ne v 0
+r = sched_wdone w q add 16 ulong v out 0
+ret
+end
+pn = at_pack div id 1000 pk
+at_count w
+o = auth_wtool c w q pk pn 1
+r = auth_wreport w q ulong o
+r = sched_wdone w q ulong o out 0
+end
+
+fn at_worker w ulong to int
+c = get atc 0
+for it ulong 1000000000
+q = sched_wjob w
+if gt q 0
+at_job c w q
+end
+r = auth_wwait c w neg int 1 1000000000
+if or eq r 2 eq r 3
+ret 0
+end
+if eq r 4
+t = auth_wctl w
+end
+if lt r 0
+ret 45
+end
+end
+ret 46
+end
+
+fn at_spawn c long w ulong to bool
+p = auth_spawn c w
+if eq p 0
+exit at_worker w
+end
+ret gt p 0
+end
+
+note Pool of 4 arenas for 2 workers, admission and review limits 8, the
+note test page, authority, both workers spawned. Exits with code on refusal.
+fn at_setup code int to long
+c = pool_new 4 2
+at_ok gt c 0 code
+put atc 0 c
+m = mapnew neg int 1 0 4096 3 33
+at_ok gt m 0 code
+put atm 0 m
+at_ok eq sup_init c 0 code
+at_ok eq sched_new c 8 8 0 code
+at_ok eq auth_new c 0 code
+for w ulong 2
+at_ok at_spawn c w code
+end
+ret c
+end
+
+fn at_down c long code int to void
+at_ok ge sched_stop c 2000000000 0 code
+sup_closeall
+at_ok eq auth_free 0 code
+at_ok eq sched_free 0 code
+at_ok eq pool_free c 0 code
+at_ok eq mapdrop get atm 0 0 code
+end
+
+fn at_step c long to void
+r = sched_step c 5000000
+k = auth_step c
+end
+
+fn at_runs to ulong
+m = get atm 0
+ret add mapget m 512 8 mapget m 520 8
+end
+
+note Step creator and authority until job j is in state st, up to ms. The
+note step comes first, so reports that preceded the state are recorded.
+fn at_until c long j ulong st ulong ms ulong to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+at_step c
+if eq get sjst j st
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+end
+ret false
+end
+
+note Step the scheduler only (nothing is decided) until worker w has
+note proposed assignment q, up to ms.
+fn at_prop c long w ulong q ulong ms ulong to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+if ge auth_cell w 72 q
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+r = sched_step c 5000000
+end
+ret false
+end
+
+note Step creator and authority until worker w's decided seq reaches q.
+fn at_decided c long w ulong q ulong ms ulong to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+if ge auth_cell w 16 q
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+at_step c
+end
+ret false
+end
+
+note Admit job id, step until it runs; its worker in test word 0 and its
+note assignment seq in word 8. Exits with code on failure.
+fn at_start c long id ulong code int to ulong
+j = sched_admit id 0 0
+at_ok ge j 0 code
+for t ulong 400
+if eq get sjst ulong j 3
+break
+end
+r = sched_step c 5000000
+end
+at_ok eq get sjst ulong j 3 code
+w = get sjw ulong j
+r = mapset get atm 0 0 8 w
+r = mapset get atm 0 8 8 sc_cell w 0
+ret ulong j
+end
+
+fn at_w to ulong
+ret mapget get atm 0 0 8
+end
+
+fn at_q to ulong
+ret mapget get atm 0 8 8
+end
+
+note The pid printed by a kind 2 tool of worker w, 0 while none.
+fn at_gpid w ulong to ulong
+b = new uchar 4096 0
+n = auth_wout w b
+v = ulong 0
+for i ulong n bound 4096
+x = get b i
+if or lt x 48 gt x 57
+ret v
+end
+v = add mul v 10 sub ulong x 48
+end
+ret 0
+end
+
+note Step until worker w's kind 2 tool has printed its grandchild's pid.
+fn at_gp c long w ulong ms ulong to ulong
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+p = at_gpid w
+if gt p 0
+ret p
+end
+if ge ulong monons dl
+ret 0
+end
+at_step c
+end
+ret 0
+end
+
+fn at_path pid ulong p edit uchar 64 to ulong
+d = new uchar 20 0
+for i ulong 6
+put p i get sproc i
+end
+x = pid
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+n = ulong 6
+for i ulong sub 20 k bound 20
+put p n get d add k i
+n = add n 1
+end
+for i ulong 5
+put p n get sstat i
+n = add n 1
+end
+ret n
+end
+
+note true while process pid exists and is neither a zombie nor dead.
+fn at_alive pid ulong to bool
+p = new uchar 64 0
+b = new uchar 512 0
+n = at_path pid p
+fd = fopen p 0 n 524288 0
+if lt fd 0
+ret false
+end
+got = read int fd b 0 511
+r = fclose int fd
+if le got 2
+ret false
+end
+rp = ulong 0
+for i ulong ulong got bound 511
+if eq get b i 41
+rp = i
+end
+end
+s = get b add rp 2
+ret and ne s 90 ne s 88
+end
+
+note Wait up to ms for pid to be gone.
+fn at_gone pid ulong ms ulong to bool
+for t ulong ms bound 100000
+if not at_alive pid
+ret true
+end
+r = sleepns 1000000
+end
+ret not at_alive pid
+end
+
+note Phase A: a granted operation is performed once; the same operation in
+note a new job is refused (7) without running its tool again.
+fn at_perform to void
+op = new ulong 4 0
+c = at_setup 10
+j = sched_admit 1001 0 0
+at_ok ge j 0 11
+at_ok at_until c ulong j 4 5000 12
+at_ok eq get sjout ulong j 2 13
+at_op op 1
+at_ok eq auth_act op 1 4 14
+at_ok eq auth_act op 2 1 15
+r = sched_review ulong j
+k = sched_admit 1001 0 0
+at_ok at_until c ulong k 4 5000 16
+at_ok eq get sjout ulong k 23 17
+at_ok eq auth_act op 2 1 18
+at_ok eq at_runs 1 19
+at_down c 20
+end
+
+note Phase B: a proposal whose dependency topic gained a newer version, or
+note whose epoch was rolled, before the decision is stale (4); a newer
+note version on an unrelated topic is not.
+fn at_stale to void
+buf = new uchar 4096 0
+op = new ulong 4 0
+c = at_setup 21
+j = sched_admit 1002 2 0
+at_ok ge j 0 22
+at_ok gt sched_publish c 2 buf 8 0 23
+w = get sjw ulong j
+at_ok at_prop c w sc_cell w 0 3000 24
+at_ok gt sched_publish c 2 buf 8 0 25
+at_ok at_until c ulong j 4 5000 26
+at_ok eq get sjout ulong j 20 27
+at_op op 2
+at_ok eq auth_act op 0 neg long 1 28
+r = sched_review ulong j
+j = sched_admit 1003 2 0
+at_ok gt sched_publish c 2 buf 8 0 29
+w = get sjw ulong j
+at_ok at_prop c w sc_cell w 0 3000 30
+at_ok gt sched_publish c 4 buf 8 0 31
+at_ok at_until c ulong j 4 5000 32
+at_ok eq get sjout ulong j 2 33
+r = sched_review ulong j
+k = at_start c 1004 34
+at_ok at_prop c at_w at_q 3000 34
+at_ok ge pool_roll c 0 35
+at_ok at_until c k 4 5000 35
+at_ok eq get sjout k 20 35
+at_down c 35
+end
+
+note Proposal word i of worker w is overwritten after it was made: a
+note proposal the worker never made.
+fn at_forge w ulong i ulong v ulong to void
+r = mapset get aumap 1 add mul w 4096 mul i 8 8 v
+end
+
+note Phase C: forged incarnation (3), job id (2) and version (1) are refused
+note and no tool runs.
+fn at_forged to void
+c = at_setup 36
+for f ulong 3
+j = at_start c add 1010 f 37
+w = at_w
+at_ok at_prop c w at_q 3000 38
+if eq f 0
+at_forge w 5 add get auinc w 1
+end
+if eq f 1
+at_forge w 2 add sc_cell w 8 1
+end
+if eq f 2
+at_forge w 0 2
+end
+at_ok at_until c j 4 5000 39
+at_ok eq get sjout j sub 19 f int add 40 f
+r = sched_review j
+end
+at_ok eq at_runs 0 44
+at_down c 45
+end
+
+note Phase D: revocation before the decision refuses the proposal (5);
+note revocation while a tool runs kills its whole process group and
+note records UNKNOWN, after which the operation is never retried (7);
+note revocation after the tool exited but before its report was recorded
+note still records it as performed.
+fn at_revoke to void
+op = new ulong 4 0
+c = at_setup 50
+j = at_start c 1020 51
+at_ok at_prop c at_w at_q 3000 51
+g = auth_revoke c
+at_ok at_until c j 4 5000 52
+at_ok eq get sjout j 21 52
+r = sched_review j
+j = at_start c 2021 53
+w = at_w
+p = at_gp c w 5000
+at_ok gt p 0 53
+at_ok at_alive p 54
+g = auth_revoke c
+at_ok at_until c j 4 5000 55
+at_ok eq get sjout j 0 56
+at_op op 21
+at_ok eq auth_act op 1 3 57
+at_ok at_gone p 3000 58
+at_ok eq auth_cell w 112 0 59
+r = sched_review j
+j = at_start c 1021 60
+at_ok at_until c j 4 5000 60
+at_ok eq get sjout j 23 61
+at_ok eq at_runs 1 62
+r = sched_review j
+j = at_start c 1022 63
+w = at_w
+at_ok at_decided c w at_q 3000 63
+at_ok eq auth_cell w 24 0 63
+dl = add ulong monons 3000000000
+for t ulong 1000000
+if or ge auth_cell w 80 at_q ge ulong monons dl
+break
+end
+r = sched_step c 5000000
+end
+at_ok ge auth_cell w 80 at_q 64
+g = auth_revoke c
+at_ok at_until c j 4 5000 65
+at_op op 22
+at_ok eq auth_act op 1 4 66
+at_ok eq get sjout j 2 67
+at_down c 68
+end
+
+note Phase E: cancel before start frees the job with no action; cancel of a
+note running tool kills its group and records UNKNOWN; cancel after the
+note result is in review changes nothing; cancel after the tool's own
+note process exited (its grandchild still holding the output) records
+note performed and still kills the leftover grandchild.
+fn at_cancel to void
+op = new ulong 4 0
+c = at_setup 70
+k = auth_pause c true
+j = sched_admit 1030 0 0
+at_ok ge j 0 71
+at_ok eq auth_cancel c ulong j 1 71
+at_ok eq get sjst ulong j 0 72
+at_op op 30
+at_ok eq auth_act op 0 neg long 1 72
+k = auth_pause c false
+i = at_start c 2031 73
+w = at_w
+p = at_gp c w 5000
+at_ok gt p 0 73
+at_ok eq auth_cancel c i 2 74
+at_ok at_until c i 4 5000 75
+at_ok eq get sjout i 0 75
+at_op op 31
+at_ok eq auth_act op 1 3 76
+at_ok at_gone p 3000 77
+r = sched_review i
+i = at_start c 1032 78
+at_ok at_until c i 4 5000 78
+at_ok eq auth_cancel c i 3 79
+at_ok eq get sjout i 2 79
+at_op op 32
+at_ok eq auth_act op 1 4 80
+r = sched_review i
+at_race c 81
+at_down c 89
+end
+
+note Kind 5: the shell exits at once, its 1 s grandchild keeps the output
+note open, the cancel lands 200 ms later.
+fn at_race c long code int to void
+op = new ulong 4 0
+i = at_start c 5033 code
+w = at_w
+at_ok at_decided c w at_q 3000 code
+dl = add ulong monons 3000000000
+for t ulong 1000000
+if or gt auth_cell w 112 0 ge ulong monons dl
+break
+end
+r = sleepns 1000000
+end
+pg = auth_cell w 112
+at_ok gt pg 0 82
+r = sleepns 200000000
+at_ok eq auth_cancel c i 2 83
+at_ok at_until c i 4 5000 84
+at_ok eq get sjout i 2 85
+at_op op 33
+at_ok eq auth_act op 1 4 86
+at_ok eq auth_cell w 96 0 87
+gone = false
+for t ulong 3000
+if eq killpid neg int pg 0 neg long 3
+gone = true
+break
+end
+r = sleepns 1000000
+end
+at_ok gone 88
+end
+
+note Phase F: a worker killed while its tool runs: the creator kills the
+note tool's process group and records UNKNOWN; the job is UNKNOWN.
+fn at_death to void
+op = new ulong 4 0
+c = at_setup 90
+i = at_start c 2040 91
+w = at_w
+p = at_gp c w 5000
+at_ok gt p 0 92
+at_ok eq killpid int get swpid w 9 0 93
+at_ok at_until c i 6 5000 94
+at_op op 40
+at_ok eq auth_act op 1 3 95
+at_ok at_gone p 3000 96
+at_ok eq auth_cell w 112 0 97
+at_down c 98
+end
+
+note Every live worker has acknowledged the latest control with paused
+note flag pv, within ms; stepping meanwhile.
+fn at_acked c long pv ulong ms ulong to bool
+dl = add ulong monons mul ms 1000000
+for t ulong 1000000
+ok = true
+for w ulong 2
+if or ne auth_cell w 64 auth_cell w 0 ne auth_cell w 104 pv
+ok = false
+end
+end
+if ok
+ret true
+end
+if ge ulong monons dl
+ret false
+end
+at_step c
+end
+ret false
+end
+
+note Phase G: pause reaches every worker through its control notification;
+note while paused a proposal is held undecided and a ready job is not
+note assigned; resume decides and assigns, and both jobs are performed.
+fn at_pausec to void
+c = at_setup 115
+j = at_start c 1050 116
+w = at_w
+q = at_q
+at_ok at_prop c w q 3000 117
+k = auth_pause c true
+at_ok at_acked c 1 1000 118
+i = sched_admit 1051 0 0
+at_ok ge i 0 119
+for t ulong 60
+at_step c
+end
+at_ok lt auth_cell w 16 q 120
+at_ok eq get sjst ulong i 2 121
+k = auth_pause c false
+at_ok at_acked c 0 1000 122
+at_ok at_until c j 4 5000 123
+at_ok eq get sjout j 2 124
+at_ok at_until c ulong i 4 5000 125
+at_ok eq get sjout ulong i 2 126
+at_ok eq at_runs 2 127
+at_down c 128
+end
+
+fn main to int
+at_perform
+at_stale
+at_forged
+at_revoke
+at_cancel
+at_death
+at_pausec
+if ne write 1 sok 0 len sok long len sok
+ret 100
+end
+ret 0
+end

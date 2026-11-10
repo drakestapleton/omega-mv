@@ -362,7 +362,7 @@ program (1575 mutants) and 500 walks of up to 40 items (17386 items) found no fa
 
 ## 7. Phase 2
 
-1. Prompt-only trial on the dev tasks, no mask (done once, 2026-10-15): the 30B on our own engine, one
+1. Prompt-only trial on the dev tasks, no mask (done once, 2026-10-15): the 30B on my own engine, one
    attempt, harness run `20261015T105049Z-e27a33ee052d-1500714` (RUN VALID): Omegese 3/10, text 3/10,
    structured 0/10; completion tokens 1015 / 1346 / 12027. 8 of 10 first answers were refused only for
    writing the task signature's type names (`u8`, `u32`); those are now accepted.
@@ -370,7 +370,7 @@ program (1575 mutants) and 500 walks of up to 40 items (17386 items) found no fa
    failures wrote nested values (`n = add (mul (uint 3) n) 1`), which v0 refused. Values now nest (section 3): 5 of
    those 6 answers, kept verbatim in `tests/one_layer/omegese/trial2`, now pass checker2; the sixth
    (dev07) has one value too many and is still refused, with its place. Rerun owed.
-2. The mask inside our own engine: `omegese next` as a table on the GPU, one lookup per token;
+2. The mask inside my own engine: `omegese next` as a table on the GPU, one lookup per token;
    positions with one legal word need no model step.
 3. A pre-registered held-out comparison: exp445 revision r3 (`docs/one_layer/EXP445_PROTOCOL.md`
    section 13), Omegese against OSC text. The `omegese` arm's system prompt is
@@ -1048,6 +1048,7 @@ Non-byte arrays and mismatched scalar types are error 7.
 | `execprog A off n` | Replace the process using a packed argument list. Only returns on failure. |
 | `execpure A off n` | Keyword id 198, AArch64 only (x86 emission refuses with error 25). As `execprog`, then pin the executable as descriptor 3 and apply the fixed strict stdio profile below before `execveat(AT_EMPTY_PATH)`. Only returns on failure, with the first failing step's negative errno. |
 | `execenv A off n B off m` | Keyword id 233, AArch64 and x86linux. As `execprog A off n`, but the child's environment is exactly packet B (u16 count 1..64, nonempty u16-length records, 2..4096 bytes, no embedded zero, no trailing bytes) instead of an empty one. Both packets are checked (trap 3) before descriptors above 2 close. Only returns on failure, with a negative errno; refused in function mode (error 9) and in contracts (error 30). Gate: `seed/host/execenv/`. |
+| `prlimit pid res A off n` | Keyword id 235, AArch64 and x86linux: Linux `prlimit64` (syscall 261 / 302). `pid` and `res` are int (0 = this process), A a writable byte array, `off` and `n` ulong. `n` 16 reads: the old `{rlim_cur, rlim_max}` is written to `A[off..off+16)` as two little-endian u64. `n` 32 sets: the new pair is read from `A[off..off+16)` and the old pair is written to `A[off+16..off+32)`. Any other `n` returns -22 without a kernel call; with `n` 32 the kernel also returns -22 (EINVAL) when the new soft value is above the new hard value, which does not mean a bad `n`. The slice `A[off..off+n)` is checked first (trap 3). Returns 0 or a negative errno. Limits are inherited across `fork` and kept across `execprog` (the gate checks RLIMIT_AS in an exec'd child). Refused in function mode (error 9), in contracts (error 30) and under `target x86efi` (error 25). Gate: `seed/host/prlimit/`. |
 | `argcnt` | Return argument count, including the executable name. |
 | `argread index A off capacity` | Copy argument bytes without a terminator; return byte length. An invalid index traps 3. Insufficient capacity returns -105 without changing the slice. |
 | `envcnt` | Return the number of entries in the process environment (the `envp` the kernel supplied). |

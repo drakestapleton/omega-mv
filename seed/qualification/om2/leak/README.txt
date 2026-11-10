@@ -35,7 +35,7 @@ A branch to a trap stub is NOT sufficient proof that it is never taken. Required
 This scans data MANUAL trap=5, verdict NOT_RUN. Native program-mode twins reachable-zero.om and
 reachable-big.om execute that same loaded conversion with 0 and 2^32: gate checks exits 0 and 105.
 Only a conversion CBNZ-to-trap whose check register is proven zero through an AND with a known
-constant mask can be discharged. We track known-zero bits for GPRs: constants, MOVK, AND-immediate
+constant mask can be discharged. The check tracks known-zero bits for GPRs: constants, MOVK, AND-immediate
 (Arm DecodeBitMasks) or AND-register, copies and UBFM/LSR. AND-proof provenance must survive to the
 check; canonicalization of a loaded narrow value alone is not an AND proof. Joins intersect zero
 bits and proof bits. CBNZ with all bits known zero and AND provenance is data never-taken-trap-check.

@@ -1,0 +1,511 @@
+note seed/node/tests/release-gate.om: the release stop gate (prefix rg). `release stop` must
+note make a durable pause (op 1: PAUSE then OPER in the journal) before it drains and stops the
+note node. An OM-2 driver composed after json.om and drv.om:
+note   { printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/release-gate.om; } | seed/out/omc
+note   release-gate BUILD OMC40 OUT
+note BUILD holds `release`, `code-main`, `infer`, `tool`, `op` and `fake-serve` (release build);
+note OMC40 is passed to `release start`; all three are absolute. T = OUT/release-gate.d is removed
+note first and kept afterwards: state/ (two objectives, empty root), map (empty: every model
+note request gets 404 after 4000 ms, so an objective ends 16 after one turn), fake.log, start.out,
+note start.err, stop.out, stop.err. Steps: fake-serve on a free port; `release start T/state BUILD
+note OMC40 PORT VIEW`; wait for the first CWE job event in run.out (objective 0's inference is in
+note flight, objective 1 still has to run); `release stop T/state`; then the checks:
+note   stop-rc             the stop exited 0 (detail: its first stderr line)
+note   stop-journal-pause  the journal holds a PAUSE (7) with word 3 = 1, an OPER (9) of op 1
+note                       after it, and no START (3) after it: the pause was durable and no
+note                       job was granted once it was
+note   stop-view-paused    view-at-stop.json has authority.paused 1 and queue.running 0
+note   stop-node-gone      the pid in node.pid no longer exists
+note Prints PASS|FAIL NAME DETAIL per check, then RELGATE pass=P fail=F; exits 0 when nothing
+note failed, 1 otherwise, 2 for bad usage. A setup failure is FAIL setup or FAIL start. The node's
+note process group (the `release start` pid) and fake-serve get SIGKILL at the end.
+
+text rgusage "usage: release-gate BUILD OMC40 OUT (absolute paths of at most 3000 bytes)\n"
+text rgdir "/release-gate.d"
+text rgjobs "/state/root/jobs"
+text rgstate "/state"
+text rgobjf "/state/objs.txt"
+text rgobjs "add,1,2,3,jobs/a.om,Fix it.\nadd,1,2,3,jobs/b.om,Fix it.\n"
+text rgmap "/map"
+text rgfake "/fake-serve"
+text rgflog "/fake.log"
+text rgrel "/release"
+text rgcst "start"
+text rgcsp "stop"
+text rgsto "/start.out"
+text rgste "/start.err"
+text rgspo "/stop.out"
+text rgspe "/stop.err"
+text rgrun "/state/run.out"
+text rgjour "/state/journal/journal"
+text rgvas "/state/view-at-stop.json"
+text rgpidf "/state/node.pid"
+text rgport "PORT "
+text rgcwe "\nCWE "
+text rgdly "4000"
+text rgkauth "authority"
+text rgkq "queue"
+text rgkpz "paused"
+text rgkrun "running"
+text rgnset "setup"
+text rgnstr "start"
+text rgnrc "stop-rc"
+text rgnjp "stop-journal-pause"
+text rgnvp "stop-view-paused"
+text rgngo "stop-node-gone"
+text rgdfix "fixture under OUT/release-gate.d: "
+text rgdfak "fake-serve did not print PORT within 5 s; pid "
+text rgdcwe "no CWE job event in run.out within 30 s"
+text rgdrc "rc="
+text rgderr " stderr: "
+text rgdrec "records="
+text rgdps " pause_at="
+text rgdnone "none"
+text rgdop " oper_op1_after="
+text rgdst " start_after="
+text rgdjno "journal unreadable: "
+text rgdvno "view-at-stop.json unreadable or not JSON: "
+text rgdpz "paused="
+text rgdrun " running="
+text rgdpid "pid="
+text rgdk0 " kill0="
+text rgdpno "node.pid unreadable: "
+text rgsum "RELGATE pass="
+text rgsfl " fail="
+text rgnl "\n"
+
+note rgp: paths 0 BUILD, 1 OMC40, 2 T, 4096 bytes each; rgl their lengths. rgg: [0] fake-serve
+note pid, [1] the node's process group (the `release start` pid); 0 when none. rgj: rg_jsc's
+note journal scan.
+global rgp uchar 12288
+global rgl ulong 4
+global rgg ulong 4
+global rgj ulong 4
+
+note rg_set k a: store a as path k.
+fn rg_set k ulong a view uchar * to void
+put rgl k len a
+for i ulong len a bound 4096
+put rgp add mul k 4096 i get a i
+end
+end
+
+note rg_cp d k: path k into d; its length.
+fn rg_cp d edit uchar 4096 k ulong to ulong
+n = get rgl k
+for i ulong n bound 4096
+put d i get rgp add mul k 4096 i
+end
+ret n
+end
+
+note rg_pj d k s: path k followed by s, into d; the length, or dvnone when it does not fit.
+fn rg_pj d edit uchar 4096 k ulong s view uchar * to ulong
+n = rg_cp d k
+ret dv_cat d n s
+end
+
+note rg_pa pk p k s: path k followed by s appended to the packed list pk[0, p) (dv_pkadd).
+fn rg_pa pk edit uchar 4096 p ulong k ulong s view uchar * to ulong
+pa = new uchar 4096 0
+n = rg_pj pa k s
+if eq n dvnone
+ret dvnone
+end
+ret dv_pkadd pk p part pa 0 n
+end
+
+note rg_pn pk p v: the decimal v appended to the packed list pk[0, p).
+fn rg_pn pk edit uchar 4096 p ulong v ulong to ulong
+d = new uchar 24 0
+n = dv_fmtu d 0 v
+ret dv_pkadd pk p part d 0 n
+end
+
+note rg_pb pk p k: path k alone appended to the packed list pk[0, p).
+fn rg_pb pk edit uchar 4096 p ulong k ulong to ulong
+pa = new uchar 4096 0
+n = rg_cp pa k
+ret dv_pkadd pk p part pa 0 n
+end
+
+note rg_go pk p w: spawn pk[0, p) with stdout and stderr by w: 0 T/fake.log for both, 1
+note T/start.out and T/start.err, 2 T/stop.out and T/stop.err; the pid, or -22 when the list did
+note not fit.
+fn rg_go pk view uchar 4096 p ulong w ulong to long
+o = new uchar 4096 0
+e = new uchar 4096 0
+if eq p dvnone
+ret neg long 22
+end
+on = rg_pj o 2 rgflog
+en = rg_pj e 2 rgflog
+if eq w 1
+on = rg_pj o 2 rgsto
+en = rg_pj e 2 rgste
+end
+if eq w 2
+on = rg_pj o 2 rgspo
+en = rg_pj e 2 rgspe
+end
+ret dv_spawn part pk 0 p part o 0 on part e 0 en
+end
+
+note rg_prep: remove T, then create T/state/root/jobs, the empty map and objs.txt; 0 or the error.
+fn rg_prep to long
+pa = new uchar 4096 0
+z = new uchar 1 0
+n = rg_cp pa 2
+r = dv_rmrf part pa 0 n
+if ne r 0
+ret r
+end
+n = rg_pj pa 2 rgjobs
+r = dv_mkdirp part pa 0 n
+if ne r 0
+ret r
+end
+n = rg_pj pa 2 rgmap
+r = dv_spit part pa 0 n part z 0 0
+if ne r 0
+ret r
+end
+n = rg_pj pa 2 rgobjf
+ret dv_spit part pa 0 n rgobjs
+end
+
+note rg_until s nd ms: whether file T+s holds nd within ms milliseconds (polled every 50 ms).
+fn rg_until s view uchar * nd view uchar * ms ulong to bool
+pa = new uchar 4096 0
+b = new uchar 65536 0
+n = rg_pj pa 2 s
+t0 = ulong monons
+while true bound 1000000
+r = dv_slurp part pa 0 n b
+if gt r 0
+if ne dv_find part b 0 ulong r nd 0 dvnone
+ret true
+end
+end
+if ge sub ulong monons t0 mul ms 1000000
+ret false
+end
+x = sleepns 50000000
+end
+ret false
+end
+
+note rg_fake po: start BUILD/fake-serve PO T/map 4000 (stdout and stderr T/fake.log).
+fn rg_fake po ulong to long
+pk = new uchar 4096 0
+p = dv_pkinit pk
+p = rg_pa pk p 0 rgfake
+p = rg_pn pk p po
+p = rg_pa pk p 2 rgmap
+p = dv_pkadd pk p rgdly
+ret rg_go pk p 0
+end
+
+note rg_start po vp: start BUILD/release start T/state BUILD OMC40 PO VP.
+fn rg_start po ulong vp ulong to long
+pk = new uchar 4096 0
+p = dv_pkinit pk
+p = rg_pa pk p 0 rgrel
+p = dv_pkadd pk p rgcst
+p = rg_pa pk p 2 rgstate
+p = rg_pb pk p 0
+p = rg_pb pk p 1
+p = rg_pn pk p po
+p = rg_pn pk p vp
+ret rg_go pk p 1
+end
+
+note rg_stop: start BUILD/release stop T/state.
+fn rg_stop to long
+pk = new uchar 4096 0
+p = dv_pkinit pk
+p = rg_pa pk p 0 rgrel
+p = dv_pkadd pk p rgcsp
+p = rg_pa pk p 2 rgstate
+ret rg_go pk p 2
+end
+
+note rg_le b o: the little-endian 64-bit word at b[o, o + 8).
+fn rg_le b view uchar * o ulong to ulong
+v = ulong 0
+for k ulong 8
+v = or v shl ulong get b add o k mul k 8
+end
+ret v
+end
+
+note rg_rc r: stop-rc, the stop's status r and the first line of T/stop.err (at most 300 bytes).
+fn rg_rc r long to void
+d = new uchar 4096 0
+pa = new uchar 4096 0
+b = new uchar 4096 0
+p = dv_cat d 0 rgdrc
+p = dv_fmtl d p r
+n = rg_pj pa 2 rgspe
+k = dv_slurp part pa 0 n b
+if gt k 0
+e = dv_find part b 0 ulong k rgnl 0
+if gt e 300
+e = 300
+end
+p = dv_cat d p rgderr
+p = dv_cat d p part b 0 e
+end
+if eq r 0
+dv_pass rgnrc part d 0 p
+else
+dv_fail rgnrc part d 0 p
+end
+end
+
+note rg_jsc b k: scan the k records of journal image b into rgj: [0] the index of the last
+note PAUSE (7) with word 3 = 1 (dvnone when none), [1] the OPERs (9) of op (word 4) 1 after it,
+note [2] the STARTs (3) after it.
+fn rg_jsc b view uchar * k ulong to void
+put rgj 0 dvnone
+put rgj 1 0
+put rgj 2 0
+for i ulong k bound 512
+o = add 64 mul i 128
+t = rg_le b o
+w = rg_le b add o 24
+if and eq t 7 eq w 1
+put rgj 0 i
+put rgj 1 0
+put rgj 2 0
+end
+w = rg_le b add o 32
+if ne get rgj 0 dvnone
+if and eq t 9 eq w 1
+put rgj 1 add get rgj 1 1
+end
+if eq t 3
+put rgj 2 add get rgj 2 1
+end
+end
+end
+end
+
+note rg_jck: stop-journal-pause. From the last PAUSE (7) with word 3 = 1: an OPER (9) whose op
+note (word 4) is 1 must follow and no START (3) may.
+fn rg_jck to void
+d = new uchar 4096 0
+pa = new uchar 4096 0
+b = new uchar 65536 0
+n = rg_pj pa 2 rgjour
+r = dv_slurp part pa 0 n b
+if lt r 64
+p = dv_cat d 0 rgdjno
+p = dv_fmtl d p r
+dv_fail rgnjp part d 0 p
+ret
+end
+k = div sub ulong r 64 128
+rg_jsc part b 0 ulong r k
+ps = get rgj 0
+op = get rgj 1
+st = get rgj 2
+p = dv_cat d 0 rgdrec
+p = dv_fmtu d p k
+p = dv_cat d p rgdps
+if eq ps dvnone
+p = dv_cat d p rgdnone
+else
+p = dv_fmtu d p ps
+end
+p = dv_cat d p rgdop
+p = dv_fmtu d p op
+p = dv_cat d p rgdst
+p = dv_fmtu d p st
+if and and ne ps dvnone gt op 0 eq st 0
+dv_pass rgnjp part d 0 p
+else
+dv_fail rgnjp part d 0 p
+end
+end
+
+note rg_jint src tape o key: the integer member key of object token o; -1 when o is jsnone, the
+note member is missing or not an integer.
+fn rg_jint src view uchar * tape view uint dvtcap o ulong key view uchar * to long
+if eq o jsnone
+ret neg long 1
+end
+t = dv_jkey src tape o key
+if eq t jsnone
+ret neg long 1
+end
+if not dv_jisl src tape t
+ret neg long 1
+end
+ret dv_jnum src tape t
+end
+
+note rg_vck: stop-view-paused, authority.paused 1 and queue.running 0 in view-at-stop.json.
+fn rg_vck to void
+d = new uchar 4096 0
+pa = new uchar 4096 0
+src = new uchar 65536 0
+tape = new uint dvtcap 0
+n = rg_pj pa 2 rgvas
+k = dv_jload part pa 0 n src tape
+if lt k 1
+p = dv_cat d 0 rgdvno
+p = dv_fmtl d p k
+dv_fail rgnvp part d 0 p
+ret
+end
+a = dv_jkey src tape 0 rgkauth
+q = dv_jkey src tape 0 rgkq
+pz = rg_jint src tape a rgkpz
+ru = rg_jint src tape q rgkrun
+p = dv_cat d 0 rgdpz
+p = dv_fmtl d p pz
+p = dv_cat d p rgdrun
+p = dv_fmtl d p ru
+if and eq pz 1 eq ru 0
+dv_pass rgnvp part d 0 p
+else
+dv_fail rgnvp part d 0 p
+end
+end
+
+note rg_gone: stop-node-gone, kill(pid, 0) of node.pid's pid is -3 (ESRCH).
+fn rg_gone to void
+d = new uchar 4096 0
+pa = new uchar 4096 0
+b = new uchar 64 0
+n = rg_pj pa 2 rgpidf
+r = dv_slurp part pa 0 n b
+e = ulong 0
+if gt r 0
+e = dv_find part b 0 ulong r rgnl 0
+if eq e dvnone
+e = ulong r
+end
+end
+v = dvnone
+if gt e 0
+v = dv_atou part b 0 e
+end
+if or eq v dvnone eq v 0
+p = dv_cat d 0 rgdpno
+p = dv_fmtl d p r
+dv_fail rgngo part d 0 p
+ret
+end
+k = dv_kill long v 0
+p = dv_cat d 0 rgdpid
+p = dv_fmtu d p v
+p = dv_cat d p rgdk0
+p = dv_fmtl d p k
+if eq k -3
+dv_pass rgngo part d 0 p
+else
+dv_fail rgngo part d 0 p
+end
+end
+
+note rg_end: SIGKILL the node's group and fake-serve, reap fake-serve, print RELGATE pass=P
+note fail=F; the exit status.
+fn rg_end to int
+d = new uchar 128 0
+if gt get rgg 1 0
+x = dv_killg long get rgg 1 9
+end
+if gt get rgg 0 0
+x = dv_killg long get rgg 0 9
+x = dv_reap long get rgg 0
+end
+p = dv_cat d 0 rgsum
+p = dv_fmtu d p dv_count 0
+p = dv_cat d p rgsfl
+p = dv_fmtu d p dv_count 1
+p = dv_cat d p rgnl
+x = dv_out part d 0 p
+if eq dv_count 1 0
+ret 0
+end
+ret 1
+end
+
+note rg_fail2 nm a v: FAIL nm with detail a followed by the decimal v.
+fn rg_fail2 nm view uchar * a view uchar * v long to void
+d = new uchar 4096 0
+p = dv_cat d 0 a
+p = dv_fmtl d p v
+dv_fail nm part d 0 p
+end
+
+fn main to int
+a = new uchar 4096 0
+if ne dv_argc 4
+x = dv_err rgusage
+ret 2
+end
+for k ulong 3
+n = dv_arg add k 1 a
+if or lt n 1 gt n 3000
+x = dv_err rgusage
+ret 2
+end
+if ne get a 0 47
+x = dv_err rgusage
+ret 2
+end
+m = ulong n
+if eq k 2
+m = dv_cat a m rgdir
+end
+rg_set k part a 0 m
+end
+r = rg_prep
+if ne r 0
+rg_fail2 rgnset rgdfix r
+ret rg_end
+end
+po = dv_port
+vp = dv_port
+for it ulong 8
+if ne vp po
+break
+end
+vp = dv_port
+end
+if or or lt po 1 lt vp 1 eq po vp
+rg_fail2 rgnset rgdfix neg long 98
+ret rg_end
+end
+f = rg_fake ulong po
+if gt f 0
+put rgg 0 ulong f
+end
+if not rg_until rgflog rgport 5000
+rg_fail2 rgnset rgdfak f
+ret rg_end
+end
+s = rg_start ulong po ulong vp
+if gt s 0
+put rgg 1 ulong s
+end
+r = dv_wait s 60000000000
+if ne r 0
+rg_fail2 rgnstr rgdrc r
+ret rg_end
+end
+if not rg_until rgrun rgcwe 30000
+dv_fail rgnset rgdcwe
+ret rg_end
+end
+t = rg_stop
+r = dv_wait t 300000000000
+rg_rc r
+rg_jck
+rg_vck
+rg_gone
+ret rg_end
+end

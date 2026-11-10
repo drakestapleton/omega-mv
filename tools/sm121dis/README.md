@@ -1,7 +1,7 @@
 # sm121dis: Omega's own GB10 disassembler
 
 A disassembler turns the GPU's machine code back into readable instructions. Omega used to borrow NVIDIA's
-`nvdisasm` for that, in every check that reads a kernel back. `sm121dis` is our own (row C6 of `docs/OMEGA.md`):
+`nvdisasm` for that, in every check that reads a kernel back. `sm121dis` is Omega's own (row C6 of `docs/OMEGA.md`):
 the decoder is `src/omega_sm121_disasm.c`, this folder holds the command line and the comparison with NVIDIA's tool.
 
 ## What it proves
@@ -25,7 +25,7 @@ the decoder is `src/omega_sm121_disasm.c`, this folder holds the command line an
 
 ## Who uses it
 
-The checks that used to call `nvdisasm` now call ours:
+The checks that used to call `nvdisasm` now call Omega's:
 
 - the listing checks inside `tests/gpu_elementwise_test.c`, `gpu_fp8_api_test.c`, `gpu_reconv_test.c`,
   `gpu_attention_test.c` and `bench/prime_race/tests/gb10_sieve_host_test.c` (linked in, `omega_sm121_listing`);
@@ -43,5 +43,5 @@ of these checks runs `nvdisasm`.
 |---|---|
 | `sm121dis.c` | command line: a listing, `-b SM121` (called like nvdisasm), `--pairs` (for the comparison), `--version` |
 | `corpus.sh` | runs every GPU test with `OMEGA_KERNEL_DUMP_DIR` set, so each kernel the library encodes is saved |
-| `check.sh` | compares our text with nvdisasm's for every saved kernel, `SM121DIS_JOBS` at a time (default: every CPU the process may use); PASS only when every word agrees |
+| `check.sh` | compares its text with nvdisasm's for every saved kernel, `SM121DIS_JOBS` at a time (default: every CPU the process may use); PASS only when every word agrees |
 | `oracle_pairs.sh` | turns nvdisasm's listing into the same one-line-per-word form |
