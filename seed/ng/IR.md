@@ -412,7 +412,7 @@ happens. Operands have the type the row names.
 | 74 | `chk.divz` | 0 | b (int) | 2 | b = 0 |
 | 75 | `chk.divovf` | 0 | a, b (signed int) | 1 | a = MIN and b = -1 (`div` only; `rem` does not trap) |
 | 76 | `chk.shl` | 0 | a, b (signed int) | 1 | the exact a x 2^b is outside the type (b already in range) |
-| 77 | `chk.shift` | 0 | b (int) | 7 | b < 0 or b >= the width of b's type (Omega shifts and rotates: amount and value share a type) |
+| 77 | `chk.shift` | 0 | b (int) | 7 | b < 0 or b >= the width of b's type (Omega rotates: amount and value share a type; an Omega shift whose amount has another integer type reaches it after conv to u64, lt the width, chk.true 7 and conv: seed/ng/front/README.md) |
 | 78 | `chk.conv` | the destination type (int) | v (int or float) | 5 | v (truncated toward zero, if float) is NaN or outside the destination |
 | 79 | `chk.bounds` | 0 | r, i, e (u64) | 3 | i + e > len r (exact, no wrap) or e = 0 |
 | 80 | `chk.slice` | 0 | r, off (u64), n (u64) | 3 | off > len r or n > len r - off |

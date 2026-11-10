@@ -95,8 +95,8 @@ failing conversions, and `while` fuel (1000000 passes, or its `bound`). Local an
 `alloca`/`gaddr` references; texts are class 1 globals.
 
 What it does not lower exits 64 with `ng: front-ir: line N: not lowered` (no output): units without
-`fn main to int` (ΩIR needs a program entry; omc writes no executable for them either), mixed-type
-shifts, and every construct outside the M1 subset (read from code: the `fe_lno` call sites).
+`fn main to int` (ΩIR needs a program entry; omc writes no executable for them either), a bool or float
+shift amount, and every construct outside the M1 subset (read from code: the `fe_lno` call sites).
 Sized array parameters are `REF` with access 1 even for `view`, since ΩIR v1 has no op that narrows a
 REF's access (so a text passed to a sized `view` parameter is not lowered); PROPOSED for ng-ir: a `view`
 op from an access-1 to an access-0 reference. Unsized (`*`) parameters are `SLICE`s of their own access
@@ -119,8 +119,8 @@ ngrun and compares exit status and stdout (stderr is free: the kernels time them
 after 1000000 passes), two signed `for` latch units of `cases/` (`for_latch_i8`, `for_latch_i64`: the body
 writes the counter's maximum and the latch's add 1 traps 1, as omc's does; fe_lendl adds it under chk.add),
 two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
-thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
-`cases/`, and the float-to-integer cases below. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
+thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last), six mixed-shift and fma run
+units of `cases/` (below), 33 refusal units of `cases/`, and the float-to-integer cases below. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
 queen) and matmul verbatim. The full-size kernels stay verbatim in `kernels/` (`kernels/PROVENANCE.md`).
 No standing gate compares all of them at full size: ng-a64's rgate front phase (ng/slice-m1, list `tfr`)
@@ -128,8 +128,10 @@ runs only the nine integer kernels (arith, branch, leafcall, fib38, fib40, isort
 natively against omc; linear (f64, rgate list `tfz`) is refused by a64, and sha, chacha and x25519 are in
 no rgate list. Full size for those four is one-off ngrun-vs-omc evidence recorded with the hand-off, not a gate.
 Every child the gate starts is killed after 600 s: that case prints `NOT_RUN` and counts in `notrun=`, never
-as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `for` latch adds 2;
-`and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped) must fail a run case,
+as ok, FAIL, a kill or a trip. Negative controls: five lowering mutants (the `for` latch adds 2;
+`and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped; a mixed-type shift amount
+checked against its own width instead of the value's; fma's second and third operands swapped) must fail a
+run case,
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
 Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
@@ -146,6 +148,25 @@ and maximum and a value past each, NaN, both infinities, both-sign fractions and
 eight bytes of the converted value so a wrong upper byte is seen, plus `seed/omc/tests/float/convert_sat.om`;
 `runs/fconv-bad-bool.om` (float to bool) must be refused as omc refuses it. The input bounds are derived in
 `float-bounds.txt` (Wolfram). `cases-fconv.txt` puts the same units through gate-front's check parity.
+
+## Mixed-type shifts and fma
+
+omc admits `shl`/`shr` with an integer value and an integer amount of another type (only a shift may mix
+its operand types) and compares the amount's 64-bit register, sign- or zero-extended by its type, unsigned
+with the value's width (`bo_schk`, trap 7): a negative amount traps like a wide one, and none is wrapped.
+`fe_lsham` lowers the amount to `conv` u64, `lt` the width, `chk.true 7` and `conv` to the value's type,
+exact because the amount is then below the width; `fe_lbop`'s checks follow unchanged. `fma a b c` lowers
+to ΩIR `fma` (46, one rounding) on three values of one float type. Run cases `cases/sh_mix*.om` and
+`cases/fma_mix.om`; their exits and stdout bytes, worked out before the run (constants from Wolfram), are in
+`cases/groups4.expect`. omc's refusals `rot_mix` (a rotate keeps one type, 7), `fma_lit` (11) and
+`fma_types` (7) are refuse cases. A bool or float shift amount, which omc also admits, and fmin/fmax (IR.md
+min/max still differs from omc's FMINNM/FMAXNM on a signaling NaN) stay not lowered; the scope gate keeps
+them failing closed, and its bool-amount admission mutant must be KILLED:
+
+    gate-front seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
+      units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
+      seed/ng/front/declared-lower-scope.txt seed/ng/front/mutants-lower-scope.txt SCRATCH \
+      seed/ng/front/cases-lower-scope.txt
 
 ## Native contracts: fail-closed lowering boundary
 
