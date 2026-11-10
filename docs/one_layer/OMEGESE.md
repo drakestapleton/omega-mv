@@ -474,9 +474,13 @@ the operations, the efi 12 file contract and qualification status.
 - `to void` makes a void function; `ret` with no value returns from it, and so does reaching its `end`.
   A function with a return type whose `end` can be reached is error 18. (s.6 t_void, s.7)
 - Arguments are read left to right, each fully before the next. (s.5 fm5)
-- Function names may have up to 63 characters; other names up to 8 (error 13). (s.4 dev01, s.7) A
-  function name longer than 8 characters is never a keyword, even when its first 8 spell one
-  (`continue_x`, `truncate_number`); a name that is exactly a keyword is error 16. (s1 kw-long-names)
+- A name may have up to 63 characters (error 13 beyond): functions, locals, parameters, `for`
+  counters, globals, texts, constants, structs and struct fields. Abstract, layout and layout-field
+  names, and every name in IR mode, stay at 8 characters (error 13). Names are compared in full:
+  `counter_a`, `counter_b` and `counter_` are three names. (s.4 dev01, s.7, `seed/omc/gate-longnames.sh`)
+  om4 keeps names other than functions at 8. A name longer than 8 characters is never a keyword, even
+  when its first 8 spell one (`continue_x`, `truncate_number`); a name that is exactly a keyword is
+  error 16. (s1 kw-long-names, s1-kw-long-field)
 - A function has at most 6 parameters; a seventh is error 9. `main` has none (error 9). A new name
   may not reuse a name already in scope, a function or a struct: error 10.
 - In program mode the stack is a fixed 8 MiB pool; a call or a local array that would go below it traps
@@ -554,7 +558,8 @@ the operations, the efi 12 file contract and qualification status.
 Input over a capacity is refused with error 14, never overrun: om4 reads at most 8 MiB - 1 bytes and
 writes at most 8 MiB, 1024 names in scope, values nested 1024 deep, 4096 functions, 8192 trap sites per function, 512 nested
 blocks. A function that needs more than the 16 registers it hands out is error 12. omc keeps the same
-input, output, nesting, trap-site, block and function limits but holds 8192 names in scope and
+input, output, nesting, trap-site, block and function limits but holds 8192 names in scope,
+4096 distinct names of 9 to 63 characters (`seed/omc/gate-longnames.sh`) and
 524288 call sites per unit (`seed/omc/gate12.sh`, `gate15.sh`), so whole programs such as an
 interpreter fit in one unit; om4 itself keeps its own smaller name and call tables. om4's function
 table (512 entries through om4 `d0da40e4`) bounds `seed/omc/omc.om` itself, which om4 must compile;
@@ -698,7 +703,7 @@ error 9. Checked by `seed/omc/gate10.sh`, which `seed/host/check.sh` runs.
 ### 9.12 Constants (omc only, gate16)
 
 `const NAME TYPE LITERAL` at top level defines a named value before use. `NAME` is at most
-8 characters and may not collide with a visible name, a function or a struct (error 10); the value
+63 characters and may not collide with a visible name, a function or a struct (error 10); the value
 must fit the type (error 8). The constant is a typed number: an integer (`uint 5`, `long -3`) or a
 float literal (`f64 0.1`, `f32 0.1`); an integer literal under a float type is refused (error 16).
 It composes wherever a value goes, including inside functions and as a call argument, and it cannot
@@ -925,7 +930,7 @@ cannot be read). In IR mode (section 11) the same codes apply; a contract line (
 | omc 10 | duplicate name |
 | omc 11 | bare number without a type from its context |
 | omc 12 | register pool exhausted |
-| omc 13 | name too long (8 bytes, 63 for a function) |
+| omc 13 | name too long (63 bytes; 8 for an abstract, a layout, a layout field, or any name in IR mode) |
 | omc 14 | capacity exceeded (names, functions, sites, nesting, input or output) |
 | omc 15 | missing end |
 | omc 16 | syntax: unknown or misplaced word |

@@ -12,7 +12,7 @@
 #   OMEGA_OMC     seed-born omc, sha256 pinned below (exit 3 NOT_RUN without it)
 #   OMEGA_BRIDGE  optional: an aien-dev/omega-bridge checkout whose src/native.om matches the pin
 set -eu
-OMC_PIN=b87c8b651fc74c90357c9a6df93172aec18e89324bd9be8adb85f5142670318e
+OMC_PIN=564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999
 NATIVE_PIN=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
 P=$(cd "$(dirname "$0")" && pwd)
 OM=$P/../aarch64.om
