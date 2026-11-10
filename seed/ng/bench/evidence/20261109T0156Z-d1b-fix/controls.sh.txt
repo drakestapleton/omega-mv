@@ -1,0 +1,52 @@
+set -u
+# D1b fix controls (lane ng-bench, 2026-11-09). Review finding F1 on 70168d58 (factory bay 6): hashpb gave
+# 2^63 for "absent" and for "present but unusable", and run mode read 2^63 as "absent".
+# Usage: bash controls.sh.txt REPO OUT NB_FIXED NB_D1B [NB_BAY6]
+#   REPO a checkout of this branch (kernels, want); OUT a scratch dir; NB_* ngbench binaries built by
+#   cat seed/ng/ngbench.om seed/ng/sha256.om seed/ng/bench/ngbench-sha.om | seed/out/omc
+# Fixture: DIR/bin/omc/arith (seeded omc build of kernels/arith.om), DIR/bin/gccO2/arith (gcc -O2 -static of
+# kernels/arith.c, any gcc: only identity and output are checked), DIR/manifest.sha256, DIR/want/arith.sha256.
+# Each case prints rc, the I row, R rows, T row count and the S row, for every binary given.
+R=$1; O=$2; NF=$3; NB=$4; N6=${5:-}
+rm -rf $O; mkdir -p $O/fx/bin/omc $O/fx/bin/gccO2 $O/fx/want
+$R/seed/out/omc < $R/seed/ng/bench/kernels/arith.om > $O/fx/bin/omc/arith; chmod +x $O/fx/bin/omc/arith
+gcc -O2 -static -o $O/fx/bin/gccO2/arith $R/seed/ng/bench/kernels/arith.c
+cp $R/seed/ng/bench/kernels/want/arith.sha256 $O/fx/want/arith.sha256
+(cd $O/fx && sha256sum bin/omc/arith bin/gccO2/arith > manifest.sha256)
+echo "fixture omc/arith $(sha256sum < $O/fx/bin/omc/arith | cut -c1-64) gccO2/arith $(sha256sum < $O/fx/bin/gccO2/arith | cut -c1-64)"
+echo "uid $(id -u) (EACCES cases need a non-root user)"
+run() { # tag dir
+  for b in fixed:$NF d1b:$NB ${N6:+bay6:$N6}; do
+    t=${b%%:*}; x=${b#*:}
+    (cd $2 && $x run 1 0 $2 omc gccO2 -- arith > $O/$1-$t.rows 2> $O/$1-$t.err); r=$?
+    echo "$1 $t rc=$r I=[$(grep '^I ' $O/$1-$t.rows | cut -c1-24)] R=[$(grep '^R ' $O/$1-$t.rows | tr '\n' ' ')] T=$(grep -c '^T ' $O/$1-$t.rows) $(grep '^S ' $O/$1-$t.rows)"
+  done
+}
+mk() { rm -rf $O/c; cp -r $O/fx $O/c; }
+# stdin file DIR/in/CASE
+mk; run pos-no-stdin $O/c
+mk; mkdir $O/c/in; printf 'hello\n' > $O/c/in/arith; run pos-stdin-6B $O/c
+mk; mkdir $O/c/in; head -c 16777215 /dev/zero > $O/c/in/arith; run pos-stdin-16MiB-1 $O/c
+mk; mkdir $O/c/in; head -c 16777216 /dev/zero > $O/c/in/arith; run nc-stdin-16MiB $O/c
+mk; mkdir -p $O/c/in/arith; run nc-stdin-directory $O/c
+mk; mkdir $O/c/in; printf 'hello\n' > $O/c/in/arith; chmod 000 $O/c/in/arith; run nc-stdin-mode000 $O/c; chmod 644 $O/c/in/arith
+# arm binary DIR/bin/ARM/CASE
+mk; truncate -s 16777216 $O/c/bin/gccO2/arith; (cd $O/c && sha256sum bin/omc/arith bin/gccO2/arith > manifest.sha256); run nc-bin-16MiB-listed $O/c
+mk; truncate -s 16777216 $O/c/bin/gccO2/arith; (cd $O/c && sha256sum bin/omc/arith > manifest.sha256); run nc-bin-16MiB-unlisted $O/c
+mk; chmod 000 $O/c/bin/gccO2/arith; run nc-bin-mode000-listed $O/c
+mk; chmod 000 $O/c/bin/gccO2/arith; (cd $O/c && grep -v gccO2 manifest.sha256 > m && mv m manifest.sha256); run nc-bin-mode000-unlisted $O/c
+mk; rm $O/c/bin/gccO2/arith; (cd $O/c && grep -v gccO2 manifest.sha256 > m && mv m manifest.sha256); run pos-bin-absent-unlisted $O/c
+mk; rm $O/c/bin/gccO2/arith; run nc-bin-absent-listed $O/c
+# sum mode: parity with coreutils on block-boundary sizes and the fixture binaries; unusable files rc 1
+mkdir -p $O/s; for n in 0 1 55 56 63 64 65 119 120 127 128 4095 4096 65535 65536 65537 1048576 16777215; do head -c $n /dev/urandom > $O/s/f$n; done
+F="$(ls $O/s/f* | tr '\n' ' ') $O/fx/bin/omc/arith $O/fx/bin/gccO2/arith $R/seed/out/omc"
+for b in fixed:$NF d1b:$NB; do t=${b%%:*}; x=${b#*:}
+  $x sum $F > $O/sum-$t.txt; r=$?; sha256sum $F > $O/sum-ref.txt
+  cmp -s $O/sum-$t.txt $O/sum-ref.txt && echo "pos-sum $t rc=$r equals coreutils sha256sum on $(wc -l < $O/sum-ref.txt) files" || echo "FAIL pos-sum $t rc=$r"
+  head -c 16777216 /dev/zero > $O/s/toobig; $x sum $O/s/toobig > /dev/null 2>&1; echo "nc-sum-16MiB $t rc=$? (expect 1)"
+  $x sum $O/s/nosuch > /dev/null 2>&1; echo "nc-sum-missing $t rc=$? (expect 1)"
+  cp $O/s/f64 $O/s/locked; chmod 000 $O/s/locked; $x sum $O/s/locked > /dev/null 2>&1; echo "nc-sum-mode000 $t rc=$? (expect 1)"; rm -f $O/s/locked
+  $x sum $O/s > /dev/null 2>&1; echo "nc-sum-directory $t rc=$? (expect 1)"
+done
+chmod -R u+rwX $O 2>/dev/null
+echo CONTROLS-END
