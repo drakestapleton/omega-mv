@@ -55,7 +55,8 @@ main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
     gate-front seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
-      seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt
+      seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt \
+      seed/ng/front/cases-fconv.txt
 
 The source is `units:seed/ng/ng.units`: the units that list names, concatenated in its order, so a
 stage lane's unit (src/a64.om on the slice branches) comes with the list and no gate command changes
@@ -119,7 +120,7 @@ after 1000000 passes), two signed `for` latch units of `cases/` (`for_latch_i8`,
 writes the counter's maximum and the latch's add 1 traps 1, as omc's does; fe_lendl adds it under chk.add),
 two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
-`cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
+`cases/`, and the float-to-integer cases below. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
 queen) and matmul verbatim. The full-size kernels stay verbatim in `kernels/` (`kernels/PROVENANCE.md`).
 No standing gate compares all of them at full size: ng-a64's rgate front phase (ng/slice-m1, list `tfr`)
@@ -132,6 +133,19 @@ as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `f
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
 Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
+
+### Float-to-integer conversion
+
+A float source converts with the total IR `conv` (op 36) and no `chk.conv`: like omc's `fp_toint` it
+truncates toward zero, saturates to the destination's range and maps NaN to 0 (`fe_lcf` answers false for a
+float source). Integer-to-integer narrowing keeps its `chk.conv` (trap 5). Before this, front-ir emitted
+`chk.conv` for a float source, so an out-of-range or NaN conversion trapped 5 where omc saturates
+(CompilerBugHunt, ledger L1060; NgFrontFull). Cases at the end of `cases-front-ir.txt`: 160 programs
+`runs/fconv-TYPE-FLOAT-EDGE.om` (f32 and f64 to each of the eight integer types: the destination's minimum
+and maximum and a value past each, NaN, both infinities, both-sign fractions and -0), each writing all
+eight bytes of the converted value so a wrong upper byte is seen, plus `seed/omc/tests/float/convert_sat.om`;
+`runs/fconv-bad-bool.om` (float to bool) must be refused as omc refuses it. The input bounds are derived in
+`float-bounds.txt` (Wolfram). `cases-fconv.txt` puts the same units through gate-front's check parity.
 
 ## Native contracts: fail-closed lowering boundary
 
