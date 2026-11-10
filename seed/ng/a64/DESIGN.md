@@ -105,8 +105,9 @@ fib38), so any future codegen A/B reports an aligned control.
      by MUL and ADDS (B.VS trap 1), then `CMP X0, #0; CSEL X0, X0, X2, LT` returns minus errno for a failed call where
      omc branches (the zeroed area makes the failed path compute 0 without trapping). Every other host word is refused
      (exit 5, `a64: unsupported` with the word id).
-   - fill r v (51) on a REF to ARRAY (count from the type) or a SLICE (count from its length wire): `X15 = count;
-     CBZ X15, done; loop: SUBS X15, X15, #1; STR v, [base, X15, LSL #size]; B.NE loop` (last element first).
+   - fill r v (51) on a REF to ARRAY (count from the type) or a SLICE (count from its length wire), of integer,
+     f32 or f64 elements: a 64-bit pattern, 16-byte blocks of it from the end down, then 8/4/2/1-byte tails
+     (section 10).
 8. **Parallel moves** (`a6_pmove`): a move fires when no pending move reads its destination; when all are blocked
    (a cycle), one source goes to x15 and its readers read x15. Slot-to-slot moves go through x16.
 8a. **E loop shape** (`a6_tre`, D13): a block ending `r = call f(...); s = add a r` (either operand order)
@@ -179,8 +180,8 @@ bits there (multiply, two-source, float). The selector never asks for these; the
 1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
    in a callee-saved register across its loop).
 2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `atom`, `atomcas`,
-   `fill` of f32/f64 elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass
-   that proves them (IR.md s15).
+   SLICE results of calls and select; bulk copy (PROPOSAL-ir-bulk-copy.md, IR and optimizer lanes). Bounds checks
+   hoisted out of loops by a pass that proves them (IR.md s15).
 3. Remaining fusions: ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
 4. f16, bf16, fp8, `fmath` and vector floats (refused, exit 5: no accuracy-stated implementation), host words beyond
    read, write, monons, realns, cpufence and cpurelax (sleepns 120 has no ngrun reference: ngrun's host words are
@@ -279,10 +280,11 @@ bits there (multiply, two-source, float). The selector never asks for these; the
 - `rgate.om` step 8, the float phase (section 9): `tests/frand.om` writes canonical ΩIR text of 56 deterministic
   edge programs and of random seeds 1..1000; ngas assembles each and it goes through the ngrun-fixture checks
   (status, stdout and stderr byte for byte against ngrun, both save forms, BL alignment). Negative control: ngrun's
-  run of float seed 1 against the ELF of float seed 2 must be sound and differ. Mutants 36..69 are the float ones:
-  each also runs the 56 edge programs and float seeds 1..8. The ngrun fixtures add ng-ir's float run pairs
-  x-float, x-convlo and x-minnan, and the front phase compares x-float against omc; the linear kernel stays a
-  front refusal (f32 `fill`).
+  run of float seed 1 against the ELF of float seed 2 must be sound and differ. Mutants 36..69 are the float ones
+  and 70..79 the fill ones (section 10): each also runs the 66 edge programs (56 float, 10 fill) and float seeds
+  1..8. The ngrun fixtures add ng-ir's float run pairs x-float, x-convlo and x-minnan, and the front phase compares
+  x-float and the linear kernel (f32 arrays filled by `fill`) against omc; no front case is left as a refusal
+  (`tfz` is empty).
 - ΩIR gap met by sort and chacha: a call argument must have exactly the parameter's type (IR.md row 64), so Omega
   passing an `edit` array or slice to a `view` parameter has no ΩIR form while `view` maps to access 0. The fixtures
   type such parameters as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
@@ -374,8 +376,8 @@ Wolfram checks (MODELED encoding and constant arithmetic; the words are also che
 - The largest finite f32: `IntegerString[bits32[(2 - 2^-23) 2^127], 16]` and `IntegerString[16^^7f800000 - 1, 16]`
   both gave `"7f7fffff"` (`a6_fsat` subtracts 1 from the infinity's bits).
 
-Not here: `fill` of f32/f64 elements (head c, the fill lowering), `fload`/`fstore` (no STRUCT field access in the
-back end for any type), f16/bf16/fp8, `fmath`, vector floats and float atomics stay refused (exit 5).
+Not here: `fload`/`fstore` (no STRUCT field access in the back end for any type), f16/bf16/fp8, `fmath`, vector
+floats and float atomics stay refused (exit 5). `fill` of f32/f64 elements is section 10.
 
 **Gates** (section 6): `gate.om` adds FCSEL S/D and MSR FPCR cases plus the float operand shapes (FPCR value, exponent
 extracts, D pairs and spills) and two refusals; `rgate.om` adds the float ngrun fixtures, x-float to the front phase,
@@ -394,3 +396,36 @@ arguments stored one slot low; 66 float stack parameters all read slot 0; 67 fma
 f32 to f64 conv uses FCVT S,D; 69 float spills stored one slot low. Two candidates are equivalent and not listed: the
 argument and result bank moved together in caller and callee (`a6_abi`, `a_d0`), since every caller and callee is
 ng code.
+
+## 10. Fill (op 51, ham/ng-a64-fill, NgFloatFill)
+
+Design: the "Fill (51) lowering plan" of `NgA64Float-design.md`, in the back end only (no copy-loop recognition, no
+bulk copy). `a6_sfill` takes a REF to an ARRAY (count from the type) or a SLICE (count from its length wire) of
+integer, f32 or f64 elements (an ΩIR array or slice holds numbers, IR.md s4.2, so there is no bool fill):
+
+1. x17 = the value's raw bits: an integer's low 8 << sz bits (`AND #0xff`, `#0xffff`, `#0xffffffff`: a signed
+   value's canonical extension is dropped), an f32 by FMOV W17, S, an f64 by FMOV X17, D (every bit, NaN payloads
+   and -0 included; no float arithmetic touches it). Then ORR x17, x17, x17, LSL #8 / #16 / #32 until it holds 64
+   bits of whole elements (`a6_fpat`).
+2. x15 = the byte count: `ADD x15, XZR, len, LSL #sz` for a slice, a constant for a REF. A slice's elements lie in
+   one storage object (at most 2^24 elements of at most 8 bytes, IR.md s4.2), so the shift cannot overflow.
+3. DUP v31.2D, x17 (v31 is float scratch; no allocated V register is touched).
+4. From the end down: `CMP x15, #16; B.LO tails; SUB x15, x15, #16; STR Q31, [base, x15]; B` the compare, then for
+   8, 4, 2 and 1 bytes `TBZ x15, #k, next; SUB x15, x15, #2^k; STR X/W/H/B 17, [base, x15]`, the tails narrower
+   than the element omitted (an 8-byte element has only the 8-byte tail).
+
+Every store begins a whole number of elements past the base (the remaining count is a multiple of the element size
+throughout), so the pattern lines up with the elements whatever the base's alignment; unaligned STR Q/X/W/H are
+allowed on normal memory. A count of 0 stores nothing; nothing outside the span is written; nothing is read. The
+base, value and count registers are the operand's own or the x16/x17/x15 scratch, as before.
+
+Gates: `gate.om` adds DUP and STR Q (register offset) cases and refusals, and the fill's operand shapes. rgate's
+edge programs 57..66 (`frand edge K`, `efill`: u8, i8, u16, i16, u32, i32, u64, i64, f32, f64): per case a
+300-element local array is filled whole with a sentinel, a slice (one case in three a slice of a slice) at offset
+0..31 is filled with a value, and all 300 elements are folded and printed, so sentinels before and after the span
+and every element are compared with ngrun; lengths 0..257 for the 1-byte types, 0..40 and 63..65, 127..129,
+255..257 for the wider ones; values and sentinels random, for floats half from the edge tables (NaN payloads,
+signaling NaNs, -0). Fill mutants 70..79: block threshold 32, each tail testing bit 4 instead of its own (8, 4, 2,
+1), the block loop's B.LO taken as B.HS (zero length and short spans store out of span), STR Q index scaled by 16,
+the u8 replication shifted by 9, the integer mask one bit wide, the float pattern read from x16; mutant 23 (no
+element-size scale) now acts on the byte count.
