@@ -384,7 +384,7 @@ extracts, D pairs and spills) and two refusals; `rgate.om` adds the float ngrun 
 the float phase (`tests/frand.om`: 56 edge programs, seeds 1..1000, a negative control) and 34 float mutants:
 
 36..39 the lt, le, gt and ge conditions take the integer LT, LE, HI and HS forms; 40 f64 add becomes sub (form
-table); 41 f32 arithmetic uses the D forms; 42 FCSEL operands swapped; 43 f64 neg becomes fabs; 44 the toward-zero
+table); 41 f32 add uses the D form; 42 FCSEL operands swapped; 43 f64 neg becomes fabs; 44 the toward-zero
 FPCR value becomes RMode 01 (toward +infinity); 45 FPCR is not restored after a toward-zero conversion; 46 `_start`
 writes x16 (RMode 10) to FPCR; 47 the signed narrow clamp uses LE; 48 the unsigned clamp uses LS; 49 f64 to signed
 integer through FCVTZU; 50 chk.conv lets NaN through (B.VC); 51 the signed chk.conv upper bound halved; 52 an f32
