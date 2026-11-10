@@ -237,7 +237,10 @@ bits there (multiply, two-source, float). The selector never asks for these; the
   `r-rot` (u8 181 and u16 46531 rotated left and right by 12 amounts each, many past the width; every result printed
   and folded into the exit status; Wolfram on two rows: rotl/rotr u8 by 23 = da/6b, u16 by 2731 = 1dae/b876) and
   `r-s12` (ngrand seed 12 shrunk by `ngrand shrink` to the `rotr u8` that a64 refused, kept as found) cover narrow
-  rotations.
+  rotations. `n-s7821` and `n-s10623` (in `seed/ng/tests/ir/`, ng-ir's N cases too) are ngrand seeds 7821 and
+  10623, the two random-phase divergences of a 20000-seed run, shrunk by `ngrand shrink` with ngrun before 26f67fbb
+  as the failing side and kept as found: a u64 outside i32 reaches `chk.conv i32`, which must trap 5 (IR.md s7.9),
+  where that ngrun read the u64 as signed and printed; a64 trapped 5 throughout.
 
   The original twenty-seven mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
   frame size, 16-byte entry alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half
