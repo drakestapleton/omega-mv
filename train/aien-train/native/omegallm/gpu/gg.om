@@ -1887,8 +1887,9 @@ note gserve and gsample (aien-train DRA-292): serve and sample (serve.om, cli.om
 note forward on the chip. cli.om's ochipup calls ogchip once the checkpoint loads: B = 1 (one
 note context row, R = T), open the chip, upload the f32 parameters. olastf then calls oglast per
 note token: upload the T context tokens of obx row 0 (positions past CT hold earlier tokens or 0,
-note which the causal forward never reads for position CT - 1), ggfwd with ggnoce (no CE: the logits
-note stay logits), and the logits of position CT - OMUTZ read back as f64 into TMP[0..V) (oa), where
+note which the causal forward never reads for position CT - 1), ggdfwd (below: the rows up to the
+note context's last 64-row tile, no CE, so the logits stay logits), and the logits of position
+note CT - OMUTZ read back as f64 into TMP[0..V) (oa), where
 note argmax and draws run as on the CPU.
 note OMUTZ: 1 in the product; 0 in mutant z (the row past the context), which gscmp must catch.
 const OMUTZ ulong 1
@@ -1901,9 +1902,12 @@ end
 fn oglast to void
 ggupt
 put gkinv 0 1
-put ggnoce 0 1
-ggfwd
-put ggnoce 0 0
+ggdfwd
+ogrd
+end
+
+note the logits of position CT - OMUTZ (row CT - OMUTZ of slot 11) read back as f64 into TMP[0..V) (oa)
+fn ogrd to void
 v = get og 0
 r = sub get og 9 OMUTZ
 o = add get gga 11 mul mul r v 4
@@ -1911,6 +1915,390 @@ tm = get og 27
 for c ulong v
 put oa add tm c ggf add o mul c 4
 end
+end
+
+note ggdfwd (ham/ollm-speed-kvdec): the per-token forward of gserve, gsample and gscmp. ggfwd runs all
+note R = T rows every token; a causal forward never lets a row read a later row, so the logits of
+note position CT - 1 need rows 0..CT - 1 only. ggdfwd runs rows 0..rr - 1, rr = 64 ceil(CT / 64)
+note capped at T (whole 64-row tiles, so every GEMM keeps ggfwd's 64x64 kernels and per-element sums),
+note keeps the residual stream in place in layer 0's input hin (hin += o wo, hin += relu(bn w1) w2: the
+note same f32 adds as ggffn's COPY then accumulate, without its two COPY launches per layer), and runs
+note the final RMS and the logits GEMM on the last 64-row tile only (the one holding row CT - 1).
+note Rows at or past rr keep stale arena data that no computed row reads (causal GEMM tiles; softmax
+note chunks past a row's own are masked, gr.om k6). No CE launch (ggnoce's logits stay logits).
+note OMUTJ: 1 in the product; 0 in mutant j (rr = 64 floor(CT / 64), at least 64: row CT - 1 lies past
+note the computed rows once CT > 64 is not a multiple of 64), which gscmp and gdbench mode 2 must catch.
+const OMUTJ ulong 1
+note ggdm[0]: the rows the ggd* GEMMs run over
+global ggdm ulong 1
+
+fn ggdrows to ulong
+ct = get og 9
+rr = mul div add ct 63 64 64
+if eq OMUTJ 0
+rr = mul div ct 64 64
+if eq rr 0
+rr = 64
+end
+end
+tt = get og 1
+if gt rr tt
+rr = tt
+end
+ret rr
+end
+
+note C[m][n] (+)= X[m][k] W[k][n] over the first m = ggdm[0] rows
+fn ggdxw x ulong w ulong c ulong n ulong k ulong bt bool to void
+k4 = uint mul k 4
+n4 = uint mul n 4
+gkopa 0 x k4 4 0 0
+gkopa 1 w 4 n4 0 0
+gkopc c n4 4 0 0 f32 1.0f64
+ggmm get ggdm 0 n k 1 1 bt
+end
+
+note C[m][n] (+)= X[m][k] W[n][k]^T over the first m = ggdm[0] rows
+fn ggdxwt x ulong w ulong c ulong n ulong k ulong bt bool to void
+k4 = uint mul k 4
+n4 = uint mul n 4
+gkopa 0 x k4 4 0 0
+gkopa 1 w k4 4 0 0
+gkopc c n4 4 0 0 f32 1.0f64
+ggmm get ggdm 0 n k 1 1 bt
+end
+
+note RMSF (kernel 10) over rows [r0, r0 + m) of the D-wide v and y and of s
+fn ggdrms v ulong g ulong y ulong s ulong r0 ulong m ulong to void
+o = mul r0 mul get og 2 4
+r = mul m 32
+ggu 0 r
+ggpt 1 add v o
+ggpt 2 g
+ggpt 3 add y o
+ggpt 4 add s mul r0 4
+ggrun 10 10 ggcd r 64 1 1
+end
+
+note q, k, u = a wq, a wk, a wv over the first ggdm[0] rows (ggqkv's batched GEMM)
+fn ggdqkv l ulong to void
+d = get og 2
+a = ggl l 1
+w = ggw opwq l
+c = ggl l 2
+s0 = get ggs 0
+s6 = get ggs 6
+s7 = get ggs 7
+gkopa 0 a s0 4 0 0
+gkopa 1 w 4 s0 0 s7
+gkopc c s0 4 0 s6 f32 1.0f64
+ggmm get ggdm 0 d d 3 3 false
+end
+
+note ggatt over the first rr = ggdm[0] rows: S (causal, rr x rr), SOFTF on rows < rr (grid rr / 2;
+note arg 0 stays the thread bound T 32), o = P u (causal, k = rr)
+fn ggdatt l ulong to void
+rr = get ggdm 0
+e = get og 7
+pp = ggl l 12
+q = ggl l 2
+k = ggl l 3
+gghd 0 q false
+gghd 1 k false
+isq = div 1.0f64 fsqrt f64 e
+ggcp pp isq
+ggbh rr rr e false 3
+ggu 0 mul get og 1 32
+ggpt 1 pp
+ggpt 2 pp
+ggrun 15 6 div rr 2 mul get og 6 get og 3 1
+u = ggl l 4
+o = ggl l 5
+ggpl 0 pp false
+gghd 1 u true
+ggch o 1.0f64
+ggbh rr e rr false 1
+end
+
+note hin += o wo; bn = rms(hin) g2; hin += relu(bn w1) w2, over the first ggdm[0] rows, hin = layer 0's
+fn ggdffn l ulong to void
+d = get og 2
+f = get og 4
+h = ggl 0 0
+x = ggl l 5
+w = ggw opwo l
+ggdxw x w h d d true
+x = ggl l 7
+w = ggw opg2 l
+s = ggl l 9
+ggdrms h w x s 0 get ggdm 0
+fp = ggl l 10
+w = ggw opw1 l
+y = ggl l 11
+gkope 1 y
+ggdxw x w fp f d false
+w = ggw opw2 l
+ggdxw y w h d f true
+end
+
+fn ggdfl l ulong to void
+h = ggl 0 0
+w = ggw opg1 l
+a = ggl l 1
+s = ggl l 8
+ggdrms h w a s 0 get ggdm 0
+ggdqkv l
+ggdatt l
+ggdffn l
+end
+
+fn ggdfwd to void
+rr = ggdrows
+put ggdm 0 rr
+d = get og 2
+x = ggl 0 0
+ggu 0 d
+ggpt 1 x
+x = ggw 0
+ggpt 2 x
+x = ggw get og 30
+ggpt 3 x
+x = gga1 2
+ggpt 4 x
+ggrun 9 10 ggcd d 64 rr get og 6
+for l ulong get og 5
+ggdfl l
+end
+tb = ulong 64
+if lt rr 64
+tb = rr
+end
+b = sub rr tb
+h = ggl 0 0
+w = ggw get og 33
+z = gga1 10
+s = gga1 9
+ggdrms h w z s b tb
+put ggdm 0 tb
+x = add z mul mul b d 4
+w = ggw 0
+v = get og 0
+c = add gga1 11 mul mul b v 4
+ggdxwt x w c v d false
+put ggdm 0 rr
+end
+
+note the forward of gdbench mode md: 0 ggfwd without CE (the gserve forward at edf39b0), else ggdfwd
+fn ggdfm md ulong to void
+if eq md 0
+put ggnoce 0 1
+ggfwd
+put ggnoce 0 0
+ret
+end
+ggdfwd
+end
+
+note FNV-1a over the f64 bits of the V logits in TMP (equal hashes: the same logits, bit for bit)
+fn ggdhash to ulong
+tm = get og 27
+h = ulong 14695981039346656037
+for c ulong get og 0
+x = bitcast ulong get oa add tm c
+h = mul xor h x 1099511628211
+end
+ret h
+end
+
+note one gdbench step in mode md on the current context: prints `GD step ct tok hash up_ns fwd_ns
+note rd_ns launches build_ns wait_ns` (up: the token upload, fwd: the forward's launches, rd: logits
+note read back and argmax; launches, build and wait from gk.om's gkt) and returns the token
+fn ggdstep s ulong md ulong to ulong
+k0 = get gkt 0
+b0 = get gkt 1
+w0 = get gkt 2
+t0 = monons
+ggupt
+put gkinv 0 1
+t1 = monons
+ggdfm md
+t2 = monons
+ogrd
+a = oargmax
+t3 = monons
+h = ggdhash
+oputc 71
+oputc 68
+oputc 32
+oputu s
+oputc 32
+oputu get og 9
+oputc 32
+oputu a
+oputc 32
+oputu h
+oputc 32
+oputl sub t1 t0
+oputc 32
+oputl sub t2 t1
+oputc 32
+oputl sub t3 t2
+oputc 32
+oputl sub get gkt 0 k0
+oputc 32
+oputl sub get gkt 1 b0
+oputc 32
+oputl sub get gkt 2 w0
+oputc 10
+oflush
+ret a
+end
+
+note gdbench mode 2 step: ggfwd's logits into gscl, then ggdfwd's into TMP on the same context;
+note prints `GQ step ct tok0 tok1 ndiff maxdiff_e9` (ndiff: logits whose f64 bits differ, read back
+note from f32, so f32 bits) and returns tok0; totals in gskd (ndiff) and gsmd (maxdiff). The logits
+note slot is zeroed (ZERO 20) between the two forwards, so ggdfwd cannot pass on ggfwd's rows.
+fn ggdpar s ulong to ulong
+ggupt
+put gkinv 0 1
+ggdfm 0
+ogrd
+tm = get og 27
+v = get og 0
+for c ulong v
+put gscl c get oa add tm c
+end
+a0 = oargmax
+ggew 20 mul ggr v gga1 11 gga1 11
+ggdfm 1
+ogrd
+a1 = oargmax
+nd = ulong 0
+dm = 0.0f64
+for c ulong v
+x = get oa add tm c
+y = get gscl c
+if ne bitcast ulong x bitcast ulong y
+nd = add nd 1
+end
+dm = fmax dm fabs sub x y
+end
+put gskd 0 add get gskd 0 nd
+put gsmd 0 fmax get gsmd 0 dm
+oputc 71
+oputc 81
+oputc 32
+oputu s
+oputc 32
+oputu get og 9
+oputc 32
+oputu a0
+oputc 32
+oputu a1
+oputc 32
+oputu nd
+oputc 32
+oputl long mul dm 1000000000.0f64
+oputc 10
+oflush
+ret a0
+end
+
+fn ggdsel s ulong md ulong to ulong
+if eq md 2
+ret ggdpar s
+end
+ret ggdstep s md
+end
+
+note gdbench CK N PROMPT MERGES MODE (ham/ollm-speed): the gserve/gsample per-token chip forward,
+note timed, on the contexts of N greedy steps from token 0 then PROMPT's encoding (once the context
+note holds T tokens it slides, as ocpush does). MODE 0: ggfwd (all R = T rows, the gserve forward at
+note edf39b0); 1: ggdfwd (oglast's forward); 2: both on every step, one GQ line each (ggdpar), then
+note `GDQ N ndiff maxdiff_e9`, exit 41 when any logit differs in its bits. Modes 0 and 1 print one GD
+note line per step (ggdstep), then run one more forward at the last context with the launch profile
+note on (`GP id gx gy gz m n k wait_ns` per launch, gk.om gkpf), 64 ZERO launches of 64 floats (the
+note bare launch round trip, GP id 20) and `GDT mode N load_ns open_ns` (checkpoint and merges load;
+note chip open and f32 parameter upload).
+fn ggdbench to void
+if ne oargc 7
+exit 2
+end
+t0 = monons
+ockload 2
+nn = oargu 3
+md = oargu 6
+v = get og 0
+if or le v 256 gt md 2
+exit 2
+end
+obload 5 v
+t1 = monons
+ogchip
+t2 = monons
+put og 9 0
+ocpush 0
+np = obprompt 4
+for i ulong np
+ocpush get obtk i
+end
+put gsmd 0 0.0f64
+put gskd 0 0
+for s ulong nn
+a = ggdsel s md
+ocpush a
+end
+if eq md 2
+oputc 71
+oputc 68
+oputc 81
+oputc 32
+oputu nn
+oputc 32
+oputu get gskd 0
+oputc 32
+oputl long mul get gsmd 0 1000000000.0f64
+oputc 10
+oflush
+r = nvstop
+if gt get gskd 0 0
+exit 41
+end
+ret
+end
+put gkpc 0 0
+put gkpf 0 1
+ggupt
+put gkinv 0 1
+ggdfm md
+for i ulong 64
+ggew 20 64 ggg 0 ggg 0
+end
+put gkpf 0 0
+for q ulong get gkpc 0
+o = mul q 8
+oputc 71
+oputc 80
+for j ulong 8
+oputc 32
+oputu get gkpl add o j
+end
+oputc 10
+end
+oputc 71
+oputc 68
+oputc 84
+oputc 32
+oputu md
+oputc 32
+oputu nn
+oputc 32
+oputl sub t1 t0
+oputc 32
+oputl sub t2 t1
+oputc 10
+oflush
+r = nvstop
 end
 
 note gscmp CK N PROMPT MERGES (V > 256): the chip forward against the CPU forward on the contexts of
@@ -2033,11 +2421,11 @@ end
 ret sub get gscl a b
 end
 
-note gb10 platform main: gcmp, gcmp2, gtrain, gtrainf, gacmp, geval, gdiag, gprof, gserve, gsample
-note and gscmp here, the BF16 commands gtrainb, gprofb, gbcmp, gbcmp2 and gbfrag in gb.om, every
-note other command through the CPU main (lio.om). Command words as in cli.om (Wolfram
+note gb10 platform main: gcmp, gcmp2, gtrain, gtrainf, gacmp, geval, gdiag, gprof, gserve, gsample,
+note gscmp and gdbench here, the BF16 commands gtrainb, gprofb, gbcmp, gbcmp2 and gbfrag in gb.om,
+note every other command through the CPU main (lio.om). Command words as in cli.om (Wolfram
 note FromDigits[Reverse[ToCharacterCode[w]],256]): gserve 111559399797607, gsample
-note 28548202775016295, gscmp 482871571303.
+note 28548202775016295, gscmp 482871571303, gdbench 29382723376407655.
 fn main to int
 if lt oargc 2
 exit 2
@@ -2057,6 +2445,10 @@ ret 0
 end
 if eq w 482871571303
 ggscmp
+ret 0
+end
+if eq w 29382723376407655
+ggdbench
 ret 0
 end
 if eq w 1886217063
