@@ -883,8 +883,10 @@ back: trap 3), and `s5-scrub-lateglob` reads a global declared after a scrubbing
 that global pinned anyway: its register is cleared and not restored, trap 3). `s5-scrub-chain` reaches
 the scrub through two calls compiled before a long global (pinned anyway: trap 3), `s5-scrub-latebase`
 writes and reads a short global (a base pin only) declared after the scrubbing function (pinned anyway: a
-store through base 0, SIGSEGV), and `s5-scrub-inl` is the ordering control: an inline scrubbing function
-written before the global is compiled at its call site in main, after the global, so it keeps the pins.
+store through base 0, SIGSEGV), and `s5-scrub-inl` reads a global declared after an inline scrubbing
+function. `pinshut` is set when the body pass begins any `fn`, an inline one too, so that global takes no
+pin and the case checks the MOVZ/MOVK path; without `pinshut` the inline body, compiled at its call site
+after the global, restored the pin.
 
 - **`dit v`** (v int, else error 7) sets PSTATE.DIT (Arm ARM C5.2.4, FEAT_DIT; bit 24 of the DIT
   special-purpose register) and gives the previous bit as 0 or 1. v outside {0, 1} (a negative int too)
