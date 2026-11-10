@@ -132,7 +132,7 @@ as ok, FAIL, a kill or a trip. Negative controls: five lowering mutants (the `fo
 `and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped; a mixed-type shift amount
 checked against its own width instead of the value's; fma's second and third operands swapped) must fail a
 run case, two host mutants (a `long` host argument lowered as `int`; `chk.bounds` in place of a host
-slice's `chk.slice`) must fail a host case,
+slice's `chk.slice`) must fail a host case, fmin and fmax swapped must fail a run case,
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
 Last line `FRONTIRGATE PASS|FAIL|NOT_RUN cases=N run=R refuse=F host=H classed=Q ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
@@ -160,14 +160,23 @@ exact because the amount is then below the width; `fe_lbop`'s checks follow unch
 to ΩIR `fma` (46, one rounding) on three values of one float type. Run cases `cases/sh_mix*.om` and
 `cases/fma_mix.om`; their exits and stdout bytes, worked out before the run (constants from Wolfram), are in
 `cases/groups4.expect`. omc's refusals `rot_mix` (a rotate keeps one type, 7), `fma_lit` (11) and
-`fma_types` (7) are refuse cases. A bool or float shift amount, which omc also admits, and fmin/fmax (IR.md
-min/max still differs from omc's FMINNM/FMAXNM on a signaling NaN) stay not lowered; the scope gate keeps
-them failing closed, and its bool-amount admission mutant must be KILLED:
+`fma_types` (7) are refuse cases. A bool or float shift amount, which omc also admits, stays not lowered; the scope
+gate keeps it failing closed, and its bool-amount admission mutant must be KILLED:
 
     gate-front seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-lower-scope.txt seed/ng/front/mutants-lower-scope.txt SCRATCH \
       seed/ng/front/cases-lower-scope.txt
+
+## fmin and fmax
+
+`fmin a b` and `fmax a b` lower to ΩIR `min` (24) and `max` (25) on two values of one float type (`fe_lfmm`);
+IR.md s7.3 gives them OMEGESE's FMINNM/FMAXNM meaning: one quiet NaN gives the other operand, a signaling
+NaN gives that NaN quieted, two quiet NaNs give the first, and -0 is below +0. Run case `cases/fmm_mix.om`
+writes the bits of 28 results (f32 and f64: ordered values, signed zeros in both orders, quiet and signaling
+NaNs with a number in both orders, two quiet NaNs); its 168 bytes, worked out before the run, are in
+`cases/groups6.expect`. `lsc_fmin` and `lsc_fmax`, the former lower-scope cases, are run cases now. The
+min/max swap mutant (8) must fail a run case.
 
 ## Host words
 

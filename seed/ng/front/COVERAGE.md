@@ -24,7 +24,7 @@ The packed C2 manifest is surveyed separately.
 | shl shr | Y (ng-groups-4) | Fixture-scoped only (cases/sh_mix*.om); generally unproven | a bool or float amount, which omc admits, exits 64 (cases-lower-scope.txt) |
 | rotr rotl | P | Fixture-scoped only; generally unproven | abstract operands absent |
 | fsqrt fabs bitcast | Y | Fixture-scoped only; generally unproven | subject to operand construct coverage |
-| fmin fmax fma | P: fma Y (ng-groups-4) | fma fixture-scoped only (cases/fma_mix.om, fused against unfused); fmin/fmax NOT_RUN | fmin/fmax exit 64 until IR.md's signaling-NaN rule lands (NgIrOracle 36edfca2) |
+| fmin fmax fma | Y: fma (ng-groups-4), fmin/fmax (ng-front-groups-6) | fixture-scoped only: cases/fma_mix.om (fused against unfused), cases/fmm_mix.om (signed zeros, quiet and signaling NaNs, both widths) | none for scalar f32/f64 |
 | true false = ( ) | Y | Fixture-scoped only; generally unproven |  |
 | get put len new | P | Fixture-scoped only; generally unproven | scalar arrays only; structs/layout fields absent |
 | view edit part | P | Fixture-scoped only; generally unproven | sized view text arguments absent; fresh signature token absent |
@@ -53,7 +53,7 @@ The packed C2 manifest is surveyed separately.
    layout 71, field 68, struct 63; fresh 45; nominal abstract 52, holds 67, seal 49, open 34.
 4. Contracts: requires 30, ensures 18, invariant 17, result 21; header policies on each file's first om2 line:
    release 12, debug 1, diag 46 (fmt 11).
-5. Float intrinsics: fma 16, fmin 7, fmax 7; hygiene scrub 13, dit 7. (ng-groups-4 lowers fma; fmin/fmax remain.)
+5. Float intrinsics: fma 16, fmin 7, fmax 7; hygiene scrub 13, dit 7. (ng-groups-4 lowers fma; ng-front-groups-6 fmin/fmax.)
 6. Units: export 28, out 72 (whole-word counts include prose); function-mode IR entry requires an IR-owner change.
 
 All ordinary loop/branch forms already have lowering; they need complete fixtures, not a replacement parser.
@@ -218,9 +218,8 @@ Two groups lowered, IMPLEMENTED and host-EXERCISED by gate-front-ir only (no QUA
 - fma. ΩIR `fma` (46), one rounding, three operands of one float type; `fma_mix` prints f64 and f32
   results whose fused and unfused values differ. omc's refusals stay (`fma_lit` 11, `fma_types` 7).
 
-Still not lowered from these rows: fmin and fmax (IR.md min/max says a NaN operand gives the other,
-while OMEGESE and omc follow FMINNM/FMAXNM, where a signaling NaN gives a quiet NaN; NgIrOracle head
-36edfca2, which corrects IR.md and ngrun, is not on main).
+Still not lowered from these rows at ng-groups-4: fmin and fmax (IR.md min/max then said a NaN operand
+gives the other, while OMEGESE and omc follow FMINNM/FMAXNM). Lowered since by ng-front-groups-6 (below).
 
 ## ng-front-host (2026-11-10, branch ham/ng-front-host)
 
@@ -230,3 +229,10 @@ gate-front only, no QUALIFIED claim); execenv and prlimit pass the check pass as
 omc's exit and stdout; for the other 55 ngrun refuses the word by class (IR.md s7.11) after ngcheck accepts
 the lowered ΩIR, so their behavior is NOT_RUN: process 11, limits 1, device 17, network 15, outside
 scratch 9, nondeterministic 1, unsafe filesystem 1. README section "Host words" has the lowering rules.
+
+## ng-front-groups-6 (2026-11-10, branch ham/ng-front-groups-6)
+
+fmin and fmax lower to ΩIR min/max (IMPLEMENTED, host-EXERCISED by gate-front-ir only). The IR.md rule
+they needed (OMEGESE FMINNM/FMAXNM) and ngrun's rn_fmm arrive with ngrun-hostwords-5 (d5dba5bb), under
+this head. Case cases/fmm_mix.om, expected bytes in cases/groups6.expect; lsc_fmin and lsc_fmax moved
+from the lower-scope list to run cases.
