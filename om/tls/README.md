@@ -440,7 +440,7 @@ had 11 findings. Each one is fixed and has a test that fails on the code before 
 | F10 F1-F4 and F7 not exercised | crafted x509 fixtures (`gen_crafted.py`), fake-server rows, DNS unit; a trap is a FAIL in interop | all rows above |
 | F11 info items | `tls_close` keeps a failed connection failed; close_notify in the handshake is `TLS_ERR_ALERT_RECEIVED`; deadline, clock, public-suffix, caller-contract, CertificateRequest and path-building limits documented above | interop `CLOSE_NOT_FAILED` check on every failure row, `closehs`, `closepre`, mutants close revives failed and handshake close_notify unmapped |
 
-MODEL-REVIEWED (2026-10-26, branch `audit/tls-outside-review`; a code-reading review by our own review
+MODEL-REVIEWED (2026-10-26, branch `audit/tls-outside-review`; a code-reading review by my own review
 agents, not an outside review): six gaps, each fixed here or stated as a
 limit in `THREAT_MODEL.md`; the audit boundary is `AUDIT_SCOPE.md`. In short: key lifetime
 (KeyUpdate at the record limit, `TLS_ERR_SEQUENCE_LIMIT` fail-closed), HTTPS transport for
