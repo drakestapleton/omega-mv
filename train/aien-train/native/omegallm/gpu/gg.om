@@ -2069,6 +2069,12 @@ ggrun 9 10 ggcd d 64 rr get og 6
 for l ulong get og 5
 ggdfl l
 end
+ggdhead rr
+end
+
+note final RMS and logits GEMM over the last 64-row tile of the rr rows (all rr when rr < 64)
+fn ggdhead rr ulong to void
+d = get og 2
 tb = ulong 64
 if lt rr 64
 tb = rr
@@ -2090,7 +2096,8 @@ end
 
 note the forward of gdbench mode md: 0 ggfwd without CE (the gserve forward at edf39b0), 3 ggdfwd with
 note every 64x64 GEMM on the BF16 tensor-core kernels (gk.om gkbf 1, docs/omegallm/CONTRACT-BF16.md;
-note GEMMs on the 32x32 tile stay f32), else ggdfwd in f32
+note GEMMs on the 32x32 tile stay f32), 5 ggdfwd as one batch.om submission (ggdbat), else ggdfwd
+note in f32
 fn ggdfm md ulong to void
 if eq md 0
 put ggnoce 0 1
@@ -2104,7 +2111,28 @@ ggdfwd
 put gkbf 0 0
 ret
 end
+if eq md 5
+ggdbat
+ret
+end
 ggdfwd
+end
+
+note ggdbat: ggdfwd's launches recorded (gk.om gkbat) into one batch.om batch of exactly 3 + 9 L
+note launches (EMB, nine per layer, final RMS, logits; batch.om refuses a different count before the
+note doorbell), sent once and waited once (gkbsub). The kernels, their order and arguments are
+note ggdfwd's; batch.om ends each body with a WFI release and a shader invalidate, so each grid
+note drains before the next starts. gdbench opens the batch packet (gbbopen) once after the chip.
+fn ggdbat to void
+if not gbbegin add 3 mul 9 get og 5
+ggdie 120
+end
+put gkbat 0 1
+ggdfwd
+put gkbat 0 0
+if not gkbsub
+ggdie 121
+end
 end
 
 note FNV-1a over the f64 bits of the V logits in TMP (equal hashes: the same logits, bit for bit)
@@ -2162,48 +2190,53 @@ oflush
 ret a
 end
 
-note gdbench mode 2 or 4 step: ggfwd's logits into gscl, then ggdfwd's (f32 in mode 2, BF16 in mode 4,
+note gdbench mode 2 or 4 step: ggfwd's logits into ggdcl, then ggdfwd's (f32 in mode 2, BF16 in mode 4,
 note ggdfm 3) into TMP on the same context; prints `GQ step ct tok0 tok1 ndiff maxdiff_e9 margin_e9`
 note (ndiff: logits whose f64 bits differ, read back from f32, so f32 bits; margin: ggfwd's top-1
-note logit minus its top-2) and returns tok0. Totals: gskd ndiff, gsmd maxdiff, ggdkd the steps whose
+note logit minus its top-2) and returns tok0. Totals: ggdnd ndiff, ggdmx maxdiff, ggdkd the steps whose
 note tokens differ although the margin exceeds 2 BFTOL. The logits slot is zeroed (ZERO 20) between
 note the two forwards, so ggdfwd cannot pass on ggfwd's rows.
 note BFTOL: the BF16 decode tolerance in nats, declared before its first chip run (ham/ollm-speed
 note 2026-11-10): mode 4 passes when maxdiff <= BFTOL and no step diverges.
 const BFTOL f64 0.25
+global ggdcl f64 65536
+global ggdmx f64 1
+global ggdnd ulong 1
 global ggdkd ulong 1
+global ggdst f64 1
+
+note ggdcl[a] minus the largest other ggdcl[c], c < V
+fn ggdmg a ulong to f64
+b = bitcast f64 ulong 18442240474082181120
+for c ulong get og 0
+if ne c a
+b = fmax b get ggdcl c
+end
+end
+ret sub get ggdcl a b
+end
+
 fn ggdpar s ulong md ulong to ulong
 ggupt
 put gkinv 0 1
 ggdfm 0
 ogrd
-tm = get og 27
-v = get og 0
-for c ulong v
-put gscl c get oa add tm c
-end
+ggdkeep
 a0 = oargmax
+v = get og 0
 ggew 20 mul ggr v gga1 11 gga1 11
 if eq md 4
 ggdfm 3
 else
-ggdfm 1
+ggdfm sub md 1
 end
 ogrd
 a1 = oargmax
-nd = ulong 0
-dm = 0.0f64
-for c ulong v
-x = get oa add tm c
-y = get gscl c
-if ne bitcast ulong x bitcast ulong y
-nd = add nd 1
-end
-dm = fmax dm fabs sub x y
-end
-put gskd 0 add get gskd 0 nd
-put gsmd 0 fmax get gsmd 0 dm
-mg = ggsmg a0
+nd = ggdcmp
+dm = get ggdst 0
+put ggdnd 0 add get ggdnd 0 nd
+put ggdmx 0 fmax get ggdmx 0 dm
+mg = ggdmg a0
 if and ne a0 a1 gt mg mul 2.0f64 BFTOL
 put ggdkd 0 add get ggdkd 0 1
 end
@@ -2228,8 +2261,34 @@ oflush
 ret a0
 end
 
+note ggdcl = the V logits in TMP
+fn ggdkeep to void
+tm = get og 27
+for c ulong get og 0
+x = get oa add tm c
+put ggdcl c x
+end
+end
+
+note the logits in TMP whose bits differ from ggdcl; the largest |difference| into ggdst[0]
+fn ggdcmp to ulong
+tm = get og 27
+nd = ulong 0
+dm = 0.0f64
+for c ulong get og 0
+x = get oa add tm c
+y = get ggdcl c
+if ne bitcast ulong x bitcast ulong y
+nd = add nd 1
+end
+dm = fmax dm fabs sub x y
+end
+put ggdst 0 dm
+ret nd
+end
+
 fn ggdsel s ulong md ulong to ulong
-if or eq md 2 eq md 4
+if or or eq md 2 eq md 4 eq md 6
 ret ggdpar s md
 end
 ret ggdstep s md
@@ -2238,13 +2297,14 @@ end
 note gdbench CK N PROMPT MERGES MODE (ham/ollm-speed): the gserve/gsample per-token chip forward,
 note timed, on the contexts of N greedy steps from token 0 then PROMPT's encoding (once the context
 note holds T tokens it slides, as ocpush does). MODE 0: ggfwd (all R = T rows, the gserve forward at
-note edf39b0); 1: ggdfwd (oglast's forward); 3: ggdfwd with BF16 GEMMs (ggdfm 3); 2 and 4: ggfwd and
-note ggdfwd (2 f32, 4 BF16) on every step, one GQ line each (ggdpar), then `GDQ N ndiff maxdiff_e9
-note diverged`; mode 2 exits 41 when any logit differs in its bits, mode 4 exits 42 when maxdiff
-note exceeds BFTOL or a step diverged. Modes 0, 1 and 3 print one GD line per step (ggdstep), then
-note run one more forward at the last context with the launch profile on (`GP id gx gy gz m n k
-note wait_ns` per launch, gk.om gkpf), 64 ZERO launches of 64 floats (the bare launch round trip, GP
-note id 20) and `GDT mode N load_ns open_ns` (checkpoint and merges load; chip open and f32
+note edf39b0); 1: ggdfwd (oglast's forward); 3: ggdfwd with BF16 GEMMs (ggdfm 3); 5: ggdfwd as one
+note batched submission (ggdbat); 2, 4 and 6: ggfwd and ggdfwd (2 f32, 4 BF16, 6 batched) on every
+note step, one GQ line each (ggdpar), then `GDQ N ndiff maxdiff_e9 diverged`; modes 2 and 6 exit 41
+note when any logit differs in its bits, mode 4 exits 42 when maxdiff exceeds BFTOL or a step
+note diverged. Modes 0, 1, 3 and 5 print one GD line per step (ggdstep), then run one more forward
+note at the last context with the launch profile on (`GP id gx gy gz m n k wait_ns` per launch, gk.om
+note gkpf; batched launches log wait 0), 64 ZERO launches of 64 floats (the bare launch round trip,
+note GP id 20) and `GDT mode N load_ns open_ns` (checkpoint and merges load; chip open and f32
 note parameter upload).
 fn ggdbench to void
 if ne oargc 7
@@ -2255,12 +2315,17 @@ ockload 2
 nn = oargu 3
 md = oargu 6
 v = get og 0
-if or le v 256 gt md 4
+if or le v 256 gt md 6
 exit 2
 end
 obload 5 v
 t1 = monons
 ogchip
+if ge md 5
+if not gbbopen
+ggdie 122
+end
+end
 t2 = monons
 put og 9 0
 ocpush 0
@@ -2268,36 +2333,61 @@ np = obprompt 4
 for i ulong np
 ocpush get obtk i
 end
-put gsmd 0 0.0f64
-put gskd 0 0
+put ggdmx 0 0.0f64
+put ggdnd 0 0
 put ggdkd 0 0
 for s ulong nn
 a = ggdsel s md
 ocpush a
 end
-if or eq md 2 eq md 4
+if or or eq md 2 eq md 4 eq md 6
+ggdverd nn md
+ret
+end
+ggdprof md
+oputc 71
+oputc 68
+oputc 84
+oputc 32
+oputu md
+oputc 32
+oputu nn
+oputc 32
+oputl sub t1 t0
+oputc 32
+oputl sub t2 t1
+oputc 10
+oflush
+r = nvstop
+end
+
+note the parity modes' last line `GDQ N ndiff maxdiff_e9 diverged`, then their exit codes
+fn ggdverd nn ulong md ulong to void
 oputc 71
 oputc 68
 oputc 81
 oputc 32
 oputu nn
 oputc 32
-oputu get gskd 0
+oputu get ggdnd 0
 oputc 32
-oputl long mul get gsmd 0 1000000000.0f64
+oputl long mul get ggdmx 0 1000000000.0f64
 oputc 32
 oputu get ggdkd 0
 oputc 10
 oflush
 r = nvstop
-if and eq md 2 gt get gskd 0 0
+if and ne md 4 gt get ggdnd 0 0
 exit 41
 end
-if and eq md 4 or gt get gsmd 0 BFTOL gt get ggdkd 0 0
+if and eq md 4 or gt get ggdmx 0 BFTOL gt get ggdkd 0 0
 exit 42
 end
-ret
 end
+
+note one forward in mode md at the current context with the launch profile on, then 64 ZERO launches
+note of 64 floats; prints one GP line per profiled launch
+fn ggdprof md ulong to void
 put gkpc 0 0
 put gkpf 0 1
 ggupt
@@ -2317,20 +2407,6 @@ oputu get gkpl add o j
 end
 oputc 10
 end
-oputc 71
-oputc 68
-oputc 84
-oputc 32
-oputu md
-oputc 32
-oputu nn
-oputc 32
-oputl sub t1 t0
-oputc 32
-oputl sub t2 t1
-oputc 10
-oflush
-r = nvstop
 end
 
 note gscmp CK N PROMPT MERGES (V > 256): the chip forward against the CPU forward on the contexts of
