@@ -24,7 +24,8 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `src/ir.om` | First unit of the `ng` program (om2): ΩIR tables, builder, the one binary reader and writer (IR.md s14). |
 | `src/main.om` | Last unit: `ng` driver; mode `@ng ir-copy` reads a unit and writes it back byte for byte; `@ng front-check` and `@ng front-ir` run `src/front.om` (front/README.md). |
 | `ng.units` | The ordered unit list of `ng`, each with its sha256 pin. |
-| `ngbuild.om` | `ngbuild build OMC UNITS OUT` checks every pin, concatenates and compiles; `ngbuild sums UNITS` prints fresh pins. |
+| `ngbuild.om` | `ngbuild build OMC UNITS OUT` validates the list, checks every pin, joins and compiles; `ngbuild sums UNITS` prints fresh pins. |
+| `*.units`, `tests/ngbuild/gate.om` | Per-tool pinned lists, including `ngbuild.units` for its own self-build; standalone Omega first-birth and refusal gate. |
 | `sha256.om` | FIPS 180-4 SHA-256 shared by ngbuild, ngcheck and the gate. |
 | `ngcheck.om` | The validator: binary ΩIR on stdin, `ACCEPT <sha256> fns= blocks= ops=` or `ngcheck: CLASS at OFFSET` with the class as exit code (IR.md s11). Its own reader: it shares no code with `src/ir.om`. `ngcheck --table` prints the host word table it was built with. |
 | `ngtxt.om`, `ngas.om`, `ngdis.om` | Canonical text tools (IR.md s10): `ngas` text to binary, `ngdis` binary to text. A third independent decoder of the wire format. |
@@ -36,10 +37,19 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 
 From the repository root (any scratch directory works):
 
-    cat seed/ng/sha256.om seed/ng/gate-ir.om | seed/out/omc > /tmp/gate-ir && chmod +x /tmp/gate-ir
+    seed/out/omc < seed/ng/tests/ngbuild/gate.om > /tmp/ngbuild-gate && chmod +x /tmp/ngbuild-gate && /tmp/ngbuild-gate seed/out/omc /tmp/ngbuild-birth
+    /tmp/ngbuild-birth/ngbuild build seed/out/omc seed/ng/gate-ir.units /tmp/gate-ir
     /tmp/gate-ir seed/out/omc /tmp/ng-ir-gate
 
-The gate builds ngbuild, ngcheck, ngas, ngdis and ngrun with that omc, builds `ng` through
+The first line is the only bootstrap invocation. The standalone Omega gate independently joins
+`sha256.om` and `ngbuild.om`, compiles the result, then has ngbuild read `ngbuild.units` and build
+itself. It requires both joined source and binary to match byte for byte. It also exercises the
+refusals below with exact exit status and diagnostic, no stdout and no created output/source.
+`ngbuild build` invokes OMC directly with `fork`, `dupfd`, `execprog` and `waitpid`, not a shell.
+No `cat` is needed by these commands. Gate negative control: append `wrong` to its arguments; the
+missing-unit expectation is inverted and the gate must end `NGBUILDGATE FAIL`, exit 1.
+
+The ΩIR gate builds ngbuild, ngcheck, ngas, ngdis and ngrun with that omc, builds `ng` through
 `ngbuild build` (so every pin in `ng.units` is checked), requires `ngcheck --table` to equal
 `hostwords.tsv`, and requires `ngbuild build` to refuse a units file with one wrong pin (exit 3,
 the exact mismatch line) before it compiles anything. Then it runs every line of `tests/ir/cases`:
@@ -57,23 +67,48 @@ changed, the class name shifted) and a mutant ngrun (`chk.fuel` one pass late) m
 their named check at least once. Last line `NGIRGATE PASS cases=N`,
 exit 0; otherwise one `FAIL` line per failure and exit 1.
 
-The tools one by one:
+The tools one by one, after first birth:
 
-    cat seed/ng/sha256.om seed/ng/ngcheck.om | seed/out/omc > ngcheck
-    cat seed/ng/ngtxt.om seed/ng/ngas.om | seed/out/omc > ngas
-    cat seed/ng/ngtxt.om seed/ng/ngdis.om | seed/out/omc > ngdis
-    cat seed/ng/sha256.om seed/ng/ngbuild.om | seed/out/omc > ngbuild
-    cat seed/ng/src/ir.om seed/ng/ngrun.om | seed/out/omc > ngrun
+    /tmp/ngbuild-birth/ngbuild build seed/out/omc seed/ng/ngbuild.units ngbuild
+    ./ngbuild build seed/out/omc seed/ng/ngcheck.units ngcheck
+    ./ngbuild build seed/out/omc seed/ng/ngas.units ngas
+    ./ngbuild build seed/out/omc seed/ng/ngdis.units ngdis
+    ./ngbuild build seed/out/omc seed/ng/ngrun.units ngrun
+    ./ngbuild build seed/out/omc seed/ng/ngbench.units ngbench
     ./ngbuild build seed/out/omc seed/ng/ng.units ng
     ./ngas < seed/ng/tests/ir/a-arith.oir | ./ngcheck
     ./ngas < seed/ng/tests/ir/x-fib.oir > fib.ir && ./ngrun fib.ir; echo $?
 
-After changing a unit listed in `ng.units`, refresh its pins with `./ngbuild sums seed/ng/ng.units`.
+After changing a listed unit, refresh every affected `*.units` file with `./ngbuild sums LIST`.
+Capture its output into a separate file before replacing LIST; never truncate a list while `sums`
+is reading it.
+
+### Unit-list contract and exit status
+
+Each line is exactly 64 lowercase SHA-256 hex digits, one space, a nonempty path of at most 4095
+bytes (no NUL), then LF. Paths are relative to the working directory. No comments, blank lines or
+ordering metadata are accepted. Order is the line order, with no inserted byte between files.
+There is no dependency graph in this format, so a cycle has no representation. At least one and
+at most 64 units, at most 65536 list bytes, and at most 8388607 joined source bytes are accepted.
+The entire list is validated before any unit is read. In `build`, paths and digest pins must be
+unique (this also catches aliases with identical contents); `sums` permits equal placeholder pins
+but still refuses duplicate paths. All units and pins are checked before output is opened or OMC runs.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Built, or sums printed. |
+| 1 / 2 / 3 | OMC refused (its status is printed) / usage / pin mismatch. |
+| 4 / 5 | Malformed or empty list / unreadable list or unit. |
+| 6 / 7 | Cannot write output / fork, exec or wait failure. |
+| 8 / 9 | Duplicate unit / list, unit count, unit file or joined-source limit exceeded. |
+
+Exact diagnostic formats are in `ngbuild.om`; malformed-line offsets count bytes from zero.
+Regression gate: `tests/ngbuild/gate.om`, with no shared implementation with ngbuild.
 
 CI: `.github/workflows/ng-ir-arm64.yml` births omc from the seed, requires the committed
-`seed/out/omc.sha256`, builds the gate and runs it. Its run lines are glue only (birth, digest
-compare, `cat A B | omc`, start the gate); every check lives in the gate. It runs on any change
-under `seed/` (the compiler's bootstrap closure and the ng tree) or to the workflow.
+`seed/out/omc.sha256`, builds the gate and runs it. That historical workflow's `cat` bootstrap is
+unchanged here (protected path); use the host commands above for the no-cat build. It runs on any
+change under `seed/` or to the workflow.
 
 ## Host dependencies
 
@@ -83,8 +118,8 @@ oracles (the pinned omc, git, gh, crumb) and referees (gcc, objdump, cuobjdump, 
 
 | host tool | version | where | what it does | Omega replacement |
 |---|---|---|---|---|
-| cat | GNU coreutils 9.4 (`/usr/bin/cat`) | bootstrap of ngbuild, ngcheck, ngas, ngdis and the gate (`cat A B \| omc`) | concatenates two units once, before ngbuild exists | ngbuild self-builds after the first birth; proposal: commit a units file per tool and drop cat after one bootstrap |
+| cat | Not required by the host commands above | historical workflow bootstrap only (unchanged) | concatenates units in the historical workflow | standalone `tests/ngbuild/gate.om` owns first birth; `ngbuild build` owns all later pinned builds |
 | taskset | util-linux 2.39.3 | Spark builds and timed runs | pins builds to core 1, timed runs to their cores | an Omega `sched_setaffinity` host word in ngbench (proposal to omega-mv) |
 | flock | util-linux 2.39.3 | Spark lane builds and bench rounds | shared and exclusive core-pool locks between agents | an Omega flock host word, or ngbench taking the lock itself (proposal) |
-| nice | GNU coreutils 9.4 (`/usr/bin/nice`) | Spark build and timing prefixes | lowers scheduling priority | a setpriority host word (proposal) |
+| nice | GNU coreutils 9.4 | Spark build and timing prefixes | lowers scheduling priority | a setpriority host word (proposal) |
 | sh / YAML run lines | GitHub runner | CI workflows `ng-<lane>-arm64.yml` | one-line invocations of `.om` gates | none planned: CI glue only, no logic |
