@@ -26,14 +26,14 @@ sh "$D/rung2/enccases.sh" > "$O/cases"
 cut -d'|' -f1 "$O/cases" | while read -r f args; do "$CHK" encode $f $args 2>&1; done > "$O/c.words"
 { cat "$T"; cut -d'|' -f2 "$O/cases"; } | "$A" > "$O/a.bin"; rc=$?
 od -An -v -tx4 -w4 "$O/a.bin" | tr -d ' ' > "$O/a.words"
-paste -d'|' "$O/cases" "$O/c.words" "$O/a.words" | awk -F'|' 'BEGIN { print "Omega reference encoder call\tasm2 line\tC word\tasm2 word\tverdict" }
+paste -d'|' "$O/cases" "$O/c.words" "$O/a.words" | awk -F'|' 'BEGIN { print "Omega reference encoder call\tasm2 line\treference word\tasm2 word\tverdict" }
   { v = ($3==$4 && $3 ~ /^[0-9a-f]{8}$/) ? "same" : "DIFFERENT"; print $1 "\t" $2 "\t" $3 "\t" $4 "\t" v }' > "$O/encoder-compare.tsv"
 nd=$(grep -c 'DIFFERENT$' "$O/encoder-compare.tsv"); nc=$(($(wc -l < "$O/encoder-compare.tsv") - 1))
 nf=$(cut -d' ' -f1 "$O/cases" | cut -d'|' -f1 | sort -u | wc -l)
 [ $rc = 0 ] && [ "$nd" = 0 ] && ok "encoder: $nc cases over $nf forms, asm2 = Omega reference encoder on every one" || bad "encoder: $nd of $nc differ (rc=$rc)"
 # label path: distance d in words for branches, in bytes for adr
 fill() { awk -v n="$1" -v s="${2:-0}" 'BEGIN { while (n > 0 && s % 4) { print ".b 0"; n--; s++ } for (i = 0; i < int(n / 4); i++) print ".w 0"; for (i = 0; i < n % 4; i++) print ".b 0" }'; }  # n bytes from offset s
-lcase() { # <C form + leading args> <asm2 insn + leading operands> <distance> <unit 4|1>
+lcase() { # <reference form + leading args> <asm2 insn + leading operands> <distance> <unit 4|1>
   d=$3; u=$4
   if [ "$u" = 4 ]; then
     if [ "$d" -le 0 ]; then { cat "$T"; echo ":T"; fill $((-d * 4)); echo "$2 T"; } > "$O/l.s"; pos=last
@@ -45,7 +45,7 @@ lcase() { # <C form + leading args> <asm2 insn + leading operands> <distance> <u
   "$A" < "$O/l.s" > "$O/l.bin"; rc=$?
   if [ $pos = first ]; then got=$(head -c 4 "$O/l.bin" | od -An -tx4 | tr -d ' '); else got=$(tail -c 4 "$O/l.bin" | od -An -tx4 | tr -d ' '); fi
   want=$("$CHK" encode $1 $d 2>&1)
-  if [ $rc = 0 ] && [ "$got" = "$want" ]; then lab_ok=$((lab_ok + 1)); else lab_bad=$((lab_bad + 1)); echo "  label case DIFFERENT: $1 d=$d asm2=$got rc=$rc C=$want"; fi
+  if [ $rc = 0 ] && [ "$got" = "$want" ]; then lab_ok=$((lab_ok + 1)); else lab_bad=$((lab_bad + 1)); echo "  label case DIFFERENT: $1 d=$d asm2=$got rc=$rc reference=$want"; fi
   printf '%s\t%s\t%s\t%s\t%s\n' "$1 $d" "$2 <label at $d>" "$want" "$got" "$([ "$got" = "$want" ] && echo same || echo DIFFERENT)" >> "$O/encoder-compare.tsv"
 }
 lab_ok=0; lab_bad=0
@@ -56,7 +56,7 @@ for d in 0 4 5 6 7 100 -1 -2 -3 -4 -5 1048575 -1048576; do lcase "adr 5" "adr x5
 # refusals: asm2 error 8 where the value is outside the field; the Omega reference encoder refuses (aborts) too
 rf() { printf '%s\n' "$2" | cat "$T" - | "$A" > /dev/null 2> "$O/r.err"; rc=$?
   "$CHK" encode $1 > /dev/null 2>&1; crc=$?
-  [ $rc = 8 ] && [ $crc != 0 ] && ref_ok=$((ref_ok + 1)) || { ref_bad=$((ref_bad + 1)); echo "  refusal case: '$2' asm2 rc=$rc, C rc=$crc"; }; }
+  [ $rc = 8 ] && [ $crc != 0 ] && ref_ok=$((ref_ok + 1)) || { ref_bad=$((ref_bad + 1)); echo "  refusal case: '$2' asm2 rc=$rc, reference rc=$crc"; }; }
 ref_ok=0; ref_bad=0
 rf "b 33554432" "b.raw 33554432"; rf "b -33554433" "b.raw -33554433"; rf "b_cond 16 0" "b.c.raw 16 0"
 rf "cbz 1 0 262144" "cbz.x.raw x0 262144"; rf "subs_imm 1 0 0 4096" "subs.x.i x0 x0 4096"
