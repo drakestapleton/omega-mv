@@ -56,7 +56,7 @@ main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt \
-      seed/ng/front/cases-fconv.txt
+      seed/ng/front/cases-fconv.txt seed/ng/front/cases-host.txt
 
 The source is `units:seed/ng/ng.units`: the units that list names, concatenated in its order, so a
 stage lane's unit (src/a64.om on the slice branches) comes with the list and no gate command changes
@@ -120,7 +120,7 @@ after 1000000 passes), two signed `for` latch units of `cases/` (`for_latch_i8`,
 writes the counter's maximum and the latch's add 1 traps 1, as omc's does; fe_lendl adds it under chk.add),
 two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last), six mixed-shift and fma run
-units of `cases/` (below), 33 refusal units of `cases/`, and the float-to-integer cases below. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
+units of `cases/` (below), 33 refusal units of `cases/`, the float-to-integer cases below, and the host-word cases (`host` rows, below). ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
 queen) and matmul verbatim. The full-size kernels stay verbatim in `kernels/` (`kernels/PROVENANCE.md`).
 No standing gate compares all of them at full size: ng-a64's rgate front phase (ng/slice-m1, list `tfr`)
@@ -131,9 +131,10 @@ Every child the gate starts is killed after 600 s: that case prints `NOT_RUN` an
 as ok, FAIL, a kill or a trip. Negative controls: five lowering mutants (the `for` latch adds 2;
 `and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped; a mixed-type shift amount
 checked against its own width instead of the value's; fma's second and third operands swapped) must fail a
-run case,
+run case, two host mutants (a `long` host argument lowered as `int`; `chk.bounds` in place of a host
+slice's `chk.slice`) must fail a host case,
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
-Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
+Last line `FRONTIRGATE PASS|FAIL|NOT_RUN cases=N run=R refuse=F host=H classed=Q ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
 
 ### Float-to-integer conversion
@@ -167,6 +168,31 @@ them failing closed, and its bool-amount admission mutant must be KILLED:
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-lower-scope.txt seed/ng/front/mutants-lower-scope.txt SCRATCH \
       seed/ng/front/cases-lower-scope.txt
+
+## Host words
+
+Every host word of `seed/ng/hostwords.tsv` (94, the words omc's keyword table admits as host operations at
+the pin) lowers to ΩIR `host` (op 110, IR.md s7.11) with the word's keyword id as imm and ty i64; `cpufence`
+and `cpurelax` are statements with ty 0. read, write, monons and realns keep their earlier paths; `fe_lhost`
+takes the other 88 from the table's argument letters (`fe_lhfmt`, generated from the table): `i` int, `l`
+long, `L` ulong, `u` a uint constant (omc requires a literal), and `r`, `w`, `S` a byte array name followed by
+off and n (ulong), with `chk.slice` on the three where omc checks the slice, before the next argument is read.
+mapaddr and mapget are ulong in omc: their i64 result is `conv`ed with the same bits. The check pass gained
+execenv (233) and prlimit (235), which the pinned omc admits: execenv goes through `fe_hpack` with omc.om
+hpack's second packet (the environment), its two pre-stack trap sites and one record scan per packet;
+prlimit through `fe_hprlim` (int pid, int resource, writable byte slice; no trap site of its own).
+
+Cases: `cases-host.txt` (the 94 programs `runs/host-WORD.om`, five refusals `runs/bad-host-*.om` and two
+`om2 diag` units `runs/diag-host-*.om`) in gate-front's check parity; in `cases-front-ir.txt` one
+`host NAME SRC C` row per word and the five refusals as `refuse` rows. A `host` row compiles and runs the
+unit with omc (empty stdin, the repository root as working directory: the programs name only empty or
+`/dev/null` paths and invalid descriptors; none opens a device), lowers it, requires ngcheck ACCEPT and runs
+the ΩIR with `ngrun --scratch SCRATCH/hK` (a new directory each run). C 0: exit and stdout equal the
+binary's. C 115..123: ngrun refuses the word by that class (IR.md s7.11: process, limits, device, network,
+outside scratch, nondeterministic, unsafe filesystem) with exit C and no stdout, so that program's ΩIR is
+checked but not executed: behavior parity for it stays NOT_RUN. The C column follows IR.md's table and
+trap-first rules (empty paths are not one path component: 119; malformed packets and empty stat paths
+trap 3 natively and in ngrun: 0; a negative descriptor gets -9 without a kernel call in both: 0).
 
 ## Native contracts: fail-closed lowering boundary
 

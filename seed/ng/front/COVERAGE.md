@@ -39,7 +39,7 @@ The packed C2 manifest is surveyed separately.
 | own free | R | NOT_RUN | seeded parser refuses their unsupported forms |
 | dit scrub | N | NOT_RUN | no value lowering |
 | read write monons realns | Y | Fixture-scoped only; generally unproven |  |
-| every other host word in table below | N | NOT_RUN | no generic host lowering |
+| every other host word in table below (90 with cpufence, cpurelax) | Y (ng-front-host) | 39 of 94 host programs exit/stdout-equal to omc under ngrun; 55 lowered and ngcheck-accepted, run refused by ngrun's class (IR.md s7.11), NOT_RUN | behavior of words ngrun refuses (process, limits, device, network, paths outside scratch, random, syncfs) not executed |
 | om2, om2 debug/release/diag | P | Fixture-scoped only; generally unproven | fmt and some contract policies exit 64 |
 | om2 fmt | N | NOT_RUN | formatting output not reproduced |
 | target x86linux/x86efi and efi, ir units | outside D8 | NOT_RUN | existing scope refusal, not an NG CPU-front implementation claim |
@@ -200,8 +200,7 @@ explicitly unsupported language boundary, not a successful contract implementati
    found input-literal error 8 rather than a semantic mismatch on the admitted cases. Large inputs
    now use Wolfram-verified power-of-two constructions within fparse mantissa limits, but those final
    spellings are NOT_RUN. Do not claim the candidate READY until all cases and negative controls pass.
-3. Host lowering is deferred in the ham/NEXT.md row titled "NG front: typed lowering for all 94 current
-   host words" (that file has two rows numbered 20; cite the title, not the number). Function-mode units, the data gaps,
+3. Host lowering: ng-front-host (below) lowers all 94 host words. Function-mode units, the data gaps,
    remaining intrinsics and hygiene words remain not lowered or unproven as itemized above.
 
 ## ng-groups-4 (2026-11-10, branch ham/ng-front-groups-4)
@@ -222,3 +221,12 @@ Two groups lowered, IMPLEMENTED and host-EXERCISED by gate-front-ir only (no QUA
 Still not lowered from these rows: fmin and fmax (IR.md min/max says a NaN operand gives the other,
 while OMEGESE and omc follow FMINNM/FMAXNM, where a signaling NaN gives a quiet NaN; NgIrOracle head
 36edfca2, which corrects IR.md and ngrun, is not on main).
+
+## ng-front-host (2026-11-10, branch ham/ng-front-host)
+
+All 94 host words of `seed/ng/hostwords.tsv` lower (IMPLEMENTED, host-EXERCISED by gate-front-ir and
+gate-front only, no QUALIFIED claim); execenv and prlimit pass the check pass as omc does (gate-front,
+`cases-host.txt`, including their `om2 diag` site records). Under ngrun, 39 of the 94 host programs give
+omc's exit and stdout; for the other 55 ngrun refuses the word by class (IR.md s7.11) after ngcheck accepts
+the lowered ΩIR, so their behavior is NOT_RUN: process 11, limits 1, device 17, network 15, outside
+scratch 9, nondeterministic 1, unsafe filesystem 1. README section "Host words" has the lowering rules.
