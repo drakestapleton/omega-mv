@@ -2,7 +2,7 @@
 
 Status: IMPLEMENTED and HOST_TESTED for the integer slice below (gates in section 6); the rest is PROPOSED.
 Code: `seed/ng/src/a64.om` (unit of `seed/ng/ng.units`, between `ir.om` and `main.om`; functions `a6_*`, globals
-`a_*`). Built by `seed/out/omc` (sha256 `5f90edea…`, omega-mv `943d9555`). Facts about seed omc it copies are in
+`a_*`). Built for the ham fusion head by `seed/out/omc` (sha256 `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`, Radicle base `a59a425b4`). Facts about seed omc it copies are in
 `~/handoffs/hive-ng/a64/REALITY.md` (file:line at `943d9555`).
 
 ## 1. Job
@@ -171,7 +171,7 @@ bits there (multiply, two-source, float). The selector never asks for these; the
 2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `atom`, `atomcas`,
    float elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass that
    proves them (IR.md s15).
-3. Fusions: compare feeding cbr as CMP + B.cond; ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
+3. Remaining fusions: ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
 4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), host words beyond
    read, write, monons, realns, cpufence and cpurelax (sleepns 120 has no ngrun reference: ngrun's host words are
    read, write, monons, realns, cpufence, cpurelax).
@@ -238,14 +238,14 @@ bits there (multiply, two-source, float). The selector never asks for these; the
   `r-s12` (ngrand seed 12 shrunk by `ngrand shrink` to the `rotr u8` that a64 refused, kept as found) cover narrow
   rotations.
 
-  Twenty-seven mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
+  The original twenty-seven mutants (spill reload slot, call clobber, live-out range, parallel-move ordering, callee-saved saves,
   frame size, 16-byte entry alignment, E never matching, E accumulating the wrong value, chk.bounds off by e, half
   zero fill, write count, u64 loads one byte, large frame without its LSL 12 part, i8 loads zero-extending, a wrong
   trap code for chk.divovf, stack parameters read from the first incoming slot, stack arguments stored one slot low,
   a slice's length taken from its offset, slice block arguments keeping the target's length, slice offsets not
   scaled by the element size, monons selecting on GE, fill stores unscaled, realns on the monotonic clock, the u8 and
   the u16 rotate copies shifted wrong, x15 allocatable) must each change at least one fixture's status (against its
-  expectation or ngrun's) or alignment.
+  expectation or ngrun's), alignment, or stdout/stderr bytes; section 8 adds seven more forms.
 - Front phase of `rgate.om` (rgate step 6; branch ng/slice-m1, where ng.units holds ir, front, a64, main): for each
   source of rgate's list `tfr` (ng-ir's 14 integer `x-*.om` run pairs and ng-front's nine integer bench kernels
   arith, branch, leafcall, fib38, fib40, isort, sieve, sort, matmul at full size) ng reads `@ng front-ir` and the
@@ -275,3 +275,28 @@ bits there (multiply, two-source, float). The selector never asks for these; the
 - B: throughput 2 per cycle; CBZ/CBNZ/TBZ: throughput 2 (p15).
 - LDP: latency 4; STP: throughput 2 (p19-20).
 The slice does no instruction scheduling.
+
+## 8. Local compare fusion (ham/ng-a64-float)
+
+A compare whose boolean has exactly one use by the immediately following cbr or select is selected at the compare site. No instruction, check, token effect or operand lifetime moves. A compare with another use remains CMP + CSET. cbr becomes CMP + B.cond; eq/ne against a zero constant becomes CBZ/CBNZ. A single-bit AND result compared with zero uses TBZ/TBNZ at the actual bit number, including bits 32 through 63. The AND itself remains, so no earlier input lifetime is extended. A compare feeding select uses its flags directly in CSEL rather than materialising a boolean and comparing it again.
+
+Use counts are computed once per function. Branch fall-through polarity follows the existing block order. Short branch fixup checks signed displacement ranges. If a conditional branch is too far, the function is emitted again with inverted short branches over ordinary B instructions, retaining trap stub and call fixups; the code buffer fits B range. No range is silently masked.
+
+`tests/fusion.om`, composed after `src/ir.om`, generates `tests/oir/f-fusion.oir`: every integer type and comparison in branch/select forms, true and false paths, every TBZ bit, and a far bit target. rgate includes the generated fixture and seven additional mutants for B.cond condition, CBZ, CBNZ, TBZ, TBNZ, bit packing and CSEL operand order. `tests/fusion-bench.om` records the before-timing NG benchmark protocol.
+
+`ngas.om` and `ngdis.om` are the canonical IR text tools, not AArch64 instruction encoders/decoders. Their unchanged compare/select/branch row encodings already cover these programs. Encoder instruction forms are in a64.om and checked against GNU objdump by gate.om. IR round trips are checked separately.
+
+### Fusion measurements (2026-11-10, MEASURED, not QUALIFIED)
+
+Same front-generated IR, same seeded compiler, baseline a64 unit 0120a15a vs fusion unit 27b64b75. NG bench used nine measured ABBA blocks after two warm blocks, core 11 (A725) and core 19 (X925), under their pool locks with nice 19. Both arms keep 64-byte function alignment. Every core/case had nine clean blocks under the K-row rule; both runs ended S rows=88 ok=88 fail=0 refused=0. Nine blocks do not meet the older 21-clean-block qualification criterion, so these are measurements, not a performance qualification.
+
+| Core | Case | Baseline median wall ms | Fused median wall ms | Median paired fused/base wall ratio |
+|---|---|---:|---:|---:|
+| A725 | branch | 531.791 | 478.156 | 0.898969 |
+| A725 | arith | 178.697 | 180.079 | 1.008854 |
+| X925 | branch | 259.285 | 237.284 | 0.913879 |
+| X925 | arith | 121.405 | 121.185 | 0.997848 |
+
+The arithmetic case is retained, including its measured A725 regression; no global speed claim is inferred. Ratios are the median of per-block sums, not the ratio of the two displayed medians. Wolfram computed statistics and formatting. Numeric T/K/H/A/S records: tests/fusion-a725.txt and tests/fusion-x925.txt; method/results: tests/fusion-stats.txt. Full process-contamination rows and exact Wolfram queries are retained with the READY's EVBACK paths, not copied into public process inventories.
+
+Acceptance on this source: gate.om 213/213 encoder cases, 23/23 refusals, wrong-bit mutant 3 mismatches and M-A 8 refusal failures; rgate fixtures 14/14, ngrun fixtures 78/78, front cases 23/23, expected float refusals 2/2, random seeds 1000/1000 in both save forms, controls differ, mutants 34/34 killed. f-fusion prints every per-call result so swapping complementary true/false results cannot cancel in its exit checksum; mutant checks compare stdout/stderr as well as status. The generated IR also passes ngas/ngdis byte-exact round trip.

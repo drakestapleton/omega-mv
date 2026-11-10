@@ -870,7 +870,10 @@ global a_ldef ulong 2097152
 note a_fs (per function): 0 values, 1 blocks, 2 bitset words per block, 3 positions, 4 spill slots, 5 callee-saved
 note mask, 6 has a call, 7 frame bytes, 8 function, 9 liveness changed, 10 trap codes used (mask), 11 saved count,
 note 12 fixups, 13 current block index, 14 E tail sites (0: no accumulator), 15 code offset of the E loop head
-global a_fs ulong 16
+global a_fs ulong 17
+note fusion: use counts by wire, two immediately consumed ops skipped after the fused producer.
+global a_nu uint 262144
+global a_skip ulong 2
 note a_sform: 0 save pairs (STP/LDP, variant A), 1 separate STR/LDR (variant B); `@ng a64 split` selects 1
 global a_sform ulong 1
 global a_ract ulong 32
@@ -1605,6 +1608,17 @@ end
 
 note ---- branch fixups: label < 1000 is a block index, 1000 + c the trap stub of code c ----
 fn a6_fx f ulong a ulong l ulong to void
+if ne get a_fs 16 0
+if and ge f a_bcond le f 109
+if eq f a_bcond
+a6_ew f xor a 1 2 0 0 0
+else
+a6_ew xor f 1 a 2 0 0 0
+end
+f = a_b
+a = 0
+end
+end
 n = get a_fs 12
 if ge n len a_xpc
 a6_unsup n
@@ -1654,9 +1668,22 @@ fn a6_fix1 i ulong t ulong to void
 pc = get a_xpc i
 f = get a_xfm i
 d = a6_wd pc t
+if or eq f 110 eq f 111
+a = get a_xa i
+if and ge d 8192 lt d sub ulong 0 8192
+put a_fs 16 1
+ret
+end
+a6_putw pc a6_enc f and a 31 shr a 5 d 0 0
+ret
+end
 if eq f a_b
 a6_putw pc a6_enc f d 0 0 0 0
 else
+if and ge d 262144 lt d sub ulong 0 262144
+put a_fs 16 1
+ret
+end
 a6_putw pc a6_enc f get a_xa i d 0 0 0
 end
 end
@@ -1972,6 +1999,9 @@ end
 
 note ---- selection ----
 fn a6_sel o ulong x ulong to void
+if or eq o get a_skip 0 eq o get a_skip 1
+ret
+end
 op = ulong get i_oop o
 r = ulong get i_ors o
 if ne r 0
@@ -2532,9 +2562,164 @@ end
 a = a6_src v 16
 b = a6_src a6_arg o 1 17
 d = a6_dst r
+n = a6_cuse o
+if ne n 0
+a6_cmpuse o n op t a b
+ret
+end
 a6_ew a_subsx 31 a b 0 0
 a6_ew a_csincx d 31 31 xor a6_cc op t 1 0
 a6_fin r d
+end
+
+note Compare fusion is local: a sole, immediately following cbr/select consumer. Operand lifetimes therefore do
+note not change, no effect or flag-setting instruction moves, and a compare used elsewhere stays materialised.
+fn a6_ucnt to void
+w = ulong 0
+while lt w get a_fs 0 bound 262144
+put a_nu w 0
+w = add w 1
+end
+x = ulong 0
+while lt x get a_fs 1 bound 65536
+o = ulong get i_bo1 get a_bh x
+while ne o 0 bound 4194305
+k = ulong 0
+while lt k ulong get i_ona o bound 1048576
+if eq ir_okd uint get i_oop o k 0
+v = a6_arg o k
+if not a6_istk v
+w = a6_wi v
+put a_nu w add get a_nu w 1
+end
+end
+k = add k 1
+end
+o = ulong get i_onx o
+end
+x = add x 1
+end
+end
+fn a6_cuse o ulong to ulong
+r = ulong get i_ors o
+if ne get a_nu a6_wi r 1
+ret 0
+end
+n = ulong get i_onx o
+if eq n 0
+ret 0
+end
+op = get i_oop n
+if eq op 61
+if eq a6_arg n 1 r
+ret n
+end
+end
+if eq op 2
+if eq a6_arg n 0 r
+ret n
+end
+end
+ret 0
+end
+fn a6_czero v ulong to bool
+if ne get i_vk v 4
+ret false
+end
+o = get i_vo v
+ret and eq get i_oop o 1 eq get i_oim o 0
+end
+note A single-bit AND followed by eq/ne zero can test its result with TBZ/TBNZ, no CMP or boolean.
+fn a6_cbit v ulong to ulong
+if ne get i_vk v 4
+ret 64
+end
+o = ulong get i_vo v
+if ne get i_oop o 16
+ret 64
+end
+k = ulong 0
+while lt k 2 bound 2
+s = a6_arg o k
+if eq get i_vk s 4
+p = get i_vo s
+if eq get i_oop p 1
+m = get i_oim p
+j = ulong 0
+while lt j 64 bound 64
+if eq m shl ulong 1 j
+ret j
+end
+j = add j 1
+end
+end
+end
+k = add k 1
+end
+ret 64
+end
+fn a6_tbfx f ulong r ulong bit ulong l ulong to void
+if ne get a_fs 16 0
+a6_ew xor f 1 r bit 2 0 0
+a6_fx a_b 0 l
+else
+a6_fx f add r shl bit 5 l
+end
+end
+fn a6_cjump o ulong op ulong cc ulong a ulong b ulong l ulong to void
+zero = false
+if or eq op 30 eq op 31
+zero = a6_czero a6_arg o 1
+end
+if zero
+f = a_cbnzx
+if eq cc 0
+f = a_cbzx
+end
+bit = a6_cbit a6_arg o 0
+if lt bit 64
+f = 111
+if eq cc 0
+f = 110
+end
+a6_tbfx f a bit l
+else
+a6_fx f a l
+end
+else
+a6_ew a_subsx 31 a b 0 0
+a6_fx a_bcond cc l
+end
+end
+
+fn a6_cmpuse o ulong n ulong op ulong t ulong a ulong b ulong to void
+put a_skip 0 n
+cc = a6_cc op t
+if eq get i_oop n 2
+a6_ew a_subsx 31 a b 0 0
+u = a6_src a6_arg n 1 17
+v = a6_src a6_arg n 2 15
+r = ulong get i_ors n
+d = a6_dst r
+a6_ew a_cselx d u v cc 0
+a6_fin r d
+ret
+end
+bt = a6_bix a6_arg n 2
+bf = a6_bix a6_arg n 3
+x = a6_bix ulong get i_ob n
+inv = eq bt add x 1
+l = bt
+if inv
+l = bf
+cc = xor cc 1
+end
+a6_cjump o op cc a b l
+if not inv
+if ne bf add x 1
+a6_fx a_b 0 bf
+end
+end
 end
 
 fn a6_cc op ulong t ulong to ulong
@@ -3207,6 +3392,10 @@ put a_fs 8 f
 a6_wmap f
 a6_lay f
 a6_tre f
+a6_ucnt
+put a_skip 0 0
+put a_skip 1 0
+put a_fs 16 0
 lw = shr add nv 63 6
 put a_fs 2 lw
 if gt mul get a_fs 1 lw a_maxw
@@ -3224,7 +3413,14 @@ a6_shw
 a6_ivcross
 a6_scan
 a6_frame
+pc = get a_cn 0
+nc = get a_ncl 0
 a6_fbody f
+if ne get a_fs 16 0
+put a_cn 0 pc
+put a_ncl 0 nc
+a6_fbody f
+end
 end
 
 note a6_al64: pad the code with NOP (C6.2.238, never executed: the previous function ends in RET or its trap stubs)
@@ -3280,6 +3476,8 @@ end
 
 fn a6_fbody f ulong to void
 a6_al64
+put a_skip 0 0
+put a_skip 1 0
 put a_fpc f get a_cn 0
 put a_fs 12 0
 put a_fs 10 0
