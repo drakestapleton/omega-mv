@@ -113,7 +113,7 @@ All entries are N at baseline except read/write/monons/realns, which are Y.
 
 All 5874 packed C2 sources and 1488 tracked .om sources were sent through front-ir (7362 inputs).
 Two cyclic size-generator C2 inputs were not materialized in this survey; FRONTGATE covers them.
-The resulting table is kept outside the repository at ~/work/hive/ham/NgFrontFull/run/sv/.
+The resulting table is kept outside the repository in the owning worktree's uncommitted run/sv/ evidence, named in the external handoff.
 674 emitted IR (this alone is not behavioral parity); 850 reached a lowering/scope refusal. Other inputs were rejected by the check pass.
 First refusal site counts (not additive demand estimates): no main 250, missing value dispatcher 220 (172 host-bearing first-blocker lines, 48 other expressions),
 unequal shift types 131, D8 scope 116, non-int main signature 42, top-level declaration 19,
