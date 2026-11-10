@@ -5,7 +5,7 @@ const cmd=(e,a)=>{let r=spawnSync(e,a,{maxBuffer:16*1024*1024});if(r.status!==0)
 // The legacy paths must still hold the base's code. Since base, main changed them in exactly three ways, each
 // checked byte for byte here; anything else (an added, renamed or otherwise edited file) fails:
 // (1) the Apache-2.0 SPDX header (HDR) put in front of a file, base bytes unchanged after it, and committed
-//     .crumb metadata; (2) the SHA-256 cutover (#776): src/sha256.c deleted, src/sha256.h reduced to the
+//     .crumb metadata (edited, or removed with every crumb on 2026-11-08); (2) the SHA-256 cutover (#776): src/sha256.c deleted, src/sha256.h reduced to the
 //     include of the Omega-generated API. The current oracle is then built against that generated SHA-256
 //     (src/omega_om_units.c), so the byte-identical IR comparison below also covers the cutover;
 // (3) reviewed edits merged after base, each file pinned by the SHA-256 of its whole current content
@@ -37,7 +37,7 @@ const legacyPaths=['src/compiler','src/checker2','src/sha256.c','src/sha256.h','
 const changed=cmd('git',['diff','--no-renames','--name-status','-z',base,'--',...legacyPaths]).toString().split('\0').filter(Boolean);
 let cutover=false;
 for(let i=0;i<changed.length;i+=2){const st=changed[i],f=changed[i+1];
- if(path.basename(f)==='.crumb'&&st==='M')continue;
+ if(path.basename(f)==='.crumb'&&(st==='M'||st==='D'))continue;
  if(f==='src/sha256.c'){assert.equal(st,'D','legacy path changed: '+st+' '+f);cutover=true;continue;}
  assert.equal(st,'M','legacy path changed: '+st+' '+f);
  const cur=fs.readFileSync(f,'utf8');
