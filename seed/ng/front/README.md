@@ -111,7 +111,9 @@ case compiles the unit with omc and runs it, lowers it with ng, requires ngcheck
 ngrun and compares exit status and stdout (stderr is free: the kernels time themselves there); for each
 `refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
 `seed/ng/tests/ir`, two default-fuel run units of `cases/` (`fuel_while`, `fuel_for`: no bound, trap 4
-after 1000000 passes), two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
+after 1000000 passes), two signed `for` latch units of `cases/` (`for_latch_i8`, `for_latch_i64`: the body
+writes the counter's maximum and the latch's add 1 traps 1, as omc's does; fe_lendl adds it under chk.add),
+two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
 `cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
