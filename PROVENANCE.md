@@ -11,10 +11,10 @@ revision) §1.2(1), §1.2(8), §1.1.2(4) and §2.1; NVIDIA driver licence §2.1 
 
 - **Class A, use freely and cite:** public NVIDIA documentation (PTX ISA, CUDA Binary Utilities,
   open-gpu-doc); open source under permissive licences (NVIDIA open kernel module headers MIT, Mesa
-  NAK/NVK MIT, LLVM `BinaryFormat/ELF.h` Apache-2.0 WITH LLVM-exception, CUTLASS BSD-3-Clause); our own
-  bytes run on our own NVIDIA GPU.
-- **Class B, oracle only:** NVIDIA's `nvcc`, `ptxas`, `cuobjdump` and `nvdisasm` installed on our own
-  machine, run only on inputs we wrote (probe kernels we authored, bytes our encoders emitted), only for
+  NAK/NVK MIT, LLVM `BinaryFormat/ELF.h` Apache-2.0 WITH LLVM-exception, CUTLASS BSD-3-Clause); my own
+  bytes run on my own NVIDIA GPU.
+- **Class B, oracle only:** NVIDIA's `nvcc`, `ptxas`, `cuobjdump` and `nvdisasm` installed on my own
+  machine, run only on inputs I wrote (probe kernels I authored, bytes my encoders emitted), only for
   NVIDIA-GPU targets, with the tool version recorded. The tools are never shipped or invoked by an Omega
   program; `tools/sm121dis` replaces `nvdisasm` in the checks (C6).
 
@@ -65,7 +65,7 @@ independent.
 
 ## Open questions for counsel
 
-1. Does deriving NVIDIA instruction encodings from nvcc output of our own probe kernels, for an
+1. Does deriving NVIDIA instruction encodings from nvcc output of my own probe kernels, for an
    NVIDIA-only toolchain, fall within the CUDA EULA (§1.2(8) is limited to non-NVIDIA targets)?
 2. `tools/sm121dis` was built to print exactly what `nvdisasm` prints, checked by comparing outputs over
    many inputs. Is systematic black-box comparison with an SDK tool "reverse engineering" of the SDK under

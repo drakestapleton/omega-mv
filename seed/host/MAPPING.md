@@ -382,3 +382,20 @@ under `cfd96b48` and `0f2de851`: 2962 of the 2970 compiles give the same bytes,
 exit status and diagnostics; the other 8 are the x86 compiles of the ill-typed
 `seed/omc/tests/float/neg_fma_*` refusals, error 9 before and now the AArch64
 error 7 or 11. Gate: `seed/omc/gate8.sh` (`refuse_x86`).
+
+The prlimit 235 host word (branch `seed/prlimit-host-word`, PROPOSED pending
+review; first born as `3c2817a5` on rad main `da8b7e66`, then merged with rad
+main `408c76b7`) births compiler
+`6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`
+from source
+`7995e0e31bb3abcf9905fbb6257d56613b2dc67dd22be56f7396151fa84e7189`.
+`prlimit pid res A off n` is Linux `prlimit64`: AArch64 syscall 261 (`hprlim`,
+x0 pid, x1 res, x2 new, x3 old) and x86-64 syscall 302 (`xhprlim`, rdi pid,
+rsi res, rdx new, r10 old). `n` 16 passes new = NULL and old = &A[off]; `n` 32
+passes new = &A[off] and old = &A[off+16]; any other `n` sets -22 and skips the
+SVC/`syscall`. Two functions were added (510 of 512). Each of the 1496 tracked
+`.om` files was compiled alone for AArch64 and for `target x86linux` under
+`0f2de851` and `6d1b1cf5`: 2980 of the 2992 compiles give the same bytes, exit
+status and diagnostics; the other 12 are the AArch64 and x86 compiles of the six
+`seed/host/prlimit/` sources, which use the new word (error 3 before). Gate:
+`seed/host/prlimit/prlimit.cases`.

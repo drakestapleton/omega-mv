@@ -1,0 +1,527 @@
+note Concatenate after transport.om, pool.om and super.om. CPU-only acceptance
+note of epoch turnover, held old versions, worker death, respawn, orphaning and
+note bounded teardown with real forked processes. No GPU, model or network.
+text pok "PASS node pool\n"
+global ptc long 1
+global ptm long 1
+global pth long 1
+global ptws uchar 4
+
+fn pt_ok ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn pt_fd4 p view uchar 8 off ulong to int
+v = ulong get p off
+v = or v shl ulong get p add off 1 8
+v = or v shl ulong get p add off 2 16
+v = or v shl ulong get p add off 3 24
+ret int v
+end
+
+fn pt_byte e ulong v ulong to uchar
+ret uchar and add mul e 16 v 255
+end
+
+note Creator: publish n full records into the current epoch, bytes f(epoch, v).
+fn pt_fill c long n ulong to bool
+buf = new uchar 4096 0
+e = pool_epoch c
+h = pool_current c
+if lt h 0
+ret false
+end
+for k ulong n bound 64
+v = add mapget h 16 8 1
+b = pt_byte e v
+for j ulong 4096
+put buf j b
+end
+if ne pool_publish c 1 buf 4096 long v
+ret false
+end
+end
+ret true
+end
+
+note 0 when arena h holds exactly n complete records of its own epoch, else a code.
+fn pt_verify h long n ulong to int
+buf = new uchar 4096 0
+e = node_epoch h
+cur = ulong 0
+cnt = ulong 0
+for k ulong 65
+v = node_next h cur 1
+if eq v 0
+break
+end
+if lt v 0
+ret 1
+end
+cur = ulong v
+if ne node_read h cur buf 4096
+ret 2
+end
+b = pt_byte e cur
+for j ulong 4096
+if ne get buf j b
+ret 3
+end
+end
+cnt = add cnt 1
+end
+if ne cnt n
+ret 4
+end
+ret 0
+end
+
+fn pt_refusals to void
+pt_ok eq pool_new 0 4 neg long 7 10
+pt_ok eq pool_new 9 4 neg long 7 11
+pt_ok eq pool_new 2 0 neg long 7 12
+pt_ok eq pool_new 2 65 neg long 7 13
+c = pool_new 2 4
+pt_ok gt c 0 14
+pt_ok eq pool_epoch c 1 15
+pt_ok eq pool_acquire c 4 neg long 7 16
+pt_ok eq pool_release c 4 neg long 7 17
+pt_ok eq node_epoch pool_current c 1 18
+pt_ok eq node_reset pool_current c 0 neg long 7 19
+pt_ok eq pool_free c 0 20
+end
+
+note One process: the creator also plays worker slots 0 and 1, whose holds are
+note plain words. Epoch numbers never repeat; arenas are reused only unheld.
+fn pt_epochs to void
+dst = new uchar 4096 0
+c = pool_new 2 4
+pt_ok gt c 0 21
+pt_ok pt_fill c 1 22
+h1 = pool_acquire c 0
+pt_ok eq h1 pool_current c 23
+pt_ok eq mapget c 256 8 1 24
+pt_ok eq pool_roll c 2 25
+pt_ok ne pool_current c h1 26
+pt_ok eq node_next pool_current c 0 1 0 27
+pt_ok eq pool_roll c neg long 9 28
+pt_ok eq pool_epoch c 2 29
+pt_ok eq pt_verify h1 1 0 30
+pt_ok eq pool_release c 0 0 31
+pt_ok eq pool_roll c 3 32
+pt_ok eq pool_slot c 3 0 33
+pt_ok eq node_read h1 1 dst neg long 7 34
+pt_ok eq node_epoch h1 3 35
+pt_ok pt_fill c 64 36
+for j ulong 4096
+put dst j pt_byte 4 1
+end
+pt_ok eq pool_publish c 1 dst 4096 1 37
+pt_ok eq pool_epoch c 4 38
+h4 = pool_acquire c 1
+pt_ok eq node_epoch h4 4 39
+pt_ok pt_fill c 63 40
+pt_ok eq pool_epoch c 4 41
+pt_ok eq pool_roll c 5 42
+pt_ok pt_fill c 64 43
+pt_ok eq pool_publish c 1 dst 1 neg long 9 44
+pt_ok eq pool_epoch c 5 45
+pt_ok eq pt_verify h4 64 0 46
+pt_ok eq pool_stop c 0 47
+pt_ok eq pool_roll c neg long 1 48
+pt_ok eq pool_acquire c 2 neg long 1 49
+pt_ok eq mapget c 272 8 0 50
+pt_ok eq pool_free c 0 51
+end
+
+note The announce race, made deterministic by running the protocol steps in
+note the order that breaks a hold without its recheck: worker 2 read epoch e,
+note the creator moved past e and picked e's arena, then worker 2 stores its
+note hold. The recheck must refuse; reuse of the arena must then proceed.
+fn pt_race to void
+c = pool_new 2 4
+pt_ok gt c 0 140
+pt_ok pt_fill c 1 141
+e = pool_epoch c
+pt_ok eq pool_roll c 2 142
+pt_ok eq pool_pick c 0 143
+pt_ok eq pool_hold c 2 e neg long 8 144
+pt_ok eq mapget c 272 8 0 145
+pt_ok eq pool_reuse c 0 3 3 146
+pt_ok eq pool_acquire c 2 pool_current c 147
+pt_ok eq pool_hold c 4 3 neg long 7 148
+pt_ok eq pool_free c 0 149
+end
+
+note Worker phase: 1 acquire and verify, 2 verify the held epoch again,
+note 3 release, acquire the current epoch and verify, 4 stall ignoring stop.
+fn pt_step c long w ulong ph ulong to int
+buf = new uchar 4096 0
+m = get ptm 0
+n = mapget m 8 8
+if eq ph 1
+if ne pool_roll c neg long 6
+ret 11
+end
+if ne pool_stop c neg long 6
+ret 12
+end
+if ne pool_clear c w neg long 6
+ret 13
+end
+h = pool_acquire c w
+if le h 0
+ret 14
+end
+put pth 0 h
+if ne node_publish h 1 buf 1 neg long 6
+ret 15
+end
+ret pt_verify h n
+end
+if eq ph 2
+ret pt_verify get pth 0 mapget m 16 8
+end
+if eq ph 3
+r = pool_release c w
+h = pool_acquire c w
+if le h 0
+ret 16
+end
+put pth 0 h
+ret pt_verify h n
+end
+if eq ph 4
+r = sleepns 30000000000
+ret 17
+end
+ret 18
+end
+
+fn pt_worker w ulong to int
+c = get ptc 0
+m = get ptm 0
+put pth 0 0
+for it ulong 64
+r = sup_wwait c w 5000000000
+if eq r 2
+if gt get pth 0 0
+r = pool_release c w
+end
+ret 0
+end
+if eq r 3
+ret 41
+end
+if eq r 0
+ret 42
+end
+if ne r 1
+ret 43
+end
+res = pt_step c w mapget m 0 8
+r = mapset m add 64 mul w 8 8 ulong res
+if ne sup_ack w 0
+ret 44
+end
+end
+ret 45
+end
+
+note Creator: wake worker w for phase ph and wait up to about 5 s for its ack.
+note Returns the worker's phase result, or 90 no ack, 91 the worker died.
+fn pt_phase c long w ulong ph ulong to int
+m = get ptm 0
+r = mapset m 0 8 ph
+r = mapset m add 64 mul w 8 8 99
+if ne sup_wake w 0
+ret 92
+end
+for t ulong 500
+if gt sup_take get swack w 0
+ret int mapget m add 64 mul w 8 8
+end
+if le get swpid w 0
+ret 91
+end
+r = sup_poll c 10000000
+end
+ret 90
+end
+
+fn pt_spawn c long w ulong to bool
+p = sup_spawn c w
+if eq p 0
+exit pt_worker w
+end
+ret gt p 0
+end
+
+fn pt_procs to void
+c = pool_new 2 4
+pt_ok gt c 0 52
+put ptc 0 c
+m = mapnew neg int 1 0 4096 3 33
+pt_ok gt m 0 53
+put ptm 0 m
+pt_ok eq sup_init c 0 54
+pt_ok pt_fill c 8 55
+r = mapset m 8 8 8
+r = mapset m 16 8 8
+pt_ok pt_spawn c 0 56
+pt_ok pt_spawn c 1 57
+pt_ok pt_spawn c 2 58
+pt_ok eq sup_spawn c 2 neg long 16 59
+for w ulong 3
+pt_ok eq pt_phase c w 1 0 60
+end
+pt_ok eq mapget c 272 8 1 61
+pt_ok eq mapget c 1288 8 1 62
+pt_ok eq pool_roll c 2 63
+pt_ok pt_fill c 5 64
+pt_ok eq pool_roll c neg long 9 65
+note An older epoch stays complete for its holder after newer publication.
+pt_ok eq pt_phase c 0 2 0 66
+r = mapset m 8 8 5
+pt_ok eq pt_phase c 0 3 0 67
+pt_ok eq pt_phase c 1 3 0 68
+pt_ok eq mapget c 256 8 2 69
+pt_ok eq pool_roll c neg long 9 70
+note Kill the last holder of epoch 1. Its death is seen through its life pipe.
+pt_ok eq killpid int get swpid 2 9 0 71
+dead = long 0
+for t ulong 500
+dead = add dead sup_poll c 10000000
+if gt dead 0
+break
+end
+end
+pt_ok eq dead 1 72
+pt_ok eq and get swst 2 127 9 73
+pt_ok eq mapget c 272 8 0 74
+pt_ok eq mapget c 1296 8 2 75
+pt_ok eq pool_roll c 3 76
+pt_ok pt_fill c 3 77
+r = mapset m 8 8 3
+pt_ok pt_spawn c 2 78
+pt_ok eq pt_phase c 2 3 0 79
+r = mapset m 0 8 4
+pt_ok eq sup_wake 1 0 80
+r = sleepns 100000000
+note A pending ack from the stalled worker must not turn the stop wait into a
+note spin that kills it before the 2 s deadline.
+pt_ok eq sup_ack 1 0 89
+t0 = monons
+k = sup_stop c 2000000000
+pt_ok ge sub monons t0 1900000000 90
+pt_ok eq k 1 81
+pt_ok eq get swst 0 0 82
+pt_ok eq get swst 2 0 83
+pt_ok eq and get swst 1 127 9 84
+pt_ok eq waitpid neg int 1 ptws 0 4 1 neg long 10 85
+pt_ok eq sup_live c 0 86
+sup_closeall
+pt_ok eq pool_free c 0 87
+pt_ok eq mapdrop m 0 88
+end
+
+note A creator that exits without stopping its worker must not leave the worker
+note waiting: the worker sees the creator's life pipe hang up and reports 3.
+fn pt_orphan to void
+pf = new uchar 8 0
+b = new uchar 1 0
+pt_ok ge pipefds pf 0 8 524288 0 93
+rd = pt_fd4 pf 0
+wr = pt_fd4 pf 4
+s = fork
+if eq s 0
+c = pool_new 1 1
+if le c 0
+exit 50
+end
+if ne sup_init c 0
+exit 51
+end
+put ptc 0 c
+p = sup_spawn c 0
+if eq p 0
+r = sup_wwait c 0 5000000000
+put b 0 uchar and ulong add r 128 255
+r = write wr b 0 1
+exit 0
+end
+exit 0
+end
+pt_ok gt s 0 94
+r = fclose wr
+pt_ok eq waitpid int s ptws 0 4 0 s 95
+pt_ok eq get ptws 0 0 96
+pt_ok gt waitio rd 1 6000000000 0 97
+pt_ok eq read rd b 0 1 1 98
+pt_ok eq get b 0 131 99
+r = fclose rd
+end
+
+note Stress: 0 when arena h shows only complete records of epoch e from start
+note to end of one hold. A reclaimed held arena changes its epoch, drops its
+note count or rewrites bytes, so a missing hold check shows up here.
+fn pt_scan h long e ulong to int
+buf = new uchar 4096 0
+if ne node_epoch h e
+ret 1
+end
+cur = ulong 0
+for k ulong 65
+v = node_next h cur 1
+if eq v 0
+break
+end
+if lt v 0
+ret 2
+end
+cur = ulong v
+if ne node_read h cur buf 4096
+ret 3
+end
+b = pt_byte e cur
+for j ulong 4096
+if ne get buf j b
+ret 4
+end
+end
+end
+if ne node_epoch h e
+ret 5
+end
+ret 0
+end
+
+fn pt_sworker w ulong to int
+c = get ptc 0
+m = get ptm 0
+n = ulong 0
+for it ulong 10000000
+if pool_stopped c
+r = mapset m add 64 mul w 8 8 n
+ret 0
+end
+h = pool_acquire c w
+if eq h neg long 1
+r = mapset m add 64 mul w 8 8 n
+ret 0
+end
+if gt h 0
+r = pt_scan h mapget c add 256 mul w 8 8
+if ne r 0
+ret add 20 r
+end
+q = pool_release c w
+n = add n 1
+end
+end
+ret 29
+end
+
+fn pt_num v ulong to void
+d = new uchar 20 0
+x = v
+k = ulong 20
+for i ulong 20
+k = sub k 1
+put d k uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 d k sub 20 k
+end
+
+text pstress "stress rolls="
+text pbusy " busy="
+text preads " reads="
+text pnl "\n"
+text psp " "
+
+note Two workers acquire, scan and release in a tight loop while the creator
+note rolls 2000 epochs over two arenas, publishing four records per epoch.
+fn pt_stress to void
+c = pool_new 2 2
+pt_ok gt c 0 120
+put ptc 0 c
+m = mapnew neg int 1 0 4096 3 33
+pt_ok gt m 0 121
+put ptm 0 m
+pt_ok eq sup_init c 0 122
+pt_ok pt_fill c 4 123
+for w ulong 2
+p = sup_spawn c w
+if eq p 0
+exit pt_sworker w
+end
+pt_ok gt p 0 124
+end
+rolls = ulong 0
+busy = ulong 0
+for i ulong 100000000
+if ge rolls 2000
+break
+end
+r = pool_roll c
+if eq r neg long 9
+busy = add busy 1
+if eq and busy 1023 0
+pt_ok eq sup_poll c 0 0 133
+end
+cpurelax
+continue
+end
+pt_ok gt r 0 125
+rolls = add rolls 1
+pt_ok pt_fill c 4 126
+end
+pt_ok eq rolls 2000 127
+pt_ok eq sup_stop c 5000000000 0 128
+pt_ok eq get swst 0 0 129
+pt_ok eq get swst 1 0 130
+r = write 1 pstress 0 len pstress
+pt_num rolls
+r = write 1 pbusy 0 len pbusy
+pt_num busy
+r = write 1 preads 0 len preads
+pt_num mapget m 64 8
+r = write 1 psp 0 1
+pt_num mapget m 72 8
+r = write 1 pnl 0 1
+sup_closeall
+pt_ok eq pool_free c 0 131
+pt_ok eq mapdrop m 0 132
+end
+
+fn pt_isarg to bool
+a = new uchar 16 0
+if ne argcnt 2
+ret false
+end
+ret eq argread 1 a 0 16 6
+end
+
+note With one argument (any 6 bytes, "stress"), run only the stress phase.
+fn main to int
+if pt_isarg
+pt_stress
+ret 0
+end
+pt_refusals
+pt_epochs
+pt_race
+pt_orphan
+pt_procs
+pt_stress
+if ne write 1 pok 0 len pok long len pok
+ret 100
+end
+ret 0
+end

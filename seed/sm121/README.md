@@ -12,12 +12,12 @@ second table. Nothing new was compiled to do it: the new part is text.
   128 bits long, four times an Arm instruction, and `asm2` writes 32 bits per line, so each GPU instruction is
   four lines, one per quarter. For example `ldg.0 2 2` / `ldg.1 4` / `ldg.2` / `ldg.3` is
   "load from memory into register 2, address in register 2, memory descriptor in uniform register 4".
-  Every line says which line of our own C code generator (`src/omega_blackwell_codegen.c`) it was read from.
+  Every line says which line of my own C code generator (`src/omega_blackwell_codegen.c`) it was read from.
 - `vecadd.s2`: the GB10 vector add (`out[i] = a[i] + b[i]`), the kernel the existing launcher has run on the
   chip since the first GPU cut, written by hand with the table's names. `vecadd.bin` is what `asm2` makes of it.
-- `gate6.sh`: the checks (below). `names.tsv`: the name our C code gives each instruction form, for the
+- `gate6.sh`: the checks (below). `names.tsv`: the name my C code gives each instruction form, for the
   disassembler check.
-- `sm121list.c`: a reference tool. It is built from our C code generators and is only a referee: for every GPU
+- `sm121list.c`: a reference tool. It is built from my C code generators and is only a referee: for every GPU
   program those generators can make, it writes the program as a text listing in `asm2`'s language and, next
   to it, the bytes the C code made. It never writes a byte under `seed/`.
 
@@ -42,7 +42,7 @@ is only read: the gate's last line before the verdict says whether each result f
 The C code generator is the referee, never an input to the table: I read its source and wrote the table by
 hand; the gate then compares.
 
-1. Every program our C generators make today, over a sweep of their settings (sizes, warp counts, depths,
+1. Every program my C generators make today, over a sweep of their settings (sizes, warp counts, depths,
    and the deliberately broken "mutant" versions the tests use), is written out as a listing; `asm2` with the
    new table turns each listing into words; the words must equal the C code's words, bit for bit.
 2. Every instruction form, with registers and numbers at the edges of their fields, the same way.
@@ -50,7 +50,7 @@ hand; the gate then compares.
 4. Controls: a wrong register, a wrong offset, an out-of-range register, a wrong bit in the table and a field
    in the wrong place must each be caught.
 5. Reference only: NVIDIA's disassembler (`nvdisasm -b SM121`) reads every instruction form back, and its
-   name is compared with the name our C code gives it. Every difference is listed.
+   name is compared with the name my C code gives it. Every difference is listed.
 6. On the chip: the seed-made vector add runs on the GB10 through the existing launcher (no CUDA library),
    with a receipt.
 
@@ -84,13 +84,13 @@ Results: `build/seed/r6/evidence/`; recorded receipt: `evidence/SEED-0/sm121/`.
 - **The controls work**: a wrong register, a wrong offset, a register number too large, one wrong bit in the
   table and a field moved by one bit are each caught.
 - **On the chip** (2026-10-20 03:02 UTC, `evidence/SEED-0/sm121/chip/`): the vector add `asm2` made ran on the
-  GB10 through the bytes tool and our own launcher, no CUDA library: 1,048,576 additions, 0 wrong. The
+  GB10 through the bytes tool and my own launcher, no CUDA library: 1,048,576 additions, 0 wrong. The
   control (the same program with one word changed) got all 1,048,576 wrong and failed, as it must. The run
   record says `dirty=3`: those are the bytes tool copied in from its own branch (ledger L098, not part of
   this branch) and the chip folder being written; the program bytes are `seed/sm121/vecadd.bin` as committed
   (fingerprint 39f3dfdf...). Receipt: `chip/receipt.json`.
 
-### What the check found in our C code (not in the table)
+### What the check found in my C code (not in the table)
 
 1. **A crash in the tensor-core matrix multiply generator.** It accepts "4 row tiles, 1 warp", then writes 16
    entries into lists that hold 8 and overwrites memory. The 48 settings that do this are skipped here and
@@ -110,8 +110,8 @@ Results: `build/seed/r6/evidence/`; recorded receipt: `evidence/SEED-0/sm121/`.
 
 ### The disassembler check (reference only)
 
-NVIDIA's disassembler (`nvdisasm` 13.0, used only to read our bits back, never to make any) read 45,024 of the
+NVIDIA's disassembler (`nvdisasm` 13.0, used only to read my bits back, never to make any) read 45,024 of the
 65,352 edge cases. It refused 20,328: 20,104 of them have the scheduling word set to all ones on purpose, and
 224 are the floating-point compare with a made-up condition word (item 4). Of 68 instruction forms, 59 got the
-same name from the disassembler as from our C code; the 9 others are the items above plus naming detail
+same name from the disassembler as from my C code; the 9 others are the items above plus naming detail
 (for example `IMAD.MOV` is how the disassembler shows a multiply-add whose inputs make it a plain copy).

@@ -1,0 +1,47 @@
+{
+  "blobs": {
+    "crates/spark-harness/src/scheduler/core.rs": "32c3f431b58c7aece11527a3da2acafda2b27f7e",
+    "crates/spark-harness/src/scheduler/mod.rs": "001db62c4f4a"
+  },
+  "command": "cd <clone> && CARGO_TARGET_DIR=<target> flock -o ~/handoffs/hive/queen/pool-8-9.lock taskset -c 8-9 nice -n 10 cargo test -p spark-harness --test dra395_blocked_head -- --nocapture --test-threads=1",
+  "commit": "dffdbd195edcbe1ec3bd2fa255355b15c530f31e",
+  "deployment": "reference-only: mod.rs opt-in, ProvisionalConfig::enabled false by default, no spark-harness API or MCP tool uses it; only consumer aien-runtime optional feature provisional-prep; installed ~/.local/bin/spark-harness sha256 9fe2941155ca0b7cae6d26f64ba6b9ac9a66ace215e9a60af1275718c0eb1eae has no provisional code; no process runs",
+  "exit": 0,
+  "identity": "rustc 1.98.1 (48a229cea 2026-09-01)\ncargo 1.98.1 (797e8a9bc 2026-08-05)\naarch64\ndffdbd195edcbe1ec3bd2fa255355b15c530f31e\n32c3f431b58c7aece11527a3da2acafda2b27f7e\n1bb855132603f39b6f8aa41a317c31d4a9cf7d3dd2fa979fe14efb692c79df94  crates/spark-harness/tests/dra395_blocked_head.rs\n?? crates/spark-harness/tests/dra395_blocked_head.rs\n",
+  "issue": "DRA-395",
+  "kind": "reference reproduction (Rust, upstream unmodified)",
+  "log_sha256": "ca7af21c9809529ff508774c2f34359e52d121f75a0dd8939fbceaae2fd651cd",
+  "output_lines_139_154": [
+    "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 04s",
+    "     Running tests/dra395_blocked_head.rs (/tmp/sched-ref/target/debug/deps/dra395_blocked_head-f683a118c59ae894)",
+    "",
+    "running 3 tests",
+    "test a_blocked_head ... DRA395-RUST blocked_head step=after_register_abc running=[a] free_cpu=1 running_count=1 queue=[b,c] states=[a:Provisional:queued=false b:Blocked:queued=true c:Blocked:queued=true] dispatched_by_b=[] dispatched_by_c=[]",
+    "DRA395-RUST blocked_head step=after_work_done_a running=[b,c] free_cpu=1 running_count=2 queue=[] states=[a:AwaitingFinalProof:queued=false b:Provisional:queued=false c:Provisional:queued=false] dispatched_by_release=[\"b\", \"c\"]",
+    "ok",
+    "test b_bounded_queue_exclusion ... DRA395-RUST queue_exclusion step=after_register_abde running=[a] free_cpu=1 running_count=1 queue=[b,d] states=[a:Provisional:queued=false b:Blocked:queued=true d:Blocked:queued=true e:Blocked:queued=false] dispatched_by_e=[]",
+    "DRA395-RUST queue_exclusion step=after_work_done_a running=[b,d] free_cpu=0 running_count=2 queue=[e] states=[a:AwaitingFinalProof:queued=false b:Provisional:queued=false d:Provisional:queued=false e:Blocked:queued=true] dispatched_by_release=[\"b\", \"d\"]",
+    "ok",
+    "test c_impossible_request ... DRA395-RUST impossible_request cpu_request=5 cpu_limit=4 result=Err(ExceedsCapacity(\"big\")) registered=false queue=[]",
+    "ok",
+    "",
+    "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "",
+    "EXIT=0"
+  ],
+  "platform": "Linux 7.0.0-1019-nvidia aarch64 spark-b87b",
+  "project": "P-DRA-14",
+  "repository": "aien-dev/aien-sovereign-core-mv",
+  "result": "3 passed, 0 failed (assertions encode the observed behaviour)",
+  "source_lines": {
+    "bounded fill in task-id order": "core.rs:584-596",
+    "head-of-line stop": "core.rs:598-602 (doc 566-567)",
+    "impossible refused": "core.rs:654-655, permits.rs:51-54",
+    "release on WorkDone": "core.rs:724-739, 379-381"
+  },
+  "test_file": {
+    "path": "crates/spark-harness/tests/dra395_blocked_head.rs (untracked, added to a scratch clone)",
+    "sha256": "1bb855132603f39b6f8aa41a317c31d4a9cf7d3dd2fa979fe14efb692c79df94",
+    "source": "// SPDX-License-Identifier: Apache-2.0\n//\n//! DRA-395 evidence: observe the CURRENT head-of-line behaviour of\n//! `Core::pump` (src/scheduler/core.rs). These tests assert what the\n//! reference scheduler does today; they are not a specification.\n\nmod common;\n\nuse common::{req, H};\nuse spark_harness::execution::TaskState;\nuse spark_harness::scheduler::{\n    EventKind, Outcome, ProvisionalConfig, ResourceLimits, SchedError,\n};\n\nconst CPU: u32 = 4;\n\nfn cfg(queue_capacity: usize) -> ProvisionalConfig {\n    ProvisionalConfig {\n        enabled: true,\n        queue_capacity,\n        limits: ResourceLimits {\n            cpu_slots: CPU,\n            memory_bytes: 1 << 40,\n            max_concurrency: 4,\n        },\n        lease_ttl: 1_000,\n        dedup_window: 64,\n    }\n}\n\nfn provisional(h: &H, ids: &[&str]) -> Vec<String> {\n    ids.iter()\n        .filter(|t| h.sched.state(t).unwrap() == TaskState::Provisional)\n        .map(|t| t.to_string())\n        .collect()\n}\n\nfn free_cpu(h: &H) -> u32 {\n    CPU - h.sched.permits_in_use().cpu_in_use\n}\n\nfn obs(scenario: &str, step: &str, h: &H, ids: &[&str], extra: &str) {\n    let pool = h.sched.permits_in_use();\n    let states: Vec<String> = ids\n        .iter()\n        .map(|t| {\n            let i = h.sched.task(t).unwrap();\n            format!(\"{t}:{:?}:queued={}\", i.state, i.queued)\n        })\n        .collect();\n    println!(\n        \"DRA395-RUST {scenario} step={step} running=[{}] free_cpu={} running_count={} queue=[{}] states=[{}]{extra}\",\n        provisional(h, ids).join(\",\"),\n        free_cpu(h),\n        pool.running,\n        h.sched.queue().join(\",\"),\n        states.join(\" \"),\n    );\n}\n\n#[test]\nfn a_blocked_head() {\n    let ids = [\"a\", \"b\", \"c\"];\n    let mut h = H::new(cfg(64));\n    let fx = h.register(\"a\", 3, &[]);\n    assert_eq!(fx.dispatched, vec![\"a\"]);\n    let fx_b = h.register(\"b\", 2, &[]);\n    let fx_c = h.register(\"c\", 1, &[]);\n    obs(\n        \"blocked_head\",\n        \"after_register_abc\",\n        &h,\n        &ids,\n        &format!(\n            \" dispatched_by_b={:?} dispatched_by_c={:?}\",\n            fx_b.dispatched, fx_c.dispatched\n        ),\n    );\n    // Current behaviour: b (2 cpu) heads the queue and does not fit next to\n    // a (3 of 4); c (1 cpu) would fit but is behind b and stays queued.\n    assert!(fx_b.dispatched.is_empty());\n    assert!(fx_c.dispatched.is_empty());\n    assert_eq!(h.sched.queue(), vec![\"b\", \"c\"]);\n    assert_eq!(free_cpu(&h), 1);\n    let c = h.sched.task(\"c\").unwrap();\n    assert_eq!((c.state, c.queued), (TaskState::Blocked, true));\n\n    // a leaves Provisional (WorkDone -> AwaitingFinalProof) and releases\n    // its permits.\n    let fx = h.work_done(\"a\");\n    obs(\n        \"blocked_head\",\n        \"after_work_done_a\",\n        &h,\n        &ids,\n        &format!(\" dispatched_by_release={:?}\", fx.dispatched),\n    );\n    assert_eq!(fx.dispatched, vec![\"b\", \"c\"]);\n    assert_eq!(free_cpu(&h), 1);\n}\n\n#[test]\nfn b_bounded_queue_exclusion() {\n    let ids = [\"a\", \"b\", \"d\", \"e\"];\n    let mut h = H::new(cfg(2));\n    assert_eq!(h.register(\"a\", 3, &[]).dispatched, vec![\"a\"]);\n    h.register(\"b\", 2, &[]);\n    h.register(\"d\", 2, &[]);\n    let fx_e = h.register(\"e\", 1, &[]);\n    obs(\n        \"queue_exclusion\",\n        \"after_register_abde\",\n        &h,\n        &ids,\n        &format!(\" dispatched_by_e={:?}\", fx_e.dispatched),\n    );\n    assert!(fx_e.dispatched.is_empty());\n    assert_eq!(h.sched.queue(), vec![\"b\", \"d\"]);\n    assert_eq!(free_cpu(&h), 1);\n    let e = h.sched.task(\"e\").unwrap();\n    assert_eq!((e.state, e.queued), (TaskState::Blocked, false));\n\n    let fx = h.work_done(\"a\");\n    obs(\n        \"queue_exclusion\",\n        \"after_work_done_a\",\n        &h,\n        &ids,\n        &format!(\" dispatched_by_release={:?}\", fx.dispatched),\n    );\n    assert_eq!(fx.dispatched, vec![\"b\", \"d\"]);\n    assert_eq!(free_cpu(&h), 0);\n    let e = h.sched.task(\"e\").unwrap();\n    assert_eq!((e.state, e.queued), (TaskState::Blocked, true));\n}\n\n#[test]\nfn c_impossible_request() {\n    let mut h = H::new(cfg(64));\n    let r = h.send(EventKind::RegisterTask {\n        task: \"big\".into(),\n        resources: req(5),\n        producers: vec![],\n    });\n    let registered = h.sched.task(\"big\").is_some();\n    println!(\n        \"DRA395-RUST impossible_request cpu_request=5 cpu_limit={CPU} result={} registered={registered} queue=[{}]\",\n        match &r {\n            Ok(Outcome::Applied(fx)) => format!(\"Applied(dispatched={:?})\", fx.dispatched),\n            Ok(o) => format!(\"{o:?}\"),\n            Err(e) => format!(\"Err({e:?})\"),\n        },\n        h.sched.queue().join(\",\"),\n    );\n    assert!(matches!(&r, Err(SchedError::ExceedsCapacity(t)) if t == \"big\"), \"{r:?}\");\n    assert!(!registered);\n}\n"
+  }
+}
