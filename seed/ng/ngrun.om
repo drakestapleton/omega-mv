@@ -1246,6 +1246,10 @@ global r_cfg ulong 3
 global r_fd long 256
 global r_own uchar 256
 global r_root uchar 4096
+note r_pst: the stat structure of a name opened without following a link; r_pp: /proc/self/fd/N for it.
+global r_pst uchar 128
+global r_pp uchar 32
+text r_ppre "/proc/self/fd/"
 text r_hmsg "ngrun: refused host class "
 text r_hword " word "
 text r_hat " at "
@@ -1521,6 +1525,13 @@ end
 rn_hr o pwrite fd r_m p n pos
 end
 fn rn_hfd o uint w ulong to void
+if eq w 117
+note fstat traps 3 natively on an output under 128 bytes before any kernel call, so ngrun gives that
+note trap before its descriptor checks.
+if lt rn_a o 4 128
+exit 103
+end
+end
 fd = rn_fget o 1
 if lt fd 0
 rn_hr o -9
@@ -1580,7 +1591,100 @@ ret
 end
 rn_hr o fstat fd r_m p n
 end
+note chmod, faccess, stat, truncate and chown follow a final link natively, so a link another process
+note plants in the scratch tree would take them outside it. ngrun opens the name O_PATH|O_NOFOLLOW|O_CLOEXEC
+note (AArch64 2097152, 32768, 524288), answers a link with -40 (ELOOP) as a NOFOLLOW open does, and gives
+note the native word /proc/self/fd/N, which names the inode that open found. rn_nofol returns that
+note descriptor or -errno; rn_ppath writes /proc/self/fd/N into r_pp and returns its length.
+fn rn_nofol p ulong n ulong to long
+flags = or int 2097152 or int 32768 int 524288
+fd = fopen r_m p n flags 0
+if lt fd 0
+ret fd
+end
+k = fstat int fd r_pst 0 len r_pst
+if lt k 0
+cl = fclose int fd
+ret k
+end
+note st_mode is bytes 16..19 of the AArch64 stat structure; S_IFMT 0xF000 and S_IFLNK 0xA000 are the
+note high nibble of byte 17.
+if eq and get r_pst 17 240 160
+cl = fclose int fd
+ret -40
+end
+ret fd
+end
+fn rn_ppath fd long to ulong
+for j ulong len r_ppre bound 16
+put r_pp j get r_ppre j
+end
+i = ulong len r_ppre
+v = ulong fd
+d = ulong 1
+while ge div v d 10 bound 20
+d = mul d 10
+end
+while gt d 0 bound 20
+put r_pp i uchar add 48 rem div v d 10
+i = add i 1
+d = div d 10
+end
+ret i
+end
+note The kernel's EINVAL checks that precede the lookup (faccess mode outside 0..7, truncate length below
+note 0) come first, as natively; then the name is opened without following a link (rn_nofol).
+fn rn_hnofol o uint w ulong p ulong n ulong to void
+a = bitcast long rn_a o 4
+if and eq w 144 or lt a 0 gt a 7
+rn_hr o -22
+ret
+end
+if and eq w 150 lt a 0
+rn_hr o -22
+ret
+end
+outp = ulong 0
+if eq w 140
+rn_ext o 4 rn_a o 5 rn_a o 6
+outp = rn_buf o 4
+end
+fd = rn_nofol p n
+if lt fd 0
+rn_hr o fd
+ret
+end
+m = rn_ppath fd
+k = long 0
+if eq w 140
+k = stat r_pp 0 m r_m outp rn_a o 6
+end
+if eq w 143
+k = chmod r_pp 0 m int a
+end
+if eq w 144
+k = faccess r_pp 0 m int a
+end
+if eq w 150
+k = truncate r_pp 0 m a
+end
+if eq w 151
+k = chown r_pp 0 m int a int bitcast long rn_a o 5
+end
+cl = fclose int fd
+rn_hr o k
+end
 fn rn_hpath o uint w ulong to void
+if or or eq w 133 eq w 140 eq w 149
+note stat, lstat and readlnk trap 3 natively on an empty path, and stat and lstat on an output under
+note 128 bytes, before any kernel call and with or without --scratch, so ngrun gives that trap first.
+if eq rn_a o 3 0
+exit 103
+end
+if and ne w 133 lt rn_a o 6 128
+exit 103
+end
+end
 p = rn_path o 1
 n = rn_a o 3
 if eq w 110
@@ -1619,24 +1723,8 @@ cl = fclose int fd
 rn_hr o k
 ret
 end
-if eq w 143
-mode = int bitcast long rn_a o 4
-rn_hr o chmod r_m p n mode
-ret
-end
-if eq w 144
-mode = int bitcast long rn_a o 4
-rn_hr o faccess r_m p n mode
-ret
-end
-if eq w 150
-rn_hr o truncate r_m p n bitcast long rn_a o 4
-ret
-end
-if eq w 151
-uid = int bitcast long rn_a o 4
-gid = int bitcast long rn_a o 5
-rn_hr o chown r_m p n uid gid
+if or or or eq w 140 eq w 143 or eq w 144 eq w 150 eq w 151
+rn_hnofol o w p n
 ret
 end
 rn_ext o 4 rn_a o 5 rn_a o 6
@@ -1644,10 +1732,6 @@ outp = rn_buf o 4
 cap = rn_a o 6
 if eq w 133
 rn_hr o readlnk r_m p n r_m outp cap
-ret
-end
-if eq w 140
-rn_hr o stat r_m p n r_m outp cap
 ret
 end
 rn_hr o lstat r_m p n r_m outp cap
@@ -1706,6 +1790,10 @@ rn_href o 118
 end
 if or eq w 135 eq w 120
 if eq w 120
+note sleepns traps 3 natively on a negative interval (OMEGESE s10): a deterministic result, not a wait.
+if lt bitcast long rn_a o 1 0
+exit 103
+end
 if eq rn_a o 1 0
 rn_hr o sleepns 0
 ret

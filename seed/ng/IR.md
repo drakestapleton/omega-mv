@@ -503,17 +503,22 @@ and the ARGS after `--` as arguments 1.., so the count equals that of a native p
 same ARGS; `envcnt`/`envread` read ngrun's own environment. `monons`, `realns`,
 `getuid`, `geteuid`, `getgid`, `getegid`, `cpufence` and `cpurelax` execute natively; IR.md
 defines no fixed-value clock mode, so clock results are live and a test may compare only their sign.
-`sleepns 0` executes; any other interval is refused as nondeterministic.
+`sleepns 0` executes; a negative interval traps 3 as the native word does; any other interval is
+refused as nondeterministic.
 File words run only with `--scratch`: ngrun creates NEW-DIR (mode 0700; it must not exist), opens it
 with O_DIRECTORY|O_NOFOLLOW and makes it the working directory. A path over 4095 bytes or holding a
 zero byte, and a `renames` or `link` packet that is malformed (count other than 2, a record past the
-end, trailing bytes, an empty record, a zero byte), trap 3 as the native word does, before
+end, trailing bytes, an empty record, a zero byte), an empty `stat`, `lstat` or `readlnk` path, and a
+`stat`, `lstat` or `fstat` output under 128 bytes, trap 3 as the native word does, before
 any check below and with or without `--scratch`. Every path must then be one nonempty component (no
 `/`, not `.` or `..`); `renames` and `link` packets must hold exactly two such names. Opens add
 O_NOFOLLOW, and `chdir` opens the name with O_PATH|O_DIRECTORY|O_NOFOLLOW and changes directory with
-`fchdir`, so neither follows a final link. The interpreted program cannot create a link (`symlnk` is
-refused), so `stat`, `chmod`, `chown`, `truncate` and `faccess`, which follow a final link as the
-native words do, stay inside NEW-DIR unless another process writes into it while ngrun runs.
+`fchdir`, so neither follows a final link. `stat`, `chmod`, `chown`, `truncate` and `faccess`, which
+follow a final link natively, open the name with O_PATH|O_NOFOLLOW, return -40 (ELOOP) when it is a
+link, and otherwise act on `/proc/self/fd/N`, the inode that open found; the kernel's EINVAL checks
+that precede the lookup (`faccess` mode outside 0..7, `truncate` length below 0) come first. So a
+link another process plants in NEW-DIR while ngrun runs is never followed. The interpreted program
+cannot create a link itself (`symlnk` is refused), so a native run and ngrun agree on every result.
 Descriptors are virtual: stdin (0) may be read and stdout/stderr (1, 2) written, and `fclose` may
 close any of the three, as a native program may; every other operation needs a descriptor created by
 an interpreted `fopen` or `memfd`. `memfd` names no path and runs without `--scratch`. A refused word
