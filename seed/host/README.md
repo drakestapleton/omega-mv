@@ -15,6 +15,14 @@ operation, not a native AienOS qualification or a GPU qualification.
 
 The language contract is [OMEGESE section 10](../../docs/one_layer/OMEGESE.md).
 
+## CPU scheduler words (draft)
+
+`cpuset`, `cpuget`, `cpunow`, `setprio` and `getprio` provide checked Linux CPU
+affinity and priority without a taskset/nice child wrapper. They are program-only
+on AArch64 and x86linux, retain kernel permissions and return minus errno.
+See [the draft contract](../../spec/omegese-cpu-workers.md) and the complete
+`seed/host/affinity/sched.cases` gate, included in `check.sh`.
+
 ## Qualification
 
 From the repository root on Linux ARM64:

@@ -1,3 +1,4 @@
+/* ORACLE: foreign reference, not on the gate path (seed rung 0/1/2; see seed/check/a64check.om). */
 /*
  * a64check.c -- REFERENCE CHECK ONLY for the seed chain (seed/README.md). It is never used to make a
  * byte of seed/: it runs the repo's own C decoder (src/aarch64_decoder.c) and C encoder

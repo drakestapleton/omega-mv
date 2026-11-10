@@ -1,5 +1,5 @@
 #!/bin/sh
-# gate0.sh <out dir> -- rung 0 gates (seed/README.md). Shell only; the C decoder and GNU objdump/readelf
+# gate0.sh <out dir> -- rung 0 gates (seed/README.md). Shell glue; the Omega decoder and GNU objdump/readelf
 # run as reference checks and never make a byte of seed/.
 #  (a) load0.sh (the one outside tool) builds seed0.bin from seed0.hex; seed0.bin run on seed0.hex
 #      gives seed0.bin byte for byte, and equals the committed seed/rung0/seed0.bin
@@ -11,7 +11,10 @@ D=$(cd "$(dirname "$0")/.." && pwd); R=$(cd "$D/.." && pwd); O=$1; mkdir -p "$O"
 CHK=$R/build/seed/a64check
 fail=0; ok() { echo "PASS $*"; }; bad() { echo "FAIL $*"; fail=1; }
 mkdir -p "$R/build/seed"
-cc -std=gnu11 -Wall -Wextra -Werror -O2 -I"$R/src" -o "$CHK" "$D/check/a64check.c" "$R/src/aarch64_decoder.c" "$R/src/aarch64_encoder.c" || { echo "FAIL a64check build"; exit 1; }
+(cd "$R" && sha256sum -c --status seed/out/omc.sha256) || { echo "FAIL a64check: seed/out/omc does not match seed/out/omc.sha256"; exit 1; }
+printf 'a64check compiler '
+sha256sum "$D/out/omc" || { echo "FAIL a64check compiler hash log"; exit 1; }
+"$D/out/omc" < "$D/check/a64check.om" > "$CHK" && chmod +x "$CHK" || { echo "FAIL a64check build"; exit 1; }
 sh "$D/rung0/load0.sh" "$D/rung0/seed0.hex" "$O/seed0.bin" && chmod +x "$O/seed0.bin" || bad "load0"
 "$O/seed0.bin" < "$D/rung0/seed0.hex" > "$O/seed0.self"; rc=$?
 [ $rc = 0 ] && cmp -s "$O/seed0.bin" "$O/seed0.self" && ok "(a) seed0 rebuilds itself byte for byte ($(wc -c < "$O/seed0.bin") bytes)" || bad "(a) self-rebuild rc=$rc"

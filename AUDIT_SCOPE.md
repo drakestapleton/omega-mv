@@ -23,9 +23,12 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999`,
-   from `seed/omc/omc.om` `9f93a91aee8c6a37e88d61b96f8224a8dd73168e787732d634de7f82a380b8c3`; names of up to 63 bytes, branch `omc/long-names` 2e20b286,
-   merged after `pearl/exec-limits` on rad main a59a425b in `ham/omc-train`). The earlier audit pins
+   `f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9`,
+   from `seed/omc/omc.om` `c86159627820cf5741be0a2a4c05df0efb78f5c91a652b986fec5d745baa62ed`; OM-2 AArch64 global array bases and lengths pinned in X18..X26, with factory bay 16's pinshut fix, branch
+   `ham/omc-perf-mem-3`, stacked on `ham/om-threads-4` and `ham/omc-perf-loops-5` on Radicle main 12bdb787). The earlier audit pins
+   `0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f` (scheduler host words cpuset/cpuget/cpunow/setprio/getprio 236..240, branch `ham/om-threads-4`, stacked on `ham/omc-perf-loops-5` on Radicle main 12bdb787),
+   `6844d173abc85ecbc04154cce85e4e5eeec8bf7b21f4ab1c10728c55efe7dd00` (OM-2 AArch64 `for` loops tested at the latch, branch `ham/omc-perf-loops-5`, on Radicle main 12bdb787),
+   `564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999` (names of up to 63 bytes, branch `omc/long-names` 2e20b286, merged after `pearl/exec-limits` on rad main a59a425b in `ham/omc-train`),
    `b87c8b651fc74c90357c9a6df93172aec18e89324bd9be8adb85f5142670318e` (exec argv packets at 1024 records / 65536 bytes, branch `pearl/exec-limits`, `ham/omc-train`),
    `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8` (the prlimit 235 host word, branch `seed/prlimit-host-word`, on rad main 408c76b7),
    `0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f` (x86 types `fma` operands before its

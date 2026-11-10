@@ -44,3 +44,12 @@ acb875cb7c77d7f12e728727071b18c7ca2b9a01989735c9e2cd5a054a5fd2be  x25519-s.om
 5c19c71da2d76d8e10cc29cae8694b508ba5c026572d7ecf5cdfdc574e1e10b8  p-part.om
 75a757d55c8548ab2c75cc7f44b78124783b6c87e06d24751fccdf6f43a4cc9d  p-partok.om
 ```
+
+## Host programs (ng-front-host)
+
+`host-WORD.om` (94, one per word of `seed/ng/hostwords.tsv`), `bad-host-*.om` (5 refusals) and
+`diag-host-*.om` (2 `om2 diag` units) were written by NgFrontFull (ham lane, 2026-11-09) and kept
+uncommitted in its latch worktree; NgFront took them unchanged (copy and sha256 in the lane's run
+directory). Each program uses private arrays, empty or `/dev/null` paths, invalid descriptors or
+argument-validation paths; none opens a device or the GPU; fork's child exits at once and is reaped;
+prlimit only reads a limit; no process other than the program is signalled.

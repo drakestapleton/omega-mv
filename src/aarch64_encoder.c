@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0
+ * ORACLE for seed rung 0/1/2 only: retained first-party C implementation, active in other targets.
+ * These seed gates use seed/check/a64check.om, not this C file.
  * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
