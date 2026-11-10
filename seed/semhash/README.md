@@ -21,7 +21,7 @@ mkdir -p build
 ```
 
 `$OMC` is the pinned seed compiler. `check.sh` pins sha256
-`0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f`. A missing or different compiler
+`f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9`. A missing or different compiler
 makes it print `SEMHASH NOT_RUN` and exit 3.
 
 ## Modes

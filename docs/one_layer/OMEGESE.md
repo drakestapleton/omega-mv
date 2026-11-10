@@ -878,6 +878,15 @@ mutants `m-zpool`, `m-zvec` and `m-movz16` (zeroing words retargeted to X16 or V
 `s5-scrub-femit` pins the same for a unit with a live float local, so which V registers are spared is
 checked (`m-twinall`, sparing the dead twins of live slots too), and `s5-scrub-flive` reads live float
 locals, a held float operand and a float call argument back after scrub (`m-twinnone`, zeroing V0-V31).
+`s5-scrub-pin` reads a pinned global base and a pinned length back after scrub (`m-pinlo`, the pins not set
+back: trap 3), and `s5-scrub-lateglob` reads a global declared after a scrubbing function (`m-pinshut`,
+that global pinned anyway: its register is cleared and not restored, trap 3). `s5-scrub-chain` reaches
+the scrub through two calls compiled before a long global (pinned anyway: trap 3), `s5-scrub-latebase`
+writes and reads a short global (a base pin only) declared after the scrubbing function (pinned anyway: a
+store through base 0, SIGSEGV), and `s5-scrub-inl` reads a global declared after an inline scrubbing
+function. `pinshut` is set when the body pass begins any `fn`, an inline one too, so that global takes no
+pin and the case checks the MOVZ/MOVK path; without `pinshut` the inline body, compiled at its call site
+after the global, restored the pin.
 
 - **`dit v`** (v int, else error 7) sets PSTATE.DIT (Arm ARM C5.2.4, FEAT_DIT; bit 24 of the DIT
   special-purpose register) and gives the previous bit as 0 or 1. v outside {0, 1} (a negative int too)
@@ -892,8 +901,13 @@ locals, a held float operand and a float call argument back after scrub (`m-twin
   [X16], #16` (C6.2.414) from SP - n upward: the frames of returned callees, their spilled registers and
   local arrays. Then `MOVZ Xr, #0` for every register that holds no live value: the pool registers at
   index npar + temporaries-in-use and above (the free temporaries and caller-saved registers), X16, and
-  X7, X18-X26, X29 (never used by program-mode code); and `MOVI Vd.2D, #0` (C7.2.247), which also clears
-  the upper SVE Z bits, for V0-V15 and for every dead twin. Since #853 an f32/f64 local name and a held
+  X7, X18-X26, X29 (no program-mode code keeps a value there except the OM-2 pinned global registers
+  below); and `MOVI Vd.2D, #0` (C7.2.247), which also clears
+  the upper SVE Z bits, for V0-V15 and for every dead twin. In an OM-2 AArch64 program the pinned global
+  registers among X18-X26 (each global array declared before the first `fn`, in order, gets one for its
+  base address and one more for its length when that is above 4095, until the nine are taken) are then set
+  back to those public constants with `MOVZ`/`MOVK`, since later element accesses read them; OM-1 and x86
+  units have no pinned registers. Since #853 an f32/f64 local name and a held
   float value live in the twin V16+j of their pool register (omc.om, "floats in v registers"); the twin
   is live when slot j is below the free index and its value lives there, and only such twins are
   spared. The twin of a free slot, or of a slot whose value is in its x register (a float parameter, an

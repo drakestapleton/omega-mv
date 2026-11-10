@@ -125,6 +125,18 @@ global ln_l uchar 4096
 global ln_h ulong 8192
 global ln_n ulong 1
 global tw8 ulong 1
+note ---- OM-2 pinned registers (AArch64 program mode only): X18..X26, which nothing else in a program names,
+note hold for the whole run the base address of the first globals and the length of a global whose length
+note is no CMP immediate. nm_pb / nm_pl: the base / length register of a global name (0: none); pinv the
+note value of pin p (register 18 + p), npin how many are taken. eof_prog sets them before main; scrub sets
+note them again after it clears X18..X26. pinshut: 1 once the body pass has begun a function; a global
+note declared after that gets no pin, because a scrub compiled before it would clear its register and
+note restore only the pins taken so far. ----
+global nm_pb uchar 8192
+global nm_pl uchar 8192
+global pinv ulong 9
+global npin ulong 1
+global pinshut ulong 1
 note ---- floats in v registers: kind 9 is a float held in v(16 + pool index of x register rv), the twin of
 note pool register rv; vsl marks each pool slot whose value lives in its twin (an f32/f64 local name, a
 note kind 9 value), saved and loaded as D around a call. fpw asks the next value read for kind 9 (1: a new
@@ -3078,6 +3090,8 @@ put nm_fv n 0
 put nm_lay n 0
 put nm_fr n 0
 put nm_lr n 0
+put nm_pb n 0
+put nm_pl n 0
 put nn 0 add n 1
 end
 
@@ -5235,6 +5249,8 @@ note Xt (C6.2.97), B.HS trap 3 (unsigned, so a negative signed index traps too).
 note (the array's register, or a new one holding its address), ea_i index register. om4 ELEMADDR.
 note OM-2 unsized array (unsz): every index, a number too, is checked against its count register nm_lr
 note (CMP Xi, Xn; B.HS trap 3); none is eliminated (spec 4, 6).
+note OM-2 global with a pinned register (pinset): the base is that register and a long length is compared
+note with its pinned register (CMP Xi, Xp), so neither is rebuilt with MOVZ/MOVK at each access.
 fn elemaddr e ulong k ulong v ulong t ulong to void
 if ne get xtarget 0 0
 xelem e k v t
@@ -5266,18 +5282,26 @@ else
 if le ln 4095
 emit or or 4043309087 shl ln 10 shl v 5
 else
+if ne get nm_pl i 0
+emit or or 3942645791 shl ulong get nm_pl i 16 shl v 5
+else
 y = alloc
 matconst y ln
 emit or or 3942645791 shl y 16 shl v 5
+end
 end
 trapc 2 3
 end
 end
 put ea_i 0 x
 if ge get nm_kind i 4
+if ne get nm_pb i 0
+put ea_b 0 ulong get nm_pb i
+else
 b = alloc
 matconst b get nm_addr i
 put ea_b 0 b
+end
 else
 put ea_b 0 ulong get nm_reg i
 end
@@ -8754,7 +8778,9 @@ note of a live slot j (below npar + nslot) whose value lives in its twin (vsl: a
 note held kind 9 float, as save stores it); a twin of a free slot or of a slot whose value is in its x
 note register holds nothing live. V0-V15 carry a float only inside one operation. Never touched: SP, X27
 note (the Linux initial stack under args), X28 (the stack floor), X30 (the return address), the live pool
-note registers and live twins, NZCV, FPCR, FPSR, and the SVE P registers and FFR. Gives long 0.
+note registers and live twins, NZCV, FPCR, FPSR, and the SVE P registers and FFR. Gives long 0. Pinned
+note registers (OM-2 global bases and lengths among X18..X26, pinset) are cleared with the rest, then set
+note back to their public constant values (pinlo), since later element accesses read them.
 harg x 0 5
 r = matreg get fr add x 8 get fr add x 9 5
 emit or 4064283679 shl r 5
@@ -8798,6 +8824,7 @@ emit or 1862329344 i
 end
 i = add i 1
 end
+pinlo
 put nslot 0 sl
 d = destreg dst
 matconst d 0
@@ -9389,6 +9416,7 @@ put curfn 0 add f 1
 put lastfn 0 add f 1
 put fn_addr f get oc 0
 put fstart 0 get oc 0
+put pinshut 0 1
 put fuel 0 0
 put fz_n 0 0
 end
@@ -9666,7 +9694,47 @@ end
 put poolb 0 s
 addname w 0 t n 4 a
 put nglob 0 get nn 0
+if ne om2cg 0
+pinset sub get nn 0 1 a n
+end
 eol
+end
+
+note om2cg: 1 when the unit gets the OM-2 AArch64 code improvements (an OM-2 unit, AArch64, not IR mode),
+note else 0. An OM-1 unit keeps om4's machine words exactly (gate5 compares them word for word).
+fn om2cg to ulong
+if and and ne get om2 0 0 eq get xtarget 0 0 eq get irmode 0 0
+ret 1
+end
+ret 0
+end
+
+note pinset: give global name i (address a, n elements) the next free pinned register for its base, then
+note one for its length when n is above 4095 (no CMP immediate); nothing once X18..X26 are all taken, and
+note nothing for a global declared after the first function body (pinshut).
+fn pinset i ulong a ulong n ulong to void
+p = get npin 0
+if or ge p 9 ne get pinshut 0 0
+ret
+end
+put nm_pb i uchar add 18 p
+put pinv p a
+p = add p 1
+if and gt n 4095 lt p 9
+put nm_pl i uchar add 18 p
+put pinv p n
+p = add p 1
+end
+put npin 0 p
+end
+
+note pinlo: MOVZ/MOVK (matconst) every pinned register X18 + p with its value pinv p
+fn pinlo to void
+p = ulong 0
+while lt p get npin 0
+matconst add 18 p get pinv p
+p = add p 1
+end
 end
 
 note s_text: text NAME "...": read-only bytes in the program image (escapes \n \t \\ \", any other is error
@@ -11015,7 +11083,7 @@ end
 note eof_prog: program mode: start code = MOVZ X28, #0x1000, LSL 16 (stack pool floor); MOVZ X16, #0x1080,
 note LSL 16; MOV SP, X16 (ADD immediate, C6.2.5); BL main (C6.2.43); [MOVZ X0, #0 for a void main]; MOVZ X8,
 note #93; SVC #0. The entry word after the header is a B to it; the header gets the file and pool sizes.
-note om4 EOF_PROG.
+note om4 EOF_PROG. An OM-2 unit with pinned registers sets them (pinlo) just before the BL.
 fn eof_prog to void
 if ne get xtarget 0 0
 xeof
@@ -11036,6 +11104,7 @@ end
 emit 3533832220
 emit 3533836304
 emit 2432696863
+pinlo
 emit or 2483027968 bdisp get oc 0 get fn_addr sub f 1 26
 if eq get fn_ret sub f 1 12
 emit 3531603968
