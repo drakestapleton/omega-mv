@@ -48,7 +48,7 @@ main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc 0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f \
+    gate-front seed/out/omc 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt
@@ -103,7 +103,7 @@ calls: both are omc code-shape choices with the same results.
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc 0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f \
+    gate-front-ir seed/out/omc 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
 It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
@@ -111,7 +111,9 @@ case compiles the unit with omc and runs it, lowers it with ng, requires ngcheck
 ngrun and compares exit status and stdout (stderr is free: the kernels time themselves there); for each
 `refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
 `seed/ng/tests/ir`, two default-fuel run units of `cases/` (`fuel_while`, `fuel_for`: no bound, trap 4
-after 1000000 passes), two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
+after 1000000 passes), two signed `for` latch units of `cases/` (`for_latch_i8`, `for_latch_i64`: the body
+writes the counter's maximum and the latch's add 1 traps 1, as omc's does; fe_lendl adds it under chk.add),
+two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
 `cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
