@@ -12,6 +12,8 @@ CHK=$R/build/seed/a64check
 fail=0; ok() { echo "PASS $*"; }; bad() { echo "FAIL $*"; fail=1; }
 mkdir -p "$R/build/seed"
 (cd "$R" && sha256sum -c --status seed/out/omc.sha256) || { echo "FAIL a64check: seed/out/omc does not match seed/out/omc.sha256"; exit 1; }
+printf 'a64check compiler '
+sha256sum "$D/out/omc" || { echo "FAIL a64check compiler hash log"; exit 1; }
 "$D/out/omc" < "$D/check/a64check.om" > "$CHK" && chmod +x "$CHK" || { echo "FAIL a64check build"; exit 1; }
 sh "$D/rung0/load0.sh" "$D/rung0/seed0.hex" "$O/seed0.bin" && chmod +x "$O/seed0.bin" || bad "load0"
 "$O/seed0.bin" < "$D/rung0/seed0.hex" > "$O/seed0.self"; rc=$?

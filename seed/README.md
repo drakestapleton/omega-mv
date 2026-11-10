@@ -724,8 +724,7 @@ It reuses the open-path argument shape (path plus two `int` ids); -1 leaves that
 ## Rung R32: named integer constants (done)
 
 `const NAME TYPE INTEGER` at top level defines a typed value before use. It is visible to later
-functions, composes wherever a value goes (including call arguments), cannot be assigned (error 7),
-and is kept across function scope resets by advancing the global-name watermark. Integer types only;
+functions, composes wherever a value goes (including call arguments), cannot be assigned (error 7),and is kept across function scope resets by advancing the global-name watermark. Integer types only;
 `f32`/`f64` constants and IR mode are refused (error 9). Names are at most 8 characters and may not
 collide with a visible name, function or struct (error 10); the value must fit (error 8).
 
@@ -1070,9 +1069,11 @@ full pin refresh; this draft must not be treated as installed or independently m
 ## How the checks stay honest
 
 - `check/a64check.om` and `check/audit.sh` are reference checks only. Rung 0 builds the Omega
-  decoder/encoder with the committed seeded `out/omc`; rungs 1 and 2 reuse it. No C compiler is
-  needed for these gates. GNU objdump remains the second independent decoder. The retained C
-  references are labelled ORACLE; none of these checks writes a byte of any rung.
+  decoder/encoder with `out/omc`, after checking `out/omc.sha256` and logging the compiler hash;
+  rungs 1 and 2 reuse it. No C compiler is needed for these gates. The Omega oracle now shares
+  ancestry with the chain it checks, and objdump remains the independent second decoder. GNU objdump remains the second independent decoder. The retained C
+  references are labelled ORACLE for these seed gates only; the two src/ implementations remain
+  active first-party C code in other targets. None of these checks writes a byte of any rung.
   Generated parity inputs are `omc/tests/a64-decode-cases.om` and `a64-encode-edge-cases.om`.
 - `check/audit2.sh` (GNU objdump) and `check/runner.c` (built with the C compiler) are reference checks
   for rungs 3 and 5 in the same way: one reads every instruction back, the other calls the functions
