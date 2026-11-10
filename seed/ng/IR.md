@@ -710,7 +710,10 @@ width it checks 18 signed special/boundary bit patterns (zeros, infinities, quie
 NaNs with payloads, minimum and maximum subnormals, minimum normals and maximum finite values)
 and 1024 deterministic random patterns. It checks float-to-int for all eight integer widths,
 16 probes at each destination's boundaries, integer-to-float in every defined mode at integer
-range and precision boundaries, and f64-to-f32 in every defined mode. NaN conversions are
+range and precision boundaries, and f64-to-f32 in every defined mode. The native toward-zero
+f64-to-f32 reference decodes the sign, exponent and significand as integers; it does not use
+ngrun's predecessor-of-nearest algorithm. A separate mutant removes that predecessor step.
+NaN conversions are
 compared by NaN classification; bitcasts and FMA compare raw bits. FMA includes three explicit
 witnesses and the same special/random sweep: two fused-versus-unfused cases and one f32 case
 (`0x3f7ff001 * 0x33800800 + 1`, exactly 1 + 2^-24 + 2^-60) where an f64 FMA narrowed to f32
