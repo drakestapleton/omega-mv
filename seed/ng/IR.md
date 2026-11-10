@@ -523,7 +523,15 @@ Descriptors are virtual: stdin (0) may be read and stdout/stderr (1, 2) written,
 close any of the three, as a native program may; every other operation needs a descriptor created by
 an interpreted `fopen` or `memfd`. `memfd` names no path and runs without `--scratch`. A refused word
 prints `ngrun: refused host class C word W at OFFSET` on stderr
-and exits C before any effect:
+and exits C before any effect. A word refused below whose native form traps 3 on its operands before
+any kernel call traps 3 first, as natively: `waitio` events outside 0..65535, a `peercred` output
+under 12 bytes, a `pollfds` length that is not a multiple of 8 or is over 8192, a `waitpid` output
+under 4 bytes, a `pipefds` output under 8 bytes, and an `execprog`, `execpure`, `execenv` or `symlnk`
+packet that breaks the packed-list rules of OMEGESE s10 (2..4096 bytes, count 1..64, records inside
+the packet, no trailing bytes, no zero byte; a nonempty first record for the exec words, exactly two
+nonempty records for `symlnk`, every `execenv` environment record nonempty). The device class (117)
+is refused without this check: its native trap conditions (mapping-table and device-descriptor checks)
+are not mirrored, so a device word with such operands exits 117 where a native run traps 3.
 
 | exit | class | words |
 |---|---|---|
@@ -532,7 +540,7 @@ and exits C before any effect:
 | 117 | device | devctl mapnew mapdrop mapread mapwrite devcall uvmctl mapaddr mapget mapset maphold mapbind vfioctl vfiomap vfiomapw eventfd vfioirq |
 | 118 | network | socknew listen accept connect bind recv send waitio sockname sockopt shutdown peercred pollfds sendmsg peername |
 | 119 | outside scratch | any path or descriptor word without `--scratch`, an absolute or multi-component path, `.`/`..`, a descriptor ngrun did not create (including pread/pwrite on 0..2) |
-| 120 | nondeterministic | random, sleepns with a nonzero interval |
+| 120 | nondeterministic | random, sleepns with a positive interval |
 | 121 | unsafe filesystem | symlnk, syncfs, a blocking or shared-wait flock |
 | 122 | unclassified | a host word id with no row here (unreachable for accepted units) |
 | 123 | descriptor table | more than 256 live virtual descriptors |
