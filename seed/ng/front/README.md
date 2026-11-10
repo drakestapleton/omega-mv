@@ -128,3 +128,23 @@ as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `f
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
 Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
+
+## Native contracts: fail-closed lowering boundary
+
+The check pass validates native contracts, but the M1 lowering does not implement them. Every
+`requires`, `ensures` and `invariant` clause is therefore refused in front-ir with the existing
+not-lowered exit 64, before any IR is written. A short clause word must never be interpreted as
+an ordinary assignment that silently removes its runtime check. OM-1 names retain their meaning.
+
+The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
+the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
+
+    gate-front seed/out/omc 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8 \
+      units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
+      seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
+      seed/ng/front/cases-contract-scope.txt
+
+Its guard-removal mutant restores the silent path and must be KILLED. This is a scope-safety gate,
+not contract execution parity. Before the guard, these fixtures emitted IR and ran without the
+required trap. Real lowering must replace this boundary with chk.true checks at entry, every
+normal return and each loop head, with the seeded debug/release policy and trap codes.

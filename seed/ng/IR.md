@@ -696,6 +696,42 @@ shrink with ngrun as the predicate, and a mutant ngrand that drops one token edg
 must refuse TOKEN. ngrun has no second oracle on these units: a back end diffing against ngrun is
 the differential, and its disagreements judge both.
 
+**Reference-interpreter float checks.** The supported scalar f32/f64 subset includes bitcast,
+nearest-even and toward-zero conversions (imm 0, 1, 4, 5 for float destinations), and fused
+FMA. Integer destinations still require imm 0: they already truncate toward zero and saturate;
+the former unsupported rounding-mode defect concerned float destinations, not float-to-int.
+Bitcasts retain the entire declared width, including the sign bit and NaN payload. FMA is
+one operation at the declared precision, not a widened or multiply-then-add evaluation.
+
+The IR gate builds `tests/ir/float-oracle.om` with the pinned seeded omc and runs it natively.
+That independent executable emits a unit containing expected raw-bit checks computed with
+native omc bitcasts, conversions and FMA. It links the IR writer, never ngrun. For each float
+width it checks 18 signed special/boundary bit patterns (zeros, infinities, quiet and signaling
+NaNs with payloads, minimum and maximum subnormals, minimum normals and maximum finite values)
+and 1024 deterministic random patterns. It checks float-to-int for all eight integer widths,
+16 probes at each destination's boundaries, integer-to-float in every defined mode at integer
+range and precision boundaries, and f64-to-f32 in every defined mode. The native toward-zero
+f64-to-f32 reference decodes the sign, exponent and significand as integers; it does not use
+ngrun's predecessor-of-nearest algorithm. A separate mutant removes that predecessor step.
+NaN conversions are
+compared by NaN classification; bitcasts and FMA compare raw bits. FMA includes three explicit
+witnesses and the same special/random sweep: two fused-versus-unfused cases and one f32 case
+(`0x3f7ff001 * 0x33800800 + 1`, exactly 1 + 2^-24 + 2^-60) where an f64 FMA narrowed to f32
+double-rounds to `0x3f800000` instead of `0x3f800001`. The oracle exits 3 unless native omc
+reproduces the exact Wolfram-checked bits of all three. The native oracle prints
+its measured check count and finite fused-versus-unfused difference count on stderr.
+`tests/ir/intcv-oracle.om` independently exercises all 16 unsigned-to-signed width pairs at
+eight boundary inputs each (128 native comparisons), including source MAX and MAX-1. Another
+256 native comparisons check f32/f64 `chk.conv` at 16 boundary probes for each integer type,
+using an independent integer decoder of the float sign, exponent and significand rather than
+ngrun's float comparisons. It emits
+the IR before performing the equivalent checked native conversion, so its native exit is the
+expected IR exit (0 or trap 5). The gate compares exit, stdout and stderr. Sign-bit erasure,
+RTZ refusal, unfused f32 and f64 FMA, f32 FMA widened to f64 then narrowed, and the former
+unsigned-to-signed check each have a separately killed interpreter mutant. These are host semantic
+checks, not hardware qualification
+of either NG back end; the integer random-IR generator still has no second independent oracle.
+
 ## 11. Refusal classes and ngcheck exit codes
 
 `ngcheck` reads binary ΩIR on stdin. Accept: exit 0 and one stdout line

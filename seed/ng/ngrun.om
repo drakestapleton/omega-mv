@@ -15,8 +15,9 @@ note "ngrun: cannot read input" and exit 27.
 note Supported: const select, integer and f32/f64 arithmetic, compare, conv, bitcast (10..37), every
 note check (70..82), facts (90..93, no effect), load store atom atomcas alloca fill gaddr len slice
 note fload fstore fref on scalar elements, br cbr ret retv call trap exit, host read write monons
-note realns cpufence cpurelax. Not yet: vectors and tiles (100..106), kernels (40, 41, 44, 45, 67),
-note fma (46), fmath (28), f16/bf16/fp8, conv rounding toward zero, vload/vstore (58, 59).
+note realns cpufence cpurelax; fused f32/f64 fma (46); every f32/f64 conv rounding/saturation mode.
+note Not yet: vectors and tiles (100..106), kernels (40, 41, 44, 45, 67), fmath (28),
+note f16/bf16/fp8, vload/vstore (58, 59).
 note Its own limits never exit 100..114 (those are the IR's traps): after STEPS executed ops (default 2^36 =
 note 68719476736, about an hour on the Spark, above the 7.8e9 of the sort kernel; a loop without chk.fuel
 note may run forever) it prints "ngrun: step limit at OFFSET" (the next
@@ -449,6 +450,40 @@ ret ulong bitcast uint f32 bitcast long a
 end
 ret ulong bitcast uint f32 a
 end
+note Integer to float toward zero: retain the leading precision bits, never round upward.
+note No intermediate float, so u64 and i64 cannot double-round through f64.
+fn rn_i2z t uint s uint a ulong to ulong
+v = a
+sg = ulong 0
+if rn_sg s
+if lt bitcast long a 0
+v = sub ulong 0 a
+sg = shl ulong 1 sub rn_w t 1
+end
+end
+if eq v 0
+ret 0
+end
+p = ulong 23
+bias = ulong 127
+if eq t 14
+p = 52
+bias = 1023
+end
+e = ulong 0
+for j ulong 64
+if ne shr v j 0
+e = j
+end
+end
+m = v
+if gt e p
+m = shr v sub e p
+else
+m = shl v sub p e
+end
+ret or sg or shl add e bias p and m sub shl ulong 1 p 1
+end
 fn rn_conv o uint to void
 t = get i_oty o
 s = rn_at o 0
@@ -458,13 +493,15 @@ if and rn_isi t rn_isi s
 rn_r o rn_cn t a
 ret
 end
-if and rn_isf t ne and im 3 0
-rn_uns o
-end
+
 if or not or rn_isi t rn_isf t not or rn_isi s rn_isf s
 rn_uns o
 end
 if rn_isi s
+if eq and im 3 1
+rn_r o rn_i2z t s a
+ret
+end
 rn_r o rn_i2f t s a
 ret
 end
@@ -479,6 +516,13 @@ ret
 end
 y = f32 x
 inf = div 1.0f64 0.0f64
+note The nearest result beyond the exact magnitude has the toward-zero predecessor.
+if eq and im 3 1
+if gt fabs f64 y fabs x
+bits = sub ulong bitcast uint y 1
+y = bitcast f32 uint bits
+end
+end
 sat = ne and im 4 0
 yi = eq fabs f64 y inf
 xf = ne fabs x inf
@@ -495,14 +539,34 @@ fn rn_bcast o uint to void
 t = get i_oty o
 a = rn_a o 0
 if rn_isf t
-rn_r o and a sub shl ulong 1 sub rn_w t 1 1
+rn_r o rn_cn t a
 ret
 end
 rn_r o rn_cn t a
 end
-note ---- pure ops (1..37) ---------------------------------------------------------------------------
+note ---- pure ops (1..37, 46) -----------------------------------------------------------------------
+note FMA is one native operation at the declared precision, never widened or split.
+fn rn_fused t uint a ulong b ulong c ulong to ulong
+if eq t 13
+x = bitcast f32 uint a
+y = bitcast f32 uint b
+z = bitcast f32 uint c
+ret ulong bitcast uint fma x y z
+end
+x = bitcast f64 a
+y = bitcast f64 b
+z = bitcast f64 c
+ret bitcast ulong fma x y z
+end
 fn rn_pure o uint op uint to void
 t = get i_oty o
+if eq op 46
+if not rn_isf t
+rn_uns o
+end
+rn_r o rn_fused t rn_a o 0 rn_a o 1 rn_a o 2
+ret
+end
 if eq op 1
 rn_r o get i_oim o
 ret
@@ -616,7 +680,9 @@ ret true
 end
 ret gt sa shr mx sb
 end
-note v (type s) outside int type t, float v truncated toward zero first, NaN outside
+note v (type s) outside int type t, float v truncated toward zero first, NaN outside. An unsigned v into a
+note signed t of any width is outside from 2^(w-1) up: the canonical test alone would take 2^64 - 1 into i32
+note as -1 (bug hunt, ledger L1060; tests/ir x-convu)
 fn rn_ckcv t uint s uint v ulong to bool
 w = rn_w t
 if rn_isf s
@@ -644,8 +710,8 @@ if lt sv 0
 ret true
 end
 end
-if and rn_sg t eq w 64
-ret ge v shl ulong 1 63
+if rn_sg t
+ret ge v shl ulong 1 sub w 1
 end
 ret ne rn_cn t v v
 end
@@ -1030,7 +1096,7 @@ end
 note ---- one op: returns the next op -----------------------------------------------------------------
 fn rn_step o uint to uint
 op = uint get i_oop o
-if lt op 38
+if or lt op 38 eq op 46
 rn_pure o op
 ret get i_onx o
 end
