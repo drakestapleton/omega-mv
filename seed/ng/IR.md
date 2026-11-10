@@ -527,7 +527,9 @@ and exits C before any effect. A word refused below whose native form traps 3 on
 any kernel call traps 3 first, as natively: `waitio` events outside 0..65535, a `peercred` output
 under 12 bytes, a `pollfds` length that is not a multiple of 8 or is over 8192, a `waitpid` output
 under 4 bytes, a `pipefds` output under 8 bytes, and an `execprog`, `execpure`, `execenv` or `symlnk`
-packet that breaks the packed-list rules of OMEGESE s10 (2..4096 bytes, count 1..64, records inside
+packet that breaks the packed-list rules of OMEGESE s10 (an exec argument packet, that of `execprog`,
+`execpure` or the first of `execenv`, is 2..65536 bytes with count 1..1024, as the pinned omc 564c5835
+lowers it; a `symlnk` packet and the `execenv` environment 2..4096 bytes with count 1..64; records inside
 the packet, no trailing bytes, no zero byte; a nonempty first record for the exec words, exactly two
 nonempty records for `symlnk`, every `execenv` environment record nonempty). The device class (117)
 is refused without this check: its native trap conditions (mapping-table and device-descriptor checks)
