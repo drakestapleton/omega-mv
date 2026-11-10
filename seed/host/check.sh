@@ -139,6 +139,10 @@ echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # prlimit 235: rlimit read/set/effect against /proc/self/limits (AArch64 and x86linux), RLIMIT_AS kept
 # across execprog, refusals, and 7 omc.om mutants killed (seed/host/prlimit/).
 "$B/gate" seed/out/omc "$pin" seed/host/prlimit/prlimit.cases "$run/prlimit"
+mkdir -p build/seed/sched-caller
+seed/out/omc < seed/host/affinity/caller-conductor.om > build/seed/sched-caller/conductor
+chmod +x build/seed/sched-caller/conductor
+"$B/gate" seed/out/omc "$pin" seed/host/affinity/sched.cases "$run/sched"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2

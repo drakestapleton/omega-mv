@@ -93,16 +93,16 @@ bytes. Each child has a30-second deadline. Scratch and child outputs remain
 available for inspection; the shell creates a separate directory on each run.
 
 The required compiler is this branch's seeded `seed/out/omc`, executable
-`6844d173abc85ecbc04154cce85e4e5eeec8bf7b21f4ab1c10728c55efe7dd00`, built from
-`seed/omc/omc.om` `f2def4bbc5d42afefc01b0fbca385157974249ac0ab22f9f4ff4cd87e93517e0`
+`0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f`, built from
+`seed/omc/omc.om` `232f89ebe688e81c289a9d0225dd06e4d8e8aaad8e489433634e7f8bf0b9b0a9`
 (both pinned in `compiler.sha256`). The original qualification used the corrected
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
 executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
-then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea, then cfd96b48, then 0f2de851, then 6d1b1cf5, then b87c8b65, then 564c5835, then 6844d173) and the gate was rerun (no rerun is
+then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea, then cfd96b48, then 0f2de851, then 6d1b1cf5, then b87c8b65, then 564c5835, then 6844d173, then 0ed21175) and the gate was rerun (no rerun is
 recorded for b1d9cff6, 6d1b1cf5 or b87c8b65; at 564c5835 factory bay 1 reran the host gate on
-ham/omc-train e68b5914: 53/53 PASS; at 6844d173 it was rerun on ham/omc-perf-loops-5). The compilers
+ham/omc-train e68b5914: 53/53 PASS; at 6844d173 it was rerun on ham/omc-perf-loops-5 and at 0ed21175 on ham/om-threads-4). The compilers
 through 3ad9f10f emit the same classifier bytes (b527a20c, pinned in `classify.sha256`). The
-hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6, 5f90edea, cfd96b48, 0f2de851, 6d1b1cf5, b87c8b65, 564c5835 and 6844d173 emit 5dd5bb47, so the
+hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6, 5f90edea, cfd96b48, 0f2de851, 6d1b1cf5, b87c8b65, 564c5835, 6844d173 and 0ed21175 emit 5dd5bb47, so the
 chip entry refuses a classifier built with the current pin until `classify.sha256` is requalified
 (the host gate above passes 53/53 with 5f90edea). The entry refuses with 3 for any other compiler. It
 does not fetch code, accept an arbitrary environment compiler, silently select an

@@ -410,3 +410,21 @@ exit status and diagnostics; the other 22 are 11 files that were error 13 under
 `cfd96b48` and are fragments or tests of that refusal (refused either way, or
 `seed/omc/om2/s1/bad-kw-field.om`, now `kw-long-field.om`, accepted).
 Gate: `seed/omc/gate-longnames.sh`.
+
+
+## Scheduler-word compiler pin (ham/om-threads, draft)
+
+Scheduler host words 236..240 are additive; first born on Radicle main a59a425b
+(`13a0c88c`, ham/om-threads-3 on f71942bb), now on `ham/om-threads-4`, stacked on
+`ham/omc-perf-loops-5` on Radicle main 12bdb787.
+The seed-born compiler is
+`0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f`,
+from compiler source
+`232f89ebe688e81c289a9d0225dd06e4d8e8aaad8e489433634e7f8bf0b9b0a9`.
+The seed birth, both-parent equality and self-rebuild fixpoint were EXERCISED.
+The contract is in `spec/omegese-cpu-workers.md`; the full scheduler module is
+`seed/host/affinity/sched.cases`, included in `seed/host/check.sh`.
+All new words are program-only. No function-mode mapping context or device word
+changes. CPU threads and scaling are NOT_RUN in this head, deferred by parent
+mac-ham to a separate run. Historical compiler and mapping receipts above stay
+unchanged.

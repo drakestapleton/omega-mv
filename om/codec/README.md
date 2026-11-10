@@ -125,7 +125,7 @@ such cycles on purpose.
   port uses its own SHA-256 (the FIPS code of `tools/zero-legacy/sha256.om`). The driver also
   checks every serialized graph's sha256 against Python's hashlib.
 
-## Parity (pinned omc `6844d173…dd00`)
+## Parity (pinned omc `0ed21175…3c4f`)
 
 `codec.om` sha256 is `c8e93310…a2e8`. It compiles to a 95,048-byte program, the same bytes as under
 the previous pins `3ad9f10f…3194`, `b4f45121…9b55`, `be8c5130…448a`, `24caacf4…abb7`, `90c8884c…3983`, `469532a5…79bc` and `62775d2a…712b`. The corpus is
