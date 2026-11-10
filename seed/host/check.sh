@@ -34,6 +34,8 @@ chmod +x "$B/gate"
 pin=$(sha256sum seed/out/omc | cut -d' ' -f1)
 run=$(mktemp -d "$B/run.XXXXXX")
 "$B/gate" seed/out/omc "$pin" seed/omc/contracts/contracts.cases "$run/cases"
+# OM-2 for loops tested at the latch: exact pass counts and the pass on which trap 4 fires (seed/omc/cflow).
+"$B/gate" seed/out/omc "$pin" seed/omc/cflow/cflow.cases "$run/cflow"
 # OM-2 dit and scrub (OMEGESE 9.13.1): s5 cases, and every s5 omc.om mutant detected (ctl-* PASS, m-* FAIL).
 "$B/gate" seed/out/omc "$pin" seed/omc/om2/s5/s5.cases "$run/s5" > "$run/s5.log" || { cat "$run/s5.log"; exit 1; }
 grep -qx 'OM2GATE PASS cases=21 pass=21 fail=0 invalid=0 not_run=0' "$run/s5.log"
