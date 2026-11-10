@@ -877,12 +877,16 @@ per function:
 1a. **PHI.** A block parameter other than the token whose arguments, over every `br` that targets
    its block, are one value v or the parameter itself is replaced by v: its uses take v, and it
    leaves the block's parameter list and each such `br` its argument (a block with a parameter
-   past its token is reached only by `br`, s9 rule 5). v dominates the block (s6.2): it is used at
-   the end of every predecessor, one of which lies outside every loop through the block. One
-   parameter per round, to a fixed point. A value an outer loop carries unchanged through an inner
-   loop's header is such a parameter, so LICM then sees its uses as invariant. Fixture `o-phi`
-   (one parameter stays, one goes); a PHI that kept a parameter's first argument even where another
-   `br` passes a different one changes its run (exit 16 for 18).
+   past its token is reached only by `br`, s9 rule 5). v dominates the block (s6.2): every block is
+   reachable (s9 rule 4), and on any path from block 0 the edge that first enters the block comes
+   from a predecessor the block does not dominate, so that `br` passes v, not the parameter, and v
+   dominates its end. One parameter per round, to a fixed point. A value an outer loop carries
+   unchanged through an inner loop's header is such a parameter, so LICM then sees its uses as
+   invariant. PHI, BCE and LICM repeat in that order while one of them changes something: LICM's
+   merging can give two `br` arguments one value only after PHI ran (ngrand seed 523 kept a
+   redundant parameter after one round). Fixture `o-phi` (one parameter stays, one goes); a PHI
+   that kept a parameter's first argument even where another `br` passes a different one changes
+   its run (exit 16 for 18).
 2. **BCE** (pass origin 1, item 1 of s15). A `chk.bounds r i e` is replaced in place by
    `fact.inbounds 1 r i e` when e is a const >= 1, r is a REF to an ARRAY of count L, and i < X is
    known where the check runs with X - 1 + e <= L: i is a const (X = i + 1), or a block on the
