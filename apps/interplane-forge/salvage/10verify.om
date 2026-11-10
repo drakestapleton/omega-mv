@@ -29,10 +29,67 @@ text tlpol "salvage-example-v1:bwrap-compile:execpure-run:3s-wall:4096-byte-outp
 global glpk uchar 8192
 global glpkn ulong 1
 global glpkc ulong 1
-global gljob long 1
 global glphase ulong 1
 global glstatus uchar 4
-global gljid uchar 64
+note The scratch root. Inside the server's own process (tests, replay) it is <store>work/. The
+note collector program sets one outside the store: the sandboxed server can write everything in
+note the store, and scratch files are compiled and executed, so they must be out of its reach.
+global glwroot uchar 512
+global glwrootn ulong 1
+note slwroot: an absolute path ending in /, no control bytes, no segment starting with a dot
+fn slwroot d view uchar * to bool
+if or lt len d 2 gt len d 500
+ret false
+end
+if or ne get d 0 47 ne get d sub len d 1 47
+ret false
+end
+for i ulong len d bound 512
+c = get d i
+if or lt c 32 eq c 127
+ret false
+end
+if gt i 0
+if and eq c 46 eq get d sub i 1 47
+ret false
+end
+end
+put glwroot i c
+end
+put glwrootn 0 len d
+ret true
+end
+fn slwpath name view uchar * to void
+n = get glwrootn 0
+if eq n 0
+slpath tlwork name
+ret
+end
+for i ulong n bound 512
+put glpath i get glwroot i
+end
+for i ulong len name bound 128
+put glpath add n i get name i
+end
+put glpathn 0 add n len name
+end
+note slwmk: the scratch folder exists and is a private 0700 directory
+fn slwmk to bool
+if eq get glwrootn 0 0
+ret slmkdir tlwork
+end
+r = makedir glwroot 0 get glwrootn 0 448
+if not or eq r 0 eq r -17
+ret false
+end
+fd = fopen glwroot 0 get glwrootn 0 573440 0
+if lt fd 0
+ret false
+end
+ok = slprivate int fd
+x = fclose int fd
+ret ok
+end
 fn slpknew to void
 put glpkn 0 2
 put glpkc 0 0
@@ -50,18 +107,18 @@ put glpk 0 uchar get glpkc 0
 end
 fn slpkpath name view uchar * to void
 p = new uchar 1024 0
-slpath tlwork name
+slwpath name
 n = slpget p
 slpkadd view part p 0 n
 end
 fn slunlink name view uchar * to void
-slpath tlwork name
+slwpath name
 r = unlink glpath 0 get glpathn 0
 end
 fn slwput name view uchar * data view uchar * to bool
 p = new uchar 1024 0
 slunlink name
-slpath tlwork name
+slwpath name
 n = slpget p
 ret slwrite view part p 0 n data 557249
 end
@@ -147,7 +204,7 @@ if not slccconfig
 ret false
 end
 slunlink tlcc
-slpath tlwork tlcc
+slwpath tlcc
 n = slpget p
 src = fopen glccpath 0 get glccn 0 557056 0
 if lt src 0
@@ -217,7 +274,7 @@ end
 fn slchild inf view uchar * outf view uchar * pure bool to void
 pk = new uchar 8192 0
 r = setpgid 0 0
-slpath tlwork inf
+slwpath inf
 fd = fopen glpath 0 get glpathn 0 557056 0
 if lt fd 0
 exit 121
@@ -228,7 +285,7 @@ if lt r 0
 exit 122
 end
 slunlink outf
-slpath tlwork outf
+slwpath outf
 fd = fopen glpath 0 get glpathn 0 557249 384
 if lt fd 0
 exit 123
@@ -239,7 +296,7 @@ if lt r 0
 exit 124
 end
 slunlink tlerr
-slpath tlwork tlerr
+slwpath tlerr
 fd = fopen glpath 0 get glpathn 0 557249 384
 if lt fd 0
 exit 125
@@ -327,13 +384,13 @@ ret eq n len data
 end
 fn slseal to bool
 b = new uchar 65536 0
-slpath tlwork tlbuilt
+slwpath tlbuilt
 src = fopen glpath 0 get glpathn 0 557056 0
 if lt src 0
 ret false
 end
 slunlink tlbin
-slpath tlwork tlbin
+slwpath tlbin
 dst = fopen glpath 0 get glpathn 0 557249 384
 if lt dst 0
 x = fclose int src
@@ -362,7 +419,7 @@ end
 fn slcheckex to bool
 b = new uchar 4097 0
 e = new uchar 4096 0
-slpath tlwork tlout
+slwpath tlout
 n = slpread b
 en = slfield 8 e
 if or lt n 0 gt n 4096
@@ -384,7 +441,7 @@ put glphase 0 1
 if ne get glrec 8 2
 ret false
 end
-if not slmkdir tlwork
+if not slwmk
 ret false
 end
 if not slpincc
@@ -417,7 +474,7 @@ global glrcpt uchar 353
 fn slrh fld ulong name view uchar * to bool
 p = new uchar 1024 0
 h = new uchar 64 0
-slpath tlwork name
+slwpath name
 n = slpget p
 if not slfilehash view part p 0 n h
 ret false
@@ -499,44 +556,82 @@ put glrcpt i get b i
 end
 ret ulong get b 64
 end
+note ---- the verification job. The server never compiles or runs a submission: the live forged
+note runs in a namespace with no compiler, no bwrap and nested namespaces disabled. It only queues
+note one job, the file <root>job holding the 64-character record id. The collector, its own program
+note (salvage/collector.om) outside that namespace, takes the job, verifies, writes the receipt and
+note removes the file. One job at a time: while the file exists every other request is "busy".
+text tljob "job"
+note sljobpoll: kept for the route. The server holds no child, so there is nothing to reap.
 fn sljobpoll to void
-st = new uchar 4 0
-pid = get gljob 0
-if le pid 0
 ret
 end
-r = waitpid int pid st 0 4 1
-if ne r 0
-put gljob 0 0
-end
-end
-fn sljobstart id view uchar * to bool
-sljobpoll
-if gt get gljob 0 0
+note sljobid: the queued record id into dst. False when no job, or the file is not 64 hex characters.
+fn sljobid dst edit uchar * to bool
+p = new uchar 1024 0
+b = new uchar 64 0
+slpath tlempty tljob
+n = slpget p
+r = slread view part p 0 n b
+if ne r 64
 ret false
+end
+if not slhex b
+ret false
+end
+for i ulong 64
+put dst i get b i
+end
+ret true
+end
+note sljobstart: queue the job. The create is exclusive (no follow, 0600), so a queued job refuses
+note the next one, and the file is synced before the request is answered.
+fn sljobstart id view uchar * to bool
+p = new uchar 1024 0
+if not slhex id
+ret false
+end
+slpath tlempty tljob
+n = slpget p
+if not slwrite view part p 0 n id 557249
+ret false
+end
+ret slsync view part p 0 n
+end
+note sljobdrop: remove the job file
+fn sljobdrop to void
+p = new uchar 1024 0
+slpath tlempty tljob
+n = slpget p
+r = unlink p 0 n
+end
+note slcollect: one pass of the collector. 0 nothing queued; 1 the job got its receipt; 2 the job
+note ended without a saved receipt, or another collector holds the lock. A job file that is not a
+note record id is removed (2), so a damaged file cannot hold the queue for ever.
+note The collector lock is held through verification, receipt and cleanup.
+fn slcollect to ulong
+id = new uchar 64 0
+p = new uchar 1024 0
+b = new uchar 65 0
+if not sljobid id
+slpath tlempty tljob
+n = slpget p
+r = slread view part p 0 n b
+if eq r -2
+ret 0
+end
+sljobdrop
+ret 2
 end
 slpath tlempty tljlock
 lockfd = fopen glpath 0 get glpathn 0 557122 384
 if lt lockfd 0
-ret false
+ret 2
 end
 locked = flock int lockfd 6
 if ne locked 0
 x = fclose int lockfd
-ret false
-end
-pid = fork
-if lt pid 0
-x = fclose int lockfd
-ret false
-end
-if eq pid 0
-note The collector lock survives server exit until all artifacts are checked and receipted.
-note Close inherited network descriptors; the separate collector keeps no client connections alive.
-for i ulong 1021
-if ne long add i 3 lockfd
-r = fclose int add i 3
-end
+ret 2
 end
 ok = slload id
 if ok
@@ -550,15 +645,10 @@ slunlink tlcode
 slunlink tlin
 slunlink tlout
 slunlink tlerr
-if not saved
-exit 1
-end
-exit 0
-end
+sljobdrop
 x = fclose int lockfd
-put gljob 0 pid
-for i ulong 64
-put gljid i get id i
+if not saved
+ret 2
 end
-ret true
+ret 1
 end
