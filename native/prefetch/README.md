@@ -99,9 +99,10 @@ The required compiler is this branch's seeded `seed/out/omc`, executable
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
 executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
 then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea, then cfd96b48, then 0f2de851, then 6d1b1cf5, then b87c8b65, then 564c5835) and the gate was rerun (no rerun is
-recorded for b1d9cff6 or 6d1b1cf5). The compilers
+recorded for b1d9cff6, 6d1b1cf5 or b87c8b65; at 564c5835 factory bay 1 reran the host gate on
+ham/omc-train e68b5914: 53/53 PASS). The compilers
 through 3ad9f10f emit the same classifier bytes (b527a20c, pinned in `classify.sha256`). The
-hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6, 5f90edea, cfd96b48, 0f2de851 and 6d1b1cf5 emit 5dd5bb47, so the
+hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6, 5f90edea, cfd96b48, 0f2de851, 6d1b1cf5, b87c8b65 and 564c5835 emit 5dd5bb47, so the
 chip entry refuses a classifier built with the current pin until `classify.sha256` is requalified
 (the host gate above passes 53/53 with 5f90edea). The entry refuses with 3 for any other compiler. It
 does not fetch code, accept an arbitrary environment compiler, silently select an
