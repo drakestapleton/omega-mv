@@ -1,6 +1,7 @@
 # ng a64: ΩIR to AArch64 Linux ELF (design, ng-a64 lane)
 
-Status: IMPLEMENTED and HOST_TESTED for the integer slice below (gates in section 6); the rest is PROPOSED.
+Status: IMPLEMENTED and HOST_TESTED for the integer slice below and for scalar f32/f64 (section 9) (gates in
+section 6); the rest is PROPOSED.
 Code: `seed/ng/src/a64.om` (unit of `seed/ng/ng.units`, between `ir.om` and `main.om`; functions `a6_*`, globals
 `a_*`). Built for the ham fusion head by `seed/out/omc` (sha256 `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`, Radicle base `a59a425b4`). Facts about seed omc it copies are in
 `~/handoffs/hive-ng/a64/REALITY.md` (file:line at `943d9555`).
@@ -138,6 +139,10 @@ fib38), so any future codegen A/B reports an aligned control.
 | x28 | stack floor 0x10000000 (omc convention, trap 6 check) |
 | x29 | unused (kept for a frame pointer) |
 | x30 | link register, saved when the function calls |
+| v0..v7 | float arguments and result (d0 / s0), allocatable caller-saved (location 32 + V) |
+| v8..v15 | allocatable callee-saved: d8..d15 saved in the prologue when used (the low 64 bits, all a scalar needs) |
+| v16..v28 | allocatable caller-saved |
+| v29, v30, v31 | float scratch: operand reloads, a result bound for a slot, chk.conv bounds; never allocated |
 
 `a6_okreg`'s `lt r 15` (the spill scan's register set) cannot change output on its own: only `a6_give` marks a
 register active, with a register from `a6_free` (never x15) or from the spill scan (already active), so x15 is
@@ -145,19 +150,23 @@ never active and the scan skips it. Widening it to x15 (review mutant M-C of 8a3
 for all 14 mkir fixtures in both forms (28/28, on ng/a64-m1-fix); it is an equivalent mutant and is not in rgate's
 list.
 
-Calls between ng functions use x0..x7 for arguments 0..7, the caller's outgoing slots `[sp, 8j]` for argument 8 + j
-(at most 64 arguments, IR.md s12), and x0 for the result. The callee reads argument 8 + j at `[sp + F + 8j]` after its
-prologue (x17 = SP + F, then `LDR`, `a6_inpar`), once the x0..x7 parameters are in place. There is no outside caller
-in program mode, so this is the only contract.
+Calls between ng functions follow the scalar AAPCS64 banks (`a6_abi`): integer, reference and slice wires take
+x0..x7 in order, f32/f64 arguments v0..v7 in order, and the rest of either bank the caller's outgoing slots
+`[sp, 8j]` in argument order (at most 64 arguments, IR.md s12); the result is x0, or d0/s0 for a float. The callee
+reads stack argument j at `[sp + F + 8j]` after its prologue (x17 = SP + F, then `LDR` X or D, `a6_inpar`), once the
+register parameters are in place. There is no outside caller in program mode, so this is the only contract. With
+integers only, every argument's place is the one before floats (argument k < 8 in xk, slot k - 8 after), so the
+bytes are unchanged.
 
 ## 4. Encoder layer
 
-`a6_enc f a b c d e` builds the word of form f (160 forms, base word + operand kind, each group citing its DDI 0487
+`a6_enc f a b c d e` builds the word of form f (163 forms, base word + operand kind, each group citing its DDI 0487
 M.d section); `a6_ew` appends it. Forms: ADD/SUB/ADDS/SUBS (shifted register, immediate, extended register),
 AND/ORR/EOR/ANDS/BIC/ORN (shifted register, bitmask immediate), MOVZ/MOVN/MOVK, MUL/MADD/MSUB/SMULH/UMULH/SDIV/UDIV,
 LSLV/LSRV/ASRV/RORV (X and W), UBFM/SBFM/EXTR, CSEL/CSINC/CSINV/CSNEG, loads and stores of every width (unsigned
 offset and register offset), LDP/STP (signed offset, pre-, post-index), B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, RET, BR,
-BLR, SVC, ADR and the FP set.
+BLR, SVC, ADR and the FP set, with FCSEL S/D (kind 8, the CSEL shape) and MSR FPCR, Xt (kind 22: one Rt field)
+added for scalar floats.
 
 An operand that does not fit its field is refused (exit 5, `immediate out of range` / `branch out of range`), never
 masked. `a6_rsv` also refuses in-field values whose encoding DDI 0487 M.d reserves (exit 5, `reserved operand
@@ -170,10 +179,10 @@ bits there (multiply, two-source, float). The selector never asks for these; the
 1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
    in a callee-saved register across its loop).
 2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `atom`, `atomcas`,
-   float elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass that
-   proves them (IR.md s15).
+   `fill` of f32/f64 elements, SLICE results of calls and select. Bounds checks hoisted out of loops by a pass
+   that proves them (IR.md s15).
 3. Remaining fusions: ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
-4. Floats (FP registers v0..v7, v16..v31 caller-saved, v8..v15 callee-saved), host words beyond
+4. f16, bf16, fp8, `fmath` and vector floats (refused, exit 5: no accuracy-stated implementation), host words beyond
    read, write, monons, realns, cpufence and cpurelax (sleepns 120 has no ngrun reference: ngrun's host words are
    read, write, monons, realns, cpufence, cpurelax).
 
@@ -267,6 +276,13 @@ bits there (multiply, two-source, float). The selector never asks for these; the
   the seed: before the narrow rotations, 147 of seeds 1..1000 were refused (all `rotr`/`rotl` on u8 or u16) and none
   gave a wrong result. Negative control: ngrun's run of seed 1 against the `@ng a64` ELF of seed 2 must be sound
   and differ. Mutants do not run this phase (a 1..200 hunt with mutant 1 gave 29 wrong seeds, outside rgate).
+- `rgate.om` step 8, the float phase (section 9): `tests/frand.om` writes canonical ΩIR text of 56 deterministic
+  edge programs and of random seeds 1..1000; ngas assembles each and it goes through the ngrun-fixture checks
+  (status, stdout and stderr byte for byte against ngrun, both save forms, BL alignment). Negative control: ngrun's
+  run of float seed 1 against the ELF of float seed 2 must be sound and differ. Mutants 36..69 are the float ones:
+  each also runs the 56 edge programs and float seeds 1..8. The ngrun fixtures add ng-ir's float run pairs
+  x-float, x-convlo and x-minnan, and the front phase compares x-float against omc; the linear kernel stays a
+  front refusal (f32 `fill`).
 - ΩIR gap met by sort and chacha: a call argument must have exactly the parameter's type (IR.md row 64), so Omega
   passing an `edit` array or slice to a `view` parameter has no ΩIR form while `view` maps to access 0. The fixtures
   type such parameters as access 1 (the machine code is the same); the rule belongs to ng-ir (proposal on the BOARD).
@@ -304,3 +320,77 @@ Same front-generated IR, same seeded compiler, baseline a64 unit 0120a15a vs fus
 The arithmetic case is retained, including its measured A725 regression; no global speed claim is inferred. Ratios are the median of per-block sums, not the ratio of the two displayed medians. Wolfram computed statistics and formatting. Numeric T/K/H/A/S records: tests/fusion-a725.txt and tests/fusion-x925.txt; method/results: tests/fusion-stats.txt. Full process-contamination rows and exact Wolfram queries are retained with the READY's EVBACK paths, not copied into public process inventories.
 
 Acceptance on the fusion head 3ad3ef7b: gate.om 213/213 encoder cases, 23/23 refusals, wrong-bit mutant 3 mismatches and M-A 8 refusal failures; rgate fixtures 14/14, ngrun fixtures 78/78, front cases 23/23, expected float refusals 2/2, random seeds 1000/1000 in both save forms, controls differ, mutants 34/34 killed. f-fusion prints every per-call result so swapping complementary true/false results cannot cancel in its exit checksum; mutant checks compare stdout/stderr as well as status. The generated IR also passes ngas/ngdis byte-exact round trip. The answer to bay 11 (branch ham/ng-a64-float-2) adds the seven refusal fixtures and mutant 35 to rgate (35 mutants); its gate results are in its READY, not here.
+
+## 9. Scalar floats (ham/ng-a64-float, NgFloatFill)
+
+Design: `~/handoffs/hive/ham/reports/NgA64Float-design.md` (PROPOSED there, implemented here). IR semantics:
+IR.md s7.2, s7.3 (min/max as OMEGESE fmin/fmax, FMINNM/FMAXNM), s7.4, s7.5 and s7.9; ngrun is the oracle.
+
+**Representation and allocation.** An f32/f64 wire (`a_vf`) is allocated from the V registers, move locations
+32..63 (V = location - 32), by the same linear scan: `a6_ffree` hands out v0..v7 and v16..v28 unless the interval
+crosses a call, then d8..d15; `a6_spill` evicts within the class. Slots stay 8 bytes (`LDR/STR D`); an f32 rides in
+the low 32 bits of its D view. Saves: x19..x27, then x30, then d8..d15; a pair (STP/LDP X or D) is two registers of
+one class, a mixed neighbour is stored alone (`a6_rcls`). Parallel moves take any two classes: FMOV D,D; FMOV D,X or
+X,D (raw bits, never a conversion); LDR/STR D for a slot; a cycle breaks through x15 holding raw bits (`a6_mvf`).
+Integer-only functions take the same path as before: no float wire, no V location, so every output byte is the same
+(checked on every a64 fixture, mkir fixture, run pair, front kernel and ngrand seeds 1..300 in both save forms).
+
+**Selection** (`a6_sflt`, before every integer case in `a6_sel`):
+
+| IR | A64 |
+|---|---|
+| const | MOVZ/MOVN/MOVK the raw bits into x16, FMOV D,X or S,W (sign and every NaN payload bit kept) |
+| add sub mul div | FADD FSUB FMUL FDIV S/D, one rounding each, never contracted |
+| min max | FMINNM FMAXNM S/D, no extra guards |
+| neg fabs fsqrt | FNEG FABS (sign bit only, NaNs included) FSQRT |
+| eq ne lt le gt ge | FCMP, CSET EQ NE MI LS GT GE: unordered sets C and V, so only ne is true then. Float compares are never fused into their consumer, and an integer compare is not fused into a float select (`a6_cuse`) |
+| select | CMP c, #0; FCSEL S/D NE |
+| bitcast | FMOV X,D / W,S then the integer's canonical extension; FMOV D,X / S,W; FMOV D for float to float |
+| conv int to float | SCVTF/UCVTF S/D from the canonical X |
+| conv f32 to f64 | FCVT D,S (exact) |
+| conv f64 to f32 | FCVT S,D; with imm bit 2 an infinite result of a finite source becomes the largest finite of its sign (`a6_fsat`: the result bits minus 1 when its exponent is 255 and the source exponent is below 2047; the source bits are read into x17 before the result may reuse its register) |
+| conv float to int | FCVTZS/FCVTZU X (toward zero, 64-bit saturation, NaN 0), then CMP/CSEL clamps for 8, 16 and 32 bits |
+| fma (46 only) | FMADD d, a, b, c (a x b + c, rounded once) |
+| load store | LDR/STR S or D, register offset, the index scaled by the element size; REF and SLICE of f32/f64 elements |
+| chk.conv of a float | the value as f64 (FCVT D,S for f32), FCMP with itself, B.VS trap 5; then B.LS lo / B.GE hi trap 5 (i64: B.MI -2^63) |
+| call, retv, block parameters | the banks of section 3, d0 for a float result |
+
+Toward-zero rounding (conv imm 1 to a float destination) writes FPCR = 0xc00000 (RMode 11) through x15 right
+before the one rounding instruction and FPCR = 0 (MSR FPCR, XZR) right after it. When the module has any f32/f64
+value (`a6_hasf`), `_start` writes FPCR = 0 (round to nearest even, no flush to zero, no default NaN, no traps)
+before `BL main`; an integer-only module has no such word.
+
+Wolfram checks (MODELED encoding and constant arithmetic; the words are also checked against GNU objdump by
+`gate.om`):
+
+- `{IntegerString[FromDigits["d5100000",16] + 2^19 + 3*2^16 + 4*2^12 + 4*2^8, 16], IntegerString[3*2^22, 16],
+  IntegerString[BitShiftLeft[16^^c0, 16], 16]}` gave `{"d51b4400", "c00000", "c00000"}`: the MSR FPCR word and the
+  RMode 11 value as MOVZ #0xc0, LSL 16.
+- The chk.conv bounds as f64 bits: `u64[-(2^(w-1)+1)] == BitOr[2^63, BitShiftLeft[1022+w, 52], 2^(53-w)]`,
+  `u64[2^(w-1)] == BitShiftLeft[1022+w, 52]` and `u64[2^w] == BitShiftLeft[1023+w, 52]` for w in {8, 16, 32}, and
+  `u64[-2^63] == BitOr[2^63, BitShiftLeft[1086, 52]]`, `u64[2^64] == BitShiftLeft[1087, 52]`,
+  `IntegerString[u64[-1.], 16]` (u64 = the IEEE binary64 bits through `ExportString[x, "Real64"]`) gave True for
+  every case and `"bff0000000000000"`.
+- The largest finite f32: `IntegerString[bits32[(2 - 2^-23) 2^127], 16]` and `IntegerString[16^^7f800000 - 1, 16]`
+  both gave `"7f7fffff"` (`a6_fsat` subtracts 1 from the infinity's bits).
+
+Not here: `fill` of f32/f64 elements (head c, the fill lowering), `fload`/`fstore` (no STRUCT field access in the
+back end for any type), f16/bf16/fp8, `fmath`, vector floats and float atomics stay refused (exit 5).
+
+**Gates** (section 6): `gate.om` adds FCSEL S/D and MSR FPCR cases plus the float operand shapes (FPCR value, exponent
+extracts, D pairs and spills) and two refusals; `rgate.om` adds the float ngrun fixtures, x-float to the front phase,
+the float phase (`tests/frand.om`: 56 edge programs, seeds 1..1000, a negative control) and 34 float mutants:
+
+36..39 the lt, le, gt and ge conditions take the integer LT, LE, HI and HS forms; 40 f64 add becomes sub (form
+table); 41 f32 arithmetic uses the D forms; 42 FCSEL operands swapped; 43 f64 neg becomes fabs; 44 the toward-zero
+FPCR value becomes RMode 01 (toward +infinity); 45 FPCR is not restored after a toward-zero conversion; 46 `_start`
+writes x16 (RMode 10) to FPCR; 47 the signed narrow clamp uses LE; 48 the unsigned clamp uses LS; 49 f64 to signed
+integer through FCVTZU; 50 chk.conv lets NaN through (B.VC); 51 the signed chk.conv upper bound halved; 52 an f32
+chk.conv source is not widened; 53 float element loads unscaled; 54 f64 stores 4 bytes; 55 the callee takes float
+parameters from the integer registers; 56 the caller takes a float result from x0; 57 d8..d15 never saved; 58 a
+float reload reads the next slot; 59 f64 min is FMIN (NaN rule); 60 f32 max is FMINNM; 61 signed i64 to f64 by
+UCVTF; 62 saturation adds 1; 63 float constants from x17; 64 V-to-V moves read the next register; 65 float stack
+arguments stored one slot low; 66 float stack parameters all read slot 0; 67 fma addend and multiplier swapped; 68
+f32 to f64 conv uses FCVT S,D; 69 float spills stored one slot low. Two candidates are equivalent and not listed: the
+argument and result bank moved together in caller and callee (`a6_abi`, `a_d0`), since every caller and callee is
+ng code.
