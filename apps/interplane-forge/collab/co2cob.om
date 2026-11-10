@@ -7,8 +7,14 @@ note then related repo commits and the identity root; only changes descend from 
 note `git log --ancestry-path <tips> ^<root>` lists exactly the later changes, oldest first with
 note --reverse --topo-order. `git grep -a -z -e ^ <changes>` prints every action blob as one line
 note `<change>:<n>\0<json>`. Read only, argv execs only (fkgit + fexec), never the rad CLI.
-note Limits: 1024 refs, 512 changes, 64 revisions, 16 merges, 64 reviews, 512 comments per COB;
-note anything past a limit is not shown. Concurrent changes replay in git topological order.
+note Limits: every ref of one kind that fxo carries (16 MiB of 82-byte lines; a longer list is the whole
+note 500 of fincut), 8,192 changes, 8,192 comments, 64 revisions, 16 merges and 64 reviews per COB, a
+note 4 MiB string pool. Past a limit the object is not whole (gcov) and its page, JSON, raw diff and
+note every write to it are the whole 500 of fincut: nothing is shown or written from a cut copy.
+note Concurrent changes replay in git topological order.
+const CORFMAX ulong 262144
+const COCHMAX ulong 8192
+const COCMMAX ulong 8192
 text tcfer "for-each-ref"
 text tcsort "--sort=-committerdate"
 text tcfmtr "--format=%(objectname) %(refname:lstrip=-1)"
@@ -68,20 +74,24 @@ text tcreject "reject"
 text tcrevd "/home/drakestapleton/handoffs/hive/manager/reviews/"
 text tcvsuf ".verdict.txt"
 note refs of the current repo: tip and COB id per ref; gcui lists the first ref of each distinct id
-global gcfo uchar 40960
-global gcfi uchar 40960
+global gcfo uchar 10485760
+global gcfi uchar 10485760
 global gcfn ulong 1
-global gcui ulong 1024
+global gcui ulong 262144
 global gcun ulong 1
+note gcuh: open-addressing set of the distinct ids (ref index + 1), for coseen
+global gcuh ulong 524288
+note gcxfull: the action index of the current chunk was full (cogrep retries a smaller chunk)
+global gcxfull ulong 1
 note the COB being loaded, and a requested id prefix
 global gcid uchar 40
 global gcrq uchar 40
 global gcrql ulong 1
 note changes: id, author time, author NID (the part of the author email after @)
-global gcch uchar 20480
-global gccts ulong 512
-global gccau uchar 32768
-global gccal ulong 512
+global gcch uchar 327680
+global gccts ulong 8192
+global gccau uchar 524288
+global gccal ulong 8192
 global gccn ulong 1
 note model slots gcm: 0,1 title (pool off,len) 2 lifecycle (0 open 1 draft 2 archived/closed)
 note 3,4 labels 5,6 assignees 7,8 close reason 9 kind (1 patch 2 issue) 10 actions not understood
@@ -108,10 +118,10 @@ global gcws ulong 128
 global gcwt ulong 64
 global gcwn ulong 1
 note comments: revision index (9999 = none: an issue comment), body (off,len), change, redacted
-global gcqr ulong 512
-global gcqs ulong 1024
-global gcqt ulong 512
-global gcqx ulong 512
+global gcqr ulong 8192
+global gcqs ulong 16384
+global gcqt ulong 8192
+global gcqx ulong 8192
 global gcqn ulong 1
 note one git grep chunk: per output line the content range, change index and blob number
 global gcxa ulong 4096
@@ -195,6 +205,14 @@ x = fexec 10000000000
 if ne x 0
 ret false
 end
+note a ref list longer than fxo is not read as the whole list (an object past the cut would be a 404)
+if ne get fxotr 0 0
+fincut
+ret false
+end
+for i ulong len gcuh
+put gcuh i 0
+end
 n = get fxol 0
 p = ulong 0
 while lt p n bound 16777216
@@ -218,7 +236,9 @@ if eq cohexr add a 41 40 false
 ret
 end
 i = get gcfn 0
-if ge i 1024
+note CORFMAX is more lines than fxo holds, so this is not reached; it stays a refusal, not a cut
+if ge i CORFMAX
+fincut
 ret
 end
 for k ulong 40
@@ -232,14 +252,27 @@ put gcui u i
 put gcun 0 add u 1
 end
 end
-note coseen: ref i carries an id already listed in gcui
+note coseen: ref i carries an id already listed in gcui (true); else its id joins the set gcuh
 fn coseen i ulong to bool
-for j ulong get gcun 0
-if cofieq get gcui j i
+m = sub len gcuh 1
+h = ulong 14695981039346656037
+for k ulong 40
+c = ulong get gcfi add mul i 40 k
+h = mul xor h c 1099511628211
+end
+j = and h m
+for it ulong len gcuh
+v = get gcuh j
+if eq v 0
+put gcuh j add i 1
+ret false
+end
+if cofieq sub v 1 i
 ret true
 end
+j = and add j 1 m
 end
-ret false
+ret true
 end
 fn cofieq x ulong y ulong to bool
 for k ulong 40
@@ -321,6 +354,10 @@ ret true
 end
 note ---- change list from `git log --format=%H %at %ae`
 fn colog to void
+note a change list longer than fxo would lose changes: the object is not whole
+if ne get fxotr 0 0
+put gcov 0 1
+end
 n = get fxol 0
 p = ulong 0
 while lt p n bound 16777216
@@ -340,7 +377,7 @@ if eq cohexr a 40 false
 ret
 end
 ci = get gccn 0
-if ge ci 512
+if ge ci COCHMAX
 put gcov 0 1
 ret
 end
@@ -391,8 +428,9 @@ text tced "ssh-ed25519"
 text tcb58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 global gcsg uchar 72
 global gcbn uchar 64
-note cosig s e: set the author NID of changes s..e-1 from `git rev-list --header` (raw commits, NUL-separated)
-fn cosig s ulong e ulong to void
+note cosig s e: set the author NID of changes s..e-1 from `git rev-list --header` (raw commits,
+note NUL-separated); false when that output did not fit fxo (coreplay retries a smaller chunk)
+fn cosig s ulong e ulong to bool
 fkgit
 fka tcrevl
 fka tcnwu
@@ -402,18 +440,19 @@ cokch add s i
 end
 x = fexec 10000000000
 if ne get fxotr 0 0
-put gcov 0 1
+ret false
 end
 if ne x 0
-ret
+ret true
 end
 n = get fxol 0
 p = ulong 0
-while lt p n bound 1024
+while lt p n bound 16777216
 q = cofindb p n 0
 cosigrec p q s e
 p = add q 1
 end
+ret true
 end
 fn cosigrec a ulong b ulong s ulong e ulong to void
 if lt sub b a 41
@@ -620,20 +659,44 @@ covlook r
 end
 ret true
 end
+note coreplay: changes in chunks of up to 32 (one rev-list and one git grep each). A chunk whose
+note output does not fit fxo, or whose action lines do not fit the index, is read again in halves, so
+note no number of changes is cut by those buffers; one change that does not fit alone makes the object
+note not whole (gcov), and it is never shown as if it were.
 fn coreplay to void
 n = get gccn 0
 s = ulong 0
-while lt s n bound 64
-e = add s 32
+c = ulong 32
+while lt s n bound 1048576
+e = add s c
 if gt e n
 e = n
 end
-cosig s e
-cogrep s e
+if coplay s e
+s = e
+c = 32
+else
+if gt sub e s 1
+c = div sub e s 2
+else
+put gcov 0 1
 s = e
 end
 end
-fn cogrep s ulong e ulong to void
+end
+end
+note coplay s e: the signatures and actions of changes [s, e); false when their output did not fit, and
+note then no action of the chunk was applied
+fn coplay s ulong e ulong to bool
+if not cosig s e
+ret false
+end
+ret cogrep s e
+end
+note cogrep s e: git grep of the action blobs of changes [s, e), indexed, then applied in change order;
+note false (nothing applied) when the output did not fit fxo or the index. Exit 1 is git grep's "no
+note line": nothing to apply. Any other failure makes the object not whole.
+fn cogrep s ulong e ulong to bool
 fkgit
 fka tcgrep
 fka tcopta
@@ -648,18 +711,27 @@ end
 fka tcdd
 x = fexec 10000000000
 if ne get fxotr 0 0
-put gcov 0 1
+ret false
+end
+if eq x 1
+ret true
 end
 if ne x 0
-ret
+put gcov 0 1
+ret true
 end
 coidx s e
+if ne get gcxfull 0 0
+ret false
+end
 for i ulong sub e s
 coapch add s i
 end
+ret true
 end
 fn coidx s ulong e ulong to void
 put gcxn 0 0
+put gcxfull 0 0
 n = get fxol 0
 p = ulong 0
 while lt p n bound 16777216
@@ -684,12 +756,14 @@ if ge ci e
 ret
 end
 k = conum add a 41 z
+note an action blob past number 4095 cannot be indexed: the change is not read whole
 if gt k 4095
+put gcov 0 1
 ret
 end
 j = get gcxn 0
 if ge j 4096
-put gcov 0 1
+put gcxfull 0 1
 ret
 end
 put gcxa j add z 1
@@ -961,7 +1035,7 @@ coacom ci a e corevix cokey a e tcrevis e
 end
 fn coacom ci ulong a ulong e ulong ri ulong to void
 q = get gcqn 0
-if ge q 512
+if ge q COCMMAX
 put gcov 0 1
 ret
 end
@@ -1017,7 +1091,7 @@ ret ulong 9999
 end
 fn coacedit a ulong e ulong to void
 q = cocomix cokey a e tcid e
-if gt q 511
+if ge q COCMMAX
 coskip
 ret
 end
@@ -1029,7 +1103,7 @@ put gcqs add mul q 2 1 l
 end
 fn coacred a ulong e ulong to void
 q = cocomix cokey a e tcid e
-if lt q 512
+if lt q COCMMAX
 put gcqx q 1
 end
 end
