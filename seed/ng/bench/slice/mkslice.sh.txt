@@ -1,0 +1,47 @@
+#!/bin/bash
+# ng-bench slice fixture builder (scratch; copied into evidence as mkslice.sh.txt). Usage:
+#   mkslice.sh REPO BENCHTREE OUT
+# REPO: a git repo holding commits FRONT and A64 below; BENCHTREE: checkout of ng/bench-slice (kernels, omc, base want);
+# GCCDIR: the baseline gcc -O2 binaries (checked against BENCHTREE's baseline manifest). Writes OUT/fixture
+# (bin/ARM/CASE, want, manifest.sha256) and OUT/slice-manifest.sha256 (tools, IR, ELFs).
+set -u
+FRONT=3353ad670f60bcd8ed2510c6cd2cb1cf0b7b199e
+A64=e70c12346
+REPO=$1; B=$2; O=$3; GCCDIR=${GCCDIR:-/tmp/ngb/base/bin/gccO2}
+T="taskset -c 1 nice -n 10"
+CASES="arith branch leafcall fib38 fib40 isort sieve sort matmul"
+rm -rf $O; mkdir -p $O/front $O/a64 $O/ir $O/fixture/want
+A64=$(git -C $REPO rev-parse $A64^{commit}) || exit 3
+git -C $REPO archive $FRONT | tar -x -C $O/front || exit 3
+git -C $REPO archive $A64 | tar -x -C $O/a64 || exit 3
+for d in front a64; do
+  (cd $O/$d && cat seed/ng/sha256.om seed/ng/ngbuild.om | $T seed/out/omc > ngbuild && chmod +x ngbuild &&
+   $T ./ngbuild build seed/out/omc seed/ng/ng.units $O/ng-$d) 2>> $O/build.log || { echo "FAIL build ng-$d"; exit 4; }
+done
+(cd $O/a64 && cat seed/ng/sha256.om seed/ng/ngcheck.om | $T seed/out/omc > $O/ngcheck) || { echo "FAIL build ngcheck"; exit 4; }
+chmod +x $O/ng-front $O/ng-a64 $O/ngcheck
+for a in omc ngA ngS ngT gccO2; do mkdir -p $O/fixture/bin/$a; done
+bad=0
+for k in $CASES; do
+  src=$B/seed/ng/bench/kernels/$k.om
+  cmp -s $src $O/front/seed/ng/front/kernels/$k.om || { echo "FAIL source $k differs from front's copy"; bad=1; }
+  $T $B/seed/out/omc < $src > $O/fixture/bin/omc/$k || { echo "FAIL omc $k"; bad=1; }
+  cp $O/fixture/bin/omc/$k $O/fixture/bin/ngA/$k
+  { printf '@ng front-ir\n'; cat $src; } | $T $O/ng-front > $O/ir/$k.ir 2> $O/ir/$k.err || { echo "FAIL front $k"; bad=1; continue; }
+  $T $O/ngcheck < $O/ir/$k.ir > $O/ir/$k.ck 2>&1 && grep -q '^ACCEPT ' $O/ir/$k.ck || { echo "FAIL ngcheck $k"; bad=1; continue; }
+  { printf '@ng a64\n'; cat $O/ir/$k.ir; } | $T $O/ng-a64 > $O/fixture/bin/ngS/$k 2> $O/ir/$k.Serr || { echo "FAIL a64 $k"; bad=1; }
+  { printf '@ng a64 split\n'; cat $O/ir/$k.ir; } | $T $O/ng-a64 > $O/fixture/bin/ngT/$k 2> $O/ir/$k.Terr || { echo "FAIL a64 split $k"; bad=1; }
+  cp $GCCDIR/$k $O/fixture/bin/gccO2/$k
+  g=$(sha256sum < $GCCDIR/$k | cut -c1-64)
+  grep -q "^$g  bin/gccO2/$k\$" $B/seed/ng/bench/evidence/20261107T0830Z-baseline-v2/manifest.sha256 || { echo "FAIL gccO2 $k not the baseline binary"; bad=1; }
+  cp $B/seed/ng/bench/kernels/want/$k.sha256 $O/fixture/want/$k.sha256 || { echo "FAIL want $k"; bad=1; }
+done
+chmod +x $O/fixture/bin/*/*
+(cd $O/fixture && sha256sum bin/*/* > manifest.sha256)
+{
+  echo "# front $FRONT  a64 $A64  omc(bench) $(sha256sum < $B/seed/out/omc | cut -c1-64)"
+  (cd $O && sha256sum ng-front ng-a64 ngcheck ir/*.ir)
+  (cd $O/fixture && sha256sum bin/*/* want/*)
+} > $O/slice-manifest.sha256
+echo "build bad=$bad"
+exit $bad
