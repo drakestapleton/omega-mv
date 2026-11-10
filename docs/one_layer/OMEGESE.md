@@ -880,7 +880,11 @@ checked (`m-twinall`, sparing the dead twins of live slots too), and `s5-scrub-f
 locals, a held float operand and a float call argument back after scrub (`m-twinnone`, zeroing V0-V31).
 `s5-scrub-pin` reads a pinned global base and a pinned length back after scrub (`m-pinlo`, the pins not set
 back: trap 3), and `s5-scrub-lateglob` reads a global declared after a scrubbing function (`m-pinshut`,
-that global pinned anyway: its register is cleared and not restored, trap 3).
+that global pinned anyway: its register is cleared and not restored, trap 3). `s5-scrub-chain` reaches
+the scrub through two calls compiled before a long global (pinned anyway: trap 3), `s5-scrub-latebase`
+writes and reads a short global (a base pin only) declared after the scrubbing function (pinned anyway: a
+store through base 0, SIGSEGV), and `s5-scrub-inl` is the ordering control: an inline scrubbing function
+written before the global is compiled at its call site in main, after the global, so it keeps the pins.
 
 - **`dit v`** (v int, else error 7) sets PSTATE.DIT (Arm ARM C5.2.4, FEAT_DIT; bit 24 of the DIT
   special-purpose register) and gives the previous bit as 0 or 1. v outside {0, 1} (a negative int too)
