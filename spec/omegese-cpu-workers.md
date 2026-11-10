@@ -50,7 +50,11 @@ inherited scheduler state. Pool locking remains the launcher's responsibility.
 
 The priority child independently reads /proc/thread-self/stat field 19. Offset checks
 use off 9 with sentinels; AArch64 and x86 offset-removal mutants must fail at
-fixture exit 14. Set/get syscall-swap mutants must fail at exit 3. Caller cases
+fixture exit 14. Set/get syscall-swap mutants must fail at exit 3. The fixture
+also pins the last inherited core and checks cpunow there (exit 17/18), so a
+cpunow that ignores the getcpu result fails even when the first inherited core
+is CPU 0; the AArch64 and x86 load-removal mutants must fail at exit 18, which
+needs an inherited mask of two or more cores (every queen pool). Caller cases
 compose the existing run.om helpers with only its main replaced: cpk1, runpk,
 child and selfpin run unchanged, then a real conductor child checks its single
 allowed core and priority. Invalid CPU 1024 is refused with exit 118.
