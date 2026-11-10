@@ -11,8 +11,10 @@ The seeded tables kw and kw2 in seed/omc/omc.om and OMEGESE sections 9, 10, 12 a
 Y means lowered, P partial, N not lowered, R a reserved spelling without an accepted executable form.
 A word being listed Y does not claim that a program containing other missing constructs lowers.
 Counts below are MEASURED tracked-file whole-word occurrences across seed/, om/, tests/ (1488 .om files),
-including notes and negative fixtures. OM-2-only counts use the 635 files with an om2 header. Counts rank
-investigation demand, not executed use or language acceptance. The packed C2 manifest is surveyed separately.
+including notes and negative fixtures. OM-2-only counts (nominal, layout, fresh, contract, hygiene and unit words)
+use 635 files: the 634 with an `om2` line plus seed/omc/omc.om, whose notes name every word, so OM-2 units alone
+give each of those counts one less. Counts rank investigation demand, not executed use or language acceptance.
+The packed C2 manifest is surveyed separately.
 
 | Words or construct | Baseline IR emitted | Same behavior | Gap |
 |---|---|---|---|
@@ -49,7 +51,8 @@ investigation demand, not executed use or language acceptance. The packed C2 man
 2. Shift operand types: shl 259, shr 230. Baseline survey first blocker in 131 packed/current inputs.
 3. Data edge cases: arrays new 445, globals 331, text 308, view 316, edit 259, const 103, qty 75;
    layout 71, field 68, struct 63; fresh 45; nominal abstract 52, holds 67, seal 49, open 34.
-4. Contracts: requires 30, ensures 18, invariant 17, result 21; policies release 11, debug 1, diag 45.
+4. Contracts: requires 30, ensures 18, invariant 17, result 21; header policies on each file's first om2 line:
+   release 12, debug 1, diag 46 (fmt 11).
 5. Float intrinsics: fma 16, fmin 7, fmax 7; hygiene scrub 13, dit 7.
 6. Units: export 28, out 72 (whole-word counts include prose); function-mode IR entry requires an IR-owner change.
 
@@ -113,7 +116,10 @@ All entries are N at baseline except read/write/monons/realns, which are Y.
 
 All 5874 packed C2 sources and 1488 tracked .om sources were sent through front-ir (7362 inputs).
 Two cyclic size-generator C2 inputs were not materialized in this survey; FRONTGATE covers them.
-The resulting table is kept outside the repository in the owning worktree's uncommitted run/sv/ evidence, named in the external handoff.
+The per-input result tables are uncommitted lane evidence (no hand-off names their path); their sha256 values are
+tree.tsv 1319f3cdc9a1896472a0b365ed3b50fef7dfe5b88ad7d26310436ed0199c3ea7 (1488 rows),
+c2.tsv 95d0a7b52ef52d9d9a191fcc7c30b3e9073d733c71c8565270ab39c27a395058 (5874 rows) and
+site.tsv 7c7bfa56a76cbeaec867e8894f6ebff0761b50b023dd53139824089c3fb3412f (7362 rows).
 674 emitted IR (this alone is not behavioral parity); 850 reached a lowering/scope refusal. Other inputs were rejected by the check pass.
 First refusal site counts (not additive demand estimates): no main 250, missing value dispatcher 220 (172 host-bearing first-blocker lines, 48 other expressions),
 unequal shift types 131, D8 scope 116, non-int main signature 42, top-level declaration 19,
