@@ -27,6 +27,21 @@ the locked path (37 checks).
 seeded compiler currently reads one source file. Module/import support is a compiler capability
 dependency; it is not a reason to keep a legacy implementation.
 
+## OM2 composition regression
+
+`action.om` also composes into OM2 units. Its identity-binding local is named `ix`,
+because `at` is reserved in OM2. The transition logic is unchanged. The dedicated
+fixture checks equal identities and a mismatch in each of the 24 identity words.
+Run from the repository root, using a fresh output directory:
+
+```sh
+out=$(mktemp -d)
+{ printf 'om2\n'; cat seed/authority/action.om seed/authority/action-om2-test.om; } > "$out/action-om2.om"
+seed/out/omc < "$out/action-om2.om" > "$out/action-om2"
+chmod +x "$out/action-om2"
+"$out/action-om2"
+```
+
 ## Run
 
 ```

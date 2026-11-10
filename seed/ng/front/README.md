@@ -26,6 +26,10 @@ and accept what omc accepts (DECISIONS D5, D6, D9):
 Since the first commit `src/front.om` is edited directly (the OM-2 renames `at`, `big`, `ops` to
 `atp`, `bigf`, `opsb`; `fe_run` split into main.om's input and `fe_check`), so the tools are the
 record of how it was derived, not a way to rebuild it. The gate checks the result.
+Long names (omc `omc/long-names` 2e20b286, omc `564c5835`) were carried over by hand at the same omc sites:
+`fe_tok2` interns a word of 9..63 bytes as the packed word 1 + 256 * index (`f_ln_*`, `f_tw8`), the 14 name
+checks omc raised from 8 to 63 bytes are raised here, and `fe_mput_name`, `fe_findfn`, `fe_newname`,
+`fe_rdval` and `fe_stmt` follow omc. Abstract, layout, layout-field and IR-mode names stay at 8 as in omc.
 
 ## What is not reproduced (D6)
 
@@ -48,7 +52,7 @@ main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc 0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f \
+    gate-front seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt
@@ -103,7 +107,7 @@ calls: both are omc code-shape choices with the same results.
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc 0f2de85153b07656f4b992d101272987fe6ed1eee471ef70b132a37f5ba6b02f \
+    gate-front-ir seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
 It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
@@ -111,7 +115,9 @@ case compiles the unit with omc and runs it, lowers it with ng, requires ngcheck
 ngrun and compares exit status and stdout (stderr is free: the kernels time themselves there); for each
 `refuse` case ng's exit and stderr must equal omc's with empty stdout. Cases: the 15 run pairs of
 `seed/ng/tests/ir`, two default-fuel run units of `cases/` (`fuel_while`, `fuel_for`: no bound, trap 4
-after 1000000 passes), two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
+after 1000000 passes), two signed `for` latch units of `cases/` (`for_latch_i8`, `for_latch_i64`: the body
+writes the counter's maximum and the latch's add 1 traps 1, as omc's does; fe_lendl adds it under chk.add),
+two slice cases (`runs/p-part.om`, its `part` traps 3, and `runs/p-partok.om`), the
 thirteen ng-bench kernels (the OM-2 crypto units sha, chacha, x25519 last) and 30 refusal units of
 `cases/`. ngrun interprets (90-470x native) and has no step cap yet, so twelve kernels run as reduced
 copies (`runs/`, loop counts and sizes only, `runs/PROVENANCE.md` lists each change; approved by the
@@ -126,3 +132,23 @@ as ok, FAIL, a kill or a trip. Negative controls: three lowering mutants (the `f
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
 Last line `FRONTIRGATE PASS|FAIL|NOT_RUN ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
+
+## Native contracts: fail-closed lowering boundary
+
+The check pass validates native contracts, but the M1 lowering does not implement them. Every
+`requires`, `ensures` and `invariant` clause is therefore refused in front-ir with the existing
+not-lowered exit 64, before any IR is written. A short clause word must never be interpreted as
+an ordinary assignment that silently removes its runtime check. OM-1 names retain their meaning.
+
+The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
+the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
+
+    gate-front seed/out/omc 564c5835f307a65c07908eb5bd236addb060a42f44cfb7ac496879195486c999 \
+      units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
+      seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
+      seed/ng/front/cases-contract-scope.txt
+
+Its guard-removal mutant restores the silent path and must be KILLED. This is a scope-safety gate,
+not contract execution parity. Before the guard, these fixtures emitted IR and ran without the
+required trap. Real lowering must replace this boundary with chk.true checks at entry, every
+normal return and each loop head, with the seeded debug/release policy and trap codes.

@@ -594,7 +594,8 @@ def current_c2_contract(fields):
     for relative in ("seed/qualification/om2/manifest-c2-capacity.txt",
                      "seed/qualification/om2/manifest-c2-batch2.txt",
                      "seed/qualification/om2/manifest-c2-fpvreg.txt",
-                     "seed/qualification/om2/manifest-c2-closerange.txt"):
+                     "seed/qualification/om2/manifest-c2-closerange.txt",
+                     "seed/qualification/om2/manifest-c2-longnames.txt"):
         path = ROOT / relative
         for line in path.read_text().splitlines():
             replacement = line.split()

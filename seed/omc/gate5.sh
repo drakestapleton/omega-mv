@@ -66,9 +66,13 @@ n=\$(ls $C | wc -l); f=$C/\$(printf '%04d' \$n).in; cat > \$f; exec $R4/om4.bin 
 EOF
 chmod +x $B/cap.sh
 g4() { # compiler build-dir evidence-dir -> gate4 with the compiler in om4's place
+  # gate4's error-13 case names a 9-byte variable, over om4's 8 bytes; omc accepts names up to 63 bytes, so here
+  # (the capturing run and the omc run alike) the case names a 64-byte one, error 13 from both.
+  l13="s/^t 13 'fn f a uint to uint\\\\nabcdefghi = a\\\\nret a\\\\nend\\\\n'/t 13 'fn f a uint to uint\\\\nabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl = a\\\\nret a\\\\nend\\\\n'/"
   sed -e "s|^R=seed/rung4; B=build/seed/r4; E=[\$]B/evidence; REC=evidence/SEED-0/rung4;|R=seed/rung4; B=$2; E=$3; REC=;|" \
-      -e "s#\\\$R/om4\\.bin < #$1 < #g" -e "s#| \\\$R/om4\\.bin #| $1 #g" $R4/gate4.sh > $2.sh
+      -e "s#\\\$R/om4\\.bin < #$1 < #g" -e "s#| \\\$R/om4\\.bin #| $1 #g" -e "$l13" $R4/gate4.sh > $2.sh
   [ "$(grep -c "$1" $2.sh)" = 7 ] || { bad "gate4 changed shape: the compiler is not in its 7 places"; return 1; }
+  grep -q "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl = a" $2.sh || { bad "gate4 changed shape: its error-13 case was not renamed"; return 1; }
   grep -q "^R=seed/rung4; B=$2; E=$3; REC=;" $2.sh || { bad "gate4 changed shape: its result and receipt directories are not set"; return 1; }
   NF_N=0 sh $2.sh > $2.out 2>&1 && tail -1 $2.out | grep -q "^GATE4 PASS$" # section 10 (next fuzz of om4 alone) is run by gate4 itself
 }
@@ -120,7 +124,8 @@ printf 'fn f a uint to uint\nret a\nend\n' > $B/ok.om; ecase 1 / $B/e.out; ecase
 printf 'fn f to uint\nret add\nend\n' > $B/e4.om; ecase 4 $B/e4.om $B/e.out
 printf 'fn f to uint\nret add 1 2\nend\n' > $B/e11.om; ecase 11 $B/e11.om $B/e.out
 { echo 'fn f to uint'; for i in $(seq 1 17); do echo "v$i = uint $i"; done; echo 'ret 0'; echo 'end'; } > $B/e12.om; ecase 12 $B/e12.om $B/e.out
-printf 'fn f to uint\nabcdefghi = uint 1\nret 0\nend\n' > $B/e13.om; ecase 13 $B/e13.om $B/e.out
+#    error 13 with a 64-byte name: om4 refuses names over 8 bytes, omc names over 63 (OMEGESE.md section 4)
+printf 'fn f to uint\nabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl = uint 1\nret 0\nend\n' > $B/e13.om; ecase 13 $B/e13.om $B/e.out
 yes 'note filler' | head -c 9000000 > $B/e14.om; ecase 14 $B/e14.om $B/e.out
 cases=$((cases + 10))
 
