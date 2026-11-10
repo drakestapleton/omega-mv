@@ -8,7 +8,9 @@ Tests: `make test-osc-gpu` (host simulator), `make test-osc-gpu-chip` (the GB10)
 
 CUDApp integration numbering (2026-11-10): BlackwellIR reserves opcode 64 for
 CUDApp main's ATOMG MIN. The unsigned conversion producers use 65 (I2FP_U32)
-and 66 (F2I_U32), matching the C migration oracle enum. This is the internal
+and 66 (F2I_U32), matching the C migration oracle enum. The carried encoder copy and checked
+bindings use the same two rows as CUDApp; CUDApp remains the encoder owner.
+This is the internal
 BlackwellIR numbering, not OSC IR version 8; OSC wire opcodes and version stay
 unchanged. Historical receipts are not renumbered. The CUDApp consumer must
 repin its C1 source together with the encoder change.
