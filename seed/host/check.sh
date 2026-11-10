@@ -38,7 +38,7 @@ run=$(mktemp -d "$B/run.XXXXXX")
 "$B/gate" seed/out/omc "$pin" seed/omc/cflow/cflow.cases "$run/cflow"
 # OM-2 dit and scrub (OMEGESE 9.13.1): s5 cases, and every s5 omc.om mutant detected (ctl-* PASS, m-* FAIL).
 "$B/gate" seed/out/omc "$pin" seed/omc/om2/s5/s5.cases "$run/s5" > "$run/s5.log" || { cat "$run/s5.log"; exit 1; }
-grep -qx 'OM2GATE PASS cases=23 pass=23 fail=0 invalid=0 not_run=0' "$run/s5.log"
+grep -qx 'OM2GATE PASS cases=26 pass=26 fail=0 invalid=0 not_run=0' "$run/s5.log"
 if "$B/gate" seed/out/omc "$pin" seed/omc/om2/s5/s5-mutants.cases "$run/s5mut" > "$run/s5mut.log"; then
     echo 'FAIL dit/scrub mutant survived' >&2
     exit 1
@@ -49,7 +49,7 @@ fi
 grep -qx 'OM2GATE FAIL cases=20 pass=9 fail=11 invalid=0 not_run=0' "$run/s5mut.log"
 [ "$(grep -c '^VERDICT ctl-[a-z-]* PASS ' "$run/s5mut.log")" = 9 ]
 [ "$(grep -c '^VERDICT m-[a-z0-9]* FAIL ' "$run/s5mut.log")" = 11 ]
-echo 'PASS dit/scrub (23 cases) and 11 omc.om mutants detected'
+echo 'PASS dit/scrub (26 cases) and 11 omc.om mutants detected'
 # Every OM-2 case and mutant file (s1..s5, bnd, fnhost, hex), with two negative controls (ROADMAP-1.0 RM1).
 sh seed/qualification/om2/every.sh
 # Error-site coverage (ROADMAP-1.0 RM8): reached omc error sites may not fall below seed/omc/sitecov.floor.
