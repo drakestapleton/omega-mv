@@ -1,0 +1,20 @@
+s = <|{"LICM+ROT","bcopy"}->{0.6736,0.6733,0.7330},{"LICM+ROT","arith"}->{0.9967,0.9964,0.9969},{"LICM+ROT","branch"}->{0.9364,0.9359,0.9371},{"LICM+ROT","isort"}->{0.6834,0.6829,0.6841},{"LICM+ROT","sort"}->{0.6819,0.6815,0.6825},{"LICM+ROT","matmul"}->{0.7566,0.7549,0.7615},{"LICM+ROT","sieve"}->{0.7744,0.7692,0.7779},{"LICM+ROT","linear"}->{1.0241,1.0232,1.0255},{"BCE","bcopy"}->{0.7733,0.7146,0.7767},{"BCE","isort"}->{0.9781,0.9771,0.9794},{"BCE","sort"}->{0.9793,0.9786,0.9796},{"BCE","matmul"}->{1.0437,1.0372,1.0483},{"BCE","sieve"}->{0.9739,0.9670,0.9812},{"BCE","linear"}->{0.9888,0.9870,0.9893},{"VEC","bcopy"}->{0.0619,0.0617,0.0623},{"DIV","arith"}->{0.3320,0.3303,0.3332},{"IFC","branch"}->{0.8950,0.8942,0.8954},{"CALL","leafcall"}->{0.3627,0.3622,0.3633},{"INL","leafcall"}->{0.8407,0.8335,0.8450},{"ISEL","linear"}->{0.9082,0.9076,0.9091}|>;
+aa = <|"bcopy"->{1.0000,0.9998,1.0002},"arith"->{1.0000,0.9991,1.0003},"branch"->{1.0001,0.9991,1.0009},"isort"->{1.0002,0.9992,1.0004},"sort"->{0.9996,0.9994,1.0001},"leafcall"->{1.0002,0.9993,1.0006},"matmul"->{1.0003,0.9966,1.0030},"sieve"->{1.0001,0.9998,1.0005},"linear"->{0.9998,0.9994,1.0005}|>;
+fibA = <|"fib40"->0.578,"fib38"->0.591|>; fibE = <|"fib40"->0.35,"fib38"->0.357|>;
+f = <|"bcopy"->{(18-11)/18,(11-7)/11},"arith"->{(17-11)/17,0},"branch"->{(18-12)/18,0},"isort"->{(28-14)/28,(14-7)/14},"sort"->{(24-14)/24,(14-7)/14},"matmul"->{(22-13)/22,(13-9)/13},"sieve"->{(19-9)/19,(9-4)/9},"linear"->{(20-17)/20,(17-13)/17}|>;
+aaok = Select[Keys[aa], !(aa[#][[2]] <= 1 <= aa[#][[3]] || 0.99 <= aa[#][[1]] <= 1.01) &];
+eL = Table[(1 - s[{"LICM+ROT", k}][[1]])/f[k][[1]], {k, {"bcopy","arith","branch","isort","sort","matmul","sieve","linear"}}];
+eB = Table[(1 - s[{"BCE", k}][[1]])/f[k][[2]], {k, {"bcopy","isort","sort","matmul","sieve","linear"}}];
+e = Median[Join[eL, eB]];
+p = <|{"sha","LICM+ROT"}->9/3650, {"sha","BCE"}->136/3650, {"sha","CALL"}->52/3650, {"chacha","LICM+ROT"}->1072/6871, {"chacha","BCE"}->1902/6871, {"chacha","CALL"}->178/6871|>;
+mod = Association[Table[k -> 1 - e p[k], {k, Keys[p]}]];
+passes = {"LICM+ROT","BCE","VEC","DIV","IFC","CALL","INL","ISEL","REC"};
+meas[P_] := Join[Table[s[k][[1]], {k, Select[Keys[s], #[[1]] == P &]}], If[P == "CALL", Values[fibA], {}], If[P == "REC", Table[fibE[c]/fibA[c], {c, {"fib40","fib38"}}], {}]];
+modl[P_] := Table[mod[k], {k, Select[Keys[mod], #[[2]] == P &]}];
+gm[x_] := 1/(Times @@ x)^(1/13);
+nd = Select[Keys[s], s[#][[2]] <= 1 <= s[#][[3]] &];
+slower = Select[Keys[s], s[#][[2]] > 1 &];
+rank = SortBy[Table[{P, N[gm[meas[P]]], N[gm[Join[meas[P], modl[P]]]], Length[meas[P]], Length[modl[P]]}, {P, passes}], -#[[3]] &];
+all = N[gm[Join[Flatten[Table[meas[P], {P, passes}]], Values[mod]]]];
+bc = <|"bcopy"->{30.7000,30.3800},"arith"->{3.4688,3.4452},"branch"->{1.8672,1.8642},"isort"->{1.9817,1.9825},"sort"->{2.7248,2.7187},"leafcall"->{3.4064,3.3951},"matmul"->{1.6703,1.6634},"sieve"->{2.0802,2.0737},"linear"->{1.2459,1.2452}|>;
+N[gm[Flatten[Table[meas[P], {P, passes}]]]]
