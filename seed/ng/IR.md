@@ -874,6 +874,15 @@ per function:
    placed before h and every outside predecessor (`br` or `cbr`) branches to it instead. A new block
    is added only within the limits of s12 (blocks, ops and values per function and per unit); a loop
    that would need one past them keeps none, and LICM leaves that loop alone.
+1a. **PHI.** A block parameter other than the token whose arguments, over every `br` that targets
+   its block, are one value v or the parameter itself is replaced by v: its uses take v, and it
+   leaves the block's parameter list and each such `br` its argument (a block with a parameter
+   past its token is reached only by `br`, s9 rule 5). v dominates the block (s6.2): it is used at
+   the end of every predecessor, one of which lies outside every loop through the block. One
+   parameter per round, to a fixed point. A value an outer loop carries unchanged through an inner
+   loop's header is such a parameter, so LICM then sees its uses as invariant. Fixture `o-phi`
+   (one parameter stays, one goes); a PHI that kept a parameter's first argument even where another
+   `br` passes a different one changes its run (exit 16 for 18).
 2. **BCE** (pass origin 1, item 1 of s15). A `chk.bounds r i e` is replaced in place by
    `fact.inbounds 1 r i e` when e is a const >= 1, r is a REF to an ARRAY of count L, and i < X is
    known where the check runs with X - 1 + e <= L: i is a const (X = i + 1), or a block on the
