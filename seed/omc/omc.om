@@ -125,6 +125,18 @@ global ln_l uchar 4096
 global ln_h ulong 8192
 global ln_n ulong 1
 global tw8 ulong 1
+note ---- OM-2 pinned registers (AArch64 program mode only): X18..X26, which nothing else in a program names,
+note hold for the whole run the base address of the first globals and the length of a global whose length
+note is no CMP immediate. nm_pb / nm_pl: the base / length register of a global name (0: none); pinv the
+note value of pin p (register 18 + p), npin how many are taken. eof_prog sets them before main; scrub sets
+note them again after it clears X18..X26. pinshut: 1 once the body pass has begun a function; a global
+note declared after that gets no pin, because a scrub compiled before it would clear its register and
+note restore only the pins taken so far. ----
+global nm_pb uchar 8192
+global nm_pl uchar 8192
+global pinv ulong 9
+global npin ulong 1
+global pinshut ulong 1
 note ---- floats in v registers: kind 9 is a float held in v(16 + pool index of x register rv), the twin of
 note pool register rv; vsl marks each pool slot whose value lives in its twin (an f32/f64 local name, a
 note kind 9 value), saved and loaded as D around a call. fpw asks the next value read for kind 9 (1: a new
@@ -907,7 +919,7 @@ put tkb 0 get inlen 0
 put tk 0 3
 end
 
-note ======== keyword lookup (original om4 KWTAB plus native host words 100..177, flock 197, execpure 198, execenv 233 and prlimit 235) ========
+note ======== keyword lookup (original om4 KWTAB plus native host words 100..177, flock 197, execpure 198, execenv 233, prlimit 235 and cpuset..getprio 236..240) ========
 note genkw.awk describes the original om4 table only; retain the native host extension on regeneration.
 note efi (178) is a keyword only under `target x86efi`; gate18 checks that scoped entry separately.
 fn kw w ulong to ulong
@@ -1084,6 +1096,21 @@ ret 232
 end
 if eq w 32767015939502704
 ret 235
+end
+if eq w 127979077595235
+ret 236
+end
+if eq w 127978876268643
+ret 237
+end
+if eq w 131320478265443
+ret 238
+end
+if eq w 31359662648747379
+ret 239
+end
+if eq w 31359662648747367
+ret 240
 end
 if eq w 461229747302
 ret 197
@@ -2597,6 +2624,13 @@ global btyp ulong 512
 global bnames ulong 512
 global bheld ulong 512
 global bdead ulong 512
+note brot / bkk / bkr: a for whose test moved to its latch (OM-2, lpmark / lpback): the place the latch
+note branches back to (0: not moved), its number K, and its K register + 1 (0 when K is the number).
+note cphn: the head clauses the last cp_head emitted (OM-2).
+global brot ulong 512
+global bkk ulong 512
+global bkr ulong 512
+global cphn ulong 1
 global nb ulong 1
 global curfn ulong 1
 note ---- break fixups (1024): output offset of the branch, block index of the loop it leaves ----
@@ -3056,6 +3090,8 @@ put nm_fv n 0
 put nm_lay n 0
 put nm_fr n 0
 put nm_lr n 0
+put nm_pb n 0
+put nm_pl n 0
 put nn 0 add n 1
 end
 
@@ -3415,6 +3451,7 @@ put bhead n head
 put breg n reg
 put btyp n ty
 put bdead n 0
+put brot n 0
 put nb 0 add n 1
 note fz_push / fz_else / fz_join: the sets when block n opens; at its else (the then sets kept, the
 note opening sets back); at its end (kind k: 1 if, 2 else, 3 while, 4 for)
@@ -5212,6 +5249,8 @@ note Xt (C6.2.97), B.HS trap 3 (unsigned, so a negative signed index traps too).
 note (the array's register, or a new one holding its address), ea_i index register. om4 ELEMADDR.
 note OM-2 unsized array (unsz): every index, a number too, is checked against its count register nm_lr
 note (CMP Xi, Xn; B.HS trap 3); none is eliminated (spec 4, 6).
+note OM-2 global with a pinned register (pinset): the base is that register and a long length is compared
+note with its pinned register (CMP Xi, Xp), so neither is rebuilt with MOVZ/MOVK at each access.
 fn elemaddr e ulong k ulong v ulong t ulong to void
 if ne get xtarget 0 0
 xelem e k v t
@@ -5243,18 +5282,26 @@ else
 if le ln 4095
 emit or or 4043309087 shl ln 10 shl v 5
 else
+if ne get nm_pl i 0
+emit or or 3942645791 shl ulong get nm_pl i 16 shl v 5
+else
 y = alloc
 matconst y ln
 emit or or 3942645791 shl y 16 shl v 5
+end
 end
 trapc 2 3
 end
 end
 put ea_i 0 x
 if ge get nm_kind i 4
+if ne get nm_pb i 0
+put ea_b 0 ulong get nm_pb i
+else
 b = alloc
 matconst b get nm_addr i
 put ea_b 0 b
+end
 else
 put ea_b 0 ulong get nm_reg i
 end
@@ -5919,6 +5966,9 @@ end
 if eq c 197
 ret 2
 end
+if eq c 240
+ret 2
+end
 ret 3
 end
 fn hsysno c ulong to ulong
@@ -6005,6 +6055,12 @@ ret 242
 end
 if eq c 107
 ret 220
+end
+if eq c 239
+ret 140
+end
+if eq c 240
+ret 141
 end
 ret 24
 end
@@ -7072,6 +7128,47 @@ patch26 bad get oc 0
 hreturn dst x
 end
 
+note cpuset 236 / cpuget 237 pid A off n: Linux sched_setaffinity 122 / sched_getaffinity 123 (ARM64),
+note X0 pid (int; 0 is the calling thread), X1 n, X2 &A[off]. The byte slice is checked like every host
+note slice (trap 3); cpuset only reads it, cpuget writes it (a text is error 20). cpuset gives 0 or minus
+note errno (a mask with no online permitted CPU is -22); cpuget gives the bytes the kernel wrote (its
+note cpumask size) or minus errno (n below that size or not a multiple of 8 is -22). cpunow 238, no
+note operands: getcpu 168 into a 16-byte stack slot, node NULL; the CPU the calling thread ran on at the
+note call (LDR W0 from the slot only when X0 is not negative), or minus errno.
+fn hsched c ulong dst ulong x ulong to void
+if eq c 238
+save
+spsub 16
+stkchk
+emit 2432697312
+matconst 1 0
+matconst 2 0
+hsys 168
+emit 4043309087
+bad = get oc 0
+emit 1409286155
+mimmed 3107979264 0 31 0
+patch19 bad get oc 0
+spadd 16
+hreturn dst x
+ret
+end
+harg x 2 8
+w = ulong 0
+if eq c 237
+w = ulong 1
+end
+e = harray x w
+save
+hload x 2 0
+basearg 2 e
+loadarg 16 1 get fr add x 21
+e3 2332033024 2 2 16
+loadarg 1 1 get fr add x 22
+hsys add 122 w
+hreturn dst x
+end
+
 note SO_PEERCRED: fixed 12-byte ucred result, never a caller-chosen getsockopt operation.
 fn hpeercr dst ulong x ulong to void
 harg x 4 8
@@ -8060,6 +8157,14 @@ if eq c 235
 hprlim dst x
 ret
 end
+if and ge c 236 le c 238
+hsched c dst x
+ret
+end
+if or eq c 239 eq c 240
+hscalar c dst x
+ret
+end
 if eq c 221
 hpollfds dst x
 ret
@@ -8673,7 +8778,9 @@ note of a live slot j (below npar + nslot) whose value lives in its twin (vsl: a
 note held kind 9 float, as save stores it); a twin of a free slot or of a slot whose value is in its x
 note register holds nothing live. V0-V15 carry a float only inside one operation. Never touched: SP, X27
 note (the Linux initial stack under args), X28 (the stack floor), X30 (the return address), the live pool
-note registers and live twins, NZCV, FPCR, FPSR, and the SVE P registers and FFR. Gives long 0.
+note registers and live twins, NZCV, FPCR, FPSR, and the SVE P registers and FFR. Gives long 0. Pinned
+note registers (OM-2 global bases and lengths among X18..X26, pinset) are cleared with the rest, then set
+note back to their public constant values (pinlo), since later element accesses read them.
 harg x 0 5
 r = matreg get fr add x 8 get fr add x 9 5
 emit or 4064283679 shl r 5
@@ -8717,6 +8824,7 @@ emit or 1862329344 i
 end
 i = add i 1
 end
+pinlo
 put nslot 0 sl
 d = destreg dst
 matconst d 0
@@ -8731,7 +8839,7 @@ if eq c 224
 hostval c dst
 ret
 end
-if or and ge c 228 le c 232 or eq c 233 eq c 235
+if or or and ge c 228 le c 232 or eq c 233 eq c 235 and ge c 236 le c 240
 hostval c dst
 ret
 end
@@ -9308,6 +9416,7 @@ put curfn 0 add f 1
 put lastfn 0 add f 1
 put fn_addr f get oc 0
 put fstart 0 get oc 0
+put pinshut 0 1
 put fuel 0 0
 put fz_n 0 0
 end
@@ -9585,7 +9694,47 @@ end
 put poolb 0 s
 addname w 0 t n 4 a
 put nglob 0 get nn 0
+if ne om2cg 0
+pinset sub get nn 0 1 a n
+end
 eol
+end
+
+note om2cg: 1 when the unit gets the OM-2 AArch64 code improvements (an OM-2 unit, AArch64, not IR mode),
+note else 0. An OM-1 unit keeps om4's machine words exactly (gate5 compares them word for word).
+fn om2cg to ulong
+if and and ne get om2 0 0 eq get xtarget 0 0 eq get irmode 0 0
+ret 1
+end
+ret 0
+end
+
+note pinset: give global name i (address a, n elements) the next free pinned register for its base, then
+note one for its length when n is above 4095 (no CMP immediate); nothing once X18..X26 are all taken, and
+note nothing for a global declared after the first function body (pinshut).
+fn pinset i ulong a ulong n ulong to void
+p = get npin 0
+if or ge p 9 ne get pinshut 0 0
+ret
+end
+put nm_pb i uchar add 18 p
+put pinv p a
+p = add p 1
+if and gt n 4095 lt p 9
+put nm_pl i uchar add 18 p
+put pinv p n
+p = add p 1
+end
+put npin 0 p
+end
+
+note pinlo: MOVZ/MOVK (matconst) every pinned register X18 + p with its value pinv p
+fn pinlo to void
+p = ulong 0
+while lt p get npin 0
+matconst add 18 p get pinv p
+p = add p 1
+end
 end
 
 note s_text: text NAME "...": read-only bytes in the program image (escapes \n \t \\ \", any other is error
@@ -9698,6 +9847,53 @@ trapc 2 4
 emit or or 2432697344 c shl c 5
 end
 
+note lpmark: after pushb of a for in an OM-2 unit on AArch64 whose head ran no clause code (cphn 0): move its
+note test to the latch (lpback). br is the head's exit branch; the latch branches back to the word after it.
+note kk is K when K is a number, kr K's register + 1 when K is a value (0 for a number).
+fn lpmark br ulong kk ulong kr ulong to void
+if eq get om2 0 0
+ret
+end
+if ne get cphn 0 0
+ret
+end
+b = sub get nb 0 1
+put brot b add br 4
+put bkk b kk
+put bkr b kr
+end
+
+note lpback: the latch test of a for whose test moved there (block b): CMP Xi, #K (C6.2.96), CMP Xi, Xk or
+note CMP Xi, X(matconst K) (C6.2.97), then B.LO (unsigned) or B.LT (signed) back to the first word after
+note the head's exit branch (C6.2.34). The head keeps its test for the first pass only; every later pass
+note is tested here, after the increment, so a pass runs one branch instead of two. When K needs a register
+note and none is free here (alloc would be error 12), the latch is B head (C6.2.35), as without the move.
+fn lpback b ulong to void
+r = get breg b
+kr = get bkr b
+if ne kr 0
+emit or or 3942645791 shl sub kr 1 16 shl r 5
+else
+kk = get bkk b
+if le kk 4095
+emit or or 4043309087 shl kk 10 shl r 5
+else
+if ge add get npar 0 get nslot 0 16
+back get bhead b
+ret
+end
+m = alloc
+matconst m kk
+emit or or 3942645791 shl r 5 shl m 16
+end
+end
+cc = ulong 3
+if ge get btyp b 6
+cc = ulong 11
+end
+emit or or 1409286144 shl bdisp get oc 0 get brot b 19 5 cc
+end
+
 note s_while: while cond [bound N]: hidden counter = 0; head: cond false -> exit; counter >= N -> trap 4;
 note counter = counter + 1; body; B head. N is 1 .. 9223372036854775807 (error 8), 1000000 with no bound. om4 S_WHILE.
 fn s_while to void
@@ -9799,6 +9995,7 @@ if ne bn 0
 lpcnt c bn
 end
 pushb br 4 hd i t
+lpmark br kk 0
 pushnh sn sh
 cp_skip
 end
@@ -9833,6 +10030,7 @@ emit or or 3942645791 shl kr 16 shl i 5
 br = sf_br t
 lpcnt c n
 pushb br 4 hd i t
+lpmark br 0 add kr 1
 pushnh sn sh
 cp_skip
 end
@@ -10795,7 +10993,11 @@ j = add j 1
 end
 end
 if ge k 3
+if ne get brot i 0
+lpback i
+else
 back get bhead i
+end
 ex = get oc 0
 j = ulong 0
 while lt j get nbrk 0
@@ -10881,7 +11083,7 @@ end
 note eof_prog: program mode: start code = MOVZ X28, #0x1000, LSL 16 (stack pool floor); MOVZ X16, #0x1080,
 note LSL 16; MOV SP, X16 (ADD immediate, C6.2.5); BL main (C6.2.43); [MOVZ X0, #0 for a void main]; MOVZ X8,
 note #93; SVC #0. The entry word after the header is a B to it; the header gets the file and pool sizes.
-note om4 EOF_PROG.
+note om4 EOF_PROG. An OM-2 unit with pinned registers sets them (pinlo) just before the BL.
 fn eof_prog to void
 if ne get xtarget 0 0
 xeof
@@ -10902,6 +11104,7 @@ end
 emit 3533832220
 emit 3533836304
 emit 2432696863
+pinlo
 emit or 2483027968 bdisp get oc 0 get fn_addr sub f 1 26
 if eq get fn_ret sub f 1 12
 emit 3531603968
@@ -14883,6 +15086,7 @@ cp_eval 10 0
 n = add n 1
 k = cp_next
 end
+put cphn 0 n
 put cur 0 p
 put line 0 l
 end
@@ -15192,6 +15396,12 @@ nr = ulong 48
 end
 if eq c 197
 nr = ulong 73
+end
+if eq c 239
+nr = ulong 141
+end
+if eq c 240
+nr = ulong 140
 end
 xhcall nr
 xhdone dst x 0
@@ -15663,6 +15873,35 @@ ximm 7 18446744073709551516
 xrr 137 6 4
 xhcall 267
 xhdone dst x 4096
+end
+note Scheduler host words 236..238 on x86linux. Linux syscall_64.tbl: affinity 203/204, getcpu 309.
+fn xhsched c ulong dst ulong x ulong to void
+if eq c 238
+xhbegin
+xsp 1 16
+xrr 137 7 4
+ximm 6 0
+ximm 2 0
+xhcall 309
+xrr 133 0 0
+bad = xbranch 11
+xhraw 0 4 0 4
+xpatch bad get oc 0
+xhdone dst x 16
+ret
+end
+harg x 2 8
+w = ulong 0
+if eq c 237
+w = ulong 1
+end
+e = harray x w
+xhbegin
+xha x 2 7
+xhb 2 e get fr add x 21
+xhs 6 get fr add x 22
+xhcall add 203 w
+xhdone dst x 0
 end
 note prlimit (235) on x86-64: prlimit64 302, RDI pid, RSI res, RDX new, R10 old; n 16 reads (RDX 0, R10
 note &A[off]), n 32 sets (RDX &A[off], R10 &A[off+16]), other n -22 without a kernel call.
@@ -16486,6 +16725,10 @@ fail 25
 end
 x = mul get depth 0 32
 put fr add x 7 get nslot 0
+if and ge c 236 le c 238
+xhsched c dst x
+ret
+end
 if eq c 235
 xhprlim dst x
 ret

@@ -34,9 +34,11 @@ chmod +x "$B/gate"
 pin=$(sha256sum seed/out/omc | cut -d' ' -f1)
 run=$(mktemp -d "$B/run.XXXXXX")
 "$B/gate" seed/out/omc "$pin" seed/omc/contracts/contracts.cases "$run/cases"
+# OM-2 for loops tested at the latch: exact pass counts and the pass on which trap 4 fires (seed/omc/cflow).
+"$B/gate" seed/out/omc "$pin" seed/omc/cflow/cflow.cases "$run/cflow"
 # OM-2 dit and scrub (OMEGESE 9.13.1): s5 cases, and every s5 omc.om mutant detected (ctl-* PASS, m-* FAIL).
 "$B/gate" seed/out/omc "$pin" seed/omc/om2/s5/s5.cases "$run/s5" > "$run/s5.log" || { cat "$run/s5.log"; exit 1; }
-grep -qx 'OM2GATE PASS cases=21 pass=21 fail=0 invalid=0 not_run=0' "$run/s5.log"
+grep -qx 'OM2GATE PASS cases=26 pass=26 fail=0 invalid=0 not_run=0' "$run/s5.log"
 if "$B/gate" seed/out/omc "$pin" seed/omc/om2/s5/s5-mutants.cases "$run/s5mut" > "$run/s5mut.log"; then
     echo 'FAIL dit/scrub mutant survived' >&2
     exit 1
@@ -44,10 +46,10 @@ else
     status=$?
     [ "$status" = 1 ] || { cat "$run/s5mut.log"; exit 1; }
 fi
-grep -qx 'OM2GATE FAIL cases=16 pass=7 fail=9 invalid=0 not_run=0' "$run/s5mut.log"
-[ "$(grep -c '^VERDICT ctl-[a-z-]* PASS ' "$run/s5mut.log")" = 7 ]
-[ "$(grep -c '^VERDICT m-[a-z0-9]* FAIL ' "$run/s5mut.log")" = 9 ]
-echo 'PASS dit/scrub (21 cases) and 9 omc.om mutants detected'
+grep -qx 'OM2GATE FAIL cases=20 pass=9 fail=11 invalid=0 not_run=0' "$run/s5mut.log"
+[ "$(grep -c '^VERDICT ctl-[a-z-]* PASS ' "$run/s5mut.log")" = 9 ]
+[ "$(grep -c '^VERDICT m-[a-z0-9]* FAIL ' "$run/s5mut.log")" = 11 ]
+echo 'PASS dit/scrub (26 cases) and 11 omc.om mutants detected'
 # Every OM-2 case and mutant file (s1..s5, bnd, fnhost, hex), with two negative controls (ROADMAP-1.0 RM1).
 sh seed/qualification/om2/every.sh
 # Error-site coverage (ROADMAP-1.0 RM8): reached omc error sites may not fall below seed/omc/sitecov.floor.
@@ -137,6 +139,10 @@ echo 'PASS function-mode host words (21 cases) and 12 omc.om mutants killed'
 # prlimit 235: rlimit read/set/effect against /proc/self/limits (AArch64 and x86linux), RLIMIT_AS kept
 # across execprog, refusals, and 7 omc.om mutants killed (seed/host/prlimit/).
 "$B/gate" seed/out/omc "$pin" seed/host/prlimit/prlimit.cases "$run/prlimit"
+mkdir -p build/seed/sched-caller
+seed/out/omc < seed/host/affinity/caller-conductor.om > build/seed/sched-caller/conductor
+chmod +x build/seed/sched-caller/conductor
+"$B/gate" seed/out/omc "$pin" seed/host/affinity/sched.cases "$run/sched"
 # Same function-mode contract behavior through the unchanged C referee and OscRt.
 if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
     echo 'NOT_RUN contract C parity: build the comparison oracles' >&2

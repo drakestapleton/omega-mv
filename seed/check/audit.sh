@@ -1,7 +1,7 @@
 #!/bin/sh
 # audit.sh <file.hex> <file.bin> <a64check> -- REFERENCE CHECK ONLY (never makes a byte of seed/).
 # For every word of a hand-written hex file: the word as written, the instruction named in its comment,
-# what our own decoder (src/aarch64_decoder.c via a64check) reads from it, what GNU objdump
+# what our own decoder (seed/check/a64check.om) reads from it, what GNU objdump
 # (-M no-aliases, a second independent decoder, reference only) reads from it, and whether each agrees
 # with the name. Words whose comment does not start with [n] are data (ELF fields); their value is
 # checked by the self-rebuild and by readelf. objdump spells LO as CC and HS as CS (the same codes, Table C1-1);
