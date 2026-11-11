@@ -25,6 +25,9 @@ all under 25.
 Written for gate-front-ir (not copies): `p-part.om` (unsized `view`/`edit` parameters, `part` into them, `len` of
 a slice; its last `part` is one element too long and traps 3, exit 103) and `p-partok.om` (the same with that
 `part` in range, exit 92).
+`longnames.om` (names of 9 to 63 bytes for a scalar, a constant, a parameter, a local array, a global, a text and
+a loop counter) and `p-longtext.om` (a long-named text handed to an unsized `view` parameter and handed on) pin
+the long-name lookups of the lowering walk (hive ledger L1143).
 
 sha256 (sha256sum):
 
@@ -43,6 +46,8 @@ f8e05a153dfa18bb824751a41437af58fa37092f59f3f026eaff9daa5047f020  chacha-s.om
 acb875cb7c77d7f12e728727071b18c7ca2b9a01989735c9e2cd5a054a5fd2be  x25519-s.om
 5c19c71da2d76d8e10cc29cae8694b508ba5c026572d7ecf5cdfdc574e1e10b8  p-part.om
 75a757d55c8548ab2c75cc7f44b78124783b6c87e06d24751fccdf6f43a4cc9d  p-partok.om
+cee3329b6a233aeb06e6431cc57cc231f30ed642cec8bc976a3c23f85fe5e772  longnames.om
+ff54f87a8d01bc7ac2e37f59d7f6f02ef3c7c7f1072990f5a74a53a68d53868c  p-longtext.om
 ```
 
 ## Host programs (ng-front-host)
