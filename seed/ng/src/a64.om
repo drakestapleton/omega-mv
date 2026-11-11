@@ -2771,6 +2771,13 @@ end
 a6_hclk o w
 ret
 end
+if and ge w 241 le w 243
+if ne get a_tgt 0 1
+a6_unsup w
+end
+a6_hlib o w
+ret
+end
 nr = ulong 64
 if eq w 53
 nr = 63
@@ -2795,6 +2802,77 @@ a6_ew a_csnegx 0 0 0 3 0
 else
 a6_ew a_movzx 8 nr 0 0 0
 a6_ew a_svc 0 0 0 0 0
+end
+r = ulong get i_ors o
+if ne r 0
+a6_mvfrom r 0
+end
+end
+
+note ---- calls into system libraries, Mach-O only (IR.md s7.11, DESIGN.md s13): libfn 241, libptr 242, libcall 243.
+note The link page is the 16 KiB below the stack floor x28: +0 dlopen and +8 dlsym (bound by dyld, a6_macho), +16 the
+note stack dyld entered on (start code). x16, x17 and x9 are scratch; a host word counts as a call for allocation, so
+note no live value sits in x0..x14 or a caller-saved V register here.
+note libfn k: 0 for k above 1, else the word at link page + 8k. MOV X0, #0; CMP X16, #2; B.HS +8;
+note LDR X0, [X17, X16, LSL #3].
+note libptr A off n: the address of byte off of A (the slice is checked by its chk.slice).
+note libcall F A off n: A[off, off+n) is the register file, 128 bytes at least (fewer: trap 3; F = 0: trap 3):
+note x0..x7 at 0..63, d0..d7 at 64..127. Saves x19 and x20 on the Omega stack (floor checked, trap 6), keeps the
+note Omega sp in x19 and the file's address in x20, moves sp to the saved system stack, loads the sixteen registers,
+note BLR X16, stores x0, x1 back at 0 and d0..d3 at 64, and restores. The word's value is x0.
+fn a6_hlib o ulong w ulong to void
+if eq w 241
+k = a6_src a6_arg o 1 16
+a6_mov 16 k
+a6_emitw 0xd1401391
+a6_emitw 0xd2800000
+a6_emitw 0xf1000a1f
+a6_emitw 0x54000042
+a6_emitw 0xf8707a20
+end
+if eq w 242
+a = a6_arg o 1
+a6_aref a
+b = a6_src a 16
+f = a6_src a6_arg o 2 17
+a6_ew a_addx 17 b f 0 0
+a6_emitw 0xaa1103e0
+end
+if eq w 243
+a = a6_arg o 2
+a6_aref a
+b = a6_src a 16
+f = a6_src a6_arg o 3 17
+a6_ew a_addx 17 b f 0 0
+n = a6_src a6_arg o 4 16
+a6_ew a_subsxi 31 n 128 0 0
+a6_fx a_bcond 3 1003
+fr = a6_src a6_arg o 1 16
+a6_mov 16 fr
+a6_ew a_subsxi 31 16 0 0 0
+a6_fx a_bcond 0 1003
+a6_emitw 0xa9bf53f3
+a6_ew a_subsxe 31 31 28 3 0
+a6_fx a_bcond 3 1006
+a6_emitw 0x910003f3
+a6_emitw 0xaa1103f4
+a6_emitw 0xd1401389
+a6_emitw 0xf9400929
+a6_emitw 0x9100013f
+a6_emitw 0xa9400680
+a6_emitw 0xa9410e82
+a6_emitw 0xa9421684
+a6_emitw 0xa9431e86
+a6_emitw 0x6d440680
+a6_emitw 0x6d450e82
+a6_emitw 0x6d461684
+a6_emitw 0x6d471e86
+a6_emitw 0xd63f0200
+a6_emitw 0xa9000680
+a6_emitw 0x6d040680
+a6_emitw 0x6d050e82
+a6_emitw 0x9100027f
+a6_emitw 0xa8c153f3
 end
 r = ulong get i_ors o
 if ne r 0
@@ -4763,6 +4841,11 @@ a6_ew a_movkx 17 255 1 0 0
 a6_ew a_addx 28 16 17 0 0
 a6_ew a_movzx 17 128 1 0 0
 a6_ew a_addx 16 28 17 0 0
+note the link page (a6_macho, DESIGN.md s13) keeps the stack dyld entered on: MOV X9, SP; SUB X10, X28, #4, LSL #12;
+note STR X9, [X10, #16]. libcall runs library code on that stack.
+a6_emitw 0x910003e9
+a6_emitw 0xd140138a
+a6_emitw 0xf9000949
 else
 a6_ew a_movzx 28 4096 1 0 0
 a6_ew a_movzx 16 4224 1 0 0
@@ -4835,15 +4918,18 @@ end
 
 note a6_macho n: the Mach-O container around the code a_code[16384, n) (`@ng a64 macho`). File: a 16 KiB header
 note page (mach_header_64 and 12 load commands, 680 bytes; the rest is room for the signature command), the code,
-note zero padding to a 16 KiB multiple F, then 16 zero bytes of __LINKEDIT (the empty string table). Memory, from
-note the slid base B (0x100000000 before the slide): __TEXT B..B+F read+execute, __DATA B+16 MiB zero-filled
-note read+write (8 MiB of stack, then the class-0 globals, rounded up to 16 KiB), __LINKEDIT after it. LC_MAIN
-note enters at file offset 16384, the start code: ADR x16, .; x28 = x16 + 0xFFC000 (the stack floor B+16 MiB);
-note sp = x28 + 8 MiB; BL main; Darwin exit. dyld and libSystem are loaded but never called; the code signature
-note (required on arm64 macOS) is added on the Mac by `codesign --sign -`, which this layout leaves room for.
+note zero padding to a 16 KiB multiple F, then 40 bytes of __LINKEDIT (24 of bind records, then the empty 16-byte
+note string table). Memory, from the slid base B (0x100000000 before the slide): __TEXT B..B+F read+execute (F at
+note most 16 MiB less 16 KiB), __DATA from B+16 MiB-16 KiB zero-filled read+write (the 16 KiB link page, 8 MiB of
+note stack, then the class-0 globals, rounded up to 16 KiB), __LINKEDIT after it. dyld binds two words of the link
+note page: dlopen at +0 and dlsym at +8 (LC_DYLD_INFO_ONLY bind_off F, bind_size 24). LC_MAIN enters at file
+note offset 16384, the start code: ADR x16, .; x28 = x16 + 0xFFC000 (the stack floor B+16 MiB); the entry sp to
+note link page +16; sp = x28 + 8 MiB; BL main; Darwin exit. Library code runs only through libcall (a6_hlib). The
+note code signature (required on arm64 macOS) is added on the Mac by `codesign --sign -`, which this layout leaves
+note room for.
 fn a6_macho n ulong to void
 f = and add n 16383 not ulong 16383
-if gt add f 16 len a_code
+if or gt add f 40 len a_code gt f 16760832
 a6_die 4 3 18446744073709551615
 end
 i = ulong 0
@@ -4886,8 +4972,8 @@ a6_pn 256 25 4
 a6_pn 260 72 4
 a6_pn 264 71830128058207 8
 a6_pn 272 0 8
-a6_pn 280 0x101000000 8
-a6_pn 288 gv 8
+a6_pn 280 0x100ffc000 8
+a6_pn 288 add gv 16384 8
 a6_pn 296 f 8
 a6_pn 312 3 4
 a6_pn 316 3 4
@@ -4898,15 +4984,17 @@ a6_pn 344 21577 8
 a6_pn 352 add 0x101000000 gv 8
 a6_pn 360 16384 8
 a6_pn 368 f 8
-a6_pn 376 16 8
+a6_pn 376 40 8
 a6_pn 384 1 4
 a6_pn 388 1 4
 a6_pn 400 0x80000022 4
 a6_pn 404 48 4
+a6_pn 416 f 4
+a6_pn 420 24 4
 a6_pn 448 2 4
 a6_pn 452 24 4
-a6_pn 456 f 4
-a6_pn 464 f 4
+a6_pn 456 add f 24 4
+a6_pn 464 add f 24 4
 a6_pn 468 16 4
 a6_pn 472 11 4
 a6_pn 476 80 4
@@ -4936,7 +5024,11 @@ a6_pn 680 212436143976 8
 a6_pn 688 0x80000028 4
 a6_pn 692 24 4
 a6_pn 696 16384 8
-put a_cn 0 add f 16
+note the bind records: dylib 1, _dlopen, pointer, segment 2 offset 0, bind; _dlsym, bind (the next word); done
+a6_pn f 0x65706f6c645f4011 8
+a6_pn add f 8 0x5f4090007251006e 8
+a6_pn add f 16 0x0090006d79736c64 8
+put a_cn 0 add f 40
 end
 
 note a6_glay: class-0 globals in the RW pool from 0x10800000 (16-byte aligned, as omc), at most 1 GiB; class-1

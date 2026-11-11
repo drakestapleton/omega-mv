@@ -451,7 +451,7 @@ The same code generator with one switch, `a_tgt` 1. Three things differ from the
    read and write `CSNEG X0, X0, X0, CC` gives the count or minus errno, the shape the Linux words return (the
    errno numbers are those of Darwin). monons 109 and realns 130 are refused (class 5, `unsupported`): Darwin has
    no clock_gettime call. The other refused words are the ones the ELF refuses.
-3. **Container** (`a6_macho`). A 16 KiB header page (mach_header_64, 12 load commands, 680 bytes: __PAGEZERO 4 GiB,
+3. **Container** (`a6_macho`; section 13 changes the __DATA start and __LINKEDIT). A 16 KiB header page (mach_header_64, 12 load commands, 680 bytes: __PAGEZERO 4 GiB,
    __TEXT with one section, __DATA zero-filled, __LINKEDIT, empty DYLD_INFO_ONLY, empty SYMTAB with a 16-byte
    string table, DYSYMTAB, LOAD_DYLINKER, LOAD_DYLIB libSystem, BUILD_VERSION macOS 11.0, a fixed UUID, MAIN), the
    code from file offset 16384 (function entries stay on 64-byte boundaries), zero padding to a 16 KiB multiple,
@@ -549,3 +549,59 @@ hits `a6_unsup 2` cleanly (`tests/oir/u-selvec.oir`).
 - **Gates**: `gate.om` adds 27 `objdump`-checked encoder cases (`263/263`) and 10 refusal cases (`37/37`); `rgate.om`
   adds 7 differential execution fixtures (`v-f32-ops`, `v-f64-ops`, `v-fma-alias`, `v-call-clobber`, `v-spill-loop`,
   `v-spill-swap`, `v-swap-nocall`), refusal fixture `u-selvec`, and 6 `VEC` mutants (`80..85`).
+
+## 13. Calls into system libraries (`target macos`: `libfn`, `libptr`, `libcall`)
+
+Until here a Mach-O program could only read, write and exit. These three words (IR.md s7.11, host ids 241..243) let
+an Omega program call any function of any library on the Mac: libSystem, the Objective-C runtime, AppKit. They are
+keywords only in a unit whose first line is `target macos`; elsewhere the names are free, as in omc. Linux output is
+untouched (`a_tgt` 0 refuses the words).
+
+**What the language gives up, and where.** Omega exposes no raw address and no arbitrary system call. That stays
+true for every unit without the target line. A `target macos` unit has one gateway: `libptr` hands out the address
+of a checked slice, and `libcall` runs code the compiler never saw. Nothing behind the gateway is checked.
+
+**The link page.** __DATA now starts 16 KiB below the stack floor (base + 16 MiB - 16 KiB); the stack and the globals
+are where they were. The page holds three words, reached as `x28 - 16384` (`SUB Xn, X28, #4, LSL #12`):
+
+| offset | word | written by |
+|---|---|---|
+| 0 | address of `dlopen` | dyld, before the program starts |
+| 8 | address of `dlsym` | dyld |
+| 16 | the stack pointer dyld entered with | the start code (`MOV X9, SP; SUB X10, X28, #4, LSL #12; STR X9, [X10, #16]`) |
+
+dyld fills the first two from 24 bytes of bind records at the start of __LINKEDIT (LC_DYLD_INFO_ONLY bind_off,
+bind_size 24): dylib ordinal 1 (libSystem), `_dlopen`, type pointer, segment 2 offset 0, bind; `_dlsym`, bind;
+done. Every other function is found at run time with `dlsym`, so the container never grows with the program. The
+text may be at most 16 MiB less 16 KiB (`a6_die` otherwise).
+
+**Lowering** (`a6_hlib`). A host word counts as a call for allocation, so no live value is in x0..x14 or a
+caller-saved V register; x16, x17 and x9 are free.
+
+- `libfn k`: `MOV X0, #0; CMP X16, #2; B.HS +8; LDR X0, [X17, X16, LSL #3]` with x17 the link page.
+- `libptr A off n`: x17 = A + off, as read and write form it; the value is x17.
+- `libcall F A off n`: x17 = A + off; `CMP n, #128; B.LO` trap 3; x16 = F; `CMP X16, #0; B.EQ` trap 3. Then
+  `STP X19, X20, [SP, #-16]!` (stack floor checked, trap 6), x19 = sp, x20 = x17, sp = link page word 16, eight
+  `LDP` load x0..x7 and d0..d7 from the file, `BLR X16`, `STP X0, X1, [X20]`, `STP D0, D1, [X20, #64]`,
+  `STP D2, D3, [X20, #80]`, sp = x19, `LDP X19, X20, [SP], #16`. Library code runs on the system stack, 16-byte
+  aligned as dyld left it, and never on the Omega stack; the C convention keeps x19..x28 and the low halves of
+  v8..v15, which is what ng keeps across any call.
+
+**Limits.** Eight integer and eight float arguments in registers; no stack arguments (so no C variadic call on
+arm64 macOS), no x8 (functions that return a large struct through memory). Results: x0, x1, d0..d3. A library
+cannot call back into Omega yet, so anything that needs a callback (a window's event handlers) is not reachable.
+One thread. `exit` leaves through the system call as before: C `atexit` handlers and stdio buffers are not run.
+
+Check: the library fixtures of `sh seed/ng/a64/tests/macho/run.sh` (`a64/tests/macho/lib/`, what each must give in
+`lib/expect.txt`): `libwrite` (dlsym, then write, 35 bytes), `libmath` (sqrt and pow through d0 and d1, exact bits),
+`libobjc` (dlopen Foundation, `objc_getClass`, `sel_registerName`, `objc_msgSend`: the processor count equals
+`sysconf`), `libloop` (200 calls with eight integer sums and one f64 live across them), `libshort` and `libnull`
+(trap 3). `libname.om` uses the three names as variables without the target line and runs on both targets. Two
+mutant compilers: without the store of d0 and d1 `libmath` must change; with `libfn` always giving `dlopen`
+`libwrite` must change.
+
+Measured 2026-11-11 (HOST_TESTED on a MacBook, macOS 26.6.2, arm64; bundle step on the Spark): 23 of 23 fixtures
+equal their ELF (the 22 of section 11 and `libname`, all with the new start code and container), 21 refused by both
+targets, 6 of 6 library fixtures give their expected status and stdout, and all four controls are caught (libmath 2
+for 1; libwrite 139 for 35). NOT_RUN: a window on screen, callbacks, a second thread, more than one library call
+deep in recursion near the stack floor.

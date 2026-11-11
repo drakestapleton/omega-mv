@@ -539,7 +539,7 @@ are not mirrored, so a device word with such operands exits 117 where a native r
 |---|---|---|
 | 115 | process | fork dupfd waitpid execprog execpure execenv killpid pipefds getpid getppid setsid getpgid setpgid getsid |
 | 116 | limits | prlimit |
-| 117 | device | devctl mapnew mapdrop mapread mapwrite devcall uvmctl mapaddr mapget mapset maphold mapbind vfioctl vfiomap vfiomapw eventfd vfioirq |
+| 117 | device | devctl mapnew mapdrop mapread mapwrite devcall uvmctl mapaddr mapget mapset maphold mapbind vfioctl vfiomap vfiomapw eventfd vfioirq libfn libptr libcall |
 | 118 | network | socknew listen accept connect bind recv send waitio sockname sockopt shutdown peercred pollfds sendmsg peername |
 | 119 | outside scratch | any path or descriptor word without `--scratch`, an absolute or multi-component path, `.`/`..`, a descriptor ngrun did not create (including pread/pwrite on 0..2) |
 | 120 | nondeterministic | random, sleepns with a positive interval |
@@ -550,6 +550,23 @@ are not mirrored, so a device word with such operands exits 117 where a native r
 These exits sit above the trap range 101..114 and below 124 (step limit), 125 (unsupported op) and
 126 (access outside storage). They describe the reference interpreter, not program semantics:
 native code may execute every word.
+
+**Library words (class `lib`, ng only).** `hostwords.tsv` is the table of omc's words and stays that: the gate
+audits it against the pinned omc source. ng's own words have their own table, `seed/ng/hostwords-ng.tsv` (same
+columns, 3 rows), which ngcheck compiles in after the first (`--table` prints the first only). In a unit whose
+first line is `target macos` the front end reads these three more keywords; in every other unit they are ordinary names, as omc reads them (omc refuses `target macos`, error
+25). They are the one gateway from an Omega program to code outside it, and only the Mach-O target has them
+(`@ng a64` refuses each: `a64: unsupported 241`..`243`, exit 5; ngrun refuses them as class 117). Their value is the
+raw 64-bit result, not a count or an errno.
+
+| id | word | value |
+|---|---|---|
+| 241 | `libfn k` | the address of `dlopen` (k = 0) or `dlsym` (k = 1), bound by dyld when the program starts; 0 for any other k |
+| 242 | `libptr A off n` | the address of byte `off` of the writable byte slice (checked like every slice) |
+| 243 | `libcall F A off n` | calls the function at address F with the C calling convention. The slice is the register file, at least 128 bytes: x0..x7 from bytes 0..63 and d0..d7 from bytes 64..127, little-endian. After the call x0 and x1 are written back at 0 and 8, d0..d3 at 64..95, and the value is x0. A slice of fewer than 128 bytes, or F = 0, traps 3 before anything is called |
+
+What the called function does is outside the language: a wrong address, a wrong argument or a function that
+writes through a pointer it was given is not caught. `a64/DESIGN.md` s13 has the lowering.
 
 **Pending host words (not on main).** omega-mv `ham/om-threads` 652694b0 adds the affinity and
 priority words `cpuset` 236, `cpuget` 237, `cpunow` 238, `setprio` 239 and `getprio` 240. Main

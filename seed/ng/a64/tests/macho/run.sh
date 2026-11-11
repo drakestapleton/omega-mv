@@ -7,10 +7,16 @@
 #       either target refuses must be refused by both with the same line. Each ELF runs here; its status and
 #       stdout sha256 go to DIR/linux.txt, the Mach-O files to DIR/m/. Two mutant compilers (built here with
 #       seed/out/omc from a changed a64.om) write DIR/mut1/ and DIR/mut2/ for the controls below.
+#       The library fixtures seed/ng/a64/tests/macho/lib/*.om (`target macos`: libfn, libptr, libcall; DESIGN.md
+#       section 13) have no ELF: `@ng a64` must refuse each (exit 5, `a64: unsupported 241..243`). Their Mach-O
+#       files go to DIR/lib/, what each must give (lib/expect.txt: name, status, stdout sha256) to DIR/lib.txt,
+#       and two more mutant compilers write DIR/mut3/ and DIR/mut4/.
 #   sh run.sh run DIR                                  on an arm64 Mac, from anywhere (copy DIR and this file).
 #       Signs every Mach-O ad hoc, runs it and compares with linux.txt. Negative controls: mut1 (read and write
 #       without the CSNEG, so a failed call is plus errno) must change badfd; mut2 (a class-1 global address
-#       taken as x28 plus, not minus) must change gtext.
+#       taken as x28 plus, not minus) must change gtext. Then the library fixtures against lib.txt, with their
+#       controls: mut3 (libcall does not store d0 and d1 back) must change libmath; mut4 (libfn gives dlopen for
+#       every number) must change libwrite.
 # Last line: NG-A64-MACHO-BUNDLE OK n, or NG-A64-MACHO PASS / FAIL n. Only OK and PASS exit 0.
 set -eu
 mode=${1:?usage: run.sh bundle NG DIR | run DIR}
@@ -18,8 +24,8 @@ sha() { if command -v sha256sum > /dev/null; then sha256sum | cut -c1-64; else s
 if [ "$mode" = bundle ]; then
     NG=${2:?}; D=${3:?}
     [ "$(uname -sm)" = "Linux aarch64" ] || { echo "NG-A64-MACHO-BUNDLE NOT_RUN (host is $(uname -sm))"; exit 1; }
-    rm -rf "$D"; mkdir -p "$D/m" "$D/mut1" "$D/mut2" "$D/w"
-    # the two mutant compilers
+    rm -rf "$D"; mkdir -p "$D/m" "$D/mut1" "$D/mut2" "$D/mut3" "$D/mut4" "$D/lib" "$D/w"
+    # the mutant compilers
     mk() { # mk N SED-EXPRESSION
         mkdir -p "$D/w/src$1"; : > "$D/w/ng$1.om"
         while read -r _ p; do
@@ -32,6 +38,8 @@ if [ "$mode" = bundle ]; then
     }
     mk 1 '/^a6_ew a_csnegx 0 0 0 3 0$/d'
     mk 2 's/^a6_ew a_subx d 28 d 0 0$/a6_ew a_addx d 28 d 0 0/'
+    mk 3 '/^a6_emitw 0x6d040680$/d'
+    mk 4 's/^a6_emitw 0xf8707a20$/a6_emitw 0xf9400220/'
     n=0; : > "$D/linux.txt"; : > "$D/refused.txt"
     for f in seed/ng/tests/ir/x-*.om seed/ng/a64/tests/front/*.om seed/ng/a64/tests/macho/*.om; do
         b=$(basename "$f" .om)
@@ -50,8 +58,23 @@ if [ "$mode" = bundle ]; then
         for k in 1 2; do { printf '@ng a64 macho\n'; cat "$D/w/$b.o.ir"; } | "$D/w/ng$k" > "$D/mut$k/$b" 2> /dev/null || rm -f "$D/mut$k/$b"; done
     done
     for b in badfd gtext; do grep -q "^$b " "$D/linux.txt" || { echo "FAIL: control fixture $b missing"; exit 1; }; done
+    # the library fixtures: Mach-O only
+    nl=0
+    for f in seed/ng/a64/tests/macho/lib/*.om; do
+        b=$(basename "$f" .om)
+        { printf '@ng front-ir\n'; cat "$f"; } | "$NG" > "$D/w/$b.ir" 2> /dev/null || { echo "FAIL lib $b: front"; exit 1; }
+        { printf '@ng opt\n'; cat "$D/w/$b.ir"; } | "$NG" > "$D/w/$b.o.ir"
+        r1=0; { printf '@ng a64\n'; cat "$D/w/$b.o.ir"; } | "$NG" > /dev/null 2> "$D/w/$b.e1" || r1=$?
+        [ $r1 -eq 5 ] && grep -Eq '^a64: unsupported 24[123]$' "$D/w/$b.e1" || { echo "FAIL lib $b: the ELF target must refuse it (exit $r1)"; exit 1; }
+        { printf '@ng a64 macho\n'; cat "$D/w/$b.o.ir"; } | "$NG" > "$D/lib/$b" 2> /dev/null || { echo "FAIL lib $b: macho"; exit 1; }
+        for k in 3 4; do { printf '@ng a64 macho\n'; cat "$D/w/$b.o.ir"; } | "$D/w/ng$k" > "$D/mut$k/$b" 2> /dev/null || rm -f "$D/mut$k/$b"; done
+        grep -q "^$b " seed/ng/a64/tests/macho/lib/expect.txt || { echo "FAIL lib $b: no line in expect.txt"; exit 1; }
+        nl=$((nl + 1))
+    done
+    cp seed/ng/a64/tests/macho/lib/expect.txt "$D/lib.txt"
+    [ "$(wc -l < "$D/lib.txt" | tr -d ' ')" = "$nl" ] || { echo "FAIL: expect.txt lines and library fixtures differ"; exit 1; }
     rm -rf "$D/w"
-    echo "NG-A64-MACHO-BUNDLE OK $n ($(wc -l < "$D/refused.txt" | tr -d ' ') refused by both targets)"
+    echo "NG-A64-MACHO-BUNDLE OK $n ($(wc -l < "$D/refused.txt" | tr -d ' ') refused by both targets; $nl library fixtures)"
     exit 0
 fi
 D=${2:?}
@@ -77,5 +100,19 @@ ctl() { # ctl MUTDIR NAME WHAT
 }
 ctl mut1 badfd "no CSNEG after write"
 ctl mut2 gtext "class-1 global address added, not subtracted"
+ls=0
+while read -r b st h; do
+    got=$(one lib "$b")
+    if [ "$got" = "$st $h" ]; then ls=$((ls + 1)); else fails=$((fails + 1)); echo "FAIL lib $b: want $st $h, mac $got"; fi
+done < "$D/lib.txt"
+echo "PASS-COUNT $ls of $(wc -l < "$D/lib.txt" | tr -d ' ') library fixtures give their status and stdout"
+lctl() { # lctl MUTDIR NAME WHAT
+    want=$(grep "^$2 " "$D/lib.txt" | cut -d' ' -f2-)
+    got=$(one "$1" "$2")
+    if [ "$got" != "$want" ]; then echo "PASS control $1 ($3): $2 gives $got, not $want"
+    else fails=$((fails + 1)); echo "FAIL control $1 ($3): $2 unchanged"; fi
+}
+lctl mut3 libmath "libcall does not store d0 and d1 back"
+lctl mut4 libwrite "libfn gives dlopen for every number"
 rm -f "$D/run.bin" "$D/run.out"
 if [ $fails -eq 0 ]; then echo "NG-A64-MACHO PASS"; else echo "NG-A64-MACHO FAIL $fails"; exit 1; fi
