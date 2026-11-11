@@ -128,7 +128,7 @@ global is refused (TYPE).
 | bytes | field |
 |---|---|
 | 1 | `kind`: 0 function, 1 kernel, 2 export (an entry a host calls in function mode) |
-| 1 | `flags`: bit 0 inline hint; other bits 0 |
+| 1 | `flags`: bit 0 inline hint; bit 1 the callback function (below); other bits 0 |
 | 4 | `nparams` 0..64, then `nparams` param type ids (`u32` each) |
 | 4 | `result` type id (0 = void) |
 | kernel only: 4+4+4 | `tx ty tz`: threads per block on each axis, each 1..4096, product 1..4096 |
@@ -141,6 +141,11 @@ one parameter, and its parameter 0 has type `tok` (s6.4); no other parameter is 
 
 Any function may call any non-kernel function, including itself and later ones. A kernel's result
 is void; a kernel calls no function and no function calls a kernel except through `launch` (s7.7).
+
+**Callback function (flags bit 1).** At most one function of a unit, of kind 0, with exactly six `u64`
+parameters and result `u64`. It is the function library code calls back in a Mach-O program (s7.11, library
+words; `seed/ng/a64/DESIGN.md` s14); to every other consumer it is an ordinary function. Any other kind or
+signature, or a second such function, is FIELD (13) at the function record.
 
 **Program entry (D11).** A unit is a program: exactly one function has kind 2 (export), no
 parameters and result i32. It is the process entry (Omega `fn main to int`), and its result is the
@@ -554,7 +559,9 @@ native code may execute every word.
 **Library words (class `lib`, ng only).** `hostwords.tsv` is the table of omc's words and stays that: the gate
 audits it against the pinned omc source. ng's own words have their own table, `seed/ng/hostwords-ng.tsv` (same
 columns, 3 rows), which ngcheck compiles in after the first (`--table` prints the first only). In a unit whose
-first line is `target macos` the front end reads these three more keywords; in every other unit they are ordinary names, as omc reads them (omc refuses `target macos`, error
+first line is `target macos` the front end reads these three more keywords, and gives the function named
+`libback` (six `ulong` parameters, result `ulong`) flags bit 1: with it, `libfn k` for k 2..17 is the address
+of callback entry k - 2, a C function that runs `libback(k - 2, x0, x1, x2, x3, x4)` and returns its result; in every other unit they are ordinary names, as omc reads them (omc refuses `target macos`, error
 25). They are the one gateway from an Omega program to code outside it, and only the Mach-O target has them
 (`@ng a64` refuses each: `a64: unsupported 241`..`243`, exit 5; ngrun refuses them as class 117). Their value is the
 raw 64-bit result, not a count or an errno.

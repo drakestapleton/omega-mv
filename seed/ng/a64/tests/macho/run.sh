@@ -10,13 +10,15 @@
 #       The library fixtures seed/ng/a64/tests/macho/lib/*.om (`target macos`: libfn, libptr, libcall; DESIGN.md
 #       section 13) have no ELF: `@ng a64` must refuse each (exit 5, `a64: unsupported 241..243`). Their Mach-O
 #       files go to DIR/lib/, what each must give (lib/expect.txt: name, status, stdout sha256) to DIR/lib.txt,
-#       and two more mutant compilers write DIR/mut3/ and DIR/mut4/.
+#       and four more mutant compilers write DIR/mut3/ .. DIR/mut6/. libback and libbackobjc are the callback
+#       fixtures (DESIGN.md section 14): library code calls the Omega function libback.
 #   sh run.sh run DIR                                  on an arm64 Mac, from anywhere (copy DIR and this file).
 #       Signs every Mach-O ad hoc, runs it and compares with linux.txt. Negative controls: mut1 (read and write
 #       without the CSNEG, so a failed call is plus errno) must change badfd; mut2 (a class-1 global address
 #       taken as x28 plus, not minus) must change gtext. Then the library fixtures against lib.txt, with their
 #       controls: mut3 (libcall does not store d0 and d1 back) must change libmath; mut4 (libfn gives dlopen for
-#       every number) must change libwrite.
+#       every number) must change libwrite; mut5 (the callback body does not pass x0 on) and mut6 (libcall does
+#       not leave its stack pointer for a callback) must change libback.
 # Last line: NG-A64-MACHO-BUNDLE OK n, or NG-A64-MACHO PASS / FAIL n. Only OK and PASS exit 0.
 set -eu
 mode=${1:?usage: run.sh bundle NG DIR | run DIR}
@@ -24,7 +26,7 @@ sha() { if command -v sha256sum > /dev/null; then sha256sum | cut -c1-64; else s
 if [ "$mode" = bundle ]; then
     NG=${2:?}; D=${3:?}
     [ "$(uname -sm)" = "Linux aarch64" ] || { echo "NG-A64-MACHO-BUNDLE NOT_RUN (host is $(uname -sm))"; exit 1; }
-    rm -rf "$D"; mkdir -p "$D/m" "$D/mut1" "$D/mut2" "$D/mut3" "$D/mut4" "$D/lib" "$D/w"
+    rm -rf "$D"; mkdir -p "$D/m" "$D/mut1" "$D/mut2" "$D/mut3" "$D/mut4" "$D/mut5" "$D/mut6" "$D/lib" "$D/w"
     # the mutant compilers
     mk() { # mk N SED-EXPRESSION
         mkdir -p "$D/w/src$1"; : > "$D/w/ng$1.om"
@@ -40,6 +42,8 @@ if [ "$mode" = bundle ]; then
     mk 2 's/^a6_ew a_subx d 28 d 0 0$/a6_ew a_addx d 28 d 0 0/'
     mk 3 '/^a6_emitw 0x6d040680$/d'
     mk 4 's/^a6_emitw 0xf8707a20$/a6_emitw 0xf9400220/'
+    mk 5 '/^a6_emitw 0xaa0003e1$/d'
+    mk 6 '/^a6_emitw 0xf9000d33$/d'
     n=0; : > "$D/linux.txt"; : > "$D/refused.txt"
     for f in seed/ng/tests/ir/x-*.om seed/ng/a64/tests/front/*.om seed/ng/a64/tests/macho/*.om; do
         b=$(basename "$f" .om)
@@ -67,7 +71,7 @@ if [ "$mode" = bundle ]; then
         r1=0; { printf '@ng a64\n'; cat "$D/w/$b.o.ir"; } | "$NG" > /dev/null 2> "$D/w/$b.e1" || r1=$?
         [ $r1 -eq 5 ] && grep -Eq '^a64: unsupported 24[123]$' "$D/w/$b.e1" || { echo "FAIL lib $b: the ELF target must refuse it (exit $r1)"; exit 1; }
         { printf '@ng a64 macho\n'; cat "$D/w/$b.o.ir"; } | "$NG" > "$D/lib/$b" 2> /dev/null || { echo "FAIL lib $b: macho"; exit 1; }
-        for k in 3 4; do { printf '@ng a64 macho\n'; cat "$D/w/$b.o.ir"; } | "$D/w/ng$k" > "$D/mut$k/$b" 2> /dev/null || rm -f "$D/mut$k/$b"; done
+        for k in 3 4 5 6; do { printf '@ng a64 macho\n'; cat "$D/w/$b.o.ir"; } | "$D/w/ng$k" > "$D/mut$k/$b" 2> /dev/null || rm -f "$D/mut$k/$b"; done
         grep -q "^$b " seed/ng/a64/tests/macho/lib/expect.txt || { echo "FAIL lib $b: no line in expect.txt"; exit 1; }
         nl=$((nl + 1))
     done
@@ -114,5 +118,7 @@ lctl() { # lctl MUTDIR NAME WHAT
 }
 lctl mut3 libmath "libcall does not store d0 and d1 back"
 lctl mut4 libwrite "libfn gives dlopen for every number"
+lctl mut5 libback "the callback body does not pass x0 on"
+lctl mut6 libback "libcall does not leave its stack pointer for a callback"
 rm -f "$D/run.bin" "$D/run.out"
 if [ $fails -eq 0 ]; then echo "NG-A64-MACHO PASS"; else echo "NG-A64-MACHO FAIL $fails"; exit 1; fi

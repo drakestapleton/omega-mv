@@ -589,8 +589,7 @@ caller-saved V register; x16, x17 and x9 are free.
 
 **Limits.** Eight integer and eight float arguments in registers; no stack arguments (so no C variadic call on
 arm64 macOS), no x8 (functions that return a large struct through memory). Results: x0, x1, d0..d3. A library
-cannot call back into Omega yet, so anything that needs a callback (a window's event handlers) is not reachable.
-One thread. `exit` leaves through the system call as before: C `atexit` handlers and stdio buffers are not run.
+can call back into Omega only through the callback entries of section 14. One thread. `exit` leaves through the system call as before: C `atexit` handlers and stdio buffers are not run.
 
 Check: the library fixtures of `sh seed/ng/a64/tests/macho/run.sh` (`a64/tests/macho/lib/`, what each must give in
 `lib/expect.txt`): `libwrite` (dlsym, then write, 35 bytes), `libmath` (sqrt and pow through d0 and d1, exact bits),
@@ -603,5 +602,53 @@ mutant compilers: without the store of d0 and d1 `libmath` must change; with `li
 Measured 2026-11-11 (HOST_TESTED on a MacBook, macOS 26.6.2, arm64; bundle step on the Spark): 23 of 23 fixtures
 equal their ELF (the 22 of section 11 and `libname`, all with the new start code and container), 21 refused by both
 targets, 6 of 6 library fixtures give their expected status and stdout, and all four controls are caught (libmath 2
-for 1; libwrite 139 for 35). NOT_RUN: a window on screen, callbacks, a second thread, more than one library call
+for 1; libwrite 139 for 35). NOT_RUN: a second thread, more than one library call
 deep in recursion near the stack floor.
+
+## 14. Callbacks from library code (`libback`)
+
+A window's buttons, an Objective-C method, the comparison function of `qsort`: library code calls a C function it
+was handed. A `target macos` unit may define one callback function,
+
+    fn libback k ulong a ulong b ulong c ulong d ulong e ulong to ulong
+
+(the front end marks it with function flags bit 1, IR.md s6.1; any other signature is refused). With it the
+program has sixteen callback entries, C functions whose addresses are `libfn 2` .. `libfn 17` (0 without a callback
+function, and for every other number above 1). When library code calls entry k with the C convention, `libback`
+runs with k and the first five integer arguments x0..x4, and its result goes back in x0. One function and a number
+keep the language free of function values: the program dispatches on k.
+
+**The entries** (`a6_back`, emitted once after the exit code): sixteen pairs `MOVZ X16, #k; B body`, then one body.
+`libfn k`, k 2..17, is the class-1 address `x28 - (16 MiB - offset of the entries) + 8 (k - 2)`, chosen with a
+`CSEL` after the table read of section 13.
+
+**The body.** A callback only ever arrives inside a `libcall`, on the thread that made it, on the C stack.
+
+- `STP X29, X30, [SP, #-48]!; MOV X29, SP; STP X27, X28, [SP, #16]`: a C frame. C code keeps x28 across calls but
+  may hold anything in it during one, so the body finds it again as the start code does: `ADR X9, .` plus a constant.
+- Link words 16 and 24 are saved in the frame. Word 16 becomes the C stack pointer here, so a `libcall` made by the
+  callback runs below the C frames that are live (the start code's value would run over them). Word 24 is the Omega
+  stack pointer of the enclosing `libcall`, which `libcall` now stores there (`STR X19, [X9, #24]`): the body moves
+  to it, so Omega frames of the callback sit below the frames of the Omega code that is waiting in the `libcall`.
+- x0..x4 move to x1..x5, x0 = k, `BL libback`. Back: sp = the C frame, the two link words are put back, the saved
+  registers reloaded, `RET`. `libback` is an ordinary ng function: it keeps x19..x27 and v8..v15 itself, checks the
+  stack floor (trap 6) and may trap; a trap ends the program as anywhere.
+
+Callbacks nest (a `libcall` in a callback may be called back again); each level restores what it found.
+
+**Limits.** Five integer arguments; no float arguments (a view's `drawRect:` gets its rectangle in d0..d3, which is
+lost: ask the view for its bounds instead), no arguments on the stack, an integer result only. Sixteen entries. The
+thread that started the program only: a library that calls an entry from another thread breaks the program.
+An entry called when no `libcall` is active does not happen on one thread.
+
+Check: `lib/libback.om` (`qsort` sorts eight numbers with `libback` as the comparison, which reads its two
+elements with `memcpy`, a `libcall` inside a callback; entry 5, so k must be 5) and `lib/libbackobjc.om` (a class
+made with `objc_allocateClassPair` whose methods `poke:` and `twice:` are entries 0 and 3: self, the selector and
+the argument must arrive, and 2 x 21 must come back through `objc_msgSend`). Two more mutant compilers: without
+`MOV X1, X0` in the body `libback` (the fixture) no longer sorts; without the store of link word 24 it cannot run.
+The IR cases `a-back`, `r13-backsig`, `r13-backtwo` and `r13-fnflags4` pin the flag's rule in ngcheck.
+
+Measured 2026-11-11 (HOST_TESTED on a MacBook, macOS 26.6.2, arm64; bundle step on the Spark): 23 of 23 fixtures
+equal their ELF, 8 of 8 library fixtures give their status and stdout, and all six controls are caught (libback 6
+for 1 without the move, 139 without the store). NOT_RUN: callbacks nested more than one deep, a callback from
+another thread, a callback that traps.
