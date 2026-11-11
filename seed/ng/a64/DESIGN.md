@@ -16,6 +16,7 @@ offset 0 with ir-copy's limit and refusals, and calls `a6_run`, which runs the m
 |---|---|---|
 | `@ng a64` | binary ΩIR (`seed/ng/IR.md`) | static AArch64 Linux ELF on stdout; saves as STP/LDP pairs (form A) |
 | `@ng a64 split` | binary ΩIR | the same with separate STR/LDR saves (form B) |
+| `@ng a64 macho` | binary ΩIR | dynamic arm64 Mach-O for macOS on stdout (form A; section 11) |
 | `@ng a64-enc` | encoder case list (`tests/enc.cases`) | one 4-byte word per case |
 
 Exit 0 on success. A refusal writes one stderr line `a64: <class> <n>` and exits with the class: the ΩIR reader's
@@ -432,3 +433,43 @@ signaling NaNs, -0). Fill mutants 70..79: block threshold 32, each tail testing 
 1), the block loop's B.LO taken as B.HS (zero length and short spans store out of span), STR Q index scaled by 16,
 the u8 replication shifted by 9, the integer mask one bit wide, the float pattern read from x16; mutant 23 (no
 element-size scale) now acts on the byte count.
+
+## 11. Mach-O for macOS (`@ng a64 macho`)
+
+The same code generator with one switch, `a_tgt` 1. Three things differ from the ELF; nothing else does, and
+`@ng a64` output is byte for byte what it was (checked on the hopfuzz unit: same sha256 before and after).
+
+1. **Position independence.** arm64 macOS runs only slid (PIE) images, so no instruction holds an absolute address.
+   The start code takes its own address with `ADR X16, .` and adds a constant: x28, the stack floor, is the image
+   base plus 16 MiB; SP is x28 plus 8 MiB. A global's address (op 52) is `x28 + (8 MiB + offset)` for class 0 and
+   `x28 - (16 MiB - file offset)` for class 1 (bytes in the text image): the constant through `a6_movi`, then one
+   ADD or SUB with x28. x28 never changes after the start code.
+2. **Calls into the system.** Darwin numbers and convention: number in x16, `SVC #0x80`, carry set on failure with
+   errno in x0. exit is 1 (the trap tail, the exit op and the start code share `a6_exit`), read 3, write 4; after
+   read and write `CSNEG X0, X0, X0, CC` gives the count or minus errno, the shape the Linux words return (the
+   errno numbers are those of Darwin). monons 109 and realns 130 are refused (class 5, `unsupported`): Darwin has
+   no clock_gettime call. The other refused words are the ones the ELF refuses.
+3. **Container** (`a6_macho`). A 16 KiB header page (mach_header_64, 12 load commands, 680 bytes: __PAGEZERO 4 GiB,
+   __TEXT with one section, __DATA zero-filled, __LINKEDIT, empty DYLD_INFO_ONLY, empty SYMTAB with a 16-byte
+   string table, DYSYMTAB, LOAD_DYLINKER, LOAD_DYLIB libSystem, BUILD_VERSION macOS 11.0, a fixed UUID, MAIN), the
+   code from file offset 16384 (function entries stay on 64-byte boundaries), zero padding to a 16 KiB multiple,
+   then 16 zero bytes of __LINKEDIT. __DATA sits at base + 16 MiB: 8 MiB of stack, then the class-0 globals. The
+   layout follows the bounded adapter of ports/macos-arm64 (L615), which ran on macOS 26.6.2. dyld and libSystem
+   are loaded and never called. The code signature arm64 macOS requires is added on the Mac with
+   `codesign --force --sign -`; the header page leaves room for its load command. That signing step is a disclosed
+   host dependency: ng does not compute it.
+
+Check: `sh seed/ng/a64/tests/macho/run.sh bundle NG DIR` on Linux AArch64, then `sh run.sh run DIR` on an arm64 Mac.
+The bundle step compiles every `seed/ng/tests/ir/x-*.om`, `a64/tests/front/*.om` and `a64/tests/macho/*.om` both
+ways (a unit one target refuses must be refused by both with the same line), runs each ELF and records its status
+and stdout. The run step signs and runs each Mach-O and compares. Its two negative controls are mutant compilers the
+bundle step builds: without the CSNEG a write to a closed descriptor (`badfd.om`) must change status; with a class-1
+global address added instead of subtracted `gtext.om` must lose its output.
+
+Measured 2026-11-10 (HOST_TESTED on a MacBook, macOS 26.6.2, arm64; ELF side on the Spark): 22 of 22 fixtures equal
+their ELF in exit status and stdout bytes (statuses 0, 3, 5, 7, 9, 17, 42, 158, 224, 243, 255 and traps 101, 103,
+104, 105, 107; three write stdout); 21 are refused by both targets with the same `unsupported` line; both controls
+are caught (badfd 247 for 9; gtext prints nothing). `a64/gate.om` passes on this head. A 300-block unit with read
+and write (the Hop matcher and a stdin batch driver) answered 40610 of 40610 cases as its Swift reference. NOT_RUN:
+floats on macOS, globals over 16 KiB, a control for the start code and for the exit call (a wrong exit number is
+another system call, so it is not run as a mutant). The Mac run is not part of gate or rgate, which run on Linux.
