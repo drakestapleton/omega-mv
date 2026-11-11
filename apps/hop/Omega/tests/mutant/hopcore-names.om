@@ -917,7 +917,7 @@ note bytes, the path as written), then the path bytes, then the name bytes. 4 by
 note match, else the score plus 1000000.
 note Kind 3, text: see fn texts. Op 1 and op 3 answer one byte; op 2 a count, then two 16-bit numbers a word;
 note op 4 two 16-bit numbers; op 5 one byte.
-note Kind 4, corrected words: see fn wdiff. Kind 5, a board line or a time: see fn board. Kind 6, a whole board: see fn asm.
+note Kind 4, corrected words: see fn wdiff. Kind 5, a board line or a time: see fn board. Kind 6, a whole board: see fn asm. Kind 7, the members' state and the graph: see fn status.
 
 note fill b[0 .. n) from stdin; false at end of input or on a short read
 fn rdn b edit uchar 1048576 n ulong to bool
@@ -2770,6 +2770,1039 @@ put32 ob 28 sdrop
 ret sub o 8
 end
 
+note ---- the state of a swarm's members, and the graph (kind 7) ----
+note A request is an op and a count c as two 32-bit values, then c numbers of 64 bits, then bytes when the op has a
+note text. Every number, in and out, is the value plus 1099511627776, so that -1 ("not known", "none") travels as
+note an unsigned number. Codes: role 0 worker, 1 coordinator, 2 helper; turn 0 not known, 1 running, 2 ended; wake
+note 2 parked for mentions, 3 for any post; state 1 working, 2 waiting, 3 stopped; attention 0 none, 1 stuck,
+note 2 error, 3 quota; group 1 needs you, 2 working, 3 waiting on someone, 4 parked; step 1 planner, 2 result,
+note 3 user, 4 error; status 1 done, 2 error.
+const k_b ulong 1099511627776
+text q_words "resource_exhausted|quota|rate limit|rate-limit|ratelimit|exhausted your capacity|"
+text q_roles "coordinatorworkernarratormonitor"
+global d_role ulong 96
+global d_kill ulong 96
+global d_wake ulong 96
+global d_turn ulong 96
+global d_lr ulong 96
+global d_lm ulong 96
+global d_fail ulong 96
+global d_own ulong 96
+global d_no ulong 96
+global d_nl ulong 96
+global d_cnt ulong 96
+global d_last ulong 96
+global d_state ulong 96
+global d_att ulong 96
+global d_won ulong 96
+global d_grp ulong 96
+global d_key ulong 96
+global d_ord ulong 96
+global d_po ulong 400
+global d_cell ulong 18432
+global d_nm ulong 96
+
+note number k of the request
+fn gi b view uchar 1048576 k ulong to ulong
+o = add 8 mul k 8
+ret or rd32 b o shl rd32 b add o 4 32
+end
+
+note number k of the request as a count; a negative number gives a value over every limit
+fn gu b view uchar 1048576 k ulong to ulong
+v = gi b k
+if lt v k_b
+ret 4294967295
+end
+ret sub v k_b
+end
+
+note number k of the answer
+fn po ob edit uchar 65544 k ulong v ulong to void
+o = add 8 mul k 8
+put32 ob o v
+put32 ob add o 4 shr v 32
+end
+
+note a member's state is worked out, never taken from what it says about itself. With a roster: stopped when it
+note was killed; else waiting when its own run has ended and working when it is mid-turn; with no transcript to
+note go on, waiting when it is parked. With no roster: working when it posted within 900 seconds (age, -1 never)
+fn swstate killed ulong turn ulong wake ulong roster ulong age ulong to ulong
+if eq killed add k_b 1
+ret 3
+end
+if ne roster add k_b 1
+if and ge age k_b le age add k_b 900
+ret 1
+end
+ret 2
+end
+if eq turn add k_b 2
+ret 2
+end
+if eq turn add k_b 1
+ret 1
+end
+if or eq wake add k_b 2 eq wake add k_b 3
+ret 2
+end
+ret 1
+end
+
+note what needs a look: a failed newest step, or a member that should be working and has not moved for more
+note than 600 seconds (idle -1: not known)
+fn swatt state ulong failure ulong idle ulong to ulong
+if eq state add k_b 3
+ret 0
+end
+if eq failure add k_b 2
+ret 2
+end
+if eq failure add k_b 3
+ret 3
+end
+if and eq state add k_b 1 gt idle add k_b 600
+ret 1
+end
+ret 0
+end
+
+note the Overview group of one member (asks and won: 1 when it asks the owner, when it waits on someone)
+fn swgroup state ulong att ulong asks ulong won ulong to ulong
+if eq state add k_b 3
+ret 4
+end
+if or ne att k_b ne asks k_b
+ret 1
+end
+if eq state add k_b 1
+ret 2
+end
+if ne won k_b
+ret 3
+end
+ret 4
+end
+
+note is this post the first row of a visual group? Posts by one sender, next to each other and at most 600
+note seconds apart, are one group
+fn swstarts ps ulong pt ulong s ulong t ulong to ulong
+if or lt s k_b ne s ps
+ret 1
+end
+if or le t k_b le pt k_b
+ret 0
+end
+if or gt t add pt 600 lt t pt
+ret 1
+end
+ret 0
+end
+
+note the n bytes at off, ASCII letters without case, against the wn bytes at w0 of q_roles
+fn eqrole b view uchar 1048576 off ulong n ulong w0 ulong wn ulong to bool
+if ne n wn
+ret false
+end
+i = ulong 0
+while lt i n bound 64
+if ne lowc ulong get b add off i ulong get q_roles add w0 i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note the order of members: by key (small first), the coordinator before the others, then by name (ASCII letters
+note without case, the shorter first). n members; keys in d_key, roles in d_role, names at d_no, d_nl; order to d_ord
+fn sworder b view uchar 1048576 n ulong to void
+cntd = ulong 0
+for i ulong n
+pos = cntd
+while gt pos 0 bound 128
+o = get d_ord sub pos 1
+after = false
+if ne get d_key o get d_key i
+after = gt get d_key o get d_key i
+else
+co = eq get d_role o 1
+ci = eq get d_role i 1
+dif = false
+if co
+if not ci
+dif = true
+end
+else
+if ci
+dif = true
+end
+end
+if dif
+after = ci
+else
+x = get d_no o
+xl = get d_nl o
+y = get d_no i
+yl = get d_nl i
+k = ulong 0
+cmp = ulong 1
+while lt k xl bound 999999
+if ge k yl
+break
+end
+cx = lowc ulong get b add x k
+cy = lowc ulong get b add y k
+if ne cx cy
+cmp = 0
+if gt cx cy
+cmp = 2
+end
+break
+end
+k = add k 1
+end
+if eq cmp 1
+if gt xl yl
+cmp = 2
+end
+end
+after = eq cmp 2
+end
+end
+if not after
+break
+end
+put d_ord pos o
+pos = sub pos 1
+end
+put d_ord pos i
+cntd = add cntd 1
+end
+end
+
+note op 8: has the member's run stopped? Its newest steps, oldest first: four counts (they must be equal), then
+note the kinds, the statuses, for a planner step how many tools it called, and which of them was the wait for
+note posts (-1 none). Ended (2) when the newest planner step called no tool and nothing came after it, or when it
+note called the wait and that call's result is done; anything newer means mid-turn (1). 0: not known
+fn swturn b view uchar 1048576 c ulong to ulong
+if lt c 4
+ret 0
+end
+n = gu b 0
+if gt n 100000
+ret 0
+end
+if or eq n 0 or ne gi b 1 gi b 0 or ne gi b 2 gi b 0 ne gi b 3 gi b 0
+ret 0
+end
+if ne c add 4 mul n 4
+ret 0
+end
+kd = ulong 4
+sx = add 4 n
+tl = add 4 mul n 2
+wt2 = add 4 mul n 3
+i = n
+results = ulong 0
+looked = ulong 0
+while gt i 0 bound 512
+if ge looked 256
+break
+end
+if ne gi b add kd sub i 1 add k_b 2
+break
+end
+results = add results 1
+i = sub i 1
+looked = add looked 1
+end
+if or eq i 0 ge looked 256
+ret 1
+end
+i = sub i 1
+if ne gi b add kd i add k_b 1
+ret 1
+end
+tools = gi b add tl i
+if le tools k_b
+if eq results 0
+ret 2
+end
+ret 1
+end
+wait = gi b add wt2 i
+if or lt wait k_b ge wait tools
+ret 1
+end
+if lt results sub tools k_b
+ret 1
+end
+if eq gi b add sx add add i 1 sub wait k_b add k_b 1
+ret 2
+end
+ret 1
+end
+
+note op 9: the step that says what the member is doing now: the newest planner step of the current turn that has
+note a label. Three counts (equal), then kinds, waits and labels. A turn starts after user input or after a wait
+note for posts. The answer is the step's place, or -1
+fn swact b view uchar 1048576 c ulong to ulong
+none = sub k_b 1
+if lt c 3
+ret none
+end
+n = gu b 0
+if gt n 100000
+ret none
+end
+if or ne gi b 1 gi b 0 ne gi b 2 gi b 0
+ret none
+end
+if ne c add 3 mul n 3
+ret none
+end
+i = n
+looked = ulong 0
+while gt i 0 bound 512
+if ge looked 256
+break
+end
+kk = gi b add 3 sub i 1
+if eq kk add k_b 3
+ret none
+end
+if eq kk add k_b 1
+if ge gi b add add 3 n sub i 1 k_b
+ret none
+end
+if eq gi b add add 3 mul n 2 sub i 1 add k_b 1
+ret add k_b sub i 1
+end
+end
+i = sub i 1
+looked = add looked 1
+end
+ret none
+end
+
+note op 10: does an error text (t0..t1) say the member ran out of quota or was rate limited? One of the words of
+note q_words in its first 32768 places, or "429" standing alone
+fn swquota b view uchar 1048576 t0 ulong t1 ulong to ulong
+tn = sub t1 t0
+w0 = ulong 0
+wi = ulong 0
+while lt wi len q_words bound 256
+if eq ulong get q_words wi 124
+wn = sub wi w0
+if and gt wn 0 ge tn wn
+i = ulong 0
+while le add i wn tn bound 40000
+if ge i 32768
+break
+end
+k = ulong 0
+while lt k wn bound 64
+if ne lowc ulong get b add add t0 i k ulong get q_words add w0 k
+break
+end
+k = add k 1
+end
+if eq k wn
+ret 1
+end
+i = add i 1
+end
+end
+w0 = add wi 1
+end
+wi = add wi 1
+end
+i = ulong 0
+while le add i 3 tn bound 40000
+if ge i 32768
+break
+end
+p = add t0 i
+if and and eq ulong get b p 52 eq ulong get b add p 1 50 eq ulong get b add p 2 57
+if not namer runeb b p t0 t1
+if not namer rune b add p 3 t1
+ret 1
+end
+end
+end
+i = add i 1
+end
+ret 0
+end
+
+note op 11: the role code of a roster member from its role (rl bytes at ro) and its name (nl bytes at no). The
+note coordinator leads; "narrator" and "monitor", also with "-<digits>" after, are helpers by name; so is any role
+note other than "worker"
+fn swrole b view uchar 1048576 ro ulong rl ulong no ulong nl ulong to ulong
+if eqrole b ro rl 0 11
+ret 1
+end
+plain = eq rl 0
+if eqrole b ro rl 11 6
+plain = true
+end
+if not plain
+ret 2
+end
+bl = nl
+pf = cprefix b no nl
+if gt pf 0
+bl = pf
+end
+if eqrole b no bl 17 8
+ret 2
+end
+if eqrole b no bl 25 7
+ret 2
+end
+ret 0
+end
+
+note op 16: everything the views show about the members. Numbers: 0 1 when there is a roster, 1 now (seconds
+note since 1970), 2 the members n (96 at most), 3 the posts p (400 at most); nine a member: role, killed, wake,
+note turn, the last post it read (-1 not known), its last own movement (0 not known), failure, 1 when it is the
+note person using Hop, the length of its name; then a post each: its number, its time (0 not known), its sender
+note (-1: not a member), how many others signed and who, how many members it addresses by name and who. The
+note names follow as bytes. The answer: 0 the newest post number, 1 to 3 the members working, waiting and stopped
+note (helpers are not counted); a number a post: 1 when it starts a visual group; then eleven lists of n: posts
+note by each member, its newest post (-1 none), state, attention, idle seconds (-1), unread posts (-1), 1 for a
+note helper, who it waits on (-1), the post that says so, the post that asks the owner (0 none), its group; then
+note the Overview order and the Members order. Returns the count of numbers, or 0 for a malformed request
+fn swderive b view uchar 1048576 c ulong nbytes ulong ob edit uchar 65544 to ulong
+if lt c 4
+ret 0
+end
+roster = gi b 0
+now = gi b 1
+n = gu b 2
+p = gu b 3
+if or gt n 96 gt p 400
+ret 0
+end
+q = add 4 mul n 9
+if gt q c
+ret 0
+end
+no = add 8 mul c 8
+for m ulong n
+o = add 4 mul m 9
+put d_role m gu b o
+put d_kill m gi b add o 1
+put d_wake m gi b add o 2
+put d_turn m gi b add o 3
+put d_lr m gi b add o 4
+put d_lm m gi b add o 5
+put d_fail m gi b add o 6
+put d_own m gi b add o 7
+l = gu b add o 8
+if gt l 1048576
+ret 0
+end
+put d_no m no
+put d_nl m l
+no = add no l
+put d_cnt m 0
+put d_last m 1000
+end
+if gt no add add 8 mul c 8 nbytes
+ret 0
+end
+for i ulong p
+if gt add q 4 c
+ret 0
+end
+put d_po i q
+nw = gu b add q 3
+if gt nw 4
+ret 0
+end
+if gt add add q 5 nw c
+ret 0
+end
+nd = gu b add add q 4 nw
+if gt nd 96
+ret 0
+end
+q = add add add q 5 nw nd
+if gt q c
+ret 0
+end
+end
+head = k_b
+if gt p 0
+head = gi b get d_po sub p 1
+end
+po ob 0 head
+for i ulong p
+q = get d_po i
+s = gi b add q 2
+sg = ulong 1
+if gt i 0
+pq = get d_po sub i 1
+sg = swstarts gi b add pq 2 gi b add pq 1 s gi b add q 1
+end
+po ob add 4 i add k_b sg
+if and ge s k_b lt s add k_b n
+sm = sub s k_b
+put d_cnt sm add get d_cnt sm 1
+put d_last sm i
+end
+nw = gu b add q 3
+for k ulong nw
+w = gi b add add q 4 k
+if ne w s
+if and ge w k_b lt w add k_b n
+wm = sub w k_b
+put d_cnt wm add get d_cnt wm 1
+put d_last wm i
+end
+end
+end
+end
+base = add 4 p
+for m ulong n
+last = get d_last m
+age = sub k_b 1
+if lt last 1000
+pt = gi b add get d_po last 1
+if gt pt k_b
+age = k_b
+if gt now pt
+age = add k_b sub now pt
+end
+end
+end
+st = swstate get d_kill m get d_turn m get d_wake m roster age
+idle = sub k_b 1
+if eq roster add k_b 1
+lm = get d_lm m
+if gt lm k_b
+idle = k_b
+if gt now lm
+idle = add k_b sub now lm
+end
+end
+end
+put d_state m st
+put d_att m swatt add k_b st get d_fail m idle
+unr = sub k_b 1
+if eq roster add k_b 1
+lr = get d_lr m
+if ge lr k_b
+unr = k_b
+if gt head lr
+unr = add k_b sub head lr
+end
+end
+end
+po ob add base m add k_b get d_cnt m
+lp = sub k_b 1
+if lt last 1000
+lp = add k_b last
+end
+po ob add add base n m lp
+po ob add add base mul n 2 m add k_b st
+po ob add add base mul n 3 m add k_b get d_att m
+po ob add add base mul n 4 m idle
+po ob add add base mul n 5 m unr
+hp = ulong 0
+if eq get d_role m 2
+hp = 1
+end
+po ob add add base mul n 6 m add k_b hp
+end
+working = ulong 0
+waiting = ulong 0
+stopped = ulong 0
+for m ulong n
+on = ulong 1000
+seq = k_b
+you = k_b
+last = get d_last m
+if and lt last 1000 ne get d_state m 3
+q = get d_po last
+nw = gu b add q 3
+nd = gu b add add q 4 nw
+t0 = add add q 5 nw
+if gt nd 0
+answered = false
+j = add last 1
+while lt j p bound 512
+if answered
+break
+end
+qj = get d_po j
+sj = gi b add qj 2
+nwj = gu b add qj 3
+for k ulong nd
+tk = gi b add t0 k
+if eq tk sj
+answered = true
+end
+for k2 ulong nwj
+if eq tk gi b add add qj 4 k2
+answered = true
+end
+end
+end
+j = add j 1
+end
+if not answered
+for k ulong nd
+tk = gi b add t0 k
+if and ge tk k_b lt tk add k_b n
+tm2 = sub tk k_b
+if eq get d_own tm2 add k_b 1
+you = gi b q
+else
+if and eq on 1000 ne get d_state tm2 3
+on = tm2
+end
+end
+end
+end
+if lt on 1000
+seq = gi b q
+end
+end
+end
+end
+wo = sub k_b 1
+won = ulong 0
+if lt on 1000
+wo = add k_b on
+won = 1
+end
+asks = ulong 0
+if gt you k_b
+asks = 1
+end
+g = swgroup add k_b get d_state m add k_b get d_att m add k_b asks add k_b won
+put d_grp m g
+po ob add add base mul n 7 m wo
+po ob add add base mul n 8 m seq
+po ob add add base mul n 9 m you
+po ob add add base mul n 10 m add k_b g
+if ne get d_role m 2
+if eq get d_state m 1
+working = add working 1
+else
+if eq get d_state m 2
+waiting = add waiting 1
+else
+stopped = add stopped 1
+end
+end
+end
+end
+po ob 1 add k_b working
+po ob 2 add k_b waiting
+po ob 3 add k_b stopped
+for pass2 ulong 2
+for m ulong n
+v = get d_grp m
+if eq pass2 1
+v = get d_state m
+end
+if ne roster add k_b 1
+v = mul v 2
+if eq get d_cnt m 0
+v = add v 1
+end
+end
+put d_key m v
+end
+sworder b n
+for m ulong n
+po ob add add base mul n add 11 pass2 m add k_b get d_ord m
+end
+end
+ret add base mul n 13
+end
+
+note op 12: who addressed whom in the first posts, for the graph. Numbers: the members n, upTo, how many posts
+note have a sender, how many helper flags, how many posts have their co-signers, their addressed members and
+note their to-all flag; then the helper flags (n); then a post each: sender, how many co-signers (4 at most) and
+note who, how many addressed members and who, 1 when it is to all. Helpers are left out. The answer is bytes,
+note six a pair in order of sender then receiver: from, to, how many posts named the receiver (16-bit), how many
+note reached it only because the post was for everyone (16-bit). Returns the reply length
+fn swedges b view uchar 1048576 c ulong ob edit uchar 65544 to ulong
+named = new ulong 96 0
+if lt c 7
+ret 0
+end
+nn = gi b 0
+if or le nn k_b gt nn add k_b 96
+ret 0
+end
+n = sub nn k_b
+upto = gi b 1
+posts = gu b 2
+if gt posts 100000
+ret 0
+end
+if lt upto add k_b posts
+posts = ulong 0
+if gt upto k_b
+posts = sub upto k_b
+end
+end
+if or gt posts 400 ne gi b 3 nn
+ret 0
+end
+if or or lt gi b 4 add k_b posts lt gi b 5 add k_b posts lt gi b 6 add k_b posts
+ret 0
+end
+for z ulong mul n n
+put d_cell z 0
+put d_cell add 9216 z 0
+end
+hb = ulong 7
+q = add 7 n
+if gt q c
+ret 0
+end
+for i ulong posts
+if gt add q 2 c
+ret 0
+end
+s0 = gi b q
+nw = gu b add q 1
+if gt nw 4
+ret 0
+end
+if gt add add q 3 nw c
+ret 0
+end
+nd = gu b add add q 2 nw
+if gt nd 96
+ret 0
+end
+dq = add add q 3 nw
+if gt add add dq nd 1 c
+ret 0
+end
+tall = gi b add dq nd
+for s ulong add nw 1
+from = s0
+if gt s 0
+from = gi b add add q 2 sub s 1
+end
+okf = and ge from k_b lt from add k_b n
+if okf
+if ne gi b add hb sub from k_b k_b
+okf = false
+end
+end
+if okf
+if gt s 0
+if eq from s0
+okf = false
+end
+end
+end
+if okf
+f = sub from k_b
+for z ulong n
+put named z 0
+end
+for k ulong nd
+if lt k n
+tv = gi b add dq k
+if and ge tv k_b lt tv add k_b n
+tt = sub tv k_b
+if and ne tt f eq gi b add hb tt k_b
+if eq get named tt 0
+put named tt 1
+put d_cell add mul f n tt add get d_cell add mul f n tt 1
+end
+end
+end
+end
+end
+if eq tall add k_b 1
+for tt ulong n
+if and ne tt f eq gi b add hb tt k_b
+if eq get named tt 0
+put d_cell add 9216 add mul f n tt add get d_cell add 9216 add mul f n tt 1
+end
+end
+end
+end
+end
+end
+q = add add dq nd 1
+end
+o = ulong 8
+for cell ulong mul n n
+dv = get d_cell cell
+av = get d_cell add 9216 cell
+if gt add dv av 0
+put ob o uchar div cell n
+put ob add o 1 uchar rem cell n
+put ob add o 2 uchar and dv 255
+put ob add o 3 uchar and shr dv 8 255
+put ob add o 4 uchar and av 255
+put ob add o 5 uchar and shr av 8 255
+o = add o 6
+end
+end
+ret sub o 8
+end
+
+note op 14: which members to draw when there are too many for one picture: the keep members with the most posts
+note to or from others (the earlier member wins a tie). Numbers: the members n, 1 to count posts for everyone
+note too, keep, how many edge numbers follow, then the edges, five numbers a row: from, to, count, direct, to all.
+note The answer is a byte a member, 1 when it is picked; a member with no line is never picked
+fn swbusy b view uchar 1048576 c ulong ob edit uchar 65544 to ulong
+weight = new ulong 96 0
+flag = new ulong 96 0
+if lt c 4
+ret 0
+end
+nn = gi b 0
+if or le nn k_b gt nn add k_b 96
+ret 0
+end
+n = sub nn k_b
+ne2 = gu b 3
+if ne c add 4 ne2
+ret 0
+end
+e = ulong 0
+while lt add e 4 ne2 bound 16384
+if ge e 46080
+break
+end
+from = gi b add 4 e
+tv = gi b add 5 e
+cv = gi b add 7 e
+if eq gi b 1 add k_b 1
+cv = gi b add 6 e
+end
+if and and ge from k_b lt from add k_b n and ge tv k_b lt tv add k_b n
+if ge cv k_b
+put weight sub from k_b add get weight sub from k_b sub cv k_b
+put weight sub tv k_b add get weight sub tv k_b sub cv k_b
+end
+end
+e = add e 5
+end
+keep = gi b 2
+picked = ulong 0
+while lt picked n bound 128
+if ge add k_b picked keep
+break
+end
+best = ulong 1000
+for m ulong n
+if and eq get flag m 0 gt get weight m 0
+if eq best 1000
+best = m
+else
+if gt get weight m get weight best
+best = m
+end
+end
+end
+end
+if eq best 1000
+break
+end
+put flag best 1
+picked = add picked 1
+end
+for m ulong n
+put ob add 8 m uchar get flag m
+end
+ret n
+end
+
+note op 13: how many of the first posts each member sent to everyone. Numbers: the members n, upTo, how many posts
+note have a sender and how many have a to-all flag, then a post each: sender, 1 when it is to all. The answer is n
+note numbers (none when n is not 1 to 96). Returns the count of numbers
+fn swbroad b view uchar 1048576 c ulong ob edit uchar 65544 to ulong
+out = new ulong 96 0
+if lt c 4
+ret 0
+end
+nn = gi b 0
+if or le nn k_b gt nn add k_b 96
+ret 0
+end
+n = sub nn k_b
+posts = gu b 2
+if gt posts 100000
+posts = ulong 100000
+end
+upto = gi b 1
+if lt upto add k_b posts
+posts = ulong 0
+if gt upto k_b
+posts = sub upto k_b
+end
+end
+na = gu b 3
+i = ulong 0
+while lt i posts bound 512
+if or ge i 400 ge i na
+break
+end
+if gt add 6 mul i 2 c
+break
+end
+s = gi b add 4 mul i 2
+if eq gi b add 5 mul i 2 add k_b 1
+if and ge s k_b lt s add k_b n
+put out sub s k_b add get out sub s k_b 1
+end
+end
+i = add i 1
+end
+for m ulong n
+po ob m add k_b get out m
+end
+ret n
+end
+
+note kind 7: see the note above. Scalar ops answer one number: 1 state, 2 attention, 3 unread (the newest post
+note less the last one read; -1 not known), 4 group, 5 starts a group, 6 failure (how a member's newest step
+note failed: a model error at once, a failed tool step once it stayed newest for 60 seconds; 3 when the text
+note spoke of quota), 7 the line weight of an edge, 1 to 5, by its count against the heaviest, 8 to 11 as noted.
+note 13 and 16 answer a list of numbers; 12 and 14 answer bytes. Returns the reply length, or
+note 18446744073709551615 for a malformed request
+fn status ib view uchar 1048576 nb ulong ob edit uchar 65544 to ulong
+bad = ulong 18446744073709551615
+if lt nb 8
+ret bad
+end
+op = rd32 ib 0
+c = rd32 ib 4
+if gt add 8 mul c 8 nb
+ret bad
+end
+nbytes = sub nb add 8 mul c 8
+t0 = add 8 mul c 8
+r = k_b
+if eq op 1
+if ne c 5
+ret bad
+end
+r = add k_b swstate gi ib 0 gi ib 1 gi ib 2 gi ib 3 gi ib 4
+end
+if eq op 2
+if ne c 3
+ret bad
+end
+r = add k_b swatt gi ib 0 gi ib 1 gi ib 2
+end
+if eq op 3
+if ne c 2
+ret bad
+end
+r = sub k_b 1
+if ge gi ib 1 k_b
+r = k_b
+if gt gi ib 0 gi ib 1
+r = add k_b sub gi ib 0 gi ib 1
+end
+end
+end
+if eq op 4
+if ne c 4
+ret bad
+end
+r = add k_b swgroup gi ib 0 gi ib 1 gi ib 2 gi ib 3
+end
+if eq op 5
+if ne c 4
+ret bad
+end
+r = add k_b swstarts gi ib 0 gi ib 1 gi ib 2 gi ib 3
+end
+if eq op 6
+if ne c 4
+ret bad
+end
+failed = eq gi ib 0 add k_b 4
+if and eq gi ib 1 add k_b 2 ge gi ib 2 add k_b 60
+failed = true
+end
+r = k_b
+if failed
+r = add k_b 2
+if eq gi ib 3 add k_b 1
+r = add k_b 3
+end
+end
+end
+if eq op 7
+if ne c 2
+ret bad
+end
+cn = gi ib 0
+hv = gi ib 1
+r = add k_b 1
+if and gt cn add k_b 1 gt hv add k_b 1
+if ge cn hv
+r = add k_b 5
+else
+r = add add k_b 1 div mul sub sub cn k_b 1 4 sub sub hv k_b 1
+end
+end
+end
+if eq op 8
+r = add k_b swturn ib c
+end
+if eq op 9
+r = swact ib c
+end
+if eq op 10
+r = add k_b swquota ib t0 add t0 nbytes
+end
+if eq op 11
+if ne c 2
+ret bad
+end
+rl = gu ib 0
+nl = gu ib 1
+if or gt rl 1048576 gt nl 1048576
+ret bad
+end
+if ne add rl nl nbytes
+ret bad
+end
+r = add k_b swrole ib t0 rl add t0 rl nl
+end
+if eq op 12
+ret swedges ib c ob
+end
+if eq op 13
+ret mul 8 swbroad ib c ob
+end
+if eq op 14
+ret swbusy ib c ob
+end
+if eq op 16
+k = swderive ib c nbytes ob
+if eq k 0
+ret bad
+end
+ret mul k 8
+end
+if or gt op 11 eq op 0
+ret bad
+end
+po ob 0 r
+ret 8
+end
+
 note ---- which words were corrected (kind 4) ----
 note After Hop types a dictation, the field is read again later. The host splits three texts into words (what was
 note dictated, the field before, the field after) and gives each distinct word a number. This finds the dictation
@@ -3110,6 +4143,10 @@ st = 0
 end
 if eq kind 6
 m = asm ib n ob
+st = 0
+end
+if eq kind 7
+m = status ib n ob
 st = 0
 end
 if eq m 18446744073709551615
