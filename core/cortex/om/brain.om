@@ -21,7 +21,13 @@ const B_TAX ulong 36
 const B_REG ulong 37
 const B_NEWID ulong 38
 const B_TEXT ulong 39
+note bsup: superseder slot + 1 per entity slot (0 = not superseded). It is kept live: built once from
+note the replayed log (bn_ensure, on the first request that needs it), then updated by every Brain
+note write (bn_commit). A retract or hard delete marks it stale (bn_stale), and the next request
+note rebuilds it. bvi 1 = valid for every space. bsc is the scratch copy of the consistency check.
 global bsup ulong EMAX
+global bsc ulong EMAX
+global bvi uchar 1
 global bwr uchar 1
 global bmn ulong 2
 global bdy long 1
@@ -193,6 +199,7 @@ text bu_16 ",\"ftsRows\":"
 text bu_17 ",\"ftsRowCapacity\":"
 text bu_18 ",\"alarmPercent\":"
 text bu_19 ",\"alarms\":["
+text bu_20 ",\"supersedeIndexMismatches\":"
 text bn_n1 "entities"
 text bn_n2 "claims"
 text bn_n3 "spaces"
@@ -814,7 +821,7 @@ ret false
 end
 ret bn_isb e
 end
-note live: stored, not retracted and not superseded (bn_index first)
+note live: stored, not retracted and not superseded (bn_ensure first)
 fn bn_live e ulong d ulong to bool
 if not bn_in e d
 ret false
@@ -873,7 +880,7 @@ t = mnm_find get esl e r
 put hst 0 h
 ret t
 end
-note bsup for the entries of space d (NONE: every space)
+note full rebuild of bsup from the stored entries (d: one space; NONE: every space)
 fn bn_index d ulong to void
 n = get nent 0
 for e ulong 4611686018427387904
@@ -895,6 +902,44 @@ end
 end
 end
 end
+end
+note the live index, rebuilt only when it is stale (at start, after a retract or hard delete)
+fn bn_ensure to void
+if eq get bvi 0 1
+ret
+end
+bn_index NONE
+put bvi 0 1
+end
+note a retract or hard delete can make a superseded entry live again or remove slots: rebuild on
+note the next request (called from api3.om)
+fn bn_stale to void
+put bvi 0 0
+end
+note consistency check: mismatches between the live index and a full rebuild (NONE when the live index
+note is stale); the rebuilt index is kept
+fn bn_icheck to ulong
+if ne get bvi 0 1
+ret NONE
+end
+n = get nent 0
+for e ulong 4611686018427387904
+if ge e n
+break
+end
+put bsc e get bsup e
+end
+bn_index NONE
+k = ulong 0
+for e ulong 4611686018427387904
+if ge e n
+break
+end
+if ne get bsc e get bsup e
+k = add k 1
+end
+end
+ret k
 end
 fn bn_space to ulong
 sp = get ap A_SPACE
@@ -1487,8 +1532,15 @@ put jobl 0 0
 if ne st 201
 trap 9
 end
-e = mnm_find dict_find get ap A_SPACE get ap A_NAME
+d = dict_find get ap A_SPACE
+e = mnm_find d get ap A_NAME
 put bsup e 0
+note incremental update of the live index: the new entry supersedes its target
+s = get ap B_SUP
+if ne s NONE
+t = mnm_find d s
+put bsup t add e 1
+end
 ret e
 end
 fn bn_write to ulong
@@ -1503,7 +1555,7 @@ ret st
 end
 d = dict_find sp
 if ne d NONE
-bn_index d
+bn_ensure
 end
 st = bn_wlink d
 if ne st 0
@@ -1657,7 +1709,7 @@ ret 200
 end
 note ranked FTS rows over the live entries of d; NONE when the query failed (qerr)
 fn bn_fts d ulong lim ulong to ulong
-bn_index d
+bn_ensure
 for e ulong 4611686018427387904
 if ge e get nent 0
 break
@@ -1722,7 +1774,7 @@ end
 if not bn_isb e
 ret bn_errr 404 be_nf get ap A_NAME
 end
-bn_index d
+bn_ensure
 put jobl 0 0
 js_raw bo_get
 bn_oent e
@@ -1738,7 +1790,7 @@ end
 d = dict_find sp
 t = NONE
 if ne d NONE
-bn_index d
+bn_ensure
 t = mnm_find d get ap A_NAME
 end
 if eq t NONE
@@ -1982,7 +2034,7 @@ js_u64 dd
 js_raw bo_al3
 d = dict_find sp
 if ne d NONE
-bn_index d
+bn_ensure
 if ne get bfa 0 NONE
 put bfa 1 bn_cpty get bfa 0 d
 end
@@ -2058,7 +2110,7 @@ o_hs sp
 js_raw bo_recs
 d = dict_find sp
 if ne d NONE
-bn_index d
+bn_ensure
 if ne get bfa 0 NONE
 put bfa 1 bn_cpty get bfa 0 d
 end
@@ -2160,7 +2212,7 @@ if eq k 0
 ret bn_err 422 be_kind
 end
 b = get bhd 3
-bn_index d
+bn_ensure
 if bn_same e k b
 ret bn_isame e
 end
@@ -2249,6 +2301,13 @@ k = add k 1
 end
 end
 js_u64 k
+js_raw bu_20
+m = bn_icheck
+if eq m NONE
+js_raw tnull
+else
+js_u64 m
+end
 js_raw bu_18
 js_u64 p
 js_raw bu_19
