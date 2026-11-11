@@ -20,6 +20,8 @@ note                             (< 262144, the store's EMAX), columns canonical
 note                             content = qct[0..qctl). A doc slot already present is deleted
 note                             first (cortex-rs does DELETE then INSERT). false: row already
 note                             used by another doc, or a capacity limit (see below) was hit.
+note                             qgr[0] names the row's group (the caller's space_slug,
+note                             < 262144; false otherwise).
 note   fts_del doc               remove the FTS row of doc slot `doc` (no-op when absent)
 note   fts_reset                 drop every row
 note   fts_search -> ulong       MATCH string qq[0..qql) (SQLite reads it up to the first NUL),
@@ -29,6 +31,11 @@ note                             row count n; qrd[0..n) doc slots and qrb[0..n) 
 note                             SQL output order. qerr = 1 when SQLite would raise an error
 note                             (syntax error, unknown column, ...; cortex-rs then sees 0 rows),
 note                             2 when a capacity limit of this replica was hit (0 rows).
+note                             Only rows of group qgsel[0] are returned, and qok is read only
+note                             for them: the caller sets qok for the rows of that group
+note                             (fts_gfirst / fts_gnext walk them) and nothing else.
+note   fts_gfirst g / fts_gnext doc  the doc slots of group g in ascending rowid (NONE at the end)
+note   fts_icheck -> ulong       mismatches between the incremental index and a rebuild (0)
 note   fts_rows / fts_tokens     nRow and total token count (the bm25 table statistics)
 note Capacities: 262144 doc slots, 16777216 token words, 2097152 distinct terms (16 MiB of
 note term bytes), 8388608 posting entries per query batch, 65536 query terms/phrases/nodes,
@@ -168,6 +175,49 @@ global qfrq f64 QX
 global qidok ulong 1
 global qavg f64 1
 global qcln ulong QX
+note ---- incremental index (kept by fts_put and fts_del; fts_icheck compares it with a rebuild) ----
+note Term lists: one node per (term, row) pair, prepended when the row is put. A node holds the
+note doc slot and the slot's generation (qgen, bumped by every delete), so a deleted row's nodes
+note are skipped without unlinking. The node pool has the size of the token pool (a live pair
+note needs a token there), so fts_lbuild (run when the pool is full, half garbage, or after a
+note generation wraps) always makes room: the index has no capacity of its own.
+note qdf: the number of rows that hold each term (the bm25 hit count of a one-term phrase).
+note Groups: the rows of each group (qgr at put time) in a doubly linked list in ascending rowid,
+note qgc rows each. qlv: 0 nodes used, 1 garbage nodes, 2 rebuild pending, 3 the most tokens one
+note row has had since the last rebuild (an upper bound, used by the arena guard of fts_route).
+global qln uint QTKN
+global qld uint QTKN
+global qlh uint QTM
+global qdf uint QTM
+global qgen uint QD
+global qlv ulong 4
+global qdg uint QD
+global qgp uint QD
+global qgn uint QD
+global qgh uint QD
+global qgt uint QD
+global qgc uint QD
+global qgr ulong 1
+global qgsel ulong 1
+note candidate rows of one search, ascending rowid (posting entries hold an index into qcd);
+note qcs is the sort scratch, qcm marks rows already taken
+global qcd uint QD
+global qcs uint QD
+global qcn ulong 1
+global qcm uchar QD
+note qfb: phrases whose hit count is counted by running their clone
+global qfb uchar QX
+note qrte: 0 choose; 1 scan the group, 2 term lists, 3 every row (the plan before the index);
+note 4 choose but never take the term-count loop (fts_ortop); set only by tests.
+note qrst: route of the last search (1, 2, 3), its candidate count, 1 when fts_ortop ran
+global qrte ulong 1
+global qrst ulong 3
+global qkbad ulong 1
+note fts_ortop: term slot of each phrase (QX when the dictionary lacks it), counts per term slot,
+note the slots counted in the current row
+global qotk ulong QX
+global qotc ulong QX
+global qotu ulong QX
 fn fts_init to void
 if eq get qini 0 1
 ret
@@ -366,6 +416,7 @@ if eq get qsn 0 0
 put qtkn 0 0
 put qtkd 0 0
 put qtot 0 0
+fts_lclear
 ret
 end
 fts_del ulong get qsr sub get qsn 0 1
@@ -380,6 +431,8 @@ s1 = ulong get qdst doc
 if eq s1 0
 ret
 end
+fts_ldel doc
+fts_gdel doc
 s = sub s1 1
 n1 = ulong get qtk add s 1
 n2 = ulong get qtk add s 2
@@ -435,6 +488,9 @@ fts_init
 if ge doc QD
 ret false
 end
+if ge get qgr 0 QD
+ret false
+end
 fts_del doc
 p = fts_spos row
 if lt p get qsn 0
@@ -468,6 +524,8 @@ put qdst doc uint add s 1
 put qdrow doc row
 fts_sins p doc
 put qtot 0 add get qtot 0 add n1 n2
+fts_ladd doc
+fts_gadd doc row
 ret true
 end
 note undo a partly tokenized row (n tokens already counted in qtmf)
@@ -2234,7 +2292,7 @@ i = add i 1
 end
 end
 end
-note build posting entries for patterns p0..p1-1 (at most 64): one scan of every row
+note build posting entries for patterns p0..p1-1 (at most 64): one scan of every candidate row
 fn fts_batch p0 ulong p1 ulong to void
 w = ulong 0
 for k ulong sub p1 p0
@@ -2246,7 +2304,7 @@ end
 for k ulong sub p1 p0
 z = fts_markp add p0 k k
 end
-n = get qsn 0
+n = get qcn 0
 r = ulong 0
 for a ulong 5
 for j ulong 999999
@@ -2261,7 +2319,7 @@ end
 fts_unmark
 end
 fn fts_scanrow r ulong p0 ulong to void
-s = sub ulong get qdst ulong get qsr r 1
+s = sub ulong get qdst ulong get qcd r 1
 n1 = ulong get qtk add s 1
 nt = add n1 ulong get qtk add s 2
 fts_scandoc r add s 3 n1 nt p0
@@ -2296,12 +2354,16 @@ put qpe1 p add w 1
 end
 end
 end
-note count pattern occurrences, then scan in batches of at most 64 patterns and QE entries
-fn fts_postings to void
+note count pattern occurrences (store-wide: an upper bound on the entries of any row set)
+fn fts_pcount to void
 for p ulong get qpn 0
 put qpcn p fts_markp p 0
 fts_unmark
 end
+end
+note posting entries of the candidate rows qcd[0..qcn), in batches of at most 64 patterns and
+note QE entries (fts_pcount first: a pattern above QE is the capacity error 2)
+fn fts_postings to void
 np = get qpn 0
 p0 = ulong 0
 while lt p0 np bound 999999
@@ -2467,6 +2529,8 @@ note ---------------- the search ----------------
 fn fts_qreset to void
 put qerr 0 0
 put qrn 0 0
+put qrst 0 0
+put qrst 2 0
 put qxn 0 0
 put qxbn 0 0
 put qhcn 0 0
@@ -2576,6 +2640,26 @@ end
 for t ulong get qxn 0
 put qxp t fts_patof t
 end
+fts_pcount
+np = get qpn 0
+for p ulong np
+if gt get qpcn p QE
+put qerr 0 2
+ret 0
+end
+end
+if ne get qlv 2 0
+fts_lbuild
+end
+if not fts_plan
+ret 0
+end
+put qrst 2 0
+if fts_orok
+put qrst 2 1
+fts_ortop lim
+ret get qrn 0
+end
 fts_postings
 if fts_bad
 ret 0
@@ -2600,7 +2684,7 @@ ret get qrn 0
 end
 fn fts_row lim ulong to void
 o = get qroot 0
-doc = ulong get qsr get qow o
+doc = ulong get qcd get qow o
 if eq get qidok 0 0
 fts_idf
 end
@@ -2613,6 +2697,861 @@ if ne b b
 b = 5.0
 end
 if eq get qok doc 1
+if eq ulong get qdg doc get qgsel 0
 fts_sort b doc lim
+end
+end
+end
+note ---------------- the plan: which rows the query runs over ----------------
+note Rows the query runs over, into qcd: 1 (scan the group's list) or 2 (the term lists of each
+note phrase's driver term) give the group's rows with qok 1 that can match, then the bm25
+note statistics are computed before the row loop (fts_idfall); 3 is every row of the table with
+note the statistics computed at the first matching row, which is how SQLite runs it. The answer
+note is the same: a row matches or not on its own tokens, rows keep their rowid order, idf uses
+note store-wide counts, and fts_route takes 3 whenever a row outside the candidates could make
+note the arena overflow (the capacity error SQLite's plan would then raise). false: no rows.
+fn fts_plan to bool
+md = fts_route
+put qrst 0 md
+if eq md 3
+fts_call
+put qrst 1 get qcn 0
+ret true
+end
+fts_cmain md
+put qrst 1 get qcn 0
+if eq get qcn 0 0
+ret false
+end
+if fts_idfall
+fts_cmain md
+end
+if fts_bad
+put qerr 0 0
+put qidok 0 0
+put qpan 0 0
+put qpah 0 0
+for h ulong get qhcn 0
+put qhsel h 0
+end
+put qrst 0 3
+fts_call
+put qrst 1 get qcn 0
+end
+ret true
+end
+fn fts_route to ulong
+r = get qrte 0
+if eq r 3
+ret 3
+end
+if gt mul mul 2 get qhcn 0 get qlv 3 QA
+ret 3
+end
+g = get qgsel 0
+gs = ulong 0
+if lt g QD
+gs = ulong get qgc g
+end
+tc = ulong 0
+inf = false
+for i ulong get qapn 0
+h = sub get qap i 1
+if gt get qhn h 0
+x = fts_drv h
+if eq x QX
+inf = true
+else
+tc = add tc fts_xdf x
+end
+end
+end
+if or eq r 1 inf
+ret 1
+end
+if or eq r 2 lt tc gs
+ret 2
+end
+ret 1
+end
+note term id of query term x (QTM when the dictionary does not hold it) and its row count
+fn fts_xtid x ulong to ulong
+ret fts_tid 1 get qxo x get qxl x false
+end
+fn fts_xdf x ulong to ulong
+t = fts_xtid x
+if eq t QTM
+ret 0
+end
+ret ulong get qdf t
+end
+note driver of phrase h: its non-prefix term held by the fewest rows (QX when all are prefixes);
+note a row that matches the phrase holds it
+fn fts_drv h ulong to ulong
+t0 = get qht0 h
+b = QX
+bd = ulong 0
+for k ulong get qhn h
+x = add t0 k
+if eq get qxr x 0
+d = fts_xdf x
+if or eq b QX lt d bd
+b = x
+bd = d
+end
+end
+end
+ret b
+end
+note candidates of the query in group qgsel with qok 1, ascending rowid (md 1 group, 2 terms)
+fn fts_cmain md ulong to void
+put qcn 0 0
+g = get qgsel 0
+if ge g QD
+ret
+end
+if eq md 1
+fts_cgrp g
+ret
+end
+for i ulong get qapn 0
+h = sub get qap i 1
+if gt get qhn h 0
+fts_clist fts_xtid fts_drv h g true
+end
+end
+fts_cfin
+end
+note every row, ascending rowid
+fn fts_call to void
+n = get qsn 0
+r = ulong 0
+for a ulong 4611686018427387904
+if ge r n
+break
+end
+put qcd r get qsr r
+r = add r 1
+end
+put qcn 0 n
+end
+fn fts_cgrp g ulong to void
+p = ulong get qgh g
+for a ulong 4611686018427387904
+if eq p 0
+ret
+end
+doc = sub p 1
+if eq get qok doc 1
+n = get qcn 0
+put qcd n uint doc
+put qcn 0 add n 1
+end
+p = ulong get qgn doc
+end
+end
+note the live rows of term t's list (filt: only group g with qok 1), each once
+fn fts_clist t ulong g ulong filt bool to void
+if eq t QTM
+ret
+end
+k = ulong get qlh t
+for a ulong 4611686018427387904
+if eq k 0
+ret
+end
+v = ulong get qld sub k 1
+doc = and v 262143
+if fts_lok doc v
+if fts_cok doc g filt
+fts_cadd doc
+end
+end
+k = ulong get qln sub k 1
+end
+end
+note filt: the row is in group g and its qok is 1
+fn fts_cok doc ulong g ulong filt bool to bool
+if not filt
+ret true
+end
+if ne ulong get qdg doc g
+ret false
+end
+ret eq get qok doc 1
+end
+note node value v (doc | generation << 18) names the live row of doc
+fn fts_lok doc ulong v ulong to bool
+if eq get qdst doc 0
+ret false
+end
+ret eq shr v 18 ulong get qgen doc
+end
+fn fts_cadd doc ulong to void
+if eq get qcm doc 0
+put qcm doc 1
+n = get qcn 0
+put qcd n uint doc
+put qcn 0 add n 1
+end
+end
+fn fts_cunm to void
+n = get qcn 0
+k = ulong 0
+for a ulong 4611686018427387904
+if ge k n
+ret
+end
+put qcm ulong get qcd k 0
+k = add k 1
+end
+end
+note clear the marks and put the candidates in ascending rowid
+fn fts_cfin to void
+fts_cunm
+n = get qcn 0
+if lt n 2
+ret
+end
+up = true
+dn = true
+k = ulong 1
+for a ulong 4611686018427387904
+if ge k n
+break
+end
+x = fts_crow 0 sub k 1
+y = fts_crow 0 k
+if gt x y
+up = false
+else
+dn = false
+end
+k = add k 1
+end
+if up
+ret
+end
+if dn
+fts_crev n
+ret
+end
+fts_csort n
+end
+fn fts_crev n ulong to void
+i = ulong 0
+j = sub n 1
+for a ulong 4611686018427387904
+if ge i j
+ret
+end
+x = get qcd i
+put qcd i get qcd j
+put qcd j x
+i = add i 1
+j = sub j 1
+end
+end
+note rowid of candidate i of array s (0 qcd, 1 qcs)
+fn fts_crow s ulong i ulong to ulong
+if eq s 0
+ret get qdrow ulong get qcd i
+end
+ret get qdrow ulong get qcs i
+end
+fn fts_cget s ulong i ulong to uint
+if eq s 0
+ret get qcd i
+end
+ret get qcs i
+end
+fn fts_cput s ulong i ulong v uint to void
+if eq s 0
+put qcd i v
+ret
+end
+put qcs i v
+end
+note bottom-up merge sort of qcd[0..n) by rowid (rowids are distinct)
+fn fts_csort n ulong to void
+s = ulong 0
+w = ulong 1
+while lt w n bound 64
+i = ulong 0
+for a ulong 4611686018427387904
+if ge i n
+break
+end
+m = add i w
+if gt m n
+m = n
+end
+e = add m w
+if gt e n
+e = n
+end
+fts_cmerge s i m e
+i = e
+end
+s = xor s 1
+w = mul w 2
+end
+if eq s 1
+for k ulong 4611686018427387904
+if ge k n
+break
+end
+put qcd k get qcs k
+end
+end
+end
+fn fts_cmerge s ulong i0 ulong m ulong e ulong to void
+d = xor s 1
+i = i0
+j = m
+k = i0
+for a ulong 4611686018427387904
+if ge k e
+ret
+end
+ti = lt i m
+if and ti lt j e
+ti = lt fts_crow s i fts_crow s j
+end
+if ti
+fts_cput d k fts_cget s i
+i = add i 1
+else
+fts_cput d k fts_cget s j
+j = add j 1
+end
+k = add k 1
+end
+end
+note bm25 statistics before the row loop: qavg and each phrase's idf. A one-term phrase with no
+note prefix, caret or column filter matches exactly the rows that hold the term, so its hit count
+note is qdf. The others are counted by running their clone over the rows that hold their driver
+note term (all rows when a phrase has only prefix terms). true when qcd was used for that.
+fn fts_idfall to bool
+nr = get qsn 0
+put qavg 0 div f64 long get qtot 0 f64 long nr
+np = get qapn 0
+nf = ulong 0
+for i ulong np
+h = sub get qap i 1
+put qfb i 0
+if fts_simple h
+put qidf i fts_idf1 nr fts_hdf h
+else
+put qfb i 1
+nf = add nf 1
+end
+end
+if eq nf 0
+put qidok 0 1
+ret false
+end
+fts_cglob
+fts_postings
+if fts_bad
+ret true
+end
+for i ulong np
+if eq get qfb i 1
+put qidf i fts_idf1 nr fts_nhit get qcln i
+end
+end
+put qidok 0 1
+ret true
+end
+fn fts_simple h ulong to bool
+n = get qhn h
+if eq n 0
+ret true
+end
+if ne n 1
+ret false
+end
+t0 = get qht0 h
+if or ne get qxr t0 0 ne get qxf t0 0
+ret false
+end
+y = get qoy sub get qhnd h 1
+ret eq get qycs sub y 1 0
+end
+fn fts_hdf h ulong to ulong
+if eq get qhn h 0
+ret 0
+end
+ret fts_xdf get qht0 h
+end
+note rows for the counted phrases (qfb), every group and no qok filter, ascending rowid
+fn fts_cglob to void
+put qcn 0 0
+all = false
+for i ulong get qapn 0
+if eq get qfb i 1
+h = sub get qap i 1
+if gt get qhn h 0
+x = fts_drv h
+if eq x QX
+all = true
+else
+fts_clist fts_xtid x 0 false
+end
+end
+end
+end
+if all
+fts_cunm
+fts_call
+ret
+end
+fts_cfin
+end
+note ---------------- index upkeep ----------------
+note first token word of row doc's region and its token count
+fn fts_rtok doc ulong to ulong
+ret add ulong get qdst doc 2
+end
+fn fts_rcnt doc ulong to ulong
+s = sub ulong get qdst doc 1
+ret add ulong get qtk add s 1 ulong get qtk add s 2
+end
+note walk the distinct terms of row doc; md bits: 1 add a list node, 2 count it in qdf, 4 uncount;
+note returns the number of distinct terms
+fn fts_lwalk doc ulong md ulong to ulong
+s = fts_rtok doc
+n = fts_rcnt doc
+v = uint or doc shl ulong get qgen doc 18
+c = ulong 0
+i = ulong 0
+for a ulong 4611686018427387904
+if ge i n
+break
+end
+t = ulong get qtk add s i
+if eq get qtmk t 0
+fts_mark1 t 0
+c = add c 1
+fts_lstep t v md
+end
+i = add i 1
+end
+fts_unmark
+ret c
+end
+fn fts_lstep t ulong v uint md ulong to void
+if ne and md 4 0
+put qdf t uint sub ulong get qdf t 1
+end
+if ne and md 2 0
+put qdf t uint add ulong get qdf t 1
+end
+if ne and md 1 0
+k = get qlv 0
+put qld k v
+put qln k get qlh t
+put qlh t uint add k 1
+put qlv 0 add k 1
+end
+end
+note a row was put: count its terms, add its nodes (or rebuild when the pool is full, half
+note garbage, or a rebuild is pending)
+fn fts_ladd doc ulong to void
+n = fts_rcnt doc
+if gt n get qlv 3
+put qlv 3 n
+end
+u = get qlv 0
+g = get qlv 1
+full = gt add u n QTKN
+junk = and gt g 1048576 gt mul g 2 u
+if or or full junk ne get qlv 2 0
+z = fts_lwalk doc 2
+fts_lbuild
+ret
+end
+z2 = fts_lwalk doc 3
+end
+note a row is deleted: uncount its terms; its nodes turn to garbage by the generation bump
+fn fts_ldel doc ulong to void
+c = fts_lwalk doc 4
+put qlv 1 add get qlv 1 c
+g = add ulong get qgen doc 1
+if ge g 16384
+g = ulong 0
+put qlv 2 1
+end
+put qgen doc uint g
+end
+fn fts_lclear to void
+nt = get qtmc 0
+k = ulong 0
+for a ulong 4611686018427387904
+if ge k nt
+break
+end
+put qlh k 0
+k = add k 1
+end
+put qlv 0 0
+put qlv 1 0
+put qlv 2 0
+put qlv 3 0
+end
+note rebuild every term list from the rows (qdf is not touched: it is kept by put and delete)
+fn fts_lbuild to void
+fts_lclear
+m = ulong 0
+n = get qsn 0
+r = ulong 0
+for a ulong 4611686018427387904
+if ge r n
+break
+end
+doc = ulong get qsr r
+z = fts_lwalk doc 1
+x = fts_rcnt doc
+if gt x m
+m = x
+end
+r = add r 1
+end
+put qlv 3 m
+end
+note link row doc into group qgr after the last row with a smaller rowid
+fn fts_gadd doc ulong row ulong to void
+g = get qgr 0
+put qdg doc uint g
+p = ulong get qgt g
+for a ulong 4611686018427387904
+if eq p 0
+break
+end
+if lt get qdrow sub p 1 row
+break
+end
+p = ulong get qgp sub p 1
+end
+x = ulong 0
+if eq p 0
+x = ulong get qgh g
+put qgh g uint add doc 1
+else
+x = ulong get qgn sub p 1
+put qgn sub p 1 uint add doc 1
+end
+put qgp doc uint p
+put qgn doc uint x
+if eq x 0
+put qgt g uint add doc 1
+else
+put qgp sub x 1 uint add doc 1
+end
+put qgc g uint add ulong get qgc g 1
+end
+fn fts_gdel doc ulong to void
+g = ulong get qdg doc
+p = ulong get qgp doc
+x = ulong get qgn doc
+if eq p 0
+put qgh g uint x
+else
+put qgn sub p 1 uint x
+end
+if eq x 0
+put qgt g uint p
+else
+put qgp sub x 1 uint p
+end
+put qgc g uint sub ulong get qgc g 1
+put qgp doc 0
+put qgn doc 0
+end
+fn fts_gfirst g ulong to ulong
+if ge g QD
+ret 18446744073709551615
+end
+p = ulong get qgh g
+if eq p 0
+ret 18446744073709551615
+end
+ret sub p 1
+end
+fn fts_gnext doc ulong to ulong
+x = ulong get qgn doc
+if eq x 0
+ret 18446744073709551615
+end
+ret sub x 1
+end
+note ---------------- consistency check ----------------
+fn fts_icheck to ulong
+fts_init
+if ne get qlv 2 0
+fts_lbuild
+end
+put qkbad 0 0
+tot = ulong 0
+nt = get qtmc 0
+t = ulong 0
+for a ulong 4611686018427387904
+if ge t nt
+break
+end
+c = fts_kcheck t
+if ne c ulong get qdf t
+put qkbad 0 add get qkbad 0 1
+end
+tot = add tot c
+t = add t 1
+end
+pairs = ulong 0
+n = get qsn 0
+r = ulong 0
+for a2 ulong 4611686018427387904
+if ge r n
+break
+end
+doc = ulong get qsr r
+pairs = add pairs fts_lwalk doc 0
+if gt fts_rcnt doc get qlv 3
+put qkbad 0 add get qkbad 0 1
+end
+r = add r 1
+end
+if ne tot pairs
+put qkbad 0 add get qkbad 0 1
+end
+ret add get qkbad 0 fts_gcheck
+end
+note live nodes of term t's list; each must name a different row that holds t
+fn fts_kcheck t ulong to ulong
+put qcn 0 0
+c = ulong 0
+k = ulong get qlh t
+for a ulong 4611686018427387904
+if eq k 0
+break
+end
+v = ulong get qld sub k 1
+doc = and v 262143
+if fts_lok doc v
+if eq get qcm doc 1
+put qkbad 0 add get qkbad 0 1
+else
+fts_cadd doc
+c = add c 1
+if not fts_rhas doc t
+put qkbad 0 add get qkbad 0 1
+end
+end
+end
+k = ulong get qln sub k 1
+end
+fts_cunm
+ret c
+end
+fn fts_rhas doc ulong t ulong to bool
+s = fts_rtok doc
+n = fts_rcnt doc
+i = ulong 0
+for a ulong 4611686018427387904
+if ge i n
+ret false
+end
+if eq ulong get qtk add s i t
+ret true
+end
+i = add i 1
+end
+ret false
+end
+note every group list: linked both ways, ascending rowid, live rows of that group, counted
+fn fts_gcheck to ulong
+bad = ulong 0
+tot = ulong 0
+for g ulong 262144
+if or ne get qgh g 0 ne get qgc g 0
+bad = add bad fts_g1 g
+tot = add tot ulong get qgc g
+end
+if ne get qgt g 0
+if eq get qgh g 0
+bad = add bad 1
+end
+end
+end
+if ne tot get qsn 0
+bad = add bad 1
+end
+ret bad
+end
+fn fts_g1 g ulong to ulong
+bad = ulong 0
+p = ulong 0
+x = ulong get qgh g
+c = ulong 0
+for a ulong 4611686018427387904
+if eq x 0
+break
+end
+if gt c get qsn 0
+ret add bad 1
+end
+doc = sub x 1
+bad = add bad fts_g1row doc g p
+c = add c 1
+p = x
+x = ulong get qgn doc
+end
+if ne ulong get qgt g p
+bad = add bad 1
+end
+if ne c ulong get qgc g
+bad = add bad 1
+end
+ret bad
+end
+note row doc of group g's list, after p (previous doc + 1, 0 at the head)
+fn fts_g1row doc ulong g ulong p ulong to ulong
+bad = ulong 0
+if or eq get qdst doc 0 ne ulong get qdg doc g
+bad = add bad 1
+end
+if ne ulong get qgp doc p
+bad = add bad 1
+end
+if gt p 0
+if le get qdrow doc get qdrow sub p 1
+bad = add bad 1
+end
+end
+ret bad
+end
+note ---------------- the term-count loop ----------------
+note A query that is one-term phrases joined by OR (what Brain read-before sends), each with no
+note prefix, caret or column filter, matches a row exactly when the row holds one of the terms,
+note and phrase i's instance count there is the number of times its term occurs in the row (a
+note TERM node with every column selected). fts_ortop gets those counts with one pass over each
+note candidate row's tokens and scores and keeps the rows as fts_row does, in the same order with
+note the same bm25 operations, instead of building posting entries and running the node engine.
+fn fts_orok to bool
+if or eq get qrte 0 4 eq get qrst 0 3
+ret false
+end
+if eq get qexpr 0 0
+ret false
+end
+ret fts_oknode get qroot 0
+end
+note node o is OR over such nodes, or a TERM node of a one-term phrase without filters
+fn fts_oknode o ulong to bool
+ty = get qot o
+if eq ty 1
+for i ulong get qoc o
+if not fts_oknode sub fts_child o i 1
+ret false
+end
+end
+ret true
+end
+if ne ty 4
+ret false
+end
+y = sub get qoy o 1
+if ne get qyk y 1
+ret false
+end
+if ne get qycs y 0
+ret false
+end
+h = fts_ph y 0
+if ne get qhn h 1
+ret false
+end
+t0 = get qht0 h
+ret and eq get qxr t0 0 eq get qxf t0 0
+end
+fn fts_ortop lim ulong to void
+np = get qapn 0
+nk = ulong 0
+for i ulong np
+t = fts_xtid get qht0 sub get qap i 1
+k = QX
+if ne t QTM
+m = get qtmk t
+if eq m 0
+nk = add nk 1
+m = nk
+put qtmk t m
+put qotc sub m 1 0
+j = get qmkn 0
+put qmkl j uint t
+put qmkn 0 add j 1
+end
+k = sub m 1
+end
+put qotk i k
+end
+n = get qcn 0
+c = ulong 0
+for a ulong 4611686018427387904
+if ge c n
+break
+end
+fts_orrow ulong get qcd c lim
+c = add c 1
+end
+fts_unmark
+end
+note count the query terms in row doc; when one occurs, score the row and keep it
+fn fts_orrow doc ulong lim ulong to void
+s = fts_rtok doc
+n = fts_rcnt doc
+u = ulong 0
+i = ulong 0
+for a ulong 4611686018427387904
+if ge i n
+break
+end
+m = get qtmk ulong get qtk add s i
+if ne m 0
+k = sub m 1
+v = get qotc k
+if eq v 0
+put qotu u k
+u = add u 1
+end
+put qotc k add v 1
+end
+i = add i 1
+end
+if eq u 0
+ret
+end
+fts_orscore doc n lim
+for j ulong u
+put qotc get qotu j 0
+end
+end
+fn fts_orscore doc ulong dt ulong lim ulong to void
+for i ulong get qapn 0
+k = get qotk i
+f = 0.0f64
+if ne k QX
+f = f64 get qotc k
+end
+put qfrq i f
+end
+b = fts_bm25 dt
+if ne b b
+b = 5.0
+end
+if eq get qok doc 1
+if eq ulong get qdg doc get qgsel 0
+fts_sort b doc lim
+end
 end
 end

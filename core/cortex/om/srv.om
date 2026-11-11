@@ -3,10 +3,15 @@ note   state process  (the first one) owns the log and the in-memory store and a
 note                  requests one at a time on a private local socket, so writes stay serialized
 note                  and crash-safe exactly as with one connection;
 note   acceptor       forked before the store is loaded (small, cheap to fork); owns the TCP
-note                  listener and forks one handler per connection (at most S_MAXH alive);
-note   handler        reads one whole request from its client under the header, request and idle
-note                  deadlines (hto), forwards the raw bytes to the state process, reads the whole
-note                  answer and writes it to the client under its own deadline.
+note                  listener (non-blocking) and keeps a pool of handlers: at least SV_IDLE idle,
+note                  at most S_MAXH alive, an extra one leaving after 10 s without a connection;
+note   handler        a long-lived process that accepts a connection itself, reads one whole
+note                  request under the header, request and idle deadlines (hto), forwards the raw
+note                  bytes to the state process, reads the whole answer and writes it to the client
+note                  under its own deadline, then takes the next connection. It tells the acceptor
+note                  on a status pipe when it takes and finishes a connection. (Until 2026-11-11 the
+note                  acceptor forked one handler per connection: the fork cost about 0.25 ms of
+note                  each request, evidence/brain/bench.)
 note A slow or stalled client only holds its own handler. The state process never reads from or
 note writes to a client socket.
 global upath uchar 108
@@ -21,6 +26,17 @@ global pxn ulong 2
 global snh ulong 1
 const S_MAXH ulong 256
 const S_SOCKMX ulong 100
+const SV_IDLE ulong 2
+note handler pool: status pipe fds (sbp), status messages read (sbb, two bytes each: 98 or 100 and
+note the handler's slot), busy handlers (snb), each slot's pid (shp, 0 free) and busy flag (shb);
+note in a handler: swk 0 the status pipe's write end, swk 1 1 for an extra handler, swk 2 its slot
+global sbp uchar 8
+global sbb uchar 256
+global snb ulong 1
+global swk ulong 3
+global shp ulong S_MAXH
+global shb uchar S_MAXH
+global sms uchar 2
 text a_sock "--sock"
 text sockext ".sock"
 text m_sockp "cortex: private socket path too long (at most 100 bytes; use --sock PATH)\n"
@@ -157,6 +173,15 @@ end
 ret int v
 end
 
+note int at byte off of the status pipe pair sbp
+fn sv_sbword off ulong to int
+v = ulong 0
+for i ulong 4
+b = ulong get sbp add off i
+v = or v shl b mul i 8
+end
+ret int v
+end
 note send b[0..n) of rqraw to u within dl; true when all of it went
 fn sv_sendraw u int n ulong dl long to bool
 o = ulong 0
@@ -262,7 +287,8 @@ end
 x2 = shutdown c 1
 end
 
-note reap finished handlers without blocking
+note reap finished handlers without blocking; a handler that ends while busy (a trap inside
+note sv_handle) is no longer counted as busy
 fn sv_reap to void
 for k ulong 1024
 r = waitpid neg int 1 sst 0 len sst 1
@@ -273,44 +299,171 @@ h = get snh 0
 if gt h 0
 put snh 0 sub h 1
 end
+for s ulong S_MAXH
+if eq get shp s ulong r
+if and eq get shb s 1 gt get snb 0 0
+put snb 0 sub get snb 0 1
+end
+put shp s 0
+put shb s 0
+end
+end
 end
 end
 note acceptor loop; returns in the acceptor when the state process is gone (its end of the go
-note pipe pr closed, so pr turns readable), and in each handler after its connection is done
-note (both then exit). getppid is not used: omc 189ada82 emits the x86-64 number (110) for it on
-note arm64, fixed upstream after this pin.
+note pipe pr closed, so pr turns readable), and in each handler when it leaves sv_work (both then
+note exit). The status messages are read before the reaping, so a dead handler's last message is
+note counted before its slot is freed, and once more after it (before a slot is reused), so a message
+note a handler wrote just before it died is dropped instead of being given to the slot's next
+note handler. When the state process is gone the listener is shut down,
+note so a new server can bind the port while a busy handler still finishes its client. getppid is
+note not used: omc 189ada82 emits the x86-64 number (110) for it on arm64, fixed upstream after
+note this pin.
 fn sv_accept lfd int pr int to void
 put snh 0 0
+put snb 0 0
+r = pipefds sbp 0 len sbp 524288
+if ne r 0
+ret
+end
+sr = sv_sbword 0
+sw = sv_sbword 4
+while true bound 999999
+for k ulong 999999
+if gt waitio pr 1 0 0
+x = shutdown lfd 0
+ret
+end
+sv_drain sr
+sv_reap
+sv_drain sr
+if sv_spawn lfd pr sr sw
+ret
+end
+w = waitio sr 1 200000000
+if gt w 0
+sv_drain sr
+end
+end
+end
+end
+note fork handlers until SV_IDLE are idle or S_MAXH are alive; true in a handler that has left
+note sv_work
+fn sv_spawn lfd int pr int sr int sw int to bool
+for k ulong 256
+h = get snh 0
+if ge h S_MAXH
+ret false
+end
+b = get snb 0
+if and gt h b ge sub h b SV_IDLE
+ret false
+end
+s = sv_slot
+if eq s S_MAXH
+ret false
+end
+pid = fork
+if lt pid 0
+ret false
+end
+if eq pid 0
+x = fclose sr
+put swk 0 ulong sw
+put swk 1 0
+if ge h SV_IDLE
+put swk 1 1
+end
+put swk 2 s
+sv_work lfd pr
+ret true
+end
+put shp s ulong pid
+put shb s 0
+put snh 0 add h 1
+end
+ret false
+end
+note a free handler slot (S_MAXH when none)
+fn sv_slot to ulong
+for s ulong S_MAXH
+if eq get shp s 0
+ret s
+end
+end
+ret S_MAXH
+end
+note read every status message waiting on the pipe: 98 a handler took a connection, 100 finished it
+note (two-byte writes are atomic on a pipe, and sbb holds a whole number of messages)
+fn sv_drain sr int to void
+for k ulong 4096
+if le waitio sr 1 0 0
+ret
+end
+n = read sr sbb 0 len sbb
+if le n 0
+ret
+end
+for i ulong div ulong n 2
+j = mul i 2
+c = ulong get sbb j
+sv_msg c ulong get sbb add j 1
+end
+end
+end
+fn sv_msg c ulong s ulong to void
+if ge s S_MAXH
+ret
+end
+if eq get shp s 0
+ret
+end
+if and eq c 98 eq get shb s 0
+put shb s 1
+put snb 0 add get snb 0 1
+end
+if and eq c 100 eq get shb s 1
+put shb s 0
+if gt get snb 0 0
+put snb 0 sub get snb 0 1
+end
+end
+end
+note a handler: accept and serve connections until the state process is gone, or (an extra
+note handler) until 10 s pass without a connection. The listener is non-blocking: when another
+note handler took the connection first, accept fails and the handler waits again.
+fn sv_work lfd int pr int to void
+t0 = monons
 while true bound 999999
 for k ulong 999999
 if gt waitio pr 1 0 0
 ret
 end
-sv_reap
-if ge get snh 0 S_MAXH
-x = sleepns 1000000
-continue
-end
 w = waitio lfd 1 200000000
 if gt w 0
 c = accept lfd 524288
 if ge c 0
-pid = fork
-if eq pid 0
-x = fclose lfd
-x = fclose pr
+sv_note 98
 sv_handle int c
 x = fclose int c
+sv_note 100
+t0 = monons
+end
+else
+if eq get swk 1 1
+if gt sub monons t0 10000000000
 ret
 end
-if gt pid 0
-put snh 0 add get snh 0 1
-end
-x = fclose int c
 end
 end
 end
 end
+end
+fn sv_note b ulong to void
+put sone 0 uchar b
+put sms 0 uchar b
+put sms 1 uchar get swk 2
+x = write int get swk 0 sms 0 2
 end
 note acceptor process: wait for the state process's go byte, bind TCP, report, serve
 fn sv_accmain pr int qw int to int
