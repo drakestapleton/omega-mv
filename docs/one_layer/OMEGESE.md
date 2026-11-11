@@ -575,6 +575,9 @@ tables, with that one grown by one entry, no longer fit in the arena (measured: 
 which every one holds a name, 16,777,209 of 16,777,216 words in use at the refusal). Name, long-name
 and function lookups are hashed, and the call graph is settled in linear time, so compile time stays
 linear (`seed/omc/gate-usage.sh` times units up to 100,000 names, calls and trap sites).
+`seed/omc/gate-nocaps.sh` drives every table past its first room and compiles those units with a checked
+twin of omc as well, in which an index past its table is trap 3 (omc c52e986e and 1e628c80 stopped with
+trap 3 on a unit with more inline edges than its call table held; fixed 2026-11-11).
 What is left, and why:
 
 - The arena: 16777216 8-byte words (128 MiB), one named pool in `seed/omc/omc.om` (`a_ar`). A unit whose

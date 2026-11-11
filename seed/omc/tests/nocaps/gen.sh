@@ -90,3 +90,23 @@ echo 12 > "$D/longnames20k.want"
 awk 'BEGIN { p = "note "; for (i = 0; i < 94; i++) p = p "p"; n = int((64 * 1048576 - 47) / 100)
   for (i = 0; i < n; i++) print p; print "fn main to int"; print "x = int 41"; print "x = add x 1"; print "ret x"; print "end" }' > "$D/in64m.om"
 echo 42 > "$D/in64m.want"
+# inline65 / inline1000 / inline22k: 65, 1,000 and 22,000 inline edges and no call. L inline leaves b1..bL,
+# a root inline a that expands every leaf, and M functions (main and g1..) that each expand the root: each of
+# them records an edge to the root and to every leaf, and the root's own body one to every leaf, so
+# (L + 1) * M + L edges (L, M = 5, 10; 12, 76; 48, 448). main returns the root, L (each leaf is 1).
+# NAME.ie is the edge count the omc-use record must show (inledge=N). NAME.old is the status of the f4fa7951
+# control when it is not error 14: its fixed edge table held 16384, so it compiles 65 and 1,000. NAME.c2 is
+# the status of the second control, omc 1e628c80: its inline-cycle check (rscan) read the calls table at
+# each edge's index, past the calls table's room once the edges outnumbered it: trap 3, exit 103.
+ie() { awk -v L=$1 -v M=$2 'BEGIN { print "om2"; for (i = 1; i <= L; i++) printf "fn b%d to int inline\nret 1\nend\n", i
+  print "fn a to int inline"; print "x = int 0"; for (i = 1; i <= L; i++) printf "x = add x b%d\n", i; print "ret x"; print "end"
+  for (j = 1; j < M; j++) printf "fn g%d to int\nret a\nend\n", j; print "fn main to int"; print "ret a"; print "end" }'; }
+for v in 65:5:10 1000:12:76 22k:48:448; do
+  n=${v%%:*}; r=${v#*:}; l=${r%%:*}; m=${r#*:}
+  ie $l $m > "$D/inline$n.om"
+  echo $l > "$D/inline$n.want"
+  echo $(( (l + 1) * m + l )) > "$D/inline$n.ie"
+  echo 103 > "$D/inline$n.c2"
+done
+echo 0 > "$D/inline65.old"
+echo 0 > "$D/inline1000.old"
