@@ -29,8 +29,13 @@ sh bench/inference_cost/driver.sh --run-model --endpoint http://127.0.0.1:18091 
   `"stream":false`.
 - The other options and their defaults are `--temperature 0.2`, `--max-tokens 4096` and
   `--out build/inference_cost/run-<utc>-<pid>`.
-- A missing endpoint, a curl failure, a non-200 status, or a body without `usage` (or with an `error`
-  member) prints `NOT_RUN: ...` and exits 3. Logs written up to that point are kept.
+- A missing endpoint, a curl failure, a non-200 status other than 503, or a body without `usage` (or
+  with an `error` member) prints `NOT_RUN: ...` and exits 3. Logs written up to that point are kept.
+- HTTP 503 means the endpoint is busy (the live server generates one reply at a time and answers a
+  concurrent request with 503). The same request is sent again every `BENCH_BUSY_SLEEP_S` seconds
+  (default 2) until another status comes back; once `BENCH_BUSY_WAIT_S` seconds (default 1800) have
+  passed since its first send, the run is NOT_RUN exit 3 (`BENCH_BUSY_WAIT_S=0`: no retry). A 503
+  carries no usage and adds no tokens; the attempt's wall time starts at the request that was answered.
 - `--out` must be absent or an empty real directory, including hidden files. Symbolic links
   (including names with trailing slashes) and nonempty directories are refused with exit 2 before
   any run files change. An atomic, persistent `.inference-cost-owner/` marker allows exactly one
@@ -45,8 +50,9 @@ The run directory holds:
 
 | file | content |
 |---|---|
-| `run.txt` | endpoint, requested model, `models_reported` (the ids the endpoint returned), options, omc sha256, times |
+| `run.txt` | endpoint, requested model, `models_reported` (the ids the endpoint returned), options, omc sha256, `task_set_sha256`, times |
 | `calls.txt` | one line per HTTP call: task lang arm attempt http_code model prompt completion total http_ms |
+| `busy.txt` | one line per attempt: task lang arm attempt, the 503 answers before it was answered, and the ms spent waiting |
 | `attempts.txt` | the attempt wire, version 2, read by `scorer.om` |
 | `summary.txt` | the scorer report |
 | `<lang>/<arm>/<task>/conv/` | the messages sent |
@@ -54,6 +60,10 @@ The run directory holds:
 
 The driver prints one line per (lang, arm): verified/attempted tasks, attempts, first-attempt
 verified, total tokens, tokens per verified program, verified per 1k tokens and verified per minute.
+
+`task_set_sha256` names the exact tasks and prompts of a run: `(cd bench/inference_cost && find tasks
+prompts -type f | LC_ALL=C sort | xargs sha256sum) | sha256sum`, first field. Runs with different
+digests were given different tasks or prompts and are not comparable.
 
 ## Not run yet
 
@@ -80,17 +90,22 @@ sh bench/inference_cost/driver.sh --self-test     # also run by `make test-infer
 3. **Chat edge.** An error object, a body without usage, and a non-JSON body each give exit 4.
 4. **`--check-tasks`.**
 5. **Fake-model runs.** `fake_model` listens on an ephemeral 127.0.0.1 port, and every reply reports
-   usage 111/37/148. Four runs, all over om, c, py and rs:
+   usage 111/37/148. Five runs, all over om, c, py and rs:
 
    | mode | arms, attempts | expected |
    |---|---|---|
-   | `good` | plain, 1 | 20/20 per language, with exact token sums |
+   | `good` | plain, 1 | 20/20 per language, with exact token sums, no 503, and run.txt naming the task set |
    | `bad` | plain, 1 | every mutant compiles and none verifies |
    | `bad-then-good` | plain + feedback, 2 | feedback verifies all 20 on attempt 2 with both attempts' tokens summed; plain verifies 0 |
    | `refuse` | plain, 1 | compiles 0 and verifies 0, and no binary is ever run |
+   | `busy` | plain, 1 | every request answers 503 once, then 200: 20/20 per language with the token sums of `good` |
 
-6. **NOT_RUN paths.** An unreachable endpoint (the fake is killed first), an HTTP 404, and a missing
-   `--endpoint` each give exit 3.
+   The task-set digest of a copy of `tasks/` and `prompts/` equals the driver's, and one added byte in
+   `tasks/task01/expected.txt` or `prompts/system-om.txt` changes it.
+
+6. **NOT_RUN paths.** An unreachable endpoint (the fake is killed first), an HTTP 404, a missing
+   `--endpoint`, `busy` with `BENCH_BUSY_WAIT_S=0`, and the `down` fake (503 on every request) past
+   `BENCH_BUSY_WAIT_S=1` each give exit 3; a nonnumeric `BENCH_BUSY_WAIT_S` gives exit 2.
 7. **Adversarial boundaries.** Oracle-reading Python, host writes, C/Rust compile-time oracle reads,
    a TERM-ignoring process with a descendant, an unavailable sandbox, empty workloads, reused or
    symlinked output directories, and competing output claimants are permanent shell-driven controls
@@ -103,7 +118,7 @@ sh bench/inference_cost/driver.sh --self-test     # also run by `make test-infer
 |---|---|
 | `driver.sh` | POSIX sh glue: assembles candidates, runs compilers and curl, writes records |
 | `chat.om` | the only JSON code (composed with `seed/json/json.om` and `jsonw.om`). `chat req` turns the request wire into the OpenAI request body. `chat resp` reads a response: usage, model id, and the code block (after the last `</think>`, the first fenced block) on fd 3 |
-| `fake_model.om` | an OpenAI-compatible fake on `seed/net/http.om`. Modes `good`, `bad`, `bad-then-good` (reference only when the conversation has 3 or more messages) and `refuse`. Uses headers `X-Bench-Task` and `X-Bench-Lang` |
+| `fake_model.om` | an OpenAI-compatible fake on `seed/net/http.om`. Modes `good`, `bad`, `bad-then-good` (reference only when the conversation has 3 or more messages), `refuse`, `busy` (503 on every other request) and `down` (503 always). Uses headers `X-Bench-Task` and `X-Bench-Lang` |
 | `scorer.om` | reads the attempt wire (v1 or v2) and writes the summary |
 | `io.om` | stdin/stdout helpers appended after an Omega candidate |
 | `audit.sh` | permanent F1-F8 adversarial self-test controls, sourced by the driver |

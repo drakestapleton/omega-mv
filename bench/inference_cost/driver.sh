@@ -24,6 +24,8 @@ BIN_DIR="$BUILD_DIR/bin"
 OMC="${OMC:-$REPO_DIR/seed/out/omc}"
 PIN_FILE="$REPO_DIR/seed/out/omc.sha256"
 ALL_LANGS="om c py rs"
+BUSY_WAIT_S="${BENCH_BUSY_WAIT_S:-1800}"
+BUSY_SLEEP_S="${BENCH_BUSY_SLEEP_S:-2}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'driver.sh: %s\n' "$*" >&2; exit 2; }
@@ -35,6 +37,13 @@ usage() {
 }
 
 now_ms() { date +%s%3N; }
+
+# task_set_sha256 DIR: one digest over every file under DIR/tasks and DIR/prompts (paths relative to
+# DIR in C-locale order, sha256sum lines), so a run names the exact tasks and prompts it was given
+task_set_sha256() {
+    [ -d "$1/tasks" ] && [ -d "$1/prompts" ] || die "no tasks/ and prompts/ under $1"
+    (cd "$1" && find tasks prompts -type f | LC_ALL=C sort | xargs sha256sum) | sha256sum | awk '{print $1}'
+}
 
 # ---- compiler pin and tools
 
@@ -441,6 +450,31 @@ claim_output() { # output directory; a persistent marker gives one invocation ow
     fi
 }
 
+# post_chat ATTEMPT_DIR TASK LANG: POST ATTEMPT_DIR/request.json; sets CODE, T0 and T1 (start and end
+# of the request that was answered), BUSY_N and BUSY_MS. HTTP 503 means the endpoint is busy (the live
+# server generates one reply at a time and answers a concurrent request with 503): the same request
+# is sent again every BUSY_SLEEP_S seconds until another status comes back, and the run is NOT_RUN
+# once BUSY_WAIT_S seconds have passed since the first send (BENCH_BUSY_WAIT_S=0: no retry). A 503
+# carries no usage, so it adds no tokens, and the attempt's wall time starts at the answered request.
+post_chat() {
+    pc_start=$(now_ms)
+    BUSY_N=0
+    while :; do
+        T0=$(now_ms)
+        CODE=$(curl -sS --max-time 600 -o "$1/response.json" -w '%{http_code}' \
+            -H 'Content-Type: application/json' -H "X-Bench-Task: $2" -H "X-Bench-Lang: $3" \
+            --data-binary @"$1/request.json" "$ENDPOINT/v1/chat/completions" 2> "$1/curl.err") ||
+            not_run "HTTP failure for $2 $3 $arm attempt $att: $(cat "$1/curl.err")"
+        T1=$(now_ms)
+        [ "$CODE" = 503 ] || break
+        BUSY_N=$((BUSY_N + 1))
+        [ $((T1 - pc_start)) -lt $((BUSY_WAIT_S * 1000)) ] ||
+            not_run "HTTP 503 (endpoint busy) for $2 $3 $arm attempt $att: $BUSY_N refusals over $((T1 - pc_start)) ms (BENCH_BUSY_WAIT_S=$BUSY_WAIT_S)"
+        sleep "$BUSY_SLEEP_S"
+    done
+    BUSY_MS=$((T0 - pc_start))
+}
+
 run_model() {
     ENDPOINT=""
     MODEL=""
@@ -470,6 +504,8 @@ run_model() {
     case $MAXTOK in ''|*[!0-9]*|0) die "--max-tokens must be a positive integer" ;; esac
     case $LANGS in ''|,*|*,|*,,*|*[!a-z,]*) die "--langs requires a nonempty comma-separated language list" ;; esac
     case $ARMS in ''|,*|*,|*,,*|*[!a-z,]*) die "--arms requires a nonempty comma-separated arm list" ;; esac
+    case $BUSY_WAIT_S in ''|*[!0-9]*) die "BENCH_BUSY_WAIT_S must be a nonnegative integer" ;; esac
+    case $BUSY_SLEEP_S in ''|*[!0-9]*) die "BENCH_BUSY_SLEEP_S must be a nonnegative integer" ;; esac
     langs=$(printf '%s' "$LANGS" | tr ',' ' ')
     arms=$(printf '%s' "$ARMS" | tr ',' ' ')
     for a in $arms; do case $a in plain|feedback) ;; *) die "unknown arm '$a' (plain feedback)" ;; esac; done
@@ -489,10 +525,12 @@ run_model() {
         say "temperature $TEMP"
         say "max_tokens $MAXTOK"
         say "omc_sha256 $(sha256sum "$OMC" | awk '{print $1}')"
+        say "task_set_sha256 $(task_set_sha256 "$SCRIPT_DIR")"
         say "started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$OUT/run.txt"
     : > "$OUT/rows.txt"
     say "# task lang arm attempt http_code model_reported prompt_tokens completion_tokens total_tokens http_ms" > "$OUT/calls.txt"
+    say "# task lang arm attempt busy_503 busy_wait_ms (busy_wait_s $BUSY_WAIT_S busy_sleep_s $BUSY_SLEEP_S)" > "$OUT/busy.txt"
     for lang in $langs; do
         for arm in $arms; do
             for tid in $(task_ids); do
@@ -510,12 +548,10 @@ run_model() {
                     build_wire "$conv" > "$a/request.wire"
                     "$BIN_DIR/chat" req < "$a/request.wire" > "$a/request.json" ||
                         not_run "could not encode the request for $tid $lang $arm attempt $att (chat req rc $?)"
-                    t0=$(now_ms)
-                    code=$(curl -sS --max-time 600 -o "$a/response.json" -w '%{http_code}' \
-                        -H 'Content-Type: application/json' -H "X-Bench-Task: $tid" -H "X-Bench-Lang: $lang" \
-                        --data-binary @"$a/request.json" "$ENDPOINT/v1/chat/completions" 2> "$a/curl.err") ||
-                        not_run "HTTP failure for $tid $lang $arm attempt $att: $(cat "$a/curl.err")"
-                    t1=$(now_ms)
+                    post_chat "$a" "$tid" "$lang"
+                    code=$CODE
+                    t0=$T0
+                    t1=$T1
                     [ "$code" = 200 ] || not_run "HTTP $code for $tid $lang $arm attempt $att"
                     "$BIN_DIR/chat" resp < "$a/response.json" > "$a/meta.txt" 3> "$a/candidate.$lang" ||
                         not_run "unusable response for $tid $lang $arm attempt $att (chat resp rc $?): no usage, an error object or no choices"
@@ -529,6 +565,7 @@ run_model() {
                     [ "$att" -ne 1 ] || first=1
                     say "$tid $lang $arm $att $first $COMP_RC $VERIFIED $((t2 - t0)) $p $c $t" >> "$OUT/rows.txt"
                     say "$tid $lang $arm $att $code $m $p $c $t $((t1 - t0))" >> "$OUT/calls.txt"
+                    say "$tid $lang $arm $att $BUSY_N $BUSY_MS" >> "$OUT/busy.txt"
                     [ "$VERIFIED" -eq 0 ] || break
                     if [ "$arm" = feedback ] && [ "$att" -lt "$ATTEMPTS" ]; then
                         { printf '```%s\n' "$(lang_fence "$lang")"; cat "$a/candidate.$lang"; printf '\n```\n'; } > "$a/assistant.txt"
@@ -659,6 +696,36 @@ self_test() {
         st_expect "good $l plain total_tokens" "$((ntask * 148))" "$(group_field "$SUMMARY" "$l" plain total_tokens)"
     done
     st_expect "good model reported" "fake-omega-bench" "$(awk 'NR==2{print $6}' "$BUILD_DIR/selftest/good/calls.txt")"
+    st_expect "good run saw no 503" "$((4 * ntask))" "$(awk 'NR>1 && $5==0' "$BUILD_DIR/selftest/good/busy.txt" | wc -l)"
+    st_expect "good run names its task set" "$(task_set_sha256 "$SCRIPT_DIR")" \
+        "$(awk '$1=="task_set_sha256"{print $2}' "$BUILD_DIR/selftest/good/run.txt")"
+    for part in tasks/task01/expected.txt prompts/system-om.txt; do
+        tsd="$BUILD_DIR/selftest/taskset-$(printf '%s' "$part" | tr '/.' '--')"
+        mkdir -p "$tsd"
+        cp -R "$SCRIPT_DIR/tasks" "$SCRIPT_DIR/prompts" "$tsd/"
+        st_expect "task set copy digest ($part unchanged)" "$(task_set_sha256 "$SCRIPT_DIR")" "$(task_set_sha256 "$tsd")"
+        printf ' ' >> "$tsd/$part"
+        if [ "$(task_set_sha256 "$tsd")" = "$(task_set_sha256 "$SCRIPT_DIR")" ]; then
+            st_bad "task set digest ignored one added byte in $part"
+        else
+            st_ok "task set digest changes with one added byte in $part"
+        fi
+    done
+
+    BENCH_BUSY_SLEEP_S=0
+    export BENCH_BUSY_SLEEP_S
+    fake_run busy busy plain 1
+    st_expect "busy rc" 0 "$FR_RC"
+    st_expect "busy global verdict" PASS "$(summary_status "$SUMMARY")"
+    for l in $ALL_LANGS; do
+        st_expect "busy $l plain verified" "$ntask" "$(group_field "$SUMMARY" "$l" plain verified_count)"
+        st_expect "busy $l plain first_attempt_verified" "$ntask" "$(group_field "$SUMMARY" "$l" plain first_attempt_verified)"
+        st_expect "busy $l plain total_tokens (a 503 adds none)" "$((ntask * 148))" "$(group_field "$SUMMARY" "$l" plain total_tokens)"
+    done
+    st_expect "busy every request refused once, then answered" "$((4 * ntask))" \
+        "$(awk 'NR>1 && $5==1' "$BUILD_DIR/selftest/busy/busy.txt" | wc -l)"
+    st_expect "busy calls all 200" "$((4 * ntask))" "$(awk 'NR>1 && $5==200' "$BUILD_DIR/selftest/busy/calls.txt" | wc -l)"
+    unset BENCH_BUSY_SLEEP_S
 
     fake_run bad bad plain 1
     st_expect "bad rc" 0 "$FR_RC"
@@ -718,6 +785,28 @@ self_test() {
     out=$(sh "$SCRIPT_DIR/driver.sh" --run-model --model fake 2>&1) || rc=$?
     say "$out"
     st_expect "missing --endpoint rc" 3 "$rc"
+    BENCH_BUSY_WAIT_S=0
+    export BENCH_BUSY_WAIT_S
+    fake_run busy-noretry busy plain 1
+    st_expect "busy with retries off rc" 3 "$FR_RC"
+    case $fr_out in
+        *"NOT_RUN: HTTP 503 (endpoint busy)"*) st_ok "busy with retries off prints NOT_RUN for the 503" ;;
+        *) st_bad "busy with retries off did not print NOT_RUN for the 503" ;;
+    esac
+    BENCH_BUSY_WAIT_S=1
+    BENCH_BUSY_SLEEP_S=1
+    export BENCH_BUSY_SLEEP_S
+    fake_run down down plain 1
+    st_expect "endpoint always busy (503 past BENCH_BUSY_WAIT_S=1) rc" 3 "$FR_RC"
+    case $fr_out in
+        *"NOT_RUN: HTTP 503 (endpoint busy)"*) st_ok "endpoint always busy prints NOT_RUN for the 503" ;;
+        *) st_bad "endpoint always busy did not print NOT_RUN for the 503" ;;
+    esac
+    BENCH_BUSY_WAIT_S=x
+    rc=0
+    out=$(sh "$SCRIPT_DIR/driver.sh" --run-model --endpoint http://127.0.0.1:9 --model fake 2>&1) || rc=$?
+    st_expect "nonnumeric BENCH_BUSY_WAIT_S rc" 2 "$rc"
+    unset BENCH_BUSY_WAIT_S BENCH_BUSY_SLEEP_S
 
     if [ "$ST_FAIL" -eq 0 ]; then
         say "SELF-TEST PASS"
