@@ -1664,10 +1664,373 @@ put ob 12 uchar nrc
 ret 344
 end
 
-note kind 5: op and a number as two 32-bit values, then the bytes of the text (at most 70000).
+note ---- who a post calls and which posts it cites (kind 5 op 3) ----
+note "@name", "@all", "@#channel" and "#seq" in the text of a post. A mention counts only at a word start: the
+note character before "@" or "#" must not be a name character, and the name must not run on into more name
+note characters. Positions in these functions are places in the request: the text is the bytes t0..t1.
+
+note the character that starts at byte i, as a code point; 4294967295 at or after t1. A broken sequence gives its
+note first byte
+fn rune b view uchar 1048576 i ulong t1 ulong to ulong
+if ge i t1
+ret 4294967295
+end
+b0 = ulong get b i
+if or lt b0 128 ge b0 248
+ret b0
+end
+if lt b0 192
+ret b0
+end
+need = ulong 1
+cp = and b0 31
+if ge b0 224
+need = 2
+cp = and b0 15
+end
+if ge b0 240
+need = 3
+cp = and b0 7
+end
+k = ulong 1
+while le k need bound 8
+if ge add i k t1
+ret b0
+end
+c = ulong get b add i k
+if ne and c 192 128
+ret b0
+end
+cp = or shl cp 6 and c 63
+k = add k 1
+end
+ret cp
+end
+
+note the character that ends just before byte e; 4294967295 at the start of the text
+fn runeb b view uchar 1048576 e ulong t0 ulong t1 ulong to ulong
+if or le e t0 gt e t1
+ret 4294967295
+end
+i = sub e 1
+back = ulong 0
+while gt i t0 bound 8
+if ge back 3
+break
+end
+if ne and ulong get b i 192 128
+break
+end
+i = sub i 1
+back = add back 1
+end
+ret rune b i t1
+end
+
+note can this character be part of a name? Letters, digits, "_" and "-"; outside ASCII everything except the
+note blocks that hold punctuation, symbols and emoji
+fn namer cp ulong to bool
+if eq cp 4294967295
+ret false
+end
+if lt cp 128
+if and ge cp 48 le cp 57
+ret true
+end
+if and ge cp 65 le cp 90
+ret true
+end
+if and ge cp 97 le cp 122
+ret true
+end
+ret or eq cp 95 eq cp 45
+end
+if or or lt cp 192 eq cp 215 eq cp 247
+ret false
+end
+if and ge cp 8192 le cp 11263
+ret false
+end
+if and ge cp 12288 le cp 12351
+ret false
+end
+if and ge cp 65072 le cp 65135
+ret false
+end
+if or and ge cp 65280 le cp 65295 and ge cp 65306 le cp 65312
+ret false
+end
+if or and ge cp 65339 le cp 65344 and ge cp 65371 le cp 65381
+ret false
+end
+if and ge cp 126976 le cp 129791
+ret false
+end
+ret true
+end
+
+fn lowc c ulong to ulong
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+note true when the ln bytes at na stand at byte pos of the text (ASCII letters without case) and no name
+note character follows them
+fn nameat b view uchar 1048576 pos ulong na ulong ln ulong t1 ulong to bool
+if eq ln 0
+ret false
+end
+if gt add pos ln t1
+ret false
+end
+for k ulong ln
+if ne lowc ulong get b add pos k lowc ulong get b add na k
+ret false
+end
+end
+ret not namer rune b add pos ln t1
+end
+
+note "all" at byte pos, and no name character after it
+fn allat b view uchar 1048576 pos ulong t1 ulong to bool
+if gt add pos 3 t1
+ret false
+end
+if ne lowc ulong get b pos 97
+ret false
+end
+if ne lowc ulong get b add pos 1 108
+ret false
+end
+if ne lowc ulong get b add pos 2 108
+ret false
+end
+ret not namer rune b add pos 3 t1
+end
+
+note a member called "<prefix>-<digits>" also answers to "@<prefix>": the length of that prefix, or 0
+fn cprefix b view uchar 1048576 na ulong nl ulong to ulong
+i = nl
+while gt i 0 bound 999999
+c = ulong get b add na sub i 1
+if or lt c 48 gt c 57
+break
+end
+i = sub i 1
+end
+if eq i nl
+ret 0
+end
+if lt i 2
+ret 0
+end
+if ne ulong get b add na sub i 1 45
+ret 0
+end
+ret sub i 1
+end
+
+note the length of a channel name at byte pos (after "@#"): a letter, then letters, digits and "-", 24 at most
+fn chlen b view uchar 1048576 pos ulong t1 ulong to ulong
+if ge pos t1
+ret 0
+end
+f = lowc ulong get b pos
+if or lt f 97 gt f 122
+ret 0
+end
+j = pos
+while lt j t1 bound 64
+if ge sub j pos 25
+break
+end
+c = lowc ulong get b j
+okc = and ge c 97 le c 122
+if and ge c 48 le c 57
+okc = true
+end
+if eq c 45
+okc = true
+end
+if not okc
+break
+end
+j = add j 1
+end
+n = sub j pos
+if gt n 24
+ret 0
+end
+if namer rune b j t1
+ret 0
+end
+ret n
+end
+
+note part idx of the answer: where it starts in the text, its length, its kind (1 a member, 2 all, 3 a channel,
+note 4 a cited post) and its value (the member's number, or the post's)
+fn semit ob edit uchar 65544 idx ulong s ulong l ulong kind ulong v ulong to void
+o = add 16 mul idx 16
+put32 ob o s
+put32 ob add o 4 l
+put32 ob add o 8 kind
+put32 ob add o 12 v
+end
+
+note op 3: n bytes after the op header: a 16-bit count of member names (96 at most), each name as a 16-bit length
+note and its bytes, then the text (900000 bytes at most). head is the highest post number that may be cited; 0
+note turns citations off. The answer: a 16-bit count of parts, a byte that is 1 when the post has more than 128
+note parts (the rest is not marked), then from byte 8 sixteen bytes a part (semit), in text order. Parts that
+note start at one byte are kept or dropped together
+fn spans b view uchar 1048576 n ulong head ulong ob edit uchar 65544 to ulong
+noff = new ulong 96 0
+nlen = new ulong 96 0
+npre = new ulong 96 0
+bad = ulong 18446744073709551615
+if lt n 2
+ret bad
+end
+nn = rd16 b 8
+if gt nn 96
+ret bad
+end
+lim = add 8 n
+p = ulong 10
+for k ulong nn
+if gt add p 2 lim
+ret bad
+end
+l = rd16 b p
+p = add p 2
+if gt add p l lim
+ret bad
+end
+put noff k p
+put nlen k l
+put npre k cprefix b p l
+p = add p l
+end
+t0 = p
+t1 = lim
+if gt sub t1 t0 900000
+ret bad
+end
+cnt = ulong 0
+clipped = ulong 0
+i = t0
+while lt i t1 bound 999999
+c = ulong get b i
+st = ulong 1
+g = ulong 0
+mark = or eq c 64 eq c 35
+if mark
+if namer runeb b i t0 t1
+mark = false
+end
+end
+if mark
+if eq c 64
+nxt = ulong 0
+if lt add i 1 t1
+nxt = ulong get b add i 1
+end
+if eq nxt 35
+cl = chlen b add i 2 t1
+if gt cl 0
+semit ob cnt sub i t0 add cl 2 3 0
+g = 1
+st = add cl 2
+end
+else
+for k ulong nn
+if nameat b add i 1 get noff k get nlen k t1
+semit ob add cnt g sub i t0 add get nlen k 1 1 k
+g = add g 1
+end
+end
+if eq g 0
+if allat b add i 1 t1
+semit ob add cnt g sub i t0 4 2 0
+g = 1
+end
+end
+k2 = ulong 0
+while lt k2 nn bound 128
+if gt g 0
+break
+end
+pk = get npre k2
+if gt pk 0
+if nameat b add i 1 get noff k2 pk t1
+j = k2
+while lt j nn bound 128
+if eq get npre j pk
+if nameat b add i 1 get noff j pk t1
+semit ob add cnt g sub i t0 add pk 1 1 j
+g = add g 1
+end
+end
+j = add j 1
+end
+end
+end
+k2 = add k2 1
+end
+end
+else
+if gt head 0
+if ne runeb b i t0 t1 38
+j = add i 1
+v = ulong 0
+while lt j t1 bound 16
+if gt sub j i 9
+break
+end
+d = ulong get b j
+if or lt d 48 gt d 57
+break
+end
+v = add mul v 10 sub d 48
+j = add j 1
+end
+if gt j add i 1
+if and ge v 1 le v head
+if not namer rune b j t1
+semit ob cnt sub i t0 sub j i 4 v
+g = 1
+st = sub j i
+end
+end
+end
+end
+end
+end
+end
+if gt g 0
+if gt add cnt g 128
+clipped = 1
+break
+end
+cnt = add cnt g
+end
+i = add i st
+end
+put ob 8 uchar and cnt 255
+put ob 9 uchar shr cnt 8
+put ob 10 uchar clipped
+for z ulong 5
+put ob add 11 z uchar 0
+end
+ret add 8 mul cnt 16
+end
+
+note kind 5: op and a number as two 32-bit values, then the bytes of the text (at most 70000 for op 1 and 2).
 note op 1: a board line (fn lline). op 2: a time at byte `number` (fn ltime); the answer is 16 bytes: 0 1 when it
 note is a time, 1 1 when it names its zone, 4 the first byte after it (32-bit), 8 the seconds since 1970 plus 100000
-note (64-bit). Returns the reply length, or 18446744073709551615 for a malformed body or an unknown op
+note (64-bit). op 3: who a post calls and what it cites (fn spans; the number is the highest post that may be
+note cited). Returns the reply length, or 18446744073709551615 for a malformed body or an unknown op
 fn board ib view uchar 1048576 nb ulong ob edit uchar 65544 to ulong
 tm = new ulong 16 0
 bad = ulong 18446744073709551615
@@ -1677,6 +2040,9 @@ end
 op = rd32 ib 0
 arg = rd32 ib 4
 n = sub nb 8
+if eq op 3
+ret spans ib n arg ob
+end
 if gt n 70000
 ret bad
 end
