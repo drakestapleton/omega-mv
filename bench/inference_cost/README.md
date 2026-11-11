@@ -45,14 +45,18 @@ sh bench/inference_cost/driver.sh --run-model --endpoint http://127.0.0.1:18091 
 - Bubblewrap is mandatory and fails closed: missing `bwrap` or unavailable namespaces give NOT_RUN
   exit 3, never unsandboxed compilation or execution. GNU `timeout`, system Python, C and Rust
   toolchains are required for the corresponding self-test paths.
+- Every sandboxed compile and run has a kernel-enforced memory ceiling (see "Memory ceiling"). If it
+  cannot be applied the driver gives NOT_RUN exit 3, never an unbounded run. `BENCH_MEM_MAX_BYTES`
+  sets it (67108864 to 4294967296; anything else exits 2); the default is 536870912.
 
 The run directory holds:
 
 | file | content |
 |---|---|
-| `run.txt` | endpoint, requested model, `models_reported` (the ids the endpoint returned), options, omc sha256, `task_set_sha256`, times |
+| `run.txt` | endpoint, requested model, `models_reported` (the ids the endpoint returned), options, omc sha256, `task_set_sha256`, `memory_max_bytes`, times |
 | `calls.txt` | one line per HTTP call: task lang arm attempt http_code model prompt completion total http_ms |
 | `busy.txt` | one line per attempt: task lang arm attempt, the 503 answers before it was answered, and the ms spent waiting |
+| `memory.txt` | one line per attempt: task lang arm attempt, the peak bytes of the compile and of the run (`-` when not run), and `none`, `compile` or `run` for a kill by the memory ceiling |
 | `attempts.txt` | the attempt wire, version 2, read by `scorer.om` |
 | `summary.txt` | the scorer report |
 | `<lang>/<arm>/<task>/conv/` | the messages sent |
@@ -112,8 +116,19 @@ sh bench/inference_cost/driver.sh --self-test     # also run by `make test-infer
 7. **Adversarial boundaries.** Oracle-reading Python, host writes, C/Rust compile-time oracle reads,
    a TERM-ignoring process with a descendant, an unavailable sandbox, empty workloads, reused or
    symlinked output directories, and competing output claimants are permanent shell-driven controls
-   in `audit.sh`. Good, bad, mixed-arm and
+   in `audit.sh`; a namespace init that never exits is refused NOT_RUN by the teardown wait below.
+   Good, bad, mixed-arm and
    compiler-refusal runs assert both the group and global PASS/FAIL strings, not only counters.
+8. **Memory ceiling** (`audit.sh`, `memory_checks`). Per language, a correct task01 candidate that
+   first writes every page of the ceiling plus 256 MiB is killed and scored wrong (`MEM_KILL=run`),
+   and the same candidate at half the ceiling verifies. A mutant driver with the ceiling line
+   removed lets the over-ceiling C candidate verify, so it fails that check. A `systemd-run` that
+   runs the command outside a new scope, and one that cannot reach the user manager, each stop
+   `--run-model` at the preflight (NOT_RUN exit 3, no run directory) and a compile at the sandbox
+   (NOT_RUN exit 3); a `systemd-run` that fails once before any scope exists is retried and the
+   reference verifies with the failure kept out of its stderr; `BENCH_MEM_MAX_BYTES` of 0, 67108863,
+   4294967297 and `1G` exit 2. The `good`
+   run's `memory.txt` shows compile and run peaks below the ceiling and no kill for every attempt.
 
 ## Handover rule
 
@@ -207,10 +222,37 @@ handshake, closes that descriptor, then executes candidate-controlled code. The 
 handshake for compilation and execution; bubblewrap namespace JSON alone is not readiness evidence
 because it is emitted before mount setup. Permanent tests exercise late compiler/runtime mount
 failures with real bubblewrap and assert NOT_RUN, descriptor closure, and denial of inherited host
-file reads at both compile time and runtime.
+file reads at both compile time and runtime. After each compile and each run the driver waits up to
+5 s for the sandbox's namespace init (bubblewrap's `child-pid`) to be gone and gives NOT_RUN if it
+is not: after a deadline kill the teardown finishes asynchronously (seen once in 15 tries with the
+memory ceiling in place, gone 1 s later), and nothing may outlive its attempt.
+
+**Memory ceiling.** Each compile and each run executes inside a transient cgroup scope, `systemd-run --user --scope -p
+MemoryMax=<ceiling> -p MemorySwapMax=0 -p OOMPolicy=continue`, around bubblewrap. The kernel counts
+every process of the scope (launcher, bubblewrap, compiler or candidate and all their children) and
+OOM-kills inside the scope when the ceiling is reached, so a candidate cannot take memory from the
+host or from the model server. The scope's first process reads back its own cgroup's `memory.max`
+and `memory.swap.max` and runs nothing unless they are exactly the ceiling and 0; after the command
+it writes `memory_peak_bytes` and `memory_oom_kills` beside bubblewrap's JSON on descriptor 4. A
+compile with an OOM kill never counts as compiled, and a run with an OOM kill is a failed attempt
+whatever it printed; both are recorded in `memory.txt`, and the feedback arm tells the model its
+code (or the compiler) was killed for exceeding the ceiling. When `XDG_RUNTIME_DIR` is unset the
+driver uses `/run/user/<uid>` to reach the user manager. A `systemd-run` that fails before its scope
+started (seen once under load: "Failed to start transient scope unit: Transport endpoint is not
+connected") has run nothing, so it is tried again, 5 times in all, 1 s apart, and only then reported
+(NOT_RUN). Exercised with systemd 255 on Linux 7.0
+(cgroup v2, memory controller delegated to the user manager).
+
+The ceiling was set from measurement: `--check-tasks` was run four times with a 4 GiB ceiling (three
+times with omc `1e628c80`, once with omc `2495bc25`) and the scope peak of every compile and run read
+from `memory.peak`. The heaviest was the Rust compile of `task01/reference.rs`, 100696064 bytes
+(about 96 MiB); the heaviest runs were 5775360 bytes (Python) and 2150400 bytes (Rust), and Omega
+compiles stayed under 2.2 MB. The default ceiling, 536870912 bytes (512 MiB), is 5.33 times the
+heaviest peak (416 MiB above it).
 
 The host dependencies exercised here are bubblewrap 0.9.0 (Linux namespaces/mounts), GNU coreutils
-`timeout` 9.4 (host deadline), and Bash 5.2.21 (sandbox-only trusted launcher, mounted as `/usr/bin/sh`).
+`timeout` 9.4 (host deadline), Bash 5.2.21 (sandbox-only trusted launcher, mounted as `/usr/bin/sh`)
+and systemd 255 `systemd-run --user --scope` (memory ceiling).
 The driver itself remains POSIX sh. The launcher needs arbitrary numeric descriptor redirections,
 which dash cannot perform above fd 9; it validates the kernel-provided numeric descriptors before
 closing them. These are isolation/verification infrastructure, not Omega implementations. Their

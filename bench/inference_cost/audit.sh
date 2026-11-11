@@ -178,6 +178,16 @@ EOF
     else
         st_bad 'timed-out sandbox process is still alive'
     fi
+    # Control for the driver's own teardown wait: a namespace init that never exits is NOT_RUN.
+    sleep 30 &
+    ac_live=$!
+    printf '{\n    "child-pid": %s\n}\n' "$ac_live" > "$ac_dir/live.sandbox"
+    ac_rc=0
+    ac_out=$(sandbox_gone "$ac_dir/live.sandbox") || ac_rc=$?
+    kill "$ac_live" 2>/dev/null || true
+    wait "$ac_live" 2>/dev/null || true
+    st_expect 'live sandbox namespace after a deadline is NOT_RUN' 3 "$ac_rc"
+    case $ac_out in *"still alive 5 s after"*) st_ok 'live sandbox namespace is named' ;; *) st_bad "live sandbox namespace: $ac_out" ;; esac
 
     mkdir -p "$ac_dir/tools"
     printf '#!/bin/sh\nexit 1\n' > "$ac_dir/tools/bwrap"
@@ -246,6 +256,107 @@ EOF
         0:2|2:0) st_ok 'only one concurrent output claimant succeeds' ;;
         *) st_bad 'concurrent output claim did not have exactly one owner' ;;
     esac
+}
+
+# ---- memory ceiling: task01 candidates that are correct but first touch BYTES of memory
+
+hog_src() { # lang bytes -> a task01 candidate on stdout
+    case $1 in
+        c) printf 'uint32_t clamp_add_u16(uint32_t a, uint32_t b) {\n    static volatile unsigned char *hog;\n    if (!hog) {\n        size_t n = %sull;\n        hog = malloc(n);\n        if (!hog) return 0;\n        for (size_t i = 0; i < n; i += 4096) hog[i] = 1;\n    }\n    uint32_t s = a + b;\n    return s > 65535u ? 65535u : s;\n}\n' "$2" ;;
+        py) printf '_hog = []\ndef clamp_add_u16(a, b):\n    if not _hog:\n        _hog.append(b"\\x01" * %s)\n    s = a + b\n    return 65535 if s > 65535 else s\n' "$2" ;;
+        rs) printf 'static HOG: std::sync::Once = std::sync::Once::new();\nfn clamp_add_u16(a: u32, b: u32) -> u32 {\n    HOG.call_once(|| {\n        let n: usize = %s;\n        let mut v: Vec<u8> = Vec::with_capacity(n);\n        let p = v.as_mut_ptr();\n        let mut i = 0usize;\n        while i < n {\n            unsafe { std::ptr::write_volatile(p.add(i), 1u8); }\n            i += 4096;\n        }\n        std::mem::forget(v);\n    });\n    let s = a.wrapping_add(b);\n    if s > 65535 { 65535 } else { s }\n}\n' "$2" ;;
+        om) # globals of 16777216 ulong (128 MiB) each, every 4096-byte page written once
+            hg_n=$(( ($2 + 134217727) / 134217728 ))
+            printf 'global hogk ulong 1\n'
+            hg_i=0
+            while [ "$hg_i" -lt "$hg_n" ]; do printf 'global hog%d ulong 16777216\n' "$hg_i"; hg_i=$((hg_i + 1)); done
+            printf 'fn clamp_add_u16 a uint b uint to uint\nif eq get hogk 0 0\nput hogk 0 1\n'
+            hg_i=0
+            while [ "$hg_i" -lt "$hg_n" ]; do printf 'for i ulong 32768\nput hog%d mul i 512 1\nend\n' "$hg_i"; hg_i=$((hg_i + 1)); done
+            printf 'end\ns = add a b\nif gt s 65535\nret 65535\nend\nret s\nend\n' ;;
+    esac
+}
+
+mem_probe() { # driver lang candidate work -> the --evaluate-probe line
+    sh "$1" --evaluate-probe "$2" "$3" "$4" 2>&1 | tail -n 1
+}
+
+memory_checks() {
+    mc_dir="$BUILD_DIR/selftest/memory"
+    mkdir -p "$mc_dir"
+    say "== memory ceiling (memory_max_bytes $MEM_MAX)"
+    # Over the ceiling by 256 MiB: killed by the kernel and scored wrong. Half the ceiling: the same
+    # code verifies, so the kill above is the ceiling's doing, not a defect of the candidate.
+    mc_over=$((MEM_MAX + 268435456))
+    mc_half=$((MEM_MAX / 2))
+    for l in $ALL_LANGS; do
+        hog_src "$l" "$mc_over" > "$mc_dir/over.$l"
+        hog_src "$l" "$mc_half" > "$mc_dir/half.$l"
+        mc_out=$(mem_probe "$SCRIPT_DIR/driver.sh" "$l" "$mc_dir/over.$l" "$mc_dir/over-$l")
+        case $mc_out in
+            "COMP_RC=0 RUN_RC="*" VERIFIED=0 MEM_KILL=run") st_ok "$l candidate over the ceiling is killed and scored wrong ($mc_out)" ;;
+            *) st_bad "$l candidate over the ceiling: $mc_out" ;;
+        esac
+        mc_out=$(mem_probe "$SCRIPT_DIR/driver.sh" "$l" "$mc_dir/half.$l" "$mc_dir/half-$l")
+        st_expect "$l candidate at half the ceiling verifies" "COMP_RC=0 RUN_RC=0 VERIFIED=1 MEM_KILL=none" "$mc_out"
+    done
+    # Mutant: the driver with the ceiling line removed must fail the check above (the over-ceiling
+    # candidate survives and verifies).
+    mc_mut="$mc_dir/no-ceiling/bench/inference_cost"
+    mkdir -p "$mc_mut"
+    cp -R "$TASKS_DIR" "$mc_mut/tasks"
+    grep -v '   # memory ceiling$' "$SCRIPT_DIR/driver.sh" > "$mc_mut/driver.sh"
+    st_expect "no-ceiling mutant removes exactly one line" 1 \
+        "$(( $(wc -l < "$SCRIPT_DIR/driver.sh") - $(wc -l < "$mc_mut/driver.sh") ))"
+    mc_out=$(mem_probe "$mc_mut/driver.sh" c "$mc_dir/over.c" "$mc_dir/mutant-over-c")
+    case $mc_out in
+        "COMP_RC=0 RUN_RC="*" VERIFIED=0 MEM_KILL=run") st_bad "no-ceiling mutant still killed the candidate ($mc_out)" ;;
+        *) st_ok "no-ceiling mutant fails the memory check ($mc_out)" ;;
+    esac
+    # Fail closed: a systemd-run that runs the command outside any new scope leaves the ceiling
+    # unapplied, and one that cannot reach the user manager fails; both are NOT_RUN, never unbounded.
+    mkdir -p "$mc_dir/noscope" "$mc_dir/nobus"
+    printf '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n' > "$mc_dir/noscope/systemd-run"
+    printf '#!/bin/sh\necho "Failed to connect to bus" >&2\nexit 1\n' > "$mc_dir/nobus/systemd-run"
+    chmod +x "$mc_dir/noscope/systemd-run" "$mc_dir/nobus/systemd-run"
+    for mc_fake in noscope nobus; do
+        mc_rc=0
+        mc_out=$(PATH="$mc_dir/$mc_fake:$PATH" sh "$SCRIPT_DIR/driver.sh" --run-model --endpoint http://127.0.0.1:1 \
+            --model fake --langs py --arms plain --out "$mc_dir/run-$mc_fake" 2>&1) || mc_rc=$?
+        st_expect "$mc_fake systemd-run: run-model NOT_RUN" 3 "$mc_rc"
+        case $mc_out in
+            *'memory ceiling (cgroup scope MemoryMax='*'cannot be applied'*) st_ok "$mc_fake systemd-run: stopped at the ceiling preflight" ;;
+            *) st_bad "$mc_fake systemd-run: $mc_out" ;;
+        esac
+        st_expect "$mc_fake systemd-run: no run directory" no "$([ -e "$mc_dir/run-$mc_fake" ] && say yes || say no)"
+        mc_rc=0
+        mc_out=$(PATH="$mc_dir/$mc_fake:$PATH" sh "$SCRIPT_DIR/driver.sh" --evaluate-probe py \
+            "$TASKS_DIR/task01/reference.py" "$mc_dir/probe-$mc_fake" 2>&1) || mc_rc=$?
+        st_expect "$mc_fake systemd-run: evaluate NOT_RUN" 3 "$mc_rc"
+    done
+    case $(PATH="$mc_dir/noscope:$PATH" sh "$SCRIPT_DIR/driver.sh" --evaluate-probe py \
+        "$TASKS_DIR/task01/reference.py" "$mc_dir/probe-noscope2" 2>&1) in
+        *'memory ceiling could not be applied to the compiler sandbox'*) st_ok 'unapplied ceiling is named at the compiler sandbox' ;;
+        *) st_bad 'unapplied ceiling was not named at the compiler sandbox' ;;
+    esac
+    # A systemd-run that fails once before any scope exists (the user bus dropping a connection) is
+    # retried: the reference still verifies, inside a scope, and the failure stays out of its stderr.
+    mkdir -p "$mc_dir/flaky"
+    printf '#!/bin/sh\nif [ ! -e "%s" ]; then\n    : > "%s"\n    echo "Failed to start transient scope unit: Transport endpoint is not connected" >&2\n    exit 1\nfi\nexec %s "$@"\n' \
+        "$mc_dir/flaky/failed-once" "$mc_dir/flaky/failed-once" "$(command -v systemd-run)" > "$mc_dir/flaky/systemd-run"
+    chmod +x "$mc_dir/flaky/systemd-run"
+    mc_out=$(PATH="$mc_dir/flaky:$PATH" sh "$SCRIPT_DIR/driver.sh" --evaluate-probe py \
+        "$TASKS_DIR/task01/reference.py" "$mc_dir/probe-flaky" 2>&1 | tail -n 1)
+    st_expect 'systemd-run failing once before the scope is retried' "COMP_RC=0 RUN_RC=0 VERIFIED=1 MEM_KILL=none" "$mc_out"
+    st_expect 'the retried failure happened' yes "$([ -e "$mc_dir/flaky/failed-once" ] && say yes || say no)"
+    st_expect 'the retried compile ran in the scope' 0 "$(sandbox_note memory_oom_kills "$mc_dir/probe-flaky/compile.sandbox")"
+    st_expect 'the retried failure is not in the compiler stderr' 0 "$(grep -c 'Transport endpoint' "$mc_dir/probe-flaky/err.txt" || true)"
+    for mc_bad in 0 67108863 4294967297 1G; do
+        mc_rc=0
+        BENCH_MEM_MAX_BYTES=$mc_bad sh "$SCRIPT_DIR/driver.sh" --run-model --endpoint http://127.0.0.1:1 \
+            --model fake --langs py --arms plain --out "$mc_dir/run-bad-$mc_bad" > /dev/null 2>&1 || mc_rc=$?
+        st_expect "BENCH_MEM_MAX_BYTES=$mc_bad refused" 2 "$mc_rc"
+    done
 }
 
 audit_reuse_check() {

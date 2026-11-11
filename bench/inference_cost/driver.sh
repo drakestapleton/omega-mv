@@ -26,6 +26,12 @@ PIN_FILE="$REPO_DIR/seed/out/omc.sha256"
 ALL_LANGS="om c py rs"
 BUSY_WAIT_S="${BENCH_BUSY_WAIT_S:-1800}"
 BUSY_SLEEP_S="${BENCH_BUSY_SLEEP_S:-2}"
+# Memory ceiling, in bytes, of every sandboxed compile and run: the kernel enforces it on the whole
+# process tree as MemoryMax (swap 0) of a transient cgroup scope (systemd-run --user --scope).
+# 536870912 (512 MiB) is 5.33 times the heaviest measured reference (rustc, 100696064 bytes; README
+# "Memory ceiling"). BENCH_MEM_MAX_BYTES may set 67108864..4294967296; run.txt records the value.
+MEM_MAX_DEFAULT=536870912
+MEM_MAX="${BENCH_MEM_MAX_BYTES:-$MEM_MAX_DEFAULT}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'driver.sh: %s\n' "$*" >&2; exit 2; }
@@ -212,6 +218,54 @@ EOF
 # system runtime libraries and the single executable/source are exposed read-only;
 # stdin carries inputs, and the host compares stdout against the oracle afterward.
 # Never fall back to direct execution if bubblewrap cannot establish its namespaces.
+# Every compile and run also lives in a cgroup scope whose MemoryMax is MEM_MAX (swap 0):
+# the kernel OOM-kills inside the scope instead of letting a candidate exhaust the host.
+
+# The scope's first process restores the caller's stderr (fd 5; systemd-run's own errors went to a
+# file), marks that the scope started, checks that its own cgroup carries exactly the ceiling and no
+# swap (else it writes memory_ceiling_unavailable on fd 4 and runs nothing), runs the command, then
+# writes the scope's peak bytes and OOM-kill count on fd 4 (beside bwrap's namespace JSON).
+MEMCAP_SH='exec 2>&5 5>&-
+: > "$2" || exit 125
+g=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)
+if [ "$(cat "$g/memory.max" 2>/dev/null)" != "$1" ] || [ "$(cat "$g/memory.swap.max" 2>/dev/null)" != 0 ]; then
+    printf "memory_ceiling_unavailable max=%s\n" "$(cat "$g/memory.max" 2>/dev/null)" >&4
+    exit 125
+fi
+shift 2
+"$@"
+rc=$?
+printf "memory_peak_bytes %s\nmemory_oom_kills %s\n" "$(cat "$g/memory.peak")" "$(sed -n "s/^oom_kill //p" "$g/memory.events")" >&4
+exit $rc'
+
+# mem_scope command...: run it in a transient scope with the memory ceiling. When systemd-run fails
+# before the scope started (observed 2026-11-11 under load: "Failed to start transient scope unit:
+# Transport endpoint is not connected"), nothing has run and nothing read stdin, so it is tried again,
+# 5 times in all, 1 s apart; then systemd-run's error goes to stderr and its status is returned.
+mem_scope() {
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    export XDG_RUNTIME_DIR
+    mkdir -p "$BUILD_DIR"
+    ms_dir=$(mktemp -d "$BUILD_DIR/scope.XXXXXX") || return 125
+    ms_try=1
+    while :; do
+        ms_rc=0
+        systemd-run --user --scope --quiet --collect -p MemoryMax="$MEM_MAX" -p MemorySwapMax=0 \
+            -p OOMPolicy=continue -- sh -c "$MEMCAP_SH" memcap "$MEM_MAX" "$ms_dir/started" "$@" \
+            5>&2 2> "$ms_dir/err" || ms_rc=$?
+        [ ! -e "$ms_dir/started" ] && [ "$ms_try" -lt 5 ] || break
+        ms_try=$((ms_try + 1))
+        sleep 1
+    done
+    [ -e "$ms_dir/started" ] || cat "$ms_dir/err" >&2
+    rm -rf "$ms_dir"
+    return "$ms_rc"
+}
+
+sandbox_note() { # key file: the key's last value, an empty line when absent or the file is missing
+    if [ -f "$2" ]; then awk -v k="$1" '$1==k{v=$2} END{print v}' "$2"; else printf '\n'; fi
+}
+
 sandbox() { # mode candidate_file
     sb_mode=$1
     sb_file=$2
@@ -235,6 +289,7 @@ sandbox() { # mode candidate_file
         --ro-bind "$(readlink -f "$(command -v python3)")" /usr/bin/python3 --symlink usr/bin /bin \
         --proc /proc --dev /dev --tmpfs /tmp --dir /work --chdir /work \
         --ro-bind "$sb_file" /work/candidate
+    set -- mem_scope "$@"   # memory ceiling
     # Compiler-only system headers/tools; never mount home, /tmp or the checkout.
     case $sb_mode in
         c|rs)
@@ -276,6 +331,15 @@ check_sandbox() {
     need_tool python3
     # The sandbox-only shell needs numeric fd redirections above 9 (dash does not).
     need_tool bash
+    need_tool systemd-run
+    case $MEM_MAX in
+        ''|*[!0-9]*) die "BENCH_MEM_MAX_BYTES must be a byte count from 67108864 to 4294967296" ;;
+    esac
+    [ "$MEM_MAX" -ge 67108864 ] && [ "$MEM_MAX" -le 4294967296 ] ||
+        die "BENCH_MEM_MAX_BYTES must be a byte count from 67108864 to 4294967296"
+    # The ceiling must take effect (scope created, MemoryMax and swap 0 read back) before any candidate.
+    cs_out=$(mem_scope true 4>&1 >/dev/null 2>&1) && [ -n "$(printf '%s\n' "$cs_out" | awk '$1=="memory_oom_kills"')" ] ||
+        not_run "the memory ceiling (cgroup scope MemoryMax=$MEM_MAX, swap 0) cannot be applied; no candidate was run"
     # Exercise the actual namespace setup, not merely bwrap's presence in PATH.
     sandbox run /dev/null 3>/dev/null 4>/dev/null >/dev/null 2>&1 ||
         not_run "bubblewrap sandbox is unavailable; no candidate was run"
@@ -285,6 +349,21 @@ run_candidate() { # file command [args...]
     # GNU timeout owns a process group; bubblewrap also owns a PID namespace.
     # TERM gets a short grace period, then KILL tears down every descendant.
     timeout --kill-after=1s 10s sh "$SCRIPT_DIR/driver.sh" --sandbox run "$1"
+}
+
+# sandbox_gone SANDBOX_JSON: after a compile or run returns, its PID namespace (bubblewrap's
+# "child-pid", the namespace init) must be gone. Teardown after a deadline kill finishes
+# asynchronously (observed 2026-11-11: the init still answered kill -0 right after timeout returned,
+# 1 of 15 tries, gone 1 s later), so wait up to 5 s; a namespace still alive then is NOT_RUN.
+sandbox_gone() {
+    sg_pid=$(awk '/"child-pid"/{gsub(/[^0-9]/, ""); print}' "$1" 2>/dev/null)
+    [ -n "$sg_pid" ] || return 0
+    sg_i=0
+    while kill -0 "$sg_pid" 2>/dev/null; do
+        [ "$sg_i" -lt 100 ] || not_run "sandbox namespace init $sg_pid still alive 5 s after its compile or run ended"
+        sleep 0.05
+        sg_i=$((sg_i + 1))
+    done
 }
 
 # ---- evaluate one candidate: sets COMP_RC, RUN_RC and VERIFIED; the work dir holds src, err.txt,
@@ -315,8 +394,19 @@ evaluate() { # lang task_dir candidate work
             { cat "$ev_c"; gen_main rs "$ev_s"; } > "$ev_w/src.rs"
             timeout --kill-after=1s 10s sh "$SCRIPT_DIR/driver.sh" --sandbox rs "$ev_w/src.rs" > "$ev_w/bin" 2> "$ev_w/err.txt" 3> "$ev_w/compile.ready" 4> "$ev_w/compile.sandbox" || COMP_RC=$? ;;
     esac
-    [ "$(cat "$ev_w/compile.ready")" = ready ] ||
+    sandbox_gone "$ev_w/compile.sandbox"
+    ev_k=$(sandbox_note memory_oom_kills "$ev_w/compile.sandbox")
+    if [ "$(cat "$ev_w/compile.ready")" != ready ]; then
+        [ -z "$(sandbox_note memory_ceiling_unavailable "$ev_w/compile.sandbox")" ] ||
+            not_run "the memory ceiling could not be applied to the compiler sandbox; no unbounded fallback"
         not_run "bubblewrap could not start the compiler sandbox; no unsandboxed fallback"
+    fi
+    MEM_KILL=none
+    # A compile the ceiling killed never counts as compiled, whatever its exit status.
+    if [ "${ev_k:-0}" -gt 0 ]; then
+        MEM_KILL=compile
+        [ "$COMP_RC" -ne 0 ] || COMP_RC=137
+    fi
     VERIFIED=0
     RUN_RC=-
     if [ "$COMP_RC" -eq 0 ]; then
@@ -327,9 +417,16 @@ evaluate() { # lang task_dir candidate work
             chmod +x "$ev_w/bin"
             run_candidate "$ev_w/bin" < "$ev_t/inputs.txt" > "$ev_w/out.txt" 2> "$ev_w/run.err" 3> "$ev_w/run.ready" 4> "$ev_w/run.sandbox" || RUN_RC=$?
         fi
-        [ "$(cat "$ev_w/run.ready")" = ready ] ||
+        sandbox_gone "$ev_w/run.sandbox"
+        ev_k=$(sandbox_note memory_oom_kills "$ev_w/run.sandbox")
+        if [ "$(cat "$ev_w/run.ready")" != ready ]; then
+            [ -z "$(sandbox_note memory_ceiling_unavailable "$ev_w/run.sandbox")" ] ||
+                not_run "the memory ceiling could not be applied to the candidate sandbox; no unbounded fallback"
             not_run "bubblewrap could not start the candidate sandbox; no unsandboxed fallback"
-        if [ "$RUN_RC" -eq 0 ] && tail -n +3 "$ev_t/expected.txt" | cmp -s - "$ev_w/out.txt"; then
+        fi
+        # A run in which the ceiling killed any process is a failed attempt, whatever it printed.
+        [ "${ev_k:-0}" -eq 0 ] || MEM_KILL=run
+        if [ "$RUN_RC" -eq 0 ] && [ "$MEM_KILL" = none ] && tail -n +3 "$ev_t/expected.txt" | cmp -s - "$ev_w/out.txt"; then
             VERIFIED=1
         fi
     fi
@@ -414,9 +511,14 @@ $r}" ;;
         esac
         [ -n "$d" ] || d=$(tail -n 3 "$2/err.txt" | sed "s|$2/||g")
         printf 'Your code did not compile. Compiler output:\n%s\n' "$(printf '%s' "$d" | head -c 600)"
+        if [ "$MEM_KILL" = compile ]; then
+            printf 'The compiler was killed for using more than %s bytes of memory on your code.\n' "$MEM_MAX"
+        fi
         if [ "$1" = om ]; then
             printf 'Line 1 of the compiled unit is the line "om2 diag" put before your code.\n'
         fi
+    elif [ "$MEM_KILL" = run ]; then
+        printf 'Your code was killed for using more than %s bytes of memory on hidden tests.\n' "$MEM_MAX"
     else
         printf 'Your code compiled but returned wrong results on hidden tests (exit status %s).\n' "$RUN_RC"
     fi
@@ -526,11 +628,13 @@ run_model() {
         say "max_tokens $MAXTOK"
         say "omc_sha256 $(sha256sum "$OMC" | awk '{print $1}')"
         say "task_set_sha256 $(task_set_sha256 "$SCRIPT_DIR")"
+        say "memory_max_bytes $MEM_MAX"
         say "started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$OUT/run.txt"
     : > "$OUT/rows.txt"
     say "# task lang arm attempt http_code model_reported prompt_tokens completion_tokens total_tokens http_ms" > "$OUT/calls.txt"
     say "# task lang arm attempt busy_503 busy_wait_ms (busy_wait_s $BUSY_WAIT_S busy_sleep_s $BUSY_SLEEP_S)" > "$OUT/busy.txt"
+    say "# task lang arm attempt compile_peak_bytes run_peak_bytes ceiling_kill (memory_max_bytes $MEM_MAX; ceiling_kill none|compile|run)" > "$OUT/memory.txt"
     for lang in $langs; do
         for arm in $arms; do
             for tid in $(task_ids); do
@@ -566,6 +670,7 @@ run_model() {
                     say "$tid $lang $arm $att $first $COMP_RC $VERIFIED $((t2 - t0)) $p $c $t" >> "$OUT/rows.txt"
                     say "$tid $lang $arm $att $code $m $p $c $t $((t1 - t0))" >> "$OUT/calls.txt"
                     say "$tid $lang $arm $att $BUSY_N $BUSY_MS" >> "$OUT/busy.txt"
+                    say "$tid $lang $arm $att $(sandbox_note memory_peak_bytes "$a/eval/compile.sandbox" | sed 's/^$/-/') $(sandbox_note memory_peak_bytes "$a/eval/run.sandbox" | sed 's/^$/-/') $MEM_KILL" >> "$OUT/memory.txt"
                     [ "$VERIFIED" -eq 0 ] || break
                     if [ "$arm" = feedback ] && [ "$att" -lt "$ATTEMPTS" ]; then
                         { printf '```%s\n' "$(lang_fence "$lang")"; cat "$a/candidate.$lang"; printf '\n```\n'; } > "$a/assistant.txt"
@@ -587,6 +692,7 @@ run_model() {
     say "finished $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/run.txt"
     say "run $OUT"
     grep '^models_reported' "$OUT/run.txt"
+    say "memory_ceiling_kills $(awk 'NR>1 && $7!="none"' "$OUT/memory.txt" | wc -l) (memory.txt)"
     report "$OUT/summary.txt"
 }
 
@@ -669,6 +775,7 @@ self_test() {
     printf 'version 2\nattempts 1\ntask01 om plain 1 1 1 0 10 111 37 148\n' | "$BIN_DIR/scorer" > /dev/null || rc=$?
     st_expect "scorer v2 refused compile rc (FAIL)" 1 "$rc"
     audit_checks
+    memory_checks
 
     say "== JSON edge (chat.om)"
     rc=0
@@ -697,6 +804,9 @@ self_test() {
     done
     st_expect "good model reported" "fake-omega-bench" "$(awk 'NR==2{print $6}' "$BUILD_DIR/selftest/good/calls.txt")"
     st_expect "good run saw no 503" "$((4 * ntask))" "$(awk 'NR>1 && $5==0' "$BUILD_DIR/selftest/good/busy.txt" | wc -l)"
+    st_expect "good run names its memory ceiling" "$MEM_MAX" "$(awk '$1=="memory_max_bytes"{print $2}' "$BUILD_DIR/selftest/good/run.txt")"
+    st_expect "good run: every attempt has compile and run peaks below the ceiling, no kill" "$((4 * ntask))" \
+        "$(awk -v m="$MEM_MAX" 'NR>1 && $5 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+$/ && $5 < m && $6 < m && $7=="none"' "$BUILD_DIR/selftest/good/memory.txt" | wc -l)"
     st_expect "good run names its task set" "$(task_set_sha256 "$SCRIPT_DIR")" \
         "$(awk '$1=="task_set_sha256"{print $2}' "$BUILD_DIR/selftest/good/run.txt")"
     for part in tasks/task01/expected.txt prompts/system-om.txt; do
@@ -762,6 +872,8 @@ self_test() {
         st_expect "refuse $l plain verified" 0 "$(group_field "$SUMMARY" "$l" plain verified_count)"
     done
     st_expect "refuse never ran a binary" 0 "$(find "$BUILD_DIR/selftest/refuse" -name out.txt | wc -l)"
+    st_expect "refuse memory.txt: compile peak, no run (-), no kill" "$((4 * ntask))" \
+        "$(awk 'NR>1 && NF==7 && $5 ~ /^[0-9]+$/ && $6=="-" && $7=="none"' "$BUILD_DIR/selftest/refuse/memory.txt" | wc -l)"
     audit_reuse_check
 
     say "== NOT_RUN paths"
@@ -854,7 +966,7 @@ case $mode in
     --output-probe) claim_output "$1" ;;
     --evaluate-probe)
         evaluate "$1" "$TASKS_DIR/task01" "$2" "$3"
-        say "COMP_RC=$COMP_RC RUN_RC=$RUN_RC VERIFIED=$VERIFIED" ;;
+        say "COMP_RC=$COMP_RC RUN_RC=$RUN_RC VERIFIED=$VERIFIED MEM_KILL=$MEM_KILL" ;;
     --deadline-probe)
         evaluate py "$TASKS_DIR/task01" "$1" "$2"
         [ "$COMP_RC" -eq 0 ] && [ "$VERIFIED" -eq 0 ] &&
