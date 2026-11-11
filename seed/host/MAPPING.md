@@ -75,6 +75,15 @@ or driver admission. Native x86, hardware and real driver integration are
 NOT_RUN. Four compiler mutants widen or narrow the allowlist or remove either
 backend's exact-length guard. A mutation counts as killed only at its intended
 admission or short-length assertion, never for an unrelated child/compiler failure.
+Only the last line is the verdict: `AIEN-IOCTL PASS ...` with exit 0. While a
+mutant runs, the case it breaks prints `AIEN-IOCTL expected mutant failure N`
+followed by `AIEN-IOCTL mutant killed M`; a FAIL line appears only for the
+unmutated compiler. Each mutant is located textually in `seed/omc/omc.om` (the
+`mfrom`/`mto` texts); a compiler change that respells or moves an anchor makes
+the step exit 92 with `AIEN-IOCTL INVALID mutant anchor ... (mutant not
+applied; not a compiler verdict)` naming the mutant and its occurrence count,
+before any case runs. Respell the anchor in the same change. An existing scratch
+directory (it must not exist) or an unbuildable mutated compiler exits 91, named.
 
 
 ### Function and program mapping contexts
