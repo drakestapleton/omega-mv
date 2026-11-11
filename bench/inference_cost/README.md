@@ -112,6 +112,63 @@ sh bench/inference_cost/driver.sh --self-test     # also run by `make test-infer
    in `audit.sh`. Good, bad, mixed-arm and
    compiler-refusal runs assert both the group and global PASS/FAIL strings, not only counters.
 
+## Handover rule
+
+`handover.om` decides, from scoreboard results only and with no person in the loop, whether a
+candidate model takes over one job (a language and an arm) from the incumbent model. **No real
+handover has been decided yet**: every verdict so far comes from the TEST DATA in
+`tests/handover/data/`, hand-edited copies of a fake-model self-test run.
+
+```sh
+{ printf 'om2\n'; cat om/tls/sha2.om; sed '/^fn main to int$/,$d' bench/inference_cost/scorer.om
+  cat bench/inference_cost/handover.om; } | seed/out/omc > handover && chmod +x handover
+./handover LANG ARM PERMFILE INCUMBENT_RUN CANDIDATE_RUN...
+sh bench/inference_cost/tests/handover/run.sh   # also run by `make test-inference-cost` and `make test-handover`
+```
+
+The inputs are one incumbent run directory and the candidate run directories (each written by
+`driver.sh --run-model`, holding `run.txt` and `attempts.txt`), the job, and a permanent-case list:
+a file of task ids, separated by whitespace, that must never fail again (it may be empty).
+
+The rule, in integer counts only:
+
+1. **Comparable.** Every run names the incumbent's `task_set_sha256` and `omc_sha256` and has
+   records for the job; every candidate run reports exactly one model and has the same
+   `model_requested` and `models_reported` as the first candidate run. Otherwise the answer is
+   REFUSED, never NO and never YES.
+2. **Enough evidence.** At least 3 candidate runs, in distinct directories (compared by device and
+   inode, so `a` and `./a/` are one directory) with distinct `started` times. Otherwise REFUSED.
+3. **Not worse.** In every candidate run, the number of verified tasks for the job is at least the
+   incumbent run's number. Equal counts pass.
+4. **Permanent cases.** In every candidate run, every permanent case is verified for the job.
+5. **Complete runs.** A run with a line starting `NOT_RUN` or `interrupted` in `run.txt`, a
+   `NOT_RUN` file, no `finished` line, a leftover `rows.txt` (the driver stopped before writing
+   `attempts.txt`), no `run.txt` or `attempts.txt`, or an `attempts.txt` that the scorer refuses
+   (truncated or malformed, or version 1, which has no language or arm) makes the answer REFUSED.
+
+REFUSED (rule 1, 2 or 5) wins over NO; the answer is NO when rule 3 or 4 fails, and YES otherwise.
+The first output line is exactly `HANDOVER YES`, `HANDOVER NO` or `HANDOVER REFUSED`. One line per
+rule follows with the counts that decided it (rules 3 and 4 say `NOT_EVALUATED` when the answer
+is REFUSED), then `sha256 <hex> <path>` for the permanent-case list and for each run's `run.txt` and
+`attempts.txt` in argument order, so the decision can be rechecked from the same files. Exit
+status: 0 YES, 1 NO, 2 REFUSED, 3 usage (fewer than one candidate, an unknown language or arm, an
+unreadable permanent-case list; nothing is printed on stdout).
+
+The wire is read by `scorer.om`'s own functions and tables, unchanged: the build leaves out only
+scorer.om's `fn main` (a unit has one main), and `handover.om` repeats that main's version-2 header
+loop. The scorer stops the process with exit 2 on a malformed wire, so each `attempts.txt` is
+first read in a forked child; the parent reads it again only after the child exited 0. Digests
+come from `om/tls/sha2.om`. The files must not change while the program runs.
+
+`tests/handover/run.sh` runs the known-verdict cases in `tests/handover/cases.txt` (every outcome
+and rule; equal counts is YES; one run one task short is NO; a permanent case failed in one of
+three runs is NO; two runs, duplicate start times, the same directory twice, mixed task-set
+digests, another omc, another candidate model, a NOT_RUN marker, an interrupted run and a
+truncated wire are REFUSED; usage errors exit 3), checks the printed digests against `sha256sum`,
+and builds each mutant in `tests/handover/mutants.txt` from a temporary copy of `handover.om`
+(`at least` made `more than`, every made any for rules 3 and 4, the comparability check removed,
+the run-count check removed). It exits 1 if any case fails or any mutant passes every case.
+
 ## Files
 
 | file | role |

@@ -1,0 +1,986 @@
+note SPDX-License-Identifier: Apache-2.0
+note bench/inference_cost/handover.om -- the handover rule: does a candidate model take over a job
+note (language, arm) from the incumbent? Decided from scoreboard run records only, in integers,
+note with no person involved.
+note
+note Usage: handover LANG ARM PERMFILE INCUMBENT_DIR CANDIDATE_DIR...
+note   LANG om|c|py|rs, ARM plain|feedback. PERMFILE lists task ids that must never fail again
+note   (whitespace separated; it may be empty). Each *_DIR is a driver.sh --run-model directory
+note   holding run.txt and attempts.txt (wire version 2).
+note Output: line 1 is HANDOVER YES, HANDOVER NO or HANDOVER REFUSED; then one line per rule with
+note   the counts that decided it; then "sha256 <hex> <path>" for every input file (PERMFILE, then
+note   run.txt and attempts.txt of each run in argument order) so the decision can be rechecked.
+note Exit: 0 YES, 1 NO, 2 REFUSED, 3 usage.
+note
+note Rules (README section "Handover rule"):
+note 1 comparable: every run's task_set_sha256 and omc_sha256 equal the incumbent's, every run has
+note   the job's group, and every candidate names one reported model and the same model_requested
+note   and models_reported as the first candidate. Otherwise REFUSED.
+note 2 evidence: at least 3 candidate runs, no two in one directory (device and inode) or with one
+note   started time. Otherwise REFUSED.
+note 3 every candidate run verifies at least as many tasks of the job as the incumbent run.
+note 4 every candidate run verifies every permanent case in the job.
+note 5 complete: a run with a NOT_RUN or interrupted line or a NOT_RUN file, without a finished
+note   line, with rows.txt left over (an interrupted driver), without run.txt or attempts.txt, or
+note   whose attempts.txt the scorer refuses (truncated or malformed) makes the answer REFUSED.
+note REFUSED wins over NO; NO when rule 3 or 4 fails; YES otherwise.
+note
+note Build (tests/handover/run.sh): { printf 'om2\n'; cat om/tls/sha2.om;
+note   sed '/^fn main to int$/,$d' bench/inference_cost/scorer.om; cat bench/inference_cost/handover.om; } | omc
+note The attempt wire is read by scorer.om's own functions and tables (read_all, read_task, lang_idx,
+note arm_idx, parse_row, record_task, require_eof), unchanged. Only scorer.om's fn main is left out,
+note because a unit has one main, and its version-2 header loop is repeated in hv_wire. scorer.om
+note stops the process (fail, exit 2) on a malformed wire, so every wire is first read in a forked
+note child and the parent reads it again only after the child exited 0.
+note Files are read twice (decision, then digest); they must not change while the program runs.
+
+note two run.txt images: base 0 and base 983040 (the scorer's input byte limit)
+global hvrun uchar 1966080
+global hvrlen ulong 2
+global hvperm uchar 983040
+global hvpermn ulong 1
+note one argument (Linux PATH_MAX 4096) plus the longest file suffix
+global hvpath uchar 4112
+global hvpathn ulong 1
+global hvst uchar 128
+global hvwst uchar 4
+global hvvo ulong 1
+global hvvl ulong 1
+global hvjob ulong 2
+global hvid ulong 2
+global hvc ulong 32
+
+const HV_NOTRUN ulong 0
+const HV_INTR ulong 1
+const HV_MISS ulong 2
+const HV_WIRE ulong 3
+const HV_TSMIS ulong 4
+const HV_OMCMIS ulong 5
+const HV_MODMIS ulong 6
+const HV_FMISS ulong 7
+const HV_JOBABS ulong 8
+const HV_DUPDIR ulong 9
+const HV_DUPSTART ulong 10
+const HV_INCV ulong 11
+const HV_ATLEAST ulong 12
+const HV_PERMOK ulong 13
+const HV_CMIN ulong 14
+const HV_PCASES ulong 15
+const HV_CPARSED ulong 16
+
+text hv_usage "usage: handover LANG ARM PERMFILE INCUMBENT_DIR CANDIDATE_DIR...\n"
+text hv_frun "/run.txt"
+text hv_fatt "/attempts.txt"
+text hv_frows "/rows.txt"
+text hv_fnr "/NOT_RUN"
+text hv_tnr "NOT_RUN"
+text hv_tint "interrupted"
+text hv_kfin "finished"
+text hv_kts "task_set_sha256"
+text hv_komc "omc_sha256"
+text hv_kmreq "model_requested"
+text hv_kmrep "models_reported"
+text hv_kstart "started"
+
+fn hv_inc i ulong to void
+put hvc i add get hvc i 1
+end
+
+fn hv_die to void
+w = write 2 hv_usage 0 len hv_usage
+exit 3
+end
+
+note hv_arg: argument a into hvpath[0..n), trailing slashes dropped; usage when empty or too long
+fn hv_arg a ulong to ulong
+k = argread a hvpath 0 4096
+if le k 0
+hv_die
+end
+n = ulong k
+while gt n 1 bound 4096
+if ne get hvpath sub n 1 47
+break
+end
+n = sub n 1
+end
+put hvpathn 0 n
+ret n
+end
+
+fn hv_add t view uchar * to ulong
+n = get hvpathn 0
+for i ulong len t
+put hvpath add n i get t i
+end
+m = add n len t
+put hvpathn 0 m
+ret m
+end
+
+fn hv_exists to bool
+s = stat hvpath 0 get hvpathn 0 hvst 0 128
+ret ge s 0
+end
+
+fn hv_argeq n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n
+if ne get hvpath i get t i
+ret false
+end
+end
+ret true
+end
+
+fn hv_langarg n ulong to ulong
+if hv_argeq n l_om
+ret 0
+end
+if hv_argeq n l_c
+ret 1
+end
+if hv_argeq n l_py
+ret 2
+end
+if hv_argeq n l_rs
+ret 3
+end
+hv_die
+ret 0
+end
+
+fn hv_armarg n ulong to ulong
+if hv_argeq n a_plain
+ret 0
+end
+if hv_argeq n a_feed
+ret 1
+end
+hv_die
+ret 0
+end
+
+note hv_load: the file at hvpath into hvrun at base; its length, -1 cannot open or read, -2 too large
+fn hv_load base ulong to long
+fd = int fopen hvpath 0 get hvpathn 0 0 0
+if lt fd 0
+ret -1
+end
+p = ulong 0
+bad = false
+note every pass adds at least one byte or leaves the loop
+while lt p 983040 bound 999999
+k = read fd hvrun add base p sub 983040 p
+if lt k 0
+bad = true
+end
+if le k 0
+break
+end
+p = add p ulong k
+end
+c = fclose fd
+if bad
+ret -1
+end
+if eq p 983040
+ret -2
+end
+put hvrlen div base 983040 p
+ret long p
+end
+
+fn hv_loadrun r ulong base ulong to long
+n = hv_arg add 4 r
+m = hv_add hv_frun
+ret hv_load base
+end
+
+fn hv_nextline s ulong lim ulong to ulong
+p = s
+while lt p lim bound 999999
+if eq get hvrun p 10
+ret add p 1
+end
+p = add p 1
+end
+ret lim
+end
+
+fn hv_startswith s ulong lim ulong t view uchar * to bool
+if gt add s len t lim
+ret false
+end
+for i ulong len t
+if ne get hvrun add s i get t i
+ret false
+end
+end
+ret true
+end
+
+note hv_keyat: the line at s starts with key and a space
+fn hv_keyat s ulong lim ulong key view uchar * to bool
+e = add s len key
+if ge e lim
+ret false
+end
+if ne get hvrun e 32
+ret false
+end
+ret hv_startswith s lim key
+end
+
+note hv_value: the value after the key's space, to the end of the line, trailing blanks dropped
+fn hv_value v ulong lim ulong to void
+s = v
+while lt s lim bound 999999
+if ne get hvrun s 32
+break
+end
+s = add s 1
+end
+e = s
+while lt e lim bound 999999
+if eq get hvrun e 10
+break
+end
+e = add e 1
+end
+while gt e s bound 999999
+c = get hvrun sub e 1
+if and ne c 32 and ne c 9 ne c 13
+break
+end
+e = sub e 1
+end
+put hvvo 0 s
+put hvvl 0 sub e s
+end
+
+note hv_find: key appears on exactly one line of the run image at base; its value in hvvo, hvvl
+fn hv_find base ulong key view uchar * to bool
+lim = add base get hvrlen div base 983040
+s = base
+hits = ulong 0
+while lt s lim bound 999999
+if hv_keyat s lim key
+hits = add hits 1
+hv_value add s len key lim
+end
+s = hv_nextline s lim
+end
+ret eq hits 1
+end
+
+note hv_scan: bit 0 a line starts NOT_RUN, bit 1 a line starts interrupted (image at base 0)
+fn hv_scan to ulong
+lim = get hvrlen 0
+f = ulong 0
+s = ulong 0
+while lt s lim bound 999999
+if hv_startswith s lim hv_tnr
+f = or f 1
+end
+if hv_startswith s lim hv_tint
+f = or f 2
+end
+s = hv_nextline s lim
+end
+ret f
+end
+
+fn hv_eqv ao ulong al ulong bo ulong bl ulong to bool
+if ne al bl
+ret false
+end
+for i ulong al
+if ne get hvrun add ao i get hvrun add bo i
+ret false
+end
+end
+ret true
+end
+
+note hv_same_key: key once in both run images, nonempty and equal; a difference counts in c
+fn hv_same_key key view uchar * c ulong to void
+if not (hv_find 0 key)
+hv_inc HV_FMISS
+ret
+end
+ao = get hvvo 0
+al = get hvvl 0
+if not (hv_find 983040 key)
+hv_inc HV_FMISS
+ret
+end
+if or eq al 0 not (hv_eqv ao al get hvvo 0 get hvvl 0)
+hv_inc c
+end
+end
+
+note ---- the attempt wire, read by scorer.om's functions (version 2 only: the job needs lang, arm)
+fn hv_wire to int
+n = read_all
+if eq n 0
+ret 1
+end
+put inlen 0 n
+put pos 0 0
+skip_token
+v = read_uint
+if ne v 2
+ret 3
+end
+skip_token
+att_cnt = read_uint
+for i ulong att_cnt
+read_task
+lg = lang_idx
+am = arm_idx
+parse_row mul add mul lg 2 am 12
+end
+require_eof
+ret 0
+end
+
+fn hv_stdin to bool
+fd = int fopen hvpath 0 get hvpathn 0 0 0
+if lt fd 0
+ret false
+end
+if eq fd 0
+ret true
+end
+r = dupfd fd 0 0
+c = fclose fd
+ret eq r 0
+end
+
+fn hv_child to void
+hv_reset
+if not (hv_stdin)
+exit 5
+end
+rc = hv_wire
+exit rc
+end
+
+note hv_wirechk: the wire at hvpath read in a child; its exit status (0 accepted, 5 cannot open)
+fn hv_wirechk to int
+pid = fork
+if lt pid 0
+ret 7
+end
+if eq pid 0
+hv_child
+exit 9
+end
+r = waitpid int pid hvwst 0 4 0
+if ne r pid
+ret 8
+end
+s0 = ulong get hvwst 0
+if ne and s0 127 0
+ret 9
+end
+ret int get hvwst 1
+end
+
+fn hv_reset to void
+for i ulong 96
+put stats i 0
+end
+for i ulong 65536
+put taskbeg i 0
+put tasklen i 0
+put taskgrp i 0
+put taskatt i 0
+put taskver i 0
+end
+end
+
+fn hv_grp to ulong
+ret mul add mul get hvjob 0 2 get hvjob 1 12
+end
+
+fn hv_same h ulong s ulong n ulong to bool
+st = get taskbeg h
+for i ulong n
+if ne get inbuf add st i get hvperm add s i
+ret false
+end
+end
+ret true
+end
+
+note hv_pver: the permanent case hvperm[s .. s+n) is verified in group b of the parsed wire
+fn hv_pver b ulong s ulong n ulong to bool
+for h ulong 65536
+if and eq get tasklen h n eq get taskgrp h b
+if hv_same h s n
+ret eq get taskver h 1
+end
+end
+end
+ret false
+end
+
+fn hv_ptokend s ulong lim ulong to ulong
+e = s
+while lt e lim bound 999999
+if is_space (get hvperm e)
+ret e
+end
+e = add e 1
+end
+ret lim
+end
+
+note hv_perm: b < 65536 checks every permanent case in group b; b = 65536 only counts them
+fn hv_perm b ulong to ulong
+lim = get hvpermn 0
+s = ulong 0
+bad = ulong 0
+while lt s lim bound 999999
+if is_space (get hvperm s)
+s = add s 1
+else
+e = hv_ptokend s lim
+if eq b 65536
+bad = add bad 1
+else
+if not (hv_pver b s (sub e s))
+bad = add bad 1
+end
+end
+s = e
+end
+end
+ret bad
+end
+
+fn hv_loadperm to void
+fd = int fopen hvpath 0 get hvpathn 0 0 0
+if lt fd 0
+hv_die
+end
+p = ulong 0
+note every pass adds at least one byte or leaves the loop
+while lt p 983040 bound 999999
+k = read fd hvperm p sub 983040 p
+if lt k 0
+hv_die
+end
+if eq k 0
+break
+end
+p = add p ulong k
+end
+c = fclose fd
+if eq p 983040
+hv_die
+end
+put hvpermn 0 p
+put hvc HV_PCASES hv_perm 65536
+end
+
+fn hv_args to ulong
+c = ulong argcnt
+if lt c 6
+hv_die
+end
+n1 = hv_arg 1
+put hvjob 0 hv_langarg n1
+n2 = hv_arg 2
+put hvjob 1 hv_armarg n2
+n3 = hv_arg 3
+hv_loadperm
+for i ulong sub c 4
+n4 = hv_arg add i 4
+end
+ret sub c 5
+end
+
+note ---- rule 3 and 4 counts of one parsed run (r 0 is the incumbent)
+fn hv_atleast cv ulong to bool
+iv = get hvc HV_INCV
+note rule 3: at least the incumbent's verified count
+if ge cv iv
+ret true
+end
+ret false
+end
+
+fn hv_tally r ulong to void
+b = hv_grp
+if eq get stats add b 9 0
+hv_inc HV_JOBABS
+ret
+end
+v = get stats add b 2
+if eq r 0
+put hvc HV_INCV v
+ret
+end
+hv_inc HV_CPARSED
+if hv_atleast v
+hv_inc HV_ATLEAST
+end
+if or (eq get hvc HV_CPARSED 1) (lt v get hvc HV_CMIN)
+put hvc HV_CMIN v
+end
+if eq (hv_perm b) 0
+hv_inc HV_PERMOK
+end
+end
+
+fn hv_parse r ulong to void
+hv_reset
+if not (hv_stdin)
+hv_inc HV_WIRE
+ret
+end
+rc = hv_wire
+if ne rc 0
+hv_inc HV_WIRE
+ret
+end
+hv_tally r
+end
+
+note ---- rule 5 for run r, then its wire and counts
+fn hv_run r ulong to void
+n = hv_loadrun r 0
+if lt n 0
+hv_inc HV_MISS
+ret
+end
+f = hv_scan
+fin = hv_find 0 hv_kfin
+n1 = hv_arg add 4 r
+m1 = hv_add hv_frows
+rows = hv_exists
+n2 = hv_arg add 4 r
+m2 = hv_add hv_fnr
+nrf = hv_exists
+if or (ne (and f 1) 0) nrf
+hv_inc HV_NOTRUN
+end
+if or (or (ne (and f 2) 0) (not fin)) rows
+hv_inc HV_INTR
+end
+n3 = hv_arg add 4 r
+m3 = hv_add hv_fatt
+st = hv_wirechk
+if eq st 5
+hv_inc HV_MISS
+ret
+end
+if ne st 0
+hv_inc HV_WIRE
+ret
+end
+hv_parse r
+end
+
+note ---- rule 1
+fn hv_cmp1 r ulong to void
+n = hv_loadrun r 983040
+if lt n 0
+hv_inc HV_FMISS
+ret
+end
+hv_same_key hv_kts HV_TSMIS
+hv_same_key hv_komc HV_OMCMIS
+end
+
+fn hv_onetok to bool
+o = get hvvo 0
+for i ulong get hvvl 0
+if eq get hvrun add o i 32
+ret false
+end
+end
+ret true
+end
+
+fn hv_cmpm r ulong to void
+n = hv_loadrun r 983040
+if lt n 0
+hv_inc HV_FMISS
+ret
+end
+hv_same_key hv_kmreq HV_MODMIS
+hv_same_key hv_kmrep HV_MODMIS
+if hv_find 983040 hv_kmrep
+if not (hv_onetok)
+hv_inc HV_MODMIS
+end
+end
+end
+
+fn hv_rule1 nc ulong to void
+n0 = hv_loadrun 0 0
+if lt n0 0
+hv_inc HV_FMISS
+else
+for r ulong nc
+hv_cmp1 add r 1
+end
+end
+n1 = hv_loadrun 1 0
+if lt n1 0
+hv_inc HV_FMISS
+ret
+end
+for i ulong nc
+hv_cmpm add i 1
+end
+end
+
+fn hv_r1ok to bool
+a = and eq get hvc HV_TSMIS 0 eq get hvc HV_OMCMIS 0
+b = and eq get hvc HV_MODMIS 0 eq get hvc HV_FMISS 0
+ret and and a b eq get hvc HV_JOBABS 0
+end
+
+note ---- rule 2
+fn hv_le64 o ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or shl v 8 ulong get hvst sub add o 7 i
+end
+ret v
+end
+
+fn hv_dirid r ulong to bool
+n = hv_arg add 4 r
+s = stat hvpath 0 n hvst 0 128
+if lt s 0
+ret false
+end
+put hvid 0 hv_le64 0
+put hvid 1 hv_le64 8
+ret true
+end
+
+fn hv_samedir j ulong dev ulong ino ulong to bool
+if not (hv_dirid j)
+ret false
+end
+ret and eq get hvid 0 dev eq get hvid 1 ino
+end
+
+note hv_samestart: run j (into base 983040) has the started value of the image at base 0
+fn hv_samestart j ulong ao ulong al ulong to bool
+n = hv_loadrun j 983040
+if lt n 0
+ret false
+end
+if not (hv_find 983040 hv_kstart)
+ret true
+end
+ret hv_eqv ao al get hvvo 0 get hvvl 0
+end
+
+note hv_dupof: candidate r shares its directory or its started time with an earlier candidate
+fn hv_dupof r ulong to void
+n = hv_loadrun r 0
+if lt n 0
+ret
+end
+ds = false
+if not (hv_find 0 hv_kstart)
+ds = true
+end
+ao = get hvvo 0
+al = get hvvl 0
+if eq al 0
+ds = true
+end
+ok = hv_dirid r
+dev = get hvid 0
+ino = get hvid 1
+dd = false
+for j ulong sub r 1
+if and ok (hv_samedir add j 1 dev ino)
+dd = true
+end
+if hv_samestart add j 1 ao al
+ds = true
+end
+end
+if dd
+hv_inc HV_DUPDIR
+end
+if ds
+hv_inc HV_DUPSTART
+end
+end
+
+fn hv_rule2 nc ulong to void
+for i ulong nc
+hv_dupof add i 1
+end
+end
+
+fn hv_r5ok to bool
+a = and eq get hvc HV_NOTRUN 0 eq get hvc HV_INTR 0
+b = and eq get hvc HV_MISS 0 eq get hvc HV_WIRE 0
+ret and a b
+end
+
+note ---- output
+fn hv_num v ulong to void
+p = ulong 32
+x = v
+for i ulong 20
+p = sub p 1
+put obuf p uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+w = write 1 obuf p sub 32 p
+end
+
+fn hv_pair t view uchar * v ulong to void
+wtext t
+hv_num v
+end
+
+text hv_tpass "PASS"
+text hv_tfailw "FAIL"
+text hv_tnot "NOT_EVALUATED"
+fn hv_status ok bool to void
+if ok
+wtext hv_tpass
+else
+wtext hv_tfailw
+end
+end
+
+text hv_tr1 "rule1 comparable "
+text hv_tr1a " runs "
+text hv_tr1b " task_set_mismatch "
+text hv_tr1c " omc_mismatch "
+text hv_tr1d " model_mismatch "
+text hv_tr1e " fields_missing "
+text hv_tr1f " job_absent "
+fn hv_line1 nc ulong ok bool to void
+wtext hv_tr1
+hv_status ok
+hv_pair hv_tr1a add nc 1
+hv_pair hv_tr1b get hvc HV_TSMIS
+hv_pair hv_tr1c get hvc HV_OMCMIS
+hv_pair hv_tr1d get hvc HV_MODMIS
+hv_pair hv_tr1e get hvc HV_FMISS
+hv_pair hv_tr1f get hvc HV_JOBABS
+wtext t_nl
+end
+
+text hv_tr2 "rule2 evidence "
+text hv_tr2a " candidate_runs "
+text hv_tr2b " distinct_dirs "
+text hv_tr2c " distinct_starts "
+text hv_tr2d " need 3\n"
+fn hv_line2 nc ulong ok bool to void
+wtext hv_tr2
+hv_status ok
+hv_pair hv_tr2a nc
+hv_pair hv_tr2b sub nc get hvc HV_DUPDIR
+hv_pair hv_tr2c sub nc get hvc HV_DUPSTART
+wtext hv_tr2d
+end
+
+fn hv_label to void
+l = get hvjob 0
+if eq l 0
+wtext l_om
+end
+if eq l 1
+wtext l_c
+end
+if eq l 2
+wtext l_py
+end
+if eq l 3
+wtext l_rs
+end
+wtext t_sp
+if eq get hvjob 1 0
+wtext a_plain
+else
+wtext a_feed
+end
+end
+
+text hv_tr3 "rule3 verified "
+text hv_tr3a " job "
+text hv_tr3b " incumbent "
+text hv_tr3c " candidate_min "
+text hv_tr3d " at_least "
+text hv_tr3e " of "
+fn hv_line3 nc ulong ok bool refused bool to void
+wtext hv_tr3
+if refused
+wtext hv_tnot
+else
+hv_status ok
+end
+wtext hv_tr3a
+hv_label
+hv_pair hv_tr3b get hvc HV_INCV
+hv_pair hv_tr3c get hvc HV_CMIN
+hv_pair hv_tr3d get hvc HV_ATLEAST
+hv_pair hv_tr3e nc
+wtext t_nl
+end
+
+text hv_tr4 "rule4 permanent "
+text hv_tr4a " cases "
+text hv_tr4b " all_verified_in "
+fn hv_line4 nc ulong ok bool refused bool to void
+wtext hv_tr4
+if refused
+wtext hv_tnot
+else
+hv_status ok
+end
+hv_pair hv_tr4a get hvc HV_PCASES
+hv_pair hv_tr4b get hvc HV_PERMOK
+hv_pair hv_tr3e nc
+wtext t_nl
+end
+
+text hv_tr5 "rule5 complete "
+text hv_tr5a " not_run "
+text hv_tr5b " interrupted "
+text hv_tr5c " missing_files "
+text hv_tr5d " wire_refused "
+fn hv_line5 nc ulong ok bool to void
+wtext hv_tr5
+hv_status ok
+hv_pair hv_tr1a add nc 1
+hv_pair hv_tr5a get hvc HV_NOTRUN
+hv_pair hv_tr5b get hvc HV_INTR
+hv_pair hv_tr5c get hvc HV_MISS
+hv_pair hv_tr5d get hvc HV_WIRE
+wtext t_nl
+end
+
+text hv_hexd "0123456789abcdef"
+text hv_tsha "sha256 "
+text hv_tmiss "MISSING "
+text hv_tunr "UNREADABLE "
+fn hv_pathln to void
+w = write 1 hvpath 0 get hvpathn 0
+wtext t_nl
+end
+
+fn hv_hexout dig view uchar 32 to void
+hx = new uchar 65 32
+for i ulong 32
+d = get dig i
+put hx mul i 2 get hv_hexd ulong shr d 4
+put hx add mul i 2 1 get hv_hexd ulong and d 15
+end
+w = write 1 hx 0 65
+end
+
+note hv_sha: "sha256 <hex> <path>" for the file at hvpath
+fn hv_sha to void
+ctx = new ulong 40 0
+buf = new uchar 65536 0
+dig = new uchar 32 0
+wtext hv_tsha
+fd = int fopen hvpath 0 get hvpathn 0 0 0
+if lt fd 0
+wtext hv_tmiss
+hv_pathln
+ret
+end
+sha256_init ctx
+more = true
+bad = false
+note every pass reads at least one byte or leaves the loop (files below 999999 * 64 KiB)
+while more bound 999999
+k = read fd buf 0 65536
+if gt k 0
+sha256_update ctx part buf 0 ulong k
+else
+more = false
+if lt k 0
+bad = true
+end
+end
+end
+c = fclose fd
+if bad
+wtext hv_tunr
+else
+sha256_final ctx dig
+hv_hexout dig
+end
+hv_pathln
+end
+
+fn hv_digests nc ulong to void
+n = hv_arg 3
+hv_sha
+for r ulong add nc 1
+a1 = hv_arg add 4 r
+b1 = hv_add hv_frun
+hv_sha
+a2 = hv_arg add 4 r
+b2 = hv_add hv_fatt
+hv_sha
+end
+end
+
+text hv_tyes "HANDOVER YES\n"
+text hv_tno "HANDOVER NO\n"
+text hv_tref "HANDOVER REFUSED\n"
+fn hv_report nc ulong to int
+r5 = hv_r5ok
+r1 = hv_r1ok
+r2n = ge nc 3
+r2 = and r2n and eq get hvc HV_DUPDIR 0 eq get hvc HV_DUPSTART 0
+refused = not (and r1 and r2 r5)
+r3ok = eq get hvc HV_ATLEAST nc
+r4ok = eq get hvc HV_PERMOK nc
+rc = int 0
+if refused
+wtext hv_tref
+rc = 2
+else
+if and r3ok r4ok
+wtext hv_tyes
+else
+wtext hv_tno
+rc = 1
+end
+end
+hv_line1 nc r1
+hv_line2 nc r2
+hv_line3 nc r3ok refused
+hv_line4 nc r4ok refused
+hv_line5 nc r5
+hv_digests nc
+ret rc
+end
+
+fn main to int
+nc = hv_args
+for r ulong add nc 1
+hv_run r
+end
+hv_rule1 nc
+hv_rule2 nc
+ret hv_report nc
+end

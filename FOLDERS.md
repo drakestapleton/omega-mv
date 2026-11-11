@@ -7,7 +7,7 @@ Two crumb files already under evidence/ stay, because existing evidence is never
 
 ## `bench/inference_cost/`
 
-Held-out inference-cost benchmark: evaluate verified programs produced per unit of inference cost
+Held-out inference-cost benchmark: evaluate verified programs produced per unit of inference cost; `handover.om` decides from its run records whether a candidate model takes over a job (no real handover decided yet)
 
 ## `bench/omc_efficiency/`
 
