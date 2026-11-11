@@ -13,9 +13,11 @@ note   B <tab> rid <tab> did <tab> note     bring the project
 note   W <tab> rid <tab> did               withdraw it (only the key that brought it)
 note A queue read to its end past 262,144 bytes is renamed to queue.old, finished and removed, so
 note forged's 1 MiB cap on the queue is never permanent.
-note Bring: refused when the key is not in <work dir>allow, when the project is already on the shelf, when its storage folder already
-note exists on this node (a repository this node holds for another reason is never touched), when
-note the key has 8 open projects or the shelf has 200. Then rad seed --scope all --fetch (90 s);
+note Bring: refused when the key is not in <work dir>allow, when the project is already on the
+note shelf, when its storage folder already exists on this node or the node already has a seeding
+note policy for it (a repository this node holds or seeds for another reason is never touched),
+note when the key has 8 open projects or the shelf has 200. A folder left by this program's own
+note failed fetch of the same project is removed first. Then rad seed --scope all --fetch (90 s);
 note not found is refused and unseeded; over 51,200 KiB is refused, unseeded and removed. The
 note project's name and description come from its Radicle identity document.
 note Withdraw: rad unseed, remove the storage folder, mark the row withdrawn. Only a row that is
@@ -60,6 +62,8 @@ global dsl ulong 1
 global dt uchar 16
 global dtl ulong 1
 global kb ulong 1
+global ub uchar 408
+global ubl ulong 1
 global qe ulong 1
 text kq "queue"
 text kqold "queue.old"
@@ -99,6 +103,8 @@ text kr2 "refused: this key already has 8 open projects"
 text kr3 "refused: the shelf is full"
 text kr4 "refused: not found on the Radicle network (publish it, then rad sync --announce)"
 text kr5 "refused: larger than 50 MiB"
+text kr6 "refused: the Radicle node did not answer; try again"
+text kr7 "refused: this node already seeds this project"
 text kname "\"name\""
 text kdesc "\"description\""
 text kunnamed "unnamed project"
@@ -405,6 +411,137 @@ ret eq faccess sb 0 get sbl 0 0 0
 end
 note jget: the string value of key t in the command output, sanitized, at most cap bytes, into
 note nm (which 0) or ds (which 1). An escape becomes a space, a control byte a space.
+note uin: lo <= c <= hi
+fn uin c uchar lo uchar hi uchar to bool
+ret and ge c lo le c hi
+end
+note uvalid: the length of the well-formed UTF-8 character at ub[i], or 0 (RFC 3629: no overlong
+note form, no surrogate, nothing past U+10FFFF). The same rule as research/agent.om.
+fn uvalid i ulong to ulong
+n = get ubl 0
+c = get ub i
+if lt c 128
+ret 1
+end
+if uin c 194 223
+if lt add i 1 n
+if uin get ub add i 1 128 191
+ret 2
+end
+end
+ret 0
+end
+lo = uchar 128
+hi = uchar 191
+if uin c 224 239
+if eq c 224
+lo = uchar 160
+end
+if eq c 237
+hi = uchar 159
+end
+if lt add i 2 n
+if and uin get ub add i 1 lo hi uin get ub add i 2 128 191
+ret 3
+end
+end
+ret 0
+end
+if uin c 240 244
+if eq c 240
+lo = uchar 144
+end
+if eq c 244
+hi = uchar 143
+end
+if lt add i 3 n
+if and and uin get ub add i 1 lo hi uin get ub add i 2 128 191 uin get ub add i 3 128 191
+ret 4
+end
+end
+end
+ret 0
+end
+note usan: every byte of ub that does not start a well-formed UTF-8 character becomes "?". A name
+note or description cut at its cap can end inside a character; the list and its JSON stay UTF-8.
+fn usan to void
+n = get ubl 0
+i = ulong 0
+while lt i n bound 408
+k = uvalid i
+if eq k 0
+put ub i 63
+i = add i 1
+else
+i = add i k
+end
+end
+end
+fn usnm to void
+n = get nml 0
+for i ulong n bound 120
+put ub i get nm i
+end
+put ubl 0 n
+usan
+for i ulong n bound 120
+put nm i get ub i
+end
+end
+fn usds to void
+n = get dsl 0
+for i ulong n bound 400
+put ub i get ds i
+end
+put ubl 0 n
+usan
+for i ulong n bound 400
+put ds i get ub i
+end
+end
+fn usnt to void
+n = get ntl 0
+for i ulong n bound 200
+put ub i get nt i
+end
+put ubl 0 n
+usan
+for i ulong n bound 200
+put nt i get ub i
+end
+end
+note policy: does the node's seeding policy list (rad seed without a rid) name the current rid?
+note 0 no, 1 yes, 2 the node did not answer or the list did not fit. A bring goes on only at 0, so
+note it never rewrites the scope of a policy the owner set, and a failed fetch never unseeds one.
+fn rmatch i ulong to bool
+n = get ridl 0
+for k ulong n bound 44
+if ne get cb add i k get rid k
+ret false
+end
+end
+ret true
+end
+fn policy to ulong
+pkrad
+pkt kseed
+if not run 30
+ret 2
+end
+n = get cbl 0
+if ge n 65535
+ret 2
+end
+m = get ridl 0
+i = ulong 0
+while le add i m n bound 65536
+if rmatch i
+ret 1
+end
+i = add i 1
+end
+ret 0
+end
 fn jput which ulong o ulong c uchar to void
 if eq which 0
 put nm o c
@@ -574,6 +711,34 @@ end
 s = add e 1
 end
 ret lim
+end
+note lstate: the state (field 1) of the row s..e is t
+fn lstate s ulong e ulong t view uchar * to bool
+a = lfld s e 1
+b = lfe a e
+if ne sub b a len t
+ret false
+end
+for i ulong len t bound 128
+if ne get lb add a i get t i
+ret false
+end
+end
+ret true
+end
+note lfailed: the private list says this program's own fetch of the current rid failed (not found
+note or over the size limit). A storage folder found for it then is that fetch's leftover (the
+note node can finish a fetch after rad was stopped at its deadline), not a repository of the owner.
+fn lfailed to bool
+s = lfind
+if ge s get lbl 0
+ret false
+end
+e = leol s
+if lstate s e kr4
+ret true
+end
+ret lstate s e kr5
 end
 note lcount: open rows; mine true counts only the current did's
 fn lcount mine bool to ulong
@@ -854,9 +1019,13 @@ if not allowed
 save kr0
 ret
 end
+left = false
 if stored
+left = lfailed
+if not left
 save kr1
 ret
+end
 end
 if ge lcount true 8
 save kr2
@@ -865,6 +1034,18 @@ end
 if ge lcount false 200
 save kr3
 ret
+end
+p = policy
+if eq p 1
+save kr7
+ret
+end
+if eq p 2
+save kr6
+ret
+end
+if left
+dorm
 end
 ok = doseed
 if ok
@@ -888,6 +1069,8 @@ end
 if dopayload
 put nml 0 jget kname 0 120
 put dsl 0 jget kdesc 1 400
+usnm
+usds
 end
 if eq get nml 0 0
 for i ulong len kunnamed bound 32
@@ -1020,36 +1203,52 @@ ret add p 1
 end
 ret e
 end
-note qline: qb[a, e) is one queue line
-fn qline a ulong e ulong to void
+note qline: qb[a, e) is one queue line. True when it was well formed and was acted on.
+fn qline a ulong e ulong to bool
 if lt sub e a 4
-ret
+ret false
 end
 kind = get qb a
 if ne get qb add a 1 9
-ret
+ret false
 end
 p = qfield add a 2 e 0 44
 p = qfield p e 1 96
 put ntl 0 0
 if eq kind 66
 p = qfield p e 2 200
+usnt
 end
 if or lt get ridl 0 20 eq get didl 0 0
-ret
+ret false
 end
 if ne get rid 0 122
-ret
+ret false
 end
 if eq kind 66
 bring
+ret true
 end
 if eq kind 87
 withdraw
+ret true
 end
+ret false
+end
+note qeol: the index of the line feed at or after a in qb[0, m), or m
+fn qeol a ulong m ulong to ulong
+e = a
+while lt e m bound 65536
+if eq get qb e 10
+ret e
+end
+e = add e 1
+end
+ret m
 end
 note qchunk: the complete lines of one 64 KiB chunk of the queue file at pth, from the stored
-note offset. qe is 1 when the file opened and nothing was left to read.
+note offset. The offset is saved after each line that was acted on and once at the end of the
+note chunk, not after every ignored line (each save is a write, a sync and a rename). qe is 1 when the file opened and nothing was left to read.
 fn qchunk to bool
 put qe 0 0
 fd = fopen pth 0 get pthl 0 524288 0
@@ -1066,24 +1265,28 @@ end
 m = ulong k
 a = ulong 0
 did1 = false
+dirty = false
 while lt a m bound 65536
-e = a
-while lt e m bound 65536
-if eq get qb e 10
-break
-end
-e = add e 1
-end
+e = qeol a m
 if ge e m
 if and eq a 0 eq m 65536
-putoff add off m
+a = m
+dirty = true
 did1 = true
 end
 break
 end
-qline a e
+acted = qline a e
 did1 = true
 a = add e 1
+if acted
+putoff add off a
+dirty = false
+else
+dirty = true
+end
+end
+if dirty
 putoff add off a
 end
 ret did1
