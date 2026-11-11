@@ -180,13 +180,14 @@ bits there (multiply, two-source, float). The selector never asks for these; the
 
 1. Shrink-wrapping (saves only on paths that need them) — D8; constant rematerialization (fib keeps the constant 2
    in a callee-saved register across its loop).
-2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC (`vload`, `vstore`), `atom`, `atomcas`,
-   SLICE results of calls and select; bulk copy (PROPOSAL-ir-bulk-copy.md, IR and optimizer lanes). Bounds checks
-   hoisted out of loops by a pass that proves them (IR.md s15).
+2. Memory beyond the slice: STRUCT fields (`fload`, `fstore`, `fref`), VEC other than the 128-bit float vectors of
+   section 12 (`vload`, `vstore` of integer and wider vectors), `atom`, `atomcas`, SLICE results of calls and select;
+   bulk copy (PROPOSAL-ir-bulk-copy.md, IR and optimizer lanes). Bounds checks hoisted out of loops by a pass that
+   proves them (IR.md s15).
 3. Remaining fusions: ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
-4. f16, bf16, fp8, `fmath` and vector floats (refused, exit 5: no accuracy-stated implementation), host words beyond
-   read, write, monons, realns, cpufence and cpurelax (sleepns 120 has no ngrun reference: ngrun's host words are
-   read, write, monons, realns, cpufence, cpurelax).
+4. f16, bf16, fp8, `fmath` and vector floats other than `vec f32 4` and `vec f64 2` (section 12) (refused, exit 5: no
+   accuracy-stated implementation), host words beyond read, write, monons, realns, cpufence and cpurelax (sleepns 120
+   has no ngrun reference: ngrun's host words are read, write, monons, realns, cpufence, cpurelax).
 
 ## 6. Gates (run from the omega-mv root on core 1)
 
