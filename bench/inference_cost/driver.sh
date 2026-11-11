@@ -816,12 +816,40 @@ self_test() {
     return 1
 }
 
+# Reusable referee interface: no other mode changes its contract.
+verify_candidate() {
+    [ "$#" -eq 4 ] || die "--verify-candidate LANG TASK_ID CANDIDATE ABS_WORK"
+    vc_lang=$1 vc_task=$2 vc_candidate=$3 vc_work=$4
+    case $vc_lang in om|c|py|rs) ;; *) die "unknown referee language" ;; esac
+    case $vc_task in task[0-9][0-9]) ;; *) die "invalid task identity" ;; esac
+    [ -d "$TASKS_DIR/$vc_task" ] && [ ! -L "$TASKS_DIR/$vc_task" ] || die "unknown task identity"
+    for vc_path in "$vc_candidate" "$vc_work"; do
+        case $vc_path in /*) ;; *) die "referee paths must be absolute" ;; esac
+        case "$vc_path/" in */../*|*/./*|*'//'*) die "noncanonical referee path" ;; esac
+        vc_walk=$vc_path
+        while [ "$vc_walk" != / ]; do
+            [ ! -L "$vc_walk" ] || die "symbolic-link referee path"
+            vc_walk=$(dirname "$vc_walk")
+        done
+    done
+    [ -f "$vc_candidate" ] && [ ! -L "$vc_candidate" ] || die "candidate is not a regular file"
+    check_pin
+    check_sandbox
+    need_lang_tools "$vc_lang"
+    claim_output "$vc_work"
+    evaluate "$vc_lang" "$TASKS_DIR/$vc_task" "$vc_candidate" "$vc_work/eval"
+    say "COMP_RC=$COMP_RC RUN_RC=$RUN_RC VERIFIED=$VERIFIED"
+    [ "$VERIFIED" -eq 1 ]
+}
+
 # ---- main
 
 [ $# -ge 1 ] || usage
 mode=$1
 shift
 case $mode in
+    --verify-candidate) verify_candidate "$@" ;;
+    --task-set-sha256) [ "$#" -eq 0 ] || die "--task-set-sha256 takes no arguments"; task_set_sha256 "$SCRIPT_DIR" ;;
     --sandbox) sandbox "$@" ;;
     --output-probe) claim_output "$1" ;;
     --evaluate-probe)
