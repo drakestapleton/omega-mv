@@ -93,11 +93,11 @@ while IFS='|' read -r site repl; do
   say "  killed mutant $k ($repl) by $caught: $(cat $B/why)"
 done <<'MUT'
 if ne a_ib add o i a_ib add s i|if eq a_ib add o i a_ib add s i
-if ne ulong a_gu 18 j n|if ne ulong a_gu 18 j 9
+if ne ulong uchar get a_ar add get a_rb 18 j n|if ne ulong uchar get a_ar add get a_rb 18 j 9
 a_pc 18 k uchar n|a_pc 18 k uchar 9
 put tw 0 add 1 shl ln_intern get ts 0 n 8|put tw 0 add 1 shl mul ln_intern get ts 0 n 0 8
 if and gt n 8 le n 63|if and gt n 8 le n 62
-a_p 20 h add j 1|a_p 20 h add j 2
+put a_ar add get a_rb 20 h add j 1|put a_ar add get a_rb 20 h add j 2
 MUT
 say "PASS $k interning mutants each fail a check"
 [ $skip = 0 ] || { say "NOT_RUN $skip x86 runs (no qemu-x86_64)"; exit 3; }

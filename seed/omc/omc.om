@@ -289,8 +289,8 @@ end
 
 note pwid: the parameter slots of fn table entry p: 2 for an unsized array (pointer, count), else 1
 fn pwid p ulong to ulong
-k = ulong a_gu 37 p
-if and or eq k 2 eq k 3 eq a_g 36 p 0
+k = ulong uchar get a_ar add get a_rb 37 p
+if and or eq k 2 eq k 3 eq get a_ar add get a_rb 36 p 0
 ret 2
 end
 ret 1
@@ -388,7 +388,8 @@ end
 end
 end
 
-note a_need: group g is about to use index n. Below its capacity nothing happens; at or above it every
+note a_need: group g is about to use index n. Call sites outside this module test `if ge n get a_gp g`
+note first: below the highest index asked so far the capacity already holds n, so no call is made. Below its capacity nothing happens; at or above it every
 note region of the group grows to twice the capacity (at least n + 1, at least 64), moving to the top when
 note it is not there already. When the moved copies do not fit in the free words, the arena is compacted
 note (a_compact: the words moved regions left behind are reclaimed) and the group grows in place
@@ -718,6 +719,20 @@ end
 note a_stage: bytes p .. p + c - 1 of the byte region at word b into a_wb from 0 (c at most 65536)
 fn a_stage b ulong p ulong c ulong to void
 i = ulong 0
+while and lt i c ne and add p i 7 0
+x = add p i
+y = get a_ar add b shr x 3
+put a_wb i uchar and shr y shl and x 7 3 255
+i = add i 1
+end
+note whole words: one load, eight bytes
+while le add i 8 c
+y = get a_ar add b shr add p i 3
+for k ulong 8
+put a_wb add i k uchar and shr y shl k 3 255
+end
+i = add i 8
+end
 while lt i c
 x = add p i
 y = get a_ar add b shr x 3
@@ -759,8 +774,10 @@ ret 1
 end
 
 note a_rdin: all of stdin into region 0, eight bytes to a word from word 0 (error 1 on a read error,
-note error 14 when the arena has no room); then the region keeps only the words the input fills, so the
-note next region starts right after it. inlen: the input's bytes.
+note error 14 when the arena has no room); then the region keeps the words the input fills and 8 more, all
+note zero, so the next region starts after them. inlen: the input's bytes. Input bytes are read inline
+note from word 0 (the codemod's a_ib form) without a region check; the 64 zero bytes past the input are
+note what a lookahead past the end reads, as the zero pool past the input did.
 fn a_rdin to void
 off = ulong 0
 go = true
@@ -785,7 +802,8 @@ m = add m 1
 end
 end
 put inlen 0 off
-w = add shr off 3 1
+w = add shr off 3 9
+a_need 0 shl w 3
 put a_rw 0 w
 put a_top 0 w
 put a_gc 0 shl w 3
@@ -794,18 +812,38 @@ end
 note a_pack: the c bytes of a_wb become input bytes off .. off + c - 1 (their words are 0 until now)
 fn a_pack off ulong c ulong to void
 i = ulong 0
+while and lt i c ne and add off i 7 0
+a_pack1 add off i ulong get a_wb i
+i = add i 1
+end
+note whole words: eight bytes, one store (the word was 0)
+while le add i 8 c
+w = ulong 0
+for k ulong 8
+w = or w shl ulong get a_wb add i k shl k 3
+end
+put a_ar shr add off i 3 w
+i = add i 8
+end
 while lt i c
-x = add off i
-s = shl and x 7 3
-b = ulong get a_wb i
-y = get a_ar shr x 3
-put a_ar shr x 3 or y shl b s
+a_pack1 add off i ulong get a_wb i
 i = add i 1
 end
 end
 
+note a_pack1: input byte x becomes b (its word holds 0 at that byte until now)
+fn a_pack1 x ulong b ulong to void
+s = shl and x 7 3
+y = get a_ar shr x 3
+put a_ar shr x 3 or y shl b s
+end
+
 note a_init: every other region gets its first room after the input: the hash tables 1024 buckets, the
-note output last (it grows most, and the last region grows in place), the rest 64 entries each
+note output last (it grows most, and the last region grows in place), the rest 64 entries each, except
+note the groups that grow with the input (names, long names, functions, calls, trap sites), which get
+note room for the entries an input of this size usually holds (a_isize). The arena is zero .bss: room
+note never written costs no page, while a region that outgrows its room moves and leaves touched pages
+note behind, so a first room that fits saves those pages (measured: 145 fewer page faults on omega-mcp).
 fn a_init to void
 a_defs
 g = ulong 2
@@ -813,7 +851,7 @@ while lt g 21
 if or or eq g 4 eq g 6 eq g 8
 a_need g 1023
 else
-a_need g 63
+a_need g sub a_isize g 1
 end
 g = add g 1
 end
@@ -827,6 +865,36 @@ while lt g 21
 put a_gp g 0
 g = add g 1
 end
+end
+
+note a_isize: the first room of group g, in entries: the input's bytes over k for the groups that grow
+note with it (names k 16, long names 64, functions 64, calls 8, trap sites 8), between 64 and 8192;
+note 64 for the rest. A guess, never a bound: past it the group doubles as always.
+fn a_isize g ulong to ulong
+k = ulong 0
+if or eq g 3 eq g 9
+k = ulong 16
+end
+if or eq g 5 eq g 7
+k = ulong 64
+end
+if eq g 10
+k = ulong 8
+end
+if eq g 9
+k = ulong 8
+end
+if eq k 0
+ret 64
+end
+c = div get inlen 0 k
+if lt c 64
+ret 64
+end
+if gt c 8192
+ret 8192
+end
+ret c
 end
 
 note a_hash: the b-bit multiplicative hash of w (2^64 divided by the golden ratio, odd)
@@ -1155,10 +1223,13 @@ ret
 end
 end
 
-note a_g / a_gu / a_p: element i of table region r, read or written. Every table access goes
-note through them, so an index is checked against its own region as the fixed pools checked it:
-note an index past the region is a fault of omc itself and traps 3 (a_oob), as a pool index did,
-note and never reads or writes a word of another region.
+note Table accesses are written inline, `get a_ar add get a_rb R i` / `put a_ar add get a_rb R i v`,
+note checked only by a_ar's own length: every index is in its region by construction. A count
+note grows only after a_need has given its group room for it, reads use indices below a count, links
+note omc stored (each below a count) or hash buckets below the bucket count, and input bytes are read
+note from region 0 at word 0, padded with 64 zero bytes (a_rdin). The lines whose registers did not
+note fit inline use the calls below; a_g / a_gu / a_p check the region (a_oob, trap 3), as a_pc,
+note a_bput and a_ib do. gate-nocaps, gate12 and gate-usage drive every group far past its first room.
 fn a_g r ulong i ulong to ulong
 if ge i get a_rw r
 a_oob i
@@ -1443,7 +1514,7 @@ mputb 45
 end
 i = a
 while and lt i b lt sub i a 32
-mputh ulong a_ib i
+mputh ulong uchar and shr get a_ar shr i 3 shl and i 7 3 255
 i = add i 1
 end
 mputw 8386097683628191520 8
@@ -1508,7 +1579,9 @@ end
 if ge o lim
 fail 14
 end
+if ge o get a_gp 1
 a_need 1 o
+end
 end
 
 note tok_num: the word at [ts,cur) is [-]decimal, at most 20 digits, from -2^63 to 2^64 - 1 (error 6
@@ -1544,7 +1617,7 @@ put tk 0 5
 ret
 end
 minus = false
-if eq a_ib p 45
+if eq uchar and shr get a_ar shr p 3 shl and p 7 3 255 45
 minus = true
 p = add p 1
 end
@@ -2681,7 +2754,7 @@ note after a backslash in a text literal. A run of blanks between words (fpend, 
 note fbo) is written as it comes, then becomes one space unless a parenthesis is next to it (fprp: the
 note word before it was one); at the end of the line it is dropped.
 fn fmtbyte p ulong to void
-b = a_ib p
+b = uchar and shr get a_ar shr p 3 shl and p 7 3 255
 s = get fst 0
 if eq b 10
 if lt s 2
@@ -2807,10 +2880,10 @@ note word is not a hex literal.
 fn tok_hex to ulong
 p = get ts 0
 e = get cur 0
-if eq a_ib p 45
+if eq uchar and shr get a_ar shr p 3 shl and p 7 3 255 45
 q = add p 1
 if lt add q 1 e
-if eq a_ib q 48
+if eq uchar and shr get a_ar shr q 3 shl and q 7 3 255 48
 c = a_ib add q 1
 if or eq c 120 eq c 88
 nfail 6
@@ -2822,10 +2895,10 @@ end
 if ge add p 1 e
 ret 0
 end
-if ne a_ib p 48
+if ne uchar and shr get a_ar shr p 3 shl and p 7 3 255 48
 ret 0
 end
-c = a_ib add p 1
+c = uchar and shr get a_ar shr add p 1 3 shl and add p 1 7 3 255
 if eq c 88
 nfail 6
 end
@@ -2911,7 +2984,7 @@ put fsuf 0 0
 put fnd 0 0
 put fg_fl 0 0
 put fg_seen 0 0
-if eq a_ib p 45
+if eq uchar and shr get a_ar shr p 3 shl and p 7 3 255 45
 put fsgn 0 1
 p = add p 1
 end
@@ -2971,7 +3044,7 @@ if and lt p e or eq a_ib p 101 eq a_ib p 69
 p = add p 1
 if lt p e
 if or eq a_ib p 43 eq a_ib p 45
-if eq a_ib p 45
+if eq uchar and shr get a_ar shr p 3 shl and p 7 3 255 45
 put fg_esign 0 -1
 end
 p = add p 1
@@ -3015,7 +3088,7 @@ r = sub e p
 if ne r 3
 fail 6
 end
-if ne a_ib p 102
+if ne uchar and shr get a_ar shr p 3 shl and p 7 3 255 102
 fail 6
 end
 if and eq a_ib add p 1 51 eq a_ib add p 2 50
@@ -3549,7 +3622,7 @@ mputw 2003134838 4
 end
 
 fn dname_kind i ulong to void
-k = ulong a_gu 7 i
+k = ulong uchar get a_ar add get a_rb 7 i
 if eq k 4
 mputw 119165519096935 6
 ret
@@ -3572,7 +3645,7 @@ ret
 end
 if ne get curfn 0 0
 f = sub get curfn 0 1
-np = ulong a_gu 24 f
+np = ulong uchar get a_ar add get a_rb 24 f
 endp = add get nglob 0 np
 if and ge i get nglob 0 lt i endp
 mputw 469786321264 5
@@ -3585,9 +3658,9 @@ end
 fn mput_name w ulong to void
 if eq and w 255 1
 k = shr w 8
-o = a_g 17 k
+o = get a_ar add get a_rb 17 k
 i = ulong 0
-while lt i ulong a_gu 18 k
+while lt i ulong uchar get a_ar add get a_rb 18 k
 mputb a_ib add o i
 i = add i 1
 end
@@ -3622,7 +3695,7 @@ ret
 end
 i = a
 while and lt i b lt sub i a 16
-c = ulong a_ib i
+c = ulong uchar and shr get a_ar shr i 3 shl and i 7 3 255
 if and gt c 32 lt c 127
 mputb uchar c
 else
@@ -3768,10 +3841,10 @@ while and go lt m 999999
 if ge i get nn 0
 go = false
 else
-if ne a_g 3 i 0
-mput_name a_g 3 i
+if ne get a_ar add get a_rb 3 i 0
+mput_name get a_ar add get a_rb 3 i
 mputb 32
-dty_w ulong a_gu 5 i
+dty_w ulong uchar get a_ar add get a_rb 5 i
 mputb 32
 dname_kind i
 mputb 10
@@ -3789,8 +3862,8 @@ f = ulong 0
 while lt f get nf 0
 mputw 2125414 3
 note Single caller: spell the function name here rather than spend a bootstrap function slot.
-o = a_g 26 f
-l = a_g 25 f
+o = get a_ar add get a_rb 26 f
+l = get a_ar add get a_rb 25 f
 if and ne o 0 gt l 0
 i = ulong 0
 while lt i l
@@ -3798,11 +3871,11 @@ mputb a_ib add o i
 i = add i 1
 end
 else
-mput_name a_g 21 f
+mput_name get a_ar add get a_rb 21 f
 end
 mputw 544175136 4
-dty_w ulong a_gu 23 f
-np = ulong a_gu 24 f
+dty_w ulong uchar get a_ar add get a_rb 23 f
+np = ulong uchar get a_ar add get a_rb 24 f
 p = ulong 0
 while lt p np
 mputb 32
@@ -3828,7 +3901,7 @@ n = get clim 0
 end
 g = get nglob 0
 lo = get nmlo 0
-k = a_g 16 a_hash w get nh_b 0
+k = get a_ar add get a_rb 16 a_hash w get nh_b 0
 best = ulong 0
 go = true
 while go
@@ -3853,17 +3926,17 @@ end
 
 note nm_link: name i becomes the newest of its bucket's chain
 fn nm_link i ulong to void
-h = a_hash a_g 3 i get nh_b 0
-a_p 15 i a_g 16 h
-a_p 16 h add i 1
+h = a_hash get a_ar add get a_rb 3 i get nh_b 0
+put a_ar add get a_rb 15 i get a_ar add get a_rb 16 h
+put a_ar add get a_rb 16 h add i 1
 end
 
 note nm_unlk: name i, the newest name of its chain (every name above it has left), leaves it. Should a
 note chain ever not start with i, the buckets are rebuilt from names 0 .. i - 1 instead.
 fn nm_unlk i ulong to void
-h = a_hash a_g 3 i get nh_b 0
-if eq a_g 16 h add i 1
-a_p 16 h a_g 15 i
+h = a_hash get a_ar add get a_rb 3 i get nh_b 0
+if eq get a_ar add get a_rb 16 h add i 1
+put a_ar add get a_rb 16 h get a_ar add get a_rb 15 i
 else
 nm_build i
 end
@@ -3893,7 +3966,9 @@ note their chains newest first; names between nn and v (a scope given back) join
 fn nm_set v ulong to void
 n = get nn 0
 if gt v 0
+if ge sub v 1 get a_gp 3
 a_need 3 sub v 1
+end
 end
 go = true
 while go
@@ -3918,13 +3993,13 @@ end
 
 note fn_same: function j is the name w of length l starting at input byte s (the test of the old scan)
 fn fn_same j ulong w ulong l ulong s ulong to ulong
-if ne a_g 21 j w
+if ne get a_ar add get a_rb 21 j w
 ret 0
 end
 if eq and w 255 1
 ret 1
 end
-fl = a_g 25 j
+fl = get a_ar add get a_rb 25 j
 if le l 8
 if le fl 8
 ret 1
@@ -3934,7 +4009,7 @@ end
 if ne fl l
 ret 0
 end
-o = a_g 26 j
+o = get a_ar add get a_rb 26 j
 k = ulong 8
 while lt k l
 if ne a_ib add o k a_ib add s k
@@ -3949,7 +4024,7 @@ note findfn: packed name w (first 8 bytes, or an interned long name), length l (
 note short name), start s in the input (read only for a name over 8 bytes that is not interned) ->
 note function index + 1 (0 none), the lowest that matches, as the old scan gave. om4 FINDFN.
 fn findfn w ulong l ulong s ulong to ulong
-k = a_g 40 a_hash w get fh_b 0
+k = get a_ar add get a_rb 40 a_hash w get fh_b 0
 best = ulong 0
 go = true
 while go
@@ -3962,7 +4037,7 @@ j = sub k 1
 if ne fn_same j w l s 0
 best = k
 end
-k = a_g 33 j
+k = get a_ar add get a_rb 33 j
 end
 m = add m 1
 end
@@ -3973,13 +4048,15 @@ end
 note fn_link: function f becomes the newest of its bucket's chain; at twice as many functions as buckets
 note the buckets double and every function is linked again in order
 fn fn_link f ulong to void
-h = a_hash a_g 21 f get fh_b 0
-a_p 33 f a_g 40 h
-a_p 40 h add f 1
+h = a_hash get a_ar add get a_rb 21 f get fh_b 0
+put a_ar add get a_rb 33 f get a_ar add get a_rb 40 h
+put a_ar add get a_rb 40 h add f 1
 if ge add f 1 shl ulong 2 get fh_b 0
 b = add get fh_b 0 1
 put fh_b 0 b
+if ge sub shl ulong 1 b 1 get a_gp 8
 a_need 8 sub shl ulong 1 b 1
+end
 a_gzero 8
 j = ulong 0
 go = true
@@ -3989,9 +4066,9 @@ while and go lt m 999999
 if gt j f
 go = false
 else
-h = a_hash a_g 21 j b
+h = a_hash get a_ar add get a_rb 21 j b
 a_p 33 j a_g 40 h
-a_p 40 h add j 1
+put a_ar add get a_rb 40 h add j 1
 j = add j 1
 end
 m = add m 1
@@ -4013,10 +4090,10 @@ end
 
 note ln_same: long name j is spelled as the n input bytes at s
 fn ln_same j ulong s ulong n ulong to ulong
-if ne ulong a_gu 18 j n
+if ne ulong uchar get a_ar add get a_rb 18 j n
 ret 0
 end
-o = a_g 17 j
+o = get a_ar add get a_rb 17 j
 i = ulong 0
 while lt i n
 if ne a_ib add o i a_ib add s i
@@ -4032,7 +4109,7 @@ note time is appended (indices in order of first appearance, as before) and link
 note twice as many long names as buckets the buckets double and every name is linked again.
 fn ln_intern s ulong n ulong to ulong
 h = a_hash ln_hw s n get lh_b 0
-k = a_g 20 h
+k = get a_ar add get a_rb 20 h
 go = true
 while go
 m = ulong 0
@@ -4044,17 +4121,19 @@ j = sub k 1
 if ne ln_same j s n 0
 ret j
 end
-k = a_g 19 j
+k = get a_ar add get a_rb 19 j
 end
 m = add m 1
 end
 end
 k = get ln_n 0
+if ge k get a_gp 5
 a_need 5 k
-a_p 17 k s
+end
+put a_ar add get a_rb 17 k s
 a_pc 18 k uchar n
 a_p 19 k a_g 20 h
-a_p 20 h add k 1
+put a_ar add get a_rb 20 h add k 1
 put ln_n 0 add k 1
 if ge add k 1 shl ulong 2 get lh_b 0
 ln_rehash add k 1
@@ -4066,7 +4145,9 @@ note ln_rehash: double the long-name buckets and link long names 0 .. c - 1 agai
 fn ln_rehash c ulong to void
 b = add get lh_b 0 1
 put lh_b 0 b
+if ge sub shl ulong 1 b 1 get a_gp 6
 a_need 6 sub shl ulong 1 b 1
+end
 a_gzero 6
 j = ulong 0
 go = true
@@ -4078,7 +4159,7 @@ go = false
 else
 h = a_hash ln_hw a_g 17 j ulong a_gu 18 j b
 a_p 19 j a_g 20 h
-a_p 20 h add j 1
+put a_ar add get a_rb 20 h add j 1
 j = add j 1
 end
 m = add m 1
@@ -4109,13 +4190,15 @@ note addname: packed name, register, type, length, kind, address. om4 ADDNAME. T
 note arena (group 3); at twice as many names as buckets the buckets double (nm_build).
 fn addname w ulong r ulong t ulong ln ulong k ulong a ulong to void
 n = get nn 0
+if ge n get a_gp 3
 a_need 3 n
-a_p 3 n w
+end
+put a_ar add get a_rb 3 n w
 a_pc 4 n uchar r
 a_pc 5 n uchar t
-a_p 6 n ln
+put a_ar add get a_rb 6 n ln
 a_pc 7 n uchar k
-a_p 8 n a
+put a_ar add get a_rb 8 n a
 a_pc 9 n 0
 a_pc 12 n 0
 a_pc 13 n 0
@@ -4126,7 +4209,9 @@ nm_link n
 put nn 0 add n 1
 if ge add n 1 shl ulong 2 get nh_b 0
 put nh_b 0 add get nh_b 0 1
+if ge sub shl ulong 1 get nh_b 0 1 get a_gp 4
 a_need 4 sub shl ulong 1 get nh_b 0 1
+end
 nm_build add n 1
 end
 end
@@ -4160,9 +4245,11 @@ note trapsite: note the place and code of a branch to the trap stub, then emit i
 note The trap list grows with the arena (group 10); island keeps every such branch within its reach.
 fn trapsite w ulong code ulong to void
 n = get nt 0
+if ge n get a_gp 10
 a_need 10 n
-a_p 44 n get oc 0
-a_p 45 n code
+end
+put a_ar add get a_rb 44 n get oc 0
+put a_ar add get a_rb 45 n code
 put nt 0 add n 1
 emit w
 if eq get om2m 0 1
@@ -4479,16 +4566,18 @@ note block stack grows with the arena (group 13). bk0 / bc0: the break and conti
 note so a loop's end patches only its own (s_end) and gives their entries back.
 fn pushb br ulong k ulong head ulong reg ulong ty ulong to void
 n = get nb 0
+if ge n get a_gp 13
 a_need 13 n
-a_p 60 n get nbrk 0
-a_p 61 n get ncont 0
-a_p 49 n k
-a_p 50 n br
-a_p 51 n head
-a_p 52 n reg
-a_p 53 n ty
-a_p 56 n 0
-a_p 57 n 0
+end
+put a_ar add get a_rb 60 n get nbrk 0
+put a_ar add get a_rb 61 n get ncont 0
+put a_ar add get a_rb 49 n k
+put a_ar add get a_rb 50 n br
+put a_ar add get a_rb 51 n head
+put a_ar add get a_rb 52 n reg
+put a_ar add get a_rb 53 n ty
+put a_ar add get a_rb 56 n 0
+put a_ar add get a_rb 57 n 0
 put nb 0 add n 1
 note fz_push / fz_else / fz_join: the sets when block n opens; at its else (the then sets kept, the
 note opening sets back); at its end (kind k: 1 if, 2 else, 3 while, 4 for)
@@ -4501,8 +4590,8 @@ end
 
 fn pushnh names ulong hd ulong to void
 n = sub get nb 0 1
-a_p 54 n names
-a_p 55 n hd
+put a_ar add get a_rb 54 n names
+put a_ar add get a_rb 55 n hd
 end
 
 note ======== small readers ========
@@ -4544,13 +4633,13 @@ if eq k 1
 if le get tl 0 63
 e = findname get tw 0
 if ne e 0
-if eq a_gu 7 sub e 1 9
-t = ulong a_gu 5 sub e 1
+if eq uchar get a_ar add get a_rb 7 sub e 1 9
+t = ulong uchar get a_ar add get a_rb 5 sub e 1
 if ge t 10
 fail 16
 end
 put tbig 0 0
-ret a_g 8 sub e 1
+ret get a_ar add get a_rb 8 sub e 1
 end
 end
 end
@@ -4638,7 +4727,7 @@ e = findname get tw 0
 if eq e 0
 fail 3
 end
-if eq a_gu 7 sub e 1 0
+if eq uchar get a_ar add get a_rb 7 sub e 1 0
 fail 7
 end
 ret e
@@ -5973,13 +6062,13 @@ canon rd ty
 end
 
 fn binrot op ulong dst ulong ix ulong to void
-ty = a_g 77 add ix 2
+ty = get a_ar add get a_rb 77 add ix 2
 if or lt ty 2 gt ty 5
 fail 7
 end
 ra = matreg a_g 77 ix a_g 77 add ix 1 ty
-bk = a_g 77 add ix 3
-bn = a_g 77 add ix 4
+bk = get a_ar add get a_rb 77 add ix 3
+bn = get a_ar add get a_rb 77 add ix 4
 w = twid ty
 rb = ulong 0
 useimm = false
@@ -6035,7 +6124,7 @@ if or eq op 59 eq op 60
 binrot op dst ix
 ret
 end
-ty = a_g 77 add ix 2
+ty = get a_ar add get a_rb 77 add ix 2
 if ne isfloat ty 0
 if ne get xtarget 0 0
 xfbinop op dst ix ty
@@ -6074,8 +6163,8 @@ fail 7
 end
 end
 imm = ulong 0
-bk = a_g 77 add ix 3
-bn = a_g 77 add ix 4
+bk = get a_ar add get a_rb 77 add ix 3
+bn = get a_ar add get a_rb 77 add ix 4
 rb = ulong 0
 useimm = false
 if eq bk 3
@@ -6198,11 +6287,11 @@ note basearg: register t = the base of array name e (index + 1): its register fr
 note address. om4 BASEARG.
 fn basearg t ulong e ulong to void
 i = sub e 1
-if ge a_gu 7 i 4
-mataddr t a_g 8 i
+if ge uchar get a_ar add get a_rb 7 i 4
+mataddr t get a_ar add get a_rb 8 i
 ret
 end
-loadarg t 1 ulong a_gu 4 i
+loadarg t 1 ulong uchar get a_ar add get a_rb 4 i
 end
 
 note restore: d destination (255: a new temporary at pool slot `slot`), slot the pool slot before the
@@ -6246,17 +6335,19 @@ end
 note ca_bl: BL to function f (index + 1), C6.2.43. The call records grow with the arena (group 9).
 fn ca_bl f ulong to void
 n = get ncalls 0
+if ge n get a_gp 9
 a_need 9 n
-a_p 41 n get oc 0
-a_p 42 n get curfn 0
-a_p 43 n f
+end
+put a_ar add get a_rb 41 n get oc 0
+put a_ar add get a_rb 42 n get curfn 0
+put a_ar add get a_rb 43 n f
 put ncalls 0 add n 1
 
 if ne get xtarget 0 0
 emitb 232
 xword 0
 else
-emit or 2483027968 bdisp get oc 0 a_g 22 sub f 1 26
+emit or 2483027968 bdisp get oc 0 get a_ar add get a_rb 22 sub f 1 26
 end
 end
 
@@ -6294,7 +6385,7 @@ if or or eq t 1 eq t 10 eq t 11
 fail 7
 end
 i = sub e 1
-ln = a_g 6 i
+ln = get a_ar add get a_rb 6 i
 x = v
 if ne unsz i 0
 x = matreg k v t
@@ -6316,7 +6407,7 @@ else
 if le ln 4095
 emit or or 4043309087 shl ln 10 shl v 5
 else
-if ne a_gu 11 i 0
+if ne uchar get a_ar add get a_rb 11 i 0
 emit or or 3942645791 shl ulong a_gu 11 i 16 shl v 5
 else
 y = alloc
@@ -6328,12 +6419,12 @@ trapc 2 3
 end
 end
 put ea_i 0 x
-if ge a_gu 7 i 4
-if ne a_gu 10 i 0
+if ge uchar get a_ar add get a_rb 7 i 4
+if ne uchar get a_ar add get a_rb 10 i 0
 put ea_b 0 ulong a_gu 10 i
 else
 b = alloc
-matconst b a_g 8 i
+matconst b get a_ar add get a_rb 8 i
 put ea_b 0 b
 end
 else
@@ -6388,7 +6479,7 @@ if eq e 0
 fail 3
 end
 i = sub e 1
-k = ulong a_gu 7 i
+k = ulong uchar get a_ar add get a_rb 7 i
 if eq k 0
 fail 7
 end
@@ -6448,7 +6539,7 @@ fn arrpart f ulong pi ulong md ulong to void
 p = add mul sub f 1 6 pi
 e = arrname
 i = sub e 1
-k = ulong a_gu 7 i
+k = ulong uchar get a_ar add get a_rb 7 i
 if ge k 6
 fail 7
 end
@@ -6456,7 +6547,7 @@ if eq k 4
 fail 19
 end
 fz_arg e
-if eq a_gu 37 p 3
+if eq uchar get a_ar add get a_rb 37 p 3
 if eq md 57
 fail 20
 end
@@ -6471,7 +6562,7 @@ end
 if ne ulong a_gu 5 i ulong a_gu 35 p
 fail 7
 end
-if ne a_g 36 p 0
+if ne get a_ar add get a_rb 36 p 0
 fail 7
 end
 rdval 0 5 255 0
@@ -6497,10 +6588,10 @@ end
 
 note partck: the two checks of part (name index i, o in ro, k in rn), then the part's base register
 fn partck i ulong ro ulong rn ulong to ulong
-rl = ulong a_gu 14 i
+rl = ulong uchar get a_ar add get a_rb 14 i
 if eq unsz i 0
 rl = alloc
-matconst rl a_g 6 i
+matconst rl get a_ar add get a_rb 6 i
 end
 if ne get xtarget 0 0
 xcmp ro rl 0
@@ -6509,14 +6600,14 @@ d = alloc
 xarith 34 5 rl ro 0 d
 xcmp rn d 0
 xtrap 8 3
-b = ulong a_gu 4 i
-if eq a_gu 7 i 5
+b = ulong uchar get a_ar add get a_rb 4 i
+if eq uchar get a_ar add get a_rb 7 i 5
 b = alloc
-mataddr b a_g 8 i
+mataddr b get a_ar add get a_rb 8 i
 end
 xload 0 ro
 xb 72 193 224
-emitb uchar tlog ulong a_gu 5 i
+emitb uchar tlog ulong uchar get a_ar add get a_rb 5 i
 xload 1 b
 xrr 1 0 1
 xstore 0 d
@@ -6528,10 +6619,10 @@ d = alloc
 e3 3405774848 d rl ro
 emit or or 3942645791 shl d 16 shl rn 5
 trapc 8 3
-b = ulong a_gu 4 i
-if eq a_gu 7 i 5
+b = ulong uchar get a_ar add get a_rb 4 i
+if eq uchar get a_ar add get a_rb 7 i 5
 b = alloc
-matconst b a_g 8 i
+matconst b get a_ar add get a_rb 8 i
 end
 emit or or or or 2332033024 shl ro 16 shl tlog ulong a_gu 5 i 10 shl b 5 d
 ret d
@@ -6555,7 +6646,7 @@ end
 
 note fwreq: hand this depth's fpw request to the part that makes the value (fpo)
 fn fwreq to void
-put fpo 0 a_g 78 get depth 0
+put fpo 0 get a_ar add get a_rb 78 get depth 0
 end
 
 note vt_un: neg / not of the value in rk/rv/rt (a bare number already refused). neg: NEG Xd, Xm (SUB from
@@ -6740,7 +6831,7 @@ end
 o = get fpo 0
 put fpo 0 0
 elemaddr e get rk 0 get rv 0 get rt 0
-ty = ulong a_gu 5 sub e 1
+ty = ulong uchar get a_ar add get a_rb 5 sub e 1
 if and ne o 0 ne isfloat ty 0
 r = fvdst o
 eaem or ldop ty 67108864 vtw r
@@ -6760,14 +6851,14 @@ note vs_chk: read / write bounds: n <= len A and off <= len A - n, else trap 3 (
 note SUB C6.2.458). om4 VT_SYS.
 fn vs_chk e ulong ro ulong rn ulong to void
 if ne get xtarget 0 0
-if ne a_gu 5 sub e 1 2
+if ne uchar get a_ar add get a_rb 5 sub e 1 2
 fail 7
 end
 xload 1 rn
 if ne unsz sub e 1 0
-xload 0 ulong a_gu 14 sub e 1
+xload 0 ulong uchar get a_ar add get a_rb 14 sub e 1
 else
-ximm 0 a_g 6 sub e 1
+ximm 0 get a_ar add get a_rb 6 sub e 1
 end
 xrr 57 1 0
 xtrap 8 3
@@ -6777,14 +6868,14 @@ xrr 57 1 0
 xtrap 8 3
 ret
 end
-if ne a_gu 5 sub e 1 2
+if ne uchar get a_ar add get a_rb 5 sub e 1 2
 fail 7
 end
 t = alloc
-l = ulong a_gu 14 sub e 1
+l = ulong uchar get a_ar add get a_rb 14 sub e 1
 if eq unsz sub e 1 0
 l = t
-matconst t a_g 6 sub e 1
+matconst t get a_ar add get a_rb 6 sub e 1
 end
 emit or or 3942645791 shl rn 5 shl l 16
 trapc 8 3
@@ -6818,12 +6909,12 @@ put rv 0 matreg 4 get rv 0 get rt 0
 put rk 0 1
 put rt 0 1
 end
-if ne get rt 0 ulong a_gu 35 p
+if ne get rt 0 ulong uchar get a_ar add get a_rb 35 p
 fail 7
 end
-a_p 77 q get rk 0
-a_p 77 add q 1 get rv 0
-a_p 77 add q 2 0
+put a_ar add get a_rb 77 q get rk 0
+put a_ar add get a_rb 77 add q 1 get rv 0
+put a_ar add get a_rb 77 add q 2 0
 end
 
 note ca_arr: an array argument i of function f, call frame cb: one array passed twice is error 19.
@@ -6838,16 +6929,16 @@ end
 j = add j 1
 end
 q = add cb mul i 3
-a_p 77 q get rk 0
-a_p 77 add q 1 get rv 0
-a_p 77 add q 2 get rt 0
+put a_ar add get a_rb 77 q get rk 0
+put a_ar add get a_rb 77 add q 1 get rv 0
+put a_ar add get a_rb 77 add q 2 get rt 0
 end
 
 note ca_end: all arguments read: save, the arguments into X0.., BL, restore. Frame cb: 3 per argument,
 note then cb+18 the parameter count, cb+19 the pool slot before the arguments. om4 CA_DONE .. CA5.
 fn ca_end f ulong dst ulong cb ulong to void
 save
-np = a_g 77 add cb 18
+np = get a_ar add get a_rb 77 add cb 18
 i = ulong 0
 while lt i np
 q = add cb mul i 3
@@ -6861,12 +6952,12 @@ i = add i 1
 end
 ca_bl f
 hr = ulong 1
-if eq a_gu 23 sub f 1 12
+if eq uchar get a_ar add get a_rb 23 sub f 1 12
 hr = ulong 0
 end
 n = get svn 0
 a = get sva 0
-sl = a_g 77 add cb 19
+sl = get a_ar add get a_rb 77 add cb 19
 r = restore dst sl n a hr
 put rk 0 1
 put rv 0 r
@@ -6880,17 +6971,17 @@ fn vs_fd x ulong to void
 if ne get rt 0 8
 fail 7
 end
-a_p 77 add x 9 get rk 0
-a_p 77 add x 10 get rv 0
+put a_ar add get a_rb 77 add x 9 get rk 0
+put a_ar add get a_rb 77 add x 10 get rv 0
 end
 
 fn vs_arr c ulong e ulong to void
 fz_arg e
-if ge a_gu 7 sub e 1 6
+if ge uchar get a_ar add get a_rb 7 sub e 1 6
 fail 7
 end
 if eq c 53
-k = a_gu 7 sub e 1
+k = uchar get a_ar add get a_rb 7 sub e 1
 if or eq k 2 eq k 5
 fail 20
 end
@@ -6901,7 +6992,7 @@ fn vs_off x ulong to void
 if ne get rt 0 5
 fail 7
 end
-a_p 77 add x 11 matreg get rk 0 get rv 0 get rt 0
+put a_ar add get a_rb 77 add x 11 matreg get rk 0 get rv 0 get rt 0
 end
 
 fn vs_end c ulong e ulong dst ulong x ulong to void
@@ -6909,12 +7000,12 @@ if ne get rt 0 5
 fail 7
 end
 rn = matreg get rk 0 get rv 0 get rt 0
-ro = a_g 77 add x 11
+ro = get a_ar add get a_rb 77 add x 11
 vs_chk e ro rn
-fk = a_g 77 add x 9
-fv = a_g 77 add x 10
+fk = get a_ar add get a_rb 77 add x 9
+fv = get a_ar add get a_rb 77 add x 10
 vs_call c fk fv e ro rn
-sl = a_g 77 add x 8
+sl = get a_ar add get a_rb 77 add x 8
 n = get svn 0
 a = get sva 0
 r = restore dst sl n a 1
@@ -7104,8 +7195,8 @@ if ne get rt 0 ty
 fail 7
 end
 q = add add x 8 mul i 2
-a_p 77 q get rk 0
-a_p 77 add q 1 get rv 0
+put a_ar add get a_rb 77 q get rk 0
+put a_ar add get a_rb 77 add q 1 get rv 0
 end
 fn hload x ulong i ulong reg ulong to void
 q = add add x 8 mul i 2
@@ -7116,7 +7207,7 @@ matconst 8 n
 emit 3556769793
 end
 fn hreturn dst ulong x ulong to void
-sl = a_g 77 add x 7
+sl = get a_ar add get a_rb 77 add x 7
 n = get svn 0
 a = get sva 0
 r = restore dst sl n a 1
@@ -7200,32 +7291,32 @@ hreturn dst x
 end
 fn harray x ulong writable ulong to ulong
 e = arrname
-if ne a_gu 5 sub e 1 2
+if ne uchar get a_ar add get a_rb 5 sub e 1 2
 fail 7
 end
 if ne writable 0
 vs_arr 53 e
 end
 fz_arg e
-a_p 77 add x 20 e
+put a_ar add get a_rb 77 add x 20 e
 harg x 0 5
 harg x 1 5
 ro = matreg a_g 77 add x 8 a_g 77 add x 9 5
 rn = matreg a_g 77 add x 10 a_g 77 add x 11 5
-a_p 77 add x 21 ro
-a_p 77 add x 22 rn
+put a_ar add get a_rb 77 add x 21 ro
+put a_ar add get a_rb 77 add x 22 rn
 vs_chk e ro rn
 ret e
 end
 note Copy a checked path to a private 4096-byte stack buffer. Reject embedded zero bytes.
 note Public paths remain length-delimited; only the kernel-facing private copy has a terminator.
 fn hpathcp x ulong to void
-e = a_g 77 add x 20
+e = get a_ar add get a_rb 77 add x 20
 save
 basearg 4 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 4 4 16
-loadarg 5 1 a_g 77 add x 22
+loadarg 5 1 get a_ar add get a_rb 77 add x 22
 matconst 6 4095
 e3 3942645760 31 5 6
 trapc 8 3
@@ -7350,15 +7441,15 @@ need = ulong 128
 end
 tmp = alloc
 matconst tmp need
-e3 3942645760 31 a_g 77 add x 22 tmp
+e3 3942645760 31 get a_ar add get a_rb 77 add x 22 tmp
 trapc 3 3
 end
 save
 hload x 4 0
 basearg 1 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 1 1 16
-loadarg 2 1 a_g 77 add x 22
+loadarg 2 1 get a_ar add get a_rb 77 add x 22
 nr = ulong 61
 if eq c 114
 nr = ulong 203
@@ -7487,12 +7578,12 @@ e3 3942645760 31 5 16
 trapc 2 3
 back scan
 patch19 done get oc 0
-loadarg 2 1 a_g 77 add x 22
+loadarg 2 1 get a_ar add get a_rb 77 add x 22
 e3 3942645760 31 5 2
 small = get oc 0
 emit 1409286152
 basearg 0 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 0 0 16
 e3 2852126720 2 31 5
 copy = get oc 0
@@ -7607,23 +7698,23 @@ if eq c 125
 harg x 2 8
 end
 if eq c 233
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 a_p 77 add x 25 a_g 77 add x 22
 e = harray x 0
-a_p 77 add x 26 e
+put a_ar add get a_rb 77 add x 26 e
 a_p 77 add x 27 a_g 77 add x 21
 a_p 77 add x 28 a_g 77 add x 22
 a_p 77 add x 20 a_g 77 add x 23
 a_p 77 add x 21 a_g 77 add x 24
 a_p 77 add x 22 a_g 77 add x 25
-e = a_g 77 add x 23
+e = get a_ar add get a_rb 77 add x 23
 end
 save
 basearg 4 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 4 4 16
-loadarg 5 1 a_g 77 add x 22
+loadarg 5 1 get a_ar add get a_rb 77 add x 22
 if ne hexw c 0
 matconst 16 65536
 else
@@ -7644,10 +7735,10 @@ stack = ulong 81920
 end
 if eq c 233
 note x14 = env base + off (ADD), x15 = env length; length 2..4096 (CMP x15,x16 B.HI; CMP x15,#2 B.LO).
-basearg 14 a_g 77 add x 26
-loadarg 16 1 a_g 77 add x 27
+basearg 14 get a_ar add get a_rb 77 add x 26
+loadarg 16 1 get a_ar add get a_rb 77 add x 27
 e3 2332033024 14 14 16
-loadarg 15 1 a_g 77 add x 28
+loadarg 15 1 get a_ar add get a_rb 77 add x 28
 matconst 16 4096
 e3 3942645760 31 15 16
 trapc 8 3
@@ -7981,11 +8072,11 @@ end
 
 fn hreadlnk dst ulong x ulong to void
 e = harray x 0
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 a_p 77 add x 25 a_g 77 add x 22
 e = harray x 1
-a_p 77 add x 26 e
+put a_ar add get a_rb 77 add x 26 e
 a_p 77 add x 27 a_g 77 add x 21
 a_p 77 add x 28 a_g 77 add x 22
 a_p 77 add x 20 a_g 77 add x 23
@@ -7995,10 +8086,10 @@ hpathcp x
 note readlnk refuses an empty path before the kernel call.
 emit 4043309247
 trapc 0 3
-basearg 2 a_g 77 add x 26
-loadarg 16 1 a_g 77 add x 27
+basearg 2 get a_ar add get a_rb 77 add x 26
+loadarg 16 1 get a_ar add get a_rb 77 add x 27
 e3 2332033024 2 2 16
-loadarg 3 1 a_g 77 add x 28
+loadarg 3 1 get a_ar add get a_rb 77 add x 28
 hcopy
 hsys 78
 spadd 4096
@@ -8019,9 +8110,9 @@ harg x 3 9
 save
 hload x 4 0
 basearg 1 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 1 1 16
-loadarg 2 1 a_g 77 add x 22
+loadarg 2 1 get a_ar add get a_rb 77 add x 22
 hload x 3 3
 nr = ulong 67
 if eq c 162
@@ -8033,11 +8124,11 @@ end
 
 fn hstat c ulong dst ulong x ulong to void
 e = harray x 0
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 a_p 77 add x 25 a_g 77 add x 22
 e = harray x 1
-a_p 77 add x 26 e
+put a_ar add get a_rb 77 add x 26 e
 a_p 77 add x 27 a_g 77 add x 21
 a_p 77 add x 28 a_g 77 add x 22
 a_p 77 add x 20 a_g 77 add x 23
@@ -8047,10 +8138,10 @@ hpathcp x
 note stat refuses an empty path before the kernel call.
 emit 4043309247
 trapc 0 3
-basearg 2 a_g 77 add x 26
-loadarg 16 1 a_g 77 add x 27
+basearg 2 get a_ar add get a_rb 77 add x 26
+loadarg 16 1 get a_ar add get a_rb 77 add x 27
 e3 2332033024 2 2 16
-loadarg 3 1 a_g 77 add x 28
+loadarg 3 1 get a_ar add get a_rb 77 add x 28
 matconst 6 128
 e3 3942645760 31 3 6
 trapc 3 3
@@ -8073,9 +8164,9 @@ hload x 2 0
 hload x 3 1
 hload x 4 2
 basearg 3 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 3 3 16
-loadarg 4 1 a_g 77 add x 22
+loadarg 4 1 get a_ar add get a_rb 77 add x 22
 note Only scalar transport options; no filters, devices, credentials or pointer-bearing options.
 hoptgate
 hreturn dst x
@@ -8141,9 +8232,9 @@ save
 hload x 2 0
 hload x 3 1
 basearg 4 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 4 4 16
-loadarg 5 1 a_g 77 add x 22
+loadarg 5 1 get a_ar add get a_rb 77 add x 22
 matconst 2 0
 e3 2852126720 3 31 4
 mimmed 4043309056 31 5 16
@@ -8196,9 +8287,9 @@ e = harray x w
 save
 hload x 2 0
 basearg 2 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 2 2 16
-loadarg 1 1 a_g 77 add x 22
+loadarg 1 1 get a_ar add get a_rb 77 add x 22
 hsys add 122 w
 hreturn dst x
 end
@@ -8210,9 +8301,9 @@ e = harray x 1
 save
 hload x 4 0
 basearg 3 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 3 3 16
-loadarg 4 1 a_g 77 add x 22
+loadarg 4 1 get a_ar add get a_rb 77 add x 22
 matconst 16 12
 e3 3942645760 31 4 16
 trapc 3 3
@@ -8235,9 +8326,9 @@ e = harray x 1
 harg x 2 9
 save
 basearg 0 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 0 0 16
-loadarg 1 1 a_g 77 add x 22
+loadarg 1 1 get a_ar add get a_rb 77 add x 22
 matconst 16 7
 e3 2315255808 17 1 16
 mimmed 4043309056 31 17 0
@@ -8283,9 +8374,9 @@ hload x 2 2
 matconst 16 16384
 e3 2852126720 2 2 16
 basearg 3 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 3 3 16
-loadarg 4 1 a_g 77 add x 22
+loadarg 4 1 get a_ar add get a_rb 77 add x 22
 spsub 80
 stkchk
 for j ulong 10
@@ -8451,9 +8542,9 @@ acc = ulong 0
 mode = ulong 1048610
 if or eq c 229 eq c 230
 harg x 4 8
-a_p 77 add x 20 harray x 0
-a_p 77 add x 23 alloc
-matconst a_g 77 add x 23 32
+put a_ar add get a_rb 77 add x 20 harray x 0
+put a_ar add get a_rb 77 add x 23 alloc
+matconst get a_ar add get a_rb 77 add x 23 32
 e3 3942645760 31 a_g 77 add x 22 a_g 77 add x 23
 trapc 1 3
 acc = ulong 1
@@ -8471,8 +8562,8 @@ harg x 4 8
 if or ne a_g 77 add x 14 3 ne a_g 77 add x 16 3
 fail 9
 end
-acc = a_g 77 add x 15
-mode = a_g 77 add x 17
+acc = get a_ar add get a_rb 77 add x 15
+mode = get a_ar add get a_rb 77 add x 17
 if and ne acc 1 ne acc 3
 fail 9
 end
@@ -8486,8 +8577,8 @@ harg x 2 5
 end
 save
 if or eq c 229 eq c 230
-basearg 6 a_g 77 add x 20
-loadarg 16 1 a_g 77 add x 21
+basearg 6 get a_ar add get a_rb 77 add x 20
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 6 6 16
 mimmed 3107979264 15 6 1
 matconst 14 or 5 sub acc 1
@@ -8633,10 +8724,10 @@ harg x 0 9
 harg x 1 8
 harg x 2 5
 harg x 3 8
-if ne a_g 77 add x 14 3
+if ne get a_ar add get a_rb 77 add x 14 3
 fail 9
 end
-acc = a_g 77 add x 15
+acc = get a_ar add get a_rb 77 add x 15
 if and ne acc 1 ne acc 3
 fail 9
 end
@@ -8706,12 +8797,12 @@ hload x 3 0
 e3 3942645760 31 0 12
 trapc 8 3
 e3 3405774848 12 12 0
-loadarg 2 1 a_g 77 add x 22
+loadarg 2 1 get a_ar add get a_rb 77 add x 22
 e3 3942645760 31 2 12
 trapc 8 3
 e3 2332033024 0 13 0
 basearg 1 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 1 1 16
 if eq c 170
 mload 15 11 3
@@ -8742,11 +8833,11 @@ note Request is exactly the 32-byte RM_ALLOC or RM_CONTROL encoding.
 fn hdevcall dst ulong x ulong to void
 n = xhreq 171 x
 e = harray x 1
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 t = alloc
 matconst t 32
-e3 3942645760 31 a_g 77 add x 22 t
+e3 3942645760 31 get a_ar add get a_rb 77 add x 22 t
 trapc 1 3
 f = harray x 1
 if eq e f
@@ -8754,18 +8845,18 @@ fail 19
 end
 t = alloc
 matconst t 1048576
-e3 3942645760 31 a_g 77 add x 22 t
+e3 3942645760 31 get a_ar add get a_rb 77 add x 22 t
 trapc 8 3
 save
 hload x 4 0
 hload x 2 1
-basearg 10 a_g 77 add x 23
-loadarg 16 1 a_g 77 add x 24
+basearg 10 get a_ar add get a_rb 77 add x 23
+loadarg 16 1 get a_ar add get a_rb 77 add x 24
 e3 2332033024 10 10 16
 basearg 11 f
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 11 11 16
-loadarg 12 1 a_g 77 add x 22
+loadarg 12 1 get a_ar add get a_rb 77 add x 22
 note Refuse overlapping parameter/header spans even through distinct edit parameters.
 mimmed 4043309056 31 12 0
 empty = mbranch 0
@@ -8820,10 +8911,10 @@ ret
 end
 harg x 1 5
 harg x 2 8
-if ne a_g 77 add x 12 3
+if ne get a_ar add get a_rb 77 add x 12 3
 fail 9
 end
-w = a_g 77 add x 13
+w = get a_ar add get a_rb 77 add x 13
 if and ne w 4 ne w 8
 fail 9
 end
@@ -8929,7 +9020,7 @@ fail 9
 end
 end
 x = mul get depth 0 32
-a_p 77 add x 7 get nslot 0
+put a_ar add get a_rb 77 add x 7 get nslot 0
 note VFIO words are program-only. These IDs are disjoint from efi178, qty223 and peername224.
 if and ge c 228 le c 232
 if eq get fdtab 0 0
@@ -8957,10 +9048,10 @@ note dirty bitmap, no ALL, no VADDR) and unmaps only the caller's IOVA range in 
 mtinit
 harg x 4 8
 harg x 2 4
-if ne a_g 77 add x 12 3
+if ne get a_ar add get a_rb 77 add x 12 3
 fail 9
 end
-q = a_g 77 add x 13
+q = get a_ar add get a_rb 77 add x 13
 if eq q 15210
 e = harray x 0
 hpathcp x
@@ -9010,17 +9101,17 @@ end
 if eq n 99
 fail 9
 end
-a_p 77 add x 23 n
+put a_ar add get a_rb 77 add x 23 n
 e = harray x 1
 t = alloc
-matconst t a_g 77 add x 23
-e3 3942645760 31 a_g 77 add x 22 t
+matconst t get a_ar add get a_rb 77 add x 23
+e3 3942645760 31 get a_ar add get a_rb 77 add x 22 t
 trapc 1 3
 save
 hload x 4 0
 matconst 1 q
 basearg 2 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 2 2 16
 if ge n 8
 matconst 16 n
@@ -9082,10 +9173,10 @@ if eq c 232
 note GET_IRQ_INFO and SET_IRQS only; caller bytes cannot introduce pointers or arbitrary ioctls.
 harg x 4 8
 harg x 2 4
-if ne a_g 77 add x 12 3
+if ne get a_ar add get a_rb 77 add x 12 3
 fail 9
 end
-q = a_g 77 add x 13
+q = get a_ar add get a_rb 77 add x 13
 if and ne q 15213 ne q 15214
 fail 9
 end
@@ -9094,9 +9185,9 @@ save
 hload x 4 10
 fdcheck 1
 basearg 2 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 2 2 16
-loadarg 3 1 a_g 77 add x 22
+loadarg 3 1 get a_ar add get a_rb 77 add x 22
 if eq q 15213
 mimmed 4043309056 31 3 16
 trapc 1 3
@@ -9228,17 +9319,17 @@ ret
 end
 if eq c 172
 note Linux UVM has unencoded commands. Exact allowlist and ABI580.173.02 byte sizes.
-a_p 77 add x 23 xhreq 172 x
+put a_ar add get a_rb 77 add x 23 xhreq 172 x
 e = harray x 1
 t = alloc
-matconst t a_g 77 add x 23
-e3 3942645760 31 a_g 77 add x 22 t
+matconst t get a_ar add get a_rb 77 add x 23
+e3 3942645760 31 get a_ar add get a_rb 77 add x 22 t
 trapc 1 3
 save
 hload x 4 0
 hload x 2 1
 basearg 2 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 2 2 16
 hsys 29
 hreturn dst x
@@ -9278,17 +9369,17 @@ if eq c 166
 note Same bounded ioctl contract as L605 src/device/omc.om at 0dee699.
 note Compose with native host words instead of maintaining a second compiler.
 note Only literal FIONREAD, encoded read/write NVRM F, or five exact aien-gpu ABI1 A requests.
-a_p 77 add x 23 xhreq 166 x
+put a_ar add get a_rb 77 add x 23 xhreq 166 x
 e = harray x 1
 t = alloc
-matconst t a_g 77 add x 23
-e3 3942645760 31 a_g 77 add x 22 t
+matconst t get a_ar add get a_rb 77 add x 23
+e3 3942645760 31 get a_ar add get a_rb 77 add x 22 t
 trapc 1 3
 save
 hload x 4 0
 hload x 2 1
 basearg 2 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 2 2 16
 hsys 29
 hreturn dst x
@@ -9298,9 +9389,9 @@ if eq c 132
 e = harray x 1
 save
 basearg 0 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 0 0 16
-loadarg 1 1 a_g 77 add x 22
+loadarg 1 1 get a_ar add get a_rb 77 add x 22
 hsys 17
 hreturn dst x
 ret
@@ -9321,9 +9412,9 @@ e = harray x 1
 harg x 2 8
 save
 basearg 0 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 0 0 16
-loadarg 1 1 a_g 77 add x 22
+loadarg 1 1 get a_ar add get a_rb 77 add x 22
 hload x 2 2
 hsys 278
 hreturn dst x
@@ -9407,11 +9498,11 @@ e = harray x 1
 harg x 2 8
 tmp = alloc
 matconst tmp 8
-e3 3942645760 31 a_g 77 add x 22 tmp
+e3 3942645760 31 get a_ar add get a_rb 77 add x 22 tmp
 trapc 3 3
 save
 basearg 0 e
-loadarg 16 1 a_g 77 add x 21
+loadarg 16 1 get a_ar add get a_rb 77 add x 21
 e3 2332033024 0 0 16
 hload x 2 1
 hsys 59
@@ -9443,7 +9534,7 @@ note fwtake: rdval's entry: keep the caller's fpw request for this depth (none o
 if eq get xtarget 0 0
 a_p 78 add get depth 0 1 get fpw 0
 else
-a_p 78 add get depth 0 1 0
+put a_ar add get a_rb 78 add get depth 0 1 0
 end
 put fpw 0 0
 put dexp 0 1
@@ -9452,30 +9543,30 @@ if ne get cpure 0 0
 fail 30
 end
 if ne get om2 0 0
-if ne a_gu 27 sub fe 1 0
+if ne uchar get a_ar add get a_rb 27 sub fe 1 0
 inl_call fe dst
 ret
 end
 end
 cb = add mul get depth 0 32 8
 a_p 77 add cb 18 ulong a_gu 24 sub fe 1
-a_p 77 add cb 19 get nslot 0
+put a_ar add get a_rb 77 add cb 19 get nslot 0
 if eq get progmode 0 0
 if eq get curfn 0 fe
 fail 9
 end
 end
 i = ulong 0
-while lt i a_g 77 add cb 18
+while lt i get a_ar add get a_rb 77 add cb 18
 p = add mul sub fe 1 6 i
-if eq a_gu 37 p 0
-if ne isfloat ulong a_gu 35 p 0
+if eq uchar get a_ar add get a_rb 37 p 0
+if ne isfloat ulong uchar get a_ar add get a_rb 35 p 0
 put fpw 0 1
 end
-rdval 0 ulong a_gu 35 p 255 0
+rdval 0 ulong uchar get a_ar add get a_rb 35 p 255 0
 ca_scal p add cb mul i 3
 else
-if ge a_gu 37 p 6
+if ge uchar get a_ar add get a_rb 37 p 6
 ca_st fe i cb
 else
 ca_arr fe i cb
@@ -9504,7 +9595,9 @@ note seed/omc/gate-nocaps.sh compiles every measured shape at 32768 deep, so a f
 if gt get depth 0 32768
 fail 14
 end
+if ge add get depth 0 1 get a_gp 18
 a_need 18 add get depth 0 1
+end
 if or eq get tk 0 0 eq get tk 0 3
 fail 4
 end
@@ -9563,7 +9656,7 @@ if gt get tl 0 63
 unkfail 13
 end
 else
-if eq a_gu 23 sub f 1 12
+if eq uchar get a_ar add get a_rb 23 sub f 1 12
 fail 7
 end
 rdval 2 0 dst f
@@ -9588,9 +9681,9 @@ end
 end
 e = findname get tw 0
 if ne e 0
-if eq a_gu 7 sub e 1 9
-ct = ulong a_gu 5 sub e 1
-cv = a_g 8 sub e 1
+if eq uchar get a_ar add get a_rb 7 sub e 1 9
+ct = ulong uchar get a_ar add get a_rb 5 sub e 1
+cv = get a_ar add get a_rb 8 sub e 1
 if ne isfloat ct 0
 vdone 7 cv ct
 else
@@ -9598,17 +9691,17 @@ vdone 3 cv ct
 end
 ret
 end
-if ne a_gu 7 sub e 1 0
+if ne uchar get a_ar add get a_rb 7 sub e 1 0
 fail 7
 end
 e1 = sub e 1
-if ne a_gu 9 e1 0
-nr = ulong a_gu 4 e1
+if ne uchar get a_ar add get a_rb 9 e1 0
+nr = ulong uchar get a_ar add get a_rb 4 e1
 if ne a_g 78 get depth 0 0
-vdone 9 nr ulong a_gu 5 e1
+vdone 9 nr ulong uchar get a_ar add get a_rb 5 e1
 else
 fv2x ulong a_gu 5 e1 vtw nr nr
-vdone 1 nr ulong a_gu 5 e1
+vdone 1 nr ulong uchar get a_ar add get a_rb 5 e1
 end
 else
 vdone 1 ulong a_gu 4 e1 ulong a_gu 5 e1
@@ -9624,7 +9717,7 @@ f = findfn get tw 0 0 0
 if eq f 0
 unkfail 3
 end
-if eq a_gu 23 sub f 1 12
+if eq uchar get a_ar add get a_rb 23 sub f 1 12
 fail 7
 end
 rdval 2 0 dst f
@@ -9898,7 +9991,7 @@ ret
 end
 if eq c 51
 e = arrname
-if ge a_gu 7 sub e 1 6
+if ge uchar get a_ar add get a_rb 7 sub e 1 6
 vt_fget e dst
 vdec
 ret
@@ -9916,19 +10009,19 @@ ret
 end
 if eq c 52
 e = arrname
-if ge a_gu 7 sub e 1 6
+if ge uchar get a_ar add get a_rb 7 sub e 1 6
 fail 7
 end
 if ne unsz sub e 1 0
-vdone 1 ulong a_gu 14 sub e 1 5
+vdone 1 ulong uchar get a_ar add get a_rb 14 sub e 1 5
 ret
 end
-vdone 3 a_g 6 sub e 1 5
+vdone 3 get a_ar add get a_rb 6 sub e 1 5
 ret
 end
 if or eq c 53 eq c 54
 x = mul get depth 0 32
-a_p 77 add x 8 get nslot 0
+put a_ar add get a_rb 77 add x 8 get nslot 0
 rdval 0 8 255 0
 vs_fd x
 e = arrname
@@ -10196,12 +10289,12 @@ end
 e = findname w
 if ne e 0
 i = sub e 1
-if ne a_gu 7 i 0
+if ne uchar get a_ar add get a_rb 7 i 0
 fail 7
 end
-r = ulong a_gu 4 i
-t = ulong a_gu 5 i
-if ne a_gu 9 i 0
+r = ulong uchar get a_ar add get a_rb 4 i
+t = ulong uchar get a_ar add get a_rb 5 i
+if ne uchar get a_ar add get a_rb 9 i 0
 put fpw 0 add r 2
 rdval 1 t 255 0
 if ne get rt 0 t
@@ -10262,7 +10355,7 @@ if eq f 0
 s_assign w
 ret
 end
-if ne a_gu 23 sub f 1 12
+if ne uchar get a_ar add get a_rb 23 sub f 1 12
 fail 7
 end
 rdval 2 0 255 f
@@ -10341,7 +10434,7 @@ end
 fz_bind add mul f 6 np ln
 p = add mul f 6 np
 a_pc 35 p uchar t
-a_p 36 p ln
+put a_ar add get a_rb 36 p ln
 a_pc 37 p uchar k
 end
 
@@ -10356,7 +10449,7 @@ arrlen ln
 addname pw poolc get psl 0 t ln 3 0
 p = add mul f 6 np
 a_pc 35 p uchar t
-a_p 36 p ln
+put a_ar add get a_rb 36 p ln
 a_pc 37 p 3
 end
 
@@ -10440,23 +10533,25 @@ f = ulong 0
 if eq get scanning 0 1
 newname w l s
 f = get nf 0
+if ge f get a_gp 7
 a_need 7 f
+end
 put nf 0 add f 1
 put curfn 0 add f 1
 put lastfn 0 add f 1
-a_p 21 f w
+put a_ar add get a_rb 21 f w
 fn_link f
-a_p 22 f get oc 0
+put a_ar add get a_rb 22 f get oc 0
 a_pc 23 f 0
 a_pc 24 f 0
-a_p 25 f l
-a_p 26 f s
+put a_ar add get a_rb 25 f l
+put a_ar add get a_rb 26 f s
 a_pc 32 f uchar get expf 0
 else
 f = sub findfn w l s 1
 put curfn 0 add f 1
 put lastfn 0 add f 1
-a_p 22 f get oc 0
+put a_ar add get a_rb 22 f get oc 0
 put fstart 0 get oc 0
 put pinshut 0 1
 put fuel 0 0
@@ -10555,7 +10650,7 @@ found = ulong 0
 bi = ulong 0
 while and eq found 0 gt j 0
 j = sub j 1
-if ge a_g 49 j 3
+if ge get a_ar add get a_rb 49 j 3
 found = ulong 1
 bi = j
 end
@@ -10563,13 +10658,15 @@ end
 if eq found 0
 fail 9
 end
-if ge a_g 49 bi 5
+if ge get a_ar add get a_rb 49 bi 5
 fail 9
 end
 n = get nbrk 0
+if ge n get a_gp 14
 a_need 14 n
-a_p 70 n get oc 0
-a_p 71 n bi
+end
+put a_ar add get a_rb 70 n get oc 0
+put a_ar add get a_rb 71 n bi
 put nbrk 0 add n 1
 if ne get xtarget 0 0
 p = xbranch 14
@@ -10589,7 +10686,7 @@ found = ulong 0
 bi = ulong 0
 while and eq found 0 gt j 0
 j = sub j 1
-if ge a_g 49 j 3
+if ge get a_ar add get a_rb 49 j 3
 found = ulong 1
 bi = j
 end
@@ -10597,13 +10694,15 @@ end
 if eq found 0
 fail 9
 end
-if ge a_g 49 bi 5
+if ge get a_ar add get a_rb 49 bi 5
 fail 9
 end
 n = get ncont 0
+if ge n get a_gp 15
 a_need 15 n
-a_p 72 n get oc 0
-a_p 73 n bi
+end
+put a_ar add get a_rb 72 n get oc 0
+put a_ar add get a_rb 73 n bi
 put ncont 0 add n 1
 if ne get xtarget 0 0
 p = xbranch 14
@@ -10626,7 +10725,7 @@ end
 note s_put: put A i v: index, then value, then the checked store (STOP table). om4 S_PUT.
 fn s_put to void
 e = arrname
-k = a_gu 7 sub e 1
+k = uchar get a_ar add get a_rb 7 sub e 1
 if ge k 6
 s_putf e
 ret
@@ -10641,7 +10740,7 @@ rdval 0 5 255 0
 ik = get rk 0
 iv = get rv 0
 it = get rt 0
-t = ulong a_gu 5 sub e 1
+t = ulong uchar get a_ar add get a_rb 5 sub e 1
 if ne isfloat t 0
 put fpw 0 1
 end
@@ -10842,7 +10941,7 @@ if eq n 0
 fail 15
 end
 i = sub n 1
-if ne a_g 49 i 1
+if ne get a_ar add get a_rb 49 i 1
 fail 15
 end
 b = get oc 0
@@ -10854,13 +10953,13 @@ end
 else
 emit 335544320
 end
-patch19 a_g 50 i get oc 0
-a_p 49 i 2
-a_p 50 i b
+patch19 get a_ar add get a_rb 50 i get oc 0
+put a_ar add get a_rb 49 i 2
+put a_ar add get a_rb 50 i b
 fz_else i
-nm_set a_g 54 i
-put held 0 a_g 55 i
-a_p 56 i get dead 0
+nm_set get a_ar add get a_rb 54 i
+put held 0 get a_ar add get a_rb 55 i
+put a_ar add get a_rb 56 i get dead 0
 put dead 0 0
 eol
 end
@@ -10896,9 +10995,9 @@ if ne get cphn 0 0
 ret
 end
 b = sub get nb 0 1
-a_p 57 b add br 4
-a_p 58 b kk
-a_p 59 b kr
+put a_ar add get a_rb 57 b add br 4
+put a_ar add get a_rb 58 b kk
+put a_ar add get a_rb 59 b kr
 end
 
 note lpback: the latch test of a for whose test moved there (block b): CMP Xi, #K (C6.2.96), CMP Xi, Xk or
@@ -10907,17 +11006,17 @@ note the head's exit branch (C6.2.34). The head keeps its test for the first pas
 note is tested here, after the increment, so a pass runs one branch instead of two. When K needs a register
 note and none is free here (alloc would be error 12), the latch is B head (C6.2.35), as without the move.
 fn lpback b ulong to void
-r = a_g 52 b
-kr = a_g 59 b
+r = get a_ar add get a_rb 52 b
+kr = get a_ar add get a_rb 59 b
 if ne kr 0
 emit or or 3942645791 shl sub kr 1 16 shl r 5
 else
-kk = a_g 58 b
+kk = get a_ar add get a_rb 58 b
 if le kk 4095
 emit or or 4043309087 shl kk 10 shl r 5
 else
 if ge add get npar 0 get nslot 0 16
-back a_g 51 b
+back get a_ar add get a_rb 51 b
 ret
 end
 m = alloc
@@ -10926,10 +11025,10 @@ emit or or 3942645791 shl r 5 shl m 16
 end
 end
 cc = ulong 3
-if ge a_g 53 b 6
+if ge get a_ar add get a_rb 53 b 6
 cc = ulong 11
 end
-emit or or 1409286144 shl bdisp get oc 0 a_g 57 b 19 5 cc
+emit or or 1409286144 shl bdisp get oc 0 get a_ar add get a_rb 57 b 19 5 cc
 end
 
 note s_while: while cond [bound N]: hidden counter = 0; head: cond false -> exit; counter >= N -> trap 4;
@@ -11186,12 +11285,12 @@ addname w 0 t 0 9 0
 n = get nb 0
 pushb 0 5 0 sub get nn 0 1 t
 pushnh sn sh
-a_p 62 n get cur 0
-a_p 63 n get line 0
-a_p 64 n 0
-a_p 65 n kk
-a_p 66 n get nn 0
-a_p 67 n get held 0
+put a_ar add get a_rb 62 n get cur 0
+put a_ar add get a_rb 63 n get line 0
+put a_ar add get a_rb 64 n 0
+put a_ar add get a_rb 65 n kk
+put a_ar add get a_rb 66 n get nn 0
+put a_ar add get a_rb 67 n get held 0
 put fzone 0 add get fzone 0 1
 cp_head get cur 0 get line 0
 cp_skip
@@ -11210,28 +11309,28 @@ end
 note s_unr: the end of an unrolled body: read it again with the next value of i, or close the block
 fn s_unr i ulong to void
 eol
-it = add a_g 64 i 1
-if lt it a_g 65 i
-a_p 64 i it
-a_p 8 a_g 52 i it
-nm_set a_g 66 i
-put held 0 a_g 67 i
-put nslot 0 a_g 67 i
+it = add get a_ar add get a_rb 64 i 1
+if lt it get a_ar add get a_rb 65 i
+put a_ar add get a_rb 64 i it
+put a_ar add get a_rb 8 get a_ar add get a_rb 52 i it
+nm_set get a_ar add get a_rb 66 i
+put held 0 get a_ar add get a_rb 67 i
+put nslot 0 get a_ar add get a_rb 67 i
 put dead 0 0
-put cur 0 a_g 62 i
-put line 0 a_g 63 i
+put cur 0 get a_ar add get a_rb 62 i
+put line 0 get a_ar add get a_rb 63 i
 cp_head get cur 0 get line 0
 cp_skip
 ret
 end
-a_p 64 i it
-a_p 8 a_g 52 i it
-nm_set a_g 66 i
-put nslot 0 a_g 67 i
-cp_head a_g 62 i a_g 63 i
+put a_ar add get a_rb 64 i it
+put a_ar add get a_rb 8 get a_ar add get a_rb 52 i it
+nm_set get a_ar add get a_rb 66 i
+put nslot 0 get a_ar add get a_rb 67 i
+cp_head get a_ar add get a_rb 62 i get a_ar add get a_rb 63 i
 put nb 0 i
-nm_set a_g 54 i
-put held 0 a_g 55 i
+nm_set get a_ar add get a_rb 54 i
+put held 0 get a_ar add get a_rb 55 i
 put dead 0 0
 put fzone 0 sub get fzone 0 1
 end
@@ -11246,8 +11345,8 @@ if le get tl 0 8
 if eq kw get tw 0 182
 a_pc 27 f 1
 eol
-a_p 28 f get cur 0
-a_p 29 f get line 0
+put a_ar add get a_rb 28 f get cur 0
+put a_ar add get a_rb 29 f get line 0
 ret
 end
 end
@@ -11257,8 +11356,8 @@ if and ne k 0 ne k 3
 put dexp 0 6
 fail 5
 end
-a_p 28 f get cur 0
-a_p 29 f get line 0
+put a_ar add get a_rb 28 f get cur 0
+put a_ar add get a_rb 29 f get line 0
 end
 
 note inl_call: a call of an inline function fe (index + 1): the result register first (dst, or the next
@@ -11267,7 +11366,7 @@ fn inl_call fe ulong dst ulong to void
 s0 = get nslot 0
 rres = ulong 255
 ns = s0
-if ne a_gu 23 sub fe 1 12
+if ne uchar get a_ar add get a_rb 23 sub fe 1 12
 if eq dst 255
 rres = alloc
 ns = add s0 1
@@ -11276,8 +11375,8 @@ rres = dst
 end
 end
 cb = add mul get depth 0 32 8
-np = ulong a_gu 24 sub fe 1
-a_p 77 add cb 18 np
+np = ulong uchar get a_ar add get a_rb 24 sub fe 1
+put a_ar add get a_rb 77 add cb 18 np
 a_p 77 add cb 19 get nslot 0
 i = ulong 0
 while lt i np
@@ -11304,8 +11403,8 @@ note unsized array parameter also takes its count register, or a new one holding
 fn inl_par fe ulong cb ulong i ulong hb ulong to void
 p = add mul sub fe 1 6 i
 q = add cb mul i 3
-k = a_g 77 q
-v = a_g 77 add q 1
+k = get a_ar add get a_rb 77 q
+v = get a_ar add get a_rb 77 add q 1
 r = ulong 0
 if eq a_gu 37 p 0
 if and eq k 1 ge regidx v hb
@@ -11332,17 +11431,17 @@ end
 note inl_lr: the unsized parameter name just added gets the count of argument ux (ul_k / ul_v): its
 note register, or a new one holding the number
 fn inl_lr ux ulong to void
-lr = a_g 80 ux
-if ne a_g 79 ux 1
+lr = get a_ar add get a_rb 80 ux
+if ne get a_ar add get a_rb 79 ux 1
 lr = alloc
-matconst lr a_g 80 ux
+matconst lr get a_ar add get a_rb 80 ux
 end
 a_pc 14 sub get nn 0 1 uchar lr
 end
 
 note inl_add: the name of parameter slot p on register r (a view struct is name kind 8, an edit one 7)
 fn inl_add p ulong r ulong to void
-pk = ulong a_gu 37 p
+pk = ulong uchar get a_ar add get a_rb 37 p
 if eq pk 0
 addname a_g 34 p r ulong a_gu 35 p 0 0 0
 ret
@@ -11352,7 +11451,7 @@ if eq pk 6
 nk = ulong 8
 end
 addname a_g 34 p r ulong a_gu 35 p a_g 36 p nk 0
-a_pc 12 sub get nn 0 1 a_gu 38 p
+a_pc 12 sub get nn 0 1 uchar get a_ar add get a_rb 38 p
 end
 
 note inl_edge: record the call-graph edge (expanding function -> inline function) once (arena group 17)
@@ -11374,9 +11473,11 @@ end
 m = add m 1
 end
 end
+if ge n get a_gp 17
 a_need 17 n
-a_p 75 n a
-a_p 76 n b
+end
+put a_ar add get a_rb 75 n a
+put a_ar add get a_rb 76 n b
 put nie 0 add n 1
 end
 
@@ -11419,8 +11520,8 @@ put inl 0 add lv 1
 put fzone 0 add get fzone 0 1
 put curret 0 ulong a_gu 23 sub fe 1
 put dead 0 0
-put cur 0 a_g 28 sub fe 1
-put line 0 a_g 29 sub fe 1
+put cur 0 get a_ar add get a_rb 28 sub fe 1
+put line 0 get a_ar add get a_rb 29 sub fe 1
 cp_entry
 inl_run lv
 end
@@ -11429,7 +11530,7 @@ note inl_bind: hide the caller's local names, bind the parameters, protect every
 fn inl_bind fe ulong cb ulong to void
 hb = add get npar 0 get held 0
 put nmlo 0 get nn 0
-np = ulong a_gu 24 sub fe 1
+np = ulong uchar get a_ar add get a_rb 24 sub fe 1
 i = ulong 0
 while lt i np
 inl_par fe cb i hb
@@ -11458,12 +11559,14 @@ end
 note inlb: the B of an inlined ret, patched to the frame's end (arena group 16)
 fn inlb to void
 n = get nilp 0
+if ge n get a_gp 16
 a_need 16 n
-a_p 74 n get oc 0
+end
+put a_ar add get a_rb 74 n get oc 0
 put nilp 0 add n 1
 if ne get xtarget 0 0
 p = xbranch 14
-a_p 74 n p
+put a_ar add get a_rb 74 n p
 else
 emit 335544320
 end
@@ -11511,7 +11614,7 @@ eol
 lv = sub get inl 0 1
 fe = get il_fn lv
 if eq get dead 0 0
-if ne a_gu 23 sub fe 1 12
+if ne uchar get a_ar add get a_rb 23 sub fe 1 12
 fail 18
 end
 cp_post 0 0 12
@@ -11531,7 +11634,7 @@ put fzone 0 sub get fzone 0 1
 put fz_n 0 get il_fz lv
 put rk 0 1
 put rv 0 get il_res lv
-put rt 0 ulong a_gu 23 sub fe 1
+put rt 0 ulong uchar get a_ar add get a_rb 23 sub fe 1
 end
 
 note inl_pat: patch the frame's ret B words (from p0) to here, after taking back a last one that is the
@@ -11542,7 +11645,7 @@ o = get oc 0
 if and ne get dead 0 0 gt n p0
 if eq get lastb 0 o
 if ne get tgoc 0 o
-if eq a_g 74 sub n 1 sub o 4
+if eq get a_ar add get a_rb 74 sub n 1 sub o 4
 put oc 0 sub o 4
 n = sub n 1
 end
@@ -11857,7 +11960,9 @@ note on stderr: omc-site 1 line=N iter=k, k the counters of the open unrolled lo
 note joined by '.', or '-'.
 fn siteb b ulong to void
 n = get nsite 0
+if ge n get a_gp 2
 a_need 2 n
+end
 a_bput 2 n uchar b
 put nsite 0 add n 1
 end
@@ -11899,11 +12004,11 @@ sitew 67561537693984 6
 any = false
 j = ulong 0
 while lt j get nb 0
-if eq a_g 49 j 5
+if eq get a_ar add get a_rb 49 j 5
 if any
 siteb 46
 end
-siten a_g 64 j
+siten get a_ar add get a_rb 64 j
 any = true
 end
 j = add j 1
@@ -12003,7 +12108,7 @@ n = get nt 0
 if ge p n
 ret
 end
-if lt sub get oc 0 a_g 44 p 524288
+if lt sub get oc 0 get a_ar add get a_rb 44 p 524288
 ret
 end
 i = ulong 0
@@ -12014,7 +12119,7 @@ while and go lt m 999999
 if ge i get nb 0
 go = false
 else
-k = a_g 49 i
+k = get a_ar add get a_rb 49 i
 if and ge k 1 le k 4
 ret
 end
@@ -12036,10 +12141,10 @@ fn patchl w ulong i ulong t ulong to void
 j = ulong 0
 n = ulong 0
 if eq w 0
-j = a_g 60 i
+j = get a_ar add get a_rb 60 i
 n = get nbrk 0
 else
-j = a_g 61 i
+j = get a_ar add get a_rb 61 i
 n = get ncont 0
 end
 go = true
@@ -12050,14 +12155,14 @@ if ge j n
 go = false
 else
 if eq w 0
-if eq a_g 71 j i
-patch19 a_g 70 j t
-a_p 71 j 65535
+if eq get a_ar add get a_rb 71 j i
+patch19 get a_ar add get a_rb 70 j t
+put a_ar add get a_rb 71 j 65535
 end
 else
-if eq a_g 73 j i
-patch19 a_g 72 j t
-a_p 73 j 65535
+if eq get a_ar add get a_rb 73 j i
+patch19 get a_ar add get a_rb 72 j t
+put a_ar add get a_rb 73 j 65535
 end
 end
 j = add j 1
@@ -12076,58 +12181,58 @@ finish
 ret
 end
 i = sub n 1
-if eq a_g 49 i 5
+if eq get a_ar add get a_rb 49 i 5
 s_unr i
 ret
 end
-if eq a_g 49 i 6
+if eq get a_ar add get a_rb 49 i 6
 s_inlx i
 ret
 end
 put nb 0 i
-k = a_g 49 i
+k = get a_ar add get a_rb 49 i
 fz_join i k
 if eq k 2
-put dead 0 and get dead 0 a_g 56 i
+put dead 0 and get dead 0 get a_ar add get a_rb 56 i
 else
 put dead 0 0
 end
 if eq k 4
 lat = get oc 0
 patchl 1 i lat
-a_p 77 0 1
+put a_ar add get a_rb 77 0 1
 a_p 77 1 a_g 52 i
 a_p 77 2 a_g 53 i
-a_p 77 3 3
-a_p 77 4 1
+put a_ar add get a_rb 77 3 3
+put a_ar add get a_rb 77 4 1
 a_p 77 5 a_g 53 i
-binop 33 a_g 52 i 0
+binop 33 get a_ar add get a_rb 52 i 0
 end
 if eq k 3
-patchl 1 i a_g 51 i
+patchl 1 i get a_ar add get a_rb 51 i
 end
 if ge k 3
-if ne a_g 57 i 0
+if ne get a_ar add get a_rb 57 i 0
 lpback i
 else
-back a_g 51 i
+back get a_ar add get a_rb 51 i
 end
 ex = get oc 0
 note the breaks and continues of loop i are the entries recorded since it opened (bk0, bc0): an inner
 note loop gave its own back when it closed, so this is linear in them, and they are given back below
 patchl 0 i ex
-put nbrk 0 a_g 60 i
-put ncont 0 a_g 61 i
+put nbrk 0 get a_ar add get a_rb 60 i
+put ncont 0 get a_ar add get a_rb 61 i
 end
 if eq k 2
-if or eq get xtarget 0 0 eq a_g 56 i 0
-patch26 a_g 50 i get oc 0
+if or eq get xtarget 0 0 eq get a_ar add get a_rb 56 i 0
+patch26 get a_ar add get a_rb 50 i get oc 0
 end
 else
-patch19 a_g 50 i get oc 0
+patch19 get a_ar add get a_rb 50 i get oc 0
 end
-nm_set a_g 54 i
-put held 0 a_g 55 i
+nm_set get a_ar add get a_rb 54 i
+put held 0 get a_ar add get a_rb 55 i
 eol
 end
 
@@ -12194,7 +12299,7 @@ f = findfn 1852399981 4 0
 if eq f 0
 fail 16
 end
-if ne a_gu 24 sub f 1 0
+if ne uchar get a_ar add get a_rb 24 sub f 1 0
 fail 9
 end
 wrword 176 or 335544320 bdisp 176 get oc 0 26
@@ -12206,8 +12311,8 @@ emit 3533832220
 emit 3533836304
 emit 2432696863
 pinlo
-emit or 2483027968 bdisp get oc 0 a_g 22 sub f 1 26
-if eq a_gu 23 sub f 1 12
+emit or 2483027968 bdisp get oc 0 get a_ar add get a_rb 22 sub f 1 26
+if eq uchar get a_ar add get a_rb 23 sub f 1 12
 emit 3531603968
 end
 emit 3531606952
@@ -12235,12 +12340,12 @@ while and go lt m 999999
 if ge i n
 go = false
 else
-s = a_g 41 i
-f = sub a_g 43 i 1
+s = get a_ar add get a_rb 41 i
+f = sub get a_ar add get a_rb 43 i 1
 if ne get xtarget 0 0
 wrword add s 1 sub a_g 22 f add s 5
 else
-wrword s or 2483027968 bdisp s a_g 22 f 26
+wrword s or 2483027968 bdisp s get a_ar add get a_rb 22 f 26
 end
 i = add i 1
 end
@@ -12259,15 +12364,19 @@ note callee, grouped by callee (k_st g .. k_st g + 1 - 1 in k_ed), k_cu the fill
 note settled functions in order. A function is settled when its count reaches 0. Arena groups 19, 20.
 fn ksettle n ulong to void
 fc = get nf 0
+if ge fc get a_gp 19
 a_need 19 fc
+end
+if ge n get a_gp 20
 a_need 20 n
+end
 kcount n fc
 kfill n fc
 t = ulong 0
 f = ulong 0
 while lt f fc
-if eq a_g 81 f 0
-a_p 84 t f
+if eq get a_ar add get a_rb 81 f 0
+put a_ar add get a_rb 84 t f
 t = add t 1
 end
 f = add f 1
@@ -12280,7 +12389,7 @@ while and go lt m 999999
 if ge h t
 go = false
 else
-g = a_g 84 h
+g = get a_ar add get a_rb 84 h
 h = add h 1
 a_pc 30 g 1
 t = kpop g t
@@ -12294,8 +12403,8 @@ note kcount: k_deg and the per-callee counts k_st g + 1 from the call records, t
 fn kcount n ulong fc ulong to void
 f = ulong 0
 while le f fc
-a_p 81 f 0
-a_p 82 f 0
+put a_ar add get a_rb 81 f 0
+put a_ar add get a_rb 82 f 0
 f = add f 1
 end
 i = ulong 0
@@ -12306,9 +12415,9 @@ while and go lt m 999999
 if ge i n
 go = false
 else
-a = a_g 42 i
+a = get a_ar add get a_rb 42 i
 if ne a 0
-b = a_g 43 i
+b = get a_ar add get a_rb 43 i
 a_p 81 sub a 1 add a_g 81 sub a 1 1
 a_p 82 b add a_g 82 b 1
 end
@@ -12339,7 +12448,7 @@ while and go lt m 999999
 if ge i n
 go = false
 else
-a = a_g 42 i
+a = get a_ar add get a_rb 42 i
 if ne a 0
 g = sub a_g 43 i 1
 a_p 85 a_g 83 g sub a 1
@@ -12355,8 +12464,8 @@ end
 note kpop: function g is settled: each caller's count drops by one per call; a caller at 0 joins the
 note queue at t. Returns the new end of the queue.
 fn kpop g ulong t ulong to ulong
-e = a_g 82 add g 1
-j = a_g 82 g
+e = get a_ar add get a_rb 82 add g 1
+j = get a_ar add get a_rb 82 g
 q = t
 go = true
 while go
@@ -12365,7 +12474,7 @@ while and go lt m 999999
 if ge j e
 go = false
 else
-c = a_g 85 j
+c = get a_ar add get a_rb 85 j
 d = sub a_g 81 c 1
 a_p 81 c d
 if eq d 0
@@ -12384,7 +12493,7 @@ note kunset: a function ksettle left unsettled is error 9 at the end of the inpu
 fn kunset to void
 f = ulong 0
 while lt f get nf 0
-if eq a_gu 30 f 0
+if eq uchar get a_ar add get a_rb 30 f 0
 put dsev 0 3
 fail 9
 end
@@ -12433,7 +12542,7 @@ while and go lt m 999999
 if ge j n
 go = false
 else
-a = a_g 42 j
+a = get a_ar add get a_rb 42 j
 b = a_g 43 j
 if ne w 0
 a = a_g 75 j
@@ -12471,7 +12580,7 @@ note inlcyc (OM-2): an inline function that reaches itself through the whole cal
 note plus an edge from each function to every inline function expanded in it) is error 9 at the end.
 f = ulong 1
 while le f get nf 0
-if ne a_gu 27 sub f 1 0
+if ne uchar get a_ar add get a_rb 27 sub f 1 0
 if ne reachself f 0
 put dsev 0 3
 fail 9
@@ -12495,7 +12604,7 @@ while and go lt m 999999
 if ge i get nglob 0
 go = false
 else
-if ne a_gu 7 i 9
+if ne uchar get a_ar add get a_rb 7 i 9
 fail 9
 end
 i = add i 1
@@ -12510,13 +12619,13 @@ n = get nexp 0
 p = ulong 512
 f = ulong 0
 while lt f get nf 0
-take = ne a_gu 32 f 0
+take = ne uchar get a_ar add get a_rb 32 f 0
 if eq n 0
 take = eq f sub get lastfn 0 1
 end
 if take
 a_bput 1 p 233
-wrword add p 1 sub a_g 22 f add p 5
+wrword add p 1 sub get a_ar add get a_rb 22 f add p 5
 a_bput 1 add p 5 144
 p = add p 6
 end
@@ -12529,8 +12638,8 @@ note expwords (OM-2, spec 6): words 0 .. E-1 of a multi-entry unit, B to each ex
 at = ulong 176
 f = ulong 0
 while lt f get nf 0
-if ne a_gu 32 f 0
-wrword at or 335544320 bdisp at a_g 22 f 26
+if ne uchar get a_ar add get a_rb 32 f 0
+wrword at or 335544320 bdisp at get a_ar add get a_rb 22 f 26
 at = add at 4
 end
 f = add f 1
@@ -12540,7 +12649,7 @@ end
 if eq get nf 0 1
 writeout 180
 end
-a = a_g 22 sub get lastfn 0 1
+a = get a_ar add get a_rb 22 sub get lastfn 0 1
 wrword 176 or 335544320 bdisp 176 a 26
 writeout 176
 end
@@ -12549,9 +12658,11 @@ note stmt: one line. Returns 1 at the end of the input. om4 STMT.
 fn stmt to ulong
 put dexp 0 0
 put nslot 0 get held 0
+if lt get tpend 0 get nt 0
 if and ne get curret 0 0 eq get inl 0 0
 if and eq get xtarget 0 0 eq get irmode 0 0
 island
+end
 end
 end
 tok
@@ -12592,7 +12703,7 @@ if gt get tl 0 63
 unkfail 13
 end
 else
-if ne a_gu 23 sub f 1 12
+if ne uchar get a_ar add get a_rb 23 sub f 1 12
 fail 7
 end
 rdval 2 0 255 f
@@ -12811,14 +12922,14 @@ note ps_at: the line's first byte that is not blank is at p: 1 when the line is 
 note ends while deciding, else 0. om4 PS_LINE .. PS_YES.
 fn ps_at p ulong to ulong
 e = get inlen 0
-if ne a_ib p 102
+if ne uchar and shr get a_ar shr p 3 shl and p 7 3 255 102
 ret 0
 end
 q = add p 1
 if ge q e
 ret 2
 end
-if ne a_ib q 110
+if ne uchar and shr get a_ar shr q 3 shl and q 7 3 255 110
 ret 0
 end
 r = add q 1
@@ -12832,7 +12943,7 @@ end
 if gt add q 4 e
 ret 0
 end
-if ne a_ib q 109
+if ne uchar and shr get a_ar shr q 3 shl and q 7 3 255 109
 ret 0
 end
 if ne a_ib add q 1 97
@@ -13145,7 +13256,7 @@ addname pw poolc get psl 0 t ln 7 0
 end
 p = add mul f 6 np
 a_pc 35 p uchar t
-a_p 36 p ln
+put a_ar add get a_rb 36 p ln
 a_pc 37 p uchar sk
 end
 
@@ -13155,7 +13266,7 @@ if ne get om2 0 0
 if ne get inl 0 0
 fail 9
 end
-if ne a_gu 27 sub get curfn 0 1 0
+if ne uchar get a_ar add get a_rb 27 sub get curfn 0 1 0
 fail 9
 end
 end
@@ -13417,7 +13528,7 @@ if ne get progmode 0 0
 ret
 end
 if ne get nexp 0 0
-if eq a_gu 32 f 0
+if eq uchar get a_ar add get a_rb 32 f 0
 ret
 end
 else
@@ -13425,12 +13536,12 @@ if ne add f 1 get nf 0
 ret
 end
 end
-if ge a_gu 23 f 64
+if ge uchar get a_ar add get a_rb 23 f 64
 fail 7
 end
 i = ulong 0
-while lt i ulong a_gu 24 f
-if ge a_gu 35 add mul f 6 i 64
+while lt i ulong uchar get a_ar add get a_rb 24 f
+if ge uchar get a_ar add get a_rb 35 add mul f 6 i 64
 fail 7
 end
 i = add i 1
@@ -13487,14 +13598,14 @@ if eq fe 0
 ret 0
 end
 f = sub fe 1
-if ne ulong a_gu 23 f add a 64
+if ne ulong uchar get a_ar add get a_rb 23 f add a 64
 ret 0
 end
 l = get ab_len a
-if ne a_g 25 f add l 2
+if ne get a_ar add get a_rb 25 f add l 2
 ret 0
 end
-o = a_g 26 f
+o = get a_ar add get a_rb 26 f
 w = get ab_name a
 i = ulong 0
 while lt i l
@@ -13615,11 +13726,11 @@ if gt xl 8
 ret 0
 end
 i = ulong 0
-while lt i ulong a_gu 24 f
+while lt i ulong uchar get a_ar add get a_rb 24 f
 p = add mul f 6 i
-if eq a_g 34 p x
-if eq a_gu 37 p 0
-if eq a_gu 35 p 4
+if eq get a_ar add get a_rb 34 p x
+if eq uchar get a_ar add get a_rb 37 p 0
+if eq uchar get a_ar add get a_rb 35 p 4
 ret 1
 end
 end
@@ -13632,7 +13743,7 @@ end
 note ab_exact: the body of constructor fe is exactly `ret seal NAME or shl ulong x 32 ulong x` then `end`
 fn ab_exact fe ulong a ulong to ulong
 f = sub fe 1
-put aw_p 0 a_g 28 f
+put aw_p 0 get a_ar add get a_rb 28 f
 if eq aw_is 7628146 3 0 0
 ret 0
 end
@@ -13682,7 +13793,7 @@ end
 note ab_bin: a binary operation whose operand (fr[x..x+5]) is abstract: only a listed preserving one, run
 note on the representation type T and giving NAME; rotr/rotl take a T count (E9), and/or/xor two NAME values
 fn ab_bin c ulong dst ulong x ulong to void
-at = a_g 77 add x 2
+at = get a_ar add get a_rb 77 add x 2
 if lt at 64
 fail 7
 end
@@ -13695,8 +13806,8 @@ if eq and get ab_ops a b 0
 fail 7
 end
 t = ulong get ab_base a
-bk = a_g 77 add x 3
-bt = a_g 77 add x 5
+bk = get a_ar add get a_rb 77 add x 3
+bt = get a_ar add get a_rb 77 add x 5
 if or eq c 59 eq c 60
 if eq bk 2
 range a_g 77 add x 4 t bt
@@ -13711,8 +13822,8 @@ if ne bt at
 fail 7
 end
 end
-a_p 77 add x 2 t
-a_p 77 add x 5 t
+put a_ar add get a_rb 77 add x 2 t
+put a_ar add get a_rb 77 add x 5 t
 binop c dst x
 put rt 0 at
 end
@@ -13739,7 +13850,7 @@ end
 
 note fz_bind: the parameter name just added for slot p gets a new written set in the body pass
 fn fz_bind p ulong ln ulong to void
-if eq a_gu 39 p 0
+if eq uchar get a_ar add get a_rb 39 p 0
 ret
 end
 if ne get scanning 0 0
@@ -13763,30 +13874,30 @@ end
 
 note fz_inl: an inline parameter slot p bound to array name e: its own fresh set, or e's set
 fn fz_inl p ulong e ulong to void
-pk = ulong a_gu 37 p
+pk = ulong uchar get a_ar add get a_rb 37 p
 if or eq pk 0 ge pk 6
 ret
 end
 n = sub get nn 0 1
-if ne a_gu 39 p 0
-fz_new n a_g 36 p
+if ne uchar get a_ar add get a_rb 39 p 0
+fz_new n get a_ar add get a_rb 36 p
 ret
 end
-a_pc 13 n a_gu 13 sub e 1
+a_pc 13 n uchar get a_ar add get a_rb 13 sub e 1
 end
 
 fn fz_else i ulong to void
 j = ulong 0
 while lt j get fz_n 0
 x = add mul i 16 j
-a_p 69 x get fz_cur j
-put fz_cur j a_g 68 x
+put a_ar add get a_rb 69 x get fz_cur j
+put fz_cur j get a_ar add get a_rb 68 x
 j = add j 1
 end
 end
 
 fn fz_join i ulong k ulong to void
-td = a_g 56 i
+td = get a_ar add get a_rb 56 i
 ed = get dead 0
 j = ulong 0
 while lt j get fz_n 0
@@ -13797,11 +13908,11 @@ if and ne td 0 eq ed 0
 v = get fz_cur j
 end
 if and ne ed 0 eq td 0
-v = a_g 69 x
+v = get a_ar add get a_rb 69 x
 end
 put fz_cur j v
 else
-put fz_cur j a_g 68 x
+put fz_cur j get a_ar add get a_rb 68 x
 end
 j = add j 1
 end
@@ -13812,7 +13923,7 @@ fn fz_get e ulong to void
 if ne get cvalid 0 0
 ret
 end
-s = ulong a_gu 13 sub e 1
+s = ulong uchar get a_ar add get a_rb 13 sub e 1
 if eq s 0
 ret
 end
@@ -13834,7 +13945,7 @@ end
 
 note fz_put: put e i v with index (k, v): a number index sets its bit
 fn fz_put e ulong k ulong v ulong to void
-s = ulong a_gu 13 sub e 1
+s = ulong uchar get a_ar add get a_rb 13 sub e 1
 if eq s 0
 ret
 end
@@ -13849,7 +13960,7 @@ end
 note fz_arg: array name e leaves the analysis (a non-inline call, read, write, a host operation): error 27
 note when it is tracked
 fn fz_arg e ulong to void
-if ne a_gu 13 sub e 1 0
+if ne uchar get a_ar add get a_rb 13 sub e 1 0
 fail 27
 end
 end
@@ -14191,7 +14302,7 @@ addname pw poolc get psl 0 2 ln k 0
 a_pc 12 sub get nn 0 1 uchar lid
 p = add mul f 6 np
 a_pc 35 p 2
-a_p 36 p ln
+put a_ar add get a_rb 36 p ln
 a_pc 37 p uchar k
 a_pc 38 p uchar lid
 end
@@ -14199,7 +14310,7 @@ end
 note ly_fld: for a layout name e, when the next word is one of its fields: consume it, return the field-table
 note index + 1; otherwise rewind and return 0 (the name is then an ordinary uchar array)
 fn ly_fld e ulong to ulong
-lid = ulong a_gu 12 sub e 1
+lid = ulong uchar get a_ar add get a_rb 12 sub e 1
 if eq lid 0
 ret 0
 end
@@ -14338,7 +14449,7 @@ x = ly_ix j get rk 0 get rv 0 get rt 0
 end
 rd = destreg dst
 if ne get xtarget 0 0
-xlayout 0 ulong a_gu 4 sub e 1 x ft rd
+xlayout 0 ulong uchar get a_ar add get a_rb 4 sub e 1 x ft rd
 else
 emit or or or ldun ft rd shl ulong a_gu 4 sub e 1 5 shl x 16
 end
@@ -14395,7 +14506,7 @@ ly_rev ft v y
 v = y
 end
 if ne get xtarget 0 0
-xlayout 1 ulong a_gu 4 sub e 1 x ft v
+xlayout 1 ulong uchar get a_ar add get a_rb 4 sub e 1 x ft v
 else
 emit or or or stun ft v shl ulong a_gu 4 sub e 1 5 shl x 16
 end
@@ -14406,7 +14517,7 @@ fn vt_fget_go e ulong dst ulong j ulong to void
 fl = ulong get sf_len j
 ft = ulong get sf_type j
 off = ulong get sf_off j
-base = ulong a_gu 4 sub e 1
+base = ulong uchar get a_ar add get a_rb 4 sub e 1
 idx = alloc
 if eq fl 0
 st_store_ld base idx off ft dst
@@ -14440,7 +14551,7 @@ end
 if gt get tl 0 63
 fail 13
 end
-si = sub ulong a_gu 5 i 16
+si = sub ulong uchar get a_ar add get a_rb 5 i 16
 fid = findfield si get tw 0
 if eq fid 0
 fail 3
@@ -14459,7 +14570,7 @@ fn s_putf_go e ulong j ulong to void
 fl = ulong get sf_len j
 ft = ulong get sf_type j
 off = ulong get sf_off j
-base = ulong a_gu 4 sub e 1
+base = ulong uchar get a_ar add get a_rb 4 sub e 1
 if ne fl 0
 rdval 0 5 255 0
 if eq get rt 0 1
@@ -14486,7 +14597,7 @@ end
 note s_putf: put p f v, or put p f i v. A view struct is error 20.
 fn s_putf e ulong to void
 i = sub e 1
-if eq ulong a_gu 7 i 8
+if eq ulong uchar get a_ar add get a_rb 7 i 8
 fail 20
 end
 tok
@@ -14496,7 +14607,7 @@ end
 if gt get tl 0 63
 fail 13
 end
-si = sub ulong a_gu 5 i 16
+si = sub ulong uchar get a_ar add get a_rb 5 i 16
 fid = findfield si get tw 0
 if eq fid 0
 fail 3
@@ -14546,7 +14657,7 @@ if eq e 0
 fail 3
 end
 ni = sub e 1
-k = ulong a_gu 7 ni
+k = ulong uchar get a_ar add get a_rb 7 ni
 if lt k 6
 fail 7
 end
@@ -14582,9 +14693,9 @@ end
 j = add j 1
 end
 q = add cb mul i 3
-a_p 77 q 5
+put a_ar add get a_rb 77 q 5
 a_p 77 add q 1 ulong a_gu 4 sub e 1
-a_p 77 add q 2 e
+put a_ar add get a_rb 77 add q 2 e
 end
 note ---- R6 IR. A leading line `ir` writes OSC IR version 1. The AArch64 path is not taken.
 note Worksheet ir_match.py matched omega_emit on the 10 dev programs; this is that algorithm.
@@ -14674,13 +14785,13 @@ end
 if ge add p 3 get inlen 0
 ret 0
 end
-if ne a_ib p 105
+if ne uchar and shr get a_ar shr p 3 shl and p 7 3 255 105
 ret 0
 end
-if ne a_ib add p 1 114
+if ne uchar and shr get a_ar shr add p 1 3 shl and add p 1 7 3 255 114
 ret 0
 end
-if gt a_ib add p 2 32
+if gt uchar and shr get a_ar shr add p 2 3 shl and add p 2 7 3 255 32
 ret 0
 end
 q = add p 2
@@ -14999,7 +15110,7 @@ emitb uchar get ir_nl 0
 p = get ir_ns 0
 e = add p get ir_nl 0
 while lt p e
-emitb a_ib p
+emitb uchar and shr get a_ar shr p 3 shl and p 7 3 255
 p = add p 1
 end
 emitb uchar get ir_npar 0
@@ -15146,12 +15257,12 @@ if le get tl 0 8
 e = findname get tw 0
 end
 if ne e 0
-if eq a_gu 7 sub e 1 9
-t = ulong a_gu 5 sub e 1
+if eq uchar get a_ar add get a_rb 7 sub e 1 9
+t = ulong uchar get a_ar add get a_rb 5 sub e 1
 if ge t 10
 fail 9
 end
-r = ir_lit a_g 8 sub e 1 t
+r = ir_lit get a_ar add get a_rb 8 sub e 1 t
 ir_set 65534 r t
 ret
 end
@@ -16044,16 +16155,16 @@ fn cp_mode q ulong to ulong
 if gt add q 4 get inlen 0
 ret 0
 end
-if ne a_ib q 111
+if ne uchar and shr get a_ar shr q 3 shl and q 7 3 255 111
 ret 0
 end
-if ne a_ib add q 1 109
+if ne uchar and shr get a_ar shr add q 1 3 shl and add q 1 7 3 255 109
 ret 0
 end
-if ne a_ib add q 2 50
+if ne uchar and shr get a_ar shr add q 2 3 shl and add q 2 7 3 255 50
 ret 0
 end
-if ne a_ib add q 3 32
+if ne uchar and shr get a_ar shr add q 3 3 shl and add q 3 7 3 255 32
 ret 0
 end
 p = add q 4
@@ -16061,7 +16172,7 @@ m = ulong 1
 if le add p 5 get inlen 0
 if and eq a_ib p 100 eq a_ib add p 1 105
 if and eq a_ib add p 2 97 eq a_ib add p 3 103
-if eq a_ib add p 4 32
+if eq uchar and shr get a_ar shr add p 4 3 shl and add p 4 7 3 255 32
 p = add p 5
 m = ulong 2
 end
@@ -16436,8 +16547,8 @@ xrr 137 3 4
 end
 fn xha x ulong i ulong r ulong to void
 q = add add x 8 mul i 2
-k = a_g 77 q
-v = a_g 77 add q 1
+k = get a_ar add get a_rb 77 q
+v = get a_ar add get a_rb 77 add q 1
 if or eq k 3 eq k 7
 ximm r v
 else
@@ -16452,10 +16563,10 @@ fn xhs r ulong s ulong to void
 xmem 139 r 3 mul s 8
 end
 fn xhb r ulong e ulong off ulong to void
-if ge a_gu 7 sub e 1 4
-xaddr r a_g 8 sub e 1
+if ge uchar get a_ar add get a_rb 7 sub e 1 4
+xaddr r get a_ar add get a_rb 8 sub e 1
 else
-xhs r ulong a_gu 4 sub e 1
+xhs r ulong uchar get a_ar add get a_rb 4 sub e 1
 end
 xhs 0 off
 xrr 1 r 0
@@ -16518,7 +16629,7 @@ xword off
 end
 fn xhpath x ulong to void
 xhb 6 a_g 77 add x 20 a_g 77 add x 21
-xhs 2 a_g 77 add x 22
+xhs 2 get a_ar add get a_rb 77 add x 22
 xhcmp 2 4095
 xtrap 8 3
 xsp 1 4096
@@ -16762,8 +16873,8 @@ harg x 3 9
 end
 xhbegin
 xha x 4 7
-xhb 6 e a_g 77 add x 21
-xhs 2 a_g 77 add x 22
+xhb 6 e get a_ar add get a_rb 77 add x 21
+xhs 2 get a_ar add get a_rb 77 add x 22
 nr = ulong 217
 if or eq c 114 eq c 115
 nr = ulong 42
@@ -16829,23 +16940,23 @@ xhdone dst x 0
 end
 fn xhstats c ulong dst ulong x ulong to void
 e = harray x 0
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 a_p 77 add x 25 a_g 77 add x 22
 e = harray x 1
-a_p 77 add x 26 e
+put a_ar add get a_rb 77 add x 26 e
 a_p 77 add x 27 a_g 77 add x 21
 a_p 77 add x 28 a_g 77 add x 22
 a_p 77 add x 20 a_g 77 add x 23
 a_p 77 add x 21 a_g 77 add x 24
 a_p 77 add x 22 a_g 77 add x 25
 xhbegin
-xhs 2 a_g 77 add x 22
+xhs 2 get a_ar add get a_rb 77 add x 22
 xrr 133 2 2
 xtrap 0 3
 xhpath x
-xhb 13 e a_g 77 add x 27
-xhs 2 a_g 77 add x 28
+xhb 13 e get a_ar add get a_rb 77 add x 27
+xhs 2 get a_ar add get a_rb 77 add x 28
 xhcmp 2 128
 xtrap 3 3
 ximm 7 18446744073709551516
@@ -16964,8 +17075,8 @@ else
 e = harray x 1
 harg x 2 9
 xhbegin
-xhb 7 e a_g 77 add x 21
-xhs 6 a_g 77 add x 22
+xhb 7 e get a_ar add get a_rb 77 add x 21
+xhs 6 get a_ar add get a_rb 77 add x 22
 xhcmp 6 8192
 xtrap 8 3
 xrr 137 0 6
@@ -17057,10 +17168,10 @@ xtrap 2 3
 p = xbranch 14
 xpatch p scan
 xpatch found get oc 0
-xhs 1 a_g 77 add x 22
+xhs 1 get a_ar add get a_rb 77 add x 22
 xrr 57 2 1
 small = xbranch 8
-xhb 7 e a_g 77 add x 21
+xhb 7 e get a_ar add get a_rb 77 add x 21
 xrr 137 6 13
 xrr 137 1 2
 emitb 243
@@ -17078,8 +17189,8 @@ if or eq c 128 eq c 135
 harg x 2 8
 end
 xhbegin
-xhb 7 e a_g 77 add x 21
-xhs 6 a_g 77 add x 22
+xhb 7 e get a_ar add get a_rb 77 add x 21
+xhs 6 get a_ar add get a_rb 77 add x 22
 nr = ulong 79
 if eq c 128
 xhcmp 6 8
@@ -17096,23 +17207,23 @@ xhdone dst x 0
 end
 fn xhreadln dst ulong x ulong to void
 e = harray x 0
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 a_p 77 add x 25 a_g 77 add x 22
 e = harray x 1
-a_p 77 add x 26 e
+put a_ar add get a_rb 77 add x 26 e
 a_p 77 add x 27 a_g 77 add x 21
 a_p 77 add x 28 a_g 77 add x 22
 a_p 77 add x 20 a_g 77 add x 23
 a_p 77 add x 21 a_g 77 add x 24
 a_p 77 add x 22 a_g 77 add x 25
 xhbegin
-xhs 2 a_g 77 add x 22
+xhs 2 get a_ar add get a_rb 77 add x 22
 xrr 133 2 2
 xtrap 0 3
 xhpath x
-xhb 2 e a_g 77 add x 27
-xhs 10 a_g 77 add x 28
+xhb 2 e get a_ar add get a_rb 77 add x 27
+xhs 10 get a_ar add get a_rb 77 add x 28
 ximm 7 18446744073709551516
 xrr 137 6 4
 xhcall 267
@@ -17142,8 +17253,8 @@ end
 e = harray x w
 xhbegin
 xha x 2 7
-xhb 2 e a_g 77 add x 21
-xhs 6 a_g 77 add x 22
+xhb 2 e get a_ar add get a_rb 77 add x 21
+xhs 6 get a_ar add get a_rb 77 add x 22
 xhcall add 203 w
 xhdone dst x 0
 end
@@ -17156,8 +17267,8 @@ e = harray x 1
 xhbegin
 xha x 2 7
 xha x 3 6
-xhb 10 e a_g 77 add x 21
-xhs 8 a_g 77 add x 22
+xhb 10 e get a_ar add get a_rb 77 add x 21
+xhs 8 get a_ar add get a_rb 77 add x 22
 ximm 2 0
 xhcmp 8 16
 rd = xbranch 0
@@ -17184,8 +17295,8 @@ xhbegin
 xha x 2 7
 xha x 3 6
 xha x 4 2
-xhb 10 e a_g 77 add x 21
-xhs 8 a_g 77 add x 22
+xhb 10 e get a_ar add get a_rb 77 add x 21
+xhs 8 get a_ar add get a_rb 77 add x 22
 xhcmp 6 1
 tcp = xbranch 1
 for j ulong 5
@@ -17228,8 +17339,8 @@ if eq c 220
 e = harray x 1
 xhbegin
 xha x 4 7
-xhb 10 e a_g 77 add x 21
-xhs 8 a_g 77 add x 22
+xhb 10 e get a_ar add get a_rb 77 add x 21
+xhs 8 get a_ar add get a_rb 77 add x 22
 xhcmp 8 12
 xtrap 3 3
 ximm 6 1
@@ -17249,8 +17360,8 @@ xha x 4 7
 xha x 2 2
 ximm 0 16384
 xrr 9 2 0
-xhb 6 e a_g 77 add x 21
-xhs 8 a_g 77 add x 22
+xhb 6 e get a_ar add get a_rb 77 add x 21
+xhs 8 get a_ar add get a_rb 77 add x 22
 xsp 1 80
 ximm 0 0
 for j ulong 10
@@ -17276,17 +17387,17 @@ if eq c 125
 harg x 2 8
 end
 if eq c 233
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 a_p 77 add x 25 a_g 77 add x 22
 e = harray x 0
-a_p 77 add x 26 e
+put a_ar add get a_rb 77 add x 26 e
 a_p 77 add x 27 a_g 77 add x 21
 a_p 77 add x 28 a_g 77 add x 22
 a_p 77 add x 20 a_g 77 add x 23
 a_p 77 add x 21 a_g 77 add x 24
 a_p 77 add x 22 a_g 77 add x 25
-e = a_g 77 add x 23
+e = get a_ar add get a_rb 77 add x 23
 end
 xhbegin
 note stack: 8192 bytes for renames, link and symlnk; 81920 for execprog; 90112 for execenv (two passes).
@@ -17300,12 +17411,12 @@ end
 pass = ulong 0
 while lt pass hnpass c
 if eq pass 0
-xhb 6 e a_g 77 add x 21
-xhs 2 a_g 77 add x 22
+xhb 6 e get a_ar add get a_rb 77 add x 21
+xhs 2 get a_ar add get a_rb 77 add x 22
 else
 note The slot snapshot is RBX-relative, so the environment slice is read after the RSP move.
 xhb 6 a_g 77 add x 26 a_g 77 add x 27
-xhs 2 a_g 77 add x 28
+xhs 2 get a_ar add get a_rb 77 add x 28
 end
 if eq hplim c pass 1024
 xhcmp 2 65536
@@ -17490,8 +17601,8 @@ harg x 4 8
 if or ne a_g 77 add x 14 3 ne a_g 77 add x 16 3
 fail 9
 end
-acc = a_g 77 add x 15
-mode = a_g 77 add x 17
+acc = get a_ar add get a_rb 77 add x 15
+mode = get a_ar add get a_rb 77 add x 17
 if and ne acc 1 ne acc 3
 fail 9
 end
@@ -17640,10 +17751,10 @@ harg x 0 9
 harg x 1 8
 harg x 2 5
 harg x 3 8
-if ne a_g 77 add x 14 3
+if ne get a_ar add get a_rb 77 add x 14 3
 fail 9
 end
-acc = a_g 77 add x 15
+acc = get a_ar add get a_rb 77 add x 15
 if and ne acc 1 ne acc 3
 fail 9
 end
@@ -17709,11 +17820,11 @@ xha x 3 2
 xrr 57 2 9
 xtrap 8 3
 xrr 41 9 2
-xhs 1 a_g 77 add x 22
+xhs 1 get a_ar add get a_rb 77 add x 22
 xrr 57 1 9
 xtrap 8 3
 xrr 1 8 2
-xhb 7 e a_g 77 add x 21
+xhb 7 e get a_ar add get a_rb 77 add x 21
 xrr 137 6 8
 if eq c 170
 xmem 139 0 13 24
@@ -17741,10 +17852,10 @@ ret
 end
 harg x 1 5
 harg x 2 8
-if ne a_g 77 add x 12 3
+if ne get a_ar add get a_rb 77 add x 12 3
 fail 9
 end
-w = a_g 77 add x 13
+w = get a_ar add get a_rb 77 add x 13
 if and ne w 4 ne w 8
 fail 9
 end
@@ -17805,10 +17916,10 @@ note One compile-time ioctl allowlist is shared by both native Linux backends.
 fn xhreq c ulong x ulong to ulong
 harg x 4 8
 harg x 2 4
-if ne a_g 77 add x 12 3
+if ne get a_ar add get a_rb 77 add x 12 3
 fail 9
 end
-q = a_g 77 add x 13
+q = get a_ar add get a_rb 77 add x 13
 n = ulong 4
 if eq c 166
 if ne q 21531
@@ -17871,21 +17982,21 @@ ret n
 end
 fn xhdev c ulong dst ulong x ulong to void
 n = xhreq c x
-a_p 77 add x 23 n
+put a_ar add get a_rb 77 add x 23 n
 e = harray x 1
 if ne c 171
 xhbegin
-xhs 2 a_g 77 add x 22
-xhcmp 2 a_g 77 add x 23
+xhs 2 get a_ar add get a_rb 77 add x 22
+xhcmp 2 get a_ar add get a_rb 77 add x 23
 xtrap 1 3
 xha x 4 7
 xha x 2 6
-xhb 2 e a_g 77 add x 21
+xhb 2 e get a_ar add get a_rb 77 add x 21
 xhcall 16
 xhdone dst x 0
 ret
 end
-a_p 77 add x 23 e
+put a_ar add get a_rb 77 add x 23 e
 a_p 77 add x 24 a_g 77 add x 21
 a_p 77 add x 25 a_g 77 add x 22
 f = harray x 1
@@ -17893,14 +18004,14 @@ if eq e f
 fail 19
 end
 xhbegin
-xhs 2 a_g 77 add x 25
+xhs 2 get a_ar add get a_rb 77 add x 25
 xhcmp 2 32
 xtrap 1 3
-xhs 9 a_g 77 add x 22
+xhs 9 get a_ar add get a_rb 77 add x 22
 xhcmp 9 1048576
 xtrap 8 3
-xhb 13 e a_g 77 add x 24
-xhb 8 f a_g 77 add x 21
+xhb 13 e get a_ar add get a_rb 77 add x 24
+xhb 8 f get a_ar add get a_rb 77 add x 21
 xrr 133 9 9
 empty = xbranch 0
 xrr 137 2 8
@@ -17968,7 +18079,7 @@ if eq c 198
 fail 25
 end
 x = mul get depth 0 32
-a_p 77 add x 7 get nslot 0
+put a_ar add get a_rb 77 add x 7 get nslot 0
 if and ge c 236 le c 238
 xhsched c dst x
 ret
@@ -18189,9 +18300,11 @@ end
 
 fn xtrap cc ulong code ulong to void
 n = get nt 0
+if ge n get a_gp 10
 a_need 10 n
-a_p 45 n code
-a_p 44 n xbranch cc
+end
+put a_ar add get a_rb 45 n code
+put a_ar add get a_rb 44 n xbranch cc
 put nt 0 add n 1
 if eq get om2m 0 1
 siterec
@@ -18572,12 +18685,14 @@ end
 
 fn xaddr r ulong v ulong to void
 n = get xnaddr 0
+if ge n get a_gp 11
 a_need 11 n
+end
 emitb uchar add 72 shl shr r 3 2
 emitb 141
 emitb uchar add 5 shl and r 7 3
-a_p 46 n get oc 0
-a_p 47 n v
+put a_ar add get a_rb 46 n get oc 0
+put a_ar add get a_rb 47 n v
 put xnaddr 0 add n 1
 xword 0
 end
@@ -18587,11 +18702,11 @@ if or or eq t 1 eq t 10 eq t 11
 fail 7
 end
 i = sub e 1
-ln = a_g 6 i
+ln = get a_ar add get a_rb 6 i
 x = v
 if ne unsz i 0
 x = matreg k v t
-xcmp x ulong a_gu 14 i 0
+xcmp x ulong uchar get a_ar add get a_rb 14 i 0
 xtrap 2 3
 else
 if eq k 3
@@ -18611,9 +18726,9 @@ xtrap 2 3
 end
 end
 put ea_i 0 x
-if ge a_gu 7 i 4
+if ge uchar get a_ar add get a_rb 7 i 4
 b = alloc
-mataddr b a_g 8 i
+mataddr b get a_ar add get a_rb 8 i
 put ea_b 0 b
 else
 put ea_b 0 ulong a_gu 4 i
@@ -18692,10 +18807,10 @@ fail 25
 end
 save
 i = sub e 1
-if ge a_gu 7 i 4
-xaddr 6 a_g 8 i
+if ge uchar get a_ar add get a_rb 7 i 4
+xaddr 6 get a_ar add get a_rb 8 i
 else
-xload 6 ulong a_gu 4 i
+xload 6 ulong uchar get a_ar add get a_rb 4 i
 end
 xmem 139 0 4 mul ro 8
 xrr 1 6 0
@@ -18791,8 +18906,10 @@ fn xleave to void
 if eq get xtarget 0 2
 note UEFI: every exit jumps to the shared firmware return emitted by xefx 1; RAX is the status.
 n = get xnexit 0
+if ge n get a_gp 12
 a_need 12 n
-a_p 48 n xbranch 14
+end
+put a_ar add get a_rb 48 n xbranch 14
 put xnexit 0 add n 1
 ret
 end
@@ -18820,19 +18937,19 @@ while and go lt m 999999
 if ge j n
 go = false
 else
-xpatch a_g 44 j get oc 0
+xpatch get a_ar add get a_rb 44 j get oc 0
 if eq get progmode 0 0
 note Bare units reserve physical R12/R14: recovery stack and immutable runtime table.
 note Host helpers clobber these registers and must remain forbidden in bare units.
 emitb 190
-xword a_g 45 j
+xword get a_ar add get a_rb 45 j
 xb 65 255 102
 emitb 16
 else
 if eq get xtarget 0 2
 ximm 0 or 9223372036854775808 add 100 a_g 45 j
 else
-ximm 0 add 100 a_g 45 j
+ximm 0 add 100 get a_ar add get a_rb 45 j
 end
 xleave
 end
@@ -18862,7 +18979,7 @@ end
 if or ne a_ib 4 101 ne a_ib 5 116
 ret
 end
-if ne a_ib 6 32
+if ne uchar and shr get a_ar 0 48 255 32
 ret
 end
 put cur 0 0
@@ -18881,7 +18998,7 @@ end
 eol
 p = ulong 0
 while lt p get cur 0
-if ne a_ib p 10
+if ne uchar and shr get a_ar shr p 3 shl and p 7 3 255 10
 a_bput 0 p 32
 end
 p = add p 1
@@ -18896,7 +19013,7 @@ f = findfn 1852399981 4 0
 if eq f 0
 fail 16
 end
-if ne a_gu 24 sub f 1 0
+if ne uchar get a_ar add get a_rb 24 sub f 1 0
 fail 9
 end
 entry = get oc 0
@@ -18911,8 +19028,8 @@ ximm 5 0
 end
 emitb 232
 p = get oc 0
-xword sub a_g 22 sub f 1 add p 4
-if eq a_gu 23 sub f 1 12
+xword sub get a_ar add get a_rb 22 sub f 1 add p 4
+if eq uchar get a_ar add get a_rb 23 sub f 1 12
 ximm 0 0
 end
 xleave
@@ -18935,8 +19052,8 @@ while and go lt m 999999
 if ge i get xnaddr 0
 go = false
 else
-p = a_g 46 i
-v = a_g 47 i
+p = get a_ar add get a_rb 46 i
+v = get a_ar add get a_rb 47 i
 if efi
 note PE: code RVA = file offset + 3584; static data lives in the bss section at xbss.
 if ge v 268435456
@@ -19433,7 +19550,7 @@ if ne get xtarget 0 2
 fail 25
 end
 x = mul get depth 0 32
-a_p 77 add x 7 get nslot 0
+put a_ar add get a_rb 77 add x 7 get nslot 0
 op = lenval 4
 if gt op 14
 fail 25
@@ -19445,8 +19562,8 @@ note (UEFI 2.3.4.2), and the caller's R14 waits in the snapshot tail beside R13.
 xhbegin
 xmem 137 14 3 152
 xrr 137 14 3
-xhb 12 e a_g 77 add x 21
-xhs 13 a_g 77 add x 22
+xhb 12 e get a_ar add get a_rb 77 add x 21
+xhs 13 get a_ar add get a_rb 77 add x 22
 xha x 2 3
 note Firmware runs on the owned stack: reserve 64 KiB (trap 6), then align RSP for UEFI 2.3.4.2.
 xcheck 65536
