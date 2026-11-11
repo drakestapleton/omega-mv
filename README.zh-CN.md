@@ -1,5 +1,9 @@
 # OMEGA（.om 或 .omg）
 
+<!-- languages -->
+[English](README.md) · **简体中文**
+<!-- /languages -->
+
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23547810.svg)](https://doi.org/10.5281/zenodo.23547810) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23644702.svg)](https://doi.org/10.5281/zenodo.23644702) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23614483.svg)](https://doi.org/10.5281/zenodo.23614483)
 论文：[Omega](https://doi.org/10.5281/zenodo.23547810)、[词元即指令](https://doi.org/10.5281/zenodo.23644702)、[致全人类的呼吁](https://doi.org/10.5281/zenodo.23614483) · 作者：Drake Stapleton <a href="https://orcid.org/0009-0002-6890-7111"><img src="https://orcid.org/assets/vectors/orcid.logo.icon.svg" alt="ORCID iD" width="16" height="16"></a>
 
