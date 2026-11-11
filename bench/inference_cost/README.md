@@ -343,3 +343,39 @@ The rates:
 | `task20` | `rot_left_u32` | 32-bit left rotation |
 
 Each `statement.txt` is language-neutral; the per-language signature is added to the user prompt.
+
+## Reusing the referee (DRA-122)
+
+Training-data admission reuses the same assembly, hidden inputs, exact-output comparison and mandatory
+bubblewrap compiler/runtime sandboxes as benchmark attempts. It does not trust an old attempt verdict.
+
+```sh
+sh bench/inference_cost/driver.sh --verify-candidate om task01 \
+  "$PWD/bench/inference_cost/tasks/task01/reference.om" "$PWD/build/referee-new"
+sh bench/inference_cost/driver.sh --task-set-sha256
+seed/out/omc < bench/inference_cost/verify-test.om > build/verify-test
+chmod +x build/verify-test
+build/verify-test "$PWD" "$PWD/build/verify-test-new"
+```
+
+The referee interface takes exactly LANG TASK_ID CANDIDATE ABS_WORK. LANG is om/c/py/rs; TASK_ID
+must be an existing taskNN identity, not a path. Both paths must be absolute and traversal-free,
+with no symlink component; CANDIDATE must be a regular file and ABS_WORK absent or an empty real
+directory. ABS_WORK is claimed atomically and never reused. Its eval/ child retains the assembled
+source, compiler diagnostics, stdout and sandbox readiness receipts. No model is called.
+
+Statuses are 0 verified now, 1 compiled/run result did not verify (including compiler refusal),
+2 refused arguments/paths, and 3 NOT_RUN (pin, dependency or sandbox unavailable). The printed
+COMP_RC/RUN_RC/VERIFIED line is evidence about this execution, not an old verdict. The digest mode
+uses exactly task_set_sha256(), the same definition written into run.txt; it takes no arguments.
+
+verify-test.om exercises all four languages, wrong results, compiler refusal, unknown language/task,
+traversal, candidate symlink, relative candidate, reused work, wrong compiler and unavailable sandbox.
+Its three source-removal mutants must be caught: accepting wrong results, accepting task traversal,
+and skipping the preflight sandbox check. The existing --check-tasks and --self-test modes retain
+their prior contracts and checks.
+
+These modes are part of the existing shell driver, still awaiting migration. The seeded-Omega
+namespace/mount, process-tree and descriptor supervisor successor is **not yet written**. The
+first-party dataset admission/serialization tool lives in aien-train/tools/verified_examples;
+it does not duplicate this sandbox or claim the shell dependency is Omega.
