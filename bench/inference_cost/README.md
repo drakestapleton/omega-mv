@@ -67,8 +67,11 @@ digests were given different tasks or prompts and are not comparable.
 
 ## Not run yet
 
-- **Every real-model number is NOT_RUN.** No real endpoint has been measured with this harness: the
-  self-test talks only to `fake_model.om`.
+- **No complete real-model run exists.** The first real run (2026-11-11, `qwen3.6-35b-a3b-fp8` on the
+  local endpoint, this driver at `3ab566f8`) ended NOT_RUN when the endpoint stopped answering. Seven
+  of its eight (language, arm) groups had finished and are filed as a partial result in benchmarks-mv
+  (`rad:z2nYCN9XZAPjNohqT8bz46rcs9zvZ`, commit `1031e01a`, `evidence/inference-cost-qwen36-20261111/`).
+  The three-run result and the frontier line are NOT_RUN (no authorized frontier endpoint).
 - Wall time in the self-test is the fake model's latency plus local compile and run time. It says
   nothing about inference speed.
 
