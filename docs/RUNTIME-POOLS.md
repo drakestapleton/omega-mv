@@ -2,7 +2,8 @@
 
 Status: landing 1 (the omc-only words of section 6, gates 1-11 of section 7 and the server case of
 section 11) IMPLEMENTED in `seed/omc/omc.om`, gate `seed/omc/gate-pools.sh`, OMEGESE 9.15. Landing 2
-(om4 and the growing compiler arena, gates 12-14) PROPOSED, not implemented. Revision 2 takes in the
+(om4 and the growing compiler arena, gates 12-14) PROPOSED, not implemented; amended 2026-11-11 (section 6,
+"The memory ceiling"): the growing arena refuses past a caller-stated real-memory ceiling, `OMC_MEMORY_MAX`. Revision 2 takes in the
 independent design review (consult-codex, 2026-11-11, findings B1-B2, S1-S8, N1-N4; recorded in section
 10). Implementation notes (landing 1): `enlarge` is keyword id 244 (above ng's 241..243); a host refusal
 returns the host's negative errno, in practice -12 (ENOMEM), the only refusal these mmap and mremap calls can
@@ -184,8 +185,81 @@ Staging, two landings:
 2. **om4 learns the minimal subset**, then omc.om declares `global a_ar ulong *` and enlarges it in
    `a_need` (doubling). The static 128 MiB arena and its RLIMIT_AS bound go away, and omc's image shrinks
    by 128 MiB of `.bss`. The new boundary is the machine's. A refused `enlarge` is error 14 with the
-   omc-use record (`full=1`, now meaning "the host refused"). Physical exhaustion under a cgroup limit is
-   an OOM kill, as for any touched page today.
+   omc-use record (`full=1`, now meaning "the host refused"). Under a cgroup memory limit the host never
+   refuses; the memory ceiling below turns that case into the same error 14.
+
+**The memory ceiling (amendment, 2026-11-11; Main: "refusals stay defined").** Reason, measured on the Spark
+with the landing-2 compiler (omc 59d7cb5e) and the 87,019,650-byte first-user unit (section 11), which peaks
+at 557,184 KiB resident (GNU time; cgroup memory.peak 573,169,664 bytes, of which anon 570,486,784, kernel
+1,826,816, page tables 1,658,880):
+- under `prlimit --as=268435456` it is a clean error 14 with `full=1` in about 1 s: RLIMIT_AS makes mremap
+  fail, and the arena's growth is refused;
+- under `systemd-run --user --scope -p MemoryMax=536870912 -p MemorySwapMax=0` it is not refused: pages are
+  charged when they are touched, so mmap and mremap never fail inside a cgroup. The kernel reclaimed and
+  refaulted omc's own file pages (D state; at 105 s memory.events max=333531, oom_kill=0,
+  workingset_refault_file 10869949, pgmajfault 346042) for about 175 s and then the memcg OOM killer ended
+  it (SIGKILL, exit 137; 1 min 2.9 s of CPU, no output). The design review's run of the same case was killed
+  after 2.36 s: the outcome is an OOM kill either way, after a delay that varies;
+- with MemoryMax=1073741824 it compiles and the round trip `cmp`s.
+
+RLIMIT_AS bounds address space, not memory, and decision 2 asks the sandboxes to move to real-memory limits
+(cgroup `memory.max`), where the growing arena would be killed or stalled rather than refused. So:
+
+- **The rule.** When a real-memory ceiling C (bytes) is known, the arena's bytes A after a growth, the bytes O
+  of output staged so far (the out region; written to a file, the artifact is page cache charged to the same
+  cgroup, dirty until written back) and the margin M (on the length after the growth) stay within C:
+  A + O + M <= C. a_grow takes twice the arena's length, or what the tables need when that is more, capped at
+  the largest length that keeps the rule; when even what the tables need does not fit under the cap, the
+  growth is refused exactly as a host refusal is: a_need compacts, grows the group in place to the largest size
+  that fits, and only then is the unit error 14 with the omc-use record, `full=1`. The output also grows inside
+  its region with no arena growth to check, so before the artifact is written omc checks once more, with the
+  most arena words ever handed out (the pages above them were never touched; a compaction lowers the words
+  handed out, not the pages it touched) in place of A and the whole artifact as O; past C the unit is error
+  14 `full=1` on its last line and nothing is written. Measured (review, and again with stdout on an ext4
+  file): with the arena alone counted, MemoryMax at the compile's peak + 4 MiB and + 1 MiB was still
+  OOM-killed in about 2.4 s while the artifact was being written. The record gains one
+  last field, `ceiling=C` (0 when none is known), after the groups; readers take fields by name (gate-usage
+  treats it as a group holding 0 words, which no threshold trips). Without a known ceiling the arena grows
+  until the host refuses, as designed above.
+- **The margin.** M = 16 MiB + (arena bytes) / 128. What is resident beyond the arena's touched words is
+  omc's image (read/write part at most 11,196,912 bytes, `memsz` 0xaad9f0, the 8 MiB stack pool included;
+  resident on a tiny unit about 0.4 to 0.6 MiB), its file (750,532 bytes), and kernel memory charged to the
+  cgroup, mostly page tables: measured 1,826,816 bytes on the first-user unit, 1,474,560 on 1,500,000
+  globals and 548,864 on a 64 MiB input, which is 1/441, 1/546 and 1/183 of their final arena bytes, so
+  arena / 128 bounds it. The arena's touched words are at most its length, and after a doubling usually
+  far less (first-user unit: 570 MB resident against an arena of 805,371,904 bytes). The fixed 16 MiB covers
+  the image and text with about 4 MiB left for reclaim of clean page cache; measured: with MemoryMax set
+  1 MiB, 4 MiB, 8 MiB and 20 MiB above that unit's own peak, it compiles in 2.1 to 2.7 s (2.09 s with no
+  limit), oom_kill 0. A file on omc's stdin is page cache charged to the cgroup that read it; it is clean and
+  reclaimable and does not count toward the rule.
+- **Why the environment and not a lead line.** A lead line (as `usage`, `om2 diag`, read by chk_mode) would
+  cost om4 nothing, but omc reads the whole input into the arena (region 0, a_rdin) before it reads any line,
+  and the input can itself be the largest region (gate 13's 512 MiB input): the ceiling must be known before
+  the input is read, which a line of that input cannot do.
+- **The explicit form (this landing).** The environment variable `OMC_MEMORY_MAX`: decimal bytes, 1 to 19
+  digits, no sign or spaces, read once when omc starts, before the input, with `envcnt` and `envread`
+  (OMEGESE 10, omc host words); the first entry named `OMC_MEMORY_MAX` wins. Absent, empty or `0`: no ceiling.
+  Anything else (a non-digit, a sign or space, more than 19 digits, or 2^63 and above) is error 26 on line 0
+  before any input is read, so a caller's typo is loud rather than an unbounded compile. Code 26 was unused;
+  it becomes an io-class row of `seed/omc/error-codes.reg` like 1 and 2 (the compiler's environment, not a
+  language input; gate15 case), and row 14's meaning names the ceiling. A ceiling too small for the first
+  room is error 14 `full=1` at the first growth. omc.om must stay inside om4's language (spec C3), so om4
+  learns `envcnt` and `envread` with words byte-identical to omc's in an OM-1 unit, as it learned the pool
+  subset (omc's lowering is about 90 lines of omc.om, about 60 machine words with its argument and range
+  checks; estimate 150 to 300 lines of `om4.s`, MODELED). Units compile to the same bytes with or without
+  the variable; it changes only whether a large one is refused.
+- **The automatic form (successor, not now).** Reading `/proc/self/cgroup`, then `memory.max` and
+  `memory.swap.max` under `/sys/fs/cgroup`, would find the ceiling without the caller. It needs `fopen` and
+  `read` on a path in omc.om, so om4 must also learn `fopen`; sandboxes may hide `/proc` or the cgroup files
+  (bwrap `--unshare-all` without a cgroup mount), so the explicit form stays the contract and the automatic
+  one only fills in when the variable is absent.
+- **The sandboxes.** The interplane-forge salvage compile (`prlimit --as=268435456`), the omega-mcp compile
+  (`--as=536870912`) and forged (`--as=4294967296`) keep a clean error 14 from RLIMIT_AS with nothing to
+  change. bench/inference_cost (`driver.sh` `mem_scope`, MemoryMax 536870912 with swap 0 since 15760b50) is
+  the case this fixes: its sandboxed compiles run under `bwrap --clearenv`, so the driver must add
+  `--setenv OMC_MEMORY_MAX "$MEM_MAX"` (minus whatever else shares the scope) to get error 14 in place of a
+  thrash and a kill. Every caller that clears the environment (`bwrap --clearenv`, `execenv`, `execpure`)
+  passes the variable explicitly; each owner makes that change.
 
 ## 7. Gates, all with negative controls (S7)
 
@@ -222,7 +296,16 @@ Staging, two landings:
     audit pass.
 13. **The arena (landing 2).** gate-nocaps units far past 128 MiB (a 512 MiB input) compile and run. Under
     `prlimit --as` set too low the result is error 14 with `full=1`. The forged salvage compile, under
-    `prlimit --as=268435456`, still passes every unit it passes today.
+    `prlimit --as=268435456`, still passes every unit it passes today. The memory ceiling (section 6): under
+    `systemd-run --user --scope -p MemoryMax=C -p MemorySwapMax=0` with `OMC_MEMORY_MAX=C` and stdout on a
+    real file, the first-user unit at C = 256 MiB and 512 MiB is error 14 `full=1` with `ceiling=C`,
+    oom_kill 0 in memory.events and a wall time under 30 s (the unconstrained compile takes about 2.5 s);
+    at a sufficient C it compiles and round-trips (`cmp`); a capped doubling that still fits compiles (a
+    unit whose doubled arena would pass C, at a C between its need and the doubled size); the `ceiling=`
+    field parses in gate-usage; the malformed values (a non-digit, a sign, 20 digits, 2^63) are error 26 on
+    line 0, and empty and 0 mean no ceiling. Mutants: the ceiling ignored, and the margin made too small,
+    each caught (killed, or past the 30 s bound). Without `systemd-run --user` those rows are NOT_RUN and
+    the variable is still checked under `prlimit --as`.
 14. **The alarm, redefined (S6).** Once the arena grows to fit, "top / arena" is near 50 to 100 percent
     by construction. gate-usage then alarms on absolute words in use per group and in all, on compile
     time and on RSS, measured on the largest real units. Its mutant control is a table growth in `a_need`
