@@ -37,7 +37,8 @@ note Ask row (first for a question) and does ask the model: the line ends " answ
 note answer came. With HOPCHECK=idle it types nothing and sends Enter on the first offer; HOPFRONT=ID then stands for
 note the app in front. With HOPRECORD set as well, a check that opens nothing still remembers what Enter chose,
 note and puts a chosen copied thing on a board of its own (the line then ends " pasted " and what is on it).
-note A check reaches no other machine but through HOPSSH and HOPSCP, its stand-ins for ssh and scp, and HOPLATE sends Enter late, when
+note A check reaches no other machine but through HOPSSH and HOPSCP, its stand-ins for ssh and scp (HOPSSH is
+note also what a check starts in place of ssh for a forwarded port), and HOPLATE sends Enter late, when
 note they have answered. With HOPCHECK=agent:TEXT a check sends TEXT to the agent of the settings and waits for it to end; with
 note HOPAGENTS it first says each agent's command as it would be run.
 note HOPASK2 is a second question a check asks in the same conversation once the first is answered; with
@@ -352,6 +353,25 @@ text x_env_clipkey "HOPCLIPKEY"
 text x_env_row "HOPROW"
 text x_env_vault "HOPVAULT"
 text x_env_cliprec "HOPCLIPREC"
+text x_real_ssh "/usr/bin/ssh"
+text x_tunnel_args "-N|-o|ControlMaster=no|-o|ControlPath=none|-o|BatchMode=yes|-o|ExitOnForwardFailure=yes|-o|ServerAliveInterval=15|-o|ServerAliveCountMax=3|-o|ConnectTimeout=8|-L"
+text x_loopback "127.0.0.1:"
+text k_tunnels "tunnels"
+text k_local_port "localPort"
+text k_remote_port "remotePort"
+text k_ssh_host "sshHost"
+text k_cortex "cortex"
+text k_enabled "enabled"
+text k_url "url"
+text k_host "host"
+text m_url_port "port"
+text m_is_executable "isExecutableFileAtPath:"
+text m_all_values "allValues"
+text s_socket "socket"
+text s_connect "connect"
+text s_close "close"
+text s_will_terminate "NSApplicationWillTerminateNotification"
+text m_app_quit "appQuit:"
 text x_env_menu "HOPMENU"
 text x_status_symbol "bolt.horizontal.circle"
 text x_status_open "Open Hop Omega (Option Space)"
@@ -881,7 +901,7 @@ note machines 50 the bytes of what the machines answered 51 what to say about a 
 note its list, 3 a file is on its way, 4 a path was copied, 5 a file could not be brought) 52 which machine
 note 53 the bytes of the text the machines were asked for 54 the count of machines 55 1 when a check's file
 note arrived 56 the machine and 57 the found file that is on its way 58 1 when a file found on a machine has exactly the typed name
-note 59 1 when other machines may be reached
+note 59 1 when other machines may be reached 60 half seconds since the forwarded ports were last looked at
 global g_n ulong 64
 note g_t: the text HOPCHECK=open:TEXT asks to type
 global g_t uchar 64
@@ -926,7 +946,9 @@ note 42 the ssh names of the machines (an array), 43 the program asking the mach
 note read, 45 the program bringing a file over, 46 to 48 the selectors remoteGo: remoteDone: fetchDone:,
 note 49 where the fetch's answer is read, 50 where the file that is on its way lands (a path), 51 its
 note machine's ssh name and path, for the clipboard, 52 the icon in the menu bar, 53 its Open at login item,
-note 54 to 59 the selectors menuOpen: menuIndex: menuPaste: menuLogin: menuSettings: menuClear:.
+note 54 to 59 the selectors menuOpen: menuIndex: menuPaste: menuLogin: menuSettings: menuClear:,
+note 60 the forwarded ports to keep open (each: this Mac's port, the far port, the ssh name), 61 the programs
+note that hold them open (by this Mac's port), 62 the selector appQuit:.
 note g_net: bytes from the server not yet read as lines
 global g_m ulong 64
 global g_net uchar 262144
@@ -951,6 +973,8 @@ global g_cm ulong 1024
 global g_ca uchar 256
 note eight bytes a library function writes a pointer into
 global g_t8 uchar 8
+note an address for asking whether a port of this Mac is open (16 bytes, as connect wants it)
+global g_sa uchar 16
 note Files on other machines. g_rb: what the machines answered (lines "K:path", K the machine's number); g_rq:
 note the text they were asked for; g_ro, g_rl, g_rs, g_rw: the best 64 found, best first (where the path starts in
 note g_rb, its length, its score plus 100000, its machine); g_mn and g_ml: the machines' names
@@ -7100,6 +7124,7 @@ ret
 end
 uagentconfig config
 umachines config
+utunnelsload config
 put g_n 34 500
 limit_number = ukeyed config k_limit
 if ne limit_number 0
@@ -10448,10 +10473,19 @@ if ne image 0
 x = umsg button usl m_set_image image 0 0
 end
 x = umsg item usl m_set_item_menu menu 0 0
+center = umsg ucl c_center usl m_default_center 0 0 0
+s_observe = usl m_add_observer
+quitting = uconst s_will_terminate
+upr 40 0
+x = umsg center s_observe get g_o 27 get g_m 62 quitting
 end
 
 note what the menu of the icon tells this program (which: the selector); true when it was one of its
 fn ustatusevent which ulong to bool
+if eq which get g_m 62
+utunnelstop
+ret true
+end
 if eq which get g_m 54
 ushow
 ret true
@@ -10493,6 +10527,238 @@ put g_m 56 usl m_menu_paste
 put g_m 57 usl m_menu_login
 put g_m 58 usl m_menu_settings
 put g_m 59 usl m_menu_clear
+ret ok
+end
+
+note ---- forwarded ports: the ssh links Hop keeps open (Sources/Factory.swift, TunnelManager) ----
+note Hop's settings name ports of other computers to have on this Mac (a model's server, the factory, the
+note knowledge base). At the start and every 20 seconds each one whose link is not running is looked at: when
+note nothing on this Mac serves its port, ssh is started for it with Hop's own options (a link of its own, never
+note the shared connection, so it ends cleanly). A port something else serves is left alone, and so Hop and this
+note program do not fight over one. When this program quits it ends its links. Not here yet: dropping the links
+note at once when the network changes (ssh notices by itself within 45 seconds, and the link is made anew).
+note the whole number an object of the settings holds (0 when it is not a number)
+fn uwhole obj ulong to ulong
+if eq obj 0
+ret 0
+end
+if eq and umsg obj usl m_is_kind ucl c_number 0 0 255 0
+ret 0
+end
+ret umsg obj usl m_integer_value 0 0 0
+end
+
+note one forwarded port to keep: added to list when both ports are ports, the ssh name is there, and this Mac's
+note port is not in the list already
+fn utunneladd list ulong local ulong remote ulong host ulong to void
+if or or eq local 0 gt local 65535 or eq remote 0 gt remote 65535
+ret
+end
+if not uiskind host 9
+ret
+end
+if eq umsg host usl m_length 0 0 0 0
+ret
+end
+sat = usl m_at
+s_whole = usl m_integer_value
+cnt = umsg list usl m_count 0 0 0
+for i ulong cnt bound 256
+if eq umsg umsg umsg list sat i 0 0 sat 0 0 0 s_whole 0 0 0 local
+ret
+end
+end
+entry = umsg ucl c_mutable_array usl m_array 0 0 0
+sadd = usl m_add_object
+c_n_v = ucl c_number
+s_number = usl m_number_integer
+x = umsg entry sadd umsg c_n_v s_number local 0 0 0 0
+x = umsg entry sadd umsg c_n_v s_number remote 0 0 0 0
+x = umsg entry sadd host 0 0
+x = umsg list sadd entry 0 0
+end
+
+note the forwarded ports of the settings: the ones named there, and the one to the knowledge base when it runs
+note on another computer
+fn utunnelsload config ulong to void
+links = umsg ucl c_mutable_array usl m_array 0 0 0
+if ne config 0
+named = ukeyed config k_tunnels
+if uiskind named 8
+sat = usl m_at
+cnt = umsg named usl m_count 0 0 0
+for i ulong cnt bound 256
+t = umsg named sat i 0 0
+if uiskind t 7
+utunneladd links uwhole ukeyed t k_local_port uwhole ukeyed t k_remote_port ukeyed t k_ssh_host
+end
+end
+end
+cx = ukeyed config k_cortex
+if uiskind cx 7
+if uyes ukeyed cx k_enabled
+address = ukeyed cx k_url
+if uiskind address 9
+url = umsg ucl c_url usl m_urlstr address 0 0
+if ne url 0
+utunneladd links uwhole umsg url usl m_url_port 0 0 0 uwhole ukeyed cx k_remote_port ukeyed cx k_host
+end
+end
+end
+end
+end
+if ne get g_m 60 0
+x = umsg get g_m 60 usl m_release 0 0 0
+end
+put g_m 60 umsg links usl m_retain 0 0 0
+if eq get g_m 61 0
+running = umsg ucl c_mutable_dict usl m_dictionary 0 0 0
+put g_m 61 umsg running usl m_retain 0 0 0
+end
+end
+
+note does something on this Mac serve the port
+fn uportopen port ulong to bool
+f_socket = usym s_socket
+f_connect = usym s_connect
+f_close = usym s_close
+if or or eq f_socket 0 eq f_connect 0 eq f_close 0
+ret true
+end
+for i ulong 16
+put g_sa i 0
+end
+put g_sa 0 16
+put g_sa 1 2
+high = div port 256
+put g_sa 2 uchar high
+put g_sa 3 uchar sub port mul high 256
+put g_sa 4 127
+put g_sa 7 1
+upr 0 2
+upr 8 1
+upr 16 0
+fd = and ucallf f_socket 4294967295
+if ge fd 2147483648
+ret true
+end
+upr 0 fd
+upr 8 ulong libptr g_sa 0 16
+upr 16 16
+answer = and ucallf f_connect 4294967295
+upr 0 fd
+x = ucallf f_close
+ret eq answer 0
+end
+
+note start the ssh link for one forwarded port (a check starts its stand-in, never ssh itself)
+fn utunnelstart local ulong remote ulong host ulong to void
+tool = uns x_real_ssh
+if eq get g_n 14 0
+n = ucs x_env_ssh
+upr 0 ulong libptr g_nm 0 1024
+given = ucall 9
+if eq given 0
+ret
+end
+n = ufetch given
+tool = unsb
+end
+manager = umsg ucl c_file_manager usl m_default_manager 0 0 0
+if eq and umsg manager usl m_is_executable tool 0 0 255 0
+ret
+end
+arguments = umsg uwords x_tunnel_args usl m_mutable_copy 0 0 0
+p = uptxt 0 x_loopback
+p = upnum p local
+put g_nm p 58
+p = uptxt add p 1 x_loopback
+p = upnum p remote
+put g_nm p 0
+forward = unsb
+sadd = usl m_add_object
+x = umsg arguments sadd forward 0 0
+x = umsg arguments sadd host 0 0
+task = umsg umsg ucl c_task usl m_alloc 0 0 0 usl m_init 0 0 0
+x = umsg task usl m_set_launch tool 0 0
+x = umsg task usl m_set_arguments arguments 0 0
+quiet = umsg ucl c_file_handle usl m_null_device 0 0 0
+x = umsg task usl m_set_output quiet 0 0
+x = umsg task usl m_set_error quiet 0 0
+x = umsg task usl m_set_input quiet 0 0
+x = umsg task usl m_launch 0 0 0
+c_n_v = ucl c_number
+s_number = usl m_number_integer
+port_key = umsg c_n_v s_number local 0 0
+x = umsg get g_m 61 usl m_set_object task port_key 0
+end
+
+note look at every forwarded port: one whose link is not running and whose port nothing serves gets its link
+fn utunnelcheck to void
+links = get g_m 60
+if or eq links 0 eq get g_m 61 0
+ret
+end
+if not uremoteok
+ret
+end
+sat = usl m_at
+s_whole = usl m_integer_value
+s_keyed = usl m_object_for_key
+s_running = usl m_is_running
+c_n_v = ucl c_number
+s_number = usl m_number_integer
+cnt = umsg links usl m_count 0 0 0
+for i ulong cnt bound 256
+entry = umsg links sat i 0 0
+local = umsg umsg entry sat 0 0 0 s_whole 0 0 0
+remote = umsg umsg entry sat 1 0 0 s_whole 0 0 0
+host = umsg entry sat 2 0 0
+port_key = umsg c_n_v s_number local 0 0
+task = umsg get g_m 61 s_keyed port_key 0 0
+alive = false
+if ne task 0
+alive = eq and umsg task s_running 0 0 0 255 1
+end
+if not alive
+if not uportopen local
+utunnelstart local remote host
+end
+end
+end
+end
+
+note twice a second: every 20 seconds, and half a second after the start, the forwarded ports are looked at
+fn utunneltick to void
+ticks = get g_n 60
+put g_n 60 add ticks 1
+if eq sub ticks mul div ticks 40 40 0
+utunnelcheck
+end
+end
+
+note this program is quitting: its links end with it
+fn utunnelstop to void
+if eq get g_m 61 0
+ret
+end
+tasks = umsg get g_m 61 usl m_all_values 0 0 0
+sat = usl m_at
+s_running = usl m_is_running
+s_end = usl m_terminate_task
+cnt = umsg tasks usl m_count 0 0 0
+for i ulong cnt bound 256
+task = umsg tasks sat i 0 0
+if eq and umsg task s_running 0 0 0 255 1
+x = umsg task s_end 0 0 0
+end
+end
+end
+
+note hear when this program is about to quit (appQuit:)
+fn uquitwatch mine ulong to bool
+ok = umethod mine m_app_quit 13 t_v
+put g_m 62 usl m_app_quit
 ret ok
 end
 
@@ -11543,6 +11809,7 @@ end
 note twice a second: when the clipboard has changed and Hop is not there to keep the history, this program does
 fn ucliptick to void
 uindextick
+utunneltick
 pb = umsg ucl c_pasteboard usl m_general_pasteboard 0 0 0
 cc = umsg pb usl m_change_count 0 0 0
 if eq cc get g_n 35
@@ -12341,6 +12608,7 @@ put g_m 40 usl m_agent_end
 put g_m 41 usl m_agent_stop
 ok = and ok umoremethods mine
 ok = and ok ustatusmethods mine
+ok = and ok uquitwatch mine
 uchecklate
 if not ok
 ret 6
@@ -12550,6 +12818,7 @@ end
 end
 if eq i 2
 ustatus
+utunnelcheck
 end
 if eq i get g_n 48
 ed = umsg fld sed 0 0 0
