@@ -380,8 +380,9 @@ Wolfram checks (MODELED encoding and constant arithmetic; the words are also che
 - The largest finite f32: `IntegerString[bits32[(2 - 2^-23) 2^127], 16]` and `IntegerString[16^^7f800000 - 1, 16]`
   both gave `"7f7fffff"` (`a6_fsat` subtracts 1 from the infinity's bits).
 
-Not here: `fload`/`fstore` (no STRUCT field access in the back end for any type), f16/bf16/fp8, `fmath`, vector
-floats and float atomics stay refused (exit 5). `fill` of f32/f64 elements is section 10.
+Not here: `fload`/`fstore` (no STRUCT field access in the back end for any type), f16/bf16/fp8, `fmath`, integer
+vectors, vectors wider than 16 bytes, `vinsert`/`vreduce`, and float atomics stay refused (exit 5). `fill` of f32/f64
+elements is section 10; 128-bit packed `vec f32 4` and `vec f64 2` are section 12.
 
 **Gates** (section 6): `gate.om` adds FCSEL S/D and MSR FPCR cases plus the float operand shapes (FPCR value, exponent
 extracts, D pairs and spills) and two refusals; `rgate.om` adds the float ngrun fixtures, x-float to the front phase,
@@ -473,3 +474,77 @@ are caught (badfd 247 for 9; gtext prints nothing). `a64/gate.om` passes on this
 and write (the Hop matcher and a stdin batch driver) answered 40610 of 40610 cases as its Swift reference. NOT_RUN:
 floats on macOS, globals over 16 KiB, a control for the start code and for the exit call (a wrong exit number is
 another system call, so it is not run as a mutant). The Mac run is not part of gate or rgate, which run on Linux.
+
+## 12. Packed 128-bit float vectors (`vec f32 4`, `vec f64 2`; NgVecA64)
+
+Scope: the two 16-byte Advanced SIMD packed IEEE-754 vector types `vec f32 4` (`i_tk = 1, i_t1 = 13, i_t2 = 4`,
+arrangement `.4S`) and `vec f64 2` (`i_tk = 1, i_t1 = 14, i_t2 = 2`, arrangement `.2D`) in `seed/ng/src/a64.om` and the
+differential reference interpreter `seed/ng/ngrun.om` (`r_v[k]` low 64 bits = lanes 0..1 of `f32` or lane 0 of `f64`,
+`r_w[k]` high 64 bits = lanes 2..3 of `f32` or lane 1 of `f64`). Integer vectors, half/brain-float vectors, 32B/64B
+vectors, and vector `div`/`min`/`max`/`select`/`vinsert`/`vreduce` stay refused (`a64: unsupported K`, exit 5); an
+integer compare followed by `select` of a `VEC` is excluded from compare fusion in `a6_cuse` (`not a6_isvv`) so it
+hits `a6_unsup 2` cleanly (`tests/oir/u-selvec.oir`).
+
+### Encodings (Arm DDI 0487, C7.2)
+
+| Form | Mnemonic | Base word | Fields |
+|---|---|---|---|
+| `a_strq` (165) | `STR Qt, [Xn, #imm12*16]` | `0x3d800000` | `Rt[4:0]`, `Rn[9:5]`, `imm12[21:10]` (`0..4095`) |
+| `a_ldrq` (166) | `LDR Qt, [Xn, #imm12*16]` | `0x3dc00000` | `Rt[4:0]`, `Rn[9:5]`, `imm12[21:10]` (`0..4095`) |
+| `a_ldrqr` (167) | `LDR Qt, [Xn, Xm]` | `0x3ce06800` | `Rt[4:0]`, `Rn[9:5]`, `Rm[20:16]`, `S = 0` (`c = 0`, unscaled byte offset; `c = 1` refused) |
+| `a_orr16b` (168) | `ORR Vd.16B, Vn.16B, Vm.16B` | `0x4ea01c00` | `Rd[4:0]`, `Rn[9:5]`, `Rm[20:16]` (`Vn = Vm` disassembles as `MOV Vd.16B, Vn.16B`) |
+| `a_dupv4s` (169) | `DUP Vd.4S, Vn.S[0]` | `0x4e040400` | `Rd[4:0]`, `Rn[9:5]` |
+| `a_dupv2d` (170) | `DUP Vd.2D, Vn.D[0]` | `0x4e080400` | `Rd[4:0]`, `Rn[9:5]` |
+| `a_dups` (171) | `DUP Sd, Vn.S[idx]` | `0x5e040400` | `Rd[4:0]`, `Rn[9:5]`, `idx[20:19]` (`0..3`, `imm5 = (idx << 3) | 4`) |
+| `a_dupd` (172) | `DUP Dd, Vn.D[idx]` | `0x5e080400` | `Rd[4:0]`, `Rn[9:5]`, `idx[20]` (`0..1`, `imm5 = (idx << 4) | 8`) |
+| `a_fadd4s` / `a_fadd2d` (173, 174) | `FADD Vd.4S/2D, Vn, Vm` | `0x4e20d400` / `0x4e60d400` | `Rd[4:0]`, `Rn[9:5]`, `Rm[20:16]`, `sz[22] = 0/1` |
+| `a_fsub4s` / `a_fsub2d` (175, 176) | `FSUB Vd.4S/2D, Vn, Vm` | `0x4ea0d400` / `0x4ee0d400` | `Rd[4:0]`, `Rn[9:5]`, `Rm[20:16]`, `sz[22] = 0/1` |
+| `a_fmul4s` / `a_fmul2d` (177, 178) | `FMUL Vd.4S/2D, Vn, Vm` | `0x6e20dc00` / `0x6e60dc00` | `Rd[4:0]`, `Rn[9:5]`, `Rm[20:16]`, `sz[22] = 0/1` |
+| `a_fmla4s` / `a_fmla2d` (179, 180) | `FMLA Vd.4S/2D, Vn, Vm` | `0x4e20cc00` / `0x4e60cc00` | `Rd[4:0]`, `Rn[9:5]`, `Rm[20:16]`, `sz[22] = 0/1` |
+
+### Lowering, AAPCS64 Call-Clobber Rule, and Stack Alignment
+
+- **Operations (`a6_svec`)**:
+  - `58 vload`: `REF` to `ARRAY` or `SLICE` of `f32`/`f64`. When the element index `iv` is a constant whose byte offset
+    `idx << sz` is a multiple of 16 in `[0, 65520]` (`a6_vqimm`), emits `LDR Qd, [base, #q]`; otherwise computes the
+    scaled byte offset in `x15` (`ADD x15, XZR, idx, LSL #sz`) and emits `LDR Qd, [base, x15]` (unaligned 128-bit loads
+    are permitted on normal memory).
+  - `59 vstore`: symmetric `STR Qx, [base, #q]` or `ADD x15, XZR, idx, LSL #sz; STR Qx, [base, x15]`.
+  - `100 vsplat`: `DUP Vd.4S, Sa[0]` (`a_dupv4s`) or `DUP Vd.2D, Da[0]` (`a_dupv2d`).
+  - `101 vextract`: checks `imm < lanes`, emits `DUP Sd, Va.S[imm]` (`a_dups`) or `DUP Dd, Va.D[imm]` (`a_dupd`).
+  - `10 add`, `11 sub`, `12 mul`: `FADD`, `FSUB`, `FMUL` on `.4S` or `.2D` (one IEEE-754 rounding per lane; `_start`
+    sets `FPCR = 0` whenever `a6_hasf` sees scalar or vector floats).
+  - `46 fma` (`a * b + c`, single rounding per lane): `FMLA Vd, Va, Vb` computes `Vd + Va * Vb`. When `Vd = Vc`, emits
+    `FMLA Vd, Va, Vb` directly. When `Vd` aliases `Va` or `Vb` (`d = a` or `d = b`, possible when `a` or `b` dies at the
+    op), copying `Vc` into `Vd` first would overwrite a live multiplicand, so `a6_vfma` copies `Vc` to scratch `v31`,
+    runs `FMLA v31, Va, Vb`, and moves `v31` to `Vd` via `ORR Vd.16B, v31.16B, v31.16B`. Otherwise copies `Vc` to `Vd`
+    and emits `FMLA Vd, Va, Vb`.
+- **AAPCS64 `BL` clobber safety (`a6_alloc`)**: under AAPCS64, `v8..v15` only preserve their low 64 bits (`d8..d15`)
+  across a subroutine call; any scalar `D` write or callee epilogue `LDP D` zeroes bits `64..127`. `a6_alloc` therefore
+  spills every 128-bit `VEC` (`a_vf[w] = 2`) whose live range crosses a `BL` (`a_vx[w] != 0`) to a 16-byte stack slot,
+  never placing a cross-call 128-bit vector in `v8..v15`.
+- **16-byte stack slots, parallel moves, and ABI (`600..631`, `700..955`, `3000 + ks`)**: `a6_slot` aligns `s` upward to
+  an even 8-byte slot index and reserves 2 slots (`16` bytes, `[sp, 16*(s/2)]`, aligned mod 16 because `sp` is 16-byte
+  aligned) so `STR Q` / `LDR Q` unsigned scaled immediates (`q = (a_vsl[w] - 1) >> 1`) address exact 16-byte boundaries.
+  Parallel moves encode allocated 128-bit `V` registers as `600 + r` (`v0..v28` = `600..628`), reserve `631` (`v31`)
+  exclusively as the `a6_mvbrk` parallel-move cycle breaker, encode 16-byte frame slots as `700 + q` where `a6_mvq`
+  slot-to-slot copies use disjoint scratch `v30` (mirroring GP `x16` slot copy vs `x15` cycle breaker so 2-slot swaps
+  across `BL` never clobber `v31`), and encode 16-byte stack ABI arguments past `v0..v7` as `3000 + ks` (`ks`
+  even-aligned).
+
+### Proofs, Wolfram Checks, and Gates
+
+- **Lean 4 (`evidence/NG-A64-VEC/lean/NgA64Vec.lean`)**: 24 kernel-checked theorems (`lake env lean`, zero `sorryAx`,
+  zero `native_decide`), proving R3 bitfield injectivity, `4S` vs `2D` encoding disjointness across all register triples,
+  `DUP` lane-index round-trip, 128-bit `Vec128` lane homomorphism (`vsplat`, `vbin`, `vfma` vs `vextract`), `a6_vfma`
+  register-aliasing correctness across all register assignments, 16-byte stack slot alignment, `a6_mvq` (`v30`) +
+  `a6_mvbrk` (`v31`) 2-cycle parallel swap correctness across registers and 16B stack slots, and four negative controls
+  (AAPCS64 64-bit `d8` save truncating upper lanes, naive `vfma` clobbering `d = a`, `sz`-bit drop colliding `4S` with
+  `2D`, and shared-`v31` slot copy clobbering a 2-slot swap).
+- **Wolfram (`evidence/NG-A64-VEC/wolfram-query.wl`, `wolfram-raw.json`)**: independently verified all 16 reference
+  instruction words, IEEE-754 single-rounding `fma` lane values vs unfused `mul+add`, and Cortex-X925 `monons` speedup
+  ratios (`v4f32`: `3.37534x` median speedup over scalar `omc`, `11.8477 GFLOP/s` vs `3.51008 GFLOP/s`; `v2f64`:
+  `1.68362x` median speedup, `5.99903 GFLOP/s` vs `3.56317 GFLOP/s`, bit-identical checksums).
+- **Gates**: `gate.om` adds 27 `objdump`-checked encoder cases (`263/263`) and 10 refusal cases (`37/37`); `rgate.om`
+  adds 7 differential execution fixtures (`v-f32-ops`, `v-f64-ops`, `v-fma-alias`, `v-call-clobber`, `v-spill-loop`,
+  `v-spill-swap`, `v-swap-nocall`), refusal fixture `u-selvec`, and 6 `VEC` mutants (`80..85`).
