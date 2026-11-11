@@ -140,7 +140,7 @@ defaults. The exit codes are listed in CONTRACT §7.
 ## Serve (DRA-119)
 
 ```sh
-ollm serve PORT CK MERGES [MAXCONN]   # AArch64 Linux only; prints "PORT n" once listening
+ollm serve PORT CK MERGES [MAXCONN]   # AArch64 Linux only; prints "MODEL id", then "PORT n" once listening
 ```
 
 `serve.om` (aarch64 builds only; gb10 and the x86 targets get `noserve.om`, which exits 2) answers
@@ -150,7 +150,12 @@ OpenAI-style chat requests on 127.0.0.1:PORT with omega-mv's `seed/net/http.om` 
 first. One connection at a time and one request per connection (`Connection: close`), so a pooled
 idle client cannot hold the listener; 10 s head and 60 s body deadlines.
 
-- `GET /health` → `{"status":"ok","in_flight":0}`; `GET /v1/models` → one model, `ollm`.
+- `GET /health` → `{"status":"ok","in_flight":0}`; `GET /v1/models` → one model, whose id is read
+  from the loaded checkpoint's header: `ollm-ck0M-vV-tT-dD-hH-lL-stepS-fnvX` (checkpoint format M,
+  shapes, step field and the payload FNV-1a 64 that the load has just verified). The rung-10
+  ck60000 checkpoint (sha256 `a53ced7265818c8f6197449315e9ca4082721665022fec4f81d4538e8d6c2d0f`)
+  is `ollm-ck02-v4096-t256-d384-h12-l8-step60000-fnv0a3ae8e8c031f163`. Every completion and chunk
+  carries the same id in `model`.
 - `POST /v1/chat/completions`: `messages` (string or null content), `max_tokens` or
   `max_completion_tokens` (1 to 999999), `temperature` (0 to 2, no exponent; 0 is argmax), `seed`,
   `stream`, `stream_options.include_usage`, `n` = 1; other members are ignored (`tools`, `model`).
@@ -166,8 +171,16 @@ idle client cannot hold the listener; 10 s head and 60 s body deadlines.
 - stdout gets one line per response: `C status prompt_tokens completion_tokens finish ms`.
 
 `tests/omegallm/serve-check.sh` starts the server under taskset/nice/bwrap, referees it with
-`serve-check.py` (27 checks; the content oracle is the same binary's `sample`, decoded with
-Python's `errors="replace"`) and stops the PIDs it started. Receipts: `evidence/OMEGALLM/serve/`.
+`serve-check.py` (31 checks; the content oracle is the same binary's `sample`, decoded with
+Python's `errors="replace"`; four `parity_` checks compare the sha256 of the served text with the
+sha256 of `sample`'s raw stdout for the same prompt, seed, temperature and token count and keep both
+files in `OUT/parity`; the model id oracle reads the checkpoint header itself), checks that the
+server's `MODEL` line equals that id and that it listened on 127.0.0.1 alone, and stops the PIDs it
+started. `tests/omegallm/serve-mutants.sh` is its negative control: it builds the seven serve
+mutants of `build.sh` (smeth, spath, sbig, sjson, sloop, sseed, smid: the 405, 404, 413 and
+malformed-JSON refusals removed, a 0.0.0.0 bind, a shifted seed, the old fixed id) and requires
+serve-check.sh to fail each one on the check written for it, each run inside a private network
+namespace. Receipts: `evidence/OMEGALLM/serve/`.
 
 ## iMac
 
