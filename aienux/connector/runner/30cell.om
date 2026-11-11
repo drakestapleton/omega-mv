@@ -21,7 +21,8 @@ text rtsout "stdout"
 text rtserr "stderr"
 const rwall ulong 3000000000
 
-note r_kidio: open the stage file nm onto descriptor t (t 0: read; 1, 2: new file 0600)
+note r_kidio: open the stage file nm onto descriptor t (t 0: read; 1, 2: new file 0600); on failure
+note report the errno as a cell failure (r_kfail)
 fn r_kidio nm view uchar * t int to void
 n = r_jpath nm
 fl = rfonew
@@ -30,32 +31,48 @@ fl = rford
 end
 fd = fopen rph 0 n fl 384
 if lt fd 0
-exit 121
+r_kfail fd
 end
 r = dupfd int fd t 0
 if lt r 0
-exit 122
+r_kfail r
 end
 if ne fd long t
 x = fclose int fd
 end
 end
 
-note r_kid: the stage child. sg 0 compiles source.om with <state>/bin/omc, sg 1 runs part.elf.
-fn r_kid sg ulong wf int to void
-pk = new uchar 4200 0
+note r_kfail: the cell could not start. execpure closes every descriptor at or above 3 before any
+note step that can fail (close_range first), so the record goes to descriptor 2, the stage's stderr
+note file (opened first; seccomp, when it is already installed, still allows write(2)): "E" and
+note the errno in 7 bytes little endian, then exit 125. The parent counts it as a cell failure
+note only when the status is 125 and the stderr file is exactly such a record or does not exist;
+note a program that imitates it only makes its own result uncounted.
+fn r_kfail v long to void
 e = new uchar 8 0
+put e 0 69
+u = ulong neg v
+for i ulong 7
+put e add i 1 uchar and shr u mul i 8 255
+end
+x = write 2 e 0 8
+exit 125
+end
+
+note r_kid: the stage child. sg 0 compiles source.om with <state>/bin/omc, sg 1 runs part.elf.
+fn r_kid sg ulong to void
+pk = new uchar 4200 0
 r = setpgid 0 0
 n = ulong 0
 if eq sg 0
+r_kidio rtcerr 2
 r_kidio rtsrc 0
 r_kidio rtcout 1
-r_kidio rtcerr 2
 n = r_path rtomc
 else
+r_kidio rtserr 2
 r_kidio rtsin 0
 r_kidio rtsout 1
-r_kidio rtserr 2
 n = r_jpath rtelf
 end
 put pk 0 1
@@ -66,13 +83,7 @@ for i ulong n bound 4096
 put pk add 4 i get rph i
 end
 v = execpure pk 0 add 4 n
-put e 0 69
-u = ulong neg v
-for i ulong 7
-put e add i 1 uchar and shr u mul i 8 255
-end
-x = write wf e 0 8
-exit 127
+r_kfail v
 end
 
 fn r_u32 b view uchar * o ulong to ulong
@@ -82,28 +93,18 @@ end
 note r_cell: run stage sg; sets rgv rwhy (0 exited with rcode, 1 killed by signal rcode, 2 wall
 note clock, 3 the cell could not start: errno rcode). False when no stage could be started.
 fn r_cell sg ulong to bool
-fds = new uchar 8 0
-r = pipefds fds 0 8 524288
-if lt r 0
-ret false
-end
-rf = int r_u32 fds 0
-wf = int r_u32 fds 4
 pid = fork
 if lt pid 0
-x = fclose rf
-x = fclose wf
 ret false
 end
 if eq pid 0
-x = fclose rf
-r_kid sg wf
-exit 127
+r_kid sg
+exit 125
 end
-x = fclose wf
 r_cwait pid
-r_cpipe rf
-x = fclose rf
+if and eq get rgv rwhy 0 eq get rgv rcode 125
+r_cfail sg
+end
 ret true
 end
 
@@ -143,11 +144,23 @@ put rgv rcode and s 127
 end
 end
 
-note r_cpipe: bytes on the close-on-exec pipe mean execpure itself failed: "E" + errno
-fn r_cpipe rf int to void
-eb = new uchar 8 0
-n = read rf eb 0 8
-if and gt n 0 eq get eb 0 69
+note r_cfail: status 125: the stage's stderr file is absent (it could not be opened) or exactly the
+note 8-byte record "E" + errno that r_kfail writes, then the cell could not start
+fn r_cfail sg ulong to void
+eb = new uchar 9 0
+n = ulong 0
+if eq sg 0
+n = r_jpath rtcerr
+else
+n = r_jpath rtserr
+end
+r = r_rd eb
+if eq r -2
+put rgv rwhy 3
+put rgv rcode 2
+ret
+end
+if and eq r 8 eq get eb 0 69
 put rgv rwhy 3
 put rgv rcode r_u32 eb 1
 end
