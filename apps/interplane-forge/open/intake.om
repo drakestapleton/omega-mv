@@ -40,7 +40,9 @@ note the open dir is made to say.
 note The page snapshot of a listed project is <open dir>p/<rid>.txt (see "the snapshot" below);
 note it is written when the project is listed, again when its lister brings it again, and removed
 note when it is withdrawn.
-note list.tsv rows: rid, state, did, date, kilobytes, name, description, note.
+note list.tsv rows: rid, state, did, date, kilobytes, name, description, note. The list has no
+note size limit: it is read a row at a time and written whole through a temp file (see "the
+note private list.tsv" below).
 global od uchar 512
 global odl ulong 1
 global sf uchar 512
@@ -56,10 +58,19 @@ global pthl ulong 1
 global pt2 uchar 1100
 global rpk uchar 2300
 global qb uchar 65536
-global lb uchar 262144
+global lb uchar 65536
 global lbl ulong 1
+global lcb uchar 131072
+global lst ulong 16
+global lerr ulong 1
+global lrmax ulong 1
+global lcd uchar 96
+global lcdl ulong 1
+global lcdn ulong 1
 global ob uchar 524288
 global obl ulong 1
+global osf ulong 1
+global oerr ulong 1
 global cb uchar 65536
 global cbl ulong 1
 global pk uchar 4096
@@ -124,6 +135,7 @@ text kgn "GIT_CONFIG_NOSYSTEM=1"
 text kgg "GIT_CONFIG_GLOBAL=/dev/null"
 text kpathg "PATH=/usr/bin:/bin"
 text kghead "HEAD"
+text klnot "open-intake: list.tsv not replaced (a read or a write failed); the old list stays\n"
 text kglog "log"
 text kgm1 "-1"
 text kgn10 "-10"
@@ -141,7 +153,6 @@ text kr0 "refused: intake is open to invited keys for now"
 text kr1 "refused: this project's storage is already on this node"
 text kr4 "refused: not found on the Radicle network (publish it, then rad sync --announce)"
 text kfull "refused: this computer is nearly full; try again later"
-text klfull "refused: the shelf list is full; the operator has been told"
 text kr6 "refused: the Radicle node did not answer; try again"
 text kr7 "refused: this node already seeds this project"
 text kr8 "refused: removed by the operator"
@@ -254,10 +265,10 @@ global upiped ulong 1
 global upipew ulong 1
 text ubegin "-----BEGIN"
 text upriv "PRIVATE KEY-----"
-global avals ulong 12
-global avol ulong 11
-global akeys uchar 1056
-global akl ulong 11
+global avals ulong 13
+global avol ulong 12
+global akeys uchar 1152
+global akl ulong 12
 global aref ulong 1
 global alimit ulong 1
 global dfv ulong 2
@@ -279,6 +290,7 @@ text kan6 "storage_free_bytes"
 text kan8 "data_free_bytes"
 text kan9 "list_bytes"
 text kan10 "reserve_refused"
+text kan11 "list_row_bytes"
 text kanull "null"
 text kadfb "-B1"
 text krsvf "reserve"
@@ -295,7 +307,8 @@ text kas4 "open/up spool; no cap: bounded by the data reserve"
 text kas5 "rad seed output; intake cb buffer 65535"
 text kas6 "df storage filesystem; warning at twice OPEN_RESERVE_STORAGE_BYTES"
 text kas8 "df open dir filesystem; warning at twice OPEN_RESERVE_DATA_BYTES"
-text kas9 "work list.tsv bytes; the list read buffer is 262143 bytes"
+text kas9 "work list.tsv bytes; no size limit (read a row at a time); 80 percent of the former 262143-byte read buffer"
+text kas11 "longest work list.tsv row (this program writes at most about 900 bytes); kept whole at any length; the intake and forged read the first 4096 bytes of each field"
 text kas10 "a bring refused at a free-space reserve; value free bytes, volume asked"
 text kas7 "largest rad inspect --delegates output; intake cb buffer 65535"
 text kaj1 "{\"schema\":\"interplane/open-alarms/1\",\"alarms\":["
@@ -1024,35 +1037,105 @@ p = add p 1
 end
 ret o
 end
-note ---- the private list.tsv in lb
-fn lload to void
-put lbl 0 0
+note ---- the private list.tsv, a row at a time. It has no size limit: the file is read in chunks
+note of 65,536 bytes (pread at the slot's own offset) through one of two slots, so one scan can run
+note inside another (arows counts a key's rows while it walks the list). The current row is in lb,
+note lbl bytes from offset 0, so the row helpers below take s = 0 and e = lbl. lb holds the first
+note 4,096 bytes of each field (every tab is kept, so the fields keep their places): this program
+note writes rows of at most about 900 bytes and reads no field past 400. A row that is not all in
+note lb (its real length, in the slot, differs from lbl) is copied whole from the file by keep
+note (kcopy), and the list_row_bytes alarm measures the longest row. A failed read sets lerr: save
+note then replaces nothing, so the list is never cut.
+note Slot sl is lst[8 sl ..]: 0 fd + 1 (0 closed), 1 next byte of its chunk (lcb[65536 sl ..]),
+note 2 bytes in the chunk, 3 file offset of the chunk, 4 the current row's length, 5 its offset.
+fn lopen sl ulong to void
+lclose sl
 wpath klist
 fd = fopen pth 0 get pthl 0 557056 0
 if lt fd 0
 ret
 end
+o = mul sl 8
+put lst o add ulong fd 1
+for i ulong 5
+put lst add add o 1 i 0
+end
+end
+fn lclose sl ulong to void
+o = mul sl 8
+f = get lst o
+if gt f 0
+x = fclose int sub f 1
+end
+put lst o 0
+end
+note lfill: the next chunk of slot sl; false at the end of the file or on a failed read (lerr)
+fn lfill sl ulong to bool
+o = mul sl 8
+pos = add get lst add o 3 get lst add o 2
+k = long -4
+while eq k -4 bound 1000000
+k = pread int sub get lst o 1 lcb mul sl 65536 65536 long pos
+end
+if le k 0
+if lt k 0
+put lerr 0 1
+end
+ret false
+end
+put lst add o 3 pos
+put lst add o 2 ulong k
+put lst add o 1 0
+ret true
+end
+note lnext: the next row of slot sl into lb; false at the end of the list (the slot is closed)
+fn lnext sl ulong to bool
+o = mul sl 8
+if eq get lst o 0
+ret false
+end
+n = ulong 0
 m = ulong 0
-k = long 1
-while gt k 0 bound 262144
-k = read int fd lb m sub 262143 m
-if gt k 0
-m = add m ulong k
+fl = ulong 0
+st = add get lst add o 3 get lst add o 1
+got = false
+while true bound 9223372036854775807
+p = get lst add o 1
+if ge p get lst add o 2
+if lfill sl
+continue
 end
+if not got
+lclose sl
+ret false
 end
-x = fclose int fd
+break
+end
+put lst add o 1 add p 1
+got = true
+c = get lcb add mul sl 65536 p
+if eq c 10
+break
+end
+if eq c 9
+fl = ulong 0
+end
+if and lt fl 4096 lt m 65536
+put lb m c
+m = add m 1
+end
+if ne c 9
+fl = add fl 1
+end
+n = add n 1
+end
 put lbl 0 m
+put lst add o 4 n
+put lst add o 5 st
+if gt n get lrmax 0
+put lrmax 0 n
 end
-fn leol a ulong to ulong
-lim = get lbl 0
-i = a
-while lt i lim bound 262144
-if eq get lb i 10
-ret i
-end
-i = add i 1
-end
-ret lim
+ret true
 end
 note lfe: the end of the field that starts at a in the row ending at e
 fn lfe a ulong e ulong to ulong
@@ -1120,18 +1203,16 @@ end
 end
 ret true
 end
-note lfind: the start of the row of the current rid, or lbl
-fn lfind to ulong
-lim = get lbl 0
-s = ulong 0
-while lt s lim bound 262144
-e = leol s
-if lisrid s e
-ret s
+note lfind: the row of the current rid into lb (true), or false when the list has none
+fn lfind to bool
+lopen 0
+while lnext 0 bound 9223372036854775807
+if lisrid 0 get lbl 0
+lclose 0
+ret true
 end
-s = add e 1
 end
-ret lim
+ret false
 end
 note lstate: the state (field 1) of the row s..e is t
 fn lstate s ulong e ulong t view uchar * to bool
@@ -1151,21 +1232,14 @@ note lfailed: the private list says this program's own fetch of the current rid 
 note or over the size limit). A storage folder found for it then is that fetch's leftover (the
 note node can finish a fetch after rad was stopped at its deadline), not a repository of the owner.
 fn lfailed to bool
-s = lfind
-if ge s get lbl 0
+if not lfind
 ret false
 end
-e = leol s
-if lstate s e kr4
+e = get lbl 0
+if lstate 0 e kr4
 ret true
 end
-ret lstate s e kfull
-end
-note lfits: one more row (at most 900 bytes: rid 44, did 96, date, kilobytes, name 120, description
-note 400, note 200, tabs) still fits what lload reads back (262,143 bytes). A real buffer bound of
-note this program until Omega has run-time memory (list_bytes alarms at 80 percent of it).
-fn lfits to bool
-ret le add get lbl 0 900 262143
+ret lstate 0 e kfull
 end
 note lpub: the row is on the shelf: open (this program fetched the project) or held (the node
 note already had it; the row only lists it)
@@ -1179,17 +1253,17 @@ end
 ret lstate s e kheld
 end
 note lcount: rows on the shelf (open or held); mine true counts only the current did's rows in
-note state open, the projects this program fetched for that key (a held row costs no fetch or disk)
+note state open, the projects this program fetched for that key (a held row costs no fetch or disk).
+note Slot 1: arows calls it inside its own scan (slot 0).
 fn lcount mine bool to ulong
-lim = get lbl 0
 n = ulong 0
-s = ulong 0
-while lt s lim bound 262144
-e = leol s
-if lpub s e
+lopen 1
+while lnext 1 bound 9223372036854775807
+e = get lbl 0
+if lpub 0 e
 if mine
-if lowned s e
-if lisdid s e
+if lowned 0 e
+if lisdid 0 e
 n = add n 1
 end
 end
@@ -1197,17 +1271,61 @@ else
 n = add n 1
 end
 end
-s = add e 1
 end
 ret n
 end
-note ---- writing the new list
+note ---- writing: emb appends to ob. While a stream is open (wbeg .. wend) a full ob is written
+note out first (oflush), so the list is written whole at any size. Outside a stream ob holds one
+note small file (a snapshot, a status, the alarms) and a byte past its 524,288 is dropped.
 fn emb c uchar to void
 o = get obl 0
+if ge o 524288
+if gt get osf 0 0
+if oflush
+o = ulong 0
+end
+end
+end
 if lt o 524288
 put ob o c
 put obl 0 add o 1
 end
+end
+note oflush: ob to the open stream, then ob is empty; false (and oerr) when a write fails
+fn oflush to bool
+f = get osf 0
+if or eq f 0 ne get oerr 0 0
+ret false
+end
+z = get obl 0
+o = ulong 0
+while lt o z bound 524288
+k = write int sub f 1 ob o sub z o
+if le k 0
+put oerr 0 1
+ret false
+end
+o = add o ulong k
+end
+put obl 0 0
+ret true
+end
+note wall: b[0, n) to the open stream, after what ob holds
+fn wall b view uchar * n ulong to bool
+if not oflush
+ret false
+end
+f = get osf 0
+o = ulong 0
+while lt o n bound 9223372036854775807
+k = write int sub f 1 b o sub n o
+if le k 0
+put oerr 0 1
+ret false
+end
+o = add o ulong k
+end
+ret true
 end
 fn emt t view uchar * to void
 for i ulong len t bound 256
@@ -1231,55 +1349,84 @@ n = sub n 1
 emb get d n
 end
 end
-note keep: every row but the current rid's into ob. Rows that are not open (refusals, withdrawals)
-note share a budget of 65,536 bytes (held rows count as open here); the oldest of them are dropped first, so a key that is not
-note invited cannot grow the list past what lload reads (262,143 bytes) and push out the rows of
-note projects this program brought. Open rows are never dropped: at most 200, 887 bytes each.
-fn keep to void
-lim = get lbl 0
-put obl 0 0
-t = ulong 0
-s = ulong 0
-while lt s lim bound 262144
-e = leol s
-if and gt e s not lisrid s e
-if not lpub s e
-t = add t add sub e s 1
+note keep: every row but the current rid's, in order, into the open stream. No row is dropped and
+note none is cut: a row not all in lb is copied whole from the file (kcopy). There is no budget and
+note no count: the list holds every refusal and withdrawal; it is bounded by the free space of the
+note work dir's filesystem (a write that fails replaces nothing) and measured by the list_bytes
+note alarm. False when the list could not be read to its end.
+fn keep to bool
+put lerr 0 0
+lopen 0
+while lnext 0 bound 9223372036854775807
+e = get lbl 0
+n = get lst 4
+if and gt n 0 not lisrid 0 e
+if ne n e
+if not kcopy 0
+lclose 0
+ret false
 end
-end
-s = add e 1
-end
-drop = ulong 0
-if gt t 65536
-drop = sub t 65536
-end
-s = ulong 0
-while lt s lim bound 262144
-e = leol s
-if and gt e s not lisrid s e
-skip = false
-if gt drop 0
-if not lpub s e
-skip = true
-d = add sub e s 1
-if gt d drop
-drop = ulong 0
 else
-drop = sub drop d
-end
-end
-end
-if not skip
-i = s
-while lt i e bound 262144
+for i ulong e bound 65536
 emb get lb i
-i = add i 1
+end
 end
 emb 10
 end
 end
-s = add e 1
+ret eq get lerr 0 0
 end
+note kcopy: the current row of slot sl, read again from the file whole, into the stream
+fn kcopy sl ulong to bool
+o = mul sl 8
+fd = int sub get lst o 1
+pos = get lst add o 5
+left = get lst add o 4
+b = new uchar 65536 0
+while gt left 0 bound 9223372036854775807
+w = left
+if gt w 65536
+w = ulong 65536
+end
+k = pread fd b 0 w long pos
+if le k 0
+put lerr 0 1
+ret false
+end
+if not wall b ulong k
+ret false
+end
+pos = add pos ulong k
+left = sub left ulong k
+end
+ret true
+end
+note lcopy: the whole file of slot sl from offset 0 into the stream (the published copy)
+fn lcopy sl ulong to bool
+f = get lst mul sl 8
+if eq f 0
+ret false
+end
+b = new uchar 65536 0
+pos = long 0
+while true bound 9223372036854775807
+k = pread int sub f 1 b 0 65536 pos
+if eq k -4
+continue
+end
+if lt k 0
+put oerr 0 1
+ret false
+end
+if eq k 0
+ret true
+end
+if not wall b ulong k
+ret false
+end
+pos = add pos k
+end
+ret false
 end
 note rowhead: rid, state, did, date for the current request
 fn rowhead state view uchar * to void
@@ -1315,8 +1462,11 @@ emb get nt i
 end
 emb 10
 end
-note wr: write ob to pth + ".tmp", sync, rename onto pth
-fn wr to bool
+note wbeg: open pth + ".tmp" (O_EXCL|O_NOFOLLOW, after removing an old one) as the stream; ob
+note keeps what it holds. wend writes the rest, syncs and renames the temp file onto pth; when any
+note write or the sync failed it removes the temp file and the old file stays as it was. Between
+note the two pth and pt2 must not change (nothing there may call wpath for another name or run).
+fn wbeg to bool
 n = get pthl 0
 for i ulong n bound 1100
 put pt2 i get pth i
@@ -1330,21 +1480,30 @@ fd = fopen pt2 0 m 557249 420
 if lt fd 0
 ret false
 end
-z = get obl 0
-o = ulong 0
-ok = true
-while lt o z bound 524288
-k = write int fd ob o sub z o
-if le k 0
-ok = false
-o = z
-else
-o = add o ulong k
+put osf 0 add ulong fd 1
+put oerr 0 0
+ret true
 end
+note wr: write ob to pth + ".tmp", sync, rename onto pth
+fn wr to bool
+if not wbeg
+ret false
 end
-r = fsync int fd
-x = fclose int fd
-if not ok
+ret wend
+end
+fn wend to bool
+f = get osf 0
+if eq f 0
+ret false
+end
+ok = oflush
+put osf 0 0
+r = fsync int sub f 1
+x = fclose int sub f 1
+n = get pthl 0
+m = add n len kxt
+if or not ok ne r 0
+r = unlink pt2 0 m
 ret false
 end
 put rpk 0 2
@@ -1362,20 +1521,42 @@ put rpk add add o 2 i get pth i
 end
 ret eq renames rpk 0 add add o 2 n 0 0
 end
-note save: the list with the current row in the given state: the private list first, then the
-note published copy
+note save: the list with the current row in the given state. The private list first: keep streams
+note the old list into list.tsv.tmp, the row goes last, then sync and rename (wend). Then the
+note published copy: the private file copied whole the same way into the pinned open dir. A list
+note that could not be read or written whole is not replaced (stderr says so); the old one stays.
 fn save state view uchar * to void
-keep
 dodate
+put obl 0 0
+wpath klist
+if not wbeg
+lnot
+ret
+end
+ok = keep
 rowhead state
 rowtail
-wpath klist
-ok = wr
+if not ok
+put oerr 0 1
+end
+if not wend
+lnot
+ret
+end
+lopen 1
 if pinopen
 rname klist
-ok = wr
+put obl 0 0
+if wbeg
+ok = lcopy 1
+ok = wend
+end
 unpin
 end
+lclose 1
+end
+fn lnot to void
+w = write 2 klnot 0 len klnot
 end
 fn blank to void
 put kb 0 0
@@ -1793,13 +1974,12 @@ end
 end
 fn bring to void
 blank
-lload
-s = lfind
-if lt s get lbl 0
-if lpub s leol s
+if lfind
+e = get lbl 0
+if lpub 0 e
 note a second bring by the key that listed the project refreshes its page snapshot (a row the
 note remove file names is left as it is; sweep takes it down)
-if lisdid s leol s
+if lisdid 0 e
 if not denied
 snap
 end
@@ -1823,10 +2003,6 @@ left = fl
 if not left
 held = true
 end
-end
-if not lfits
-rsave klfull fl
-ret
 end
 if held
 if not dovis
@@ -1910,12 +2086,11 @@ end
 note withdraw: only an open or held row brought by this key. Its name is kept; size, description
 note and note are cleared.
 fn withdraw to void
-lload
-s = lfind
-if ge s get lbl 0
+if not lfind
 ret
 end
-e = leol s
+s = ulong 0
+e = get lbl 0
 held = lstate s e kheld
 if not held
 if not lowned s e
@@ -2008,19 +2183,17 @@ fn sweep to bool
 if not dload
 ret false
 end
-lload
-lim = get lbl 0
-s = ulong 0
-while lt s lim bound 262144
-e = leol s
-if lpub s e
-setrow s e
+lopen 0
+while lnext 0 bound 9223372036854775807
+e = get lbl 0
+if lpub 0 e
+setrow 0 e
 if dscan
-takedown s e
+lclose 0
+takedown 0 e
 ret true
 end
 end
-s = add e 1
 end
 ret false
 end
@@ -3508,7 +3681,6 @@ ret false
 end
 fn upload to void
 uscratch
-lload
 put ridl 0 0
 if denied
 uref kr8
@@ -3516,10 +3688,6 @@ ret
 end
 if not allowed
 uref kr0
-ret
-end
-if not lfits
-uref klfull
 ret
 end
 note storage while it is stored: the decoded archive, the unpacked tree, the git objects and the
@@ -3846,15 +4014,13 @@ r = waitpid int pid st 0 4 0
 ret false
 end
 fn allarchives to void
-lload
-s = ulong 0
-while lt s get lbl 0 bound 262144
-e = leol s
-if lpub s e
-setrow s e
+lopen 0
+while lnext 0 bound 9223372036854775807
+e = get lbl 0
+if lpub 0 e
+setrow 0 e
 archive
 end
-s = add e 1
 end
 end
 note ---- alarms (no-hard-caps point 5): measurements beside the unchanged caps. Nothing here refuses.
@@ -3937,19 +4103,22 @@ ret tot
 end
 note arows: the shelf from the private list: rows on it (avals 1), the key with the most rows
 note this program fetched or stored for it (avals 0, its key and volume), the largest row in KiB
-note (avals 2, its key), the total volume, and the list's own size against what lload reads
+note (avals 2, its key), the total volume, the list's own size in bytes (avals 9) and its longest
+note row (avals 12). One scan in slot 0; lcount and lkib scan in slot 1 inside it.
 fn arows to void
-lload
 for i ulong 3
 put avals i 0
 akclr i
 end
 put avol 1 0
-put avals 9 get lbl 0
-lim = get lbl 0
+wpath klist
+put avals 9 alsize
+put lrmax 0 0
+put lcdl 0 1000
+lopen 0
+while lnext 0 bound 9223372036854775807
+e = get lbl 0
 s = ulong 0
-while lt s lim bound 262144
-e = leol s
 if lpub s e
 put avals 1 add get avals 1 1
 v = lkibat s e
@@ -3961,7 +4130,7 @@ put avol 2 mul v 1024
 akset 2
 end
 if lowned s e
-n = lcount true
+n = lcountc
 if gt n get avals 0
 put avals 0 n
 put avol 0 mul lkib 1024
@@ -3970,8 +4139,33 @@ akcopy 0 1
 end
 end
 end
-s = add e 1
 end
+put avals 12 get lrmax 0
+put avol 11 get lrmax 0
+end
+note lcountc: lcount true for the current did, remembered for the last did it counted: arows asks
+note once for every row of a key, and a whole scan each time would cost the list's size per row
+note (arows sets lcdl to 1000, a length no did has, at the start of each pass)
+fn lcountc to ulong
+n = get didl 0
+if eq get lcdl 0 n
+same = true
+for i ulong n bound 96
+if ne get lcd i get did i
+same = false
+end
+end
+if same
+ret get lcdn 0
+end
+end
+v = lcount true
+for i ulong n bound 96
+put lcd i get did i
+end
+put lcdl 0 n
+put lcdn 0 v
+ret v
 end
 note lkibat: field 4 (kilobytes) of the row s..e
 fn lkibat s ulong e ulong to ulong
@@ -3986,21 +4180,19 @@ end
 end
 ret v
 end
-note lkib: the kilobytes of the current did's rows this program fetched or stored
+note lkib: the kilobytes of the current did's rows this program fetched or stored (slot 1)
 fn lkib to ulong
-lim = get lbl 0
 t = ulong 0
-s = ulong 0
-while lt s lim bound 262144
-e = leol s
-if lpub s e
-if lowned s e
-if lisdid s e
-t = add t lkibat s e
+lopen 1
+while lnext 1 bound 9223372036854775807
+e = get lbl 0
+if lpub 0 e
+if lowned 0 e
+if lisdid 0 e
+t = add t lkibat 0 e
 end
 end
 end
-s = add e 1
 end
 ret t
 end
@@ -4138,6 +4330,9 @@ end
 if eq i 10
 emt kan10
 end
+if eq i 11
+emt kan11
+end
 end
 fn atsrc i ulong to void
 if lt i 3
@@ -4166,6 +4361,9 @@ emt kas9
 end
 if eq i 10
 emt kas10
+end
+if eq i 11
+emt kas11
 end
 end
 note akey: the key of alarm i, as text ("-" when it names none) or as a JSON value (null)
@@ -4253,6 +4451,7 @@ aemit 7 get adelmax 0 52428 json
 aemit 8 get avals 8 mul rsvget 1 2 json
 aemit 9 get avals 9 209715 json
 aemit 10 get avals 10 get avals 11 json
+aemit 11 get avals 12 4096 json
 end
 note arefuse: a bring refused at the reserve of filesystem which: free bytes then, the volume it
 note asked for, its key; reported by the next alarm pass
