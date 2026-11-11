@@ -1,0 +1,162 @@
+note runner/10key.om -- the machine key: NIST P-256 ECDSA with SHA-256 (om/tls ec.om, ecdh.om).
+note The private scalar is made here from getrandom, kept in <state>/key (0600, 32 bytes) and never
+note sent. The public key is 04 || X || Y; the key id is the hex SHA-256 of those 65 bytes.
+note Signing (r_ksign) uses a fresh random k per signature, computes R = k*G with ecdh_pub (the
+note constant-time fixed-window P-256 multiplication of ec.om), and s = k^-1 (e + r d) mod n with
+note the mod-n Montgomery helpers of ec.om. Those helpers are variable time, so the inversion is
+note blinded: s = (t b) (k b)^-1 for a second random b, and the private d only enters one product.
+note Every signature is checked with ecdsa_verify_raw before it is used.
+
+text rtkey "key"
+
+note r_kset: set rpub, rpubh and rkid from the public point q
+fn r_kset q view uchar * to void
+h = new uchar 32 0
+x = new uchar 130 0
+k = r_hex q x 0
+for i ulong 130
+put rpubh i get x i
+end
+for i ulong 65
+put rpub i get q i
+end
+r_sha q h
+k = r_hex h x 0
+for i ulong 64
+put rkid i get x i
+end
+end
+
+note r_kload: read <state>/key and derive the public key
+fn r_kload to bool
+d = new uchar 32 0
+q = new uchar 65 0
+n = r_path rtkey
+r = r_rd d
+if ne r 32
+r_wipe d
+ret false
+end
+e = ecdh_pub d q
+if ne e 0
+r_wipe d
+ret false
+end
+for i ulong 32
+put rsk i get d i
+end
+r_wipe d
+r_kset q
+ret true
+end
+
+note r_kgen: a new key, written to <state>/key with O_EXCL and mode 0600
+fn r_kgen to bool
+d = new uchar 32 0
+q = new uchar 65 0
+for t ulong 16
+r = random d 0 32 0
+if ne r 32
+ret false
+end
+e = ecdh_pub d q
+if eq e 0
+n = r_path rtkey
+ok = r_wr d rfonew 384
+for i ulong 32
+put rsk i get d i
+end
+r_wipe d
+if not ok
+ret false
+end
+r_kset q
+ret true
+end
+end
+ret false
+end
+
+note r_kin: true when x (slot o of w) is in [1, n-1]
+fn r_kin w edit ulong ECWN o ulong to bool
+if eq ec_cmp w o ECZ 0
+ret false
+end
+ret eq ec_cmp w o ECCN 1
+end
+
+note r_ksign: the 128-hex signature r || s of m into sg
+note in: [0,32) e = SHA-256(m), [32,64) d, [64,96) k, [96,128) the blind b
+fn r_ksign m view uchar * sg edit uchar * to bool
+w = new ulong ECWN 0
+h = new uchar 32 0
+in = new uchar 128 0
+q = new uchar 65 0
+hs = new uchar 96 0
+r_sha m h
+for i ulong 32
+put in i get h i
+put in add 32 i get rsk i
+end
+ok = false
+for t ulong 16
+x = random in 64 64 0
+if eq x 64
+if eq ecdh_pub part in 64 32 q 0
+ok = r_ksig2 w in q hs
+end
+end
+if ok
+break
+end
+end
+r_wipe in
+if not ok
+ret false
+end
+for i ulong 65
+put q i get rpub i
+end
+if ne ecdsa_verify_raw 256 q hs 32 0
+ret false
+end
+k = r_hex part hs 32 64 sg 0
+ret true
+end
+
+note r_ksig2: from R (q) and in (e, d, k, b), the signature into hs[32..96); hs[0..32) = e
+fn r_ksig2 w edit ulong ECWN in view uchar 128 q view uchar 65 hs edit uchar 96 to bool
+x = ec_setup w 256
+if ne x 0
+ret false
+end
+ec_load w ECA0 part q 1 32
+ec_add w ECCN ECA0 ECA0 ECZ
+ec_load w ECA4 part in 96 32
+if not and r_kin w ECA0 r_kin w ECA4
+ret false
+end
+ec_load w ECA1 part in 0 32
+ec_add w ECCN ECA1 ECA1 ECZ
+ec_load w ECA2 part in 32 32
+ec_load w ECA3 part in 64 32
+ec_mul w ECCN ECA5 ECA4 add ECCN 28
+ec_mul w ECCN ECA6 ECA3 ECA5
+ec_mul w ECCN ECA6 ECA6 add ECCN 28
+ec_inv w ECCN ECA6 ECA6
+ec_mul w ECCN ECA7 ECA2 add ECCN 28
+ec_mul w ECCN ECA8 ECA0 ECA7
+ec_add w ECCN ECA8 ECA8 ECA1
+ec_mul w ECCN ECA8 ECA8 ECA5
+ec_mul w ECCN ECA9 ECA8 ECA6
+ok = r_kin w ECA9
+for i ulong 32
+put hs i get in i
+end
+ecd_out w ECA0 hs 32
+ecd_out w ECA9 hs 64
+for i ulong ECWN
+put w i 0
+end
+ret ok
+end

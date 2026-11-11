@@ -1,0 +1,380 @@
+note runner/20net.om -- outbound HTTP(S) to the hub, and the ipcc1 messages (docs/PROTOCOL.md).
+note The runner only ever dials out: it opens no listening socket. https:// URLs use the om/tls
+note TLS 1.3 client with the system trust store; plain http:// is accepted only for 127.0.0.1
+note (a private test hub on the same machine).
+
+text rtget "GET"
+text rtpost "POST"
+text rthost "Host"
+text rtuan "User-Agent"
+text rtuav "interplane-runner/1"
+text rtctn "Content-Type"
+text rtctv "text/plain"
+text rthttps "https://"
+text rthttp "http://127.0.0.1:"
+text rtlo "127.0.0.1"
+text rtapi "/community/api"
+text rtsalv "/salvage/"
+text rtrecs "/record"
+text rtipcc "ipcc1 "
+text rtsig "sig"
+text rtkeyn "key"
+text rttime "time"
+
+note r_hubset: parse the hub URL u ("https://HOST" or "https://HOST:PORT", or for tests
+note "http://127.0.0.1:PORT"); sets rhub, rhost, rport, rtls
+fn r_hubset u view uchar * to bool
+if or lt len u 9 gt len u 300
+ret false
+end
+tls = true
+o = len rthttps
+if r_eq part u 0 len rthttp rthttp
+tls = false
+o = sub len rthttp 1
+r_hostset rtlo
+else
+if not r_eq part u 0 len rthttps rthttps
+ret false
+end
+end
+e = len u
+c = r_colon u o
+if tls
+if not r_hostok part u o sub c o
+ret false
+end
+r_hostset part u o sub c o
+end
+port = ulong 443
+if lt c e
+port = r_undec part u add c 1 sub sub e c 1
+if or eq port 0 gt port 65535
+ret false
+end
+else
+if not tls
+ret false
+end
+end
+put rgv rport port
+put rgv rtls 0
+if tls
+put rgv rtls 1
+end
+for i ulong e bound 512
+put rhub i get u i
+end
+put rgv rhubl e
+ret true
+end
+
+note r_colon: the index of the first ':' in u at or after o, or len u
+fn r_colon u view uchar * o ulong to ulong
+c = o
+while lt c len u bound 512
+if eq get u c 58
+ret c
+end
+c = add c 1
+end
+ret c
+end
+
+note r_hostok: 1..253 bytes of a-z 0-9 . -
+fn r_hostok s view uchar * to bool
+if or eq len s 0 gt len s 253
+ret false
+end
+for i ulong len s bound 256
+ch = get s i
+lo = and ge ch 97 le ch 122
+dg = and ge ch 48 le ch 57
+if not or or lo dg or eq ch 46 eq ch 45
+ret false
+end
+end
+ret true
+end
+
+fn r_hostset s view uchar * to void
+for i ulong len s bound 256
+put rhost i get s i
+end
+put rgv rhstl len s
+end
+
+note r_call: one request to the hub; GET when rgv rpost is 0, else POST of rmsg. The response body
+note goes to rrsp. Returns the HTTP status, or negative: -1000 connect, -2000 trust store,
+note -413 body larger than rrsp, else the http.om / TLS result.
+fn r_call pth view uchar * to long
+cs = new ulong 320 0
+io = new uchar 262144 0
+st = new uchar 262144 0
+hb = new uchar 256 0
+hl = get rgv rhstl
+for i ulong hl bound 256
+put hb i get rhost i
+end
+tls = eq get rgv rtls 1
+if tls
+e = tls_store st
+if ne e 0
+ret -2000
+end
+end
+fd = tls_dial part hb 0 hl get rgv rport
+if lt fd 0
+ret -1000
+end
+r = hinit cs io int fd 0
+hsettmo cs 30000000000 30000000000
+htlsdl cs 120000000000
+if tls
+r = hfe r htlsinit cs io part hb 0 hl
+if ge r 0
+r = htlsconn cs io st
+end
+end
+if ge r 0
+r = r_xchg cs io pth
+end
+if tls
+x = htlsend cs io
+else
+x = hclose cs
+end
+ret r
+end
+
+fn r_xchg cs edit ulong * io edit uchar * pth view uchar * to long
+r = r_xhead cs io pth
+if lt r 0
+ret r
+end
+ret r_xresp cs io
+end
+
+note r_xhead: the request line, headers and (POST) body
+fn r_xhead cs edit ulong * io edit uchar * pth view uchar * to long
+hb = new uchar 256 0
+hl = get rgv rhstl
+for i ulong hl bound 256
+put hb i get rhost i
+end
+post = eq get rgv rpost 1
+r = long 0
+if post
+r = hreqst cs io rtpost
+else
+r = hreqst cs io rtget
+end
+r = hfe r hreqtg cs io pth
+r = hfe r hhname cs io rthost
+r = hfe r hhval cs io part hb 0 hl
+r = hfe r hhname cs io rtuan
+r = hfe r hhval cs io rtuav
+if post
+r = hfe r r_xbody cs io
+else
+r = hfe r hhend cs io 0 0
+end
+ret hfe r hwfin cs io
+end
+
+fn r_xbody cs edit ulong * io edit uchar * to long
+mb = new uchar 8192 0
+n = get rgv rmsgl
+for i ulong n bound 8192
+put mb i get rmsg i
+end
+r = hhname cs io rtctn
+r = hfe r hhval cs io rtctv
+r = hfe r hhend cs io 0 n
+ret hfe r hput cs io part mb 0 n
+end
+
+note r_xresp: the status, and the body into rrsp
+fn r_xresp cs edit ulong * io edit uchar * to long
+d = new uchar 16384 0
+s = hrsprd cs io
+if lt s 0
+ret s
+end
+put rgv rrspl 0
+for it ulong 999999
+k = hbodyrd cs io d
+if lt k 0
+ret k
+end
+if eq k 0
+ret s
+end
+if not r_rspapp part d 0 ulong k
+ret -413
+end
+end
+ret -413
+end
+
+note r_rspapp: append d to rrsp; false when it would not fit
+fn r_rspapp d view uchar * to bool
+m = get rgv rrspl
+if gt add m len d len rrsp
+ret false
+end
+for j ulong len d bound 16384
+put rrsp add m j get d j
+end
+put rgv rrspl add m len d
+ret true
+end
+
+note ---- messages
+fn r_madd s view uchar * to void
+n = get rgv rmsgl
+for i ulong len s bound 8192
+put rmsg add n i get s i
+end
+put rgv rmsgl add n len s
+end
+
+fn r_mbeg k view uchar * to void
+put rgv rmsgl 0
+r_madd rtipcc
+r_madd k
+r_madd rtnl
+end
+
+fn r_mline nm view uchar * v view uchar * to void
+r_madd nm
+r_madd rtsp
+r_madd v
+r_madd rtnl
+end
+
+fn r_mnum nm view uchar * v ulong to void
+d = new uchar 20 0
+k = r_dec d 0 v
+r_mline nm part d 0 k
+end
+
+note r_mkey: "key <key id>"
+fn r_mkey to void
+k = new uchar 64 0
+for i ulong 64
+put k i get rkid i
+end
+r_mline rtkeyn k
+end
+
+note r_mjf: "nm <rjf[o, o+n)>"
+fn r_mjf nm view uchar * o ulong n ulong to void
+d = new uchar 256 0
+for i ulong n bound 256
+put d i get rjf add o i
+end
+r_mline nm part d 0 n
+end
+
+note r_mtime: "time <unix seconds>"
+fn r_mtime to void
+r_mnum rttime ulong div realns 1000000000
+end
+
+note r_msign: append "sig <r||s hex>" over every byte of rmsg so far
+fn r_msign to bool
+m = new uchar 8192 0
+sg = new uchar 128 0
+n = get rgv rmsgl
+for i ulong n bound 8192
+put m i get rmsg i
+end
+if not r_ksign part m 0 n sg
+ret false
+end
+r_mline rtsig sg
+ret true
+end
+
+note r_post: POST rmsg to the hub API; the HTTP status or a negative r_call result
+fn r_post to long
+put rgv rpost 1
+ret r_call rtapi
+end
+
+note r_rspis: the response body starts with t
+fn r_rspis t view uchar * to bool
+if lt get rgv rrspl len t
+ret false
+end
+for i ulong len t bound 4096
+if ne get rrsp i get t i
+ret false
+end
+end
+ret true
+end
+
+note r_rspfld: the value of the response line "nm <value>" into d; its length must be len d
+fn r_rspfld nm view uchar * d edit uchar * to bool
+n = get rgv rrspl
+s = ulong 0
+while lt s n bound 65536
+ok = le add add s len nm 1 n
+if ok
+for i ulong len nm bound 64
+if ne get rrsp add s i get nm i
+ok = false
+end
+end
+end
+if ok
+ok = eq get rrsp add s len nm 32
+end
+if ok
+v = add add s len nm 1
+e = v
+while lt e n bound 65536
+if eq get rrsp e 10
+break
+end
+e = add e 1
+end
+if or ge e n ne sub e v len d
+ret false
+end
+for i ulong len d bound 65536
+put d i get rrsp add v i
+end
+ret true
+end
+while lt s n bound 65536
+if eq get rrsp s 10
+break
+end
+s = add s 1
+end
+s = add s 1
+end
+ret false
+end
+
+note r_rspline: the first response line to stdout (the hub's answer word), for the log
+fn r_rspline to void
+n = get rgv rrspl
+d = new uchar 256 0
+k = ulong 0
+while lt k n bound 256
+c = get rrsp k
+if eq c 10
+break
+end
+if or lt c 32 gt c 126
+c = 63
+end
+put d k c
+k = add k 1
+end
+w = write 1 d 0 k
+end
