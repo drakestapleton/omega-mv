@@ -518,7 +518,8 @@ the operations, the efi 12 file contract and qualification status.
   a pool written without its length is refused (error 16). (s.7)
 - `global NAME T N`: a pool of N elements (1 .. 16777216), all 0 when the program starts, in the
   program's own memory image (no heap, no allocation call); at most 1 GiB of pools, else error 23.
-  Program mode only (error 9). (s.6 echo, bytecopy, s.7)
+  Program mode only (error 9). (s.6 echo, bytecopy, s.7) A run-time pool, `global NAME T *` (omc only,
+  section 9.15), is the one array whose length is set while the program runs.
 - `text NAME "bytes"`: a read-only array of uchar holding the bytes between the quotes, with its
   length; `\n` is 10, `\t` is 9, `\\` is 92, `\"` is 34; any other escape, or a quote missing its end,
   is error 22. An empty text `""` is a sized array of length 0: `len` is 0, a number index is error 21,
@@ -972,6 +973,54 @@ after the global, restored the pin.
   expression and of an enclosing call) and their live twins; NZCV, FPCR, FPSR, the SVE P registers and
   FFR; memory above SP, the live frames. The result register is set
   to 0 last.
+
+### 9.15 Run-time pools (omc only, `seed/omc/gate-pools.sh`; design `docs/RUNTIME-POOLS.md`)
+
+Decision 3 of 2026-11-11 (omega-mv #793 RM4, #795 RM6): a region whose length is known at run time,
+obtained from the host as zero pages, bounds-checked like every array, with no `free` and no general
+allocator. Program mode on AArch64 Linux only.
+
+- `global NAME T *`: a run-time pool of element type T (as for `global`; `bool` is error 9). Its length
+  is 0 when the program starts. Function mode and IR mode refuse it (error 9), any `target` other than
+  the default refuses it (error 25). Like every global it is never passed as an argument and never
+  sliced with `part` (error 19), and a struct argument is never a pool (error 7).
+- `r = enlarge NAME n`: n a ulong and r a long (error 7 otherwise; r is an existing long local or a new
+  one), allowed only as the whole of an assignment (error 9 inside a value, a `put` or a condition; a bare
+  `enlarge P n` line is error 16, as for every value word written as a statement), in any function and
+  any block. `enlarge` on a name that is not a run-time pool is error 7.
+  Results: n at or below `len NAME`: 0, nothing changes (`enlarge` never shrinks). n above it: NAME has
+  n elements, the first `len NAME` keep their values, the rest are 0, the result is 0. n times the
+  element size at or past 2^63: -22 and NAME is unchanged. The host refuses (mmap or mremap fails, for
+  example under RLIMIT_AS or `vm.overcommit_memory=2`): the host's negative errno, -12 (ENOMEM), and
+  NAME is unchanged. A refusal is a result the program handles; it is never a trap. Under a cgroup
+  memory limit (`memory.max`) the mapping is not refused: pages are charged when first touched, and
+  past the limit the kernel's OOM killer ends the process, as it would for a touched `.bss` page.
+- `len NAME` is the current length, a run-time ulong, never folded: a contract on it (`requires eq len P
+  0`, `invariant le i len P`) is checked when the program runs.
+- `get NAME i`, `put NAME i v`, `read fd NAME off n` and `write fd NAME off n` (a uchar pool) behave as for
+  any array and are checked against the current length: an index at or past it traps 3, a number index
+  included (it is checked at run time, never error 21). Every other word that takes an array (the device
+  and mapping words such as `mapread` and `mapwrite`, the path and buffer words) refuses a pool with
+  error 7.
+- Memory is held until the process ends: no word gives it back (decision 24). A long-running program
+  sizes a pool to its high-water mark and reuses it, keeping its own used length, rather than enlarging
+  for every request; `gate-pools.sh` has such a server-shaped case with resident memory checked flat.
+- Lowering: each pool has a 16-byte slot in the global pool area (base, length in elements; never held in
+  a pinned register X18..X26). Every access loads the slot after all its operands have been read (LDP,
+  CMP, B.HS trap 3), because an `enlarge` inside an operand may move the pool. `enlarge` calls one helper
+  per unit, emitted at the unit's first `enlarge`: lengths are rounded up to whole 4096-byte pages, a
+  growth inside the pages already mapped only stores the length, the first growth is mmap (syscall 222,
+  MAP_PRIVATE|MAP_ANONYMOUS) and a later one mremap (216, MREMAP_MAYMOVE), which moves page tables and
+  never copies the data or touches the untouched pages. A unit that uses no pool compiles to the same
+  bytes as before (gate-pools.sh compares every tracked unit).
+- What verification keeps and loses: every access stays bounds-checked (trap 3 exactly as for a sized
+  array) and `enlarge` cannot overrun or shrink; what is lost is the compile-time knowledge of the
+  length, so a number index into a pool is no longer error 21 at compile time, no pool check is
+  eliminated under unrolling or inlining, and a contract on `len` is a run-time check (om2 diag
+  `kept rule=runtime`), never proved constant. checker2, the C path and IR mode do not see pools.
+- om4 does not know these words (the seed chain is unchanged in this landing); `enlarge` is keyword
+  id 244, a C1 language addition. It changes no manifest-c2 row (every tracked unit compiles to the same
+  bytes), so there is no delta file; `gate-pools.sh` scans the corpus and no tracked unit uses it as a name.
 
 ### 9.14 Compiler error codes (omc, registry `seed/omc/error-codes.reg`)
 

@@ -36,10 +36,15 @@ binary from another producer will usually fail closed.
   found by content) is in the table, except `const`/`qty` (types), `cpufence`/`cpurelax`,
   which lower to `DSB SY`/`YIELD`, and `fma` (fused multiply-add, one `FMADD`); a probe shows
   they add no syscall beyond exit (93). The VFIO words are `device` (`vfioctl`, `vfioirq`:
-  ioctl 29; `vfiomap`, `vfiomapw`: mmap 222) and `eventfd` is `fd` (eventfd2 19).
-  `omc.om` has exactly 5 SVC emit sites (a new site means the table needs review)
+  ioctl 29; `vfiomap`, `vfiomapw`: mmap 222) and `eventfd` is `fd` (eventfd2 19). `enlarge` (run-time
+  pools) maps the process's own anonymous memory and is `device` like `mapnew`/`maphold` (mmap 222 at the
+  first growth, mremap 216 past the capacity).
+  `omc.om` has exactly 7 SVC emit sites (a new site means the table needs review); `fn en_help` holds
+  two of them, the omc_enlarge helper's mremap and mmap
 - probe parity: one compiled probe per word; the ELF syscalls equal the table row. A row
-  lists any number of syscalls (`execpure` lowers to ten, `execprog` to execve and close_range)
+  lists any number of syscalls (`execpure` lowers to ten, `execprog` to execve and close_range). A word
+  that cannot be an expression names a whole probe program instead (`enlarge|@probe-enlarge.om` in
+  `cases/probes.txt`)
 - self manifest, fixtures, policy refusals with word, class and line
 - every program-mode unit in `seed/host/tests` and `seed/rung4/tests`, and omc itself:
   binary syscalls lie within the source manifest

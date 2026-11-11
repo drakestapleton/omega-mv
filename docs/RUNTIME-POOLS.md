@@ -1,7 +1,15 @@
 # Run-time pools: a global whose length is set while the program runs
 
-Status: PROPOSED (2026-11-11). Revision 2 takes in the independent design review (consult-codex,
-2026-11-11, findings B1-B2, S1-S8, N1-N4; recorded in section 10). Not implemented.
+Status: landing 1 (the omc-only words of section 6, gates 1-11 of section 7 and the server case of
+section 11) IMPLEMENTED in `seed/omc/omc.om`, gate `seed/omc/gate-pools.sh`, OMEGESE 9.15. Landing 2
+(om4 and the growing compiler arena, gates 12-14) PROPOSED, not implemented. Revision 2 takes in the
+independent design review (consult-codex, 2026-11-11, findings B1-B2, S1-S8, N1-N4; recorded in section
+10). Implementation notes (landing 1): `enlarge` is keyword id 244 (above ng's 241..243); a host refusal
+returns the host's negative errno, in practice -12 (ENOMEM), the only refusal these mmap and mremap calls can
+reach by construction;
+the element types are those `global` takes, f32 and f64 included (they use the array path unchanged);
+the keyword changes no manifest-c2 row, so section 3.2's manifest-c2 delta has no rows and no file. Section 7
+item 14's mutant control is amended there (2026-11-11).
 
 Authority: decision 3 in `~/handoffs/yourtrained-cortex/briefs/decisions-20261111.md`. The lead took it
 under Drake's delegation of 2026-11-11 ("Do whatever you think is best ... for longterm ... Lift all of
@@ -30,8 +38,8 @@ ordinary Omega array can live in one. `seed/rung4/om4.s` has none of these words
 
 ## 3. The language addition (omc, program mode, AArch64 Linux only in this slice)
 
-1. **Declaration.** `global NAME T *` declares a run-time pool of element type T (uchar .. long, the
-   types `global` takes; `bool` stays error 9, as `elemtype` gives for every bool array today). Its length is 0 when the program
+1. **Declaration.** `global NAME T *` declares a run-time pool of element type T (uchar .. long, f32 and
+   f64: the types `global` takes; `bool` stays error 9, as `elemtype` gives for every bool array today). Its length is 0 when the program
    starts. Like every global it is never passed as an argument and never sliced with `part` (error 19).
    Function mode refuses it with error 9, IR mode with error 9, and any `target` other than the default
    with error 25.
@@ -217,9 +225,15 @@ Staging, two landings:
     `prlimit --as=268435456`, still passes every unit it passes today.
 14. **The alarm, redefined (S6).** Once the arena grows to fit, "top / arena" is near 50 to 100 percent
     by construction. gate-usage then alarms on absolute words in use per group and in all, on compile
-    time and on RSS, measured on the largest real units. Its mutant control becomes a growth that never
-    doubles (+1 page each time): it must trip the time alarm. omc's self-compile time and RSS before and
-    after the switch are recorded (each arena access gains a slot load).
+    time and on RSS, measured on the largest real units. Its mutant control is a table growth in `a_need`
+    that never doubles (+512 words each time, `c = add c 512` in place of `c = shl c 1`): it must trip
+    the RSS or absolute-words alarm, and its compile time is recorded. Amended 2026-11-11 (landing 1): the
+    first form, the arena itself growing by +1 page instead of doubling, cannot trip any alarm, because
+    the arena grows only when a group's doubling does not fit (about log2 of its size times per compile)
+    and mremap copies no data; measured on the Spark, the in64m unit took 1.06 s against 1.26 s and
+    forged, omc.om, cortex and omega-mcp were within 0.01 to 0.09 s with identical output, while the
+    a_need mutant takes globals100k from 26 MB to 1.0 GB resident (0.07 to 0.53 s). omc's self-compile
+    time and RSS before and after the switch are recorded (each arena access gains a slot load).
 
 ## 8. What #793 and #795 decided, and what they left open
 

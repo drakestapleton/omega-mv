@@ -54,13 +54,15 @@ else bad "cpufence/cpurelax/fma probe does not compile: $(cat "$B/probe/cpuord.e
 "$E" table | cut -d' ' -f1 | grep -v -x -e read -e write | sort > "$B/tab.txt"
 if cmp -s "$B/kw.txt" "$B/tab.txt"; then ok "closure: $(wc -l < "$B/kw.txt") host keywords == table"
 else bad "closure: host keywords differ from table"; diff "$B/kw.txt" "$B/tab.txt"; fi
-# omc emits SVC at exactly these sites; a new site means the table must be re-reviewed.
+# omc emits SVC at exactly these sites; a new site means the table must be re-reviewed. The 7: fn vs_call,
+# hsys, stubs, eof_prog, stmt, and fn en_help's two (the omc_enlarge helper's mremap 216 and mmap 222).
 n=$(grep -c '^emit 3556769793$' seed/omc/omc.om)
-if [ "$n" = 5 ]; then ok "omc.om SVC emit sites = 5"; else bad "omc.om SVC emit sites = $n (expected 5): review table"; fi
+if [ "$n" = 7 ]; then ok "omc.om SVC emit sites = 7"; else bad "omc.om SVC emit sites = $n (expected 7): review table"; fi
 
 # 2. Probe parity: compile one program per table word with the pinned omc and read the
 #    syscalls back out of the ELF; they must equal the table row (93 = exit is always present).
-probe() { # probe EXPR OUT
+probe() { # probe EXPR OUT; EXPR @FILE is a whole probe program in $C (a word that cannot be an expression)
+    case $1 in @*) cp "$C/${1#@}" "$2.om"; build "$2.om" "$2"; return ;; esac
     printf 'fn main to int\na = new uchar 8 65\nb = new uchar 64 0\nc = new uchar 128 0\nr = long %s\nret 0\nend\n' "$1" > "$2.om"
     build "$2.om" "$2"
 }
