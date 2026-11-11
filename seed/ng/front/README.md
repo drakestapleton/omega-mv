@@ -60,6 +60,8 @@ fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
 An input of any size the arena holds is read whole (cases `size_*`, newlines only: both compilers' error 16). The
 one input edge that is main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 
+Without a run-time pool declaration, `enlarge` (keyword 244, omc pools landing 1) is reserved and its misuses receive omc's same code and line (`cases/pool_enlarge_*.om`); pool `len`, `get`, `put`, `read` and `write` add no words or non-pool forms.
+
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
