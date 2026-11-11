@@ -1,7 +1,3 @@
-<!-- languages -->
-**English** · [简体中文](README.zh-CN.md)
-<!-- /languages -->
-
 # OMEGA (.om or .omg)
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23547810.svg)](https://doi.org/10.5281/zenodo.23547810) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23644702.svg)](https://doi.org/10.5281/zenodo.23644702) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23614483.svg)](https://doi.org/10.5281/zenodo.23614483)
