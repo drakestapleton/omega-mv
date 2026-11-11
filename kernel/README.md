@@ -1,7 +1,3 @@
-<!-- languages -->
-**English** · [简体中文](README.zh-CN.md)
-<!-- /languages -->
-
 # Aienux
 
 > **Status: experimental, pre-alpha. Nothing here is qualified for real use.** The C kernel has run on a Raspberry Pi 5 and on a 2017 iMac, but only in test builds with TEST keys or throwaway secrets. It has not been booted on the NVIDIA DGX Spark. There are no support, stability or compatibility promises. Expect breaking changes.
