@@ -28,6 +28,7 @@ a slice; its last `part` is one element too long and traps 3, exit 103) and `p-p
 `longnames.om` (names of 9 to 63 bytes for a scalar, a constant, a parameter, a local array, a global, a text and
 a loop counter) and `p-longtext.om` (a long-named text handed to an unsized `view` parameter and handed on) pin
 the long-name lookups of the lowering walk (hive ledger L1143).
+`p-emptytext.om` (empty text `len`, unused empty text, 0-byte `write`, 0-length `part`, and passing to `view uchar *`, exit 42) and `p-emptytext-trap.om` (variable index 0 into an empty text traps 3, exit 103) pin empty-text lowering (hive ledger L1144).
 
 sha256 (sha256sum):
 
@@ -48,6 +49,8 @@ acb875cb7c77d7f12e728727071b18c7ca2b9a01989735c9e2cd5a054a5fd2be  x25519-s.om
 75a757d55c8548ab2c75cc7f44b78124783b6c87e06d24751fccdf6f43a4cc9d  p-partok.om
 cee3329b6a233aeb06e6431cc57cc231f30ed642cec8bc976a3c23f85fe5e772  longnames.om
 ff54f87a8d01bc7ac2e37f59d7f6f02ef3c7c7f1072990f5a74a53a68d53868c  p-longtext.om
+29886186df0173e9ae6b73efcf76a352a01d04a76519a73241dcc4ec38babb89  p-emptytext.om
+4a3a90f3dd12c0553833de48f81ec2c15cce369e9a987bdadf0beebfa715ad8a  p-emptytext-trap.om
 ```
 
 ## Host programs (ng-front-host)
