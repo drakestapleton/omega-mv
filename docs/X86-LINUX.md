@@ -52,9 +52,8 @@ its relative displacement and a padding NOP; conditional branches use the long
 Jcc form. `xpatch` distinguishes their displacement positions. Calls have a
 separate rel32 fixup in `resolve`.
 
-The x86 byte-output pool is 16 MiB; default AArch64 emission retains its existing
-8 MiB ceiling. This target-specific capacity accommodates the larger variable-
-length instruction stream without changing the default target's refusal gate.
+The x86 byte output, like the AArch64 output, is part of omc's arena and grows with it (OMEGESE 9.6,
+since 2026-11-11; it was a 16 MiB pool here and 8 MiB for AArch64).
 Dead then-arms do not emit an unreachable skip branch past the final bare-unit
 instruction. Numeric and value `for` loops both check invariant obligations at
 the loop head, including final false heads and `continue` backedges.
@@ -373,10 +372,9 @@ silently replacing current-candidate checks with historical replay is allowed.
 
 ### Recovered OM-2 growth bound
 
-The recovered x86 byte emitter now enforces the same per-function emitted-storage
-budget as the AArch64 word emitter: 262144 bytes in an OM-2 function, including
-unrolled and inlined output. This is a storage bound, not an x86 instruction
-count. The total output-pool ceiling and expansion-fuel bounds remain unchanged.
+Through omc f4fa7951 the x86 byte emitter enforced the per-function emitted-storage budget of the
+AArch64 word emitter (262144 bytes in an OM-2 function). Since 2026-11-11 neither target has that
+budget (OMEGESE 9.6); x86 branches are rel32, and the expansion-fuel bounds remain unchanged.
 The existing growth fixtures must refuse with error 14 and empty stdout;
 their diagnostic twins must retain `obligation=growth`. Rolled and OM-1 controls
 remain accepted. Removing only the new guard is the negative control.

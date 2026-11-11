@@ -101,7 +101,8 @@ feature anyone may want", and it never means hardware qualification beyond the t
    from 58, so one number names many different mistakes. `om2 diag` adds machine records
    (`omc-diag 1 ...`) only in OM-2 units. Rechecked 2026-11-10 at main `a59a425b`: `seed/omc/error-codes.reg` lists codes 1..25 and
    27..30, with 26 unused. I have not re-derived the per-code site counts.
-6. **Capacity and naming limits block real programs.** omc holds 4096 functions per unit; om4, which
+6. **Capacity and naming limits block real programs.** Since 2026-11-11 omc has no table capacities
+   (OMEGESE 9.6: one growing arena, a usage alarm, `seed/omc/gate-usage.sh`); before that omc held 4096 functions per unit; om4, which
    must compile `omc.om`, held 512 (raised to 4096 by the `feat/om4-fn-table` draft), 16 registers with no spilling (error 12),
    6 parameter slots. These are implementation limits, not language rules, and each needs a decision
    before 1.0 freezes them. Names are decided (Drake, 2026-11-08: long names belong in the final
@@ -258,7 +259,7 @@ Acceptance:
 Current: no `import`; units compose by concatenation. OM-2 adds `export fn` (up to 32 entries) and
 links separately compiled units only through bridge symbols that embed source sha256, omc pin and
 profile. FR-3 (imports by digest) is blocked on the OSC content-addressed unit store. Capacity:
-omc: 4096 functions per unit; om4 (compiles `omc.om`): 512 on main, 4096 proposed on `feat/om4-fn-table`. Owners: #621, #648, #631.
+omc: no per-unit table capacity since 2026-11-11 (OMEGESE 9.6; 50,000 functions in `seed/omc/gate-nocaps.sh`); om4 (compiles `omc.om`): 4096 (`seed/rung4/gate4.sh` 7b). Owners: #621, #648, #631.
 
 Acceptance:
 - A decided module form: digest-addressed import (source sha256 plus compiler pin), with a stated

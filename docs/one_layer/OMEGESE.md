@@ -433,7 +433,8 @@ gate that tests it (`seed/rung4/gate4.sh`, section numbers of that script). Deci
 - A conditional branch (B.cond, CBZ, CBNZ) carries a signed 19-bit word displacement. A block layout
   that needs more than 2^18 - 1 words forward or 2^18 words back (1,048,572 or 1,048,576 bytes) is
   refused with error 24 before any output is accepted; it is never silently truncated. Unconditional
-  B uses a 26-bit field, which the 8 MiB output capacity cannot exceed. (gate 669)
+  B uses a 26-bit field (128 MiB), which the output, part of omc's 128 MiB arena with the input and the
+  other tables (section 9.6), cannot reach; past it would be error 24 too. (gate 669)
 
 An initial line `target x86linux` selects the candidate FR-9 native x86-64 Linux backend.
 Without it, the existing AArch64 output remains unchanged. Whole-program output is a
@@ -553,23 +554,74 @@ the operations, the efi 12 file contract and qualification status.
   it in the same block is error 17. (s.6 t_exit, s.7)
 - `note ...` is a line the translator does not read beyond its first word. (s.6 sort, fib)
 
-### 9.6 Capacities (decision 23)
+### 9.6 Capacities (decision 23, amended 2026-11-11)
 
-Input over a capacity is refused with error 14, never overrun: om4 reads at most 8 MiB - 1 bytes and
-writes at most 8 MiB, 1024 names in scope, values nested 1024 deep, 4096 functions, 8192 trap sites per function, 512 nested
-blocks. A function that needs more than the 16 registers it hands out is error 12. omc keeps the same
-input, output, nesting, trap-site, block and function limits but holds 8192 names in scope,
-4096 distinct names of 9 to 63 characters (`seed/omc/gate-longnames.sh`) and
-524288 call sites per unit (`seed/omc/gate12.sh`, `gate15.sh`), so whole programs such as an
-interpreter fit in one unit; om4 itself keeps its own smaller name and call tables. om4's function
+A refusal is defined behaviour: input past a real capacity is refused with error 14, never overrun,
+truncated or corrupted. Since 2026-11-11 (Drake: "no hard caps on our own software; notice and fix
+instead") omc has no table capacity of its own; om4 keeps its own.
+
+**om4** reads at most 8 MiB - 1 bytes and writes at most 8 MiB, 1024 names in scope, values nested 1024
+deep, 4096 functions, 8192 trap sites per function, 512 nested blocks (error 14 past each). om4's function
 table (512 entries through om4 `d0da40e4`) bounds `seed/omc/omc.om` itself, which om4 must compile;
 `seed/rung4/gate4.sh` section 7b checks 4096 accepted and the 4097th error 14.
-The candidate `target x86linux` backend has a 16 MiB output pool because native
-x86 instruction sequences can require more bytes than their AArch64 counterparts.
-The AArch64 output ceiling remains 8 MiB; input and frontend limits are unchanged.
-An exhausted target output pool still refuses with error 14.
-A single AArch64 conditional branch span is limited to 2^18 - 1 words forward or 2^18 words back
-(section 9.1); a larger span is error 24, even when the input and output pools still fit.
+
+**omc** keeps every table that grows with the unit in one arena: the input, the output, names in scope
+(globals, texts, constants, locals), names of 9 to 63 characters, functions and their parameters, call
+sites, trap sites, open blocks, breaks and continues, inline returns and edges, the per-depth value cells,
+the x86 fixups and the `om2 diag` site records. A table starts small and doubles when it fills. When
+doubling does not fit, the arena is compacted (the words that moved tables left behind are reclaimed)
+and the table grows in place, to the largest size that fits; a table is refused only when all the live
+tables, with that one grown by one entry, no longer fit in the arena (measured: 982,370 globals of
+which every one holds a name, 16,777,209 of 16,777,216 words in use at the refusal). Name, long-name
+and function lookups are hashed, and the call graph is settled in linear time, so compile time stays
+linear (`seed/omc/gate-usage.sh` times units up to 100,000 names, calls and trap sites).
+What is left, and why:
+
+- The arena: 16777216 8-byte words (128 MiB), one named pool in `seed/omc/omc.om` (`a_ar`). A unit whose
+  tables need more is error 14 on the line being read, followed on stderr by an `omc-use` record with
+  `full=1` (below), which says what held the arena. The arena is fixed because a program has no
+  run-time growth (no heap, decision 24); its size is bounded by the smallest address-space limit omc
+  runs under (`prlimit --as=268435456` in the interplane-forge salvage compile: the whole static image
+  counts there, measured 2026-11-11: a data segment of 268296192 bytes still starts, one page more does
+  not) and by the 16777216-element pool limit (section 9.4). It is the boundary a heap would lift.
+- Value nesting: omc reads a value by recursion on its own fixed 8 MiB program stack (section 9.2). A
+  value nested deeper than 32768 levels is error 14 on its line, before that stack could run out
+  (measured: at most 144 bytes per level; 32768 allows 256). `seed/omc/gate-nocaps.sh` compiles every
+  measured shape 32767 deep, so a frame that grows is noticed. The same holds in IR mode.
+- The output: AArch64 output stops at 134217728 bytes, the reach of B and BL (imm26), so every call
+  and jump stays encodable; x86 code at 0x400000 ends below the pools at 0x10000000, at 264241152
+  bytes. Either is error 14 at its first byte (with the 128 MiB arena the arena fills first).
+- A single AArch64 conditional branch span is limited to 2^18 - 1 words forward or 2^18 words back
+  (section 9.1); a larger span (an `if` or loop body over 1 MiB) is error 24. Trap branches no longer
+  wait for the function's end: when a function's oldest waiting trap branch is 512 KiB back, omc
+  places the waiting stubs there, behind a B (an island), between two body lines that are outside
+  every `if`, `else`, `while` and `for` (unrolled bodies take islands; no block ever gets longer, so
+  block spans are as before). A trap branch can still reach error 24 inside one line that emits more
+  than 512 KiB (a value of some 18,000 nested calls) or inside a block that is itself near 1 MiB.
+- A function that needs more than the 16 registers it hands out is error 12 (no spilling).
+- Fixed tables omc still has, each error 14 past its number, kept in this change and listed so that
+  none is hidden (each a candidate for the arena): the OM-2 expansion bounds of `spec/omegese-om2.md`
+  section 4 (64 unrolled copies, 4 inline levels, 65536 units of expansion fuel per function); 16 structs,
+  16 fields and 64 cells a struct (9.7; struct and abstract types are encoded in the uchar type codes
+  16 + i and 64 + i); 16 abstract types; 16 layouts and 256 layout fields; 32 `export fn`; 64 entry and 64
+  head contract clauses; 16 `fresh` slots of at most 64 elements; the IR mode tables of 64 registers,
+  32 blocks, 256 ops, 32 literals, 32 bindings and 32 functions (OSC IR v1, which the C oracle shares); and
+  256 error and 256 done branches per x86efi operation.
+
+**The alarm** in place of the old capacities: a unit whose first line (after notes and blank lines) is
+`usage` is compiled as usual; instead of the artifact omc writes one line to stdout and exits 0:
+
+    omc-use 1 arena=A top=T waste=W full=F GROUP=N/H ...
+
+A the arena's words, T the words handed out, W the words left behind when a table moved, F 1 when the
+arena filled; for each group (`inp out site names namehash long longhash fns fnhash calls traps x86addr
+x86exit blocks breaks conts inlret inledge depth kahnfn kahncall`) N what the unit asked it to hold (bytes
+for `inp`, `out` and `site`, else the highest index plus 1) and H the words it holds. A refused `usage`
+unit writes the human line and then the record to stderr. `seed/omc/gate-usage.sh` compiles the largest
+units of the stack (omc.om itself, omega-mcp, cortex, forged) and scale units, and fails loudly, naming
+the unit, the measure and the number, when the arena top passes 25% (75% for a scale unit), one group
+passes 12.5%, a compile takes more than 2 s (10 s) or more than 64 MiB (256 MiB) resident. Its mutant
+control, an arena shrunk back to 8 MiB, must be caught.
 
 ### 9.7 Structs (omc only, rung 6)
 
@@ -603,15 +655,15 @@ om4 refuses them, so they are omc-only like structs. Checked by `seed/omc/gate7.
 
 - `break` scans the open blocks for the innermost loop (kind 3 while, 4 for), emits an
   always-taken `B.AL` to that loop's exit and records the word. When the loop closes, `s_end`
-  patches only the entries recorded for that block and marks them spent, so a later loop that
-  reuses the block slot cannot move an earlier break. Outside a loop it is error 9. Like `ret`,
-  the line ends the path: a later line in the same block is error 17. At most 1024 break sites
-  per function (error 14 over that), reset when the function ends. (gate7 w1, f1, n1-n3)
+  patches only the entries recorded since that loop opened and gives them back, so a later loop
+  that reuses the block slot cannot move an earlier break. Outside a loop it is error 9. Like `ret`,
+  the line ends the path: a later line in the same block is error 17. Break sites have no count of
+  their own since 2026-11-11 (they were 1024 per function; section 9.6). (gate7 w1, f1, n1-n3)
 - `continue` finds the innermost loop the same way, but its recorded branch is patched to the loop's
   latch, not its exit: the head of a while, so the condition and the bound count run again, or the
   increment of a for, so the counter still advances. Outside a loop it is error 9; a later line in the
-  same block is error 17; at most 1024 sites per function (error 14). (gate7 c1-c5, bad_continue,
-  bad_after_continue)
+  same block is error 17; continue sites have no count of their own (section 9.6). (gate7 c1-c5,
+  bad_continue, bad_after_continue)
 - `trap N` takes a decimal number 1..14 (error 4 when the line ends, 16 when the token is not a
   number, 8 out of range). It emits the same always-taken branch the runtime trap checks use;
   `finish` makes one stub per code, so program mode exits 100 + N and function mode calls
@@ -787,9 +839,9 @@ meaning and, for the C2 manifest, its exact output bytes or error.
   its runtime trap. Conversions are never folded. A number index into a sized array is checked when it
   is compiled (error 21), as in OM-1, and in an OM-2 unit up to 4095 it is an immediate offset (LDR/STR
   unsigned offset) with no runtime check. Every other index keeps its runtime check.
-- **Bounds.** At most 65536 emitted words per function after unrolling and inlining, 64 copies per
-  unrolled loop and 4 inline levels (error 14, `obligation=growth`). 16 registers stay the limit
-  (error 12, `obligation=regs`). Expansion fuel (E14, E16): each function has 65536; an unrolled loop is
+- **Bounds.** 64 copies per unrolled loop and 4 inline levels (error 14, `obligation=growth`); a
+  function's emitted words have no bound since 2026-11-11 (it was 65536 words; section 9.6). 16 registers
+  stay the limit (error 12, `obligation=regs`). Expansion fuel (E14, E16): each function has 65536; an unrolled loop is
   charged K when it starts, at its line, before any copy expands, and an inline expansion 1 at its call
   line, in emission order at every nesting depth (nested unrolls multiply). The charge that takes the
   total above 65536 is error 14 (`growth`) on its line; exactly 65536 is allowed. So two nested 64-copy
@@ -945,7 +997,7 @@ cannot be read). In IR mode (section 11) the same codes apply; a contract line (
 | omc 11 | bare number without a type from its context |
 | omc 12 | register pool exhausted |
 | omc 13 | name too long (63 bytes; 8 for an abstract, a layout, a layout field, or any name in IR mode) |
-| omc 14 | capacity exceeded (names, functions, sites, nesting, input or output) |
+| omc 14 | capacity exceeded (the compiler's arena, value nesting past omc's own stack, the program image, or an OM-2 expansion bound) |
 | omc 15 | missing end |
 | omc 16 | syntax: unknown or misplaced word |
 | omc 17 | line after ret, break, continue, trap or exit in the same block |

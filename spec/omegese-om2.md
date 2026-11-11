@@ -111,11 +111,14 @@ freeze needs `omegese-om3.md`.
   checked at compile time (error 21 outside) and gets no runtime check. Every other index keeps its
   runtime check. That includes every index into an unsized view (section 6) and every conversion range
   check. No other check is eliminated in OM-2.
-- **Resource bounds:** a function's emitted words after unrolling and inlining are at most 65536, an
-  unrolled body at most 64 copies, and inlining at most 4 levels deep. Anything beyond that is
-  error 14 with `obligation=growth`. The 16-register limit stays error 12 (`obligation=regs`): there is
-  no spilling. Each bound limits compiler work and memory linearly in the output. The per-function
-  stack of an inlined body counts toward the caller's frame under the OM-1 4 MiB local-array rule.
+- **Resource bounds:** an unrolled body is at most 64 copies, and inlining at most 4 levels deep.
+  Anything beyond that is error 14 with `obligation=growth`. The 16-register limit stays error 12
+  (`obligation=regs`): there is no spilling. Each bound limits compiler work and memory linearly in the
+  output. The per-function stack of an inlined body counts toward the caller's frame under the OM-1
+  4 MiB local-array rule. A function's emitted words have no bound of their own since 2026-11-11 (the
+  65536-word bound, which refused a unit such as 6553 view calls in one body, was a table size, not a
+  rule; OMEGESE 9.6): the output is part of omc's arena, and trap branches stay in reach through
+  islands of trap stubs inside a long function.
 - **Source mapping:** every emitted instruction keeps its source line. With `om2 diag`, a runtime trap
   site table is written after the artifact on stderr as `omc-site 1 line=N iter=k` records (k for
   unrolled copies, `-` otherwise). This does not change stdout.

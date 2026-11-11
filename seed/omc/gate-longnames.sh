@@ -1,5 +1,5 @@
 #!/bin/sh
-# gate-longnames.sh -- names of up to 63 bytes (docs/one_layer/OMEGESE.md 9.2, error 13; 9.6, error 14).
+# gate-longnames.sh -- names of up to 63 bytes (docs/one_layer/OMEGESE.md 9.2, error 13; 9.6, the arena).
 # The compiler under test is seed/out/omc (OMC overrides it).
 #  1. Every seed/omc/tests/longnames/NAME.om gives NAME.expect: "compile C", then "exit X" (the program's
 #     status; NAME.stdout, when present, is its exact stdout) or "stderr LINE" (the exact refusal). Target
@@ -7,8 +7,9 @@
 #     a newline, then the unit, and the program runs under qemu-x86_64; the prepended line makes every
 #     refusal line one higher (the om2 units carry their mode line after their notes, so they take it too).
 #     Without qemu-x86_64 the x86 runs are NOT_RUN and the gate ends with status 3.
-#  2. Capacity: 4096 distinct long globals compile and keep their values apart; the 4097th is error 14
-#     on its own line.
+#  2. Capacity: the long-name table is part of omc's arena (OMEGESE 9.6) and has no count of its own:
+#     20000 distinct long globals (the table held 4096 through omc f4fa7951) compile and keep their
+#     values apart, which also takes the long-name hash through its rebuilds (every 2^(b+1) names).
 #  3. Mutants: each one-line change of the interning in seed/omc/omc.om (a site that occurs exactly once)
 #     must build a compiler (om4 cannot be asked, so the compiler under test builds it) that fails some
 #     check of 1 or 2 on a64 (a wrong result, a refusal or a trap of the mutated compiler). A mutant that
@@ -52,18 +53,16 @@ check() {
   *) echo "$n.expect: bad second line"; return 1 ;;
   esac
 }
-# capacity COMPILER -> 0 when 4096 long globals work and the 4097th is error 14
+# capacity COMPILER -> 0 when 20000 long globals compile and keep their values apart (exit 12)
 gen() { awk -v n=$1 'BEGIN { for (i = 1; i <= n; i++) printf "global long_global_name_%05d uint 1\n", i
   print "fn main to int"; print "put long_global_name_00001 0 uint 5"; printf "put long_global_name_%05d 0 uint 7\n", n
   printf "ret int add get long_global_name_00001 0 get long_global_name_%05d 0\nend\n", n }'; }
-gen 4096 > $B/cap4096.om; gen 4097 > $B/cap4097.om
+gen 20000 > $B/cap20000.om
 capacity() {
-  set +e; "$1" < $B/cap4096.om > $B/c.bin 2> $B/c.err; rc=$?; set -e
-  [ $rc = 0 ] || { echo "capacity: 4096 long globals: compile $rc ($(cat $B/c.err))"; return 1; }
+  set +e; "$1" < $B/cap20000.om > $B/c.bin 2> $B/c.err; rc=$?; set -e
+  [ $rc = 0 ] || { echo "capacity: 20000 long globals: compile $rc ($(cat $B/c.err))"; return 1; }
   chmod +x $B/c.bin; set +e; $B/c.bin; x=$?; set -e
-  [ $x = 12 ] || { echo "capacity: 4096 long globals: exit $x, wanted 12"; return 1; }
-  set +e; "$1" < $B/cap4097.om > $B/c.bin 2> $B/c.err; rc=$?; set -e
-  [ $rc = 14 ] && [ "$(cat $B/c.err)" = "omc: line 4097: error 14" ] || { echo "capacity: 4097 long globals: compile $rc ($(cat $B/c.err)), wanted line 4097 error 14"; return 1; }
+  [ $x = 12 ] || { echo "capacity: 20000 long globals: exit $x, wanted 12"; return 1; }
 }
 names=$(ls $D/*.om | sed 's|.*/||; s|\.om$||')
 nr=0; nx=0; skip=0
@@ -74,7 +73,7 @@ for n in $names; do
 done
 say "PASS $nr long-name units on a64, $nx on x86${Q:+ (qemu-x86_64)}"
 capacity "$S" > $B/why || bad "$(cat $B/why)"
-say "PASS capacity: 4096 long globals keep their values apart (exit 12), the 4097th is line 4097 error 14"
+say "PASS capacity: 20000 long globals keep their values apart (exit 12)"
 
 # mutants: SITE|REPLACEMENT, each site exactly once in omc.om
 k=0
@@ -93,12 +92,12 @@ while IFS='|' read -r site repl; do
   [ -n "$caught" ] || bad "mutant $k ($repl): no check notices it"
   say "  killed mutant $k ($repl) by $caught: $(cat $B/why)"
 done <<'MUT'
-i = add n 1|i = add i 1
-if ne get ln_b add o i bt|if eq get ln_b add o i bt
-put ln_l k uchar n|put ln_l k uchar 9
-put tw 0 add 1 shl k 8|put tw 0 add 1 shl mul k 0 8
+if ne a_ib add o i a_ib add s i|if eq a_ib add o i a_ib add s i
+if ne ulong a_gu 18 j n|if ne ulong a_gu 18 j 9
+a_pc 18 k uchar n|a_pc 18 k uchar 9
+put tw 0 add 1 shl ln_intern get ts 0 n 8|put tw 0 add 1 shl mul ln_intern get ts 0 n 0 8
 if and gt n 8 le n 63|if and gt n 8 le n 62
-if ge k 4096|if ge k 4095
+a_p 20 h add j 1|a_p 20 h add j 2
 MUT
 say "PASS $k interning mutants each fail a check"
 [ $skip = 0 ] || { say "NOT_RUN $skip x86 runs (no qemu-x86_64)"; exit 3; }

@@ -100,14 +100,15 @@ fi
 run "$T/p.om"
 expect e12_register_pool 12 18
 
-# 14: the 8193rd global exceeds the name table.
+# 14: a value nested past the depth omc's own 8 MiB stack can hold (32768 levels, OMEGESE 9.6). The
+# arena-full refusal, the other emitting site, is checked by seed/omc/gate12.sh.
 {
-    i=1
-    while [ "$i" -le 8193 ]; do printf 'global g%s uchar 1\n' "$i"; i=$((i + 1)); done
-    printf 'fn main to int\nret 0\nend\n'
+    printf 'fn main to int\ny = ulong 7\nx = '
+    awk 'BEGIN { for (i = 0; i < 32768; i++) printf "ulong " }'
+    printf 'y\nret int rem x 256\nend\n'
 } > "$T/p.om"
 run "$T/p.om"
-expect e14_capacity 14 8193
+expect e14_capacity 14 3
 
 # 24: an `if` body of N one-word lines. N=262142 keeps the B.cond displacement in range (accept);
 # N=262143 does not, and the refusal names the `end` that closes the `if` (line N+4).

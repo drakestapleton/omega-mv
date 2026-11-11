@@ -91,7 +91,8 @@ end
 `unroll` emits the body eight times with `i` constant, so the loop branch and counter disappear; `rotr`
 with a number amount becomes one `ROR`. Removing `unroll` changes size and speed, never behaviour. The
 same is true for `inline`. Both are bounded by contract, not by hope: 64 copies per loop, 4 inline
-levels, 65536 emitted words and 65536 expansion fuel per function, 16 registers (errors 14 and 12).
+levels and 65536 expansion fuel per function, 16 registers (errors 14 and 12). A function's emitted
+words have no bound since 2026-11-11 (OMEGESE 9.6).
 
 Folding happens only inside an unrolled or inlined body, and never for an operation that would trap. A
 **number** index into a sized array (up to 4095) becomes an immediate offset with no run-time check;

@@ -180,7 +180,13 @@ it came from.
   - no undefined behaviour: unsigned numbers wrap, signed numbers stop with an error ("trap") when they
     overflow, division by zero traps, a bad index traps, running out of stack traps; the spec has no
     "undefined" in it (the gate checks with a search);
-  - no automatic conversions: mixing two types in one operation is refused.
+  - no automatic conversions: mixing two types in one operation is refused;
+  - capacities (decision 23): input past a capacity is refused with error 14, never overrun. om4 keeps
+    its fixed tables. Amended 2026-11-11 for omc (Drake: no hard caps on our own software; notice and
+    fix instead): omc's tables grow in one arena, the refusals left are the arena itself (bounded by
+    the address space omc must start in, while a program has no heap) and value nesting past omc's own
+    stack, and a test alarms on usage instead (`seed/omc/gate-usage.sh`, `gate-nocaps.sh`;
+    `docs/one_layer/OMEGESE.md` 9.6).
 - Checks (`rung4/gate4.sh`, results in `build/seed/r4/evidence/`, compared with the recorded receipt
   `evidence/SEED-0/rung4/`, never written over it), 217 cases, all pass:
   - asm2 rebuilds om4 to the same bytes; objdump (the referee) reads all 3,170 instructions back to

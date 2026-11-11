@@ -74,6 +74,16 @@ g4() { # compiler build-dir evidence-dir -> gate4 with the compiler in om4's pla
   [ "$(grep -c "$1" $2.sh)" = 7 ] || { bad "gate4 changed shape: the compiler is not in its 7 places"; return 1; }
   grep -q "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl = a" $2.sh || { bad "gate4 changed shape: its error-13 case was not renamed"; return 1; }
   grep -q "^R=seed/rung4; B=$2; E=$3; REC=;" $2.sh || { bad "gate4 changed shape: its result and receipt directories are not set"; return 1; }
+  # om4's own table capacities (OMEGESE 9.6): its value nesting of 1024 and its 4096 functions (section 7b)
+  # are om4's fixed tables; omc has none of its own since 2026-11-11, so with any compiler but om4 itself
+  # those two checks are left out here (gate12, gate-nocaps and gate-usage check omc's boundaries instead)
+  if [ "$1" != "$B/cap.sh" ]; then
+    grep -c "values nested over 1024 deep (a capacity, refused not overrun)" $2.sh | grep -qx 1 &&
+      grep -c "^# 7b\. function table capacity" $2.sh | grep -qx 1 &&
+      grep -c "^# 8\. negative control" $2.sh | grep -qx 1 || { bad "gate4 changed shape: its capacity checks were not found"; return 1; }
+    awk '/values nested over 1024 deep \(a capacity, refused not overrun\)/ { next }
+      /^# 7b\. function table capacity/ { skip = 1 } /^# 8\. negative control/ { skip = 0 } !skip { print }' $2.sh > $2.sh.t && mv $2.sh.t $2.sh
+  fi
   NF_N=0 sh $2.sh > $2.out 2>&1 && tail -1 $2.out | grep -q "^GATE4 PASS$" # section 10 (next fuzz of om4 alone) is run by gate4 itself
 }
 g4 $B/cap.sh $B/g4cap $B/g4cape || bad "gate4 (capturing) did not pass: $(grep FAIL $B/g4cap.out | head -3)"
@@ -84,14 +94,22 @@ done
 #    added beyond om4 (OMEGESE.md section 9), listed by the sha256 of its text with om4's refusal and omc's exit;
 #    the C path (the language oracle) must accept it. An unlisted difference, a listed row that no longer differs,
 #    a listed row the corpus does not reach, or a listed program the C path refuses is a FAIL.
-X=$R/tests/om4-superset.tsv; same=0; ext=0; n=0; seen=""
+#    The rows of $R/tests/om4-capacity.tsv are inputs om4 refuses with error 14 at one of its own table capacities
+#    (OMEGESE 9.6), which omc no longer has: om4 must give exactly the row's refusal and omc exactly the row's
+#    status and stderr line (`-` for none); a stale or unreached row is a FAIL as above.
+X=$R/tests/om4-superset.tsv; K=$R/tests/om4-capacity.tsv; same=0; ext=0; capd=0; n=0; seen=""
 for f in $C/*.in; do n=$((n + 1))
   set +e; $R4/om4.bin < $f > $B/c.a 2> $B/c.ae; ra=$?; $S < $f > $B/c.b 2> $B/c.be; rb=$?; set -e
   CODES="$CODES $ra"
   sed -i 's/^om4:/X:/' $B/c.ae; sed -i 's/^omc:/X:/' $B/c.be
-  h=$(sha $f); row=$(grep "^$h[[:space:]]" $X || true)
+  h=$(sha $f); row=$(grep "^$h[[:space:]]" $X || true); krow=$(grep "^$h[[:space:]]" $K || true)
   if [ $ra = $rb ] && cmp -s $B/c.a $B/c.b && cmp -s $B/c.ae $B/c.be; then same=$((same + 1))
-    [ -z "$row" ] || bad "om4-superset row $(echo "$row" | cut -f2) no longer differs from om4: drop the row"
+    [ -z "$row$krow" ] || bad "om4-superset/om4-capacity row $(echo "$row$krow" | cut -f2) no longer differs from om4: drop the row"
+  elif [ -n "$krow" ]; then seen="$seen $h"; src=$(echo "$krow" | cut -f2); ke=$(echo "$krow" | cut -f3); kb=$(echo "$krow" | cut -f4); kx=$(echo "$krow" | cut -f5)
+    [ "$kx" = - ] && kx=""
+    if [ $ra = 14 ] && [ "$(cat $B/c.ae)" = "X: $ke" ] && [ $rb = $kb ] && [ "$(cat $B/c.be)" = "${kx:+X: $kx}" ]
+    then capd=$((capd + 1)); say "  om4 capacity: $src: om4 $ke; omc exit $rb${kx:+ ($kx)}"
+    else bad "om4-capacity $src: om4 exit $ra $(cat $B/c.ae) (row: 14 $ke), stage2 exit $rb $(cat $B/c.be) (row: $kb $kx)"; fi
   elif [ -z "$row" ]; then bad "corpus $(basename $f): om4 exit $ra $(cat $B/c.ae), stage2 exit $rb $(cat $B/c.be)"
   else seen="$seen $h"; src=$(echo "$row" | cut -f2); xa=$(echo "$row" | cut -f4); xe=$(echo "$row" | cut -f5); xb=$(echo "$row" | cut -f6)
     if [ $ra = $xa ] && [ "$(cat $B/c.ae)" = "X: $xe" ] && [ $rb = $xb ] && [ -s $B/c.b ] && [ ! -s $B/c.be ] && build/omegese/omegese emit $f $B/c.json > /dev/null 2>&1
@@ -99,15 +117,16 @@ for f in $C/*.in; do n=$((n + 1))
     else bad "om4-superset $src: om4 exit $ra $(cat $B/c.ae) (row: $xa $xe), stage2 exit $rb $(cat $B/c.be) (row: $xb), C path: $(build/omegese/omegese emit $f $B/c.json 2>&1 | head -1)"; fi
   fi
 done
-for h in $(grep -v '^#' $X | tail -n +2 | cut -f1); do case "$seen" in *" $h"*) ;; *) bad "om4-superset row $h is not in the corpus: stale row";; esac; done
+for h in $(cat $X $K | grep -v '^#' | grep -v '^sha256	' | cut -f1); do case "$seen" in *" $h"*) ;; *) bad "om4-superset/om4-capacity row $h is not in the corpus: stale row";; esac; done
 refused=$(for f in $C/*.in; do $R4/om4.bin < $f > /dev/null 2>&1 || echo x; done | wc -l)
-[ $((same + ext)) = $n ] && say "PASS corpus: om4 = stage2 on $same inputs ($refused of them refused, same error number and line); $ext inputs beyond om4 are listed in seed/omc/tests/om4-superset.tsv, each accepted by omc and the C path"
+[ $((same + ext + capd)) = $n ] && say "PASS corpus: om4 = stage2 on $same inputs ($refused of them refused, same error number and line); $ext inputs beyond om4 are listed in seed/omc/tests/om4-superset.tsv, each accepted by omc and the C path; $capd inputs at om4's own capacities are listed in seed/omc/tests/om4-capacity.tsv"
 cases=$((cases + n))
 
 # 3b. what the corpus does not reach. A program that writes a text with every escape, checked against fixed
 #     bytes and a fixed exit value (97 + 9 + 98, worked by hand), not only against om4. One input for each
 #     error number the corpus and the fuzz do not reach: 1 (stdin is a folder), 2 (stdout is full), 4, 11,
-#     12, 13, 14 (input over 8 MiB); om4 and stage2 must both give it, with the same message
+#     12, 13; om4 and stage2 must both give it, with the same message. 14: om4's 8 MiB input buffer refuses a
+#     9000000-byte unit, which omc, whose input is part of its arena (OMEGESE 9.6), compiles.
 for c in om4:$R4/om4.bin stage2:$S; do n=${c%%:*}; cc=${c#*:}
   $cc < $R/tests/text.om > $B/text.$n; chmod +x $B/text.$n
   set +e; ./$B/text.$n > $B/text.$n.out; rc=$?; set -e
@@ -126,7 +145,11 @@ printf 'fn f to uint\nret add 1 2\nend\n' > $B/e11.om; ecase 11 $B/e11.om $B/e.o
 { echo 'fn f to uint'; for i in $(seq 1 17); do echo "v$i = uint $i"; done; echo 'ret 0'; echo 'end'; } > $B/e12.om; ecase 12 $B/e12.om $B/e.out
 #    error 13 with a 64-byte name: om4 refuses names over 8 bytes, omc names over 63 (OMEGESE.md section 4)
 printf 'fn f to uint\nabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl = uint 1\nret 0\nend\n' > $B/e13.om; ecase 13 $B/e13.om $B/e.out
-yes 'note filler' | head -c 9000000 > $B/e14.om; ecase 14 $B/e14.om $B/e.out
+{ yes 'note filler' | head -c 9000000 | sed '$d'; printf 'fn f a uint to uint\nret a\nend\n'; } > $B/e14.om
+set +e; $R4/om4.bin < $B/e14.om > $B/e.out 2> $B/e.a; ra=$?; $S < $B/e14.om > $B/e.out 2> $B/e.b; rb=$?; set -e
+[ $ra = 14 ] && [ "$(cat $B/e.a)" = "om4: line 0: error 14" ] && [ $rb = 0 ] && [ -s $B/e.out ] && [ ! -s $B/e.b ] &&
+  say "PASS error 14 from om4 (line 0, its 8 MiB input); omc compiles the same 9000000-byte unit" || bad "error 14: om4 exit $ra $(cat $B/e.a), stage2 exit $rb $(cat $B/e.b)"
+CODES="$CODES $ra"
 cases=$((cases + 10))
 
 # 4. (c) gate4 with stage2 in om4's place: the 10 dev tasks and 9 function-mode tests against the C path

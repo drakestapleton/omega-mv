@@ -1,6 +1,10 @@
 #!/bin/sh
-# gate12.sh -- documented capacities (OMEGESE 9.6). Each case is generated, compiled by
-# seed/out/omc, and checked for the documented accept/refuse boundary. RC=0 only when all pass.
+# gate12.sh -- documented capacities (OMEGESE 9.6, decision 23 as amended 2026-11-11). omc's tables live in
+# one arena and grow; what is left are the arena itself, the depth omc's own stack can hold, and the
+# program's own pool limits (OMEGESE 9.4, error 23). Each case is generated, compiled by seed/out/omc, and
+# checked for the documented accept/refuse boundary. The units one past each old table size (8192 names,
+# 4096 functions, 512 blocks, 8 MiB input) are accepted; seed/omc/gate-nocaps.sh takes them far past.
+# RC=0 only when all pass.
 set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$R"
@@ -31,30 +35,33 @@ refuse() { # name file code
     say "PASS $1 error $3"
 }
 
-awk 'BEGIN{for(i=0;i<8192;i++)printf "global g%d uchar 1\n",i; print "fn main to int"; print "ret 0"; print "end"}' > "$T/g8192.om"
 awk 'BEGIN{for(i=0;i<8193;i++)printf "global g%d uchar 1\n",i; print "fn main to int"; print "ret 0"; print "end"}' > "$T/g8193.om"
-awk 'BEGIN{for(i=0;i<4095;i++)printf "fn q%d to int\nret 0\nend\n",i; print "fn main to int"; print "ret 0"; print "end"}' > "$T/f4095.om"
 awk 'BEGIN{for(i=0;i<4096;i++)printf "fn q%d to int\nret 0\nend\n",i; print "fn main to int"; print "ret 0"; print "end"}' > "$T/f4096.om"
-for n in 512 513; do
-    awk -v n="$n" 'BEGIN{print "fn main to int"; print "x = ulong 1"; for(i=0;i<n;i++)print "if eq x 1"; print "ret 0"; for(i=0;i<n;i++)print "end"; print "ret 0"; print "end"}' > "$T/b$n.om"
-done
+awk 'BEGIN{print "fn main to int"; print "x = ulong 1"; for(i=0;i<513;i++)print "if eq x 1"; print "ret 0"; for(i=0;i<513;i++)print "end"; print "ret 0"; print "end"}' > "$T/b513.om"
 printf 'fn main to int\na = new uchar 4194305 0\nret 0\nend\n' > "$T/local.om"
 printf 'fn main to int\na = new uchar 16777217 0\nret 0\nend\n' > "$T/arr.om"
 awk 'BEGIN{for(i=0;i<64;i++)printf "global h%d uchar 16777216\n",i; print "global k uchar 1"; print "fn main to int"; print "ret 0"; print "end"}' > "$T/pools.om"
+# a value nested 32768 deep: past what omc's own 8 MiB stack holds (32767 is accepted)
+for d in 32767 32768; do
+    { printf 'fn main to int\ny = ulong 7\nx = '; awk -v d=$d 'BEGIN { for (i = 0; i < d; i++) printf "ulong " }'; printf 'y\nret int rem x 256\nend\n'; } > "$T/v$d.om"
+done
+# an input one byte over the old 8 MiB buffer: a program after note lines
+{ yes 'note padding' | head -c 8388609 | sed '$d'; printf 'fn main to int\nret 0\nend\n'; } > "$T/big.om"
+# an input past the arena (16777216 words, 134217728 bytes)
+yes 'note padding' | head -c 134217729 > "$T/arena.om"
 
-accept g8192 "$T/g8192.om"
-refuse g8193 "$T/g8193.om" 14
-accept f4095 "$T/f4095.om"
-refuse f4096 "$T/f4096.om" 14
-accept b512 "$T/b512.om"
-refuse b513 "$T/b513.om" 14
+accept g8193 "$T/g8193.om"
+accept f4096 "$T/f4096.om"
+accept b513 "$T/b513.om"
 refuse local "$T/local.om" 23
 refuse arr "$T/arr.om" 23
 refuse pools "$T/pools.om" 23
-
-# The input buffer is 8 MiB; one byte over must be refused with error 14.
-dd if=/dev/zero bs=8388609 count=1 2>/dev/null | tr '\0' '\n' > "$T/big.om"
-refuse big "$T/big.om" 14
+accept v32767 "$T/v32767.om"
+refuse v32768 "$T/v32768.om" 14
+accept big "$T/big.om"
+refuse arena "$T/arena.om" 14
+grep -q '^omc-use 1 arena=16777216 .* full=1 ' "$T/arena.err" || bad "arena: no omc-use record with full=1"
+rm -f "$T/arena.om" "$T/big.om"
 
 say "PASS gate12 10 cases"
 exit 0

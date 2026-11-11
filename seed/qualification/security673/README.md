@@ -39,15 +39,18 @@ print the success line. An unexpected gate crash is INVALID, never a passing neg
 The actual compiler encoder `bdisp` (every B.cond/CBZ/CBNZ imm19 and every B/BL imm26 site) is
 exposed by an exact-once source transform, not copied into a test implementation. Probe cases 0..7
 accept the imm19 and imm26 extremes with the exact field, 8..15 refuse one word past each limit and
-misaligned ends with error 24, 16..17 show the 8 MiB output ceiling (error 14) that keeps every B/BL
-inside its signed 128 MiB reach, so imm26 error 24 is a defence that no legal program reaches. The
+misaligned ends with error 24, 16..17 show the AArch64 output ceiling (error 14) that keeps every B/BL
+inside its signed 128 MiB reach: 16 accepts a word at 8 MiB (the ceiling through omc f4fa7951; since
+2026-11-11 the output grows in omc's arena, OMEGESE 9.6) and 17 refuses the first word at 128 MiB, so imm26 error 24 is a defence that no legal program reaches. The
 forward branch-limit mutant is compiled from a distinct transformed source; its output is decoded
 and rejected without execution. The range-free mutant (`branch-mutate 7`, then `0`) must answer 81
 on exactly the four out-of-range cases. Long backward imm19 from source is not reachable through
-`while`/`continue`: the loop-bound trap B.cs at the head is 5 words longer forward than the continue
-is back, so the forward limit refuses first. Corpus mode 4 rows: N = 3, 16 and 262127 (the largest
-accepted, continue 262138 words back) compile, decode with `branch-check 1` and exit 0; N = 262128,
-262133 and 262134 are refused with 24. The range-free compiler accepts N = 262134 (continue 2^18 + 1
+`while`/`continue`: the loop-bound trap B.cs at the head reaches farther forward than the continue
+reaches back, so the forward limit refuses first. Corpus mode 4 rows: N = 3, 16 and 262131 (the largest
+accepted, continue 262142 words back) compile, decode with `branch-check 1` and exit 0; N = 262132,
+262133 and 262134 are refused with 24. (Through omc f4fa7951 the head's stubs sat after the function's
+`ret`, 4 words farther: 262127 was the largest accepted and 262128 the first refused. Since 2026-11-11 the
+stubs of a trap branch 512 KiB back sit in an island right after the loop, OMEGESE 9.6.) The range-free compiler accepts N = 262134 (continue 2^18 + 1
 words back) and its B.AL decodes to the wrong target (61); that output is never executed.
 
 GNU objdump is outside the seed compiler lineage. The `.om` checker consumes its selected text
@@ -64,11 +67,15 @@ edges; the unconditional B over an `else`; a branch inside a called function; an
 and divide-by-zero trap sites. The coordinator compiles and executes each and compares the exit
 with the fixed table in `formwant`. These cases check target selection, while `boundaries`,
 `positive`, `negative`, `array-fill` and `mutant` continue to check the imm19 range and refusal.
+Corpus mode 3 (a trap, then 300000 one-word lines) was a `negative` row (error 24: the trap stub sat
+at the function's end) through omc f4fa7951; since 2026-11-11 omc places waiting trap stubs in an island
+(OMEGESE 9.6), so `trapfar` compiles it and runs it to trap 2 (exit 102), the CBZ landing on the island's code-2 stub.
 
 All imm19 writes still flow through `disp19`/`patch19`. The compiler does not expand or relax a
 branch: a target outside the signed 19-bit word displacement, or an unaligned target, is refused
 with error 24 before an artifact is accepted. Unconditional B uses `patch26` and the inspected
-8 MiB output-pool capacity. Evidence is `evidence/SECURITY-673/branchforms1`.
+8 MiB output-pool capacity (through omc f4fa7951; since 2026-11-11 the AArch64 output ceiling is the
+128 MiB imm26 reach itself, OMEGESE 9.6, and long functions get trap-stub islands). Evidence is `evidence/SECURITY-673/branchforms1`.
 
 ## Strict launch profile (#670)
 

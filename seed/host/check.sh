@@ -26,6 +26,11 @@ sh seed/omc/gate18.sh
 sh seed/omc/gate-recursion.sh
 # names of up to 63 bytes; status 3 (NOT_RUN) only for its x86 runs when qemu-x86_64 is absent, printed by the gate
 sh seed/omc/gate-longnames.sh || { r=$?; [ $r = 3 ] || exit $r; }
+# no table capacities in omc (OMEGESE 9.6): units far past the old ones, with omc f4fa7951 as control
+sh seed/omc/gate-nocaps.sh
+# the alarm in place of the capacities: arena, time and memory of the stack's largest units; status 3
+# (NOT_RUN) only when a sibling checkout (../omega-mcp, ../cortex, ../interplane-forge) is absent
+sh seed/omc/gate-usage.sh || { r=$?; [ $r = 3 ] || exit $r; }
 # Executable contracts use the existing fail-closed Omega conductor.
 B=build/seed/contracts
 mkdir -p "$B"

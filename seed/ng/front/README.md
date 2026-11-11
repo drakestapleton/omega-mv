@@ -43,16 +43,20 @@ without the cap (slots past 16 share a number); ΩIR values replace them.
 Units ng does not take exit 64 and are `scope` rows (`NAME scope K REASON`, omc must exit K): x86/EFI
 targets (D8) and IR v1 units (first line `ir`). A bound of ng's own that omc never reaches because
 another omc limit refuses first is an `ngonly` row (`NAME ngonly K REASON`): both must exit K, and
-their stderr lines differ. The one today is ng's 524288-entry call table (`calls_524289`; omc stops at
-its 8192-entry trap-site table, so `calls_524288` is a beyond row). Each K is omc's exit as measured
-with the pinned omc. om2 fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
-Input of 8388608 bytes or more is error 14 as in omc (cases `size_*`); the one input edge that is
+their stderr lines differ (none today). Since 2026-11-11 omc has no table capacities (OMEGESE 9.6) while
+ng's front keeps its fixed tables (8 MiB input, 8192 names, 4096 long names and functions, 512 blocks,
+1024 value nesting, 524288 calls): an input ng refuses at one of them and omc takes past it is an
+`ngcap` row (`NAME ngcap K REASON`, REASON naming ng's table): ng must exit K and omc anything else below
+100. The gate prints `NGCAP ng still refuses C inputs omc accepts` on every run with C > 0, so the gap
+stays visible until ng's tables are lifted, and a row whose input ng accepts fails. Each K is omc's exit
+as measured with the pinned omc (ng's for ngcap). om2 fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
+Input of 8388608 bytes or more is ng's error 14 (cases `size_*`, ngcap rows: omc reads past it since 2026-11-11); the one input edge that is
 main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
+    gate-front seed/out/omc c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607 \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt \
@@ -108,7 +112,7 @@ calls: both are omc code-shape choices with the same results.
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
+    gate-front-ir seed/out/omc c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607 \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
 It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
@@ -163,7 +167,7 @@ to ΩIR `fma` (46, one rounding) on three values of one float type. Run cases `c
 `fma_types` (7) are refuse cases. A bool or float shift amount, which omc also admits, stays not lowered; the scope
 gate keeps it failing closed, and its bool-amount admission mutant must be KILLED:
 
-    gate-front seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
+    gate-front seed/out/omc c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607 \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-lower-scope.txt seed/ng/front/mutants-lower-scope.txt SCRATCH \
       seed/ng/front/cases-lower-scope.txt
@@ -213,7 +217,7 @@ an ordinary assignment that silently removes its runtime check. OM-1 names retai
 The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
 the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
 
-    gate-front seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
+    gate-front seed/out/omc c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607 \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
       seed/ng/front/cases-contract-scope.txt
