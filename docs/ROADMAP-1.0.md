@@ -223,11 +223,19 @@ slices), #705, #759.
 Gap: programs whose working set is not known at compile time (parsers, interpreters, `aien-math`)
 must preallocate global pools or use mapping copies.
 
+Decision (2026-11-11): run-time growth in its smallest form, recorded as decision 3 of
+`~/handoffs/yourtrained-cortex/briefs/decisions-20261111.md` (the lead, under Drake's delegation of that
+day; Drake can reverse it). This decision is the operator gate this milestone waited for. PROPOSED design,
+independently reviewed: `docs/RUNTIME-POOLS.md` (run-time pools: `global NAME T *`, `enlarge`, `len`; no
+`free`). Nothing built yet; the acceptance items below apply to its landings.
+
 Acceptance:
-- BLOCKED_OPERATOR until Drake records a decision: keep decision 24 (and document pools plus
-  mappings as the 1.0 model with sizing guidance), or replace it with a named model. Options with
-  existing specs: region/arena with whole-region release; generation-checked handles matching IR
-  `HALLOC/HGEN/HFREE` so checker2 can validate the lowering.
+- A decided model: the decision above. It settled as: decision 24 kept (no `free`), with run-time growth
+  added as a region without release, so the next bullet applies with no reachable release. The choice
+  was between keeping decision 24 (documenting
+  pools plus mappings as the 1.0 model with sizing guidance) or to replace it with a named model;
+  options with existing specs were region/arena with whole-region release, and generation-checked
+  handles matching IR `HALLOC/HGEN/HFREE` so checker2 can validate the lowering.
 - If a model is adopted: use-after-release, double release and stale generation are refused at
   compile time or trap with a named code before any access; exhaustion returns a status, never an
   overrun; fixtures, mutants that remove each check, and a fuzz differential against an independent
@@ -268,8 +276,8 @@ Acceptance:
 - Two separately compiled `.om` modules linked into one program-mode binary and one function-mode
   library, with interleaved calls, matching a concatenated single-unit build in behaviour.
 - Negative controls: wrong digest, wrong pin, wrong profile, duplicate export, cycle.
-- Per-unit capacities chosen by measurement on the largest real consumer and gated at their boundary
-  (accept N, refuse N+1 with error 14), as gate12/gate15 do today.
+- (Amended 2026-11-11: the no-caps rule, OMEGESE 9.6, supersedes per-unit capacities.) No per-unit
+  capacity of omc's own; usage is watched by `seed/omc/gate-usage.sh`, which alarms past its thresholds.
 
 ### RM7. omega-bridge FFI
 
@@ -372,7 +380,7 @@ Acceptance:
 ## 3. Order
 
 RM1 first: it makes every later gate meaningful. RM8 and RM6 decisions early, because RM2, RM5 and
-RM7 add codes and boundaries. RM4 waits on Drake's decision; RM5 does not depend on it for 1.0 if the
+RM7 add codes and boundaries. RM4 has its decision (2026-11-11, docs/RUNTIME-POOLS.md); RM5 does not depend on it for 1.0 if the
 text unit uses caller-provided buffers. RM3's baseline can run now; its optimization step waits for RM2
 so contracts and optimization do not edit the same compiler paths at once. RM9 and RM10 run in
 parallel on disjoint paths. RM11 is last and freezes only what passed.
