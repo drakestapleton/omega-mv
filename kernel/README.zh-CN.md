@@ -1,5 +1,9 @@
 # Aienux
 
+<!-- languages -->
+[English](README.md) · **简体中文**
+<!-- /languages -->
+
 > **状态：实验性，pre-alpha。这里的任何内容都未经可供实际使用的鉴定。** C 内核已在 Raspberry Pi 5 和一台 2017 年的 iMac 上运行过，但仅限于使用 TEST 密钥或一次性机密的测试构建。它尚未在 NVIDIA DGX Spark 上启动过。不提供任何支持、稳定性或兼容性承诺。预计会有破坏性变更。
 
 Aienux 是 AienOS 的内核：它是我自己的操作系统内核，用来取代 DGX Spark 上的 Linux。AienOS 是构建在它之上的整个系统。它是智能体原生的：智能体是控制平面，而模型永远不是内核。内核保持小巧、确定且不含智能，智能体也永远不是信任根。内核的大部分是 `native/` 中的 C 代码。较早的 Rust 内核和工具位于 `crates/` 中。
