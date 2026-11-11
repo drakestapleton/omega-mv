@@ -23,8 +23,9 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04`,
-   from `seed/omc/omc.om` `ec414f48bd973dc0fbfd181d9475a4636dc0b2ff8e7c9bbadc97d8504d548448`; omc inline-cycle check reads the inline-edge tables only (no trap 3 past the calls' room; gate-nocaps drives every table past its first room), branch `omc/inline-edges` on Radicle main ad3f7770). The earlier audit pins
+   `a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533`,
+   from `seed/omc/omc.om` `763747fc549c1270cce0471b32b744664dcde975abb0e7f4e6e564e254ac5a4f`; omc run-time pools, landing 1 (global NAME T *, enlarge, len; OMEGESE 9.15), branch `omc/pools` on Radicle main 83507124). The earlier audit pins
+   `2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04` (omc inline-cycle check reads the inline-edge tables only (no trap 3 past the calls' room; gate-nocaps drives every table past its first room), branch `omc/inline-edges` on Radicle main ad3f7770),
    `1e628c80d5bd2ad0b08eb46d8abff66eff284a74e5a302e589c2d61cfe9f7347` (omc arena accesses written inline, in range by construction, and input-sized first rooms (compile time at or below f4fa7951 on the stack's units), branch `omc/perf` on Radicle main 1fa9e360),
    `c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607` (omc tables in one growing arena, no table capacities (OMEGESE 9.6, decision 23 amended 2026-11-11), branch `omc/no-caps` on Radicle main b2ad967e),
    `f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9` (OM-2 AArch64 global array bases and lengths pinned in X18..X26, with factory bay 16's pinshut fix, branch `ham/omc-perf-mem-3`, stacked on `ham/om-threads-4` and `ham/omc-perf-loops-5` on Radicle main 12bdb787),

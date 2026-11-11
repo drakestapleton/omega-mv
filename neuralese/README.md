@@ -17,11 +17,13 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after omc inline-cycle check reads the inline-edge tables only (no trap 3 past the calls' room; gate-nocaps drives every table past its first room), branch `omc/inline-edges` on Radicle main ad3f7770 (2026-11-11): committed
+Current pin after omc run-time pools, landing 1 (global NAME T *, enlarge, len; OMEGESE 9.15), branch `omc/pools` on Radicle main 83507124 (2026-11-11): committed
 `seed/out/omc` SHA-256
-`2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04`, compiler
-source SHA-256 `ec414f48bd973dc0fbfd181d9475a4636dc0b2ff8e7c9bbadc97d8504d548448`.
-The previous pin, after omc arena accesses written inline, in range by construction, and input-sized first rooms (compile time at or below f4fa7951 on the stack's units; branch `omc/perf`, landed as d6840959, 2026-11-11), was
+`a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533`, compiler
+source SHA-256 `763747fc549c1270cce0471b32b744664dcde975abb0e7f4e6e564e254ac5a4f`.
+The previous pin, after omc inline-cycle check reads the inline-edge tables only (no trap 3 past the calls' room; gate-nocaps drives every table past its first room; branch `omc/inline-edges`, landed as 83507124, 2026-11-11), was
+`2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04` (source
+`ec414f48bd973dc0fbfd181d9475a4636dc0b2ff8e7c9bbadc97d8504d548448`); before that, after omc arena accesses written inline, in range by construction, and input-sized first rooms (compile time at or below f4fa7951 on the stack's units; branch `omc/perf`, landed as d6840959, 2026-11-11), was
 `1e628c80d5bd2ad0b08eb46d8abff66eff284a74e5a302e589c2d61cfe9f7347` (source
 `de4099cad761a315d6bf9898bc29eb18b9eedddb568594d41e80d0de462f4199`); before that, after omc tables in one growing arena, no table capacities (branch `omc/no-caps`, landed as 3537baad, 2026-11-11), was
 `c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607` (source
@@ -183,7 +185,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04 \
+    a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533 \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -399,7 +401,7 @@ It is exactly the committed `seed/out/omc` introduced by
 the lock. Read-only `git show <revision>:seed/out/omc | sha256sum` resolved the
 older `2c824805...` at82a399b9 and `49923639...` at ec07d25d as different
 historical binaries. No compiler change is part of NL4. After the reseed
-recorded at the top of this file, the committed compiler is `2495bc25...`; the
+recorded at the top of this file, the committed compiler is `a5613368...`; the
 lock and receipt below keep the `d6290c76...` run unedited, and the command
 below uses the current pin because the conductor refuses any other hash.
 
@@ -413,7 +415,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc 2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533 neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch
