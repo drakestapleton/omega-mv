@@ -3,10 +3,15 @@ note omegallm serve.om (aien-train DRA-119): `ollm serve PORT CK MERGES [MAXCONN
 note OpenAI-compatible HTTP/1.1 server for a v1 BPE checkpoint (V > 256) on 127.0.0.1:PORT only.
 note aarch64 only: build.sh composes it under one `om2` line after the omega-mv e5b32567 units
 note net/http.om, net/json.om and net/jsonw.om (vendored unmodified); the other targets take
-note noserve.om. It prints `PORT n`, then serves one connection at a time, one request each
-note (Connection: close), until MAXCONN connections (default 1000000) have been served.
+note noserve.om. It prints `PORT n` and `MODEL id`, then serves one connection at a time, one
+note request each (Connection: close), until MAXCONN connections (default 1000000) have been served.
 note Routes: GET /health {"status":"ok","in_flight":0}; GET /v1/models; POST /v1/chat/completions
 note with JSON or SSE (stream true) responses; other paths 404, other methods 405.
+note Model id (svmid): read from the loaded checkpoint's header, so it names this model and this
+note checkpoint: `ollm-ck0M-vV-tT-dD-hH-lL-stepS-fnvX`, M the checkpoint magic (1 OLLMCK01,
+note 2 OLLMCK02), V T D H L its shapes, S its step field and X the FNV-1a 64 of its payload as the
+note header records it (ockload has already refused a payload that does not hash to it, exit 14).
+note The same id is `/v1/models` data[0].id and the `model` of every completion and chunk.
 note Request: messages (non-empty array of objects with a string role of at most 32 bytes and a
 note string or null content), optional max_tokens or max_completion_tokens (1 .. 999999),
 note temperature (0 .. 2 without exponent, used to 0.001; default 1), seed (unsigned, default 1),
@@ -23,10 +28,24 @@ note cut by the end) becomes U+FFFD. One line per routed response (and per 413 a
 note to stdout: `C status prompt_tokens completion_tokens finish(0 none, 1 stop, 2 length) ms`.
 note Exit codes: 2 usage; 27 merges (bpe.om); 71 the port cannot be bound.
 note wb layout: raw token bytes [0, 8192), content [8192, 73728), template [73728, 77824),
-note message [81920, 82176), response id [82176, 82240). sv slots: 0 stream, 1 max tokens,
-note 2 TEMPMILLI, 3 seed state, 4 include_usage, 5 template bytes, 6 CT0, 7 generated, 8 finish,
-note 9 request count, 10 created, 11 start ns, 12 raw bytes, 13 content bytes, 14 content sent,
-note 16 error code, 19 T, 21 last status.
+note message [81920, 82176), response id [82176, 82240), model id [82240, 82432). sv slots:
+note 0 stream, 1 max tokens, 2 TEMPMILLI, 3 seed state, 4 include_usage, 5 template bytes, 6 CT0,
+note 7 generated, 8 finish, 9 request count, 10 created, 11 start ns, 12 raw bytes, 13 content
+note bytes, 14 content sent, 16 error code, 19 T, 21 last status, 22 model id bytes.
+note
+note Mutants (tests/omegallm/build.sh --mutant NAME sets one constant to 0; tests/omegallm/
+note serve-mutants.sh requires the serve gate to fail on each): OMUTMETH answers a known path's
+note other methods instead of 405, OMUTPATH answers other paths as /health instead of 404, OMUTBIG
+note drops the 413 (no head bound, an over-long body is a plain 400), OMUTJSON serves malformed JSON
+note instead of 400, OMUTLOOP binds 0.0.0.0 instead of 127.0.0.1, OMUTSEED shifts the request seed
+note by one (parity with `sample`), OMUTMID reports the old fixed id `ollm`.
+const OMUTMETH ulong 1
+const OMUTPATH ulong 1
+const OMUTBIG ulong 1
+const OMUTJSON ulong 1
+const OMUTLOOP ulong 1
+const OMUTSEED ulong 1
+const OMUTMID ulong 1
 
 text svtjson "application/json"
 text svtctyp "Content-Type"
@@ -36,8 +55,20 @@ text svpchat "/v1/chat/completions"
 text svmget "GET"
 text svmpost "POST"
 text svthlth "{\"status\":\"ok\",\"in_flight\":0}"
-text svtmods "{\"object\":\"list\",\"data\":[{\"id\":\"ollm\",\"object\":\"model\",\"created\":0,\"owned_by\":\"aien\"}]}"
+text svtlist "list"
+text skdata "data"
+text skowned "owned_by"
+text svaien "aien"
 text svport "PORT "
+text svmodl "MODEL "
+text svmid1 "ollm-ck0"
+text svmidv "-v"
+text svmidt "-t"
+text svmidd "-d"
+text svmidh "-h"
+text svmidl "-l"
+text svmids "-step"
+text svmidf "-fnv"
 text skmsgs "messages"
 text skrole "role"
 text skcont "content"
@@ -408,7 +439,115 @@ svwt ob t
 svwt ob skcrt
 js_wulong ob get sv 10
 svwt ob skmodel
+svmidw ob wb sv
+end
+
+note svmidw: the model id as a JSON string value (the checkpoint id; OMUTMID 0: the fixed `ollm`)
+fn svmidw ob edit uchar 409600 wb edit uchar 82432 sv edit ulong 64 to void
+if eq OMUTMID 0
 svwt ob svollm
+else
+js_wsbuf ob wb 82240 get sv 22
+end
+end
+
+note svmhex: v as 16 lowercase hex digits into wb at p, at most up to e; the next p
+fn svmhex wb edit uchar 82432 p ulong e ulong v ulong to ulong
+q = p
+for i ulong 16
+if ge q e
+ret q
+end
+d = and shr v mul sub 15 i 4 15
+c = add d 48
+if gt d 9
+c = add d 87
+end
+put wb q uchar c
+q = add q 1
+end
+ret q
+end
+
+note svmid: the model id of the checkpoint loaded from argv[3] (ockload has run and checked it)
+note into wb[82240, 82432), its length into sv22, then `MODEL id` on stdout. The header is read
+note again for its payload FNV-1a field, which ockload keeps only while it loads.
+fn svmid wb edit uchar 82432 sv edit ulong 64 to void
+hl = ulong 112
+if eq get og 46 2
+hl = 120
+end
+hn = oprd 3 0 0 120
+if lt hn hl
+exit 10
+end
+e = ulong 82432
+p = svmcat wb 82240 e svmid1
+p = svmdec wb p e get og 46
+p = svmcat wb p e svmidv
+p = svmdec wb p e get og 0
+p = svmcat wb p e svmidt
+p = svmdec wb p e get og 1
+p = svmcat wb p e svmidd
+p = svmdec wb p e get og 2
+p = svmcat wb p e svmidh
+p = svmdec wb p e get og 3
+p = svmcat wb p e svmidl
+p = svmdec wb p e get og 5
+p = svmcat wb p e svmids
+p = svmdec wb p e get og 41
+p = svmcat wb p e svmidf
+p = svmhex wb p e opw8 sub hl 8
+put sv 22 sub p 82240
+for i ulong len svmodl
+oputc ulong get svmodl i
+end
+for i ulong get sv 22
+oputc ulong get wb add 82240 i
+end
+oputc 10
+end
+
+note svmods: GET /v1/models, the one model this server answers with
+fn svmods cs edit ulong 320 io edit uchar 131072 wb edit uchar 82432 sv edit ulong 64 to long
+ob = new uchar 409600 0
+x = js_winit ob
+js_wobj ob
+svwt ob skobj
+svwt ob svtlist
+svwt ob skdata
+js_warr ob
+js_wobj ob
+svwt ob skid
+svmidw ob wb sv
+svwt ob skobj
+svwt ob skmodel
+svwt ob skcrt
+js_wulong ob 0
+svwt ob skowned
+svwt ob svaien
+js_wobje ob
+js_warre ob
+js_wobje ob
+m = js_wdone ob
+if lt m 0
+put sv 16 16
+r = svfail cs io wb sv 500
+svlog sv
+ret r
+end
+put sv 21 200
+r = svsend cs io ob 200 ulong m
+svlog sv
+ret r
+end
+
+note svbig: the status for a body over the bound, 413 (OMUTBIG 0: 400, the 413 refusal removed)
+fn svbig to ulong
+if eq OMUTBIG 0
+ret 400
+end
+ret 413
 end
 
 fn svfr ob edit uchar 409600 sv edit ulong 64 to void
@@ -719,7 +858,7 @@ end
 if or ne ty 7 not js_isu bd vo
 ret 9
 end
-put sv 3 js_tou bd vo
+put sv 3 add js_tou bd vo sub 1 OMUTSEED
 ret 0
 end
 if js_streq bd o skstrm
@@ -754,19 +893,23 @@ note svparse: the request body bd[0, n) into sv and the template; 0 or an error 
 fn svparse bd edit uchar 983040 n ulong wb edit uchar 82432 sv edit ulong 64 to ulong
 tp = new uint 262144 0
 x = js_init tp 983040 64
-r = js_parse bd tp n
-if lt r 0
-ret 1
-end
-if ne js_type tp 0 1
-ret 2
-end
 put sv 0 0
 put sv 1 999999
 put sv 2 1000
 put sv 3 1
 put sv 4 0
 put sv 5 0
+r = js_parse bd tp n
+if lt r 0
+if eq OMUTJSON 0
+put sv 1 1
+ret 0
+end
+ret 1
+end
+if ne js_type tp 0 1
+ret 2
+end
 ma = jsnone
 k = js_first tp 0
 for it ulong js_nkids tp 0
@@ -910,7 +1053,7 @@ if lt n 0
 put cs HKEEP 0
 if eq n HEBIG
 put sv 16 13
-r = svfail cs io wb sv 413
+r = svfail cs io wb sv svbig
 svlog sv
 ret r
 end
@@ -988,22 +1131,25 @@ end
 fn svroute cs edit ulong 320 io edit uchar 131072 bd edit uchar 983040 wb edit uchar 82432 sv edit ulong 64 to long
 svbeg sv
 if hispath cs io svpchat
-if hismeth cs io svmpost
+if or hismeth cs io svmpost eq OMUTMETH 0
 ret svchat cs io bd wb sv
 end
 ret svend cs io wb sv 15 405
 end
 if hispath cs io svphlth
-if hismeth cs io svmget
+if or hismeth cs io svmget eq OMUTMETH 0
 ret svok cs io sv svthlth
 end
 ret svend cs io wb sv 15 405
 end
 if hispath cs io svpmods
-if hismeth cs io svmget
-ret svok cs io sv svtmods
+if or hismeth cs io svmget eq OMUTMETH 0
+ret svmods cs io wb sv
 end
 ret svend cs io wb sv 15 405
+end
+if eq OMUTPATH 0
+ret svok cs io sv svthlth
 end
 ret svend cs io wb sv 14 404
 end
@@ -1050,7 +1196,7 @@ r = hreqrd cs io
 if eq r HEBIG
 put cs HKEEP 0
 svbeg sv
-x = svend cs io wb sv 13 413
+x = svend cs io wb sv 13 svbig
 end
 if and lt r 0 ne r HEBIG
 x = hreject cs io r
@@ -1087,9 +1233,10 @@ io = new uchar 131072 0
 bd = new uchar 983040 0
 wb = new uchar 82432 0
 sv = new ulong 64 0
+svmid wb sv
 a = new uchar 16 0
 put sv 19 get og 1
-r = haddr4 a 2130706433 port
+r = haddr4 a uint mul 2130706433 OMUTLOOP port
 lf = hlisten a 16
 if lt lf 0
 exit 71
