@@ -1,0 +1,383 @@
+note community/20api.om -- the four message kinds, in the order of checks:
+note size, form, key, clock, signature, deny list, replay, per-key rate, global rate, then the kind.
+note The signature is checked before any rate counter moves, so nobody can spend another key's quota.
+
+const cmcagr ulong 25
+const cmcsnd ulong 26
+text cmtnone "next"
+text cmlok "ok"
+text cmjlf "job "
+text cmtsl "/"
+text cmplf "part "
+text cmclf "compiler "
+
+fn cm_api to long
+put cmgv cmchub 0
+put cmgv cmcsec 0
+if not cm_on
+ret cm_refuse cmeoff
+end
+if ne get fmeth 0 3
+ret 405
+end
+if not cm_lock
+ret cm_refuse cmeio
+end
+r = cm_handle
+cm_unlock
+ret r
+end
+
+fn cm_handle to long
+e = cm_parse
+if ne e 0
+ret cm_refuse e
+end
+cm_msha
+k = get cmgv cmkind
+if eq k 1
+e = cm_regkey
+else
+e = cm_kload
+end
+if ne e 0
+ret cm_refuse e
+end
+t = cm_fnum cmftime
+now = cm_now
+if or gt t add now cmskew lt add t cmskew now
+ret cm_refuse cmeclk
+end
+if not cm_verify
+ret cm_refuse cmesig
+end
+if cm_kdeny
+ret cm_refuse cmeden
+end
+cm_msgp
+if cm_exists
+ret cm_refuse cmedup
+end
+if not cm_rkey
+ret cm_refuse cmerk
+end
+if not cm_rate cmtall cmrall
+ret cm_refuse cmera
+end
+if eq k 1
+ret cm_doreg
+end
+if eq k 2
+ret cm_donext
+end
+if eq k 3
+ret cm_dores
+end
+ret cm_doleave
+end
+
+fn cm_kdeny to bool
+k = new uchar 64 0
+for i ulong 64
+put k i get cmkid i
+end
+ret cm_denied cmdkey k
+end
+
+fn cm_rkey to bool
+k = new uchar 64 0
+for i ulong 64
+put k i get cmkid i
+end
+ret cm_rate k cmrkey
+end
+
+fn cm_doreg to long
+r = cm_fnum cmfthird
+if gt r 3600
+ret cm_refuse cmemal
+end
+if not cm_kwrite cmlj r
+ret cm_refuse cmeio
+end
+if not cm_store
+ret cm_refuse cmedup
+end
+x = cm_ledger cmtreg false cmlok
+ret cm_rok cmkreg
+end
+
+fn cm_doleave to long
+if not cm_kwrite cmll cm_krate
+ret cm_refuse cmeio
+end
+if not cm_store
+ret cm_refuse cmedup
+end
+x = cm_ledger cmtlv false cmlok
+ret cm_rok cmkleft
+end
+
+note cm_donext: the newest published part this key has not run yet, as a new job
+fn cm_donext to long
+if not cm_store
+ret cm_refuse cmedup
+end
+if not cm_pickjob
+x = cm_ledger cmtnext false cmlnone
+ret cm_rok cmknone
+end
+j = new uchar 16 0
+jh = new uchar 32 0
+d = new uchar 256 0
+r = random j 0 16 0
+if ne r 16
+ret cm_refuse cmeio
+end
+cm_tohex j jh
+k = cm_jline d
+cm_p0
+cm_pa cmtjobs
+cm_pa jh
+if not cm_wnew part d 0 k
+ret cm_refuse cmeio
+end
+x = cm_ledger cmtnext false cmlok
+z = cm_reply 200
+fput cmrok
+fput cmkjob
+fput cmjlf
+fput jh
+fput cmnl
+fput cmplf
+cm_putpick
+fput cmnl
+fput cmclf
+fput tlpin
+fput cmnl
+ret 200
+end
+
+fn cm_putpick to void
+p = new uchar 64 0
+for i ulong 64
+put p i get cmpick i
+end
+fput p
+end
+
+note cm_jline: "<key> <part> <compiler> <issued>\n" for the job file
+fn cm_jline d edit uchar * to ulong
+k = cm_khex d 0
+k = cm_cp d k cmsp
+for i ulong 64
+put d add k i get cmpick i
+end
+k = add k 64
+k = cm_cp d k cmsp
+k = cm_cp d k tlpin
+k = cm_cp d k cmsp
+k = cm_decput d k cm_now
+ret cm_cp d k cmnl
+end
+
+note cm_pickjob: newest first through the salvage index
+fn cm_pickjob to bool
+id = new uchar 64 0
+n = get glidxn 0
+for ix ulong n bound 1000000
+pos = sub sub n ix 1
+for i ulong 64
+put id i get glidx add mul pos 65 i
+end
+if cm_pickok id
+for i ulong 64
+put cmpick i get id i
+end
+ret true
+end
+end
+ret false
+end
+
+note cm_pickok: a published part with a passing receipt from the pinned compiler, not denied,
+note and not already run by this key
+fn cm_pickok id view uchar * to bool
+if not slpublic id
+ret false
+end
+if ne get glrec 8 2
+ret false
+end
+for i ulong 64
+if ne get glrcpt add 193 i get tlpin i
+ret false
+end
+end
+if cm_denied cmdpart id
+ret false
+end
+cm_kpath id
+ret not cm_exists
+end
+
+note cm_kpath: cmpth = <root>parts/<id>/k/<key>
+fn cm_kpath id view uchar * to void
+cm_p0
+cm_pa cmtparts
+cm_pa id
+cm_pa cmtk
+cm_pkid
+end
+
+note cm_dores: the result must answer a job issued to this key less than an hour ago, for the same
+note part and compiler, used once
+fn cm_dores to long
+b = new uchar 512 0
+j = new uchar 32 0
+p = new uchar 64 0
+if not and cm_fget cmfjob j cm_fget cmfpart p
+ret cm_refuse cmemal
+end
+cm_p0
+cm_pa cmtjobs
+cm_pa j
+r = cm_rd b
+if ne r 206
+ret cm_refuse cmejob
+end
+e = cm_jobok part b 0 206
+if ne e 0
+ret cm_refuse e
+end
+if cm_denied cmdpart p
+ret cm_refuse cmeden
+end
+cm_p0
+cm_pa cmtused
+cm_pa j
+if not cm_wnew part b 0 0
+ret cm_refuse cmedup
+end
+if not cm_store
+ret cm_refuse cmedup
+end
+ret cm_count1 p
+end
+
+note cm_jobok: the job file is "<key> <part> <compiler> <issued>\n" (206 bytes with a 10-digit time)
+fn cm_jobok b view uchar * to ulong
+f = new uchar 64 0
+for i ulong 64
+if ne get b i get cmkid i
+ret cmejob
+end
+end
+iss = cm_dec part b 195 10
+now = cm_now
+if or gt iss now ge sub now iss cmjlife
+ret cmejob
+end
+if not cm_fget cmfpart f
+ret cmemal
+end
+if not cm_eq part b 65 64 f
+ret cmemis
+end
+if not cm_fget cmfcomp f
+ret cmemal
+end
+if not cm_eq part b 130 64 f
+ret cmemis
+end
+ret 0
+end
+
+note cm_count1: record the counted result (the first for this key and part), or answer duplicate
+fn cm_count1 p view uchar * to long
+d = new uchar 256 0
+if cm_iscell
+x = cm_ledger cmtres true cmlcell
+ret cm_rok cmkstor
+end
+cm_p0
+cm_pa cmtparts
+cm_pa p
+x = cm_mkdir
+cm_pa cmtk
+x = cm_mkdir
+cm_pkid
+k = cm_triple d
+k = cm_cp d k cmsp
+k = cm_decput d k cm_fnum cmftime
+k = cm_cp d k cmsp
+k = cm_shex d k
+k = cm_cp d k cmnl
+if not cm_wnew part d 0 k
+x = cm_ledger cmtres true cmldup
+ret cm_refuse cmedup
+end
+if not cm_group p
+ret cm_refuse cmeio
+end
+x = cm_ledger cmtres true cmlcnt
+ret cm_rok cmkcnt
+end
+
+fn cm_iscell to bool
+n = get cmfn cmfexit
+if lt n len cmxcell
+ret false
+end
+ret cm_bodyis get cmfo cmfexit cmxcell
+end
+
+note cm_triple: "<binary> <stdout> <exit>" from the message into d; its length
+fn cm_triple d edit uchar * to ulong
+b = new uchar 64 0
+e = new uchar 32 0
+x = cm_fget cmfbin b
+k = cm_cp d 0 b
+k = cm_cp d k cmsp
+x = cm_fget cmfout b
+k = cm_cp d k b
+k = cm_cp d k cmsp
+n = get cmfn cmfexit
+o = get cmfo cmfexit
+for i ulong n bound 32
+put d add k i get fbody add o i
+end
+ret add k n
+end
+
+note cm_group: parts/<p>/g/<hash of the triple>.v holds the triple, and the directory
+note parts/<p>/g/<hash>/ holds one empty file per key with that triple
+fn cm_group p view uchar * to bool
+d = new uchar 256 0
+h = new uchar 32 0
+x = new uchar 64 0
+k = cm_triple d
+cm_sha part d 0 k h
+cm_tohex h x
+put d k 10
+cm_p0
+cm_pa cmtparts
+cm_pa p
+cm_pa cmtg
+y = cm_mkdir
+cm_pa x
+cm_pa cmtv
+y = cm_wnew part d 0 add k 1
+cm_p0
+cm_pa cmtparts
+cm_pa p
+cm_pa cmtg
+cm_pa x
+if not cm_mkdir
+ret false
+end
+cm_pa cmtsl
+cm_pkid
+e = new uchar 1 0
+ret cm_wnew part e 0 0
+end
