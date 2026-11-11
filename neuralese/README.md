@@ -17,11 +17,13 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after OM-2 AArch64 global array bases and lengths pinned in X18..X26, with factory bay 16's pinshut fix (branch `ham/omc-perf-mem-3`, stacked on `ham/om-threads-4` and `ham/omc-perf-loops-5` on Radicle main `12bdb787`, 2026-11-10): committed
+Current pin after omc tables in one growing arena, no table capacities (OMEGESE 9.6, decision 23 amended 2026-11-11), branch `omc/no-caps` on Radicle main b2ad967e (2026-11-11): committed
 `seed/out/omc` SHA-256
-`f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9`, compiler
-source SHA-256 `c86159627820cf5741be0a2a4c05df0efb78f5c91a652b986fec5d745baa62ed`.
-The previous pin, after scheduler host words cpuset/cpuget/cpunow/setprio/getprio 236..240 (branch `ham/om-threads-4`, stacked on `ham/omc-perf-loops-5` on Radicle main `12bdb787`, 2026-11-10), was
+`c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607`, compiler
+source SHA-256 `ed8e6a6aca3dfed740de2a1aa458095a8a50a757f5b1d3f2b1683ad4ba9cb740`.
+The previous pin, after OM-2 AArch64 global array bases and lengths pinned in X18..X26, with factory bay 16's pinshut fix (branch `ham/omc-perf-mem-3`, 2026-11-10), was
+`f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9` (source
+`c86159627820cf5741be0a2a4c05df0efb78f5c91a652b986fec5d745baa62ed`); before that, after scheduler host words cpuset/cpuget/cpunow/setprio/getprio 236..240 (branch `ham/om-threads-4`, stacked on `ham/omc-perf-loops-5` on Radicle main `12bdb787`, 2026-11-10), was
 `0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f` (source
 `232f89ebe688e81c289a9d0225dd06e4d8e8aaad8e489433634e7f8bf0b9b0a9`); before that, after OM-2 AArch64 `for` loops tested at the latch (branch `ham/omc-perf-loops-5` on Radicle main `12bdb787`, 2026-11-10), was
 `6844d173abc85ecbc04154cce85e4e5eeec8bf7b21f4ab1c10728c55efe7dd00` (source
@@ -177,7 +179,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 \
+    c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607 \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -393,7 +395,7 @@ It is exactly the committed `seed/out/omc` introduced by
 the lock. Read-only `git show <revision>:seed/out/omc | sha256sum` resolved the
 older `2c824805...` at82a399b9 and `49923639...` at ec07d25d as different
 historical binaries. No compiler change is part of NL4. After the reseed
-recorded at the top of this file, the committed compiler is `f4fa7951...`; the
+recorded at the top of this file, the committed compiler is `c52e986e...`; the
 lock and receipt below keep the `d6290c76...` run unedited, and the command
 below uses the current pin because the conductor refuses any other hash.
 
@@ -407,7 +409,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607 neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch
