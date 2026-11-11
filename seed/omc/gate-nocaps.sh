@@ -96,7 +96,8 @@ for f in $B/u/*.om; do
     [ $c2 = $(cat $B/u/$u.c2) ] || bad "control $u: omc 1e628c80 gave $c2, wanted $(cat $B/u/$u.c2)"
     extra="$extra; control 1e628c80 status $c2 (trap $((c2 - 100)))"
   fi
-  say "PASS $u: exit $x$extra; control $(cat $B/o.err | head -1 | sed 's/^$/compiled/')"
+  if [ $orc = 0 ]; then octl=compiled; else octl=$(head -1 $B/o.err); fi
+  say "PASS $u: exit $x$extra; control $octl"
   n=$((n + 1))
 done
 
