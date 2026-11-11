@@ -1,0 +1,459 @@
+note Local same-uid limited-run broker. SOCK_SEQPACKET ALR1 protocol, one request then reply.
+note Request: ALR1, memory u64 LE, pids u64 LE, cwd u16 LE + bytes, argv packet.
+note Reply: four-byte raw wait status. A setup refusal is 125, OOM is 137 plus marker on stderr.
+note The authenticated client's live /proc/PID/fd/0,1,2 are opened, never arbitrary descriptors.
+note This preserves pipe/file streams without an unsupported SCM_RIGHTS host implementation.
+
+fn lrAddr a edit uchar 110 to long
+bset 0
+pstr lrSocket
+n = plen
+if gt n 107
+ret -36
+end
+put a 0 1
+put a 1 0
+for j ulong n
+put a add j 2 get pth j
+end
+put a add n 2 0
+ret long add n 3
+end
+
+fn lrListen to void
+put lrState 0 -1
+a = new uchar 110 0
+n = lrAddr a
+if lt n 0
+ret
+end
+u = unlink pth 0 plen
+fd = socknew 1 526341 0
+if lt fd 0
+ret
+end
+r = bind int fd a 0 ulong n
+if ge r 0
+r = chmod pth 0 plen 384
+end
+if ge r 0
+r = listen int fd 16
+end
+if lt r 0
+c = fclose int fd
+ret
+end
+put lrState 0 fd
+end
+
+fn lrNum n ulong to long
+if eq n 0
+ret -1
+end
+v = ulong 0
+for j ulong n
+b = get av j
+if or lt b 48 gt b 57
+ret -1
+end
+if gt v 922337203685477580
+ret -1
+end
+v = add mul v 10 ulong sub b 48
+if gt v 9223372036854775807
+ret -1
+end
+end
+ret long v
+end
+
+fn lrPut64 a edit uchar 65536 position ulong value ulong to void
+for j ulong 8
+put a add position j uchar and shr value mul j 8 255
+end
+end
+
+fn lrGet64 a view uchar 65536 position ulong to ulong
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get a add position j mul j 8
+end
+ret v
+end
+
+fn lrParse to bool
+if lt argcnt 6
+ret false
+end
+n = arg 2
+if not aveq n lrMemory
+ret false
+end
+n = arg 3
+memory = lrNum n
+if le memory 0
+ret false
+end
+put lrState 1 memory
+put lrState 2 0
+idx = ulong 4
+n = arg idx
+if aveq n lrPids
+idx = add idx 1
+n = arg idx
+tasks = lrNum n
+if le tasks 0
+ret false
+end
+put lrState 2 tasks
+idx = add idx 1
+n = arg idx
+end
+if not aveq n lrDash
+ret false
+end
+idx = add idx 1
+if ge idx ulong argcnt
+ret false
+end
+pkreset
+while lt idx ulong argcnt bound 1024
+n = arg idx
+if eq get gu GPKN 0
+if or eq n 0 ne get av 0 47
+ret false
+end
+end
+if not pkroom n
+ret false
+end
+pkav n
+idx = add idx 1
+end
+ret true
+end
+
+fn lrPacket req edit uchar 65536 to long
+for j ulong 4
+put req j get lrMagic j
+end
+lrPut64 req 4 ulong get lrState 1
+lrPut64 req 12 ulong get lrState 2
+r = cwd av 0 len av
+if le r 0
+ret r
+end
+n = sub ulong r 1
+put req 20 uchar and n 255
+put req 21 uchar shr n 8
+for j ulong n
+put req add j 22 get av j
+end
+position = add n 22
+for j ulong get gu GPK
+put req add position j get pk j
+end
+ret long add position get gu GPK
+end
+
+fn lrClient to int
+req = new uchar 65536 0
+a = new uchar 110 0
+reply = new uchar 4 0
+if not lrParse
+w = write 2 lrUsage 0 len lrUsage
+ret 2
+end
+count = lrPacket req
+if lt count 0
+lrFailure count
+ret 125
+end
+addresslen = lrAddr a
+if lt addresslen 0
+lrFailure addresslen
+ret 125
+end
+fd = socknew 1 524293 0
+if lt fd 0
+lrFailure fd
+ret 125
+end
+r = connect int fd a 0 ulong addresslen
+if lt r 0
+c = fclose int fd
+lrFailure r
+ret 125
+end
+r = send int fd req 0 ulong count 0
+if ne r count
+c = fclose int fd
+lrFailure -5
+ret 125
+end
+r = recv int fd reply 0 4 0
+c = fclose int fd
+if ne r 4
+lrFailure -5
+ret 125
+end
+st = or ulong get reply 0 shl ulong get reply 1 8
+if ne and st 127 0
+ret int add 128 and st 127
+end
+ret int shr st 8
+end
+
+fn lrFailure why long to void
+put gu GOB 0
+ostr cgLimitFailure
+onum why
+ostr tnl
+oflush 2
+end
+
+fn lrOpenClient pid long index ulong to long
+pset
+pstr tproc
+pnum ulong pid
+pstr lrFd
+pnum index
+flags = ORDO
+if gt index 0
+flags = 525313
+end
+ret popen flags 0
+end
+
+fn lrReply fd int code int to void
+a = new uchar 4 0
+put a 1 uchar code
+w = send fd a 0 4 0
+end
+
+fn lrAttachClient pid long to bool
+for idx ulong 3
+fd = lrOpenClient pid idx
+if lt fd 0
+ret false
+end
+r = dupfd int fd int idx 0
+if ne fd long idx
+c = fclose int fd
+end
+if lt r 0
+ret false
+end
+end
+ret true
+end
+
+fn lrDecode req view uchar 65536 size ulong to bool
+if lt size 26
+ret false
+end
+for j ulong 4
+if ne get req j get lrMagic j
+ret false
+end
+end
+memory = lrGet64 req 4
+tasks = lrGet64 req 12
+n = or ulong get req 20 shl ulong get req 21 8
+if or or eq memory 0 gt memory 9223372036854775807 gt tasks 9223372036854775807
+ret false
+end
+put lrState 1 long memory
+put lrState 2 long tasks
+if or eq n 0 ge add n 24 size
+ret false
+end
+pset
+for j ulong n
+b = get req add j 22
+if eq b 0
+ret false
+end
+pb b
+end
+r = chdir pth 0 plen
+if lt r 0
+ret false
+end
+idx = add n 22
+n = sub size idx
+if gt n len pk
+ret false
+end
+for j ulong n
+put pk j get req add idx j
+end
+put gu GPK n
+ret true
+end
+
+fn lrReadRequest fd int pid long to bool
+req = new uchar 65536 0
+r = waitio fd 1 2000000000
+if le r 0
+ret false
+end
+r = recv fd req 0 len req 0
+if lt r 0
+ret false
+end
+if not lrDecode req ulong r
+ret false
+end
+ret lrAttachClient pid
+end
+
+fn lrSpawn to long
+ready = new uchar 1 0
+fds = new uchar 8 0
+r = pipefds fds 0 8 524288
+if lt r 0
+ret r
+end
+rd = int or ulong get fds 0 shl ulong get fds 1 8
+wr = int or ulong get fds 4 shl ulong get fds 5 8
+pid = fork
+if eq pid 0
+c = fclose rd
+s = setsid
+if lt s 0
+exit 125
+end
+r = cgEnter
+if lt r 0
+lrFailure r
+exit 125
+end
+put ready 0 1
+w = write wr ready 0 1
+r = execprog pk 0 get gu GPK
+exit 127
+end
+c = fclose wr
+if lt pid 0
+c = fclose rd
+ret pid
+end
+r = read rd ready 0 1
+c = fclose rd
+if ne r 1
+r = waitpid int pid st4 0 4 0
+ret -13
+end
+ret pid
+end
+
+fn lrWait fd int childpid long to void
+stbuf = new uchar 4 0
+while true bound 9223372036854775807
+s = waitpid int childpid stbuf 0 4 1
+if eq s childpid
+break
+end
+r = waitio fd 17 100000000
+if gt r 0
+cgKillLeaf
+k = killpid neg int childpid 9
+s = waitpid int childpid stbuf 0 4 0
+break
+end
+end
+cgKillLeaf
+oom = cgOomCount
+cgRemove
+if gt oom 0
+w = write 2 cgOomMarker 0 len cgOomMarker
+lrReply fd 137
+else
+w = send fd stbuf 0 4 0
+end
+end
+
+fn lrServe fd int pid long to void
+if not lrReadRequest fd pid
+lrReply fd 125
+exit 125
+end
+cgrootpath
+pstr cgJob
+pnum ulong getpid
+cgleafsave
+r = cgPrepare ulong get lrState 1 ulong get lrState 2 0
+if lt r 0
+lrFailure r
+cgRemove
+lrReply fd 125
+exit 125
+end
+childpid = lrSpawn
+if lt childpid 0
+lrFailure childpid
+cgKillLeaf
+cgRemove
+lrReply fd 125
+exit 125
+end
+lrWait fd childpid
+exit 0
+end
+
+fn lrAccept to void
+fd = get lrState 0
+if lt fd 0
+ret
+end
+for j ulong get lrWorkerCount 0
+pid = get lrWorkers j
+if gt pid 0
+r = waitpid int pid st4 0 4 1
+if eq r pid
+put lrWorkers j 0
+end
+end
+end
+conn = accept int fd 526336
+if lt conn 0
+ret
+end
+cred = new uchar 12 0
+r = peercred int conn cred 0 len cred
+uid = ulong 0
+peerpid = ulong 0
+for j ulong 4
+uid = or uid shl ulong get cred add j 4 mul j 8
+peerpid = or peerpid shl ulong get cred j mul j 8
+end
+if or lt r 0 ne uid ulong geteuid
+c = fclose int conn
+ret
+end
+pid = fork
+if eq pid 0
+c = fclose int fd
+lrServe int conn long peerpid
+exit 125
+end
+c = fclose int conn
+if gt pid 0
+j = ulong 0
+while lt j get lrWorkerCount 0 bound 9223372036854775807
+if eq get lrWorkers j 0
+put lrWorkers j pid
+ret
+end
+j = add j 1
+end
+r = enlarge lrWorkers add j 1
+if lt r 0
+k = killpid int pid 9
+ret
+end
+put lrWorkers j pid
+put lrWorkerCount 0 add j 1
+end
+end

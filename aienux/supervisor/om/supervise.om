@@ -93,7 +93,7 @@ text mdaemon "aien-supervise: "
 text mup "daemon running pid="
 text mdown "daemon not running"
 text mrunning "already running pid="
-text musage "usage: aien-supervise run|ensure|status [NAME]|start|stop|restart NAME|check [NAME]|shutdown"
+text musage "usage: aien-supervise run|ensure|status [NAME]|start|stop|restart NAME|check [NAME]|reload|shutdown|run-limited --memory BYTES [--pids N] -- CMD..."
 text mnoname "no such service: "
 text mnoack "request not taken by the daemon within 20 s (is it running?)"
 text mok "ok "
@@ -159,6 +159,8 @@ global stf ulong 48
 global rb uchar 65536
 global st4 uchar 4
 global pfd uchar 8
+global sxAckFds uchar 8
+global sxAck long 2
 note Slots of sv.
 const VST ulong 0
 const VUD ulong 1
@@ -459,27 +461,30 @@ put sls i 0
 logopen i
 end
 
-fn logneed i ulong n ulong to void
+fn logrb i ulong n ulong to void
 logopen i
-if gt add get sls i n get slmx i
-if gt get sls i 0
+position = ulong 0
+while lt position n bound 65536
+if ge get sls i get slmx i
 rotate i
 end
+room = sub get slmx i get sls i
+chunk = sub n position
+if gt chunk room
+chunk = room
 end
-end
-
-fn logrb i ulong n ulong to void
-logneed i n
 fd = get slf i
 if lt fd 0
 ret
 end
-w = write int fd rb 0 n
-if gt w 0
+w = write int fd rb position chunk
+if le w 0
+ret
+end
 put sls i add get sls i ulong w
+position = add position ulong w
 end
 end
-
 note Move everything readable from the service's pipe into its log.
 fn drain i ulong to void
 fd = get spfd i
@@ -566,6 +571,7 @@ put slmx i 10485760
 put slkp i 3
 put sau i 1
 put sumk i 18
+sxDefaults i
 put sdt i 0
 end
 
@@ -588,6 +594,10 @@ ret false
 end
 if wis 1 walways
 put srs i 2
+ret true
+end
+if wis 1 sxNever
+put srs i 0
 ret true
 end
 if wis 1 wonfail
@@ -711,6 +721,9 @@ while lt p get gu GSF bound 100000
 p = lnext p
 if gt nw 0
 ok = true
+if and sxKey eq get sro i 0
+ok = sxApply i
+else
 if dkey
 ok = dapply i
 else
@@ -720,6 +733,7 @@ else
 if not and eq get sro i 1 sbkey
 cerr ckey i
 ret false
+end
 end
 end
 end
@@ -754,40 +768,7 @@ end
 
 note User service: env -i ENV... [nice -n N] [aien-watch DIR SUF PER] PROG ARGS (from sf).
 fn pkuser i ulong to bool
-pkreset
-pkstr tenv
-pkstr tdi
-p = ulong 0
-while lt p get gu GSF bound 100000
-p = lnext p
-if and gt nw 1 wis 0 kenv
-if not pkroom wlen 1
-ret false
-end
-pkword 1
-end
-end
-p = 0
-while lt p get gu GSF bound 100000
-p = lnext p
-if and eq nw 2 wis 0 knice
-pkstr tnice
-pkstr tdn
-pkword 1
-end
-end
-p = 0
-while lt p get gu GSF bound 100000
-p = lnext p
-if and eq nw 5 wis 0 kwatch
-pkstr twatch
-pkword 1
-pkword 2
-pkword 3
-pkword 4
-end
-end
-ret pkexec
+ret sxUserPacket i
 end
 
 fn pkexec to bool
@@ -869,6 +850,18 @@ put sbk i 9
 backoff i 0
 ret false
 end
+if not sxReady i
+ret false
+end
+put sxReasonCode i 0
+put cgWhy i 0
+r = cgServicePrepare i
+if lt r 0
+put cgWhy i r
+put sxReasonCode i 1
+setst i 7
+ret false
+end
 logopen i
 if eq get sro i 0
 if not pkuser i
@@ -891,8 +884,18 @@ ret false
 end
 rd = long or ulong get pfd 0 shl ulong get pfd 1 8
 wr = long or ulong get pfd 4 shl ulong get pfd 5 8
+ar = pipefds sxAckFds 0 8 524288
+if lt ar 0
+c = fclose int rd
+c = fclose int wr
+ret false
+end
+put sxAck 0 or long get sxAckFds 0 shl long get sxAckFds 1 8
+put sxAck 1 or long get sxAckFds 4 shl long get sxAckFds 5 8
 pid = fork
 if lt pid 0
+c = fclose int get sxAck 0
+c = fclose int get sxAck 1
 c = fclose int rd
 c = fclose int wr
 ev i mfork
@@ -902,6 +905,19 @@ if eq pid 0
 child i int wr
 end
 c = fclose int wr
+c = fclose int get sxAck 1
+ack = new uchar 1 0
+ar = read int get sxAck 0 ack 0 1
+c = fclose int get sxAck 0
+if ne ar 1
+put cgWhy i -13
+put sxReasonCode i 1
+c = fclose int rd
+r = waitpid int pid st4 0 4 0
+setst i 7
+ret false
+end
+put sxHealthy i 0
 put spid i pid
 put spfd i rd
 put sbg i now
@@ -915,8 +931,18 @@ ret true
 end
 
 fn child i ulong wr int to void
+c = fclose int get sxAck 0
 s = setsid
+if lt s 0
+exit 125
+end
+r = cgServiceEnter i
+if lt r 0
+exit 125
+end
 if eq get sro i 0
+r = setprio 0 0 int get sxNice i
+udir
 m = umask int get sumk i
 if gt get gu GPT 0
 c = chdir pth 0 plen
@@ -928,7 +954,14 @@ d = dupfd int nf 0 0
 end
 d = dupfd wr 1 0
 d = dupfd wr 2 0
+ready = new uchar 1 1
+w = write int get sxAck 1 ready 0 1
+c = fclose int get sxAck 1
+if eq get sro i 0
+r = sxExec i
+else
 r = execprog pk 0 get gu GPK
+end
 w = write 2 mexec 0 len mexec
 exit 127
 end
@@ -1029,6 +1062,9 @@ end
 
 note A child exited with raw wait status st.
 fn exited i ulong st ulong to void
+sxCleanGroup i
+cgServiceExit i
+put sxHealthy i 0
 drain i
 fd = get spfd i
 if ge fd 0
@@ -1094,6 +1130,7 @@ end
 note ------------------------------------------------------------------- one tick
 
 fn tick1 i ulong to void
+sxUpdateHealth i
 drain i
 pid = get spid i
 if gt pid 0
@@ -1342,6 +1379,7 @@ onum d
 end
 ostr f7
 onum long get sro i
+sxStatus i
 ostr tnl
 end
 
@@ -1413,10 +1451,12 @@ put av j dnch k j
 end
 if and aveq d vall verbis k d vexit
 put sv VEXIT 1
-for i ulong get sv VN
-put sdn i 1
-stopsvc i
+sxShutdownStep
+ret
 end
+if and aveq d vall verbis k d vreload
+rescan
+put sv VBEAT 1
 ret
 end
 f = findsvc d
@@ -1558,6 +1598,8 @@ oflush 2
 ret 3
 end
 mkdirs
+cgInitialize
+lrListen
 wrpid
 put sv VN 0
 put sv VEXIT 0
@@ -1566,6 +1608,8 @@ put sv VSCAN 0
 for outer ulong 1000000
 for inner ulong 1000000
 ctlscan
+lrAccept
+sxShutdownStep
 for i ulong get sv VN
 tick1 i
 end
@@ -1577,10 +1621,7 @@ ret 0
 end
 c = add get sv VSCAN 1
 put sv VSCAN c
-if eq rem c 50 0
-rescan
-put sv VBEAT 1
-end
+note No declaration polling. inotify trigger is MISSING_IMPLEMENTATION position this compiler.
 if eq get sv VBEAT 1
 put sv VBEAT 0
 wrstates
@@ -1803,6 +1844,9 @@ oflush 2
 ret 2
 end
 n = arg 1
+if aveq n lrCommand
+ret lrClient
+end
 if aveq n vrun
 ret daemon
 end
@@ -1823,6 +1867,15 @@ ret request vrestart
 end
 if aveq n vcheck
 ret check
+end
+if aveq n vreload
+put av 0 97
+put av 1 108
+put av 2 108
+if ctlwrite 3 vreload
+ret 0
+end
+ret 1
 end
 if aveq n vshut
 put av 0 97
