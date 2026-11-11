@@ -1,0 +1,359 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note BTWAVE-P0: Multi-Process Duplex Waveguide IPC on Cortex-X925 (native/btwave/wave_ipc.om).
+note Uses raw 80-byte binary/ternary frames over Linux pipefds (zero JSON/Protobuf),
+note pinning Node A to Cortex-X925 core 16 and forked Node B to Cortex-X925 core 17
+note via cpuset + cpunow, with monons round-trip telemetry and live Give-Before-Take
+note reciprocal ledger settlement.
+
+const FLEN ulong 80
+
+note Telemetry output from ipc_run:
+note   0 coreA, 1 coreB, 2 rounds, 3 contrib, 4 extract, 5 odraft_rc, 6 elapsed_ns, 7 chain_lo64
+global IpcOut long 8
+
+fn pin_core c ulong to long
+requires and lt c 64 and ne c 3 and ne c 7 ne c 15
+m = new uchar 16 0
+bi = shr c 3
+bt = and c 7
+put m bi uchar shl uint 1 uint bt
+ret cpuset 0 m 0 16
+end
+
+fn write_all fd int buf view uchar * n ulong to long
+off = ulong 0
+while lt off n bound 1024
+nw = write fd buf off sub n off
+if le nw 0
+ret -1
+end
+off = add off ulong nw
+end
+ret 0
+end
+
+fn read_all fd int buf edit uchar * n ulong to long
+off = ulong 0
+while lt off n bound 1024
+nr = read fd buf off sub n off
+if le nr 0
+ret -1
+end
+off = add off ulong nr
+end
+ret 0
+end
+
+fn pack_hdr op uint seq uint to WaveDup
+tag = or 0x42540000 or shl and op 0xff 8 and seq 0xff
+ret wdup_tag tag
+end
+
+fn unpack_hdr raw ulong op uint seq uint to bool
+wd = WaveDupmk raw
+tag = or 0x42540000 or shl and op 0xff 8 and seq 0xff
+ret wdup_chk wd tag
+end
+
+fn rcpt_chain ch view uchar 32 ep ulong w ulong y long outd edit uchar 32 to void
+msg = new uchar 56 0
+for i ulong 32 unroll
+put msg i get ch i
+end
+wr64le msg 32 ep
+wr64le msg 40 w
+wr64le msg 48 u64_tc y
+sha256_slice view msg outd
+end
+
+fn child_give_exec rxw Trit32 sc long reqe ulong bch edit uchar 32 tx edit uchar 80 to long
+dg = new uchar 32 0
+d0 = dit 1
+decs = h16dec rxw
+if lt decs 0
+d1 = dit int d0
+ret sub -1 mul 0 d1
+end
+jw = job_wave ulong decs
+yv = wave_eval jw sc
+rcpt_chain bch reqe open jw yv dg
+for i ulong 32 unroll
+put bch i get dg i
+put tx add 48 i get dg i
+end
+wr64le tx 32 open jw
+scb = scrub 64
+d2 = dit int d0
+ret add scb mul 0 d2
+end
+
+fn child_give_round rfd int wfd int seq uint bch edit uchar 32 cn long to int
+rx = new uchar 80 0
+tx = new uchar 80 0
+if lt read_all rfd rx FLEN 0
+ret 21
+end
+if not unpack_hdr rd64le view rx 0 10 seq
+ret 22
+end
+reqe = rd64le view rx 8
+wu = rd64le view rx 16
+sc = i64_tc rd64le view rx 24
+rxw = Trit32mk rd64le view rx 32
+if lt child_give_exec rxw sc reqe bch tx 0
+ret 23
+end
+hdr = pack_hdr 1 seq
+wr64le tx 0 open hdr
+wr64le tx 8 reqe
+wr64le tx 16 wu
+wr64le tx 24 u64_tc sc
+wr64le tx 40 u64_tc cn
+if lt write_all wfd view tx FLEN 0
+ret 24
+end
+if lt read_all rfd rx FLEN 0
+ret 25
+end
+if not unpack_hdr rd64le view rx 0 20 seq
+ret 26
+end
+if ne i64_tc rd64le view rx 40 0
+ret 27
+end
+ret 0
+end
+
+fn child_take_round rfd int wfd int seq uint ep ulong tu ulong bch edit uchar 32 to long
+rx = new uchar 80 0
+tx = new uchar 80 0
+sym = add 9 and ulong seq 7
+jw = job_wave sym
+hdr = pack_hdr 2 seq
+wr64le tx 0 open hdr
+wr64le tx 8 ep
+wr64le tx 16 tu
+wr64le tx 24 u64_tc 2
+wr64le tx 32 open jw
+wr64le tx 40 sym
+for i ulong 32 unroll
+put tx add 48 i get bch i
+end
+if lt write_all wfd view tx FLEN 0
+ret -99
+end
+if lt read_all rfd rx FLEN 0
+ret -98
+end
+if not unpack_hdr rd64le view rx 0 20 seq
+ret -97
+end
+st = i64_tc rd64le view rx 40
+if eq st 0
+for i ulong 32 unroll
+put bch i get rx add 48 i
+end
+end
+ret st
+end
+
+fn ipc_node_b rfd int wfd int to void
+bch = new uchar 32 0
+if lt pin_core 17 0
+exit 30
+end
+cn = cpunow
+if ne cn 17
+exit 31
+end
+for k ulong 4
+rc = child_give_round rfd wfd uint k bch cn
+if ne rc 0
+exit rc
+end
+end
+od = child_take_round rfd wfd 4 5 300 bch
+if ne od -10
+exit 32
+end
+for k ulong 3
+tk = child_take_round rfd wfd uint add 5 k add 5 k 60 bch
+if ne tk 0
+exit 33
+end
+end
+x1 = fclose rfd
+x2 = fclose wfd
+exit 0
+end
+
+fn rx_rcpt_ok rx view uchar 80 expd view uchar 32 to bool
+rxd = new uchar 32 0
+for i ulong 32 unroll
+put rxd i get rx add 48 i
+end
+ret rcpt_eq expd rxd
+end
+
+fn host_give_round wfd int rfd int seq uint sym ulong to long
+tx = new uchar 80 0
+rx = new uchar 80 0
+expd = new uchar 32 0
+noisy = t32flip t32flip h16enc sym 2 11
+reqe = add get Lstate 0 1
+wr64le tx 0 open pack_hdr 10 seq
+wr64le tx 8 reqe
+wr64le tx 16 60
+wr64le tx 24 u64_tc 3
+wr64le tx 32 open noisy
+wr64le tx 40 0
+if lt write_all wfd view tx FLEN 0
+ret -41
+end
+if lt read_all rfd rx FLEN 0
+ret -42
+end
+if not unpack_hdr rd64le view rx 0 1 seq
+ret -43
+end
+jw = Trit32mk rd64le view rx 32
+yv = wave_eval jw 3
+ldg_rcpt reqe open jw yv expd
+if not rx_rcpt_ok rx expd
+ret -44
+end
+ldg_commit_give reqe 60 yv expd
+wr64le tx 0 open pack_hdr 20 seq
+wr64le tx 40 u64_tc 0
+if lt write_all wfd view tx FLEN 0
+ret -45
+end
+ret i64_tc rd64le view rx 40
+end
+
+fn host_take_round wfd int rfd int seq uint to long
+rx = new uchar 80 0
+tx = new uchar 80 0
+ev = new long 7 0
+if lt read_all rfd rx FLEN 0
+ret -51
+end
+if not unpack_hdr rd64le view rx 0 2 seq
+ret -52
+end
+reqe = rd64le view rx 8
+tu = rd64le view rx 16
+sc = i64_tc rd64le view rx 24
+sym = rd64le view rx 40
+anc = rd64le view rx 48
+put ev 0 2
+put ev 1 long reqe
+put ev 2 0
+put ev 3 long tu
+put ev 4 sc
+put ev 5 long sym
+put ev 6 0
+if ne anc ldg_chid
+put ev 6 5
+end
+st = ldg_step ev
+ack = pack_hdr 20 seq
+wr64le tx 0 open ack
+wr64le tx 40 u64_tc st
+for i ulong 32 unroll
+put tx add 48 i get Lchain i
+end
+if lt write_all wfd view tx FLEN 0
+ret -53
+end
+ret st
+end
+
+fn ipc_spawn p2c view uchar 8 c2p view uchar 8 to long
+ar = int rd32le p2c 0
+aw = int rd32le p2c 4
+br = int rd32le c2p 0
+bw = int rd32le c2p 4
+pid = fork
+if lt pid 0
+ret -60
+end
+if eq pid 0
+x1 = fclose aw
+x2 = fclose br
+ipc_node_b ar bw
+end
+x3 = fclose ar
+x4 = fclose bw
+ret pid
+end
+
+fn ipc_host_rounds aw int br int res edit long 2 to int
+cnb = long -1
+for k ulong 4
+cnb = host_give_round aw br uint k add mul k 5 1
+if lt cnb 0
+ret 65
+end
+end
+od = host_take_round aw br 4
+if ne od -10
+ret 66
+end
+for k ulong 3
+tk = host_take_round aw br uint add 5 k
+if ne tk 0
+ret 67
+end
+end
+x1 = fclose aw
+x2 = fclose br
+put res 0 cnb
+put res 1 od
+ret 0
+end
+
+fn ipc_run to int
+p2c = new uchar 8 0
+c2p = new uchar 8 0
+wst = new uchar 4 0
+res = new long 2 0
+if lt pipefds p2c 0 8 0 0
+ret 61
+end
+if lt pipefds c2p 0 8 0 0
+ret 62
+end
+ldg_reset
+t0 = monons
+pid = ipc_spawn p2c c2p
+if lt pid 0
+ret 63
+end
+if lt pin_core 16 0
+ret 64
+end
+cna = cpunow
+rrc = ipc_host_rounds int rd32le p2c 4 int rd32le c2p 0 res
+wp = waitpid int pid wst 0 4 0
+t1 = monons
+if ne rrc 0
+ret rrc
+end
+st = rd32le view wst 0
+if or lt wp 0 ne st 0
+ret 68
+end
+if or ne cna 16 ne get res 0 17
+ret 69
+end
+put IpcOut 0 cna
+put IpcOut 1 get res 0
+put IpcOut 2 8
+put IpcOut 3 long get Lstate 1
+put IpcOut 4 long get Lstate 2
+put IpcOut 5 get res 1
+put IpcOut 6 sub t1 t0
+put IpcOut 7 i64_tc ldg_chid
+ret 0
+end

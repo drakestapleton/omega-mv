@@ -1,0 +1,546 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note BTWAVE-P0: Non-binary balanced-ternary SWAR wave foundation (native/btwave/trit.om).
+note Pure seeded OM-2 (om2) implementation:
+note   1. Trit32: 32 balanced trits {-1, 0, +1} packed in u64 ((pos32 << 32) | neg32)
+note      with constructor postcondition (pos32 & neg32) == 0 (traps 10 -> exit 110).
+note   2. WaveDup: mirrored 64-bit waveguide frame tag with OM-2 holds dup32 (traps 10).
+note   3. CreditJ and GrantJ: distinct abstract types separating earned compute credit
+note      from authorized compute extraction (swaps fail omc compilation with error 7).
+note   4. Multi-scale M=6 balanced-ternary toroidal codec on [-364, 364] (729 states,
+note      enc(0) = 0 Dark Consensus, 1-op ROR negation symmetry) + M=3 16/16 hypercube.
+note   5. Orthogonal H16 Walsh-Hadamard ternary wave spreading (d_H = 8), correcting
+note      all 0..3 carrier corruptions and fail-closed refusing >= 4-carrier ties.
+note   6. Pure OM-2 FIPS 180-4 SHA-256 with fresh message schedule and unrolled rounds.
+om2
+abstract Trit32 ulong ops rotr rotl
+abstract WaveDup ulong
+holds WaveDup dup32
+abstract CreditJ ulong
+abstract GrantJ ulong
+
+const M32 ulong 0xffffffff
+const M16 ulong 0xffff
+const VMAX long 65536
+const WMAX ulong 1000
+
+fn Trit32mk w ulong to Trit32
+ensures eq and shr w 32 and w 0xffffffff 0
+ret seal Trit32 w
+end
+
+fn WaveDupmk w ulong to WaveDup
+ret seal WaveDup w
+end
+
+fn CreditJmk w ulong to CreditJ
+ret seal CreditJ w
+end
+
+fn GrantJmk w ulong to GrantJ
+ret seal GrantJ w
+end
+
+fn wdup_tag tag uint to WaveDup
+u = ulong tag
+ret WaveDupmk or shl u 32 u
+end
+
+fn wdup_chk d WaveDup exp uint to bool
+ret eq and open d 0xffffffff ulong exp
+end
+
+note 1-op balanced-ternary negation across all 32 lanes via single AArch64 ROR #32.
+fn t32neg a Trit32 to Trit32
+ret rotr a 32
+end
+
+note Zero-multiply 32-wide balanced-ternary wave product under constant-time SWAR.
+fn t32mul a Trit32 b Trit32 to Trit32
+wa = open a
+wb = open b
+ws = rotr wb 32
+ab = and wa wb
+as = and wa ws
+p = or shr ab 32 and ab M32
+n = or shr as 32 and as M32
+ret Trit32mk or shl p 32 n
+end
+
+note Branchless SWAR popcount on 32-bit unsigned word (zero hardware multiplies).
+fn pop32 x uint to long
+ensures and ge result 0 le result 32
+v = sub x and shr x 1 0x55555555
+v = add and v 0x33333333 and shr v 2 0x33333333
+v = and add v shr v 4 0x0f0f0f0f
+v = add v shr v 8
+v = add v shr v 16
+ret long and v 0x3f
+end
+
+note Branchless 32-trit inner product in [-32, +32].
+fn t32dot a Trit32 b Trit32 to long
+ensures and ge result -32 le result 32
+m = open t32mul a b
+pp = pop32 uint shr m 32
+nn = pop32 uint and m M32
+ret sub pp nn
+end
+
+note Active non-zero carrier count in [0, 32]; 0 iff Dark Zero (all 32 lanes 0).
+fn t32pow a Trit32 to long
+ensures and ge result 0 le result 32
+wa = open a
+act = or shr wa 32 and wa M32
+ret pop32 uint act
+end
+
+note Flip carrier sign (+1 <-> -1, leaving 0 unchanged) at lane c < 32.
+fn t32flip a Trit32 c ulong to Trit32
+requires lt c 32
+wa = open a
+bit = shl ulong 1 c
+p = shr wa 32
+n = and wa M32
+bp = and p bit
+bn = and n bit
+np = or and p xor M32 bit bn
+nn = or and n xor M32 bit bp
+ret Trit32mk or shl np 32 nn
+end
+
+note Erase carrier to Dark Zero (0) at lane c < 32.
+fn t32eras a Trit32 c ulong to Trit32
+requires lt c 32
+wa = open a
+msk = xor M32 shl ulong 1 c
+p = and shr wa 32 msk
+n = and and wa M32 msk
+ret Trit32mk or shl p 32 n
+end
+
+note M=6 balanced-ternary encoder on [-364, +364] (3^6 = 729 states).
+note Branchless digit split: r in {0,1,2} -> pos = r>>1, neg = (2-r)>>1.
+fn bt6enc u long to Trit32
+requires and ge u -364 le u 364
+z = ulong add u 364
+p = ulong 0
+n = ulong 0
+for k ulong 6 unroll
+r = rem z 3
+z = div z 3
+ip = shr r 1
+ineg = shr sub 2 r 1
+p = or p shl ip k
+n = or n shl ineg k
+end
+ret Trit32mk or shl p 32 n
+end
+
+note M=6 balanced-ternary decoder to [-364, +364].
+fn bt6dec_w wa ulong to long
+requires eq and wa 0xffffffc0ffffffc0 0
+ensures and ge result -364 le result 364
+p = shr wa 32
+n = and wa M32
+acc = long 0
+w = long 1
+for k ulong 6 unroll
+dp = long and shr p k 1
+dn = long and shr n k 1
+acc = add acc mul sub dp dn w
+w = mul w 3
+end
+ret acc
+end
+
+fn bt6dec a Trit32 to long
+ret bt6dec_w open a
+end
+
+note Toroidal group addition on Z/729Z centered on [-364, +364].
+fn bt6tor u long v long to long
+requires and ge u -364 le u 364
+requires and ge v -364 le v 364
+ensures and ge result -364 le result 364
+s = add add u v 1093
+ret sub rem s 729 364
+end
+
+note Constructive 3-trit (3^3 = 27 > 16) hypercube encoder for 4-bit corner m < 16.
+fn hc3enc m ulong to Trit32
+requires lt m 16
+z = add m 6
+p = ulong 0
+n = ulong 0
+for k ulong 3 unroll
+r = rem z 3
+z = div z 3
+p = or p shl shr r 1 k
+n = or n shl shr sub 2 r 1 k
+end
+ret Trit32mk or shl p 32 n
+end
+
+note Constructive 3-trit hypercube decoder; returns 0..15 or 99 if outside [-7, +8].
+fn hc3dec_w wa ulong to ulong
+requires eq and wa 0xfffffff8fffffff8 0
+p = shr wa 32
+n = and wa M32
+u = sub long and p 1 long and n 1
+u = add u mul 3 sub long and shr p 1 1 long and shr n 1 1
+u = add u mul 9 sub long and shr p 2 1 long and shr n 2 1
+if or lt u -7 gt u 8
+ret 99
+end
+ret ulong add u 7
+end
+
+fn hc3dec a Trit32 to ulong
+ret hc3dec_w open a
+end
+
+note Sylvester Walsh-Hadamard H16 biorthogonal wave encoder (32 codewords, d_H = 8).
+fn h16enc sym ulong to Trit32
+requires lt sym 32
+r = and sym 15
+pol = shr sym 4
+p = ulong 0
+n = ulong 0
+for c ulong 16
+pc = ulong and pop32 uint and r c 1
+par = xor pc pol
+ib = shl ulong 1 c
+if eq par 0
+p = or p ib
+else
+n = or n ib
+end
+end
+ret Trit32mk or shl p 32 n
+end
+
+note Branchless-metric H16 decoder: corrects all 0..3 carrier corruptions (flips or erasures)
+note and fail-closed returns -1 on >= 4-carrier corruptions or midpoint ties.
+fn h16dec rx Trit32 to long
+bestd = long 99
+bests = long -1
+ties = long 0
+for s ulong 32
+cw = h16enc s
+pr = open t32mul rx cw
+mt = pop32 uint and shr pr 32 M16
+d = sub 16 mt
+if lt d bestd
+bestd = d
+bests = long s
+ties = 1
+else
+if eq d bestd
+ties = add ties 1
+end
+end
+end
+if and le bestd 3 eq ties 1
+ret bests
+end
+ret -1
+end
+
+note Pack full 32-carrier job wave from decoded H16 symbol sym < 32.
+fn job_wave sym ulong to Trit32
+requires lt sym 32
+lo = open h16enc sym
+hi = open h16enc xor sym 21
+plo = and shr lo 32 M16
+nlo = and lo M16
+phi = shl and shr hi 32 M16 16
+nhi = shl and hi M16 16
+ret Trit32mk or shl or plo phi 32 or nlo nhi
+end
+
+note Deterministic 32-trit operator bank row r in 0..3.
+fn wbank_row r ulong to Trit32
+requires lt r 4
+p = ulong 0
+n = ulong 0
+for i ulong 32
+rm = rem add add mul 3 r i 1 3
+ib = shl ulong 1 i
+if eq rm 2
+p = or p ib
+else
+if eq rm 0
+n = or n ib
+end
+end
+end
+ret Trit32mk or shl p 32 n
+end
+
+note Weighted harmonic inner-product sum across the 4-row balanced-ternary bank.
+fn wave_sum jw Trit32 to long
+ensures and ge result -1280 le result 1280
+d0 = t32dot wbank_row 0 jw
+d1 = t32dot wbank_row 1 jw
+d2 = t32dot wbank_row 2 jw
+d3 = t32dot wbank_row 3 jw
+acc = add d0 mul 3 d1
+acc = add acc mul 9 d2
+acc = add acc mul 27 d3
+ret acc
+end
+
+note Scaled wave evaluation; checked signed mul traps 1 (exit 101) if scale overflows.
+fn wave_eval jw Trit32 sc long to long
+ws = wave_sum jw
+ret mul sc ws
+end
+
+note Two's-complement conversion of signed long to unsigned 64-bit word without trap 5.
+fn u64_tc x long to ulong
+if ge x 0
+ret ulong x
+end
+xp = neg add x 1
+ret sub 0xffffffffffffffff ulong xp
+end
+
+fn i64_tc u ulong to long
+if lt u 0x8000000000000000
+ret long u
+end
+up = sub 0xffffffffffffffff u
+ret sub neg long up 1
+end
+
+fn wr64le b edit uchar * o ulong u ulong to void
+for i ulong 8 unroll
+put b add o i uchar and shr u mul i 8 0xff
+end
+end
+
+fn rd64le b view uchar * o ulong to ulong
+u = ulong 0
+for i ulong 8 unroll
+u = or u shl ulong get b add o i mul i 8
+end
+ret u
+end
+
+fn rd64be b view uchar * o ulong to ulong
+u = ulong 0
+for i ulong 8 unroll
+u = or shl u 8 ulong get b add o i
+end
+ret u
+end
+
+fn wr32le b edit uchar * o ulong u uint to void
+for i ulong 4 unroll
+put b add o i uchar and shr u uint mul i 8 0xff
+end
+end
+
+fn rd32le b view uchar * o ulong to uint
+u = uint 0
+for i ulong 4 unroll
+u = or u shl uint get b add o i uint mul i 8
+end
+ret u
+end
+
+note FIPS 180-4 SHA-256 round constants K[0..63].
+fn wskinit k edit uint 64 to void
+put k 0 0x428a2f98
+put k 1 0x71374491
+put k 2 0xb5c0fbcf
+put k 3 0xe9b5dba5
+put k 4 0x3956c25b
+put k 5 0x59f111f1
+put k 6 0x923f82a4
+put k 7 0xab1c5ed5
+put k 8 0xd807aa98
+put k 9 0x12835b01
+put k 10 0x243185be
+put k 11 0x550c7dc3
+put k 12 0x72be5d74
+put k 13 0x80deb1fe
+put k 14 0x9bdc06a7
+put k 15 0xc19bf174
+put k 16 0xe49b69c1
+put k 17 0xefbe4786
+put k 18 0x0fc19dc6
+put k 19 0x240ca1cc
+put k 20 0x2de92c6f
+put k 21 0x4a7484aa
+put k 22 0x5cb0a9dc
+put k 23 0x76f988da
+put k 24 0x983e5152
+put k 25 0xa831c66d
+put k 26 0xb00327c8
+put k 27 0xbf597fc7
+put k 28 0xc6e00bf3
+put k 29 0xd5a79147
+put k 30 0x06ca6351
+put k 31 0x14292967
+put k 32 0x27b70a85
+put k 33 0x2e1b2138
+put k 34 0x4d2c6dfc
+put k 35 0x53380d13
+put k 36 0x650a7354
+put k 37 0x766a0abb
+put k 38 0x81c2c92e
+put k 39 0x92722c85
+put k 40 0xa2bfe8a1
+put k 41 0xa81a664b
+put k 42 0xc24b8b70
+put k 43 0xc76c51a3
+put k 44 0xd192e819
+put k 45 0xd6990624
+put k 46 0xf40e3585
+put k 47 0x106aa070
+put k 48 0x19a4c116
+put k 49 0x1e376c08
+put k 50 0x2748774c
+put k 51 0x34b0bcb5
+put k 52 0x391c0cb3
+put k 53 0x4ed8aa4a
+put k 54 0x5b9cca4f
+put k 55 0x682e6ff3
+put k 56 0x748f82ee
+put k 57 0x78a5636f
+put k 58 0x84c87814
+put k 59 0x8cc70208
+put k 60 0x90befffa
+put k 61 0xa4506ceb
+put k 62 0xbef9a3f7
+put k 63 0xc67178f2
+end
+
+fn wsiv s edit uint 8 to void
+put s 0 0x6a09e667
+put s 1 0xbb67ae85
+put s 2 0x3c6ef372
+put s 3 0xa54ff53a
+put s 4 0x510e527f
+put s 5 0x9b05688c
+put s 6 0x1f83d9ab
+put s 7 0x5be0cd19
+end
+
+fn wssched w edit uint 64 fresh m view uchar * o ulong to void
+q = ulong 0
+x = uint 0
+y = uint 0
+for i ulong 16 unroll
+q = add o mul i 4
+x = uint get m q
+x = or shl x 8 uint get m add q 1
+x = or shl x 8 uint get m add q 2
+put w i or shl x 8 uint get m add q 3
+end
+for i ulong 48 unroll
+x = get w add i 1
+y = get w add i 14
+x = add add get w i get w add i 9 xor xor rotr x 7 rotr x 18 shr x 3
+put w add i 16 add x xor xor rotr y 17 rotr y 19 shr y 10
+end
+end
+
+fn wsround s edit uint 8 w view uint 64 kt view uint 64 to void
+a = get s 0
+b = get s 1
+c = get s 2
+d = get s 3
+e = get s 4
+f = get s 5
+g = get s 6
+h = get s 7
+t = uint 0
+for i ulong 64 unroll
+h = add h get kt i
+h = add h get w i
+t = xor rotr e 6 rotr e 11
+t = xor t rotr e 25
+h = add h t
+h = add h xor g and e xor f g
+d = add d h
+t = xor rotr a 2 rotr a 13
+t = xor t rotr a 22
+h = add h t
+t = and c or a b
+h = add h or and a b t
+t = h
+h = g
+g = f
+f = e
+e = d
+d = c
+c = b
+b = a
+a = t
+end
+put s 0 add get s 0 a
+put s 1 add get s 1 b
+put s 2 add get s 2 c
+put s 3 add get s 3 d
+put s 4 add get s 4 e
+put s 5 add get s 5 f
+put s 6 add get s 6 g
+put s 7 add get s 7 h
+end
+
+fn wscomp s edit uint 8 w edit uint 64 kt view uint 64 m view uchar * o ulong to void
+wssched w m o
+wsround s w kt
+end
+
+fn wsout dg edit uchar 32 s view uint 8 to void
+for i ulong 8 unroll
+v = get s i
+o = mul i 4
+put dg o uchar and shr v 24 0xff
+put dg add o 1 uchar and shr v 16 0xff
+put dg add o 2 uchar and shr v 8 0xff
+put dg add o 3 uchar and v 0xff
+end
+end
+
+fn wsfin s edit uint 8 w edit uint 64 kt view uint 64 pad edit uchar 128 n ulong to void
+remb = and n 63
+put pad remb 0x80
+eb = ulong 64
+if ge remb 56
+eb = 128
+end
+bits = shl n 3
+for i ulong 8 unroll
+put pad sub eb add i 1 uchar and shr bits mul i 8 0xff
+end
+wscomp s w kt view pad 0
+if eq eb 128
+wscomp s w kt view pad 64
+end
+end
+
+note Hash arbitrary slice m (up to 64 MiB per call) into 32-byte SHA-256 digest dg.
+fn sha256_slice m view uchar * dg edit uchar 32 to void
+n = len m
+s = new uint 8 0
+w = new uint 64 0
+kt = new uint 64 0
+pad = new uchar 128 0
+wsiv s
+wskinit kt
+nb = shr n 6
+for b ulong nb
+wscomp s w kt m shl b 6
+end
+remb = and n 63
+base = shl nb 6
+for i ulong remb
+put pad i get m add base i
+end
+wsfin s w kt pad n
+wsout dg s
+end
