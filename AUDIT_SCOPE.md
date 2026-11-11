@@ -23,8 +23,9 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607`,
-   from `seed/omc/omc.om` `ed8e6a6aca3dfed740de2a1aa458095a8a50a757f5b1d3f2b1683ad4ba9cb740`; omc tables in one growing arena, no table capacities (OMEGESE 9.6, decision 23 amended 2026-11-11), branch `omc/no-caps` on Radicle main b2ad967e). The earlier audit pins
+   `1e628c80d5bd2ad0b08eb46d8abff66eff284a74e5a302e589c2d61cfe9f7347`,
+   from `seed/omc/omc.om` `de4099cad761a315d6bf9898bc29eb18b9eedddb568594d41e80d0de462f4199`; omc arena accesses written inline, in range by construction, and input-sized first rooms (compile time at or below f4fa7951 on the stack's units), branch `omc/perf` on Radicle main 1fa9e360). The earlier audit pins
+   `c52e986ed693c241f0bbb5c673a81a4aef70b9b923c447004360ffd111383607` (omc tables in one growing arena, no table capacities (OMEGESE 9.6, decision 23 amended 2026-11-11), branch `omc/no-caps` on Radicle main b2ad967e),
    `f4fa7951816bbd09c5eaaae6692852a70c3c305164b365027c5b683dec7d63e9` (OM-2 AArch64 global array bases and lengths pinned in X18..X26, with factory bay 16's pinshut fix, branch `ham/omc-perf-mem-3`, stacked on `ham/om-threads-4` and `ham/omc-perf-loops-5` on Radicle main 12bdb787),
    `0ed21175a1709cb755c289383cd8fcbfaac8330c3967fe4656b9f82fc96a3c4f` (scheduler host words cpuset/cpuget/cpunow/setprio/getprio 236..240, branch `ham/om-threads-4`, stacked on `ham/omc-perf-loops-5` on Radicle main 12bdb787),
    `6844d173abc85ecbc04154cce85e4e5eeec8bf7b21f4ab1c10728c55efe7dd00` (OM-2 AArch64 `for` loops tested at the latch, branch `ham/omc-perf-loops-5`, on Radicle main 12bdb787),
