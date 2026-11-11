@@ -66,6 +66,7 @@ global lbl ulong 1
 global lcb uchar 131072
 global lst ulong 16
 global lerr ulong 1
+global lfail ulong 1
 global lrmax ulong 1
 global lcd uchar 96
 global lcdl ulong 1
@@ -145,6 +146,7 @@ text kgverify "--verify"
 text kgheadc "HEAD^{commit}"
 text kuhead ".head"
 text klnot "open-intake: list.tsv not replaced (a read or a write failed); the old list stays\n"
+text klread "open-intake: list.tsv read failed; no list decision made; queue request will be retried\n"
 text kglog "log"
 text kgm1 "-1"
 text kgn10 "-10"
@@ -1062,6 +1064,9 @@ lclose sl
 wpath klist
 fd = fopen pth 0 get pthl 0 557056 0
 if lt fd 0
+if ne fd -2
+put lerr 0 1
+end
 ret
 end
 o = mul sl 8
@@ -1113,6 +1118,11 @@ p = get lst add o 1
 if ge p get lst add o 2
 if lfill sl
 continue
+end
+if ne get lerr 0 0
+lclose sl
+put lbl 0 0
+ret false
 end
 if not got
 lclose sl
@@ -1213,7 +1223,28 @@ end
 ret true
 end
 note lfind: the row of the current rid into lb (true), or false when the list has none
+note lvalid: validate a complete read before making a list decision. In particular allarchives
+note and sweep must not act on a prefix before a later read fails. The decision scan reads the
+note same private file; nobody else writes it. Missing file is an empty list, other errors fail.
+fn lvalid to bool
+put lerr 0 0
+lopen 0
+while lnext 0 bound 9223372036854775807
+end
+ret lok
+end
+fn lok to bool
+if ne get lerr 0 0
+put lfail 0 1
+w = write 2 klread 0 len klread
+ret false
+end
+ret true
+end
 fn lfind to bool
+if not lvalid
+ret false
+end
 lopen 0
 while lnext 0 bound 9223372036854775807
 if lisrid 0 get lbl 0
@@ -1221,6 +1252,7 @@ lclose 0
 ret true
 end
 end
+ok = lok
 ret false
 end
 note lstate: the state (field 1) of the row s..e is t
@@ -1280,6 +1312,9 @@ else
 n = add n 1
 end
 end
+end
+if not lok
+ret 0
 end
 ret n
 end
@@ -1398,6 +1433,9 @@ if gt w 65536
 w = ulong 65536
 end
 k = pread fd b 0 w long pos
+if eq k -4
+continue
+end
 if le k 0
 put lerr 0 1
 ret false
@@ -1997,6 +2035,9 @@ ret
 end
 end
 fl = lfailed
+if ne get lfail 0 0
+ret
+end
 if denied
 rsave kr8 fl
 ret
@@ -2082,8 +2123,10 @@ end
 note no size refusal: largest_project_kib is an alarm. The fetch is refused only when it took the
 note storage filesystem below its reserve; then it is unseeded and removed (a failed fetch).
 note What one fetch can write is bounded by radicle-node itself (limits.fetchPackReceive, 500 MiB
-note on the Spark, fetchConcurrency 1), far inside the storage reserve: the design depends on that
-note setting (docs/OPEN-BUILDS.md, "Free-space reserves").
+note on the Spark, fetchConcurrency 1): it limits ONE fetch, not the total repository size. A
+note repository seeded with scope all keeps fetching from peers after it is listed; the intake
+note does not check its reserve for those later fetches. Only storage_free_bytes alarms on that
+note growth. The initial-fetch check is not a lifetime storage guarantee (docs/OPEN-BUILDS.md).
 if not rsvok 0 0
 put avol 10 mul get kb 0 1024
 dounseed
@@ -2195,6 +2238,9 @@ fn sweep to bool
 if not dload
 ret false
 end
+if not lvalid
+ret false
+end
 lopen 0
 while lnext 0 bound 9223372036854775807
 e = get lbl 0
@@ -2207,6 +2253,7 @@ ret true
 end
 end
 end
+ok = lok
 ret false
 end
 note ---- the queue
@@ -2383,7 +2430,14 @@ did1 = true
 end
 break
 end
+put lfail 0 0
 acted = qline a e
+if ne get lfail 0 0
+if dirty
+putoff add off a
+end
+ret false
+end
 did1 = true
 a = add e 1
 if acted
@@ -3840,11 +3894,12 @@ note files and <rid>.head names that commit, the download is current and nothing
 note second bring line of the lister and every allarchives pass cost one git process, not an
 note archive. Else git archive of that commit writes to a pipe; this program counts, hashes and
 note copies the bytes into a/<rid>.tar.tmp, created exclusively and never through a link in the a/
-note it pinned. Past alimit (free bytes of the open dir's filesystem less its reserve, plus the
-note bytes of the <rid>.tar the rename replaces) or 30 s, git is stopped and the row has no
-note download. There is no size cap. Else the old hash and commit go, the temp file is renamed
-note onto <rid>.tar, and the hash and the commit are written to <rid>.sha256 and <rid>.head with
-note wr. Nothing is written outside the pinned a/.
+note it pinned. When HEAD has moved (or there is no current download) the old download is stale:
+note it is removed first (adel), so the old and the new file never take room on the data filesystem
+note together. Then alimit is the free bytes of the open dir's filesystem less its reserve; past it
+note or 30 s, git is stopped and the row has no download. There is no size cap. Else the temp file
+note is renamed onto <rid>.tar, and the hash and the commit are written to <rid>.sha256 and
+note <rid>.head with wr. Nothing is written outside the pinned a/.
 fn archive to void
 if not ahead
 adel
@@ -3857,20 +3912,12 @@ if cur
 ret
 end
 end
+adel
 fa = dfree 1
 ra = rsvget 1
-if not apath kuhead true
-ret
-end
-arel kutar
-old = ulong 0
-if areg
-old = alsize
-end
-unpin
 put alimit 0 0
-if gt add fa old ra
-put alimit 0 sub add fa old ra
+if gt fa ra
+put alimit 0 sub fa ra
 end
 if not apath kutmp true
 ret
@@ -4140,6 +4187,9 @@ r = waitpid int pid st 0 4 0
 ret false
 end
 fn allarchives to void
+if not lvalid
+ret
+end
 lopen 0
 while lnext 0 bound 9223372036854775807
 e = get lbl 0
@@ -4148,6 +4198,7 @@ setrow 0 e
 archive
 end
 end
+ok = lok
 end
 note ---- alarms (no-hard-caps point 5): measurements beside the unchanged caps. Nothing here refuses.
 note A check fires at value >= threshold (free disk: percent free <= 15). <work>alarms.txt holds one
@@ -4232,6 +4283,7 @@ note this program fetched or stored for it (avals 0, its key and volume), the la
 note (avals 2, its key), the total volume, the list's own size in bytes (avals 9) and its longest
 note row (avals 12). One scan in slot 0; lcount and lkib scan in slot 1 inside it.
 fn arows to void
+put lerr 0 0
 for i ulong 3
 put avals i 0
 akclr i
@@ -4268,6 +4320,7 @@ end
 end
 put avals 12 get lrmax 0
 put avol 11 get lrmax 0
+ok = lok
 end
 note lcountc: lcount true for the current did, remembered for the last did it counted: arows asks
 note once for every row of a key, and a whole scan each time would cost the list's size per row
@@ -4590,6 +4643,10 @@ akset 10
 end
 fn alarms to void
 arows
+if ne get lerr 0 0
+aspace dfree 1
+ret
+end
 put avals 3 amax aqsize get aqmax 0
 put avol 3 get avals 3
 put aqmax 0 0
