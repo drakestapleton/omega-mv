@@ -43,15 +43,22 @@ without the cap (slots past 16 share a number); ΩIR values replace them.
 Units ng does not take exit 64 and are `scope` rows (`NAME scope K REASON`, omc must exit K): x86/EFI
 targets (D8) and IR v1 units (first line `ir`). A bound of ng's own that omc never reaches because
 another omc limit refuses first is an `ngonly` row (`NAME ngonly K REASON`): both must exit K, and
-their stderr lines differ (none today). Since 2026-11-11 omc has no table capacities (OMEGESE 9.6) while
-ng's front keeps its fixed tables (8 MiB input, 8192 names, 4096 long names and functions, 512 blocks,
-1024 value nesting, 524288 calls): an input ng refuses at one of them and omc takes past it is an
-`ngcap` row (`NAME ngcap K REASON`, REASON naming ng's table): ng must exit K and omc anything else below
-100. The gate prints `NGCAP ng still refuses C inputs omc accepts` on every run with C > 0, so the gap
-stays visible until ng's tables are lifted, and a row whose input ng accepts fails. Each K is omc's exit
-as measured with the pinned omc (ng's for ngcap). om2 fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
-Input of 8388608 bytes or more is ng's error 14 (cases `size_*`, ngcap rows: omc reads past it since 2026-11-11); the one input edge that is
-main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
+their stderr lines differ (none today). omc has had no table capacities since 2026-11-11 (OMEGESE 9.6), and
+ng's front has had none since the same day (no-caps arena, `src/ir.om` `ar_*`): its input, names, long names,
+functions, calls, blocks, breaks, continues, inline edges, om2 diag site records, value-depth cells and the
+front-ir lowering's names, block stack, snapshots, local arrays and call arguments are regions of one 128 MiB
+arena that grow on demand. A full arena is error 14 with an ng-use record on stderr. Value nesting is bounded
+by ng's own stack at 32768 levels, as omc's is. Names, long names, functions and lowering names have chained
+hashes. A unit whose first line is `usage` is checked as usual and writes the ng-use record in place of output,
+as omc's `usage` does (`seed/ng/tests/nocaps/gate.om` is the alarm).
+An input ng refuses at a fixed table of its own while omc goes past it would be an `ngcap` row
+(`NAME ngcap K REASON`, REASON naming ng's table): ng must exit K and omc anything else below 100. The gate prints
+`NGCAP ng still refuses C inputs omc accepts` on every run with C > 0, and a row whose input ng accepts fails.
+There are none since the arena: the seven former rows are ordinary rows (`calls_524289`, `size_*`, `c2-00312`,
+`c2-05720` and `c2-00308` exact, `c2-00838` beyond 12). Each K is omc's exit as measured with the pinned omc. om2
+fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
+An input of any size the arena holds is read whole (cases `size_*`, newlines only: both compilers' error 16). The
+one input edge that is main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 
 ## Gate
 
@@ -69,13 +76,16 @@ stage lane's unit (src/a64.om on the slice branches) comes with the list and no 
 on ng's stdin, while omc reads the case alone. A wrong mode line makes every case FAIL.
 
 Cases: `cases-front.txt` (f64 rem/and/or/xor, the gate15 refusal cases error-codes.reg names, omc.om,
-the ng-front tools and each ng unit alone, the input-size and call-table edges, and `diag_big`, an om2
+the ng-front tools and each ng unit alone, the input-size edges, 524288, 524289 and 1000000 calls in one function,
+and `diag_big`, an om2
 `diag` unit whose 96955 stderr bytes are compared in full: omc and ng each write stderr to their own
 descriptor and the gate compares the two in 65536-byte chunks), `cases-om2.txt` (every .om under
 seed/omc/om2), `cases-tests.txt` (seed/omc/tests), and the frozen C2 manifest (5876 units). Mutants
 (`mutants/`): m_scope (s_end forgets to restore the name table), m_fltop (f64 accepts rem/and/or/xor),
 m_fmtcr (om2 fmt misses a CR), m_sitebyte (one site-record byte past 65536 corrupted), m_callcap (the
-call table takes one call more); each must be KILLED.
+old 524288-entry call table again: `calls_524289` and `calls_1000000` fail); each must be KILLED.
+Units far past every old table, run to their answers through `@ng a64`, are the no-caps gate's
+(`seed/ng/tests/nocaps/gate.om`; seed/ng/README.md, No-caps gate).
 
 The gate runs on the Spark; there is no GitHub workflow for it. Build ng through its pins and check that
 the gate's checker (`SCRATCH/fecheck`) is byte-for-byte that ng:

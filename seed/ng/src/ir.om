@@ -33,10 +33,6 @@ global i_t5 uint 65568
 global i_xty uint 65536
 global i_xof uint 65536
 global i_xor uchar 65536
-global i_gty uint 65537
-global i_gcl uchar 65537
-global i_gd0 ulong 65537
-global i_gdat uchar 16777216
 global i_fk uchar 65537
 global i_ffl uchar 65537
 global i_frs uint 65537
@@ -76,8 +72,931 @@ global i_vk uchar 8388609
 global i_vo uint 8388609
 global i_vnx uint 8388609
 global i_vno uint 8388609
-global i_in uchar 16777216
-global i_out uchar 16777216
+note ---- the arena (no table capacities; Drake 2026-11-11, OMEGESE 9.6; port of omc.om's a_* unit) -------
+note Every ng table whose size depends on the input is a region of one pool, ar_m (16777216 words, 128 MiB):
+note the payload (front input or ΩIR binary), the output, ΩIR global data and globals, the front's names,
+note long names, functions, calls, blocks, breaks, continues, inline edges, value-depth cells, call-graph
+note order, om2 diag site records and the front-ir lowering tables, and a64's global addresses. A region
+note starts empty and doubles when an index reaches its group's capacity (ar_need); when the moved copies
+note do not fit, the arena is compacted and the group grows in place to the largest size that fits, so the
+note only capacity left is the arena itself. Running out of it is a refusal of the stage that asked
+note (front error 14, a reader's LIMIT class 23, a writer's `ng: arena full`) with an ng-use record on
+note stderr naming every group and the words it held (ar_rec). What bounds the arena: ng has no run-time
+note growth (no heap, decision 24); one pool is at most 16777216 elements (OMEGESE 9.4), so 128 MiB of
+note ulong words; its pages are never resident until touched. It lives in ir.om because every ng tool is
+note composed with ir.om first (ng, ngrun, ngrand and the oracles), so each has the same arena.
+note Regions (ar_defs): ar_rb base word, ar_rw words held, ar_rg group, ar_rm words per group index (0: a
+note byte region, eight bytes to a word). Groups: ar_gc capacity, ar_gp highest index asked for, plus 1.
+note ar_top words handed out, ar_wst words left behind by moves, ar_fl 1 once the arena was full, ar_nr
+note regions defined, ar_wb staging bytes of read and write. Element i of a word region R is
+note `get ar_m add get ar_rb R i` (a uchar or uint region keeps one element per word, read through a
+note conversion and written by ar_pc / ar_pu); an index below the group capacity holds by construction
+note at every such access (the count that bounds it was asked of ar_need first). Where an index comes from
+note input it is checked (ar_g, ar_p): past its region is a fault of ng itself and traps 3, never another
+note region's word.
+global ar_m ulong 16777216
+global ar_rb ulong 160
+global ar_rw ulong 160
+global ar_rg ulong 160
+global ar_rm ulong 160
+global ar_gc ulong 48
+global ar_gp ulong 48
+global ar_top ulong 1
+global ar_wst ulong 1
+global ar_fl ulong 1
+global ar_nr ulong 1
+global ar_ord ulong 160
+global ar_np ulong 160
+global ar_wb uchar 65536
+global ar_rbuf uchar 4096
+global ar_rc ulong 1
+note ar_inl: bytes read into region 0 by ar_rdin (also while it reads, so a full arena's record shows them)
+global ar_inl ulong 1
+note ar_oc: bytes of region 1 (the output) written so far, for the record
+global ar_oc ulong 1
+note ar_gl (generated with ar_defs): the group labels of the ng-use record, each ended by a space
+text ar_gl "in out gdat site names namehash long longhash fns fnhash calls blocks breaks conts inledge depth kahnfn kahncall lnames lnamehash lstack lsnap laq lca irglob a64glob a64val a64live a64call a64code a64fix "
+
+note ar_def: region r is in group g with m words per group index (0: a byte region)
+fn ar_def r ulong g ulong m ulong to void
+put ar_rg r g
+put ar_rm r m
+if ge r get ar_nr 0
+put ar_nr 0 add r 1
+end
+end
+
+note ar_words: the words region r takes at group capacity c
+fn ar_words r ulong c ulong to ulong
+m = get ar_rm r
+if eq m 0
+ret shr add c 7 3
+end
+ret mul c m
+end
+
+note ar_move: room in region r for group capacity c. The last region handed out grows in place; any other
+note moves to the top with its words copied, and the words it leaves behind are counted in ar_wst. Words
+note past ar_top were never handed out and are 0. ar_need has checked that the group fits first, so the two
+note full tests below are never met (they stay as a defence: 1 is returned and nothing moves).
+fn ar_move r ulong c ulong to ulong
+w = ar_words r c
+o = get ar_rw r
+if le w o
+ret 0
+end
+b = get ar_rb r
+t = get ar_top 0
+if and ne o 0 eq add b o t
+if gt sub w o sub len ar_m t
+ret 1
+end
+put ar_top 0 add b w
+put ar_rw r w
+ret 0
+end
+if gt w sub len ar_m t
+ret 1
+end
+ar_copy t b o
+put ar_wst 0 add get ar_wst 0 o
+put ar_rb r t
+put ar_rw r w
+put ar_top 0 add t w
+ret 0
+end
+
+note ar_copy: words s .. s + n - 1 to d .. d + n - 1 in ascending order (d above s + n, or d below s)
+fn ar_copy d ulong s ulong n ulong to void
+i = ulong 0
+while lt i n bound 16777217
+put ar_m add d i get ar_m add s i
+i = add i 1
+end
+end
+
+note ar_copyd: words s .. s + n - 1 to d .. d + n - 1 in descending order (d above s: a slide up)
+fn ar_copyd d ulong s ulong n ulong to void
+i = n
+while gt i 0 bound 16777217
+i = sub i 1
+put ar_m add d i get ar_m add s i
+end
+end
+
+note ar_clear: words a .. b - 1 become 0
+fn ar_clear a ulong b ulong to void
+i = a
+while lt i b bound 16777217
+put ar_m i 0
+i = add i 1
+end
+end
+
+note ar_need: group g is about to use index n; 0 when it may, 1 when the arena has no room (ar_fl set,
+note nothing changed but a compaction). Below the group's capacity nothing happens; at or above it every
+note region of the group grows to twice the capacity (at least n + 1, at least 64), moving to the top when
+note not there already. When the moved copies do not fit in the free words, the arena is compacted (the
+note words moved regions left behind are reclaimed) and the group grows in place (ar_relayout), to twice
+note when that fits, else to the largest capacity that does (ar_gfit). So a table is refused only when
+note the live tables with its group grown by one entry no longer fit in the arena.
+fn ar_need g ulong n ulong to ulong
+if eq get ar_nr 0 0
+ar_defs
+end
+if ge n get ar_gp g
+put ar_gp g add n 1
+end
+c = get ar_gc g
+if lt n c
+ret 0
+end
+c = shl c 1
+if le c n
+c = add n 1
+end
+if lt c 64
+c = ulong 64
+end
+if gt ar_gneed g c sub len ar_m get ar_top 0
+ar_compact
+if gt ar_gextra g c sub len ar_m get ar_top 0
+c = ar_gfit g n c
+if eq c 0
+put ar_fl 0 1
+ret 1
+end
+end
+ar_relayout g c
+put ar_gc g c
+ret 0
+end
+r = ulong 0
+while lt r get ar_nr 0 bound 161
+if eq get ar_rg r g
+if ne ar_move r c 0
+put ar_fl 0 1
+ret 1
+end
+end
+r = add r 1
+end
+put ar_gc g c
+ret 0
+end
+
+note ar_gneed: the words group g's regions take at capacity c, counted as if every one of them moved
+fn ar_gneed g ulong c ulong to ulong
+s = ulong 0
+r = ulong 0
+while lt r get ar_nr 0 bound 161
+if eq get ar_rg r g
+s = add s ar_words r c
+end
+r = add r 1
+end
+ret s
+end
+
+note ar_gextra: the words group g's regions need beyond the words they hold, at capacity c
+fn ar_gextra g ulong c ulong to ulong
+s = ulong 0
+r = ulong 0
+while lt r get ar_nr 0 bound 161
+if eq get ar_rg r g
+w = ar_words r c
+if gt w get ar_rw r
+s = add s sub w get ar_rw r
+end
+end
+r = add r 1
+end
+ret s
+end
+
+note ar_gfit: when doubling does not fit, the capacity group g grows to in place: the largest in n + 1 .. hi whose
+note growth takes at most half the free words (binary search; the need grows with the capacity), so the other
+note groups keep room to grow (omc's a_gfit takes all of it; ng's a64 stage grows several groups per function),
+note else n + 1 when that alone fits in the free words, else 0 (the arena is full)
+fn ar_gfit g ulong n ulong hi ulong to ulong
+f = sub len ar_m get ar_top 0
+lo = add n 1
+if gt ar_gextra g lo f
+ret 0
+end
+h = shr f 1
+if gt ar_gextra g lo h
+ret lo
+end
+while gt sub hi lo 1 bound 64
+mid = add lo shr sub hi lo 1
+if gt ar_gextra g mid h
+hi = mid
+else
+lo = mid
+end
+end
+ret lo
+end
+
+note ar_lowest: index + 1 of the region holding words with the lowest base above lb (any base when any is
+note false), or 0 when none is left
+fn ar_lowest any bool lb ulong to ulong
+best = ulong 0
+bb = ulong 0
+r = ulong 0
+while lt r get ar_nr 0 bound 161
+if ne get ar_rw r 0
+b = get ar_rb r
+if or not any gt b lb
+if or eq best 0 lt b bb
+best = add r 1
+bb = b
+end
+end
+end
+r = add r 1
+end
+ret best
+end
+
+note ar_compact: slide every region down over the words moved regions left behind, in order of base, so
+note the free words are one run at the top again; the words above the new top become 0. Region 0, the
+note payload, has base 0 and stays there.
+fn ar_compact to void
+t = get ar_top 0
+pos = ulong 0
+lb = ulong 0
+any = false
+k = ulong 0
+while lt k 161 bound 162
+best = ar_lowest any lb
+if eq best 0
+k = ulong 161
+else
+r = sub best 1
+b = get ar_rb r
+w = get ar_rw r
+if ne b pos
+ar_copy pos b w
+put ar_rb r pos
+end
+pos = add pos w
+lb = b
+any = true
+k = add k 1
+end
+end
+ar_clear pos t
+put ar_top 0 pos
+put ar_wst 0 0
+end
+
+note ar_relayout: after ar_compact (regions contiguous from word 0 in order of base), give group g's
+note regions their words at capacity c in place: new places in the same order, every region at or above
+note its old place, moved from the top down (ar_copyd), each new tail zeroed. A region of g that holds no
+note words yet goes at the top.
+fn ar_relayout g ulong c ulong to void
+k = ulong 0
+lb = ulong 0
+any = false
+go = true
+while go bound 162
+best = ar_lowest any lb
+if eq best 0
+go = false
+else
+r = sub best 1
+put ar_ord k r
+k = add k 1
+lb = get ar_rb r
+any = true
+end
+end
+r = ulong 0
+while lt r get ar_nr 0 bound 161
+if and eq get ar_rg r g eq get ar_rw r 0
+put ar_ord k r
+k = add k 1
+end
+r = add r 1
+end
+pos = ulong 0
+i = ulong 0
+while lt i k bound 161
+r = get ar_ord i
+put ar_np i pos
+w = get ar_rw r
+if eq get ar_rg r g
+w = ar_words r c
+end
+pos = add pos w
+i = add i 1
+end
+i = k
+while gt i 0 bound 161
+i = sub i 1
+r = get ar_ord i
+np = get ar_np i
+b = get ar_rb r
+w = get ar_rw r
+if and ne np b ne w 0
+ar_copyd np b w
+end
+put ar_rb r np
+if eq get ar_rg r g
+nw = ar_words r c
+if gt nw w
+ar_clear add np w add np nw
+put ar_rw r nw
+end
+end
+end
+put ar_top 0 pos
+end
+
+note ar_zero: the first k words of region r become 0
+fn ar_zero r ulong k ulong to void
+b = get ar_rb r
+ar_clear b add b k
+end
+
+note ar_gzero: every word of every region of group g becomes 0 (a hash table about to be rebuilt)
+fn ar_gzero g ulong to void
+r = ulong 0
+while lt r get ar_nr 0 bound 161
+if eq get ar_rg r g
+ar_zero r get ar_rw r
+end
+r = add r 1
+end
+end
+
+note ar_hash: the b-bit multiplicative hash of w (2^64 divided by the golden ratio, odd)
+fn ar_hash w ulong b ulong to ulong
+ret shr mul w 11400714819323198485 sub 64 b
+end
+
+note ar_oob: an index past its region is a fault of ng itself, never an input's: trap 3 (the pool check on
+note ar_rb at index 160 + i, always past its 160), as an index past a fixed pool trapped
+fn ar_oob i ulong to void
+z = get ar_rb add 160 i
+end
+
+note ar_g / ar_p: element i of word region r, read or written, checked against the region (indices that
+note come from input). ar_pc / ar_pu: element i of a uchar / uint region written (index by construction).
+fn ar_g r ulong i ulong to ulong
+if ge i get ar_rw r
+ar_oob i
+end
+ret get ar_m add get ar_rb r i
+end
+fn ar_p r ulong i ulong v ulong to void
+if ge i get ar_rw r
+ar_oob i
+end
+put ar_m add get ar_rb r i v
+end
+note ar_w / ar_c / ar_u: element i of a ulong / uchar / uint region read through a call: the form of a line
+note whose inline reads do not fit omc's 16-register expression pool (index by construction, unchecked)
+fn ar_w r ulong i ulong to ulong
+ret get ar_m add get ar_rb r i
+end
+fn ar_c r ulong i ulong to uchar
+ret uchar get ar_m add get ar_rb r i
+end
+fn ar_u r ulong i ulong to uint
+ret uint get ar_m add get ar_rb r i
+end
+fn ar_pw r ulong i ulong v ulong to void
+put ar_m add get ar_rb r i v
+end
+fn ar_pc r ulong i ulong v uchar to void
+put ar_m add get ar_rb r i ulong v
+end
+fn ar_pu r ulong i ulong v uint to void
+put ar_m add get ar_rb r i ulong v
+end
+
+note ar_ib: byte i of region 0, the payload. It is the first region placed, so it starts at word 0. Past its
+note words the byte is 0, as the zero pool past the input was.
+fn ar_ib i ulong to uchar
+x = shr i 3
+if ge x get ar_rw 0
+ret 0
+end
+ret uchar and shr get ar_m x shl and i 7 3 255
+end
+
+note ar_bg: byte i of byte region r (0 past its words)
+fn ar_bg r ulong i ulong to uchar
+x = shr i 3
+if ge x get ar_rw r
+ret 0
+end
+y = get ar_m add get ar_rb r x
+ret uchar and shr y shl and i 7 3 255
+end
+
+note ar_bp: byte i of byte region r becomes v. Every writer asked ar_need for the byte first, so the index is in
+note the region by construction and is not checked here (the omc owner measured 11 to 13% for checking every
+note arena access; checks stay where an index comes from input: ar_g, ar_p, ar_ib)
+fn ar_bp r ulong i ulong v uchar to void
+x = add get ar_rb r shr i 3
+s = shl and i 7 3
+y = and get ar_m x not shl ulong 255 s
+put ar_m x or y shl ulong v s
+end
+
+note ar_stage: bytes p .. p + c - 1 of the byte region at word b into ar_wb from 0 (c at most 65536). Bytes up to a
+note word boundary one at a time, then each whole word read once for its 8 bytes, then the last bytes
+fn ar_stage b ulong p ulong c ulong to void
+i = ulong 0
+while and lt i c ne and add p i 7 0 bound 8
+ar_stage1 b add p i i
+i = add i 1
+end
+while le add i 8 c bound 8193
+y = get ar_m add b shr add p i 3
+put ar_wb i uchar and y 255
+put ar_wb add i 1 uchar and shr y 8 255
+put ar_wb add i 2 uchar and shr y 16 255
+put ar_wb add i 3 uchar and shr y 24 255
+put ar_wb add i 4 uchar and shr y 32 255
+put ar_wb add i 5 uchar and shr y 40 255
+put ar_wb add i 6 uchar and shr y 48 255
+put ar_wb add i 7 uchar shr y 56
+i = add i 8
+end
+while lt i c bound 8
+ar_stage1 b add p i i
+i = add i 1
+end
+end
+
+note ar_stage1: byte x of the byte region at word b into ar_wb at i
+fn ar_stage1 b ulong x ulong i ulong to void
+y = get ar_m add b shr x 3
+put ar_wb i uchar and shr y shl and x 7 3 255
+end
+
+note ar_out: write bytes p .. e - 1 of byte region r to fd, 65536 at a time through ar_wb: 1 when every
+note byte was written, 0 when a write returned 0 or less
+fn ar_out fd ulong r ulong p ulong e ulong to ulong
+b = get ar_rb r
+q0 = p
+while lt q0 e bound 2049
+c = sub e q0
+if gt c 65536
+c = ulong 65536
+end
+ar_stage b q0 c
+q = ulong 0
+while lt q c bound 65537
+n = write int fd ar_wb q sub c q
+if le n 0
+ret 0
+end
+q = add q ulong n
+end
+q0 = add q0 c
+end
+ret 1
+end
+
+note ar_rdin: all of fd into region 0 (the payload), eight bytes to a word from word 0, before any other
+note region is placed: 0 done, 1 a read error, 2 the arena is full (ar_inl: the bytes read). The region
+note then keeps the words the bytes fill and 8 more (zero): the input bytes are read inline past their end
+note by at most that much (the tokenizers look one or two bytes ahead), and the next region starts after.
+fn ar_rdin fd int to ulong
+off = ulong 0
+go = true
+while go bound 134217729
+n = read fd ar_wb 0 65536
+if eq n 0
+go = false
+else
+if lt n 0
+put ar_inl 0 off
+ret 1
+end
+c = ulong n
+put ar_inl 0 add off c
+if ne ar_need 0 add off c 0
+ret 2
+end
+ar_pack off c
+off = add off c
+end
+end
+put ar_inl 0 off
+w = add shr off 3 8
+if ne ar_need 0 sub shl w 3 1 0
+ret 2
+end
+put ar_rw 0 w
+put ar_top 0 w
+put ar_gc 0 shl w 3
+ret 0
+end
+
+note ar_pack: the c bytes of ar_wb become payload bytes off .. off + c - 1 (their words are 0 until now). Bytes
+note up to a word boundary one at a time, then whole words of 8 (one store each), then the last bytes (measured
+note under qemu-aarch64 on a 14785-byte unit: 502253 guest instructions a byte at a time, 160761 this way)
+fn ar_pack off ulong c ulong to void
+i = ulong 0
+while and lt i c ne and add off i 7 0 bound 8
+ar_pack1 add off i get ar_wb i
+i = add i 1
+end
+while le add i 8 c bound 8193
+y = ulong get ar_wb i
+y = or y shl ulong get ar_wb add i 1 8
+y = or y shl ulong get ar_wb add i 2 16
+y = or y shl ulong get ar_wb add i 3 24
+y = or y shl ulong get ar_wb add i 4 32
+y = or y shl ulong get ar_wb add i 5 40
+y = or y shl ulong get ar_wb add i 6 48
+y = or y shl ulong get ar_wb add i 7 56
+put ar_m shr add off i 3 y
+i = add i 8
+end
+while lt i c bound 8
+ar_pack1 add off i get ar_wb i
+i = add i 1
+end
+end
+
+note ar_pack1: payload byte x becomes b (its word's other bytes are kept)
+fn ar_pack1 x ulong b uchar to void
+w = shr x 3
+put ar_m w or get ar_m w shl ulong b shl and x 7 3
+end
+
+note ar_gwords: the words the regions of group g hold
+fn ar_gwords g ulong to ulong
+s = ulong 0
+r = ulong 0
+while lt r get ar_nr 0 bound 161
+if eq get ar_rg r g
+s = add s get ar_rw r
+end
+r = add r 1
+end
+ret s
+end
+
+note ar_gcount: what group g was asked to hold: the payload's and the output's bytes, else the highest index
+note asked for, plus 1 (bytes for a byte group)
+fn ar_gcount g ulong to ulong
+if eq g 0
+ret get ar_inl 0
+end
+if eq g 1
+ret get ar_oc 0
+end
+ret get ar_gp g
+end
+
+note record writer: bytes into ar_rbuf (flushed to fd when near full)
+fn ar_rb1 fd ulong b ulong to void
+c = get ar_rc 0
+if ge c 4000
+w = write int fd ar_rbuf 0 c
+c = ulong 0
+end
+put ar_rbuf c uchar b
+put ar_rc 0 add c 1
+end
+fn ar_rn fd ulong v ulong to void
+d = ulong 1
+while le d div v 10 bound 20
+d = mul d 10
+end
+x = v
+while gt d 0 bound 21
+ar_rb1 fd add 48 div x d
+x = rem x d
+d = div d 10
+end
+end
+note ar_rs: the bytes "k=" of a key packed little-endian in w (n bytes)
+fn ar_rs fd ulong w ulong n ulong to void
+x = w
+for i ulong n bound 8
+ar_rb1 fd and x 255
+x = shr x 8
+end
+end
+
+note ar_rec: the ng-use record, one line to fd: ng-use 1 arena=A top=T waste=W full=F, then for each group
+note LABEL=N/H, N what it was asked to hold (ar_gcount) and H the words it holds. A, T, W and H count 8-byte
+note words of the arena; F is 1 when a stage was refused because the arena was full.
+fn ar_rec fd ulong to void
+put ar_rc 0 0
+ar_rs fd 3539940853674764142 8
+ar_rs fd 17277100355641632 7
+ar_rn fd len ar_m
+ar_rs fd 263879357472 5
+ar_rn fd get ar_top 0
+ar_rs fd 17281524405729056 7
+ar_rn fd get ar_wst 0
+ar_rs fd 67535885395488 6
+ar_rn fd get ar_fl 0
+g = ulong 0
+p = ulong 0
+while lt p len ar_gl bound 1024
+ar_rb1 fd 32
+while ne get ar_gl p 32 bound 16
+ar_rb1 fd ulong get ar_gl p
+p = add p 1
+end
+p = add p 1
+ar_rb1 fd 61
+ar_rn fd ar_gcount g
+ar_rb1 fd 47
+ar_rn fd ar_gwords g
+g = add g 1
+end
+ar_rb1 fd 10
+w = write int fd ar_rbuf 0 get ar_rc 0
+put ar_rc 0 0
+end
+
+note ar_die: a stage with no refusal path of its own: `ng: arena full`, the record, exit 14
+text ar_dmsg "ng: arena full\n"
+fn ar_die to void
+w = write 2 ar_dmsg 0 len ar_dmsg
+ar_rec 2
+exit int 14
+end
+
+note ar_defs: the regions (generated by the one-off NgNoCaps codemod; region: name, group, kind)
+note 0 f_inp group 0 (in) bytes
+note 1 i_out group 1 (out) bytes
+note 2 i_gdat group 2 (gdat) bytes
+note 3 f_sitebu group 3 (site) bytes
+note 4 f_nmname group 4 (names) ulong x1
+note 5 f_nm_reg group 4 (names) uchar in a word x1
+note 6 f_nmtype group 4 (names) uchar in a word x1
+note 7 f_nm_len group 4 (names) ulong x1
+note 8 f_nmkind group 4 (names) uchar in a word x1
+note 9 f_nmaddr group 4 (names) ulong x1
+note 10 f_nm_fv group 4 (names) uchar in a word x1
+note 11 f_nm_lay group 4 (names) uchar in a word x1
+note 12 f_nm_fr group 4 (names) uchar in a word x1
+note 13 f_nm_lr group 4 (names) uchar in a word x1
+note 14 f_nm_nx group 4 (names) ulong x1
+note 15 f_nm_h group 5 (namehash) ulong x1
+note 16 f_ln_o group 6 (long) ulong x1
+note 17 f_ln_l group 6 (long) uchar in a word x1
+note 18 f_ln_x group 6 (long) ulong x1
+note 19 f_ln_h group 7 (longhash) ulong x1
+note 20 f_fnname group 8 (fns) ulong x1
+note 21 f_fn_ret group 8 (fns) uchar in a word x1
+note 22 f_fn_np group 8 (fns) uchar in a word x1
+note 23 f_fnnmle group 8 (fns) ulong x1
+note 24 f_fn_off group 8 (fns) ulong x1
+note 25 f_fn_inl group 8 (fns) uchar in a word x1
+note 26 f_fnbody group 8 (fns) ulong x1
+note 27 f_fn_bln group 8 (fns) ulong x1
+note 28 f_settle group 8 (fns) uchar in a word x1
+note 29 f_reach group 8 (fns) uchar in a word x1
+note 30 f_fn_exp group 8 (fns) uchar in a word x1
+note 31 f_fn_nx group 8 (fns) ulong x1
+note 32 f_fn_pn group 8 (fns) ulong x6
+note 33 f_fn_pt group 8 (fns) uchar in a word x6
+note 34 f_fn_pl group 8 (fns) ulong x6
+note 35 f_fn_pk group 8 (fns) uchar in a word x6
+note 36 f_fnplay group 8 (fns) uchar in a word x6
+note 37 f_fn_pfr group 8 (fns) uchar in a word x6
+note 38 f_fn_h group 9 (fnhash) ulong x1
+note 39 f_callfr group 10 (calls) ulong x1
+note 40 f_callto group 10 (calls) ulong x1
+note 41 f_bkind group 11 (blocks) ulong x1
+note 42 f_breg group 11 (blocks) ulong x1
+note 43 f_btyp group 11 (blocks) ulong x1
+note 44 f_bnames group 11 (blocks) ulong x1
+note 45 f_bheld group 11 (blocks) ulong x1
+note 46 f_bdead group 11 (blocks) ulong x1
+note 47 f_u_cur group 11 (blocks) ulong x1
+note 48 f_u_line group 11 (blocks) ulong x1
+note 49 f_u_it group 11 (blocks) ulong x1
+note 50 f_u_k group 11 (blocks) ulong x1
+note 51 f_u_nn group 11 (blocks) ulong x1
+note 52 f_u_held group 11 (blocks) ulong x1
+note 53 f_fz_ent group 11 (blocks) ulong x16
+note 54 f_fz_thn group 11 (blocks) ulong x16
+note 55 f_brkblk group 12 (breaks) ulong x1
+note 56 f_cblk group 13 (conts) ulong x1
+note 57 f_iefrom group 14 (inledge) ulong x1
+note 58 f_ie_to group 14 (inledge) ulong x1
+note 59 f_fr group 15 (depth) ulong x32
+note 60 f_fwv group 15 (depth) ulong x1
+note 61 f_ul_k group 15 (depth) ulong x6
+note 62 f_ul_v group 15 (depth) ulong x6
+note 63 f_k_deg group 16 (kahnfn) ulong x1
+note 64 f_k_st group 16 (kahnfn) ulong x1
+note 65 f_k_cu group 16 (kahnfn) ulong x1
+note 66 f_k_q group 16 (kahnfn) ulong x1
+note 67 f_k_ed group 17 (kahncall) ulong x1
+note 68 f_lnw group 18 (lnames) ulong x1
+note 69 f_lnk group 18 (lnames) uchar in a word x1
+note 70 f_lnt group 18 (lnames) ulong x1
+note 71 f_lnv group 18 (lnames) uint in a word x1
+note 72 f_lnc group 18 (lnames) ulong x1
+note 73 f_lnx group 18 (lnames) ulong x1
+note 74 f_lnh group 19 (lnamehash) ulong x1
+note 75 f_lsk group 20 (lstack) uchar in a word x1
+note 76 f_lsn group 20 (lstack) ulong x1
+note 77 f_lsm group 20 (lstack) ulong x1
+note 78 f_lsj group 20 (lstack) uint in a word x1
+note 79 f_lsh group 20 (lstack) uint in a word x1
+note 80 f_lsx group 20 (lstack) uint in a word x1
+note 81 f_lse group 20 (lstack) uint in a word x1
+note 82 f_lsl group 20 (lstack) uint in a word x1
+note 83 f_lss group 20 (lstack) ulong x1
+note 84 f_lsv group 21 (lsnap) uint in a word x1
+note 85 f_laq group 22 (laq) uint in a word x1
+note 86 f_lca group 23 (lca) uint in a word x1
+note 87 i_gty group 24 (irglob) uint in a word x1
+note 88 i_gcl group 24 (irglob) uchar in a word x1
+note 89 i_gd0 group 24 (irglob) ulong x1
+note 90 a_gad group 25 (a64glob) ulong x1
+note 91 a_vh group 26 (a64val) ulong x1
+note 92 a_vs group 26 (a64val) ulong x1
+note 93 a_ve group 26 (a64val) ulong x1
+note 94 a_vx group 26 (a64val) uchar in a word x1
+note 95 a_vr group 26 (a64val) uchar in a word x1
+note 96 a_vsl group 26 (a64val) ulong x1
+note 97 a_vnx group 26 (a64val) ulong x1
+note 98 a_vln group 26 (a64val) ulong x1
+note 99 a_vf group 26 (a64val) uchar in a word x1
+note 100 a_nu group 26 (a64val) uint in a word x1
+note 101 a_lin group 27 (a64live) ulong x1
+note 102 a_lout group 27 (a64live) ulong x1
+note 103 a_luse group 27 (a64live) ulong x1
+note 104 a_ldef group 27 (a64live) ulong x1
+note 105 a_cpc group 28 (a64call) ulong x1
+note 106 a_cft group 28 (a64call) ulong x1
+note 107 a_code group 29 (a64code) bytes
+note 108 a_xpc group 30 (a64fix) ulong x1
+note 109 a_xfm group 30 (a64fix) ulong x1
+note 110 a_xa group 30 (a64fix) ulong x1
+note 111 a_xl group 30 (a64fix) ulong x1
+fn ar_defs to void
+ar_def 0 0 0
+ar_def 1 1 0
+ar_def 2 2 0
+ar_def 3 3 0
+ar_def 4 4 1
+ar_def 5 4 1
+ar_def 6 4 1
+ar_def 7 4 1
+ar_def 8 4 1
+ar_def 9 4 1
+ar_def 10 4 1
+ar_def 11 4 1
+ar_def 12 4 1
+ar_def 13 4 1
+ar_def 14 4 1
+ar_def 15 5 1
+ar_def 16 6 1
+ar_def 17 6 1
+ar_def 18 6 1
+ar_def 19 7 1
+ar_def 20 8 1
+ar_def 21 8 1
+ar_def 22 8 1
+ar_def 23 8 1
+ar_def 24 8 1
+ar_def 25 8 1
+ar_def 26 8 1
+ar_def 27 8 1
+ar_def 28 8 1
+ar_def 29 8 1
+ar_def 30 8 1
+ar_def 31 8 1
+ar_def 32 8 6
+ar_def 33 8 6
+ar_def 34 8 6
+ar_def 35 8 6
+ar_def 36 8 6
+ar_def 37 8 6
+ar_def 38 9 1
+ar_def 39 10 1
+ar_def 40 10 1
+ar_def 41 11 1
+ar_def 42 11 1
+ar_def 43 11 1
+ar_def 44 11 1
+ar_def 45 11 1
+ar_def 46 11 1
+ar_def 47 11 1
+ar_def 48 11 1
+ar_def 49 11 1
+ar_def 50 11 1
+ar_def 51 11 1
+ar_def 52 11 1
+ar_def 53 11 16
+ar_def 54 11 16
+ar_def 55 12 1
+ar_def 56 13 1
+ar_def 57 14 1
+ar_def 58 14 1
+ar_def 59 15 32
+ar_def 60 15 1
+ar_def 61 15 6
+ar_def 62 15 6
+ar_def 63 16 1
+ar_def 64 16 1
+ar_def 65 16 1
+ar_def 66 16 1
+ar_def 67 17 1
+ar_def 68 18 1
+ar_def 69 18 1
+ar_def 70 18 1
+ar_def 71 18 1
+ar_def 72 18 1
+ar_def 73 18 1
+ar_def 74 19 1
+ar_def 75 20 1
+ar_def 76 20 1
+ar_def 77 20 1
+ar_def 78 20 1
+ar_def 79 20 1
+ar_def 80 20 1
+ar_def 81 20 1
+ar_def 82 20 1
+ar_def 83 20 1
+ar_def 84 21 1
+ar_def 85 22 1
+ar_def 86 23 1
+ar_def 87 24 1
+ar_def 88 24 1
+ar_def 89 24 1
+ar_def 90 25 1
+ar_def 91 26 1
+ar_def 92 26 1
+ar_def 93 26 1
+ar_def 94 26 1
+ar_def 95 26 1
+ar_def 96 26 1
+ar_def 97 26 1
+ar_def 98 26 1
+ar_def 99 26 1
+ar_def 100 26 1
+ar_def 101 27 1
+ar_def 102 27 1
+ar_def 103 27 1
+ar_def 104 27 1
+ar_def 105 28 1
+ar_def 106 28 1
+ar_def 107 29 0
+ar_def 108 30 1
+ar_def 109 30 1
+ar_def 110 30 1
+ar_def 111 30 1
+end
+note ar_init: every region but the payload gets its first room after it: hash buckets 1024
+note (fnhash, lnamehash, longhash, namehash), the output 65536 bytes, every other group 64 entries
+fn ar_init to void
+ar_defs
+z = ar_need 1 65535
+z = ar_need 2 63
+z = ar_need 3 63
+z = ar_need 4 63
+z = ar_need 5 1023
+z = ar_need 6 63
+z = ar_need 7 1023
+z = ar_need 8 63
+z = ar_need 9 1023
+z = ar_need 10 63
+z = ar_need 11 63
+z = ar_need 12 63
+z = ar_need 13 63
+z = ar_need 14 63
+z = ar_need 15 63
+z = ar_need 16 63
+z = ar_need 17 63
+z = ar_need 18 63
+z = ar_need 19 1023
+z = ar_need 20 63
+z = ar_need 21 63
+z = ar_need 22 63
+z = ar_need 23 63
+z = ar_need 24 63
+z = ar_need 25 63
+z = ar_need 26 63
+z = ar_need 27 63
+z = ar_need 28 63
+z = ar_need 29 63
+z = ar_need 30 63
+for g ulong 31
+put ar_gp g 0
+end
+put ar_gp 0 get ar_inl 0
+end
 global i_on ulong 1
 note reader state: 0 cursor, 1 end, 2 refusal class (0 none), 3 refusal offset, 4 value base,
 note 5 block base, 6 function value count
@@ -160,6 +1079,15 @@ end
 ret 0
 end
 note ---- builder ------------------------------------------------------------------------------
+note The builder's tables are those of IR.md s12 for a whole module (65536 types, struct fields and functions,
+note 1048576 blocks, 4194304 ops, 16777216 operand slots, 8388608 values); the reader refuses a count past
+note s12 before building. A builder (front-ir, ngrand, the oracles) asked for more ends with ir_lim: one stderr
+note line and exit 23 (LIMIT), never an index past a table. Globals and their data are in the arena (ir_glob).
+text i_limm "ng: refused class 23 (IR.md s12 table full while building)\n"
+fn ir_lim to void
+w = write 2 i_limm 0 len i_limm
+exit 23
+end
 fn ir_init to void
 ir_rinit
 for i ulong 15
@@ -169,6 +1097,9 @@ put i_on 0 0
 end
 fn ir_newv t uint k uint o uint to uint
 n = add get i_n 6 1
+if gt n 8388608
+ir_lim
+end
 put i_n 6 n
 put i_vty n t
 put i_vk n uchar k
@@ -213,6 +1144,9 @@ ret eq get i_t5 t get i_tq 5
 end
 fn ir_tadd k uint a uint b uint c uint d uint e uint to uint
 t = add get i_n 0 32
+if ge get i_n 0 65536
+ir_lim
+end
 put i_n 0 add get i_n 0 1
 put i_tk t uchar k
 put i_t1 t a
@@ -250,6 +1184,9 @@ put i_sp 1 get i_n 1
 end
 fn ir_tsf t uint off uint ord uint to void
 x = get i_n 1
+if ge x 65536
+ir_lim
+end
 put i_xty x t
 put i_xof x off
 put i_xor x uchar ord
@@ -303,21 +1240,32 @@ ret t
 end
 ret ir_tadd 3 size uint nf uint f0 0 0
 end
+note ir_glob / ir_gbyt: a new global and its data bytes, in the arena (groups irglob and gdat); a full
+note arena ends the build (ar_die), and the reader asks for the room first so that it refuses with LIMIT
 fn ir_glob t uint cls uint to uint
 g = add get i_n 2 1
+if ne ar_need 24 g 0
+ar_die
+end
 put i_n 2 g
-put i_gty g t
-put i_gcl g uchar cls
-put i_gd0 g get i_n 8
+ar_pu 87 g t
+ar_pc 88 g uchar cls
+put ar_m add get ar_rb 89 g get i_n 8
 ret uint g
 end
 fn ir_gbyt g uint b uint to void
 x = get i_n 8
-put i_gdat x uchar b
+if ne ar_need 2 x 0
+ar_die
+end
+ar_bp 2 x uchar b
 put i_n 8 add x 1
 end
 fn ir_fnew kind uint flags uint res uint to uint
 f = add get i_n 3 1
+if gt f 65536
+ir_lim
+end
 put i_n 3 f
 fu = uint f
 put i_fk f uchar kind
@@ -369,6 +1317,9 @@ ret v
 end
 fn ir_blk f uint to uint
 b = add get i_n 4 1
+if gt b 1048576
+ir_lim
+end
 put i_n 4 b
 bu = uint b
 put i_bf b f
@@ -410,6 +1361,9 @@ end
 end
 fn ir_op b uint op uint ty uint imm ulong n uint to uint
 o = add get i_n 5 1
+if or gt o 4194304 gt add get i_n 7 ulong n 16777216
+ir_lim
+end
 put i_n 5 o
 ou = uint o
 put i_oop o uchar op
@@ -523,12 +1477,26 @@ end
 ret 0
 end
 note ---- binary writer (IR.md s3-s7) ----------------------------------------------------------
+note ir_wn: the k (at most 8) low bytes of v at the output's end (region 1 asked for them first). The output is
+note written from byte 0 in order, so the first byte of each word sets the word and the others are ORed in (inline)
 fn ir_wn v ulong k ulong to void
 p = get i_on 0
+if ne ar_need 1 add p k 0
+ar_die
+end
+b = get ar_rb 1
 for j ulong k bound 8
-put i_out add p j uchar and shr v mul j 8 255
+q = add p j
+x = add b shr q 3
+d = and shr v mul j 8 255
+c = shl d shl and q 7 3
+if ne and q 7 0
+c = or c get ar_m x
+end
+put ar_m x c
 end
 put i_on 0 add p k
+put ar_oc 0 add p k
 end
 fn ir_wty t ulong to void
 k = ulong get i_tk t
@@ -561,14 +1529,17 @@ ir_wn ulong get i_t2 t 1
 ir_wn ulong get i_t3 t 1
 end
 fn ir_wglb g ulong to void
-ir_wn ulong get i_gty g 4
-ir_wn ulong get i_gcl g 1
-if eq get i_gcl g 1
-s = ir_tsize get i_gty g
-d = get i_gd0 g
+ir_wn ulong uint get ar_m add get ar_rb 87 g 4
+ir_wn ulong uchar get ar_m add get ar_rb 88 g 1
+if eq ar_c 88 g 1
+s = ir_tsize uint get ar_m add get ar_rb 87 g
+d = get ar_m add get ar_rb 89 g
 p = get i_on 0
-for j ulong s bound 16777216
-put i_out add p j get i_gdat add d j
+if ne ar_need 1 add p s 0
+ar_die
+end
+for j ulong s bound 134217729
+ar_bp 1 add p j ar_bg 2 add d j
 end
 put i_on 0 add p s
 end
@@ -660,7 +1631,7 @@ for i ulong get i_n 0 bound 65536
 ir_wty add i 32
 end
 ir_wn get i_n 2 4
-for i ulong get i_n 2 bound 65536
+for i ulong get i_n 2 bound 134217729
 ir_wglb add i 1
 end
 ir_wn get i_n 3 4
@@ -687,9 +1658,13 @@ ir_bad 12 p
 put i_rd 0 get i_rd 1
 ret 0
 end
+note the payload bytes p .. p + k - 1 are inside region 0 (p + k is at most the payload's end, checked above),
+note which sits at word 0: read inline, no per-byte check
 v = ulong 0
 for j ulong k bound 8
-v = or v shl ulong get i_in add p j mul j 8
+q = add p j
+w = get ar_m shr q 3
+v = or v shl and shr w shl and q 7 3 255 mul j 8
 end
 put i_rd 0 add p k
 ret v
@@ -821,15 +1796,16 @@ end
 ir_rty1
 end
 end
+note globals: the count is bounded by the arena only (group irglob; src/ir.om, no-caps 2026-11-11); ngcheck
+note and the text tools keep the 65536 of IR.md s12. A count the arena cannot hold is LIMIT at the entry.
 fn ir_rglbs to void
-ofs = get i_rd 0
 n = ir_rn 4
-if gt n 65536
-ir_bad 23 ofs
+for i ulong n bound 134217729
+if not ir_ok
 ret
 end
-for i ulong n bound 65536
-if not ir_ok
+if ne ar_need 24 add get i_n 2 1 0
+ir_bad 23 get i_rd 0
 ret
 end
 ir_rglb
@@ -863,8 +1839,13 @@ put i_rd 0 get i_rd 1
 ret
 end
 d = get i_n 8
-for j ulong s bound 16777216
-put i_gdat add d j get i_in add p j
+if ne ar_need 2 add d s 0
+ir_bad 23 p
+put i_rd 0 get i_rd 1
+ret
+end
+for j ulong s bound 134217729
+ar_bp 2 add d j ar_ib add p j
 end
 put i_n 8 add d s
 put i_rd 0 add p s

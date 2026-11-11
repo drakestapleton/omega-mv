@@ -68,7 +68,9 @@ fixture text) or the exact refusal line `ngcheck: CLASS at OFFSET` with empty st
 ir-copy` on every unit (IR.md s14: identity, or the same refusal line for structural classes);
 ngas syntax and limit refusals; byte mutants judged by ngcheck, ngdis and ng; inputs the gate
 generates at the capacities of IR.md s10 and s12 (a unit of exactly 16777216 bytes and one byte
-more, 65537 type entries, text with 65537 types, globals, functions, blocks or parameters); and
+more, which ngcheck and ngdis refuse as LIMIT while ng and ngrun, reading into the no-caps arena of
+`src/ir.om`, read it whole and refuse the byte as TRAILING; 65537 type entries, text with 65537 types,
+globals, functions, blocks or parameters); and
 run pairs: ngrun on `x-NAME.oir` against omc's build of `x-NAME.om` (exit status, stdout and
 stderr equal); N cases: ngrun alone on `n-NAME.oir` with a step budget of 1000000 (exit status,
 empty stdout, the step-limit or outside-storage line); random units of ngrand for seeds 1..1000 (ngcheck's whole ACCEPT line,
@@ -142,6 +144,37 @@ CI: `.github/workflows/ng-ir-arm64.yml` births omc from the seed, requires the c
 `seed/out/omc.sha256`, builds the gate and runs it. That historical workflow's `cat` bootstrap is
 unchanged here (protected path); use the host commands above for the no-cat build. It runs on any
 pull request that changes `seed/**` or the workflow, and on every push to main.
+
+## No-caps gate
+
+ng's input-sized tables (the front's, the front-ir lowering's, the ΩIR payload, output, global data and
+globals of `src/ir.om`, and a64's per-function wires, liveness bitsets, call sites, global addresses and code
+image) are regions of one arena, `ar_m` in `src/ir.om` (16777216 words, 128 MiB; omc.om's arena design,
+OmcNoCaps 2026-11-11). A region doubles when an index reaches its capacity, and the arena is compacted when the
+copies do not fit, so the only capacity left is the arena itself: a full arena is a defined refusal (front error 14,
+ΩIR reader LIMIT 23, otherwise `ng: arena full`, exit 14) followed by the ng-use record `ng-use 1 arena=A top=T
+waste=W full=F GROUP=N/H ...` on stderr. A front unit whose first line is `usage` writes that record in place of
+output (the alarm's input). Value nesting stays bounded by ng's 8 MiB stack at 32768 levels (front.om's note at the
+depth check). The tables of IR.md s12 that the ΩIR builder, ngcheck and the text tools keep are refused with a line,
+never overrun (`ir_lim`).
+
+    cat seed/ng/sha256.om seed/ng/tests/nocaps/gate.om | seed/out/omc > nocaps-gate
+    nocaps-gate seed/out/omc $(sha256sum seed/out/omc | cut -c1-64) SCRATCH [NG]
+
+It builds ng from `ng.units`, generates units far past every old table (100,000 globals, texts and long names,
+60,000 functions, 1,000,000 calls in one function and 1,100,000 in 1100, a 64 MiB input, 5000 nested blocks,
+3000 breaks and continues, values 5000 and 32767 deep, nested calls, 2,000,000 front-ir name snapshots, 10,000
+local arrays, 22,500 inline edges, an om2 diag unit of 1,000,000 sites, 17 MiB of text data; past the front's old
+loop bounds, 1,000,001 rets in one inline body, one text literal of 16,777,219 bytes and 16,777,232 blank lines in
+one block; past a64's 262144 branch fixups a function, 270,000 overflow branches, once with the trap taken), has
+omc compile and run each and ng check, lower, compile and run it, and requires the same answers. 32 mutants
+(each old table or loop bound put back, the trap-label tag of a64 back at 1000, a moved region losing its words)
+must be KILLED, and a control (a wrong expected answer) tripped. The usage alarm: ng checks
+`seed/omc/omc.om` and its own units after a `usage` line; the arena top must stay at or below 10% of the arena,
+every group at or below 5%, a check at or below 2 s
+(both stand near 1.3% and 20 ms); ng with the arena shrunk to 1048576 words must trip it. With NG given, that binary
+is judged and nothing is built (the ng of the base must FAIL here). Last line `NOCAPSGATE PASS cases=31 fail=0
+mutants=32 killed=32 controls=2 tripped=2 notrun=0`, exit 0.
 
 ## Host dependencies
 

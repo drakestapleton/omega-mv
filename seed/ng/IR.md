@@ -885,8 +885,14 @@ function faults at the function record's.
 | `call`/`host`/`launch` arguments | 64 |
 
 A count above its limit is LIMIT (exit 23) at the count's offset, checked before reading what it
-counts. ngcheck and `src/ir.om` share these numbers; the text tools use the capacities of s10
-(65536 for every table, parameters included), which are never below them.
+counts. ngcheck keeps every number of this table; the text tools use the capacities of s10 (65536 for
+every table, parameters included), which are never below them. `src/ir.om` (ng, ngrun, ngrand) keeps
+them too, but two (no-caps arena, 2026-11-11): its input is region 0 of the arena (`ar_m`, 128 MiB), so
+ng and ngrun read a payload of any size the arena holds (past that, LIMIT at the bytes read, with ng's
+ng-use record), and its globals and their data are arena regions, so ng reads and writes a module of more
+than 65536 globals (ngrun keeps its own 65536-entry address table: more is LIMIT at offset 0). The ΩIR
+builder (front-ir, ngrand, the oracles) refuses a table it would fill with `ng: refused class 23 (IR.md s12
+table full while building)` and exit 23, never an index past it (`ir_lim`).
 
 ## 13. Mapping from Omega (for `src/front.om`)
 
@@ -962,19 +968,25 @@ ngcheck. `ir_wr` writes the tables to `i_out` and returns the byte count. `ir_wr
 reproduces the input bytes exactly for every unit `ir_read` accepts. The gate runs `ng ir-copy` on
 every fixture unit, every byte mutation and the generated binaries (full, over, types): where
 ngcheck refuses with a structural class (MAGIC, VERSION, TRUNCATED, TRAILING, UNKNOWN_OP, LIMIT,
-IO) ng must print the same class and offset with empty stdout; otherwise ng must give the bytes back
-exactly or, where ngcheck refuses, refuse with a class of s11 and empty stdout. In the tables a
-`gaddr` imm is the global's handle (the writer subtracts 1, the reader adds 1); every other imm is
-the wire value.
+IO) ng must print the same class and offset with empty stdout, except where that refusal is a LIMIT of
+s12 that ng's reader no longer has (the input size and the globals count, no-caps arena): there ngcheck
+keeps its LIMIT and the gate row pins the verdict of this reader (the class of s11 and the offset) for ng
+(for example `M a-fib 31 1 23 28 13 42`: a globals count of 16777216; the reader resolves a global's type
+only for class 1, so it reads on to the first class byte outside s5, NONCANONICAL at that record). Otherwise
+ng must give the bytes back exactly or, where ngcheck refuses, refuse with a class of s11 and empty stdout.
+In the tables a `gaddr` imm is the global's handle (the writer subtracts 1, the reader adds 1); every other
+imm is the wire value.
 
 Register budget: omc gives a function 16 registers, and each global array read in one expression
-costs one. Keep table reads to two or three per statement (the `ir_*` code shows the pattern).
+costs one, and an expression in a loop's or a branch's head holds its registers to the block's end. Keep
+table reads to two or three per statement (the `ir_*` code shows the pattern); an arena table read is
+three (`get ar_m add get ar_rb R i`), so a crowded line reads through `ar_w` / `ar_c` / `ar_u`.
 
 `main.om` reads the first input line (the mode, at most 63 bytes and its newline) apart, so the
-payload after it fills `i_in` from offset 0 and may be the full 16777216 bytes of s12. `@ng ir-copy`
-reads the ΩIR binary payload and writes it back (reader/writer round trip). A refusal prints `ng:
-refused class C at OFFSET`, offset in the payload, empty stdout, and exits C: a payload over
-16777216 bytes is class 23 at 16777216, an unreadable one class 27; an unknown mode is `ng:
+payload after it is region 0 of the arena (`ar_rdin`) from offset 0, as large as the arena holds.
+`@ng ir-copy` reads the ΩIR binary payload and writes it back (reader/writer round trip). A refusal
+prints `ng: refused class C at OFFSET`, offset in the payload, empty stdout, and exits C: a payload the
+arena cannot hold is class 23 at the bytes read (then the ng-use record), an unreadable one class 27; an unknown mode is `ng:
 unknown mode` and exit 2. `@ng opt` reads the payload like `@ng ir-copy`, runs the optimizer of
 `src/opt.om` (s15.1) and writes the result; `@ng opt-count` runs the same passes and prints one line
 of counts instead of the unit. Stage lanes add their modes (`@ng dump-ir <stage>` after the front end or

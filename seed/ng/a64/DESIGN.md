@@ -652,3 +652,35 @@ Measured 2026-11-11 (HOST_TESTED on a MacBook, macOS 26.6.2, arm64; bundle step 
 equal their ELF, 8 of 8 library fixtures give their status and stdout, and all six controls are caught (libback 6
 for 1 without the move, 139 without the store). NOT_RUN: callbacks nested more than one deep, a callback from
 another thread, a callback that traps.
+
+## 15. Tables in the arena (no-caps, 2026-11-11)
+
+The back end's input-sized tables are regions of the arena of `src/ir.om` (`ar_m`, 16777216 words): the payload
+(region 0), the class-1 data and globals ir.om reads, the global addresses (`a_gad`, group a64glob), the per-wire
+tables `a_vh a_vs a_ve a_vx a_vr a_vsl a_vnx a_vln a_vf a_nu` (a64val, ten words a wire, grown per function to the
+function's values plus the wires `a6_shw` and `a6_tacc` add), the liveness bitsets `a_lin a_lout a_luse a_ldef`
+(a64live, blocks x words, words = wires / 64 rounded up), the call sites `a_cpc a_cft` (a64call), the branch fixups
+`a_xpc a_xfm a_xa a_xl` (a64fix, regions 108..111, four words a fixup: code offset, form, operand, label) and the
+code image `a_code` (a64code). They were fixed at 65537 globals, 262144 wires and 2097152 liveness words a function,
+1048576 call sites, 262144 fixups a function and 16 MiB of code; each is now grown on demand and bounded by the
+arena only, and a full arena is `ng: arena full`, the ng-use record and exit 14. What still bounds a function,
+measured on the Spark:
+the per-wire tables take 10 words a wire, and a call makes two wires (its result and its token), so one function of
+1,000,000 calls (2,000,009 wires, 20 M words) does not fit the arena while 524289 calls (1,048,591 wires) and
+1,000,000 calls spread over functions do; the liveness bitsets grow with blocks x wires, so 5000 nested ifs (7.0 M
+words a bitset) do not fit while 3000 (2.5 M) do. Both are refused with the record, never overrun. A function of
+270000 checked adds (one overflow branch, so one fixup, each) was refused as `a64: unsupported 262144` (exit 5) and
+now compiles and runs (exit 177, as omc's); started 269000 below the largest long it traps 1 (exit 101) at the
+269001st add, as omc's does, so branches patched past the old table still reach their trap stub. Every fixup emits
+at least one code word, so the code reach below also bounds the fixups of a function (2^25; `a6_fixb`'s loop bound
+is that reach). The code image stops at the machine's B/BL reach (2^27 bytes: `a64: branch out of range`, exit 5),
+as omc's AArch64 output does; the Mach-O layout keeps its 16 MiB less 16 KiB (section 11). Blocks and positions a
+function stay IR.md s12's.
+Trap stubs were branch labels 1000 + code (`a6_fx`), so in a function of 1000 blocks or more a block index read as
+a trap code (1064 and up shifted by 64: trap 7 inside ng; found by c2-00308's 513 nested ifs, about 1030 blocks);
+the tag is `a_tlab` = 2^32 now, above every block index. Ten trap branches (traps 1, 3, 5 and 6, the prologue's
+stack check among them) still passed the literal 1000 + code until the next change: read as block 1000 + code they
+became `b.cc 0` and the stub was never marked, so a64/rgate's deep fixture ran to 132 (SIGILL) instead of 106; they
+name `add a_tlab code` now and its ELF equals the one before the arena work. The liveness loops over a block's words
+were bound at 4096 (the old 262144 wires / 64) and are at the arena's bound now. Gate:
+`seed/ng/tests/nocaps/gate.om` (seed/ng/README.md, No-caps gate), whose mutants put each of these back.
