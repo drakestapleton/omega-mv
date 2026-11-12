@@ -1,0 +1,566 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Usage: exec RAW_TEXT MEMORY. MEMORY is a seekable flat byte file, modified in place.
+note Kernarg at byte zero: little-endian u64 a/b/c pointers at 0/8/16, u32 count at 24.
+note Dispatch max(1,ceil(count/64)) wave64 workgroups; s[0:1]=0, s2=group, v0=lane.
+note Source: LLVM llvmorg-18.1.3 llvm/lib/Target/AMDGPU/{SM,SOP,VOP1,VOP2,VOPC,FLAT}Instructions.td,
+note the format and opcode definitions cited in PROVENANCE.md section 8; no NVIDIA facts.
+note Raw .text is decoded, not vadd.isa or an assembly listing. The gate extracts it using ELF headers.
+note Subset only: no SDWA/DPP, scalar-offset SMEM, alternate GLOBAL addressing, flags, other opcodes.
+note Inline integer sources 0..64 and -1..-16, SGPR, VCC/EXEC halves, VGPR, and literal supported.
+note Waits complete immediately: loads/stores are synchronous, not a latency or race model.
+note Refusals: 64 usage/path; 65 malformed code/branch/truncated word; 66 unsupported encoding;
+note 67 memory range; 74 I/O. Compiler loop fuel trap 104 is a defined sandbox refusal.
+note No code/memory buffer cap: both are seekable files. Register sizes are ISA boundaries.
+note Path scratch is Linux PATH_MAX. Loops use the assigned compiler's maximum bound 999999.
+note st: code fd/bytes, memory fd/bytes, PC/next, word/extension/literal, class/op/src0/src1/dst, EXEC/VCC.
+global st ulong 16
+global sr ulong 102
+global vr ulong 16384
+global io uchar 4
+fn fail c int to void
+exit c
+end
+fn fld w ulong s ulong n ulong to ulong
+ret and shr w s sub shl ulong 1 n 1
+end
+fn rdword fd int p ulong lim ulong to ulong
+if lt lim 4
+fail 65
+end
+if gt p sub lim 4
+fail 65
+end
+r = fseek fd long p 0
+if ne r long p
+fail 74
+end
+i = ulong 0
+while lt i 4 bound 999999
+r = read fd io i sub 4 i
+if le r 0
+fail 74
+end
+i = add i ulong r
+end
+v = ulong 0
+for j ulong 4
+v = or v shl ulong get io j mul j 8
+end
+ret v
+end
+fn memaddr p ulong to void
+if lt get st 3 4
+fail 67
+end
+if gt p sub get st 3 4
+fail 67
+end
+end
+fn mread p ulong to ulong
+memaddr p
+ret rdword int get st 2 p get st 3
+end
+fn mwrite p ulong v ulong to void
+memaddr p
+for j ulong 4
+put io j uchar and shr v mul j 8 255
+end
+r = fseek int get st 2 long p 0
+if ne r long p
+fail 74
+end
+i = ulong 0
+while lt i 4 bound 999999
+r = write int get st 2 io i sub 4 i
+if le r 0
+fail 74
+end
+i = add i ulong r
+end
+end
+fn fetch to ulong
+v = rdword int get st 0 get st 5 get st 1
+put st 5 add get st 5 4
+ret v
+end
+fn srcok s ulong vector bool to void
+if le s 101
+ret
+end
+if or or eq s 106 eq s 107 or eq s 126 eq s 127
+ret
+end
+if and ge s 128 le s 208
+ret
+end
+if eq s 255
+ret
+end
+if and vector and ge s 256 le s 511
+ret
+end
+fail 66
+end
+fn scalar s ulong to ulong
+if le s 101
+ret get sr s
+end
+if eq s 106
+ret and get st 15 0xffffffff
+end
+if eq s 107
+ret shr get st 15 32
+end
+if eq s 126
+ret and get st 14 0xffffffff
+end
+if eq s 127
+ret shr get st 14 32
+end
+if and ge s 128 le s 192
+ret sub s 128
+end
+if and ge s 193 le s 208
+ret sub 0x100000000 sub s 192
+end
+if eq s 255
+ret get st 8
+end
+fail 66
+ret 0
+end
+fn vg r ulong lane ulong to ulong
+ret get vr add mul r 64 lane
+end
+fn vs r ulong lane ulong v ulong to void
+put vr add mul r 64 lane and v 0xffffffff
+end
+fn source s ulong lane ulong to ulong
+if ge s 256
+ret vg sub s 256 lane
+end
+ret scalar s
+end
+fn lit to void
+if eq get st 11 255
+put st 8 fetch
+end
+end
+fn decsm w ulong to void
+if ne fld w 13 5 16
+fail 66
+end
+op = fld w 18 8
+if gt op 2
+fail 66
+end
+sd = fld w 6 7
+sb = mul fld w 0 6 2
+if or gt add sd shl ulong 1 op 102 gt sb 100
+fail 66
+end
+x = fetch
+if ne shr x 21 0
+fail 66
+end
+put st 9 1
+put st 10 op
+put st 11 sb
+put st 12 x
+put st 13 sd
+end
+fn decsop w ulong to void
+if eq shr w 23 0x17f
+op = fld w 16 7
+im = and w 65535
+if eq op 1
+if ne im 0
+fail 66
+end
+else
+if ne op 8
+if ne op 12
+fail 66
+end
+if and ne im 0xc07f ne im 0x0f70
+fail 66
+end
+end
+end
+put st 9 4
+put st 10 op
+put st 11 im
+ret
+end
+if eq shr w 23 0x17d
+if ne fld w 8 8 32
+fail 66
+end
+ss = and w 255
+sd = fld w 16 7
+if or gt sd 100 ne and sd 1 0
+fail 66
+end
+if ne ss 106
+if or gt ss 100 ne and ss 1 0
+fail 66
+end
+end
+put st 9 3
+put st 11 ss
+put st 13 sd
+ret
+end
+if eq shr w 30 2
+if ne fld w 23 7 28
+fail 66
+end
+sd = fld w 16 7
+if gt sd 101
+fail 66
+end
+s0 = and w 255
+s1 = fld w 8 8
+srcok s0 false
+srcok s1 false
+put st 9 2
+put st 11 s0
+put st 12 s1
+put st 13 sd
+if or eq s0 255 eq s1 255
+put st 8 fetch
+end
+ret
+end
+fail 66
+end
+fn decglob w ulong to void
+if ne fld w 13 5 4
+fail 66
+end
+if ne fld w 25 1 0
+fail 66
+end
+op = fld w 18 7
+if and ne op 20 ne op 28
+fail 66
+end
+x = fetch
+if ne fld x 16 8 127
+fail 66
+end
+va = and x 255
+if ge va 255
+fail 66
+end
+if eq op 20
+if ne fld x 8 8 0
+fail 66
+end
+else
+if ne shr x 24 0
+fail 66
+end
+end
+put st 9 7
+put st 10 op
+put st 11 va
+put st 12 fld x 8 8
+put st 13 shr x 24
+put st 7 and w 8191
+end
+fn decvec w ulong to void
+ss = and w 511
+srcok ss true
+put st 11 ss
+put st 12 fld w 9 8
+put st 13 fld w 17 8
+if eq shr w 25 63
+if ne fld w 9 8 1
+fail 66
+end
+put st 9 8
+else
+if eq shr w 25 62
+if ne fld w 17 8 204
+fail 66
+end
+put st 9 6
+else
+op = shr w 25
+ok = or or eq op 1 eq op 16 or eq op 18 eq op 19
+ok = or ok or or eq op 25 eq op 28 eq op 52
+if not ok
+fail 66
+end
+put st 9 5
+put st 10 op
+end
+end
+lit
+end
+fn decode pc ulong to void
+put st 4 pc
+put st 5 pc
+put st 8 0
+w = fetch
+put st 6 w
+if eq shr w 26 48
+decsm w
+ret
+end
+if eq shr w 26 55
+decglob w
+ret
+end
+if eq shr w 31 0
+decvec w
+ret
+end
+decsop w
+end
+fn branch to ulong
+im = get st 11
+pc = get st 5
+if ge im 32768
+back = mul sub 65536 im 4
+if gt back pc
+fail 65
+end
+pc = sub pc back
+else
+pc = add pc mul im 4
+end
+if ge pc get st 1
+fail 65
+end
+ret pc
+end
+fn boundary targetpc ulong to void
+pc = ulong 0
+while lt pc targetpc bound 999999
+decode pc
+pc = get st 5
+end
+if ne pc targetpc
+fail 65
+end
+end
+fn validate to void
+pc = ulong 0
+while lt pc get st 1 bound 999999
+decode pc
+nx = get st 5
+if and eq get st 9 4 eq get st 10 8
+t = branch
+boundary t
+end
+pc = nx
+end
+if ne pc get st 1
+fail 65
+end
+end
+fn smexec to void
+sb = get st 11
+p = or get sr sb shl get sr add sb 1 32
+if gt p sub ulong 18446744073709551615 get st 12
+fail 67
+end
+p = add p get st 12
+sd = get st 13
+n = shl ulong 1 get st 10
+for i ulong n
+put sr add sd i mread add p mul i 4
+end
+end
+fn sexec to void
+cl = get st 9
+if eq cl 1
+smexec
+ret
+end
+if eq cl 2
+a = scalar get st 11
+b = scalar get st 12
+put sr get st 13 and shl a and b 31 0xffffffff
+ret
+end
+if eq cl 3
+ss = get st 11
+v = get st 15
+if ne ss 106
+v = or get sr ss shl get sr add ss 1 32
+end
+ex = get st 14
+put sr get st 13 and ex 0xffffffff
+put sr add get st 13 1 shr ex 32
+put st 14 and ex v
+ret
+end
+if eq cl 4
+if eq get st 10 8
+if eq get st 14 0
+put st 5 branch
+end
+end
+ret
+end
+fail 66
+end
+fn carry lane ulong yes bool to void
+mask = shl ulong 1 lane
+v = and get st 15 xor mask ulong 18446744073709551615
+if yes
+v = or v mask
+end
+put st 15 v
+end
+fn vecalu lane ulong to void
+a = source get st 11 lane
+b = vg get st 12 lane
+op = get st 10
+r = ulong 0
+if eq op 1
+r = fpadd a b
+end
+if eq op 16
+r = shr b and a 31
+end
+if eq op 18
+r = shl b and a 31
+end
+if eq op 19
+r = and a b
+end
+if or or eq op 25 eq op 28 eq op 52
+r = add a b
+if eq op 28
+r = add r and shr get st 15 lane 1
+end
+if ne op 52
+carry lane gt r 0xffffffff
+end
+end
+vs get st 13 lane r
+end
+fn globalop lane ulong to void
+va = get st 11
+p = or vg va lane shl vg add va 1 lane 32
+im = get st 7
+if ge im 4096
+im = sub 8192 im
+if lt p im
+fail 67
+end
+p = sub p im
+else
+if gt p sub ulong 18446744073709551615 im
+fail 67
+end
+p = add p im
+end
+if eq get st 10 20
+vs get st 13 lane mread p
+else
+mwrite p vg get st 12 lane
+end
+end
+fn vexec to void
+cl = get st 9
+if eq cl 6
+put st 15 0
+end
+for lane ulong 64
+if ne and shr get st 14 lane 1 0
+if eq cl 5
+vecalu lane
+end
+if eq cl 6
+carry lane gt source get st 11 lane vg get st 12 lane
+end
+if eq cl 7
+globalop lane
+end
+if eq cl 8
+vs get st 13 lane source get st 11 lane
+end
+end
+end
+end
+fn wave group ulong to void
+for i ulong 102
+put sr i 0
+end
+for i ulong 16384
+put vr i 0
+end
+put sr 2 group
+for i ulong 64
+vs 0 i i
+end
+put st 14 18446744073709551615
+put st 15 0
+pc = ulong 0
+while true bound 999999
+decode pc
+if and eq get st 9 4 eq get st 10 1
+ret
+end
+if le get st 9 4
+sexec
+else
+vexec
+end
+pc = get st 5
+end
+end
+fn openarg idx ulong flags int to ulong
+path = new uchar 4096 0
+n = argread idx path 0 len path
+if le n 0
+fail 64
+end
+fd = fopen path 0 ulong n flags 0
+if lt fd 0
+fail 74
+end
+ret ulong fd
+end
+fn filesize fd ulong to ulong
+n = fseek int fd 0 2
+if lt n 0
+fail 74
+end
+ret ulong n
+end
+fn main to int
+if ne argcnt 3
+ret 64
+end
+put st 0 openarg 1 0
+put st 1 filesize get st 0
+if or eq get st 1 0 ne and get st 1 3 0
+ret 65
+end
+validate
+put st 2 openarg 2 2
+put st 3 filesize get st 2
+n = mread 24
+groups = div add n 63 64
+if eq groups 0
+groups = 1
+end
+for g ulong groups
+wave g
+end
+r = fclose int get st 2
+if ne r 0
+ret 74
+end
+r = fclose int get st 0
+if ne r 0
+ret 74
+end
+ret 0
+end
