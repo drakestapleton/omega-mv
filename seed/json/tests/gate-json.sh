@@ -123,6 +123,20 @@ set -e
 [ "$orc" = 1 ] && grep -q 'FAIL field/stop-copy rc=0 got=-21 want=-22' "$B/optimized-field-control.log" || fail 'optimized field wrong-expectation survived or failed for another reason'
 echo 'PASS optimized field wrong expectation rejected (1)'
 
+# Consumer applications must continue compiling, including their independently owned buffer types.
+if [ -n "${JSON_COMPAT_BASE:-}" ]; then
+  $LOW python3 "$J/tests/consumers.py" "$OMC" "$B/consumers" --base "$JSON_COMPAT_BASE" || fail 'base/head consumer composition parity'
+else
+  $LOW python3 "$J/tests/consumers.py" "$OMC" "$B/consumers" || fail 'consumer compositions'
+fi
+
+set +e
+$LOW env PYTHONOPTIMIZE=1 python3 "$J/tests/consumers.py" "$OMC" "$B/optimized-consumer-control" --wrong-expectation > "$B/optimized-consumer-control.log" 2>&1
+orc=$?
+set -e
+[ "$orc" = 1 ] && grep -q 'RuntimeError: composition expectation mismatch: bench-chat' "$B/optimized-consumer-control.log" || fail 'optimized consumer wrong-expectation survived or failed for another reason'
+echo 'PASS optimized consumer wrong expectation rejected (1)'
+
 # 5. Mutants: each must make the parity run fail.
 mutant() { # name file old new
     rm -rf "$B/m"

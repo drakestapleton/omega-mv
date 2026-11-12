@@ -19,7 +19,8 @@ host evidence only. It is not a merge, a deployment, or qualification of any HTT
 | `tests/gen.py` | Deterministic corpus and CPython oracle (test harness only) |
 | `tests/gate-json.sh` | Gate: parity, refusals, limits, mutants |
 | `tests/big.om`, `tests/growing.py` | Above-old-limit reader/writer/formatter driver and independent CPython oracle |
-| `tests/field.py` | Native function-mode sparse uint-field edges and guarded read probes (test instrument) |
+| `tests/field.py` | Native function-mode sparse uint-field edges, escape-end scans and guarded reads (test instrument) |
+| `tests/consumers.py` | Compile compatibility of documented repository compositions; optional --base comparison |
 
 ## Composition
 
@@ -81,8 +82,8 @@ The native test checks the inclusive field edge and refusal immediately beyond i
 
 Sizes are checked before narrowing into the tape. A size refusal invalidates previous success/tokens
 and records error 5 at the configured limit, rather than trapping on the uint conversion. The internal
-number scanner uses zero for failure: every successful exclusive end is greater than its starting
-offset, so a number ending at 4294967295 is not confused with jsnone. Both writer loops consume the
+number scanner and position-returning escape scanners use zero for failure: successful next/end
+positions are nonzero, so position 4294967295 is never confused with jsnone. Both writer loops consume the
 admitted span and stop immediately on sticky output failure, including before another source read.
 The decimal exponent is accumulated exactly until its magnitude exceeds the mantissa displacement
 plus the binary64 range; early exponent saturation cannot erase long-mantissa cancellation.
@@ -271,7 +272,9 @@ is missing, it prints `JSONGATE NOT_RUN` and exits 3. It runs these steps:
    beyond 983040 bytes. CPython `float`, binary64 bits and `repr` independently check balanced
    million-digit mantissas/exponents and randomized long numbers. Native sparse views check both
    uint-field edges and number consumers at the maximum end offset; guard pages prove exhausted
-   output stops before reading another source byte. Eight additional mutants restore each defect.
+   output stops before reading another source byte. Escape probes also scan a real field-width string
+   ending in a simple/Unicode escape and compare its closed control; a sparse valid writer string
+   crosses the same next-position edge. Growth/field mutants restore each defect.
 5. Five mutants must each be caught:
    - an overlong E0 sequence accepted;
    - raw 0x1F accepted;
@@ -295,6 +298,12 @@ accepts --wrong-expectation to make one expected result deliberately wrong; runn
 with PYTHONOPTIMIZE=1 must fail. The existing corpus generator and local evidence instruments use
 the same unconditional-check rule. Long balanced exact midpoint cases straddle zero/min-subnormal,
 subnormal/normal and finite/overflow rounding thresholds, with both signs and both mantissa forms.
+Fixed-size callers must use a constant for their own allocation and signatures, not jsmaxn (the
+library format ceiling). The Node acceptance drivers use their own ndjsz declared in nodedrv.om.
+consumers.py compiles each concrete documented composition, including the Node drivers, benchmark
+chat/fake-model, agent, library variants and native probes. JSON_COMPAT_BASE=REF adds base/head
+compile-status parity; its manifest records exact inputs, citations and any new test application
+held identical across both library versions. Three width mutants must be compile refusal 23.
 The gate prints `SOURCE`, compiler/source hashes, and a final PASS naming the checkout head; retain
 that output from a clean committed tree as the exact-head receipt.
 

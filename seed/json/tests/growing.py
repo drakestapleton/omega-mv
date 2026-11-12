@@ -133,7 +133,7 @@ for index,lex in enumerate(lexemes):
     checks+=1
 
 gate_require(not field.check(omc,out/'field',units), 'gate condition failed')
-checks+=10
+checks+=len(field.field_cases())
 # Each defect has a compiling, behaviorally killed control. Mutations are test-only source twins.
 mutants=0
 for label,filename,old,new,mode,data,want,args in [
@@ -158,7 +158,7 @@ for label,filename,old,new,mode,data,want,args in [
 for label,old in [('copy-stop','if ne get ob jswerr 0\nret\nend\njs_wb ob get s add p i'),('string-stop','if ne get ob jswerr 0\nret\nend\njs_wsb ob get s add off i')]:
     twin=dict(units);gate_require(twin['jsonw.om'].count(old)==1, 'gate condition failed')
     twin['jsonw.om']=twin['jsonw.om'].replace(old,old.split('\nend\n',1)[1])
-    failures=field.check(omc,out/label,twin)
+    failures=field.check(omc,out/label,twin,large_scans=False)
     gate_require(('stop-copy' if label=='copy-stop' else 'stop-string') in failures, 'survived '+label)
     print('PASS growing/mutant '+label+' caught',flush=True);mutants+=1
 for label,filename,old,new in [
@@ -171,8 +171,24 @@ for label,filename,old,new in [
         start=twin[filename].index('fn js_numend ');end=twin[filename].index('\nfn js_wcopy',start)
         twin[filename]=twin[filename][:start]+twin[filename][start:end].replace('ret 0','ret jsnone')+twin[filename][end:]
         twin['jsonf.om']=twin['jsonf.om'].replace('if eq js_numend src off n 0','if eq js_numend src off n jsnone')
-    failures=field.check(omc,out/label,twin)
+    failures=field.check(omc,out/label,twin,large_scans=False)
     gate_require(('parse-above' if label=='preflight-narrow' else 'float') in failures, 'survived '+label)
+    print('PASS growing/mutant '+label+' caught',flush=True);mutants+=1
+# Restore the original escape sentinel independently in reader and writer consumers.
+for label,filename,begin,endmarker,callold,callnew in [
+    ('reader-escape-sentinel','json.om','fn js_uesc ','\nfn js_strtok ',
+     'p = js_escape src tape p\nif eq p 0','p = js_escape src tape p\nif eq p jsnone'),
+    ('writer-escape-sentinel','jsonw.om','fn js_wsesc ','\nfn js_wsrc ',
+     'p = js_wsesc ob src p\nif eq p 0','p = js_wsesc ob src p\nif eq p jsnone'),
+]:
+    twin=dict(units)
+    start=twin[filename].index(begin)
+    end=twin[filename].index(endmarker,start)
+    twin[filename]=twin[filename][:start]+twin[filename][start:end].replace('ret 0','ret jsnone')+twin[filename][end:]
+    gate_require(twin[filename].count(callold)==1,'escape caller mutation is not unique')
+    twin[filename]=twin[filename].replace(callold,callnew)
+    failures=field.check(omc,out/label,twin,large_scans=(label=='reader-escape-sentinel'))
+    gate_require(('esc' if label=='reader-escape-sentinel' else 'wsrc') in failures,'survived '+label)
     print('PASS growing/mutant '+label+' caught',flush=True);mutants+=1
 print('GROWING PASS checks='+str(checks)+' float-oracle='+str(len(lexemes))+' mutants='+str(mutants),flush=True)
 
