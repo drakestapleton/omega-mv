@@ -204,9 +204,13 @@ been submitted to a laboratory, there is no CMVP certificate, and nothing here i
      or rsa_pss_rsae_sha256/384/512. rsa_pkcs1 is never accepted here.
   4. The server Finished HMAC, compared in constant time.
 - RSA key policy. A key the server presents (leaf, intermediate, and the CertificateVerify key)
-  must have a 2048-4096-bit modulus and an odd public exponent in 3 .. 2^32-1, else
-  `X509_ERR_WEAK_KEY`. This bounds the verification cost per certificate. Trust anchors need only
-  2048 bits or more.
+  must have a 2048-4096-bit modulus (`x509_rsaok`) and an odd public exponent in 3 .. 2^32-1
+  (`x509_rsapres`), else `X509_ERR_WEAK_KEY`. This bounds the verification cost per certificate. The
+  parsed certificate record keeps only the modulus size (`X5RBITS`); the exponent check
+  (`x509_rsaeok`) parses the key bytes again when a presented key is checked, so no exponent can change
+  the size that minimum-size checks read. Trust anchors, CRL issuers and OCSP responders need 2048 bits
+  or more whatever their exponent (`chain_sig` reads the size only; x509 C `anchor_rsa*`, rev
+  `revweak` rows).
 - Certificate size limits: a leaf larger than 16896 bytes, or a certificate with more than 9999
   elements in any list (extensions, names, SAN, EKU, RDNs), is refused (`X509_ERR_MALFORMED`)
   instead of trapping. issuerUniqueID and subjectUniqueID may each appear once, in that order.
@@ -391,8 +395,9 @@ The interop refusal table (`build/tls/tls/interop-table.txt`):
 The x509 suite runs `openssl verify -x509_strict -purpose sslserver -verify_hostname HOST -attime
 NOW` (OpenSSL 3.0) on every chain case and fails on any difference that
 `test/x509/vectors/openssl-diff.txt` does not list, and on any listed case where OpenSSL agrees.
-23 of the 106 cases differ. In every one this client refuses and OpenSSL accepts: there is no case
-where this client accepts a chain OpenSSL refuses. The two such cases the review found
+The gate prints how many cases agree (`openssl-parity=P/N`). In every differing case this client
+refuses and OpenSSL accepts: there is no case where this client accepts a chain OpenSSL refuses.
+The two such cases the review found
 (`store_intermediate_anchor`, `at_not_after`) were closed by making this client stricter (above);
 mutants anchor-self-issued and date-at-not-after reopen them and are caught.
 
