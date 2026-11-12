@@ -1363,6 +1363,89 @@ only a private 32-byte header is stack-backed. See
 and 1048576 bytes, and refusal at 1048577 bytes. `devctl` retains its
 request-encoded size limit.
 
+#### KFD device words
+
+Program-mode Linux only: native AArch64 and `target x86linux`. Function mode,
+including OM-2 functions, refuses these words with error 9; firmware targets
+refuse them with error 25. Results are `long`: a handle or syscall result on
+success, negative Linux errno otherwise. No device is opened implicitly.
+
+- `kfdres n` reserves a nonzero, 4096-byte-multiple `ulong` length with
+  `PROT_NONE`, at a kernel-chosen address aligned to 2 MiB. It over-reserves
+  anonymously and unmaps its own alignment prefix/suffix. Misaligned lengths
+  and addition overflow trap 3. The old `maphold` address and length limits
+  do not apply. No physical backing is committed by a reservation.
+- `kfdmap fd offset n` maps `n` bytes read/write and shared, without choosing
+  an address. `fd` is `int`; offset and length are `ulong`; zero length traps
+  3. Use the DRM render fd for buffer offsets and `/dev/kfd` for doorbells,
+  according to the kernel's returned offsets. The kernel validates the fd
+  and mapping offset. The CPU gate also exercises this mapping with an
+  ordinary file; it does not claim that every fd is a KFD descriptor.
+- `kfdctl fd request H off n ...` uses a writable `uchar` header span.
+  `request` is a literal `uint` from the KFD 1.14 allowlist; an unknown or
+  nonliteral request is error 9. The header length must equal that request's
+  ABI size (trap 3 otherwise). Normal array-span bounds checks also apply.
+
+The allowlist covers GET_VERSION, ACQUIRE_VM, GET_PROCESS_APERTURES_NEW,
+CREATE_QUEUE, DESTROY_QUEUE, ALLOC_MEMORY_OF_GPU, FREE_MEMORY_OF_GPU,
+MAP_MEMORY_TO_GPU, UNMAP_MEMORY_FROM_GPU, CREATE_EVENT, DESTROY_EVENT and
+WAIT_EVENTS. It also covers SET_SCRATCH_BACKING_VA and RUNTIME_ENABLE:
+Linux `kfd_ioctl.h` defines their records at lines 355–359 and 976–980 and
+their ioctl macros at 1516–1517 and 1576–1577 in the installed header used
+by `tests/kfd/check.py`. That test compiles the C UAPI as an independent
+oracle and compares the emitted immediates; the compiler does not include C.
+
+The suffix depends on the request:
+
+| Request | Suffix and binding |
+|---|---|
+| GET_PROCESS_APERTURES_NEW | `P poff pn`: writable byte span, count × 56 must fit |
+| MAP_MEMORY_TO_GPU, UNMAP_MEMORY_FROM_GPU | `P poff pn`: device IDs, count × 4 must fit |
+| WAIT_EVENTS | `P poff pn`: event records, count × 48 must fit; every extension pointer must be zero |
+| ALLOC_MEMORY_OF_GPU | `R`: live reservation handle; requested size must fit; USERPTR flag refused |
+| SET_SCRATCH_BACKING_VA | `R`: live reservation handle |
+| CREATE_QUEUE | `ring wptr rptr eop ctx`: live read/write handles; ring size at least 1024 and a power of two, ring/eop/context declared sizes fit, pointer buffers contain at least 8 bytes; zero eop/context handles require zero declared sizes |
+| RUNTIME_ENABLE | `debug`: read/write handle, or `long 0` for NULL |
+| Other requests | No suffix; ACQUIRE_VM verifies its `drm_fd` with fstat as a DRM render character descriptor (major 226, minor at least 128) |
+
+**Address-binding rule:** every caller-supplied address field must be zero.
+The compiler copies the header privately, validates each handle's generation,
+liveness, access kind and size (or each span's bounds), then writes only its
+checked base into the private ioctl record. Header and payload spans must not
+overlap. Copy-out excludes address fields, so those bytes remain zero even
+when the kernel returns an error. Invalid handles, kinds, sizes, addresses,
+overlapping spans, USERPTR and event extensions trap 3 (exit 103).
+Opaque kernel allocation handles and mmap offsets are values, not pointers.
+
+Use one reservation per GPU allocation. After ALLOC, existing
+`mapbind R renderfd mmap_offset 3` replaces the entire owned reservation
+with a shared mapping at exactly the same address, keeping `R` usable as a
+read/write handle; failure retires it. `mapaddr R` gives the checked base
+as a `ulong` for AQL/kernarg data, never as an unchecked ioctl address.
+`mapget`, `mapset`, `mapdrop` and `cpufence` retain their existing contracts.
+The existing program mapping table's handle capacity is unchanged.
+GPU VM mappings require 4096-byte alignment: upstream
+[`amdgpu_gart.h`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/amdgpu/amdgpu_gart.h)
+defines `AMDGPU_GPU_PAGE_SIZE`, and
+[`amdgpu_vm.c`](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c)
+rejects a start, offset or size with bits in `AMDGPU_GPU_PAGE_MASK`.
+The 2 MiB reservation alignment is a stronger compiler guarantee for large
+pages, not a claim that every KFD allocation requires 2 MiB. Actual mapping
+offsets and sizes remain subject to the target kernel. No raw virtual address
+operand exists, so an unaligned caller address cannot reach ALLOC or SCRATCH.
+
+CPU acceptance: `python3 tests/kfd/check.py`. `/dev/kfd` absence is `fopen`
+errno -2. Native invalid-fd ioctl calls return -9; QEMU-user currently returns
+-25 for its unsupported KFD ioctl translation before looking up that fd.
+Both are checked separately. CPU/emulator acceptance is not AMD device
+qualification; all device rows remain NOT_RUN until an authorized device run.
+The native AArch64 ptrace oracle observes every bound address at the syscall
+boundary and poisons private output pointer fields after a real EBADF; caller
+pointer bytes must remain zero. Five independently compiled compiler mutants
+remove request, size, address, kind or OM-2 function-mode refusals and must be
+detected. `--record-history` appends measured compiler facts to the existing
+size ledger only after the CPU gate passes; it never rewrites historical rows.
+
 ### Host CPU ordering words (#939)
 
 | Statement | Meaning |
