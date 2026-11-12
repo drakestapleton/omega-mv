@@ -94,6 +94,10 @@ dmut "mutant dns_a4 name length unchecked" 's/^if gt len hn 253$/if gt len hn 99
 if python3 "$here/resolv.py" "$omc" --out "$out/resolv" > "$out/resolv.log" 2>&1; then
   echo "PASS resolv: $(tail -n 1 "$out/resolv.log")"
 else echo 'FAIL resolv:'; cat "$out/resolv.log"; fail=1; fi
+rc=0; PYTHONOPTIMIZE=1 python3 "$here/resolv.py" "$omc" --out "$out/resolv-optimized-control" --wrong-expectation > "$out/resolv-optimized-control.log" 2>&1 || rc=$?
+if [ "$rc" = 1 ] && grep -q 'RuntimeError: resolver cases failed: at' "$out/resolv-optimized-control.log"; then
+  echo 'PASS optimized resolv wrong expectation rejected (1)'
+else echo 'FAIL optimized resolv expectation control:'; cat "$out/resolv-optimized-control.log"; fail=1; fi
 
 # DIT: tls_hwdit must agree with the kernel's cpuinfo flag (1 on a GB10, 0 on hosted runners); a
 # mutant looking for an auxv key that no kernel emits (60) must report -1 on every host
