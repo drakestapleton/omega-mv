@@ -7,7 +7,7 @@ note   base MODE              the API base for MODE, sandbox (the default of doi
 note   check REPO FILE...     .zenodo.json, LICENSE and the files to upload; every problem on stderr, exit 1
 note   body REPO              the create request: .zenodo.json as metadata, with prereserve_doi
 note   pick MODE FILE WHAT    one checked value of a Zenodo answer: bucket publish html doi pubdoi key size message
-note   setdoi MODE REPO DOI   writes "doi" into .zenodo.json as its first member; every other byte is kept
+note   serve MODE REPO WORK [SOURCE] retains directory custody and metadata across the network phase
 note   consent MODE DOI       asks on /dev/tty; exit 0 only when the line typed there is exactly yes
 note JSON: a file is read whole into gj and checked by recursive descent (modelled on
 note harness-observe tools/jflat.om at 92eba82c, not vendored). Nesting is limited by the 8 MiB stack
@@ -21,20 +21,31 @@ global gn ulong 1
 global gmode ulong 1
 global gprod uchar 1
 global gbad uchar 1
+global gfd long 4
 
 text tpfx "doi: "
 text tnl "\n"
 text tsp " "
 text tind "  "
 text tcolon ": "
-text tusage "usage: doi token | base MODE | snapshot INPUT OUTPUT | check REPO FILE... | body REPO | pick MODE FILE WHAT | setdoi MODE REPO DOI | consent MODE DOI\n(MODE is sandbox or production. Authors run tools/doi/doi.sh, not this program.)\n"
+text tusage "usage: doi token | base MODE | snapshot INPUT OUTPUT | check REPO FILE... | body REPO | pick MODE FILE WHAT | serve MODE REPO WORK [SOURCE] | consent MODE DOI\n(MODE is sandbox or production. Authors run tools/doi/doi.sh, not this program.)\n"
 text wtoken "token"
 text wbase "base"
 text wcheck "check"
 text wsnap "snapshot"
 text wbody "body"
 text wpick "pick"
-text wsetdoi "setdoi"
+text wserve "serve"
+text tdot "."
+text troot "/"
+text tready "READY\n"
+text tsaved "SAVED\n"
+text tbody "body.json"
+text tmcopy "repo/.zenodo.json"
+text tfiles "files/"
+text mdrift "metadata changed since submission; edit preserved, draft kept unpublished (see Draft and Reserved DOI above)"
+text manchor "cannot anchor path without following symlinks: "
+text mlock "another DOI writer holds this repository"
 text wconsent "consent"
 text wpubdoi "pubdoi"
 text ktitle "title"
@@ -78,6 +89,8 @@ text papi "/api"
 text pfiles "/api/files/"
 text pdep "/api/deposit/depositions/"
 text phtml "/"
+text hdep "deposit/"
+text hrec "records/"
 text sactpub "/actions/publish"
 text dsand "10.5072/"
 text dprod "10.5281/"
@@ -116,7 +129,7 @@ text murl "refused: Zenodo's answer points outside "
 text mbaddoi "refused: not a DOI under "
 text mwhat "WHAT must be bucket publish html doi pubdoi key size or message, not "
 text mwrite "cannot write "
-text mrename "cannot replace .zenodo.json; it is unchanged"
+text mrename "cannot exchange metadata; inspect .zenodo.json and .zenodo.json.doi-new; nothing was published"
 text mtokno "ZENODO_TOKEN is not set: create a personal access token on Zenodo (scopes deposit:write and deposit:actions) and export it in this shell only"
 text mtokbad "ZENODO_TOKEN holds a byte other than A-Z a-z 0-9 - . _ ~ + / = (the token is never printed)"
 text mnotty "no terminal at /dev/tty: publishing needs the author to type yes there; nothing was published"
@@ -825,8 +838,80 @@ end
 note ---- files
 note openreg: O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW on Linux AArch64 (asm/fcntl.h).
 note Opening and fstat use the same descriptor: no stat/open symlink race, and no FIFO wait.
+note walkopen restores cwd; every ancestor opened through the previous directory fd.
+note AArch64 O_DIRECTORY=16384, O_NOFOLLOW=32768, O_CLOEXEC=524288.
+fn walkopen p view uchar * flags int mode int to long
+home = fopen tdot 0 len tdot 540672 0
+if lt home 0
+ret -1
+end
+r = long 0
+start = ulong 0
+if eq len p 0
+x = fclose int home
+ret -1
+end
+if eq get p 0 47
+r = chdir troot 0 len troot
+start = ulong 1
+end
+if ge r 0
+r = walkrel p start flags mode
+end
+x = fchdir int home
+y = fclose int home
+if lt x 0
+die manchor
+end
+ret r
+end
+
+fn walkrel p view uchar * start ulong flags int mode int to long
+s = start
+for i ulong sub len p start bound 9223372036854775807
+j = add start i
+if eq get p j 47
+if eq j s
+ret -1
+end
+if not compok part p s sub j s
+ret -1
+end
+fd = fopen p s sub j s or int 540672 32768 0
+if lt fd 0
+ret -1
+end
+r = fchdir int fd
+x = fclose int fd
+if lt r 0
+ret -1
+end
+s = add j 1
+end
+end
+if ge s len p
+ret -1
+end
+if not compok part p s sub len p s
+ret -1
+end
+ret fopen p s sub len p s flags mode
+end
+
+fn compok p view uchar * to bool
+if beq p tdot
+ret false
+end
+if eq len p 2
+if and eq get p 0 46 eq get p 1 46
+ret false
+end
+end
+ret true
+end
+
 fn openreg p view uchar * to long
-fd = fopen p 0 len p or int 526336 32768 0
+fd = walkopen p or int 526336 32768 0
 if lt fd 0
 ret -1
 end
@@ -1036,9 +1121,14 @@ end
 fn cdrepo i ulong to void
 b = new uchar 4096 0
 k = getarg i b
-r = chdir b 0 k
-if lt r 0
+fd = walkopen part b 0 k or int 540672 32768 0
+if lt fd 0
 die2 mcd part b 0 k
+end
+r = fchdir int fd
+x = fclose int fd
+if lt r 0
+die mcd
 end
 end
 
@@ -1171,6 +1261,56 @@ say ttail
 ret 0
 end
 
+note One bucket component; publish/html bind exact decimal create id, no slash/dot normalization.
+fn idmatch b view uchar * to bool
+v = mem ws 0 kid
+if lt v 0
+ret false
+end
+u = ulong v
+e = digs u
+if or eq e u ne long e sknum u
+ret false
+end
+if ne len b sub e u
+ret false
+end
+for i ulong len b bound 9223372036854775807
+if ne get b i get gj add u i
+ret false
+end
+end
+ret true
+end
+
+fn epok b view uchar * kind int to bool
+if eq kind 1
+if eq len b 0
+ret false
+end
+for i ulong len b bound 9223372036854775807
+c = get b i
+if not or isaln c eq c 45
+ret false
+end
+end
+ret true
+end
+if eq kind 2
+if not endsw b sactpub
+ret false
+end
+ret idmatch part b 0 sub len b len sactpub
+end
+if bat b 0 hdep
+ret idmatch part b len hdep sub len b len hdep
+end
+if bat b 0 hrec
+ret idmatch part b len hrec sub len b len hrec
+end
+ret false
+end
+
 note pkurl: kind 1 bucket, 2 publish, 3 html; the string must match its mode and path
 fn pkurl v long kind int to int
 if lt v 0
@@ -1194,10 +1334,8 @@ die2 murl part o 0 k
 end
 um = ulong m
 ok = urlok part b 0 um part o 0 k
-if eq kind 2
-if not endsw part b 0 um sactpub
-ok = false
-end
+if ok
+ok = epok part b k sub um k kind
 end
 if not ok
 warn tpfx
@@ -1392,46 +1530,296 @@ ret and and and a b and c e and f g
 end
 
 note zrepl: rename .zenodo.json.doi-new over .zenodo.json (one step: the old file or the new one)
-fn zrepl to void
+fn zrepl flags int to void
 pk = new uchar 64 0
 wr16 pk 0 2
 wr16 pk 2 len tznew
 k = cpy pk 4 tznew
 wr16 pk k len tzj
 k = cpy pk add k 2 tzj
-r = renames pk 0 k 0
+r = renames pk 0 k flags
 if lt r 0
-x = unlink tznew 0 len tznew
 die mrename
 end
 end
 
-fn dosetd ac ulong to int
-if ne ac 5
+note READY after exclusive reservation and snapshots; receive one DOI line; SAVED after fsync.
+fn homefd i ulong to void
+r = fchdir int get gfd i
+if lt r 0
+die manchor
+end
+end
+
+fn outsnap p view uchar * inf int to void
+homefd 1
+fd = fopen p 0 len p 524481 384
+if lt fd 0
+die2 mwrite p
+end
+ok = copyfd inf int fd
+x = fclose int fd
+homefd 0
+if or not ok lt x 0
+die2 mwrite p
+end
+end
+
+fn filecopy p view uchar * to void
+if not nameok p bname p
+die2 mfname p
+end
+fd = openreg p
+if lt fd 0
+die2 mnotreg p
+end
+o = new uchar 4096 0
+n = cpy o 0 tfiles
+n = cpy o n part p bname p sub len p bname p
+outsnap part o 0 n int fd
+x = fclose int fd
+end
+
+fn scanpdf to void
+buf = new uchar 65536 0
+fd = fopen tdot 0 len tdot 540672 0
+if lt fd 0
+die mnofile
+end
+count = ulong 0
+while true bound 9223372036854775807
+r = getdnts int fd buf 0 len buf
+if lt r 0
+die mnofile
+end
+if eq r 0
+break
+end
+p = ulong 0
+while lt p ulong r bound 9223372036854775807
+n = rd16 buf add p 16
+if or lt n 20 gt add p n ulong r
+die mnofile
+end
+j = add p 19
+e = j
+while lt e add p n bound 9223372036854775807
+if eq get buf e 0
+break
+end
+e = add e 1
+end
+if ge sub e j 4
+if bati part buf j sub e j sub sub e j 4 tpdf
+filecopy part buf j sub e j
+count = add count 1
+end
+end
+p = add p n
+end
+end
+x = fclose int fd
+if eq count 0
+die mnopdf
+end
+end
+
+fn snaplic to void
+buf = new uchar 128 0
+s = ulong 0
+found = false
+for i ulong len tlics bound 9223372036854775807
+if eq get tlics i 10
+n = sub i s
+r = lstat tlics s n buf 0 len buf
+if ge r 0
+fd = openreg part tlics s n
+if lt fd 0
+die2 mnotreg part tlics s n
+end
+x = fclose int fd
+found = true
+end
+s = add i 1
+end
+end
+if not found
+die mnolic
+end
+end
+
+fn snapmeta to void
+slurp tzj
+meta
+if ne get gbad 0 0
+exit 1
+end
+homefd 1
+fd = fopen tmcopy 0 len tmcopy 524481 384
+if lt fd 0
+die mwrite
+end
+ok = wgj int fd 0 get gn 0
+x = fclose int fd
+if or not ok lt x 0
+die mwrite
+end
+fd = fopen tbody 0 len tbody 524481 384
+if lt fd 0
+die mwrite
+end
+ok = wall int fd thead
+ok = and ok wgj int fd add ws 0 1 sub ulong skobj ws 0 1
+ok = and ok wall int fd ttail
+x = fclose int fd
+if or not ok lt x 0
+die mwrite
+end
+homefd 0
+end
+
+note Compare to the exact submitted bytes, including after exchange to close the pre-rename gap.
+fn samejson fd int to bool
+buf = new uchar 65536 0
+p = ulong 0
+while true bound 9223372036854775807
+r = pread fd buf 0 len buf long p
+if eq r -4
+continue
+end
+if lt r 0
+ret false
+end
+if eq r 0
+ret eq p get gn 0
+end
+if gt add p ulong r get gn 0
+ret false
+end
+for i ulong ulong r bound 9223372036854775807
+if ne get buf i get gj add p i
+ret false
+end
+end
+p = add p ulong r
+end
+ret false
+end
+
+fn namedok p view uchar * to bool
+fd = openreg p
+if lt fd 0
+ret false
+end
+ok = samejson int fd
+x = fclose int fd
+ret and ok ge x 0
+end
+
+fn recvdoi d edit uchar * to ulong
+n = ulong 0
+while lt n len d bound 9223372036854775807
+r = read 0 d n 1
+if eq r -4
+continue
+end
+if le r 0
+die mread
+end
+if eq get d n 10
+ret n
+end
+n = add n 1
+end
+die mbaddoi
+ret 0
+end
+
+fn putdoi d view uchar * to void
+homefd 0
+if not namedok tzj
+die mdrift
+end
+fd = int get gfd 2
+r = fchmod fd int get gmode 0
+if lt r 0
+die mwrite
+end
+ok = zwrite fd d
+r = fsync fd
+if or not ok lt r 0
+die mwrite
+end
+note RENAME_EXCHANGE keeps the displaced edit even when an editor wins after namedok.
+zrepl 2
+if not namedok tznew
+zrepl 2
+r = fsync int get gfd 0
+if lt r 0
+die mwrite
+end
+die mdrift
+end
+r = fsync int get gfd 0
+if lt r 0
+die mwrite
+end
+r = unlink tznew 0 len tznew
+if lt r 0
+die mwrite
+end
+r = fsync int get gfd 0
+if lt r 0
+die mwrite
+end
+say tsaved
+end
+
+fn doserve ac ulong to int
+if or lt ac 5 gt ac 6
 usg
 end
 setmode 2
-d = new uchar 4096 0
-dn = getarg 4 d
-doichk part d 0 dn
-cdrepo 3
-slurp tzj
-meta
-if eq get gbad 0 1
-ret 1
+p = new uchar 4096 0
+n = getarg 3 p
+fd = walkopen part p 0 n or int 540672 32768 0
+if lt fd 0
+die2 manchor part p 0 n
 end
-fd = fopen tznew 0 len tznew 524481 int get gmode 0
+put gfd 0 fd
+r = flock int fd 6
+if lt r 0
+die mlock
+end
+n = getarg 4 p
+fd = walkopen part p 0 n or int 540672 32768 0
+if lt fd 0
+die manchor
+end
+put gfd 1 fd
+fd = fopen tdot 0 len tdot 540672 0
+if lt fd 0
+die manchor
+end
+put gfd 3 fd
+homefd 0
+fd = fopen tznew 0 len tznew or int 524482 32768 384
 if lt fd 0
 die2 mwrite tznew
 end
-ok = zwrite int fd part d 0 dn
-y = fsync int fd
-z = fclose int fd
-if or not ok or lt y 0 lt z 0
-x = unlink tznew 0 len tznew
-die2 mwrite tznew
+put gfd 2 fd
+snapmeta
+snaplic
+scanpdf
+if eq ac 6
+homefd 3
+n = getarg 5 p
+filecopy part p 0 n
 end
-zrepl
+say tready
+n = recvdoi p
+doichk part p 0 n
+putdoi part p 0 n
 ret 0
 end
 
@@ -1547,8 +1935,8 @@ end
 if beq part c 0 k wpick
 ret dopick ac
 end
-if beq part c 0 k wsetdoi
-ret dosetd ac
+if beq part c 0 k wserve
+ret doserve ac
 end
 if beq part c 0 k wconsent
 ret docons ac
