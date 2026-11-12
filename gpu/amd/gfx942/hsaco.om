@@ -1,0 +1,728 @@
+om2
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gfx942 vadd code-object writer. Usage: hsaco TABLE > vadd.hsaco (TABLE is a seekable file).
+note Instruction words come from vadd.isa, packed by Omega, never LLVM. ELF, descriptor, symbol
+note tables and MessagePack metadata are serialized below. No device, subprocess or library opens.
+note LLVM 18.1.3 public sources are the format authority; see PROVENANCE.md and tests/amd/run.sh.
+note Schema: exactly the eight formats in vadd.isa; each field occupies >=1 of at most 64 bits.
+note Three streaming passes: locate label, validate fields, then emit. No table/line/code-size buffer.
+note Only label 1 is used by vadd. Output begins after the two validating passes have finished.
+note The producer uses stdout and a seekable instruction-table argument. Exit 2 usage, 3 I/O,
+note 4 bad table; kernel and ELF layout are fixed for this vadd, not a general assembler/linker.
+text use "usage: hsaco /path/to/vadd.isa > vadd.hsaco\n"
+text ioerr "hsaco: I/O error\n"
+text tblerr "hsaco: invalid instruction table\n"
+text owner "AMDGPU"
+text entry "vadd"
+text symkd "vadd.kd"
+text target "amdgcn-amd-amdhsa--gfx942"
+text ver "amdhsa.version"
+text kernels "amdhsa.kernels"
+text tgtkey "amdhsa.target"
+text kname ".name"
+text ksym ".symbol"
+text kargs ".args"
+text ksize ".kernarg_segment_size"
+text kalign ".kernarg_segment_align"
+text kgroup ".group_segment_fixed_size"
+text kpriv ".private_segment_fixed_size"
+text kwave ".wavefront_size"
+text ksgpr ".sgpr_count"
+text kvgpr ".vgpr_count"
+text kagpr ".agpr_count"
+text kmax ".max_flat_workgroup_size"
+text aname ".name"
+text aoffset ".offset"
+text asize ".size"
+text akind ".value_kind"
+text aspace ".address_space"
+text aglobal "global"
+text abuffer "global_buffer"
+text avalue "by_value"
+text aa "a"
+text ab "b"
+text ac "c"
+text an "count"
+text stext ".text"
+text sdata ".rodata"
+text snote ".note"
+text sstr ".strtab"
+text ssym ".symtab"
+text sdyn ".dynsym"
+text sds ".dynstr"
+text shstr ".shstrtab"
+text sdynamic ".dynamic"
+text shash ".hash"
+note State: 0 table fd, 1 current character (256=EOF), 2 code byte count, 3 label position,
+note 4 label seen, 5 pass (0=labels, 1=validate, 2=emit), 6 output cursor, 7 output fill, 8 input cursor,
+note 9 metadata start, 10 ELF total size, 11 section headers, 12 names start,
+note 13 symtab start, 14 dynsym start, 15 dynamic start, 16 code start, 17 note size, 18 strtab start.
+note 19 count-only mode for metadata sizing, 20 metadata payload size, 21 SysV hash start, 22 input fill.
+global gs ulong 23
+note These are flushing I/O buffers, never input/output capacity limits.
+global ib uchar 4096
+global ob uchar 4096
+global forms ulong 8
+global bases ulong 16
+global masks ulong 16
+global counts ulong 8
+note Each field is word-index/shift/width; <=64 fields is the actual 64-bit instruction boundary.
+global fields ulong 1536
+
+fn die rc int msg view uchar * to void
+n = write 2 msg 0 len msg
+exit rc
+end
+fn bad to void
+die 4 tblerr
+end
+fn advance to void
+if eq get gs 8 get gs 22
+r = read int get gs 0 ib 0 len ib
+if lt r 0
+die 3 ioerr
+end
+if eq r 0
+put gs 1 256
+ret
+end
+put gs 22 ulong r
+put gs 8 0
+end
+put gs 1 ulong get ib get gs 8
+put gs 8 add get gs 8 1
+end
+fn token to ulong
+while true bound 999999
+c = get gs 1
+if eq c 35
+while ne get gs 1 10 bound 999999
+if eq get gs 1 256
+ret 256
+end
+advance
+end
+end
+c = get gs 1
+if eq c 256
+ret c
+end
+if gt c 32
+ret c
+end
+advance
+end
+ret 256
+end
+fn number to ulong
+c = token
+if or lt c 48 gt c 57
+bad
+end
+v = ulong 0
+base = ulong 10
+digs = ulong 0
+if eq c 48
+digs = 1
+advance
+if eq get gs 1 120
+base = 16
+digs = 0
+advance
+end
+end
+while true bound 999999
+c = get gs 1
+if or le c 32 eq c 256
+break
+end
+if eq c 35
+break
+end
+d = ulong 255
+if and ge c 48 le c 57
+d = sub c 48
+end
+if and ge c 97 le c 102
+d = add sub c 97 10
+end
+if ge d base
+bad
+end
+if gt v div sub ulong 18446744073709551615 d base
+bad
+end
+v = add mul v base d
+digs = add digs 1
+advance
+end
+if eq digs 0
+bad
+end
+ret v
+end
+fn format to ulong
+v = number
+if or lt v 1 gt v 8
+bad
+end
+ret sub v 1
+end
+fn fieldidx f ulong k ulong to ulong
+if ge k 64
+bad
+end
+ret mul add mul f 64 k 3
+end
+fn bitmask w ulong to ulong
+if or eq w 0 gt w 32
+bad
+end
+ret sub shl ulong 1 w 1
+end
+fn cell f ulong wd ulong to ulong
+if ge wd get forms f
+bad
+end
+ret add mul f 2 wd
+end
+fn setfield f ulong wd ulong shift ulong width ulong value ulong to void
+if gt shift 31
+bad
+end
+if gt add shift width 32
+bad
+end
+m = bitmask width
+if gt value m
+bad
+end
+ix = cell f wd
+m = shl m shift
+if ne and get masks ix m 0
+bad
+end
+put masks ix or get masks ix m
+put bases ix or get bases ix shl value shift
+end
+fn emitword v ulong to void
+p = get gs 2
+if gt v 0xffffffff
+bad
+end
+if eq get gs 5 2
+wrle v 4
+end
+put gs 2 add p 4
+end
+fn operand f ulong to ulong
+v = ulong 0
+if eq token 64
+advance
+if ne number 1
+bad
+end
+if ne f 3
+bad
+end
+if gt get gs 5 0
+if eq get gs 4 0
+bad
+end
+v = div sub get gs 3 add get gs 2 4 4
+end
+else
+v = number
+end
+ret v
+end
+fn inst f ulong to void
+w0 = get bases mul f 2
+w1 = get bases add mul f 2 1
+for k ulong get counts f
+ix = fieldidx f k
+wd = get fields ix
+sh = get fields add ix 1
+bw = get fields add ix 2
+v = operand f
+if gt v bitmask bw
+bad
+end
+v = shl v sh
+if eq wd 0
+w0 = or w0 v
+else
+w1 = or w1 v
+end
+end
+emitword w0
+if eq get forms f 2
+emitword w1
+end
+end
+fn table to void
+put gs 2 0
+put gs 8 0
+put gs 22 0
+for i ulong len forms
+put forms i 0
+put counts i 0
+end
+for i ulong len bases
+put bases i 0
+put masks i 0
+end
+r = fseek int get gs 0 0 0
+if ne r 0
+die 3 ioerr
+end
+advance
+while true bound 999999
+c = token
+if eq c 256
+break
+end
+advance
+if eq c 70
+f = format
+n = number
+if or lt n 1 gt n 2
+bad
+end
+if ne get forms f 0
+bad
+end
+put forms f n
+else
+if eq c 66
+f = format
+wd = number
+sh = number
+bw = number
+v = number
+setfield f wd sh bw v
+else
+if eq c 68
+f = format
+k = number
+if ne k get counts f
+bad
+end
+ix = fieldidx f k
+wd = number
+sh = number
+bw = number
+setfield f wd sh bw 0
+put fields ix wd
+put fields add ix 1 sh
+put fields add ix 2 bw
+put counts f add k 1
+else
+if eq c 73
+f = format
+if eq get forms f 0
+bad
+end
+inst f
+else
+if eq c 76
+emitword number
+else
+if eq c 84
+if ne number 1
+bad
+end
+if eq get gs 5 0
+if ne get gs 4 0
+bad
+end
+put gs 3 get gs 2
+put gs 4 1
+else
+if ne get gs 3 get gs 2
+bad
+end
+end
+else
+bad
+end
+end
+end
+end
+end
+end
+end
+if eq get gs 2 0
+bad
+end
+end
+
+fn flush to void
+p = ulong 0
+n = get gs 7
+while lt p n bound 999999
+r = write 1 ob p sub n p
+if le r 0
+die 3 ioerr
+end
+p = add p ulong r
+end
+put gs 7 0
+end
+fn octet v ulong to void
+if eq get gs 19 0
+if eq get gs 7 len ob
+flush
+end
+put ob get gs 7 uchar and v 255
+put gs 7 add get gs 7 1
+end
+put gs 6 add get gs 6 1
+end
+fn wrle v ulong n ulong to void
+for j ulong n
+octet and shr v mul j 8 255
+end
+end
+fn zeros n ulong to void
+for j ulong n
+octet 0
+end
+end
+fn padto off ulong to void
+if gt get gs 6 off
+die 4 tblerr
+end
+zeros sub off get gs 6
+end
+fn bytes v view uchar * to void
+for j ulong len v
+octet ulong get v j
+end
+end
+fn strz v view uchar * to void
+bytes v
+octet 0
+end
+fn mpstr v view uchar * to void
+if le len v 31
+octet add 160 len v
+else
+octet 217
+octet len v
+end
+bytes v
+end
+fn kv key view uchar * v ulong to void
+mpstr key
+octet v
+end
+fn arg name view uchar * off ulong sz ulong pointer bool to void
+if pointer
+octet 133
+mpstr aspace
+mpstr aglobal
+else
+octet 132
+end
+mpstr aname
+mpstr name
+kv aoffset off
+kv asize sz
+mpstr akind
+if pointer
+mpstr abuffer
+else
+mpstr avalue
+end
+end
+fn meta to void
+note Same key order as the oracle, but encoded independently from typed fields here.
+octet 131
+mpstr kernels
+octet 145
+octet 140
+kv kagpr 0
+mpstr kargs
+octet 148
+arg aa 0 8 true
+arg ab 8 8 true
+arg ac 16 8 true
+arg an 24 4 false
+kv kgroup 0
+kv kalign 8
+kv ksize 28
+kv kmax 64
+mpstr kname
+mpstr entry
+kv kpriv 0
+kv ksgpr 20
+mpstr ksym
+mpstr symkd
+kv kvgpr 9
+kv kwave 64
+mpstr tgtkey
+mpstr target
+mpstr ver
+octet 146
+octet 1
+octet 2
+end
+fn nameidx n ulong to ulong
+note NUL, .text, .rodata, .note, .strtab, .symtab, .dynstr, .dynsym, .shstrtab, .dynamic
+if eq n 1
+ret 1
+end
+if eq n 2
+ret add nameidx 1 add len stext 1
+end
+if eq n 3
+ret add nameidx 2 add len sdata 1
+end
+if eq n 4
+ret add nameidx 3 add len snote 1
+end
+if eq n 5
+ret add nameidx 4 add len sstr 1
+end
+if eq n 6
+ret add nameidx 5 add len ssym 1
+end
+if eq n 7
+ret add nameidx 6 add len sds 1
+end
+if eq n 8
+ret add nameidx 7 add len sdyn 1
+end
+if eq n 9
+ret add nameidx 8 add len shstr 1
+end
+if eq n 10
+ret add nameidx 9 add len sdynamic 1
+end
+ret 0
+end
+fn ph ty ulong flags ulong off ulong sz ulong align ulong to void
+wrle ty 4
+wrle flags 4
+wrle off 8
+wrle off 8
+wrle off 8
+wrle sz 8
+wrle sz 8
+wrle align 8
+end
+fn shdr name ulong ty ulong flags ulong off ulong sz ulong align ulong to void
+wrle nameidx name 4
+wrle ty 4
+wrle flags 8
+if ne flags 0
+wrle off 8
+else
+wrle 0 8
+end
+wrle off 8
+wrle sz 8
+if eq ty 2
+wrle 4 4
+wrle 1 4
+else
+if eq ty 11
+wrle 6 4
+wrle 1 4
+else
+if eq ty 6
+wrle 6 4
+wrle 0 4
+else
+if eq ty 5
+wrle 7 4
+wrle 0 4
+else
+wrle 0 4
+wrle 0 4
+end
+end
+end
+end
+wrle align 8
+if or eq ty 2 eq ty 11
+wrle 24 8
+else
+if eq ty 6
+wrle 16 8
+else
+if eq ty 5
+wrle 4 8
+else
+wrle 0 8
+end
+end
+end
+end
+fn symbol name ulong info ulong vis ulong sec ulong value ulong sz ulong to void
+wrle name 4
+wrle info 1
+wrle vis 1
+wrle sec 2
+wrle value 8
+wrle sz 8
+end
+fn symbols to void
+zeros 24
+symbol 1 18 3 1 get gs 16 get gs 2
+symbol 6 17 0 2 512 64
+end
+fn kdesc to void
+zeros 8
+wrle 28 4
+zeros 4
+note Signed byte displacement from descriptor VA 512 to code VA 768; no relocations remain.
+wrle sub get gs 16 ulong 512 8
+zeros 20
+note compute_pgm_rsrc3: accum_offset = 12/4 - 1 = 2 (LLVM AMDHSAKernelDescriptor.h).
+wrle 2 4
+note compute_pgm_rsrc1: VGPR blocks 1, SGPR blocks 2, DX10 clamp, IEEE; FP32/64 denorm preserve.
+wrle 0xaf0081 4
+note user SGPR count 2, workgroup id x enabled; kernel_code_properties kernarg pointer enabled.
+wrle 0x84 4
+wrle 8 2
+zeros 6
+end
+fn dynent tag ulong value ulong to void
+wrle tag 8
+wrle value 8
+end
+fn roundup n ulong a ulong to ulong
+ret mul div add n sub a 1 a a
+end
+fn object to void
+note Fixed layout sized from the exact vadd and metadata; ELF64 boundary fields are authoritative.
+put gs 16 768
+put gs 9 roundup add get gs 16 get gs 2 64
+put gs 19 1
+meta
+put gs 20 get gs 6
+put gs 6 0
+put gs 19 0
+put gs 17 roundup add get gs 20 20 4
+put gs 18 add get gs 9 get gs 17
+put gs 13 roundup add get gs 18 14 8
+put gs 14 add get gs 13 72
+put gs 15 add get gs 14 72
+put gs 21 add get gs 15 96
+put gs 12 add get gs 21 24
+put gs 11 roundup add get gs 12 add nameidx 10 add len shash 1 8
+put gs 10 add get gs 11 mul ulong 11 64
+wrle 0x464c457f 4
+wrle 2 1
+wrle 1 1
+wrle 1 1
+wrle 64 1
+wrle 3 1
+zeros 7
+wrle 3 2
+wrle 224 2
+wrle 1 4
+wrle 0 8
+wrle 64 8
+wrle get gs 11 8
+wrle 0x54c 4
+wrle 64 2
+wrle 56 2
+wrle 4 2
+wrle 64 2
+wrle 11 2
+wrle 8 2
+note One read/execute load, one note, one dynamic, plus stack flags (no executable host stack).
+ph 1 5 0 get gs 10 256
+ph 4 4 get gs 9 get gs 17 4
+ph 2 4 get gs 15 96 8
+ph 0x6474e551 6 0 0 8
+padto 512
+kdesc
+padto get gs 16
+put gs 5 2
+table
+padto get gs 9
+wrle 7 4
+wrle get gs 20 4
+wrle 32 4
+strz owner
+octet 0
+meta
+padto get gs 18
+octet 0
+strz entry
+strz symkd
+padto get gs 13
+symbols
+padto get gs 14
+symbols
+padto get gs 15
+dynent 5 get gs 18
+dynent 10 14
+dynent 6 get gs 14
+dynent 11 24
+dynent 4 get gs 21
+dynent 0 0
+note SysV hash: one bucket, three symbols; all names collide into the single 1->2->0 chain.
+wrle 1 4
+wrle 3 4
+wrle 1 4
+wrle 0 4
+wrle 2 4
+wrle 0 4
+padto get gs 12
+octet 0
+strz stext
+strz sdata
+strz snote
+strz sstr
+strz ssym
+strz sds
+strz sdyn
+strz shstr
+strz sdynamic
+strz shash
+padto get gs 11
+zeros 64
+shdr 1 1 6 get gs 16 get gs 2 256
+shdr 2 1 2 512 64 64
+shdr 3 7 2 get gs 9 get gs 17 4
+shdr 4 3 0 get gs 18 14 1
+shdr 5 2 0 get gs 13 72 8
+shdr 6 3 2 get gs 18 14 1
+shdr 7 11 2 get gs 14 72 8
+shdr 8 3 0 get gs 12 add nameidx 10 add len shash 1 1
+shdr 9 6 2 get gs 15 96 8
+shdr 10 5 2 get gs 21 24 4
+if ne get gs 6 get gs 10
+bad
+end
+end
+fn main to int
+p = new uchar 4096 0
+if ne argcnt 2
+die 2 use
+end
+n = argread 1 p 0 len p
+if le n 0
+die 2 use
+end
+fd = fopen p 0 ulong n 0 0
+if lt fd 0
+die 3 ioerr
+end
+put gs 0 ulong fd
+table
+put gs 5 1
+table
+object
+flush
+r = fclose int fd
+if ne r 0
+die 3 ioerr
+end
+ret 0
+end
