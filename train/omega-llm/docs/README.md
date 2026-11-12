@@ -114,7 +114,7 @@ The build script does four things:
      (omega-mv PR #1022 commit `cf9fbda1`: main `d3d1b1bc`, where #1015's x86efi backend merged
      on 2026-11-04, plus efi 14, `../omega-efi`); the receipts in `evidence/OMEGALLM/efi` and `imac`
      were built earlier with omc `b4f45121` from #1015's commit `5ce9ecaa`;
-   - a64efi: `34c51cdc467a0103700786ed5acea49db8a919ce277c62c8e5b680d476022f32` (omega-mv with
+   - a64efi: `ef27690591c86cab8cd2fefed1bf3bf5b7f29145f344fa3c6b9fc1af1b1fba22` (omega-mv with
      `target a64efi`, `../omega-mv-a64efi`); `seed/a64efi/efirt.om` of that checkout (sha256
      `e778b2ce15960e658a461c926388b17005e39de58bf7d1c7e216e8881a5293dd`, also checked) is placed
      after the first line.
