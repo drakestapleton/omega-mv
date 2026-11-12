@@ -1,7 +1,7 @@
 # AArch64 UEFI backend (`target a64efi`)
 
 Status (2026-11-12): **IMPLEMENTED; EXERCISED on one physical machine** (NVIDIA DGX Spark, American
-Megatrends firmware, one boot, see Evidence) and under virtualization (QEMU `virt` with KVM on a
+Megatrends firmware, two recorded boots, see Evidence) and under virtualization (QEMU `virt` with KVM on a
 Cortex-X925 host, EDK2 `QEMU_EFI.fd` 2024.02). One machine and one firmware are not a qualification.
 
 The purpose is a program that runs on an Arm machine with nothing beneath it but the machine's own
@@ -119,6 +119,10 @@ them: the source of the image that ran on the DGX Spark (aien-train `bb19fba9` w
 `evidence/a64efi-dgx-spark-20261112/pciid.om`) compiles to the same sha256, `f2e31985…ecaba`, with
 this compiler.
 
+A key press on the physical machine: EXERCISED once (2026-11-12, one session, two typed lines at
+the DGX Spark's own keyboard, both answers equal to the Linux build's; aien-train
+`evidence/OMEGALLM/a64efi/dgx-spark-ask/RESULT.txt` at main 7b4445ecaa2719cea458d591e4a90d9310bbdc17).
+
 NOT_RUN: any other machine or firmware; the 15.8M-parameter checkpoint on the physical machine (it
-does not fit on that machine's 298 MiB EFI system partition); a key press; efi 14 SMBIOS on physical
+does not fit on that machine's 298 MiB EFI system partition); efi 14 SMBIOS on physical
 firmware beyond the banner line; any device access other than the two register reads above.
