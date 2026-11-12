@@ -1,22 +1,21 @@
 om2
 note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-note gfx942 vadd code-object writer. Usage: hsaco TABLE > vadd.hsaco (TABLE is a seekable file).
-note Instruction words come from vadd.isa, packed by Omega, never LLVM. ELF, descriptor, symbol
+note gfx942 code-object writer. Usage: hsaco TABLE > kernel.hsaco (TABLE is a seekable file).
+note Instruction words and kernel metadata come from TABLE, packed by Omega, never LLVM.
 note tables and MessagePack metadata are serialized below. No device, subprocess or library opens.
 note LLVM 18.1.3 public sources are the format authority; see PROVENANCE.md and tests/amd/run.sh.
 note Schema: exactly the eight formats in vadd.isa; each field occupies >=1 of at most 64 bits.
 note Three streaming passes: locate label, validate fields, then emit. No table/line/code-size buffer.
 note Only label 1 is used by vadd. Output begins after the two validating passes have finished.
 note The producer uses stdout and a seekable instruction-table argument. Exit 2 usage, 3 I/O,
-note 4 bad table; kernel and ELF layout are fixed for this vadd, not a general assembler/linker.
+note 4 bad table; ELF layout targets gfx942 HSA v5, not a general assembler/linker.
 note Loops are bound 999999: the pinned omc (omega-mv e5b32567) refuses a larger bound with error 8.
 note A table that needs more passes traps 4 (a clean refusal); a newer pin lifts the number.
-text use "usage: hsaco /path/to/vadd.isa > vadd.hsaco\n"
+text use "usage: hsaco /path/to/kernel.isa > kernel.hsaco\n"
 text ioerr "hsaco: I/O error\n"
 text tblerr "hsaco: invalid instruction table\n"
 text owner "AMDGPU"
-text entry "vadd"
-text symkd "vadd.kd"
+text kdsuf ".kd"
 text target "amdgcn-amd-amdhsa--gfx942"
 text ver "amdhsa.version"
 text kernels "amdhsa.kernels"
@@ -41,10 +40,6 @@ text aspace ".address_space"
 text aglobal "global"
 text abuffer "global_buffer"
 text avalue "by_value"
-text aa "a"
-text ab "b"
-text ac "c"
-text an "count"
 text stext ".text"
 text sdata ".rodata"
 text snote ".note"
@@ -60,7 +55,12 @@ note 4 label seen, 5 pass (0=labels, 1=validate, 2=emit), 6 output cursor, 7 out
 note 9 metadata start, 10 ELF total size, 11 section headers, 12 names start,
 note 13 symtab start, 14 dynsym start, 15 dynamic start, 16 code start, 17 note size, 18 strtab start.
 note 19 count-only mode for metadata sizing, 20 metadata payload size, 21 SysV hash start, 22 input fill.
-global gs ulong 23
+global gs ulong 30
+note 23 byte cursor, 24 emit arguments, 25 argument count, 26/27 last name span, 28 K seen, 29 argument end.
+note cfg: name span, kernarg size/alignment, group/private bytes, SGPR/VGPR/AGPR count,
+note maximum workgroup/wave size, rsrc3/rsrc1/rsrc2/properties. These are table data, not kernel switches.
+global cfg ulong 15
+global nb uchar 4096
 note These are flushing I/O buffers, never input/output capacity limits.
 global ib uchar 4096
 global ob uchar 4096
@@ -93,6 +93,7 @@ put gs 8 0
 end
 put gs 1 ulong get ib get gs 8
 put gs 8 add get gs 8 1
+put gs 23 add get gs 23 1
 end
 fn token to ulong
 while true bound 999999
@@ -262,10 +263,92 @@ if eq get forms f 2
 emitword w1
 end
 end
+fn namespan to void
+c = token
+put gs 26 sub get gs 23 1
+n = ulong 0
+while and gt c 32 ne c 256 bound 999999
+if eq c 35
+break
+end
+ok = or and ge c 97 le c 122 and ge c 65 le c 90
+ok = or ok eq c 95
+if gt n 0
+ok = or ok and ge c 48 le c 57
+end
+if not ok
+bad
+end
+n = add n 1
+advance
+c = get gs 1
+end
+if eq n 0
+bad
+end
+put gs 27 n
+end
+fn kernel to void
+if ne get gs 28 0
+bad
+end
+namespan
+put cfg 0 get gs 26
+put cfg 1 get gs 27
+for i ulong 13
+v = number
+if gt v 0xffffffff
+bad
+end
+put cfg add i 2 v
+end
+if or eq get cfg 3 0 ne and get cfg 3 sub get cfg 3 1 0
+bad
+end
+if or gt get cfg 6 102 gt get cfg 7 256
+bad
+end
+if or gt get cfg 8 256 gt get cfg 14 65535
+bad
+end
+if or ne get cfg 10 64 gt get cfg 9 1024
+bad
+end
+put gs 28 1
+end
+fn argrow to void
+if eq get gs 28 0
+bad
+end
+namespan
+p = get gs 26
+n = get gs 27
+off = number
+sz = number
+kind = number
+if or ne off get gs 29 gt kind 1
+bad
+end
+if or and eq kind 0 ne sz 8 and eq kind 1 ne sz 4
+bad
+end
+put gs 29 add off sz
+if gt get gs 29 get cfg 2
+bad
+end
+put gs 25 add get gs 25 1
+if ne get gs 24 0
+arg p n off sz eq kind 0
+end
+end
 fn table to void
 put gs 2 0
 put gs 8 0
 put gs 22 0
+put gs 23 0
+put gs 25 0
+put gs 28 0
+put gs 29 0
 for i ulong len forms
 put forms i 0
 put counts i 0
@@ -285,6 +368,17 @@ if eq c 256
 break
 end
 advance
+if eq c 75
+kernel
+continue
+end
+if eq c 65
+argrow
+continue
+end
+if eq get gs 28 0
+bad
+end
 if eq c 70
 f = format
 n = number
@@ -355,6 +449,9 @@ end
 end
 end
 if eq get gs 2 0
+bad
+end
+if or eq get gs 25 0 ne get gs 29 get cfg 2
 bad
 end
 end
@@ -435,8 +532,7 @@ end
 octet 207
 wrbe v 8
 end
-fn mpstr v view uchar * to void
-n = ulong len v
+fn mphead n ulong to void
 if le n 31
 octet add 160 n
 else
@@ -457,13 +553,58 @@ wrbe n 4
 end
 end
 end
+end
+fn mpstr v view uchar * to void
+mphead len v
 bytes v
+end
+fn span p ulong n ulong to void
+i = ulong 0
+while lt i n bound 999999
+sz = sub n i
+if gt sz len nb
+sz = len nb
+end
+r = pread int get gs 0 nb 0 sz long add p i
+if le r 0
+die 3 ioerr
+end
+for j ulong ulong r
+octet ulong get nb j
+end
+i = add i ulong r
+end
+end
+fn mpname p ulong n ulong to void
+mphead n
+span p n
+end
+fn kdname to void
+mphead add get cfg 1 len kdsuf
+span get cfg 0 get cfg 1
+bytes kdsuf
+end
+fn mparray n ulong to void
+if le n 15
+octet add 144 n
+ret
+end
+if le n 65535
+octet 220
+wrbe n 2
+ret
+end
+if gt n 0xffffffff
+bad
+end
+octet 221
+wrbe n 4
 end
 fn kv key view uchar * v ulong to void
 mpstr key
 mpuint v
 end
-fn arg name view uchar * off ulong sz ulong pointer bool to void
+fn arg p ulong n ulong off ulong sz ulong pointer bool to void
 if pointer
 octet 133
 mpstr aspace
@@ -472,7 +613,7 @@ else
 octet 132
 end
 mpstr aname
-mpstr name
+mpname p n
 kv aoffset off
 kv asize sz
 mpstr akind
@@ -488,25 +629,25 @@ octet 131
 mpstr kernels
 octet 145
 octet 140
-kv kagpr 0
+kv kagpr get cfg 8
 mpstr kargs
-octet 148
-arg aa 0 8 true
-arg ab 8 8 true
-arg ac 16 8 true
-arg an 24 4 false
-kv kgroup 0
-kv kalign 8
-kv ksize 28
-kv kmax 64
+mparray get gs 25
+put gs 5 1
+put gs 24 1
+table
+put gs 24 0
+kv kgroup get cfg 4
+kv kalign get cfg 3
+kv ksize get cfg 2
+kv kmax get cfg 9
 mpstr kname
-mpstr entry
-kv kpriv 0
-kv ksgpr 20
+mpname get cfg 0 get cfg 1
+kv kpriv get cfg 5
+kv ksgpr get cfg 6
 mpstr ksym
-mpstr symkd
-kv kvgpr 9
-kv kwave 64
+kdname
+kv kvgpr get cfg 7
+kv kwave get cfg 10
 mpstr tgtkey
 mpstr target
 mpstr ver
@@ -617,22 +758,21 @@ end
 fn symbols to void
 zeros 24
 symbol 1 18 3 1 get gs 16 get gs 2
-symbol 6 17 0 2 512 64
+symbol add get cfg 1 2 17 0 2 512 64
 end
 fn kdesc to void
-zeros 8
-wrle 28 4
+wrle get cfg 4 4
+wrle get cfg 5 4
+wrle get cfg 2 4
 zeros 4
 note Signed byte displacement from descriptor VA 512 to code VA 768; no relocations remain.
 wrle sub get gs 16 ulong 512 8
 zeros 20
-note compute_pgm_rsrc3: accum_offset = 12/4 - 1 = 2 (LLVM AMDHSAKernelDescriptor.h).
-wrle 2 4
-note compute_pgm_rsrc1: VGPR blocks 1, SGPR blocks 2, DX10 clamp, IEEE; FP32/64 denorm preserve.
-wrle 0xaf0081 4
-note user SGPR count 2, workgroup id x enabled; kernel_code_properties kernarg pointer enabled.
-wrle 0x84 4
-wrle 8 2
+note Descriptor resources and properties are explicit table fields, checked against LLVM by the gate.
+wrle get cfg 11 4
+wrle get cfg 12 4
+wrle get cfg 13 4
+wrle get cfg 14 2
 zeros 6
 end
 fn dynent tag ulong value ulong to void
@@ -642,8 +782,11 @@ end
 fn roundup n ulong a ulong to ulong
 ret mul div add n sub a 1 a a
 end
+fn strsize to ulong
+ret add mul get cfg 1 2 add len kdsuf 3
+end
 fn object to void
-note Fixed layout sized from the exact vadd and metadata; ELF64 boundary fields are authoritative.
+note Layout sized from the instruction words and table metadata; ELF64 boundary fields are authoritative.
 put gs 16 768
 put gs 9 roundup add get gs 16 get gs 2 64
 put gs 19 1
@@ -653,7 +796,7 @@ put gs 6 0
 put gs 19 0
 put gs 17 roundup add get gs 20 20 4
 put gs 18 add get gs 9 get gs 17
-put gs 13 roundup add get gs 18 14 8
+put gs 13 roundup add get gs 18 strsize 8
 put gs 14 add get gs 13 72
 put gs 15 add get gs 14 72
 put gs 21 add get gs 15 96
@@ -699,15 +842,17 @@ octet 0
 meta
 padto get gs 18
 octet 0
-strz entry
-strz symkd
+span get cfg 0 get cfg 1
+octet 0
+span get cfg 0 get cfg 1
+strz kdsuf
 padto get gs 13
 symbols
 padto get gs 14
 symbols
 padto get gs 15
 dynent 5 get gs 18
-dynent 10 14
+dynent 10 strsize
 dynent 6 get gs 14
 dynent 11 24
 dynent 4 get gs 21
@@ -736,9 +881,9 @@ zeros 64
 shdr 1 1 6 get gs 16 get gs 2 256
 shdr 2 1 2 512 64 64
 shdr 3 7 2 get gs 9 get gs 17 4
-shdr 4 3 0 get gs 18 14 1
+shdr 4 3 0 get gs 18 strsize 1
 shdr 5 2 0 get gs 13 72 8
-shdr 6 3 2 get gs 18 14 1
+shdr 6 3 2 get gs 18 strsize 1
 shdr 7 11 2 get gs 14 72 8
 shdr 8 3 0 get gs 12 add nameidx 10 add len shash 1 1
 shdr 9 6 2 get gs 15 96 8
