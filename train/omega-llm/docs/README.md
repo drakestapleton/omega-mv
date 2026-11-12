@@ -70,6 +70,8 @@ names the binary and source sha256 it ran; `core-receipts.sh` builds all six bin
 | `ollm` as an x86-64 Linux program (`TARGET=x86linux`, omega-mv main `ba5559d9`) | EXERCISED, EMULATED (qemu-x86_64 8.2.2 user mode) | `evidence/OMEGALLM/x86/`: the whole receipt suite, 48/48 PASS, every receipt equal to the AArch64 one apart from hashes, paths and wall time; the v0 checkpoint's final eval `E 20000 4096 1014099 1463036` reproduced |
 | `ollm` as a UEFI application (`TARGET=x86efi`, compiler from omega-mv #1015, merged as main `d3d1b1bc`) | EXERCISED, EMULATED (QEMU 8.2.2 TCG + OVMF) | `evidence/OMEGALLM/efi/`: the 11 commands of `tests/omegallm/efi-job.txt` read from `\OLLM\JOB.TXT`; the OUT.TXT body matches the AArch64 reference after efi-check.sh strips the banner, J (timing) and DONE lines; TR.BIN, HE.BIN and S.CK written on the FAT volume identical; mutant b differs at byte 375; corrupted checkpoint, 65535- and 65536-byte job controls pass |
 | the same image on one physical machine (names iMac18,3 and Core i5-7500 are from earlier aienux evidence; this run does not record them) | EXERCISED on physical hardware (one machine) | `evidence/OMEGALLM/imac/`: the OUT.TXT body matches the AArch64 reference after efi-check.sh strips the banner, J (timing) and DONE lines; TR.BIN, HE.BIN and S.CK identical, `OLLM DONE 11 186521`; negative controls in `check.txt` DIFFERENT; FAT clean after the firmware's writes |
+| `ollm` as an AArch64 UEFI application (`TARGET=a64efi`, omega-mv `target a64efi`, docs/A64-EFI.md there) | EXERCISED, virtualized (QEMU virt + EDK2, KVM on a GB10 core) | `evidence/OMEGALLM/a64efi/`: `tests/omegallm/a64efi-receipts.sh`: the 11 commands of `efi-job.txt`; the OUT.TXT body matches the AArch64 Linux reference; TR.BIN, HE.BIN and S.CK identical; `fsck.vfat -n` clean; mutant b differs |
+| an a64efi image on one physical machine, a DGX Spark, with no operating system and no NVIDIA software loaded | EXERCISED on physical hardware (one machine, one boot, 2026-11-12) | `evidence/OMEGALLM/a64efi/dgx-spark/`: started by the machine's firmware from its EFI system partition; `OLLM DONE 11 13594`; the OUT.TXT body matches the reference; TR.BIN, HE.BIN and S.CK identical. That image was this source at `bb19fba9` built with an earlier candidate of the same compiler branch, plus a unit that read the GPU's identity registers through the firmware (omega-mv `evidence/a64efi-dgx-spark-20261112/`). The 15.8M-parameter checkpoint on that machine without an operating system is NOT_RUN: its file does not fit on the machine's 298 MiB EFI system partition |
 
 b729cc35 differs from a9b5f3ec only in bounds handling. The source diff shows it: the concatenated
 source goes from `cb80250d…` (a9b5f3ec, recorded in commit da910097's `init-v0.txt`) to `47c27b0b…`
@@ -95,6 +97,7 @@ sh tests/omegallm/build.sh --variant bx  # small bank-A capacities (CONTRACT-V3 
 sh tests/omegallm/build.sh --mutant y    # bx plus the wrong bank-B layer (four lines): -> ../build/ollm-mut-y
 TARGET=x86linux sh tests/omegallm/build.sh   # x86-64 Linux ELF
 TARGET=x86efi sh tests/omegallm/build.sh     # -> ../build/ollm.efi, a UEFI x86-64 application
+TARGET=a64efi sh tests/omegallm/build.sh     # -> ../build/ollm-aa64.efi, a UEFI AArch64 application
 TARGET=gb10 sh tests/omegallm/build.sh       # -> ../build/ollm-gb10, CPU ollm plus the GB10 GPU commands
 TARGET=gb10 sh tests/omegallm/build.sh --mutant g   # also h, m, f, k, s, p, t, r, x, q, w: -> ../build/ollm-mut-X-gb10
 TARGET=gb10 sh tests/omegallm/build.sh --variant r0  # GEMM FFMAs without reuse: -> ../build/ollm-var-r0-gb10
@@ -110,11 +113,15 @@ The build script does four things:
    - x86efi: `3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`
      (omega-mv PR #1022 commit `cf9fbda1`: main `d3d1b1bc`, where #1015's x86efi backend merged
      on 2026-11-04, plus efi 14, `../omega-efi`); the receipts in `evidence/OMEGALLM/efi` and `imac`
-     were built earlier with omc `b4f45121` from #1015's commit `5ce9ecaa`.
+     were built earlier with omc `b4f45121` from #1015's commit `5ce9ecaa`;
+   - a64efi: `34c51cdc467a0103700786ed5acea49db8a919ce277c62c8e5b680d476022f32` (omega-mv with
+     `target a64efi`, `../omega-mv-a64efi`); `seed/a64efi/efirt.om` of that checkout (sha256
+     `e778b2ce15960e658a461c926388b17005e39de58bf7d1c7e216e8881a5293dd`, also checked) is placed
+     after the first line.
 2. It concatenates `math.om data.om`, the pool unit (`lpool.om` on Linux, `epool.om` on UEFI;
    CONTRACT-V3 §2), `model.om adam.om ckpt.om bpe.om cli.om` and the platform unit
    (`lio.om` for Linux, `eio.om` for UEFI; CONTRACT §9). The x86 targets put the line
-   `target x86linux` or `target x86efi` first.
+   `target x86linux` or `target x86efi` first, a64efi `target a64efi`.
 3. For a mutant, it changes exactly one line of the concatenated copy (`OMUTA`, `OMUTB`, `OMUTC`;
    mutant y changes four: bx's three capacities and `OMUTY`). A variant sets both gcheck steps `GCH`
    and `GCH2` to 1e-5 (h5) or 1e-7 (h7) and must change exactly those two lines (bx: the three
@@ -274,6 +281,25 @@ Reading the stick back: after the run, macOS 26 refused to mount the stick's par
 read-only, although a `dd` copy of the same bytes mounts as a file and checks clean. Copy the raw
 partition (`sudo dd if=/dev/rdiskNs1 of=STICK.img bs=1m`) and take the files out with
 `MTOOLS_SKIP_CHECK=1 mcopy -i STICK.img ::/OLLM/OUT.TXT …`.
+
+## DGX Spark and other Arm machines, without an operating system
+
+`TARGET=a64efi` gives `ollm-aa64.efi`, which a 64-bit Arm UEFI firmware starts as
+`\EFI\BOOT\BOOTAA64.EFI` (or from a firmware boot entry). It reads `\OLLM\JOB.TXT` and writes
+`\OLLM\OUT.TXT` exactly as the iMac image does. When `\OLLM\REBOOT.TXT` exists the image restarts
+the machine when the job is done (after its wait for a key); without it, it returns to the firmware.
+
+```
+sh tests/omegallm/a64efi-receipts.sh    # virtualized: QEMU virt + EDK2, compared with a Linux build
+```
+
+On a machine that already runs Linux from the same disk, one boot without touching the boot order:
+copy the image to the EFI system partition (for example `\EFI\OMEGA\OLLM.EFI`) and the job files to
+`\OLLM`, create a firmware entry for it (`efibootmgr -c ... -l '\EFI\OMEGA\OLLM.EFI'`), put the boot
+order back as it was, and select the entry for the next boot only (`efibootmgr -n ENTRY`). After the
+restart, compare `\OLLM\OUT.TXT` with `efi-check.sh` as above. Status and receipts: the Status table.
+The model runs on the processor only: the GPU commands need the Linux NVIDIA driver and are not in
+this image.
 
 ## Throughput
 
