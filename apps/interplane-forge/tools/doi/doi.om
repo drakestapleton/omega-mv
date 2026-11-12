@@ -22,6 +22,7 @@ global gmode ulong 1
 global gprod uchar 1
 global gbad uchar 1
 global gfd long 4
+global gparent long 1
 
 text tpfx "doi: "
 text tnl "\n"
@@ -40,6 +41,10 @@ text tdot "."
 text troot "/"
 text tready "READY\n"
 text tsaved "SAVED\n"
+text tdone "DONE\n"
+text tin "/in"
+text mipc "keeper IPC failed"
+text mkdead "keeper exited unsuccessfully; no upload permitted"
 text tbody "body.json"
 text tmcopy "repo/.zenodo.json"
 text tfiles "files/"
@@ -1720,11 +1725,24 @@ end
 fn recvdoi d edit uchar * to ulong
 n = ulong 0
 while lt n len d bound 9223372036854775807
+if ne getppid get gparent 0
+die mipc
+end
 r = read 0 d n 1
 if eq r -4
 continue
 end
-if le r 0
+if or eq r -11 eq r 0
+note EOF before the shell opens its writer is not failure; parent monitors consumer lifetime.
+x = waitio 0 1 10000000
+if lt x 0
+if ne x -4
+die mipc
+end
+end
+continue
+end
+if lt r 0
 die mread
 end
 if eq get d n 10
@@ -1805,6 +1823,121 @@ if lt r 0
 die mwrite
 end
 say tsaved
+end
+
+note The shell pipeline exists before launch; this private response pipe exists before fork.
+note Only Omega supervises keeper lifetime. DONE certifies successful wait, not merely SAVED.
+fn stopkid pid int to void
+st = new uchar 4 0
+r = killpid pid 9
+while true bound 9223372036854775807
+r = waitpid pid st 0 4 0
+if ne r -4
+break
+end
+end
+end
+
+fn watchkid pid int fd int to int
+st = new uchar 4 0
+buf = new uchar 4096 0
+done = false
+while true bound 9223372036854775807
+if not done
+r = waitpid pid st 0 4 1
+if eq r long pid
+done = true
+if ne rd32 st 0 0
+warn tpfx
+warn mkdead
+warn tnl
+ret 1
+end
+else
+if and lt r 0 ne r -4
+stopkid pid
+die mipc
+end
+end
+end
+r = read fd buf 0 len buf
+if gt r 0
+if not wall 1 part buf 0 ulong r
+if not done
+stopkid pid
+end
+ret 1
+end
+else
+if and eq r 0 done
+if not wall 1 tdone
+ret 1
+end
+ret 0
+end
+if and lt r 0 and ne r -11 ne r -4
+if not done
+stopkid pid
+end
+die mipc
+end
+end
+note POLLERR on the pipeline writer means the consumer closed its read end.
+r = waitio 1 0 0
+if or lt r 0 ne and r 8 0
+if not done
+stopkid pid
+end
+ret 1
+end
+r = waitio fd 1 10000000
+end
+ret 1
+end
+
+fn kidio fd int to void
+p = new uchar 4096 0
+n = getarg 4 p
+n = cpy p n tin
+note startup gate before-input (tests insert SIGSTOP here in compiled fixture variants)
+inf = fopen p 0 n or int 524288 2048 0
+if lt inf 0
+die mipc
+end
+r = dupfd int inf 0 0
+x = fclose int inf
+if lt r 0
+die mipc
+end
+note startup gate before-output (input is open, output is not bound)
+r = dupfd fd 1 0
+x = fclose fd
+if lt r 0
+die mipc
+end
+end
+
+fn supervise ac ulong to int
+if or lt ac 5 gt ac 6
+usg
+end
+fds = new uchar 8 0
+r = pipefds fds 0 8 or int 524288 2048
+if lt r 0
+die mipc
+end
+put gparent 0 getpid
+pid = fork
+if lt pid 0
+die mipc
+end
+if eq pid 0
+x = fclose int rd32 fds 0
+kidio int rd32 fds 4
+ret doserve ac
+end
+x = fclose int rd32 fds 4
+ret watchkid int pid int rd32 fds 0
 end
 
 fn doserve ac ulong to int
@@ -1968,7 +2101,7 @@ if beq part c 0 k wpick
 ret dopick ac
 end
 if beq part c 0 k wserve
-ret doserve ac
+ret supervise ac
 end
 if beq part c 0 k wconsent
 ret docons ac
