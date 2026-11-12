@@ -1,7 +1,7 @@
 note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-note Usage: exec RAW_TEXT MEMORY COUNT_OFFSET. MEMORY is a seekable flat byte file, modified in place.
-note Kernarg at byte zero; COUNT_OFFSET is its decimal u32 count offset (vadd 24, fsum16 16).
-note Dispatch max(1,ceil(count/64)) wave64 workgroups; s[0:1]=0, s2=group, v0=lane.
+note Usage: exec RAW_TEXT MEMORY GRID_X GRID_Y. MEMORY is a seekable flat byte file, modified in place.
+note Kernarg is byte zero. Decimal grid extents are work-items; local size is (64,1,1).
+note Dispatch ceil(GRID_X/64) by GRID_Y wave64 groups; s[0:1]=0, s2=group x, s3=group y, v0=lane.
 note Source: LLVM llvmorg-18.1.3 llvm/lib/Target/AMDGPU/{SM,SOP,VOP1,VOP2,VOPC,FLAT}Instructions.td,
 note the format and opcode definitions cited in PROVENANCE.md section 8; no NVIDIA facts.
 note Raw .text is decoded, not vadd.isa or an assembly listing. The gate extracts it using ELF headers.
@@ -13,7 +13,7 @@ note 67 memory range; 74 I/O. Compiler loop fuel trap 104 is a defined sandbox r
 note No code/memory buffer cap: both are seekable files. Register sizes are ISA boundaries.
 note Path scratch is Linux PATH_MAX. Loops use the assigned compiler's maximum bound 999999.
 note st: code fd/bytes, memory fd/bytes, PC/next, word/extension/literal, class/op/src0/src1/dst, EXEC/VCC.
-global st ulong 16
+global st ulong 17
 global sr ulong 102
 global vr ulong 16384
 global io uchar 4
@@ -178,7 +178,7 @@ if ne im 0
 fail 66
 end
 else
-if ne op 8
+if and ne op 8 and ne op 4 ne op 5
 if ne op 12
 fail 66
 end
@@ -193,26 +193,38 @@ put st 11 im
 ret
 end
 if eq shr w 23 0x17d
-if ne fld w 8 8 32
+op = fld w 8 8
+if and ne op 32 ne op 0
 fail 66
 end
 ss = and w 255
 sd = fld w 16 7
-if or gt sd 100 ne and sd 1 0
+if or gt sd 101 and eq op 32 or gt sd 100 ne and sd 1 0
 fail 66
 end
+if eq op 32
 if ne ss 106
 if or gt ss 100 ne and ss 1 0
 fail 66
 end
 end
+else
+srcok ss false
+if eq ss 255
+put st 8 fetch
+end
+end
 put st 9 3
+put st 10 op
 put st 11 ss
 put st 13 sd
 ret
 end
 if eq shr w 30 2
-if ne fld w 23 7 28
+op = fld w 23 7
+ok = or or eq op 28 eq op 29 or eq op 0 eq op 1
+ok = or ok or or eq op 4 eq op 36 eq op 44
+if not ok
 fail 66
 end
 sd = fld w 16 7
@@ -223,7 +235,16 @@ s0 = and w 255
 s1 = fld w 8 8
 srcok s0 false
 srcok s1 false
+if eq op 29
+if or gt sd 100 ne and sd 1 0
+fail 66
+end
+if or gt s0 100 ne and s0 1 0
+fail 66
+end
+end
 put st 9 2
+put st 10 op
 put st 11 s0
 put st 12 s1
 put st 13 sd
@@ -290,6 +311,11 @@ else
 op = shr w 25
 ok = or or eq op 1 eq op 16 or eq op 18 eq op 19
 ok = or ok or or eq op 25 eq op 28 eq op 52
+ok = or ok or eq op 5 eq op 59
+note ADDC consumes VCC on the constant bus; another SGPR or literal is outside the valid subset.
+if and eq op 28 or lt ss 128 eq ss 255
+fail 66
+end
 if not ok
 fail 66
 end
@@ -351,7 +377,8 @@ pc = ulong 0
 while lt pc get st 1 bound 999999
 decode pc
 nx = get st 5
-if and eq get st 9 4 eq get st 10 8
+op = get st 10
+if and eq get st 9 4 or eq op 8 or eq op 4 eq op 5
 t = branch
 boundary t
 end
@@ -374,6 +401,41 @@ for i ulong n
 put sr add sd i mread add p mul i 4
 end
 end
+fn sop2run to void
+a = scalar get st 11
+b = scalar get st 12
+d = get st 13
+op = get st 10
+r = ulong 0
+if eq op 29
+a = or a shl get sr add get st 11 1 32
+r = shl a and b 63
+put sr add d 1 shr r 32
+put st 16 fmbool ne r 0
+end
+if eq op 28
+r = and shl a and b 31 0xffffffff
+put st 16 fmbool ne r 0
+end
+if or eq op 0 eq op 4
+r = add a b
+if eq op 4
+r = add r get st 16
+end
+put st 16 fmbool gt r 0xffffffff
+end
+if eq op 1
+r = sub a b
+put st 16 fmbool ge a b
+end
+if eq op 36
+r = mul a b
+end
+if eq op 44
+r = shr mul a b 32
+end
+put sr d and r 0xffffffff
+end
 fn sexec to void
 cl = get st 9
 if eq cl 1
@@ -381,12 +443,14 @@ smexec
 ret
 end
 if eq cl 2
-a = scalar get st 11
-b = scalar get st 12
-put sr get st 13 and shl a and b 31 0xffffffff
+sop2run
 ret
 end
 if eq cl 3
+if eq get st 10 0
+put sr get st 13 scalar get st 11
+ret
+end
 ss = get st 11
 v = get st 15
 if ne ss 106
@@ -396,13 +460,19 @@ ex = get st 14
 put sr get st 13 and ex 0xffffffff
 put sr add get st 13 1 shr ex 32
 put st 14 and ex v
+put st 16 fmbool ne get st 14 0
 ret
 end
 if eq cl 4
-if eq get st 10 8
+op = get st 10
+cc = get st 16
+if eq op 8
 if eq get st 14 0
 put st 5 branch
 end
+end
+if or and eq op 4 eq cc 0 and eq op 5 ne cc 0
+put st 5 branch
 end
 ret
 end
@@ -423,6 +493,12 @@ op = get st 10
 r = ulong 0
 if eq op 1
 r = fpadd a b
+end
+if eq op 59
+r = fpfma a b vg get st 13 lane
+end
+if eq op 5
+r = fpfma a b and xor a b 0x80000000
 end
 if eq op 16
 r = shr b and a 31
@@ -488,7 +564,7 @@ end
 end
 end
 end
-fn wave group ulong to void
+fn wave group ulong row ulong to void
 for i ulong 102
 put sr i 0
 end
@@ -496,11 +572,13 @@ for i ulong 16384
 put vr i 0
 end
 put sr 2 group
+put sr 3 row
 for i ulong 64
 vs 0 i i
 end
 put st 14 18446744073709551615
 put st 15 0
+put st 16 0
 pc = ulong 0
 while true bound 999999
 decode pc
@@ -534,9 +612,9 @@ fail 74
 end
 ret ulong n
 end
-fn countpos to ulong
+fn gridarg idx ulong to ulong
 p = new uchar 4096 0
-n = argread 3 p 0 len p
+n = argread idx p 0 len p
 if le n 0
 fail 64
 end
@@ -552,10 +630,13 @@ fail 64
 end
 v = add mul v 10 c
 end
+if gt v 0xffffffff
+fail 64
+end
 ret v
 end
 fn main to int
-if ne argcnt 4
+if ne argcnt 5
 ret 64
 end
 put st 0 openarg 1 0
@@ -566,13 +647,13 @@ end
 validate
 put st 2 openarg 2 2
 put st 3 filesize get st 2
-n = mread countpos
-groups = div add n 63 64
-if eq groups 0
-groups = 1
-end
+nx = gridarg 3
+ny = gridarg 4
+groups = div add nx 63 64
+for y ulong ny
 for g ulong groups
-wave g
+wave g y
+end
 end
 r = fclose int get st 2
 if ne r 0
