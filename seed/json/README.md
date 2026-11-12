@@ -54,15 +54,18 @@ Two limits of omc at pin `befb8199` affect composition. Both were reported to th
 
 | Limit | Value | Where |
 |---|---|---|
-| Input bytes per parse | 1 .. 983040 (`jsmaxn`), chosen per tape at `js_init` | refusal 5 |
+| Input bytes per parse | 1 .. 4294967295 (`jsmaxn`, the 32-bit offset cell of the tape), chosen per tape at `js_init` | refusal 5 |
 | Nesting depth | 1 .. 65535 (`jsdcap`), chosen at `js_init` | refusal 4 |
 | Tokens | `(len tape - 16) / 4`, at most 16777215 | refusal 11 |
 | Writer nesting | 1024 | writer refusal 25 |
 | Writer output | `len ob - 1040` bytes | writer refusal 21 |
 
-983040 bytes is 960 KiB: Wolfram `2^20*15/16 -> 983040`. Every loop has a bound that a proof
-can justify. For example, each parser step uses at least one distinct input byte, so the steps
-number at most n + 1 <= 983041 < 999999.
+Until 2026-11-12 the input bound was 983040 bytes, chosen so that every loop bound stayed under the old
+limit 999999 of `while ... bound N`. omc now takes N up to 2^63 - 1, so the loops use that bound and the
+proof is unchanged: each parser step uses at least one distinct input byte, so the steps number at most
+n + 1. The input bound is now the tape format's 32-bit offset cell. What a caller can hold is set by omc:
+the input and tape are caller arrays (locals, at most 4 MiB per function, or parameters), because a global
+or a run-time pool cannot be passed as an argument (OMEGESE 9.15, error 19 / 7).
 
 ## Reader API (`json.om`)
 

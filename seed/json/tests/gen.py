@@ -31,7 +31,7 @@ getcontext().prec = 4000
 assert json.scanner.c_make_scanner is not None, "CPython C scanner required"
 assert json.encoder.c_encode_basestring is not None, "CPython C encoder required"
 
-MAXN = 983040                    # js_init size limit cap
+MAXN = 4294967295                # js_init size limit: the tape stores offsets in 32-bit cells (json/growing)
 DLIM = 512                       # driver default depth limit
 TAPE = 262144                    # driver tape cells (jsdrv.om dvtape)
 CAP = (TAPE - 16) // 4           # tokens the driver tape holds

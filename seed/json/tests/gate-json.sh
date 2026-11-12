@@ -5,8 +5,8 @@ set -eu
 cd "$(dirname "$0")/../../.."
 B=${JSON_BUILD:-build/seed/json}
 OMC=${OMC:-seed/out/omc}
-# Compiler pin recorded independently before any reseed; update together with seed/out/omc.
-PIN=${JSON_OMC_PIN:-106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed}
+# Compiler pin: the hash seed/omega-from-seed.sh wrote to seed/out/omc.sha256 (JSON_OMC_PIN overrides it).
+PIN=${JSON_OMC_PIN:-$(cut -d ' ' -f 1 seed/out/omc.sha256)}
 J=seed/json
 fail() { printf 'JSONGATE FAIL %s\n' "$*"; exit 1; }
 notrun() { printf 'JSONGATE NOT_RUN %s\n' "$*"; exit 3; }
@@ -104,6 +104,23 @@ rc=$?
 set -e
 [ "$rc" = 93 ] || fail "oversized driver input rc=$rc (want 93)"
 echo 'PASS oversized driver input refused (93)'
+
+# 4b. No library bound of its own (json/growing): a 4 MiB workflow body parses; a caller-chosen size limit one byte
+# below it refuses with error 5 (exit 15).
+{ printf 'om2\n'; cat "$J/json.om" "$J/tests/big.om"; } > "$B/big.om"
+$LOW "$OMC" < "$B/big.om" > "$B/big" || fail "big.om does not compile"
+chmod +x "$B/big"
+python3 -c 'import json, sys
+b = {"version": "v1", "jobs": {"j": {"image": {"uri": "docker://alpine"}, "script": "x" * (4194304 - 200)}}}
+s = json.dumps(b); sys.stdout.write(s + " " * (4194304 - len(s)))' > "$B/w4.json"
+[ "$(wc -c < "$B/w4.json")" = 4194304 ] || fail "4 MiB fixture size"
+set +e
+"$B/big" < "$B/w4.json"; r1=$?
+"$B/big" 4194303 < "$B/w4.json"; r2=$?
+set -e
+[ "$r1" = 0 ] || fail "4 MiB body exit $r1 (want 0)"
+[ "$r2" = 15 ] || fail "4 MiB body under a 4194303-byte limit exit $r2 (want 15: size refusal)"
+echo 'PASS 4 MiB workflow body parses; a caller limit one byte below refuses (error 5)'
 
 # 5. Mutants: each must make the parity run fail.
 mutant() { # name file old new
