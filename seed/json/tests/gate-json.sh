@@ -105,22 +105,9 @@ set -e
 [ "$rc" = 93 ] || fail "oversized driver input rc=$rc (want 93)"
 echo 'PASS oversized driver input refused (93)'
 
-# 4b. No library bound of its own (json/growing): a 4 MiB workflow body parses; a caller-chosen size limit one byte
-# below it refuses with error 5 (exit 15).
-{ printf 'om2\n'; cat "$J/json.om" "$J/tests/big.om"; } > "$B/big.om"
-$LOW "$OMC" < "$B/big.om" > "$B/big" || fail "big.om does not compile"
-chmod +x "$B/big"
-python3 -c 'import json, sys
-b = {"version": "v1", "jobs": {"j": {"image": {"uri": "docker://alpine"}, "script": "x" * (4194304 - 200)}}}
-s = json.dumps(b); sys.stdout.write(s + " " * (4194304 - len(s)))' > "$B/w4.json"
-[ "$(wc -c < "$B/w4.json")" = 4194304 ] || fail "4 MiB fixture size"
-set +e
-"$B/big" < "$B/w4.json"; r1=$?
-"$B/big" 4194303 < "$B/w4.json"; r2=$?
-set -e
-[ "$r1" = 0 ] || fail "4 MiB body exit $r1 (want 0)"
-[ "$r2" = 15 ] || fail "4 MiB body under a 4194303-byte limit exit $r2 (want 15: size refusal)"
-echo 'PASS 4 MiB workflow body parses; a caller limit one byte below refuses (error 5)'
+# 4b. Above-old-limit reader, writer and formatter parity; EOF/error/overflow and true uint
+# field edges through documented native function-mode slots; every new defect has a killed twin.
+$LOW python3 "$J/tests/growing.py" "$OMC" "$B/growing" || fail 'growing consumer/boundary cases'
 
 # 5. Mutants: each must make the parity run fail.
 mutant() { # name file old new
@@ -142,4 +129,4 @@ mutant depth-off-by-one json.om 'if ge d js_hg tape jshdlim' 'if gt d js_hg tape
 mutant writer-escape jsonw.om 'if ge c 32' 'if ge c 31'
 mutant ties-to-even jsonf.om 'ret eq rem js_dget fs q ulong sub i 1 2 1' 'ret true'
 rm -rf "$B/m"
-printf 'JSONGATE PASS rows=%s mutants=5\n' "$rows"
+printf 'JSONGATE PASS rows=%s mutants=5 growing=PASS source=%s\n' "$rows" "$(git rev-parse HEAD)"

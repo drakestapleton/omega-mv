@@ -1,42 +1,284 @@
-note seed/json/tests/big.om: parse up to 4 MiB of JSON from stdin with seed/json (json/growing: no 983040-byte bound of
-note the library). The input is a local of main and the tape a local of jparse, so neither function passes the
-note omc limit of 4 MiB of local arrays. argv[1], when present, is the size limit given to js_init (decimal). Exit 0
-note parsed, 2 js_init refused, 10 + error code when js_parse refused (15 = over the size limit).
-fn jparse src view uchar * n ulong lim ulong to int
-tape = new uint 262144 0
-r = js_init tape lim 512
-if lt r 0
-ret 2
-end
-r2 = js_parse src tape n
-if lt r2 0
-ret add 10 int js_hg tape jsherr
-end
-ret 0
-end
-fn arglim to ulong
-if ne argcnt 2
-ret 4194304
-end
-d = new uchar 16 0
-k2 = argread 1 d 0 16
-lim = ulong 0
-i = ulong 0
-while lt i ulong k2 bound 16
-lim = add mul lim 10 ulong sub get d i 48
-i = add i 1
-end
-ret lim
-end
-fn main to int
-src = new uchar 4194304 0
-n = ulong 0
-while lt n 4194304 bound 4194304
-k = read 0 src n sub 4194304 n
+note seed/json/tests/big.om: test driver for inputs above the old 983040-byte bound (json/growing). Program
+note mode, composed after json.om, jsonw.om and jsonf.om under one `om2` line by tests/gate-json.sh.
+note Usage: big MODE [A] < input
+note   p [SLIM]  parse with size limit SLIM (default jsmaxn); prints "OK tokens"
+note   r [CAP]   parse, then write every token again through js_wtok into an output array of CAP bytes
+note             (default 2098192); prints the JSON text, no newline
+note   n [CAP]   the whole input is one number lexeme, written by js_wnumb into CAP bytes
+note   s [CAP]   the whole input is the raw UTF-8 bytes of one string, written by js_wsbuf into CAP bytes
+note   f         the whole input is one number lexeme: "F status bits text", status js_f64st, bits the f64
+note             in hex, text from js_wf64
+note A refusal prints one line: js_init "INIT -code", js_parse "ERR code pos", the writer "WERR code".
+note Exit 0 after printing; 90 a read or write error, 92 usage, 93 more input than the 4194304-byte array.
+note The input is read to its end, never a prefix: a full array is followed by a one-byte probe read.
+note Stack: the input is a local of main (4194304 bytes, the omc limit of 4 MiB of local arrays per
+note function); the tape (1048576 bytes) and the output (2098192 bytes) are locals of the functions it
+note calls; their combined live arrays remain below the 8 MiB program stack.
+
+note ======== output ========
+
+note bg_w: write all of b[o .. o + n); every pass writes at least one byte or exits, so passes <= n
+fn bg_w b view uchar * o ulong n ulong to void
+q = ulong 0
+while lt q n bound 9223372036854775807
+k = write 1 b add o q sub n q
 if le k 0
+exit 90
+end
+q = add q ulong k
+end
+end
+
+fn bg_c c uchar to void
+b = new uchar 1 0
+put b 0 c
+bg_w b 0 1
+end
+
+fn bg_dec v ulong to void
+b = new uchar 20 0
+k = ulong 20
+x = v
+for i ulong 20
+k = sub k 1
+put b k uchar add rem x 10 48
+x = div x 10
+if eq x 0
 break
 end
-n = add n ulong k
 end
-ret jparse src n arglim
+bg_w b k sub 20 k
+end
+
+fn bg_hexd v ulong to uchar
+if lt v 10
+ret uchar add v 48
+end
+ret uchar add v 87
+end
+
+fn bg_hex16 v ulong to void
+h = new uchar 16 0
+for i ulong 16
+put h i bg_hexd and shr v mul sub 15 i 4 15
+end
+bg_w h 0 16
+end
+
+fn bg_werr c ulong to void
+bg_c 87
+bg_c 69
+bg_c 82
+bg_c 82
+bg_c 32
+bg_dec c
+bg_c 10
+end
+
+fn bg_err c ulong p ulong to void
+bg_c 69
+bg_c 82
+bg_c 82
+bg_c 32
+bg_dec c
+bg_c 32
+bg_dec p
+bg_c 10
+end
+
+note ======== input and arguments ========
+
+note bg_read: all of stdin into src. Exit 90 on a read error, 93 when one more byte follows a full array.
+note Every pass reads at least one byte or leaves, so passes <= len src.
+fn bg_read src edit uchar * to ulong
+p = ulong 0
+while lt p len src bound 9223372036854775807
+k = read 0 src p sub len src p
+if lt k 0
+exit 90
+end
+if eq k 0
+ret p
+end
+p = add p ulong k
+end
+x = new uchar 1 0
+k = read 0 x 0 1
+if lt k 0
+exit 90
+end
+if gt k 0
+exit 93
+end
+ret p
+end
+
+fn bg_arg i ulong d ulong to ulong
+b = new uchar 32 0
+if le argcnt long i
+ret d
+end
+k = argread i b 0 32
+if or le k 0 gt k 20
+exit 92
+end
+v = ulong 0
+for j ulong ulong k
+c = get b j
+if or lt c 48 gt c 57
+exit 92
+end
+if gt v 1844674407370955160
+exit 92
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn bg_mode to uchar
+b = new uchar 2 0
+if lt argcnt 2
+exit 92
+end
+k = argread 1 b 0 2
+if ne k 1
+exit 92
+end
+ret get b 0
+end
+
+note ======== modes ========
+
+fn bg_done ob edit uchar * to void
+r = js_wdone ob
+if lt r 0
+bg_werr ulong neg r
+ret
+end
+bg_w ob jswh ulong r
+end
+
+note bg_rw2: every token of the tape through js_wtok; one token per pass, so passes <= js_ntok tape
+fn bg_rw2 src view uchar * tape view uint * ob edit uchar * to void
+r = js_winit ob
+if lt r 0
+bg_werr ulong neg r
+ret
+end
+t = ulong 0
+while lt t js_ntok tape bound 9223372036854775807
+js_wtok ob src js_type tape t js_off tape t
+t = add t 1
+end
+bg_done ob
+end
+
+fn bg_rw src view uchar * tape view uint * cap ulong to void
+ob = new uchar 2098192 0
+bg_rw2 src tape part ob 0 cap
+end
+
+fn bg_parse src view uchar * m uchar sl ulong cap ulong to void
+tape = new uint 262144 0
+r = js_init tape sl 512
+if lt r 0
+bg_c 73
+bg_c 78
+bg_c 73
+bg_c 84
+bg_c 32
+bg_c 45
+bg_dec ulong neg r
+bg_c 10
+ret
+end
+r2 = js_parse src tape len src
+if lt r2 0
+bg_err js_err tape js_epos tape
+ret
+end
+if eq m 112
+bg_c 79
+bg_c 75
+bg_c 32
+bg_dec ulong r2
+bg_c 10
+ret
+end
+bg_rw src tape cap
+end
+
+fn bg_wr2 src view uchar * m uchar ob edit uchar * to void
+r = js_winit ob
+if lt r 0
+bg_werr ulong neg r
+ret
+end
+if eq m 110
+js_wnumb ob src 0 len src
+else
+js_wsbuf ob src 0 len src
+end
+bg_done ob
+end
+
+fn bg_wr src view uchar * m uchar cap ulong to void
+ob = new uchar 2098192 0
+bg_wr2 src m part ob 0 cap
+end
+
+fn bg_f src view uchar * to void
+fs = new long jsfs 0
+ob = new uchar 2048 0
+x = js_f64 src 0 fs
+bg_c 70
+bg_c 32
+bg_dec js_f64st fs
+bg_c 32
+bg_hex16 bitcast ulong x
+bg_c 32
+r = js_winit ob
+if lt r 0
+exit 92
+end
+js_wf64 ob x fs
+r2 = js_wdone ob
+if lt r2 0
+bg_werr ulong neg r2
+ret
+end
+bg_w ob jswh ulong r2
+bg_c 10
+end
+
+fn main to int
+src = new uchar 4194304 0
+m = bg_mode
+a = bg_arg 2 2098192
+sl = bg_arg 2 jsmaxn
+n = bg_read src
+if eq m 112
+bg_parse part src 0 n m sl 2098192
+ret 0
+end
+if eq m 114
+if gt a 2098192
+exit 92
+end
+bg_parse part src 0 n m jsmaxn a
+ret 0
+end
+if or eq m 110 eq m 115
+if gt a 2098192
+exit 92
+end
+bg_wr part src 0 n m a
+ret 0
+end
+if eq m 102
+bg_f part src 0 n
+ret 0
+end
+exit 92
 end
