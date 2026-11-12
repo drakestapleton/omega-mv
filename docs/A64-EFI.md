@@ -84,9 +84,17 @@ line they are ordinary names.
 
 - A wrong address given to `fwld`, `fwst` or `fwcall` is not caught: there is no memory protection
   beneath a UEFI application.
-- X18 is never touched, as UEFI asks; OM-2 pinned globals (X18..X26) do not exist here because
-  `om2` and `target a64efi` are both first lines.
+- `om2` may be the line after the target line (`om2` first is error 16 at line 2). The unit is then
+  OM-2 in language, without the AArch64 OM-2 code improvements: no global is pinned in a register, as
+  on the x86 targets. X18 is never touched, as UEFI asks: the OM-2 word `scrub` clears X19..X26 here and leaves X18
+  (on the Linux target it clears X18..X26). `efirt.om` compiles under both profiles. (At `50485583`
+  and before, the combination pinned globals in X18..X26, registers the entry never set, and `scrub`
+  cleared X18.)
 - The firmware's interrupts run on the Omega stack while the program runs.
+- The OM-2 word `dit` sets the processor's data-independent-timing bit, and the return to the firmware
+  does not put it back: a program that ends with `dit 1` in force returns with it set. The bit changes
+  how long some instructions take, never their results; clear it (`dit 0`) before returning if the
+  firmware should get the bit as it gave it.
 
 ## Evidence (2026-11-12)
 
@@ -96,7 +104,7 @@ The compiler is `seed/out/omc` of the commit that carries this file, rebuilt fro
 | Check | Result |
 |---|---|
 | Default output | gate17 (300 programs byte-identical to the pinned reference compiler) and the other `seed/host/check.sh` gates |
-| `tests/a64efi/run.sh` | tests/x86efi's float, refusals, file, exit and ident programs compiled for this target and booted under QEMU virt + EDK2, the compile-time refusals of this target and the default-target control: every check PASS, 1 NOT_RUN (efi 11 is x86efi only) |
+| `tests/a64efi/run.sh` | tests/x86efi's float, refusals, file, exit and ident programs compiled for this target and booted under QEMU virt + EDK2, an OM-2 program (`om2.om`), the compile-time refusals of this target and the default-target control: every check PASS, 1 NOT_RUN (efi 11 is x86efi only) |
 | `ollm` acceptance job, virtualized | aien-train `bb19fba9` `native/omegallm` with `efirt.om` first, the 11 jobs of `tests/omegallm/efi-job.txt`: OUT.TXT body EQUAL to the AArch64 Linux reference (`efi-check.sh`), TR.BIN, HE.BIN and S.CK byte-identical, `fsck.vfat -n` clean; with `\OLLM\REBOOT.TXT` the machine restarts at exit |
 | `ollm` with the 15.8M-parameter checkpoint, virtualized | two 120-token samples from the rung-10 checkpoint and its BPE merges complete |
 | **Physical machine** | `evidence/a64efi-dgx-spark-20261112/`: the same `ollm` image plus `pciid.om`, started once by the firmware of a DGX Spark from its EFI system partition (`BootNext`), no operating system loaded. `OLLM DONE 11`; OUT.TXT body EQUAL to the Linux reference; TR.BIN, HE.BIN and S.CK byte-identical; the image then restarted the machine. `pciid.om` read, through the firmware's PCI I/O protocol and with no NVIDIA software, the display device `10de:2e12` at 000f:01:00.0 and two identity registers of its BAR 0 (offset 0: `1bb000a1`, offset 0xA00: `1bba1000`). The image (sha256 `f2e31985…ecaba`) was built by an earlier candidate of this branch; the committed `seed/out/omc` builds the same bytes from the same source |

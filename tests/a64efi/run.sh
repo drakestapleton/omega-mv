@@ -69,6 +69,7 @@ refuse "function mode" "1 25" 'target a64efi\nfn f a ulong to ulong\nret a\nend\
 refuse "run-time pool" "2 25" 'target a64efi\nglobal p uchar *\nfn main to int\nret 0\nend\n'
 refuse "efi without fn efirt" "4 16" 'target a64efi\nglobal b uchar 8\nfn main to int\nr = efi 13 0 b 0 1\nret 0\nend\n'
 refuse "efi OP above 14" "7 25" 'target a64efi\nglobal b uchar 8\nfn efirt o ulong a ulong p ulong n ulong to ulong\nret 0\nend\nfn main to int\nr = efi 15 0 b 0 1\nret 0\nend\n'
+refuse "om2 before the target line" "2 16" 'om2\ntarget a64efi\nfn main to int\nret 0\nend\n'
 refuse "unknown target" "1 25" 'target a64uefi\nfn main to int\nret 0\nend\n'
 refuse "read" "4 25" 'target a64efi\nglobal b uchar 8\nfn main to int\nk = read 0 b 0 1\nret 0\nend\n'
 refuse "write" "4 25" 'target a64efi\nglobal b uchar 8\nfn main to int\nk = write 1 b 0 1\nret 0\nend\n'
@@ -131,6 +132,35 @@ if boot ident-neg "$I/id.om"; then
   block "$work/ident-neg/serial.log" | grep -qx 'sm=OtherMaker/IdentBox/7.1' && ok "ident negative control: OtherMaker is reported" || bad "ident negative control: OtherMaker not reported"
 fi
 smb=
+# om2: `target a64efi` then `om2`, efirt.om and tests/a64efi/om2.om: an OM-2 form and globals, no pinned register
+d=$work/om2; mkdir -p "$d"
+{ echo "target a64efi"; echo om2; cat "$root/seed/a64efi/efirt.om" "$here/om2.om"; } > "$d/app.om"
+if "$omc" < "$d/app.om" > "$d/app.efi" 2> "$d/omc.err"; then
+  dd if=/dev/zero of="$d/disk.img" bs=1048576 count=64 2> /dev/null
+  mformat -i "$d/disk.img" -F :: && mmd -i "$d/disk.img" ::/EFI ::/EFI/BOOT && mcopy -i "$d/disk.img" "$d/app.efi" ::/EFI/BOOT/BOOTAA64.EFI
+  # shellcheck disable=SC2086
+  timeout -k 3 "$wait" qemu-system-aarch64 -M virt $accel -m 1024 -display none -bios "$code" \
+    -drive if=none,id=d0,format=raw,file="$d/disk.img" -device virtio-blk-device,drive=d0 \
+    -net none -serial file:"$d/serial.log" -monitor none -no-reboot < /dev/null > /dev/null 2>&1
+  [ "$(block "$d/serial.log")" = "om2 7 26" ] && ok "om2: an OM-2 unit under target a64efi prints om2 7 26" || bad "om2: printed '$(block "$d/serial.log")'"
+else bad "om2: omc refused it: $(cat "$d/omc.err")"; fi
+# no pinned global under `target a64efi` then `om2`: a global declared before the first function is read
+# through X18 on the default target (LDRB W1, [X18] is the word 39400241), and must not be here
+printf 'om2\nglobal b uchar 8\nfn main to int\nx = ulong get b 0\nret int x\nend\n' > "$work/p.om"
+{ echo "target a64efi"; cat "$work/p.om"; } > "$work/pa.om"
+if "$omc" < "$work/pa.om" > "$work/pa.efi" 2> /dev/null && "$omc" < "$work/p.om" > "$work/p.elf" 2> /dev/null; then
+  na=$(od -An -tx4 -v "$work/pa.efi" | tr ' ' '\n' | grep -c '^39400241$'); nd=$(od -An -tx4 -v "$work/p.elf" | tr ' ' '\n' | grep -c '^39400241$')
+  [ "$na" = 0 ] && [ "$nd" -ge 1 ] && ok "om2 pins: no load through X18 under target a64efi (the default target has $nd)" || bad "om2 pins: X18 loads a64efi=$na default=$nd"
+else bad "om2 pins: omc refused the units"; fi
+# scrub under `target a64efi` then `om2` must not write X18 (MOVZ X18, #0 is the word d2800012); on the default
+# target the same word is part of scrub, which shows the check sees it
+printf 'om2\nfn main to int\nz = scrub 16\nret int z\nend\n' > "$work/s.om"
+{ echo "target a64efi"; cat "$work/s.om"; } > "$work/sa.om"
+if "$omc" < "$work/sa.om" > "$work/sa.efi" 2> /dev/null && "$omc" < "$work/s.om" > "$work/s.elf" 2> /dev/null; then
+  na=$(od -An -tx4 -v "$work/sa.efi" | tr ' ' '\n' | grep -c '^d2800012$'); nd=$(od -An -tx4 -v "$work/s.elf" | tr ' ' '\n' | grep -c '^d2800012$')
+  n19=$(od -An -tx4 -v "$work/sa.efi" | tr ' ' '\n' | grep -c '^d2800013$')
+  [ "$na" = 0 ] && [ "$n19" -ge 1 ] && [ "$nd" -ge 1 ] && ok "scrub: no write of X18 under target a64efi (X19 cleared; the default target clears X18)" || bad "scrub: X18 words a64efi=$na default=$nd, X19 words a64efi=$n19"
+else bad "scrub: omc refused the scrub units"; fi
 nr "file11: efi 11 is x86efi only"
 echo "SUMMARY pass=$pass fail=$fail not_run=$notrun"
 [ $fail = 0 ]
