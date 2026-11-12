@@ -461,6 +461,13 @@ and a call to it is error 3): `r = efi OP ARG A OFF N`, OP a literal 0..14 (a li
 EFI_STATUS `2^63 | (100 + T)`. See [the x86efi design and evidence](../X86-EFI.md) for
 the operations, the efi 12 file contract and qualification status.
 
+An initial line `target a64efi` selects the AArch64 UEFI backend: the default AArch64 code
+generator, a PE32+ image a 64-bit Arm firmware starts with no operating system, base-relative
+addresses, and no host words (error 25, as is function mode and a run-time pool). Its `efi` word
+keeps the x86efi contract and compiles to a call of the program's own `fn efirt`
+(`seed/a64efi/efirt.om`); the firmware words `fwcall`, `fwld`, `fwst`, `fwsys` and `fwadr` exist
+under this target only. See [the a64efi design and evidence](../A64-EFI.md).
+
 ### 9.2 Functions and calls
 
 - `fn` may appear many times. A names pass reads every signature before any code is written, so a call

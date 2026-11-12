@@ -1,0 +1,475 @@
+note SPDX-License-Identifier: Apache-2.0
+note efirt.om: the efi word of `target a64efi`, written in Omega (docs/A64-EFI.md). The compiler turns
+note `efi OP ARG A OFF N` into a call of efirt OP ARG address N after its bounds check; everything the
+note firmware does for it is here, through the fw words (fwcall, fwld, fwst, fwsys, fwadr). Place this
+note unit before the program's own functions. The contract is x86efi's (docs/X86-EFI.md): results are
+note ulong, an error is 2^63 | code. Operations here: 1 key, 2 stall, 10 milliseconds, 12 general file,
+note 13 console, 14 identity. The others (0 info, 3 Blt, 4 time, 5 entropy, 6..9 network and pointer,
+note 11 boot file) are 2^63 | 3 (EFI_UNSUPPORTED) on this target until someone needs them.
+note UEFI 2.10 offsets: SystemTable 24 FirmwareVendor, 32 FirmwareRevision, 48 ConIn, 64 ConOut,
+note 96 BootServices, 104 NumberOfTableEntries, 112 ConfigurationTable. BootServices 72 FreePool,
+note 152 HandleProtocol, 248 Stall, 256 SetWatchdogTimer, 312 LocateHandleBuffer. File protocol 8 Open,
+note 16 Close, 24 Delete, 32 Read, 40 Write, 56 SetPosition, 64 GetInfo, 80 Flush.
+
+note efh: 0 file handle, 8 volume root, 16 writable, 24 and 32 out-parameters, 40 started, 48 tick base
+global efh uchar 64
+note efu: UCS-2 text for the firmware (a path of 255 characters, or a console chunk)
+global efu uchar 1024
+global efg uchar 16
+global efinf uchar 512
+
+fn eferr c ulong to ulong
+ret or 9223372036854775808 c
+end
+
+fn efbs to ulong
+ret fwld add fwsys 1 96 8
+end
+
+note efhg / efhp: the 8-byte cell at byte k of efh
+fn efhg k ulong to ulong
+ret fwld fwadr efh k 8 8
+end
+
+fn efhp k ulong v ulong to void
+x = fwst fwadr efh k 8 8 v
+end
+
+note efguid: the GUID whose two little-endian halves are a and b, in efg; its address
+fn efguid a ulong b ulong to ulong
+p = fwadr efg 0 16
+x = fwst p 8 a
+x = fwst add p 8 8 b
+ret p
+end
+
+note efstart: once, before the first operation: no watchdog reset during a long job (UEFI 7.5
+note SetWatchdogTimer 0), and the counter value that efi 10 counts from
+fn efstart to void
+if ne efhg 40 0
+ret
+end
+efhp 40 1
+efhp 48 fwsys 2
+x = fwcall fwld add efbs 256 8 0 0 0 0 0 0
+end
+
+note efi 13: A[0, n) to ConOut. Bytes 9, 10, 13 and 32..126 only (42), all checked first; LF becomes
+note CR LF; chunks of at most 250 characters. No ConOut, or OutputString fails: 43. Result n.
+fn efcon addr ulong n ulong to ulong
+con = fwld add fwsys 1 64 8
+if eq con 0
+ret eferr 43
+end
+i = ulong 0
+while lt i n
+b = fwld add addr i 1
+ok = or or eq b 9 eq b 10 or eq b 13 and ge b 32 le b 126
+if not ok
+ret eferr 42
+end
+i = add i 1
+end
+out = fwld add con 8 8
+u = fwadr efu 0 1024
+k = ulong 0
+i = 0
+while lt i n
+b = fwld add addr i 1
+if eq b 10
+x = fwst add u mul k 2 2 13
+k = add k 1
+end
+x = fwst add u mul k 2 2 b
+k = add k 1
+i = add i 1
+if or ge k 250 eq i n
+x = fwst add u mul k 2 2 0
+r = fwcall out con u 0 0 0 0
+if ne shr r 63 0
+ret eferr 43
+end
+k = 0
+end
+end
+ret n
+end
+
+note efclose: flush when writable, close the file and its root, empty the slot; 0 or 40
+fn efclose to ulong
+f = efhg 0
+r = ulong 0
+if ne f 0
+if ne efhg 16 0
+s = fwcall fwld add f 80 8 f 0 0 0 0 0
+if ne shr s 63 0
+r = eferr 40
+end
+end
+x = fwcall fwld add f 16 8 f 0 0 0 0 0
+end
+t = efhg 8
+if ne t 0
+x = fwcall fwld add t 16 8 t 0 0 0 0 0
+end
+efhp 0 0
+efhp 8 0
+efhp 16 0
+ret r
+end
+
+note efroot: open the root of volume v (255: the volume this image came from) into efh 8; 0 or an error
+note 16 no handles, 18 no LoadedImage, 19 no such volume, 21 no file system on it, 22 OpenVolume failed
+fn efroot v ulong to ulong
+bs = efbs
+o = fwadr efh 24 8
+dev = ulong 0
+if eq v 255
+g = efguid 1284253093421855137 4283602510276476814
+hp = fwld add bs 152 8
+ih = fwsys 0
+s = fwcall hp ih g o 0 0 0
+if ne s 0
+ret eferr 18
+end
+dev = fwld add efhg 24 24 8
+else
+g = efguid 1284199179690597154 4283602510276475278
+c = fwadr efh 32 8
+s = fwcall fwld add bs 312 8 2 g 0 c o 0
+if ne s 0
+ret eferr 16
+end
+buf = efhg 24
+if ge v efhg 32
+x = fwcall fwld add bs 72 8 buf 0 0 0 0 0
+ret eferr 19
+end
+dev = fwld add buf mul v 8 8
+x = fwcall fwld add bs 72 8 buf 0 0 0 0 0
+end
+g = efguid 1284199179690597154 4283602510276475278
+s = fwcall fwld add bs 152 8 dev g o 0 0 0
+if ne s 0
+ret eferr 21
+end
+fs = efhg 24
+ov = fwld add fs 8 8
+ro = fwadr efh 8 8
+s = fwcall ov fs ro 0 0 0 0
+if ne s 0
+efhp 8 0
+ret eferr 22
+end
+ret 0
+end
+
+note efopen: Open(root, path in efu, mode, 0) into efh 0; the firmware status
+fn efopen mode ulong to ulong
+t = efhg 8
+op = fwld add t 8 8
+fh = fwadr efh 0 8
+nm = fwadr efu 0 1024
+ret fwcall op t fh nm mode 0 0
+end
+
+note efpath: the path A[0, n) checked (1..255 bytes, first '\', each 32..126) and copied to efu as UCS-2
+fn efpath addr ulong n ulong to ulong
+if or eq n 0 gt n 255
+ret eferr 33
+end
+if ne fwld addr 1 92
+ret eferr 33
+end
+u = fwadr efu 0 1024
+i = ulong 0
+while lt i n
+b = fwld add addr i 1
+if or lt b 32 gt b 126
+ret eferr 33
+end
+x = fwst add u mul i 2 2 b
+i = add i 1
+end
+x = fwst add u mul n 2 2 0
+ret 0
+end
+
+note efsize: FileSize of the open file (GetInfo with the FileInfo GUID), or 41 after closing it
+fn efsize to ulong
+f = efhg 0
+g = efguid 1284208961261104786 4283602510276475278
+efhp 24 512
+sz = fwadr efh 24 8
+inf = fwadr efinf 0 512
+s = fwcall fwld add f 64 8 f g sz inf 0 0
+if ne s 0
+x = efclose
+ret eferr 41
+end
+ret fwld add inf 8 8
+end
+
+note efopn: subs 0, 1 and 5 on volume vol, the path already in efu
+fn efopn sb ulong vol ulong to ulong
+if ne efhg 0 0
+ret eferr 34
+end
+e = efroot vol
+if ne e 0
+ret e
+end
+if eq sb 1
+s = efopen 3
+if eq s 0
+f = efhg 0
+x = fwcall fwld add f 24 8 f 0 0 0 0 0
+efhp 0 0
+end
+s = efopen 9223372036854775811
+if ne s 0
+efhp 0 0
+x = efclose
+ret eferr 36
+end
+efhp 16 1
+ret 0
+end
+mode = ulong 1
+if eq sb 5
+mode = 3
+end
+s = efopen mode
+if ne s 0
+efhp 0 0
+x = efclose
+ret eferr 36
+end
+r = efsize
+if and eq sb 5 eq shr r 63 0
+efhp 16 1
+end
+ret r
+end
+
+note efrw: sub 2 (read) or 3 (write) of n bytes at position pos
+fn efrw sb ulong pos ulong addr ulong n ulong to ulong
+f = efhg 0
+bad = ulong 37
+if eq sb 3
+bad = 38
+if eq efhg 16 0
+ret eferr 38
+end
+end
+s = fwcall fwld add f 56 8 f pos 0 0 0 0
+if ne s 0
+ret eferr bad
+end
+efhp 24 n
+sz = fwadr efh 24 8
+m = ulong 32
+if eq sb 3
+m = 40
+end
+s = fwcall fwld add f m 8 f sz addr 0 0 0
+if ne s 0
+ret eferr bad
+end
+if eq sb 2
+ret efhg 24
+end
+if ne efhg 24 n
+ret eferr 39
+end
+ret n
+end
+
+note efi 12, see docs/X86-EFI.md "efi 12 general file" for the contract kept here
+fn effile arg ulong addr ulong n ulong to ulong
+sb = and arg 255
+if gt sb 5
+ret eferr 32
+end
+if or or eq sb 0 eq sb 1 eq sb 5
+e = efpath addr n
+if ne e 0
+ret e
+end
+ret efopn sb and shr arg 8 255
+end
+if eq efhg 0 0
+ret eferr 35
+end
+if eq sb 4
+ret efclose
+end
+ret efrw sb shr arg 16 addr n
+end
+
+note efcfg: the address stored for configuration table GUID (a, b), 0 when it is not there
+fn efcfg a ulong b ulong to ulong
+st = fwsys 1
+cnt = fwld add st 104 8
+tab = fwld add st 112 8
+i = ulong 0
+while lt i cnt
+e = add tab mul i 24
+if and eq fwld e 8 a eq fwld add e 8 8 b
+ret fwld add e 16 8
+end
+i = add i 1
+end
+ret 0
+end
+
+note efi 14 identity. ARG with bits 0..15 zero: this target has no CPUID; leaf 0 gives MIDR_EL1 in the
+note first 8 of 16 bytes and zeros after it, every other leaf 16 zeros (N < 16 is 5, a leaf at or above
+note 2^32 is 32; result 16). ARG 1 FirmwareVendor, ARG 2 FirmwareRevision, sub 3 the SMBIOS structure
+note table from byte ARG >> 16, as on x86efi (44 when no table is found). Any other ARG is 32.
+fn efident arg ulong addr ulong n ulong to ulong
+st = fwsys 1
+sb = and arg 65535
+par = shr arg 16
+if eq sb 0
+if ne shr par 32 0
+ret eferr 32
+end
+if lt n 16
+ret eferr 5
+end
+v = ulong 0
+if eq par 0
+v = fwsys 4
+end
+x = fwst addr 8 v
+x = fwst add addr 8 8 0
+ret 16
+end
+if eq arg 1
+p = fwld add st 24 8
+if eq p 0
+ret 0
+end
+k = ulong 0
+go = true
+while and go le add k 2 n
+c = fwld add p k 2
+if eq c 0
+go = false
+else
+x = fwst add addr k 2 c
+k = add k 2
+end
+end
+ret k
+end
+if eq arg 2
+ret fwld add st 32 4
+end
+if eq sb 3
+base = ulong 0
+size = ulong 0
+ep = efcfg 5344813523769562436 10728454813909331609
+if ne ep 0
+if eq fwld ep 4 860705631
+size = fwld add ep 12 4
+base = fwld add ep 16 8
+end
+else
+ep = efcfg 1284420384822471985 5602828850577807002
+if ne ep 0
+if eq fwld ep 4 1598903135
+size = fwld add ep 22 2
+base = fwld add ep 24 4
+end
+end
+end
+if eq base 0
+ret eferr 44
+end
+if ge par size
+ret 0
+end
+m = sub size par
+if gt m n
+m = n
+end
+i = ulong 0
+while lt i m
+x = fwst add addr i 1 fwld add add base par i 1
+i = add i 1
+end
+ret m
+end
+ret eferr 32
+end
+
+fn efirt op ulong arg ulong addr ulong n ulong to ulong
+efstart
+if eq op 13
+if ne arg 0
+ret eferr 32
+end
+ret efcon addr n
+end
+if eq op 12
+ret effile arg addr n
+end
+if eq op 10
+if lt n 8
+ret eferr 5
+end
+f = fwsys 3
+if eq f 0
+ret eferr 3
+end
+t = sub fwsys 2 efhg 48
+x = fwst addr 8 add mul div t f 1000 div mul rem t f 1000 f
+ret 0
+end
+if eq op 14
+ret efident arg addr n
+end
+if eq op 2
+ret fwcall fwld add efbs 248 8 arg 0 0 0 0 0
+end
+if eq op 1
+if lt n 4
+ret eferr 5
+end
+ci = fwld add fwsys 1 48 8
+if eq ci 0
+ret eferr 3
+end
+ret fwcall fwld add ci 8 8 ci addr 0 0 0 0
+end
+ret eferr 3
+end
+
+note efiexit: called by the shared return on every exit path (return, exit, trap): a file still open
+note is flushed and closed, as a process exit closes descriptors. Then, when the boot volume holds a
+note file \OLLM\REBOOT.TXT, the machine is restarted (Runtime Services ResetSystem, SystemTable 88,
+note offset 104, EfiResetCold): a firmware that shows its menu after an application returns would
+note otherwise leave an unattended machine there. Without that file the image returns to the firmware.
+text efrbt "\\OLLM\\REBOOT.TXT"
+fn efiexit to void
+x = efclose
+u = fwadr efu 0 1024
+n = len efrbt
+i = ulong 0
+while lt i n
+x = fwst add u mul i 2 2 ulong get efrbt i
+i = add i 1
+end
+x = fwst add u mul n 2 2 0
+if ne efroot 255 0
+ret
+end
+s = efopen 1
+x = efclose
+if eq s 0
+rs = fwld add fwsys 1 88 8
+x = fwcall fwld add rs 104 8 0 0 0 0 0 0
+end
+end
