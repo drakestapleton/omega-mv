@@ -1,0 +1,181 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Compose context.om, vector.om, launch.om, batch.om. No alternate driver or queue.
+note Bodies are produced by gbbody, or an equivalent INLINE/DMA body WITHOUT gbtail.
+note Every body has a WFI release and full shader invalidation before the next body.
+note QMD/bank updates are inline DMA, never CPU overwrites while the GPU reads them.
+note Source: class/clc96f.h:75-87 RELEASE_WFI_EN; om/streams/streams.om INVALL.
+note All gbmem allocations and code/data operands stay live and immutable until completion.
+note No reset, append, free or retry after uncertain completion: nvfault remains latched.
+global gbst ulong 8
+note gbst: expected, recorded, bytes, phase(0 idle,1 recording,2 in-flight,3 poison),
+note bad index(count means final tail), bad caller id, kicks, waits.
+global gbids ulong 512
+global gbpkt long 1
+fn gbberr idx ulong id ulong err long to bool
+put gbst 4 idx
+put gbst 5 id
+put gbst 3 3
+put nverr 0 err
+ret false
+end
+note Allocate once after opening the context. GPU-uncached packet storage.
+fn gbbopen to bool
+if ne get nvfault 0 0
+ret false
+end
+if gt get gbpkt 0 0
+ret true
+end
+m = nvalloc 1048576 false
+if le m 0
+ret false
+end
+put gbpkt 0 m
+ret true
+end
+note Count admission precedes body recording or any send. A bad append poisons the whole batch.
+fn gbbegin count ulong to bool
+if or ne get nvfault 0 0 eq get gbst 3 2
+ret false
+end
+if or eq count 0 gt count 512
+ret gbberr 0 0 -75
+end
+if le get gbpkt 0 0
+ret gbberr 0 0 -22
+end
+put gbst 0 count
+put gbst 1 0
+put gbst 2 0
+put gbst 3 1
+put gbst 4 18446744073709551615
+put gbst 5 0
+put gbst 6 0
+put gbst 7 0
+ret true
+end
+note Copy directly into the persistent submit mapping, not through a second megabyte buffer.
+fn gbbcopy to bool
+n = get gbused 0
+base = get gbst 2
+r = mapwrite get gbpkt 0 base gbcmd 0 n
+if ne r long n
+ret gbberr get gbst 1 0 -5
+end
+put gbst 2 add base n
+ret true
+end
+note dep = zero for none, or producer index+1. Only already-recorded producers are admissible.
+fn gbappend id ulong dep ulong to bool
+idx = get gbst 1
+if or ne get gbst 3 1 ne get nvfault 0 0
+ret false
+end
+if ge idx get gbst 0
+ret gbberr idx id -75
+end
+if gt dep idx
+ret gbberr idx id -22
+end
+n = get gbused 0
+if or or eq n 0 gt n 65536 ne rem n 4 0
+ret gbberr idx id -22
+end
+note Reserve seam release/invalidate (32 bytes) and unchanged tail (68 bytes) before copying.
+if gt n sub ulong 1048476 get gbst 2
+ret gbberr idx id -75
+end
+if not gbbcopy
+ret false
+end
+put gbids idx id
+if gt get gbst 0 1
+put gbused 0 0
+va = add mapaddr get gbmem 3 add ulong 32 mul idx 4
+gbrel va 6
+note Full shader invalidation after the WFI release has drained this grid.
+gbmth 1 540 1
+gbemit 4113
+if not gbbcopy
+ret false
+end
+end
+put gbst 1 add idx 1
+ret true
+end
+note Scan seals without waiting. Blame FIRST uncompleted index and the caller's kernel id.
+note Tail timeout with all seals complete is count, not a fabricated kernel failure.
+fn gbbcheck to bool
+n = get gbst 0
+if gt n 1
+for i ulong n
+if ne mapget get gbmem 3 add ulong 32 mul i 4 4 6
+put gbst 4 i
+put gbst 5 get gbids i
+ret false
+end
+end
+else
+if ne mapget get gbmem 2 8192 4 6
+put gbst 4 0
+put gbst 5 get gbids 0
+ret false
+end
+end
+put gbst 4 n
+put gbst 5 0
+ret true
+end
+note Existing nvwait is sleep-polling: never spin or inherit a process spin window.
+note One nvsend and one nvwait. The second marker follows the unchanged C3 L2 flush.
+fn gbbsubmit budget ulong to bool
+if or ne get gbst 3 1 ne get nvfault 0 0
+ret false
+end
+if ne get gbst 1 get gbst 0
+ret gbberr get gbst 1 0 -22
+end
+if or eq budget 0 gt budget 30000000000
+ret gbberr get gbst 1 0 -22
+end
+put gbused 0 0
+gbtail
+if not gbbcopy
+ret false
+end
+r = mapset get gbmem 2 8192 4 0
+r = mapset get gbmem 3 0 4 0
+r = mapset get gbmem 3 16 4 0
+for i ulong get gbst 0
+r = mapset get gbmem 3 add ulong 32 mul i 4 4 0
+end
+n = get gbst 2
+put gbst 3 2
+put nvstage 0 41
+if not nvsend get gbpkt 0 0 uint div n 4
+note Conservative fail-stop even if the driver refused before its doorbell.
+put nvfault 0 1
+put gbst 3 3
+ret false
+end
+put gbst 6 1
+put gbst 7 1
+put nvstage 0 42
+if not nvwait get gbmem 3 16 1179010630 budget
+ok = gbbcheck
+put nvfault 0 1
+put gbst 3 3
+ret false
+end
+ok = gbbcheck
+if or not ok ne mapget get gbmem 3 0 4 1145324612
+put nvfault 0 1
+put gbst 3 3
+put nverr 0 -5
+ret false
+end
+put gbst 3 0
+put gbst 4 18446744073709551615
+put nvstage 0 43
+ret true
+end

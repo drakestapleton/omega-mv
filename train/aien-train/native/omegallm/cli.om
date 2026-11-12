@@ -87,6 +87,11 @@ if eq w 1701737844
 cmdtune
 ret 0
 end
+note kvcmp (ham/ollm-speed) 482871572075
+if eq w 482871572075
+cmdkvcmp
+ret 0
+end
 exit 2
 end
 
@@ -330,6 +335,7 @@ exit 2
 end
 obload 7 v
 end
+ochipup
 osampleloaded st nn tm
 end
 
@@ -384,12 +390,181 @@ end
 note one sampling step (cmdsamp, serve.om): the next token from the logits at the last context
 note position, argmax when TEMPMILLI tm is 0, else a draw with the splitmix64 stream state st.
 fn osstep st ulong tm ulong to ulong
-lf = ofwd 0
-olast
+olastf
 if eq tm 0
 ret oargmax
 end
 ret odraw st div f64 tm 1000.0
+end
+
+note ogpu[0] = 1 when the per-token forward runs on the chip: gpu/gg.om's gserve and gsample set it
+note before cmdserve or cmdsamp; nogpu.om's ogchip and oglast refuse with exit 2 on the CPU targets.
+global ogpu ulong 1
+
+note after the checkpoint loads: on the chip path, open the chip and upload the parameters once
+fn ochipup to void
+if ne get ogpu 0 0
+ogchip
+end
+end
+
+note forward of the context in obx row 0, then its last position's logits into TMP[0..V) (oa),
+note on the chip when ogpu[0] = 1 (oglast), else on the CPU (ofwdi, model.om: only the rows past the
+note prefix the previous call computed, then olast)
+fn olastf to void
+if ne get ogpu 0 0
+oglast
+ret
+end
+t0 = ofwdi
+olast
+end
+
+note kvcmp CK N PROMPT MERGES (ham/ollm-speed, V > 256, N V <= 2^20): ofwdi against ofwd 0. Pass 1:
+note N greedy steps from token 0 then PROMPT's encoding with ofwdi then olast (the CPU decode), every
+note step's V logits kept in okvr; prints `KI step ct t0 tok ns`. Pass 2: the same contexts again
+note (pass 1's tokens pushed) with ofwd 0 then olast; prints `KF step ct tok ndiff ns`, ndiff = logits
+note whose f64 bits differ from pass 1's. Before step N/2 of both passes the context token at CT - 5
+note (when CT > 5) becomes its successor mod V, so ofwdi must find the changed prefix. Last line
+note `KVCMP N ndiff inc_ns full_ns` (forward and logits time summed over the steps); exit 43 when
+note ndiff > 0.
+global okvr f64 1048576
+global okvk ulong 4096
+fn kvstart to void
+put og 9 0
+ocpush 0
+np = obprompt 4
+for i ulong np
+ocpush get obtk i
+end
+end
+
+fn kvpert s ulong nn ulong to void
+ct = get og 9
+if and eq s div nn 2 gt ct 5
+i = sub ct 5
+put obx i rem add get obx i 1 get og 0
+end
+end
+
+fn kvline a ulong b ulong c ulong d ulong e long to void
+oputc 32
+oputu a
+oputc 32
+oputu b
+oputc 32
+oputu c
+oputc 32
+oputu d
+oputc 32
+oputl e
+oputc 10
+oflush
+end
+
+note kvcmp totals: okvs[0] pass 1 ns, [1] pass 2 ns, [2] differing logits
+global okvs ulong 3
+fn cmdkvcmp to void
+if ne oargc 6
+exit 2
+end
+ockload 2
+nn = oargu 3
+v = get og 0
+if or le v 256 or gt nn 4096 gt mul nn v 1048576
+exit 2
+end
+obload 5 v
+put okvs 0 0
+put okvs 1 0
+put okvs 2 0
+kvstart
+for s ulong nn
+kvpert s nn
+c = kvinc s
+ocpush c
+end
+kvstart
+for s2 ulong nn
+kvpert s2 nn
+kvfull s2
+ocpush get okvk s2
+end
+oputc 75
+oputc 86
+oputc 67
+oputc 77
+oputc 80
+oputc 32
+oputu nn
+oputc 32
+oputu get okvs 2
+oputc 32
+oputu get okvs 0
+oputc 32
+oputu get okvs 1
+oputc 10
+oflush
+if gt get okvs 2 0
+exit 43
+end
+end
+
+note pass 1 step s: ofwdi then olast, logits into okvr row s, KI line; returns the greedy token
+fn kvinc s ulong to ulong
+a = monons
+t0 = ofwdi
+olast
+e = ulong sub monons a
+put okvs 0 add get okvs 0 e
+c = oargmax
+kvkeep s
+put okvk s c
+oputc 75
+oputc 73
+kvline s get og 9 t0 c long e
+ret c
+end
+
+note okvr row s = the V logits in TMP
+fn kvkeep s ulong to void
+v = get og 0
+tm = get og 27
+o = mul s v
+for j ulong v
+x = get oa add tm j
+put okvr add o j x
+end
+end
+
+note the logits in TMP whose f64 bits differ from okvr row s
+fn kvdiff s ulong to ulong
+v = get og 0
+tm = get og 27
+o = mul s v
+nd = ulong 0
+for j ulong v
+x = bitcast ulong get oa add tm j
+y = bitcast ulong get okvr add o j
+if ne x y
+nd = add nd 1
+end
+end
+ret nd
+end
+
+note pass 2 step s: ofwd 0 then olast, compared bit for bit with okvr row s, KF line
+fn kvfull s ulong to void
+a = monons
+lf = ofwd 0
+olast
+e = ulong sub monons a
+put okvs 1 add get okvs 1 e
+nd = kvdiff s
+put okvs 2 add get okvs 2 nd
+oputc 75
+oputc 70
+kvline s get og 9 oargmax nd long e
 end
 
 note logits of the last context position into TMP[0..V) (oa)
