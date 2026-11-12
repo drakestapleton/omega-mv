@@ -107,9 +107,10 @@ The build script does four things:
      (omega-mv `e5b32567`, `../omega-mv`);
    - x86linux: `be8c51301307555254fc59e351d281aae1aa096d91521777e33a41c8b446448a`
      (omega-mv main `ba5559d9`, `../omega-mv-x86`);
-   - x86efi: `b4f45121f6c6d5d8a6ed0f5c4f3934b7cc4bec369bfa89523699bd33928f9b55`
-     (omega-mv main `d3d1b1bc`, PR #1015 merged 2026-11-04, `../omega-efi`; the receipts were
-     built from #1015's commit `5ce9ecaa`, an ancestor, with this same omc).
+   - x86efi: `3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`
+     (omega-mv PR #1022 commit `cf9fbda1`: main `d3d1b1bc`, where #1015's x86efi backend merged
+     on 2026-11-04, plus efi 14, `../omega-efi`); the receipts in `evidence/OMEGALLM/efi` and `imac`
+     were built earlier with omc `b4f45121` from #1015's commit `5ce9ecaa`.
 2. It concatenates `math.om data.om`, the pool unit (`lpool.om` on Linux, `epool.om` on UEFI;
    CONTRACT-V3 §2), `model.om adam.om ckpt.om bpe.om cli.om` and the platform unit
    (`lio.om` for Linux, `eio.om` for UEFI; CONTRACT §9). The x86 targets put the line
@@ -140,47 +141,104 @@ defaults. The exit codes are listed in CONTRACT §7.
 ## Serve (DRA-119)
 
 ```sh
-ollm serve PORT CK MERGES [MAXCONN]   # AArch64 Linux only; prints "MODEL id", then "PORT n" once listening
+ollm serve PORT CK MERGES [MAXCONN] [tplmax=N] [test=1]    # AArch64 Linux; prints "MODEL id", then "PORT n" once listening
+ollm-gb10 gserve PORT CK MERGES [MAXCONN] [tplmax=N] [test=1]   # the same server, logits from the GB10
 ```
 
-`serve.om` (aarch64 builds only; gb10 and the x86 targets get `noserve.om`, which exits 2) answers
+`serve.om` (aarch64 and gb10 builds; the x86 targets get `noserve.om`, which exits 2) answers
 OpenAI-style chat requests on 127.0.0.1:PORT with omega-mv's `seed/net/http.om` and
 `seed/json/{json,jsonw}.om`, vendored byte for byte from omega-mv `e5b32567` into
 `native/omegallm/net/`. `build.sh` checks their sha256 (`NET_PIN_MISMATCH`, exit 3) and puts `om2`
-first. One connection at a time and one request per connection (`Connection: close`), so a pooled
-idle client cannot hold the listener; 10 s head and 60 s body deadlines.
+first. One request at a time and one request per connection (`Connection: close`), so a pooled
+idle client cannot hold the listener. A connection is served only once its first bytes arrive:
+one that sends nothing within 20 ms of its accept waits in one of 8 pending slots (polled with
+the listener; when all 8 are taken, new connections wait in the listen backlog) and is closed
+unanswered 10 s after its accept. Once bytes arrive the head must complete within 10 s and the
+body within 60 s, so a client that starts a request and stalls holds an idle server up to that
+bound. `tplmax=N` (256 to 983040, default 65536) caps the chat template in bytes. `test=1`
+enables the test-only members `ollm_test_output` (a string whose encoding replaces the drawn
+tokens, then token 0) and `ollm_test_delay_ms` (0 to 10000, how long the server waits for
+connections before each token); without it they are 400.
 
-- `GET /health` → `{"status":"ok","in_flight":0}`; `GET /v1/models` → one model, whose id is read
+- `GET /health` → `{"status":"ok","in_flight":0,"busy":false}`; `GET /v1/models` → one model, whose id is read
   from the loaded checkpoint's header: `ollm-ck0M-vV-tT-dD-hH-lL-stepS-fnvX` (checkpoint format M,
   shapes, step field and the payload FNV-1a 64 that the load has just verified). The rung-10
   ck60000 checkpoint (sha256 `a53ced7265818c8f6197449315e9ca4082721665022fec4f81d4538e8d6c2d0f`)
   is `ollm-ck02-v4096-t256-d384-h12-l8-step60000-fnv0a3ae8e8c031f163`. Every completion and chunk
   carries the same id in `model`.
-- `POST /v1/chat/completions`: `messages` (string or null content), `max_tokens` or
-  `max_completion_tokens` (1 to 999999), `temperature` (0 to 2, no exponent; 0 is argmax), `seed`,
-  `stream`, `stream_options.include_usage`, `n` = 1; other members are ignored (`tools`, `model`).
-  JSON or SSE (`data:` chunks: role, content, finish, optional usage, `[DONE]`).
-- Interim template, until DRA-123 fixes a shared one: `role: content\n` per message, then
-  `assistant: `, at most 4000 bytes. The context is token 0 plus its encoding; when that reaches T
-  the answer is 400 `context_length_exceeded`. Output is at most min(max_tokens, T − prompt tokens)
-  tokens drawn with `sample`'s step (`osstep`), so the same SEED and TEMPMILLI give `sample`'s
-  bytes. Bytes are sent as UTF-8; an ill-formed sequence becomes U+FFFD.
+  `in_flight` is the number of chat completions generating, 0 or 1 (one slot), and `busy` is
+  `in_flight == 1`; connections waiting in pending slots or the backlog are not counted.
+- One generation slot. Between tokens the listener and the pending connections are served:
+  `GET /health` answers `{"status":"ok","in_flight":1,"busy":true}`, `GET /v1/models` the list,
+  and every other request 503 `server_busy` with `Retry-After: 1`. These side requests get a
+  250 ms head and 1 s body deadline, so one that starts and stalls costs the generation at most
+  about 1.3 s; a silent connection costs it 20 ms once.
+- Between tokens the generating request's socket is peeked (`MSG_PEEK | MSG_DONTWAIT`). End of
+  stream or a socket error means the client left: generation stops, nothing more is sent, the
+  slot frees and the log line has status 499 and finish 4. A client that half-closes its
+  sending side after the request counts as gone. A stream also ends when a chunk cannot be sent.
+- `POST /v1/chat/completions`: `messages` (content a string, null, or an array of
+  `{"type":"text","text":...}` parts joined with no separator; other part types are 400),
+  `max_tokens` or `max_completion_tokens` (1 to 999999), `temperature` (0 to 2, no exponent; 0 is
+  argmax), `seed`, `top_k` (-1 to 999999; -1, 0 and K ≥ V are off), `top_p` (0 to 1, no
+  exponent, resolution 0.000001; 0 keeps only the most probable token, 1 is off), `stop` (a
+  string or an array of at most 8 strings of 1 to 128 bytes), `tools`, `tool_choice` (`none`,
+  `auto`, `required` or an object), `stream`,
+  `stream_options.include_usage`, `n` = 1; other members are ignored (`model`). JSON or SSE
+  (`data:` chunks: role, content, tool calls, finish, optional usage, `[DONE]`).
+- Interim template, until DRA-123 fixes a shared one: when `tools` is non-empty, `tools: ` and
+  the tools JSON exactly as sent, then `\n`; then `role: content\n` per message, an assistant's
+  `tool_calls` appended to its content as `<tool_call>{"name":NAME,"arguments":ARGS}</tool_call>`
+  (ARGS the decoded string or the object's JSON text as sent); then `assistant: `. At most
+  `tplmax` bytes. The context is token 0 plus the template's encoding; when that reaches T the
+  answer is 400 `context_length_exceeded`, stating the prompt's tokens and T (the 14,364-byte
+  allen-chat system prompt gets this against a T = 256 checkpoint). Output is at most
+  min(max_tokens, T − prompt tokens) tokens drawn with `sample`'s step (`osstep`), so the same
+  SEED and TEMPMILLI give `sample`'s bytes; with `top_k`/`top_p` on, the kept tokens are the most
+  probable (ties to the lower id), up to K and until their mass reaches `top_p`, drawn by the same
+  uniform scaled to the kept mass. Token 0 ends with `stop`, the limit with `length`, the earliest
+  stop string with `stop` (content cut before it; a stream never sends bytes a stop could still
+  claim). Bytes are sent as UTF-8; an ill-formed sequence becomes U+FFFD.
+- Tool calls (tools non-empty, `tool_choice` not `none`): when the content from the first
+  `<tool_call>` on is 1 to 8 blocks `<tool_call>{"name":N,"arguments":A}</tool_call>` with only
+  whitespace between and after, each N a declared tool, the answer carries `tool_calls` (ids
+  `call_<request>_<i>`, `arguments` the object's JSON text or the string) with `finish_reason`
+  `tool_calls` and content the text before (null when empty); otherwise the text is plain content.
+  A stream holds back a possible marker and sends the calls in one delta chunk. Role `tool`
+  messages are rendered like any other role. Whether the model emits such blocks is a model
+  matter; the checks script the output with `ollm_test_output`.
+- `POST /v1/completions` (raw prompt, for the Omega Node edit→verify→review workflow): `prompt`
+  (a non-empty string) is the whole template: the context is token 0 plus the prompt's encoding,
+  with no role lines and no `assistant: ` prefix, so the same SEED and TEMPMILLI give
+  `ollm sample CK SEED N TEMPMILLI PROMPT MERGES`'s bytes. The scalar members are chat's
+  (`max_tokens`, `temperature`, `seed`, `top_k`, `top_p`, `stop`, `n` = 1). JSON only:
+  `{"id":"cmpl-ollm-N","object":"text_completion","created":..,"model":ID,"choices":[{"index":0,"text":..,"finish_reason":"stop"|"length"}],"usage":{..}}`.
+  400 `invalid_request` for `stream` true, for `messages`, `tools` or `tool_choice` present, and
+  for a missing, non-string or empty `prompt`; `tplmax` and `context_length_exceeded` apply as on
+  chat. Busy 503, client-left 499 and the log line are shared with chat.
 - Refusals are JSON `{"error":{...}}`: 400 (`invalid_json`, `invalid_request`,
-  `context_length_exceeded`), 404, 405, and 413 for a body over 983040 bytes (the JSON parser's
-  limit), refused at the head.
-- stdout gets one line per response: `C status prompt_tokens completion_tokens finish ms`.
+  `context_length_exceeded`), 404, 405, 503 `server_busy`, and 413 `request_too_large` for a body
+  over 983040 bytes (refused at the head) or over 65532 JSON tokens (the JSON parser's tape).
+- stdout gets one line per response: `C status prompt_tokens completion_tokens finish ms`
+  (finish 0 none, 1 stop, 2 length, 3 tool_calls, 4 client left).
 
-`tests/omegallm/serve-check.sh` starts the server under taskset/nice/bwrap, referees it with
-`serve-check.py` (31 checks; the content oracle is the same binary's `sample`, decoded with
-Python's `errors="replace"`; four `parity_` checks compare the sha256 of the served text with the
-sha256 of `sample`'s raw stdout for the same prompt, seed, temperature and token count and keep both
-files in `OUT/parity`; the model id oracle reads the checkpoint header itself), checks that the
-server's `MODEL` line equals that id and that it listened on 127.0.0.1 alone, and stops the PIDs it
-started. `tests/omegallm/serve-mutants.sh` is its negative control: it builds the seven serve
-mutants of `build.sh` (smeth, spath, sbig, sjson, sloop, sseed, smid: the 405, 404, 413 and
-malformed-JSON refusals removed, a 0.0.0.0 bind, a shifted seed, the old fixed id) and requires
-serve-check.sh to fail each one on the check written for it, each run inside a private network
-namespace. Receipts: `evidence/OMEGALLM/serve/`.
+`tests/omegallm/serve-check.sh` starts two servers under taskset/nice/bwrap (defaults on PORT,
+`tplmax=4000 test=1` on TPORT), referees them with `serve-check.py` (the content oracle
+is the same binary's `sample`, decoded with Python's `errors="replace"`; the 499 log lines are read
+from `server-test.log` via `SERVE_TLOG`; `cmpl_*`/`t_cmpl_*` cover `/v1/completions`) and stops the PIDs it started. The checks added since
+DRA-119's first 27 come with control checks (`*_control`, `*_is_sample`,
+`sample_differs_from_greedy`, `t_ctl_*`, `t_forced_plain`): the same request with one input
+changed, expecting the other outcome. A refusal (`refuse_*`) is controlled by the accepted
+request it varies.
+Four `parity_` checks compare the sha256 of the served text with the sha256 of `sample`'s raw
+stdout for the same prompt, seed, temperature and token count and keep both files in `OUT/parity`;
+the model id oracle reads the checkpoint header itself, and the gate also requires the first
+server's `MODEL` line to equal that id and both servers to listen on 127.0.0.1 alone.
+`tests/omegallm/serve-mutants.sh` is the negative control: it builds the seven serve mutants of
+`build.sh` (smeth, spath, sbig, sjson, sloop, sseed, smid: the 405, 404, 413 and malformed-JSON
+refusals removed, a 0.0.0.0 bind, a shifted seed, the old fixed id) and requires serve-check.sh to
+fail each one on the check written for it, each run inside a private network namespace. Receipts:
+`evidence/OMEGALLM/serve/`.
 
 ## iMac
 
