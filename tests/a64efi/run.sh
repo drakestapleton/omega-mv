@@ -70,10 +70,22 @@ refuse "run-time pool" "2 25" 'target a64efi\nglobal p uchar *\nfn main to int\n
 refuse "efi without fn efirt" "4 16" 'target a64efi\nglobal b uchar 8\nfn main to int\nr = efi 13 0 b 0 1\nret 0\nend\n'
 refuse "efi OP above 14" "7 25" 'target a64efi\nglobal b uchar 8\nfn efirt o ulong a ulong p ulong n ulong to ulong\nret 0\nend\nfn main to int\nr = efi 15 0 b 0 1\nret 0\nend\n'
 refuse "unknown target" "1 25" 'target a64uefi\nfn main to int\nret 0\nend\n'
-# Without the target line the firmware words are ordinary names: a program may define fwld itself.
-printf '%b' 'fn fwld a ulong b ulong to ulong\nret add a b\nend\nfn main to int\nret int fwld 40 2\nend\n' > "$work/n.om"
+refuse "read" "4 25" 'target a64efi\nglobal b uchar 8\nfn main to int\nk = read 0 b 0 1\nret 0\nend\n'
+refuse "write" "4 25" 'target a64efi\nglobal b uchar 8\nfn main to int\nk = write 1 b 0 1\nret 0\nend\n'
+refuse "function named fwld" "2 16" 'target a64efi\nfn fwld to ulong\nret 7\nend\nfn main to int\nret 0\nend\n'
+refuse "variable named fwld" "3 16" 'target a64efi\nfn main to int\nfwld = ulong 3\nret 0\nend\n'
+refuse "global named efi" "2 16" 'target a64efi\nglobal efi uchar 8\nfn main to int\nret 0\nend\n'
+refuse "parameter named fwadr" "2 16" 'target a64efi\nfn f fwadr ulong to ulong\nret 0\nend\nfn main to int\nret 0\nend\n'
+refuse "efirt without parameters" "7 9" 'target a64efi\nglobal b uchar 8\nfn efirt to ulong\nret 0\nend\nfn main to int\nr = efi 13 0 b 0 1\nret 0\nend\n'
+refuse "efirt giving int" "7 9" 'target a64efi\nglobal b uchar 8\nfn efirt o ulong a ulong p ulong n ulong to int\nret 0\nend\nfn main to int\nr = efi 13 0 b 0 1\nret 0\nend\n'
+refuse "efirt with a uchar parameter" "7 9" 'target a64efi\nglobal b uchar 8\nfn efirt o ulong a uchar p ulong n ulong to ulong\nret 0\nend\nfn main to int\nr = efi 13 0 b 0 1\nret 0\nend\n'
+refuse "efirt with an array parameter" "7 9" 'target a64efi\nglobal b uchar 8\nfn efirt o ulong a ulong p view uchar 8 n ulong to ulong\nret 0\nend\nfn main to int\nr = efi 13 0 b 0 1\nret 0\nend\n'
+refuse "efiexit with parameters" "7 9" 'target a64efi\nfn efiexit a ulong b ulong to void\nend\nfn main to int\nret 0\nend\n'
+refuse "efiexit giving a value" "8 9" 'target a64efi\nfn efiexit to ulong\nret 99\nend\nfn main to int\nret 0\nend\n'
+# Without the target line the six words are ordinary names: a program may define fwld and a variable efi.
+printf '%b' 'fn fwld a ulong b ulong to ulong\nefi = add a b\nret efi\nend\nfn main to int\nret int fwld 40 2\nend\n' > "$work/n.om"
 if "$omc" < "$work/n.om" > "$work/n" 2> /dev/null && chmod +x "$work/n"; then
-  if [ "$(uname -m)" = aarch64 ]; then "$work/n"; r=$?; [ $r = 42 ] && ok "default target: fwld is an ordinary name (exit 42)" || bad "default target: fwld program exit $r"
+  if [ "$(uname -m)" = aarch64 ]; then "$work/n"; r=$?; [ $r = 42 ] && ok "default target: fwld and efi are ordinary names (exit 42)" || bad "default target: fwld program exit $r"
   else nr "default target fwld program: not an AArch64 host"; fi
 else bad "default target: a program defining fwld was refused"; fi
 
