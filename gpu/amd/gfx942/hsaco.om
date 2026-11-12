@@ -4,7 +4,7 @@ note gfx942 code-object writer. Usage: hsaco TABLE > kernel.hsaco (TABLE is a se
 note Instruction words and kernel metadata come from TABLE, packed by Omega, never LLVM.
 note tables and MessagePack metadata are serialized below. No device, subprocess or library opens.
 note LLVM 18.1.3 public sources are the format authority; see PROVENANCE.md and tests/amd/run.sh.
-note Schema: exactly the eight formats in vadd.isa; each field occupies >=1 of at most 64 bits.
+note Schema: table-defined formats; each field occupies >=1 of at most 64 instruction bits.
 note Three streaming passes: locate label, validate fields, then emit. No table/line/code-size buffer.
 note Numeric T labels and @ references resolve through a growable anonymous file, with checked signed SOPP offsets.
 note The producer uses stdout and a seekable instruction-table argument. Exit 2 usage, 3 I/O,
@@ -55,8 +55,9 @@ note 4 label count, 5 pass (0=labels, 1=validate, 2=emit), 6 output cursor, 7 ou
 note 9 metadata start, 10 ELF total size, 11 section headers, 12 names start,
 note 13 symtab start, 14 dynsym start, 15 dynamic start, 16 code start, 17 note size, 18 strtab start.
 note 19 count-only mode for metadata sizing, 20 metadata payload size, 21 SysV hash start, 22 input fill.
-global gs ulong 30
+global gs ulong 32
 note 23 byte cursor, 24 emit arguments, 25 argument count, 26/27 last name span, 28 K seen, 29 argument end.
+note 30 format-file fd, 31 format count. Format IDs have no fixed table-capacity ceiling.
 note cfg: name span, kernarg size/alignment, group/private bytes, SGPR/VGPR/AGPR count,
 note maximum workgroup/wave size, rsrc3/rsrc1/rsrc2/properties. These are table data, not kernel switches.
 global cfg ulong 15
@@ -64,12 +65,10 @@ global nb uchar 4096
 note These are flushing I/O buffers, never input/output capacity limits.
 global ib uchar 4096
 global ob uchar 4096
-global forms ulong 8
-global bases ulong 16
-global masks ulong 16
-global counts ulong 8
-note Each field is word-index/shift/width; <=64 fields is the actual 64-bit instruction boundary.
-global fields ulong 1536
+note One format record: ID, word count, field count, two bases, two masks, 64 field triples.
+note Its fixed byte size derives from the 64-bit instruction boundary, not the number of formats.
+global fr uchar 1592
+text fmtname "gfx942-formats"
 global lb uchar 16
 text labname "gfx942-labels"
 fn labword off ulong to ulong
@@ -225,18 +224,52 @@ bad
 end
 ret v
 end
-fn format to ulong
-v = number
-if or lt v 1 gt v 8
+fn fpos f ulong k ulong to long
+if gt f div sub ulong 0x7fffffffffffffff 1591 1592
 bad
 end
-ret sub v 1
+ret long add mul f 1592 mul k 8
 end
-fn fieldidx f ulong k ulong to ulong
+fn fg f ulong k ulong to ulong
+r = pread int get gs 30 lb 0 8 fpos f k
+if ne r 8
+die 3 ioerr
+end
+ret labword 0
+end
+fn fs f ulong k ulong v ulong to void
+for i ulong 8
+put lb i uchar and shr v mul i 8 255
+end
+r = pwrite int get gs 30 lb 0 8 fpos f k
+if ne r 8
+die 3 ioerr
+end
+end
+fn format to ulong
+id = number
+if eq id 0
+bad
+end
+for i ulong get gs 31
+if eq fg i 0 id
+ret i
+end
+end
+f = get gs 31
+r = pwrite int get gs 30 fr 0 len fr fpos f 0
+if ne r long len fr
+die 3 ioerr
+end
+fs f 0 id
+put gs 31 add f 1
+ret f
+end
+fn fieldidx k ulong to ulong
 if ge k 64
 bad
 end
-ret mul add mul f 64 k 3
+ret add 7 mul k 3
 end
 fn bitmask w ulong to ulong
 if or eq w 0 gt w 32
@@ -245,10 +278,10 @@ end
 ret sub shl ulong 1 w 1
 end
 fn cell f ulong wd ulong to ulong
-if ge wd get forms f
+if ge wd fg f 1
 bad
 end
-ret add mul f 2 wd
+ret wd
 end
 fn setfield f ulong wd ulong shift ulong width ulong value ulong to void
 if gt shift 31
@@ -263,11 +296,11 @@ bad
 end
 ix = cell f wd
 m = shl m shift
-if ne and get masks ix m 0
+if ne and fg f add 5 ix m 0
 bad
 end
-put masks ix or get masks ix m
-put bases ix or get bases ix shl value shift
+fs f add 5 ix or fg f add 5 ix m
+fs f add 3 ix or fg f add 3 ix shl value shift
 end
 fn emitword v ulong to void
 p = get gs 2
@@ -284,7 +317,7 @@ v = ulong 0
 if eq token 64
 advance
 id = number
-if ne f 3
+if ne fg f 0 4
 bad
 end
 if gt get gs 5 0
@@ -296,13 +329,16 @@ end
 ret v
 end
 fn inst f ulong to void
-w0 = get bases mul f 2
-w1 = get bases add mul f 2 1
-for k ulong get counts f
-ix = fieldidx f k
-wd = get fields ix
-sh = get fields add ix 1
-bw = get fields add ix 2
+if eq fg f 1 0
+bad
+end
+w0 = fg f 3
+w1 = fg f 4
+for k ulong fg f 2
+ix = fieldidx k
+wd = fg f ix
+sh = fg f add ix 1
+bw = fg f add ix 2
 v = operand f
 if gt v bitmask bw
 bad
@@ -315,7 +351,7 @@ w1 = or w1 v
 end
 end
 emitword w0
-if eq get forms f 2
+if eq fg f 1 2
 emitword w1
 end
 end
@@ -405,14 +441,7 @@ put gs 23 0
 put gs 25 0
 put gs 28 0
 put gs 29 0
-for i ulong len forms
-put forms i 0
-put counts i 0
-end
-for i ulong len bases
-put bases i 0
-put masks i 0
-end
+put gs 31 0
 r = fseek int get gs 0 0 0
 if ne r 0
 die 3 ioerr
@@ -441,10 +470,10 @@ n = number
 if or lt n 1 gt n 2
 bad
 end
-if ne get forms f 0
+if ne fg f 1 0
 bad
 end
-put forms f n
+fs f 1 n
 else
 if eq c 66
 f = format
@@ -457,24 +486,21 @@ else
 if eq c 68
 f = format
 k = number
-if ne k get counts f
+if ne k fg f 2
 bad
 end
-ix = fieldidx f k
+ix = fieldidx k
 wd = number
 sh = number
 bw = number
 setfield f wd sh bw 0
-put fields ix wd
-put fields add ix 1 sh
-put fields add ix 2 bw
-put counts f add k 1
+fs f ix wd
+fs f add ix 1 sh
+fs f add ix 2 bw
+fs f 2 add k 1
 else
 if eq c 73
 f = format
-if eq get forms f 0
-bad
-end
 inst f
 else
 if eq c 76
@@ -954,6 +980,11 @@ if lt lf 0
 die 3 ioerr
 end
 put gs 3 ulong lf
+ff = memfd fmtname 0 len fmtname 0
+if lt ff 0
+die 3 ioerr
+end
+put gs 30 ulong ff
 table
 put gs 5 1
 table
@@ -964,6 +995,10 @@ if ne r 0
 die 3 ioerr
 end
 r = fclose int get gs 3
+if ne r 0
+die 3 ioerr
+end
+r = fclose int get gs 30
 if ne r 0
 die 3 ioerr
 end
