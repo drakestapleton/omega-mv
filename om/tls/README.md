@@ -258,6 +258,7 @@ been submitted to a laboratory, there is no CMVP certificate, and nothing here i
   Resolver configuration accepts only an opened regular file: nonblocking open avoids waiting on
   FIFOs, and fstat checks the type on that same descriptor, not on a raceable path. Its initial
   nonnegative signed-64-bit file size defines the finite read extent; there is no software byte cap.
+  A regular file reporting size 0 is read as empty (including procfs-style content-bearing files).
   Later appends do not extend the read; a short EOF, read error or close error refuses even after
   selecting an address. This is not an atomic snapshot of concurrent content rewrites. 4096 bytes
   is only an I/O chunk. Parser state crosses chunk boundaries and the initial extent finalizes a
