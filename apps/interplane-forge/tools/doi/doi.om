@@ -1,6 +1,7 @@
 om2
 note tools/doi/doi.om: the engine of tools/doi/doi.sh, which reserves a Zenodo DOI for a paper
 note repository. doi.sh is the command authors run; it calls these subcommands:
+note   snapshot INPUT OUTPUT  copy a nofollow regular descriptor into an exclusive private output
 note   token                  ZENODO_TOKEN is set and safe inside a quoted curl config line (never printed)
 note   base MODE              the API base for MODE, sandbox (the default of doi.sh) or production
 note   check REPO FILE...     .zenodo.json, LICENSE and the files to upload; every problem on stderr, exit 1
@@ -26,10 +27,11 @@ text tnl "\n"
 text tsp " "
 text tind "  "
 text tcolon ": "
-text tusage "usage: doi token | base MODE | check REPO FILE... | body REPO | pick MODE FILE WHAT | setdoi MODE REPO DOI | consent MODE DOI\n(MODE is sandbox or production. Authors run tools/doi/doi.sh, not this program.)\n"
+text tusage "usage: doi token | base MODE | snapshot INPUT OUTPUT | check REPO FILE... | body REPO | pick MODE FILE WHAT | setdoi MODE REPO DOI | consent MODE DOI\n(MODE is sandbox or production. Authors run tools/doi/doi.sh, not this program.)\n"
 text wtoken "token"
 text wbase "base"
 text wcheck "check"
+text wsnap "snapshot"
 text wbody "body"
 text wpick "pick"
 text wsetdoi "setdoi"
@@ -102,7 +104,7 @@ text mnolic "no LICENSE file at the top of the repository (LICENSE, LICENSE.md, 
 text mnofile "no file to upload: put the paper's PDF at the top of the repository"
 text mnopdf "no PDF among the files to upload: the paper's PDF is required"
 text mfname "a file name may hold only A-Z a-z 0-9 - . _ and must not start with a dot: "
-text mnotreg "not a non-empty regular file: "
+text mnotreg "not a non-empty regular file, or a symlink (refused): "
 text mdup "two files to upload share the name "
 text mlong "an argument is longer than 4095 bytes"
 text mmode "MODE must be sandbox or production, not "
@@ -670,7 +672,7 @@ end
 
 note slurp: the whole file p into gj; its permission bits into gmode
 fn slurp p view uchar * to void
-fd = fopen p 0 len p 524288 0
+fd = openreg p
 if lt fd 0
 die2 mopen p
 end
@@ -821,22 +823,92 @@ end
 end
 
 note ---- files
-note regfile: p names a regular file with at least one byte (opened non-blocking: a FIFO never waits)
-fn regfile p view uchar * to bool
-fd = fopen p 0 len p 526336 0
+note openreg: O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW on Linux AArch64 (asm/fcntl.h).
+note Opening and fstat use the same descriptor: no stat/open symlink race, and no FIFO wait.
+fn openreg p view uchar * to long
+fd = fopen p 0 len p or int 526336 32768 0
 if lt fd 0
-ret false
+ret -1
 end
 st = new uchar 128 0
 x = fstat int fd st 0 128
+if ge x 0
+if eq and rd32 st 16 61440 32768
+if gt rd64 st 48 0
+ret fd
+end
+end
+end
 y = fclose int fd
-if lt x 0
+ret -1
+end
+
+fn regfile p view uchar * to bool
+fd = openreg p
+if lt fd 0
 ret false
 end
-if ne and rd32 st 16 61440 32768
+x = fclose int fd
+ret true
+end
+
+note copyfd: descriptor to descriptor; the caller never reopens the input path after its check
+fn copyfd inf int outf int to bool
+buf = new uchar 65536 0
+total = ulong 0
+while true bound 9223372036854775807
+r = read inf buf 0 len buf
+if eq r -4
+continue
+end
+if lt r 0
 ret false
 end
-ret gt rd64 st 48 0
+if eq r 0
+ret gt total 0
+end
+n = ulong 0
+while lt n ulong r bound 9223372036854775807
+k = write outf buf n sub ulong r n
+if eq k -4
+continue
+end
+if le k 0
+ret false
+end
+n = add n ulong k
+end
+total = add total ulong r
+end
+ret false
+end
+
+note snapshot INPUT OUTPUT: freeze a checked nofollow descriptor into an exclusive private file.
+fn dosnap ac ulong to int
+if ne ac 4
+usg
+end
+p = new uchar 4096 0
+o = new uchar 4096 0
+pn = getarg 2 p
+on = getarg 3 o
+inf = openreg part p 0 pn
+if lt inf 0
+die2 mnotreg part p 0 pn
+end
+outf = fopen o 0 on 524481 384
+if lt outf 0
+x = fclose int inf
+die2 mwrite part o 0 on
+end
+ok = copyfd int inf int outf
+x = fclose int inf
+y = fclose int outf
+if or not ok or lt x 0 lt y 0
+z = unlink o 0 on
+die2 mwrite part o 0 on
+end
+ret 0
 end
 
 fn bname p view uchar * to ulong
@@ -1462,6 +1534,9 @@ ret dotoken
 end
 if beq part c 0 k wbase
 ret dobase ac
+end
+if beq part c 0 k wsnap
+ret dosnap ac
 end
 if beq part c 0 k wcheck
 ret docheck ac
