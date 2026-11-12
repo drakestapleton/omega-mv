@@ -255,9 +255,14 @@ been submitted to a laboratory, there is no CMVP certificate, and nothing here i
   RCODE 0); only A records whose owner is the queried name, or the target of a CNAME chain from
   it (case-insensitive compare), are used; a name over 127 labels or a looping pointer is
   `TLS_ERR_DNS`, never a trap.
+  Resolver configuration is streamed through EOF; 4096 bytes is only an I/O chunk, not a file or
+  line limit. Parser state crosses chunk boundaries and EOF finalizes a line without LF. Only the
+  fixed keyword and an IPv4 token are retained (four three-digit octets and three dots: at most
+  15 bytes); arbitrarily long comments, blanks and rejected tokens need no growing allocation.
+  The first valid IPv4 nameserver wins. An open, read or close error returns `TLS_ERR_DNS`.
 - Caller-contract traps (not reachable by a peer): `tls_dial` with a hostname longer than the
-  query buffer (validate it with `tls_init` first), `tls_write` of more than 16 GB at once,
-  `/etc/resolv.conf` with more than 4096 consecutive blanks. A trust bundle larger than `TLSTSZ`
+  query buffer (validate it with `tls_init` first), `tls_write` of more than 16 GB at once.
+  A trust bundle larger than `TLSTSZ`
   fails closed.
 
 ## Side channels: what is and is not constant time
@@ -349,6 +354,10 @@ How the suites are built:
     (a full TLS 1.3 server in Python that misbehaves after a valid handshake), all on 127.0.0.1.
     Ports already in use are skipped. Every failure row also checks that `tls_close` leaves the
     connection failed.
+  - `resolv.py OMC` composes `resolv.om` with a private resolver path (never edits the host file).
+    It covers lines straddling and beyond the old window, no trailing newline, long comments/blanks/
+    rejected tokens, first-address selection, malformed/empty and unreadable files. Restoring the
+    single 4096-byte read must fail these same cases. `test/tls/run.sh` includes this gate.
   - `dnsunit.om` runs the 23 cases of `vectors/dns.txt` (`gen_dns.py`): 21 DNS answers and two
     host names over 253 bytes that `dns_a4` must refuse before building its query.
   - `TLS_NET=1` adds the live checks. The handshakes reach api.github.com (ECDSA P-256 chain),
