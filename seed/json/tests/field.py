@@ -2,6 +2,10 @@
 # Test instrument only. Invoke raw function-mode Omega using its documented pointer/length slots.
 # Sparse anonymous mappings supply real 4 GiB source views, touching only first/last pages. This is
 # host-ABI evidence, not a claim that a seeded-Omega caller can construct/pass that source today.
+def gate_require(condition, detail):
+    if not condition:
+        raise RuntimeError(detail)
+
 import argparse
 import ctypes as C
 import json
@@ -78,7 +82,7 @@ def native(binary, op):
         src[page-2:page] = b'xx'
         libc = C.CDLL(None)
         libc.mprotect.argtypes = [C.c_void_p,C.c_size_t,C.c_int]
-        assert libc.mprotect(pointer+page,2097152-page,0) == 0
+        gate_require(libc.mprotect(pointer+page,2097152-page,0) == 0, 'gate condition failed')
         f = C.CFUNCTYPE(C.c_int64,C.c_void_p,C.c_uint64)(address)
         print(f(pointer+page-2,1000001),flush=True)
         return
@@ -105,7 +109,7 @@ def native(binary, op):
     print(f(pointer,MAX,MAX-1),flush=True)
 
 
-def check(omc, directory, units):
+def check(omc, directory, units, wrong_expectation=False):
     directory = Path(directory)
     directory.mkdir(parents=True,exist_ok=True)
     for name,wrapper in WRAPPERS.items():
@@ -113,7 +117,7 @@ def check(omc, directory, units):
         (directory/(name+'.om')).write_text(program)
         r = subprocess.run([str(Path(omc).resolve())],input=program.encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         (directory/(name+'.err')).write_bytes(r.stderr)
-        assert r.returncode == 0, (name,r.returncode,r.stderr)
+        gate_require(r.returncode == 0, (name,r.returncode,r.stderr))
         (directory/name).write_bytes(r.stdout)
     cases = [
       ('stop-copy','stop-copy',-21),('stop-string','stop-string',-21),
@@ -124,6 +128,8 @@ def check(omc, directory, units):
       ('end','end',MAX),('end-bad','end',0),
       ('float','float',4607182418800017408),('write','write',49),
     ]
+    if wrong_expectation:
+        cases[0]=('stop-copy','stop-copy',-22)
     failures=[]
     for op,unit,want in cases:
         r = subprocess.run([sys.executable,__file__,'--native',str(directory/unit),op],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
@@ -140,10 +146,12 @@ if __name__ == '__main__':
     else:
         p=argparse.ArgumentParser()
         p.add_argument('omc');p.add_argument('out');p.add_argument('--ref')
+        p.add_argument('--wrong-expectation',action='store_true')
         a=p.parse_args()
         j=Path(__file__).resolve().parent.parent
         if a.ref:
             units={u:subprocess.check_output(['git','-C',str(j),'show',a.ref+':seed/json/'+u],text=True) for u in ('json.om','jsonw.om','jsonf.om')}
         else:
             units={u:(j/u).read_text() for u in ('json.om','jsonw.om','jsonf.om')}
-        raise SystemExit(1 if check(a.omc,a.out,units) else 0)
+        raise SystemExit(1 if check(a.omc,a.out,units,a.wrong_expectation) else 0)
+

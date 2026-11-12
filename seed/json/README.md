@@ -289,6 +289,12 @@ The oracle differs from CPython in four documented places. CPython accepts all o
 CPython is a test-only referee, fixture generator and driver. The original corpus oracle writes no
 compiled implementation. The growth/field instruments compose the hand-written Omega driver/wrappers
 and explicit source mutants; all JSON implementation and conversion remains seeded Omega.
+All acceptance and mutant checks use explicit failure branches, not Python assertions. Test execution,
+including mprotect in the native guard probes, is never removed by PYTHONOPTIMIZE. Each Python gate
+accepts --wrong-expectation to make one expected result deliberately wrong; running that control
+with PYTHONOPTIMIZE=1 must fail. The existing corpus generator and local evidence instruments use
+the same unconditional-check rule. Long balanced exact midpoint cases straddle zero/min-subnormal,
+subnormal/normal and finite/overflow rounding thresholds, with both signs and both mantissa forms.
 The gate prints `SOURCE`, compiler/source hashes, and a final PASS naming the checkout head; retain
 that output from a clean committed tree as the exact-head receipt.
 

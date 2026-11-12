@@ -108,6 +108,20 @@ echo 'PASS oversized driver input refused (93)'
 # 4b. Above-old-limit reader, writer and formatter parity; EOF/error/overflow and true uint
 # field edges through documented native function-mode slots; every new defect has a killed twin.
 $LOW python3 "$J/tests/growing.py" "$OMC" "$B/growing" || fail 'growing consumer/boundary cases'
+# Optimization must not remove either test execution or enforcement. Require the deliberate
+# expectation failure specifically, not an arbitrary compile/setup failure with the same exit.
+set +e
+$LOW env PYTHONOPTIMIZE=1 python3 "$J/tests/growing.py" "$OMC" "$B/optimized-growth-control" --wrong-expectation > "$B/optimized-growth-control.log" 2>&1
+orc=$?
+set -e
+[ "$orc" = 1 ] && grep -q 'RuntimeError: reader expectation mismatch' "$B/optimized-growth-control.log" || fail 'optimized growth wrong-expectation survived or failed for another reason'
+echo 'PASS optimized growing wrong expectation rejected (1)'
+set +e
+$LOW env PYTHONOPTIMIZE=1 python3 "$J/tests/field.py" "$OMC" "$B/optimized-field-control" --wrong-expectation > "$B/optimized-field-control.log" 2>&1
+orc=$?
+set -e
+[ "$orc" = 1 ] && grep -q 'FAIL field/stop-copy rc=0 got=-21 want=-22' "$B/optimized-field-control.log" || fail 'optimized field wrong-expectation survived or failed for another reason'
+echo 'PASS optimized field wrong expectation rejected (1)'
 
 # 5. Mutants: each must make the parity run fail.
 mutant() { # name file old new
