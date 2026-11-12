@@ -301,6 +301,17 @@ restart, compare `\OLLM\OUT.TXT` with `efi-check.sh` as above. Status and receip
 The model runs on the processor only: the GPU commands need the Linux NVIDIA driver and are not in
 this image.
 
+### Typing to the model on the bare machine
+
+A job line `ask CK SEED N TEMPMILLI [MERGES]` in `\OLLM\JOB.TXT` turns the machine's own keyboard and
+screen into a conversation: the image prints `You: `, you type a line and press Enter, and the model
+continues it with N tokens (the same computation as `sample CK SEED+turn N TEMPMILLI LINE [MERGES]`).
+Backspace removes a character. An empty line, Esc, or ten minutes without a key ends it, and the
+image goes on as after any job. Everything typed and answered is also in `\OLLM\OUT.TXT`. Both UEFI
+images have it (x86efi and a64efi); the Linux programs do not, and no recorded job file uses it.
+`tests/omegallm/a64efi-receipts.sh` types two lines on the virtual console and requires both answers
+to equal the Linux build's `sample` output (row `ask`). On a physical keyboard it is NOT_RUN.
+
 ## Throughput
 
 All timings ran on Spark GB10 Grace core 6. `host.txt` records its `midr_el1` (0x410fd851, Arm part
