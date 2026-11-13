@@ -50,9 +50,14 @@ checked on measured inputs, not asserted for arbitrary floating-point states.
 ## Verification
 
 ```sh
-OMC=/path/to/pinned/omc OUT=/private/build CORE=4 sh tests/omegallm/build.sh
-python3 tests/omegallm/grow-check.py /private/build /path/to/pinned/omc
+python3 tests/omegallm/grow-gate.py compilers.json /private/growth-gate --core 4
 ```
+
+The release gate discovers the targets from `build.sh`, requires a local JSON
+object mapping every target name to its pinned compiler path, builds every target,
+and then runs the host growth checks. Keep the a64efi compiler with its existing
+`../a64efi/efirt.om` companion. Missing compilers or a failed target stop the gate.
+Compiling the GPU and EFI targets is not a claim of running growth on them.
 
 The external Python instrument reuses the repository's independent checkpoint,
 initialization and forward/backward oracle. It tests both checkpoint versions,
@@ -60,8 +65,10 @@ all preserved tensors, deterministic growth, sampled-token and held-out-loss
 preservation, gradients and actual updates in new branches, training-resume
 identity, repeated growth to the current depth boundary, invalid inputs and
 non-finite weights. It repeats the checks with the existing reduced-bank geometry.
-Six compiled negative controls must be caught: nonzero attention/FFN outputs,
-missing old weights, lost final gain, stale optimizer state and dead new inputs.
+Compiled negative controls must be caught: nonzero attention/FFN outputs,
+missing old weights, lost final gain, stale optimizer state, lost signed-zero bits
+and dead new inputs. Preservation compares packed tensor bytes and includes a
+negative-zero source weight.
 Python is not a product dependency.
 
 Before promoting any grown checkpoint, train it and compare it with its source
