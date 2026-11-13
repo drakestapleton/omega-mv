@@ -147,9 +147,10 @@ for target in ('a64','x86'):
             src=f'global H uchar {n}\nfn main to int\nv = kfdctl neg int 1 {q} H 0 {n}\nret 0\nend\n'
             compile_case('sibling-refusal-'+name,src,target,9)
     # One writable handle named as both write and read pointer selects the AMD queue object:
-    # the compiler binds base+56 and base+128 and requires 256 bytes; distinct handles stay base-only.
+    # the compiler binds base+56 and base+128 and requires the 2304-byte amd_queue_v2_t;
+    # distinct handles stay base-only.
     for label,setup,suffix in [('queue-object-shared-ring',None,None),
-                               ('queue-object-exact-256',qsetup(256),' r q q long 0 long 0'),
+                               ('queue-object-exact-2304',qsetup(2304),' r q q long 0 long 0'),
                                ('queue-base-distinct',qsetup(4096)+'p = mapnew neg int 1 0 4096 3 34\n',' r q p long 0 long 0')]:
         execute(label,compile_case(label,source('CREATE_QUEUE',setup_override=setup,suffix_override=suffix),target),target)
     dynamic_size=source('GET_VERSION',size='bad').replace('fn main to int\n','fn main to int\nbad = ulong 7\n')
@@ -168,7 +169,7 @@ for target in ('a64','x86'):
     objq=' r q q long 0 long 0'
     for kind in (0,1):
         bads.append(('queue-object-type-'+str(kind),source('CREATE_QUEUE',put(40,kind),setup_override=qsetup(4096),suffix_override=objq),103,0))
-    for size in (48,100,255):
+    for size in (48,100,255,256,2303):
         bads.append(('queue-object-short-'+str(size),source('CREATE_QUEUE',setup_override=qsetup(size),suffix_override=objq),103,0))
     bads.append(('queue-object-readonly',source('CREATE_QUEUE',setup_override=qsetup(4096,1),suffix_override=objq),103,0))
     bads.append(('queue-object-stale',source('CREATE_QUEUE','drop = mapdrop q\n',setup_override=qsetup(4096),suffix_override=objq),103,0))
@@ -321,7 +322,9 @@ mutants.extend([
     ('queue-object-range', [('kbind','kfdtrap 8\nnote Subtract only after offset <= length; the existing extent check sees remaining bytes.','note Subtract only after offset <= length; the existing extent check sees remaining bytes.')],
      source('CREATE_QUEUE',setup_override=qsetup(48),suffix_override=' r q q long 0 long 0'),False),
     ('queue-object-extent', [('kbind','kfdtrap 8\nif eq get xtarget 0 0\nmstore 13 31 div off 8','if eq get xtarget 0 0\nmstore 13 31 div off 8')],
-     source('CREATE_QUEUE',setup_override=qsetup(255),suffix_override=' r q q long 0 long 0'),False),
+     source('CREATE_QUEUE',setup_override=qsetup(2303),suffix_override=' r q q long 0 long 0'),False),
+    ('queue-object-v1-extent', [('kctl','shl ulong 2248 48','shl ulong 200 48'),('kctl','shl ulong 2176 48','shl ulong 128 48')],
+     source('CREATE_QUEUE',setup_override=qsetup(256),suffix_override=' r q q long 0 long 0'),False),
     ('literal-size', [('kctl','if ne a_g 77 add x 11 n\nfail 9','if ne a_g 77 add x 11 n\nnote planted missing literal refusal'),
                       ('kctl','kfdcmpv 0 n\nkfdtrap 1','kfdcmpv 0 n')],
      source('GET_VERSION',size=7),False),
