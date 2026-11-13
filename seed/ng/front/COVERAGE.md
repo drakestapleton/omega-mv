@@ -260,3 +260,10 @@ getprio 240 (IMPLEMENTED, host-EXERCISED by gate-front-ir, gate-front and gate-i
 ngcheck have 99 rows (class `sched`); host-audit's closed id set ends at 240 (HOSTTABLE rows=99
 differences=0). ngcheck accepts each lowered program; ngrun refuses cpuset, cpuget, setprio and getprio as
 115 and cpunow as 120, so their behavior under ngrun is NOT_RUN. Refusals: cpuget on a text (20), a long pid (7).
+
+## Executable-contract completion follow-on
+
+The earlier contract-safety section records the previous refusal boundary. The current lowerer
+executes checked function and loop prefixes; see front/README.md for ordering and release policy.
+The canonical compiler contract manifest feeds the differential gate directly. Function mode,
+struct/layout/nominal lowering and runtime-pool lowering are separate remaining work.

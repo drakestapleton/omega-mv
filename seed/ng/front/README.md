@@ -246,22 +246,24 @@ checked but not executed: behavior parity for it stays NOT_RUN. The C column fol
 trap-first rules (empty paths are not one path component: 119; malformed packets and empty stat paths
 trap 3 natively and in ngrun: 0; a negative descriptor gets -9 without a kernel call in both: 0).
 
-## Native contracts: fail-closed lowering boundary
+## Executable contracts
 
-The check pass validates native contracts, but the M1 lowering does not implement them. Every
-`requires`, `ensures` and `invariant` clause is therefore refused in front-ir with the existing
-not-lowered exit 64, before any IR is written. A short clause word must never be interpreted as
-an ordinary assignment that silently removes its runtime check. OM-1 names retain their meaning.
+The check pass still validates every clause. Lowering consumes the validated function and loop
+prefixes. `requires` is a `chk.true` with trap 9 at entry; `ensures` is trap 10 at every normal
+explicit or implicit return. The return expression is evaluated once. Postconditions see the
+current values of names visible at entry, and `result` only while checking a value return.
 
-The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
-the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
+Loop invariants run at the loop head before its condition, including zero trips and the final
+false condition. Continue returns to that head (through the increment for a `for`); break,
+exit and trap do not add contract checks. Release mode consumes predicates without evaluating
+them. Diagnostic mode preserves the check pass's diagnostic stream. A contract clause outside
+these supported prefix paths still encounters the central not-lowered guard.
 
-    gate-front seed/out/omc "$(cut -d' ' -f1 seed/out/omc.sha256)" \
-      units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
-      seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
-      seed/ng/front/cases-contract-scope.txt
+The front IR gate imports runtime, refusal and diagnostic fixture sources directly from
+`seed/omc/contracts/contracts.cases`, so there is no separate fixture inventory to maintain.
+Three enforcement mutants remove function checks, postconditions, and loop invariants.
+The native and interpreter differential also covers side effects before a failing check.
+Function-mode units remain outside this program-entry lowering. Constant-true predicates are
+semantically preserved; matching omc's proof-erased output bytes is not claimed.
 
-Its guard-removal mutant restores the silent path and must be KILLED. This is a scope-safety gate,
-not contract execution parity. Before the guard, these fixtures emitted IR and ran without the
-required trap. Real lowering must replace this boundary with chk.true checks at entry, every
-normal return and each loop head, with the seeded debug/release policy and trap codes.
+Implementation: OpenAI Codex, assigned NG completion lane.
