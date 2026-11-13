@@ -1378,22 +1378,27 @@ success, negative Linux errno otherwise. No device is opened implicitly.
 - `kfdmap fd offset n` maps `n` bytes read/write and shared, without choosing
   an address. `fd` is `int`; offset and length are `ulong`; zero length traps
   3. Use the DRM render fd for buffer offsets and `/dev/kfd` for doorbells,
-  according to the kernel's returned offsets. The kernel validates the fd
-  and mapping offset. The CPU gate also exercises this mapping with an
-  ordinary file; it does not claim that every fd is a KFD descriptor.
+  according to the kernel's returned offsets. Before mmap, fstat must identify
+  a character device: DRM major 226 with render minor at least 128, or the same
+  device number as stat(`/dev/kfd`). Invalid fds, ordinary files and other
+  character devices trap 3. The span is nonzero and uses the full `ulong` length;
+  the kernel enforces mapping-offset, page, address-space and device boundaries.
+  No 32-bit truncation or arbitrary 64 GiB KFD mapping cap is applied.
 - `kfdctl fd request H off n ...` uses a writable `uchar` header span.
   `request` is a literal `uint` from the KFD 1.14 allowlist; an unknown or
-  nonliteral request is error 9. The header length must equal that request's
-  ABI size (trap 3 otherwise). Normal array-span bounds checks also apply.
+  nonliteral request is error 9. A literal header length unequal to the request's
+  ABI size is error 9; a computed unequal length traps 3 before the ioctl.
+  Normal array-span bounds checks also apply.
 
 The allowlist covers GET_VERSION, ACQUIRE_VM, GET_PROCESS_APERTURES_NEW,
 CREATE_QUEUE, DESTROY_QUEUE, ALLOC_MEMORY_OF_GPU, FREE_MEMORY_OF_GPU,
 MAP_MEMORY_TO_GPU, UNMAP_MEMORY_FROM_GPU, CREATE_EVENT, DESTROY_EVENT and
-WAIT_EVENTS. It also covers SET_SCRATCH_BACKING_VA and RUNTIME_ENABLE:
-Linux `kfd_ioctl.h` defines their records at lines 355–359 and 976–980 and
-their ioctl macros at 1516–1517 and 1576–1577 in the installed header used
-by `tests/kfd/check.py`. That test compiles the C UAPI as an independent
-oracle and compares the emitted immediates; the compiler does not include C.
+WAIT_EVENTS. It also covers SET_SCRATCH_BACKING_VA:
+Linux `kfd_ioctl.h` defines its record at lines 355–359 and its ioctl macro at
+1516–1517 in the installed header used by `tests/kfd/check.py`. That test compiles
+every AMDKFD_IOC request macro as an independent C UAPI oracle, compares emitted
+immediates for admitted requests and requires compile error 9 for every sibling,
+including RUNTIME_ENABLE, DBG_TRAP and SET_TRAP_HANDLER. The compiler includes no C.
 
 The suffix depends on the request:
 
@@ -1405,7 +1410,6 @@ The suffix depends on the request:
 | ALLOC_MEMORY_OF_GPU | `R`: live reservation handle; requested size must fit; USERPTR flag refused |
 | SET_SCRATCH_BACKING_VA | `R`: live reservation handle |
 | CREATE_QUEUE | `ring wptr rptr eop ctx`: live read/write handles; ring size at least 1024 and a power of two, ring/eop/context declared sizes fit, pointer buffers contain at least 8 bytes; zero eop/context handles require zero declared sizes |
-| RUNTIME_ENABLE | `debug`: read/write handle, or `long 0` for NULL |
 | Other requests | No suffix; ACQUIRE_VM verifies its `drm_fd` with fstat as a DRM render character descriptor (major 226, minor at least 128) |
 
 **Address-binding rule:** every caller-supplied address field must be zero.
@@ -1441,8 +1445,8 @@ Both are checked separately. CPU/emulator acceptance is not AMD device
 qualification; all device rows remain NOT_RUN until an authorized device run.
 The native AArch64 ptrace oracle observes every bound address at the syscall
 boundary and poisons private output pointer fields after a real EBADF; caller
-pointer bytes must remain zero. Five independently compiled compiler mutants
-remove request, size, address, kind or OM-2 function-mode refusals and must be
+pointer bytes must remain zero. Independently compiled compiler mutants
+remove request, literal/dynamic size, address, kind, fd-class or function-mode refusals and must be
 detected. `--record-history` appends measured compiler facts to the existing
 size ledger only after the CPU gate passes; it never rewrites historical rows.
 

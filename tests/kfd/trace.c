@@ -76,7 +76,6 @@ int main(int argc, char **argv) {
                     offsets[count++]=8; expected=payload; break;
                 case AMDKFD_IOC_ALLOC_MEMORY_OF_GPU:
                 case AMDKFD_IOC_SET_SCRATCH_BACKING_VA:
-                case AMDKFD_IOC_RUNTIME_ENABLE:
                     offsets[count++]=0; break;
                 case AMDKFD_IOC_CREATE_QUEUE:
                     offsets[count++]=0; offsets[count++]=8; offsets[count++]=16;

@@ -7,6 +7,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,9 +31,11 @@ def record(name, actual, want, detail=''):
 names = ['GET_VERSION','ACQUIRE_VM','GET_PROCESS_APERTURES_NEW','CREATE_QUEUE',
          'DESTROY_QUEUE','ALLOC_MEMORY_OF_GPU','FREE_MEMORY_OF_GPU',
          'MAP_MEMORY_TO_GPU','UNMAP_MEMORY_FROM_GPU','CREATE_EVENT','DESTROY_EVENT',
-         'WAIT_EVENTS','SET_SCRATCH_BACKING_VA','RUNTIME_ENABLE']
+         'WAIT_EVENTS','SET_SCRATCH_BACKING_VA']
+header = Path('/usr/include/linux/kfd_ioctl.h').read_text()
+all_names = re.findall(r'^#define AMDKFD_IOC_(\w+)\s', header, re.M)
 csrc = '#include <stdio.h>\n#include <linux/kfd_ioctl.h>\nint main(void){\n'
-for name in names:
+for name in all_names:
     csrc += f'printf("{name} %lu %lu\\n", (unsigned long)AMDKFD_IOC_{name}, (unsigned long)_IOC_SIZE(AMDKFD_IOC_{name}));\n'
 csrc += 'return 0; }\n'
 (out/'abi.c').write_text(csrc)
@@ -56,7 +59,6 @@ def shape(name):
     if name in ('ALLOC_MEMORY_OF_GPU','SET_SCRATCH_BACKING_VA'):
         setup='r = kfdres 2097152\n'; suffix=' r'
         if name=='ALLOC_MEMORY_OF_GPU': setup+=put(8,4096,8)+put(36,2)
-    if name=='RUNTIME_ENABLE': suffix=' long 0'
     if name=='CREATE_QUEUE':
         setup='r = mapnew neg int 1 0 4096 3 34\n'+put(32,4096)+put(40,2)
         suffix=' r r r long 0 long 0'
@@ -111,8 +113,15 @@ for target in ('a64','x86'):
             found=(hex(q) in dis) if target=='x86' else (hex(q&65535) in dis and hex(q>>16) in dis)
             record(target+' UAPI immediate '+name,0 if found else 1,0,hex(q))
         print('NOT_RUN device '+target+' '+name+' no authorized AMD device')
+    for name in all_names:
+        if name not in names:
+            q,n=abi[name]
+            src=f'global H uchar {n}\nfn main to int\nv = kfdctl neg int 1 {q} H 0 {n}\nret 0\nend\n'
+            compile_case('sibling-refusal-'+name,src,target,9)
+    dynamic_size=source('GET_VERSION',size='bad').replace('fn main to int\n','fn main to int\nbad = ulong 7\n')
     bads=[('wrong-request',source('GET_VERSION',request=0),0,9),
-          ('wrong-size',source('GET_VERSION',size=7),103,0),
+          ('wrong-size-literal',source('GET_VERSION',size=7),0,9),
+          ('wrong-size-dynamic',dynamic_size,103,0),
           ('ring-small',source('CREATE_QUEUE',put(32,512)),103,0),
           ('ring-nonpower',source('CREATE_QUEUE',put(32,3072)),103,0),
           ('wrong-drm-kind',source('ACQUIRE_VM'),103,0),
@@ -125,7 +134,7 @@ for target in ('a64','x86'):
     for name,offs in [('GET_PROCESS_APERTURES_NEW',[0]),('CREATE_QUEUE',[0,8,16,56,72]),
                       ('ALLOC_MEMORY_OF_GPU',[0]),('MAP_MEMORY_TO_GPU',[8]),
                       ('UNMAP_MEMORY_FROM_GPU',[8]),('WAIT_EVENTS',[0]),
-                      ('SET_SCRATCH_BACKING_VA',[0]),('RUNTIME_ENABLE',[0])]:
+                      ('SET_SCRATCH_BACKING_VA',[0])]:
         for off in offs:
             bads.append((name+'-address-'+str(off),source(name,put(off,1,8)),103,0))
     for label,src,want,ce in bads:
@@ -168,7 +177,7 @@ end
 if ne mapset r 0 8 12345 0
 ret 89
 end
-s = kfdmap int f 0 4096
+s = mapnew int f 0 4096 3 1
 if le s 0
 ret 90
 end
@@ -179,13 +188,16 @@ v = mapdrop r
 v = mapdrop s
 v = fclose int f
 v = unlink K 0 len K
-if ne kfdmap neg int 1 0 4096 neg long 9
-ret 92
-end
 ret 0
 end
 '''
     execute('mapping-large-aligned',compile_case('mapping-large-aligned',mapping,target),target)
+    regular='text K "kfd-map-refusal.bin"\nfn main to int\nf = fopen K 0 len K 578 384\nr = unlink K 0 len K\nr = kfdmap int f 0 4096\nret 0\nend\n'
+    execute('map-regular-refusal',compile_case('map-regular-refusal',regular,target),target,103)
+    null='text K "/dev/null"\nfn main to int\nf = fopen K 0 len K 2 0\nr = kfdmap int f 0 4096\nret 0\nend\n'
+    execute('map-character-refusal',compile_case('map-character-refusal',null,target),target,103)
+    invalid='fn main to int\nr = kfdmap neg int 1 0 4096\nret 0\nend\n'
+    execute('map-invalid-fd',compile_case('map-invalid-fd',invalid,target),target,103)
     for label,expr in [('reserve-zero','kfdres 0'),('reserve-unaligned','kfdres 4097'),('reserve-overflow','kfdres 18446744073709547520')]:
         execute(label,compile_case(label,'fn main to int\nr = '+expr+'\nret 0\nend\n',target),target,103)
 
@@ -197,12 +209,10 @@ if os.uname().machine=='aarch64':
         for name,offs in [('GET_VERSION',[]),('GET_PROCESS_APERTURES_NEW',[0]),
                           ('CREATE_QUEUE',[0,8,16,56,72]),('ALLOC_MEMORY_OF_GPU',[0]),
                           ('MAP_MEMORY_TO_GPU',[8]),('UNMAP_MEMORY_FROM_GPU',[8]),
-                          ('WAIT_EVENTS',[0]),('SET_SCRATCH_BACKING_VA',[0]),('RUNTIME_ENABLE',[0])]:
+                          ('WAIT_EVENTS',[0]),('SET_SCRATCH_BACKING_VA',[0])]:
             kwargs={}
             if name=='CREATE_QUEUE':
                 kwargs={'changes':put(64,64,8)+put(80,64),'suffix_override':' r r r r r'}
-            if name=='RUNTIME_ENABLE':
-                kwargs={'setup_override':'r = mapnew neg int 1 0 4096 3 34\n','suffix_override':' r'}
             s=source(name,**kwargs).replace('v = kfdctl ','w = write int 1 P 0 112\nv = kfdctl ')
             checks=''
             for off in offs:
@@ -216,6 +226,31 @@ if os.uname().machine=='aarch64':
             if b:
                 p=run([out/'trace',b])
                 record('trace '+name,p.returncode,0,p.stderr.decode())
+    p=run(['cc','-Wall','-Wextra','-Werror',root/'tests/kfd/fdtrace.c','-o',out/'fdtrace'])
+    record('fd trace oracle compile',p.returncode,0,p.stderr.decode())
+    if not p.returncode:
+        size=68721573888
+        src=f'''text K "kfd-fd-oracle"
+fn main to int
+f = memfd K 0 len K 0
+r = ftrunc int f {size}
+h = kfdmap int f 0 {size}
+if le h 0
+ret 90
+end
+r = mapset h {size-8} 8 12345
+if ne mapget h {size-8} 8 12345
+ret 91
+end
+r = mapdrop h
+ret 0
+end
+'''
+        b=compile_case('fd-trace',src,'a64')
+        if b:
+            for mode in range(7):
+                p=run([out/'fdtrace',b,mode,size])
+                record('fd trace synthetic mode '+str(mode),p.returncode,0,p.stderr.decode())
 else:
     print('NOT_RUN AArch64 native trace oracle: host is not aarch64')
 
@@ -226,7 +261,7 @@ mutants=[
     ('request', [('ksize','fail 9\nret 0','ret 8')],
      source('GET_VERSION',request=0),False),
     ('size', [('kctl','kfdcmpv 0 n\nkfdtrap 1','kfdcmpv 0 n')],
-     source('GET_VERSION',size=7),False),
+     source('GET_VERSION',size='bad').replace('fn main to int\n','fn main to int\nbad = ulong 7\n'),False),
     ('address', [('kfdzero','kfdtrap 1','note planted missing address refusal')],
      source('GET_PROCESS_APERTURES_NEW',put(0,1,8)),False),
     ('kind', [('kbind','kfdcmpv 0 kind\nkfdtrap 1','kfdcmpv 0 kind')],
@@ -234,6 +269,16 @@ mutants=[
     ('function', [(f,'if eq ok 0\nfail 9','if eq ok 0\nnote planted missing mode refusal')
                   for f in ('hostval','xhost')],
      'om2\nfn f to long\nret kfdres 4096\nend\n',True)]
+mutants.extend([
+    ('literal-size', [('kctl','if ne a_g 77 add x 11 n\nfail 9','if ne a_g 77 add x 11 n\nnote planted missing literal refusal'),
+                      ('kctl','kfdcmpv 0 n\nkfdtrap 1','kfdcmpv 0 n')],
+     source('GET_VERSION',size=7),False),
+    ('map-fd', [('kmapfd','kchar mo','note planted missing fd class refusal'),
+                ('kmapfd','kfdcmpv 1 57856','kfdcmpv 1 0'),
+                ('kmapfd','kfdcmpv 0 128','kfdcmpv 0 0')],
+     regular,False),
+    ('sibling', [('ksize','fail 9\nret 0',f'if eq q {abi["DBG_TRAP"][0]}\nret {abi["DBG_TRAP"][1]}\nend\nfail 9\nret 0')],
+     source('GET_VERSION',size=abi['DBG_TRAP'][1],request=abi['DBG_TRAP'][0]),False)])
 for label, patches, case, function in mutants:
     changed=original
     for fn,old,new in patches:
