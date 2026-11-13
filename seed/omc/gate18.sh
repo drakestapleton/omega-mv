@@ -39,8 +39,26 @@ cmp -s "$T/chain.pairs" "$T/gen.pairs" || {
     diff -u "$T/chain.pairs" "$T/gen.pairs" | sed -n '1,20p' >&2
     bad "generated keyword packs differ from the committed chain"
 }
+# The canonicalizer consumes a separate committed keyword inventory. Do not
+# regenerate that inventory in this gate: losing an entry from both files above
+# must still fail. Compare the complete ID multiset, including spelling aliases.
+awk '
+    /^text tkw1 "/ {
+        sub(/^text tkw1 "/, ""); sub(/"$/, "")
+        n=split($0, a, /\\n/)
+        for (i=1; i<=n; i++) {
+            split(a[i], p, " ")
+            if (a[i] != "" && p[2] != 133 && p[2] != 134) print p[2]
+        }
+    }
+' seed/semhash/semhash.om | sort -n > "$T/semantic.ids"
+[ -s "$T/semantic.ids" ] || bad "semantic keyword inventory is absent"
+cut -d ' ' -f 1 "$T/gen.pairs" > "$T/generated.ids"
+cmp -s "$T/generated.ids" "$T/semantic.ids" ||
+    bad "generated keyword inventory differs from committed semantic inventory"
 n=$(wc -l < "$T/gen.pairs")
-[ "$n" -gt 0 ] || bad "generator produced no literal pairs"
+expected=$(wc -l < "$T/semantic.ids")
+[ "$n" = "$expected" ] || bad "literal pair count $n differs from semantic inventory $expected"
 
 grep -q '^ret 133$' seed/omc/omc.om || bad "committed chain lacks readlnk (133)"
 grep -q '^ret 134$' seed/omc/omc.om || bad "committed chain lacks sockopt (134)"

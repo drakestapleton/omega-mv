@@ -28,6 +28,30 @@ def record(name, actual, want, detail=''):
     rows.append(dict(name=name, actual=actual, expected=want, detail=detail))
     print(('PASS' if actual == want else 'FAIL'), name, 'exit', actual, 'expected', want, detail, flush=True)
 
+# Coordinated keyword deletion must not pass merely because generator and chain agree.
+# The semantic canonicalizer inventory is copied unchanged into the isolated mutant.
+p = run(['sh', 'seed/omc/gate18.sh'])
+record('keyword inventory baseline', p.returncode, 0, p.stdout.decode()+p.stderr.decode())
+kwmut = out/'keyword-removal'
+for rel in ('seed/omc/gate18.sh', 'seed/omc/genkw.awk', 'seed/omc/omc.om',
+            'seed/semhash/semhash.om'):
+    dest = kwmut/rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(root/rel, dest)
+genpath = kwmut/'seed/omc/genkw.awk'
+gen = genpath.read_text()
+assert gen.count(' kfdctl:241') == 1
+genpath.write_text(gen.replace(' kfdctl:241', ''))
+chainpath = kwmut/'seed/omc/omc.om'
+chain = chainpath.read_text()
+chain, dropped = re.subn(r'^if eq w [0-9]+\nret 241\nend\n', '', chain, flags=re.M)
+assert dropped == 1
+chainpath.write_text(chain)
+p = run(['sh', kwmut/'seed/omc/gate18.sh'])
+record('keyword coordinated-removal control', p.returncode, 1, p.stdout.decode()+p.stderr.decode())
+record('keyword control failure reason',
+       int(b'generated keyword inventory differs from committed semantic inventory' in p.stderr), 1)
+
 names = ['GET_VERSION','ACQUIRE_VM','GET_PROCESS_APERTURES_NEW','CREATE_QUEUE',
          'DESTROY_QUEUE','ALLOC_MEMORY_OF_GPU','FREE_MEMORY_OF_GPU',
          'MAP_MEMORY_TO_GPU','UNMAP_MEMORY_FROM_GPU','CREATE_EVENT','DESTROY_EVENT',

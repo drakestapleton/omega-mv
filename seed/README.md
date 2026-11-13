@@ -982,11 +982,17 @@ This fixes `if x` with `uint x`, `ret x` in a `uchar` function, and `x = eq ...`
 
 ## Rung R50: keyword generator parity (done)
 
-`seed/omc/gate18.sh` regenerates the chain with `genkw.awk` and compares its 153 literal pack/id
-pairs with `fn kw` scoped to that function; it also checks the two computed entries (`readlnk` 133,
-`sockopt` 134) and that the generator lists them. The generator now includes every host word
-100-177 (the device and mapping words devctl..mapbind are 166-177) and packs 64-bit words with decimal string arithmetic, so values above 2^53 print exactly.
-0 mismatches; `seed/host/check.sh` runs the gate.
+`seed/omc/gate18.sh` regenerates the chain with `genkw.awk` and compares every literal pack/id
+pair with `fn kw` scoped to that function. It independently checks the complete ID multiset
+and derives the expected pair count from the semantic canonicalizer's committed `tkw1`
+inventory (`seed/semhash/semhash.om`), without regenerating that inventory during verification.
+The two computed entries (`readlnk` 133, `sockopt` 134) and target-scoped `efi` are checked
+separately. Thus deleting a word from both the generator and compiler chain still fails;
+`tests/kfd/check.py` exercises that coordinated-removal control.
+To generate the canonicalizer inventory when changing the language, use
+`awk -v semhash=1 -f seed/omc/genkw.awk`; replace its `text tkw1` declaration with that output.
+`seed/semhash/check.sh` checks the canonicalizer's full spelling/id parity.
+Decimal string arithmetic preserves packs above 2^53 exactly. `seed/host/check.sh` runs gate18.
 
 ## Rung R51: constants in function mode (done)
 
