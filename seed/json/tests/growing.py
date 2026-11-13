@@ -38,7 +38,7 @@ def run(binary,mode,data,want,args=(),rc=0):
     r=subprocess.run([str(binary),mode,*map(str,args)],input=data,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
     ok=r.returncode==rc and r.stdout==want
     if not ok:
-        print('MISMATCH mode='+mode+' bytes='+str(len(data))+' rc='+str(r.returncode)+' got='+repr(r.stdout[:100])+' want='+repr(want[:100]),flush=True)
+        print('MISMATCH mode='+mode+' bytes='+str(len(data))+' status='+str(r.returncode)+' got='+repr(r.stdout[:100])+' want='+repr(want[:100]),flush=True)
     return ok
 
 big=build('real',units)
