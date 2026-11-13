@@ -1,8 +1,11 @@
 # DDC650: diverse double compilation of `seed/omc/omc.om` (issue #650)
 
-Status: **PROPOSED gate, EXERCISED on host** (DGX Spark, Linux AArch64) at base
-`62d1d0d668f897386a0e311374f8dbcc5c32dde8`. This gate is not wired into CI and is not QUALIFIED. It does
-not cure trusting trust. Its scope is the claim below, for the exact inputs it prints.
+Status: **available qualification, not wired into the default gate**. The current
+oracle source is checked in at `tools/omega_ref/omega_ref.c`; it executes the
+current compiler's run-time pools and environment operations. All identities
+are taken from the supplied files on each run. Results below under “Base run”
+are historical, not qualification of a later source/binary pair. A final
+integrated compiler must run this check and its controls again.
 
 ## Claim
 
@@ -16,7 +19,7 @@ show that `SRC` is correct or safe, and it does not show that any shared compone
 | Route | Trusted compiler | Built from | Diversity from `BIN` |
 |---|---|---|---|
 | S (seed) | `seed/rung4/om4.bin`, pinned by SHA-256 | seed0 → hex1 → asm2 → om4 (hand-written, holds no bytes of `BIN`) | different binary lineage; same project, author and spec |
-| I (interpreter) | `omega_ref`, built by the host C compiler `CC` from `ORACLE_SRC` (pinned by SHA-256) | `tools/omega_ref/omega_ref.c` at commit `190130b71d0a59b93f01c515218a5509b149a145` (branch `seed/omega-ref-sync`) | third-party toolchain (GCC 13.3.0, Ubuntu 13.3.0-6ubuntu2~24.04.1); interprets `SRC` from the spec, no Omega code generator in the path |
+| I (interpreter) | `omega_ref`, built by the host C compiler `CC` from `ORACLE_SRC` (pinned by SHA-256) | checked-in `tools/omega_ref/omega_ref.c`, hashed at execution | third-party toolchain (GCC 13.3.0, Ubuntu 13.3.0-6ubuntu2~24.04.1); interprets `SRC` from the spec, no Omega code generator in the path |
 
 Route S computes `stage1 = om4 < SRC` and then `stage2 = stage1 < SRC`. Route I computes
 `ref = oracle run SRC < SRC`. Each artifact is built twice and the two copies must be equal. The gate
@@ -40,15 +43,21 @@ From the repository root (host CPU only), with a fresh scratch directory on disk
 
 ```sh
 T=$(mktemp -d)
-git show 190130b71d0a59b93f01c515218a5509b149a145:tools/omega_ref/omega_ref.c > "$T/omega_ref.c"
 seed/out/omc < seed/qualification/ddc650/ddc.om > "$T/ddc" && chmod +x "$T/ddc"
-"$T/ddc" seed/rung4/om4.bin d0da40e45f1fcc45d9a39c9c52c9d745b545e076970729e51c12d76ef519efab \
-  /usr/bin/gcc "$T/omega_ref.c" 52e747096c1d978103432460a2978b21a604cc5d3e961bbe4b253fcc7636290e \
-  seed/omc/omc.om seed/out/omc "$T/run" [stage1|oracle|source|binary|comparator]
+OM4_SHA=$(sha256sum seed/rung4/om4.bin | cut -d' ' -f1)
+ORACLE_SHA=$(sha256sum tools/omega_ref/omega_ref.c | cut -d' ' -f1)
+"$T/ddc" seed/rung4/om4.bin "$OM4_SHA" \
+  /usr/bin/gcc tools/omega_ref/omega_ref.c "$ORACLE_SHA" \
+  seed/omc/omc.om seed/out/omc "$T/run"
+# Repeat with a fresh scratch directory and each optional final argument:
+# stage1 oracle source binary comparator
+# Expected exits: 1 1 1 1 3. Every control must say CONTROL CAUGHT;
+# INVALID (3) is not a substitute for a route-comparison FAIL (1).
 ```
 
 Exit codes: 0 PASS, 1 FAIL, 3 INVALID, 4 CONTROL SURVIVED, 90 usage, 91 the scratch directory already
-exists. Children run with an empty environment, have no PATH search and get a 300 s deadline. The C
+exists. The mutation buffer grows from the actual input instead of a fixed file-size ceiling.
+Children run with an empty environment, have no PATH search and get a 300 s deadline. The C
 compiler is called with `-B/usr/bin/` because gcc cannot find `ld` without PATH. The gate prints the
 SHA-256 of every input and artifact. Cross-check those digests with coreutils `sha256sum` and `cmp`
 (see below), because the conductor is itself compiled by the compiler under test.
@@ -99,8 +108,8 @@ In this tree `stage1 == BIN` as well; the gate prints that fact and does not req
   code-generation design, which is why `stage1 == BIN` here. Route I adds a third-party compiler and
   an interpreter that emits no machine code, but the oracle source was written by the project.
 - **Oracle placement:** `omega_ref.c` is a qualification oracle outside the delivered closure. It is
-  pinned by commit and SHA-256 and is not on main. Whether a permanent copy lands in the tree is
-  Drake's decision. GCC is a third-party oracle and is pinned only by the printed digest of the
+  checked in beside its regression fixtures and pinned by the supplied SHA-256.
+  GCC is a third-party oracle and is pinned only by the printed digest of the
   driver binary, not of `cc1`, `as` or `ld`.
 - **Conductor:** `ddc.om` is compiled by `BIN` itself. The coreutils `sha256sum`/`cmp` cross-check
   above is the mitigation; a subverted conductor could misreport its own checks.
