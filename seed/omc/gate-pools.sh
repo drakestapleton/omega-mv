@@ -273,6 +273,16 @@ if on 11; then
   # that name enlarge, listed by name"); any other user fails, and the listed ones leave the byte identity list.
   cut -d: -f1 $B/scanuse | sort -u > $B/users
   grep -v '^#' $T/enlarge-users.txt | sort -u > $B/allowed
+  # An exemption must name an actual tracked unit with the excluded feature.
+  # This also prevents a future file being exempted outside its own change.
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || bad "11 inventory: blank entry"
+    case "$unit" in *.om) ;; *) bad "11 inventory: not an Omega unit: $unit" ;; esac
+    [ -f "$unit" ] && git --literal-pathspecs ls-files --error-unmatch -- "$unit" > /dev/null 2>&1 ||
+      bad "11 inventory: not a tracked file: $unit"
+    grep -qw enlarge "$unit" || grep -qE '^global [^ ]+ [^ ]+ \*$' "$unit" ||
+      bad "11 inventory: no enlarge or run-time pool declaration: $unit"
+  done < $B/allowed
   if [ -n "$(comm -23 $B/users $B/allowed)" ]; then bad "11 scan: units use enlarge outside $T and are not listed in $T/enlarge-users.txt: $(comm -23 $B/users $B/allowed | tr '\n' ' ')"; fi
   say "PASS 11 scan: git grep -nw enlarge outside $T: $(wc -l < $B/scan) lines; units using the word: $(tr '\n' ' ' < $B/users)(each listed in enlarge-users.txt); the rest are notes"
   if [ "${POOLS_SKIP_EQUIV:-0}" = 1 ]; then
