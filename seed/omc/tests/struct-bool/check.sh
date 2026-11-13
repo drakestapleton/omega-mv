@@ -12,22 +12,23 @@ set -u
 R=$(CDPATH= cd -- "$(dirname "$0")/../../../.." && pwd)
 cd "$R"
 D=seed/omc/tests/struct-bool
-B=build/seed/struct-bool
+mkdir -p build/seed
+B=$(mktemp -d build/seed/struct-bool.XXXXXX)
 S=${1:-${OMC:-seed/out/omc}}
 case "$S" in /*) ;; *) S="$R/$S";; esac
 [ -x "$S" ] || { printf 'FAIL: %s missing; run sh seed/omega-from-seed.sh first\n' "$S" >&2; exit 2; }
-rm -rf "$B"; mkdir -p "$B"
+printf "STRUCTBOOL compiler %s %s scratch %s\n" "$S" "$(sha256sum "$S" | cut -d' ' -f1)" "$B"
 ulimit -c 0
 say() { printf '%s\n' "$*"; }
 
 # run_status BIN -> prints the exit status (132 = SIGILL), nothing else, no shell job messages
-run_status() { sh -c '"$1" >/dev/null 2>&1; echo $?' sh "$1" 2>/dev/null; }
+run_status() { timeout 15 sh -c '"$1" >/dev/null 2>&1; echo $?' sh "$1" 2>/dev/null; }
 
 # twin SRC DST: bool -> uchar, true -> 1, false -> 0
 twin() { sed -E 's/\bbool\b/uchar/g; s/\btrue\b/1/g; s/\bfalse\b/0/g' "$1" > "$2"; }
 
 # compile COMPILER SRC OUT -> sets crc; OUT is the object, OUT.err the diagnostics
-compile() { "$1" < "$2" > "$3" 2> "$3.err"; crc=$?; [ "$crc" != 0 ] || chmod +x "$3"; }
+compile() { timeout 60 "$1" < "$2" > "$3" 2> "$3.err"; crc=$?; [ "$crc" != 0 ] || chmod +x "$3"; }
 
 # rows COMPILER PREFIX: run every row of cases.tsv, one PASS/FAIL line each into PREFIX.log
 rows() {
@@ -36,16 +37,6 @@ rows() {
         [ -n "$name" ] || continue
         o="$2.$name"
         compile "$1" "$D/$name.om" "$o"
-        case "$want" in
-        refuse-or:*)
-            if [ "$crc" != 0 ]; then
-                if [ -s "$o" ]; then echo "FAIL $name refusal emitted an object"
-                elif ! grep -q 'error' "$o.err"; then echo "FAIL $name refusal without an error text"
-                else echo "PASS $name refused (compiler exit $crc)"; fi
-                continue
-            fi
-            want=${want#refuse-or:} ;;
-        esac
         if [ "$crc" != 0 ]; then echo "FAIL $name compiler exit $crc ($(head -c 80 "$o.err"))"; continue; fi
         rc=$(run_status "$o")
         if [ "$rc" = "$want" ]; then echo "PASS $name exit $rc"
@@ -75,7 +66,8 @@ grep -v '^#' "$D/cases.tsv" | while IFS='	' read -r name want tw kind; do
     [ "$rc" = "$want" ] && echo "OK $name twin exit $rc" || echo "BAD $name twin exit $rc, wanted $want"
 done > "$B/twins.log"
 nt=$(grep -c '^OK' "$B/twins.log"); nb=$(grep -c '^BAD' "$B/twins.log")
-if [ "$nb" = 0 ] && [ "$nt" -gt 0 ]; then cok "$nt uchar twins give the expected status"
+expected_twins=$(awk -F '\t' '$3 == "yes" {n++} END {print n+0}' "$D/cases.tsv")
+if [ "$nb" = 0 ] && [ "$nt" = "$expected_twins" ] && [ "$nt" -gt 0 ]; then cok "$nt uchar twins give the expected status"
 else cat "$B/twins.log"; cbad "uchar twins: $nt ok, $nb bad"; fi
 
 # 3. mutants of the twins change the status (each site occurs exactly once)
@@ -93,7 +85,8 @@ grep -v '^#' "$D/mutants.tsv" | while IFS='	' read -r name expr; do
     else echo "OK $name mutant exit $rc, not $want"; fi
 done > "$B/mutants.log"
 nm=$(grep -c '^OK' "$B/mutants.log"); nmb=$(grep -c '^BAD' "$B/mutants.log")
-if [ "$nmb" = 0 ] && [ "$nm" -gt 0 ]; then cok "$nm twin mutants change the status"
+expected_mutants=$(grep -v '^#' "$D/mutants.tsv" | grep -c .)
+if [ "$nmb" = 0 ] && [ "$nm" = "$expected_mutants" ] && [ "$nm" -gt 0 ]; then cok "$nm twin mutants change the status"
 else cat "$B/mutants.log"; cbad "mutants: $nm detected, $nmb not"; fi
 
 # 4. the row runner fails every row on fake broken compilers (the control that catches a broken one)
@@ -133,7 +126,7 @@ if [ "$cfail" != 0 ]; then
     say "STRUCTBOOL INVALID controls=$controls failed=$cfail rows pass=$pass fail=$fail (the rows cannot be trusted)"
     exit 2
 fi
-if [ "$fail" != 0 ]; then
+if [ "$fail" != 0 ] || [ "$pass" != "$total" ]; then
     say "STRUCTBOOL FAIL rows pass=$pass fail=$fail of $total (controls PASS $controls): struct bool field is broken"
     exit 1
 fi

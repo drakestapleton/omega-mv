@@ -391,3 +391,7 @@ Runner for the DUAL applicability experiment: runs the pre-registered campaign a
 ## `tools/reservoir/`
 
 Gate 2 tooling for the reservoir (omega#440): in-house zlib inflate and MAT v5 reader, the archived-reference comparison (res_qualify), benchmarks and timing (res_bench), and qualify_reservoir.sh, which writes the content-addressed receipt under evidence/RESERVOIR. No Python; reads the untrusted archive as data only.
+
+## `seed/omc/tests/struct-bool/`
+
+Boolean struct-field execution regressions, exact expected outcomes, scalar controls and deliberate broken-compiler controls. Run by the seeded host gate. Results are kept in unique build directories.
