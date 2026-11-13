@@ -18,6 +18,34 @@ chmod +x "$B/gate"
 pin=$(sha256sum "$R/seed/out/omc" | cut -d' ' -f1)
 bad() { printf 'OM2EVERY FAIL %s\n' "$*" >&2; exit 1; }
 n=0
+# anchors FILE: every "subst FROM TO" row of FILE must find FROM exactly once in the source the next case
+# compiles (the gate's own rule, INVALID otherwise). Checked here for all files at once, before any case
+# runs, so one stale mutation recipe cannot hide the others and names its file, line and match count.
+# Sources joined with + or given as pack:/cyc: segments are left to the gate, which enforces the same rule.
+anchors() {
+    awk -v cf="$1" '
+    function whole(p,   x, r) { r = RS; RS = "\001"; x = ""; if ((getline x < p) < 0) x = "\001unreadable"; close(p); RS = r; return x }
+    NF == 0 || $1 ~ /^#/ { next }
+    $1 == "subst" { from = $2; at = NR; next }
+    from == "" || $1 == "deadline" { next }
+    {
+        src = ($1 == "cc") ? $2 : $3
+        if (src != "pinned" && src !~ /[:+]/) {
+            h = whole(src); n = whole(from); c = 0
+            if (n != "" && h != "\001unreadable" && n != "\001unreadable") {
+                while ((i = index(h, n)) > 0) { c++; h = substr(h, i + 1) }
+            } else c = -1
+            if (c != 1) { printf "%s:%d: %s matches %d times in %s (need exactly 1)\n", cf, at, from, c, src; bad++ }
+        }
+        from = ""
+    }
+    END { exit bad > 0 }' "$1"
+}
+stale=0
+for c in seed/omc/om2/*/*.cases seed/omc/sites/*.cases; do
+    anchors "$c" >> "$B/anchors.log" || stale=1
+done
+[ "$stale" = 0 ] || { cat "$B/anchors.log" >&2; bad "stale mutation anchors (list above)"; }
 # judge FILE LOG STATUS: 0 when the run is what FILE's kind requires, else prints why and returns 1.
 # A case file may skip only the cases it declares with a notrun line (a planned case whose prerequisite,
 # such as the omega-bridge ABI generator, is absent): the NOT_RUN count must equal those lines and every
@@ -93,6 +121,11 @@ printf 'PASS negative control: surviving mutants are refused\n'
 # negative control 3: an undeclared NOT_RUN (wrong compiler identity: every case NOT_RUN) must be refused.
 PIN=0000000000000000000000000000000000000000000000000000000000000000 run seed/qualification/om2/sec/s0s2/candidate.cases neg3 > /dev/null && bad "negative control 3 (undeclared NOT_RUN) was accepted"
 printf 'PASS negative control: an undeclared NOT_RUN is refused\n'
+# negative control 4: a substitution whose FROM text is absent from its source must be refused by the preflight.
+printf 'no such text in omc.om\n' > "$B/neg4.from"
+printf 'subst %s/neg4.from seed/omc/om2/bnd/mutants/bnd-extra.to\ncc seed/omc/omc.om\n' "$B" > "$B/neg4.cases"
+anchors "$B/neg4.cases" > /dev/null && bad "negative control 4 (stale mutation anchor) was accepted"
+printf 'PASS negative control: a stale mutation anchor is refused\n'
 sk=$(cat seed/qualification/om2/sec/s0s2/candidate.cases seed/qualification/om2/sec/s3s4/candidate.cases \
     seed/qualification/om2/sec/s5s7/candidate.cases seed/qualification/om2/leak/candidate.cases | grep -c '^[^ #]* notrun ') || true
 printf 'OM2EVERY PASS files=%s cases=%s skipped_declared=%s mutants=%s\n' "$files" "$cases" "$sk" "$muts"
