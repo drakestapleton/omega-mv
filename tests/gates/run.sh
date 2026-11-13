@@ -177,6 +177,20 @@ case "$step" in
                       sh seed/omc/gate5.sh 2>&1 | tee "$OUT_DIR.seed-gate5.log"
                       grep -q "^PASS native-host qualification" "$OUT_DIR.seed-check.log" || { echo "OMEGA-SEED: native-host qualification did not pass" >&2; exit 1; }
                       tail -1 "$OUT_DIR.seed-gate5.log" | grep -q "^GATE5 PASS" || { echo "OMEGA-SEED: gate5 failed" >&2; exit 1; } ;;
+  # Standalone backend qualification: these execute the current sources, never
+  # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).
+  # They are separate from seed so CPU OpenCL is not required by every host check.
+  irwasm)
+    sh seed/wasm/gate-irwasm.sh 2>&1 | tee "$OUT_DIR/qualification.log"
+    grep -q '^PASS IRWASM native parity cases=' "$OUT_DIR/qualification.log"
+    grep -q '^PASS v7 run parity cases=' "$OUT_DIR/qualification.log"
+    grep -q '^PASS v7 OOB traps=.*no-bounds mutant caught' "$OUT_DIR/qualification.log"
+    ;;
+  irspirv)
+    # CPU OpenCL only. This is not Vulkan or physical GPU qualification.
+    sh seed/spirv/gate-irspirv.sh 2>&1 | tee "$OUT_DIR/qualification.log"
+    grep -q '^PASS IRSPIRV CPU OpenCL parity cases=' "$OUT_DIR/qualification.log"
+    ;;
   # omega-mv#731 ORIG-4 (no hosted mirror; host only): the shadow advisor's glue over the
   # pinned aien-train units (native/orig4/orig4.pin, one aien-train main commit), materialised
   # under build/pins from the sibling clone; every verdict is made by the .om units.
