@@ -21,7 +21,7 @@ the model is intentionally not supported. Use the same tokenizer as the input.
 `train` and the existing GPU trainers consume the ordinary output checkpoint; this
 change's training tests exercise the host trainer, not the GPU path.
 
-The normal checkpoint writer saves OUTPUT.ck through OUTPUT.ck.tmp. As with
+On Linux, the normal checkpoint writer saves OUTPUT.ck through OUTPUT.ck.tmp. As with
 `tune`, an existing output is replaced. Use a distinct output in a private working
 directory and preserve the input. Do not target a served checkpoint or a path
 another process is writing. Checkpoints derived from private data remain private.
