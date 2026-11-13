@@ -27,6 +27,13 @@ required=$(mktemp -d build/seed/required.XXXXXX)
 cat "$required/pools.log"
 grep -qx 'PASS gate-pools' "$required/pools.log"
 [ "$(tail -1 "$required/pools.log")" = 'RC=0' ]
+# Compiler-pin consumers (every gate that is handed a compiler and reads seed/out/omc.sha256): admission is
+# measured at its boundary (exact refusal, decoy not run, nothing made or removed), with a positive twin
+# per consumer, then the per-consumer wrong-compiler controls. Test instruments; they build nothing here.
+sh seed/omc/tests/pins/admission-check.sh
+sh seed/omc/tests/pins/om-check.sh
+sh seed/omc/tests/pins/seed-check.sh
+sh seed/omc/tests/pins/orig4-check.sh
 sh seed/omc/tests/struct-bool/check.sh
 sh seed/ng/front/cases/nom-wrap.sh check
 seed/out/omc < seed/ng/front/gate-front.om > "$required/gate-front"

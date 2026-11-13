@@ -4,10 +4,17 @@
 # OSC IR v1 scalar functions. Host CPU only; no C participates in checking.
 set -eu
 cd "$(dirname "$0")/../.."
+# Compiler admission precedes dependencies and backend work. The expected hash comes
+# from the tracked seed receipt, never from OMC or a caller-supplied sidecar.
+OMC=${OMC:-seed/out/omc}
+canonical_pin=$(cut -d ' ' -f 1 seed/out/omc.sha256 2>/dev/null) || canonical_pin=
+case "$canonical_pin" in *[!0-9a-f]*) canonical_pin= ;; esac
+[ ${#canonical_pin} -eq 64 ] || { printf 'NOT_RUN gate-irequiv: compiler pin file missing or malformed\n'; exit 3; }
+PIN=$canonical_pin
+[ -x "$OMC" ] || { printf 'NOT_RUN gate-irequiv: no compiler at %s\n' "$OMC"; exit 3; }
+compiler_hash=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$compiler_hash" = "$PIN" ] || { printf 'NOT_RUN gate-irequiv: compiler %s sha256 %s differs from pin %s\n' "$OMC" "$compiler_hash" "$PIN"; exit 3; }
 [ "$(uname -m)" = aarch64 ] || { echo "SKIP gate-irequiv: needs aarch64 (omc emits AArch64)"; exit 0; }
-OMC=seed/out/omc
-PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
-[ "$(sha256sum "$OMC" | cut -d' ' -f1)" = "$PIN" ] || { echo "FAIL pin: $OMC"; exit 1; }
 B=build/seed/equiv
 mkdir -p "$B"
 fails=0

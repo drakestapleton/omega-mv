@@ -17,7 +17,9 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main 46520074 (2026-11-13): committed
+The current pin is the record `seed/out/omc.sha256`, written by `seed/omega-from-seed.sh` beside the
+committed `seed/out/omc` (one source; the current hash is not typed in this file, and the commands
+below read it from the record). The last pin typed here, after omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main 46520074 (2026-11-13), was committed
 `seed/out/omc` SHA-256
 `26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`, compiler
 source SHA-256 `9977db63aae76ee41c35a7a5715d7dc40427f3c7711597f31e5b60697ef8e7ef`.
@@ -195,7 +197,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991 \
+    "$(cut -d ' ' -f 1 seed/out/omc.sha256)" \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -411,9 +413,9 @@ It is exactly the committed `seed/out/omc` introduced by
 the lock. Read-only `git show <revision>:seed/out/omc | sha256sum` resolved the
 older `2c824805...` at82a399b9 and `49923639...` at ec07d25d as different
 historical binaries. No compiler change is part of NL4. After the reseed
-recorded at the top of this file, the committed compiler is `26540e6d...`; the
-lock and receipt below keep the `d6290c76...` run unedited, and the command
-below uses the current pin because the conductor refuses any other hash.
+recorded at the top of this file, the committed compiler is the one named by
+`seed/out/omc.sha256`; the lock and receipt below keep the `d6290c76...` run unedited, and the command
+below reads the current pin from that record because the conductor refuses any other hash.
 
 From this checkout with separately fetched sibling source repositories. The lock names
 aien-protocols-mv `6fb728a1`, the draft commit the original run read; that commit is not
@@ -428,7 +430,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc 26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc "$(cut -d ' ' -f 1 seed/out/omc.sha256)" neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch

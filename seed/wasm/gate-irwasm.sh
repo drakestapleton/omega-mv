@@ -2,14 +2,21 @@
 # Host-only verification. Node is a read-only wasm oracle, never a generator.
 set -eu
 cd "$(dirname "$0")/../.."
+# Compiler admission precedes dependencies and backend work. The expected hash comes
+# from the tracked seed receipt, never from OMC or a caller-supplied sidecar.
+OMC=${OMC:-seed/out/omc}
+canonical_pin=$(cut -d ' ' -f 1 seed/out/omc.sha256 2>/dev/null) || canonical_pin=
+case "$canonical_pin" in *[!0-9a-f]*) canonical_pin= ;; esac
+[ ${#canonical_pin} -eq 64 ] || { printf 'NOT_RUN gate-irwasm: compiler pin file missing or malformed\n'; exit 3; }
+pin=$canonical_pin
+[ -x "$OMC" ] || { printf 'NOT_RUN gate-irwasm: no compiler at %s\n' "$OMC"; exit 3; }
+compiler_hash=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$compiler_hash" = "$pin" ] || { printf 'NOT_RUN gate-irwasm: compiler %s sha256 %s differs from pin %s\n' "$OMC" "$compiler_hash" "$pin"; exit 3; }
 B=build/seed/wasm
 mkdir -p "$B"
 fail() { printf 'FAIL %s\n' "$*"; exit 1; }
 [ "$(uname -m)" = aarch64 ] || { echo 'NOT_RUN requires AArch64 Linux'; exit 3; }
 command -v node >/dev/null || { echo 'NOT_RUN requires Node WebAssembly oracle'; exit 3; }
-OMC=seed/out/omc
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
 printf 'SOURCE %s\n' "$(git rev-parse HEAD)"
 printf 'COMPILER %s\n' "$pin"
 node --version

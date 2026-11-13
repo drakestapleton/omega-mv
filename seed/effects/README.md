@@ -86,6 +86,19 @@ sequence the compiler emits is relied on for that, as it was before this rule wa
   entry-SVC, leaves-segment and falls-off-the-end refusals each removed, and the two
   message numbers put back wrong, and the two unknown-branch refusals each removed
 
+For executed-owner evidence, `gate-pools.sh` supplies a generated compiler runner as `OMC` and the
+real compiler ELF as `OMC_BINARY`. With `OMC_BINARY` unset, it defaults to `OMC` and the ordinary
+qualification output is unchanged. When they differ, the real ELF must match the normal
+`seed/out/omc.sha256` pin (no override for that artifact); both runner and artifact hashes are
+printed, the artifact is used for the compiler ELF self-check, and the final success line starts
+`WRAPPED-EFFECTS-RESULT ok` (never the ordinary `SEMANTIC EFFECTS PASS` phrase, even as a substring) and includes both hashes as `runner=... artifact=...`. This is distinguishable from ordinary qualification, which still runs separately.
+Section 11 admits its wrapped result only with that marker and, under its reviewed-owner trust
+assumption, checks each record's executed-compiler hash against the actual head. A different hash
+from the generated wrapper fails coverage even if the separately supplied artifact was correct. The recording script is a labeled
+test instrument, not part of the effects runtime. The wrapped effects result alone does not identify
+the binary executed by that runner; section 11 checks the recorded binary hashes under its stated
+reviewed-owner trust boundary.
+
 ## Limits
 
 - Classes and the filter work at syscall granularity. `fopen` is `path` whether it
@@ -96,5 +109,12 @@ sequence the compiler emits is relied on for that, as it was before this rule wa
   this gap but needs a `prctl`/`seccomp` host word, which is a compiler change.
 - The filter restricts syscalls only. The check runs bwrap with `--dev-bind / /`, so
   filesystem and namespace isolation are separate.
-- The table is pinned to the compiler in `om/units.sh`. A compiler that changes how
+- The table is pinned to the compiler recorded in `seed/out/omc.sha256`. No environment variable or
+  argument changes that pin: a different compiler, or a missing or malformed record, is `NOT_RUN` exit 3
+  before anything is built. Section 11 of `seed/omc/gate-pools.sh` runs this check once through its
+  recording runner and names the compiler ELF as `OMC_BINARY`; that runner is admitted by what it is
+  (`#!/bin/sh`, the binding of `OMC_BINARY`, one log binding, then the tracked
+  `seed/omc/tests/pools/record-compiler.sh`, byte for byte) with `OMC_BINARY` equal to the record, never
+  by a digest the caller supplies, and it reports `WRAPPED-EFFECTS-RESULT`, never the ordinary result.
+  `seed/omc/tests/pins/admission-check.sh` holds the controls. A compiler that changes how
   host words lower is caught by closure and probe parity, not silently accepted.

@@ -20,8 +20,8 @@ mkdir -p build
   && $OMC < build/semhash.full.om > build/semhash && chmod +x build/semhash
 ```
 
-`$OMC` is the pinned seed compiler. `check.sh` pins sha256
-`26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`. A missing or different compiler
+`$OMC` is the pinned seed compiler. `check.sh` pins the sha256 that `seed/omega-from-seed.sh` wrote to
+`seed/out/omc.sha256` (one source of truth; no hash is typed here). A missing or different compiler
 makes it print `SEMHASH NOT_RUN` and exit 3.
 
 ## Modes

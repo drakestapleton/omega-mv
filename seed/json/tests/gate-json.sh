@@ -5,8 +5,8 @@ set -eu
 cd "$(dirname "$0")/../../.."
 B=${JSON_BUILD:-build/seed/json}
 OMC=${OMC:-seed/out/omc}
-# Compiler pin: the hash seed/omega-from-seed.sh wrote to seed/out/omc.sha256 (JSON_OMC_PIN overrides it).
-PIN=${JSON_OMC_PIN:-$(cut -d ' ' -f 1 seed/out/omc.sha256)}
+# Compiler pin: the hash seed/omega-from-seed.sh wrote to seed/out/omc.sha256. No environment variable changes it.
+PIN=$(cut -d ' ' -f 1 seed/out/omc.sha256 2>/dev/null || true)
 J=seed/json
 fail() { printf 'JSONGATE FAIL %s\n' "$*"; exit 1; }
 notrun() { printf 'JSONGATE NOT_RUN %s\n' "$*"; exit 3; }

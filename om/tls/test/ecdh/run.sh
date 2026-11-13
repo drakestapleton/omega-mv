@@ -11,8 +11,11 @@ set -eu
 omc=${1:?usage: run.sh OMC}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../../.." && pwd)
+pin=$(cut -c1-64 "$root/seed/out/omc.sha256" 2>/dev/null || true)
+case $pin in *[!0-9a-f]*) pin= ;; esac
+[ ${#pin} -eq 64 ] || { echo "ECDH NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
+[ "$(sha256sum < "$omc" 2>/dev/null | cut -c1-64)" = "$pin" ] || { echo "ECDH NOT_RUN: omc is not the pinned compiler $pin"; exit 3; }
 out="$root/build/tls/ecdh"
-pin=$(sed -n 's/^OMC_PIN=//p' "$root/om/units.sh")
 rm -rf "$out"
 mkdir -p "$out"
 fail=0
@@ -20,11 +23,6 @@ nice="nice -n 19 ionice -c3"
 
 sum=$(sha256sum "$omc" | cut -d' ' -f1)
 echo "omc $sum"
-if [ "$sum" != "$pin" ]; then
-	echo "FAIL omc is not the pinned compiler $pin"
-	echo "ECDH FAIL"
-	exit 1
-fi
 
 build() { # build SRC_ECDH OUT_BINARY [SRC_EC]
 	{ echo om2; cat "${3:-$root/om/tls/ec.om}" "$1" "$here/driver.om"; } > "$2.unit.om"

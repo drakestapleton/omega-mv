@@ -10,16 +10,20 @@
 #   7 dups             dups.sh over seed/semhash/dups matches dups.exp; a hash changed past the
 #                      16-digit key must not group (full-hash compare)
 # Prints SEMHASH PASS cases=N controls=M (exit 0), SEMHASH FAIL ... (exit 1), or
-# SEMHASH NOT_RUN ... (exit 3) when the pinned compiler is missing or differs.
+# SEMHASH NOT_RUN ... (exit 3) when the pinned compiler is missing or differs. The pin is the hash that
+# seed/omega-from-seed.sh wrote to seed/out/omc.sha256. No environment variable or argument changes it.
 # Run from anywhere; paths are relative to the repository root.
 set -u
 cd "$(dirname "$0")/../.." || exit 3
 OMC=${OMC:-seed/out/omc}
-PIN=${SEMHASH_OMC_PIN:-26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991}
+note_pin=seed/out/omc.sha256
+PIN=$(cut -d ' ' -f 1 "$note_pin" 2>/dev/null)
+case $PIN in *[!0-9a-f]*) PIN= ;; esac
 W=${SEMHASH_OUT:-build/semhash-check}
 C=seed/semhash/cases
 
 notrun() { printf 'SEMHASH NOT_RUN %s\n' "$1"; exit 3; }
+[ ${#PIN} -eq 64 ] || notrun "no compiler pin in seed/out/omc.sha256"
 [ -x "$OMC" ] || notrun "no compiler at $OMC"
 GOT=$(sha256sum "$OMC" | cut -d ' ' -f 1)
 [ "$GOT" = "$PIN" ] || notrun "compiler $OMC sha256 $GOT differs from pin $PIN"

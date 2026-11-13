@@ -59,13 +59,14 @@ seed/nki/setup-oracle.sh /tmp/nki-oracle          # pinned downloads, user files
 NKI_ORACLE_DIR=/tmp/nki-oracle nice -n 19 seed/nki/gate-irnki.sh
 ```
 
-Exit codes: 0 PASS, 1 FAIL, 3 NOT_RUN (no oracle directory, the oracle does not start,
-the oracle version differs from the pin, or the host is not AArch64). Artifacts go to
+Exit codes: 0 PASS, 1 FAIL, 3 NOT_RUN (compiler missing or different, compiler pin missing or
+malformed, no oracle directory, the oracle does not start, the oracle version differs from the pin,
+or the host is not AArch64). After compiler admission, artifacts go to
 `build/seed/nki/`, and `gate.log` holds SOURCE, COMPILER, ORACLE and PLATFORM.
 
 The gate does the following:
 
-1. Builds `irnki` with the pinned `seed/out/omc` (sha256 `2c824805…029f`).
+1. Builds `irnki` with the compiler hash recorded in `seed/out/omc.sha256`; a missing or different compiler is NOT_RUN (exit 3), before oracle setup.
 2. Lifts `vecadd.unit.om` (f32 and u32) and `ops.unit.om` (8 functions: every op,
    swapped operands `sub b a`, and repeated operands `add a a`). Each module is emitted
    twice and compared with `cmp`.

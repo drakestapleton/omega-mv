@@ -7,6 +7,16 @@
 # Exit 0 PASS, 1 FAIL, 3 NOT_RUN. Every artifact stays under build/seed/spirv.
 set -eu
 cd "$(dirname "$0")/../.."
+# Compiler admission precedes dependencies and backend work. The expected hash comes
+# from the tracked seed receipt, never from OMC or a caller-supplied sidecar.
+OMC=${OMC:-seed/out/omc}
+canonical_pin=$(cut -d ' ' -f 1 seed/out/omc.sha256 2>/dev/null) || canonical_pin=
+case "$canonical_pin" in *[!0-9a-f]*) canonical_pin= ;; esac
+[ ${#canonical_pin} -eq 64 ] || { printf 'NOT_RUN gate-irspirv: compiler pin file missing or malformed\n'; exit 3; }
+pin=$canonical_pin
+[ -x "$OMC" ] || { printf 'NOT_RUN gate-irspirv: no compiler at %s\n' "$OMC"; exit 3; }
+compiler_hash=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$compiler_hash" = "$pin" ] || { printf 'NOT_RUN gate-irspirv: compiler %s sha256 %s differs from pin %s\n' "$OMC" "$compiler_hash" "$pin"; exit 3; }
 B=build/seed/spirv
 mkdir -p "$B"
 # Drop the previous run's artifacts, keeping only a prebuilt default host.
@@ -16,14 +26,11 @@ say() { printf '%s\n' "$*" | tee -a "$B/gate.log"; }
 fail() { say "FAIL $*"; exit 1; }
 notrun() { say "NOT_RUN $*"; exit 3; }
 [ "$(uname -m)" = aarch64 ] || notrun 'requires AArch64 Linux'
-OMC=${OMC:-seed/out/omc}
 SPIRV_VAL=${SPIRV_VAL:-spirv-val}
 PYTHON=${PYTHON:-python3}
 command -v "$SPIRV_VAL" >/dev/null || notrun "requires spirv-val ($SPIRV_VAL)"
 command -v "$PYTHON" >/dev/null || notrun "requires Python parity oracle ($PYTHON)"
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
 [ -f "$OMC" ] || fail "compiler $OMC missing"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
 case "${POCL_LIBRARY:-}" in /*/libpocl.so*) ;; *) notrun 'POCL_LIBRARY must name the absolute trusted PoCL shared library' ;; esac
 CC=${CC:-cc}
 command -v "$CC" >/dev/null || notrun "requires a C compiler ($CC) for the OpenCL host controls"
