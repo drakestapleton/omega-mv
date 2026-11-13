@@ -37,6 +37,12 @@ ollm tune CK OUT TOTAL LRMICRO        # fine-tune: keep weights, step 0, new TOT
 v0's 1.463036 bpb scores 4096 × 64 bytes, 0.11803 of the same held text; v1's 0.680427 scores
 nearly all of it, so the two are not measured on the same positions.
 
+## Depth growth
+
+`ollm grow INPUT OUTPUT LAYERS TOTAL LRMICRO` adds trainable layers while
+keeping learned tensors. See [growth behavior and verification](GROW.md).
+Growth increases capacity; it is not a measured quality improvement.
+
 ## Status
 
 Evidence for every row is in `evidence/OMEGALLM/core/summary.tsv` (48/48 as expected). Every receipt
