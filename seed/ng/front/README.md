@@ -267,3 +267,14 @@ Function-mode units remain outside this program-entry lowering. Constant-true pr
 semantically preserved; matching omc's proof-erased output bytes is not claimed.
 
 Implementation: OpenAI Codex, assigned NG completion lane.
+
+## Nominal, struct and layout gate rows
+
+The `nom-*` rows of `cases-front-ir.txt` (31 run, 54 refuse) exercise the nominal, struct and layout lowering of
+`src/front.om`: the 76-case data sweep in its same classes, wrapped copies of the struct units whose `main` does
+not return int (`cases/nom_tN.om`, `sh cases/nom-wrap.sh check` verifies them against `seed/omc/tests/struct`),
+and boundary and evaluation-order controls `cases/nom_*.om` whose exits and stdout are those of the omc binary.
+Mutants 14 to 18 of `gate-front-ir.om` change struct field indexing, the array bound, layout byte order and the
+dup32 retained check; each pattern occurs once in `src/front.om`, so a rewrite of those lines makes the gate
+report the pattern missing, loudly. Run-time pools are not lowered; `cases/pool_runtime.om` stays a declared scope
+case. `COVERAGE.md` lists what was run and the limits.

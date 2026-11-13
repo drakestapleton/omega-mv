@@ -26,11 +26,11 @@ The packed C2 manifest is surveyed separately.
 | fsqrt fabs bitcast | Y | Fixture-scoped only; generally unproven | subject to operand construct coverage |
 | fmin fmax fma | Y: fma (ng-groups-4), fmin/fmax (ng-front-groups-6) | fixture-scoped only: cases/fma_mix.om (fused against unfused), cases/fmm_mix.om (signed zeros, quiet and signaling NaNs, both widths) | none for scalar f32/f64 |
 | true false = ( ) | Y | Fixture-scoped only; generally unproven |  |
-| get put len new | P | Fixture-scoped only; generally unproven | scalar arrays only; structs/layout fields absent |
+| get put len new | P | Fixture-scoped only; generally unproven | scalar arrays, struct fields and layout fields lower in the parent's candidate `fe_lst*`/`fe_lly*` (see Nominal section below); run-time pools absent |
 | view edit part | Y (sized parameters as SLICE: ng-front-groups-8) | Fixture-scoped only; generally unproven |  |
 | global text const | Y (empty text, bool and qty const: ng-front-groups-7, -8) | Fixture-scoped only; generally unproven |  |
-| struct layout field at little big sizeof offsetof | N | NOT_RUN | no declaration/storage/field/query lowering |
-| abstract ops seal open holds | N | NOT_RUN | no nominal lowering or constructor checks |
+| struct layout field at little big sizeof offsetof | Y in the candidate (seed/ng/src/front.om, uncommitted when this row was written) | host-EXERCISED only: gate-front-ir `nom-*` rows (31 run, 54 refuse) | struct bool fields (below); functions without main stay function mode |
+| abstract ops seal open holds | Y in the candidate (`fe_lseal`) | host-EXERCISED only: gate-front-ir `nom-a-*`, `nom-abstract-*` rows | a-kept-diag and a-exact-diag (no main) stay function mode |
 | fn to ret end | P | Fixture-scoped only; generally unproven | main must return int; units without main absent |
 | inline for unroll while bound if else break continue trap exit | P | Fixture-scoped only; generally unproven | M1 fixtures only; signed latch wrapping was incorrect before e156056a; contracts absent |
 | requires ensures invariant result | N | No: silent omission before the safety head | no observation-point lowering |
@@ -265,5 +265,37 @@ differences=0). ngcheck accepts each lowered program; ngrun refuses cpuset, cpug
 
 The earlier contract-safety section records the previous refusal boundary. The current lowerer
 executes checked function and loop prefixes; see front/README.md for ordering and release policy.
-The canonical compiler contract manifest feeds the differential gate directly. Function mode,
-struct/layout/nominal lowering and runtime-pool lowering are separate remaining work.
+The canonical compiler contract manifest feeds the differential gate directly. Function mode
+and runtime-pool lowering are separate remaining work. Struct/layout/nominal lowering is in the
+candidate front.om; its coverage is the next section.
+
+## Nominal, struct and layout lowering: gate coverage (candidate head, not a release claim)
+
+Status labels: the lowering is in `seed/ng/src/front.om` on finish/ng-20261113 as a parent-owned uncommitted
+change; this section covers only the tests that exercise it. Nothing here is hardware qualification.
+
+What the gate runs (`cases-front-ir.txt`, rows `nom-*`, 85 rows: 31 run, 54 refuse):
+- The 76 canonical cases of the outside data sweep, in their same classes: 21 run units (a-kept, a-om1, a-ok,
+  l-trap, l-rw, l-om1, struct t1..t9, float/structs, layout/sizes, longnames/long_names) and 53 omc refusals
+  (exit and stderr bytes through `@ng front-ir`). The two function-mode units (a-kept-diag, a-exact-diag) have no
+  `main`; ng exits 64 for them, as for every function-mode unit, so they are not rows.
+- Struct units whose `main` returns uint, ulong or long run as wrapped copies `cases/nom_tN.om`
+  (`cases/nom-wrap.sh` regenerates and checks them; `main to int` is the only lowered signature).
+- Controls with exits fixed by the omc binary: `nom-struct-order` (put evaluates the index call before the value
+  call: trace 21), `nom-struct-put-idx-trap` (index trap 3 before a value overflow, exit 103),
+  `nom-struct-put-idx-only`, `nom-struct-idx-trap` (an index one past an array field traps rather than reading the
+  next field), `nom-struct-bounds` (every scalar width at its extremes in 8-byte cells, last array element,
+  untouched neighbours), `nom-layout-order`, `nom-layout-bounds` (a field ending exactly at the layout size, both
+  byte orders, last array element, index past the array traps 3), `nom-layout-put-idx-trap`,
+  `nom-layout-short` (a view over a buffer shorter than the layout is refused, error 7), `nom-abstract-order`
+  (call operands before the retained holds check, boundary values, trap 10 after a byte of stdout),
+  `nom-abstract-op-order` (left operand first).
+- Five lowering mutants (gate-front-ir mutants 14 to 18) must each fail a run case: struct field index adding the
+  length for the offset; array bound taken from the offset; big-endian layout read and write byte order reversed;
+  the dup32 retained check with eq as ne. Each is killed by the nom controls alone (log nomgate-3 outside the repo).
+
+Limits, measured: the gate was run only on the `nom-*` rows and the contract rows it always includes (targeted,
+CPU3 nice19); the full list and its other 13 mutants were not run by this lane, so no full FRONTIRGATE PASS is
+claimed. A struct with a `bool` field: the omc binary for `new W 1 false` ends in SIGILL (exit 132) and ng emits
+ΩIR that ngcheck rejects (TYPE), so no bool-field fixture is a row (TEST-FINDINGS.md outside the repository).
+Run-time pools are not lowered (`cases/pool_runtime.om`, declared scope, ng exit 64) and are not claimed.
