@@ -17,7 +17,7 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after omc KFD words rebased with current diagnostic and module compiler work, branch `amdserve/kfd-word-r2` on Radicle main df19e881 (2026-11-13): committed
+Current pin after omc KFD words rebased with current diagnostic and module compiler work, branch `amdserve/kfd-word-r2` on Radicle main ace2691c (2026-11-13): committed
 `seed/out/omc` SHA-256
 `5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc`, compiler
 source SHA-256 `4155f90148dae34dd1fc78f035fbf98c4352a28158ddef79b1f200efba46858c`.
