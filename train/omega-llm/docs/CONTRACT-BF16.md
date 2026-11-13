@@ -218,3 +218,35 @@ heuristic step check of 4.3. A binary used for `gtrainb` runs must pass 4.1-4.5 
 
 Adoption is not a quality claim. 4.4 compares step 2000 only. The first long `gtrainb` run carries
 its own pre-registration and compares its final value with the f32 run on the same schedule.
+
+
+## BF16 inference with sensitive operations retained in f32
+
+The opt-in `gserveb` and `gsampb` commands use BF16 tensor-core operands for
+the attention-output projection and the two feed-forward projections.
+Accumulation and epilogues remain f32. QKV projection, attention scores and
+value reduction, normalization and final logits stay f32. This is a mixed
+BF16/f32 inference path, not an all-BF16 model or checkpoint conversion.
+
+They take the same arguments as `gserve` and `gsample`. Existing commands,
+training, evaluation and checkpoint formats retain their behavior.
+`gdbench` mode 7 executes this path; mode 8 compares it with the existing f32
+forward on the same contexts. Mode 8 retains the existing 0.25-nat maximum
+logit difference and high-margin token-divergence rule. Modes 3 and 4 retain
+the original all-eligible-GEMM BF16 experiment, including its known failed
+accuracy result. No failed threshold was relaxed to admit the new path.
+
+The external `tests/omegallm/bf16-inference.py` gate runs within an authorized
+Spark window. It checks both numerical and execution evidence: four prompts
+per supplied checkpoint, 250 steps each including context sliding; exact
+f32 and legacy-mode regressions; three BF16 projection dispatches per layer;
+CLI repeatability; and a compiled no-BF16 mutant that must lose those
+dispatches. The supplied baseline, candidate, source, compiler, checkpoints
+and tokenizer are hashed before and after the run. Its output is an
+acceptance record for those inputs, not a universal numerical error bound
+or a timing claim.
+
+The existing serving referee accepts `VERB=gserveb` and compares responses
+with `gsampb`, so protocol and sampler parity exercise the same precision
+path. Source alone is not an adoption claim: preserve the actual gate
+receipts and independent review before installing this command.
