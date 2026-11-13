@@ -104,8 +104,11 @@ fi
 # mutants: each must make the driver finish normally with exit 1 and MISMATCH lines
 mut=0
 mutok=0
-# mutant SED NAME: library mutant. Detected when the driver finishes with exit 1 and MISMATCH lines,
-# or dies on a runtime trap (exit >= 100: the main run fails on any trap, so the mutant is caught)
+# mutant SED NAME [ROWS]: library mutant. Detected when the driver finishes with exit 1 and MISMATCH
+# lines, or dies on an Omega runtime trap (exit 101..114: the main run fails on any trap, so the mutant
+# is caught). Any other status (a launch failure 126/127, a signal 128+) is not a detection. With ROWS
+# (strict): only exit 1 with the completed driver summary (as many checks as the unmutated run, $checks)
+# and a MISMATCH for every named row counts.
 mutant() {
 	mut=$((mut + 1))
 	sed "$1" "$tls/x509.om" > "$out/mut-$2-lib.om"
@@ -113,10 +116,21 @@ mutant() {
 	if ! build "$out/mut-$2-lib.om" "$here/driver.om" "$out/mut-$2"; then fail "mutant $2: build"; return; fi
 	drive "$out/cases.txt" "$out/mut-$2" "mut-$2"
 	n=$(grep -c '^MISMATCH ' "$out/mut-$2.out" || true)
-	if [ "$rc" -eq 1 ] && [ "$n" -gt 0 ] && printf '%s\n' "$last" | grep -q "^x509 driver: [0-9]* checks, $n failed$"; then
+	if [ -n "${3:-}" ]; then
+		miss=
+		for r in $3; do grep -q "^MISMATCH line [0-9][0-9]* $r got " "$out/mut-$2.out" || miss="$miss $r"; done
+		if [ "$rc" -eq 1 ] && [ "$n" -gt 0 ] && [ -z "$miss" ] && [ -n "${checks:-}" ] && printf '%s\n' "$last" | grep -q "^x509 driver: $checks checks, $n failed$"; then
+			mutok=$((mutok + 1))
+			say "PASS mutant $2 detected ($n MISMATCH, required rows:$(printf ' %s' $3))"
+		else
+			fail "mutant $2 not detected as required: exit $rc, $n MISMATCH, rows without a MISMATCH:${miss:- none}: $last"
+		fi
+		return
+	fi
+	if [ "$rc" -eq 1 ] && [ "$n" -gt 0 ] && printf '%s\n' "$last" | grep -q "^x509 driver: [0-9][0-9]* checks, $n failed$"; then
 		mutok=$((mutok + 1))
 		say "PASS mutant $2 detected ($n MISMATCH: $(grep '^MISMATCH ' "$out/mut-$2.out" | head -n 2 | cut -d' ' -f4 | tr '\n' ' '))"
-	elif [ "$rc" -ge 100 ]; then
+	elif [ "$rc" -ge 101 ] && [ "$rc" -le 114 ]; then
 		mutok=$((mutok + 1))
 		say "PASS mutant $2 detected (driver trapped, exit $rc, after $n MISMATCH)"
 	else
@@ -141,6 +155,9 @@ mutant 's/^if eq o 20$/if eq o 99/' name-constraints-noncritical
 mutant 's/^if or lt b 2048 gt b 4096$/if lt b 2048/' rsa-modulus-max
 # finding 6: exponent policy dropped (only e >= 1)
 mutant 's/^if or lt v 3 eq and v 1 0$/if lt v 1/' rsa-exponent
+# anchor key size: the exponent policy merged into the bit count again (an out-of-policy exponent adds
+# 2^32 to X5RBITS), so a 1024-bit anchor with e = 2^32+1 passes chain_sig (anchor_rsa1024_e2_32_plus_1)
+mutant 's/^ret bits$/ret add bits mul sub 1 x509_rsaeok k 4294967296/' size-exponent-merged anchor_rsa1024_e2_32_plus_1
 # finding 2: no leaf size limit
 mutant 's/^if gt get w add X5WIX 1 X5LMAX$/if gt get w add X5WIX 1 X5BIG/' leaf-size
 # finding 2: element caps removed: a 10001-element list hits the loop bound (trap)
@@ -161,7 +178,7 @@ mutant 's/^if gt get w X5WLNB chain_dcut add s 65$/if gt get w X5WLNB 9999999999
 mut=$((mut + 1))
 sed 's/^C rsa_good X509_OK /C rsa_good X509_ERR_EXPIRED /' "$out/cases.txt" > "$out/mut-expect.txt"
 drive "$out/mut-expect.txt" "$out/driver" mut-expect
-if [ "$rc" -eq 1 ] && printf '%s\n' "$last" | grep -q '^x509 driver: [0-9]* checks, 1 failed$' && grep -q '^MISMATCH .* rsa_good ' "$out/mut-expect.out"; then
+if [ "$rc" -eq 1 ] && printf '%s\n' "$last" | grep -q '^x509 driver: [0-9][0-9]* checks, 1 failed$' && grep -q '^MISMATCH .* rsa_good ' "$out/mut-expect.out"; then
 	mutok=$((mutok + 1))
 	say "PASS mutant expectation detected"
 else

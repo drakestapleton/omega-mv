@@ -84,8 +84,6 @@ note largest presented leaf (bytes, DER), equal to TLLFSZ in tls.om; a larger on
 const X5LMAX ulong 16896
 note element cap of the SEQUENCE OF loops (EKU, SAN, Extensions, SAN host walk): X5EMAL beyond it
 const X5NMAX ulong 9999
-note added to the RSA bit count in X5RBITS when the public exponent is out of policy (x509_rsaexp)
-const X5RBADE ulong 4294967296
 const X5BIG ulong 0xffffffffffffffff
 
 const X5EMAL ulong 1
@@ -569,10 +567,11 @@ end
 
 note ---------------------------------------------------------------- certificate parser
 
-note x509_rsabits: RSAPublicKey TLV that is exactly k (RFC 8017 A.1.1): modulus bit count, plus
-note X5RBADE when the public exponent is out of policy (x509_rsaexp); 0 when malformed
-note (non-minimal or non-positive integers, trailing bytes)
-fn x509_rsabits k view uchar * to ulong
+note x509_rsakey: the RSAPublicKey TLV that is exactly k (RFC 8017 A.1.1) into q (len >= 4): q[0], q[1]
+note the offset and length of the modulus magnitude (sign octet removed), q[2], q[3] the offset and
+note length of the public exponent content. 1, or 0 when malformed (non-minimal or non-positive
+note integers, trailing bytes)
+fn x509_rsakey k view uchar * q edit ulong * to ulong
 h = new ulong 3 0
 if ne der_hdr k 0 len k h 0
 ret 0
@@ -601,21 +600,43 @@ end
 if ne x509_posint part k get h 1 sub e get h 1 0
 ret 0
 end
-x = x509_rsaexp part k get h 1 sub e get h 1
+put q 2 get h 1
+put q 3 sub e get h 1
 if eq get k s 0
 s = add s 1
 n = sub n 1
 end
-b = ulong get k s
-bits = mul sub n 1 8
+put q 0 s
+put q 1 n
+ret 1
+end
+
+note x509_rsabits: the modulus bit count of the RSAPublicKey k (x509_rsakey), 0 when malformed. It is
+note the size only (the record keeps it in X5RBITS); the exponent policy is x509_rsaeok, which parses
+note the key bytes again when needed, so no exponent can change what a minimum-size check (x509_rsaok,
+note chain_sig for anchors and revocation signers) reads.
+fn x509_rsabits k view uchar * to ulong
+q = new ulong 4 0
+if eq x509_rsakey k edit q 0
+ret 0
+end
+b = ulong get k get q 0
+bits = mul sub get q 1 1 8
 while ne b 0 bound 9
 bits = add bits 1
 b = shr b 1
 end
-if eq x 0
-bits = add bits X5RBADE
-end
 ret bits
+end
+
+note x509_rsaeok: 1 when the public exponent of the RSAPublicKey k is within x509_rsaexp, 0 when it is
+note not or k is malformed
+fn x509_rsaeok k view uchar * to ulong
+q = new ulong 4 0
+if eq x509_rsakey k edit q 0
+ret 0
+end
+ret x509_rsaexp part k get q 2 get q 3
 end
 
 note x509_rsaexp: 1 when the public exponent content x (minimal, positive) is odd and in 3 .. 2^32-1
@@ -641,9 +662,9 @@ end
 ret 1
 end
 
-note x509_rsaok: 1 when the RSA bit count b (X5RBITS) is in 2048 .. 4096 and the exponent passed
-note (policy for keys presented by the server; anchors only need >= 2048 bits, chain_sig). The modulus
-note size must also be a multiple of 8 bits (Mozilla Root Store Policy 5.1).
+note x509_rsaok: 1 when the RSA modulus bit count b (X5RBITS) is in 2048 .. 4096: the size part of the
+note policy for keys presented by the server (x509_rsapres); anchors only need >= 2048 bits
+note (chain_sig). The modulus size must also be a multiple of 8 bits (Mozilla Root Store Policy 5.1).
 fn x509_rsaok b ulong to ulong
 if or lt b 2048 gt b 4096
 ret 0
@@ -652,6 +673,16 @@ if ne and b 7 0
 ret 0
 end
 ret 1
+end
+
+note x509_rsapres: 1 when the RSA key of the parsed certificate c (record r) is within the policy for
+note keys presented by the server: the size from the record (x509_rsaok) and the exponent parsed again
+note (x509_rsaeok on the key bytes c[r[X5RKO] .. +r[X5RKL]))
+fn x509_rsapres c view uchar * r view ulong * to ulong
+if eq x509_rsaok get r X5RBITS 0
+ret 0
+end
+ret x509_rsaeok part c get r X5RKO get r X5RKL
 end
 
 note x509_posint: INTEGER content c is minimal and positive (0 ok, 1 not)
@@ -2114,7 +2145,7 @@ v = chain_xchk view part kb 0 l view part w X5RSZ X5RSZ
 if ne v 0
 ret v
 end
-if ne chain_rsapol part w X5RSZ X5RSZ 0
+if ne chain_rsapol view part kb 0 l part w X5RSZ X5RSZ 0
 ret X5EWEAK
 end
 j = get w X5WCUR
@@ -2158,17 +2189,20 @@ end
 ret 0
 end
 
-note chain_rsapol: X5EWEAK when the certificate record r has an RSA key outside x509_rsaok, else 0
-fn chain_rsapol r view ulong * to ulong
-if and eq get r X5RKT 1 eq x509_rsaok get r X5RBITS 0
+note chain_rsapol: X5EWEAK when the certificate c (record r) has an RSA key outside x509_rsapres,
+note else 0
+fn chain_rsapol c view uchar * r view ulong * to ulong
+if eq get r X5RKT 1
+if eq x509_rsapres c r 0
 ret X5EWEAK
+end
 end
 ret 0
 end
 
 note chain_leaf: the leaf (entry 0): parse, validity at now, host name, not a CA, keyUsage (if
 note present) digitalSignature, EKU (if present) serverAuth, key type supported, RSA key policy
-note (x509_rsaok: 2048 .. 4096 bits, exponent odd in 3 .. 2^32-1)
+note (x509_rsapres: 2048 .. 4096 bits, exponent odd in 3 .. 2^32-1)
 fn chain_leaf cl view uchar * hq view uchar * w edit ulong * to ulong
 lo = get w X5WIX
 ll = get w add X5WIX 1
@@ -2213,8 +2247,10 @@ kt = get w X5RKT
 if or eq kt 0 gt kt 3
 ret X5EALG
 end
-if and eq kt 1 eq x509_rsaok get w X5RBITS 0
+if eq kt 1
+if eq x509_rsapres part cl lo ll part w 0 X5RSZ 0
 ret X5EWEAK
+end
 end
 ret 0
 end
@@ -2353,7 +2389,7 @@ hb = 384
 end
 if and and ge scheme 0x0804 le scheme 0x0806 eq kt 1
 hb = add 256 mul sub scheme 0x0804 128
-if eq x509_rsaok get r X5RBITS 0
+if eq x509_rsapres part cl ulong 3 l view r 0
 ret X5EWEAK
 end
 end

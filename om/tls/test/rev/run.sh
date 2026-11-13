@@ -21,9 +21,9 @@ run() { nice -n 19 ionice -c3 "$@"; }
 
 [ "$(sha256sum < "$omc" | cut -c1-64)" = "$pin" ] || { say "FAIL omc is not the pinned compiler"; exit 1; }
 
-# build LIB DRIVER BIN
+# build LIB DRIVER BIN [X509]   (X509: the x509.om text to compose, default om/tls/x509.om)
 build() {
-	{ echo om2; cat "$tls/sha2.om" "$tls/hkdf.om" "$tls/ec.om" "$tls/rsa.om" "$tls/x509.om" "$1" "$2"; } > "$3.om"
+	{ echo om2; cat "$tls/sha2.om" "$tls/hkdf.om" "$tls/ec.om" "$tls/rsa.om" "${4:-$tls/x509.om}" "$1" "$2"; } > "$3.om"
 	if ! run "$omc" < "$3.om" > "$3" 2> "$3.err" || [ -s "$3.err" ]; then
 		say "omc refused $3.om: $(cat "$3.err")"
 		return 1
@@ -35,7 +35,8 @@ build "$tls/rev.om" "$here/driver.om" "$out/driver" || { say "REV FAIL build"; e
 say "omc     sha256 $pin"
 say "library sha256 $(sha256sum < "$tls/rev.om" | cut -c1-64) ($(grep -c '^fn ' "$tls/rev.om") functions)"
 say "driver  sha256 $(sha256sum < "$out/driver" | cut -c1-64)"
-cp "$vec/cases.txt" "$out/cases.txt"
+# cases.txt (gen_rev.py) and the weak revocation signers (gen_revweak.py)
+cat "$vec/cases.txt" "$vec/revweak/cases.txt" > "$out/cases.txt"
 ncase=$(grep -c '^[OUIHAE] ' "$out/cases.txt")
 
 # drive FILE BIN NAME -> sets rc, last
@@ -92,20 +93,39 @@ if command -v openssl > /dev/null 2>&1; then
 	say "PASS openssl oracle $oracle/$oraclen"
 fi
 
-# mutants: each must make the driver finish with exit 1 and MISMATCH lines (or trap)
+# mutants: each must make the driver finish with exit 1 and MISMATCH lines (or an Omega trap, 101..114)
 mut=0
 mutok=0
+# mutant SED NAME [x509 [ROWS]]: sed applied to rev.om, or to x509.om when the third argument is x509.
+# Any status other than 1 or an Omega trap (a launch failure 126/127, a signal 128+) is not a detection.
+# With ROWS (strict): only exit 1 with the completed driver summary (as many checks as the unmutated run,
+# $checks) and a MISMATCH for every named row.
 mutant() {
 	mut=$((mut + 1))
-	sed "$1" "$tls/rev.om" > "$out/mut-$2-lib.om"
-	if cmp -s "$tls/rev.om" "$out/mut-$2-lib.om"; then fail "mutant $2: sed changed nothing"; return; fi
-	if ! build "$out/mut-$2-lib.om" "$here/driver.om" "$out/mut-$2"; then fail "mutant $2: build"; return; fi
+	rows=${4:-}
+	src=$tls/rev.om
+	[ "${3:-}" != x509 ] || src=$tls/x509.om
+	sed "$1" "$src" > "$out/mut-$2-lib.om"
+	if cmp -s "$src" "$out/mut-$2-lib.om"; then fail "mutant $2: sed changed nothing"; return; fi
+	if [ "$src" = "$tls/rev.om" ]; then set -- "$1" "$2" "$out/mut-$2-lib.om" "$tls/x509.om"; else set -- "$1" "$2" "$tls/rev.om" "$out/mut-$2-lib.om"; fi
+	if ! build "$3" "$here/driver.om" "$out/mut-$2" "$4"; then fail "mutant $2: build"; return; fi
 	drive "$out/cases.txt" "$out/mut-$2" "mut-$2"
 	n=$(grep -c '^MISMATCH ' "$out/mut-$2.out" || true)
-	if [ "$rc" -eq 1 ] && [ "$n" -gt 0 ] && printf '%s\n' "$last" | grep -q "^rev driver: [0-9]* checks, $n failed$"; then
+	if [ -n "$rows" ]; then
+		miss=
+		for r in $rows; do grep -q "^MISMATCH line [0-9][0-9]* $r got " "$out/mut-$2.out" || miss="$miss $r"; done
+		if [ "$rc" -eq 1 ] && [ "$n" -gt 0 ] && [ -z "$miss" ] && [ -n "${checks:-}" ] && printf '%s\n' "$last" | grep -q "^rev driver: $checks checks, $n failed$"; then
+			mutok=$((mutok + 1))
+			say "PASS mutant $2 detected ($n MISMATCH, required rows:$(printf ' %s' $rows))"
+		else
+			fail "mutant $2 not detected as required: exit $rc, $n MISMATCH, rows without a MISMATCH:${miss:- none}: $last"
+		fi
+		return
+	fi
+	if [ "$rc" -eq 1 ] && [ "$n" -gt 0 ] && printf '%s\n' "$last" | grep -q "^rev driver: [0-9][0-9]* checks, $n failed$"; then
 		mutok=$((mutok + 1))
 		say "PASS mutant $2 detected ($n MISMATCH: $(grep '^MISMATCH ' "$out/mut-$2.out" | head -n 2 | cut -d' ' -f4 | tr '\n' ' '))"
-	elif [ "$rc" -ge 100 ]; then
+	elif [ "$rc" -ge 101 ] && [ "$rc" -le 114 ]; then
 		mutok=$((mutok + 1))
 		say "PASS mutant $2 detected (driver trapped, exit $rc, after $n MISMATCH)"
 	else
@@ -144,11 +164,14 @@ mutant 's/^if or eq o 11 eq o 15$/if eq o 99/' crl-delta-indirect
 mutant 's/^ret RVEREV$/ret 0/' revoked-verdict
 # SHA-1 round constant
 mutant 's/^ret 0x8f1bbcdc$/ret 0x8f1bbcdd/' sha1-constant
+# x509.om: the exponent policy merged into the RSA bit count again, so a 1024-bit CRL issuer or OCSP
+# responder with e = 2^32+1 passes chain_sig (revweak crl_issuer_rsa1024_e2_32_plus_1, ocsp_responder_*)
+mutant 's/^ret bits$/ret add bits mul sub 1 x509_rsaeok k 4294967296/' size-exponent-merged x509 'ocsp_responder_rsa1024_e2_32_plus_1 crl_issuer_rsa1024_e2_32_plus_1'
 # expectation mutant: one expected code changed
 mut=$((mut + 1))
 sed 's/^O ocsp_good X509_OK /O ocsp_good REV_ERR_STALE /' "$out/cases.txt" > "$out/mut-expect.txt"
 drive "$out/mut-expect.txt" "$out/driver" mut-expect
-if [ "$rc" -eq 1 ] && printf '%s\n' "$last" | grep -q '^rev driver: [0-9]* checks, 1 failed$' && grep -q '^MISMATCH .* ocsp_good ' "$out/mut-expect.out"; then
+if [ "$rc" -eq 1 ] && printf '%s\n' "$last" | grep -q '^rev driver: [0-9][0-9]* checks, 1 failed$' && grep -q '^MISMATCH .* ocsp_good ' "$out/mut-expect.out"; then
 	mutok=$((mutok + 1))
 	say "PASS mutant expectation detected"
 else
