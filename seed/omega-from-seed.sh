@@ -68,6 +68,14 @@ printf '%s  seed/out/omc\n' "$s3" > seed/out/omc.sha256
 chmod +x seed/out/omc
 printf 'PASS omc fixpoint %s\n' "$s3"
 
+# Record the measured compiler identity at birth; never hand-copy derived size fields.
+"$B/diaggen" "$SRC" seed/out/omc > "$B/size-record.tsv"
+if ! tail -1 seed/omc/size-history.tsv | grep -q "	$s3$"; then
+  cat "$B/size-record.tsv" >> seed/omc/size-history.tsv
+fi
+printf 'PASS generated compiler size record\n'
+python3 seed/omc/tests/size-record.py "$B/diaggen"
+
 # 6. The names pass, run by the seed-born compiler, not by a C tool.
 probe() { # name file expect-exit
   set +e

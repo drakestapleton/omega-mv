@@ -54,3 +54,10 @@ the corrected source and binary are independently pinned. The original
 boolean crash and corrected execution are both checked. This permits the
 intentional bug correction while keeping every corpus row in the byte
 comparison and retaining the historical no-pools behavior.
+
+## Compiler size record
+
+The seeded build generates the source line/function counts, encoded word count and
+compiler digest through diaggen size mode, and appends a row only for a new final
+compiler identity. Do not hand-copy those measurements. The independent size-record
+test checks content changes, exact counts and malformed executable refusals.
