@@ -157,6 +157,7 @@ defaults. The exit codes are listed in CONTRACT §7.
 ```sh
 ollm serve PORT CK MERGES [MAXCONN] [tplmax=N] [test=1]    # AArch64 Linux; prints "MODEL id", then "PORT n" once listening
 ollm-gb10 gserve PORT CK MERGES [MAXCONN] [tplmax=N] [test=1]   # the same server, logits from the GB10
+ollm-gb10 gserveb PORT CK MERGES [MAXCONN] [tplmax=N] [test=1]  # mixed BF16, see CONTRACT-BF16.md
 ```
 
 `serve.om` (aarch64 and gb10 builds; the x86 targets get `noserve.om`, which exits 2) answers
