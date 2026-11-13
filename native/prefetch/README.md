@@ -93,16 +93,16 @@ bytes. Each child has a30-second deadline. Scratch and child outputs remain
 available for inspection; the shell creates a separate directory on each run.
 
 The required compiler is this branch's seeded `seed/out/omc`, executable
-`106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed`, built from
-`seed/omc/omc.om` `eac9784b018dff579f8c1c187f209c241973d52d355f39a4729073379345521f`
+`a7a21591ee41d5a5b0a45bede36b08b4deeaf2ab593e5414f189134deae3767b`, built from
+`seed/omc/omc.om` `2446cea9a3fb1f6406fa82eab03c7508f5b875e13e945a4481d79a6e7d073393`
 (both pinned in `compiler.sha256`). The original qualification used the corrected
 mapping profile from Omega PR676 commit `1dffceaeb0dd26fb69ea64d367a49a9950c25a62`,
 executable 9f48f66a; the pin moved with each reseed (62775d2a, then 1578b357, then be8c5130,
-then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea, then cfd96b48, then 0f2de851, then 6d1b1cf5, then b87c8b65, then 564c5835, then 6844d173, then 0ed21175, then f4fa7951, then c52e986e, then 1e628c80, then 2495bc25, then a5613368, then 106558ba) and the gate was rerun (no rerun is
+then b4f45121, then 3ad9f10f, then b1d9cff6, then 5f90edea, then cfd96b48, then 0f2de851, then 6d1b1cf5, then b87c8b65, then 564c5835, then 6844d173, then 0ed21175, then f4fa7951, then c52e986e, then 1e628c80, then 2495bc25, then a5613368, then 106558ba, then a7a21591) and the gate was rerun (no rerun is
 recorded for b1d9cff6, 6d1b1cf5 or b87c8b65; at 564c5835 factory bay 1 reran the host gate on
-ham/omc-train e68b5914: 53/53 PASS; at 6844d173 it was rerun on ham/omc-perf-loops-5, at 0ed21175 on ham/om-threads-4, at f4fa7951 on ham/omc-perf-mem-3 at c52e986e on omc/no-caps, at 1e628c80 on omc/perf, at 2495bc25 on omc/inline-edges, at a5613368 on omc/pools and at 106558ba on completion/integrated-20261112). The compilers
+ham/omc-train e68b5914: 53/53 PASS; at 6844d173 it was rerun on ham/omc-perf-loops-5, at 0ed21175 on ham/om-threads-4, at f4fa7951 on ham/omc-perf-mem-3 at c52e986e on omc/no-caps, at 1e628c80 on omc/perf, at 2495bc25 on omc/inline-edges, at a5613368 on omc/pools, at 106558ba on completion/integrated-20261112 and at a7a21591 on amdserve/kfd-word-r2). The compilers
 through 3ad9f10f emit the same classifier bytes (b527a20c, pinned in `classify.sha256`). The
-hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6, 5f90edea, cfd96b48, 0f2de851, 6d1b1cf5, b87c8b65, 564c5835, 6844d173, 0ed21175, f4fa7951, c52e986e, 1e628c80, 2495bc25, a5613368 and 106558ba emit 5dd5bb47, so the
+hosted-x86 ABI1 lowering of #1050 changed them: b1d9cff6, 5f90edea, cfd96b48, 0f2de851, 6d1b1cf5, b87c8b65, 564c5835, 6844d173, 0ed21175, f4fa7951, c52e986e, 1e628c80, 2495bc25, a5613368, 106558ba and a7a21591 emit 5dd5bb47, so the
 chip entry refuses a classifier built with the current pin until `classify.sha256` is requalified
 (the host gate above passes 53/53 with 5f90edea). The entry refuses with 3 for any other compiler. It
 does not fetch code, accept an arbitrary environment compiler, silently select an
