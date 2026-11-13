@@ -27,9 +27,10 @@ static void poke(pid_t p, uint64_t a, uint64_t v) {
     if (ptrace(PTRACE_POKEDATA,p,(void *)(uintptr_t)a,(void *)(uintptr_t)v)) die("poke");
 }
 int main(int argc, char **argv) {
-    if (argc!=2 && argc!=4) return 90;
+    if (argc!=2 && argc!=3 && argc!=4) return 90;
     uint64_t wp=0,rp=0;
     if (argc==4) { wp=strtoull(argv[2],NULL,10); rp=strtoull(argv[3],NULL,10); }
+    uint64_t aperture_offset=argc==3 ? strtoull(argv[2],NULL,10) : 0;
     pid_t p=fork();
     if (p<0) die("fork");
     if (!p) {
@@ -71,6 +72,7 @@ int main(int argc, char **argv) {
                 uint64_t expected=base;
                 switch (q) {
                 case AMDKFD_IOC_GET_PROCESS_APERTURES_NEW:
+                    offsets[count++]=0; expected=argc==3 ? base+aperture_offset : payload; break;
                 case AMDKFD_IOC_WAIT_EVENTS:
                     offsets[count++]=0; expected=payload; break;
                 case AMDKFD_IOC_MAP_MEMORY_TO_GPU:
@@ -106,6 +108,7 @@ int main(int argc, char **argv) {
                 for (unsigned i=0;i<count;i++) poke(p,h+offsets[i],0xdeadbeef);
                 if (q==AMDKFD_IOC_GET_VERSION) poke(p,h,0x44332211);
                 if (q==AMDKFD_IOC_ALLOC_MEMORY_OF_GPU) poke(p,h+16,0x44332211);
+                if (q==AMDKFD_IOC_GET_PROCESS_APERTURES_NEW && argc==3) poke(p,h+8,7);
             }
         }
         entering=!entering;

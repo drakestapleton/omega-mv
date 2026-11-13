@@ -1404,7 +1404,7 @@ The suffix depends on the request:
 
 | Request | Suffix and binding |
 |---|---|
-| GET_PROCESS_APERTURES_NEW | `P poff pn`: writable byte span, count × 56 must fit |
+| GET_PROCESS_APERTURES_NEW | `P poff pn`: writable byte array span or live writable owned mapping handle; offset + length must not wrap and must fit the mapping, and count × 56 must fit `pn`; count zero and `pn` zero are legal |
 | MAP_MEMORY_TO_GPU, UNMAP_MEMORY_FROM_GPU | `P poff pn`: device IDs, count × 4 must fit |
 | WAIT_EVENTS | `P poff pn`: event records, count × 48 must fit; every extension pointer must be zero |
 | ALLOC_MEMORY_OF_GPU | `R`: live reservation handle; requested size must fit; USERPTR flag refused |
@@ -1420,6 +1420,7 @@ overlap. Copy-out excludes address fields, so those bytes remain zero even
 when the kernel returns an error. Invalid handles, kinds, sizes, addresses,
 overlapping spans, USERPTR and event extensions trap 3 (exit 103).
 Opaque kernel allocation handles and mmap offsets are values, not pointers.
+For the aperture mapping form, the private pointer is the checked mapping base plus `poff`; the header's `num_of_nodes` is copied back, including on a zero-count query, while its address bytes remain zero.
 
 **AMD queue object.** Naming one handle as both `wptr` and `rptr` selects the
 AMD queue layout. The positions come from the compiler, never from caller

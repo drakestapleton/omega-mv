@@ -92,6 +92,13 @@ def qsetup(size, prot=3):
     # Ring r and a separate queue-object mapping q of `size` bytes; queue type 2 is COMPUTE_AQL.
     return f'r = mapnew neg int 1 0 4096 3 34\nq = mapnew neg int 1 0 {size} {prot} 34\n'+put(32,4096)+put(40,2)
 
+def aperture(count=1, off=16, length=None, size=4096, prot=3, changes=''):
+    if length is None: length=count*56
+    setup=f'r = mapnew neg int 1 0 {size} {prot} 34\n'+put(8,count)
+    return source('GET_PROCESS_APERTURES_NEW',changes,setup_override=setup,
+                  suffix_override=f' r {off} {length}')
+
+
 def source(name, changes='', size=None, setup_override=None, suffix_override=None, request=None):
     q,n=abi[name]
     setup,suffix=shape(name)
@@ -100,6 +107,15 @@ def source(name, changes='', size=None, setup_override=None, suffix_override=Non
     if size is not None: n=size
     if request is not None: q=request
     return common+'fn main to int\n'+setup+changes+f'v = kfdctl neg int 1 {q} H 0 {n}{suffix}\nif ne v neg long 9\nret 80\nend\nret 0\nend\n'
+aperture_bad = {
+    'stale': aperture(changes='drop = mapdrop r\ns = mapnew neg int 1 0 4096 3 34\n'),
+    'dead': aperture(changes='drop = mapdrop r\n'),
+    'readonly': aperture(prot=1),
+    'extent': aperture(off=4090),
+    'wrap': aperture(off=2**64-16),
+    'count': aperture(count=3,length=2*56),
+    'address': aperture(changes=put(0,1,8)),
+}
 
 def compile_case(label, src, target, want=0, compiler=omc):
     stem=out/(target+'-'+label)
@@ -153,6 +169,12 @@ for target in ('a64','x86'):
                                ('queue-object-exact-2304',qsetup(2304),' r q q long 0 long 0'),
                                ('queue-base-distinct',qsetup(4096)+'p = mapnew neg int 1 0 4096 3 34\n',' r q p long 0 long 0')]:
         execute(label,compile_case(label,source('CREATE_QUEUE',setup_override=setup,suffix_override=suffix),target),target)
+    for label,src in [('count-query',aperture(count=0,length=0)),
+                      ('one',aperture()),('many-exact',aperture(count=7,size=16+7*56)),
+                      ('end-empty',aperture(count=0,off=4096,length=0))]:
+        execute('aperture-'+label,compile_case('aperture-'+label,src,target),target)
+    for label,src in aperture_bad.items():
+        execute('aperture-'+label,compile_case('aperture-'+label,src,target),target,103)
     dynamic_size=source('GET_VERSION',size='bad').replace('fn main to int\n','fn main to int\nbad = ulong 7\n')
     bads=[('wrong-request',source('GET_VERSION',request=0),0,9),
           ('wrong-size-literal',source('GET_VERSION',size=7),0,9),
@@ -273,6 +295,16 @@ if os.uname().machine=='aarch64':
             if b:
                 p=run([out/'trace',b]+([56,128] if name=='CREATE_QUEUE' else []))
                 record('trace '+name,p.returncode,0,p.stderr.decode())
+        checks=''.join(f'if ne get H {i} 0\nret 95\nend\n' for i in range(8))
+        checks+= ''.join(f'if ne get H {8+i} {b}\nret 96\nend\n'
+                         for i,b in enumerate((7).to_bytes(4,'little')))
+        for label,src in [('count',aperture(count=0,length=0)),('fill',aperture(count=7))]:
+            b=compile_case('trace-aperture-'+label,src.replace('ret 0\nend\n',checks+'ret 0\nend\n'),'a64')
+            if b:
+                for expected,want in [(16,0),(17,1)]:
+                    p=run([out/'trace',b,expected])
+                    record('trace aperture '+label+' expected-offset '+str(expected),
+                           p.returncode,want,p.stderr.decode())
     p=run(['cc','-Wall','-Wextra','-Werror',root/'tests/kfd/fdtrace.c','-o',out/'fdtrace'])
     record('fd trace oracle compile',p.returncode,0,p.stderr.decode())
     if not p.returncode:
@@ -334,6 +366,17 @@ mutants.extend([
      regular,False),
     ('sibling', [('ksize','fail 9\nret 0',f'if eq q {abi["DBG_TRAP"][0]}\nret {abi["DBG_TRAP"][1]}\nend\nfail 9\nret 0')],
      source('GET_VERSION',size=abi['DBG_TRAP'][1],request=abi['DBG_TRAP'][0]),False)])
+mutants.extend([
+    ('aperture-kind',[('kmspan','kfdcmpv 0 3\nkfdtrap 1','kfdcmpv 0 3')],aperture_bad['readonly'],False),
+    ('aperture-wrap',[('kmspan','kfdcmp 3 0\nkfdtrap 3','kfdcmp 3 0')],aperture_bad['wrap'],False),
+    ('aperture-extent',[('kmspan','kfdtrap 8','note planted missing mapping extent')],aperture_bad['extent'],False),
+    ('aperture-count',[('kspan','kfdcmp 0 2\nkfdtrap 8','kfdcmp 0 2')],aperture_bad['count'],False),
+    ('aperture-address',[('kfdzero','kfdtrap 1','note planted missing address refusal')],aperture_bad['address'],False),
+    ('aperture-generation',[
+        ('mcheck','e3 3942645760 31 10 14\ntrapc 1 3','e3 3942645760 31 10 14'),
+        ('xhmcheck','xrr 57 10 9\nxtrap 1 3','xrr 57 10 9')],
+        aperture_bad['stale'],False),
+])
 for label, patches, case, function in mutants:
     changed=original
     for fn,old,new in patches:
