@@ -283,3 +283,5 @@ Update this table in the same commit as the work it credits.
 
 | OpenAI Codex and Claude module recovery (under Drake Stapleton's direction) | Implemented typed native module storage and linking with independent native callers, relocation and cache controls, and checked allocation boundary tests. |
 | Claude Sonnet 5.5 (NG data-test recovery for L1206, under Drake Stapleton's direction) | Added the nominal, struct and layout rows to gate-front-ir (the 76-case data sweep in its classes, wrapped struct units, boundary and evaluation-order controls whose exits are fixed by the omc binary) and five lowering mutants for struct indexing, layout byte order and the retained seal check; targeted CPU-only results, no full gate claim. |
+
+| OpenAI Codex with Claude Sonnet 5.5 source audit and documentation support | NG runtime pools: non-escaping IR storage, independent validation/text readers, interpreter and Linux AArch64 execution, canonical source parity, all-width/order regressions and pool fault controls. |

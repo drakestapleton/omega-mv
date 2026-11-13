@@ -30,11 +30,26 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 | `sha256.om` | FIPS 180-4 SHA-256 shared by ngbuild, ngcheck and the gate. |
 | `ngcheck.om` | The validator: binary ΩIR on stdin, `ACCEPT <sha256> fns= blocks= ops=` or `ngcheck: CLASS at OFFSET` with the class as exit code (IR.md s11). Its own reader: it shares no code with `src/ir.om`. `ngcheck --table` prints the host word table it was built with. |
 | `ngtxt.om`, `ngas.om`, `ngdis.om` | Canonical text tools (IR.md s10): `ngas` text to binary, `ngdis` binary to text. A third independent decoder of the wire format. |
-| `ngrun.om` | The reference interpreter (IR.md s7): `ngrun FILE.ir [STEPS] [--scratch NEW-DIR] [-- ARGS...]` runs the program entry of an accepted unit; exit status = the entry's result, a failing check exits 100 + code. Host words follow IR.md s7.11: argument, environment, clock, id and cpu words execute (ARGS after `--` are arguments 1..), file words only inside the fresh `--scratch` directory on one-component names and descriptors ngrun created, and every other word prints `ngrun: refused host class C word W at OFFSET` and exits C, 115..123. Scalar f32/f64 bitcasts preserve all bits; every defined f32/f64 conversion mode and fused FMA are supported. Unsupported ops (vectors, tiles, kernels, fmath, f16/bf16/fp8) print `ngrun: unsupported op N at OFFSET` and exit 125. Its own limits stay off the trap exits 100..114: `ngrun FILE.ir STEPS` stops after STEPS executed ops (default 2^36, about an hour) with `ngrun: step limit at OFFSET` and exit 124, and an element outside the object its REF or SLICE names (reachable only from input ngcheck refuses) gives `ngrun: access outside storage at OFFSET` and exit 126. Its exit status is an IR result only for a unit ngcheck accepts; on refused input it means nothing. Back ends diff their output against it (D9). It reads through `src/ir.om`, the reader `ng` itself uses, so a diff against ngrun alone cannot see a reader fault both share: that is what the gate's run pairs are for, which judge ngrun against omc's build of the same program in Omega (no shared code). Exercised: `sub` operands swapped in both the reader and the writer of `ir.om` pass every round-trip and ir-copy case and are caught by the run pairs `x-fib` and `x-float`. The gate also mutates ngrun nine ways (fuel one pass late; rem MIN/-1, u64 `chk.add` and `chk.mul`, `chk.shl` negative side, signed conv lower bound, `chk.bounds` with e = 0, narrow `neg`, depth cap): each is caught by a run pair or an N case (`n-*.oir`, ngrun alone, for the semantics Omega cannot state). |
+| `ngrun.om` | The reference interpreter (IR.md s7): `ngrun FILE.ir [STEPS] [--scratch NEW-DIR] [-- ARGS...]` runs the program entry of an accepted unit; exit status = the entry's result, a failing check exits 100 + code. Host words follow IR.md s7.11: argument, environment, clock, id and cpu words execute (ARGS after `--` are arguments 1..), file words only inside the fresh `--scratch` directory on one-component names and descriptors ngrun created, and every other word prints `ngrun: refused host class C word W at OFFSET` and exits C, 115..123. Scalar f32/f64 bitcasts preserve all bits; every defined f32/f64 conversion mode and fused FMA are supported. Run-time pool ops 111..116 execute (IR.md s7.13); pool storage and the program's frames share one 16 MiB live-storage budget. Unsupported ops (vectors, tiles, kernels, fmath, f16/bf16/fp8) print `ngrun: unsupported op N at OFFSET` and exit 125. Its own limits stay off the trap exits 100..114: `ngrun FILE.ir STEPS` stops after STEPS executed ops (default 2^36, about an hour) with `ngrun: step limit at OFFSET` and exit 124, and an element outside the object its REF or SLICE names (reachable only from input ngcheck refuses) gives `ngrun: access outside storage at OFFSET` and exit 126. Its exit status is an IR result only for a unit ngcheck accepts; on refused input it means nothing. Back ends diff their output against it (D9). It reads through `src/ir.om`, the reader `ng` itself uses, so a diff against ngrun alone cannot see a reader fault both share: that is what the gate's run pairs are for, which judge ngrun against omc's build of the same program in Omega (no shared code). Exercised: `sub` operands swapped in both the reader and the writer of `ir.om` pass every round-trip and ir-copy case and are caught by the run pairs `x-fib` and `x-float`. The gate also mutates ngrun nine ways (fuel one pass late; rem MIN/-1, u64 `chk.add` and `chk.mul`, `chk.shl` negative side, signed conv lower bound, `chk.bounds` with e = 0, narrow `neg`, depth cap): each is caught by a run pair or an N case (`n-*.oir`, ngrun alone, for the semantics Omega cannot state). |
 | `ngrand.om` | Random programs, valid by construction (IR.md s10): `ngrand SEED` writes a binary unit (helpers, diamonds, counted loops, calls, checks with their codes, i64 memory, host write) built with `src/ir.om`; `ngrand tape FILE` replays a choice tape; `ngrand shrink SEED STATUS OUT CMD [ARG...]` deletes and zeroes tape bytes while `CMD ARG... OUT` exits STATUS and leaves the smallest unit in OUT and its tape in OUT.tape (the predicate runs at most 20001 times). The D9 differential source: a back end runs the same units as ngrun and the outputs must agree. |
 | `tests/ir/` | Text fixtures (`*.oir`), run pairs (`x-*.oir` + `x-*.om`) and `cases`, the expectations the gate runs. |
 | `tests/opt/` | Optimizer fixtures (`O`/`L` lines of `tests/ir/cases`): ng-front's 23 lowered run units and six by hand (`o-pre2`, `o-zero`, `o-bce0`, `o-bce1`, and the kernel loops `o-shfl` and `o-mma`, whose invariant `shfl` and `mma` must not leave the loop). |
 | `gate-ir.om` | The ΩIR gate. |
+
+## Run-time pools
+
+`global NAME T *` lowers to a class 2 global and six descriptor-based operations:
+`pool.grow`, `pool.len`, `pool.load`, `pool.store`, `pool.read`, and `pool.write`.
+See [IR.md, section 7.13](IR.md#713-run-time-pool-ops-111116) for types, tokens, and bounds.
+No REF or SLICE can name pool storage, so growth during operand evaluation cannot leave a stale address.
+
+The interpreter and Linux AArch64 back end support these operations. The interpreter keeps its
+16 MiB combined live-storage budget and existing host I/O policy; Linux uses mmap/mremap and the
+host's allocation limits. Mach-O pool operations are explicitly unsupported. This does not add
+other host words to the native back end or pool operations to kernels.
+
+Regression coverage is in the IR, source-lowering and AArch64 gates below. Full front check parity
+is also required by `tests/gates/run.sh seed`.
 
 ## Build and gate
 
@@ -170,8 +185,8 @@ one block; past a64's 262144 branch fixups a function, 270,000 overflow branches
 omc compile and run each and ng check, lower, compile and run it, and requires the same answers. 32 mutants
 (each old table or loop bound put back, the trap-label tag of a64 back at 1000, a moved region losing its words)
 must be KILLED, and a control (a wrong expected answer) tripped. The usage alarm: ng checks
-`seed/node/journal-gate.om` (a large real first-party unit; `seed/omc/omc.om` declares a run-time pool, which
-ng refuses as scope) and its own units after a `usage` line; the arena top must stay at or below 10% of the
+`seed/node/journal-gate.om` (a large real first-party unit) and its own units after a `usage` line;
+the arena top must stay at or below 10% of the
 arena, every group at or below 5%, a check at or below 2 s; ng with the arena shrunk to 1048576 words must
 trip it. With NG given, that binary
 is judged and nothing is built (the ng of the base must FAIL here). Last line `NOCAPSGATE PASS cases=31 fail=0

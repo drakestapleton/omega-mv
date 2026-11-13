@@ -8,7 +8,7 @@ run-time pool grown by `a_need` (doubling, `a_grow`); gates `seed/rung4/gate4.sh
 `seed/omc/gate-nocaps.sh` section 3, `gate12.sh`, `gate-usage.sh` (absolute words; its mutant control is
 a_need's doubling made +512 entries, see section 7 item 14); first user (section 11) compiled and run.
 ng-front refuses `global NAME T *` as a scope form (exit 64; the ng lane, NgNoCaps2), so
-`seed/omc/omc.om` is a declared `scope 0` row of `seed/ng/front/gate-front.om` (section 6). Amended
+`seed/omc/omc.om` is a declared `scope 0` row of `seed/ng/front/gate-front.om` (section 6). (Historical state of 2026-11-11; section 12 supersedes the two NG pool scope exclusions.) Amended
 2026-11-11 (section 6, "The memory ceiling"): the growing arena refuses past a caller-stated real-memory
 ceiling, `OMC_MEMORY_MAX`. Revision 2 takes in the
 independent design review (consult-codex, 2026-11-11, findings B1-B2, S1-S8, N1-N4; recorded in section
@@ -274,13 +274,14 @@ RLIMIT_AS bounds address space, not memory, and decision 2 asks the sandboxes to
   timeout or a kill (its compile timeout is 10 s, `driver.sh`). Every caller that clears the environment (`bwrap --clearenv`, `execenv`, `execpure`)
   passes the variable explicitly; each owner makes that change.
 
-omc.om has one more consumer that this section first missed: `seed/ng/front/cases-front.txt` runs
+Historical landing-2 consumer handling (superseded for NG pools by section 12): `seed/ng/front/cases-front.txt` runs
 `seed/omc/omc.om` as an ng parity case (`gate-front.om`), so a pool in omc.om needs ng-front to treat
 `global NAME T *` as a scope form (exit 64; the ng lane, NgNoCaps2, landed it with `seed/ng/front/cases/pool_runtime.om`). Landing 2 carries the row
 `seed/omc/omc.om scope 0` in `seed/ng/front/declared.txt`.
 A second consumer is ng's no-caps gate: `seed/ng/tests/nocaps/gate.om` (unit 0, gn_uin) feeds `seed/omc/omc.om` to
 ng front-check in usage mode as a large real unit, which ng refuses as a scope form (exit 64) once omc.om
 holds a pool; the ng lane (NgNoCaps2) chooses between a pinned pre-pool omc.om as that unit and accepting 64.
+(Current gate: `gn_uin` uses `seed/node/journal-gate.om` and ng itself for the usage alarm. The earlier omc-based description is historical.)
 
 ## 7. Gates, all with negative controls (S7)
 
@@ -433,3 +434,25 @@ designed, it does:
 - The gates of the first landing add a server-shaped case: a loop that serves requests of growing and
   shrinking size from one pool, enlarging only past its high-water mark, with RSS checked to stay at that
   mark.
+
+## 12. NG runtime pools
+
+NG represents each pool as a class 2 global whose type is the scalar element type, with six
+token-ordered operations (111..116). See [the complete IR contract](../seed/ng/IR.md#713-run-time-pool-ops-111116).
+No REF or SLICE exposes the storage. Each access resolves the descriptor and checks bounds after
+its operands, preserving section 4's store order even when an operand grows a pool.
+
+Linux AArch64 uses the canonical mmap/mremap growth helper. The reference interpreter stores pools
+separately from frames while enforcing one 16 MiB live-storage budget; allocation refusal preserves
+all existing contents. Mach-O pool ops are explicitly unsupported. Native support for other host
+words is unchanged. Pool ops are host-only and have no GPU lowering.
+
+`ngcheck` rejects illegal element types, pointer escape, kernel placement, argument types and token
+use. Text tools preserve type-invalid inputs for independent validation; they reject unknown wire
+classes. The front end removes its old pool scope exclusions, while existing x86/EFI and IR v1 scope
+exclusions remain.
+
+The IR, front-lowering and AArch64 gates contain the regression cases and negative controls.
+The canonical pool source fixtures are reused for differential execution. Release evidence records
+their results and source/compiler identities. Memory measurements can use an external /proc reader
+when the native back end cannot yet lower the RSS fixture's `fopen`; that adaptation must be recorded.

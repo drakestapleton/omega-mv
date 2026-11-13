@@ -30,7 +30,8 @@ relative to every observable effect a dataflow edge, and only checked contracts 
    only where its token edge lets it; the two legal ways to remove one are s15.
 4. **Memory access is covered.** Every memory access op must be dominated by a bounds check or a
    bounds fact on the same SSA values, and read the token at or after it (s8). The validator
-   enforces this, so an optimizer deletes a check only by putting a fact in its place.
+   enforces this, so an optimizer deletes a check only by putting a fact in its place. The one
+   exception is the run-time pool ops (s7.13), which hold their own bounds test and expose no address.
 5. **Facts carry authority only when checked (D2c).** A front-end fact must sit under the runtime
    check that establishes it; a pass-made fact names the pass whose proof it is (s7.10).
 6. **Target facts are not IR.** Calling convention, register classes, clobbers, subgroup width
@@ -111,7 +112,7 @@ element; STRUCT its size. Scalars in memory are little-endian unless a STRUCT fi
 
 ## 5. Globals
 
-Entry: `type u32` (an ARRAY), `class u8`, then for class 1 the initial bytes:
+Entry: `type u32` (an ARRAY for classes 0 and 1; a scalar element type for class 2), `class u8`, then for class 1 the initial bytes:
 
 | class | meaning | data |
 |---|---|---|
@@ -120,6 +121,15 @@ Entry: `type u32` (an ARRAY), `class u8`, then for class 1 the initial bytes:
 
 Global ids are table indices. `gaddr` (s7.5) gives a REF to one; a REF with access 1 to a class 1
 global is refused (TYPE).
+
+**Class 2, run-time pool (s7.13).** `type`
+is not an ARRAY but the *element type id* itself, one of the native pool scalars: u8 u16 u32 u64 i8
+i16 i32 i64 f32 f64 (ids 2..9, 13, 14). Never bool, vectors, structs, ARRAYs, REFs, SLICEs or the
+reduced-precision floats (TYPE). There are no data bytes. The pool starts with zero elements; its
+length only grows (`pool.grow`), and its storage is zero-filled and may move whenever it grows. Because
+the storage can move, no REF or SLICE to it can exist: `gaddr` of a class 2 global is TYPE, no op takes a
+pool as a value, and every access names the global id as an immediate (s7.13). A class byte above 2 is
+NONCANONICAL. Classes 0 and 1 and every existing op are unchanged.
 
 ## 6. Functions
 
@@ -188,8 +198,8 @@ s7.12):
 
 | class | ops | rule |
 |---|---|---|
-| E effect | every `chk.*`, `store fstore vstore fill atom atomcas mmast alloca sync call launch host` | operand 0 is the current token; the op defines a new token, which becomes current |
-| R reader | `load fload vload mmald slice` | operand 0 is a token defined in this block at or before the current one, or one that dominates the block (the memory state it reads; s8 bounds which) |
+| E effect | every `chk.*`, `store fstore vstore fill atom atomcas mmast alloca sync call launch host`, and the pool ops `pool.grow pool.store pool.read pool.write` | operand 0 is the current token; the op defines a new token, which becomes current |
+| R reader | `load fload vload mmald slice`, and the pool ops `pool.len pool.load` | operand 0 is a token defined in this block at or before the current one, or one that dominates the block (the memory state it reads; s8 bounds which) |
 | T terminator | `br cbr ret retv trap exit` | operand 0 of `br`'s arguments, and operand 0 of the others, is the current token |
 
 All other ops take no token. A token value is used only as operand 0 of an E, R or T op (TOKEN,
@@ -641,9 +651,94 @@ value), 0 always 0.
 | 105 | `mmast` | E | y | 5 | - | 0 |
 | 106 | `mma` | P | y | 3 | - | r |
 | 110 | `host` | E | y | 0 | y | o |
+| 111 | `pool.grow` | E | y | 1 | - | r |
+| 112 | `pool.len` | R | y | 0 | - | r |
+| 113 | `pool.load` | R | y | 1 | - | r |
+| 114 | `pool.store` | E | y | 2 | - | 0 |
+| 115, 116 | `pool.read pool.write` | E | y | 3 | - | r |
+
+For the pool rows (111..116) the imm is the pool's global id, written on the wire exactly as the `gaddr`
+imm is (the in-memory form holds the handle, the writer subtracts 1, the reader adds 1; s14).
 
 Every op byte not in the table is UNKNOWN_OP. `shfl`, `mma`, `mmald`, `mmast` and `sync` are
 *convergent*: an optimizer never moves them into or out of a branch, and never duplicates them.
+
+### 7.13 Run-time pool ops (111..116)
+
+Each op names its pool by the global id in `imm` (a class 2 global, s5); none takes a pool, a REF or a
+SLICE as an operand and none returns one. Every op is **self-contained and checked**: the bounds test is
+part of the op, so none needs a `chk.bounds`, `chk.slice` or fact, and none is an access op of s8. The
+current length and base are read from the pool's descriptor *when the op executes*, after every operand
+has been evaluated, so storage that moved while an operand was being computed (a call inside an operand
+that grew the pool) is never used stale. `u64` is type id 5, `i64` type id 9, `i32` type id 8.
+
+| op | name | ty | imm | operands (after the token) | meaning |
+|---|---|---|---|---|---|
+| 111 | `pool.grow` | i64 | pool id | n (u64) | E. Make the pool at least n elements. Result 0: grown, or n <= length (no shrink); new elements are zero, old ones kept. -22: n times the element size is 2^63 bytes or more; the pool is unchanged. -12: the host refused (or, in ngrun, the 16 MiB budget would be exceeded); the pool is unchanged. Advances the token. |
+| 112 | `pool.len` | u64 | pool id | - | R. The current element count. Reads the token, does not advance it. |
+| 113 | `pool.load` | the pool's element type | pool id | i (u64) | R. Element i. Trap 3 (exit 103) if i is at or past the current length. |
+| 114 | `pool.store` | 0 | pool id | i (u64), v (element type) | E. Element i = v. Index and value are both evaluated, then the descriptor is resolved, then the bound is checked; trap 3 (exit 103) before any store when i is at or past the length. Advances the token. |
+| 115 | `pool.read` | i64 | pool id | fd (i32), off (u64), n (u64) | E. Host `read` of n bytes from fd into bytes off .. off+n-1 of the pool. Trap 3 (exit 103) unless off <= length and n <= length - off. Result: the byte count, or minus the Linux errno. Advances the token. |
+| 116 | `pool.write` | i64 | pool id | fd (i32), off (u64), n (u64) | E. As `pool.read`, writing those bytes to fd. |
+
+Rules ngcheck enforces (exit classes of s11, from `ck_tpool` and `ck_place`): the id must name a global
+(REF 24) of class 2 (TYPE 16); `pool.len` has type u64; `pool.grow` type i64 with a u64 operand;
+`pool.load` the element type with a u64 index; `pool.store` a u64 index and an element-typed value;
+`pool.read` and `pool.write` type i64, an i32 descriptor, u64 offset and count, and a *u8* pool (TYPE 16 for
+any other element type). Pool ops are refused in a kernel (EFFECT 22). A `gaddr` of a class 2 global is
+TYPE 16. A class 2 global whose type is not one of the ten native scalars is TYPE 16; a class above 2 is
+NONCANONICAL 13.
+
+Order and meaning of `pool.grow` results, taken from the implementations:
+
+- `-22` when n times the element size exceeds 2^63 - 1 bytes, which is the same as "reaches 2^63 or more"
+  (`ngrun` tests `n > 9223372036854775807 / size`). The pool is unchanged. The a64 path uses omc's helper
+  for this test. The boundary cases are `g8b.om` and `x-pool-widths.om`.
+- `-12` when the host refuses. Under `ngrun` the host is its own 16 MiB budget (s7.13.2).
+
+#### 7.13.1 Text and wire
+
+Text: `global @gN ELEMENT pool` (class 2; ELEMENT is the built-in scalar name, for example `u32`), and for the
+ops the imm prints as `@gN` right after the (optional) result type, as `gaddr` does:
+
+    global @g0 u32 pool
+    %2 %3 = pool.grow i64 @g0 %0 %1
+    %6 = pool.store @g0 %2 %4 %5
+    %7 = pool.load u32 @g0 %6 %4
+
+(See the complete fixture `tests/ir/x-pool.oir`.) `ngas` reads the word `pool` as
+class 2 and takes the ops' imm as `@gN`; `ngdis` prints them back. The wire version byte (9) and the tag are
+not changed by this addition; a reader built before it refuses class 2 (NONCANONICAL) and ops 111..116
+(UNKNOWN_OP).
+
+#### 7.13.2 Back ends and the reference interpreter
+
+- **`ngrun`** (reference interpreter) supports every pool op. Pool storage is kept apart from invocation
+  frames and the interpreted program's `alloca`/global memory, but both draw on **one combined live-storage
+  budget of 16 MiB** (the interpreter's established bound, kept as it was): `pool.grow` returns -12 when the
+  new bytes would not fit beside the storage already in use, leaving every existing pool intact, and a
+  frame allocation that no longer fits beside the pools is the existing exit 106 (trap 6). Growing a pool
+  moves the pools after it; no pool op yields an address, so no IR value can go stale. This 16 MiB is the
+  interpreter's own storage bound, not a rule of the language.
+- **`@ng a64` for Linux AArch64** (`@ng a64`, `@ng a64 split`) lowers every pool op. A pool is a 16-byte
+  descriptor (base, length) in the global area, as omc's slot is. The descriptor is loaded after the operands;
+  `pool.grow` emits an mmap/mremap helper whose instruction words the source copies from omc's `en_help`.
+- **The Mach-O (macOS) target is not supported for pools.** `@ng a64 macho` refuses any pool op explicitly
+  (an `a64: unsupported` line naming the op, exit 5, from `a6_die 5 5 op` in the source), and
+  does not guess an equivalent. It stays refused until a matched Darwin helper exists.
+- **Host only.** Pool ops are refused in kernels (EFFECT), and there is no GPU lowering.
+
+#### 7.13.3 Regression coverage
+
+`gate-ir.om` checks the `x-pool*` run pairs, malformed `r*-pool-*` inputs, byte/text round trips,
+and `o-pool` before and after optimization. Its pool mutants corrupt stored bytes, zero filling, and
+relocation of another pool. `front/gate-front-ir.om` compares the canonical source pool cases and
+`pool-widths-order.om` with omc. `a64/rgate.om` compares both register-save modes and exercises
+native bounds, descriptor-update and float-index mutants. Release receipts must bind the complete
+gate results to their source and compiler identities.
+
+Pool I/O retains the interpreter's host policy (s7.11), including descriptor ownership restrictions.
+A refused pool read/write names host word 53/54 in the existing diagnostic.
 
 ## 8. Coverage (the memory safety rule)
 
@@ -665,6 +760,10 @@ An access op A with token operand t is covered by a check or fact op C when
 A REF obtained from `gaddr`, `alloca`, `shared` or `fref` is still covered this way: the check is
 explicit even when the bound is a constant, and a pass replaces a proven check by a fact (s15). An
 uncovered access is UNCHECKED.
+
+The pool ops (s7.13) are the one family outside this table: each carries its own bounds test against the
+pool's current length, so they need no `chk.*` or fact and ngcheck demands none. A pool has no REF, so a
+check on a pool can never be separated from its access by a growth that moves the storage.
 
 ## 9. Structural rules ngcheck enforces
 
@@ -900,6 +999,12 @@ table full while building)` and exit 23, never an index past it (`ir_lim`).
 
 | Omega | ΩIR |
 |---|---|
+| `global P T *` (run-time pool) | a class 2 global of element type T (s5); the front end gives it a private name kind and never a REF |
+| `len P` | `pool.len` |
+| `get P i` | the index is evaluated, then `pool.load` (its own bound test, trap 3) |
+| `put P i v` | index, then value, then `pool.store`; the descriptor is read after both |
+| `r = enlarge P n` | n (u64) evaluated, then `pool.grow`; its i64 result is r |
+| `read fd P off n`, `write fd P off n` | `pool.read`, `pool.write` (u8 pools only), no separate `chk.slice` |
 | signed `add x y` | `t1 = chk.add 1 t x y`, then `add` |
 | `div a b` signed | `chk.divz 2 b`, `chk.divovf 1 a b`, then `div` |
 | `rem a b` | `chk.divz 2 b`, `rem` |
@@ -974,7 +1079,7 @@ keeps its LIMIT and the gate row pins the verdict of this reader (the class of s
 (for example `M a-fib 31 1 23 28 13 42`: a globals count of 16777216; the reader resolves a global's type
 only for class 1, so it reads on to the first class byte outside s5, NONCANONICAL at that record). Otherwise
 ng must give the bytes back exactly or, where ngcheck refuses, refuse with a class of s11 and empty stdout.
-In the tables a `gaddr` imm is the global's handle (the writer subtracts 1, the reader adds 1); every other
+In the tables a `gaddr` imm, and the imm of each pool op 111..116 (s7.13), is the global's handle (the writer subtracts 1, the reader adds 1); every other
 imm is the wire value.
 
 Register budget: omc gives a function 16 registers, and each global array read in one expression

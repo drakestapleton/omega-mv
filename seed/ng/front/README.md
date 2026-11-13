@@ -41,8 +41,8 @@ or a C twin): NOT_RUN until ng emits code. The value slots of `fe_alloc` keep om
 without the cap (slots past 16 share a number); ΩIR values replace them.
 
 Units ng does not take exit 64 and are `scope` rows (`NAME scope K REASON`, omc must exit K): x86/EFI
-targets (D8), IR v1 units (first line `ir`) and run-time pools (`global NAME T *`, OMEGESE 9.15;
-`cases/pool_runtime.om`). A bound of ng's own that omc never reaches because
+targets (D8) and IR v1 units (first line `ir`). Runtime pools are accepted, so their former
+scope rows are removed from `declared.txt`. A bound of ng's own that omc never reaches because
 another omc limit refuses first is an `ngonly` row (`NAME ngonly K REASON`): both must exit K, and
 their stderr lines differ (none today). omc has had no table capacities since 2026-11-11 (OMEGESE 9.6), and
 ng's front has had none since the same day (no-caps arena, `src/ir.om` `ar_*`): its input, names, long names,
@@ -61,7 +61,7 @@ fmt units get all of omc's checks (`fe_fmtprep`) and no formatted text.
 An input of any size the arena holds is read whole (cases `size_*`, newlines only: both compilers' error 16). The
 one input edge that is main.om's: a stdin read error is `ng: refused class 27` (omc: error 1).
 
-Without a run-time pool declaration, `enlarge` (keyword 244, omc pools landing 1) is reserved and its misuses receive omc's same code and line (`cases/pool_enlarge_*.om`); pool `len`, `get`, `put`, `read` and `write` add no words or non-pool forms.
+`enlarge` (keyword 244, omc pools landing 1) is reserved in every unit. Without a pool to name, its misuses receive omc's same code and line (`cases/pool_enlarge_*.om`); pool `len`, `get`, `put`, `read` and `write` add no words or non-pool forms. With a pool, `NAME = enlarge P n` is accepted and lowered (below).
 
 ## Gate
 
@@ -276,5 +276,17 @@ not return int (`cases/nom_tN.om`, `sh cases/nom-wrap.sh check` verifies them ag
 and boundary and evaluation-order controls `cases/nom_*.om` whose exits and stdout are those of the omc binary.
 Mutants 14 to 18 of `gate-front-ir.om` change struct field indexing, the array bound, layout byte order and the
 dup32 retained check; each pattern occurs once in `src/front.om`, so a rewrite of those lines makes the gate
-report the pattern missing, loudly. Run-time pools are not lowered; `cases/pool_runtime.om` stays a declared scope
-case. `COVERAGE.md` lists what was run and the limits.
+report the pattern missing, loudly. `COVERAGE.md` lists what was run and the limits.
+
+## Run-time pools
+
+`global NAME T *` uses a class 2 global with a scalar element type. `len`, `get`, `put`,
+`read`, `write` and assignment-form `enlarge` lower to ops 111..116; [IR.md](../IR.md)
+defines their types, tokens, bounds and storage contract. A store evaluates index, then value,
+then resolves and checks the current descriptor. Pool storage never becomes a REF or SLICE.
+
+The canonical pool fixtures and `pool-widths-order.om` exercise source execution against omc;
+`pool-fd-policy.om` retains the interpreter's host restrictions. The old scope rows for
+`pool_runtime.om` and `seed/omc/omc.om` are removed. Existing target and IR v1 exclusions remain.
+The full front check, lowering, IR and native gates are required for release; their receipts carry
+the actual results. Linux AArch64 and the interpreter support pools; Mach-O pool ops remain unsupported.

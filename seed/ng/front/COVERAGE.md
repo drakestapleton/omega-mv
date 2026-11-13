@@ -31,7 +31,7 @@ The packed C2 manifest is surveyed separately.
 | fsqrt fabs bitcast | Y | Fixture-scoped only; generally unproven | subject to operand construct coverage |
 | fmin fmax fma | Y: fma (ng-groups-4), fmin/fmax (ng-front-groups-6) | fixture-scoped only: cases/fma_mix.om (fused against unfused), cases/fmm_mix.om (signed zeros, quiet and signaling NaNs, both widths) | none for scalar f32/f64 |
 | true false = ( ) | Y | Fixture-scoped only; generally unproven |  |
-| get put len new | P | Fixture-scoped only; generally unproven | scalar arrays, struct fields and layout fields lower in the parent's candidate `fe_lst*`/`fe_lly*` (see Nominal section below); run-time pools absent |
+| get put len new | P | Fixture-scoped only; generally unproven | scalar arrays, struct fields and layout fields lower in the parent's candidate `fe_lst*`/`fe_lly*` (see Nominal section below); runtime pools lower through checked descriptor operations; see "Runtime pools" below |
 | view edit part | Y (sized parameters as SLICE: ng-front-groups-8) | Fixture-scoped only; generally unproven |  |
 | global text const | Y (empty text, bool and qty const: ng-front-groups-7, -8) | Fixture-scoped only; generally unproven |  |
 | struct layout field at little big sizeof offsetof | Y in the candidate (seed/ng/src/front.om, uncommitted when this row was written) | host-EXERCISED only: gate-front-ir `nom-*` rows (31 run, 54 refuse) | struct bool fields (below); functions without main stay function mode |
@@ -272,7 +272,7 @@ The dated sections above preserve earlier refusal boundaries. The current lowere
 executes checked function and loop prefixes, and lowers nominal types, structs and
 layouts. See [README.md](README.md) for ordering and release policy. The canonical
 compiler contract manifest feeds the differential gate directly. Function mode
-and runtime-pool lowering remain separate work.
+remains separate work. Runtime-pool lowering is described below.
 
 ## Nominal, struct and layout lowering: current gate coverage
 
@@ -300,5 +300,21 @@ The gate exercises:
   in [gate-front-ir.om](gate-front-ir.om). A partial case run is not a complete gate.
 
 Release evidence must retain the complete `FRONTIRGATE PASS` result and its source
-and compiler identities, alongside the separate check-parity gate. Runtime pools
-remain outside lowering scope (`cases/pool_runtime.om`, exit 64).
+and compiler identities, alongside the separate check-parity gate.
+
+## Runtime pools
+
+The front end accepts `global NAME T *` for the ten native numeric types and lowers growth, length,
+element access and byte I/O to the descriptor-based operations in [IR.md](../IR.md).
+`cases/pool_runtime.om` and `seed/omc/omc.om` are ordinary check-parity cases now; their former
+scope exclusions are removed. Existing x86/EFI and IR v1 scope exclusions remain.
+
+The lowering manifest reuses the canonical pool cases for growth, bounds, moving storage,
+contracts, overflow and byte I/O. `pool-widths-order.om` covers all ten widths, multiple pools,
+nested growth and store operand order. `pool-fd-policy.om` covers the interpreter's existing
+descriptor restrictions. The IR and native gates separately cover malformed inputs, optimization,
+both register-save modes and deliberate pool implementation faults.
+
+These fixtures define coverage, not a claim that every input or target is qualified. Release receipts
+must include complete gate results. The interpreter has a 16 MiB live-storage budget, Mach-O pool
+operations remain unsupported, and function mode remains separate work.
