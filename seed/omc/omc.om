@@ -5,29 +5,37 @@ note extend that subset; om4 still builds this compiler, and the compiler rebuil
 note All compiler state lives in global pools (decision 24: no heap). Every working value is a ulong
 note (raw 64 bits) so the language's checked conversions never fire on om4's untyped-register logic.
 
-note ---- the arena (decision 23 as amended 2026-11-11, OMEGESE 9.6). Every table whose size grows with the
+note ---- the arena (decision 23 as amended 2026-11-11, OMEGESE 9.6; grown at run time since landing 2 of the
+note run-time pools, decision 3 of 2026-11-11, docs/RUNTIME-POOLS.md s6). Every table whose size grows with the
 note unit (the input, the output, names, long names, functions and their parameters, call sites, trap sites,
 note blocks, breaks, value nesting, the x86 fixups, the om2 diag sites) is a region of the one pool a_ar.
-note A region starts small and doubles when an index reaches its capacity (a_need), so no table fills while
-note the arena has room: the only capacity left is the arena itself, and running out of it is error 14 with
-note an omc-use record on stderr naming every group and the words it held (a_full, a_rec).
-note The arena's size is the length of a_ar, written once below. What bounds it today:
-note  1. The program image. omc has no run-time growth (no heap, decision 24, omega-mv #793 #795): every pool
-note     is zero-filled .bss in its memory image, and the whole image counts toward RLIMIT_AS at exec even
-note     though untouched pages are never resident (measured 2026-11-11 at omc f4fa7951: data PT_LOAD filesz
-note     0 memsz 61 MB; resident 512 KB on a tiny unit; under prlimit --as=50000000 omc dies with SIGSEGV
-note     at exec, at 80000000 it runs). The smallest RLIMIT_AS omc must run under is the interplane-forge
-note     salvage compile, 268435456 (salvage/10verify.om); a static image whose data segment is at most
-note     268296192 bytes still execs there (omega-mcp 536870912: 536731648; forged 4294967296: 4294828032).
-note  2. One pool is at most 16777216 elements (OMEGESE 9.4, om4 ARRLEN), so a ulong arena is 128 MiB.
-note With the 8 MiB stack pool and the other pools omc's image stays far below the salvage limit.
-note It is a consequence of having no run-time growth, not a design goal: when a program can map memory
-note at run time, the arena grows instead of refusing.
+note A region starts small and doubles when an index reaches its capacity (a_need), so no table fills.
+note a_ar is a run-time pool (global a_ar ulong *, OMEGESE 9.15): its length is 0 when omc starts, and a_need
+note enlarges it (a_grow) whenever a group's growth would not fit in the words left: to twice its length, or
+note to what the tables need when that is more. So omc has no arena size of its own: the host is the bound.
+note When the host refuses (enlarge's negative result, for example under prlimit --as), the arena is compacted
+note and the group grows in place to the largest size that fits; when not even one more entry fits, the unit
+note is error 14 with an omc-use record on stderr (full=1: the host refused) naming every group and the words
+note it held (a_full, a_rec). The static 128 MiB arena this replaces was sized by omc's image under the
+note smallest RLIMIT_AS omc runs under (the interplane-forge salvage compile, 268435456) and by the 16777216
+note elements of a sized pool (OMEGESE 9.4); a run-time pool is bounded by neither, and the image no longer
+note holds the arena.
 note a_rb / a_rw: a region's first word and the words it holds; a_rg its group; a_rm its elements per group
 note index (0: a byte region, 8 bytes to a word); a_gc / a_gp a group's capacity and the highest index it
 note was asked for, plus 1; a_top the words handed out; a_wst the words left behind by moves; a_fl 1 while
 note error 14 is the arena's; a_nr the region count; a_wb the staging bytes of read and write.
-global a_ar ulong 16777216
+global a_ar ulong *
+note a_cel: the caller-stated memory ceiling C in bytes (OMC_MEMORY_MAX, a_env; 0: none). The arena's bytes A, the
+note output's bytes O (written to stdout they are page cache of the same cgroup) and the margin 16 MiB + A / 128
+note stay within C (docs/RUNTIME-POOLS.md s6, "The memory ceiling"): a_capw at every growth, a_ceilo before the write
+global a_cel ulong 1
+note a_rdy: 1 once a_init has given every region its first room (a_need compacts only then, or while region 0 is alone)
+global a_rdy ulong 1
+note a_hw: the most words a_top ever held (a_hwset); a compaction lowers a_top, not the pages it touched
+global a_hw ulong 1
+text a_envk "OMC_MEMORY_MAX="
+note a_eb: one environment entry (Linux keeps each below 131072 bytes, MAX_ARG_STRLEN)
+global a_eb uchar 131072
 global a_rb ulong 96
 global a_rw ulong 96
 global a_rg ulong 96
@@ -402,9 +410,10 @@ note region of the group grows to twice the capacity (at least n + 1, at least 6
 note it is not there already. When the moved copies do not fit in the free words, the arena is compacted
 note (a_compact: the words moved regions left behind are reclaimed) and the group grows in place
 note (a_relayout: everything above its first region slides up), to twice when that fits, else to the
-note largest capacity that does (a_gfit). So a table is refused (error 14) only when the live tables with
-note its group grown by one entry no longer fit in the arena. a_gp keeps the highest index asked for,
-note plus 1, for the omc-use record.
+note largest capacity that does (a_gfit). Before that the arena itself grows (a_grow); the compaction runs
+note only when the host refused. So a table is refused (error 14) only when the host refuses the arena's
+note growth and the live tables with its group grown by one entry no longer fit in the arena as it is.
+note a_gp keeps the highest index asked for, plus 1, for the omc-use record.
 fn a_need g ulong n ulong to void
 if ge n get a_gp g
 put a_gp g add n 1
@@ -421,12 +430,48 @@ if lt c 64
 c = ulong 64
 end
 if gt a_gneed g c sub len a_ar get a_top 0
+a_grow a_gneed g c
+end
+cm = ulong 0
+if gt a_gneed g c sub len a_ar get a_top 0
+cm = ulong 1
+end
+if eq a_ok g c add get a_top 0 a_gneed g c 0
+cm = ulong 1
+end
+note under a ceiling a move to the top never raises the high-water (the group grows in place after a compaction),
+note and a group never grows to less than its doubling: then the words handed out follow the same course for
+note every ceiling, and a unit refused at a ceiling is refused at every lower one
+if ne get a_cel 0 0
+if ne get a_rdy 0 0
+if gt add get a_top 0 a_gneed g c get a_hw 0
+cm = ulong 1
+end
+end
+end
+if ne cm 0
+if eq get a_rdy 0 0
+if ne get a_nr 0 1
+a_full
+end
+end
 a_compact
+if ne get a_cel 0 0
 if gt a_gextra g c sub len a_ar get a_top 0
+a_grow a_gextra g c
+end
+if ne get a_rdy 0 0
+if ne a_bad g c 0
+a_full
+end
+end
+end
+if ne a_bad g c 0
 c = a_gfit g n c
 end
 a_relayout g c
 put a_gc g c
+a_hwset
 ret
 end
 r = ulong 0
@@ -437,6 +482,180 @@ end
 r = add r 1
 end
 put a_gc g c
+a_hwset
+end
+
+note a_hwset: a_hw follows a_top up. While a_rdin reads the input, region 0 is the only region (a_nr 1): it grows
+note in place, words past the input are handed out but never touched, and how far depends on how the reads were
+note cut (a pipe or a file), so a_hw is not followed then; a_rdin sets it to the words the input holds
+fn a_hwset to void
+if eq get a_nr 0 1
+ret
+end
+if gt get a_top 0 get a_hw 0
+put a_hw 0 get a_top 0
+end
+end
+
+note a_grow: the arena a_ar grows so that w more words are free above a_top: to twice its length, or to a_top
+note + w when that is more (doubling, so the copies a_need makes are linear in the arena's final size). A
+note refusal by the host (enlarge's negative result: -12 when mmap or mremap fails, -22 past 2^63 bytes)
+note leaves a_ar as it was, and a_need goes on to compact. Words past the old length are 0 (a fresh pool's
+note pages), as a_move expects of words above a_top.
+fn a_grow w ulong to void
+t = add get a_top 0 w
+n = shl len a_ar 1
+if lt n t
+n = t
+end
+note under a memory ceiling the arena grows at most to a_capw words; when that is less than the tables need,
+note a_need goes on as after a host refusal (compaction, then error 14 full=1)
+if ne get a_cel 0 0
+c = a_capw 0
+if gt n c
+n = c
+end
+end
+r = enlarge a_ar n
+end
+
+note a_capw: the arena's largest length in words under the ceiling with the output so far: A + A / 128 + 16 MiB + O
+note <= C, A = 8 words, so words <= (C - 16 MiB - O) / 129 * 16 (0 when C does not cover 16 MiB and O)
+fn a_capw z ulong to ulong
+f = add 16777216 a_resv 0 0
+if le get a_cel 0 f
+ret 0
+end
+ret mul div sub get a_cel 0 f 129 16
+end
+
+note a_marg: the margin added to b bytes of arena: b / 128 for the kernel's page tables, 16 MiB for omc's image
+note (docs/RUNTIME-POOLS.md s6, "The margin")
+fn a_marg b ulong to ulong
+ret add add b shr b 7 16777216
+end
+
+note a_resv: the output reserve in bytes: the capacities of group 1 (the artifact) and group 2 (the om2 diag site
+note records written after it), with group g at capacity c. Everything omc writes beyond them is small and
+note inside the margin (diagnostics, the omc-use record)
+fn a_resv g ulong c ulong to ulong
+r = get a_gc 1
+if eq g 1
+r = c
+end
+t = get a_gc 2
+if eq g 2
+t = c
+end
+ret add r t
+end
+
+note a_ok: 1 when group g at capacity c with the words handed out at t keeps the budget under the ceiling: the most
+note words ever handed out (a_hw, or t when higher) in bytes, their margin and the output reserve within C; 1
+note without a ceiling. Every growth keeps it, so the artifact and the site records always fit when written
+fn a_ok g ulong c ulong t ulong to ulong
+if eq get a_cel 0 0
+ret 1
+end
+h = get a_hw 0
+if gt t h
+h = t
+end
+if gt add a_marg shl h 3 a_resv g c get a_cel 0
+ret 0
+end
+ret 1
+end
+
+note a_bad: 1 when group g cannot grow in place to capacity c after a compaction: no room in the arena, or past
+note the budget (a_ok)
+fn a_bad g ulong c ulong to ulong
+x = a_gextra g c
+if gt x sub len a_ar get a_top 0
+ret 1
+end
+if eq a_ok g c add get a_top 0 x 0
+ret 1
+end
+ret 0
+end
+
+note a_ceilo: before the artifact (o bytes) is written: under a ceiling, the most arena words ever handed out
+note (a_hw: the words above it were never handed out and their pages never touched), the margin and o must fit in
+note it (the output grows inside its region without a growth to check), else error 14 full=1 and nothing is written
+fn a_ceilo o ulong to void
+if eq get a_cel 0 0
+ret
+end
+if gt add a_marg shl get a_hw 0 3 o get a_cel 0
+a_full
+end
+end
+
+note a_env: the memory ceiling from the environment (docs/RUNTIME-POOLS.md s6): the first entry named
+note OMC_MEMORY_MAX, read with envcnt / envread into a_eb before the input; an entry that does not fit is error 26
+fn a_env to void
+nl = envcnt
+n = ulong nl
+i = ulong 0
+while lt i n
+kl = envread i a_eb 0 131072
+if lt kl 0
+fail 26
+end
+if ge kl 15
+k = ulong kl
+if eq a_envp 0 1
+a_envv k
+ret
+end
+end
+i = add i 1
+end
+end
+
+note a_envp: 1 when a_eb starts with OMC_MEMORY_MAX=
+fn a_envp z ulong to ulong
+j = ulong 0
+while lt j 15
+if ne get a_eb j get a_envk j
+ret 0
+end
+j = add j 1
+end
+ret 1
+end
+
+note a_envv: the value of OMC_MEMORY_MAX=, bytes 15 .. k - 1 of a_eb: empty or 0 is no ceiling; 1 to 19 decimal
+note digits below 2^63 a ceiling; anything else is a caller's mistake: error 26 on line 0, before any input is read
+fn a_envv k ulong to void
+if eq k 15
+ret
+end
+if gt sub k 15 19
+fail 26
+end
+v = ulong 0
+j = ulong 15
+while lt j k
+c = ulong get a_eb j
+if or lt c 48 gt c 57
+fail 26
+end
+if gt v 922337203685477580
+fail 26
+end
+v = add mul v 10 sub c 48
+j = add j 1
+end
+if ge v 9223372036854775808
+fail 26
+end
+if eq v 0
+ret
+end
+note CEILMUT
+put a_cel 0 v
 end
 
 note a_gextra: the words group g's regions need beyond the words they hold, at capacity c
@@ -455,12 +674,12 @@ end
 ret s
 end
 
-note a_gfit: the largest capacity in n + 1 .. hi whose growth in place (a_gextra) fits in the free words
+note a_gfit: the largest capacity in n + 1 .. hi whose growth in place fits in the free words and the budget (a_bad)
 note (binary search; it grows with the capacity), or error 14 (a_full) when not even n + 1 does
 fn a_gfit g ulong n ulong hi ulong to ulong
 f = sub len a_ar get a_top 0
 lo = add n 1
-if gt a_gextra g lo f
+if ne a_bad g lo 0
 a_full
 end
 go = true
@@ -471,7 +690,7 @@ if le sub hi lo 1
 go = false
 else
 mid = add lo shr sub hi lo 1
-if gt a_gextra g mid f
+if ne a_bad g mid 0
 hi = mid
 else
 lo = mid
@@ -639,7 +858,8 @@ end
 ret s
 end
 
-note a_full: the arena has no room left: error 14, and fail writes the omc-use record after its line
+note a_full: the arena has no room left and the host refused to grow it: error 14 (full=1), and fail writes the
+note omc-use record after its line
 fn a_full to void
 put a_fl 0 1
 fail 14
@@ -814,6 +1034,7 @@ w = add shr off 3 9
 a_need 0 shl w 3
 put a_rw 0 w
 put a_top 0 w
+put a_hw 0 w
 put a_gc 0 shl w 3
 end
 
@@ -873,6 +1094,7 @@ while lt g 21
 put a_gp g 0
 g = add g 1
 end
+put a_rdy 0 1
 end
 
 note a_isize: the first room of group g, in entries: the input's bytes over k for the groups that grow
@@ -962,6 +1184,9 @@ mputb 47
 mputn a_gwords g
 g = add g 1
 end
+mputb 32
+mputw 4424626557984269667 8
+mputn get a_cel 0
 mputb 10
 w = write int fd msg 0 get mc 0
 end
@@ -12606,6 +12831,11 @@ end
 if ne get fmtm 0 0
 fmtout
 end
+o = sub get oc 0 st
+if eq get om2m 0 1
+o = add o get nsite 0
+end
+a_ceilo o
 if eq a_out 1 1 st get oc 0 0
 fail 2
 end
@@ -16508,6 +16738,7 @@ end
 if ne get fmtm 0 0
 fmtout
 end
+a_ceilo get oc 0
 n = a_out 1 1 0 get oc 0
 exit 0
 end
@@ -16853,6 +17084,7 @@ note statement per line from output byte 180 (om4 START .. STMT)
 fn main to int
 note the input becomes region 0 of the arena (a_rdin), then every other region gets its first room
 put a_nr 0 1
+a_env
 a_rdin
 a_init
 xlead

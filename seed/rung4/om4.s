@@ -51,7 +51,13 @@
 ; 128 bytes (name 8, address 8, return type 4, parameter count 4, then per parameter 16 bytes: type 4,
 ; length 4, kind 4), sit at 0x19f0000 up to 0x1a70000. All three are past the file and zeroed with the
 ; rest of the mapping.
-; Name kinds: 0 scalar, 1 local array, 2 view parameter, 3 edit parameter, 4 global array, 5 text.
+; Name kinds: 0 scalar, 1 local array, 2 view parameter, 3 edit parameter, 4 global array, 5 text, 10 run-time
+; pool (global NAME T *, program mode: a 16-byte slot, base then length in elements, in the global pool area).
+; Run-time pools (docs/RUNTIME-POOLS.md s6, OMEGESE 9.15): om4 knows the subset seed/omc/omc.om uses, get, put,
+; len and r = enlarge P n, and emits for them the words omc emits for an OM-1 unit (gate5 compares them); any
+; other use of a pool (read, write, a pool as an argument) is refused. State slot 14 is the address of the
+; unit's omc_enlarge helper once emitted (0 before); slot 15 is 1 once a unit uses envcnt or envread (the start
+; code then keeps the initial stack in X27, MOV X27, SP, as omc does).
 ; Errors: "om4: line N: error E" on stderr, exit E: 1 read, 2 write, 3 unknown name, 4 line ends too
 ; early, 5 extra words, 6 bad number, 7 type mismatch, 8 number out of range for its type, 9 not in the
 ; subset, 10 name defined twice, 11 number with no type, 12 out of registers, 13 word over 8 characters,
@@ -86,7 +92,7 @@
   .w 0x00000000
   .w 0x00400000
   .w 0x00000000
-  .w 0x00003790 ; p_filesz = the size of om4.bin, 14224 bytes (asm2 has no size arithmetic; gate4.sh checks it)
+  .w 0x00003f48 ; p_filesz = the size of om4.bin, 16200 bytes (asm2 has no size arithmetic; gate4.sh checks it)
   .w 0x00000000
   .w 0x01670000 ; p_memsz: through the function table at 0x19f0000, which ends at 0x1a70000
   .w 0x00000000
@@ -361,6 +367,20 @@
   .w 0x006e776f
   .w 0x00000000
   .w 77
+  .w 0
+; envcnt (code 86) and envread (code 87): host words of a program (VT_ENVCNT, VT_ENVREAD)
+  .w 0x63766e65
+  .w 0x0000746e
+  .w 86
+  .w 0
+  .w 0x72766e65
+  .w 0x00646165
+  .w 87
+  .w 0
+; enlarge (code 85): only as the whole of an assignment, r = enlarge P n (S_ENL); in a value error 9
+  .w 0x616c6e65
+  .w 0x00656772
+  .w 85
   .w 0
   .w 0
   .w 0
@@ -924,6 +944,15 @@
   mov.x x4 x1
   mov.x x5 x2
 :SA1
+  cmp.x.i x3 1
+  b.ne SA1B
+  cmp.x.i x5 8
+  b.hi SA1B
+  mov.x x1 x4
+  bl KW
+  cmp.x.i x0 85
+  b.eq S_ENL
+:SA1B
   ldr.x x1 sp 0
   bl FINDNAME
   cbz.x x0 SA_NEW
@@ -976,6 +1005,411 @@
   add.x.i sp sp 64
   bl EOL
   b STMT
+; r = enlarge P n (omc.om s_enlarge): r an existing long scalar or a new one (error 7, error 10 for a function's
+; name), P a run-time pool (error 7), n a ulong (error 7; a bare number error 11). The helper is emitted at the
+; unit's first enlarge (ENHELP); then the registers in use are saved, X1 = n, X0 = P's slot, X2 = log2 of the
+; element size, BL omc_enlarge (C6.2.43), and the result goes to r as the registers come back.
+; Frame (S_ASSIGN's): 0 name, 1 entry (0 new), 2 r, 3 P, 4 pool slot before, 5 n, 6 saved count, 7 save bytes.
+:S_ENL
+  ldr.x x1 sp 0
+  bl FINDNAME
+  str.x x0 sp 1
+  cbz.x x0 SE_NEW
+  ldr.w w9 x0 5
+  cbnz.x x9 E_TYPE
+  ldr.w w9 x0 3
+  cmp.x.i x9 9
+  b.ne E_TYPE
+  ldr.w w9 x0 2
+  str.x x9 sp 2
+  b SE_HELP
+:SE_NEW
+  ldr.x x1 sp 0
+  movz.x x2 0 0
+  bl FINDFN
+  cbnz.x x0 E_TWICE
+  bl ALLOC
+  str.x x0 sp 2
+  mov.x x28 x24
+:SE_HELP
+  bl ENHELP
+  bl ARRNAME
+  ldr.w w9 x0 5
+  cmp.x.i x9 10
+  b.ne E_TYPE
+  str.x x0 sp 3
+  str.x x24 sp 4
+  movz.x x0 5 0
+  movz.x x1 255 0
+  bl VAL
+  cmp.x.i x0 2
+  b.eq E_BARE
+  cmp.x.i x2 5
+  b.ne E_TYPE
+  bl MATREG
+  str.x x0 sp 5
+  bl SAVE
+  str.x x0 sp 6
+  str.x x1 sp 7
+  movz.x x0 1 0
+  movz.x x1 1 0
+  ldr.x x2 sp 5
+  bl LOADARG
+  movz.x x0 0 0
+  ldr.x x9 sp 3
+  ldr.x x1 x9 3
+  bl MATCONST
+  ldr.x x9 sp 3
+  ldr.w w9 x9 3
+  adr x10 TLOG
+  ldrb.r w1 x10 x9
+  movz.x x0 2 0
+  bl MATCONST
+  movz.x x9 0x185 1
+  ldr.x x10 x9 14
+  sub.x x10 x10 x20
+  ubfm.x x10 x10 2 27
+  movz.x x0 0 0
+  movk.x x0 0x9400 1 ; BL omc_enlarge (behind: a negative imm26), C6.2.43
+  orr.x x0 x0 x10
+  bl EMIT
+  ldr.x x0 sp 2
+  ldr.x x1 sp 4
+  ldr.x x2 sp 6
+  ldr.x x3 sp 7
+  movz.x x4 1 0
+  bl RESTORE
+  str.x x0 sp 2
+  ldr.x x9 sp 1
+  cbnz.x x9 SA_END
+  ldr.x x1 sp 0
+  ldr.x x2 sp 2
+  movz.x x3 9 0
+  movz.x x4 0 0
+  movz.x x5 0 0
+  movz.x x6 0 0
+  bl ADDNAME
+  b SA_END
+; ---- envcnt / envread (OMEGESE 10; omc.om hostval and hargs, c 136 and 137): program mode only (error 9).
+; X27 holds the initial stack (argc, argv, 0, envp..., 0): the start code keeps it when state slot 15 is set.
+; envcnt: SAVE, walk envp to its null (words ENVCNTW), RESTORE: a long. envread index A off capacity: index a
+; ulong, A a writable uchar array (error 7 or 20), off and capacity ulong; capacity <= len A and off <= len A -
+; capacity (CMP, B.HI trap 3, as read); then SAVE, X0 = index, the scan (an index at or past the count traps 3),
+; the entry's length (an entry of 1 MiB or more traps 3), the copy, or -105 when capacity is short; RESTORE.
+; Frame (VALTOK's): 2 dest, 4/5 index, 6 A, 7/8 off, 9/10 capacity, 11 small, 12/13 SAVE, 14 pool slot, 15 endbr.
+:VT_ENVCNT
+  movz.x x9 0x185 1
+  ldr.x x10 x9 6
+  cbz.x x10 E_SUBSET
+  movz.x x10 1 0
+  str.x x10 x9 15
+  str.x x24 sp 14
+  bl SAVE
+  str.x x0 sp 12
+  str.x x1 sp 13
+  adr x10 ENVCNTW
+  movz.x x11 11 0
+  bl EMITN
+  b VE_RET
+:VT_ENVREAD
+  movz.x x9 0x185 1
+  ldr.x x10 x9 6
+  cbz.x x10 E_SUBSET
+  movz.x x10 1 0
+  str.x x10 x9 15
+  str.x x24 sp 14
+  movz.x x0 5 0
+  movz.x x1 255 0
+  bl VAL
+  cmp.x.i x2 5
+  b.ne E_TYPE
+  str.x x0 sp 4
+  str.x x1 sp 5
+  bl ARRNAME
+  ldr.w w9 x0 5
+  cmp.x.i x9 10
+  b.eq E_TYPE
+  ldr.w w9 x0 3
+  cmp.x.i x9 2
+  b.ne E_TYPE
+  ldr.w w9 x0 5
+  cmp.x.i x9 2
+  b.eq E_RDONLY
+  cmp.x.i x9 5
+  b.eq E_RDONLY
+  str.x x0 sp 6
+  movz.x x0 5 0
+  movz.x x1 255 0
+  bl VAL
+  cmp.x.i x2 5
+  b.ne E_TYPE
+  str.x x0 sp 7
+  str.x x1 sp 8
+  movz.x x0 5 0
+  movz.x x1 255 0
+  bl VAL
+  cmp.x.i x2 5
+  b.ne E_TYPE
+  str.x x0 sp 9
+  str.x x1 sp 10
+  ldr.x x0 sp 7
+  ldr.x x1 sp 8
+  movz.x x2 5 0
+  bl MATREG
+  str.x x0 sp 7
+  ldr.x x0 sp 9
+  ldr.x x1 sp 10
+  movz.x x2 5 0
+  bl MATREG
+  str.x x0 sp 9
+  bl ALLOC
+  str.x x0 sp 11
+  ldr.x x9 sp 6
+  ldr.w w1 x9 4
+  bl MATCONST
+  movz.x x0 0x001f 0
+  movk.x x0 0xeb00 1 ; CMP Xcap, Xt, C6.2.97
+  ldr.x x1 sp 9
+  ubfm.x x1 x1 59 58
+  orr.x x0 x0 x1
+  ldr.x x1 sp 11
+  ubfm.x x1 x1 48 47
+  orr.x x0 x0 x1
+  bl EMIT
+  movz.x x0 8 0
+  movz.x x1 3 0
+  bl TRAPC
+  movz.x x0 0 0
+  movk.x x0 0xcb00 1 ; SUB Xt, Xt, Xcap, C6.2.458
+  ldr.x x1 sp 11
+  ldr.x x2 sp 11
+  ldr.x x3 sp 9
+  bl E3
+  movz.x x0 0x001f 0
+  movk.x x0 0xeb00 1 ; CMP Xoff, Xt, C6.2.97
+  ldr.x x1 sp 7
+  ubfm.x x1 x1 59 58
+  orr.x x0 x0 x1
+  ldr.x x1 sp 11
+  ubfm.x x1 x1 48 47
+  orr.x x0 x0 x1
+  bl EMIT
+  movz.x x0 8 0
+  movz.x x1 3 0
+  bl TRAPC
+  bl SAVE
+  str.x x0 sp 12
+  str.x x1 sp 13
+  movz.x x0 0 0
+  ldr.x x1 sp 4
+  ldr.x x2 sp 5
+  bl LOADARG
+  adr x10 ENVR1
+  movz.x x11 10 0
+  bl EMITN
+  movz.x x0 0 0
+  movz.x x1 3 0
+  bl TRAPC
+  adr x10 ENVR2
+  movz.x x11 5 0
+  bl EMITN
+  movz.x x0 0 0
+  movz.x x1 3 0
+  bl TRAPC
+  adr x10 ENVR3
+  movz.x x11 9 0
+  bl EMITN
+  movz.x x0 2 0
+  movz.x x1 3 0
+  bl TRAPC
+  adr x10 ENVR4
+  movz.x x11 1 0
+  bl EMITN
+  movz.x x0 2 0
+  movz.x x1 1 0
+  ldr.x x2 sp 9
+  bl LOADARG
+  adr x10 ENVR5
+  movz.x x11 2 0
+  bl EMITN
+  sub.x.i x9 x20 4
+  str.x x9 sp 11
+  movz.x x0 0 0
+  ldr.x x9 sp 6
+  bl BASEARG
+  movz.x x0 16 0
+  movz.x x1 1 0
+  ldr.x x2 sp 7
+  bl LOADARG
+  adr x10 ENVR6
+  movz.x x11 12 0
+  bl EMITN
+  sub.x.i x9 x20 4
+  str.x x9 sp 15
+  ldr.x x0 sp 11
+  mov.x x1 x20
+  bl PATCH19
+  movz.x x0 0 0
+  movz.x x1 0xff97 0
+  movk.x x1 0xffff 1
+  movk.x x1 0xffff 2
+  movk.x x1 0xffff 3 ; -105
+  bl MATCONST
+  ldr.x x0 sp 15
+  sub.x x10 x20 x0
+  ubfm.x x10 x10 2 63
+  ldr.w w11 x0 0
+  orr.x x11 x11 x10
+  str.w w11 x0 0
+:VE_RET
+  ldr.x x0 sp 2
+  ldr.x x1 sp 14
+  ldr.x x2 sp 12
+  ldr.x x3 sp 13
+  movz.x x4 1 0
+  bl RESTORE
+  mov.x x1 x0
+  movz.x x0 1 0
+  movz.x x2 9 0
+  b VT_RET
+; EMITN: x11 words from x10 to the output. Clobbers x0, x9..x12.
+:EMITN
+  str.x.pre x30 sp -16
+  mov.x x12 x10
+:EN1
+  cbz.x x11 EN2
+  ldr.w w0 x12 0
+  bl EMIT
+  add.x.i x12 x12 4
+  sub.x.i x11 x11 1
+  b EN1
+:EN2
+  ldr.x.post x30 sp 16
+  ret
+:ENVCNTW
+  .w 0xf9400361
+  .w 0x91000821
+  .w 0xd37df021
+  .w 0x8b010360
+  .w 0xd2800002
+  .w 0xf9400003
+  .w 0xb4000083
+  .w 0x91000442
+  .w 0x91002000
+  .w 0x17fffffc
+  .w 0xaa0203e0
+:ENVR1
+  .w 0xaa0003e2
+  .w 0xf9400361
+  .w 0x91000821
+  .w 0xaa0103e0
+  .w 0xd2800110
+  .w 0x9b107c00
+  .w 0x8b000363
+  .w 0xb40000e2
+  .w 0xf9400064
+  .w 0xf100009f
+:ENVR2
+  .w 0x91002063
+  .w 0xd1000442
+  .w 0x17fffffa
+  .w 0xf9400063
+  .w 0xf100007f
+:ENVR3
+  .w 0xaa0303e4
+  .w 0xd2800005
+  .w 0x39400086
+  .w 0xf10000df
+  .w 0x540000e0
+  .w 0x91000484
+  .w 0x910004a5
+  .w 0xd2a00210
+  .w 0xeb1000bf
+:ENVR4
+  .w 0x17fffff8
+:ENVR5
+  .w 0xeb0200bf
+  .w 0x54000008
+:ENVR6
+  .w 0x8b100000
+  .w 0xaa0503e2
+  .w 0xf10000bf
+  .w 0x540000e0
+  .w 0x39400066
+  .w 0x39000006
+  .w 0x91000463
+  .w 0x91000400
+  .w 0xd10004a5
+  .w 0x17fffff9
+  .w 0xaa0203e0
+  .w 0x14000000
+; ENHELP: the unit's omc_enlarge helper, emitted once at the unit's first enlarge behind a B over it (C6.2.35),
+; word for word omc.om en_help (docs/RUNTIME-POOLS.md s4: X0 the slot, X1 n, X2 log2 of the element size; out
+; X0 0, -22 or the host's -errno). State slot 14 keeps the address of its first word. Clobbers x0, x9..x11.
+:ENHELP
+  movz.x x9 0x185 1
+  ldr.x x10 x9 14
+  cbnz.x x10 EH2
+  str.x.pre x30 sp -16
+  movz.x x11 0 0
+:EH1
+  adr x10 ENWORDS
+  ldr.w.r w0 x10 x11
+  bl EMIT
+  cbnz.x x11 EH3
+  movz.x x9 0x185 1
+  str.x x20 x9 14
+:EH3
+  add.x.i x11 x11 1
+  cmp.x.i x11 42
+  b.lo EH1
+  ldr.x.post x30 sp 16
+:EH2
+  ret
+; ENWORDS: the B over the helper (+42 words), then the helper's 41 words (omc.om en_help)
+:ENWORDS
+  .w 0x1400002a
+  .w 0xaa0003e9
+  .w 0xaa0103ea
+  .w 0xf9400523
+  .w 0xeb03015f
+  .w 0x54000429
+  .w 0xd28007e4
+  .w 0xcb020084
+  .w 0x9ac42545
+  .w 0xb50003e5
+  .w 0x9ac22145
+  .w 0x913ffca5
+  .w 0x9274cca5
+  .w 0x9ac22066
+  .w 0x913ffcc6
+  .w 0x9274ccc6
+  .w 0xeb0600bf
+  .w 0x54000289
+  .w 0xb4000106
+  .w 0xf9400120
+  .w 0xaa0603e1
+  .w 0xaa0503e2
+  .w 0xd2800023
+  .w 0xd2801b08
+  .w 0xd4000001
+  .w 0x14000009
+  .w 0xd2800000
+  .w 0xaa0503e1
+  .w 0xd2800062
+  .w 0xd2800443
+  .w 0x92800004
+  .w 0xd2800005
+  .w 0xd2801bc8
+  .w 0xd4000001
+  .w 0xb13ffc1f
+  .w 0x54000082
+  .w 0xf9000120
+  .w 0xf900052a
+  .w 0xd2800000
+  .w 0xd65f03c0
+  .w 0x928002a0
+  .w 0xd65f03c0
 ; x = new T N v: N elements of type T on the stack, each set to v; only in the function's outermost block,
 ; so the stack held by local arrays is known at every ret. SUB SP (C6.2.457); program mode: CMP SP, X28
 ; (SUBS extended, C6.2.463), B.LO trap 6; MOV Xb, SP (ADD immediate, C6.2.5); then the fill loop.
@@ -1186,6 +1620,13 @@
   bl ELEMTYPE
   mov.x x13 x0
   bl TOK
+  cmp.x.i x0 1
+  b.ne SG1
+  cmp.x.i x2 1
+  b.ne SG1
+  cmp.x.i x1 42
+  b.eq SG_POOL
+:SG1
   cmp.x.i x0 2
   b.ne E_SYNTAX
   bl ARRLEN
@@ -1210,6 +1651,30 @@
   mov.x x3 x13
   mov.x x4 x14
   movz.x x5 4 0
+  bl ADDNAME
+  movz.x x9 0x185 1
+  str.x x23 x9 1
+  bl EOL
+  b STMT
+; global NAME T *: a run-time pool (kind 10, length 0 at start), program mode only (error 9); its 16-byte
+; slot (base, length) is taken from the global pool area like any global's elements (omc.om sg_pool)
+:SG_POOL
+  movz.x x9 0x185 1
+  ldr.x x10 x9 6
+  cbz.x x10 E_SUBSET
+  ldr.x x10 x9 7
+  movz.x x6 0x1080 1
+  add.x x6 x6 x10
+  add.x.i x10 x10 16
+  movz.x x11 0x4000 1
+  cmp.x x10 x11
+  b.hi E_TOOBIG
+  str.x x10 x9 7
+  mov.x x1 x12
+  movz.x x2 0 0
+  mov.x x3 x13
+  movz.x x4 0 0
+  movz.x x5 10 0
   bl ADDNAME
   movz.x x9 0x185 1
   str.x x23 x9 1
@@ -1757,6 +2222,13 @@
   movz.x x3 0x1400 1 ; B, C6.2.35
   orr.x x3 x3 x2
   str.w w3 x12 0
+  movz.x x9 0x185 1
+  ldr.x x10 x9 15
+  cbz.x x10 EP_NOARG
+  movz.x x0 0x03fb 0
+  movk.x x0 0x9100 1 ; MOV X27, SP (ADD, C6.2.5): the initial argument stack, for envcnt / envread
+  bl EMIT
+:EP_NOARG
   movz.x x0 0x001c 0
   movk.x x0 0xd2a2 1 ; MOVZ X28, #0x1000, LSL #16, C6.2.285
   bl EMIT
@@ -1897,6 +2369,12 @@
   b.eq VT_PAREN
   cmp.x.i x0 77
   b.eq E_SUBSET
+  cmp.x.i x0 85
+  b.eq E_SUBSET
+  cmp.x.i x0 86
+  b.eq VT_ENVCNT
+  cmp.x.i x0 87
+  b.eq VT_ENVREAD
   str.x x0 sp 3
   cmp.x.i x0 51
   b.eq VT_GET
@@ -3266,8 +3744,31 @@
 ; len A: the length of A, a ulong number
 :VT_LEN
   bl ARRNAME
+  ldr.w w9 x0 5
+  cmp.x.i x9 10
+  b.eq VL_POOL
   ldr.w w1 x0 4
   movz.x x0 3 0
+  movz.x x2 5 0
+  b VT_RET
+; len P of a run-time pool: a run-time load of the slot's length, LDR Xd, [Xd, #8] (C6.2.214; omc.om pl_len)
+:VL_POOL
+  str.x x0 sp 4
+  ldr.x x0 sp 2
+  bl DESTREG
+  str.x x0 sp 7
+  ldr.x x9 sp 4
+  ldr.x x1 x9 3
+  bl MATCONST
+  ldr.x x1 sp 7
+  movz.x x0 0x0400 0
+  movk.x x0 0xf940 1 ; LDR Xt, [Xn, #8], C6.2.214
+  orr.x x0 x0 x1
+  ubfm.x x1 x1 59 58
+  orr.x x0 x0 x1
+  bl EMIT
+  movz.x x0 1 0
+  ldr.x x1 sp 7
   movz.x x2 5 0
   b VT_RET
 ; get A i: the checked load (the load of the element type, register offset, LDOP table)
@@ -3320,6 +3821,9 @@
   str.x x0 sp 4
   str.x x1 sp 5
   bl ARRNAME
+  ldr.w w9 x0 5
+  cmp.x.i x9 10
+  b.eq E_SUBSET ; read / write on a run-time pool: omc only
   str.x x0 sp 6
   ldr.x x9 sp 3
   cmp.x.i x9 53
@@ -3598,6 +4102,8 @@
   cbz.x x9 E_TYPE
   cmp.x.i x9 4
   b.eq E_ALIAS
+  cmp.x.i x9 10
+  b.eq E_ALIAS
   ldr.x x11 sp 1
   ldr.w w10 x11 8
   cmp.x.i x10 3
@@ -3772,6 +4278,9 @@
   str.x x0 sp 1
   cmp.x.i x3 1
   b.eq E_TYPE
+  ldr.w w9 x0 5
+  cmp.x.i x9 10
+  b.eq EA_POOL
   cmp.x.i x1 3
   b.ne EA_R
   ldr.w w9 x0 4
@@ -3826,6 +4335,48 @@
   bl MATCONST
   ldr.x x0 sp 4
 :EA_X
+  ldr.x x1 sp 3
+  ldr.x.post x30 sp 48
+  ret
+; a run-time pool (omc.om ea_pool): the index in a register, the slot loaded after every operand (LDP Xb, Xl,
+; [Xb], C6.2.163), CMP Xi, Xl (C6.2.97), B.HS trap 3; a number index too is checked at run time (no error 21)
+:EA_POOL
+  mov.x x0 x1
+  mov.x x1 x2
+  mov.x x2 x3
+  bl MATREG
+  str.x x0 sp 3
+  bl ALLOC
+  str.x x0 sp 4
+  bl ALLOC
+  str.x x0 sp 5
+  ldr.x x0 sp 4
+  ldr.x x9 sp 1
+  ldr.x x1 x9 3
+  bl MATCONST
+  movz.x x0 0 0
+  movk.x x0 0xa940 1 ; LDP Xb, Xl, [Xb], C6.2.163
+  ldr.x x1 sp 4
+  orr.x x0 x0 x1
+  ubfm.x x1 x1 59 58
+  orr.x x0 x0 x1
+  ldr.x x1 sp 5
+  ubfm.x x1 x1 54 53
+  orr.x x0 x0 x1
+  bl EMIT
+  movz.x x0 0x001f 0
+  movk.x x0 0xeb00 1 ; CMP Xi, Xl, C6.2.97
+  ldr.x x1 sp 3
+  ubfm.x x1 x1 59 58
+  orr.x x0 x0 x1
+  ldr.x x1 sp 5
+  ubfm.x x1 x1 48 47
+  orr.x x0 x0 x1
+  bl EMIT
+  movz.x x0 2 0
+  movz.x x1 3 0
+  bl TRAPC
+  ldr.x x0 sp 4
   ldr.x x1 sp 3
   ldr.x.post x30 sp 48
   ret

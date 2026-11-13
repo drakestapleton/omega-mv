@@ -88,6 +88,11 @@ if [ -w /dev/full ]; then
 else
     bad "e2_output_unwritable: /dev/full is not writable here"
 fi
+# 26: the compiler's environment entry OMC_MEMORY_MAX is malformed: refused before any input is read (line 0)
+export OMC_MEMORY_MAX=12x
+run "$T/ok.om"
+unset OMC_MEMORY_MAX
+expect e26_memory_max 26 0
 
 # 12: the 17th live name exhausts the 16-register pool.
 {
@@ -122,7 +127,7 @@ br 262143
 run "$T/p.om"
 expect e24_branch_range 24 262147
 
-[ "$n" = 33 ] || bad "ran $n of 33 refusal cases"
+[ "$n" = 34 ] || bad "ran $n of 34 refusal cases"
 
 # The registry drift check, compiled by the same omc.
 run seed/omc/codereg.om "$T/codereg"
@@ -152,5 +157,5 @@ grep -v '^e30_ir_requires 30$' "$T/ran.log" > "$T/ran.mut" || true
 cmp -s "$T/ran.log" "$T/ran.mut" && bad "negative control dropped-case: grep removed nothing"
 neg dropped-case "$REG" "$DOC" "$T/ran.mut"
 
-say "PASS gate15 $n refusal cases (codes 1..25, 27..30; 24 with its accept side) plus a valid control, registry drift check and 3 negative controls"
+say "PASS gate15 $n refusal cases (codes 1..30; 24 with its accept side) plus a valid control, registry drift check and 3 negative controls"
 exit 0

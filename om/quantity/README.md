@@ -42,7 +42,7 @@ Run from repository root on Linux AArch64. The only production unit is `quantity
 ```sh
 nice -n 19 sh seed/omega-from-seed.sh
 sha256sum seed/out/omc
-# Required compiler hash: a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533
+# Required compiler hash: 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed
 # (the replay receipt below used the previous pin 62775d2a...; both emit the same bytes for these programs)
 mkdir -p /tmp/security756-replay
 cat om/quantity/quantity.om om/quantity/tests.om | nice -n 19 seed/out/omc > /tmp/security756-replay/tests

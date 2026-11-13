@@ -183,9 +183,9 @@ it came from.
   - no automatic conversions: mixing two types in one operation is refused;
   - capacities (decision 23): input past a capacity is refused with error 14, never overrun. om4 keeps
     its fixed tables. Amended 2026-11-11 for omc (Drake: no hard caps on our own software; notice and
-    fix instead): omc's tables grow in one arena, the refusals left are the arena itself (bounded by
-    the address space omc must start in, while a program has no heap) and value nesting past omc's own
-    stack, and a test alarms on usage instead (`seed/omc/gate-usage.sh`, `gate-nocaps.sh`;
+    fix instead): omc's tables grow in one arena, which itself grows at run time (a run-time pool,
+    `docs/RUNTIME-POOLS.md` landing 2), so the refusals left are the host refusing that growth and value
+    nesting past omc's own stack, and a test alarms on usage instead (`seed/omc/gate-usage.sh`, `gate-nocaps.sh`;
     `docs/one_layer/OMEGESE.md` 9.6).
 - Checks (`rung4/gate4.sh`, results in `build/seed/r4/evidence/`, compared with the recorded receipt
   `evidence/SEED-0/rung4/`, never written over it), 217 cases, all pass:

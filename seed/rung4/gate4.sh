@@ -88,11 +88,15 @@ cmp -s $B/in.bin $B/echo.out && say "PASS echo: 50000 fixture bytes stdin -> std
 cmp -s $B/bc.out $X/bytecopy.want && say "PASS byte copy: 50000 bytes reversed = expected output" || bad "bytecopy"
 cases=$((cases + 4))
 for p in fib sort echo bytecopy; do cp $B/$p $E/$p.elf; done
-#    program-mode traps and exit: status 100 + trap code, or the exit value
-for t in $X/t_*.om; do n=$(basename $t .om)
+#    program-mode traps and exit: status 100 + trap code, or the exit value. Run-time pools (OMEGESE 9.15):
+#    t_pool (grow, keep, zero, len), t_pool_range (index = length, trap 3), t_pool_grow (a grow inside while
+#    and if); h_* run under prlimit --as=268435456 (h_poolhost: the host refuses enlarge, -12, and the program
+#    goes on with the pool unchanged)
+for t in $X/t_*.om $X/h_*.om; do n=$(basename $t .om)
   $R/om4.bin < $t > $B/$n; chmod +x $B/$n
-  set +e; ./$B/$n < /dev/null; rc=$?; set -e; cases=$((cases + 1))
-  [ "$rc" = "$(cat ${t%.om}.want)" ] && say "PASS $n: exit $rc" || bad "$n: exit $rc, want $(cat ${t%.om}.want)"
+  case $n in h_*) lim="prlimit --as=268435456";; *) lim="";; esac
+  set +e; $lim ./$B/$n < /dev/null; rc=$?; set -e; cases=$((cases + 1))
+  [ "$rc" = "$(cat ${t%.om}.want)" ] && say "PASS $n${lim:+ under $lim}: exit $rc" || bad "$n${lim:+ under $lim}: exit $rc, want $(cat ${t%.om}.want)"
 done
 
 # 7. om4 refuses, each with its own number (decisions 16-24 of docs/PROGRAM.md marked)

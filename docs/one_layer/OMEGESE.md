@@ -433,8 +433,8 @@ gate that tests it (`seed/rung4/gate4.sh`, section numbers of that script). Deci
 - A conditional branch (B.cond, CBZ, CBNZ) carries a signed 19-bit word displacement. A block layout
   that needs more than 2^18 - 1 words forward or 2^18 words back (1,048,572 or 1,048,576 bytes) is
   refused with error 24 before any output is accepted; it is never silently truncated. Unconditional
-  B uses a 26-bit field (128 MiB), which the output, part of omc's 128 MiB arena with the input and the
-  other tables (section 9.6), cannot reach; past it would be error 24 too. (gate 669)
+  B uses a 26-bit field (128 MiB): omc's AArch64 output stops at 134217728 bytes (error 14 at its first
+  byte past them, section 9.6), so every B and BL stays in reach. (gate 669)
 
 An initial line `target x86linux` selects the candidate FR-9 native x86-64 Linux backend.
 Without it, the existing AArch64 output remains unchanged. Whole-program output is a
@@ -576,11 +576,16 @@ table (512 entries through om4 `d0da40e4`) bounds `seed/omc/omc.om` itself, whic
 **omc** keeps every table that grows with the unit in one arena: the input, the output, names in scope
 (globals, texts, constants, locals), names of 9 to 63 characters, functions and their parameters, call
 sites, trap sites, open blocks, breaks and continues, inline returns and edges, the per-depth value cells,
-the x86 fixups and the `om2 diag` site records. A table starts small and doubles when it fills. When
-doubling does not fit, the arena is compacted (the words that moved tables left behind are reclaimed)
-and the table grows in place, to the largest size that fits; a table is refused only when all the live
-tables, with that one grown by one entry, no longer fit in the arena (measured: 982,370 globals of
-which every one holds a name, 16,777,209 of 16,777,216 words in use at the refusal). Name, long-name
+the x86 fixups and the `om2 diag` site records. A table starts small and doubles when it fills. The
+arena itself is a run-time pool (`global a_ar ulong *`, section 9.15; since landing 2 of the run-time
+pools, `docs/RUNTIME-POOLS.md` section 6): its length is 0 when omc starts, and when a table's doubling
+does not fit in the words left, `enlarge` grows the arena to twice its length (or to what the tables
+need, when that is more). Only when the host refuses that growth (enlarge's negative result, for example
+under `prlimit --as`) is the arena compacted (the words that moved tables left behind are reclaimed) and
+the table grown in place, to the largest size that fits; a table is refused only when the host refused
+and all the live tables, with that one grown by one entry, no longer fit in the arena as it is. Measured
+2026-11-11: 1,500,000 globals (61,354,864 words handed out) and a 512 MiB input compile and run
+(`seed/omc/gate-nocaps.sh` section 3); the static 128 MiB arena before it refused that globals unit at its line 877,501. Name, long-name
 and function lookups are hashed, and the call graph is settled in linear time, so compile time stays
 linear (`seed/omc/gate-usage.sh` times units up to 100,000 names, calls and trap sites).
 `seed/omc/gate-nocaps.sh` drives every table past its first room and compiles those units with a checked
@@ -588,20 +593,35 @@ twin of omc as well, in which an index past its table is trap 3 (omc c52e986e an
 trap 3 on a unit with more inline edges than its call table held; fixed 2026-11-11).
 What is left, and why:
 
-- The arena: 16777216 8-byte words (128 MiB), one named pool in `seed/omc/omc.om` (`a_ar`). A unit whose
-  tables need more is error 14 on the line being read, followed on stderr by an `omc-use` record with
-  `full=1` (below), which says what held the arena. The arena is fixed because a program has no
-  run-time growth (no heap, decision 24); its size is bounded by the smallest address-space limit omc
-  runs under (`prlimit --as=268435456` in the interplane-forge salvage compile: the whole static image
-  counts there, measured 2026-11-11: a data segment of 268296192 bytes still starts, one page more does
-  not) and by the 16777216-element pool limit (section 9.4). It is the boundary a heap would lift.
+- The arena: no size of its own. It grows while the host gives it memory; the host's refusal is error 14
+  on the line being read, followed on stderr by an `omc-use` record with `full=1` (below), which says what
+  held the arena. Until landing 2 of the run-time pools it was a static pool of 16777216 8-byte words
+  (128 MiB), sized by omc's whole image under the smallest RLIMIT_AS omc runs under (`prlimit
+  --as=268435456` in the interplane-forge salvage compile) and by the 16777216-element limit of a sized
+  pool (section 9.4); a run-time pool is bounded by neither. Measured 2026-11-11 (omc a06777de) under that
+  salvage limit: omc.om compiles; cortex's 87,019,650-byte page unit (`docs/RUNTIME-POOLS.md` section 11)
+  is error 14 with `full=1` at 256 MiB of address space and compiles at 512 MiB.
+- The memory ceiling (`docs/RUNTIME-POOLS.md` section 6). A cgroup memory limit (`memory.max`) never makes
+  mmap or mremap fail: pages are charged when touched, so without a ceiling a compile past such a limit is
+  not refused. Measured 2026-11-11 (omc 59d7cb5e, the page unit, `MemoryMax=536870912`, swap 0): an OOM
+  kill (SIGKILL, exit 137), after 175 s of reclaim thrash in one run and after 2.4 s in another. A caller
+  states its ceiling in the environment, `OMC_MEMORY_MAX` (decimal bytes, read once before the input; empty
+  or 0: none; anything else but 1 to 19 digits below 2^63, or an entry too long to read whole, is error 26 on
+  line 0). Under it every growth keeps H + 16 MiB + H / 128 + R within the ceiling: H the most arena bytes ever
+  handed out, R the capacities of the artifact's region and of the om2 diag site records' region (both are
+  written after the compile, as page cache of the caller's cgroup). A growth never moves a group past H (it
+  compacts and grows in place) and never stops short of a doubling, so the result is monotonic in the
+  ceiling: refused (error 14, `full=1`, `ceiling=` set in the record) below one C, compiled from it. Measured
+  with `OMC_MEMORY_MAX` equal to `MemoryMax` and stdout and stderr on files: the page unit is error 14 below
+  512 MiB and compiles from 512 MiB; an om2 diag unit of 1,200,000 lines, error 14 below 496 MiB; every run
+  with no OOM kill (`seed/omc/gate-nocaps.sh` section 5).
 - Value nesting: omc reads a value by recursion on its own fixed 8 MiB program stack (section 9.2). A
   value nested deeper than 32768 levels is error 14 on its line, before that stack could run out
   (measured: at most 144 bytes per level; 32768 allows 256). `seed/omc/gate-nocaps.sh` compiles every
   measured shape 32767 deep, so a frame that grows is noticed. The same holds in IR mode.
 - The output: AArch64 output stops at 134217728 bytes, the reach of B and BL (imm26), so every call
   and jump stays encodable; x86 code at 0x400000 ends below the pools at 0x10000000, at 264241152
-  bytes. Either is error 14 at its first byte (with the 128 MiB arena the arena fills first).
+  bytes. Either is error 14 at its first byte.
 - A single AArch64 conditional branch span is limited to 2^18 - 1 words forward or 2^18 words back
   (section 9.1); a larger span (an `if` or loop body over 1 MiB) is error 24. Trap branches no longer
   wait for the function's end: when a function's oldest waiting trap branch is 512 KiB back, omc
@@ -624,15 +644,19 @@ What is left, and why:
 
     omc-use 1 arena=A top=T waste=W full=F GROUP=N/H ...
 
-A the arena's words, T the words handed out, W the words left behind when a table moved, F 1 when the
-arena filled; for each group (`inp out site names namehash long longhash fns fnhash calls traps x86addr
+A the arena's words (its length when the record is written: the arena grows), T the words handed out,
+W the words left behind when a table moved, F 1 when the host refused to grow the arena (or the memory
+ceiling stopped it) and the tables no longer fit (error 14); for each group (`inp out site names namehash long longhash fns fnhash calls traps x86addr
 x86exit blocks breaks conts inlret inledge depth kahnfn kahncall`) N what the unit asked it to hold (bytes
-for `inp`, `out` and `site`, else the highest index plus 1) and H the words it holds. A refused `usage`
+for `inp`, `out` and `site`, else the highest index plus 1) and H the words it holds; last, `ceiling=C`,
+the `OMC_MEMORY_MAX` in force (0: none). A refused `usage`
 unit writes the human line and then the record to stderr. `seed/omc/gate-usage.sh` compiles the largest
 units of the stack (omc.om itself, omega-mcp, cortex, forged) and scale units, and fails loudly, naming
-the unit, the measure and the number, when the arena top passes 25% (75% for a scale unit), one group
-passes 12.5%, a compile takes more than 2 s (10 s) or more than 64 MiB (256 MiB) resident. Its mutant
-control, an arena shrunk back to 8 MiB, must be caught.
+the unit, the measure and the number, when the words handed out pass 4194304 (12582912 for a scale
+unit), one group holds more than 2097152 words (16777216), the host refused (`full=1`), a compile takes more than 2 s (10 s) or more than 64 MiB (256 MiB) resident. Since the arena grows to fit, the words are
+absolute (the old fractions of the 16777216-word static arena). Its mutant control, tables that never
+double (a_need's growth made +512 entries), must be caught (measured 2026-11-11: calls100k, 94,048,221
+words handed out and 730 MB resident).
 
 ### 9.7 Structs (omc only, rung 6)
 
@@ -1025,9 +1049,14 @@ allocator. Program mode on AArch64 Linux only.
   length, so a number index into a pool is no longer error 21 at compile time, no pool check is
   eliminated under unrolling or inlining, and a contract on `len` is a run-time check (om2 diag
   `kept rule=runtime`), never proved constant. checker2, the C path and IR mode do not see pools.
-- om4 does not know these words (the seed chain is unchanged in this landing); `enlarge` is keyword
-  id 244, a C1 language addition. It changes no manifest-c2 row (every tracked unit compiles to the same
-  bytes), so there is no delta file; `gate-pools.sh` scans the corpus and no tracked unit uses it as a name.
+- om4 knows the subset `seed/omc/omc.om` uses (landing 2): `global NAME T *`, `get`, `put` and `len` on a
+  pool, and `r = enlarge P n`, for which it emits the same words as omc in an OM-1 unit (gate5 builds omc
+  from omc.om with both; gate4 runs `seed/rung4/tests/t_pool*.om` and, under `prlimit
+  --as=268435456`, `h_poolhost.om`). om4 refuses `read` and `write` on a pool with error 9 (omc only).
+  `enlarge` is keyword id 244 in omc (code 85 in om4's table), a C1 language addition. It changes no
+  manifest-c2 row, so there is no delta file; `gate-pools.sh` scans the corpus: no tracked unit uses it as
+  a name, and the units that use the word outside `seed/omc/tests/pools` (omc.om and om4's pool cases) are
+  listed there by name.
 
 ### 9.14 Compiler error codes (omc, registry `seed/omc/error-codes.reg`)
 
@@ -1056,7 +1085,7 @@ cannot be read). In IR mode (section 11) the same codes apply; a contract line (
 | omc 11 | bare number without a type from its context |
 | omc 12 | register pool exhausted |
 | omc 13 | name too long (63 bytes; 8 for an abstract, a layout, a layout field, or any name in IR mode) |
-| omc 14 | capacity exceeded (the compiler's arena, value nesting past omc's own stack, the program image, or an OM-2 expansion bound) |
+| omc 14 | capacity exceeded (the host refused to grow the compiler's arena or its memory ceiling OMC_MEMORY_MAX was reached, value nesting past omc's own stack, the program image, or an OM-2 expansion bound) |
 | omc 15 | missing end |
 | omc 16 | syntax: unknown or misplaced word |
 | omc 17 | line after ret, break, continue, trap or exit in the same block |
@@ -1068,7 +1097,7 @@ cannot be read). In IR mode (section 11) the same codes apply; a contract line (
 | omc 23 | size capacity |
 | omc 24 | AArch64 branch displacement out of range |
 | omc 25 | unknown target, an AArch64-only path on another target, or an x86efi refusal (bare unit, Linux host word, efi OP literal outside 0..14) |
-| omc 26 | no emitting site |
+| omc 26 | the compiler's environment entry OMC_MEMORY_MAX is not empty, 0 or 1 to 19 decimal digits below 2^63, or an entry is too long to read whole |
 | omc 27 | fresh element read before it is definitely written, or fresh array passed on |
 | omc 28 | abstract type: seal outside its constructor, or an unsupported holds |
 | omc 29 | external layout out of bounds or misplaced |

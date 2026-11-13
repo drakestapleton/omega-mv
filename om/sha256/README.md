@@ -18,7 +18,7 @@ call sites are unchanged (`om2-evidence/AUDIT-L838.txt`).
 | `om/sha256/parity/` | parity against the replaced C retrieved from git history (`run.sh`), section 7 receipts (`receipts.c`), throughput probes (`bench.c`, `small.c`) |
 | `om/sha256/om2-evidence/` | caller audit, compile log per compiler slice, baseline at acb3f15c, cutover plan, desk check, S4 run |
 
-Pins: omc `a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533`
+Pins: omc `106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed`
 (rebuilt by `seed/omega-from-seed.sh`; `om/units.sh` `OMC_PIN`);
 generator `src/native.om` of omega-bridge `962924233146f349da8486c7bce726f67b4dac4c`
 (omega-bridge#45 merged; `om/omega-bridge.lock`; sha256 `2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d`),

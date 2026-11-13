@@ -41,7 +41,8 @@ or a C twin): NOT_RUN until ng emits code. The value slots of `fe_alloc` keep om
 without the cap (slots past 16 share a number); ΩIR values replace them.
 
 Units ng does not take exit 64 and are `scope` rows (`NAME scope K REASON`, omc must exit K): x86/EFI
-targets (D8) and IR v1 units (first line `ir`). A bound of ng's own that omc never reaches because
+targets (D8), IR v1 units (first line `ir`) and run-time pools (`global NAME T *`, OMEGESE 9.15;
+`cases/pool_runtime.om`). A bound of ng's own that omc never reaches because
 another omc limit refuses first is an `ngonly` row (`NAME ngonly K REASON`): both must exit K, and
 their stderr lines differ (none today). omc has had no table capacities since 2026-11-11 (OMEGESE 9.6), and
 ng's front has had none since the same day (no-caps arena, `src/ir.om` `ar_*`): its input, names, long names,
@@ -65,7 +66,7 @@ Without a run-time pool declaration, `enlarge` (keyword 244, omc pools landing 1
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533 \
+    gate-front seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt \
@@ -124,7 +125,7 @@ calls: both are omc code-shape choices with the same results.
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533 \
+    gate-front-ir seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
 It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
@@ -179,7 +180,7 @@ to ΩIR `fma` (46, one rounding) on three values of one float type. Run cases `c
 `fma_types` (7) are refuse cases. A bool or float shift amount, which omc also admits, stays not lowered; the scope
 gate keeps it failing closed, and its bool-amount admission mutant must be KILLED:
 
-    gate-front seed/out/omc a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533 \
+    gate-front seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-lower-scope.txt seed/ng/front/mutants-lower-scope.txt SCRATCH \
       seed/ng/front/cases-lower-scope.txt
@@ -229,7 +230,7 @@ an ordinary assignment that silently removes its runtime check. OM-1 names retai
 The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
 the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
 
-    gate-front seed/out/omc a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533 \
+    gate-front seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
       seed/ng/front/cases-contract-scope.txt

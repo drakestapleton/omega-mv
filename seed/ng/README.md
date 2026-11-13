@@ -170,9 +170,10 @@ one block; past a64's 262144 branch fixups a function, 270,000 overflow branches
 omc compile and run each and ng check, lower, compile and run it, and requires the same answers. 32 mutants
 (each old table or loop bound put back, the trap-label tag of a64 back at 1000, a moved region losing its words)
 must be KILLED, and a control (a wrong expected answer) tripped. The usage alarm: ng checks
-`seed/omc/omc.om` and its own units after a `usage` line; the arena top must stay at or below 10% of the arena,
-every group at or below 5%, a check at or below 2 s
-(both stand near 1.3% and 20 ms); ng with the arena shrunk to 1048576 words must trip it. With NG given, that binary
+`seed/node/journal-gate.om` (a large real first-party unit; `seed/omc/omc.om` declares a run-time pool, which
+ng refuses as scope) and its own units after a `usage` line; the arena top must stay at or below 10% of the
+arena, every group at or below 5%, a check at or below 2 s; ng with the arena shrunk to 1048576 words must
+trip it. With NG given, that binary
 is judged and nothing is built (the ng of the base must FAIL here). Last line `NOCAPSGATE PASS cases=31 fail=0
 mutants=32 killed=32 controls=2 tripped=2 notrun=0`, exit 0.
 
