@@ -171,7 +171,7 @@ case "$step" in
   # seed compiler (no hosted mirror; Spark only): rebuild from the loader, full qualification, IR oracles required
   seed)               make OUT_DIR=build build/omegese/omegese build/omega_emit/omega_emit build/checker2/checker2
                       sh seed/omega-from-seed.sh
-                      # REVIEW-LESSONS.md: host-keyword closure is required, not an optional external-driver step.
+                      # A change that adds, removes or renumbers a host keyword runs `seed/effects/check.sh` inside `tests/gates/run.sh seed`, before that gate's final PASS. The run counts only if it prints the closure line (`host keywords == table`, or `closure: host keywords differ from table`). Exit 3, `NOT_RUN`, or any other exit that does not print that line is not a pass and is not proof the closure was checked. A closure diff is a failing seed gate. A step that exists only in a driver outside this repository does not count.
                       sh seed/effects/check.sh 2>&1 | tee "$OUT_DIR.seed-effects.log"
                       if ! grep -qE '^ok +closure: [0-9]+ host keywords == table$' "$OUT_DIR.seed-effects.log" ||
                          grep -q 'NOT_RUN' "$OUT_DIR.seed-effects.log"; then
