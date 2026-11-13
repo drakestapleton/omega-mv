@@ -182,14 +182,20 @@ case "$step" in
   # They are separate from seed so CPU OpenCL is not required by every host check.
   irwasm)
     sh seed/wasm/gate-irwasm.sh 2>&1 | tee "$OUT_DIR/qualification.log"
-    grep -q '^PASS IRWASM native parity cases=' "$OUT_DIR/qualification.log"
-    grep -q '^PASS v7 run parity cases=' "$OUT_DIR/qualification.log"
-    grep -q '^PASS v7 OOB traps=.*no-bounds mutant caught' "$OUT_DIR/qualification.log"
+    if ! grep -q '^PASS IRWASM native parity cases=' "$OUT_DIR/qualification.log" ||
+       ! grep -q '^PASS v7 run parity cases=' "$OUT_DIR/qualification.log" ||
+       ! grep -q '^PASS v7 OOB traps=.*no-bounds mutant caught' "$OUT_DIR/qualification.log"; then
+      echo "FAIL IRWASM incomplete qualification evidence" >&2
+      exit 1
+    fi
     ;;
   irspirv)
     # CPU OpenCL only. This is not Vulkan or physical GPU qualification.
     sh seed/spirv/gate-irspirv.sh 2>&1 | tee "$OUT_DIR/qualification.log"
-    grep -q '^PASS IRSPIRV CPU OpenCL parity cases=' "$OUT_DIR/qualification.log"
+    if ! grep -q '^PASS IRSPIRV CPU OpenCL parity cases=' "$OUT_DIR/qualification.log"; then
+      echo "FAIL IRSPIRV incomplete qualification evidence" >&2
+      exit 1
+    fi
     ;;
   # omega-mv#731 ORIG-4 (no hosted mirror; host only): the shadow advisor's glue over the
   # pinned aien-train units (native/orig4/orig4.pin, one aien-train main commit), materialised
