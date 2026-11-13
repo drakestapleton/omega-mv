@@ -40,8 +40,9 @@ aligned. Loads are 16-byte: mode 1 needs a stride that is a multiple of 16, and 
 outer stride 4 with a depth stride that is a multiple of 16. k must be a multiple of 32. There is
 no fallback: a GEMM the kernels cannot take fails with nverr -22.
 
-`gkbf 1` selects the path. It is set only by `gtrainb`, `gprofb` and the gb.om gates. With
-`gkbf 0` (every pre-existing command) the dispatch is unchanged.
+`gkbf 1` selects the path. Callers control this flag for BF16 training, diagnostic
+gates, and the selected inference projections described below. With `gkbf 0`,
+dispatch remains f32. Existing commands retain their previous selection.
 
 Encoding provenance: the instruction words were verified with `nvdisasm -b SM121` against ptxas
 13.0 sm_121 output for `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`,
