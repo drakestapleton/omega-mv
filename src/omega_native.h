@@ -15,7 +15,7 @@ extern "C" {
 #define OMEGA_REENTRY 33u
 #define OMEGA_BAD_RT 34u
 #define OMEGA_NO_STACK 35u
-#define OMEGA2_IDENT_sha256_om2 "omega-ident 1 unit=sha256_om2 abi=2 profile=OM-2 src=dbf002dd6aa36585632b9d01d98ac3f0bd2fa0f0475082940de53638847994bb omc=9c9f0810050c466a2dd2e0872da46564df303aeb6beb3c376889833d9877def6"
+#define OMEGA2_IDENT_sha256_om2 "omega-ident 1 unit=sha256_om2 abi=2 profile=OM-2 src=dbf002dd6aa36585632b9d01d98ac3f0bd2fa0f0475082940de53638847994bb omc=bef974c1414dbac5b8f636d872a5815fb04594cda7bb213e9c0e0a1ff6f31c5b"
 const char *omega2_ident_sha256_om2(void);
 /* export fn sha256_init c edit shactx to void */
 uint32_t omega2_sha256_init(uint64_t *result, uint8_t *o_c);
