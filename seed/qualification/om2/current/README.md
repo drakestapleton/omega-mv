@@ -32,7 +32,15 @@ Every `abi-*` and `sha-*` declared `notrun` case in
 fails if a case is added, omitted, or duplicated. Each C driver's expected
 case names are read from its explicit `check` calls and must appear once in
 its output. The ABI symbol and stale-source/compiler/profile cases are
-executed separately. Wrong source identity, wrong compiler identity and a
+executed separately. The identity checker is copied into the evidence directory;
+only its OMC_PIN literal is replaced, exactly once, with the digest of the
+snapshotted candidate compiler. Bindings are freshly generated there before
+the positive and negative identity checks. The projected script, original
+script digest and derived pin are recorded. Canonical pins, sources and
+generated artifacts are unchanged. This is candidate checker qualification,
+not a claim that the canonical generated bindings are current.
+
+Wrong source identity, wrong compiler identity and a
 wrong independent SHA digest must each fail for the expected reason.
 
 Exit 0 means this ABI/SHA gate passed. Exit 1 means a check failed; exit 3

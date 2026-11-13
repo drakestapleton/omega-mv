@@ -278,7 +278,27 @@ class Qualification:
                 shutil.copyfile(source,target)
         bridge = self.out/'inputs/bridge'
         env = {'OMEGA_OMC':str(self.omc),'OMEGA_BRIDGE':str(bridge)}
-        command = [self.tools['sh'],stage/'om/units.sh','--check']
+        # Test the existing identity checker on candidate-generated bindings. Only its
+        # compiler identity literal changes, mechanically derived from the snapshot.
+        # Canonical source/pins/generated outputs are never edited by this instrument.
+        script = stage/'om/units.sh'
+        original = script.read_text()
+        pins = re.findall(r'^OMC_PIN=([0-9a-f]{64})$', original, re.M)
+        self.require(len(pins) == 1, 'unit checker compiler-pin declaration changed')
+        projected, count = re.subn(r'^OMC_PIN=[0-9a-f]{64}$',
+                                  'OMC_PIN=' + self.pin, original, flags=re.M)
+        self.require(count == 1, 'unit checker pin projection must match exactly once')
+        script.write_text(projected)
+        self.report['unit_checker_projection'] = {
+            'original_compiler_pin': pins[0], 'candidate_compiler_pin': self.pin,
+            'original_script_sha256': hashlib.sha256(original.encode()).hexdigest(),
+            'projected_script_sha256': digest(script),
+            'change': 'Only OMC_PIN is derived from the candidate compiler; checker logic unchanged.',
+            'canonical_binding_check': 'NOT_RUN: this check uses freshly generated candidate bindings.'
+        }
+        self.save()
+        self.run('units-generate-candidate',[self.tools['sh'],script],extra_env=env)
+        command = [self.tools['sh'],script,'--check']
         self.run('units-baseline',command,extra_env=env)
         source = stage/'om/sha256/sha256-om2.om'
         before = source.read_bytes()
