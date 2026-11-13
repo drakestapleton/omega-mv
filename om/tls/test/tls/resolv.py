@@ -114,7 +114,7 @@ def execute(binary, name, expected, label, input=None):
         rc,got=124,b''
     want=1 if expected is None else 0
     ok=rc==want and got==(expected or b'')
-    print(('PASS' if ok else 'FAIL')+' '+label+'/'+name+' rc='+str(rc)+' output='+got.hex(),flush=True)
+    print(('PASS' if ok else 'FAIL')+' '+label+'/'+name+' status='+str(rc)+' output='+got.hex(),flush=True)
     return ok
 
 
@@ -232,7 +232,7 @@ for name in extent_cases:
         output,error=child.communicate(b'x',timeout=2)
         if name=='truncate-after-address':
             require(child.returncode==1 and not output and not error,(name,child.returncode,output,error))
-            print('PASS extent/'+name+' rc=1 (short EOF after address refused)',flush=True)
+            print('PASS extent/'+name+' status=1 (short EOF after address refused)',flush=True)
         else:
             require(child.returncode==0 and output==address,(name,child.returncode,output,error))
             require(error==len(initial).to_bytes(8,'big'),(name,'read beyond initial descriptor extent',error))
