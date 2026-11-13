@@ -1,7 +1,7 @@
 #!/bin/sh
 # gate-pools.sh [OMC] -- run-time pools (docs/RUNTIME-POOLS.md sections 3, 4, 5, 7 and 11). The compiler
 # under test is the argument, else $OMC, else seed/out/omc. The control CTRL (environment) defaults to the
-# base omc 1e628c80..., read from this repository's history (commit f615b139). Cases: seed/omc/tests/pools
+# base omc 1e628c80..., read from history (f615b139), with the pinned bool-field correction below. Cases: seed/omc/tests/pools
 # (NAME.om, NAME.want: stdout, then `status N`). One line per check; last line RC=0 when all passed.
 #  0. Controls: CTRL refuses `global P ulong *` (error 16) and `enlarge` (error 3), and every pools case.
 #     The cases are generated: `python3 seed/omc/tests/pools/mk.py DIR` gives every committed NAME.om and
@@ -70,7 +70,43 @@ if [ -n "${CTRL:-}" ]; then
 else
   git cat-file blob f615b139:seed/out/omc > $B/ctrl 2> /dev/null || bad "control: commit f615b139 is not in this clone"
   [ "$(sha256sum $B/ctrl | cut -d' ' -f1)" = $BASE ] || bad "control: f615b139:seed/out/omc is not omc $BASE"
-  chmod +x $B/ctrl; CTRL=$B/ctrl
+  chmod +x $B/ctrl
+  # Keep the historical no-pools implementation as the reference, with only the
+  # independently reproduced bool-field opcode correction. No corpus row is skipped.
+  mv "$B/ctrl" "$B/ctrl-raw"
+  git cat-file blob f615b139:seed/omc/omc.om > "$B/ctrl-src.om"
+  python3 - "$B/ctrl-raw" "$B/ctrl-src.om" "$B/ctrl" <<'PYBOOL'
+from pathlib import Path
+import hashlib, subprocess, sys
+raw, source, out = map(Path, sys.argv[1:])
+sha = lambda b: hashlib.sha256(b).hexdigest()
+assert sha(raw.read_bytes()) == '1e628c80d5bd2ad0b08eb46d8abff66eff284a74e5a302e589c2d61cfe9f7347'
+data = source.read_bytes()
+assert sha(data) == 'de4099cad761a315d6bf9898bc29eb18b9eedddb568594d41e80d0de462f4199'
+s = data.decode()
+for fn, old, new in [
+    ('ldop', 'if eq t 2', 'if or eq t 1 eq t 2'),
+    ('stop', 'if or eq t 2 eq t 6', 'if or or eq t 1 eq t 2 eq t 6'),
+]:
+    start = s.index('fn '+fn+' t ulong to ulong\n')
+    end = s.index('\nfn ', start + 1)
+    part = s[start:end]
+    assert part.count(old+'\n') == 1
+    s = s[:start] + part.replace(old+'\n', new+'\n') + s[end:]
+assert sha(s.encode()) == '33e993b566c5dbd36fa9d3a063584019485777841d4e4252655503bd9374b418'
+image = subprocess.run([raw], input=s.encode(), capture_output=True, check=True, timeout=60).stdout
+assert sha(image) == 'a0db6165a56811f1315cb445b037568a13bd40d82a155636a53550d123db8748'
+out.write_bytes(image); out.chmod(0o700)
+probe = b'struct W a uint f bool end\nfn main to int\nw = new W 1 false\nput w f true\nif get w f\nret 7\nend\nret 1\nend\n'
+for compiler, want, suffix in [(raw, -4, 'raw'), (out, 7, 'corrected')]:
+    p = subprocess.run([compiler], input=probe, capture_output=True, check=True, timeout=60)
+    exe = out.with_name('bool-probe-'+suffix)
+    exe.write_bytes(p.stdout); exe.chmod(0o700)
+    result = subprocess.run([exe], capture_output=True, timeout=10)
+    assert result.returncode == want, (suffix, result.returncode, want)
+print('PASS historical control bool correction: original SIGILL, corrected exit 7; source and image pins match')
+PYBOOL
+  CTRL=$B/ctrl
 fi
 say "control $CTRL $(sha256sum "$CTRL" | cut -c1-16)"
 

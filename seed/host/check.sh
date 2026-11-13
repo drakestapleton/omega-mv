@@ -27,6 +27,7 @@ required=$(mktemp -d build/seed/required.XXXXXX)
 cat "$required/pools.log"
 grep -qx 'PASS gate-pools' "$required/pools.log"
 [ "$(tail -1 "$required/pools.log")" = 'RC=0' ]
+sh seed/ng/front/cases/nom-wrap.sh check
 seed/out/omc < seed/ng/front/gate-front.om > "$required/gate-front"
 chmod +x "$required/gate-front"
 set --

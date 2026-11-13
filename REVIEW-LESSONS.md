@@ -37,3 +37,20 @@ A pending fixture must be added by its own change, never exempted ahead of time.
 This corrective change does not claim completion of the wider Omega roadmap,
 hardware qualification, or the caller-ceiling feature's release. Those require
 their own exact-head results and independent review.
+
+## Admitted scalar storage and historical comparison controls
+
+A scalar accepted in a struct declaration must have valid load and store
+lowering. Boolean fields exposed a gap: the AArch64 opcode tables returned
+zero for bool, while the NG numeric-conversion operation excludes bool.
+Test true and false initialization, read and write, neighboring fields,
+arrays and parameter access. NG represents bool cells through selection
+and comparison, with validator, interpreter and native checks.
+
+The no-pools compatibility reference remains the historical f615b139
+compiler, with only its two missing bool opcode cases corrected. The
+reference is rebuilt by that pinned historical binary from pinned source;
+the corrected source and binary are independently pinned. The original
+boolean crash and corrected execution are both checked. This permits the
+intentional bug correction while keeping every corpus row in the byte
+comparison and retaining the historical no-pools behavior.
