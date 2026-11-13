@@ -6,6 +6,10 @@
 # under `target x86efi` only, is not generated; it must appear exactly once in its fixed form.
 # Foreign gate kept for generator parity; pair count is derived, never hand-maintained. .om successor seed/omc/gate18.om,
 # tracked in aien-dev/omega-mv#1073.
+# Replacing `[ "$n" = N ]` with `[ "$n" -gt 0 ]` is a weakened gate.
+# The expectation comes from a committed table the gate does not regenerate in that run.
+# A control that deletes the new keyword from the generator and from `omc.om`, and leaves
+# that table unchanged, must exit nonzero when only `sh seed/omc/gate18.sh` is run.
 set -eu
 R=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$R"

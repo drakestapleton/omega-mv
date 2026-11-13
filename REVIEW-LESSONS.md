@@ -7,6 +7,16 @@ the list of parity inputs lives in `seed/ng/front/check-lists.txt`.
 Do not substitute a targeted pass or a lowering pass for the check-parity sweep.
 Interrupted commands have no overall passing result. Preserve their logs.
 
+## Host-keyword closure corrective action
+
+A change that adds, removes or renumbers a host keyword runs
+`seed/effects/check.sh` inside `tests/gates/run.sh seed`, before that gate's final
+PASS. The run counts only if it prints the closure line (`host keywords == table`,
+or `closure: host keywords differ from table`). Exit 3, `NOT_RUN`, or any other
+exit that does not print that line is not a pass and is not proof the closure was
+checked. A closure diff is a failing seed gate. A step that exists only in a
+driver outside this repository does not count.
+
 ## Runtime-pools review corrective action, 2026-11-12
 
 Three reviews occurred on the recovered runtime-pools change before its next

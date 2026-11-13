@@ -171,6 +171,13 @@ case "$step" in
   # seed compiler (no hosted mirror; Spark only): rebuild from the loader, full qualification, IR oracles required
   seed)               make OUT_DIR=build build/omegese/omegese build/omega_emit/omega_emit build/checker2/checker2
                       sh seed/omega-from-seed.sh
+                      # REVIEW-LESSONS.md: host-keyword closure is required, not an optional external-driver step.
+                      sh seed/effects/check.sh 2>&1 | tee "$OUT_DIR.seed-effects.log"
+                      if ! grep -qE '^ok +closure: [0-9]+ host keywords == table$' "$OUT_DIR.seed-effects.log" ||
+                         grep -q 'NOT_RUN' "$OUT_DIR.seed-effects.log"; then
+                        echo "OMEGA-SEED: effects closure did not pass" >&2
+                        exit 1
+                      fi
                       sh seed/host/check.sh 2>&1 | tee "$OUT_DIR.seed-check.log"
                       if grep -q "^SKIP" "$OUT_DIR.seed-check.log"; then echo "OMEGA-SEED: a seed gate was skipped" >&2; exit 1; fi
                       # gate5 checks that seed/omc/size-history.tsv ends with a row for this omc; check.sh does not run it
