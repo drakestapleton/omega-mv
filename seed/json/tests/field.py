@@ -183,7 +183,7 @@ def check(omc, directory, units, wrong_expectation=False, large_scans=True):
         r = subprocess.run([sys.executable,__file__,'--native',str(directory/unit),op],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
         got = json.loads(r.stdout) if r.returncode == 0 else None
         ok = r.returncode == 0 and got == want
-        print(('PASS' if ok else 'FAIL')+' field/'+op+' rc='+str(r.returncode)+' got='+repr(got)+' want='+repr(want),flush=True)
+        print(('PASS' if ok else 'FAIL')+' field/'+op+' status='+str(r.returncode)+' got='+repr(got)+' want='+repr(want),flush=True)
         if not ok:
             failures.append(op)
     return failures

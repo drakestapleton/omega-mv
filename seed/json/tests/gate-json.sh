@@ -105,7 +105,7 @@ set +e
 $LOW "$B/jsdrv" t < "$B/big.in" > /dev/null 2>&1
 rc=$?
 set -e
-[ "$rc" = 93 ] || fail "oversized driver input rc=$rc (want 93)"
+[ "$rc" = 93 ] || fail "oversized driver input status=$rc (want 93)"
 echo 'PASS oversized driver input refused (93)'
 
 # 4b. Above-old-limit reader, writer and formatter parity; EOF/error/overflow and true uint
@@ -123,7 +123,7 @@ set +e
 $LOW env PYTHONOPTIMIZE=1 python3 "$J/tests/field.py" "$OMC" "$B/optimized-field-control" --wrong-expectation > "$B/optimized-field-control.log" 2>&1
 orc=$?
 set -e
-[ "$orc" = 1 ] && grep -q 'FAIL field/stop-copy rc=0 got=-21 want=-22' "$B/optimized-field-control.log" || fail 'optimized field wrong-expectation survived or failed for another reason'
+[ "$orc" = 1 ] && grep -q 'FAIL field/stop-copy status=0 got=-21 want=-22' "$B/optimized-field-control.log" || fail 'optimized field wrong-expectation survived or failed for another reason'
 echo 'PASS optimized field wrong expectation rejected (1)'
 
 # Consumer applications must continue compiling, including their independently owned buffer types.
