@@ -182,6 +182,10 @@ any other generated token writes its decoded bytes. N counts tokens. PROMPT is a
 refused; 27 V over the merges file's V, or V ≤ 256 given to `bpeenc`; 28 fit ran out of pairs;
 29 bad K.
 
+The later [depth-growth command](GROW.md) adds exit 54 for non-finite source
+weights. Its invalid depth, schedule or zero learning rate returns 12; malformed
+arguments return 2. Existing checkpoint refusal codes still apply.
+
 ## 8. Interface between `bpe.om` and the model units
 
 `bpe.om` is a shared unit (no I/O of its own beyond the platform calls). The model and cli code use

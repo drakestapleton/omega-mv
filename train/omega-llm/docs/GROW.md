@@ -18,8 +18,9 @@ prints `G OLD_LAYERS NEW_LAYERS PARAMETERS`.
 The output starts at step zero with zero Adam moments and the specified learning
 rate and schedule, just as a fresh fine-tune does. Retaining moments while changing
 the model is intentionally not supported. Use the same tokenizer as the input.
-`train` and the existing GPU trainers consume the ordinary output checkpoint; this
-change's training tests exercise the host trainer, not the GPU path.
+`train` consumes the ordinary output checkpoint. The GPU trainers use the same
+checkpoint format, but growth followed by GPU training has not been exercised.
+This change tests host training only.
 
 On Linux, the normal checkpoint writer saves OUTPUT.ck through OUTPUT.ck.tmp. As with
 `tune`, an existing output is replaced. Use a distinct output in a private working
@@ -64,11 +65,16 @@ initialization and forward/backward oracle. It tests both checkpoint versions,
 all preserved tensors, deterministic growth, sampled-token and held-out-loss
 preservation, gradients and actual updates in new branches, training-resume
 identity, repeated growth to the current depth boundary, invalid inputs and
-non-finite weights. It repeats the checks with the existing reduced-bank geometry.
+non-finite weights. It repeats the checks using the reduced-bank variant built by
+`build.sh`, and
+checks preservation and non-finite refusals beyond the first snapshot chunk.
+Native `eval` comparisons check the printed micro-nat and micro-bits-per-byte values, not
+bitwise internal losses; the independent oracle also compares its unrounded
+losses. The bitwise preservation claim applies to the saved learned tensors.
 Compiled negative controls must be caught: nonzero attention/FFN outputs,
-missing old weights, lost final gain, stale optimizer state, lost signed-zero bits
-and dead new inputs. Preservation compares packed tensor bytes and includes a
-negative-zero source weight.
+missing old weights, lost final gain, stale optimizer state, lost signed-zero bits,
+dead new inputs and a truncated snapshot. Preservation compares packed tensor bytes
+and includes a negative-zero source weight.
 Python is not a product dependency.
 
 Before promoting any grown checkpoint, train it and compare it with its source
