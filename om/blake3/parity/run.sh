@@ -7,6 +7,13 @@
 #   OMEGA_OMC, OMEGA_BRIDGE as for om/units.sh (exit 3 NOT_RUN without them)
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+# A compiler handed to this runner (the mutants build with it through om/units.sh) is admitted before anything
+# is created or built: its bytes are the ones seed/out/omc.sha256 records, or this is NOT_RUN.
+if [ -n "${OMEGA_OMC:-}" ]; then
+  OMC_PIN=$(sed -n '$!d;1s/^\([0-9a-f]\{64\}\)  seed\/out\/omc$/\1/p' "$ROOT/seed/out/omc.sha256" 2>/dev/null) || OMC_PIN=
+  [ ${#OMC_PIN} = 64 ] || { echo "BLAKE3-PARITY NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
+  [ "$(sha256sum < "$OMEGA_OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "BLAKE3-PARITY NOT_RUN: omc is not the pinned compiler"; exit 3; }
+fi
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 ORACLE=633a17353ba9a62761c9ccb83416d0dbd1689cfe
 V=$ROOT/tests/resolve/blake3_vectors.txt
@@ -27,6 +34,8 @@ out=$("$T/par" "$V" | tail -1); echo "$out"
 [ -n "${OMEGA_OMC:-}" ] && [ -n "${OMEGA_BRIDGE:-}" ] || { echo "BLAKE3-PARITY NOT_RUN: the mutants need OMEGA_OMC and OMEGA_BRIDGE"; exit 3; }
 mutant() { # mutant <name> <exact line> <replacement> <vectors that must differ>
   rm -rf "$T/m"; mkdir -p "$T/m/om"; cp -r "$ROOT/om/." "$T/m/om/"; cp -r "$ROOT/src" "$T/m/src"
+  # om/units.sh reads its compiler pin from the seed receipt beside seed/out/omc; the scratch tree needs it.
+  mkdir -p "$T/m/seed/out"; cp "$ROOT/seed/out/omc.sha256" "$T/m/seed/out/omc.sha256"
   python3 - "$T/m/om/blake3/b3unit.om" "$2" "$3" <<'PY'
 import sys
 p, old, new = sys.argv[1:]

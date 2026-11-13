@@ -37,8 +37,8 @@ every connection of the process).
 | `tls.om` | handshake, record layer, key schedule, alerts, DNS A lookup, TCP connect, approved-only mode, X25519MLKEM768 hybrid key exchange | 149 |
 
 The client composition is 612 functions. `gcmsiv.om` adds 24, so the table total is 636. omc at
-`2c824805` (the batch 2 pin, `OMC_PIN` in `om/units.sh`, which
-the ec, rsa and x509 suites check) allows 4095 functions per unit, as `189ada82` did.
+`2c824805` (the batch 2 pin; the ec, ecdh, rsa, rev and x509 suites now check
+`seed/out/omc.sha256`) allows 4095 functions per unit, as `189ada82` did.
 
 ## Client API (`tls.om`)
 

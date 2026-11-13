@@ -10,6 +10,16 @@
 # Exit 0 PASS, 1 FAIL, 3 NOT_RUN. Every artifact stays under build/seed/nki.
 set -eu
 cd "$(dirname "$0")/../.."
+# Compiler admission precedes dependencies and backend work. The expected hash comes
+# from the tracked seed receipt, never from OMC or a caller-supplied sidecar.
+OMC=${OMC:-seed/out/omc}
+canonical_pin=$(cut -d ' ' -f 1 seed/out/omc.sha256 2>/dev/null) || canonical_pin=
+case "$canonical_pin" in *[!0-9a-f]*) canonical_pin= ;; esac
+[ ${#canonical_pin} -eq 64 ] || { printf 'NOT_RUN gate-irnki: compiler pin file missing or malformed\n'; exit 3; }
+pin=$canonical_pin
+[ -x "$OMC" ] || { printf 'NOT_RUN gate-irnki: no compiler at %s\n' "$OMC"; exit 3; }
+compiler_hash=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$compiler_hash" = "$pin" ] || { printf 'NOT_RUN gate-irnki: compiler %s sha256 %s differs from pin %s\n' "$OMC" "$compiler_hash" "$pin"; exit 3; }
 B=build/seed/nki
 mkdir -p "$B"
 find "$B" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -18,10 +28,7 @@ say() { printf '%s\n' "$*" | tee -a "$B/gate.log"; }
 fail() { say "FAIL $*"; exit 1; }
 notrun() { say "NOT_RUN $*"; exit 3; }
 [ "$(uname -m)" = aarch64 ] || notrun 'requires AArch64 Linux (seed/out/omc emits AArch64)'
-OMC=${OMC:-seed/out/omc}
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
 [ -f "$OMC" ] || fail "compiler $OMC missing"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
 D=${NKI_ORACLE_DIR:-}
 [ -n "$D" ] || notrun 'NKI_ORACLE_DIR unset; prepare it with seed/nki/setup-oracle.sh DIR'
 for f in qemu/usr/bin/qemu-x86_64 python/bin/python3.12 sysroot/usr/lib/x86_64-linux-gnu/libc.so.6 site/nki/__init__.py; do

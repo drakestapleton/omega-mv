@@ -8,15 +8,19 @@
 # small mutants of evidence.om must each change their stream's hash (the corpus discriminates). With
 # OMEGA_BRIDGE set, the 13 exported functions are also cut into function-mode units (unit.py), bound by
 # the pinned omega-bridge generator and compiled as C (bindability).
-#   OMEGA_OMC     seed-born omc, sha256 pinned below (exit 3 NOT_RUN without it)
+#   OMEGA_OMC     seed-born omc, sha256 pinned by seed/out/omc.sha256 (exit 3 NOT_RUN without it)
 #   OMEGA_BRIDGE  optional: an aien-dev/omega-bridge checkout whose src/native.om matches the pin
 # The tree listings hash each entry's path, type and mode, each file's size and content, and no
 # directory size (filesystem-dependent: ext4 4096, tmpfs 40..3800), so any TMPDIR works; the stream
 # directory is created 775 whatever the caller's umask.
 set -eu
-OMC_PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
-NATIVE_PIN=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
 P=$(cd "$(dirname "$0")" && pwd)
+# The compiler pin is the record seed/omega-from-seed.sh writes beside seed/out/omc; it is never typed here.
+# Generator pin: omega-bridge 012860db src/native.om, the generator whose input framing this runner writes
+# (README bindability section). It is NOT om/omega-bridge.lock: the locked generator expects om/units.sh framing.
+NATIVE_PIN=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
+OMC_PIN=$(sed -n '$!d;1s/^\([0-9a-f]\{64\}\)  seed\/out\/omc$/\1/p' "$P/../../../seed/out/omc.sha256" 2>/dev/null) || OMC_PIN=
+[ ${#OMC_PIN} = 64 ] || { echo "EVIDENCE-PARITY NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
 OM=$P/../evidence.om
 [ -n "${OMEGA_OMC:-}" ] || { echo "EVIDENCE-PARITY NOT_RUN: set OMEGA_OMC"; exit 3; }
 [ "$(sha256sum < "$OMEGA_OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "EVIDENCE-PARITY NOT_RUN: omc is not the pinned compiler"; exit 3; }

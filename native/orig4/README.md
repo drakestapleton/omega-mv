@@ -10,7 +10,7 @@ arms with the ORIG-2 candidate scorer. It changes no decision: output is `SHADOW
 |---|---|
 | `shadow.om` | the advisor unit (admission, per-record advice `hvscore`, cost sums, modes S/G/H); handwritten .om |
 | `shadowmain.om` | `fn main`: mode dispatch, the last file of the program unit |
-| `orig4.pin` | the compiler hash and every pinned source (repo, commit, path, sha256) and candidate image hash; all aien-train units at one aien-train main commit, the omega unit at an ancestor of HEAD |
+| `orig4.pin` | the canonical compiler-receipt path and every pinned source (repo, commit, path, sha256) and candidate image hash; all aien-train units at one aien-train main commit, the omega unit at an ancestor of HEAD |
 | `candidates/` | the immutable ORIG-2 candidates (`SHA256SUMS`), byte-identical to aien-train `evidence/SI19-ORIG2/candidates` |
 
 Unit order (concatenation, no import): add32 mul32 metadata affine fixture world omexp

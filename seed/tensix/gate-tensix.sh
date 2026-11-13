@@ -12,6 +12,16 @@
 # Exit 0 PASS, 1 FAIL, 3 NOT_RUN (some oracle absent, nothing failed). Artifacts: build/seed/tensix.
 set -u
 cd "$(dirname "$0")/../.."
+# Compiler admission precedes dependencies and backend work. The expected hash comes
+# from the tracked seed receipt, never from OMC or a caller-supplied sidecar.
+OMC=${OMC:-seed/out/omc}
+canonical_pin=$(cut -d ' ' -f 1 seed/out/omc.sha256 2>/dev/null) || canonical_pin=
+case "$canonical_pin" in *[!0-9a-f]*) canonical_pin= ;; esac
+[ ${#canonical_pin} -eq 64 ] || { printf 'NOT_RUN gate-tensix: compiler pin file missing or malformed\n'; exit 3; }
+OMC_PIN=$canonical_pin
+[ -x "$OMC" ] || { printf 'NOT_RUN gate-tensix: no compiler at %s\n' "$OMC"; exit 3; }
+compiler_hash=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$compiler_hash" = "$OMC_PIN" ] || { printf 'NOT_RUN gate-tensix: compiler %s sha256 %s differs from pin %s\n' "$OMC" "$compiler_hash" "$OMC_PIN"; exit 3; }
 R=seed/tensix
 B=build/seed/tensix
 rm -rf "$B"
@@ -29,8 +39,6 @@ first_diff() { cmp "$1" "$2" 2>&1 | sed -n 1p; }
 ASM=seed/rung2/asm2.bin
 TAB=$R/rv32im.tbl
 ASM_PIN=6988abe072fac3cdef2240d5ad13a3ecd8fb576fa09112d344b9e7c2315969c4
-OMC=seed/out/omc
-OMC_PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
 TTSIM_VERSION=v1.15.0
 TTSIM_WH_PIN=e2a56ffe04072a10d477db1ef85cdbd5d392d9fc52043bb949b90a4c01ff6b4f
 TTSIM_BH_PIN=2367dccc964c0ce4a20b14520e5f7ac6191bb227fb20e87aca1e94bf7432ced2

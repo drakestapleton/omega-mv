@@ -21,7 +21,11 @@ The language contract is [OMEGESE section 10](../../docs/one_layer/OMEGESE.md).
 affinity and priority without a taskset/nice child wrapper. They are program-only
 on AArch64 and x86linux, retain kernel permissions and return minus errno.
 See [the draft contract](../../spec/omegese-cpu-workers.md) and the complete
-`seed/host/affinity/sched.cases` gate, included in `check.sh`.
+`seed/host/affinity/sched.cases` gate, included in `check.sh`. That gate never widens the mask it
+inherits. A `cpunow` that returns the raw `getcpu` status gives 0, which is also the right answer on
+CPU 0, so on a pool whose only core is CPU 0 a comparison cannot detect it: there (and in the `*-inject`
+rows on every pool) `sched.om` runs itself under the oracle `/usr/bin/strace`, which makes `getcpu`
+report CPU 77, and requires `cpunow` to return 77. A tracer that cannot run is exit 20, never a pass.
 
 ## Qualification
 

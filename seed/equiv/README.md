@@ -17,6 +17,9 @@ seed/out/omc < seed/equiv/irequiv.om > irequiv && chmod +x irequiv
 sh seed/equiv/gate-irequiv.sh
 ```
 
+The gate checks the compiler hash against `seed/out/omc.sha256` before host checks. A missing
+or different compiler, or a missing or malformed pin, is NOT_RUN (exit 3).
+
 - `check` needs identical parameter and return types and at most 24 parameter bits (bool counts 1);
   inputs are enumerated with the last parameter in the low bits. The whole domain is scanned; the
   line reports the count of differing inputs and the first one with both results.

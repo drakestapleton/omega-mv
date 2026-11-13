@@ -10,7 +10,10 @@ set -eu
 omc=${1:?usage: run.sh OMC}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../../.." && pwd)
-pin=$(sed -n 's/^OMC_PIN=//p' "$root/om/units.sh")
+pin=$(cut -c1-64 "$root/seed/out/omc.sha256" 2>/dev/null || true)
+case $pin in *[!0-9a-f]*) pin= ;; esac
+[ ${#pin} -eq 64 ] || { echo "RSA NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
+[ "$(sha256sum < "$omc" 2>/dev/null | cut -c1-64)" = "$pin" ] || { echo "RSA NOT_RUN: omc is not the pinned compiler $pin"; exit 3; }
 lib="$root/om/tls"
 vec="$here/vectors"
 out="$root/build/tls/rsa"
@@ -21,11 +24,6 @@ nice_run() { nice -n 19 ionice -c3 "$@"; }
 
 got=$(sha256sum "$omc" | cut -d' ' -f1)
 echo "omc $got"
-if [ "$got" != "$pin" ]; then
-	echo "FAIL omc sha256 is not the pinned $pin"
-	echo "RSA FAIL"
-	exit 1
-fi
 echo "rsa.om $(sha256sum "$lib/rsa.om" | cut -d' ' -f1)"
 echo "sha2.om $(sha256sum "$lib/sha2.om" | cut -d' ' -f1)"
 echo "functions rsa.om $(grep -c '^fn ' "$lib/rsa.om")"

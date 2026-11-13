@@ -29,7 +29,21 @@
 # interleaved ORIG4_REPS (default 5) times: disabled, image scorer, retrieval. Wall times in
 # microseconds land in OUT/<run>.wall_us; the judge computes the overhead from them.
 set -u
+CHECK_COMPILER_PIN=0
+if [ "${1:-}" = --check-compiler-pin ]; then CHECK_COMPILER_PIN=1; fi
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+OMC=$ROOT/seed/out/omc
+PIN=$ROOT/native/orig4/orig4.pin
+# 1. The compiler, before any directory is made or file truncated: seed/out/omc must be the bytes that the
+#    receipt named by orig4.pin (seed/out/omc.sha256) records.
+receipt=$(awk '$1 == "omc" {print $2}' "$PIN" 2>/dev/null)
+[ "$receipt" = seed/out/omc.sha256 ] || { echo "ORIG4_SHADOW_RUN_FAIL orig4.pin must name the canonical compiler receipt"; exit 1; }
+OMC_WANT=$(cut -d ' ' -f 1 "$ROOT/$receipt" 2>/dev/null)
+case $OMC_WANT in *[!0-9a-f]*) OMC_WANT= ;; esac
+[ ${#OMC_WANT} -eq 64 ] || { echo "ORIG4_SHADOW NOT_RUN: no compiler pin in $receipt"; exit 3; }
+[ -x "$OMC" ] || { echo "ORIG4_SHADOW NOT_RUN: no compiler at seed/out/omc"; exit 3; }
+OMC_SHA=$(sha256sum < "$OMC" | cut -c1-64)
+[ "$OMC_SHA" = "$OMC_WANT" ] || { echo "ORIG4_SHADOW NOT_RUN: compiler hash $OMC_SHA differs from $receipt"; exit 3; }
 OUT=${OUT:-$ROOT/build/orig4}
 if [ -n "${BUILD:-}" ]; then
   mkdir -p "$BUILD"
@@ -37,10 +51,8 @@ else
   BUILD=$(mktemp -d "${TMPDIR:-/tmp}/orig4.XXXXXX")
   trap 'rm -rf "$BUILD"' EXIT
 fi
-OMC=$ROOT/seed/out/omc
 TRAIN=${ORIG4_TRAIN_GIT:-$ROOT/../aien-train}
 EXPECT=$ROOT/tests/orig4/expected
-PIN=$ROOT/native/orig4/orig4.pin
 CAND=$ROOT/native/orig4/candidates
 N=$ROOT/native/orig4
 FIXSEED=7
@@ -60,12 +72,13 @@ note "build_dir=$BUILD"
 note "source_commit=$(git -C "$ROOT" rev-parse HEAD)"
 note "host=$(uname -srm)"
 
-# 1. The compiler: seed/out/omc must match seed/out/omc.sha256 and the pin.
-set -- $(sha256sum "$OMC")
-OMC_SHA=$1
-[ "$OMC_SHA" = "$(awk '{print $1}' "$ROOT/seed/out/omc.sha256")" ] || fail "compiler hash $OMC_SHA differs from seed/out/omc.sha256"
-[ "$OMC_SHA" = "$(awk '$1 == "omc" {print $2}' "$PIN")" ] || fail "compiler hash $OMC_SHA differs from orig4.pin"
+# The compiler was admitted at the top (step 1), before this directory existed.
 note "compiler_sha256=$OMC_SHA"
+# Pin preflight is exercised independently of historical source/image availability; normal invocation still runs every gate.
+if [ "$CHECK_COMPILER_PIN" = 1 ]; then
+  echo "ORIG4_SHADOW compiler pin PASS"
+  exit 0
+fi
 
 # 2. The pinned units: git show from the pinned object stores, hash against the pin. Every
 # aien-train unit names one commit (the gate step checks out exactly that one), and every

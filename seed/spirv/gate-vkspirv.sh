@@ -9,6 +9,16 @@
 # Exit 0 PASS, 1 FAIL, 3 NOT_RUN. Every artifact stays under build/seed/vkspirv.
 set -eu
 cd "$(dirname "$0")/../.."
+# Compiler admission precedes dependencies and backend work. The expected hash comes
+# from the tracked seed receipt, never from OMC or a caller-supplied sidecar.
+OMC=${OMC:-seed/out/omc}
+canonical_pin=$(cut -d ' ' -f 1 seed/out/omc.sha256 2>/dev/null) || canonical_pin=
+case "$canonical_pin" in *[!0-9a-f]*) canonical_pin= ;; esac
+[ ${#canonical_pin} -eq 64 ] || { printf 'NOT_RUN gate-vkspirv: compiler pin file missing or malformed\n'; exit 3; }
+pin=$canonical_pin
+[ -x "$OMC" ] || { printf 'NOT_RUN gate-vkspirv: no compiler at %s\n' "$OMC"; exit 3; }
+compiler_hash=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$compiler_hash" = "$pin" ] || { printf 'NOT_RUN gate-vkspirv: compiler %s sha256 %s differs from pin %s\n' "$OMC" "$compiler_hash" "$pin"; exit 3; }
 B=build/seed/vkspirv
 mkdir -p "$B"
 find "$B" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -17,7 +27,6 @@ say() { printf '%s\n' "$*" | tee -a "$B/gate.log"; }
 fail() { say "FAIL $*"; exit 1; }
 notrun() { say "NOT_RUN $*"; exit 3; }
 [ "$(uname -m)" = aarch64 ] || notrun 'requires AArch64 Linux'
-OMC=${OMC:-seed/out/omc}
 SPIRV_VAL=${SPIRV_VAL:-spirv-val}
 LVP_ICD=${LVP_ICD:-/usr/share/vulkan/icd.d/lvp_icd.json}
 PORTLAB_DIR=${PORTLAB_DIR:-bench/portlab}
@@ -26,9 +35,7 @@ command -v "$SPIRV_VAL" >/dev/null || notrun "requires spirv-val ($SPIRV_VAL)"
 command -v "$CC" >/dev/null || notrun "requires a C compiler ($CC) for the interim Vulkan host"
 case "$LVP_ICD" in /*lvp_icd*.json) ;; *) notrun 'LVP_ICD must name the absolute lavapipe ICD manifest' ;; esac
 [ -f "$LVP_ICD" ] || notrun "lavapipe ICD manifest $LVP_ICD missing"
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
 [ -f "$OMC" ] || fail "compiler $OMC missing"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
 hostbuild() {
     # shellcheck disable=SC2086 # flag lists are intentionally word-split
     "$CC" -std=c11 -O2 -Wall -Wextra -Werror ${VULKAN_CFLAGS:-} "$1" seed/spirv/vk-host.c \
