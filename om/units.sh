@@ -38,8 +38,7 @@ UNITS="${OMEGA_UNITS:-om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_
 FS_UNITS="om/sha256/sha256-om2.om"
 DEST="${OMEGA_UNITS_DEST:-$ROOT/src}"
 OUTS="omega_om_units.c omega_native.h omega_api_decl.h omega_om_units.ident omega_om_units_fs.c"
-[ -n "${OMEGA_OMC:-}" ] && [ -n "${OMEGA_BRIDGE:-}" ] || { echo "NOT_RUN: set OMEGA_OMC and OMEGA_BRIDGE"; exit 3; }
-[ "$(sha256sum < "$OMEGA_OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "NOT_RUN: omc is not the pinned compiler"; exit 3; }
+[ ${#NATIVE_PIN} = 64 ] || { echo "NOT_RUN: OMEGA_BRIDGE has no src/native.om at om/omega-bridge.lock $bridge_lock"; exit 3; }
 [ "$(sha256sum < "$OMEGA_BRIDGE/src/native.om" | cut -c1-64)" = "$NATIVE_PIN" ] || { echo "NOT_RUN: native.om is not the pinned generator"; exit 3; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 "$OMEGA_OMC" < "$OMEGA_BRIDGE/src/native.om" > "$T/native"; chmod +x "$T/native"

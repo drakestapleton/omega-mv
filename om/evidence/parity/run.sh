@@ -8,7 +8,7 @@
 # small mutants of evidence.om must each change their stream's hash (the corpus discriminates). With
 # OMEGA_BRIDGE set, the 13 exported functions are also cut into function-mode units (unit.py), bound by
 # the pinned omega-bridge generator and compiled as C (bindability).
-#   OMEGA_OMC     seed-born omc, sha256 pinned below (exit 3 NOT_RUN without it)
+#   OMEGA_OMC     seed-born omc, sha256 pinned by seed/out/omc.sha256 (exit 3 NOT_RUN without it)
 #   OMEGA_BRIDGE  optional: an aien-dev/omega-bridge checkout whose src/native.om matches the pin
 # The tree listings hash each entry's path, type and mode, each file's size and content, and no
 # directory size (filesystem-dependent: ext4 4096, tmpfs 40..3800), so any TMPDIR works; the stream

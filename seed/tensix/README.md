@@ -61,7 +61,7 @@ If any of these, or a ttsim library, is missing, the gate prints NOT_RUN and exi
 
 All of these checks are interop oracles, not Omega-native.
 
-1. **Same bytes every build.** Each image is assembled twice and both builds must match byte for byte. The kernel must also equal the committed `vecadd.bin`, and both start images must end with exactly those bytes. omc (pinned sha256) builds `irrv32.om` twice; both builds must be identical. `irrv32` emits each unit twice. Its vecadd output must be byte-identical to asm2's `vecadd.bin`. GNU objdump must print exactly `mix.expect` for the mix kernel.
+1. **Same bytes every build.** Each image is assembled twice and both builds must match byte for byte. The kernel must also equal the committed `vecadd.bin`, and both start images must end with exactly those bytes. omc (hash from `seed/out/omc.sha256`, checked before assembler work; missing or different compiler or invalid pin is NOT_RUN, exit 3) builds `irrv32.om` twice; both builds must be identical. `irrv32` emits each unit twice. Its vecadd output must be byte-identical to asm2's `vecadd.bin`. GNU objdump must print exactly `mix.expect` for the mix kernel.
 2. **Two independent disassemblers.**
    - GNU objdump must print exactly `vecadd.expect` and `edges.expect`. These cover all 48 table names: 51 words in total.
    - LLVM objdump must agree with GNU on every mnemonic and register.

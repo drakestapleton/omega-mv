@@ -14,6 +14,8 @@ OMC_PIN_ROOT=$ROOT
 # A forged sidecar must fail here, with both digests, and must not be reported as NOT_RUN.
 # The live tree is not modified. A shell file that types either compiler hash fails too,
 # and the generated unit identity must name the sidecar pin.
+# The ordinary path runs this. Section 11's recording runner does not: that runner is a
+# shell around the pinned compiler, and planting a compiler here would not test it.
 pin_disagree_control() {
     d=$(mktemp -d)
     badpin=0000000000000000000000000000000000000000000000000000000000000001
@@ -70,9 +72,37 @@ pin_disagree_control() {
 }
 
 [ -f "$OMC" ] || { echo "NOT_RUN effects: no omc at $OMC"; exit 3; }
-pin_disagree_control
-omc_pin_match "$OMC" effects || exit $?
+omc_pin_load || { echo "NOT_RUN effects: seed/out/omc.sha256 has no compiler pin"; exit 3; }
 PIN=$OMC_PIN
+runner_hash=$(sha256sum < "$OMC" | cut -c1-64)
+# Section 11 of seed/omc/gate-pools.sh runs this owner once through its recording runner and names the
+# compiler ELF as OMC_BINARY. That path exists only for that labelled test instrument and is admitted by
+# what the runner is, never by a digest the caller supplies: OMC_BINARY must be the recorded compiler and
+# OMC must be, byte for byte, "#!/bin/sh", the binding of OMC_BINARY, one log binding, and the tracked
+# seed/omc/tests/pools/record-compiler.sh. Its result line is WRAPPED-EFFECTS-RESULT, never the ordinary one.
+OMC_BINARY=${OMC_BINARY:-$OMC}
+wrapped=
+if [ "$OMC_BINARY" != "$OMC" ]; then
+    [ -x "$OMC_BINARY" ] || { echo "NOT_RUN effects: compiler artifact missing $OMC_BINARY"; exit 3; }
+    artifact_hash=$(sha256sum < "$OMC_BINARY" | cut -c1-64)
+    [ "$artifact_hash" = "$PIN" ] || { echo "NOT_RUN effects: omc is not the pinned compiler $PIN"; exit 3; }
+    recorder=seed/omc/tests/pools/record-compiler.sh
+    bound=$(sed -n 2p "$OMC")
+    logline=$(sed -n 3p "$OMC")
+    expected=$( { printf '#!/bin/sh\n%s\n%s\n' "$bound" "$logline"; cat "$recorder"; } 2>/dev/null | sha256sum | cut -c1-64)
+    case $OMC_BINARY in *"'"*) bound= ;; esac
+    case $logline in "OMC_RECORD_LOG='"*"'") inner=${logline#OMC_RECORD_LOG=\'}; inner=${inner%\'}; case $inner in *"'"*) logline= ;; esac ;; *) logline= ;; esac
+    if [ -f "$recorder" ] && [ "$bound" = "OMC_RECORD_REAL='$OMC_BINARY'" ] && [ -n "$logline" ] && [ "$expected" = "$runner_hash" ]; then
+        wrapped=1
+        echo "effects wrapped runner-sha256=$runner_hash compiler-artifact-sha256=$artifact_hash"
+    else
+        echo "NOT_RUN effects: OMC is not section 11's recording runner for the pinned compiler $PIN"; exit 3
+    fi
+else
+    pin_disagree_control
+    omc_pin_match "$OMC" effects || exit $?
+    PIN=$OMC_PIN
+fi
 for t in strace bwrap od dd awk; do
     command -v $t > /dev/null || { echo "NOT_RUN effects: oracle $t missing"; exit 3; }
 done
@@ -94,7 +124,7 @@ sys_of() { # syscalls line of an elf report
 }
 
 build seed/effects/effects.om "$E" || { cat "$E.err"; echo "SEMANTIC EFFECTS FAIL build"; exit 1; }
-echo "omc $PIN"
+if [ -n "$wrapped" ]; then echo "effects runner $runner_hash artifact $artifact_hash"; else echo "omc $PIN"; fi
 echo "effects sha256 $(sha256sum < "$E" | cut -c1-64)"
 
 # 1. Closure: every keyword with a host code (>= 100, except the non-host type/declaration
@@ -175,7 +205,7 @@ for s in seed/host/tests/*.om seed/rung4/tests/*.om; do
     "$E" verify "$s" "$o" > "$o.v" || { cf=$((cf + 1)); echo "  corpus FAIL $s: $(tail -1 "$o.v")"; }
 done
 [ $cn -gt 0 ] && [ $cf = 0 ] && ok "corpus verify: $cn compiled programs, binary syscalls within source manifest" || bad "corpus verify: $cf of $cn"
-"$E" verify seed/omc/omc.om "$OMC" > "$B/omc.v"; want "verify omc.om vs pinned omc" 0 $?
+"$E" verify seed/omc/omc.om "$OMC_BINARY" > "$B/omc.v"; want "verify omc.om vs pinned omc" 0 $?
 
 # 6. Dynamic oracle: syscalls observed by strace (after the initial execve) within the ELF set.
 dyn() { # dyn NAME BINARY [ARGS] < stdin
@@ -356,5 +386,12 @@ mut fall-off-ok 's/^if and eq fal 1 ge nx1 nwd$/if and eq fal 2 ge nx1 nwd/' fal
 mut regbranch-ok 's/^if eq and w 4261412864 3590324224$/if eq and w 4261412864 3590324225/' braaz
 mut bccond-ok 's/^if eq and w 4278190096 1409286160$/if eq and w 4278190096 1409286161/' bccond
 
-if [ $fails = 0 ]; then echo "SEMANTIC EFFECTS PASS checks=$checks"; exit 0; fi
+if [ $fails = 0 ]; then
+    if [ -n "$wrapped" ]; then
+        echo "WRAPPED-EFFECTS-RESULT ok checks=$checks runner=$runner_hash artifact=$artifact_hash"
+    else
+        echo "SEMANTIC EFFECTS PASS checks=$checks"
+    fi
+    exit 0
+fi
 echo "SEMANTIC EFFECTS FAIL failed=$fails checks=$checks"; exit 1

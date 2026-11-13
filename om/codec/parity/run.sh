@@ -6,11 +6,14 @@
 # omega_codec.c, omega_canonical.c, omega_validate.c, omega_core.c, sha256.c, built with the Makefile
 # CFLAGS) was run once by a driver outside the tree; README.md names it and its rerun command.
 #   usage: sh om/codec/parity/run.sh [--mutants]
-#   OMEGA_OMC  the seed-born omc (default seed/out/omc in this checkout), sha256 pinned below
+#   OMEGA_OMC  the seed-born omc (default seed/out/omc in this checkout), sha256 pinned by seed/out/omc.sha256
 # Exit 0 PASS, 1 FAIL, 3 NOT_RUN (no pinned omc or no python3).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
+# The compiler pin is the record seed/omega-from-seed.sh writes beside seed/out/omc; it is never typed here.
+OMC_PIN=$(sed -n '$!d;1s/^\([0-9a-f]\{64\}\)  seed\/out\/omc$/\1/p' "$ROOT/seed/out/omc.sha256" 2>/dev/null) || OMC_PIN=
+[ ${#OMC_PIN} = 64 ] || { echo "NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
 OMC=${OMEGA_OMC:-$ROOT/seed/out/omc}
 [ -x "$OMC" ] || { echo "NOT_RUN: no omc at $OMC (set OMEGA_OMC)"; exit 3; }
 . "$ROOT/seed/omc-pin.sh"

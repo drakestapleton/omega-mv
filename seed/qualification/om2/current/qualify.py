@@ -29,6 +29,25 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 
+def admit(root: Path) -> str:
+    # The expected identity comes from the repository's seed receipt, never from the candidate being
+    # qualified. Nothing is created, read from the bridge or compiled before this returns.
+    pinfile = root / 'seed/out/omc.sha256'
+    try:
+        record = pinfile.read_text()
+    except OSError as e:
+        raise NotRun(f'no compiler pin in seed/out/omc.sha256: {e}') from e
+    match = re.fullmatch(r'([0-9a-f]{64})  seed/out/omc\n', record)
+    if match is None:
+        raise NotRun('no compiler pin in seed/out/omc.sha256')
+    compiler = root / 'seed/out/omc'
+    if not compiler.is_file() or not os.access(compiler, os.X_OK):
+        raise NotRun('no executable compiler at seed/out/omc')
+    if digest(compiler) != match[1]:
+        raise NotRun(f'omc is not the pinned compiler {match[1]}')
+    return match[1]
+
+
 class Qualification:
     def __init__(self, root: Path, bridge: Path, out: Path):
         self.root, self.bridge, self.out = root, bridge, out
@@ -133,6 +152,9 @@ class Qualification:
         self.save()
 
     def execute(self):
+        # main() admitted the compiler before the evidence directory existed; it is admitted again here so that
+        # a compiler or record replaced in between is refused before any input is compiled.
+        self.pin = admit(self.root)
         if not self.bridge.is_dir():
             raise NotRun(f"missing bridge checkout: {self.bridge}")
         for tool in ('git', 'cc', 'nm', 'sh'):
@@ -158,7 +180,7 @@ class Qualification:
         self.run('cc-version', [self.tools['cc'], '--version'])
         self.run('nm-version', [self.tools['nm'], '--version'])
         relative = [
-            'seed/out/omc', 'om/units.sh', 'om/omega-bridge.lock',
+            'seed/out/omc', 'seed/out/omc.sha256', 'om/units.sh', 'om/omega-bridge.lock',
             'seed/qualification/om2/current/qualify.py',
             'seed/qualification/om2/sec/s5s7/candidate.cases',
             'seed/qualification/om2/oracle/s5s7/abi/driver.c',
@@ -176,7 +198,9 @@ class Qualification:
         native_source = self.snapshot(self.bridge/'src/native.om', 'bridge/src/native.om')
         self.omc = self.inputs['seed/out/omc']
         self.omc.chmod(0o700)
-        self.pin = digest(self.omc)
+        # admit() accepted exactly one line "<pin>  seed/out/omc"; the snapshot must hold that same record.
+        if digest(self.omc) != self.pin or self.inputs['seed/out/omc.sha256'].read_text() != f'{self.pin}  seed/out/omc\n':
+            raise NotRun('compiler or seed/out/omc.sha256 changed during snapshot')
         self.report['compiler_sha256'] = self.pin
         self.native = self.compile('native-build', native_source)
         self.abi_and_sha()
@@ -272,15 +296,20 @@ class Qualification:
     def unit_identity_controls(self):
         stage = self.out/'units-check'
         for relative, source in self.inputs.items():
-            if relative.startswith(('om/','src/')):
+            if relative.startswith(('om/','src/')) or relative == 'seed/out/omc.sha256':
                 target = stage/relative
                 target.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copyfile(source,target)
-        bridge = self.out/'inputs/bridge'
+        # om/units.sh derives its generator pin from om/omega-bridge.lock with git, so it needs the
+        # verified git checkout (clean, at the lock: execute() checked both), not the plain snapshot.
+        # The snapshot still fixes the bytes: the checkout's native.om must equal it.
+        bridge = self.bridge
+        self.require(digest(bridge/'src/native.om') == digest(self.out/'inputs/bridge/src/native.om'),
+                     'bridge native.om changed since its snapshot')
         env = {'OMEGA_OMC':str(self.omc),'OMEGA_BRIDGE':str(bridge)}
-        # Test the existing identity checker on candidate-generated bindings. Only its
-        # compiler identity literal changes, mechanically derived from the snapshot.
-        # Canonical source/pins/generated outputs are never edited by this instrument.
+        # Test the unchanged checker on candidate-generated bindings in a private tree.
+        # Its expected compiler identity comes from the same snapshotted seed receipt;
+        # no script/pin projection or canonical generated-output change is needed.
         script = stage/'om/units.sh'
         original = script.read_text()
         self.require(re.search(r'^OMC_PIN=[0-9a-f]{64}$', original, re.M) is None,
@@ -332,6 +361,11 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[4]
     output = args.output.resolve()
+    try:
+        admit(root)
+    except NotRun as e:
+        print(f'ABI_SHA_GATE NOT_RUN: {e}; nothing was created',file=sys.stderr)
+        return 3
     try:
         output.mkdir(mode=0o700,parents=True,exist_ok=False)
     except OSError as e:

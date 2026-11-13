@@ -24,8 +24,9 @@ module {
 IREE_COMPILE=... IREE_RUN=... PYTHON=... nice -n 19 sh seed/stablehlo/gate-irstablehlo.sh
 ```
 
-Exit 0 PASS, 1 FAIL, 3 NOT_RUN (not AArch64 Linux, or an oracle missing). Artifacts go to
-`build/seed/stablehlo`. The gate pins `seed/out/omc` by sha256, builds the translator, translates every
+Exit 0 PASS, 1 FAIL, 3 NOT_RUN (compiler missing or different, pin missing or malformed,
+not AArch64 Linux, or an oracle missing). Artifacts go to `build/seed/stablehlo`. The gate checks
+the compiler against `seed/out/omc.sha256` before oracle setup, builds the translator, translates every
 row of `cases.tsv` twice (byte-identical), compiles and runs each module on two oracles, and compares
 every element exactly. Integer rows are also run through the same Omega function compiled natively by
 omc. It then requires these to be caught: a wrong op (add to subtract, add to multiply), a wrong
