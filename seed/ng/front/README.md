@@ -64,12 +64,12 @@ Without a run-time pool declaration, `enlarge` (keyword 244, omc pools landing 1
 
 ## Gate
 
-    seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533 \
-      units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
-      seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
-      seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt \
-      seed/ng/front/cases-fconv.txt seed/ng/front/cases-host.txt
+The complete check-parity sweep is mandatory in `tests/gates/run.sh seed`.
+Its input lists are enumerated once in `seed/ng/front/check-lists.txt`.
+The host gate compiles `gate-front.om`, supplies `declared.txt` and
+`mutants.txt`, and gives the runner a fresh scratch directory.
+Targeted invocations remain useful while developing, but do not replace this
+full release check.
 
 The source is `units:seed/ng/ng.units`: the units that list names, concatenated in its order, so a
 stage lane's unit (src/a64.om on the slice branches) comes with the list and no gate command changes

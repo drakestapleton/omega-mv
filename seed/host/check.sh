@@ -8,6 +8,34 @@ if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ] || [ !
     exit 3
 fi
 sh seed/omega-from-seed.sh
+# Required release checks are part of the host gate, not a caller-maintained list.
+# Preserve each log and stop on either a failing command or missing final evidence.
+printf 'SOURCE %s\n' "$(git rev-parse HEAD)"
+sha256sum -c seed/out/omc.sha256
+printf 'COMPILER %s\n' "$(sha256sum seed/out/omc)"
+required=$(mktemp -d build/seed/required.XXXXXX)
+(
+    unset POOLS_ONLY POOLS_SKIP_EQUIV POOLS_EQUIV_MAX POOLS_FUZZ_SEEDS CTRL OMC
+    sh seed/omc/gate-pools.sh
+) > "$required/pools.log" 2>&1 || { cat "$required/pools.log"; exit 1; }
+cat "$required/pools.log"
+grep -qx 'PASS gate-pools' "$required/pools.log"
+[ "$(tail -1 "$required/pools.log")" = 'RC=0' ]
+seed/out/omc < seed/ng/front/gate-front.om > "$required/gate-front"
+chmod +x "$required/gate-front"
+set --
+while IFS= read -r cases; do
+    [ -n "$cases" ] || continue
+    [ -f "$cases" ] || { printf 'FAIL missing front case list: %s\n' "$cases" >&2; exit 1; }
+    set -- "$@" "$cases"
+done < seed/ng/front/check-lists.txt
+[ "$#" -gt 0 ]
+"$required/gate-front" seed/out/omc "$(cut -d' ' -f1 seed/out/omc.sha256)" \
+    units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
+    seed/ng/front/declared.txt seed/ng/front/mutants.txt "$required/front" "$@" \
+    > "$required/front.log" 2>&1 || { cat "$required/front.log"; exit 1; }
+cat "$required/front.log"
+grep -q '^FRONTGATE PASS cases=[1-9][0-9]* .* fail=0 ' "$required/front.log"
 sh seed/omc/gate-ir.sh
 sh seed/omc/gate7.sh
 sh seed/omc/gate8.sh
