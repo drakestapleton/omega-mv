@@ -252,4 +252,4 @@ with `gsampb`, so protocol and sampler parity exercise the same precision
 path. Source alone is not an adoption claim: preserve the actual gate
 receipts and independent review before installing this command.
 
-The GB10 run is retained in [bf16-inference-20261113](../../evidence/OMEGALLM/bf16-inference-20261113/README.md): 26 numerical/execution checks and 122 serving checks. It does not establish a speedup.
+The GB10 run is retained in [bf16-inference-20261113](../../evidence/OMEGALLM/bf16-inference-20261113/README.md). The receipt records the numerical, execution and serving check results. It does not establish a speedup.
