@@ -23,10 +23,27 @@ Exit status: 0 pass, 1 refused or undeclared syscall, 2 usage, 3 invalid or
 unresolvable input, 4 read error.
 
 `elf` treats every SVC in an executable load segment as reachable. Each SVC must be
-immediately preceded by `MOVZ X8,#n`, no direct branch may land on it, and the text
-may contain no `BR`/`BLR`. Anything else is `ELF UNRESOLVED` (exit 3). W+X segments
-are refused. These rules hold for every program the pinned compiler emits today. A
-binary from another producer will usually fail closed.
+immediately preceded by `MOVZ X8,#n`, and the segment may contain no `BR`/`BLR`; both
+rules apply to every word of the segment, instruction or not. No direct branch may land
+on an SVC. That rule applies to the words control can reach: omc puts texts in the same
+segment as the instructions, and a text can hold the bit pattern of a branch (the four
+bytes `@-(6` read as `TBZ`), so holding data to it refused correct programs, omc itself
+among them. Reach starts at the entry word and follows the next word and the target of
+every direct branch; it stops after an unconditional `B`, a `RET`, and an SVC whose
+number is 93 or 94 (exit, exit_group). Such an SVC does not return, and the reason is part
+of the rule: it can be entered only through the `MOVZ X8` before it, because a reached
+branch onto it is refused and an entry point on an SVC is refused, so X8 holds 93 or 94
+when it runs. Reach must not lose control, so three more things are refused: an entry
+point that is an SVC, a reached direct branch whose target lies outside the segment, and
+a reached word that falls through past the last word of the segment. A reached
+register-branch instruction other than `RET` (the pointer-authentication forms, `ERET`) and
+a reached `BC.cond` are refused as well, because the walk cannot follow them. When the entry point
+is not in the segment, every word is held to the rule. Anything else is `ELF UNRESOLVED`
+(exit 3). W+X segments are refused. A binary from another producer will usually fail
+closed.
+
+What this does not show: that a `RET` returns to the word after a `BL`. The calling
+sequence the compiler emits is relied on for that, as it was before this rule was narrowed.
 
 ## Qualification
 
@@ -52,8 +69,22 @@ binary from another producer will usually fail closed.
 - seccomp: each fixture runs under its own filter; a binary run under a narrower
   filter is killed (exit 159, SIGSYS)
 - fail-closed controls: SVC without `MOVZ X8`, `MOVZ X9`, branch into an SVC, `BR`,
-  W+X segment, non-ELF input
-- tool mutants (dropped row, wrong syscall number, weakened MOVZ check) are killed
+  W+X segment, non-ELF input, a syscall number of 512 or more, no executable segment; the
+  last two also check the reason text, which was empty before because the message numbers
+  in the source pointed past the end of the message table
+- data is not code: a text word patched into a `B` onto an SVC behind the entry branch,
+  behind a `RET` and behind an exit SVC passes with the syscalls of the unpatched binary
+  (`cases/tb-entry.om`, `tb-ret.om`, `tb-exit.om`); the same word is refused once the entry
+  word branches to it; a `B` onto the SVC in the word after a returning SVC is refused; an
+  entry point outside the segment holds every word; an entry point off a word boundary is
+  invalid; an entry point on an SVC, a reached branch to past the end or to before the start
+  of the segment, a reached word that falls off the end, a reached `BRAAZ` and a reached
+  `BC.cond` are refused; a text word with the `BRAAZ` pattern passes
+- tool mutants are killed, each by the control named for it in `check.sh`: dropped row,
+  wrong syscall number, weakened MOVZ check, every word held again, nothing held, the
+  outside-entry fallback off, fall-through after `B`, after `RET` and after exit, and the
+  entry-SVC, leaves-segment and falls-off-the-end refusals each removed, and the two
+  message numbers put back wrong, and the two unknown-branch refusals each removed
 
 ## Limits
 
