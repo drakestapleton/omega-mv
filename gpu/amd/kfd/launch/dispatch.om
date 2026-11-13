@@ -3,11 +3,99 @@ note launch: table,ninputs,repeats,timeoutns,outbytes,groupsX,groupsY,queueid,be
 global launch ulong 10
 text timed "OMEGA dispatch_ns="
 text repeatlabel " packets="
+note Diagnostics retain CPU-side inputs only; no additional device writes.
+global queueinput ulong 11
+note diagstate: vadd,full doorbell offset,last packet slot.
+global diagstate ulong 3
+text diagprefix "OMEGA diag "
+text diagspace " "
+text dread "queue_read_pointer"
+text dwrite "queue_write_pointer"
+text dkind "signal_kind"
+text dvalue "signal_value"
+text dheader "ring_header"
+text dslot "ring_slot_byte_offset"
+text dout "output_word_"
+text dqueue "create_queue_input_qword_"
+text did "queue_id"
+text dbell "doorbell_offset"
+text dentry "kernel_code_entry_byte_offset"
+text drsrc1 "compute_pgm_rsrc1"
+text drsrc2 "compute_pgm_rsrc2"
+text drsrc3 "compute_pgm_rsrc3"
+text dprops "kernel_code_properties"
+text dgroup "group_segment_size"
+text dprivate "private_segment_size"
+text dargsize "kernarg_size"
+text dobject "packet_kernel_object"
+text dargaddr "packet_kernarg_address"
+text dnan "output_first8_nan_fill_count"
+text dsum "output_first8_expected_vadd_sum_count"
+text dtimeout "wait_timeout_ns"
+fn diag name view uchar * value ulong to void
+emit diagprefix
+emit name
+emit diagspace
+printnum value
+emit newline
+end
+fn diagindexed name view uchar * index ulong value ulong to void
+emit diagprefix
+emit name
+printnum index
+emit diagspace
+printnum value
+emit newline
+end
 fn lh i ulong to long
 ret long mapget long get launch 0 mul i 24 8
 end
 fn allocate i ulong n ulong flags ulong to long
 ret gpumem n flags long get launch 0 mul i 24
+end
+fn diagnostics to void
+cpufence
+diag dread mapget lh 5 0 8
+diag dwrite mapget lh 4 0 8
+diag dkind mapget lh 7 0 8
+diag dvalue mapget lh 7 8 8
+diag dslot get diagstate 2
+diag dheader mapget lh 3 get diagstate 2 4
+diag dobject mapget lh 3 add get diagstate 2 32 8
+diag dargaddr mapget lh 3 add get diagstate 2 40 8
+diag did get launch 7
+diag dbell get diagstate 1
+for i ulong 11
+diagindexed dqueue i get queueinput i
+end
+diag dentry mapget lh 0 add get el 6 16 8
+diag drsrc1 mapget lh 0 add get el 6 48 4
+diag drsrc2 mapget lh 0 add get el 6 52 4
+diag drsrc3 mapget lh 0 add get el 6 44 4
+diag dprops and mapget lh 0 add get el 6 56 4 65535
+diag dgroup mapget lh 0 get el 6 4
+diag dprivate mapget lh 0 add get el 6 4 4
+diag dargsize mapget lh 0 add get el 6 8 4
+count = div get launch 4 4
+if gt count 8
+count = ulong 8
+end
+nan = ulong 0
+sum = ulong 0
+for i ulong count
+word = mapget lh 2 mul i 4 4
+diagindexed dout i word
+if eq word 0x7fc00000
+nan = add nan 1
+end
+if eq word 0x40000000
+sum = add sum 1
+end
+end
+diag dnan nan
+if ne get diagstate 0 0
+diag dsum sum
+end
 end
 fn queueinit to void
 ctxsizes
@@ -43,10 +131,21 @@ hput 48 4 7
 hput 80 4 get dev 8
 hput 84 4 get dev 9
 note gfx942 AQL queues require no EOP allocation (ROCT queues.c).
+note kfdctl supplies these five mapping addresses in its private ioctl block.
+note Reconstruct that input here, before the ioctl returns output fields.
+for i ulong 11
+put queueinput i hget mul i 8 8
+end
+put queueinput 0 mapaddr lh 3
+put queueinput 1 mapaddr lh 4
+put queueinput 2 mapaddr lh 5
+put queueinput 7 0
+put queueinput 9 mapaddr lh 6
 r = checked kfdctl int get dev 0 3227011842 hdr 0 88 lh 3 lh 4 lh 5 long 0 lh 6
 put launch 7 hget 52 4
 stepend
 belloff = hget 24 8
+put diagstate 1 belloff
 put launch 9 rem belloff 8192
 stepbegin stbell belloff
 put launch 8 ulong checked kfdmap int get dev 0 sub belloff rem belloff 8192 8192
@@ -54,6 +153,7 @@ stepend
 end
 fn packet id ulong to void
 slot = mul rem id 16 64
+put diagstate 2 slot
 zerohdr
 note First dword kept INVALID until every other field is published.
 hput 0 2 1
@@ -83,15 +183,18 @@ fn deadline start long to void
 now = monons
 if lt now start
 steprow 110 false
+diagnostics
 exit 75
 end
 if gt ulong sub now start get launch 3
 steprow 110 false
+diagnostics
 exit 75
 end
 end
 fn dispatch to void
 stepbegin stdispatch get launch 2
+diag dtimeout get launch 3
 start = monons
 if lt start 0
 steprow ulong neg start false
@@ -118,6 +221,7 @@ printnum ulong elapsed
 emit repeatlabel
 printnum get launch 2
 emit newline
+diagnostics
 end
 fn teardown to void
 stepbegin stcleanup 0
