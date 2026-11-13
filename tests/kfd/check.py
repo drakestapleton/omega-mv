@@ -88,6 +88,10 @@ def shape(name):
         suffix=' r r r long 0 long 0'
     return setup,suffix
 
+def qsetup(size, prot=3):
+    # Ring r and a separate queue-object mapping q of `size` bytes; queue type 2 is COMPUTE_AQL.
+    return f'r = mapnew neg int 1 0 4096 3 34\nq = mapnew neg int 1 0 {size} {prot} 34\n'+put(32,4096)+put(40,2)
+
 def source(name, changes='', size=None, setup_override=None, suffix_override=None, request=None):
     q,n=abi[name]
     setup,suffix=shape(name)
@@ -142,6 +146,12 @@ for target in ('a64','x86'):
             q,n=abi[name]
             src=f'global H uchar {n}\nfn main to int\nv = kfdctl neg int 1 {q} H 0 {n}\nret 0\nend\n'
             compile_case('sibling-refusal-'+name,src,target,9)
+    # One writable handle named as both write and read pointer selects the AMD queue object:
+    # the compiler binds base+56 and base+128 and requires 256 bytes; distinct handles stay base-only.
+    for label,setup,suffix in [('queue-object-shared-ring',None,None),
+                               ('queue-object-exact-256',qsetup(256),' r q q long 0 long 0'),
+                               ('queue-base-distinct',qsetup(4096)+'p = mapnew neg int 1 0 4096 3 34\n',' r q p long 0 long 0')]:
+        execute(label,compile_case(label,source('CREATE_QUEUE',setup_override=setup,suffix_override=suffix),target),target)
     dynamic_size=source('GET_VERSION',size='bad').replace('fn main to int\n','fn main to int\nbad = ulong 7\n')
     bads=[('wrong-request',source('GET_VERSION',request=0),0,9),
           ('wrong-size-literal',source('GET_VERSION',size=7),0,9),
@@ -155,6 +165,18 @@ for target in ('a64','x86'):
           ('wrong-handle-kind',source('ALLOC_MEMORY_OF_GPU',setup_override='r = mapnew neg int 1 0 4096 3 34\n'+put(8,4096,8)),103,0),
           ('stale-handle',source('ALLOC_MEMORY_OF_GPU',changes='drop = mapdrop r\n'),103,0),
           ('short-handle',source('ALLOC_MEMORY_OF_GPU',put(8,4194304,8)),103,0)]
+    objq=' r q q long 0 long 0'
+    for kind in (0,1):
+        bads.append(('queue-object-type-'+str(kind),source('CREATE_QUEUE',put(40,kind),setup_override=qsetup(4096),suffix_override=objq),103,0))
+    for size in (48,100,255):
+        bads.append(('queue-object-short-'+str(size),source('CREATE_QUEUE',setup_override=qsetup(size),suffix_override=objq),103,0))
+    bads.append(('queue-object-readonly',source('CREATE_QUEUE',setup_override=qsetup(4096,1),suffix_override=objq),103,0))
+    bads.append(('queue-object-stale',source('CREATE_QUEUE','drop = mapdrop q\n',setup_override=qsetup(4096),suffix_override=objq),103,0))
+    for off in (8,16):
+        for value in (56,128):
+            bads.append(('queue-object-address-'+str(off)+'-'+str(value),source('CREATE_QUEUE',put(off,value,8),setup_override=qsetup(4096),suffix_override=objq),103,0))
+            distinct=qsetup(4096)+'p = mapnew neg int 1 0 4096 3 34\n'
+            bads.append(('queue-base-address-'+str(off)+'-'+str(value),source('CREATE_QUEUE',put(off,value,8),setup_override=distinct,suffix_override=' r q p long 0 long 0'),103,0))
     for name,offs in [('GET_PROCESS_APERTURES_NEW',[0]),('CREATE_QUEUE',[0,8,16,56,72]),
                       ('ALLOC_MEMORY_OF_GPU',[0]),('MAP_MEMORY_TO_GPU',[8]),
                       ('UNMAP_MEMORY_FROM_GPU',[8]),('WAIT_EVENTS',[0]),
@@ -248,7 +270,7 @@ if os.uname().machine=='aarch64':
             s=s.replace('ret 0\nend\n',checks+'ret 0\nend\n')
             b=compile_case('trace-'+name,s,'a64')
             if b:
-                p=run([out/'trace',b])
+                p=run([out/'trace',b]+([56,128] if name=='CREATE_QUEUE' else []))
                 record('trace '+name,p.returncode,0,p.stderr.decode())
     p=run(['cc','-Wall','-Wextra','-Werror',root/'tests/kfd/fdtrace.c','-o',out/'fdtrace'])
     record('fd trace oracle compile',p.returncode,0,p.stderr.decode())
@@ -294,6 +316,12 @@ mutants=[
                   for f in ('hostval','xhost')],
      'om2\nfn f to long\nret kfdres 4096\nend\n',True)]
 mutants.extend([
+    ('queue-object-type', [('kctl','kfdcmpv 0 2\nkfdtrap 1','kfdcmpv 0 2')],
+     source('CREATE_QUEUE',put(40,0),setup_override=qsetup(4096),suffix_override=' r q q long 0 long 0'),False),
+    ('queue-object-range', [('kbind','kfdtrap 8\nnote Subtract only after offset <= length; the existing extent check sees remaining bytes.','note Subtract only after offset <= length; the existing extent check sees remaining bytes.')],
+     source('CREATE_QUEUE',setup_override=qsetup(48),suffix_override=' r q q long 0 long 0'),False),
+    ('queue-object-extent', [('kbind','kfdtrap 8\nif eq get xtarget 0 0\nmstore 13 31 div off 8','if eq get xtarget 0 0\nmstore 13 31 div off 8')],
+     source('CREATE_QUEUE',setup_override=qsetup(255),suffix_override=' r q q long 0 long 0'),False),
     ('literal-size', [('kctl','if ne a_g 77 add x 11 n\nfail 9','if ne a_g 77 add x 11 n\nnote planted missing literal refusal'),
                       ('kctl','kfdcmpv 0 n\nkfdtrap 1','kfdcmpv 0 n')],
      source('GET_VERSION',size=7),False),

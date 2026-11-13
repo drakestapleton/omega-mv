@@ -1409,17 +1409,33 @@ The suffix depends on the request:
 | WAIT_EVENTS | `P poff pn`: event records, count × 48 must fit; every extension pointer must be zero |
 | ALLOC_MEMORY_OF_GPU | `R`: live reservation handle; requested size must fit; USERPTR flag refused |
 | SET_SCRATCH_BACKING_VA | `R`: live reservation handle |
-| CREATE_QUEUE | `ring wptr rptr eop ctx`: live read/write handles; ring size at least 1024 and a power of two, ring/eop/context declared sizes fit, pointer buffers contain at least 8 bytes; zero eop/context handles require zero declared sizes |
+| CREATE_QUEUE | `ring wptr rptr eop ctx`: live read/write handles; ring size at least 1024 and a power of two, ring/eop/context declared sizes fit; distinct `wptr` and `rptr` handles each hold at least 8 bytes and bind at their base; the same handle in both positions selects the AMD queue object (queue type 2, at least 256 bytes, write pointer at base+56, read pointer at base+128); zero eop/context handles require zero declared sizes |
 | Other requests | No suffix; ACQUIRE_VM verifies its `drm_fd` with fstat as a DRM render character descriptor (major 226, minor at least 128) |
 
 **Address-binding rule:** every caller-supplied address field must be zero.
 The compiler copies the header privately, validates each handle's generation,
-liveness, access kind and size (or each span's bounds), then writes only its
-checked base into the private ioctl record. Header and payload spans must not
+liveness, access kind and size (or each span's bounds), then writes only checked
+addresses into the private ioctl record. Header and payload spans must not
 overlap. Copy-out excludes address fields, so those bytes remain zero even
 when the kernel returns an error. Invalid handles, kinds, sizes, addresses,
 overlapping spans, USERPTR and event extensions trap 3 (exit 103).
 Opaque kernel allocation handles and mmap offsets are values, not pointers.
+
+**AMD queue object.** Naming one handle as both `wptr` and `rptr` selects the
+`amd_queue_t` layout. The positions come from the compiler, never from caller
+bytes: write_dispatch_id at base+56 and read_dispatch_id at base+128. The
+request must have queue type 2 (COMPUTE_AQL), and the whole 256-byte object
+must lie inside the writable mapping, so the header before the read pointer
+and the fields after it are inside checked memory. Any other queue type with a
+shared handle traps 3. Distinct handles keep base-only binding with 8 bytes
+each. Ring, EOP and context addresses are always the handle's base.
+The 56, 128 and 256 are the v1 `amd_queue_t` layout in ROCm's
+`amd_hsa_queue.h` (64-byte aligned; write_dispatch_id after the 40-byte
+`hsa_queue_t`, caps and three reserved words; read_dispatch_id after
+reserved2). CP firmware reads the larger v2 fields only when the queue's caps
+word carries AMD_QUEUE_CAPS_SW_ASYNC_RECLAIM. That word is caller data, so a
+caller that sets it owns keeping the v2 extent inside its mapping; the
+compiler qualifies the v1 object only.
 
 Use one reservation per GPU allocation. After ALLOC, existing
 `mapbind R renderfd mmap_offset 3` replaces the entire owned reservation

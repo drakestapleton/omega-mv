@@ -27,7 +27,9 @@ static void poke(pid_t p, uint64_t a, uint64_t v) {
     if (ptrace(PTRACE_POKEDATA,p,(void *)(uintptr_t)a,(void *)(uintptr_t)v)) die("poke");
 }
 int main(int argc, char **argv) {
-    if (argc!=2) return 90;
+    if (argc!=2 && argc!=4) return 90;
+    uint64_t wp=0,rp=0;
+    if (argc==4) { wp=strtoull(argv[2],NULL,10); rp=strtoull(argv[3],NULL,10); }
     pid_t p=fork();
     if (p<0) die("fork");
     if (!p) {
@@ -85,8 +87,13 @@ int main(int argc, char **argv) {
                 }
                 for (unsigned i=0;i<count;i++) {
                     uint64_t actual=peek(p,h+offsets[i]);
-                    if (!expected || actual!=expected) {
-                        fprintf(stderr,"FAIL pointer offset=%u actual=%#llx expected=%#llx\n",offsets[i],(unsigned long long)actual,(unsigned long long)expected);
+                    uint64_t target=expected;
+                    if (q==AMDKFD_IOC_CREATE_QUEUE) {
+                        if (offsets[i]==8) target+=wp;
+                        if (offsets[i]==16) target+=rp;
+                    }
+                    if (!expected || actual!=target) {
+                        fprintf(stderr,"FAIL pointer offset=%u actual=%#llx expected=%#llx\n",offsets[i],(unsigned long long)actual,(unsigned long long)target);
                         return 1;
                     }
                 }

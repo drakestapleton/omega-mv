@@ -23,8 +23,9 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc`,
-   from `seed/omc/omc.om` `4155f90148dae34dd1fc78f035fbf98c4352a28158ddef79b1f200efba46858c`; omc KFD words rebased with current diagnostic and module compiler work, branch `amdserve/kfd-word-r2` on Radicle main ace2691c). The earlier audit pins
+   `9c9f0810050c466a2dd2e0872da46564df303aeb6beb3c376889833d9877def6`,
+   from `seed/omc/omc.om` `99a154ede6c5b93b96b2e70dffac604aaa9bcc7b3305684b86787ef92352dd24`; omc KFD CREATE_QUEUE write/read pointer offsets (change by Codex L1214) on the KFD words, branch `amdserve/kfd-offsets` on Radicle main 8a09ef44). The earlier audit pins
+   `5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc` (omc KFD words rebased with current diagnostic and module compiler work, branch `amdserve/kfd-word-r2` on Radicle main ace2691c),
    `106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed` (omc's arena is a run-time pool that grows under a caller-stated memory ceiling, OMC_MEMORY_MAX (om4 learns the pool subset and envcnt/envread; error 14 now means the host or the ceiling refused), branch `completion/integrated-20261112` on Radicle main 4b4a0e4c),
    `a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533` (omc run-time pools, landing 1 (global NAME T *, enlarge, len; OMEGESE 9.15), branch `omc/pools` on Radicle main 83507124),
    `2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04` (omc inline-cycle check reads the inline-edge tables only (no trap 3 past the calls' room; gate-nocaps drives every table past its first room), branch `omc/inline-edges` on Radicle main ad3f7770),
