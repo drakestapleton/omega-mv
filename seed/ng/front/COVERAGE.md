@@ -1,4 +1,9 @@
-# NG front coverage at a59a425b
+# NG front coverage
+
+The inventory and dated checkpoints below are historical measurements at the named
+revisions. Current contract and data lowering is described in the final sections.
+
+## Baseline at a59a425b
 
 The oracle is seed/out/omc, SHA256 6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8.
 The check pass and lowering are separate. FRONTGATE checks accept/refuse diagnostics, not execution.
@@ -261,41 +266,39 @@ ngcheck have 99 rows (class `sched`); host-audit's closed id set ends at 240 (HO
 differences=0). ngcheck accepts each lowered program; ngrun refuses cpuset, cpuget, setprio and getprio as
 115 and cpunow as 120, so their behavior under ngrun is NOT_RUN. Refusals: cpuget on a text (20), a long pid (7).
 
-## Executable-contract completion follow-on
+## Executable-contract and data lowering
 
-The earlier contract-safety section records the previous refusal boundary. The current lowerer
-executes checked function and loop prefixes; see front/README.md for ordering and release policy.
-The canonical compiler contract manifest feeds the differential gate directly. Function mode
-and runtime-pool lowering are separate remaining work. Struct/layout/nominal lowering is in the
-candidate front.om; its coverage is the next section.
+The dated sections above preserve earlier refusal boundaries. The current lowerer
+executes checked function and loop prefixes, and lowers nominal types, structs and
+layouts. See [README.md](README.md) for ordering and release policy. The canonical
+compiler contract manifest feeds the differential gate directly. Function mode
+and runtime-pool lowering remain separate work.
 
-## Nominal, struct and layout lowering: gate coverage (candidate head, not a release claim)
+## Nominal, struct and layout lowering: current gate coverage
 
-Status labels: the lowering is in `seed/ng/src/front.om` on finish/ng-20261113 as a parent-owned uncommitted
-change; this section covers only the tests that exercise it. Nothing here is hardware qualification.
+The implementation and its regression cases are part of this source. This describes
+the checks, not hardware qualification. The authoritative case list is
+[cases-front-ir.txt](cases-front-ir.txt), including the `nom-*` rows; derive counts
+from that file rather than treating historical counts above as current.
 
-What the gate runs (`cases-front-ir.txt`, rows `nom-*`, 85 rows: 31 run, 54 refuse):
-- The 76 canonical cases of the outside data sweep, in their same classes: 21 run units (a-kept, a-om1, a-ok,
-  l-trap, l-rw, l-om1, struct t1..t9, float/structs, layout/sizes, longnames/long_names) and 53 omc refusals
-  (exit and stderr bytes through `@ng front-ir`). The two function-mode units (a-kept-diag, a-exact-diag) have no
-  `main`; ng exits 64 for them, as for every function-mode unit, so they are not rows.
-- Struct units whose `main` returns uint, ulong or long run as wrapped copies `cases/nom_tN.om`
-  (`cases/nom-wrap.sh` regenerates and checks them; `main to int` is the only lowered signature).
-- Controls with exits fixed by the omc binary: `nom-struct-order` (put evaluates the index call before the value
-  call: trace 21), `nom-struct-put-idx-trap` (index trap 3 before a value overflow, exit 103),
-  `nom-struct-put-idx-only`, `nom-struct-idx-trap` (an index one past an array field traps rather than reading the
-  next field), `nom-struct-bounds` (every scalar width at its extremes in 8-byte cells, last array element,
-  untouched neighbours), `nom-layout-order`, `nom-layout-bounds` (a field ending exactly at the layout size, both
-  byte orders, last array element, index past the array traps 3), `nom-layout-put-idx-trap`,
-  `nom-layout-short` (a view over a buffer shorter than the layout is refused, error 7), `nom-abstract-order`
-  (call operands before the retained holds check, boundary values, trap 10 after a byte of stdout),
-  `nom-abstract-op-order` (left operand first).
-- Five lowering mutants (gate-front-ir mutants 14 to 18) must each fail a run case: struct field index adding the
-  length for the offset; array bound taken from the offset; big-endian layout read and write byte order reversed;
-  the dup32 retained check with eq as ne. Each is killed by the nom controls alone (log nomgate-3 outside the repo).
+The gate exercises:
 
-Limits, measured: the gate was run only on the `nom-*` rows and the contract rows it always includes (targeted,
-CPU3 nice19); the full list and its other 13 mutants were not run by this lane, so no full FRONTIRGATE PASS is
-claimed. A struct with a `bool` field: the omc binary for `new W 1 false` ends in SIGILL (exit 132) and ng emits
-ΩIR that ngcheck rejects (TYPE), so no bool-field fixture is a row (TEST-FINDINGS.md outside the repository).
-Run-time pools are not lowered (`cases/pool_runtime.om`, declared scope, ng exit 64) and are not claimed.
+- Canonical nominal, layout, struct, float-struct, size and long-name cases, with
+  accepted programs executed and refusals compared by exit and diagnostic bytes.
+  Function-mode units without `main` remain outside lowering scope.
+- Struct units whose `main` returns uint, ulong or long through wrapped copies
+  `cases/nom_tN.om`. [nom-wrap.sh](cases/nom-wrap.sh) regenerates and checks them;
+  `main to int` is the lowered entry signature.
+- Evaluation order and bounds: index before value, index traps before value
+  overflow, field-cell boundaries, all scalar widths, untouched neighbouring
+  fields, layout byte order and short-buffer refusals, and operand ordering before
+  retained nominal checks.
+- Boolean field storage through [nom_struct_bool.om](cases/nom_struct_bool.om).
+  The compiler load/store and NG boolean-cell conversions are fixed; the prior
+  SIGILL and invalid numeric-conversion behavior is covered by regressions.
+- Deliberately wrong field offsets, bounds, layout byte order and nominal checks
+  in [gate-front-ir.om](gate-front-ir.om). A partial case run is not a complete gate.
+
+Release evidence must retain the complete `FRONTIRGATE PASS` result and its source
+and compiler identities, alongside the separate check-parity gate. Runtime pools
+remain outside lowering scope (`cases/pool_runtime.om`, exit 64).
