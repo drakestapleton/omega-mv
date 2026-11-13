@@ -277,3 +277,5 @@ Update this table in the same commit as the work it credits.
 | OpenAI Codex (current ABI/SHA qualification, under Drake Stapleton's direction) | Added a source-bound external test instrument that executes the existing ABI and SHA oracles, checks the declared inventory, and preserves failure and identity-control evidence. |
 
 | OpenAI Codex (diagnostic completion, under Drake Stapleton's direction) | Added opt-in human reasons and source-bound diagnostic records, stable emitting-site identifiers, generated source identity, and independent identity/parity coverage. |
+
+| OpenAI Codex and Claude module recovery (under Drake Stapleton's direction) | Implemented typed native module storage and linking with independent native callers, relocation and cache controls, and checked allocation boundary tests. |
