@@ -5,16 +5,19 @@ set -eu
 cd "$(dirname "$0")/../../.."
 B=${JSON_BUILD:-build/seed/json}
 OMC=${OMC:-seed/out/omc}
-# Compiler pin recorded independently before any reseed; update together with seed/out/omc.
-PIN=${JSON_OMC_PIN:-bef974c1414dbac5b8f636d872a5815fb04594cda7bb213e9c0e0a1ff6f31c5b}
+# Compiler pin: the hash seed/omega-from-seed.sh wrote to seed/out/omc.sha256 (JSON_OMC_PIN overrides it).
+PIN=${JSON_OMC_PIN:-$(cut -d ' ' -f 1 seed/out/omc.sha256)}
 J=seed/json
 fail() { printf 'JSONGATE FAIL %s\n' "$*"; exit 1; }
 notrun() { printf 'JSONGATE NOT_RUN %s\n' "$*"; exit 3; }
 [ "$(uname -sm)" = 'Linux aarch64' ] || notrun 'requires Linux aarch64'
+[ -x "$OMC" ] || notrun "no compiler at $OMC"
+case $PIN in *[!0-9a-f]*) PIN= ;; esac
+[ ${#PIN} -eq 64 ] || notrun 'gate-json: no compiler pin in seed/out/omc.sha256'
+h=$(sha256sum < "$OMC" | cut -c1-64)
+[ "$h" = "$PIN" ] || notrun "gate-json: compiler $OMC sha256 $h differs from pin $PIN"
 command -v python3 >/dev/null || notrun 'requires python3 (read-only oracle)'
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || notrun 'requires python3 >= 3.11'
-[ -x "$OMC" ] || notrun "no compiler at $OMC"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$PIN" ] || fail "compiler $OMC differs from pin $PIN"
 if command -v ionice >/dev/null; then LOW='ionice -c3 nice -n 19'; else LOW='nice -n 19'; fi
 rm -rf "$B"
 mkdir -p "$B/out"
@@ -102,8 +105,40 @@ set +e
 $LOW "$B/jsdrv" t < "$B/big.in" > /dev/null 2>&1
 rc=$?
 set -e
-[ "$rc" = 93 ] || fail "oversized driver input rc=$rc (want 93)"
+[ "$rc" = 93 ] || fail "oversized driver input status=$rc (want 93)"
 echo 'PASS oversized driver input refused (93)'
+
+# 4b. Above-old-limit reader, writer and formatter parity; EOF/error/overflow and true uint
+# field edges through documented native function-mode slots; every new defect has a killed twin.
+$LOW python3 "$J/tests/growing.py" "$OMC" "$B/growing" || fail 'growing consumer/boundary cases'
+# Optimization must not remove either test execution or enforcement. Require the deliberate
+# expectation failure specifically, not an arbitrary compile/setup failure with the same exit.
+set +e
+$LOW env PYTHONOPTIMIZE=1 python3 "$J/tests/growing.py" "$OMC" "$B/optimized-growth-control" --wrong-expectation > "$B/optimized-growth-control.log" 2>&1
+orc=$?
+set -e
+[ "$orc" = 1 ] && grep -q 'RuntimeError: reader expectation mismatch' "$B/optimized-growth-control.log" || fail 'optimized growth wrong-expectation survived or failed for another reason'
+echo 'PASS optimized growing wrong expectation rejected (1)'
+set +e
+$LOW env PYTHONOPTIMIZE=1 python3 "$J/tests/field.py" "$OMC" "$B/optimized-field-control" --wrong-expectation > "$B/optimized-field-control.log" 2>&1
+orc=$?
+set -e
+[ "$orc" = 1 ] && grep -q 'FAIL field/stop-copy status=0 got=-21 want=-22' "$B/optimized-field-control.log" || fail 'optimized field wrong-expectation survived or failed for another reason'
+echo 'PASS optimized field wrong expectation rejected (1)'
+
+# Consumer applications must continue compiling, including their independently owned buffer types.
+if [ -n "${JSON_COMPAT_BASE:-}" ]; then
+  $LOW python3 "$J/tests/consumers.py" "$OMC" "$B/consumers" --base "$JSON_COMPAT_BASE" || fail 'base/head consumer composition parity'
+else
+  $LOW python3 "$J/tests/consumers.py" "$OMC" "$B/consumers" || fail 'consumer compositions'
+fi
+
+set +e
+$LOW env PYTHONOPTIMIZE=1 python3 "$J/tests/consumers.py" "$OMC" "$B/optimized-consumer-control" --wrong-expectation > "$B/optimized-consumer-control.log" 2>&1
+orc=$?
+set -e
+[ "$orc" = 1 ] && grep -q 'RuntimeError: composition expectation mismatch: bench-chat' "$B/optimized-consumer-control.log" || fail 'optimized consumer wrong-expectation survived or failed for another reason'
+echo 'PASS optimized consumer wrong expectation rejected (1)'
 
 # 5. Mutants: each must make the parity run fail.
 mutant() { # name file old new
@@ -125,4 +160,4 @@ mutant depth-off-by-one json.om 'if ge d js_hg tape jshdlim' 'if gt d js_hg tape
 mutant writer-escape jsonw.om 'if ge c 32' 'if ge c 31'
 mutant ties-to-even jsonf.om 'ret eq rem js_dget fs q ulong sub i 1 2 1' 'ret true'
 rm -rf "$B/m"
-printf 'JSONGATE PASS rows=%s mutants=5\n' "$rows"
+printf 'JSONGATE PASS rows=%s mutants=5 growing=PASS source=%s\n' "$rows" "$(git rev-parse HEAD)"

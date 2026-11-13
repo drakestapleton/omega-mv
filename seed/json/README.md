@@ -18,6 +18,9 @@ host evidence only. It is not a merge, a deployment, or qualification of any HTT
 | `tests/jsdrv.om` | Test driver program |
 | `tests/gen.py` | Deterministic corpus and CPython oracle (test harness only) |
 | `tests/gate-json.sh` | Gate: parity, refusals, limits, mutants |
+| `tests/big.om`, `tests/growing.py` | Above-old-limit reader/writer/formatter driver and independent CPython oracle |
+| `tests/field.py` | Native function-mode sparse uint-field edges, escape-end scans and guarded reads (test instrument) |
+| `tests/consumers.py` | Compile compatibility of documented repository compositions; optional --base comparison |
 
 ## Composition
 
@@ -54,15 +57,36 @@ Two limits of omc at pin `befb8199` affect composition. Both were reported to th
 
 | Limit | Value | Where |
 |---|---|---|
-| Input bytes per parse | 1 .. 983040 (`jsmaxn`), chosen per tape at `js_init` | refusal 5 |
+| Input bytes per parse | 1 .. 4294967295 (`jsmaxn`, the 32-bit offset cell of the tape), chosen per tape at `js_init` | refusal 5 |
 | Nesting depth | 1 .. 65535 (`jsdcap`), chosen at `js_init` | refusal 4 |
 | Tokens | `(len tape - 16) / 4`, at most 16777215 | refusal 11 |
 | Writer nesting | 1024 | writer refusal 25 |
 | Writer output | `len ob - 1040` bytes | writer refusal 21 |
 
-983040 bytes is 960 KiB: Wolfram `2^20*15/16 -> 983040`. Every loop has a bound that a proof
-can justify. For example, each parser step uses at least one distinct input byte, so the steps
-number at most n + 1 <= 983041 < 999999.
+Until 2026-11-12 the input bound was 983040 bytes, chosen so that every loop bound stayed under the old
+limit 999999 of `while ... bound N`. omc now takes N up to 2^63 - 1, so the loops use that bound and the
+proof is unchanged: each parser step uses at least one distinct input byte, so the steps number at most
+n + 1. The input bound is now the tape format's 32-bit offset cell. What a caller can hold is set by omc:
+the input and tape are caller arrays (locals, at most 4 MiB per function, or parameters), because a global
+or a run-time pool cannot be passed as an argument (OMEGESE 9.15, error 19 / 7).
+
+**Remaining boundary for runtime input held by an Omega caller today:** a source local can contain
+at most 4194304 bytes (the compiler's 4 MiB local-array allowance per function). Put input, tape and output in separate
+call frames if their sum exceeds that allowance; their combined live frames must still fit the
+compiler's 8 MiB program stack. Passing a pool as a view is not implemented here and remains Drake's
+decision. The 4294967295-byte tape-field boundary is therefore not a reachable all-Omega input-size
+promise. tests/field.py independently exercises actual sparse 4 GiB source views through the documented
+native function-mode pointer/length slots: that is host-ABI evidence, not a new Omega caller facility.
+Static text or native-supplied views are different constructions, not growing runtime input pools.
+The native test checks the inclusive field edge and refusal immediately beyond it, without scanning 4 GiB of bytes.
+
+Sizes are checked before narrowing into the tape. A size refusal invalidates previous success/tokens
+and records error 5 at the configured limit, rather than trapping on the uint conversion. The internal
+number scanner and position-returning escape scanners use zero for failure: successful next/end
+positions are nonzero, so position 4294967295 is never confused with jsnone. Both writer loops consume the
+admitted span and stop immediately on sticky output failure, including before another source read.
+The decimal exponent is accumulated exactly until its magnitude exceeds the mantissa displacement
+plus the binary64 range; early exponent saturation cannot erase long-mantissa cancellation.
 
 ## Reader API (`json.om`)
 
@@ -242,7 +266,15 @@ is missing, it prints `JSONGATE NOT_RUN` and exits 3. It runs these steps:
    must match `int()`. The rewrite must be byte-identical to a serializer built from
    `json.encoder.c_encode_basestring` with lexemes kept. Writer scripts must match pinned bytes
    and refusal codes.
-4. A driver input larger than its array exits 93.
+4. A driver input larger than its array exits 93. The 4 MiB driver distinguishes EOF, read error
+   (90), and overflow (93), including an invalid byte appended to the full valid workflow fixture.
+   Growth cases exercise reader, raw-string writer, number writer, token rewrite and float formatting
+   beyond 983040 bytes. CPython `float`, binary64 bits and `repr` independently check balanced
+   million-digit mantissas/exponents and randomized long numbers. Native sparse views check both
+   uint-field edges and number consumers at the maximum end offset; guard pages prove exhausted
+   output stops before reading another source byte. Escape probes also scan a real field-width string
+   ending in a simple/Unicode escape and compare its closed control; a sparse valid writer string
+   crosses the same next-position edge. Growth/field mutants restore each defect.
 5. Five mutants must each be caught:
    - an overlong E0 sequence accepted;
    - raw 0x1F accepted;
@@ -257,7 +289,23 @@ The oracle differs from CPython in four documented places. CPython accepts all o
 - depth over the limit;
 - size or tape capacity over the limit.
 
-CPython is a read-only referee. It never writes bytes that are compiled.
+CPython is a test-only referee, fixture generator and driver. The original corpus oracle writes no
+compiled implementation. The growth/field instruments compose the hand-written Omega driver/wrappers
+and explicit source mutants; all JSON implementation and conversion remains seeded Omega.
+All acceptance and mutant checks use explicit failure branches, not Python assertions. Test execution,
+including mprotect in the native guard probes, is never removed by PYTHONOPTIMIZE. Each Python gate
+accepts --wrong-expectation to make one expected result deliberately wrong; running that control
+with PYTHONOPTIMIZE=1 must fail. The existing corpus generator and local evidence instruments use
+the same unconditional-check rule. Long balanced exact midpoint cases straddle zero/min-subnormal,
+subnormal/normal and finite/overflow rounding thresholds, with both signs and both mantissa forms.
+Fixed-size callers must use a constant for their own allocation and signatures, not jsmaxn (the
+library format ceiling). The Node acceptance drivers use their own ndjsz declared in nodedrv.om.
+consumers.py compiles each concrete documented composition, including the Node drivers, benchmark
+chat/fake-model, agent, library variants and native probes. JSON_COMPAT_BASE=REF adds base/head
+compile-status parity; its manifest records exact inputs, citations and any new test application
+held identical across both library versions. Three width mutants must be compile refusal 23.
+The gate prints `SOURCE`, compiler/source hashes, and a final PASS naming the checkout head; retain
+that output from a clean committed tree as the exact-head receipt.
 
 Driver modes and the writer-script language are documented at the top of `tests/jsdrv.om`. A
 writer script has one operation per line:

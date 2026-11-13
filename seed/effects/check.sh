@@ -152,6 +152,9 @@ bwrap --dev-bind / / --seccomp 9 "$E" src < seed/effects/effects.om 9< "$B/run/s
 [ "$(wc -c < "$B/run/exact.bpf")" = 64 ] && ok "exact filter for plain = 8 instructions (64 bytes)" || bad "exact filter size $(wc -c < "$B/run/exact.bpf")"
 
 # 8. Fail-closed ELF controls (patched copies of plain).
+le32() { # LE_BYTES (octal escapes) of the 32-bit value $1
+    printf '\\%03o\\%03o\\%03o\\%03o' $(($1 & 255)) $((($1 >> 8) & 255)) $((($1 >> 16) & 255)) $((($1 >> 24) & 255))
+}
 word_at_svc() { # index of the first SVC word in the text segment
     od -An -v -tx4 -w4 "$1" | awk '$1 == "d4000001" { print NR - 1; exit }'
 }
@@ -171,14 +174,83 @@ patch "$B/plain" "$B/run/btgt" $((i - 2)) '\002\000\000\024'            # B +2 l
 grep -q 'reason=branch-target' "$B/run/btgt.txt" && ok "  reason branch-target" || bad "  reason text"
 patch "$B/plain" "$B/run/br" $((i - 2)) '\000\000\037\326'              # BR X0
 "$E" elf < "$B/run/br" > "$B/run/br.txt"; want "NEGATIVE indirect branch" 3 $?
+grep -q 'reason=indirect-branch' "$B/run/br.txt" && ok "  reason indirect-branch" || bad "  reason text"
 patch "$B/plain" "$B/run/wx" 17 '\007'                                  # p_flags of phdr 0 = RWX
 "$E" elf < "$B/run/wx" > "$B/run/wx.txt"; want "NEGATIVE W+X segment" 3 $?
 grep -qx 'ELF REFUSED wx-segment' "$B/run/wx.txt" && ok "  reason wx-segment" || bad "  reason text"
+patch "$B/plain" "$B/run/nr600" $((i - 1)) "$(le32 $((0xd2800008 | (600 << 5))))"   # MOVZ X8,#600: number out of range
+"$E" elf < "$B/run/nr600" > "$B/run/nr600.txt"; want "NEGATIVE syscall number out of range" 3 $?
+grep -q 'reason=nr-range' "$B/run/nr600.txt" && ok "  reason nr-range" || bad "  reason text: $(cat "$B/run/nr600.txt")"
+patch "$B/plain" "$B/run/noexec" 17 '\004'                              # p_flags of phdr 0 = R
+"$E" elf < "$B/run/noexec" > "$B/run/noexec.txt"; want "NEGATIVE no executable segment" 3 $?
+grep -qx 'ELF REFUSED no-exec-segment' "$B/run/noexec.txt" && ok "  reason no-exec-segment" || bad "  reason text: $(cat "$B/run/noexec.txt")"
 printf 'not an elf' > "$B/run/junk"
 "$E" elf < "$B/run/junk" > /dev/null; want "NEGATIVE not an ELF" 3 $?
 
+# 8b. Data is not code. Texts share the executable segment with the instructions, so a text can
+# hold the bit pattern of a direct branch onto an SVC. The fixtures carry the text "QZQZ" (one
+# word, 5a515a51) in three places: behind the entry branch, behind a RET and behind an exit SVC.
+# That word is patched into a B onto an SVC. Control cannot reach it, so the binary must pass
+# with the syscalls of the unpatched one; the mutants in section 9 prove each stop rule is needed.
+word_of() { # index of the first word equal to HEX
+    od -An -v -tx4 -w4 "$1" | awk -v h="$2" '$1 == h { print NR - 1; exit }'
+}
+bword() { # LE_BYTES of B with the signed word displacement $1
+    le32 $(( 0x14000000 | ($1 & 0x3ffffff) ))
+}
+for f in tb-entry tb-ret tb-exit; do
+    build $C/$f.om "$B/$f" || { bad "fixture $f does not compile"; continue; }
+    d=$(word_of "$B/$f" 5a515a51); v=$(word_at_svc "$B/$f")
+    if [ -z "$d" ] || [ -z "$v" ]; then bad "fixture $f: text word or SVC not found"; continue; fi
+    patch "$B/$f" "$B/run/$f" "$d" "$(bword $((v - d)))"
+    u=$("$E" elf < "$B/$f" | sys_of)
+    g=$("$E" elf < "$B/run/$f" | sys_of); r=$?
+    [ "$r" = 0 ] && [ -n "$u" ] && [ "$g" = "$u" ] && ok "text word that reads as B onto an SVC is data ($f: syscalls $g)" \
+        || bad "$f: text word held to the branch rule (exit $r, syscalls [$g], unpatched [$u])"
+done
+# the same word is refused as soon as control can reach it
+d=$(word_of "$B/tb-entry" 5a515a51)
+e=$(( (0x$(od -An -v -tx4 -w4 -j 24 -N 4 "$B/tb-entry" | tr -d ' ') - 0x400000) / 4 ))       # entry word index
+patch "$B/run/tb-entry" "$B/run/reach" "$e" "$(bword $((d - e)))"       # entry: B onto the patched text word
+"$E" elf < "$B/run/reach" > "$B/run/reach.txt"; want "NEGATIVE reached text word branches into SVC" 3 $?
+grep -q 'reason=branch-target' "$B/run/reach.txt" && ok "  reason branch-target" || bad "  reason text"
+patch "$B/plain" "$B/run/svcnext" $((i + 1)) "$(bword -1)"              # word after the write SVC: B onto it
+"$E" elf < "$B/run/svcnext" > "$B/run/svcnext.txt"; want "NEGATIVE word after a returning SVC branches into it" 3 $?
+grep -q 'reason=branch-target' "$B/run/svcnext.txt" && ok "  reason branch-target" || bad "  reason text"
+patch "$B/run/tb-entry" "$B/run/noentry" 6 '\000\000\000\000'             # e_entry outside the segment: every word is held
+"$E" elf < "$B/run/noentry" > "$B/run/noentry.txt"; want "NEGATIVE entry outside the segment holds every word" 3 $?
+grep -q 'reason=branch-target' "$B/run/noentry.txt" && ok "  reason branch-target" || bad "  reason text"
+sx=$(od -An -v -tx4 -w4 "$B/plain" | awk '$1 == "d4000001" { n = NR - 1 } END { print n }')   # last SVC of plain: exit
+[ "$(od -An -v -tx4 -w4 -j $(((sx - 1) * 4)) -N 4 "$B/plain" | tr -d ' ')" = d2800ba8 ] && ok "plain: last SVC is exit (MOVZ X8,#93 before it)" || bad "plain: last SVC is not exit"
+patch "$B/plain" "$B/run/entrysvc" 6 "$(le32 $((0x400000 + sx * 4)))"       # e_entry = the exit SVC
+[ "$(od -An -v -tx4 -w4 -j 24 -N 4 "$B/run/entrysvc" | tr -d ' ')" = "$(printf '%08x' $((0x400000 + sx * 4)))" ] && ok "entrysvc: e_entry is the exit SVC" || bad "entrysvc: e_entry not patched as meant"
+"$E" elf < "$B/run/entrysvc" > "$B/run/entrysvc.txt"; want "NEGATIVE entry point on an SVC" 3 $?
+grep -q 'reason=entry-svc' "$B/run/entrysvc.txt" && ok "  reason entry-svc" || bad "  reason text"
+patch "$B/tb-entry" "$B/run/outbr" "$e" "$(bword 1048576)"              # entry: B far past the segment
+"$E" elf < "$B/run/outbr" > "$B/run/outbr.txt"; want "NEGATIVE reached branch leaves the segment" 3 $?
+grep -q 'reason=leaves-segment' "$B/run/outbr.txt" && ok "  reason leaves-segment" || bad "  reason text"
+patch "$B/tb-entry" "$B/run/backbr" "$e" "$(bword $((-e - 1)))"         # entry: B to before the segment start
+"$E" elf < "$B/run/backbr" > "$B/run/backbr.txt"; want "NEGATIVE reached branch to before the segment" 3 $?
+grep -q 'reason=leaves-segment' "$B/run/backbr.txt" && ok "  reason leaves-segment" || bad "  reason text"
+[ "$sx" = "$(( $(wc -c < "$B/plain") / 4 - 1 ))" ] && ok "plain: the exit SVC is the last word" || bad "plain: exit SVC is not the last word"
+patch "$B/plain" "$B/run/falloff" "$sx" '\037\040\003\325'                 # NOP replaces the final exit SVC
+"$E" elf < "$B/run/falloff" > "$B/run/falloff.txt"; want "NEGATIVE reached word falls off the end of the segment" 3 $?
+grep -q 'reason=leaves-segment' "$B/run/falloff.txt" && ok "  reason leaves-segment" || bad "  reason text"
+patch "$B/tb-entry" "$B/run/braaz" "$e" "$(le32 0xd61f0a1f)"             # entry: BRAAZ X16
+"$E" elf < "$B/run/braaz" > "$B/run/braaz.txt"; want "NEGATIVE reached pointer-auth branch" 3 $?
+grep -q 'reason=unknown-branch' "$B/run/braaz.txt" && ok "  reason unknown-branch" || bad "  reason text"
+patch "$B/tb-entry" "$B/run/bccond" "$e" "$(le32 0x54000030)"            # entry: BC.EQ +1
+"$E" elf < "$B/run/bccond" > "$B/run/bccond.txt"; want "NEGATIVE reached BC.cond" 3 $?
+grep -q 'reason=unknown-branch' "$B/run/bccond.txt" && ok "  reason unknown-branch" || bad "  reason text"
+patch "$B/tb-entry" "$B/run/databraaz" "$d" "$(le32 0xd61f0a1f)"         # the text word: same pattern, never reached
+g=$("$E" elf < "$B/run/databraaz" | sys_of); r=$?
+[ "$r" = 0 ] && [ "$g" = "$("$E" elf < "$B/tb-entry" | sys_of)" ] && ok "text word that reads as BRAAZ is data (syscalls $g)" || bad "text word with a BRAAZ pattern refused (exit $r)"
+patch "$B/tb-entry" "$B/run/oddentry" 6 '\262\000\100\000'                # e_entry not on a word boundary
+"$E" elf < "$B/run/oddentry" > "$B/run/oddentry.txt"; want "NEGATIVE entry off a word boundary" 3 $?
+grep -qx 'ELF INVALID' "$B/run/oddentry.txt" && ok "  reason invalid" || bad "  reason text"
+
 # 9. Tool mutants must be killed by the checks above.
-mut() { # mut NAME SED_EXPR
+mut() { # mut NAME SED_EXPR [CONTROL that must be among the killers]
     sed "$2" seed/effects/effects.om > "$B/mut-$1.om"
     if cmp -s seed/effects/effects.om "$B/mut-$1.om"; then bad "mutant $1 did not apply"; return; fi
     build "$B/mut-$1.om" "$B/mut-$1" || { bad "mutant $1 does not compile"; return; }
@@ -187,11 +259,39 @@ mut() { # mut NAME SED_EXPR
     "$B/mut-$1" table | cut -d' ' -f1 | grep -v -x -e read -e write | sort | cmp -s - "$B/kw.txt" || k="$k closure"
     "$B/mut-$1" verify $C/clock.om "$B/clock" > /dev/null || k="$k verify"
     "$B/mut-$1" elf < "$B/run/movzx9" > /dev/null; [ $? = 3 ] || k="$k movzx9"
-    [ -n "$k" ] && ok "mutant $1 killed by:$k" || bad "mutant $1 survived"
+    "$B/mut-$1" elf < "$B/run/btgt" > /dev/null; [ $? = 3 ] || k="$k btgt"
+    "$B/mut-$1" elf < "$B/run/noentry" > /dev/null; [ $? = 3 ] || k="$k noentry"
+    "$B/mut-$1" elf < "$B/run/nr600" | grep -q 'reason=nr-range' || k="$k nr600"
+    "$B/mut-$1" elf < "$B/run/noexec" | grep -qx 'ELF REFUSED no-exec-segment' || k="$k noexec"
+    for f in entrysvc outbr backbr falloff braaz bccond; do
+        "$B/mut-$1" elf < "$B/run/$f" > /dev/null; [ $? = 3 ] || k="$k $f"
+    done
+    for f in tb-entry tb-ret tb-exit; do
+        "$B/mut-$1" elf < "$B/run/$f" > /dev/null; [ $? = 0 ] || k="$k $f"
+    done
+    if [ -z "$k" ]; then bad "mutant $1 survived"; return; fi
+    case " $k " in
+    *" ${3:-} "*) ok "mutant $1 killed by:$k" ;;
+    *) [ -z "${3:-}" ] && ok "mutant $1 killed by:$k" || bad "mutant $1 killed by:$k but not by $3" ;;
+    esac
 }
 mut drop-getpid 's/getpid ident 172 -\\n//'
 mut wrong-random 's/random random 278 -/random random 277 -/'
 mut svc-any-prev 's/^if ne and p 4292870175 3531603976$/if eq p 1/'
+mut nr-msg-wrong 's/^ret unres j 27$/ret unres j 29/' nr600
+mut noexec-msg-wrong 's/^say 28$/say 30/' noexec
+# reach rules: every word held again (the defect), nothing held, and each stop rule removed
+mut reach-all 's/^if ge ent nwd$/if ge ent 0/' tb-entry
+mut reach-none 's/^sp = ulong 1$/sp = ulong 0/' btgt
+mut fallback-off 's/^if eq get mk u 1$/if eq get mk u 2/' noentry
+mut b-falls 's/^if eq and w 4227858432 335544320$/if eq and w 4227858432 335544321/' tb-entry
+mut ret-falls 's/^if eq and w 4294966303 3596550144$/if eq and w 4294966303 3596550145/' tb-ret
+mut exit-falls 's/^if or eq nr 93 eq nr 94$/if or eq nr 293 eq nr 294/' tb-exit
+mut entry-svc-ok 's/^if eq get mk ent 1$/if eq get mk ent 2/' entrysvc
+mut out-branch-ok 's/^if and ne t 4294967295 ge t nwd$/if and ne t 4294967295 ge t 4294967295/' outbr
+mut fall-off-ok 's/^if and eq fal 1 ge nx1 nwd$/if and eq fal 2 ge nx1 nwd/' falloff
+mut regbranch-ok 's/^if eq and w 4261412864 3590324224$/if eq and w 4261412864 3590324225/' braaz
+mut bccond-ok 's/^if eq and w 4278190096 1409286160$/if eq and w 4278190096 1409286161/' bccond
 
 if [ $fails = 0 ]; then echo "SEMANTIC EFFECTS PASS checks=$checks"; exit 0; fi
 echo "SEMANTIC EFFECTS FAIL failed=$fails checks=$checks"; exit 1

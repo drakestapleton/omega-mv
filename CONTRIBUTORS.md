@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| Claude Fable 5.2 (lead session, effects reach) | `seed/effects`: the rule that no direct branch may land on an SVC now applies to the words control can reach from the entry point, so a text whose bytes read as a branch is no longer refused (omc itself was refused: `ELF UNRESOLVED at=120125 reason=branch-target`; reduced to a four-byte text by the fzcore compiler lane). Whole-segment SVC and `BR`/`BLR` rules unchanged. Three text fixtures, five refusal controls and six tool mutants, each killed by its named control |
 | OpenAI Codex (NG environment and self-hosting) | Implemented Linux envcnt/envread in the native backend, controlled-environment regression and mutation coverage, and verified that the NG-built compiler reproduces the canonical compiler bytes. |
 | Claude Sonnet 5.5 (L1210) and OpenAI Codex | Added boolean struct-field regression cases and broken-compiler controls; Codex required exact admitted behavior and integrated them into the seeded host gate. |
 | OpenAI Codex and Claude Sonnet 5.5 (completion regression repair) | Codex repaired bool field storage and NG bool conversion; Sonnet identified the regression and restored all stale mutation anchors with an exhaustive preflight. |

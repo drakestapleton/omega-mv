@@ -16,6 +16,10 @@ Usage: gen.py OUTDIR. Writes OUTDIR/cases.tsv (id, mode, arg2, arg3, kind) and p
 OUTDIR/<id>.in and OUTDIR/<id>.<mode>.want. kind `exact` compares bytes; kind `err` only
 requires the driver to print a line starting `ERR ` (the parse was refused).
 """
+def gate_require(condition, detail):
+    if not condition:
+        raise RuntimeError(detail)
+
 import json
 import json.encoder
 import json.scanner
@@ -28,10 +32,10 @@ from decimal import Decimal, getcontext
 sys.setrecursionlimit(20000)
 sys.set_int_max_str_digits(0)
 getcontext().prec = 4000
-assert json.scanner.c_make_scanner is not None, "CPython C scanner required"
-assert json.encoder.c_encode_basestring is not None, "CPython C encoder required"
+gate_require(json.scanner.c_make_scanner is not None, "CPython C scanner required")
+gate_require(json.encoder.c_encode_basestring is not None, "CPython C encoder required")
 
-MAXN = 983040                    # js_init size limit cap
+MAXN = 4294967295                # js_init size limit: the tape stores offsets in 32-bit cells (json/growing)
 DLIM = 512                       # driver default depth limit
 TAPE = 262144                    # driver tape cells (jsdrv.om dvtape)
 CAP = (TAPE - 16) // 4           # tokens the driver tape holds
@@ -221,7 +225,7 @@ class Corpus:
         """A refusal whose exact code and position are part of the contract (README)."""
         s = MAXN if slim is None else slim
         d = DLIM if dlim is None else dlim
-        assert oracle(data, s, d) is None, ("oracle accepts pinned refusal", data[:40])
+        gate_require(oracle(data, s, d) is None, ("oracle accepts pinned refusal", data[:40]))
         a2 = str(s)
         a3 = "-" if dlim is None else str(dlim)
         cid = self._new(data)
@@ -377,7 +381,7 @@ def float_lexemes(R):
         out.append(dlex(mid - tiny))
         out.append("-" + dlex(mid))
     for lex in list(out):
-        assert oracle(lex.encode()) is not None, lex
+        gate_require(oracle(lex.encode()) is not None, lex)
     return out
 
 
@@ -510,7 +514,7 @@ def gateway(R):
         size += k
     body.append("x" * (GATEWAY - size))
     data = (head + "".join(body) + tail).encode()
-    assert len(data) == GATEWAY
+    gate_require(len(data) == GATEWAY, 'gate condition failed')
     return data
 
 
@@ -590,7 +594,7 @@ def main():
     C.pinned(b"[" + b"0," * (CAP - 1) + b"0]", "ERR 11 %d" % (1 + 2 * (CAP - 1)))
     g = gateway(R)
     cid, ok = C.parse(g, slim=GATEWAY)
-    assert ok
+    gate_require(ok, 'gate condition failed')
     C.pinned(g, "ERR 5 %d" % (GATEWAY - 1), slim=GATEWAY - 1)
     C.raw("t", b"1", b"INIT -13\n", str(MAXN + 1), "-")
     C.raw("t", b"1", b"INIT -13\n", str(MAXN), "0")
@@ -639,3 +643,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
