@@ -11,6 +11,12 @@ sh seed/omega-from-seed.sh
 # Required release checks are part of the host gate, not a caller-maintained list.
 # Preserve each log and stop on either a failing command or missing final evidence.
 printf 'SOURCE %s\n' "$(git rev-parse HEAD)"
+source_state=$(git status --porcelain)
+if [ -n "$source_state" ]; then
+    printf 'FAIL source checkout is dirty\n%s\n' "$source_state" >&2
+    exit 1
+fi
+printf 'SOURCE_CLEAN\n'
 sha256sum -c seed/out/omc.sha256
 printf 'COMPILER %s\n' "$(sha256sum seed/out/omc)"
 required=$(mktemp -d build/seed/required.XXXXXX)
