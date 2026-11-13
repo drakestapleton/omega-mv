@@ -280,7 +280,7 @@ if on 11; then
     case "$unit" in *.om) ;; *) bad "11 inventory: not an Omega unit: $unit" ;; esac
     [ -f "$unit" ] && git --literal-pathspecs ls-files --error-unmatch -- "$unit" > /dev/null 2>&1 ||
       bad "11 inventory: not a tracked file: $unit"
-    grep -qw enlarge "$unit" || grep -qE '^global [^ ]+ [^ ]+ \*$' "$unit" ||
+    grep -qxF "$unit" "$B/users" || grep -qE '^global [^ ]+ [^ ]+ \*$' "$unit" ||
       bad "11 inventory: no enlarge or run-time pool declaration: $unit"
   done < $B/allowed
   if [ -n "$(comm -23 $B/users $B/allowed)" ]; then bad "11 scan: units use enlarge outside $T and are not listed in $T/enlarge-users.txt: $(comm -23 $B/users $B/allowed | tr '\n' ' ')"; fi
