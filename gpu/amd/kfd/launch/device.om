@@ -1,0 +1,281 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note dev: kfd,render,gpu,simds,simdpercu,arrays,arraysperengine,xcc,ctxperxcc,ctl,debug.
+global dev ulong 11
+global dirbuf uchar 4096
+global nodepath uchar 4096
+global noden ulong 1
+text nodes "/sys/class/kfd/kfd/topology/nodes/"
+text props "/properties"
+text gpufile "/gpu_id"
+text render "/dev/dri/renderD"
+text gfxkey "gfx_target_version"
+text drmkey "drm_render_minor"
+text simdkey "simd_count"
+text cukey "simd_per_cu"
+text arrkey "array_count"
+text engkey "simd_arrays_per_engine"
+text xcckey "num_xcc"
+text absent "OMEGA device=absent errno=2\n"
+fn addpath b view uchar * p ulong to ulong
+span p len b len pathbuf
+for i ulong len b bound 4096
+put pathbuf add p i get b i
+end
+ret add p len b
+end
+fn nodefile suffix view uchar * to int
+n = get noden 0
+for i ulong n bound 4096
+put pathbuf i get nodepath i
+end
+n = addpath suffix n
+ret int checked fopen pathbuf 0 n 0 0
+end
+fn propvalue fd int key view uchar * to ulong
+r = checked fseek fd 0 0
+idx = ulong 0
+match = true
+value = ulong 0
+number = false
+while true bound 9223372036854775807
+r = read fd one 0 1
+if eq r 0
+exit 66
+end
+r = checked r
+c = get one 0
+if eq c 10
+if and match number
+ret value
+end
+idx = ulong 0
+match = true
+number = false
+value = ulong 0
+continue
+end
+if number
+if match
+if or lt c 48 gt c 57
+exit 66
+end
+if gt value div sub ulong 18446744073709551615 ulong sub c 48 10
+exit 66
+end
+value = add mul value 10 ulong sub c 48
+end
+else
+if eq c 32
+if ne idx len key
+match = false
+end
+number = true
+else
+if lt idx len key
+if ne c get key idx
+match = false
+end
+else
+match = false
+end
+idx = add idx 1
+end
+end
+end
+ret 0
+end
+fn nodecheck to bool
+fd = nodefile props
+gfx = propvalue fd gfxkey
+if ne gfx 90402
+r = checked fclose fd
+ret false
+end
+put dev 1 propvalue fd drmkey
+put dev 3 propvalue fd simdkey
+put dev 4 propvalue fd cukey
+put dev 5 propvalue fd arrkey
+put dev 6 propvalue fd engkey
+put dev 7 propvalue fd xcckey
+r = checked fclose fd
+fd = nodefile gpufile
+v = ulong 0
+while true bound 9223372036854775807
+r = checked read fd one 0 1
+if eq r 0
+break
+end
+c = get one 0
+if eq c 10
+break
+end
+if or lt c 48 gt c 57
+exit 66
+end
+if gt v 429496729
+exit 66
+end
+v = add mul v 10 ulong sub c 48
+end
+if or eq v 0 gt v 4294967295
+exit 66
+end
+put dev 2 v
+r = checked fclose fd
+ret true
+end
+fn topology to void
+note O_DIRECTORY differs across ARM64 and x86. getdnts verifies the read-only fd.
+dfd = int checked fopen nodes 0 len nodes 0 0
+found = false
+while not found bound 9223372036854775807
+r = checked getdnts dfd dirbuf 0 len dirbuf
+if eq r 0
+exit 66
+end
+p = ulong 0
+while lt p ulong r bound 4096
+span p 20 ulong r
+sz = add ulong get dirbuf add p 16 shl ulong get dirbuf add p 17 8
+if lt sz 20
+exit 66
+end
+span p sz ulong r
+c = get dirbuf add p 19
+if and ge c 48 le c 57
+n = len nodes
+for i ulong n bound 4096
+put nodepath i get nodes i
+end
+j = add p 19
+while true bound 4096
+if ge j add p sz
+exit 66
+end
+if eq get dirbuf j 0
+break
+end
+if ge n len nodepath
+exit 66
+end
+put nodepath n get dirbuf j
+n = add n 1
+j = add j 1
+end
+put noden 0 n
+if nodecheck
+found = true
+break
+end
+end
+p = add p sz
+end
+end
+r = checked fclose dfd
+n = addpath render 0
+minor = get dev 1
+if gt minor 4294967295
+exit 66
+end
+b = new uchar 10 0
+p = ulong 10
+while gt minor 9 bound 10
+p = sub p 1
+put b p uchar add rem minor 10 48
+minor = div minor 10
+end
+p = sub p 1
+put b p uchar add minor 48
+n = addpath part b p sub 10 p n
+put dev 1 ulong checked fopen pathbuf 0 n 2 0
+end
+fn connectkfd to void
+fd = fopen kfdpath 0 len kfdpath 2 0
+if eq fd -2
+emit absent
+exit 77
+end
+put dev 0 ulong checked fd
+zerohdr
+r = checked kfdctl int fd 2148027137 hdr 0 8
+if or ne hget 0 4 1 lt hget 4 4 14
+exit 67
+end
+topology
+zerohdr
+hput 0 4 get dev 1
+hput 4 4 get dev 2
+r = checked kfdctl int get dev 0 1074285333 hdr 0 8
+for i ulong 4
+put ids i uchar and shr get dev 2 mul i 8 255
+end
+end
+fn ctxsizes to void
+if or eq get dev 4 0 eq get dev 7 0
+exit 66
+end
+if eq get dev 6 0
+exit 66
+end
+cu = div div get dev 3 get dev 4 get dev 7
+if eq cu 0
+exit 66
+end
+waves = mul cu 40
+maxwaves = mul div div get dev 5 get dev 6 get dev 6 512
+if lt maxwaves waves
+waves = maxwaves
+end
+if eq waves 0
+exit 66
+end
+ctl = roundup add 40 add mul waves 8 8 4096
+wg = roundup mul cu add add ulong 0x80000 0x4000 add ulong 0x10000 0x1000 4096
+put dev 8 add ctl wg
+put dev 9 ctl
+put dev 10 roundup mul waves 32 64
+if gt get dev 8 4294967295
+exit 66
+end
+end
+fn mapgpu kh ulong to void
+zerohdr
+hput 0 8 kh
+hput 16 4 1
+r = checked kfdctl int get dev 0 3222817560 hdr 0 24 ids 0 4
+if ne hget 20 4 1
+exit 68
+end
+end
+note Allocation record on the caller's table: CPU handle, KFD handle, byte size (24 bytes).
+fn gpumem n ulong flags ulong table long rec ulong to long
+sz = roundup n 4096
+h = checked kfdres sz
+zerohdr
+hput 8 8 sz
+hput 32 4 get dev 2
+hput 36 4 flags
+r = checked kfdctl int get dev 0 3223866134 hdr 0 40 h
+kh = hget 16 8
+moff = hget 24 8
+r = checked mapset table rec 8 ulong h
+r = checked mapset table add rec 8 8 kh
+r = checked mapset table add rec 16 8 sz
+mapgpu kh
+r = checked mapbind h int get dev 1 moff 3
+ret h
+end
+fn gpufree table long rec ulong to void
+kh = mapget table add rec 8 8
+zerohdr
+hput 0 8 kh
+hput 16 4 1
+r = checked kfdctl int get dev 0 3222817561 hdr 0 24 ids 0 4
+if ne hget 20 4 1
+exit 68
+end
+r = checked mapdrop long mapget table rec 8
+zerohdr
+hput 0 8 kh
+r = checked kfdctl int get dev 0 1074285335 hdr 0 8
+end
