@@ -17,13 +17,15 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after omc KFD CREATE_QUEUE queue object, amd_queue_v2_t extent; effects rows for the KFD words, branch `amdserve/kfd-queueobj` on Radicle main c0718cd3 (2026-11-13): committed
+Current pin after omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main c0718cd3 (2026-11-13): committed
 `seed/out/omc` SHA-256
-`46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1`, compiler
-source SHA-256 `b676af9ead6eef53ede18da136dabc89b15e879b4d0bb1a2ad66276f517a3c67`.
-The previous pin, after omc KFD CREATE_QUEUE compiler-owned queue-object binding (branch `amdserve/kfd-queueobj`, not landed), was
+`26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`, compiler
+source SHA-256 `9977db63aae76ee41c35a7a5715d7dc40427f3c7711597f31e5b60697ef8e7ef`.
+The previous pin, after omc KFD CREATE_QUEUE queue object, amd_queue_v2_t extent; effects rows for the KFD words (branch `amdserve/kfd-queueobj`, not landed), was
+`46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1` (source
+`b676af9ead6eef53ede18da136dabc89b15e879b4d0bb1a2ad66276f517a3c67`); before that, after omc KFD CREATE_QUEUE compiler-owned queue-object binding (branch `amdserve/kfd-queueobj`, not landed), was
 `bef974c1414dbac5b8f636d872a5815fb04594cda7bb213e9c0e0a1ff6f31c5b` (source
-`2805d733f646291cfe9763167db66e88d83871c8146adef2ce5b2172752932eb`); before that, after omc KFD words rebased with current diagnostic and module compiler work (branch `amdserve/kfd-word-r2`, landed as ebf256ae, 2026-11-13), was
+`2805d733f646291cfe9763167db66e88d83871c8146adef2ce5b2172752932eb`); before that, after omc KFD words rebased with current diagnostic and module compiler work (branch `amdserve/kfd-word-r2`, not landed separately (merged into this line)), was
 `5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc` (source
 `4155f90148dae34dd1fc78f035fbf98c4352a28158ddef79b1f200efba46858c`); before that, after omc's arena is a run-time pool that grows under a caller-stated memory ceiling, OMC_MEMORY_MAX (om4 learns the pool subset and envcnt/envread; error 14 now means the host or the ceiling refused; branch `completion/integrated-20261112`, landed as a7260bed, 2026-11-12), was
 `106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed` (source
@@ -193,7 +195,7 @@ mkdir -p build
 if seed/out/omc < seed/qualification/om2/gate.om > build/neuralese-gate; then
   chmod +x build/neuralese-gate &&
   build/neuralese-gate seed/out/omc \
-    46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1 \
+    26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991 \
     neuralese/host.cases build/neuralese-host
 else
   exit 1
@@ -409,7 +411,7 @@ It is exactly the committed `seed/out/omc` introduced by
 the lock. Read-only `git show <revision>:seed/out/omc | sha256sum` resolved the
 older `2c824805...` at82a399b9 and `49923639...` at ec07d25d as different
 historical binaries. No compiler change is part of NL4. After the reseed
-recorded at the top of this file, the committed compiler is `46dedc0a...`; the
+recorded at the top of this file, the committed compiler is `26540e6d...`; the
 lock and receipt below keep the `d6290c76...` run unedited, and the command
 below uses the current pin because the conductor refuses any other hash.
 
@@ -423,7 +425,7 @@ sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
 chmod +x build/nl4-gate
-build/nl4-gate seed/out/omc 46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1 neuralese/nl4-host.cases build/nl4-host
+build/nl4-gate seed/out/omc 26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991 neuralese/nl4-host.cases build/nl4-host
 ```
 
 The conductor hashes the compiler itself and requires a previously absent scratch

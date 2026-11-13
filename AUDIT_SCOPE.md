@@ -23,10 +23,11 @@ current security review.
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
    identical bytes), and the committed `seed/out/omc` (sha256
-   `46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1`,
-   from `seed/omc/omc.om` `b676af9ead6eef53ede18da136dabc89b15e879b4d0bb1a2ad66276f517a3c67`; omc KFD CREATE_QUEUE queue object, amd_queue_v2_t extent; effects rows for the KFD words, branch `amdserve/kfd-queueobj` on Radicle main c0718cd3). The earlier audit pins
+   `26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`,
+   from `seed/omc/omc.om` `9977db63aae76ee41c35a7a5715d7dc40427f3c7711597f31e5b60697ef8e7ef`; omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main c0718cd3). The earlier audit pins
+   `46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1` (omc KFD CREATE_QUEUE queue object, amd_queue_v2_t extent; effects rows for the KFD words, branch `amdserve/kfd-queueobj`, not landed),
    `bef974c1414dbac5b8f636d872a5815fb04594cda7bb213e9c0e0a1ff6f31c5b` (omc KFD CREATE_QUEUE compiler-owned queue-object binding, branch `amdserve/kfd-queueobj`, not landed),
-   `5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc` (omc KFD words rebased with current diagnostic and module compiler work, branch `amdserve/kfd-word-r2` on Radicle main ace2691c),
+   `5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc` (omc KFD words rebased with current diagnostic and module compiler work, branch `amdserve/kfd-word-r2`, not landed separately (merged into this line)),
    `106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed` (omc's arena is a run-time pool that grows under a caller-stated memory ceiling, OMC_MEMORY_MAX (om4 learns the pool subset and envcnt/envread; error 14 now means the host or the ceiling refused), branch `completion/integrated-20261112` on Radicle main 4b4a0e4c),
    `a5613368f427aacd73ebeee16d46f8b3203405711d4de5b860d0cbee11ce4533` (omc run-time pools, landing 1 (global NAME T *, enlarge, len; OMEGESE 9.15), branch `omc/pools` on Radicle main 83507124),
    `2495bc253c662dce362ac62393796a3579156dcfd5df7e3eba06df3436ae5d04` (omc inline-cycle check reads the inline-edge tables only (no trap 3 past the calls' room; gate-nocaps drives every table past its first room), branch `omc/inline-edges` on Radicle main ad3f7770),
