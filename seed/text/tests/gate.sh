@@ -3,7 +3,8 @@
 # Builds the case generator gen.om and txdrv (om2 + text.om + txdrv.om) with seed/out/omc, writes the
 # fixed and seeded random cases with their expected answers, and requires every answer of text.om to
 # equal the oracle's. Then twelve mutants of text.om, each removing or bending one rule, must each
-# produce at least one wrong answer. Prints TEXTGATE PASS rows=N mutants=12.
+# produce at least one wrong answer. Also checks boundary cases and slice-guard mutants.
+# Prints TEXTGATE PASS rows=N mutants=M boundaries=B.
 # Exit 0 PASS, 1 FAIL, 3 NOT_RUN (interrupted by HUP, INT or TERM).
 # Migration debt: this driver is still sh, with perl for the mutant edits; it is not ported to .om yet.
 set -eu
@@ -63,4 +64,32 @@ mutant "U+D800 encoded" 's/if and ge cp 55296/if and ge cp 55297/'
 mutant "3-byte lead written as 4-byte" 's/lead = 224/lead = 240/'
 mutant "U+07FF sized as 3 bytes" 's/if lt cp 2048/if lt cp 2047/'
 mutant "backquote read as a hex digit" 's/if and ge c 97 le c 102/if and ge c 96 le c 102/'
-printf 'TEXTGATE PASS rows=%s mutants=%s\n' "$rows" "$m"
+# Boundary contracts are exercised through the same exact-status conductor as OM-2.
+# The cases include invalid caller ranges and the named function-mode text refusal.
+"$S" < seed/qualification/om2/gate.om > "$T/boundary-gate"
+chmod +x "$T/boundary-gate"
+pin=$(sha256sum "$S" | cut -d' ' -f1)
+"$T/boundary-gate" "$R/$S" "$pin" seed/text/tests/boundary.cases "$T/boundary" > "$T/boundary.log" 2>&1 || {
+    cat "$T/boundary.log"
+    trap - EXIT HUP INT TERM
+    bad "text boundary contract failed ($T kept)"
+}
+cat "$T/boundary.log"
+boundaries=$(sed -n 's/^OM2GATE PASS cases=\([0-9]*\) .*/\1/p' "$T/boundary.log")
+[ -n "$boundaries" ] || bad "missing boundary verdict"
+# Each mutant changes a refusing original (exit 103) into a clean return (exit 0).
+# A signal, compile error or another exit is not counted as the expected kill.
+boundary_mutant() {
+    perl -0pe "$2" seed/text/text.om > "$T/boundary-mut.om"
+    cmp -s seed/text/text.om "$T/boundary-mut.om" && bad "boundary mutant $1 did not apply"
+    cat seed/text/tests/boundaries.om "$T/boundary-mut.om" > "$T/boundary-mut.src"
+    "$S" < "$T/boundary-mut.src" > "$T/boundary-mut" 2> "$T/build.err" || bad "boundary mutant did not compile: $(cat "$T/build.err")"
+    chmod +x "$T/boundary-mut"
+    st=0
+    "$T/boundary-mut" "$3" > "$T/boundary-mut.out" 2> "$T/boundary-mut.err" || st=$?
+    [ "$st" = 0 ] && [ ! -s "$T/boundary-mut.out" ] && [ ! -s "$T/boundary-mut.err" ] || bad "boundary mutant $1 did not produce its expected wrong clean return ($st)"
+    m=$((m + 1)); printf 'PASS boundary mutant caught: %s (original 103, mutant 0)\n' "$1"
+}
+boundary_mutant "offset guard removed" 's/if gt o l\ntrap 3\nend\n//' 1
+boundary_mutant "length guard removed" 's/if gt n sub l o\ntrap 3\nend\n//' 2
+printf 'TEXTGATE PASS rows=%s mutants=%s boundaries=%s\n' "$rows" "$m" "$boundaries"

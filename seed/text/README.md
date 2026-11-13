@@ -51,5 +51,15 @@ still sh with perl for the mutant edits (migration debt). Exit status: 0 PASS, 1
 run was interrupted by HUP, INT or TERM). On a FAIL against the oracle the gate keeps its run folder
 and names the cases file, the driver's exit status (100+N is trap N) and the got and want files.
 
-Not here yet: number text for floats (see `seed/json/jsonf.om`),
-and text in function mode (RM5's ABI item).
+The gate also runs `tests/boundary.cases` through the existing OM-2 conductor. It checks
+empty end slices, wrapped offsets and counts, insufficient output space, unchanged caller
+storage on clean refusal, invalid UTF-8 code points, and exact bounds traps. Two additional
+mutants remove the offset and length guards; each must turn the expected trap into a clean
+wrong return. These checks do not require allocating enormous arrays.
+
+Function-mode `text` literals, including empty literals, are refused with error 9 under
+OMEGESE section 9.12. The boundary cases enforce that named refusal, satisfying RM5's
+literal support-or-refusal choice without claiming a foreign text ABI. The byte-array
+functions remain composable; cross-language callers require separate RM7 qualification.
+
+Not here yet: number text for floats (see `seed/json/jsonf.om`).

@@ -271,3 +271,4 @@ Update this table in the same commit as the work it credits.
 | OpenAI Codex (release-check corrective action, under Drake Stapleton's direction) | Made pool behavior and complete front-end parity mandatory within the seeded host qualification, with preserved logs and source/compiler identity. |
 
 | OpenAI Codex (native object compiler, under Drake Stapleton's direction) | Added opt-in typed imports and native object metadata with call relocations and whole-link stack inputs, plus independent object parity and refusal checks. |
+| OpenAI Codex (Omega text qualification, under Drake Stapleton's direction) | Added exact text range, refusal-storage and function-literal boundary cases with two slice-guard mutants to the existing text gate. |
