@@ -45,6 +45,15 @@ OM4=seed/rung4/om4.bin
 SRC=seed/omc/omc.om
 "$OM4" < "$SRC" > "$B/stage1"
 chmod +x "$B/stage1"
+
+# Derive diagnostic strings and the normalized source identity using the newborn compiler.
+# A stale identity is a build failure; generated source is never silently installed.
+{ printf 'om2\n'; sed '/^fn sha256 /,$d' seed/trace/sha256.om; cat seed/omc/diaggen.om; } > "$B/diaggen.om"
+"$B/stage1" < "$B/diaggen.om" > "$B/diaggen"
+chmod +x "$B/diaggen"
+"$B/diaggen" "$SRC" seed/omc/error-codes.reg seed/trace/sha256.om seed/omc/diag-runtime.om > "$B/diagnostics-source.om"
+cmp -s "$SRC" "$B/diagnostics-source.om" || bad "diagnostic source is stale; inspect and regenerate with $B/diaggen"
+printf 'PASS diagnostic source identity and generated strings\n'
 "$B/stage1" < "$SRC" > "$B/stage2"
 chmod +x "$B/stage2"
 "$B/stage2" < "$SRC" > "$B/stage3"
