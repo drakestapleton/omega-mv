@@ -17,7 +17,7 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after omc's arena is a run-time pool that grows under a caller-stated memory ceiling, OMC_MEMORY_MAX (om4 learns the pool subset and envcnt/envread; error 14 now means the host or the ceiling refused), branch `omc/pools-arena` on Radicle main 4b4a0e4c (2026-11-11): committed
+Current pin after omc's arena is a run-time pool that grows under a caller-stated memory ceiling, OMC_MEMORY_MAX (om4 learns the pool subset and envcnt/envread; error 14 now means the host or the ceiling refused), branch `completion/integrated-20261112` on Radicle main 4b4a0e4c (2026-11-12): committed
 `seed/out/omc` SHA-256
 `106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed`, compiler
 source SHA-256 `eac9784b018dff579f8c1c187f209c241973d52d355f39a4729073379345521f`.
