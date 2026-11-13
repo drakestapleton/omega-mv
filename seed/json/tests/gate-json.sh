@@ -11,10 +11,13 @@ J=seed/json
 fail() { printf 'JSONGATE FAIL %s\n' "$*"; exit 1; }
 notrun() { printf 'JSONGATE NOT_RUN %s\n' "$*"; exit 3; }
 [ "$(uname -sm)" = 'Linux aarch64' ] || notrun 'requires Linux aarch64'
+[ -x "$OMC" ] || notrun "no compiler at $OMC"
+case $PIN in *[!0-9a-f]*) PIN= ;; esac
+[ ${#PIN} -eq 64 ] || notrun 'gate-json: no compiler pin in seed/out/omc.sha256'
+h=$(sha256sum < "$OMC" | cut -c1-64)
+[ "$h" = "$PIN" ] || notrun "gate-json: compiler $OMC sha256 $h differs from pin $PIN"
 command -v python3 >/dev/null || notrun 'requires python3 (read-only oracle)'
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || notrun 'requires python3 >= 3.11'
-[ -x "$OMC" ] || notrun "no compiler at $OMC"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$PIN" ] || fail "compiler $OMC differs from pin $PIN"
 if command -v ionice >/dev/null; then LOW='ionice -c3 nice -n 19'; else LOW='nice -n 19'; fi
 rm -rf "$B"
 mkdir -p "$B/out"
