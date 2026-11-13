@@ -136,7 +136,7 @@ fib38), so any future codegen A/B reports an aligned control.
 | x0..x7 | arguments and result (x0), allocatable caller-saved |
 | x8..x14 | allocatable caller-saved |
 | x15, x16, x17 | scratch: spill reloads, check temporaries, parallel-move cycle (x15) and slot-to-slot (x16); never allocated (`a6_free` scans x0..x14 then x19..x27; rgate mutant 16 and fixture lv) |
-| x18 | platform register (AAPCS64 6.1.1), unused |
+| x18 | excluded from allocation; original Linux entry stack for modules using envcnt/envread; unused by the Mach-O backend |
 | x19..x27 | allocatable callee-saved (saved in the prologue when used) |
 | x28 | stack floor 0x10000000 (omc convention, trap 6 check) |
 | x29 | unused (kept for a frame pointer) |
@@ -186,8 +186,8 @@ bits there (multiply, two-source, float). The selector never asks for these; the
    proves them (IR.md s15).
 3. Remaining fusions: ADD/SUB immediates; bitmask immediates; check + op as one ADDS.
 4. f16, bf16, fp8, `fmath` and vector floats other than `vec f32 4` and `vec f64 2` (section 12) (refused, exit 5: no
-   accuracy-stated implementation), host words beyond read, write, monons, realns, cpufence and cpurelax (sleepns 120
-   has no ngrun reference: ngrun's host words are read, write, monons, realns, cpufence, cpurelax).
+   accuracy-stated implementation), host words beyond read, write, monons, realns, envcnt, envread, cpufence and cpurelax.
+   The implemented Linux words have native/interpreter or canonical-compiler comparisons.
 
 ## 6. Gates (run from the omega-mv root on core 1)
 
@@ -684,3 +684,19 @@ became `b.cc 0` and the stub was never marked, so a64/rgate's deep fixture ran t
 name `add a_tlab code` now and its ELF equals the one before the arena work. The liveness loops over a block's words
 were bound at 4096 (the old 262144 wires / 64) and are at the arena's bound now. Gate:
 `seed/ng/tests/nocaps/gate.om` (seed/ng/README.md, No-caps gate), whose mutants put each of these back.
+
+## Linux process environment
+
+`envcnt` and `envread` use the original process environment. The entry stub saves
+the kernel stack in non-allocatable x18 only when the module uses these words.
+The layout and return behavior follow `omc` hargs: indices at or beyond the
+terminator trap 3; an insufficient destination returns -105 before any write;
+a successful copy excludes the terminating zero. Normal IR slice checks still
+validate the destination. These operations are refused for Mach-O.
+
+The A64 gate runs environment fixtures with a fixed three-entry environment,
+including an empty value, through both save modes and the canonical compiler.
+It also checks exact-fit copies, unchanged short buffers, invalid indices and
+invalid destination slices. Environment-address, capacity and copied-byte
+mutants run through the same comparisons; no operator environment is copied
+into a fixture or its output.

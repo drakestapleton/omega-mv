@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex (NG environment and self-hosting) | Implemented Linux envcnt/envread in the native backend, controlled-environment regression and mutation coverage, and verified that the NG-built compiler reproduces the canonical compiler bytes. |
 | Claude Sonnet 5.5 (L1210) and OpenAI Codex | Added boolean struct-field regression cases and broken-compiler controls; Codex required exact admitted behavior and integrated them into the seeded host gate. |
 | OpenAI Codex and Claude Sonnet 5.5 (completion regression repair) | Codex repaired bool field storage and NG bool conversion; Sonnet identified the regression and restored all stale mutation anchors with an exhaustive preflight. |
 | OpenAI Codex (NG data lowering) | Lowered structs, typed layouts and nominal values through checked IR; repaired bool cell conversion with select and comparison and verified the interpreter/native path. |
