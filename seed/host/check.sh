@@ -222,4 +222,6 @@ fi
 # caught, so that suite, and therefore this script, exits nonzero.
 sh om/tls/test/gcmsiv/run.sh seed/out/omc
 sh om/tls/test/reuse/run.sh seed/out/omc
+sh seed/omc/gate-objects.sh seed/out/omc
+sh seed/text/tests/gate.sh
 printf 'PASS native-host qualification; seeded build, C tools are comparison oracles only\n'
