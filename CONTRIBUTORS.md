@@ -269,3 +269,5 @@ Update this table in the same commit as the work it credits.
 | OpenAI Codex (NG completion recovery) | Recovered the unlanded quantity, data-parameter and scheduler-word follow-ons onto the current arena-based front end; retained main's empty-text and macOS library-word behavior, regenerated affected source pins, and exercised differential, scope and host-policy controls. |
 | OpenAI Codex (Omega completion qualification lane, under Drake Stapleton's direction) | Standalone WebAssembly and CPU OpenCL SPIR-V gate manifests and standard entry-point wiring; unavailable dependencies and incomplete current-run evidence remain nonpassing. |
 | OpenAI Codex (release-check corrective action, under Drake Stapleton's direction) | Made pool behavior and complete front-end parity mandatory within the seeded host qualification, with preserved logs and source/compiler identity. |
+
+| OpenAI Codex (native object compiler, under Drake Stapleton's direction) | Added opt-in typed imports and native object metadata with call relocations and whole-link stack inputs, plus independent object parity and refusal checks. |

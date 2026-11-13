@@ -1747,3 +1747,26 @@ Fixtures and exact expected outcomes are in
 `seed/qualification/om2/gate.om` conductor. The example above is exercised by
 `seed/omc/contracts/ok.om`; release/erased and proved/plain pairs require
 byte-identical output, not just equal exit statuses.
+
+## Native object output (experimental, outside frozen OM-2)
+
+A first line `object`, followed by `om2` or `om2 release`, requests an
+AArch64 function-mode object instead of an executable or bare callable unit.
+The payload uses the existing function ABI and preserves its trap behavior.
+`extern fn NAME ... to TYPE` declares a typed imported function without a body.
+Imports must be resolved by the native module linker before execution.
+Exports use `export fn`; the existing profiles retain their own behavior.
+
+Objects carry compiler-generated symbols, typed interfaces, call relocations and
+stack-cost records. The object format and separate source-digest/compiler-pin
+identity checks are specified in `spec/omegese-modules.md`.
+This first format accepts scalar and array interfaces. It refuses nominal and
+struct/layout interfaces, inline imports, imported fresh scratch contracts,
+globals, text literals and host effects. Function-mode call cycles still refuse.
+A function named `main` has no special meaning inside an object.
+
+The object is not an executable. Its linker must validate identities, interfaces,
+relocations, whole-program cycles and stack demand before publishing a final
+image. Compiler parse refusals leave stdout empty. A failed output write can
+leave a partial object, which consumers must reject. Existing OM-1/OM-2 output
+does not change unless the explicit object line is present.
