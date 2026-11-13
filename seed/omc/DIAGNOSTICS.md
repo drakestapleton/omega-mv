@@ -17,6 +17,9 @@ the numeric code. Forwarding helpers retain their caller's site. New emitting
 calls must have new identifiers; do not renumber existing ones. The gate rejects
 missing and duplicate sites and reports unexercised identifiers separately.
 A registered site is not automatically a tested site.
+The checked KFD request, header-size and span-alias refusals also carry sites.
+The KFD CPU suite matches mutation seams across diagnostic annotations while
+still requiring exactly one semantic match and exercising every mutant.
 
 `diaggen.om` regenerates strings and the source identity from the registry,
 inline site notes, SHA core and diagnostic runtime. It hashes the complete

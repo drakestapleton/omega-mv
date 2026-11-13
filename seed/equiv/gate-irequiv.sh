@@ -6,7 +6,7 @@ set -eu
 cd "$(dirname "$0")/../.."
 [ "$(uname -m)" = aarch64 ] || { echo "SKIP gate-irequiv: needs aarch64 (omc emits AArch64)"; exit 0; }
 OMC=seed/out/omc
-PIN=a7a21591ee41d5a5b0a45bede36b08b4deeaf2ab593e5414f189134deae3767b
+PIN=5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc
 [ "$(sha256sum "$OMC" | cut -d' ' -f1)" = "$PIN" ] || { echo "FAIL pin: $OMC"; exit 1; }
 B=build/seed/equiv
 mkdir -p "$B"

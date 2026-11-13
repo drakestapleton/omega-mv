@@ -310,8 +310,14 @@ for label, patches, case, function in mutants:
         stop=changed.find('\nfn ',start+1)
         if stop<0: stop=len(changed)
         body=changed[start:stop]
-        if body.count(old)!=1: raise RuntimeError('mutation seam '+label+' '+fn)
-        changed=changed[:start]+body.replace(old,new)+changed[stop:]
+        # Diagnostic site annotations may separate the semantic instructions.
+        # Still require exactly one complete seam; never silently skip a mutant.
+        seam = r'\n(?:note d2site [^\n]*\nput d2site 0 \d+\n)?'
+        pattern = seam.join(re.escape(line) for line in old.split('\n'))
+        matches = list(re.finditer(pattern, body))
+        if len(matches)!=1: raise RuntimeError('mutation seam '+label+' '+fn)
+        hit = matches[0]
+        changed=changed[:start]+body[:hit.start()]+new+body[hit.end():]+changed[stop:]
     m=out/('mutant-'+label)
     m.with_suffix('.om').write_text(changed)
     p=run([omc],changed.encode())
