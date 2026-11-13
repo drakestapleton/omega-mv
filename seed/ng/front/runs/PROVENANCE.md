@@ -61,3 +61,9 @@ uncommitted in its latch worktree; NgFront took them unchanged (copy and sha256 
 directory). Each program uses private arrays, empty or `/dev/null` paths, invalid descriptors or
 argument-validation paths; none opens a device or the GPU; fork's child exits at once and is reaped;
 prlimit only reads a limit; no process other than the program is signalled.
+
+`host-cpuset.om`, `host-cpuget.om`, `host-cpunow.om`, `host-setprio.om`, `host-getprio.om`,
+`bad-host-cpuget-readonly.om` and `bad-host-cpuget-type.om` were written by NgFront2 (ham lane,
+2026-11-10) after the fixtures of `seed/host/affinity/`. They change no scheduling state: cpuset passes an
+empty mask (the kernel returns -22 before any change), setprio passes `which` 99 (-22 before any change);
+cpuget, cpunow and getprio only read.

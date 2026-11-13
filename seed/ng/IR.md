@@ -479,9 +479,10 @@ Other origin values are NONCANONICAL.
 | 110 | `host` | i64, or 0 for class `cpu` | word id | n arguments | the Omega host word with that keyword id; result as OMEGESE s10: a count or minus the Linux errno |
 
 `imm` is the keyword id of the pinned `seed/omc/omc.om` keyword lookup (`read` 53, `write` 54,
-`fclose` 100 through `vfioirq` 232, `execenv` 233 and `prlimit` 235; `exit`, `const`, `qty`,
+`fclose` 100 through `vfioirq` 232, `execenv` 233, `prlimit` 235 and the scheduler words `cpuset` 236
+through `getprio` 240; `exit`, `const`, `qty`,
 `fma` and the x86efi word `efi` are not host words). The normative
-table is `seed/ng/hostwords.tsv` (columns `id word args class`, 94 rows, extracted from OMEGESE s10,
+table is `seed/ng/hostwords.tsv` (columns `id word args class`, 99 rows, extracted from OMEGESE s10,
 `seed/host/MAPPING.md` and the typing code of `seed/omc/omc.om` at the pin); `ngcheck --table`
 prints the table it compiles in and the gate requires those bytes to equal the file. Argument
 letters, one per source argument:
@@ -542,12 +543,12 @@ are not mirrored, so a device word with such operands exits 117 where a native r
 
 | exit | class | words |
 |---|---|---|
-| 115 | process | fork dupfd waitpid execprog execpure execenv killpid pipefds getpid getppid setsid getpgid setpgid getsid |
+| 115 | process | fork dupfd waitpid execprog execpure execenv killpid pipefds getpid getppid setsid getpgid setpgid getsid cpuset cpuget setprio getprio |
 | 116 | limits | prlimit |
 | 117 | device | devctl mapnew mapdrop mapread mapwrite devcall uvmctl mapaddr mapget mapset maphold mapbind vfioctl vfiomap vfiomapw eventfd vfioirq libfn libptr libcall |
 | 118 | network | socknew listen accept connect bind recv send waitio sockname sockopt shutdown peercred pollfds sendmsg peername |
 | 119 | outside scratch | any path or descriptor word without `--scratch`, an absolute or multi-component path, `.`/`..`, a descriptor ngrun did not create (including pread/pwrite on 0..2) |
-| 120 | nondeterministic | random, sleepns with a positive interval |
+| 120 | nondeterministic | random, sleepns with a positive interval, cpunow |
 | 121 | unsafe filesystem | symlnk, syncfs, a blocking or shared-wait flock |
 | 122 | unclassified | a host word id with no row here (unreachable for accepted units) |
 | 123 | descriptor table | more than 256 live virtual descriptors |
@@ -575,13 +576,12 @@ raw 64-bit result, not a count or an errno.
 What the called function does is outside the language: a wrong address, a wrong argument or a function that
 writes through a pointer it was given is not caught. `a64/DESIGN.md` s13 has the lowering.
 
-**Pending host words (not on main).** omega-mv `ham/om-threads` 652694b0 adds the affinity and
-priority words `cpuset` 236, `cpuget` 237, `cpunow` 238, `setprio` 239 and `getprio` 240. Main
-(82e536e1, omc 6d1b1cf5) does not have them, so they have no row in `hostwords.tsv` and no class
-above; ngcheck refuses a unit naming one (`ngcheck: EFFECT`, exit 22). When that head lands and reseeds omc, the same change
-adds their rows and refuses them by class: `cpuset`, `cpuget`, `setprio` and `getprio` as 115
-process (they read or change scheduling state of the process), `cpunow` as 120 nondeterministic
-(the CPU a thread runs on may change between calls).
+**Scheduler host words.** The affinity and priority words `cpuset` 236, `cpuget` 237, `cpunow` 238,
+`setprio` 239 and `getprio` 240 are on Radicle main (c106bae0, omc f4fa7951; OMEGESE s10 rows
+1071-1075). Their rows are in `hostwords.tsv` with class `sched` (not `cpu`: each has an i64 result),
+and ngrun refuses them by class: `cpuset`, `cpuget`, `setprio` and `getprio` as 115 process (they read
+or change scheduling state of the process), `cpunow` as 120 nondeterministic (the CPU a thread runs on
+may change between calls).
 
 ### 7.12 Row table (the layout every reader uses)
 

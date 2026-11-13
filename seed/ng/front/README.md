@@ -70,7 +70,8 @@ Without a run-time pool declaration, `enlarge` (keyword 244, omc pools landing 1
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt \
-      seed/ng/front/cases-fconv.txt seed/ng/front/cases-host.txt
+      seed/ng/front/cases-fconv.txt seed/ng/front/cases-host.txt seed/ng/front/cases-quantity.txt \
+      seed/ng/front/cases-data.txt
 
 The source is `units:seed/ng/ng.units`: the units that list names, concatenated in its order, so a
 stage lane's unit (src/a64.om on the slice branches) comes with the list and no gate command changes
@@ -149,7 +150,8 @@ as ok, FAIL, a kill or a trip. Negative controls: five lowering mutants (the `fo
 `and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped; a mixed-type shift amount
 checked against its own width instead of the value's; fma's second and third operands swapped) must fail a
 run case, two host mutants (a `long` host argument lowered as `int`; `chk.bounds` in place of a host
-slice's `chk.slice`) must fail a host case, fmin and fmax swapped must fail a run case,
+slice's `chk.slice`) must fail a host case, fmin and fmax swapped qty arithmetic without its checks and every array parameter declared read-only must each fail
+a run case,
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
 Last line `FRONTIRGATE PASS|FAIL|NOT_RUN cases=N run=R refuse=F host=H classed=Q ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
@@ -195,22 +197,48 @@ NaNs with a number in both orders, two quiet NaNs); its 168 bytes, worked out be
 `cases/groups6.expect`. `lsc_fmin` and `lsc_fmax`, the former lower-scope cases, are run cases now. The
 min/max swap mutant (8) must fail a run case.
 
+## qty
+
+`qty` (omc type 13) lowers as ΩIR u64. Its `add`, `sub` and `mul` carry `chk.add`/`chk.sub`/`chk.mul` code 1,
+which fail on any unsigned wrap (IR.md s7.9), as omc traps 1; `div` and `rem` keep `chk.divz` (trap 2);
+compares are unsigned. `qty V` (`fe_lqty`): a literal is a qty constant, a signed value gets `chk.conv` u64
+(trap 5 when negative), an unsigned one converts; `ulong q` and `qty u` with a ulong keep the u64 value (no op,
+as omc); narrowing a qty to a smaller or signed type gets `chk.conv` (trap 5). A qty is a valid index and a valid
+shift amount (u64, as a ulong amount: `cases/qty_shamt.om`). Cases:
+every unit of `tests/quantity` (38 run, 39 refuse) in `cases-front-ir.txt` and `cases-quantity.txt` for
+gate-front; mutant 9 (the checks dropped) must fail a run case.
+
+## Data edges
+
+Every array parameter, sized or unsized, is an ΩIR SLICE of its declared access (0 view, 1 edit); the caller
+passes the name's slice or a `slice` over the whole array, so a text (access 0) reaches a sized `view`
+parameter (fe_check has already matched a sized parameter's length, error 7, and refused a text to `edit`,
+error 20). OM-2 `fresh` after an edit parameter is a check-pass rule (error 27) and lowers to nothing. An
+empty text gets one zero byte of ΩIR storage and its name is the empty slice after `chk.slice (0, 0)`, so
+`len` is 0 and a `get` traps 3 as omc's. `const NAME bool 0|1` is a bool constant. Cases (programs by
+NgFrontFull): `runs/data-bool.om`, `data-empty.om`, `data-empty-bounds.om` (trap 3), `data-view.om`, and
+omc's refusals `runs/bad-data-*.om` (8, 27, 7, 20), also in `cases-data.txt` for gate-front.
+
 ## Host words
 
-Every host word of `seed/ng/hostwords.tsv` (94, the words omc's keyword table admits as host operations at
+Every host word of `seed/ng/hostwords.tsv` (99, the words omc's keyword table admits as host operations at
 the pin) lowers to ΩIR `host` (op 110, IR.md s7.11) with the word's keyword id as imm and ty i64; `cpufence`
 and `cpurelax` are statements with ty 0. read, write, monons and realns keep their earlier paths; `fe_lhost`
-takes the other 88 from the table's argument letters (`fe_lhfmt`, generated from the table): `i` int, `l`
+takes the other 93 from the table's argument letters (`fe_lhfmt`, generated from the table): `i` int, `l`
 long, `L` ulong, `u` a uint constant (omc requires a literal), and `r`, `w`, `S` a byte array name followed by
 off and n (ulong), with `chk.slice` on the three where omc checks the slice, before the next argument is read.
 mapaddr and mapget are ulong in omc: their i64 result is `conv`ed with the same bits. The check pass gained
 execenv (233) and prlimit (235), which the pinned omc admits: execenv goes through `fe_hpack` with omc.om
 hpack's second packet (the environment), its two pre-stack trap sites and one record scan per packet;
 prlimit through `fe_hprlim` (int pid, int resource, writable byte slice; no trap site of its own).
+The scheduler words of omc f4fa7951 (Radicle main c106bae0) follow omc.om: `cpuset` 236 and `cpuget` 237
+through `fe_hsched` (int pid, then a byte slice, writable for cpuget; text is error 20), `cpunow` 238
+through `fe_hsched` (no operand; the stack-floor check before its 16-byte slot), and `setprio` 239 (three
+int) and `getprio` 240 (two int) through `fe_hscalar`. All five are program-only (function mode error 9).
 
-Cases: `cases-host.txt` (the 94 programs `runs/host-WORD.om`, five refusals `runs/bad-host-*.om` and two
+Cases: `cases-host.txt` (the 99 programs `runs/host-WORD.om`, seven refusals `runs/bad-host-*.om` and two
 `om2 diag` units `runs/diag-host-*.om`) in gate-front's check parity; in `cases-front-ir.txt` one
-`host NAME SRC C` row per word and the five refusals as `refuse` rows. A `host` row compiles and runs the
+`host NAME SRC C` row per word and the seven refusals as `refuse` rows. A `host` row compiles and runs the
 unit with omc (empty stdin, the repository root as working directory: the programs name only empty or
 `/dev/null` paths and invalid descriptors; none opens a device), lowers it, requires ngcheck ACCEPT and runs
 the ΩIR with `ngrun --scratch SCRATCH/hK` (a new directory each run). C 0: exit and stdout equal the

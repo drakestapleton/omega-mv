@@ -19,16 +19,16 @@ The packed C2 manifest is surveyed separately.
 | Words or construct | Baseline IR emitted | Same behavior | Gap |
 |---|---|---|---|
 | bool, uchar/u8, ushort/u16, uint/u32, ulong/u64, byte/i8, short/i16, int/i32, long/i64, f32, f64, void | P | Fixture-scoped only; generally unproven | bool const/type reader; qty absent |
-| qty | N | NOT_RUN | qty values/storage/conversions/checked unsigned arithmetic |
+| qty | Y (ng-front-groups-7) | fixture-scoped only: every unit of tests/quantity (38 run equal, 39 refusals equal), cases/qty_shamt.om | none known for scalars, arrays, globals, constants and shift amounts |
 | add sub mul div rem and or xor eq ne lt le gt ge neg not | P | Fixture-scoped only; generally unproven | qty/abstract operands absent |
-| shl shr | Y (ng-groups-4) | Fixture-scoped only (cases/sh_mix*.om); generally unproven | a bool or float amount, which omc admits, exits 64 (cases-lower-scope.txt) |
+| shl shr | Y (ng-groups-4) | Fixture-scoped only (cases/sh_mix*.om, cases/qty_shamt.om); generally unproven | a bool or float amount, which omc admits, exits 64 (cases-lower-scope.txt) |
 | rotr rotl | P | Fixture-scoped only; generally unproven | abstract operands absent |
 | fsqrt fabs bitcast | Y | Fixture-scoped only; generally unproven | subject to operand construct coverage |
 | fmin fmax fma | Y: fma (ng-groups-4), fmin/fmax (ng-front-groups-6) | fixture-scoped only: cases/fma_mix.om (fused against unfused), cases/fmm_mix.om (signed zeros, quiet and signaling NaNs, both widths) | none for scalar f32/f64 |
 | true false = ( ) | Y | Fixture-scoped only; generally unproven |  |
 | get put len new | P | Fixture-scoped only; generally unproven | scalar arrays only; structs/layout fields absent |
-| view edit part | P | Fixture-scoped only; generally unproven | sized view text arguments absent; fresh signature token absent |
-| global text const | P | Fixture-scoped only; generally unproven | empty text, bool/qty const absent |
+| view edit part | Y (sized parameters as SLICE: ng-front-groups-8) | Fixture-scoped only; generally unproven |  |
+| global text const | Y (empty text, bool and qty const: ng-front-groups-7, -8) | Fixture-scoped only; generally unproven |  |
 | struct layout field at little big sizeof offsetof | N | NOT_RUN | no declaration/storage/field/query lowering |
 | abstract ops seal open holds | N | NOT_RUN | no nominal lowering or constructor checks |
 | fn to ret end | P | Fixture-scoped only; generally unproven | main must return int; units without main absent |
@@ -39,7 +39,7 @@ The packed C2 manifest is surveyed separately.
 | own free | R | NOT_RUN | seeded parser refuses their unsupported forms |
 | dit scrub | N | NOT_RUN | no value lowering |
 | read write monons realns | Y | Fixture-scoped only; generally unproven |  |
-| every other host word in table below (90 with cpufence, cpurelax) | Y (ng-front-host) | 39 of 94 host programs exit/stdout-equal to omc under ngrun; 55 lowered and ngcheck-accepted, run refused by ngrun's class (IR.md s7.11), NOT_RUN | behavior of words ngrun refuses (process, limits, device, network, paths outside scratch, random, syncfs) not executed |
+| every other host word in table below (95 with cpufence, cpurelax) | Y (ng-front-host, scheduler words ng-front-hostwords-99) | 39 of 99 host programs exit/stdout-equal to omc under ngrun; 60 lowered and ngcheck-accepted, run refused by ngrun's class (IR.md s7.11), NOT_RUN | behavior of words ngrun refuses (process and scheduler, limits, device, network, paths outside scratch, random, cpunow, syncfs) not executed |
 | om2, om2 debug/release/diag | P | Fixture-scoped only; generally unproven | fmt and some contract policies exit 64 |
 | om2 fmt | N | NOT_RUN | formatting output not reproduced |
 | target x86linux/x86efi and efi, ir units | outside D8 | NOT_RUN | existing scope refusal, not an NG CPU-front implementation claim |
@@ -200,7 +200,7 @@ explicitly unsupported language boundary, not a successful contract implementati
    found input-literal error 8 rather than a semantic mismatch on the admitted cases. Large inputs
    now use Wolfram-verified power-of-two constructions within fparse mantissa limits, but those final
    spellings are NOT_RUN. Do not claim the candidate READY until all cases and negative controls pass.
-3. Host lowering: ng-front-host (below) lowers all 94 host words. Function-mode units, the data gaps,
+3. Host lowering: ng-front-host and ng-front-hostwords-99 (below) lower all 99 host words. Function-mode units, the data gaps,
    remaining intrinsics and hygiene words remain not lowered or unproven as itemized above.
 
 ## ng-groups-4 (2026-11-10, branch ham/ng-front-groups-4)
@@ -236,3 +236,27 @@ fmin and fmax lower to ΩIR min/max (IMPLEMENTED, host-EXERCISED by gate-front-i
 they needed (OMEGESE FMINNM/FMAXNM) and ngrun's rn_fmm arrive with ngrun-hostwords-5 (d5dba5bb), under
 this head. Case cases/fmm_mix.om, expected bytes in cases/groups6.expect; lsc_fmin and lsc_fmax moved
 from the lower-scope list to run cases.
+
+## ng-front-groups-7 (2026-11-10, branch ham/ng-front-groups-7)
+
+qty lowers as u64 with checked add/sub/mul (IMPLEMENTED, host-EXERCISED by gate-front-ir and gate-front
+only). All 77 units of tests/quantity: 38 run with omc's exit and stdout under ngrun, 39 refused with
+omc's code and stderr. A qty shift amount (`shl ulong 1 q`, which omc admits) lowers like a ulong amount
+(factory bay 12 review fix; before it, ng exit 64): cases/qty_shamt.om.
+
+## ng-front-groups-8 (2026-11-10, branch ham/ng-front-groups-8)
+
+Data edges (IMPLEMENTED, host-EXERCISED by gate-front-ir and gate-front only): sized array parameters as
+SLICEs of their declared access (texts reach sized view parameters), OM-2 `fresh` on edit parameters, empty
+texts (empty slice of a one-byte global), bool constants. Ported from NgFrontFull's uncommitted data work
+(preserved as omega-mv ham/ng-front-data-wip 1323c6e1; its qty and min/max parts are groups 7 and 6).
+Still not lowered: struct, layout, field, at, little, big, sizeof, offsetof; abstract, ops, seal, open, holds;
+out and export (function mode); contracts (fail closed).
+
+## ng-front-hostwords-99 (2026-11-10, branch ham/ng-front-hostwords-99)
+
+The scheduler words of omc f4fa7951 (Radicle main c106bae0): cpuset 236, cpuget 237, cpunow 238, setprio 239,
+getprio 240 (IMPLEMENTED, host-EXERCISED by gate-front-ir, gate-front and gate-ir only). hostwords.tsv and
+ngcheck have 99 rows (class `sched`); host-audit's closed id set ends at 240 (HOSTTABLE rows=99
+differences=0). ngcheck accepts each lowered program; ngrun refuses cpuset, cpuget, setprio and getprio as
+115 and cpunow as 120, so their behavior under ngrun is NOT_RUN. Refusals: cpuget on a text (20), a long pid (7).
