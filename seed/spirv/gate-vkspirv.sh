@@ -26,7 +26,7 @@ command -v "$SPIRV_VAL" >/dev/null || notrun "requires spirv-val ($SPIRV_VAL)"
 command -v "$CC" >/dev/null || notrun "requires a C compiler ($CC) for the interim Vulkan host"
 case "$LVP_ICD" in /*lvp_icd*.json) ;; *) notrun 'LVP_ICD must name the absolute lavapipe ICD manifest' ;; esac
 [ -f "$LVP_ICD" ] || notrun "lavapipe ICD manifest $LVP_ICD missing"
-pin=bef974c1414dbac5b8f636d872a5815fb04594cda7bb213e9c0e0a1ff6f31c5b
+pin=46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1
 [ -f "$OMC" ] || fail "compiler $OMC missing"
 [ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
 hostbuild() {
