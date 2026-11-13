@@ -18,9 +18,9 @@ The packed C2 manifest is surveyed separately.
 
 | Words or construct | Baseline IR emitted | Same behavior | Gap |
 |---|---|---|---|
-| bool, uchar/u8, ushort/u16, uint/u32, ulong/u64, byte/i8, short/i16, int/i32, long/i64, f32, f64, void | P | Fixture-scoped only; generally unproven | bool const/type reader; qty absent |
+| bool, uchar/u8, ushort/u16, uint/u32, ulong/u64, byte/i8, short/i16, int/i32, long/i64, f32, f64, void | P | Fixture-scoped only; generally unproven | subject to construct coverage; bool and qty constants lower |
 | qty | Y (ng-front-groups-7) | fixture-scoped only: every unit of tests/quantity (38 run equal, 39 refusals equal), cases/qty_shamt.om | none known for scalars, arrays, globals, constants and shift amounts |
-| add sub mul div rem and or xor eq ne lt le gt ge neg not | P | Fixture-scoped only; generally unproven | qty/abstract operands absent |
+| add sub mul div rem and or xor eq ne lt le gt ge neg not | P | Fixture-scoped only; generally unproven | abstract operands absent |
 | shl shr | Y (ng-groups-4) | Fixture-scoped only (cases/sh_mix*.om, cases/qty_shamt.om); generally unproven | a bool or float amount, which omc admits, exits 64 (cases-lower-scope.txt) |
 | rotr rotl | P | Fixture-scoped only; generally unproven | abstract operands absent |
 | fsqrt fabs bitcast | Y | Fixture-scoped only; generally unproven | subject to operand construct coverage |

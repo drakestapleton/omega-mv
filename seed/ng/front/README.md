@@ -66,7 +66,7 @@ Without a run-time pool declaration, `enlarge` (keyword 244, omc pools landing 1
 ## Gate
 
     seed/out/omc < seed/ng/front/gate-front.om > gate-front
-    gate-front seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
+    gate-front seed/out/omc "$(cut -d' ' -f1 seed/out/omc.sha256)" \
       units:seed/ng/ng.units+in:seed/ng/front/front-check.in \
       seed/ng/front/declared.txt seed/ng/front/mutants.txt SCRATCH seed/ng/front/cases-front.txt \
       seed/ng/front/cases-om2.txt seed/ng/front/cases-tests.txt seed/qualification/om2/manifest-c2.txt \
@@ -115,10 +115,9 @@ failing conversions, and `while` fuel (1000000 passes, or its `bound`). Local an
 What it does not lower exits 64 with `ng: front-ir: line N: not lowered` (no output): units without
 `fn main to int` (ΩIR needs a program entry; omc writes no executable for them either), a bool or float
 shift amount, and every construct outside the M1 subset (read from code: the `fe_lno` call sites).
-Sized array parameters are `REF` with access 1 even for `view`, since ΩIR v1 has no op that narrows a
-REF's access (so a text passed to a sized `view` parameter is not lowered); PROPOSED for ng-ir: a `view`
-op from an access-1 to an access-0 reference. Unsized (`*`) parameters are `SLICE`s of their own access
-(0 `view`, 1 `edit`); `len` of one is the `len` op. An argument for one is the caller's slice when the
+Every array parameter, sized or unsized, is a `SLICE` of its declared access (0 `view`, 1 `edit`).
+A sized parameter's length is checked by the front end before lowering, so a text can reach a sized
+`view` parameter. `len` of a parameter is the `len` op. An argument is the caller's slice when the
 access matches, else `slice` over the whole array, and `part A o k` is `chk.slice` (trap 3, omc's two
 part checks in one) then `slice`. `unroll` loops lower as plain `for` loops and `inline` functions as
 calls: both are omc code-shape choices with the same results.
@@ -126,7 +125,7 @@ calls: both are omc code-shape choices with the same results.
 Gate (Omega, `gate-front-ir.om`; the scratch directory must not exist):
 
     cat seed/ng/sha256.om seed/ng/front/gate-front-ir.om | seed/out/omc > gate-front-ir
-    gate-front-ir seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
+    gate-front-ir seed/out/omc "$(cut -d' ' -f1 seed/out/omc.sha256)" \
       SCRATCH seed/ng/front/cases-front-ir.txt
 
 It builds ng (the units of `seed/ng/ng.units`), ngcheck and ngrun with the pinned omc, then for each `run`
@@ -150,8 +149,8 @@ as ok, FAIL, a kill or a trip. Negative controls: five lowering mutants (the `fo
 `and`/`or`/`xor` shifted to the next op; a `part`'s offset and count swapped; a mixed-type shift amount
 checked against its own width instead of the value's; fma's second and third operands swapped) must fail a
 run case, two host mutants (a `long` host argument lowered as `int`; `chk.bounds` in place of a host
-slice's `chk.slice`) must fail a host case, fmin and fmax swapped qty arithmetic without its checks and every array parameter declared read-only must each fail
-a run case,
+slice's `chk.slice`) must fail a host case. Swapped fmin and fmax, qty arithmetic without its checks,
+and every array parameter declared read-only must each fail a run case;
 `@ng front-check` mode must fail the first run case (no ΩIR) and `@ng ir-copy` mode the first refusal case.
 Last line `FRONTIRGATE PASS|FAIL|NOT_RUN cases=N run=R refuse=F host=H classed=Q ... notrun=U`, exit 0, 1 or 4 (NOT_RUN: no failure but U > 0,
 never PASS).
@@ -182,7 +181,7 @@ to ΩIR `fma` (46, one rounding) on three values of one float type. Run cases `c
 `fma_types` (7) are refuse cases. A bool or float shift amount, which omc also admits, stays not lowered; the scope
 gate keeps it failing closed, and its bool-amount admission mutant must be KILLED:
 
-    gate-front seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
+    gate-front seed/out/omc "$(cut -d' ' -f1 seed/out/omc.sha256)" \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-lower-scope.txt seed/ng/front/mutants-lower-scope.txt SCRATCH \
       seed/ng/front/cases-lower-scope.txt
@@ -258,7 +257,7 @@ an ordinary assignment that silently removes its runtime check. OM-1 names retai
 The four scope cases in `cases-contract-scope.txt` are accepted by omc but must be refused by
 the lowering. Reuse the existing gate-front with its lowering-mode input and dedicated declarations:
 
-    gate-front seed/out/omc 106558ba36e28d1a55384b9e2e1387ec429ff267bb03f1215f86c9c03ca64bed \
+    gate-front seed/out/omc "$(cut -d' ' -f1 seed/out/omc.sha256)" \
       units:seed/ng/ng.units+in:seed/ng/front/front-ir.in \
       seed/ng/front/declared-contract-scope.txt seed/ng/front/mutants-contract-scope.txt SCRATCH \
       seed/ng/front/cases-contract-scope.txt
