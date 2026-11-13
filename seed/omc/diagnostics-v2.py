@@ -77,6 +77,16 @@ for mode in (b'', b'om2\n', b'om2 diag\n', b'check\n', b'check span\n', b'usage\
              b'target x86linux\n', b'object\nom2\n'):
     case('profile-' + repr(mode), mode + bad)
 case('good', good)
+# A failed check-record write must not recursively try stdout again.
+for prefix in (b'check\n', b''):
+    data = prefix + good
+    e = env.copy(); e['OMC_DIAGNOSTICS'] = '2'
+    with open('/dev/full','wb') as full:
+        result = subprocess.run([str(compiler)],input=data,stdout=full,stderr=subprocess.PIPE,env=e,timeout=10)
+    assert result.returncode == 2, result.stderr
+    record(result,data)
+    rows.append({"case": "stdout-refusal-" + repr(prefix), "exit": result.returncode})
+
 for n in (0, 1, 55, 56, 63, 64, 65, 4096, 65535, 65536, 65537, 131072):
     case('sha-boundary-' + str(n), bad + b'note ' + b'x' * n + b'\n')
 case('environment-refusal', bad, {'OMC_MEMORY_MAX': 'bad'})
