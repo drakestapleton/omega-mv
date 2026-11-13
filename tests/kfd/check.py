@@ -114,6 +114,7 @@ aperture_bad = {
     'extent': aperture(off=4090),
     'wrap': aperture(off=2**64-16),
     'count': aperture(count=3,length=2*56),
+    'count-u32-max': aperture(count=2**32-1,length=0),
     'address': aperture(changes=put(0,1,8)),
 }
 
@@ -171,7 +172,9 @@ for target in ('a64','x86'):
         execute(label,compile_case(label,source('CREATE_QUEUE',setup_override=setup,suffix_override=suffix),target),target)
     for label,src in [('count-query',aperture(count=0,length=0)),
                       ('one',aperture()),('many-exact',aperture(count=7,size=16+7*56)),
-                      ('end-empty',aperture(count=0,off=4096,length=0))]:
+                      ('end-empty',aperture(count=0,off=4096,length=0)),
+                      ('runtime-span',aperture(off='start',length='bytes',
+                          changes='start = ulong 16\nbytes = ulong 392\n'+put(8,7)))]:
         execute('aperture-'+label,compile_case('aperture-'+label,src,target),target)
     for label,src in aperture_bad.items():
         execute('aperture-'+label,compile_case('aperture-'+label,src,target),target,103)
