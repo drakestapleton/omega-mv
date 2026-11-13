@@ -2904,33 +2904,129 @@ put ip 3 uchar v
 ret 1
 end
 
-note first "nameserver a.b.c.d" line of /etc/resolv.conf into ip; 0 or TLEDNS
+note Return the opened regular file's nonnegative byte size, or -1. Linux AArch64 stat ABI:
+note asm-generic/stat.h: st_mode at 16 (S_IFMT 61440, S_IFREG 32768), signed st_size at 48.
+fn dns_fsize fd int to long
+sb = new uchar 128 0
+if ne fstat fd sb 0 len sb 0
+ret -1
+end
+if ne and tls_gl sb 16 61440 32768
+ret -1
+end
+ret bitcast long tls_gl sb 48
+end
+
+note Read the initially observed byte extent of an opened regular resolver file, never a stream.
+note O_NONBLOCK prevents a FIFO open from waiting for a writer; fstat decides type on that same fd.
+note Appends after fstat do not extend this read. A short EOF, read error or close error refuses,
+note even after finding an address. This is a bounded extent, not an atomic content snapshot.
+note The 4096-byte array is an I/O chunk, not a byte cap. Parser state crosses every chunk boundary.
 fn dns_conf ip edit uchar * to ulong
 b = new uchar 4096 0
-fd = fopen TLRESOLV 0 len TLRESOLV 524288 0
+a = new uchar 15 0
+st = new ulong 3 0
+fd = fopen TLRESOLV 0 len TLRESOLV or int 524288 2048 0
 if lt fd 0
 ret TLEDNS
 end
-n = read int fd b 0 4096
+size = dns_fsize int fd
+if lt size 0
 x = fclose int fd
-if le n 0
 ret TLEDNS
 end
-ret dns_lines part b 0 ulong n ip
+left = ulong size
+note Every pass consumes at least one byte of the initial signed-64-bit file extent or refuses.
+while gt left 0 bound 9223372036854775807
+ask = left
+if gt ask len b
+ask = len b
 end
-
-note try each line of b (split at LF) as a nameserver line
-fn dns_lines b view uchar * ip edit uchar * to ulong
-s = ulong 0
-for e ulong add len b 1
-if or eq e len b eq tls_at b e 10
-if eq dns_nsline part b s sub e s ip 1
+n = read int fd b 0 ask
+if le n 0
+x = fclose int fd
+ret TLEDNS
+end
+left = sub left ulong n
+for i ulong ulong n bound 4096
+c = get b i
+if eq c 10
+dns_cfgend a st ip
+else
+dns_cfgbyte a st c
+end
+end
+end
+x = fclose int fd
+if lt x 0
+ret TLEDNS
+end
+dns_cfgend a st ip
+if eq get st 2 1
 ret 0
 end
-s = add e 1
-end
-end
 ret TLEDNS
+end
+
+note st: keyword position 0..10, 11 blanks, 12 address, 13 ignored line, 14 address ended;
+note address length; found-first-address flag. Only one byte of parser state advances per input byte.
+fn dns_cfgbyte a edit uchar 15 st edit ulong 3 c uchar to void
+if eq get st 2 1
+ret
+end
+p = get st 0
+if lt p 10
+if eq c get TLNS p
+put st 0 add p 1
+else
+put st 0 13
+end
+ret
+end
+if eq p 10
+if eq dns_blank ulong c 1
+put st 0 11
+else
+put st 0 13
+end
+ret
+end
+if eq p 11
+if eq dns_blank ulong c 1
+ret
+end
+put st 0 12
+p = 12
+end
+if ne p 12
+ret
+end
+if eq dns_blank ulong c 1
+put st 0 14
+ret
+end
+n = get st 1
+if eq n len a
+put st 0 13
+ret
+end
+put a n c
+put st 1 add n 1
+end
+
+note Finalize at LF or EOF, including a last line without LF. Once found, keep the first address.
+fn dns_cfgend a view uchar 15 st edit ulong 3 ip edit uchar * to void
+if eq get st 2 1
+ret
+end
+if or eq get st 0 12 eq get st 0 14
+if eq dns_ip4 part a 0 get st 1 ip 1
+put st 2 1
+ret
+end
+end
+put st 0 0
+put st 1 0
 end
 
 note b[i] as a ulong, or 256 past the end (never traps)
@@ -2939,31 +3035,6 @@ if ge i len b
 ret 256
 end
 ret ulong get b i
-end
-
-note 1 when the line l is "nameserver", blanks, an IPv4 address, optional trailing blanks
-fn dns_nsline l view uchar * ip edit uchar * to ulong
-if lt len l 12
-ret 0
-end
-if ne tls_cteq TLNS l 0 10 0
-ret 0
-end
-p = ulong 10
-if eq dns_blank tls_at l p 0
-ret 0
-end
-while eq dns_blank tls_at l p 1 bound 4096
-p = add p 1
-end
-q = p
-while lt tls_at l q 256 bound 4096
-if eq dns_blank tls_at l q 1
-break
-end
-q = add q 1
-end
-ret dns_ip4 part l p sub q p ip
 end
 
 note 1 for space, tab or CR

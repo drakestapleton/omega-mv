@@ -255,9 +255,20 @@ been submitted to a laboratory, there is no CMVP certificate, and nothing here i
   RCODE 0); only A records whose owner is the queried name, or the target of a CNAME chain from
   it (case-insensitive compare), are used; a name over 127 labels or a looping pointer is
   `TLS_ERR_DNS`, never a trap.
+  Resolver configuration accepts only an opened regular file: nonblocking open avoids waiting on
+  FIFOs, and fstat checks the type on that same descriptor, not on a raceable path. Its initial
+  nonnegative signed-64-bit file size defines the finite read extent; there is no software byte cap.
+  A regular file reporting size 0 is read as empty (including procfs-style content-bearing files).
+  Later appends do not extend the read; a short EOF, read error or close error refuses even after
+  selecting an address. This is not an atomic snapshot of concurrent content rewrites. 4096 bytes
+  is only an I/O chunk. Parser state crosses chunk boundaries and the initial extent finalizes a
+  line without LF. Only the
+  fixed keyword and an IPv4 token are retained (four three-digit octets and three dots: at most
+  15 bytes); arbitrarily long comments, blanks and rejected tokens need no growing allocation.
+  The first valid IPv4 nameserver wins. An open, read or close error returns `TLS_ERR_DNS`.
 - Caller-contract traps (not reachable by a peer): `tls_dial` with a hostname longer than the
-  query buffer (validate it with `tls_init` first), `tls_write` of more than 16 GB at once,
-  `/etc/resolv.conf` with more than 4096 consecutive blanks. A trust bundle larger than `TLSTSZ`
+  query buffer (validate it with `tls_init` first), `tls_write` of more than 16 GB at once.
+  A trust bundle larger than `TLSTSZ`
   fails closed.
 
 ## Side channels: what is and is not constant time
@@ -349,6 +360,16 @@ How the suites are built:
     (a full TLS 1.3 server in Python that misbehaves after a valid handshake), all on 127.0.0.1.
     Ports already in use are skipped. Every failure row also checks that `tls_close` leaves the
     connection failed.
+  - `resolv.py OMC` composes `resolv.om` with a private resolver path (never edits the host file).
+    It covers lines straddling and beyond the old window, no trailing newline, long comments/blanks/
+    rejected tokens, first-address selection, malformed/empty/unreadable/absent paths, directories,
+    and FIFOs with and without a held writer. Deterministic keyword/address/comment/CR-LF chunk
+    splits and NUL placements exercise the state machine. Fault/barrier instruments cover a real
+    read error after address selection, concurrent file growth and replacing the pathname while
+    the original descriptor stays open. The window mutant clamps only the reader extent, retaining
+    the new parser; a separate mutant removes nonblocking open. Test enforcement is unconditional
+    under Python optimization; --wrong-expectation must fail with PYTHONOPTIMIZE=1.
+    `test/tls/run.sh` includes this gate.
   - `dnsunit.om` runs the 23 cases of `vectors/dns.txt` (`gen_dns.py`): 21 DNS answers and two
     host names over 253 bytes that `dns_a4` must refuse before building its query.
   - `TLS_NET=1` adds the live checks. The handshakes reach api.github.com (ECDSA P-256 chain),

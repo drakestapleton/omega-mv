@@ -17,7 +17,7 @@ Authority: `docs/one_layer/OMEGESE.md`, sections 9, 10 and 12, and
 
 ## Active reproduction pin (not historical run evidence)
 
-Current pin after omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main c0718cd3 (2026-11-13): committed
+Current pin after omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main 46520074 (2026-11-13): committed
 `seed/out/omc` SHA-256
 `26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`, compiler
 source SHA-256 `9977db63aae76ee41c35a7a5715d7dc40427f3c7711597f31e5b60697ef8e7ef`.

@@ -90,6 +90,15 @@ dmut "mutant dns owner ignored"    's/^if eq dns_neq r o cur 0$/if lt dns_neq r 
 dmut "mutant dns label cap gone"   's/^if gt k 127$/if gt k 9999/'
 dmut "mutant dns_a4 name length unchecked" 's/^if gt len hn 253$/if gt len hn 9999/'
 
+# Resolver configuration: private files only, full-file streaming and the truncation mutant.
+if python3 "$here/resolv.py" "$omc" --out "$out/resolv" > "$out/resolv.log" 2>&1; then
+  echo "PASS resolv: $(tail -n 1 "$out/resolv.log")"
+else echo 'FAIL resolv:'; cat "$out/resolv.log"; fail=1; fi
+rc=0; PYTHONOPTIMIZE=1 python3 "$here/resolv.py" "$omc" --out "$out/resolv-optimized-control" --wrong-expectation > "$out/resolv-optimized-control.log" 2>&1 || rc=$?
+if [ "$rc" = 1 ] && grep -q 'RuntimeError: resolver cases failed: at' "$out/resolv-optimized-control.log"; then
+  echo 'PASS optimized resolv wrong expectation rejected (1)'
+else echo 'FAIL optimized resolv expectation control:'; cat "$out/resolv-optimized-control.log"; fail=1; fi
+
 # DIT: tls_hwdit must agree with the kernel's cpuinfo flag (1 on a GB10, 0 on hosted runners); a
 # mutant looking for an auxv key that no kernel emits (60) must report -1 on every host
 if grep -qw dit /proc/cpuinfo; then dexp=1; else dexp=0; fi
