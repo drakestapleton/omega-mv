@@ -765,6 +765,45 @@ FORGE
   say "LIMIT 11 demonstration (not a security control): forging owner ran no compiler; trusted-record coverage returned $observed_forgery; wrapper PID shape is not independently authenticated ancestry"
 }
 
+# Container-word landing controls for the generalized declaration schema; production lowering is not changed here.
+multiwordcontrols11() {
+  cat > "$B/multiple-base.om" <<'OM'
+note TEST INSTRUMENT: actual two-new-word compiler admission, never a product workload.
+global P uchar *
+fn main to int
+r = enlarge P ulong 128
+r = fstatfs 0 P 0 128
+cpurelax
+ret 0
+end
+OM
+  printf 'note gate-pools: uses enlarge on purpose: owner=seed/host/fstatfs/check.sh declaration-schema-control\n' > "$B/decl-enlarge"
+  printf 'note gate-pools: uses fstatfs on purpose: owner=seed/host/fstatfs/check.sh declaration-schema-control\n' > "$B/decl-fstatfs"
+  for fault in unused known missing-one complete; do
+    cat "$B/multiple-base.om" "$B/decl-enlarge" > "$B/multiple-$fault.om" || bad '11 control: writing multiword input failed'
+    [ "$fault" = missing-one ] || cat "$B/decl-fstatfs" >> "$B/multiple-$fault.om" || bad '11 control: appending fstatfs intent failed'
+    case "$fault" in
+      unused) printf 'note gate-pools: uses mount on purpose: owner=seed/host/fstatfs/check.sh false-unused-word\n' >> "$B/multiple-$fault.om";;
+      known) printf 'note gate-pools: uses cpurelax on purpose: owner=seed/host/fstatfs/check.sh false-control-known-word\n' >> "$B/multiple-$fault.om";;
+    esac
+    compile11 "$CTRL" "$B/multiple-$fault.om" "$B/multiple-old"
+    compile11 "$S" "$B/multiple-$fault.om" "$B/multiple-head"
+    if [ "$fault" = complete ]; then
+      classify11 "$B/multiple-$fault.om" "$B/multiple-old" "$B/multiple-head" "$B/new-keywords" || bad '11 control: complete multiword declarations refused'
+      [ "$CLASS11" = accepted ] || bad '11 control: multiword input not newly accepted'
+      say 'PASS 11 control: a unit using enlarge and fstatfs declares both actual new tokens'
+    else
+      if classify11 "$B/multiple-$fault.om" "$B/multiple-old" "$B/multiple-head" "$B/new-keywords" > "$B/multiple-$fault.why" 2>&1; then bad "11 control: $fault declaration accepted"; fi
+      case "$fault" in
+        unused) grep -q 'false declaration .*mount is not used as a token' "$B/multiple-$fault.why" || bad '11 control: wrong unused-word reason';;
+        known) grep -q 'false declaration .*cpurelax is not a keyword absent from the control' "$B/multiple-$fault.why" || bad '11 control: wrong control-known-word reason';;
+        missing-one) grep -q 'missing declarations for fstatfs' "$B/multiple-$fault.why" || bad '11 control: wrong missing-word reason';;
+      esac
+      say "PASS 11 control: $fault declaration rejected by unit and word: $(cat "$B/multiple-$fault.why")"
+    fi
+  done
+}
+
 notrun11=
 if on 11 && [ "$(git rev-parse --is-shallow-repository 2> /dev/null || echo unknown)" != false ]; then
   # lexer11 builds the lexer with the compiler of the one commit that introduced keyword-users.om. A shallow
@@ -783,6 +822,7 @@ elif on 11; then
     words11
     wordcontrols11
     poolcontrols11
+    multiwordcontrols11
     git ls-files '*.om' > "$B/corpus-all" || bad '11 instrument: listing tracked units failed'
     # The original pool fixtures have their separate sections above; no other path list or declaration excludes a unit.
     if grep -v "^$T/" "$B/corpus-all" > "$B/files"; then :; else lr=$?; [ "$lr" = 1 ] || bad '11 instrument: filtering pool fixtures failed'; fi

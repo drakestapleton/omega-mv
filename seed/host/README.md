@@ -27,6 +27,29 @@ CPU 0, so on a pool whose only core is CPU 0 a comparison cannot detect it: ther
 rows on every pool) `sched.om` runs itself under the oracle `/usr/bin/strace`, which makes `getcpu`
 report CPU 77, and requires `cpunow` to return 77. A tracer that cannot run is exit 20, never a pass.
 
+## Container words and explicit caller-owned launch
+
+`unshare`, `mount`, `umount`, `pivroot`, `sethost`, `prctl`, `sigmask`, `sigwait`,
+`capget`, `capset`, `opentree`, `mntattr` and `mntmove` provide the checked kernel
+operations documented in [`container/README.md`](container/README.md). Their gate
+includes root-mode parity in private namespaces, refusal cases, compiler mutants,
+and malformed large-packet preflight with no decode allocation.
+
+`execfds` is the separate caller-owned argv/environment plus explicit descriptor-keep
+launch interface; see [`execfds/README.md`](execfds/README.md). `fstatfs` writes checked
+descriptor-based native filesystem statistics; see [`fstatfs/README.md`](fstatfs/README.md).
+Both are AArch64 program-mode operations, and their gates run from `check.sh`.
+The six existing packed-list words preserve existing non-pool inputs, original lowering, protective
+packet bounds, refusal behavior and strict profile. The approved pool extension additionally admits pool
+byte operands for them with the same packet bounds. Their historical qualification and ingress inventory
+are not rewritten.
+
+### Current ingress inventory addition
+
+| Entry | Who owns the input | Required protection |
+|---|---|---|
+| `execfds` (new; not a hostile-ingress decoder) | Our program/operator constructs the argv, environment and descriptor list. Raw outsider packets must never be forwarded to it. | It has no admission byte/count limit of its own: the caller must retain and enforce outsider input and resource budgets before calling. Complete framing is checked before decode allocation, which is sized from the actual supplied slices; all descriptor effects follow validation. This does not replace any bound in the [historical hostile-ingress inventory](../../evidence/SECURITY-673/ingress-inventory.md). |
+
 ## Qualification
 
 From the repository root on Linux ARM64:
