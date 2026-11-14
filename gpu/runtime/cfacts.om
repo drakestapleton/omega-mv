@@ -1,0 +1,1486 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/runtime/cfacts.om: facts about every C file (.c, .h, .inc) of CUDApp src/, read by gpu/runtime/classes.om,
+note in seeded Omega (OM-2 program mode, Linux AArch64). This file is the scanner; cfacts-main.om is the program
+note and check/cfacts-check.om the gate's check of it. Build from the repository root:
+note   { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/cfacts.om gpu/runtime/cfacts-main.om; } \
+note     | seed/out/omc > cfacts
+note Run from the repository root: cfacts ROOT [DIR]   (ROOT a CUDApp checkout, DIR defaults to gpu/runtime)
+note Inputs in DIR: cudapp-src.sha256.txt (the files, with their sha256), cudapp-ident.txt (its unit= values name
+note the Omega units: the C symbol of unit U is omega_U), devwords.txt (call names that reach the GPU, the driver
+note or the operating system). Every listed file is read at ROOT/PATH and must hash to its line of the list, so
+note the facts are of the CUDApp commit the list was taken from.
+note Output on stdout: a header, then one row per file in list order, tab separated:
+note   path   the CUDApp path
+note   gen    1 when the file starts with the bytes "/* Generated", else 0
+note   act    lines a default build compiles: every pending flag (a name starting CUDAPP_MIGRATION_PENDING) off
+note   pend   lines that a default build drops because a pending flag is off: the C kept for comparison
+note   fns    function definitions in the act lines
+note   omfn   of them, functions that hand work to Omega: they call an Omega unit, or a function that does
+note   devfn  of the rest, functions that call a device word, or a function that does
+note   hostl  lines of the functions that do neither: host logic written in C
+note   shell  lines of the omfn and devfn functions
+note The rules, applied to the text with comments blanked and string and character literal bodies blanked:
+note - A line whose first byte that is not white space is # is a directive, joined with the next line while it
+note   ends with a backslash. #if, #elif, #ifdef, #ifndef evaluate their condition in three values (false, true,
+note   unknown): a pending flag is 0 and defined(FLAG) is false; a name #define'd without parameters earlier in
+note   the file outside a dropped region stands for its body when every enclosing region is certainly taken, and
+note   is unknown otherwise, or when its chain of names meets a name twice; every other name is unknown; 0 is
+note   false and other decimal numbers true; ! && || and
+note   parentheses combine. A region whose condition is certainly false is dropped; #else and #elif follow C.
+note - A directive counts in act unless it starts inside a dropped region (then pend) or opens one (neither).
+note   Other lines count when they hold a byte that is not white space: in pend inside a dropped region, else act.
+note - A function definition is a { at brace depth 0 whose last token at depth 0 was ); its name is the token
+note   before the first ( of that statement. A { at depth 0 after a string token (extern "C" {) opens nothing.
+note   Its lines are the act lines from the one with its { to the one with its matching }.
+note - A call is a name followed, on the same line after spaces and tabs, by (. A call names the functions of
+note   that name in the same file when there are any, else every function of that name in the list.
+note Exit 0, 2 bad usage, 3 an input is malformed or unreadable or a file does not hash to its list line, 4 the
+note host refused memory. Memory grows with the input; the one fixed buffer is a path of PATH_MAX (4096) bytes.
+text cf_dflt "gpu/runtime"
+text cf_fsrc "/cudapp-src.sha256.txt"
+text cf_fid "/cudapp-ident.txt"
+text cf_fdev "/devwords.txt"
+text cf_hdr "path\tgen\tact\tpend\tfns\tomfn\tdevfn\thostl\tshell\n"
+text cf_kgen "/* Generated"
+text cf_kpend "CUDAPP_MIGRATION_PENDING"
+text cf_komega "omega_"
+text cf_kunit "unit="
+text cf_kc ".c"
+text cf_kh ".h"
+text cf_kinc ".inc"
+text cf_wif "if"
+text cf_wifdef "ifdef"
+text cf_wifndef "ifndef"
+text cf_welif "elif"
+text cf_welse "else"
+text cf_wendif "endif"
+text cf_wdefine "define"
+text cf_wdefined "defined"
+text cf_e_usage "usage: cfacts ROOT [DIR] (ROOT a CUDApp checkout; run from the repository root)\n"
+text cf_e_read "cfacts: cannot read "
+text cf_e_list "cfacts: malformed sha256 list line in "
+text cf_e_sha "cfacts: the file does not hash to its line of cudapp-src.sha256.txt: "
+text cf_e_mem "cfacts: the host refused memory\n"
+text cf_e_long "cfacts: a path is longer than 4095 bytes\n"
+global cf_t uchar *
+global cf_f uchar *
+global cf_o uchar *
+global cf_w uchar *
+global cf_nm uchar *
+global cf_ni ulong *
+global cf_h ulong *
+global cf_fn ulong *
+global cf_cl ulong *
+global cf_r ulong *
+global cf_al ulong *
+global cf_g ulong *
+global cf_fh ulong *
+global cf_fx ulong *
+global cf_pa uchar 4096
+global cf_root uchar 4096
+global cf_dir uchar 4096
+global cf_n ulong 64
+note cf_t inputs, cf_f the file being read, cf_o output, cf_w a name being interned, cf_nm name bytes, cf_ni per
+note name (start, length, kind: 1 an Omega unit, 2 a device word), cf_h the name hash table (name + 1, 0 empty),
+note cf_fn per function (file, name, flags 1 Omega 2 device, lines, first call, end of calls), cf_cl call names,
+note cf_r per file (path start, path end, gen, act, pend, fns, omfn, devfn, hostl, shell), cf_al per #define
+note (name, body start, body end; start CF_NONE when unknown), cf_g the region stack (value, taken),
+note cf_fh per name its first function + 1, cf_fx per function the next of its name + 1.
+note cf_n: 0 path length, 1 dir length, 2 cf_t used, 3 cf_o used, 4..9 ranges [s,e) of the list, ident, devwords;
+note 10 cf_f length, 11 names, 12 cf_nm used, 13 hash table size, 14 functions, 15 calls, 16 files, 17 defines,
+note 18 region depth, 19, 20 the condition cursor and its end, 21 root length, 22 cf_w length, 23 brace depth,
+note 24 in a function, 25 it calls Omega, 26 it calls a device word, 27 its lines, 28 the last byte at depth 0,
+note 29 paren depth at depth 0, 30, 31 the name candidate [s,e), 32, 33 the previous token [s,e), 34 the function
+note name, 35 its first call, 36 act, 37 pend, 38 fns, 39 this line counted, 40 file index, 41, 42 the condition
+note token [s,e), 43 its kind (0 none, 1 name, 2 number, 3 &&, 4 ||, 5 one byte)
+const CF_NONE ulong 9223372036854775808
+note ---- failure
+fn die t view uchar * code int to void
+r = write 2 t 0 len t
+exit code
+end
+fn diepa t view uchar * to void
+r = write 2 t 0 len t
+r = write 2 cf_pa 0 get cf_n 0
+q = new uchar 1 10
+r = write 2 q 0 1
+exit 3
+end
+note ---- growth: each makes room for index n
+fn gt_ n ulong to void
+if ge n len cf_t
+r = enlarge cf_t add mul n 2 131072
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gf_ n ulong to void
+if ge n len cf_f
+r = enlarge cf_f add mul n 2 131072
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gw_ n ulong to void
+if ge n len cf_w
+r = enlarge cf_w add mul n 2 4096
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gnm_ n ulong to void
+if ge n len cf_nm
+r = enlarge cf_nm add mul n 2 65536
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gni_ n ulong to void
+if ge n len cf_ni
+r = enlarge cf_ni add mul n 2 4096
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gfn_ n ulong to void
+if ge n len cf_fn
+r = enlarge cf_fn add mul n 2 4096
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gcl_ n ulong to void
+if ge n len cf_cl
+r = enlarge cf_cl add mul n 2 4096
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gr_ n ulong to void
+if ge n len cf_r
+r = enlarge cf_r add mul n 2 4096
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gal_ n ulong to void
+if ge n len cf_al
+r = enlarge cf_al add mul n 2 4096
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+fn gg_ n ulong to void
+if ge n len cf_g
+r = enlarge cf_g add mul n 2 64
+if ne r 0
+die cf_e_mem 4
+end
+end
+end
+note ---- output pool
+fn oc c ulong to void
+n = get cf_n 3
+if ge n len cf_o
+r = enlarge cf_o add mul n 2 65536
+if ne r 0
+die cf_e_mem 4
+end
+end
+put cf_o n uchar c
+put cf_n 3 add n 1
+end
+fn ot t view uchar * to void
+for i ulong len t bound 4096
+oc ulong get t i
+end
+end
+fn otr a ulong b ulong to void
+for i ulong sub b a bound 9223372036854775807
+oc ulong get cf_t add a i
+end
+end
+fn onum v ulong to void
+if ge v 10
+onum div v 10
+end
+oc add 48 rem v 10
+end
+fn oflush to void
+n = get cf_n 3
+o = ulong 0
+while lt o n bound 9223372036854775807
+x = write 1 cf_o o sub n o
+if le x 0
+exit 3
+end
+o = add o ulong x
+end
+put cf_n 3 0
+end
+note ---- paths: cf_pa[0, cf_n 0)
+fn pclr to void
+put cf_n 0 0
+end
+fn pc c ulong to void
+n = get cf_n 0
+if ge n 4095
+die cf_e_long 3
+end
+put cf_pa n uchar c
+put cf_n 0 add n 1
+end
+fn pt t view uchar * to void
+for i ulong len t bound 4096
+pc ulong get t i
+end
+end
+fn ptr a ulong b ulong to void
+for i ulong sub b a bound 9223372036854775807
+pc ulong get cf_t add a i
+end
+end
+fn pdir t view uchar * to void
+pclr
+for i ulong get cf_n 1 bound 4096
+pc ulong get cf_dir i
+end
+pt t
+end
+note ROOT / then cf_t[a, b)
+fn proot a ulong b ulong to void
+pclr
+for i ulong get cf_n 21 bound 4096
+pc ulong get cf_root i
+end
+pc 47
+ptr a b
+end
+fn popen to int
+r = fopen cf_pa 0 get cf_n 0 int 524288 int 0
+if lt r 0
+ret -1
+end
+ret int r
+end
+note ---- inputs: append the file at cf_pa to cf_t; slot k gets its start, k+1 its end
+fn tload k ulong to void
+fd = popen
+if lt fd 0
+diepa cf_e_read
+end
+s = get cf_n 2
+n = s
+while true bound 9223372036854775807
+gt_ add n 65536
+x = read fd cf_t n sub len cf_t n
+if lt x 0
+diepa cf_e_read
+end
+if eq x 0
+break
+end
+n = add n ulong x
+end
+r = fclose fd
+put cf_n 2 n
+put cf_n k s
+put cf_n add k 1 n
+end
+note the file at cf_pa into cf_f[0, cf_n 10)
+fn fload to void
+fd = popen
+if lt fd 0
+diepa cf_e_read
+end
+n = ulong 0
+while true bound 9223372036854775807
+gf_ add n 65536
+x = read fd cf_f n sub len cf_f n
+if lt x 0
+diepa cf_e_read
+end
+if eq x 0
+break
+end
+n = add n ulong x
+end
+r = fclose fd
+put cf_n 10 n
+end
+note ---- bytes
+fn teol p ulong e ulong to ulong
+q = p
+while lt q e bound 9223372036854775807
+if eq get cf_t q 10
+ret q
+end
+q = add q 1
+end
+ret e
+end
+fn feol p ulong e ulong to ulong
+q = p
+while lt q e bound 9223372036854775807
+if eq get cf_f q 10
+ret q
+end
+q = add q 1
+end
+ret e
+end
+fn tteq a ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get cf_t add a i get t i
+ret false
+end
+end
+ret true
+end
+fn fteq a ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get cf_f add a i get t i
+ret false
+end
+end
+ret true
+end
+note cf_f[a, e) starts with t
+fn fpre a ulong e ulong t view uchar * to bool
+if lt sub e a len t
+ret false
+end
+ret fteq a len t t
+end
+note cf_t[a, e) ends with t
+fn tsuf a ulong e ulong t view uchar * to bool
+if lt sub e a len t
+ret false
+end
+ret tteq sub e len t len t t
+end
+note white space as C and Python's ASCII \s have it, less the newline
+fn isws c ulong to bool
+if or eq c 32 eq c 9
+ret true
+end
+ret or or eq c 13 eq c 12 eq c 11
+end
+note white space inside a directive: also the newline and backslash of a joined line
+fn dws c ulong to bool
+if isws c
+ret true
+end
+ret or eq c 10 eq c 92
+end
+fn isids c ulong to bool
+if or eq c 95 and ge c 97 le c 122
+ret true
+end
+ret and ge c 65 le c 90
+end
+fn isidc c ulong to bool
+if isids c
+ret true
+end
+ret and ge c 48 le c 57
+end
+note end of the name characters of cf_f from a, before e
+fn idend a ulong e ulong to ulong
+q = a
+while lt q e bound 9223372036854775807
+if not isidc ulong get cf_f q
+ret q
+end
+q = add q 1
+end
+ret e
+end
+note cf_f[s, e) is a pending flag name
+fn ispend s ulong e ulong to bool
+ret fpre s e cf_kpend
+end
+fn ishex c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+ret and ge c 97 le c 102
+end
+note ---- sha256sum list: 64 lowercase hex, two spaces, a path of at least one byte
+fn lineok p ulong q ulong to bool
+if lt sub q p 67
+ret false
+end
+for i ulong 64
+if not ishex get cf_t add p i
+ret false
+end
+end
+ret and eq get cf_t add p 64 32 eq get cf_t add p 65 32
+end
+fn listok to void
+p = get cf_n 4
+e = get cf_n 5
+while lt p e bound 9223372036854775807
+q = teol p e
+if or eq q e not lineok p q
+pdir cf_fsrc
+diepa cf_e_list
+end
+p = add q 1
+end
+end
+fn digeq p ulong to bool
+for j ulong 32
+b = get sh_dig j
+if ne get cf_t add p mul j 2 sh_hexd uint shr b 4
+ret false
+end
+if ne get cf_t add p add mul j 2 1 sh_hexd uint and b 15
+ret false
+end
+end
+ret true
+end
+note ---- names: interned, so a name is a number
+fn wclr to void
+put cf_n 22 0
+end
+fn wc c ulong to void
+n = get cf_n 22
+gw_ n
+put cf_w n uchar c
+put cf_n 22 add n 1
+end
+fn wf a ulong b ulong to void
+for i ulong sub b a bound 9223372036854775807
+wc ulong get cf_f add a i
+end
+end
+fn wtr a ulong b ulong to void
+for i ulong sub b a bound 9223372036854775807
+wc ulong get cf_t add a i
+end
+end
+fn wt t view uchar * to void
+for i ulong len t bound 4096
+wc ulong get t i
+end
+end
+fn fnvw to ulong
+h = ulong 14695981039346656037
+for i ulong get cf_n 22 bound 9223372036854775807
+h = mul xor h ulong get cf_w i 1099511628211
+end
+ret h
+end
+fn fnvn id ulong to ulong
+s = get cf_ni mul id 3
+n = get cf_ni add mul id 3 1
+h = ulong 14695981039346656037
+for i ulong n bound 9223372036854775807
+c = ulong get cf_nm add s i
+h = mul xor h c 1099511628211
+end
+ret h
+end
+fn nmeq id ulong to bool
+s = get cf_ni mul id 3
+n = get cf_ni add mul id 3 1
+if ne n get cf_n 22
+ret false
+end
+for i ulong n bound 9223372036854775807
+if ne get cf_nm add s i get cf_w i
+ret false
+end
+end
+ret true
+end
+fn hins id ulong h ulong to void
+m = sub get cf_n 13 1
+i = and h m
+while ne get cf_h i 0 bound 9223372036854775807
+i = and add i 1 m
+end
+put cf_h i add id 1
+end
+note a table of sz empty slots, then every name back in
+fn hsize sz ulong to void
+if lt len cf_h sz
+r = enlarge cf_h sz
+if ne r 0
+die cf_e_mem 4
+end
+end
+for i ulong sz bound 9223372036854775807
+put cf_h i 0
+end
+put cf_n 13 sz
+for id ulong get cf_n 11 bound 9223372036854775807
+hins id fnvn id
+end
+end
+note the devwords.txt line cf_t[a, b) (trimmed, not empty) names cf_w: a line ending in * names every name
+note starting with the rest; a line starting with # names nothing
+fn dlm a ulong b ulong to bool
+if ne get cf_t a 35
+n = get cf_n 22
+e = b
+pre = eq get cf_t sub b 1 42
+if pre
+e = sub b 1
+end
+k = sub e a
+if or eq k n and pre le k n
+for i ulong k bound 9223372036854775807
+if ne get cf_t add a i get cf_w i
+ret false
+end
+end
+ret true
+end
+end
+ret false
+end
+note cf_w against devwords.txt: 2 when a line names it
+fn devk to ulong
+p = get cf_n 8
+e = get cf_n 9
+while lt p e bound 9223372036854775807
+q = teol p e
+a = p
+while lt a q bound 9223372036854775807
+if not isws ulong get cf_t a
+break
+end
+a = add a 1
+end
+b = q
+while gt b a bound 9223372036854775807
+if not isws ulong get cf_t sub b 1
+break
+end
+b = sub b 1
+end
+if lt a b
+if dlm a b
+ret 2
+end
+end
+p = add q 1
+end
+ret 0
+end
+fn intern to ulong
+h = fnvw
+m = sub get cf_n 13 1
+i = and h m
+while true bound 9223372036854775807
+x = get cf_h i
+if eq x 0
+break
+end
+if nmeq sub x 1
+ret sub x 1
+end
+i = and add i 1 m
+end
+id = get cf_n 11
+s = get cf_n 12
+n = get cf_n 22
+gnm_ add s n
+for j ulong n bound 9223372036854775807
+put cf_nm add s j get cf_w j
+end
+put cf_n 12 add s n
+gni_ add mul id 3 2
+put cf_ni mul id 3 s
+put cf_ni add mul id 3 1 n
+put cf_ni add mul id 3 2 devk
+put cf_h i add id 1
+put cf_n 11 add id 1
+if ge mul add id 1 2 get cf_n 13
+hsize mul get cf_n 13 2
+end
+ret id
+end
+note every unit=U of cudapp-ident.txt: the name omega_U is an Omega unit
+fn units to void
+p = get cf_n 6
+e = get cf_n 7
+while lt p e bound 9223372036854775807
+ok = false
+if ge sub e p len cf_kunit
+ok = tteq p len cf_kunit cf_kunit
+end
+if ok
+a = add p len cf_kunit
+b = a
+while lt b e bound 9223372036854775807
+c = ulong get cf_t b
+if or isws c eq c 10
+break
+end
+b = add b 1
+end
+if gt b a
+wclr
+wt cf_komega
+wtr a b
+id = intern
+k = add mul id 3 2
+put cf_ni k or get cf_ni k 1
+p = b
+else
+p = add p 1
+end
+else
+p = add p 1
+end
+end
+end
+note ---- C text: comments blanked, string and character literal bodies blanked (newlines stay)
+fn blank a ulong b ulong to void
+for i ulong sub b a bound 9223372036854775807
+if ne get cf_f add a i 10
+put cf_f add a i 32
+end
+end
+end
+note the end of the block comment opened at i (after its */), or n
+fn cmtend i ulong n ulong to ulong
+k = add i 2
+while lt add k 1 n bound 9223372036854775807
+if and eq get cf_f k 42 eq get cf_f add k 1 47
+ret add k 2
+end
+k = add k 1
+end
+ret n
+end
+note the stop of the literal opened at i by the byte c: its closing c, a newline, or n
+fn litend i ulong n ulong c ulong to ulong
+j = add i 1
+while lt j n bound 9223372036854775807
+x = ulong get cf_f j
+if or eq x c eq x 10
+ret j
+end
+if eq x 92
+j = add j 2
+else
+j = add j 1
+end
+end
+ret n
+end
+fn fstrip to void
+n = get cf_n 10
+i = ulong 0
+while lt i n bound 9223372036854775807
+c = ulong get cf_f i
+nx = i
+if lt add i 1 n
+d = ulong get cf_f add i 1
+if and eq c 47 eq d 42
+nx = cmtend i n
+blank i nx
+end
+if and eq c 47 eq d 47
+nx = feol i n
+blank i nx
+end
+end
+if eq nx i
+if or eq c 34 eq c 39
+j = litend i n c
+blank add i 1 j
+nx = j
+if lt j n
+if eq ulong get cf_f j c
+nx = add j 1
+end
+end
+end
+end
+if eq nx i
+nx = add i 1
+end
+i = nx
+end
+end
+note ---- regions
+fn anyoff to bool
+for k ulong get cf_n 18 bound 9223372036854775807
+if eq get cf_g mul k 2 0
+ret true
+end
+end
+ret false
+end
+fn allon to bool
+for k ulong get cf_n 18 bound 9223372036854775807
+if ne get cf_g mul k 2 1
+ret false
+end
+end
+ret true
+end
+fn gpush v ulong to void
+d = get cf_n 18
+gg_ add mul d 2 1
+put cf_g mul d 2 v
+put cf_g add mul d 2 1 v
+put cf_n 18 add d 1
+end
+fn c3and v ulong w ulong to ulong
+if or eq v 0 eq w 0
+ret 0
+end
+if and eq v 1 eq w 1
+ret 1
+end
+ret 2
+end
+fn c3or v ulong w ulong to ulong
+if or eq v 1 eq w 1
+ret 1
+end
+if and eq v 0 eq w 0
+ret 0
+end
+ret 2
+end
+note ---- conditions: the token at the cursor (slots 41, 42, 43), not consumed
+fn tk to void
+p = get cf_n 19
+e = get cf_n 20
+while lt p e bound 9223372036854775807
+if not dws ulong get cf_f p
+break
+end
+p = add p 1
+end
+put cf_n 19 p
+put cf_n 41 p
+put cf_n 42 p
+put cf_n 43 0
+if eq p e
+ret
+end
+c = ulong get cf_f p
+k = ulong 5
+q = add p 1
+if isidc c
+q = idend p e
+k = 2
+if isids c
+k = 1
+end
+else
+if lt q e
+d = ulong get cf_f q
+if and eq c 38 eq d 38
+q = add q 1
+k = 3
+end
+if and eq c 124 eq d 124
+q = add q 1
+k = 4
+end
+end
+end
+put cf_n 42 q
+put cf_n 43 k
+end
+fn adv to void
+put cf_n 19 get cf_n 42
+end
+note the token at the cursor is the one byte c
+fn tkis c ulong to bool
+tk
+if ne get cf_n 43 5
+ret false
+end
+ret eq ulong get cf_f get cf_n 41 c
+end
+fn tkk k ulong to bool
+tk
+ret eq get cf_n 43 k
+end
+note a number: 0 when it is one 0 then u U l L, 1 when digits then u U l L, else unknown
+fn numv s ulong e ulong to ulong
+i = s
+while lt i e bound 9223372036854775807
+c = get cf_f i
+if not and ge c 48 le c 57
+break
+end
+i = add i 1
+end
+nd = sub i s
+while lt i e bound 9223372036854775807
+c = get cf_f i
+if not or or eq c 117 eq c 85 or eq c 108 eq c 76
+ret 2
+end
+i = add i 1
+end
+if and eq nd 1 eq get cf_f s 48
+ret 0
+end
+ret 1
+end
+fn defd to ulong
+pr = false
+if tkis 40
+adv
+pr = true
+end
+tk
+k = get cf_n 43
+s = get cf_n 41
+e = get cf_n 42
+adv
+pd = false
+if eq k 1
+pd = ispend s e
+end
+if pr
+if tkis 41
+adv
+end
+end
+if pd
+ret 0
+end
+ret 2
+end
+note the value of the name cf_f[s, e): its latest #define, read at depth dp + 1, or unknown
+fn aliasv s ulong e ulong dp ulong to ulong
+wclr
+wf s e
+id = intern
+n = get cf_n 17
+for j ulong n bound 9223372036854775807
+k = sub sub n 1 j
+if eq get cf_al mul k 3 id
+a = get cf_al add mul k 3 1
+if eq a CF_NONE
+ret 2
+end
+note a chain longer than the defines seen so far has met a name twice: a cycle, unknown
+if ge dp n
+ret 2
+end
+ret ev a get cf_al add mul k 3 2 add dp 1
+end
+end
+ret 2
+end
+fn prim dp ulong to ulong
+tk
+k = get cf_n 43
+if eq k 0
+ret 2
+end
+s = get cf_n 41
+e = get cf_n 42
+adv
+if eq k 5
+c = get cf_f s
+if eq c 33
+v = prim dp
+if eq v 2
+ret 2
+end
+ret sub 1 v
+end
+if eq c 40
+v = evor dp
+if tkis 41
+adv
+end
+ret v
+end
+ret 2
+end
+if eq k 2
+ret numv s e
+end
+if eq k 1
+if fteq s sub e s cf_wdefined
+ret defd
+end
+if ispend s e
+ret 0
+end
+ret aliasv s e dp
+end
+ret 2
+end
+fn evand dp ulong to ulong
+v = prim dp
+while tkk 3 bound 9223372036854775807
+adv
+w = prim dp
+v = c3and v w
+end
+ret v
+end
+fn evor dp ulong to ulong
+v = evand dp
+while tkk 4 bound 9223372036854775807
+adv
+w = evand dp
+v = c3or v w
+end
+ret v
+end
+note the value of the condition cf_f[a, b): unknown unless every token is used
+fn ev a ulong b ulong dp ulong to ulong
+sp = get cf_n 19
+se = get cf_n 20
+put cf_n 19 a
+put cf_n 20 b
+v = evor dp
+tk
+if ne get cf_n 43 0
+v = 2
+end
+put cf_n 19 sp
+put cf_n 20 se
+ret v
+end
+note #ifdef (want 0) or #ifndef (want 1): a pending flag decides, anything else is unknown
+fn flagdir a ulong b ulong want ulong to void
+put cf_n 19 a
+put cf_n 20 b
+tk
+v = ulong 2
+if eq get cf_n 43 1
+if ispend get cf_n 41 get cf_n 42
+v = want
+end
+end
+gpush v
+end
+fn dodefine a ulong b ulong to void
+p = a
+while lt p b bound 9223372036854775807
+if not dws ulong get cf_f p
+break
+end
+p = add p 1
+end
+if eq p b
+ret
+end
+if not isids ulong get cf_f p
+ret
+end
+q = idend p b
+if lt q b
+if eq get cf_f q 40
+ret
+end
+end
+if ispend p q
+ret
+end
+wclr
+wf p q
+id = intern
+n = get cf_n 17
+gal_ add mul n 3 2
+put cf_al mul n 3 id
+put cf_al add mul n 3 1 CF_NONE
+put cf_al add mul n 3 2 CF_NONE
+if allon
+put cf_al add mul n 3 1 q
+put cf_al add mul n 3 2 b
+end
+put cf_n 17 add n 1
+end
+fn doelif a ulong b ulong to void
+d = get cf_n 18
+if eq d 0
+ret
+end
+k = mul sub d 1 2
+w = ev a b 0
+g = get cf_g add k 1
+v = ulong 2
+if eq g 1
+v = 0
+end
+if eq g 0
+v = w
+end
+if eq g 2
+if eq w 0
+v = 0
+end
+end
+put cf_g k v
+put cf_g add k 1 c3or g w
+end
+fn doelse to void
+d = get cf_n 18
+if eq d 0
+ret
+end
+k = mul sub d 1 2
+g = get cf_g add k 1
+v = ulong 2
+if eq g 1
+v = 0
+end
+if eq g 0
+v = 1
+end
+put cf_g k v
+put cf_g add k 1 1
+end
+note one directive: cf_f[a, b) after its #, n physical lines
+fn dline a ulong b ulong n ulong to void
+off = anyoff
+s = a
+while lt s b bound 9223372036854775807
+if not isws ulong get cf_f s
+break
+end
+s = add s 1
+end
+t = s
+if lt s b
+if isids ulong get cf_f s
+t = idend s b
+end
+end
+w = sub t s
+if fteq s w cf_wif
+gpush ev t b 0
+end
+if fteq s w cf_wifdef
+flagdir t b 0
+end
+if fteq s w cf_wifndef
+flagdir t b 1
+end
+if fteq s w cf_welif
+doelif t b
+end
+if fteq s w cf_welse
+doelse
+end
+if fteq s w cf_wendif
+d = get cf_n 18
+if gt d 0
+put cf_n 18 sub d 1
+end
+end
+if fteq s w cf_wdefine
+if not off
+dodefine t b
+end
+end
+if off
+put cf_n 37 add get cf_n 37 n
+else
+if not anyoff
+put cf_n 36 add get cf_n 36 n
+end
+end
+end
+note ---- functions
+fn setprev s ulong t ulong to void
+put cf_n 32 s
+put cf_n 33 t
+end
+fn fnopen to void
+put cf_n 24 1
+put cf_n 38 add get cf_n 38 1
+put cf_n 25 0
+put cf_n 26 0
+wclr
+wf get cf_n 30 get cf_n 31
+put cf_n 34 intern
+put cf_n 35 get cf_n 15
+if eq get cf_n 39 0
+put cf_n 27 add get cf_n 27 1
+put cf_n 39 1
+end
+end
+fn fnclose to void
+put cf_n 24 0
+n = get cf_n 14
+gfn_ add mul n 6 5
+b = mul n 6
+put cf_fn b get cf_n 40
+put cf_fn add b 1 get cf_n 34
+put cf_fn add b 2 or get cf_n 25 shl get cf_n 26 1
+put cf_fn add b 3 get cf_n 27
+put cf_fn add b 4 get cf_n 35
+put cf_fn add b 5 get cf_n 15
+put cf_n 14 add n 1
+put cf_n 27 0
+end
+note the name cf_f[s, t) inside a function: a call when ( follows on this line after spaces and tabs
+fn callchk s ulong t ulong q ulong to void
+k = t
+while lt k q bound 9223372036854775807
+c = get cf_f k
+if not or eq c 32 eq c 9
+break
+end
+k = add k 1
+end
+if eq k q
+ret
+end
+if ne get cf_f k 40
+ret
+end
+wclr
+wf s t
+id = intern
+n = get cf_n 15
+gcl_ n
+put cf_cl n id
+put cf_n 15 add n 1
+kd = get cf_ni add mul id 3 2
+if ne and kd 1 0
+put cf_n 25 1
+else
+if ne and kd 2 0
+put cf_n 26 1
+end
+end
+end
+note one token cf_f[s, t) of a code line that ends at q
+fn ctok s ulong t ulong q ulong to void
+c = ulong get cf_f s
+one = eq sub t s 1
+d = get cf_n 23
+if and one eq c 123
+if eq d 0
+if eq get cf_n 28 34
+put cf_n 28 123
+setprev s t
+ret
+end
+if eq get cf_n 28 41
+fnopen
+end
+end
+put cf_n 23 add d 1
+setprev s t
+ret
+end
+if and one eq c 125
+if gt d 0
+d = sub d 1
+put cf_n 23 d
+end
+if and eq d 0 eq get cf_n 24 1
+fnclose
+end
+put cf_n 28 125
+setprev s t
+ret
+end
+if eq d 0
+pd = get cf_n 29
+if and one eq c 40
+if eq pd 0
+put cf_n 30 get cf_n 32
+put cf_n 31 get cf_n 33
+end
+put cf_n 29 add pd 1
+end
+if and one eq c 41
+if gt pd 0
+put cf_n 29 sub pd 1
+end
+end
+put cf_n 28 ulong get cf_f sub t 1
+end
+if eq get cf_n 24 1
+if isids c
+callchk s t q
+end
+end
+setprev s t
+end
+note one code line cf_f[a, q) that holds a byte that is not white space, outside dropped regions
+fn ctoks a ulong q ulong to void
+put cf_n 39 0
+if eq get cf_n 24 1
+put cf_n 27 add get cf_n 27 1
+put cf_n 39 1
+end
+p = a
+while lt p q bound 9223372036854775807
+c = ulong get cf_f p
+if isws c
+p = add p 1
+continue
+end
+t = add p 1
+if isids c
+t = idend p q
+end
+ctok p t q
+p = t
+end
+end
+note the physical line [ls, qq) ends with a backslash and another line follows it in a file of e bytes
+fn dcont ls ulong qq ulong e ulong to bool
+if ge add qq 1 e
+ret false
+end
+k = qq
+while gt k ls bound 9223372036854775807
+if not isws ulong get cf_f sub k 1
+break
+end
+k = sub k 1
+end
+if eq k ls
+ret false
+end
+ret eq get cf_f sub k 1 92
+end
+fn fscan to void
+put cf_n 17 0
+put cf_n 18 0
+for k ulong 17 bound 64
+put cf_n add k 23 0
+end
+e = get cf_n 10
+p = ulong 0
+while lt p e bound 9223372036854775807
+q = feol p e
+a = p
+while lt a q bound 9223372036854775807
+if not isws ulong get cf_f a
+break
+end
+a = add a 1
+end
+isd = false
+if lt a q
+if eq get cf_f a 35
+isd = true
+end
+end
+if isd
+ls = p
+qq = q
+n = ulong 1
+while dcont ls qq e bound 9223372036854775807
+ls = add qq 1
+qq = feol ls e
+n = add n 1
+end
+dline add a 1 qq n
+p = add qq 1
+else
+if anyoff
+if lt a q
+put cf_n 37 add get cf_n 37 1
+end
+else
+if lt a q
+put cf_n 36 add get cf_n 36 1
+ctoks a q
+end
+end
+p = add q 1
+end
+end
+end
+note ---- one listed file: the list line's hex at h, its path cf_t[a, b)
+fn fproc h ulong a ulong b ulong to void
+proot a b
+fload
+n = get cf_n 10
+zbeg
+for i ulong n bound 9223372036854775807
+zbyte ulong get cf_f i
+end
+zend
+if not digeq h
+diepa cf_e_sha
+end
+fi = get cf_n 16
+gr_ add mul fi 10 9
+r = mul fi 10
+put cf_r r a
+put cf_r add r 1 b
+put cf_r add r 2 0
+if fpre 0 n cf_kgen
+put cf_r add r 2 1
+end
+for k ulong 7
+put cf_r add r add k 3 0
+end
+put cf_n 40 fi
+fstrip
+fscan
+put cf_r add r 3 get cf_n 36
+put cf_r add r 4 get cf_n 37
+put cf_r add r 5 get cf_n 38
+put cf_n 16 add fi 1
+end
+note ---- the call closure
+note the flags of the functions a call of name id from file fi names
+fn ftarg id ulong fi ulong to ulong
+same = false
+x = get cf_fh id
+while ne x 0 bound 9223372036854775807
+k = sub x 1
+if eq get cf_fn mul k 6 fi
+same = true
+end
+x = get cf_fx k
+end
+fl = ulong 0
+x = get cf_fh id
+while ne x 0 bound 9223372036854775807
+k = sub x 1
+if or not same eq get cf_fn mul k 6 fi
+fl = or fl get cf_fn add mul k 6 2
+end
+x = get cf_fx k
+end
+ret fl
+end
+fn fpass k ulong to bool
+b = mul k 6
+fl = get cf_fn add b 2
+if eq fl 3
+ret false
+end
+fi = get cf_fn b
+s = get cf_fn add b 4
+n = sub get cf_fn add b 5 s
+nf = fl
+for j ulong n bound 9223372036854775807
+id = get cf_cl add s j
+t = ftarg id fi
+nf = or nf t
+end
+if eq nf fl
+ret false
+end
+put cf_fn add b 2 nf
+ret true
+end
+fn closure to void
+nn = get cf_n 11
+nf = get cf_n 14
+if lt len cf_fh add nn 1
+r = enlarge cf_fh add nn 1
+if ne r 0
+die cf_e_mem 4
+end
+end
+if lt len cf_fx add nf 1
+r = enlarge cf_fx add nf 1
+if ne r 0
+die cf_e_mem 4
+end
+end
+for i ulong nn bound 9223372036854775807
+put cf_fh i 0
+end
+for k ulong nf bound 9223372036854775807
+id = get cf_fn add mul k 6 1
+put cf_fx k get cf_fh id
+put cf_fh id add k 1
+end
+ch = true
+while ch bound 9223372036854775807
+ch = false
+for k ulong nf bound 9223372036854775807
+if fpass k
+ch = true
+end
+end
+end
+tally nf
+end
+note add each function to its file: omfn and shell, devfn and shell, or hostl
+fn tally nf ulong to void
+for k ulong nf bound 9223372036854775807
+b = mul k 6
+r = mul get cf_fn b 10
+fl = get cf_fn add b 2
+ln = get cf_fn add b 3
+if ne and fl 1 0
+put cf_r add r 6 add get cf_r add r 6 1
+put cf_r add r 9 add get cf_r add r 9 ln
+else
+if ne and fl 2 0
+put cf_r add r 7 add get cf_r add r 7 1
+put cf_r add r 9 add get cf_r add r 9 ln
+else
+put cf_r add r 8 add get cf_r add r 8 ln
+end
+end
+end
+end
+fn rows to void
+ot cf_hdr
+for fi ulong get cf_n 16 bound 9223372036854775807
+r = mul fi 10
+otr get cf_r r get cf_r add r 1
+for k ulong 8
+oc 9
+onum get cf_r add r add k 2
+end
+oc 10
+if ge get cf_n 3 1048576
+oflush
+end
+end
+oflush
+end
+note the list (slots 4, 5), cudapp-ident.txt (6, 7) and devwords.txt (8, 9) are loaded and cf_root is set:
+note read every listed file (all) or the .c, .h and .inc ones, then write the rows
+fn cfrun all bool to void
+listok
+put cf_n 11 0
+hsize 65536
+units
+p = get cf_n 4
+e = get cf_n 5
+while lt p e bound 9223372036854775807
+q = teol p e
+a = add p 66
+if or all or or tsuf a q cf_kc tsuf a q cf_kh tsuf a q cf_kinc
+fproc p a q
+end
+p = add q 1
+end
+closure
+rows
+end

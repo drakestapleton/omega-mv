@@ -25,6 +25,12 @@ in CUDApp and serves as the reference (the oracle); it is compiled and run outsi
 | `checks.tsv` | the gate's checks: parts to compose, expected output, and a source mutation that must be caught |
 | `controls.tsv` | the gate's inventory controls: an input byte changed, and how the inventory must notice |
 | `gate.om` | the gate, OMEGA-GPU-RUNTIME (OM-2) |
+| `cfacts.om`, `cfacts-main.om` | the C facts scanner (OM-2) and its program: per C file of CUDApp `src/`, the lines a default build compiles, the lines kept only behind a pending flag, and the lines of functions that hand work to Omega, call the chip or the operating system, or do host logic |
+| `devwords.txt` | input of `cfacts.om`: the call names that reach the GPU, the driver or the operating system |
+| `cudapp-cfacts.tsv` | the output of `cfacts-main.om` on CUDApp at the source commit, committed (CUDApp is not in this tree, so the gate cannot rerun it) |
+| `check/cfacts-check.om`, `check/cfacts-fixture-*.txt`, `check/cfacts-fixture.sha256.txt`, `check/cfacts.expect.txt` | the gate's check of `cfacts.om`: two test inputs of C text (data, never compiled) and the facts they must give |
+| `classes.om` | the classes program (OM-2): reads `INVENTORY.tsv` and `cudapp-cfacts.tsv` and gives each unrecorded file a class |
+| `CLASSES.tsv` | the output of `classes.om`, committed; the gate requires the program to reproduce it byte for byte |
 
 The headers of `inventory.om` and `gate.om` define their columns, fields and exit codes.
 
@@ -73,6 +79,35 @@ The inventory hashes the files of this tree that it names, and it refuses to run
 matches `omega-base.sha256.txt`. That covers every Bridge source part and every file at a CUDApp path (`identical`
 or `diverged`). It also refuses when a `cudapp-only` path now exists in the tree. When that happens, the list is
 stale: regenerate it.
+
+## What blocks each unrecorded file
+
+`CLASSES.tsv` has one row per `unrecorded` file of `INVENTORY.tsv`, with a class that says what stands between it
+and an Omega rewrite: `r` rewritten; `c` a generator wrote it; `d` C kept only behind a pending flag, as a reference;
+`b` a C entry point over Omega or over the chip; `a` C host logic that a rewrite can be checked against now. The
+header of `classes.om` gives the exact rule, and the header of `cfacts.om` the facts it is applied to. The last lines
+of `CLASSES.tsv` give the counts; this file does not restate them.
+
+A class `b` file is waiting for Omega to produce a library that C can call: its functions are thin C over an Omega
+unit or over a device call. A class `d` file holds bodies that a default build drops (every `CUDAPP_MIGRATION_PENDING_*`
+flag is defined 0 in CUDApp); CUDApp keeps them as the old implementation to compare against.
+
+To list the files a rewrite can start on, with their host-logic lines:
+
+    awk -F'\t' '$3=="a"{print $10, $1}' gpu/runtime/CLASSES.tsv | sort -n
+
+`cudapp-cfacts.tsv` is regenerated from a CUDApp checkout `../cudapp` at the commit of `cudapp-src.sha256.txt`:
+
+    { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/cfacts.om gpu/runtime/cfacts-main.om; } \
+      | seed/out/omc > cfacts
+    ./cfacts ../cudapp > gpu/runtime/cudapp-cfacts.tsv
+    { printf 'om2\n'; cat gpu/runtime/classes.om; } | seed/out/omc > classes
+    ./classes > gpu/runtime/CLASSES.tsv
+
+The committed `cudapp-cfacts.tsv` has sha256 `705fc7d97dd4afb7e6d909e822ba8f3ae703321bf6535c4fcd5e549a7d12644c`.
+The lane that wrote this slice also wrote the same rules separately, outside this repository, as a reference
+program in Python (`cfacts_ref.py`, sha256 `ab808cff555cad8a1017460efb6f0ddc319e3bcc08c7b5035747ddbcbf2e677d`), and
+its output on CUDApp was byte for byte the same file. On the two test inputs it gives `check/cfacts.expect.txt`.
 
 ## The scanref oracle
 
@@ -128,7 +163,9 @@ is made with it.
 
 That is all the gate checks. It does not check the CUDApp commit, or that a file of `INVENTORY.tsv` is really
 hand-written. It does not rerun the C oracle. It does not check that a rewrite covers every function of the C file,
-beyond what its check program prints.
+beyond what its check program prints. It checks the rules of `cfacts.om` on its two test inputs only; that
+`cudapp-cfacts.tsv` is what those rules give on CUDApp is checked outside this tree, as "What blocks each unrecorded
+file" says.
 
 A new rewrite slice adds four things:
 
@@ -137,7 +174,7 @@ A new rewrite slice adds four things:
 - at least one row in `checks.tsv` whose parts include the Omega file;
 - one row in `rewrites.tsv`.
 
-It then regenerates `INVENTORY.tsv`.
+It then regenerates `INVENTORY.tsv` and `CLASSES.tsv`.
 
 Hardware: none of this opens a device. The runtime's device paths have not run on hardware from this tree; every
 hardware tier is NOT_RUN.
