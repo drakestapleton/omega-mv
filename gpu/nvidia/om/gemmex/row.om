@@ -1,0 +1,196 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note One gathered run of the general GEMM (CUDApp#144, src/omega_gpu_gemm_ex.c run_part, scan_bad): n stored elements
+note of type t, packed little-endian in src by the C shell, become core-type elements in dst, or are scanned.
+note ops 0 1 2 (put_core f32 f16 bf16, non-finite as 0), 3 (e4m3 copy, NaN as 0), 4 (FAST_BF16: RNE bf16) give the dst
+note elements written (ops 5 6, the bf16x3 planes, are the x3 unit); 7 gives 1 when any element is non-finite; 8 sets
+note dst[j] = 1 for every non-finite j. Ops 0 1 2 4 7 read the run as words from w (the C shell gives the same bytes as
+note src and w, word aligned), op 3 and the fp8 table runs read it as bytes from src; 9 (t = any | rowbad << 1, src
+note the column flags) sets dst[j] = 1 exactly where the epilogue recomputes.
+note Word constants (Wolfram FromDigits of the hex, base 16): the exponent masks 7f8000007f800000
+note 9187343241974906880, 7f807f807f807f80 9187483429707480960, 7c007c007c007c00 8935278002225314816,
+note 7f7f7f7f7f7f7f7f 9187201950435737471, 7c7c7c7c7c7c7c7c 8970181431921507452; the lane high bits 8000000080000000
+note 9223372039002259456, 8000800080008000 9223512776490647552, 8080808080808080 9259542123273814144, and shifted
+note right by 8 es - 1 the lane ones 4294967297, 281479271743489, 72340172838076673 (Wolfram BitShiftRight).
+note The op and the type come as ot = op | t << 4. tab caches the 256 results of ops 0 1 2 4 for an fp8 type (t 3 4):
+note tab[256] = ot + 1 of the table it holds (0 when none; the C shell gives it zeroed and keeps it for the call).
+
+note the exponent mask of type t, repeated over a word
+fn gx_wm t ulong to ulong
+if eq t 0
+ret ulong 9187343241974906880
+end
+if eq t 1
+ret ulong 9187483429707480960
+end
+if eq t 2
+ret ulong 8935278002225314816
+end
+if eq t 3
+ret ulong 9187201950435737471
+end
+ret ulong 8970181431921507452
+end
+
+note the high bit of every es-byte lane of a word
+fn gx_wh es ulong to ulong
+if eq es 4
+ret ulong 9223372039002259456
+end
+if eq es 2
+ret ulong 9223512776490647552
+end
+ret ulong 9259542123273814144
+end
+
+note the elements e0 .. n - 1 of a last partial word of w, one at a time: 1 when one is non-finite
+fn gx_wtail t ulong n ulong e0 ulong w view ulong 8192 to ulong
+es = gx_es t
+for j ulong sub n e0
+if gx_bad t gx_wel view w add e0 j es
+ret 1
+end
+end
+ret 0
+end
+
+note op 7, the last nw & 7 whole words one at a time after the ones that go eight at a time (a, the lane bits so far)
+fn gx_wrest w view ulong 8192 nw ulong m ulong one ulong a ulong to ulong
+for i ulong and nw 7
+x = xor and get w sub nw add i 1 m m
+a = or a sub x one
+end
+ret a
+end
+
+note op 7: 1 when any of the n elements is non-finite (src/omega_gpu_gemm_ex.c run_bad). A lane x = (v & m) ^ m is 0
+note exactly when its exponent bits are all set, and below the lane high bit always (m leaves the sign bit out). x - one
+note (one = 1 in every lane) sets a lane's high bit only when that lane or a lower one is 0 (a borrow), so the OR over
+note the words has a lane high bit set exactly when an element is non-finite. The whole words go eight at a time with
+note no call per word, then the last nw & 7 one at a time, then the elements of a last partial word. A row past the
+note window traps up front on the read of word nw, as the scan would at word 8192; with that bound known the C compiler
+note drops the per-word bounds checks of the eight-word loop.
+fn gx_wbad t ulong n ulong w view ulong 8192 to ulong
+m = gx_wm t
+one = shr gx_wh gx_es t sub shl gx_es t 3 1
+nw = shr mul n gx_es t 3
+if gt nw 8192
+ret get w nw
+end
+a = ulong 0
+for i ulong shr nw 3
+j = shl i 3
+x = xor and get w j m m
+a = or a sub x one
+x = xor and get w add j 1 m m
+a = or a sub x one
+x = xor and get w add j 2 m m
+a = or a sub x one
+x = xor and get w add j 3 m m
+a = or a sub x one
+x = xor and get w add j 4 m m
+a = or a sub x one
+x = xor and get w add j 5 m m
+a = or a sub x one
+x = xor and get w add j 6 m m
+a = or a sub x one
+x = xor and get w add j 7 m m
+a = or a sub x one
+end
+a = gx_wrest view w nw m one a
+es = gx_es t
+if ne and a gx_wh es 0
+ret 1
+end
+ret gx_wtail t n div shl nw 3 es view w
+end
+
+note the core bits of one element (ops 0 1 2 4)
+fn gx_cv op ulong t ulong u uint to uint
+b = bitcast uint gx_ldf t u
+if not gx_fin b
+ret 0
+end
+if eq op 0
+ret b
+end
+if eq op 1
+ret gx_f2h b
+end
+if eq op 2
+ret shr b 16
+end
+ret gx_f2bf b
+end
+
+note runs of 256 or more fp8 elements (ops 0 1 2 4, t 3 4; ot = op | t << 4) look each byte up in tab, built on first use
+fn gx_tcv ot ulong n ulong src view uchar 65536 tab edit ulong 257 dst edit uchar 65536 ce ulong to ulong
+op = and ot 15
+t = shr ot 4
+k = add ot 1
+if ne get tab 256 k
+for b ulong 256
+put tab b ulong gx_cv op t uint b
+end
+put tab 256 k
+end
+for i ulong n
+gx_put edit dst i ce uint get tab ulong get src i
+end
+ret n
+end
+
+note ops 8 9
+fn gx_scan op ulong t ulong n ulong src view uchar 65536 dst edit uchar 65536 to ulong
+if eq op 9
+for j ulong n
+v = uchar 0
+if ne and t 1 0
+if or ne and t 2 0 ne get src j 0
+v = uchar 1
+end
+end
+put dst j v
+end
+ret n
+end
+es = gx_es t
+for i ulong n
+if gx_bad t gx_get view src i es
+put dst i uchar 1
+end
+end
+ret 0
+end
+
+fn gemm_ex_row ot ulong n ulong src view uchar 65536 w view ulong 8192 tab edit ulong 257 dst edit uchar 65536 to ulong
+op = and ot 15
+t = shr ot 4
+if eq op 7
+ret gx_wbad t n view w
+end
+if ge op 8
+ret gx_scan op t n view src edit dst
+end
+if eq op 3
+for i ulong n
+b = get src i
+if eq and b 127 127
+b = uchar 0
+end
+put dst i b
+end
+ret n
+end
+es = gx_es t
+ce = ulong 2
+if eq op 0
+ce = ulong 4
+end
+if and ge t 3 ge n 256
+ret gx_tcv ot n view src edit tab edit dst ce
+end
+for i ulong n
+gx_put edit dst i ce gx_cv op t gx_wel view w i es
+end
+ret n
+end

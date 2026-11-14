@@ -1,0 +1,962 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note artexp: the decisions of tools/artifact_export.c (offline handoff of one CUDApp GPU realization).
+note This unit reads the command line one argument at a time, checks it against the frozen v1
+note contracts, picks the kernel and its launch shape, writes the attention semantic-spec text, the
+note manifest strings and every message, and decides the exit status. The C shell keeps the library
+note calls (spec init, code generation, cbank arguments, SHA-256, register declaration, QMD templates,
+note export) and the writes to stdout and stderr; it calls them when this unit asks.
+note facts f (ulong 8): 0 OMEGA_GPU_MATMUL_MAX_CTAS, 1 OMEGA_ARTIFACT_OK.
+note token t: the shell copies argv[s 1] (NUL included, at most 131072 bytes) when asked (return 1), the
+note 32 hash bytes (returns 6, 9), or after the export the NUL-separated texts (return 14).
+note state s (ulong 128, all 0 at the start; the shell writes 2 and 3 once, 18, 21..24 after calls):
+note 0 phase, 1 argument index, 2 length of argv[s 1], 3 argc, 4 pending flag, 5 mode (1 matmul,
+note 2 attention), 6 --out index, 7 --contract-id index, 8 its length is 64, 9 the frozen id it names
+note (1 matmul-bf16-v1, 2 gqa-causal-v1), 10 --commit index, 11 its length is 40, 12 it is lowercase
+note hex, 13 m, 14 k, 15 n, 16 q-heads, 17 kv-heads, 18 rc of the last call (int64 bits), 19 grid x of
+note the matmul, 20 log2 GQA, 21 heads per CTA, 22 register peak, 23 declared registers, 24 declared ok,
+note 25 exit status; QMD config 32 threads per block, 33 threads x, 34 grid x, 35 grid y,
+note 36 elements, 37 shared bytes, 38 registers; manifest 40 grid x, 41 grid y, 42..44 block x y z,
+note 45 shared bytes, 46 cbank words, 47 parameter count; 64..75 parameters (offset | size << 16 |
+note pointer << 32); 80..83 the semantic spec id (32 bytes, little-endian words).
+note Returns: 1 load argv[s 1] into t and s 2; 2 + 256 * length: o to stderr, exit s 25;
+note 3 omega_matmul_spec_init(m, k, n, BF16); 4 omega_blackwell_codegen_matmul; 5 ..._matmul_tensor_loop
+note with grid s 19; 6 the spec id into t; 7 the matmul cbank arguments; 8 the attention code with
+note log2 GQA s 20; 9 + 256 * length: SHA-256 of o into t; 10 heads per CTA into s 21; 11 cbank word 14 =
+note q-heads; 12 registers into s 22..24; 13 the QMD templates (rc 1 when either refuses); 14 the export
+note with the 13 NUL-separated manifest texts in o; 15 + 256 * length: o to stdout, exit 0; 0 abort.
+fn ae_s o edit uchar 262144 p ulong w ulong n ulong to ulong
+i = ulong 0
+while lt i n bound 9
+put o add p i uchar and shr w mul i 8 255
+i = add i 1
+end
+ret add p n
+end
+fn ae_nd v ulong to ulong
+n = ulong 1
+x = div v 10
+while ne x 0 bound 20
+n = add n 1
+x = div x 10
+end
+ret n
+end
+fn ae_u o edit uchar 262144 p ulong v ulong to ulong
+w = ae_nd v
+k = add p w
+x = v
+for i ulong w
+k = sub k 1
+put o k uchar add 48 rem x 10
+x = div x 10
+end
+ret add p w
+end
+note ae_d: %d of an int held as int64 bits.
+fn ae_d o edit uchar 262144 p ulong v ulong to ulong
+if ne and shr v 63 1 0
+put o p uchar 45
+ret ae_u o add p 1 sub ulong 0 v
+end
+ret ae_u o p v
+end
+note ae_cp: the NUL-terminated text of t at at, appended at p; returns p after it.
+fn ae_cp o edit uchar 262144 p ulong t view uchar 262144 at ulong to ulong
+q = p
+i = at
+while lt i 262144 bound 262144
+c = get t i
+if eq c uchar 0
+break
+end
+put o q c
+q = add q 1
+i = add i 1
+end
+ret q
+end
+note ae_skip: the offset after the NUL-terminated text of t at at.
+fn ae_skip t view uchar 262144 at ulong to ulong
+i = at
+while lt i 262144 bound 262144
+if eq get t i uchar 0
+ret add i 1
+end
+i = add i 1
+end
+ret i
+end
+fn ae_m8 t view uchar 262144 pos ulong w ulong n ulong to ulong
+for i ulong n
+if ne ulong get t add pos i and shr w mul i 8 255
+ret ulong 0
+end
+end
+ret ulong 1
+end
+note ae_hx: the value of a hex digit, 99 for any other byte.
+fn ae_hx c ulong to ulong
+if and ge c 48 le c 57
+ret sub c 48
+end
+if and ge c 97 le c 102
+ret sub c 87
+end
+if and ge c 65 le c 70
+ret sub c 55
+end
+ret ulong 99
+end
+fn ae_sp c ulong to ulong
+if eq c 32
+ret ulong 1
+end
+if and ge c 9 le c 13
+ret ulong 1
+end
+ret ulong 0
+end
+note ae_num: num() of the C, strtoul(s, &e, 0) in the C locale kept when it ends the text and is at most
+note 0xffffffff, else 0: spaces, a sign, 0x/0X hex when a hex digit follows, 0 octal, decimal; an
+note overflow (ULONG_MAX) is 0; a minus sign negates modulo 2^64.
+fn ae_num t view uchar 262144 n ulong to ulong
+i = ulong 0
+while lt i n bound 262144
+if eq ae_sp ulong get t i 0
+break
+end
+i = add i 1
+end
+ng = ulong 0
+if lt i n
+c = ulong get t i
+if eq c 43
+i = add i 1
+end
+if eq c 45
+ng = ulong 1
+i = add i 1
+end
+end
+b = ulong 10
+if lt i n
+if eq get t i uchar 48
+b = ulong 8
+if lt add i 2 n
+c = ulong get t add i 1
+if or eq c 120 eq c 88
+if lt ae_hx ulong get t add i 2 16
+b = ulong 16
+i = add i 2
+end
+end
+end
+end
+end
+st = i
+v = ulong 0
+ov = ulong 0
+while lt i n bound 262144
+d = ae_hx ulong get t i
+if ge d b
+break
+end
+if gt v div sub sub ulong 0 1 d b
+ov = ulong 1
+end
+v = add mul v b d
+i = add i 1
+end
+if or eq i st ne i n
+ret ulong 0
+end
+if ne ov 0
+ret ulong 0
+end
+if ne ng 0
+v = sub ulong 0 v
+end
+if gt v 4294967295
+ret ulong 0
+end
+ret v
+end
+note ae_flag: 1 --out, 2 --contract-id, 3 --commit, 4 --m, 5 --k, 6 --n, 7 --q-heads, 8 --kv-heads, 0 other.
+fn ae_flag t view uchar 262144 n ulong to ulong
+note s "--out"
+e = ulong 0
+if eq n 5
+e = ulong 1
+e = and e ae_m8 t 0 500186426669 5
+end
+if ne e 0
+ret ulong 1
+end
+note s "--contract-id"
+e = ulong 0
+if eq n 13
+e = ulong 1
+e = and e ae_m8 t 0 7021802786688019757 8
+e = and e ae_m8 t 8 431261316195 5
+end
+if ne e 0
+ret ulong 2
+end
+note s "--commit"
+e = ulong 0
+if eq n 8
+e = ulong 1
+e = and e ae_m8 t 0 8388356097741892909 8
+end
+if ne e 0
+ret ulong 3
+end
+note s "--m"
+e = ulong 0
+if eq n 3
+e = ulong 1
+e = and e ae_m8 t 0 7154989 3
+end
+if ne e 0
+ret ulong 4
+end
+note s "--k"
+e = ulong 0
+if eq n 3
+e = ulong 1
+e = and e ae_m8 t 0 7023917 3
+end
+if ne e 0
+ret ulong 5
+end
+note s "--n"
+e = ulong 0
+if eq n 3
+e = ulong 1
+e = and e ae_m8 t 0 7220525 3
+end
+if ne e 0
+ret ulong 6
+end
+note s "--q-heads"
+e = ulong 0
+if eq n 9
+e = ulong 1
+e = and e ae_m8 t 0 7233173974647123245 8
+e = and e ae_m8 t 8 115 1
+end
+if ne e 0
+ret ulong 7
+end
+note s "--kv-heads"
+e = ulong 0
+if eq n 10
+e = ulong 1
+e = and e ae_m8 t 0 7018130138796338477 8
+e = and e ae_m8 t 8 29540 2
+end
+if ne e 0
+ret ulong 8
+end
+ret ulong 0
+end
+fn ae_mode t view uchar 262144 n ulong to ulong
+note s "matmul"
+e = ulong 0
+if eq n 6
+e = ulong 1
+e = and e ae_m8 t 0 119251603317101 6
+end
+if ne e 0
+ret ulong 1
+end
+note s "attention"
+e = ulong 0
+if eq n 9
+e = ulong 1
+e = and e ae_m8 t 0 8028075828261975137 8
+e = and e ae_m8 t 8 110 1
+end
+if ne e 0
+ret ulong 2
+end
+ret ulong 0
+end
+fn ae_cid t view uchar 262144 n ulong to ulong
+note s "647116fc1ba1e1394982fc8ba181ce565293f160a6b56afc0f02b2128a675704"
+e = ulong 0
+if eq n 64
+e = ulong 1
+e = and e ae_m8 t 0 7162471842286351414 8
+e = and e ae_m8 t 8 4121692394664059441 8
+e = and e ae_m8 t 16 7077516104993093940 8
+e = and e ae_m8 t 24 3906139728515707233 8
+e = and e ae_m8 t 32 3474018477578727989 8
+e = and e ae_m8 t 40 7162519142831109729 8
+e = and e ae_m8 t 48 3616727373085435440 8
+e = and e ae_m8 t 56 3760566390553469240 8
+end
+if ne e 0
+ret ulong 1
+end
+note s "003696e422bba7274877ba9e01a61076ea0f862f32760cbaa06c60f85a115359"
+e = ulong 0
+if eq n 64
+e = ulong 1
+e = and e ae_m8 t 0 3775483481970389040 8
+e = and e ae_m8 t 8 3977302312323527218 8
+e = and e ae_m8 t 16 7293968145964283956 8
+e = and e ae_m8 t 24 3906644189691064624 8
+e = and e ae_m8 t 32 7364007956564697445 8
+e = and e ae_m8 t 40 7017280228115821107 8
+e = and e ae_m8 t 48 4063988723899314273 8
+e = and e ae_m8 t 56 4122257337479160117 8
+end
+if ne e 0
+ret ulong 2
+end
+ret ulong 0
+end
+fn ae_lhex t view uchar 262144 n ulong to ulong
+for i ulong n
+c = ulong get t i
+if not or and ge c 48 le c 57 and ge c 97 le c 102
+ret ulong 0
+end
+end
+ret ulong 1
+end
+note ae_val: the value after a flag.
+fn ae_val s edit ulong 128 t view uchar 262144 to ulong
+k = get s 4
+i = get s 1
+n = get s 2
+if eq k 1
+put s 6 i
+end
+if eq k 2
+put s 7 i
+put s 8 ulong 0
+if eq n 64
+put s 8 ulong 1
+end
+put s 9 ae_cid t n
+end
+if eq k 3
+put s 10 i
+put s 11 ulong 0
+if eq n 40
+put s 11 ulong 1
+end
+put s 12 ae_lhex t n
+end
+if ge k 4
+put s add 9 k ae_num t n
+end
+ret ulong 0
+end
+fn ae_usg o edit uchar 262144 p ulong to ulong
+note s "usage: artifact-export matmul --m M --k K --n N --contract-id HEX --out PREFIX --commit HEX\n"
+p = ae_s o p 6998658028134298485 8
+p = ae_s o p 3275352098986357874 8
+p = ae_s o p 7863412984233621605 8
+p = ae_s o p 3255293755857400929 8
+p = ae_s o p 2336010503560437869 8
+p = ae_s o p 2327833714973548619 8
+p = ae_s o p 7021802786688019757 8
+p = ae_s o p 4992275802573599843 8
+p = ae_s o p 2338623226871881816 8
+p = ae_s o p 3251696002696303184 8
+p = ae_s o p 2338610025220498221 8
+p = ae_s o p 173557064 4
+note s "       artifact-export attention --q-heads H --kv-heads H --contract-id HEX --out PREFIX --commit HEX\n"
+p = ae_s o p 6998629143283769376 8
+p = ae_s o p 3275352098986357874 8
+p = ae_s o p 6998721855778486373 8
+p = ae_s o p 7957695015376221300 8
+p = ae_s o p 7018130138708389152 8
+p = ae_s o p 7722878552682558308 8
+p = ae_s o p 2338323001011350902 8
+p = ae_s o p 8389765627588190280 8
+p = ae_s o p 2334106150831874418 8
+p = ae_s o p 8462031896691885384 8
+p = ae_s o p 6361693212185206900 8
+p = ae_s o p 7596848471616597280 8
+p = ae_s o p 11374235754612 6
+ret p
+end
+note ae_exit: the text o 0..p - 1 to stderr and exit status e.
+fn ae_exit s edit ulong 128 p ulong e ulong to ulong
+put s 0 99
+put s 25 e
+ret add 2 shl p 8
+end
+fn ae_usage s edit ulong 128 o edit uchar 262144 to ulong
+ret ae_exit s ae_usg o 0 2
+end
+note ae_ctr: the commit and frozen-contract refusals; 0 when the arguments pass them.
+fn ae_ctr s edit ulong 128 o edit uchar 262144 to ulong
+if or or eq get s 6 0 eq get s 7 0 eq get s 8 0
+ret ae_usage s o
+end
+p = ulong 0
+if or eq get s 10 0 eq get s 11 0
+note s "--commit must be a 40-hex source revision\n"
+p = ae_s o p 8388356097741892909 8
+p = ae_s o p 7305437230073736480 8
+p = ae_s o p 7307140080464847136 8
+p = ae_s o p 7305808869231632504 8
+p = ae_s o p 8028074707559739936 8
+p = ae_s o p 2670 2
+ret ae_exit s ae_usg o p 2
+end
+if eq get s 12 0
+note s "--commit must be lowercase 40-hex\n"
+p = ae_s o p 8388356097741892909 8
+p = ae_s o p 7305437230073736480 8
+p = ae_s o p 7017578424494418976 8
+p = ae_s o p 7307140080464848243 8
+p = ae_s o p 2680 2
+ret ae_exit s p 2
+end
+md = get s 5
+if eq md 1
+if ne get s 9 1
+note s "contract id is not matmul-bf16-v1\n"
+p = ae_s o p 8386654075301556067 8
+p = ae_s o p 7935469438779025696 8
+p = ae_s o p 8461547236690523247 8
+p = ae_s o p 8515522056226483564 8
+p = ae_s o p 2609 2
+ret ae_exit s p 3
+end
+b = ulong 0
+if gt get s 13 8192
+b = ulong 1
+end
+if gt get s 14 16384
+b = ulong 1
+end
+if gt get s 15 8192
+b = ulong 1
+end
+if ne b 0
+note s "shape outside matmul-bf16-v1 bounds (m<=8192,k<=16384,n<=8192)\n"
+p = ae_s o p 8462017844901668979 8
+p = ae_s o p 7020303013988889460 8
+p = ae_s o p 3559640502715641204 8
+p = ae_s o p 8462090115260755254 8
+p = ae_s o p 4412521754026796142 8
+p = ae_s o p 4412519572481585464 8
+p = ae_s o p 4354466492506650161 8
+p = ae_s o p 2860045451737149 7
+ret ae_exit s p 3
+end
+end
+if eq md 2
+if ne get s 9 2
+note s "contract id is not gqa-causal-v1\n"
+p = ae_s o p 8386654075301556067 8
+p = ae_s o p 7935469438779025696 8
+p = ae_s o p 7146475323396224111 8
+p = ae_s o p 3564086098625000801 8
+p = ae_s o p 10 1
+ret ae_exit s p 3
+end
+b = ulong 0
+if gt get s 16 64
+b = ulong 1
+end
+if gt get s 17 64
+b = ulong 1
+end
+if ne b 0
+note s "heads outside gqa-causal-v1 bounds (hq<=64,hkv<=64)\n"
+p = ae_s o p 8462017904829883752 8
+p = ae_s o p 8171535668735472500 8
+p = ae_s o p 7809650176819408225 8
+p = ae_s o p 7959390383684810285 8
+p = ae_s o p 4412526427079996260 8
+p = ae_s o p 4412531938597549110 8
+p = ae_s o p 170472502 4
+ret ae_exit s p 3
+end
+end
+ret ulong 0
+end
+note ae_mm: the matmul shape checks; returns the spec-init request.
+fn ae_mm s edit ulong 128 o edit uchar 262144 to ulong
+m = get s 13
+k = get s 14
+n = get s 15
+if or or eq m 0 eq k 0 eq n 0
+ret ae_usage s o
+end
+b = ulong 0
+if ne rem m 16 0
+b = ulong 1
+end
+if ne rem n 8 0
+b = ulong 1
+end
+if ne rem k 16 0
+b = ulong 1
+end
+if ne b 0
+p = ulong 0
+note s "matmul-bf16-v1 export needs m%16 == 0, n%8 == 0, k%16 == 0 (got "
+p = ae_s o p 7074429841272234349 8
+p = ae_s o p 7286878580719890790 8
+p = ae_s o p 7308814929777094776 8
+p = ae_s o p 3904943502533026917 8
+p = ae_s o p 7935391128637750560 8
+p = ae_s o p 3184080383941556261 8
+p = ae_s o p 4412718627017812768 8
+p = ae_s o p 2338616595357642784 8
+p = ae_u o p m
+put o p uchar 120
+p = ae_u o add p 1 k
+put o p uchar 120
+p = ae_u o add p 1 n
+note s ")\n"
+p = ae_s o p 2601 2
+ret ae_exit s p 3
+end
+put s 0 5
+ret ulong 3
+end
+note ae_at: the attention head checks and the GQA ratio; returns the attention code request.
+fn ae_at s edit ulong 128 o edit uchar 262144 to ulong
+hq = get s 16
+hk = get s 17
+if or eq hq 0 eq hk 0
+ret ae_usage s o
+end
+if ne rem hq hk 0
+ret ae_usage s o
+end
+r = div hq hk
+l = ulong 0
+while lt shl ulong 1 l r bound 64
+l = add l 1
+end
+if ne shl ulong 1 l r
+p = ulong 0
+note s "GQA ratio is not a power of two\n"
+p = ae_s o p 7598805614076186951 8
+p = ae_s o p 8390045716468801647 8
+p = ae_s o p 8243126013477806368 8
+p = ae_s o p 751951003437657888 8
+ret ae_exit s p 3
+end
+put s 20 l
+put s 0 8
+ret ulong 8
+end
+note ae_chk: every check after the last argument.
+fn ae_chk s edit ulong 128 o edit uchar 262144 to ulong
+x = ae_ctr s o
+if ne x 0
+ret x
+end
+md = get s 5
+if eq md 1
+ret ae_mm s o
+end
+if eq md 2
+ret ae_at s o
+end
+ret ae_usage s o
+end
+fn ae_msg s edit ulong 128 o edit uchar 262144 w ulong n ulong to ulong
+p = ae_s o 0 w n
+ret ae_exit s p 3
+end
+fn ae_prm s edit ulong 128 i ulong off ulong sz ulong pt ulong to ulong
+put s add 64 i or or off shl sz 16 shl pt 32
+ret ulong 0
+end
+fn ae_cfg s edit ulong 128 tb ulong gx ulong gy ulong el ulong sh ulong to ulong
+put s 32 tb
+put s 33 tb
+put s 34 gx
+put s 35 gy
+put s 36 el
+put s 37 sh
+put s 40 gx
+put s 41 gy
+put s 42 tb
+put s 43 1
+put s 44 1
+put s 45 sh
+put s 0 10
+ret ulong 0
+end
+note ae_mmcfg: the matmul launch: CTA (x, y) over 16 x 8 tiles, 32 threads, 1024 shared bytes, three pointer
+note parameters at 0x380, 10 cbank words.
+fn ae_mmcfg s edit ulong 128 to ulong
+m = get s 13
+gy = div m 16
+el = and mul m get s 15 4294967295
+gx = get s 19
+x = ae_cfg s 32 gx gy el 1024
+put s 46 10
+put s 47 3
+for i ulong 3
+x = ae_prm s i add 896 mul i 8 8 1
+end
+ret ulong 7
+end
+note ae_atcfg: the attention launch: 128 threads, q-heads / heads-per-CTA CTAs, (3 * hpc + 1) * 128 * 4 shared
+note bytes, four pointers at 0x380 then eight u32 at 0x3a0, 16 cbank words.
+fn ae_atcfg s edit ulong 128 to ulong
+hq = get s 16
+hp = get s 21
+sh = add mul 3 hp 1
+sh = and mul sh 512 4294967295
+gx = div hq hp
+el = and mul hq 128 4294967295
+x = ae_cfg s 128 gx 1 el sh
+put s 46 16
+put s 47 12
+for i ulong 4
+x = ae_prm s i add 896 mul i 8 8 1
+end
+for i ulong 8
+x = ae_prm s add 4 i add 928 mul i 4 4 0
+end
+ret ulong 11
+end
+fn ae_spec s edit ulong 128 t view uchar 262144 to ulong
+for i ulong 4
+w = ulong 0
+for j ulong 8
+c = ulong get t add mul i 8 j
+w = or w shl c mul j 8
+end
+put s add 80 i w
+end
+ret ulong 0
+end
+note ae_stext: "omega-attention-spec/1\nhead_dim=128\nq_heads=%u\nkv_heads=%u\nlog2_gqa=%u\n", hashed by
+note the shell.
+fn ae_stext s edit ulong 128 o edit uchar 262144 to ulong
+p = ulong 0
+note s "omega-attention-spec/1\nhead_dim=128\nq_heads="
+p = ae_s o p 8386033877510352239 8
+p = ae_s o p 3273676477860570484 8
+p = ae_s o p 7496858609312428147 8
+p = ae_s o p 4426309888593125733 8
+p = ae_s o p 7307195334516027953 8
+p = ae_s o p 1030972513 4
+p = ae_u o p get s 16
+note s "\nkv_heads="
+p = ae_s o p 7233173975486327562 8
+p = ae_s o p 15731 2
+p = ae_u o p get s 17
+note s "\nlog2_gqa="
+p = ae_s o p 8171604718975413258 8
+p = ae_s o p 15713 2
+p = ae_u o p get s 20
+put o p uchar 10
+put s 0 9
+ret add 9 shl add p 1 8
+end
+fn ae_hex o edit uchar 262144 p ulong s view ulong 128 to ulong
+q = p
+for i ulong 32
+w = get s add 80 div i 8
+b = and shr w mul rem i 8 8 255
+for j ulong 2
+d = shr b mul sub 1 j 4
+d = and d 15
+if lt d 10
+put o q uchar add 48 d
+else
+put o q uchar add 87 d
+end
+q = add q 1
+end
+end
+put o q uchar 0
+ret add q 1
+end
+note ae_mmtx: the matmul manifest texts up to the bounds.
+fn ae_mmtx s edit ulong 128 o edit uchar 262144 to ulong
+p = ulong 0
+note s "matmul\0matmul-bf16-v1\0bf16\0fp32\0abs<=1e-5*max(1,abs(ref))\0m="
+p = ae_s o p 7854397001737462125 8
+p = ae_s o p 7377509083436119137 8
+p = ae_s o p 7377459352022365745 8
+p = ae_s o p 14130306676176433 8
+p = ae_s o p 3271074843431494241 8
+p = ae_s o p 3184370909023382069 8
+p = ae_s o p 2983183344158859873 8
+p = ae_s o p 1030553641 4
+p = ae_u o p get s 13
+note s ",k="
+p = ae_s o p 4025132 3
+p = ae_u o p get s 14
+note s ",n="
+p = ae_s o p 4025900 3
+p = ae_u o p get s 15
+note s "\0m<=8192,k<=16384,n<=8192\0"
+p = ae_s o p 3618977893184204032 8
+p = ae_s o p 4049640075044875052 8
+p = ae_s o p 4121136969678728244 8
+p = ae_s o p 50 2
+p = ae_hex o p s
+note s "omega_matmul_bf16\0"
+p = ae_s o p 7020372266091638127 8
+p = ae_s o p 3559640717464006004 8
+p = ae_s o p 54 2
+ret p
+end
+fn ae_attx s edit ulong 128 o edit uchar 262144 to ulong
+p = ulong 0
+note s "gqa-causal-attention\0gqa-causal-v1\0f32-kv\0fp32\0rel<=1e-3,abs<=1e-4\0r>=1,base=0,hq="
+p = ae_s o p 8319662965227876711 8
+p = ae_s o p 7954892360015244385 8
+p = ae_s o p 7021506545597770100 8
+p = ae_s o p 3273098177709957933 8
+p = ae_s o p 7722884132346278262 8
+p = ae_s o p 8214620916834238582 8
+p = ae_s o p 3687714932041477221 8
+p = ae_s o p 7291676601532703020 8
+p = ae_s o p 3184393749937533997 8
+p = ae_s o p 7506427719172972898 8
+p = ae_s o p 15729 2
+p = ae_u o p get s 16
+note s ",hkv="
+p = ae_s o p 263979755564 5
+p = ae_u o p get s 17
+note s ",hd=128\0hq<=64,hkv<=64,hd=128,rows+base<=4096\0"
+p = ae_s o p 15817785760573484 8
+p = ae_s o p 7506432086480023912 8
+p = ae_s o p 7506432086480025195 8
+p = ae_s o p 8030529705426894180 8
+p = ae_s o p 4352011477019489143 8
+p = ae_s o p 232887694397 6
+p = ae_hex o p s
+note s "omega_gqa_attention_causal\0"
+p = ae_s o p 8171604920838221167 8
+p = ae_s o p 8389754706680962913 8
+p = ae_s o p 8319662966067588969 8
+p = ae_s o p 27745 3
+ret p
+end
+note ae_texts: the 13 manifest texts in the order op, contract name, precision, accumulation, tolerance,
+note shape, bounds, semantic spec id, kernel function, minimum driver, requires, tool version,
+note qualification.
+fn ae_texts s edit ulong 128 o edit uchar 262144 to ulong
+p = ulong 0
+if eq get s 5 1
+p = ae_mmtx s o
+else
+p = ae_attx s o
+end
+note s "580.173.02\0sm_121,nvidia-cubin-abi-v8\0cudapp-artifact-export/1\0"
+p = ae_s o p 3329065233924765749 8
+p = ae_s o p 3616776899440685616 8
+p = ae_s o p 7019251898354904113 8
+p = ae_s o p 7002374394533471021 8
+p = ae_s o p 8458604767632779618 8
+p = ae_s o p 8390875903532491108 8
+p = ae_s o p 8675390235105912425 8
+p = ae_s o p 54079886880624 7
+note s "offline-disassembly=PASS;device-load=NOT_RUN;device-exec=NOT_RUN\0"
+p = ae_s o p 3271142103423805039 8
+p = ae_s o p 7882833662175308132 8
+p = ae_s o p 6004214541099560034 8
+p = ae_s o p 3271130008963605563 8
+p = ae_s o p 6075160447930167148 8
+p = ae_s o p 8531335275003335263 8
+p = ae_s o p 7162263158351291241 8
+p = ae_s o p 5644508277368639037 8
+p = ae_s o p 0 1
+put s 0 14
+ret ulong 14
+end
+note ae_done: after the export: t holds the rc name and the error, or the id, the contract id and PREFIX.
+fn ae_done s edit ulong 128 f view ulong 8 t view uchar 262144 o edit uchar 262144 to ulong
+p = ulong 0
+if ne get s 18 get f 1
+note s "artifact-export refused: "
+p = ae_s o p 8386654023577793121 8
+p = ae_s o p 2338619929466004781 8
+p = ae_s o p 4207599498436175218 8
+p = ae_s o p 32 1
+p = ae_cp o p t 0
+note s ": "
+p = ae_s o p 8250 2
+p = ae_cp o p t ae_skip t 0
+put o p uchar 10
+ret ae_exit s add p 1 3
+end
+at = ulong 0
+note s "artifact_id="
+p = ae_s o p 8386654023577793121 8
+p = ae_s o p 1029990751 4
+p = ae_cp o p t at
+at = ae_skip t at
+note s "\nop="
+p = ae_s o p 1030778634 4
+if eq get s 5 1
+note s "matmul"
+p = ae_s o p 119251603317101 6
+else
+note s "gqa-causal-attention"
+p = ae_s o p 8319662965227876711 8
+p = ae_s o p 7954892360015244385 8
+p = ae_s o p 1852795252 4
+end
+note s "\ncontract_id="
+p = ae_s o p 7161130726890365706 8
+p = ae_s o p 263677632372 5
+p = ae_cp o p t at
+at = ae_skip t at
+note s "\ncubin="
+p = ae_s o p 17291372481831690 7
+p = ae_cp o p t at
+note s ".cubin\n"
+p = ae_s o p 2936148669588270 7
+put s 0 99
+ret add 15 shl p 8
+end
+note ae_args: phases 0..3, the command line.
+fn ae_args s edit ulong 128 t view uchar 262144 o edit uchar 262144 to ulong
+ph = get s 0
+i = get s 1
+ac = get s 3
+if eq ph 0
+if lt ac 2
+ret ae_usage s o
+end
+put s 1 1
+put s 0 1
+ret ulong 1
+end
+if eq ph 1
+put s 5 ae_mode t get s 2
+i = ulong 2
+end
+if eq ph 2
+k = ae_flag t get s 2
+if or eq k 0 ge add i 1 ac
+ret ae_usage s o
+end
+put s 4 k
+put s 1 add i 1
+put s 0 3
+ret ulong 1
+end
+if eq ph 3
+x = ae_val s t
+i = add i 1
+end
+put s 1 i
+if lt i ac
+put s 0 2
+ret ulong 1
+end
+ret ae_chk s o
+end
+fn artexp f view ulong 8 s edit ulong 128 t view uchar 262144 o edit uchar 262144 to ulong
+ph = get s 0
+rc = get s 18
+p = ulong 0
+if lt ph 4
+ret ae_args s t o
+end
+if eq ph 5
+if ne rc 0
+note s "spec refused\n"
+p = ae_s o p 7378429047948537971 8
+p = ae_s o p 44634043253 5
+ret ae_exit s p 3
+end
+m = get s 13
+n = get s 15
+gx = div n 8
+put s 0 6
+if eq get s 14 16
+put s 19 gx
+ret ulong 4
+end
+b = div get f 0 div m 16
+if eq b 0
+b = ulong 1
+end
+if gt gx b
+gx = b
+end
+put s 19 gx
+ret ulong 5
+end
+if eq ph 6
+if ne rc 0
+note s "codegen refused\n"
+p = ae_s o p 2336916751408983907 8
+p = ae_s o p 748834984615634290 8
+ret ae_exit s p 3
+end
+put s 0 7
+ret ulong 6
+end
+if eq ph 7
+x = ae_spec s t
+ret ae_mmcfg s
+end
+if eq ph 8
+if ne rc 0
+note s "attention codegen refused: "
+p = ae_s o p 8028075828261975137 8
+p = ae_s o p 7306920402471821422 8
+p = ae_s o p 7310315702801539182 8
+p = ae_s o p 2112100 3
+p = ae_d o p rc
+put o p uchar 10
+ret ae_exit s add p 1 3
+end
+ret ae_stext s o
+end
+if eq ph 9
+x = ae_spec s t
+put s 0 12
+ret ulong 10
+end
+if eq ph 12
+ret ae_atcfg s
+end
+if eq ph 10
+put s 0 11
+ret ulong 12
+end
+if eq ph 11
+put s 38 get s 23
+if eq get s 24 0
+note s "declared registers refused\n"
+p = ae_s o p 7234314139196417380 8
+p = ae_s o p 7310594991672619552 8
+p = ae_s o p 8319668472529318770 8
+p = ae_s o p 681061 3
+ret ae_exit s p 3
+end
+put s 0 13
+ret ulong 13
+end
+if eq ph 13
+if ne rc 0
+note s "QMD template refused\n"
+p = ae_s o p 8101242854141349201 8
+p = ae_s o p 7378429047983071596 8
+p = ae_s o p 44634043253 5
+ret ae_exit s p 3
+end
+ret ae_texts s o
+end
+if eq ph 14
+ret ae_done s f t o
+end
+ret ulong 0
+end

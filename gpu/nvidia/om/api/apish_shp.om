@@ -1,0 +1,900 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Shape, alignment, overflow and refusal decisions for the kernel-family API shells.
+note One ulong result. Multi-field results pack the second field in bits 32..63.
+note op 1 lane bytes, 2 fp8 defaults, 3 register fit, 4 tgemm bm, 5 tgemm spec,
+note 6 tgemm size, 7 tern rows and depth, 8 tern warps and ctas, 9 pad 8,
+note 10 segment bound, 11 segment end, 12 f32 finite, 13 packed bytes, 14 align,
+note 15 tile 8, 16 cta budget, 17 perm4, 18 pf bm, 19 swiglu source, 20 max mkn,
+note 21 decode cache bounds, 22 decode register fit, 23 tern pack args, 24 router rows,
+note 25 router dest, 26 router source, 27 decode splits, 28 power of two, 29 theta.
+note 30 fp8 mt, 31 tc spec, 32 tc warps, 33 round up, 34 window offset, 35 window ok, 36 quant group.
+note 37 qgemm rows, 38 qgemm wait, 39 declared registers at most 128.
+
+fn lane k uint to ulong
+if eq rem k 512 0
+ret ulong 16
+end
+ret ulong 8
+end
+
+fn fp8def mt uint wp uint to ulong
+m = mt
+w = wp
+if eq mt 0
+m = 4
+end
+if eq wp 0
+w = 16
+end
+ret or ulong ulong m shl ulong ulong w 32
+end
+
+fn regfit w uint decl uint to ulong
+p = mul ulong mul ulong 32 ulong w ulong decl
+if le p ulong 65536
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn tgbm rt uint w uint n uint to ulong
+if ne rt 0
+ret mul ulong 16 ulong rt
+end
+ww = w
+if eq w 0
+ww = 16
+if ne rem n 256 0
+ww = 8
+end
+end
+if eq ww 16
+ret ulong 128
+end
+ret ulong 64
+end
+
+fn tgspec rt uint w uint n uint to ulong
+ww = w
+if eq w 0
+ww = 16
+if ne rem n 256 0
+ww = 8
+end
+end
+r = rt
+if eq rt 0
+r = 4
+if eq ww 16
+r = 8
+end
+end
+ret or ulong ulong r shl ulong ulong ww 32
+end
+
+fn tgsz m uint n uint bm uint to ulong
+if or eq m 0 eq bm 0
+ret ulong 1
+end
+if ne rem m bm 0
+ret ulong 1
+end
+if gt div m bm 65535
+ret ulong 2
+end
+if ge mul ulong ulong m ulong n ulong 4294967296
+ret ulong 2
+end
+ret ulong 0
+end
+
+fn take ksc uint r uint d uint best uint lim uint to uint
+if eq d 0
+ret best
+end
+if gt d lim
+ret best
+end
+if ne rem ksc d 0
+ret best
+end
+if gt mul r d 16
+ret best
+end
+if gt d best
+ret d
+end
+ret best
+end
+fn scan ksc uint r uint d0 uint to uint
+best = uint 1
+f = uint 1
+while le mul ulong f ulong f ulong ksc bound 65537
+if eq rem ksc f 0
+q = div ksc f
+best = take ksc r f best d0
+best = take ksc r q best d0
+end
+f = add f 1
+end
+ret best
+end
+fn ctz32 x uint to uint
+if eq x 0
+ret 32
+end
+n = uint 0
+v = x
+while eq and v 1 0 bound 31
+v = shr v 1
+n = add n 1
+end
+ret n
+end
+fn invodd a uint to uint
+x = uint 1
+for i uint 5
+x = mul x sub 2 mul a x
+end
+ret x
+end
+fn largest step uint d0 uint to uint
+if eq step 0
+ret 0
+end
+ret sub d0 rem d0 step
+end
+fn cong0 r uint d0 uint to uint
+inv = invodd r
+best = uint 1
+s = uint 0
+while le s 16 bound 17
+pp = mul s inv
+if and le pp d0 ge pp 2
+if gt pp best
+best = pp
+end
+end
+s = add s 1
+end
+ret best
+end
+fn candhi sg uint inv uint mod uint d0 uint to uint
+pp = and mul sg inv sub mod 1
+if gt pp d0
+ret 0
+end
+ret add pp mul div sub d0 pp mod mod
+end
+fn conghi r uint d0 uint v uint to uint
+g = shl 1 v
+inv = invodd shr r v
+mod = shl 1 sub 32 v
+best = uint 1
+s = uint 0
+while le s 16 bound 17
+if eq rem s g 0
+c = candhi div s g inv mod d0
+if and ge c 2 gt c best
+best = c
+end
+end
+s = add s g
+end
+ret best
+end
+fn cong r uint d0 uint to uint
+v = ctz32 r
+if ge v 5
+d = largest shl 1 sub 32 v d0
+if ge d 2
+ret d
+end
+ret 1
+end
+if eq v 0
+ret cong0 r d0
+end
+ret conghi r d0 v
+end
+fn tdepth ksc uint r uint d0 uint to uint
+d = d0
+while gt d 1 bound 65537
+if eq rem ksc d 0
+if le mul r d 16
+ret d
+end
+end
+d = sub d 1
+end
+ret d
+end
+
+fn ternd k uint lay uint R uint gr uint gd uint to ulong
+nch = div add k 8191 8192
+ksc = uint 0
+if ne nch 0
+ksc = div div k nch 256
+end
+r = gr
+if eq lay 1
+r = R
+end
+if and eq lay 0 eq r 0
+r = 1
+end
+d0 = gd
+if and eq gd 0 ne r 0
+d0 = div 16 r
+end
+d0 = tdepth ksc r d0
+ret or ulong ulong r shl ulong ulong d0 32
+end
+
+fn ternwc w uint ct uint to ulong
+ww = w
+cc = ct
+if eq w 0
+ww = 8
+end
+if eq ct 0
+cc = 160
+end
+ret or ulong ulong ww shl ulong ulong cc 32
+end
+
+fn pad8 n uint to ulong
+ret ulong mul div add n 7 8 8
+end
+
+fn segb i uint cnt uint n uint en uint mu uint to ulong
+if ge add i 1 cnt
+ret ulong n
+end
+if eq mu 2
+if eq cnt 0
+ret ulong 0
+end
+ret ulong mul add i 1 div n cnt
+end
+ret ulong en
+end
+
+fn segend i uint cnt uint n uint en uint pv uint to ulong
+if or eq cnt 0 gt cnt 4
+ret ulong 1
+end
+if eq en 0
+ret ulong 1
+end
+if and ne i 0 le en pv
+ret ulong 1
+end
+if and eq add i 1 cnt ne en n
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn finite u uint to ulong
+if eq and shr u 23 255 255
+ret ulong 0
+end
+ret ulong 1
+end
+
+fn pkbytes e uint k uint to ulong
+ret mul mul ulong add div k 4 1 ulong e ulong 16
+end
+
+fn alignok lo uint mask uint to ulong
+if eq and lo mask 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn tile8 c0 uint to ulong
+if eq rem c0 8 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn ctabud segs uint ov uint to ulong
+if ne ov 0
+ret ulong ov
+end
+if ge segs 64
+ret ulong 2
+end
+if ge segs 8
+ret ulong 12
+end
+ret ulong 96
+end
+
+fn perm4 q uint to ulong
+h = and q 3
+o = uint 0
+if eq h 1
+o = 2
+end
+if eq h 2
+o = 1
+end
+if eq h 3
+o = 3
+end
+ret ulong or and q 4294967292 o
+end
+
+fn pfbm rt uint to ulong
+r = rt
+if eq rt 0
+r = 8
+end
+ret mul ulong 16 ulong r
+end
+
+fn swsrc p uint n uint to ulong
+G = div p 16
+h = rem p 16
+i = uint perm4 add mul 8 G rem h 8
+if lt h 8
+ret ulong i
+end
+ret ulong add div n 2 i
+end
+
+fn maxmnk m uint k uint n uint to ulong
+if or eq m 0 or eq k 0 eq n 0
+ret ulong 0
+end
+if or gt m 8192 or gt k 16384 gt n 262144
+ret ulong 0
+end
+ret ulong 1
+end
+
+fn dcache layers uint mx uint rot uint to ulong
+if or eq layers 0 gt layers 64
+ret ulong 1
+end
+if or eq mx 0 or gt mx 131072 ne rem mx 256 0
+ret ulong 1
+end
+if or lt rot 2 or gt rot 256 ne rem rot 2 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn dreg decl uint to ulong
+if le mul ulong 256 ulong decl ulong 65536
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn tpack n uint k uint lay uint R uint np uint to ulong
+if or eq n 0 ne rem k 16 0
+ret ulong 1
+end
+if lt np n
+ret ulong 1
+end
+step = uint 1
+if eq lay 1
+step = R
+end
+if eq step 0
+ret ulong 1
+end
+if ne rem np mul 2 step 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn rrows s uint to ulong
+if eq s 0
+ret ulong 16
+end
+ret ulong s
+end
+
+fn rtdst g uint ex uint q uint e uint to ulong
+ret ulong add mul add mul g e ex 4 q
+end
+
+fn rtsrc ex uint k uint g uint q uint to ulong
+ret ulong add add mul ex k mul 4 g q
+end
+
+fn dsplit pos uint per uint mx uint to ulong
+p = per
+if eq per 0
+p = 256
+end
+if ne rem p 256 0
+ret ulong 1
+end
+sp = div add pos p p
+if gt sp mx
+ret ulong 2
+end
+ret shl ulong ulong sp 32
+end
+
+fn vy2 v uint to ulong
+if eq v 0
+ret ulong 0
+end
+if eq and v sub v 1 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn thok lo uint hi uint to ulong
+t = bitcast f64 or ulong ulong lo shl ulong ulong hi 32
+if gt t 0.0f64
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn fp8mt mt uint segs uint to ulong
+if ne mt 0
+ret ulong mt
+end
+if lt segs 8
+ret ulong 8
+end
+ret ulong 4
+end
+fn tcsp rt uint ct uint n uint to ulong
+r = rt
+c = ct
+if eq rt 0
+r = 4
+end
+if eq ct 0
+c = 1
+if eq rem n 128 0
+c = 2
+end
+end
+ret or ulong ulong r shl ulong ulong c 32
+end
+fn tcw w uint to ulong
+if eq w 0
+ret ulong 8
+end
+ret ulong w
+end
+fn rup v uint q uint to ulong
+if eq q 0
+ret ulong 0
+end
+ret ulong mul div add v sub q 1 q q
+end
+fn woff kp uint col0 uint to ulong
+ret mul mul ulong div col0 8 ulong kp ulong 16
+end
+fn wok c0 uint cols uint n uint to ulong
+if ne rem c0 8 0
+ret ulong 0
+end
+if eq cols 0
+ret ulong 0
+end
+if gt c0 n
+ret ulong 0
+end
+if gt cols sub n c0
+ret ulong 0
+end
+ret ulong 1
+end
+fn qgrp kb uint to ulong
+g = uint 32
+while and gt g 0 ne rem kb g 0 bound 32
+g = sub g 1
+end
+ret ulong g
+end
+fn qrt rt uint to ulong
+if eq rt 0
+ret ulong 4
+end
+ret ulong rt
+end
+fn qwait set uint w uint to ulong
+if eq set 0
+ret ulong 45
+end
+ret ulong w
+end
+fn le128 d uint to ulong
+if gt d 128
+ret ulong 0
+end
+ret ulong 1
+end
+
+fn roomok n uint pos uint mx uint to ulong
+if eq n 0
+ret ulong 1
+end
+if gt pos mx
+ret ulong 1
+end
+room = sub mx pos
+if gt n room
+ret ulong 1
+end
+ret ulong 0
+end
+fn pa256b m uint pos uint mx uint to ulong
+if gt m 32768
+ret ulong 1
+end
+ret roomok m pos mx
+end
+fn qydiv qh uint pc uint to ulong
+if eq pc 0
+ret shl ulong ulong 1 32
+end
+ret ulong div qh pc
+end
+fn qfbyt rows uint qh uint to ulong
+pairs = div add rows 1 2
+ret mul ulong mul ulong pairs ulong qh ulong 1024
+end
+fn gxatt m uint to ulong
+ret ulong div add m 7 8
+end
+fn kvsb mx uint to ulong
+ret mul ulong mx ulong 512
+end
+fn hostb n uint w uint to ulong
+ret mul ulong mul ulong n ulong w ulong 4
+end
+fn vy16 v uint to ulong
+if gt v 16
+ret ulong 1
+end
+ret ulong 0
+end
+fn splt mx uint to ulong
+ret ulong div mx 256
+end
+fn plane kvh uint mx uint to ulong
+ret add mul ulong mul ulong kvh ulong mx ulong 512 ulong 8256
+end
+fn persok p uint to ulong
+if eq p 0
+ret ulong 1
+end
+if eq p 256
+ret ulong 1
+end
+ret ulong 0
+end
+fn stride need uint got uint mask uint to ulong
+if lt got need
+ret ulong 1
+end
+if ne and got mask 0
+ret ulong 1
+end
+ret ulong 0
+end
+fn mtfit n uint pos uint vy uint to ulong
+smax = add div add pos sub n 1 256 1
+prod = mul ulong mul ulong mul ulong n ulong vy ulong smax ulong 6192
+if gt prod ulong 67108864
+ret ulong 1
+end
+ret ulong 0
+end
+fn mtgrp left uint p0 uint t0 uint vy uint to ulong
+n = left
+if gt n 128
+n = uint 128
+end
+pos = add p0 t0
+while and gt n 1 eq mtfit n pos vy 1 bound 128
+n = sub n 1
+end
+smax = add div add pos sub n 1 256 1
+ret or ulong ulong n shl ulong ulong smax 32
+end
+fn mtbig n uint vy uint sm uint to ulong
+ps = mul ulong mul ulong vy ulong sm ulong 6192
+if gt mul ulong n ulong ps ulong 67108864
+ret ulong 1
+end
+ret ulong 0
+end
+fn smaxp pos uint n uint to ulong
+ret ulong add div add pos sub n 1 256 1
+end
+fn mtps vy uint sm uint to ulong
+ret mul ulong mul ulong vy ulong sm ulong 6192
+end
+fn p2bad v uint to ulong
+if eq v 0
+ret ulong 1
+end
+if ne and v sub v 1 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn nkbad n uint k uint to ulong
+if eq n 0
+ret ulong 1
+end
+if gt n 1073741824
+ret ulong 1
+end
+if eq k 0
+ret ulong 1
+end
+if ne rem k 256 0
+ret ulong 1
+end
+if gt k 16384
+ret ulong 2
+end
+if and gt k 8192 ne rem k 512 0
+ret ulong 2
+end
+ret ulong 0
+end
+fn layok lay uint R uint to ulong
+if gt lay 1
+ret ulong 1
+end
+if and eq lay 1 ne R 2
+if ne R 4
+ret ulong 1
+end
+end
+ret ulong 0
+end
+fn tritok v uint to ulong
+if eq v 0
+ret ulong 1
+end
+if eq v 1
+ret ulong 1
+end
+if eq v 255
+ret ulong 1
+end
+ret ulong 0
+end
+fn qset k uint to ulong
+if ne rem k 128 0
+ret ulong 0
+end
+kb = div k 128
+if le kb 32
+ret ulong 0
+end
+ret qgrp kb
+end
+fn pfargs n uint k uint lay uint to ulong
+if eq n 0
+ret ulong 1
+end
+if eq k 0
+ret ulong 1
+end
+if ne rem n 128 0
+ret ulong 1
+end
+if ne rem k 128 0
+ret ulong 1
+end
+if gt lay 1
+ret ulong 1
+end
+if and eq lay 1 ne rem n 256 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+
+fn apishp op uint a uint b uint c uint d uint e uint to ulong
+if eq op 1
+ret lane a
+end
+if eq op 2
+ret fp8def a b
+end
+if eq op 3
+ret regfit a b
+end
+if eq op 4
+ret tgbm a b c
+end
+if eq op 5
+ret tgspec a b c
+end
+if eq op 6
+ret tgsz a b c
+end
+if eq op 7
+ret ternd a b c d e
+end
+if eq op 8
+ret ternwc a b
+end
+if eq op 9
+ret pad8 a
+end
+if eq op 10
+ret segb a b c d e
+end
+if eq op 11
+ret segend a b c d e
+end
+if eq op 12
+ret finite a
+end
+if eq op 13
+ret pkbytes a b
+end
+if eq op 14
+ret alignok a b
+end
+if eq op 15
+ret tile8 a
+end
+if eq op 16
+ret ctabud a b
+end
+if eq op 17
+ret perm4 a
+end
+if eq op 18
+ret pfbm a
+end
+if eq op 19
+ret swsrc a b
+end
+if eq op 20
+ret maxmnk a b c
+end
+if eq op 21
+ret dcache a b c
+end
+if eq op 22
+ret dreg a
+end
+if eq op 23
+ret tpack a b c d e
+end
+if eq op 24
+ret rrows a
+end
+if eq op 25
+ret rtdst a b c d
+end
+if eq op 26
+ret rtsrc a b c d
+end
+if eq op 27
+ret dsplit a b c
+end
+if eq op 28
+ret vy2 a
+end
+if eq op 29
+ret thok a b
+end
+if eq op 30
+ret fp8mt a b
+end
+if eq op 31
+ret tcsp a b c
+end
+if eq op 32
+ret tcw a
+end
+if eq op 33
+ret rup a b
+end
+if eq op 34
+ret woff a b
+end
+if eq op 35
+ret wok a b c
+end
+if eq op 36
+ret qgrp a
+end
+if eq op 37
+ret qrt a
+end
+if eq op 38
+ret qwait a b
+end
+if eq op 39
+ret le128 a
+end
+if eq op 40
+ret roomok a b c
+end
+if eq op 41
+ret qydiv a b
+end
+if eq op 42
+ret qfbyt a b
+end
+if eq op 43
+ret gxatt a
+end
+if eq op 44
+ret kvsb a
+end
+if eq op 45
+ret hostb a b
+end
+if eq op 46
+ret pa256b a b c
+end
+if eq op 47
+ret vy16 a
+end
+if eq op 48
+ret splt a
+end
+if eq op 49
+ret plane a b
+end
+if eq op 50
+ret persok a
+end
+if eq op 51
+ret stride a b c
+end
+if eq op 52
+ret mtgrp a b c d
+end
+if eq op 53
+ret mtbig a b c
+end
+if eq op 54
+ret smaxp a b
+end
+if eq op 55
+ret mtps a b
+end
+if eq op 56
+ret p2bad a
+end
+if eq op 57
+ret nkbad a b
+end
+if eq op 58
+ret layok a b
+end
+if eq op 59
+ret tritok a
+end
+if eq op 60
+ret qset a
+end
+if eq op 61
+ret pfargs a b c
+end
+ret ulong 0
+end
