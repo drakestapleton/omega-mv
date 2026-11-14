@@ -89,8 +89,11 @@ header of `classes.om` gives the exact rule, and the header of `cfacts.om` the f
 of `CLASSES.tsv` give the counts; this file does not restate them.
 
 A class `b` file is waiting for Omega to produce a library that C can call: its functions are thin C over an Omega
-unit or over a device call. A class `d` file holds bodies that a default build drops (every `CUDAPP_MIGRATION_PENDING_*`
-flag is defined 0 in CUDApp); CUDApp keeps them as the old implementation to compare against.
+unit or over a device call. A class `d` file holds bodies that a default build drops. A default build is CUDApp's
+Makefile build: every `CUDAPP_MIGRATION_PENDING_*` flag is 0 or undefined there, so is `OMEGA_GPU_NO_POSIX` (the
+freestanding build, which keeps C where it cannot call Omega yet), and so is every name a file defines only under
+one of them (for example a `*_C_PRIMARY` name). CUDApp keeps those bodies as the old implementation to compare
+against.
 
 To list the files a rewrite can start on, with their host-logic lines:
 
@@ -104,9 +107,9 @@ To list the files a rewrite can start on, with their host-logic lines:
     { printf 'om2\n'; cat gpu/runtime/classes.om; } | seed/out/omc > classes
     ./classes > gpu/runtime/CLASSES.tsv
 
-The committed `cudapp-cfacts.tsv` has sha256 `705fc7d97dd4afb7e6d909e822ba8f3ae703321bf6535c4fcd5e549a7d12644c`.
+The committed `cudapp-cfacts.tsv` has sha256 `400231a8a9084bf6b3cf6f0e5c8df9dd1ecd8c6f0e358ca6bde1337af7e0916c`.
 The lane that wrote this slice also wrote the same rules separately, outside this repository, as a reference
-program in Python (`cfacts_ref.py`, sha256 `ab808cff555cad8a1017460efb6f0ddc319e3bcc08c7b5035747ddbcbf2e677d`), and
+program in Python (`cfacts_ref.py`, sha256 `89040a9c62562bf226ad4aa21deb8df321400bf01f0fe9c3239e68ea59c1a5ea`), and
 its output on CUDApp was byte for byte the same file. On the two test inputs it gives `check/cfacts.expect.txt`.
 
 ## The scanref oracle
