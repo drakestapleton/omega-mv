@@ -39,6 +39,15 @@ Rules:
 - `test-sh-84b524ca.txt` and `fixture-*.tsv` are outputs of the old implementation, never retyped; only the oracle tier (CUDApp checkout and old omc given) checks gcc's builds and transcript lines 1 and 2
 - no C, Python or shell in this directory; the C test application stays in CUDApp as the foreign program under test
 
+## `bridge/nvml/`
+
+The NVML library slice: one slice of CUDApp `compat/` at `84b524ca` (its `compat/nvml/` files). `libnvidia-ml.c`, `nvml.h` and `libnvidia-ml.map` are omega-bridge output of `gpu/nvidia/native/nvml/api.om`, so they are listed as derived in `derived.tsv` and not stored; the gate (`gate.om`, step `bridge-nvml`) makes them again with a pinned omega-bridge generator and compares digests. See its README.
+
+Rules:
+
+- nothing generated is stored here; a derived file is a row of `derived.tsv` (source, generator and output digests)
+- the omega-bridge generator is an input pinned by digest, never a copy in this tree
+
 ## `docs/autodiff/`
 
 M21 OMEGA_AUTODIFF scope, op and error-contract table, status (not qualified)
