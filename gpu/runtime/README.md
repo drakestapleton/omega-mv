@@ -116,7 +116,9 @@ To list the files a rewrite can start on, with their host-logic lines:
 decision about the API, not a translation. `src/omega_gpu_platform_linux_rest_oracle.h` is itself the old C kept
 to check `gpu/nvidia/om/platform-linux/plat_rest.om` against; `check/platrest-check.om` compares the two, so
 `rewrites.tsv` names that unit. The oracle driver that printed `check/platrest.expect.txt` lives outside this tree,
-with the lane's oracle notes.
+with the lane's oracle notes: `platrest_driver.c`, sha256
+`c999e5e64ad14c6a9ddbe90407350848af7bf480e7c055a7cf8c17f63103b925`; its output, byte for byte
+`check/platrest.expect.txt`, sha256 `a721a22406576aac779e88fce138851d2136fb8b1ef422cdda3cf920c9be616f`.
 
 `cudapp-cfacts.tsv` is regenerated from a CUDApp checkout `../cudapp` at the commit of `cudapp-src.sha256.txt`:
 
@@ -264,8 +266,9 @@ root:
     { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/nativeh.om; } | seed/out/omc > nativeh
     ./nativeh > cudapp_native.h
 
-The units whose parts the inventory reports `absent` cannot be declared from this tree; `nativeh.om` names each
-part on stderr and leaves the unit out. At this base that is unit `c5` (CUDApp `tools/c5/policy.om` and
+The units whose parts the inventory reports `absent` cannot be declared from this tree; `nativeh.om` stops at the
+first absent part of such a unit, names that part on stderr and leaves the unit out. At this base that is unit
+`c5` (CUDApp `tools/c5/policy.om` and
 `tools/c5/runtime.om`, not moved here). `check/nativeh.expect.txt` is therefore CUDApp's header less that unit's
 one line:
 
