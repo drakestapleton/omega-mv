@@ -61,6 +61,20 @@ cd CUDApp && ../inventory ../list.txt ../gpulist.txt ../omega-mv/gpu/nvidia/chec
 
 LABEL is the inputs line, the second line of `INVENTORY.tsv`: it names the CUDApp commit of the checkout and the omega-mv commit whose `gpu/` list was read, so put the commits you actually used there. `inventory` exits 1 in two cases: a `ports.tsv` row names no CUDApp path, or a path appears twice. It exits 2 on a malformed row, on a path that does not fit Linux PATH_MAX, or when it cannot read an input or the host refuses the memory; it reads inputs of any size into memory that grows to fit them.
 
+## Why files are retired
+
+A file is `retired` only when no behaviour of it is left unchecked: it is not a test or tool (prose, session metadata, recorded evidence), or the job it did no longer exists once CUDApp is folded into omega-mv. A test whose behaviour no Omega check covers is never retired; it stays `open` or is `blocked`. Every retired row of `ports.tsv` gives one of these reasons; the rows themselves are the list of files.
+
+| Reason (DETAIL begins) | Why it is safe |
+|---|---|
+| `agent breadcrumb (.crumb)` | Session metadata of the CUDApp lanes. Not a test, a tool or an input to one; nothing reads it. |
+| `recorded evidence of a past run` | A receipt or its log. No `.om`, `.c`, `.h`, `.py`, `.sh`, `.gate` or make file of CUDApp names it, so no test or tool reads it. It records a past run; it checks nothing. |
+| `prose (Markdown)` | Not a test and not an input: nothing runs or reads it. It stays readable in CUDApp history, and each Omega port documents itself in its own README. |
+| `tools/extract drift check` | `drift.sh` failed when Omega's copy of a GPU file moved away from CUDApp after the cutover; `test-drift.sh` tests only `drift.sh`, and `drift-baseline.tsv` is its input. With one copy of each file left there is nothing to drift. |
+| `tools/extract history cut` | Scripts, path lists, maps and outputs of the one-time cut of the CUDA++ history out of the Omega and physics repositories into CUDApp. The cut is not repeated, and no test or tool reads these files. |
+
+Not retired from `tools/extract`: `audit-scan.sh`, its rule files `rules-secrets.txt` and `rules-private.txt`, and its self-tests `audit-selftest.sh` and `audit-error-selftest.sh`. They scan every object of a repository's history for secrets, private data and binaries; that job still applies to omega-mv, which has no Omega replacement for it, so they stay `open`.
+
 ## Oracles
 
 Kept outside the repository by the lane, identified by sha256. Each was run from a CUDApp checkout at `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`, writing the table to stdout.
