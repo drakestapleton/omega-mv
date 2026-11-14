@@ -1,10 +1,11 @@
 # gpu/runtime: CUDApp `src/` (the C runtime) brought into Omega
 
 CUDApp's `src/` is the runtime behind its CUDA-compatible ABI. Most of it was not written by hand. The Omega Bridge
-emitted it from Omega source, and each emitted file has an `.ident` record naming its parts. The rest is hand-written
-C and headers. This directory sorts every file of CUDApp `src/` into one of those classes. Hand-written files are
-rewritten here in seeded Omega, one slice at a time. No C, Python, shell or assembly is kept here. The old C stays
-in CUDApp and serves as the reference (the oracle); it is compiled and run outside this repository.
+emitted it from Omega source, and each emitted file has an `.ident` record naming its parts. No `.ident` record names
+the rest: hand-written C and headers, plus files that other CUDApp generators wrote without one. This directory
+sorts every file of CUDApp `src/` into those classes. Files without a record are rewritten here in seeded Omega, one
+slice at a time. No C, Python, shell or assembly is kept here. The old C stays in CUDApp and serves as the reference
+(the oracle); it is compiled and run outside this repository.
 
 ## What is here
 
@@ -17,8 +18,8 @@ in CUDApp and serves as the reference (the oracle); it is compiled and run outsi
 | `cudapp-ident.txt` | input: every CUDApp `src/*.ident` record, concatenated |
 | `omega-base.sha256.txt` | input: `sha256sum` of every file under `src/` and `gpu/` of this repository at the base |
 | `pathmap.tsv` | input: where a CUDApp Omega path (`om/`, `native/`, ...) lives in this tree |
-| `rewrites.tsv` | input: a hand-written CUDApp file and the Omega file here that replaces it |
-| `scanref.om` | rewrite of `src/omega_gpu_scan_ref.c` (OM-1): the host scan, prefix sum and radix sort references |
+| `rewrites.tsv` | input: a CUDApp file without a record and the Omega file here that replaces it |
+| `scanref.om` | rewrite of CUDApp's `src/omega_gpu_scan_ref.c` (OM-1): the host scan, prefix sum and radix sort references |
 | `check/scanref-check.om`, `check/scanref.expect.txt` | the scanref check program and the old C's output it must match |
 | `checks.tsv` | the gate's checks: parts to compose, expected output, and a source mutation that must be caught |
 | `controls.tsv` | the gate's inventory controls: an input byte changed, and how the inventory must notice |
@@ -28,49 +29,72 @@ The headers of `inventory.om` and `gate.om` define their columns, fields and exi
 
 ## The inventory at this base
 
-The last summary line of `INVENTORY.tsv` gives the counts. It is the source; this file does not restate them. Every
-file is one of three kinds:
+The last summary lines of `INVENTORY.tsv` give the counts. They are the source; this file does not restate them.
+Every file has one of three origins:
 
 - `record`: an `.ident` file.
 - `bridge`: emitted by the Omega Bridge. The row says whether its parts are in this tree and compose to the
   recorded source (`same`), compose to something else (`changed`), or are missing here (`absent`).
-- `hand`: written by hand. The row says whether it has been `rewritten` (with the Omega path), or `none`.
+- `unrecorded`: no `.ident` record names it. The row says whether it has been `rewritten` (with the Omega path), or
+  `none`. Not all of them were written by hand. For example, CUDApp `om/native-freest.sh` generates
+  `src/cudapp_freest_pathcopy.c` from `om/components/pathcopy.om` (here `gpu/nvidia/om/components/pathcopy.om`),
+  and CUDApp `om/units.sh` generates `src/cudapp_native.h`. Neither writes a record, so both are `unrecorded`. The
+  inventory cannot tell these apart from hand-written files, because it reads only the lists, never CUDApp's files.
 
-To list the hand files that are not yet rewritten:
+To list the unrecorded files that are not yet rewritten:
 
-    awk -F'\t' '$4=="hand" && $5=="none"' gpu/runtime/INVENTORY.tsv
+    awk -F'\t' '$4=="unrecorded" && $5=="none"' gpu/runtime/INVENTORY.tsv
+
+The `omega_src` column compares each CUDApp path with the file of the same path in this repository's base list
+(`identical`, `diverged` or `cudapp-only`). This repository's own `src/` holds older copies of many CUDApp files.
+`scanref.om` replaces CUDApp's `src/omega_gpu_scan_ref.c`, the oracle below. It does not replace this repository's
+own `src/omega_gpu_scan_ref.c`, which is one of those older copies (`diverged` from CUDApp's) and stays as it is.
 
 ## Regenerating the inputs
 
 Run these from a directory that holds a CUDApp checkout `cudapp/` at the source commit and this repository
-`omega-mv/`. The inventory at this base used CUDApp `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66` and omega-mv base
-`f7a068ec54d67ccad504cf5e5887376916158b7b`. All three commands were checked to reproduce the committed files byte
-for byte.
+`omega-mv/` (`BASE` is the base commit of this repository):
 
     (cd cudapp && find src -type f | LC_ALL=C sort | xargs sha256sum) > omega-mv/gpu/runtime/cudapp-src.sha256.txt
     (cd cudapp && find src -name '*.ident' -type f | LC_ALL=C sort | xargs cat) > omega-mv/gpu/runtime/cudapp-ident.txt
     (cd omega-mv && git ls-tree -r --name-only BASE src gpu | LC_ALL=C sort | xargs sha256sum) > omega-mv/gpu/runtime/omega-base.sha256.txt
+
+The committed lists came from CUDApp `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66` and omega-mv base
+`f7a068ec54d67ccad504cf5e5887376916158b7b`. That is recorded here only. The lists themselves carry no commit, and
+the gate cannot check the CUDApp commit, because CUDApp is not in this repository.
 
 Then rebuild the inventory and write its output:
 
     { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/inventory.om; } | seed/out/omc > inventory
     ./inventory > gpu/runtime/INVENTORY.tsv
 
-The inventory refuses to run (exit 3) when a Bridge source part in this tree differs from `omega-base.sha256.txt`.
-When that happens, the list is stale: regenerate it.
+The inventory hashes the files of this tree that it names, and it refuses to run (exit 3) when any of them no longer
+matches `omega-base.sha256.txt`. That covers every Bridge source part and every file at a CUDApp path (`identical`
+or `diverged`). It also refuses when a `cudapp-only` path now exists in the tree. When that happens, the list is
+stale: regenerate it.
 
 ## The scanref oracle
 
-`check/scanref.expect.txt` is the output of the old C. It was produced by a driver kept outside this repository
-(`scanref_driver.c`, sha256 `0861c617842414d024db4ae95de0d45fb8f0cd74ca8037c43940d6aedb3b6fa7`). The driver was built
-against CUDApp `84b524ca` `src/`:
+`check/scanref.expect.txt` is the output of the old C. A driver kept outside this repository produced it. The
+driver, its output and the build commands are kept in
+`~/handoffs/hive/cuda-in-20261114/oracles/RuntimeC/` on spark-b87b:
+
+- `scanref_driver.c`: sha256 `0861c617842414d024db4ae95de0d45fb8f0cd74ca8037c43940d6aedb3b6fa7`.
+- `scanref.expect.txt`: byte for byte the same as `check/scanref.expect.txt`.
+
+The driver was built against CUDApp `src/` at the commit above:
 
     cc -std=c11 -O1 -ffp-contract=off -Icudapp/src scanref_driver.c cudapp/src/omega_gpu_scan_ref.c \
        cudapp/src/cudapp_om_av_scan.c cudapp/src/cudapp_om_ar_carry.c -lm -o scanref_oracle
     ./scanref_oracle > scanref.expect.txt
 
-The Omega check prints the same 25 lines, built from the same inputs in the same order. The C was compiled and run
+The Omega check prints the same lines, built from the same inputs in the same order. The C was compiled and run
 only to produce that file; it is not part of this repository.
+
+The oracle and the check share code. `cudapp_om_av_scan.c` and `cudapp_om_ar_carry.c` are Bridge output of
+`scan.om` and `scancarry.om`, and the check composes `gpu/nvidia/om/apiviews/scan.om` itself. So the comparison
+proves the rewritten driver logic only: levels, carries, the radix passes and the handling of bad arguments. It does
+not independently check the 32-wide tile scan, which both sides take from the same Omega source.
 
 ## The gate
 
@@ -86,18 +110,24 @@ The gate takes these steps:
 1. It checks the compiler against `seed/out/omc.sha256`.
 2. It runs each row of `checks.tsv`: compose the parts, compile, run, and compare the output with the expected file.
    It then applies the row's mutation, which must change the output or the exit status.
-3. It reruns the inventory on an unchanged copy of its inputs, which must reproduce `INVENTORY.tsv`.
-4. It runs each row of `controls.tsv`, each on a copy with one byte changed.
-5. It checks that a compiler one byte longer is refused.
+3. It checks that each `rewrites.tsv` row's Omega file is one of the parts of some check row. As a control, a path
+   that is only a prefix of that Omega file must not match.
+4. It reruns the inventory on an unchanged copy of its inputs, which must reproduce `INVENTORY.tsv`.
+5. It runs each row of `controls.tsv`, each on a copy with one byte changed.
+6. It checks that a compiler one byte longer is refused.
 
 Its last line is `OMEGA-GPU-RUNTIME PASS|FAIL checks=N controls=C caught=K hardware=NOT_RUN`. A PASS needs at least
 one check, no FAIL line, and K equal to C.
+
+That is all the gate checks. It does not check the CUDApp commit, or that a file of `INVENTORY.tsv` is really
+hand-written. It does not rerun the C oracle. It does not check that a rewrite covers every function of the C file,
+beyond what its check program prints.
 
 A new rewrite slice adds four things:
 
 - the Omega file;
 - its check program and the oracle's output;
-- one row in `checks.tsv`;
+- at least one row in `checks.tsv` whose parts include the Omega file;
 - one row in `rewrites.tsv`.
 
 It then regenerates `INVENTORY.tsv`.
