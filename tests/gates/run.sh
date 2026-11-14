@@ -197,7 +197,7 @@ case "$step" in
     [ "$rc" -eq 0 ] || exit "$rc"
     grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
-  # Omega driver-client logic moved from CUDApp nvrm/ and m16/ (gpu/nvidia/driver/): the gate is seeded Omega,
+  # One slice of the CUDApp merge: new Omega for part of the C decision logic of CUDApp nvrm/ and m16/ (gpu/nvidia/driver/). The gate is seeded Omega,
   # gpu/nvidia/driver/gate.om, composed in the order of gpu/nvidia/driver/parts.txt and built by seed/out/omc after its
   # digest is checked. It recomputes every case the C oracle printed (oracle-cases.tsv) and runs one changed-answer
   # control per case kind. The expected case count is counted from the table. Host only; it opens no device.

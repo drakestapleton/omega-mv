@@ -1,7 +1,8 @@
 # gpu/nvidia/driver
 
-Omega form of part of the decision logic still written in C in CUDApp `nvrm/` and `m16/` (CUDApp main
-84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66), with the gate that checks it against that C.
+One slice of the CUDApp merge, not the move of a directory: new Omega for part of the decision logic still
+written in C in CUDApp `nvrm/` and `m16/` (CUDApp main 84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66), with the
+gate that checks it against that C.
 
 Much of `nvrm/` and `m16/` was already in Omega before this directory: `gpu/nvidia/native/nvrm/`
 (policy, VA allocator, struct packing, RM and UVM wire, the GB10 driver client `context.om`) and
@@ -49,8 +50,8 @@ shell script). See "The oracle".
 
 ## The oracle
 
-The C oracle is kept outside this tree, because only Omega goes in it. Its durable copy is
-`~/handoffs/hive/cuda-in-20261114/oracles/DriverC/` on spark-b87b:
+The C oracle is kept outside the repository by the lane that wrote this directory, because only Omega goes
+in it. Its files are identified by sha256:
 
 | File | sha256 | Does |
 |---|---|---|
@@ -87,8 +88,10 @@ Not rewritten here, and not checked by this gate:
   compared with this C;
 - decisions inside those device functions: the count bound in `m16_native_enqueue_methods`, the slot
   search in `m16_native_alloc_memory`, `nvrm_chan_put`, the range checks in `copy_live`, the size checks in
-  `alloc_with_cacheability`, the SM86 check in `nvrm_alloc_vram`, the `nvrm_chan_retire` guard, and the C
-  branch of `m16_gpu_wait_failure_class` (its Omega branch is `eng.om`);
+  `alloc_with_cacheability`, the SM86 check in `nvrm_alloc_vram`, the `nvrm_chan_retire` guard, the C
+  branch of `m16_gpu_wait_failure_class` (its Omega branch is `eng.om`), and the null-pointer refusal at
+  the top of `m16_native_wait_marker_ge` (`!marker` returns -1). `drv_wait_ge` takes a mapping handle and
+  an offset, not a pointer, so that check belongs to whoever makes the mapping; nothing in Omega makes it yet;
 - the C test programs of `nvrm/` and `m16/` and the seccomp fixture `nvrm/native_ioctl_fixture.h`.
 
 ## Limits
