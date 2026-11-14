@@ -1,6 +1,6 @@
 # gpu/nvidia/checks: Omega checks for part of CUDApp tests and tools
 
-CUDApp keeps its tests and tools in C, Python and shell (`tests/`, `tools/`). This directory is one slice of porting them to Omega, not the whole port: two checks (`leftovers` and `gdn_admit`) with the tables of expected values they read, their gate, and an inventory that lists every file of `tests/` and `tools/` with its status, so what is still open is counted in `INVENTORY.tsv` rather than claimed done.
+CUDApp keeps its tests and tools in C, Python and shell (`tests/`, `tools/`). This directory is one slice of porting them to Omega, not the whole port: the checks listed in `checks.tsv` with the tables of expected values they read, their gate, and an inventory that lists every file of `tests/` and `tools/` with its status, so what is still open is counted in `INVENTORY.tsv` rather than claimed done.
 
 ## What is here
 
@@ -70,11 +70,15 @@ Kept outside the repository by the lane, identified by sha256. Each was run from
 | `leftovers_oracle.c` | `4a3fb73154fbaf31ccc50badb0902605c113360e97f00908d4b65831a41bd0c1` | `leftovers.tsv` | `gcc -std=gnu11 -O1 -Wall -I<CUDApp>/src -o leftovers_oracle leftovers_oracle.c` |
 | `gdn_oracle.c` | `7038e63b0e003dbaa4d8f525619eb73f083d02886e12c584d565f3b90a0b117e` | `gdn_admit.tsv` | `gcc -std=gnu11 -O1 -Wall -I<CUDApp>/src -I. -o gdn_oracle gdn_oracle.c` (with `shape_extract.c` beside it) |
 | `shape_extract.c` | `7b4013331e36ecae3e07e3573e4d156982f618ac6cb517c71dbad4ae5ff20681` | (included by `gdn_oracle.c`) | `omega_gdn_shape`, copied unchanged from `src/omega_blackwell_codegen_gdn.c` lines 206 to 220, because that file does not build alone |
+| `streams_oracle.c` | `94fe9d5c9fe6d16f29b54e0fd1035346f072ef05dc992f5511d43ec854e94cf8` | `streams.tsv` | `sh build.sh <CUDApp>` (with `streams_oracle.c` beside it), then `./streams_oracle` |
+| `streams_extract.c` | `72cf19d81d947b3392e13b358c602543818aa7a48cd07af92b476e56116ebafb` | (included by `streams_oracle.c`) | written by `build.sh`: the C side of the streams generator, cut by line range from `src/omega_gpu_cmdlist.c` (`emit_tail`, `emit_stamp`, `emit_inline_qmd`, `emit_chunk_c`, the C branch of `pair_marker` and the defines they use), `src/omega_gpu_platform_linux.c` (`channels_c`) and `src/omega_gpu_session.c` (`xq_admit_c`) |
+| `build.sh` | `41f43913bd00b794841bda1b331c28aa5971b84a66858f0b2c8dc472a9f05af4` | `streams_extract.c`, `streams_oracle` | `gcc -std=gnu11 -O1 -Wall -I<CUDApp>/src -I<CUDApp>/nvrm -I. -o streams_oracle streams_oracle.c` |
 
 Which rows are the C's answers:
 
 - `gdn_admit.tsv`: every row. `gdn_oracle.c` calls the pending C `src/omega_gpu_gdn_admit.c` (`CUDAPP_MIGRATION_PENDING_C_GDN_ADMIT`) and `omega_gdn_shape` on the domain of `tests/gdn_admit_diff.c`.
 - `leftovers.tsv`: the `byte` and `path` rows and the `op` rows of ops 2, 3 and 4 are answers of the pending C (`CUDAPP_MIGRATION_PENDING_LEFTOVERS`) in `src/omega_path_check.h`, `src/omega_gpu_q36_native.h` (`omega_q36_native_record_status`, op 2) and `src/omega_numeric_lifecycle.h` (`omega_numeric_native_acquire` for op 3, `omega_numeric_native_uncertain` for op 4). The rows of ops 1, 5 and 6 are the values `tests/leftovers_test.c` asserts, written as its formulas: the pending C of those ops sits inside functions that need a device context and a lookup result, so there is no standalone C to call.
+- `streams.tsv`: every row. `streams_oracle.c` runs the C test's sweep (`tests/streams_diff_test.c` and `omega_gpu_cmdlist_streams_diff_sweep`) through the C side only. A chunk row holds, for one wait mask, independence mask, mode and barrier, the chunk count, the word total and an FNV-1a-64 digest of every chunk the C emits over the remaining options, so every word of the sweep is compared without storing each one.
 
 ## Checks
 
@@ -82,6 +86,7 @@ Which rows are the C's answers:
 |---|---|---|---|
 | `leftovers` | `tests/leftovers_test.c` | `gpu/nvidia/om/components/pathcopy.om`, `leftovers.om` | The NULL-pointer cases (`tests/leftovers_test.c` lines 41, 42, 47), which exist only in the C binding (`omega_path_check.h`); Omega has no null view. The acquire, release and poison state changes of lines 57 to 64, which act on the C atomic `omega_numeric_native_state`: host C state with no Omega unit. Line 54 (`omega_q36_native_record_status`) is covered by the op 2 rows. |
 | `gdn_admit` | `tests/gdn_admit_diff.c` | `gpu/nvidia/om/gdn/admit.om` (all eight ops: shape, alloc, layer, finite, multi, tokens, prefill layout, move) | Nothing: the table holds the C test's whole domain, each case with the C oracle's verdict and outputs. The C test also checks that some but not all cases are admitted; the table holds both kinds. |
+| `streams` | `tests/streams_diff_test.c` | `gpu/nvidia/om/streams/streams.om` (setup, launch, inline header, finish, channels, pair marker), `xq.om` | The `CUDAPP_STREAMS_DIFF_LOG` hook, which only logs in the C binding. The check assembles the chunk as the C binding `emit_chunk_om` does (launch words, then the inline QMD header and the 96 QMD words when the launch says inline). One mutant was tried and left out because the C domain cannot tell it apart: the inline header's `shr va 40` mask (`511` to `255`) changes nothing for the sweep's QMD addresses, which are below 2^48. |
 
 `tests/pathcopy_mutants.py` became the rows of `mutants.tsv` for check `leftovers` whose part is `pathcopy.om`. Each Python mutant is written as the one line of `pathcopy.om` it changes; the gate kills each one through the `leftovers` check, as the Python did through `tests/leftovers_test.c`.
 
