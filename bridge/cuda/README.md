@@ -14,10 +14,10 @@ CUDApp `compat/` held two C files, two shell scripts and a set of tables.
 | `compat/cuda/fixture/vadd_drv.c` | A small CUDA Driver API program written as the test subject: one context, one PTX module, three buffers, one kernel launch, and a check of the result on the host. | Stays in CUDApp. It is the foreign application under test, not part of Omega; the gate's oracle tier compiles it with gcc outside the tree. |
 | `compat/nvml/libnvidia-ml.c` (with `nvml.h`, `libnvidia-ml.map`) | A replacement for 11 functions of NVIDIA's monitoring library. It is generated C, emitted by the omega-bridge C-ABI emitter from the Omega unit that is already in this tree as `gpu/nvidia/native/nvml/api.om`. | Not copied: the Omega source is already here. The C exists only because `omc` cannot yet emit a shared library; see `EXTENSION-PROPOSAL.md`. |
 | `compat/cuda/build.sh` | Builds the test program for AArch64 and x86-64 with gcc. To link it, it makes a placeholder `libcuda.so.1` that defines every `cu*` name the program uses as 0, with no code. | The placeholder library is written by `fixture.om` (mode `stub`), byte-exact with what `ld` makes, so the old gcc build linked against it gives the same executables. The gcc compile itself stays outside, run by the gate's oracle tier. |
-| `compat/cuda/test.sh` | Rebuilds twice and requires the same bytes, checks the three profile generations list the same CUDA calls, admits both current profiles, then makes 14 broken variants and requires each to be refused. | `gate.om`, step for step, with the same transcript. |
+| `compat/cuda/test.sh` | Rebuilds twice and requires the same bytes, checks the three profile generations list the same CUDA calls, admits both current profiles, then makes 14 broken variants and requires each to be refused. | `gate.om`, with the same checks in the same order and two differences: "rebuild twice with gcc" becomes "synthesize twice with `fixture.om`", and the two "built ISA" lines (transcript lines 1 and 2, which name gcc's executable hashes) are not reproduced; only the oracle tier compares them. |
 | `compat/cuda/fixture/vadd_u32.ptx` | The GPU kernel (a vector add), written by hand in PTX. | Inside `fixture.om` (mode `ptx`), written out byte for byte; the gate checks its SHA-256 against the profiles. |
-| `compat/cuda/profile-c0-{aarch64,x86_64}-v{1,2,3}.tsv` | The frozen profiles: which libraries, versioned C symbols, CUDA calls, PTX instructions and file hashes are allowed. v3 is current; v1 and v2 are kept unchanged as history. | Here, byte for byte (same git blob ids). |
-| `compat/cuda/c0_check.om` | The checker that reads a profile, an executable and a PTX file and admits or refuses. Already Omega. | Here, unchanged. |
+| `compat/cuda/profile-c0-{aarch64,x86_64}-v{1,2,3}.tsv` | The frozen profiles: which libraries, versioned C symbols, CUDA calls, PTX instructions and file hashes are allowed. v3 is current; v1 and v2 are kept unchanged as history. | Here, byte for byte (same git blob ids), pinned by `copied.tsv`. |
+| `compat/cuda/c0_check.om` | The checker that reads a profile, an executable and a PTX file and admits or refuses. Already Omega. | Here, unchanged, pinned by `copied.tsv`. |
 
 ## Files
 
@@ -26,8 +26,9 @@ CUDApp `compat/` held two C files, two shell scripts and a set of tables.
 | `c0_check.om` | The checker: `c0_check check PROFILE EXE PTX RUNISA` (exit 0 admitted, 1 refused) and `c0_check emit PROFILE EXE PTX` (prints what it read). Build: `cat gpu/nvidia/om/cache/digest.om bridge/cuda/c0_check.om \| seed/out/omc`. |
 | `fixture.om` | Writes the test inputs. `fixture ptx OUT` writes the kernel. `fixture stub PROFILE OUT` writes the link-only `libcuda.so.1` for the profile's ISA, with its symbol table in the order GNU `ld` uses (GNU-hash bucket, then ld's own hash slot), which is what makes gcc's link reproduce the frozen hashes. `fixture exe TABLE PROFILE full\|nolib OUT` writes a small executable that the checker reads exactly as it reads gcc's (built from a `fixture-*.tsv` table), so the gate does not need a C compiler. Build: `seed/out/omc < bridge/cuda/fixture.om`. |
 | `fixture-aarch64.tsv`, `fixture-x86_64.tsv` | What `c0_check emit` reads from the real gcc executables. They are derived, not typed: the gate's oracle tier recomputes them from gcc's output and refuses any difference. |
+| `copied.tsv` | SHA-256 and name of each file copied unchanged from CUDApp `compat/cuda/` (the six profiles and `c0_check.om`). Made by `sha256sum` over the CUDApp files, not typed. Every run checks the files here against it; the oracle tier checks the CUDApp files against it, so a stale table or an edited copy fails. |
 | `gate.om` | The gate (below). Build: `{ printf 'om2\n'; cat seed/ng/sha256.om bridge/cuda/gate.om; } \| seed/out/omc`. |
-| `test-sh-84b524ca.txt` | The output of CUDApp's `test.sh` at `84b524ca`, run with omc `2c824805`. The gate's own transcript must equal it from line 3 on (lines 1 and 2 are the gcc build hashes, which only the oracle tier can reproduce). |
+| `test-sh-84b524ca.txt` | The output of CUDApp's `test.sh` at `84b524ca`, run with omc `2c824805`. The gate's own transcript must equal it from line 3 on. Lines 1 and 2 are the gcc build hashes, which only the oracle tier can reproduce: an edit of lines 1 or 2 is caught only by the oracle tier, never by a default run. |
 | `EXTENSION-PROPOSAL.md` | What `omc` would need to emit the NVML library itself. |
 
 ## The gate
@@ -43,17 +44,21 @@ variant has no CUDA import; pins copies of the v3 profiles to the synthetic hash
 v1/v2/v3 CUDA import lists are equal; admits both profiles; and refuses the 14 broken variants of
 `test.sh` (wrong ISA, wrong executable, edited hash, dropped or added import, unsupported status,
 wrong schema, libc floor, `dlsym`-style lookup, missing library, missing libcuda, barrier and
-two-statement PTX). The lines it records must equal `test-sh-84b524ca.txt` from line 3.
+two-statement PTX). The lines it records must equal `test-sh-84b524ca.txt` from line 3. It then
+checks the import-list limit at its edge (below) and the `copied.tsv` digests.
 
 With `BRIDGE_CUDA_CUDAPP` (a CUDApp checkout at `84b524ca`) and `BRIDGE_CUDA_OLDOMC` (omc
 `2c824805…`) set, it also runs the old `test.sh` and requires its whole output to equal the
-stored file; links gcc's objects against the Omega `libcuda.so.1` stub and requires the frozen v3
-executable hashes; and requires the checker's reading of gcc's executables to equal the
-`fixture-*.tsv` tables.
+stored file, lines 1 and 2 included; links gcc's objects against the Omega `libcuda.so.1` stub
+and requires the frozen v3 executable hashes; requires the checker's reading of gcc's executables
+to equal the `fixture-*.tsv` tables; and requires CUDApp's own `compat/cuda` files to have the
+`copied.tsv` digests. Only this tier shows that gcc links against the stub to the frozen
+executables. Last oracle run (fresh clone of this branch, `oracle=PASS`):
+`~/work/hive/cuda-in-20261114/CompatCuda/fresh-oracle.log` on spark-b87b.
 
 The run then rebuilds `c0_check` with its "missing row" refusal removed and requires the gate to
-fail with it. The last line is `BRIDGE-CUDA PASS checks=N failed=0 oracle=NOT_RUN|PASS
-hardware=NOT_RUN`.
+fail with it. The last line is `BRIDGE-CUDA PASS checks=27 failed=0 oracle=NOT_RUN
+hardware=NOT_RUN`, or `checks=34 … oracle=PASS` with the oracle tier; `run.sh` pins both counts.
 
 | Tier | Verdict |
 |---|---|
@@ -64,5 +69,9 @@ hardware=NOT_RUN`.
 ## Limits
 
 The checker refuses, rather than truncates, a profile or PTX over 64 KiB and an executable over
-1 MiB (exit 3), as the C-era checker did. The gate and fixture writer refuse cleanly when an input
-passes their buffers (16 MiB for files, 2,097,152 import names).
+1 MiB (exit 3), as the C-era checker did. The fixture writer and the gate refuse files of 16 MiB
+or more. The gate reads the three profile versions of one ISA into one 16 MiB buffer, so that is
+the limit that binds the import comparison: every run writes three versions totalling 16,777,215
+bytes, which must be read and compared, and 16,777,216 bytes, which must be refused. The name
+table behind it (2,097,152 entries) cannot fill under that buffer: an indexed row is at least
+12 bytes, and 16,777,216 / 12 rounds down to 1,398,101.

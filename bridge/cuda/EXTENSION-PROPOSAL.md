@@ -99,9 +99,10 @@ export fn nvmlShutdown to int
 
 The dynamic-section layout is not new work: `bridge/cuda/fixture.om` already writes an `ET_DYN`
 library from Omega (the link-only `libcuda.so.1` stub: `.dynstr`, `.dynsym`, `.hash`, `.dynamic`
-with `DT_SONAME`, symbols in GNU `ld`'s own order) and the `bridge-cuda` gate proves gcc links
-against it to the byte-identical executables of the frozen profiles. The compiler change adds
-code, relocations and imports to that layout.
+with `DT_SONAME`, symbols in GNU `ld`'s own order). The `bridge-cuda` gate's oracle tier (run with
+`BRIDGE_CUDA_CUDAPP` and `BRIDGE_CUDA_OLDOMC` set) shows gcc links against it to the
+byte-identical executables of the frozen profiles; a default run does not run gcc and does not
+show this. The compiler change adds code, relocations and imports to that layout.
 
 ## How it would be accepted
 

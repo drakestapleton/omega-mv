@@ -29,6 +29,16 @@ Rules:
 
 - canonical bitmap format is the contract; never reuse previous pass results; no CUDA symbols in AIEN binaries
 
+## `bridge/cuda/`
+
+The CUDA compatibility profile moved from CUDApp `compat/cuda/` at `84b524ca`, in Omega only: the profile checker (`c0_check.om`), the frozen profiles, the fixture writer that makes the PTX, the link-only `libcuda.so.1` stub and synthetic executables (`fixture.om`), and the gate (`gate.om`, step `bridge-cuda`) that replays CUDApp's `test.sh`. See its README.
+
+Rules:
+
+- the profiles and `c0_check.om` are byte copies of CUDApp's, pinned by `copied.tsv`; v1 and v2 are history and never edited
+- `test-sh-84b524ca.txt` and `fixture-*.tsv` are outputs of the old implementation, never retyped; only the oracle tier (CUDApp checkout and old omc given) checks gcc's builds and transcript lines 1 and 2
+- no C, Python or shell in this directory; the C test application stays in CUDApp as the foreign program under test
+
 ## `docs/autodiff/`
 
 M21 OMEGA_AUTODIFF scope, op and error-contract table, status (not qualified)
