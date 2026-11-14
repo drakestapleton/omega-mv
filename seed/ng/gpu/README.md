@@ -51,4 +51,6 @@ oracle's bytes, which the pinned `.om` encoder reproduces and CUDApp b774723f's 
 HOST_TESTED (Linux AArch64, core 1): 18/18 PASS with CUDApp at the lock commit 1988c50e; with CUDApp 1818e9d2 (only
 bw_alloc.om differs) lock-bw_alloc FAILs and the gate exits 1; against CUDApp b774723f's encoder (before #373) the
 pin, slice and ldg cases FAIL as well. No GPU involved. After the move to `gpu/nvidia/` (2026-11-14) the same 18 cases,
-with the same digests and goldens, run against the in-tree files; see `gpu/nvidia/README.md`.
+with the same digests and goldens, run against the in-tree files; see `gpu/nvidia/README.md`. Later that day the
+encoder and `cubin_elf.om` were replaced by CUDApp 84b524ca's bytes (the lock's comment says which rows): the lock
+rows, `lock-self` and `enc-pin` were re-pinned, the goldens, refusals and mutants are unchanged, and 18/18 pass.

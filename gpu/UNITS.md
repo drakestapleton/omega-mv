@@ -32,15 +32,15 @@ their behaviour checks are C, Python and shell (`make test-*`, `tests/`). Those 
 move.
 
 The unit `bw_enc_sm121` compiles to the same bytes `seed/ng/gpu/gate.cases` pins for the encoder (`enc-pin`,
-sha256 `4d652093...`).
+sha256 `460fb3a4...`).
 
-## Versions kept from step 2
+## Versions from step 2
 
-`gpu/nvidia/om/encoder/bw_enc_sm121.om`, `gpu/nvidia/om/components/bw_alloc.om` and `gpu/nvidia/om/cubin/cubin_elf.om`
-are the versions `seed/ng/cudapp.lock` pins (CUDApp `1988c50e`), not CUDApp main's. The six units that use them
-(`bw_enc_sm121`, `cubin_elf`, `compose`, `encode`, `validate`, `q38_emit`) compile with them. Moving the newer
-versions is the follow-up listed in `gpu/nvidia/README.md`. The other copy of the encoder, the top-level
-`om/encoder/bw_enc_sm121.om` that the Makefile uses, is not touched.
+`gpu/nvidia/om/encoder/bw_enc_sm121.om` and `gpu/nvidia/om/cubin/cubin_elf.om` are CUDApp main's (84b524ca) since
+2026-11-14; `gpu/nvidia/om/components/bw_alloc.om` is the same at the lock commit and at 84b524ca. All three are the
+bytes `seed/ng/cudapp.lock` pins. The six units that use them (`bw_enc_sm121`, `cubin_elf`, `compose`, `encode`,
+`validate`, `q38_emit`) compile with them. The other copy of the encoder, the top-level `om/encoder/bw_enc_sm121.om`
+that the Makefile uses, is not touched.
 
 ## Not here yet
 
