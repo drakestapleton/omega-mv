@@ -12,7 +12,7 @@ tools below; the other lanes own their `src/*.om` unit and their subdirectory:
 |---|---|---|
 | `front/`, `src/front.om` | ng-front | Omega source to ΩIR (`@ng front-ir`, gate `front/gate-front-ir.om`); every language refusal of omc (`@ng front-check`, gate `front/gate-front.om`). |
 | `a64/`, `src/a64.om` | ng-a64 | ΩIR to AArch64: the integer slice and scalar f32/f64 (`a64/DESIGN.md` sections 2 and 9; gates `a64/gate.om` and `a64/rgate.om`, whose float phase runs `a64/tests/frand.om`). |
-| `gpu/`, `src/gpu.om` | ng-gpu | Encoder conformance gate over the CUDApp units pinned in `cudapp.lock` (D10); `gpu.om` lands in `src/`. |
+| `gpu/`, `src/gpu.om` | ng-gpu | Encoder conformance gate over the units pinned in `cudapp.lock`, now in this repository under `gpu/nvidia/` (ADR 0047); `gpu.om` lands in `src/`. |
 | `bench/` | ng-bench | A/B timing harness against omc and gcc -O2. |
 
 ## ΩIR files (lane ng-ir)
