@@ -14,7 +14,9 @@ or gate. One pass, `filter-repo-command.txt`, with the selections and renames in
 | `backend/targets.om` | `gpu/targets.om` |
 
 The rewritten branch (356 commits) was merged with `git merge --allow-unrelated-histories`. Every file in that
-history is one of the kept paths: Omega source and the one table `hwman` reads.
+history matches one of the kept patterns: Omega source and the one table `hwman` reads. Three of those paths were
+deleted in CUDApp before the source commit and so appear only in history, not in the tree:
+`gpu/nvidia/om/codegen-tc/cg_tc.om`, `gpu/nvidia/om/codegen-tc/cg_tc_emit.om` and `gpu/nvidia/om/disasm/fimm_probe.om`.
 
 - `commit-map`: "old new" for every CUDApp commit reachable from the source commit; forty zeros for a commit that
   touched none of the kept paths. Look a CUDApp hash up with `grep '^SHA' gpu/import/step3-om-backend/commit-map`.

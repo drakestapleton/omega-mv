@@ -8,9 +8,11 @@ note OMC      the compiler under test; its sha256 must equal the first word of s
 note          runs (exit 69, nothing written)
 note SCRATCH  a new directory (created 0700), at most 1024 bytes of path; an existing one is refused (exit 2)
 note Units. gpu/units.tsv lists every unit, one per line: NAME then the paths of its parts, single spaces; a line
-note starting with # is a comment. The parts are concatenated in order, each followed by a newline (the composition
-note of CUDApp om/units.sh), into SCRATCH/NAME.om and compiled twice by OMC: each compile exits 0 with empty stderr,
-note and both outputs hold the same bytes. A missing part, a failed compile or two different outputs is a FAIL line.
+note starting with # is a comment and an empty line is skipped. NAME is 1 to 255 of A-Z a-z 0-9 _ and appears once.
+note The parts are concatenated in order, each followed by a newline (the composition of CUDApp om/units.sh), into
+note SCRATCH/NAME.om and compiled twice by OMC: each compile exits 0 with empty stderr, and both outputs hold the same
+note bytes. A malformed or repeated row, a missing part, a failed compile, two different outputs or a table with no
+note unit is a FAIL line. The runner (tests/gates/run.sh gpu-units) also requires the exact unit count.
 note Control, must be caught: a compiler one byte longer fails the digest check.
 note Output: one line per unit, then OMEGA-GPU-UNITS PASS|FAIL units=U controls=C caught=K hardware=NOT_RUN.
 note Exit 0 PASS, 1 FAIL, 2 bad usage or setup, 69 compiler digest refused. Every input is length-checked; a trap
@@ -24,9 +26,9 @@ text t_b1 ".1"
 text t_b2 ".2"
 text t_e1 ".1.err"
 text t_e2 ".2.err"
-text t_om2 "om2\n"
-text t_x86 "target x86linux\n"
-text t_main "fn main to int"
+text t_badname "units.tsv: name outside A-Z a-z 0-9 _"
+text t_dup "units.tsv: name repeated, or more than 64 KiB of names"
+text t_empty "units.tsv names no unit"
 text t_plus "omc-plus-one"
 text t_usage "usage: units-gate OMC SCRATCH (run from the omega-mv repository root)\n"
 text t_refd "OMEGA-GPU-UNITS REFUSED: compiler digest differs from seed/out/omc.sha256 (exit 69)\n"
@@ -70,8 +72,10 @@ global g_pin uchar 64
 global g_d1 uchar 32
 global g_stb uchar 4
 global g_n ulong 32
+global g_seen uchar 65536
 note g_n: 0 path length, 1 omc length, 2 scratch length (with '/'), 3 argv bytes, 4 argc, 5 output length,
-note 6 buffer length, 7 table length, 8 units, 11 failures, 12 controls, 13 caught, 14 name length
+note 6 buffer length, 7 table length, 8 units, 11 failures, 12 controls, 13 caught, 14 name length, 15 g_seen length,
+note 16 unit rows
 note ---- output
 fn oc c ulong to void
 n = get g_n 5
@@ -452,13 +456,6 @@ ret false
 end
 ret ne ulong get g_u i c
 end
-fn lit t view uchar * to void
-n = get g_n 6
-for q ulong len t bound 64
-put g_b add n q get t q
-end
-put g_n 6 add n len t
-end
 note append one newline to g_b (units.sh writes one after every part)
 fn nl to bool
 n = get g_n 6
@@ -469,40 +466,21 @@ put g_b n 10
 put g_n 6 add n 1
 ret true
 end
-note the path in g_pa becomes the name printed by a failure line
-fn pnm2 to void
+note a missing or unreadable part: FAIL unit NAME source unreadable: PATH (the path is in g_pa, at most 4000 bytes)
+fn psrcfail to void
+ot t_fail
+ot t_unit
+onm
+oc 32
+ot t_src
 for q ulong get g_n 0 bound 4096
-put g_nm q get g_pa q
+oc ulong get g_pa q
 end
-put g_n 14 get g_n 0
+onl
+put g_n 11 add get g_n 11 1
 end
-note cut g_b at the first line, at or after st, that starts with "fn main to int"
-fn mcut st ulong to void
-n = get g_n 6
-p = st
-while lt p n bound 16777216
-if mline p n
-put g_n 6 p
-ret
-end
-while and lt p n ne get g_b p 10 bound 16777216
-p = add p 1
-end
-p = add p 1
-end
-end
-fn mline p ulong n ulong to bool
-if gt add p len t_main n
-ret false
-end
-for q ulong len t_main
-if ne get g_b add p q get t_main q
-ret false
-end
-end
-ret true
-end
-note compose the parts g_u[s, e) into g_b; false (reported) when a part is unreadable or too long a path
+note compose the parts g_u[s, e) into g_b as CUDApp om/units.sh does: each part's bytes, then one newline; false
+note (reported) when a part is unreadable or its path is longer than 4000 bytes
 fn compose s ulong e ulong to bool
 put g_n 6 0
 i = s
@@ -521,35 +499,17 @@ if gt sub j i 4000
 ofail t_unit t_row
 ret false
 end
-if eq get g_u i 43
-if eq get g_u add i 1 120
-lit t_x86
-else
-lit t_om2
-end
-else
-cut = eq get g_u sub j 1 33
-k = j
-if cut
-k = sub j 1
-end
 pclr
-for q ulong sub k i bound 4096
+for q ulong sub j i bound 4096
 pc ulong get g_u add i q
 end
-st = get g_n 6
 if not bload
-pnm2
-ofail t_unit t_src
+psrcfail
 ret false
-end
-if cut
-mcut st
 end
 if not nl
 ofail t_unit t_big
 ret false
-end
 end
 i = j
 end
@@ -637,9 +597,69 @@ for q ulong sub k s bound 256
 put g_nm q get g_u add s q
 end
 put g_n 14 sub k s
+put g_n 16 add get g_n 16 1
+if not nameok
+ofail t_unit t_badname
+ret
+end
+if not nameadd
+ofail t_unit t_dup
+ret
+end
 if compose k e
 z = build
 end
+end
+note a unit name uses only A-Z a-z 0-9 _ (the alphabet om/units.sh gives its names), so it names a file in SCRATCH
+fn nameok to bool
+for q ulong get g_n 14 bound 256
+c = get g_nm q
+d = and ge c 48 le c 57
+u = and ge c 65 le c 90
+l = and ge c 97 le c 122
+ok = or or d u or l eq c 95
+if not ok
+ret false
+end
+end
+ret true
+end
+note record the name in g_seen (names joined by newlines); false when it is already there or g_seen is full
+fn nameadd to bool
+n = get g_n 15
+m = get g_n 14
+p = ulong 0
+while lt p n bound 65536
+q = p
+while and lt q n ne get g_seen q 10 bound 65536
+q = add q 1
+end
+if nameat p q
+ret false
+end
+p = add q 1
+end
+if ge add add n m 1 len g_seen
+ret false
+end
+for j ulong m bound 256
+put g_seen add n j get g_nm j
+end
+put g_seen add n m 10
+put g_n 15 add add n m 1
+ret true
+end
+note g_seen[p, q) equals the current name
+fn nameat p ulong q ulong to bool
+if ne sub q p get g_n 14
+ret false
+end
+for j ulong sub q p bound 256
+if ne get g_seen add p j get g_nm j
+ret false
+end
+end
+ret true
 end
 fn table to bool
 pclr
@@ -664,6 +684,10 @@ e = add e 1
 end
 urow s e
 s = add e 1
+end
+if eq get g_n 16 0
+nmset t_tab
+ofail t_unit t_empty
 end
 ret true
 end

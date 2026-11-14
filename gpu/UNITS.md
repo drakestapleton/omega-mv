@@ -21,8 +21,9 @@ change, not part of the move.
 `om/units.sh` at the source commit (default selection, `om/` read as `gpu/nvidia/om/`), plus `emit`, `conform`,
 `targets` and `hwman`. `gpu/units-gate.om` (OMEGA-GPU-UNITS, `tests/gates/run.sh gpu-units`) is seeded Omega. It
 refuses any compiler but `seed/out/omc` (by `seed/out/omc.sha256`), composes every unit as `om/units.sh` does (each
-part followed by a newline), compiles it twice and requires exit 0, empty stderr and identical bytes. The runner
-requires the exact summary line, so a shortened table fails. Every hardware row stays NOT_RUN.
+part followed by a newline), compiles it twice and requires exit 0, empty stderr and identical bytes. Unit names are
+`A-Z a-z 0-9 _` and unique; a malformed row, a missing part or a table with no unit fails. The runner requires the
+exact summary line, so a shortened table fails. Every hardware row stays NOT_RUN.
 
 This gate shows that the units compile, reproducibly, with this repository's compiler. It does not show that they
 behave correctly. In CUDApp the units are lowered to portable C by the omega-bridge converter (`om/units.sh`), and
@@ -45,9 +46,12 @@ versions is the follow-up listed in `gpu/nvidia/README.md`. The other copy of th
 - Units with parts in CUDApp `native/` (26: the `closure_*` units, `nvrm_*`, `nvml_*`, `aiengpu`): they come with the
   native/ move (step 4). Units with parts in CUDApp `tools/` (`c5`): with the tools move (step 6). The list is at
   the top of `gpu/units.tsv`.
-- 41 `.om` files that `om/units.sh` does not list (tests, fixtures, drivers such as `cache/*_test.om`,
-  `encoder/*_test.om`, `q38-head/driver.om`) moved with the rest but are not in the table: CUDApp builds them from
-  make targets and shell tests, whose compositions are not Omega.
+- 53 of the 487 moved `.om` files under `gpu/nvidia/om/` are compiled by no row of the table (434 are). 41 are files
+  `om/units.sh` does not list (tests, fixtures, drivers such as `cache/*_test.om`, `encoder/*_test.om`,
+  `q38-head/driver.om`), which CUDApp builds from make targets and shell tests, whose compositions are not Omega. 12
+  are parts only of the deferred `native/` units (`moe/closure_*.om`, `pipeline/coverage_entry.om`,
+  `pipeline/mccover.om`, `pipeline/seal_entry.om`, `pipeline/seal_reuse.om`); they are compiled once step 4 adds those
+  units.
 - Everything in CUDApp `om/` that is not Omega stayed there: 34 `.md`, 31 `.json`, 27 `.py`, 22 `.c`, 8 `.h`, 7 `.sh`
   (`units.sh`, `no-posix.sh`, `native-freest.sh` and four more), 5 `.lock`, 2 `.patch`, 2 `.log`, 1 `.gitignore` and
   39 crumb files (retired, history only). So did `backend/hw/README.md`, the multitarget and hw test drivers
