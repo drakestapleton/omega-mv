@@ -1,8 +1,9 @@
-# gpu/amd/rest: the AMD leftovers, checked in Omega
+# gpu/amd/rest: checks of the AMD leftovers, in Omega
 
-CUDApp (main 84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66) kept AMD checkers in C, Python, shell and assembly.
-Their behaviour is replayed here by `gate.om` against tables recorded from those old checkers. The old
-files stay in CUDApp as the oracles that recorded the tables.
+This directory is one slice of the AMD gfx942 back end: the checks that CUDApp (main
+84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66) ran in C, Python, shell and assembly, written in Omega. `gate.om`
+replays them against tables recorded from those old checkers. The old files stay in CUDApp as the oracles
+that recorded the tables.
 
 | part | old checker | table |
 |---|---|---|
@@ -25,13 +26,13 @@ rows have no row, because the gate does those itself. Hardware rows are NOT_RUN 
 The `guard` row of `kfd-verdicts.tsv` is not an oracle verdict: it is written by hand in `tables.py` and
 states the gate's own control (records.om without its index guard must not refuse that index).
 
-The tables were generated outside this tree by `oracle/tables.py` (with `oracle/sections.py` and
-`oracle/plan-keep.py`) from the old checkers' outputs. Those scripts and every input they read are kept,
-with a `SHA256SUMS` list, at `~/handoffs/hive/cuda-in-20261114/oracles/AmdRest/` on spark-b87b
-(sha256: `tables.py` 743733a4a260dd22263cc848a0e5eccf5d199ff27a95740610f110a28d526d79, `sections.py`
+The tables were generated outside this tree by the lane's oracle scripts `tables.py` (with `sections.py` and
+`plan-keep.py`) from the old checkers' outputs. Those scripts and every input they read are kept outside the
+repository by the lane, identified by sha256: `tables.py`
+743733a4a260dd22263cc848a0e5eccf5d199ff27a95740610f110a28d526d79, `sections.py`
 a7ba7e6a4e856973a0eec91a80216cd215a5953af3e41fee11482a26e6010b44, `plan-keep.py`
-87b60ac43b437df63ac7f15583ef71d6bc0c37ce2246688edeb73a09a6216caf, `SHA256SUMS`
-6acb5a6c860660b50a861b1bb49c87cb3a9774de86bf25b007b2d4400563f8a6).
+87b60ac43b437df63ac7f15583ef71d6bc0c37ce2246688edeb73a09a6216caf, and the `SHA256SUMS` list of every
+file kept, 2333d37fbd7ccec4f6bc46be459954d41d07b14a0013c5614975adefc5306a01.
 
 Run: `tests/gates/run.sh gpu-amd-rest` (or build by hand:
 `{ printf 'om2\n'; cat seed/ng/sha256.om gpu/amd/rest/gate.om; } | seed/out/omc > gate; ./gate seed/out/omc SCRATCH`,

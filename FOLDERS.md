@@ -67,7 +67,7 @@ Rules:
 
 ## `gpu/amd/rest/`
 
-The AMD back end's leftovers from CUDApp `84b524ca` (C, Python, shell and LLVM assembly checkers), checked in Omega: `gate.om` (step `gpu-amd-rest`) replays the verdicts those checkers recorded against the Omega-built units, `classify.om` writes `gpu/amd/NOT-YET-OMEGA.tsv` from `classes.tsv`. See its README.
+One slice of the AMD back end: the checks that CUDApp `84b524ca` ran in C, Python, shell and LLVM assembly, written in Omega: `gate.om` (step `gpu-amd-rest`) replays the verdicts those checkers recorded against the Omega-built units, `classify.om` writes `gpu/amd/NOT-YET-OMEGA.tsv` from `classes.tsv`. See its README.
 
 Rules:
 
