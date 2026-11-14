@@ -23,6 +23,8 @@ in CUDApp and serves as the reference (the oracle); it is compiled and run outsi
 | `scanref.om` | rewrite of CUDApp's `src/omega_gpu_scan_ref.c` (OM-1): the host scan, prefix sum and radix sort references |
 | `check/scanref-check.om`, `check/scanref.expect.txt` | the scanref check program and the old C's output it must match |
 | `check/platrest-check.om`, `check/platrest.expect.txt` | the check of `gpu/nvidia/om/platform-linux/plat_rest.om` against CUDApp's `src/omega_gpu_platform_linux_rest_oracle.h` (the old C kept as its reference): every mode on xorshift64 inputs with boundary values, and the oracle's output it must match |
+| `apiplan.om` | rewrite of CUDApp's `src/omega_api_plan.h` (`ap_plan`): one family number picks one of the six plan units of `gpu/nvidia/om/components/` (`api_mm_plan.om` to `api_rt_plan.om`), and its refusal becomes the C's return value |
+| `check/apiplan-check.om`, `check/apiplan.expect.txt` | the check of `apiplan.om` and those six units against the header's C plans (`ap_c`, kept as the old implementation): every family and mode on xorshift64 inputs with boundary values, and the C's output it must match |
 | `held.tsv` | a CUDApp file that is not rewritten because it waits on a decision, not a translation, and which decision |
 | `checks.tsv` | the gate's checks: parts to compose, expected output, and a source mutation that must be caught |
 | `controls.tsv` | the gate's inventory controls: an input byte changed, and how the inventory must notice |
@@ -144,6 +146,45 @@ The oracle and the check share code. `cudapp_om_av_scan.c` and `cudapp_om_ar_car
 `scan.om` and `scancarry.om`, and the check composes `gpu/nvidia/om/apiviews/scan.om` itself. So the comparison
 proves the rewritten driver logic only: levels, carries, the radix passes and the handling of bad arguments. It does
 not independently check the 32-wide tile scan, which both sides take from the same Omega source.
+
+## The api plan oracle
+
+`check/apiplan.expect.txt` is the output of the C plans `ap_c` of CUDApp `src/omega_api_plan.h` (sha256
+`3a572b497df46f1aeb036f02df078315541f48e6cc8eeb97e1603e1c2f31cd60`), the code its freestanding build still runs.
+A driver kept outside this repository by the lane that wrote this slice produced it:
+
+- `apiplan_driver.c`: sha256 `27f14850dca542c1c8fb17eb10c66f45bd62d1f9e35276db3086cac74a7f1b02`.
+- its output: byte for byte `check/apiplan.expect.txt`, sha256
+  `1b3ad963aae1ff8eb96da42b5f1e4c431d83daae734123ceaedf8fc4bcb97642`.
+
+Built against CUDApp `src/` at the commit above; built again with `-fsanitize=undefined -fno-sanitize-recover=all`,
+it printed the same bytes and exit 0:
+
+    cc -std=c11 -O1 -ffp-contract=off -DOMEGA_GPU_NO_POSIX -Icudapp/src apiplan_driver.c -o apiplan_driver
+    ./apiplan_driver > apiplan.expect.txt
+
+Per family 0..5 the check runs every mode up to one past the last the C knows, and family 6; 4096 cases each.
+Inputs `a[0..7]` come from xorshift64 and a list of boundary values, `a[8..15]` start as `0x9e3779b9 + i` (as in
+CUDApp `tests/runtime/api_plan_unit.c`). The check prints the first two cases of each mode whole, and a line with
+the count of refusals and an FNV-1a-64 digest of every refusal and all sixteen words.
+
+Both sides then rewrite some inputs the same way (`akdom` in the check, `dom` in the driver), to stay in the
+domain where the C is defined and the two are meant to agree. Divisors are made nonzero. The rules below go
+further, and dropping any one of them makes the Omega check stop with the trap shown, in that mode (run against
+this check, the rule replaced by a `note`):
+
+| family, mode | rule | Omega without it | the C there |
+| --- | --- | --- | --- |
+| 1 (at), 1 | `a[0]` below 2^33 | trap 4: `at_log` has `bound 32`, a power of two of 2^33 or more needs more passes | returns its log, 33 to 63 |
+| 1, 5 | `a[4]` below 2^33 | trap 4, the same `at_log` | the same |
+| 1, 4 | `a[0]` 0..4 | trap 4: the loop has `bound 4` | loops `a[0]` times; a shift of 64 or more is undefined |
+| 1, 7 and 1, 22 | `a[3]`, `a[1]` below 2^32 | trap 5: `uint get` is a checked conversion | keeps the low 32 bits of the float |
+| 3 (bf), 0 | `a[0]` below 2^24 | trap 4: the divisor search has `bound 65536` | searches down from `a[0]/256`, up to 2^56 passes |
+
+So the units agree with the C only inside these rules. CUDApp's own differential test of the units against `ap_c`
+(`tests/runtime/api_plan_unit.c`) stays inside them too. The limits sit in the units of
+`gpu/nvidia/om/components/`, which are Bridge source parts of CUDApp; changing them is outside this slice. The
+comparison covers `ap_plan`'s dispatch and refusal mapping, and every family's plans on the domain above.
 
 ## The gate
 
