@@ -3,7 +3,7 @@ note It turns a solved BlackwellIR program into machine code: four 32-bit words 
 note little-endian, padded with NOPs to a multiple of 8 and at least 32 instructions.
 note It replaces encode_single_insn and omega_bw_encode_program of src/omega_blackwell_codegen.c,
 note which stays compiled only behind CUDAPP_MIGRATION_PENDING_C_ENCODER as the differential oracle
-note (and in the freestanding build, which has no native binding yet).
+note or the explicit CUDAPP_MIGRATION_PENDING_C_NO_POSIX oracle switch; both defaults use Omega.
 note
 note Input (bw_om_encode in src/omega_blackwell_codegen.c packs it; 8 ulong per instruction, at most 1024 instructions):
 note   0 op (the BlackwellIROpcode number)   1 dst_vreg   2 src1_vreg   3 src2_vreg   4 src3_vreg
@@ -14,7 +14,7 @@ note     or dst_subreg shl 16 or src1_subreg shl 24 or src2_subreg shl 32 or src
 note phys: vreg_to_phys 0..255 then uvreg_to_phys at 256..287 (C int, two's complement).
 note pad 1: omega_bw_encode_program (pad to the multiple of 8, at least 32); pad 0: exactly n instructions.
 note Result: the bytes written, or 0 when an instruction is refused (unknown op, an offset outside its
-note field, a BSSY delta below 2, a barrier register above 15) or n is above 1024.
+note field, a BSSY delta below 2, a barrier register above 15, a P0 guard on LDCU / LDCU.64) or n is above 1024.
 note Every constant is the decimal form of the C encoder's hex word (conversions by Wolfram,
 note evidence/CUDAPP-OM-ENCODER/wolfram-constants.txt).
 
@@ -191,6 +191,7 @@ put4 w wda o 30732 imm 66085488 ctl o 2087424
 ret 0
 end
 if eq op 11
+note Existing C LDG.E signed byte-offset form (#373), identical to the wide-load field below.
 if not off24 imm
 ret 1
 end
@@ -357,9 +358,6 @@ ret 0
 end
 if eq op 45
 a = ulong 31053
-if ne get o 9 0
-a = 2381
-end
 put4 w a 0 58720256 ctl o 1042944
 ret 0
 end
@@ -503,10 +501,110 @@ a = or or 31144 shl rz o 1 15 16 shl rb o 2 24
 put4 w a or rb o 3 2147483648 or 144659712 rb o 5 ctl o 3284480
 ret 0
 end
+note WolframLanguageEvaluator: FromDigits[#,16]& /@ {"7245","7305","00201000","0020f000","004fe200","004e2200"}
+note -> {29253,29445,2101248,2158592,5235200,5120512}.
+if eq op 65
+put4 w wd o 29253 rb o 2 2101248 ctl o 5235200
+ret 0
+end
+if eq op 66
+put4 w wd o 29445 rb o 2 2158592 ctl o 5120512
+ret 0
+end
+note Native half forms are the E1_CVT sm_121 fixtures in src/omega_numeric.c.
+note Widening is HADD2.F32 Rd,-RZ,Ra.H0_H0; narrowing is F2F.F16.F32 Rd,Ra.
+note WolframLanguageEvaluator: FromDigits[#,16]& /@ {"ff007230","20000000","4100","7304","00200800","010fca00","010e2800"}
+note -> {4278219312,536870912,16640,29444,2099200,17811968,17704960}.
+if eq op 67
+put4 w wd o 4278219312 or 536870912 rb o 2 16640 ctl o 17811968
+ret 0
+end
+if eq op 68
+put4 w wd o 29444 rb o 2 2099200 ctl o 17704960
+ret 0
+end
 ret 1
 end
 
-fn enc1 o view ulong 16 w edit ulong 4 to ulong
+note IEEE binary64 register forms, independently derived using nvcc 13.0.88 sm_121 and nvdisasm.
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note WolframLanguageEvaluator: FromDigits[#,16]& /@ {"7229","7228","722b","722a","7308","1800","1c00","7310","301000","201800","7312","201c00","7311","30d100","03f06000","000e2400"}
+note -> {29225,29224,29227,29226,29448,6144,7168,29456,3149824,2103296,29458,2104320,29457,3199232,66084864,926720}.
+note R255 is RZ, not the upper half of a writable double pair.
+fn dpair o view ulong 16 k ulong to ulong
+r = get o k
+if or ne and r 1 0 ge r 254
+ret 0
+end
+ret 1
+end
+
+fn pick c bool a ulong b ulong to ulong
+if c
+ret a
+end
+ret b
+end
+
+fn enc_f o view ulong 16 w edit ulong 4 to ulong
+op = get o 0
+if gt op 79
+ret 1
+end
+if le op 72
+if eq and dpair o 2 dpair o 3 0
+ret 1
+end
+if eq op 72
+if ne get o 15 0
+ret 1
+end
+put4 w wa o 29226 rb o 3 pick ne get o 6 0 get o 6 66084864 ctl o 926720
+ret 0
+end
+if eq dpair o 1 0
+ret 1
+end
+if eq op 69
+put4 w wda o 29225 0 rb o 3 ctl o 926720
+ret 0
+end
+if eq op 70
+put4 w wda o 29224 rb o 3 0 ctl o 926720
+ret 0
+end
+if and ne get o 4 255 eq dpair o 4 0
+ret 1
+end
+put4 w wda o 29227 rb o 3 rb o 4 ctl o 926720
+ret 0
+end
+if le op 74
+put4 w wd o 29448 rb o 2 pick eq op 73 6144 7168 ctl o 926720
+ret 0
+end
+if or eq op 76 eq op 79
+if eq dpair o 2 0
+ret 1
+end
+else
+if eq dpair o 1 0
+ret 1
+end
+end
+if le op 76
+put4 w wd o 29456 rb o 2 pick eq op 75 2103296 3149824 ctl o 926720
+ret 0
+end
+if le op 78
+put4 w wd o 29458 rb o 2 pick eq op 77 2104320 2103296 ctl o 926720
+ret 0
+end
+put4 w wd o 29457 rb o 2 3199232 ctl o 926720
+ret 0
+end
+
+fn encraw o view ulong 16 w edit ulong 4 to ulong
 op = get o 0
 if lt op 15
 ret enc_a o w
@@ -520,7 +618,26 @@ end
 if lt op 60
 ret enc_d o w
 end
+if lt op 69
 ret enc_e o w
+end
+ret enc_f o w
+end
+
+note A P0 guard is not a uniform guard: LDCU and LDCU.64 must refuse it (DRA-483).
+note See PROVENANCE.md and guard_pred_test.om for the independent instruction oracle.
+fn enc1 o view ulong 16 w edit ulong 4 to ulong
+r = encraw o w
+if or ne r 0 eq get o 9 0
+ret r
+end
+op = get o 0
+if isuld op
+ret 1
+end
+x = get w 0
+put w 0 or sub x and x 61440 shl pred o 12
+ret 0
 end
 
 note the 16 bytes of instruction i, each word little-endian
