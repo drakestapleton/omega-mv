@@ -1,6 +1,6 @@
-# gpu/nvidia/checks: CUDApp tests and tools, in Omega
+# gpu/nvidia/checks: Omega checks for part of CUDApp tests and tools
 
-CUDApp kept its tests and tools in C, Python and shell (`tests/`, `tools/`). This directory holds what replaces them inside omega-mv, written only in Omega, plus the tables of expected values they read.
+CUDApp keeps its tests and tools in C, Python and shell (`tests/`, `tools/`). This directory is one slice of porting them to Omega, not the whole port: two checks (`leftovers` and `gdn_admit`) with the tables of expected values they read, their gate, and an inventory that lists every file of `tests/` and `tools/` with its status, so what is still open is counted in `INVENTORY.tsv` rather than claimed done.
 
 ## What is here
 
@@ -42,11 +42,11 @@ The gate first checks that `seed/out/omc` matches `seed/out/omc.sha256`. Then, f
 
 A wrong-compiler control runs once: a compiler one byte longer must fail the digest check.
 
-Then it checks the inventory: each row of `ports.tsv` must be the status and detail of its path's row in `INVENTORY.tsv`, every other row of `INVENTORY.tsv` must be `open`, and the counts in its last line (`files`, `ported`, `retired`, `blocked`, `open`) must be the counts of its rows. A failure here means `INVENTORY.tsv` was not regenerated after `ports.tsv` changed. The gate does not check the CUDApp side of the inventory (paths, kinds, sizes); that needs a CUDApp checkout, see below.
+Then it checks the inventory: each row of `ports.tsv` must be the status and detail of its path's row in `INVENTORY.tsv`, every other row of `INVENTORY.tsv` must be `open`, the counts in its last line (`files`, `ported`, `retired`, `blocked`, `open`) must be the counts of its rows, and every `om_ref` and `same_stem` cell that is not `-` must name a `.om` file under `gpu/` that exists in this tree. A failure here means `INVENTORY.tsv` was not regenerated after `ports.tsv` or the `gpu/` tree changed. The gate does not check the CUDApp side of the inventory (paths, kinds, sizes); that needs a CUDApp checkout, see below.
 
 The summary must read `OMEGA-GPU-CHECKS PASS checks=N controls=C caught=C hardware=NOT_RUN`. N is the number of rows of `checks.tsv` and C = N + (rows of `mutants.tsv`) + 1: one table control per check, one control per mutant, and the wrong compiler. `run.sh` computes both from the two files. The gate checks nothing more than the above. Nothing here opens a device. Any hardware tier of an old test is recorded as NOT_RUN in `ports.tsv`.
 
-The gate reads its files into memory that grows to fit them; it has no fixed size for them. If the host refuses the memory, the check fails with a message saying so.
+The gate reads its files into memory that grows to fit them, and hashes files of any size; it has no fixed size for them. If the host refuses the memory, the check fails with a message saying so. Paths are held in buffers of Linux PATH_MAX bytes (the host words that take a path cannot take growing memory); a path that does not fit, a check name that with its scratch suffix does not fit Linux NAME_MAX, or a SCRATCH directory too long for both is refused by name (FAIL, or exit 2 for SCRATCH), never cut short.
 
 ## Regenerating INVENTORY.tsv
 
@@ -59,11 +59,11 @@ git -C omega-mv ls-tree -r --name-only HEAD -- gpu > gpulist.txt
 cd CUDApp && ../inventory ../list.txt ../gpulist.txt ../omega-mv/gpu/nvidia/checks/ports.tsv "LABEL" > ../omega-mv/gpu/nvidia/checks/INVENTORY.tsv
 ```
 
-LABEL is the inputs line: copy it from the second line of the current `INVENTORY.tsv`, changing the commits if they moved. `inventory` exits 1 in two cases: a `ports.tsv` row names no CUDApp path, or a path appears twice. It exits 2 on a malformed row.
+LABEL is the inputs line, the second line of `INVENTORY.tsv`: it names the CUDApp commit of the checkout and the omega-mv commit whose `gpu/` list was read, so put the commits you actually used there. `inventory` exits 1 in two cases: a `ports.tsv` row names no CUDApp path, or a path appears twice. It exits 2 on a malformed row, on a path that does not fit Linux PATH_MAX, or when it cannot read an input or the host refuses the memory; it reads inputs of any size into memory that grows to fit them.
 
 ## Oracles
 
-Kept outside this repository, on the Spark, in `~/handoffs/hive/cuda-in-20261114/oracles/TestsTools/`. Each was run from a CUDApp checkout at `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`, writing the table to stdout.
+Kept outside the repository by the lane, identified by sha256. Each was run from a CUDApp checkout at `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`, writing the table to stdout.
 
 | Oracle | sha256 | Writes | Build (run with no arguments) |
 |---|---|---|---|

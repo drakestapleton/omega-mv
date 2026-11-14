@@ -66,13 +66,13 @@ Rules:
 
 ## `gpu/nvidia/checks/`
 
-Omega behaviour checks that replace the C, Python and shell of CUDApp `tests/` and `tools/`, each with its table of expected values, and their gate `OMEGA-GPU-CHECKS` (`tests/gates/run.sh gpu-checks`). `README.md` says what each check covers and what it does not.
+Omega checks for part of CUDApp `tests/` and `tools/` (one slice of porting them, not the whole port), each with its table of expected values, their gate `OMEGA-GPU-CHECKS` (`tests/gates/run.sh gpu-checks`), and `INVENTORY.tsv`, which lists every file of CUDApp `tests/` and `tools/` with its status. `README.md` says what each check covers and what it does not.
 
 Rules:
 
-- only Omega, tables and Markdown; the C oracles that wrote the tables stay outside the repository, with their path, sha256 and build line in `README.md`
+- only Omega, tables and Markdown; the C oracles that wrote the tables are kept outside the repository by the lane, identified by sha256, with their build line in `README.md`
 - a table is the output of its oracle at the CUDApp commit its header names; regenerate it, never retype a value
-- `ports.tsv` is the only hand-written input; `INVENTORY.tsv` is written by `inventory.om` from it and a CUDApp checkout, and the gate fails when the two disagree
+- `ports.tsv` is the only hand-written input; `INVENTORY.tsv` is written by `inventory.om` from it, a CUDApp checkout and the `gpu/` file list, and the gate fails when it disagrees with `ports.tsv` or names a `gpu/` file this tree does not have
 - every check has a table control, every row of `mutants.tsv` must compile and be caught, and a FROM must match exactly one line of its part
 
 ## `gpu/spirv/` and `gpu/hw/`
