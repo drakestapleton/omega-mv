@@ -29,6 +29,15 @@ Rules:
 
 - canonical bitmap format is the contract; never reuse previous pass results; no CUDA symbols in AIEN binaries
 
+## `bridge/shlib/`
+
+AArch64 Linux shared libraries written by Omega alone: `shlib.om` turns omc's object-mode output (`OMOBJ001`) and a table into an ELF shared object (no C compiler, assembler or linker), and writes a probe executable that loads it through the system's dynamic loader. `test.om` is the gate's test unit; `nvml.om` is CUDApp's libnvidia-ml.so.1 export list with stub bodies. `README.md` says what works and what is still missing for real NVML bodies.
+
+Rules:
+
+- only Omega source and its tables; C, `readelf` or `gcc` checks run outside the tree
+- every change keeps `tests/gates/run.sh shlib` passing with its five controls caught
+
 ## `docs/autodiff/`
 
 M21 OMEGA_AUTODIFF scope, op and error-contract table, status (not qualified)
