@@ -20,7 +20,8 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
   `.text` and `.dynamic` (`DT_HASH`, `DT_STRTAB`, `DT_SYMTAB`, `DT_STRSZ`, `DT_SYMENT`, `DT_SONAME`).
   The code is position independent, so the library needs no relocations.
 - One wrapper per export turns a C call (AAPCS64) into an omc function call. It saves x19..x30
-  and d8..d15. It builds the per-call context omc expects in x7, where entry 16 is a trap entry,
+  and d8..d15. It builds the per-call context omc expects in x7, whose byte offset 16
+  (`[x7, #16]`) holds the trap entry,
   and sign- or zero-extends narrow integer arguments, because omc assumes they are already
   extended. A trap inside Omega code (for example a division by zero) returns the row's TRAP
   value to the C caller with every saved register restored.
@@ -31,6 +32,10 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
   first. A caller whose stack is too small then faults on its guard page before the body runs,
   instead of the body writing past the guard into other memory.
 - The object's code is copied unchanged, at a 16-byte boundary as in the object.
+- Before linking, the generator checks the object's metadata: the export count against the
+  header, each function's flags, address (inside the code, 4-aligned, increasing), result and
+  parameter records and name padding, and each call record's instruction (a BL inside its source
+  function). Every BL in the code must have exactly one call record.
 
 ## Limits
 
@@ -46,7 +51,7 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
 ## Gate
 
 `tests/gates/run.sh shlib` (manifest `tests/gates/omega-shlib.gate`, program `gate.om`, in Omega)
-has 12 checks:
+has 13 checks:
 
 1. It builds both units in object mode.
 2. It builds both libraries and both probes.
@@ -54,15 +59,17 @@ has 12 checks:
    `test.tsv` probe makes 13 calls: constants, int arguments with dirty upper halves, a trapping
    division followed by another call, a pointer write read back by a later call, a uint with a
    dirty upper half, and two bodies that need 8 KiB and 16 KiB of stack (one through a private
-   call). The `nvml.tsv` probe calls all 11 NVML exports. Each probe also checks that x19..x27 and
-   sp come back unchanged.
+   call). The `nvml.tsv` probe calls all 11 NVML exports. Each probe also sets x19..x27, x29 and
+   d8..d15 and checks that they and sp come back unchanged.
 4. It runs `/usr/bin/readelf -W -S --dyn-syms` on each library. readelf reads the symbols through
    the section headers, which the loader never looks at; it must exit 0, print no warning, and
-   list every export of the table. readelf (GNU Binutils 2.42 here) is a read-only verification
-   oracle, not part of the build.
-5. It requires a second build to have identical bytes.
+   list every export of the table as a `FUNC GLOBAL DEFAULT` symbol line. readelf (GNU Binutils
+   2.42 here) is a read-only verification oracle, not part of the build.
+5. It reads the test library's wrappers (found through `.dynsym`) for the stack probe: exactly
+   two probe loops, the first covering 2 pages and the second 5.
+6. It requires a second build to have identical bytes.
 
-The gate also runs 9 controls. Each must be caught with its exact exit status and, where one is
+The gate also runs 12 controls. Each must be caught with its exact exit status and, where one is
 given, with that text in the failing program's error output:
 
 | Control | Change | Required |
@@ -76,6 +83,9 @@ given, with that text in the failing program's error output:
 | uextend | the wrappers' zero extensions removed | 10 |
 | restore | the shared return reloads x19 and x20 from the wrong slot | 250 |
 | runtime | the object's trap-entry load turned into a load of another runtime entry | 1, `runtime entry` |
+| need | the call record's stack cost zeroed, so deep's probe covers 4 pages instead of 5 | 1 (stack probe check) |
+| address | the first function's address in the object moved by 2 bytes | 1, `not an OMOBJ001` |
+| frestore | the shared return reloads d8 and d9 from the wrong slot | 250 |
 
 ## NVML status
 

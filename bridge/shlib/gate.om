@@ -30,6 +30,14 @@ note   uextend  every UXTW (UBFX X, X, #0, #32) turned into NOP: call 9 (a uint 
 note   restore  the shared return's LDP X19, X20, [SP, #32] turned into [SP, #48]: x19 and x20 come back wrong (250)
 note   runtime  one trap-entry load LDR X16, [X7, #16] in test.obj turned into [X7, #0], a runtime entry the
 note            library does not provide: SHLIB refuses the object (1, "runtime entry")
+note   need     the call record's stack cost in test.obj zeroed: deep's settled need drops from 16400 to 16384
+note            bytes, so its probe covers 4 pages, not 5: the stack probe check reports it (1)
+note   address  omega_shlib_seven's address in test.obj moved by 2 bytes: SHLIB refuses the object (1, "not an
+note            OMOBJ001")
+note   frestore the shared return's LDP D8, D9, [SP, #128] turned into [SP, #144]: d8 and d9 come back wrong (250)
+note The stack probe check reads the test library's wrappers: exactly two probes, sum's covering 2 pages and
+note deep's 5 (16400 bytes through its private call), in that order.
+note The extend and uextend controls change only the wrappers' words, found through .dynsym.
 note Output: one line per check and control, then OMEGA-SHLIB PASS|FAIL checks=N controls=C caught=K.
 note Exit 0 PASS, 1 FAIL, 2 bad usage or setup, 69 compiler digest refused.
 global g_pin uchar 64
@@ -44,7 +52,8 @@ global g_av uchar 16384
 global g_o uchar 8192
 global g_b uchar *
 note g_n: 0 path length, 1 omc length, 2 scratch length (with '/'), 3 argv bytes, 4 argc, 5 output length,
-note 6 buffer length, 7 generator length, 8 checks, 11 failures, 12 controls, 13 caught
+note 6 buffer length, 7 generator length, 8 checks, 11 failures, 12 controls, 13 caught, 14 and 15 the
+note wrappers' range, 16 probe loops found, 17 a probe loop with the wrong page count
 text t_pin "seed/out/omc.sha256"
 text t_null "/dev/null"
 text t_ttab "bridge/shlib/test.tsv"
@@ -95,6 +104,15 @@ text t_mnum "malformed number"
 text t_udiv "undefined symbol: omega_shlib_div"
 text t_usym "undefined symbol: "
 text t_mrt "runtime entry"
+text t_mobj "not an OMOBJ001"
+text t_fgl "FUNC    GLOBAL DEFAULT"
+text t_c10obj "c10.obj"
+text t_c10so "c10.so"
+text t_c11obj "c11.obj"
+text t_c11so "c11.so"
+text t_d12 "c12"
+text t_c12lib "c12/libomshlib.so.1"
+text t_c12prb "c12/probe"
 text t_lout "log.out"
 text t_lerr "log.err"
 text t_lib "lib"
@@ -115,6 +133,7 @@ text t_k9 "lib test again"
 text t_k10 "same bytes"
 text t_k11 "readelf test"
 text t_k12 "readelf nvml"
+text t_k13 "stack probe words"
 text t_x1 "row"
 text t_x2 "export"
 text t_x3 "hash"
@@ -124,6 +143,9 @@ text t_x6 "extend"
 text t_x7 "runtime"
 text t_x8 "uextend"
 text t_x9 "restore"
+text t_x10 "need"
+text t_x11 "address"
+text t_x12 "frestore"
 text t_ok "ok "
 text t_fail "FAIL "
 text t_ctl "control "
@@ -362,15 +384,21 @@ put g_pin j c
 end
 ret true
 end
+note the sha256 of the file at g_pa, streamed through sh_dat in whole 64-byte blocks (no size limit), equals g_pin
 fn pinok to bool
 fd = frd
 if lt fd 0
 ret false
 end
-n = ulong 0
+sh_init
+for j ulong 8
+put sh_h j get sh_k add j 64
+end
+t = ulong 0
+r = ulong 0
 ok = true
-while true bound 16777218
-x = read fd sh_dat n sub len sh_dat n
+while true bound 9223372036854775807
+x = read fd sh_dat r sub len sh_dat r
 if lt x 0
 ok = false
 break
@@ -378,17 +406,14 @@ end
 if eq x 0
 break
 end
-n = add n ulong x
-if ge n len sh_dat
-ok = false
-break
-end
+t = add t ulong x
+r = gblks add r ulong x
 end
 fclo fd
 if not ok
 ret false
 end
-sh_all n
+gfin t r
 for j ulong 32
 b = get sh_dig j
 if ne get g_pin mul j 2 sh_hexd uint shr b 4
@@ -399,6 +424,42 @@ ret false
 end
 end
 ret true
+end
+note hash the whole blocks of sh_dat[0, m), move the rest to the front; its length
+fn gblks m ulong to ulong
+nb = div m 64
+for b ulong nb bound 262144
+sh_blk 0 mul b 64
+end
+r = rem m 64
+o = mul nb 64
+for j ulong r bound 64
+put sh_dat j get sh_dat add o j
+end
+ret r
+end
+note the padding of FIPS 180-4 for a message of n bytes whose last r bytes are sh_dat[0, r); digest into sh_dig
+fn gfin n ulong r ulong to void
+for j ulong 128
+put sh_pad j 0
+end
+for j ulong r bound 64
+put sh_pad j get sh_dat j
+end
+put sh_pad r 128
+e = ulong 64
+if ge r 56
+e = 128
+end
+bits = mul n 8
+for j ulong 8
+put sh_pad sub sub e 1 j uchar and shr bits mul j 8 255
+end
+sh_blk 1 0
+if eq e 128
+sh_blk 1 64
+end
+sh_out
 end
 note ---- processes
 fn aclr to void
@@ -469,6 +530,10 @@ end
 fclo fi
 fclo fo
 fclo fe
+ret reap pid
+end
+note wait for the child pid: its exit code, 256 + the signal, or 1000 after the 600 s deadline (killed)
+fn reap pid long to ulong
 t0 = monons
 while true bound 1000000000
 r = waitpid int pid g_stb 0 len g_stb 1
@@ -545,23 +610,10 @@ end
 fclo fi
 fclo fo
 fclo fe
-while true bound 1000000000
-r = waitpid int pid g_stb 0 len g_stb 0
-if eq r pid
-x = ulong get g_stb 0
-if ne x 0
-ret add 256 x
-end
-ret ulong get g_stb 1
-end
-if lt r 0
-exit 2
-end
-end
-exit 2
+ret reap pid
 end
 note SHLIB lib TABLE OBJ OUT; tr is TABLE relative to the repository root, else to SCRATCH; OBJ is test.obj
-note when ob is 0, nvml.obj when 1, the runtime control's c7.obj when 2
+note when ob is 0, nvml.obj when 1, the controls' c7.obj (runtime), c10.obj (need) or c11.obj (address) for 2..4
 fn genlib tab view uchar * tr bool ob ulong dst view uchar * to ulong
 aclr
 agen
@@ -577,7 +629,15 @@ else
 if eq ob 2
 asc t_c7obj
 else
+if eq ob 3
+asc t_c10obj
+else
+if eq ob 4
+asc t_c11obj
+else
 asc t_tobj
+end
+end
 end
 end
 asc dst
@@ -682,6 +742,7 @@ check t_k7 gencall t_ntab true t_nprb 0
 check t_k8 runprb t_nprb 0
 check t_k11 relf t_ttab t_tlib 0
 check t_k12 relf t_ntab t_nlib 0
+check t_k13 pchk t_tlib 0
 check t_k9 genlib t_ttab true 0 t_again 0
 s = ulong 1
 if same2 t_tlib t_again
@@ -750,13 +811,33 @@ ret false
 end
 ret bat o t_exp
 end
-note g_b[s, s + l) followed by a newline occurs in g_b[0, m)
+note g_b[s, s + l) occurs in g_b[0, m) as a whole readelf symbol line's name: a space before it, a newline after
+note it, and "FUNC    GLOBAL DEFAULT" earlier on its line
 fn bline s ulong l ulong m ulong to bool
-if lt m add l 1
+if lt m add l 2
 ret false
 end
-for o ulong sub m l bound 9223372036854775807
+for i ulong sub sub m l 1 bound 9223372036854775807
+o = add i 1
 if and bsame o s l eq get g_b add o l 10
+if and eq get g_b i 32 fglob o
+ret true
+end
+end
+end
+ret false
+end
+note the line holding g_b[o] has "FUNC    GLOBAL DEFAULT" before o
+fn fglob o ulong to bool
+a = o
+while and gt a 0 ne get g_b sub a 1 10 bound 9223372036854775807
+a = sub a 1
+end
+if lt sub o a len t_fgl
+ret false
+end
+for i ulong add sub sub o a len t_fgl 1 bound 9223372036854775807
+if bat add a i t_fgl
 ret true
 end
 end
@@ -907,17 +988,60 @@ fn tload dir view uchar * to bool
 ok = mkd dir
 ret and ok sload t_tlib
 end
-note turn every 4-aligned word with little-endian bytes a b c d in g_b into NOP (0xd503201f); how many
-fn nopw a ulong b ulong c ulong d ulong to ulong
+note the wrappers' range of the library in g_b, from its .dynsym (the lowest symbol value, the highest value plus
+note size) into g_n 14 and 15; false when there is no .dynsym
+fn wrange to bool
+so = bq 40
+put g_n 14 shl ulong 1 63
+put g_n 15 0
+for i ulong bh 60 bound 65536
+h = add so mul i 64
+if eq bh add h 4 11
+symr bq add h 24 bq add h 32
+end
+end
+ret gt get g_n 15 0
+end
+fn symr o ulong n ulong to void
+for k ulong div n 24 bound 9223372036854775807
+e = add o mul k 24
+v = bq add e 8
+if ne v 0
+if lt v get g_n 14
+put g_n 14 v
+end
+if gt add v bq add e 16 get g_n 15
+put g_n 15 add v bq add e 16
+end
+end
+end
+end
+note the u64 and the u16 of g_b at o
+fn bq o ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get g_b add o i mul i 8
+end
+ret v
+end
+fn bh o ulong to ulong
+ret or ulong get g_b o shl ulong get g_b add o 1 8
+end
+note turn every 4-aligned word w inside the wrappers into NOP (0xd503201f); how many
+fn nopw w ulong to ulong
 k = ulong 0
-o = bfind4 a b c d
-while lt o shl ulong 1 63 bound 9223372036854775807
+if not wrange
+ret 0
+end
+for i ulong div sub get g_n 15 get g_n 14 4 bound 9223372036854775807
+o = add get g_n 14 mul i 4
+if eq bw o w
 put g_b o 31
 put g_b add o 1 32
 put g_b add o 2 3
 put g_b add o 3 213
 k = add k 1
-o = bfind4 a b c d
+end
 end
 ret k
 end
@@ -934,8 +1058,8 @@ end
 fn cext to void
 note SXTW X0, W0 is 0x93407c00 (bytes 00 7c 40 93) and SXTW X1, W1 0x93407c21: add's and div's arguments
 ok = tload t_d6
-k = nopw 0 124 64 147
-k = add k nopw 33 124 64 147
+k = nopw 2470476800
+k = add k nopw 2470476833
 if or not ok eq k 0
 csetup t_x6
 ret
@@ -945,7 +1069,7 @@ end
 fn cuext to void
 note UXTW X0, W0 (UBFX X0, X0, #0, #32) is 0xd3407c00 (bytes 00 7c 40 d3): hi's argument
 ok = tload t_d8
-k = nopw 0 124 64 211
+k = nopw 3544218624
 if or not ok eq k 0
 csetup t_x8
 ret
@@ -995,6 +1119,105 @@ ret
 end
 r = genlib t_ttab true 2 t_c7so
 ctle t_x7 r 1 t_mrt
+end
+note the stack probe check on the scratch library lib: 0 when its wrappers hold exactly two probe loops, the first
+note covering 2 pages (MOVZ X17, #2) and the second 5 (MOVZ X17, #5); 1 otherwise, 512 when unreadable
+fn pchk lib view uchar * to ulong
+if not sload lib
+ret 512
+end
+if not wrange
+ret 512
+end
+put g_n 16 0
+put g_n 17 0
+for i ulong div sub get g_n 15 get g_n 14 4 bound 9223372036854775807
+pone add get g_n 14 mul i 4
+end
+if and eq get g_n 17 0 eq get g_n 16 2
+ret 0
+end
+ret 1
+end
+note one word of the wrappers: a probe loop at o counts in g_n 16; a wrong MOVZ X17 before it sets g_n 17
+fn pone o ulong to void
+if not ploop o
+ret
+end
+k = add get g_n 16 1
+put g_n 16 k
+if ne bw sub o 8 pwant k
+put g_n 17 1
+end
+end
+note the MOVZ X17 the k-th probe must hold: #2, then #5
+fn pwant k ulong to ulong
+if eq k 1
+ret 3531604049
+end
+ret 3531604145
+end
+note g_b at o holds the probe loop SUB X16, X16, #1, LSL #12; LDR XZR, [X16]; SUBS X17, X17, #1; B.NE loop
+fn ploop o ulong to bool
+if gt add o 16 get g_n 6
+ret false
+end
+ok = and eq bw o 3510634000 eq bw add o 4 4181721631
+ret and ok and eq bw add o 8 4043310641 eq bw add o 12 1426063265
+end
+note the u32 of g_b at o
+fn bw o ulong to ulong
+ret or bh o shl bh add o 2 16
+end
+fn cneed to void
+note test.obj ends with its one call record; its last u64 is the stack cost
+if not sload t_tobj
+csetup t_x10
+ret
+end
+n = get g_n 6
+for j ulong 8
+put g_b sub n add j 1 0
+end
+psc t_c10obj
+if not bsave false
+csetup t_x10
+ret
+end
+r = genlib t_ttab true 3 t_c10so
+if ne r 0
+ctl t_x10 r 1
+ret
+end
+ctl t_x10 pchk t_c10so 1
+end
+fn caddr to void
+note the first function record sits at the code end C (object offset 40); its address is 8 bytes in
+if not sload t_tobj
+csetup t_x11
+ret
+end
+a = add bq 40 8
+put g_b a uchar add get g_b a 2
+psc t_c11obj
+if not bsave false
+csetup t_x11
+ret
+end
+r = genlib t_ttab true 4 t_c11so
+ctle t_x11 r 1 t_mobj
+end
+fn cfrest to void
+note LDP D8, D9, [SP, #128] is 0x6d4827e8 (bytes e8 27 48 6d), first in the shared return; byte 2 0x49
+note makes the offset 144
+ok = tload t_d12
+o = bfind4 232 39 72 109
+if or not ok ge o shl ulong 1 63
+csetup t_x12
+ret
+end
+put g_b add o 2 73
+ctl t_x12 tsave t_c12lib t_c12prb 250
 end
 note g_b[o] is v
 fn bis o ulong v ulong to bool
@@ -1070,6 +1293,9 @@ cext
 cuext
 crestore
 cruntime
+cneed
+caddr
+cfrest
 f = get g_n 11
 ot t_sum
 if eq f 0

@@ -36,7 +36,7 @@ AArch64 Linux shared libraries written by Omega alone: `shlib.om` turns omc's ob
 Rules:
 
 - only Omega source and its tables; C and `gcc` checks run outside the tree, and the gate runs `readelf` only as a read-only oracle
-- every change keeps `tests/gates/run.sh shlib` passing with its nine controls caught
+- every change keeps `tests/gates/run.sh shlib` passing with its twelve controls caught
 
 ## `docs/autodiff/`
 
