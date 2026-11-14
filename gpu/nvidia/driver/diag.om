@@ -1,0 +1,173 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/nvidia/driver/diag.om: the memory diagnosis the driver client adds when an allocation fails.
+note Omega form of CUDApp nvrm/nvrm.c meminfo_kb, buddy_free_blocks_ge, fail_alloc_context and
+note fail_channel_no_memory (84b524ca). Parsing reuses gpu/nvidia/native/nvrm/counts.om (nc_mem, nc_buddy),
+note which must come first in the composition (it carries the om2 line); gpu/nvidia/driver/parts.txt.
+note The caller reads /proc/meminfo and /proc/buddyinfo whole and hands the bytes in; nothing here opens a file.
+note The C reads lines in 256 and 512 byte pieces and cuts its message at 255 bytes; here a line is a whole
+note line and the message is as long as it needs to be. A caller buffer too small for the message is refused
+note (drv_amsg and drv_cmsg return 2^64 - 1), never cut short. counts.om walks at most 512 bytes of one line,
+note so a longer line is refused here (false) rather than handed to it.
+
+text drv_t " for | bytes, MemFree | kB, MemAvailable | kB| after | attempts over | ms; MemFree | kB, free 2 MiB blocks |UNKNOWN|"
+const drv_line ulong 512
+const drv_none ulong 18446744073709551615
+
+note end of the line that starts at s: the index just past its newline, or len f
+fn drv_eol f view uchar * s ulong to ulong
+i = s
+while lt i len f bound 9223372036854775807
+if eq get f i 10
+ret add i 1
+end
+i = add i 1
+end
+ret i
+end
+
+note meminfo_kb: r[0] gets the kB value of the first line "KEY:", 0 when there is none or its value does not
+note parse (the C answer for an unreadable file is also 0; the caller passes empty bytes then).
+fn drv_meminfo f view uchar * key view uchar * r edit ulong 1 to bool
+st = new ulong 2 0
+put r 0 0
+s = ulong 0
+while lt s len f bound 9223372036854775807
+e = drv_eol f s
+if gt sub e s drv_line
+ret false
+end
+if ne nc_mem part f s sub e s key st 0
+put r 0 get st 1
+ret true
+end
+s = e
+end
+ret true
+end
+
+note buddy_free_blocks_ge: r[0] gets the free blocks of every order >= order summed over all zone lines.
+note The C answer for an unreadable file, ULLONG_MAX, is the caller's to give.
+fn drv_buddy f view uchar * order ulong r edit ulong 1 to bool
+st = new ulong 2 0
+put st 0 order
+s = ulong 0
+while lt s len f bound 9223372036854775807
+e = drv_eol f s
+if gt sub e s drv_line
+ret false
+end
+x = nc_buddy part f s sub e s st
+s = e
+end
+put r 0 get st 1
+ret true
+end
+
+note copy piece w of drv_t (pieces end at "|") to o at n; the new end, or drv_none when o is too small.
+note Past the last piece nothing is copied.
+fn drv_tput o edit uchar * n ulong w ulong to ulong
+if eq n drv_none
+ret n
+end
+k = ulong 0
+i = ulong 0
+while and lt k w lt i len drv_t bound 9223372036854775807
+if eq get drv_t i 124
+k = add k 1
+end
+i = add i 1
+end
+p = n
+if ge i len drv_t
+ret p
+end
+while ne get drv_t i 124 bound 9223372036854775807
+if ge p len o
+ret drv_none
+end
+put o p get drv_t i
+p = add p 1
+i = add i 1
+end
+ret p
+end
+
+note copy the bytes of b to o at n (the C "%s" of the previous error); a NUL in b ends it, as in C
+fn drv_sput o edit uchar * n ulong b view uchar * to ulong
+if eq n drv_none
+ret n
+end
+p = n
+for i ulong len b bound 9223372036854775807
+if eq get b i 0
+break
+end
+if ge p len o
+ret drv_none
+end
+put o p get b i
+p = add p 1
+end
+ret p
+end
+
+note "%llu" of v to o at n
+fn drv_nput o edit uchar * n ulong v ulong to ulong
+if eq n drv_none
+ret n
+end
+d = new uchar 20 0
+k = ulong 0
+x = v
+while true bound 20
+put d k uchar add 48 rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+if gt add n k len o
+ret drv_none
+end
+for j ulong k bound 20
+put o add n j get d sub sub k j 1
+end
+ret add n k
+end
+
+note fail_alloc_context: "%s for %llu bytes, MemFree %llu kB, MemAvailable %llu kB" with v = size, MemFree kB,
+note MemAvailable kB. Returns the message length in o, or drv_none when o is too small.
+fn drv_amsg prev view uchar * v view ulong 3 o edit uchar * to ulong
+n = drv_sput o 0 prev
+n = drv_tput o n 0
+n = drv_nput o n get v 0
+n = drv_tput o n 1
+n = drv_nput o n get v 1
+n = drv_tput o n 2
+n = drv_nput o n get v 2
+ret drv_tput o n 3
+end
+
+note fail_channel_no_memory: "%s after %u attempts over %u ms; MemFree %llu kB, free 2 MiB blocks %s" with
+note v = attempts, delay ms (both u32), MemFree kB, free blocks of order >= 9 (drv_none prints UNKNOWN).
+note The span is (attempts - 1) * delay in 32-bit arithmetic, as the C computes it.
+fn drv_cmsg prev view uchar * v view ulong 4 o edit uchar * to ulong
+a = and get v 0 4294967295
+w = ulong 0
+if gt a 1
+w = and mul sub a 1 and get v 1 4294967295 4294967295
+end
+n = drv_sput o 0 prev
+n = drv_tput o n 4
+n = drv_nput o n a
+n = drv_tput o n 5
+n = drv_nput o n w
+n = drv_tput o n 6
+n = drv_nput o n get v 2
+n = drv_tput o n 7
+if eq get v 3 drv_none
+ret drv_tput o n 8
+end
+ret drv_nput o n get v 3
+end

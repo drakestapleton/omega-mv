@@ -222,6 +222,24 @@ case "$step" in
     [ "$rc" -eq 0 ] || exit "$rc"
     grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
+  # One slice of the CUDApp merge: new Omega for part of the C decision logic of CUDApp nvrm/ and m16/ (gpu/nvidia/driver/). The gate is seeded Omega,
+  # gpu/nvidia/driver/gate.om, composed in the order of gpu/nvidia/driver/parts.txt and built by seed/out/omc after its
+  # digest is checked. It recomputes every case the C oracle printed (oracle-cases.tsv) and runs one changed-answer
+  # control per case kind. The expected case count is counted from the table. Host only; it opens no device.
+  gpu-driver)
+    sha256sum -c --quiet seed/out/omc.sha256 || { echo "OMEGA-GPU-DRIVER REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
+    rm -f "$OUT_DIR/gate"
+    parts=()
+    while IFS= read -r p; do parts+=("$p"); done < gpu/nvidia/driver/parts.txt
+    cat "${parts[@]}" | seed/out/omc > "$OUT_DIR/gate"
+    chmod 700 "$OUT_DIR/gate"
+    cases="$(grep -cv -e '^#' -e '^$' gpu/nvidia/driver/oracle-cases.tsv)"
+    kinds="$(grep -v -e '^#' -e '^$' gpu/nvidia/driver/oracle-cases.tsv | cut -f1 | sort -u | wc -l)"
+    rc=0; "$OUT_DIR/gate" gpu/nvidia/driver/oracle-cases.tsv > "$OUT_DIR/gate.log" || rc=$?
+    cat "$OUT_DIR/gate.log"
+    [ "$rc" -eq 0 ] || exit "$rc"
+    grep -qx "OMEGA-GPU-DRIVER PASS cases=$cases controls=$kinds caught=$kinds hardware=NOT_RUN" "$OUT_DIR/gate.log" ||
+      { echo "OMEGA-GPU-DRIVER FAIL: the summary line does not show every case and control of the table" >&2; exit 1; } ;;
   # Standalone backend qualification: these execute the current sources, never
   # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).
   # They are separate from seed so CPU OpenCL is not required by every host check.
