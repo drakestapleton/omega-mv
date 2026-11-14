@@ -269,6 +269,84 @@ case "$step" in
     c=$((n + m + 1))
     grep -qx "OMEGA-GPU-CHECKS PASS checks=$n controls=$c caught=$c hardware=NOT_RUN" "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-CHECKS FAIL: the summary line does not show $n checks and $c caught controls" >&2; exit 1; } ;;
+  # CUDA compatibility bridge (bridge/cuda/, one slice of CUDApp compat/: the compat/cuda profile): seeded Omega only. c0_check.om is the
+  # profile checker; fixture.om writes the PTX kernel, the link-only libcuda.so.1 stub and synthetic executables;
+  # gate.om replays CUDApp's compat/cuda/test.sh and compares its transcript with bridge/cuda/test-sh-84b524ca.txt.
+  # The control rebuilds c0_check with its "missing row" refusal removed; the gate must then fail.
+  # With BRIDGE_CUDA_CUDAPP (a CUDApp checkout at 84b524ca) and BRIDGE_CUDA_OLDOMC (omc 2c824805...) set, the gate also
+  # runs the old test.sh and gcc builds against the Omega stub, and requires oracle=PASS. Hardware stays NOT_RUN.
+  # The check counts in want= are pinned, as gpu-units pins its unit count; a change in gate.om's checks changes them here.
+  bridge-cuda)
+    sha256sum -c --quiet seed/out/omc.sha256 || { echo "BRIDGE-CUDA REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
+    rm -rf "$OUT_DIR"; mkdir -p "$OUT_DIR"
+    cat gpu/nvidia/om/cache/digest.om bridge/cuda/c0_check.om | seed/out/omc > "$OUT_DIR/c0_check"
+    seed/out/omc < bridge/cuda/fixture.om > "$OUT_DIR/fixture"
+    { printf 'om2\n'; cat seed/ng/sha256.om bridge/cuda/gate.om; } | seed/out/omc > "$OUT_DIR/gate"
+    sed 's/^rfl 55 l 1$/note rfl 55 l 1/' bridge/cuda/c0_check.om > "$OUT_DIR/mutant.om"
+    cmp -s bridge/cuda/c0_check.om "$OUT_DIR/mutant.om" && { echo "BRIDGE-CUDA FAIL: the control mutation did not apply" >&2; exit 1; }
+    cat gpu/nvidia/om/cache/digest.om "$OUT_DIR/mutant.om" | seed/out/omc > "$OUT_DIR/c0_mutant"
+    chmod 700 "$OUT_DIR/c0_check" "$OUT_DIR/fixture" "$OUT_DIR/gate" "$OUT_DIR/c0_mutant"
+    oracle=(); want='checks=27 failed=0 oracle=NOT_RUN'
+    if [ -n "${BRIDGE_CUDA_CUDAPP:-}" ] && [ -n "${BRIDGE_CUDA_OLDOMC:-}" ]; then
+      oracle=("$BRIDGE_CUDA_CUDAPP" "$BRIDGE_CUDA_OLDOMC" "${BRIDGE_CUDA_CC_AARCH64:-/usr/bin/gcc}" "${BRIDGE_CUDA_CC_X86_64:-/usr/bin/x86_64-linux-gnu-gcc}")
+      want='checks=34 failed=0 oracle=PASS'
+    fi
+    rc=0; "$OUT_DIR/gate" "$ROOT/$OUT_DIR/work" "$ROOT/$OUT_DIR/c0_check" "$ROOT/$OUT_DIR/fixture" "${oracle[@]}" > "$OUT_DIR/gate.log" 2>&1 || rc=$?
+    cat "$OUT_DIR/gate.log"
+    [ "$rc" -eq 0 ] || exit "$rc"
+    tail -1 "$OUT_DIR/gate.log" | grep -qx "BRIDGE-CUDA PASS $want hardware=NOT_RUN" ||
+      { echo "BRIDGE-CUDA FAIL: the summary line is not PASS with $want" >&2; exit 1; }
+    crc=0; "$OUT_DIR/gate" "$ROOT/$OUT_DIR/control" "$ROOT/$OUT_DIR/c0_mutant" "$ROOT/$OUT_DIR/fixture" > "$OUT_DIR/control.log" 2>&1 || crc=$?
+    if [ "$crc" -eq 0 ] || ! tail -1 "$OUT_DIR/control.log" | grep -q '^BRIDGE-CUDA FAIL '; then
+      echo "BRIDGE-CUDA FAIL: the mutant c0_check was not caught (rc=$crc)" >&2; exit 1
+    fi
+    echo "BRIDGE-CUDA CONTROL caught: $(tail -1 "$OUT_DIR/control.log")"
+    rm -rf "$OUT_DIR/work" "$OUT_DIR/control" ;;
+  # NVML library slice (bridge/nvml/, one slice of CUDApp compat/: compat/nvml): libnvidia-ml.c, nvml.h and
+  # libnvidia-ml.map are derived files, listed in bridge/nvml/derived.tsv and never stored here. gate.om (seeded Omega)
+  # checks the table and the source digests and compiles the source. With BRIDGE_NVML_TOC set (one or more omega-bridge
+  # src/toc.om paths, ':'-separated) it compiles each emitter and requires the pinned output digests; with
+  # BRIDGE_NVML_CUDAPP (a CUDApp checkout at 84b524ca) it requires CUDApp's committed files to have them too.
+  # Controls: a table with one source digest changed (always); with BRIDGE_NVML_TOC, api.om with one value changed
+  # (its digest re-pinned, so only the emitted bytes can catch it) and the first toc.om with one line added.
+  bridge-nvml)
+    sha256sum -c --quiet seed/out/omc.sha256 || { echo "BRIDGE-NVML REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
+    rm -rf "$OUT_DIR"; mkdir -p "$OUT_DIR"
+    { printf 'om2\n'; cat seed/ng/sha256.om bridge/nvml/gate.om; } | seed/out/omc > "$OUT_DIR/gate"
+    chmod 700 "$OUT_DIR/gate"
+    extra=(); emit=NOT_RUN; orc=NOT_RUN; tocs=()
+    if [ -n "${BRIDGE_NVML_TOC:-}" ]; then
+      IFS=: read -r -a tocs <<< "$BRIDGE_NVML_TOC"
+      for t in "${tocs[@]}"; do extra+=("toc=$t"); done; emit=PASS
+    fi
+    if [ -n "${BRIDGE_NVML_CUDAPP:-}" ]; then extra+=("cudapp=$BRIDGE_NVML_CUDAPP"); orc=PASS; fi
+    rc=0; "$OUT_DIR/gate" "$OUT_DIR/work" seed/out/omc bridge/nvml/derived.tsv "${extra[@]}" > "$OUT_DIR/gate.log" 2>&1 || rc=$?
+    cat "$OUT_DIR/gate.log"
+    [ "$rc" -eq 0 ] || exit "$rc"
+    tail -1 "$OUT_DIR/gate.log" | grep -qE "^BRIDGE-NVML PASS checks=[0-9]+ failed=0 emitter=$emit oracle=$orc\$" ||
+      { echo "BRIDGE-NVML FAIL: the summary line is not PASS with emitter=$emit oracle=$orc" >&2; exit 1; }
+    nvml_control() { # name table [args...]: the gate must report FAIL
+      local name="$1" table="$2"; shift 2
+      local crc=0; "$OUT_DIR/gate" "$OUT_DIR/c-$name" seed/out/omc "$table" "$@" > "$OUT_DIR/c-$name.log" 2>&1 || crc=$?
+      if [ "$crc" -ne 1 ] || ! tail -1 "$OUT_DIR/c-$name.log" | grep -q '^BRIDGE-NVML FAIL '; then
+        echo "BRIDGE-NVML FAIL: control $name was not caught (rc=$crc)" >&2; exit 1
+      fi
+      echo "BRIDGE-NVML CONTROL $name caught: $(grep -m1 '^FAIL ' "$OUT_DIR/c-$name.log" | cut -c1-160) | $(tail -1 "$OUT_DIR/c-$name.log")"
+    }
+    src=gpu/nvidia/native/nvml/api.om; ssum="$(sha256sum "$src" | cut -d' ' -f1)"
+    sed "0,/\t$ssum\t/s//\t0${ssum:1}\t/" bridge/nvml/derived.tsv > "$OUT_DIR/pin.tsv"
+    cmp -s bridge/nvml/derived.tsv "$OUT_DIR/pin.tsv" && { echo "BRIDGE-NVML FAIL: the table mutation did not apply" >&2; exit 1; }
+    nvml_control pin "$OUT_DIR/pin.tsv"
+    if [ "${#tocs[@]}" -gt 0 ]; then
+      sed 's/^note cabi value nvmlReturn_t NVML_ERROR_IRQ_ISSUE 11$/note cabi value nvmlReturn_t NVML_ERROR_IRQ_ISSUE 111/' "$src" > "$OUT_DIR/api-mutant.om"
+      cmp -s "$src" "$OUT_DIR/api-mutant.om" && { echo "BRIDGE-NVML FAIL: the source mutation did not apply" >&2; exit 1; }
+      msum="$(sha256sum "$OUT_DIR/api-mutant.om" | cut -d' ' -f1)"
+      sed "s|\t$src\t$ssum\t|\t$OUT_DIR/api-mutant.om\t$msum\t|" bridge/nvml/derived.tsv > "$OUT_DIR/source.tsv"
+      nvml_control source "$OUT_DIR/source.tsv" "${extra[@]}"
+      { cat "${tocs[0]}"; printf 'note bridge-nvml control: one added line\n'; } > "$OUT_DIR/toc-mutant.om"
+      nvml_control toc bridge/nvml/derived.tsv "toc=$OUT_DIR/toc-mutant.om"
+    fi
+    rm -rf "$OUT_DIR"/work "$OUT_DIR"/c-* ;;
   # Standalone backend qualification: these execute the current sources, never
   # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).
   # They are separate from seed so CPU OpenCL is not required by every host check.
