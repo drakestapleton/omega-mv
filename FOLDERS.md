@@ -77,14 +77,14 @@ Rules:
 
 ## `gpu/nvidia/`
 
-The NVIDIA units of Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047), moved from CUDApp with the history of their files. Step 2 brought the five seeded-Omega units Omega NG pins (`seed/ng/cudapp.lock`): the sm_121 encoder ng pins (a different file from the top-level `om/encoder/bw_enc_sm121.om`, which the Makefile uses), the allocator, the cubin writer, the Blackwell launch unit and the nvrm context unit. Step 3 brought the rest of CUDApp's `om/` tree to `gpu/nvidia/om/` (its CUDApp layout kept). `gpu/nvidia/README.md` and `gpu/UNITS.md` say what is here and what is still in CUDApp.
+The NVIDIA units of Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047), moved from CUDApp with the history of their files. Step 2 brought the five seeded-Omega units Omega NG pins (`seed/ng/cudapp.lock`): the sm_121 encoder ng pins (a different file from the top-level `om/encoder/bw_enc_sm121.om`, which the Makefile uses), the allocator, the cubin writer, the Blackwell launch unit and the nvrm context unit. Step 3 brought the rest of CUDApp's `om/` tree to `gpu/nvidia/om/` and step 4 the rest of its `native/` tree to `gpu/nvidia/native/` (their CUDApp layout kept). `gpu/nvidia/README.md` and `gpu/UNITS.md` say what is here and what is still in CUDApp.
 
 Rules:
 
 - only Omega source (Drake, 2026-11-14: "make sure it's pure omega"); anything else is rewritten in Omega first or stays in CUDApp, listed in the README
 - the bytes of the five pinned units are checked by `seed/ng/gpu/gate.cases` against the digests in `seed/ng/cudapp.lock`; a change to one is a re-qualification of that gate, never a silent edit
 - `gpu/nvidia/import/` and `gpu/import/` are the records of the moves (command, commit map); never edited after the landing that wrote them
-- every unit in `gpu/units.tsv` must compile reproducibly with `seed/out/omc` (`tests/gates/run.sh gpu-units`); the table is written once from CUDApp `om/units.sh` and changes only with the units it lists
+- every unit in `gpu/units.tsv` must compile reproducibly with `seed/out/omc` (`tests/gates/run.sh gpu-units`); the table is written from CUDApp `om/units.sh` and the moved `native/` programs, and changes only with the units it lists
 
 ## `gpu/spirv/` and `gpu/hw/`
 

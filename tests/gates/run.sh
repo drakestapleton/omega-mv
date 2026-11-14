@@ -209,6 +209,7 @@ case "$step" in
     grep -qx 'OMEGA-GPU-AMD-REST PASS sections=34 objects=34 verdicts=377 not_run=120 writer=19 kfd=103 plan=200 controls=14 caught=14 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-AMD-REST FAIL: the summary line does not show the expected sections, verdicts, plan rows and controls" >&2; exit 1; } ;;
   # Omega GPU units (gpu/units.tsv, moved from CUDApp om/ and backend/): the gate is seeded Omega, gpu/units-gate.om,
+  # Omega GPU units (gpu/units.tsv, moved from CUDApp om/, backend/ and native/): the gate is seeded Omega, gpu/units-gate.om,
   # built with seed/ng/sha256.om by seed/out/omc after that compiler's digest is checked; the gate checks it again.
   # The expected count follows gpu/units.tsv; a change to the table changes it in the same commit.
   gpu-units)
@@ -219,7 +220,7 @@ case "$step" in
     rc=0; "$OUT_DIR/gate" seed/out/omc "$OUT_DIR/work" > "$OUT_DIR/gate.log" || rc=$?
     cat "$OUT_DIR/gate.log"
     [ "$rc" -eq 0 ] || exit "$rc"
-    grep -qx 'OMEGA-GPU-UNITS PASS units=372 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
+    grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
   # Standalone backend qualification: these execute the current sources, never
   # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).
