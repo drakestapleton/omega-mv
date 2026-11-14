@@ -35,7 +35,9 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
   4 KiB guard page before the body runs, instead of the body writing past the guard into other
   memory. That assumes a guard of at least 4 KiB directly below the stack (a thread created with
   guard size 0 has none) and a caller whose own stack pointer is inside mapped stack. The gate
-  checks the probe's words; the fault was shown outside the tree with a C caller on an 8 KiB stack.
+  checks the probe's words and, with a mutant generator that drops the call cost, fails. The fault
+  itself is shown outside the tree (a C caller on an 8 KiB thread stack); no receipt of that is
+  kept in this repository.
 - The object's code is copied unchanged, at a 16-byte boundary as in the object.
 - Before linking, the generator checks the object's metadata as spec/omegese-modules.md asks:
   the export count against the header, each function's flags, address (inside the code,
@@ -80,23 +82,27 @@ runs these checks; `gate.om`'s header lists each with its exact status:
    `test.tsv` probe calls constants, int arguments with dirty upper halves, a trapping division
    followed by another call, a pointer write read back by a later call, a uint with a dirty upper
    half, two bodies that need 8 KiB and 16 KiB of stack (one through a private call), a uchar,
-   ushort, byte and short each under dirty upper bits, and a division inside a private callee
-   that traps. The `nvml.tsv` probe calls all 11 NVML exports. Each probe also sets x19..x27, x29
-   and d8..d15 and checks that they and sp come back unchanged.
+   ushort, byte and short each under dirty upper bits, a division inside a private callee that
+   traps, and a body whose need sits one call cost past a 4 KiB page. The `nvml.tsv` probe calls
+   all 11 NVML exports. Each probe also sets x19..x27, x29 and d8..d15 and checks that they and sp
+   come back unchanged.
 4. It runs `/usr/bin/readelf -W -S -d --dyn-syms` on each library. readelf reads the symbols
    through the section headers, which the loader never looks at; it must exit 0, print no
    warning, show the table's soname and list every export of the table (at least one) as a
    `FUNC GLOBAL DEFAULT` symbol line. readelf is a read-only verification oracle, not part of the
    build.
-5. It reads the test library's wrappers (found through `.dynsym`): three stack probes covering
-   3, 5 and 1 pages, each with its ADD, MOVZ and MOVKs and the wrapper's BL after it; and in each
-   wrapper the 10 STP words that save x19..x30 and d8..d15, with the matching LDPs in the shared
-   return.
+5. It reads the test library's wrappers (found through `.dynsym`): the stack probes, each with
+   its ADD, MOVZ and MOVKs and the wrapper's BL after it, covering the page counts `gate.om`'s
+   header gives; and in each wrapper the 10 STP words that save x19..x30 and d8..d15, with the
+   matching LDPs somewhere outside the wrappers (the restore controls check the shared return at
+   run time).
 6. It requires a second build from the same object to have identical bytes.
 
 Its controls change one thing each (the table, the object, the library or its copy) and must be
-caught with their exact exit status and, where one is given, the refusal's own text. Each check
-has at least one. `gate.om`'s header lists them; `run.sh` pins the summary line.
+caught with their exact exit status and, where one is given, the refusal's own text. Checks 3 to
+6 have controls on the test library; the compile checks and the nvml library's copies of the
+same checks have none of their own. `gate.om`'s header lists the controls; `run.sh` pins the
+summary line.
 
 ## NVML status
 

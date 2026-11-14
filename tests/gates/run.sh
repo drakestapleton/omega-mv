@@ -210,7 +210,7 @@ case "$step" in
     rc=0; "$OUT_DIR/gate" seed/out/omc "$OUT_DIR/shlib" "$OUT_DIR/work" > "$OUT_DIR/gate.log" || rc=$?
     cat "$OUT_DIR/gate.log"
     [ "$rc" -eq 0 ] || exit "$rc"
-    grep -qx 'OMEGA-SHLIB PASS checks=14 controls=22 caught=22' "$OUT_DIR/gate.log" ||
+    grep -qx 'OMEGA-SHLIB PASS checks=14 controls=23 caught=23' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-SHLIB FAIL: the summary line does not show the expected checks and controls" >&2; exit 1; } ;;
   # Standalone backend qualification: these execute the current sources, never
   # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).
