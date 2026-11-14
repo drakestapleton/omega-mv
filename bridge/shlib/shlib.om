@@ -51,8 +51,10 @@ note dynstr, 14 runpath in dynstr, 15 section header offset, 16 address minus of
 note 17 object call records, 18 a stack need changed in this pass, 19 the previous function address,
 note 20 and 21 the slot and extension counts of exts, 22 the object's exported functions
 note ck, per object call record (4): source function, destination function, stack cost, instruction offset
-note SMAX: the most stack a call may need, the linker's 8 MiB caller stack (spec/omegese-modules.md)
-const SMAX ulong 8388608
+note SMAX: the most stack a call may need, the AArch64 Linux user address space (48-bit virtual addresses,
+note 2^48 bytes): no stack can be larger. Every settled need and cost is at most SMAX, so need + cost stays
+note below 2^64; the probe's page count (at most 2^36) takes MOVZ and two MOVKs.
+const SMAX ulong 281474976710656
 note ex, per export (8): 0 name offset in ib, 1 name length, 2 trap value, 3 function index, 4 dynstr offset,
 note 5 wrapper offset in .text, 6 wrapper bytes, 7 extensions
 note cl, per call (16): 0 name offset, 1 name length, 2 expect, 3 arguments, 4..9 values, 10..15 1 for buf
@@ -84,12 +86,17 @@ text e_trap "shlib: a trap value above 4294967295\n"
 text e_obj "shlib: the object is not an OMOBJ001 version 1 AArch64 object\n"
 text e_imp "shlib: the object imports a function; imports are not linked here\n"
 text e_rt "shlib: the code loads a runtime entry other than the trap entry\n"
+text e_rtw "shlib: the code stores through the per-call context (x7)\n"
+text e_addr "shlib: a function address is outside the code, unaligned, out of order or inside the entry slots\n"
+text e_slotb "shlib: an export's entry slot does not branch to its function\n"
+text e_bl "shlib: a BL word has no call record, or two records name one BL\n"
+text e_call "shlib: a call record does not match its BL (offset, source, destination or cost)\n"
 text e_miss "shlib: a table export is not an export of the object\n"
 text e_flt "shlib: a float parameter or result; refused\n"
 text e_slot "shlib: more than 6 parameter slots\n"
 text e_ncall "shlib: a call names no export of the table\n"
 text e_reach "shlib: output past the AArch64 branch or literal reach\n"
-text e_stk "shlib: a function needs more than 8 MiB of stack, or its calls form a cycle\n"
+text e_stk "shlib: a function needs more stack than the 2^48-byte address space, or its calls form a cycle\n"
 note ---- small helpers
 fn die t view uchar * code int to void
 r = write 2 t 0 len t
@@ -695,10 +702,13 @@ end
 note the word at object offset w is a B to object offset a
 fn bslot w ulong a ulong to void
 if ne shr ib32 add get nv 0 w 26 5
-die e_obj 1
+die e_slotb 1
 end
 if ne brt w a
-die e_obj 1
+die e_slotb 1
+end
+if lt a add 176 mul oq 64 4
+die e_addr 1
 end
 end
 note the target of the B or BL word at object offset w
@@ -744,7 +754,7 @@ end
 a = get fr add f 1
 if lt fg 2
 if or lt a 176 or ge a get nv 8 or ne and a 3 0 le a get nv 19
-die e_obj 1
+die e_addr 1
 end
 put nv 19 a
 end
@@ -783,6 +793,9 @@ end
 if or ne q add p 24 0 gt q add p 32 1
 die e_obj 1
 end
+if and eq k 0 ne q add p 16 0
+die e_obj 1
+end
 end
 note the end of function s's code: the lowest higher address of a private or exported function, else the
 note code end
@@ -809,13 +822,13 @@ n = add n 1
 end
 end
 if ne n get nv 17
-die e_obj 1
+die e_bl 1
 end
 for k ulong get nv 17 bound 9223372036854775807
 w = get ck add mul k 4 3
 for j ulong k bound 9223372036854775807
 if eq get ck add mul j 4 3 w
-die e_obj 1
+die e_bl 1
 end
 end
 end
@@ -873,10 +886,10 @@ end
 w = oq o
 csite s w
 if ne brt w get fr add mul d 8 1
-die e_obj 1
+die e_call 1
 end
 if eq oq add o 24 0
-die e_obj 1
+die e_call 1
 end
 x = mul k 4
 put ck x s
@@ -891,13 +904,13 @@ end
 note the call instruction at object offset w: aligned, inside function s and a BL
 fn csite s ulong w ulong to void
 if or lt w get fr add mul s 8 1 ne and w 3 0
-die e_obj 1
+die e_call 1
 end
 if ge w fend s
-die e_obj 1
+die e_call 1
 end
 if ne shr ib32 add get nv 0 w 26 37
-die e_obj 1
+die e_call 1
 end
 end
 note the stack each function needs, settled as the linker does: need(f) = max(local(f), cost(call) +
@@ -937,7 +950,8 @@ v = or v shl ulong get ib add o j mul j 8
 end
 ret v
 end
-note no load of a runtime entry other than [x7, #16]: LDR (immediate, 64-bit) with Rn = x7
+note no load of a runtime entry other than [x7, #16] (LDR immediate, 64-bit, Rn = x7) and no store through x7
+note (stx7): the wrapper's saved registers sit in the same frame
 fn rtscan to void
 b = add get nv 0 176
 n = div sub get nv 8 176 4
@@ -948,7 +962,22 @@ if ne and shr w 10 4095 2
 die e_rt 1
 end
 end
+if stx7 w
+die e_rtw 1
 end
+end
+end
+note w stores with base register x7: STR (unsigned offset, any size), STUR/STR pre- or post-index or
+note register offset and the atomics of that class, or STP/STNP (any form); a pattern check like rtscan's
+fn stx7 w ulong to bool
+if ne and shr w 5 31 7
+ret false
+end
+m = and w 1002438656
+if or eq m 956301312 eq m 939524096
+ret true
+end
+ret eq and w 977272832 671088640
 end
 fn exbind k ulong to void
 x = mul k 8
@@ -1093,23 +1122,24 @@ end
 w32 p 2432697328
 wrmov add p 4 0 g 17
 wrmov add p 8 1 shr g 16 17
-w32 add p 12 3510634000
-w32 add p 16 4181721631
-w32 add p 20 4043310641
-w32 add p 24 1426063265
-ret add p 28
+wrmov add p 12 2 shr g 32 17
+w32 add p 16 3510634000
+w32 add p 20 4181721631
+w32 add p 24 4043310641
+w32 add p 28 1426063265
+ret add p 32
 end
 note the 4 KiB pages export k's body needs (its function's settled stack need, rounded up)
 fn pgs k ulong to ulong
 f = mul get ex add mul k 8 3 8
 ret div add get fr add f 7 4095 4096
 end
-note the probe's words for export k: 7, or 0 when the body needs no stack
+note the probe's words for export k: 8, or 0 when the body needs no stack
 fn pwds k ulong to ulong
 if eq pgs k 0
 ret 0
 end
-ret 7
+ret 8
 end
 note the library layout in ly: 0 .hash, 1 its bytes, 2 .dynsym, 3 .dynstr, 4 .text (the trap entry), 5 the
 note object's code, 6 the end of the RX segment, 7 .dynamic (file offset), 8 .dynamic address, 9 .shstrtab,
