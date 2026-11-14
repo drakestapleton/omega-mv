@@ -64,6 +64,16 @@ Rules:
 - `gpu/nvidia/import/` and `gpu/import/` are the records of the moves (command, commit map); never edited after the landing that wrote them
 - every unit in `gpu/units.tsv` must compile reproducibly with `seed/out/omc` (`tests/gates/run.sh gpu-units`); the table is written from CUDApp `om/units.sh` and the moved `native/` programs, and changes only with the units it lists
 
+## `gpu/nvidia/driver/`
+
+New Omega for decision logic still written in C in CUDApp `nvrm/` and `m16/` (84b524ca), not a move: card selection, the class-list marshalling, the GPFIFO retire window, the `/proc` readers and failure messages, the M16 marker wait. Its gate (`tests/gates/run.sh gpu-driver`) compares it with `oracle-cases.tsv`, printed by a C oracle kept outside the tree. See its README.
+
+Rules:
+
+- `oracle-cases.tsv` is output of the old C, never retyped; regenerate it with the oracle the README names (sha256 and location) and change it only with that oracle
+- the parts are joined in the order of `parts.txt`, not listed in `gpu/units.tsv`
+- no C, Python or shell in this directory; the oracle and its mutation controls stay outside
+
 ## `gpu/spirv/` and `gpu/hw/`
 
 Seeded-Omega programs moved from CUDApp `backend/` (ADR 0047, step 3): the SPIR-V kernel builder and its bit-exact host reference (`gpu/spirv/emit.om`, `conform.om`), and `hwman`, the hardware capability manifest (`gpu/hw/*.om` with the table `gpu/hw/manifest.tsv` it reads). Their run-time checks are still shell and C in CUDApp; here they are compiled by `tests/gates/run.sh gpu-units`.
