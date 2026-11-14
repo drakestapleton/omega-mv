@@ -120,10 +120,11 @@ The gate takes these steps:
 Its last line is `OMEGA-GPU-RUNTIME PASS|FAIL checks=N controls=C caught=K hardware=NOT_RUN`. A PASS needs at least
 one check, no FAIL line, and K equal to C.
 
-Names and table rows have no length limit of the gate's own; its memory grows with the input. The one fixed limit
-is the Linux path limit (PATH_MAX, 4096 bytes with the terminating zero): a path the gate would build at 4096 bytes
-or more (the compiler path, `SCRATCH/`, or `SCRATCH/NAME` with a suffix) is refused with exit 2 before any system
-call is made with it.
+Names and table rows have no length limit of the gate's own; its memory grows with the input. A name is never a file
+name: the gate's scratch files are `SCRATCH/uK.*` and `SCRATCH/uKd/`, K the number of the name in reading order. The
+one fixed limit is the Linux path limit (PATH_MAX, 4096 bytes with the terminating zero): a compiler path, or a
+`SCRATCH/` that with one of those file names would reach 4096 bytes, is refused with exit 2 before any system call
+is made with it.
 
 That is all the gate checks. It does not check the CUDApp commit, or that a file of `INVENTORY.tsv` is really
 hand-written. It does not rerun the C oracle. It does not check that a rewrite covers every function of the C file,
