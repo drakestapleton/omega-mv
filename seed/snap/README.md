@@ -1,0 +1,79 @@
+# seed/snap: words that click
+
+Status: IMPLEMENTED, HOST_TESTED (2026-11-14). Not wired into any engine. No model has written a strand. GPU: NOT_RUN.
+
+In an Omega program some items have no alternative: after `add a b` the line must end, and after `ret x` at
+the end of a function the next line must be `end`. `snap.om` finds those items exactly where it can and
+leaves everything else alone. It is the base for two ways of not paying a model step for them:
+
+- Build 1, snap in the engine: the engine asks `snap` after each item and appends a forced item without
+  sampling it. Output is the same program. Not built: no engine file is touched here.
+- Build 2, single strand: the model writes only the items that were choices (`strip` shows that form) and
+  `expand` puts the forced items back.
+
+## Use
+
+    seed/out/omc < seed/snap/snap.om > snap && chmod +x snap
+    { TABLE; echo '%%'; echo strip;  cat prog.om;  } | ./snap > prog.strand
+    { TABLE; echo '%%'; echo expand; cat prog.strand; } | ./snap > prog.back.om
+
+TABLE is one line per compiler word, `NAME ARITY ISTYPE`, generated from omega-mcp `data/reference.json`
+for the compiler in use (gate.py shows how). Modes: `strip`, `expand`, `count`. Every mode prints
+`snap items N forced F bad B` on stderr. `strip` exits 3 with no stdout when the program has something
+else where an item was forced (omc refuses such a program too). Other exits: 64 bad framing, 65 bad table
+number, 70 memory refused by the host, 71 read error, 72 write error.
+
+## What is forced (and what is deliberately not)
+
+Forced: the end of a line whose words are all present (statement words, operators and host words by their
+table arity, known functions by their parameter count, known names), and `end` after a line that ends its
+path (`ret`, `exit`, `trap`, `break`, `continue`) unless an `else` may still come.
+
+Left open, so nothing is forced on that line: a name not yet known (it may be a later function), any
+bracket, `while` before an optional `bound`, `for` after its counter name, `get`/`put`/`offsetof` in a unit
+with `struct`, `layout` or `abstract`, a function header in an `om2` unit, every top-level line that is not
+a `fn` line. This under-counts; it never forces an item that had an alternative in the tested programs.
+
+Limit of `expand`: a `note` line written between a path end and its forced `end` comes back after that
+`end`. The compiled program is the same. `text` lines and `note` lines are copied byte for byte.
+
+## Gate
+
+    python3 seed/snap/gate.py seed/out/omc REFERENCE_JSON SCRATCH PROGRAM_DIR...
+
+Python is the test conductor and the oracle (`snapref.py`, a second writing of the same rules); the product
+is `snap.om`. The gate checks every program omc accepts: A strip equals the oracle, B expand equals the
+oracle and compiles to the same binary as the original, C at every forced position omc refuses one more
+word (line end) or one more statement (`end`), D six broken machines each fail.
+
+## Measured (host only)
+
+Compiler: omega-mv main `098be1e5`, omc sha256 `26540e6d…8991`, run through the omega MCP sandbox.
+Programs: 59 accepted examples of omega-harness main `f8561115`, the 20 `bench/inference_cost` reference
+solutions, 9 fixtures.
+
+| Set | Programs | Items | Forced | Qwen3.8-27B tokens, program | tokens, strand |
+|---|---|---|---|---|---|
+| bench/inference_cost references | 20 | 1022 | 218 (21.3%) | 1265 | 1067 |
+| omega-harness examples | 59 | 7891 | 1536 | 15057 | 13575 |
+| both | 79 | 8913 | 1754 (19.7%) | 16322 | 14642 |
+
+Items are words and line ends. Tokens were counted with the tokenizer of Qwen3.8-27B-FP8 rev `017b9c7a`
+(tokenizer.json sha256 `0997f410…`). On the bench set the strand is 198 tokens shorter (15.7%).
+
+Gate run on the Spark (Linux AArch64) with the committed `seed/out/omc` (sha256 `26540e6d…8991`), programs from
+the omega-harness examples, `bench/inference_cost/tasks` (references and the 20 deliberately wrong `mutant.om`
+answers, which still compile) and the fixtures: `SNAPGATE PASS accepted=108 items=9420 forced=1896
+positions=1896 mutants=6/6 fail=0`.
+
+- A/B: 108 of 108 accepted programs pass; every expanded program compiles to the same binary.
+- C: at all 1896 forced positions omc refused the alternative (error 5: 1537, error 16: 243, error 17: 116).
+  26 of the 142 `end` positions were refused with error 16 instead of 17, so there the inserted statement may
+  have been refused for another reason; those are weaker evidence.
+- D: 6 of 6 mutants caught (each fails 19 to 106 of the 108 programs).
+- The 71 programs omc refuses were all answered by `strip` (none trapped).
+
+MODELED, not measured: on the bench set Build 2 needs 1265/1067 = 1.186 times fewer model steps; Build 1
+needs 1265/(1067 + 0.313 x 198) = 1.120 times fewer row-passes if a forced row costs 0.313 of a row (the
+FP8 matrix-vector figure measured on the MI300X, one session, synthetic matrix; other per-row costs ignored).
+Whether a model writes the strand form as correctly as the normal form is not measured.
