@@ -18,8 +18,10 @@ Needs AArch64 Linux (a Raspberry Pi 4/5 on a 64-bit OS, an Ampere or Graviton bo
 an arm64 Linux VM, a DGX Spark) with `git`, `sh`, `awk`, `sed`, `tar` and coreutils. No root, no
 network after the clone, no compiler.
 
+Get a copy of the project from its page, <https://interplane.io/drakestapleton/omega-mv> (the page shows how),
+then:
+
 ```sh
-git clone https://github.com/aien-dev/omega-mv
 cd omega-mv
 sh seed/challenge/run.sh
 ```

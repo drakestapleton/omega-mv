@@ -19,9 +19,9 @@ Shared rules: read https://www.aienos.com/agents/RULES.md first. This file adds 
 
 Needs an AArch64 Linux host with `gcc`, `make` and `sh`. CI runs host suites on `ubuntu-24.04-arm`, and `test-realize` compiles with `-march=armv8.6-a+dotprod+i8mm+sve`.
 
+Get a copy with its history from the project page, https://interplane.io/drakestapleton/omega-mv, then in that folder:
+
 ```bash
-git clone https://github.com/aien-dev/omega-mv.git omega
-cd omega
 sh seed/omega-from-seed.sh   # or: make omega-from-seed
 ```
 
@@ -35,7 +35,7 @@ Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) 
 - `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0` on `make` builds the host suites without a physics checkout.
 - `OUT_DIR`: per-step build directory; `tests/gates/run.sh` sets it to `build/step-<name>`.
 - `.aien/always` lists the gates every commit must pass (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`); `.aien/verify.pub` is the Spark judge's public key.
-- `AIEN_OMEGA_FP8_GROUPED_WAVE=1` and `AIEN_OMEGA_FP8_GROUPED_CTAS=n` change the GB10 FP8 grouped expert launch (off by default; see `README.md`).
+- `AIEN_OMEGA_FP8_GROUPED_WAVE=1` and `AIEN_OMEGA_FP8_GROUPED_CTAS=n` change the GB10 FP8 grouped expert launch (off by default; see `ENGINEERING-NOTES.md`).
 
 ## Usage
 
@@ -78,11 +78,11 @@ Gates whose manifest lists `gb10` under `requires:` (for example the `*-silicon`
 
 ## Further reading
 
-- `README.md`: current state, standing rules and the legacy build commands.
+- `README.md`: the plain front page. `ENGINEERING-NOTES.md`: current state, standing rules and the legacy build commands.
 - `seed/README.md`: the seed ladder rung by rung, and the seeded compiler's checks.
 - `docs/one_layer/OMEGESE.md`, `docs/one_layer/OM_COMPLETION.md`: the language and its completeness audit.
 - `docs/ROADMAP-1.0.md`: the Omega 1.0 readiness audit, milestones RM1..RM11 and their acceptance gates (live status stays with aien-architecture).
 - `docs/migration/C-TO-OM-INVENTORY.md`: remaining C to replace.
 - `docs/PIPELINE.md`: how a pull request is tested on the Spark.
 - `CONTRIBUTORS.md`: who built what.
-- The kernel Omega is meant to run on, Aienux: https://github.com/aien-dev/aienux
+- The kernel Omega is meant to run on, Aienux: https://interplane.io/drakestapleton/aienux
