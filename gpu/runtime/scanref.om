@@ -1,0 +1,270 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/runtime/scanref.om: the host scan references of CUDApp src/omega_gpu_scan_ref.c (84b524ca) in Omega,
+note the frozen tile order on the CPU, additions only. Program mode (OM-1, run-time pools). Composed after
+note gpu/nvidia/om/apiviews/scan.om, whose av_scan is the one 32-wide tile, as the C called it. The cross-tile
+note carry is the order of gpu/nvidia/om/apiviews/scancarry.om (ar_carry), tot[e / 32 - 1] + out[e]; that unit is
+note OM-2 and scan.om is OM-1 (its parameter `out` is an OM-2 word), so the two do not compose into one unit and
+note the carry is written here on the pools.
+note The caller fills the input pools (sr_x, sr_u, sr_k, sr_v) to at least n elements; the temporaries are
+note sized here from n. Every function gives 0, 1 for bad arguments (the C's -1), or 4 when the host refuses
+note memory (the C's malloc failure, also -1 there).
+global sr_x f32 *
+global sr_y f32 *
+global sr_t f32 *
+global sr_r f32 1
+global sr_u uint *
+global sr_uy uint *
+global sr_k uint *
+global sr_v uint *
+global sr_tk uint *
+global sr_tv uint *
+note Tile count of n values: ceil(n / 32).
+fn sr_tiles n ulong to ulong
+ret div add n 31 32
+end
+note Length of prefix level l: level 0 is the n inputs, level l + 1 the tile totals of level l.
+fn sr_len n ulong l ulong to ulong
+m = n
+for i ulong l
+m = sr_tiles m
+end
+ret m
+end
+note Offset in sr_t of the totals of level l; level l + 1 is scanned in place there.
+fn sr_off n ulong l ulong to ulong
+o = ulong 0
+m = n
+for i ulong l
+k = sr_tiles m
+o = add o k
+m = k
+end
+ret o
+end
+note Elements of sr_t the prefix needs: the totals of every level the C's recursion allocated.
+fn sr_ptmp n ulong to ulong
+k = sr_tiles n
+t = k
+while gt k 1 bound 64
+k = sr_tiles k
+t = add t k
+end
+ret t
+end
+fn sr_grow n ulong to ulong
+r = enlarge sr_t n
+if ne r 0
+ret 4
+end
+ret 0
+end
+note Load the live values of a tile into w: from sr_x (src 0) or sr_t (src 1) at offset o.
+fn sr_ld src ulong o ulong live ulong w edit f32 32 to void
+for i ulong live
+if eq src 0
+put w i get sr_x add o i
+else
+put w i get sr_t add o i
+end
+end
+end
+fn sr_live m ulong b ulong to ulong
+live = sub m b
+if gt live 32
+ret 32
+end
+ret live
+end
+note omega_gpu_reduce_reference: op 0 sum, 1 max, 2 min over sr_x[0, n); the result in sr_r[0]. Each level
+note is written over sr_t from 0 (tile j is read before sr_t[j] is written, j <= 32j).
+fn sr_reduce op ulong n ulong to ulong
+if or gt op 2 eq n 0
+ret 1
+end
+if lt len sr_x n
+ret 1
+end
+if ne sr_grow sr_tiles n 0
+ret 4
+end
+w = new f32 32 0.0f32
+v = new f32 32 0.0f32
+src = ulong 0
+m = n
+while or eq src 0 gt m 1 bound 64
+nt = sr_tiles m
+for j ulong nt bound 9223372036854775807
+b = mul j 32
+live = sr_live m b
+sr_ld src b live w
+if ne av_scan op live w v 0
+ret 1
+end
+put sr_t j get v 0
+end
+src = ulong 1
+m = nt
+end
+put sr_r 0 get sr_t 0
+ret 0
+end
+note One prefix tile: live values at data offset o + b of level l (l 0: sr_x into sr_y; later: sr_t in place),
+note scanned through av_scan op 3; its total (v[31]) to sr_t[ti].
+fn sr_ltile l ulong o ulong b ulong live ulong ti ulong to ulong
+w = new f32 32 0.0f32
+v = new f32 32 0.0f32
+src = ulong 0
+if ne l 0
+src = ulong 1
+end
+sr_ld src add o b live w
+if ne av_scan 3 live w v 0
+ret 1
+end
+for i ulong live
+if eq l 0
+put sr_y add b i get v i
+else
+put sr_t add o add b i get v i
+end
+end
+put sr_t ti get v 31
+ret 0
+end
+note Scan prefix level l of n inputs; the tile totals to sr_t from sr_off n l.
+fn sr_lvl n ulong l ulong to ulong
+m = sr_len n l
+o = ulong 0
+if gt l 0
+o = sr_off n sub l 1
+end
+tt = sr_off n l
+for j ulong sr_tiles m bound 9223372036854775807
+b = mul j 32
+if ne sr_ltile l o b sr_live m b add tt j 0
+ret 1
+end
+end
+ret 0
+end
+note Carry of prefix level l from its prefixed totals: data[e] = tot[e / 32 - 1] + data[e], e from 32.
+fn sr_carry n ulong l ulong to void
+m = sr_len n l
+tt = sr_off n l
+e = ulong 32
+if eq l 0
+while lt e m bound 9223372036854775807
+c = get sr_t add tt sub div e 32 1
+put sr_y e add c get sr_y e
+e = add e 1
+end
+else
+o = sr_off n sub l 1
+while lt e m bound 9223372036854775807
+c = get sr_t add tt sub div e 32 1
+d = add o e
+put sr_t d add c get sr_t d
+e = add e 1
+end
+end
+end
+note omega_gpu_prefix_sum_reference: inclusive prefix sum of sr_x[0, n) into sr_y. The C recursed (scan a
+note level, prefix its totals, carry); this scans down the levels, then carries back up, deepest first.
+fn sr_prefix n ulong to ulong
+if or eq n 0 lt len sr_x n
+ret 1
+end
+r = enlarge sr_y n
+if ne r 0
+ret 4
+end
+if ne sr_grow sr_ptmp n 0
+ret 4
+end
+if ne sr_lvl n 0 0
+ret 1
+end
+l = ulong 1
+while gt sr_len n l 1 bound 64
+if ne sr_lvl n l 0
+ret 1
+end
+l = add l 1
+end
+note levels 0 .. l - 1 are scanned and level l - 1 is one tile; carry levels l - 2 down to 0
+k = sub l 1
+while gt k 0 bound 64
+k = sub k 1
+sr_carry n k
+end
+ret 0
+end
+note omega_gpu_prefix_sum_u32_reference: the running total of sr_u[0, n) into sr_uy, modulo 2^32.
+fn sr_pu32 n ulong to ulong
+if or eq n 0 lt len sr_u n
+ret 1
+end
+r = enlarge sr_uy n
+if ne r 0
+ret 4
+end
+s = uint 0
+for i ulong n bound 9223372036854775807
+s = add s get sr_u i
+put sr_uy i s
+end
+ret 0
+end
+note One stable counting pass of sr_radix on the 4-bit digit at shift sh.
+fn sr_rpass n ulong hv ulong sh ulong to void
+at = new ulong 16 0
+for i ulong n bound 9223372036854775807
+d = and shr ulong get sr_k i sh 15
+put at d add get at d 1
+end
+s = ulong 0
+for d ulong 16
+c = get at d
+put at d s
+s = add s c
+end
+for i ulong n bound 9223372036854775807
+d = and shr ulong get sr_k i sh 15
+w = get at d
+put at d add w 1
+put sr_tk w get sr_k i
+if ne hv 0
+put sr_tv w get sr_v i
+end
+end
+for i ulong n bound 9223372036854775807
+put sr_k i get sr_tk i
+if ne hv 0
+put sr_v i get sr_tv i
+end
+end
+end
+note omega_gpu_radix_sort_reference: sort sr_k[0, n), and sr_v[0, n) with it when hv is not 0 (the C's vals
+note not NULL): least significant digit first, 4-bit digits, a stable counting pass per digit.
+fn sr_radix n ulong hv ulong to ulong
+if or eq n 0 lt len sr_k n
+ret 1
+end
+if and ne hv 0 lt len sr_v n
+ret 1
+end
+r = enlarge sr_tk n
+if ne r 0
+ret 4
+end
+if ne hv 0
+r = enlarge sr_tv n
+if ne r 0
+ret 4
+end
+end
+for p ulong 8
+sr_rpass n hv mul p 4
+end
+ret 0
+end

@@ -197,6 +197,19 @@ case "$step" in
     [ "$rc" -eq 0 ] || exit "$rc"
     grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
+  # CUDApp src/ (the C runtime) moved into gpu/runtime/: the gate is seeded Omega, gpu/runtime/gate.om, built with
+  # seed/ng/sha256.om and gpu/runtime/zsha.om by seed/out/omc after that compiler's digest is checked; the gate checks
+  # it again. Its counts follow gpu/runtime/checks.tsv and controls.tsv, so the line is matched by its form.
+  gpu-runtime)
+    sha256sum -c --quiet seed/out/omc.sha256 || { echo "OMEGA-GPU-RUNTIME REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
+    rm -rf "$OUT_DIR/gate" "$OUT_DIR/work"
+    { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/gate.om; } | seed/out/omc > "$OUT_DIR/gate"
+    chmod 700 "$OUT_DIR/gate"
+    rc=0; "$OUT_DIR/gate" seed/out/omc "$OUT_DIR/work" > "$OUT_DIR/gate.log" || rc=$?
+    cat "$OUT_DIR/gate.log"
+    [ "$rc" -eq 0 ] || exit "$rc"
+    tail -1 "$OUT_DIR/gate.log" | grep -Eqx 'OMEGA-GPU-RUNTIME PASS checks=[1-9][0-9]* controls=([1-9][0-9]*) caught=\1 hardware=NOT_RUN' ||
+      { echo "OMEGA-GPU-RUNTIME FAIL: the summary line is not a PASS with every control caught" >&2; exit 1; } ;;
   # Standalone backend qualification: these execute the current sources, never
   # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).
   # They are separate from seed so CPU OpenCL is not required by every host check.
