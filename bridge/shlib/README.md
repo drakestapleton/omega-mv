@@ -118,8 +118,10 @@ runs these checks; `gate.om`'s header lists each with its exact status:
    an offset argument, the C library's `strlen`), keeps a counter in a state, and shows that a trap
    releases the lock. The `nvml.tsv` probe drives the real NVML bodies against the RM fake: init,
    count, handles, name, UUID, temperature, memory, utilization, the running processes, error
-   strings, refused arguments and shutdown. It compares what each call writes, the word after it and
-   the words at each pointer a refused call was given, and each error string, with the C library.
+   strings, refused arguments and shutdown, and the narrow arguments (error code, index, name
+   length, sensor) with their upper 32 bits set. It compares what each call writes, the word after
+   it and the words at each pointer a refused call was given, and each error string, with the C
+   library.
    Each probe also sets x19..x27, x29 and d8..d15 and checks that they and sp come back unchanged.
 4. It runs `/usr/bin/readelf -W -S -d --dyn-syms` on each library. readelf reads the symbols
    through the section headers, which the loader never looks at; it must exit 0, print no
@@ -159,6 +161,7 @@ point as the C does after its own trap.
 `amp_qmd` unit. `omega_ampere_build_qmd` has ten parameters; the last two come on the caller's stack,
 which a frame export reaches through the frame word after its states. The gate's probe checks the three
 refusals; one accepted build whose last two arguments it passes on the stack, every narrow argument with
-its upper bits set; the same build as a policy request; and the policy with no q. It compares the 256 QMD
-bytes each writes, and the word after them, with what the C writes for the same arguments; 200000 random
-builds are compared with the C outside this tree.
+its upper bits set; the same build as a policy request; the policy with no q; and the byte-reserve
+question CUDApp's `dma_alloc` asks (op 2) at four sizes around the reserve and the free bytes. It compares
+the 256 QMD bytes each writes, the word after them and the request words, with what the C writes for the
+same arguments; 200000 random builds are compared with the C outside this tree.
