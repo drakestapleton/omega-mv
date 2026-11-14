@@ -64,6 +64,17 @@ Rules:
 - `gpu/nvidia/import/` and `gpu/import/` are the records of the moves (command, commit map); never edited after the landing that wrote them
 - every unit in `gpu/units.tsv` must compile reproducibly with `seed/out/omc` (`tests/gates/run.sh gpu-units`); the table is written from CUDApp `om/units.sh` and the moved `native/` programs, and changes only with the units it lists
 
+## `gpu/nvidia/checks/`
+
+Omega behaviour checks that replace the C, Python and shell of CUDApp `tests/` and `tools/`, each with its table of expected values, and their gate `OMEGA-GPU-CHECKS` (`tests/gates/run.sh gpu-checks`). `README.md` says what each check covers and what it does not.
+
+Rules:
+
+- only Omega, tables and Markdown; the C oracles that wrote the tables stay outside the repository, with their path, sha256 and build line in `README.md`
+- a table is the output of its oracle at the CUDApp commit its header names; regenerate it, never retype a value
+- `ports.tsv` is the only hand-written input; `INVENTORY.tsv` is written by `inventory.om` from it and a CUDApp checkout, and the gate fails when the two disagree
+- every check has a table control, every row of `mutants.tsv` must compile and be caught, and a FROM must match exactly one line of its part
+
 ## `gpu/spirv/` and `gpu/hw/`
 
 Seeded-Omega programs moved from CUDApp `backend/` (ADR 0047, step 3): the SPIR-V kernel builder and its bit-exact host reference (`gpu/spirv/emit.om`, `conform.om`), and `hwman`, the hardware capability manifest (`gpu/hw/*.om` with the table `gpu/hw/manifest.tsv` it reads). Their run-time checks are still shell and C in CUDApp; here they are compiled by `tests/gates/run.sh gpu-units`.
