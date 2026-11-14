@@ -197,7 +197,7 @@ case "$step" in
     [ "$rc" -eq 0 ] || exit "$rc"
     grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
-  # CUDApp src/ (the C runtime) moved into gpu/runtime/: the gate is seeded Omega, gpu/runtime/gate.om, built with
+  # gpu/runtime/ (one slice of the work on CUDApp src/, the C runtime): the gate is seeded Omega, gpu/runtime/gate.om, built with
   # seed/ng/sha256.om and gpu/runtime/zsha.om by seed/out/omc after that compiler's digest is checked; the gate checks
   # it again. Its counts follow gpu/runtime/checks.tsv and controls.tsv, so the line is matched by its form.
   gpu-runtime)
