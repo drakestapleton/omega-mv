@@ -36,13 +36,19 @@ note                             argument 9 on, 8 bytes each, a narrow one in it
 note                             unspecified); each further parameter, one per STATE named (at most 5), is a sized
 note                             view or edit that the wrapper points at that state, at most its size
 note   call NAME EXPECT ARG...   the probe calls NAME with up to 10 arguments (a decimal 64-bit value, buf for
-note                             a pointer to one 4096-byte writable buffer, zeroed at load and shared by every
+note                             a pointer to one writable buffer, every byte 0xA5 at load and shared by every
 note                             call, so a later call reads what an earlier one wrote, buf+N for the pointer
-note                             N bytes into it (0..4095), or bufword for the u64 that buffer holds at offset
-note                             0; arguments 9 and 10 go on the stack, as AAPCS64
-note                             passes them) and compares the low 32 bits of the result with EXPECT
-note   bufeq OFF VALUE           the probe compares the u64 the buffer holds at byte offset OFF (0..4088) with
-note                             VALUE, all 64 bits, after the rows before it (at least one call row)
+note                             N bytes into it, or bufword for the u64 that buffer holds at offset 0;
+note                             arguments 9 and 10 go on the stack, as AAPCS64
+note                             passes them) and compares the low 32 bits of the result with EXPECT (any:
+note                             not compared, for an address)
+note   bufeq OFF VALUE           the probe compares the u64 the buffer holds at byte offset OFF with VALUE, all
+note                             64 bits, after the rows before it (at least one call row)
+note   bufset OFF VALUE          the probe stores the u64 VALUE at byte offset OFF of the buffer, after the rows
+note                             before it (at least one call row), so a later call reads it
+note   reteq OFF VALUE           the probe compares the u64 at byte OFF from the address the last call returned
+note                             with VALUE (at least one call row before it)
+note The buffer reaches 4096 bytes past the largest offset buf+N, bufeq or bufset names.
 note From the C calling convention (AAPCS64) to omc's function ABI, per export: each C argument register is one
 note omc parameter slot, in order (a scalar or a sized array: one slot; an unsized view or edit: a pointer slot
 note then a ulong count slot). Narrow integer arguments are sign- or zero-extended as omc expects. x7 points at a
@@ -130,6 +136,9 @@ text k_buf "buf"
 text k_bufw "bufword"
 text k_bufeq "bufeq"
 text k_bufp "buf+"
+text k_bufset "bufset"
+text k_reteq "reteq"
+text k_any "any"
 text k_need "needed"
 text k_rpath "runpath"
 text k_state "state"
@@ -628,7 +637,15 @@ callrow
 ret
 end
 if ft 0 k_bufeq
-eqrow
+eqrow 1
+ret
+end
+if ft 0 k_bufset
+eqrow 2
+ret
+end
+if ft 0 k_reteq
+eqrow 3
 ret
 end
 if ft 0 k_need
@@ -662,8 +679,11 @@ fname 1 false
 b = clnew
 put cl b get fo 1
 put cl add b 1 get fl 1
+e = ulong 4294967296
+if not ft 2 k_any
 e = fnum 2
-if gt e 4294967295
+end
+if and gt e 4294967295 not ft 2 k_any
 die e_num 1
 end
 put cl add b 2 e
@@ -680,9 +700,7 @@ else
 if fpre f k_bufp
 put cl add add b 14 j 1
 u = dnum add get fo f 4 sub get fl f 4
-if gt u 4095
-die e_num 1
-end
+bufref u
 put cl add add b 4 j u
 else
 put cl add add b 4 j fnum f
@@ -691,15 +709,16 @@ end
 end
 end
 end
-note a bufeq row: OFF at most 4088, after a call row, whose name it takes (its GOT slot is never called)
-fn eqrow to void
+note a bufeq (kind 1), bufset (2) or reteq (3) row after a call row, whose name it takes (its GOT slot is never
+note called)
+fn eqrow kind ulong to void
 nc = get nv 4
 if or ne get nv 9 3 eq nc 0
 die e_row 1
 end
 o = fnum 1
-if gt o 4088
-die e_num 1
+if ne kind 3
+bufref o
 end
 v = fnum 2
 a = mul sub nc 1 CLW
@@ -708,7 +727,16 @@ put cl b get cl a
 put cl add b 1 get cl add a 1
 put cl add b 4 o
 put cl add b 5 v
-put cl add b 24 1
+put cl add b 24 kind
+end
+note the buffer reaches 4096 bytes past the largest offset a row names (nv 39 holds that offset + 1)
+fn bufref o ulong to void
+if gt o sub SMAX 1
+die e_num 1
+end
+if ge o get nv 39
+put nv 39 add o 1
+end
 end
 note a new zeroed call row; its first word
 fn clnew to ulong
@@ -2082,18 +2110,18 @@ note bytes of call row k's code: a bufeq row 10 words; a call row its arguments 
 note 4; a stack argument 1 more for its STR, and SUB SP and ADD SP when there is one) and 8
 fn callsz k ulong to ulong
 b = mul k CLW
-if eq get cl add b 24 1
-ret 40
+if ne get cl add b 24 0
+ret 52
 end
 na = get cl add b 3
 n = ulong 0
 for j ulong na bound 10
 c = get cl add add b 14 j
 if eq c 1
-n = add n 1
+n = add n 2
 else
 if eq c 2
-n = add n 2
+n = add n 3
 else
 n = add n 4
 end
@@ -2109,9 +2137,10 @@ ret mul add n 8 4
 end
 note the probe layout in ly: 0 .hash, 1 its bytes, 2 .dynsym, 3 .dynstr, 4 the relocations, 5 the exit block
 note (code), 6 the end of the RX segment, 7 the RW segment's file offset, 8 its address minus the base, 9 the
-note file's length; the base address is 4 MiB; RW holds .dynamic (192 bytes), the GOT, then the 4096-byte buf
+note file's length, 17 the buffer's size; the base address is 4 MiB; RW holds .dynamic (192 bytes), the GOT, then
+note the buffer
 const PBASE ulong 4194304
-note the arguments of call row k from offset p (buf: ADR of the buffer; bufword: ADR, then LDR of its first
+note the arguments of call row k from offset p (buf: ADRP and ADD of the buffer; bufword: then LDR of its first
 note word): arguments 1..8 into x0..x7; arguments 9 and 10 into x17, then STR X17, [SP, #0 or #8] below SUB SP,
 note SP, #16; the next offset
 fn wrargs k ulong p ulong to ulong
@@ -2151,26 +2180,43 @@ wrmov add p mul h 4 h u j
 end
 ret add p 16
 end
-note argument j as the buffer's address (c 1) or its first word (c 2) at p; the next offset
+note argument j as the buffer's address + N (c 1) or its first word (c 2) at p (ADRP; ADD; LDR); the next offset
 fn wrbuf p ulong bf ulong j ulong c ulong to ulong
-wradr p bf j
+wradrp p bf j
+wraddlo add p 4 bf j j
 if eq c 2
-w32 add p 4 or 4181721088 or shl j 5 j
+w32 add p 8 or 4181721088 or shl j 5 j
+ret add p 12
+end
 ret add p 8
 end
-ret add p 4
-end
 note call row k at offset p (LDR X16, GOT[k]; BLR X16; ADD SP, SP, #16 after stack arguments; X16 = expect; CMP
-note W0, W16; B.EQ +12; MOVZ X0, #k+1; B exit), or its bufeq (ADR X16, buffer + OFF; LDR X16, [X16]; X17 =
-note VALUE; CMP X16, X17; B.EQ +12; MOVZ X0, #k+1; B exit); the next offset
+note W0, W16; B.EQ +12; MOVZ X0, #k+1; B exit), its bufeq (X16 = buffer + OFF; LDR X16, [X16]; X17 = VALUE; CMP
+note X16, X17; B.EQ +12; MOVZ X0, #k+1; B exit), bufset (X16 = buffer + OFF; X17 = VALUE; STR X17, [X16]) or
+note reteq (X17 = OFF; LDR X16, [X0, X17]; X17 = VALUE; CMP and exit as bufeq); the next offset
 fn wrcall1 k ulong p ulong to ulong
 tx = get ly 5
 b = mul k CLW
-if eq get cl add b 24 1
-bf = add add get ly 8 192 mul get nv 4 8
-wradr p add bf get cl add b 4 16
-w32 add p 4 4181721616
-p = wrval add p 8 get cl add b 5 17
+kd = get cl add b 24
+if ne kd 0
+if eq kd 3
+p = wrval p get cl add b 4 17
+w32 p 4168181776
+p = add p 4
+else
+bf = add add add get ly 8 192 mul get nv 4 8 get cl add b 4
+p = wrbuf p bf 16 1
+end
+if eq kd 2
+p = wrval p get cl add b 5 17
+w32 p 4177527313
+ret add p 4
+end
+if eq kd 1
+w32 p 4181721616
+p = add p 4
+end
+p = wrval p get cl add b 5 17
 w32 p 3943760415
 ret wrfail k add p 4
 end
@@ -2183,6 +2229,9 @@ w32 p 2432713727
 p = add p 4
 end
 e = get cl add b 2
+if gt e 4294967295
+ret p
+end
 wrmov p 0 e 16
 wrmov add p 4 1 shr e 16 16
 w32 add p 8 1796210719
@@ -2236,7 +2285,9 @@ end
 put ly 6 add get ly 5 cs
 put ly 7 al16 get ly 6
 put ly 8 add get ly 7 65536
-put ly 9 add add add get ly 7 192 mul nc 8 4096
+note ly 17 the buffer's size: 4096 bytes past the largest offset a row names, a multiple of 16
+put ly 17 al16 add get nv 39 4096
+put ly 9 add add add get ly 7 192 mul nc 8 get ly 17
 end
 fn callsyms to void
 nc = get nv 4
@@ -2251,6 +2302,11 @@ for k ulong nc bound 9223372036854775807
 o = add get ly 4 mul k 24
 w64 o add PBASE add add get ly 8 192 mul k 8
 w64 add o 8 or shl add k 1 32 1025
+end
+note the buffer is in the file, every byte 0xA5, so a write of zeros or of a value past an output shows
+bo = add add get ly 7 192 mul nc 8
+for i ulong get ly 17 bound 9223372036854775807
+w8 add bo i 165
 end
 end
 fn calltext to void

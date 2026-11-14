@@ -79,10 +79,13 @@ table format, the refusals and the exit codes are at the top of `shlib.om`.
   parameter must not overlap another argument.
 - The wrappers have no frame record and the library has no `.eh_frame`, so debuggers and
   `backtrace()` cannot unwind through a wrapper.
-- The probe compares the low 32 bits of each result, and a `bufeq OFF VALUE` row compares the u64
-  the buffer holds at OFF. A call row passes up to ten arguments (`buf`, `buf+N`, `bufword` or a
-  number), the ninth and tenth on the stack. Its mismatch status is 1 + the row index, capped at
-  100 so it never collides with the loader's 127 or the register check's 250.
+- The probe compares the low 32 bits of each result (`any` skips that, for a result that is an
+  address). A call row passes up to ten arguments (`buf`, `buf+N`, `bufword` or a number), the
+  ninth and tenth on the stack. The buffer starts with every byte 0xA5 and reaches 4096 bytes past
+  the largest offset a row names; `bufset OFF VALUE` stores a u64 in it, `bufeq OFF VALUE` compares
+  the u64 it holds at OFF, and `reteq OFF VALUE` compares the u64 at OFF from the address the last
+  call returned. Its mismatch status is 1 + the row index, capped at 100 so it never collides with
+  the loader's 127 or the register check's 250.
 - The module linker refuses a need above 8 MiB (its program's own stack). A library runs on its
   caller's stack, which may be larger, so the generator bounds the need only by the address space.
 - Each object refusal names the rule that fired (address, entry slot, call record, its
@@ -114,8 +117,9 @@ runs these checks; `gate.om`'s header lists each with its exact status:
    past a 4 KiB page. The `imp.tsv` probe calls across imports (live registers kept, a swapped and
    an offset argument, the C library's `strlen`), keeps a counter in a state, and shows that a trap
    releases the lock. The `nvml.tsv` probe drives the real NVML bodies against the RM fake: init,
-   count, handles, name, UUID, temperature, memory, utilization, the running processes, refused
-   arguments and shutdown, and compares every byte they write with what the C library writes.
+   count, handles, name, UUID, temperature, memory, utilization, the running processes, error
+   strings, refused arguments and shutdown. It compares what each call writes, the word after it and
+   the words at each pointer a refused call was given, and each error string, with the C library.
    Each probe also sets x19..x27, x29 and d8..d15 and checks that they and sp come back unchanged.
 4. It runs `/usr/bin/readelf -W -S -d --dyn-syms` on each library. readelf reads the symbols
    through the section headers, which the loader never looks at; it must exit 0, print no
@@ -154,6 +158,7 @@ point as the C does after its own trap.
 `libomega-ampere-qmd.so.1`: `omega_ampere_policy` and `omega_ampere_build_qmd` over the unchanged
 `amp_qmd` unit. `omega_ampere_build_qmd` has ten parameters; the last two come on the caller's stack,
 which a frame export reaches through the frame word after its states. The gate's probe checks the three
-refusals and one accepted build whose last two arguments it passes on the stack, every narrow argument with
-its upper bits set, and compares all 256 QMD bytes with what the C writes for the same arguments; 200000
-random builds are compared with the C outside this tree.
+refusals; one accepted build whose last two arguments it passes on the stack, every narrow argument with
+its upper bits set; the same build as a policy request; and the policy with no q. It compares the 256 QMD
+bytes each writes, and the word after them, with what the C writes for the same arguments; 200000 random
+builds are compared with the C outside this tree.
