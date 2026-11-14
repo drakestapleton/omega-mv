@@ -1,0 +1,457 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Zero-copy buffer sharing over the NVIDIA RM client, ABI 580.173.02: the OM-2 function-mode unit
+note for the one hosted native library (omega-bridge ABI v2, tools/native --host). It has the same
+note export and import semantics as the program-mode native/share/share.om, which composes with
+note native/nvrm/context.om globals. Function mode has no globals or texts, so all state lives in
+note caller buffers: one zcshare block per shared buffer, the 24-byte zcrec share record, one
+note 9264-byte parameter scratch (the largest request, UVM_MAP_EXTERNAL_ALLOCATION), and the
+note control-device path for the fresh descriptor RM_MAP_MEMORY binds. The CPU mapping token lives
+note in whichever native context the caller passes (omega2_ctx_nvshare_*); import and release
+note must use the same context, and each live import holds one of its slots.
+note Export grants DUP_OBJECT by RM_SHARE with the OS security token policy (same user only).
+note Import duplicates the owner's memory with RM_DUP_OBJECT, proves its size, then maps it for
+note the CPU and the GPU at the caller's address. Read-only imports set every access flag read-only.
+note The duplicate holds its own reference: the pages outlive the owner's free or exit.
+note Exports return 0, or the error that zcshare.err also records: a negative errno, or the
+note positive RM status of a refused request. -5 faulted block, -16 block already holds an import,
+note -22 malformed record or block, -34 size other than wanted or than the object, -75 address,
+note -1 re-export of an import (EPERM); a slot shortage is maphold's -24.
+om2
+note Per-buffer block. Inputs: ctlfd, uvmfd, client, device, vaspace, uuid (from the NVRM client);
+note export: obj (the owned memory handle) and size; import: newh (the handle the duplicate gets),
+note mode (0 read/write, 1 read-only), size (the byte size wanted) and addr (CPU and GPU address).
+note Outputs: obj (the live duplicate), map (the CPU mapping token), live (1 RM duplicate, 2 CPU
+note mapping, 4 UVM range, 8 DMA mapping, 16 completed import), stage (51 export, 52 duplicate,
+note 53 size proof and CPU map, 54 UVM range, 55 DMA map, 56 UVM external mapping, 57 imported),
+note err and fault. fault is sticky: the RM view may differ from the block, as for a faulted
+note context.om; the block is released with nvshare_release and then discarded.
+layout zcshare 96
+field ctlfd int at 0 little
+field uvmfd int at 4 little
+field client uint at 8 little
+field device uint at 12 little
+field vaspace uint at 16 little
+field obj uint at 20 little
+field newh uint at 24 little
+field mode uint at 28 little
+field size ulong at 32 little
+field addr ulong at 40 little
+field map long at 48 little
+field live uint at 56 little
+field stage uint at 60 little
+field err long at 64 little
+field uuid uchar 16 at 72 little
+field fault uint at 88 little
+end
+note Share record, little endian: magic OMZC, version 1, owner client, owner memory handle,
+note byte size (whole 4 KiB pages). Byte-identical to share.om's nvshrec.
+layout zcrec 24
+field magic uint at 0 little
+field version uint at 4 little
+field client uint at 8 little
+field handle uint at 12 little
+field size ulong at 16 little
+end
+
+fn zcz p edit uchar 9264 n ulong to void
+for i ulong n
+put p i 0
+end
+end
+fn zcp32 p edit uchar 9264 off ulong v uint to void
+for i ulong 4
+put p add off i uchar and shr v mul i 8 255
+end
+end
+fn zcg32 p edit uchar 9264 off ulong to uint
+v = uint 0
+for i ulong 4
+v = or v shl uint get p add off i mul i 8
+end
+ret v
+end
+fn zcp64 p edit uchar 9264 off ulong v ulong to void
+for i ulong 8
+put p add off i uchar and shr v mul i 8 255
+end
+end
+fn zcg64 p edit uchar 9264 off ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get p add off i mul i 8
+end
+ret v
+end
+fn zcfail s edit zcshare e long to long
+put s err e
+ret e
+end
+note A Linux result r and an RM status st: both zero, or record the first failure.
+fn zcok s edit zcshare r long st uint to bool
+if ne r 0
+put s err r
+ret false
+end
+if ne st 0
+put s err long st
+ret false
+end
+ret true
+end
+note Shareable sizes: whole 4 KiB pages, at most 64 GiB.
+fn zcsize size ulong to bool
+if or eq size 0 gt size 68719476736
+ret false
+end
+ret eq and size 4095 0
+end
+
+note Publish one owned buffer: obj and size in s. Fills rec on success only.
+note A block that holds an import is refused (EPERM): only the owner exports.
+export fn nvshare_export s edit zcshare rec edit zcrec p edit uchar 9264 to long
+if ne get s fault 0
+ret zcfail s neg long 5
+end
+if ne and get s live 16 0
+ret zcfail s neg long 1
+end
+h = get s obj
+size = get s size
+if or eq h 0 eq get s client 0
+ret zcfail s neg long 22
+end
+if not zcsize size
+ret zcfail s neg long 22
+end
+put s stage 51
+zcz p 24
+zcp32 p 0 get s client
+zcp32 p 4 h
+note RS_SHARE_POLICY: target 0, access mask bit RS_ACCESS_DUP_OBJECT, type OS security token, action 0.
+zcp32 p 8 0
+zcp32 p 12 1
+zcp32 p 16 2
+r = devctl get s ctlfd uint 3222816309 p 0 24
+if not zcok s r zcg32 p 20
+ret get s err
+end
+put rec magic 1129991503
+put rec version 1
+put rec client get s client
+put rec handle h
+put rec size size
+put s err 0
+ret long 0
+end
+
+note RM_FREE of the duplicate under the device. Clears live bit 1 on success; faults otherwise.
+fn zcfree s edit zcshare p edit uchar 9264 to bool
+zcz p 16
+zcp32 p 0 get s client
+zcp32 p 4 get s device
+zcp32 p 8 get s obj
+r = devctl get s ctlfd uint 3222292009 p 0 16
+if not zcok s r zcg32 p 12
+put s fault 1
+ret false
+end
+put s live and get s live 4294967294
+put s obj 0
+ret true
+end
+
+note RM_MAP_MEMORY on the control device. Returns a negative errno or the RM status.
+fn zcmap s edit zcshare p edit uchar 9264 obj uint off ulong n ulong fd long to long
+zcz p 56
+zcp32 p 0 get s client
+zcp32 p 4 get s device
+zcp32 p 8 obj
+zcp64 p 16 off
+zcp64 p 24 n
+if eq get s mode 1
+zcp32 p 44 1
+end
+zcp32 p 48 uint fd
+r = devctl get s ctlfd uint 3224913486 p 0 56
+if lt r 0
+ret r
+end
+if gt r 0
+ret neg long 5
+end
+ret long zcg32 p 40
+end
+
+note Size proof and CPU map. RM refuses a map that starts at or past the object's end
+note (INVALID_BASE 0x20) and one that runs past it (INVALID_LIMIT 0x2e). A probe one page past
+note the claimed end must be refused as INVALID_BASE, and the full claimed span must map.
+note Either mismatch is -34 (ERANGE). Returns the mapping token, or -1 with err set. A
+note mapping that cannot be dropped after a failed close stays in map with live bit 2.
+fn zccpu s edit zcshare p edit uchar 9264 path view uchar * obj uint size ulong to long
+fd = fopen path 0 len path 524290 0
+if lt fd 0
+put s err fd
+ret neg long 1
+end
+st = zcmap s p obj size 4096 fd
+if eq st 32
+st = zcmap s p obj 0 size fd
+if eq st 46
+st = neg long 34
+end
+else
+if eq st 0
+st = neg long 34
+end
+end
+if ne st 0
+r = fclose int fd
+if ne r 0
+put s fault 1
+end
+put s err st
+ret neg long 1
+end
+m = maphold get s addr size
+if gt m 0
+r = neg long 1
+if eq get s mode 1
+r = mapbind m int fd 0 1
+else
+r = mapbind m int fd 0 3
+end
+if ne r 0
+m = r
+end
+end
+r = fclose int fd
+if ne r 0
+put s err r
+put s fault 1
+if gt m 0
+r = mapdrop m
+if ne r 0
+put s map m
+put s live or get s live 2
+end
+end
+ret neg long 1
+end
+if lt m 0
+put s err m
+ret neg long 1
+end
+ret m
+end
+
+note GPU side of an import, after the CPU map, as in nvalloc: UVM external range at the CPU
+note address, DMA map at that fixed address, UVM external mapping. A failure faults the block
+note and leaves its live bits for nvshare_release.
+fn zcgpu s edit zcshare p edit uchar 9264 d uint size ulong va ulong to bool
+put s stage 54
+zcz p 24
+zcp64 p 0 va
+zcp64 p 8 size
+r = uvmctl get s uvmfd uint 73 p 0 24
+if not zcok s r zcg32 p 16
+put s fault 1
+ret false
+end
+put s live or get s live 4
+put s stage 55
+zcz p 64
+zcp32 p 0 get s client
+zcp32 p 4 get s device
+zcp32 p 8 get s vaspace
+zcp32 p 12 d
+zcp64 p 24 size
+fl = uint 33040
+if eq get s mode 1
+fl = 33041
+end
+zcp32 p 32 fl
+zcp64 p 48 va
+r = devctl get s ctlfd uint 3225437783 p 0 64
+if not zcok s r zcg32 p 56
+put s fault 1
+ret false
+end
+put s live or get s live 8
+if ne zcg64 p 48 va
+put s err neg long 22
+put s fault 1
+ret false
+end
+put s stage 56
+zcz p 9264
+zcp64 p 0 va
+zcp64 p 8 size
+for i ulong 16
+put p add i 24 get s uuid i
+end
+kind = uint 1
+if eq get s mode 1
+kind = 3
+end
+zcp32 p 40 kind
+zcp64 p 9240 1
+zcp32 p 9248 uint get s ctlfd
+zcp32 p 9252 get s client
+zcp32 p 9256 d
+r = uvmctl get s uvmfd uint 33 p 0 9264
+if not zcok s r zcg32 p 9260
+put s fault 1
+ret false
+end
+ret true
+end
+
+note Record and block checks before any RM call: 0, or the clean refusal to return.
+fn zcchk s edit zcshare rec view zcrec to long
+if ne get s fault 0
+ret neg long 5
+end
+if ne get s live 0
+ret neg long 16
+end
+if or ne get rec magic 1129991503 ne get rec version 1
+ret neg long 22
+end
+if or eq get rec client 0 eq get rec handle 0
+ret neg long 22
+end
+size = get rec size
+if not zcsize size
+ret neg long 22
+end
+if ne size get s size
+ret neg long 34
+end
+if gt get s mode 1
+ret neg long 22
+end
+if or eq get s newh 0 eq get s client 0
+ret neg long 22
+end
+note maphold's bounds (64 KiB up to 1 TiB) also keep the GPU address below the VA space vaSize.
+va = get s addr
+if ne and va 4095 0
+ret neg long 75
+end
+if or lt va 65536 gt va sub 1099511627776 size
+ret neg long 75
+end
+ret long 0
+end
+
+note RM_DUP_OBJECT of the record's object under the device as newh. Returns the duplicate
+note handle, or 0 with err set (fault too when RM accepted but returned handle 0).
+fn zcdup s edit zcshare rec view zcrec p edit uchar 9264 to uint
+zcz p 28
+zcp32 p 0 get s client
+zcp32 p 4 get s device
+zcp32 p 8 get s newh
+zcp32 p 12 get rec client
+zcp32 p 16 get rec handle
+zcp32 p 20 0
+r = devctl get s ctlfd uint 3223078452 p 0 28
+if not zcok s r zcg32 p 24
+ret 0
+end
+d = zcg32 p 8
+if eq d 0
+put s err neg long 22
+put s fault 1
+end
+ret d
+end
+
+note Import the buffer rec describes into s. Clean refusals leave no RM object or mapping and
+note do not fault the block: malformed record or block -22, size other than wanted or than the
+note object -34, address -75, slots full -24, RM refusal of the duplicate (wrong handle, not
+note shared) the positive RM status. A returned duplicate handle 0 is -22 and faults.
+export fn nvshare_import s edit zcshare rec view zcrec p edit uchar 9264 path view uchar * to long
+e = zcchk s rec
+if ne e 0
+ret zcfail s e
+end
+size = get rec size
+va = get s addr
+put s stage 52
+d = zcdup s rec p
+if eq d 0
+ret get s err
+end
+put s obj d
+put s live 1
+put s stage 53
+m = zccpu s p path d size
+if le m 0
+e = get s err
+if zcfree s p
+put s err e
+end
+ret get s err
+end
+put s map m
+put s live 3
+if not zcgpu s p d size va
+ret get s err
+end
+put s live 31
+put s stage 57
+put s err 0
+ret long 0
+end
+
+note Undo an import in nvmrel's order: UVM free, DMA unmap, RM free, CPU unmap. Each live bit
+note clears only after its step is confirmed; a refused step faults the block and keeps the rest
+note live for a retry. With nothing live it returns 0. fault stays set.
+export fn nvshare_release s edit zcshare p edit uchar 9264 to long
+va = get s addr
+size = get s size
+if ne and get s live 4 0
+zcz p 24
+zcp64 p 0 va
+zcp64 p 8 size
+r = uvmctl get s uvmfd uint 34 p 0 24
+if not zcok s r zcg32 p 16
+put s fault 1
+ret get s err
+end
+put s live and get s live 4294967291
+end
+if ne and get s live 8 0
+zcz p 48
+zcp32 p 0 get s client
+zcp32 p 4 get s device
+zcp32 p 8 get s vaspace
+zcp32 p 12 get s obj
+zcp64 p 24 va
+zcp64 p 32 size
+r = devctl get s ctlfd uint 3224389208 p 0 48
+if not zcok s r zcg32 p 40
+put s fault 1
+ret get s err
+end
+put s live and get s live 4294967287
+end
+if ne and get s live 1 0
+if not zcfree s p
+ret get s err
+end
+end
+if ne and get s live 2 0
+r = mapdrop get s map
+if ne r 0
+put s fault 1
+ret zcfail s r
+end
+end
+put s live 0
+put s map 0
+put s obj 0
+put s stage 0
+put s err 0
+ret long 0
+end

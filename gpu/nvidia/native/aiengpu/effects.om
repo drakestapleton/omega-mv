@@ -1,0 +1,130 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note aien-gpu compute ABI 1 client effects (CUDApp#128): the device open/close, the five AGPU ioctls, the CPU
+note mappings and the ordered submit stores. The decisions and request bytes are context.om; the C system calls stay
+note in src/omega_gpu_platform_aien.c behind CUDAPP_MIGRATION_PENDING_C_PLATFORM_AIEN_EFFECTS as the oracle. Needs
+note the OM-2 context compiler that also carries the aien-gpu devctl allowlist (omega-mv feat/om2-devctl-aien-abi1)
+note and a bridge whose mapping fingerprint names it. Returns are Linux results: >= 0, or a negative errno.
+note AGPU_BOOT, AGPU_RM_INIT and AGPU_ARENA_READ are operator requests and are absent on purpose; any request other
+note than the five below, or of another size, is -22 (EINVAL) and never reaches the kernel.
+note Request numbers, _IOC(dir, 'A' 65, nr, size): WolframLanguageEvaluator
+note BitOr[BitShiftLeft[2,30],BitShiftLeft[112,16],BitShiftLeft[65,8],16] -> 2154840336 (AGPU_INFO),
+note BitOr[BitShiftLeft[3,30],BitShiftLeft[48,16],BitShiftLeft[65,8],33] -> 3224387873 (AGPU_MEM_ALLOC),
+note BitOr[BitShiftLeft[3,30],BitShiftLeft[24,16],BitShiftLeft[65,8],34] -> 3222815010 (AGPU_MEM_FREE),
+note BitOr[BitShiftLeft[3,30],BitShiftLeft[72,16],BitShiftLeft[65,8],35] -> 3225960739 (AGPU_CHAN_CREATE),
+note BitOr[BitShiftLeft[3,30],BitShiftLeft[24,16],BitShiftLeft[65,8],36] -> 3222815012 (AGPU_CHAN_DESTROY).
+note O_RDWR|O_CLOEXEC BitOr[2,524288] -> 524290. USERD GPPut 1024*8+0x8c -> 8332; doorbell word 0x90 -> 144
+note (WolframLanguageEvaluator). Mapping extents: maphold/mapnew take 1 byte..64 GiB (2^36 = 68719476736) below
+note 1 TiB (2^40 = 1099511627776); refusals return -22/-27 here instead of trapping.
+om2
+fn ag_le b view uchar * off ulong n ulong to ulong
+v = ulong 0
+for i ulong n
+v = or v shl ulong get b add off i mul i 8
+end
+ret v
+end
+export fn aiengpu_open path view uchar * to long
+ret fopen path 0 len path 524290 0
+end
+export fn aiengpu_close fd long to long
+ret fclose int fd
+end
+export fn aiengpu_ioctl fd long req ulong b edit uchar * to long
+note The caller passes the whole request number and its argument block; both must match one of the five.
+if and eq req 2154840336 eq len b 112
+ret devctl int fd uint 2154840336 b 0 112
+end
+if and eq req 3224387873 eq len b 48
+ret devctl int fd uint 3224387873 b 0 48
+end
+if and eq req 3222815010 eq len b 24
+ret devctl int fd uint 3222815010 b 0 24
+end
+if and eq req 3225960739 eq len b 72
+ret devctl int fd uint 3225960739 b 0 72
+end
+if and eq req 3222815012 eq len b 24
+ret devctl int fd uint 3222815012 b 0 24
+end
+ret neg long 22
+end
+export fn aiengpu_reserve address ulong size ulong to long
+note PROT_NONE MAP_FIXED_NOREPLACE at exactly address; -17 when the range is taken. Refusals never trap.
+if or eq size 0 lt address 65536
+ret neg long 22
+end
+if ne and or address size 4095 0
+ret neg long 22
+end
+if gt size 68719476736
+ret neg long 27
+end
+if ge address 1099511627776
+ret neg long 27
+end
+if gt size sub 1099511627776 address
+ret neg long 27
+end
+ret maphold address size
+end
+export fn aiengpu_bind token long fd long offset ulong to long
+ret mapbind token int fd offset 3
+end
+export fn aiengpu_map_file fd long offset ulong size ulong to long
+if or eq size 0 gt size 68719476736
+ret neg long 22
+end
+ret mapnew int fd offset size 3 1
+end
+export fn aiengpu_address token long to ulong
+ret mapaddr token
+end
+export fn aiengpu_drop token long to long
+ret mapdrop token
+end
+fn ag_plan_ok plan view uchar * to ulong
+note plan: the 128-byte block context.om op 18 wrote (prefix words at 0, GP entry 24, slot 32, GPPut 36,
+note prefix count 40, total words 44).
+if ne len plan 128
+ret 0
+end
+if or gt ag_le plan 40 4 5 ge ag_le plan 32 4 1024
+ret 0
+end
+if ge ag_le plan 36 4 1024
+ret 0
+end
+ret 1
+end
+export fn aiengpu_push pb long plan view uchar * words view uchar * to long
+note Pushbuffer = the plan's prefix words, then the caller's words. The two arrays take four of the six
+note argument slots, so the ring stores are a second export (aiengpu_ring) the caller makes right after.
+if eq ag_plan_ok plan 0
+ret neg long 22
+end
+pre = ag_le plan 40 4
+n = len words
+if or eq n 0 ne and n 3 0
+ret neg long 22
+end
+if ne mul ag_le plan 44 4 4 add mul pre 4 n
+ret neg long 22
+end
+if ne pre 0
+a = mapwrite pb 0 plan 0 mul pre 4
+end
+c = mapwrite pb mul pre 4 words 0 n
+ret 0
+end
+export fn aiengpu_ring fifo long db long plan view uchar * token ulong to long
+note One fence orders the pushbuffer before the ring entry; mapset brackets each store with DSB SY, so the
+note ring entry, GPPut and the doorbell land in that order. A refused plan stores nothing.
+if eq ag_plan_ok plan 0
+ret neg long 22
+end
+cpufence
+e = mapset fifo mul ag_le plan 32 4 8 8 ag_le plan 24 8
+g = mapset fifo 8332 4 ag_le plan 36 4
+h = mapset db 144 4 and token 4294967295
+ret 0
+end

@@ -1,0 +1,228 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note aien-gpu compute ABI 1 client decisions and request bytes (CUDApp#128). Successor of the logic in
+note src/omega_gpu_platform_aien.c; that C stays behind CUDAPP_MIGRATION_PENDING_C_PLATFORM_AIEN as the oracle.
+note Layouts: third_party/aien-gpu-abi1/aien_gpu_uapi.h, little endian, reserved bytes zero. The open, ioctl,
+note mmap and doorbell/USERD stores stay in the C host binding until devctl accepts the AGPU requests.
+note m[0] operation, m[1..] arguments; b is one 128-byte request or reply block (the largest struct is 112).
+note 1 info check: b=agpu_info; 0 usable, 1 abi is not 1, 2 state is not RM_READY (4).
+note 2 mem size: m1 bytes; page-rounded size, or 0 when bytes is 0 or above 2^37.
+note 3 VA start: m1 cursor; the cursor, or the window base when it lies outside [2^36, 2^40).
+note 4 VA align: m1 x, m2 align; x rounded up to max(align, 4096).
+note 5 VA try: m1 at, m2 size, m3 wrapped, m4 start; 0 reserve at, 1 give up, 2 wrap to the base.
+note 6 VA base, 7 VA top. 8 VA step: m1 at, m2 size, m3 align; next candidate after a taken range.
+note 9 MEM_ALLOC request: m1 size, m2 va, m3 flags; writes b, returns 48 (bytes of the request).
+note 10 rm ok: m1 offset of agpu_rm_status in b; 1 when its verdict is AGPU_RM_OK (1).
+note 11 MEM_FREE request: m1 handle; returns 24. 12 CHAN_CREATE request: m1 ring/USERD handle, m2 notifier
+note handle; 1024 entries, ring at 0, USERD at 8192; returns 72. 13 CHAN_DESTROY request: m1 channel; 24.
+note 14 cache policy: m1 kind, m2 rights, m3 cache; 1 GPU-uncached flag, 0 GPU-cached, 2 refused.
+note 15 range: m1 size, m2 off, m3 len; 1 inside. 16 poll check: m1 rights, m2 off, m3 size;
+note 0 ok, 1 not HOST_POLLED, 2 misaligned, 3 out of range. 17 serial compare: m1 observed, m2 target;
+note 1 when (int32)(observed - target) >= 0.
+note 18 submit plan: m1 nwords, m2 words present, m3 L2 invalidate pending, m4 pushbuffer bytes, m5 put,
+note m6 retired, m7 pushbuffer VA. 0 accepted, 1 bad args, 2 bad length, 3 ring full. Accepted writes
+note b[0..20) prefix words, b[24..32) GP entry, b[32..36) ring slot, b[36..40) new GPPut, b[40..44)
+note prefix words, b[44..48) total words.
+note 19 GP entry: m1 va, m2 words. Any other operation returns 0 and writes nothing.
+const AGBASE ulong 68719476736
+const AGTOP ulong 1099511627776
+const AGMAXB ulong 137438953472
+const AGPAGE ulong 4096
+const AGGPMAX ulong 2097151
+const AGRING ulong 1024
+const AGUSERD ulong 8192
+const AGUNC ulong 1
+fn ag_put b edit uchar 128 off ulong v ulong n ulong to void
+for i ulong 8
+if ge i n
+break
+end
+put b add off i uchar and shr v mul i 8 255
+end
+end
+fn ag_load b edit uchar 128 off ulong n ulong to ulong
+v = ulong 0
+for i ulong 8
+if ge i n
+break
+end
+v = or v shl ulong get b add off i mul i 8
+end
+ret v
+end
+fn ag_clear b edit uchar 128 to void
+for i ulong 128
+put b i uchar 0
+end
+end
+fn ag_align x ulong a ulong to ulong
+al = a
+if lt al AGPAGE
+al = AGPAGE
+end
+y = sub add x al 1
+ret sub y and y sub al 1
+end
+fn ag_gp va ulong n ulong to ulong
+ret or or sub va and va 3 shl and n AGGPMAX 42 shl ulong 1 41
+end
+fn ag_submit m view ulong 16 b edit uchar 128 to ulong
+if or eq get m 2 0 eq get m 1 0
+ret 1
+end
+pre = ulong 0
+if ne get m 3 0
+pre = ulong 5
+end
+total = add get m 1 pre
+if or gt mul total 4 get m 4 gt total AGGPMAX
+ret 2
+end
+if ge and sub get m 5 get m 6 4294967295 sub AGRING 1
+ret 3
+end
+ag_clear b
+if ne pre 0
+ag_put b 0 537133066 4
+ag_put b 16 2281701376 4
+end
+ag_put b 24 ag_gp get m 7 total 8
+ag_put b 32 rem and get m 5 4294967295 AGRING 4
+ag_put b 36 rem and add get m 5 1 4294967295 AGRING 4
+ag_put b 40 pre 4
+ag_put b 44 total 4
+ret 0
+end
+fn ag_range sz ulong off ulong ln ulong to ulong
+if or eq ln 0 gt off sz
+ret 0
+end
+if gt ln sub sz off
+ret 0
+end
+ret 1
+end
+fn ag_chk m view ulong 16 b edit uchar 128 to ulong
+op = get m 0
+if eq op 14
+if eq get m 3 1
+note GPU-cached only for device-private DATA (kind 2): no CPU_READ (1), no HOST_POLLED (32).
+if or ne get m 1 2 ne and get m 2 33 0
+ret 2
+end
+ret 0
+end
+ret AGUNC
+end
+if eq op 15
+ret ag_range get m 1 get m 2 get m 3
+end
+if eq op 16
+if eq and get m 1 32 0
+ret 1
+end
+if ne and get m 2 3 0
+ret 2
+end
+if eq ag_range get m 3 get m 2 4 0
+ret 3
+end
+ret 0
+end
+if eq op 17
+if lt and sub get m 1 get m 2 4294967295 2147483648
+ret 1
+end
+ret 0
+end
+if eq op 18
+ret ag_submit m b
+end
+if eq op 19
+ret ag_gp get m 1 get m 2
+end
+ret 0
+end
+fn aiengpu m view ulong 16 b edit uchar 128 to ulong
+op = get m 0
+if eq op 1
+if ne ag_load b 0 4 1
+ret 1
+end
+if ne ag_load b 4 4 4
+ret 2
+end
+ret 0
+end
+if eq op 2
+if or eq get m 1 0 gt get m 1 AGMAXB
+ret 0
+end
+ret ag_align get m 1 AGPAGE
+end
+if eq op 3
+if or lt get m 1 AGBASE ge get m 1 AGTOP
+ret AGBASE
+end
+ret get m 1
+end
+if eq op 4
+ret ag_align get m 1 get m 2
+end
+if eq op 5
+if gt add get m 1 get m 2 AGTOP
+if ne get m 3 0
+ret 1
+end
+ret 2
+end
+if and ne get m 3 0 ge get m 1 get m 4
+ret 1
+end
+ret 0
+end
+if eq op 6
+ret AGBASE
+end
+if eq op 7
+ret AGTOP
+end
+if eq op 8
+ret ag_align add get m 1 get m 2 get m 3
+end
+if eq op 9
+ag_clear b
+ag_put b 0 get m 1 8
+ag_put b 8 get m 2 8
+ag_put b 16 get m 3 4
+ret 48
+end
+if eq op 10
+if eq ag_load b get m 1 4 1
+ret 1
+end
+ret 0
+end
+if eq op 11
+ag_clear b
+ag_put b 0 get m 1 4
+ret 24
+end
+if eq op 12
+ag_clear b
+ag_put b 0 get m 1 4
+ag_put b 4 AGRING 4
+ag_put b 16 get m 1 4
+ag_put b 20 get m 2 4
+ag_put b 24 AGUSERD 8
+ret 72
+end
+if eq op 13
+ag_clear b
+ag_put b 0 get m 1 4
+ret 24
+end
+if ge op 14
+ret ag_chk m b
+end
+ret 0
+end
