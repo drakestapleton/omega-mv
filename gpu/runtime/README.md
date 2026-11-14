@@ -25,6 +25,9 @@ in CUDApp and serves as the reference (the oracle); it is compiled and run outsi
 | `check/platrest-check.om`, `check/platrest.expect.txt` | the check of `gpu/nvidia/om/platform-linux/plat_rest.om` against CUDApp's `src/omega_gpu_platform_linux_rest_oracle.h` (the old C kept as its reference): every mode on xorshift64 inputs with boundary values, and the oracle's output it must match |
 | `apiplan.om` | rewrite of CUDApp's `src/omega_api_plan.h` (`ap_plan`): one family number picks one of the six plan units of `gpu/nvidia/om/components/` (`api_mm_plan.om` to `api_rt_plan.om`), and its refusal becomes the C's return value |
 | `check/apiplan-check.om`, `check/apiplan.expect.txt` | the check of `apiplan.om` and those six units against the header's C plans (`ap_c`, kept as the old implementation): every family and mode on xorshift64 inputs with boundary values, and the C's output it must match |
+| `check/hostrest-check.om`, `check/hostrest.expect.txt` | the check of `gpu/nvidia/om/apiviews/hostrest.om` (`ah_rest`, ops 0 to 24) against CUDApp's `src/omega_gpu_api_hostrest.h` (`omega_ah_c`, the old C) |
+| `check/platpolicy-check.om`, `check/platpolicy.expect.txt` | the check of `gpu/nvidia/om/platform-linux/plat_policy.om` against CUDApp's `src/omega_gpu_platform_linux_cpolicy.h` (`plat_c`, the old C) |
+| `check/numeric-check.om`, `check/numeric.expect.txt` | the check of `numeric_ref` of `gpu/nvidia/om/numeric/numeric.om` (scalar codes 0 to 30) against the C reference functions of CUDApp's `src/omega_numeric.c` and `src/omega_numeric_reduce.c` |
 | `held.tsv` | a CUDApp file that is not rewritten because it waits on a decision, not a translation, and which decision |
 | `checks.tsv` | the gate's checks: parts to compose, expected output, and a source mutation that must be caught |
 | `controls.tsv` | the gate's inventory controls: an input byte changed, and how the inventory must notice |
@@ -185,6 +188,61 @@ So the units agree with the C only inside these rules. CUDApp's own differential
 (`tests/runtime/api_plan_unit.c`) stays inside them too. The limits sit in the units of
 `gpu/nvidia/om/components/`, which are Bridge source parts of CUDApp; changing them is outside this slice. The
 comparison covers `ap_plan`'s dispatch and refusal mapping, and every family's plans on the domain above.
+
+## The host-rest, platform policy and numeric oracles
+
+These three checks compare units already in this tree, unchanged, with the old C that CUDApp keeps behind a pending
+flag. Each expected file is the output of a driver kept outside this repository by the lane that wrote this slice,
+built against CUDApp `src/` at the commit above; built again with `-fsanitize=undefined -fno-sanitize-recover=all`,
+each printed the same bytes and exit 0.
+
+| check | old C (sha256) | driver (sha256) | expected output (sha256) |
+| --- | --- | --- | --- |
+| hostrest | `src/omega_gpu_api_hostrest.h` (`41a018a75edf2d520d8d33c34becbf765ec41f3dff9f34782443fadc5340a4ba`) | `hostrest_driver.c` (`cec570043558cb59899ed7a7f7f0ad7b58eec9995cc442a25319929a6466693e`) | `b8cfe9930689a97e616008e9f66a9e02980a2c29b9ba89fbe5d1a07677408df4` |
+| platpolicy | `src/omega_gpu_platform_linux_cpolicy.h` (`e9bbbcbdcc048e0b28e6b031660e4a35da4dcb34f6da73301328d7931a0fee68`) | `platpolicy_driver.c` (`a538ce143dac3c7ea5ad8512c8e0403c4f09def92758acbffa45b6231ab85801`) | `36abe9d62fe764c7084d8cc0305b41b0e4611dd6bc1683020162c75aa22c2540` |
+| numeric | `src/omega_numeric.c` (`309d757a8a2aa76f3cfa3294b3adf7decc25cf7065b498debc4978cbfa7c46f2`), `src/omega_numeric_reduce.c` (`c16475c7b8d87b748a2e50a4198a1dbaebf448c855378fdb024450ea59c455c2`) | `numeric_driver.c` (`5bf3826bfd69141fe701339616571f0ba82ea212b8d4b2e3241e691f7e0944f8`) | `492c29649687c0f611b4376225ffa1fcb4282c96f13d733ef3ecca046cd29fba` |
+
+    cc -std=c11 -O1 -ffp-contract=off -DCUDAPP_MIGRATION_PENDING_C_API_FP8_GDN_HOST -Icudapp/src hostrest_driver.c -o hostrest_driver
+    cc -std=c11 -O1 -ffp-contract=off -Icudapp/src platpolicy_driver.c -o platpolicy_driver
+    (cd cudapp && cc -std=gnu11 -O1 -ffp-contract=off -I. -Isrc -DCUDAPP_MIGRATION_PENDING_C_NUMERIC \
+      -DCUDAPP_MIGRATION_PENDING_C_NUMERIC_REST ../numeric_driver.c src/omega_numeric_reduce.c -lm \
+      -Wl,--unresolved-symbols=ignore-all -o ../numeric_driver)
+
+(The numeric driver includes `src/omega_numeric.c` itself; the device builders that file names are never called and
+are left unresolved.) All three use the xorshift64 generator, 4096 cases per op, the first two cases printed whole,
+then a line with the count of nonzero answers and an FNV-1a-64 digest of every answer (for platpolicy, of the
+answer and all sixteen output words).
+
+hostrest: ops 0 to 24, inputs `p[0..8]` from xorshift64 and boundary values, `p[9..15]` zero. Both sides rewrite
+the inputs the same way (`hkdom` in the check, `dom` in the driver): where the unit takes a word with `uint get`
+(a checked conversion) the first five words keep their low 32 bits; divisors are made nonzero. Two rules go
+further:
+
+| op | rule | why |
+| --- | --- | --- |
+| 8 | `p[0]` below 2^24 | `ah_depth`'s divisor search is a `while` with the default bound of 1000000 passes; with `p[0]` 2^24 or more the Omega stops with trap 4 (observed), where the C searches on |
+| 19 | `p[3]` 0 or 1 | the C answers 1 when the test holds and `ah_rest` answers `p[3]`; both callers in CUDApp (`src/omega_gpu_fp8_api.c`) pass `p[3]` = 1 and use the answer as a truth value |
+
+Every other case of ops 8, 16 and 19 takes the shape of CUDApp `tests/api_hostrest_test.c` (`hkshape`, `shape`),
+so that their accepting answers are reached. Ops 25 and up are not checked: there the C's default case rounds
+`p[0]/p[1]` up (when `p[3]` is 0) and `ah_rest`'s last case rounds it down, and no `OMEGA_AH` use in CUDApp `src/`
+passes an op above 24.
+
+platpolicy: message kinds 0 to 15, `m[1..15]` from xorshift64 and boundary values. For kind 7 every other case
+holds a short text of digits, blanks and signs packed eight bytes to a word from `m[2]`, its length in `m[1]`; for
+kind 12 every other case has a slot that matches `m[2]` and `m[3]`. The output words `q` start at zero, as
+`plat_decide` of CUDApp `src/omega_gpu_platform_linux.c` sets them before each call (the C clears them itself; the
+unit writes only the words it answers in). The check is OM-1 because `plat_policy.om` is.
+
+numeric: codes 0 to 30 of `numeric_ref` (the `OMEGA_NUMERIC_OM_*` codes of CUDApp `src/omega_numeric_om.h`), each
+against the C function it stands for, with operands in the form the public wrappers at the end of
+`src/omega_numeric.c` pass them: 32-bit FP32 words (special values, small integers, random words), 16 bits for the
+half-precision widenings, a mode 0 to 4 for `compare_equal`, a 64-bit count for `reduce_levels` and
+`launch_shape`, and for `fsetp_pred` one of the fourteen fsetp ops on the C side and its mask (`nk_fm`, the
+`fsetp_mask` of `src/omega_numeric.c`) on the Omega side. Every fourth case of codes 27 and 28 compares an operand
+with itself. This covers the scalar reference tier of `src/omega_numeric.c`, the part `rewrites.tsv` names;
+its tile, reduction, patch and device-realization code (the units `tile.om`, `reduce.om`, `rest.om`, `patch.om`,
+`check.om` of `gpu/nvidia/om/numeric/`) is not checked here.
 
 ## The gate
 
