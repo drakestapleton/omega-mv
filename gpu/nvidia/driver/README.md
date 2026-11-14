@@ -124,7 +124,7 @@ The sequence gate's oracle is in the same place:
 | `seq-extract-verbatim.inc` | `bdb1729cc5dfa39337d6dba7078e0598f2408f479c7b1f1f393d7e149235d9e2` | the C bodies as CUDApp has them |
 | `seqoracle.c` | `ad7f2542dfd04969130f65b0ab0db8e9558cc760d6949d5cd4b77a851da4acca` | the effect stubs that record and refuse by script, the programs, and the runs over failure scripts |
 | `build.sh` | `259abaf8f260a16b19ebb6b7d5803f14a0cb2dadea5648fc162f90a2e8c94d2d` | builds both oracles, prints `seq-cases.tsv`, `seq-cases-verbatim.tsv` and `fix1-diff.txt` |
-| `seq-controls.sh` | `97d87c1d318b2cf42c0ef101c330c25e874bffb609cccb784543666bba559042` | table mutations, one-line source mutations of `client.om` and `fx.om`, and the run on the unchanged C's table; each must fail |
+| `seq-controls.sh` | `cb12f8159ba8b639952b71fc901439a90753944352f09857e734c23285239f85` | table mutations, one-line source mutations of `client.om` and `fx.om`, and the run on the unchanged C's table; each must fail |
 | `coverage-map.tsv` | `99a65c3156185bc2e2dac46e8f08adadca49d8b623c0d227bf1605d74324c620` | the map above, with the sequence rows moved to `client.om` |
 
 `CUDAPP_REF=<CUDApp checkout at 84b524ca> ./build.sh` rebuilds; its `seq-cases.tsv` must equal the one
