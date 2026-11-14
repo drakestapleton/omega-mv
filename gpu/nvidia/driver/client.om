@@ -1,0 +1,1184 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/nvidia/driver/client.om: the setup and teardown sequences of CUDApp nvrm/nvrm.c and m16/m16_native.c
+note (84b524ca) that were still C: nvrm_open, quarantine_allocation, alloc_with_cacheability, nvrm_free,
+note chan_extra, chan_extra_destroy, nvrm_channel, nvrm_channel_n, nvrm_channel_destroy, nvrm_enqueue,
+note nvrm_chan_submit, nvrm_close and m16_native_free_memory, and the wrappers around them that were marked
+note device shell: nvrm_ring, nvrm_submit, m16_native_open, m16_native_create_channel, m16_native_ring_doorbell
+note and m16_native_close. Each decides which driver command comes next, with which request fields, and how a
+note refusal is unwound; the command itself is a dx_ effect.
+note
+note The dx_ effects are declared by the part composed with this one. fx.om answers them from a script and
+note records each one (the host gate, seqgate.om). No device part exists yet: DEVICE.md lists, per effect, what
+note it needs from the hardware and which existing Omega unit already does it. Request fields go to dx_fk (struct
+note kind, as nvrm_struct.om numbers them) and dx_fa (one field) before the effect that sends them.
+note
+note One client per process: its state is the globals below (the C keeps it in one Nvrm). Memory descriptors
+note (NvrmMem: handle, va, size, cpu) are rows of cm: 0 the main ring, 1 its notifier, 2 + 2i and 3 + 2i extra
+note channel i's ring and notifier, 8 a scratch row for the descriptor the C builds on its stack, 9 m16's
+note pushbuffer, 10 to 25 the caller's, 26 to 89 m16's legacy table. The live table lv has the C's NVRM_MAX_LIVE (4096) rows of 9:
+note handle, va, size, cpu, uvm_live, dma_live, rm_live, cpu_live, quarantined. A refusal at 4096 rows is the
+note C's defined answer ("live allocation table full"), reproduced here; the table is not grown silently.
+
+const CS_FAULT ulong 0
+const CS_ROOT ulong 1
+const CS_DEV ulong 2
+const CS_SUB ulong 3
+const CS_VMEM ulong 4
+const CS_UMODE ulong 5
+const CS_VAS ulong 6
+const CS_CHG ulong 7
+const CS_CTX ulong 8
+const CS_GPF ulong 9
+const CS_COMP ulong 10
+const CS_FDCTL ulong 11
+const CS_FDDEV ulong 12
+const CS_FDUVM ulong 13
+const CS_FDUVM2 ulong 14
+const CS_GREG ulong 15
+const CS_VREG ulong 16
+const CS_CREG ulong 17
+const CS_NEXTRA ulong 18
+const CS_LIVEN ulong 19
+const CS_PUT ulong 20
+const CS_RET ulong 21
+const CS_ENT ulong 22
+const CS_USERD ulong 23
+const CS_TOKEN ulong 24
+const CS_CHVA ulong 25
+const CS_CHVASZ ulong 26
+const CS_SLOT ulong 27
+const CS_VANEXT ulong 28
+const CS_TSM ulong 29
+const CS_DISC ulong 30
+const CS_CCLS ulong 31
+const CS_GCLS ulong 32
+const CS_UCLS ulong 33
+const CS_SMV ulong 34
+const CS_GPUID ulong 35
+const CS_MINOR ulong 36
+const CS_UCPU ulong 37
+const CS_LRS ulong 38
+const CS_RETRIES ulong 39
+const CS_RETMS ulong 40
+const CS_NEXTH ulong 41
+const CS_UUID0 ulong 42
+const CS_UUID1 ulong 43
+const CS_DOOR ulong 44
+const CN_MAPFAILED ulong 18446744073709551615
+const CN_U32 ulong 4294967295
+
+global cs ulong 64
+global cm ulong 360
+global lv ulong 36864
+global cx ulong 48
+
+fn cg i ulong to ulong
+ret get cs i
+end
+
+fn cp i ulong v ulong to void
+put cs i v
+end
+
+fn cn_fault to void
+put cs CS_FAULT 1
+end
+
+fn cn_faulted to bool
+ret ne get cs CS_FAULT 0
+end
+
+note memory descriptor rows
+fn mh s ulong to ulong
+ret get cm mul s 4
+end
+
+fn mva s ulong to ulong
+ret get cm add mul s 4 1
+end
+
+fn msz s ulong to ulong
+ret get cm add mul s 4 2
+end
+
+fn mcpu s ulong to ulong
+ret get cm add mul s 4 3
+end
+
+fn mset s ulong h ulong va ulong sz ulong cpu ulong to void
+put cm mul s 4 h
+put cm add mul s 4 1 va
+put cm add mul s 4 2 sz
+put cm add mul s 4 3 cpu
+end
+
+fn mzero s ulong to void
+mset s 0 0 0 0
+end
+
+note live rows
+fn lg r ulong f ulong to ulong
+ret get lv add mul r 9 f
+end
+
+fn lp r ulong f ulong v ulong to void
+put lv add mul r 9 f v
+end
+
+note extra channel i (0 to 2) fields: 0 gpfifo, 1 compute_obj, 2 ctxshare, 3 entries, 4 userd_off, 5 token,
+note 6 put, 7 retired, 8 channel_va, 9 channel_va_size, 10 registered
+fn xg i ulong f ulong to ulong
+ret get cx add mul i 16 f
+end
+
+fn xp i ulong f ulong v ulong to void
+put cx add mul i 16 f v
+end
+
+note fail(): message code (the oracle's table, seqoracle.c g_msgs), its arguments, -1
+fn cn_e0 code ulong to long
+dx_er code
+dx_ee
+ret -1
+end
+
+fn cn_e1 code ulong a ulong to long
+dx_er code
+dx_eu a
+dx_ee
+ret -1
+end
+
+fn cn_e2 code ulong a ulong b ulong to long
+dx_er code
+dx_eu a
+dx_eu b
+dx_ee
+ret -1
+end
+
+fn cn_ed code ulong d long to long
+dx_er code
+dx_ed d
+dx_ee
+ret -1
+end
+
+fn cn_bool b bool to ulong
+if b
+ret 1
+end
+ret 0
+end
+
+note the shell's va_release faults the client on every refused release
+fn cn_varel va ulong sz ulong to bool
+ok = dx_varel va sz
+if not ok
+cn_fault
+end
+ret ok
+end
+
+note client reset: the C's memset of the whole Nvrm (live table, extra channels, ring and notifier included)
+fn cn_zero to void
+for i ulong 64
+put cs i 0
+end
+for i ulong 36864
+put lv i 0
+end
+for i ulong 48
+put cx i 0
+end
+for s ulong 9
+mzero s
+end
+end
+
+note uuid byte i (0 to 15) of the GPU, from the two little-endian words
+fn cn_uuidb i ulong to ulong
+w = get cs add CS_UUID0 div i 8
+ret and shr w mul rem i 8 8 255
+end
+
+note RM_ALLOC under parent of class cls into client field i; false when refused (the field keeps its value)
+fn cn_obj i ulong parent ulong cls ulong to bool
+h = dx_alloc parent cls
+if eq h 0
+ret false
+end
+cp i h
+ret true
+end
+
+note --- nvrm_open: admission, VA slot, the control nodes, the RM client, UVM, the card table ---
+fn cn_open to long
+cn_zero
+if not dx_admit_open
+ret -1
+end
+cp CS_NEXTH 3472883713
+va = dx_slot
+cp CS_VANEXT va
+if eq va 0
+ret cn_e0 0
+end
+cp CS_SLOT va
+cp CS_FDCTL bitcast ulong dx_fopen 1
+cp CS_FDUVM bitcast ulong dx_fopen 2
+cp CS_FDUVM2 bitcast ulong dx_fopen 2
+if or or lt bitcast long cg CS_FDCTL 0 lt bitcast long cg CS_FDUVM 0 lt bitcast long cg CS_FDUVM2 0
+ret cn_ed 1 dx_errno
+end
+if not cn_obj CS_ROOT 0 65
+ret -1
+end
+dx_fk 18
+dx_fa 0
+if not dx_uvm bitcast long cg CS_FDUVM 805306369
+ret -1
+end
+dx_fk 19
+dx_fa and cg CS_FDUVM CN_U32
+dx_uvmraw bitcast long cg CS_FDUVM2 75
+dx_fk 16
+dx_fa 0
+if not dx_ioctl bitcast long cg CS_FDCTL 200
+ret cn_ed 2 dx_errno
+end
+found = dx_cardidx
+if lt found 0
+dx_er 3
+dx_es
+dx_ee
+ret -1
+end
+if ne cn_open_card ulong found 0
+ret -1
+end
+ret cn_open_vas
+end
+
+note nvrm_open on card index found: admission, the device node, device, subdevice, virtual memory, SM version,
+note class list and the class selection, which must select the SM the admission admitted
+fn cn_open_card found ulong to long
+asm = dx_admit_card found
+if lt asm 0
+ret -1
+end
+cp CS_GPUID and dx_cardget found 5 CN_U32
+cp CS_MINOR and dx_cardget found 6 CN_U32
+fd = dx_opendev cg CS_MINOR
+cp CS_FDDEV bitcast ulong fd
+if lt fd 0
+ret -1
+end
+dx_fk 1
+dx_fa cg CS_GPUID
+if not dx_ctrl cg CS_ROOT 517
+ret -1
+end
+dx_fk 2
+dx_fa dx_nsget 1 1
+dx_fa cg CS_ROOT
+dx_fa 0
+if not cn_obj CS_DEV cg CS_ROOT 128
+ret -1
+end
+dx_fk 3
+dx_fa 0
+if not cn_obj CS_SUB cg CS_DEV 8320
+ret -1
+end
+dx_fk 4
+dx_fa 0
+dx_fa 562949953421311
+if not cn_obj CS_VMEM cg CS_DEV 112
+ret -1
+end
+dx_fk 17
+dx_fa 12
+dx_fk 6
+dx_fa 1
+dx_fa 0
+if not dx_ctrl cg CS_SUB 545264129
+ret -1
+end
+cp CS_SMV and dx_nsget 17 1 CN_U32
+dx_fk 7
+dx_fa 0
+if not dx_ctrl cg CS_DEV 8389121
+ret -1
+end
+ncls = and dx_nsget 7 0 CN_U32
+if gt ncls 512
+ret cn_e0 4
+end
+dx_fk 7
+dx_fa ncls
+dx_fa 0
+if not dx_ctrl cg CS_DEV 8389121
+ret -1
+end
+ncls = and dx_nsget 7 0 CN_U32
+if gt ncls 512
+ret -1
+end
+if not dx_select ncls and dx_cardget found 7 65535 and dx_cardget found 8 65535
+ret -1
+end
+if ne cg CS_TSM ulong asm
+ret cn_e2 5 ulong asm cg CS_TSM
+end
+ret 0
+end
+
+note nvrm_open last: usermode doorbell page, VA space, the GPU uuid, UVM registration of the GPU and its VA space
+fn cn_open_vas to long
+if not cn_obj CS_UMODE cg CS_SUB cg CS_UCLS
+ret -1
+end
+mmio = dx_map cg CS_UMODE 65536 0 0 0
+if eq mmio CN_MAPFAILED
+ret -1
+end
+cp CS_UCPU mmio
+cp CS_DOOR add mmio 144
+dx_fk 8
+dx_fa 0
+dx_fa 72
+dx_fa 562949869535232
+dx_fa 4096
+if not cn_obj CS_VAS cg CS_DEV 37105
+ret -1
+end
+dx_fk 9
+dx_fa 0
+dx_fa 2
+dx_fa 16
+if not dx_ctrl cg CS_SUB 545259850
+ret -1
+end
+for i ulong 16
+w = add CS_UUID0 div i 8
+cp w or cg w shl and dx_nsget 9 add 3 i 255 mul rem i 8 8
+end
+dx_fk 21
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+dx_fa CN_U32
+if not dx_uvm bitcast long cg CS_FDUVM 37
+ret -1
+end
+cp CS_GREG 1
+dx_fk 23
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+dx_fa and cg CS_FDCTL CN_U32
+dx_fa cg CS_ROOT
+dx_fa cg CS_VAS
+if not dx_uvm bitcast long cg CS_FDUVM 25
+ret -1
+end
+cp CS_VREG 1
+ret 0
+end
+
+note --- quarantine_allocation: a live row that is kept, quarantined, and the client faulted ---
+fn cn_quar h ulong va ulong sz ulong cpu ulong uvml ulong dmal ulong to void
+r = cg CS_LIVEN
+cp CS_LIVEN add r 1
+lp r 0 h
+lp r 1 va
+lp r 2 sz
+lp r 3 cpu
+lp r 4 uvml
+lp r 5 dmal
+lp r 6 1
+lp r 7 1
+lp r 8 1
+dx_transfer h
+cn_fault
+end
+
+note --- alloc_with_cacheability (cach: NVOS32_ATTR2_GPU_CACHEABLE 1 yes, 2 no; local: framebuffer) into row s ---
+fn cn_alloc size ulong s ulong cach ulong local bool to long
+sz = drv_asize cn_faulted size
+if eq sz 0
+ret cn_e0 7
+end
+if drv_livefull cg CS_LIVEN 4096
+ret cn_ed 8 4096
+end
+va = dx_vatake sz 4096
+if eq va 0
+ret cn_e0 9
+end
+res = dx_reserve va sz
+if ne res va
+if ne res CN_MAPFAILED
+q = dx_drop res sz
+end
+cn_fault
+ret cn_e1 10 va
+end
+dx_fk 10
+dx_fa cg CS_ROOT
+dx_fa 0
+dx_fa 49409
+attr = ulong 436207616
+cls = ulong 62
+system = long 1
+if local
+attr = ulong 402653184
+cls = ulong 64
+system = long 0
+end
+dx_fa attr
+dx_fa or shl cach 2 1
+dx_fa 6
+dx_fa sz
+dx_fa 4096
+dx_fa sub sz 1
+h = dx_alloc cg CS_DEV cls
+if eq h 0
+if not dx_drop va sz
+cn_fault
+end
+if local
+if not cn_faulted
+if ne cg CS_LRS 0
+q = cn_varel va sz
+ret -1
+end
+end
+end
+cn_fault
+dx_ea sz
+ret -1
+end
+cpu = dx_map h sz va 0 system
+if ne cpu va
+cn_quar h va sz va 0 0
+if local
+mset 8 h va sz va
+if eq cn_free 8 0
+cp CS_FAULT 0
+end
+end
+dx_er 11
+dx_eu va
+dx_es
+dx_ee
+ret -1
+end
+um = dx_uvmmap va sz h
+if ne um 0
+cn_quar h va sz cpu cn_bool ge um 2 cn_bool ge um 3
+if local
+mset 8 h va sz cpu
+if eq cn_free 8 0
+cp CS_FAULT 0
+end
+end
+ret -1
+end
+mset s h va sz cpu
+dx_zero cpu sz
+r = cg CS_LIVEN
+lp r 0 h
+lp r 1 va
+lp r 2 sz
+lp r 3 cpu
+lp r 4 1
+lp r 5 1
+lp r 6 1
+lp r 7 1
+note FIX-1: the C leaves quarantined as the row's last tenant had it. After a local allocation whose CPU or UVM
+note mapping failed and was released at once (its row quarantined, then removed, the client unfaulted), the next
+note allocation took that row with quarantined 1 and copy_live refused it. A new row is not quarantined.
+lp r 8 0
+dx_transfer h
+cp CS_LIVEN add r 1
+ret 0
+end
+
+note nvrm_alloc (cacheable), nvrm_alloc_gpu_uncached and nvrm_alloc_vram
+fn cn_alloc_mode size ulong s ulong mode ulong to long
+if eq mode 0
+ret cn_alloc size s 1 false
+end
+if eq mode 1
+ret cn_alloc size s 2 false
+end
+if not drv_vramok ne cg CS_DISC 0 cg CS_TSM
+ret cn_e0 6
+end
+ret cn_alloc size s 2 true
+end
+
+note the live row of descriptor s (same va, handle and size): its index; 2^64 - 1 none; 2^64 - 2 two rows
+fn cn_find s ulong to ulong
+idx = ulong 18446744073709551615
+for i ulong cg CS_LIVEN bound 4096
+if and and eq lg i 1 mva s eq lg i 0 mh s eq lg i 2 msz s
+if ne idx 18446744073709551615
+ret 18446744073709551614
+end
+idx = i
+end
+end
+ret idx
+end
+
+note --- nvrm_free of descriptor row s ---
+fn cn_free s ulong to long
+if and and and eq mh s 0 eq mva s 0 eq msz s 0 eq mcpu s 0
+ret 0
+end
+idx = cn_find s
+if eq idx 18446744073709551614
+cn_fault
+ret cn_e0 12
+end
+if eq idx 18446744073709551615
+dx_er 13
+dx_eu mva s
+dx_eu mh s
+dx_eu msz s
+dx_ee
+ret -1
+end
+h = mh s
+va = mva s
+sz = msz s
+cpu = mcpu s
+bad = ne lg idx 3 cpu
+bad = or bad eq cpu 0
+bad = or bad eq sz 0
+bad = or bad ne and va 4095 0
+bad = or bad ne and sz 4095 0
+if bad
+cn_fault
+ret cn_e0 14
+end
+if ne lg idx 4 0
+if not dx_uvmfree va sz
+lp idx 8 1
+cn_fault
+ret -1
+end
+lp idx 4 0
+end
+if ne lg idx 5 0
+if not dx_dmaunmap h va sz
+lp idx 8 1
+cn_fault
+ret -1
+end
+lp idx 5 0
+end
+if ne lg idx 6 0
+if not dx_free cg CS_DEV h
+lp idx 8 1
+cn_fault
+ret -1
+end
+lp idx 6 0
+end
+if ne lg idx 7 0
+if not dx_drop cpu sz
+lp idx 8 1
+cn_fault
+dx_er 15
+dx_eu va
+dx_ed dx_errno
+dx_ee
+ret -1
+end
+lp idx 7 0
+end
+last = sub cg CS_LIVEN 1
+for f ulong 9
+lp idx f lg last f
+end
+cp CS_LIVEN last
+if not cn_varel va sz
+ret -1
+end
+mzero s
+ret 0
+end
+
+note --- chan_extra: extra channel i (n_extra already counts it) ---
+fn cn_chx i ulong to long
+fifo = add 2 mul i 2
+notif = add fifo 1
+dx_fk 13
+dx_fa cg CS_VAS
+dx_fa 1
+ctx = dx_alloc cg CS_CHG 36967
+if eq ctx 0
+ret -1
+end
+xp i 2 ctx
+xp i 3 1024
+if ne cn_alloc 65536 fifo 2 false 0
+ret -1
+end
+if ne cn_alloc 1048576 notif 1 false 0
+ret -1
+end
+xp i 4 and mul xg i 3 8 CN_U32
+dx_fk 11
+dx_fa mh notif
+dx_fa mh fifo
+dx_fa mva fifo
+dx_fa xg i 3
+dx_fa ctx
+dx_fa 0
+dx_fa mh fifo
+dx_fa xg i 4
+dx_fa 0
+g = dx_alloc cg CS_CHG cg CS_GCLS
+if eq g 0
+ret -1
+end
+xp i 0 g
+co = dx_alloc g cg CS_CCLS
+if eq co 0
+ret -1
+end
+xp i 1 co
+dx_fk 14
+dx_fa CN_U32
+if not dx_ctrl g 3278831880
+ret -1
+end
+xp i 5 and dx_nsget 14 0 CN_U32
+cva = dx_vatake 67108864 4096
+xp i 8 cva
+if eq cva 0
+cn_fault
+ret cn_e0 16
+end
+xp i 9 67108864
+dx_fk 24
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+dx_fa and cg CS_FDCTL CN_U32
+dx_fa cg CS_ROOT
+dx_fa g
+dx_fa cva
+dx_fa 67108864
+if not dx_uvm bitcast long cg CS_FDUVM 27
+cn_fault
+ret -1
+end
+xp i 10 1
+xp i 6 0
+xp i 7 0
+ret 0
+end
+
+note --- chan_extra_destroy: extra channel i ---
+fn cn_chxd i ulong to long
+fifo = add 2 mul i 2
+notif = add fifo 1
+if ne xg i 10 0
+dx_fk 25
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+dx_fa cg CS_ROOT
+dx_fa xg i 0
+if not dx_uvm bitcast long cg CS_FDUVM 28
+ret -1
+end
+xp i 10 0
+end
+if ne xg i 1 0
+if not dx_free xg i 0 xg i 1
+ret -1
+end
+end
+xp i 1 0
+if ne xg i 0 0
+if not dx_free cg CS_CHG xg i 0
+ret -1
+end
+end
+xp i 0 0
+if ne xg i 2 0
+if not dx_free cg CS_CHG xg i 2
+ret -1
+end
+end
+xp i 2 0
+if ne mh fifo 0
+if ne cn_free fifo 0
+ret -1
+end
+end
+if ne mh notif 0
+if ne cn_free notif 0
+ret -1
+end
+end
+if ne xg i 9 0
+if not cn_varel xg i 8 xg i 9
+ret -1
+end
+xp i 8 0
+xp i 9 0
+end
+xp i 6 0
+xp i 7 0
+ret 0
+end
+
+note --- nvrm_channel_n (nvrm_channel is extra 0) ---
+fn cn_channel extra ulong to long
+adm = nvrm_chadm cg CS_FAULT cg CS_CHG cg CS_CREG cg CS_NEXTRA extra 3
+if eq adm 1
+ret cn_e0 17
+end
+if eq adm 2
+dx_er 18
+dx_eu extra
+dx_ed 3
+dx_ee
+ret -1
+end
+dx_fk 12
+dx_fa 0
+dx_fa 1
+chg = dx_alloc cg CS_DEV 41068
+if eq chg 0
+ret -1
+end
+cp CS_CHG chg
+dx_fk 13
+dx_fa cg CS_VAS
+dx_fa 1
+ctx = dx_alloc chg 36967
+if eq ctx 0
+ret -1
+end
+cp CS_CTX ctx
+cp CS_ENT 1024
+if ne cn_alloc 65536 0 2 false 0
+ret -1
+end
+if ne cn_alloc 1048576 1 1 false 0
+ret -1
+end
+cp CS_USERD and mul cg CS_ENT 8 CN_U32
+dx_fk 11
+dx_fa mh 1
+dx_fa mh 0
+dx_fa mva 0
+dx_fa cg CS_ENT
+dx_fa cg CS_CTX
+dx_fa 0
+dx_fa mh 0
+dx_fa cg CS_USERD
+dx_fa 0
+g = dx_alloc cg CS_CHG cg CS_GCLS
+if eq g 0
+ret -1
+end
+cp CS_GPF g
+delay = cg CS_RETMS
+if eq delay 0
+delay = ulong 100
+end
+cp CS_RETRIES 0
+while true bound 1000
+co = dx_alloc g cg CS_CCLS
+arc = ulong 1
+if ne co 0
+cp CS_COMP co
+arc = ulong 0
+end
+rd = nvrm_retry arc cg CS_RETRIES 50 cn_bool eq cg CS_LRS 81
+if eq rd 0
+break
+end
+if eq rd 3
+ret -1
+end
+if eq rd 2
+dx_en and add cg CS_RETRIES 1 CN_U32 delay
+ret -1
+end
+cp CS_RETRIES and add cg CS_RETRIES 1 CN_U32
+dx_sleep and mul delay 1000 CN_U32
+end
+dx_fk 14
+dx_fa CN_U32
+if not dx_ctrl g 3278831880
+ret -1
+end
+cp CS_TOKEN and dx_nsget 14 0 CN_U32
+cva = dx_vatake 67108864 4096
+cp CS_CHVA cva
+if eq cva 0
+cn_fault
+ret cn_e0 19
+end
+cp CS_CHVASZ 67108864
+dx_fk 24
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+dx_fa and cg CS_FDCTL CN_U32
+dx_fa cg CS_ROOT
+dx_fa g
+dx_fa cva
+dx_fa 67108864
+if not dx_uvm bitcast long cg CS_FDUVM 27
+cn_fault
+ret -1
+end
+cp CS_CREG 1
+for i ulong extra bound 3
+cp CS_NEXTRA add i 1
+if ne cn_chx i 0
+ret -1
+end
+end
+dx_fk 15
+dx_fa 1
+if not dx_ctrl cg CS_CHG 2691432705
+ret -1
+end
+cp CS_PUT 0
+cp CS_RET 0
+ret 0
+end
+
+note --- nvrm_channel_destroy: extras last first, then the main channel; any refusal faults the client ---
+fn cn_chdestroy to long
+while ne cg CS_NEXTRA 0 bound 3
+if ne cn_chxd sub cg CS_NEXTRA 1 0
+cn_fault
+ret -1
+end
+cp CS_NEXTRA sub cg CS_NEXTRA 1
+end
+if ne cg CS_CREG 0
+dx_fk 25
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+dx_fa cg CS_ROOT
+dx_fa cg CS_GPF
+if not dx_uvm bitcast long cg CS_FDUVM 28
+cn_fault
+ret -1
+end
+cp CS_CREG 0
+end
+if ne cg CS_COMP 0
+if not dx_free cg CS_GPF cg CS_COMP
+cn_fault
+ret -1
+end
+end
+cp CS_COMP 0
+if ne cg CS_GPF 0
+if not dx_free cg CS_CHG cg CS_GPF
+cn_fault
+ret -1
+end
+end
+cp CS_GPF 0
+if ne cg CS_CTX 0
+if not dx_free cg CS_CHG cg CS_CTX
+cn_fault
+ret -1
+end
+end
+cp CS_CTX 0
+if ne cg CS_CHG 0
+if not dx_free cg CS_DEV cg CS_CHG
+cn_fault
+ret -1
+end
+end
+cp CS_CHG 0
+if ne mh 0 0
+if ne cn_free 0 0
+cn_fault
+ret -1
+end
+end
+if ne mh 1 0
+if ne cn_free 1 0
+cn_fault
+ret -1
+end
+end
+if ne cg CS_CHVASZ 0
+if not cn_varel cg CS_CHVA cg CS_CHVASZ
+cn_fault
+ret -1
+end
+cp CS_CHVA 0
+cp CS_CHVASZ 0
+end
+cp CS_PUT 0
+cp CS_RET 0
+ret 0
+end
+
+note --- nvrm_enqueue: pushbuffer row s, words [off, off + 4 nw) on the main channel ---
+fn cn_enqueue s ulong off ulong nw ulong to long
+if or or or ne cg CS_FAULT 0 eq cg CS_GPF 0 eq mcpu 0 0 lt cg CS_ENT 2
+ret cn_e0 20
+end
+sp = nvrm_pspan off nw msz s mva s
+if eq sp 1
+ret cn_e0 21
+end
+if ne cg CS_DISC 0
+if not dx_validate off nw
+ret -1
+end
+end
+if eq sp 2
+ret cn_e0 22
+end
+if ne nvrm_pfull cg CS_PUT cg CS_RET cg CS_ENT 0
+ret cn_e1 23 and sub cg CS_PUT cg CS_RET CN_U32
+end
+if not dx_publish mh 0 cg CS_ENT cg CS_PUT cg CS_USERD add mva s off nw
+ret cn_e0 24
+end
+cp CS_PUT and add cg CS_PUT 1 CN_U32
+ret 0
+end
+
+note --- nvrm_chan_submit: the same on extra channel ch (1 to n_extra), then its doorbell ---
+fn cn_submit ch ulong s ulong off ulong nw ulong to long
+if or or ne cg CS_FAULT 0 eq ch 0 gt ch cg CS_NEXTRA
+ret cn_e1 25 ch
+end
+i = sub ch 1
+if or or eq xg i 0 0 eq mcpu add 2 mul i 2 0 lt xg i 3 2
+ret cn_e1 25 ch
+end
+sp = nvrm_pspan off nw msz s mva s
+if eq sp 1
+ret cn_e0 21
+end
+if eq sp 2
+ret cn_e0 22
+end
+if ne cg CS_DISC 0
+if not dx_validate off nw
+ret -1
+end
+end
+if ne nvrm_pfull xg i 6 xg i 7 xg i 3 0
+ret cn_e2 26 ch and sub xg i 6 xg i 7 CN_U32
+end
+if not dx_publish mh add 2 mul i 2 xg i 3 xg i 6 xg i 4 add mva s off nw
+ret cn_e1 27 ch
+end
+xp i 6 and add xg i 6 1 CN_U32
+if not dx_doorbell xg i 5
+ret cn_e1 28 ch
+end
+ret 0
+end
+
+note close a descriptor that is above 0 (the C closes fd > 0 and then forgets it)
+fn cn_fdclose i ulong to void
+fd = bitcast long cg i
+if gt fd 0
+q = dx_fclose fd
+end
+cp i 0
+end
+
+note --- nvrm_close ---
+fn cn_close to long
+if ne cg CS_ROOT 0
+if ne cn_chdestroy 0
+cn_fault
+end
+end
+i = cg CS_LIVEN
+while gt i 0 bound 1000000
+i = sub i 1
+eh = lg i 0
+eva = lg i 1
+esz = lg i 2
+ecpu = lg i 3
+ecl = lg i 7
+mset 8 eh eva esz ecpu
+rc = cn_free 8
+if ne rc 0
+cn_fault
+if and ne ecl 0 ne ecpu 0
+q = dx_drop ecpu esz
+end
+end
+if and eq rc 0 lt i cg CS_LIVEN
+i = add i 1
+end
+end
+if ne cg CS_UCPU 0
+if dx_drop cg CS_UCPU 65536
+cp CS_UCPU 0
+cp CS_DOOR 0
+else
+cn_fault
+end
+end
+if ne cg CS_VREG 0
+dx_fk 22
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+if not dx_uvm bitcast long cg CS_FDUVM 26
+cn_fault
+end
+cp CS_VREG 0
+end
+if ne cg CS_GREG 0
+dx_fk 22
+dx_fa cg CS_UUID0
+dx_fa cg CS_UUID1
+if not dx_uvm bitcast long cg CS_FDUVM 38
+cn_fault
+end
+cp CS_GREG 0
+end
+if ne cg CS_UMODE 0
+if not dx_free cg CS_SUB cg CS_UMODE
+cn_fault
+end
+end
+cp CS_UMODE 0
+if ne cg CS_VAS 0
+if not dx_free cg CS_DEV cg CS_VAS
+cn_fault
+end
+end
+cp CS_VAS 0
+if ne cg CS_VMEM 0
+if not dx_free cg CS_DEV cg CS_VMEM
+cn_fault
+end
+end
+cp CS_VMEM 0
+if ne cg CS_SUB 0
+if not dx_free cg CS_DEV cg CS_SUB
+cn_fault
+end
+end
+cp CS_SUB 0
+if ne cg CS_DEV 0
+if not dx_free cg CS_ROOT cg CS_DEV
+cn_fault
+end
+end
+cp CS_DEV 0
+if ne cg CS_ROOT 0
+if not dx_free cg CS_ROOT cg CS_ROOT
+cn_fault
+end
+end
+cp CS_ROOT 0
+cn_fdclose CS_FDDEV
+cn_fdclose CS_FDUVM2
+cn_fdclose CS_FDUVM
+cn_fdclose CS_FDCTL
+if not dx_finish
+cn_fault
+end
+base = cg CS_SLOT
+vn = cg CS_VANEXT
+if and and and eq cg CS_FAULT 0 eq cg CS_LIVEN 0 eq cg CS_CREG 0 ne base 0
+if ge vn base
+if le sub vn base 4294967296
+dx_recycle base
+end
+end
+end
+cp CS_SLOT 0
+if ne cg CS_FAULT 0
+ret -1
+end
+ret 0
+end
+
+note --- m16_native_alloc_memory and m16_native_free_memory over the 64 legacy rows (26 to 89) ---
+fn cn_m16alloc size ulong to long
+for i ulong 64
+s = add 26 i
+if eq mh s 0
+if ne cn_alloc size s 1 false 0
+ret -1
+end
+ret 0
+end
+end
+ret -1
+end
+
+fn cn_m16free cpu ulong to long
+if eq cpu 0
+ret -1
+end
+for i ulong 64
+s = add 26 i
+if and eq mcpu s cpu ne mh s 0
+ret cn_free s
+end
+end
+ret -1
+end
+
+note --- m16_native_open, m16_native_create_channel and m16_native_close: the m16 context is the client, its
+note legacy rows (26 to 89) and its pushbuffer descriptor (row 9) ---
+fn cn_m16open to long
+for s ulong 81
+mzero add 9 s
+end
+if eq cn_open 0
+ret 0
+end
+r = cn_close
+ret -1
+end
+
+note nvrm_channel, then the pushbuffer the CPU rewrites between submissions, uncached on the GPU
+fn cn_m16chan to long
+if ne cn_channel 0 0
+ret -1
+end
+if ne cn_alloc 4096 9 2 false 0
+ret -1
+end
+ret 0
+end
+
+fn cn_m16close to long
+ret cn_close
+end
+
+note --- nvrm_ring (also m16_native_ring_doorbell) and nvrm_submit: a refused doorbell faults the client ---
+fn cn_ring to void
+if not dx_doorbell cg CS_TOKEN
+cp CS_FAULT 1
+end
+end
+
+fn cn_nsubmit s ulong off ulong nw ulong to long
+if ne cn_enqueue s off nw 0
+ret -1
+end
+cn_ring
+ret 0
+end

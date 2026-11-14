@@ -8,7 +8,8 @@ Much of `nvrm/` and `m16/` was already in Omega before this directory: `gpu/nvid
 (policy, VA allocator, struct packing, RM and UVM wire, the GB10 driver client `context.om`) and
 `gpu/nvidia/om/engine/eng.om` (the M16 wait machine, lifecycle, visibility and requalify gates, the
 release packet). This directory adds the pieces listed below. `coverage.tsv` names, for every C function
-of `nvrm/` and `m16/`, where its logic lives now; the section "Still C" says what is left.
+of `nvrm/` and `m16/`, where its logic lives now; the section "Still C" says what is left (no decision
+logic; the device side, which `DEVICE.md` describes).
 
 ## Files
 
@@ -22,6 +23,12 @@ of `nvrm/` and `m16/`, where its logic lives now; the section "Still C" says wha
 | `parts.txt` | the order the parts are joined in before `seed/out/omc` compiles them | none |
 | `oracle-cases.tsv` | cases printed by the C oracle; `gate.om` documents the columns | none |
 | `coverage.tsv` | every C function of CUDApp `nvrm/` and `m16/` at 84b524ca, and where its logic lives: an Omega path, device shell, test program, or still C. Generated (see "The oracle"); count it with the command in its header | none |
+| `client.om` | the setup and teardown sequences: `nvrm_open`, `alloc_with_cacheability`, `quarantine_allocation`, `nvrm_free`, the channel create and destroy paths, `nvrm_enqueue`, `nvrm_chan_submit`, `nvrm_ring`, `nvrm_submit`, `nvrm_close`, and m16's open, create channel, ring, free memory and close. Every driver command is a `dx_` effect | the sequence gate, against the command sequence the C sent for the same program and the same scripted refusals |
+| `fx.om` | the host recorder: answers each `dx_` effect from a failure script and records it as text | through the sequence gate |
+| `seqgate.om` | the sequence gate program; its header documents the program operations and the trace | none |
+| `seqparts.txt` | the order the sequence gate's parts are joined in | none |
+| `seq-cases.tsv` | sequences printed by the C oracle: program, failure script, trace | none |
+| `DEVICE.md` | what each `dx_` effect and each `device shell` row needs from the machine | none |
 
 `parts.txt` starts with `gpu/nvidia/native/nvrm/counts.om` because it carries the one `om2` line and the
 decimal readers, then `gpu/nvidia/om/encoder/amp_runtime.om`, which `drv_select` calls, and
@@ -51,6 +58,29 @@ clock reads, the marker read and the sleep inside `drv_wait_ge` are not run by a
 The source and table mutations that show the gate catches broken Omega are not in this tree (they are a
 shell script). See "The oracle".
 
+## The sequence gate
+
+The same step then joins the parts in `seqparts.txt`, compiles them, and runs `seqgate` on
+`seq-cases.tsv`. None of those parts has an `om2` line, so they compile as one OM-1 unit, as
+`gpu/nvidia/native/nvrm/policy.om` is compiled for its bridge unit (it names a parameter `out`, which
+is a reserved word only in an OM-2 unit). Each case is a program (a list of calls: open, allocate, free, create and destroy
+channels, enqueue, submit, ring, close, and m16's wrappers), a failure script (K F R: effect number K, and
+from then on every F-th one up to R times, is refused) and the trace the C printed: each driver command
+with its request fields and answer, each message code, each call's result, then the client state and
+every live row. `seqgate` runs the program on `client.om` with `fx.om` answering, prints the same trace,
+and compares it byte for byte. For each distinct program it also runs two controls, which must mismatch:
+the first case with one expected byte changed, and the program rerun with another failure script. The
+step counts cases and programs from the table and requires exactly:
+
+    OMEGA-GPU-DRIVER-SEQ PASS cases=<cases> programs=<programs> controls=<2 x programs> caught=<2 x programs> hardware=NOT_RUN
+
+FIX-1. `client.om` differs from the C in one place. In `alloc_with_cacheability`, when the CPU map or
+the UVM map of a VRAM allocation fails, the row is quarantined and `nvrm_free` then drops it, so the next
+allocation reuses the table slot, and the C's success path never clears `quarantined`: the new live row
+inherits it and `copy_live` refuses the allocation. `cn_alloc` clears it (`lp r 8 0`). The oracle runs the
+C with that one line added after `cpu_live = 1`; the unchanged C makes the gate fail on exactly the four
+cases its program reaches, which the oracle lists in `fix1-diff.txt`.
+
 ## The oracle
 
 The C oracle is kept outside the repository by the lane that wrote this directory, because only Omega goes
@@ -66,7 +96,7 @@ in it. Its files are identified by sha256:
 | `controls.sh` | `969ca2c34e92b55232858504a7408165655bc018a17f767f318f5c8d791bb8ff` | table and source mutations; each must make the gate fail |
 | `cfuncs.awk` | `bd79d95ecd1a89f51591dba27a871e1e3bdff2143a2ac4f49ac49fdce5b07c9c` | lists every C function definition of the given files |
 | `coverage.sh` | `6010e0683fb5911ae23fae7ae09349ea7685ef5af830000856c0e79afea9accf` | prints `coverage.tsv` from `cfuncs.awk` and `coverage-map.tsv`; fails on an unmapped function, an unused map row, or an Omega path missing from the tree |
-| `coverage-map.tsv` | `3147d5b3869fe91ddd96bae25d566f29fdc66f3f90718eaf471b2fd5d76c57a4` | where each function's logic lives, written once by hand |
+| `coverage-map.tsv` | `3147d5b3869fe91ddd96bae25d566f29fdc66f3f90718eaf471b2fd5d76c57a4` | where each function's logic lives, written once by hand; replaced by the sequence oracle's copy below |
 
 `oracle.c` compiles the kept original C branches, not CUDApp's default build: it sets
 `CUDAPP_MIGRATION_PENDING_C_NVRM_ALLOC=1`, `CUDAPP_MIGRATION_PENDING_C_ENGINE_FIXTURE_REST=1`,
@@ -82,8 +112,23 @@ holding these files and a CUDApp checkout at 84b524ca in `../cudapp-ref`:
 
 `cases.tsv` must equal `oracle-cases.tsv`. `controls.sh <scratch-dir>` runs from the root of an omega-mv
 checkout and prints `CONTROLS CAUGHT all` when every mutation fails the gate. From the root of an omega-mv
-checkout, `bash coverage.sh ../cudapp-ref . > gpu/nvidia/driver/coverage.tsv` regenerates the table, which
-must come out unchanged.
+checkout, `bash coverage.sh ../cudapp-ref . > gpu/nvidia/driver/coverage.tsv`, with the current
+`coverage-map.tsv` (below), regenerates the table, which must come out unchanged.
+
+The sequence gate's oracle is in the same place:
+
+| File | sha256 | Does |
+|---|---|---|
+| `extract.sh` | `db5a18d1305514482d701372865ca5fb759a51f685fa9e62836415dcaecb776b` | the above, plus the sequence bodies into `seq-extract-verbatim.inc`, then `seq-extract.inc` with the FIX-1 line |
+| `seq-extract.inc` | `540b9d101193c87f53f97ca5750f4b044f018ef21563277ab03c487faa344bab` | the C bodies with FIX-1 |
+| `seq-extract-verbatim.inc` | `bdb1729cc5dfa39337d6dba7078e0598f2408f479c7b1f1f393d7e149235d9e2` | the C bodies as CUDApp has them |
+| `seqoracle.c` | `ad7f2542dfd04969130f65b0ab0db8e9558cc760d6949d5cd4b77a851da4acca` | the effect stubs that record and refuse by script, the programs, and the runs over failure scripts |
+| `build.sh` | `259abaf8f260a16b19ebb6b7d5803f14a0cb2dadea5648fc162f90a2e8c94d2d` | builds both oracles, prints `seq-cases.tsv`, `seq-cases-verbatim.tsv` and `fix1-diff.txt` |
+| `seq-controls.sh` | `97d87c1d318b2cf42c0ef101c330c25e874bffb609cccb784543666bba559042` | table mutations, one-line source mutations of `client.om` and `fx.om`, and the run on the unchanged C's table; each must fail |
+| `coverage-map.tsv` | `99a65c3156185bc2e2dac46e8f08adadca49d8b623c0d227bf1605d74324c620` | the map above, with the sequence rows moved to `client.om` |
+
+`CUDAPP_REF=<CUDApp checkout at 84b524ca> ./build.sh` rebuilds; its `seq-cases.tsv` must equal the one
+here. `seq-controls.sh <scratch-dir>`, from an omega-mv root, prints `CONTROLS CAUGHT all`.
 
 ## Hardware tier: NOT_RUN
 
@@ -92,17 +137,13 @@ look, as the C does with `usleep(50)`. It compiles; it has not been run against 
 
 ## Still C
 
-Not rewritten here, and not checked by this gate (`coverage.tsv` lists each function by name):
+No decision logic of `nvrm/` and `m16/` is still C (`coverage.tsv` has no `still C` row). Not rewritten
+here, and not checked by these gates:
 
-- the device side of `nvrm/nvrm.c`, `nvrm/native_client.h`, `nvrm/cpu_barrier.h` and `m16/m16_native.c`
-  (ioctl, mmap, doorbell, barrier, clock, byte copies), marked `device shell`. Omega code for a
+- the device side, marked `device shell` (ioctl, mmap, the doorbell write, barriers, clocks, byte copies
+  into mappings). `DEVICE.md` says what each needs and which Omega already does it; Omega code for a
   single-channel client exists in `gpu/nvidia/native/nvrm/context.om`, `transport.om` and
-  `gpu/nvidia/native/streams/submit.om`; it is not compared with this C;
-- the rows marked `still C: decision logic, not yet ported`: the open, channel, free and close sequences
-  with their unwinds and teardown order, the ready guards and check order of `nvrm_enqueue` and
-  `nvrm_chan_submit`, `quarantine_allocation`, the slot lookup of `m16_native_free_memory`, and the
-  allocate, map and unwind sequence of `alloc_with_cacheability` (its size and table checks are in
-  `nvrm.om`);
+  `gpu/nvidia/native/streams/submit.om`, and is not compared with this C;
 - the null-pointer refusal at the top of `m16_native_wait_marker_ge` (`!marker` returns -1).
   `drv_wait_ge` takes a mapping handle and an offset, not a pointer, so that check belongs to whoever
   makes the mapping; nothing in Omega makes it yet;
@@ -120,3 +161,6 @@ differently; no case in the table reaches either. Two limits remain, and both re
   than that is refused.
 - The gate reads one table line into a 65536-byte array, so a longer line is refused by name. Omega array
   sizes are fixed when the program is compiled.
+- `seqgate` reads a line into a 65536-byte array and builds a trace into another, and a program has at
+  most 256 tokens; each is refused by name. The step warns when the longest table line passes half of
+  that (it is about 6.5 KB now).

@@ -239,7 +239,25 @@ case "$step" in
     cat "$OUT_DIR/gate.log"
     [ "$rc" -eq 0 ] || exit "$rc"
     grep -qx "OMEGA-GPU-DRIVER PASS cases=$cases controls=$kinds caught=$kinds hardware=NOT_RUN" "$OUT_DIR/gate.log" ||
-      { echo "OMEGA-GPU-DRIVER FAIL: the summary line does not show every case and control of the table" >&2; exit 1; } ;;
+      { echo "OMEGA-GPU-DRIVER FAIL: the summary line does not show every case and control of the table" >&2; exit 1; }
+    # The sequence gate: client.om (the setup and teardown of nvrm/ and m16/, ported from C) against the command
+    # sequences the C oracle recorded (seq-cases.tsv), with two controls for each distinct program.
+    rm -f "$OUT_DIR/seqgate"
+    parts=()
+    while IFS= read -r p; do parts+=("$p"); done < gpu/nvidia/driver/seqparts.txt
+    cat "${parts[@]}" | seed/out/omc > "$OUT_DIR/seqgate"
+    chmod 700 "$OUT_DIR/seqgate"
+    cases="$(grep -cv -e '^#' -e '^$' gpu/nvidia/driver/seq-cases.tsv)"
+    progs="$(grep -v -e '^#' -e '^$' gpu/nvidia/driver/seq-cases.tsv | cut -f2 | sort -u | wc -l)"
+    # seqgate reads a line into a 65536-byte array fixed at compile time and refuses a longer one; warn at half.
+    longest="$(awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }' gpu/nvidia/driver/seq-cases.tsv)"
+    [ "$longest" -le 32768 ] ||
+      echo "OMEGA-GPU-DRIVER-SEQ ALARM: longest seq-cases.tsv line is $longest bytes, over half of seqgate's 65536-byte line array" >&2
+    rc=0; "$OUT_DIR/seqgate" gpu/nvidia/driver/seq-cases.tsv > "$OUT_DIR/seqgate.log" || rc=$?
+    tail -n 20 "$OUT_DIR/seqgate.log"
+    [ "$rc" -eq 0 ] || exit "$rc"
+    grep -qx "OMEGA-GPU-DRIVER-SEQ PASS cases=$cases programs=$progs controls=$((2 * progs)) caught=$((2 * progs)) hardware=NOT_RUN" "$OUT_DIR/seqgate.log" ||
+      { echo "OMEGA-GPU-DRIVER-SEQ FAIL: the summary line does not show every case and control of the table" >&2; exit 1; } ;;
   # gpu/runtime/ (one slice of the work on CUDApp src/, the C runtime): the gate is seeded Omega, gpu/runtime/gate.om, built with
   # seed/ng/sha256.om and gpu/runtime/zsha.om by seed/out/omc after that compiler's digest is checked; the gate checks
   # it again. Its counts follow gpu/runtime/checks.tsv and controls.tsv, so the line is matched by its form.
