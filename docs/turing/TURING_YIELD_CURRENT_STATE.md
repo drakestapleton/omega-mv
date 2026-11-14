@@ -224,7 +224,7 @@ The honest pairing:
   - A unit "Turing (T)" inside records named `turing_*` is ambiguous. Prefer domain `turing.yield.*` and field names
     `t_millibits`. Never reuse `turing_evidence`.
   - "Turing" is also an NVIDIA GPU generation (physics `third_party/nvidia-open-*` headers).
-- **"yield"**: 23 omega files, all plain-English prose ("yields identical SEMANTIC_ID", `README.md:95-96`). No identifier conflict. "surprise": 0 hits.
+- **"yield"**: 23 omega files, all plain-English prose ("yields identical SEMANTIC_ID", the identity paragraph of `README.md`). No identifier conflict. "surprise": 0 hits.
 - **"profile"**: collides with `spec/aarch64-realization.md:96` (Target Profile ID), `spec/machine.md:101` (machine
   profile) and `spec/cognitive-routing.md:14`. Use "measurement profile" or `yprofile` in full, never bare "profile".
 - **"sealed"**: already meaningful in crumbs (`crates/crumbs/src/sealed.rs`, sealed verifier/held-outs in `ledger.jsonl`

@@ -178,8 +178,8 @@ condition choices in 1.6 (LT -> MI, LE -> LS, GT, GE, EQ, NE) read false on NaN 
 intended. Two facts the table adds: `fmov d0, #0.0` is not encodable (zero has no
 FMOV-immediate form; use `fmov dD, xzr` / `fmov sD, wzr`), and FMOV immediates take
 the 8-bit imm8 code, not the float (1.0 = 0x70, 2.0 = 0x00, 0.5 = 0x60, -1.0 = 0xF0).
-The builder still runs `docs-read omega` before touching the encoder (README.md:32-34
-standing rules; manual-guard hook) and adds `enc_expect` goldens taken from the .h table.
+The builder still runs `docs-read omega` before touching the encoder (the standing rules in `README.md` and
+`ENGINEERING-NOTES.md`; manual-guard hook) and adds `enc_expect` goldens taken from the .h table.
 
 | Op | Fixed bits (S / D) | Golden example | Word |
 |---|---|---|---|
