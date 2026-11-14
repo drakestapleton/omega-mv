@@ -1,17 +1,18 @@
-# gpu/runtime: CUDApp `src/` (the C runtime) brought into Omega
+# gpu/runtime: the inventory of CUDApp `src/` (the C runtime) and its Omega rewrites so far
 
 CUDApp's `src/` is the runtime behind its CUDA-compatible ABI. Most of it was not written by hand. The Omega Bridge
 emitted it from Omega source, and each emitted file has an `.ident` record naming its parts. No `.ident` record names
 the rest: hand-written C and headers, plus files that other CUDApp generators wrote without one. This directory
-sorts every file of CUDApp `src/` into those classes. Files without a record are rewritten here in seeded Omega, one
-slice at a time. No C, Python, shell or assembly is kept here. The old C stays in CUDApp and serves as the reference
-(the oracle); it is compiled and run outside this repository.
+sorts every file of CUDApp `src/` into those classes. This is one slice of that work, not the move of `src/`: the
+files without a record that are rewritten here so far are listed in `rewrites.tsv` (`INVENTORY.tsv` counts them and
+the rest), and the others follow one slice at a time. No C, Python, shell or assembly is kept here. The old C stays
+in CUDApp and serves as the reference (the oracle); it is compiled and run outside this repository.
 
 ## What is here
 
 | path | what it is |
 | --- | --- |
-| `inventory.om` | the inventory program (OM-2): reads the five input lists and prints one row per CUDApp `src/` file |
+| `inventory.om` | the inventory program (OM-2): reads the input lists below and prints one row per CUDApp `src/` file |
 | `zsha.om` | streaming SHA-256 over a file, on top of `seed/ng/sha256.om` (used by the inventory and the gate) |
 | `INVENTORY.tsv` | the inventory's output, committed; the gate requires the program to reproduce it byte for byte |
 | `cudapp-src.sha256.txt` | input: `sha256sum` of every file under CUDApp `src/` |
@@ -30,7 +31,7 @@ The headers of `inventory.om` and `gate.om` define their columns, fields and exi
 ## The inventory at this base
 
 The last summary lines of `INVENTORY.tsv` give the counts. They are the source; this file does not restate them.
-Every file has one of three origins:
+Every file has one of these origins:
 
 - `record`: an `.ident` file.
 - `bridge`: emitted by the Omega Bridge. The row says whether its parts are in this tree and compose to the
@@ -75,12 +76,12 @@ stale: regenerate it.
 
 ## The scanref oracle
 
-`check/scanref.expect.txt` is the output of the old C. A driver kept outside this repository produced it. The
-driver, its output and the build commands are kept in
-`~/handoffs/hive/cuda-in-20261114/oracles/RuntimeC/` on spark-b87b:
+`check/scanref.expect.txt` is the output of the old C. A driver kept outside this repository by the lane that wrote
+this slice produced it, and its sha256 is its identity:
 
 - `scanref_driver.c`: sha256 `0861c617842414d024db4ae95de0d45fb8f0cd74ca8037c43940d6aedb3b6fa7`.
-- `scanref.expect.txt`: byte for byte the same as `check/scanref.expect.txt`.
+- its output: byte for byte `check/scanref.expect.txt`, sha256
+  `554788ac49ceb590feec937dc223a9befd15ef6ba4488936395b589d5e7a9958`.
 
 The driver was built against CUDApp `src/` at the commit above:
 
@@ -118,6 +119,11 @@ The gate takes these steps:
 
 Its last line is `OMEGA-GPU-RUNTIME PASS|FAIL checks=N controls=C caught=K hardware=NOT_RUN`. A PASS needs at least
 one check, no FAIL line, and K equal to C.
+
+Names and table rows have no length limit of the gate's own; its memory grows with the input. The one fixed limit
+is the Linux path limit (PATH_MAX, 4096 bytes with the terminating zero): a path the gate would build at 4096 bytes
+or more (the compiler path, `SCRATCH/`, or `SCRATCH/NAME` with a suffix) is refused with exit 2 before any system
+call is made with it.
 
 That is all the gate checks. It does not check the CUDApp commit, or that a file of `INVENTORY.tsv` is really
 hand-written. It does not rerun the C oracle. It does not check that a rewrite covers every function of the C file,
