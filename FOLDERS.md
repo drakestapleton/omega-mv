@@ -55,7 +55,7 @@ Immutable receipts of learner development runs (seeds 1..5 per level, HOLDOUT/TR
 
 ## `gpu/nvidia/`
 
-The NVIDIA units of Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047), moved from CUDApp with the history of their files. Today: the five seeded-Omega units Omega NG pins (`seed/ng/cudapp.lock`): the sm_121 encoder, the allocator, the cubin writer, the Blackwell launch unit and the nvrm context unit. `gpu/nvidia/README.md` says what each is and what is still in CUDApp.
+The NVIDIA units of Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047), moved from CUDApp with the history of their files. Today: the five seeded-Omega units Omega NG pins (`seed/ng/cudapp.lock`): the sm_121 encoder ng pins (a different file from the top-level `om/encoder/bw_enc_sm121.om`, which the Makefile uses), the allocator, the cubin writer, the Blackwell launch unit and the nvrm context unit. `gpu/nvidia/README.md` says what each is and what is still in CUDApp.
 
 Rules:
 
