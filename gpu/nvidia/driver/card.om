@@ -1,0 +1,164 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/nvidia/driver/card.om: which GPU the driver client opens, and the class list it hands to amp_runtime.
+note Omega form of CUDApp nvrm/nvrm.c card_index and the marshalling half of select_classes (84b524ca).
+note Needs OM-2 (unsized views): compose after an om2 part; gpu/nvidia/driver/parts.txt lists the order.
+note Card table: the bytes NV_ESC_CARD_INFO fills, records of 72 bytes (nv_ioctl_card_info_t of NVIDIA open
+note 580.173.02): valid u8 at 0, PCI domain u32 LE at 4, bus u8 at 8, slot u8 at 9, function u8 at 10. The C
+note walks 64 records; here the record count is the table length divided by 72, so a caller hands 64.
+
+note value of one lowercase hex digit, or 16 when c is not one ("%x" output is lowercase)
+fn drv_hexd c ulong to ulong
+if and ge c 48 le c 57
+ret sub c 48
+end
+if and ge c 97 le c 102
+ret sub c 87
+end
+ret 16
+end
+
+note the hex digits b[s, s + n) as one number, or 2^64 - 1 when one of them is not a lowercase hex digit
+fn drv_hexn b view uchar * s ulong n ulong to ulong
+v = ulong 0
+for i ulong n bound 8
+d = drv_hexd ulong get b add s i
+if gt d 15
+ret 18446744073709551615
+end
+v = add shl v 4 d
+end
+ret v
+end
+
+note A BDF the C accepts: sscanf "%x:%x:%x.%x%c" reads exactly four fields, domain <= 0xffff, bus <= 0xff,
+note slot <= 0x1f, function <= 7, and the text equals its own "%04x:%02x:%02x.%x". That is exactly
+note dddd:bb:ss.f in lowercase hex, 12 bytes. o gets domain, bus, slot, function. False refuses it.
+fn drv_bdf b view uchar * o edit ulong 4 to bool
+if ne len b 12
+ret false
+end
+if or ne get b 4 58 or ne get b 7 58 ne get b 10 46
+ret false
+end
+d = drv_hexn b 0 4
+u = drv_hexn b 5 2
+s = drv_hexn b 8 2
+f = drv_hexn b 11 1
+if or gt d 65535 or gt u 255 or gt s 31 gt f 7
+ret false
+end
+put o 0 d
+put o 1 u
+put o 2 s
+put o 3 f
+ret true
+end
+
+note little-endian u32 at byte p of the card table
+fn drv_u32 c view uchar * p ulong to ulong
+a = ulong get c p
+b = shl ulong get c add p 1 8
+x = shl ulong get c add p 2 16
+y = shl ulong get c add p 3 24
+ret or or a b or x y
+end
+
+note card_index: with has false, the first valid card; with has true, the first valid card whose PCI address
+note is the BDF in b (refused BDF: none). Returns the card index plus one, 0 when there is none.
+fn drv_card c view uchar * has bool b view uchar * to ulong
+o = new ulong 4 0
+n = div len c 72
+if has
+if not drv_bdf b o
+ret 0
+end
+end
+for i ulong n bound 9223372036854775807
+p = mul i 72
+if ne get c p 0
+if not has
+ret add i 1
+end
+if drv_at c p o
+ret add i 1
+end
+end
+end
+ret 0
+end
+
+note the card record at byte p has the PCI address o[0..3]
+fn drv_at c view uchar * p ulong o view ulong 4 to bool
+if ne drv_u32 c add p 4 get o 0
+ret false
+end
+if ne ulong get c add p 8 get o 1
+ret false
+end
+if ne ulong get c add p 9 get o 2
+ret false
+end
+ret eq ulong get c add p 10 get o 3
+end
+
+note select_classes marshalling: the amp_runtime class-set request m for SM sm and PCI vendor:device. Bit k of
+note m[10] says the vendor list holds Ampere class m[4 + k] (compute B, GPFIFO A, Volta usermode A); bit k of
+note m[11] says it holds Blackwell class m[7 + k] (compute B, channel GPFIFO A, Hopper usermode A).
+fn drv_marshal sm ulong vendor ulong device ulong cls view uint * m edit ulong 16 to void
+for z ulong 16
+put m z 0
+end
+put m 0 1
+put m 1 sm
+put m 2 0x806
+put m 3 0xc01
+put m 4 0xc7c0
+put m 5 0xc56f
+put m 6 0xc361
+put m 7 0xcec0
+put m 8 0xc96f
+put m 9 0xc661
+put m 12 0xa04
+put m 13 vendor
+put m 14 device
+for i ulong len cls bound 9223372036854775807
+v = ulong get cls i
+for k ulong 3
+if eq v get m add 4 k
+put m 10 or get m 10 shl ulong 1 k
+end
+if eq v get m add 7 k
+put m 11 or get m 11 shl ulong 1 k
+end
+end
+end
+end
+
+note select_classes: s gets target SM, discrete, compute, GPFIFO and usermode class; false is the C refusal
+note "unsupported SM 0x%x or missing target classes" (s is then all zero).
+fn drv_select sm ulong vendor ulong device ulong cls view uint * s edit ulong 5 to bool
+m = new ulong 16 0
+q = new ulong 64 0
+drv_marshal sm vendor device cls m
+for z ulong 5
+put s z 0
+end
+if ne amp_runtime m q 1
+ret false
+end
+for z ulong 5
+put s z get q z
+end
+ret true
+end
+
+note nvrm_retire and nvrm_chan_retire (nvrm/nvrm.c): the channel's retired GPFIFO count after the caller reports
+note completion up to up. It moves only when up lies in [rt, pt] counted forward from rt with u32 wrap:
+note (up - rt) <= (pt - rt). For u32 inputs the 64-bit differences order exactly as the 32-bit ones do (a
+note difference that wraps is above every one that does not, in both widths), so no mask is needed.
+fn drv_retire rt ulong pt ulong up ulong to ulong
+if le sub up rt sub pt rt
+ret up
+end
+ret rt
+end

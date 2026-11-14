@@ -1,0 +1,615 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/nvidia/driver/gate.om: the gpu-driver gate. It reads the cases the C oracle printed
+note (gpu/nvidia/driver/oracle-cases.tsv: CUDApp 84b524ca nvrm/ and m16/ C, run outside this tree) and
+note recomputes each one with card.om, diag.om and m16.om. For the first case of each kind it also runs a
+note control: the same case with its expected answer changed, which must be caught. Exit 0 is PASS.
+note Line kinds, tab separated, numbers decimal, bytes lowercase hex, "-" absent, "e" empty bytes:
+note card HAS BDF CARDS INDEX+1 / cls SM VENDOR DEVICE CLASSES M10 M11 / amem PREV SIZE MEMINFO MESSAGE /
+note chan PREV ATTEMPTS DELAY MEMINFO BUDDYINFO MESSAGE / maps MAPS HIT / name KIND CODE TEXT /
+note wge NOW TIMEOUT T MARKER TARGET RC+1 CLOCK_READS / ret RETIRED PUT UPTO NEWRETIRED. A card record is 9
+note bytes: index, valid, domain u32 LE,
+note bus, slot, function. CLASSES are u32 LE words. In wge the clock reads NOW, then T, then 2^64 - 1.
+note Lines starting with # are notes. One line is read into a 65536-byte array (an Omega array's size is fixed
+note when it is compiled), so a longer line is refused by name, never cut; the committed table's longest line
+note is 1459 bytes. Arrays are passed as arguments, so they are main's locals: l line, d decoded fields,
+note c card table, u class words, o recomputed message.
+
+text gt_k "card|cls|amem|chan|maps|name|wge|ret|"
+text gt_mf "MemFree"
+text gt_ma "MemAvailable"
+text gt_use "usage: gate ORACLE-CASES.tsv\n"
+text gt_open "gate: cannot open, size or map the cases file\n"
+text gt_long "gate: a line of the cases file is longer than 65536 bytes; refused\n"
+text gt_fl1 "FAIL line "
+text gt_bad "FAIL malformed line "
+text gt_none "FAIL no cases of kind "
+text gt_ctl "FAIL control not caught, kind "
+text gt_sum "OMEGA-GPU-DRIVER "
+text gt_pass "PASS"
+text gt_fail "FAIL"
+text gt_cs " cases="
+text gt_co " controls="
+text gt_ca " caught="
+text gt_hw " hardware=NOT_RUN\n"
+text gt_nl "\n"
+global g_p uchar 4096
+global g_st uchar 256
+global g_nb uchar 24
+global g_fs ulong 16
+global g_fe ulong 16
+global g_ds ulong 8
+global g_dl ulong 8
+global g_kc ulong 8
+note g_n: 0 decode top, 1 control on, 2 fields, 3 line number, 4 cases, 5 fails, 6 controls, 7 caught,
+note 8 malformed lines, 9 clock reads, 10 clock NOW, 11 clock T
+global g_n ulong 16
+
+fn gnum v ulong to void
+k = ulong 0
+x = v
+while true bound 20
+put g_nb k uchar add 48 rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for j ulong div k 2 bound 10
+a = get g_nb j
+put g_nb j get g_nb sub sub k j 1
+put g_nb sub sub k j 1 a
+end
+r = write 1 g_nb 0 k
+end
+
+fn gbad to void
+put g_n 8 add get g_n 8 1
+end
+
+note decimal field i: 1 to 20 digits below 2^64; anything else marks the line malformed
+fn fdec i ulong l view uchar 65536 to ulong
+v = ulong 0
+s = get g_fs i
+n = sub get g_fe i s
+if or eq n 0 gt n 20
+gbad
+ret 0
+end
+for j ulong n bound 20
+c = ulong get l add s j
+if or lt c 48 gt c 57
+gbad
+ret 0
+end
+if gt v div sub ulong 18446744073709551615 sub c 48 10
+gbad
+ret 0
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+
+note the byte whose two hex digits start at l[q], or 256 when they are not lowercase hex
+fn ghex2 q ulong l view uchar 65536 to ulong
+h = drv_hexd ulong get l q
+x = drv_hexd ulong get l add q 1
+if or gt h 15 gt x 15
+ret 256
+end
+ret or shl h 4 x
+end
+
+note hex field i decoded into d as segment slot; false when the field is "-" (absent)
+fn fhex i ulong slot ulong l view uchar 65536 d edit uchar 65536 to bool
+s = get g_fs i
+n = sub get g_fe i s
+p = get g_n 0
+put g_ds slot p
+put g_dl slot 0
+if eq n 1
+if eq get l s 45
+ret false
+end
+if eq get l s 101
+ret true
+end
+end
+if ne rem n 2 0
+gbad
+ret false
+end
+n = div n 2
+if gt add p n 65536
+gbad
+ret false
+end
+for j ulong n bound 65536
+x = ghex2 add s mul j 2 l
+if gt x 255
+gbad
+ret false
+end
+put d add p j uchar x
+end
+put g_n 0 add p n
+put g_dl slot n
+ret true
+end
+
+note o[0, n) equals segment slot of d; with the control on, the first expected byte is changed
+fn gcmp n ulong slot ulong d view uchar 65536 o view uchar 65536 to bool
+if ne n get g_dl slot
+ret false
+end
+b = get g_ds slot
+for i ulong n bound 65536
+x = ulong get d add b i
+if and eq i 0 eq get g_n 1 1
+x = xor x 1
+end
+if ne ulong get o i x
+ret false
+end
+end
+ret true
+end
+
+note place the 9-byte card record at d[q] into the 64 x 72-byte table c; false when its index is past 63
+fn gcrec q ulong d view uchar 65536 c edit uchar 4608 to bool
+p = mul ulong get d q 72
+if ge p 4608
+gbad
+ret false
+end
+put c p get d add q 1
+for j ulong 4
+put c add add p 4 j get d add add q 2 j
+end
+put c add p 8 get d add q 6
+put c add p 9 get d add q 7
+put c add p 10 get d add q 8
+ret true
+end
+
+fn hcard l view uchar 65536 d edit uchar 65536 c edit uchar 4608 to bool
+pb = fhex 2 0 l d
+pc = fhex 3 1 l d
+for z ulong 4608
+put c z 0
+end
+for r ulong div get g_dl 1 9 bound 65536
+if not gcrec add get g_ds 1 mul r 9 d c
+ret false
+end
+end
+got = drv_card c ne fdec 1 l 0 part d get g_ds 0 get g_dl 0
+ret eq got add fdec 4 l get g_n 1
+end
+
+note the little-endian u32 at d[q]
+fn gu32 q ulong d view uchar 65536 to ulong
+x = or ulong get d q shl ulong get d add q 1 8
+ret or x or shl ulong get d add q 2 16 shl ulong get d add q 3 24
+end
+
+fn hcls l view uchar 65536 d edit uchar 65536 u edit uint 16384 to bool
+pc = fhex 4 0 l d
+n = div get g_dl 0 4
+for i ulong n bound 16384
+put u i uint gu32 add get g_ds 0 mul i 4 d
+end
+m = new ulong 16 0
+drv_marshal fdec 1 l fdec 2 l fdec 3 l part u 0 n m
+if ne get m 10 add fdec 5 l get g_n 1
+ret false
+end
+ret eq get m 11 fdec 6 l
+end
+
+note MemFree (w 0) or MemAvailable (w 1) of segment slot of d into r[0]
+fn gmem slot ulong w ulong d view uchar 65536 r edit ulong 1 to bool
+if eq w 0
+ret drv_meminfo part d get g_ds slot get g_dl slot part gt_mf 0 len gt_mf r
+end
+ret drv_meminfo part d get g_ds slot get g_dl slot part gt_ma 0 len gt_ma r
+end
+
+fn hamem l view uchar 65536 d edit uchar 65536 o edit uchar 65536 to bool
+pp = fhex 1 0 l d
+pm = fhex 3 1 l d
+px = fhex 4 2 l d
+v = new ulong 3 0
+r = new ulong 1 0
+put v 0 fdec 2 l
+if pm
+if not gmem 1 0 d r
+ret false
+end
+put v 1 get r 0
+if not gmem 1 1 d r
+ret false
+end
+put v 2 get r 0
+end
+n = drv_amsg part d get g_ds 0 get g_dl 0 v o
+ret gcmp n 2 d o
+end
+
+fn hchan l view uchar 65536 d edit uchar 65536 o edit uchar 65536 to bool
+pp = fhex 1 0 l d
+pm = fhex 4 1 l d
+pb = fhex 5 2 l d
+px = fhex 6 3 l d
+v = new ulong 4 0
+r = new ulong 1 0
+put v 0 fdec 2 l
+put v 1 fdec 3 l
+if pm
+if not gmem 1 0 d r
+ret false
+end
+put v 2 get r 0
+end
+put v 3 18446744073709551615
+if pb
+if not drv_buddy part d get g_ds 2 get g_dl 2 9 r
+ret false
+end
+put v 3 get r 0
+end
+n = drv_cmsg part d get g_ds 0 get g_dl 0 v o
+ret gcmp n 3 d o
+end
+
+fn hmaps l view uchar 65536 d edit uchar 65536 to bool
+if not fhex 1 0 l d
+ret false
+end
+got = drv_maps part d get g_ds 0 get g_dl 0
+ret eq got add fdec 2 l get g_n 1
+end
+
+fn hname l view uchar 65536 d edit uchar 65536 o edit uchar 65536 to bool
+p = fhex 3 0 l d
+code = fdec 2 l
+r = long code
+if ge code 2147483648
+r = neg long sub 4294967296 code
+end
+w = new ulong 2 0
+if eq fdec 1 l 0
+drv_wres r w
+else
+drv_wkind r w
+end
+for i ulong get w 1 bound 64
+put o i get drv_m16t add get w 0 i
+end
+ret gcmp get w 1 0 d o
+end
+
+note the scripted clock of a wge case: NOW, then T, then 2^64 - 1
+fn gclk to ulong
+c = get g_n 9
+put g_n 9 add c 1
+if eq c 0
+ret get g_n 10
+end
+if eq c 1
+ret get g_n 11
+end
+ret 18446744073709551615
+end
+
+note m16_native_wait_marker_ge on the scripted clock, step for step as drv_wait_ge runs on the real one
+fn hwge l view uchar 65536 to bool
+put g_n 10 fdec 1 l
+put g_n 11 fdec 3 l
+put g_n 9 0
+mk = fdec 4 l
+tg = fdec 5 l
+dur = drv_wdur fdec 2 l
+endt = ulong 18446744073709551615
+if ne dur 18446744073709551615
+endt = drv_wend gclk dur
+end
+rc = ulong 0
+done = false
+while lt gclk endt bound 8
+if drv_reached mk tg
+rc = ulong 1
+done = true
+break
+end
+end
+if not done
+if drv_reached mk tg
+rc = ulong 1
+end
+end
+if ne rc add fdec 6 l get g_n 1
+ret false
+end
+ret eq get g_n 9 fdec 7 l
+end
+
+note nvrm_retire: the retired count after a completion report
+fn hret l view uchar 65536 to bool
+got = drv_retire fdec 1 l fdec 2 l fdec 3 l
+ret eq got add fdec 4 l get g_n 1
+end
+
+note fields a line of kind k has
+fn gnf k ulong to ulong
+if or eq k 0 eq k 2
+ret 5
+end
+if or eq k 1 eq k 3
+ret 7
+end
+if eq k 4
+ret 3
+end
+if eq k 5
+ret 4
+end
+if eq k 7
+ret 5
+end
+ret 8
+end
+
+note kind of field 0 (index of its piece in gt_k), or 8 when it names none
+fn gkind l view uchar 65536 to ulong
+s = get g_fs 0
+n = sub get g_fe 0 s
+i = ulong 0
+for k ulong 8
+st = i
+while ne get gt_k i 124 bound 16
+i = add i 1
+end
+if eq sub i st n
+same = true
+for j ulong n bound 16
+if ne get l add s j get gt_k add st j
+same = false
+end
+end
+if same
+ret k
+end
+end
+i = add i 1
+end
+ret 8
+end
+
+fn hrun k ulong l view uchar 65536 d edit uchar 65536 c edit uchar 4608 u edit uint 16384 o edit uchar 65536 to bool
+put g_n 0 0
+if eq k 0
+ret hcard l d c
+end
+if eq k 1
+ret hcls l d u
+end
+if eq k 2
+ret hamem l d o
+end
+if eq k 3
+ret hchan l d o
+end
+if eq k 4
+ret hmaps l d
+end
+if eq k 5
+ret hname l d o
+end
+if eq k 6
+ret hwge l
+end
+ret hret l
+end
+
+note split l[0, n) into fields at tabs; false when it has more than 16
+fn gsplit n ulong l view uchar 65536 to bool
+f = ulong 0
+put g_fs 0 0
+for i ulong n bound 65536
+if eq get l i 9
+if ge add f 1 16
+ret false
+end
+put g_fe f i
+f = add f 1
+put g_fs f add i 1
+end
+end
+put g_fe f n
+put g_n 2 add f 1
+ret true
+end
+
+note report a case result: a failing case prints its line number
+fn gcase ok bool to void
+put g_n 4 add get g_n 4 1
+if not ok
+put g_n 5 add get g_n 5 1
+r = write 1 gt_fl1 0 len gt_fl1
+gnum get g_n 3
+r = write 1 gt_nl 0 len gt_nl
+end
+end
+
+note report a control result: a control that is not caught prints its kind
+fn gctl caught bool k ulong to void
+put g_n 6 add get g_n 6 1
+if caught
+put g_n 7 add get g_n 7 1
+else
+r = write 1 gt_ctl 0 len gt_ctl
+gnum k
+r = write 1 gt_nl 0 len gt_nl
+end
+end
+
+note one line l[0, n): split, check, run, and the control for a kind's first case
+fn gline n ulong l view uchar 65536 d edit uchar 65536 c edit uchar 4608 u edit uint 16384 o edit uchar 65536 to void
+put g_n 3 add get g_n 3 1
+if eq n 0
+ret
+end
+if eq get l 0 35
+ret
+end
+bad = get g_n 8
+if not gsplit n l
+gbad
+end
+k = ulong 8
+if eq get g_n 8 bad
+k = gkind l
+if or eq k 8 ne get g_n 2 gnf k
+gbad
+end
+end
+if eq get g_n 8 bad
+put g_n 1 0
+ok = hrun k l d c u o
+if eq get g_n 8 bad
+gcase ok
+if eq get g_kc k 0
+put g_n 1 1
+cc = hrun k l d c u o
+put g_n 1 0
+gctl not cc k
+end
+put g_kc k add get g_kc k 1
+end
+end
+if ne get g_n 8 bad
+r = write 1 gt_bad 0 len gt_bad
+gnum get g_n 3
+r = write 1 gt_nl 0 len gt_nl
+end
+end
+
+note the size of the open file fd from fstat (st_size, byte 48 of the AArch64 struct stat), 0 on failure
+fn gsize fd int to ulong
+if ne fstat fd g_st 0 128 0
+ret 0
+end
+size = ulong 0
+for j ulong 8
+size = or size shl ulong get g_st add 48 j mul j 8
+end
+ret size
+end
+
+fn gsummary to int
+fl = add get g_n 5 get g_n 8
+for k ulong 8
+if eq get g_kc k 0
+fl = add fl 1
+r = write 1 gt_none 0 len gt_none
+gnum k
+r = write 1 gt_nl 0 len gt_nl
+end
+end
+if ne get g_n 6 get g_n 7
+fl = add fl 1
+end
+r = write 1 gt_sum 0 len gt_sum
+if eq fl 0
+r = write 1 gt_pass 0 len gt_pass
+else
+r = write 1 gt_fail 0 len gt_fail
+end
+r = write 1 gt_cs 0 len gt_cs
+gnum get g_n 4
+r = write 1 gt_co 0 len gt_co
+gnum get g_n 6
+r = write 1 gt_ca 0 len gt_ca
+gnum get g_n 7
+r = write 1 gt_hw 0 len gt_hw
+if ne fl 0
+ret 1
+end
+ret 0
+end
+
+note open argv[1] and map it whole; g_n 12 gets the descriptor and g_n 13 the size. 0 when it cannot.
+fn gopen to long
+if ne argcnt 2
+r = write 2 gt_use 0 len gt_use
+ret 0
+end
+pl = argread 1 g_p 0 4095
+if lt pl 1
+r = write 2 gt_use 0 len gt_use
+ret 0
+end
+fd = int fopen g_p 0 ulong pl 524288 0
+if lt fd 0
+r = write 2 gt_open 0 len gt_open
+ret 0
+end
+size = gsize fd
+put g_n 12 ulong fd
+put g_n 13 size
+h = long 0
+if gt size 0
+h = mapnew fd 0 size 1 2
+end
+if le h 0
+r = write 2 gt_open 0 len gt_open
+ret 0
+end
+ret h
+end
+
+note the offset of the first newline in l[0, k), or k when there is none
+fn geol k ulong l view uchar 65536 to ulong
+for i ulong k bound 65536
+if eq get l i 10
+ret i
+end
+end
+ret k
+end
+
+fn main to int
+l = new uchar 65536 0
+d = new uchar 65536 0
+c = new uchar 4608 0
+u = new uint 16384 0
+o = new uchar 65536 0
+h = gopen
+if le h 0
+ret 2
+end
+size = get g_n 13
+pos = ulong 0
+while lt pos size bound 9223372036854775807
+k = sub size pos
+if gt k 65536
+k = ulong 65536
+end
+if ne mapread h pos l 0 k long k
+r = write 2 gt_open 0 len gt_open
+ret 2
+end
+e = geol k l
+if and eq e k eq k 65536
+r = write 2 gt_long 0 len gt_long
+ret 2
+end
+gline e l d c u o
+pos = add pos add e 1
+end
+r = mapdrop h
+q = fclose int get g_n 12
+ret gsummary
+end
