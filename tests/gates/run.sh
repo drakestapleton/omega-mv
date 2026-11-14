@@ -199,7 +199,8 @@ case "$step" in
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
   gpu-checks)
     # The behaviour checks that replace CUDApp tests/ and tools/ (gpu/nvidia/checks/README.md). The expected
-    # count is the number of check rows in checks.tsv, so a row the gate skipped cannot pass unseen.
+    # counts come from checks.tsv (one row per check, one table control each) and mutants.tsv (one source-mutant
+    # control per row), so a row the gate skipped cannot pass unseen.
     sha256sum -c --quiet seed/out/omc.sha256 || { echo "OMEGA-GPU-CHECKS REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
     rm -rf "$OUT_DIR/gate" "$OUT_DIR/work"
     { printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/checks/gate.om; } | seed/out/omc > "$OUT_DIR/gate"
@@ -208,8 +209,10 @@ case "$step" in
     cat "$OUT_DIR/gate.log"
     [ "$rc" -eq 0 ] || exit "$rc"
     n=$(grep -c '^[A-Za-z0-9_]' gpu/nvidia/checks/checks.tsv)
-    grep -qx "OMEGA-GPU-CHECKS PASS checks=$n controls=$((n + 1)) caught=$((n + 1)) hardware=NOT_RUN" "$OUT_DIR/gate.log" ||
-      { echo "OMEGA-GPU-CHECKS FAIL: the summary line does not show $n checks and $((n + 1)) caught controls" >&2; exit 1; } ;;
+    m=$(grep -c '^[A-Za-z0-9_]' gpu/nvidia/checks/mutants.tsv)
+    c=$((n + m + 1))
+    grep -qx "OMEGA-GPU-CHECKS PASS checks=$n controls=$c caught=$c hardware=NOT_RUN" "$OUT_DIR/gate.log" ||
+      { echo "OMEGA-GPU-CHECKS FAIL: the summary line does not show $n checks and $c caught controls" >&2; exit 1; } ;;
   # Standalone backend qualification: these execute the current sources, never
   # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).
   # They are separate from seed so CPU OpenCL is not required by every host check.
