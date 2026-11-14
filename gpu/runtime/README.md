@@ -28,6 +28,8 @@ in CUDApp and serves as the reference (the oracle); it is compiled and run outsi
 | `check/hostrest-check.om`, `check/hostrest.expect.txt` | the check of `gpu/nvidia/om/apiviews/hostrest.om` (`ah_rest`, ops 0 to 24) against CUDApp's `src/omega_gpu_api_hostrest.h` (`omega_ah_c`, the old C) |
 | `check/platpolicy-check.om`, `check/platpolicy.expect.txt` | the check of `gpu/nvidia/om/platform-linux/plat_policy.om` against CUDApp's `src/omega_gpu_platform_linux_cpolicy.h` (`plat_c`, the old C) |
 | `check/numeric-check.om`, `check/numeric.expect.txt` | the check of `numeric_ref` of `gpu/nvidia/om/numeric/numeric.om` (scalar codes 0 to 30) against the C reference functions of CUDApp's `src/omega_numeric.c` and `src/omega_numeric_reduce.c` |
+| `nativeh.om`, `cudapp-units.ident` | the generator of CUDApp's `src/cudapp_native.h` (OM-2), in place of CUDApp `om/units.sh`, and its input: CUDApp `src/cudapp_om_units.ident` unchanged |
+| `check/nativeh.expect.txt` | CUDApp's `src/cudapp_native.h` less the units whose Omega is not in this tree (see "The generated files") |
 | `held.tsv` | a CUDApp file that is not rewritten because it waits on a decision, not a translation, and which decision |
 | `checks.tsv` | the gate's checks: parts to compose, expected output, and a source mutation that must be caught |
 | `controls.tsv` | the gate's inventory controls: an input byte changed, and how the inventory must notice |
@@ -52,8 +54,9 @@ Every file has one of these origins:
 - `unrecorded`: no `.ident` record names it. The row says whether it has been `rewritten` (with the Omega path), or
   `none`. Not all of them were written by hand. For example, CUDApp `om/native-freest.sh` generates
   `src/cudapp_freest_pathcopy.c` from `om/components/pathcopy.om` (here `gpu/nvidia/om/components/pathcopy.om`),
-  and CUDApp `om/units.sh` generates `src/cudapp_native.h`. Neither writes a record, so both are `unrecorded`. The
-  inventory cannot tell these apart from hand-written files, because it reads only the lists, never CUDApp's files.
+  and CUDApp `om/units.sh` generates `src/cudapp_native.h`. Neither writes a record, so both are `unrecorded`
+  (`nativeh.om` below now regenerates the second). The inventory cannot tell generated files from hand-written ones,
+  because it reads only the lists, never CUDApp's files.
 
 To list the unrecorded files that are not yet rewritten:
 
@@ -71,6 +74,7 @@ Run these from a directory that holds a CUDApp checkout `cudapp/` at the source 
 
     (cd cudapp && find src -type f | LC_ALL=C sort | xargs sha256sum) > omega-mv/gpu/runtime/cudapp-src.sha256.txt
     (cd cudapp && find src -name '*.ident' -type f | LC_ALL=C sort | xargs cat) > omega-mv/gpu/runtime/cudapp-ident.txt
+    cp cudapp/src/cudapp_om_units.ident omega-mv/gpu/runtime/cudapp-units.ident
     (cd omega-mv && git ls-tree -r --name-only BASE src gpu | LC_ALL=C sort | xargs sha256sum) > omega-mv/gpu/runtime/omega-base.sha256.txt
 
 The committed lists came from CUDApp `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66` and omega-mv base
@@ -243,6 +247,51 @@ half-precision widenings, a mode 0 to 4 for `compare_equal`, a 64-bit count for 
 with itself. This covers the scalar reference tier of `src/omega_numeric.c`, the part `rewrites.tsv` names;
 its tile, reduction, patch and device-realization code (the units `tile.om`, `reduce.om`, `rest.om`, `patch.om`,
 `check.om` of `gpu/nvidia/om/numeric/`) is not checked here.
+
+## The generated files
+
+CUDApp `src/` holds four files that no `.ident` record names but that look generated. This is what each one is and
+what this tree does with it (all at CUDApp `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`).
+
+`src/cudapp_native.h` is written by CUDApp `om/units.sh`: a fixed head, one C declaration per unit of
+`src/cudapp_om_units.ident` in that order, a fixed tail. `nativeh.om` writes the same bytes from the Omega source
+in this tree, by the rule its header states (the root is the last `fn` of the unit's composed parts; its
+parameters give the C types; the bridge runtime-views line goes before a `bridge-seeded-runtime` unit and before a
+unit whose composition starts with the line `om2`). Its input `cudapp-units.ident` must hash to the row of
+`src/cudapp_om_units.ident` in `cudapp-src.sha256.txt`, or it writes nothing and exits 3. Run from the repository
+root:
+
+    { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/nativeh.om; } | seed/out/omc > nativeh
+    ./nativeh > cudapp_native.h
+
+The units whose parts the inventory reports `absent` cannot be declared from this tree; `nativeh.om` names each
+part on stderr and leaves the unit out. At this base that is unit `c5` (CUDApp `tools/c5/policy.om` and
+`tools/c5/runtime.om`, not moved here). `check/nativeh.expect.txt` is therefore CUDApp's header less that unit's
+one line:
+
+    grep -v '^uint32_t omega_native_c5(' cudapp/src/cudapp_native.h > omega-mv/gpu/runtime/check/nativeh.expect.txt
+
+With the two `tools/c5` files copied to `gpu/nvidia/tools/c5/` in a scratch copy of this tree, the same program
+printed CUDApp's whole header: sha256 `17fc48509d7089d34be4d9f5a5cd578b55b5fc83bcc0ca59e66b286201de0f46`, the row of
+`src/cudapp_native.h` in `cudapp-src.sha256.txt`. When `tools/c5` moves into this tree, the expected file becomes
+CUDApp's header unchanged. Controls: the three `nativeh` rows of `checks.tsv` change the spacing rule, the
+runtime-views rule and the `f32` rule, and each is caught; one changed byte in `cudapp-units.ident` makes it exit 3
+with nothing written (checked by hand; the gate has no input-byte control for this program).
+
+`src/cudapp_freest_pathcopy.c` is written by CUDApp `om/native-freest.sh` through the Omega Bridge's native
+backend (`tools/native --freestanding` of omega-bridge): the unit `gpu/nvidia/om/components/pathcopy.om` compiled
+to AArch64 and x86-64 machine code by the compilers that script pins, and wrapped as C. This tree has neither that
+backend nor those compilers (the script pins omc builds `734f0a39...` and `2c82480...`, an x86-64 build
+`be8c5130...` and the native backend `14b2b51e...`, all outside this repository), so the file is not regenerated
+here. Doing so needs that backend written in Omega in this tree, or this tree's `seed/out/omc` able to emit the
+same freestanding objects.
+
+`src/omega_core_om.inc` (added in CUDApp commit `a86d199f`, "feat(core): move utility computation and cubin
+diagnostics to seeded Omega") and `src/omega_native_artifact_om.inc` (added in `4531d707`, "Move native artifact
+format and admission into seeded Omega") were both written by hand. No Makefile rule, `mk/*.mk` file or script in
+CUDApp writes them; they appear only as prerequisites. They hold the C side of two Omega units: argument
+marshalling, `_Static_assert` checks of the layout, pointers and I/O. There is no generator to reproduce, so they
+stay class `b`: C over Omega, waiting for Omega to produce a library that C can call.
 
 ## The gate
 
