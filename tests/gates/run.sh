@@ -203,6 +203,7 @@ case "$step" in
   # The control rebuilds c0_check with its "missing row" refusal removed; the gate must then fail.
   # With BRIDGE_CUDA_CUDAPP (a CUDApp checkout at 84b524ca) and BRIDGE_CUDA_OLDOMC (omc 2c824805...) set, the gate also
   # runs the old test.sh and gcc builds against the Omega stub, and requires oracle=PASS. Hardware stays NOT_RUN.
+  # The check counts are pinned: 27 without the oracle tier, 34 with it (gate.om prints one line per check).
   bridge-cuda)
     sha256sum -c --quiet seed/out/omc.sha256 || { echo "BRIDGE-CUDA REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
     rm -rf "$OUT_DIR"; mkdir -p "$OUT_DIR"
@@ -213,15 +214,15 @@ case "$step" in
     cmp -s bridge/cuda/c0_check.om "$OUT_DIR/mutant.om" && { echo "BRIDGE-CUDA FAIL: the control mutation did not apply" >&2; exit 1; }
     cat gpu/nvidia/om/cache/digest.om "$OUT_DIR/mutant.om" | seed/out/omc > "$OUT_DIR/c0_mutant"
     chmod 700 "$OUT_DIR/c0_check" "$OUT_DIR/fixture" "$OUT_DIR/gate" "$OUT_DIR/c0_mutant"
-    oracle=(); want='oracle=NOT_RUN'
+    oracle=(); want='checks=27 failed=0 oracle=NOT_RUN'
     if [ -n "${BRIDGE_CUDA_CUDAPP:-}" ] && [ -n "${BRIDGE_CUDA_OLDOMC:-}" ]; then
       oracle=("$BRIDGE_CUDA_CUDAPP" "$BRIDGE_CUDA_OLDOMC" "${BRIDGE_CUDA_CC_AARCH64:-/usr/bin/gcc}" "${BRIDGE_CUDA_CC_X86_64:-/usr/bin/x86_64-linux-gnu-gcc}")
-      want='oracle=PASS'
+      want='checks=34 failed=0 oracle=PASS'
     fi
     rc=0; "$OUT_DIR/gate" "$ROOT/$OUT_DIR/work" "$ROOT/$OUT_DIR/c0_check" "$ROOT/$OUT_DIR/fixture" "${oracle[@]}" > "$OUT_DIR/gate.log" 2>&1 || rc=$?
     cat "$OUT_DIR/gate.log"
     [ "$rc" -eq 0 ] || exit "$rc"
-    tail -1 "$OUT_DIR/gate.log" | grep -qxE "BRIDGE-CUDA PASS checks=[0-9]+ failed=0 $want hardware=NOT_RUN" ||
+    tail -1 "$OUT_DIR/gate.log" | grep -qx "BRIDGE-CUDA PASS $want hardware=NOT_RUN" ||
       { echo "BRIDGE-CUDA FAIL: the summary line is not PASS with $want" >&2; exit 1; }
     crc=0; "$OUT_DIR/gate" "$ROOT/$OUT_DIR/control" "$ROOT/$OUT_DIR/c0_mutant" "$ROOT/$OUT_DIR/fixture" > "$OUT_DIR/control.log" 2>&1 || crc=$?
     if [ "$crc" -eq 0 ] || ! tail -1 "$OUT_DIR/control.log" | grep -q '^BRIDGE-CUDA FAIL '; then
