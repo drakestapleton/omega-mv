@@ -12,13 +12,32 @@ files stay in CUDApp as the oracles that recorded the tables.
 | 5 | `tests/amd-kfd/oracle.py`, `tests/amd-kfd/run.sh` | `kfd-verdicts.tsv` |
 | 6 | `tests/amd-kfd-launch/plan-check.py` (CPU cases) | `plan-verdicts.tsv` |
 
-The tables were generated outside this tree by running the old checkers (oracle scripts kept with the lane,
-not in the tree). Cases that need the ptrace instrument `trace.c` or a child with descriptor 2 closed are
-listed as `notrun` rows and print NOT_RUN. Hardware rows are NOT_RUN on every host.
+What the gate checks, per table: it builds the Omega units each table names with this repository's
+`seed/out/omc`, compares the bytes and hashes the rows record (sections, objects, input files, unit
+texts), runs each `run` row's command on the Omega-built binaries and compares its exit status, stdout and
+stderr with what the old checker saw. Each header of a table says what its row kinds mean. Every case of
+`check.py` and `plan-check.py` is either replayed or listed as a `notrun` row with its reason (a case
+that needs the ptrace instrument `trace.c`, another CUDApp instrument such as `aql-oracle`,
+`publication`, `cc` or `python3`, or a child with descriptor 2 closed); a `notrun` row prints NOT_RUN and
+is counted in `not_run=`. Only the compiles of the unit binaries and the `hsaco` builds of the `obj`
+rows have no row, because the gate does those itself. Hardware rows are NOT_RUN on every host.
+
+The `guard` row of `kfd-verdicts.tsv` is not an oracle verdict: it is written by hand in `tables.py` and
+states the gate's own control (records.om without its index guard must not refuse that index).
+
+The tables were generated outside this tree by `oracle/tables.py` (with `oracle/sections.py` and
+`oracle/plan-keep.py`) from the old checkers' outputs. Those scripts and every input they read are kept,
+with a `SHA256SUMS` list, at `~/handoffs/hive/cuda-in-20261114/oracles/AmdRest/` on spark-b87b
+(sha256: `tables.py` 743733a4a260dd22263cc848a0e5eccf5d199ff27a95740610f110a28d526d79, `sections.py`
+a7ba7e6a4e856973a0eec91a80216cd215a5953af3e41fee11482a26e6010b44, `plan-keep.py`
+87b60ac43b437df63ac7f15583ef71d6bc0c37ce2246688edeb73a09a6216caf, `SHA256SUMS`
+6acb5a6c860660b50a861b1bb49c87cb3a9774de86bf25b007b2d4400563f8a6).
 
 Run: `tests/gates/run.sh gpu-amd-rest` (or build by hand:
 `{ printf 'om2\n'; cat seed/ng/sha256.om gpu/amd/rest/gate.om; } | seed/out/omc > gate; ./gate seed/out/omc SCRATCH`,
-SCRATCH must not exist). The summary line counts `/dev/kfd` absent and `qemu-x86_64` present.
+SCRATCH must not exist). The x86-64 launcher rows run under `/usr/bin/qemu-x86_64`. Without it, or on a
+host where `/dev/kfd` exists (the launcher and plan rows would open the device), the gate prints
+`OMEGA-GPU-AMD-REST NOT_RUN reason=...` and exits 3.
 
 `classify.om` with `classes.tsv` generates `gpu/amd/NOT-YET-OMEGA.tsv`, the class of every leftover file:
 (a) behaviour rewritten here, (b) kept in CUDApp as an oracle or instrument, (c) obsolete. An AMD path that
