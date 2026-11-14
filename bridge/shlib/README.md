@@ -27,15 +27,20 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
   value to the C caller with every saved register restored.
 - omc code runs on the caller's stack. The generator settles each function's stack need from the
   object's call records, as the module linker does (`need(f) = max(local(f), cost(call) +
-  need(callee))`), and refuses a cycle or a need above the linker's 8 MiB. When an export's body
-  needs stack, its wrapper first reads one word in each 4 KiB page down past that need, top page
-  first. A caller whose stack is too small then faults on its guard page before the body runs,
-  instead of the body writing past the guard into other memory.
+  need(callee))`), and refuses a cycle (every call costs at least its save area, so a cycle keeps
+  growing and is still changing in the last pass) or a need above the linker's 8 MiB. When an
+  export's body needs stack, its wrapper first reads one word in each 4 KiB page down past that
+  need, top page first, so by construction a caller whose stack is too small faults on its guard
+  page before the body runs, instead of the body writing past the guard into other memory. The
+  gate checks the probe's words; the fault itself was shown outside the tree with a C caller on
+  an 8 KiB stack.
 - The object's code is copied unchanged, at a 16-byte boundary as in the object.
-- Before linking, the generator checks the object's metadata: the export count against the
-  header, each function's flags, address (inside the code, 4-aligned, increasing), result and
-  parameter records and name padding, and each call record's instruction (a BL inside its source
-  function). Every BL in the code must have exactly one call record.
+- Before linking, the generator checks the object's metadata as spec/omegese-modules.md asks:
+  the export count against the header, each function's flags, address (inside the code,
+  4-aligned, increasing), result and parameter records and name padding, unique names, each
+  export's entry B slot pointing at its own function, and each call record (a nonzero cost, a BL
+  inside its source function that branches to the record's destination). Every BL in the code
+  must have exactly one call record. An object that imports a function is refused.
 
 ## Limits
 
@@ -47,6 +52,13 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
   `backtrace()` cannot unwind through a wrapper.
 - The probe compares the low 32 bits of each result. Its mismatch status is 1 + the call index,
   capped at 100 so it never collides with the loader's 127 or the register check's 250.
+- The 8 MiB stack bound is the module linker's (spec/omegese-modules.md), kept so that the
+  library and a linked program accept the same objects; past it the object is refused cleanly.
+- The library is position independent only because omc refuses `text` and `global` in object
+  mode today; in program mode it builds their addresses as absolute constants. If object mode
+  ever allows them, the generator must refuse such constants or relocate them.
+- The trap path returns without a matching BL and RET pair, and the library carries no GCS or
+  BTI property note. On a system that enforces Guarded Control Stack the trap path would fault.
 
 ## Gate
 
@@ -56,20 +68,22 @@ has 13 checks:
 1. It builds both units in object mode.
 2. It builds both libraries and both probes.
 3. It runs each probe, which loads its library through the system's dynamic loader. The
-   `test.tsv` probe makes 13 calls: constants, int arguments with dirty upper halves, a trapping
+   `test.tsv` probe makes 17 calls: constants, int arguments with dirty upper halves, a trapping
    division followed by another call, a pointer write read back by a later call, a uint with a
-   dirty upper half, and two bodies that need 8 KiB and 16 KiB of stack (one through a private
-   call). The `nvml.tsv` probe calls all 11 NVML exports. Each probe also sets x19..x27, x29 and
-   d8..d15 and checks that they and sp come back unchanged.
-4. It runs `/usr/bin/readelf -W -S --dyn-syms` on each library. readelf reads the symbols through
-   the section headers, which the loader never looks at; it must exit 0, print no warning, and
-   list every export of the table as a `FUNC GLOBAL DEFAULT` symbol line. readelf (GNU Binutils
-   2.42 here) is a read-only verification oracle, not part of the build.
+   dirty upper half, two bodies that need 8 KiB and 16 KiB of stack (one through a private call),
+   and a uchar, ushort, byte and short each under dirty upper bits. The `nvml.tsv` probe calls
+   all 11 NVML exports. Each probe also sets x19..x27, x29 and d8..d15 and checks that they and
+   sp come back unchanged.
+4. It runs `/usr/bin/readelf -W -S -d --dyn-syms` on each library. readelf reads the symbols
+   through the section headers, which the loader never looks at; it must exit 0, print no
+   warning, show the table's soname and list every export of the table as a
+   `FUNC GLOBAL DEFAULT` symbol line. readelf (GNU Binutils 2.42 here) is a read-only
+   verification oracle, not part of the build.
 5. It reads the test library's wrappers (found through `.dynsym`) for the stack probe: exactly
    two probe loops, the first covering 2 pages and the second 5.
-6. It requires a second build to have identical bytes.
+6. It requires a second build from the same object to have identical bytes.
 
-The gate also runs 12 controls. Each must be caught with its exact exit status and, where one is
+The gate also runs 13 controls. Each must be caught with its exact exit status and, where one is
 given, with that text in the failing program's error output:
 
 | Control | Change | Required |
@@ -81,9 +95,10 @@ given, with that text in the failing program's error output:
 | stack | the wrapper's stack restore off by 16 bytes | 250 |
 | extend | the wrappers' sign extensions removed (omc's int add then traps on call 1) | 2 |
 | uextend | the wrappers' zero extensions removed | 10 |
+| nextend | the wrappers' byte and halfword extensions removed | 13 |
 | restore | the shared return reloads x19 and x20 from the wrong slot | 250 |
 | runtime | the object's trap-entry load turned into a load of another runtime entry | 1, `runtime entry` |
-| need | the call record's stack cost zeroed, so deep's probe covers 4 pages instead of 5 | 1 (stack probe check) |
+| need | deep's frame in the object made 16 bytes smaller (accepted), so its probe covers 4 pages instead of 5 | 1 (stack probe check) |
 | address | the first function's address in the object moved by 2 bytes | 1, `not an OMOBJ001` |
 | frestore | the shared return reloads d8 and d9 from the wrong slot | 250 |
 
