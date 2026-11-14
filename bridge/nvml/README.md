@@ -46,11 +46,17 @@ must be refused as not a generator.
 ## What is not in this tree, and why
 
 - The generator. omega-bridge is its own repository, so its `src/toc.om` is an input to the gate,
-  pinned by digest, and not a copy here. CUDApp's bytes come from the generator of omega-bridge
-  commit `9172b525cdf0c521e2d717d17d0dfc818592d7c2`, which is not on omega-bridge `main`. The
-  generator of omega-bridge `main` `0138839cc3e7aef1c77230505f757372b8ae6ad5` makes the same three
-  files except for line 1, where the emitter writes its own digest; the table pins both. Until that
-  commit is published, a fresh machine can run the emitter tier only with the `main` generator.
+  pinned by digest, and not a copy here. CUDApp's bytes come from `src/toc.om` at omega-bridge
+  commit `f6b7cc4042bdf55d8f9d866c97439bb7e53506f5` ("cabi-1: C ABI library emitter"), which is
+  on omega-bridge `main`: it is an ancestor of `0138839cc3e7aef1c77230505f757372b8ae6ad5`. The
+  `src/toc.om` of `0138839c` makes the same three files except for line 1, where the emitter
+  writes its own digest; the table pins both. In any clone of omega-bridge `main`, both
+  generators come out of history:
+
+      git -C OMEGA_BRIDGE show f6b7cc4042bdf55d8f9d866c97439bb7e53506f5:src/toc.om > toc-cabi1.om
+      git -C OMEGA_BRIDGE show 0138839cc3e7aef1c77230505f757372b8ae6ad5:src/toc.om > toc-main.om
+      BRIDGE_NVML_TOC="$PWD/toc-cabi1.om:$PWD/toc-main.om" tests/gates/run.sh bridge-nvml
+
 - A launcher in Omega. The emitter reads `toc.om` from descriptor 3, and this compiler's exec
   words close every descriptor from 3 up, so the gate starts the emitter through
   `/bin/sh -c 'exec "$0" 3<"$1"'`. An exec word that keeps a chosen descriptor open would remove
