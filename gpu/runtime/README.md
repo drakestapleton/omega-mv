@@ -22,6 +22,8 @@ in CUDApp and serves as the reference (the oracle); it is compiled and run outsi
 | `rewrites.tsv` | input: a CUDApp file without a record and the Omega file here that replaces it |
 | `scanref.om` | rewrite of CUDApp's `src/omega_gpu_scan_ref.c` (OM-1): the host scan, prefix sum and radix sort references |
 | `check/scanref-check.om`, `check/scanref.expect.txt` | the scanref check program and the old C's output it must match |
+| `check/platrest-check.om`, `check/platrest.expect.txt` | the check of `gpu/nvidia/om/platform-linux/plat_rest.om` against CUDApp's `src/omega_gpu_platform_linux_rest_oracle.h` (the old C kept as its reference): every mode on xorshift64 inputs with boundary values, and the oracle's output it must match |
+| `held.tsv` | a CUDApp file that is not rewritten because it waits on a decision, not a translation, and which decision |
 | `checks.tsv` | the gate's checks: parts to compose, expected output, and a source mutation that must be caught |
 | `controls.tsv` | the gate's inventory controls: an input byte changed, and how the inventory must notice |
 | `gate.om` | the gate, OMEGA-GPU-RUNTIME (OM-2) |
@@ -99,12 +101,13 @@ To list the files a rewrite can start on, with their host-logic lines:
 
     awk -F'\t' '$3=="a"{print $10, $1}' gpu/runtime/CLASSES.tsv | sort -n
 
-Two class `a` files are not plain rewrites. `src/omega_runtime_api.c` returns CUDApp's runtime API version, which
-its own `src/omega_runtime_api.h` sets; this tree has a different `src/omega_runtime_api.h` and
+`src/omega_runtime_api.c` is held (`held.tsv`): it returns CUDApp's runtime API version, which its own
+`src/omega_runtime_api.h` sets; this tree has a different `src/omega_runtime_api.h` and
 `docs/runtime/omega_runtime_api.manifest` with their own version, so which version one Omega library reports is a
 decision about the API, not a translation. `src/omega_gpu_platform_linux_rest_oracle.h` is itself the old C kept
-to check `gpu/nvidia/om/platform-linux/plat_rest.om` against; it becomes class `r` once a check here compares the
-two and `rewrites.tsv` names that unit.
+to check `gpu/nvidia/om/platform-linux/plat_rest.om` against; `check/platrest-check.om` compares the two, so
+`rewrites.tsv` names that unit. The oracle driver that printed `check/platrest.expect.txt` lives outside this tree,
+with the lane's oracle notes.
 
 `cudapp-cfacts.tsv` is regenerated from a CUDApp checkout `../cudapp` at the commit of `cudapp-src.sha256.txt`:
 
