@@ -44,8 +44,8 @@ chmod +x seven
 It prints `7`, the number the program returns.
 
 To rebuild a fixed, published version of the compiler from the seed on your own machine, and check every step
-against published fingerprints without changing any tracked file (this needs a git copy with its full history,
-not a zip download):
+against published fingerprints without changing any tracked file (this needs a git copy that contains the one
+commit the challenge pins; a normal clone has it, a zip download does not):
 
 ```sh
 sh seed/challenge/run.sh
@@ -130,12 +130,13 @@ every release. [CONTRIBUTORS.md](CONTRIBUTORS.md) lists which model did what.
 
 The method is described by Gregory M. Kurtzer in
 [*Ginux: Building an Independent Kernel That Runs Linux Userspace through Human-Directed Agentic Engineering* (2026)](https://doi.org/10.5281/zenodo.23682548).
-I cite it for the method only.
+I cite it for the method only. It does not change authorship or the qualification of earlier experiments.
 
 ## Contributing
 
 The way to send a change to this project through Interplane is still being built. Until it is ready, write to
 aien@aienos.com. Bring the exact command you ran and what it printed, for the exact version you changed.
+Receipts name the exact commit and refuse a dirty tree, and existing evidence is never edited in place.
 Someone who did not write the change reviews it before it lands.
 
 ## Licence
