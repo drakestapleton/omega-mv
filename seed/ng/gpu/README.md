@@ -1,10 +1,13 @@
 # seed/ng/gpu: the sm_121 path of Omega NG (Hive NG lane ng-gpu)
 
-Omega NG's GPU stage turns ΩIR kernel functions into sm_121 machine code and launches it. Per Hive NG decision D10 it
-does not copy CUDApp's seeded units: it consumes `om/encoder/bw_enc_sm121.om`, `om/components/bw_alloc.om` and
-`om/cubin/cubin_elf.om` from aien-dev/CUDApp at the commit pinned in `seed/ng/cudapp.lock`, checked out as the sibling
-directory `../CUDApp`. ng-gpu's own code is `seed/ng/src/gpu.om` (functions `gp_`, globals `g_`), which does not
-exist yet: it waits for ng-ir's ΩIR kernel form.
+Omega NG's GPU stage turns ΩIR kernel functions into sm_121 machine code and launches it. It consumes the seeded
+units `gpu/nvidia/om/encoder/bw_enc_sm121.om`, `gpu/nvidia/om/components/bw_alloc.om` and
+`gpu/nvidia/om/cubin/cubin_elf.om` (with `gpu/nvidia/native/blackwell/launch.om` and `gpu/nvidia/native/nvrm/context.om`
+also pinned). They came from aien-dev/CUDApp at the commit in `seed/ng/cudapp.lock` (1988c50e) with their history, per
+ADR 0047 (aien-architecture-mv; the GPU layer of Sovereign Intelligence moves into this repository); before that, Hive
+NG decision D10 consumed them from a sibling `../CUDApp` checkout. `seed/ng/cudapp.lock` keeps its bytes: its five
+digest rows are the identities the `lock-*` cases check against the files in `gpu/nvidia/`. ng-gpu's own code is
+`seed/ng/src/gpu.om` (functions `gp_`, globals `g_`), which does not exist yet: it waits for ng-ir's ΩIR kernel form.
 
 What is here today: the conformance gate of the encoder ng consumes.
 
@@ -20,14 +23,14 @@ What is here today: the conformance gate of the encoder ng consumes.
 | `tests/badmagic.*`, `tests/trunc.*` | Malformed input: exit 2 / exit 3 with one stderr line. |
 | `tests/m1..m4.{from,to}` | Encoder mutants, applied by `subst`: CUDApp mk/om-encoder.mk OM_ENC_MUTANTS 1..3 and OM_ENC_LDG_RED's first edit (the pre-fix LDG.E line). |
 
-Run from the repository root, with CUDApp at the lock's commit in `../CUDApp`:
+Run from the repository root (no CUDApp checkout is needed):
 
     seed/out/omc < seed/qualification/om2/gate.om > /tmp/gate && chmod +x /tmp/gate
     /tmp/gate seed/out/omc "$(cut -c1-64 seed/out/omc.sha256)" seed/ng/gpu/gate.cases /tmp/ng-gpu-gate
 
 Final line `OM2GATE PASS cases=18 pass=18 ...`.
 
-The lock is enforced by the gate: the `lock-*` run cases hash each file ng composes from `../CUDApp` (the five rows
+The lock is enforced by the gate: the `lock-*` run cases hash each file ng composes from `gpu/nvidia/` (the five rows
 of `seed/ng/cudapp.lock`) and the lock file itself with `pinsum.om` and compare the digest with the pinned one. A
 different file makes its case FAIL and the gate exit 1, naming the row; a missing file is INVALID (exit 3). A wrong
 file is FAIL rather than INVALID because the shared `seed/qualification/om2/gate.om` has no input-identity case
@@ -47,4 +50,5 @@ oracle's bytes, which the pinned `.om` encoder reproduces and CUDApp b774723f's 
 ## Status
 HOST_TESTED (Linux AArch64, core 1): 18/18 PASS with CUDApp at the lock commit 1988c50e; with CUDApp 1818e9d2 (only
 bw_alloc.om differs) lock-bw_alloc FAILs and the gate exits 1; against CUDApp b774723f's encoder (before #373) the
-pin, slice and ldg cases FAIL as well. No GPU involved.
+pin, slice and ldg cases FAIL as well. No GPU involved. After the move to `gpu/nvidia/` (2026-11-14) the same 18 cases,
+with the same digests and goldens, run against the in-tree files; see `gpu/nvidia/README.md`.
