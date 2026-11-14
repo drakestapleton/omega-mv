@@ -99,6 +99,13 @@ To list the files a rewrite can start on, with their host-logic lines:
 
     awk -F'\t' '$3=="a"{print $10, $1}' gpu/runtime/CLASSES.tsv | sort -n
 
+Two class `a` files are not plain rewrites. `src/omega_runtime_api.c` returns CUDApp's runtime API version, which
+its own `src/omega_runtime_api.h` sets; this tree has a different `src/omega_runtime_api.h` and
+`docs/runtime/omega_runtime_api.manifest` with their own version, so which version one Omega library reports is a
+decision about the API, not a translation. `src/omega_gpu_platform_linux_rest_oracle.h` is itself the old C kept
+to check `gpu/nvidia/om/platform-linux/plat_rest.om` against; it becomes class `r` once a check here compares the
+two and `rewrites.tsv` names that unit.
+
 `cudapp-cfacts.tsv` is regenerated from a CUDApp checkout `../cudapp` at the commit of `cudapp-src.sha256.txt`:
 
     { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/cfacts.om gpu/runtime/cfacts-main.om; } \
