@@ -13,25 +13,31 @@ note                                unchanged
 note OBJECT is omc's output for the line "object" followed by the unit (OMOBJ001, spec/omegese-modules.md).
 note TABLE: one row per line, fields separated by one tab; an empty line or one starting with # is skipped.
 note   soname NAME               the library's DT_SONAME (exactly one row)
-note   unit PATH                 the unit the object is compiled from (a record for the reader; not read here)
 note   export NAME TRAP          NAME, an `export fn` of the object, becomes a global function symbol; a trap
 note                             inside it returns TRAP (0..4294967295) to the C caller
 note   call NAME EXPECT ARG...   the probe calls NAME with up to 6 arguments (a decimal 64-bit value, or buf for
-note                             a pointer to 4096 zeroed writable bytes) and compares the low 32 bits of the
-note                             result with EXPECT
+note                             a pointer to one 4096-byte writable buffer, zeroed at load and shared by every
+note                             call, so a later call reads what an earlier one wrote) and compares the low 32
+note                             bits of the result with EXPECT
 note From the C calling convention (AAPCS64) to omc's function ABI, per export: each C argument register is one
 note omc parameter slot, in order (a scalar or a sized array: one slot; an unsized view or edit: a pointer slot
 note then a ulong count slot). Narrow integer arguments are sign- or zero-extended as omc expects. x7 points at a
 note per-call context on the caller's stack whose byte offset 16 ([x7, #16]) holds the trap entry; x19..x30 and d8..d15 are saved
 note there and restored on both the return and the trap path. The result is returned in x0.
-note Refused (exit 1, nothing written): an object that is not an OMOBJ001 version 1 AArch64 object or has
-note trailing bytes, an object with an imported function, code that loads a runtime entry other than the trap
-note entry ([x7, #16]), a float parameter or result (omc passes them in x registers, C in v registers), a table
-note export that is not an export of the object, a repeated or malformed name, a malformed row or number, no
-note soname or no export, a call of a name that is no export of the table.
+note Refused (exit 1, nothing written), each with its own message: an object that is not an OMOBJ001 version 1
+note AArch64 object (header, trailing bytes, records, padding, names); an imported function; a function address
+note outside the code, unaligned, out of order or inside the entry slots; an entry slot that does not branch to
+note its function; a BL with no call record or two; a call record whose offset, source or cost does not fit its
+note BL, or whose destination is not the BL's target; a base-register use of x7 other than the trap-entry load
+note [x7, #16] (a pattern check over the load/store group); a stack need above the 2^48-byte address space or a
+note call cycle; a float parameter or result (omc passes them in x registers, C in v registers); more than 6
+note parameter slots; a table export that is not an export of the object; a repeated or malformed name; a
+note malformed row or number; no soname or no export; a call of a name that is no export of the table.
 note Exit 0 written, 1 refused, 2 usage, 3 a file unreadable or unwritable or memory refused.
-note Every buffer is a run-time pool sized from its input. The ADR and LDR literal reach (1 MiB) and the B and BL
-note reach (128 MiB) of AArch64 are real boundaries: an output past them is refused, never truncated.
+note Every buffer is a run-time pool sized from its input. The wrappers, entry slots and probe reach their
+note targets with ADR and LDR literal (1 MiB) and B and BL (128 MiB) because each is one word; an output past
+note their reach is refused (e_reach), never truncated. That is a choice of instruction forms, not a machine
+note limit: a larger output needs ADRP + ADD and veneers for the far branches.
 global ib uchar *
 global eb uchar *
 global ds uchar *
@@ -64,7 +70,6 @@ note in ib, 5 name offset in ib, 6 name length
 text m_lib "lib"
 text m_call "call"
 text k_son "soname"
-text k_unit "unit"
 text k_exp "export"
 text k_call "call"
 text k_buf "buf"
@@ -86,11 +91,12 @@ text e_trap "shlib: a trap value above 4294967295\n"
 text e_obj "shlib: the object is not an OMOBJ001 version 1 AArch64 object\n"
 text e_imp "shlib: the object imports a function; imports are not linked here\n"
 text e_rt "shlib: the code loads a runtime entry other than the trap entry\n"
-text e_rtw "shlib: the code stores through the per-call context (x7)\n"
+text e_rtw "shlib: the code reads or writes through the per-call context (x7) other than the trap-entry load\n"
 text e_addr "shlib: a function address is outside the code, unaligned, out of order or inside the entry slots\n"
 text e_slotb "shlib: an export's entry slot does not branch to its function\n"
 text e_bl "shlib: a BL word has no call record, or two records name one BL\n"
-text e_call "shlib: a call record does not match its BL (offset, source, destination or cost)\n"
+text e_call "shlib: a call record's offset, source or cost does not fit its BL\n"
+text e_cdst "shlib: a call record's destination is not its BL's target\n"
 text e_miss "shlib: a table export is not an export of the object\n"
 text e_flt "shlib: a float parameter or result; refused\n"
 text e_slot "shlib: more than 6 parameter slots\n"
@@ -416,9 +422,7 @@ else
 if ft 0 k_call
 callrow
 else
-if not ft 0 k_unit
 die e_row 1
-end
 end
 end
 end
@@ -886,7 +890,7 @@ end
 w = oq o
 csite s w
 if ne brt w get fr add mul d 8 1
-die e_call 1
+die e_cdst 1
 end
 if eq oq add o 24 0
 die e_call 1
@@ -950,8 +954,10 @@ v = or v shl ulong get ib add o j mul j 8
 end
 ret v
 end
-note no load of a runtime entry other than [x7, #16] (LDR immediate, 64-bit, Rn = x7) and no store through x7
-note (stx7): the wrapper's saved registers sit in the same frame
+note no use of x7 as a base register except the trap-entry load LDR Xt, [X7, #16]: every instruction of the
+note load/store group (literal loads aside, which have no base register) whose Rn is x7 is refused; another
+note LDR (immediate, 64-bit) offset is e_rt, any other form e_rtw. The wrapper's saved registers sit in the frame
+note x7 points at.
 fn rtscan to void
 b = add get nv 0 176
 n = div sub get nv 8 176 4
@@ -961,23 +967,22 @@ if eq and w 4290773984 4181721312
 if ne and shr w 10 4095 2
 die e_rt 1
 end
-end
-if stx7 w
+else
+if lsx7 w
 die e_rtw 1
 end
 end
 end
-note w stores with base register x7: STR (unsigned offset, any size), STUR/STR pre- or post-index or
-note register offset and the atomics of that class, or STP/STNP (any form); a pattern check like rtscan's
-fn stx7 w ulong to bool
-if ne and shr w 5 31 7
+end
+note w is in the load/store group (op0 x1x0), is not a literal load (011x 0 0), and has base register x7
+fn lsx7 w ulong to bool
+if ne and w 167772160 134217728
 ret false
 end
-m = and w 1002438656
-if or eq m 956301312 eq m 939524096
-ret true
+if eq and w 989855744 402653184
+ret false
 end
-ret eq and w 977272832 671088640
+ret eq and shr w 5 31 7
 end
 fn exbind k ulong to void
 x = mul k 8
@@ -1110,16 +1115,17 @@ f = mul get ex add b 3 8
 wrb add a 4 add cb sub get fr add f 1 176 2483027968
 wrb add a 8 add tx 8 335544320
 end
-note the stack probe at p when export k's body needs stack: touch one word in each 4 KiB page from sp down
-note past the body's need, top first, so a stack too small for it faults on its guard page instead of running
-note past it: MOV X16, SP; MOVZ/MOVK X17, pages; loop: SUB X16, X16, #1, LSL #12; LDR XZR, [X16];
+note the stack probe at p when export k's body needs stack: touch one word in each 4 KiB page below the
+note wrapper's lowest store [sp, #16], down past the body's need, top first, so no two touches are more than
+note 4096 bytes apart and a stack too small for the body faults on a 4 KiB guard page before the body runs:
+note ADD X16, SP, #16; MOVZ/MOVK X17, pages; loop: SUB X16, X16, #1, LSL #12; LDR XZR, [X16];
 note SUBS X17, X17, #1; B.NE loop. The next offset.
 fn wrprobe k ulong p ulong to ulong
 g = pgs k
 if eq g 0
 ret p
 end
-w32 p 2432697328
+w32 p 2432713712
 wrmov add p 4 0 g 17
 wrmov add p 8 1 shr g 16 17
 wrmov add p 12 2 shr g 32 17
@@ -1129,10 +1135,15 @@ w32 add p 24 4043310641
 w32 add p 28 1426063265
 ret add p 32
 end
-note the 4 KiB pages export k's body needs (its function's settled stack need, rounded up)
+note the 4 KiB pages export k's probe touches: 0 when its function needs no stack, else the settled need plus
+note the 16 bytes from sp to the wrapper's lowest store, rounded up, so the last touch is at or below sp - need
 fn pgs k ulong to ulong
 f = mul get ex add mul k 8 3 8
-ret div add get fr add f 7 4095 4096
+n = get fr add f 7
+if eq n 0
+ret 0
+end
+ret div add n 4111 4096
 end
 note the probe's words for export k: 8, or 0 when the body needs no stack
 fn pwds k ulong to ulong
@@ -1330,8 +1341,8 @@ b = mul k 16
 put cd k dsib get cl b get cl add b 1
 end
 ns = add nc 1
-note .hash after the 27-byte interpreter path at 344, aligned to 8
-put ly 0 376
+note .hash after the interpreter path and its NUL at 344, aligned to 8
+put ly 0 al8 add 345 len t_interp
 put ly 1 mul add nbk nc add ns 2 4
 put ly 2 al8 add get ly 0 get ly 1
 put ly 3 add get ly 2 mul ns 24

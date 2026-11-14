@@ -30,11 +30,12 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
   need(callee))`), and refuses a cycle (every call costs at least its save area, so a cycle keeps
   growing and is still changing in the last pass) or a need larger than the 2^48-byte user address
   space of AArch64 Linux. When an export's body needs stack, its wrapper first reads one word in
-  each 4 KiB page down past that need, top page first, so by construction a caller whose stack is
-  too small faults on its guard page before the body runs, instead of the body writing past the
-  guard into other memory. That assumes a guard of at least 4 KiB directly below the stack; a
-  thread created with guard size 0 has none. The gate checks the probe's words; the fault itself
-  was shown outside the tree with a C caller on an 8 KiB stack.
+  each 4 KiB page below its own lowest store (`[sp, #16]`), down past that need, top page first.
+  No two touches are more than 4096 bytes apart, so a caller whose stack is too small faults on a
+  4 KiB guard page before the body runs, instead of the body writing past the guard into other
+  memory. That assumes a guard of at least 4 KiB directly below the stack (a thread created with
+  guard size 0 has none) and a caller whose own stack pointer is inside mapped stack. The gate
+  checks the probe's words; the fault was shown outside the tree with a C caller on an 8 KiB stack.
 - The object's code is copied unchanged, at a 16-byte boundary as in the object.
 - Before linking, the generator checks the object's metadata as spec/omegese-modules.md asks:
   the export count against the header, each function's flags, address (inside the code,
@@ -45,19 +46,23 @@ The table format, the refusals and the exit codes are at the top of `shlib.om`.
 
 ## Limits
 
-- The check that refuses runtime entries other than the trap entry reads the code for
-  `LDR Xt, [X7, #imm]` in its unsigned-offset form, the only form omc emits for those loads today,
-  and refuses every store through x7 (where the wrapper saved the caller's registers). Both are
-  pattern checks, not proofs. A future omc that reached the context another way would get past
-  them, so the lasting fix is for omc to record runtime-entry use in the object's metadata.
+- The x7 check refuses every instruction of the load/store group whose base register is x7,
+  except the trap-entry load `LDR Xt, [X7, #16]`, because the wrapper's saved registers sit in the
+  frame x7 points at. It reads instruction words, so it is a pattern check, not a proof: the
+  lasting fix is for omc to record runtime-entry use in the object's metadata.
+- The wrappers do not save x18. Linux leaves x18 to the caller, but a caller built with a shadow
+  call stack keeps it in x18, and omc code may change it.
+- A C caller must hold up the side of each parameter's declaration: a sized `edit` or `view` is a
+  pointer to at least that many elements, which omc trusts without a check, and a `fresh`
+  parameter must not overlap another argument.
 - The wrappers have no frame record and the library has no `.eh_frame`, so debuggers and
   `backtrace()` cannot unwind through a wrapper.
 - The probe compares the low 32 bits of each result. Its mismatch status is 1 + the call index,
   capped at 100 so it never collides with the loader's 127 or the register check's 250.
 - The module linker refuses a need above 8 MiB (its program's own stack). A library runs on its
   caller's stack, which may be larger, so the generator bounds the need only by the address space.
-- Each object refusal names the rule that fired (address, entry slot, call record, BL coverage,
-  runtime entry, store through x7); the remaining malformations share one message.
+- Each object refusal names the rule that fired (address, entry slot, call record, its
+  destination, BL coverage, runtime entry, x7 use); the remaining malformations share one message.
 - The library is position independent only because omc refuses `text` and `global` in object
   mode today; in program mode it builds their addresses as absolute constants. If object mode
   ever allows them, the generator must refuse such constants or relocate them.
@@ -80,36 +85,18 @@ runs these checks; `gate.om`'s header lists each with its exact status:
    and d8..d15 and checks that they and sp come back unchanged.
 4. It runs `/usr/bin/readelf -W -S -d --dyn-syms` on each library. readelf reads the symbols
    through the section headers, which the loader never looks at; it must exit 0, print no
-   warning, show the table's soname and list every export of the table as a
-   `FUNC GLOBAL DEFAULT` symbol line. readelf (GNU Binutils 2.42 here) is a read-only
-   verification oracle, not part of the build.
+   warning, show the table's soname and list every export of the table (at least one) as a
+   `FUNC GLOBAL DEFAULT` symbol line. readelf is a read-only verification oracle, not part of the
+   build.
 5. It reads the test library's wrappers (found through `.dynsym`): three stack probes covering
-   2, 5 and 1 pages, each with its MOV, MOVZ and MOVKs and the wrapper's BL after it; and in each
+   3, 5 and 1 pages, each with its ADD, MOVZ and MOVKs and the wrapper's BL after it; and in each
    wrapper the 10 STP words that save x19..x30 and d8..d15, with the matching LDPs in the shared
    return.
 6. It requires a second build from the same object to have identical bytes.
 
-Its controls must each be caught with their exact exit status and, where one is given, with
-that text in the failing program's error output:
-
-| Control | Change | Required |
-|---|---|---|
-| row | a malformed row in the table | 1, `malformed number` |
-| export | an export removed from the library while the probe still needs it | 127, `undefined symbol: omega_shlib_div` |
-| hash | every hash bucket zeroed | 127, `undefined symbol: ` |
-| expect | a wrong expected value | 1 |
-| stack | the wrapper's stack restore off by 16 bytes | 250 |
-| extend | the wrappers' sign extensions removed (omc's int add then traps on call 1) | 2 |
-| uextend | the wrappers' zero extensions removed | 10 |
-| nextend | the wrappers' byte and halfword extensions removed | 13 |
-| restore | the shared return reloads x19 and x20 from the wrong slot | 250 |
-| runtime | the object's trap-entry load turned into a load of another runtime entry | 1, `runtime entry` |
-| need | deep's frame in the object made 16 bytes smaller (accepted), so its probe covers 4 pages instead of 5 | 1 (stack probe check) |
-| address | the first function's address in the object moved by 2 bytes | 1, `a function address is outside the code` |
-| frestore | the shared return reloads d8 and d9 from the wrong slot | 250 |
-| callrec | the object's last call record dropped | 1, `a BL word has no call record` |
-| callto | the object's last call record pointed at another function | 1, `a call record does not match its BL` |
-| nosave | one wrapper's save of x19 and x20 removed | 1 (save check) |
+Its controls change one thing each (the table, the object, the library or its copy) and must be
+caught with their exact exit status and, where one is given, the refusal's own text. Each check
+has at least one. `gate.om`'s header lists them; `run.sh` pins the summary line.
 
 ## NVML status
 
@@ -118,8 +105,11 @@ that text in the failing program's error output:
 register; `nvmlDevice_t` is a `ulong`. The bodies are stubs: every query answers
 `NVML_ERROR_NOT_SUPPORTED` (3) and writes nothing, and `nvmlErrorString` answers NULL (also its
 trap value). A caller that prints that string will crash, so this library proves the shape and the
-calling convention only. It must not be installed in place of a real `libnvidia-ml.so.1` until the
-items below exist.
+calling convention only. `nvmlDeviceGetName` and `nvmlDeviceGetUUID` take a C buffer and its
+length; the stubs declare the buffer as one byte, which is safe only because they write nothing.
+Real bodies need the unsized form (pointer, then a ulong count), and the wrapper would then have to
+zero-extend C's `unsigned int` length into that count. It must not be installed in place of a real
+`libnvidia-ml.so.1` until the items below exist.
 
 The real bodies in `gpu/nvidia/native/nvml/api.om` need things omc's callable units do not yet
 offer:
