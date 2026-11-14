@@ -107,9 +107,9 @@ To list the files a rewrite can start on, with their host-logic lines:
     { printf 'om2\n'; cat gpu/runtime/classes.om; } | seed/out/omc > classes
     ./classes > gpu/runtime/CLASSES.tsv
 
-The committed `cudapp-cfacts.tsv` has sha256 `a0eaea7a60d771735bf557566c4bcfe4dad4e823c6acba46965d8ade6342ab65`.
+The committed `cudapp-cfacts.tsv` has sha256 `b013c30574aa4fc42cc467a94431d3757ece00c291dc553e015b15fc32dce407`.
 The lane that wrote this slice also wrote the same rules separately, outside this repository, as a reference
-program in Python (`cfacts_ref.py`, sha256 `bc2c6f28b7e607d11849b53fc4c2e056f369666d838eee9c19725d43d0644a6c`), and
+program in Python (`cfacts_ref.py`, sha256 `0dcd595e9d12362370c8a18cfcf73ecc1dc8794a23d72fe387b2808abb51f596`), and
 its output on CUDApp was byte for byte the same file. On the two test inputs it gives `check/cfacts.expect.txt`.
 
 ## The scanref oracle
