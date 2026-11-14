@@ -24,3 +24,18 @@ deleted in CUDApp before the source commit and so appear only in history, not in
 
 Commit messages, authors and dates are kept; a CUDApp hash named in a message is still the CUDApp hash
 (`--preserve-commit-hashes`). CUDApp itself was not changed.
+
+## Changed after the import
+
+Two moved files are no longer byte-equal to their CUDApp copies. The commit that changed them came after step 3 was
+merged into main. It keeps home paths and machine names out of the tree:
+
+- `gpu/nvidia/om/cache/templates_fixture.om`, line 3: a `note` named the fixture's folder by its full home path. It now
+  gives the folder's name only. A `note` is not compiled, so the fixture program is the same binary as before.
+- `gpu/hw/manifest.tsv`, rows `tpu-google-edge` and `dpu-bluefield`: the blocker column named the test host by its
+  machine name. It now says "the DGX Spark test host". `hwman` does not print that column, so `hwman check` and
+  `hwman doctor` print the same output as before.
+
+The imported history still holds the old lines, because a commit is never rewritten. CUDApp's own evidence keeps the
+digests of its own copies: `om/cache/templates-evidence.json` and `evidence/HW-MANIFEST-*`. Those digests describe the
+CUDApp files, not these two files.
