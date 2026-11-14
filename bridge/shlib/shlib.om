@@ -35,11 +35,14 @@ note                             on), then the address of the caller's stack arg
 note                             argument 9 on, 8 bytes each, a narrow one in its low bytes with the rest
 note                             unspecified); each further parameter, one per STATE named (at most 5), is a sized
 note                             view or edit that the wrapper points at that state, at most its size
-note   call NAME EXPECT ARG...   the probe calls NAME with up to 6 arguments (a decimal 64-bit value, buf for
+note   call NAME EXPECT ARG...   the probe calls NAME with up to 10 arguments (a decimal 64-bit value, buf for
 note                             a pointer to one 4096-byte writable buffer, zeroed at load and shared by every
-note                             call, so a later call reads what an earlier one wrote, or bufword for the u64
-note                             that buffer holds at offset 0) and compares the low 32 bits of the result with
-note                             EXPECT
+note                             call, so a later call reads what an earlier one wrote, buf+N for the pointer
+note                             N bytes into it (0..4095), or bufword for the u64 that buffer holds at offset
+note                             0; arguments 9 and 10 go on the stack, as AAPCS64
+note                             passes them) and compares the low 32 bits of the result with EXPECT
+note   bufeq OFF VALUE           the probe compares the u64 the buffer holds at byte offset OFF (0..4088) with
+note                             VALUE, all 64 bits, after the rows before it (at least one call row)
 note From the C calling convention (AAPCS64) to omc's function ABI, per export: each C argument register is one
 note omc parameter slot, in order (a scalar or a sized array: one slot; an unsized view or edit: a pointer slot
 note then a ulong count slot). Narrow integer arguments are sign- or zero-extended as omc expects. x7 points at a
@@ -112,7 +115,9 @@ note .text, 6 veneer bytes
 note mp, per import row (20): 0 name offset in ib, 1 name length, 2 tokens, 3..10 their slots, 11..18 their
 note offsets, 19 1 once an import uses the row
 note nd, per needed row (3): 0 name offset in ib, 1 name length, 2 dynstr offset
-note cl, per call (16): 0 name offset, 1 name length, 2 expect, 3 arguments, 4..9 values, 10..15 1 for buf
+note cl, per call row (CLW): 0 name offset, 1 name length, 2 expect, 3 arguments, 4..13 values, 14..23 1 for buf,
+note 2 for bufword, 24 1 for a bufeq row (its offset in 4, its value in 5; its name the call row's before it)
+const CLW ulong 25
 note cd, per call: the dynstr offset of its name
 note fr, per object function (8): 0 flags, 1 address, 2 result type, 3 parameters, 4 parameter records offset
 note in ib, 5 name offset in ib, 6 name length
@@ -123,6 +128,8 @@ text k_exp "export"
 text k_call "call"
 text k_buf "buf"
 text k_bufw "bufword"
+text k_bufeq "bufeq"
+text k_bufp "buf+"
 text k_need "needed"
 text k_rpath "runpath"
 text k_state "state"
@@ -148,7 +155,7 @@ text e_trap "shlib: a trap value above 4294967295\n"
 text e_obj "shlib: the object is not an OMOBJ001 version 1 AArch64 object\n"
 text e_imp "shlib: an import with an address or a stack need\n"
 text e_improw "shlib: an import row names no import of the object, or a slot past the import's slots, or more than 8\n"
-text e_frame "shlib: a frame export's parameters do not match its row (a sized ulong frame of 1..8 + states, then one sized view or edit per state, within its size)\n"
+text e_frame "shlib: a frame export's parameters do not match its row (a sized ulong frame of 1..9 + states, then one sized view or edit per state, within its size)\n"
 text e_state "shlib: a state row is malformed, repeated, or named before it is declared\n"
 text e_lock "shlib: a lock row is malformed or repeated, or an export of a locked library is not a frame export\n"
 text e_rt "shlib: the code loads a runtime entry other than the trap entry\n"
@@ -328,6 +335,19 @@ ret p
 end
 fn ft i ulong t view uchar * to bool
 if ne get fl i len t
+ret false
+end
+o = get fo i
+for j ulong len t bound 4096
+if ne get ib add o j get t j
+ret false
+end
+end
+ret true
+end
+note field i starts with text t and is longer
+fn fpre i ulong t view uchar * to bool
+if le get fl i len t
 ret false
 end
 o = get fo i
@@ -584,7 +604,7 @@ if or lt n 2 ne get ib o 115
 die e_improw 1
 end
 p = ulong 1
-while lt p n bound 64
+while lt p n bound 9223372036854775807
 if eq get ib add o p 43
 break
 end
@@ -605,6 +625,10 @@ ret
 end
 if ft 0 k_call
 callrow
+ret
+end
+if ft 0 k_bufeq
+eqrow
 ret
 end
 if ft 0 k_need
@@ -631,16 +655,11 @@ die e_row 1
 end
 fn callrow to void
 nf = get nv 9
-if or lt nf 3 gt nf 9
+if or lt nf 3 gt nf 13
 die e_row 1
 end
 fname 1 false
-nc = get nv 4
-r = enlarge cl mul add nc 1 16
-if lt r 0
-die e_mem 3
-end
-b = mul nc 16
+b = clnew
 put cl b get fo 1
 put cl add b 1 get fl 1
 e = fnum 2
@@ -650,19 +669,60 @@ end
 put cl add b 2 e
 na = sub nf 3
 put cl add b 3 na
-for j ulong na bound 6
+for j ulong na bound 10
 f = add j 3
 if ft f k_buf
-put cl add add b 10 j 1
+put cl add add b 14 j 1
 else
 if ft f k_bufw
-put cl add add b 10 j 2
+put cl add add b 14 j 2
+else
+if fpre f k_bufp
+put cl add add b 14 j 1
+u = dnum add get fo f 4 sub get fl f 4
+if gt u 4095
+die e_num 1
+end
+put cl add add b 4 j u
 else
 put cl add add b 4 j fnum f
 end
 end
 end
+end
+end
+note a bufeq row: OFF at most 4088, after a call row, whose name it takes (its GOT slot is never called)
+fn eqrow to void
+nc = get nv 4
+if or ne get nv 9 3 eq nc 0
+die e_row 1
+end
+o = fnum 1
+if gt o 4088
+die e_num 1
+end
+v = fnum 2
+a = mul sub nc 1 CLW
+b = clnew
+put cl b get cl a
+put cl add b 1 get cl add a 1
+put cl add b 4 o
+put cl add b 5 v
+put cl add b 24 1
+end
+note a new zeroed call row; its first word
+fn clnew to ulong
+nc = get nv 4
+r = enlarge cl mul add nc 1 CLW
+if lt r 0
+die e_mem 3
+end
+b = mul nc CLW
+for i ulong CLW
+put cl add b i 0
+end
 put nv 4 add nc 1
+ret b
 end
 fn parse to void
 p = ulong 0
@@ -697,7 +757,7 @@ if eq get nv 3 0
 die e_noexp 1
 end
 for k ulong get nv 4 bound 9223372036854775807
-b = mul k 16
+b = mul k CLW
 if eq exfind get cl b get cl add b 1 get nv 3
 die e_ncall 1
 end
@@ -1863,7 +1923,9 @@ put im add x 6 vsz i
 vo = add vo get im add x 6
 end
 put ly 6 vo
-put ly 7 al16 get ly 6
+note the RW segment at a 64-byte boundary (its address is its offset + 64 KiB), so each state, at a multiple of
+note 64 from it, is 64-byte aligned as the state row promises
+put ly 7 and add get ly 6 63 not ulong 63
 put ly 8 add get ly 7 65536
 de = add get nv 26 11
 if ne get nv 27 0
@@ -2016,12 +2078,17 @@ libtext
 libsecs
 end
 note ---- the probe executable (ET_EXEC at 4 MiB)
-note bytes of call k's code
+note bytes of call row k's code: a bufeq row 10 words; a call row its arguments (buf 1 word, bufword 2, a value
+note 4; a stack argument 1 more for its STR, and SUB SP and ADD SP when there is one) and 8
 fn callsz k ulong to ulong
-b = mul k 16
+b = mul k CLW
+if eq get cl add b 24 1
+ret 40
+end
+na = get cl add b 3
 n = ulong 0
-for j ulong get cl add b 3 bound 6
-c = get cl add add b 10 j
+for j ulong na bound 10
+c = get cl add add b 14 j
 if eq c 1
 n = add n 1
 else
@@ -2031,6 +2098,12 @@ else
 n = add n 4
 end
 end
+if ge j 8
+n = add n 1
+end
+end
+if gt na 8
+n = add n 2
 end
 ret mul add n 8 4
 end
@@ -2038,20 +2111,37 @@ note the probe layout in ly: 0 .hash, 1 its bytes, 2 .dynsym, 3 .dynstr, 4 the r
 note (code), 6 the end of the RX segment, 7 the RW segment's file offset, 8 its address minus the base, 9 the
 note file's length; the base address is 4 MiB; RW holds .dynamic (192 bytes), the GOT, then the 4096-byte buf
 const PBASE ulong 4194304
-note the arguments of call k from offset p (buf: ADR of the buffer; bufword: ADR, then LDR of its first
-note word); the next offset
+note the arguments of call row k from offset p (buf: ADR of the buffer; bufword: ADR, then LDR of its first
+note word): arguments 1..8 into x0..x7; arguments 9 and 10 into x17, then STR X17, [SP, #0 or #8] below SUB SP,
+note SP, #16; the next offset
 fn wrargs k ulong p ulong to ulong
-b = mul k 16
-bf = add add get ly 8 192 mul get nv 4 8
-for j ulong get cl add b 3 bound 6
-c = get cl add add b 10 j
-if ne c 0
-p = wrbuf p bf j c
-else
-p = wrval p get cl add add b 4 j j
+b = mul k CLW
+na = get cl add b 3
+if gt na 8
+w32 p 3506455551
+p = add p 4
+end
+for j ulong na bound 10
+r = j
+if ge j 8
+r = 17
+end
+p = wrarg p b j r
+if ge j 8
+w32 p or 4177527793 shl sub j 8 10
+p = add p 4
 end
 end
 ret p
+end
+note argument j of the call row at cl word b into xr at p; the next offset
+fn wrarg p ulong b ulong j ulong r ulong to ulong
+bf = add add get ly 8 192 mul get nv 4 8
+c = get cl add add b 14 j
+if ne c 0
+ret wrbuf p add bf get cl add add b 4 j r c
+end
+ret wrval p get cl add add b 4 j r
 end
 note MOVZ/MOVK of v into xj at p; the next offset
 fn wrval p ulong v ulong j ulong to ulong
@@ -2070,25 +2160,44 @@ ret add p 8
 end
 ret add p 4
 end
-note call k at offset p (LDR X16, GOT[k]; BLR X16; X16 = expect; CMP W0, W16; B.EQ +12; MOVZ X0, #k+1;
-note B exit); the next offset
+note call row k at offset p (LDR X16, GOT[k]; BLR X16; ADD SP, SP, #16 after stack arguments; X16 = expect; CMP
+note W0, W16; B.EQ +12; MOVZ X0, #k+1; B exit), or its bufeq (ADR X16, buffer + OFF; LDR X16, [X16]; X17 =
+note VALUE; CMP X16, X17; B.EQ +12; MOVZ X0, #k+1; B exit); the next offset
 fn wrcall1 k ulong p ulong to ulong
 tx = get ly 5
+b = mul k CLW
+if eq get cl add b 24 1
+bf = add add get ly 8 192 mul get nv 4 8
+wradr p add bf get cl add b 4 16
+w32 add p 4 4181721616
+p = wrval add p 8 get cl add b 5 17
+w32 p 3943760415
+ret wrfail k add p 4
+end
 p = wrargs k p
 wrldr p add add get ly 8 192 mul k 8
 w32 add p 4 3594453504
-e = get cl add mul k 16 2
-wrmov add p 8 0 e 16
-wrmov add p 12 1 shr e 16 16
-w32 add p 16 1796210719
-w32 add p 20 1409286240
+p = add p 8
+if gt get cl add b 3 8
+w32 p 2432713727
+p = add p 4
+end
+e = get cl add b 2
+wrmov p 0 e 16
+wrmov add p 4 1 shr e 16 16
+w32 add p 8 1796210719
+ret wrfail k add p 12
+end
+note B.EQ +12; MOVZ X0, #k+1 (at most 100); B exit at p; the next offset
+fn wrfail k ulong p ulong to ulong
+w32 p 1409286240
 x = add k 1
 if gt x 100
 x = 100
 end
-wrmov add p 24 0 x 0
-wrb add p 28 tx 335544320
-ret add p 32
+wrmov add p 4 0 x 0
+wrb add p 8 get ly 5 335544320
+ret add p 12
 end
 note CMP-equal check then exit 250 (B.EQ +12; MOVZ X0, #250; B exit) at p; the next offset
 fn chk250 p ulong cmp ulong to ulong
@@ -2108,7 +2217,7 @@ if lt r 0
 die e_mem 3
 end
 for k ulong nc bound 9223372036854775807
-b = mul k 16
+b = mul k CLW
 put cd k dsib get cl b get cl add b 1
 end
 ns = add nc 1
