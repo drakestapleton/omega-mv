@@ -61,6 +61,8 @@ cd CUDApp && ../inventory ../list.txt ../gpulist.txt ../omega-mv/gpu/nvidia/chec
 
 LABEL is the inputs line, the second line of `INVENTORY.tsv`: it names the CUDApp commit of the checkout and the omega-mv commit whose `gpu/` list was read, so put the commits you actually used there. `inventory` exits 1 in two cases: a `ports.tsv` row names no CUDApp path, or a path appears twice. It exits 2 on a malformed row, on a path that does not fit Linux PATH_MAX, or when it cannot read an input or the host refuses the memory; it reads inputs of any size into memory that grows to fit them.
 
+What is still open, by tier and kind, is the line `# open by tier/kind:` just above the counts at the end of `INVENTORY.tsv`: `inventory.om` writes one `TIER/KIND=COUNT` per tier and file extension of the `open` rows (`none` for a file without one), in the order each first appears. Read the figures there; this README does not repeat them.
+
 ## Why files are retired
 
 A file is `retired` only when no behaviour of it is left unchecked: it is not a test or tool (prose, session metadata, recorded evidence), or the job it did no longer exists once CUDApp is folded into omega-mv. A test whose behaviour no Omega check covers is never retired; it stays `open` or is `blocked`. Every retired row of `ports.tsv` gives one of these reasons; the rows themselves are the list of files.
