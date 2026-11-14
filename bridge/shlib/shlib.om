@@ -1,0 +1,1477 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note bridge/shlib/shlib.om: writes an AArch64 Linux shared library (ELF64 ET_DYN) from a table and the native
+note object omc emits for an OM-2 unit with `export fn` entries, and a probe executable that loads it through the
+note system's dynamic loader and calls it. No C compiler, assembler or linker is involved.
+note Build: seed/out/omc < bridge/shlib/shlib.om > shlib
+note   shlib lib TABLE OBJECT OUT   the library: DT_SONAME from TABLE, one global function symbol per export row
+note   shlib call TABLE OUT         the probe: an executable that needs the TABLE's SONAME (searched next to the
+note                                probe, DT_RUNPATH $ORIGIN, bound at load), makes each call row's call in order
+note                                and exits 0 when every result matches, 1+k (100 for k >= 99) when call k does
+note                                not, 250 when x19..x27, x29, d8..d15 or the stack pointer did not come back
+note                                unchanged
+note OBJECT is omc's output for the line "object" followed by the unit (OMOBJ001, spec/omegese-modules.md).
+note TABLE: one row per line, fields separated by one tab; an empty line or one starting with # is skipped.
+note   soname NAME               the library's DT_SONAME (exactly one row)
+note   export NAME TRAP          NAME, an `export fn` of the object, becomes a global function symbol; a trap
+note                             inside it returns TRAP (0..4294967295) to the C caller
+note   call NAME EXPECT ARG...   the probe calls NAME with up to 6 arguments (a decimal 64-bit value, or buf for
+note                             a pointer to one 4096-byte writable buffer, zeroed at load and shared by every
+note                             call, so a later call reads what an earlier one wrote) and compares the low 32
+note                             bits of the result with EXPECT
+note From the C calling convention (AAPCS64) to omc's function ABI, per export: each C argument register is one
+note omc parameter slot, in order (a scalar or a sized array: one slot; an unsized view or edit: a pointer slot
+note then a ulong count slot). Narrow integer arguments are sign- or zero-extended as omc expects. x7 points at a
+note per-call context on the caller's stack whose byte offset 16 ([x7, #16]) holds the trap entry; x19..x30 and d8..d15 are saved
+note there and restored on both the return and the trap path. The result is returned in x0.
+note Refused (exit 1, nothing written), each with its own message: an object that is not an OMOBJ001 version 1
+note AArch64 object (header, trailing bytes, records, padding, names); an imported function; a function address
+note outside the code, unaligned or out of order, or an export's inside the entry slots; an entry slot that does not branch to
+note its function; a BL with no call record or two; a call record whose offset, source or cost does not fit its
+note BL, or whose destination is not the BL's target; a base-register use of x7 other than the trap-entry load
+note [x7, #16] (a pattern check over the load/store group); a stack need above the 2^48-byte address space or a
+note call cycle; a float scalar parameter or result (omc passes them in x registers, C in v registers); more than 6
+note parameter slots; a table export that is not an export of the object; a repeated or malformed name; a
+note malformed row or number; no soname or no export; a call of a name that is no export of the table.
+note Exit 0 written, 1 refused, 2 usage, 3 a file unreadable or unwritable or memory refused.
+note Every buffer is a run-time pool sized from its input. The wrappers, entry slots and probe reach their
+note targets with ADR and LDR literal (1 MiB) and B and BL (128 MiB) because each is one word; an output past
+note their reach is refused (e_reach), never truncated. That is a choice of instruction forms, not a machine
+note limit: a larger output needs ADRP + ADD and veneers for the far branches.
+global ib uchar *
+global eb uchar *
+global ds uchar *
+global ex ulong *
+global cl ulong *
+global cd ulong *
+global fr ulong *
+global ck ulong *
+global ag uchar 4096
+global fo ulong 16
+global fl ulong 16
+global nv ulong 64
+global ly ulong 32
+note nv: 0 table end (object start), 1 object end, 2 dynstr length, 3 exports, 4 calls, 5 soname offset in ib,
+note 6 soname length, 7 functions, 8 code end, 9 fields in the current row, 10 output length, 13 soname in
+note dynstr, 14 runpath in dynstr, 15 section header offset, 16 address minus offset of the current section,
+note 17 object call records, 18 a stack need changed in this pass, 19 the previous function address,
+note 20 and 21 the slot and extension counts of exts, 22 the object's exported functions
+note ck, per object call record (4): source function, destination function, stack cost, instruction offset
+note SMAX: the most stack a call may need, the AArch64 Linux user address space (48-bit virtual addresses,
+note 2^48 bytes): no stack can be larger. Every settled need and cost is at most SMAX, so need + cost stays
+note below 2^64; the probe's page count (at most 2^36) takes MOVZ and two MOVKs.
+const SMAX ulong 281474976710656
+note ex, per export (8): 0 name offset in ib, 1 name length, 2 trap value, 3 function index, 4 dynstr offset,
+note 5 wrapper offset in .text, 6 wrapper bytes, 7 extensions
+note cl, per call (16): 0 name offset, 1 name length, 2 expect, 3 arguments, 4..9 values, 10..15 1 for buf
+note cd, per call: the dynstr offset of its name
+note fr, per object function (8): 0 flags, 1 address, 2 result type, 3 parameters, 4 parameter records offset
+note in ib, 5 name offset in ib, 6 name length
+text m_lib "lib"
+text m_call "call"
+text k_son "soname"
+text k_exp "export"
+text k_call "call"
+text k_buf "buf"
+text k_obj "OMOBJ001"
+text t_interp "/lib/ld-linux-aarch64.so.1"
+text t_origin "$ORIGIN"
+note the section names, each space written as a zero
+text t_shs " .hash .dynsym .dynstr .text .dynamic .shstrtab "
+text e_usage "usage: shlib lib TABLE OBJECT OUT | shlib call TABLE OUT\n"
+text e_read "shlib: cannot read an input file\n"
+text e_write "shlib: cannot write the output file\n"
+text e_mem "shlib: memory refused\n"
+text e_row "shlib: malformed table row\n"
+text e_num "shlib: malformed number in the table\n"
+text e_name "shlib: a name outside A-Z a-z 0-9 _ (1..63 bytes; a soname also . + -, any length) or repeated\n"
+text e_son "shlib: the table needs exactly one soname row\n"
+text e_noexp "shlib: the table names no export\n"
+text e_trap "shlib: a trap value above 4294967295\n"
+text e_obj "shlib: the object is not an OMOBJ001 version 1 AArch64 object\n"
+text e_imp "shlib: the object imports a function; imports are not linked here\n"
+text e_rt "shlib: the code loads a runtime entry other than the trap entry\n"
+text e_rtw "shlib: the code reads or writes through the per-call context (x7) other than the trap-entry load\n"
+text e_addr "shlib: a function address is outside the code, unaligned, out of order or inside the entry slots\n"
+text e_slotb "shlib: an export's entry slot does not branch to its function\n"
+text e_bl "shlib: a BL word has no call record, or two records name one BL\n"
+text e_call "shlib: a call record's offset, source or cost does not fit its BL\n"
+text e_cdst "shlib: a call record's destination is not its BL's target\n"
+text e_miss "shlib: a table export is not an export of the object\n"
+text e_flt "shlib: a float parameter or result; refused\n"
+text e_slot "shlib: more than 6 parameter slots\n"
+text e_ncall "shlib: a call names no export of the table\n"
+text e_reach "shlib: output past the AArch64 branch or literal reach\n"
+text e_stk "shlib: a function needs more stack than the 2^48-byte address space, or its calls form a cycle\n"
+note ---- small helpers
+fn die t view uchar * code int to void
+r = write 2 t 0 len t
+exit code
+end
+fn al8 x ulong to ulong
+ret and add x 7 not ulong 7
+end
+fn al16 x ulong to ulong
+ret and add x 15 not ulong 15
+end
+fn w8 o ulong v ulong to void
+put eb o uchar and v 255
+end
+fn w16 o ulong v ulong to void
+w8 o v
+w8 add o 1 shr v 8
+end
+fn w32 o ulong v ulong to void
+w16 o and v 65535
+w16 add o 2 shr v 16
+end
+fn w64 o ulong v ulong to void
+w32 o and v 4294967295
+w32 add o 4 shr v 32
+end
+note the u32 of eb at o
+fn r32 o ulong to ulong
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get eb add o i mul i 8
+end
+ret v
+end
+note the u64 of ib at o, inside the object
+fn q o ulong to ulong
+if gt add o 8 get nv 1
+die e_obj 1
+end
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get ib add o i mul i 8
+end
+ret v
+end
+note the u64 at object offset o
+fn oq o ulong to ulong
+ret q add get nv 0 o
+end
+note argument ai into ag; its length
+fn ap ai ulong to ulong
+r = argread ai ag 0 4095
+if le r 0
+die e_usage 2
+end
+ret ulong r
+end
+fn argis ai ulong t view uchar * to bool
+r = argread ai ag 0 4095
+if ne r long len t
+ret false
+end
+for i ulong len t bound 4096
+if ne get ag i get t i
+ret false
+end
+end
+ret true
+end
+note append argument ai's file to ib from offset at; the new end
+fn ldf ai ulong from ulong to ulong
+m = ap ai
+fd = fopen ag 0 m int 524288 int 0
+if lt fd 0
+die e_read 3
+end
+n = from
+while true bound 9223372036854775807
+if lt sub len ib n 65536
+r = enlarge ib add add n 65536 len ib
+if lt r 0
+die e_mem 3
+end
+end
+x = read int fd ib n sub len ib n
+if lt x 0
+die e_read 3
+end
+if eq x 0
+break
+end
+n = add n ulong x
+end
+r = fclose int fd
+ret n
+end
+note write eb[0, nv 10) to argument ai's path with mode md
+fn save ai ulong md int to void
+m = ap ai
+r = unlink ag 0 m
+fd = fopen ag 0 m int 524865 md
+if lt fd 0
+die e_write 3
+end
+n = get nv 10
+o = ulong 0
+while lt o n bound 9223372036854775807
+x = write int fd eb o sub n o
+if le x 0
+die e_write 3
+end
+o = add o ulong x
+end
+r = fclose int fd
+if lt r 0
+die e_write 3
+end
+end
+note eb grown to n bytes, all zero
+fn ebnew n ulong to void
+if gt n len eb
+r = enlarge eb n
+if lt r 0
+die e_mem 3
+end
+end
+for i ulong n bound 9223372036854775807
+put eb i 0
+end
+put nv 10 n
+end
+note ---- table rows: the fields of one line into fo/fl, their count into nv 9; returns the next line
+fn row o ulong e ulong to ulong
+put nv 9 0
+s = o
+p = o
+while lt p e bound 9223372036854775807
+c = get ib p
+if eq c 10
+break
+end
+if eq c 9
+k = get nv 9
+if ge k 15
+die e_row 1
+end
+put fo k s
+put fl k sub p s
+put nv 9 add k 1
+s = add p 1
+end
+p = add p 1
+end
+k = get nv 9
+put fo k s
+put fl k sub p s
+put nv 9 add k 1
+if lt p e
+p = add p 1
+end
+ret p
+end
+fn ft i ulong t view uchar * to bool
+if ne get fl i len t
+ret false
+end
+o = get fo i
+for j ulong len t bound 4096
+if ne get ib add o j get t j
+ret false
+end
+end
+ret true
+end
+note field i as a decimal u64
+fn fnum i ulong to ulong
+n = get fl i
+if or eq n 0 gt n 20
+die e_num 1
+end
+o = get fo i
+v = ulong 0
+for j ulong n bound 20
+c = get ib add o j
+if or lt c 48 gt c 57
+die e_num 1
+end
+d = ulong sub c 48
+if gt v div sub 18446744073709551615 d 10
+die e_num 1
+end
+v = add mul v 10 d
+end
+ret v
+end
+note ib[a, a+n) equals ib[b, b+n)
+fn same a ulong b ulong n ulong to bool
+for j ulong n bound 9223372036854775807
+if ne get ib add a j get ib add b j
+ret false
+end
+end
+ret true
+end
+note field i is a name: 1..63 bytes of A-Z a-z 0-9 _ (omc's own name limit), or when so (a soname) at least
+note one byte of those and . + -
+fn fname i ulong so bool to void
+n = get fl i
+if or eq n 0 and not so gt n 63
+die e_name 1
+end
+o = get fo i
+for j ulong n bound 9223372036854775807
+c = get ib add o j
+ok = or and ge c 48 le c 57 eq c 95
+ok = or ok or and ge c 65 le c 90 and ge c 97 le c 122
+if so
+ok = or ok or or eq c 46 eq c 43 eq c 45
+end
+if not ok
+die e_name 1
+end
+end
+end
+note the export named ib[a, a+n), or the export count when none
+fn exfind a ulong n ulong to ulong
+nx = get nv 3
+for k ulong nx bound 9223372036854775807
+b = mul k 8
+if eq get ex add b 1 n
+if same get ex b a n
+ret k
+end
+end
+end
+ret nx
+end
+fn exrow to void
+if ne get nv 9 3
+die e_row 1
+end
+fname 1 false
+nx = get nv 3
+if ne exfind get fo 1 get fl 1 nx
+die e_name 1
+end
+t = fnum 2
+if gt t 4294967295
+die e_trap 1
+end
+r = enlarge ex mul add nx 1 8
+if lt r 0
+die e_mem 3
+end
+b = mul nx 8
+put ex b get fo 1
+put ex add b 1 get fl 1
+put ex add b 2 t
+put nv 3 add nx 1
+end
+fn callrow to void
+nf = get nv 9
+if or lt nf 3 gt nf 9
+die e_row 1
+end
+fname 1 false
+nc = get nv 4
+r = enlarge cl mul add nc 1 16
+if lt r 0
+die e_mem 3
+end
+b = mul nc 16
+put cl b get fo 1
+put cl add b 1 get fl 1
+e = fnum 2
+if gt e 4294967295
+die e_num 1
+end
+put cl add b 2 e
+na = sub nf 3
+put cl add b 3 na
+for j ulong na bound 6
+f = add j 3
+if ft f k_buf
+put cl add add b 10 j 1
+else
+put cl add add b 4 j fnum f
+end
+end
+put nv 4 add nc 1
+end
+fn parse to void
+p = ulong 0
+e = get nv 0
+ns = ulong 0
+while lt p e bound 9223372036854775807
+p = row p e
+skip = and eq get nv 9 1 eq get fl 0 0
+if gt get fl 0 0
+if eq get ib get fo 0 35
+skip = true
+end
+end
+if not skip
+if ft 0 k_son
+if ne get nv 9 2
+die e_row 1
+end
+fname 1 true
+put nv 5 get fo 1
+put nv 6 get fl 1
+ns = add ns 1
+else
+if ft 0 k_exp
+exrow
+else
+if ft 0 k_call
+callrow
+else
+die e_row 1
+end
+end
+end
+end
+end
+if ne ns 1
+die e_son 1
+end
+if eq get nv 3 0
+die e_noexp 1
+end
+for k ulong get nv 4 bound 9223372036854775807
+b = mul k 16
+if eq exfind get cl b get cl add b 1 get nv 3
+die e_ncall 1
+end
+end
+end
+note ---- dynstr
+fn dsgrow n ulong to void
+if gt n len ds
+r = enlarge ds add n 4096
+if lt r 0
+die e_mem 3
+end
+end
+end
+note append ib[a, a+n) and a zero; its offset
+fn dsib a ulong n ulong to ulong
+s = get nv 2
+dsgrow add add s n 1
+for j ulong n bound 9223372036854775807
+put ds add s j get ib add a j
+end
+put ds add s n 0
+put nv 2 add add s n 1
+ret s
+end
+fn dstx t view uchar * to ulong
+s = get nv 2
+dsgrow add add s len t 1
+for j ulong len t bound 4096
+put ds add s j get t j
+end
+put ds add s len t 0
+put nv 2 add add s len t 1
+ret s
+end
+fn dsinit to void
+dsgrow 1
+put ds 0 0
+put nv 2 1
+end
+note SysV ELF hash of the dynstr string at o
+fn ehash o ulong to ulong
+h = ulong 0
+p = o
+while ne get ds p 0 bound 9223372036854775807
+h = and add shl h 4 ulong get ds p 4294967295
+g = and h 4026531840
+if ne g 0
+h = xor h shr g 24
+end
+h = and h not g
+p = add p 1
+end
+ret h
+end
+note the dynstr offset of symbol k + 1 (library: ex 4, probe: cd)
+fn symname k ulong lib bool to ulong
+if lib
+ret get ex add mul k 8 4
+end
+ret get cd k
+end
+note .hash at off for n symbols after the null one: n buckets, n + 1 chain entries
+fn nbk n ulong to ulong
+if eq n 0
+ret 1
+end
+ret n
+end
+fn wrhash off ulong n ulong lib bool to void
+nb = nbk n
+w32 off nb
+w32 add off 4 add n 1
+cb = add off 8
+ch = add cb mul nb 4
+for k ulong n bound 9223372036854775807
+s = add k 1
+bo = add cb mul rem ehash symname k lib nb 4
+w32 add ch mul s 4 r32 bo
+w32 bo s
+end
+end
+note copy ds to eb at off
+fn wrstr off ulong to void
+for j ulong get nv 2 bound 9223372036854775807
+put eb add off j get ds j
+end
+end
+fn wrbytes off ulong t view uchar * to void
+for j ulong len t bound 4096
+c = get t j
+if eq c 32
+c = 0
+end
+put eb add off j c
+end
+end
+note ELF64 header: type, entry, program headers, section header offset, sections
+fn wrehdr ty ulong entry ulong nph ulong shoff ulong nsh ulong to void
+w32 0 1179403647
+w8 4 2
+w8 5 1
+w8 6 1
+w16 16 ty
+w16 18 183
+w32 20 1
+w64 24 entry
+w64 32 64
+w64 40 shoff
+w16 52 64
+w16 54 56
+w16 56 nph
+if ne nsh 0
+w16 58 64
+w16 60 nsh
+w16 62 sub nsh 1
+end
+end
+note program header i; a PT_LOAD is aligned to 64 KiB, anything else to 8
+fn wrph i ulong ty ulong fg ulong off ulong va ulong sz ulong to void
+o = add 64 mul i 56
+w32 o ty
+w32 add o 4 fg
+w64 add o 8 off
+w64 add o 16 va
+w64 add o 24 va
+w64 add o 32 sz
+w64 add o 40 sz
+if eq ty 1
+w64 add o 48 65536
+else
+w64 add o 48 8
+end
+end
+note section header i (address = offset + nv 16 when allocated)
+fn wrsh i ulong nm ulong ty ulong fg ulong off ulong sz ulong to void
+o = add get nv 15 mul i 64
+w32 o nm
+w32 add o 4 ty
+w64 add o 8 fg
+if ne and fg 2 0
+w64 add o 16 add off get nv 16
+end
+w64 add o 24 off
+w64 add o 32 sz
+end
+fn wrshl i ulong lk ulong inf ulong al ulong es ulong to void
+o = add get nv 15 mul i 64
+w32 add o 40 lk
+w32 add o 44 inf
+w64 add o 48 al
+w64 add o 56 es
+end
+fn dyn o ulong tag ulong v ulong to ulong
+w64 o tag
+w64 add o 8 v
+ret add o 16
+end
+note a B or BL (op) at offset p to offset t, both in the same address space
+fn wrb p ulong t ulong op ulong to void
+d = sub t p
+if ne and d 3 0
+die e_obj 1
+end
+if and ge d 134217728 lt d sub ulong 0 134217728
+die e_reach 1
+end
+w32 p or op and shr d 2 67108863
+end
+note ADR rd at p to t
+fn wradr p ulong t ulong rd ulong to void
+d = sub t p
+if and ge d 1048576 lt d sub ulong 0 1048576
+die e_reach 1
+end
+w32 p or or 268435456 rd or shl and d 3 29 shl and shr d 2 524287 5
+end
+note LDR X16 (literal) at p from t
+fn wrldr p ulong t ulong to void
+d = sub t p
+if and ge d 1048576 lt d sub ulong 0 1048576
+die e_reach 1
+end
+w32 p or 1476395024 shl and shr d 2 524287 5
+end
+note MOVZ (k 0) or MOVK (k 1..3, shift 16k) of the 16 bits v into rd
+fn wrmov p ulong k ulong v ulong rd ulong to void
+op = ulong 3531603968
+if ne k 0
+op = or 4068474880 shl k 21
+end
+w32 p or or op rd shl and v 65535 5
+end
+note ---- the object
+fn objparse to void
+b = get nv 0
+e = get nv 1
+if lt sub e b 176
+die e_obj 1
+end
+for j ulong 8
+if ne get ib add b j get k_obj j
+die e_obj 1
+end
+end
+if or ne oq 8 1 or ne oq 16 1 or gt oq 24 1 ne oq 32 176
+die e_obj 1
+end
+for j ulong 13
+if ne oq add 72 mul j 8 0
+die e_obj 1
+end
+end
+c = oq 40
+if or gt c sub e b lt c 176
+die e_obj 1
+end
+if ne and c 3 0
+die e_obj 1
+end
+put nv 8 c
+nf = oq 48
+nc = oq 56
+note a function record takes at least 48 bytes and a call record 32: counts past that are malformed, and
+note checking them first keeps every size product below 2^64
+if or gt nf div sub e b 48 gt nc div sub e b 32
+die e_obj 1
+end
+put nv 7 nf
+put nv 17 nc
+r = enlarge fr mul add nf 1 8
+if lt r 0
+die e_mem 3
+end
+r = enlarge ck mul add nc 1 4
+if lt r 0
+die e_mem 3
+end
+o = c
+for i ulong nf bound 9223372036854775807
+o = frec i o
+end
+if ne get nv 22 oq 64
+die e_obj 1
+end
+for k ulong nc bound 9223372036854775807
+o = crec k o
+end
+if ne o sub e b
+die e_obj 1
+end
+slots
+uniq
+blscan
+needs
+end
+note the B slot of the k-th export (record order) at 176 + 4k branches to that export's own address
+fn slots to void
+k = ulong 0
+for i ulong get nv 7 bound 9223372036854775807
+if eq get fr mul i 8 1
+w = add 176 mul k 4
+bslot w get fr add mul i 8 1
+k = add k 1
+end
+end
+end
+note the word at object offset w is a B to object offset a
+fn bslot w ulong a ulong to void
+if ne shr ib32 add get nv 0 w 26 5
+die e_slotb 1
+end
+if ne brt w a
+die e_slotb 1
+end
+if lt a add 176 mul oq 64 4
+die e_addr 1
+end
+end
+note the target of the B or BL word at object offset w
+fn brt w ulong to ulong
+m = and ib32 add get nv 0 w 67108863
+t = add w mul m 4
+if ne and m 33554432 0
+t = sub t 268435456
+end
+ret t
+end
+note no two non-imported function names are equal
+fn uniq to void
+nf = get nv 7
+for i ulong nf bound 9223372036854775807
+for j ulong i bound 9223372036854775807
+if dupn i j
+die e_obj 1
+end
+end
+end
+end
+fn dupn i ulong j ulong to bool
+a = mul i 8
+b = mul j 8
+if ne get fr add a 6 get fr add b 6
+ret false
+end
+ret same get fr add a 5 get fr add b 5 get fr add a 6
+end
+note function i's checks (spec/omegese-modules.md): flags 0, 1 or 2; a private or exported function's address
+note aligned, inside the code and above the previous one; a legal result type; zero name padding; legal
+note parameter records. nv 19 holds the previous address, nv 22 counts exports.
+fn fchk i ulong o ulong to void
+f = mul i 8
+fg = get fr f
+if gt fg 2
+die e_obj 1
+end
+if eq fg 1
+put nv 22 add get nv 22 1
+end
+a = get fr add f 1
+if lt fg 2
+if or lt a 176 or ge a get nv 8 or ne and a 3 0 le a get nv 19
+die e_addr 1
+end
+put nv 19 a
+end
+rt = get fr add f 2
+if or eq rt 0 gt rt 13
+die e_obj 1
+end
+s = add add get nv 0 o 48
+padz add s get fr add f 6 get fr add f 4
+precs f
+end
+note function record f's parameter records
+fn precs f ulong to void
+for p ulong get fr add f 3 bound 6
+prec add get fr add f 4 mul p 40
+end
+end
+note the bytes ib[s, e) are zero (a name's padding)
+fn padz s ulong e ulong to void
+for j ulong sub e s bound 8
+if ne get ib add s j 0
+die e_obj 1
+end
+end
+end
+note parameter record at ib offset p: type 1..13 but not 12 (void), kind 0, 2 or 3, layout 0, fresh 0 or 1
+fn prec p ulong to void
+t = q p
+k = q add p 8
+if or or eq t 0 gt t 13 eq t 12
+die e_obj 1
+end
+if and ne k 0 and ne k 2 ne k 3
+die e_obj 1
+end
+if or ne q add p 24 0 gt q add p 32 1
+die e_obj 1
+end
+if and eq k 0 ne q add p 16 0
+die e_obj 1
+end
+end
+note the end of function s's code: the lowest higher address of a private or exported function, else the
+note code end
+fn fend s ulong to ulong
+a = get fr add mul s 8 1
+e = get nv 8
+for i ulong get nv 7 bound 9223372036854775807
+x = get fr add mul i 8 1
+ok = lt get fr mul i 8 2
+if and ok and gt x a lt x e
+e = x
+end
+end
+ret e
+end
+note every BL word of the code [176, C) has exactly one call record (spec: "Every native BL word must have a
+note record"), so the stack needs settle over every call
+fn blscan to void
+b = get nv 0
+n = ulong 0
+for i ulong div sub get nv 8 176 4 bound 9223372036854775807
+if eq shr ib32 add add b 176 mul i 4 26 37
+n = add n 1
+end
+end
+if ne n get nv 17
+die e_bl 1
+end
+for k ulong get nv 17 bound 9223372036854775807
+w = get ck add mul k 4 3
+for j ulong k bound 9223372036854775807
+if eq get ck add mul j 4 3 w
+die e_bl 1
+end
+end
+end
+end
+note function record i at object offset o into fr (0 flags, 1 address, 2 result type, 3 parameters, 4 their
+note records in ib, 5 name in ib, 6 name length, 7 stack need, first its own frame); the next record's offset
+fn frec i ulong o ulong to ulong
+b = get nv 0
+if gt add o 48 sub get nv 1 b
+die e_obj 1
+end
+f = mul i 8
+put fr f oq o
+put fr add f 1 oq add o 8
+put fr add f 2 oq add o 16
+np = oq add o 24
+if gt np 6
+die e_slot 1
+end
+put fr add f 3 np
+put fr add f 7 oq add o 32
+if gt get fr add f 7 SMAX
+die e_stk 1
+end
+nl = oq add o 40
+if gt nl 63
+die e_obj 1
+end
+put fr add f 5 add b add o 48
+put fr add f 6 nl
+n = al8 add add o 48 nl
+put fr add f 4 add b n
+n = add n mul np 40
+if gt n sub get nv 1 b
+die e_obj 1
+end
+if eq get fr f 2
+die e_imp 1
+end
+fchk i o
+ret n
+end
+note call record k at object offset o into ck (source, destination, stack cost, instruction offset): the
+note instruction is a BL inside the source function; the next record's offset
+fn crec k ulong o ulong to ulong
+if gt add o 32 sub get nv 1 get nv 0
+die e_obj 1
+end
+nf = get nv 7
+s = oq add o 8
+d = oq add o 16
+if or ge s nf ge d nf
+die e_obj 1
+end
+w = oq o
+csite s w
+if ne brt w get fr add mul d 8 1
+die e_cdst 1
+end
+if eq oq add o 24 0
+die e_call 1
+end
+x = mul k 4
+put ck x s
+put ck add x 1 d
+put ck add x 2 oq add o 24
+put ck add x 3 w
+if gt get ck add x 2 SMAX
+die e_stk 1
+end
+ret add o 32
+end
+note the call instruction at object offset w: aligned, inside function s and a BL
+fn csite s ulong w ulong to void
+if or lt w get fr add mul s 8 1 ne and w 3 0
+die e_call 1
+end
+if ge w fend s
+die e_call 1
+end
+if ne shr ib32 add get nv 0 w 26 37
+die e_call 1
+end
+end
+note the stack each function needs, settled as the linker does: need(f) = max(local(f), cost(call) +
+note need(callee) for each call of f). Each pass lengthens every settled path by one call, so nf + 1 passes
+note settle an acyclic graph; a change in the last pass is a cycle. Values stay at or below SMAX (refused past it).
+fn needs to void
+nf = get nv 7
+for p ulong add nf 1 bound 9223372036854775807
+put nv 18 0
+for k ulong get nv 17 bound 9223372036854775807
+nstep k
+end
+if eq get nv 18 0
+ret
+end
+end
+die e_stk 1
+end
+fn nstep k ulong to void
+x = mul k 4
+d = mul get ck add x 1 8
+v = add get ck add x 2 get fr add d 7
+s = mul get ck x 8
+if gt v SMAX
+die e_stk 1
+end
+if gt v get fr add s 7
+put fr add s 7 v
+put nv 18 1
+end
+end
+note the u32 of ib at o
+fn ib32 o ulong to ulong
+v = ulong 0
+for j ulong 4
+v = or v shl ulong get ib add o j mul j 8
+end
+ret v
+end
+note no use of x7 as a base register except the trap-entry load LDR Xt, [X7, #16]: every instruction of the
+note load/store group (literal loads aside, which have no base register) whose Rn is x7 is refused; another
+note LDR (immediate, 64-bit) offset is e_rt, any other form e_rtw. The wrapper's saved registers sit in the frame
+note x7 points at.
+fn rtscan to void
+b = add get nv 0 176
+n = div sub get nv 8 176 4
+for i ulong n bound 9223372036854775807
+w = ib32 add b mul i 4
+if eq and w 4290773984 4181721312
+if ne and shr w 10 4095 2
+die e_rt 1
+end
+else
+if lsx7 w
+die e_rtw 1
+end
+end
+end
+end
+note w is in the load/store group (op0 x1x0), is not a literal load (011x 0 0), and has base register x7
+fn lsx7 w ulong to bool
+if ne and w 167772160 134217728
+ret false
+end
+if eq and w 989855744 402653184
+ret false
+end
+ret eq and shr w 5 31 7
+end
+fn exbind k ulong to void
+x = mul k 8
+a = get ex x
+n = get ex add x 1
+for i ulong get nv 7 bound 9223372036854775807
+if fnis i a n
+put ex add x 3 i
+ret
+end
+end
+die e_miss 1
+end
+note object function i is exported under the name ib[a, a+n)
+fn fnis i ulong a ulong n ulong to bool
+f = mul i 8
+if or ne get fr f 1 ne get fr add f 6 n
+ret false
+end
+ret same get fr add f 5 a n
+end
+note the extension of a scalar of type ty in register s: UBFX/SBFX X, X, #0, #width (0 none)
+fn extw ty ulong s ulong to ulong
+d = or shl s 5 s
+if le ty 2
+ret or 3544194048 d
+end
+if eq ty 3
+ret or 3544202240 d
+end
+if eq ty 4
+ret or 3544218624 d
+end
+if eq ty 6
+ret or 2470452224 d
+end
+if eq ty 7
+ret or 2470460416 d
+end
+if eq ty 8
+ret or 2470476800 d
+end
+ret 0
+end
+fn isflt ty ulong to bool
+ret or eq ty 10 eq ty 11
+end
+note parameter record o: advances the slot count nv 20; the extension word (0 none). A float scalar is refused;
+note a float view or edit is a pointer in an x register like any other.
+fn pext o ulong to ulong
+ty = q o
+if and eq q add o 8 0 isflt ty
+die e_flt 1
+end
+s = get nv 20
+if eq q add o 8 0
+put nv 20 add s 1
+ret extw ty s
+end
+if eq q add o 16 0
+put nv 20 add s 2
+else
+put nv 20 add s 1
+end
+ret 0
+end
+note the extensions of export k, written from eb offset wa when wr; their count
+fn exts k ulong wr bool wa ulong to ulong
+f = mul get ex add mul k 8 3 8
+if isflt get fr add f 2
+die e_flt 1
+end
+put nv 20 0
+put nv 21 0
+pr = get fr add f 4
+for j ulong get fr add f 3 bound 6
+w = pext add pr mul j 40
+if ne w 0
+n = get nv 21
+if wr
+w32 add wa mul n 4 w
+end
+put nv 21 add n 1
+end
+end
+if gt get nv 20 6
+die e_slot 1
+end
+ret get nv 21
+end
+note STP or LDP (op) of registers r and r + 1 at [sp, #8 * im]
+fn pw op ulong r ulong im ulong to ulong
+a = or shl im 15 shl add r 1 10
+ret or or op a or 992 r
+end
+note the register save area at sp + 32: STP (LDP when back) of x19..x30 and d8..d15, 10 words from p
+fn saves p ulong back bool to void
+xo = ulong 2835349504
+vo = ulong 1828716544
+if back
+xo = ulong 2839543808
+vo = ulong 1832910848
+end
+for i ulong 6
+v = pw xo add 19 mul i 2 add 4 mul i 2
+w32 add p mul i 4 v
+end
+for i ulong 4
+v = pw vo add 8 mul i 2 add 16 mul i 2
+w32 add p mul add i 6 4 v
+end
+end
+note ---- the library
+note export k's wrapper: tx is the trap entry (the shared return follows it at tx + 8), cb the object's code
+fn wrwrap k ulong tx ulong cb ulong to void
+b = mul k 8
+p = get ex add b 5
+w32 p 3506635775
+saves add p 4 false
+wradr add p 44 tx 16
+w32 add p 48 4177529840
+t = get ex add b 2
+wrmov add p 52 0 t 16
+wrmov add p 56 1 shr t 16 16
+w32 add p 60 4177530864
+n = exts k true wrprobe k add p 64
+a = add wrprobe k add p 64 mul n 4
+w32 a 2432697319
+f = mul get ex add b 3 8
+wrb add a 4 add cb sub get fr add f 1 176 2483027968
+wrb add a 8 add tx 8 335544320
+end
+note the stack probe at p when export k's body needs stack: touch one word in each 4 KiB page below the
+note wrapper's lowest store [sp, #16], down past the body's need, top first, so no two touches are more than
+note 4096 bytes apart and a stack too small for the body faults on a 4 KiB guard page before the body runs:
+note ADD X16, SP, #16; MOVZ/MOVK X17, pages; loop: SUB X16, X16, #1, LSL #12; LDR XZR, [X16];
+note SUBS X17, X17, #1; B.NE loop. The next offset.
+fn wrprobe k ulong p ulong to ulong
+g = pgs k
+if eq g 0
+ret p
+end
+w32 p 2432713712
+wrmov add p 4 0 g 17
+wrmov add p 8 1 shr g 16 17
+wrmov add p 12 2 shr g 32 17
+w32 add p 16 3510634000
+w32 add p 20 4181721631
+w32 add p 24 4043310641
+w32 add p 28 1426063265
+ret add p 32
+end
+note the 4 KiB pages export k's probe touches: 0 when its function needs no stack, else the settled need plus
+note the 16 bytes from sp to the wrapper's lowest store, rounded up, so the last touch is at or below sp - need
+fn pgs k ulong to ulong
+f = mul get ex add mul k 8 3 8
+n = get fr add f 7
+if eq n 0
+ret 0
+end
+ret div add n 4111 4096
+end
+note the probe's words for export k: 8, or 0 when the body needs no stack
+fn pwds k ulong to ulong
+if eq pgs k 0
+ret 0
+end
+ret 8
+end
+note the library layout in ly: 0 .hash, 1 its bytes, 2 .dynsym, 3 .dynstr, 4 .text (the trap entry), 5 the
+note object's code, 6 the end of the RX segment, 7 .dynamic (file offset), 8 .dynamic address, 9 .shstrtab,
+note 10 the section headers, 11 symbols
+fn liblay to void
+nx = get nv 3
+dsinit
+put nv 13 dsib get nv 5 get nv 6
+for k ulong nx bound 9223372036854775807
+b = mul k 8
+put ex add b 4 dsib get ex b get ex add b 1
+exbind k
+put ex add b 7 exts k false 0
+w = add 19 pwds k
+put ex add b 6 mul add w get ex add b 7 4
+end
+rtscan
+ns = add nx 1
+put ly 11 ns
+put ly 0 288
+put ly 1 mul add nbk nx add ns 2 4
+put ly 2 al8 add get ly 0 get ly 1
+put ly 3 add get ly 2 mul ns 24
+put ly 4 al16 add get ly 3 get nv 2
+note .text: the trap entry and the shared return (14 words), the wrappers, then the object's code
+wo = add get ly 4 56
+for k ulong nx bound 9223372036854775807
+b = mul k 8
+put ex add b 5 wo
+wo = add wo get ex add b 6
+end
+note the object's code keeps its 16-byte alignment (it starts at 176 in the object)
+put ly 5 al16 wo
+put ly 6 add get ly 5 sub get nv 8 176
+put ly 7 al16 get ly 6
+put ly 8 add get ly 7 65536
+put ly 9 add get ly 7 112
+put ly 10 al8 add get ly 9 len t_shs
+put nv 15 get ly 10
+end
+fn libsyms to void
+wrhash get ly 0 get nv 3 true
+for k ulong get nv 3 bound 9223372036854775807
+b = mul k 8
+o = add get ly 2 mul add k 1 24
+w32 o get ex add b 4
+w8 add o 4 18
+w16 add o 6 4
+w64 add o 8 get ex add b 5
+w64 add o 16 get ex add b 6
+end
+wrstr get ly 3
+end
+fn libtext to void
+tx = get ly 4
+cb = get ly 5
+note trap entry: MOV SP, X0; LDR X0, [SP, #24]; the shared return: restore, ADD SP, SP, #192; RET
+w32 tx 2432696351
+w32 add tx 4 4181725152
+saves add tx 8 true
+w32 add tx 48 2432893951
+w32 add tx 52 3596551104
+for k ulong get nv 3 bound 9223372036854775807
+wrwrap k tx cb
+end
+b = add get nv 0 176
+for i ulong sub get nv 8 176 bound 9223372036854775807
+put eb add cb i get ib add b i
+end
+end
+fn libsecs to void
+o = dyn get ly 7 4 get ly 0
+o = dyn o 5 get ly 3
+o = dyn o 6 get ly 2
+o = dyn o 10 get nv 2
+o = dyn o 11 24
+o = dyn o 14 get nv 13
+o = dyn o 0 0
+wrbytes get ly 9 t_shs
+note sections: names at .hash 1, .dynsym 7, .dynstr 15, .text 23, .dynamic 29, .shstrtab 38
+put nv 16 0
+wrsh 1 1 5 2 get ly 0 get ly 1
+wrshl 1 2 0 8 4
+wrsh 2 7 11 2 get ly 2 mul get ly 11 24
+wrshl 2 3 1 8 24
+wrsh 3 15 3 2 get ly 3 get nv 2
+wrshl 3 0 0 1 0
+wrsh 4 23 1 6 get ly 4 sub get ly 6 get ly 4
+wrshl 4 0 0 16 0
+put nv 16 65536
+wrsh 5 29 6 3 get ly 7 112
+wrshl 5 3 0 8 16
+put nv 16 0
+wrsh 6 38 3 0 get ly 9 len t_shs
+wrshl 6 0 0 1 0
+end
+fn wrlib to void
+liblay
+sh = get ly 10
+ebnew add sh 448
+wrehdr 3 0 4 sh 7
+wrph 0 1 5 0 0 get ly 6
+wrph 1 1 6 get ly 7 get ly 8 112
+wrph 2 2 6 get ly 7 get ly 8 112
+wrph 3 1685382481 6 0 0 0
+note PT_GNU_STACK's alignment (offset 64 + 3 * 56 + 48)
+w64 280 16
+libsyms
+libtext
+libsecs
+end
+note ---- the probe executable (ET_EXEC at 4 MiB)
+note bytes of call k's code
+fn callsz k ulong to ulong
+b = mul k 16
+n = ulong 0
+for j ulong get cl add b 3 bound 6
+if eq get cl add add b 10 j 1
+n = add n 1
+else
+n = add n 4
+end
+end
+ret mul add n 8 4
+end
+note the probe layout in ly: 0 .hash, 1 its bytes, 2 .dynsym, 3 .dynstr, 4 the relocations, 5 the exit block
+note (code), 6 the end of the RX segment, 7 the RW segment's file offset, 8 its address minus the base, 9 the
+note file's length; the base address is 4 MiB; RW holds .dynamic (192 bytes), the GOT, then the 4096-byte buf
+const PBASE ulong 4194304
+note the arguments of call k from offset p; the next offset
+fn wrargs k ulong p ulong to ulong
+b = mul k 16
+bf = add add get ly 8 192 mul get nv 4 8
+for j ulong get cl add b 3 bound 6
+if eq get cl add add b 10 j 1
+wradr p bf j
+p = add p 4
+else
+v = get cl add add b 4 j
+for h ulong 4
+u = shr v mul h 16
+wrmov add p mul h 4 h u j
+end
+p = add p 16
+end
+end
+ret p
+end
+note call k at offset p (LDR X16, GOT[k]; BLR X16; X16 = expect; CMP W0, W16; B.EQ +12; MOVZ X0, #k+1;
+note B exit); the next offset
+fn wrcall1 k ulong p ulong to ulong
+tx = get ly 5
+p = wrargs k p
+wrldr p add add get ly 8 192 mul k 8
+w32 add p 4 3594453504
+e = get cl add mul k 16 2
+wrmov add p 8 0 e 16
+wrmov add p 12 1 shr e 16 16
+w32 add p 16 1796210719
+w32 add p 20 1409286240
+x = add k 1
+if gt x 100
+x = 100
+end
+wrmov add p 24 0 x 0
+wrb add p 28 tx 335544320
+ret add p 32
+end
+note CMP-equal check then exit 250 (B.EQ +12; MOVZ X0, #250; B exit) at p; the next offset
+fn chk250 p ulong cmp ulong to ulong
+w32 p cmp
+w32 add p 4 1409286240
+w32 add p 8 3531611968
+wrb add p 12 get ly 5 335544320
+ret add p 16
+end
+fn calllay to void
+nc = get nv 4
+dsinit
+put nv 13 dsib get nv 5 get nv 6
+put nv 14 dstx t_origin
+r = enlarge cd add nc 1
+if lt r 0
+die e_mem 3
+end
+for k ulong nc bound 9223372036854775807
+b = mul k 16
+put cd k dsib get cl b get cl add b 1
+end
+ns = add nc 1
+note .hash after the interpreter path and its NUL at 344, aligned to 8
+put ly 0 al8 add 345 len t_interp
+put ly 1 mul add nbk nc add ns 2 4
+put ly 2 al8 add get ly 0 get ly 1
+put ly 3 add get ly 2 mul ns 24
+put ly 4 al8 add get ly 3 get nv 2
+put ly 5 al16 add get ly 4 mul nc 24
+note exit block 8, register setup 76, the calls, register checks 10 * 16 + 8 * 20 + 4 + 16, exit 0 8
+cs = ulong 432
+for k ulong nc bound 9223372036854775807
+cs = add cs callsz k
+end
+put ly 6 add get ly 5 cs
+put ly 7 al16 get ly 6
+put ly 8 add get ly 7 65536
+put ly 9 add add add get ly 7 192 mul nc 8 4096
+end
+fn callsyms to void
+nc = get nv 4
+wrhash get ly 0 nc false
+for k ulong nc bound 9223372036854775807
+o = add get ly 2 mul add k 1 24
+w32 o get cd k
+w8 add o 4 18
+end
+wrstr get ly 3
+for k ulong nc bound 9223372036854775807
+o = add get ly 4 mul k 24
+w64 o add PBASE add add get ly 8 192 mul k 8
+w64 add o 8 or shl add k 1 32 1025
+end
+end
+fn calltext to void
+tx = get ly 5
+note exit: MOVZ X8, #94; SVC #0 (exit_group with X0)
+w32 tx 3531606984
+w32 add tx 4 3556769793
+note entry: MOVZ X19..X27 with their numbers; MOV X28, SP; MOVZ X29, #29; FMOV D8..D15 from X19..X26
+p = add tx 8
+for i ulong 9
+r = add 19 i
+wrmov add p mul i 4 0 r r
+end
+w32 add p 36 2432697340
+wrmov add p 40 0 29 29
+for i ulong 8
+w32 add add p 44 mul i 4 or 2657550336 or shl add 19 i 5 add 8 i
+end
+p = add p 76
+for k ulong get nv 4 bound 9223372036854775807
+p = wrcall1 k p
+end
+note CMP Xr, #r for r 19..27 and 29; FMOV X16, Dd and CMP X16, #(d + 11) for d 8..15; MOV X16, SP;
+note CMP X16, X28; MOVZ X0, #0; B exit
+for i ulong 9
+r = add 19 i
+c = or 4043309087 or shl r 10 shl r 5
+p = chk250 p c
+end
+r = ulong 29
+p = chk250 p or 4043309087 or shl r 10 shl r 5
+for i ulong 8
+w32 p or 2657484816 shl add 8 i 5
+p = chk250 add p 4 or 4043309599 shl add 19 i 10
+end
+w32 p 2432697328
+p = chk250 add p 4 3944481311
+w32 p 3531603968
+wrb add p 4 tx 335544320
+end
+fn calldyn to void
+nc = get nv 4
+o = dyn get ly 7 1 get nv 13
+o = dyn o 29 get nv 14
+o = dyn o 4 add PBASE get ly 0
+o = dyn o 5 add PBASE get ly 3
+o = dyn o 6 add PBASE get ly 2
+o = dyn o 10 get nv 2
+o = dyn o 11 24
+o = dyn o 7 add PBASE get ly 4
+o = dyn o 8 mul nc 24
+o = dyn o 9 24
+o = dyn o 30 8
+o = dyn o 0 0
+end
+fn wrcall to void
+calllay
+tot = get ly 9
+ebnew tot
+dof = get ly 7
+dva = add PBASE get ly 8
+wrehdr 2 add add PBASE get ly 5 8 5 0 0
+wrph 0 3 4 344 add PBASE 344 27
+wrph 1 1 5 0 PBASE get ly 6
+wrph 2 1 6 dof dva sub tot dof
+wrph 3 2 6 dof dva 192
+wrph 4 1685382481 6 0 0 0
+note PT_GNU_STACK's alignment (offset 64 + 4 * 56 + 48)
+w64 336 16
+wrbytes 344 t_interp
+callsyms
+calltext
+calldyn
+end
+fn main to int
+if lt argcnt 2
+die e_usage 2
+end
+if argis 1 m_lib
+if ne argcnt 5
+die e_usage 2
+end
+put nv 0 ldf 2 0
+put nv 1 ldf 3 get nv 0
+parse
+objparse
+wrlib
+save 4 int 420
+ret 0
+end
+if argis 1 m_call
+if ne argcnt 4
+die e_usage 2
+end
+put nv 0 ldf 2 0
+put nv 1 get nv 0
+parse
+wrcall
+save 3 int 493
+ret 0
+end
+die e_usage 2
+ret 2
+end
