@@ -197,13 +197,13 @@ case "$step" in
     [ "$rc" -eq 0 ] || exit "$rc"
     grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
-  # CUDA compatibility bridge (bridge/cuda/, moved from CUDApp compat/cuda/): seeded Omega only. c0_check.om is the
+  # CUDA compatibility bridge (bridge/cuda/, one slice of CUDApp compat/: the compat/cuda profile): seeded Omega only. c0_check.om is the
   # profile checker; fixture.om writes the PTX kernel, the link-only libcuda.so.1 stub and synthetic executables;
   # gate.om replays CUDApp's compat/cuda/test.sh and compares its transcript with bridge/cuda/test-sh-84b524ca.txt.
   # The control rebuilds c0_check with its "missing row" refusal removed; the gate must then fail.
   # With BRIDGE_CUDA_CUDAPP (a CUDApp checkout at 84b524ca) and BRIDGE_CUDA_OLDOMC (omc 2c824805...) set, the gate also
   # runs the old test.sh and gcc builds against the Omega stub, and requires oracle=PASS. Hardware stays NOT_RUN.
-  # The check counts are pinned: 27 without the oracle tier, 34 with it (gate.om prints one line per check).
+  # The check counts in want= are pinned, as gpu-units pins its unit count; a change in gate.om's checks changes them here.
   bridge-cuda)
     sha256sum -c --quiet seed/out/omc.sha256 || { echo "BRIDGE-CUDA REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
     rm -rf "$OUT_DIR"; mkdir -p "$OUT_DIR"

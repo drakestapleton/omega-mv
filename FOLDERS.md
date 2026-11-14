@@ -31,7 +31,7 @@ Rules:
 
 ## `bridge/cuda/`
 
-The CUDA compatibility profile moved from CUDApp `compat/cuda/` at `84b524ca`, in Omega only: the profile checker (`c0_check.om`), the frozen profiles, the fixture writer that makes the PTX, the link-only `libcuda.so.1` stub and synthetic executables (`fixture.om`), and the gate (`gate.om`, step `bridge-cuda`) that replays CUDApp's `test.sh`. See its README.
+The CUDA compatibility profile slice: one slice of CUDApp `compat/` at `84b524ca` (its `compat/cuda/` profile), written in Omega only: the profile checker (`c0_check.om`), the frozen profiles, the fixture writer that makes the PTX, the link-only `libcuda.so.1` stub and synthetic executables (`fixture.om`), and the gate (`gate.om`, step `bridge-cuda`) that replays CUDApp's `test.sh`. See its README.
 
 Rules:
 

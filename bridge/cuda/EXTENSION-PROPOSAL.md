@@ -10,7 +10,7 @@ extension exists the generated C stays in CUDApp and is not copied here.
 ## What the in-tree omc emits today
 
 Compiler: `seed/out/omc`, sha256 `26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`
-(omega-mv `2ee0a70d`). Measured 2026-11-14 on spark-b87b (aarch64).
+(omega-mv `2ee0a70d`). Measured 2026-11-14 on an aarch64 Linux host.
 
 Program mode (a unit with `fn main`): a static AArch64 executable.
 
@@ -64,11 +64,11 @@ And the export count is capped: 32 `export fn` compile, the 33rd is `omc: line 9
 |---|---|
 | `ET_DYN` file, position independent, loadable by `ld.so` | no: `ET_EXEC` at fixed addresses, or headerless words |
 | `PT_DYNAMIC` with `DT_SONAME libnvidia-ml.so.1`, `DT_SYMTAB`, `DT_STRTAB`, `DT_HASH`/`DT_GNU_HASH` | no dynamic segment at all |
-| 11 named exports (`nvmlInit_v2` … `nvmlDeviceGetComputeRunningProcesses_v3`), and nothing else exported (the `.map`'s `local: *;`) | exports are unnamed branch slots; at most 32 |
+| The named exports of `libnvidia-ml.map` (`nvmlInit_v2` … `nvmlDeviceGetComputeRunningProcesses_v3`), and nothing else exported (the `.map`'s `local: *;`) | exports are unnamed branch slots, of a number fixed by omc |
 | AAPCS64 calls in: arguments in x0..x7, pointers into the caller's memory, `int32` status returns | the slot calling convention is omc's own; not checked against AAPCS64 |
 | Imports resolved at load: `omega2_nvrm_open_file`, `omega2_nvrm_close_file`, `omega2_nvrm_ioctl` (from the loading process) | a name the unit does not define is error 3 |
 | Process-wide lock around shared state (`note cabi lock NvLock process mutex`; the C uses `pthread_mutex_*`) and per-thread trap recovery (the C uses `_Thread_local` and `setjmp`) | `x = atomic`, `cas`, `futex`, `thread`, `lock`, `syscall` are each `error 3` (unknown name); `seed/omc/omc.om:8129`: "No raw address or arbitrary syscall is exposed to an Omega program." |
-| Writable process state (`NvS` ulong×128, `NvB` 83,296 B, `NvR` ulong×1, `NvT` 2,048 B, `NvO` 96 B: 86,472 bytes) relocated with the library | program mode puts writable data in a `PT_LOAD` at the fixed address `0x10000000` (above); function mode output carries no data segment or relocations |
+| Writable process state (the globals `NvS`, `NvB`, `NvR`, `NvT`, `NvO` of `api.om`, sized there) relocated with the library | program mode puts writable data in a `PT_LOAD` at the fixed address `0x10000000` (above); function mode output carries no data segment or relocations |
 
 ## The extension
 
@@ -107,10 +107,10 @@ show this. The compiler change adds code, relocations and imports to that layout
 ## How it would be accepted
 
 - `api.om` compiled by the new omc gives a library for which `readelf -d` shows
-  `SONAME libnvidia-ml.so.1`, `nm -D --defined-only` lists exactly the 11 exports, and
-  `nm -D --undefined-only` lists exactly the three transport imports.
-- CUDApp's existing NVML caller test (`tests/nvml/nvml_test.c` over the fake resource manager,
-  476 checks) passes against it as it does against the cabi-1 C build.
+  `SONAME libnvidia-ml.so.1`, `nm -D --defined-only` lists exactly the exports of
+  `libnvidia-ml.map`, and `nm -D --undefined-only` lists exactly the three transport imports.
+- CUDApp's existing NVML caller test (`tests/nvml/nvml_test.c` over the fake resource manager)
+  passes against it as it does against the cabi-1 C build.
 - A mutant `api.om` with one export renamed is refused by that comparison.
 - Then `compat/nvml/` is deleted from CUDApp, and the C emitter is no longer on this path.
 
