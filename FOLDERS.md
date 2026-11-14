@@ -50,7 +50,7 @@ Rules:
 
 ## `bridge/shlib/`
 
-AArch64 Linux shared libraries written by Omega alone: `shlib.om` turns omc's object-mode output (`OMOBJ001`) and a table into an ELF shared object (no C compiler, assembler or linker), and writes a probe executable that loads it through the system's dynamic loader. `test.om` is the gate's test unit; `nvml.om` is CUDApp's libnvidia-ml.so.1 export list with stub bodies. `README.md` says what works and what is still missing for real NVML bodies.
+AArch64 Linux shared libraries written by Omega alone: `shlib.om` turns omc's object-mode output (`OMOBJ001`) and a table into an ELF shared object (no C compiler, assembler or linker), and writes a probe executable that loads it through the system's dynamic loader. Libraries can need other libraries, import C functions, keep state between calls and run every call under a lock. `test.om`, `dep.om` and `imp.om` are the gate's test units; `nvml.om` is CUDApp's libnvidia-ml.so.1 with real bodies over `gpu/nvidia/native/nvml/`, and `nvrmfake.om` with `rmfake.om` (CUDApp's RM fake, unchanged) is the transport the gate runs it against. `ampqmd.om` is CUDApp's `src/omega_ampere_qmd.c` as `libomega-ampere-qmd.so.1`. `README.md` says what works and its limits.
 
 Rules:
 
