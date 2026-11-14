@@ -1,20 +1,30 @@
 note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 note gpu/nvidia/driver/gate.om: the gpu-driver gate. It reads the cases the C oracle printed
 note (gpu/nvidia/driver/oracle-cases.tsv: CUDApp 84b524ca nvrm/ and m16/ C, run outside this tree) and
-note recomputes each one with card.om, diag.om and m16.om. For the first case of each kind it also runs a
-note control: the same case with its expected answer changed, which must be caught. Exit 0 is PASS.
+note recomputes each one with card.om, diag.om, m16.om, nvrm.om and eng.om fcls. For the first case of each
+note kind it also runs a control: the same case with its expected answer changed, which must be caught.
+note Exit 0 is PASS.
 note Line kinds, tab separated, numbers decimal, bytes lowercase hex, "-" absent, "e" empty bytes:
 note card HAS BDF CARDS INDEX+1 / cls SM VENDOR DEVICE CLASSES M10 M11 / amem PREV SIZE MEMINFO MESSAGE /
 note chan PREV ATTEMPTS DELAY MEMINFO BUDDYINFO MESSAGE / maps MAPS HIT / name KIND CODE TEXT /
-note wge NOW TIMEOUT T MARKER TARGET RC+1 CLOCK_READS / ret RETIRED PUT UPTO NEWRETIRED. A card record is 9
-note bytes: index, valid, domain u32 LE,
-note bus, slot, function. CLASSES are u32 LE words. In wge the clock reads NOW, then T, then 2^64 - 1.
+note wge NOW TIMEOUT T MARKER TARGET RC+1 CLOCK_READS / ret RETIRED PUT UPTO NEWRETIRED /
+note enq PBSIZE COUNT RC+1 NWORDS (0: not enqueued) / slot HANDLES ARC+1 RC+1 SLOT (the slot count: none) /
+note cput NEXTRA PUT0 PUT1 PUT2 PUT3 CH RESULT / cret NEXTRA CH RETIRED1 PUT1 RETIRED2 PUT2 RETIRED3 PUT3 UPTO
+note NEWRETIRED1 NEWRETIRED2 NEWRETIRED3 / copy DIR NOBUF FAULTED OFF BYTES HANDLE VA SIZE CPU ROWS RC+1 MSG /
+note alloc VRAM DISCRETE SM FAULTED LIVECOUNT CAP SIZE RC+1 CODE VASIZE / vinfo DISCRETE IORC STATUS TOTAL FREE
+note RC+1 CODE OUTFREE OUTTOTAL / fcls RESULT KIND LAST EXPECTED MARKER2 MARKER2WANT PROGRESS CLASS.
+note A card record is 9 bytes: index, valid, domain u32 LE, bus, slot, function. CLASSES and HANDLES are u32
+note LE words. ROWS are live rows of 7 u64 LE: handle, va, size, cpu, cpu_live, rm_live, quarantined (cpu as an
+note offset from one buffer, as is CPU). alloc CODE: 0 none, 1 SM86, 2 size, 3 table full, 4 VA exhausted (the
+note oracle's va_take answers 0, so a case that passes every check ends there with VASIZE the size it asked
+note for). vinfo CODE: 0 none, 1 errno or status, 2 invalid heap information. fcls CLASS: 0 wrong_marker,
+note 1 late_progress, 2 no_progress. In wge the clock reads NOW, then T, then 2^64 - 1.
 note Lines starting with # are notes. One line is read into a 65536-byte array (an Omega array's size is fixed
 note when it is compiled), so a longer line is refused by name, never cut. Arrays are passed as arguments, so
 note they are main's locals: l line, d decoded fields,
 note c card table, u class words, o recomputed message.
 
-text gt_k "card|cls|amem|chan|maps|name|wge|ret|"
+text gt_k "card|cls|amem|chan|maps|name|wge|ret|enq|slot|cput|cret|copy|alloc|vinfo|fcls|"
 text gt_mf "MemFree"
 text gt_ma "MemAvailable"
 text gt_use "usage: gate ORACLE-CASES.tsv\n"
@@ -39,7 +49,7 @@ global g_fs ulong 16
 global g_fe ulong 16
 global g_ds ulong 8
 global g_dl ulong 8
-global g_kc ulong 8
+global g_kc ulong 16
 note g_n: 0 decode top, 1 control on, 2 fields, 3 line number, 4 cases, 5 fails, 6 controls, 7 caught,
 note 8 malformed lines, 9 clock reads, 10 clock NOW, 11 clock T
 global g_n ulong 16
@@ -336,6 +346,199 @@ got = drv_retire fdec 1 l fdec 2 l fdec 3 l
 ret eq got add fdec 4 l get g_n 1
 end
 
+note m16_native_enqueue_methods with nvrm_enqueue answering 0: RC+1 1 and NWORDS = COUNT when drv_enqok
+fn henq l view uchar 65536 to bool
+cnt = fdec 2 l
+rc = ulong 0
+nw = ulong 0
+if drv_enqok cnt fdec 1 l
+rc = ulong 1
+nw = cnt
+end
+if ne rc add fdec 3 l get g_n 1
+ret false
+end
+ret eq nw fdec 4 l
+end
+
+note m16_native_alloc_memory: drv_slot over the handles, then nvrm_alloc's answer ARC decides RC
+fn hslot l view uchar 65536 d edit uchar 65536 u edit uint 16384 to bool
+if not fhex 1 0 l d
+ret false
+end
+n = div get g_dl 0 4
+for i ulong n bound 16384
+put u i uint gu32 add get g_ds 0 mul i 4 d
+end
+s = drv_slot part u 0 n
+if ne s add fdec 4 l get g_n 1
+ret false
+end
+rc = ulong 0
+if and lt s n eq fdec 2 l 1
+rc = ulong 1
+end
+ret eq rc fdec 3 l
+end
+
+note nvrm_chan_put: PUT0 for the main channel, PUT(ch) for an extra one, 0 for no channel. A line carries
+note three extra puts, so NEXTRA above 3 is malformed.
+fn hcput l view uchar 65536 to bool
+nx = fdec 1 l
+if gt nx 3
+gbad
+ret false
+end
+ch = fdec 6 l
+s = drv_chan ch nx
+got = ulong 0
+if eq s 0
+got = fdec 2 l
+end
+if eq s 1
+got = fdec add 2 ch l
+end
+ret eq got add fdec 7 l get g_n 1
+end
+
+note nvrm_chan_retire: only the entry ch names moves, by drv_retire; the others keep their retired count
+fn hcret l view uchar 65536 to bool
+nx = fdec 1 l
+if gt nx 3
+gbad
+ret false
+end
+ch = fdec 2 l
+s = drv_chan ch nx
+up = fdec 9 l
+for i ulong 3
+want = fdec add 3 mul i 2 l
+if and eq s 1 eq add i 1 ch
+want = drv_retire want fdec add 4 mul i 2 l up
+end
+if eq i 0
+want = add want get g_n 1
+end
+if ne want fdec add 10 i l
+ret false
+end
+end
+ret true
+end
+
+note the little-endian u64 at d[q]
+fn gu64 q ulong d view uchar 65536 to ulong
+ret or gu32 q d shl gu32 add q 4 d 32
+end
+
+note true when one of the live rows decoded into d is the allocation m (drv_lrow)
+fn glive d view uchar 65536 m view ulong 4 to bool
+a = new ulong 7 0
+for r ulong div get g_dl 0 56 bound 65536
+q = add get g_ds 0 mul r 56
+for j ulong 7
+put a j gu64 add q mul j 8 d
+end
+if drv_lrow a m
+ret true
+end
+end
+ret false
+end
+
+note nvrm_copy_to and nvrm_copy_from up to the byte copy: glive, then drv_copy;
+note 0 is RC+1 1 with no message, 1 RC+1 0 with no message, 2 RC+1 0 with the message
+fn hcopy l view uchar 65536 d edit uchar 65536 to bool
+m = new ulong 4 0
+for j ulong 4
+put m j fdec add 6 j l
+end
+if not fhex 10 0 l d
+ret false
+end
+live = glive d m
+st = drv_copy eq fdec 2 l 0 ne fdec 3 l 0 fdec 4 l fdec 5 l get m 2 live
+rc = ulong 0
+if eq st 0
+rc = ulong 1
+end
+if ne rc add fdec 11 l get g_n 1
+ret false
+end
+ret eq bv eq st 2 fdec 12 l
+end
+
+note nvrm_alloc_vram (VRAM 1) and alloc_with_cacheability up to va_take: the first check that refuses gives
+note CODE; a case that passes every check asks va_take for drv_asize's size (CODE 4, the oracle's va_take
+note answers 0). RC+1 is 0 on every line.
+fn halloc l view uchar 65536 to bool
+code = ulong 0
+vs = ulong 0
+if and eq fdec 1 l 1 not drv_vramok ne fdec 2 l 0 fdec 3 l
+code = ulong 1
+end
+if eq code 0
+vs = drv_asize ne fdec 4 l 0 fdec 7 l
+if eq vs 0
+code = ulong 2
+end
+end
+if eq code 0
+if drv_livefull fdec 5 l fdec 6 l
+code = ulong 3
+vs = ulong 0
+end
+end
+if eq code 0
+code = ulong 4
+end
+if ne code add fdec 9 l get g_n 1
+ret false
+end
+if ne fdec 8 l 0
+ret false
+end
+ret eq vs fdec 10 l
+end
+
+note nvrm_vram_info: drv_vinfo; on 0 the call returns the heap's free and total bytes, otherwise it leaves
+note the caller's two numbers (7 in the oracle) alone
+fn hvinfo l view uchar 65536 to bool
+t = fdec 4 l
+f = fdec 5 l
+st = drv_vinfo ne fdec 1 l 0 fdec 2 l fdec 3 l t f
+rc = ulong 0
+code = ulong 0
+of = ulong 7
+ot = ulong 7
+if eq st 0
+rc = ulong 1
+of = f
+ot = t
+end
+if or eq st 1 eq st 2
+code = st
+end
+if ne rc add fdec 6 l get g_n 1
+ret false
+end
+if ne code fdec 7 l
+ret false
+end
+ret and eq of fdec 8 l eq ot fdec 9 l
+end
+
+note m16_gpu_wait_failure_class, C branch: eng.om fcls with the report in m[1] to m[7]
+fn hfcls l view uchar 65536 to bool
+m = new ulong 24 0
+for j ulong 7
+put m add j 1 fdec add 1 j l
+end
+w = new ulong 16 0
+fcls m w
+ret eq get w 0 add fdec 8 l get g_n 1
+end
+
 note fields a line of kind k has
 fn gnf k ulong to ulong
 if or eq k 0 eq k 2
@@ -350,18 +553,30 @@ end
 if eq k 5
 ret 4
 end
-if eq k 7
+if or eq k 7 or eq k 8 eq k 9
 ret 5
 end
+if or eq k 6 eq k 10
 ret 8
 end
+if or eq k 11 eq k 12
+ret 13
+end
+if eq k 13
+ret 11
+end
+if eq k 14
+ret 10
+end
+ret 9
+end
 
-note kind of field 0 (index of its piece in gt_k), or 8 when it names none
+note kind of field 0 (index of its piece in gt_k), or 16 when it names none
 fn gkind l view uchar 65536 to ulong
 s = get g_fs 0
 n = sub get g_fe 0 s
 i = ulong 0
-for k ulong 8
+for k ulong 16
 st = i
 while ne get gt_k i 124 bound 16
 i = add i 1
@@ -379,7 +594,7 @@ end
 end
 i = add i 1
 end
-ret 8
+ret 16
 end
 
 fn hrun k ulong l view uchar 65536 d edit uchar 65536 c edit uchar 4608 u edit uint 16384 o edit uchar 65536 to bool
@@ -405,7 +620,31 @@ end
 if eq k 6
 ret hwge l
 end
+if eq k 7
 ret hret l
+end
+if eq k 8
+ret henq l
+end
+if eq k 9
+ret hslot l d u
+end
+if eq k 10
+ret hcput l
+end
+if eq k 11
+ret hcret l
+end
+if eq k 12
+ret hcopy l d
+end
+if eq k 13
+ret halloc l
+end
+if eq k 14
+ret hvinfo l
+end
+ret hfcls l
 end
 
 note split l[0, n) into fields at tabs; false when it has more than 16
@@ -463,10 +702,10 @@ bad = get g_n 8
 if not gsplit n l
 gbad
 end
-k = ulong 8
+k = ulong 16
 if eq get g_n 8 bad
 k = gkind l
-if or eq k 8 ne get g_n 2 gnf k
+if or eq k 16 ne get g_n 2 gnf k
 gbad
 end
 end
@@ -505,7 +744,7 @@ end
 
 fn gsummary to int
 fl = add get g_n 5 get g_n 8
-for k ulong 8
+for k ulong 16
 if eq get g_kc k 0
 fl = add fl 1
 r = write 1 gt_none 0 len gt_none
