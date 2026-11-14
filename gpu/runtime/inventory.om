@@ -1,0 +1,838 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/runtime/inventory.om: the inventory of CUDApp src/ against this repository, in seeded Omega (OM-2 program
+note mode, Linux AArch64). Build from the repository root (seed/ng/sha256.om supplies sh_dat, sh_blk, sh_out;
+note gpu/runtime/zsha.om the streaming hash):
+note   { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/inventory.om; } | seed/out/omc > inventory
+note Run from the repository root: inventory [DIR]   (DIR defaults to gpu/runtime)
+note Inputs, all in DIR, made outside the tree by the commands in gpu/runtime/README.md:
+note   cudapp-src.sha256.txt   sha256sum lines (64 hex, two spaces, path) of every file under CUDApp src/
+note   omega-base.sha256.txt   sha256sum lines of every file under src/ and gpu/ of this repository at the base
+note   cudapp-ident.txt        every CUDApp src/*.ident record, concatenated: the Omega Bridge provenance lines
+note   pathmap.tsv             FROM TAB TO: a CUDApp Omega path starting FROM lives in this tree at TO then the rest
+note   rewrites.tsv            CUDAPP-PATH TAB OMEGA-PATH: a CUDApp file without an ident record rewritten in Omega here
+note A line of pathmap.tsv or rewrites.tsv starting with # is a comment; an empty line is skipped.
+note Output on stdout, one row per CUDApp file in list order: PATH KIND OMEGA_SRC ORIGIN OMEGA DETAIL, tab separated.
+note   KIND       the file name's extension (c, h, inc, ident, ...)
+note   OMEGA_SRC  identical | diverged | cudapp-only: this repository's file at the same path, from the base list;
+note              the file in the tree is hashed and must still match the base list (cudapp-only: must not exist)
+note   ORIGIN     record (an .ident file) | bridge (its sha256 is the c= or h= of an ident record, so the Omega
+note              Bridge emitted it from Omega source) | unrecorded (no ident record names it: written by hand,
+note              or emitted by a CUDApp generator that writes no ident record)
+note   OMEGA      bridge: same (every source part is in this tree and the parts compose to the record's src=
+note              sha256), changed (all parts here, another composition), absent (a part is not here);
+note              unrecorded: rewritten (rewrites.tsv names an Omega file that exists here), rewrite-missing, none;
+note              record: -
+note An omega-ident record composes its parts each followed by a newline (CUDApp om/units.sh); an
+note omega-native-ident record (parts joined by +) composes them with nothing between.
+note Then summary lines starting with #. Exit 0, 2 bad usage, 3 an input is malformed, a tree file differs from the
+note base list or a cudapp-only path exists in the tree (the list is stale: regenerate it), 4 the host refused memory.
+note Every input is length-checked.
+note Memory grows with the input (run-time pools); the one fixed buffer is a path of PATH_MAX (4096) bytes.
+text iv_dflt "gpu/runtime"
+text iv_fsrc "/cudapp-src.sha256.txt"
+text iv_fbase "/omega-base.sha256.txt"
+text iv_fid "/cudapp-ident.txt"
+text iv_fmap "/pathmap.tsv"
+text iv_frw "/rewrites.tsv"
+text iv_hdr "path\tkind\tomega_src\torigin\tomega\tdetail\n"
+text iv_kid "ident"
+text iv_kc "c"
+text iv_kh "h"
+text iv_kinc "inc"
+text iv_knat "omega-native-ident "
+text iv_kunit "unit="
+text iv_ksrc "src="
+text iv_kpath "path="
+text iv_identical "identical"
+text iv_diverged "diverged"
+text iv_conly "cudapp-only"
+text iv_record "record"
+text iv_bridge "bridge"
+text iv_unrec "unrecorded"
+text iv_same "same"
+text iv_changed "changed"
+text iv_absent "absent"
+text iv_rewritten "rewritten"
+text iv_rwmiss "rewrite-missing"
+text iv_none "none"
+text iv_dash "-"
+text iv_s_rows "# rows="
+text iv_s_rec " record="
+text iv_s_br " bridge="
+text iv_s_bs " bridge_same="
+text iv_s_bc " bridge_changed="
+text iv_s_ba " bridge_absent="
+text iv_s_hd " unrecorded="
+text iv_s_hr " unrecorded_rewritten="
+text iv_s_hm " unrecorded_rewrite_missing="
+text iv_s_hn " unrecorded_none="
+text iv_s_id "# omega_src identical="
+text iv_s_dv " diverged="
+text iv_s_co " cudapp_only="
+text iv_s_rem "# unrecorded_none by kind c="
+text iv_s_rh " h="
+text iv_s_ri " inc="
+text iv_s_ro " other="
+text iv_s_rd "# unrecorded_none by omega_src identical="
+text iv_e_usage "usage: inventory [DIR] (run from the repository root)\n"
+text iv_e_read "inventory: cannot read "
+text iv_e_list "inventory: malformed sha256 list line in "
+text iv_e_tab "inventory: malformed row (FROM TAB TO) in "
+text iv_e_drift "inventory: tree file differs from omega-base.sha256.txt (regenerate the list): "
+text iv_e_new "inventory: tree file is not in omega-base.sha256.txt (regenerate the list): "
+text iv_e_part "inventory: cannot read Omega source part "
+text iv_e_mem "inventory: the host refused memory\n"
+text iv_e_long "inventory: a path is longer than 4095 bytes\n"
+text iv_e_rec "inventory: an ident record has no unit=, src= or path= value of the expected form\n"
+global iv_t uchar *
+global iv_o uchar *
+global iv_x ulong *
+global iv_bl ulong *
+global iv_pa uchar 4096
+global iv_dir uchar 4096
+global iv_n ulong 64
+note iv_n: 0 path length, 1 dir length, 2 iv_t used, 3 iv_o used, 4..13 input ranges [s,e) of src, base, ident,
+note pathmap, rewrites; 14 hash fill, 15 hash total; 16, 17 a token value [s,e); 18 a part is absent;
+note 19 iv_x entries, 20 rows, 21 record, 22 bridge, 23 same, 24 changed, 25 absent, 26 unrecorded, 27 rewritten,
+note 28 rewrite-missing, 29 unrecorded none, 30 identical, 31 diverged, 32 cudapp-only, 33..36 unrecorded none c h
+note inc other, 37..39 unrecorded none identical diverged cudapp-only, 40 iv_bl entries, 41 parts emitted
+const IV_NONE ulong 9223372036854775808
+note ---- failure
+fn die t view uchar * code int to void
+r = write 2 t 0 len t
+exit code
+end
+note die naming the path in iv_pa
+fn diepa t view uchar * to void
+r = write 2 t 0 len t
+r = write 2 iv_pa 0 get iv_n 0
+q = new uchar 1 10
+r = write 2 q 0 1
+exit 3
+end
+note ---- output pool
+fn oc c ulong to void
+n = get iv_n 3
+if ge n len iv_o
+r = enlarge iv_o add mul n 2 65536
+if ne r 0
+die iv_e_mem 4
+end
+end
+put iv_o n uchar c
+put iv_n 3 add n 1
+end
+fn ot t view uchar * to void
+for i ulong len t bound 4096
+oc ulong get t i
+end
+end
+fn otr a ulong b ulong to void
+for i ulong sub b a bound 9223372036854775807
+oc ulong get iv_t add a i
+end
+end
+fn opa to void
+for i ulong get iv_n 0 bound 4096
+oc ulong get iv_pa i
+end
+end
+fn onum v ulong to void
+if ge v 10
+onum div v 10
+end
+oc add 48 rem v 10
+end
+fn oflush to void
+n = get iv_n 3
+o = ulong 0
+while lt o n bound 9223372036854775807
+x = write 1 iv_o o sub n o
+if le x 0
+exit 3
+end
+o = add o ulong x
+end
+put iv_n 3 0
+end
+note ---- paths: iv_pa[0, iv_n 0)
+fn pclr to void
+put iv_n 0 0
+end
+fn pc c ulong to void
+n = get iv_n 0
+if ge n 4095
+die iv_e_long 3
+end
+put iv_pa n uchar c
+put iv_n 0 add n 1
+end
+fn pt t view uchar * to void
+for i ulong len t bound 4096
+pc ulong get t i
+end
+end
+fn ptr a ulong b ulong to void
+for i ulong sub b a bound 9223372036854775807
+pc ulong get iv_t add a i
+end
+end
+note DIR then a file name
+fn pdir t view uchar * to void
+pclr
+for i ulong get iv_n 1 bound 4096
+pc ulong get iv_dir i
+end
+pt t
+end
+fn popen to int
+r = fopen iv_pa 0 get iv_n 0 int 524288 int 0
+if lt r 0
+ret -1
+end
+ret int r
+end
+note ---- input pool: append the file at iv_pa to iv_t; slot k gets its start, k+1 its end
+fn tload k ulong to void
+fd = popen
+if lt fd 0
+diepa iv_e_read
+end
+s = get iv_n 2
+n = s
+while true bound 9223372036854775807
+if ge add n 65536 len iv_t
+r = enlarge iv_t add mul len iv_t 2 131072
+if ne r 0
+die iv_e_mem 4
+end
+end
+x = read fd iv_t n sub len iv_t n
+if lt x 0
+diepa iv_e_read
+end
+if eq x 0
+break
+end
+n = add n ulong x
+end
+r = fclose fd
+put iv_n 2 n
+put iv_n k s
+put iv_n add k 1 n
+end
+note ---- bytes of iv_t
+fn eol p ulong e ulong to ulong
+q = p
+while lt q e bound 9223372036854775807
+if eq get iv_t q 10
+ret q
+end
+q = add q 1
+end
+ret e
+end
+note first index of byte c in [p, e), or e
+fn tfind p ulong e ulong c ulong to ulong
+q = p
+while lt q e bound 9223372036854775807
+if eq ulong get iv_t q c
+ret q
+end
+q = add q 1
+end
+ret e
+end
+fn teq a ulong b ulong n ulong to bool
+for i ulong n bound 9223372036854775807
+if ne get iv_t add a i get iv_t add b i
+ret false
+end
+end
+ret true
+end
+note iv_t[a, a+n) equals the text t
+fn tteq a ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get iv_t add a i get t i
+ret false
+end
+end
+ret true
+end
+note iv_t at a starts with the text t, inside [a, e)
+fn tpre a ulong e ulong t view uchar * to bool
+if lt sub e a len t
+ret false
+end
+ret tteq a len t t
+end
+note iv_t[a, a+n) equals iv_pa
+fn tpaeq a ulong n ulong to bool
+if ne n get iv_n 0
+ret false
+end
+for i ulong n bound 4096
+if ne get iv_t add a i get iv_pa i
+ret false
+end
+end
+ret true
+end
+fn ishex c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+ret and ge c 97 le c 102
+end
+note ---- sha256sum lists: a line is 64 lowercase hex, two spaces, a path of at least one byte
+fn lineok p ulong q ulong to bool
+if lt sub q p 67
+ret false
+end
+for i ulong 64
+if not ishex get iv_t add p i
+ret false
+end
+end
+ret and eq get iv_t add p 64 32 eq get iv_t add p 65 32
+end
+note check every line of list k (slots k, k+1); a list that is not newline-terminated is malformed
+fn listok k ulong nm view uchar * to void
+p = get iv_n k
+e = get iv_n add k 1
+while lt p e bound 9223372036854775807
+q = eol p e
+if or eq q e not lineok p q
+pdir nm
+diepa iv_e_list
+end
+p = add q 1
+end
+end
+note index the base list: iv_bl holds line starts
+fn blindex to void
+p = get iv_n 6
+e = get iv_n 7
+n = ulong 0
+while lt p e bound 9223372036854775807
+if ge n len iv_bl
+r = enlarge iv_bl add mul n 2 4096
+if ne r 0
+die iv_e_mem 4
+end
+end
+put iv_bl n p
+n = add n 1
+p = add eol p e 1
+end
+put iv_n 40 n
+end
+note the base-list line whose path is iv_t[a, b), or IV_NONE
+fn bfind a ulong b ulong to ulong
+e = get iv_n 7
+for j ulong get iv_n 40 bound 9223372036854775807
+p = get iv_bl j
+q = eol p e
+if eq sub q add p 66 sub b a
+if teq add p 66 a sub b a
+ret p
+end
+end
+end
+ret IV_NONE
+end
+note the base-list line whose path is iv_pa, or IV_NONE
+fn bfindpa to ulong
+e = get iv_n 7
+for j ulong get iv_n 40 bound 9223372036854775807
+p = get iv_bl j
+q = eol p e
+if tpaeq add p 66 sub q add p 66
+ret p
+end
+end
+ret IV_NONE
+end
+note ---- ident records: iv_x holds (hash offset, record line start) for every c= and h= value
+fn xadd h ulong ls ulong to void
+n = get iv_n 19
+if ge add n 1 len iv_x
+r = enlarge iv_x add mul n 2 4096
+if ne r 0
+die iv_e_mem 4
+end
+end
+put iv_x n h
+put iv_x add n 1 ls
+put iv_n 19 add n 2
+end
+note a token at q (up to the next space or e) that is c= or h= then 64 hex
+fn xtok q ulong e ulong ls ulong to void
+c = get iv_t q
+if not or eq c 99 eq c 104
+ret
+end
+if lt sub e q 66
+ret
+end
+if ne get iv_t add q 1 61
+ret
+end
+t = tfind q e 32
+if ne sub t q 66
+ret
+end
+xadd add q 2 ls
+end
+fn xindex to void
+p = get iv_n 8
+e = get iv_n 9
+while lt p e bound 9223372036854775807
+q = eol p e
+a = p
+while lt a q bound 9223372036854775807
+b = tfind a q 32
+xtok a b p
+a = add b 1
+end
+p = add q 1
+end
+end
+note the record line whose c= or h= is iv_t[h, h+64), or IV_NONE
+fn xfind h ulong to ulong
+for j ulong div get iv_n 19 2 bound 9223372036854775807
+if teq get iv_x mul j 2 h 64
+ret get iv_x add mul j 2 1
+end
+end
+ret IV_NONE
+end
+note the value of the token KEY... in the record line [ls, le) into slots 16, 17; false when absent
+fn tokval ls ulong lz ulong kw view uchar * to bool
+a = ls
+while lt a lz bound 9223372036854775807
+b = tfind a lz 32
+if tpre a b kw
+put iv_n 16 add a len kw
+put iv_n 17 b
+ret true
+end
+a = add b 1
+end
+ret false
+end
+note ---- hash the file at iv_pa into the gpu/runtime/zsha.om stream; false when unreadable
+fn zfile to bool
+fd = popen
+if lt fd 0
+ret false
+end
+ok = zfd fd
+r = fclose fd
+ret ok
+end
+note sh_dig equals the hex at iv_t[p, p+64)
+fn digeq p ulong to bool
+for j ulong 32
+b = get sh_dig j
+if ne get iv_t add p mul j 2 sh_hexd uint shr b 4
+ret false
+end
+if ne get iv_t add p add mul j 2 1 sh_hexd uint and b 15
+ret false
+end
+end
+ret true
+end
+note ---- tables (pathmap, rewrites): FROM TAB TO rows
+fn rowskip p ulong q ulong to bool
+if eq p q
+ret true
+end
+ret eq get iv_t p 35
+end
+note check every row of table k: a tab with bytes on both sides, newline-terminated
+fn tabok k ulong nm view uchar * to void
+p = get iv_n k
+e = get iv_n add k 1
+while lt p e bound 9223372036854775807
+q = eol p e
+if eq q e
+pdir nm
+diepa iv_e_tab
+end
+if not rowskip p q
+t = tfind p q 9
+if or or eq t q eq t p eq add t 1 q
+pdir nm
+diepa iv_e_tab
+end
+end
+p = add q 1
+end
+end
+note map the CUDApp Omega path iv_t[a, b) into iv_pa by the first pathmap row whose FROM it starts with
+fn pmap a ulong b ulong to void
+pclr
+p = get iv_n 10
+e = get iv_n 11
+while lt p e bound 9223372036854775807
+q = eol p e
+if not rowskip p q
+t = tfind p q 9
+if le sub t p sub b a
+if teq p a sub t p
+ptr add t 1 q
+ptr add a sub t p b
+ret
+end
+end
+end
+p = add q 1
+end
+ptr a b
+end
+note ---- one bridge record: its parts
+note the parts of record [ls, le) into slots 16, 17 (after unit=... or as is); false for a malformed record
+fn partsof ls ulong lz ulong to bool
+if not tokval ls lz iv_kpath
+ret false
+end
+if tpre ls lz iv_knat
+ret true
+end
+s = get iv_n 16
+e = get iv_n 17
+q = tfind s e 61
+if lt q e
+put iv_n 16 add q 1
+end
+ret true
+end
+note one part [a, b), mode 0 check presence and the base digest, 1 hash, 2 print
+fn part1 a ulong b ulong mode ulong nat bool to void
+pmap a b
+if eq mode 0
+f = bfindpa
+if eq f IV_NONE
+put iv_n 18 1
+ret
+end
+zbeg
+if not zfile
+diepa iv_e_part
+end
+zend
+if not digeq f
+diepa iv_e_drift
+end
+ret
+end
+if eq mode 1
+if not zfile
+diepa iv_e_part
+end
+if not nat
+zbyte 10
+end
+ret
+end
+if ne get iv_n 41 0
+oc 44
+end
+opa
+put iv_n 41 add get iv_n 41 1
+end
+note every part of record [ls, le) in mode
+fn parts ls ulong lz ulong mode ulong to void
+if not partsof ls lz
+die iv_e_rec 3
+end
+nat = tpre ls lz iv_knat
+sep = ulong 44
+if nat
+sep = 43
+end
+s = get iv_n 16
+e = get iv_n 17
+if eq s e
+die iv_e_rec 3
+end
+put iv_n 41 0
+a = s
+while lt a e bound 9223372036854775807
+b = tfind a e sep
+part1 a b mode nat
+a = add b 1
+end
+end
+note OMEGA and DETAIL of a bridge file whose record line starts at ls
+fn bridge ls ulong to void
+e = get iv_n 9
+lz = eol ls e
+put iv_n 18 0
+parts ls lz 0
+st = ulong 0
+if eq get iv_n 18 0
+zbeg
+parts ls lz 1
+zend
+if not tokval ls lz iv_ksrc
+die iv_e_rec 3
+end
+if or ne sub get iv_n 17 get iv_n 16 64 not digeq get iv_n 16
+st = 1
+end
+else
+st = 2
+end
+if eq st 0
+ot iv_same
+put iv_n 23 add get iv_n 23 1
+end
+if eq st 1
+ot iv_changed
+put iv_n 24 add get iv_n 24 1
+end
+if eq st 2
+ot iv_absent
+put iv_n 25 add get iv_n 25 1
+end
+oc 9
+if not tokval ls lz iv_kunit
+die iv_e_rec 3
+end
+otr get iv_n 16 get iv_n 17
+oc 58
+parts ls lz 2
+end
+note ---- files without an ident record
+note OMEGA and DETAIL of an unrecorded file at path [a, b), kind slot ks, omega_src slot os
+fn unrec a ulong b ulong ks ulong os ulong to void
+p = get iv_n 12
+e = get iv_n 13
+while lt p e bound 9223372036854775807
+q = eol p e
+if not rowskip p q
+t = tfind p q 9
+if eq sub t p sub b a
+if teq p a sub t p
+pclr
+ptr add t 1 q
+fd = popen
+if lt fd 0
+ot iv_rwmiss
+put iv_n 28 add get iv_n 28 1
+else
+r = fclose fd
+ot iv_rewritten
+put iv_n 27 add get iv_n 27 1
+end
+oc 9
+opa
+ret
+end
+end
+end
+p = add q 1
+end
+ot iv_none
+oc 9
+ot iv_dash
+put iv_n 29 add get iv_n 29 1
+put iv_n ks add get iv_n ks 1
+put iv_n os add get iv_n os 1
+end
+note ---- the tree file at path [a, b) against its base digest at iv_t f (IV_NONE: the base has no such file)
+fn treeok a ulong b ulong f ulong to void
+pclr
+ptr a b
+if eq f IV_NONE
+fd = popen
+if ge fd 0
+r = fclose fd
+diepa iv_e_new
+end
+ret
+end
+zbeg
+if not zfile
+diepa iv_e_drift
+end
+zend
+if not digeq f
+diepa iv_e_drift
+end
+end
+note ---- one CUDApp file: the list line [p, q)
+fn bump k ulong to void
+put iv_n k add get iv_n k 1
+end
+note the kind of path [a, b): the bytes after the last dot of the file name, into slots 16, 17
+fn kindof a ulong b ulong to void
+d = b
+q = a
+while lt q b bound 9223372036854775807
+c = get iv_t q
+if eq c 47
+d = b
+end
+if eq c 46
+d = q
+end
+q = add q 1
+end
+if eq d b
+put iv_n 16 b
+else
+put iv_n 16 add d 1
+end
+put iv_n 17 b
+end
+fn kslot ks ulong ke ulong to ulong
+if tteq ks sub ke ks iv_kc
+ret 33
+end
+if tteq ks sub ke ks iv_kh
+ret 34
+end
+if tteq ks sub ke ks iv_kinc
+ret 35
+end
+ret 36
+end
+fn row p ulong q ulong to void
+a = add p 66
+bump 20
+otr a q
+oc 9
+kindof a q
+ks = get iv_n 16
+ke = get iv_n 17
+otr ks ke
+oc 9
+f = bfind a q
+treeok a q f
+os = ulong 39
+if eq f IV_NONE
+ot iv_conly
+bump 32
+else
+if teq f p 64
+ot iv_identical
+bump 30
+os = 37
+else
+ot iv_diverged
+bump 31
+os = 38
+end
+end
+oc 9
+if tteq ks sub ke ks iv_kid
+ot iv_record
+oc 9
+ot iv_dash
+oc 9
+ot iv_dash
+bump 21
+oc 10
+ret
+end
+ls = xfind p
+if ne ls IV_NONE
+ot iv_bridge
+oc 9
+bump 22
+bridge ls
+oc 10
+ret
+end
+ot iv_unrec
+oc 9
+bump 26
+unrec a q kslot ks ke os
+oc 10
+end
+note ---- summary
+fn okv t view uchar * k ulong to void
+ot t
+onum get iv_n k
+end
+fn summary to void
+okv iv_s_rows 20
+okv iv_s_rec 21
+okv iv_s_br 22
+okv iv_s_bs 23
+okv iv_s_bc 24
+okv iv_s_ba 25
+okv iv_s_hd 26
+okv iv_s_hr 27
+okv iv_s_hm 28
+okv iv_s_hn 29
+oc 10
+okv iv_s_id 30
+okv iv_s_dv 31
+okv iv_s_co 32
+oc 10
+okv iv_s_rem 33
+okv iv_s_rh 34
+okv iv_s_ri 35
+okv iv_s_ro 36
+oc 10
+okv iv_s_rd 37
+okv iv_s_dv 38
+okv iv_s_co 39
+oc 10
+end
+fn main to int
+if gt argcnt 2
+die iv_e_usage 2
+end
+if eq argcnt 2
+r = argread 1 iv_dir 0 4000
+if lt r 1
+die iv_e_usage 2
+end
+put iv_n 1 ulong r
+else
+for i ulong len iv_dflt
+put iv_dir i get iv_dflt i
+end
+put iv_n 1 len iv_dflt
+end
+pdir iv_fsrc
+tload 4
+pdir iv_fbase
+tload 6
+pdir iv_fid
+tload 8
+pdir iv_fmap
+tload 10
+pdir iv_frw
+tload 12
+listok 4 iv_fsrc
+listok 6 iv_fbase
+tabok 10 iv_fmap
+tabok 12 iv_frw
+blindex
+xindex
+ot iv_hdr
+p = get iv_n 4
+e = get iv_n 5
+while lt p e bound 9223372036854775807
+q = eol p e
+row p q
+p = add q 1
+if ge get iv_n 3 1048576
+oflush
+end
+end
+summary
+oflush
+ret 0
+end
