@@ -184,7 +184,7 @@ case "$step" in
                       sh seed/omc/gate5.sh 2>&1 | tee "$OUT_DIR.seed-gate5.log"
                       grep -q "^PASS native-host qualification" "$OUT_DIR.seed-check.log" || { echo "OMEGA-SEED: native-host qualification did not pass" >&2; exit 1; }
                       tail -1 "$OUT_DIR.seed-gate5.log" | grep -q "^GATE5 PASS" || { echo "OMEGA-SEED: gate5 failed" >&2; exit 1; } ;;
-  # Omega GPU units (gpu/units.tsv, moved from CUDApp om/ and backend/): the gate is seeded Omega, gpu/units-gate.om,
+  # Omega GPU units (gpu/units.tsv, moved from CUDApp om/, backend/ and native/): the gate is seeded Omega, gpu/units-gate.om,
   # built with seed/ng/sha256.om by seed/out/omc after that compiler's digest is checked; the gate checks it again.
   # The expected count follows gpu/units.tsv; a change to the table changes it in the same commit.
   gpu-units)
@@ -195,7 +195,7 @@ case "$step" in
     rc=0; "$OUT_DIR/gate" seed/out/omc "$OUT_DIR/work" > "$OUT_DIR/gate.log" || rc=$?
     cat "$OUT_DIR/gate.log"
     [ "$rc" -eq 0 ] || exit "$rc"
-    grep -qx 'OMEGA-GPU-UNITS PASS units=372 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
+    grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
   # Standalone backend qualification: these execute the current sources, never
   # accept an old receipt, and leave unavailable dependencies nonpassing (exit 3).

@@ -47,5 +47,5 @@ name the CUDApp paths.
 - Retiring `seed/ng/cudapp.lock`. Under ADR 0047 Decision 5 it is deleted with its last row. Here it stays as the
   identity table of the five files, because removing it changes the gate (`lock-self` and the `lock-*` rows). That
   change goes with the follow-up above.
-- Everything else of CUDApp's NVIDIA layer (`nvrm/`, `m16/`, `native/`, the C runtime) moves in later steps, as
-  Omega only. The rest of `om/` came in step 3 (`gpu/UNITS.md`).
+- The rest of CUDApp's NVIDIA layer that is Omega came in steps 3 (`om/`) and 4 (`native/`): see `gpu/UNITS.md`.
+  The driver client in C (`nvrm/`, `m16/`) and the C runtime stay in CUDApp until they are rewritten in Omega.
