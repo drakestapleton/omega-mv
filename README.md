@@ -101,7 +101,7 @@ time, and the R15 parity rig gives both sides a fixed cost table (`r15_use_cost_
 
 ## Repository layout
 
-`src/` existing core and C compiler awaiting replacement (`src/compiler/`), `src/runtime/` reaction runtime, `src/fabric/` host-only fabric interface, `src/physics0/` Physics Zero apparatus, `spec/` and `docs/` specifications, `tests/` gate suites, `evidence/` content-addressed receipts, `tools/` harnesses, `mk/` make fragments included by the `Makefile`. Also `bench/prime_race/` (Prime Drag Race implementation), `calibration/` (Turing calibration experiments, preregistration and blinding protocol), `research/` (experiments and prototypes) and `doctrine/` (the Milestone 4 doctrine).
+`src/` existing core and C compiler awaiting replacement (`src/compiler/`), `src/runtime/` reaction runtime, `src/fabric/` host-only fabric interface, `src/physics0/` Physics Zero apparatus, `spec/` and `docs/` specifications, `tests/` gate suites, `evidence/` content-addressed receipts, `tools/` harnesses, `mk/` make fragments included by the `Makefile`. Also `gpu/` (Omega GPU, the GPU layer of Sovereign Intelligence (SI), moving here from CUDApp as pure Omega; see [gpu/README.md](gpu/README.md)), `bench/prime_race/` (Prime Drag Race implementation), `calibration/` (Turing calibration experiments, preregistration and blinding protocol), `research/` (experiments and prototypes) and `doctrine/` (the Milestone 4 doctrine).
 
 ## Human-Directed Agentic Engineering
 

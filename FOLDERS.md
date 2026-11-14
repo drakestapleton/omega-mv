@@ -53,6 +53,18 @@ Seed0-born exact ABI1 plus hosted-x86 superset CPU qualification; no GPU or driv
 
 Immutable receipts of learner development runs (seeds 1..5 per level, HOLDOUT/TRIAL/REP withheld by the harness). New files per cut, never rewritten.
 
+## `gpu/`
+
+Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047): one directory per back end (`gpu/amd/` so far), moved here from CUDApp one piece per landing with the history of its Omega files. `gpu/README.md` gives the layout.
+
+Rules:
+
+- only Omega source and the data tables its units read; a C, Python, shell or other file is rewritten in Omega first or stays out, listed as not yet Omega in the back end's README (Drake, 2026-11-14: "make sure it's pure omega")
+- every unit is built by this repository's own `seed/out/omc`; a back end carries no compiler pin of its own and its gate refuses any other compiler
+- `gpu/<vendor>/card.tsv` records the bytes the receipts record (what ran on hardware, and host-built references marked `host`), written once from the receipts it names; never regenerated from a build
+- `gpu/<vendor>/import/` is the record of a move (command, commit map); never edited after the landing that wrote it
+- receipts stay in CUDApp where they were written; new receipts are written in this repository's `evidence/`
+
 ## `native/`
 
 Handwritten .om units of omega-mv that are not part of the seed ladder: the ORIG-4 shadow advisor (native/orig4).
