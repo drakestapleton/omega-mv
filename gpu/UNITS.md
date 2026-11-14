@@ -1,0 +1,54 @@
+# gpu/: Omega GPU units from CUDApp om/ and backend/ (ADR 0047, step 3)
+
+Omega GPU is the GPU layer of Sovereign Intelligence (SI), the stack Drake named, with Omega as its language and
+compiler. This step brought CUDApp's seeded-Omega units here with the history of those files. Source: CUDApp main
+`84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`. Command and maps: `gpu/import/step3-om-backend/`.
+
+| CUDApp path | Here | What |
+| --- | --- | --- |
+| `om/**/*.om` (484 files) | `gpu/nvidia/om/` | CUDApp's seeded-Omega components: encoders, codegen, kernel generators, cache, pipeline, graph, numeric, platform, API, sessions, tools and the rest. The three files step 2 brought at the lock commit stay at that version (see below). |
+| `backend/spirv/*.om` | `gpu/spirv/` | `emit.om` (SPIR-V kernel builder) and `conform.om` (host reference and bit-exact compare). |
+| `backend/hw/*.om`, `backend/hw/manifest.tsv` | `gpu/hw/` | `hwman`, the hardware capability manifest (`core.om`, `cpu.om`, `tpm.om`, `main.om`) and the table it reads. |
+| `backend/targets.om` | `gpu/targets.om` | The portable target table and code-object loader checks. Same bytes as CUDApp `dc536882`, the version step 1 also carries. |
+
+`om/` keeps its CUDApp layout under `gpu/nvidia/om/`, as step 2 did, so that a CUDApp path maps to its new path by
+one prefix. Some of these units are not NVIDIA-specific (cache, pipeline, graph, numeric); regrouping them is a later
+change, not part of the move.
+
+## The units and their gate
+
+`gpu/units.tsv` lists 372 units: NAME and its parts. It was written once from the unit list of CUDApp
+`om/units.sh` at the source commit (default selection, `om/` read as `gpu/nvidia/om/`), plus `emit`, `conform`,
+`targets` and `hwman`. `gpu/units-gate.om` (OMEGA-GPU-UNITS, `tests/gates/run.sh gpu-units`) is seeded Omega. It
+refuses any compiler but `seed/out/omc` (by `seed/out/omc.sha256`), composes every unit as `om/units.sh` does (each
+part followed by a newline), compiles it twice and requires exit 0, empty stderr and identical bytes. The runner
+requires the exact summary line, so a shortened table fails. Every hardware row stays NOT_RUN.
+
+This gate shows that the units compile, reproducibly, with this repository's compiler. It does not show that they
+behave correctly. In CUDApp the units are lowered to portable C by the omega-bridge converter (`om/units.sh`), and
+their behaviour checks are C, Python and shell (`make test-*`, `tests/`). Those checks are not Omega and did not
+move.
+
+The unit `bw_enc_sm121` compiles to the same bytes `seed/ng/gpu/gate.cases` pins for the encoder (`enc-pin`,
+sha256 `4d652093...`).
+
+## Versions kept from step 2
+
+`gpu/nvidia/om/encoder/bw_enc_sm121.om`, `gpu/nvidia/om/components/bw_alloc.om` and `gpu/nvidia/om/cubin/cubin_elf.om`
+are the versions `seed/ng/cudapp.lock` pins (CUDApp `1988c50e`), not CUDApp main's. The six units that use them
+(`bw_enc_sm121`, `cubin_elf`, `compose`, `encode`, `validate`, `q38_emit`) compile with them. Moving the newer
+versions is the follow-up listed in `gpu/nvidia/README.md`. The other copy of the encoder, the top-level
+`om/encoder/bw_enc_sm121.om` that the Makefile uses, is not touched.
+
+## Not here yet
+
+- Units with parts in CUDApp `native/` (26: the `closure_*` units, `nvrm_*`, `nvml_*`, `aiengpu`): they come with the
+  native/ move (step 4). Units with parts in CUDApp `tools/` (`c5`): with the tools move (step 6). The list is at
+  the top of `gpu/units.tsv`.
+- 41 `.om` files that `om/units.sh` does not list (tests, fixtures, drivers such as `cache/*_test.om`,
+  `encoder/*_test.om`, `q38-head/driver.om`) moved with the rest but are not in the table: CUDApp builds them from
+  make targets and shell tests, whose compositions are not Omega.
+- Everything in CUDApp `om/` that is not Omega stayed there: 34 `.md`, 31 `.json`, 27 `.py`, 22 `.c`, 8 `.h`, 7 `.sh`
+  (`units.sh`, `no-posix.sh`, `native-freest.sh` and four more), 5 `.lock`, 2 `.patch`, 2 `.log`, 1 `.gitignore` and
+  39 crumb files (retired, history only). So did `backend/hw/README.md`, the multitarget and hw test drivers
+  (`tests/multitarget/run.sh`, `tests/hw/run.sh`) and the C SPIR-V launcher.
