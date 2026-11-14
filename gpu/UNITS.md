@@ -6,7 +6,7 @@ compiler. This step brought CUDApp's seeded-Omega units here with the history of
 
 | CUDApp path | Here | What |
 | --- | --- | --- |
-| `om/**/*.om` (484 files) | `gpu/nvidia/om/` | CUDApp's seeded-Omega components: encoders, codegen, kernel generators, cache, pipeline, graph, numeric, platform, API, sessions, tools and the rest. The three files step 2 brought at the lock commit stay at that version (see below). |
+| `om/**/*.om` (484 files) | `gpu/nvidia/om/` | CUDApp's seeded-Omega components: encoders, codegen, kernel generators, cache, pipeline, graph, numeric, platform, API, sessions, tools and the rest. The three files step 2 brought are the ones `seed/ng/cudapp.lock` pins (see below). |
 | `backend/spirv/*.om` | `gpu/spirv/` | `emit.om` (SPIR-V kernel builder) and `conform.om` (host reference and bit-exact compare). |
 | `backend/hw/*.om`, `backend/hw/manifest.tsv` | `gpu/hw/` | `hwman`, the hardware capability manifest (`core.om`, `cpu.om`, `tpm.om`, `main.om`) and the table it reads. |
 | `backend/targets.om` | `gpu/targets.om` | The portable target table and code-object loader checks. Same bytes as CUDApp `dc536882`, the version step 1 also carries. |
@@ -37,7 +37,7 @@ sha256 `460fb3a4...`).
 ## Versions from step 2
 
 `gpu/nvidia/om/encoder/bw_enc_sm121.om` and `gpu/nvidia/om/cubin/cubin_elf.om` are CUDApp main's (84b524ca) since
-2026-11-14; `gpu/nvidia/om/components/bw_alloc.om` is the same at the lock commit and at 84b524ca. All three are the
+2026-11-14; `gpu/nvidia/om/components/bw_alloc.om` is the same at 1988c50e (step 2) and at 84b524ca. All three are the
 bytes `seed/ng/cudapp.lock` pins. The six units that use them (`bw_enc_sm121`, `cubin_elf`, `compose`, `encode`,
 `validate`, `q38_emit`) compile with them. The other copy of the encoder, the top-level `om/encoder/bw_enc_sm121.om`
 that the Makefile uses, is not touched.
@@ -58,8 +58,10 @@ that the Makefile uses, is not touched.
 ## Step 4: CUDApp native/
 
 Step 4 brought the Omega files of CUDApp `native/` (57 `.om`) to `gpu/nvidia/native/` with the history of those
-files (64 commits), from the same CUDApp commit `84b524ca`. Two `native/` files were already here from step 2 at the
-lock commit (`native/blackwell/launch.om`, `native/nvrm/context.om`); they stay at that version. Command and maps:
+files (64 commits), from the same CUDApp commit `84b524ca`. Two `native/` files were already here from step 2 at
+1988c50e (`native/blackwell/launch.om`, `native/nvrm/context.om`); step 4 left them at that version. Since
+2026-11-14 `launch.om` is 84b524ca's too (`context.om` is the same at both). `native/blackwell/batch.om` calls
+`gbbody` and `gbtail`, which only the newer `launch.om` defines. Command and maps:
 `gpu/import/step4-native/`.
 
 `gpu/units.tsv` gained 33 rows (405 in all). 26 are the `om/units.sh` units whose parts are in `native/` (the

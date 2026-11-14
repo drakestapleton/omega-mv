@@ -3,7 +3,7 @@
 Omega NG's GPU stage turns ΩIR kernel functions into sm_121 machine code and launches it. It consumes the seeded
 units `gpu/nvidia/om/encoder/bw_enc_sm121.om`, `gpu/nvidia/om/components/bw_alloc.om` and
 `gpu/nvidia/om/cubin/cubin_elf.om` (with `gpu/nvidia/native/blackwell/launch.om` and `gpu/nvidia/native/nvrm/context.om`
-also pinned). They came from aien-dev/CUDApp at the commit in `seed/ng/cudapp.lock` (1988c50e) with their history, per
+also pinned). They came from aien-dev/CUDApp at 1988c50e with their history (now at 84b524ca's bytes, see Status), per
 ADR 0047 (aien-architecture-mv; the GPU layer of Sovereign Intelligence moves into this repository); before that, Hive
 NG decision D10 consumed them from a sibling `../CUDApp` checkout. `seed/ng/cudapp.lock` keeps its bytes: its five
 digest rows are the identities the `lock-*` cases check against the files in `gpu/nvidia/`. ng-gpu's own code is
@@ -48,9 +48,10 @@ outputs: golden and dump are the bytes on which CUDApp's `.om` encoder and its C
 oracle's bytes, which the pinned `.om` encoder reproduces and CUDApp b774723f's (before #373) does not (LDG.E offset defect).
 
 ## Status
-HOST_TESTED (Linux AArch64, core 1): 18/18 PASS with CUDApp at the lock commit 1988c50e; with CUDApp 1818e9d2 (only
+HOST_TESTED (Linux AArch64, core 1): 18/18 PASS with CUDApp at the then lock commit 1988c50e; with CUDApp 1818e9d2 (only
 bw_alloc.om differs) lock-bw_alloc FAILs and the gate exits 1; against CUDApp b774723f's encoder (before #373) the
 pin, slice and ldg cases FAIL as well. No GPU involved. After the move to `gpu/nvidia/` (2026-11-14) the same 18 cases,
 with the same digests and goldens, run against the in-tree files; see `gpu/nvidia/README.md`. Later that day the
-encoder and `cubin_elf.om` were replaced by CUDApp 84b524ca's bytes (the lock's comment says which rows): the lock
-rows, `lock-self` and `enc-pin` were re-pinned, the goldens, refusals and mutants are unchanged, and 18/18 pass.
+encoder and `cubin_elf.om`, then `launch.om` in its own commit, were replaced by CUDApp 84b524ca's bytes, the commit
+the lock now names: the lock rows, `lock-self` and `enc-pin` were re-pinned, the goldens, refusals and mutants are
+unchanged, and 18/18 pass. No case checks `launch.om` beyond its identity.

@@ -21,9 +21,10 @@ The table lists the five units step 2 brought. Step 3 brought the rest of CUDApp
 These are exactly the five files `seed/ng/cudapp.lock` pins. Step 2 brought them at CUDApp
 `1988c50e93c4dd971bcb94e69692c8e57e53f54b`, with the history of those paths (27 CUDApp commits,
 `import/filter-repo-command.txt`). Old paths: `om/` became `gpu/nvidia/om/`, `native/` became `gpu/nvidia/native/`.
-On 2026-11-14 `bw_enc_sm121.om` and `cubin_elf.om` were replaced by the bytes of CUDApp main
-`84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`, in one commit that names the CUDApp commits between; that later
-history was not imported. Each file's sha256 equals its row in `seed/ng/cudapp.lock`.
+On 2026-11-14 `bw_enc_sm121.om` and `cubin_elf.om`, and then in its own commit `launch.om`, were replaced by the
+bytes of CUDApp main `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`; each commit names the CUDApp commits between, and
+that later history was not imported. `bw_alloc.om` and `context.om` are the same at both commits, so all five files
+are now 84b524ca's, the commit `seed/ng/cudapp.lock` names. Each file's sha256 equals its row there.
 
 This repository also has another, different copy of the encoder at the top level: `om/encoder/bw_enc_sm121.om`
 (sha256 b69455c2...). The `Makefile`, `mk/om-encoder.mk` and `mk/omega-gpu-engine.mk` reference that copy, and this
@@ -35,19 +36,19 @@ step does not touch it. The encoder Omega NG pins and its gate checks is
 `seed/ng/gpu/gate.cases`, run by `seed/qualification/om2/gate.om` (see `seed/ng/gpu/README.md`), checks these
 bytes: the `lock-*` cases hash each file against its lock row, `enc-pin` pins the encoder's compiled bytes, and the
 fixture, refusal and mutant cases check the encoder's output. The move changed only the paths the cases read
-(`../CUDApp/` became `gpu/nvidia/`). The 2026-11-14 replacement changed the `lock-self`, `lock-bw_enc_sm121`,
-`lock-cubin_elf` and `enc-pin` digests and nothing else: every golden file, expected exit and mutant is unchanged, and
-all 18 cases pass with the new bytes. `enc-pin` is what this repository's `seed/out/omc` emits for the new encoder,
-an identity pin; the behaviour evidence is the fixture, refusal and mutant cases. The rows of `seed/ng/cudapp.lock`
-still name the CUDApp paths.
+(`../CUDApp/` became `gpu/nvidia/`). The 2026-11-14 replacements changed the `lock-self`, `lock-bw_enc_sm121`,
+`lock-cubin_elf`, `lock-launch` and `enc-pin` digests and nothing else: every golden file, expected exit and mutant is
+unchanged, and all 18 cases pass with the new bytes. `enc-pin` is what this repository's `seed/out/omc` emits for the
+new encoder, an identity pin; the behaviour evidence is the fixture, refusal and mutant cases. The gate checks no
+behaviour of `launch.om`, only its identity. The rows of `seed/ng/cudapp.lock` still name the CUDApp paths.
 
 ## Not here yet
 
-- The newer `launch.om`. CUDApp 84b524ca has one later commit on `native/blackwell/launch.om` (`3b4f5807`,
-  batched launches with one submit, 2026-11-09); the copy here is 1988c50e's. Moving it changes `lock-launch` in
-  `seed/ng/gpu/gate.cases` and the device launch path, so it is its own change.
+- A behaviour check of `launch.om` here. CUDApp's is `tests/host-trace/run-host-trace.sh`: Omega checks with a fake
+  device (`tests/host-trace/*.om`) composed by shell, including the batch path `native/blackwell/batch.om` and a
+  mutant of `launch.om`. It has not moved. `launch.om` has not been run on the GPU from this repository.
 - Retiring `seed/ng/cudapp.lock`. Under ADR 0047 Decision 5 it is deleted with its last row. Here it stays as the
   identity table of the five files, because removing it changes the gate (`lock-self` and the `lock-*` rows). That
-  change goes with the follow-up above.
+  is its own change.
 - The rest of CUDApp's NVIDIA layer that is Omega came in steps 3 (`om/`) and 4 (`native/`): see `gpu/UNITS.md`.
   The driver client in C (`nvrm/`, `m16/`) and the C runtime stay in CUDApp until they are rewritten in Omega.
