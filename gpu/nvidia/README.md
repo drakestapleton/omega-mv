@@ -13,6 +13,9 @@ repository's own `seed/out/omc`, and they come from CUDApp one piece at a time (
 | `native/nvrm/context.om` | The nvrm context unit (NVIDIA driver client, ABI 580.173.02). |
 | `import/` | How these came from CUDApp: the filter-repo command and its commit map. |
 
+The table lists the five units step 2 brought. Step 3 brought the rest of CUDApp's `om/` tree to `gpu/nvidia/om/`;
+`gpu/UNITS.md` describes it and its gate.
+
 ## Where they came from
 
 These are exactly the five files `seed/ng/cudapp.lock` pins, at CUDApp `1988c50e93c4dd971bcb94e69692c8e57e53f54b`,
@@ -44,5 +47,5 @@ name the CUDApp paths.
 - Retiring `seed/ng/cudapp.lock`. Under ADR 0047 Decision 5 it is deleted with its last row. Here it stays as the
   identity table of the five files, because removing it changes the gate (`lock-self` and the `lock-*` rows). That
   change goes with the follow-up above.
-- Everything else of CUDApp's NVIDIA layer (the rest of `om/`, `nvrm/`, `m16/`, `native/`, the C runtime) moves in
-  later steps, as Omega only.
+- Everything else of CUDApp's NVIDIA layer (`nvrm/`, `m16/`, `native/`, the C runtime) moves in later steps, as
+  Omega only. The rest of `om/` came in step 3 (`gpu/UNITS.md`).

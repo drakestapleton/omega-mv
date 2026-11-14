@@ -1,0 +1,922 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note core.om: hardware capability manifest reader, checker and admission (seeded Omega, AArch64).
+note Unit 1 of hwman: cat backend/hw/core.om backend/hw/cpu.om backend/hw/tpm.om backend/hw/main.om | omc
+note Units share globals; each unit's private names carry its prefix (cpu*, tpm*); core owns the rest.
+note
+note Manifest format (backend/hw/manifest.tsv): line 1 is exactly "hwman<TAB>1" (schema 1); line 2 is
+note exactly the column header THDR below; every later line that is neither empty nor starts with '#'
+note is one target row of exactly NCOL tab-separated nonempty fields ("-" when a field has no value).
+note The checker refuses (exit 3) a wrong schema line, a wrong header, a wrong field count, an empty
+note field, an id outside [a-z0-9-] or repeated, a family/route/status/admit value outside its
+note enumeration, a non-decimal timeout_ms, any of the 21 required families missing, and these rules:
+note   admit YES   needs status CHIP_TESTED, evidence other than NOT_RUN, a hwman-* runner, ops, blocker -
+note   BLOCKED_*   needs a blocker and admit NO; route UNRESOLVED exactly when status BLOCKED_NAME
+note   PROPOSED    needs admit NO; every other status except BLOCKED_* needs evidence other than NOT_RUN
+note Refusals print one line "REFUSE <class> <reason> ..." on stdout.
+om2
+
+text THDR "id\tfamily\tvendor\tpart\trevision\troute\tplatform\tidentity\tnode\tisa_cmds\tdiscovery\tops\taddr_spaces\tdma_coherence\tqueue_irq\treset_power\tfirmware\tcompiler_artifact\trefs\trunner\ttimeout_ms\tstatus\tadmit\tevidence\tblocker"
+text TSCH "hwman\t1"
+text TFAM "CPU GPU APU PPU SPU NPU TPU LPU MCU ISP TPM SECURE_ENCLAVE ASIC FPGA DPU WSE NEUROMORPHIC PHOTONIC QPU TSU BPU"
+text TROUTE "NATIVE_ISA DIRECT_DEVICE VENDOR_RUNTIME REMOTE_SERVICE FIRMWARE_OWNED UNRESOLVED"
+text TSTAT "CHIP_TESTED PRIOR_RECEIPT EMULATED HOST_TESTED PROPOSED BLOCKED_ACCESS BLOCKED_NAME"
+text TYESNO "YES NO"
+text TDASH "-"
+text TNOTRUN "NOT_RUN"
+text THWPFX "hwman-"
+note The closed runner table: the runners this program implements, the one family and route each
+note drives, and the operations each dispatches (cpuop in cpu.om; runtpm in main.om). check refuses
+note a row naming any other hwman- runner, another family or route, or another operation.
+text TRUN "hwman-cpu hwman-tpm"
+text TOPCPU "sumsq64 fnv1a64"
+text TOPTPM "props getrandom"
+const FCPU long 0
+const FTPM long 10
+const RNATIVE long 0
+const RDIRECT long 1
+text TREF "REFUSE "
+text TNL "\n"
+text TSP " "
+text TEQ "="
+text TLINE " line="
+text TIO "hwman: I/O error reading "
+text TBIG "hwman: manifest larger than 262144 bytes\n"
+
+note column indices (0-based)
+const CID ulong 0
+const CFAM ulong 1
+const CVEND ulong 2
+const CPART ulong 3
+const CREV ulong 4
+const CROUTE ulong 5
+const CIDENT ulong 7
+const CNODE ulong 8
+const COPS ulong 11
+const CRUNNER ulong 19
+const CTMO ulong 20
+const CSTAT ulong 21
+const CADMIT ulong 22
+const CEVID ulong 23
+const CBLOCK ulong 24
+const NCOL ulong 25
+const NFAM ulong 21
+const MAXROW ulong 128
+const MANCAP ulong 262144
+
+note exit classes shared by every command
+const XOK int 0
+const XUSAGE int 2
+const XMAN int 3
+const XUNKNOWN int 4
+const XUNSUP int 5
+const XAUTH int 6
+const XSTALE int 7
+const XWRDEV int 8
+const XBUSY int 9
+const XOFFLINE int 10
+const XTIMEOUT int 11
+const XMISM int 12
+const XDEVERR int 13
+const XINVAL int 14
+const XIO int 74
+
+global gman uchar 262144
+global gav uchar 8192
+global gao ulong 16
+global gal ulong 16
+global gpath uchar 4096
+global gfile uchar 65536
+global gob uchar 8192
+global gfo ulong 32
+global gfl ulong 32
+global grow ulong 128
+global grln ulong 128
+note gst: 0 manifest length, 1 output fill, 2 fields in current row, 3 rows, 4 argc, 5 path length,
+note 6 current row line number, 7 gfile length, 8 admitted rows
+global gst ulong 16
+
+fn oflush to void
+n = write 1 gob 0 get gst 1
+put gst 1 0
+end
+
+fn oc b uchar to void
+f = get gst 1
+if ge f 8000
+oflush
+f = get gst 1
+end
+put gob f b
+put gst 1 add f 1
+end
+
+fn ot t view uchar * to void
+for i ulong len t
+oc get t i
+end
+end
+
+fn odec v ulong to void
+d = new uchar 20 0
+k = ulong 0
+x = v
+while true bound 21
+put d k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong k
+oc get d sub sub k i 1
+end
+end
+
+fn osdec v long to void
+if lt v 0
+oc 45
+odec ulong sub 0 v
+else
+odec ulong v
+end
+end
+
+fn ohx v ulong w ulong to void
+oc 48
+oc 120
+for i ulong w
+s = mul sub sub w i 1 4
+q = and shr v s 15
+if lt q 10
+oc uchar add q 48
+else
+oc uchar add q 87
+end
+end
+end
+
+fn ofield k ulong to void
+o = get gfo k
+for i ulong get gfl k
+oc get gman add o i
+end
+end
+
+fn oarg a ulong to void
+o = get gao a
+for i ulong get gal a
+oc get gav add o i
+end
+end
+
+fn fail code int msg view uchar * to void
+oflush
+n = write 2 msg 0 len msg
+exit code
+end
+
+note copy every argument into gav; argument a is gav[gao a .. + gal a]
+fn loadargs to void
+c = argcnt
+if gt c 16
+fail XUSAGE TNL
+end
+put gst 4 ulong c
+o = ulong 0
+for a ulong ulong c
+n = argread a gav o sub len gav o
+if lt n 0
+fail XUSAGE TNL
+end
+put gao a o
+put gal a ulong n
+o = add o ulong n
+end
+end
+
+fn argc to ulong
+ret get gst 4
+end
+
+fn argeq a ulong t view uchar * to bool
+if ne get gal a len t
+ret false
+end
+o = get gao a
+for i ulong len t
+if ne get gav add o i get t i
+ret false
+end
+end
+ret true
+end
+
+note decimal argument; -1 when empty, non-decimal or above 2^40
+fn argdec a ulong to long
+n = get gal a
+if eq n 0
+ret -1
+end
+if gt n 13
+ret -1
+end
+o = get gao a
+v = ulong 0
+for i ulong n
+c = get gav add o i
+if or lt c 48 gt c 57
+ret -1
+end
+v = add mul v 10 ulong sub c 48
+end
+ret long v
+end
+
+note path buffer
+fn pclear to void
+put gst 5 0
+end
+
+fn pc b uchar to void
+p = get gst 5
+if ge p sub len gpath 1
+fail XUSAGE TNL
+end
+put gpath p b
+put gst 5 add p 1
+end
+
+fn pt t view uchar * to void
+for i ulong len t
+pc get t i
+end
+end
+
+fn pfield k ulong to void
+o = get gfo k
+for i ulong get gfl k
+pc get gman add o i
+end
+end
+
+fn parg a ulong to void
+o = get gao a
+for i ulong get gal a
+pc get gav add o i
+end
+end
+
+fn pdec v ulong to void
+d = new uchar 20 0
+k = ulong 0
+x = v
+while true bound 21
+put d k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong k
+pc get d sub sub k i 1
+end
+end
+
+note read the file named in gpath into gfile; return its length or -errno
+fn readpath to long
+fd = fopen gpath 0 get gst 5 0 0
+if lt fd 0
+ret fd
+end
+t = ulong 0
+while true bound 4096
+n = read int fd gfile t sub len gfile t
+if lt n 0
+c = fclose int fd
+ret n
+end
+if eq n 0
+break
+end
+t = add t ulong n
+if eq t len gfile
+break
+end
+end
+c = fclose int fd
+put gst 7 t
+ret long t
+end
+
+fn readman a ulong to void
+pclear
+parg a
+fd = fopen gpath 0 get gst 5 0 0
+if lt fd 0
+ot TIO
+oarg a
+oc 10
+fail XIO TNL
+end
+t = ulong 0
+while true bound 4096
+n = read int fd gman t sub MANCAP t
+if lt n 0
+fail XIO TIO
+end
+if eq n 0
+break
+end
+t = add t ulong n
+if eq t MANCAP
+fail XMAN TBIG
+end
+end
+c = fclose int fd
+put gst 0 t
+end
+
+note split the line starting at off into gfo/gfl; return the offset after its newline
+fn rowat off ulong to ulong
+m = get gst 0
+k = ulong 0
+s = off
+i = off
+put gfo 0 off
+while true bound 262145
+if ge i m
+break
+end
+c = get gman i
+if eq c 10
+break
+end
+if eq c 9
+if lt k sub len gfo 1
+put gfl k sub i s
+k = add k 1
+put gfo k add i 1
+end
+s = add i 1
+end
+i = add i 1
+end
+put gfl k sub i s
+put gst 2 add k 1
+if lt i m
+ret add i 1
+end
+ret i
+end
+
+fn feq k ulong t view uchar * to bool
+if ne get gfl k len t
+ret false
+end
+o = get gfo k
+for i ulong len t
+if ne get gman add o i get t i
+ret false
+end
+end
+ret true
+end
+
+fn fpfx k ulong t view uchar * to bool
+if lt get gfl k len t
+ret false
+end
+o = get gfo k
+for i ulong len t
+if ne get gman add o i get t i
+ret false
+end
+end
+ret true
+end
+
+fn fargeq k ulong a ulong to bool
+if ne get gfl k get gal a
+ret false
+end
+o = get gfo k
+p = get gao a
+for i ulong get gfl k
+if ne get gman add o i get gav add p i
+ret false
+end
+end
+ret true
+end
+
+note gman[o..o+n) equals t[s..s+n)
+fn mteq o ulong n ulong t view uchar * s ulong to bool
+if gt add s n len t
+ret false
+end
+for j ulong n
+if ne get gman add o j get t add s j
+ret false
+end
+end
+ret true
+end
+
+note gman[o..o+n) equals gav[p..p+n)
+fn maeq o ulong n ulong p ulong to bool
+for j ulong n
+if ne get gman add o j get gav add p j
+ret false
+end
+end
+ret true
+end
+
+note index of field k in the space-separated enumeration t, or -1
+fn fenum k ulong t view uchar * to long
+o = get gfo k
+n = get gfl k
+idx = long 0
+s = ulong 0
+for i ulong add len t 1
+b = true
+if lt i len t
+b = eq get t i 32
+end
+if b
+if eq sub i s n
+if mteq o n t s
+ret idx
+end
+end
+idx = add idx 1
+s = add i 1
+end
+end
+ret -1
+end
+
+note decimal field value, or -1
+fn fdec k ulong to long
+n = get gfl k
+if or eq n 0 gt n 13
+ret -1
+end
+o = get gfo k
+v = ulong 0
+for i ulong n
+c = get gman add o i
+if or lt c 48 gt c 57
+ret -1
+end
+v = add mul v 10 ulong sub c 48
+end
+ret long v
+end
+
+note does the comma list in field k contain argument a
+fn flisthas k ulong a ulong to bool
+o = get gfo k
+n = get gfl k
+w = get gal a
+if eq w 0
+ret false
+end
+s = ulong 0
+for i ulong add n 1
+b = true
+if lt i n
+b = eq get gman add o i 44
+end
+if b
+if eq sub i s w
+if maeq add o s w get gao a
+ret true
+end
+end
+s = add i 1
+end
+end
+ret false
+end
+
+note is gman[o..o+w) one word of the space-separated list t
+fn wordin o ulong w ulong t view uchar * to bool
+if eq w 0
+ret false
+end
+s = ulong 0
+for i ulong add len t 1
+b = true
+if lt i len t
+b = eq get t i 32
+end
+if b
+if eq sub i s w
+if mteq o w t s
+ret true
+end
+end
+s = add i 1
+end
+end
+ret false
+end
+
+note is every comma-separated item of field k a word of the space-separated list t
+fn listin k ulong t view uchar * to bool
+o = get gfo k
+n = get gfl k
+s = ulong 0
+for i ulong add n 1
+b = true
+if lt i n
+b = eq get gman add o i 44
+end
+if b
+if not wordin add o s sub i s t
+ret false
+end
+s = add i 1
+end
+end
+ret true
+end
+
+note gav[p..p+w) equals t[s..s+w)
+fn ateq p ulong w ulong t view uchar * s ulong to bool
+for j ulong w
+if ne get gav add p j get t add s j
+ret false
+end
+end
+ret true
+end
+
+note is argument a one word of the space-separated list t
+fn argin a ulong t view uchar * to bool
+w = get gal a
+s = ulong 0
+for i ulong add len t 1
+b = true
+if lt i len t
+b = eq get t i 32
+end
+if b
+if and eq sub i s w gt w 0
+if ateq get gao a w t s
+ret true
+end
+end
+s = add i 1
+end
+end
+ret false
+end
+
+fn mrefuse why view uchar * line ulong to int
+ot TREF
+ot why
+ot TLINE
+odec line
+oc 10
+oflush
+ret XMAN
+end
+
+text RSCHEMA "manifest schema_version"
+text RHDR "manifest header"
+text RCOLS "manifest field_count"
+text REMPTY "manifest empty_field"
+text RIDCH "manifest id_charset"
+text RDUP "manifest duplicate_id"
+text RFAM "manifest family"
+text RROUTE "manifest route"
+text RSTAT "manifest status"
+text RADMIT "manifest admit"
+text RTMO "manifest timeout_ms"
+text RADMEV "manifest admit_without_chip_evidence"
+text RBLK "manifest blocked_without_blocker"
+text RUNRES "manifest unresolved_route_status"
+text RPROP "manifest proposed_admitted"
+text REVID "manifest status_without_evidence"
+text RROWS "manifest too_many_rows"
+text RMISS "manifest missing_family "
+text RRUN "manifest unknown_runner"
+text RRFAM "manifest runner_family_route"
+text RROP "manifest runner_op"
+
+note is the line starting at st exactly t (followed by a newline or the end of the manifest)
+fn lineis st ulong t view uchar * to bool
+m = get gst 0
+if gt add st len t m
+ret false
+end
+for i ulong len t
+if ne get gman add st i get t i
+ret false
+end
+end
+e = add st len t
+if eq e m
+ret true
+end
+ret eq get gman e 10
+end
+
+note print token idx of the space-separated enumeration t
+fn otok t view uchar * idx ulong to void
+k = ulong 0
+for i ulong len t
+c = get t i
+if eq c 32
+k = add k 1
+else
+if eq k idx
+oc c
+end
+end
+end
+end
+
+global gchk ulong 4
+
+note the id of the split row is [a-z0-9-]
+fn idok to bool
+o = get gfo CID
+for i ulong get gfl CID
+c = get gman add o i
+ok = or and ge c 97 le c 122 or and ge c 48 le c 57 eq c 45
+if not ok
+ret false
+end
+end
+ret true
+end
+
+note runner rn of TRUN drives exactly one family and route
+fn runok rn long fam long route long to bool
+if eq rn 0
+ret and eq fam FCPU eq route RNATIVE
+end
+ret and eq fam FTPM eq route RDIRECT
+end
+
+note every operation of the row is one runner rn dispatches
+fn runops rn long to bool
+if eq rn 0
+ret listin COPS TOPCPU
+end
+ret listin COPS TOPTPM
+end
+
+note rules for the split row at manifest line `line`; sets gchk 0 family index, gchk 1 admitted
+fn chkrow line ulong to int
+if ne get gst 2 NCOL
+ret mrefuse RCOLS line
+end
+for k ulong NCOL
+if eq get gfl k 0
+ret mrefuse REMPTY line
+end
+end
+if not idok
+ret mrefuse RIDCH line
+end
+fam = fenum CFAM TFAM
+if lt fam 0
+ret mrefuse RFAM line
+end
+route = fenum CROUTE TROUTE
+if lt route 0
+ret mrefuse RROUTE line
+end
+sts = fenum CSTAT TSTAT
+if lt sts 0
+ret mrefuse RSTAT line
+end
+yes = fenum CADMIT TYESNO
+if lt yes 0
+ret mrefuse RADMIT line
+end
+if lt fdec CTMO 0
+ret mrefuse RTMO line
+end
+noev = or feq CEVID TNOTRUN feq CEVID TDASH
+nobl = feq CBLOCK TDASH
+put gchk 1 0
+if eq yes 0
+ok = and and eq sts 0 not noev and and fpfx CRUNNER THWPFX nobl not feq COPS TDASH
+if not ok
+ret mrefuse RADMEV line
+end
+put gchk 1 1
+end
+if ge sts 5
+if or nobl eq yes 0
+ret mrefuse RBLK line
+end
+end
+if ne eq route 5 eq sts 6
+ret mrefuse RUNRES line
+end
+if and eq sts 4 eq yes 0
+ret mrefuse RPROP line
+end
+if and lt sts 4 noev
+ret mrefuse REVID line
+end
+if fpfx CRUNNER THWPFX
+rn = fenum CRUNNER TRUN
+if lt rn 0
+ret mrefuse RRUN line
+end
+if not runok rn fam route
+ret mrefuse RRFAM line
+end
+if not runops rn
+ret mrefuse RROP line
+end
+end
+put gchk 0 ulong fam
+ret XOK
+end
+
+note gman[a..a+n) equals gman[b..b+n)
+fn mmeq a ulong b ulong n ulong to bool
+for j ulong n
+if ne get gman add a j get gman add b j
+ret false
+end
+end
+ret true
+end
+
+note does any of the first rows rows carry the id at gman[io..io+il)
+fn iddup rows ulong io ulong il ulong to bool
+for r ulong rows
+q = rowat get grow r
+if eq get gfl CID il
+if mmeq get gfo CID io il
+ret true
+end
+end
+end
+ret false
+end
+
+note check the loaded manifest; record row offsets in grow/grln; return an exit class
+fn check to int
+m = get gst 0
+if not lineis 0 TSCH
+ret mrefuse RSCHEMA 1
+end
+h = rowat 0
+if not lineis h THDR
+ret mrefuse RHDR 2
+end
+off = rowat h
+line = ulong 2
+rows = ulong 0
+fams = ulong 0
+adm = ulong 0
+while true bound 65536
+if ge off m
+break
+end
+line = add line 1
+st = off
+off = rowat st
+if and eq get gfl 0 0 eq get gst 2 1
+continue
+end
+if eq get gman st 35
+continue
+end
+c = chkrow line
+if ne c XOK
+ret c
+end
+if ge rows MAXROW
+ret mrefuse RROWS line
+end
+if iddup rows get gfo CID get gfl CID
+ret mrefuse RDUP line
+end
+put grow rows st
+put grln rows line
+rows = add rows 1
+fams = or fams shl ulong 1 get gchk 0
+adm = add adm get gchk 1
+end
+put gst 3 rows
+put gst 8 adm
+note report the first missing family by name
+for f ulong NFAM
+if eq and shr fams f 1 0
+ot TREF
+ot RMISS
+otok TFAM f
+oc 10
+oflush
+ret XMAN
+end
+end
+ret XOK
+end
+
+note row index of the target named by argument a, or -1; leaves that row split
+fn findrow a ulong to long
+for r ulong get gst 3
+q = rowat get grow r
+if fargeq CID a
+ret long r
+end
+end
+ret -1
+end
+
+fn hexdig c uchar to long
+if and ge c 48 le c 57
+ret long sub c 48
+end
+if and ge c 97 le c 102
+ret long sub c 87
+end
+if and ge c 65 le c 70
+ret long sub c 55
+end
+ret -1
+end
+
+note "0x" hex number at gfile[off..off+n), optional trailing newline; -1 when malformed or above 2^60
+fn hexat off ulong n ulong to long
+if lt n 3
+ret -1
+end
+if or ne get gfile off 48 ne get gfile add off 1 120
+ret -1
+end
+v = ulong 0
+d = ulong 0
+for i ulong sub n 2
+c = get gfile add add off 2 i
+if eq c 10
+if eq add i 3 n
+break
+end
+ret -1
+end
+x = hexdig c
+if lt x 0
+ret -1
+end
+if ge v 0x0800000000000000
+ret -1
+end
+v = or shl v 4 ulong x
+d = add d 1
+end
+if eq d 0
+ret -1
+end
+ret long v
+end
+
+note identity field "key=0xHEX": the value, or -1
+fn fidhex to long
+o = get gfo CIDENT
+n = get gfl CIDENT
+e = n
+for i ulong n
+if eq get gman add o i 61
+if eq e n
+e = i
+end
+end
+end
+if ge add e 3 n
+ret -1
+end
+if or ne get gman add add o e 1 48 ne get gman add add o e 2 120
+ret -1
+end
+v = ulong 0
+for i ulong sub sub n e 3
+x = hexdig get gman add add add o e 3 i
+if or lt x 0 ge v 0x0800000000000000
+ret -1
+end
+v = or shl v 4 ulong x
+end
+ret long v
+end
+
+fn hexc q ulong to uchar
+if lt q 10
+ret uchar add q 48
+end
+ret uchar add q 87
+end
