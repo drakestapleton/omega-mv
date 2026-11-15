@@ -64,6 +64,6 @@ int osc_native_call(const OscUnit *u, int fi, const OscNative *nm, uint32_t entr
     if (!u || !nm || fi < 0 || (unsigned)fi >= u->nfuncs) return -1;
     void *entry = osc_native_at(nm, entry_off);
     if (!entry) return -1;
-    if (osc_ir_slice_args_ok(&u->funcs[fi], args, nargs)) return -1; /* refused: never calls in */
+    if (osc_rt_args_ok(&u->funcs[fi], args, nargs, rt)) return -1; /* refused: never calls in */
     return osc_rt_call_native(rt, entry, args, nargs, ret);
 }

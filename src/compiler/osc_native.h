@@ -40,8 +40,9 @@ int osc_native_map(OscNative *nm, const uint8_t *code, size_t len);
 /* Address of byte offset `off` in the mapping, or NULL if out of range/misaligned. */
 void *osc_native_at(const OscNative *nm, uint32_t off);
 void osc_native_unmap(OscNative *nm);
-/* Checked native entry: refuses (-1, no call) malformed or overlapping slice args via osc_ir_slice_args_ok, else
- * osc_rt_call_native on the code at entry_off. Returns the trap code (0 = ok) or -1. osc_rt_call_native is raw and unchecked. */
+/* Checked native entry: refuses (-1, no call) invalid arguments via osc_rt_args_ok,
+ * else osc_rt_call_native on the code at entry_off. Returns the trap code
+ * (0 = ok) or -1. osc_rt_call_native is raw and unchecked. */
 int osc_native_call(const OscUnit *u, int fi, const OscNative *nm, uint32_t entry_off, OscRt *rt, const uint64_t *args,
                     unsigned nargs, uint64_t *ret);
 
