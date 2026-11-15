@@ -20,7 +20,7 @@
 #   tools/effect_cap64_receipt.sh [out-dir]      (default: evidence/EFFECT_CAP64)
 #
 # Runs, on the committed tree only:
-#   - the pinned AIENOS capability library, rebuilt from `git archive` of the
+#   - the pinned Aienux capability library, rebuilt from `git archive` of the
 #     commit in aienos.lock (AIENOS_REPO, default ~/workspace/aienos-repo)
 #   - make test-effect-cap64                         (4 gates, physics-free)
 #   - make test-visor-core, test-visor-world, test-visor-authority

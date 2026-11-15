@@ -21,7 +21,7 @@
 #
 # Runs, on the committed tree only:
 #   - make test-program-id                           (5 gates, physics-free)
-#   - make test-visor-core, test-visor-world, test-visor-authority (pinned AIENOS lib)
+#   - make test-visor-core, test-visor-world, test-visor-authority (pinned Aienux lib)
 #   - the Visor V1 qualification campaign (tests/visor/qualification/run_qualification.sh,
 #     plain shell) against a freshly built physics-free `omega`
 #   - program consumers: omegatool M8 M9 M10 M11 M14 gate suites and test-crumbline
