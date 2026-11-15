@@ -17,8 +17,10 @@ leaves everything else alone. It is the base for two ways of not paying a model 
     { TABLE; echo '%%'; echo strip;  cat prog.om;  } | ./snap > prog.strand
     { TABLE; echo '%%'; echo expand; cat prog.strand; } | ./snap > prog.back.om
 
-TABLE is one line per compiler word, `NAME ARITY ISTYPE`, generated from omega-mcp `data/reference.json`
-for the compiler in use (gate.py shows how). Modes: `strip`, `expand`, `count`. Every mode prints
+TABLE is one line per compiler word, `NAME ARITY FLAGS`, generated from omega-mcp `data/reference.json`
+for the compiler in use by `snapref.table_text` (gate.py uses it). FLAGS: 1 a type word; 2 a word whose
+reference form has an optional tail (`[` in the form) and no rule of its own in snap, today only `kfdctl`,
+whose SUFFIX length depends on the request; 0 otherwise. Modes: `strip`, `expand`, `count`. Every mode prints
 `snap items N forced F bad B` on stderr. `strip` exits 3 with no stdout when the program has something
 else where an item was forced (omc refuses such a program too). Other exits: 64 bad framing, 65 bad table
 number, 70 memory refused by the host, 71 read error, 72 write error.
@@ -29,8 +31,8 @@ Forced: the end of a line whose words are all present (statement words, operator
 table arity, known functions by their parameter count, known names), and `end` after a line that ends its
 path (`ret`, `exit`, `trap`, `break`, `continue`) unless an `else` may still come.
 
-Left open, so nothing is forced on that line: a name not yet known (it may be a later function), any
-bracket, `while` before an optional `bound`, `for` after its counter name, `get`/`put`/`offsetof` in a unit
+Left open, so nothing is forced on that line: a name not yet known (it may be a later function), a word
+with an optional tail (table flag 2, e.g. `kfdctl`), any bracket, `while` before an optional `bound`, `for` after its counter name, `get`/`put`/`offsetof` in a unit
 with `struct`, `layout` or `abstract`, a function header in an `om2` unit, every top-level line that is not
 a `fn` line. This under-counts; it never forces an item that had an alternative in the tested programs.
 
@@ -44,7 +46,8 @@ Limit of `expand`: a `note` line written between a path end and its forced `end`
 Python is the test conductor and the oracle (`snapref.py`, a second writing of the same rules); the product
 is `snap.om`. The gate checks every program omc accepts: A strip equals the oracle, B expand equals the
 oracle and compiles to the same binary as the original, C at every forced position omc refuses one more
-word (line end) or one more statement (`end`), D six broken machines each fail.
+word (line end) or one more statement (`end`), D seven broken machines each fail, E (alarm) every word
+with an optional tail is used by at least one accepted program, so a new such word needs a fixture.
 
 ## Measured (host only)
 
@@ -61,17 +64,20 @@ solutions, 9 fixtures.
 Items are words and line ends. Tokens were counted with the tokenizer of Qwen3.8-27B-FP8 rev `017b9c7a`
 (tokenizer.json sha256 `0997f410…`). On the bench set the strand is 198 tokens shorter (15.7%).
 
-Gate run on the Spark (Linux AArch64) with the committed `seed/out/omc` (sha256 `26540e6d…8991`), programs from
-the omega-harness examples, `bench/inference_cost/tasks` (references and the 20 deliberately wrong `mutant.om`
-answers, which still compile) and the fixtures: `SNAPGATE PASS accepted=108 items=9420 forced=1896
-positions=1896 mutants=6/6 fail=0`.
+Gate run on the Spark (Linux AArch64) with the committed `seed/out/omc` (sha256 `26540e6d…8991`, unchanged at
+omega-mv main `e4271abd`), programs from the omega-harness examples, `bench/inference_cost/tasks` (references
+and the 20 deliberately wrong `mutant.om` answers, which still compile) and the fixtures: `SNAPGATE PASS
+accepted=110 items=9510 forced=1909 positions=1909 mutants=7/7 fail=0`.
 
-- A/B: 108 of 108 accepted programs pass; every expanded program compiles to the same binary.
-- C: at all 1896 forced positions omc refused the alternative (error 5: 1537, error 16: 243, error 17: 116).
-  26 of the 142 `end` positions were refused with error 16 instead of 17, so there the inserted statement may
+- A/B: 110 of 110 accepted programs pass; every expanded program compiles to the same binary.
+- C: at all 1909 forced positions omc refused the alternative (error 5: 1548, error 16: 243, error 17: 118).
+  26 of the 144 `end` positions were refused with error 16 instead of 17, so there the inserted statement may
   have been refused for another reason; those are weaker evidence.
-- D: 6 of 6 mutants caught (each fails 19 to 106 of the 108 programs).
+- D: 7 of 7 mutants caught (each fails 2 to 108 of the 110 programs).
+- E: optional-tail words: `kfdctl`, used by `fixtures/fx_kfdctl_*.om`.
 - The 71 programs omc refuses were all answered by `strip` (none trapped).
+- Fixed 2026-11-15: `strip` refused valid `kfdctl` programs (exit 3) because the table gave `kfdctl` a fixed
+  arity of 5 while its SUFFIX adds 0, 1, 3 or 5 words by request. The first gate had no program using it.
 
 MODELED, not measured: on the bench set Build 2 needs 1265/1067 = 1.186 times fewer model steps; Build 1
 needs 1265/(1067 + 0.313 x 198) = 1.120 times fewer row-passes if a forced row costs 0.313 of a row (the
