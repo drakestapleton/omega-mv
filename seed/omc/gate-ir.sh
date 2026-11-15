@@ -1042,5 +1042,148 @@ if flt[7] != 7 or flt[8] != 0 or flt[9] != 0 or flt[10] != 0:
     raise SystemExit("float header %s" % list(flt[:12]))
 PY
 echo 'PASS float header stays nstructs 0 nregions 0; array header is version 7'
+path_refuse s_arr_scalar 'ir
+struct I a uint 3 b uint end
+struct O c I d uint end
+fn f to uint
+s = new O 1 2 3
+put s c a 9
+ret 1
+end' 'struct I a uint 3 b uint end
+struct O c I d uint end
+fn main to uint
+s = new O 1 2 3
+put s c a 9
+ret 1
+end' 21 16
+ir_wasm() { # name expect source
+    printf '%s\n' "$3" > "$B/$1.om"
+    timeout 10 "$B/stage2" < "$B/$1.om" > "$B/$1.ir" 2> "$B/$1.err" || fail "$1 ir $(cat "$B/$1.err")"
+    timeout 10 "$B/irwasm" < "$B/$1.ir" > "$B/$1.wasm" 2> "$B/$1.werr" || fail "$1 irwasm $(cat "$B/$1.werr")"
+    got=$(node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); process.stdout.write(String(i.exports.f()));' "$B/$1.wasm") || fail "$1 wasm run"
+    [ "$got" = "$2" ] || fail "$1 wasm $got wanted $2"
+    echo "PASS $1 wasm=$got"
+}
+ir_wasm s_arr_elem 9 'ir
+struct I a uint 3 b uint end
+struct O c I d uint end
+fn f to uint
+s = new O 1 2 3
+put s c a 1 9
+ret get s c a 1
+end'
+ir_wasm s_arr_keep 1 'ir
+struct I a uint 3 b uint end
+struct O c I d uint end
+fn f to uint
+s = new O 1 2 3
+put s c a 1 9
+ret 1
+end'
+ir_wasm s_arr_head 1 'ir
+struct I a uint 3 b uint end
+struct O c I d uint end
+fn f to uint
+s = new O 1 2 3
+put s c a 1 9
+ret get s c a 0
+end'
+lay() { # name source
+    printf '%s\n' "$2" > "$B/$1.om"
+    timeout 10 "$B/stage2" < "$B/$1.om" > "$B/$1.ir" 2> "$B/$1.err" || fail "$1 layout $(cat "$B/$1.err")"
+}
+lay lay_s 'ir
+struct S a bool b f64 end
+fn f to uint
+ret 0
+end'
+lay lay_t 'ir
+struct T a f32 b f32 end
+fn f to uint
+ret 0
+end'
+lay lay_u 'ir
+struct U a uchar b uchar end
+fn f to uint
+ret 0
+end'
+lay lay_o 'ir
+struct I a bool b f64 end
+struct O c I d bool end
+fn f to uint
+ret 0
+end'
+lay lay_c 'ir
+struct A x uint end
+struct P q A end
+struct C r P w uint end
+fn f to uint
+ret 0
+end'
+lay lay_z 'ir
+struct Z z uchar end
+struct A x uint end
+struct P q A end
+struct C r P w uint end
+fn f to uint
+ret 0
+end'
+python3 - "$B" <<'PY'
+import sys
+bdir = sys.argv[1]
+def u16(b, i):
+    return b[i] | (b[i+1] << 8), i + 2
+def structs(path):
+    b = open(path, "rb").read()
+    if b[:7] != b"OSC1IR\x00" or b[7] != 7:
+        raise SystemExit("not v7 %s" % path)
+    i = 9
+    out = {}
+    for _ in range(b[8]):
+        nl = b[i]; i += 1
+        name = b[i:i+nl].decode(); i += nl
+        nf = b[i]; i += 1
+        size, i = u16(b, i)
+        fields = {}
+        for _k in range(nf):
+            fl = b[i]; i += 1
+            fn = b[i:i+fl].decode(); i += fl
+            tag = b[i]; i += 1
+            alen, i = u16(b, i)
+            off, i = u16(b, i)
+            fields[fn] = (tag, alen, off)
+        out[name] = (size, fields)
+    return out
+def need(got, name, size, offs):
+    st = got[name]
+    if st[0] != size:
+        raise SystemExit("%s size %s wanted %s" % (name, st[0], size))
+    for fn, off in offs.items():
+        if st[1][fn][2] != off:
+            raise SystemExit("%s.%s off %s wanted %s" % (name, fn, st[1][fn][2], off))
+need(structs(bdir + "/lay_s.ir"), "S", 16, {"a": 0, "b": 8})
+need(structs(bdir + "/lay_t.ir"), "T", 8, {"a": 0, "b": 4})
+need(structs(bdir + "/lay_u.ir"), "U", 2, {"a": 0, "b": 1})
+o = structs(bdir + "/lay_o.ir")
+need(o, "I", 16, {"a": 0, "b": 8})
+need(o, "O", 24, {"c": 0, "d": 16})
+c = structs(bdir + "/lay_c.ir")
+need(c, "A", 4, {"x": 0})
+need(c, "P", 4, {"q": 0})
+need(c, "C", 8, {"r": 0, "w": 4})
+z = structs(bdir + "/lay_z.ir")
+need(z, "Z", 1, {"z": 0})
+need(z, "C", 8, {"r": 0, "w": 4})
+def place(st):
+    size, fields = st
+    return (size, {n: (tag, off) for n, (tag, _alen, off) in fields.items()})
+if place(c["C"]) != place(z["C"]):
+    raise SystemExit("leading struct moved C: %s vs %s" % (place(c["C"]), place(z["C"])))
+# The length of a struct field is that struct's index plus one. Z takes the first
+# slot, so the index moves and the offsets do not.
+if c["C"][1]["r"][1] != 2 or z["C"][1]["r"][1] != 3:
+    raise SystemExit("C.r names the wrong struct %s %s" % (c["C"][1]["r"][1], z["C"][1]["r"][1]))
+PY
+echo 'PASS struct layout offsets'
 echo 'SCALAR_IR_CHECKPOINT 10/10 + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; floats: 13 wasm=native bools, const fold, bits 1.0/0.1/-0.0; path codes f_for_const 7/7, f_trap_const 16/16, f_while_const 16/16, f_fma_bare 3/11, f_fma_mix 3/7, f_fsqrt_bare 3/11; aggregates a_idx 7, a_nest 9, s_field 4, s_copy 3, s_flt 2, s_feq 1, a_oob trap/103, s_nest wasm 4 native 16'
 echo 'RC=0'

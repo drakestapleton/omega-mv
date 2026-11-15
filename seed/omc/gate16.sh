@@ -85,7 +85,6 @@ done <<'REF'
 assign|7|const N uint 5\nfn main to int\nN = uint 6\nret 0\nend
 duplicate|10|const N uint 5\nconst N uint 6\nfn main to int\nret 0\nend
 out_of_range|8|const N uchar 300\nfn main to int\nret 0\nend
-ir_float_const|9|ir\nconst H f64 0.1\nfn f to f64\nret H\nend
 extra_word|5|const N uint 5 6\nfn main to int\nret 0\nend
 long_name|13|const abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl uint 5\nfn main to int\nret 0\nend
 reserved|16|const while uint 5\nfn main to int\nret 0\nend
@@ -118,7 +117,20 @@ for_num_bound_over|8|fn main to int\nfor i ulong 2 bound 9223372036854775808\nen
 for_bound_missing|4|fn main to int\nn = ulong 2\nfor i ulong n bound\nend\nret 0\nend
 for_bound_local|16|fn main to int\nn = ulong 2\nfor i ulong n bound n\nend\nret 0\nend
 REF
-[ "$n" = 35 ] || bad "refusal table ran $n of 35 cases"
+[ "$n" = 34 ] || bad "refusal table ran $n of 34 cases"
+# A float constant in IR mode compiles. It used to be refused with error 9, before IR
+# accepted floats. The constant folds to the same IR as the literal.
+printf '%b\n' 'ir\nconst H f64 0.1\nfn f to f64\nret H\nend' > "$T/c.om"
+printf '%b\n' 'ir\nfn f to f64\nret f64 0.1\nend' > "$T/l.om"
+set +e
+"$S" < "$T/c.om" > "$T/c.ir" 2> "$T/c.err"
+rc=$?
+"$S" < "$T/l.om" > "$T/l.ir" 2> "$T/l.err"
+lrc=$?
+set -e
+[ "$rc" = 0 ] || bad "ir_float_const: compile $rc: $(cat "$T/c.err")"
+[ "$lrc" = 0 ] || bad "ir_float_const literal: compile $lrc: $(cat "$T/l.err")"
+cmp -s "$T/c.ir" "$T/l.ir" || bad "ir_float_const: IR differs from the literal"
 
 # Function mode (no `fn main`): an integer or float constant folds to its literal, so the bare function
 # words must be byte-identical to the same unit written with literals. Each line: name|const unit|literal unit.
@@ -153,5 +165,5 @@ fm_for_default|const B ulong 1000000\nfn f a ulong to ulong\nx = ulong 0\nfor i 
 FM
 [ "$n" = 11 ] || bad "function-mode table ran $n of 11 cases"
 
-say "PASS gate16 31 constant programs, 35 refusals and 11 function-mode units"
+say "PASS gate16 31 constant programs, 34 refusals, IR float constant folds, and 11 function-mode units"
 exit 0
