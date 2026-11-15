@@ -22,14 +22,18 @@ A thread function owns its locals and its stack. Those are not shared.
 
 A global is shared only when every access to it is `aadd`. `aadd cell N` adds N to element 0 of a ulong global and returns the old value. The add is one indivisible step. Two threads may `aadd` the same cell. The result is the sum of the adds, and each `aadd` observes the value the previous one left.
 
-A plain `get` or `put` of a global, or of a run-time pool, is not shared. A thread function that does one is refused. So is any function it calls, unless that function is itself a `thread fn`. A global that is used both with `aadd` and with `get` or `put` is refused too, from any function, whatever order the two uses are written in.
+A plain `get` or `put` of a global, or of a run-time pool, is not shared. A thread function that does one is refused. So is any function it calls, unless that function is itself a `thread fn`. A global that is used both with `aadd` and with a plain access is refused too, from any function, whatever order the two uses are written in.
+
+The same refusal covers every other word that stores into a named global or a run-time pool. The write set is `read`, `getdnts`, `waitpid`, `fstat`, `recv`, `argread`, `pipefds`, `sockname`, `cwd`, `readlnk`, `random`, `envread`, `stat`, `lstat`, `pread`, `devctl`, `mapread`, `devcall`, `uvmctl`, `efi`, `peercred`, `pollfds`, `peername`, `vfioctl`, `vfioirq`, `prlimit`, `cpuget`, `kfdctl` and `enlarge`. Two threads that store the same global by any of these are refused with error 9. A word that only reads the buffer (`write`, `send`, `pwrite`, `mapwrite`, `cpuset`) is not in that set.
 
 This is conservative. A thread that only reads a global nobody writes is still refused. That program has no race, and this slice does not try to prove that. It refuses the access.
 
 Two things this slice does not call a data race, and does not refuse:
 
-- Two threads doing host words that happen to touch the same file or the same device. That is a host-effect question, not this memory model.
-- A thread that traps or is killed before it publishes its result. `join` then waits. It does not time out and it does not turn that into a compile error. The programs in this slice always publish, then exit.
+- Two threads doing host words that happen to touch the same file or the same device, without storing a shared global. That is a host-effect question, not this memory model.
+- A thread that traps for a reason other than its frame size, or is killed, before it publishes its result. `join` then waits. The programs in this slice that compile always publish, then exit.
+
+A thread function whose own frame does not fit is refused at compile time. The mapping is 65536 bytes and the stack floor is at 4096, so 61440 bytes are usable. The frame is the stack arrays plus the scratch a host word uses inside that function. `new uchar 70000` is past that and is error 9. `new uchar 60000` fits, publishes, and joins.
 
 ## Memory order (OTM-1)
 
@@ -68,4 +72,4 @@ The instructions are the AArch64 ones in ARM DDI 0487, issue M.d: `LDADDAL` is C
 
 ## The proof program
 
-`seed/omc/tests/fr6/sum.om` starts two threads. One adds 20, the other adds 22. After both joins, adding 0 returns the old value. That value is 42, and the process exits 42. If either add were lost, the value would be 20 or 22. `seed/omc/tests/fr6/race.om` is a thread that `put`s a global. The compiler refuses it with error 9 (a word in a place that does not allow it).
+`seed/omc/tests/fr6/sum.om` starts two threads. One adds 20, the other adds 22. After both joins, adding 0 returns the old value. That value is 42, and the process exits 42. If either add were lost, the value would be 20 or 22. `seed/omc/tests/fr6/stress.om` is eight threads adding 1, ten thousand times each. The old value is 80000. `seed/omc/tests/fr6/race.om` is a thread that `put`s a global. The compiler refuses it with error 9 (a word in a place that does not allow it). `seed/omc/tests/fr6/write/` is the same refusal for every word in the write set. `seed/omc/tests/fr6/stackbig.om` is the 70000-byte frame.
