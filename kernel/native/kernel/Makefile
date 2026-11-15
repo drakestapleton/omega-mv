@@ -1634,6 +1634,14 @@ spinlock-mutant: $(OUT)/host/test_spinlock_mutant $(OUT)/host/test_pipe_irq_muta
 	  echo "test_pipe_irq mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
 	else grep -F "test_pipe_irq: FAIL" $(OUT)/host/test_pipe_irq_mutant.log && echo "test_pipe_irq mutant (interrupts not masked): FAILS as required"; fi
 
+# DRA-556: Lean 4 proof of the ticket arithmetic in core/spinlock.h (mutual exclusion, FIFO, wrap). Core Lean only,
+# toolchain pinned in proofs/lean-toolchain. Not part of "make test" (Lean is not a build dependency): prints NOT_RUN
+# without lean, FAIL on any error or "sorry".
+ticketlock-proof:
+	@command -v lean >/dev/null || { echo "CK_TICKETLOCK_PROOF: NOT_RUN (lean not installed)"; exit 3; }
+	@if grep -n "sorry" $(KDIR)/proofs/TicketLock.lean; then echo "CK_TICKETLOCK_PROOF: FAIL (sorry)"; exit 1; fi
+	@cd $(KDIR)/proofs && lean TicketLock.lean && echo "CK_TICKETLOCK_PROOF: PASS"
+
 # TEST-ONLY mutant of core/pipe.c: a write does not check the WRITE right or the end. test_pipe must FAIL against it
 # (red before green); "make test" fails if the test stops catching it. Host only.
 $(OUT)/host/test_pipe_mutant: $(PIPE_DEPS)
