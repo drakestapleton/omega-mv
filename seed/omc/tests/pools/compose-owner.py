@@ -94,11 +94,14 @@ def recipe(unit: str) -> tuple[str, str, list[str]]:
 
 
 def declaring_units() -> list[str]:
+    # Tracked units only. A host-check copy under build/ repeats the note and is not a unit.
+    listed = subprocess.run(
+        ["git", "ls-files", "*.om"], cwd=ROOT, check=True, capture_output=True, text=True)
     found = []
-    for path in ROOT.rglob("*.om"):
-        text = path.read_text(encoding="utf-8", errors="replace")
+    for rel in listed.stdout.splitlines():
+        text = (ROOT / rel).read_text(encoding="utf-8", errors="replace")
         if f"owner={OWNER}" in text:
-            found.append(str(path.relative_to(ROOT)))
+            found.append(rel)
     return sorted(found)
 
 
