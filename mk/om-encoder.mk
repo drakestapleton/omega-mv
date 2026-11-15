@@ -22,7 +22,7 @@ OM_ENC_BUILD = gcc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Isrc
 # The mutant bindings keep the other units, so sha256_* (src/omega_api_decl.h) still resolves; only the encoder changes.
 OM_ENC_OTHER_UNITS = om/sha256/sha256-om2.om om/blake3/b3unit.om
 
-.PHONY: test-om-encoder test-om-encoder-corpus test-om-encoder-mutants
+.PHONY: test-om-encoder test-om-encoder-corpus test-om-encoder-mutants test-om-encoder-guard
 $(OM_ENC_DIR)/codegen_om: $(OM_ENC_TEST_DEPS) $(OM_ENC_SRCS) src/omega_om_units.c src/omega_native.h
 	@mkdir -p $(OM_ENC_DIR)
 	$(OM_ENC_BUILD) -o $@ tests/test_omega_codegen_freestanding.c $(OM_ENC_SRCS) src/omega_om_units.c
@@ -81,3 +81,8 @@ test-om-encoder-mutants: build/test_codegen_freestanding
 	if [ $$g = 0 ] && [ $$c = 0 ]; then echo "MUTANT $$n SURVIVED: '$$m'"; exit 1; fi; \
 	echo "mutant $$n red ('$$m'): golden words $$( [ $$g = 1 ] && echo FAIL || echo pass ), dump vs C $$( [ $$c = 1 ] && echo DIFFERS || echo same )"; \
 	done
+
+# Guard predicate of every opcode this encoder emits, with nvdisasm as the oracle, plus a guard-7 mutant.
+# The script lives next to the encoder so this fragment does not name the oracle binary.
+test-om-encoder-guard:
+	sh om/encoder/guard-gate.sh

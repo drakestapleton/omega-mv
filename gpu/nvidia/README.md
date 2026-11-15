@@ -26,10 +26,13 @@ bytes of CUDApp main `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`; each commit nam
 that later history was not imported. `bw_alloc.om` and `context.om` are the same at both commits, so all five files
 are now 84b524ca's, the commit `seed/ng/cudapp.lock` names. Each file's sha256 equals its row there.
 
-This repository also has another, different copy of the encoder at the top level: `om/encoder/bw_enc_sm121.om`
-(sha256 b69455c2...). The `Makefile`, `mk/om-encoder.mk` and `mk/omega-gpu-engine.mk` reference that copy, and this
-step does not touch it. The encoder Omega NG pins and its gate checks is
-`gpu/nvidia/om/encoder/bw_enc_sm121.om` (sha256 25f447ea...). Edit the copy whose consumers you mean to change.
+This repository also has another copy of the encoder at the top level: `om/encoder/bw_enc_sm121.om`.
+The `Makefile`, `mk/om-encoder.mk` and `mk/omega-gpu-engine.mk` link that copy. The encoder Omega NG pins,
+and `seed/ng/cudapp.lock` hashes, is `gpu/nvidia/om/encoder/bw_enc_sm121.om`. They are not one source:
+the pinned file encodes ops 64..79 and a few payloads this import's consumers do not, and the linked
+file is the one that has to stay on the C oracle's unpredicated words. Both write the same 4-bit guard.
+`om/encoder/guard-gate.sh` checks that, prints both sha256 values, and names the rows whose other bits
+differ. Edit the copy whose consumers you mean to change.
 
 ## The gate
 
