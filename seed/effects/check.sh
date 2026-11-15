@@ -66,6 +66,7 @@ pin_disagree_control() {
     echo "ok   generated unit identity matches seed/out/omc.sha256"
     rm -rf "$d"
     omc_pin_load || { echo "NOT_RUN effects: seed/out/omc.sha256 has no compiler pin"; exit 3; }
+    sh "$ROOT/seed/omc/tests/pin-plant.sh"
 }
 
 [ -f "$OMC" ] || { echo "NOT_RUN effects: no omc at $OMC"; exit 3; }
