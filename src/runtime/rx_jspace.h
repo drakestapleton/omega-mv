@@ -299,6 +299,7 @@ typedef struct {
     JsStats stats;
     uint64_t clock;
     int spill_fd;
+    int dir_fd;                     /* retained validated durable directory, or -1 */
     uint64_t spill_end;
     bool reuse_enabled;
     /* Bytes of the last realization rebuilt, so a sequential read of a
@@ -358,6 +359,10 @@ void js_limits_default(JsLimits *lim);
  * (js_space_anchor returns 0). Commits write version 3. */
 int  js_space_open(JsSpace *s, const char *dir, const JsRealizer *const *realizers,
                    uint32_t n_realizers, const JsLimits *lim, const JsHome *local_home);
+/* Open one durable subdirectory relative to a retained validated directory. */
+int  js_space_open_at(JsSpace *s, int root_fd, const char *name,
+                      const JsRealizer *const *realizers, uint32_t n_realizers,
+                      const JsLimits *lim, const JsHome *local_home);
 /* Make the current non-staged state the durable checkpoint: data first
  * (fdatasync), then metadata to a temporary file, fsync, atomic rename,
  * directory fsync. Only then are quarantined extents reusable. */

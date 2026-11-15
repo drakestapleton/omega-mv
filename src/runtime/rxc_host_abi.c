@@ -35,7 +35,7 @@
 #include "runtime/rx_graph.h"
 #include "runtime/rx_skillroute.h"
 #include "sha256.h"
-#include "omega_path_check.h"
+#include "omega_fs.h"
 
 #include <fcntl.h>
 #include <errno.h>
@@ -264,28 +264,33 @@ int rxc_host_open(const char *dir, uint32_t root_kind, const uint8_t *root, size
     memset(&inf, 0, sizeof inf);
     inf.abi_version = RXC_HOST_ABI_VERSION;
     fill_identity(&inf, &self);
-    /* Check before mkdir (src/omega_path_check.h): a refused dir is an argument error and creates nothing. */
+    /* Check and retain the root while probing identity and journal state. */
     char checked[200];
     if (omega_path_copy(checked, sizeof checked, dir) != 0) return RXC_HOST_E_ARG;
-    if (mkdir(checked, 0700) && errno != EEXIST) return RXC_HOST_E_ARG;
+    int dir_fd = omega_fs_root_open(checked, 1, 0700);
+    if (dir_fd < 0) return RXC_HOST_E_ARG;
 
     /* Identity first (rx_compose_open checks it again). */
-    char p[256];
-    snprintf(p, sizeof p, "%s/machine.id", dir);
-    if (access(p, F_OK) == 0) {
+    struct stat st;
+    if (omega_fs_lstat_at(dir_fd, "machine.id", &st) == 0) {
         AienMachineId stored;
-        if (aien_mid_load(p, &stored) != AIEN_MID_OK || !aien_mid_equal(&stored, &self)) {
+        if (aien_mid_load_at(dir_fd, "machine.id", &stored) != AIEN_MID_OK ||
+            !aien_mid_equal(&stored, &self)) {
+            close(dir_fd);
             if (info) *info = inf;
             return RXC_HOST_E_IDENTITY;
         }
         inf.machine_id_was_stored = 1;
+    } else if (errno != ENOENT) {
+        close(dir_fd);
+        return RXC_HOST_E_ARG;
     }
     /* Torn-tail probe: read-only, no lock, no repair. */
-    snprintf(p, sizeof p, "%s/cortex.cx", dir);
-    if (access(p, F_OK) == 0) {
+    if (omega_fs_lstat_at(dir_fd, "cortex.cx", &st) == 0) {
         CxStore probe;
         memset(&probe, 0, sizeof probe);
-        int prc = cx_open(&probe, p, RX_CORTEX_SUBJECTS, CX_OPEN_READONLY);
+        int prc = cx_open_at(&probe, dir_fd, "cortex.cx", RX_CORTEX_SUBJECTS,
+                             CX_OPEN_READONLY);
         if (prc == CX_OK) {
             inf.records = probe.n;
             cx_close(&probe);
@@ -293,10 +298,15 @@ int rxc_host_open(const char *dir, uint32_t root_kind, const uint8_t *root, size
             inf.tail_torn = 1;
         } else {
             inf.open_rc = prc;
+            close(dir_fd);
             if (info) *info = inf;
             return RXC_HOST_E_OPEN;
         }
+    } else if (errno != ENOENT) {
+        close(dir_fd);
+        return RXC_HOST_E_OPEN;
     }
+    close(dir_fd);
     /* Strict: a torn tail is refused, never cut here (rxc_host_recover). */
     if (inf.tail_torn) {
         if (info) *info = inf;
@@ -319,7 +329,7 @@ int rxc_host_open(const char *dir, uint32_t root_kind, const uint8_t *root, size
         return RXC_HOST_E_FULL;
     }
     h->slot = slot;
-    snprintf(h->dir, sizeof h->dir, "%s", dir);
+    snprintf(h->dir, sizeof h->dir, "%s", checked);
     h->session = session;
     h->self = self;
     h->info = inf;
@@ -557,46 +567,65 @@ int rxc_host_recover(const char *dir, uint32_t root_kind, const uint8_t *root, s
     AienMachineId self;
     if (aien_mid_derive((uint8_t)root_kind, root, root_len, &self) != AIEN_MID_OK)
         return RXC_HOST_E_IDENTITY;
-    char p[256];
-    snprintf(p, sizeof p, "%s/machine.id", dir);
+    char checked[200];
+    if (omega_path_copy(checked, sizeof checked, dir) != 0) return RXC_HOST_E_ARG;
+    int dir_fd = omega_fs_root_open(checked, 0, 0);
+    if (dir_fd < 0) return RXC_HOST_E_ARG;
     AienMachineId stored;
-    if (aien_mid_load(p, &stored) != AIEN_MID_OK || !aien_mid_equal(&stored, &self))
+    if (aien_mid_load_at(dir_fd, "machine.id", &stored) != AIEN_MID_OK ||
+        !aien_mid_equal(&stored, &self)) {
+        close(dir_fd);
         return RXC_HOST_E_IDENTITY;   /* only the home's own machine repairs it */
-    snprintf(p, sizeof p, "%s/cortex.cx", dir);
+    }
     struct stat st;
-    if (stat(p, &st) != 0) return RXC_HOST_OK;   /* no journal: nothing to repair */
+    if (omega_fs_lstat_at(dir_fd, "cortex.cx", &st) != 0) {
+        int absent = errno == ENOENT;
+        close(dir_fd);
+        return absent ? RXC_HOST_OK : RXC_HOST_E_OPEN;
+    }
     const uint64_t old_size = (uint64_t)st.st_size;
 
     /* Keep the tail bytes before anything is cut (the cut goes into the
      * repair record, so nothing leaves the journal unrecorded). */
     uint64_t keep_n = old_size < RXC_HOST_REPAIR_KEEP_MAX ? old_size : RXC_HOST_REPAIR_KEEP_MAX;
     uint8_t *tail = malloc(keep_n ? keep_n : 1);
-    if (!tail) return RXC_HOST_E_NOMEM;
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (!tail) { close(dir_fd); return RXC_HOST_E_NOMEM; }
+    int fd = omega_fs_open_regular_at(dir_fd, "cortex.cx", O_RDONLY, 0);
     if (fd < 0 || pread(fd, tail, keep_n, (off_t)(old_size - keep_n)) != (ssize_t)keep_n) {
         if (fd >= 0) close(fd);
         free(tail);
+        close(dir_fd);
         return RXC_HOST_E_OPEN;
     }
     close(fd);
 
     CxStore probe;
     memset(&probe, 0, sizeof probe);
-    int prc = cx_open(&probe, p, RX_CORTEX_SUBJECTS, CX_OPEN_READONLY);
+    int prc = cx_open_at(&probe, dir_fd, "cortex.cx", RX_CORTEX_SUBJECTS, CX_OPEN_READONLY);
     if (prc == CX_OK) cx_close(&probe);
     else if (prc == CX_ERR_TORN) out->tail_torn = 1;
-    else { free(tail); return RXC_HOST_E_OPEN; }
+    else { free(tail); close(dir_fd); return RXC_HOST_E_OPEN; }
 
     /* The writer open: takes the journal lock (a live handle on this home
      * makes it fail: RXC_HOST_E_OPEN) and, if torn, truncates the one
      * incomplete trailing record. */
     CxStore cx;
     memset(&cx, 0, sizeof cx);
-    if (cx_open(&cx, p, RX_CORTEX_SUBJECTS, CX_OPEN_SYNC | CX_OPEN_REPAIR_TAIL) != CX_OK) {
+    if (cx_open_at(&cx, dir_fd, "cortex.cx", RX_CORTEX_SUBJECTS,
+                   CX_OPEN_SYNC | CX_OPEN_REPAIR_TAIL) != CX_OK) {
         free(tail);
+        close(dir_fd);
         return RXC_HOST_E_OPEN;
     }
-    if (stat(p, &st) != 0) { cx_close(&cx); free(tail); return RXC_HOST_E_OPEN; }
+    fd = omega_fs_open_regular_at(dir_fd, "cortex.cx", O_RDONLY, 0);
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        if (fd >= 0) close(fd);
+        cx_close(&cx);
+        free(tail);
+        close(dir_fd);
+        return RXC_HOST_E_OPEN;
+    }
+    close(fd);
     const uint64_t new_size = (uint64_t)st.st_size;
     const uint64_t kept = cx.n;
     out->cut_lo = new_size;
@@ -611,10 +640,10 @@ int rxc_host_recover(const char *dir, uint32_t root_kind, const uint8_t *root, s
     const JsRealizer *rz[1] = { &RXC_REALIZER };
     JsSpace js;
     memset(&js, 0, sizeof js);
-    snprintf(p, sizeof p, "%s/jspace", dir);
-    if (js_space_open(&js, p, rz, 1, NULL, &home) != JS_OK) {
+    if (js_space_open_at(&js, dir_fd, "jspace", rz, 1, NULL, &home) != JS_OK) {
         cx_close(&cx);
         free(tail);
+        close(dir_fd);
         return RXC_HOST_E_OPEN;
     }
     uint8_t an[48];
@@ -691,6 +720,7 @@ done:
     js_space_destroy(&js);
     cx_close(&cx);
     free(tail);
+    close(dir_fd);
     if (rc == RXC_HOST_OK && out->repaired) {
         /* Trial open: does the composition accept the repaired home? */
         RxcHost *t = NULL;

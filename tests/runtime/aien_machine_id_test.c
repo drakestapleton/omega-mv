@@ -92,6 +92,39 @@ static void test_round_trip(void) {
     unlink(path);
 }
 
+static void test_symlink_refusal(void) {
+    AienMachineId m;
+    aien_mid_derive(AIEN_MID_ROOT_PROVISIONED, (const uint8_t *)"symlink-root", 12, &m);
+    char dir[] = "/tmp/aien_mid_symlink_XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    char victim[160], path[160];
+    snprintf(victim, sizeof victim, "%s/victim", dir);
+    snprintf(path, sizeof path, "%s/machine.id", dir);
+    int fd = open(victim, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    CHECK(fd >= 0 && write(fd, "SAFE", 4) == 4);
+    if (fd >= 0) close(fd);
+    CHECK(symlink(victim, path) == 0);
+    CHECK(aien_mid_store(path, &m) == AIEN_MID_E_IO);
+    char got[5] = { 0 };
+    fd = open(victim, O_RDONLY);
+    CHECK(fd >= 0 && read(fd, got, 4) == 4 && memcmp(got, "SAFE", 4) == 0);
+    if (fd >= 0) close(fd);
+    unlink(path);
+    unlink(victim);
+    rmdir(dir);
+
+    char real[] = "/tmp/aien_mid_real_XXXXXX";
+    char link[] = "/tmp/aien_mid_link_XXXXXX";
+    CHECK(mkdtemp(real) != NULL && mkdtemp(link) != NULL);
+    CHECK(rmdir(link) == 0 && symlink(real, link) == 0);
+    snprintf(path, sizeof path, "%s/machine.id", link);
+    CHECK(aien_mid_store(path, &m) == AIEN_MID_E_IO);
+    snprintf(path, sizeof path, "%s/machine.id", real);
+    CHECK(access(path, F_OK) != 0);
+    unlink(link);
+    rmdir(real);
+}
+
 static void test_equality_hash(void) {
     AienMachineId a, b, c;
     uint8_t s[32];
@@ -208,6 +241,7 @@ int main(int argc, char **argv) {
     }
     test_derive_and_aienos_compat();
     test_round_trip();
+    test_symlink_refusal();
     test_equality_hash();
     test_conversions();
     test_malformed();

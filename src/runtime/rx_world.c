@@ -21,7 +21,7 @@
 #include "rx_argus.h"
 #include "sha256.h"
 #include "rx_generation.h"   /* RX_GEN_HALT_MARK */
-#include "omega_path_check.h"
+#include "omega_fs.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -959,72 +959,77 @@ static int seal_append(char *buf, size_t len, size_t cap) {
     return (int)len + 72;
 }
 
-static int fsync_dir(const char *dir) {
-    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) return -errno;
-    int rc = fsync(fd) == 0 ? 0 : -errno;
-    close(fd);
-    return rc;
-}
-
 /* Write `buf` to dir/name durably (temporary file, fsync, rename, fsync dir).
  * With excl, an existing dir/name is never replaced (link, not rename). The
  * name is one checked component (src/omega_path_check.h, no '/'); dir is
- * w->halt_dir, checked when it was set. */
-static int durable_write(const char *dir, const char *name, const char *buf, size_t len, bool excl) {
-    char nm[160], tmp[512], dst[512];
+ * w->halt_fd, validated and retained when it was set. */
+static int durable_write(int dir_fd, const char *name, const char *buf, size_t len, bool excl) {
+    char nm[160], stem[200], tmp[OMEGA_FS_NAME_MAX + 1];
     if (omega_path_copy(nm, sizeof nm, name) != 0 || strchr(nm, '/') || strcmp(nm, ".") == 0)
         return -EINVAL;
-    if (snprintf(tmp, sizeof tmp, "%s/%s.partial", dir, nm) >= (int)sizeof tmp ||
-        snprintf(dst, sizeof dst, "%s/%s", dir, nm) >= (int)sizeof dst)
+    if (snprintf(stem, sizeof stem, "%s.partial", nm) >= (int)sizeof stem ||
+        omega_fs_temp_name(tmp, sizeof tmp, stem) != 0)
         return -ENAMETOOLONG;
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (!excl && omega_fs_replace_ok_at(dir_fd, nm) != 0) return -errno;
+    int fd = omega_fs_open_regular_at(dir_fd, tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) return -errno;
     size_t off = 0;
     while (off < len) {
         ssize_t n = write(fd, buf + off, len - off);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { int e = n < 0 ? errno : EIO; close(fd); unlink(tmp); return -e; }
+        if (n <= 0) {
+            int e = n < 0 ? errno : EIO;
+            close(fd);
+            omega_fs_unlink_at(dir_fd, tmp, 0);
+            return -e;
+        }
         off += (size_t)n;
     }
-    if (fsync(fd) != 0) { int e = errno; close(fd); unlink(tmp); return -e; }
+    if (fsync(fd) != 0) {
+        int e = errno;
+        close(fd);
+        omega_fs_unlink_at(dir_fd, tmp, 0);
+        return -e;
+    }
     close(fd);
     if (excl) {
-        if (link(tmp, dst) != 0) { int e = errno; unlink(tmp); return -e; }
-        unlink(tmp);
-    } else if (rename(tmp, dst) != 0) {
-        int e = errno; unlink(tmp); return -e;
+        if (omega_fs_link_at(dir_fd, tmp, nm) != 0) {
+            int e = errno;
+            omega_fs_unlink_at(dir_fd, tmp, 0);
+            return -e;
+        }
+        omega_fs_unlink_at(dir_fd, tmp, 0);
+    } else if (omega_fs_rename_at(dir_fd, tmp, nm) != 0) {
+        int e = errno;
+        omega_fs_unlink_at(dir_fd, tmp, 0);
+        return -e;
     }
-    return fsync_dir(dir);
+    return fsync(dir_fd) == 0 ? 0 : -errno;
 }
 
 static int halt_mark_write(const RxWorld *w) {
-    if (!w->halt_dir[0]) return 0;
+    if (w->halt_fd < 0) return 0;
     char buf[512];
     int n = halt_record(&w->halt, buf, sizeof buf);
     if (n < 0 || (n = seal_append(buf, (size_t)n, sizeof buf)) < 0) return -EOVERFLOW;
-    int rc = durable_write(w->halt_dir, RX_GEN_HALT_MARK, buf, (size_t)n, false);
+    int rc = durable_write(w->halt_fd, RX_GEN_HALT_MARK, buf, (size_t)n, false);
     return rc == 0 ? 1 : rc;
 }
 
 /* Read dir/OPERATOR_HALT. 0 absent, 1 read and its seal holds (h filled),
  * RX_ERR_TORN present but unreadable as a sealed record, RX_ERR_IO cannot tell. */
-static int halt_mark_read(const char *dir, RxHaltStatus *h, char *raw, size_t cap, size_t *raw_len) {
-    char path[512];
-    if (snprintf(path, sizeof path, "%s/%s", dir, RX_GEN_HALT_MARK) >= (int)sizeof path)
-        return RX_ERR_IO;
+static int halt_mark_read(int dir_fd, RxHaltStatus *h, char *raw, size_t cap, size_t *raw_len) {
     raw[0] = 0;
     *raw_len = 0;
     /* Never follow a link or block on a FIFO under the world locks: a mark that
      * is not a regular file is damaged (TORN: the world stays stopped, and resume
      * keeps a record and removes it, so the store is never blocked for good). */
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0) return errno == ENOENT ? 0 : errno == ELOOP ? RX_ERR_TORN : RX_ERR_IO;
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        close(fd);
-        return RX_ERR_TORN;
-    }
+    if (omega_fs_lstat_at(dir_fd, RX_GEN_HALT_MARK, &st) != 0)
+        return errno == ENOENT ? 0 : RX_ERR_IO;
+    if (!S_ISREG(st.st_mode)) return RX_ERR_TORN;
+    int fd = omega_fs_open_regular_at(dir_fd, RX_GEN_HALT_MARK, O_RDONLY | O_NONBLOCK, 0);
+    if (fd < 0) return RX_ERR_TORN;
     ssize_t n = read(fd, raw, cap - 1);
     close(fd);
     if (n < 0) return RX_ERR_IO;
@@ -1067,16 +1072,20 @@ static uint64_t halt_crumb(RxWorld *w, RxCrumbKind kind, RxCapRef cap, int32_t r
 }
 
 int rx_world_set_halt_dir(RxWorld *w, const char *dir) {
-    /* Only the checked copy (src/omega_path_check.h) is kept and opened. */
+    /* Retain the checked directory so every later operation stays in it. */
     char checked[sizeof w->halt_dir];
     if (!w || omega_path_copy(checked, sizeof checked, dir) != 0) return RX_ERR_ARG;
+    int dir_fd = omega_fs_root_open(checked, 0, 0);
+    if (dir_fd < 0) return RX_ERR_ARG;
     pthread_mutex_lock(&w->mu);
     pthread_mutex_lock(&w->callers_mu);
+    if (w->halt_fd >= 0) close(w->halt_fd);
+    w->halt_fd = dir_fd;
     memcpy(w->halt_dir, checked, strlen(checked) + 1);
     RxHaltStatus h;
     char raw[600];
     size_t raw_len = 0;
-    int rc = halt_mark_read(w->halt_dir, &h, raw, sizeof raw, &raw_len);
+    int rc = halt_mark_read(w->halt_fd, &h, raw, sizeof raw, &raw_len);
     if (rc == 0 && w->halted) {
         w->halt.durable = halt_mark_write(w);   /* a stop taken before the directory was set */
     } else if (rc != 0 && !w->halted) {
@@ -1139,14 +1148,14 @@ int rx_world_emergency_resume(RxWorld *w, uint32_t subject, const RxCallerCred *
     pthread_mutex_lock(&w->callers_mu);
     int rc = halt_authorize(w, subject, cred, cap);
     if (rc == RX_OK && !w->halted) rc = RX_HALT_NOT_STOPPED;
-    if (rc == RX_OK && w->halt_dir[0]) {
+    if (rc == RX_OK && w->halt_fd >= 0) {
         /* The stop record is kept, never deleted: its bytes, then the resume,
          * sealed together under a name no later resume can take; only then is
          * the mark removed. Any failure leaves the world stopped. */
         RxHaltStatus disk;
         char raw[600];
         size_t raw_len = 0;
-        int mr = halt_mark_read(w->halt_dir, &disk, raw, sizeof raw, &raw_len);
+        int mr = halt_mark_read(w->halt_fd, &disk, raw, sizeof raw, &raw_len);
         if (mr == RX_ERR_IO) rc = RX_ERR_IO;
         else if (mr != 0) {
             char buf[1200], name[160];
@@ -1158,11 +1167,12 @@ int rx_world_emergency_resume(RxWorld *w, uint32_t subject, const RxCallerCred *
                 rc = RX_ERR_IO;
             snprintf(name, sizeof name, "%s.resumed.%llu.%llu", RX_GEN_HALT_MARK,
                      (unsigned long long)w->halt.seq, (unsigned long long)t);
-            if (rc == RX_OK && durable_write(w->halt_dir, name, buf, (size_t)n, true) != 0)
+            if (rc == RX_OK && durable_write(w->halt_fd, name, buf, (size_t)n, true) != 0)
                 rc = RX_ERR_IO;
-            char mark[512];
-            snprintf(mark, sizeof mark, "%s/%s", w->halt_dir, RX_GEN_HALT_MARK);
-            if (rc == RX_OK && (unlink(mark) != 0 || fsync_dir(w->halt_dir) != 0)) rc = RX_ERR_IO;
+            if (rc == RX_OK &&
+                (omega_fs_unlink_at(w->halt_fd, RX_GEN_HALT_MARK, 0) != 0 ||
+                 fsync(w->halt_fd) != 0))
+                rc = RX_ERR_IO;
         }
     }
     if (rc == RX_OK) {
@@ -2117,6 +2127,7 @@ static int init_common(RxWorld *w, RxCapRoot *root, const void *auth_ctx,
         return RX_ERR_ARG;
     if (!root && !validate) return RX_ERR_ARG;
     memset(w, 0, sizeof(*w));
+    w->halt_fd = -1;
     w->root = root;
     pthread_mutex_init(&w->callers_mu, NULL);
     w->sequential = sequential;
@@ -2189,6 +2200,8 @@ void rx_world_destroy(RxWorld *w) {
     w->recorder = NULL;
     w->recorder_release = NULL;
     w->recorder_ctx = NULL;
+    if (w->halt_fd >= 0) close(w->halt_fd);
+    w->halt_fd = -1;
     for (uint32_t i = 0; i < RX_MAX_OBJECTS; i++) free(w->subs[i]);
     rx_coherent_free(w);
     free(w->deferred);

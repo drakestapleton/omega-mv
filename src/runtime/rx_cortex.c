@@ -36,6 +36,7 @@
 #endif
 
 #ifndef CX_NO_POSIX
+#include "omega_fs.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -386,8 +387,9 @@ static int write_all(int fd, const uint8_t *b, size_t n) {
 }
 
 static int jp_open(void *ctx, const char *name, int ro, void **h) {
-    (void)ctx;
-    int fd = open(name, ro ? O_RDONLY | O_CLOEXEC : O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    int flags = ro ? O_RDONLY : O_RDWR | O_CREAT;
+    int fd = ctx ? omega_fs_open_regular_at((int)(intptr_t)ctx - 1, name, flags, 0644)
+                 : omega_fs_open_regular(name, flags, 0644);
     if (fd < 0) return CX_ERR_IO;
     if (!ro && flock(fd, LOCK_EX | LOCK_NB) != 0) {
         int e = errno;
@@ -447,6 +449,12 @@ const CxJournalOps cx_journal_posix = { jp_open, jp_size, jp_read, jp_append, jp
 
 int cx_open(CxStore *s, const char *path, uint64_t n_subjects, uint32_t flags) {
     return cx_open_with(s, &cx_journal_posix, NULL, path, n_subjects, flags);
+}
+
+int cx_open_at(CxStore *s, int dir_fd, const char *name, uint64_t n_subjects, uint32_t flags) {
+    if (dir_fd < 0 || !name || strchr(name, '/')) return CX_ERR_ARG;
+    return cx_open_with(s, &cx_journal_posix, (void *)(intptr_t)(dir_fd + 1), name,
+                        n_subjects, flags);
 }
 #endif /* !CX_NO_POSIX */
 

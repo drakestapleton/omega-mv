@@ -247,12 +247,15 @@ static inline int aien_mid_from_text(const char *s, AienMachineId *out) {
 
 /* ---- aien_machine_id.c -------------------------------------------------- */
 
-/* Persist atomically (temp file, fsync, rename, fsync directory). A path that
- * src/omega_path_check.h refuses (a ".." component, a byte outside its set, too
- * long) is AIEN_MID_E_ARG for both calls, before any file is touched. */
+/* Persist atomically (exclusive temp file, fsync, descriptor-relative rename,
+ * fsync directory). Every path component and final file refuses symlinks; a
+ * path that src/omega_path_check.h refuses is AIEN_MID_E_ARG before any file
+ * is touched. The _at forms use one checked component in a held directory. */
 int aien_mid_store(const char *path, const AienMachineId *m);
+int aien_mid_store_at(int dir_fd, const char *name, const AienMachineId *m);
 /* Load; any file that is not exactly one valid record is rejected. */
 int aien_mid_load(const char *path, AienMachineId *out);
+int aien_mid_load_at(int dir_fd, const char *name, AienMachineId *out);
 
 /* Local runtime index <-> canonical identity. Index 0 means "none" (as in
  * rx_capq); indexes are dense from 1 in bind order and live only in this
