@@ -682,6 +682,10 @@ om4(omc.om) stays equal to omc(omc.om). Checked by `seed/omc/gate6.sh`.
   structs of one call are distinct names (error 19). A function does not return a struct.
 - `len` of a struct is refused (error 7). `read` and `write` of a struct are refused (error 7).
 
+### 9.7.1 Packed structs (omc only, gate-packed)
+
+`struct packed` is the same struct with a layout attribute. The image, the endian attribute, bitfields, and the record a C ABI would read are specified in `docs/one_layer/FR2-PACKED-STRUCTS.md`. `sizeof` and `offsetof` report that image. An ordinary struct is unchanged. IR mode still refuses `struct` (error 9).
+
 ### 9.8 Break, continue and trap (omc only, gate7)
 
 `break`, `continue` and `trap` are the path-ending statements §3 lists. omc implements all three;
@@ -779,7 +783,7 @@ code. A group whose only value has no type is still ambiguous (error 11), and a 
 ### 9.11 Layout queries (omc only, gate10)
 
 `sizeof T` is the size in bytes of a scalar type (bool 1; uchar/byte 1; ushort/short 2;
-uint/int/f32 4; ulong/long/f64 8). `sizeof S` is a struct's size: 8 bytes for each of its cells.
+uint/int/f32 4; ulong/long/f64 8). `sizeof S` is a struct's size: 8 bytes for each of its cells, or the packed image size (9.7.1).
 `offsetof S f` is the byte offset of field `f`; an array field gives its first element. Both are
 compile-time constants of type ulong and add no code, so they compose in expressions.
 
