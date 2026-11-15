@@ -40,7 +40,7 @@ twice: a validation pass (trailer digest with SHA-256 in Omega, header, every re
 and the coding pass, which re-checks every record and symbol and hashes the file again; a file
 that changed between the passes is refused (DIGEST). An output path that names an input (same
 device and inode) is refused before anything is opened for writing, and a refusal after the
-output was created removes it.
+output was created, including IO (102) from a failed fsync or fclose in `ofinish`, removes it.
 
 Two ceilings come from the 64-bit micro-bit sums, not from a buffer (Wolfram W3). `tpsload`
 refuses `n > 1152514738906` with ARG before the body-size check, because `16005647*n + 480000000`
@@ -61,7 +61,19 @@ T the section 8 ideal length of exactly the coded symbols:
     lower:  coded_bits >= T + 472 - G,   G = sum, over the symbols coded as the last symbol of
                                              their row (s = K - 1), of log2(1 + 256/q)
 
-In integers (micro-bits, as checked by the program on every run):
+The integer inequalities below are what the program evaluates on every encode, decode,
+verify and selftest. The lower one is a necessary consequence of the stated bound (no
+false ALARM 6 when that bound holds) but not a sufficient one: the rounding of T into
+`ideal_ub`, the `- n` slack, and the excess of `gain_ub` over 10^6 G open a gap of at
+most `1.49984 n + 24.37 m` micro-bits (m is the number of last-symbol occurrences;
+derived in proof step 5). So `lower=PASS` certifies
+
+    coded_bits >= T + 472 - G - (1.49984 n + 24.37 m) / 10^6
+
+The stated bound itself comes from Lean `encode_lower` on the model, together with the
+logarithm and the length identity. Tightening the integer test so that a pass implied
+the stated form would raise the threshold by that gap and could ALARM on a stream that
+still meets `encode_lower`. In integers (micro-bits):
 
     1,000,000 x coded_bits <= ideal_ub + 5647 n + 480,000,000
     1,000,000 x coded_bits >= ideal_ub + 472,000,000 - n - gain_ub
@@ -129,15 +141,23 @@ coder's bytes, so they sit exactly where the C coder's do.
    shifts for one renorm byte still decodes, then fails ALARM 1; the host gate builds that mutant
    and requires the identity alarm on verify. Lean does not prove this identity.
 4. **Integer ideal (receipt W2).** Wolfram recomputed the section 8 ub rule for every
-   q = 1..65535: exact - ub lies in [-0.50019, +0.49984] ub; sum ub = 94,539,136,349 and
+   q = 1..65535: exact - ub lies in [-0.500192, +0.49984] ub; sum ub = 94,539,136,349 and
    sum q * ub mod 2^64 = 1,549,081,999,916,376. `tcr-om selftest` recomputes both sums in Omega and
    must match (ALARM 5 otherwise), so the Omega ub equals the rule for every q.
 5. **Combining.** Upper: 10^6 coded_bits < ideal_ub + n (10^6 eps + 0.49984) + 480 x 10^6 +
    3.4e-4, and 5647 >= 10^6 eps + 0.501 leaves at least 0.022 ub per symbol, more than the
    3.4e-4 ub constant for any n >= 1; n = 0 gives equality (480 bits, a 4-byte payload). Lower:
-   10^6 coded_bits > ideal_ub - 0.50019 n + 472 x 10^6 - 10^6 G, and 10^6 G <= gain_ub (each term
-   is within 0.50019 + 0.49984 < 2 ub of its exact gain; for q > 65280 the gain is at most its value
-   at q = 65281, 5646.48 ub < 5649).
+   10^6 coded_bits > ideal_ub - 0.500192 n + 472 x 10^6 - 10^6 G, and 10^6 G <= gain_ub (each term
+   is within 0.500192 + 0.49984 < 2 ub of its exact gain; for q > 65280 the gain is at most its
+   value at q = 65281, 5646.48 ub < 5649, and the excess is largest at q = 65535:
+   5649 - 10^6 log2(1 + 256/65535) = 24.36515... < 24.37). The program's integer test is
+   `10^6 coded_bits >= ideal_ub + 472 x 10^6 - n - gain_ub`. Against the stated form
+   `10^6 coded_bits >= 10^6 T + 472 x 10^6 - 10^6 G`, a pass therefore implies the stated
+   bound minus a gap of `(10^6 T - ideal_ub) + n + (gain_ub - 10^6 G)` micro-bits.
+   `10^6 T - ideal_ub` is at most `0.49984 n` (W2). The `- n` term contributes another `n`.
+   `gain_ub - 10^6 G` is at most 24.37 ub per last symbol, so the gap is at most
+   `1.49984 n + 24.37 m` micro-bits. (The W2 interval is written [-0.500192, +0.49984]
+   because the receipt minimum is -0.500191829..., which is slightly below -0.50019.)
 
 Model-to-system link: the Lean `step`/`renorm` are a transcription of CODER_SPEC section 5 and of
 the arithmetic in `encs`. The Lean proof covers that model, not `encs`. It never mentions `low`,
@@ -166,15 +186,18 @@ checks, not by Lean.
   truncated (TRUNC), trailing byte (TRAIL), other TPS1 (BINDING), altered magic (HEADER),
   corrupted TPS1 (DIGEST), TSY1 of another trace (COUNT), corrupted TSY1 (DIGEST). A decode
   refused after its output was created leaves no file; an output path naming an input is refused
-  (ARG) and the input is unchanged.
+  (ARG) and the input is unchanged. An encode whose `ofinish` fsync fails (forced in the gate)
+  exits 2 with IO (102) and leaves no output; a mutant that clears the open flag before that
+  check leaves the file and is caught.
 - Mutants caught on that run: `range >> 15` (no longer byte-identical), upper-bound constants
   lowered (ALARM 2), ub rounding removed (ALARM 5), lower-bound constant raised by 10 bits
   (ALARM 6).
 - Lean: 10 theorems checked, standard axioms only.
 
 The host script's later checks (decoder shift alarm, `n = cap+1` refused ARG, ALARM 7 on a
-wrapping sum, and the `range >> 15` mutant required to differ or alarm on more than one unit)
-are not part of the Spark paragraph above.
+wrapping sum, the `ofinish` fsync-failure cleanup and its old-order mutant, and the
+`range >> 15` mutant required to differ or alarm on more than one unit) are not part of the
+Spark paragraph above.
 
 Whole dev file (seed 1 only; seeds 8 to 10 untouched), not part of the gate because the data is not
 in the repository: 2,172,776 symbols, TY-2 candidate: ideal 1,752,630.382351 bits, coded 1,754,208

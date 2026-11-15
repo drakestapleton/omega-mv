@@ -32,10 +32,13 @@
 #  4b n = 1152514738907 (cap+1) refuses ARG. The file is a digest-valid 160-byte TPS1, not a
 #    terabyte body. A sibling with n = 1 and the same shape refuses FORMAT, so a size-check
 #    miss is not counted as the cap. `selftest overflow` raises ALARM 7 on the wrapping sum.
+#  4c ofinish: a forced fsync failure (seccomp EIO on fsync/fdatasync) refuses IO (102) and
+#    removes the partial output; a mutant that clears the open flag before that check leaves
+#    the file.
 #  5 mutants that must fail: range >> 15 on every real unit (exit 0 and bytes differ from C, or
 #    exit 3 from an ALARM; a refusal of every unit is a failed mutant), decoder renorm count
 #    doubled (ALARM 1 on verify, the decode still finishes), upper-bound constants, ub rounding,
-#    lower-bound constant;
+#    lower-bound constant, ofinish flag-clear order;
 #  6 Lean: docs/turing/proofs/TcrBound.lean checks with the pinned toolchain, 10 theorems, no
 #    sorry, standard axioms only (lean found as $LEAN, on PATH or in ~/.elan/bin; missing = FAIL).
 set -u
@@ -136,6 +139,55 @@ cmp -s "$N/self.tps" "$N/self.ref" && pass "input left intact" || fail "the inpu
 expect_rc "usage" 1 "$B" encode rans "$D/s.tps" "$D/s.tsy" "$N/w.tcr"
 grep -q '^lower=PASS$' "$D/enc.txt" || fail "unit 1 has no lower=PASS line"
 
+# ofinish fsync failure. A small seccomp wrapper makes fsync and fdatasync return EIO
+# (qemu-user translates the AArch64 fsync to the host syscall, so the filter on the
+# wrapper process is enough). Writes already succeeded, so this hits ofinish, not oflush.
+# The open flag must still be set so cleanup unlinks the partial output.
+cat > "$N/fail_fsync.c" << 'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static int install(void) {
+  struct sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fsync, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EIO & 0xffff)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fdatasync, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EIO & 0xffff)),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog prog = { .len = (unsigned short)(sizeof filter / sizeof filter[0]), .filter = filter };
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
+  return (int)syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+}
+int main(int argc, char **argv) {
+  if (argc < 2) { fprintf(stderr, "usage: fail_fsync CMD [ARGS]\n"); return 127; }
+  if (install() != 0) { perror("seccomp"); return 127; }
+  execvp(argv[1], argv + 1);
+  perror("exec");
+  return 127;
+}
+C
+if gcc -O2 -Wall -Werror -o "$OUT/fail_fsync" "$N/fail_fsync.c"; then
+  rm -f "$N/fsync.tcr"
+  expect_rc "ofinish fsync failure is IO" 2 "$OUT/fail_fsync" "$B" encode range "$D/s.tps" "$D/s.tsy" "$N/fsync.tcr"
+  grep -q 'refused -102 IO' "$OUT/last.err" || fail "ofinish fsync failure: not IO ($(head -c 160 "$OUT/last.err"))"
+  if [ -e "$N/fsync.tcr" ]; then fail "ofinish fsync failure left the output file"
+  else pass "ofinish fsync failure removed the partial output"; fi
+else
+  fail "fail_fsync wrapper did not compile"
+fi
+
 # Symbol-count cap. Both files are 128-byte headers plus a real trailer (160 bytes). n = 1
 # still dies on the body-size check (FORMAT). n = cap+1 dies on the word cap (ARG), which is
 # checked first so this does not require a terabyte of records.
@@ -216,6 +268,55 @@ cmp -s "$N/mut4.om" "$ROOT/src/turing/tc_range.om" && fail "mutant 4 did not cha
 if build "$N/mut4.om" "$N/mut4"; then
   expect_rc "lower-bound mutant (10 bits too high) raises the ALARM" 3 "$N/mut4" encode range "$OUT/u2/s.tps" "$OUT/u2/s.tsy" "$N/m4.tcr"
 else fail "mutant 4 build"; fi
+# Old ofinish order: clear OS[4] after fclose, then refuse. The fsync-failure case must
+# leave the output (cleanup sees the flag already clear). A binary that still unlinks
+# does not catch the bug.
+python3 - "$ROOT/src/turing/tc_range.om" "$N/mut6.om" << 'PY'
+import sys
+src = open(sys.argv[1]).read()
+old = """fn ofinish to void
+note Flush, fsync and close. Refuse IO (102) on fsync or fclose failure before clearing
+note OS[4], so cleanup still unlinks the partial output.
+oflush
+f = int get OS 0
+k = fsync f
+z = fclose f
+if lt k 0
+refuse 102 0
+end
+if lt z 0
+refuse 102 0
+end
+put OS 4 0
+end
+"""
+new = """fn ofinish to void
+oflush
+f = int get OS 0
+k = fsync f
+z = fclose f
+put OS 4 0
+if lt k 0
+refuse 102 0
+end
+end
+"""
+if old not in src:
+    sys.stderr.write("ofinish block not found for the old-order mutant\n")
+    sys.exit(1)
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PY
+cmp -s "$N/mut6.om" "$ROOT/src/turing/tc_range.om" && fail "ofinish old-order mutant did not change the source"
+if [ -x "$OUT/fail_fsync" ] && build "$N/mut6.om" "$N/mut6"; then
+  rm -f "$N/mut6.tcr"
+  "$OUT/fail_fsync" "$N/mut6" encode range "$D/s.tps" "$D/s.tsy" "$N/mut6.tcr" > "$OUT/last.out" 2> "$OUT/last.err"
+  rc=$?
+  if [ "$rc" -eq 2 ] && grep -q 'refused -102 IO' "$OUT/last.err" && [ -e "$N/mut6.tcr" ]; then
+    pass "ofinish old-order mutant leaves the output on fsync failure (exit 2 IO)"
+  else
+    fail "ofinish old-order mutant: exit $rc, file exists=$([ -e "$N/mut6.tcr" ] && echo yes || echo no) ($(head -c 160 "$OUT/last.err"))"
+  fi
+else fail "ofinish old-order mutant build or fail_fsync missing"; fi
 
 # Lean: the bound's proof must still check, with no sorry and only the standard axioms.
 # docs/turing/proofs/lean-toolchain pins the toolchain; elan's `lean` picks it from that folder.
