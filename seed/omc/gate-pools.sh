@@ -324,7 +324,11 @@ if on 11; then
   if [ "${POOLS_SKIP_EQUIV:-0}" = 1 ]; then
     say "NOT_RUN 11 byte identity (POOLS_SKIP_EQUIV=1)"
   else
-    git ls-files '*.om' | grep -v "^$T/" | grep -vxF -f $B/allowed > $B/files
+    # The control compiler has no thread, spawn, join or aadd. The FR-6 programs and the two
+    # effect probes exist to use those words, so they are not part of this comparison.
+    git ls-files '*.om' | grep -v "^$T/" | grep -v '^seed/omc/tests/fr6/' \
+      | grep -vxF -e seed/effects/cases/probe-spawn.om -e seed/effects/cases/probe-join.om \
+      | grep -vxF -f $B/allowed > $B/files
     [ -z "${POOLS_EQUIV_MAX:-}" ] || { head -n "$POOLS_EQUIV_MAX" $B/files > $B/f2; mv $B/f2 $B/files; }
     n=0; d=0
     while read -r f; do
