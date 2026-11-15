@@ -4,7 +4,7 @@
 # change to the seeded compiler line: every step, its command, exit, expected exit, required text and log sha256 go to
 # OUT/SUMMARY.log; nothing is retried; a step whose exit or required text differs is a failed record.
 # usage: tests/landgate/run.sh BASE OUT     (run from a CLEAN checkout of the head; OUT must not exist)
-#   BASE          the Radicle main commit the head sits on (its seed/out/omc is the comparison compiler)
+#   BASE          the main commit the head sits on (its seed/out/omc is the comparison compiler)
 #   OMEGA_BRIDGE  an omega-bridge git checkout holding the om/omega-bridge.lock commit (units, parity, qualify)
 #   PHYSICS_DIR   the physics checkout for make test-m15
 #   LANDGATE_CORE0_LOCK  optional lock file taken (flock) around the one step pinned to CPU 0 (sched-core0)
@@ -93,6 +93,20 @@ WANT_TEXT="NOT_RUN gate-pools: shallow clone" rec pools-shallow 3 bash -c 'cd "$
 core0() { if [ -n "${LANDGATE_CORE0_LOCK:-}" ]; then flock "$LANDGATE_CORE0_LOCK" taskset -c 0 "$@"; else taskset -c 0 "$@"; fi; }
 WANT_TEXT="OM2GATE PASS" rec sched-core0 0 core0 bash -c 'set -e; mkdir -p build/seed/c0 build/seed/sched-caller; seed/out/omc < seed/qualification/om2/gate.om > build/seed/c0/gate; chmod +x build/seed/c0/gate; seed/out/omc < seed/host/affinity/caller-conductor.om > build/seed/sched-caller/conductor; chmod +x build/seed/sched-caller/conductor; echo "mask $(taskset -cp $$)"; exec build/seed/c0/gate seed/out/omc "$(cut -c1-64 seed/out/omc.sha256)" seed/host/affinity/sched.cases "$1"' sh "$L/sched-core0.scratch"
 if [ -f seed/host/matrix-check.py ]; then rec matrix-check 0 python3 seed/host/matrix-check.py seed/host/EFFECT-MATRIX.md "$BASE"; else na matrix-check "seed/host/EFFECT-MATRIX.md is not in this head"; fi
+rec matrix-anchor 0 sh seed/host/matrix-anchor-gate.sh
+rec lexer-agree 0 sh seed/omc/tests/lexer-agree.sh
+rec owner-truth 0 sh seed/omc/tests/pools/owner-truth.sh
+rec no-new-radicle 0 sh tests/landgate/no-new-radicle.sh
+rec gpu-steps 0 sh tests/landgate/gpu-steps.sh
+rec gpcut-note 0 sh gpu/amd/rest/gpcut-note.sh
+gb10() { step=$1; shift; if [ "${LANDGATE_GB10:-}" = 1 ]; then rec "$step" 0 "$@"; else na "$step" "requires: gb10"; fi; }
+gb10 gpu-amd tests/gates/run.sh gpu-amd
+gb10 gpu-amd-rest tests/gates/run.sh gpu-amd-rest
+gb10 gpu-runtime tests/gates/run.sh gpu-runtime
+gb10 gpu-checks tests/gates/run.sh gpu-checks
+gb10 bridge-nvml tests/gates/run.sh bridge-nvml
+gb10 shlib tests/gates/run.sh shlib
+gb10 gpu-units tests/gates/run.sh gpu-units
 WANT_TEXT="LANDGATE-CONTROLS PASS" rec judge-controls 0 bash tests/landgate/controls.sh "$BASE" "$L/controls"
 WANT_TEXT="LANDGATE-INSTRUMENTS PASS" rec instrument-controls 0 bash tests/landgate/instruments.sh "$L/instruments"
 WANT_TEXT="MERGE-RESIDUE PASS" rec merge-residue 0 bash tests/landgate/merge-residue.sh
