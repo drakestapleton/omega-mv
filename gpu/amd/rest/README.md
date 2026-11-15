@@ -26,6 +26,11 @@ rows have no row, because the gate does those itself. Hardware rows are NOT_RUN 
 The `guard` row of `kfd-verdicts.tsv` is not an oracle verdict: it is written by hand in `tables.py` and
 states the gate's own control (records.om without its index guard must not refuse that index).
 
+Before a source is composed, the gate drops each of its lines that starts with `note gate-pools:`. Those lines
+are the pool declarations that `seed/omc/gate-pools.sh` (section 11) reads from the source itself, and the oracles
+composed the sources without them, so the text hashed and compiled is still the oracle's. Any other change to a
+source still differs and fails (control: an ordinary `note` line appended to `launch/plan.om` fails 15 rows).
+
 The tables were generated outside this tree by the lane's oracle scripts `tables.py` (with `sections.py` and
 `plan-keep.py`) from the old checkers' outputs. Those scripts and every input they read are kept outside the
 repository by the lane, identified by sha256: `tables.py`
