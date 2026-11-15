@@ -18,7 +18,8 @@ T=$(mktemp -d build/seed/r18/kw.XXXXXX)
 trap 'rm -rf "$T"' EXIT HUP INT TERM
 bad() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
-awk -f seed/omc/genkw.awk > "$T/gen"
+# No input file: gawk waits on a terminal otherwise, and the seed gate never returns.
+awk -f seed/omc/genkw.awk > "$T/gen" < /dev/null
 
 # The committed chain, scoped to fn kw: stop at its final `ret 0` fallback.
 awk '
