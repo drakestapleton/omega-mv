@@ -47,9 +47,12 @@ with `struct`, `layout` or `abstract`, a function header in an `om2` unit, every
 a `fn` line. This under-counts; it never forces an item that had an alternative in the tested programs.
 
 Limit of `expand`: a `note` line written between a path end and its forced `end` comes back after that
-`end`. The compiled program is the same. `text` lines and `note` lines are copied with their leading and
+`end`, and blank lines are not kept. `text` lines and `note` lines are copied with their leading and
 trailing blanks removed, so an `om2 fmt` unit (whose omc output is its own formatted source) does not come back
-byte for byte; a compiled program does.
+byte for byte. A compiled program usually does, but not always: in an om2 unit omc compiles an erasing
+`abstract` constructor differently when a blank or `note` line sits between its `ret seal ...` and `end`, so
+after strip and expand such a program can compile to a different binary (seen once, review 4 of 2026-11-15:
+same exit code and output). Gate B checks the same-binary property only on the programs it runs.
 
 ## Gate
 
@@ -68,6 +71,8 @@ word (line end) or one more statement (`end`), D seven broken machines each fail
 with an optional tail is used by at least one accepted program, so a new such word needs a fixture.
 
 ## Measured (host only)
+
+A dated snapshot (2026-11-15) of one gate run, typed from its output; run the gate for current figures.
 
 Compiler: omega-mv main `098be1e5`, omc sha256 `26540e6d…8991`, run through the omega MCP sandbox.
 Programs: 59 accepted examples of omega-harness main `f8561115` and the 20 `bench/inference_cost` reference
@@ -89,6 +94,7 @@ and the 20 deliberately wrong `mutant.om` answers, which still compile) and the 
 accepted=110 items=9510 forced=1909 positions=1909 mutants=7/7 probed=127 unprobed=6 fail=0`.
 
 - A/B: 110 of 110 accepted programs pass; every expanded program compiles to the same binary.
+- C: 14696 wider alternatives (8 at each line end, 4 at each `end`) were all refused too.
 - C: every rebuilt program compiles (control), and at all 1909 forced positions omc refused the alternative
   with the expected error: 5 at all 1765 line ends, 17 at all 144 `end` positions. (Before 2026-11-15 the gate
   rebuilt om2 units as `om2 ` with a trailing blank, so 243 positions were refused for that reason alone, error 16;
