@@ -63,6 +63,11 @@ s2=$(sha256sum "$B/stage2" | cut -d' ' -f1)
 s3=$(sha256sum "$B/stage3" | cut -d' ' -f1)
 [ "$s2" = "$s3" ] || bad "fixpoint: stage2 $s2 != stage3 $s3"
 [ "$s1" = "$s2" ] || bad "parents differ: om4-built $s1 != omc-built $s2"
+# The committed sidecar is the pin. A rebuild that does not reproduce it stops
+# here and leaves the pair on disk, so a planted compiler with a matching
+# sidecar cannot be laundered into the real fixpoint.
+side=$(awk 'NR==1 { print $1; exit }' seed/out/omc.sha256 2>/dev/null || true)
+[ "$side" = "$s3" ] || bad "seed/out/omc.sha256 pin ${side:-missing} disagrees with the seed fixpoint $s3; sidecar left unchanged"
 cp "$B/stage3" seed/out/omc
 printf '%s  seed/out/omc\n' "$s3" > seed/out/omc.sha256
 chmod +x seed/out/omc
