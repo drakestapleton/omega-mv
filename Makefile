@@ -1427,8 +1427,18 @@ test-typed-results: $(RX_TYPED_TEST)
 # same library as the default targets (with no observer set it
 # costs one NULL check per admin operation), RX_ARGUS=0 included.
 ARGUS_REPO ?= ../aienos-argus
-ARGUS_COMMIT ?= $(shell head -n 1 argus.lock)
-ARGUS_SHORT = $(shell echo $(ARGUS_COMMIT) | cut -c1-7)
+# The lock is code-adjacent input: parse it as data and expose only validated
+# lowercase commit text to recipes.  The second field is derived in the same
+# parser so no lock content is ever interpolated into another shell command.
+# Pin: aien-dev/aienux native/argus (ARGUS-0, ABI v1.1), feat/argus-0 integrator
+# round 3. argus_abi.h is byte-identical at 398cfb9, 03b9f06, be2814d and
+# b375dca. Branch head a64bc55 differs from b375dca in native/argus only by docs.
+override ARGUS_LOCK_FIELDS := $(shell LC_ALL=C awk 'NR == 1 && length($$0) == 40 && $$0 ~ /^[0-9a-f]+$$/ { commit = $$0; next } { invalid = 1 } END { if (!invalid && NR == 1) printf "%s %s\n", commit, substr(commit, 1, 7); else exit 1 }' argus.lock 2>/dev/null)
+ifneq ($(words $(ARGUS_LOCK_FIELDS)),2)
+$(error argus.lock must contain exactly one lowercase 40-hex commit)
+endif
+override ARGUS_COMMIT := $(word 1,$(ARGUS_LOCK_FIELDS))
+override ARGUS_SHORT := $(word 2,$(ARGUS_LOCK_FIELDS))
 ARGUS_SRC = $(OUT_DIR)/argus-src/$(ARGUS_SHORT)/native/argus
 ARGUS_STAMP = $(OUT_DIR)/argus-src/$(ARGUS_SHORT)/.extracted
 ARGUS_LIB_SRCS = $(addprefix $(ARGUS_SRC)/,argus_event.c argus_ring.c argus_core.c argus_detect.c)
@@ -1443,11 +1453,17 @@ ARGUS_CFLAGS = $(CFLAGS) -DRX_ARGUS=$(RX_ARGUS) -I$(ARGUS_SRC)
 ARGUS_STREAMS ?= $(HOME)/workspace/argus-runtime-streams
 ARGUS_RUN_ID = $(shell git rev-parse --short HEAD 2>/dev/null)-argus$(ARGUS_SHORT)
 
+.PHONY: check-argus-lock test-argus-lock
+check-argus-lock:
+	@:
+
+test-argus-lock:
+	bash tests/argus_lock_validation.sh
+
 $(ARGUS_STAMP):
-	@test -n "$(ARGUS_COMMIT)" || { echo "argus.lock is empty"; exit 1; }
-	mkdir -p $(OUT_DIR)/argus-src/$(ARGUS_SHORT)
-	git -C $(ARGUS_REPO) archive $(ARGUS_COMMIT) native/argus | tar -x -C $(OUT_DIR)/argus-src/$(ARGUS_SHORT)
-	touch $@
+	mkdir -p "$(OUT_DIR)/argus-src/$(ARGUS_SHORT)"
+	git -C "$(ARGUS_REPO)" archive "$(ARGUS_COMMIT)" -- native/argus | tar -x -C "$(OUT_DIR)/argus-src/$(ARGUS_SHORT)"
+	touch "$@"
 
 $(ARGUS_LIB_SRCS): $(ARGUS_STAMP)
 

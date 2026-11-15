@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Made `argus.lock` a strict single-commit file, validated it as data before GNU make derives ARGUS paths or recipes, and added static regression coverage for malformed and shell-bearing lock content. |
 | Grok 4.7 (via Cursor Agent) | Reviewed the generation-work ownership fix: length-prefixed the store directory in `work_resource_value` (`src/runtime/rx_generation.c`) so a shorter path cannot alias a longer one, and added `tests/runtime/rx_gen_work_auth.c`, a host probe of proposer-only assignment, delegated finish, cross-subject and cross-work refusal, and evidence-digest binding. It runs without the aienos sibling. The R16 negative binary still needs `libaienos_capability.a`. |
 | Codex | Bounded Physics0 reset request encoding by arity and output capacity, refused null inputs before transport, and added hostile-count and valid-framing regression controls. |
 | OpenAI Codex (Flash-Next) | Implemented the native file-backed n-gram embedding lookup and compared its BF16 output with the FP8 checkpoint on the Spark CPU. |
