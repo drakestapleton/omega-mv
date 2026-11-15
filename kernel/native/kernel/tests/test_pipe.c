@@ -1186,7 +1186,7 @@ static void bounce_fault(int sig)
 {
     (void)sig;
     bounce_faults++;
-    if (__atomic_load_n(&pool.lock_ticket, __ATOMIC_RELAXED) != __atomic_load_n(&pool.lock_serving, __ATOMIC_RELAXED))
+    if (ck_spin_busy(&pool.lock))
         bounce_held = 1;
     if (mprotect(bounce_page, bounce_pagesz, PROT_READ | PROT_WRITE) != 0)
         _Exit(2);

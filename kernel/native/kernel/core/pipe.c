@@ -1,9 +1,9 @@
 /* pipe.c -- see pipe.h. Bounded byte pipes over ipc.h capability tables; no allocation, no libc.
  *
- * The pool lock is a ticket lock on lock_ticket / lock_serving. core/smp.c publishes cross-core state with
- * __atomic_*; this file uses the same builtins (there is no spinlock type in the kernel). Every pipe field,
- * refcount, stat and the live count is touched only while the lock is held. wait and wake run after it is
- * dropped, so a hook can re-enter. Pipe ops are not called from interrupt handlers; the lock does not mask IRQs.
+ * The pool lock is the kernel's shared spinlock (core/spinlock.h; its ticket lock started here as pool_lock /
+ * pool_unlock): fair, and it masks interrupts on this CPU while held. Every pipe field, refcount, stat and the
+ * live count is touched only while the lock is held. wait and wake run after it is dropped (interrupts restored),
+ * so a hook can re-enter.
  */
 #include "pipe.h"
 
@@ -26,28 +26,14 @@ static void stats_zero(struct ck_pipe_stats *s)
     *s = (struct ck_pipe_stats){ 0 };
 }
 
-static void cpu_relax(void)
-{
-#if defined(__aarch64__)
-    __asm__ volatile("yield" ::: "memory");
-#elif defined(__x86_64__) || defined(__i386__)
-    __asm__ volatile("pause" ::: "memory");
-#else
-    __asm__ volatile("" ::: "memory");
-#endif
-}
-
 static void pool_lock(struct ck_pipe_pool *p)
 {
-    uint32_t me = __atomic_fetch_add(&p->lock_ticket, 1u, __ATOMIC_RELAXED);
-    while (__atomic_load_n(&p->lock_serving, __ATOMIC_ACQUIRE) != me)
-        cpu_relax();
+    ck_spin_lock(&p->lock);
 }
 
 static void pool_unlock(struct ck_pipe_pool *p)
 {
-    uint32_t next = __atomic_load_n(&p->lock_serving, __ATOMIC_RELAXED) + 1u;
-    __atomic_store_n(&p->lock_serving, next, __ATOMIC_RELEASE);
+    ck_spin_unlock(&p->lock);
 }
 
 void ck_pipe_pool_init(struct ck_pipe_pool *p, const struct ck_pipe_hooks *hooks)
@@ -64,9 +50,8 @@ void ck_pipe_pool_init(struct ck_pipe_pool *p, const struct ck_pipe_hooks *hooks
     p->hooks = hooks;
     stats_zero(&p->total);
     p->live = 0;
-    /* Unlocked (ticket == serving). Init is single-threaded, before the pool is shared. */
-    __atomic_store_n(&p->lock_ticket, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&p->lock_serving, 0u, __ATOMIC_RELAXED);
+    /* Unlocked. Init is single-threaded, before the pool is shared. */
+    ck_spin_init(&p->lock);
 }
 
 int ck_pipe_pool_empty(struct ck_pipe_pool *p)

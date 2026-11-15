@@ -1536,6 +1536,7 @@ TESTS := test_fmt test_frames test_pt test_acpi test_dmar test_acpi_dev test_hea
 	test_netboot_text test_gb10_gsp_boot
 TESTS += test_gpu_sim test_gsp_mmio
 TESTS += test_smmu_svc
+TESTS += test_spinlock test_pipe_irq
 HCFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -Werror -I$(KDIR)/core -I$(KDIR)/mm -I$(KDIR)/tests -I$(BOOT)
 SANFLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 
@@ -1593,6 +1594,45 @@ $(OUT)/host/test_pipe: $(PIPE_DEPS)
 $(OUT)/host-san/test_pipe: $(PIPE_DEPS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) $(PIPE_DEF) -o $@ $< $(PIPE_SRCS)
+
+# DRA-556: core/spinlock.h, the one kernel spinlock (fair ticket lock, masks interrupts while held). test_spinlock:
+# mutual exclusion, FIFO order, counter wrap, interrupt deferral. test_pipe_irq: race test, a pipe op from an
+# interrupt (host: SIGUSR1) on the thread that holds the pool lock; before DRA-556 it deadlocks. Both must FAIL
+# against the TEST-ONLY mutant -DCK_SPIN_TEST_NO_IRQ_MASK (interrupts left open). Host only.
+SPIN_DEPS := $(KDIR)/core/spinlock.h
+$(OUT)/host/test_spinlock: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -o $@ $<
+
+$(OUT)/host-san/test_spinlock: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) -o $@ $<
+
+PIPE_IRQ_SRCS := $(KDIR)/core/pipe.c $(KDIR)/core/ipc.c
+PIPE_IRQ_DEPS := $(KDIR)/tests/test_pipe_irq.c $(PIPE_IRQ_SRCS) $(SPIN_DEPS) $(HDRS)
+$(OUT)/host/test_pipe_irq: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -o $@ $< $(PIPE_IRQ_SRCS)
+
+$(OUT)/host-san/test_pipe_irq: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) -o $@ $< $(PIPE_IRQ_SRCS)
+
+$(OUT)/host/test_spinlock_mutant: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_NO_IRQ_MASK -o $@ $<
+
+$(OUT)/host/test_pipe_irq_mutant: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_NO_IRQ_MASK -o $@ $< $(PIPE_IRQ_SRCS)
+
+spinlock-mutant: $(OUT)/host/test_spinlock_mutant $(OUT)/host/test_pipe_irq_mutant
+	@if $(OUT)/host/test_spinlock_mutant > $(OUT)/host/test_spinlock_mutant.log 2>&1; then cat $(OUT)/host/test_spinlock_mutant.log; \
+	  echo "test_spinlock mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_spinlock: FAIL" $(OUT)/host/test_spinlock_mutant.log && echo "test_spinlock mutant (interrupts not masked): FAILS as required"; fi
+	@if $(OUT)/host/test_pipe_irq_mutant > $(OUT)/host/test_pipe_irq_mutant.log 2>&1; then cat $(OUT)/host/test_pipe_irq_mutant.log; \
+	  echo "test_pipe_irq mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe_irq: FAIL" $(OUT)/host/test_pipe_irq_mutant.log && echo "test_pipe_irq mutant (interrupts not masked): FAILS as required"; fi
 
 # TEST-ONLY mutant of core/pipe.c: a write does not check the WRITE right or the end. test_pipe must FAIL against it
 # (red before green); "make test" fails if the test stops catching it. Host only.
@@ -1763,8 +1803,8 @@ smmu-l2-mutants: $(OUT)/host/test_smmu
 	else echo "mutant flag refused under CK_HARDWARE_STAGING"; fi; \
 	if [ $$fail = 0 ]; then echo "CK_SMMU_L2_MUTANTS: PASS"; else echo "CK_SMMU_L2_MUTANTS: FAIL"; exit 1; fi
 
-test: $(addprefix $(OUT)/host/,$(TESTS)) osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check
-	@fail=0; for t in $(filter-out osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check,$^); do $$t || fail=1; done; \
+test: $(addprefix $(OUT)/host/,$(TESTS)) osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant spinlock-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check
+	@fail=0; for t in $(filter-out osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant spinlock-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check,$^); do $$t || fail=1; done; \
 	if [ $$fail = 0 ]; then echo "CK_CORE_HOST: PASS"; else echo "CK_CORE_HOST: FAIL"; exit 1; fi
 
 sanitize: $(addprefix $(OUT)/host-san/,$(TESTS))

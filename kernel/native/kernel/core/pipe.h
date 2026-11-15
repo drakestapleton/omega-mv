@@ -43,11 +43,10 @@
  * copies once, under the pool lock, straight into the ring; ck_pipe_dispatch never hands it caller memory (see the
  * user-window note below).
  *
- * Locking. One ticket lock covers the pool (every pipe, the ref counts, the ring, the stats, the live count).
- * core/smp.c is the kernel's SMP primitive and it synchronises with __atomic_*; there is no separate spinlock
- * type, so the ticket lock uses those same orders. create, read, write, close, dup, revoke, cancel, release and
- * ck_pipe_pool_empty all take it. It is not IRQ-safe: pipe ops are not called from interrupt handlers. If a wake
- * or a cancel is ever called from an IRQ, this lock must mask IRQs, or that CPU deadlocks against itself. It is
+ * Locking. One lock covers the pool (every pipe, the ref counts, the ring, the stats, the live count). It is the
+ * kernel's shared spinlock (core/spinlock.h): a fair ticket lock that masks interrupts on the holding CPU, so a
+ * pipe op reached from an interrupt handler waits for the unlock instead of deadlocking that CPU against itself.
+ * create, read, write, close, dup, revoke, cancel, release and ck_pipe_pool_empty all take it. It is
  * never held across wait or wake, so a hook may call back into the pipe. The waiter increments waiting[end] under
  * the lock before dropping it; a waker calls the wake hook after dropping the lock, and only when that count was
  * non-zero. The wake hook must be sticky (woken[] stays set until wait has observed it). before_wait, if set,
@@ -81,6 +80,7 @@
 #include <stdint.h>
 #include "ipc.h"
 #include "osh_err.h"
+#include "spinlock.h"
 
 #define CK_PIPE_ABI_VERSION 1u          /* section 3: abi_version of the platform frame */
 #define CK_PIPE_FRAME_MAGIC 0x4F534846u /* section 3: "OSHF", platform frame magic */
@@ -181,9 +181,7 @@ struct ck_pipe_pool {
     const struct ck_pipe_hooks *hooks; /* may be 0 */
     struct ck_pipe_stats total;        /* every incarnation since init */
     unsigned live;                     /* pipes currently live */
-    /* Ticket lock. ticket is the next number handed out; serving is the number now inside.
-     * Both 0 is unlocked. Only __atomic_* touches them. */
-    uint32_t lock_ticket, lock_serving;
+    struct ck_spinlock lock; /* core/spinlock.h: fair, masks interrupts while held */
 };
 
 void ck_pipe_pool_init(struct ck_pipe_pool *p, const struct ck_pipe_hooks *hooks);
