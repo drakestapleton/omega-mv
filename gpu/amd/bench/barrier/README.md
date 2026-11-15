@@ -2,7 +2,7 @@
 
 Host-side micro-benchmark for one question: what does a grid-wide barrier inside a persistent kernel cost on an MI300X, compared with the AQL dispatch barrier it would replace.
 
-Decode currently issues about 1,126 barrier-ordered AQL dispatches per token, measured at about 1.54 µs each. Those two figures are the reason this bench exists. This tree did not remeasure them. A persistent megakernel would replace the dispatches with in-kernel grid barriers. Eighteen kernels are not worth porting until that barrier's cost is known on a warm L2 and after the L2 has been flushed.
+Motivation from an earlier, separate MI300X session, not reproduced by this PR: about 1,126 barrier-ordered AQL dispatches per token, at about 1.54 µs each. Those two figures are motivation only. This tree does not present them as results. A persistent megakernel would replace those dispatches with in-kernel grid barriers. Eighteen kernels are not worth porting until that barrier's cost is known on a warm L2 and after the L2 has been flushed.
 
 This directory does not submit work to a GPU. Every timing it prints is `source=model` or `NOT_RUN`.
 
