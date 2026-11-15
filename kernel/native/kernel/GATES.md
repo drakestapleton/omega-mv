@@ -885,7 +885,7 @@ cancel INTERRUPTED once with no byte moved. Host test `test_pipe` (the 20-case c
 scheduler transfers, also under ASan+UBSan); a mutant that skips the write-right check must fail it (`make pipe-mutant`).
 `ck_pipe_dispatch` copies the caller's slice through a kernel bounce buffer (at most `CK_PIPE_BOUNCE` = 1024 bytes per call) and
 never touches it with the pool lock held; a window ending above `CK_PIPE_USER_TOP` is INVALID_ARG (aienux#494). Host
-`test_pipe` puts the slice on a page that faults on first touch and checks the ticket lock is free at the fault; the mutants
+`test_pipe` puts the slice on a page that faults on first touch and checks the pool lock is free at the fault; the mutants
 `make pipe-bounce-mutant` (slice copied under the lock) and `make pipe-top-mutant` (top not checked) must fail it.
 Limits: (1) the kernel's wait hook yields cooperatively to the scheduler inside one kernel thread; the QEMU image does not
 context-switch a blocked pipe op onto another core. Host `test_pipe` does, with pthreads: concurrent read/write, close while
@@ -897,6 +897,26 @@ PIPE_CREATE, the capability resource layout, the pool size (4 pipes) and STREAM_
 instead of a descriptor number) are this kernel's choices, UNVERIFIED against a frozen contract. (4) A ck_cap_table has 8 slots,
 below the draft's "3 standard streams plus 16 open streams" per session; a session with more streams needs a larger table.
 (5) No QEMU negative control mutates the kernel image; the red-before-green control is the host mutant.
+
+Pool lock (DRA-556). The pool lock is the kernel's shared spinlock, `core/spinlock.h`: the ticket lock that was private to
+`core/pipe.c` (lines 40-51 at d01b2f19), now masking interrupts on the holding CPU (aarch64 DAIF.I|F; x86-64 cli with the saved
+RFLAGS.IF). Allen's note lock (`ui/allen_ui.c`) and the iMac frame lock (`x86/kmain_x86.c` draw_lock) are the same type, taken
+with its `_nomask` forms because the iMac drawing cores keep interrupts on for TLB-shootdown IPIs. Checks, all labelled:
+- `test_spinlock` (HOST, `make test`): mutual exclusion with masked and `_nomask` takers, FIFO order across the 2^32 wrap,
+  trylock never jumps the queue, and the interrupt rules in the host model (a thread's interrupt is SIGUSR1; masked = blocked):
+  an interrupt raised while held, or exactly between mask and ticket, or exactly between release and restore, runs only after
+  the lock is free; nested and pre-masked callers. `make spinlock-mutant` (part of `make test`) requires it to FAIL against
+  each TEST-ONLY mutant: mask removed, ticket before mask, restore before release.
+- `test_pipe_irq` (HOST, `make test`): race test. A pipe op from an interrupt (SIGUSR1) on the thread that holds the pool
+  lock. Built against d01b2f19's `core/pipe.c` it deadlocks (FAIL, watchdog on stalled progress); at this change it PASSes;
+  against the mask-removed mutant it FAILs. Host signal model only: no kernel interrupt handler calls a pipe op today.
+- `make spinlock-asm-check` (BUILD, cross compilers): the freestanding aarch64 and x86-64 code of `core/spinlock.h` has the mask
+  before the first ticket atomic and the restore after the releasing store; a dump with the mask removed must FAIL it.
+- `make ticketlock-proof` (Lean 4 v4.35.0, `proofs/TicketLock.lean`): mutual exclusion and FIFO of the ticket arithmetic, the
+  queue invariant derived from the two operations, and the interrupt ordering in a one-CPU model with each mutant unsafe.
+- Row 221 (QEMU) runs the pipe primitive with the masking lock; it shows the DAIF save/restore does not break the pipe, not that
+  an interrupt is deferred (no interrupt handler takes the pool lock). The iMac kernel QEMU test
+  (`scripts/qemu_ck_imac_kernel_test.sh`) runs draw_lock and the note lock on 4 cores with TLB shootdowns. Hardware NOT_RUN.
 
 | # | Check | CK gate | Status |
 |---|---|---|---|

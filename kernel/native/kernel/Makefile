@@ -1618,21 +1618,38 @@ $(OUT)/host-san/test_pipe_irq: $(PIPE_IRQ_DEPS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) -o $@ $< $(PIPE_IRQ_SRCS)
 
-$(OUT)/host/test_spinlock_mutant: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
+SPIN_MUTANTS := NO_IRQ_MASK TICKET_BEFORE_MASK RESTORE_BEFORE_RELEASE
+$(OUT)/host/test_spinlock_mutant_%: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_NO_IRQ_MASK -o $@ $<
+	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_$* -o $@ $<
 
 $(OUT)/host/test_pipe_irq_mutant: $(PIPE_IRQ_DEPS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_NO_IRQ_MASK -o $@ $< $(PIPE_IRQ_SRCS)
 
-spinlock-mutant: $(OUT)/host/test_spinlock_mutant $(OUT)/host/test_pipe_irq_mutant
-	@if $(OUT)/host/test_spinlock_mutant > $(OUT)/host/test_spinlock_mutant.log 2>&1; then cat $(OUT)/host/test_spinlock_mutant.log; \
-	  echo "test_spinlock mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_spinlock: FAIL" $(OUT)/host/test_spinlock_mutant.log && echo "test_spinlock mutant (interrupts not masked): FAILS as required"; fi
+spinlock-mutant: $(addprefix $(OUT)/host/test_spinlock_mutant_,$(SPIN_MUTANTS)) $(OUT)/host/test_pipe_irq_mutant
+	@for m in $(SPIN_MUTANTS); do b=$(OUT)/host/test_spinlock_mutant_$$m; \
+	  if $$b > $$b.log 2>&1; then cat $$b.log; echo "test_spinlock mutant $$m: PASSED, test does not catch it"; exit 1; \
+	  else grep -F "test_spinlock: FAIL" $$b.log && echo "test_spinlock mutant $$m: FAILS as required"; fi || exit 1; done
 	@if $(OUT)/host/test_pipe_irq_mutant > $(OUT)/host/test_pipe_irq_mutant.log 2>&1; then cat $(OUT)/host/test_pipe_irq_mutant.log; \
 	  echo "test_pipe_irq mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
 	else grep -F "test_pipe_irq: FAIL" $(OUT)/host/test_pipe_irq_mutant.log && echo "test_pipe_irq mutant (interrupts not masked): FAILS as required"; fi
+
+# DRA-556: the freestanding instruction order of core/spinlock.h, aarch64 (KCC, KCFLAGS) and x86-64 (X86CFLAGS):
+# the interrupt mask comes before the first atomic of the acquire, and the restore after the releasing store.
+# Needs the cross compiler and objdump; not part of "make test". tools/ck_spinlock_asm_check.sh reads the dumps.
+spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(SPIN_DEPS)
+	@mkdir -p $(OUT)/spinlock-asm
+	$(KCC) $(KCFLAGS) -c -o $(OUT)/spinlock-asm/a64.o $<
+	$(X86CC) $(X86CFLAGS) -c -o $(OUT)/spinlock-asm/x86.o $<
+	$(CROSS)objdump -d $(OUT)/spinlock-asm/a64.o > $(OUT)/spinlock-asm/a64.dis
+	$(X86_CROSS)objdump -d $(OUT)/spinlock-asm/x86.o > $(OUT)/spinlock-asm/x86.dis
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh $(OUT)/spinlock-asm/a64.dis $(OUT)/spinlock-asm/x86.dis
+	@grep -v 'daifset' $(OUT)/spinlock-asm/a64.dis > $(OUT)/spinlock-asm/a64-nomask.dis; \
+	grep -vE '[[:space:]]cli' $(OUT)/spinlock-asm/x86.dis > $(OUT)/spinlock-asm/x86-nomask.dis; \
+	if bash $(REPO)/tools/ck_spinlock_asm_check.sh $(OUT)/spinlock-asm/a64-nomask.dis $(OUT)/spinlock-asm/x86-nomask.dis > $(OUT)/spinlock-asm/neg.log 2>&1; \
+	then cat $(OUT)/spinlock-asm/neg.log; echo "spinlock-asm-check negative control (mask removed from the dump): PASSED, check does not catch it"; exit 1; \
+	else grep -qF "CK_SPINLOCK_ASM: FAIL" $(OUT)/spinlock-asm/neg.log && echo "spinlock-asm-check negative control (mask removed from the dump): FAILS as required"; fi
 
 # DRA-556: Lean 4 proof of the ticket arithmetic in core/spinlock.h (mutual exclusion, FIFO, wrap). Core Lean only,
 # toolchain pinned in proofs/lean-toolchain. Not part of "make test" (Lean is not a build dependency): prints NOT_RUN
@@ -2877,7 +2894,7 @@ endif
 $(IMACKERN_DIR)/efi_entry_x86_64.o: $(BOOT)/efi_entry_x86_64.S
 $(IMACKERN_DIR)/efi_x86.o: $(X86K)/efi_x86.c $(IMACKERN_HDRS) $(BOOT)/netboot_proto.h
 $(IMACKERN_DIR)/efi_gop.o: $(BOOT)/efi_gop.c $(IMACKERN_HDRS)
-$(IMACKERN_DIR)/kmain_x86.o: $(X86K)/kmain_x86.c $(IMACKERN_HDRS) $(KDIR)/core/handoff_check.h $(KDIR)/mm/frames.h $(KDIR)/mm/heap.h $(KDIR)/ui/allen_ui.h $(KDIR)/svc/allen_reply.h $(KDIR)/svc/allen_intent.h $(KDIR)/svc/allen_code.h $(KDIR)/dev/usb_hid.h $(KDIR)/svc/courier.h $(X86K)/courier_udp.h $(KDIR)/svc/setup_wizard.h $(OUT)/commit.stamp
+$(IMACKERN_DIR)/kmain_x86.o: $(X86K)/kmain_x86.c $(IMACKERN_HDRS) $(KDIR)/core/handoff_check.h $(KDIR)/core/spinlock.h $(KDIR)/mm/frames.h $(KDIR)/mm/heap.h $(KDIR)/ui/allen_ui.h $(KDIR)/svc/allen_reply.h $(KDIR)/svc/allen_intent.h $(KDIR)/svc/allen_code.h $(KDIR)/dev/usb_hid.h $(KDIR)/svc/courier.h $(X86K)/courier_udp.h $(KDIR)/svc/setup_wizard.h $(OUT)/commit.stamp
 $(IMACKERN_DIR)/console_x86.o: $(X86K)/console_x86.c $(IMACKERN_HDRS) $(KDIR)/core/fbcon.h
 $(IMACKERN_DIR)/trap.o: $(X86K)/trap.S
 ifeq ($(CK_LOCAL_MODEL),1)
@@ -2949,7 +2966,7 @@ $(IMACKERN_DIR)/xhci_x86.o: $(X86K)/xhci_x86.c $(IMACKERN_HDRS) $(KDIR)/mm/frame
 $(IMACKERN_DIR)/hda_x86.o: $(X86K)/hda_x86.c $(IMACKERN_HDRS) $(KDIR)/mm/frames.h $(KDIR)/ui/chirp.h $(KDIR)/ui/night.h
 $(IMACKERN_DIR)/usb_hid.o: $(KDIR)/dev/usb_hid.c $(KDIR)/dev/usb_hid.h $(NATIVE)/argus/sha256.h
 $(IMACKERN_DIR)/sha256.o: $(NATIVE)/argus/sha256.c $(NATIVE)/argus/sha256.h
-$(IMACKERN_DIR)/allen_ui.o: $(KDIR)/ui/allen_ui.c $(KDIR)/ui/allen_ui.h $(KDIR)/ui/allen_font.h $(KDIR)/ui/night.h $(KDIR)/ui/mind.h $(KDIR)/ui/flow.h $(KDIR)/ui/paint.h $(KDIR)/ui/canvas.h $(KDIR)/svc/allen_code.h
+$(IMACKERN_DIR)/allen_ui.o: $(KDIR)/ui/allen_ui.c $(KDIR)/ui/allen_ui.h $(KDIR)/core/spinlock.h $(KDIR)/ui/allen_font.h $(KDIR)/ui/night.h $(KDIR)/ui/mind.h $(KDIR)/ui/flow.h $(KDIR)/ui/paint.h $(KDIR)/ui/canvas.h $(KDIR)/svc/allen_code.h
 $(IMACKERN_DIR)/allen_font.o: $(KDIR)/ui/allen_font.c $(KDIR)/ui/allen_font.h
 $(IMACKERN_DIR)/paint.o: $(KDIR)/ui/paint.c $(KDIR)/ui/paint.h $(KDIR)/ui/allen_font.h
 $(IMACKERN_DIR)/night.o: $(KDIR)/ui/night.c $(KDIR)/ui/night.h $(KDIR)/ui/paint.h $(KDIR)/ui/sky_real.h $(KDIR)/ui/sky_data.h

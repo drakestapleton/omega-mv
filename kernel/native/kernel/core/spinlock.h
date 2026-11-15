@@ -1,36 +1,59 @@
-/* spinlock.h -- the kernel's one spinlock type: a fair (FIFO) ticket lock that masks interrupts on the
- * calling CPU for as long as it is held.
+/* spinlock.h -- the kernel's one spinlock type: a fair (FIFO) ticket lock. Its default acquire masks interrupts
+ * on the calling CPU for as long as the lock is held.
  *
- * The lock is the ticket lock that core/pipe.c carried privately (pool_lock / pool_unlock, the same
- * __atomic_* orders core/smp.c uses), moved here so every kernel lock is the same type.
+ * The lock is the ticket lock that core/pipe.c carried privately (pipe.c:40-51 at d01b2f19, pool_lock /
+ * pool_unlock, the same __atomic_* orders core/smp.c uses), moved here. Every spinning lock in the kernel tree is
+ * this type: the pipe pool lock (core/pipe.c), Allen's note lock (ui/allen_ui.c) and the iMac frame lock
+ * (x86/kmain_x86.c draw_lock).
  *
  *   ticket   the next number handed out; a caller takes one with a relaxed fetch-add.
  *   serving  the number now inside; the caller spins (acquire) until serving == its number, and the
  *            holder releases by storing serving + 1 (release). Both equal means unlocked.
  *
- * Fair: callers enter in the order they took tickets. Mutual exclusion holds while fewer than 2^32
- * callers wait on one lock at once (the counters wrap; only equality is compared).
+ * Fair: callers enter in the order they took tickets. Mutual exclusion holds while fewer than 2^32 callers wait on
+ * one lock at once (the counters wrap; only equality is compared). Proof of the arithmetic and of the interrupt
+ * ordering below: proofs/TicketLock.lean (make ticketlock-proof).
  *
- * Interrupts. ck_spin_lock_irqsave masks interrupts on this CPU BEFORE it takes a ticket and returns the
- * previous mask; ck_spin_unlock_irqrestore releases the lock and THEN puts that mask back. So an
- * interrupt handler on the CPU that holds (or is queued for) a lock cannot spin on that same lock and
- * deadlock the CPU against itself; the interrupt is taken after the unlock instead. Nested locks
- * restore in reverse order and the outermost restore re-opens interrupts.
+ * Interrupts (the default pair). ck_spin_lock_irqsave masks interrupts on this CPU BEFORE it takes a ticket and
+ * returns the previous mask; ck_spin_unlock_irqrestore releases the lock and THEN puts that mask back. So an
+ * interrupt handler on the CPU that holds (or is queued for) a lock cannot spin on that same lock and deadlock
+ * the CPU against itself; the interrupt is taken after the unlock instead. Nested locks restore in reverse order
+ * and the outermost restore re-opens interrupts. A caller that already had interrupts masked gets them back masked.
  *
- *   aarch64 kernel  DAIF.I and DAIF.F are set ("msr daifset, #3"); the saved DAIF is written back.
- *   x86-64 kernel   RFLAGS is saved and "cli" runs; IF is set again only if it was set before.
- *   hosted build    (host unit tests, __STDC_HOSTED__) a thread's interrupt is the signal
- *                   CK_SPIN_HOST_IRQ_SIGNAL (default SIGUSR1); "masked" means that signal is blocked
- *                   for the thread, and the saved value says whether it already was. Only that one
- *                   signal is touched: synchronous faults (SIGSEGV, SIGBUS) are never deferred.
+ *   aarch64 kernel  DAIF.I and DAIF.F are set ("msr daifset, #3"); the saved DAIF is written back. arch/arch.h
+ *                   ck_irq_off masks I only; this lock also masks F so a FIQ handler, if one is ever installed, is
+ *                   covered too. SError (A) and debug (D) are not masked.
+ *   x86-64 kernel   RFLAGS is saved and "cli" runs; IF is set again only if it was set before. NMI cannot be masked
+ *                   by cli: an NMI handler must never take a ck_spinlock. Reading RFLAGS uses pushfq inside inline
+ *                   asm, which is safe only because the x86 kernel is built with -mno-red-zone (X86CFLAGS).
+ *   hosted build    (host unit tests, __STDC_HOSTED__) a thread's interrupt is the signal CK_SPIN_HOST_IRQ_SIGNAL
+ *                   (default SIGUSR1); "masked" means that signal is blocked for the thread, and the saved value
+ *                   says whether it already was. Only that one signal is touched: synchronous faults (SIGSEGV,
+ *                   SIGBUS) are never deferred.
  *
- * ck_spin_lock / ck_spin_unlock are the same pair with the saved state kept in the lock itself: only the
- * holder writes l->irq (after it entered) and reads it (before it leaves), so the next holder cannot see
- * or clobber it. Locks must be released in reverse order of taking, with either pair.
+ * ck_spin_lock / ck_spin_unlock are the same pair with the saved state kept in the lock itself: only the holder
+ * writes l->irq (after it entered) and reads it (before it leaves), so the next holder cannot see or clobber it.
+ * Locks must be released in reverse order of taking, with either pair.
+ *
+ * The _nomask forms (lock, trylock, unlock) take the same ticket lock and leave interrupts as they are. Use them
+ * only for a lock that no interrupt handler ever takes AND whose holders or waiters must keep taking interrupts:
+ * the iMac kernel's drawing cores keep interrupts on to acknowledge TLB-shootdown IPIs (x86/kmain_x86.c), and a
+ * core spinning with interrupts masked for a lock whose holder waits on that acknowledgement would deadlock.
+ * A trylock succeeds only when nobody holds or waits (it never jumps the queue).
  *
  * Code that holds a lock must not sleep or park: a wait hook runs after the unlock (see core/pipe.c).
- * CK_SPIN_TEST_NO_IRQ_MASK (TEST-ONLY, host mutant) turns the mask into a no-op so the race test can be
- * shown to catch the self-deadlock; a freestanding build refuses it.
+ *
+ * Why C and not Omega: every user is a C translation unit of the C kernel, the lock is inlined into the caller's
+ * critical section, and it runs privileged instructions (mrs/msr daif, pushfq/cli/sti). The newest omc builds
+ * standalone programs, and the omega-bridge freestanding route emits separate units; neither gives an inline unit a
+ * C kernel includes, with system-register access (aienux AGENTS.md section 6: C where a hardware reason exists).
+ *
+ * TEST-ONLY (host builds only; a freestanding build refuses them):
+ *   CK_SPIN_TEST_STEP(l)                 called between the two steps of acquire (mask, ticket) and of release
+ *                                        (release, restore); test_spinlock raises an interrupt there.
+ *   CK_SPIN_TEST_NO_IRQ_MASK             mutant: the mask is a no-op.
+ *   CK_SPIN_TEST_TICKET_BEFORE_MASK      mutant: the ticket is taken before the mask.
+ *   CK_SPIN_TEST_RESTORE_BEFORE_RELEASE  mutant: the mask is restored before the release.
  */
 #ifndef AIENOS_CK_SPINLOCK_H
 #define AIENOS_CK_SPINLOCK_H
@@ -48,11 +71,18 @@ struct ck_spinlock {
 
 #define CK_SPINLOCK_INIT { 0u, 0u, 0u }
 
-#if defined(CK_SPIN_TEST_NO_IRQ_MASK) && !__STDC_HOSTED__
-#error "CK_SPIN_TEST_NO_IRQ_MASK is a TEST-ONLY host mutant"
+#if (defined(CK_SPIN_TEST_NO_IRQ_MASK) || defined(CK_SPIN_TEST_TICKET_BEFORE_MASK) ||                                \
+     defined(CK_SPIN_TEST_RESTORE_BEFORE_RELEASE) || defined(CK_SPIN_TEST_STEP)) &&                                    \
+    !__STDC_HOSTED__
+#error "CK_SPIN_TEST_* are TEST-ONLY host hooks and mutants"
+#endif
+
+#ifndef CK_SPIN_TEST_STEP
+#define CK_SPIN_TEST_STEP(l) ((void)(l))
 #endif
 
 #if __STDC_HOSTED__
+#include <pthread.h>
 #include <signal.h>
 #ifndef CK_SPIN_HOST_IRQ_SIGNAL
 #define CK_SPIN_HOST_IRQ_SIGNAL SIGUSR1
@@ -122,22 +152,58 @@ static inline void ck_spin_init(struct ck_spinlock *l)
     l->irq = 0;
 }
 
-/* Mask interrupts, then wait for this caller's turn. Returns the state to restore. */
-static inline ck_irqflags_t ck_spin_lock_irqsave(struct ck_spinlock *l)
+/* Take a ticket and wait for it. Interrupts are left as they are. */
+static inline void ck_spin_lock_nomask(struct ck_spinlock *l)
 {
-    ck_irqflags_t f = ck_irq_save();
     uint32_t me = __atomic_fetch_add(&l->ticket, 1u, __ATOMIC_RELAXED);
     while (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != me)
         ck_spin_relax();
+}
+
+/* 1 and the lock is held if nobody held or waited for it; 0 and nothing changed otherwise. */
+static inline int ck_spin_trylock_nomask(struct ck_spinlock *l)
+{
+    uint32_t s = __atomic_load_n(&l->serving, __ATOMIC_ACQUIRE); /* pairs with the last holder's release */
+    uint32_t t = s;
+    return __atomic_compare_exchange_n(&l->ticket, &t, s + 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+/* Hand the lock to the next ticket. Interrupts are left as they are. */
+static inline void ck_spin_unlock_nomask(struct ck_spinlock *l)
+{
+    uint32_t next = __atomic_load_n(&l->serving, __ATOMIC_RELAXED) + 1u;
+    __atomic_store_n(&l->serving, next, __ATOMIC_RELEASE);
+}
+
+/* Mask interrupts, then wait for this caller's turn. Returns the state to restore. */
+static inline ck_irqflags_t ck_spin_lock_irqsave(struct ck_spinlock *l)
+{
+#if defined(CK_SPIN_TEST_TICKET_BEFORE_MASK)
+    uint32_t me = __atomic_fetch_add(&l->ticket, 1u, __ATOMIC_RELAXED);
+    CK_SPIN_TEST_STEP(l);
+    ck_irqflags_t f = ck_irq_save();
+    while (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != me)
+        ck_spin_relax();
+#else
+    ck_irqflags_t f = ck_irq_save();
+    CK_SPIN_TEST_STEP(l);
+    ck_spin_lock_nomask(l);
+#endif
     return f;
 }
 
 /* Hand the lock to the next ticket, then restore the interrupt state saved by the matching lock. */
 static inline void ck_spin_unlock_irqrestore(struct ck_spinlock *l, ck_irqflags_t f)
 {
-    uint32_t next = __atomic_load_n(&l->serving, __ATOMIC_RELAXED) + 1u;
-    __atomic_store_n(&l->serving, next, __ATOMIC_RELEASE);
+#if defined(CK_SPIN_TEST_RESTORE_BEFORE_RELEASE)
     ck_irq_restore(f);
+    CK_SPIN_TEST_STEP(l);
+    ck_spin_unlock_nomask(l);
+#else
+    ck_spin_unlock_nomask(l);
+    CK_SPIN_TEST_STEP(l);
+    ck_irq_restore(f);
+#endif
 }
 
 /* The same pair, with the saved state kept in the lock (see the header comment). */

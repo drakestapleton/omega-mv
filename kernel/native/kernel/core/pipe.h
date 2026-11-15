@@ -46,6 +46,8 @@
  * Locking. One lock covers the pool (every pipe, the ref counts, the ring, the stats, the live count). It is the
  * kernel's shared spinlock (core/spinlock.h): a fair ticket lock that masks interrupts on the holding CPU, so a
  * pipe op reached from an interrupt handler waits for the unlock instead of deadlocking that CPU against itself.
+ * Only the non-blocking forms may be called from an interrupt handler: a blocking read or write calls the wait
+ * hook, which parks the caller, and an interrupt handler must never park.
  * create, read, write, close, dup, revoke, cancel, release and ck_pipe_pool_empty all take it. It is
  * never held across wait or wake, so a hook may call back into the pipe. The waiter increments waiting[end] under
  * the lock before dropping it; a waker calls the wake hook after dropping the lock, and only when that count was

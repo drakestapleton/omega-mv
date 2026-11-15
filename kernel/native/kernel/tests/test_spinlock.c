@@ -4,7 +4,10 @@
  * thread's interrupt is CK_SPIN_HOST_IRQ_SIGNAL (SIGUSR1). A handler that takes a lock its own thread holds must
  * be deferred until the unlock; without the mask it spins on its own ticket forever. A watchdog thread turns that
  * hang into "test_spinlock: FAIL" (an alarm, not a cap: a passing run never waits on it).
- * The TEST-ONLY mutant -DCK_SPIN_TEST_NO_IRQ_MASK must FAIL here (make spinlock-mutant).
+ * Ordering is checked deterministically: CK_SPIN_TEST_STEP raises the interrupt between the two steps of acquire
+ * (mask, ticket) and of release (release, restore). The TEST-ONLY mutants -DCK_SPIN_TEST_NO_IRQ_MASK,
+ * -DCK_SPIN_TEST_TICKET_BEFORE_MASK and -DCK_SPIN_TEST_RESTORE_BEFORE_RELEASE must each FAIL here
+ * (make spinlock-mutant). The _nomask forms: mutual exclusion, trylock never jumps the queue, mask untouched.
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -16,7 +19,20 @@
 #include <time.h>
 #include <unistd.h>
 
+struct ck_spinlock;
+static void step_hook(struct ck_spinlock *l);
+#define CK_SPIN_TEST_STEP(l) step_hook(l)
 #include "spinlock.h"
+
+/* Armed with a lock: the next acquire or release step on that lock raises the interrupt once. */
+static struct ck_spinlock *volatile step_armed;
+static void step_hook(struct ck_spinlock *l)
+{
+    if (l && l == step_armed) {
+        step_armed = 0;
+        pthread_kill(pthread_self(), CK_SPIN_HOST_IRQ_SIGNAL);
+    }
+}
 
 static int failures;
 #define CHECK(c)                                                                 \
@@ -61,13 +77,19 @@ static uint64_t mx_count; /* plain, only under mx */
 
 static void *mx_worker(void *arg)
 {
-    (void)arg;
     for (int i = 0; i < MX_ITERS; i++) {
-        ck_spin_lock(&mx);
+        int open = (int)(intptr_t)arg; /* half the threads take the same lock with the _nomask forms */
+        if (open)
+            ck_spin_lock_nomask(&mx);
+        else
+            ck_spin_lock(&mx);
         uint64_t v = mx_count;
         __asm__ volatile("" ::: "memory");
         mx_count = v + 1;
-        ck_spin_unlock(&mx);
+        if (open)
+            ck_spin_unlock_nomask(&mx);
+        else
+            ck_spin_unlock(&mx);
         if ((i & 1023) == 0)
             tick();
     }
@@ -79,7 +101,7 @@ static void test_mutex(void)
     phase = "mutex";
     pthread_t th[MX_THREADS];
     for (int i = 0; i < MX_THREADS; i++)
-        CHECK(pthread_create(&th[i], 0, mx_worker, 0) == 0);
+        CHECK(pthread_create(&th[i], 0, mx_worker, (void *)(intptr_t)(i & 1)) == 0);
     for (int i = 0; i < MX_THREADS; i++)
         pthread_join(th[i], 0);
     CHECK(mx_count == (uint64_t)MX_THREADS * MX_ITERS);
@@ -195,6 +217,31 @@ static void test_irq(void)
     CHECK(irq_ran == 1);
     tick();
 
+    /* Interrupt raised exactly between mask and ticket: it must wait (mutant ticket-before-mask: it lands after the
+     * ticket and before the mask, and the handler spins on its own CPU's ticket). */
+    phase = "irq-step-acquire";
+    irq_ran = 0;
+    step_armed = &ia;
+    ck_spin_lock(&ia);
+    tick();
+    CHECK(irq_ran == 0);
+    ck_spin_unlock(&ia);
+    CHECK(irq_ran == 1);
+    CHECK(step_armed == 0);
+    tick();
+
+    /* Interrupt raised exactly between release and restore: the lock is already free when it runs (mutant
+     * restore-before-release: it runs before the release, on a held lock). */
+    phase = "irq-step-release";
+    irq_ran = 0;
+    ck_spin_lock(&ia);
+    step_armed = &ia;
+    ck_spin_unlock(&ia);
+    CHECK(irq_ran == 1);
+    CHECK(step_armed == 0);
+    CHECK(!ck_spin_busy(&ia));
+    tick();
+
     phase = "irq-premasked";
     sigset_t one;
     sigemptyset(&one);
@@ -207,6 +254,46 @@ static void test_irq(void)
     tick();
 }
 
+/* ---- 4. _nomask forms ---- */
+static struct ck_spinlock nm = CK_SPINLOCK_INIT;
+static void *nm_waiter(void *arg)
+{
+    (void)arg;
+    ck_spin_lock_nomask(&nm);
+    ck_spin_unlock_nomask(&nm);
+    return 0;
+}
+
+static void test_nomask(void)
+{
+    phase = "nomask";
+    CHECK(ck_spin_trylock_nomask(&nm) == 1); /* free */
+    CHECK(!irq_blocked());                    /* the mask is untouched */
+    CHECK(ck_spin_trylock_nomask(&nm) == 0); /* held */
+    CHECK(nm.ticket == 1u && nm.serving == 0u);
+    pthread_t w;
+    CHECK(pthread_create(&w, 0, nm_waiter, 0) == 0);
+    wait_ticket(&nm, 2u);                     /* a waiter queued behind the holder */
+    ck_spin_unlock_nomask(&nm);               /* handed to the waiter */
+    pthread_join(w, 0);
+    CHECK(nm.ticket == 2u && nm.serving == 2u);
+    ck_spin_lock_nomask(&nm);
+    CHECK(pthread_create(&w, 0, nm_waiter, 0) == 0);
+    wait_ticket(&nm, 4u);
+    CHECK(ck_spin_trylock_nomask(&nm) == 0); /* never jumps the queue */
+    CHECK(nm.ticket == 4u);
+    ck_spin_unlock_nomask(&nm);
+    pthread_join(w, 0);
+    CHECK(ck_spin_trylock_nomask(&nm) == 1);
+    ck_spin_unlock_nomask(&nm);
+    CHECK(!ck_spin_busy(&nm));
+    nm.ticket = nm.serving = 0xFFFFFFFFu;     /* trylock across the wrap */
+    CHECK(ck_spin_trylock_nomask(&nm) == 1 && nm.ticket == 0u);
+    ck_spin_unlock_nomask(&nm);
+    CHECK(nm.serving == 0u && !ck_spin_busy(&nm));
+    tick();
+}
+
 int main(void)
 {
     pthread_t wd;
@@ -216,6 +303,7 @@ int main(void)
     test_mutex();
     test_fifo();
     test_irq();
+    test_nomask();
     __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
     pthread_join(wd, 0);
     printf("test_spinlock: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);

@@ -10,6 +10,13 @@
   * mutual exclusion: the caller with offset i may enter (its ticket equals serving) iff i = 0;
   * FIFO: after a release, the caller at offset i + 1 is at offset i, so callers enter in the
     order they took tickets.
+  Also proved below: the queue invariant itself, derived from the two operations (Reach, reach_le,
+  enters_iff_head, wrap_increment), and the interrupt ordering of core/spinlock.h in a one-CPU model
+  (lockUnlock_safe, nested_safe, lockUnlock_restores), with each TEST-ONLY mutant of the header shown
+  unsafe (ticketBeforeMask_unsafe, restoreBeforeRelease_unsafe, noMask_unsafe). The link to the code is
+  by construction, not extraction: each Op is one statement of core/spinlock.h, named at its definition,
+  and tests/test_spinlock.c runs the same three mutants (make spinlock-mutant); tools/ck_spinlock_asm_check.sh
+  checks the compiled instruction order on aarch64 and x86-64 (make spinlock-asm-check).
   No Mathlib; core Lean 4 only.
 -/
 
@@ -67,3 +74,103 @@ theorem wrap_instance : enters (2^32) (2^32 - 1) 0 ∧ ¬ enters (2^32) (2^32 - 
   intro h
   have := only_head_enters (2^32) (2^32 - 1) 1 (by decide) h
   omega
+
+/-! ## The queue invariant, derived from the two operations
+
+  The code's counters are 32-bit and wrap. Model them as unbounded naturals `ticket`, `serving`; the code
+  stores `ticket % 2^32` and `serving % 2^32`. Acquire is `ticket := ticket + 1` (the caller keeps the old
+  value, core/spinlock.h ck_spin_lock_nomask fetch-add); release is `serving := serving + 1` and is only
+  done by the holder, i.e. while some ticket is outstanding (ck_spin_unlock_nomask). -/
+
+structure Q where
+  ticket : Nat
+  serving : Nat
+
+/-- States reachable from the unlocked lock (0, 0) by acquires and holder releases. -/
+inductive Reach : Q → Prop
+  | init : Reach ⟨0, 0⟩
+  | take {q : Q} : Reach q → Reach ⟨q.ticket + 1, q.serving⟩
+  | release {q : Q} : Reach q → q.serving < q.ticket → Reach ⟨q.ticket, q.serving + 1⟩
+
+theorem reach_le {q : Q} (h : Reach q) : q.serving ≤ q.ticket := by
+  induction h with
+  | init => exact Nat.le_refl 0
+  | take _ ih => exact Nat.le_succ_of_le ih
+  | release _ hlt _ => exact hlt
+
+/-- The 32-bit increment the code does equals the unbounded increment, reduced. -/
+theorem wrap_increment (M x : Nat) : (x + 1) % M = (x % M + 1) % M := by
+  rw [Nat.add_mod, Nat.add_mod (x % M) 1 M, Nat.mod_mod]
+
+/-- Every outstanding caller holds a ticket t with serving ≤ t < ticket (it took the old value of ticket
+    after serving had passed nobody it had not served). Its offset is t - serving < ticket - serving.
+    With at most M outstanding, the reduced comparison the code does (t % M = serving % M) admits exactly
+    the caller whose ticket is serving: the head of the queue. -/
+theorem enters_iff_head (M : Nat) (q : Q) (t : Nat)
+    (hlo : q.serving ≤ t) (hhi : t < q.ticket) (hM : q.ticket - q.serving ≤ M) :
+    t % M = q.serving % M ↔ t = q.serving := by
+  constructor
+  · intro h
+    have hi : t - q.serving < M := by omega
+    have e : q.serving + (t - q.serving) = t := by omega
+    have h' : enters M q.serving (t - q.serving) := by unfold enters tk; rw [e]; exact h
+    have := only_head_enters M q.serving (t - q.serving) hi h'
+    omega
+  · intro h; rw [h]
+
+/-! ## Interrupt ordering (the property DRA-556 is about)
+
+  One CPU runs a lock program. State: whether interrupts are masked, how many tickets this CPU has
+  outstanding (held or queued), and the stack of saved mask states. An interrupt can be taken in any state
+  where interrupts are open; a handler that takes the same lock while this CPU has a ticket outstanding spins
+  on a ticket behind its own CPU's and never returns (self-deadlock). So a program is safe when every state it
+  passes through has: outstanding > 0 → masked. -/
+
+inductive Op
+  | mask      -- ck_irq_save: push the current state, then mask
+  | restore   -- ck_irq_restore: pop the saved state
+  | take      -- fetch-add on ticket (then spin until served)
+  | release   -- store serving + 1
+  deriving DecidableEq
+
+structure S where
+  masked : Bool
+  outstanding : Nat
+  saved : List Bool
+  deriving DecidableEq
+
+def S.step (s : S) : Op → S
+  | .mask => { s with masked := true, saved := s.masked :: s.saved }
+  | .restore => { s with masked := s.saved.headD s.masked, saved := s.saved.tail }
+  | .take => { s with outstanding := s.outstanding + 1 }
+  | .release => { s with outstanding := s.outstanding - 1 }
+
+def S.ok (s : S) : Bool := s.outstanding == 0 || s.masked
+
+/-- Safe: the start state and every state after each step are ok. -/
+def safe : S → List Op → Bool
+  | s, [] => s.ok
+  | s, o :: os => s.ok && safe (s.step o) os
+
+def start (b : Bool) : S := ⟨b, 0, []⟩
+
+/-- core/spinlock.h order: mask, take (ck_spin_lock_irqsave); release, restore (ck_spin_unlock_irqrestore). -/
+def lockUnlock : List Op := [.mask, .take, .release, .restore]
+/-- Mutant CK_SPIN_TEST_TICKET_BEFORE_MASK. -/
+def ticketBeforeMask : List Op := [.take, .mask, .release, .restore]
+/-- Mutant CK_SPIN_TEST_RESTORE_BEFORE_RELEASE. -/
+def restoreBeforeRelease : List Op := [.mask, .take, .restore, .release]
+/-- Mutant CK_SPIN_TEST_NO_IRQ_MASK. -/
+def noMask : List Op := [.take, .release]
+/-- Two locks nested, released in reverse order. -/
+def nested : List Op := [.mask, .take, .mask, .take, .release, .restore, .release, .restore]
+
+theorem lockUnlock_safe (b : Bool) : safe (start b) lockUnlock = true := by cases b <;> decide
+theorem nested_safe (b : Bool) : safe (start b) nested = true := by cases b <;> decide
+/-- The caller's mask state comes back unchanged (a pre-masked caller stays masked). -/
+theorem lockUnlock_restores (b : Bool) :
+    (lockUnlock.foldl S.step (start b)).masked = b ∧ (lockUnlock.foldl S.step (start b)).outstanding = 0 := by
+  cases b <;> decide
+theorem ticketBeforeMask_unsafe : safe (start false) ticketBeforeMask = false := by decide
+theorem restoreBeforeRelease_unsafe : safe (start false) restoreBeforeRelease = false := by decide
+theorem noMask_unsafe : safe (start false) noMask = false := by decide

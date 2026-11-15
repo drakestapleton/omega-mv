@@ -50,6 +50,7 @@
  * is called. QEMU runs of this path qualify nothing physical. */
 #include "../core/ck_internal.h"
 #include "../core/handoff_check.h"
+#include "../core/spinlock.h"
 #include "../mm/frames.h"
 #include "../mm/heap.h"
 #include "../svc/allen_code.h"
@@ -857,7 +858,9 @@ static uint32_t night_ms, night_mib;                     /* what is said about i
 static uint64_t night_t0;                                /* when the night began (TSC); the chirp keeps time with it */
 static uint64_t night_last, night_cost;                  /* the boot core's last frame and what it took */
 static volatile uint32_t draw_run, draw_on, draw_helpers; /* drawing allowed; a core draws frames; cores helping */
-static volatile uint8_t draw_lock;
+/* core/spinlock.h without the interrupt mask: no interrupt handler draws, and the drawing cores keep interrupts on
+ * to acknowledge TLB-shootdown IPIs; a core spinning here with interrupts masked could block a shootdown. */
+static struct ck_spinlock draw_lock = CK_SPINLOCK_INIT;
 
 static uint64_t night_clock(void) { return ck_rdtsc(); }
 
@@ -869,13 +872,13 @@ static void night_tick(void)
     ck_x86_hda_step();
     uint64_t now = ck_rdtsc();
     if (__atomic_load_n(&draw_on, __ATOMIC_ACQUIRE) || now - night_last < night_cost * 2 ||
-        __atomic_test_and_set(&draw_lock, __ATOMIC_ACQUIRE))
+        !ck_spin_trylock_nomask(&draw_lock))
         return;
     if (ck_allen_ui_tick(now)) {
         night_last = ck_rdtsc();
         night_cost = night_last - now;
     }
-    __atomic_clear(&draw_lock, __ATOMIC_RELEASE);
+    ck_spin_unlock_nomask(&draw_lock);
 }
 
 /* The secondary cores' work while the night is up; each returns to its halt
@@ -897,11 +900,10 @@ static void draw_loop(void)
     __atomic_store_n(&draw_on, 1, __ATOMIC_RELEASE);
     while (__atomic_load_n(&draw_run, __ATOMIC_ACQUIRE)) {
         uint32_t g = __atomic_load_n(&park.gen, __ATOMIC_ACQUIRE);
-        while (__atomic_test_and_set(&draw_lock, __ATOMIC_ACQUIRE))
-            ck_pause();
+        ck_spin_lock_nomask(&draw_lock);
         (void)ck_allen_ui_tick(ck_rdtsc()); /* drawn or not, the pass ends in a PAUSE */
         int dark = ck_allen_ui_asleep();
-        __atomic_clear(&draw_lock, __ATOMIC_RELEASE);
+        ck_spin_unlock_nomask(&draw_lock);
         if (dark)
             rest_wait(g);
         else
@@ -938,7 +940,7 @@ static void draw_stop(void)
     uint64_t t0 = ck_rdtsc();
     while ((draw_on || draw_helpers) && ck_rdtsc() - t0 < tsc_hz / 5)
         ck_pause();
-    while (__atomic_test_and_set(&draw_lock, __ATOMIC_ACQUIRE) && ck_rdtsc() - t0 < tsc_hz / 5)
+    while (!ck_spin_trylock_nomask(&draw_lock) && ck_rdtsc() - t0 < tsc_hz / 5)
         ck_pause();
 }
 
@@ -1269,9 +1271,9 @@ void ck_x86_hold_step(uint64_t *end)
         if (sample) ck_allen_ui_said(0, sample, ck_rdtsc());
     }
     ck_x86_setup_step();
-    if (!__atomic_load_n(&draw_on, __ATOMIC_ACQUIRE) && !__atomic_test_and_set(&draw_lock, __ATOMIC_ACQUIRE)) {
+    if (!__atomic_load_n(&draw_on, __ATOMIC_ACQUIRE) && ck_spin_trylock_nomask(&draw_lock)) {
         ck_allen_ui_tick(ck_rdtsc()); /* no secondary core draws: this one does */
-        __atomic_clear(&draw_lock, __ATOMIC_RELEASE);
+        ck_spin_unlock_nomask(&draw_lock);
     }
     static int told;
     if (!told && ck_rdtsc() - allen_woke > 20 * tsc_hz) {

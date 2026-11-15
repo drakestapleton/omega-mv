@@ -60,6 +60,7 @@ static const int32_t sky_region_dec_udeg[SKY_NREGIONS] = {
 #include "night.h"
 #include "paint.h"
 #include "../svc/allen_code.h"
+#include "../core/spinlock.h"
 
 #define TEXT_MAX 160
 #define LINES_MAX 5
@@ -107,7 +108,7 @@ struct words {
 
 /* what the keyboard side has left for the next frame */
 static struct {
-    volatile char lock;
+    struct ck_spinlock lock; /* core/spinlock.h, _nomask: see lock() */
     volatile int refresh;
     unsigned input_gen, said_gen, map_gen, wake_gen;
     unsigned said_input_gen; /* input_gen when the last words came: keys after them stay in the bar */
@@ -250,12 +251,10 @@ static void relax(void)
 #endif
 }
 
-static void lock(void)
-{
-    while (__atomic_test_and_set(&note.lock, __ATOMIC_ACQUIRE))
-        relax();
-}
-static void unlock(void) { __atomic_clear(&note.lock, __ATOMIC_RELEASE); }
+/* The kernel's shared ticket lock without the interrupt mask: no interrupt handler takes the note lock, and on the
+ * iMac the drawing core that takes it keeps interrupts on for TLB-shootdown IPIs (core/spinlock.h, _nomask). */
+static void lock(void) { ck_spin_lock_nomask(&note.lock); }
+static void unlock(void) { ck_spin_unlock_nomask(&note.lock); }
 
 static uint32_t ms(uint64_t now) { return (uint32_t)((now - ui.t0) * 1000u / ui.hz); }
 
