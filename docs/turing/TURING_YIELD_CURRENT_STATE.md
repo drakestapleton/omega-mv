@@ -71,7 +71,7 @@ MERGED. No open PR anywhere mentions TURING yield, Evolution Arena runtime, or T
 | DISCOVERY DESCRIPTION_LENGTH / PREDICTIVE_SCORE | PLANNED (doctrine only) | arch `doctrine/DISCOVERY.md:232-233`; no code in omega (grep 0 files) |
 | Shannon entropy helper | IMPLEMENTED in Rust only (nats) | `aien-protocols/crates/aien-probe/src/math.rs:65-70` entropy in nats; `aien-sovereign-core/crates/aien-inference-abi/src/moe_plan.rs:64,201` `routing_entropy_bits` |
 | Entropy helper in C | MISSING | omega `*.c/*.h`: no `entropy`/`shannon` (grep); only `log2` in selectors (`oma_select.c`, `rx_costmodel.c`, `field_select.c`) |
-| Lossless entropy coder (arith/range/ANS/Huffman) in C | MISSING | none in omega, physics, aienos, aien-architecture, benchmarks, aien-protocols, sovereign-core C files (grep; vendor/third_party excluded) |
+| Lossless entropy coder (arith/range/ANS/Huffman) in C | MISSING | none in omega, physics, aienos, aien-architecture, benchmarks, aien-protocols, sovereign-core C files (grep; vendor/third_party excluded). Later (not part of this 2026-09-29 audit): C range and rANS reference coders `src/turing/tc_range.c`, `tc_rans.c` (EXP-001 lane B); the Omega range coder `src/turing/tc_range.om` with a proved length bound, [TURING_YIELD_RANGE_CODER_OM.md](TURING_YIELD_RANGE_CODER_OM.md) (L111) |
 | SPBM resolution/accuracy docs | IMPLEMENTED | `research/m15/spbm/README.md:16-21,30,36,47` (1 mJ step is not 1 mJ accuracy; no external meter); `spec/r15-performance-proof.md:597-621` |
 | benchmarks energy | PARTIAL, different boundary | `benchmarks/src/models.rs:121-122` `power_watts`, `joules_per_token`; `src/bin/bench_canonical_suite.rs:128-129` instantaneous `nvidia-smi power.draw`, GPU only, not an accumulator; Rust |
 | C BLAKE3 | MISSING | omega grep 0 files; crumbs trace chain uses Rust `blake3 = "1.8"` (`crates/crumbs/Cargo.toml:13`) |
@@ -199,6 +199,8 @@ The honest pairing:
 - The evidence then refers to the same work: the bits come from exactly the symbols scored inside the metered window.
 - **Ideal code length only.** No C lossless coder exists (§2). T is Shannon code length, not a decodable bitstream.
   - Optional check later: a C arithmetic coder whose output size is within a few bytes of Σ −log2 P.
+    (Done later in Omega, L111: coded bits <= T_ideal + 480 + 0.005647 n, proved;
+    [TURING_YIELD_RANGE_CODER_OM.md](TURING_YIELD_RANGE_CODER_OM.md).)
   - That is new in-house code. It is not an outside dependency.
 - Numeric identity: T in bits is a float sum. Goldens must reproduce under any build flags (`test_turing.c:33`). So
   store T in digested records as fixed-point integers (for example millibits as u64, energy in µJ as u64, as in
