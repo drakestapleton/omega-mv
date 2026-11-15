@@ -12,12 +12,30 @@ CTRL = {'=', 'fn', 'to', 'end', 'if', 'else', 'while', 'for', 'ret', 'bound', 'n
         'export', '(', ')'}
 SKIP1 = {'sizeof': 0, 'bitcast': 1, 'seal': 1, 'enlarge': 1}   # one skipped word, then this many values
 ARG1 = {'view', 'edit'}                                       # as an argument: one array name
+# words this machine reads by a rule of their own; every other table word is read by its table arity
+NAMED = CTRL | set(SKIP1) | ARG1 | {'get', 'offsetof', 'new'}
+
+
+def flags(name, entry):
+    """table column 3: 1 a type word; 2 a word whose form has an optional tail ("[" in the reference form,
+    e.g. kfdctl's request-dependent SUFFIX) and no rule of its own here, so the rest of its line is open"""
+    if entry['category'] == 'type':
+        return 1
+    if '[' in entry.get('form', '') and name not in NAMED:
+        return 2
+    return 0
+
+
+def table_text(table):
+    """the word table snap.om reads: one line NAME ARITY FLAGS per reference word"""
+    return ''.join(f"{k} {v['arity']} {flags(k, v)}\n" for k, v in table.items())
 
 
 class M:
     def __init__(s, table):
         s.ar = {k: v['arity'] for k, v in table.items()}
         s.ty = {k for k, v in table.items() if v['category'] == 'type'} | {'f32', 'f64'}
+        s.tail_open = {k for k, v in table.items() if flags(k, v) == 2}
         s.om2 = False; s.struct = False; s.first = True
         s.names = []; s.fns = {}; s.blocks = []; s.infn = False; s.void = False; s.ended = False
         s.fnmark = 0
@@ -73,6 +91,8 @@ class M:
         if w in s.names:
             s.owed -= 1; return
         if w in s.ar and w not in CTRL:
+            if w in s.tail_open:
+                s.open = True; return            # how many words follow depends on its arguments
             s.owed += s.ar[w] - 1; return
         s.open = True
 
