@@ -13,7 +13,7 @@ Checks, each printed PASS or raising with a named contract:
   stack    the module driver refuses (37, at build) a call chain that fits 8 MiB only if a host push is ignored,
            and links and runs the same chain once the push fits.
 """
-import hashlib, os, pathlib, re, struct, subprocess, sys
+import hashlib, os, pathlib, re, shutil, struct, subprocess, sys
 
 P = pathlib.Path
 REPO = P(__file__).resolve().parents[4]
@@ -80,13 +80,42 @@ SUBSET = {
     "getgid": "n = getgid\nret n",
     "getegid": "n = getegid\nret n",
 }
+OBJDUMP = shutil.which("aarch64-linux-gnu-objdump") or shutil.which("objdump")
+
+
+def sp_walk(code):
+    """Independent decoder (GNU objdump): the deepest SP and the final SP along the emitted words."""
+    (OUT / "code.bin").write_bytes(code)
+    r = subprocess.run([OBJDUMP, "-D", "-b", "binary", "-m", "aarch64", str(OUT / "code.bin")],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    cur = deep = low = 0
+    for line in r.stdout.splitlines():
+        if re.search(r"\bmov\s+sp\b|\[sp, #-?0x[0-9a-f]+\]!|\[sp\], #-?0x[0-9a-f]+", line):
+            raise AssertionError(("object-sp-write-unmodelled", line))
+        m = re.search(r"\t(sub|add)\s+sp, sp, #0x([0-9a-f]+)(, lsl #12)?", line)
+        if m:
+            v = int(m.group(2), 16) << (12 if m.group(3) else 0)
+            cur += v if m.group(1) == "sub" else -v
+            deep, low = max(deep, cur), min(low, cur)
+        elif re.search(r"\t(sub|add)\s+sp,", line):
+            raise AssertionError(("object-sp-write-unmodelled", line))
+    return deep, cur, low
+
+
 for word, body in SUBSET.items():
     sig = "to void" if word == "exit" else "to long"
     src = f"om2\nexport fn t b edit uchar * {sig}\n{body}\nend\n"
     obj = omc("object\n" + src)
     fns, calls, (s, e) = parse(obj)
     assert obj[s:e] == omc(src), f"object-code-equals-function-mode {word}"
-    ok(f"accept {word}")
+    walk = sp_walk(obj[s:e]) if OBJDUMP else None
+    if walk is None:
+        ok(f"accept {word} (objdump cross-check NOT_RUN)")
+        continue
+    assert walk == (fns[0]["stack"], 0, 0), ("object-host-stack-record", word, fns[0]["stack"], walk)
+    ok(f"accept {word}; record {fns[0]['stack']} = deepest SP in objdump's decode, SP back to 0")
 
 # refuse: what still needs state the module linker does not provide.
 REFUSE = {
