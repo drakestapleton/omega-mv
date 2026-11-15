@@ -13,8 +13,34 @@ normal is ±2^(−7), and the minimum denormal is ±2^(−10). The table does no
 the name FNUZ. That is the industry name for this encoding. It is not OCP E4M3
 (bias 7, NaN at 0x7F and 0xFF, a negative zero, maximum 448).
 
-`SH_MEM_CONFIG` bit 8 must be 1 for the device to treat the bytes as BF8/FP8
-(§7.2). The code object does not write that register.
+`SH_MEM_CONFIG` bit 8 is the field `SH_MEM_CONFIG__F8_MODE` (shift `0x8`, mask
+`0x00000100`) in Linux `drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_4_3_sh_mask.h`.
+It is not the alignment mode and not the retry bit. `SH_MEM_CONFIG__ALIGNMENT_MODE`
+is bits 4:3 (shift `0x3`, mask `0x18`). `drivers/gpu/drm/amd/include/vega10_enum.h`
+gives `SH_MEM_ALIGNMENT_MODE_UNALIGNED` the value 3. `SH_MEM_CONFIG__RETRY_DISABLE`
+is bit 12 (shift `0xc`, mask `0x1000`).
+
+CDNA3 ISA §7.2 says bit 8 must be 1 for the device to treat the bytes as BF8/FP8.
+The Linux header names the bit and does not describe the convert. This kernel
+issues `v_cvt_pk_f32_fp8`, so a cleared `F8_MODE` would make those converts a
+different format. Alignment mode and retry do not. The dwordx4 weight loads are
+16-byte aligned, so the unaligned mode KFD programs does not change them, and
+retry only changes what a page fault does.
+
+KFD sets the bit on this GPU. In `drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v9.c`,
+both `set_cache_memory_policy_v9` and `update_qpd_v9` OR
+`1 << SH_MEM_CONFIG__F8_MODE__SHIFT` into `qpd->sh_mem_config` when
+`KFD_GC_VERSION` is `IP_VERSION(9, 4, 3)` or `IP_VERSION(9, 4, 4)`.
+`kfd_device.c` labels `IP_VERSION(9, 4, 3)` as GC 9.4.3. `kfd_packet_manager.c`
+`pm_init` selects `kfd_aldebaran_pm_funcs` for that version, and
+`pm_map_process_aldebaran` in `kfd_packet_manager_v9.c` copies
+`qpd->sh_mem_config` into the MAP_PROCESS packet field `sh_mem_config`. The same
+word is what `program_sh_mem_settings` writes to `mmSH_MEM_CONFIG`
+(`kgd_gfx_v9_program_sh_mem_settings` in `amdgpu_amdkfd_gfx_v9.c`). The code
+object does not write the register. The earlier device-init store in
+`gfx_v9_4_3.c` `gfx_v9_4_3_xcc_init_compute_vmid` leaves `F8_MODE` clear; the
+process packet is what sets it. Those files were read at Linux commit
+`23c62304dde29abe92013d85910d03a77dada35d`.
 
 The convert in the kernel is `v_cvt_pk_f32_fp8_e32` (Table 31, VOP1, destination
 even). `llvm-mc-18 -mcpu=gfx942` encodes it as opcode 86. The kernel converts the
@@ -147,9 +173,43 @@ check number in `main`.
 gpu/amd/gfx942/fp8gemv/bench.sh
 ```
 
-Correctness first (`check.sh`). If `/dev/kfd` is absent it prints
-`BLOCKED_HARDWARE` and exits non-zero. It does not invent a bandwidth. On a
-card it runs `hipblaslt-bench` at these shapes (`f8_fnuz_r` times `f8_fnuz_r`,
-which is the FP8 combination that library has; the kernel is FP8 times FP32)
-and times this kernel with the row-remap bit off and on. Warmup, then 21
-samples, then the median, the spread, and GB/s against 5.3 TB/s.
+Correctness first (`check.sh`, which also compiles `plain_ref_test` and checks
+it against the same bit patterns as `check.om`). If `/dev/kfd` is absent the
+script prints `BLOCKED_HARDWARE` and exits non-zero. It does not invent a
+bandwidth.
+
+On a card, each device arm launches the kernel and compares `y` with the CPU
+column-order plain reference before any sample is timed. The tolerance is the
+one in `check.om`: `|yk − yp|` within `2*(K+1)*2^(−23)*Σ|product|*|scale|`,
+plus 8 ulps of `|yk|+|yp|`, and non-finite results must be the same bits.
+Flags bit 0 is checked both clear and set. A mismatch prints `FAIL` and the
+process exits non-zero. No GB/s line is printed for an arm that failed that
+check.
+
+hipBLASLt is FP8×FP8 into f32 (`f8_fnuz_r` × `f8_fnuz_r`, compute f32, D f32).
+The kernel is FP8 weights × FP32 activations plus a per-row scale. Those are
+different operations.
+
+Each side's GB/s uses its own byte count. The kernel count is `M*K + 4*K + 8*M`
+(FP8 weights, FP32 activations, FP32 scale, FP32 store). The library count is
+`M*K + K + 4*M` (FP8 A, FP8 B, FP32 D; beta is 0, so C is not counted). At the
+listed shapes the non-weight bytes are at most 0.293% of the weight bytes for
+the kernel (`(4*K+8*M)/(M*K)`, the maximum at M=K=4096) and at most 0.122% for
+the library (`(K+4*M)/(M*K)`, the same shape). Larger listed shapes are smaller
+shares.
+
+`bench_GB/s` is hipBLASLt's own `hipblaslt-GB/s` column, not the GB/s recomputed
+from the library byte count and the median `us`. `kernel_swizzle` is flags bit 0
+of this kernel. It changes which workgroup owns a row and does not change the
+byte count. It is not `--swizzleA`. 5.3 TB/s is the published MI300X HBM peak,
+not a measurement from this harness.
+
+Both arms have a hot mode and a cold mode, and every line names the mode. Cold
+reads a 512 MiB device buffer before each timed sample, which also puts that
+read between samples. 512 MiB is larger than 256 MB, so the read does not fit
+in the L2 or in a 256 MB MALL. The kernel does the read in process. hipBLASLt's
+cold samples call the same binary (`time_fp8gemv --flush`) before each process.
+Hot does not do that read. `hipblaslt-bench --flush` flushes the instruction
+cache and is not passed. Hot uses 10 warmup launches on the buffers being
+timed, then 21 samples. Cold times 21 samples with no warmup after the read.
+Each line gives the median, the spread, and GB/s against the published peak.

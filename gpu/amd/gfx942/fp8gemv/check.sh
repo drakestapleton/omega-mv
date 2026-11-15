@@ -116,4 +116,8 @@ if [ -s "$work/check.err" ]; then
 fi
 chmod +x "$work/check"
 "$work/check"
+
+echo "plain reference"
+g++ -O2 -std=c++17 -ffp-contract=off -o "$work/plain_ref_test" "$HERE/plain_ref_test.cpp"
+"$work/plain_ref_test"
 echo "check.sh pass"
