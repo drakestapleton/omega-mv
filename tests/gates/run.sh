@@ -575,7 +575,7 @@ case "$step" in
     make "$t"
     ;;
   # turing-yield.yml
-  turing-yield)       make test-turing-yield test-turing-energy ;;
+  turing-yield)       make test-turing-yield test-turing-energy test-turing-range-om ;;
   # evidence-immutable.yml: reviewed evidence is additions-only. Hosted compares the PR base
   # and head; locally the base is origin/main (or AIEN_BASE_REF).
   evidence-immutable)
