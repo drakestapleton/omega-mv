@@ -171,6 +171,11 @@ int osc_rt_same_outcome(const OscRt *a, const OscRt *b);
 /* 1 if addr is the start of a live slot (used to check REF arguments). */
 int osc_rt_is_live_ref(const OscRt *rt, uint64_t addr, uint64_t len);
 
+/* Checked host-call boundary for a validated function: 0 if every argument is
+ * canonical for its scalar type, every REF names a live slot of matching
+ * length in rt, and every external slice pair is valid; -1 otherwise. */
+int osc_rt_args_ok(const OscFunc *f, const uint64_t *args, unsigned nargs, const OscRt *rt);
+
 /* ---- OSC-2 arenas (docs/osc/OSC-2-DESIGN.md section 3) ----------------
  * An arena is one pool slot with capacity cap (1..OSC_MAX_ARRAY_LEN cells),
  * opened by osc_rt_arena_open, which returns its handle (the slot's address)

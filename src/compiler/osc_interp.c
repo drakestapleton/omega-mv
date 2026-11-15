@@ -225,25 +225,9 @@ static uint64_t run_func(Ctx *c, int fi, const uint64_t *args) {
     }
 }
 
-static int check_args(const OscUnit *u, int func, const uint64_t *args, unsigned nargs, const OscRt *rt) {
-    if (!rt || func < 0 || func >= u->nfuncs) return -1;
-    const OscFunc *f = &u->funcs[func];
-    if (nargs != f->nparams || (nargs && !args)) return -1;
-    for (unsigned p = 0; p < nargs; p++) {
-        const OscType *t = &f->vtype[p];
-        if (t->s == OSC_T_BYTES || t->s == OSC_T_CELLS) continue; /* external pointer: checked as a pair below */
-        if (t->s == OSC_T_REF) {
-            if (!osc_rt_is_live_ref(rt, args[p], t->len)) return -1;
-        } else if (canon(t->s, args[p]) != args[p]) {
-            return -1;
-        }
-    }
-    return osc_ir_slice_args_ok(f, args, nargs); /* NULL with len > 0, wrapping range, overlapping cells */
-}
-
 int osc_interp_run_prevalidated(const OscUnit *u, int func, const uint64_t *args, unsigned nargs, OscRt *rt,
                                 uint64_t *ret) {
-    if (!u || !ret || check_args(u, func, args, nargs, rt)) return -1;
+    if (!u || !ret || func < 0 || func >= u->nfuncs || osc_rt_args_ok(&u->funcs[func], args, nargs, rt)) return -1;
     Ctx c = {u, rt, 0};
     uint64_t a[OSC_MAX_PARAMS] = {0};
     for (unsigned i = 0; i < nargs; i++) a[i] = args[i];

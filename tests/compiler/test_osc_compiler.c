@@ -2122,6 +2122,63 @@ static void slice_host_checks(void)
     free(buf);
 }
 
+/* checked native entry: fixed references must belong to the supplied runtime,
+ * match their declared length, remain live, and accompany canonical scalars */
+static void native_arg_checks(void)
+{
+    OscUnit *u = U1;
+    OscDiag d;
+    const char *src = "fn f(a: &[u64; 2], i: u8, take: bool) -> u64 { if take { return a[i]; } return 9; }\n";
+    CHECK(osc_compile(src, strlen(src), u, &d, NULL) == 0, "native-arg unit refused: %s", d.message);
+    const OscFunc *f = &u->funcs[0];
+    CHECK(f->nparams == 3, "native-arg function should take three registers, got %u", f->nparams);
+
+    osc_rt_reset(RN);
+    uint64_t live = osc_rt_alloc(RN, 2, 11);
+    uint64_t wrong_len = osc_rt_alloc(RN, 3, 12);
+    uint64_t stale = osc_rt_alloc(RN, 2, 13);
+    osc_rt_release(RN, stale, 2);
+    ((uint64_t *)(uintptr_t)live)[1] = 42;
+    uint64_t fake[2] = {21, 22};
+    uint64_t good[3] = {live, 1, 1};
+    uint64_t bad[5][3] = {
+        {(uint64_t)(uintptr_t)fake, 1, 1}, /* address outside the runtime pool */
+        {wrong_len, 1, 1},                /* live slot of the wrong declared length */
+        {stale, 1, 1},                    /* released slot */
+        {live, 256, 1},                   /* noncanonical u8 */
+        {live, 1, 2}                      /* noncanonical bool */
+    };
+    const char *why[5] = {"arbitrary reference", "wrong-length reference", "stale reference", "noncanonical u8",
+                          "noncanonical bool"};
+    CHECK(osc_rt_args_ok(f, good, 3, RN) == 0, "shared argument check refused a live matching reference");
+    for (unsigned i = 0; i < 5; i++)
+        CHECK(osc_rt_args_ok(f, bad[i], 3, RN) == -1, "shared argument check accepted %s", why[i]);
+    CHECK(osc_rt_args_ok(f, good, 3, NULL) == -1, "shared argument check accepted a NULL runtime");
+
+    OscCode code;
+    OscNative nm;
+    char err[160];
+    memset(&code, 0, sizeof code);
+    CHECK(osc_cg_compile(u, &code, err, sizeof err) == 0, "native-arg codegen refused: %s", err);
+    if (osc_native_map(&nm, code.code, code.len) == 0) {
+        uint64_t ret = 77;
+        CHECK(osc_native_call(u, 0, &nm, code.entry[0], RN, good, 3, &ret) == 0 && ret == 42,
+              "checked native call refused valid arguments (ret %llu)", (unsigned long long)ret);
+        for (unsigned i = 0; i < 5; i++) {
+            ret = 77;
+            CHECK(osc_native_call(u, 0, &nm, code.entry[0], RN, bad[i], 3, &ret) == -1 && ret == 77,
+                  "checked native call entered with %s", why[i]);
+        }
+        ret = 77;
+        CHECK(osc_native_call(u, 0, &nm, code.entry[0], NULL, good, 3, &ret) == -1 && ret == 77,
+              "checked native call entered with a NULL runtime");
+        osc_native_unmap(&nm);
+    }
+    osc_cg_free(&code);
+    osc_rt_release(RN, live, 2);
+    osc_rt_release(RN, wrong_len, 3);
+}
+
 int main(int argc, char **argv)
 {
     unsigned fuzz = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 1000;
@@ -2172,6 +2229,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < ns; i++) free(sv[i]);
         free(sv);
     }
+    native_arg_checks();
 
     const char *const *tn = trap_names;
     printf("trap coverage (runs, interpreter == native):\n");

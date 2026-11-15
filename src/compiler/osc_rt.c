@@ -146,6 +146,32 @@ int osc_rt_is_live_ref(const OscRt *rt, uint64_t addr, uint64_t len) {
     return slot_of(rt, addr, len) >= 0;
 }
 
+static uint64_t canonical_arg(OscScalar t, uint64_t x) {
+    unsigned w = osc_scalar_width(t);
+    if (t == OSC_T_BOOL) return x & 1;
+    if (w >= 64) return x;
+    if (osc_scalar_signed(t)) {
+        uint64_t m = 1ULL << (w - 1);
+        x &= (1ULL << w) - 1;
+        return (x ^ m) - m;
+    }
+    return x & ((1ULL << w) - 1);
+}
+
+int osc_rt_args_ok(const OscFunc *f, const uint64_t *args, unsigned nargs, const OscRt *rt) {
+    if (!rt || !f || nargs != f->nparams || (nargs && !args)) return -1;
+    for (unsigned p = 0; p < nargs; p++) {
+        const OscType *t = &f->vtype[p];
+        if (t->s == OSC_T_BYTES || t->s == OSC_T_CELLS) continue; /* external pointer: checked as a pair below */
+        if (t->s == OSC_T_REF) {
+            if (!osc_rt_is_live_ref(rt, args[p], t->len)) return -1;
+        } else if (canonical_arg(t->s, args[p]) != args[p]) {
+            return -1;
+        }
+    }
+    return osc_ir_slice_args_ok(f, args, nargs); /* NULL with len > 0, wrapping range, overlapping cells */
+}
+
 void osc_rt_release(OscRt *rt, uint64_t addr, uint64_t len) {
     int s = slot_of(rt, addr, len);
     if (s < 0 || rt->slot_arena[s]) osc_rt_trap(rt, OSC_TRAP_RUNTIME);
