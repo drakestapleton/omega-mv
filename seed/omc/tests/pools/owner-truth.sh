@@ -5,7 +5,7 @@ set -eu
 ROOT=${1:-.}
 cd "$ROOT"
 bad=0
-if grep -R -n -F 'composes it with the OM-2 core and seed/ng/sha256.om' --include='*.om' . >/tmp/omc-b-owner-hits 2>/dev/null; then
+if git grep -n -F 'composes it with the OM-2 core and seed/ng/sha256.om' -- '*.om' >/tmp/omc-b-owner-hits 2>/dev/null; then
   echo "FAIL pasted composition sentence still present"
   cat /tmp/omc-b-owner-hits
   echo "OWNER-TRUTH FAIL"
@@ -14,19 +14,18 @@ fi
 # Other units still name recovered-owners.sh for a reason that is true for them.
 # These are the ones whose reason claimed a sha256 composition they do not have.
 python3 - << 'PY'
-import pathlib, runpy, sys
+import pathlib, runpy, subprocess, sys
 sys.argv = ["compose-owner.py", "seed/out/omc", "--recipes"]
 ns = runpy.run_path("seed/omc/tests/pools/compose-owner.py")
 # run_path executes main only when __name__ is __main__. Call the pieces.
 recipe = ns["recipe"]
-root = pathlib.Path(".")
 bad = 0
 owner = "owner=seed/omc/tests/pools/compose-owner.sh"
-for path in list(root.rglob("*.om")):
-    text = path.read_text(encoding="utf-8", errors="replace")
+listed = subprocess.run(["git", "ls-files", "*.om"], check=True, capture_output=True, text=True)
+for unit in listed.stdout.splitlines():
+    text = pathlib.Path(unit).read_text(encoding="utf-8", errors="replace")
     if owner not in text:
         continue
-    unit = str(path)
     name, source, parts = recipe(unit)
     for line in text.splitlines():
         if owner not in line:
