@@ -29,8 +29,13 @@
 #    (flipped payload byte, truncated, trailing byte, other TPS1, altered magic, corrupted TPS1,
 #    TSY1 of another trace, corrupted TSY1); a refusal after the output exists removes it; an
 #    output path naming an input is refused and the input is left intact; usage;
-#  5 mutants that must fail: coder arithmetic (not byte-identical to C), upper-bound constants,
-#    ub rounding (exhaustive ub check), lower-bound constant (ALARM exit 3 in each alarm case);
+#  4b n = 1152514738907 (cap+1) refuses ARG. The file is a digest-valid 160-byte TPS1, not a
+#    terabyte body. A sibling with n = 1 and the same shape refuses FORMAT, so a size-check
+#    miss is not counted as the cap. `selftest overflow` raises ALARM 7 on the wrapping sum.
+#  5 mutants that must fail: range >> 15 on every real unit (exit 0 and bytes differ from C, or
+#    exit 3 from an ALARM; a refusal of every unit is a failed mutant), decoder renorm count
+#    doubled (ALARM 1 on verify, the decode still finishes), upper-bound constants, ub rounding,
+#    lower-bound constant;
 #  6 Lean: docs/turing/proofs/TcrBound.lean checks with the pinned toolchain, 10 theorems, no
 #    sorry, standard axioms only (lean found as $LEAN, on PATH or in ~/.elan/bin; missing = FAIL).
 set -u
@@ -131,15 +136,70 @@ cmp -s "$N/self.tps" "$N/self.ref" && pass "input left intact" || fail "the inpu
 expect_rc "usage" 1 "$B" encode rans "$D/s.tps" "$D/s.tsy" "$N/w.tcr"
 grep -q '^lower=PASS$' "$D/enc.txt" || fail "unit 1 has no lower=PASS line"
 
+# Symbol-count cap. Both files are 128-byte headers plus a real trailer (160 bytes). n = 1
+# still dies on the body-size check (FORMAT). n = cap+1 dies on the word cap (ARG), which is
+# checked first so this does not require a terabyte of records.
+python3 - "$N/n1.tps" 1 "$N/ncap.tps" 1152514738907 << 'PY'
+import hashlib, struct, sys
+def write(path, n):
+    hdr = bytearray(128)
+    hdr[0:4] = b"TPS1"
+    struct.pack_into("<H", hdr, 4, 1)
+    hdr[6] = 2
+    hdr[7] = 16
+    struct.pack_into("<Q", hdr, 12, n)
+    struct.pack_into("<I", hdr, 20, 28)
+    dig = hashlib.sha256(b"turing.tc.pstream.v1\x00" + bytes(hdr)).digest()
+    with open(path, "wb") as f:
+        f.write(bytes(hdr) + dig)
+write(sys.argv[1], int(sys.argv[2]))
+write(sys.argv[3], int(sys.argv[4]))
+PY
+expect_rc "n = 1 with no records still fails the size check" 2 "$B" encode range "$N/n1.tps" "$N/absent.tsy" "$N/n1.out"
+grep -q 'refused -103 FORMAT' "$OUT/last.err" || fail "n = 1 header: not FORMAT ($(head -c 160 "$OUT/last.err"))"
+expect_rc "n = cap+1 refused" 2 "$B" encode range "$N/ncap.tps" "$N/absent.tsy" "$N/ncap.out"
+grep -q 'refused -101 ARG' "$OUT/last.err" || fail "n = cap+1: not ARG ($(head -c 160 "$OUT/last.err"))"
+expect_rc "wrapping micro-bit sum raises the overflow alarm" 3 "$B" selftest overflow
+grep -q 'would wrap' "$OUT/last.err" || fail "overflow alarm text missing ($(head -c 160 "$OUT/last.err"))"
+
 # Mutants.
 sed 's/^r = shr rg 16$/r = shr rg 15/' "$ROOT/src/turing/tc_range.om" > "$N/mut1.om"
 cmp -s "$N/mut1.om" "$ROOT/src/turing/tc_range.om" && fail "mutant 1 did not change the source"
 if build "$N/mut1.om" "$N/mut1"; then
-  "$N/mut1" encode range "$D/s.tps" "$D/s.tsy" "$N/m1.tcr" > /dev/null 2>&1
-  if [ -e "$N/m1.tcr" ] && cmp -s "$N/m1.tcr" "$D/c.tcr"; then fail "coder mutant still byte-identical"
-  else pass "coder mutant (range >> 15) caught: output differs from C or refused"; fi
+  good=0; refused=0; other=0; i=1
+  while [ "$i" -le 14 ]; do
+    "$N/mut1" encode range "$OUT/u$i/s.tps" "$OUT/u$i/s.tsy" "$N/m1-$i.tcr" > "$N/m1-$i.out" 2> "$N/m1-$i.err"
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ -f "$N/m1-$i.tcr" ] && ! cmp -s "$N/m1-$i.tcr" "$OUT/u$i/c.tcr"; then
+      good=$((good + 1))
+    elif [ "$rc" -eq 3 ] && grep -q 'tcr-om: ALARM \(length identity\|length bound\|lower bound\)' "$N/m1-$i.err"; then
+      good=$((good + 1))
+    elif [ "$rc" -eq 2 ]; then
+      refused=$((refused + 1))
+    else
+      other=$((other + 1))
+    fi
+    i=$((i + 1))
+  done
+  if [ "$good" -ge 2 ]; then
+    pass "coder mutant (range >> 15) caught on $good units (exit 0 and bytes differ, or exit 3 identity/bound alarm); refusals=$refused other=$other"
+  else
+    fail "coder mutant: good=$good refused=$refused other=$other (need a real difference or the bound alarm on more than unit 1; a total refusal is not a catch)"
+  fi
 else fail "mutant 1 build"; fi
-sed 's/^bnd = add add get ST 1 mul n 5647 480000000$/bnd = add add get ST 1 mul n 0 470000000/' \
+# One renorm byte counted twice: the decode still consumes the payload, and ALARM 1 fires
+# because shifts + 4 is no longer the payload. A binary that only refuses does not pass.
+sed 's/^put DC 5 add get DC 5 1$/put DC 5 add get DC 5 2/' "$ROOT/src/turing/tc_range.om" > "$N/mut5.om"
+cmp -s "$N/mut5.om" "$ROOT/src/turing/tc_range.om" && fail "decoder shift mutant did not change the source"
+if build "$N/mut5.om" "$N/mut5"; then
+  i=1
+  while [ "$i" -le 2 ]; do
+    expect_rc "decoder shift mutant alarms on unit $i" 3 "$N/mut5" verify range "$OUT/u$i/s.tps" "$OUT/u$i/s.tsy" "$OUT/u$i/c.tcr"
+    grep -q 'length identity' "$OUT/last.err" || fail "decoder shift mutant unit $i: not the identity alarm ($(head -c 160 "$OUT/last.err"))"
+    i=$((i + 1))
+  done
+else fail "decoder shift mutant build"; fi
+sed 's/umul n 5647 480000000/umul n 0 470000000/' \
   "$ROOT/src/turing/tc_range.om" > "$N/mut2.om"
 cmp -s "$N/mut2.om" "$ROOT/src/turing/tc_range.om" && fail "mutant 2 did not change the source"
 if build "$N/mut2.om" "$N/mut2"; then
@@ -151,7 +211,7 @@ cmp -s "$N/mut3.om" "$ROOT/src/turing/tc_range.om" && fail "mutant 3 did not cha
 if build "$N/mut3.om" "$N/mut3"; then
   expect_rc "ub rounding mutant fails the exhaustive ub check" 3 "$N/mut3" selftest
 else fail "mutant 3 build"; fi
-sed 's/^lw = add get ST 1 472000000$/lw = add get ST 1 482000000/' "$ROOT/src/turing/tc_range.om" > "$N/mut4.om"
+sed 's/^lw = uadd get ST 1 472000000$/lw = uadd get ST 1 482000000/' "$ROOT/src/turing/tc_range.om" > "$N/mut4.om"
 cmp -s "$N/mut4.om" "$ROOT/src/turing/tc_range.om" && fail "mutant 4 did not change the source"
 if build "$N/mut4.om" "$N/mut4"; then
   expect_rc "lower-bound mutant (10 bits too high) raises the ALARM" 3 "$N/mut4" encode range "$OUT/u2/s.tps" "$OUT/u2/s.tsy" "$N/m4.tcr"

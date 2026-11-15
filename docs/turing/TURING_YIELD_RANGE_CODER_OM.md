@@ -40,9 +40,17 @@ twice: a validation pass (trailer digest with SHA-256 in Omega, header, every re
 and the coding pass, which re-checks every record and symbol and hashes the file again; a file
 that changed between the passes is refused (DIGEST). An output path that names an input (same
 device and inode) is refused before anything is opened for writing, and a refusal after the
-output was created removes it. The only size limits are the 64-bit machine word: the length sums
-are 64-bit micro-bit counts, so a stream of more than 1,152,514,738,906 symbols (or a coded file of
-more than 2,305,843,009,213 bytes) is refused (ARG) instead of wrapping (Wolfram W3).
+output was created removes it.
+
+Two ceilings come from the 64-bit micro-bit sums, not from a buffer (Wolfram W3). `tpsload`
+refuses `n > 1152514738906` with ARG before the body-size check, because `16005647*n + 480000000`
+no longer fits in `2^64-1`. `report` refuses a coded file of more than `2305843009213` bytes with
+ARG, because `coded_bytes * 8 * 1000000` no longer fits. The host gate builds a 160-byte TPS1
+(header and a real trailer, no record body) at `n = cap+1` and requires ARG; the same shape with
+`n = 1` is FORMAT, which is the size check, so that refusal is not mistaken for the cap. A sum
+that would wrap anyway raises ALARM 7. `tcr-om selftest overflow` forms the upper sum at
+`n = cap+1` with the maximum per-symbol ideal and must take that alarm. `selftest` itself forms
+the same sum at `n = cap` and the coded-byte product at the byte cap, and must not alarm.
 
 ## The bounds
 
@@ -100,11 +108,26 @@ coder's bytes, so they sit exactly where the C coder's do.
    sum_t (16 - log2 q_t) is the exact ideal length I, `24 - log2 16711681 = -log2(1 - 65535/2^24)`
    = eps with 10^6 eps = 5646.4768..., and 32 - log2(2^32 - 1) = 3.359e-10. log2 of
    `encode_lower`: 8S >= I - G - (log2(2^32 - 1) - 24), with log2(2^32 - 1) - 24 = 7.99999999966.
-3. **Length identity (checked on every run, not proved).** payload_bytes = S + 4: each
-   `shift_low` call is one byte position, the flush makes 5 calls, the fifth always resolves
-   (low is 0 by then) and its cache byte is the only one not emitted. `tc_range.om` compares the two
-   counts on every encode, decode, verify and selftest case and raises ALARM 1 if they differ. So
-   coded_bits = 8 (S + 4) + 448 = 8S + 480.
+3. **Length identity (checked, not proved).** payload_bytes = S + 4, where S is the number of
+   renormalisation shifts (one per time `range` goes below `2^24`), not a value computed from the
+   payload. The flush is five `shift_low` calls; the fifth resolves (low is 0 by then) and its
+   cache byte is the only one not emitted, which is why the emitted payload is S + 4 rather than
+   S + 5. What each path actually compares:
+
+   - **encode.** `encs` counts S in `EN[5]`. `encend` does not. `ST[6]` is the bytes emitted
+     (`EN[6]`). `report` raises ALARM 1 when those bytes differ from S + 4. A carry before the
+     first cached byte has nowhere to land; `shlow` raises the same ALARM 1 instead of refusing
+     the input.
+   - **decode and verify.** `decs` counts S in `DC[5]`, once per payload byte read in that loop.
+     `decbeg` reads four bytes and does not count them. `ST[6]` is the declared payload. `ST[7]`
+     is `DC[5]`. `report` raises ALARM 1 when the declared payload differs from S + 4. It does not
+     store `payload - 4` back into `ST[7]`.
+   - **selftest.** The same two comparisons: emitted bytes against `EN[5] + 4`, and, after a
+     decode that round-trips, the payload against `DC[5] + 4`.
+
+   A run that passes has `coded_bits = 8(S + 4) + 448 = 8S + 480`. A decoder that counts two
+   shifts for one renorm byte still decodes, then fails ALARM 1; the host gate builds that mutant
+   and requires the identity alarm on verify. Lean does not prove this identity.
 4. **Integer ideal (receipt W2).** Wolfram recomputed the section 8 ub rule for every
    q = 1..65535: exact - ub lies in [-0.50019, +0.49984] ub; sum ub = 94,539,136,349 and
    sum q * ub mod 2^64 = 1,549,081,999,916,376. `tcr-om selftest` recomputes both sums in Omega and
@@ -116,13 +139,14 @@ coder's bytes, so they sit exactly where the C coder's do.
    is within 0.50019 + 0.49984 < 2 ub of its exact gain; for q > 65280 the gain is at most its value
    at q = 65281, 5646.48 ub < 5649).
 
-Model-to-system link: the Lean `step`/`renorm` are transcribed from CODER_SPEC section 5 and
-`encs` in `tc_range.om`; `tc_range.om` is byte-identical to the C reference on every gate unit and
-on two whole dev files (below); the renormalisation loops in `encs` and `decs` carry `bound 2`, so
-a third shift (a range below 256, which `step_ge` rules out) would trap (exit 104). The theorems
-are about the model; the byte identity and the run-time checks of both bounds tie them to the
-program. A change to `encs` that the Lean model does not follow is caught by the byte identity
-with C and by the run-time bound checks, not by Lean.
+Model-to-system link: the Lean `step`/`renorm` are a transcription of CODER_SPEC section 5 and of
+the arithmetic in `encs`. The Lean proof covers that model, not `encs`. It never mentions `low`,
+the cache, pending bytes, or `coded_bits`. `tc_range.om` is byte-identical to the C reference on
+every gate unit and on two whole dev files (below). The renormalisation loops in `encs` and `decs`
+carry `bound 2`, so a third shift (a range below 256, which `step_ge` rules out) traps (exit 104).
+Byte identity with C and the run-time checks are what tie the model to the program. A change to
+`encs` that the Lean model does not follow is caught by the byte identity with C and by those
+checks, not by Lean.
 
 ## Results (EXERCISED on the Spark, omc `26540e6d...`, omega-mv base e4271abd)
 
@@ -143,9 +167,14 @@ with C and by the run-time bound checks, not by Lean.
   corrupted TPS1 (DIGEST), TSY1 of another trace (COUNT), corrupted TSY1 (DIGEST). A decode
   refused after its output was created leaves no file; an output path naming an input is refused
   (ARG) and the input is unchanged.
-- Mutants caught: `range >> 15` (no longer byte-identical), upper-bound constants lowered
-  (ALARM 2), ub rounding removed (ALARM 5), lower-bound constant raised by 10 bits (ALARM 6).
+- Mutants caught on that run: `range >> 15` (no longer byte-identical), upper-bound constants
+  lowered (ALARM 2), ub rounding removed (ALARM 5), lower-bound constant raised by 10 bits
+  (ALARM 6).
 - Lean: 10 theorems checked, standard axioms only.
+
+The host script's later checks (decoder shift alarm, `n = cap+1` refused ARG, ALARM 7 on a
+wrapping sum, and the `range >> 15` mutant required to differ or alarm on more than one unit)
+are not part of the Spark paragraph above.
 
 Whole dev file (seed 1 only; seeds 8 to 10 untouched), not part of the gate because the data is not
 in the repository: 2,172,776 symbols, TY-2 candidate: ideal 1,752,630.382351 bits, coded 1,754,208
@@ -157,7 +186,9 @@ shared machine at load 28 to 37: Omega encode 5.4 to 10.8 s, verify 5.1 to 21.8 
 ## Not claimed
 
 - Coder B (rANS, `TCA1`) is not ported; `tcr-om` refuses `rans` with usage.
-- The length identity (proof step 3) is checked on every run, not proved in Lean.
+- The length identity (proof step 3) is checked on encode, decode, verify and selftest, as that
+  step describes. It is not proved in Lean. The Lean proof covers the model (`step`, `renorm`,
+  `run`), not `encs`.
 - The Lean check runs `lean` on the single file (it imports nothing); there is no lake project in
   this repository.
 - C remains the reference implementation of the calibration profile; nothing here changes

@@ -4,8 +4,10 @@ Copyright 2026 Drake Stapleton (AIEN / aien-dev)
 
 docs/turing/proofs/TcrBound.lean: the length bound of the TCR1 range coder (L111).
 
-Model (transcribed from calibration/docs/CODER_SPEC.md section 5 and src/turing/tc_range.om
-`encs`, which is byte-identical to src/turing/tc_range.c on every gate unit):
+Model (transcribed from calibration/docs/CODER_SPEC.md section 5 and the arithmetic of
+src/turing/tc_range.om `encs`, which is byte-identical to src/turing/tc_range.c on every gate
+unit). The theorems prove this model. They do not prove `encs`, and they do not mention `low`,
+the output cache, or the bytes the encoder emits:
   r = R >> 16;  R' = (last ? R - r*cum : r*q);  while R' < 2^24: R' <<= 8, shifts += 1
 with R in [2^24, 2^32) between symbols, R0 = 2^32 - 1, q >= 1, cum + q <= 65536 and
 cum + q = 65536 for the last symbol of the row (rows sum to 65536).

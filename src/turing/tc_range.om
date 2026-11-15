@@ -16,24 +16,37 @@ note   tcr-om decode range IN.tps IN.tcr OUT.tsy
 note   tcr-om verify range IN.tps IN.tsy IN.tcr
 note   tcr-om selftest
 note Exit 0 accepted, 2 refused (one line on stderr with the CODER_SPEC s.10 code), 1 usage,
-note 3 ALARM: a proved property failed on this run (length identity, upper or lower bound, ub rule).
+note 3 ALARM: a proved property failed on this run (length identity, upper or lower bound, ub rule,
+note or a micro-bit sum that would wrap).
 note Refusals come in turing-coder's order (encode: TPS1, TSY1, pair; decode: TPS1, coded file,
 note decode; verify: TPS1, coded file and decode, TSY1 and pair, byte identity).
 note
-note Every file is streamed through fixed buffers, so no input size is capped by this program:
-note memory does not grow with the number of symbols. Each input is read twice: a validation
-note pass (trailer digest, header, every record or symbol, in the refusal order of
-note src/turing/tc_pstream.c) and the coding pass, which re-checks every record and symbol and
-note re-hashes the file (DIGEST if it changed in between). An output path naming an input is
-note refused; a refusal after the output was created removes it.
+note Every file is streamed through fixed buffers, so memory does not grow with the number of
+note symbols. The micro-bit sums are 64-bit, and one past either ceiling wraps 2^64-1 (Wolfram W3):
+note   tpsload refuses n > 1152514738906 with ARG, before the body-size check, because
+note   16005647*n + 480000000 no longer fits
+note   report refuses a coded file of more than 2305843009213 bytes with ARG, because
+note   coded_bytes*8*1000000 no longer fits
+note These are the word limits of the check, not a buffer size. A sum that would wrap anyway
+note raises ALARM 7 (uadd / umul). Each input is read twice: a validation pass (trailer digest,
+note header, every record or symbol, in the refusal order of src/turing/tc_pstream.c) and the
+note coding pass, which re-checks every record and symbol and re-hashes the file (DIGEST if it
+note changed in between). An output path naming an input is refused; a refusal after the output
+note was created removes it.
 note
-note Length bounds (proved: docs/turing/proofs/TcrBound.lean, the log step and Wolfram receipts in
-note docs/turing/TURING_YIELD_RANGE_CODER_OM.md):
-note   payload_bytes = shifts + 4 (checked here on every run), coded_bits = 8 * shifts + 480
+note Length bounds. The Lean file docs/turing/proofs/TcrBound.lean proves the natural-number model
+note (step, renorm, run), not encs. The log step and Wolfram receipts are in
+note docs/turing/TURING_YIELD_RANGE_CODER_OM.md.
+note   payload_bytes = renorm shifts + 4, coded_bits = 8 * shifts + 480
+note   encode: shifts are EN[5], one per encs renorm; payload is the bytes emitted (EN[6])
+note   decode and verify: shifts are DC[5], one per decs renorm byte (range < 2^24). The four
+note     bytes decbeg reads are not shifts. Payload is the declared length. ST[7] is DC[5],
+note     not payload - 4. ALARM 1 if they disagree.
+note   selftest: both comparisons, on the encoded bytes and after a successful decode
 note   upper: 1000000 * coded_bits <= ideal_ub + 5647 * n + 480000000
 note   lower: 1000000 * coded_bits >= ideal_ub + 472000000 - n - gain_ub, gain_ub = sum over symbols
 note          coded as the last of their row of an upper bound of 1e6 * log2(1 + 256/q) (gub)
-note Both are checked on every run.
+note The upper and lower comparisons run on every encode, decode, verify and selftest case.
 
 global RB uchar 196608
 global RS ulong 24
@@ -101,6 +114,8 @@ text ALRT "selftest round trip"
 text ALFL "selftest corruption not detected"
 text ALUB "ub rule differs from the Wolfram receipt"
 text ALLO "lower bound 1e6*coded_bits < ideal_ub + 472e6 - n - gain_ub"
+text ALOV "length sum would wrap the 64-bit micro-bit word"
+text WOVF "overflow"
 text KUB "ub_rule q=1..65535 sum="
 text KUBQ " qsum="
 
@@ -230,6 +245,9 @@ ptext ALUB
 end
 if eq w 6
 ptext ALLO
+end
+if eq w 7
+ptext ALOV
 end
 pbyte 10
 pflush 2
@@ -546,7 +564,9 @@ end
 note ---------------------------------------------------------------- range coder (CODER_SPEC s.5)
 
 fn shlow to ulong
-note shift_low; returns 0, or 115 for a carry before the first byte (CORRUPT).
+note shift_low; returns 0. A carry before the first cached byte has nowhere to land, so the
+note emitted length cannot equal the renorm shifts. That is the length identity, ALARM 1,
+note not a bad input (decode still reports CORRUPT).
 lo = get EN 0
 c = shr lo 32
 if or lt and lo 4294967295 4278190080 ne c 0
@@ -555,7 +575,7 @@ obyte and add get EN 2 c 255
 put EN 6 add get EN 6 1
 else
 if ne c 0
-ret 115
+alarm 1
 end
 end
 while gt get EN 4 0 bound 9223372036854775807
@@ -620,11 +640,13 @@ ret 0
 end
 
 fn decbeg to ulong
-note DC: 0 code, 1 range, 2 payload bytes consumed, 3 payload bytes declared, 4 source.
+note DC: 0 code, 1 range, 2 payload bytes consumed, 3 payload bytes declared, 4 source,
+note 5 renorm shifts (one per decs byte, not these four).
 if lt get DC 3 4
 ret 113
 end
 put DC 2 0
+put DC 5 0
 c = ulong 0
 for i ulong 4
 c = or shl c 8 nxtb
@@ -667,6 +689,7 @@ ret 1113
 end
 code = and or shl code 8 b 4294967295
 rg = shl rg 8
+put DC 5 add get DC 5 1
 end
 put DC 0 code
 put DC 1 rg
@@ -760,6 +783,46 @@ put DG add 64 i get HB add 92 i
 end
 end
 
+fn uadd a ulong b ulong to ulong
+note a + b, or ALARM 7 if the sum would wrap 2^64.
+if gt a sub 18446744073709551615 b
+alarm 7
+end
+ret add a b
+end
+
+fn umul a ulong b ulong to ulong
+note a * b, or ALARM 7 if the product would wrap 2^64.
+if eq a 0
+ret 0
+end
+if eq b 0
+ret 0
+end
+if gt a div 18446744073709551615 b
+alarm 7
+end
+ret mul a b
+end
+
+fn ncap n ulong to void
+note ARG when n is past the last count whose maximum upper sum fits in 64 bits.
+note 16005647 * n + 480000000 <= 2^64-1 for n = 1152514738906 and not for n + 1 (Wolfram W3).
+if gt n 1152514738906
+refuse 101 0
+end
+end
+
+fn bndsum idl ulong n ulong to ulong
+note ideal_ub + 5647*n + 480000000. ALARM 7 if that sum would wrap.
+ret uadd uadd idl umul n 5647 480000000
+end
+
+fn cubit cb ulong to ulong
+note 1000000 * coded_bits = cb * 8 * 1000000. ALARM 7 if that product would wrap.
+ret umul umul cb 8 1000000
+end
+
 fn tpsload a ulong to void
 note Validate TPS1 argument a fully (CODER_SPEC s.2 order). DG[0..32) = its digest,
 note DG[64..96) = its dataset digest, ST[0] = count, ST[2] = K, ST[3] = record bytes.
@@ -778,17 +841,16 @@ end
 srew 0
 tpshdr 1
 n = get ST 0
+note Before the body-size check. A short file whose header count is past the cap must refuse
+note ARG here; the size check would otherwise report FORMAT and the cap would be unreachable
+note without a multi-terabyte body.
+ncap n
 rb = get ST 3
 if gt n div sub sz 160 rb
 refuse 103 0
 end
 if ne mul n rb sub sz 160
 refuse 103 0
-end
-if gt n 1152514738906
-note Machine-word boundary, not a size choice: every length sum is a 64-bit micro-bit count and
-note the bound reaches 16005647 n + 480e6 ub, which fits 2^64 - 1 up to this n (Wolfram W3).
-refuse 101 0
 end
 t = ulong 0
 while lt t n bound 9223372036854775807
@@ -903,19 +965,20 @@ fn acc s ulong to void
 note Add symbol s (row Q) to the ideal length ST[1] and, for the last symbol of the row, to the
 note lower-bound gain ST[8].
 q = get Q s
-put ST 1 add get ST 1 ub q
+put ST 1 uadd get ST 1 ub q
 if eq s sub get ST 2 1
-put ST 8 add get ST 8 gub q
+put ST 8 uadd get ST 8 gub q
 end
 end
 
 fn report to void
-note ST: 0 n, 1 ideal_ub, 6 payload bytes, 7 shifts, 8 last-symbol gain. Prints the length lines
-note and checks the identity and both bounds; a failure is an ALARM (exit 3), never a silent pass.
-note The 64-bit limits here are the machine word: n is capped in tpsload, cb below.
+note ST: 0 n, 1 ideal_ub, 6 payload bytes, 7 renorm shifts, 8 last-symbol gain. Prints the length
+note lines and checks the identity and both bounds; a failure is an ALARM (exit 3).
+note n is capped in tpsload. cb above 2305843009213 is ARG: coded_bytes*8*1000000 would not fit.
+note The additions themselves alarm if they would wrap, which is what a bypassed cap would hit.
 n = get ST 0
 pay = get ST 6
-cb = add pay 56
+cb = uadd pay 56
 if gt cb 2305843009213
 refuse 101 0
 end
@@ -925,8 +988,8 @@ pkv KCB cb
 pkv KCBT mul cb 8
 pkv KPAY pay
 pkv KSHF get ST 7
-bnd = add add get ST 1 mul n 5647 480000000
-cub = mul mul cb 8 1000000
+bnd = bndsum get ST 1 n
+cub = cubit cb
 pkv KBND bnd
 if ne pay add get ST 7 4
 alarm 1
@@ -935,8 +998,8 @@ if gt cub bnd
 alarm 2
 end
 pkv KSLK sub bnd cub
-lw = add get ST 1 472000000
-g = add n get ST 8
+lw = uadd get ST 1 472000000
+g = uadd n get ST 8
 lo = ulong 0
 if gt lw g
 lo = sub lw g
@@ -1203,7 +1266,7 @@ refuse e n
 end
 rehend 0 0 192 0
 put ST 6 get DC 3
-put ST 7 sub get DC 3 4
+put ST 7 get DC 5
 end
 
 fn cmddec to int
@@ -1388,8 +1451,8 @@ end
 fn stlow n ulong idl ulong cub ulong to void
 note Lower bound for a selftest case (ST[8] = last-symbol gain), its smallest slack (ST[27]) and
 note the largest amount any case codes below its ideal (ST[28]).
-lw = add idl 472000000
-g = add n get ST 8
+lw = uadd idl 472000000
+g = uadd n get ST 8
 lo = ulong 0
 if gt lw g
 lo = sub lw g
@@ -1415,8 +1478,8 @@ pay = get OS 2
 if ne pay add get EN 5 4
 alarm 1
 end
-bnd = add add idl mul n 5647 480000000
-cub = mul mul add pay 56 8 1000000
+bnd = bndsum idl n
+cub = cubit uadd pay 56
 if gt cub bnd
 alarm 2
 end
@@ -1431,6 +1494,9 @@ end
 end
 if ne stdec seed n k md 0
 alarm 3
+end
+if ne get DC 3 add get DC 5 4
+alarm 1
 end
 flip pay
 if eq stdec seed n k md 0
@@ -1465,8 +1531,31 @@ alarm 5
 end
 end
 
+fn ceilchk to void
+note The last legal n and the last legal coded length still fit. cmdovf is one past the n cap.
+note A constant that no longer fits alarms here and selftest does not pass.
+ncap 1152514738906
+z = bndsum umul 1152514738906 16000000 1152514738906
+y = cubit 2305843009213
+if eq z 0
+alarm 7
+end
+if eq y 0
+alarm 7
+end
+end
+
+fn cmdovf to int
+note n = cap+1 at ub(q=1) per symbol. 16005647*(cap+1) + 480000000 does not fit in 64 bits.
+note Must ALARM 7. Returning 0 means the sum wrapped or the check was removed.
+z = bndsum umul 1152514738907 16000000 1152514738907
+put ST 29 z
+ret 0
+end
+
 fn cmdself to int
 note Cases: K 2..16, all four row modes, three symbol modes, n from 0 to 200000.
+ceilchk
 put ST 20 18446744073709551615
 put ST 24 18446744073709551615
 put ST 27 18446744073709551615
@@ -1527,6 +1616,15 @@ if eq c 2
 argget 1
 if argis 1 WSLF
 ret cmdself
+end
+end
+if eq c 3
+argget 1
+if argis 1 WSLF
+argget 2
+if argis 2 WOVF
+ret cmdovf
+end
 end
 end
 if ne c 6
