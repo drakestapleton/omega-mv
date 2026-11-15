@@ -32,9 +32,11 @@
 #  4b n = 1152514738907 (cap+1) refuses ARG. The file is a digest-valid 160-byte TPS1, not a
 #    terabyte body. A sibling with n = 1 and the same shape refuses FORMAT, so a size-check
 #    miss is not counted as the cap. `selftest overflow` raises ALARM 7 on the wrapping sum.
-#  4c ofinish: a forced fsync failure (seccomp EIO on fsync/fdatasync) refuses IO (102) and
-#    removes the partial output; a mutant that clears the open flag before that check leaves
-#    the file.
+#  4c ofinish: a forced fsync failure (seccomp EIO on fsync/fdatasync; compile-time
+#    AUDIT_ARCH_X86_64 / AUDIT_ARCH_AARCH64 and __NR_fsync/__NR_fdatasync) refuses
+#    IO (102) and removes the partial output only if rc is 2 and the IO line is
+#    present; a SIGSYS or other rc with no file must not PASS. A mutant that
+#    clears the open flag before that check leaves the file.
 #  5 mutants that must fail: range >> 15 on every real unit (exit 0 and bytes differ from C, or
 #    exit 3 from an ALARM; a refusal of every unit is a failed mutant), decoder renorm count
 #    doubled (ALARM 1 on verify, the decode still finishes), upper-bound constants, ub rounding,
@@ -139,10 +141,24 @@ cmp -s "$N/self.tps" "$N/self.ref" && pass "input left intact" || fail "the inpu
 expect_rc "usage" 1 "$B" encode rans "$D/s.tps" "$D/s.tsy" "$N/w.tcr"
 grep -q '^lower=PASS$' "$D/enc.txt" || fail "unit 1 has no lower=PASS line"
 
-# ofinish fsync failure. A small seccomp wrapper makes fsync and fdatasync return EIO
-# (qemu-user translates the AArch64 fsync to the host syscall, so the filter on the
-# wrapper process is enough). Writes already succeeded, so this hits ofinish, not oflush.
-# The open flag must still be set so cleanup unlinks the partial output.
+# ofinish fsync failure. A small seccomp wrapper makes fsync and fdatasync return EIO.
+# The filter is compile-time arch-aware and lives in the generated fail_fsync.c:
+#   #if defined(__x86_64__)     AUDIT_ARCH_X86_64
+#   #elif defined(__aarch64__)  AUDIT_ARCH_AARCH64
+#   #else #error
+# and the syscall numbers are __NR_fsync / __NR_fdatasync from <sys/syscall.h>.
+# On a native AArch64 host (Spark) that is the process arch and the AArch64
+# syscall numbers. On x86_64, qemu-user translates the guest fsync to the host
+# syscall, and the x86_64 wrapper catches that. Writes already succeeded, so
+# this hits ofinish, not oflush. The open flag must still be set so cleanup
+# unlinks the partial output.
+# "removed the partial output" PASSes only after rc 2 AND a refused -102 IO
+# line AND the file is gone. A SIGSYS (or any other rc) with no file must not
+# PASS: that was the vacuous pass in Test Master R-07 when the x86-only filter
+# killed the process before the file was created.
+ofinish_removed_ok() { # ofinish_removed_ok <rc> <errfile> <outfile>
+  [ "$1" -eq 2 ] && grep -q 'refused -102 IO' "$2" && [ ! -e "$3" ]
+}
 cat > "$N/fail_fsync.c" << 'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -154,10 +170,17 @@ cat > "$N/fail_fsync.c" << 'C'
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if defined(__x86_64__)
+#define FAIL_FSYNC_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define FAIL_FSYNC_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#else
+#error "fail_fsync: only x86_64 and aarch64 are supported"
+#endif
 static int install(void) {
   struct sock_filter filter[] = {
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FAIL_FSYNC_AUDIT_ARCH, 1, 0),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fsync, 0, 1),
@@ -182,8 +205,21 @@ if gcc -O2 -Wall -Werror -o "$OUT/fail_fsync" "$N/fail_fsync.c"; then
   rm -f "$N/fsync.tcr"
   expect_rc "ofinish fsync failure is IO" 2 "$OUT/fail_fsync" "$B" encode range "$D/s.tps" "$D/s.tsy" "$N/fsync.tcr"
   grep -q 'refused -102 IO' "$OUT/last.err" || fail "ofinish fsync failure: not IO ($(head -c 160 "$OUT/last.err"))"
-  if [ -e "$N/fsync.tcr" ]; then fail "ofinish fsync failure left the output file"
-  else pass "ofinish fsync failure removed the partial output"; fi
+  if ofinish_removed_ok "$rc" "$OUT/last.err" "$N/fsync.tcr"; then
+    pass "ofinish fsync failure removed the partial output"
+  else
+    fail "ofinish fsync failure: rc=$rc file=$([ -e "$N/fsync.tcr" ] && echo present || echo absent) (need rc 2, IO, and no file)"
+  fi
+  # Vacuous-removal guard: SIGSYS (exit 159) with no output file must not PASS.
+  # This is the R-07 shape (exit 159, no file, no IO line).
+  rm -f "$N/sigsys.tcr"
+  sh -c 'kill -s SYS $$' > "$N/sigsys.out" 2> "$N/sigsys.err"
+  src=$?
+  if ofinish_removed_ok "$src" "$N/sigsys.err" "$N/sigsys.tcr"; then
+    fail "ofinish cleanup PASSed on exit $src with no IO refusal (vacuous removal)"
+  else
+    pass "SIGSYS or other non-IO exit does not count as ofinish cleanup (exit $src)"
+  fi
 else
   fail "fail_fsync wrapper did not compile"
 fi
@@ -276,7 +312,8 @@ import sys
 src = open(sys.argv[1]).read()
 old = """fn ofinish to void
 note Flush, fsync and close. Refuse IO (102) on fsync or fclose failure before clearing
-note OS[4], so cleanup still unlinks the partial output.
+note OS[4], so cleanup still unlinks the partial output. After a successful close,
+note zero OS[0] so the stale descriptor is not reused by a later fclose.
 oflush
 f = int get OS 0
 k = fsync f
@@ -287,6 +324,7 @@ end
 if lt z 0
 refuse 102 0
 end
+put OS 0 0
 put OS 4 0
 end
 """
