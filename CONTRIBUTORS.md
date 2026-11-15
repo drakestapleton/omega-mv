@@ -7,6 +7,8 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| Grok 4.7 (via Cursor Agent) | Closed the pinned-checkout copy so a sibling `uploadpack.packObjectsHook` or fsmonitor does not run, took the root tree from the commit object, and refused a physics.lock that is not one 40-hex commit before any recipe echoes it. `tools/test_pinned_checkout.sh`: 15 checks PASS. |
+| Codex | Isolated every gate dependency pin in a fresh read-only checkout copied from the locked object graph; disabled replacements and grafts; added raw commit, tree, blob, path and mode verification; strengthened Physics pin checks and added hostile-source regression controls. Static verification only. |
 | Grok 4.7 (via Cursor Agent) | Kept the ARGUS pin note in the Makefile when `argus.lock` lost its comments, and checked that `make ARGUS_COMMIT=...` cannot override the parsed lock. |
 | OpenAI Codex | Made `argus.lock` a strict single-commit file, validated it as data before GNU make derives ARGUS paths or recipes, and added static regression coverage for malformed and shell-bearing lock content. |
 | Grok 4.7 (via Cursor Agent) | Reviewed the generation-work ownership fix: length-prefixed the store directory in `work_resource_value` (`src/runtime/rx_generation.c`) so a shorter path cannot alias a longer one, and added `tests/runtime/rx_gen_work_auth.c`, a host probe of proposer-only assignment, delegated finish, cross-subject and cross-work refusal, and evidence-digest binding. It runs without the aienos sibling. The R16 negative binary still needs `libaienos_capability.a`. |
