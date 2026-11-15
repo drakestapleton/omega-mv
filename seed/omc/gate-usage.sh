@@ -59,7 +59,8 @@ else say "NOT_RUN cortex: no sibling checkout $P/cortex"; skip=$((skip + 1)); fi
 if [ -f "$P/interplane-forge/run.sh" ]; then
   sed -n '/^units()/,/^}/p' "$P/interplane-forge/run.sh" > $B/units.sh
   [ -s $B/units.sh ] || bad "forged: no units() in $P/interplane-forge/run.sh"
-  ( cd "$P/interplane-forge" && ROOT=$P/interplane-forge && OMV=$R && . $B/units.sh && { printf 'om2\n'; cat $(units); } ) > $B/real/forged.om
+  # run.sh forces LC_ALL=C: en_US sorts dljson.om before dl.om and omc then stops with error 3
+  ( cd "$P/interplane-forge" && LC_ALL=C ROOT=$P/interplane-forge && OMV=$R && . $B/units.sh && { printf 'om2\n'; cat $(units); } ) > $B/real/forged.om
 else say "NOT_RUN forged: no sibling checkout $P/interplane-forge"; skip=$((skip + 1)); fi
 sh seed/omc/tests/nocaps/gen.sh $B/gen
 for u in texts100k globals100k fns50k calls100k view100k traps100k longnames20k in64m; do
