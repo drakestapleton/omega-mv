@@ -612,11 +612,17 @@ blocked).
    - Also: the P2 revocation thread's `pthread_join` result is now checked,
      and the flip recheck carries the contract that `rx_gen_bind_authority`
      is startup-only and lock-free.
-   - Limits: any live enrolled subject may add or finish work on any
-     candidate (the credential proves who the caller is, not that it owns
-     the candidate; a proposer-only rule would change the drain contract).
-     A drain callback on a bound store must now use `rx_gen_finish_work_as`;
-     no in-tree bound store uses a drain callback, so that path has no probe.
+   - Follow-up authorization closure (2026-11-15): on a bound store only the
+     authenticated candidate proposer may add work. The proposer either owns
+     the item or explicitly names a delegated worker, and supplies that
+     worker's capability for the store/parent-generation/candidate/work/finish
+     resource returned by `rx_gen_work_resource`. The native authority checks
+     the capability when work is added and again when it is finished, so a
+     revoked, expired, cross-worker or cross-work grant cannot produce DONE.
+     Completion writes a root- and receipt-committed `R9WORK1` blob containing
+     the completer and the digest of the evidence observed at completion.
+     A bound-store drain must therefore run as the assigned worker and use
+     `rx_gen_finish_work_as`; unbound R9 and visor accounting remains legacy.
    - Host ladder rerun after this fix: R7, R8 (116/0), R9, R10 (198/0), R11
      (436/0), R13 host, R14 host (A to F PASS), R15 parity host (5 pairs, 0
      failures), R15 G7 host (57/0), workflow fusion (17059/0; its check count
