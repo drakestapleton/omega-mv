@@ -59,16 +59,19 @@ def arity_probe(omc, table, skip):
         typed = [slot(t) for t in v.get('types', [])][:a]
         cands = ([typed] if len(typed) == a else []) + [[c] * a for c in PLAIN]
         hit = None
-        for args in cands:
-            for form in FORMS:
-                if rc(PRE + form.format(w=' '.join([k] + args)) + '\nend\n') == 0:
-                    hit = (args, form); break
+        for unit in ('', 'om2\n'):                       # OM-2 words compile only in an om2 unit
+            for args in cands:
+                for form in FORMS:
+                    if rc(unit + PRE + form.format(w=' '.join([k] + args)) + '\nend\n') == 0:
+                        hit = (unit, args, form); break
+                if hit:
+                    break
             if hit:
                 break
         if not hit:
             unprobed.append(k); continue
-        args, form = hit
-        e = rc(PRE + form.format(w=' '.join([k] + args + [args[-1] if args else '1'])) + '\nend\n')
+        unit, args, form = hit
+        e = rc(unit + PRE + form.format(w=' '.join([k] + args + [args[-1] if args else '1'])) + '\nend\n')
         probed.append(k)
         if e != 5:
             bad.append((k, e))
