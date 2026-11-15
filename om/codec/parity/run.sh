@@ -9,12 +9,13 @@
 #   OMEGA_OMC  the seed-born omc (default seed/out/omc in this checkout), sha256 pinned below
 # Exit 0 PASS, 1 FAIL, 3 NOT_RUN (no pinned omc or no python3).
 set -eu
-OMC_PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 OMC=${OMEGA_OMC:-$ROOT/seed/out/omc}
 [ -x "$OMC" ] || { echo "NOT_RUN: no omc at $OMC (set OMEGA_OMC)"; exit 3; }
-[ "$(sha256sum < "$OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "NOT_RUN: $OMC is not the pinned omc"; exit 3; }
+. "$ROOT/seed/omc-pin.sh"
+OMC_PIN_ROOT=$ROOT
+omc_pin_match "$OMC" codec-parity || exit $?
 command -v python3 >/dev/null || { echo "NOT_RUN: python3 missing"; exit 3; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 STREAMS="decode validate serialize format parse hexid header"

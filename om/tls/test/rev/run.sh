@@ -10,7 +10,10 @@ omc=${1:?usage: run.sh OMC}
 here=$(cd "$(dirname "$0")" && pwd)
 tls=$(cd "$here/../.." && pwd)
 root=$(cd "$tls/../.." && pwd)
-pin=$(sed -n 's/^OMC_PIN=//p' "$root/om/units.sh")
+. "$root/seed/omc-pin.sh"
+OMC_PIN_ROOT=$root
+omc_pin_load || { echo "FAIL omc pin: seed/out/omc.sha256 has no compiler pin"; exit 1; }
+pin=$OMC_PIN
 out="$root/build/tls/rev"
 vec="$here/vectors"
 mkdir -p "$out"
@@ -19,7 +22,8 @@ say() { printf '%s\n' "$*"; }
 fail() { say "FAIL $*"; bad=1; }
 run() { nice -n 19 ionice -c3 "$@"; }
 
-[ "$(sha256sum < "$omc" | cut -c1-64)" = "$pin" ] || { say "FAIL omc is not the pinned compiler"; exit 1; }
+have=$(sha256sum < "$omc" | cut -c1-64)
+[ "$have" = "$pin" ] || { say "FAIL omc sha256 $have disagrees with seed/out/omc.sha256 pin $pin"; exit 1; }
 
 # build LIB DRIVER BIN [X509]   (X509: the x509.om text to compose, default om/tls/x509.om)
 build() {

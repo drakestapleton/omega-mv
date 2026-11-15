@@ -82,7 +82,7 @@ chmod +x build/seed/profile-check && build/seed/profile-check
 ```
 
 It exits 0 (`PROFILE CHECK PASS`), 1 (`PROFILE CHECK FAIL failed=N`) or 3 (`NOT_RUN`: no `seed/out/omc`,
-or its sha256 is not `OMC_PIN`). It runs these checks:
+or its sha256 is not the first field of `seed/out/omc.sha256`). It runs these checks:
 
 - `profile.cases` (53 rows): one refusal fixture per rule, pre-fix controls on the real modules, and the capacity and stop rows.
   - Three B2 structure fixtures that the checker at `7ae0a1df` wrongly passed: `b2-else` (stop in the else arm), `b2-arm` (guard borrowed from the sibling then-arm) and `b2-sibling` (guard in a separate earlier block). One positive nested control, `ok-b2-nested`.

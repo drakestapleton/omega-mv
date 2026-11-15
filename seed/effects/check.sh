@@ -2,14 +2,76 @@
 # Qualification for seed/effects (effect-derived capability manifest).
 # The tool is seeded Omega; this coordinator only compiles, runs and compares.
 # strace, bwrap, od and dd are read-only oracles / launchers, not implementation.
-# Exit 0 PASS, 1 FAIL, 3 NOT_RUN (wrong compiler or missing oracle).
+# Exit 0 PASS, 1 FAIL (including a compiler that disagrees with seed/out/omc.sha256),
+# 3 NOT_RUN (compiler or oracle missing).
 set -u
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 OMC=${OMC:-$ROOT/seed/out/omc}
-PIN=$(sed -n 's/^OMC_PIN=//p' om/units.sh)
-[ -x "$OMC" ] || { echo "NOT_RUN effects: no omc at $OMC"; exit 3; }
-[ "$(sha256sum < "$OMC" | cut -c1-64)" = "$PIN" ] || { echo "NOT_RUN effects: omc is not the pinned compiler $PIN"; exit 3; }
+. "$ROOT/seed/omc-pin.sh"
+OMC_PIN_ROOT=$ROOT
+
+# A forged sidecar must fail here, with both digests, and must not be reported as NOT_RUN.
+# The live tree is not modified. A shell file that types either compiler hash fails too,
+# and the generated unit identity must name the sidecar pin.
+pin_disagree_control() {
+    d=$(mktemp -d)
+    badpin=0000000000000000000000000000000000000000000000000000000000000001
+    printf '%s  seed/out/omc\n' "$badpin" > "$d/omc.sha256"
+    OMC_PIN_FILE=$d/omc.sha256
+    out=$(omc_pin_match "$OMC" effects)
+    rc=$?
+    unset OMC_PIN_FILE
+    if [ "$rc" -ne 1 ]; then
+        echo "FAIL effects: pin/sidecar disagree control exited $rc"
+        printf '%s\n' "$out"
+        rm -rf "$d"
+        exit 1
+    fi
+    printf '%s\n' "$out" | grep -q "disagrees with seed/out/omc.sha256 pin $badpin" || {
+        echo "FAIL effects: pin/sidecar disagree control did not name both digests"
+        printf '%s\n' "$out"
+        rm -rf "$d"
+        exit 1
+    }
+    if printf '%s\n' "$out" | grep -q NOT_RUN; then
+        echo "FAIL effects: pin/sidecar disagree control printed NOT_RUN"
+        rm -rf "$d"
+        exit 1
+    fi
+    mkdir -p "$ROOT/build/seed"
+    printf '%s\n' "$out" > "$ROOT/build/seed/pin-disagree.out"
+    echo "ok   pin/sidecar disagree control exit=1"
+    sed 's/^/control /' "$ROOT/build/seed/pin-disagree.out"
+    want=$(awk 'NR==1 { print $1; exit }' "$ROOT/seed/out/omc.sha256")
+    # Any shell assignment of a compiler pin is a hand-typed hash. The pin is the sidecar.
+    if git grep -nE '^[[:space:]]*(OMC_PIN|pin)=[0-9a-f]{64}[[:space:]]*$' -- '*.sh' > "$d/scan"; then
+        echo "FAIL effects: a shell file still types a compiler pin"
+        cat "$d/scan"
+        rm -rf "$d"
+        exit 1
+    fi
+    if git grep -n "=$want" -- '*.sh' > "$d/scan"; then
+        echo "FAIL effects: a shell file types the sidecar pin"
+        cat "$d/scan"
+        rm -rf "$d"
+        exit 1
+    fi
+    got=$(sed -n 's/.* omc=\([0-9a-f]\{64\}\).*/\1/p' "$ROOT/src/omega_om_units.ident" | sort -u)
+    if [ "$got" != "$want" ]; then
+        echo "FAIL effects: src/omega_om_units.ident pin [$got] disagrees with seed/out/omc.sha256 pin $want"
+        rm -rf "$d"
+        exit 1
+    fi
+    echo "ok   generated unit identity matches seed/out/omc.sha256"
+    rm -rf "$d"
+    omc_pin_load || { echo "NOT_RUN effects: seed/out/omc.sha256 has no compiler pin"; exit 3; }
+}
+
+[ -f "$OMC" ] || { echo "NOT_RUN effects: no omc at $OMC"; exit 3; }
+pin_disagree_control
+omc_pin_match "$OMC" effects || exit $?
+PIN=$OMC_PIN
 for t in strace bwrap od dd awk; do
     command -v $t > /dev/null || { echo "NOT_RUN effects: oracle $t missing"; exit 3; }
 done

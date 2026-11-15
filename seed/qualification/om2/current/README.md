@@ -32,10 +32,10 @@ Every `abi-*` and `sha-*` declared `notrun` case in
 fails if a case is added, omitted, or duplicated. Each C driver's expected
 case names are read from its explicit `check` calls and must appear once in
 its output. The ABI symbol and stale-source/compiler/profile cases are
-executed separately. The identity checker is copied into the evidence directory;
-only its OMC_PIN literal is replaced, exactly once, with the digest of the
-snapshotted candidate compiler. Bindings are freshly generated there before
-the positive and negative identity checks. The projected script, original
+executed separately. The identity checker is copied into the evidence directory. Its staged
+`seed/out/omc.sha256` is the digest of the snapshotted candidate compiler,
+and `om/units.sh` derives `OMC_PIN` from that file. Bindings are freshly
+generated there before the positive and negative identity checks. The
 script digest and derived pin are recorded. Canonical pins, sources and
 generated artifacts are unchanged. This is candidate checker qualification,
 not a claim that the canonical generated bindings are current.
