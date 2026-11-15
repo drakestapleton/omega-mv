@@ -33,11 +33,14 @@
 # 11. Byte identity: `git grep -nw enlarge` names no tracked unit outside tests/pools except in `note`
 #     lines (comments, listed: omc.om documents its own keyword); every other tracked
 #     .om gives the same status, stdout and stderr under OMC and CTRL, except the units
-#     seed/omc/cabi/introduced.txt names. Those were introduced by FR-7. The historical
-#     compiler has no cabi word, so it must refuse each of them (error 16) and the compiler
-#     under test must not. An ordinary program is the control: the historical compiler
-#     accepts it, which is why a cabi unit rewritten that way goes red. POOLS_SKIP_EQUIV=1
-#     skips the comparison (NOT_RUN); POOLS_EQUIV_MAX=N compares only the first N files.
+#     named in seed/omc/cabi/introduced.txt. Each line is the source sha256 and the path.
+#     seed/omc/cabi/golden.sha256 is the stdout sha256, the stderr sha256, and the exit
+#     from the compiler that wrote it (seed/omc/cabi/regen.sh, run by seed/units/regen.sh).
+#     call.om and trap.om exit 0. The other six are refusals, pinned to that exit and to
+#     the diagnostic bytes. The historical compiler must still refuse every one (error 16).
+#     An unlisted file under seed/omc/cabi/, a missing file, a hash mismatch, or an extra
+#     or unparseable line fails the gate. POOLS_SKIP_EQUIV=1 skips the comparison
+#     (NOT_RUN); POOLS_EQUIV_MAX=N compares only the first N files.
 #  S. Server (design 11, srv): 2000 requests of growing and shrinking size from one pool; enlarge calls
 #     and growth syscalls (strace) equal the high-water marks of the model; VmRSS at the end is at most
 #     the high-water VmRSS + 1024 kB. Control: the leak mode (stdin L) rises past it.
@@ -325,33 +328,84 @@ if on 11; then
   done < $B/allowed
   if [ -n "$(comm -23 $B/users $B/allowed)" ]; then bad "11 scan: units use enlarge outside $T and are not listed in $T/enlarge-users.txt: $(comm -23 $B/users $B/allowed | tr '\n' ' ')"; fi
   say "PASS 11 scan: git grep -nw enlarge outside $T: $(wc -l < $B/scan) lines; units using the word: $(tr '\n' ' ' < $B/users)(each listed in enlarge-users.txt); the rest are notes"
-  # FR-7 units. The directory is declared in seed/omc/cabi/introduced.txt. The file list is
-  # whatever is tracked there, not a second hand-written list. The historical compiler must
-  # refuse each one, and the compiler under test must understand cabi.
+  # FR-7. The list is the lines of introduced.txt, not the directory.
   intro=seed/omc/cabi/introduced.txt
+  gold=seed/omc/cabi/golden.sha256
   [ -f "$intro" ] || bad "11 FR-7: $intro is missing"
-  dir=$(grep -v '^#' "$intro" | head -n 1)
-  [ -n "$dir" ] || bad "11 FR-7: $intro names no directory"
-  git ls-files "$dir/*.om" > $B/fr7
-  [ -s $B/fr7 ] || bad "11 FR-7: no tracked units under $dir"
-  while read -r f; do
-    first=$(awk 'NF && $1 != "note" { print; exit }' "$f")
-    [ "$first" = "cabi" ] || bad "11 FR-7: $f does not open with cabi"
+  [ -f "$gold" ] || bad "11 FR-7: $gold is missing"
+  : > $B/fr7
+  : > $B/fr7src
+  nline=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    nline=$((nline + 1))
+    printf '%s\n' "$line" | grep -Eq '^[0-9a-f]{64} seed/omc/cabi/[A-Za-z0-9._-]+\.om$' \
+      || bad "11 FR-7: unparseable line $nline in $intro"
+    sum=${line%% *}
+    path=${line#* }
+    grep -qxF "$path" $B/fr7 && bad "11 FR-7: duplicate $path"
+    printf '%s\n' "$path" >> $B/fr7
+    printf '%s %s\n' "$sum" "$path" >> $B/fr7src
+  done < "$intro"
+  [ "$nline" = 8 ] || bad "11 FR-7: $intro has $nline lines, wanted the 8 units"
+  : > $B/fr7g
+  nline=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    nline=$((nline + 1))
+    printf '%s\n' "$line" | grep -Eq '^[0-9a-f]{64} [0-9a-f]{64} [0-9]+ seed/omc/cabi/[A-Za-z0-9._-]+\.om$' \
+      || bad "11 FR-7: unparseable line $nline in $gold"
+    rest=${line#* }
+    errsum=${rest%% *}
+    rest=${rest#* }
+    gexit=${rest%% *}
+    path=${rest#* }
+    grep -qxF "$path" $B/fr7g && bad "11 FR-7: duplicate golden $path"
+    printf '%s\n' "$path" >> $B/fr7g
+    printf '%s %s %s %s\n' "${line%% *}" "$errsum" "$gexit" "$path" >> $B/fr7grow
+  done < "$gold"
+  [ "$nline" = 8 ] || bad "11 FR-7: $gold has $nline lines, wanted the 8 units"
+  sort $B/fr7 > $B/fr7s
+  sort $B/fr7g > $B/fr7gs
+  cmp -s $B/fr7s $B/fr7gs || bad "11 FR-7: introduced.txt and golden.sha256 name different units"
+  git ls-files 'seed/omc/cabi/*.om' | sort > $B/fr7tracked
+  cmp -s $B/fr7s $B/fr7tracked || bad "11 FR-7: tracked units and introduced.txt differ: $(comm -3 $B/fr7s $B/fr7tracked | tr '\n' ' ')"
+  git ls-files 'seed/omc/cabi' | sort > $B/cabiall
+  printf '%s\n' \
+    seed/omc/cabi/call.c \
+    seed/omc/cabi/trap.c \
+    seed/omc/cabi/introduced.txt \
+    seed/omc/cabi/golden.sha256 \
+    seed/omc/cabi/regen.sh \
+    | sort > $B/cabiok
+  sort -u $B/fr7s $B/cabiok > $B/cabiwant
+  extra=$(comm -23 $B/cabiall $B/cabiwant || true)
+  [ -z "$extra" ] || bad "11 FR-7: unlisted file under seed/omc/cabi/: $(printf '%s' "$extra" | tr '\n' ' ')"
+  while read -r sum path; do
+    [ -f "$path" ] || bad "11 FR-7: missing $path"
+    have=$(sha256sum < "$path" | cut -c1-64)
+    [ "$have" = "$sum" ] || bad "11 FR-7: source hash mismatch $path"
+  done < $B/fr7src
+  : > $B/fr7
+  while read -r outsum errsum gexit path; do
     set +e
-    timeout 60 "$CTRL" < "$f" > $B/eb 2> $B/ebe; b=$?
-    timeout 60 "$S" < "$f" > $B/ea 2> $B/eae; a=$?
+    timeout 60 "$S" < "$path" > $B/ea 2> $B/eae; a=$?
+    timeout 60 "$CTRL" < "$path" > $B/eb 2> $B/ebe; b=$?
     set -e
-    [ "$b" = 16 ] && grep -q 'error 16$' $B/ebe || bad "11 FR-7: historical compiler did not refuse $f (status $b)"
-    [ "$a" != 16 ] || bad "11 FR-7: compiler under test still reports an unknown word for $f"
-  done < $B/fr7
+    [ "$b" = 16 ] && grep -q 'error 16$' $B/ebe || bad "11 FR-7: historical compiler did not refuse $path (status $b)"
+    [ "$a" = "$gexit" ] || bad "11 FR-7: $path status $a, golden $gexit"
+    got=$(sha256sum < $B/ea | cut -c1-64)
+    [ "$got" = "$outsum" ] || bad "11 FR-7: $path output hash $got, golden $outsum"
+    got=$(sha256sum < $B/eae | cut -c1-64)
+    [ "$got" = "$errsum" ] || bad "11 FR-7: $path diagnostic hash $got, golden $errsum"
+    printf '%s\n' "$path" >> $B/fr7
+  done < $B/fr7grow
   printf 'fn main to int\nret 0\nend\n' > $B/fr7mut.om
   set +e
   timeout 60 "$CTRL" < $B/fr7mut.om > $B/eb 2> $B/ebe; b=$?
   set -e
   if [ "$b" = 16 ] && grep -q 'error 16$' $B/ebe; then
-    bad "11 FR-7 mutant: the historical compiler refused an ordinary program, so rewriting a cabi unit that way would not go red"
+    bad "11 FR-7 mutant: the historical compiler refused an ordinary program, so the refusal check cannot go red"
   fi
-  say "PASS 11 FR-7: $(wc -l < $B/fr7) units introduced by FR-7, historical compiler refuses each (error 16); an ordinary program is not refused"
+  say "PASS 11 FR-7: 8 units, source and output pinned; historical compiler refuses each (error 16)"
   if [ "${POOLS_SKIP_EQUIV:-0}" = 1 ]; then
     say "NOT_RUN 11 byte identity (POOLS_SKIP_EQUIV=1)"
   else
