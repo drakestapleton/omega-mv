@@ -10,6 +10,11 @@
 # commit the five files under src/ before the seed gate: the host check refuses
 # a dirty checkout.
 #
+# The same compiler's C ABI pins are refreshed next, by seed/omc/cabi/regen.sh.
+# That rewrites seed/omc/cabi/introduced.txt (source sha256 of each listed
+# unit) and seed/omc/cabi/golden.sha256 (stdout, stderr, and exit of compiling
+# it). It does not add or drop a unit. Commit those two files with the bindings.
+#
 # The generator is omega-bridge src/native.om at the commit in om/omega-bridge.lock,
 # compiled by seed/out/omc (om/units.sh). This step does not call tools/bridge-seeded
 # or tools/bridge-freest. Those two refuse any compiler other than the one
@@ -54,3 +59,4 @@ fi
 got=$(sha256sum < "$bridge/src/native.om" | cut -c1-64)
 [ "$got" = "$native" ] || { echo "FAIL: src/native.om sha256 $got disagrees with om/units.sh generator pin $native"; exit 1; }
 OMEGA_OMC=$OMC OMEGA_BRIDGE=$bridge nice -n 19 sh "$ROOT/om/units.sh" ${1:+"$1"}
+nice -n 19 sh "$ROOT/seed/omc/cabi/regen.sh" ${1:+"$1"}
