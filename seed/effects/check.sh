@@ -72,7 +72,7 @@ pin_disagree_control() {
 }
 
 [ -f "$OMC" ] || { echo "NOT_RUN effects: no omc at $OMC"; exit 3; }
-omc_pin_load || { echo "NOT_RUN effects: seed/out/omc.sha256 has no compiler pin"; exit 3; }
+omc_pin_load || { echo "NOT_RUN effects: no compiler pin in seed/out/omc.sha256"; exit 3; }
 PIN=$OMC_PIN
 runner_hash=$(sha256sum < "$OMC" | cut -c1-64)
 # Section 11 of seed/omc/gate-pools.sh runs this owner once through its recording runner and names the
@@ -99,6 +99,7 @@ if [ "$OMC_BINARY" != "$OMC" ]; then
         echo "NOT_RUN effects: OMC is not section 11's recording runner for the pinned compiler $PIN"; exit 3
     fi
 else
+    [ "$runner_hash" = "$PIN" ] || { echo "NOT_RUN effects: omc is not the pinned compiler $PIN"; exit 3; }
     pin_disagree_control
     omc_pin_match "$OMC" effects || exit $?
     PIN=$OMC_PIN

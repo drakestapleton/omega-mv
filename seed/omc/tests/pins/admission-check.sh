@@ -160,7 +160,7 @@ manifest() { # TREE: every path with type, mode and content digest
 setup() {
   r=$T/$1.$2; t=$r/tree
   mkdir -p "$t/seed/out" "$t/build" "$t/bridge" "$r/home" "$r/tmp"
-  for f in $3; do mkdir -p "$t/$(dirname "$f")"; cp -p "$ROOT/$f" "$t/$f"; done
+  for f in $3 seed/omc-pin.sh; do mkdir -p "$t/$(dirname "$f")"; cp -p "$ROOT/$f" "$t/$f"; done
   cp "$DECOY" "$t/seed/out/omc"
   case $2 in
     wrong|wrapped-*) cp "$ROOT/seed/out/omc.sha256" "$t/seed/out/omc.sha256" ;;
@@ -279,6 +279,9 @@ classify() {
   if grep -q "^[a-z0-9-]*|$1[ |]" "$T/table"; then echo controlled; return; fi
   case $1 in
     seed/omc/tests/pins/*.sh) echo instrument ;;
+    seed/omc-pin.sh) echo "shared sidecar reader sourced by the consumers; it is not handed a compiler" ;;
+    seed/omc/tests/pin-plant.sh) echo "planted-compiler control run by seed/effects/check.sh after the compiler matches" ;;
+    seed/units/regen.sh) echo "rewrites the unit bindings from the sidecar compiler; reads the record and writes src" ;;
     tests/landgate/*.sh|tests/landgate/*.py) echo "instrument: the landing campaign and its record judges, which check the head compiler against the record" ;;
     seed/omega-from-seed.sh|seed/omc/gate6.sh) echo "writer of the record" ;;
     seed/omc/gate5.sh|tests/autodiff664/run-tape.sh|bench/inference_cost/verify-test.om) echo "another omc.sha256 file, not the record" ;;

@@ -19,6 +19,9 @@ P=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$P/../../.." && pwd)
 OM=$P/../evidence.om
 [ -n "${OMEGA_OMC:-}" ] || { echo "EVIDENCE-PARITY NOT_RUN: set OMEGA_OMC"; exit 3; }
+OMC_PIN=$(sed -n '$!d;1s/^\([0-9a-f]\{64\}\)  seed\/out\/omc$/\1/p' "$ROOT/seed/out/omc.sha256" 2>/dev/null) || OMC_PIN=
+[ ${#OMC_PIN} = 64 ] || { echo "EVIDENCE-PARITY NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
+[ "$(sha256sum < "$OMEGA_OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "EVIDENCE-PARITY NOT_RUN: omc is not the pinned compiler"; exit 3; }
 . "$ROOT/seed/omc-pin.sh"
 OMC_PIN_ROOT=$ROOT
 omc_pin_match "$OMEGA_OMC" EVIDENCE-PARITY || exit $?

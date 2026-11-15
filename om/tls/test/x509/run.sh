@@ -10,6 +10,10 @@ omc=${1:?usage: run.sh OMC}
 here=$(cd "$(dirname "$0")" && pwd)
 tls=$(cd "$here/../.." && pwd)
 root=$(cd "$tls/../.." && pwd)
+pin=$(cut -c1-64 "$root/seed/out/omc.sha256" 2>/dev/null || true)
+case $pin in *[!0-9a-f]*) pin= ;; esac
+[ ${#pin} -eq 64 ] || { echo "X509 NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
+[ "$(sha256sum < "$omc" 2>/dev/null | cut -c1-64)" = "$pin" ] || { echo "X509 NOT_RUN: omc is not the pinned compiler $pin"; exit 3; }
 . "$root/seed/omc-pin.sh"
 OMC_PIN_ROOT=$root
 omc_pin_load || { echo "FAIL omc pin: seed/out/omc.sha256 has no compiler pin"; exit 1; }

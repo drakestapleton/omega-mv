@@ -16,6 +16,7 @@ OMC_PIN=$(sed -n '$!d;1s/^\([0-9a-f]\{64\}\)  seed\/out\/omc$/\1/p' "$ROOT/seed/
 [ ${#OMC_PIN} = 64 ] || { echo "NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
 OMC=${OMEGA_OMC:-$ROOT/seed/out/omc}
 [ -x "$OMC" ] || { echo "NOT_RUN: no omc at $OMC (set OMEGA_OMC)"; exit 3; }
+[ "$(sha256sum < "$OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "NOT_RUN: $OMC is not the pinned omc"; exit 3; }
 . "$ROOT/seed/omc-pin.sh"
 OMC_PIN_ROOT=$ROOT
 omc_pin_match "$OMC" codec-parity || exit $?

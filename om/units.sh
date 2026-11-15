@@ -27,10 +27,13 @@
 set -eu
 NATIVE_PIN=2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-# pin: seed/omc-pin.sh reads seed/out/omc.sha256
+# pin: seed/omc-pin.sh reads seed/out/omc.sha256. The refusal lines are the ones the
+# admission check requires; the loader is what a forged sidecar is judged by.
 . "$ROOT/seed/omc-pin.sh"
 OMC_PIN_ROOT=$ROOT
-omc_pin_load || { echo "NOT_RUN: seed/out/omc.sha256 has no compiler pin"; exit 3; }
+omc_pin_load || { echo "NOT_RUN: no compiler pin in seed/out/omc.sha256"; exit 3; }
+[ -n "${OMEGA_OMC:-}" ] && [ -n "${OMEGA_BRIDGE:-}" ] || { echo "NOT_RUN: set OMEGA_OMC and OMEGA_BRIDGE"; exit 3; }
+[ "$(sha256sum < "$OMEGA_OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "NOT_RUN: omc is not the pinned compiler"; exit 3; }
 # One generated library for all units: the bindings share one ABI runtime (ombr_enter).
 # om/encoder/bw_enc_sm121.om: the sm_121 instruction encoder, twin of aien-dev/CUDApp's (mk/om-encoder.mk).
 UNITS="${OMEGA_UNITS:-om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_enc_sm121.om}"
