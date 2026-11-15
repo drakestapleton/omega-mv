@@ -1631,25 +1631,26 @@ spinlock-mutant: $(addprefix $(OUT)/host/test_spinlock_mutant_,$(SPIN_MUTANTS)) 
 	@for m in $(SPIN_MUTANTS); do b=$(OUT)/host/test_spinlock_mutant_$$m; \
 	  if $$b > $$b.log 2>&1; then cat $$b.log; echo "test_spinlock mutant $$m: PASSED, test does not catch it"; exit 1; \
 	  else grep -F "test_spinlock: FAIL" $$b.log && echo "test_spinlock mutant $$m: FAILS as required"; fi || exit 1; done
+	@for mp in TICKET_BEFORE_MASK:irq-step-acquire RESTORE_BEFORE_RELEASE:irq-step-release; do m=$${mp%%:*}; ph=$${mp##*:}; \
+	  b=$(OUT)/host/test_spinlock_mutant_$$m; \
+	  if TEST_SPINLOCK_ONLY=$$ph $$b > $$b.$$ph.log 2>&1; then cat $$b.$$ph.log; echo "test_spinlock mutant $$m, phase $$ph alone: PASSED, phase does not catch it"; exit 1; \
+	  else grep -F "test_spinlock: FAIL deadlock (no progress for 5 s) in phase $$ph" $$b.$$ph.log && echo "test_spinlock mutant $$m: phase $$ph alone FAILS as required"; fi || exit 1; done
 	@if $(OUT)/host/test_pipe_irq_mutant > $(OUT)/host/test_pipe_irq_mutant.log 2>&1; then cat $(OUT)/host/test_pipe_irq_mutant.log; \
 	  echo "test_pipe_irq mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
 	else grep -F "test_pipe_irq: FAIL" $(OUT)/host/test_pipe_irq_mutant.log && echo "test_pipe_irq mutant (interrupts not masked): FAILS as required"; fi
 
 # DRA-556: the freestanding instruction order of core/spinlock.h, aarch64 (KCC, KCFLAGS) and x86-64 (X86CFLAGS):
 # the interrupt mask comes before the first atomic of the acquire, and the restore after the releasing store.
-# Needs the cross compiler and objdump; not part of "make test". tools/ck_spinlock_asm_check.sh reads the dumps.
+# Needs the cross compilers and objdump; not part of "make test". tools/ck_spinlock_asm_check.sh reads the dumps; its
+# --selftest mutates them (mask removed, order swapped, release store to another symbol) and requires each to FAIL.
 spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(SPIN_DEPS)
 	@mkdir -p $(OUT)/spinlock-asm
 	$(KCC) $(KCFLAGS) -c -o $(OUT)/spinlock-asm/a64.o $<
 	$(X86CC) $(X86CFLAGS) -c -o $(OUT)/spinlock-asm/x86.o $<
-	$(CROSS)objdump -d $(OUT)/spinlock-asm/a64.o > $(OUT)/spinlock-asm/a64.dis
-	$(X86_CROSS)objdump -d $(OUT)/spinlock-asm/x86.o > $(OUT)/spinlock-asm/x86.dis
+	$(CROSS)objdump -dr $(OUT)/spinlock-asm/a64.o > $(OUT)/spinlock-asm/a64.dis
+	$(X86_CROSS)objdump -dr $(OUT)/spinlock-asm/x86.o > $(OUT)/spinlock-asm/x86.dis
 	@bash $(REPO)/tools/ck_spinlock_asm_check.sh $(OUT)/spinlock-asm/a64.dis $(OUT)/spinlock-asm/x86.dis
-	@grep -v 'daifset' $(OUT)/spinlock-asm/a64.dis > $(OUT)/spinlock-asm/a64-nomask.dis; \
-	grep -vE '[[:space:]]cli' $(OUT)/spinlock-asm/x86.dis > $(OUT)/spinlock-asm/x86-nomask.dis; \
-	if bash $(REPO)/tools/ck_spinlock_asm_check.sh $(OUT)/spinlock-asm/a64-nomask.dis $(OUT)/spinlock-asm/x86-nomask.dis > $(OUT)/spinlock-asm/neg.log 2>&1; \
-	then cat $(OUT)/spinlock-asm/neg.log; echo "spinlock-asm-check negative control (mask removed from the dump): PASSED, check does not catch it"; exit 1; \
-	else grep -qF "CK_SPINLOCK_ASM: FAIL" $(OUT)/spinlock-asm/neg.log && echo "spinlock-asm-check negative control (mask removed from the dump): FAILS as required"; fi
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh --selftest $(OUT)/spinlock-asm/a64.dis $(OUT)/spinlock-asm/x86.dis
 
 # DRA-556: Lean 4 proof of the ticket arithmetic in core/spinlock.h (mutual exclusion, FIFO, wrap). Core Lean only,
 # toolchain pinned in proofs/lean-toolchain. Not part of "make test" (Lean is not a build dependency): prints NOT_RUN

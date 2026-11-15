@@ -10,13 +10,20 @@
   * mutual exclusion: the caller with offset i may enter (its ticket equals serving) iff i = 0;
   * FIFO: after a release, the caller at offset i + 1 is at offset i, so callers enter in the
     order they took tickets.
-  Also proved below: the queue invariant itself, derived from the two operations (Reach, reach_le,
-  enters_iff_head, wrap_increment), and the interrupt ordering of core/spinlock.h in a one-CPU model
-  (lockUnlock_safe, nested_safe, lockUnlock_restores), with each TEST-ONLY mutant of the header shown
-  unsafe (ticketBeforeMask_unsafe, restoreBeforeRelease_unsafe, noMask_unsafe). The link to the code is
-  by construction, not extraction: each Op is one statement of core/spinlock.h, named at its definition,
-  and tests/test_spinlock.c runs the same three mutants (make spinlock-mutant); tools/ck_spinlock_asm_check.sh
-  checks the compiled instruction order on aarch64 and x86-64 (make spinlock-asm-check).
+  Also proved below:
+  * the queue invariant, derived from the operations alone: Reach2 (acquire = fetch-add, trylock only
+    when ticket = serving, release by the holder) reaches only states whose outstanding tickets are
+    exactly serving, serving+1, ..., ticket-1 (outstanding_eq_range), hence distinct (reach_nodup), and
+    with at most 2^32 outstanding the reduced comparison admits exactly the oldest (reach_mutual_exclusion);
+    wrap_increment: the 32-bit increment is the unbounded one reduced. (Reach/reach_le/enters_iff_head are
+    the smaller lemmas these use.)
+  * the interrupt ordering of core/spinlock.h in a one-CPU model checked by `decide` over the concrete
+    lock programs (lockUnlock_safe, nested_safe, lockUnlock_restores), and each TEST-ONLY mutant of the
+    header unsafe (ticketBeforeMask_unsafe, restoreBeforeRelease_unsafe, noMask_unsafe).
+  Not modelled: memory ordering (acquire/release) and several CPUs running at once; the operations are
+  taken as atomic steps. The link to the C is by construction, not extraction: each Op and each Reach2
+  rule names its statement in core/spinlock.h; tests/test_spinlock.c runs the same three mutants (make
+  spinlock-mutant) and tools/ck_spinlock_asm_check.sh checks the compiled order (make spinlock-asm-check).
   No Mathlib; core Lean 4 only.
 -/
 
@@ -174,3 +181,60 @@ theorem lockUnlock_restores (b : Bool) :
 theorem ticketBeforeMask_unsafe : safe (start false) ticketBeforeMask = false := by decide
 theorem restoreBeforeRelease_unsafe : safe (start false) restoreBeforeRelease = false := by decide
 theorem noMask_unsafe : safe (start false) noMask = false := by decide
+
+/-! ## The queue invariant over the outstanding tickets (derived, with trylock)
+
+  `out` is the list of tickets held or waited on, oldest first. Acquire (fetch-add) appends the old
+  ticket; trylock (ck_spin_trylock_nomask) does the same but only when ticket = serving (nobody holds or
+  waits); release (by the holder) drops the oldest and moves serving on. From these alone, every
+  reachable state has out = [serving, serving+1, ..., ticket-1]: distinct, contiguous, oldest = serving. -/
+
+structure Q2 where
+  ticket : Nat
+  serving : Nat
+  out : List Nat
+
+inductive Reach2 : Q2 → Prop
+  | init : Reach2 ⟨0, 0, []⟩
+  | take {q : Q2} : Reach2 q → Reach2 ⟨q.ticket + 1, q.serving, q.out ++ [q.ticket]⟩
+  | trylock {q : Q2} : Reach2 q → q.ticket = q.serving → Reach2 ⟨q.ticket + 1, q.serving, q.out ++ [q.ticket]⟩
+  | release {q : Q2} : Reach2 q → q.serving < q.ticket → Reach2 ⟨q.ticket, q.serving + 1, q.out.tail⟩
+
+theorem outstanding_eq_range {q : Q2} (h : Reach2 q) :
+    q.serving ≤ q.ticket ∧ q.out = List.range' q.serving (q.ticket - q.serving) := by
+  induction h with
+  | init => exact ⟨Nat.le_refl 0, rfl⟩
+  | @take q _ ih =>
+    obtain ⟨hle, hout⟩ := ih
+    refine ⟨Nat.le_succ_of_le hle, ?_⟩
+    show q.out ++ [q.ticket] = List.range' q.serving (q.ticket + 1 - q.serving)
+    have e1 : q.ticket + 1 - q.serving = (q.ticket - q.serving) + 1 := by omega
+    have e2 : q.serving + 1 * (q.ticket - q.serving) = q.ticket := by omega
+    rw [hout, e1, List.range'_concat, e2]
+  | @trylock q _ _ ih =>
+    obtain ⟨hle, hout⟩ := ih
+    refine ⟨Nat.le_succ_of_le hle, ?_⟩
+    show q.out ++ [q.ticket] = List.range' q.serving (q.ticket + 1 - q.serving)
+    have e1 : q.ticket + 1 - q.serving = (q.ticket - q.serving) + 1 := by omega
+    have e2 : q.serving + 1 * (q.ticket - q.serving) = q.ticket := by omega
+    rw [hout, e1, List.range'_concat, e2]
+  | @release q _ hlt ih =>
+    obtain ⟨_, hout⟩ := ih
+    refine ⟨hlt, ?_⟩
+    show q.out.tail = List.range' (q.serving + 1) (q.ticket - (q.serving + 1))
+    have e1 : q.ticket - q.serving = (q.ticket - (q.serving + 1)) + 1 := by omega
+    rw [hout, e1]
+    rfl
+
+/-- Mutual exclusion from the operations alone: in any reachable state with at most M outstanding
+    callers, the reduced comparison the code does admits exactly one outstanding caller, the oldest. -/
+theorem reach_mutual_exclusion (M : Nat) {q : Q2} (h : Reach2 q) (hM : q.ticket - q.serving ≤ M)
+    (t : Nat) (ht : t ∈ q.out) : t % M = q.serving % M ↔ t = q.serving := by
+  obtain ⟨_, hout⟩ := outstanding_eq_range h
+  rw [hout, List.mem_range'_1] at ht
+  exact enters_iff_head M ⟨q.ticket, q.serving⟩ t ht.1 (by simp only; omega) hM
+
+/-- The outstanding tickets are distinct. -/
+theorem reach_nodup {q : Q2} (h : Reach2 q) : q.out.Nodup := by
+  rw [(outstanding_eq_range h).2]
+  exact List.nodup_range'

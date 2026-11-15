@@ -90,8 +90,7 @@ static void *mx_worker(void *arg)
             ck_spin_unlock_nomask(&mx);
         else
             ck_spin_unlock(&mx);
-        if ((i & 1023) == 0)
-            tick();
+        tick();
     }
     return 0;
 }
@@ -177,13 +176,49 @@ static int irq_blocked(void)
     return sigismember(&cur, CK_SPIN_HOST_IRQ_SIGNAL) == 1;
 }
 
-static void test_irq(void)
+static void step_acquire(void)
+{
+    /* Interrupt raised exactly between mask and ticket: it must wait (mutant ticket-before-mask: it lands after the
+     * ticket and before the mask, and the handler spins on its own CPU's ticket). */
+    phase = "irq-step-acquire";
+    irq_ran = 0;
+    step_armed = &ia;
+    ck_spin_lock(&ia);
+    tick();
+    CHECK(irq_ran == 0);
+    ck_spin_unlock(&ia);
+    CHECK(irq_ran == 1);
+    CHECK(step_armed == 0);
+    tick();
+}
+
+static void step_release(void)
+{
+    /* Interrupt raised exactly between release and restore: the lock is already free when it runs (mutant
+     * restore-before-release: it runs before the release, on a held lock). */
+    phase = "irq-step-release";
+    irq_ran = 0;
+    ck_spin_lock(&ia);
+    step_armed = &ia;
+    ck_spin_unlock(&ia);
+    CHECK(irq_ran == 1);
+    CHECK(step_armed == 0);
+    CHECK(!ck_spin_busy(&ia));
+    tick();
+}
+
+static void irq_setup(void)
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_irq;
     sigemptyset(&sa.sa_mask);
     CHECK(sigaction(CK_SPIN_HOST_IRQ_SIGNAL, &sa, 0) == 0);
+}
+
+static void test_irq(void)
+{
+    irq_setup();
 
     phase = "irq-open";
     irq_ran = 0;
@@ -217,30 +252,8 @@ static void test_irq(void)
     CHECK(irq_ran == 1);
     tick();
 
-    /* Interrupt raised exactly between mask and ticket: it must wait (mutant ticket-before-mask: it lands after the
-     * ticket and before the mask, and the handler spins on its own CPU's ticket). */
-    phase = "irq-step-acquire";
-    irq_ran = 0;
-    step_armed = &ia;
-    ck_spin_lock(&ia);
-    tick();
-    CHECK(irq_ran == 0);
-    ck_spin_unlock(&ia);
-    CHECK(irq_ran == 1);
-    CHECK(step_armed == 0);
-    tick();
-
-    /* Interrupt raised exactly between release and restore: the lock is already free when it runs (mutant
-     * restore-before-release: it runs before the release, on a held lock). */
-    phase = "irq-step-release";
-    irq_ran = 0;
-    ck_spin_lock(&ia);
-    step_armed = &ia;
-    ck_spin_unlock(&ia);
-    CHECK(irq_ran == 1);
-    CHECK(step_armed == 0);
-    CHECK(!ck_spin_busy(&ia));
-    tick();
+    step_acquire();
+    step_release();
 
     phase = "irq-premasked";
     sigset_t one;
@@ -300,10 +313,24 @@ int main(void)
     if (pthread_create(&wd, 0, watchdog, 0) != 0)
         return 2;
     ck_spin_init(&ff);
-    test_mutex();
-    test_fifo();
-    test_irq();
-    test_nomask();
+    /* TEST_SPINLOCK_ONLY=irq-step-acquire|irq-step-release runs that phase alone (make spinlock-mutant uses it to
+     * show each ordering mutant caught by its own phase). */
+    const char *only = getenv("TEST_SPINLOCK_ONLY");
+    if (only && !strcmp(only, "irq-step-acquire")) {
+        irq_setup();
+        step_acquire();
+    } else if (only && !strcmp(only, "irq-step-release")) {
+        irq_setup();
+        step_release();
+    } else if (only) {
+        printf("test_spinlock: FAIL unknown TEST_SPINLOCK_ONLY=%s\n", only);
+        return 2;
+    } else {
+        test_mutex();
+        test_fifo();
+        test_irq();
+        test_nomask();
+    }
     __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
     pthread_join(wd, 0);
     printf("test_spinlock: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);

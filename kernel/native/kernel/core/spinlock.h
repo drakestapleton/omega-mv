@@ -29,7 +29,7 @@
  *   hosted build    (host unit tests, __STDC_HOSTED__) a thread's interrupt is the signal CK_SPIN_HOST_IRQ_SIGNAL
  *                   (default SIGUSR1); "masked" means that signal is blocked for the thread, and the saved value
  *                   says whether it already was. Only that one signal is touched: synchronous faults (SIGSEGV,
- *                   SIGBUS) are never deferred.
+ *                   SIGBUS) are never deferred. While waiting, a host thread yields its CPU (ck_spin_relax).
  *
  * ck_spin_lock / ck_spin_unlock are the same pair with the saved state kept in the lock itself: only the holder
  * writes l->irq (after it entered) and reads it (before it leaves), so the next holder cannot see or clobber it.
@@ -84,6 +84,7 @@ struct ck_spinlock {
 #if __STDC_HOSTED__
 #include <pthread.h>
 #include <signal.h>
+int sched_yield(void); /* POSIX <sched.h>; declared here because some host builds put core/ (core/sched.h) on -I */
 #ifndef CK_SPIN_HOST_IRQ_SIGNAL
 #define CK_SPIN_HOST_IRQ_SIGNAL SIGUSR1
 #endif
@@ -91,7 +92,11 @@ struct ck_spinlock {
 
 static inline void ck_spin_relax(void)
 {
-#if defined(__aarch64__)
+#if __STDC_HOSTED__
+    /* A host thread is not a CPU: the holder or the next ticket may be descheduled on this very CPU, so give it the
+     * CPU (with fewer CPUs than threads a fair lock otherwise convoys for seconds per handoff). */
+    sched_yield();
+#elif defined(__aarch64__)
     __asm__ volatile("yield" ::: "memory");
 #elif defined(__x86_64__) || defined(__i386__)
     __asm__ volatile("pause" ::: "memory");

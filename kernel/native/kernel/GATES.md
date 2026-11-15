@@ -905,22 +905,34 @@ with its `_nomask` forms because the iMac drawing cores keep interrupts on for T
 - `test_spinlock` (HOST, `make test`): mutual exclusion with masked and `_nomask` takers, FIFO order across the 2^32 wrap,
   trylock never jumps the queue, and the interrupt rules in the host model (a thread's interrupt is SIGUSR1; masked = blocked):
   an interrupt raised while held, or exactly between mask and ticket, or exactly between release and restore, runs only after
-  the lock is free; nested and pre-masked callers. `make spinlock-mutant` (part of `make test`) requires it to FAIL against
-  each TEST-ONLY mutant: mask removed, ticket before mask, restore before release.
-- `test_pipe_irq` (HOST, `make test`): race test. A pipe op from an interrupt (SIGUSR1) on the thread that holds the pool
-  lock. Built against d01b2f19's `core/pipe.c` it deadlocks (FAIL, watchdog on stalled progress); at this change it PASSes;
-  against the mask-removed mutant it FAILs. Host signal model only: no kernel interrupt handler calls a pipe op today.
-- `make spinlock-asm-check` (BUILD, cross compilers): the freestanding aarch64 and x86-64 code of `core/spinlock.h` has the mask
-  before the first ticket atomic and the restore after the releasing store; a dump with the mask removed must FAIL it.
-- `make ticketlock-proof` (Lean 4 v4.35.0, `proofs/TicketLock.lean`): mutual exclusion and FIFO of the ticket arithmetic, the
-  queue invariant derived from the two operations, and the interrupt ordering in a one-CPU model with each mutant unsafe.
+  the lock is free; nested and pre-masked callers. A host thread waiting for the lock yields its CPU, so the run holds on a
+  one-CPU host. `make spinlock-mutant` (part of `make test`) requires it to FAIL against each TEST-ONLY mutant (mask removed,
+  ticket before mask, restore before release), and each ordering mutant also alone in its own phase
+  (`TEST_SPINLOCK_ONLY=irq-step-acquire|irq-step-release`).
+- `test_pipe_irq` (HOST, `make test`): race test. A periodic POSIX timer raises SIGUSR1 at the thread that loops on a pipe op
+  holding the pool lock (20 us ticks, aimed at that thread, so it lands asynchronously on any number of CPUs), and the handler
+  calls a pipe op too. Built against d01b2f19's `core/pipe.c` it deadlocks (FAIL, watchdog on stalled progress); at this
+  change it PASSes and needs at least 1000 interrupts handled; against the mask-removed mutant it FAILs. Host signal model
+  only: no kernel interrupt handler calls a pipe op today.
+- `make spinlock-asm-check` (BUILD, cross compilers): in `objdump -dr` of the freestanding aarch64 and x86-64 code of
+  `core/spinlock.h`, the mask comes before the ticket atomic, the restore after the releasing store, and the atomics touch
+  ticket and serving (register base + 4 on aarch64, relocations on x86-64). `--selftest` mutates the dumps (mask removed, order
+  swapped, release store to another symbol) and requires each to FAIL. One translation unit only (tests/spinlock_tu.c).
+- `make ticketlock-proof` (Lean 4 v4.35.0, `proofs/TicketLock.lean`): from acquire, trylock and release alone, the outstanding
+  tickets are serving..ticket-1 and only the oldest enters (mutual exclusion, FIFO, across the 2^32 wrap); the interrupt
+  ordering in a one-CPU model, each mutant unsafe. Not modelled: memory ordering and several CPUs at once.
 - Row 221 (QEMU) runs the pipe primitive with the masking lock; it shows the DAIF save/restore does not break the pipe, not that
   an interrupt is deferred (no interrupt handler takes the pool lock). The iMac kernel QEMU test
   (`scripts/qemu_ck_imac_kernel_test.sh`) runs draw_lock and the note lock on 4 cores with TLB shootdowns. Hardware NOT_RUN.
 
 | # | Check | CK gate | Status |
 |---|---|---|---|
-| 221 | `CK_PIPE_TEST=1` image: 11 `pipe_check` lines PASS with `tables_empty=1`, `pipe_test: done checks=11 failed=0 capacity=65536 pool_pipes=4`, payload detail `bytes=163840 ... mismatches=0 would_block>0`, revoked write `n=0 ... bytes_delivered=0`, boot report reached, no panic, QEMU exit 0 | PIPE | QEMU PASS (2026-10-18, base ee34c7d plus this change, QEMU 8.2.2, AIENOS_CK_PIPE PASS; hardware NOT_RUN) |
+| 221 | `CK_PIPE_TEST=1` image: 11 `pipe_check` lines PASS with `tables_empty=1`, `pipe_test: done checks=11 failed=0 capacity=65536 pool_pipes=4`, payload detail `bytes=163840 ... mismatches=0 would_block>0`, revoked write `n=0 ... bytes_delivered=0`, boot report reached, no panic, QEMU exit 0 | PIPE | QEMU PASS (2026-10-18, base ee34c7d plus this change, QEMU 8.2.2, AIENOS_CK_PIPE PASS; rerun 2026-11-15 at base d01b2f19 plus DRA-556 (masking pool lock), QEMU 8.2.2, AIENOS_CK_PIPE PASS; hardware NOT_RUN) |
+| 221a | `test_spinlock`: mutual exclusion, FIFO, wrap, trylock, interrupt deferral (held, between mask and ticket, between release and restore), nesting, pre-masked; `make spinlock-mutant`: 3 mutants FAIL, 2 of them also alone in their own phase | PIPE (DRA-556) | HOST PASS (2026-11-15, base d01b2f19 plus DRA-556; also on one CPU under taskset -c 0) |
+| 221b | `test_pipe_irq`: timer interrupt aimed at the lock-holding thread; FAIL (deadlock) on d01b2f19's pipe.c, PASS with >= 1000 interrupts handled at DRA-556, FAIL against the mask-removed mutant | PIPE (DRA-556) | HOST PASS (2026-11-15, same; base FAIL as required; also on one CPU) |
+| 221c | `make spinlock-asm-check`: instruction order and targets on aarch64 and x86-64, self-test mutants FAIL | PIPE (DRA-556) | BUILD PASS (2026-11-15, aarch64-linux-gnu-gcc and x86_64-linux-gnu-gcc 13.3.0) |
+| 221d | `make ticketlock-proof` | PIPE (DRA-556) | PROOF PASS (2026-11-15, Lean 4.35.0, no sorry; axioms propext, Quot.sound, Classical.choice) |
+| 221e | iMac kernel QEMU (`scripts/qemu_ck_imac_kernel_test.sh`): draw_lock and the note lock on the shared type, 4 cores drawing, TLB shootdown to every core | PIPE (DRA-556) | QEMU PASS (2026-11-15, base d01b2f19 plus DRA-556, AIENOS_IMAC_KERNEL PASS; hardware NOT_RUN) |
 
 
 ## LIFECYCLE: resident production lifecycle (native v1 plan P03, P04 cuts 1-2b, P05 cut 1, P06 cuts 2-4; C-only) -> CK `LIFECYCLE` (scripts/qemu_ck_lifecycle_test.sh)
