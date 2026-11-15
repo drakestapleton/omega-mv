@@ -94,7 +94,9 @@ for source in [scalar,array,stack,scalar.replace("om2","om2 release")]:
     assert obj==compile_source("object\n"+source), "nondeterministic object"
     count+=1
 fs,cs,h=parse(compile_source("object\n"+stack))
-assert fs[1]["stack"]==48 and cs[0][3]>=48, "object-stack-contract"
+# A function's record is the deepest SP its own code reaches (frame, save areas, host buffers),
+# callees excluded; here that is the call: frame 48 plus the call's save area.
+assert cs[0][3]>48 and fs[1]["stack"]==cs[0][3] and fs[0]["stack"]==0, "object-stack-contract"
 imports="""object
 om2
 extern fn dep a int to int
@@ -111,7 +113,7 @@ assert len(parse(compile_source(many))[0])==80
 count+=1
 # These boundaries must refuse rather than encoding untyped or effectful imports.
 refusals=[
-("object\nom2\nexport fn run to long\nret getuid\nend\n",9),
+("object\nom2\nexport fn run to long\nret mapdrop 1\nend\n",9),
 ("object\nfn main to int\nret 0\nend\n",16),
 (imports.replace("dep a","dep a b",1),16),
 (imports.replace("extern fn dep a int to int","extern fn dep a int to int inline"),9),

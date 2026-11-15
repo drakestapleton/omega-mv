@@ -1868,7 +1868,23 @@ stack-cost records. The object format and separate source-digest/compiler-pin
 identity checks are specified in `spec/omegese-modules.md`.
 This first format accepts scalar and array interfaces. It refuses nominal and
 struct/layout interfaces, inline imports, imported fresh scratch contracts,
-globals, text literals and host effects. Function-mode call cycles still refuse.
+globals and text literals. Function-mode call cycles still refuse.
+
+Host effects (DRA-542): an object takes `read`, `write`, `exit` and the OM-2
+function-mode host subset that needs no program image: `fopen`, `fclose`,
+`fstat`, `stat`, `lstat`, `getuid`, `geteuid`, `getgid`, `getegid`, `monons`,
+`realns` and `sleepns`. Each compiles to the same code as in function mode, so
+a program linked from modules reads, writes, opens files and exits. The device
+words 166..177 stay error 9 in an object (their table lives in a runtime context
+the module linker does not set up), as do program-only host words (error 9,
+function-mode subset). A host word's transient stack (its save area and, for a
+path, a private 4096-byte buffer) is charged to the function's stack record:
+the record is the deepest SP the function's own code reaches below its entry
+(frame, save areas, host buffers; callees excluded), and a call's record is the
+frame plus everything pushed at that call. omc counts every SP push and pop it
+emits; an object function whose count would go below zero or does not return to
+zero at its end is refused (error 9, site 628) instead of being under-reported.
+Checked by `seed/omc/gate-objhost.sh`.
 A function named `main` has no special meaning inside an object.
 
 The object is not an executable. Its linker must validate identities, interfaces,

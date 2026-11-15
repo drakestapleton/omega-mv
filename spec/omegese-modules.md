@@ -65,9 +65,13 @@ The compiler input is `object\n`, the profile line, generated extern lines,
 and the original source with import lines removed. Explicit `export fn`
 definitions provide public entries. Private functions remain module-local.
 The compiler independently checks call types, array capabilities, and its
-function-mode restrictions. This initial format excludes globals, text,
-host effects, struct/layout/nominal interfaces, inline external interfaces,
-and fresh external parameters. Internal functions may retain fresh semantics.
+function-mode restrictions. This format excludes globals, text,
+struct/layout/nominal interfaces, inline external interfaces, and fresh
+external parameters. A module may use `read`, `write`, `exit` and the
+function-mode host subset that needs no program image (files, identity,
+clocks; OMEGESE "Native object output"); the device words stay refused. The
+stack each host word pushes is in the object's stack record, so the stack
+check below covers it (`seed/omc/gate-objhost.sh`). Internal functions may retain fresh semantics.
 Only acyclic module and call graphs are accepted, including unused imports
 and unreachable private calls. Program entry must be exported, zero-argument,
 and return `int` or `void`. `main` has no special meaning in objects.
