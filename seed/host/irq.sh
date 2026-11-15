@@ -36,8 +36,8 @@ printf 'PASS real eventfd initial/read/write/drain/poll/close and table capacity
 "$B/oracle" "$B/vfioirq" 0 0 0
 # The next fixture opens descriptors until it holds 1100. A soft limit of 1024
 # makes that open fail, and the oracle then reports a wait error.
-if [ "$(ulimit -n)" -lt 1200 ]; then
-  ulimit -n 1200 || { printf 'FAIL: high-fd IRQ fixture needs 1200 descriptors, have %s\n' "$(ulimit -n)" >&2; exit 1; }
+if [ "$(ulimit -S -n)" -lt 1200 ]; then
+  ulimit -S -n 1200 || { printf 'FAIL: high-fd IRQ fixture needs 1200 descriptors, have %s\n' "$(ulimit -S -n)" >&2; exit 1; }
 fi
 "$B/oracle" "$B/vfioirq" 0 0 1
 "$B/oracle" "$B/vfioirq" '?' 0 0
