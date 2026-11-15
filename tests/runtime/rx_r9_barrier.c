@@ -306,7 +306,8 @@ static int child_crash(const char *dir, int step) {
     draft.n_objects = 1;
     uint64_t id = 0;
     if (rx_gen_propose(store, SUBJ_PROPOSER, &draft, &id) != RX_GEN_OK) return 5;
-    RxGenWork effect = {42, RX_WORK_EXTERNAL, RX_WORK_ISSUED, 0};
+    RxGenWork effect = {.id = 42, .class = RX_WORK_EXTERNAL,
+                        .state = RX_WORK_ISSUED, .required = 0};
     if (rx_gen_add_work(store, id, &effect) != RX_GEN_OK) return 6;
     rx_gen_set_crash(store, step);
     RxPromotionRequest req = request_for(id, SUBJ_AUTHORITY, cap);
@@ -519,10 +520,14 @@ static void negative_and_live(void) {
     CHECK(rx_gen_propose(store, SUBJ_PROPOSER, &draft, &first) == RX_GEN_OK, "first candidate");
     CHECK(rx_gen_propose(store, SUBJ_PROPOSER, &draft, &second) == RX_GEN_OK, "second candidate");
     g_cand = first;
-    RxGenWork ephemeral = {1, RX_WORK_EPHEMERAL, RX_WORK_PENDING, 0};
-    RxGenWork optional = {7, RX_WORK_EVIDENCE, RX_WORK_PENDING, 0};
-    RxGenWork required = {3, RX_WORK_EVIDENCE, RX_WORK_PENDING, 1};
-    RxGenWork effect = {11, RX_WORK_EXTERNAL, RX_WORK_ISSUED, 0};
+    RxGenWork ephemeral = {.id = 1, .class = RX_WORK_EPHEMERAL,
+                           .state = RX_WORK_PENDING, .required = 0};
+    RxGenWork optional = {.id = 7, .class = RX_WORK_EVIDENCE,
+                          .state = RX_WORK_PENDING, .required = 0};
+    RxGenWork required = {.id = 3, .class = RX_WORK_EVIDENCE,
+                          .state = RX_WORK_PENDING, .required = 1};
+    RxGenWork effect = {.id = 11, .class = RX_WORK_EXTERNAL,
+                        .state = RX_WORK_ISSUED, .required = 0};
     CHECK(rx_gen_add_work(store, first, &ephemeral) == RX_GEN_OK, "ephemeral");
     CHECK(rx_gen_add_work(store, first, &optional) == RX_GEN_OK, "optional evidence");
     CHECK(rx_gen_add_work(store, first, &required) == RX_GEN_OK, "required evidence");

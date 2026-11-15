@@ -214,7 +214,7 @@ Format: repository/path | function/type | hazard | current ownership model | cur
 36. omega/src/runtime/rx_coherent.c:88-106 | g_crc lazy init | racy global init | global | process | const table computed at compile time | low | none
 37. omega/src/runtime/rx_resident_gpu.c:137 | emit_overflow | global error flag in codegen | global | process | Result from builder | low | none
 38. omega/src/runtime/rx_fusion.c:675, 899 | g_bench, g_blob | non-reentrant globals | global | process | per-call `own<T>` context | low | none
-39. omega/src/runtime/rx_generation.c:560-565, 515-531 | generation blobs/receipt | persists runtime slot id+generation and cap_id as durable identity | store (disk) | across restarts | `SemanticId<T>` / durable object id; slot handles stay runtime-only | high | on-disk R9 format v2 (ROOT_AUTH_GEN_HI etc.)
+39. omega/src/runtime/rx_generation.c | generation blobs/receipt | persists promotion and work capability generations as durable identity, with root-committed completer/evidence provenance | store (disk) | across restarts | `SemanticId<T>` / durable object id; slot handles stay runtime-only | high | on-disk R9 root/receipt format v3 and R9WORK1 (v1/v2 roots remain readable)
 40. omega/src/visor/visor_evidence.c:29-32, 445-447; tools/omega.c:42-53 | JSON parser + REPL view buffers | large static mutable buffers, non-reentrant | global | process | `own<T>` session context | low | Visor console API
 
 ---

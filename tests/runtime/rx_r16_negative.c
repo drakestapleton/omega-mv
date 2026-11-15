@@ -97,6 +97,7 @@
  */
 #include "rx_r15_rig.h"
 #include "runtime/aienos_cap.h"
+#include "sha256.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -383,6 +384,33 @@ static int permissive_auth(void *ctx, uint32_t cap_id, uint64_t generation, uint
                            uint64_t resource, uint32_t rights) {
     (void)ctx; (void)cap_id; (void)generation; (void)subject; (void)resource; (void)rights;
     return 0;
+}
+
+typedef struct {
+    uint32_t cap_id;
+    uint64_t generation;
+    uint32_t worker;
+    uint64_t resource;
+    int checks;
+} WorkAuth;
+
+/* The promotion grant is not the subject of P4. Work grants are accepted
+ * only for the exact worker, capability generation and derived resource the
+ * probe selected, modeling the native root's object/action/lease checks. */
+static int work_auth(void *ctx, uint32_t cap_id, uint64_t generation, uint32_t subject,
+                     uint64_t resource, uint32_t rights) {
+    WorkAuth *a = ctx;
+    if (rights == RX_GEN_RIGHT_PROMOTE)
+        return resource == RX_GEN_RES_PROMOTION ? 0 : -1;
+    if (rights != RX_GEN_RIGHT_FINISH) return -1;
+    a->checks++;
+    return cap_id == a->cap_id && generation == a->generation && subject == a->worker &&
+                   resource == a->resource ? 0 : -1;
+}
+
+static uint32_t work_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
 }
 
 static void fill_random(uint8_t *p, size_t n) {
@@ -764,17 +792,19 @@ static int drain_never(uint64_t work_id, void *ctx) {
 }
 
 static void probe_work(Tally *t) {
-    enum { PROP = 7401, PRO = 7402 };
-    static RxCallerCred prop, pro;
+    enum { PROP = 7401, PRO = 7402, WORKER = 7403 };
+    static RxCallerCred prop, pro, worker;
+    WorkAuth auth = {0};
     char dir[64];
     RxGenStore *g = NULL;
     RxWorld *w = scratch_world(permissive_world, NULL);
     int ok = w && rx_world_enroll_caller(w, PROP, &prop) == RX_CALLER_OK &&
              rx_world_enroll_caller(w, PRO, &pro) == RX_CALLER_OK &&
+             rx_world_enroll_caller(w, WORKER, &worker) == RX_CALLER_OK &&
              rx_world_bind_callers(w) == RX_OK &&
              mkdtemp(strcpy(dir, "/tmp/r16-work-XXXXXX")) &&
              rx_gen_open(dir, &g) == RX_GEN_OK &&
-             rx_gen_bind_authority(g, rx_world_caller_check_fn, w, permissive_auth, NULL) ==
+             rx_gen_bind_authority(g, rx_world_caller_check_fn, w, work_auth, &auth) ==
                  RX_GEN_OK;
     expect(t, ok, 1, "C7 P4: scratch world and bound store");
     if (!ok) goto out;
@@ -790,8 +820,8 @@ static void probe_work(Tally *t) {
     /* v0 baseline: an unfinished required item refuses the promotion.
      * v1 attack: nobody completes it with the bare call.
      * v2 attack: the proposer inserts it already done.
-     * v3 attack: the bare insert on a bound store; forged credentials.
-     * v4 control: the proposer adds it and completes it with its credential.
+     * v3 attack: bare, forged, cross-subject and cross-work-capability calls.
+     * v4 control: proposer-owned and explicitly delegated work both complete.
      * The control runs first: a refused candidate keeps its slot (4 in all). */
     static const int order[5] = {4, 0, 1, 2, 3};
     for (int k = 0; k < 5; k++) {
@@ -799,10 +829,21 @@ static void probe_work(Tally *t) {
         uint64_t cand = 0, a0 = 0, l0 = 0, a1 = 0, l1 = 0;
         int drains = 0;
         int prc = rx_gen_propose_as(g, PROP, &prop, &gd, &cand);
-        RxGenWork item = {100 + (uint64_t)v, RX_WORK_EVIDENCE, RX_WORK_PENDING, 1};
+        RxGenWork item = {.id = 100 + (uint64_t)v, .class = RX_WORK_EVIDENCE,
+                          .state = RX_WORK_PENDING, .required = 1};
+        item.finish_cap_id = 900 + (uint32_t)v;
+        item.finish_cap_generation = 70 + (uint64_t)v;
+        uint64_t item_resource = 0;
+        int rrc = prc == RX_GEN_OK
+                    ? rx_gen_work_resource(g, cand, item.id, &item_resource) : prc;
+        auth.cap_id = item.finish_cap_id;
+        auth.generation = item.finish_cap_generation;
+        auth.worker = PROP;
+        auth.resource = item_resource;
         int arc = RX_GEN_OK, frc = RX_GEN_OK;
         if (prc == RX_GEN_OK && v != 2) arc = rx_gen_add_work_as(g, PROP, &prop, cand, &item);
-        expect(t, prc == RX_GEN_OK && arc == RX_GEN_OK, 1, "C7 P4: propose and add the item");
+        expect(t, prc == RX_GEN_OK && rrc == RX_GEN_OK && arc == RX_GEN_OK, 1,
+               "C7 P4: propose, scope and add the item");
         if (v == 1) {
             frc = rx_gen_finish_work(g, cand, item.id);
             expect(t, frc, RX_GEN_ERR_IDENTITY,
@@ -819,9 +860,22 @@ static void probe_work(Tally *t) {
             expect(t, rx_gen_add_work_as(g, PROP, &prop, cand, &item), RX_GEN_OK,
                    "C7 P4: the item added pending");
         } else if (v == 3) {
-            RxGenWork more = {200, RX_WORK_EVIDENCE, RX_WORK_PENDING, 0};
+            RxGenWork more = {.id = 200, .class = RX_WORK_EVIDENCE,
+                              .state = RX_WORK_PENDING, .required = 0};
+            more.finish_cap_id = item.finish_cap_id;
+            more.finish_cap_generation = item.finish_cap_generation;
+            uint64_t more_resource = 0;
+            expect(t, rx_gen_work_resource(g, cand, more.id, &more_resource) == RX_GEN_OK &&
+                          more_resource != item_resource,
+                   1, "C7 P4: derive a distinct sibling work resource");
             expect(t, rx_gen_add_work(g, cand, &more), RX_GEN_ERR_IDENTITY,
                    "C7 P4: rx_gen_add_work (no credential) on a bound store");
+            expect(t, rx_gen_add_work_as(g, PRO, &pro, cand, &more), RX_GEN_ERR_AUTHORITY,
+                   "C7 P4: another subject adds work to the candidate");
+            expect(t, rx_gen_add_work_as(g, PROP, &prop, cand, &more), RX_GEN_ERR_AUTHORITY,
+                   "C7 P4: a capability for one work id is reused for another");
+            expect(t, rx_gen_finish_work_as(g, PRO, &pro, cand, item.id),
+                   RX_GEN_ERR_AUTHORITY, "C7 P4: another subject finishes the proposer's work");
             expect(t, rx_gen_add_work_as(g, PROP, &forged, cand, &more), RX_GEN_ERR_IDENTITY,
                    "C7 P4: rx_gen_add_work_as with a forged credential");
             expect(t, rx_gen_finish_work_as(g, PROP, &forged, cand, item.id),
@@ -829,6 +883,23 @@ static void probe_work(Tally *t) {
         } else if (v == 4) {
             frc = rx_gen_finish_work_as(g, PROP, &prop, cand, item.id);
             expect(t, frc, RX_GEN_OK, "C7 P4 control: the proposer completes its item");
+            RxGenWork delegated = {.id = 204, .class = RX_WORK_EVIDENCE,
+                                   .state = RX_WORK_PENDING, .required = 1};
+            delegated.worker = WORKER;
+            delegated.worker_set = 1;
+            delegated.finish_cap_id = 1204;
+            delegated.finish_cap_generation = 94;
+            uint64_t delegated_resource = 0;
+            expect(t, rx_gen_work_resource(g, cand, delegated.id, &delegated_resource),
+                   RX_GEN_OK, "C7 P4 control: derive the delegated work resource");
+            auth.cap_id = delegated.finish_cap_id;
+            auth.generation = delegated.finish_cap_generation;
+            auth.worker = WORKER;
+            auth.resource = delegated_resource;
+            expect(t, rx_gen_add_work_as(g, PROP, &prop, cand, &delegated), RX_GEN_OK,
+                   "C7 P4 control: proposer delegates its required work");
+            expect(t, rx_gen_finish_work_as(g, WORKER, &worker, cand, delegated.id), RX_GEN_OK,
+                   "C7 P4 control: delegated worker completes its item");
         }
         rx_gen_active(g, &a0, &l0);
         RxPromotionRequest req = {cand, PRO, 1, 1, RX_GEN_RES_PROMOTION,
@@ -840,8 +911,8 @@ static void probe_work(Tally *t) {
         static const char *const name[5] = {"baseline, item unfinished",
                                             "item completed with no credential",
                                             "item offered already done",
-                                            "bare and forged work calls",
-                                            "control, item completed by the proposer"};
+                                            "bare, forged and cross-subject work calls",
+                                            "control, proposer and delegate complete their items"};
         char what[160];
         if (v < 4) {
             snprintf(what, sizeof what, "C7 P4: promotion, %s", name[v]);
@@ -849,6 +920,23 @@ static void probe_work(Tally *t) {
             expect(t, a1 == a0, 1, "C7 P4: active generation unchanged");
         } else {
             expect(t, rc == RX_GEN_OK && a1 == cand, 1, "C7 P4 control: promotion succeeds");
+            uint8_t work_blob[2048] = {0}, digest[32];
+            size_t work_len = 0;
+            int wrc = rx_gen_read_blob(g, cand, "work", work_blob, sizeof work_blob, &work_len);
+            sha256_hash(junk, sizeof junk - 1, digest);
+            const uint8_t *own = work_blob + 16;
+            const uint8_t *deleg = own + 80;
+            expect(t, wrc == RX_GEN_OK && work_len == 176 &&
+                          memcmp(work_blob, "R9WORK1", 7) == 0 && work_u32(work_blob + 8) == 2,
+                   1, "C7 P4 control: root-committed work provenance blob");
+            expect(t, work_u32(own + 20) == PROP && work_u32(own + 28) == PROP &&
+                          memcmp(own + 48, digest, sizeof digest) == 0,
+                   1, "C7 P4 control: proposer completion provenance");
+            expect(t, work_u32(deleg + 20) == WORKER && work_u32(deleg + 28) == WORKER &&
+                          memcmp(deleg + 48, digest, sizeof digest) == 0,
+                   1, "C7 P4 control: delegated completion provenance");
+            expect(t, auth.checks >= 4, 1,
+                   "C7 P4 control: work capabilities checked at assignment and completion");
         }
         printf("R16 C7 P4 %s: promote rc %d; generation %llu -> %llu; drain calls %d\n",
                name[v], rc, U(a0), U(a1), drains);
@@ -856,7 +944,7 @@ static void probe_work(Tally *t) {
 out:
     if (g) rx_gen_close(g);
     scratch_world_free(w);
-    rx_caller_wipe(&prop); rx_caller_wipe(&pro);
+    rx_caller_wipe(&prop); rx_caller_wipe(&pro); rx_caller_wipe(&worker);
 }
 
 static int review_probes(void) {
