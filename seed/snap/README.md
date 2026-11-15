@@ -14,11 +14,12 @@ leaves everything else alone. It is the base for two ways of not paying a model 
 ## Use
 
     seed/out/omc < seed/snap/snap.om > snap && chmod +x snap
-    { TABLE; echo '%%'; echo strip;  cat prog.om;  } | ./snap > prog.strand
-    { TABLE; echo '%%'; echo expand; cat prog.strand; } | ./snap > prog.back.om
+    { cat seed/snap/words.table; echo '%%'; echo strip;  cat prog.om;  } | ./snap > prog.strand
+    { cat seed/snap/words.table; echo '%%'; echo expand; cat prog.strand; } | ./snap > prog.back.om
 
-TABLE is one line per compiler word, `NAME ARITY FLAGS`, generated from omega-mcp `data/reference.json`
-for the compiler in use by `snapref.table_text` (gate.py uses it). FLAGS: 1 a type word; 2 a word whose
+`words.table` is one line per compiler word, `NAME ARITY FLAGS`, generated from omega-mcp `data/reference.json`
+for the compiler in use by `gate.py --table REFERENCE_JSON > seed/snap/words.table`; the gate fails when the
+file is stale for that reference or the reference's pin is not the compiler under test. FLAGS: 1 a type word; 2 a word whose
 reference form has an optional tail (`[` in the form) and no rule of its own in snap, today only `kfdctl`,
 whose SUFFIX length depends on the request; 0 otherwise. Modes: `strip`, `expand`, `count`. Every mode prints
 `snap items N forced F bad B` on stderr. `strip` exits 3 with no stdout when the program has something
@@ -37,7 +38,9 @@ with `struct`, `layout` or `abstract`, a function header in an `om2` unit, every
 a `fn` line. This under-counts; it never forces an item that had an alternative in the tested programs.
 
 Limit of `expand`: a `note` line written between a path end and its forced `end` comes back after that
-`end`. The compiled program is the same. `text` lines and `note` lines are copied byte for byte.
+`end`. The compiled program is the same. `text` lines and `note` lines are copied with their leading and
+trailing blanks removed, so an `om2 fmt` unit (whose omc output is its own formatted source) does not come back
+byte for byte; a compiled program does.
 
 ## Gate
 
@@ -52,8 +55,8 @@ with an optional tail is used by at least one accepted program, so a new such wo
 ## Measured (host only)
 
 Compiler: omega-mv main `098be1e5`, omc sha256 `26540e6d…8991`, run through the omega MCP sandbox.
-Programs: 59 accepted examples of omega-harness main `f8561115`, the 20 `bench/inference_cost` reference
-solutions, 9 fixtures.
+Programs: 59 accepted examples of omega-harness main `f8561115` and the 20 `bench/inference_cost` reference
+solutions (the table below); the gate adds the programs in `fixtures/`.
 
 | Set | Programs | Items | Forced | Qwen3.8-27B tokens, program | tokens, strand |
 |---|---|---|---|---|---|
