@@ -59,7 +59,8 @@ enum { OMEGA_BW_HZ_RAW = 1, OMEGA_BW_HZ_WAR = 2, OMEGA_BW_HZ_WAW = 3 };
 
 typedef struct {
     uint32_t pc;       /* instruction index of the offending reader / writer */
-    uint32_t src_pc;   /* the last producer / queued reader of the register seen on some path (a hint) */
+    uint32_t src_pc;   /* the smallest pc of a producer / queued reader of the register merged on some path since the
+                        * entry was last empty (order-independent; a hint: it may name an op already waited on along one path) */
     uint8_t kind;      /* OMEGA_BW_HZ_* */
     uint8_t reg;
     uint8_t uniform;

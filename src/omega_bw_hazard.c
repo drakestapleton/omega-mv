@@ -36,6 +36,7 @@ int omega_bw_decode(const uint8_t b[16], OmegaBwInsn *d) {
     d->yield = (uint8_t)((w3 >> 13) & 1u);
     d->wbar = (uint8_t)((w3 >> 14) & 7u);
     d->rbar = (uint8_t)((w3 >> 17) & 7u);
+    if (d->wbar == 6u || d->rbar == 6u) return -1; /* sm_121 has barriers 0..5 (7 = none); 6 would shift by 64 in step() */
     d->wait = (uint8_t)((w3 >> 20) & 0x3fu);
     unsigned D = (w0 >> 16) & 0xffu, A = w0 >> 24, B = w1 & 0xffu, C = w2 & 0xffu;
     int n;
@@ -127,9 +128,12 @@ const char *omega_bw_hazard_kind(uint8_t kind) {
 typedef struct {
     uint64_t w[NREG];   /* pending writes (RAW / WAW) */
     uint64_t r[NREG];   /* pending late reads (WAR) */
-    uint32_t wpc[NREG]; /* last producer / queued reader seen (a hint for the report) */
-    uint32_t rpc[NREG];
+    uint32_t wpc[NREG]; /* 1 + the smallest pc of a producer merged into w[i] since it was last empty; 0 = none */
+    uint32_t rpc[NREG]; /* the same for the queued late readers in r[i] */
 } State;
+
+/* join on the pc tags: 0 is bottom, otherwise the smaller pc wins (order-independent) */
+static uint32_t pmin(uint32_t a, uint32_t b) { return !a ? b : !b ? a : a < b ? a : b; }
 
 static uint64_t kill_mask(unsigned wait) {
     uint64_t k = 0;
@@ -156,24 +160,28 @@ static void note(OmegaBwHazardReport *r, uint32_t pc, uint32_t src, uint8_t kind
 static void step(const OmegaBwInsn *d, uint32_t pc, State *s, OmegaBwHazardReport *rep) {
     if (d->wait) {
         uint64_t k = ~kill_mask(d->wait);
-        for (unsigned i = 0; i < NREG; i++) { s->w[i] &= k; s->r[i] &= k; }
+        for (unsigned i = 0; i < NREG; i++) {
+            s->w[i] &= k; s->r[i] &= k;
+            if (!s->w[i]) s->wpc[i] = 0;
+            if (!s->r[i]) s->rpc[i] = 0;
+        }
     }
     /* reads: RAW against pending writes; the first reader is reported and the entry dropped (no cascade) */
     for (unsigned j = 0; j < d->nr; j++)
         for (unsigned q = 0; q < d->rd[j].n; q++) {
             unsigned i = (d->rd[j].uniform ? 256u : 0u) + ((d->rd[j].reg + q) & 0xffu);
             if ((i & 0xffu) == OMEGA_BW_RZ) continue;
-            if (s->w[i]) { if (rep) note(rep, pc, s->wpc[i], OMEGA_BW_HZ_RAW, i, s->w[i]); s->w[i] = 0; }
+            if (s->w[i]) { if (rep) note(rep, pc, s->wpc[i] - 1, OMEGA_BW_HZ_RAW, i, s->w[i]); s->w[i] = 0; s->wpc[i] = 0; }
         }
     /* writes: WAR against queued late readers, WAW against pending writes */
     for (unsigned j = 0; j < d->nw; j++)
         for (unsigned q = 0; q < d->wr[j].n; q++) {
             unsigned i = (d->wr[j].uniform ? 256u : 0u) + ((d->wr[j].reg + q) & 0xffu);
             if ((i & 0xffu) == OMEGA_BW_RZ) continue;
-            if (s->r[i]) { if (rep) note(rep, pc, s->rpc[i], OMEGA_BW_HZ_WAR, i, s->r[i]); s->r[i] = 0; }
-            if (s->w[i]) { if (rep) note(rep, pc, s->wpc[i], OMEGA_BW_HZ_WAW, i, s->w[i]); s->w[i] = 0; }
+            if (s->r[i]) { if (rep) note(rep, pc, s->rpc[i] - 1, OMEGA_BW_HZ_WAR, i, s->r[i]); s->r[i] = 0; s->rpc[i] = 0; }
+            if (s->w[i]) { if (rep) note(rep, pc, s->wpc[i] - 1, OMEGA_BW_HZ_WAW, i, s->w[i]); s->w[i] = 0; s->wpc[i] = 0; }
             int has_w = d->wbar != OMEGA_BW_NOBAR;
-            if (has_w || d->var) { s->w[i] |= 1ull << (has_w ? (1u << d->wbar) : 0u); s->wpc[i] = pc; }
+            if (has_w || d->var) { s->w[i] |= 1ull << (has_w ? (1u << d->wbar) : 0u); s->wpc[i] = pc + 1; }
         }
     /* late source reads: held until a wait on the read barrier or on the write barrier (completion) */
     if (d->late || d->rbar != OMEGA_BW_NOBAR) {
@@ -182,7 +190,8 @@ static void step(const OmegaBwInsn *d, uint32_t pc, State *s, OmegaBwHazardRepor
             for (unsigned q = 0; q < d->rd[j].n; q++) {
                 unsigned i = (d->rd[j].uniform ? 256u : 0u) + ((d->rd[j].reg + q) & 0xffu);
                 if ((i & 0xffu) == OMEGA_BW_RZ) continue;
-                s->r[i] |= 1ull << m; s->rpc[i] = pc;
+                s->rpc[i] = s->r[i] ? pmin(s->rpc[i], pc + 1) : pc + 1;
+                s->r[i] |= 1ull << m;
             }
     }
 }
@@ -192,8 +201,10 @@ static int join(State *dst, const State *src) {
     int ch = 0;
     for (unsigned i = 0; i < NREG; i++) {
         uint64_t w = dst->w[i] | src->w[i], r = dst->r[i] | src->r[i];
-        if (w != dst->w[i]) { dst->w[i] = w; dst->wpc[i] = src->wpc[i]; ch = 1; }
-        if (r != dst->r[i]) { dst->r[i] = r; dst->rpc[i] = src->rpc[i]; ch = 1; }
+        uint32_t wp = src->w[i] ? pmin(dst->wpc[i], src->wpc[i]) : dst->wpc[i];
+        uint32_t rp = src->r[i] ? pmin(dst->rpc[i], src->rpc[i]) : dst->rpc[i];
+        if (w != dst->w[i] || wp != dst->wpc[i]) { dst->w[i] = w; dst->wpc[i] = wp; ch = 1; }
+        if (r != dst->r[i] || rp != dst->rpc[i]) { dst->r[i] = r; dst->rpc[i] = rp; ch = 1; }
     }
     return ch;
 }

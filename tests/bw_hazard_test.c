@@ -186,7 +186,7 @@ static int finding(const OmegaBwHazardReport *r, uint32_t pc, uint8_t kind, uint
 }
 static void print_findings(const char *tag, const OmegaBwHazardReport *r) {
     for (size_t i = 0; i < r->count && i < OMEGA_BW_HAZARD_MAX; i++)
-        printf("  %s: IR %u %s %sR%u (release mask 0x%x, last producer/reader IR %u)\n", tag, r->f[i].pc, omega_bw_hazard_kind(r->f[i].kind),
+        printf("  %s: IR %u %s %sR%u (release mask 0x%x, earliest producer/reader IR %u)\n", tag, r->f[i].pc, omega_bw_hazard_kind(r->f[i].kind),
                r->f[i].uniform ? "U" : "", r->f[i].reg, r->f[i].release, r->f[i].src_pc);
 }
 static void set_wait(uint8_t *code, uint32_t pc, unsigned wait) {
@@ -242,6 +242,9 @@ static BlackwellIRInsn mk(BlackwellIROpcode op, int d, int a, int b, int c, int 
     BlackwellIRInsn in; memset(&in, 0, sizeof in);
     in.op = op; in.dst_vreg = d; in.src1_vreg = a; in.src2_vreg = b; in.src3_vreg = c; in.ureg = u; in.control = control; return in;
 }
+/* hand-encoded words (forms the encoder never writes, e.g. a forged control word) */
+static void raw16(uint8_t *b, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) { uint32_t w[4] = { w0, w1, w2, w3 }; memcpy(b, w, 16); }
+static uint32_t bra16(int rel) { return 0x947u | ((uint32_t)(rel - 1) & 0x3fu) << 18; } /* BRA, target = this + rel (small rel > 0) */
 static void test_controls(void) {
     uint8_t c[16 * 16]; size_t n;
     const uint32_t FIX = CW(6, 7, 7, 0), LD = CW(4, 0, 1, 0) | 0x2000u, ST = CW(4, 7, 1, 0) | 0x2000u, ENDW = CW(5, 7, 7, 0);
@@ -303,6 +306,46 @@ static void test_controls(void) {
     BlackwellIRInsn far[] = { mk(BW_IR_BRA, -1, -1, -1, -1, -1, CW(5, 7, 7, 0)) }; far[0].imm = 5; n = enc(far, 1, c);
     CHECK(omega_bw_hazard_check(c, n, &g_rep) == -1 && g_rep.bad_pc == 0, "control: a branch out of the buffer is refused");
     CHECK(omega_bw_hazard_check(c, 15, &g_rep) == -1 && omega_bw_hazard_check(NULL, 16, &g_rep) == -1, "control: bad length / NULL refused");
+    /* barrier 6 does not exist on sm_121 (0..5, 7 = none) and would shift by 64 in the walk: a forged control word is
+     * refused (the kernel is reported as not checked), on either barrier field (DRA-606) */
+    {
+        static const unsigned bars[3][2] = { { 6, 6 }, { 6, 7 }, { 7, 6 } };
+        for (int b = 0; b < 3; b++) {
+            uint8_t u[3 * 16]; OmegaBwInsn d;
+            raw16(u + 0, 0x919u | 7u << 12 | 1u << 16, 0, 0, CW(0, bars[b][0], bars[b][1], 0)); /* S2R R1 */
+            raw16(u + 16, 0x202u | 7u << 12 | 2u << 16, 1, 0, CW(6, 7, 7, 0));                 /* MOV R2, R1 */
+            raw16(u + 32, 0x94du | 7u << 12, 0, 0, CW(5, 7, 7, 0));                             /* EXIT */
+            CHECK(omega_bw_decode(u, &d) == -1, "control: decode refuses wbar %u rbar %u", bars[b][0], bars[b][1]);
+            CHECK(omega_bw_hazard_check(u, sizeof u, &g_rep) == -1 && g_rep.bad_pc == 0,
+                  "control: a kernel with wbar %u rbar %u is not checked (bad_pc %lld)", bars[b][0], bars[b][1], (long long)g_rep.bad_pc);
+        }
+    }
+    /* src_pc is the smallest producer pc merged on any path, whatever order the worklist visits the two successors in.
+     * Layout A: the taken path (visited first) holds the larger producer pc; layout B: the smaller. Both report the
+     * smaller (before DRA-606 layout A reported IR 3, the producer visited first). bw_real_demo.c, Math Wizard. */
+    {
+        uint8_t k[7 * 16];
+        const uint32_t S2R1 = 0x919u | 7u << 12 | 1u << 16, MOV21 = 0x202u | 7u << 12 | 2u << 16, EX = 0x94du | 7u << 12;
+        raw16(k + 0, bra16(3) | 0u << 12, 0, 0, CW(5, 7, 7, 0)); /* 0: @P0 BRA -> 3 */
+        raw16(k + 16, S2R1, 0, 0, CW(1, 0, 7, 0));               /* 1: S2R R1, wbar 0 */
+        raw16(k + 32, bra16(2) | 7u << 12, 0, 0, CW(5, 7, 7, 0)); /* 2: BRA -> 4 */
+        raw16(k + 48, S2R1, 0, 0, CW(1, 0, 7, 0));               /* 3: S2R R1, wbar 0 */
+        raw16(k + 64, MOV21, 1, 0, CW(6, 7, 7, 0));              /* 4: MOV R2, R1 (no wait) */
+        raw16(k + 80, EX, 0, 0, CW(5, 7, 7, 0));                 /* 5: EXIT */
+        int rc = omega_bw_hazard_check(k, 6 * 16, &g_rep);
+        CHECK(rc == 0 && g_rep.count == 1 && finding(&g_rep, 4, OMEGA_BW_HZ_RAW, 1) && g_rep.f[0].src_pc == 1,
+              "control: diamond A RAW R1 at IR 4 names producer IR 1 (rc %d, %zu findings, src_pc %u)", rc, g_rep.count, g_rep.count ? g_rep.f[0].src_pc : 0u);
+        raw16(k + 0, bra16(2) | 0u << 12, 0, 0, CW(5, 7, 7, 0)); /* 0: @P0 BRA -> 2 */
+        raw16(k + 16, bra16(3) | 7u << 12, 0, 0, CW(5, 7, 7, 0)); /* 1: BRA -> 4 */
+        raw16(k + 32, S2R1, 0, 0, CW(1, 0, 7, 0));               /* 2: S2R R1, wbar 0 */
+        raw16(k + 48, bra16(2) | 7u << 12, 0, 0, CW(5, 7, 7, 0)); /* 3: BRA -> 5 */
+        raw16(k + 64, S2R1, 0, 0, CW(1, 0, 7, 0));               /* 4: S2R R1, wbar 0 */
+        raw16(k + 80, MOV21, 1, 0, CW(6, 7, 7, 0));              /* 5: MOV R2, R1 (no wait) */
+        raw16(k + 96, EX, 0, 0, CW(5, 7, 7, 0));                 /* 6: EXIT */
+        rc = omega_bw_hazard_check(k, 7 * 16, &g_rep);
+        CHECK(rc == 0 && g_rep.count == 1 && finding(&g_rep, 5, OMEGA_BW_HZ_RAW, 1) && g_rep.f[0].src_pc == 2,
+              "control: diamond B RAW R1 at IR 5 names producer IR 2 (rc %d, %zu findings, src_pc %u)", rc, g_rep.count, g_rep.count ? g_rep.f[0].src_pc : 0u);
+    }
 }
 
 /* ------------------------------------------------------------------------------------------------------- 4. sweep */
@@ -371,7 +414,7 @@ static void sweep_bytes(const char *family, const char *variant, const uint8_t *
         for (size_t k = 0; g_known[k].family; k++)
             if (!strcmp(g_known[k].family, family) && (g_known[k].pc == ANY_PC || g_known[k].pc == f->pc) && g_known[k].kind == f->kind &&
                 g_known[k].reg == f->reg && g_known[k].uniform == f->uniform) { g_known[k].seen = 1; known = g_known[k].cls; }
-        printf("FINDING %s %s: IR %u %s %sR%u release 0x%x (last producer/reader IR %u) [%s %c]\n", family, variant, f->pc, omega_bw_hazard_kind(f->kind),
+        printf("FINDING %s %s: IR %u %s %sR%u release 0x%x (earliest producer/reader IR %u) [%s %c]\n", family, variant, f->pc, omega_bw_hazard_kind(f->kind),
                f->uniform ? "U" : "", f->reg, f->release, f->src_pc, known ? "triaged" : "UNTRIAGED", known ? known : '-');
         CHECK(known, "%s %s: untriaged %s at IR %u", family, variant, omega_bw_hazard_kind(f->kind), f->pc);
     }
