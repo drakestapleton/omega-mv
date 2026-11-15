@@ -216,11 +216,11 @@ only.
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Units compose by concatenation; there is no import | SUPPORTED (a limit, not a feature) | OM-1 rule, unchanged in OM-2 (FR-3 open) |
+| A module is imported by the SHA-256 of its source | SUPPORTED for native modules | `docs/one_layer/FR3-IMPORT-DIGEST.md`, `seed/modules/fr3-gate.sh` |
 | ABI v2: `omega2_<export>` symbols, `omega2_ident_<unit>()`, `out` through a caller buffer | SUPPORTED | identity records (E1), 19 status-32 refusals that leave state untouched, six-language v1 refusal |
 | A freestanding object needs no new libc surface | SUPPORTED | `rx_cortex.o` undefined set identical to `main`'s; `RX_CX_FS_ALLOWED` unchanged (E18) |
 | Calling convention drift between compiler and bridge | DETECTED, not prevented | the bridge refuses unknown slots/statuses; a mismatch surfaces as status 32 or a link error |
-| Packed structs, imports, shared objects, heap | UNSUPPORTED at this pin | FR-2, FR-3, FR-7, decision 24 |
+| Packed structs, shared objects, heap | UNSUPPORTED at this pin | FR-2, FR-7, decision 24. Digest import is FR-3, separate from those three |
 
 ### Timing and leakage
 

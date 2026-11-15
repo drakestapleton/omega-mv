@@ -209,7 +209,17 @@ for malformed reads/digests, 25..27 for path/read/write errors, 28 for source
 imports, 30..32 for object/relocation validation, 33 for missing export, 34 for
 store identity/format, 35 for import signature, 36 for cycles, 37 for stack,
 38 for no-replace publication failure, 39 for compiler/child failure, and 40
-for the requested entry. Stderr supplies that numeric code. Compiler stderr
+for the requested entry. Stderr supplies that numeric code after the line
+`ommod: refused (code below)`. Two refusals also write a named line first:
+
+| What happened | Exit | Stderr name |
+| --- | --- | --- |
+| Bytes do not match the digest that names them: stored artifact bytes (a stored blob of the wrong length included), the source file passed to `build`, the compiler file against `COMPILER_SHA256`, or a dependency artifact against the digest its parent records. A one-byte change is this case. | 24 | `ommod: digest-mismatch` |
+| The store open returns "no such file": no `KEY.ref` for that source digest under this compiler, profile and target, or the referenced artifact file is absent. | 34 | `ommod: digest-missing` |
+
+Exit 24 is only a digest mismatch, so its name is part of every exit 24.
+Exit 34 is also used for a malformed artifact or reference; the name
+`digest-missing` is written only for "no such file". Compiler stderr
 is retained. Tests require an explicit driver refusal rather than accepting
 a crash/trap as correct rejection.
 

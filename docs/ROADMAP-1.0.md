@@ -120,8 +120,8 @@ feature anyone may want", and it never means hardware qualification beyond the t
    (`om/sha256/om2-evidence/s4/measure/RESULTS.txt`) is OM-2 versus OM-1 plus a C adapter; arm C
    (pure C) is NOT_RUN. Hashes of 1 to 55 bytes were 6.5-12.9% slower (declared REGRESSION under the
    predeclared policy; ratios 1.065 to 1.129 in that file).
-10. **No heap and no imports by design decision.** Decision 24 (no heap, no `free`) and FR-3 (imports by
-   digest, needs the OSC content-addressed unit store) are recorded blockers, not oversights.
+10. **No heap by design decision.** Decision 24 (no heap, no `free`) stays a recorded blocker.
+   FR-3 (imports by digest) resolves in the local module store: `docs/one_layer/FR3-IMPORT-DIGEST.md`.
 
 ## 2. Milestones
 
@@ -264,9 +264,11 @@ Acceptance:
 
 ### RM6. Modules and separate compilation
 
-Current: no `import`; units compose by concatenation. OM-2 adds `export fn` (up to 32 entries) and
-links separately compiled units only through bridge symbols that embed source sha256, omc pin and
-profile. FR-3 (imports by digest) is blocked on the OSC content-addressed unit store. Capacity:
+Current: a module imports one exported function by the SHA-256 of that module's source bytes.
+The local store (`spec/omegese-modules.md`, `docs/one_layer/FR3-IMPORT-DIGEST.md`) resolves the
+digest for the compiler pin in `seed/out/omc.sha256`, the profile and the target. A missing digest
+and a digest that does not match the stored bytes fail closed. OM-2 `export fn` marks the visible
+entry. Capacity:
 omc: no per-unit table capacity since 2026-11-11 (OMEGESE 9.6; 50,000 functions in `seed/omc/gate-nocaps.sh`); om4 (compiles `omc.om`): 4096 (`seed/rung4/gate4.sh` 7b). Owners: #621, #648, #631.
 
 Acceptance:

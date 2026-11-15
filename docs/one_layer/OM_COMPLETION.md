@@ -67,7 +67,7 @@ cannot emit them, so there is no reference unit to verify against.
 |---|---|---|
 | FR-1 file I/O | complete for the exposed set (open/read/write/seek/stat/link/chmod/chown/truncate/memfd) | no blocker for this subset |
 | FR-2 packed structs | structs are 8-byte cells; packed u8/u16/u32/u64 fields are not expressible | needs a layout syntax and alignment rule (decision) |
-| FR-3 imports by digest | no `import`; units concatenate | requires the OSC content-addressed unit store (external) |
+| FR-3 imports by digest | an import names the SHA-256 of the module source; the local store resolves it | decided in `docs/one_layer/FR3-IMPORT-DIGEST.md`. A missing module and a byte that does not hash to the digest fail closed (`digest-missing`, `digest-mismatch`). No external unit store |
 | FR-4 floats | implemented end to end for AArch64 (types, literals, arithmetic, arrays, pools, structs) | IR floats are spec-blocked: OSC-1 scalar tags are integer-only |
 | FR-5 mmap/ioctl | implemented for AArch64 program mode as handle-checked words `devctl devcall uvmctl mapnew mapdrop mapread mapwrite mapaddr mapget mapset maphold mapbind` (ids 166..177, `seed/omc/genkw.awk`; contracts in [`seed/host/MAPPING.md`](../../seed/host/MAPPING.md), tests `seed/host/tests/{mapio,devcall,memcheck,reserve}.om` run by `seed/host/gate.om`) | access through a raw integer address stays refused: `mapaddr` exports a ulong but access requires the live owned handle; no GPU launcher or model execution (MAPPING.md) |
 | FR-6 threads/atomics | absent | decision 37 (disjoint threads) has no chosen design |
