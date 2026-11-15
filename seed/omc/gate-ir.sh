@@ -59,11 +59,7 @@ text t "x"
 fn main to int
 ret 0
 end'
-ir_refuse float_use 3 'ir
-fn main to int
-x = f64 1.0
-ret 0
-end'
+# Float words are accepted (wire version 7). The cases are the float section below.
 ir_refuse continue_use 3 'ir
 fn main to int
 continue
@@ -84,7 +80,7 @@ fn f x uint to uint
 invariant lt x 10
 ret x
 end'
-# Integer constants fold to the IR of their literal; float constants are still refused.
+# Integer constants fold to the IR of their literal. Float constants fold in the float section.
 printf 'ir\nconst N uint 5\nfn f to uint\nret N\nend\n' > "$B/c1.om"
 printf 'ir\nfn f to uint\nret uint 5\nend\n' > "$B/c2.om"
 timeout 5 "$B/stage2" < "$B/c1.om" > "$B/c1.ir"
@@ -650,5 +646,138 @@ for f in "$B"/fz*.omegese; do
 done
 [ "$fzn" = 30 ] || fail "fuzz ran $fzn of 30 programs"
 echo "PASS 30 random two-function call units identical; checker2 ACCEPT"
-echo 'SCALAR_IR_CHECKPOINT 10/10 + 31 refusals + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; structs IR spec-blocked'
+# Integer-only IR stays version 1. A float unit is version 7 and runs through irwasm.
+python3 - "$B/c2.ir" <<'PY'
+import sys
+b = open(sys.argv[1], "rb").read()
+if b[7] != 1:
+    raise SystemExit("integer unit version %s" % b[7])
+PY
+echo 'PASS integer unit stays version 1'
+command -v node >/dev/null || fail 'float section needs node'
+nice -n 19 "$B/stage2" < seed/wasm/irwasm.om > "$B/irwasm"
+chmod +x "$B/irwasm"
+ir_bool() { # name expr expect
+    printf 'ir\nfn f to bool\nret %s\nend\n' "$2" > "$B/$1.om"
+    printf 'fn main to int\nif %s\nret 1\nend\nret 0\nend\n' "$2" > "$B/$1.nat.om"
+    timeout 10 "$B/stage2" < "$B/$1.om" > "$B/$1.ir" 2> "$B/$1.err" || fail "$1 compile $(cat "$B/$1.err")"
+    python3 - "$B/$1.ir" <<'PY'
+import sys
+b = open(sys.argv[1], "rb").read()
+if b[7] != 7:
+    raise SystemExit("version %s" % b[7])
+PY
+    timeout 10 "$B/irwasm" < "$B/$1.ir" > "$B/$1.wasm" 2> "$B/$1.wasm.err" || fail "$1 irwasm $(cat "$B/$1.wasm.err")"
+    got=$(node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); process.stdout.write(String(i.exports.f()));' "$B/$1.wasm") || fail "$1 wasm run"
+    [ "$got" = "$3" ] || fail "$1 wasm $got wanted $3"
+    timeout 10 "$B/stage2" < "$B/$1.nat.om" > "$B/$1.nat" 2> "$B/$1.nat.err" || fail "$1 native compile $(cat "$B/$1.nat.err")"
+    chmod +x "$B/$1.nat"
+    set +e
+    "$B/$1.nat" >/dev/null
+    nrc=$?
+    set -e
+    [ "$nrc" = "$3" ] || fail "$1 native $nrc wanted $3"
+    echo "PASS $1 wasm=$got native=$nrc"
+}
+ir_bool f_add 'eq add f64 1.5 f64 2.5 f64 4.0' 1
+ir_bool f_nan_ne 'ne div f64 0.0 f64 0.0 f64 0.0' 1
+ir_bool f_nan_eq 'eq div f64 0.0 f64 0.0 f64 0.0' 0
+ir_bool f_negzero 'eq f64 -0.0 f64 0.0' 1
+ir_bool f_inf 'gt div f64 1.0 f64 0.0 f64 1.0' 1
+ir_bool f_neginf 'lt div f64 -1.0 f64 0.0 f64 0.0' 1
+ir_bool f_neg 'eq neg f64 1.5 f64 -1.5' 1
+ir_bool f_round 'ne add f64 0.1 f64 0.2 f64 0.3' 1
+ir_bool f_cast_int 'eq f64 uint 3 f64 3.0' 1
+ir_bool f_trunc 'eq uint f64 3.9 uint 3' 1
+ir_bool f_promote 'eq f64 f32 1.5f32 f64 1.5' 1
+ir_bool f_demote 'eq f32 f64 1.5 f32 1.5f32' 1
+printf 'ir\nfn g a f64 to f64\nret add a f64 1.0\nend\nfn f to bool\nret eq g f64 2.0 f64 3.0\nend\n' > "$B/f_call.om"
+printf 'fn g a f64 to f64\nret add a f64 1.0\nend\nfn main to int\nif eq g f64 2.0 f64 3.0\nret 1\nend\nret 0\nend\n' > "$B/f_call.nat.om"
+timeout 10 "$B/stage2" < "$B/f_call.om" > "$B/f_call.ir"
+timeout 10 "$B/irwasm" < "$B/f_call.ir" > "$B/f_call.wasm"
+got=$(node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); process.stdout.write(String(i.exports.f()));' "$B/f_call.wasm")
+[ "$got" = 1 ] || fail "f_call wasm $got"
+timeout 10 "$B/stage2" < "$B/f_call.nat.om" > "$B/f_call.nat"
+chmod +x "$B/f_call.nat"
+set +e; "$B/f_call.nat" >/dev/null; nrc=$?; set -e
+[ "$nrc" = 1 ] || fail "f_call native $nrc"
+echo 'PASS f_call wasm=1 native=1'
+printf 'ir\nconst A f64 1.5\nfn f to f64\nret A\nend\n' > "$B/f_const.om"
+printf 'ir\nfn f to f64\nret f64 1.5\nend\n' > "$B/f_const_lit.om"
+timeout 10 "$B/stage2" < "$B/f_const.om" > "$B/f_const.ir"
+timeout 10 "$B/stage2" < "$B/f_const_lit.om" > "$B/f_const_lit.ir"
+cmp -s "$B/f_const.ir" "$B/f_const_lit.ir" || fail 'float constant IR differs from its literal'
+echo 'PASS float constant folds to the literal IR'
+printf 'ir\nfn f to f64\nret f64 1.0\nend\n' > "$B/f_one.om"
+printf 'ir\nfn f to f64\nret f64 0.1\nend\n' > "$B/f_tenth.om"
+printf 'ir\nfn f to f64\nret f64 -0.0\nend\n' > "$B/f_nzero.om"
+timeout 10 "$B/stage2" < "$B/f_one.om" > "$B/f_one.ir"
+timeout 10 "$B/stage2" < "$B/f_tenth.om" > "$B/f_tenth.ir"
+timeout 10 "$B/stage2" < "$B/f_nzero.om" > "$B/f_nzero.ir"
+python3 - "$B/f_one.ir" "$B/f_tenth.ir" "$B/f_nzero.ir" <<'PY'
+import sys
+pairs = [
+    (sys.argv[1], bytes.fromhex("000000000000f03f"), "1.0"),
+    (sys.argv[2], bytes.fromhex("9a9999999999b93f"), "0.1"),
+    (sys.argv[3], bytes.fromhex("0000000000000080"), "-0.0"),
+]
+for path, needle, name in pairs:
+    b = open(path, "rb").read()
+    if b[7] != 7 or needle not in b:
+        raise SystemExit("missing %s bits" % name)
+PY
+echo 'PASS f64 1.0 is 3ff0000000000000; 0.1 is 3fb999999999999a; -0.0 keeps the sign bit'
+ir_refuse f_mix 7 'ir
+fn f to f64
+ret add f64 1.0 uint 1
+end'
+ir_refuse f_bool 9 'ir
+fn f to f64
+ret f64 true
+end'
+ir_refuse f_rem 7 'ir
+fn f to f64
+ret rem f64 1.0 f64 1.0
+end'
+ir_refuse f_bare 11 'ir
+fn f to int
+x = 1.0
+ret 0
+end'
+ir_refuse f_intlit 7 'ir
+fn f to f64
+ret add f64 1.0 1
+end'
+ir_refuse f_for 7 'ir
+fn f to int
+for i f64 3
+end
+ret 0
+end'
+ir_refuse f_sqrt 3 'ir
+fn f to f64
+ret fsqrt f64 1.0
+end'
+ir_refuse f_fma 3 'ir
+fn f to f64
+ret fma f64 1.0 f64 2.0 f64 3.0
+end'
+ir_refuse f_suffix 7 'ir
+fn f to f64
+ret f64 1.0f32
+end'
+ir_refuse f_shl 7 'ir
+fn f to f64
+ret shl f64 1.0 f64 1.0
+end'
+ir_refuse f_not 7 'ir
+fn f to f64
+ret not f64 1.0
+end'
+ir_refuse f_const_int 16 'ir
+const N f64 1
+fn f to f64
+ret N
+end'
+echo 'SCALAR_IR_CHECKPOINT 10/10 + 30 refusals + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; floats: 13 wasm=native bools (f_add 1, f_nan_ne 1, f_nan_eq 0, f_negzero 1, f_inf 1, f_neginf 1, f_neg 1, f_round 1, f_cast_int 1, f_trunc 1, f_promote 1, f_demote 1, f_call 1), const fold, bits 1.0/0.1/-0.0; float refusals f_mix 7, f_bool 9, f_rem 7, f_bare 11, f_intlit 7, f_for 7, f_sqrt 3, f_fma 3, f_suffix 7, f_shl 7, f_not 7, f_const_int 16; arrays and structs still refused'
 echo 'RC=0'

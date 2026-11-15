@@ -52,7 +52,9 @@ cannot emit them, so there is no reference unit to verify against.
 
 1. **IR structs.** Version-2 struct records exist, but allocation, field ops and identity need the
    OSC-1 struct lowering spec.
-3. **IR floats.** Float constants cannot be folded until the IR type system carries f32/f64.
+3. **IR floats.** The producer emits f32 and f64 as wire version 7 (tags 13 and 14), folded with the
+   native literal converter. Arrays and structs in that model are specified in
+   `docs/one_layer/IR-AGGREGATES-FLOATS.md` and are still refused.
 
 **Decision-bound language/ecosystem work.**
 

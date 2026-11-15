@@ -749,8 +749,9 @@ is error 7.
   In particular `(1+2^-52)*(1-2^-52)-1` is `-2^-104` for f64 rather than the zero from separately
   rounded multiply and add. x86linux and x86efi refuse a well-typed `fma` with error 9: their SSE2
   baseline does not provide a fused instruction, and no unfused fallback is permitted. The operands
-  are typed first, so errors 7 and 11 have the same line and code on every target. IR mode refuses
-  float words with error 3. (gate8 fma, neg_fma_* on AArch64, x86linux and x86efi; gate-fma
+are typed first, so errors 7 and 11 have the same line and code on every target. IR mode accepts
+f32 and f64 arithmetic, comparisons, neg and explicit casts (wire version 7). It refuses fma,
+fsqrt, fabs, fmin, fmax and bitcast with error 3. (gate8 fma, neg_fma_* on AArch64, x86linux and x86efi; gate-fma
   wrong-opcode, unfused and rounding mutants)
 - Conversions `<type> value` handle int<->float, f32<->f64 and float->int. Int to float is SCVTF/UCVTF
   (round to nearest even); float to int is FCVTZS/FCVTZU (truncate, saturate, NaN -> 0); f32<->f64 is
@@ -763,9 +764,10 @@ is error 7.
 - Floats are allowed in `global` pools, `new` arrays, parameters, returns and struct fields.
   Arrays are packed by element type: f32 occupies four bytes and f64 eight (`tlog` and `sa_arr`
   in `seed/omc/omc.om`). Struct fields retain eight-byte cells, including f32 in the low half.
-  A float cannot index an array or be a `for` count
-  (error 7), `read`/`write` still need a uchar array (error 7), and IR mode refuses float words
-  (error 3). (gate8 arrays, globals, params, structs, neg_*)
+A float cannot index an array or be a `for` count
+(error 7), `read`/`write` still need a uchar array (error 7). IR mode accepts the same arithmetic
+and refuses fma and the float intrinsics with error 3
+(`docs/one_layer/IR-AGGREGATES-FLOATS.md`). (gate8 arrays, globals, params, structs, neg_*)
 
 
 ### 9.10 Grouping parentheses (omc only, gate9)
@@ -795,8 +797,9 @@ must fit the type (error 8). The constant is a typed number: an integer (`uint 5
 float literal (`f64 0.1`, `f32 0.1`); an integer literal under a float type is refused (error 16).
 It composes wherever a value goes, including inside functions and as a call argument, and it cannot
 be assigned (error 7). In IR mode an integer constant is folded to its literal, including as a
-`trap` code, a `while` bound, or a `for` count; a float constant there is refused (error 9), as are
-struct/global/text declarations. Definitions are sequential, so a
+`trap` code, a `while` bound, or a `for` count. A float constant folds to the same CONST as its
+literal. A float constant used as a trap, a bound, a `for` count or a length is error 16.
+struct, global and text declarations stay error 9. Definitions are sequential, so a
 constant defined after a function is not visible to that function.
 
 A constant needs no program image, so it is also accepted in function mode (a unit without
@@ -1514,8 +1517,8 @@ the `else` boundary; redeclaring an in-scope name is error 10, and reading
 an out-of-scope name is error 3. Locals and parameters retain the native
 eight-byte name limit (13), while function names retain full matching up
 to 63 bytes. A reachable non-void function end is error 18; a void end
-emits an implicit return. Missing function `end` is error 15. Unsupported
-float parameter/result types are refused with error 9 before serialization.
+emits an implicit return. Missing function `end` is error 15. f32 and f64 parameters and results are wire version 7 (tags 13 and 14). An integer-only unit
+stays version 1.
 Typed literals are range-checked (8). Parentheses remain unsupported in
 this scalar IR checkpoint, rather than being silently discarded.
 
@@ -1532,8 +1535,10 @@ native path. `gate-ir.sh` checks all three against the C encoder and checker2.
 Arithmetic (`add` through `rem`) and shifts of booleans remain error 7.
 
 Limits, said plainly: scalar values, calls to earlier functions, at most 32 functions and 6
-parameters. IR mode refuses a `struct`, `global` or `text` declaration with error 9 and refuses a
-float word, a host word, `continue`, `sizeof` or `offsetof` with error 3, and a contract line
+parameters. Float arithmetic, comparisons, neg and explicit casts are version 7
+(`docs/one_layer/IR-AGGREGATES-FLOATS.md`). IR mode refuses a `struct`, `global` or `text`
+declaration with error 9 and refuses a host word, `continue`, `sizeof`, `offsetof`, `fma`,
+`fsqrt`, `fabs`, `fmin`, `fmax` or `bitcast` with error 3, and a contract line
 (`requires`, `ensures`, `invariant`; section 12 is native only) with error 30 on that line (#791); it
 never skips a declaration it cannot lower or reads a contract clause as a local. A contract word followed
 by `=` (`ensures = ulong 1`) assigns a local of that name, as the C oracle and native mode do. `note` lines are
