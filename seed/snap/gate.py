@@ -12,7 +12,8 @@ Checks, on every program OMC accepts:
   B  snap expand of that strand equals the oracle, and OMC compiles it to the same binary as the original
   C  every forced position is checked against OMC: one more word where the line had to end, or one more
      statement where `end` had to come, must be refused
-  D  broken machines must fail A or B on at least one program (six mutants)
+  D  broken machines must fail A or B on at least one program (seven mutants)
+  E  alarm: every word with an optional tail (table flag 2) is used by at least one accepted program
 Programs OMC refuses are fed to strip only to show it answers (exit 0 or 3), never a trap.
 Exit 0 and a last line SNAPGATE PASS only when every check holds; otherwise exit 1 and SNAPGATE FAIL.
 """
@@ -34,7 +35,7 @@ def main():
     dirs = sys.argv[4:] + [os.path.join(HERE, 'fixtures')]
     os.makedirs(scratch, exist_ok=True)
     T = json.load(open(refp))['words']
-    table = ''.join(f"{k} {v['arity']} {1 if v['category'] == 'type' else 0}\n" for k, v in T.items())
+    table = R.table_text(T)
     print('omc sha256', sha(open(omc, 'rb').read()))
 
     def compile_(src, out):
@@ -123,6 +124,12 @@ def main():
                 if rc == 0:
                     fails.append(('C', f, f'item {k}: omc accepts an alternative at a forced position'))
             m.feed(it[1])
+    # E (alarm): a word with an optional tail that no accepted program uses is untested here; add a fixture
+    tails = sorted(k for k, v in T.items() if R.flags(k, v) == 2)
+    for k in tails:
+        if not any(x[0] == 'w' and x[1] == k for f in acc for x in R.items(progs[f][0])):
+            fails.append(('E', k, 'optional-tail word used by no accepted program: add a fixture'))
+    print('E optional-tail words', tails)
     print('C forced positions against omc:', dict(sorted((f'{a}:error{b}', c) for (a, b), c in kinds.items())),
           'accepted', sum(c for (a, b), c in kinds.items() if b == 0))
 
@@ -136,6 +143,7 @@ def main():
         'M3 expander never closes at end of input': (mut('if eq mode 2\npushforced\nend', 'if eq mode 9\npushforced\nend'), table),
         'M4 a name takes no slot': (mut('if findname off n\nsv S_OWED sub g S_OWED 1\nret\nend\nt = findtab', 'if findname off n\nret\nend\nt = findtab'), table),
         'M5 void ret takes a value': (mut('if ne g S_VOID 0\nsv S_OWED 0\nelse', 'if ne g S_VOID 0\nsv S_OWED 1\nelse'), table),
+        'M6 optional tail ignored': (mut('if ne get tty sub t 1 2\n', 'if ne get tty sub t 1 9\n'), table),
     }
     caught = 0
     for name, (src, tab) in mutants.items():
