@@ -7,6 +7,8 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| Grok 4.7 (via Cursor Agent) | Ran the R15 rerun validator under qemu-user on this x86 host: the seeded compiler is AArch64, so `tools/r15_receipt.sh` uses `qemu-aarch64` only when `uname -m` is not aarch64. Added refusal cases for a second trailing JSON value and for a `\u0050ASS` value, which must still count as PASS. |
+| Codex | Replaced R15 rerun substring acceptance with strict seeded-Omega JSON and exact-schema validation, including duplicate, nested, malformed, extra-key and non-string regression controls. |
 | Grok 4.7 (via Cursor Agent) | Closed the pinned-checkout copy so a sibling `uploadpack.packObjectsHook` or fsmonitor does not run, took the root tree from the commit object, and refused a physics.lock that is not one 40-hex commit before any recipe echoes it. `tools/test_pinned_checkout.sh`: 15 checks PASS. |
 | Codex | Isolated every gate dependency pin in a fresh read-only checkout copied from the locked object graph; disabled replacements and grafts; added raw commit, tree, blob, path and mode verification; strengthened Physics pin checks and added hostile-source regression controls. Static verification only. |
 | Grok 4.7 (via Cursor Agent) | Kept the ARGUS pin note in the Makefile when `argus.lock` lost its comments, and checked that `make ARGUS_COMMIT=...` cannot override the parsed lock. |
