@@ -16,7 +16,10 @@ where S is the total number of renormalisation shifts and 16711681 = 2^24 - 6553
 Taking log2 (docs/turing/TURING_YIELD_RANGE_CODER_OM.md):
   8 S < sum_t (16 - log2 q_t) + n * (24 - log2 16711681) + (32 - log2 R0)
       = ideal_exact_bits + n * eps + 3.36e-10,   eps = -log2(1 - 65535/2^24).
-Natural numbers only; no Mathlib, no sorry, no extra axioms.
+Lower side `encode_lower`: 2^24 * (2^16)^n <= R0 * (prod wq_t) * 256^S, wq_t = q_t (+ 256 for
+the last symbol of the row), so 8 S > ideal_exact_bits - G - 8, G = sum over last symbols of
+log2(1 + 256/q_t).
+Natural numbers only; no Mathlib, no extra axioms.
 -/
 namespace TcrBound
 
@@ -189,6 +192,84 @@ theorem encode_bound (l : List Sym) (hv : ∀ s ∈ l, s.valid) :
 theorem constants : W = 2 ^ 32 ∧ MQ * TOP = 2 ^ 40 ∧ C = 2 ^ 24 - 65535 ∧ TOP = 2 ^ 24 ∧ MQ = 2 ^ 16 := by
   unfold W MQ TOP C; decide
 
+/-! Lower side. The last symbol of a row takes the slack R - r * cum, so it can get more than its
+share: at most R * (q + 256) / 2^16 (`step_ub`). Every other symbol gets at most R * q / 2^16. -/
+
+/-- Width credited to a symbol by the upper estimate: q, plus 256 for the last symbol of a row. -/
+def wq (s : Sym) : Nat := s.q + (if s.last then 256 else 0)
+
+def prodw : List Sym → Nat
+  | [] => 1
+  | s :: rest => wq s * prodw rest
+
+theorem step_ub (R : Nat) (s : Sym) (hR : TOP ≤ R) (hv : s.valid) :
+    step R s.q s.cum s.last * MQ ≤ R * wq s := by
+  obtain ⟨hq, hc, hl⟩ := hv
+  obtain ⟨d1, d2⟩ := div_facts R
+  unfold step wq
+  cases hlast : s.last
+  · simp only [Bool.false_eq_true, ↓reduceIte, Nat.add_zero]
+    calc (R / MQ) * s.q * MQ = (MQ * (R / MQ)) * s.q := by ac_rfl
+      _ ≤ R * s.q := Nat.mul_le_mul_right _ d1
+  · simp only [↓reduceIte]
+    have hsum := hl hlast
+    -- rem = R - MQ * r < MQ, cum < MQ, so cum * rem < 2^32 <= 256 * R
+    have hcum : s.cum ≤ MQ - 1 := by omega
+    have hrem : R - MQ * (R / MQ) ≤ MQ - 1 := by omega
+    have p1 : s.cum * (R - MQ * (R / MQ)) ≤ (MQ - 1) * (MQ - 1) := Nat.mul_le_mul hcum hrem
+    have p2 : (MQ - 1) * (MQ - 1) ≤ 256 * R := by unfold MQ TOP at *; omega
+    have e1 : s.cum * (R - MQ * (R / MQ)) = s.cum * R - MQ * ((R / MQ) * s.cum) := by
+      rw [Nat.mul_sub, Nat.mul_comm s.cum R]
+      congr 1; ac_rfl
+    have a1 : MQ * ((R / MQ) * s.cum) ≤ R * s.cum := by
+      rw [← Nat.mul_assoc]; exact Nat.mul_le_mul_right _ d1
+    have a2 : R * s.cum + R * s.q = R * MQ := by rw [← Nat.mul_add, hsum]
+    have a3 : (R / MQ) * s.cum ≤ R := by
+      have : (R / MQ) * s.cum ≤ (R / MQ) * MQ := Nat.mul_le_mul_left _ (by omega)
+      rw [Nat.mul_comm (R / MQ) MQ] at this; omega
+    rw [Nat.sub_mul, Nat.mul_comm ((R / MQ) * s.cum) MQ, Nat.mul_add]
+    rw [Nat.mul_comm s.cum R] at e1
+    omega
+
+/-- Telescoped lower side from any start range in [2^24, 2^32). -/
+theorem run_lower (l : List Sym) (hv : ∀ s ∈ l, s.valid) :
+    ∀ R, TOP ≤ R → R < W →
+      (run R l).1 * MQ ^ l.length ≤ R * prodw l * 256 ^ (run R l).2 := by
+  induction l with
+  | nil => intro R _ _; simp [run, prodw]
+  | cons s rest ih =>
+    intro R h1 h2
+    have hs : s.valid := hv s (by simp)
+    have hrest : ∀ x ∈ rest, x.valid := fun x hx => hv x (by simp [hx])
+    obtain ⟨g1, g2⟩ := step_ge R s h1 hs
+    have ub := step_ub R s h1 hs
+    rw [run_cons]
+    simp only [prodw, List.length_cons]
+    generalize step R s.q s.cum s.last = x at g1 g2 ub ⊢
+    obtain ⟨e1, e2, e3⟩ := renorm_spec x g1 (by omega)
+    generalize renorm x = p at e1 e2 e3 ⊢
+    obtain ⟨R2, k⟩ := p
+    simp only at e1 e2 e3 ⊢
+    have i1 := ih hrest R2 e2 e3
+    have ub2 : R2 * MQ ≤ R * wq s * 256 ^ k := by
+      rw [e1]
+      calc x * 256 ^ k * MQ = x * MQ * 256 ^ k := by rw [Nat.mul_right_comm]
+        _ ≤ R * wq s * 256 ^ k := Nat.mul_le_mul_right _ ub
+    calc (run R2 rest).1 * MQ ^ (rest.length + 1)
+        = ((run R2 rest).1 * MQ ^ rest.length) * MQ := by rw [Nat.pow_succ]; ac_rfl
+      _ ≤ (R2 * prodw rest * 256 ^ (run R2 rest).2) * MQ := Nat.mul_le_mul_right _ i1
+      _ = (R2 * MQ) * (prodw rest * 256 ^ (run R2 rest).2) := by ac_rfl
+      _ ≤ (R * wq s * 256 ^ k) * (prodw rest * 256 ^ (run R2 rest).2) := Nat.mul_le_mul_right _ ub2
+      _ = R * (wq s * prodw rest) * 256 ^ (k + (run R2 rest).2) := by rw [Nat.pow_add]; ac_rfl
+
+/-- Lower side for the coder's start range: 2^24 * 2^(16 n) <= (2^32 - 1) * prod wq_t * 256^S. -/
+theorem encode_lower (l : List Sym) (hv : ∀ s ∈ l, s.valid) :
+    TOP * MQ ^ l.length ≤ (W - 1) * prodw l * 256 ^ (run (W - 1) l).2 := by
+  have b1 := run_lower l hv (W - 1) (by unfold TOP W; omega) (by unfold W; omega)
+  obtain ⟨_, b2, _⟩ := run_bound l hv (W - 1) (by unfold TOP W; omega) (by unfold W; omega)
+  calc TOP * MQ ^ l.length ≤ (run (W - 1) l).1 * MQ ^ l.length := Nat.mul_le_mul_right _ b2
+    _ ≤ (W - 1) * prodw l * 256 ^ (run (W - 1) l).2 := b1
+
 /-! Negative control: a coder that drops the last-symbol slack rule and uses r = R >> 17
 violates the per-step inequality on a concrete valid symbol, so `step_lb` is not vacuous. -/
 def badStep (R q : Nat) : Nat := (R / 131072) * q
@@ -204,11 +285,23 @@ theorem tight_without_loss :
     ¬ ((16777216 + 65535) * 1 * 16777216 ≤ step (16777216 + 65535) 1 0 false * (MQ * TOP)) := by
   unfold step MQ TOP; decide
 
+
+/-- Lower-side control: the +256 credit for the last symbol is needed. Without it the step
+estimate fails at R = 2^24 + 65535, q = 1, cum = 65535: the slack gives that symbol about 256
+times its share, i.e. it codes about 8 bits below its ideal. -/
+theorem lower_needs_slack :
+    ¬ (step (16777216 + 65535) 1 65535 true * MQ ≤ (16777216 + 65535) * 1) := by
+  unfold step MQ; decide
+
 end TcrBound
 
 #print axioms TcrBound.step_lb
 #print axioms TcrBound.run_bound
 #print axioms TcrBound.encode_bound
+#print axioms TcrBound.step_ub
+#print axioms TcrBound.run_lower
+#print axioms TcrBound.encode_lower
 #print axioms TcrBound.constants
 #print axioms TcrBound.tight_without_loss
 #print axioms TcrBound.bad_step_violates
+#print axioms TcrBound.lower_needs_slack

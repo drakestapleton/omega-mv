@@ -26,102 +26,142 @@ CLI, same shape as `turing-coder` (range only):
 Exit 0 accepted, 2 refused (one stderr line with the CODER_SPEC section 10 code and name), 1 usage,
 3 ALARM (a proved property failed on this run; never expected, loud if it happens). Encode,
 decode and verify print `count`, `ideal_ub`, `coded_bytes`, `coded_bits`, `payload_bytes`,
-`shifts`, `bound_ub`, `slack_ub`, `overhead_ub` and `bound=PASS`.
+`shifts`, `bound_ub`, `slack_ub`, `lower_ub`, `overhead_ub`, `bound=PASS` and `lower=PASS`.
+
+Refusals follow `turing-coder`'s order: encode checks the TPS1, the TSY1, then the pair; decode
+the TPS1, the coded file, then the decode; verify the TPS1, the coded file and the whole decode,
+then the TSY1 and the pair, then byte identity (compared through the TSY1 digests of domain,
+header and symbols, which stands for comparing the bytes). On every single-fault input of the
+gate both tools report the same code.
 
 Every file is streamed through fixed buffers: memory does not grow with the number of symbols
-(640 KB peak on a 2,172,776-symbol, 91 MB stream where the C tool used 154 MB), so no input size is
-capped. Each input is read twice: a validation pass (trailer digest with SHA-256 in Omega, header,
-every record or symbol) and the coding pass. A refused encode or decode removes its partial output.
+(640 KB peak on a 2,172,776-symbol, 91 MB stream where the C tool used 154 MB). Each input is read
+twice: a validation pass (trailer digest with SHA-256 in Omega, header, every record or symbol)
+and the coding pass, which re-checks every record and symbol and hashes the file again; a file
+that changed between the passes is refused (DIGEST). An output path that names an input (same
+device and inode) is refused before anything is opened for writing, and a refusal after the
+output was created removes it. The only size limits are the 64-bit machine word: the length sums
+are 64-bit micro-bit counts, so a stream of more than 1,152,514,738,906 symbols (or a coded file of
+more than 2,305,843,009,213 bytes) is refused (ARG) instead of wrapping (Wolfram W3).
 
-## The bound
+## The bounds
 
-For a coded file of n symbols (header and flush counted, CODER_SPEC section 4 accounting):
+For a coded file of n symbols (header and flush counted, CODER_SPEC section 4 accounting), with
+T the section 8 ideal length of exactly the coded symbols:
 
-    1,000,000 x coded_bits  <=  ideal_ub + 5647 x n + 480,000,000
+    upper:  coded_bits <= T + 480 + 0.005647 n
+    lower:  coded_bits >= T + 472 - G,   G = sum, over the symbols coded as the last symbol of
+                                             their row (s = K - 1), of log2(1 + 256/q)
 
-In bits: coded length <= T_ideal + 480 + 0.005647 n, where T_ideal is the section 8 ideal length
-of exactly the coded symbols. The 480 bits are the 448-bit header plus 32 bits of range-coder
-flush; 0.005647 bits per symbol is the worst case of the `range >> 16` truncation. The program
-checks the bound on every run (ALARM exit 3 if it ever fails).
+In integers (micro-bits, as checked by the program on every run):
 
-Proof chain:
+    1,000,000 x coded_bits <= ideal_ub + 5647 n + 480,000,000
+    1,000,000 x coded_bits >= ideal_ub + 472,000,000 - n - gain_ub
 
-1. **Per step and telescoped (Lean 4, `docs/turing/proofs/TcrBound.lean`).** Over an explicit
-   model of section 5 (`step`, `renorm`, `run`), for every list of valid symbols
-   (q >= 1, cum + q <= 65536, cum + q = 65536 for the last symbol of the row):
-   `encode_bound`: (2^32 - 1) * prod q_t * 16711681^n * 256^S < 2^32 * (2^40)^n,
-   where S is the number of renormalisation shifts. Lemmas: `step_lb` (each step keeps at least
-   (1 - 65535/2^24) of p * R), `step_ge` (R' >= 256 and R' <= R, so at most two shifts and no
-   overflow), `renorm_spec`, `run_bound`. Negative controls: `bad_step_violates` (r = R >> 17
-   breaks the step inequality) and `tight_without_loss` (without the loss factor the inequality
-   fails at R = 2^24 + 65535: the per-symbol cost is real). Checked with the pinned toolchain
-   `leanprover/lean4:v4.35.0` (`lean docs/turing/proofs/TcrBound.lean`, no imports, exit 0);
-   axioms: `step_lb` [propext, Quot.sound], `run_bound` and `encode_bound` [propext,
-   Classical.choice, Quot.sound], the three controls and `constants` none. No `sorry`.
-2. **Logarithm (Wolfram, receipt W1).** log2 of `encode_bound`:
-   8S < sum_t (16 - log2 q_t) + n (24 - log2 16711681) + (32 - log2 (2^32 - 1)).
-   sum_t (16 - log2 q_t) is the exact ideal length I; Wolfram: `FullSimplify[24 - Log2[16711681]
-   == -Log2[1 - 65535/2^24]]` = True, so the middle term is n * eps with
-   eps = -log2(1 - 65535/2^24), 10^6 eps = 5646.4768125983...; 32 - log2(2^32 - 1) = 3.359e-10.
+where gain_ub sums, over the last-symbol occurrences, ub(q) - ub(q + 256) + 2 for q <= 65280 and
+5649 for larger q (an upper bound of 10^6 log2(1 + 256/q); receipts W2 and W3).
+
+Where the terms come from: 480 bits are the 448-bit header plus 32 bits of flush; 0.005647 bits
+per symbol is the worst case of the `range >> 16` truncation. On the lower side, the last symbol
+of a row takes the slack `range - r * cum`, which can give it up to 256/q more than its share, so
+that symbol can code below its ideal (by about 8 bits at q = 1). "T bytes on disk" therefore holds
+up to these two stated terms, and the lower term shows in the data: on the gate's real units the
+coded length sits 1.2 to 17.8 bits above the lower bound, and a selftest case that codes only last
+symbols comes out 70,682 bits below its ideal length, still inside the lower bound.
+
+Relation to the frozen calibration envelope (CODER_SPEC section 9, S4): S4 is an empirical
+two-sided band, |overhead - 448| <= 64 + 0.001 N bits, fitted to observed data. The bounds here are
+worst-case and proved: the upper slope 0.005647 bits per symbol is larger than S4's 0.001
+(CODER_SPEC itself notes adversarial sequences reach about 0.0056), and the lower term depends on
+the data. Nothing here changes S4 or its receipts; on every gate unit the Omega files are the C
+coder's bytes, so they sit exactly where the C coder's do.
+
+### Proof chain
+
+1. **Model and telescoping (Lean 4, `docs/turing/proofs/TcrBound.lean`).** An explicit model of
+   section 5 (`step`, `renorm`, `run`), for every list of valid symbols (q >= 1,
+   cum + q <= 65536, cum + q = 65536 for the last symbol of the row):
+   - `encode_bound`: (2^32 - 1) * prod q_t * 16711681^n * 256^S < 2^32 * (2^40)^n
+   - `encode_lower`: 2^24 * (2^16)^n <= (2^32 - 1) * prod wq_t * 256^S, wq_t = q_t (+ 256 for a
+     last symbol)
+
+   where S is the number of renormalisation shifts. Lemmas `step_lb` and `step_ub` (each step keeps
+   at least (1 - 65535/2^24) of p * R and at most R * wq / 2^16), `step_ge` (R' >= 256 and R' <= R,
+   so at most two shifts and no overflow), `renorm_spec`, `run_bound`, `run_lower`. Negative
+   controls: `bad_step_violates` (r = R >> 17 breaks the step inequality), `tight_without_loss`
+   (the per-symbol loss factor is needed) and `lower_needs_slack` (the +256 credit is needed).
+   The gate runs `lean TcrBound.lean` with the toolchain pinned in
+   `docs/turing/proofs/lean-toolchain` (`leanprover/lean4:v4.35.0`) and requires 10 axiom lines,
+   no `sorry` and no axiom outside propext, Classical.choice, Quot.sound (observed: `step_lb`,
+   `step_ub` [propext, Quot.sound]; `run_bound`, `encode_bound`, `run_lower`, `encode_lower`
+   [propext, Classical.choice, Quot.sound]; the three controls and `constants` none).
+2. **Logarithm (receipts W1, W3).** log2 of `encode_bound`:
+   8S < sum_t (16 - log2 q_t) + n (24 - log2 16711681) + (32 - log2 (2^32 - 1)), where
+   sum_t (16 - log2 q_t) is the exact ideal length I, `24 - log2 16711681 = -log2(1 - 65535/2^24)`
+   = eps with 10^6 eps = 5646.4768..., and 32 - log2(2^32 - 1) = 3.359e-10. log2 of
+   `encode_lower`: 8S >= I - G - (log2(2^32 - 1) - 24), with log2(2^32 - 1) - 24 = 7.99999999966.
 3. **Length identity (checked on every run, not proved).** payload_bytes = S + 4: each
-   `shift_low` call is one byte position, the flush makes 5 calls and the last cache byte is not
-   emitted. `tc_range.om` compares the two counts on every encode, decode, verify and selftest case
-   and raises ALARM 1 if they differ. So coded_bits = 8 (S + 4) + 448 = 8S + 480.
-4. **Integer ideal (Wolfram, receipt W2).** The section 8 ub rule is within 0.501 ub of the exact
-   value per symbol; Wolfram recomputed the rule for every q = 1..65535 and found
-   max(exact - ub) = 0.49984 ub, min = -0.50019 ub, sum ub = 94,539,136,349 and
+   `shift_low` call is one byte position, the flush makes 5 calls, the fifth always resolves
+   (low is 0 by then) and its cache byte is the only one not emitted. `tc_range.om` compares the two
+   counts on every encode, decode, verify and selftest case and raises ALARM 1 if they differ. So
+   coded_bits = 8 (S + 4) + 448 = 8S + 480.
+4. **Integer ideal (receipt W2).** Wolfram recomputed the section 8 ub rule for every
+   q = 1..65535: exact - ub lies in [-0.50019, +0.49984] ub; sum ub = 94,539,136,349 and
    sum q * ub mod 2^64 = 1,549,081,999,916,376. `tcr-om selftest` recomputes both sums in Omega and
    must match (ALARM 5 otherwise), so the Omega ub equals the rule for every q.
-5. Combining 2 to 4: 10^6 coded_bits < ideal_ub + n (10^6 eps + 0.501) + 480 x 10^6 + 3.4e-4, and
-   ceil(10^6 eps + 0.501) = 5647 (Wolfram W1) leaves 0.022 ub per symbol, more than the 3.4e-4 ub
-   constant for any n >= 1; n = 0 gives equality (480 bits, payload of 4 bytes).
+5. **Combining.** Upper: 10^6 coded_bits < ideal_ub + n (10^6 eps + 0.49984) + 480 x 10^6 +
+   3.4e-4, and 5647 >= 10^6 eps + 0.501 leaves at least 0.022 ub per symbol, more than the
+   3.4e-4 ub constant for any n >= 1; n = 0 gives equality (480 bits, a 4-byte payload). Lower:
+   10^6 coded_bits > ideal_ub - 0.50019 n + 472 x 10^6 - 10^6 G, and 10^6 G <= gain_ub (each term
+   is within 0.50019 + 0.49984 < 2 ub of its exact gain; for q > 65280 the gain is at most its value
+   at q = 65281, 5646.48 ub < 5649).
 
 Model-to-system link: the Lean `step`/`renorm` are transcribed from CODER_SPEC section 5 and
 `encs` in `tc_range.om`; `tc_range.om` is byte-identical to the C reference on every gate unit and
-on two whole dev files (below), and the renormalisation loops in `encs` and `decs` carry `bound 2`:
-a third shift (a range below 256, which `step_ge` rules out) would trap 4 (exit 104), so the "at
-most two shifts" fact is also enforced at run time.
-The theorem is about the model; the byte identity and the run-time checks are what tie it to the
-program.
-
-How tight it is: the n = 1 selftest case of a symbol with q = 1 codes 16 bits of ideal into 496
-bits, slack 5647 ub, i.e. within eps of the bound. On real data the slack is far larger (the
-truncation loses about 5e-4 bits per symbol, CODER_SPEC section 9).
+on two whole dev files (below); the renormalisation loops in `encs` and `decs` carry `bound 2`, so
+a third shift (a range below 256, which `step_ge` rules out) would trap (exit 104). The theorems
+are about the model; the byte identity and the run-time checks of both bounds tie them to the
+program. A change to `encs` that the Lean model does not follow is caught by the byte identity
+with C and by the run-time bound checks, not by Lean.
 
 ## Results (EXERCISED on the Spark, omc `26540e6d...`, omega-mv base e4271abd)
 
 `make test-turing-range-om` (part of the `turing-yield` gate step):
 
-- selftest: 484 synthetic cases, 1,284,560 symbols, K = 2..16, four row shapes, sampled and
-  worst-information symbols, n = 0 to 200,000: round trip exact, identity and bound hold, one
-  flipped payload byte detected in every case (484 of 484); ub rule exhaustive match.
+- selftest: 726 synthetic cases, 1,926,840 symbols, K = 2..16, four row shapes, three symbol
+  choices (sampled, least likely, always the last symbol), n = 0 to 200,000: round trip exact,
+  identity and both bounds hold; one random payload byte flipped per case is detected in all 726
+  cases; ub rule exhaustive match. Smallest upper slack for n >= 1: 5647 ub (a single q = 1
+  symbol, within eps of the bound); smallest lower slack 11,228 ub.
 - 14 real units (2 committed CTR1 traces x the TY-2 candidate, uniform:9 and the five EXP-001
   candidates B0..B3, M): Omega encode byte-identical to C, C verifies every Omega file, Omega
-  verifies every C file, Omega decode byte-identical to the TSY1, ideal_ub equal to the C value.
-  Example (trace crumbs 05-07, TY-2 candidate): n = 1418, ideal 1456.957896 bits, coded 1936 bits
-  (242 bytes), bound 1944.965342 bits.
-- Refusals with the right code: flipped byte (SYMBOL), truncated (TRUNC), trailing byte (TRAIL),
-  other TPS1 (BINDING), altered magic (HEADER), corrupted TPS1 (DIGEST), TSY1 of another trace
-  (COUNT), usage.
-- Mutants caught: `range >> 15` (output no longer byte-identical), bound constants lowered (ALARM 2),
-  ub rounding removed (ALARM 5).
+  verifies every C file, Omega decode byte-identical to the TSY1, ideal_ub equal to the C value,
+  both bounds PASS. Example (trace crumbs 05-07, TY-2 candidate): n = 1418, ideal 1456.957896
+  bits, coded 1936 bits (242 bytes), upper bound 1944.965342 bits, lower bound 1922.925988 bits.
+- Single-fault inputs refused with the same code as the C tool: flipped payload byte (CORRUPT),
+  truncated (TRUNC), trailing byte (TRAIL), other TPS1 (BINDING), altered magic (HEADER),
+  corrupted TPS1 (DIGEST), TSY1 of another trace (COUNT), corrupted TSY1 (DIGEST). A decode
+  refused after its output was created leaves no file; an output path naming an input is refused
+  (ARG) and the input is unchanged.
+- Mutants caught: `range >> 15` (no longer byte-identical), upper-bound constants lowered
+  (ALARM 2), ub rounding removed (ALARM 5), lower-bound constant raised by 10 bits (ALARM 6).
+- Lean: 10 theorems checked, standard axioms only.
 
 Whole dev file (seed 1 only; seeds 8 to 10 untouched), not part of the gate because the data is not
 in the repository: 2,172,776 symbols, TY-2 candidate: ideal 1,752,630.382351 bits, coded 1,754,208
-bits (219,276 bytes), byte-identical to C, round trip exact, slack 11,172 bits; uniform:9 also
-byte-identical. Single core, nice 10, shared machine: Omega encode 2.90 s, verify 2.89 s, decode
-3.98 s; C encode 0.56 s.
+bits (219,276 bytes), byte-identical to C, round trip exact, upper slack 11,172 bits, lower bound
+1,752,900.795377 bits; uniform:9 also byte-identical, both bounds PASS. Single core, nice 10, on a
+shared machine at load 28 to 37: Omega encode 5.4 to 10.8 s, verify 5.1 to 21.8 s, decode 5.5 to
+17.7 s; C encode 0.52 to 0.84 s.
 
 ## Not claimed
 
 - Coder B (rANS, `TCA1`) is not ported; `tcr-om` refuses `rans` with usage.
-- `verify` checks the TSY1 before the coded file; the C tool checks the coded file first. Refusal
-  codes agree when an input has one fault; with several faults the first code reported can differ.
-- The length identity (step 3) is checked on every run, not proved.
-- The Lean check used `lean` from the pinned toolchain on the single file (it imports nothing);
-  it is not wired into a lake project inside this repository.
+- The length identity (proof step 3) is checked on every run, not proved in Lean.
+- The Lean check runs `lean` on the single file (it imports nothing); there is no lake project in
+  this repository.
 - C remains the reference implementation of the calibration profile; nothing here changes
-  CODER_SPEC or any frozen receipt.
+  CODER_SPEC, S4 or any frozen receipt.
 
 ## Wolfram receipts (Wolfram Language evaluator, 2026-11-15)
 
@@ -142,3 +182,12 @@ W2 (the CODER_SPEC section 8 rule, transcribed, for every q):
     -> {16000000, 1000000, 591903, 485194, 0.49983840009545..., -0.50019182915248..., 94539136349, 1549081999916376}
 
 The four test values agree with CODER_SPEC section 8.
+
+W3:
+
+    {N[10^6*Log2[1 + 256/65281], 20], Ceiling[10^6*Log2[1 + 256/65281]], N[10^6*Log2[1 + 256/1], 20],
+     N[Log2[2^32 - 1] - 24, 20], Floor[(2^64 - 1 - 480*10^6)/16005647], Floor[(2^64 - 1)/(8*10^6)]}
+    -> {5646.4768139155787531..., 5647, 8.0056245491938781...*10^6, 7.9999999996640963..., 1152514738906, 2305843009213}
+
+16005647 = 16,000,000 + 5647 is the largest growth of the upper bound per symbol in ub (ub(1) plus
+the slope), so the bound of n symbols fits a 64-bit word up to the stated n.

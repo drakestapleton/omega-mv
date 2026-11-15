@@ -6,8 +6,9 @@ note of src/turing/tc_range.c (ledger L111). Normative text: calibration/docs/CO
 note sections 2 (TPS1), 3 (TSY1), 4 (coded header), 5 (range coder), 8 (ideal length) and
 note docs/turing/TURING_YIELD_RANGE_CODER_OM.md (the length bound and its proof).
 note
-note Program mode, OM-1. Composed after the FIPS 180-4 unit seed/ng/sha256.om (prefix sh_):
-note   cat seed/ng/sha256.om src/turing/tc_range.om | seed/out/omc > tcr-om
+note Program mode, OM-1 code in an OM-2 unit: composed after the FIPS 180-4 unit seed/ng/sha256.om
+note (prefix sh_), with an om2 first line for the unsized text views:
+note   { printf 'om2\n'; cat seed/ng/sha256.om src/turing/tc_range.om; } | seed/out/omc > tcr-om
 note
 note CLI (same shape as turing-coder, range only):
 note   tcr-om encode range IN.tps IN.tsy OUT.tcr
@@ -15,19 +16,24 @@ note   tcr-om decode range IN.tps IN.tcr OUT.tsy
 note   tcr-om verify range IN.tps IN.tsy IN.tcr
 note   tcr-om selftest
 note Exit 0 accepted, 2 refused (one line on stderr with the CODER_SPEC s.10 code), 1 usage,
-note 3 ALARM: a proved property failed on this run (length identity or length bound).
+note 3 ALARM: a proved property failed on this run (length identity, upper or lower bound, ub rule).
+note Refusals come in turing-coder's order (encode: TPS1, TSY1, pair; decode: TPS1, coded file,
+note decode; verify: TPS1, coded file and decode, TSY1 and pair, byte identity).
 note
 note Every file is streamed through fixed buffers, so no input size is capped by this program:
 note memory does not grow with the number of symbols. Each input is read twice: a validation
 note pass (trailer digest, header, every record or symbol, in the refusal order of
-note src/turing/tc_pstream.c) and then the coding pass.
+note src/turing/tc_pstream.c) and the coding pass, which re-checks every record and symbol and
+note re-hashes the file (DIGEST if it changed in between). An output path naming an input is
+note refused; a refusal after the output was created removes it.
 note
-note Length bound (proved, docs/turing/proofs/TcrBound.lean plus the log step in the doc):
-note   payload_bytes = shifts + 4 (checked here on every run)
-note   8 * shifts < ideal_exact_bits + n * eps + 3.4e-10, eps = -log2(1 - 65535 / 2^24)
-note so, with the s.8 integer ideal (each symbol within 0.501 ub of exact) and the 448-bit header:
-note   1000000 * coded_bits <= ideal_ub + 5647 * n + 480000000
-note where 5647 = ceil(1e6 * eps + 0.501) (Wolfram: 1e6 * eps = 5646.4768...).
+note Length bounds (proved: docs/turing/proofs/TcrBound.lean, the log step and Wolfram receipts in
+note docs/turing/TURING_YIELD_RANGE_CODER_OM.md):
+note   payload_bytes = shifts + 4 (checked here on every run), coded_bits = 8 * shifts + 480
+note   upper: 1000000 * coded_bits <= ideal_ub + 5647 * n + 480000000
+note   lower: 1000000 * coded_bits >= ideal_ub + 472000000 - n - gain_ub, gain_ub = sum over symbols
+note          coded as the last of their row of an upper bound of 1e6 * log2(1 + 256/q) (gub)
+note Both are checked on every run.
 
 global RB uchar 196608
 global RS ulong 24
@@ -45,7 +51,9 @@ global ST ulong 32
 global UBT ulong 65537
 global AR uchar 24576
 global AL ulong 8
-global DG uchar 160
+global DG uchar 256
+global INO ulong 8
+global HSEL ulong 4
 global FS uchar 128
 global PB uchar 4096
 global PL ulong 2
@@ -71,12 +79,16 @@ text KOVH "overhead_ub="
 text KTPS "tps1_digest="
 text KTSY "tsy1_digest="
 text KBOK "bound=PASS\n"
+text KLOW "lower_ub="
+text KLOK "lower=PASS\n"
 text KRT "roundtrip=byte-exact\n"
 text KCASE "selftest cases="
 text KSYM " symbols="
 text KFLIP " flips_detected="
 text KMIN " min_slack_ub="
 text KMIN1 " min_slack_n_ge_1_ub="
+text KLMIN " min_lower_slack_ub="
+text KBELOW " max_below_ideal_ub="
 text KPASS "\nselftest=PASS\n"
 text WENC "encode"
 text WDEC "decode"
@@ -88,6 +100,7 @@ text ALBD "length bound 1e6*coded_bits > ideal_ub + 5647*n + 480e6"
 text ALRT "selftest round trip"
 text ALFL "selftest corruption not detected"
 text ALUB "ub rule differs from the Wolfram receipt"
+text ALLO "lower bound 1e6*coded_bits < ideal_ub + 472e6 - n - gain_ub"
 text KUB "ub_rule q=1..65535 sum="
 text KUBQ " qsum="
 
@@ -215,6 +228,9 @@ end
 if eq w 5
 ptext ALUB
 end
+if eq w 6
+ptext ALLO
+end
 pbyte 10
 pflush 2
 exit 3
@@ -235,7 +251,7 @@ ret ulong k
 end
 
 fn rdb s ulong to ulong
-note Next byte of stream s, or 256 at end of file.
+note Next byte of stream s, or 256 at end of file. HSEL[s] = 1 + h feeds the byte to hash stream h.
 b = mul s 8
 if ge get RS add b 1 get RS add b 2
 k = rdfill s
@@ -245,11 +261,25 @@ end
 end
 p = get RS add b 1
 put RS add b 1 add p 1
-ret ulong get RB add mul s 65536 p
+v = ulong get RB add mul s 65536 p
+h = get HSEL s
+if ne h 0
+hbyte sub h 1 v
+end
+ret v
+end
+
+fn lefs o ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or shl v 8 ulong get FS sub add o 7 i
+end
+ret v
 end
 
 fn sopen s ulong a ulong to ulong
-note Open argument a read-only as stream s; returns its size in bytes.
+note Open argument a read-only as stream s; returns its size in bytes and keeps its device and
+note inode (INO[2s], INO[2s+1]) so that an output path naming an input is refused.
 o = mul a 4096
 f = fopen AR o get AL a 0 0
 if lt f 0
@@ -259,19 +289,14 @@ b = mul s 8
 put RS b ulong f
 put RS add b 1 0
 put RS add b 2 0
+put HSEL s 0
 k = fstat int f FS 0 128
 if lt k 0
 refuse 102 0
 end
-ret lev48
-end
-
-fn lev48 to ulong
-v = ulong 0
-for i ulong 8
-v = or shl v 8 ulong get FS sub 55 i
-end
-ret v
+put INO mul s 2 lefs 0
+put INO add mul s 2 1 lefs 8
+ret lefs 48
 end
 
 fn srew s ulong to void
@@ -760,6 +785,11 @@ end
 if ne mul n rb sub sz 160
 refuse 103 0
 end
+if gt n 1152514738906
+note Machine-word boundary, not a size choice: every length sum is a 64-bit micro-bit count and
+note the bound reaches 16005647 n + 480e6 ub, which fits 2^64 - 1 up to this n (Wolfram W3).
+refuse 101 0
+end
 t = ulong 0
 while lt t n bound 9223372036854775807
 tpsrow t 1
@@ -858,12 +888,37 @@ end
 
 note ---------------------------------------------------------------- report
 
+fn gub q ulong to ulong
+note Upper bound, in ub, of 1e6 * log2(1 + 256/q): the most the last symbol of a row can gain
+note over its ideal (lower bound, TcrBound.lean encode_lower). Each ub is within
+note [-0.50019, +0.49984] of exact (Wolfram W2), so the difference plus 2 is safe; for q > 65280
+note the gain is below its value at 65281, 1e6 * log2(1 + 256/65281) = 5646.48 (Wolfram W3).
+if le q 65280
+ret add sub ub q ub add q 256 2
+end
+ret 5649
+end
+
+fn acc s ulong to void
+note Add symbol s (row Q) to the ideal length ST[1] and, for the last symbol of the row, to the
+note lower-bound gain ST[8].
+q = get Q s
+put ST 1 add get ST 1 ub q
+if eq s sub get ST 2 1
+put ST 8 add get ST 8 gub q
+end
+end
+
 fn report to void
-note ST: 0 n, 1 ideal_ub, 6 payload bytes, 7 shifts. Prints the length lines and checks the
-note identity and the bound; a failure is an ALARM (exit 3), never a silent pass.
+note ST: 0 n, 1 ideal_ub, 6 payload bytes, 7 shifts, 8 last-symbol gain. Prints the length lines
+note and checks the identity and both bounds; a failure is an ALARM (exit 3), never a silent pass.
+note The 64-bit limits here are the machine word: n is capped in tpsload, cb below.
 n = get ST 0
 pay = get ST 6
 cb = add pay 56
+if gt cb 2305843009213
+refuse 101 0
+end
 pkv KCNT n
 pkv KIDL get ST 1
 pkv KCB cb
@@ -880,6 +935,16 @@ if gt cub bnd
 alarm 2
 end
 pkv KSLK sub bnd cub
+lw = add get ST 1 472000000
+g = add n get ST 8
+lo = ulong 0
+if gt lw g
+lo = sub lw g
+end
+pkv KLOW lo
+if lt cub lo
+alarm 6
+end
 ptext KOVH
 if ge cub get ST 1
 pdec sub cub get ST 1
@@ -889,6 +954,7 @@ pdec sub get ST 1 cub
 end
 pbyte 10
 ptext KBOK
+ptext KLOK
 end
 
 fn hdrw t view uchar * to void
@@ -916,8 +982,28 @@ end
 
 text MTCR "TCR1"
 
+fn sameio d ulong i ulong to bool
+r = false
+for s ulong 3
+if eq get INO mul s 2 d
+if eq get INO add mul s 2 1 i
+r = true
+end
+end
+end
+ret r
+end
+
 fn ocreate a ulong to void
+note Refuse (ARG) an output path that names one of the open inputs (same device and inode):
+note O_TRUNC would destroy the input and the refusal cleanup would then remove it.
 o = mul a 4096
+k = stat AR o get AL a FS 0 128
+if eq k 0
+if sameio lefs 0 lefs 8
+refuse 101 0
+end
+end
 f = fopen AR o get AL a 577 420
 if lt f 0
 refuse 102 0
@@ -940,6 +1026,25 @@ refuse 102 0
 end
 end
 
+fn rehbeg s ulong h ulong d ulong to void
+note Coding pass: re-read stream s from byte 0 through hash stream h (domain d).
+srew s
+hbeg h d
+put HSEL s add h 1
+end
+
+fn rehend s ulong h ulong o ulong w ulong to void
+note End of a coding pass: skip the 32-byte trailer, finish hash h into DG[o..o+32) and refuse
+note DIGEST unless it equals the validation-pass digest DG[w..w+32) (the file changed between
+note the passes).
+put HSEL s 0
+rdn s 32
+hend h o
+if not dgeq o w
+refuse 104 0
+end
+end
+
 note ---------------------------------------------------------------- modes
 
 fn cmdenc to int
@@ -949,36 +1054,42 @@ ocreate 5
 for i ulong 56
 obyte 0
 end
-srew 0
+rehbeg 0 0 0
 tpshdr 0
-srew 1
+rehbeg 1 1 1
 rdn 1 56
 encbeg
 n = get ST 0
-idl = ulong 0
+k = get ST 2
+put ST 1 0
+put ST 8 0
 t = ulong 0
 while lt t n bound 9223372036854775807
-tpsrow t 0
+tpsrow t 1
 s = rdb 1
+if ge s k
+refuse 116 t
+end
 e = encs s
 if ne e 0
 refuse e t
 end
-idl = add idl ub get Q s
+acc s
 t = add t 1
 end
 e = encend
 if ne e 0
 refuse e n
 end
-put ST 1 idl
+rehend 0 0 192 0
+rehend 1 1 224 96
 put ST 6 get EN 6
 put ST 7 get EN 5
 oflush
 hdrw MTCR
 f = int get OS 0
-k = pwrite f HB 0 56 long 0
-if ne k 56
+w = pwrite f HB 0 56 long 0
+if ne w 56
 refuse 102 0
 end
 ofinish
@@ -1032,50 +1143,9 @@ put DC 3 p
 put DC 4 0
 end
 
-fn decrun cmp ulong to void
-note Decode all symbols. cmp 1: compare with TSY stream 1 (verify); cmp 2: write them to the
-note output with the TSY1 header and trailer (decode). Fills ST[1] (ideal), ST[6], ST[7].
-srew 0
-tpshdr 0
-e = decbeg
-if ne e 0
-refuse e 0
-end
-n = get ST 0
-idl = ulong 0
-sh = ulong 0
-t = ulong 0
-while lt t n bound 9223372036854775807
-tpsrow t 0
-s = decs
-if gt s 999
-refuse sub s 1000 t
-end
-if eq cmp 1
-if ne s rdb 1
-refuse 116 t
-end
-else
-obyte s
-hbyte 1 s
-end
-idl = add idl ub get Q s
-t = add t 1
-end
-e = decend
-if ne e 0
-refuse e n
-end
-put ST 1 idl
-put ST 6 get DC 3
-put ST 7 sub get DC 3 4
-end
-
-fn cmddec to int
-tpsload 3
-codhdr 4
-ocreate 5
-hbeg 1 1
+fn tsyhdr w ulong to void
+note The TSY1 header of the decoded symbols (K, count, dataset digest of the TPS1), fed to hash
+note stream 1 and, when w = 1, written to the output.
 for i ulong 56
 put HB i 0
 end
@@ -1094,10 +1164,55 @@ put HB add 24 i get DG add 64 i
 end
 for i ulong 56
 b = ulong get HB i
+if eq w 1
 obyte b
+end
 hbyte 1 b
 end
-decrun 2
+end
+
+fn decrun w ulong to void
+note Decode all symbols into hash stream 1 (and, w = 1, the output file). Fills ST[1] (ideal),
+note ST[6], ST[7], ST[8]. The TPS1 is re-hashed and its rows re-checked on the way.
+rehbeg 0 0 0
+tpshdr 0
+e = decbeg
+if ne e 0
+refuse e 0
+end
+n = get ST 0
+put ST 1 0
+put ST 8 0
+t = ulong 0
+while lt t n bound 9223372036854775807
+tpsrow t 1
+s = decs
+if gt s 999
+refuse sub s 1000 t
+end
+if eq w 1
+obyte s
+end
+hbyte 1 s
+acc s
+t = add t 1
+end
+e = decend
+if ne e 0
+refuse e n
+end
+rehend 0 0 192 0
+put ST 6 get DC 3
+put ST 7 sub get DC 3 4
+end
+
+fn cmddec to int
+tpsload 3
+codhdr 4
+ocreate 5
+hbeg 1 1
+tsyhdr 1
+decrun 1
 hend 1 96
 for i ulong 32
 obyte ulong get DG add 96 i
@@ -1115,12 +1230,19 @@ ret 0
 end
 
 fn cmdver to int
+note Same order as turing-coder verify: probability stream, coded file and full decode, then the
+note symbol file and the pair check, then byte identity of the symbol file with the decoded one
+note (compared through their TSY1 digests: equal digests of domain || header || symbols).
 tpsload 3
-tsyload 4
 codhdr 5
-srew 1
-rdn 1 56
-decrun 1
+hbeg 1 1
+tsyhdr 0
+decrun 0
+hend 1 160
+tsyload 4
+if not dgeq 160 96
+refuse 116 0
+end
 ptext KMODE
 ptext WVER
 pbyte 10
@@ -1179,7 +1301,11 @@ put Q d add get Q d sub 65536 used
 end
 
 fn gensym k ulong md ulong to ulong
-note md 0: sample from Q; md 1: the least likely symbol (worst information per symbol).
+note md 0: sample from Q; md 1: the least likely symbol (worst information per symbol);
+note md 2: always the last symbol of the row (the lower side of the bound).
+if eq md 2
+ret sub k 1
+end
 if eq md 1
 b = ulong 0
 for x ulong k bound 16
@@ -1201,13 +1327,15 @@ ret sub k 1
 end
 
 fn stenc seed ulong n ulong k ulong md ulong to ulong
-note Encode case (seed, n, k, md) into MB; returns ideal_ub. md: low 2 bits row mode, bit 2 symbol mode.
+note Encode case (seed, n, k, md) into MB; returns ideal_ub (gain in ST[8]). md: low 2 bits row
+note mode, md >> 2 symbol mode.
 put RG 0 seed
 put ST 2 k
 put OS 3 1
 put OS 2 0
 encbeg
-idl = ulong 0
+put ST 1 0
+put ST 8 0
 t = ulong 0
 while lt t n bound 9223372036854775807
 genrow k and md 3
@@ -1216,13 +1344,13 @@ e = encs s
 if ne e 0
 alarm 3
 end
-idl = add idl ub get Q s
+acc s
 t = add t 1
 end
 if ne encend 0
 alarm 3
 end
-ret idl
+ret get ST 1
 end
 
 fn stdec seed ulong n ulong k ulong md ulong to ulong
@@ -1257,8 +1385,31 @@ x = add rem rnd 255 1
 put MB p uchar xor ulong get MB p x
 end
 
+fn stlow n ulong idl ulong cub ulong to void
+note Lower bound for a selftest case (ST[8] = last-symbol gain), its smallest slack (ST[27]) and
+note the largest amount any case codes below its ideal (ST[28]).
+lw = add idl 472000000
+g = add n get ST 8
+lo = ulong 0
+if gt lw g
+lo = sub lw g
+end
+if lt cub lo
+alarm 6
+end
+if lt sub cub lo get ST 27
+put ST 27 sub cub lo
+end
+if gt idl cub
+if gt sub idl cub get ST 28
+put ST 28 sub idl cub
+end
+end
+end
+
 fn stcase seed ulong n ulong k ulong md ulong to void
-note One case: round trip, length identity, bound, then flip one payload byte and require detection.
+note One case: round trip, length identity, both bounds, then flip one payload byte and require
+note detection.
 idl = stenc seed n k md
 pay = get OS 2
 if ne pay add get EN 5 4
@@ -1269,6 +1420,7 @@ cub = mul mul add pay 56 8 1000000
 if gt cub bnd
 alarm 2
 end
+stlow n idl cub
 if lt sub bnd cub get ST 20
 put ST 20 sub bnd cub
 end
@@ -1314,16 +1466,18 @@ end
 end
 
 fn cmdself to int
-note Cases: K 2..16, all four row modes, both symbol modes, n from 0 to 200000.
+note Cases: K 2..16, all four row modes, three symbol modes, n from 0 to 200000.
 put ST 20 18446744073709551615
 put ST 24 18446744073709551615
+put ST 27 18446744073709551615
+put ST 28 0
 ubchk
 put ST 21 0
 put ST 22 0
 put ST 23 0
 seed = ulong 1
 for k ulong 15
-for md ulong 8
+for md ulong 12
 stcase seed 0 add k 2 md
 seed = add seed 1
 stcase seed 1 add k 2 md
@@ -1338,6 +1492,8 @@ stcase 777 200000 9 0
 stcase 778 200000 2 4
 stcase 779 200000 16 5
 stcase 780 200000 16 7
+stcase 781 200000 16 9
+stcase 782 200000 2 9
 ptext KUB
 pdec get ST 25
 ptext KUBQ
@@ -1353,12 +1509,19 @@ ptext KMIN
 pdec get ST 20
 ptext KMIN1
 pdec get ST 24
+ptext KLMIN
+pdec get ST 27
+ptext KBELOW
+pdec get ST 28
 ptext KPASS
 pflush 1
 ret 0
 end
 
 fn main to int
+for i ulong 8
+put INO i 18446744073709551615
+end
 c = argcnt
 if eq c 2
 argget 1

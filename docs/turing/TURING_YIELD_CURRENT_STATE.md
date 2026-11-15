@@ -199,7 +199,8 @@ The honest pairing:
 - The evidence then refers to the same work: the bits come from exactly the symbols scored inside the metered window.
 - **Ideal code length only.** No C lossless coder exists (§2). T is Shannon code length, not a decodable bitstream.
   - Optional check later: a C arithmetic coder whose output size is within a few bytes of Σ −log2 P.
-    (Done later in Omega, L111: coded bits <= T_ideal + 480 + 0.005647 n, proved;
+    (Later, in Omega, L111: proved T_ideal + 472 - G <= coded bits <= T_ideal + 480 + 0.005647 n,
+    G from the last symbols of their rows; on 2.17 M symbols the upper term is about 1.5 KB, not a few bytes;
     [TURING_YIELD_RANGE_CODER_OM.md](TURING_YIELD_RANGE_CODER_OM.md).)
   - That is new in-house code. It is not an outside dependency.
 - Numeric identity: T in bits is a float sum. Goldens must reproduce under any build flags (`test_turing.c:33`). So
