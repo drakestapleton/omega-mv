@@ -27,6 +27,10 @@ while IFS= read -r hit; do
     base:native/prefetch/README.md) c="prose of the qualification-bound pair" ;;
     base:AUDIT_SCOPE.md|base:neuralese/README.md|base:om/gpumath/README.md)
       if printf '%s' "$text" | grep -q 'last\|was$\|was,\|Before that record' || sed -n "$((line - 3)),${line}p" "$f" | grep -q 'last typed\|last pin typed\|Before that record\|was typed'; then c="history: named as the last typed pin"; else c=UNCLASSIFIED; fi ;;
+    base:bridge/cuda/EXTENSION-PROPOSAL.md)
+      if sed -n "$((line + 1))p" "$f" | grep -q '^(omega-mv .[0-9a-f]*.)\. Measured 20[0-9-]* on '; then c="measurement record: the compiler a dated measurement was made with"; else c=UNCLASSIFIED; fi ;;
+    base:gpu/amd/rest/kfd-verdicts.tsv|base:gpu/amd/rest/launch-verdicts.tsv|base:gpu/amd/rest/plan-verdicts.tsv)
+      case $text in "#"*) c="oracle record: the compiler the generated verdict table was made with (comment row; the gate compares this tree's compiler with those verdicts)" ;; *) c=UNCLASSIFIED ;; esac ;;
     *) c=UNCLASSIFIED ;;
   esac
   case "$c:$f" in "generated binding identity"*) ;; *:*.sh|*:*.py|*:*.om|*:*.c|*:*.pin|*:*.yml|*:*.awk) c="TYPED LIVE PIN" ;; esac

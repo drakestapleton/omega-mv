@@ -284,6 +284,13 @@ classify() {
     seed/omc/gate5.sh|tests/autodiff664/run-tape.sh|bench/inference_cost/verify-test.om) echo "another omc.sha256 file, not the record" ;;
     native/orig4/orig4.pin) echo "data: names the record for tests/orig4/run.sh (controlled as orig4)" ;;
     tools/omegatool.c) echo "reader, no compiler handed in: m15 compares src/omega_om_units.ident with the record" ;;
+    # Omega gate programs that take the compiler as OMC and carry their own digest refusal (exit 69, nothing written). Each listed
+    # file must still hold the refusal text and the exit; this class is not an admission row: no decoy or twin runs against them.
+    bridge/shlib/gate.om|gpu/amd/gate.om|gpu/amd/rest/gate.om|gpu/nvidia/checks/gate.om|gpu/runtime/gate.om|gpu/units-gate.om)
+      if grep -q -F "REFUSED: compiler digest differs from seed/out/omc.sha256 (exit 69)" "$ROOT/$1" && grep -q -E "^ret 69$" "$ROOT/$1"; then
+        echo "gate program with its own digest refusal (exit 69, text and exit checked here); NOT_COVERED by an admission twin row"
+      else echo UNCLASSIFIED; fi ;;
+    gpu/amd/NOT-YET-OMEGA.tsv|gpu/amd/rest/classes.tsv) echo "data: a table row that names the record as the launcher compiler pin of a moved piece" ;;
     seed/host/check.sh|seed/omc/qualify-ir-trap.sh|seed/rung0/gate0.sh|seed/tilelab/gate.sh|seed/trace/cli-gate.sh|seed/trace/gate.sh|tests/gates/run.sh) echo "self-check of the fixed seed/out/omc against the record; no compiler handed in" ;;
     bench/inference_cost/driver.sh|bench/inference_cost/tests/handover/run.sh) echo "consumer that already read the record before pins were derived; unchanged, no row here" ;;
     tests/gates/*.gate) echo "gate manifest listing the record as an input" ;;
