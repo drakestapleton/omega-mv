@@ -3,6 +3,7 @@
 # Python 3 standard library and git only. Run at the checked repository root:
 #   python3 seed/host/matrix-check.py seed/host/EFFECT-MATRIX.md BASE
 # It checks references, not syscall semantics or whether a cited test passed.
+import hashlib
 import re
 import subprocess
 import sys
@@ -91,16 +92,59 @@ class Checker:
         return self.texts[path]
 
     def source(self, value: str) -> None:
-        fields = value.split(":", 2)
-        if len(fields) != 3 or not fields[1].isdecimal() or not fields[2]:
-            raise MatrixError(f"malformed line reference {value!r}")
-        path, number, symbol = fields
+        # A line number moves when a harmless line is inserted anywhere above it.
+        # A citation is the line text plus the hash of a short window of lines
+        # ending on that line: PATH:TEXT#N:12HEX. N lines, joined by newlines,
+        # sha256, first 12 hex digits. Exactly one window in the file may match.
+        if not re.search(r"#[1-9][0-9]*:[0-9a-f]{12}$", value):
+            if re.search(r":[0-9]+:", value):
+                raise MatrixError(
+                    f"line-number anchor {value!r}; cite the line text and its window hash")
+            raise MatrixError(f"malformed text anchor {value!r}")
+        body, hashsep, hexd = value.rpartition("#")
+        if hashsep != "#" or not re.fullmatch(r"[1-9][0-9]*:[0-9a-f]{12}", hexd):
+            raise MatrixError(f"malformed text anchor {value!r}")
+        n_text, _, digest = hexd.partition(":")
+        window_n = int(n_text)
+        path, sep, symbol = body.partition(":")
+        if not sep or not symbol:
+            raise MatrixError(f"malformed text anchor {value!r}")
         lines = self.text(path).splitlines()
-        line = int(number)
-        if line < 1 or line > len(lines) or symbol not in lines[line - 1]:
-            actual = lines[line - 1] if 1 <= line <= len(lines) else "<outside file>"
-            raise MatrixError(f"{self.path(path)}:{line} lacks {symbol!r}; "
-                              f"actual={actual!r}")
+        hits = []
+        for i, line in enumerate(lines):
+            if symbol not in line or i + 1 < window_n:
+                continue
+            window = "\n".join(lines[i + 1 - window_n:i + 1])
+            if hashlib.sha256(window.encode()).hexdigest().startswith(digest):
+                hits.append(i + 1)
+        if len(hits) != 1:
+            raise MatrixError(
+                f"{self.path(path)} text {symbol!r} window {window_n} "
+                f"matches {len(hits)} lines")
+
+    def anchor_probe(self, matrix: str) -> None:
+        # Inserting one line above every citation must leave the windows valid,
+        # and the old line-number form must be refused.
+        path = "seed/omc/omc.om"
+        if path not in self.texts:
+            self.text(path)
+        self.texts[path] = "note harmless\n" + self.texts[path]
+        active = False
+        for line in matrix.splitlines():
+            if line.startswith("@alias "):
+                active = True
+            if not active:
+                continue
+            for token in re.findall(r"`((?:src|test):[^`\n]+)`", line):
+                self.source(token.split(":", 1)[1])
+        try:
+            self.source("seed/omc/omc.om:1:fn")
+        except MatrixError as error:
+            if "line-number anchor" not in str(error):
+                raise
+        else:
+            raise MatrixError("line-number anchor was accepted")
+        print("MATRIX-ANCHOR PASS shift=note-harmless refused=line-number")
 
     def case(self, value: str) -> None:
         path_name, separator, name = value.rpartition(":")
@@ -262,12 +306,20 @@ class Checker:
 def main() -> int:
     checker = None
     try:
-        if len(sys.argv) != 3:
-            raise MatrixError("usage: matrix-check.py MATRIX BASE (cwd=repository root)")
-        checker = Checker(sys.argv[2])
-        matrix = Path(sys.argv[1]).read_text(encoding="utf-8")
+        args = sys.argv[1:]
+        probe = False
+        if args and args[0] == "--probe":
+            probe = True
+            args = args[1:]
+        if len(args) != 2:
+            raise MatrixError(
+                "usage: matrix-check.py [--probe] MATRIX BASE (cwd=repository root)")
+        checker = Checker(args[1])
+        matrix = Path(args[0]).read_text(encoding="utf-8")
         rows, not_covered = checker.run(matrix)
         print(f"MATRIX-CHECK PASS rows={rows} not_covered={not_covered}")
+        if probe:
+            checker.anchor_probe(matrix)
         return 0
     except (MatrixError, OSError, UnicodeError, ValueError) as error:
         where = checker.location if checker is not None else "row=setup"
