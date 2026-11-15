@@ -415,12 +415,15 @@ recorded at the top of this file, the committed compiler is `26540e6d...`; the
 lock and receipt below keep the `d6290c76...` run unedited, and the command
 below uses the current pin because the conductor refuses any other hash.
 
-From this checkout with separately fetched sibling source repositories:
+From this checkout with separately fetched sibling source repositories. The lock names
+aien-protocols-mv `6fb728a1`, the draft commit the original run read; that commit is not
+in the canonical history, which carries the same `validator.om` bytes in the landed NL3
+commit `703eb1b2`, so the command reads it there and the sha256 check below still decides:
 
 ```sh
 mkdir -p build/nl4-deps
 git -C ../aien-train show 0e01c58a41f1a2fb976efa75c1cc554503aa2ee4:native/neuralese/hadamard.om > build/nl4-deps/h.om
-git -C ../aien-protocols-mv show 6fb728a14781eb4e5262ffbdc9c2e6be64974f36:specs/latent-payload/validator.om > build/nl4-deps/v.om
+git -C ../aien-protocols-mv show 703eb1b2fdf72cc03ef9851957d70054957e01fe:specs/latent-payload/validator.om > build/nl4-deps/v.om
 sha256sum build/nl4-deps/h.om build/nl4-deps/v.om
 # Refuse to continue unless both hashes equal nl4-dependencies.json.
 seed/out/omc < seed/qualification/om2/gate.om > build/nl4-gate
