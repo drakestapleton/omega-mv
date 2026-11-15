@@ -629,9 +629,19 @@ static void e6_durable(void) {
     Env e;
     check(setup(&e, 1, 1u << 16) == 0, "E6 setup: world");
     check(rx_world_set_halt_dir(&e.w, dir) == 0, "E6 no mark: set_halt_dir answers 0, world runs");
+    char partial[200], victim[200];
+    snprintf(partial, sizeof partial, "%s/%s.partial", dir, RX_GEN_HALT_MARK);
+    snprintf(victim, sizeof victim, "%s/halt-victim", dir);
+    FILE *vf = fopen(victim, "wb");
+    check(vf && fwrite("SAFE", 1, 4, vf) == 4, "E6 setup: halt partial victim");
+    if (vf) fclose(vf);
+    check(symlink(victim, partial) == 0, "E6 setup: planted predictable halt partial symlink");
     RxHaltStatus h;
     check(rx_world_emergency_stop(&e.w, OP, &e.cr_op, e.c_op, 606, &h) == RX_OK && h.durable == 1,
           "E6 the stop wrote its mark durably (durable = 1)");
+    char safe[8];
+    check(read_file(victim, safe, sizeof safe) == 4 && memcmp(safe, "SAFE", 4) == 0,
+          "E6 halt partial symlink target was not modified");
     int n = read_file(mark, raw, sizeof raw);
     char want_head[200];
     snprintf(want_head, sizeof want_head, "aien-operator-halt v1\nseq 1\nsubject %u\ncap %u %llu\nreason 606\n",

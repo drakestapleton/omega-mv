@@ -173,8 +173,9 @@ typedef struct {
 } RxGenPhases;
 
 /* rx_gen_open, rx_gen_recover and rx_gen_reject_replay answer RX_GEN_ERR_ARG,
- * before touching any file, for a dir that src/omega_path_check.h refuses
- * (a ".." component, a byte outside its set, or too long for RxGenStore). */
+ * before touching any file, for a dir that src/omega_path_check.h refuses.
+ * The root is retained as a descriptor and child operations refuse symlink
+ * components, non-regular files, foreign ownership and hard links. */
 int rx_gen_open(const char *dir, RxGenStore **out);
 void rx_gen_close(RxGenStore *store);
 /* R15: process-wide bytes written and fsync calls made by every store.
