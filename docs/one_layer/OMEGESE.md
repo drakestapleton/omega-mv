@@ -1879,8 +1879,10 @@ words 166..177 stay error 9 in an object (their table lives in a runtime context
 the module linker does not set up), as do program-only host words (error 9,
 function-mode subset). A host word's transient stack (its save area and, for a
 path, a private 4096-byte buffer) is charged to the function's stack record:
-the record is the deepest SP the function's own code reaches below its entry
-(frame, save areas, host buffers; callees excluded), and a call's record is the
+the record is stkbytes (the whole frame) plus the largest transient push, an
+upper bound on the deepest SP the function's own code reaches below its entry
+(callees excluded; equal to it when no transient push precedes a frame
+allocation, as in the gate's one-statement bodies), and a call's record is the
 frame plus everything pushed at that call. omc counts every SP push and pop it
 emits; an object function whose count would go below zero or does not return to
 zero at its end is refused (error 9, site 628) instead of being under-reported.

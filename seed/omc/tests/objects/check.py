@@ -94,8 +94,8 @@ for source in [scalar,array,stack,scalar.replace("om2","om2 release")]:
     assert obj==compile_source("object\n"+source), "nondeterministic object"
     count+=1
 fs,cs,h=parse(compile_source("object\n"+stack))
-# A function's record is the deepest SP its own code reaches (frame, save areas, host buffers),
-# callees excluded; here that is the call: frame 48 plus the call's save area.
+# A function's record is stkbytes plus its largest transient push (save areas, host buffers), an
+# upper bound on the deepest SP its own code reaches, callees excluded; here: frame 48 plus the call's save area.
 assert cs[0][3]>48 and fs[1]["stack"]==cs[0][3] and fs[0]["stack"]==0, "object-stack-contract"
 imports="""object
 om2

@@ -84,7 +84,9 @@ OBJDUMP = shutil.which("aarch64-linux-gnu-objdump") or shutil.which("objdump")
 
 
 def sp_walk(code):
-    """Independent decoder (GNU objdump): the deepest SP and the final SP along the emitted words."""
+    """Independent decoder (GNU objdump): the deepest SP and the final SP along the emitted words, read in
+    order. Valid for the straight-line one-statement bodies below (no early ret, no frame allocation after
+    a push), where the record must equal it; in general the record is an upper bound."""
     (OUT / "code.bin").write_bytes(code)
     r = subprocess.run([OBJDUMP, "-D", "-b", "binary", "-m", "aarch64", str(OUT / "code.bin")],
                        capture_output=True, text=True)
