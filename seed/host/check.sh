@@ -230,4 +230,5 @@ sh seed/text/tests/gate.sh
 # Diagnostic-v2 oracle and explicit uncovered-site inventory.
 python3 seed/omc/diagnostics-v2.py seed/out/omc
 python3 seed/modules/tests/check.py seed/out/omc "$(mktemp -d build/seed/modules.XXXXXX)"
+sh seed/modules/fr3-gate.sh
 printf 'PASS native-host qualification; seeded build, C tools are comparison oracles only\n'
