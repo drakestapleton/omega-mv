@@ -203,11 +203,6 @@ s = add s i
 end
 ret s
 end'
-ir_refuse float_const 9 'ir
-const H f64 0.1
-fn f to f64
-ret H
-end'
 ir_refuse call_self 3 'ir
 fn f to uint
 ret f
@@ -434,11 +429,7 @@ if eq a 0
 ret 1
 end
 end'
-ir_refuse float_param 9 'ir
-fn f a f64 to f64
-ret a
-end'
-ir_refuse float_ret 9 'ir
+ir_refuse float_ret 7 'ir
 fn f a uint to f64
 ret a
 end'
@@ -779,5 +770,5 @@ const N f64 1
 fn f to f64
 ret N
 end'
-echo 'SCALAR_IR_CHECKPOINT 10/10 + 30 refusals + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; floats: 13 wasm=native bools (f_add 1, f_nan_ne 1, f_nan_eq 0, f_negzero 1, f_inf 1, f_neginf 1, f_neg 1, f_round 1, f_cast_int 1, f_trunc 1, f_promote 1, f_demote 1, f_call 1), const fold, bits 1.0/0.1/-0.0; float refusals f_mix 7, f_bool 9, f_rem 7, f_bare 11, f_intlit 7, f_for 7, f_sqrt 3, f_fma 3, f_suffix 7, f_shl 7, f_not 7, f_const_int 16; arrays and structs still refused'
+echo 'SCALAR_IR_CHECKPOINT 10/10 + 28 refusals + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; floats: 13 wasm=native bools (f_add 1, f_nan_ne 1, f_nan_eq 0, f_negzero 1, f_inf 1, f_neginf 1, f_neg 1, f_round 1, f_cast_int 1, f_trunc 1, f_promote 1, f_demote 1, f_call 1), const fold, bits 1.0/0.1/-0.0; float refusals f_mix 7, f_bool 9, f_rem 7, f_bare 11, f_intlit 7, f_for 7, f_sqrt 3, f_fma 3, f_suffix 7, f_shl 7, f_not 7, f_const_int 16; arrays and structs still refused'
 echo 'RC=0'
