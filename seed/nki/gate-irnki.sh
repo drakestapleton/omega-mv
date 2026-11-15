@@ -19,9 +19,12 @@ fail() { say "FAIL $*"; exit 1; }
 notrun() { say "NOT_RUN $*"; exit 3; }
 [ "$(uname -m)" = aarch64 ] || notrun 'requires AArch64 Linux (seed/out/omc emits AArch64)'
 OMC=${OMC:-seed/out/omc}
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
+. seed/omc-pin.sh
+omc_pin_load || fail 'seed/out/omc.sha256 has no compiler pin'
+pin=$OMC_PIN
 [ -f "$OMC" ] || fail "compiler $OMC missing"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
+have=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$have" = "$pin" ] || fail "compiler sha256 $have disagrees with seed/out/omc.sha256 pin $pin"
 D=${NKI_ORACLE_DIR:-}
 [ -n "$D" ] || notrun 'NKI_ORACLE_DIR unset; prepare it with seed/nki/setup-oracle.sh DIR'
 for f in qemu/usr/bin/qemu-x86_64 python/bin/python3.12 sysroot/usr/lib/x86_64-linux-gnu/libc.so.6 site/nki/__init__.py; do

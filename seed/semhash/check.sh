@@ -9,20 +9,28 @@
 #   6 rename           a fn-name-only rename reports RENAMED with an equal fn hash
 #   7 dups             dups.sh over seed/semhash/dups matches dups.exp; a hash changed past the
 #                      16-digit key must not group (full-hash compare)
-# Prints SEMHASH PASS cases=N controls=M (exit 0), SEMHASH FAIL ... (exit 1), or
-# SEMHASH NOT_RUN ... (exit 3) when the pinned compiler is missing or differs.
+# Prints SEMHASH PASS cases=N controls=M (exit 0), SEMHASH FAIL ... (exit 1, including a
+# compiler that disagrees with seed/out/omc.sha256), or SEMHASH NOT_RUN ... (exit 3)
+# when the compiler or the sidecar pin is missing. SEMHASH_OMC_PIN overrides the sidecar.
 # Run from anywhere; paths are relative to the repository root.
 set -u
 cd "$(dirname "$0")/../.." || exit 3
 OMC=${OMC:-seed/out/omc}
-PIN=${SEMHASH_OMC_PIN:-26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991}
 W=${SEMHASH_OUT:-build/semhash-check}
 C=seed/semhash/cases
-
 notrun() { printf 'SEMHASH NOT_RUN %s\n' "$1"; exit 3; }
+. seed/omc-pin.sh
+if [ -n "${SEMHASH_OMC_PIN:-}" ]; then
+    OMC_PIN=$SEMHASH_OMC_PIN
+else
+    omc_pin_load || notrun 'no compiler pin in seed/out/omc.sha256'
+fi
 [ -x "$OMC" ] || notrun "no compiler at $OMC"
 GOT=$(sha256sum "$OMC" | cut -d ' ' -f 1)
-[ "$GOT" = "$PIN" ] || notrun "compiler $OMC sha256 $GOT differs from pin $PIN"
+if [ "$GOT" != "$OMC_PIN" ]; then
+    printf 'SEMHASH FAIL compiler %s sha256 %s disagrees with seed/out/omc.sha256 pin %s\n' "$OMC" "$GOT" "$OMC_PIN"
+    exit 1
+fi
 printf 'omc %s sha256 %s\n' "$OMC" "$GOT"
 
 rm -rf "$W"

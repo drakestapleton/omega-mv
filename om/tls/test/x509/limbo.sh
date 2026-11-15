@@ -10,13 +10,17 @@ omc=${1:?usage: limbo.sh OMC [LIMBO_DIR]}
 here=$(cd "$(dirname "$0")" && pwd)
 tls=$(cd "$here/../.." && pwd)
 root=$(cd "$tls/../.." && pwd)
-pin=$(sed -n 's/^OMC_PIN=//p' "$root/om/units.sh")
+. "$root/seed/omc-pin.sh"
+OMC_PIN_ROOT=$root
+omc_pin_load || { echo "LIMBO FAIL omc pin: seed/out/omc.sha256 has no compiler pin"; exit 1; }
+pin=$OMC_PIN
 limbo_pin=1080e565f26e544bbe9cf99953be8a57c08e7e20
 out="$root/build/tls/x509/limbo"
 src=${2:-$root/build/tls/x509/limbo-src}
 run() { nice -n 19 ionice -c3 "$@"; }
 
-[ "$(sha256sum < "$omc" | cut -c1-64)" = "$pin" ] || { echo "LIMBO FAIL omc is not the pinned compiler"; exit 1; }
+have=$(sha256sum < "$omc" | cut -c1-64)
+[ "$have" = "$pin" ] || { echo "LIMBO FAIL omc sha256 $have disagrees with seed/out/omc.sha256 pin $pin"; exit 1; }
 [ -d "$src/.git" ] || git clone -q https://github.com/C2SP/x509-limbo "$src"
 head=$(git -C "$src" rev-parse HEAD)
 case $limbo_pin in "$head"*) ;; *)

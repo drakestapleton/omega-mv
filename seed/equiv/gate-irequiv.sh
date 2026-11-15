@@ -6,8 +6,11 @@ set -eu
 cd "$(dirname "$0")/../.."
 [ "$(uname -m)" = aarch64 ] || { echo "SKIP gate-irequiv: needs aarch64 (omc emits AArch64)"; exit 0; }
 OMC=seed/out/omc
-PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
-[ "$(sha256sum "$OMC" | cut -d' ' -f1)" = "$PIN" ] || { echo "FAIL pin: $OMC"; exit 1; }
+. seed/omc-pin.sh
+omc_pin_load || { echo "FAIL pin: seed/out/omc.sha256 has no compiler pin"; exit 1; }
+PIN=$OMC_PIN
+have=$(sha256sum "$OMC" | cut -d' ' -f1)
+[ "$have" = "$PIN" ] || { echo "FAIL pin: compiler sha256 $have disagrees with seed/out/omc.sha256 pin $PIN"; exit 1; }
 B=build/seed/equiv
 mkdir -p "$B"
 fails=0

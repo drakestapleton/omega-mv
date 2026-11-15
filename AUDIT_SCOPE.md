@@ -22,9 +22,10 @@ current security review.
 
 1. The seed chain: `seed/rung0/seed0.hex`, `seed/rung0/load0.sh` (the one outside step, POSIX
    `printf`), rungs 1 to 4, `seed/omc/omc.om`, `seed/omega-from-seed.sh` (rebuilds omc twice to
-   identical bytes), and the committed `seed/out/omc` (sha256
-   `26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`,
-   from `seed/omc/omc.om` `9977db63aae76ee41c35a7a5715d7dc40427f3c7711597f31e5b60697ef8e7ef`; omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main 46520074). The earlier audit pins
+   identical bytes), and the committed `seed/out/omc` (its sha256 is the first field of
+   `seed/out/omc.sha256`). The previous pin
+   `26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991`
+   (from `seed/omc/omc.om` `9977db63aae76ee41c35a7a5715d7dc40427f3c7711597f31e5b60697ef8e7ef`; omc KFD GET_PROCESS_APERTURES_NEW owned-mapping span, branch `amdserve/kfd-aperture` on Radicle main 46520074). The earlier audit pins
    `46dedc0a55c3e6187f7c7cea896c9691761f961210c906337a4cdbac7baa32f1` (omc KFD CREATE_QUEUE queue object, amd_queue_v2_t extent; effects rows for the KFD words, branch `amdserve/kfd-queueobj`, not landed),
    `bef974c1414dbac5b8f636d872a5815fb04594cda7bb213e9c0e0a1ff6f31c5b` (omc KFD CREATE_QUEUE compiler-owned queue-object binding, branch `amdserve/kfd-queueobj`, not landed),
    `5fe037d9653e72dfc57a346312ec9284f388a6e002adce6fdee1305fe70c5bdc` (omc KFD words rebased with current diagnostic and module compiler work, branch `amdserve/kfd-word-r2`, not landed separately (merged into this line)),

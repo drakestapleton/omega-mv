@@ -14,12 +14,14 @@
 # directory size (filesystem-dependent: ext4 4096, tmpfs 40..3800), so any TMPDIR works; the stream
 # directory is created 775 whatever the caller's umask.
 set -eu
-OMC_PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
 NATIVE_PIN=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
 P=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$P/../../.." && pwd)
 OM=$P/../evidence.om
 [ -n "${OMEGA_OMC:-}" ] || { echo "EVIDENCE-PARITY NOT_RUN: set OMEGA_OMC"; exit 3; }
-[ "$(sha256sum < "$OMEGA_OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "EVIDENCE-PARITY NOT_RUN: omc is not the pinned compiler"; exit 3; }
+. "$ROOT/seed/omc-pin.sh"
+OMC_PIN_ROOT=$ROOT
+omc_pin_match "$OMEGA_OMC" EVIDENCE-PARITY || exit $?
 command -v python3 > /dev/null || { echo "EVIDENCE-PARITY NOT_RUN: python3 missing"; exit 3; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 python3 "$P/corpus.py" "$T/corp" > "$T/counts"
