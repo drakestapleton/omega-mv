@@ -108,6 +108,16 @@ run_bad dup 10
 run_bad ir 9
 run_bad index 21
 
+# Raw image. A value round trip stays green when the byte swap is missing on
+# both the store and the load. These bytes do not. Scratch is the gate's own
+# directory, removed with the rest of the build tree.
+set +e
+timeout 180 python3 "$D/rawbyte.py" "$S" "$B/raw"
+rrc=$?
+set -e
+if [ "$rrc" = 0 ]; then say "PASS raw bytes"
+else bad "raw bytes exit $rrc"; fi
+
 if [ "$fail" != 0 ]; then
   printf 'RC=1\n'
   exit 1
