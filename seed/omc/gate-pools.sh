@@ -32,8 +32,12 @@
 #     cases, the same unit with a sized global compiles (the pool is what is refused).
 # 11. Byte identity: `git grep -nw enlarge` names no tracked unit outside tests/pools except in `note`
 #     lines (comments, listed: omc.om documents its own keyword); every other tracked
-#     .om gives the same status, stdout and stderr under OMC and CTRL. POOLS_SKIP_EQUIV=1 skips the
-#     comparison (NOT_RUN); POOLS_EQUIV_MAX=N compares only the first N files.
+#     .om gives the same status, stdout and stderr under OMC and CTRL, except the units
+#     seed/omc/cabi/introduced.txt names. Those were introduced by FR-7. The historical
+#     compiler has no cabi word, so it must refuse each of them (error 16) and the compiler
+#     under test must not. An ordinary program is the control: the historical compiler
+#     accepts it, which is why a cabi unit rewritten that way goes red. POOLS_SKIP_EQUIV=1
+#     skips the comparison (NOT_RUN); POOLS_EQUIV_MAX=N compares only the first N files.
 #  S. Server (design 11, srv): 2000 requests of growing and shrinking size from one pool; enlarge calls
 #     and growth syscalls (strace) equal the high-water marks of the model; VmRSS at the end is at most
 #     the high-water VmRSS + 1024 kB. Control: the leak mode (stdin L) rises past it.
@@ -321,10 +325,37 @@ if on 11; then
   done < $B/allowed
   if [ -n "$(comm -23 $B/users $B/allowed)" ]; then bad "11 scan: units use enlarge outside $T and are not listed in $T/enlarge-users.txt: $(comm -23 $B/users $B/allowed | tr '\n' ' ')"; fi
   say "PASS 11 scan: git grep -nw enlarge outside $T: $(wc -l < $B/scan) lines; units using the word: $(tr '\n' ' ' < $B/users)(each listed in enlarge-users.txt); the rest are notes"
+  # FR-7 units. The directory is declared in seed/omc/cabi/introduced.txt. The file list is
+  # whatever is tracked there, not a second hand-written list. The historical compiler must
+  # refuse each one, and the compiler under test must understand cabi.
+  intro=seed/omc/cabi/introduced.txt
+  [ -f "$intro" ] || bad "11 FR-7: $intro is missing"
+  dir=$(grep -v '^#' "$intro" | head -n 1)
+  [ -n "$dir" ] || bad "11 FR-7: $intro names no directory"
+  git ls-files "$dir/*.om" > $B/fr7
+  [ -s $B/fr7 ] || bad "11 FR-7: no tracked units under $dir"
+  while read -r f; do
+    first=$(awk 'NF && $1 != "note" { print; exit }' "$f")
+    [ "$first" = "cabi" ] || bad "11 FR-7: $f does not open with cabi"
+    set +e
+    timeout 60 "$CTRL" < "$f" > $B/eb 2> $B/ebe; b=$?
+    timeout 60 "$S" < "$f" > $B/ea 2> $B/eae; a=$?
+    set -e
+    [ "$b" = 16 ] && grep -q 'error 16$' $B/ebe || bad "11 FR-7: historical compiler did not refuse $f (status $b)"
+    [ "$a" != 16 ] || bad "11 FR-7: compiler under test still reports an unknown word for $f"
+  done < $B/fr7
+  printf 'fn main to int\nret 0\nend\n' > $B/fr7mut.om
+  set +e
+  timeout 60 "$CTRL" < $B/fr7mut.om > $B/eb 2> $B/ebe; b=$?
+  set -e
+  if [ "$b" = 16 ] && grep -q 'error 16$' $B/ebe; then
+    bad "11 FR-7 mutant: the historical compiler refused an ordinary program, so rewriting a cabi unit that way would not go red"
+  fi
+  say "PASS 11 FR-7: $(wc -l < $B/fr7) units introduced by FR-7, historical compiler refuses each (error 16); an ordinary program is not refused"
   if [ "${POOLS_SKIP_EQUIV:-0}" = 1 ]; then
     say "NOT_RUN 11 byte identity (POOLS_SKIP_EQUIV=1)"
   else
-    git ls-files '*.om' | grep -v "^$T/" | grep -vxF -f $B/allowed > $B/files
+    git ls-files '*.om' | grep -v "^$T/" | grep -vxF -f $B/allowed | grep -vxF -f $B/fr7 > $B/files
     [ -z "${POOLS_EQUIV_MAX:-}" ] || { head -n "$POOLS_EQUIV_MAX" $B/files > $B/f2; mv $B/f2 $B/files; }
     n=0; d=0
     while read -r f; do
