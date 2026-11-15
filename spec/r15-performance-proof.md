@@ -422,6 +422,12 @@ coverage, rerun the correctness gates, and repeat the entire qualification.
   window, crumb-derived interval, counter snapshot, telemetry sample), each
   with run id, configuration, round, trial, and monotonic timestamps; plus
   `machine.json` (§13) and `SHA256SUMS`.
+- Build provenance: `build-provenance.json` names the exact omega, physics and
+  aienos archive commits and digests, compiler and make digests and versions,
+  build command/log digest, and source-to-binary hashes. `final-state.json`
+  records final HEAD/tree state and executable hashes after reduction.
+  `PROVENANCE_SHA256SUMS` covers both records, the build log and every staged
+  executable. Section 22 defines the required isolated build and checks.
 - Reducer: `tools/r15_reduce.c` (C, no Python), deterministic, reads only the
   raw directory, recomputes every summary number and every gate, and writes
   `summary.json`. The receipt embeds the reducer source SHA-256 and the raw
@@ -430,7 +436,8 @@ coverage, rerun the correctness gates, and repeat the entire qualification.
   `AIEN_RX_R15_REACTION_PERFORMANCE_V1`, named by the SHA-256 of its own
   bytes: candidate_commit, run_commit, candidate_bound, tree_dirty,
   silicon_observed, hardware identity, aienos and physics commits, benchmark
-  binary SHA-256s, raw digest, reducer digest, all 17 metrics, legacy status
+  binary SHA-256s, source archives, toolchain/build provenance, final state,
+  raw digest, reducer digest, all 17 metrics, legacy status
   (NOT DIRECTLY COMPARABLE, §2), resident and SEQ results, paired comparisons,
   CIs, thresholds and outcomes, correctness reruns, regressions, `not_claimed`.
 - No headline number is edited by hand. The receipt's metric values are
@@ -441,8 +448,9 @@ coverage, rerun the correctness gates, and repeat the entire qualification.
 Host name, `/etc/machine-id` SHA-256, kernel release, CPU MIDR per core and
 core-class map, governor and frequencies, memory size, GPU name and PCI id,
 driver version, Secure Boot and lockdown state, `perf_event_paranoid` before
-and during, thermal readings, omega/aienos/physics commits, compiler version,
-benchmark binary SHA-256.
+and during, thermal readings, omega/aienos/physics commits, compiler version
+and digest, build command, source-archive SHA-256s, benchmark/reducer SHA-256s,
+and final HEAD/tree state.
 
 ## 14. Correctness reruns required before a PASS
 
@@ -820,3 +828,43 @@ path's intended advantage (one scan covering many completions). A
 multi-claim-in-flight L2 phase (N > 1, e.g. 16, Option B) is deferred to a
 later gate and is listed in the receipt's limits. Empty-poll spin cost is
 a known host-side cost of both paths and is not claimed to be small.
+
+## 22. Amendment A2: candidate-to-executable provenance (2026-11-15)
+
+This strengthens candidate binding after qualification data existed. Earlier
+receipts remain historical records, but their one-time binary snapshots do not
+satisfy this amendment and are not a current candidate-bound qualification. A
+new PASS requires a complete R15 run under these controls; no prior result is
+relabelled. The workloads, metrics, G1–G16 thresholds and interleaving are
+unchanged.
+
+**Why.** The former runner hashed pre-existing ignored files under `build/`
+once, then resolved those mutable pathnames for every trial and reduction. It
+did not establish which candidate sources produced them or check the files and
+tree after use. A stale artifact, concurrent writer or self-replacement could
+therefore make a receipt attribute measurements to bytes not built from its
+named clean commit.
+
+**Required build boundary.** `tools/r15_qualify.sh` reads the omega candidate
+and dependency locks from Git objects with replace refs and grafts disabled,
+re-hashes and checks their object closures, and creates fresh archives of the
+candidate, the pinned physics commit and the pinned aienos capability source.
+It extracts omega and physics into a private directory, rebuilds
+`r15-perf-<mode>` there with repository flags and the pinned aienos source, and
+does not consume a pre-existing `build/` artifact. Compiler-affecting
+environment overrides are removed. The archive, toolchain, command, log and
+resulting binary digests are recorded in `build-provenance.json`.
+
+**Required execution boundary.** The two benchmark binaries and reducer are
+copied into the new run directory, made read-only, and executed only there.
+The runner compares each executable with its build digest immediately before
+and after every use and aborts on a mismatch. After reduction it checks all
+three again, records final HEAD and tracked-tree state, and seals those files
+and records in `PROVENANCE_SHA256SUMS`.
+
+**Receipt rule.** `candidate_bound` is true only when the initial candidate is
+clean and matches the requested commit, both checksum manifests verify, the
+build/final schemas and source-to-binary hashes agree, dependency commits equal
+the candidate locks, final HEAD is unchanged, the final tracked tree is clean,
+and every executable retained its staged digest. Missing provenance is a FAIL,
+not an inference from the old initial snapshot.

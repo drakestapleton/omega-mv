@@ -280,16 +280,18 @@ analysis was done first.
     rig on X925.
   - `l2 <RES1|SEQ>`: 256 closed-loop claims through `living.blackwell.add`;
     chip `%globaltimer` pick/done from the heartbeat block.
-  - Four binaries: `make r15-perf-host` / `make r15-perf-silicon` (production
-    and `_nodigest`) plus `build/r15_reduce`.
+  - Four build targets: `r15-perf-host` / `r15-perf-silicon` (production and
+    `_nodigest`) plus `r15_reduce`. Qualification builds them from verified
+    candidate/dependency archives and stages digest-bound run copies; ignored
+    files under `build/` are never qualification inputs.
 - `tools/r15_reduce.c`: verifies every file against SHA256SUMS, recomputes
   metrics 1-17 and G1-G16, writes `summary.json`. Seed 0x15, 10,000
   resamples, percentile CI; missing data = FAIL.
 - `tools/r15_qualify.sh [--detach] <host|silicon> [rounds] [l1] [l2]`: balanced
   Latin square, L1, L2, machine.json, paranoid 4 -> 1 -> 4, SHA256SUMS, reducer.
   `--detach` = setsid nohup; progress in plain words in `progress.log`.
-  Set `AIENOS_R7_DIR`/`PHYSICS_DIR` so the recorded commits are right, and
-  `R15_OUT_BASE` for dry runs outside `evidence/`.
+  Set `AIENOS_LOCK_REPO`/`PHYSICS_DIR` to repositories holding the pinned
+  commits, and `R15_OUT_BASE` for dry runs outside `evidence/`.
 
 Still blocking a real qualification: (1) the goal-margin decision above (R14
 silicon and G1); (2) §9: LM Studio and Ollama were resident at 13:45 and must
