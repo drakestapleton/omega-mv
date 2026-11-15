@@ -12,6 +12,7 @@ ROCr or HIP in the production path.
 | `kfd/` | KFD ioctl requests, AQL dispatch packets, kernel arguments, records and the queue ring, with a shared CLI (`kfd/cli.om`); `kfd/requests.tsv` is the request table they read. |
 | `kfd/launch/` | The direct-KFD launcher (`omega-launch`); its x86-64 build ran Qwen3.8-27B-FP8 on an MI300X. |
 | `tests/amd-exec/*-probe.om` | Probe programs for the executor (semantics, rows, FMA, transcendental, rope frequencies). |
+| `bench/barrier/` | Host bench for a persistent grid barrier against AQL dispatch. No packet is submitted. `bench/barrier/README.md`. |
 | `gate.om`, `card.tsv` | The gate and the receipt-recorded bytes it checks. |
 | `import/` | How this came from CUDApp. |
 
