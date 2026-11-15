@@ -21,6 +21,7 @@
 #                             memset and memmove) then output fapic (the same C API as apic, __builtin_trap()
 #                             on a nonzero status). Its declarations are those of omega_api_decl.h.
 # A unit, compiler or profile that changes without regenerating these files fails --check.
+# sh seed/units/regen.sh does that rewrite from the sidecar compiler and this lock.
 # OMEGA_UNITS (the unit list, repo-relative or absolute) and OMEGA_UNITS_DEST (output directory, default src)
 # override the defaults; mk/om-encoder.mk uses them to build mutant encoders beside the real binding.
 set -eu
