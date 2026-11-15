@@ -68,7 +68,7 @@ The platform contract has its own number (`OMEGA_GPU_PLATFORM_ABI_MAJOR` 1, `OME
 **Device and platform.** Omega talks to the GPU through a small "platform" layer: a table of services (a clock, a lock,
 device-visible memory, a submission queue, a way to poll for completion). Today one platform exists, the Linux reference
 (`src/omega_gpu_platform_linux.c`), which uses NVIDIA's open kernel driver. The contract is written so a second backend
-(WSL2 on Windows, or AIENOS with no Linux driver) can fill the same table. A program normally never touches the platform:
+(WSL2 on Windows, or Aienux with no Linux driver) can fill the same table. A program normally never touches the platform:
 the first call that needs the GPU installs the Linux reference by itself. There is **one device, one channel per process**.
 There is no call to ask the device its name, SM count or memory size yet (section 8).
 
@@ -398,7 +398,7 @@ Each line is a gap named in `docs/runtime/ROADMAP.md` section 1 (on branch `runt
 - Async copy, streams, events, host callbacks (omega-mv#580 is building ordering on command lists).
 - Cached read-write buffers; unified memory.
 - Launches with more than the 32 argument words, or an asynchronous single launch.
-- A second real backend (WSL2 `/dev/dxg` is on branch `rig/gb20x`; native AIENOS is planned), so the platform contract has only been exercised by one.
+- A second real backend (WSL2 `/dev/dxg` is on branch `rig/gb20x`; native Aienux is planned), so the platform contract has only been exercised by one.
 - A runtime function that reports the version of the linked library (the version is a compile-time macro only).
 
 ## 9. EXPERIMENTAL entries

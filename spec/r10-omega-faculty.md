@@ -64,7 +64,7 @@ that regime exists.
   reference by 5% or more. If none does, the reference is kept and that is
   recorded too.
 - **Authority:** production and Omega are separate subjects under the native
-  AIENOS authority. Omega can read `demand` but cannot write any production
+  Aienux authority. Omega can read `demand` but cannot write any production
   object. A revoked Omega capability blocks that reaction, and production
   carries on.
 
@@ -112,7 +112,7 @@ that regime exists.
   record. Choosing a realization per core class is not implemented.
 - The realization store is process memory. It does not survive a restart and
   does not go through the R9 generation barrier.
-- The sandbox is a forked Linux process, not an AIENOS-enforced sandbox.
+- The sandbox is a forked Linux process, not an Aienux-enforced sandbox.
 - The production reaction is labelled `RX_FACULTY_EXTERNAL`. It is not AIEN
   (R11).
 - The M12 emitters return without writing `y` when N = 0. The reference

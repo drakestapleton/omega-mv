@@ -16,7 +16,7 @@ migration is claimed.
 AIEN is the organism (the resident World, its faculties, its Cortex) and the
 cognitive faculty inside it (`src/runtime/rx_aien.*`, "AIEN PROPOSES"). ALLEN
 is the durable subject the organism sustains: the same agent identity, the
-same standing intents and the same memory lineage, resolved from the AIENOS
+same standing intents and the same memory lineage, resolved from the Aienux
 Store after any restart. ALLEN is state. It has no cognition, no authority and
 no loop.
 
@@ -48,7 +48,7 @@ timer, no `max_turns`. Gate G5 checks the symbol tables of `allen_bind.o` and
 
 Inspection and qualification only: not a chat, not an agent runtime, not a
 planner, not a daemon, not a Visor, not an operator shell. Verbs: `make`
-(test fixture writer; in production the object is committed by the AIENOS
+(test fixture writer; in production the object is committed by the Aienux
 kernel), `inspect`, `digest`, `lineage`, `seed-journal`, `publish` (the
 R11 part-A rig: capability root, World, resident AIEN faculty; checks the
 memory binding, publishes every ACTIVE intent, waits for quiescence, prints

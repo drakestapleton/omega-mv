@@ -154,7 +154,7 @@ Evidence scope is reported exactly as the receipt states it (`host`, `qemu`,
 `tests/visor/qualification/` + `tools/qualify_visor.sh` (shell glue only; every
 assertion lives in C tests and `.omega-session` scripts). Run it on a committed
 tree: `tools/qualify_visor.sh [--skip-regression] [--no-asan] [out-dir]`. It
-rebuilds the AIENOS capability library from the commit in `aienos.lock` (as CI
+rebuilds the Aienux capability library from the commit in `aienos.lock` (as CI
 and `tools/effect_cap64_receipt.sh` do) and records its identity (commit, source
 tree, lib sha256) in the receipt. Receipts live in `evidence/VISOR/` as
 content-addressed JSON, never overwritten; the tool writes only a new receipt and

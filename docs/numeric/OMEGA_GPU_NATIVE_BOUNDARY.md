@@ -116,12 +116,12 @@ files in section 3.
 
 | Responsibility | Linux path today | Native owner | Cut | Status |
 |---|---|---|---|---|
-| Device discovery, bounded ownership (MMIO/DMA/IRQ capabilities) | RM device open (`nvrm_open`, `m16_native_open`) | AIENOS PCI/SMMU layer + `OmegaGpuPlatform` MMIO/DMA services | B | NOT_RUN |
-| Device and firmware initialization (GSP, falcons) | RM boot inside the kernel module | AIENOS GB10 firmware lifecycle (P08) | B/P08 | NOT_RUN |
+| Device discovery, bounded ownership (MMIO/DMA/IRQ capabilities) | RM device open (`nvrm_open`, `m16_native_open`) | Aienux PCI/SMMU layer + `OmegaGpuPlatform` MMIO/DMA services | B | NOT_RUN |
+| Device and firmware initialization (GSP, falcons) | RM boot inside the kernel module | Aienux GB10 firmware lifecycle (P08) | B/P08 | NOT_RUN |
 | Context / address space creation | RM client + VA space objects (`nvrm_mthd`) | native context object behind `OmegaGpuDeviceHandle` | B | NOT_RUN |
 | Memory allocation with cache attributes | `nvrm_alloc`, `nvrm_alloc_gpu_uncached` | `OmegaGpuPlatform.dma_alloc` with `OmegaGpuBufferDesc` (kind, rights, cache policy) | B | contract DONE, device NOT_RUN |
-| GPU page tables / mapping | UVM + RM map | AIENOS page tables, GPU VA through `OmegaGpuVa` | B | NOT_RUN |
-| Bus addresses / SMMU translation | kernel DMA API inside RM | AIENOS SMMU, `OmegaGpuBusAddr` (no raw physical address type exists) | B | NOT_RUN |
+| GPU page tables / mapping | UVM + RM map | Aienux page tables, GPU VA through `OmegaGpuVa` | B | NOT_RUN |
+| Bus addresses / SMMU translation | kernel DMA API inside RM | Aienux SMMU, `OmegaGpuBusAddr` (no raw physical address type exists) | B | NOT_RUN |
 | Channel / queue creation (GPFIFO, USERD) | `m16_native_create_channel`, `nvrm_channel` | native queue behind `OmegaGpuQueueHandle`, ring is a `BUF_QUEUE` buffer | B/C | NOT_RUN |
 | Submit token / doorbell | `m16_native_submit_methods`, `nvrm_enqueue`, `nvrm_ring` | `OmegaGpuPlatform.mmio_write32` on the doorbell region | C | NOT_RUN |
 | Completion (marker words, semaphores) | `m16_native_wait_marker*`, host polling | `OmegaGpuPlatform.poll_word` (polling, ABI 1.1) on a HOST_POLLED, GPU-uncached buffer | C | contract and session DONE (cut C), device NOT_RUN |
@@ -258,7 +258,7 @@ an RM method table.
   (`omega_gpu_attention_api.c`, `omega_gpu_elementwise_api.c`) still malloc
   their code and move with the session in cut C (the attention API moved in
   cut C session part; the elementwise API has not).
-- B (needs an attended window, native v1 gate order N1 then N4): AIENOS-side
+- B (needs an attended window, native v1 gate order N1 then N4): Aienux-side
   discovery and bounded device ownership through the platform services; a
   discovery-only run makes zero configuration writes; SMMU/DMA resolved;
   polling does not claim IRQ. Implement aienos#285 before any domain-1

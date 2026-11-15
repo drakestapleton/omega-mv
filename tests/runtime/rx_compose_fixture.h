@@ -18,7 +18,7 @@
  * rx_compose_fixture.h -- shared setup for the COMPOSITION-2 tests and gate:
  * a canonical machine, a Capability Graph with two digest-pinned local
  * Skills for one operation, the contract the AEGIS verifier enforces, and
- * open/close of a composition on a fresh AIENOS authority.
+ * open/close of a composition on a fresh Aienux authority.
  */
 #ifndef RX_COMPOSE_FIXTURE_H
 #define RX_COMPOSE_FIXTURE_H
@@ -147,7 +147,7 @@ static __attribute__((unused)) int fx_init(Fx *f) {
 
 static __attribute__((unused)) void fx_free(Fx *f) { cq_catalog_free(&f->cat); }
 
-/* Open on an authority the caller already runs (the living system's AIENOS
+/* Open on an authority the caller already runs (the living system's Aienux
  * admin and view). fx_close then leaves that authority running. */
 static __attribute__((unused)) int fx_open_on(Fx *f, RxCompose *c, const char *dir,
                                               uint32_t n_workers, AienosCapAdmin *admin,
