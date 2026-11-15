@@ -76,6 +76,65 @@ sed -i 's/,$/}/' "$OUT/reruns.json"
 check "all gates PASS but no reruns -> still FAIL" '[ $? = 1 ]'
 P=$("$HERE/tools/r15_receipt.sh" "$SYN" "$OUT/syn-out" ad8e1f2ea4e4906ed810c6bd696cc905b801d69a "$OUT/reruns.json")
 check "all gates PASS + reruns PASS -> PASS" '[ $? = 0 ] && grep -q "\"outcome\": \"PASS\"" "$P"'
+
+printf '{\n' > "$OUT/reruns-formatted.json"
+first=1
+for k in R15_SEQ_parity R14_silicon R14_host R13_silicon R13_host R12_silicon R12_host R11 R10 R9 R8 R7 R3; do
+    [ $first = 1 ] || printf ',\n' >> "$OUT/reruns-formatted.json"
+    first=0
+    printf '  "%s" : "PASS"' "$k" >> "$OUT/reruns-formatted.json"
+done
+printf '\n}\n' >> "$OUT/reruns-formatted.json"
+F=$("$HERE/tools/r15_receipt.sh" "$SYN" "$OUT/syn-out" ad8e1f2ea4e4906ed810c6bd696cc905b801d69a "$OUT/reruns-formatted.json")
+check "reordered whitespace-formatted reruns -> PASS" '[ $? = 0 ] && grep -q "\"outcome\": \"PASS\"" "$F"'
+
+# The rerun input is a security boundary: only the exact root object is
+# accepted. The structural fixtures retain enough PASS substrings for the old
+# grep loop to accept them; the value fixtures exercise the exact schema.
+bad_reruns() { # label file
+    label=$1; file=$2
+    Q=$("$HERE/tools/r15_receipt.sh" "$SYN" "$OUT/syn-out" ad8e1f2ea4e4906ed810c6bd696cc905b801d69a "$file")
+    qrc=$?
+    check "$label -> FAIL" '[ $qrc = 1 ] && grep -q "correctness reruns must be one exact root object" "$Q"'
+    check "$label -> untrusted JSON not embedded" 'grep -Fq "\"correctness_reruns\": {\"status\":\"invalid\"}" "$Q"'
+}
+
+printf '{"reported":' > "$OUT/reruns-nested.json"
+cat "$OUT/reruns.json" >> "$OUT/reruns-nested.json"
+printf '}' >> "$OUT/reruns-nested.json"
+bad_reruns "nested decoy PASS keys" "$OUT/reruns-nested.json"
+
+sed 's/}$/,"R3":"FAIL"}/' "$OUT/reruns.json" > "$OUT/reruns-duplicate.json"
+bad_reruns "duplicate conflicting key" "$OUT/reruns-duplicate.json"
+
+sed 's/}$/,"R\\u0033":"FAIL"}/' "$OUT/reruns.json" > "$OUT/reruns-escaped-duplicate.json"
+bad_reruns "escaped duplicate key" "$OUT/reruns-escaped-duplicate.json"
+
+sed 's/"R7":"PASS"/"R\\u0033":"FAIL"/' "$OUT/reruns.json" > "$OUT/reruns-escaped-duplicate-13.json"
+bad_reruns "decoded duplicate among thirteen keys" "$OUT/reruns-escaped-duplicate-13.json"
+
+sed 's/}$/,"extra":"PASS"}/' "$OUT/reruns.json" > "$OUT/reruns-extra.json"
+bad_reruns "extra root key" "$OUT/reruns-extra.json"
+
+sed 's/"R3":"PASS"/"R3":true/' "$OUT/reruns.json" > "$OUT/reruns-nonstring.json"
+bad_reruns "non-string PASS value" "$OUT/reruns-nonstring.json"
+
+sed 's/"R3":"PASS"/"R3":"FAIL"/' "$OUT/reruns.json" > "$OUT/reruns-fail.json"
+bad_reruns "non-PASS string value" "$OUT/reruns-fail.json"
+
+sed 's/"R3":"PASS",//' "$OUT/reruns.json" > "$OUT/reruns-missing.json"
+bad_reruns "missing required key" "$OUT/reruns-missing.json"
+
+sed 's/}$//' "$OUT/reruns.json" > "$OUT/reruns-malformed.json"
+bad_reruns "malformed JSON" "$OUT/reruns-malformed.json"
+
+printf '%s{"injected":true}\n' "$(cat "$OUT/reruns.json")" > "$OUT/reruns-trailing.json"
+bad_reruns "trailing second value" "$OUT/reruns-trailing.json"
+
+sed 's/"R3":"PASS"/"R3":"\\u0050ASS"/' "$OUT/reruns.json" > "$OUT/reruns-pass-escape.json"
+E=$("$HERE/tools/r15_receipt.sh" "$SYN" "$OUT/syn-pass-escape" ad8e1f2ea4e4906ed810c6bd696cc905b801d69a "$OUT/reruns-pass-escape.json")
+check "decoded PASS escape -> PASS" '[ $? = 0 ] && grep -q "\"outcome\": \"PASS\"" "$E"'
+
 "$HERE/tools/r15_receipt.sh" "$SYN" "$OUT/syn-out" 0000000000000000000000000000000000000000 "$OUT/reruns.json" >/dev/null
 check "wrong candidate -> FAIL" '[ $? = 1 ]'
 check "nodigest flag checked from raw" 'grep -q "\"checked_from_raw\": true, \"nodigest_processes_digest_off\": 12, \"production_processes_digest_on\": 46" "$R"'
