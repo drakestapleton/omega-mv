@@ -31,7 +31,7 @@ This is conservative. A thread that only reads a global nobody writes is still r
 Two things this slice does not call a data race, and does not refuse:
 
 - Two threads doing host words that happen to touch the same file or the same device, without storing a shared global. That is a host-effect question, not this memory model.
-- A thread that traps for a reason other than its frame size, or is killed, before it publishes its result. `join` then waits. The programs in this slice that compile always publish, then exit.
+- A signal that kills a thread without entering the trap stub. `join` then waits. A bounds check or a divide by zero does enter the stub, and that path publishes.
 
 A thread function whose own frame does not fit is refused at compile time. The mapping is 65536 bytes and the stack floor is at 4096, so 61440 bytes are usable. The frame is the stack arrays plus the scratch a host word uses inside that function. `new uchar 70000` is past that and is error 9. `new uchar 60000` fits, publishes, and joins.
 
@@ -62,7 +62,9 @@ One mapping per thread, 65536 bytes, private and anonymous. The handle is its ad
 
 The stack grows down. If it reaches the floor, the existing stack check traps. That is the machine refusing, not a silent cut.
 
-`spawn` is `mmap` (222), then `clone` (220) with flags `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID` and no exit signal. The child sets its stack floor, calls the thread function, release-stores the result and the done flag, wakes one waiter (`futex` 98, `FUTEX_WAKE`), and `exit` (93). The parent returns the mapping address.
+`spawn` is `mmap` (222), then `clone` (220) with flags `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID` and no exit signal. The child sets its stack floor, writes the mapping address into `TPIDR_EL0`, calls the thread function, release-stores the result and the done flag, wakes one waiter (`futex` 98, `FUTEX_WAKE`), and `exit` (93). The parent returns the mapping address. `TPIDR_EL0` is per thread and this compiler does not otherwise use it. X18 through X26 stay available for pinned globals.
+
+A trap in the child reads `TPIDR_EL0`. The main thread leaves that register zero, so its trap is still `exit` of 100 plus the trap code. A thread stores that same failure at offset 0, release-stores the done flag, wakes `join`, and exits the thread. `join` returns the failure. Bounds is trap 3, so the result is 103. Divide by zero is trap 2, so the result is 102.
 
 `join` acquire-loads the done flag. If it is clear, it waits (`futex` 98, `FUTEX_WAIT`) and tries again. A wait that returns early is tried again. When the flag is set, `join` acquire-loads the result, `munmap` (215) the mapping, and returns the result.
 
@@ -72,4 +74,4 @@ The instructions are the AArch64 ones in ARM DDI 0487, issue M.d: `LDADDAL` is C
 
 ## The proof program
 
-`seed/omc/tests/fr6/sum.om` starts two threads. One adds 20, the other adds 22. After both joins, adding 0 returns the old value. That value is 42, and the process exits 42. If either add were lost, the value would be 20 or 22. `seed/omc/tests/fr6/stress.om` is eight threads adding 1, ten thousand times each. The old value is 80000. `seed/omc/tests/fr6/race.om` is a thread that `put`s a global. The compiler refuses it with error 9 (a word in a place that does not allow it). `seed/omc/tests/fr6/write/` is the same refusal for every word in the write set. `seed/omc/tests/fr6/stackbig.om` is the 70000-byte frame.
+`seed/omc/tests/fr6/sum.om` starts two threads. One adds 20, the other adds 22. After both joins, adding 0 returns the old value. That value is 42, and the process exits 42. If either add were lost, the value would be 20 or 22. `seed/omc/tests/fr6/stress.om` is eight threads adding 1, ten thousand times each. The old value is 80000. `seed/omc/tests/fr6/race.om` is a thread that `put`s a global. The compiler refuses it with error 9 (a word in a place that does not allow it). `seed/omc/tests/fr6/write/` is the same refusal for every word in the write set. `seed/omc/tests/fr6/stackbig.om` is the 70000-byte frame. `seed/omc/tests/fr6/bounds.om` reads one past an 8-byte array and `join` returns 103. `seed/omc/tests/fr6/div0.om` divides by zero and `join` returns 102. Both finish inside a few seconds. A compiler that drops the done-flag store in the trap path leaves `join` waiting, and the gate's timeout catches it.

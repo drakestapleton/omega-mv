@@ -130,6 +130,38 @@ else
     fail=1
 fi
 
+# a trap must publish and let join return. A timeout is a hang, and that fails.
+compile seed/omc/tests/fr6/bounds.om /tmp/fr6-bounds /tmp/fr6-bounds.err
+rc=$?
+if [ "$rc" != 0 ]; then
+    say "bounds did not compile: exit $rc"
+    cat /tmp/fr6-bounds.err
+    fail=1
+else
+    chmod +x /tmp/fr6-bounds
+    timeout 3 /tmp/fr6-bounds
+    ec=$?
+    say "bounds exit $ec"
+    if [ "$ec" != 42 ]; then
+        fail=1
+    fi
+fi
+compile seed/omc/tests/fr6/div0.om /tmp/fr6-div0 /tmp/fr6-div0.err
+rc=$?
+if [ "$rc" != 0 ]; then
+    say "div0 did not compile: exit $rc"
+    cat /tmp/fr6-div0.err
+    fail=1
+else
+    chmod +x /tmp/fr6-div0
+    timeout 3 /tmp/fr6-div0
+    ec=$?
+    say "div0 exit $ec"
+    if [ "$ec" != 42 ]; then
+        fail=1
+    fi
+fi
+
 # eight threads, 10000 adds each
 compile seed/omc/tests/fr6/stress.om /tmp/fr6-stress /tmp/fr6-stress.err
 rc=$?
@@ -173,6 +205,10 @@ vdone 1 rd 5
 if src.count(needle) != 1:
     raise SystemExit("haemit pattern missing")
 Path("/tmp/fr6-plain.om").write_text(src.replace(needle, repl, 1))
+flag = "note thflag\nemit 2292186625\n"
+if src.count(flag) != 1:
+    raise SystemExit("trap flag store missing")
+Path("/tmp/fr6-noflag.om").write_text(src.replace(flag, "", 1))
 PY
 py=$?
 if [ "$py" != 0 ]; then
@@ -238,6 +274,30 @@ print(n)
 ')
             say "plain stress ok $pok bad $pbad ldadd $nld"
             if [ "$pbad" = 0 ] || [ "$nld" != 0 ]; then
+                fail=1
+            fi
+        fi
+    fi
+    "$OMC" < /tmp/fr6-noflag.om > /tmp/fr6-noflag 2>/tmp/fr6-noflag.err
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        say "noflag compiler exit $rc"
+        cat /tmp/fr6-noflag.err
+        fail=1
+    else
+        chmod +x /tmp/fr6-noflag
+        /tmp/fr6-noflag < seed/omc/tests/fr6/bounds.om > /tmp/fr6-nbounds 2>/tmp/e
+        rc=$?
+        if [ "$rc" != 0 ]; then
+            say "noflag bounds did not compile: exit $rc"
+            cat /tmp/e
+            fail=1
+        else
+            chmod +x /tmp/fr6-nbounds
+            timeout 3 /tmp/fr6-nbounds
+            ec=$?
+            say "noflag bounds exit $ec"
+            if [ "$ec" != 124 ]; then
                 fail=1
             fi
         fi
