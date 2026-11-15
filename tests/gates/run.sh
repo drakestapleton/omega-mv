@@ -26,6 +26,8 @@
 # them from git status. Here the same commits are materialised under build/pins/ (build/ is
 # gitignored) from the sibling local clones ../physics and ../aienos, offline.
 set -euo pipefail
+# Reviewer 2026-11-15 (P1032): an inherited MAKEFLAGS (e.g. -i/-k) or MAKEFILES (e.g. a file with .IGNORE:) would let a failing gate pass; gates run with a clean make.
+unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEFILES
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 step="${1:?usage: tests/gates/run.sh <step>}"
@@ -450,6 +452,18 @@ case "$step" in
                       # physics-src at physics.lock; host, no device (the chip run is by hand)
     physics_pin; make test-atomf32-probe-host ;;
   gpu-decode-graph)   physics_pin; make test-gpu-decode-graph ;;
+  gpu-prefill-host)   # omega-mv#1032 (from #456): REQUIRED, first-party prefill host-only tests (3 probes); no device,
+                      # no model-shape cases, no OWN-30B build (those run in gpu-prefill-modelshapes)
+    physics_pin; set -o pipefail; mkdir -p "$OUT_DIR"
+    env -i PATH="$PATH" HOME="$HOME" OUT_DIR="$OUT_DIR" PHYSICS_DIR="$PHYSICS_DIR" make -f Makefile test-gpu-prefill-host-fp | tee "$OUT_DIR/prefill-host.log"
+    grep -qx 'test-gpu-prefill-host-fp: PASS (3 first-party prefill tests, host model, no device)' "$OUT_DIR/prefill-host.log"
+    ;;
+  gpu-prefill-modelshapes) # omega-mv#1032: OPTIONAL lane (requires: operator): model-shape prefill cases + the OWN-30B -Werror build
+    physics_pin; set -o pipefail; mkdir -p "$OUT_DIR"
+    env -i PATH="$PATH" HOME="$HOME" OUT_DIR="$OUT_DIR" PHYSICS_DIR="$PHYSICS_DIR" make -f Makefile test-gpu-prefill-modelshapes check-own30b-decode-profile | tee "$OUT_DIR/prefill-modelshapes.log"
+    grep -qx 'test-gpu-prefill-modelshapes: PASS (5 model-shape prefill tests, host model + warp simulator, no device)' "$OUT_DIR/prefill-modelshapes.log"
+    grep -qx 'check-own30b-decode-profile: PASS (compiles with -Werror)' "$OUT_DIR/prefill-modelshapes.log"
+    ;;
   # host-suites-3.yml
   numeric-lifecycle)  make $NOPHYS test-numeric-lifecycle ;;
   numeric-transc-digest)

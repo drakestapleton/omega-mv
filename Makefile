@@ -2875,6 +2875,38 @@ test-gpu-prefill-host: $(GPU_TC_PROBE_TEST) $(GPU_TCGEMM_TEST) $(GPU_PATTN_TEST)
 	./$(GPU_PFHOST_TEST) --host-only
 	./$(GPU_PFHOST_TEST) --sim
 	@echo "test-gpu-prefill-host: PASS (8 prefill tests, host model + warp simulator, no device)"
+# omega-mv#1032 (review REJECT 2026-11-06, Linear DRA-127): the REQUIRED prefill gate runs first-party cases only.
+# gpu_tcgemm_test and gpu_qgemm_test (Qwen3.8-27B widths), pattn/pfgemm/pfhost (Qwen3-30B-A3B shapes, Reviewer 2026-11-15),
+# and tools/own30b_decode_profile.c (the OWN-30B build) all stay out of it: six items, all in the
+# optional model-shape lane below (OMEGA-GPU-PREFILL-MODELSHAPES, requires: operator). The required lane is host-only.
+# Refuse a non-empty inherited MAKEFILES when these gates are the goal. A MAKEFILES file containing
+# `.IGNORE:` would otherwise turn a failing recipe into PASS (Reviewer 2026-11-15 v2). Parse-time
+# $(error) is not subject to `.IGNORE`. run.sh also unsets MAKEFILES before it invokes make.
+ifneq ($(filter test-gpu-prefill-host-fp test-gpu-prefill-modelshapes check-own30b-decode-profile,$(MAKECMDGOALS)),)
+  ifneq ($(strip $(MAKEFILES)),)
+    $(error MAKEFILES must be empty for the prefill gates; inherited $(MAKEFILES) can ignore recipe failures)
+  endif
+endif
+.PHONY: test-gpu-prefill-host-fp
+test-gpu-prefill-host-fp: $(GPU_TC_PROBE_TEST) $(GPU_QMMA_PROBE_TEST) $(GPU_PF_MEM_TEST)
+	./$(GPU_TC_PROBE_TEST) --host-only
+	./$(GPU_QMMA_PROBE_TEST) --host-only
+	./$(GPU_PF_MEM_TEST) --host-only
+	@echo "test-gpu-prefill-host-fp: PASS (3 first-party prefill tests, host model, no device)"
+# omega-mv#1032: the optional model-shape lane (not required): the five prefill tests with outside model-family shapes.
+.PHONY: test-gpu-prefill-modelshapes
+test-gpu-prefill-modelshapes: $(GPU_TCGEMM_TEST) $(GPU_QGEMM_TEST) $(GPU_PATTN_TEST) $(GPU_PFGEMM_TEST) $(GPU_PFHOST_TEST)
+	./$(GPU_TCGEMM_TEST) --host-only
+	./$(GPU_TCGEMM_TEST) --sim
+	./$(GPU_QGEMM_TEST) --host-only
+	./$(GPU_QGEMM_TEST) --sim
+	./$(GPU_PATTN_TEST) --host-only
+	./$(GPU_PATTN_TEST) --sim
+	./$(GPU_PFGEMM_TEST) --host-only
+	./$(GPU_PFGEMM_TEST) --sim
+	./$(GPU_PFHOST_TEST) --host-only
+	./$(GPU_PFHOST_TEST) --sim
+	@echo "test-gpu-prefill-modelshapes: PASS (5 model-shape prefill tests, host model + warp simulator, no device)"
 # omega#456: tools/own30b_decode_profile.c is a link-only recorder built by hand on the Spark; compile it with the
 # project's -Werror flags so a warning cannot land unseen.
 .PHONY: check-own30b-decode-profile
