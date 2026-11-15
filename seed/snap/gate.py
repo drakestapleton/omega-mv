@@ -11,7 +11,8 @@ Checks, on every program OMC accepts:
   A  snap strip refuses nothing (bad = 0) and equals the oracle (snapref.py): strand text, item and forced counts
   B  snap expand of that strand equals the oracle, and OMC compiles it to the same binary as the original
   C  every forced position is checked against OMC: one more word where the line had to end, or one more
-     statement where `end` had to come, must be refused
+     statement where `end` had to come, must be refused (error 5 or 17), and so must each wider alternative
+     in ALT_NL / ALT_END
   D  broken machines must fail A or B on at least one program (seven mutants)
   E  alarm: every word with an optional tail (table flag 2) is used by at least one accepted program
   F  alarm: every word snap reads by its table arity is probed in OMC: exactly that many arguments compile,
@@ -34,6 +35,8 @@ def sha(b):
 
 # arity probe: for each word snap reads by its table arity, a program omc accepts with exactly that many
 # arguments, and the same program with one more, which omc must refuse with error 5
+ALT_NL = ('1 ', 'x ', 'inline ', 'unroll ', 'bound 5 ', 'fresh ', 'else ', 'int 1 ')   # before a forced line end
+ALT_END = ('ret 0\n', 'x = int 1\n', 'else\n', 'break\n')                            # before a forced end
 PRE = 'global H uchar 64\nglobal E uchar *\nfn main to int\nh = long 1\n'
 FORMS = ('x = {w}\nret 0', '{w}\nret 0', 'ret int {w}', 'if {w}\nret 1\nend\nret 0')
 PLAIN = ('1', 'int 1', 'long 1', 'ulong 1', 'f64 1', 'f32 1', 'H', 'true', 'h')
@@ -166,7 +169,7 @@ def main():
             fails.append(('REFUSED-INPUT', f, f'rc={rc}'))
     print(f'refused-by-omc programs {len(ref)} answered {answered}')
 
-    kinds = collections.Counter()
+    kinds = collections.Counter(); wide = 0
     for f in acc:
         its = R.items(progs[f][0]); m = R.M(T)
 
@@ -188,6 +191,11 @@ def main():
                     fails.append(('C', f, f'item {k}: omc accepts an alternative at a forced position'))
                 elif rc not in (5, 17):
                     fails.append(('C', f, f'item {k}: omc error {rc}, not 5 or 17, so the refusal proves nothing'))
+                # wider alternatives (tail words, a literal, a name, a statement): each must be refused too
+                for alt in (ALT_NL if fo == '\n' else ALT_END):
+                    if compile_(text(its[:k]) + alt + text(its[k:]), os.path.join(scratch, 'm.bin')) == 0:
+                        fails.append(('C', f, f'item {k}: omc accepts {alt!r} at a forced position'))
+                    wide += 1
             m.feed(it[1])
     # E (alarm): a word with an optional tail that no accepted program uses is untested here; add a fixture
     tails = sorted(k for k, v in T.items() if R.flags(k, v) == 2)
@@ -207,6 +215,7 @@ def main():
     for k, e in bad:
         fails.append(('F', k, f'omc gives {e}, not error 5, for one word more than the table arity'))
     print(f'F arity probe: probed {len(probed)} wrong {len(bad)} unprobed {len(unprobed)}:', ' '.join(unprobed))
+    print('C wider alternatives refused:', wide)
     print('C forced positions against omc:', dict(sorted((f'{a}:error{b}', c) for (a, b), c in kinds.items())),
           'accepted', sum(c for (a, b), c in kinds.items() if b == 0))
 
