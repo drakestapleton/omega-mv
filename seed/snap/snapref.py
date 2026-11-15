@@ -4,6 +4,7 @@ Items are words and NL ("\n"). forced() gives the one item that must come next, 
 Sound by design: whenever something is not known for certain, the rest of the line is OPEN.
 Raw lines (`note ...` anywhere, `text ...` at top level) are copied verbatim and never forced.
 """
+import os
 import re
 
 CTRL = {'=', 'fn', 'to', 'end', 'if', 'else', 'while', 'for', 'ret', 'bound', 'note', 'global', 'text',
@@ -12,13 +13,24 @@ CTRL = {'=', 'fn', 'to', 'end', 'if', 'else', 'while', 'for', 'ret', 'bound', 'n
         'export', '(', ')'}
 SKIP1 = {'sizeof': 0, 'bitcast': 1, 'seal': 1, 'enlarge': 1}   # one skipped word, then this many values
 ARG1 = {'view', 'edit'}                                       # as an argument: one array name
-# words this machine reads by a rule of their own; every other table word is read by its table arity
-NAMED = CTRL | set(SKIP1) | ARG1 | {'get', 'offsetof', 'new'}
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def snap_words(snap_src):
+    """the words snap.om reads by a rule of its own: its `kwl` and `ctl` text lists (one source, the product)"""
+    out = set()
+    for name in ('kwl', 'ctl'):
+        m = re.search(r'^text ' + name + r' "(.*)"$', snap_src, re.M)
+        out |= set(m.group(1).split())
+    return out
+
+
+NAMED = snap_words(open(os.path.join(HERE, 'snap.om')).read())
 
 
 def flags(name, entry):
-    """table column 3: 1 a type word; 2 a word whose form has an optional tail ("[" in the reference form,
-    e.g. kfdctl's request-dependent SUFFIX) and no rule of its own here, so the rest of its line is open"""
+    """table column 3: 1 a type word; 2 a word whose reference form has an optional tail ("[" in the form, e.g.
+    kfdctl's request-dependent SUFFIX) and no rule of its own in snap.om, so the rest of its line is open"""
     if entry['category'] == 'type':
         return 1
     if '[' in entry.get('form', '') and name not in NAMED:
@@ -27,7 +39,7 @@ def flags(name, entry):
 
 
 def table_text(table):
-    """the word table snap.om reads: one line NAME ARITY FLAGS per reference word"""
+    """seed/snap/words.table: one line NAME ARITY FLAGS per reference word (gate.py --table writes it)"""
     return ''.join(f"{k} {v['arity']} {flags(k, v)}\n" for k, v in table.items())
 
 

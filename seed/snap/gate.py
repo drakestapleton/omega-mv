@@ -14,6 +14,10 @@ Checks, on every program OMC accepts:
      statement where `end` had to come, must be refused
   D  broken machines must fail A or B on at least one program (seven mutants)
   E  alarm: every word with an optional tail (table flag 2) is used by at least one accepted program
+  F  alarm: every word snap reads by its table arity is probed in OMC: exactly that many arguments compile,
+     one more is refused with error 5; words no probe program fits are listed as unprobed
+Before any check: REFERENCE_JSON's pin must be OMC's sha256, and words.table must equal its projection.
+usage: gate.py --table REFERENCE_JSON   writes the words.table text for that reference to stdout
 Programs OMC refuses are fed to strip only to show it answers (exit 0 or 3), never a trap.
 Exit 0 and a last line SNAPGATE PASS only when every check holds; otherwise exit 1 and SNAPGATE FAIL.
 """
@@ -28,15 +32,67 @@ def sha(b):
     return hashlib.sha256(b).hexdigest()
 
 
+# arity probe: for each word snap reads by its table arity, a program omc accepts with exactly that many
+# arguments, and the same program with one more, which omc must refuse with error 5
+PRE = 'global H uchar 64\nglobal E uchar *\nfn main to int\n'
+FORMS = ('x = {w}\nret 0', '{w}\nret 0', 'ret int {w}', 'if {w}\nret 1\nend\nret 0')
+PLAIN = ('1', 'int 1', 'long 1', 'ulong 1', 'f64 1', 'f32 1', 'H', 'true')
+
+
+def slot(t):
+    t = t.split(':', 1)[-1].lower()
+    for key, c in (('array', 'H'), ('uchar', 'H'), ('ulong', 'ulong 1'), ('uint', 'uint 1'), ('long', 'long 1'),
+                   ('int', 'int 1'), ('f64', 'f64 1'), ('f32', 'f32 1'), ('bool', 'true')):
+        if key in t:
+            return c
+    return '1'
+
+
+def arity_probe(omc, table, skip):
+    def rc(src):
+        return subprocess.run([omc], input=src.encode(), capture_output=True).returncode
+    probed, unprobed, bad = [], [], []
+    for k, v in table.items():
+        if k in skip or v['category'] == 'type' or not isinstance(v.get('arity'), int):
+            continue
+        a = v['arity']
+        typed = [slot(t) for t in v.get('types', [])][:a]
+        cands = ([typed] if len(typed) == a else []) + [[c] * a for c in PLAIN]
+        hit = None
+        for args in cands:
+            for form in FORMS:
+                if rc(PRE + form.format(w=' '.join([k] + args)) + '\nend\n') == 0:
+                    hit = (args, form); break
+            if hit:
+                break
+        if not hit:
+            unprobed.append(k); continue
+        args, form = hit
+        e = rc(PRE + form.format(w=' '.join([k] + args + [args[-1] if args else '1'])) + '\nend\n')
+        probed.append(k)
+        if e != 5:
+            bad.append((k, e))
+    return probed, unprobed, bad
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == '--table':
+        sys.stdout.write(R.table_text(json.load(open(sys.argv[2]))['words'])); return 0
     if len(sys.argv) < 4:
         print(__doc__); return 2
     omc, refp, scratch = sys.argv[1:4]
     dirs = sys.argv[4:] + [os.path.join(HERE, 'fixtures')]
     os.makedirs(scratch, exist_ok=True)
     T = json.load(open(refp))['words']
-    table = R.table_text(T)
-    print('omc sha256', sha(open(omc, 'rb').read()))
+    pin = json.load(open(refp)).get('pin', {}).get('omc_sha256')
+    omc_sha = sha(open(omc, 'rb').read())
+    print('omc sha256', omc_sha, 'reference pin', pin)
+    if pin != omc_sha:
+        print('SNAPGATE FAIL the reference is for another compiler: use the reference.json whose pin is this omc'); return 1
+    table = open(os.path.join(HERE, 'words.table')).read()
+    if table != R.table_text(T):
+        print('SNAPGATE FAIL words.table is stale for this reference: gate.py --table REFERENCE_JSON > seed/snap/words.table')
+        return 1
 
     def compile_(src, out):
         r = subprocess.run([omc], input=src.encode(), stdout=open(out, 'wb'), stderr=subprocess.PIPE)
@@ -130,6 +186,18 @@ def main():
         if not any(x[0] == 'w' and x[1] == k for f in acc for x in R.items(progs[f][0])):
             fails.append(('E', k, 'optional-tail word used by no accepted program: add a fixture'))
     print('E optional-tail words', tails)
+    # the oracle's own copies of snap.om's word lists must match snap.om
+    src_ctl = set(re.search(r'^text ctl "(.*)"$', snap_src, re.M).group(1).split())
+    if R.CTRL - {'(', ')'} != src_ctl:
+        fails.append(('LISTS', 'CTRL', f'oracle and snap.om differ: {sorted((R.CTRL - {"(", ")"}) ^ src_ctl)}'))
+    own = set(R.SKIP1) | R.ARG1 | {'get', 'offsetof', 'new'}
+    if not own <= R.NAMED:
+        fails.append(('LISTS', 'own rules', f'not in snap.om kwl: {sorted(own - R.NAMED)}'))
+    # F (alarm): every word read by its table arity refuses one more word in omc
+    probed, unprobed, bad = arity_probe(omc, T, R.NAMED | R.CTRL | {k for k, v in T.items() if R.flags(k, v) == 2})
+    for k, e in bad:
+        fails.append(('F', k, f'omc gives {e}, not error 5, for one word more than the table arity'))
+    print(f'F arity probe: probed {len(probed)} wrong {len(bad)} unprobed {len(unprobed)}:', ' '.join(unprobed))
     print('C forced positions against omc:', dict(sorted((f'{a}:error{b}', c) for (a, b), c in kinds.items())),
           'accepted', sum(c for (a, b), c in kinds.items() if b == 0))
 
@@ -158,7 +226,8 @@ def main():
     for x in fails[:40]:
         print('FAIL', *x)
     print(f'SNAPGATE {"FAIL" if fails else "PASS"} accepted={len(acc)} items={items} forced={forced} '
-          f'positions={sum(kinds.values())} mutants={caught}/{len(mutants)} fail={len(fails)}')
+          f'positions={sum(kinds.values())} mutants={caught}/{len(mutants)} probed={len(probed)} '
+          f'unprobed={len(unprobed)} fail={len(fails)}')
     return 1 if fails else 0
 
 
