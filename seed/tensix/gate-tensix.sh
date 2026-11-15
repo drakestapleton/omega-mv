@@ -30,7 +30,8 @@ ASM=seed/rung2/asm2.bin
 TAB=$R/rv32im.tbl
 ASM_PIN=6988abe072fac3cdef2240d5ad13a3ecd8fb576fa09112d344b9e7c2315969c4
 OMC=seed/out/omc
-OMC_PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
+. seed/omc-pin.sh
+omc_pin_load || { say "FAIL compiler pin: seed/out/omc.sha256 has no compiler pin"; exit 1; }
 TTSIM_VERSION=v1.15.0
 TTSIM_WH_PIN=e2a56ffe04072a10d477db1ef85cdbd5d392d9fc52043bb949b90a4c01ff6b4f
 TTSIM_BH_PIN=2367dccc964c0ce4a20b14520e5f7ac6191bb227fb20e87aca1e94bf7432ced2
@@ -84,7 +85,7 @@ OM_OK=
 if [ ! -x "$OMC" ]; then
     nr "seeded Omega path: $OMC absent"
 elif [ "$(sha "$OMC")" != "$OMC_PIN" ]; then
-    bad "compiler $OMC pin differs"
+    bad "compiler $OMC sha256 $(sha "$OMC") disagrees with seed/out/omc.sha256 pin $OMC_PIN"
 elif ! nice -n 19 "$OMC" < $R/irrv32.om > "$B/irrv32" 2> "$B/irrv32.err"; then
     bad "omc refused irrv32.om: $(cat "$B/irrv32.err")"
 else

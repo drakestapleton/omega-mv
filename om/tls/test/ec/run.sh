@@ -15,7 +15,10 @@ omc=${1:?usage: run.sh OMC}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../../.." && pwd)
 out="$root/build/tls/ec"
-pin=$(sed -n 's/^OMC_PIN=//p' "$root/om/units.sh")
+. "$root/seed/omc-pin.sh"
+OMC_PIN_ROOT=$root
+omc_pin_load || { echo "FAIL omc pin: seed/out/omc.sha256 has no compiler pin"; exit 1; }
+pin=$OMC_PIN
 rm -rf "$out"
 mkdir -p "$out"
 fail=0
@@ -24,7 +27,7 @@ nice="nice -n 19 ionice -c3"
 sum=$(sha256sum "$omc" | cut -d' ' -f1)
 echo "omc $sum"
 if [ "$sum" != "$pin" ]; then
-	echo "FAIL omc is not the pinned compiler $pin"
+	echo "FAIL omc sha256 $sum disagrees with seed/out/omc.sha256 pin $pin"
 	echo "EC FAIL"
 	exit 1
 fi

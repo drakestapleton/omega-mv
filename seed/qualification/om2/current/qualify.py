@@ -283,17 +283,22 @@ class Qualification:
         # Canonical source/pins/generated outputs are never edited by this instrument.
         script = stage/'om/units.sh'
         original = script.read_text()
-        pins = re.findall(r'^OMC_PIN=([0-9a-f]{64})$', original, re.M)
-        self.require(len(pins) == 1, 'unit checker compiler-pin declaration changed')
-        projected, count = re.subn(r'^OMC_PIN=[0-9a-f]{64}$',
-                                  'OMC_PIN=' + self.pin, original, flags=re.M)
-        self.require(count == 1, 'unit checker pin projection must match exactly once')
-        script.write_text(projected)
+        self.require(re.search(r'^OMC_PIN=[0-9a-f]{64}$', original, re.M) is None,
+                     'unit checker still carries a hand-typed compiler pin')
+        self.require('seed/omc-pin.sh' in original, 'unit checker does not derive its pin')
+        helper = stage/'seed/omc-pin.sh'
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.root/'seed/omc-pin.sh', helper)
+        sidecar = stage/'seed/out/omc.sha256'
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(self.pin + '  seed/out/omc\n')
+        repo_pin = (self.root/'seed/out/omc.sha256').read_text().split()[0]
         self.report['unit_checker_projection'] = {
-            'original_compiler_pin': pins[0], 'candidate_compiler_pin': self.pin,
+            'original_compiler_pin': repo_pin, 'candidate_compiler_pin': self.pin,
             'original_script_sha256': hashlib.sha256(original.encode()).hexdigest(),
             'projected_script_sha256': digest(script),
-            'change': 'Only OMC_PIN is derived from the candidate compiler; checker logic unchanged.',
+            'staged_sidecar_sha256': digest(sidecar),
+            'change': 'The staged seed/out/omc.sha256 is the candidate compiler digest; units.sh derives OMC_PIN from it.',
             'canonical_binding_check': 'NOT_RUN: this check uses freshly generated candidate bindings.'
         }
         self.save()
