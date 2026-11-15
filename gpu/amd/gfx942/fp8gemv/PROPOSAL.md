@@ -2,8 +2,9 @@
 
 The GEMV is a gfx942 instruction table (`fp8gemv_stream.isa`) packed by
 `gpu/amd/gfx942/hsaco.om`. That is the path this tree already uses for a kernel.
-The numeric reference (`check.om`, composed with `exec/fma.om`) is OM-2. The
-table is data. It is not a typed Omega load.
+The numeric references in `check.om` (a column-order loop and the kernel's own
+order, composed with `exec/fma.om`) are OM-2. The table is data. It is not a
+typed Omega load.
 
 These are the operations the kernel needs and OM-2 does not have as operations.
 Each one is emitted as instruction fields instead.

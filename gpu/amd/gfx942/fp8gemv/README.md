@@ -111,11 +111,12 @@ is the row). Both are in the one kernel.
 ### What the device kernel does not do
 
 Per-block scales (128 columns) and OCP E4M3 are computed by `check.om` only.
-Putting either into the device kernel would change the FMA and `vmcnt` order
-the reference matches. The reference's per-block rule is: a lane sums its 16
-products from zero, multiplies by `scale[col >> 7]`, then adds that into the
-lane accumulator, and only then does the same DPP reduction. A lane's 16 columns
-start on a multiple of 16 and do not cross a multiple of 128.
+The kernel-order per-block rule is: a lane sums its 16 products from zero,
+multiplies by `scale[col >> 7]`, then adds that into the lane accumulator, and
+only then does the same DPP reduction. A lane's 16 columns start on a multiple
+of 16 and do not cross a multiple of 128. The column-order reference instead
+scales each product as it goes. Those two associations agree on the K=256 ones
+case because every partial sum is an integer the 24-bit mantissa holds exactly.
 
 ## CPU check
 
@@ -126,10 +127,16 @@ gpu/amd/gfx942/fp8gemv/check.sh
 That hashes `seed/out/omc` against `seed/out/omc.sha256`, assembles both `.s`
 files, packs both `.isa` files, diffs the bytes against `encprobe.golden` and
 `fp8gemv_stream.golden`, recomputes the descriptor fields, and runs `check.om`.
-The reference is `fpfma` from `exec/fma.om` (x86linux rejects the `fma` keyword).
-Finite cases are bit-exact with that order. A NaN product becomes `0x7fc00000`.
-That is the reference's canonical NaN, not a claim about the device convert's
-payload.
+Both references call `fpfma` from `exec/fma.om` (x86linux rejects the `fma`
+keyword). `plain` is a column loop. `gemv` is the kernel's lane and tile order.
+They are bit-exact when the association is the same: K of 16 or less, and any
+dot that produces a NaN. FNUZ NaN is the byte 0x80 only. 0xFF decodes to −240.
+Elsewhere `check.om` allows the difference Higham's recursive-summation bound
+gives two associations, with a factor of two so the bound itself (computed in
+binary32) cannot round down through a difference that estimate allows, plus 8
+ulps of the two results. The seeded inputs and the cross-lane cancellation are
+required to differ. The fused residual and RMSNorm-scale epilogue, and the bf16
+store rounding, run inside both functions.
 
 `check.om` exits 0 after printing `fp8gemv check pass`. Any other exit is the
 check number in `main`.
@@ -140,5 +147,9 @@ check number in `main`.
 gpu/amd/gfx942/fp8gemv/bench.sh
 ```
 
-Correctness first. If `/dev/kfd` or the profiler tools are absent it prints
-`BLOCKED_HARDWARE` and stops. It does not invent a bandwidth.
+Correctness first (`check.sh`). If `/dev/kfd` is absent it prints
+`BLOCKED_HARDWARE` and exits non-zero. It does not invent a bandwidth. On a
+card it runs `hipblaslt-bench` at these shapes (`f8_fnuz_r` times `f8_fnuz_r`,
+which is the FP8 combination that library has; the kernel is FP8 times FP32)
+and times this kernel with the row-remap bit off and on. Warmup, then 21
+samples, then the median, the spread, and GB/s against 5.3 TB/s.
