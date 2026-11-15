@@ -1,0 +1,985 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note trit: one native 3-valued signal per bot, read from DIR/inbox/<bot>.md and <bot>.emergency.md.
+note Built after the core of seed/trace/sha256.om in OM-2; see tools/trit/build.sh and README.md.
+note Usage: trit DIR BOT...            one line "<bot> <1|2> <token>" per bot to wake.
+note        trit DIR --ack BOT TOKEN   prints the receipt "<bot> 0", then the next wake if any.
+note Silence means nothing to do (TURNS.md 12:24): a bot with no wake line prints nothing. 0 is only the
+note ack receipt. Exit: 0 printed a line, 1 silent, 2 usage, 3 ack refused, 4/5 bad codebook/key, 70+ internal.
+note 2 = an unread line that verifies with the codebook (tools/codebook/codebook.om, compiled into this
+note binary) and carries a 3xx code: last '|' field ocb2:<cbsha>:<counter>:<digits>:<mac>, over
+note ocb2|cbsha|counter|lane|ts|from|to|tag|text|ref|digits. Signed lines are the 6-field form
+note ts|from|to|tag|text|ref; to must equal the BOT being read, and the lane (n or e) must match the
+note file. An ocb1 line is at most 1. Key and codebook at DIR/codebook/{key,codebook.tsv}; the key
+note must be mode 0600 (no group/other bits) and its path must not contain a boards/ segment. Counters
+note DIR/inbox/<bot>.<sender>.ctr hold "<counter> <ts>". Anything that is not fyi gives at most 1,
+note including STOP text, a stop tag, unsigned, tampered, stale, replayed and retargeted lines.
+note Token: L<offset>:<sha256 hex of bytes 0..offset>, L = n (inbox) or e (emergency lane).
+note A cursor is DIR/inbox/<bot>[.emergency].md.cur holding "<offset> <sha256 hex of bytes 0..offset>".
+const NMAX ulong 3
+const WIN ulong 60
+global dir uchar 4096
+global dn ulong 1
+global bot uchar 256
+global bn ulong 1
+global acc ulong *
+global an ulong 1
+global rej ulong 1
+global lf ulong 3
+global vk ulong 1
+global outb uchar 512
+global tk uchar 160
+global tl ulong 2
+text tinbox "inbox/"
+text tmd ".md"
+text temd ".emergency.md"
+text tcur ".cur"
+text tack "--ack"
+text tstop "stop"
+text tstopu "STOP"
+text tfyi "fyi"
+text tdrake "drake"
+text tcbd "codebook/"
+text tcbf "codebook.tsv"
+text tkey "key"
+text trej "rejected "
+
+note Dominance 2 > 1 > 0 is the maximum of the two values.
+fn tmax a trit b trit to trit
+if gt open a open b
+ret a
+end
+ret b
+end
+
+fn pdir to void
+put pn 0 0
+for i ulong get dn 0 bound BIG
+pbyte get dir i
+end
+if gt get dn 0 0
+pbyte 47
+end
+ptext tinbox
+end
+
+fn pbase lane ulong to void
+if eq lane 1
+put vln 0 101
+else
+put vln 0 110
+end
+pdir
+for i ulong get bn 0 bound BIG
+pbyte get bot i
+end
+if eq lane 1
+ptext temd
+else
+ptext tmd
+end
+end
+
+fn loadf to bool
+put fbn 0 0
+fd = fopen pb 0 get pn 0 0 0
+if lt fd 0
+ret false
+end
+n = ulong 0
+while true bound BIG
+if lt len fb add n 4096
+e1 = enlarge fb add n 4096
+if ne e1 0
+exit 72
+end
+end
+r = read int fd fb n 4096
+if lt r 0
+exit 73
+end
+if eq r 0
+break
+end
+n = add n ulong r
+end
+e2 = fclose int fd
+put fbn 0 n
+ret true
+end
+
+fn lastnl to ulong
+i = get fbn 0
+while gt i 0 bound BIG
+if eq get fb sub i 1 10
+ret sub i 1
+end
+i = sub i 1
+end
+ret get fbn 0
+end
+
+note A content line starts with a timestamp YYYY-MM-DDT; anything else (a header) is not content.
+fn ists p ulong e ulong to bool
+if lt sub e p 11
+ret false
+end
+for i ulong 11
+c = get fb add p i
+if or eq i 4 eq i 7
+if ne c 45
+ret false
+end
+else
+if eq i 10
+if ne c 84
+ret false
+end
+else
+if eq isdig c false
+ret false
+end
+end
+end
+end
+ret true
+end
+
+fn fpre t view uchar * to bool
+s = get fs 0
+if lt sub get fs 1 s len t
+ret false
+end
+for i ulong len t bound BIG
+if ne get fb add s i get t i
+ret false
+end
+end
+ret true
+end
+
+fn npipe p ulong e ulong to ulong
+c = ulong 0
+for i ulong sub e p bound BIG
+if eq get fb add p i 124
+c = add c 1
+end
+end
+ret c
+end
+
+fn lastpipe p ulong e ulong to ulong
+i = e
+while gt i p bound BIG
+if eq get fb sub i 1 124
+ret sub i 1
+end
+i = sub i 1
+end
+ret e
+end
+
+fn startsw q ulong e ulong t view uchar * to bool
+if lt sub e q len t
+ret false
+end
+for i ulong len t bound BIG
+if ne get fb add q i get t i
+ret false
+end
+end
+ret true
+end
+
+note Exact STOP: the text field is "STOP", or starts "STOP " or "STOP:".
+fn stopx to bool
+s = get fs 0
+n = sub get fs 1 s
+if lt n 4
+ret false
+end
+for i ulong 4
+if ne get fb add s i get tstopu i
+ret false
+end
+end
+if eq n 4
+ret true
+end
+c = get fb add s 4
+if or eq c 32 eq c 58
+ret true
+end
+ret false
+end
+
+note Kind of one content line: 2 stop (tag "stop" or exact STOP text), 0 fyi (never wakes), else 1.
+note A stop wins over fyi.
+fn lnkind p ulong e ulong to ulong
+lfmt p e
+ee = get lf 0
+tg = get lf 1
+if splitf p ee tg 124
+if feq tstop
+ret 2
+end
+end
+if splitf p ee add tg 1 124
+if stopx
+ret 2
+end
+end
+if splitf p ee tg 124
+if feq tfyi
+ret 0
+end
+end
+ret 1
+end
+
+note SHA-256 of fb[s..s+n) as 64 lowercase hex bytes in hx, on the seeded core above.
+fn hfb s ulong n ulong to void
+hinit
+full = div n 64
+for b ulong full bound BIG
+o = add s mul b 64
+for i ulong 64
+put blk i get fb add o i
+end
+compress
+end
+hpadf add s mul full 64 rem n 64 n
+hhex
+end
+
+fn hpadf o ulong left ulong n ulong to void
+for i ulong 64
+put blk i 0
+end
+for j ulong left bound BIG
+put blk j get fb add o j
+end
+put blk left 128
+if ge left 56
+compress
+for i ulong 64
+put blk i 0
+end
+end
+bits = mul n 8
+for q ulong 8
+v = and shr bits mul sub 7 q 8 255
+put blk add 56 q uchar v
+end
+compress
+end
+
+note Unread starts at the cursor offset only when the cursor is well formed, inside the file, on a
+note line end, and the sha256 of every byte before it matches. Otherwise the whole file is unread.
+fn rdcur lane ulong to ulong
+pbase lane
+ptext tcur
+fd = fopen pb 0 get pn 0 0 0
+if lt fd 0
+ret 0
+end
+r = read int fd cb 0 len cb
+e2 = fclose int fd
+if lt r 66
+ret 0
+end
+n = ulong r
+off = ulong 0
+i = ulong 0
+while lt i n bound BIG
+c = get cb i
+if eq c 32
+break
+end
+if eq isdig c false
+ret 0
+end
+if gt off 100000000000000
+ret 0
+end
+off = add mul off 10 ulong sub c 48
+i = add i 1
+end
+if or eq off 0 gt off get fbn 0
+ret 0
+end
+if gt add i 65 n
+ret 0
+end
+if ne get fb sub off 1 10
+ret 0
+end
+hfb 0 off
+for j ulong 64
+if ne get hx j get cb add add i 1 j
+ret 0
+end
+end
+ret off
+end
+
+fn scann st ulong to trit
+t = tritmk 0
+p = st
+while lt p get fbn 0 bound BIG
+e = lnend p
+if eq e get fbn 0
+break
+end
+if ists p e
+t = tmax t lnlevel p e
+end
+p = add e 1
+end
+ret t
+end
+
+fn absd a ulong b ulong to ulong
+if gt a b
+ret sub a b
+end
+ret sub b a
+end
+
+fn sameid a ulong m ulong s ulong n ulong to bool
+if ne m n
+ret false
+end
+for i ulong n bound BIG
+if ne get fb add a i get fb add s i
+ret false
+end
+end
+ret true
+end
+
+fn dig2 q ulong to ulong
+a = get fb q
+b = get fb add q 1
+if or eq isdig a false eq isdig b false
+ret 100000
+end
+ret add mul ulong sub a 48 10 ulong sub b 48
+end
+
+fn days y ulong m ulong d ulong to ulong
+yy = y
+if le m 2
+yy = sub y 1
+end
+era = div yy 400
+yoe = sub yy mul era 400
+mp = add m 9
+if gt m 2
+mp = sub m 3
+end
+doy = add div add mul 153 mp 2 5 sub d 1
+q4 = div yoe 4
+c1 = div yoe 100
+doe = add mul yoe 365 q4
+doe = sub add doe doy c1
+ret add mul era 146097 doe
+end
+
+note Minutes since a fixed civil origin, plus one; 0 means the timestamp does not parse.
+fn minute p ulong e ulong to ulong
+if lt sub e p 16
+ret 0
+end
+if ne get fb add p 13 58
+ret 0
+end
+y = add mul dig2 p 100 dig2 add p 2
+mn = dig2 add p 5
+d = dig2 add p 8
+hh = dig2 add p 11
+mi = dig2 add p 14
+if or lt mn 1 gt mn 12
+ret 0
+end
+if or lt d 1 gt d 31
+ret 0
+end
+if or gt hh 23 gt mi 59
+ret 0
+end
+if lt y 1
+ret 0
+end
+dd = days y mn d
+t1 = mul hh 60
+t2 = add mul dd 1440 t1
+ret add t2 add mi 1
+end
+
+note Sender check: a slug of a-z 0-9 '-', 1..64 bytes, that is drake or has DIR/inbox/<slug>.md.
+fn okname s ulong n ulong to bool
+if or eq n 0 gt n 64
+ret false
+end
+for i ulong n bound BIG
+if eq okch get fb add s i false
+ret false
+end
+end
+if eq n len tdrake
+d = true
+for j ulong n bound BIG
+if ne get fb add s j get tdrake j
+d = false
+end
+end
+if d
+ret true
+end
+end
+pdir
+for kk ulong n bound BIG
+pbyte get fb add s kk
+end
+ptext tmd
+a = faccess pb 0 get pn 0 0
+if eq a 0
+ret true
+end
+ret false
+end
+
+fn putdec v ulong to ulong
+n = ulong 1
+x = v
+while ge x 10 bound BIG
+x = div x 10
+n = add n 1
+end
+x = v
+for i ulong n bound BIG
+put cb sub sub n 1 i add uchar rem x 10 48
+x = div x 10
+end
+ret n
+end
+
+fn wr fd int n ulong to void
+i = ulong 0
+while lt i n bound BIG
+r = write fd outb i sub n i
+if le r 0
+exit 75
+end
+i = add i ulong r
+end
+end
+
+fn rejout to void
+o = ulong 0
+for i ulong len trej
+put outb i get trej i
+end
+o = len trej
+for j ulong get bn 0 bound BIG
+put outb add o j get bot j
+end
+o = add o get bn 0
+put outb o 32
+o = add o 1
+n = putdec get rej 0
+for kk ulong n bound BIG
+put outb add o kk get cb kk
+end
+o = add o n
+put outb o 10
+wr 2 add o 1
+end
+
+fn botout to ulong
+n = get bn 0
+for i ulong n bound BIG
+put outb i get bot i
+end
+put outb n 32
+ret add n 1
+end
+
+note Wake line "<bot> <1|2> <token>"; a 0 (nothing to do) prints nothing. Returns 1 when printed.
+fn emit t trit to ulong
+if eq open t 0
+ret 0
+end
+o = botout
+put outb o add uchar open t 48
+put outb add o 1 32
+o = add o 2
+put outb o 110
+if eq get tl 0 2
+put outb o 101
+end
+o = add o 1
+m = putdec get tl 1
+for j ulong m bound BIG
+put outb add o j get cb j
+end
+o = add o m
+put outb o 58
+o = add o 1
+for kk ulong 64
+put outb add o kk get hx kk
+end
+o = add o 64
+put outb o 10
+wr 1 add o 1
+ret 1
+end
+
+fn receipt to void
+o = botout
+put outb o 48
+put outb add o 1 10
+wr 1 add o 2
+end
+
+note Token for the lane in fb: the end of its last complete line and the sha256 of all bytes before it.
+fn mktok lane ulong to void
+q = lastnl
+put tl 0 add lane 1
+put tl 1 add q 1
+hfb 0 add q 1
+end
+
+note Atomic cursor write: "<off> <hx>" into <cursor>.tmp, fsync, then renameat2 over the cursor.
+fn wrcur lane ulong off ulong to void
+n = putdec off
+put cb n 32
+for i ulong 64
+put cb add add n 1 i get hx i
+end
+put cb add n 65 10
+pbase lane
+ptext tcur
+ptext ttmp
+fd = fopen pb 0 get pn 0 577 420
+if lt fd 0
+exit 76
+end
+w2 = ulong 0
+m = add n 66
+while lt w2 m bound BIG
+r = write int fd cb w2 sub m w2
+if le r 0
+exit 77
+end
+w2 = add w2 ulong r
+end
+s1 = fsync int fd
+e2 = fclose int fd
+if ne s1 0
+exit 77
+end
+put pk 0 2
+put pk 1 0
+put pkn 0 2
+pkrec
+pbase lane
+ptext tcur
+pkrec
+rn = renames pk 0 get pkn 0 0
+if ne rn 0
+exit 77
+end
+pbase lane
+ptext tcur
+syncdir
+end
+
+note Parse TOKEN = L<offset>:<64 hex>; return the lane, the offset in tl 1, the hex at tk 2+digits.
+fn parsetok tn ulong to ulong
+lane = ulong 0
+c0 = get tk 0
+if eq c0 101
+lane = 1
+else
+if ne c0 110
+exit 3
+end
+end
+off = ulong 0
+i = ulong 1
+while lt i tn bound BIG
+c = get tk i
+if eq c 58
+break
+end
+if eq isdig c false
+exit 3
+end
+if gt i 18
+exit 3
+end
+off = add mul off 10 ulong sub c 48
+i = add i 1
+end
+if or eq i 1 ne tn add i 65
+exit 3
+end
+for j ulong 64
+if eq ishex get tk add add i 1 j false
+exit 3
+end
+end
+put tl 0 add i 1
+put tl 1 off
+ret lane
+end
+
+fn getbot a ulong to void
+p = argread a bot 0 len bot
+if lt p 1
+exit 2
+end
+if gt p 64
+exit 2
+end
+put bn 0 ulong p
+if eq get bot 0 45
+exit 2
+end
+for i ulong get bn 0 bound BIG
+if eq okch get bot i false
+exit 2
+end
+end
+end
+
+fn isack to bool
+if ne get bn 0 len tack
+ret false
+end
+for i ulong len tack
+if ne get bot i get tack i
+ret false
+end
+end
+ret true
+end
+
+note Line format: when the last '|' field is a codebook signature (ocb2: or a leftover ocb1:), it
+note is not a content field; the tag is field 3 in the 6-field "to" format, else field 2.
+fn lfmt p ulong e ulong to void
+nf = add npipe p e 1
+ee = e
+if ge nf 2
+lp = lastpipe p e
+if or startsw add lp 1 e tocb startsw add lp 1 e tocbo
+ee = lp
+nf = sub nf 1
+end
+end
+put lf 0 ee
+put lf 1 2
+if eq nf 6
+put lf 1 3
+end
+end
+
+note verified: the codebook's own verify (codebook.om verl, quiet, table mode) on fb[p..e).
+note Without DIR/codebook/codebook.tsv and DIR/codebook/key nothing verifies.
+fn verified p ulong e ulong to bool
+put vm 0 0
+put vf 0 0
+put ve 0 0
+put vc 0 0
+if eq get vk 0 1
+verx p e
+end
+ret eq get vf 0 1
+end
+
+note Level of a line whose verify already ran: 2 only for a verified line carrying a 3xx code;
+note STOP text, a stop tag and every unsigned, tampered, stale or replayed line give at most 1.
+fn lvl p ulong e ulong to trit
+if and eq get vf 0 1 eq get ve 0 1
+ret tritmk 2
+end
+if eq lnkind p e 0
+ret tritmk 0
+end
+ret tritmk 1
+end
+
+fn lnlevel p ulong e ulong to trit
+v = verified p e
+ret lvl p e
+end
+
+note Quota entries are (sender off, len, minute, counter) and only MAC-verified lines are counted,
+note once per (sender, counter): forged lines and replayed copies never use up a sender's quota.
+fn cntwin s ulong n ulong m ulong to ulong
+c = ulong 0
+for i ulong get an 0 bound BIG
+b = mul i 4
+a0 = get acc b
+a1 = get acc add b 1
+if sameid a0 a1 s n
+a2 = get acc add b 2
+if lt absd a2 m WIN
+c = add c 1
+end
+end
+end
+ret c
+end
+
+fn seenc s ulong n ulong v ulong to bool
+for i ulong get an 0 bound BIG
+b = mul i 4
+if eq get acc add b 3 v
+if sameid get acc b get acc add b 1 s n
+ret true
+end
+end
+end
+ret false
+end
+
+note Admission for the emergency lane, after verified ran on the line.
+fn admit p ulong e ulong to bool
+if eq splitf p e 1 124 false
+ret false
+end
+s = get fs 0
+n = sub get fs 1 s
+if eq okname s n false
+ret false
+end
+m = minute p e
+if eq m 0
+ret false
+end
+if eq get vm 0 0
+ret true
+end
+v = get vc 0
+if seenc s n v
+ret true
+end
+if ge cntwin s n m NMAX
+ret false
+end
+b2 = mul get an 0 4
+if lt len acc add b2 4
+e1 = enlarge acc add mul b2 2 64
+if ne e1 0
+exit 74
+end
+end
+put acc b2 s
+put acc add b2 1 n
+put acc add b2 2 m
+put acc add b2 3 v
+put an 0 add get an 0 1
+ret true
+end
+
+fn scane st ulong to trit
+put an 0 0
+t = tritmk 0
+p = ulong 0
+while lt p get fbn 0 bound BIG
+e = lnend p
+if eq e get fbn 0
+break
+end
+if ists p e
+v = verified p e
+ok = admit p e
+if ge p st
+if ok
+t = tmax t lvl p e
+else
+put rej 0 add get rej 0 1
+end
+end
+end
+p = add e 1
+end
+ret t
+end
+
+note Counter state for this bot: DIR/inbox/<bot>.<sender>.ctr, lock DIR/inbox/<bot>.ctr.lock.
+fn setsd to void
+pdir
+for i ulong get bn 0 bound BIG
+pbyte get bot i
+put rbot i get bot i
+end
+put rbn 0 get bn 0
+for j ulong get pn 0 bound BIG
+put sd j get pb j
+end
+put sdn 0 get pn 0
+put vtc 0 0
+put vtn 0 0
+end
+
+note A verified 3xx (2) in the emergency lane is reported first; an emergency-lane 1 is reported
+note only when the normal lane is quiet, so unsigned lines there cannot hide normal work.
+fn state to trit
+put rej 0 0
+put tl 0 0
+setsd
+pbase 1
+te = tritmk 0
+if loadf
+te = scane rdcur 1
+end
+if gt get rej 0 0
+rejout
+end
+if eq open te 2
+mktok 1
+ret te
+end
+pbase 0
+tn = tritmk 0
+if loadf
+tn = scann rdcur 0
+end
+if gt open tn 0
+mktok 0
+ret tn
+end
+if gt open te 0
+pbase 1
+if loadf
+mktok 1
+end
+end
+ret te
+end
+
+note --ack: under the state lock, verify-and-advance (vt = 0) every line the token covers, then
+note move the cursor. A crash between the two leaves those lines unread but stale (at most 1).
+fn doack tn ulong to void
+lane = parsetok tn
+hp = get tl 0
+off = get tl 1
+pbase lane
+if eq loadf false
+exit 3
+end
+cur = rdcur lane
+if or eq off 0 gt off get fbn 0
+exit 3
+end
+if lt off cur
+exit 3
+end
+if ne get fb sub off 1 10
+exit 3
+end
+hfb 0 off
+for j ulong 64
+if ne get hx j get tk add hp j
+exit 3
+end
+end
+if eq get vk 0 1
+ackv cur off
+hfb 0 off
+end
+wrcur lane off
+end
+
+fn ackv cur ulong off ulong to void
+setsd
+lk = lockst
+put vt 0 0
+p = cur
+while lt p off bound BIG
+e = lnend p
+if ists p e
+verx p e
+end
+p = add e 1
+end
+put vt 0 1
+unlockst lk
+end
+
+note pb = DIR/codebook/<name>.
+fn pcb t view uchar * to void
+put pn 0 0
+for i ulong get dn 0 bound BIG
+pbyte get dir i
+end
+if gt get dn 0 0
+pbyte 47
+end
+ptext tcbd
+ptext t
+end
+
+fn ldvk to void
+pcb tcbf
+a = faccess pb 0 get pn 0 0
+pcb tkey
+b = faccess pb 0 get pn 0 0
+if or ne a 0 ne b 0
+ret
+end
+pcb tcbf
+ldcbq
+pcb tkey
+ldkeyq
+put vk 0 1
+end
+
+fn main to int
+put vq 0 1
+put vt 0 1
+put ssep 0 46
+c = argcnt
+if lt c 3
+ret 2
+end
+p = argread 1 dir 0 len dir
+if lt p 0
+ret 2
+end
+put dn 0 ulong p
+q = argread 2 bot 0 len bot
+if lt q 0
+ret 2
+end
+put bn 0 ulong q
+ldvk
+if isack
+if ne c 5
+ret 2
+end
+getbot 3
+tn = argread 4 tk 0 len tk
+if lt tn 1
+exit 3
+end
+doack ulong tn
+receipt
+z = emit state
+zap
+ret 0
+end
+any = ulong 0
+for a ulong sub ulong c 2 bound BIG
+getbot add a 2
+any = add any emit state
+end
+zap
+if eq any 0
+ret 1
+end
+ret 0
+end

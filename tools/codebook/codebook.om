@@ -1,0 +1,1838 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note codebook: T-002 items 7-10, the signed layered digit codebook, in OM-2 on the seeded SHA-256 core.
+note Built after the core of seed/trace/sha256.om (up to "fn sha256"); see tools/codebook/build.sh.
+note Wire form: a code is (9xx)^k then one terminal 000..899, each group exactly 3 decimal digits; a
+note message is codes concatenated with no separator. The model and proofs are proof/CodebookProof.lean.
+note Usage (batch, one stdin line in, one stdout line out):
+note   codebook enc                      "901.12 345" -> "901012345"   (or ERR syntax|range)
+note   codebook dec                      "901012345" -> "901.12 345"   (or ERR len|digit|esc)
+note   codebook sha CB                   prints the codebook id, the sha256 of the TSV file
+note   codebook sign CB KEY              "lane|ts|from|to|tag|text|ref|counter|digits" ->
+note                                     "ocb2:<cbsha>:<counter>:<digits>:<mac>"
+note   codebook verify CB KEY STATE [LANE]  inbox line -> "<verdict> <trit>"  (LANE is n or e, default n)
+note MAC = HMAC-SHA256(key, ocb2|cbsha|counter|lane|ts|from|to|tag|text|ref|digits). A signed line must
+note be the 6-field form ts|from|to|tag|text|ref plus the ocb2 field. verify checks, in order: unsigned
+note (no ocb2 field or no MAC), legacy (ocb1, caps at trit 1), badsender, badfmt (including a missing
+note field or a bad timestamp), badcb, badlen/baddigit/badesc, unknown, badmac, badto (to != receiving
+note bot, when one is set), stale (counter not strictly above STATE/<sender>.ctr, or ts older than the
+note last accepted ts). Else ok: the counter and ts are stored atomically as "<counter> <ts>\n". Trit 2
+note only for ok plus a 3xx emergency code; every other line is 1. Exit: 2 usage, 4 bad codebook, 5 bad
+note key (unreadable, empty, mode & 077 != 0, or a path with a boards/ segment). The key is never printed;
+note key buffers are zeroed before exit. Keep the key file outside boards/.
+const BIG ulong 9223372036854775807
+abstract trit uint
+global fb uchar *
+global fbn ulong 1
+global cbk uchar *
+global cbn ulong 1
+global mb uchar *
+global mbn ulong 1
+global ms uchar *
+global msn ulong 1
+global ob uchar *
+global obn ulong 1
+global gr ulong *
+global ng ulong 1
+global ce ulong *
+global nc ulong 1
+global eo ulong *
+global nen ulong 1
+global pb uchar 4096
+global pn ulong 1
+global av uchar 64
+global avn ulong 1
+global sd uchar 2048
+global sdn ulong 1
+global kr uchar 4096
+global krn ulong 1
+global kz uchar 64
+global dg uchar 32
+global hx uchar 64
+global cs uchar 64
+global cb uchar 128
+global fs ulong 2
+global pk uchar 4096
+global pkn ulong 1
+global mo ulong 1
+global vq ulong 1
+global vt ulong 1
+global vm ulong 1
+global vf ulong 1
+global ve ulong 1
+global vc ulong 1
+global ssep ulong 1
+global vtb uchar 4096
+global vtn ulong 1
+global vti ulong 384
+global vtc ulong 1
+global vln ulong 1
+global stt uchar 128
+global nts uchar 32
+global ntn ulong 1
+global lts uchar 32
+global ltn ulong 1
+global fa ulong 12
+global rbot uchar 256
+global rbn ulong 1
+global vc0 ulong 1
+global vcl ulong 1
+global vd0 ulong 1
+global vdl ulong 1
+text thex "0123456789abcdef"
+text tenc "enc"
+text tdec "dec"
+text tsha "sha"
+text tsign "sign"
+text tver "verify"
+text tr45 "r45"
+text tins "inst"
+text tsig "sig"
+text temg "emerg"
+text tocb "ocb2:"
+text tocb4 "ocb2"
+text tocbo "ocb1:"
+text tocb1 "ocb1"
+text tctr ".ctr"
+text ttmp ".tmp"
+text tlock "ctr.lock"
+text eesyn "ERR syntax"
+text eerng "ERR range"
+text eelen "ERR len"
+text eedig "ERR digit"
+text eeesc "ERR esc"
+text eesnd "ERR sender"
+text eectr "ERR counter"
+text eeunk "ERR unknown"
+text eefmt "ERR fmt"
+text vok "ok"
+text vuns "unsigned"
+text vsnd "badsender"
+text vfmt "badfmt"
+text vcb "badcb"
+text vlen "badlen"
+text vdig "baddigit"
+text vesc "badesc"
+text vunk "unknown"
+text vmac "badmac"
+text vstl "stale"
+text vleg "legacy"
+text vto "badto"
+
+note The trit type: only tritmk makes one, so no value outside 0..2 exists.
+fn tritmk x uint to trit
+if gt x 2
+exit 70
+end
+ret seal trit x
+end
+
+note Lean lineTrit: 2 only for a verified line that carries an emergency code, else 1.
+fn ltrit ok bool em bool to trit
+if and ok em
+ret tritmk 2
+end
+ret tritmk 1
+end
+
+fn obyte c uchar to void
+n = get obn 0
+if ge n len ob
+e1 = enlarge ob add mul n 2 4096
+if ne e1 0
+exit 72
+end
+end
+put ob n c
+put obn 0 add n 1
+end
+
+fn otext t view uchar * to void
+for i ulong len t bound BIG
+obyte get t i
+end
+end
+
+fn mbyte c uchar to void
+n = get mbn 0
+if ge n len mb
+e1 = enlarge mb add mul n 2 4096
+if ne e1 0
+exit 72
+end
+end
+put mb n c
+put mbn 0 add n 1
+end
+
+fn msbyte c uchar to void
+n = get msn 0
+if ge n len ms
+e1 = enlarge ms add mul n 2 4096
+if ne e1 0
+exit 72
+end
+end
+put ms n c
+put msn 0 add n 1
+end
+
+fn gpush v ulong to void
+n = get ng 0
+if ge n len gr
+e1 = enlarge gr add mul n 2 64
+if ne e1 0
+exit 72
+end
+end
+put gr n v
+put ng 0 add n 1
+end
+
+fn cpush v ulong to void
+n = get nc 0
+if ge n len ce
+e1 = enlarge ce add mul n 2 64
+if ne e1 0
+exit 72
+end
+end
+put ce n v
+put nc 0 add n 1
+end
+
+fn wrall fd int to void
+i = ulong 0
+n = get obn 0
+while lt i n bound BIG
+r = write fd ob i sub n i
+if le r 0
+exit 75
+end
+i = add i ulong r
+end
+put obn 0 0
+end
+
+fn odec v ulong to void
+n = ulong 1
+x = v
+while ge x 10 bound BIG
+x = div x 10
+n = add n 1
+end
+x = v
+for i ulong n bound BIG
+put cb sub sub n 1 i add uchar rem x 10 48
+x = div x 10
+end
+for j ulong n bound BIG
+obyte get cb j
+end
+end
+
+fn o3 v ulong to void
+obyte add uchar rem div v 100 10 48
+obyte add uchar rem div v 10 10 48
+obyte add uchar rem v 10 48
+end
+
+note Read all of fd into fb (grows as needed; no size limit).
+fn ldfd fd int to void
+n = ulong 0
+while true bound BIG
+if lt len fb add n 4096
+e1 = enlarge fb add mul n 2 8192
+if ne e1 0
+exit 72
+end
+end
+r = read int fd fb n 4096
+if lt r 0
+exit 73
+end
+if eq r 0
+break
+end
+n = add n ulong r
+end
+put fbn 0 n
+end
+
+fn argpb a ulong to void
+p = argread a pb 0 len pb
+if lt p 1
+exit 2
+end
+put pn 0 ulong p
+end
+
+fn loadp to bool
+put fbn 0 0
+fd = fopen pb 0 get pn 0 0 0
+if lt fd 0
+ret false
+end
+ldfd int fd
+e2 = fclose int fd
+ret true
+end
+
+fn isdig c uchar to bool
+if lt c 48
+ret false
+end
+if gt c 57
+ret false
+end
+ret true
+end
+
+fn ishex c uchar to bool
+if isdig c
+ret true
+end
+if lt c 97
+ret false
+end
+if gt c 102
+ret false
+end
+ret true
+end
+
+fn okch c uchar to bool
+if isdig c
+ret true
+end
+if eq c 45
+ret true
+end
+if lt c 97
+ret false
+end
+if gt c 122
+ret false
+end
+ret true
+end
+
+fn lnend p ulong to ulong
+i = p
+while lt i get fbn 0 bound BIG
+if eq get fb i 10
+ret i
+end
+i = add i 1
+end
+ret i
+end
+
+note Field kk of fb[p..e) split on byte sp, into fs 0 (start) and fs 1 (end).
+fn splitf p ulong e ulong kk ulong sp uchar to bool
+s = p
+f = ulong 0
+i = p
+while lt i e bound BIG
+if eq get fb i sp
+if eq f kk
+put fs 0 s
+put fs 1 i
+ret true
+end
+f = add f 1
+s = add i 1
+end
+i = add i 1
+end
+if eq f kk
+put fs 0 s
+put fs 1 e
+ret true
+end
+ret false
+end
+
+fn feq t view uchar * to bool
+s = get fs 0
+n = sub get fs 1 s
+if ne n len t
+ret false
+end
+for i ulong n bound BIG
+if ne get fb add s i get t i
+ret false
+end
+end
+ret true
+end
+
+fn dv q ulong to ulong
+ret ulong sub get fb q 48
+end
+
+note Decode fb[p..e) into groups gr and code ends ce (index of each code's last group).
+note 0 ok, 1 length not a multiple of 3, 2 non-digit, 3 dangling escape (Lean groups/parse).
+fn decl p ulong e ulong to ulong
+put ng 0 0
+put nc 0 0
+n = sub e p
+if ne rem n 3 0
+ret 1
+end
+for i ulong n bound BIG
+if eq isdig get fb add p i false
+ret 2
+end
+end
+m = div n 3
+for j ulong m bound BIG
+q = add p mul j 3
+g = add add mul dv q 100 mul dv add q 1 10 dv add q 2
+gpush g
+if lt g 900
+cpush sub get ng 0 1
+end
+end
+if gt get ng 0 0
+if ge get gr sub get ng 0 1 900
+ret 3
+end
+end
+ret 0
+end
+
+note Canonical text of the decoded codes: groups in decimal joined by '.', codes joined by ' '.
+fn otcode to void
+s = ulong 0
+for j ulong get nc 0 bound BIG
+if gt j 0
+obyte 32
+end
+en = get ce j
+i = s
+while le i en bound BIG
+if gt i s
+obyte 46
+end
+odec get gr i
+i = add i 1
+end
+s = add en 1
+end
+end
+
+note Parse the text form fb[p..e) into gr/ce: 0 ok, 4 syntax, 5 range (escape 900..999 before a
+note terminal 0..899, Lean Valid).
+fn encp p ulong e ulong to ulong
+put ng 0 0
+put nc 0 0
+if eq p e
+ret 0
+end
+i = p
+while true bound BIG
+v = ulong 0
+d = ulong 0
+while lt i e bound BIG
+if eq isdig get fb i false
+break
+end
+v = add mul v 10 dv i
+d = add d 1
+i = add i 1
+end
+if or eq d 0 gt d 3
+ret 4
+end
+gpush v
+if eq i e
+cpush sub get ng 0 1
+break
+end
+c = get fb i
+if eq c 32
+cpush sub get ng 0 1
+else
+if ne c 46
+ret 4
+end
+end
+i = add i 1
+end
+ret encv
+end
+
+fn encv to ulong
+s = ulong 0
+for j ulong get nc 0 bound BIG
+en = get ce j
+i = s
+while le i en bound BIG
+g = get gr i
+if lt i en
+if lt g 900
+ret 5
+end
+else
+if ge g 900
+ret 5
+end
+end
+i = add i 1
+end
+s = add en 1
+end
+ret 0
+end
+
+fn doenc to void
+p = ulong 0
+while lt p get fbn 0 bound BIG
+e = lnend p
+r = encp p e
+if eq r 0
+for i ulong get ng 0 bound BIG
+o3 get gr i
+end
+else
+if eq r 4
+otext eesyn
+else
+otext eerng
+end
+end
+obyte 10
+p = add e 1
+end
+end
+
+fn dodec to void
+p = ulong 0
+while lt p get fbn 0 bound BIG
+e = lnend p
+r = decl p e
+if eq r 0
+otcode
+else
+if eq r 1
+otext eelen
+end
+if eq r 2
+otext eedig
+end
+if eq r 3
+otext eeesc
+end
+end
+obyte 10
+p = add e 1
+end
+end
+
+note SHA-256 of mb[0..mbn) into h, streamed block by block over the seeded hinit/compress.
+note seed/trace/sha256.om:175 "fn sha256 data view uchar 4096" stops at 4096 bytes and a growable
+note global cannot be passed to it, so this driver pads and hashes buffers of any length.
+fn hmb to void
+hinit
+n = get mbn 0
+full = div n 64
+for b ulong full bound BIG
+o = mul b 64
+for i ulong 64
+put blk i get mb add o i
+end
+compress
+end
+hpad mul full 64 rem n 64 n
+end
+
+fn hpad o ulong left ulong n ulong to void
+for i ulong 64
+put blk i 0
+end
+for j ulong left bound BIG
+put blk j get mb add o j
+end
+put blk left 128
+if ge left 56
+compress
+for i ulong 64
+put blk i 0
+end
+end
+bits = mul n 8
+for q ulong 8
+v = and shr bits mul sub 7 q 8 255
+put blk add 56 q uchar v
+end
+compress
+end
+
+fn hdig to void
+for i ulong 8
+v = ulong get h i
+for j ulong 4
+put dg add mul i 4 j uchar and shr v mul sub 3 j 8 255
+end
+end
+end
+
+fn hhex to void
+for i ulong 8
+v = ulong get h i
+for j ulong 4
+x = and shr v mul sub 3 j 8 255
+o = add mul i 8 mul j 2
+put hx o get thex shr x 4
+put hx add o 1 get thex and x 15
+end
+end
+end
+
+note HMAC key block K0 (RFC 2104): the key, or its sha256 when longer than 64 bytes, zero padded.
+fn mkk0 to void
+for i ulong 64
+put kz i 0
+end
+n = get krn 0
+if gt n 64
+put mbn 0 0
+for j ulong n bound BIG
+mbyte get kr j
+end
+hmb
+hdig
+for q ulong 32
+put kz q get dg q
+end
+ret
+end
+for j ulong n bound BIG
+put kz j get kr j
+end
+end
+
+note HMAC-SHA256(K0, ms) as 64 hex bytes in hx: H((K0^ipad) || H((K0^opad)... per RFC 2104.
+fn hmac to void
+put mbn 0 0
+for i ulong 64
+mbyte uchar xor get kz i 54
+end
+for j ulong get msn 0 bound BIG
+mbyte get ms j
+end
+hmb
+hdig
+put mbn 0 0
+for i ulong 64
+mbyte uchar xor get kz i 92
+end
+for q ulong 32
+mbyte get dg q
+end
+hmb
+hhex
+for i ulong 64
+put mb i 0
+end
+end
+
+fn zap to void
+for i ulong len kr
+put kr i 0
+end
+for j ulong 64
+put kz j 0
+end
+if ge len mb 64
+for q ulong 64
+put mb q 0
+end
+end
+end
+
+fn isty p ulong e ulong to ulong
+if feq tr45
+ret 1
+end
+if feq tins
+ret 2
+end
+if feq tsig
+ret 3
+end
+if feq temg
+ret 4
+end
+ret 0
+end
+
+fn sameb a ulong b ulong n ulong to bool
+for i ulong n bound BIG
+if ne get fb add a i get fb add b i
+ret false
+end
+end
+ret true
+end
+
+note One TSV entry fb[p..e): code (one valid layered code), type (r45|inst|sig|emerg), meaning
+note (1..200 printable bytes). 3xx codes and the emerg type go together. A code may appear once.
+fn cbent p ulong e ulong to bool
+if eq splitf p e 3 9 true
+ret false
+end
+if eq splitf p e 2 9 false
+ret false
+end
+ms0 = get fs 0
+ml = sub get fs 1 ms0
+if or eq ml 0 gt ml 200
+ret false
+end
+for i ulong ml bound BIG
+c = get fb add ms0 i
+if or lt c 32 gt c 126
+ret false
+end
+end
+if eq splitf p e 1 9 false
+ret false
+end
+ty = isty p e
+if eq ty 0
+ret false
+end
+if eq splitf p e 0 9 false
+ret false
+end
+cs0 = get fs 0
+cl = sub get fs 1 cs0
+r = decl cs0 add cs0 cl
+if or ne r 0 ne get nc 0 1
+ret false
+end
+ret cbent2 cs0 cl ty
+end
+
+fn cbent2 cs0 ulong cl ulong ty ulong to bool
+em = false
+if eq get ng 0 1
+g = get gr 0
+if and ge g 300 lt g 400
+em = true
+end
+end
+if ne em eq ty 4
+ret false
+end
+for i ulong get nen 0 bound BIG
+b = mul i 2
+if eq get eo add b 1 cl
+if sameb get eo b cs0 cl
+ret false
+end
+end
+end
+n = get nen 0
+if lt len eo add mul n 2 2
+e1 = enlarge eo add mul n 4 64
+if ne e1 0
+exit 72
+end
+end
+put eo mul n 2 cs0
+put eo add mul n 2 1 cl
+put nen 0 add n 1
+ret true
+end
+
+note Validate and index the codebook in fb. Every line ends in LF; '#' lines are comments.
+fn cbval to bool
+put nen 0 0
+n = get fbn 0
+if eq n 0
+ret false
+end
+if ne get fb sub n 1 10
+ret false
+end
+p = ulong 0
+while lt p n bound BIG
+e = lnend p
+if ne get fb p 35
+if eq cbent p e false
+ret false
+end
+end
+p = add e 1
+end
+ret true
+end
+
+note Load, validate and index the codebook named by argument a; its sha256 (hex) is the id in cs.
+fn ldcb a ulong to void
+argpb a
+ldcbq
+end
+
+note Load and validate the codebook whose path is already in pb (exit 4 when unreadable or invalid).
+fn ldcbq to void
+if eq loadp false
+exit 4
+end
+if eq cbval false
+exit 4
+end
+n = get fbn 0
+put mbn 0 0
+for i ulong n bound BIG
+mbyte get fb i
+end
+hmb
+hhex
+for j ulong 64
+put cs j get hx j
+end
+if lt len cbk n
+e1 = enlarge cbk add n 64
+if ne e1 0
+exit 72
+end
+end
+for q ulong n bound BIG
+put cbk q get fb q
+end
+put cbn 0 n
+end
+
+fn ldkey a ulong to void
+argpb a
+ldkeyq
+end
+
+note True when pb[0..pn) has a path segment exactly equal to boards (so a key inside
+note boards/ is refused; a name like boards-key is not).
+fn bdseg to bool
+n = get pn 0
+i = ulong 0
+while le i n bound BIG
+e = i
+while lt e n bound BIG
+if eq get pb e 47
+break
+end
+e = add e 1
+end
+if eq sub e i 6
+q = ulong 0
+if eq get pb i 98
+if eq get pb add i 1 111
+if eq get pb add i 2 97
+if eq get pb add i 3 114
+if eq get pb add i 4 100
+if eq get pb add i 5 115
+q = 1
+end
+end
+end
+end
+end
+end
+if eq q 1
+ret true
+end
+end
+if eq e n
+break
+end
+i = add e 1
+end
+ret false
+end
+
+fn ldkeyq to void
+if eq bdseg true
+exit 5
+end
+fd = fopen pb 0 get pn 0 0 0
+if lt fd 0
+exit 5
+end
+fsr = fstat int fd stt 0 128
+e2 = fclose int fd
+if or lt fsr 0 ne and get stt 16 63 0
+exit 5
+end
+if eq loadp false
+exit 5
+end
+n = get fbn 0
+if or eq n 0 gt n len kr
+exit 5
+end
+for i ulong n bound BIG
+put kr i get fb i
+put fb i 0
+end
+put krn 0 n
+mkk0
+end
+
+fn rdin to void
+put fbn 0 0
+ldfd int 0
+end
+
+note fb[a..a+n) equals cbk[s..s+n).
+fn cbeq a ulong s ulong n ulong to bool
+for j ulong n bound BIG
+if ne get fb add a j get cbk add s j
+ret false
+end
+end
+ret true
+end
+
+note Is the code fb[a..a+n) an entry of the loaded codebook?
+fn lookup a ulong n ulong to bool
+for i ulong get nen 0 bound BIG
+b = mul i 2
+if eq get eo add b 1 n
+if cbeq a get eo b n
+ret true
+end
+end
+end
+ret false
+end
+
+note All codes decoded from digits at p are in the codebook.
+fn known p ulong to bool
+s = ulong 0
+for j ulong get nc 0 bound BIG
+en = get ce j
+a = add p mul s 3
+n = mul sub add en 1 s 3
+if eq lookup a n false
+ret false
+end
+s = add en 1
+end
+ret true
+end
+
+note Lean emerg: some code is the single group 300..399.
+fn hasem to bool
+s = ulong 0
+for j ulong get nc 0 bound BIG
+en = get ce j
+if eq en s
+g = get gr s
+if and ge g 300 lt g 400
+ret true
+end
+end
+s = add en 1
+end
+ret false
+end
+
+fn slugok s ulong n ulong to bool
+if or eq n 0 gt n 64
+ret false
+end
+for i ulong n bound BIG
+if eq okch get fb add s i false
+ret false
+end
+end
+ret true
+end
+
+note Canonical counter: 1..18 digits, no leading zero; returns the value or 0 when malformed.
+fn ctrval s ulong n ulong to ulong
+if or eq n 0 gt n 18
+ret 0
+end
+if eq get fb s 48
+ret 0
+end
+v = ulong 0
+for i ulong n bound BIG
+c = get fb add s i
+if eq isdig c false
+ret 0
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn msrng s ulong n ulong to void
+for i ulong n bound BIG
+msbyte get fb add s i
+end
+end
+
+note tsok: YYYY-MM-DDTHH:MM, 16 bytes, so lexicographic compare matches time order.
+fn tsok s ulong n ulong to bool
+if ne n 16
+ret false
+end
+for i ulong 16
+c = get fb add s i
+if or eq i 4 eq i 7
+if ne c 45
+ret false
+end
+else
+if eq i 10
+if ne c 84
+ret false
+end
+else
+if eq i 13
+if ne c 58
+ret false
+end
+else
+if eq isdig c false
+ret false
+end
+end
+end
+end
+end
+ret true
+end
+
+note tsok on a copy in nts (the line's ts is saved there before wrctr).
+fn ntsok to bool
+if ne get ntn 0 16
+ret false
+end
+for i ulong 16
+c = get nts i
+if or eq i 4 eq i 7
+if ne c 45
+ret false
+end
+else
+if eq i 10
+if ne c 84
+ret false
+end
+else
+if eq i 13
+if ne c 58
+ret false
+end
+else
+if eq isdig c false
+ret false
+end
+end
+end
+end
+end
+ret true
+end
+
+note Last accepted ts (lts) is <= the new ts in nts. An empty last ts always passes.
+fn tsge to bool
+if eq get ltn 0 0
+ret true
+end
+if ne get ltn 0 get ntn 0
+ret false
+end
+for i ulong get ntn 0 bound BIG
+a = get lts i
+b = get nts i
+if lt b a
+ret false
+end
+if lt a b
+ret true
+end
+end
+ret true
+end
+
+note Fill fa[0..11] with start/end of the 6 content fields in fb[p..q).
+fn setfa p ulong q ulong to bool
+kk = ulong 0
+s = p
+i = p
+while lt i q bound BIG
+if eq get fb i 124
+if eq kk 5
+ret false
+end
+put fa mul kk 2 s
+put fa add mul kk 2 1 i
+kk = add kk 1
+s = add i 1
+end
+i = add i 1
+end
+if ne kk 5
+ret false
+end
+put fa 10 s
+put fa 11 q
+ret true
+end
+
+fn savets to void
+a = get fa 0
+b = get fa 1
+n = sub b a
+if gt n 32
+n = 32
+end
+for i ulong n bound BIG
+put nts i get fb add a i
+end
+put ntn 0 n
+end
+
+note ms = ocb2|cbsha|counter|lane|ts|from|to|tag|text|ref|digits.
+fn mkocb to void
+put msn 0 0
+msbyte 111
+msbyte 99
+msbyte 98
+msbyte 50
+msbyte 124
+for i ulong 64
+msbyte get cs i
+end
+msbyte 124
+msrng get vc0 0 get vcl 0
+msbyte 124
+msbyte uchar get vln 0
+for kk ulong 6
+msbyte 124
+a = get fa mul kk 2
+b = get fa add mul kk 2 1
+msrng a sub b a
+end
+msbyte 124
+msrng get vd0 0 get vdl 0
+end
+
+note ms = sender|cbsha|counter|digits (kept for the ocb1 path, which never verifies).
+fn mkmsg s ulong sn ulong c ulong cn ulong d ulong dn ulong to void
+put msn 0 0
+msrng s sn
+msbyte 124
+for i ulong 64
+msbyte get cs i
+end
+msbyte 124
+msrng c cn
+msbyte 124
+msrng d dn
+end
+
+fn dosign to void
+p = ulong 0
+while lt p get fbn 0 bound BIG
+e = lnend p
+signl p e
+obyte 10
+p = add e 1
+end
+end
+
+fn signl p ulong e ulong to void
+c = ulong 0
+i = p
+while lt i e bound BIG
+if eq get fb i 124
+c = add c 1
+end
+i = add i 1
+end
+if ne c 8
+otext eefmt
+ret
+end
+if eq splitf p e 0 124 false
+otext eefmt
+ret
+end
+if ne sub get fs 1 get fs 0 1
+otext eefmt
+ret
+end
+o = get fs 0
+if and ne get fb o 110 ne get fb o 101
+otext eefmt
+ret
+end
+put vln 0 ulong get fb o
+if eq splitf p e 1 124 false
+otext eefmt
+ret
+end
+if eq tsok get fs 0 sub get fs 1 get fs 0 false
+otext eefmt
+ret
+end
+if eq splitf p e 2 124 false
+otext eefmt
+ret
+end
+if eq slugok get fs 0 sub get fs 1 get fs 0 false
+otext eesnd
+ret
+end
+if eq splitf p e 3 124 false
+otext eefmt
+ret
+end
+if eq slugok get fs 0 sub get fs 1 get fs 0 false
+otext eefmt
+ret
+end
+if eq splitf p e 7 124 false
+otext eefmt
+ret
+end
+put vc0 0 get fs 0
+put vcl 0 sub get fs 1 get fs 0
+if eq ctrval get vc0 0 get vcl 0 0
+otext eectr
+ret
+end
+if eq splitf p e 8 124 false
+otext eefmt
+ret
+end
+put vd0 0 get fs 0
+put vdl 0 sub get fs 1 get fs 0
+if eq splitf p e 1 124 false
+otext eefmt
+ret
+end
+a = get fs 0
+if eq splitf p e 7 124 false
+otext eefmt
+ret
+end
+if eq setfa a sub get fs 0 1 false
+otext eefmt
+ret
+end
+savets
+if eq ntsok false
+otext eefmt
+ret
+end
+r = decl get vd0 0 add get vd0 0 get vdl 0
+if ne r 0
+if eq r 1
+otext eelen
+end
+if eq r 2
+otext eedig
+end
+if eq r 3
+otext eeesc
+end
+ret
+end
+if eq known get vd0 0 false
+otext eeunk
+ret
+end
+mkocb
+hmac
+emitsig
+end
+
+fn emitsig to void
+otext tocb
+for i ulong 64
+obyte get cs i
+end
+obyte 58
+b = get vc0 0
+for j ulong get vcl 0 bound BIG
+obyte get fb add b j
+end
+obyte 58
+d = get vd0 0
+for q ulong get vdl 0 bound BIG
+obyte get fb add d q
+end
+obyte 58
+for t ulong 64
+obyte get hx t
+end
+end
+
+fn pbyte c uchar to void
+n = get pn 0
+if ge n len pb
+exit 71
+end
+put pb n c
+put pn 0 add n 1
+end
+
+fn ptext t view uchar * to void
+for i ulong len t bound BIG
+pbyte get t i
+end
+end
+
+note Counter file path STATE/<sender>.ctr into pb.
+fn ctrpath s ulong n ulong to void
+sdsep
+for j ulong n bound BIG
+pbyte get fb add s j
+end
+ptext tctr
+end
+
+note The sender's last accepted counter; 0 when no file. A malformed file returns BIG (fail closed).
+note File form is "<counter> <ts>\n"; a lone counter (old form) is accepted with an empty last ts.
+fn rdctf s ulong n ulong to ulong
+put ltn 0 0
+ctrpath s n
+fd = fopen pb 0 get pn 0 0 0
+if lt fd 0
+ret 0
+end
+r = read int fd cb 0 len cb
+e2 = fclose int fd
+if lt r 1
+ret BIG
+end
+m = ulong r
+if eq get cb sub m 1 10
+m = sub m 1
+end
+if eq m 0
+ret BIG
+end
+sp = BIG
+for i ulong m bound BIG
+if eq get cb i 32
+sp = i
+break
+end
+end
+ww = m
+if ne sp BIG
+ww = sp
+end
+if or eq ww 0 gt ww 18
+ret BIG
+end
+v = ulong 0
+for j ulong ww bound BIG
+c = get cb j
+if eq isdig c false
+ret BIG
+end
+v = add mul v 10 ulong sub c 48
+end
+if ne sp BIG
+if eq takets m sp false
+ret BIG
+end
+end
+ret v
+end
+
+fn takets m ulong sp ulong to bool
+tn = sub m add sp 1
+if or eq tn 0 gt tn 32
+ret false
+end
+x = add sp 1
+for kk ulong tn bound BIG
+put lts kk get cb add x kk
+end
+put ltn 0 tn
+ret true
+end
+
+fn pkrec to void
+n = get pn 0
+o = get pkn 0
+if gt add add o n 2 len pk
+exit 78
+end
+put pk o uchar and n 255
+put pk add o 1 uchar shr n 8
+for i ulong n bound BIG
+put pk add add o 2 i get pb i
+end
+put pkn 0 add add o n 2
+end
+
+note pb = STATE then the separator: '/' for codebook verify, '.' for trit (DIR/inbox/<bot>.<sender>.ctr).
+fn sdsep to void
+put pn 0 0
+for i ulong get sdn 0 bound BIG
+pbyte get sd i
+end
+if eq get ssep 0 0
+pbyte 47
+else
+pbyte uchar get ssep 0
+end
+end
+
+note The last accepted counter: the counter file, raised by the in-memory table (trit read mode).
+fn rdts i ulong n ulong to void
+o = get vti mul i 3
+for j ulong 16
+put lts j get vtb add add o n j
+end
+put ltn 0 16
+end
+
+fn rdctr s ulong n ulong to ulong
+v = rdctf s n
+t = vtget s n
+if gt t v
+i = vtfind s n
+if ne i BIG
+rdts i n
+end
+ret t
+end
+ret v
+end
+
+note In-memory counter table (sender bytes in vtb, entries off/len/ctr in vti): used when vt = 1,
+note so a read-only pass (trit without --ack) still refuses a replay later in the same pass.
+fn vtfind s ulong n ulong to ulong
+for i ulong get vtc 0 bound BIG
+b = mul i 3
+if eq get vti add b 1 n
+if vteq get vti b s n
+ret i
+end
+end
+end
+ret BIG
+end
+
+fn vteq o ulong s ulong n ulong to bool
+for j ulong n bound BIG
+if ne get vtb add o j get fb add s j
+ret false
+end
+end
+ret true
+end
+
+fn vtget s ulong n ulong to ulong
+i = vtfind s n
+if eq i BIG
+ret 0
+end
+ret get vti add mul i 3 2
+end
+
+fn vtput s ulong n ulong c ulong to void
+i = vtfind s n
+if ne i BIG
+b = mul i 3
+if gt c get vti add b 2
+put vti add b 2 c
+o2 = get vti b
+for j ulong get ntn 0 bound BIG
+put vtb add add o2 n j get nts j
+end
+end
+ret
+end
+o = get vtn 0
+kq = get vtc 0
+tn = get ntn 0
+if or gt add add o n tn len vtb ge mul add kq 1 3 len vti
+exit 79
+end
+for j ulong n bound BIG
+put vtb add o j get fb add s j
+end
+for kk ulong tn bound BIG
+put vtb add add o n kk get nts kk
+end
+b2 = mul kq 3
+put vti b2 o
+put vti add b2 1 n
+put vti add b2 2 c
+put vtn 0 add add o n tn
+put vtc 0 add kq 1
+end
+
+note fsync the directory holding the path in pb, so a rename survives a crash (opened O_RDONLY).
+fn syncdir to void
+n = get pn 0
+i = n
+while gt i 0 bound BIG
+if eq get pb sub i 1 47
+break
+end
+i = sub i 1
+end
+if eq i 0
+put pn 0 0
+pbyte 46
+else
+if eq i 1
+put pn 0 1
+else
+put pn 0 sub i 1
+end
+end
+fd = fopen pb 0 get pn 0 0 0
+if lt fd 0
+exit 77
+end
+s1 = fsync int fd
+e2 = fclose int fd
+if ne s1 0
+exit 77
+end
+end
+
+note Exclusive flock on STATE<sep>ctr.lock for one verify-and-advance pass. The lock file is never
+note renamed, so it stays the same inode while the .ctr files are replaced by rename.
+fn lockst to int
+sdsep
+ptext tlock
+fd = fopen pb 0 get pn 0 66 384
+if lt fd 0
+exit 76
+end
+r = flock int fd 2
+if ne r 0
+exit 76
+end
+ret int fd
+end
+
+fn unlockst fd int to void
+r = flock fd 8
+e2 = fclose fd
+end
+
+note Verify fb[p..e) with the verdict in globals: vm (MAC good), vf (ok: MAC good and fresh),
+note ve (ok and some code is 3xx), vc (the counter when vm). Prints only when vq = 0.
+fn verx p ulong e ulong to void
+put vm 0 0
+put vf 0 0
+put ve 0 0
+put vc 0 0
+if eq get vln 0 0
+put vln 0 110
+end
+verl p e
+end
+
+note Atomic counter write: "<counter> <ts>\n" into <file>.tmp, fsync, then renameat2 over the file.
+fn wrctr s ulong n ulong c ulong cn ulong to void
+for i ulong cn bound BIG
+put cb i get fb add c i
+end
+put cb cn 32
+for j ulong get ntn 0 bound BIG
+put cb add add cn 1 j get nts j
+end
+put cb add add cn get ntn 0 1 10
+ctrpath s n
+ptext ttmp
+fd = fopen pb 0 get pn 0 577 384
+if lt fd 0
+exit 76
+end
+w2 = ulong 0
+m = add add cn get ntn 0 2
+while lt w2 m bound BIG
+r = write int fd cb w2 sub m w2
+if le r 0
+exit 77
+end
+w2 = add w2 ulong r
+end
+s1 = fsync int fd
+e2 = fclose int fd
+if ne s1 0
+exit 77
+end
+put pk 0 2
+put pk 1 0
+put pkn 0 2
+pkrec
+ctrpath s n
+pkrec
+rn = renames pk 0 get pkn 0 0
+if ne rn 0
+exit 77
+end
+ctrpath s n
+syncdir
+end
+
+fn verdict v view uchar * t trit to void
+if eq get vq 0 1
+ret
+end
+otext v
+obyte 32
+obyte add uchar open t 48
+end
+
+fn bad v view uchar * to void
+verdict v ltrit false false
+end
+
+note A refused line that still decodes keeps its emergency request, and ltrit demotes it to 1.
+fn bademd v view uchar * to void
+verdict v ltrit false hasem
+end
+
+note Unsigned with an ocb1 field: decode its digits (part 3) only to pass the request to ltrit.
+fn baduns f ulong e ulong to void
+if splitf f e 3 58
+d = get fs 0
+if eq decl d get fs 1 0
+bademd vuns
+ret
+end
+end
+bad vuns
+end
+
+fn dover to void
+p = ulong 0
+while lt p get fbn 0 bound BIG
+e = lnend p
+verx p e
+obyte 10
+p = add e 1
+end
+end
+
+note Last '|' field of fb[p..e) into fs; false when the line has no '|'.
+fn lastf p ulong e ulong to bool
+i = e
+while gt i p bound BIG
+if eq get fb sub i 1 124
+put fs 0 i
+put fs 1 e
+ret true
+end
+i = sub i 1
+end
+ret false
+end
+
+note Verify one inbox line; the check order is Lean `status`.
+fn verl p ulong e ulong to void
+if eq lastf p e false
+bad vuns
+ret
+end
+f = get fs 0
+if or lt sub e f 5 eq splitf f e 0 58 false
+bad vuns
+ret
+end
+if eq feq tocb1 true
+bad vleg
+ret
+end
+if eq feq tocb4 false
+bad vuns
+ret
+end
+if eq splitf f e 4 58 false
+baduns f e
+ret
+end
+if eq get fs 0 get fs 1
+baduns f e
+ret
+end
+verl2 p e f
+end
+
+note toeq: when a receiving bot is set (rbn > 0), field 2 (to) must equal rbot.
+fn toeq to bool
+if eq get rbn 0 0
+ret true
+end
+a = get fa 4
+b = get fa 5
+if ne sub b a get rbn 0
+ret false
+end
+for i ulong get rbn 0 bound BIG
+if ne get fb add a i get rbot i
+ret false
+end
+end
+ret true
+end
+
+fn verl2 p ulong e ulong f ulong to void
+if eq splitf p e 1 124 false
+bad vsnd
+ret
+end
+s = get fs 0
+sn = sub get fs 1 s
+if eq slugok s sn false
+bad vsnd
+ret
+end
+if eq f p
+bad vfmt
+ret
+end
+if eq setfa p sub f 1 false
+bad vfmt
+ret
+end
+savets
+if eq ntsok false
+bad vfmt
+ret
+end
+if eq toeq false
+bad vto
+ret
+end
+if splitf f e 5 58
+bad vfmt
+ret
+end
+if eq splitf f e 4 58 false
+bad vfmt
+ret
+end
+mac = get fs 0
+if ne sub get fs 1 mac 64
+bad vfmt
+ret
+end
+for i ulong 64
+if eq ishex get fb add mac i false
+bad vfmt
+ret
+end
+end
+verl3 s sn f e mac
+end
+
+fn verl3 s ulong sn ulong f ulong e ulong mac ulong to void
+if eq splitf f e 1 58 false
+bad vfmt
+ret
+end
+hs = get fs 0
+if ne sub get fs 1 hs 64
+bad vfmt
+ret
+end
+if eq splitf f e 2 58 false
+bad vfmt
+ret
+end
+c = get fs 0
+cn = sub get fs 1 c
+ctr = ctrval c cn
+if eq ctr 0
+bad vfmt
+ret
+end
+for i ulong 64
+if ne get fb add hs i get cs i
+bad vcb
+ret
+end
+end
+if eq splitf f e 3 58 false
+bad vfmt
+ret
+end
+d = get fs 0
+dn = sub get fs 1 d
+put mo 0 mac
+verl4 s sn c cn d dn
+end
+
+note The computed MAC (hx) equals the line's MAC at fb[mo]; all 64 bytes are compared every time.
+fn maceq to bool
+mac = get mo 0
+x = ulong 0
+for i ulong 64
+y = xor get hx i get fb add mac i
+x = or x ulong y
+end
+ret eq x 0
+end
+
+note At most 6 parameters per function (OMEGESE.md:492), so the MAC offset rides in global mo.
+fn verl4 s ulong sn ulong c ulong cn ulong d ulong dn ulong to void
+r = decl d add d dn
+if eq r 1
+bad vlen
+ret
+end
+if eq r 2
+bad vdig
+ret
+end
+if eq r 3
+bad vesc
+ret
+end
+if eq known d false
+bad vunk
+ret
+end
+put vc0 0 c
+put vcl 0 cn
+put vd0 0 d
+put vdl 0 dn
+mkocb
+hmac
+if eq maceq false
+bad vmac
+ret
+end
+ctr = ctrval c cn
+put vm 0 1
+put vc 0 ctr
+if le ctr rdctr s sn
+bad vstl
+ret
+end
+if eq tsge false
+bad vstl
+ret
+end
+if eq get vt 0 0
+wrctr s sn c cn
+else
+vtput s sn ctr
+end
+put vf 0 1
+if hasem
+put ve 0 1
+end
+verdict vok ltrit true hasem
+end
