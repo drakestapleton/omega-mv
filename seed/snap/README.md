@@ -1,6 +1,6 @@
 # seed/snap: words that click
 
-Status: IMPLEMENTED, HOST_TESTED (2026-11-14). Not wired into any engine. No model has written a strand. GPU: NOT_RUN.
+Status: IMPLEMENTED, HOST_TESTED (2026-11-14; kfdctl fix and gate checks 2026-11-15). Not wired into any engine. No model has written a strand. GPU: NOT_RUN.
 
 In an Omega program some items have no alternative: after `add a b` the line must end, and after `ret x` at
 the end of a function the next line must be `end`. `snap.om` finds those items exactly where it can and
@@ -20,13 +20,16 @@ leaves everything else alone. It is the base for two ways of not paying a model 
 `words.table` is one line per compiler word, `NAME ARITY FLAGS`, generated from omega-mcp `data/reference.json`
 for the compiler in use (the reference whose `pin.omc_sha256` is `seed/out/omc`'s sha256; get it with
 `git clone https://interplane.io/drakestapleton/omega-mcp.git` and use `omega-mcp/data/reference.json` at the
-commit whose pin matches, or make it with that repository's `tools/gen-reference.py` against omega-mv at the
+commit whose pin matches (for omc `26540e6d…8991` that is omega-mcp main `44cf6b20`), or make it with that repository's `tools/gen-reference.py` against omega-mv at the
 pinned head) by `gate.py --table REFERENCE_JSON > seed/snap/words.table`; the gate fails when the
 file is stale for that reference or the reference's pin is not the compiler under test. FLAGS: 1 a type word; 2 a word whose
 reference form has an optional tail (`[` in the form) and no rule of its own in snap, today only `kfdctl`,
-whose SUFFIX length depends on the request; 0 otherwise. Modes: `strip`, `expand`, `count`. Every mode prints
+whose SUFFIX length depends on the request; 0 otherwise. Modes: `strip`, `expand`, `count`. Every mode that reads a program prints
 `snap items N forced F bad B` on stderr. `strip` and `count` exit 3 (strip with no stdout) when the program has
-something else where an item was forced (omc refuses such a program too). Other exits: 64 an unknown mode
+a word or line end where an item was forced (omc refuses such a program too). `note` and `text` lines are
+not checked against a forced `end`, and `om2` with blanks around it is taken as an om2 header (omc takes it only
+alone on its line), so strip can pass a few programs omc refuses and expand can turn them into programs omc
+accepts: compile what `expand` writes before trusting it. Other exits: 64 an unknown mode
 word, 65 a bad table number (also input with no `%%` line, whose mode word is then read as a table row),
 70 memory refused by the host, 71 read error, 72 write error. A mode word with no line end after it is an
 empty program: exit 0, `items 0`. `expand` reports a forced line end at the very end of a strand line as an
@@ -56,7 +59,7 @@ Before any check the gate requires REFERENCE_JSON's pin to be omc's sha256 and `
 projection, and checks that the oracle's word lists match `snap.om`'s. F (alarm) probes every word snap reads
 by its table arity: a program with exactly that many arguments compiles and one more word is refused (error 5);
 the words no probe program fits are printed by name on every run (today device words that need an
-allowlisted request value, and `part`), and stay a known gap.
+allowlisted request value, and `part`), and stay a known gap: a wrong arity on them would go unseen.
 
 Python is the test conductor and the oracle (`snapref.py`, a second writing of the same rules); the product
 is `snap.om`. The gate checks every program omc accepts: A strip equals the oracle, B expand equals the
@@ -83,15 +86,16 @@ measured by the SnapPairs lane and their receipts are not in this repository. To
 Gate run on the Spark (Linux AArch64) with the committed `seed/out/omc` (sha256 `26540e6d…8991`, unchanged at
 omega-mv main `e4271abd`), programs from the omega-harness examples, `bench/inference_cost/tasks` (references
 and the 20 deliberately wrong `mutant.om` answers, which still compile) and the fixtures: `SNAPGATE PASS
-accepted=110 items=9510 forced=1909 positions=1909 mutants=7/7 probed=125 unprobed=8 fail=0`.
+accepted=110 items=9510 forced=1909 positions=1909 mutants=7/7 probed=127 unprobed=6 fail=0`.
 
 - A/B: 110 of 110 accepted programs pass; every expanded program compiles to the same binary.
-- C: at all 1909 forced positions omc refused the alternative (error 5: 1548, error 16: 243, error 17: 118).
-  26 of the 144 `end` positions were refused with error 16 instead of 17, so there the inserted statement may
-  have been refused for another reason; those are weaker evidence.
+- C: every rebuilt program compiles (control), and at all 1909 forced positions omc refused the alternative
+  with the expected error: 5 at all 1765 line ends, 17 at all 144 `end` positions. (Before 2026-11-15 the gate
+  rebuilt om2 units as `om2 ` with a trailing blank, so 243 positions were refused for that reason alone, error 16;
+  any error other than 5 or 17 now fails the gate.)
 - D: 7 of 7 mutants caught (each fails 2 to 108 of the 110 programs).
 - E: optional-tail words: `kfdctl`, used by `fixtures/fx_kfdctl_*.om`.
-- F: 125 words probed in omc, 0 wrong; 8 unprobed, named in the gate output.
+- F: 127 words probed in omc, 0 wrong; 6 unprobed, named in the gate output.
 - The 71 programs omc refuses were all answered by `strip` (none trapped).
 - Fixed 2026-11-15: `strip` refused valid `kfdctl` programs (exit 3) because the table gave `kfdctl` a fixed
   arity of 5 while its SUFFIX adds 0, 1, 3 or 5 words by request. The first gate had no program using it.

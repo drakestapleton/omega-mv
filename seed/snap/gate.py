@@ -34,14 +34,14 @@ def sha(b):
 
 # arity probe: for each word snap reads by its table arity, a program omc accepts with exactly that many
 # arguments, and the same program with one more, which omc must refuse with error 5
-PRE = 'global H uchar 64\nglobal E uchar *\nfn main to int\n'
+PRE = 'global H uchar 64\nglobal E uchar *\nfn main to int\nh = long 1\n'
 FORMS = ('x = {w}\nret 0', '{w}\nret 0', 'ret int {w}', 'if {w}\nret 1\nend\nret 0')
-PLAIN = ('1', 'int 1', 'long 1', 'ulong 1', 'f64 1', 'f32 1', 'H', 'true')
+PLAIN = ('1', 'int 1', 'long 1', 'ulong 1', 'f64 1', 'f32 1', 'H', 'true', 'h')
 
 
 def slot(t):
     t = t.split(':', 1)[-1].lower()
-    for key, c in (('array', 'H'), ('uchar', 'H'), ('ulong', 'ulong 1'), ('uint', 'uint 1'), ('long', 'long 1'),
+    for key, c in (('handle', 'h'), ('array', 'H'), ('uchar', 'H'), ('ulong', 'ulong 1'), ('uint', 'uint 1'), ('long', 'long 1'),
                    ('int', 'int 1'), ('f64', 'f64 1'), ('f32', 'f32 1'), ('bool', 'true')):
         if key in t:
             return c
@@ -57,7 +57,7 @@ def arity_probe(omc, table, skip):
             continue
         a = v['arity']
         typed = [slot(t) for t in v.get('types', [])][:a]
-        cands = ([typed] if len(typed) == a else []) + [[c] * a for c in PLAIN]
+        cands = ([typed] + [typed[:1] + [c] * (a - 1) for c in ('1', '8')] if len(typed) == a and a else []) + [[c] * a for c in PLAIN]
         hit = None
         for unit in ('', 'om2\n'):                       # OM-2 words compile only in an om2 unit
             for args in cands:
@@ -171,7 +171,11 @@ def main():
         its = R.items(progs[f][0]); m = R.M(T)
 
         def text(lst):
-            return ''.join((x[1] + '\n') if x[0] == 'raw' else (x[1] if x[1] == '\n' else x[1] + ' ') for x in lst)
+            s = ''.join((x[1] + '\n') if x[0] == 'raw' else (x[1] if x[1] == '\n' else x[1] + ' ') for x in lst)
+            return s.replace(' \n', '\n')                  # omc reads `om2` only alone on its line
+        # control: the rebuilt program itself must compile, or the mutants below prove nothing
+        if compile_(text(its), os.path.join(scratch, 'm.bin')) != 0:
+            fails.append(('C', f, 'the rebuilt program does not compile (control)')); continue
         for k, it in enumerate(its):
             if it[0] == 'raw':
                 m.raw(it[2], it[3]); continue
@@ -182,6 +186,8 @@ def main():
                 kinds[('nl' if fo == '\n' else 'end', rc)] += 1
                 if rc == 0:
                     fails.append(('C', f, f'item {k}: omc accepts an alternative at a forced position'))
+                elif rc not in (5, 17):
+                    fails.append(('C', f, f'item {k}: omc error {rc}, not 5 or 17, so the refusal proves nothing'))
             m.feed(it[1])
     # E (alarm): a word with an optional tail that no accepted program uses is untested here; add a fixture
     tails = sorted(k for k, v in T.items() if R.flags(k, v) == 2)
