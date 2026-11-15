@@ -226,6 +226,7 @@ sh om/tls/test/gcmsiv/run.sh seed/out/omc
 sh om/tls/test/reuse/run.sh seed/out/omc
 sh seed/omc/gate-objects.sh seed/out/omc
 sh seed/omc/gate-objhost.sh seed/out/omc
+sh seed/omc/gate-cabi.sh seed/out/omc
 sh seed/text/tests/gate.sh
 # Diagnostic-v2 oracle and explicit uncovered-site inventory.
 python3 seed/omc/diagnostics-v2.py seed/out/omc
