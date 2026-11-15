@@ -198,18 +198,33 @@ the kernel (`(4*K+8*M)/(M*K)`, the maximum at M=K=4096) and at most 0.122% for
 the library (`(K+4*M)/(M*K)`, the same shape). Larger listed shapes are smaller
 shares.
 
-`bench_GB/s` is hipBLASLt's own `hipblaslt-GB/s` column, not the GB/s recomputed
-from the library byte count and the median `us`. `kernel_swizzle` is flags bit 0
-of this kernel. It changes which workgroup owns a row and does not change the
-byte count. It is not `--swizzleA`. 5.3 TB/s is the published MI300X HBM peak,
-not a measurement from this harness.
+`kernel_swizzle` is flags bit 0 of this kernel. It changes which workgroup owns
+a row and does not change the byte count. It is not `--swizzleA`. 5.3 TB/s is
+the published MI300X HBM peak, not a measurement from this harness.
 
-Both arms have a hot mode and a cold mode, and every line names the mode. Cold
-reads a 512 MiB device buffer before each timed sample, which also puts that
-read between samples. 512 MiB is larger than 256 MB, so the read does not fit
-in the L2 or in a 256 MB MALL. The kernel does the read in process. hipBLASLt's
-cold samples call the same binary (`time_fp8gemv --flush`) before each process.
-Hot does not do that read. `hipblaslt-bench --flush` flushes the instruction
-cache and is not passed. Hot uses 10 warmup launches on the buffers being
-timed, then 21 samples. Cold times 21 samples with no warmup after the read.
-Each line gives the median, the spread, and GB/s against the published peak.
+Both arms are timed in one `time_fp8gemv` process, and every line names the
+mode. Hot is 10 calls on the buffers being timed, then 21 samples. Nothing else
+reads or writes those operands between the samples. Cold, before each of 21
+samples, reads a 512 MiB device buffer and then times the next call. 512 MiB is
+larger than 256 MB, so that read does not fit in the L2 or in a 256 MB MALL.
+The kernel weights are not written between the read and the GEMV. The GEMM's A
+and B are filled once, before either library mode, and are not written between
+the read and `hipblasLtMatmul`. Each line is the minimum, the median, the
+maximum, and the spread of those 21 samples, then GB/s from that median and
+that arm's own byte count, against the published peak. There is no
+`bench_GB/s` column. hipblaslt-bench's `us` is one interval around every
+iteration, so it cannot be this median.
+
+The timer is `hipblasLtMatmul` in this process. In ROCm/hipBLASLt
+`3a609b06926c8227e753b62087555e1f435bf2d4`, `clients/include/testing_matmul.hpp`,
+`--flush` launches `flush_icache`, whose body is `s_icache_inv` and sixteen
+`s_nop 0`. `clients/benchmarks/README.md` describes `--rotating` as "Use
+rotating memory blocks for each iteration, size in MB." The client sets
+`rotating = arg.rotating * 1024 * 1024`, `max_iters = max(cold_iters, iters)`,
+and `block_count = max(1, min(max_iters, ceil(rotating / totalRotatingSizeNeeded)))`.
+The hot loop calls `hipblasLtMatmul` on copy `i % block_count`.
+`hipblaslt_init_device` and `broadcast` fill those copies before
+`pre_gpu_time` / `post_gpu_time`, one `hipEvent` pair around the whole hot
+loop. `clients/include/argument_model.hpp` `log_perf` divides that interval by
+`iters` when `iters > 1` and prints one `us`. That average follows a write of
+the operands, so this harness times each `hipblasLtMatmul` itself.

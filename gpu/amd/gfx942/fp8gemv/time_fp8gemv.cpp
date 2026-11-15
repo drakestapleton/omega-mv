@@ -1,14 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-// Times fp8gemv_stream on a machine that has /dev/kfd. bench.sh compiles this
-// with hipcc and passes the hsaco path.
+// Times fp8gemv_stream and hipblasLtMatmul on a machine that has /dev/kfd.
+// bench.sh compiles this with hipcc and passes the hsaco path. Both arms run
+// in this process.
 //
-// Two cache modes, both on this kernel:
-//   hot  - warmup launches, then samples, no extra traffic between them
-//   cold - a read of a 512 MiB device buffer between samples. 512 MiB is
-//          larger than 256 MB, so the read does not fit in the L2 or in a
-//          256 MB MALL. hipBLASLt's cold arm calls this same binary with
-//          --flush, so both arms take the same read and neither uses
-//          hipblaslt-bench --flush (that flag is an instruction-cache flush).
+//   hot  - 10 calls on the buffers being timed, then 21 samples. Nothing is
+//          read or written between those samples except the call itself.
+//   cold - before each of the 21 samples, a read of a 512 MiB device buffer.
+//          512 MiB is larger than 256 MB, so the read does not fit in the L2
+//          or in a 256 MB MALL. The GEMV weights and the GEMM A and B are not
+//          written between that read and the timed call.
+//
+// The library timer is hipblasLtMatmul. hipblaslt-bench --flush launches
+// flush_icache, which is s_icache_inv and sixteen s_nop 0
+// (clients/include/testing_matmul.hpp, ROCm/hipBLASLt
+// 3a609b06926c8227e753b62087555e1f435bf2d4). --rotating (size in MB,
+// clients/benchmarks/README.md) indexes copy i % block_count, with
+// block_count = max(1, min(max(cold_iters, iters), ceil(rotating /
+// totalRotatingSizeNeeded))). Those copies are initialized before one
+// hipEvent pair around the hot loop, and argument_model.hpp log_perf divides
+// that interval by iters. The operands were just written. That is not this
+// cold mode.
 //
 // flags bit 0 is the workgroup-to-row remap, not hipBLASLt's tensor swizzle.
 // Both settings are checked against the column-order plain reference before
@@ -24,6 +35,7 @@
 #include "plain_ref.h"
 
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -65,6 +77,16 @@ static_assert(offsetof(Args, flags) == 60, "flags offset");
     }                                                                          \
   } while (0)
 
+#define CHECK_LT(cmd)                                                          \
+  do {                                                                         \
+    hipblasStatus_t st_ = (cmd);                                               \
+    if (st_ != HIPBLAS_STATUS_SUCCESS) {                                       \
+      std::fprintf(stderr, "%s: hipblaslt status %d\n", #cmd,                  \
+                   static_cast<int>(st_));                                     \
+      return 1;                                                                \
+    }                                                                          \
+  } while (0)
+
 }  // namespace
 
 __global__ void flush_l2(const uint32_t* p, size_t n, uint32_t* sink) {
@@ -98,6 +120,187 @@ int flush_cache(uint32_t* buf, uint32_t* sink) {
   flush_l2<<<kFlushBlocks, 256>>>(buf, n, sink);
   CHECK(hipGetLastError());
   CHECK(hipDeviceSynchronize());
+  return 0;
+}
+
+void print_samples(const std::vector<double>& us) {
+  std::printf("samples_us");
+  for (double sample : us) std::printf(" %.4f", sample);
+  std::printf("\n");
+}
+
+// One hipblasLtMatmul per sample, on A and B that were filled once. Hot does
+// not touch those buffers between samples. Cold calls flush_cache and then
+// the matmul, and does not fill A or B again. beta is 0, so the byte count
+// is M*K + K + 4*M (A, B, D). C is a separate buffer and is not in that count,
+// which is the exclusion testing_matmul.hpp makes when beta is 0
+// (sizeC is 0 in totalRotatingSizeNeeded).
+int time_hipblaslt(uint32_t* flush_buf, uint32_t* flush_sink, hipEvent_t start,
+                   hipEvent_t stop, const uint32_t* rows, int nrows,
+                   const uint32_t* cols, int ncols) {
+  uint64_t biggest = 0;
+  uint32_t max_m = 0;
+  uint32_t max_k = 0;
+  for (int i = 0; i < nrows; ++i) {
+    max_m = std::max(max_m, rows[i]);
+    for (int j = 0; j < ncols; ++j) {
+      max_k = std::max(max_k, cols[j]);
+      biggest = std::max(biggest, static_cast<uint64_t>(rows[i]) * cols[j]);
+    }
+  }
+
+  void* a = nullptr;
+  void* b = nullptr;
+  void* c = nullptr;
+  void* d = nullptr;
+  void* scale_a = nullptr;
+  void* scale_b = nullptr;
+  void* workspace = nullptr;
+  CHECK(hipMalloc(&a, biggest));
+  CHECK(hipMalloc(&b, max_k));
+  CHECK(hipMalloc(&c, static_cast<size_t>(max_m) * sizeof(float)));
+  CHECK(hipMalloc(&d, static_cast<size_t>(max_m) * sizeof(float)));
+  CHECK(hipMalloc(&scale_a, sizeof(float)));
+  CHECK(hipMalloc(&scale_b, sizeof(float)));
+  const uint64_t kWorkspace = 128ull << 20;
+  CHECK(hipMalloc(&workspace, kWorkspace));
+  // Filled once. Neither hot nor cold writes A or B again.
+  CHECK(hipMemset(a, 0x40, biggest));
+  CHECK(hipMemset(b, 0x40, max_k));
+  const float one = 1.f;
+  CHECK(hipMemcpy(scale_a, &one, sizeof(one), hipMemcpyHostToDevice));
+  CHECK(hipMemcpy(scale_b, &one, sizeof(one), hipMemcpyHostToDevice));
+
+  hipblasLtHandle_t handle = nullptr;
+  CHECK_LT(hipblasLtCreate(&handle));
+  hipblasLtMatmulPreference_t pref = nullptr;
+  CHECK_LT(hipblasLtMatmulPreferenceCreate(&pref));
+  CHECK_LT(hipblasLtMatmulPreferenceSetAttribute(
+      pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &kWorkspace,
+      sizeof(kWorkspace)));
+
+  struct Problem {
+    uint32_t m;
+    uint32_t k;
+    hipblasLtMatrixLayout_t layout_a;
+    hipblasLtMatrixLayout_t layout_b;
+    hipblasLtMatrixLayout_t layout_c;
+    hipblasLtMatrixLayout_t layout_d;
+    hipblasLtMatmulDesc_t desc;
+    hipblasLtMatmulAlgo_t algo;
+    size_t workspace_bytes;
+  };
+  std::vector<Problem> problems;
+  const float alpha = 1.f;
+  const float beta = 0.f;
+  hipblasOperation_t trans_a = HIPBLAS_OP_T;
+  hipblasOperation_t trans_b = HIPBLAS_OP_N;
+  // Unset --compute_input_typeA/B becomes the compute type's real type.
+  // For f32 that is HIP_R_32F. The matrix types stay FNUZ.
+  hipDataType compute_input = HIP_R_32F;
+
+  for (int i = 0; i < nrows; ++i) {
+    for (int j = 0; j < ncols; ++j) {
+      Problem p{};
+      p.m = rows[i];
+      p.k = cols[j];
+      CHECK_LT(hipblasLtMatrixLayoutCreate(&p.layout_a, HIP_R_8F_E4M3_FNUZ, p.k, p.m,
+                                           static_cast<int64_t>(p.k)));
+      CHECK_LT(hipblasLtMatrixLayoutCreate(&p.layout_b, HIP_R_8F_E4M3_FNUZ, p.k, 1,
+                                           static_cast<int64_t>(p.k)));
+      CHECK_LT(hipblasLtMatrixLayoutCreate(&p.layout_c, HIP_R_32F, p.m, 1,
+                                           static_cast<int64_t>(p.m)));
+      CHECK_LT(hipblasLtMatrixLayoutCreate(&p.layout_d, HIP_R_32F, p.m, 1,
+                                           static_cast<int64_t>(p.m)));
+      CHECK_LT(hipblasLtMatmulDescCreate(&p.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+      CHECK_LT(hipblasLtMatmulDescSetAttribute(
+          p.desc, HIPBLASLT_MATMUL_DESC_COMPUTE_INPUT_TYPE_A_EXT, &compute_input,
+          sizeof(void*)));
+      CHECK_LT(hipblasLtMatmulDescSetAttribute(
+          p.desc, HIPBLASLT_MATMUL_DESC_COMPUTE_INPUT_TYPE_B_EXT, &compute_input,
+          sizeof(void*)));
+      CHECK_LT(hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSA,
+                                              &trans_a, sizeof(int32_t)));
+      CHECK_LT(hipblasLtMatmulDescSetAttribute(p.desc, HIPBLASLT_MATMUL_DESC_TRANSB,
+                                              &trans_b, sizeof(int32_t)));
+      CHECK_LT(hipblasLtMatmulDescSetAttribute(
+          p.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_a, sizeof(void*)));
+      CHECK_LT(hipblasLtMatmulDescSetAttribute(
+          p.desc, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_b, sizeof(void*)));
+
+      hipblasLtMatmulHeuristicResult_t heur{};
+      int returned = 0;
+      CHECK_LT(hipblasLtMatmulAlgoGetHeuristic(handle, p.desc, p.layout_a, p.layout_b,
+                                               p.layout_c, p.layout_d, pref, 1, &heur,
+                                               &returned));
+      if (returned < 1 || heur.state != HIPBLAS_STATUS_SUCCESS) {
+        std::printf("FAIL hipBLASLt heuristic M %u K %u returned %d\n", p.m, p.k,
+                    returned);
+        std::fprintf(stderr, "FAIL hipBLASLt heuristic M %u K %u returned %d\n", p.m,
+                     p.k, returned);
+        return 1;
+      }
+      p.algo = heur.algo;
+      p.workspace_bytes = heur.workspaceSize;
+      if (p.workspace_bytes > kWorkspace) {
+        std::printf("FAIL hipBLASLt workspace M %u K %u wants %zu\n", p.m, p.k,
+                    p.workspace_bytes);
+        std::fprintf(stderr, "FAIL hipBLASLt workspace M %u K %u wants %zu\n", p.m, p.k,
+                     p.workspace_bytes);
+        return 1;
+      }
+      problems.push_back(p);
+    }
+  }
+
+  std::printf(
+      "hipblaslt timer hipblasLtMatmul in this process. A and B filled once. "
+      "cold reads flush_bytes %zu then calls matmul on those same buffers.\n",
+      kFlushBytes);
+
+  const char* modes[] = {"hot", "cold"};
+  for (const char* mode : modes) {
+    bool cold = std::strcmp(mode, "cold") == 0;
+    int warmup = cold ? 0 : kWarmup;
+    for (const Problem& p : problems) {
+      float ms = 0.f;
+      void* ws = p.workspace_bytes == 0 ? nullptr : workspace;
+      for (int n = 0; n < warmup; ++n) {
+        CHECK(hipEventRecord(start));
+        CHECK_LT(hipblasLtMatmul(handle, p.desc, &alpha, a, p.layout_a, b, p.layout_b,
+                                 &beta, c, p.layout_c, d, p.layout_d, &p.algo, ws,
+                                 p.workspace_bytes, nullptr));
+        CHECK(hipEventRecord(stop));
+        CHECK(hipEventSynchronize(stop));
+      }
+      std::vector<double> us;
+      us.reserve(kRuns);
+      for (int n = 0; n < kRuns; ++n) {
+        if (cold && flush_cache(flush_buf, flush_sink)) return 1;
+        CHECK(hipEventRecord(start));
+        CHECK_LT(hipblasLtMatmul(handle, p.desc, &alpha, a, p.layout_a, b, p.layout_b,
+                                 &beta, c, p.layout_c, d, p.layout_d, &p.algo, ws,
+                                 p.workspace_bytes, nullptr));
+        CHECK(hipEventRecord(stop));
+        CHECK(hipEventSynchronize(stop));
+        CHECK(hipEventElapsedTime(&ms, start, stop));
+        us.push_back(static_cast<double>(ms) * 1000.0);
+      }
+      std::vector<double> sorted = us;
+      std::sort(sorted.begin(), sorted.end());
+      double med = sorted[sorted.size() / 2];
+      double bytes = static_cast<double>(p.m) * p.k + static_cast<double>(p.k) +
+                     4.0 * p.m;
+      double gbps = bytes / (med * 1e-6) / 1e9;
+      double pct = (bytes / (med * 1e-6)) / kPeakBytesPerSec * 100.0;
+      std::printf(
+          "hipblaslt mode %s M %u K %u warmup %d runs %d min_us %.4f median_us %.4f "
+          "max_us %.4f spread_us %.4f bytes %.0f GB/s %.4f pct_of_5.3TBs %.4f\n",
+          mode, p.m, p.k, warmup, kRuns, sorted.front(), med, sorted.back(),
+          sorted.back() - sorted.front(), bytes, gbps, pct);
+      print_samples(us);
+    }
+  }
   return 0;
 }
 
@@ -295,10 +498,13 @@ int main(int argc, char** argv) {
           "GB/s %.4f pct_of_5.3TBs %.4f\n",
           s.swizzle, mode, s.m, s.k, s.grid, warmup, kRuns, lo, med, hi, hi - lo,
           bytes, gbps, pct);
-      std::printf("samples_us");
-      for (double sample : us) std::printf(" %.4f", sample);
-      std::printf("\n");
+      print_samples(us);
     }
+  }
+  if (time_hipblaslt(flush_buf, flush_sink, start, stop, rows,
+                     static_cast<int>(sizeof(rows) / sizeof(rows[0])), cols,
+                     static_cast<int>(sizeof(cols) / sizeof(cols[0])))) {
+    return 1;
   }
   return 0;
 }
