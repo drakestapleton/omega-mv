@@ -26,9 +26,12 @@ command -v "$SPIRV_VAL" >/dev/null || notrun "requires spirv-val ($SPIRV_VAL)"
 command -v "$CC" >/dev/null || notrun "requires a C compiler ($CC) for the interim Vulkan host"
 case "$LVP_ICD" in /*lvp_icd*.json) ;; *) notrun 'LVP_ICD must name the absolute lavapipe ICD manifest' ;; esac
 [ -f "$LVP_ICD" ] || notrun "lavapipe ICD manifest $LVP_ICD missing"
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
+. seed/omc-pin.sh
+omc_pin_load || fail 'seed/out/omc.sha256 has no compiler pin'
+pin=$OMC_PIN
 [ -f "$OMC" ] || fail "compiler $OMC missing"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
+have=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$have" = "$pin" ] || fail "compiler sha256 $have disagrees with seed/out/omc.sha256 pin $pin"
 hostbuild() {
     # shellcheck disable=SC2086 # flag lists are intentionally word-split
     "$CC" -std=c11 -O2 -Wall -Wextra -Werror ${VULKAN_CFLAGS:-} "$1" seed/spirv/vk-host.c \

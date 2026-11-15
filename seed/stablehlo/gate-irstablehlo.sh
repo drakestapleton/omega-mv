@@ -19,8 +19,11 @@ PYTHON=${PYTHON:-$(command -v python3 || true)}
 [ -n "$IREE_RUN" ] && [ -x "$IREE_RUN" ] || notrun 'requires iree-run-module oracle'
 [ -n "$PYTHON" ] && "$PYTHON" -c 'import jax, jaxlib, numpy' 2>/dev/null || notrun 'requires jaxlib PJRT CPU oracle'
 OMC=seed/out/omc
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
+. seed/omc-pin.sh
+omc_pin_load || fail 'seed/out/omc.sha256 has no compiler pin'
+pin=$OMC_PIN
+have=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$have" = "$pin" ] || fail "compiler sha256 $have disagrees with seed/out/omc.sha256 pin $pin"
 rm -rf "$B"
 mkdir -p "$B"
 printf 'SOURCE %s\n' "$(git rev-parse HEAD)"

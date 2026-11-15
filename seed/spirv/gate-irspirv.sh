@@ -21,9 +21,12 @@ SPIRV_VAL=${SPIRV_VAL:-spirv-val}
 PYTHON=${PYTHON:-python3}
 command -v "$SPIRV_VAL" >/dev/null || notrun "requires spirv-val ($SPIRV_VAL)"
 command -v "$PYTHON" >/dev/null || notrun "requires Python parity oracle ($PYTHON)"
-pin=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
+. seed/omc-pin.sh
+omc_pin_load || fail 'seed/out/omc.sha256 has no compiler pin'
+pin=$OMC_PIN
 [ -f "$OMC" ] || fail "compiler $OMC missing"
-[ "$(sha256sum "$OMC" | cut -d ' ' -f 1)" = "$pin" ] || fail 'compiler pin differs'
+have=$(sha256sum "$OMC" | cut -d ' ' -f 1)
+[ "$have" = "$pin" ] || fail "compiler sha256 $have disagrees with seed/out/omc.sha256 pin $pin"
 case "${POCL_LIBRARY:-}" in /*/libpocl.so*) ;; *) notrun 'POCL_LIBRARY must name the absolute trusted PoCL shared library' ;; esac
 CC=${CC:-cc}
 command -v "$CC" >/dev/null || notrun "requires a C compiler ($CC) for the OpenCL host controls"

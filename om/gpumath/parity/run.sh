@@ -10,12 +10,14 @@
 #   OMEGA_OMC     seed-born omc, sha256 pinned below (exit 3 NOT_RUN without it)
 #   OMEGA_BRIDGE  optional: an aien-dev/omega-bridge checkout whose src/native.om matches the pin
 set -eu
-OMC_PIN=26540e6de62402d5784b30b24d7c6faae488137c1f8a4b3e784fd0b5d5528991
 NATIVE_PIN=2c2c53f61d4ab302f1a2092c3c32189335dd53f6cf2b388f47a475f99f2c3940
 P=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$P/../../.." && pwd)
 OM=$P/../gpumath.om
 [ -n "${OMEGA_OMC:-}" ] || { echo "GPUMATH-PARITY NOT_RUN: set OMEGA_OMC"; exit 3; }
-[ "$(sha256sum < "$OMEGA_OMC" | cut -c1-64)" = "$OMC_PIN" ] || { echo "GPUMATH-PARITY NOT_RUN: omc is not the pinned compiler"; exit 3; }
+. "$ROOT/seed/omc-pin.sh"
+OMC_PIN_ROOT=$ROOT
+omc_pin_match "$OMEGA_OMC" GPUMATH-PARITY || exit $?
 command -v python3 > /dev/null || { echo "GPUMATH-PARITY NOT_RUN: python3 missing"; exit 3; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 python3 "$P/corpus.py" "$T/corp" > "$T/counts"
