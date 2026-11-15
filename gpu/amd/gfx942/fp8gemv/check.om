@@ -1,0 +1,385 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note CPU reference for fp8gemv_stream. Same product order as the kernel, then the
+note parallel row_shr 8,4,2,1 reduction. Lane 15 of each row of 16 holds that row's
+note sum (CDNA3 ISA 13.3.9: ROW_SR writes lane n from lane n-k, and BC=0 does not
+note write a lane whose source is outside the row). The wave result is
+note (lane15+lane31)+(lane47+lane63). Per-row scale is one multiply after that.
+note Per-block scale (128-wide) is reference-only: each lane sums its 16 products
+note from zero, multiplies by scale[col>>7], then adds. Device code does not.
+note FNUZ is ISA 7.2 Table 30 (E4M3, bias 8, NaN 0x80). OCP is a reference input.
+note NaN results are the canonical 0x7fc00000 from fpfma, not a device payload.
+global W uchar 8192
+global X ulong 4096
+global SC ulong 64
+global AC ulong 64
+global AC2 ulong 64
+global CFG ulong 4
+global HIT uchar 32
+text pass "fp8gemv check pass\n"
+
+fn fnuzden mant ulong to ulong
+if eq mant 1
+ret 0x3a800000
+end
+if eq mant 2
+ret 0x3b000000
+end
+if eq mant 3
+ret 0x3b400000
+end
+if eq mant 4
+ret 0x3b800000
+end
+if eq mant 5
+ret 0x3ba00000
+end
+if eq mant 6
+ret 0x3bc00000
+end
+ret 0x3be00000
+end
+
+fn fnuz b ulong to ulong
+if eq b 128
+ret 0x7fc00000
+end
+sign = shl and b 128 24
+mag = and b 127
+if eq mag 0
+ret sign
+end
+exp = shr mag 3
+mant = and mag 7
+if eq exp 0
+d = fnuzden mant
+ret or sign d
+end
+ret or sign or shl add exp 119 23 shl mant 20
+end
+
+fn ocpden mant ulong to ulong
+if eq mant 1
+ret 0x3b000000
+end
+if eq mant 2
+ret 0x3b800000
+end
+if eq mant 3
+ret 0x3bc00000
+end
+if eq mant 4
+ret 0x3c000000
+end
+if eq mant 5
+ret 0x3c200000
+end
+if eq mant 6
+ret 0x3c400000
+end
+ret 0x3c600000
+end
+
+fn ocp b ulong to ulong
+mag = and b 127
+if eq mag 127
+ret 0x7fc00000
+end
+sign = shl and b 128 24
+if eq mag 0
+ret sign
+end
+exp = shr mag 3
+mant = and mag 7
+if eq exp 0
+d = ocpden mant
+ret or sign d
+end
+ret or sign or shl add exp 120 23 shl mant 20
+end
+
+fn dec b ulong to ulong
+if eq get CFG 2 1
+ret ocp b
+end
+ret fnuz b
+end
+
+fn bf16 x ulong to ulong
+lsb = and shr x 16 1
+sum = add x add 32767 lsb
+ret and shr sum 16 65535
+end
+
+fn dppstep n ulong to void
+for i ulong 64
+v = get AC i
+if ge i n
+s = sub i n
+if eq div s 16 div i 16
+v = fpfma v 0x3f800000 get AC s
+end
+end
+put AC2 i v
+end
+for j ulong 64
+put AC j get AC2 j
+end
+end
+
+fn wavesum to ulong
+dppstep 8
+dppstep 4
+dppstep 2
+dppstep 1
+a = fpfma get AC 15 0x3f800000 get AC 31
+b = fpfma get AC 47 0x3f800000 get AC 63
+ret fpfma a 0x3f800000 b
+end
+
+fn grouprow lane ulong base ulong to void
+for b ulong 16
+col = add base add mul lane 16 b
+if lt col get CFG 1
+bits = dec ulong get W add mul get CFG 0 get CFG 1 col
+put AC lane fpfma bits get X col get AC lane
+end
+end
+end
+
+fn groupblk lane ulong base ulong to void
+tmp = ulong 0
+for b ulong 16
+col = add base add mul lane 16 b
+bits = dec ulong get W add mul get CFG 0 get CFG 1 col
+tmp = fpfma bits get X col tmp
+end
+col0 = add base mul lane 16
+sc = get SC shr col0 7
+put AC lane fpfma tmp sc get AC lane
+end
+
+fn tail k ulong to void
+for b ulong 16
+for lane ulong 64
+col = add k add mul lane 16 b
+if lt col get CFG 1
+bits = dec ulong get W add mul get CFG 0 get CFG 1 col
+if eq get CFG 3 0
+put AC lane fpfma bits get X col get AC lane
+else
+p = fpfma bits get X col 0
+sc = get SC shr col 7
+put AC lane fpfma p sc get AC lane
+end
+end
+end
+end
+end
+
+fn applytiles k ulong to ulong
+kk = get CFG 1
+while le add k 2048 kk bound 16
+for lane ulong 64
+if eq get CFG 3 0
+grouprow lane k
+grouprow lane add k 1024
+else
+groupblk lane k
+groupblk lane add k 1024
+end
+end
+k = add k 2048
+end
+if le add k 1024 kk
+for lane ulong 64
+if eq get CFG 3 0
+grouprow lane k
+else
+groupblk lane k
+end
+end
+k = add k 1024
+end
+ret k
+end
+
+fn gemv to ulong
+for i ulong 64
+put AC i 0
+end
+k = applytiles 0
+tail k
+s = wavesum
+if eq get CFG 3 0
+s = fpfma s get SC get CFG 0 0
+end
+ret s
+end
+
+fn setcfg row ulong kk ulong mode ulong blk ulong to void
+put CFG 0 row
+put CFG 1 kk
+put CFG 2 mode
+put CFG 3 blk
+end
+
+fn ones n ulong wb ulong to void
+for i ulong 4096
+if lt i n
+put W i uchar wb
+put X i 0x3f800000
+end
+end
+put SC 0 0x3f800000
+end
+
+fn swrow id ulong m ulong to ulong
+span = shr add m 7 3
+ret add mul and id 7 span shr id 3
+end
+
+fn swcheck m ulong code int to void
+span = shr add m 7 3
+n = mul 8 span
+for i ulong 32
+put HIT i 0
+end
+for i ulong 64
+if lt i n
+r = swrow i m
+if lt r m
+put HIT r add get HIT r 1
+end
+end
+end
+for i ulong 32
+if lt i m
+if ne get HIT i 1
+exit code
+end
+end
+end
+end
+
+fn expect got ulong want ulong code int to void
+if ne got want
+exit code
+end
+end
+
+fn main to void
+z = fnuz 0
+expect z 0 20
+z = fnuz 64
+expect z 0x3f800000 21
+z = fnuz 128
+expect z 0x7fc00000 22
+z = fnuz 1
+expect z 0x3a800000 23
+z = fnuz 192
+expect z 0xbf800000 24
+z = fnuz 127
+expect z 0x43700000 25
+z = ocp 56
+expect z 0x3f800000 26
+z = ocp 64
+expect z 0x40000000 27
+z = ocp 1
+expect z 0x3b000000 28
+z = ocp 127
+expect z 0x7fc00000 29
+z = ocp 128
+expect z 0x80000000 30
+z = ocp 0
+expect z 0 31
+z = bf16 0x3f800000
+expect z 0x3f80 32
+z = bf16 0x3f808000
+expect z 0x3f80 33
+z = bf16 0x3f818000
+expect z 0x3f82 34
+ones 0 64
+setcfg 0 0 0 0
+z = gemv
+expect z 0 1
+ones 1 64
+setcfg 0 1 0 0
+z = gemv
+expect z 0x3f800000 2
+ones 16 64
+setcfg 0 16 0 0
+z = gemv
+expect z 0x41800000 3
+ones 17 64
+setcfg 0 17 0 0
+z = gemv
+expect z 0x41880000 4
+put W 0 64
+put W 1 192
+put W 2 64
+put X 0 0x4b000000
+put X 1 0x4b000000
+put X 2 0x3f800000
+put SC 0 0x3f800000
+setcfg 0 3 0 0
+z = gemv
+expect z 0x3f800000 5
+ones 1 64
+put W 0 1
+setcfg 0 1 0 0
+z = gemv
+expect z 0x3a800000 6
+ones 1 64
+put W 0 128
+setcfg 0 1 0 0
+z = gemv
+expect z 0x7fc00000 7
+ones 1024 64
+setcfg 0 1024 0 0
+z = gemv
+expect z 0x44800000 8
+ones 1025 64
+setcfg 0 1025 0 0
+z = gemv
+expect z 0x44802000 9
+ones 2048 64
+setcfg 0 2048 0 0
+z = gemv
+expect z 0x45000000 10
+ones 3072 64
+setcfg 0 3072 0 0
+z = gemv
+expect z 0x45400000 11
+ones 1 64
+setcfg 0 1 0 0
+y = gemv
+y = fpfma y 0x3f800000 0x3f800000
+y = fpfma y 0x3f000000 0
+y = fpfma y 0x40000000 0
+expect y 0x40000000 12
+swcheck 10 13
+swcheck 16 14
+ones 256 64
+put SC 0 0x40000000
+put SC 1 0x40400000
+setcfg 0 256 0 1
+z = gemv
+expect z 0x44200000 15
+put W 0 0
+put W 1 64
+put X 0 0x3f800000
+put SC 0 0x3f800000
+put SC 1 0x40000000
+setcfg 1 1 0 0
+z = gemv
+expect z 0x40000000 16
+ones 1 64
+setcfg 0 1 1 0
+z = gemv
+expect z 0x40000000 17
+nw = write 1 pass 0 len pass
+if lt nw 0
+exit 18
+end
+exit 0
+end
