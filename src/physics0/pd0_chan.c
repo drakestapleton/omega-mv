@@ -59,7 +59,10 @@ int pd0_chan_describe(pd0_chan *c, pd0_desc *d) {
 }
 int pd0_chan_reset(pd0_chan *c, uint8_t n_obs, const int64_t *vals, pd0_rec *r) {
     uint8_t req[PD0_REQ_MAX], resp[PD0_REC_MAX];
-    size_t n = chan_call(c, req, pd0_req_reset(n_obs, vals, req), resp, sizeof resp);
+    if (!c || !vals || !r) return -1;
+    size_t req_len = pd0_req_reset(n_obs, vals, req, sizeof req);
+    if (req_len == 0 || req_len > sizeof req) return -1;
+    size_t n = chan_call(c, req, req_len, resp, sizeof resp);
     return n ? pd0_rec_decode(resp, n, r) : -1;
 }
 int pd0_chan_step(pd0_chan *c, uint8_t channel, int64_t value, pd0_rec *r) {

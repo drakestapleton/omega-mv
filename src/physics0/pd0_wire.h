@@ -83,7 +83,8 @@ int    pd0_rec_decode(const uint8_t *in, size_t len, pd0_rec *r);
 int    pd0_rec_chained(const pd0_rec *r, const pd0_rec *prev);
 
 size_t pd0_req_describe(uint8_t *out);
-size_t pd0_req_reset(uint8_t n_obs, const int64_t *vals, uint8_t *out);
+/* Returns 0 unless n_obs, pointers and output capacity describe a complete reset request. */
+size_t pd0_req_reset(uint8_t n_obs, const int64_t *vals, uint8_t *out, size_t cap);
 size_t pd0_req_step(uint8_t channel, int64_t value, uint8_t *out);
 
 /* little-endian helpers shared by the law record encoder */
