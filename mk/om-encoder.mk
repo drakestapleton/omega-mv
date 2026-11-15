@@ -35,7 +35,7 @@ $(OM_ENC_DIR)/codegen_diff_red: $(OM_ENC_TEST_DEPS) $(OM_ENC_SRCS) src/omega_om_
 	$(OM_ENC_BUILD) -DCUDAPP_MIGRATION_PENDING_ENCODER_DIFF -DCUDAPP_ENCODER_DIFF_SELFTEST -o $@ \
 		tests/test_omega_codegen_freestanding.c $(OM_ENC_SRCS) src/omega_om_units.c
 
-test-om-encoder: $(OM_ENC_DIR)/codegen_om $(OM_ENC_DIR)/codegen_diff $(OM_ENC_DIR)/codegen_diff_red
+test-om-encoder: test-om-encoder-guard $(OM_ENC_DIR)/codegen_om $(OM_ENC_DIR)/codegen_diff $(OM_ENC_DIR)/codegen_diff_red
 	$(OM_ENC_DIR)/codegen_om --golden
 	rm -f $(OM_ENC_DIR)/diff.log
 	CUDAPP_ENCODER_DIFF_LOG=$(OM_ENC_DIR)/diff.log $(OM_ENC_DIR)/codegen_diff --golden

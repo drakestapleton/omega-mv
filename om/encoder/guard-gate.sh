@@ -2,8 +2,8 @@
 # guard-gate.sh: the sm_121 guard predicate, on the encoder the C build links.
 # Oracle: NVIDIA nvdisasm -b SM121 -hex (not shipped, not first-party).
 # A guard-7 mutant of enc1 must fail both the row check and the oracle.
-# The two encoder sources are compared: their guards on ops 0..63 must agree,
-# and the rows whose other bits differ are printed. Run from anywhere.
+# The two encoder sources are compared on ops 0..63. Guards must agree, and any
+# other word difference fails the gate. Run from anywhere.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
@@ -126,6 +126,6 @@ NR==FNR { k=$1" "$2; st[k]=$3; g[k]=$4; w[k]=$5" "$6" "$7" "$8; next }
   if (st[k] != $3 || g[k] != $4) { print "GUARD DIFF " k " link " st[k] " " g[k] " ng " $3 " " $4; bad++ }
   if (w[k] != $5" "$6" "$7" "$8) { print "WORD DIFF " k " link " w[k] " ng " $5" "$6" "$7" "$8; words++ }
 }
-END { print "guard diffs " bad+0; print "word diffs " words+0; if (bad+0 > 0) exit 1 }
+END { print "guard diffs " bad+0; print "word diffs " words+0; if (bad+0 > 0 || words+0 > 0) exit 1 }
 ' "$D/wa.txt" "$D/wb.txt"
 echo "GUARD GATE PASS"

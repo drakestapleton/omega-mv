@@ -517,10 +517,11 @@ static int bw_c_encode_insn(const BlackwellIRInsn *insn, const OmegaRegAlloc *ra
             break;
 
         case BW_IR_LDG_MMIO:
-            /* LDG.E.EF. Drop the cached line, then load. */
+            /* LDG.E.MMIO.GPU. Do not keep a stale cached copy.
+             * 0x0c1f1900. 0x0c0e1900 is LDG.E.EF, the EF mutant, not this opcode. */
             w[0] = 0x7981 | ((uint32_t)(dst & 0xff) << 16) | ((uint32_t)(src1 & 0xff) << 24);
             w[1] = (uint32_t)(ureg & 0xff);
-            w[2] = 0x0c0e1900;
+            w[2] = 0x0c1f1900;
             w[3] = insn->control ? insn->control : 0x000f2200;
             break;
 

@@ -28,11 +28,13 @@ are now 84b524ca's, the commit `seed/ng/cudapp.lock` names. Each file's sha256 e
 
 This repository also has another copy of the encoder at the top level: `om/encoder/bw_enc_sm121.om`.
 The `Makefile`, `mk/om-encoder.mk` and `mk/omega-gpu-engine.mk` link that copy. The encoder Omega NG pins,
-and `seed/ng/cudapp.lock` hashes, is `gpu/nvidia/om/encoder/bw_enc_sm121.om`. They are not one source:
-the pinned file encodes ops 64..79 and a few payloads this import's consumers do not, and the linked
-file is the one that has to stay on the C oracle's unpredicated words. Both write the same 4-bit guard.
-`om/encoder/guard-gate.sh` checks that, prints both sha256 values, and names the rows whose other bits
-differ. Edit the copy whose consumers you mean to change.
+and `seed/ng/cudapp.lock` hashes, is `gpu/nvidia/om/encoder/bw_enc_sm121.om`. Those are the two reasons
+they stay two files: the lock row, and ops 64..79, which only the pinned file encodes. Op 11 and op 21
+were bugs in the linked file, now fixed to this file's words. Op 11 dropped the signed offset, so
+nvdisasm read `LDG.E R4, desc[UR4][R8.64]` instead of `LDG.E R4, desc[UR4][R8.64+0x40]` for imm 64.
+Op 21's word2 was `202250496`, which nvdisasm reads as `LDG.E.EF`; it is `203364608`, `LDG.E.MMIO.GPU`.
+`om/encoder/guard-gate.sh` checks the guard on both and exits nonzero while any other word on ops 0..63
+still differs.
 
 ## The gate
 
