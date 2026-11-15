@@ -748,10 +748,11 @@ is error 7.
   such as zero times infinity. NaN payload selection is Arm's rule, not a host-library rule.
   In particular `(1+2^-52)*(1-2^-52)-1` is `-2^-104` for f64 rather than the zero from separately
   rounded multiply and add. x86linux and x86efi refuse a well-typed `fma` with error 9: their SSE2
-  baseline does not provide a fused instruction, and no unfused fallback is permitted. The operands
-are typed first, so errors 7 and 11 have the same line and code on every target. IR mode accepts
+  baseline does not provide a fused instruction, and no unfused fallback is permitted. On the
+native path the operands are typed first, so a bare `fma 1.0 2.0 3.0` or `fsqrt 1.0` is error 11
+and a mixed `fma f64 1.0 uint 1 f64 2.0` is error 7, on every native target. IR mode accepts
 f32 and f64 arithmetic, comparisons, neg and explicit casts (wire version 7). It refuses fma,
-fsqrt, fabs, fmin, fmax and bitcast with error 3. (gate8 fma, neg_fma_* on AArch64, x86linux and x86efi; gate-fma
+fsqrt, fabs, fmin, fmax and bitcast with error 3, well-typed and ill-typed alike. (gate8 fma, neg_fma_* on AArch64, x86linux and x86efi; gate-fma
   wrong-opcode, unfused and rounding mutants)
 - Conversions `<type> value` handle int<->float, f32<->f64 and float->int. Int to float is SCVTF/UCVTF
   (round to nearest even); float to int is FCVTZS/FCVTZU (truncate, saturate, NaN -> 0); f32<->f64 is
@@ -798,7 +799,7 @@ float literal (`f64 0.1`, `f32 0.1`); an integer literal under a float type is r
 It composes wherever a value goes, including inside functions and as a call argument, and it cannot
 be assigned (error 7). In IR mode an integer constant is folded to its literal, including as a
 `trap` code, a `while` bound, or a `for` count. A float constant folds to the same CONST as its
-literal. A float constant used as a trap, a bound, a `for` count or a length is error 16.
+literal. A float constant used as a trap code, a `while` bound or a length is error 16 on the native path and in IR. A float constant used as a `for` count is error 7 on both paths.
 struct, global and text declarations stay error 9. Definitions are sequential, so a
 constant defined after a function is not visible to that function.
 
@@ -1536,13 +1537,15 @@ Arithmetic (`add` through `rem`) and shifts of booleans remain error 7.
 
 Limits, said plainly: scalar values, calls to earlier functions, at most 32 functions and 6
 parameters. Float arithmetic, comparisons, neg and explicit casts are version 7
-(`docs/one_layer/IR-AGGREGATES-FLOATS.md`). IR mode refuses a `struct`, `global` or `text`
-declaration with error 9 and refuses a host word, `continue`, `sizeof`, `offsetof`, `fma`,
+(`docs/one_layer/IR-AGGREGATES-FLOATS.md`). IR mode refuses a `global` or `text`
+declaration with error 9. A fixed array is a version 7 region (`new`, `get`, `put`). A struct
+value is one register per scalar field. A struct-typed field is accepted in IR and is error 16
+on the native path. IR refuses a host word, `continue`, `sizeof`, `offsetof`, `fma`,
 `fsqrt`, `fabs`, `fmin`, `fmax` or `bitcast` with error 3, and a contract line
 (`requires`, `ensures`, `invariant`; section 12 is native only) with error 30 on that line (#791); it
 never skips a declaration it cannot lower or reads a contract clause as a local. A contract word followed
 by `=` (`ensures = ulong 1`) assigns a local of that name, as the C oracle and native mode do. `note` lines are
-skipped. Struct IR remains open. The gate needs the
+skipped. The gate needs the
 C-built oracles, so `seed/host/check.sh` runs it only when `build/omegese/omegese`,
 `build/omega_emit/omega_emit` and `build/checker2/checker2` exist, and says `SKIP` otherwise.
 

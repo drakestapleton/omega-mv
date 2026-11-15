@@ -44,11 +44,6 @@ ir_refuse() { # name expected-error source
     [ "$crc" = "$2" ] || fail "$1: exit $crc, wanted $2"
     echo "PASS $1 refused $2"
 }
-ir_refuse struct_decl 9 'ir
-struct S a uchar end
-fn main to int
-ret 0
-end'
 ir_refuse global_decl 9 'ir
 global g uchar 4
 fn main to int
@@ -770,5 +765,282 @@ const N f64 1
 fn f to f64
 ret N
 end'
-echo 'SCALAR_IR_CHECKPOINT 10/10 + 28 refusals + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; floats: 13 wasm=native bools (f_add 1, f_nan_ne 1, f_nan_eq 0, f_negzero 1, f_inf 1, f_neginf 1, f_neg 1, f_round 1, f_cast_int 1, f_trunc 1, f_promote 1, f_demote 1, f_call 1), const fold, bits 1.0/0.1/-0.0; float refusals f_mix 7, f_bool 9, f_rem 7, f_bare 11, f_intlit 7, f_for 7, f_sqrt 3, f_fma 3, f_suffix 7, f_shl 7, f_not 7, f_const_int 16; arrays and structs still refused'
+path_refuse() { # name ir-source native-source ir-exit native-exit
+    printf '%s\n' "$2" > "$B/$1.om"
+    printf '%s\n' "$3" > "$B/$1.nat.om"
+    set +e
+    timeout 10 "$B/stage2" < "$B/$1.om" > "$B/$1.out" 2> "$B/$1.err"
+    irc=$?
+    timeout 10 "$B/stage2" < "$B/$1.nat.om" > "$B/$1.nat" 2> "$B/$1.nat.err"
+    nrc=$?
+    set -e
+    [ "$irc" = "$4" ] || fail "$1 ir exit $irc wanted $4 ($(cat "$B/$1.err"))"
+    [ "$nrc" = "$5" ] || fail "$1 native exit $nrc wanted $5 ($(cat "$B/$1.nat.err"))"
+    echo "PASS $1 ir=$irc native=$nrc"
+}
+path_refuse f_for_const 'ir
+const N f64 1.0
+fn main to int
+for i uint N
+end
+ret 0
+end' 'const N f64 1.0
+fn main to int
+for i uint N
+end
+ret 0
+end' 7 7
+path_refuse f_trap_const 'ir
+const N f64 1.0
+fn main to int
+trap N
+ret 0
+end' 'const N f64 1.0
+fn main to int
+trap N
+ret 0
+end' 16 16
+path_refuse f_while_const 'ir
+const N f64 1.0
+fn main to int
+while bool 1 bound N
+ret 0
+end
+end' 'const N f64 1.0
+fn main to int
+while bool 1 bound N
+ret 0
+end
+end' 16 16
+path_refuse f_fma_bare 'ir
+fn main to f64
+ret fma 1.0 2.0 3.0
+end' 'fn main to f64
+ret fma 1.0 2.0 3.0
+end' 3 11
+path_refuse f_fma_mix 'ir
+fn main to f64
+ret fma f64 1.0 uint 1 f64 2.0
+end' 'fn main to f64
+ret fma f64 1.0 uint 1 f64 2.0
+end' 3 7
+path_refuse f_fsqrt_bare 'ir
+fn main to f64
+ret fsqrt 1.0
+end' 'fn main to f64
+ret fsqrt 1.0
+end' 3 11
+agg_run() { # name expect ir-source native-source
+    printf '%s\n' "$3" > "$B/$1.om"
+    timeout 10 "$B/stage2" < "$B/$1.om" > "$B/$1.ir" 2> "$B/$1.err" || fail "$1 ir $(cat "$B/$1.err")"
+    timeout 10 "$B/irwasm" < "$B/$1.ir" > "$B/$1.wasm" 2> "$B/$1.werr" || fail "$1 irwasm $(cat "$B/$1.werr")"
+    got=$(node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); process.stdout.write(String(i.exports.f()));' "$B/$1.wasm") || fail "$1 wasm run"
+    [ "$got" = "$2" ] || fail "$1 wasm $got wanted $2"
+    printf '%s\n' "$4" > "$B/$1.nat.om"
+    timeout 10 "$B/stage2" < "$B/$1.nat.om" > "$B/$1.nat" 2> "$B/$1.nat.err" || fail "$1 native $(cat "$B/$1.nat.err")"
+    chmod +x "$B/$1.nat"
+    set +e
+    "$B/$1.nat" >/dev/null
+    nrc=$?
+    set -e
+    [ "$nrc" = "$2" ] || fail "$1 native $nrc wanted $2"
+    echo "PASS $1 wasm=$got native=$nrc"
+}
+agg_run a_idx 7 'ir
+fn f to uint
+a = new uint 4 0
+put a 1 7
+ret get a 1
+end' 'fn main to uint
+a = new uint 4 0
+put a 1 7
+ret get a 1
+end'
+agg_run a_nest 9 'ir
+struct S a uint 3 end
+fn f to uint
+s = new S 1
+put s a 2 9
+ret get s a 2
+end' 'struct S a uint 3 end
+fn main to uint
+s = new S 1
+put s a 2 9
+ret get s a 2
+end'
+agg_run s_field 4 'ir
+struct S a uint b uint end
+fn f to uint
+s = new S 3 4
+put s a 9
+ret get s b
+end' 'struct S a uint b uint end
+fn main to uint
+s = new S 3 4
+put s a 9
+ret get s b
+end'
+agg_run s_copy 3 'ir
+struct S a uint b uint end
+fn f to uint
+s = new S 3 4
+t = new S 3 4
+put s a 9
+ret get t a
+end' 'struct S a uint b uint end
+fn main to uint
+s = new S 3 4
+t = new S 3 4
+put s a 9
+ret get t a
+end'
+agg_run s_flt 2 'ir
+struct S a f64 b uint end
+fn f to uint
+s = new S 1.5 2
+ret get s b
+end' 'struct S a f64 b uint end
+fn main to uint
+s = new S 1.5 2
+ret get s b
+end'
+agg_run s_feq 1 'ir
+struct S a f64 b uint end
+fn f to bool
+s = new S 1.5 2
+ret eq get s a f64 1.5
+end' 'struct S a f64 b uint end
+fn main to int
+s = new S 1.5 2
+if eq get s a f64 1.5
+ret 1
+end
+ret 0
+end'
+printf 'ir\nfn f i uint to uint\na = new uint 4 0\nput a 1 6\nret get a i\nend\n' > "$B/a_oob.om"
+timeout 10 "$B/stage2" < "$B/a_oob.om" > "$B/a_oob.ir" 2> "$B/a_oob.err" || fail "a_oob ir $(cat "$B/a_oob.err")"
+timeout 10 "$B/irwasm" < "$B/a_oob.ir" > "$B/a_oob.wasm" 2> "$B/a_oob.werr" || fail "a_oob irwasm $(cat "$B/a_oob.werr")"
+got=$(node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); process.stdout.write(String(i.exports.f(1)));' "$B/a_oob.wasm") || fail 'a_oob in-bounds wasm'
+[ "$got" = 6 ] || fail "a_oob in-bounds wasm $got"
+set +e
+node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); i.exports.f(4);' "$B/a_oob.wasm" >/dev/null 2>"$B/a_oob.trap"
+trc=$?
+set -e
+[ "$trc" != 0 ] || fail 'a_oob wasm index 4 did not trap'
+printf 'fn g i uint to uint\na = new uint 4 0\nput a 1 6\nret get a i\nend\nfn main to uint\nret g uint 4\nend\n' > "$B/a_oob.nat.om"
+timeout 10 "$B/stage2" < "$B/a_oob.nat.om" > "$B/a_oob.nat" 2> "$B/a_oob.nat.err" || fail "a_oob native $(cat "$B/a_oob.nat.err")"
+chmod +x "$B/a_oob.nat"
+set +e
+"$B/a_oob.nat" >/dev/null
+nrc=$?
+set -e
+[ "$nrc" = 103 ] || fail "a_oob native $nrc wanted 103"
+echo 'PASS a_oob wasm trap native=103'
+printf 'ir\nstruct I a uint end\nstruct O b I c uint end\nfn f to uint\ns = new O 4 5\nret get s b a\nend\n' > "$B/s_nest.om"
+timeout 10 "$B/stage2" < "$B/s_nest.om" > "$B/s_nest.ir" 2> "$B/s_nest.err" || fail "s_nest ir $(cat "$B/s_nest.err")"
+timeout 10 "$B/irwasm" < "$B/s_nest.ir" > "$B/s_nest.wasm" 2> "$B/s_nest.werr" || fail "s_nest irwasm $(cat "$B/s_nest.werr")"
+got=$(node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); process.stdout.write(String(i.exports.f()));' "$B/s_nest.wasm") || fail 's_nest wasm'
+[ "$got" = 4 ] || fail "s_nest wasm $got wanted 4"
+printf 'struct I a uint end\nstruct O b I c uint end\nfn main to uint\ns = new O 4 5\nret get s b a\nend\n' > "$B/s_nest.nat.om"
+set +e
+timeout 10 "$B/stage2" < "$B/s_nest.nat.om" > "$B/s_nest.nat" 2> "$B/s_nest.nat.err"
+nrc=$?
+set -e
+[ "$nrc" = 16 ] || fail "s_nest native exit $nrc wanted 16 ($(cat "$B/s_nest.nat.err"))"
+echo 'PASS s_nest wasm=4 native refuses 16'
+path_refuse a_oob_const 'ir
+fn main to uint
+a = new uint 4 0
+ret get a 4
+end' 'fn main to uint
+a = new uint 4 0
+ret get a 4
+end' 21 21
+path_refuse s_assign 'ir
+struct S a uint end
+fn main to uint
+s = new S 1
+t = s
+ret get t a
+end' 'struct S a uint end
+fn main to uint
+s = new S 1
+t = s
+ret get t a
+end' 7 7
+path_refuse a_new_if 'ir
+fn main to uint
+if bool 1
+a = new uint 2 0
+end
+ret 0
+end' 'fn main to uint
+if bool 1
+a = new uint 2 0
+end
+ret 0
+end' 9 9
+path_refuse a_fidx 'ir
+fn main to uint
+a = new uint 4 0
+ret get a f64 1.0
+end' 'fn main to uint
+a = new uint 4 0
+ret get a f64 1.0
+end' 7 7
+path_refuse a_bidx 'ir
+fn main to uint
+a = new uint 4 0
+ret get a bool 1
+end' 'fn main to uint
+a = new uint 4 0
+ret get a bool 1
+end' 7 7
+path_refuse s_unk 'ir
+struct S a uint end
+fn main to uint
+s = new S 1
+ret get s z
+end' 'struct S a uint end
+fn main to uint
+s = new S 1
+ret get s z
+end' 3 3
+path_refuse a_free 'ir
+fn main to uint
+a = new uint 2 0
+free a
+ret 0
+end' 'fn main to uint
+a = new uint 2 0
+free a
+ret 0
+end' 9 9
+path_refuse a_put_scalar 'ir
+fn main to uint
+x = uint 1
+put x 2
+ret x
+end' 'fn main to uint
+x = uint 1
+put x 2
+ret x
+end' 7 7
+printf 'ir\nfn f to uint\na = new uint 4 0\nput a 2 7\nret get a 1\nend\n' > "$B/a_idx_mut.om"
+timeout 10 "$B/stage2" < "$B/a_idx_mut.om" > "$B/a_idx_mut.ir" 2> "$B/a_idx_mut.err" || fail "a_idx_mut ir $(cat "$B/a_idx_mut.err")"
+timeout 10 "$B/irwasm" < "$B/a_idx_mut.ir" > "$B/a_idx_mut.wasm" 2> "$B/a_idx_mut.werr" || fail "a_idx_mut irwasm"
+mut=$(node -e 'const fs=require("fs"); const m=new WebAssembly.Module(fs.readFileSync(process.argv[1])); const i=new WebAssembly.Instance(m); process.stdout.write(String(i.exports.f()));' "$B/a_idx_mut.wasm") || fail 'a_idx_mut wasm'
+[ "$mut" != 7 ] || fail 'mutant did not change the array result'
+echo "PASS a_idx mutant wasm=$mut"
+python3 - "$B/a_idx.ir" "$B/f_one.ir" <<'PY'
+import sys
+arr = open(sys.argv[1], "rb").read()
+flt = open(sys.argv[2], "rb").read()
+if arr[7] != 7 or arr[8] != 0:
+    raise SystemExit("array header %s" % list(arr[:12]))
+if flt[7] != 7 or flt[8] != 0 or flt[9] != 0 or flt[10] != 0:
+    raise SystemExit("float header %s" % list(flt[:12]))
+PY
+echo 'PASS float header stays nstructs 0 nregions 0; array header is version 7'
+echo 'SCALAR_IR_CHECKPOINT 10/10 + 9 multi-call units + 3 break units + 2 for-value units + 1 shift unit + 4 bool units + 24 cast units + 2 contract-name units + 30 fuzz units + 1 guarded for-bound unit + 2 bound-range pairs (1000000 accepted, 1000001 error 8) + 1 count-range set (1000000 identical to the oracle; 1000001, -1, -0, const 1000001 error 8); validation: 38 refusals + 1 same-IR pair + 4 scope/fallthrough/long-name units; floats: 13 wasm=native bools, const fold, bits 1.0/0.1/-0.0; path codes f_for_const 7/7, f_trap_const 16/16, f_while_const 16/16, f_fma_bare 3/11, f_fma_mix 3/7, f_fsqrt_bare 3/11; aggregates a_idx 7, a_nest 9, s_field 4, s_copy 3, s_flt 2, s_feq 1, a_oob trap/103, s_nest wasm 4 native 16'
 echo 'RC=0'

@@ -1,6 +1,6 @@
 # IR aggregates and floats
 
-Status: floats are emitted. Fixed-size arrays and structs are specified here and still refused by the producer.
+Status: floats, fixed-size arrays and struct values are emitted. A struct-typed field is accepted in IR and refused by the native compiler (error 16). Packed alignment 1 is not this slice. The native backend still stores struct fields in 8-byte cells.
 
 This is the shared model for Omega's IR. The wire is OSC (`spec/one-layer-format.md`). An integer-only unit stays version 1 and keeps the bytes it had. A unit that uses f32 or f64 is version 7: tags 13 and 14 on ordinary value registers, `nstructs` 0, `nregions` 0, then the same function records. Version 7 already admits those tags. Putting them in a version 1 unit is a range error, so the producer does not do it.
 
@@ -23,7 +23,7 @@ Tags 10, 11 and 12 stay what the wire already says (reference, bytes, cells). Th
 
 No tag converts to another tag because it was nearby. `f32` and `f64` are ordinary words, and so are `uint`, `ulong` and the rest. Writing the word is the conversion. A bare integer where a float is expected is error 7. A bare float literal where an integer is expected is error 7. A float literal with no type expected is error 11. `bool` and a number, integer or float, convert only by comparison (error 9), the same rule the integer IR already uses.
 
-`fma`, `fsqrt`, `fabs`, `fmin`, `fmax` and `bitcast` stay out of this IR (error 3). The BIN and UN opcodes have no fused subcode and no reinterpret subcode. Emitting an unfused multiply and add would round twice and call it `fma`. A later slice can add one opcode for each, with the native rounding, rather than a stand-in.
+`fma`, `fsqrt`, `fabs`, `fmin`, `fmax` and `bitcast` stay out of this IR. IR reports error 3 for the word, including a well-typed `fma f64 1.0 f64 2.0 f64 3.0` and an ill-typed one. The native path types the operands first: a bare `fma 1.0 2.0 3.0` or `fsqrt 1.0` is error 11, a mixed `fma f64 1.0 uint 1 f64 2.0` is error 7, and a well-typed `fma` compiles. The BIN and UN opcodes have no fused subcode and no reinterpret subcode. Emitting an unfused multiply and add would round twice and call it `fma`. A later slice can add one opcode for each, with the native rounding, rather than a stand-in.
 
 ## 2. Float values
 
@@ -48,7 +48,7 @@ Comparisons use the IEEE predicates, not a total order. NaN compares false for e
 
 `rem`, `and`, `or`, `xor`, `shl`, `shr` and `not` on a float are error 7. A float is not a `for` count and not an index (error 7).
 
-A float constant (`const N f64 1.0`) folds to the same CONST as the literal. An integer literal under a float constant is error 16, as in a native constant. A float constant used as a trap code, a loop bound, a `for` count or a length is error 16.
+A float constant (`const N f64 1.0`) folds to the same CONST as the literal. An integer literal under a float constant is error 16, as in a native constant. A float constant used as a trap code, a `while` bound or a length is error 16 on both paths. A float constant used as a `for` count is error 7 on both paths, the same code as a float literal in that place.
 
 ## 3. Layout and alignment
 
@@ -73,9 +73,7 @@ Example, under this rule, not under today's 8-byte cells: `struct S a bool b f64
 
 ## 4. Arrays
 
-Still refused. `new`, `get` and `put` in IR mode are error 16 or error 3, as they were. The model they will use:
-
-An array is a version 7 region, class 1 (function-local) or class 0 (module global). The region id is the name. The element count is fixed and is part of the type. The producer will emit RINIT of the initial value before any load, then RLOAD and RSTORE. Opcode 9 LOAD and opcode 10 STORE stay the old reference ops. This slice does not emit them, because those ops belong to the `free` model.
+An array is a version 7 region, class 1 (function-local). The region id is the name. The element count is fixed and is part of the type. The producer emits RINIT of the initial value at the `new`, then RLOAD and RSTORE for `get` and `put`. Opcode 9 LOAD and opcode 10 STORE stay the old reference ops. This slice does not emit them, because those ops belong to the `free` model. `new` is only in the function's outermost block (error 9 inside `if`, the same place the native path refuses it). `free` stays error 9. A module-global array is still refused with the other `global` forms (error 9).
 
 The index is an integer, not a byte offset and not a pointer. A float index is error 7. A bool index is error 7. A constant index outside `0 .. count-1` is error 21, the same compile error the native path uses. A register index is compared as unsigned with the count before any address is formed (a negative signed index is a huge unsigned value and fails the compare). The failure is trap 3, the same trap the native path uses (`B.HS` after the compare). The address is `base + index * stride` only after that compare. There is no wrapping index.
 
@@ -101,17 +99,18 @@ Floats, this slice:
 - `seed/wasm/irwasm.om` is the backend that runs them. Integer-to-float casts convert the i64 register that already holds the extended integer (`f32.convert_i64_*` / `f64.convert_i64_*`), because that register is the value, not a raw i32 slot. f32 to f64 is `f64.promote_f32`. f64 to f32 is `f32.demote_f64`. Float-to-int stays the saturating lowering irwasm already had.
 - The AArch64 path is unchanged. It never reads this IR. The gate runs the same expression both ways and compares the bool.
 
-Arrays, when they land: irwasm already lowers RLOAD, RSTORE and RINIT, and it checks the index before the address. The producer has to emit those ops and the region table. It does not emit them yet.
+Arrays: the producer writes the region table and opcodes 30, 31 and 33. irwasm lowers RLOAD, RSTORE and RINIT, and it checks the index before the address. A constant index outside the array is error 21 on both paths. A register index that fails the compare traps: irwasm does not return, and the native path exits 103.
 
-Structs, when they land: version 7 already has a struct table in front of the regions. Field ops are FLOAD and FSTORE (opcodes 16 and 17) with the field index. irwasm currently refuses a nonempty struct table. The packed-struct work implements the layout in section 3 and a backend that accepts the table. Until then the producer refuses `struct` with error 9.
+Structs: the producer writes the version 7 struct table in front of the regions. Each scalar field is its own register. `new` moves the initializer into that register, and a later `put` moves into the same register, so the field does not alias a constant. An array field is its own region. A struct-typed field is tag 12 and its length is the inner struct's index plus 1. irwasm reads that table and does not execute a field opcode; the field values are the ordinary registers. The native compiler still refuses a struct-typed field with error 16. Two `new`s are two values: writing one leaves the other as it was. `t = s` is error 7 on both paths. The wire offsets follow section 3. The native `sizeof` and `offsetof` stay on 8-byte cells.
 
 ## 7. What the producer still refuses
 
 | program | error |
 |---|---|
-| struct, global, text | 9 |
-| fma, fsqrt, fabs, fmin, fmax, bitcast, get, continue | 3 |
-| new, put as a statement | 16 |
+| global, text, free, new inside if | 9 on both paths |
+| a struct-typed field | accepted in IR; native error 16 |
+| t = s, a struct or array name used as a scalar, put on a scalar | 7 on both paths |
+| fma, fsqrt, fabs, fmin, fmax, bitcast, continue | 3 in IR. Native types first: bare float literals are 11, a mixed operand is 7, and a well-typed fma compiles |
 | float mixed with a typed integer, rem, shifts, bitwise, not, float for-count, bad suffix | 7 |
 | bool and float | 9 |
 | a float literal with no expected type, `x = 1.0` | 11 |
