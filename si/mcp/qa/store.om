@@ -1,0 +1,1070 @@
+note Agent Q&A store. Drake (2026-10-29): "We need a StackOverflow specifically for agents, built in to every
+note coding CLI where opt-in contribution (selected by users for their agents) is strongly promoted."
+note One entry per file in the store directory, named by the SHA-256 of its exact bytes (64 lowercase hex),
+note so stores can be copied and merged by any transport and a damaged copy is seen on read.
+note Reading (search, read, consent_status) is open to every agent. Contributing (ask, answer, check) needs
+note the line `allow AGENT` in the consent file, which the person writes; this server only ever reads it,
+note again at every contribution, so removing the line stops sharing at once.
+note A contribution is refused, never edited, when it holds a private key block, a home directory path
+note or a long mixed-case run that looks like a key or token. Entry layout (text, one field per line):
+note   agent-qa 1 / kind K / agent A / [ref ID] / [title T] / [versions V] / [result R] / [evidence E]
+note   then `steps N` and `body N` blocks: N decimal bytes follow the newline, then one newline.
+global qv ulong 16
+global qagent uchar 64
+global qcpath uchar 4096
+global qid uchar 64
+global qerr uint 1
+
+const qagentn ulong 0
+const qcpathn ulong 1
+const qdirfd ulong 2
+const qmatch ulong 3
+const qshown ulong 4
+const qskip ulong 5
+const qfoff ulong 6
+const qflen ulong 7
+const qrule ulong 8
+const qfmax ulong 32768
+const qmax ulong 65536
+const qpage ulong 50
+note Flags as in maintenance/state.om (Wolfram-checked there): directory/nofollow/cloexec, read/nofollow/
+note cloexec/nonblock, rdwr/create/excl/nofollow/cloexec. 420 is mode 0644 (aien-calc receipt in the commit message).
+const qodir int 573440
+const qord int 559104
+const qonew int 557250
+const qmode int 420
+
+text qhex "0123456789abcdef"
+text qdot "."
+text qargstore "--store"
+text qargagent "--agent"
+text qargcons "--consent"
+text qallow "allow "
+text qmagic "agent-qa 1\n"
+text qkind "kind "
+text qkq "question"
+text qka "answer"
+text qkc "check"
+text qlagent "agent "
+text qlref "ref "
+text qltitle "title "
+text qlvers "versions "
+text qlres "result "
+text qlevid "evidence "
+text qlsteps "steps "
+text qlbody "body "
+text qworks "works"
+text qfails "fails"
+text qbegin "-----BEGIN"
+text qhome "/home/"
+text qusers "/Users/"
+text qroot "/root/"
+text qtmpp ".qa-tmp-"
+
+text qkok "ok"
+text qkerr "error"
+text qkid "id"
+text qkkind "kind"
+text qktitle "title"
+text qkref "ref"
+text qktext "text"
+text qkres "results"
+text qkmatch "matches"
+text qkshown "shown"
+text qkskip "skipped"
+text qkmore "more"
+text qkcreated "created"
+text qkagent "agent"
+text qkmay "may_contribute"
+text qkcfile "consent_file"
+text qkhow "how_to_enable"
+text qknone ""
+
+text qhow1 "Reading is open. To let this agent share questions, answers and checks, the person (not the agent) adds the line `allow "
+text qhow2 "` to the consent file named in consent_file, and deletes it to stop. Only the entry text is shared: no chats, code or files."
+text qhownf "Reading is open. Sharing is off because this server was started without --consent FILE. The person adds --consent with a file they own to this agent's MCP entry, then the line `allow AGENT` to that file."
+text qeno "Sharing is off for this agent. Ask the person to turn it on (see consent_status); reading still works."
+text qeline "Refused: a one-line field holds a control character or a line break. Nothing was saved."
+text qetext "Refused: a text field holds a control character other than line break or tab. Nothing was saved."
+text qekey "Refused: the text holds a private key block (-----BEGIN). Remove it. Nothing was saved."
+text qehome "Refused: the text names a home directory (/home/, /Users/ or /root/). Write ~/... instead. Nothing was saved."
+text qetok "Refused: the text holds a long mixed-case string that looks like a key or token. Remove or split it. Nothing was saved."
+text qeid "Refused: an id is 64 lowercase hexadecimal characters."
+text qemiss "No entry has this id in this store."
+text qekindq "Refused: question must be the id of a question entry."
+text qekinda "Refused: answer must be the id of an answer entry."
+text qedamage "The entry file does not match its id or is not a valid entry; it was not used."
+text qeres "Refused: result is works or fails."
+text qeempty "Refused: every field must be nonempty."
+text qestale "Refused: a temporary file from an interrupted write (.qa-tmp-ID) blocks this entry; remove it and retry."
+text qeio "The store could not be written (input/output error); nothing new is visible."
+text qedir "The store directory could not be read."
+
+fn qa_eq a view uchar * t view uchar * to bool
+if ne len a len t
+ret false
+end
+for i ulong len a
+if ne get a i get t i
+ret false
+end
+end
+ret true
+end
+
+fn qa_lower c uchar to uchar
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+note True when w (nonempty) occurs in h, ASCII letters compared without case.
+fn qa_has h view uchar * w view uchar * to bool
+if gt len w len h
+ret false
+end
+for i ulong add sub len h len w 1
+hit = true
+for j ulong len w
+if ne qa_lower get h add i j qa_lower get w j
+hit = false
+break
+end
+end
+if hit
+ret true
+end
+end
+ret false
+end
+
+fn qa_isid s view uchar * to bool
+if ne len s 64
+ret false
+end
+for i ulong 64
+c = get s i
+if not or and ge c 48 le c 57 and ge c 97 le c 102
+ret false
+end
+end
+ret true
+end
+
+fn qa_agentok s view uchar * to bool
+if or eq len s 0 gt len s 64
+ret false
+end
+for i ulong len s
+c = get s i
+ok = or and ge c 97 le c 122 and ge c 48 le c 57
+if and gt i 0 or eq c 45 eq c 95
+ok = true
+end
+if not ok
+ret false
+end
+end
+ret true
+end
+
+note Strict UTF-8 (no overlong forms, no surrogates, at most U+10FFFF), so the JSON writer never fails.
+fn qa_utf8 s view uchar * to bool
+i = ulong 0
+n = len s
+while lt i n bound 16777216
+c = get s i
+if lt c 128
+i = add i 1
+continue
+end
+k = ulong 0
+lo = uchar 128
+hi = uchar 191
+if and ge c 194 le c 223
+k = 1
+end
+if and ge c 224 le c 239
+k = 2
+if eq c 224
+lo = 160
+end
+if eq c 237
+hi = 159
+end
+end
+if and ge c 240 le c 244
+k = 3
+if eq c 240
+lo = 144
+end
+if eq c 244
+hi = 143
+end
+end
+if eq k 0
+ret false
+end
+if gt add i k sub n 1
+ret false
+end
+for j ulong k
+d = get s add add i j 1
+if eq j 0
+if or lt d lo gt d hi
+ret false
+end
+else
+if or lt d 128 gt d 191
+ret false
+end
+end
+end
+i = add add i k 1
+end
+ret true
+end
+
+note 0 when the field may be shared; else the refusal: 1 key block, 2 home path, 3 token-like run.
+note A token-like run is 24 or more of A-Z a-z 0-9 _ - holding an upper-case letter, a lower-case letter
+note and a digit (lowercase hex digests such as sha256 values pass).
+fn qa_private s view uchar * to ulong
+if qa_has s qbegin
+ret 1
+end
+if or qa_has s qhome or qa_has s qusers qa_has s qroot
+ret 2
+end
+rn = ulong 0
+sn = ulong 0
+for i ulong len s
+c = get s i
+cl = ulong 0
+if and ge c 65 le c 90
+cl = 1
+end
+if and ge c 97 le c 122
+cl = 2
+end
+if and ge c 48 le c 57
+cl = 4
+end
+if or eq c 95 eq c 45
+cl = 8
+end
+if eq cl 0
+rn = 0
+sn = 0
+else
+rn = add rn 1
+sn = or sn cl
+if and ge rn 24 eq and sn 7 7
+ret 3
+end
+end
+end
+ret 0
+end
+
+note 0 ok, 1 when a one-line field (multi false) or a block (multi true) holds a forbidden control byte.
+fn qa_ctl s view uchar * multi bool to bool
+for i ulong len s
+c = get s i
+if or lt c 32 eq c 127
+if not and multi or eq c 10 eq c 9
+ret false
+end
+end
+end
+ret true
+end
+
+fn qa_wt ob edit uchar * s view uchar * to void
+js_wsbuf ob s 0 len s
+end
+
+fn qa_fail ob edit uchar * msg view uchar * to bool
+js_wobj ob
+qa_wt ob qkok
+js_wbool ob false
+qa_wt ob qkerr
+qa_wt ob msg
+js_wobje ob
+put qerr 0 1
+ret false
+end
+
+note Appends s at ent[n]; returns the new length (the caller sized ent above every reachable total).
+fn qa_add ent edit uchar * n ulong s view uchar * to ulong
+for i ulong len s
+put ent add n i get s i
+end
+ret add n len s
+end
+
+fn qa_addnum ent edit uchar * n ulong v ulong to ulong
+d = new uchar 24 0
+k = ulong 0
+x = v
+while true bound 24
+put d k add 48 uchar rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong k
+put ent add n i get d sub sub k i 1
+end
+ret add n k
+end
+
+fn qa_line ent edit uchar 65536 n ulong kw view uchar * vl view uchar * to ulong
+m = qa_add ent n kw
+m = qa_add ent m vl
+put ent m 10
+ret add m 1
+end
+
+fn qa_block ent edit uchar 65536 n ulong kw view uchar * vl view uchar * to ulong
+m = qa_add ent n kw
+m = qa_addnum ent m len vl
+put ent m 10
+m = qa_add ent add m 1 vl
+put ent m 10
+ret add m 1
+end
+
+fn qa_hexid d view uchar 32 to void
+for i ulong 32
+c = get d i
+put qid mul i 2 get qhex ulong shr c 4
+put qid add mul i 2 1 get qhex ulong and c 15
+end
+end
+
+fn qa_idis name view uchar * to bool
+if ne len name 64
+ret false
+end
+for i ulong 64
+if ne get qid i get name i
+ret false
+end
+end
+ret true
+end
+
+fn qa_idof ent view uchar * to void
+d = new uchar 32 0
+sha256_hash ent d
+qa_hexid d
+end
+
+note Reads file name (relative to the store) into fb; returns its size, -1 missing, -2 unreadable,
+note -3 larger than qmax.
+fn qa_load name view uchar * fb edit uchar 65536 to long
+x = new uchar 1 0
+r = fopen name 0 len name qord 0
+if lt r 0
+if eq r -2
+ret -1
+end
+ret -2
+end
+fd = int r
+n = ulong 0
+res = long 0
+while lt n qmax bound 65537
+k = read fd fb n sub qmax n
+if eq k -4
+continue
+end
+if lt k 0
+res = -2
+break
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+if and eq res 0 eq n qmax
+k = read fd x 0 1
+if ne k 0
+res = -3
+end
+end
+z = fclose fd
+if lt res 0
+ret res
+end
+ret long n
+end
+
+note Finds header field key (e.g. `title `) in entry e, up to the first steps or body block; sets
+note qv[qfoff], qv[qflen] and returns true when present.
+fn qa_field e view uchar * key view uchar * to bool
+p = len qmagic
+while lt p len e bound 65536
+q = p
+while lt q len e bound 65536
+if eq get e q 10
+break
+end
+q = add q 1
+end
+ln = sub q p
+if or and ge ln len qlsteps qa_eq part e p len qlsteps qlsteps and ge ln len qlbody qa_eq part e p len qlbody qlbody
+ret false
+end
+if ge ln len key
+if qa_eq part e p len key key
+put qv qfoff add p len key
+put qv qflen sub ln len key
+ret true
+end
+end
+p = add q 1
+end
+ret false
+end
+
+note An entry is usable when its bytes hash to its name, start with the magic line, carry a kind and
+note are valid UTF-8.
+fn qa_valid name view uchar * e view uchar * to bool
+if lt len e len qmagic
+ret false
+end
+if not qa_eq part e 0 len qmagic qmagic
+ret false
+end
+if not qa_utf8 e
+ret false
+end
+qa_idof e
+if not qa_idis name
+ret false
+end
+ret qa_field e qkind
+end
+
+fn qa_kindis e view uchar * k view uchar * to bool
+if not qa_field e qkind
+ret false
+end
+ret qa_eq part e get qv qfoff get qv qflen k
+end
+
+note True when line s..e of b is exactly `allow AGENT` for this server's agent.
+fn qa_isallow b view uchar * to bool
+if ne len b add len qallow get qv qagentn
+ret false
+end
+if not qa_eq part b 0 len qallow qallow
+ret false
+end
+for i ulong get qv qagentn
+if ne get b add len qallow i get qagent i
+ret false
+end
+end
+ret true
+end
+
+fn qa_allowed b view uchar * to bool
+s = ulong 0
+while lt s len b bound 65537
+e = s
+while lt e len b bound 65537
+if eq get b e 10
+break
+end
+e = add e 1
+end
+if qa_isallow part b s sub e s
+ret true
+end
+s = add e 1
+end
+ret false
+end
+
+fn qa_consented to bool
+if eq get qv qcpathn 0
+ret false
+end
+p = new uchar 4096 0
+b = new uchar 65536 0
+for i ulong get qv qcpathn
+put p i get qcpath i
+end
+r = fopen p 0 get qv qcpathn qord 0
+if lt r 0
+ret false
+end
+n = ulong 0
+while lt n 65536 bound 65537
+k = read int r b n sub 65536 n
+if eq k -4
+continue
+end
+if le k 0
+break
+end
+n = add n ulong k
+end
+z = fclose int r
+ret qa_allowed part b 0 n
+end
+
+fn qa_consent ob edit uchar * to bool
+h = new uchar 512 0
+a = new uchar 64 0
+for i ulong get qv qagentn
+put a i get qagent i
+end
+p = new uchar 4096 0
+for i ulong get qv qcpathn
+put p i get qcpath i
+end
+js_wobj ob
+qa_wt ob qkok
+js_wbool ob true
+qa_wt ob qkagent
+js_wsbuf ob a 0 get qv qagentn
+qa_wt ob qkmay
+js_wbool ob qa_consented
+qa_wt ob qkcfile
+if eq get qv qcpathn 0
+js_wnull ob
+else
+js_wsbuf ob p 0 get qv qcpathn
+end
+qa_wt ob qkhow
+if eq get qv qcpathn 0
+qa_wt ob qhownf
+else
+m = qa_add h 0 qhow1
+m = qa_add h m part a 0 get qv qagentn
+m = qa_add h m qhow2
+js_wsbuf ob h 0 m
+end
+js_wobje ob
+ret true
+end
+
+fn qa_read ob edit uchar * id view uchar * fb edit uchar 65536 to bool
+if not qa_isid id
+ret qa_fail ob qeid
+end
+r = qa_load id fb
+if eq r -1
+ret qa_fail ob qemiss
+end
+if lt r 0
+ret qa_fail ob qedamage
+end
+if not qa_valid id part fb 0 ulong r
+ret qa_fail ob qedamage
+end
+js_wobj ob
+qa_wt ob qkok
+js_wbool ob true
+qa_wt ob qkid
+qa_wt ob id
+qa_wt ob qktext
+js_wsbuf ob fb 0 ulong r
+js_wobje ob
+ret true
+end
+
+note True when every space-separated word of q occurs in e (an empty query matches every entry).
+fn qa_words e view uchar * q view uchar * to bool
+p = ulong 0
+while lt p len q bound 65536
+if eq get q p 32
+p = add p 1
+continue
+end
+s = p
+while lt p len q bound 65536
+if eq get q p 32
+break
+end
+p = add p 1
+end
+if not qa_has e part q s sub p s
+ret false
+end
+end
+ret true
+end
+
+fn qa_hit ob edit uchar * name view uchar * e view uchar * to void
+put qv qmatch add get qv qmatch 1
+if ge get qv qshown qpage
+ret
+end
+put qv qshown add get qv qshown 1
+js_wobj ob
+qa_wt ob qkid
+qa_wt ob name
+qa_wt ob qkkind
+if qa_field e qkind
+js_wsbuf ob e get qv qfoff get qv qflen
+else
+qa_wt ob qknone
+end
+qa_wt ob qktitle
+if qa_field e qltitle
+js_wsbuf ob e get qv qfoff get qv qflen
+else
+qa_wt ob qknone
+end
+qa_wt ob qkref
+if qa_field e qlref
+js_wsbuf ob e get qv qfoff get qv qflen
+else
+qa_wt ob qknone
+end
+js_wobje ob
+end
+
+note getdents64 record: ino u64, offset i64, reclen u16 at 16, type at 18, NUL-terminated name at 19.
+note Names that are not 64 lowercase hex (temporary files, anything else) are not entries.
+fn qa_one ob edit uchar * q view uchar * name view uchar 64 to void
+fb = new uchar 65536 0
+m = qa_load name fb
+if lt m 0
+put qv qskip add get qv qskip 1
+ret
+end
+if not qa_valid name part fb 0 ulong m
+put qv qskip add get qv qskip 1
+ret
+end
+if qa_words part fb 0 ulong m q
+qa_hit ob name part fb 0 ulong m
+end
+end
+
+note Copies the NUL-terminated name of the record at p (length rl) into name (first 64 bytes); returns its length.
+fn qa_dname buf view uchar 32768 p ulong rl ulong name edit uchar 64 to ulong
+n = ulong 0
+for i ulong sub rl 19
+c = get buf add add p 19 i
+if eq c 0
+break
+end
+if lt n 64
+put name n c
+end
+n = add n 1
+end
+ret n
+end
+
+note Walks one getdents64 batch of k bytes; false when a record is malformed.
+fn qa_batch ob edit uchar * q view uchar * buf view uchar 32768 k ulong to bool
+name = new uchar 64 0
+p = ulong 0
+while lt add p 19 k bound 32768
+rl = ulong get buf add p 17
+rl = add shl rl 8 ulong get buf add p 16
+if or lt rl 20 gt add p rl k
+ret false
+end
+n = qa_dname buf p rl name
+if eq n 64
+if qa_isid name
+qa_one ob q name
+end
+end
+p = add p rl
+end
+ret true
+end
+
+note Names that are not 64 lowercase hex (temporary files, anything else) are not entries.
+fn qa_search ob edit uchar * q view uchar * fb edit uchar 65536 to bool
+buf = new uchar 32768 0
+r = fopen qdot 0 1 qodir 0
+if lt r 0
+ret qa_fail ob qedir
+end
+put qv qmatch 0
+put qv qshown 0
+put qv qskip 0
+js_wobj ob
+qa_wt ob qkok
+js_wbool ob true
+qa_wt ob qkres
+js_warr ob
+ok = true
+while true bound 16777216
+k = getdnts int r buf 0 32768
+if eq k 0
+break
+end
+if lt k 0
+ok = false
+break
+end
+if not qa_batch ob q buf ulong k
+ok = false
+break
+end
+end
+z = fclose int r
+js_warre ob
+qa_wt ob qkmatch
+js_wulong ob get qv qmatch
+qa_wt ob qkshown
+js_wulong ob get qv qshown
+qa_wt ob qkmore
+js_wbool ob gt get qv qmatch get qv qshown
+qa_wt ob qkskip
+js_wulong ob get qv qskip
+js_wobje ob
+if not ok
+put qerr 0 1
+end
+ret ok
+end
+
+note Creates tmp exclusively and writes ent to it with fsync: 0 done, 1 tmp already exists, 2 I/O error
+note (tmp removed).
+fn qa_writetmp tmp view uchar 72 ent view uchar * to ulong
+r = fopen tmp 0 72 qonew qmode
+if lt r 0
+if eq r -17
+ret 1
+end
+ret 2
+end
+p = ulong 0
+ok = true
+while lt p len ent bound 65537
+k = write int r ent p sub len ent p
+if eq k -4
+continue
+end
+if le k 0
+ok = false
+break
+end
+p = add p ulong k
+end
+if ok
+k = fsync int r
+if ne k 0
+ok = false
+end
+end
+k = fclose int r
+if ne k 0
+ok = false
+end
+if not ok
+z = unlink tmp 0 72
+ret 2
+end
+ret 0
+end
+
+note Renames tmp to id (a packed list of two records) and syncs the store directory.
+fn qa_commit tmp view uchar 72 id view uchar 64 to bool
+pk = new uchar 160 0
+put pk 0 2
+put pk 2 72
+for i ulong 72
+put pk add 4 i get tmp i
+end
+put pk 76 64
+for i ulong 64
+put pk add 78 i get id i
+end
+k = renames pk 0 142 0
+if ne k 0
+z = unlink tmp 0 72
+ret false
+end
+k = fsync int get qv qdirfd
+ret eq k 0
+end
+
+note Writes ent as the file named by its SHA-256: exclusive temporary file, write, fsync, rename, directory
+note fsync. An entry that already exists is not rewritten (created false).
+fn qa_store ob edit uchar * ent view uchar * kind view uchar * to bool
+id = new uchar 64 0
+tmp = new uchar 72 0
+qa_idof ent
+for i ulong 64
+put id i get qid i
+put tmp add 8 i get qid i
+end
+for i ulong 8
+put tmp i get qtmpp i
+end
+created = true
+r = fopen id 0 64 qord 0
+if ge r 0
+z = fclose int r
+created = false
+else
+w = qa_writetmp tmp ent
+if eq w 1
+ret qa_fail ob qestale
+end
+if ne w 0
+ret qa_fail ob qeio
+end
+if not qa_commit tmp id
+ret qa_fail ob qeio
+end
+end
+js_wobj ob
+qa_wt ob qkok
+js_wbool ob true
+qa_wt ob qkid
+qa_wt ob id
+qa_wt ob qkkind
+qa_wt ob kind
+qa_wt ob qkcreated
+js_wbool ob created
+js_wobje ob
+ret true
+end
+
+fn qa_share ob edit uchar * s view uchar * multi bool to bool
+if eq len s 0
+ret qa_fail ob qeempty
+end
+if not qa_ctl s multi
+if multi
+ret qa_fail ob qetext
+end
+ret qa_fail ob qeline
+end
+r = qa_private s
+if eq r 1
+ret qa_fail ob qekey
+end
+if eq r 2
+ret qa_fail ob qehome
+end
+if eq r 3
+ret qa_fail ob qetok
+end
+ret true
+end
+
+note sel 0: id must name a question; sel 1: id must name an answer.
+fn qa_refkind ob edit uchar * id view uchar * sel ulong fb edit uchar 65536 to bool
+if not qa_isid id
+ret qa_fail ob qeid
+end
+r = qa_load id fb
+if eq r -1
+ret qa_fail ob qemiss
+end
+if lt r 0
+ret qa_fail ob qedamage
+end
+if not qa_valid id part fb 0 ulong r
+ret qa_fail ob qedamage
+end
+if eq sel 0
+if not qa_kindis part fb 0 ulong r qkq
+ret qa_fail ob qekindq
+end
+else
+if not qa_kindis part fb 0 ulong r qka
+ret qa_fail ob qekinda
+end
+end
+ret true
+end
+
+fn qa_head ent edit uchar 65536 kind view uchar * to ulong
+a = new uchar 64 0
+for i ulong get qv qagentn
+put a i get qagent i
+end
+n = qa_add ent 0 qmagic
+n = qa_line ent n qkind kind
+n = qa_line ent n qlagent part a 0 get qv qagentn
+ret n
+end
+
+note Field slots in fv (qfmax bytes each, lengths in fl): 0 words, 1 id, 2 title, 3 versions, 4 body,
+note 5 question, 6 answer, 7 steps, 8 evidence, 9 result.
+fn qa_ask ob edit uchar * fv view uchar 327680 fl view ulong 10 ent edit uchar 65536 to bool
+if not qa_consented
+ret qa_fail ob qeno
+end
+if not qa_share ob part fv mul 2 qfmax get fl 2 false
+ret false
+end
+if not qa_share ob part fv mul 3 qfmax get fl 3 false
+ret false
+end
+if not qa_share ob part fv mul 4 qfmax get fl 4 true
+ret false
+end
+n = qa_head ent qkq
+n = qa_line ent n qltitle part fv mul 2 qfmax get fl 2
+n = qa_line ent n qlvers part fv mul 3 qfmax get fl 3
+n = qa_block ent n qlbody part fv mul 4 qfmax get fl 4
+ret qa_store ob part ent 0 n qkq
+end
+
+fn qa_answer ob edit uchar * fv view uchar 327680 fl view ulong 10 ent edit uchar 65536 fb edit uchar 65536 to bool
+if not qa_consented
+ret qa_fail ob qeno
+end
+if not qa_refkind ob part fv mul 5 qfmax get fl 5 0 fb
+ret false
+end
+if not qa_share ob part fv mul 3 qfmax get fl 3 false
+ret false
+end
+if not qa_share ob part fv mul 8 qfmax get fl 8 false
+ret false
+end
+if not qa_share ob part fv mul 7 qfmax get fl 7 true
+ret false
+end
+if not qa_share ob part fv mul 4 qfmax get fl 4 true
+ret false
+end
+n = qa_head ent qka
+n = qa_line ent n qlref part fv mul 5 qfmax get fl 5
+n = qa_line ent n qlvers part fv mul 3 qfmax get fl 3
+n = qa_line ent n qlevid part fv mul 8 qfmax get fl 8
+n = qa_block ent n qlsteps part fv mul 7 qfmax get fl 7
+n = qa_block ent n qlbody part fv mul 4 qfmax get fl 4
+ret qa_store ob part ent 0 n qka
+end
+
+fn qa_check ob edit uchar * fv view uchar 327680 fl view ulong 10 ent edit uchar 65536 fb edit uchar 65536 to bool
+if not qa_consented
+ret qa_fail ob qeno
+end
+if not or qa_eq part fv mul 9 qfmax get fl 9 qworks qa_eq part fv mul 9 qfmax get fl 9 qfails
+ret qa_fail ob qeres
+end
+if not qa_refkind ob part fv mul 6 qfmax get fl 6 1 fb
+ret false
+end
+if not qa_share ob part fv mul 8 qfmax get fl 8 false
+ret false
+end
+if not qa_share ob part fv mul 4 qfmax get fl 4 true
+ret false
+end
+n = qa_head ent qkc
+n = qa_line ent n qlref part fv mul 6 qfmax get fl 6
+n = qa_line ent n qlres part fv mul 9 qfmax get fl 9
+n = qa_line ent n qlevid part fv mul 8 qfmax get fl 8
+n = qa_block ent n qlbody part fv mul 4 qfmax get fl 4
+ret qa_store ob part ent 0 n qkc
+end
+
+note Startup: --store DIR (absolute, an existing directory, becomes the working directory), --agent NAME
+note (lowercase letters, digits, - and _, at most 64), optional --consent FILE (absolute). Exit 90 on a
+note bad command line, 91 when the store cannot be opened.
+fn qa_boot to int
+put qerr 0 0
+for i ulong 16
+put qv i 0
+end
+a = new uchar 4096 0
+v = new uchar 4096 0
+ns = ulong 0
+i = ulong 1
+while lt i ulong argcnt bound 8
+r = argread i a 0 4096
+if lt r 0
+ret 90
+end
+n = ulong r
+i = add i 1
+if ge i ulong argcnt
+ret 90
+end
+r = argread i v 0 4096
+if le r 0
+ret 90
+end
+m = ulong r
+i = add i 1
+if qa_eq part a 0 n qargstore
+if or ne ns 0 ne get v 0 47
+ret 90
+end
+r = fopen v 0 m qodir 0
+if lt r 0
+ret 91
+end
+put qv qdirfd ulong r
+k = fchdir int r
+if ne k 0
+ret 91
+end
+ns = m
+else
+if qa_eq part a 0 n qargagent
+if or ne get qv qagentn 0 not qa_agentok part v 0 m
+ret 90
+end
+for j ulong m
+put qagent j get v j
+end
+put qv qagentn m
+else
+if qa_eq part a 0 n qargcons
+if or ne get qv qcpathn 0 ne get v 0 47
+ret 90
+end
+for j ulong m
+put qcpath j get v j
+end
+put qv qcpathn m
+else
+ret 90
+end
+end
+end
+end
+if or eq ns 0 eq get qv qagentn 0
+ret 90
+end
+ret 0
+end
+
+note Tool numbers: 0 search, 1 read, 2 consent_status, 3 ask, 4 answer, 5 check.
+fn qa_call op ulong fv view uchar 327680 fl view ulong 10 ob edit uchar * to bool
+put qerr 0 0
+ent = new uchar 65536 0
+fb = new uchar 65536 0
+if eq op 0
+ret qa_search ob part fv 0 get fl 0 fb
+end
+if eq op 1
+ret qa_read ob part fv qfmax get fl 1 fb
+end
+if eq op 2
+ret qa_consent ob
+end
+if eq op 3
+ret qa_ask ob fv fl ent
+end
+if eq op 4
+ret qa_answer ob fv fl ent fb
+end
+ret qa_check ob fv fl ent fb
+end
