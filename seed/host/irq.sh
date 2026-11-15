@@ -34,6 +34,11 @@ printf 'PASS GCC/Omega IRQ wire-layout differential\n'
 printf 'PASS real eventfd initial/read/write/drain/poll/close and table capacity\n'
 (cd "$B"; ./irqcheck "$OMC")
 "$B/oracle" "$B/vfioirq" 0 0 0
+# The next fixture opens descriptors until it holds 1100. A soft limit of 1024
+# makes that open fail, and the oracle then reports a wait error.
+if [ "$(ulimit -n)" -lt 1200 ]; then
+  ulimit -n 1200 || { printf 'FAIL: high-fd IRQ fixture needs 1200 descriptors, have %s\n' "$(ulimit -n)" >&2; exit 1; }
+fi
 "$B/oracle" "$B/vfioirq" 0 0 1
 "$B/oracle" "$B/vfioirq" '?' 0 0
 for mode in 1 2 3 4 5 6 7 8 9 ':' ';' '<' '=' '>'; do
