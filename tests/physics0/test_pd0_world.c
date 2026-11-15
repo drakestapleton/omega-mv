@@ -50,6 +50,16 @@ uint64_t turing_ev_cost(const turing_evidence *e, int pack) { (void)e; (void)pac
 static unsigned long failures, checks;
 #define CHECK(c, ...) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
+typedef struct { unsigned calls; size_t req_len; } reset_probe;
+
+static size_t probe_reset_call(void *ctx, const uint8_t *req, size_t req_len, uint8_t *resp, size_t cap) {
+    reset_probe *p = ctx;
+    (void)req; (void)resp; (void)cap;
+    p->calls++;
+    p->req_len = req_len;
+    return 0;
+}
+
 static void t_wire(void) {
     pd0_desc d, d2;
     pd0_gen_desc(PD0_L3, &d);
@@ -108,6 +118,42 @@ static void t_wire(void) {
     char claim[512];
     pd0_claim_text(&l, claim, sizeof claim);
     CHECK(!strstr(claim, "always") && !strstr(claim, "true") && !strstr(claim, "universally"), "forbidden words");
+}
+
+static void t_reset_request_bounds(void) {
+    static const uint8_t bad_counts[] = {0, PD0_MAX_OBS + 1, 116, 117, 255};
+    int64_t vals[PD0_MAX_OBS] = {1, -2, 3, -4};
+    uint8_t req[PD0_REQ_MAX], untouched[PD0_REQ_MAX];
+    memset(untouched, 0xA5, sizeof untouched);
+
+    for (size_t i = 0; i < sizeof bad_counts; i++) {
+        memcpy(req, untouched, sizeof req);
+        CHECK(pd0_req_reset(bad_counts[i], vals, req, sizeof req) == 0 && memcmp(req, untouched, sizeof req) == 0,
+              "reset arity %u refused without touching output", (unsigned)bad_counts[i]);
+    }
+    memcpy(req, untouched, sizeof req);
+    CHECK(pd0_req_reset(PD0_MAX_OBS, vals, req, sizeof req - 1) == 0 && memcmp(req, untouched, sizeof req) == 0,
+          "reset request refuses short output capacity");
+    CHECK(pd0_req_reset(1, NULL, req, sizeof req) == 0, "reset request refuses null values");
+    CHECK(pd0_req_reset(1, vals, NULL, sizeof req) == 0, "reset request refuses null output");
+
+    size_t n = pd0_req_reset(PD0_MAX_OBS, vals, req, sizeof req);
+    CHECK(n == sizeof req && req[0] == PD0_OP_RESET && req[1] == PD0_MAX_OBS &&
+              (int64_t)pd0_get_u64(req + 2) == vals[0] && (int64_t)pd0_get_u64(req + 26) == vals[3],
+          "valid maximum-arity reset keeps its canonical framing");
+
+    reset_probe probe = {0, 0};
+    pd0_chan c = {probe_reset_call, &probe, -1, -1};
+    pd0_rec rec;
+    for (size_t i = 0; i < sizeof bad_counts; i++) {
+        CHECK(pd0_chan_reset(&c, bad_counts[i], vals, &rec) == -1 && probe.calls == 0,
+              "reset arity %u refused before transport", (unsigned)bad_counts[i]);
+    }
+    CHECK(pd0_chan_reset(&c, 1, NULL, &rec) == -1 && probe.calls == 0, "null reset values refused before transport");
+    CHECK(pd0_chan_reset(NULL, 1, vals, &rec) == -1 && probe.calls == 0, "null reset channel refused before transport");
+    CHECK(pd0_chan_reset(&c, 1, vals, NULL) == -1 && probe.calls == 0, "null reset record refused before transport");
+    CHECK(pd0_chan_reset(&c, PD0_MAX_OBS, vals, &rec) == -1 && probe.calls == 1 && probe.req_len == sizeof req,
+          "valid maximum-arity reset reaches transport with bounded length");
 }
 
 /* drive a channel with a fixed script; append record bytes into out */
@@ -423,6 +469,7 @@ static void t_desc2(void) {
 
 int main(void) {
     t_wire();
+    t_reset_request_bounds();
     t_rules();
     t_splitmix();
     t_null_world();
