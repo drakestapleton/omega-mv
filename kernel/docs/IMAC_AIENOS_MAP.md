@@ -1,0 +1,168 @@
+# AienOS on the 2017 iMac: gap map and ordered path (L210)
+
+Status: read-only map. First written 2026-10-20 against `18e2765`; refreshed 2026-11-15 against aienux `main` at `d01b2f19`. Sources: this repository's `main`, the named branches in the aienux repository on the project's own git host, the companion repositories named in each row (aien-train, omega-mv), the hardware evidence folders under `evidence/`, and the iMac handoff notes kept on the Spark (named by folder, not copied here). No machine was touched for this document: no reboot, no boot-order change, no firmware load, no iMac access. Every claim is tagged OBSERVED (read in a file, a commit or a command output), INFERRED (with confidence) or UNKNOWN (with the experiment that resolves it). No row says something works unless it names where it was proven.
+
+Names: Aienux is the kernel, AienOS is the system. Older files say AIENOS, and Allen for what is now called Aien. The Pi twin of this file is `docs/PI5_AIENOS_MAP.md`. The Spark map (L191) is on the branch `feat/spark-replace-linux-map` and is not on `main`.
+
+Goal (Drake, 2026-10-20): "everything from up and down, hardware now and everything in the future". For the iMac that means every device on the board, the model run, and the iMac's place on the network of AienOS machines.
+
+## 1. Plain-English summary
+
+The iMac is the machine where our own software has run on real hardware the most. Two different programs run on it today, and they are easy to mix up:
+
+1. **The C kernel** (`native/kernel/x86/`). Apple's firmware starts it from the iMac's own disk or from the network. It starts all four cores, reads both disks without writing, takes a USB keyboard, draws Aien's window and plays sound. A branch build of it also ran one small language model (15 million parameters) on the CPU on 2026-10-30; the model code is on `main`. Since 2026-10-24 this kernel is **frozen**: it takes bug fixes only, while Aienux is rewritten in Omega (`native/kernel/README.md`, line 3).
+2. **Omega programs that run inside Apple's firmware** (UEFI applications), built by the Omega compiler's `x86efi` target. On 2026-11-14 one of them held a typed conversation on the iMac with our own Omega language model, using the same model files the Spark's own-model service loads, and its answer matched the Spark's answer byte for byte. Apple's firmware stays underneath these programs, so they are not the kernel.
+
+Still missing for "everything": the Radeon GPU (nothing has run on it), Wi-Fi, Bluetooth, Thunderbolt, the SD reader, the camera, fan and temperature control, protection against devices writing anywhere in memory (VT-d: only the table reader exists), and a working chat link to the Spark from the Omega firmware app (its network does not come up; ledger L974 is open; the ledger records that on 2026-11-07 Drake asked for the remaining work to be handed to the Hive, and a later note says the remaining items "were paused by Drake").
+
+## 2. The machine, exactly
+
+OBSERVED from `evidence/imac_boot0_2026-10-16/README.md` (a real run of `IMACDIAG.EFI` on this iMac). The 2026-11-14 run wrote `smbios=Apple Inc./iMac18,3/1.0` and `cpu=Intel(R) Core(TM) i5-7500 CPU @ 3.40GHz` from the machine itself (handoff `imac-x86-boot-20261113`, `imac-run/OUT.TXT`).
+
+| Part | Id | Notes |
+| --- | --- | --- |
+| Model | iMac18,3, Apple firmware 529.140.2.0.0, UEFI 2.40 | 27-inch Retina 5K, 2017 |
+| CPU | Intel Core i5-7500 (Kaby Lake, family 6 model 0x9e), 4 cores, 1 thread each, 3.4 GHz | AVX2 and FMA, no AVX-512, invariant TSC, RDRAND/RDSEED, x2APIC |
+| Memory | about 16 GB usable (`conventional_mib=16078`) | |
+| GPU | AMD `1002:67df` rev c5 at 01:00.0 | Polaris 10 (Radeon Pro 570, 575 or 580; which one is UNKNOWN until the VRAM size is read). HDMI audio `1002:aaf0` |
+| Intel graphics | `8086:5912` HD 630 at 00:02.0 | Not used for the panel in this report |
+| Screen | GOP 3840x2160 | The panel is 5120x2880; the firmware hands us a 4K mode. Native 5K needs a display driver (INFERRED, medium) |
+| Disk 1 | SATA AHCI `8086:a102`, 1 TB HDD, 512 B blocks | The slow half of the Fusion Drive |
+| Disk 2 | NVMe Samsung `144d:a806`, 26,702 MiB (about 26.1 GiB), 4096 B blocks | The fast half of the Fusion Drive |
+| Ethernet | Broadcom `14e4:1686` (BCM57766) | |
+| Wi-Fi | Broadcom `14e4:43ba` | |
+| SD reader | Broadcom `14e4:16bc` | |
+| USB | xHCI `8086:a12f` | |
+| Thunderbolt 3 | Alpine Ridge `8086:1578`, `15d3`, `15d2`, and xHCI `15d4` | |
+| ACPI | 24 tables, checksums ok, includes `DMAR` (Intel VT-d) and `MCFG`; no `TPM2` table | |
+
+Not in the report (UNKNOWN until read): the Bluetooth part, the camera, the fan and temperature controller (Apple SMC) and the Apple security parts. With no TPM2 table, keys here use a recovery-secret path like the Pi, not a TPM seal (INFERRED, medium).
+
+## 3. What is on `main` and what is not
+
+OBSERVED with `git log` and `git merge-base --is-ancestor` on 2026-11-15.
+
+| Piece | Where | State |
+| --- | --- | --- |
+| Boot probe, C kernel on x86-64, SATA read, all cores, NVMe read, Ethernet report | #404 to #408 | on `main` |
+| Report is lab-only, allowlisted, labelled unauthenticated | #412 (`104c8eb7`) | on `main` |
+| Network loader `NETLDR.EFI` (signed kernels from the Spark) and Apple NetBoot answerer | #414 (`cc2f200f`, `48eb2993`) | on `main` |
+| Audio output; CS8409 speakers | #423; #415 | on `main` |
+| W^X page permissions, NX, CR0.WP on all cores | #426 (`9e0e6179`, "QEMU-verified only; iMac hardware NOT_RUN"); mutant `ap_no_wp` #507; TLB shootdown #511; page 0 unmapped #512 | on `main` |
+| USB keyboard and Aien's window | #415 (`9165e025`) | on `main` |
+| Start from the iMac's own disk (two-slot boot section) | #418 (`47e5c4b5`) | on `main` |
+| Keyboard unplug and replug | #421 (`3d6824ff`) | on `main` |
+| Aien with persistent memory, network updates, local tools runner, DMAR table reader, the 15M model, panel power, GPU core files | #473 (`5e0c7970`, 453 files) | on `main` |
+| Omega-written GPT and ESP boot-medium builder | `tools/imac-image/` (#455, `29e884d5`) | on `main` |
+| Aien in seeded Omega as a firmware app, with a local Omega model option | `native/omega/allen/` (`e5669dd1`, `8903a432`, `bbe75cca`) | on `main`, marked WIP; its README pins omega-mv `b8bd1d03`, which sits on the omega-mv branch `fix/imac-net-L974-snp` and not on omega-mv `main` (so this pin is not the newest Omega build) |
+| Native-model release that ran on the iMac (`5e21abb0`) | `feat/imac-native-omega-model` | branch, not an ancestor of `main`, but its content reached `main` in #473: of the 445 files it changed (crumb files left out), 350 are byte-identical on `main`, 92 differ and 3 are absent (Python helper scripts) (blob comparison, 2026-11-15). INFERRED (high): nothing on it needs landing; the 92 differing files were not examined one by one |
+| Network boot that survives server restarts | `fix/imac-network-boot-persistent` (`a5448b1b`) | not an ancestor of `main`, but its change (BSDP replies from port 1067 in `scripts/ck_imac_lab_services.sh`) reached `main` in #473 (`git log -S reply_source_port`) |
+| Firmware-app network repair | `fix/imac-net-L974` (head `8903a432`) and the offline-message fixes (`4e8c9641`, `408c65ea`, `27459237`) | on `main`. Ledger L974 stays open for its outcome (the firmware app's network still does not come up; the courier has no model backend); the ledger records that on 2026-11-07 Drake asked for the remaining work to be handed to the Hive, and a later note says the remaining items "were paused by Drake" |
+| Hardware-gate register (every physical gate with a receipt rule) | `hive/t_dfeb5d5b-hw-gates` | branch, not on `main` |
+| Combined #412 + #413 lab build that ran on 2026-10-17 | `test/imac-412-413` (`e0c033a`) | branch, not on `main` |
+| W^X physical-run record | `fix/409-imac-wx` (`evidence/imac_wx_2026-10-17/`) | branch, not on `main` |
+| Microphone first cut | `feat/imac-screensaver` | branch, not on `main` (its screen sleep reached `main` separately, `x86/kmain_x86.c`) |
+| Conversation with the own Omega model (x86efi `ask`) | aien-train `imac/x86efi-ask` at `e8df9a3c` | held in the lane's own clone; not in the shared aien-train repository. Its MERGE verdict came from another provider's model under the older review rule; landing it now needs a fresh Claude Opus 5.5 review of that head |
+
+Other iMac branches exist that are not on `main`; `git branch --list '*imac*' --no-merged main` in the aienux repository lists them, and only those that bear on a row here are named above.
+
+Open review findings on the iMac drivers: ledger L1281 lists ten (F1 to F10) from the 2026-10-29 driver review, still open on `main` `d01b2f19`. Two were read on `main` by the 2026-11-15 kernel triage: `x86/xhci_x86.c` `ck_x86_xhci_stop_all()` only prints and never clears the run bit, and `x86/tg3_x86.c` stops the MAC only. Today they affect the lab image's hand-over to a new kernel (L1281 marks F1 as lab image; live swap over the network is not built, `docs/IMAC_GPU_BENCH.md`), and any future swap path.
+
+## 4. The gap table
+
+Columns: device; **Aienux today** (file, gate, where proven: host, QEMU, real iMac); **missing**; **reference** (first document to read, with licence); **host-only now?**. "Real iMac" means a physical run recorded in a commit message, a receipt or a handoff; QEMU never proves hardware. The C kernel is frozen, so every "missing" entry below is new work for the Omega rewrite unless it is a bug fix.
+
+### Class D: devices that need a driver or a kernel service
+
+| # | Device | Aienux today | Missing | Reference | Host-only now? |
+| --- | --- | --- | --- | --- | --- |
+| IM1 | Boot and firmware handoff | `x86/efi_x86.c`, handoff record, `core/handoff_check.c`. Gates (QEMU): `scripts/qemu_ck_imac_kernel_test.sh` (AIENOS_IMAC_KERNEL), `scripts/qemu_ck_imac_bootdisk_test.sh` (AIENOS_IMAC_BOOTDISK), `scripts/qemu_ck_imac_netboot_test.sh` (AIENOS_IMAC_NETBOOT); host `scripts/ck_imac_bsdp_test.sh` (AIENOS_IMAC_BSDP). Real iMac: first C kernel run from a stick on 2026-10-16 (#405, `evidence/imac_kernel0_2026-10-16/`), from the internal boot section with no loader (#418) and by signed network boot (handoffs `imac-native-model`, 2026-10-30, and `imac-boot-repair-20261107`) | A watchdog: a kernel that hangs after ExitBootServices still needs a hand on the power button | Intel PCH watchdog/TCO documentation | Yes for watchdog logic in QEMU |
+| IM2 | CPU, cores, timer, interrupts | Four cores (`x86/smp_x86.S`), local APIC timer, TSS/IDT, TLB shootdown (#511); I/O APICs are found in the MADT and every line is masked (`x86/kmain_x86.c`, `ioapic_mask_all`). Gate: AIENOS_IMAC_KERNEL (QEMU). Real iMac: a build of `84464940` (#407, an ancestor of `main`) printed `smp: cpus=4 started=3 failed=0` and `ioapic_lines_masked=24` on 2026-10-17 (`evidence/imac_kernel1_2026-10-17/README.md`); a combined #412 + #413 lab build (local branch at `e0c033a`, image sha256 `ea12b2ab…`, not on `main`) printed `smp 3/3` on 2026-10-17; the evidence was recorded on #413 at `c6e3ede` (handoff `2026-10-17-imac-allen-milestone`) | Interrupt routing through the I/O APIC, MSI/MSI-X; a hardware run of today's `main` (TLB shootdown #511 and page 0 unmapped #512 came later) | Intel SDM (public) | Yes (QEMU) |
+| IM3 | Memory protection | W^X, NX, CR0.WP on all cores, page 0 unmapped (#426, #507, #512). The #426 commit on `main` (`9e0e6179`) says "QEMU-verified only; iMac hardware NOT_RUN". Gate: AIENOS_IMAC_KERNEL W^X audit checks (QEMU). The same 2026-10-17 combined lab build (not on `main`) printed `wx ok, wx_audit ok 15/15` on the iMac (same handoff; the record is `evidence/imac_wx_2026-10-17/README.md` on the branch `fix/409-imac-wx`, not on `main`) | A hardware run of `main`'s W^X code | Intel SDM | Done in QEMU |
+| IM4 | DMA confinement (VT-d) | **Table reader only.** `core/dmar.c` and `x86/dmar_x86.c` read and check the DMAR table (`docs/IMAC_DMAR_INVENTORY.md`, Intel VT-d spec rev 5.0 sections 8.1 to 8.4); host test `native/kernel/tests/test_dmar.c`. That document says it "does not implement or qualify device DMA confinement" | Root and context tables, queued invalidation, fault handling. Without them the network chip can write anywhere in RAM | Intel VT-d specification (public); `core/smmu.c` is the Arm pattern | Yes (QEMU `intel-iommu`) |
+| IM5 | PCI and ACPI discovery | MCFG walk (`x86/pci_x86.c`), ACPI table checks. Gate: AIENOS_IMAC_KERNEL (QEMU). Real iMac: the firmware diagnostic read 24 ACPI tables on 2026-10-16; the kernel parsed the MADT on 2026-10-17 (`evidence/imac_kernel1_2026-10-17/README.md`) | AML-described devices (SMC, fans, some power rails). UNKNOWN how much of the board works without an AML interpreter | ACPI specification (public) | Partly |
+| IM6 | SATA HDD | `x86/ahci_x86.c`: polled, read-only. Gate: AIENOS_IMAC_KERNEL (QEMU). Real iMac: our driver read sector 0 (`boot_sig=55aa`) on 2026-10-17, build `84464940` (`evidence/imac_kernel1_2026-10-17/README.md`); on 2026-10-16 only the firmware diagnostic listed the disk | Writes (the write hooks refuse) | AHCI specification (Intel, public) | Yes in QEMU |
+| IM7 | NVMe half | Read-only, shared NVMe driver. Gate: AIENOS_IMAC_KERNEL (QEMU). Real iMac: our driver read 4096 bytes on 2026-10-17, build `84464940` (same folder) | Write, flush, deeper queues. Too small for big models | NVMe base spec (public) | Yes |
+| IM8 | Boot section on the ESP (A/B slots) | `native/boot` FAT slot writer (#418), `tools/imac-image/` (Omega). Gates: `scripts/ck_fat_boot_test.sh` (AIENOS_FAT_BOOT, host), AIENOS_IMAC_BOOTDISK (QEMU). Real iMac: Apple firmware starts it by itself | A recorded second power-on from disk with no stick or network | none | Done in QEMU |
+| IM9 | Wired Ethernet | `x86/tg3_x86.c`: reset, rings, transmit; receive in lab builds; courier over UDP (`x86/courier_udp_x86.c`). Gates: `scripts/ck_imac_report_test.sh` (AIENOS_IMAC_REPORT, host), AIENOS_IMAC_NETBOOT (QEMU, without the BCM57766 chip, which QEMU does not emulate), host test `native/kernel/x86/tests/courier_udp_test.c`. Real iMac: signed kernels fetched, verified and started over the network | Stop of all DMA on hand-over (L1281), receive in the default image, VT-d (IM4), TCP | Broadcom programmer guides: to be located and quoted; Linux `tg3` (GPL) read-only | Yes |
+| IM10 | USB keyboard | `x86/xhci_x86.c`, `dev/usb_kbd.c`, `usb_hid.c`. Gate: `scripts/qemu_ck_imac_keyboard_test.sh` (AIENOS_IMAC_KEYBOARD, QEMU). Real iMac: keyboard works (also in the 2026-11-14 firmware program). No hardware record of the replug fix (#421) was found | Halt result checked before reuse (L1281), mouse/trackpad, hubs, mass storage | xHCI specification (Intel, public) | Yes |
+| IM11 | Screen as a framebuffer | `core/fbcon.c`, `ui/`, `x86/console_x86.c`. Gate: `scripts/ck_allen_ui_test.sh` (host). Real iMac: Aien's window and night sky (#415). The Omega firmware programs draw their own text through GOP at 3840x2160 (2026-11-14) | Native 5K and a GPU-drawn picture (IM13) | none | Done on the CPU path |
+| IM12 | Panel power | `x86/panel_x86.c` on `main`. No gate found for it. Real iMac: UNKNOWN | A hardware run | AMD register headers (Linux, MIT, read-only, cited per define) | Register model yes |
+| IM13 | GPU display engine (Polaris 10, DCE 11.2) | `gpu/amd_display.c`, `amd_mc.c`, `amd_smu.c` on `main`. Chip naming on `main` now says Polaris 10, `1002:67df` (the L213 correction; L213's own commit `a8c274c` is not on `main`, the naming reached it another way). Host test `native/kernel/tests/test_amd_gpu.c`; QEMU `scripts/qemu_ck_gpu_bench_test.sh`, which still uses `0x67ef1002` as a stand-in config value (`x86/bench_x86.c:342`, checked at line 132 of that script); that is a test fixture, not a chip check. Real iMac, 2026-10-30 branch build `5e21abb0`: the start log says the GPU BAR5 and BAR0 were mapped and the bench console started; no register value was read back, and the diagnostic endpoint "did not respond" over the network (handoff `imac-native-model`, `physical-start.unauthenticated.txt` and `PR-BODY.md`) | First read-only steps on hardware (memory controller aperture, VRAM size, SMU answer), then a 5K mode set | AMD Polaris register headers and GCN4 ISA (public); Linux `amdgpu` (GPL) read-only | Model yes, chip no |
+| IM14 | GPU compute path | `gpu/amd_compute.c`, `amd_sdma.c`, `amd_ucode.c` on `main`: stubs that need AMD firmware blobs; host test `native/kernel/tests/test_amd_gpu_ring.c`. `amd_ucode.c:20` records a known firmware-name mismatch (L213). The GCN encoder (`gpu/gcn_enc.c`) and the PM4 interpreter are on `feat/imac-gpu-shader` (`5b56323c`), not on `main`; the bench console branch `feat/imac-gpu-bench` (`25b9b9da`), the core branch `feat/imac-gpu-core` (`26eb3547`) and the register fix `fix/imac-gpu-regs-verified` (`7642c70a`, ledger L187 done) are not ancestors of `main`, but the L187 register corrections (for example `mmGRPH_PRIMARY_SURFACE_ADDRESS 0x1a04u`, `mmSMC_MESSAGE_0 0x0094u`), `scripts/gpu_bench/` and `x86/bench_x86.c` reached `main` in #473. The October draft's open note that compute queue selection uses the wrong register still appears to hold on `main`: `gpu/amd_compute.c` selects the queue through GRBM_GFX_INDEX and never writes SRBM_GFX_CNTL, which is not defined in the tree, while `main`'s own header says GRBM_GFX_INDEX "does NOT select a compute queue: Linux selects the MEC pipe/queue through SRBM_GFX_CNTL" (`gpu/amd_gpu_regs.h:219-220`). OBSERVED: the driver and its header disagree on `main`. `scripts/gpu_bench/check_regs.sh` on `main` checks register numbers, not this choice | Firmware load (Drake's go), GART, command ring, fences, matmul kernels | AMD GCN4 ISA (public), Linux `amdgpu` | Shader side yes; ring and microcode need the chip |
+| IM15 | Audio | `x86/hda_x86.c`, Cirrus CS8409 speaker path (#415, `9165e025`; audio output #423). Gates: `scripts/ck_chirp_test.sh` (host, the start-up sound), AIENOS_IMAC_KERNEL sound checks (QEMU). Real iMac: the speakers played and all four amplifiers answered (#415 commit body) | Microphone (a first cut is on `feat/imac-screensaver`, not on `main`), HDMI audio (`1002:aaf0`), volume policy; stop of DMA on hand-over (L1281) | Intel HDA spec (public); Linux `snd-hda-codec-cs8409` (GPL) read-only | Output done; input yes |
+| IM16 | Wi-Fi (`14e4:43ba`) | **None** (no driver or kernel source names the id; `grep` 2026-11-15) | Driver and firmware. Linux `brcmfmac` (Dual BSD/GPL) claims this id and wants `brcmfmac43602-pcie.bin`; the firmware's licence is not read | Linux `brcmfmac` as reference | Model yes; firmware load needs Drake |
+| IM17 | Bluetooth | **None** | The part is not in the report. UNKNOWN whether on USB or the Wi-Fi card. Resolve by listing xHCI ports read-only on the next lab boot | Bluetooth Core spec (public) | After the list |
+| IM18 | Thunderbolt 3 | **None.** The USB scan skips the Thunderbolt xHCI when it answers all ones (comment at `x86/pci_x86.c:271`) | NHI ring driver, tunnelling, hot-add. UNKNOWN what Apple's firmware leaves set up | Intel Thunderbolt documentation (not located); Linux `thunderbolt` (GPL) read-only | After a read |
+| IM19 | SD reader (`14e4:16bc`), camera | **None** | Drivers. Camera not in the report | none located | After the list |
+| IM20 | Fans, temperatures, SMC | **None.** Drake's question of 2026-10-18 ("does the fan work natively?") has no recorded answer. RAPL watts are read (`x86/kmain_x86.c`) | A measured answer: fan speed and temperature over a long run. INFERRED (low): the SMC runs the fans on its own default curve | Apple SMC is undocumented: DOCS SILENT; Linux `applesmc` (GPL) read-only | Model yes; answer needs hardware |
+| IM21 | Idle power and sleep | MWAIT idle, screen sleep, RAPL watts (`x86/kmain_x86.c`). Gate: AIENOS_IMAC_KERNEL (QEMU only) | A first real watts line | Intel SDM | Done in QEMU |
+| IM22 | Power off, restart | S5 power off: AIENOS_IMAC_KERNEL checks it in QEMU, and the first kernel run found it works on the iMac (`evidence/imac_kernel0_2026-10-16/README.md`). Restart via FADT reset register with 0xCF9 fallback: code on `main`, real iMac UNKNOWN | Real S3 sleep and wake | ACPI specification | Yes |
+| IM23 | Clock and entropy | TSC and RDRAND/RDSEED are present on the real iMac per the 2026-10-16 diagnostic; no use of RDRAND/RDSEED was found in `x86/` (`grep` 2026-11-15) | Wall-clock time (RTC) and network time | Intel PCH RTC registers (public) | Yes |
+| IM24 | Firmware replacement | Not built. The 2026-10-18 attempt was stopped twice by an automated safeguard and is marked "do not retry" | Stays Drake's decision, with an external flash programmer. Apple's logo and start-up time come first until then | Intel PCH SPI documentation | n/a |
+| IM25 | Intel HD 630, Apple security parts | **None** | Leave alone unless a measurement shows the panel or Thunderbolt depends on them | n/a | n/a |
+
+### Class M: the model run
+
+| # | Path | State and evidence | What it takes next |
+| --- | --- | --- | --- |
+| IM-M1 | Own Omega language model, typed conversation, as a firmware program | **EXERCISED on the real iMac, one boot, one turn (2026-11-14).** aien-train `imac/x86efi-ask` (program code of `20df2dea`, head `e8df9a3c`), `ollm.efi` sha256 `aeaa1010…`, compiler omega-mv `2ee0a70d` (omc `26540e6d…`). Model files `CK.BIN` sha256 `a53ced72…` and `MERGES.BIN` `73a29baf…`, the files the Spark's own-model service loads. The answer read back from the stick equals the Spark's AArch64 reference byte for byte (`cmp` exit 0); seed 8 gives a different story (control). The `ask` job took 206,931 ms on the iMac's clock, typing and reading included (handoff `imac-x86-boot-20261113`, `imac-run/RESULT.md`). No tokens-per-second figure was measured | Land the aien-train head; time generation apart from typing; then speed against the memory ceiling |
+| IM-M1b | Same program family, fixed 11-job check | EXERCISED on the real iMac 2026-11-01: job output equal to the AArch64 reference, 186,521 ms by the firmware clock (aien-train `main`, `evidence/OMEGALLM/imac/`) | none beyond IM-M1 |
+| IM-M2 | 15M model inside the C kernel (CPL3 runner) | Code on `main`: `native/kernel/x86/model/` (`llama.om` compiled by omega-mv `bf54b19f`, weights `stories15M.bin` sha256 `cd590644…`). Real iMac 2026-10-30, release `5e21abb0` (branch build): signed network boot, the story appeared on screen, confirmed by the user. Elapsed time not recorded (the 16 KiB console log lost the last line) | Frozen kernel: no new model work here |
+| IM-M3 | Local model inside the Omega Aien firmware app | `native/omega/allen/local-model.om` on `main`. QEMU only: eight greedy tokens (`native/omega/allen/LOCAL-MODEL.md`) in 110.04 s under emulation on an M2 MacBook Air (`evidence/OMEGA-LOCAL-MODEL/macbook-20261106/sample.json`). iMac NOT_RUN | First iMac run |
+| IM-M4 | CPU speed ceiling | UNKNOWN. No memory-bandwidth measurement exists for this iMac. The inference engine crate `crates/aienos-infer` has an Arm fast path only (no AVX2 path in `src/`, `grep` 2026-11-15) | A bandwidth loop on the iMac, then an AVX2 inner loop in Omega |
+| IM-M5 | GPU, the honest path | Not built. Polaris 10 has no matrix units; the path is GCN4 shader kernels fed through PM4 rings, with weights in VRAM. VRAM size is one read-only register value away (IM13). No GPU tokens-per-second target is quoted before VRAM size and memory clock are read | IM13 first steps, then IM14 with Drake's go for the firmware load |
+
+Verdict (INFERRED, high): the iMac already runs our own model at small scale on its CPU, through Omega firmware programs. The GPU is the part that is new engineering.
+
+## 5. Role on the network of AienOS machines
+
+OBSERVED in the repository:
+
+- Pairwise secure transport `native/net/aienos_sec.{h,c}`, a signed and encrypted link between two machines that each know only the other's key: a three-message SIGMA-style handshake (X25519, Ed25519 identities, HKDF, AES-256-GCM-SIV). Each side accepts one peer key, "a pinned roster of one" (`aienos_sec.h:25`). Only TEST identities exist. Reliable channel `aienos_ctl.c`; UDP, IPv4, ARP and ICMP in `aienos_net.c`. No TCP, TLS, DNS or DHCP in `native/net`.
+- The Omega firmware app carries its own HTTP and TLS units (`native/omega/allen/http.om`, `tls.om`, `tls-crypto.om`); they belong to that WIP app, not to a kernel network stack.
+- Lab wire formats: unauthenticated report (lab image only), signed network boot (kernels checked with Ed25519 before start), and the courier that carries Aien's chat to the Spark over UDP. Live kernel swap over the network is NOT BUILT (`docs/IMAC_GPU_BENCH.md`, Status). That document also says the GPU bench console is NOT TESTED on hardware; since then the 2026-10-30 branch build started it on the iMac, and it never answered (IM13).
+- The word "gateway" appears in no file under `native/net`, `docs/adr` or `docs/*.md` (other than these two maps). A network gateway is a design item, not code. Ledger L690 (open) is a different thing: an Omega chat gateway for Aien, named in `docs/superpowers/specs/2026-10-23-allen-omega-platform-gates.md`.
+
+Today's role (OBSERVED in the 2026-11-07 handoff `imac-boot-repair-20261107`): the iMac is a **leaf of the Spark**. The Spark answers its network boot, serves signed images, and runs the courier for Aien's chat. As of that handoff two faults stood between the iMac and a working chat: the Omega firmware app's network never came up (L974, open; see section 3 for its recorded pause), and the courier's model backend pointed at a port with no listener (L975). This map does not re-check either.
+
+The MacBook today is the operator's machine in this picture: it writes the iMac's boot sticks and reads them back for the byte comparison (handoff `imac-x86-boot-20261113`), and it hosted the emulated local-model run (IM-M3). It runs macOS (the stick guide drives it from Terminal) and is not always on, so it is not a gateway candidate (INFERRED, high).
+
+Role to aim for (INFERRED, high): Aien's screen and a small local model on its own; a **peer of the Spark** for big-model work once identities are real and the roster holds more than one peer. It does not need to be a gateway, relay or time source.
+
+Joining the operator's private network: a native node needs an encrypted link and its control protocol over TCP and TLS. Native TCP exists only as the QEMU-exercised seeded-Omega stack in `native/net/tcp/`, in no kernel image; the encrypted link and a TLS server role do not exist. The near-term route is a Linux machine routing for the home network so the other machines reach the iMac at its LAN address (INFERRED, medium). Until the Omega transport above exists, the iMac's traffic on that route is the unencrypted courier and the unauthenticated lab report: lab traffic, not the signed network role.
+
+## 6. Ordered path
+
+Notation: **[H]** host or QEMU only; **[A]** needs the iMac with a stick or network boot and a power-on; **[O]** Drake only; **[C]** needs the GPU chip. Because the C kernel is frozen, new device work is written in Omega; fixes to the C kernel are allowed and come first where they touch safety.
+
+1. [H] Fix L1281 F1 to F7, F9 and F10 in the C kernel (bug fixes are allowed while frozen): stop every device's DMA before memory is handed on, check the xHCI halt result. F8 (no DMA confinement) is new work, answered by step 7. Confirm and fix the compute queue selection (IM14), and re-run `scripts/gpu_bench/check_regs.sh`.
+2. [H] Land what already ran on the iMac: aien-train `imac/x86efi-ask` with its evidence folder, after a fresh review.
+3. [O][H][A] L974: confirm with Drake that the recorded pause is lifted, then bring up the firmware app's network and give the courier a real own-model backend; then one recorded chat turn from the iMac to the Spark.
+4. [A] One read-only lab boot, from a probe written in Omega (an `x86efi` firmware program like IM-M1): list xHCI ports (Bluetooth, camera), read the GPU memory controller and VRAM size, read Thunderbolt state, record the watts line. Resolves IM13's first step, IM17, IM19.
+5. [A][O] Fan and temperature answer (IM20): a long run with a person listening and a temperature read.
+6. [H][A] Model speed: time generation apart from typing, a memory-bandwidth loop, then an AVX2 inner loop written in Omega (IM-M1, IM-M4).
+7. [H] VT-d in Omega, tested against QEMU `intel-iommu` (IM4).
+8. [H][A] GPU display: 5K mode set and a GPU-drawn frame (IM13).
+9. [H] Wi-Fi model and a firmware inventory with licences (IM16); [A] hardware after Drake allows the firmware load.
+10. [H] Thunderbolt and SD, if step 4 shows they are reachable (IM18, IM19).
+11. [C][O] GPU compute: microcode and rings on hardware, a fill kernel, then matmul (IM14, IM-M5).
+12. [H] Real keys and a multi-peer roster (section 5). Whether the Pi owner key from the 2026-10-14 ceremony (`docs/native/PI5-8-OWNER-CEREMONY.md`) is the root for the other machines' transport identities is UNKNOWN; it is settled by writing the key hierarchy down before any real identity is issued.
+
+## 7. Operator steps (Drake only)
+
+None of these is authorized by this document.
+
+- Power the iMac on for each lab image (network boot or stick) and say what the screen shows, or let the report arrive.
+- Listen to the fan during a long run (IM20).
+- Decide on the flash chip and an external programmer (IM24).
+- Allow the first GPU and Wi-Fi firmware loads when steps 9 and 11 are reached.
+- The owner-key ceremony, as on the other machines.
+
+## 8. Limits of this document
+
+- No gate was run for the facts in this file. Results are quoted from commit messages, receipts and handoffs, which were not re-run here.
+- Physical results above are single runs on one machine. Several sit on branches that are not on `main` (section 3).
+- The iMac was not contacted. The device table is the 2026-10-16 report plus the 2026-11-14 identity line.
+- Searched for this refresh: `git log 18e2765..main` over `native/kernel/x86`, `native/kernel/gpu`, `native/net`, `native/omega`, `tools`, `docs/IMAC*` and `evidence`; branch lists in the aienux repository; aien-train `main` evidence; `evidence/imac_boot0_2026-10-16`, `imac_kernel0_2026-10-16` and `imac_kernel1_2026-10-17`; a blob comparison of `feat/imac-native-omega-model` against `main`; the iMac handoff folders `imac-x86-boot-20261113`, `imac-boot-repair-20261107`, `imac-native-model` and `imac-review`; ledger rows L213, L879, L974 to L976 and L1281.
+- No speed or time estimate appears except those tied to a receipt.

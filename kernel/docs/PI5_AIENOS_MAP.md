@@ -1,0 +1,139 @@
+# AienOS on the Raspberry Pi 5 ("hub"): gap map and ordered path (L210)
+
+Status: read-only map. First written 2026-10-20 against `18e2765`; refreshed 2026-11-15 against aienux `main` at `d01b2f19`; rechecked 2026-11-16 at `main` `409fb677` (the commits between change `native/kernel/Makefile` only by adding spinlock targets; no Pi target or Pi file changed). Edited 2026-11-18 in omega-mv (review of the fold): what the Pi runs under Linux was taken out of this public file, and the TCP lines now name the native TCP in `native/net/tcp/`. Sources: this repository's `main` (`docs/native/PI5-*.md`, `docs/native/pi5-8/`, `native/kernel/dev/pi5_*`, `native/kernel/core/pi5*.c`, `scripts/pi5_receipts_verdicts.tsv`), aien-train `main`, the Pi handoff notes kept on the Spark, and two read-only looks at the live Pi over ssh (2026-10-20 and 2026-11-15). Nothing was written to the Pi, no service was touched, no reboot, no boot-order or firmware change. Every claim is tagged OBSERVED, INFERRED (with confidence) or UNKNOWN (with the experiment that resolves it). Network addresses, account names and serial numbers are left out on purpose.
+
+Names: Aienux is the kernel, AienOS is the system; older files say Allen for what is now called Aien. The iMac twin of this file is `docs/IMAC_AIENOS_MAP.md`. The Spark map (L191) is on the branch `feat/spark-replace-linux-map` and is not on `main`.
+
+## 1. Plain-English summary
+
+The Pi does two jobs at once. It is a small test computer where Aienux has run on real hardware: it reads its memory card, keeps a locked and signed store that survives a power cut while idle (one real run; a cut in the middle of a write is tested in QEMU only), unlocks it with a recovery secret, runs a 1-billion-parameter model at 1.20 tokens per second (a token is roughly a word piece), loads signed programs, and runs Aien's request router (Reflex) on the board. On a branch that is not on `main` it also held signed, encrypted sessions with the Spark over the wired network (11 of 11 on 2026-10-16; section 3). Between native windows it runs Linux as one of the operator's always-on machines ("hub"; section 4).
+
+Native Aienux cannot take over that Linux work today: native TCP is in seeded Omega under `native/net/tcp/` (ledger L232): exercised by its hosted corpus, and in QEMU as a process in a Linux guest, which exercises it and proves nothing; it is not bound into the kernel's virtio-net driver, and hardware is NOT_RUN (`native/net/tcp/README.md`, Evidence). There is no TLS server role and no network service in `native/`. Every native test so far is a temporary window: the Pi boots Aienux once from its memory card, then goes back to Linux.
+
+Little has changed in the Pi's native code since 2026-10-20: the one addition on `main` is the Reflex router image (#402). The C kernel is frozen since 2026-10-24 (bug fixes only, `native/kernel/README.md` line 3), so new Pi device work is written in Omega.
+
+## 2. The board, exactly
+
+OBSERVED over ssh. Board identity and devices from 2026-10-20 (raw output and exit codes kept with the handoff on the Spark); the 2026-11-15 look re-read the model, kernel, disks, links, temperature and services.
+
+| Part | Value |
+| --- | --- |
+| Board | `Raspberry Pi 5 Model B Rev 1.0` (2026-11-15), device tree `raspberrypi,5-model-b brcm,bcm2712` |
+| CPU | 4 cores, Arm implementer `0x41` part `0xd0b` (Cortex-A76), features include `asimddp` (dot product) and `fphp`; cpufreq 2.3 GHz, 2.4 GHz max |
+| Memory | 8,118,184 kB total |
+| PCIe | `0002:00:00.0` Broadcom BCM2712 PCIe bridge `14e4:2712`; `0002:01:00.0` RP1 south bridge `1de4:0001`. Nothing else on PCIe: the external x1 slot is empty |
+| Storage | microSD `mmcblk0` 119.4 GB (p1 512 MiB, p2 4 GiB, p3 784 MiB: the AienOS card layout in `PI5-6-INFER-RUNS.md`, not re-read on 2026-11-15); one USB stick, 28.9 GB, which held the live Linux root and `/boot/firmware` on 2026-10-20 (the 2026-11-15 look listed disks without mount points). The second 960 MB stick seen on 2026-10-20 was not listed on 2026-11-15 |
+| Linux kernel | Ubuntu `raspi` kernel; the exact builds of both looks are in the read-only inventory kept with the L210 evidence on the Spark |
+| Ethernet | `eth0` up (RP1 Gigabit MAC with a BCM54213PE PHY, per the native runs) |
+| Wi-Fi | `wlan0` (driver `brcmfmac`, SDIO host at `/axi/mmc@1100000`), down |
+| Bluetooth | `hci0` present (2026-10-20) |
+| Display | `HDMI-A-1`, `HDMI-A-2` both disconnected (2026-10-20) |
+| Other device nodes | `gpiochip0`, `gpiochip10` to `13`, `i2c-1`, `i2c-13`, `i2c-14`, `spidev0.0`, `0.1`, `10.0`, `rtc0`, `hwrng`, `dri`, `video19` to `video28`, `ttyAMA0`, `ttyAMA10` (2026-10-20) |
+| USB hosts | four buses on xhci (RP1) and one `dwc2` (2026-10-20) |
+| Sensors | hwmon `cpu_thermal`, `rpi_volt`, `rp1_adc`, `pwmfan` (a `fan1_input` exists); CPU 56.75 C (2026-10-20), 57.3 C (2026-11-15) |
+| Load | load average 6.78 (2026-10-20) and 10.84 (2026-11-15) on four cores |
+
+Every read on 2026-11-15 exited 0 except one that timed out; on 2026-10-20 three reads each stalled once and the causes were never separated. The exit codes are in the read-only inventory kept with the L210 evidence on the Spark.
+
+## 3. What Aienux has on the Pi, with where it was proven
+
+Host tests named below are part of `make -C native/kernel test`, which the gate `tests/gates/run.sh ck-host-tests` runs. All "real Pi" rows are runs of the same board, booted one-time from the card with Linux returning afterwards. Evidence: `docs/native/PI5-*-RUNS.md`, `docs/native/pi5-8/`, `evidence/pi5_hardware_runs_2026-10-13/`, `scripts/pi5_receipts_verdicts.tsv` (72 lines, 59 verdict rows). Run tiers are QUALIFICATION with TEST keys unless said otherwise.
+
+| # | Device | Aienux today | Missing | Reference (licence) | Host-only now? |
+| --- | --- | --- | --- | --- | --- |
+| PI1 | Firmware handoff, one-time boot | UEFI image `BOOTAA64.EFI` per variant; `native/kernel/Makefile` targets `pi5`, `pi5-store`, `pi5-unlock`, `pi5-unlock-card`, `pi5-infer`, `pi5-agent`, `pi5-allen`, `pi5-lifecycle`, `pi5-artifact`, `pi5-fact`, `pi5-diag`, `pi5-pcie`, `pi5-net` and mutant builds. Gate `scripts/ck_pi5_build_check.sh`; reproducible builds `scripts/ck_pi5_repro_check.sh` (PI5-8 Q1). Real Pi: boots by tryboot, returns to Linux | A boot that never involves Linux: installer and first-boot path off the USB stick | Raspberry Pi firmware and EEPROM bootloader documentation (public) | Build yes; boot is attended |
+| PI2 | Cores, interrupts, timer | GICv2 (GIC-400) from the MADT; timer; EL2 to EL1; the three secondary cores start through PSCI and park waiting (WFE). Gate: `scripts/qemu_ck_pi5_diag_test.sh` boots the Pi diagnostic image in QEMU AArch64 (it qualifies nothing about a Pi 5, by its own words). Real Pi: every run; `smp: cpus=4 started=4 checked_in=4 psci_errors=0` in `docs/native/pi5-8/route/results/pi-route-399b.kernel.log` and in `evidence/pi5_hardware_runs_2026-10-13/` (pi5-sd1a, pi5-sd1b, pi5-k1) | Work for the three parked cores (none is given any today) | Arm Architecture Reference Manual; BCM2712 documents are not fully public: record DOCS SILENT per block, quote Raspberry Pi's published parts | Yes in QEMU, then one attended run |
+| PI3 | microSD (boot card, Store, model partition) | SD host driver with PIO (`pi5_sd` in `core/pi5.c`): 4-bit, 25 MHz, read sector 0, GPT, Store view; card layout host test `native/kernel/tests/test_pi5_marker.c`. Real Pi: `pi5-sd1a/b`, `pi5-store1..4` | Speed (the model is read by the firmware instead, PI-M1); DMA; write endurance policy | SD Host Controller spec (public); Linux sdhci (GPL) read-only | Partly |
+| PI4 | Sealed Store on the card | Store v1 and M5 sealed envelopes; formats, reopens, bumps generation across boots. Real Pi: `pi5-store1..4` | Mid-commit power cut on the real card: QEMU only | none | Yes |
+| PI5 | Unlock with the recovery secret | `make pi5-unlock`, recovery-secret slot, wrong and corrupt secrets refused; unlock request file host test `native/kernel/tests/test_unlock_req.c`. Real Pi: unlock runs A to E | The secret comes from a labelled card file in tests; no keyboard and no UART input on the Pi image | none | Yes after PI6 |
+| PI6 | USB (RP1 xHCI) | **None**; no gate | RP1 bring-up beyond the Ethernet block, xHCI through the RP1 BAR, keyboard class (`dev/usb_kbd.c`, `usb_hid.c`, `xhci_fence.c` exist for the Spark and iMac) | RP1 datasheet (public, Raspberry Pi); Linux `xhci` (GPL) read-only | Model yes, chip no |
+| PI7 | PCIe root complex and RP1 | `dev/pi5_pcie.c`: finds `14e4:2712` and `1de4:0001`, programs inbound and outbound windows; host test `native/kernel/tests/test_pi5_pcie.c`. Real Pi: `pi5-pcie` and NET-2 runs | Interrupts (polling only), other RP1 blocks | RP1 datasheet | Yes |
+| PI8 | DMA confinement | ADR 0020 (`docs/adr/0020-pi5-software-only-dma-confinement.md`): 2 MiB bounce window. Real Pi, NET-3: the network chip's write outside the safe window was stopped (canary unchanged, one run; recorded as "confinement A BLOCKED"); the read-side test B is inferred only | A wire capture settles B; the Pi has no IOMMU, so this stays weaker than the Spark | none | n/a |
+| PI9 | Ethernet | On `main`: `dev/pi5_gem.c` and `pi5_net.c`: PHY link (BCM54213PE, 1000 Mbit full), loopback PASS twice, one ARP frame sent; host tests `native/kernel/tests/test_pi5_gem.c` and `test_pi5_net.c` (fake registers). The NET-3 run on `main`'s code saw no incoming frame in 400 ms. On the branch `pi5/net-398-wire` (section 3b, not on `main`): receive, ARP answers, UDP and signed sessions with the Spark worked on the real Pi (run r2, 2026-10-16: `frames_rx=150`, `udp_from_spark=81`, `arp_answered=2`, `SUMMARY 11/11 sessions as expected`) | Land or redo that branch (section 3b). A general IP stack; DMA confinement as in PI8 | RP1 datasheet; Linux `macb` (GPL) read-only | Model yes |
+| PI10 | Random numbers | `dev/pi5_rng.c`: RNG200; host test `native/kernel/tests/test_pi5_rng.c`. Real Pi: `entropy: source=rng200` | none | RNG200 documentation | Done |
+| PI11 | Watchdog | `dev/pi5_wdt.c`: 15 s, petted at stages; register values host test `native/kernel/tests/test_pi5.c`. Real Pi: every run | Policy for long runs without code-level pet points | none | Done |
+| PI12 | Serial console | UART output only | UART input (needed until USB keyboard lands); a header cable is a physical step | BCM2712 UART documentation | Yes in QEMU |
+| PI13 | Clock (RTC) | **None** (no gate). `rtc0` exists under Linux | Read and set the wall clock; battery state UNKNOWN | RP1 and PMIC documentation | Yes |
+| PI14 | Fan, thermal, frequency | **None.** Firmware clocks left as found | A temperature read and a fan rule. UNKNOWN whether the firmware keeps the fan under control with no OS running. Resolve with a long run and a temperature read | Raspberry Pi documentation; Linux `pwm-fan` (GPL) read-only | Read path yes; answer needs hardware |
+| PI15 | GPIO, I2C, SPI, ADC, PWM | **None** (the PHY reset uses GPIO 32 in `pi5_net.c` as a one-off) | The RP1 pin controller and the three buses | RP1 datasheet | Yes (register model) |
+| PI16 | HDMI (two ports) | **None.** Console text reaches a screen through the firmware framebuffer (INFERRED, medium, from a code comment) | Native display (HVS and HDMI blocks); no full public documentation known: DOCS SILENT, Mesa `vc4` (MIT) read-only | Mesa / Linux `vc4` | Model yes, chip no |
+| PI17 | Wi-Fi | **None** | An SDIO host driver for the second controller (`mmc@1100000`) plus Broadcom/Cypress firmware; firmware licence not read | Linux `brcmfmac` (Dual BSD/GPL) read-only | Model yes; firmware load needs Drake |
+| PI18 | Bluetooth | **None** | UART transport, HCI, the same firmware family. UNKNOWN which UART (`ttyAMA10` is a candidate) | Bluetooth Core spec | Model yes |
+| PI19 | Camera, DSI display, video codec, VideoCore GPU | **None** | Not on the path to a model run; listed so the map is complete | Mesa `v3d`, `vc4` (MIT) read-only | Later |
+| PI20 | RTC battery, power button, PCIe x1 slot, NVMe | **None**; slot empty on this unit | Only if hardware is added | n/a | n/a |
+| PI21 | Signed units and agents | EL0 artifact loader, agent lifecycle, a resident agent reply kept in the sealed Store across reboot, Cortex memory across cold boot (`PI5-7-ARTIFACT-RUNS.md`, `PI5-7-LIFECYCLE-RUNS.md`, `PI5-6-AGENT-RUNS.md`, `PI5-5-CORTEX-RUNS.md`). Real Pi: all four | Production keys: an owner-key ceremony was performed on 2026-10-14 (`PI5-8-OWNER-CEREMONY.md`), but the run tiers are still TEST keys | none | Done at that tier |
+| PI22 | Aien's request router (Reflex) | `make pi5-allen` (#402, `544e12b3`): `crates/allen-reflex-kernel`, `core/allen_gate.c`; host test `native/kernel/tests/test_allen_gate.c` with a mutant, QEMU twin `scripts/qemu_ck_allen_reflex_test.sh`. Real Pi run `pi5-allen-route-399b` (2026-10-16): `AIENOS_CK_ALLEN: PASS`, all 207 proposal lines byte-identical to the host harness, `authority_violations=0`; per-request p50 875 us (reflex), 57 us (nearest), 23 us (perceptron) (`docs/native/pi5-8/route/README.md`) | Typed input after boot (no live input path); a real Store, desk, local model or link on that image; any send to the Spark | none | Done at that tier |
+
+### 3b. Pi branches that are not on `main`
+
+OBSERVED with `git merge-base --is-ancestor <branch> d01b2f19` in the aienux repository on 2026-11-15.
+
+| Branch | Head | What it holds | Where proven |
+| --- | --- | --- | --- |
+| `pi5/net-398-wire` | `b870a15c` (3 commits ahead of `main`) | Pi to Spark signed session over the RP1 Ethernet: `native/net/pispark.[ch]` (requests and replies over `aienos_sec`), `native/kernel/dev/pi5_peer.[ch]` (UDP and ARP handling), a Spark-side peer, host tests | Real Pi, attended runs on 2026-10-16 with a packet capture on the Spark: r1 at `6c73a6d3` `SUMMARY 9/9 sessions as expected`; r2 at `b870a15c` `SUMMARY 11/11 sessions as expected`, including a link drop inside a session and a fresh session after it. The run folders are kept on the Spark (`pi5-net-398-r1`, `pi5-net-398-r2`, with `-spark` capture folders), not in this repository |
+| `pi5/unlock-1`, `pi5/unlock-2`, `pi5/unlock-3` | `56d27648`, `55f6cc01`, `7a4fbb72` | The first unlock image cuts (AIENOS-PI5-4) | INFERRED (high): superseded; `main` has the `pi5-unlock` and `pi5-unlock-card` targets and the unlock runs |
+| `pi5/target-backup` | `52800c0f` | Early GICv2 and SD driver work-in-progress | INFERRED (high): superseded; `main` has GICv2 selection and the SD driver |
+
+`pi5/net-398-wire` adds feature code to the C kernel, which is frozen. Whether it lands as it is or is redone in Omega is a decision for whoever owns the Pi network lane; the map records it as the starting point for path step 5 either way.
+
+### Class M: the model run
+
+| # | Item | Value |
+| --- | --- | --- |
+| PI-M1 | Measured | Llama-3.2-1B-Instruct Q4_K_M, 807,694,368 bytes, SDOT path (`PI5-6-INFER-RUNS.md`): `mean_tok_us=833129`, which is **1.20029 tokens/s** (calc:591b5dece54642aa0674f6f1024931b5516110a08ca5d5207e492da70f1fd399). Output equals the llama.cpp reference tokens ("The capital of France is Paris."). TinyLlama 1.1B Q4_K_M 1.462 tok/s; h2o-danube3-500m 3.227 tok/s (`PI5-8-MODEL-CHOICE.md`, one boot each). Model read through the firmware from a raw partition at 96.16 MB/s (807,694,368 B in 8.39966 s, calc:3cd091978f8c3653aa4788edb52c1c3e9ddca7d188f005ab047a4e87e2587970) |
+| PI-M2 | Hardware ceiling | From a vendor figure not in this repository (UNVERIFIED): LPDDR4X-4267 on a 32-bit bus, 17,068 MB/s. A model whose weights are read once per token cannot exceed 17,068,000,000 / 807,694,368 = **21.13 tok/s** (calc:166ba5b3792e1780456161c95ebc868dd14cebf73c5cd20287c3fbc6db480ec8). The measured 1.20 is about 5.68% of that (calc:ae057014bbb594a6ccce93bb553428a2a43d92ad522a759635cb0d100847d6e5). The bandwidth must be measured on the board before a plan uses it |
+| PI-M3 | What bounds it today | UNKNOWN until profiled. The run used one execution thread as far as the logs show; features `dotprod=1 i8mm=0 bf16=0 fhm=0 fp16=1 sve=0` (OBSERVED, `PI5-6-INFER-RUNS.md`). Experiments: (a) a memory-copy loop for real bandwidth; (b) per-layer timing; (c) give the three parked cores matrix rows (they already start, PI2) |
+| PI-M4 | Our own Omega model on the Pi | Not run on the Pi. aien-train `main` has an AArch64 UEFI build of the own Omega model program (`TARGET=a64efi`, `ollm-aa64.efi`) with emulated receipts, including `ask` equal to the reference (`evidence/OMEGALLM/a64efi/`, `tests/omegallm/a64efi-receipts.sh`). Builds of the same program (different images: `f2e31985…` for the 11-job run, `a67ac240…` for `ask`) ran on physical Arm hardware with no operating system: on the DGX Spark on 2026-11-12, started by its own UEFI firmware, the 11-job output equalled the Linux reference (`evidence/OMEGALLM/a64efi/dgx-spark/RESULT.txt`), and a typed `ask` conversation was recorded as EXERCISED on physical hardware (`evidence/OMEGALLM/a64efi/dgx-spark-ask/RESULT.txt`). The x86 build of the same program ran on the iMac (`docs/IMAC_AIENOS_MAP.md`, IM-M1). INFERRED (medium): the Pi's UEFI boot path, which already starts the Aienux `BOOTAA64.EFI` images, can start it. UNKNOWN until one attended run |
+| PI-M5 | GPU | VideoCore (V3D). No Aienux driver and no plan. It shares the same memory bus, so for a bandwidth-bound model its gain is capped by the same ceiling. Not a priority |
+
+## 4. The network role
+
+Between native windows the Pi runs Linux as one of the operator's always-on machines. What it runs there is operator infrastructure and is not described in this public file (2026-11-18, review of the fold into omega-mv). For the kernel map one fact matters: that work needs TCP and TLS servers, HTTP and an encrypted network link, bound into a running kernel, which native Aienux does not have; and one board cannot run two operating systems at once.
+
+Aienux side (OBSERVED in the repository): pairwise signed transport `native/net/aienos_sec.{h,c}`, a signed and encrypted link between two machines that each know only the other's key (SIGMA-style handshake, X25519, Ed25519, HKDF, AES-256-GCM-SIV; "a pinned roster of one", TEST identities only). Where it is proven: on `main` it is hosted code with host tests only (`native/net/README.md`), linked into no kernel image; its one real-hardware use is on the Pi branch `pi5/net-398-wire` (section 3b), not on `main`. Reliable channel `aienos_ctl.c`; UDP/IPv4/ARP/ICMP `aienos_net.c`. No TCP, TLS, DNS or DHCP in that C code; native TCP is in seeded Omega under `native/net/tcp/` (ledger L232): exercised by its hosted corpus, and in QEMU as a process in a Linux guest, which exercises it and proves nothing; it is not bound into the kernel's virtio-net driver, and hardware is NOT_RUN (`native/net/tcp/README.md`, Evidence). The Pi to Spark session layer `native/net/pispark.[ch]` exists only on `pi5/net-398-wire` (section 3b). Machine identities issued by an owner root are written in seeded Omega in `native/omega/netid/` (ledger L231): the owner root (Ed25519 on the owner YubiKey, PIV slot 9c, `docs/OWNER_KEY_CEREMONY.md`) issues each machine's Ed25519 credential, TEST credentials and other roots are refused, and the handshake is SIGMA over TCP. It is not on `main`: it is held only under the Radicle-era ref `refs/heads/patches/0de8f71b00c8df8f79d3515beeabc7c95af277a4` (head `b821a0dd`, 2026-11-09), which is history; landing it needs a fresh review and the gates through the current route. Per its README it is IMPLEMENTED and EXERCISED on Linux hosts only: `tests/run.sh` and `tests/twomachine.sh`, the latter between the Spark and this Pi under Linux, with a stand-in owner key generated for the test; nothing has run on Aienux. Its handshake uses the host's TCP sockets, and the native TCP in `native/net/tcp/` is in no kernel image, so landing it does not by itself give AienOS machines a multi-peer roster. Its README lists wiring into `native/net/aienos_sec.c` as a next step, but the C kernel is frozen and that file is in no kernel image on `main`, so carrying it into a kernel would be new feature work there. The native side needs a signed machine-to-machine transport written in seeded Omega, and none exists yet: omega-mv `main` has the primitives (for example `om/tls/gcmsiv.om`) but no such transport (NOT BUILT; whether it runs over native TCP in Omega, step 9, or over UDP is not yet decided). The word "gateway" appears in no file under `native/net`, `docs/adr` or `docs/*.md` (other than these two maps); ledger L690 (open) is an Omega chat gateway for Aien, not the network gateway discussed here.
+
+What native Aienux would need before it could carry network services (INFERRED, high, from what is in `native/` and in omega-mv):
+
+| Need | State | Verdict |
+| --- | --- | --- |
+| TCP bound into a kernel image | Native TCP in seeded Omega (`native/net/tcp/`), exercised by its hosted corpus and as a process in a QEMU Linux guest; not bound into the kernel's virtio-net driver; hardware NOT_RUN | Bind it to a NIC path, written in Omega, and test it there |
+| A TLS 1.3 server role and HTTP | omega-mv has HTTP/1.1 client and server units in seeded Omega (`seed/net/http.om`, `https.om`) and a TLS 1.3 client under audit (`om/tls/`, `AUDIT_SCOPE.md`); no TLS server role | Missing. TLS primitives come from vetted implementations, never hand-rolled |
+| An encrypted network link to other machines | The pairwise signed transport above (one peer, TEST identities) | The signed machine-to-machine transport in seeded Omega (NOT BUILT) and the gateway decision below |
+
+Recommended role (INFERRED, medium): the Pi stays a Linux machine between native windows, and native Aienux on the Pi stays a short attended window, as today, until another machine takes over its Linux work or native Aienux can carry it. The reason is physical: one board cannot run two operating systems at once.
+
+Gateway (a decision for Drake; no gateway code on `main`): a machine that speaks HTTPS to people and the signed machine-to-machine transport (NOT BUILT, above) to the AienOS machines. Candidates: the hub (always on) or the Spark (always on, already the iMac's boot and chat server). The 2026-10-20 draft also named the MacBook; it is dropped here because it is not always on and is the operator's own machine (it writes and reads back the iMac's boot sticks, `docs/IMAC_AIENOS_MAP.md` section 5). A gateway also needs a roster of many peers; on `main`, `aienos_sec` accepts one, and the owner-issued identities of `native/omega/netid/` (above) are not on `main`. Not on `main`: branch `feat/aienos-interplane-join` (head `5af5ac7d`, 2026-10-20, ledger L263) has a C design for exactly this, an owner-signed roster of up to 15 machines with a gateway that is a roster member with platform `hub`, plus a signed relay; it passed hosted tests (a cut link relayed through the Pi) and a 5-VM QEMU gate (Spark, Pi and Mac in one roster, a signed message relayed through the Pi on an owner-set route) and was never run on hardware, and its gateway rendezvous has hosted tests only. Its design names the hub as the gateway. It is frozen-C feature code, so it is a reference for the Omega transport, not a landing candidate (`docs/IMAC_AIENOS_MAP.md` section 5).
+
+## 5. Ordered path
+
+Notation: **[H]** host or QEMU only; **[A]** needs an attended one-time boot of the Pi (Linux comes back afterwards); **[O]** Drake only. The C kernel is frozen, so new Pi device work is written in Omega; bug fixes to the C kernel are allowed.
+
+1. [A] Run the own Omega model on the Pi from an aien-train `a64efi` build of `main` (PI-M4), its sha256 recorded before the boot, with the answer compared byte for byte to the Spark reference. Builds of the same program already ran with no operating system on the DGX Spark, so it is expected to need no new driver (INFERRED, medium; PI-M4).
+2. [A] One lab image, written in Omega (an `a64efi` firmware program like step 1), that prints: a bandwidth loop (PI-M3 a), temperature and fan state (PI14), the RTC value (PI13).
+3. [H] UART input and a serial shell; [O] a USB-serial cable (physical) removes the card-file secret from unlock (PI5, PI12).
+4. [H] RP1 xHCI model and keyboard class; [A] keyboard on hardware (PI6). This also gives real-secret entry (PI5) and typed input to Reflex (PI22).
+5. [H][O] Network: decide whether `pi5/net-398-wire` (receive, ARP, signed sessions with the Spark, proven on the real Pi on 2026-10-16) lands in the frozen C kernel or is redone in Omega (section 3b); then the first signed session from a build of `main`.
+6. [H] Multi-core inference, new and written in Omega (for example in the `a64efi` own-model program of step 1): split rows across cores, checked against the reference output; report speed against the measured ceiling (PI-M3 c).
+7. [H][A] Wall clock and a fan and thermal rule (PI13, PI14), so a native window can be long.
+8. [H] Wi-Fi, Bluetooth, GPIO/I2C/SPI, HDMI (PI15 to PI18): seeded-Omega models and a documentation record already exist on `hive/t_0adfd822-pi5-models` (section 3b); they need a fresh review and landing before any chip code. Firmware loads only with Drake's go.
+9. [H] The native TCP of `native/net/tcp/` bound into a kernel image (today it is exercised only as a process in a QEMU Linux guest), then a TLS 1.3 server role (shared with the Spark; omega-mv already has HTTP/1.1 units and a TLS 1.3 client, section 4), one part at a time.
+10. [O] Decide the gateway machine, and which machine takes over the Pi's Linux work if native windows are to grow long (section 4; the design on `feat/aienos-interplane-join` names the hub). Until then the Pi's native windows stay short.
+
+## 6. Operator steps (Drake only)
+
+None of these is authorized by this document.
+
+- Each native window needs the card's boot menu set for a one-time boot and Linux restored afterwards, as in `docs/native/PREFLIGHT-AND-RECOVERY.md`.
+- A USB-serial cable from another machine to the Pi's UART header.
+- A decision on the gateway, and on which machine takes over the Pi's Linux work.
+- The same owner-key and release-key steps as the other machines.
+- Allow any firmware load (Wi-Fi, Bluetooth) if those rows are built.
+
+## 7. Limits of this document
+
+- No gate was run for the facts in this file. Results are quoted from `docs/native/PI5-*-RUNS.md`, `docs/native/pi5-8/` and the receipts table, which were not re-run.
+- The two ssh looks were single moments on a loaded Pi.
+- The bandwidth used for the ceiling is a vendor figure, not measured and not from this repository; the percentage is a bound, not a result.
+- No configuration, key, database or site content was opened on the Pi. What the Pi runs under Linux is left out of this public file on purpose (2026-11-18): it is operator infrastructure, not part of the kernel map.
+- Searched for this refresh: `git log 18e2765..main` over the Pi paths above and `ROADMAP.md`; every branch in the aienux repository whose name contains `pi5`; the `native/kernel/Makefile` target list; aien-train `main` evidence for `a64efi`; the Pi run folders and handoff notes on the Spark; the EDK2, edk2-platforms and TF-A licence files in the local tree of the rpi5-uefi port; the Radicle-era patch refs for `native/omega/netid/`.
+- No time, effort or speed estimate appears except those tied to a receipt.
