@@ -52,3 +52,36 @@ function; `sh tools/trit/proof/difftest.sh` (python3 + lean) runs it with `#eval
 on generated fixture dirs and requires identical stdout, stderr and exit status. The fixtures include codebook-signed lines
 (valid, tampered, wrong key/id, replayed, stale counter files) and unsigned STOP lines.
 `sh tools/trit/mutate.sh` runs 16 mutants against both.
+
+## Current daily flow
+
+The receipt-era interface above remains available for historical callers. For the
+current Trinary Doctrine use:
+
+```
+trit DIR --inspect BOT...       unread work as 1 plus its exact token; silence when quiet
+trit DIR --consume BOT TOKEN    consume that token durably; no stdout and no next wake
+```
+
+`--inspect` preserves the existing inbox, verification and cursor rules. It emits
+only inspection requests, including for signed stop records. The current shared
+HMAC key proves key possession, not a particular sender, and the verifier's
+counter ordering does not prove wall-clock freshness. No stop request from this
+interface is an authorized process action. Inspect the record and establish fresh
+sender identity and existing runtime authorization separately before acting.
+These commands do not stop any process. Bad tokens still fail without advancing
+the cursor; consumption never hides a later unread task.
+
+Task details stay once in the existing durable record. Reading sends nothing.
+An explicit request for help is notification `0` only after its task record exists;
+no value produced by the legacy `--ack` interface may be forwarded as help. No
+codebook row is reassigned here. The proposed combined-digit codes and ambient
+liveness mechanism are not implemented. Harnesses that need a startup prompt
+receive the record reference; this is not an enforced one-trit transport and no
+usage savings are claimed.
+
+`python3 tools/trit/test-daily.py` is an external verification oracle. It signs
+fixtures independently with Python's HMAC and checks exact output, exits, tokens,
+silent consumption, legacy behavior and invalid requests. It is not a runtime
+dependency. Existing Lean/differential proofs cover the legacy interface only;
+the new entry points are host-tested, not claimed source-proved.
