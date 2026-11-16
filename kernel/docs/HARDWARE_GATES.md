@@ -24,7 +24,7 @@ the TRUST-1 owner ceremony first.
   `HWGATE <id> <tier> <status>`. No receipt, no claim.
 
 [`tools/hwgates/hwgates.om`](../tools/hwgates/hwgates.om) (seeded Omega, built with the compiler
-named in [`tools/hwgates/PIN`](../tools/hwgates/PIN)) enforces these as rules R1..R9, refuses an
+named in [`OMC_PIN`](../OMC_PIN)) enforces these as rules R1..R9, refuses an
 empty register (R8) and the deletion of a gate whose receipt still names it (R9), and prints
 `HWGATES PASS rows=… gates=… physical=… physical_pass=… physical_not_pass=…`. The local Spark gate
 `AIENOS-HW-GATES` (`tests/gates/run.sh hw-gates`, which runs `tools/hwgates/gate.sh`) runs the

@@ -3,7 +3,7 @@
 # tools/hwgates/gate.sh: run the hardware-gate register check (hwgates.om) on its fixtures, kill
 # its compiling behavior mutants, then check docs/hardware-gates.tsv, the receipts it cites, and
 # planted-bad copies of it.
-#   AIEN_OMC=<the omc named in tools/hwgates/PIN> sh tools/hwgates/gate.sh
+#   AIEN_OMC=<the omc named in OMC_PIN> sh tools/hwgates/gate.sh
 # Prints HWGATES-GATE PASS (exit 0) or HWGATES-GATE FAIL (exit 1). Without the pinned compiler it
 # prints HWGATES-GATE NOT_RUN and exits 3. A NOT_RUN is never a pass.
 # Invariants this gate holds:
@@ -13,13 +13,14 @@
 #   - a gate whose receipt still names it cannot be deleted from the register;
 #   - the register's gate ids equal those of docs/hardware-gates-needs.tsv, so a gate no receipt
 #     names yet cannot leave the inventory silently either;
-#   - a cited receipt's HWGATE line agrees with the register row for its id and tier, unless a
-#     CORRECTION-*.txt beside the receipt names that line (receipts are never rewritten);
-#   - a PASS or FAIL row's source commit is recorded by a file in its receipt's folder.
+#   - every HWGATE line in a tracked evidence file agrees with the register row for its id and
+#     tier, unless a tracked CORRECTION-*.txt beside it names that line (receipts are never rewritten);
+#   - a PASS or FAIL row's source REPO@COMMIT is recorded by files in its receipt's folder, and
+#     names a commit of this repository exactly when REPO is this repository.
 set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-PIN=tools/hwgates/PIN
+PIN=OMC_PIN
 want=$(sed -n 's/^sha256 //p' "$PIN")
 commit=$(sed -n 's/^commit //p' "$PIN")
 if [ -z "${AIEN_OMC:-}" ] || [ ! -r "$AIEN_OMC" ]; then
@@ -121,18 +122,21 @@ regsh() {
       echo "FAIL claim: $r says HWGATE $id $tier $st, the register says ${have:-no row}, and no tracked CORRECTION-*.txt beside it names the line"; rb=1
     done < "$W/claims"
   done
-  # a PASS or FAIL row names REPO@COMMIT (40 hex); a *source-commit.txt beside its receipt holds
-  # COMMIT as a whole line; COMMIT is a commit of this repository exactly when REPO is $SELF
+  # a PASS or FAIL row names REPO@COMMIT (40 hex); a *source-commit.txt in its receipt's folder or
+  # below holds COMMIT as a whole line; COMMIT is a commit of this repository exactly when REPO is
+  # $SELF; for any other REPO a *source-repo.txt there holds REPO@COMMIT as a whole line
   awk -F '\t' '!/^#/ && NF == 7 && ($5 == "PASS" || $5 == "FAIL") {print $1 " " $3 " " $6}' "$1" > "$W/srcs"
   while read -r id src r; do
     repo=${src%%@*}; c=${src#*@}
     if ! printf '%s\n' "$src" | grep -qxE '[A-Za-z0-9._-]+@[0-9a-f]{40}'; then echo "FAIL source: $id names '$src', not REPO@<40 hex commit>"; rb=1; continue; fi
     [ -f "$r" ] || continue
-    if ! find "$(dirname "$r")" -name '*source-commit.txt' -type f -exec cat {} + | grep -qxF -- "$c"; then
-      echo "FAIL source: $id names $src, which no *source-commit.txt beside $r records"; rb=1; continue; fi
+    if ! find "$(dirname "$r")" -name '*source-commit.txt' -type f -exec cat {} + | grep -xF -- "$c" > /dev/null; then
+      echo "FAIL source: $id names $src, which no *source-commit.txt in the folder of $r records"; rb=1; continue; fi
     own=no; [ "$(git cat-file -t "$c" 2> /dev/null)" = commit ] && own=yes
     if [ "$repo" = "$SELF" ] && [ "$own" = no ]; then echo "FAIL source: $id names $src, which is not a commit of this repository"; rb=1; fi
-    if [ "$repo" != "$SELF" ] && [ "$own" = yes ]; then echo "FAIL source: $id names $src, a commit of $SELF, not of $repo"; rb=1; fi
+    if [ "$repo" != "$SELF" ] && [ "$own" = yes ]; then echo "FAIL source: $id names $src, a commit of $SELF, not of $repo"; rb=1; continue; fi
+    if [ "$repo" != "$SELF" ] && ! find "$(dirname "$r")" -name '*source-repo.txt' -type f -exec cat {} + | grep -xF -- "$src" > /dev/null; then
+      echo "FAIL source: $id names $src, which no *source-repo.txt in the folder of $r records"; rb=1; fi
   done < "$W/srcs"
   return "$rb"
 }
@@ -158,7 +162,8 @@ plantsh "gate ZZ-PLANTED with rows but no inventory entry" inventory "$W/p6r.tsv
 awk -F '\t' 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" {$5="NOT_RUN"; $6="-"; done=1} {print}' "$REG" > "$W/p7.tsv"
 plantsh "PASS row silently downgraded" claim "$W/p7.tsv"
 # planted control 8: the first PASS row names a source commit its receipt does not record, an
-# empty commit, or a commit of this repository under another repository's name -> source
+# empty commit, a commit of this repository under another repository's name, or another
+# repository's recorded commit under a misspelt name -> source
 awk -F '\t' 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" {sub(/@.*/, "@0000000000000000000000000000000000000000", $3); done=1} {print}' "$REG" > "$W/p8.tsv"
 plantsh "PASS row with an unrecorded source commit" source "$W/p8.tsv"
 awk -F '\t' 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" {sub(/@.*/, "@", $3); done=1} {print}' "$REG" > "$W/p8e.tsv"
@@ -166,6 +171,8 @@ plantsh "PASS row with an empty source commit" source "$W/p8e.tsv"
 selfc=$(awk -F '\t' -v s="$SELF" '!/^#/ && NF == 7 && $5 == "PASS" && index($3, s "@") == 1 {print substr($3, length(s) + 2); exit}' "$REG")
 awk -F '\t' -v s="$SELF" -v c="$selfc" 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" && index($3, s "@") != 1 {sub(/@.*/, "@" c, $3); done=1} {print}' "$REG" > "$W/p8x.tsv"
 plantsh "another repository's PASS row naming $SELF@$selfc" source "$W/p8x.tsv"
+awk -F '\t' -v s="$SELF" 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" && index($3, s "@") != 1 {sub(/@/, "x@", $3); done=1} {print}' "$REG" > "$W/p8r.tsv"
+plantsh "another repository's PASS row under a misspelt repository name" source "$W/p8r.tsv"
 # alarm: the checker refuses registers and receipts larger than its tables (CAP bytes, MAXR rows,
 # read from hwgates.om); fail loudly at three quarters of either so the tables grow first
 cap=$(sed -n 's/^const CAP ulong \([0-9]*\)$/\1/p' "$SRC")
