@@ -171,7 +171,11 @@ text raids3 "76666,82342,85188"
 text raids4 "76666,83423,82342,85188"
 text racompat "compat"
 text racoper "compat-oper"
-text racap "deadline 3x measured wall exceeded; not a cap result"
+text racfx "code-main: "
+text rca6 " c="
+text rca7 " j="
+text rca8 " s="
+text rcap4 "uncapped run did not pass rc="
 text ractag "cap"
 text racpfx "memory-cap"
 text rca1 "tries="
@@ -219,7 +223,8 @@ note (ra_lines, ra_events, ra_mlines): the next check is then a FAIL naming that
 global raerr ulong 1
 global raas uchar 32
 global raunit ulong 1
-global rawall ulong 1
+note racef[0]: trials below the passing cap that failed explicitly (classes in ra_capcls).
+global racef ulong 1
 global radl ulong 1
 global racnt ulong 1
 global rapas ulong 1
@@ -230,6 +235,7 @@ global racr long 8
 global racnl ulong 8
 global racst ulong 8
 global racmx ulong 8
+global raccl ulong 8
 global racbb ulong 1
 text ralost "node output lost (missing, unreadable or over the driver's capacity); "
 
@@ -2368,7 +2374,8 @@ end
 ret st
 end
 
-note 0 no journal, 1 a consistent journal, 2 a journal that is not consistent.
+note 0 no journal (absent or empty), 1 a consistent journal, 2 any other journal state
+note (unreadable, torn, over the 64-byte probe or more than one start).
 fn ra_capjs cx edit uchar 65536 to ulong
 b = new uchar 64 0
 if ra_jload cx
@@ -2380,15 +2387,13 @@ ret 1
 end
 n = nd_sub cx 4 5 ndjfile
 r = dv_slurp view part cx 20480 n b
-if eq r neg long 27
-ret 2
-end
-if lt r 64
+if or eq r neg long 2 eq r 0
 ret 0
 end
 ret 2
 end
 
+note dvnone when cap.out could not be loaded; the caller treats that as a harness failure.
 fn ra_caplin cx edit uchar 65536 o edit uchar 65536 to ulong
 ok = ra_load cx ractag
 if not ok
@@ -2400,32 +2405,69 @@ put racel 0 n
 ret ra_nlines view part o 0 n
 end
 
-fn ra_explic rc long nl ulong st ulong to bool
+note ra_cause: true when some line of cap.err starts with "code-main: " (cw_fail's cause line).
+fn ra_cause cx edit uchar 65536 to bool
+fe = new uchar 4096 0
+n = nd_tagp cx fe ractag nderr
+if eq n dvnone
+ret false
+end
+b = new uchar 65536 0
+r = dv_slurp view part fe 0 n b
+if lt r 0
+ret false
+end
+m = ulong r
+s = ulong 0
+while lt s m bound 65537
+e = nd_lend view part b 0 m s
+if nd_pfx view part b 0 m s e racfx
+ret true
+end
+s = add e 1
+end
+ret false
+end
+
+note Trial class: 0 explicit fail (counts toward fail-closed), 1 pass, 2 signal death with no
+note output (reported, not counted), 3 bad (harness exit 97/126/127, an inconsistent journal,
+note or any other end). Explicit fail: one CWO line that is a FAIL with rc 1, or no CWO line
+note with a code-main refusal exit 50..57 and its cause line on stderr. Pass: one CWO PASS
+note line, rc 0 and a consistent journal.
+fn ra_capcls cx edit uchar 65536 o view uchar * rc long nl ulong st ulong to ulong
 if eq st 2
-ret false
+ret 3
 end
-if and eq nl 0 and ne rc 0 eq st 0
-ret true
+if or eq rc 97 or eq rc 126 eq rc 127
+ret 3
 end
-if and eq nl 1 or eq rc 0 eq rc 1
-ret true
-end
-ret false
-end
-
-fn ra_ispass o view uchar * rc long to bool
-n = get racel 0
-if eq n 0
-ret false
-end
-if not or eq rc 0 eq rc 1
-ret false
-end
+if eq nl 1
 e = nd_lend o 0
-ret nd_pfx o 0 e raT41
+ps = nd_pfx o 0 e raT41
+if and eq rc 1 not ps
+ret 0
+end
+if and and eq rc 0 ps eq st 1
+ret 1
+end
+ret 3
+end
+if ne nl 0
+ret 3
+end
+if and ge rc 50 le rc 57
+if ra_cause cx
+ret 0
+end
+ret 3
+end
+if lt rc 0
+ret 2
+end
+ret 3
 end
 
-fn ra_store cap ulong rc long nl ulong st ulong mx ulong to void
+fn ra_store cap ulong rc long nl ulong st ulong mx ulong cl ulong to void
 i = get racnt 0
 if ge i 8
 ret
@@ -2435,6 +2477,7 @@ put racr i rc
 put racnl i nl
 put racst i st
 put racmx i mx
+put raccl i cl
 put racnt 0 add i 1
 end
 
@@ -2442,22 +2485,28 @@ note Judge one finished trial. 1 stops the ladder.
 fn ra_capfin cx edit uchar 65536 cap ulong rc long to ulong
 lines = new uchar 65536 0
 nl = ra_caplin cx lines
-if eq nl dvnone
-nl = 0
-end
 jsv = ra_capjs cx
 mx = ulong 0
 if eq jsv 1
 mx = get raj 3
 end
-ra_store cap rc nl jsv mx
-if not ra_explic rc nl jsv
+if eq nl dvnone
+put racbad 0 1
+ra_store cap rc 0 jsv mx 3
+ret 1
+end
+cl = ra_capcls cx view part lines 0 get racel 0 rc nl jsv
+ra_store cap rc nl jsv mx cl
+if eq cl 3
 put racbad 0 1
 ret 1
 end
-if ra_ispass view part lines 0 get racel 0 rc
+if eq cl 1
 put rapas 0 add cap 1
 ret 1
+end
+if eq cl 0
+put racef 0 add get racef 0 1
 end
 ret 0
 end
@@ -2467,20 +2516,20 @@ fn ra_captry cx edit uchar 65536 js edit uchar ndjsz tp edit uint dvtcap k ulong
 cap = ra_capkb k
 if not ra_caprep cx js tp k
 put racbad 0 1
-ra_store cap neg long 1 0 2 0
+ra_store cap neg long 1 0 2 0 3
 ret 1
 end
 i = ra_capgo cx ractag fp mul cap 1024
 if eq i dvnone
 put racbad 0 1
-ra_store cap neg long 1 0 2 0
+ra_store cap neg long 1 0 2 0 3
 ret 1
 end
 st = dv_wait get ndpid i get radl 0
 put ndpst i st
 if eq st neg long 110
 put racbad 0 1
-ra_store cap st 0 0 0
+ra_store cap st 0 0 0 3
 ret 1
 end
 ret ra_capfin cx cap ra_pyrc st
@@ -2504,6 +2553,12 @@ p = dv_cat o p raT43
 p = dv_fmtl o p get racr k
 p = dv_cat o p rca5
 p = dv_fmtu o p get racnl k
+p = dv_cat o p rca6
+p = dv_fmtu o p get raccl k
+p = dv_cat o p rca7
+p = dv_fmtu o p get racst k
+p = dv_cat o p rca8
+p = dv_fmtu o p get racmx k
 end
 if eq p dvnone
 ret 0
@@ -2531,6 +2586,7 @@ put radl 0 mul wall 3
 put racnt 0 0
 put rapas 0 0
 put racbad 0 0
+put racef 0 0
 for k ulong 7
 s = ra_captry cx js tp k fp
 if eq s 1
@@ -2538,7 +2594,7 @@ break
 end
 end
 p = ra_capdet d
-ok = and gt get racnt 0 1 eq get racbad 0 0
+ok = and gt get racef 0 0 eq get racbad 0 0
 if eq get rapas 0 0
 ok = false
 end
@@ -2548,10 +2604,10 @@ end
 fn ra_mem cx edit uchar 65536 js edit uchar ndjsz tp edit uint dvtcap to void
 o = new uchar 1024 0
 fp = ra_model cx 150
+t = ulong monons
 i = ra_node cx raT76 fp
 ra_hwrst
 n = ulong 0
-t = ulong monons
 while eq nd_poll i -1 bound 9223372036854775807
 ra_sample get ndpid i
 n = add n 1
@@ -2578,7 +2634,13 @@ p = dv_cat o p rasamp
 p = dv_fmtu o p n
 ra_result 37 false o p
 end
+if ne rc 0
+p = dv_cat o 0 rcap4
+p = dv_fmtl o p rc
+ra_result 36 false o p
+else
 ra_caps cx js tp fp w
+end
 ra_close
 end
 

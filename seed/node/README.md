@@ -2053,12 +2053,25 @@ MEASURED `memory-peak-kB` (VmHWM and VmPeak of `code-main`, `infer` and
 when no `code-main` sample was read. `memory-caps-fail-closed-then-pass`
 runs that same one-objective job again under the `prlimit` host word
 (keyword 235, RLIMIT_AS): half the measured `code-main` VmPeak, then that
-peak, then double, up to 32 times the peak. A trial counts only when it ends
-with an explicit result and a consistent journal (at most one start). The
-check passes when one of those caps passes after at least one smaller cap
-failed. Each trial waits at most three times the measured uncapped run; past
-that is not a cap result. The one-job recording that host run uses is
-`seed/node/tests/ra40/final-selected.json`. The driver prints
+peak, then double, up to 32 times the peak. A smaller cap fails closed only
+with an explicit result: one `CWO` FAIL line and exit 1, or a `code-main`
+refusal exit 50 to 57 with its `code-main: ` cause line on stderr. A pass is
+one `CWO 0 PASS` line, exit 0 and a journal with at most one start. A signal
+death with no output is reported (`c=2`) and not counted either way. A harness
+failure (exit 97, 126 or 127, an output that cannot be read), a journal that
+is torn, unreadable or has more than one start, or any other end fails the
+check. The check passes when one cap passes after at least one explicit
+smaller-cap failure, and only after the uncapped run passed; each trial shows
+the cap, rc, CWO lines (`n`), class (`c`: 0 explicit fail, 1 pass, 2 signal
+death, 3 bad), journal state (`j`: 0 none, 1 consistent, 2 other) and starts
+(`s`). Each trial waits at most three times the uncapped run, measured from
+before the node starts; a trial past that deadline (`rc=-110`) fails the
+check. The host run uses a one-job stand-in for the round40 recording, which
+is not on this machine: `seed/node/tests/ra40/final-selected.json` (sha256
+`9d07cedc7a25a7c6bbfd2f0864d6f2c2f19cf1e246f4c2d3e44d448697830ba2`), a small
+loop repair (id 76666) whose answers were constructed from the node's own
+prompts on this build. It serves only the memory scenario; with it as
+ROUND40 every other scenario fails fixture preparation. The driver prints
 `PASS|FAIL|NOT_RUN NAME DETAIL` per check and `RELSUM pass=P fail=F
 not_run=N mode=MODE`; a node output it needs that is missing, unreadable or
 over capacity fails the next check, naming it.
