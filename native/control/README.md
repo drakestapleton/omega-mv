@@ -1,8 +1,7 @@
 # Om control contracts
 
-Refs [#659](https://github.com/aien-dev/omega-mv/issues/659),
-[#649](https://github.com/aien-dev/omega-mv/issues/649) and
-[#651](https://github.com/aien-dev/omega-mv/issues/651).
+Live record: Linear DRA-312. Historical references (GitHub, no longer a forge
+for this project; No GitHub rule, 2026-11-11): omega-mv issues #659, #649 and #651.
 
 Three bounded Om modules implement action recovery decisions, delegation
 constraints and KV reuse admission. They use caller-owned fixed arrays. They
@@ -180,14 +179,17 @@ evidence of a speedup or a new hardware run.
 
 ## Build and evidence
 
-Compiler source pin: `57f5f4258cebf3d5b2c22853cd062e351265c525`,
-`seed/omc/omc.om`. The seed reconstruction and identical compiler stages are
-recorded in [evidence/659](evidence/659/README.md). No compiler changes are needed.
+Compiler: the in-tree `seed/out/omc` of the omega-mv revision being built. Its
+sha256 is in `seed/out/omc.sha256`; do not copy that value here. The original
+2026-10-23 run used compiler source `57f5f4258cebf3d5b2c22853cd062e351265c525`
+under QEMU ([evidence/659](evidence/659/README.md)). The 2026-11-16 replay onto
+main ran natively on AArch64 with the main compiler of that day
+([evidence/replay-20261116](evidence/replay-20261116/README.md)).
 On a supported AArch64 host, a module's test is built as one source unit:
 
 ```sh
 cat native/control/src/action.om native/control/tests/action.om > /tmp/action.om
-/path/to/pinned/omc < /tmp/action.om > /tmp/action.elf
+seed/out/omc < /tmp/action.om > /tmp/action.elf
 chmod +x /tmp/action.elf
 /tmp/action.elf
 ```

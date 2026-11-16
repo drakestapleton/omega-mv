@@ -99,13 +99,17 @@ records 367 passing assertions, three detected always-accept stubs, ten
 detected compiled guard mutants and three expected compiler refusals. Each
 mutant ran and failed assertions; none was counted from a compiler error.
 
-- Independent review of the final functional source: NOT_RUN.
+- Independent review of the final functional source: run on 2026-11-16 for the
+  replay onto omega-mv main (see [../replay-20261116/README.md](../replay-20261116/README.md));
+  its findings were fixed before landing.
 - Trusted authority/receipt verification and durable store/dispatch integration:
   NOT_RUN. These modules accept facts produced by those owners.
 - Concurrent actors, actual crash/restart, persistence failure and revocation
   racing with dispatch: NOT_RUN at the integration boundary.
-- Native AArch64/Spark/GB10 and other hardware profiles: NOT_RUN.
+- Spark/GB10 GPU and other hardware profiles: NOT_RUN. Native AArch64 CPU
+  execution on the Spark host ran on 2026-11-16 (replay record above).
 - Full existing runtime suite: NOT_RUN; no legacy runtime source or build target
   changes. The full new component suites and compiled controls are exercised.
-- Release/merge/publication: retain the existing Renda/desk workflow. A passing
-  component receipt is not permission to mark the parent issues complete.
+- Landing: by the lane's own exact-head review and receipt (receipts, not
+  approvals; no review desk, Drake 2026-11-11). A passing component receipt is
+  not permission to mark the parent issues complete.
