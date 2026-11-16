@@ -51,7 +51,12 @@ Proof: `lean tools/trit/proof/TritSignal.lean`. Namespace `TritBin` mirrors trit
 function; `sh tools/trit/proof/difftest.sh` (python3 + lean) runs it with `#eval` against the binary
 on generated fixture dirs and requires identical stdout, stderr and exit status. The fixtures include codebook-signed lines
 (valid, tampered, wrong key/id, replayed, stale counter files) and unsigned STOP lines.
-`sh tools/trit/mutate.sh` runs 16 mutants against both.
+`sh tools/trit/mutate.sh` runs 16 mutants against both (OMC defaults to the absolute `seed/out/omc`). The unmutated tree must pass
+first. A mutant counts as killed only when `test.sh` itself reports failed assertions (`TOTAL ... fail>=1`, exit 1); a compile error,
+an unapplied mutation, a crashed runner or a missing prerequisite is never a kill. The differential models read mode only, so it must
+kill the read-mode mutants and is recorded, not required, for the five `--ack`/fsync mutants. Exit 0 = all killed; 1 survivor;
+2 prerequisite missing; 3 mutant unapplied or invalid; 4 harness error; 5 baseline failed. `sh tools/trit/test-mutate.sh` is the
+regression for that driver. Gate: `tests/gates/run.sh trinary` (manifest `tests/gates/omega-trinary.gate`).
 
 ## Current daily flow
 
