@@ -2,7 +2,9 @@ note chain.om: the INTERPLANE ledger, a hash chain anyone can check. Composed af
 note   chain add LEDGER KIND ACTOR SUBJECT < payload    append one record; prints "OK seq head"
 note   chain verify LEDGER                              prints "OK count head" or "BAD line N code"
 note   chain check LEDGER SEQ < payload                 the payload is the one record SEQ committed to
-note   chain feed LEDGER FILE KIND ACTOR                 one record per new complete line of FILE
+note   chain feed LEDGER FILE KIND ACTOR [PAGE]          one record per new complete line of FILE; then
+note                                                    the page, when PAGE is given
+note   chain page LEDGER OUT                             write OUT: the head as a page with the check by hand
 note feed records line N of FILE with the subject "<file name> line N" and the SHA-256 of the line's
 note bytes (without its line feed) as payload. It resumes after the highest N already recorded for
 note that KIND and file name, so running it again adds only new lines. A last line without a line
@@ -24,7 +26,10 @@ note BAD codes: 1 not seven fields, or a byte that is not a tab or printable ASC
 note zero); 3 utc (a real date and time, never earlier than the record before); 4 payload digest;
 note 5 prev; 6 line longer than 1,023 bytes; 7 last line has no line feed; 8 kind, actor or subject
 note breaks its rule (kind 1..24 bytes of A-Z 0-9 _, actor 1..64 bytes, subject 1..128 bytes).
-note Commands are matched as whole words: add, verify, check, feed.
+note page verifies the ledger first and writes nothing when it does not verify (exit 2). OUT is
+note written as OUT.tmp (created exclusively) and renamed, so a reader never sees half a page. A
+note page name, or its .tmp, that is the ledger or the fed file is refused (exit 1).
+note Commands are matched as whole words: add, verify, check, feed, page.
 global gl uchar 1024
 global gll ulong 1
 global gh uchar 64
@@ -47,6 +52,20 @@ text tver "verify"
 text tchk "check"
 text tfeed "feed"
 text tline " line "
+text tpage "page"
+text ttmp ".tmp"
+text tnone "no records yet"
+text q01 "<!doctype html><html lang='en' data-theme='dark'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Check the record yourself - INTERPLANE</title><link rel='stylesheet' href='/assets/tokens.css'><link rel='stylesheet' href='/assets/proof.css'></head><body><main>\n"
+text q02 "<p class='eyebrow'>Proof</p><h1>Check the record yourself</h1>\n<p class='sub'>The agents that build INTERPLANE talk on one message board. Each line of that board is recorded here by its SHA-256 digest, and each record names the digest of the record before it. You do not need to trust this page, this site or its author. Download the ledger and check it with tools already on your machine.</p>\n<dl class='stats'><div><dt>Records</dt><dd>"
+text q03 "</dd></div><div><dt>Last record (UTC)</dt><dd>"
+text q04 "</dd></div></dl>\n<h2>The head</h2>\n<p class='sub'>The head is the SHA-256 of the ledger's last line. Change, remove, add or move any earlier record and the head changes.</p>\n<pre class='cmd'>"
+text q05 "</pre>\n<h2>Check it by hand</h2>\n<p class='sub'>Get the ledger and compute its head. It must be the line above. Where there is no sha256sum (macOS), shasum -a 256 does the same.</p>\n<pre class='cmd'>curl -s https://interplane.io/proof/board.tsv -o board.tsv\nprintf %s &quot;$(tail -n 1 board.tsv)&quot; | sha256sum</pre>\n"
+text q06 "<p class='sub'>Then check every link. Field 7 of each record must be the SHA-256 of the line above it.</p>\n<pre class='cmd'>awk 'NR&gt;1' board.tsv | cut -f7 &gt; claimed\nsed '$d' board.tsv | while IFS= read -r line; do printf %s &quot;$line&quot; | sha256sum | cut -d' ' -f1; done &gt; computed\ncmp claimed computed &amp;&amp; echo chain intact</pre>\n"
+text q07 "<h2>Prove one message</h2>\n<p class='sub'>Only digests are public; the board itself is not. Whoever holds line N of the board can prove it is the line that was recorded: its SHA-256 is field 6 of the record whose subject is BOARD.md line N.</p>\n<pre class='cmd'>printf %s 'the line, without its line feed' | sha256sum</pre>\n"
+text q08 "<h2>What this proves, and what it does not</h2>\n<p class='sub'>Proved in Lean 4 with no axioms: two valid ledgers with the same head are the same ledger, unless SHA-256 gives one digest for two different lines. Nobody is known to be able to do that; it is assumed, not proved.</p>\n<p class='sub'>Not proved by the chain alone: when a record was written, and who or what wrote a message. A ledger kept on one machine can be rebuilt by whoever holds it. Time comes from outside, from publishing each head where it cannot be taken back.</p>\n</main></body></html>\n"
+global gp uchar 16384
+global gpl ulong 1
+global go uchar 2100
 note gs: 0 records accepted, 1 first BAD code, 2 its line number, 3 wanted seq, 4 wanted seq found,
 note 5 feed mode, 6 highest source line already recorded for the fed kind and file name
 note gx: the fed kind at 0 (length gxl 0), actor at 64 (gxl 1), file name at 192 (gxl 2)
@@ -945,6 +964,12 @@ end
 if not sarg 3 192 2 100 false
 ret 1
 end
+if eq argcnt 7
+pl = argread 6 ga 0 4095
+if or lt pl 1 gt pl 1000
+ret 1
+end
+end
 m = argread 3 ga 0 4095
 sf = int fopen ga 0 ulong m 0 0
 if lt sf 0
@@ -960,6 +985,12 @@ end
 r = fsame sf fd
 if ne r 0
 ret r
+end
+if eq argcnt 7
+r = pprep 6
+if ne r 0
+ret r
+end
 end
 put gs 5 1
 put gs 6 0
@@ -977,7 +1008,240 @@ end
 if ne r 0
 ret r
 end
+if eq argcnt 7
+pbuild
+w = pfile
+if ne w 0
+ret w
+end
+end
 y = fclose fd
+ret say
+end
+note ---- page
+fn pb c uchar to void
+o = get gpl 0
+if lt o 16383
+put gp o c
+put gpl 0 add o 1
+end
+end
+note pt: a text of at most 4,096 bytes into the page
+fn pt t view uchar * to void
+n = len t
+i = ulong 0
+while lt i n bound 4096
+pb get t i
+i = add i 1
+end
+end
+note pn: a count with its digits grouped in threes
+fn pn v ulong to void
+d = new uchar 20 0
+n = ulong 0
+x = v
+if eq x 0
+pb 48
+end
+while gt x 0 bound 20
+put d n uchar add 48 rem x 10
+x = div x 10
+n = add n 1
+end
+while gt n 0 bound 20
+n = sub n 1
+pb get d n
+if gt n 0
+if eq rem n 3 0
+pb 44
+end
+end
+end
+end
+note pbuild: the page for the ledger just verified (gs 0 records, head in gh, last time in gu)
+fn pbuild to void
+put gpl 0 0
+pt q01
+pt q02
+pn get gs 0
+pt q03
+if eq get gs 0 0
+pt tnone
+else
+for i ulong 10
+pb get gu i
+end
+pb 32
+for j ulong 8
+pb get gu add 11 j
+end
+end
+pt q04
+if eq get gs 0 0
+pt tnone
+else
+for k ulong 64
+pb get gh k
+end
+end
+pt q05
+pt q06
+pt q07
+pt q08
+end
+note pput: the page into the new file named go[0, n), mode 0644, created exclusively (O_WRONLY,
+note O_CREAT, O_EXCL: never through a link, never into a file that is already there); true when all
+note of it is written and synced
+fn pput n ulong to bool
+fd = int fopen go 0 n 193 420
+if lt fd 0
+ret false
+end
+m = get gpl 0
+o = ulong 0
+good = true
+while lt o m bound 16384
+k = write fd gp o sub m o
+if le k 0
+good = false
+o = m
+else
+o = add o ulong k
+end
+end
+if ne fsync fd 0
+good = false
+end
+r = fclose fd
+ret good
+end
+note peq: the first 16 bytes of two stat records (st_dev, st_ino) are equal
+fn peq a view uchar 128 b view uchar 128 to bool
+for i ulong 16
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+note pid: s holds the lstat of a name; 1 when it is the entry or the file argument idx names (by
+note lstat or by stat), 0 when not, 3 when argument idx cannot be read or does not exist
+fn pid s view uchar 128 idx ulong to int
+m = argread idx ga 0 4095
+if lt m 1
+ret 3
+end
+t = new uchar 128 0
+if lt stat ga 0 ulong m t 0 128 0
+ret 3
+end
+if peq s t
+ret 1
+end
+if lt lstat ga 0 ulong m t 0 128 0
+ret 3
+end
+if peq s t
+ret 1
+end
+ret 0
+end
+note pguard: 0 when the name go[0, n) does not exist or is neither the ledger (argument 2) nor, in
+note feed, the fed file (argument 3); otherwise the exit code. Renaming the page over the ledger, or
+note removing a stale <name>.tmp that is the ledger, would destroy it.
+fn pguard n ulong to int
+s = new uchar 128 0
+if lt lstat go 0 n s 0 128 0
+ret 0
+end
+r = pid s 2
+if ne r 0
+ret r
+end
+if eq argcnt 7
+ret pid s 3
+end
+ret 0
+end
+note pprep: argument idx (1..1,000 bytes) into go as <name>.tmp, its length in gs 7, and both names
+note through pguard. Runs before anything is written. 0, or the exit code.
+fn pprep idx ulong to int
+n = argread idx ga 0 4095
+if or lt n 1 gt n 1000
+ret 1
+end
+l = ulong n
+for i ulong l bound 1000
+put go i get ga i
+end
+for j ulong 4
+put go add l j get ttmp j
+end
+put gs 7 l
+r = pguard l
+if ne r 0
+ret r
+end
+ret pguard add l 4
+end
+note pfile: the page built by pbuild into the name pprep prepared, written as <name>.tmp and
+note renamed. A stale <name>.tmp is removed first (the name only, never what it points to); on any
+note failure the .tmp is removed again. w holds the two names as the list renames takes: count 2,
+note then each name as a 2-byte length and its bytes. 0, or the exit code.
+fn pfile to int
+l = get gs 7
+t = add l 4
+u = unlink go 0 t
+if not pput t
+u = unlink go 0 t
+ret 3
+end
+w = new uchar 2100 0
+put w 0 2
+put w 1 0
+put w 2 uchar rem t 256
+put w 3 uchar div t 256
+for a ulong t bound 1004
+put w add 4 a get go a
+end
+b = add 4 t
+put w b uchar rem l 256
+put w add b 1 uchar div l 256
+for c ulong l bound 1000
+put w add add b 2 c get go c
+end
+if ne renames w 0 add add b 2 l 0 0
+u = unlink go 0 t
+ret 3
+end
+ret 0
+end
+fn cpage to int
+fd = ropen 0
+if lt fd 0
+ret 3
+end
+note the same exclusive lock add and feed take: one page writer per ledger, and never mid-append
+if ne flock fd 2 0
+ret 3
+end
+p = pprep 3
+if ne p 0
+ret p
+end
+good = vfy fd
+r = fclose fd
+if not good
+ret 3
+end
+if ne get gs 1 0
+ret say
+end
+pbuild
+w = pfile
+if ne w 0
+ret w
+end
 ret say
 end
 fn main to int
@@ -1003,8 +1267,14 @@ end
 ret 1
 end
 if argis tfeed
-if eq argcnt 6
+if or eq argcnt 6 eq argcnt 7
 ret cfeed
+end
+ret 1
+end
+if argis tpage
+if eq argcnt 4
+ret cpage
 end
 ret 1
 end
