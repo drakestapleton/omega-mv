@@ -90,9 +90,9 @@ scripts_verdict() {
 # pinned_omc COMMIT SHA256: make AIEN_OMC the seeded Omega compiler with that hash. AIEN_OMC wins
 # when it has the hash; otherwise the committed compiler at COMMIT is taken from the sibling
 # checkout ../omega-mv (a clone of ~/git/omega-mv.git). Neither available: exit 3, never a pass.
-# OMC_PIN at the repository root names the one compiler build (omega-mv "commit <sha1>",
-# "sha256 <omc sha256>") for native/disk and tools/hwgates; moving it moves both.
-pin_of() { pinned_omc "$(sed -n 's/^commit //p' "$1")" "$(sed -n 's/^sha256 //p' "$1")"; }
+# PIN at the repository root names the one compiler build ("omega-mv <sha1>", "omc-sha256 <omc
+# sha256>", the format pin-follow.sh moves) for native/disk and tools/hwgates; moving it moves both.
+pin_of() { pinned_omc "$(sed -n 's/^omega-mv //p' "$1")" "$(sed -n 's/^omc-sha256 //p' "$1")"; }
 pinned_omc() {
   local pc="$1" ps="$2" h=""
   if [ -n "${AIEN_OMC:-}" ] && [ -r "$AIEN_OMC" ]; then h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1); fi
@@ -208,15 +208,15 @@ case "$step" in
     bash scripts/qemu_ck_b7b_probe_test.sh --events
     ;;
   # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register, its
-  # receipts, a size alarm and planted-bad copies. Needs the compiler named in OMC_PIN.
+  # receipts, a size alarm and planted-bad copies. Needs the compiler named in PIN.
   hw-gates)
-    pin_of OMC_PIN
+    pin_of PIN
     sh tools/hwgates/gate.sh
     ;;
   # Bounded read-only NVMe protocol in seeded Omega (#472): host cases, guard mutants and
   # disposable-QEMU cases (the test prints its counts). Physical NVMe stays NOT_RUN.
   omega-nvme)
-    pin_of OMC_PIN
+    pin_of PIN
     must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
       -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
     scripts_verdict

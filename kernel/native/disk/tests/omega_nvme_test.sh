@@ -4,7 +4,7 @@
 set -eu
 cd "$(dirname "$0")/../../.."
 : "${AIEN_OMC:?set AIEN_OMC to the existing pinned seeded compiler}"
-want=$(sed -n 's/^sha256 //p' OMC_PIN)
+want=$(sed -n 's/^omc-sha256 //p' PIN)
 actual=$(sha256sum "$AIEN_OMC")
 [ "${actual%% *}" = "$want" ] || { echo 'compiler pin mismatch' >&2; exit 2; }
 out=${OMEGA_NVME_EVIDENCE:-$(mktemp -d /tmp/omega-nvme-evidence-XXXXXX)}
