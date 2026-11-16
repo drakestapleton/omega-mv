@@ -19,6 +19,15 @@ cases = [
     ('receipt-leak', 'if consume\nzap\nret 0', 'if consume\nreceipt\nzap\nret 0'),
     ('next-wake-leak', 'if consume\nzap\nret 0', 'if consume\nz = emit state\nzap\nret 0'),
     ('consume-bypassed', 'doack ulong tn\nif consume', 'note omitted consumption\nif consume'),
+    ('help-suppressed', 'if and eq get helping 0 1 ne open t 2\nput outb o 48',
+     'if and eq get helping 0 1 ne open t 2\nput outb o 49'),
+    ('help-unverified', 'if or ne get signaling 0 1 ne get vf 0 1',
+     'if ne get signaling 0 1'),
+    ('receipt-becomes-help', 'text ttaskcode "101"', 'text ttaskcode "100"'),
+    ('help-lane-leak', 'pbase 0\nput helping 0 0\ntn = tritmk 0',
+     'pbase 0\ntn = tritmk 0'),
+    ('help-hides-stop', 'if and eq get helping 0 1 ne open t 2',
+     'if eq get helping 0 1'),
 ]
 records = []
 failed = False

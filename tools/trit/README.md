@@ -65,6 +65,7 @@ current Trinary Doctrine use:
 
 ```
 trit DIR --inspect BOT...       unread work as 1 plus its exact token; silence when quiet
+trit DIR --signal BOT...        verified explicit help as 0; other unread work as inspection 1
 trit DIR --consume BOT TOKEN    consume that token durably; no stdout and no next wake
 ```
 
@@ -80,10 +81,47 @@ the cursor; consumption never hides a later unread task.
 Task details stay once in the existing durable record. Reading sends nothing.
 An explicit request for help is notification `0` only after its task record exists;
 no value produced by the legacy `--ack` interface may be forwarded as help. No
-codebook row is reassigned here. Neither native help signalling nor the proposed
-combined-digit codes or ambient liveness mechanism are implemented by these commands. Harnesses that need a startup prompt
+codebook row is reassigned here. The proposed combined-digit codes and ambient
+liveness mechanism remain unimplemented. Harnesses that need a startup prompt
 receive the record reference; this is not an enforced one-trit transport and no
 usage savings are claimed.
+
+### Native help records
+
+Use `--signal` for the current help wire and `--consume` after reading the selected
+record window. `--inspect` remains a way to request inspection without classifying
+help. An unread help record must pass the existing `ocb2` verification, have exact
+tag `help`, nonblank reason and task reference (neither may be a lone `-`), and
+carry exactly the existing `101` task-waiting code. The signed fields are:
+
+```
+timestamp|sender|recipient|help|reason while still working|task-reference|ocb2:...
+```
+
+The existing `codebook sign` input is
+`n|timestamp|sender|recipient|help|reason while still working|task-reference|counter|101`.
+Append that record durably through the existing record writer before notifying
+the recipient. The reader returns `<recipient> 0 <token>`; delivery sends the
+bare `0` only where the harness supports it. The token identifies the exact
+record prefix to read and consume. It is not part of the bare notification.
+No new queue, dispatcher, acknowledgement or periodic wake is introduced.
+
+The `101` code binds a task record whose explicit tag asks for help. The held
+`102` proposal is not deployed, and the table hash and old signatures stay valid.
+An old `100` receipt never becomes help even if its tag says `help`. Unsigned,
+tampered, replayed, misaddressed or incomplete help records become inspection `1`.
+A verified stop dominates help in the same unread window but still emits only
+inspection `1`. Existing lane selection is unchanged: a verified emergency stop
+is selected first; other emergency-lane records wait until the normal lane is
+quiet. Read the whole selected window; a help notification can accompany ordinary
+tasks in that window. Consuming a prefix leaves later work unread.
+
+A help record expresses the sender's request; it does not prove that the sender
+is currently alive, identify an individual shared-key holder, or authorize a
+restart. A key holder can claim another sender name. Establish identity and
+existing runtime authority separately before any process action. Answer help
+with useful authorized work, never a trit acknowledgement. Physical delivery and
+harness-wide integration are separate from host reader qualification.
 
 `python3 tools/trit/test-daily.py` is an external verification oracle. It signs
 fixtures independently with Python's HMAC and checks exact output, exits, tokens,
