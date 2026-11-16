@@ -8,7 +8,7 @@ Reads `DIR/inbox/<bot>.md` and the emergency lane `DIR/inbox/<bot>.emergency.md`
 delivery stays outside (SendToAgent). Trit meaning follows TURNS.md (Drake 12:24): 1 = task,
 2 = stop, 0 = read/done receipt (only from `--ack`), silence = nothing to do.
 
-Exit status: 0 printed at least one line, 1 silent (no bot has work), 2 usage, 3 ack refused, 4 invalid codebook, 5 bad key,
+Legacy exit status: 0 printed at least one line, 1 silent (no bot has work), 2 usage, 3 ack refused, 4 invalid codebook, 5 bad key,
 70+ internal/I-O.
 
 - A line is content when it starts `YYYY-MM-DDT`; headers are not content. `fyi` lines never wake.
@@ -93,3 +93,11 @@ the new entry points are host-tested, not claimed source-proved.
 
 Mutation work directories must be fresh. A supplied existing `W` is refused and
 left intact; gate runs keep separate output directories so earlier failures survive.
+
+`python3 tools/trit/mutate-daily.py` checks the daily oracle against a passing
+baseline and deliberate stop promotion, receipt leakage, next-wake leakage and
+bypassed consumption. Invalid compilation or an incomplete test run fails the
+instrument; it never counts as a killed mutant. The host gate preserves all
+fixtures, mutant sources, binaries, raw exits and logs under its fresh output
+directory, and emits tool versions and log hashes. Wrong-recipient stop records
+remain inspection work for the reader to reject, never runtime authority.

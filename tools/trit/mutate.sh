@@ -20,7 +20,7 @@
 # Exit: 0 every mutant applied, built, killed by test.sh, and killed by difftest where modelled;
 #       1 a mutant survived; 2 a prerequisite is missing; 3 a mutant is not applied or invalid;
 #       4 a harness error; 5 the baseline did not build or did not pass.
-# Precedence when several apply: 5, 2, 4, 3, 1.
+# Prerequisites are checked first; a failed baseline exits next. Mutant result precedence: 4, 3, 1.
 set -u
 R=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$R" || exit 2
@@ -48,10 +48,11 @@ stage() {
   rm -rf "$1/tools/trit/trit.bin" "$1/tools/codebook/codebook.bin"
 }
 # build DIR TAG: both binaries with $OMC; logs kept.
-build() { (cd "$1" && sh tools/trit/build.sh && sh tools/codebook/build.sh) > "$LOGS/$2.build.log" 2>&1; }
+build() { (cd "$1" && sh tools/trit/build.sh && sh tools/codebook/build.sh) > "$LOGS/$2.build.log" 2>&1; rc=$?; printf '%s\n' "$rc" > "$LOGS/$2.build.rc"; return "$rc"; }
 # run_test DIR TAG: prints killed|survived|harness-error.
 run_test() {
   (cd "$1" && FIX="$W/fix-$2" timeout 300 sh tools/trit/test.sh) > "$LOGS/$2.test.log" 2>&1; rc=$?
+  printf '%s\n' "$rc" > "$LOGS/$2.test.rc"
   tot=$(grep '^TOTAL pass=[0-9]* fail=[0-9]* skip=[0-9]*$' "$LOGS/$2.test.log" | tail -1)
   f=${tot#*fail=}; f=${f%% *}
   case $tot in
@@ -63,6 +64,7 @@ run_test() {
 }
 run_diff() {
   (cd "$1" && N=200 SEED=3 W="$W/diff-$2" timeout 600 sh tools/trit/proof/difftest.sh) > "$LOGS/$2.diff.log" 2>&1; rc=$?
+  printf '%s\n' "$rc" > "$LOGS/$2.diff.rc"
   if [ "$rc" = 0 ] && grep -q '^DIFF agree=' "$LOGS/$2.diff.log"; then echo survived
   elif [ "$rc" = 1 ] && grep -q '^DIFF disagree=' "$LOGS/$2.diff.log"; then echo killed
   else echo harness-error; fi
@@ -81,11 +83,12 @@ k1=0; k2=0; n=0; surv=0; inval=0; herr=0
 # m FILE NAME EXPR SCOPE: SCOPE "read" = difftest must kill it; "ack" = outside the differential model.
 m() {
   n=$((n+1)); f=$1; name=$2; expr=$3; scope=$4
-  stage "$W/r"
-  perl -0pi -e "$expr" "$W/r/tools/$f"
-  if cmp -s "$W/r/tools/$f" "tools/$f"; then echo "MUTANT $n $name: NOT APPLIED"; inval=$((inval+1)); return; fi
-  if ! build "$W/r" "m$n"; then echo "MUTANT $n $name: BUILD INVALID (see $LOGS/m$n.build.log)"; inval=$((inval+1)); return; fi
-  t=$(run_test "$W/r" "m$n"); d=$(run_diff "$W/r" "m$n")
+  md="$W/m$n"
+  stage "$md"
+  perl -0pi -e "$expr" "$md/tools/$f"
+  if cmp -s "$md/tools/$f" "tools/$f"; then echo "MUTANT $n $name: NOT APPLIED"; inval=$((inval+1)); return; fi
+  if ! build "$md" "m$n"; then echo "MUTANT $n $name: BUILD INVALID (see $LOGS/m$n.build.log)"; inval=$((inval+1)); return; fi
+  t=$(run_test "$md" "m$n"); d=$(run_diff "$md" "m$n")
   verdict=ok
   case $t in
     killed) k1=$((k1+1)) ;;

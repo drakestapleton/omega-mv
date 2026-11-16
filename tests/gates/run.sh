@@ -721,17 +721,24 @@ case "$step" in
                       # Builds both binaries, runs both fixture suites (a SKIP is not a pass), the codebook mutant list,
                       # the regression for the trit mutation driver itself, the trit mutation driver (every mutant applied,
                       # built and killed by test.sh; difftest kills the read-mode ones), the Lean differential of trit.bin
-                      # against TritSignal.lean, and the existing Lean proofs (compilation and reported trit axioms).
-                      # Needs python3, perl, strace and lean: without them NOT_RUN (exit 3).
+                      # against TritSignal.lean, and the existing Lean proofs (compilation and reported theorem axioms).
+                      # Needs python3, perl, strace, lean, cmp and timeout: without them NOT_RUN (exit 3).
     sha256sum -c seed/out/omc.sha256
     OMC="$ROOT/seed/out/omc"; export OMC
     obs omc_sha256 "\"$(sha256sum < "$OMC" | cut -c1-64)\""
-    for t in python3 perl lean strace; do
+    for t in python3 perl lean strace cmp timeout; do
       command -v "$t" >/dev/null 2>&1 || { echo "run.sh: trinary NOT_RUN: $t is not installed" >&2; exit 3; }
     done
     tri=$(mktemp -d "$OUT_DIR/trinary.XXXXXX")
+    export TMPDIR="$ROOT/$tri"
+    obs lean_version "\"$(lean --version)\""
+    obs python_version "\"$(python3 --version)\""
+    obs perl_version "\"$(perl -e 'printf "%vd", $^V')\""
+    obs strace_version "\"$(strace --version | head -n 1)\""
     B="$tri/codebook" sh tools/codebook/build.sh > "$tri/build-codebook.log"
     B="$tri/trit" sh tools/trit/build.sh > "$tri/build-trit.log"
+    obs trit_binary_sha256 "\"$(sha256sum < "$tri/trit/trit" | cut -c1-64)\""
+    obs codebook_binary_sha256 "\"$(sha256sum < "$tri/codebook/codebook" | cut -c1-64)\""
     tri_suite() { # name, then the command: its own TOTAL line must show fail=0 skip=0
       local name="$1" rc=0 tot; shift
       "$@" > "$tri/$name.log" 2>&1 || rc=$?
@@ -744,9 +751,11 @@ case "$step" in
     tri_suite trit-test env BIN="$ROOT/$tri/trit/trit" CBIN="$ROOT/$tri/codebook/codebook" FIX="$ROOT/$tri/fix-trit" sh tools/trit/test.sh
     BIN="$ROOT/$tri/trit/trit" python3 tools/trit/test-daily.py > "$tri/daily.log" 2>&1 || { cat "$tri/daily.log" >&2; exit 1; }
     tail -n 1 "$tri/daily.log"
+    COMPOSED="$ROOT/$tri/trit/trit.full.om" python3 tools/trit/mutate-daily.py > "$tri/daily-mutations.log" 2>&1 || { cat "$tri/daily-mutations.log" >&2; exit 1; }
+    tail -n 1 "$tri/daily-mutations.log"
     sh tools/codebook/test-mutate.sh > "$tri/codebook-driver.log" 2>&1 || { cat "$tri/codebook-driver.log" >&2; exit 1; }
     tail -n 1 "$tri/codebook-driver.log"
-    sh tools/codebook/mutate.sh > "$tri/codebook-mutate.log" 2>&1 || { echo "run.sh: trinary codebook mutate FAIL" >&2; tail -n 20 "$tri/codebook-mutate.log" >&2; exit 1; }
+    M="$ROOT/$tri/codebook-mutants" sh tools/codebook/mutate.sh > "$tri/codebook-mutate.log" 2>&1 || { echo "run.sh: trinary codebook mutate FAIL" >&2; tail -n 20 "$tri/codebook-mutate.log" >&2; exit 1; }
     tail -n 1 "$tri/codebook-mutate.log"
     W="$ROOT/$tri/driver-regression" sh tools/trit/test-mutate.sh > "$tri/test-mutate.log" 2>&1 || { echo "run.sh: trinary mutation-driver regression FAIL" >&2; tail -n 20 "$tri/test-mutate.log" >&2; exit 1; }
     tail -n 1 "$tri/test-mutate.log"
@@ -769,6 +778,8 @@ case "$step" in
       echo "trinary lean $lf: $nax axiom lines, standard axioms only"
       [ "$lf" != codebook ] || [ "$nax" = "$cbthm" ] || { echo "run.sh: trinary CodebookProof.lean: $nax axiom lines for $cbthm theorems" >&2; exit 1; }
     done
+    find "$tri" -maxdepth 1 -type f -name "*.log" -print0 | sort -z | xargs -0 sha256sum > "$tri/LOGS.sha256"
+    cat "$tri/LOGS.sha256"
     echo "TRINARY PASS"
     ;;
   *) echo "run.sh: unknown step '$step'" >&2; exit 2 ;;

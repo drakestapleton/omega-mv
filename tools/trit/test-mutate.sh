@@ -42,7 +42,7 @@ expect() {
   ok "$n"
 }
 
-# 1. normal matrix subset with the default compiler path (OMC unset: default must be absolute and work)
+# 1. normal subset with an explicit compiler, then the unset-OMC default and ack-only scope
 scratch ok-read "lvl-ignores-3xx verify-disabled"
 drive ok-read OMC="$OMC"
 expect read-mutants-accepted 0 'BASELINE test.sh survived, difftest survived' 'MUTANT 1 lvl-ignores-3xx \[read\]: test.sh killed, difftest killed => ok' 'mutate.sh: PASS 2/2'
