@@ -1,10 +1,9 @@
 # native/net/tcp: native TCP in seeded Omega (ledger L232)
 
-TCP over IPv4 and ARP, written in Omega and built by the pinned seeded `omc`
-(omega-mv `1e3ecbba779ee84e2de70ec231e83533a9c61f45`, `seed/out/omc` sha256
-`6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`, rebuilt
-from the seed with an identical hash). No C, no heap, no outside library in the
-stack or its drivers.
+TCP over IPv4 and ARP, written in Omega and built by the pinned seeded `omc`.
+The pin is the `omc-sha256` line of the repository's one `PIN` file, which
+`gate.sh` reads and checks; it refuses any other compiler. No C, no heap, no outside library
+in the stack or its drivers.
 
 | File | What it is |
 |---|---|
@@ -53,7 +52,19 @@ hit the defect; no run has shown it.
 ## Limits (not claimed)
 
 - One connection at a time; no window scaling, SACK or timestamps; receive
-  window 65,535 bytes; TIME-WAIT is 1 s (`Tcf 8`), not 2 MSL of minutes.
+  window 65,535 bytes; TIME-WAIT is 1 s (`Tcf 8`), not 2 MSL of minutes. A
+  passive block whose SYN-ACK is never answered returns to LISTEN when its
+  retries run out, as it does on an exact RST.
+- The minimum RTO is 200 ms (`Tcf 10`), below RFC 6298's 1 s (rule 2.4, a
+  SHOULD), so recovery on a fast link does not wait a full second.
+- Challenge ACKs (RFC 5961 sections 3 to 5) are not rate limited (section 7
+  recommends a limit): every forged in-window RST or SYN, or out-of-range ACK,
+  gets one ACK.
+- Fixed tables: 4 ARP entries reused round robin (any on-link host can evict
+  the gateway entry, as ARP is unauthenticated) and one connection block. The
+  drivers' main loops (`tcpd` 100,000,000 passes, `link` 1,000,000,000) trap
+  if ever reached; the gate's deadlines (QEMU 200 s, link 230 s) end a run
+  long before that.
 - Blind in-window forgery is inherent to TCP without authentication: an
   attacker who knows the 4-tuple and lands a sequence number exactly at
   RCV.NXT can reset the connection (RFC 5961 narrows this to one exact value).
