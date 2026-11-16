@@ -27,11 +27,10 @@ the TRUST-1 owner ceremony first.
 named in [`tools/hwgates/PIN`](../tools/hwgates/PIN)) enforces these as rules R1..R9, refuses an
 empty register (R8) and the deletion of a gate whose receipt still names it (R9), and prints
 `HWGATES PASS rows=… gates=… physical=… physical_pass=… physical_not_pass=…`. The local Spark gate
-`AIENOS-HW-GATES` (`tests/gates/run.sh hw-gates`, which runs `tools/hwgates/gate.sh`) checks the
-register, the fixtures in `tools/hwgates/fixtures/` (one good, the rest each breaking one rule), the
-checker's compiling behavior mutants, that every cited receipt is a tracked regular file under
-`evidence/`, that the register and receipts stay under three quarters of the checker's tables, and
-planted-bad copies of the register. Without the pinned compiler it exits 3 (NOT_RUN), never 0.
+`AIENOS-HW-GATES` (`tests/gates/run.sh hw-gates`, which runs `tools/hwgates/gate.sh`) runs the
+checker on the register, its fixtures, mutants and planted-bad copies, and the shell checks that
+the checker cannot do (receipt files, inventory, receipt claims, source commits, size alarm); the
+comments in `gate.sh` name each check. Without the pinned compiler it exits 3 (NOT_RUN), never 0.
 
 To add a physical PASS: run the attended procedure under its own authorization, commit the raw
 receipt under `evidence/` with the `HWGATE <id> PHYSICAL PASS` line plus source commit, image

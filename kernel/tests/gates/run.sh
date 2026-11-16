@@ -90,10 +90,9 @@ scripts_verdict() {
 # pinned_omc COMMIT SHA256: make AIEN_OMC the seeded Omega compiler with that hash. AIEN_OMC wins
 # when it has the hash; otherwise the committed compiler at COMMIT is taken from the sibling
 # checkout ../omega-mv (a clone of ~/git/omega-mv.git). Neither available: exit 3, never a pass.
-# native/disk pins omega-mv 397e6704 (native/disk/tests/omega_nvme_test.sh); tools/hwgates pins
-# its own build in tools/hwgates/PIN.
-NVME_OMC_COMMIT=397e67040fb74853c6814097fe02ae4e1ebd6f66
-NVME_OMC_SHA256=bcfa582892afca8f65e551fe56867d918d86e84540c7381be8fa9ef18d0cf0f6
+# native/disk pins its build in native/disk/tests/PIN; tools/hwgates pins its own in
+# tools/hwgates/PIN. Both files hold "commit <sha1>" and "sha256 <omc sha256>".
+pin_of() { pinned_omc "$(sed -n 's/^commit //p' "$1")" "$(sed -n 's/^sha256 //p' "$1")"; }
 pinned_omc() {
   local pc="$1" ps="$2" h=""
   if [ -n "${AIEN_OMC:-}" ] && [ -r "$AIEN_OMC" ]; then h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1); fi
@@ -211,13 +210,13 @@ case "$step" in
   # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register, its
   # receipts, a size alarm and planted-bad copies. Needs the compiler named in tools/hwgates/PIN.
   hw-gates)
-    pinned_omc "$(sed -n 's/^commit //p' tools/hwgates/PIN)" "$(sed -n 's/^sha256 //p' tools/hwgates/PIN)"
+    pin_of tools/hwgates/PIN
     sh tools/hwgates/gate.sh
     ;;
-  # Bounded read-only NVMe protocol in seeded Omega (#472): 37 host cases, 7 guard mutants,
-  # 10 disposable-QEMU cases. Physical NVMe stays NOT_RUN.
+  # Bounded read-only NVMe protocol in seeded Omega (#472): host cases, guard mutants and
+  # disposable-QEMU cases (the test prints its counts). Physical NVMe stays NOT_RUN.
   omega-nvme)
-    pinned_omc "$NVME_OMC_COMMIT" "$NVME_OMC_SHA256"
+    pin_of native/disk/tests/PIN
     must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
       -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
     scripts_verdict
