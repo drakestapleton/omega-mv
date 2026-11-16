@@ -752,16 +752,23 @@ case "$step" in
     tail -n 1 "$tri/test-mutate.log"
     W="$ROOT/$tri/mutants" sh tools/trit/mutate.sh > "$tri/trit-mutate.log" 2>&1 || { echo "run.sh: trinary trit mutate FAIL" >&2; tail -n 25 "$tri/trit-mutate.log" >&2; exit 1; }
     grep -E '^(MUTANTS|mutate.sh: PASS)' "$tri/trit-mutate.log"
-    grep -qE '^mutate.sh: PASS [1-9][0-9]*/[1-9][0-9]* killed by test.sh;' "$tri/trit-mutate.log"
+    mline="$(grep '^MUTANTS ' "$tri/trit-mutate.log")"; mn="${mline#MUTANTS }"; mn="${mn%% *}"; mk="${mline#*killed-by-test.sh=}"; mk="${mk%% *}"
+    [ "$mn" -ge 1 ] && [ "$mk" = "$mn" ] && printf '%s\n' "$mline" | grep -qE 'survived=0 invalid=0 harness-errors=0$' || { echo "run.sh: trinary mutants: killed-by-test.sh=$mk of $mn, or a survivor/invalid/harness error: $mline" >&2; exit 1; }
     BIN="$ROOT/$tri/trit/trit" N=600 SEED=1 W="$ROOT/$tri/diff" sh tools/trit/proof/difftest.sh > "$tri/difftest.log" 2>&1 || { echo "run.sh: trinary difftest FAIL" >&2; tail -n 20 "$tri/difftest.log" >&2; exit 1; }
     grep -E '^DIFF agree=600/600 ' "$tri/difftest.log"
-    ( cd tools/codebook/proof && lean CodebookProof.lean ) > "$tri/lean-codebook.log" 2>&1 || { echo "run.sh: trinary CodebookProof.lean FAIL" >&2; head -n 20 "$tri/lean-codebook.log" >&2; exit 1; }
+    # CodebookProof.lean prints no axioms itself: check a copy of it with one `#print axioms Codebook.<name>` appended per top-level theorem.
+    { cat tools/codebook/proof/CodebookProof.lean; sed -n "s/^theorem \([^ ]*\) .*/#print axioms Codebook.\1/p" tools/codebook/proof/CodebookProof.lean; } > "$tri/CodebookAxioms.lean"
+    lean "$tri/CodebookAxioms.lean" > "$tri/lean-codebook.log" 2>&1 || { echo "run.sh: trinary CodebookProof.lean FAIL" >&2; head -n 20 "$tri/lean-codebook.log" >&2; exit 1; }
     ( cd tools/trit/proof && lean TritSignal.lean ) > "$tri/lean-trit.log" 2>&1 || { echo "run.sh: trinary TritSignal.lean FAIL" >&2; head -n 20 "$tri/lean-trit.log" >&2; exit 1; }
     if grep -q 'sorry\|error' "$tri/lean-codebook.log" "$tri/lean-trit.log"; then echo "run.sh: trinary Lean output mentions sorry or error" >&2; exit 1; fi
-    nax="$(grep -c "depends on axioms\|does not depend on any axioms" "$tri/lean-trit.log" || true)"
-    badax="$(grep "depends on axioms" "$tri/lean-trit.log" | sed 's/.*\[\(.*\)\]/\1/' | tr ',' '\n' | tr -d ' ' | grep -v '^propext$\|^Classical.choice$\|^Quot.sound$' | sort -u | tr '\n' ' ' || true)"
-    [ "$nax" -ge 1 ] && [ -z "$badax" ] || { echo "run.sh: trinary TritSignal axioms: $nax lines, non-standard '$badax'" >&2; exit 1; }
-    echo "trinary lean: both proof files compile; $nax reported TritSignal axiom lines use standard axioms"
+    cbthm="$(grep -c '^theorem ' tools/codebook/proof/CodebookProof.lean || true)"
+    for lf in codebook trit; do
+      nax="$(grep -c "depends on axioms\|does not depend on any axioms" "$tri/lean-$lf.log" || true)"
+      badax="$(grep "depends on axioms" "$tri/lean-$lf.log" | sed 's/.*\[\(.*\)\]/\1/' | tr ',' '\n' | tr -d ' ' | grep -v '^propext$\|^Classical.choice$\|^Quot.sound$' | sort -u | tr '\n' ' ' || true)"
+      [ "$nax" -ge 1 ] && [ -z "$badax" ] || { echo "run.sh: trinary $lf axioms: $nax lines, non-standard '$badax'" >&2; exit 1; }
+      echo "trinary lean $lf: $nax axiom lines, standard axioms only"
+      [ "$lf" != codebook ] || [ "$nax" = "$cbthm" ] || { echo "run.sh: trinary CodebookProof.lean: $nax axiom lines for $cbthm theorems" >&2; exit 1; }
+    done
     echo "TRINARY PASS"
     ;;
   *) echo "run.sh: unknown step '$step'" >&2; exit 2 ;;
