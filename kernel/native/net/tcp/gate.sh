@@ -10,11 +10,13 @@
 # injection) to QEMU slirp, and talks to peer.om on the host. Exit 0 only when
 # every run passes every check. Requires qemu-system-aarch64 with KVM.
 set -u
-PIN=6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8
 OMC=$1 IMAGE=$2 BUSYBOX=$3 OUT=$4
 PROFILES=${5:-clean loss reorder hostile}
 SCEN=${6:-echo h2g g2h}
 HERE=$(cd "$(dirname "$0")" && pwd)
+# The compiler pin is the repository's one PIN file (moved by pin-follow.sh).
+PIN=$(sed -n 's/^omc-sha256 //p' "$HERE/../../../PIN")
+[ -n "$PIN" ] || { echo "GATE_FAIL no omc-sha256 line in $HERE/../../../PIN"; exit 2; }
 mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd)
 have=$(sha256sum "$OMC" | cut -d' ' -f1)
@@ -77,14 +79,15 @@ for prof in $PROFILES; do
   for sc in $SCEN; do
     n=$((n + 1)); runs=$((runs + 1))
     HP=$((PORTBASE + n)); SEED=$((7919 * n + 17))
-    D=$OUT/run-$prof-$sc; rm -rf "$D"; mkdir -p "$D"
+    D=$OUT/run-$prof-$sc; rm -rf "$D"; mkdir -p "$D"; : > "$D/console.log"
     T=$(mktemp -d /tmp/l232g.XXXXXX)
     case $sc in
       echo) ARGS="e,7,-,-,150"; FWD=",hostfwd=tcp:127.0.0.1:$HP-10.0.2.15:7"; WANT=$P1 ;;
       h2g)  ARGS="r,9,-,/tmp/rx,150"; FWD=",hostfwd=tcp:127.0.0.1:$HP-10.0.2.15:9"; WANT=$P2 ;;
       g2h)  ARGS="s,$HP,10.0.2.2,/bin/busybox,150"; FWD=""; WANT=$BUSYBOX ;;
     esac
-    "$B/link" "$T/l1" "$T/g" "$T/l2" "$T/s" $SEED $RATES 8 > "$D/link.log" 2>&1 &
+    # link.om stops on its own when the guest goes quiet; timeout bounds it if traffic never stops.
+    timeout 230 "$B/link" "$T/l1" "$T/g" "$T/l2" "$T/s" $SEED $RATES 8 > "$D/link.log" 2>&1 &
     LP=$!
     if [ "$sc" = g2h ]; then
       "$B/peer" r $HP "$WANT" 170 "$D/received" > "$D/peer.log" 2>&1 &
