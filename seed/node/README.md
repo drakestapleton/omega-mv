@@ -2058,8 +2058,9 @@ with an explicit result: one `CWO` FAIL line and exit 1, or a `code-main`
 refusal exit 50 to 57 with its cause line for that exit on stderr
 (`code-main: WHAT, exit R` with R equal to the exit). A pass is
 one `CWO 0 PASS` line, exit 0 and a journal with at most one start. A signal
-death before the node did anything (no journal and nothing on stderr: the
-kernel refused the exec under the cap) is reported (`c=2`) and not counted
+death that leaves no journal and nothing on stderr is treated as the kernel
+refusing the exec under the cap (it cannot be told apart from a death after
+the exec but before the node wrote anything) and is reported (`c=2`) and not counted
 either way. A signal death after the node started (a journal or stderr
 exists) is a crash and fails the check. A harness
 failure (exit 97, 126 or 127, an output that cannot be read, a wait error), a
