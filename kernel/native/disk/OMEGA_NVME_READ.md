@@ -40,10 +40,9 @@ replace or claim the System Store journal or that consumer.
 
 ## Pins and reproducible acceptance
 
-- Compiler source: aien-dev/omega-mv `397e67040fb74853c6814097fe02ae4e1ebd6f66`,
-  the existing omega-gpu-driver `feat/vfio-dma-bar` pin, not an invented profile.
-- Seeded omc SHA-256:
-  `bcfa582892afca8f65e551fe56867d918d86e84540c7381be8fa9ef18d0cf0f6`.
+- Compiler: the omega-mv commit and seeded omc SHA-256 in `tests/PIN`, read by
+  `tests/omega_nvme_test.sh` and `tests/gates/run.sh`. The first pin was the existing
+  omega-gpu-driver `feat/vfio-dma-bar` pin, not an invented profile.
 - Existing C reference: `disk_nvme.c`; existing model: `tests/nvme_test.c`.
   Their exact hashes and the compiled candidate hash are in
   `tests/omega_nvme_receipt.txt`. They were not modified by this change.

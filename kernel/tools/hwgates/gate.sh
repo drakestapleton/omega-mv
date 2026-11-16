@@ -95,56 +95,77 @@ for r in $(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$REG" | sort 
   fi
 done
 if [ "$bad" = 0 ]; then echo "PASS receipts are tracked regular files under evidence/"; n=$((n + 1)); else fail=1; fi
-# inventory, receipt claims and source commits (regsh REGISTER): one FAIL line per problem, exit 1 if any
+# inventory, receipt claims and source commits (regsh REGISTER NEEDS): one FAIL line per problem,
+# exit 1 if any. Claims are read from every tracked file under evidence/ with HWGATE lines, cited
+# or not; a CORRECTION-*.txt counts only when it is a tracked regular file beside the receipt.
 NEEDS=docs/hardware-gates-needs.tsv
+# this repository's name as the register's source column spells it
+SELF=aienux
 regsh() {
   rb=0
   awk -F '\t' '!/^#/ && NF == 7 {print $1}' "$1" | sort -u > "$W/ids-reg"
-  awk -F '\t' '!/^#/ && NF == 2 {print $1}' "$NEEDS" | sort -u > "$W/ids-need"
+  awk -F '\t' '!/^#/ && NF == 2 {print $1}' "$2" | sort -u > "$W/ids-need"
   for g in $(comm -23 "$W/ids-need" "$W/ids-reg"); do echo "FAIL inventory: gate $g is in $NEEDS but has no rows in the register"; rb=1; done
   for g in $(comm -13 "$W/ids-need" "$W/ids-reg"); do echo "FAIL inventory: gate $g has rows but no entry in $NEEDS"; rb=1; done
-  for r in $(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$1" | sort -u); do
+  for r in $( (git grep -l '^HWGATE ' -- evidence/; awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$1") | sort -u); do
     [ -f "$r" ] || continue
     grep '^HWGATE ' "$r" > "$W/claims" || true
+    : > "$W/corr"
+    for c in "$(dirname "$r")"/CORRECTION-*.txt; do
+      if [ -f "$c" ] && [ ! -L "$c" ] && git ls-files --error-unmatch -- "$c" > /dev/null 2>&1; then cat "$c" >> "$W/corr"; fi
+    done
     while read -r _ id tier st; do
       have=$(awk -F '\t' -v i="$id" -v t="$tier" '!/^#/ && NF == 7 && $1 == i && $4 == t {print $5}' "$1")
       [ "$have" = "$st" ] && continue
-      if cat "$(dirname "$r")"/CORRECTION-*.txt 2> /dev/null | grep -qxF "CORRECTS HWGATE $id $tier $st"; then continue; fi
-      echo "FAIL claim: $r says HWGATE $id $tier $st, the register says ${have:-no row}, and no CORRECTION-*.txt beside it names the line"; rb=1
+      if grep -qxF "CORRECTS HWGATE $id $tier $st" "$W/corr"; then continue; fi
+      echo "FAIL claim: $r says HWGATE $id $tier $st, the register says ${have:-no row}, and no tracked CORRECTION-*.txt beside it names the line"; rb=1
     done < "$W/claims"
   done
+  # a PASS or FAIL row names REPO@COMMIT (40 hex); a *source-commit.txt beside its receipt holds
+  # COMMIT as a whole line; COMMIT is a commit of this repository exactly when REPO is $SELF
   awk -F '\t' '!/^#/ && NF == 7 && ($5 == "PASS" || $5 == "FAIL") {print $1 " " $3 " " $6}' "$1" > "$W/srcs"
   while read -r id src r; do
+    repo=${src%%@*}; c=${src#*@}
+    if ! printf '%s\n' "$src" | grep -qxE '[A-Za-z0-9._-]+@[0-9a-f]{40}'; then echo "FAIL source: $id names '$src', not REPO@<40 hex commit>"; rb=1; continue; fi
     [ -f "$r" ] || continue
-    if ! grep -rqF -- "${src#*@}" "$(dirname "$r")"; then echo "FAIL source: $id names $src, which no file beside $r records"; rb=1; fi
+    if ! find "$(dirname "$r")" -name '*source-commit.txt' -type f -exec cat {} + | grep -qxF -- "$c"; then
+      echo "FAIL source: $id names $src, which no *source-commit.txt beside $r records"; rb=1; continue; fi
+    own=no; [ "$(git cat-file -t "$c" 2> /dev/null)" = commit ] && own=yes
+    if [ "$repo" = "$SELF" ] && [ "$own" = no ]; then echo "FAIL source: $id names $src, which is not a commit of this repository"; rb=1; fi
+    if [ "$repo" != "$SELF" ] && [ "$own" = yes ]; then echo "FAIL source: $id names $src, a commit of $SELF, not of $repo"; rb=1; fi
   done < "$W/srcs"
   return "$rb"
 }
-rc=0; regsh "$REG" > "$W/rs" || rc=$?
+rc=0; regsh "$REG" "$NEEDS" > "$W/rs" || rc=$?
 cat "$W/rs"
 if [ "$rc" = 0 ]; then echo "PASS inventory, receipt claims and source commits agree with $REG"; n=$((n + 1)); else fail=1; fi
-# plantsh NAME KIND FILE: regsh must refuse FILE with a FAIL KIND line
+# plantsh NAME KIND REGISTER [NEEDS]: regsh must refuse the copy with a FAIL KIND line
 plantsh() {
-  rc=0; regsh "$3" > "$W/out" || rc=$?
-  if ! cmp -s "$REG" "$3" && [ "$rc" = 1 ] && grep -q "^FAIL $2:" "$W/out"; then
+  pn=${4:-$NEEDS}
+  rc=0; regsh "$3" "$pn" > "$W/out" || rc=$?
+  if { ! cmp -s "$REG" "$3" || ! cmp -s "$NEEDS" "$pn"; } && [ "$rc" = 1 ] && grep -q "^FAIL $2:" "$W/out"; then
     echo "PASS planted $1 refused ($2)"; n=$((n + 1))
   else echo "FAIL planted $1: rc=$rc, expected a FAIL $2 line: $(tr '\n' ' ' < "$W/out")"; fail=1; fi
 }
-# planted control 6: every row of a gate that no cited receipt names removed (R9 cannot see it;
-# the checker alone passes this copy) -> inventory
-cat $(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$REG" | sort -u) | awk '$1 == "HWGATE" {print $2}' | sort -u > "$W/named"
-gid=$(awk -F '\t' '!/^#/ && NF == 7 {print $1}' "$REG" | sort -u | comm -23 - "$W/named" | head -n 1)
-awk -F '\t' -v g="$gid" '$1 != g' "$REG" > "$W/p6.tsv"
-rc=0; "$W/hwgates" "$W/p6.tsv" "$ROOT" > "$W/out" 2>&1 || rc=$?
-if [ -n "$gid" ] && [ "$rc" = 0 ]; then echo "PASS checker alone accepts the copy without $gid (the gap the inventory closes)"; n=$((n + 1))
-else echo "FAIL planted control 6 setup: gate '$gid', checker rc=$rc"; fail=1; fi
-plantsh "receipt-less gate $gid deleted" inventory "$W/p6.tsv"
+# planted control 6: a gate listed in the inventory with no rows (a deleted gate that no receipt
+# names, which R9 cannot see), and a gate with rows but no inventory entry -> inventory.
+# ZZ-PLANTED is synthetic, so the control holds whatever receipts the real gates have.
+{ cat "$NEEDS"; printf 'ZZ-PLANTED\tplanted control\n'; } > "$W/p6n.tsv"
+plantsh "gate ZZ-PLANTED listed without rows" inventory "$REG" "$W/p6n.tsv"
+{ cat "$REG"; printf 'ZZ-PLANTED\tplanted\tplanted\tPHYSICAL\tNOT_RUN\t-\tplanted control\n'; } > "$W/p6r.tsv"
+plantsh "gate ZZ-PLANTED with rows but no inventory entry" inventory "$W/p6r.tsv"
 # planted control 7: the first PASS row downgraded to NOT_RUN without a correction -> claim
 awk -F '\t' 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" {$5="NOT_RUN"; $6="-"; done=1} {print}' "$REG" > "$W/p7.tsv"
 plantsh "PASS row silently downgraded" claim "$W/p7.tsv"
-# planted control 8: the first PASS row names a source commit its receipt does not record -> source
+# planted control 8: the first PASS row names a source commit its receipt does not record, an
+# empty commit, or a commit of this repository under another repository's name -> source
 awk -F '\t' 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" {sub(/@.*/, "@0000000000000000000000000000000000000000", $3); done=1} {print}' "$REG" > "$W/p8.tsv"
 plantsh "PASS row with an unrecorded source commit" source "$W/p8.tsv"
+awk -F '\t' 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" {sub(/@.*/, "@", $3); done=1} {print}' "$REG" > "$W/p8e.tsv"
+plantsh "PASS row with an empty source commit" source "$W/p8e.tsv"
+selfc=$(awk -F '\t' -v s="$SELF" '!/^#/ && NF == 7 && $5 == "PASS" && index($3, s "@") == 1 {print substr($3, length(s) + 2); exit}' "$REG")
+awk -F '\t' -v s="$SELF" -v c="$selfc" 'BEGIN{OFS="\t"} !done && !/^#/ && $5=="PASS" && index($3, s "@") != 1 {sub(/@.*/, "@" c, $3); done=1} {print}' "$REG" > "$W/p8x.tsv"
+plantsh "another repository's PASS row naming $SELF@$selfc" source "$W/p8x.tsv"
 # alarm: the checker refuses registers and receipts larger than its tables (CAP bytes, MAXR rows,
 # read from hwgates.om); fail loudly at three quarters of either so the tables grow first
 cap=$(sed -n 's/^const CAP ulong \([0-9]*\)$/\1/p' "$SRC")
@@ -157,8 +178,8 @@ for f in "$REG" $(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$REG" 
   if [ $((s * 4)) -gt $((cap * 3)) ]; then echo "ALARM $f is $s bytes; the checker reads CAP=$cap ($SRC)"; big=1; fi
 done
 if [ "$big" = 0 ]; then echo "PASS sizes: $rows rows of MAXR=$maxr, every file under 3/4 of CAP=$cap"; n=$((n + 1)); else fail=1; fi
-# planted control 1: the first PHYSICAL NOT_RUN row claims PASS without a receipt -> R3
-awk -F '\t' 'BEGIN{OFS="\t"} !done && $4=="PHYSICAL" && $5=="NOT_RUN" {$5="PASS"; done=1} {print}' "$REG" > "$W/p1.tsv"
+# planted control 1: the first PHYSICAL row, whatever its status, claims PASS without a receipt -> R3
+awk -F '\t' 'BEGIN{OFS="\t"} !done && !/^#/ && $4=="PHYSICAL" {$5="PASS"; $6="-"; done=1} {print}' "$REG" > "$W/p1.tsv"
 planted "physical PASS without receipt" R3 "$W/p1.tsv"
 # planted control 2: every PHYSICAL row removed -> R5
 awk -F '\t' '$4!="PHYSICAL"' "$REG" > "$W/p2.tsv"
