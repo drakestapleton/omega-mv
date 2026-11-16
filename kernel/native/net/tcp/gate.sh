@@ -1,7 +1,7 @@
 #!/bin/sh
 # gate.sh: L232 QEMU gate for the Omega TCP stack (verification rig, not product code).
 # Usage: gate.sh OMC IMAGE BUSYBOX OUTDIR [PROFILES] [SCENARIOS]
-#   OMC      pinned seeded omc (sha256 checked against PIN below)
+#   OMC      pinned seeded omc (sha256 checked against the repository PIN file)
 #   IMAGE    arm64 Linux Image for the guest (needs virtio-net, AF_PACKET)
 #   BUSYBOX  static aarch64 busybox (guest init, sha256sum, and the g2h payload)
 #   PROFILES default "clean loss reorder hostile"; SCENARIOS default "echo h2g g2h"

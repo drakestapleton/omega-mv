@@ -34,7 +34,7 @@ frames by default (`FUZZ=`).
 Verification-only dependencies (not in the stack): QEMU `qemu-system-aarch64`
 with KVM, a Linux arm64 `Image` with virtio-net and AF_PACKET, a static
 aarch64 busybox (guest init, `sha256sum`, and the g2h payload), POSIX sh,
-gzip, cpio, sha256sum.
+gzip, cpio, sha256sum, sed and timeout.
 
 Oracle defect (QEMU's slirp, libslirp 4.7.0-1ubuntu3.1, unchanged on upstream
 master): `tcp_input` runs `tcp_dooptions` on every segment outside LISTEN, and
@@ -54,7 +54,9 @@ hit the defect; no run has shown it.
 - One connection at a time; no window scaling, SACK or timestamps; receive
   window 65,535 bytes; TIME-WAIT is 1 s (`Tcf 8`), not 2 MSL of minutes. A
   passive block whose SYN-ACK is never answered returns to LISTEN when its
-  retries run out, as it does on an exact RST.
+  retries run out (13 retransmissions, 483 s), as it does on an exact RST.
+  Until then every other client's SYN gets a RST, so one unanswered SYN
+  every 8 minutes keeps the only listener busy.
 - The minimum RTO is 200 ms (`Tcf 10`), below RFC 6298's 1 s (rule 2.4, a
   SHOULD), so recovery on a fast link does not wait a full second.
 - Challenge ACKs (RFC 5961 sections 3 to 5) are not rate limited (section 7

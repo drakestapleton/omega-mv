@@ -91,7 +91,8 @@ scripts_verdict() {
 # when it has the hash; otherwise the committed compiler at COMMIT is taken from the sibling
 # checkout ../omega-mv (a clone of ~/git/omega-mv.git). Neither available: exit 3, never a pass.
 # PIN at the repository root names the one compiler build ("omega-mv <sha1>", "omc-sha256 <omc
-# sha256>", the format pin-follow.sh moves) for native/disk and tools/hwgates; moving it moves both.
+# sha256>", the format pin-follow.sh moves) for native/disk, native/net/tcp and tools/hwgates;
+# moving it moves all three.
 pin_of() { pinned_omc "$(sed -n 's/^omega-mv //p' "$1")" "$(sed -n 's/^omc-sha256 //p' "$1")"; }
 pinned_omc() {
   local pc="$1" ps="$2" h=""
@@ -219,6 +220,16 @@ case "$step" in
     pin_of PIN
     must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
       -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
+    scripts_verdict
+    ;;
+  # Native TCP stack in seeded Omega (L232): the hosted hostile corpus (exact-state cases plus
+  # 2,000,000 seeded mutated frames), built with the compiler named in PIN. No QEMU; the
+  # QEMU profiles stay in native/net/tcp/gate.sh.
+  tcp-corpus)
+    pin_of PIN
+    cat native/net/tcp/tcp.om native/net/tcp/corpus.om | "$AIEN_OMC" > "$TMP/tcp-corpus"
+    chmod +x "$TMP/tcp-corpus"
+    must_pass tcp_corpus 'CORPUS_PASS checks=[0-9]+ .*' -- "$TMP/tcp-corpus" 2000000
     scripts_verdict
     ;;
   # native-suites.yml matrix
