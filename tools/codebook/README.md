@@ -33,3 +33,10 @@ Round 4 (combined with tools/trit): `codebook.om` is the shared core and `main.o
 `ok <newsha>` when NEW is a valid codebook that starts with every byte of OLD, else `ERR notprefix`
 (exit 6) or exit 4 when either file is invalid. `verify` holds `flock(LOCK_EX)` on `STATE/ctr.lock` for
 the whole verify-and-advance pass and fsyncs STATE after each counter rename.
+
+Mutation acceptance runs a passing unmutated baseline first. Compile failures,
+unapplied mutations and test-runner errors never count as kills; a kill needs
+exit 1 plus the runner's completed failing-assertion summary. Full logs and raw
+runner exits are retained. A supplied existing mutation work directory is refused
+without deleting it. `sh tools/codebook/test-mutate.sh` checks these driver
+refusals with external test-runner stand-ins.

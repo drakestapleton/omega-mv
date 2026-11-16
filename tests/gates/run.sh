@@ -744,6 +744,8 @@ case "$step" in
     tri_suite trit-test env BIN="$ROOT/$tri/trit/trit" CBIN="$ROOT/$tri/codebook/codebook" FIX="$ROOT/$tri/fix-trit" sh tools/trit/test.sh
     BIN="$ROOT/$tri/trit/trit" python3 tools/trit/test-daily.py > "$tri/daily.log" 2>&1 || { cat "$tri/daily.log" >&2; exit 1; }
     tail -n 1 "$tri/daily.log"
+    sh tools/codebook/test-mutate.sh > "$tri/codebook-driver.log" 2>&1 || { cat "$tri/codebook-driver.log" >&2; exit 1; }
+    tail -n 1 "$tri/codebook-driver.log"
     sh tools/codebook/mutate.sh > "$tri/codebook-mutate.log" 2>&1 || { echo "run.sh: trinary codebook mutate FAIL" >&2; tail -n 20 "$tri/codebook-mutate.log" >&2; exit 1; }
     tail -n 1 "$tri/codebook-mutate.log"
     W="$ROOT/$tri/driver-regression" sh tools/trit/test-mutate.sh > "$tri/test-mutate.log" 2>&1 || { echo "run.sh: trinary mutation-driver regression FAIL" >&2; tail -n 20 "$tri/test-mutate.log" >&2; exit 1; }

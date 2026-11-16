@@ -80,8 +80,8 @@ the cursor; consumption never hides a later unread task.
 Task details stay once in the existing durable record. Reading sends nothing.
 An explicit request for help is notification `0` only after its task record exists;
 no value produced by the legacy `--ack` interface may be forwarded as help. No
-codebook row is reassigned here. The proposed combined-digit codes and ambient
-liveness mechanism are not implemented. Harnesses that need a startup prompt
+codebook row is reassigned here. Neither native help signalling nor the proposed
+combined-digit codes or ambient liveness mechanism are implemented by these commands. Harnesses that need a startup prompt
 receive the record reference; this is not an enforced one-trit transport and no
 usage savings are claimed.
 
