@@ -87,23 +87,24 @@ scripts_verdict() {
   [ "$script_fail" = 0 ]
 }
 
-# The seeded Omega compiler native/disk pins (omega-mv 397e6704, sha256 bcfa5828...). AIEN_OMC
-# wins when it has the pinned hash; otherwise the committed compiler at the pin is taken from
-# the sibling checkout ../omega-mv (as crumb-verify takes its tool from ../aien-architecture).
-# Neither available: exit 3, never a pass.
-OMC_PIN_COMMIT=397e67040fb74853c6814097fe02ae4e1ebd6f66
-OMC_PIN_SHA256=bcfa582892afca8f65e551fe56867d918d86e84540c7381be8fa9ef18d0cf0f6
+# pinned_omc COMMIT SHA256: make AIEN_OMC the seeded Omega compiler with that hash. AIEN_OMC wins
+# when it has the hash; otherwise the committed compiler at COMMIT is taken from the sibling
+# checkout ../omega-mv (a clone of ~/git/omega-mv.git). Neither available: exit 3, never a pass.
+# native/disk pins omega-mv 397e6704 (native/disk/tests/omega_nvme_test.sh); tools/hwgates pins
+# its own build in tools/hwgates/PIN.
+NVME_OMC_COMMIT=397e67040fb74853c6814097fe02ae4e1ebd6f66
+NVME_OMC_SHA256=bcfa582892afca8f65e551fe56867d918d86e84540c7381be8fa9ef18d0cf0f6
 pinned_omc() {
-  local h=""
+  local pc="$1" ps="$2" h=""
   if [ -n "${AIEN_OMC:-}" ] && [ -r "$AIEN_OMC" ]; then h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1); fi
-  if [ "$h" != "$OMC_PIN_SHA256" ]; then
-    if [ -d ../omega-mv ] && git -C ../omega-mv show "$OMC_PIN_COMMIT:seed/out/omc" > "$TMP/omc" 2>/dev/null; then
+  if [ "$h" != "$ps" ]; then
+    if [ -d ../omega-mv ] && git -C ../omega-mv show "$pc:seed/out/omc" > "$TMP/omc" 2>/dev/null; then
       chmod +x "$TMP/omc"; export AIEN_OMC="$TMP/omc"
       h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1)
     fi
   fi
-  if [ "$h" != "$OMC_PIN_SHA256" ]; then
-    echo "run.sh: no omc with sha256 $OMC_PIN_SHA256 (set AIEN_OMC, or check out aien-dev/omega-mv beside this tree)" >&2
+  if [ "$h" != "$ps" ]; then
+    echo "run.sh: no omc with sha256 $ps (set AIEN_OMC, or clone ~/git/omega-mv.git beside this tree as ../omega-mv)" >&2
     obs omc_pinned false
     exit 3
   fi
@@ -207,16 +208,16 @@ case "$step" in
     # with the decoded SID/address, the canary page stays intact, the recovery read succeeds.
     bash scripts/qemu_ck_b7b_probe_test.sh --events
     ;;
-  # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register and
-  # two planted-bad copies. Needs the seeded compiler pinned by native/disk (omc bcfa5828).
+  # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register, its
+  # receipts, a size alarm and planted-bad copies. Needs the compiler named in tools/hwgates/PIN.
   hw-gates)
-    pinned_omc
+    pinned_omc "$(sed -n 's/^commit //p' tools/hwgates/PIN)" "$(sed -n 's/^sha256 //p' tools/hwgates/PIN)"
     sh tools/hwgates/gate.sh
     ;;
   # Bounded read-only NVMe protocol in seeded Omega (#472): 37 host cases, 7 guard mutants,
   # 10 disposable-QEMU cases. Physical NVMe stays NOT_RUN.
   omega-nvme)
-    pinned_omc
+    pinned_omc "$NVME_OMC_COMMIT" "$NVME_OMC_SHA256"
     must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
       -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
     scripts_verdict
