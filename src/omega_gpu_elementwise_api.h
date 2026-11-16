@@ -91,7 +91,9 @@ typedef enum {
     OMEGA_GPU_EW_RC_REFUSE_SHFL_IN_REGION, /* SHFL inside an open region */
     OMEGA_GPU_EW_RC_REFUSE_UNCLOSED,       /* region begun, never joined */
     OMEGA_GPU_EW_RC_REFUSE_JOIN_ONLY,      /* BSYNC with no BSSY */
-    OMEGA_GPU_EW_RSQ          /* out[i] = 1/sqrt(a[i])                 (probe for bare MUFU.RSQ, omega #462) */
+    /* MUFU probes (appended after the refusals so earlier values stay put) */
+    OMEGA_GPU_EW_RSQ,         /* out[i] = 1/sqrt(a[i])                 (probe for bare MUFU.RSQ, omega #462) */
+    OMEGA_GPU_EW_OP_END       /* one past the last op: loops over every op stop here; not an op */
 } OmegaGpuEwOp;
 
 /* Shape rules (checked, refused with BAD_ARGS / TOO_LARGE):

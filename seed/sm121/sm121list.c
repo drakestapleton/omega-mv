@@ -357,7 +357,7 @@ static void kernels(void) {
  * program and the kernel bytes the API itself made (the oracle here is the API's own code buffer) */
 #include "../../src/omega_gpu_elementwise_api.h"
 static void ew_kernels(void) {
-    for (int op = OMEGA_GPU_EW_EX2; op <= OMEGA_GPU_EW_RC_REFUSE_JOIN_ONLY; op++)
+    for (int op = OMEGA_GPU_EW_EX2; op < OMEGA_GPU_EW_OP_END; op++)
         for (int mu = 0; mu <= 3; mu++) {
             OmegaBlackwellKernel kern; memset(&kern, 0, sizeof kern);
             omega_bw_ir_init(&g_p);

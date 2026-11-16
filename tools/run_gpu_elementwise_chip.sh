@@ -20,7 +20,7 @@
 # sealed receipt folder OUT_ROOT/FB1-CUT4-<sha>/ (default ~/workspace/evidence-out):
 #   receipt.json  machine-readable verdict per case      run.log    test output
 #   device.txt    kernel, driver, omega and physics shas  build.log  compiler output
-#   copies of the three source files the verdict depends on, SHA256SUMS over all
+#   copies of the source files the verdict depends on (bw_mufu_ftz.h: the flush model), SHA256SUMS over all
 # Run it through the heavy queue only (lanes.sh queue --heavy); never kill it.
 set -u
 cd "$(dirname "$0")/.." || exit 2
@@ -40,7 +40,7 @@ fi
 } > "$OUT/device.txt"
 ./build/gpu_elementwise_test --out "$OUT/receipt.json" > "$OUT/run.log" 2>&1
 rc=$?
-cp src/omega_gpu_elementwise_api.c src/omega_gpu_elementwise_api.h tests/gpu_elementwise_test.c "$OUT/"
+cp src/omega_gpu_elementwise_api.c src/omega_gpu_elementwise_api.h tests/gpu_elementwise_test.c tests/bw_mufu_ftz.h "$OUT/"
 (cd "$OUT" && sha256sum -- * > SHA256SUMS)
 tail -1 "$OUT/run.log"
 echo "FB1-CUT4 chip gate rc=$rc receipt=$OUT/receipt.json"

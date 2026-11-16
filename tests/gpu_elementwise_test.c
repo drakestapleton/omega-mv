@@ -184,13 +184,13 @@ static void record(Case c, FILE *out) {
 /* omega #462 flush probes. want is the host model (tests/bw_mufu_ftz.h: input flushed, IEEE function, result
  * flushed). 0 = violation, 1 = match, 2 = flushed at the FLT_MIN boundary (allowed only with `boundary`).
  * A zero, infinite or NaN want must come back exactly (NaN: any NaN). A normal want needs a normal result within
- * rel, so an unflushed subnormal is always a violation; with `boundary` a zero is also allowed when want is within
- * 2^-21 rel above FLT_MIN (MUFU is approximate, the model flushes a correctly rounded result). */
+ * rel, so an unflushed subnormal is always a violation; with `boundary` a zero of want's sign is also allowed when
+ * want is within 2^-21 rel above FLT_MIN (MUFU is approximate, the model flushes a correctly rounded result). */
 static int ftz_match(float got, float want, double rel, int boundary, double *scaled) {
     uint32_t g, w; memcpy(&g, &got, 4); memcpy(&w, &want, 4);
     if (isnan(want)) return isnan(got);
     if ((w & 0x7fffffffu) == 0u || isinf(want)) return g == w;
-    if (boundary && (g & 0x7fffffffu) == 0u && fabsf(want) < FLT_MIN * (1.0f + 0x1p-21f)) return 2;
+    if (boundary && (g & 0x7fffffffu) == 0u && ((g ^ w) & 0x80000000u) == 0u && fabsf(want) < FLT_MIN * (1.0f + 0x1p-21f)) return 2;
     if ((g & 0x7f800000u) == 0u || isinf(got) || isnan(got)) return 0;
     double s = fabs((double)got - (double)want) / (rel * fabs((double)want));
     if (scaled && s > *scaled) *scaled = s;
@@ -207,8 +207,10 @@ static float ieee_rsq(float x) { return 1.0f / sqrtf(x); }
  * The op's mutant must be caught by the same comparator. */
 static void ftz_probe(const char *name, OmegaGpuEwOp op, int (*fn)(uint32_t, const float *, float *, OmegaGpuEwInfo *),
                       float (*model)(float), float (*ieee)(float), const float *x, int n, int boundary, FILE *out) {
-    float *got = malloc((size_t)n * 4), *want = malloc((size_t)n * 4);
-    OmegaGpuEwInfo info;
+    /* zeroed so a run that fails before writing (device open, codegen) leaves defined words and info */
+    float *got = calloc((size_t)n, 4), *want = calloc((size_t)n, 4);
+    if (!got || !want) { printf("%s: out of memory\n", name); exit(2); }
+    OmegaGpuEwInfo info = {0};
     for (int i = 0; i < n; i++) want[i] = model(x[i]);
     Case c = { .name = name, .n = (size_t)n };
     c.rc = fn((uint32_t)n, x, got, &info);
@@ -250,7 +252,7 @@ static int chip(const char *out_path) {
                      "\"ex2_ftz\":\"tests/bw_mufu_ftz.h model; zero, inf, NaN exact; normal results normal and 1e-6 rel; zero allowed within 2^-21 rel above FLT_MIN\","
                      "\"rsq_ftz\":\"tests/bw_mufu_ftz.h model; zero, inf, NaN exact; normal results normal and 1e-6 rel\"},\"cases\":[");
     uint32_t seed = 0xfb1c0004u;
-    OmegaGpuEwInfo info;
+    OmegaGpuEwInfo info = {0};
 
     /* 1. EX2 probe, with a negative control on the comparison itself */
     {

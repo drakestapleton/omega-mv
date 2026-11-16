@@ -564,8 +564,8 @@ static void sweep(void) {
         sweep_bytes("attention", v, k.code, k.code_size);
         free(k.code);
     }
-    /* elementwise kernels, the reconvergence probes and the RSQ probe (the last op) */
-    for (int op = OMEGA_GPU_EW_EX2; op <= OMEGA_GPU_EW_RSQ; op++) {
+    /* every elementwise op: the kernels, the reconvergence probes and the MUFU probes */
+    for (int op = OMEGA_GPU_EW_EX2; op < OMEGA_GPU_EW_OP_END; op++) {
         OmegaBlackwellKernel k; memset(&k, 0, sizeof k);
         if (omega_gpu_elementwise_codegen_ir((OmegaGpuEwOp)op, 0, &g_prog, &k) != 0 || !k.code) { free(k.code); continue; }
         snprintf(v, sizeof v, "op%d", op);

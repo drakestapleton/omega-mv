@@ -1,11 +1,12 @@
 /* bw_mufu_ftz.h: the GB10 MUFU unit's flush-to-zero rule, shared by every host model of it (omega #462).
  *
- * MUFU (the SASS EX2 / RCP / RSQ unit) flushes a subnormal input and a subnormal result to a sign-preserving zero.
- * Chip-observed on GB10:
+ * The model assumes MUFU (the SASS EX2 / RCP / RSQ unit) flushes a subnormal input and a subnormal result to a
+ * sign-preserving zero. Chip-observed on GB10:
  *  - RCP result flush: the SwiGLU reciprocal 1 / (2^t + 1) for t in (126, 128) came back as +-0 on all 101 of 101
  *    differing elements (evidence OWN30B-L1G-PFGEMM-SWIGLU-FTZ-df9bd9c4, gpu_pfgemm_test host red test).
  *  - EX2 result flush: ex2(x) for x stepped by 1/8 from -151 came back as 0 on all 191 of 191 inputs whose IEEE result
- *    is subnormal (evidence/GPU-MUFU-FTZ-ebbb089a-20261116, gpu_elementwise_test ex2_ftz_probe).
+ *    is subnormal (evidence/GPU-MUFU-FTZ-20261116, gpu_elementwise_test ex2_ftz_probe, run by
+ *    tools/run_gpu_elementwise_chip.sh; first seen in evidence/GPU-MUFU-FTZ-ebbb089a-20261116).
  *  - RSQ input flush, with sign: rsq of each of the 8 subnormal inputs of both signs came back as +-inf, where IEEE
  *    gives a finite value (positive) or NaN (negative) (same evidence, rsq_ftz_probe).
  * Not chip-observed: the EX2 / RCP input flush and the sign of a flushed EX2 result (EX2 of a subnormal is 1 either way
