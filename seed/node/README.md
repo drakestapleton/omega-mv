@@ -2050,9 +2050,15 @@ second authority, journal compatibility in both directions, and address-space
 caps. Each prints MEASURED latency and seconds; the memory scenario prints
 MEASURED `memory-peak-kB` (VmHWM and VmPeak of `code-main`, `infer` and
 `tool`, sampled from `/proc` every 5 ms) and fails `memory-peak-measured`
-when no `code-main` sample was read. `memory-caps-fail-closed-then-pass` is
-NOT_RUN until a reviewed `prlimit` host word exists (omega-mv
-`seed/prlimit-host-word`); no host tool stands in for it. The driver prints
+when no `code-main` sample was read. `memory-caps-fail-closed-then-pass`
+runs that same one-objective job again under the `prlimit` host word
+(keyword 235, RLIMIT_AS): half the measured `code-main` VmPeak, then that
+peak, then double, up to 32 times the peak. A trial counts only when it ends
+with an explicit result and a consistent journal (at most one start). The
+check passes when one of those caps passes after at least one smaller cap
+failed. Each trial waits at most three times the measured uncapped run; past
+that is not a cap result. The one-job recording that host run uses is
+`seed/node/tests/ra40/final-selected.json`. The driver prints
 `PASS|FAIL|NOT_RUN NAME DETAIL` per check and `RELSUM pass=P fail=F
 not_run=N mode=MODE`; a node output it needs that is missing, unreadable or
 over capacity fails the next check, naming it.
