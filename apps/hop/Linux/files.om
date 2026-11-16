@@ -1,0 +1,1714 @@
+note Hop Linux file-list foundation. SPDX-License-Identifier: Apache-2.0
+note No timer or scan runs until explicitly requested. Symlink directories are never traversed.
+note File format HOPFIND1:64-byte header, then NUL-terminated absolute pathname byte strings.
+note CLI JSON follows RFC8259 section7 and UTF-8 validation RFC3629 sections3/4.
+note Invalid filesystem UTF-8 bytes use the reversible surrogateescape convention U+DC80..U+DCFF;
+note agents must retain these escapes when round-tripping such names. Ordinary Unicode is encoded normally.
+note Header0..7 magic; u64 little-endian at8 record count,16 partial-warning count,24 body bytes,
+note 32 attempted-directory count;40..63 reserved zero. A newline is an ordinary pathname byte.
+note Linux AArch64 stat and fcntl layouts are those of installed kernel UAPI headers.
+note Directory flags O_NOFOLLOW|O_DIRECTORY=49152 calc:a636669bf8335bbaf4882cbbea217a1bbb71e5037a035961710684bb41f1597c.
+note Temp flags O_NOFOLLOW|O_CREAT|O_EXCL|O_WRONLY=32961 calc:a20ca9614e5701d380af7d625ecc52fc9d081fc5f1c2dbce397542e1bb81313a.
+note Lock flags O_NOFOLLOW|O_CREAT|O_NONBLOCK|O_RDWR=34882 calc:55d3315f96faa89f2851ea6d22b07a20adda0081bf621917b0eca71661a94ceb.
+note Fixed4096 pathname buffers reflect the Linux pathname syscall boundary; directories and records grow.
+note All cache operations occur relative to an open cache directory, then the original working directory is restored.
+note This avoids imposing the compiler's4096-byte packed-rename boundary on a pair of long absolute paths.
+global ff_path uchar 4096
+global ff_cache uchar 4096
+global ff_home uchar 4096
+global ff_cwd uchar 4096
+global ff_tmp uchar 96
+global ff_hdr uchar 64
+global ff_buf uchar 65536
+global ff_stat uchar 128
+global ff_arg uchar 131072
+global ff_rename uchar 128
+global ff_nul uchar 1
+global ff_out uchar 4096
+global ff_on ulong 1
+global ff_queue uchar *
+global ff_qmeta ulong *
+global ff_seen ulong *
+global ff_oldseen ulong *
+global ff_data uchar *
+global ff_hits ulong *
+global ff_terms uchar *
+global ff_s ulong 32
+global ff_fd int 4
+note ff_s fields:0 path bytes,1 cache bytes,2 temp-name bytes,3 records,4 partial warnings,
+note 5 body bytes,6 attempted directories,7 queued dirs,8 queue bytes,9 seen count,10 seen slots,
+note 11 alarm threshold,12 alarm emitted,13 error,14 UI mode,15 loaded bytes,16 hits,
+note 17 term bytes,18 home bytes,19 cwd bytes,20 temp exists,21 leading status rows.
+text ff_magic "HOPFIND1"
+text ff_index "files.idx"
+text ff_lock "files.lock"
+text ff_tempstart ".files."
+text ff_dot "."
+text ff_reindexarg "--reindex"
+text ff_tmpend ".tmp"
+text ff_homekey "HOME="
+text ff_cachekey "XDG_CACHE_HOME="
+text ff_cachetail "/.cache"
+text ff_hoptail "/hop"
+text ff_hive "/work/hive"
+text ff_lanes "/work/lanes"
+text ff_alarmkey "HOP_INDEX_ALARM_ENTRIES="
+text ff_node "node_modules"
+text ff_target "target"
+text ff_build "build"
+text ff_dist "dist"
+text ff_py "__pycache__"
+text ff_venv "venv"
+text ff_dotvenv ".venv"
+text ff_site "site-packages"
+text ff_slash "/"
+text ff_partialmsg "Hop kept the file list it could read. Some folders were unavailable; coverage is partial.\n"
+text ff_failmsg "Hop could not replace its file list. The previous list has been kept.\n"
+text ff_cachemsg "Hop needs an absolute private cache folder and a valid home folder or explicit root.\n"
+text ff_busymsg "Hop's file list is already being built. The current list is unchanged.\n"
+text ff_badmsg "Hop's file list is damaged. Rebuild it before searching.\n"
+text ff_missingmsg "Hop has no file list yet. Use --reindex or choose Build file list.\n"
+text ff_memmsg "Hop could not grow its file-list memory.\n"
+text ff_alarmmsg "ALARM Hop file-list entries "
+text ff_alarmmid " crossed HOP_INDEX_ALARM_ENTRIES="
+text ff_alarmend "; indexing continues.\n"
+text ff_alarmbad "Hop: invalid HOP_INDEX_ALARM_ENTRIES; using the default alarm threshold.\n"
+text ff_buildrow "Build file list\n"
+text ff_rebuildrow "File list is damaged. Build it again\n"
+text ff_warnrow "Some folders could not be read. Results below are partial\n"
+text ff_emptyrow "No files match that search\n"
+text ff_hex "0123456789abcdef"
+
+fn ff_message message view uchar * to void
+k = write 2 message 0 len message
+end
+
+fn ff_reserve which ulong need ulong to bool
+r = long 0
+if eq which 0
+if gt need len ff_queue
+r = enlarge ff_queue add need add len ff_queue 4096
+end
+end
+if eq which 1
+if gt need len ff_qmeta
+r = enlarge ff_qmeta add need add len ff_qmeta 64
+end
+end
+if eq which 2
+r = enlarge ff_seen need
+end
+if eq which 3
+r = enlarge ff_oldseen need
+end
+if eq which 4
+if gt need len ff_data
+r = enlarge ff_data add need add len ff_data 65536
+end
+end
+if eq which 5
+if gt need len ff_hits
+r = enlarge ff_hits add need add len ff_hits 128
+end
+end
+if eq which 6
+if gt need len ff_terms
+r = enlarge ff_terms add need add len ff_terms 128
+end
+end
+if lt r 0
+put ff_s 13 1
+ff_message ff_memmsg
+ret false
+end
+ret true
+end
+
+fn ff_pathset source view uchar * to bool
+if ge len source len ff_path
+ret false
+end
+for i ulong len source bound 9223372036854775807
+c = get source i
+put ff_path i c
+end
+put ff_s 0 len source
+ret true
+end
+
+fn ff_pathadd source view uchar * to bool
+p = get ff_s 0
+if ge add p len source len ff_path
+ret false
+end
+for i ulong len source bound 9223372036854775807
+c = get source i
+put ff_path add p i c
+end
+put ff_s 0 add p len source
+ret true
+end
+
+fn ff_envpath n ulong to bool
+if ge n len ff_path
+ret false
+end
+for i ulong n bound 9223372036854775807
+c = get ha_env i
+put ff_path i c
+end
+put ff_s 0 n
+ret true
+end
+
+fn ff_normalize to bool
+n = get ff_s 0
+if eq n 0
+ret false
+end
+if ne get ff_path 0 47
+ret false
+end
+r = ulong 1
+w = ulong 1
+while lt r n bound 4096
+while lt r n bound 4096
+if ne get ff_path r 47
+break
+end
+r = add r 1
+end
+start = r
+while lt r n bound 4096
+if eq get ff_path r 47
+break
+end
+r = add r 1
+end
+size = sub r start
+if eq size 1
+if eq get ff_path start 46
+size = 0
+end
+end
+if eq size 2
+if eq get ff_path start 46
+if eq get ff_path add start 1 46
+if gt w 1
+w = sub w 1
+while gt w 1 bound 4096
+if eq get ff_path sub w 1 47
+break
+end
+w = sub w 1
+end
+if gt w 1
+w = sub w 1
+end
+end
+size = 0
+end
+end
+end
+if gt size 0
+if gt w 1
+put ff_path w 47
+w = add w 1
+end
+ff_pathmove start w size
+w = add w size
+end
+end
+put ff_s 0 w
+ret true
+end
+
+fn ff_pathmove source ulong dest ulong size ulong to void
+for i ulong size bound 4096
+c = get ff_path add source i
+put ff_path add dest i c
+end
+end
+
+fn ff_statword offset ulong size ulong to ulong
+v = ulong 0
+for i ulong size bound 8
+c = ulong get ff_stat add offset i
+v = or v shl c mul i 8
+end
+ret v
+end
+
+fn ff_mode to ulong
+ret and ff_statword 16 4 61440
+end
+
+fn ff_getstat follow bool to bool
+r = long 0
+if follow
+r = stat ff_path 0 get ff_s 0 ff_stat 0 len ff_stat
+else
+r = lstat ff_path 0 get ff_s 0 ff_stat 0 len ff_stat
+end
+ret ge r 0
+end
+
+fn ff_setup create bool to bool
+for i ulong 4
+put ff_fd i -1
+end
+put ff_s 20 0
+put ff_s 18 0
+n = ha_envget ff_homekey
+if gt n 0
+if eq get ha_env 0 47
+if ff_envpath ulong n
+if ff_normalize
+ff_savehome
+end
+end
+end
+end
+n = cwd ff_cwd 0 len ff_cwd
+if le n 0
+ret false
+end
+put ff_s 19 sub ulong n 1
+n = ha_envget ff_cachekey
+valid = false
+if gt n 0
+valid = eq get ha_env 0 47
+end
+if valid
+if not ff_envpath ulong n
+ret false
+end
+else
+if eq get ff_s 18 0
+ret false
+end
+ff_homepath
+if not ff_pathadd ff_cachetail
+ret false
+end
+end
+if not ff_pathadd ff_hoptail
+ret false
+end
+if not ff_normalize
+ret false
+end
+ff_savecache
+if create
+if not ff_mkdirs
+ret false
+end
+end
+ret true
+end
+
+fn ff_savehome to void
+n = get ff_s 0
+for i ulong n bound 4096
+c = get ff_path i
+put ff_home i c
+end
+put ff_s 18 n
+end
+
+fn ff_homepath to void
+n = get ff_s 18
+for i ulong n bound 4096
+c = get ff_home i
+put ff_path i c
+end
+put ff_s 0 n
+end
+
+fn ff_savecache to void
+n = get ff_s 0
+for i ulong n bound 4096
+c = get ff_path i
+put ff_cache i c
+end
+put ff_s 1 n
+end
+
+fn ff_cachepath to void
+n = get ff_s 1
+for i ulong n bound 4096
+c = get ff_cache i
+put ff_path i c
+end
+put ff_s 0 n
+end
+
+fn ff_mkdirs to bool
+n = get ff_s 0
+for i ulong add n 1 bound 4097
+sep = eq i n
+if not sep
+sep = eq get ff_path i 47
+end
+if and sep gt i 0
+r = makedir ff_path 0 i 448
+if and lt r 0 ne r -17
+ret false
+end
+end
+end
+if not ff_getstat false
+ret false
+end
+if ne ff_mode 16384
+ret false
+end
+if ne ff_statword 24 4 ulong getuid
+ret false
+end
+ret eq and ff_statword 16 4 63 0
+end
+
+fn ff_enter to bool
+old = int fopen ff_dot 0 len ff_dot 0 0
+if lt old 0
+ret false
+end
+put ff_fd 0 old
+ff_cachepath
+cache = int fopen ff_path 0 get ff_s 0 49152 0
+if lt cache 0
+put ff_s 24 ulong neg long cache
+ret false
+end
+put ff_fd 1 cache
+ret eq fchdir cache 0
+end
+
+fn ff_cleanup to void
+if ge get ff_fd 3 0
+k = fclose get ff_fd 3
+put ff_fd 3 -1
+end
+if ne get ff_s 20 0
+k = unlink ff_tmp 0 get ff_s 2
+put ff_s 20 0
+end
+if ge get ff_fd 2 0
+k = fclose get ff_fd 2
+put ff_fd 2 -1
+end
+if ge get ff_fd 0 0
+k = fchdir get ff_fd 0
+if ne k 0
+put ff_s 13 1
+end
+k = fclose get ff_fd 0
+put ff_fd 0 -1
+end
+if ge get ff_fd 1 0
+k = fclose get ff_fd 1
+put ff_fd 1 -1
+end
+end
+
+fn ff_temptext source view uchar * to void
+p = get ff_s 2
+for i ulong len source bound 96
+c = get source i
+put ff_tmp add p i c
+end
+put ff_s 2 add p len source
+end
+
+fn ff_tempnum value ulong to void
+digits = new uchar 20 0
+n = ulong 0
+v = value
+while true bound 20
+put digits n uchar add 48 rem v 10
+n = add n 1
+v = div v 10
+if eq v 0
+break
+end
+end
+p = get ff_s 2
+for i ulong n bound 20
+put ff_tmp add p i get digits sub sub n i 1
+end
+put ff_s 2 add p n
+end
+
+fn ff_startoutput to int
+lockfd = int fopen ff_lock 0 len ff_lock 34882 384
+if lt lockfd 0
+ret 1
+end
+put ff_fd 2 lockfd
+k = fstat lockfd ff_stat 0 len ff_stat
+if lt k 0
+ret 1
+end
+if ne ff_mode 32768
+ret 1
+end
+k = flock lockfd 6
+if eq k -11
+ret 3
+end
+if ne k 0
+ret 1
+end
+put ff_s 2 0
+ff_temptext ff_tempstart
+ff_tempnum ulong getpid
+ff_temptext ff_dot
+ff_tempnum ulong monons
+ff_temptext ff_tmpend
+fd = int fopen ff_tmp 0 get ff_s 2 32961 384
+if lt fd 0
+ret 1
+end
+put ff_s 20 1
+put ff_fd 3 fd
+ff_header
+ret ff_writeheader
+end
+
+fn ff_headernum offset ulong value ulong to void
+for i ulong 8
+c = uchar and shr value mul i 8 255
+put ff_hdr add offset i c
+end
+end
+
+fn ff_header to void
+for i ulong len ff_hdr
+put ff_hdr i 0
+end
+for i ulong len ff_magic
+put ff_hdr i get ff_magic i
+end
+ff_headernum 8 get ff_s 3
+ff_headernum 16 get ff_s 4
+ff_headernum 24 get ff_s 5
+ff_headernum 32 get ff_s 6
+end
+
+fn ff_writeheader to int
+p = ulong 0
+while lt p len ff_hdr bound 64
+k = write get ff_fd 3 ff_hdr p sub len ff_hdr p
+if eq k -4
+continue
+end
+if le k 0
+put ff_s 13 1
+ret 1
+end
+p = add p ulong k
+end
+ret 0
+end
+
+fn ff_dataword offset ulong to ulong
+v = ulong 0
+for i ulong 8
+c = ulong get ff_data add offset i
+v = or v shl c mul i 8
+end
+ret v
+end
+
+fn ff_load to int
+put ff_s 13 0
+put ff_s 15 0
+put ff_s 16 0
+put ff_s 4 0
+put ff_s 24 0
+if not ff_setup false
+ret 3
+end
+if not ff_enter
+ff_cleanup
+if eq get ff_s 24 2
+ret 1
+end
+ret 3
+end
+fd = int fopen ff_index 0 len ff_index 34816 0
+if lt fd 0
+ff_cleanup
+if eq fd -2
+ret 1
+end
+ret 3
+end
+put ff_fd 3 fd
+k = fstat fd ff_stat 0 len ff_stat
+if or lt k 0 ne ff_mode 32768
+ff_cleanup
+ret 2
+end
+while true bound 9223372036854775807
+n = read fd ff_buf 0 len ff_buf
+if eq n -4
+continue
+end
+if lt n 0
+ff_cleanup
+ret 3
+end
+if eq n 0
+break
+end
+if not ff_loadpart ulong n
+ff_cleanup
+ret 3
+end
+end
+ff_cleanup
+if ne get ff_s 13 0
+ret 3
+end
+if not ff_validate
+ret 2
+end
+ret 0
+end
+
+fn ff_loadpart size ulong to bool
+p = get ff_s 15
+if not ff_reserve 4 add p size
+ret false
+end
+for i ulong size bound 65536
+c = get ff_buf i
+put ff_data add p i c
+end
+put ff_s 15 add p size
+ret true
+end
+
+fn ff_validate to bool
+n = get ff_s 15
+if lt n 64
+ret false
+end
+for i ulong len ff_magic
+if ne get ff_data i get ff_magic i
+ret false
+end
+end
+for i ulong 24
+if ne get ff_data add i 40 0
+ret false
+end
+end
+if ne ff_dataword 24 sub n 64
+ret false
+end
+p = ulong 64
+count = ulong 0
+while lt p n bound 9223372036854775807
+if ne get ff_data p 47
+ret false
+end
+start = p
+while lt p n bound 4096
+if eq get ff_data p 0
+break
+end
+p = add p 1
+if ge sub p start 4096
+ret false
+end
+end
+if eq p n
+ret false
+end
+count = add count 1
+p = add p 1
+end
+if ne count ff_dataword 8
+ret false
+end
+put ff_s 3 count
+put ff_s 4 ff_dataword 16
+put ff_s 5 ff_dataword 24
+put ff_s 6 ff_dataword 32
+ret true
+end
+
+fn ff_termwhite c uchar to bool
+ret or eq c 32 and ge c 9 le c 13
+end
+
+fn ff_pathhas start ulong size ulong term ulong termsize ulong to bool
+if gt termsize size
+ret false
+end
+for i ulong add sub size termsize 1 bound 4096
+if ff_pathterm add start i term termsize
+ret true
+end
+end
+ret false
+end
+
+fn ff_pathterm start ulong term ulong size ulong to bool
+for j ulong size bound 9223372036854775807
+a = ha_lower get ff_data add start j
+b = ha_lower get ff_terms add term j
+if ne a b
+ret false
+end
+end
+ret true
+end
+
+fn ff_match start ulong size ulong to bool
+n = get ff_s 17
+p = ulong 0
+while lt p n bound 9223372036854775807
+while lt p n bound 9223372036854775807
+if not ff_termwhite get ff_terms p
+break
+end
+p = add p 1
+end
+lo = p
+while lt p n bound 9223372036854775807
+if ff_termwhite get ff_terms p
+break
+end
+p = add p 1
+end
+if gt p lo
+if not ff_pathhas start size lo sub p lo
+ret false
+end
+end
+end
+ret true
+end
+
+fn ff_search to bool
+put ff_s 16 0
+p = ulong 64
+n = get ff_s 15
+while lt p n bound 9223372036854775807
+start = p
+while ne get ff_data p 0 bound 4096
+p = add p 1
+end
+if ff_match start sub p start
+k = get ff_s 16
+if not ff_reserve 5 mul add k 1 2
+ret false
+end
+put ff_hits mul k 2 start
+put ff_hits add mul k 2 1 sub p start
+put ff_s 16 add k 1
+end
+p = add p 1
+end
+ret true
+end
+
+fn ff_rowbyte c uchar to void
+p = get lx_rn 0
+if eq p len lx_rows
+r = enlarge lx_rows add add p p 128
+if lt r 0
+put ff_s 13 1
+ret
+end
+end
+put lx_rows p c
+put lx_rn 0 add p 1
+end
+
+fn ff_rowtext value view uchar * to void
+for i ulong len value bound 4096
+ff_rowbyte get value i
+end
+end
+
+fn ff_rowpath start ulong size ulong to void
+for i ulong size bound 4096
+c = get ff_data add start i
+if eq c 10
+ff_rowbyte 92
+ff_rowbyte 110
+else
+if eq c 13
+ff_rowbyte 92
+ff_rowbyte 114
+else
+if eq c 9
+ff_rowbyte 92
+ff_rowbyte 116
+else
+if eq c 92
+ff_rowbyte 92
+ff_rowbyte 92
+else
+if or lt c 32 eq c 127
+ff_rowbyte 92
+ff_rowbyte 120
+ff_rowbyte get ff_hex shr c 4
+ff_rowbyte get ff_hex and c 15
+else
+ff_rowbyte c
+end
+end
+end
+end
+end
+end
+ff_rowbyte 10
+end
+
+fn ff_queryterms start ulong size ulong to bool
+if not ff_reserve 6 size
+ret false
+end
+for i ulong size bound 9223372036854775807
+c = get lx_query add start i
+put ff_terms i c
+end
+put ff_s 17 size
+ret true
+end
+
+fn ff_isfind to bool
+n = get lx_qn 0
+if lt n 4
+ret false
+end
+if ne ha_lower get lx_query 0 102
+ret false
+end
+if ne ha_lower get lx_query 1 105
+ret false
+end
+if ne ha_lower get lx_query 2 110
+ret false
+end
+if ne ha_lower get lx_query 3 100
+ret false
+end
+if eq n 4
+ret true
+end
+ret eq get lx_query 4 32
+end
+
+fn ff_query to int
+if not ff_isfind
+ret 0
+end
+start = ulong 4
+if gt get lx_qn 0 4
+start = 5
+end
+put lx_rn 0 0
+put lx_pick 0 0
+put ff_s 14 3
+put ff_s 21 0
+if not ff_queryterms start sub get lx_qn 0 start
+ret 1
+end
+loaded = ff_load
+if ne loaded 0
+if eq loaded 1
+put ff_s 14 1
+ff_rowtext ff_buildrow
+else
+if eq loaded 2
+put ff_s 14 1
+ff_rowtext ff_rebuildrow
+else
+ff_rowtext ff_failmsg
+end
+end
+ret 1
+end
+if not ff_search
+ff_rowtext ff_memmsg
+ret 1
+end
+if ne get ff_s 4 0
+ff_rowtext ff_warnrow
+put ff_s 21 1
+end
+if eq get ff_s 16 0
+ff_rowtext ff_emptyrow
+ret 1
+end
+put ff_s 14 2
+for i ulong get ff_s 16 bound 9223372036854775807
+ff_rowhit i
+end
+if eq get ff_s 21 1
+put lx_pick 0 1
+end
+ret 1
+end
+
+fn ff_rowhit index ulong to void
+p = get ff_hits mul index 2
+n = get ff_hits add mul index 2 1
+ff_rowpath p n
+end
+
+fn ff_activate to int
+mode = get ff_s 14
+if eq mode 1
+if eq ff_rebuild 0
+k = ff_query
+end
+ret 0
+end
+if ne mode 2
+ret 0
+end
+pick = get lx_pick 0
+if lt pick get ff_s 21
+ret 0
+end
+pick = sub pick get ff_s 21
+if ge pick get ff_s 16
+ret 0
+end
+p = get ff_hits mul pick 2
+n = get ff_hits add mul pick 2 1
+path = new uchar 4096 0
+for i ulong n bound 4096
+c = get ff_data add p i
+put path i c
+end
+ret ha_openfile part path 0 n
+end
+
+fn ff_partial to ulong
+ret get ff_s 4
+end
+
+fn ff_flush to bool
+p = ulong 0
+n = get ff_on 0
+while lt p n bound 4096
+k = write 1 ff_out p sub n p
+if eq k -4
+continue
+end
+if le k 0
+put ff_s 13 1
+ret false
+end
+p = add p ulong k
+end
+put ff_on 0 0
+ret true
+end
+
+fn ff_outbyte c uchar to void
+if eq get ff_on 0 len ff_out
+if not ff_flush
+ret
+end
+end
+p = get ff_on 0
+put ff_out p c
+put ff_on 0 add p 1
+end
+
+fn ff_jsonhex scalar ulong to void
+ff_outbyte 92
+ff_outbyte 117
+ff_outbyte get ff_hex and shr scalar 12 15
+ff_outbyte get ff_hex and shr scalar 8 15
+ff_outbyte get ff_hex and shr scalar 4 15
+ff_outbyte get ff_hex and scalar 15
+end
+
+fn ff_scalar pos ulong endpos ulong to ulong
+put ff_s 25 1
+c = ulong get ff_data pos
+if lt c 128
+ret c
+end
+count = ulong 0
+value = ulong 0
+if and ge c 194 le c 223
+count = 2
+value = and c 31
+end
+if and ge c 224 le c 239
+count = 3
+value = and c 15
+end
+if and ge c 240 le c 244
+count = 4
+value = and c 7
+end
+if or eq count 0 gt add pos count endpos
+ret add 56320 c
+end
+for i ulong sub count 1 bound 3
+d = ulong get ff_data add add pos i 1
+if or lt d 128 gt d 191
+ret add 56320 c
+end
+value = or shl value 6 and d 63
+end
+if and eq count 2 lt value 128
+ret add 56320 c
+end
+if and eq count 3 lt value 2048
+ret add 56320 c
+end
+if and eq count 4 lt value 65536
+ret add 56320 c
+end
+if or and ge value 55296 le value 57343 gt value 1114111
+ret add 56320 c
+end
+put ff_s 25 count
+ret value
+end
+
+fn ff_jsonpath start ulong size ulong to void
+ff_outbyte 34
+p = start
+endpos = add start size
+while lt p endpos bound 4096
+v = ff_scalar p endpos
+if or eq v 34 eq v 92
+ff_outbyte 92
+ff_outbyte uchar v
+else
+if or lt v 32 ge v 127
+if le v 65535
+ff_jsonhex v
+else
+partv = sub v 65536
+ff_jsonhex add 55296 shr partv 10
+ff_jsonhex add 56320 and partv 1023
+end
+else
+ff_outbyte uchar v
+end
+end
+p = add p get ff_s 25
+end
+ff_outbyte 34
+end
+
+fn ff_json to int
+put ff_on 0 0
+ff_outbyte 91
+for i ulong get ff_s 16 bound 9223372036854775807
+if ne i 0
+ff_outbyte 44
+end
+ff_jsonhit i
+end
+ff_outbyte 93
+ff_outbyte 10
+if not ff_flush
+ret 1
+end
+if ne get ff_s 13 0
+ret 1
+end
+ret 0
+end
+
+fn ff_jsonhit index ulong to void
+p = get ff_hits mul index 2
+n = get ff_hits add mul index 2 1
+ff_jsonpath p n
+end
+
+fn ff_cliterms to bool
+put ff_s 17 0
+if le argcnt 2
+ret true
+end
+n = argread 2 ff_arg 0 len ff_arg
+if lt n 0
+ret false
+end
+if not ff_reserve 6 ulong n
+ret false
+end
+for i ulong ulong n bound 131072
+c = get ff_arg i
+put ff_terms i c
+end
+put ff_s 17 ulong n
+ret true
+end
+
+fn ff_cli mode int to int
+if eq mode 0
+ret ff_rebuild
+end
+if gt argcnt 3
+ret 2
+end
+if not ff_cliterms
+ret 1
+end
+loaded = ff_load
+if ne loaded 0
+if eq loaded 1
+ff_message ff_missingmsg
+else
+if eq loaded 2
+ff_message ff_badmsg
+else
+ff_message ff_failmsg
+end
+end
+ret 1
+end
+if not ff_search
+ret 1
+end
+if ne get ff_s 4 0
+ff_message ff_partialmsg
+end
+ret ff_json
+end
+
+fn ff_record to bool
+n = get ff_s 0
+p = ulong 0
+while lt p n bound 4096
+k = write get ff_fd 3 ff_path p sub n p
+if eq k -4
+continue
+end
+if le k 0
+put ff_s 13 1
+ret false
+end
+p = add p ulong k
+end
+k = write get ff_fd 3 ff_nul 0 1
+if ne k 1
+put ff_s 13 1
+ret false
+end
+put ff_s 3 add get ff_s 3 1
+put ff_s 5 add get ff_s 5 add n 1
+ff_alarm
+ret true
+end
+
+fn ff_printnum value ulong to void
+b = new uchar 20 0
+v = value
+n = ulong 20
+while true bound 20
+n = sub n 1
+put b n uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+k = write 2 b n sub 20 n
+end
+
+fn ff_alarm to void
+if ne get ff_s 12 0
+ret
+end
+if le get ff_s 3 get ff_s 11
+ret
+end
+put ff_s 12 1
+ff_message ff_alarmmsg
+ff_printnum get ff_s 3
+ff_message ff_alarmmid
+ff_printnum get ff_s 11
+ff_message ff_alarmend
+end
+
+fn ff_alarmsetting to void
+put ff_s 11 1000000
+n = ha_envget ff_alarmkey
+if lt n 0
+ret
+end
+if eq n 0
+ff_message ff_alarmbad
+ret
+end
+v = ulong 0
+for i ulong ulong n bound 131072
+c = get ha_env i
+if or lt c 48 gt c 57
+ff_message ff_alarmbad
+ret
+end
+d = ulong sub c 48
+if gt v div sub 18446744073709551615 d 10
+ff_message ff_alarmbad
+ret
+end
+v = add mul v 10 d
+end
+put ff_s 11 v
+end
+
+fn ff_seenplace device ulong inode ulong cap ulong to ulong
+slot = rem xor device inode cap
+while ne get ff_seen add mul slot 3 2 0 bound 9223372036854775807
+if eq get ff_seen mul slot 3 device
+if eq get ff_seen add mul slot 3 1 inode
+ret slot
+end
+end
+slot = rem add slot 1 cap
+end
+ret slot
+end
+
+fn ff_seengrow to bool
+oldcap = get ff_s 10
+cap = ulong 64
+if gt oldcap 0
+cap = mul oldcap 2
+end
+if not ff_reserve 3 mul oldcap 3
+ret false
+end
+for i ulong mul oldcap 3 bound 9223372036854775807
+c = get ff_seen i
+put ff_oldseen i c
+end
+if not ff_reserve 2 mul cap 3
+ret false
+end
+for i ulong cap bound 9223372036854775807
+put ff_seen add mul i 3 2 0
+end
+for i ulong oldcap bound 9223372036854775807
+if ne get ff_oldseen add mul i 3 2 0
+ff_rehash i cap
+end
+end
+put ff_s 10 cap
+ret true
+end
+
+fn ff_rehash oldslot ulong cap ulong to void
+device = get ff_oldseen mul oldslot 3
+inode = get ff_oldseen add mul oldslot 3 1
+slot = ff_seenplace device inode cap
+put ff_seen mul slot 3 device
+put ff_seen add mul slot 3 1 inode
+put ff_seen add mul slot 3 2 1
+end
+
+fn ff_remember device ulong inode ulong to int
+if ge mul get ff_s 9 2 get ff_s 10
+if not ff_seengrow
+ret -1
+end
+end
+slot = ff_seenplace device inode get ff_s 10
+if ne get ff_seen add mul slot 3 2 0
+ret 0
+end
+put ff_seen mul slot 3 device
+put ff_seen add mul slot 3 1 inode
+put ff_seen add mul slot 3 2 1
+put ff_s 9 add get ff_s 9 1
+ret 1
+end
+
+fn ff_homesuffix suffix view uchar * to bool
+n = get ff_s 18
+if eq n 0
+ret false
+end
+if ne get ff_s 0 add n len suffix
+ret false
+end
+for i ulong n bound 4096
+if ne get ff_path i get ff_home i
+ret false
+end
+end
+for i ulong len suffix bound 4096
+if ne get ff_path add n i get suffix i
+ret false
+end
+end
+ret true
+end
+
+fn ff_excludedpath to bool
+if ff_skipcurrent
+ret true
+end
+if eq get ff_s 0 get ff_s 1
+same = true
+for i ulong get ff_s 1 bound 4096
+if ne get ff_path i get ff_cache i
+same = false
+break
+end
+end
+if same
+ret true
+end
+end
+if ff_homesuffix ff_hive
+ret true
+end
+ret ff_homesuffix ff_lanes
+end
+
+fn ff_enqueue to bool
+if ff_excludedpath
+ret true
+end
+if not ff_getstat false
+ff_warn
+ret true
+end
+if ne ff_mode 16384
+ff_warn
+ret true
+end
+device = ff_statword 0 8
+inode = ff_statword 8 8
+newdir = ff_remember device inode
+if lt newdir 0
+ret false
+end
+if eq newdir 0
+ret true
+end
+q = get ff_s 7
+p = get ff_s 8
+n = get ff_s 0
+if not ff_reserve 0 add p n
+ret false
+end
+if not ff_reserve 1 mul add q 1 4
+ret false
+end
+ff_queuecopy p n
+put ff_qmeta mul q 4 p
+put ff_qmeta add mul q 4 1 n
+put ff_qmeta add mul q 4 2 device
+put ff_qmeta add mul q 4 3 inode
+put ff_s 7 add q 1
+put ff_s 8 add p n
+ret ff_record
+end
+
+fn ff_queuecopy dest ulong size ulong to void
+for i ulong size bound 4096
+c = get ff_path i
+put ff_queue add dest i c
+end
+end
+
+fn ff_queuepath index ulong to void
+p = get ff_qmeta mul index 4
+n = get ff_qmeta add mul index 4 1
+for i ulong n bound 4096
+c = get ff_queue add p i
+put ff_path i c
+end
+put ff_s 0 n
+end
+
+fn ff_warn to void
+put ff_s 4 add get ff_s 4 1
+end
+
+fn ff_skipname pos ulong size ulong to bool
+b = new uchar 4096 0
+if ge size len b
+ret true
+end
+for i ulong size bound 4096
+put b i get ff_buf add pos i
+end
+ret ff_skipvalue part b 0 size
+end
+
+fn ff_skipcurrent to bool
+b = new uchar 4096 0
+n = get ff_s 0
+start = n
+while gt start 0 bound 4096
+if eq get ff_path sub start 1 47
+break
+end
+start = sub start 1
+end
+size = sub n start
+for i ulong size bound 4096
+put b i get ff_path add start i
+end
+ret ff_skipvalue part b 0 size
+end
+
+fn ff_equal a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+for i ulong len a bound 4096
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn ff_skipvalue value view uchar * to bool
+if eq len value 0
+ret false
+end
+if eq get value 0 46
+ret true
+end
+if ff_equal value ff_node
+ret true
+end
+if ff_equal value ff_target
+ret true
+end
+if ff_equal value ff_build
+ret true
+end
+if ff_equal value ff_dist
+ret true
+end
+if ff_equal value ff_py
+ret true
+end
+if ff_equal value ff_venv
+ret true
+end
+if ff_equal value ff_dotvenv
+ret true
+end
+ret ff_equal value ff_site
+end
+
+fn ff_childpath dir ulong pos ulong size ulong to bool
+ff_queuepath dir
+base = get ff_s 0
+extra = ulong 1
+if eq base 1
+extra = 0
+end
+if ge add add base extra size len ff_path
+ff_warn
+ret false
+end
+if ne extra 0
+put ff_path base 47
+end
+for i ulong size bound 65536
+c = get ff_buf add pos i
+put ff_path add add base extra i c
+end
+put ff_s 0 add add base extra size
+ret true
+end
+
+fn ff_entry dir ulong pos ulong endpos ulong to bool
+start = add pos 19
+n = ulong 0
+while lt add start n endpos bound 65536
+if eq get ff_buf add start n 0
+break
+end
+n = add n 1
+end
+if eq add start n endpos
+ff_warn
+ret true
+end
+if eq n 0
+ret true
+end
+if eq get ff_buf start 46
+if eq n 1
+ret true
+end
+if eq n 2
+if eq get ff_buf add start 1 46
+ret true
+end
+end
+end
+if not ff_childpath dir start n
+ret true
+end
+if not ff_getstat false
+ff_warn
+ret true
+end
+kind = ff_mode
+if eq kind 16384
+if ff_skipname start n
+ret true
+end
+ret ff_enqueue
+end
+if or eq kind 32768 eq kind 40960
+ret ff_record
+end
+ret true
+end
+
+fn ff_dirbytes dir ulong size ulong to bool
+p = ulong 0
+while lt p size bound 65536
+if lt sub size p 20
+ff_warn
+ret true
+end
+low = ulong get ff_buf add p 16
+high = ulong get ff_buf add p 17
+rec = add low shl high 8
+if or lt rec 20 gt add p rec size
+ff_warn
+ret true
+end
+if not ff_entry dir p add p rec
+ret false
+end
+p = add p rec
+end
+ret true
+end
+
+fn ff_scandir dir ulong to bool
+ff_queuepath dir
+fd = int fopen ff_path 0 get ff_s 0 49152 0
+put ff_s 6 add get ff_s 6 1
+if lt fd 0
+ff_warn
+ret true
+end
+k = fstat fd ff_stat 0 len ff_stat
+if lt k 0
+k = fclose fd
+ff_warn
+ret true
+end
+if not ff_samedir dir
+k = fclose fd
+ff_warn
+ret true
+end
+ok = true
+while true bound 9223372036854775807
+n = getdnts fd ff_buf 0 len ff_buf
+if eq n -4
+continue
+end
+if lt n 0
+ff_warn
+break
+end
+if eq n 0
+break
+end
+if not ff_dirbytes dir ulong n
+ok = false
+break
+end
+end
+k = fclose fd
+ret ok
+end
+
+fn ff_samedir dir ulong to bool
+if ne ff_mode 16384
+ret false
+end
+if ne ff_statword 0 8 get ff_qmeta add mul dir 4 2
+ret false
+end
+ret eq ff_statword 8 8 get ff_qmeta add mul dir 4 3
+end
+
+fn ff_rootarg source view uchar * to bool
+if eq len source 0
+ret false
+end
+if eq get source 0 47
+if not ff_pathset source
+ret false
+end
+else
+n = get ff_s 19
+for i ulong n bound 4096
+c = get ff_cwd i
+put ff_path i c
+end
+put ff_s 0 n
+if not ff_pathadd ff_slash
+ret false
+end
+if not ff_pathadd source
+ret false
+end
+end
+ret ff_normalize
+end
+
+fn ff_roots to bool
+if not ff_rootargs
+if eq get ff_s 18 0
+put ff_s 13 1
+ret false
+end
+ff_homepath
+ret ff_enqueue
+end
+for i ulong sub ulong argcnt 2 bound 9223372036854775807
+n = argread add i 2 ff_arg 0 len ff_arg
+if lt n 0
+ff_warn
+else
+if ff_rootargbuf ulong n
+if not ff_enqueue
+ret false
+end
+else
+ff_warn
+end
+end
+end
+ret true
+end
+
+fn ff_rootargs to bool
+if le argcnt 2
+ret false
+end
+b = new uchar 16 0
+n = argread 1 b 0 len b
+if ne n long len ff_reindexarg
+ret false
+end
+for i ulong len ff_reindexarg
+if ne get b i get ff_reindexarg i
+ret false
+end
+end
+ret true
+end
+
+fn ff_rootargbuf size ulong to bool
+local = new uchar 4096 0
+if ge size len local
+ret false
+end
+for j ulong size bound 4096
+put local j get ff_arg j
+end
+ret ff_rootarg part local 0 size
+end
+
+fn ff_publish to bool
+ff_header
+k = fseek get ff_fd 3 0 0
+if ne k 0
+ret false
+end
+if ne ff_writeheader 0
+ret false
+end
+if ne fsync get ff_fd 3 0
+ret false
+end
+put ff_rename 0 2
+put ff_rename 1 0
+n = get ff_s 2
+put ff_rename 2 uchar n
+put ff_rename 3 0
+for i ulong n bound 96
+c = get ff_tmp i
+put ff_rename add i 4 c
+end
+p = add n 4
+put ff_rename p uchar len ff_index
+put ff_rename add p 1 0
+for i ulong len ff_index
+put ff_rename add add p 2 i get ff_index i
+end
+k = renames ff_rename 0 add add p 2 len ff_index 0
+if ne k 0
+ret false
+end
+put ff_s 20 0
+ret true
+end
+
+fn ff_rebuild to int
+for i ulong 32
+put ff_s i 0
+end
+if not ff_setup true
+ff_message ff_cachemsg
+ff_cleanup
+ret 1
+end
+if not ff_enter
+ff_message ff_failmsg
+ff_cleanup
+ret 1
+end
+started = ff_startoutput
+if ne started 0
+if eq started 3
+ff_message ff_busymsg
+else
+ff_message ff_failmsg
+end
+ff_cleanup
+ret started
+end
+ff_alarmsetting
+ok = ff_roots
+di = ulong 0
+while and ok lt di get ff_s 7 bound 9223372036854775807
+ok = ff_scandir di
+di = add di 1
+end
+if ok
+ok = ff_publish
+end
+if not ok
+put ff_s 13 1
+end
+ff_cleanup
+if ne get ff_s 13 0
+ff_message ff_failmsg
+ret 1
+end
+if ne get ff_s 4 0
+ff_message ff_partialmsg
+end
+ret 0
+end
