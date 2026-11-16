@@ -117,7 +117,7 @@ What each hub service needs if the Pi itself runs Aienux (INFERRED, high, from t
 
 Recommended role (INFERRED, medium): the Pi stays the **always-on Linux hub** until a second always-on machine can carry the coordination service and the websites. Native Aienux on the Pi stays a short attended window, as today. The reason is physical: one board cannot run two operating systems at once, and nothing else currently provides those services.
 
-Gateway (a decision for Drake; no code exists): a machine that speaks HTTPS to people and the signed UDP transport to the AienOS machines. Candidates: the hub (always on, already the tailnet anchor) or the Spark (always on, already the iMac's boot and chat server). The 2026-10-20 draft also named the MacBook; it is dropped here because it is not always on and is the operator's own machine (it writes and reads back the iMac's boot sticks, `docs/IMAC_AIENOS_MAP.md` section 5). A gateway also needs a roster of many peers; `aienos_sec` accepts one, and the owner-issued identities of `native/omega/netid/` (above) are not on `main`.
+Gateway (a decision for Drake; no gateway code on `main`): a machine that speaks HTTPS to people and the signed machine-to-machine transport (NOT BUILT, above) to the AienOS machines. Candidates: the hub (always on, already the tailnet anchor) or the Spark (always on, already the iMac's boot and chat server). The 2026-10-20 draft also named the MacBook; it is dropped here because it is not always on and is the operator's own machine (it writes and reads back the iMac's boot sticks, `docs/IMAC_AIENOS_MAP.md` section 5). A gateway also needs a roster of many peers; on `main`, `aienos_sec` accepts one, and the owner-issued identities of `native/omega/netid/` (above) are not on `main`. Not on `main`: branch `feat/aienos-interplane-join` (head `5af5ac7d`, 2026-10-20, ledger L263) has a C design for exactly this, an owner-signed roster of up to 15 machines with a gateway that is a roster member with platform `hub`, plus a signed relay; it passed a 5-VM QEMU gate (Spark, Pi and Mac in one roster, a partitioned link relayed through the Pi) and was never run on hardware, and its gateway rendezvous has hosted tests only. Its design names the hub as the gateway. It is frozen-C feature code, so it is a reference for the Omega transport, not a landing candidate (`docs/IMAC_AIENOS_MAP.md` section 5).
 
 ## 5. Ordered path
 
@@ -132,7 +132,7 @@ Notation: **[H]** host or QEMU only; **[A]** needs an attended one-time boot of 
 7. [H][A] Wall clock and a fan and thermal rule (PI13, PI14), so a native window can be long.
 8. [H] Wi-Fi, Bluetooth, GPIO/I2C/SPI, HDMI (PI15 to PI18): seeded-Omega models and a documentation record already exist on `hive/t_0adfd822-pi5-models` (section 3b); they need a fresh review and landing before any chip code. Firmware loads only with Drake's go.
 9. [H] A native TCP stack, then a TLS 1.3 server role (shared with the Spark; omega-mv `main` already has HTTP/1.1 units and a TLS 1.3 client, section 4), then the coordination protocol, one part at a time.
-10. [O] Decide the gateway machine and the second always-on machine (section 4). Until then the Pi's native windows stay short.
+10. [O] Decide the gateway machine and the second always-on machine (section 4; the design on `feat/aienos-interplane-join` names the hub). Until then the Pi's native windows stay short.
 
 ## 6. Operator steps (Drake only)
 
