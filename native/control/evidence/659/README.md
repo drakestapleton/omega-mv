@@ -54,7 +54,9 @@ chmod +x "$OUT/reuse.elf"
 "$QEMU" "$OUT/reuse.elf"
 ```
 
-Expected final output, respectively:
+Expected final output of the 2026-10-23 source, respectively (the tests have
+since gained assertions; the current counts are in
+[../replay-20261116/README.md](../replay-20261116/README.md)):
 
 ```text
 action checks=219 000
@@ -93,7 +95,7 @@ record as its own independent authority-facts argument must remain refused.
 
 ## What remains
 
-Final functional source: `baa1587fc1542177595b90dccf36f98b1e294b0a`.
+2026-10-23 final functional source: `baa1587fc1542177595b90dccf36f98b1e294b0a`.
 The clean-source replay in [qualified/receipt.json](qualified/receipt.json)
 records 367 passing assertions, three detected always-accept stubs, ten
 detected compiled guard mutants and three expected compiler refusals. Each
