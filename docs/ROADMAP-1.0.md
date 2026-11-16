@@ -266,7 +266,8 @@ Acceptance:
 
 Current: a module imports one exported function by the SHA-256 of that module's source bytes.
 The local store (`spec/omegese-modules.md`, `docs/one_layer/FR3-IMPORT-DIGEST.md`) resolves the
-digest for the compiler pin in `seed/out/omc.sha256`, the profile and the target. A missing digest
+digest for the `COMPILER_SHA256` argument (which `build` checks against the compiler file it loads),
+the profile and the target; the FR-3 gate passes the digest from `seed/out/omc.sha256`. A missing digest
 and a digest that does not match the stored bytes fail closed. OM-2 `export fn` marks the visible
 entry. Capacity:
 omc: no per-unit table capacity since 2026-11-11 (OMEGESE 9.6; 50,000 functions in `seed/omc/gate-nocaps.sh`); om4 (compiles `omc.om`): 4096 (`seed/rung4/gate4.sh` 7b). Owners: #621, #648, #631.

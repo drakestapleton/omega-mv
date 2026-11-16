@@ -32,12 +32,12 @@ digest of different bytes is refused before a module is published.
 ```
 
 `seed/omega-from-seed.sh` writes that line from the compiler it just built.
-`build` takes those 64 digits as `COMPILER_SHA256` and checks them against
-the compiler file it loads, and the store key binds them. An import
-therefore resolves only for the compiler the sidecar names. Replacing
-`seed/out/omc` without updating the sidecar, or the reverse, makes
-`sha256sum -c seed/out/omc.sha256` fail, and a module built under the other
-pin does not resolve.
+`build` takes a `COMPILER_SHA256` argument, checks it against the compiler
+file it loads, and the store key binds it. `ommod` does not read the
+sidecar itself: `seed/modules/fr3-gate.sh` passes the sidecar's 64 digits
+as that argument after `sha256sum -c seed/out/omc.sha256` succeeds. An
+import therefore resolves only for the compiler digest the caller passed,
+and a module built under another compiler digest does not resolve.
 
 The import digest does not replace the sidecar, and the sidecar does not
 replace the import digest. `.sha256` sidecars elsewhere in the tree (the
@@ -58,6 +58,12 @@ spaces, path. They are not store keys.
 - `seed/modules/fr3/missing.om` names a digest that is not in the store and
   is refused with `digest-missing`; the store holds the same files before and
   after the refused build.
+- `build` with a source digest that does not match the source file, and
+  `build` with a `COMPILER_SHA256` that does not match the compiler file,
+  are each refused with `digest-mismatch`.
+- Linking after the referenced module file is removed from the store
+  (its `KEY.ref` still present) is refused with `digest-missing`, and the
+  link output is not created.
 
 Each unit prints `PASS <unit>`; a failed unit prints `FAIL <unit>` with what
 it saw to stderr and the gate exits 1.
