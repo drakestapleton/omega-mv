@@ -1,0 +1,924 @@
+note SPDX-License-Identifier: Apache-2.0
+note tools/build.om: build synapse-board from src/*.om with the pinned seeded omc (replaces build.sh).
+note It is an OM-2 program composed after the pinned omega-mv's om/tls/sha2.om (SHA-256 of the compiler):
+note   mkdir -p build
+note   { printf 'om2\n'; cat "$OMEGA_SRC/om/tls/sha2.om" tools/build.om; } | "$OMEGA_SRC/seed/out/omc" > build/build
+note   chmod 755 build/build
+note usage: build OMEGA_SRC OUT   (run from the synapse-board repository root)
+note   OMEGA_SRC  checkout of omega-mv at the commit in omega.pin; its seed/out/omc must have the pinned sha256
+note   OUT        output binary; OUT.unit.om keeps the composed unit, OUT.err omc's diagnostics; missing
+note              directories above OUT are created
+note The unit is the om2 line, then OMEGA_SRC seed/json/json.om, seed/net/http.om and seed/net/notls.om,
+note then every src/*.om in byte order of its name. OMEGA_SRC's commit is read from its .git directory
+note (or the gitdir named by a .git file): HEAD, the loose ref it names, or that ref's packed-refs line.
+note Exit: 0 built; 1 omc rejected the unit (OUT removed, never run); 64 usage or not run from the
+note repository root; 65 omega.pin malformed, OMEGA_SRC not at the pinned commit, omc missing or not the
+note pinned compiler, an input that cannot be read, or an output that cannot be written.
+
+text tuse "usage: build OMEGA_SRC OUT (run from the synapse-board repository root)\n"
+text tme "build: "
+text tnl "\n"
+text tpin "omega.pin"
+text tsrc "src"
+text tdotom ".om"
+text tgit "/.git"
+text thead "/HEAD"
+text tslash "/"
+text tpacked "/packed-refs"
+text tcommon "/commondir"
+text tomc "/seed/out/omc"
+text tjson "/seed/json/json.om"
+text thttp "/seed/net/http.om"
+text tnotls "/seed/net/notls.om"
+text tunit ".unit.om"
+text ttmp ".tmp"
+text terr ".err"
+text tom2 "om2\n"
+text tpre1 "aien-dev/omega-mv@"
+text tpre2 "omc-sha256 "
+text tref "ref: "
+text tgd "gitdir: "
+text emroot "omega.pin not found; run from the synapse-board repository root"
+text empin "omega.pin malformed"
+text emhead "cannot read the commit of OMEGA_SRC from its .git"
+text emrev "OMEGA_SRC is at "
+text emwant ", omega.pin wants "
+text emomc "omc missing or unreadable: "
+text emsha "omc sha256 "
+text emsrc "cannot list src/"
+text emfull "src/ holds more .om names than the name table (1024 names, 65536 bytes: gno, gnl, gnm); grow them"
+text emread "cannot read "
+text emwrite "cannot write "
+text emrej "omc rejected "
+text embuilt "built "
+text hexd "0123456789abcdef"
+
+global gsrc uchar 4096
+global gout uchar 4096
+global gl ulong 6
+note gl: 0 OMEGA_SRC length, 1 OUT length, 2 path length, 3 git dir length, 4 bytes used in gnm,
+note 5 path overflow (gp would pass 8191 bytes: openp then refuses with -36, ENAMETOOLONG)
+global gp uchar 8192
+global gdir uchar 8192
+global gbuf uchar 65536
+global gpin uchar 4096
+global gpinl ulong 1
+global gwant uchar 40
+global gwomc uchar 64
+global ghave uchar 40
+global gsha uchar 64
+global gline uchar 4096
+global gpk uchar 16384
+global gst uchar 4
+global gdn uchar 32768
+global gnm uchar 65536
+global gno ulong 1024
+global gnl ulong 1024
+global gnc ulong 2
+note gnc: 0 names collected, 1 set when the name table was full
+
+note ======== diagnostics
+fn say s view uchar * to void
+r = write 2 tme 0 len tme
+r = write 2 s 0 len s
+end
+fn sayl s view uchar * to void
+say s
+r = write 2 tnl 0 len tnl
+end
+fn saypath to void
+r = write 2 gp 0 get gl 2
+r = write 2 tnl 0 len tnl
+end
+
+note ======== the path scratch gp
+fn pclr to void
+put gl 2 0
+put gl 5 0
+end
+fn pc c uchar to void
+n = get gl 2
+if lt n 8191
+put gp n c
+put gl 2 add n 1
+else
+put gl 5 1
+end
+end
+fn pt s view uchar * to void
+for i ulong len s
+pc get s i
+end
+end
+fn psrc to void
+for i ulong get gl 0
+pc get gsrc i
+end
+end
+fn pout to void
+for i ulong get gl 1
+pc get gout i
+end
+end
+fn pdir to void
+for i ulong get gl 3
+pc get gdir i
+end
+end
+note pname: append the i-th collected src/ name
+fn pname i ulong to void
+o = get gno i
+for k ulong get gnl i
+pc get gnm add o k
+end
+end
+fn openp flags ulong mode ulong to long
+if ne get gl 5 0
+ret -36
+end
+ret fopen gp 0 get gl 2 int flags int mode
+end
+note mkparents: create each missing directory above OUT (like mkdir -p of its dirname); an existing one is kept
+fn mkparents to void
+pclr
+for i ulong get gl 1
+c = get gout i
+if and eq c 47 gt i 0
+r = makedir gp 0 get gl 2 493
+end
+pc c
+end
+end
+
+note ======== small files: rd reads gp into gline (at most 4095 bytes); byte count or negative
+fn rdline to long
+fd = openp 524288 0
+if lt fd 0
+ret fd
+end
+p = ulong 0
+for it ulong 4096
+if ge p 4095
+break
+end
+r = read int fd gline p sub 4095 p
+if lt r 0
+if ne r -4
+c = fclose int fd
+ret r
+end
+else
+if eq r 0
+break
+end
+p = add p ulong r
+end
+end
+c = fclose int fd
+if ge p 4095
+ret -27
+end
+ret long p
+end
+
+note ======== omega.pin: line 1 aien-dev/omega-mv@SHA40, line 2 omc-sha256 HEX64
+fn ishex c uchar to bool
+ret or and ge c 48 le c 57 and ge c 97 le c 102
+end
+fn pinload to bool
+pclr
+pt tpin
+fd = openp 524288 0
+if lt fd 0
+ret false
+end
+r = read int fd gpin 0 4096
+c = fclose int fd
+if or lt r 0 ge r 4096
+put gpinl 0 4096
+ret true
+end
+put gpinl 0 ulong r
+ret true
+end
+fn pinparse to bool
+n = get gpinl 0
+a = len tpre1
+b = len tpre2
+want = add add add a 41 add b 64 1
+if ne n want
+ret false
+end
+for i ulong a
+if ne get gpin i get tpre1 i
+ret false
+end
+end
+for i ulong 40
+c = get gpin add a i
+if not ishex c
+ret false
+end
+put gwant i c
+end
+if ne get gpin add a 40 10
+ret false
+end
+s = add a 41
+for i ulong b
+if ne get gpin add s i get tpre2 i
+ret false
+end
+end
+s = add s b
+for i ulong 64
+c = get gpin add s i
+if not ishex c
+ret false
+end
+put gwomc i c
+end
+ret eq get gpin add s 64 10
+end
+
+note ======== OMEGA_SRC's commit, read from its git directory
+note gitdir: OMEGA_SRC/.git when that is a directory, else the path a ".git" file names
+fn findgit to bool
+pclr
+psrc
+pt tgit
+pt thead
+fd = openp 524288 0
+if ge fd 0
+c = fclose int fd
+n = sub get gl 2 len thead
+for i ulong n
+put gdir i get gp i
+end
+put gl 3 n
+ret true
+end
+pclr
+psrc
+pt tgit
+r = rdline
+if lt r 0
+ret false
+end
+m = len tgd
+if lt ulong r add m 1
+ret false
+end
+for i ulong m
+if ne get gline i get tgd i
+ret false
+end
+end
+e = ulong r
+while and gt e m eq get gline sub e 1 10 bound 4096
+e = sub e 1
+end
+n = ulong 0
+if ne get gline m 47
+for i ulong get gl 0
+put gdir n get gsrc i
+n = add n 1
+end
+put gdir n 47
+n = add n 1
+end
+for i ulong sub e m
+put gdir n get gline add m i
+n = add n 1
+end
+put gl 3 n
+ret true
+end
+note commondir: a worktree's gitdir names the shared repository in its commondir file; refs live there
+fn common to void
+pclr
+pdir
+pt tcommon
+r = rdline
+if le r 0
+ret
+end
+e = ulong r
+while and gt e 0 eq get gline sub e 1 10 bound 4096
+e = sub e 1
+end
+d = get gl 3
+if eq get gline 0 47
+d = 0
+else
+put gdir d 47
+d = add d 1
+end
+for i ulong e
+if lt d 8191
+put gdir d get gline i
+d = add d 1
+end
+end
+put gl 3 d
+end
+note hex40: gline[o..o+40) is 40 lowercase hex digits; copy them into ghave
+fn hex40 o ulong to bool
+for i ulong 40
+c = get gline add o i
+if not ishex c
+ret false
+end
+put ghave i c
+end
+ret true
+end
+note headsha: 1 found, 0 not resolvable
+fn headsha to bool
+if not findgit
+ret false
+end
+pclr
+pdir
+pt thead
+r = rdline
+m = len tref
+if lt r long add m 1
+ret false
+end
+isref = true
+for i ulong m
+if ne get gline i get tref i
+isref = false
+end
+end
+if not isref
+if lt r 40
+ret false
+end
+ret hex40 0
+end
+e = ulong r
+while and gt e m eq get gline sub e 1 10 bound 4096
+e = sub e 1
+end
+rl = sub e m
+rn = new uchar 1024 0
+if gt rl 1024
+ret false
+end
+for i ulong rl
+put rn i get gline add m i
+end
+common
+pclr
+pdir
+pt tslash
+for i ulong rl
+pc get rn i
+end
+r = rdline
+if ge r 40
+ret hex40 0
+end
+pclr
+pdir
+pt tpacked
+ret packed rn rl
+end
+note packed: scan packed-refs line by line for "SHA40 NAME"; lines longer than gline cannot be NAME
+fn packed rn view uchar 1024 rl ulong to bool
+fd = openp 524288 0
+if lt fd 0
+ret false
+end
+ll = ulong 0
+skip = false
+for it ulong 999999
+r = read int fd gbuf 0 65536
+if lt r 0
+if ne r -4
+c = fclose int fd
+ret false
+end
+continue
+end
+if eq r 0
+break
+end
+for i ulong ulong r
+c = get gbuf i
+if eq c 10
+if and not skip linematch rn rl ll
+f = fclose int fd
+ret true
+end
+ll = 0
+skip = false
+else
+if lt ll 4095
+put gline ll c
+ll = add ll 1
+else
+skip = true
+end
+end
+end
+end
+c = fclose int fd
+ret false
+end
+fn linematch rn view uchar 1024 rl ulong ll ulong to bool
+if ne ll add 41 rl
+ret false
+end
+if ne get gline 40 32
+ret false
+end
+for i ulong rl
+if ne get gline add 41 i get rn i
+ret false
+end
+end
+ret hex40 0
+end
+
+note ======== SHA-256 of OMEGA_SRC/seed/out/omc, streamed (sha2.om from the pinned omega-mv)
+fn hashomc to bool
+pclr
+psrc
+pt tomc
+fd = openp 524288 0
+if lt fd 0
+ret false
+end
+ctx = new ulong 40 0
+sha256_init ctx
+blk = new uchar 65536 0
+one = new uchar 1 0
+for it ulong 999999
+r = read int fd gbuf 0 65536
+if lt r 0
+if ne r -4
+c = fclose int fd
+ret false
+end
+continue
+end
+if eq r 0
+break
+end
+n = ulong r
+if eq n 65536
+for i ulong 65536
+put blk i get gbuf i
+end
+sha256_update ctx blk
+else
+for i ulong n
+put one 0 get gbuf i
+sha256_update ctx one
+end
+end
+end
+c = fclose int fd
+d = new uchar 32 0
+sha256_final ctx d
+for i ulong 32
+v = get d i
+put gsha mul i 2 get hexd ulong shr v 4
+put gsha add mul i 2 1 get hexd ulong and v 15
+end
+ret true
+end
+
+note ======== src/*.om names, sorted by bytes
+fn nameless a ulong b ulong to bool
+oa = get gno a
+ob = get gno b
+na = get gnl a
+nb = get gnl b
+m = na
+if lt nb m
+m = nb
+end
+for i ulong m
+ca = get gnm add oa i
+cb = get gnm add ob i
+if ne ca cb
+ret lt ca cb
+end
+end
+ret lt na nb
+end
+note takeent: record the getdents64 record at gdn[p] when it names a visible *.om file; false when the name table is full
+fn takeent p ulong to bool
+q = add p 19
+n = ulong 0
+while ne get gdn add q n 0 bound 256
+n = add n 1
+end
+k = len tdotom
+if or le n k eq get gdn q 46
+ret true
+end
+for i ulong k
+if ne get gdn add q add sub n k i get tdotom i
+ret true
+end
+end
+c = get gnc 0
+used = get gl 4
+if or ge c 1024 gt add used n 65536
+put gnc 1 1
+ret false
+end
+put gno c used
+put gnl c n
+for i ulong n
+put gnm add used i get gdn add q i
+end
+put gl 4 add used n
+put gnc 0 add c 1
+ret true
+end
+fn sortnames to void
+for i ulong get gnc 0
+j = i
+while gt j 0 bound 1024
+if not nameless j sub j 1
+break
+end
+ho = get gno j
+tl = get gnl j
+put gno j get gno sub j 1
+put gnl j get gnl sub j 1
+put gno sub j 1 ho
+put gnl sub j 1 tl
+j = sub j 1
+end
+end
+end
+fn listsrc to bool
+pclr
+pt tsrc
+fd = openp 540672 0
+if lt fd 0
+ret false
+end
+put gl 4 0
+put gnc 0 0
+for it ulong 999999
+r = getdnts int fd gdn 0 32768
+if le r 0
+c = fclose int fd
+if lt r 0
+ret false
+end
+sortnames
+ret true
+end
+p = ulong 0
+while lt p ulong r bound 32768
+if not takeent p
+c = fclose int fd
+ret false
+end
+p = add p add ulong get gdn add p 16 shl ulong get gdn add p 17 8
+end
+end
+c = fclose int fd
+ret false
+end
+
+note ======== composing the unit
+fn wall fd int s view uchar * to bool
+p = ulong 0
+for it ulong 4096
+if ge p len s
+ret true
+end
+w = write fd s p sub len s p
+if le w 0
+ret false
+end
+p = add p ulong w
+end
+ret false
+end
+note copyin: append the file named by gp to fd; false (gp still names it) when it cannot be read or written
+fn copyin fd int to bool
+in = openp 524288 0
+if lt in 0
+ret false
+end
+for it ulong 999999
+r = read int in gbuf 0 65536
+if lt r 0
+if ne r -4
+c = fclose int in
+ret false
+end
+continue
+end
+if eq r 0
+c = fclose int in
+ret true
+end
+p = ulong 0
+for k ulong 65536
+if ge p ulong r
+break
+end
+w = write fd gbuf p sub ulong r p
+if le w 0
+c = fclose int in
+ret false
+end
+p = add p ulong w
+end
+end
+c = fclose int in
+ret false
+end
+note compose: write OUT.unit.om; 0 ok, 65 an input could not be read, 66 the unit could not be written
+fn compose to int
+pclr
+pout
+pt tunit
+fd = openp 524865 420
+if lt fd 0
+ret 66
+end
+if not wall int fd tom2
+c = fclose int fd
+ret 66
+end
+for s ulong 4
+pclr
+if eq s 0
+psrc
+pt tjson
+end
+if eq s 1
+psrc
+pt thttp
+end
+if eq s 2
+psrc
+pt tnotls
+end
+if eq s 3
+break
+end
+if not copyin int fd
+c = fclose int fd
+ret 65
+end
+end
+for i ulong get gnc 0
+pclr
+pt tsrc
+pt tslash
+pname i
+if not copyin int fd
+c = fclose int fd
+ret 65
+end
+end
+c = fclose int fd
+if lt c 0
+ret 66
+end
+ret 0
+end
+
+note ======== running omc: stdin OUT.unit.om, stdout OUT.tmp, stderr OUT.err
+fn pkadd to void
+n = get gl 2
+c = add ulong get gpk 0 shl ulong get gpk 1 8
+o = ulong 2
+for i ulong c
+o = add add o 2 add ulong get gpk o shl ulong get gpk add o 1 8
+end
+put gpk o uchar and n 255
+put gpk add o 1 uchar shr n 8
+for i ulong n
+put gpk add add o 2 i get gp i
+end
+c = add c 1
+put gpk 0 uchar and c 255
+put gpk 1 uchar shr c 8
+end
+fn pklen to ulong
+c = add ulong get gpk 0 shl ulong get gpk 1 8
+o = ulong 2
+for i ulong c
+o = add add o 2 add ulong get gpk o shl ulong get gpk add o 1 8
+end
+ret o
+end
+fn child to void
+pclr
+pout
+pt tunit
+fd = openp 524288 0
+if lt fd 0
+exit 126
+end
+r = dupfd int fd 0 0
+pclr
+pout
+pt ttmp
+fd = openp 524865 493
+if lt fd 0
+exit 126
+end
+r = dupfd int fd 1 0
+pclr
+pout
+pt terr
+fd = openp 524865 420
+if lt fd 0
+exit 126
+end
+r = dupfd int fd 2 0
+put gpk 0 0
+put gpk 1 0
+pclr
+psrc
+pt tomc
+pkadd
+r = execprog gpk 0 pklen
+exit 127
+end
+note runomc: omc's exit status, or -1 when it could not be run or did not exit normally
+fn runomc to long
+pid = fork
+if lt pid 0
+ret -1
+end
+if eq pid 0
+child
+end
+r = waitpid int pid gst 0 4 0
+if ne r pid
+ret -1
+end
+if ne get gst 0 0
+ret -1
+end
+ret long get gst 1
+end
+fn errempty to bool
+pclr
+pout
+pt terr
+fd = openp 524288 0
+if lt fd 0
+ret false
+end
+r = read int fd gbuf 0 1
+c = fclose int fd
+ret eq r 0
+end
+fn rmtmp to void
+pclr
+pout
+pt ttmp
+r = unlink gp 0 get gl 2
+end
+fn catom to void
+pclr
+pout
+pt terr
+fd = openp 524288 0
+if lt fd 0
+ret
+end
+for it ulong 999999
+r = read int fd gbuf 0 65536
+if le r 0
+break
+end
+w = write 2 gbuf 0 ulong r
+end
+c = fclose int fd
+end
+
+fn main to int
+if ne argcnt 3
+r = write 2 tuse 0 len tuse
+ret 64
+end
+n = argread 1 gsrc 0 4096
+if lt n 1
+r = write 2 tuse 0 len tuse
+ret 64
+end
+put gl 0 ulong n
+n = argread 2 gout 0 4096
+if lt n 1
+r = write 2 tuse 0 len tuse
+ret 64
+end
+put gl 1 ulong n
+if not pinload
+sayl emroot
+ret 64
+end
+if not pinparse
+sayl empin
+ret 65
+end
+if not headsha
+sayl emhead
+ret 65
+end
+same = true
+for i ulong 40
+if ne get ghave i get gwant i
+same = false
+end
+end
+if not same
+say emrev
+r = write 2 ghave 0 40
+r = write 2 emwant 0 len emwant
+r = write 2 gwant 0 40
+r = write 2 tnl 0 len tnl
+ret 65
+end
+if not hashomc
+say emomc
+saypath
+ret 65
+end
+same = true
+for i ulong 64
+if ne get gsha i get gwomc i
+same = false
+end
+end
+if not same
+say emsha
+r = write 2 gsha 0 64
+r = write 2 emwant 0 len emwant
+r = write 2 gwomc 0 64
+r = write 2 tnl 0 len tnl
+ret 65
+end
+if not listsrc
+if ne get gnc 1 0
+sayl emfull
+ret 65
+end
+sayl emsrc
+ret 65
+end
+mkparents
+pclr
+pout
+r = unlink gp 0 get gl 2
+rmtmp
+k = compose
+if eq k 65
+say emread
+saypath
+ret 65
+end
+if ne k 0
+say emwrite
+saypath
+ret 65
+end
+e = runomc
+if or ne e 0 not errempty
+rmtmp
+catom
+say emrej
+pclr
+pout
+pt tunit
+saypath
+ret 1
+end
+pclr
+pout
+pt ttmp
+put gpk 0 0
+put gpk 1 0
+pkadd
+pclr
+pout
+pkadd
+r = renames gpk 0 pklen 0
+if lt r 0
+say emwrite
+saypath
+ret 65
+end
+say embuilt
+saypath
+ret 0
+end
