@@ -75,7 +75,7 @@ struct RxGpuSeat {
     volatile int sem_ok;
     volatile uint32_t marker_value; /* words the host read when the wait ended (diagnostic) */
     volatile uint32_t sem_value;
-    char err[160];
+    char err[sizeof(((Nvrm *)0)->err) + 128]; /* our label plus nvrm's whole reason */
     LaunchJob *job;
     volatile uint32_t *hb_watch;
     RxWorld *world;
@@ -747,7 +747,8 @@ static void *launch_main(void *arg) {
             nvrm_alloc(&ctx->rm, 0x10000, &job->qmd_mem) != 0 ||
             nvrm_alloc_gpu_uncached(&ctx->rm, 0x1000, &job->marker_mem) != 0 ||
             nvrm_alloc(&ctx->rm, 0x10000, &job->large_pb) != 0) {
-            snprintf(s->err, sizeof s->err, "graphics memory was not allocated");
+            snprintf(s->err, sizeof s->err, "graphics memory was not allocated (last RM_ALLOC status 0x%x; nvrm: %s)",
+                     ctx->rm.last_rm_status, ctx->rm.err);
             job->submit_rc = -1;
             return NULL;
         }
@@ -869,7 +870,8 @@ static void *launch_main(void *arg) {
     }
     job->submit_rc = m16_native_submit_methods(ctx, pb, n);
     if (job->submit_rc != 0) {
-        snprintf(s->err, sizeof s->err, "the graphics seat was not submitted");
+        snprintf(s->err, sizeof s->err, "the graphics seat was not submitted (rc %d; last RM_ALLOC status 0x%x; nvrm: %s)",
+                 job->submit_rc, ctx->rm.last_rm_status, ctx->rm.err);
         return NULL;
     }
     int wait = wait_marker_or_abort(s, hmarker, OMEGA_BW_MARKER_COMPLETION_PAYLOAD, 60000);
@@ -998,7 +1000,9 @@ int rx_gpu_seat_kill(RxGpuSeat *s) {
 int rx_gpu_seat_relaunch(RxGpuSeat *s) {
     if (!s || !s->killed || !s->image_bound || !s->job) return -1;
     if (nvrm_channel(&s->ctx.rm) != 0) {
-        snprintf(s->err, sizeof s->err, "the graphics channel was not rebuilt");
+        snprintf(s->err, sizeof s->err, "the graphics channel was not rebuilt (last RM_ALLOC status 0x%x; nvrm: %s)",
+                 s->ctx.rm.last_rm_status, s->ctx.rm.err);
+        fprintf(stderr, "seat: %s\n", s->err);
         return -1;
     }
     s->killed = 0;
@@ -1012,7 +1016,12 @@ int rx_gpu_seat_relaunch(RxGpuSeat *s) {
     s->job->args.seat_gen = current_seat_gen(s->world);
     memset(s->world->coherent + rx_world_off_heartbeat(), 0, 64);
     __asm__ volatile("dsb sy" ::: "memory");
-    if (pthread_create(&s->thread, NULL, launch_main, s->job) != 0) return -1;
+    int th_rc = pthread_create(&s->thread, NULL, launch_main, s->job);
+    if (th_rc != 0) {
+        snprintf(s->err, sizeof s->err, "the relaunch thread was not started: %s", strerror(th_rc));
+        fprintf(stderr, "seat: %s\n", s->err);
+        return -1;
+    }
     s->thread_live = 1;
     if (wait_heartbeat(s) != 0) return -1;
     return lease_start(s);
@@ -1071,8 +1080,12 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     if (open_rc != 0 || chan_rc != 0) {
         snprintf(s->err, sizeof s->err, open_rc != 0 ? "the graphics device did not open"
                                                      : "the graphics channel was not created");
-        fprintf(stderr, "seat: %s (open %d channel %d; last RM_ALLOC status 0x%x; nvrm: %s)\n", s->err, open_rc,
-                chan_rc, s->ctx.rm.last_rm_status, s->ctx.rm.err);
+        if (open_rc != 0)
+            fprintf(stderr, "seat: %s (open %d, channel not tried; last RM_ALLOC status 0x%x; nvrm: %s)\n", s->err,
+                    open_rc, s->ctx.rm.last_rm_status, s->ctx.rm.err);
+        else
+            fprintf(stderr, "seat: %s (channel %d; last RM_ALLOC status 0x%x; nvrm: %s)\n", s->err, chan_rc,
+                    s->ctx.rm.last_rm_status, s->ctx.rm.err);
         /* m16_native_open already closed its own descriptors when it failed; closing again could close
          * a number another thread was handed meanwhile. */
         if (open_rc == 0) m16_native_close(&s->ctx);
