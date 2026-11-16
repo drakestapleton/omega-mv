@@ -1021,7 +1021,10 @@ int rx_gpu_seat_relaunch(RxGpuSeat *s) {
 int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     if (out) *out = NULL;
     if (!w || !w->coherent || !w->resident_enabled) return -1;
-    if (!crc_matches_sealer()) return -1;
+    if (!crc_matches_sealer()) {
+        fprintf(stderr, "seat: the sealer's checksum table does not match\n");
+        return -1;
+    }
 
     BlackwellIRProgram prog;
     uint32_t gpr = 0;
@@ -1035,9 +1038,13 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     if (padded < 32) padded = 32;
     size_t bytes = padded * 16u;
     uint8_t *code = calloc(1, bytes);
-    if (!code) return -1;
+    if (!code) {
+        fprintf(stderr, "seat: no memory for %zu bytes of code\n", bytes);
+        return -1;
+    }
     size_t emitted = 0;
     if (omega_bw_encode_program(&prog, code, bytes, &emitted) != 0) {
+        fprintf(stderr, "seat: program was not encoded (%d instructions)\n", insns);
         free(code);
         return -1;
     }
@@ -1048,20 +1055,27 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     }
     seat_scoreboard(code, emitted);
     if (!first_is_lane_check(code, emitted)) {
+        fprintf(stderr, "seat: program does not start with the lane check\n");
         free(code);
         return -1;
     }
 
     RxGpuSeat *s = calloc(1, sizeof(*s));
-    if (!s) { free(code); return -1; }
+    if (!s) {
+        fprintf(stderr, "seat: no memory for the seat\n");
+        free(code);
+        return -1;
+    }
     int open_rc = m16_native_open(&s->ctx);
     int chan_rc = open_rc == 0 ? m16_native_create_channel(&s->ctx) : -1;
     if (open_rc != 0 || chan_rc != 0) {
         snprintf(s->err, sizeof s->err, open_rc != 0 ? "the graphics device did not open"
                                                      : "the graphics channel was not created");
-        fprintf(stderr, "seat: %s (open %d channel %d; rm status 0x%x: %s)\n", s->err, open_rc, chan_rc,
-                s->ctx.rm.last_rm_status, s->ctx.rm.err);
-        m16_native_close(&s->ctx);
+        fprintf(stderr, "seat: %s (open %d channel %d; last RM_ALLOC status 0x%x; nvrm: %s)\n", s->err, open_rc,
+                chan_rc, s->ctx.rm.last_rm_status, s->ctx.rm.err);
+        /* m16_native_open already closed its own descriptors when it failed; closing again could close
+         * a number another thread was handed meanwhile. */
+        if (open_rc == 0) m16_native_close(&s->ctx);
         free(code);
         free(s);
         return -1;
@@ -1075,7 +1089,8 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     if (alloc < 0x100000) alloc = 0x100000;
     if (nvrm_alloc_gpu_uncached(&s->ctx.rm, alloc, &image) != 0) {
         snprintf(s->err, sizeof s->err, "the shared image was not allocated");
-        fprintf(stderr, "seat: %s (%llu bytes)\n", s->err, (unsigned long long)alloc);
+        fprintf(stderr, "seat: %s (%llu bytes; last RM_ALLOC status 0x%x; nvrm: %s)\n", s->err,
+                (unsigned long long)alloc, s->ctx.rm.last_rm_status, s->ctx.rm.err);
         m16_native_close(&s->ctx);
         free(code);
         free(s);
@@ -1094,6 +1109,7 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
 
     LaunchJob *job = calloc(1, sizeof(*job));
     if (!job) {
+        fprintf(stderr, "seat: no memory for the launch job\n");
         seat_return_image(s);
         m16_native_close(&s->ctx);
         free(code);
@@ -1112,7 +1128,9 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     job->args.off_hb = (uint32_t)rx_world_off_heartbeat();
     job->args.off_tbl = (uint32_t)rx_world_off_object_table();
     job->args.giveup = GIVEUP;
-    if (pthread_create(&s->thread, NULL, launch_main, job) != 0) {
+    int th_rc = pthread_create(&s->thread, NULL, launch_main, job);
+    if (th_rc != 0) {
+        fprintf(stderr, "seat: the launch thread was not started (%s)\n", strerror(th_rc));
         free(job);
         free(code);
         seat_return_image(s);
