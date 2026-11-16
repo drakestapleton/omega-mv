@@ -33,7 +33,10 @@ for t in perl python3 cmp timeout; do
 done
 [ -f "$OMC" ] && [ -x "$OMC" ] || { echo "mutate.sh: prerequisite missing: compiler $OMC is not an executable file" >&2; exit 2; }
 command -v "$LEAN" >/dev/null 2>&1 || { echo "mutate.sh: prerequisite missing: lean ($LEAN)" >&2; exit 2; }
-if [ -z "${W:-}" ]; then W=$(mktemp -d "${TMPDIR:-/tmp}/trit-mut.XXXXXX") || exit 2; else rm -rf "$W"; mkdir -p "$W" || exit 2; fi
+if [ -z "${W:-}" ]; then W=$(mktemp -d "${TMPDIR:-/tmp}/trit-mut.XXXXXX") || exit 2; else
+  if [ -e "$W" ] || [ -L "$W" ]; then echo "work directory already exists: $W (preserved)" >&2; exit 2; fi
+  mkdir -p "$W" || exit 2
+fi
 case $W in /*) ;; *) W=$(pwd)/$W ;; esac
 LOGS=$W/logs; mkdir -p "$LOGS"
 echo "mutate.sh: omc=$OMC sha256=$(sha256sum < "$OMC" | cut -c1-64) logs=$LOGS"

@@ -9,7 +9,10 @@
 set -u
 R=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd); cd "$R" || exit 2
 OMC=${OMC:-$R/seed/out/omc}; case $OMC in /*) ;; *) OMC=$(pwd)/$OMC ;; esac
-if [ -z "${W:-}" ]; then W=$(mktemp -d "${TMPDIR:-/tmp}/trit-mutate-test.XXXXXX") || exit 2; else rm -rf "$W"; mkdir -p "$W" || exit 2; fi
+if [ -z "${W:-}" ]; then W=$(mktemp -d "${TMPDIR:-/tmp}/trit-mutate-test.XXXXXX") || exit 2; else
+  if [ -e "$W" ] || [ -L "$W" ]; then echo "work directory already exists: $W (preserved)" >&2; exit 2; fi
+  mkdir -p "$W" || exit 2
+fi
 case $W in /*) ;; *) W=$(pwd)/$W ;; esac
 [ -x "$OMC" ] || { echo "test-mutate.sh: compiler $OMC missing" >&2; exit 2; }
 pass=0; fail=0
