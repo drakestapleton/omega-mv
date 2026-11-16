@@ -63,7 +63,7 @@ step matmul_timing      ./build/gpu_matmul_api_test --timing --out "$OUT/matmul_
 tail -1 "$OUT/probe.log"
 echo "end $(date -u +%FT%TZ)" >> "$OUT/device.txt"
 cp src/omega_gpu_session.c src/omega_gpu_session.h src/omega_gpu_platform.c src/omega_gpu_platform_linux.c src/omega_gpu_fmt.c src/omega_gpu_matmul_api.c src/omega_gpu_elementwise_api.c src/omega_gpu_elementwise_api.h \
-   src/omega_gpu_attention_api.c src/omega_gpu_attention_api.h tests/gpu_elementwise_test.c tests/gpu_attention_test.c tests/gpu_matmul_api_test.c "$OUT/"
+   src/omega_gpu_attention_api.c src/omega_gpu_attention_api.h tests/gpu_elementwise_test.c tests/bw_mufu_ftz.h tests/gpu_attention_test.c tests/gpu_matmul_api_test.c "$OUT/"
 (cd "$OUT" && sha256sum -- * probe/* 2>/dev/null > SHA256SUMS)
 echo "FB1-CUT4B chip gate failed_steps=$fail probe_rc=$prc receipt=$OUT"
 [ "$fail" -eq 0 ] && [ "$prc" -ne 3 ]

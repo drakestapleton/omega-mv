@@ -90,14 +90,15 @@ typedef enum {
     OMEGA_GPU_EW_RC_REFUSE_BAR_IN_REGION,  /* BAR.SYNC inside an open region */
     OMEGA_GPU_EW_RC_REFUSE_SHFL_IN_REGION, /* SHFL inside an open region */
     OMEGA_GPU_EW_RC_REFUSE_UNCLOSED,       /* region begun, never joined */
-    OMEGA_GPU_EW_RC_REFUSE_JOIN_ONLY       /* BSYNC with no BSSY */
+    OMEGA_GPU_EW_RC_REFUSE_JOIN_ONLY,      /* BSYNC with no BSSY */
+    OMEGA_GPU_EW_RSQ          /* out[i] = 1/sqrt(a[i])                 (probe for bare MUFU.RSQ, omega #462) */
 } OmegaGpuEwOp;
 
 /* Shape rules (checked, refused with BAD_ARGS / TOO_LARGE):
  *   rmsnorm: dim % OMEGA_GPU_EW_THREADS == 0, dim <= OMEGA_GPU_EW_MAX_DIM, rows >= 1
  *   rope:    head_dim even, 2 <= head_dim <= 2048 (head_dim/2 threads per CTA), heads >= 1
  *   swiglu:  n >= 1 (the kernel guards the tail with a predicated EXIT)
- *   ex2:     n >= 1;  xchg: n % OMEGA_GPU_EW_THREADS == 0 */
+ *   ex2, rsq: n >= 1;  xchg: n % OMEGA_GPU_EW_THREADS == 0 */
 #define OMEGA_GPU_EW_THREADS 128u
 #define OMEGA_GPU_EW_MAX_DIM 16384u
 #define OMEGA_GPU_EW_MAX_CTAS 1024u
@@ -132,8 +133,10 @@ int omega_gpu_rope_f32(uint32_t heads, uint32_t head_dim, const float *v,
 int omega_gpu_swiglu_f32(uint32_t n, const float *gate, const float *up, float *out,
                          OmegaGpuEwInfo *info);
 
-/* Probes. ex2: out[i] = 2^x[i]. xchg: out[i] = x[i ^ (OMEGA_GPU_EW_THREADS-1)] within each CTA. */
+/* Probes. ex2: out[i] = 2^x[i]. rsq: out[i] = MUFU.RSQ(x[i]), no Newton step (the raw unit, for its flush rule).
+ * xchg: out[i] = x[i ^ (OMEGA_GPU_EW_THREADS-1)] within each CTA. */
 int omega_gpu_ex2_f32(uint32_t n, const float *x, float *out, OmegaGpuEwInfo *info);
+int omega_gpu_rsq_f32(uint32_t n, const float *x, float *out, OmegaGpuEwInfo *info);
 int omega_gpu_shared_xchg_u32(uint32_t n, const uint32_t *x, uint32_t *out, OmegaGpuEwInfo *info);
 /* Reconvergence probes (op = one of OMEGA_GPU_EW_RC_DIAMOND .. OMEGA_GPU_EW_RC_DEPTH16, else
  * BAD_ARGS). n >= 1, any n: lanes past the end take part in the warp step and exit before
@@ -161,7 +164,7 @@ int omega_gpu_elementwise_codegen_ir(OmegaGpuEwOp op, int mutant, void *prog,
 /* TEST ONLY. Selects a deliberately wrong kernel for one op (0 clears). Each
  * mutant changes the math by far more than the op's tolerance, so a parity
  * check that still passes against it proves nothing. Clears the kernel cache.
- *   EX2: computes 2^(x+1).  XCHG: reads its own shared word (no exchange).
+ *   EX2: computes 2^(x+1).  RSQ: computes rsq(4x) (half the result).  XCHG: reads its own shared word (no exchange).
  *   RMSNORM: the warp tree drops its last SHFL step (half the lanes go missing).
  *   ROPE: out0 = q0*cos + q1*sin.  SWIGLU: exp(+g) instead of exp(-g). */
 void omega_gpu_elementwise_test_set_mutant(int op);

@@ -2566,7 +2566,7 @@ $(GPU_R4_RECEIPT): tests/gpu_matmul_r4_receipt.c src/omega_gpu_matmul_api.h $(OU
 # through the heavy queue. -ffp-contract=off keeps the f32 oracle free of FMA.
 .PHONY: test-gpu-elementwise
 GPU_EW_TEST = $(OUT_DIR)/gpu_elementwise_test
-$(GPU_EW_TEST): tests/gpu_elementwise_test.c src/omega_gpu_elementwise_api.h $(OUT_DIR)/libomega_gpu.a
+$(GPU_EW_TEST): tests/gpu_elementwise_test.c tests/bw_mufu_ftz.h src/omega_gpu_elementwise_api.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_elementwise_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 test-gpu-elementwise: $(GPU_EW_TEST)
 	./$(GPU_EW_TEST) --host-only

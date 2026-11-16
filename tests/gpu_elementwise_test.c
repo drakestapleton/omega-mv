@@ -136,6 +136,7 @@ static void host_only(void) {
     CHECK(omega_gpu_rope_f32(1, 64, NULL, b, b, c, NULL) == OMEGA_GPU_EW_BAD_ARGS, "NULL vector refused");
     CHECK(omega_gpu_swiglu_f32(0, a, b, c, NULL) == OMEGA_GPU_EW_BAD_ARGS, "n=0 refused");
     CHECK(omega_gpu_shared_xchg_u32(100, (uint32_t *)a, (uint32_t *)c, NULL) == OMEGA_GPU_EW_BAD_ARGS, "xchg n not a multiple of 128 refused");
+    CHECK(omega_gpu_rsq_f32(0, a, c, NULL) == OMEGA_GPU_EW_BAD_ARGS, "rsq n=0 refused");
     CHECK(strcmp(omega_gpu_elementwise_rc_name(OMEGA_GPU_EW_UNWRITTEN), "UNWRITTEN") == 0, "rc name");
 
     struct { OmegaGpuEwOp op; const char *name; const char *must[6]; int n; } ops[] = {
@@ -144,6 +145,7 @@ static void host_only(void) {
         { OMEGA_GPU_EW_RMSNORM, "rmsnorm", { "SHFL.DOWN", "BAR.SYNC", "MUFU.RSQ", "@!P0 BRA", "STS [R", "LDS R" }, 6 },
         { OMEGA_GPU_EW_ROPE, "rope", { "FADD", "FMUL", "STG.E" }, 3 },
         { OMEGA_GPU_EW_SWIGLU, "swiglu", { "MUFU.EX2", "MUFU.RCP", "@P0 EXIT" }, 3 },
+        { OMEGA_GPU_EW_RSQ, "rsq", { "MUFU.RSQ", "@P0 EXIT", "STG.E" }, 3 },
     };
     for (size_t i = 0; i < sizeof ops / sizeof ops[0]; i++) {
         OmegaBlackwellKernel k; memset(&k, 0, sizeof k);
@@ -163,7 +165,7 @@ static void host_only(void) {
 }
 
 /* ------------------------------------------------------------- chip gate */
-typedef struct { const char *name; size_t n; int rc; size_t bad; double worst; int pass; int mutant_rc; size_t mutant_bad; int mutant_caught; uint64_t chip_ns; uint32_t calls; uint32_t unwritten; } Case;
+typedef struct { const char *name; size_t n; int rc; size_t bad; double worst; int pass; int mutant_rc; size_t mutant_bad; int mutant_caught; uint64_t chip_ns; uint32_t calls; uint32_t unwritten; char probe[256]; } Case;
 static int g_ncases;
 
 static void record(Case c, FILE *out) {
@@ -173,15 +175,80 @@ static void record(Case c, FILE *out) {
     printf("%s %s n=%zu rc=%s violations=%zu worst_scaled_err=%g chip_ns=%" PRIu64 " calls=%u unwritten=%u | mutant rc=%s violations=%zu %s\n",
            c.pass && c.mutant_caught ? "PASS" : "FAIL", c.name, c.n, omega_gpu_elementwise_rc_name(c.rc), c.bad, c.worst, c.chip_ns, c.calls, c.unwritten,
            omega_gpu_elementwise_rc_name(c.mutant_rc), c.mutant_bad, c.mutant_caught ? "CAUGHT" : "NOT CAUGHT");
-    if (out) fprintf(out, "%s{\"case\":\"%s\",\"n\":%zu,\"rc\":\"%s\",\"violations\":%zu,\"worst_scaled_err\":%g,\"pass\":%s,\"chip_elapsed_ns\":%" PRIu64 ",\"chip_calls\":%u,\"unwritten_words\":%u,\"mutant_rc\":\"%s\",\"mutant_violations\":%zu,\"mutant_caught\":%s}",
+    if (out) fprintf(out, "%s{\"case\":\"%s\",\"n\":%zu,\"rc\":\"%s\",\"violations\":%zu,\"worst_scaled_err\":%g,\"pass\":%s,\"chip_elapsed_ns\":%" PRIu64 ",\"chip_calls\":%u,\"unwritten_words\":%u,\"mutant_rc\":\"%s\",\"mutant_violations\":%zu,\"mutant_caught\":%s%s%s%s}",
                      g_ncases > 1 ? "," : "", c.name, c.n, omega_gpu_elementwise_rc_name(c.rc), c.bad, c.worst, c.pass ? "true" : "false", c.chip_ns, c.calls, c.unwritten,
-                     omega_gpu_elementwise_rc_name(c.mutant_rc), c.mutant_bad, c.mutant_caught ? "true" : "false");
+                     omega_gpu_elementwise_rc_name(c.mutant_rc), c.mutant_bad, c.mutant_caught ? "true" : "false",
+                     c.probe[0] ? ",\"probe\":{" : "", c.probe, c.probe[0] ? "}" : "");
+}
+
+/* omega #462 flush probes. want is the host model (tests/bw_mufu_ftz.h: input flushed, IEEE function, result
+ * flushed). 0 = violation, 1 = match, 2 = flushed at the FLT_MIN boundary (allowed only with `boundary`).
+ * A zero, infinite or NaN want must come back exactly (NaN: any NaN). A normal want needs a normal result within
+ * rel, so an unflushed subnormal is always a violation; with `boundary` a zero is also allowed when want is within
+ * 2^-21 rel above FLT_MIN (MUFU is approximate, the model flushes a correctly rounded result). */
+static int ftz_match(float got, float want, double rel, int boundary, double *scaled) {
+    uint32_t g, w; memcpy(&g, &got, 4); memcpy(&w, &want, 4);
+    if (isnan(want)) return isnan(got);
+    if ((w & 0x7fffffffu) == 0u || isinf(want)) return g == w;
+    if (boundary && (g & 0x7fffffffu) == 0u && fabsf(want) < FLT_MIN * (1.0f + 0x1p-21f)) return 2;
+    if ((g & 0x7f800000u) == 0u || isinf(got) || isnan(got)) return 0;
+    double s = fabs((double)got - (double)want) / (rel * fabs((double)want));
+    if (scaled && s > *scaled) *scaled = s;
+    return s <= 1.0;
+}
+
+static float ieee_rsq(float x) { return 1.0f / sqrtf(x); }
+
+/* One flush probe: the chip against the model, then two controls on the rows where the model and IEEE f32
+ * without the flush differ (the rows that decide the rule):
+ *   host control (no chip): the comparator must reject IEEE-without-flush on every such row, so a pass below
+ *     cannot come from a comparator that accepts both hypotheses;
+ *   chip control: the chip's word must differ from IEEE-without-flush on every such row.
+ * The op's mutant must be caught by the same comparator. */
+static void ftz_probe(const char *name, OmegaGpuEwOp op, int (*fn)(uint32_t, const float *, float *, OmegaGpuEwInfo *),
+                      float (*model)(float), float (*ieee)(float), const float *x, int n, int boundary, FILE *out) {
+    float *got = malloc((size_t)n * 4), *want = malloc((size_t)n * 4);
+    OmegaGpuEwInfo info;
+    for (int i = 0; i < n; i++) want[i] = model(x[i]);
+    Case c = { .name = name, .n = (size_t)n };
+    c.rc = fn((uint32_t)n, x, got, &info);
+    size_t deciding = 0, host_flagged = 0, chip_differs = 0, boundary_flush = 0;
+    for (int i = 0; i < n; i++) {
+        float ie = ieee(x[i]);
+        uint32_t g, w, ib, xb; memcpy(&g, &got[i], 4); memcpy(&w, &want[i], 4); memcpy(&ib, &ie, 4); memcpy(&xb, &x[i], 4);
+        if (ib != w && !(isnan(ie) && isnan(want[i]))) {
+            deciding++;
+            if (ftz_match(ie, want[i], 1e-6, boundary, NULL) == 0) host_flagged++;
+            if (g != ib && !(isnan(got[i]) && isnan(ie))) chip_differs++;
+        }
+        int m = ftz_match(got[i], want[i], 1e-6, boundary, &c.worst);
+        if (m == 2) boundary_flush++;
+        if (m == 0) { c.bad++; printf("  %s x=0x%08x got 0x%08x want 0x%08x ieee 0x%08x\n", name, xb, g, w, ib); }
+    }
+    printf("%s inputs=%d model_differs_from_ieee=%zu host_control_flagged=%zu chip_differs_from_ieee=%zu boundary_flush=%zu\n",
+           name, n, deciding, host_flagged, chip_differs, boundary_flush);
+    CHECK(deciding > 0 && host_flagged == deciding, "%s host control: the comparator rejects IEEE without the flush on every "
+          "deciding row (%zu of %zu)", name, host_flagged, deciding);
+    CHECK(chip_differs == deciding, "%s chip control: the chip differs from IEEE without the flush on every deciding row (%zu of %zu)",
+          name, chip_differs, deciding);
+    snprintf(c.probe, sizeof c.probe, "\"model_differs_from_ieee\":%zu,\"host_control_flagged\":%zu,\"chip_differs_from_ieee\":%zu,\"boundary_flush\":%zu",
+             deciding, host_flagged, chip_differs, boundary_flush);
+    c.pass = c.rc == OMEGA_GPU_EW_OK && c.bad == 0; c.chip_ns = info.elapsed_ns; c.calls = info.chip_calls; c.unwritten = info.unwritten_words;
+    omega_gpu_elementwise_test_set_mutant((int)op);
+    c.mutant_rc = fn((uint32_t)n, x, got, &info);
+    for (int i = 0; i < n; i++) if (ftz_match(got[i], want[i], 1e-6, boundary, NULL) == 0) c.mutant_bad++;
+    c.mutant_caught = c.mutant_rc != OMEGA_GPU_EW_OK || c.mutant_bad > 0;
+    omega_gpu_elementwise_test_set_mutant(0);
+    record(c, out);
+    free(got); free(want);
 }
 
 static int chip(const char *out_path) {
     FILE *out = out_path ? fopen(out_path, "w") : NULL;
     if (out_path && !out) { printf("cannot open %s\n", out_path); return 2; }
-    if (out) fprintf(out, "{\"schema\":\"OMEGA_GPU_ELEMENTWISE_V1\",\"tolerances\":{\"ex2_rel\":1e-6,\"xchg\":\"exact\",\"rmsnorm_rel\":1e-5,\"rmsnorm_abs\":1e-6,\"rope\":\"exact\",\"swiglu_rel\":1e-5,\"swiglu_abs\":1e-6},\"cases\":[");
+    if (out) fprintf(out, "{\"schema\":\"OMEGA_GPU_ELEMENTWISE_V1\",\"tolerances\":{\"ex2_rel\":1e-6,\"xchg\":\"exact\",\"rmsnorm_rel\":1e-5,\"rmsnorm_abs\":1e-6,\"rope\":\"exact\",\"swiglu_rel\":1e-5,\"swiglu_abs\":1e-6,"
+                     "\"ex2_ftz\":\"tests/bw_mufu_ftz.h model; zero, inf, NaN exact; normal results normal and 1e-6 rel; zero allowed within 2^-21 rel above FLT_MIN\","
+                     "\"rsq_ftz\":\"tests/bw_mufu_ftz.h model; zero, inf, NaN exact; normal results normal and 1e-6 rel\"},\"cases\":[");
     uint32_t seed = 0xfb1c0004u;
     OmegaGpuEwInfo info;
 
@@ -202,49 +269,35 @@ static int chip(const char *out_path) {
         omega_gpu_elementwise_test_set_mutant(0);
         record(c, out); free(x); free(got); free(want); free(wrong);
     }
-    /* 1b. omega #462: MUFU.EX2 flush rule on the chip. The host models (tests/bw_mufu_ftz.h) say a subnormal
-     * input is read as zero and a subnormal result comes back as a zero of the same sign; until this probe only
-     * RCP's result flush was chip-observed. Inputs: x = -151 .. -125 in steps of 1/8 (2^x runs from below the
-     * smallest subnormal to normal) and eight subnormal inputs. Expectation: ws_mufu_ex2 bit for bit where it is
-     * zero, 1e-6 rel where it is normal; a result within 2^-21 rel of FLT_MIN may also flush (MUFU is approximate,
-     * EX2 about 2 ulp). Negative control: IEEE exp2 without the flush must disagree with the chip on every input
-     * whose IEEE result is subnormal, else the chip does not flush and the model is wrong. */
+    /* 1b. omega #462: the MUFU flush rule on the chip (tests/bw_mufu_ftz.h). Until these probes only RCP's result
+     * flush was chip-observed.
+     * EX2 observes the result flush: x = -151 .. -125 in steps of 1/8, so 2^x runs from below the smallest
+     * subnormal to normal; the model wants +0 wherever the IEEE result is subnormal. The eight subnormal inputs are
+     * a sanity row only: 2^(+-subnormal) is 1.0f with or without an input flush, so EX2 cannot observe the input
+     * flush, and its results are never negative, so it cannot observe the sign of a flushed zero either.
+     * RSQ observes the input flush: a subnormal input read as +-0 gives +-inf, where IEEE gives a finite value
+     * (positive) or NaN (negative), so the sign half of the input rule shows too. RSQ cannot show a result flush:
+     * 1/sqrt of a finite f32 is at least 2^-64. Its other rows are 2^e * {1, 1.25, 1.5, 1.75} for every normal
+     * exponent and the special values +-0, +-inf, -1. */
     {
         enum { NS = 209, NSUB = 8, N = NS + NSUB };
         static const uint32_t sub[NSUB] = { 0x00000001u, 0x00000002u, 0x00400000u, 0x007fffffu,
                                             0x80000001u, 0x80000002u, 0x80400000u, 0x807fffffu };
-        float x[N], got[N], want[N];
+        float x[N];
         for (int i = 0; i < NS; i++) x[i] = -151.0f + 0.125f * (float)i;
         for (int i = 0; i < NSUB; i++) memcpy(&x[NS + i], &sub[i], 4);
-        for (int i = 0; i < N; i++) want[i] = ws_mufu_ex2(x[i]);
-        Case c = { .name = "ex2_ftz_probe", .n = N };
-        c.rc = omega_gpu_ex2_f32(N, x, got, &info);
-        size_t ieee_sub = 0, ieee_disagree = 0, boundary_flush = 0;
-        for (int i = 0; i < N; i++) {
-            uint32_t g, w; memcpy(&g, &got[i], 4); memcpy(&w, &want[i], 4);
-            float ieee = exp2f(x[i]); uint32_t ie; memcpy(&ie, &ieee, 4);
-            int ieee_is_sub = (ie & 0x7f800000u) == 0u && (ie & 0x007fffffu) != 0u;
-            if (ieee_is_sub) { ieee_sub++; if (g != ie) ieee_disagree++; }
-            int ok;
-            if (w == 0u) ok = g == 0u;
-            else if (g == 0u && want[i] < FLT_MIN * (1.0f + 0x1p-21f)) { ok = 1; boundary_flush++; }
-            else ok = fabs((double)got[i] - (double)want[i]) <= 1e-6 * fabs((double)want[i]);
-            if (!ok) { uint32_t xb; memcpy(&xb, &x[i], 4); c.bad++; printf("  ex2_ftz x=0x%08x got 0x%08x want 0x%08x\n", xb, g, w); }
-        }
-        printf("ex2_ftz_probe inputs=%d ieee_subnormal_results=%zu chip_disagrees_with_ieee=%zu boundary_flush=%zu\n",
-               N, ieee_sub, ieee_disagree, boundary_flush);
-        CHECK(ieee_sub > 0 && ieee_disagree == ieee_sub, "ex2 negative control: IEEE exp2 without the flush is rejected on every "
-              "subnormal result (%zu of %zu)", ieee_disagree, ieee_sub);
-        c.pass = c.rc == OMEGA_GPU_EW_OK && c.bad == 0; c.chip_ns = info.elapsed_ns; c.calls = info.chip_calls; c.unwritten = info.unwritten_words;
-        omega_gpu_elementwise_test_set_mutant(OMEGA_GPU_EW_EX2);
-        c.mutant_rc = omega_gpu_ex2_f32(N, x, got, &info);
-        for (int i = 0; i < N; i++) {
-            uint32_t g, w; memcpy(&g, &got[i], 4); memcpy(&w, &want[i], 4);
-            if (g != w && !(fabs((double)got[i] - (double)want[i]) <= 1e-6 * fabs((double)want[i]))) c.mutant_bad++;
-        }
-        c.mutant_caught = c.mutant_rc != OMEGA_GPU_EW_OK || c.mutant_bad > 0;
-        omega_gpu_elementwise_test_set_mutant(0);
-        record(c, out);
+        ftz_probe("ex2_ftz_probe", OMEGA_GPU_EW_EX2, omega_gpu_ex2_f32, ws_mufu_ex2, exp2f, x, N, 1, out);
+    }
+    {
+        enum { NE = 254 * 4, NSUB = 8, NSP = 5, N = NE + NSUB + NSP };
+        static const uint32_t sub[NSUB] = { 0x00000001u, 0x00000002u, 0x00400000u, 0x007fffffu,
+                                            0x80000001u, 0x80000002u, 0x80400000u, 0x807fffffu };
+        static const uint32_t sp[NSP] = { 0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u, 0xbf800000u };
+        float x[N];
+        for (int i = 0; i < NE; i++) x[i] = ldexpf(1.0f + 0.25f * (float)(i % 4), -126 + i / 4);
+        for (int i = 0; i < NSUB; i++) memcpy(&x[NE + i], &sub[i], 4);
+        for (int i = 0; i < NSP; i++) memcpy(&x[NE + NSUB + i], &sp[i], 4);
+        ftz_probe("rsq_ftz_probe", OMEGA_GPU_EW_RSQ, omega_gpu_rsq_f32, ws_mufu_rsq, ieee_rsq, x, N, 0, out);
     }
     /* 2. shared-memory exchange probe (STS, BAR.SYNC, LDS) */
     {

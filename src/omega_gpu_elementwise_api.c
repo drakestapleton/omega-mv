@@ -232,6 +232,24 @@ static void gen_ex2(Em *e, int mutant) {
     tail(e);
 }
 
+/* out[i] = MUFU.RSQ(a[i]) for i < n (n = P0), the bare unit with no Newton step, so its flush rule shows
+ * (omega #462). Threads 128, grid ceil(n/128). Mutant: rsq(4a), half the result. */
+static void gen_rsq(Em *e, int mutant) {
+    Pro p = prologue(e);
+    int n = V(e), i = V(e), off = V64(e), x = V(e), y = V(e);
+    ldc32(e, n, ARG_P0);
+    imadi(e, i, p.cta, OMEGA_GPU_EW_THREADS, p.tid);
+    isetp_ge_u32(e, i, n);
+    exit_if_p0(e);
+    addr4(e, off, i, p.pa);
+    ldg(e, x, off, p.udesc);
+    if (mutant) { int four = V(e); movf(e, four, 4.0f); fmul(e, x, x, four); }
+    mufu(e, BW_IR_MUFU_RSQ, y, x);
+    addr4(e, off, i, p.pc);
+    stg(e, off, y, p.udesc);
+    tail(e);
+}
+
 /* out[i] = a[i ^ 127] within each CTA of 128 (n % 128 == 0). STS own word, BAR.SYNC,
  * LDS the partner word. Mutant: LDS own word (no exchange). */
 static void gen_xchg(Em *e, int mutant) {
@@ -825,6 +843,7 @@ static int build_kernel(OmegaGpuEwOp op, int mutant, OmegaBlackwellKernel *kerne
     int math = mutant == 1;
     switch (op) {
     case OMEGA_GPU_EW_EX2: gen_ex2(&e, math); break;
+    case OMEGA_GPU_EW_RSQ: gen_rsq(&e, math); break;
     case OMEGA_GPU_EW_XCHG: gen_xchg(&e, math); break;
     case OMEGA_GPU_EW_RMSNORM: gen_rmsnorm(&e, math); break;
     case OMEGA_GPU_EW_ROPE: gen_rope(&e, math); break;
@@ -1127,6 +1146,10 @@ int omega_gpu_swiglu_f32(uint32_t n, const float *gate, const float *up, float *
 int omega_gpu_ex2_f32(uint32_t n, const float *x, float *out, OmegaGpuEwInfo *info) {
     if (!x || !out || n == 0) return OMEGA_GPU_EW_BAD_ARGS;
     return run_1d(OMEGA_GPU_EW_EX2, n, x, NULL, out, info);
+}
+int omega_gpu_rsq_f32(uint32_t n, const float *x, float *out, OmegaGpuEwInfo *info) {
+    if (!x || !out || n == 0) return OMEGA_GPU_EW_BAD_ARGS;
+    return run_1d(OMEGA_GPU_EW_RSQ, n, x, NULL, out, info);
 }
 int omega_gpu_shared_xchg_u32(uint32_t n, const uint32_t *x, uint32_t *out, OmegaGpuEwInfo *info) {
     if (!x || !out || n == 0 || n % OMEGA_GPU_EW_THREADS != 0) return OMEGA_GPU_EW_BAD_ARGS;
