@@ -400,6 +400,8 @@ def main():
     rng = random.Random(SEED)
     mutants = {name: worker.with_name("worker-" + name)
                for name in ("clock", "random", "state", "hardcode")}
+    if gpu:
+        mutants["gpu-cache"] = worker.with_name("worker-gpu-cache")
     config = dict(schema="atemporal-schedule-invariance-v1", seed=SEED,
                   modulus=MOD, small_max_nodes=4,
                   small_graphs="all naturally numbered binary-input DAGs; every linear extension",
@@ -577,6 +579,16 @@ def main():
             finally:
                 save(rec)
         control("dependency_violation", bad_order, "SCHEDULE_DEPENDENCY")
+        if gpu:
+            def stale_gpu_input():
+                rec = dict(kind="negative", name="gpu_cached_mutable_input")
+                graph = [node(1, x=2144, y=12692), node(1, x=18004, y=3522)]
+                try:
+                    execute(worker, graph, [0, 1], 97, [0, 0], rec,
+                            gpu=mutants["gpu-cache"], placements=["gpu", "gpu"])
+                finally:
+                    save(rec)
+            control("gpu_cached_mutable_input", stale_gpu_input, "VALUE_MISMATCH")
         summary["verdict"] = "PASS_BOUNDED_CONFORMANCE"
     except BaseException as exc:
         summary.update(verdict="FAIL", reason=getattr(exc, "reason", type(exc).__name__),

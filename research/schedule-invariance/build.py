@@ -51,6 +51,10 @@ def main():
     }
     native_paths = ["gpu/nvidia/native/nvrm/context.om", "gpu/nvidia/native/blackwell/vector.om", "gpu/nvidia/native/blackwell/launch.om"]
     variants["worker-gpu"] = "".join((root / p).read_text() + "\n" for p in native_paths) + (here / "gpu.om").read_text() + "\n" + worker
+    cache_site = "m = nvalloc size eq i 7"
+    if variants["worker-gpu"].count(cache_site) != 1:
+        raise RuntimeError("GPU input-cache mutation site missing or ambiguous")
+    variants["worker-gpu-cache"] = variants["worker-gpu"].replace(cache_site, "m = nvalloc size ge i 5")
     manifest = {
         "source_head": head,
         "source_dirty": bool(subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"])),
@@ -63,7 +67,7 @@ def main():
         "gpu_executed_by_build": False,
     }
     for name, text in variants.items():
-        source = text if name == "worker-gpu" else cpu + "\n" + text
+        source = text if name.startswith("worker-gpu") else cpu + "\n" + text
         (args.out / (name + ".om")).write_text(source)
         result = subprocess.run([str(compiler)], input=source.encode(), capture_output=True, check=False)
         (args.out / (name + ".compile.stderr")).write_bytes(result.stderr)

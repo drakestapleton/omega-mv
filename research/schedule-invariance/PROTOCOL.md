@@ -1,4 +1,4 @@
-# Schedule-invariance experiment, SI-1
+# Schedule-invariance experiment, SI-2
 
 Intent, from the operator: "I would like to run this" followed by the description
 of the unrun schedule-invariance experiment in Zenodo 23547813.
@@ -9,6 +9,9 @@ The downloaded record and paper are preserved with each campaign's evidence.
 The older AT-0 and AT-1 experiments explicitly do not establish this result.
 
 This protocol is frozen by its source commit before the campaign begins.
+SI-2 adds a regression control for stale GPU input caches found by the failed
+SI-1 campaign. The positive acceptance criteria are unchanged. SI-1 failures
+remain under their original source revision and are not rescored.
 Each campaign also writes its exact configuration before its first execution.
 Failed campaigns are preserved. Changing acceptance criteria requires a new
 protocol and campaign. These are public, development examples, not held-out data.
@@ -84,6 +87,13 @@ with falsified nonce or input-port provenance must be rejected for projection
 soundness. Neither correct numeric output nor a graph digest rescues false binding.
 Each negative control is recorded by its violated obligation. A missed control
 fails the experiment; it is not normalized into a passing result.
+
+The GPU arm additionally restores the unsafe cached-input allocation in a
+deliberately faulty executable. Repeated additions with changed inputs must
+expose its stale result and be refused as an implementation value mismatch.
+The correct realizer uses GPU-uncached CPU-written inputs, as required by the
+NVIDIA allocation contract (`nvos.h`, GPU_CACHEABLE comments). This is a repair
+to physical realization, not a change to the graph's declared semantics.
 
 ## Interpretation
 
