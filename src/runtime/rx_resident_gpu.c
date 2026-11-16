@@ -723,8 +723,9 @@ struct LaunchJob {
     NvrmMem code_mem, cbank_mem, qmd_mem, marker_mem, large_pb;
 };
 
-/* The launch thread writes s->err first and publishes submit_rc after it (release); wait_heartbeat reads submit_rc
- * (acquire) before it reads s->err, so it never prints a reason still being written. */
+/* The launch thread writes s->err first and publishes submit_rc after it (release). wait_heartbeat reads s->err only
+ * after an acquire load of a nonzero submit_rc, and never writes it: while submit_rc is 0 the launch thread may still
+ * be writing s->err, so a heartbeat timeout prints its own text. */
 static void job_failed(LaunchJob *job, int rc) { __atomic_store_n(&job->submit_rc, rc, __ATOMIC_RELEASE); }
 
 /* The launch marker lands only when the seat leaves. A kill stops the wait. */
@@ -895,11 +896,13 @@ static int wait_heartbeat(RxGpuSeat *s) {
     for (int i = 0; i < 2000; i++) {
         __asm__ volatile("dsb sy" ::: "memory");
         if (*hb != 0) return 0;
-        if (__atomic_load_n(&s->job->submit_rc, __ATOMIC_ACQUIRE) != 0 && s->err[0]) break;
+        if (__atomic_load_n(&s->job->submit_rc, __ATOMIC_ACQUIRE) != 0) break;
         usleep(1000);
     }
-    if (!s->err[0]) snprintf(s->err, sizeof s->err, "the graphics seat did not show a heartbeat");
-    fprintf(stderr, "seat: %s\n", s->err);
+    if (__atomic_load_n(&s->job->submit_rc, __ATOMIC_ACQUIRE) != 0 && s->err[0])
+        fprintf(stderr, "seat: %s\n", s->err);
+    else
+        fprintf(stderr, "seat: the graphics seat did not show a heartbeat\n");
     return -1;
 }
 
@@ -1000,8 +1003,7 @@ int rx_gpu_seat_kill(RxGpuSeat *s) {
     }
     s->killed = 1;
     if (rc != 0) {
-        snprintf(s->err, sizeof s->err, "the graphics channel was not destroyed (last RM_ALLOC status 0x%x; nvrm: %s)",
-                 s->ctx.rm.last_rm_status, s->ctx.rm.err);
+        snprintf(s->err, sizeof s->err, "the graphics channel was not destroyed (nvrm: %s)", s->ctx.rm.err);
         fprintf(stderr, "seat kill: %s\n", s->err);
     }
     return rc == 0 ? 0 : -1;
@@ -1082,7 +1084,7 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     }
     seat_scoreboard(code, emitted);
     if (!first_is_lane_check(code, emitted)) {
-        fprintf(stderr, "seat: program does not start with the lane check\n");
+        fprintf(stderr, "seat: program is too short (%zu bytes) or does not start with the lane check\n", emitted);
         free(code);
         return -1;
     }
@@ -1127,7 +1129,7 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
         free(s);
         return -1;
     }
-    RxStatus bind_rc = rx_world_bind_coherent(w, image.cpu, bytes_img, 1);
+    int bind_rc = rx_world_bind_coherent(w, image.cpu, bytes_img, 1);
     if (bind_rc != RX_OK) {
         snprintf(s->err, sizeof s->err, "the world image was not bound (status %d)", (int)bind_rc);
         fprintf(stderr, "seat: %s\n", s->err);
