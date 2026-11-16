@@ -48,20 +48,18 @@ logs beside it). To read it as a table: `column -t -s "$(printf '\t')" docs/hard
 
 ## What a physical receipt needs
 
-What each gate needs before its PHYSICAL row can say PASS:
+[`hardware-gates-needs.tsv`](hardware-gates-needs.tsv) lists every gate id and what its PHYSICAL
+receipt must show before that row can say PASS. The blocker and owner of each gate are field 7
+of its PHYSICAL row in `hardware-gates.tsv`; this page does not repeat either. The gate
+(`tools/hwgates/gate.sh`) refuses when the id sets of the two files differ, so a gate that has
+no receipt yet cannot leave the inventory without a reviewed change to both files. To read
+them side by side:
+`join -t "$(printf '\t')" <(grep -v '^#' docs/hardware-gates-needs.tsv | sort) <(awk -F '\t' '$4=="PHYSICAL" {print $1 "\t" $7}' docs/hardware-gates.tsv | sort)`.
 
-| Gate id | Physical receipt needed | Blocker and owner |
-|---|---|---|
-| AX-SMMU-P07 | B7B probe on the Spark: all-SID readout of the three SMMUv3 instances, a confined device fault with matching SID/address | TRUST-1 owner ceremony (no `CK_OWNER_PUBKEYS`/`CK_MACHINE_ID`, so `CK_HARDWARE_STAGING` refuses); attended window; DRA-25 |
-| AX-DMA-RETAIN | a failed physical abort that keeps the stream confined (needs a fault-injection path on hardware) | no hardware injection exists; with AX-SMMU-P07 |
-| AX-NVME-OMEGA | the Omega protocol driving a real NVMe read-only | native VFIO/kernel adapter (absent); attended window |
-| AX-NVME-C | native NVMe read on the Spark | TRUST-1, attended window |
-| AX-RO-MEDIUM | attended USB boot of the staging-built medium, display record of `report_kind: final` | TRUST-1 staging build; Main owns the medium and live-service stop/restore |
-| AX-BOOT-INPUT | physical xHCI/HID input, RTL8127 link/TX, UDP report | TRUST-1; `SPARK-BOOT-INPUT-20261028.md` |
-| AX-SB01-ANCHOR | TPM NV anchor read and checked every boot on the machine | owner chooses anchor and policy (#457, #32) |
-| AX-SB05-MEDIA | signed medium booted under the enrolled owner key, tampered medium refused | owner key custody and enrollment (#458) |
-| AX-GSP-C, OGD-* | GB10 identity read, GSP boot, request/reply, first compute, fault recovery | DRA-149..152 under DRA-174; Drake's authorization and a queen-scheduled exclusive spark-window lease |
-| CUDAPP-UTIL | live `--rm` read checked against raw RM data | DRA-153; read-only spark-window lease |
+A receipt is never rewritten. When a later review finds that a committed receipt line claims
+more than the register allows, a dated `CORRECTION-<date>.txt` beside the receipt names the line
+(`CORRECTS HWGATE <id> <tier> <status>`) and says why. The gate refuses a receipt line whose
+status differs from the register's row for that id and tier unless such a correction covers it.
 
 The native Spark path still runs the GB10 through NVIDIA's `nvidia.ko`/`nvidia-uvm.ko`
 580.173.02; none of the GPU gates replaces it.
