@@ -80,7 +80,10 @@ Run these from a directory that holds a CUDApp checkout `cudapp/` at the source 
 The committed CUDApp lists came from CUDApp `84b524cadaaa8bc9b556adfaea9d6dd2e0d67a66`. The slice was written on
 omega-mv `f7a068ec54d67ccad504cf5e5887376916158b7b`; the merge that brought it into main regenerated
 `omega-base.sha256.txt` and `INVENTORY.tsv` with `BASE` = that merge's first parent,
-`d0f9bb23ac321915c987d58ea97cca0fc9392493`. That is recorded here only. The lists themselves carry no commit, and
+`d0f9bb23ac321915c987d58ea97cca0fc9392493`. The DRA-606 change (barrier 6 refusal in
+`gpu/nvidia/om/codegen/bw_hazard.om`) regenerated them again with `BASE` =
+`e8fcdc014b872af308da3e08a54f92069ffd14bc`, run in its own tree, so the list holds that change's files. That is
+recorded here only. The lists themselves carry no commit, and
 the gate cannot check the CUDApp commit, because CUDApp is not in this repository.
 
 Then rebuild the inventory and write its output:
