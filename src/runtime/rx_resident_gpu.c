@@ -1054,8 +1054,13 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
 
     RxGpuSeat *s = calloc(1, sizeof(*s));
     if (!s) { free(code); return -1; }
-    if (m16_native_open(&s->ctx) != 0 || m16_native_create_channel(&s->ctx) != 0) {
-        snprintf(s->err, sizeof s->err, "the graphics device did not open");
+    int open_rc = m16_native_open(&s->ctx);
+    int chan_rc = open_rc == 0 ? m16_native_create_channel(&s->ctx) : -1;
+    if (open_rc != 0 || chan_rc != 0) {
+        snprintf(s->err, sizeof s->err, open_rc != 0 ? "the graphics device did not open"
+                                                     : "the graphics channel was not created");
+        fprintf(stderr, "seat: %s (open %d channel %d; rm status 0x%x: %s)\n", s->err, open_rc, chan_rc,
+                s->ctx.rm.last_rm_status, s->ctx.rm.err);
         m16_native_close(&s->ctx);
         free(code);
         free(s);
@@ -1070,6 +1075,7 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     if (alloc < 0x100000) alloc = 0x100000;
     if (nvrm_alloc_gpu_uncached(&s->ctx.rm, alloc, &image) != 0) {
         snprintf(s->err, sizeof s->err, "the shared image was not allocated");
+        fprintf(stderr, "seat: %s (%llu bytes)\n", s->err, (unsigned long long)alloc);
         m16_native_close(&s->ctx);
         free(code);
         free(s);
@@ -1077,6 +1083,7 @@ int rx_gpu_seat_begin(RxWorld *w, RxGpuSeat **out) {
     }
     if (rx_world_bind_coherent(w, image.cpu, bytes_img, 1) != RX_OK) {
         snprintf(s->err, sizeof s->err, "the world image was not bound");
+        fprintf(stderr, "seat: %s\n", s->err);
         m16_native_close(&s->ctx);
         free(code);
         free(s);
