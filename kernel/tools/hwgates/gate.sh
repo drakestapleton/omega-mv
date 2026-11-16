@@ -1,21 +1,28 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# tools/hwgates/gate.sh: run the hardware-gate register check (hwgates.om) on its fixtures,
-# kill three compiling behavior mutants of the checker, then check docs/hardware-gates.tsv and two
+# tools/hwgates/gate.sh: run the hardware-gate register check (hwgates.om) on its fixtures, kill
+# its compiling behavior mutants, then check docs/hardware-gates.tsv, the receipts it cites, and
 # planted-bad copies of it.
-#   AIEN_OMC=<omc sha256 bcfa5828...> sh tools/hwgates/gate.sh
+#   AIEN_OMC=<the omc named in tools/hwgates/PIN> sh tools/hwgates/gate.sh
 # Prints HWGATES-GATE PASS (exit 0) or HWGATES-GATE FAIL (exit 1). Without the pinned compiler it
 # prints HWGATES-GATE NOT_RUN and exits 3. A NOT_RUN is never a pass.
+# Invariants this gate holds:
+#   - a PASS or FAIL row names a tracked, regular receipt file under evidence/ holding its
+#     HWGATE <id> <tier> <status> line (no receipt, no claim);
+#   - every gate id has exactly one PHYSICAL row, and QEMU is never PHYSICAL;
+#   - a gate whose receipt still names it cannot be deleted from the register.
 set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-want=bcfa582892afca8f65e551fe56867d918d86e84540c7381be8fa9ef18d0cf0f6
+PIN=tools/hwgates/PIN
+want=$(sed -n 's/^sha256 //p' "$PIN")
+commit=$(sed -n 's/^commit //p' "$PIN")
 if [ -z "${AIEN_OMC:-}" ] || [ ! -r "$AIEN_OMC" ]; then
-  echo "HWGATES-GATE NOT_RUN: set AIEN_OMC to omc sha256 $want (omega-mv 397e6704)"; exit 3
+  echo "HWGATES-GATE NOT_RUN: set AIEN_OMC to omc sha256 $want (omega-mv $commit, $PIN)"; exit 3
 fi
 have=$(sha256sum "$AIEN_OMC"); have=${have%% *}
 if [ "$have" != "$want" ]; then
-  echo "HWGATES-GATE NOT_RUN: compiler sha256 $have is not the pin $want"; exit 3
+  echo "HWGATES-GATE NOT_RUN: compiler sha256 $have is not the pin $want ($PIN)"; exit 3
 fi
 W=$(mktemp -d "${TMPDIR:-/tmp}/hwgates.XXXXXX")
 trap 'rm -rf "$W"' EXIT
@@ -43,6 +50,13 @@ fixtures() {
   done
   return "$bad"
 }
+# planted NAME RULE FILE: the checker must refuse FILE with exit 1 and rule=RULE
+planted() {
+  rc=0; "$W/hwgates" "$3" "$ROOT" > "$W/out" 2>&1 || rc=$?
+  if ! cmp -s "$REG" "$3" && [ "$rc" = 1 ] && grep -q "rule=$2\$" "$W/out"; then
+    echo "PASS planted $1 refused ($2)"; n=$((n + 1))
+  else echo "FAIL planted $1: rc=$rc, expected exit 1 with rule=$2: $(tr '\n' ' ' < "$W/out")"; fail=1; fi
+}
 fail=0; n=0
 build "$SRC" "$W/hwgates" || { echo "HWGATES-GATE FAIL: compile"; exit 1; }
 rc=0; fixtures "$W/hwgates" "" || rc=$?
@@ -60,21 +74,51 @@ mutant() { # NAME AWK-PROGRAM
 mutant claim-without-receipt 'prev=="if dash" && $0=="fail ln 3" {prev=$0; next} {prev=$0; print}'
 mutant physical-row-optional '$0=="if ne np 1" {print "if gt np 1"; next} {print}'
 mutant any-line-of-length '$0=="ok = eqneed ls n" {print "ok = true"; next} {print}'
+mutant empty-register-accepted '$0=="fail 0 8" {next} {print}'
+mutant receipt-ids-unchecked '$0=="receiptids" {next} {print}'
 # the register itself
 rc=0; "$W/hwgates" "$REG" "$ROOT" > "$W/reg" 2>&1 || rc=$?
 cat "$W/reg"
 if [ "$rc" = 0 ]; then echo "PASS register $REG"; n=$((n + 1)); else echo "FAIL register $REG rc=$rc"; fail=1; fi
+# the receipts it cites: tracked regular files that resolve inside evidence/
+bad=0
+for r in $(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$REG" | sort -u); do
+  rp=$(realpath -e "$r" 2>/dev/null || true)
+  if [ -L "$r" ] || [ ! -f "$r" ]; then echo "FAIL receipt $r is not a regular file"; bad=1
+  elif [ "${rp#"$ROOT/evidence/"}" = "$rp" ]; then echo "FAIL receipt $r resolves outside evidence/"; bad=1
+  elif ! git ls-files --error-unmatch -- "$r" > /dev/null 2>&1; then echo "FAIL receipt $r is not tracked by git"; bad=1
+  fi
+done
+if [ "$bad" = 0 ]; then echo "PASS receipts are tracked regular files under evidence/"; n=$((n + 1)); else fail=1; fi
+# alarm: the checker refuses registers and receipts larger than its tables (CAP bytes, MAXR rows,
+# read from hwgates.om); fail loudly at three quarters of either so the tables grow first
+cap=$(sed -n 's/^const CAP ulong \([0-9]*\)$/\1/p' "$SRC")
+maxr=$(sed -n 's/^const MAXR ulong \([0-9]*\)$/\1/p' "$SRC")
+rows=$(awk -F '\t' '!/^#/ && NF > 0' "$REG" | wc -l)
+big=0
+if [ $((rows * 4)) -gt $((maxr * 3)) ]; then echo "ALARM register has $rows rows; the checker holds MAXR=$maxr ($SRC)"; big=1; fi
+for f in "$REG" $(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$REG" | sort -u); do
+  s=$(wc -c < "$f")
+  if [ $((s * 4)) -gt $((cap * 3)) ]; then echo "ALARM $f is $s bytes; the checker reads CAP=$cap ($SRC)"; big=1; fi
+done
+if [ "$big" = 0 ]; then echo "PASS sizes: $rows rows of MAXR=$maxr, every file under 3/4 of CAP=$cap"; n=$((n + 1)); else fail=1; fi
 # planted control 1: the first PHYSICAL NOT_RUN row claims PASS without a receipt -> R3
 awk -F '\t' 'BEGIN{OFS="\t"} !done && $4=="PHYSICAL" && $5=="NOT_RUN" {$5="PASS"; done=1} {print}' "$REG" > "$W/p1.tsv"
-rc=0; "$W/hwgates" "$W/p1.tsv" "$ROOT" > "$W/out" 2>&1 || rc=$?
-if ! cmp -s "$REG" "$W/p1.tsv" && [ "$rc" = 1 ] && grep -q 'rule=R3$' "$W/out"; then
-  echo "PASS planted physical PASS without receipt refused (R3)"; n=$((n + 1))
-else echo "FAIL planted physical PASS: rc=$rc"; fail=1; fi
+planted "physical PASS without receipt" R3 "$W/p1.tsv"
 # planted control 2: every PHYSICAL row removed -> R5
 awk -F '\t' '$4!="PHYSICAL"' "$REG" > "$W/p2.tsv"
-rc=0; "$W/hwgates" "$W/p2.tsv" "$ROOT" > "$W/out" 2>&1 || rc=$?
-if [ "$rc" = 1 ] && grep -q 'rule=R5$' "$W/out"; then
-  echo "PASS planted register without physical rows refused (R5)"; n=$((n + 1))
-else echo "FAIL planted no-physical: rc=$rc"; fail=1; fi
+planted "register without physical rows" R5 "$W/p2.tsv"
+# planted control 3: every row of the first gate with a receipt removed -> R9
+gid=$(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $1; exit}' "$REG")
+awk -F '\t' -v g="$gid" '$1 != g' "$REG" > "$W/p3.tsv"
+planted "gate $gid deleted while its receipt names it" R9 "$W/p3.tsv"
+# planted control 4: comments only -> R8
+grep '^#' "$REG" > "$W/p4.tsv" || true
+planted "register without rows" R8 "$W/p4.tsv"
+# planted control 5: one row more than MAXR -> exit 2 naming the row table, never a rule verdict
+awk -v m="$maxr" 'BEGIN{for (i = 0; i <= m; i++) printf "ZZ-%d\tc\ts\tPHYSICAL\tNOT_RUN\t-\to\n", i}' > "$W/p5.tsv"
+rc=0; "$W/hwgates" "$W/p5.tsv" "$ROOT" > "$W/out" 2>&1 || rc=$?
+if [ "$rc" = 2 ] && grep -q 'MAXR' "$W/out"; then echo "PASS planted $((maxr + 1)) rows refused (exit 2, MAXR)"; n=$((n + 1))
+else echo "FAIL planted $((maxr + 1)) rows: rc=$rc: $(tr '\n' ' ' < "$W/out")"; fail=1; fi
 if [ "$fail" = 0 ]; then echo "HWGATES-GATE PASS checks=$n"; exit 0; fi
 echo "HWGATES-GATE FAIL checks_passed=$n"; exit 1

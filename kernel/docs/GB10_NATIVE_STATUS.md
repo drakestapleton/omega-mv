@@ -75,5 +75,6 @@ driver) are not native evidence and are not claimed here.
 ## Hardware gate register
 
 Which Aienux and GB10 driver gates ran on the host, in QEMU or on the machine, each with its
-receipt: [HARDWARE_GATES.md](HARDWARE_GATES.md). Every physical row is NOT_RUN or
-MISSING_IMPLEMENTATION until an attended run adds a receipt.
+receipt: the register [hardware-gates.tsv](hardware-gates.tsv), explained in
+[HARDWARE_GATES.md](HARDWARE_GATES.md). A physical row says PASS only once an attended run has
+committed its receipt.
