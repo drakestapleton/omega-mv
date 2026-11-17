@@ -23,6 +23,9 @@ This checkout, counted at the cutover commit:
 | `seed/omc/omc.om` | 1 `.om` production compiler | builds all other first-party `.om` |
 | Cross-repo | Rust/C | `spark-rsi-mv`, `open-humanity`, `aienux`, `aien-sovereign-core-mv` |
 
+Aienux is folded into this repository as `kernel/` (Drake 2026-11-17, from aienux main `1f12818d`; see
+`kernel/MIGRATION.md`), so its Rust and C are now in this checkout, not counted above.
+
 The count is large enough that this is a phased replacement, not one change. Every phase ends with
 deleted legacy code and qualified consumers; a plan or a passing unit test is not a cutover.
 

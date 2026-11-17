@@ -110,8 +110,10 @@ These are what the project is built toward. The notes under each say how far it 
   programs in other languages call compiled Omega.
 - [aien-architecture-mv](https://interplane.io/drakestapleton/aien-architecture-mv) holds the decision records
   and the order of the work.
-- [aienux](https://interplane.io/drakestapleton/aienux) is the core of AienOS, the operating system Omega is
-  meant to run on.
+- Aienux, the kernel of AienOS, the operating system Omega is meant to run on, is folded into `kernel/` here
+  with its history (Drake 2026-11-17), from aienux main `1f12818d`
+  ([aienux](https://interplane.io/drakestapleton/aienux) served `d01b2f19`, 22 commits earlier).
+  `kernel/MIGRATION.md` says how; `tests/gates/run.sh kernel` runs its gates.
 
 ## Papers
 
