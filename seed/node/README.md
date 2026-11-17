@@ -2054,7 +2054,7 @@ when no `code-main` sample was read. `memory-caps-fail-closed-then-pass`
 runs that same one-objective job again under the `prlimit` host word
 (keyword 235, RLIMIT_AS): half the measured `code-main` VmPeak, then that
 peak, then double, up to 32 times the peak. A smaller cap fails closed only
-with an explicit result: one `CWO` FAIL line and exit 1, or a `code-main`
+with an explicit result: one `CWO` line that is not a pass and exit 1, or a `code-main`
 refusal exit 50 to 57 with its cause line for that exit on stderr
 (`code-main: WHAT, exit R` with R equal to the exit). A pass is
 one `CWO 0 PASS` line, exit 0 and a journal with at most one start. A signal
@@ -2084,11 +2084,14 @@ recording has no answer for it, so `code-main` ends `CWO 0 FAIL 16`
 problem. So the explicit fails come from caps below execpure's ceiling, the
 passing cap is the first step at or above it, and when 32 times the
 `code-main` peak stays below it the check fails whatever the node does. The
-check shows that under a cap the node cannot work under the run ends in an
+check shows that under a cap at which its tools cannot run the run ends in an
 explicit FAIL, and that the node completes under a cap that leaves its tools
 their ceiling. It does not read the job file, so it does not show that a
 failing run leaves that file unchanged, and it does not measure how much
 memory the node needs.
+The one-job stand-in does not exercise the more-than-one-start guard or a
+trial that ends with an exit other than 1 after its single `CWO` line: those
+are guards in the check, not cases observed on this host.
 The host run uses a one-job stand-in for the round40 recording, which is not
 at the path qual reads:
 `seed/node/tests/ra40/final-selected.json`, a small
