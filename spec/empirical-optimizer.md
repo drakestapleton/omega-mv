@@ -234,7 +234,7 @@ not required.
 
 Candidate ff0109b, receipt
 `evidence/EMPIRICAL/7aab6079fab855675c89698e62dfb347af7a7c948ffa5fdd4d85aa0564a008a3.json`
-(bound, clean tree, Aienux c8ab65e, load average 2.1 to 3.8). 44 checks, 0
+(bound, clean tree, AIENOS c8ab65e, load average 2.1 to 3.8). 44 checks, 0
 failures; 20,212 runs checked against the reference, 0 mismatches; planted arm
 refused, 0 parent runs; 0 budget violations. Model blob 28,112 bytes.
 
