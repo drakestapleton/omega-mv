@@ -2,14 +2,15 @@
 # gate.sh: rebuild lm1b from a clean checkout and judge it against the Rust reference.
 # Existing-tool class (POSIX sh, awk, sha256sum, cmp, cargo for the reference). Prints RC=0 when
 # every check passes, RC=1 otherwise. Raw logs go to out/gate/ (not committed).
-#   OMC    seed-born Omega compiler (default ~/workspace/arch314/omega-mv/seed/out/omc)
+#   OMC    seed-born Omega compiler (default omega-mv's seed/out/omc; kernel/ is folded into omega-mv)
 #   MODEL  pinned GGUF (default ~/models/aien-mail/Llama-3.2-1B-Instruct-Q4_K_M.gguf)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
-OMC=${OMC:-$HOME/workspace/arch314/omega-mv/seed/out/omc}
+OMC=${OMC:-$ROOT/../seed/out/omc}
 MODEL=${MODEL:-$HOME/models/aien-mail/Llama-3.2-1B-Instruct-Q4_K_M.gguf}
-OMC_SHA=734f0a39319fbfa930bcc62cb30dbf06d47d78e126372b74f5baf478e6126b61
+# omega-mv's own pin (before the fold: 734f0a39319fbfa930bcc62cb30dbf06d47d78e126372b74f5baf478e6126b61)
+OMC_SHA=$(cut -c1-64 "$ROOT/../seed/out/omc.sha256")
 MODEL_SHA=3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1
 EOS=128009
 O=$HERE/out/gate

@@ -3,7 +3,7 @@
 # tools/hwgates/gate.sh: run the hardware-gate register check (hwgates.om) on its fixtures, kill
 # its compiling behavior mutants, then check docs/hardware-gates.tsv, the receipts it cites, and
 # planted-bad copies of it.
-#   AIEN_OMC=<the omc named in PIN> sh tools/hwgates/gate.sh
+#   AIEN_OMC=<omega-mv seed/out/omc> sh tools/hwgates/gate.sh
 # Prints HWGATES-GATE PASS (exit 0) or HWGATES-GATE FAIL (exit 1). Without the pinned compiler it
 # prints HWGATES-GATE NOT_RUN and exits 3. A NOT_RUN is never a pass.
 # Invariants this gate holds:
@@ -20,11 +20,14 @@
 set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-PIN=PIN
-want=$(sed -n 's/^omc-sha256 //p' "$PIN")
-commit=$(sed -n 's/^omega-mv //p' "$PIN")
+# The compiler pin is omega-mv's own (kernel/ is folded into omega-mv): seed/out/omc.sha256 at its root.
+PIN=../seed/out/omc.sha256
+want=$(cut -c1-64 "$PIN" 2>/dev/null) || want=
+if ! printf '%s\n' "$want" | grep -qxE '[0-9a-f]{64}'; then
+  echo "HWGATES-GATE NOT_RUN: no sha256 in $ROOT/$PIN"; exit 3
+fi
 if [ -z "${AIEN_OMC:-}" ] || [ ! -r "$AIEN_OMC" ]; then
-  echo "HWGATES-GATE NOT_RUN: set AIEN_OMC to omc sha256 $want (omega-mv $commit, $PIN)"; exit 3
+  echo "HWGATES-GATE NOT_RUN: set AIEN_OMC to omc sha256 $want (omega-mv $PIN)"; exit 3
 fi
 have=$(sha256sum "$AIEN_OMC"); have=${have%% *}
 if [ "$have" != "$want" ]; then

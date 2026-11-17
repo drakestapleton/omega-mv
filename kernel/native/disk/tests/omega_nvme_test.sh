@@ -3,8 +3,9 @@
 # Host/disposable-QEMU verification only; no device path argument exists.
 set -eu
 cd "$(dirname "$0")/../../.."
-: "${AIEN_OMC:?set AIEN_OMC to the existing pinned seeded compiler}"
-want=$(sed -n 's/^omc-sha256 //p' PIN)
+: "${AIEN_OMC:?set AIEN_OMC to omega-mv's pinned seeded compiler (seed/out/omc)}"
+# The pin is omega-mv's own (kernel/ is folded into omega-mv): seed/out/omc.sha256 at its root.
+want=$(cut -c1-64 ../seed/out/omc.sha256)
 actual=$(sha256sum "$AIEN_OMC")
 [ "${actual%% *}" = "$want" ] || { echo 'compiler pin mismatch' >&2; exit 2; }
 out=${OMEGA_NVME_EVIDENCE:-$(mktemp -d /tmp/omega-nvme-evidence-XXXXXX)}

@@ -1,7 +1,7 @@
 #!/bin/sh
 # gate.sh: L232 QEMU gate for the Omega TCP stack (verification rig, not product code).
 # Usage: gate.sh OMC IMAGE BUSYBOX OUTDIR [PROFILES] [SCENARIOS]
-#   OMC      pinned seeded omc (sha256 checked against the repository PIN file)
+#   OMC      pinned seeded omc (sha256 checked against omega-mv's seed/out/omc.sha256)
 #   IMAGE    arm64 Linux Image for the guest (needs virtio-net, AF_PACKET)
 #   BUSYBOX  static aarch64 busybox (guest init, sha256sum, and the g2h payload)
 #   PROFILES default "clean loss reorder hostile"; SCENARIOS default "echo h2g g2h"
@@ -14,9 +14,10 @@ OMC=$1 IMAGE=$2 BUSYBOX=$3 OUT=$4
 PROFILES=${5:-clean loss reorder hostile}
 SCEN=${6:-echo h2g g2h}
 HERE=$(cd "$(dirname "$0")" && pwd)
-# The compiler pin is the repository's one PIN file (moved by pin-follow.sh).
-PIN=$(sed -n 's/^omc-sha256 //p' "$HERE/../../../PIN")
-[ -n "$PIN" ] || { echo "GATE_FAIL no omc-sha256 line in $HERE/../../../PIN"; exit 2; }
+# The compiler pin is omega-mv's own (kernel/ is folded into omega-mv): seed/out/omc.sha256 at its root.
+PINFILE=$HERE/../../../../seed/out/omc.sha256
+PIN=$(cut -c1-64 "$PINFILE" 2>/dev/null)
+printf '%s\n' "$PIN" | grep -qxE '[0-9a-f]{64}' || { echo "GATE_FAIL no sha256 in $PINFILE"; exit 2; }
 mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd)
 have=$(sha256sum "$OMC" | cut -d' ' -f1)

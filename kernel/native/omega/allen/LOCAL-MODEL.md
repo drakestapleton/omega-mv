@@ -38,12 +38,17 @@ as pure Omega or evidence of a native macOS Omega runtime.
 
 ## Build and boot
 
-On Linux ARM64, provide the x86efi compiler pinned to
+On Linux ARM64, the compiler is omega-mv's own `seed/out/omc`, checked against
+`seed/out/omc.sha256` at the omega-mv root (aienux is folded into omega-mv as `kernel/`,
+Drake 2026-11-17); before the fold it was the x86efi compiler pinned to
 `3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`.
 The training source needs `osampleloaded` in `native/omegallm/cli.om`.
+Measured 2026-11-17 against aien-train b9bafc3c: both that old compiler and omega-mv's
+omc `34d611ca…` stop at `omc: line 3866: error 4` on the composed unit, so this build does not
+complete at that aien-train head with either compiler.
 
 ```sh
-OMEGA_COMPILER=/path/to/omc sh native/omega/allen/build-local-model.sh \
+sh native/omega/allen/build-local-model.sh \
   /path/to/aien-train /fresh/output/BOOTX64.EFI
 ```
 

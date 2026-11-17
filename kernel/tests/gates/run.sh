@@ -87,27 +87,32 @@ scripts_verdict() {
   [ "$script_fail" = 0 ]
 }
 
-# pinned_omc COMMIT SHA256: make AIEN_OMC the seeded Omega compiler with that hash. AIEN_OMC wins
-# when it has the hash; otherwise the committed compiler at COMMIT is taken from the sibling
-# checkout ../omega-mv (a clone of ~/git/omega-mv.git). Neither available: exit 3, never a pass.
-# PIN at the repository root names the one compiler build ("omega-mv <sha1>", "omc-sha256 <omc
-# sha256>", the format pin-follow.sh moves) for native/disk, native/net/tcp and tools/hwgates;
-# moving it moves all three.
-pin_of() { pinned_omc "$(sed -n 's/^omega-mv //p' "$1")" "$(sed -n 's/^omc-sha256 //p' "$1")"; }
-pinned_omc() {
-  local pc="$1" ps="$2" h=""
-  if [ -n "${AIEN_OMC:-}" ] && [ -r "$AIEN_OMC" ]; then h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1); fi
-  if [ "$h" != "$ps" ]; then
-    if [ -d ../omega-mv ] && git -C ../omega-mv show "$pc:seed/out/omc" > "$TMP/omc" 2>/dev/null; then
-      chmod +x "$TMP/omc"; export AIEN_OMC="$TMP/omc"
-      h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1)
-    fi
-  fi
-  if [ "$h" != "$ps" ]; then
-    echo "run.sh: no omc with sha256 $ps (set AIEN_OMC, or clone ~/git/omega-mv.git beside this tree as ../omega-mv)" >&2
+# omega_omc: make AIEN_OMC omega-mv's own committed seeded compiler. Aienux is folded into omega-mv
+# as kernel/ (Drake 2026-11-17), so the kernel's compiler pin is omega-mv's: seed/out/omc at the
+# omega-mv root, whose sha256 is the first field of seed/out/omc.sha256 there (the file the
+# omega-mv gates check). AIEN_OMC wins when it has that hash; otherwise seed/out/omc is used when it
+# has it. Neither: exit 3, never a pass. native/disk, native/net/tcp and tools/hwgates read the
+# same file, so moving omega-mv's compiler moves all three.
+OMEGA_ROOT="$(cd "$ROOT/.." && pwd)"
+omega_omc() {
+  local ps h=""
+  ps=$(cut -c1-64 "$OMEGA_ROOT/seed/out/omc.sha256" 2>/dev/null | head -n 1)
+  if ! printf '%s\n' "$ps" | grep -qxE '[0-9a-f]{64}'; then
+    echo "run.sh: no sha256 in $OMEGA_ROOT/seed/out/omc.sha256 (run from kernel/ inside an omega-mv checkout)" >&2
     obs omc_pinned false
     exit 3
   fi
+  if [ -n "${AIEN_OMC:-}" ] && [ -r "$AIEN_OMC" ]; then h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1); fi
+  if [ "$h" != "$ps" ] && [ -r "$OMEGA_ROOT/seed/out/omc" ]; then
+    export AIEN_OMC="$OMEGA_ROOT/seed/out/omc"
+    h=$(sha256sum "$AIEN_OMC" | cut -d' ' -f1)
+  fi
+  if [ "$h" != "$ps" ]; then
+    echo "run.sh: no omc with sha256 $ps (omega-mv seed/out/omc.sha256; set AIEN_OMC or build seed/out/omc)" >&2
+    obs omc_pinned false
+    exit 3
+  fi
+  obs omc_sha256 "\"$ps\""
   obs omc_pinned true
 }
 
@@ -209,24 +214,24 @@ case "$step" in
     bash scripts/qemu_ck_b7b_probe_test.sh --events
     ;;
   # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register, its
-  # receipts, a size alarm and planted-bad copies. Needs the compiler named in PIN.
+  # receipts, a size alarm and planted-bad copies. Needs omega-mv's pinned seed/out/omc.
   hw-gates)
-    pin_of PIN
+    omega_omc
     sh tools/hwgates/gate.sh
     ;;
   # Bounded read-only NVMe protocol in seeded Omega (#472): host cases, guard mutants and
   # disposable-QEMU cases (the test prints its counts). Physical NVMe stays NOT_RUN.
   omega-nvme)
-    pin_of PIN
+    omega_omc
     must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
       -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
     scripts_verdict
     ;;
   # Native TCP stack in seeded Omega (L232): the hosted hostile corpus (exact-state cases plus
-  # 2,000,000 seeded mutated frames), built with the compiler named in PIN. No QEMU; the
+  # 2,000,000 seeded mutated frames), built with omega-mv's pinned seed/out/omc. No QEMU; the
   # QEMU profiles stay in native/net/tcp/gate.sh.
   tcp-corpus)
-    pin_of PIN
+    omega_omc
     cat native/net/tcp/tcp.om native/net/tcp/corpus.om | "$AIEN_OMC" > "$TMP/tcp-corpus"
     chmod +x "$TMP/tcp-corpus"
     must_pass tcp_corpus 'CORPUS_PASS checks=[0-9]+ .*' -- "$TMP/tcp-corpus" 2000000

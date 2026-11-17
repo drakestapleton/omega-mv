@@ -1,8 +1,8 @@
 # native/net/tcp: native TCP in seeded Omega (ledger L232)
 
 TCP over IPv4 and ARP, written in Omega and built by the pinned seeded `omc`.
-The pin is the `omc-sha256` line of the repository's one `PIN` file, which
-`gate.sh` reads and checks; it refuses any other compiler. No C, no heap, no outside library
+The pin is omega-mv's own: the SHA-256 in `seed/out/omc.sha256` at the omega-mv root (kernel/ is
+folded into omega-mv), which `gate.sh` reads and checks; it refuses any other compiler. No C, no heap, no outside library
 in the stack or its drivers.
 
 | File | What it is |
