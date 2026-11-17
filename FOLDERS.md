@@ -154,6 +154,17 @@ Rules:
 
 Seeded-Omega programs moved from CUDApp `backend/` (ADR 0047, step 3): the SPIR-V kernel builder and its bit-exact host reference (`gpu/spirv/emit.om`, `conform.om`), and `hwman`, the hardware capability manifest (`gpu/hw/*.om` with the table `gpu/hw/manifest.tsv` it reads). Their run-time checks are still shell and C in CUDApp; here they are compiled by `tests/gates/run.sh gpu-units`.
 
+## `kernel/`
+
+Aienux, the kernel of AienOS, folded into omega-mv with its history (Drake 2026-11-17) from aienux main `1f12818d`: the C kernel (`native/kernel/`), the other native suites, the Rust crates under `crates/` with their vendored dependencies in `vendor/`, scripts, tools, docs and aienux's own evidence, in aienux's layout. `kernel/MIGRATION.md` says how it came, what was left out and why, and what the fold changed; `kernel/import/` is the filter-repo record. `kernel/AGENTS.md` and `kernel/README.md` are aienux's files as they were at the fold.
+
+Rules:
+
+- the kernel compiles Omega with this repository's `seed/out/omc`, checked against `seed/out/omc.sha256`; it has no compiler pin of its own (aienux's `PIN` and `REPIN` are gone)
+- the kernel's gates run from `kernel/` through `kernel/tests/gates/run.sh`; `tests/gates/run.sh kernel` (and `kernel-<step>`) runs `make test` of `native/kernel`, `ck-host-tests`, `hw-gates`, `omega-nvme` and `tcp-corpus` from the omega-mv root
+- receipts in `kernel/evidence/` are kept as written, as under `evidence/` (the `evidence-immutable` step checks only the top-level `evidence/`); an aienux hash in a receipt stays the aienux hash, and `kernel/import/commit-map` gives its commit here
+- `kernel/import/` is the record of the move; never edited after the landing that wrote it
+
 ## `native/`
 
 Handwritten .om units of omega-mv that are not part of the seed ladder: the ORIG-4 shadow advisor (native/orig4).

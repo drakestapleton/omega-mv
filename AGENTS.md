@@ -13,6 +13,7 @@ Shared rules: read https://www.aienos.com/agents/RULES.md first. This file adds 
 - `spec/`, `docs/`: specifications. `tests/`: gate suites; `tests/gates/*.gate` are the manifests the DGX Spark judge runs. `tools/`: harnesses. `mk/`: make fragments included by the `Makefile`.
 - `bench/prime_race/`, `calibration/`, `research/`, `doctrine/`: benchmark, Turing calibration, experiments, the Milestone 4 doctrine.
 - `evidence/`: content-addressed receipts, additions only.
+- `kernel/`: Aienux, the kernel, folded here with its history (Drake 2026-11-17, aienux main `1f12818d`); `kernel/MIGRATION.md` says how, and `tests/gates/run.sh kernel` runs its gates. `kernel/AGENTS.md` is aienux's file as it was at the fold.
 - `docs/migration/C-TO-OM-INVENTORY.md` lists the C that remains to be replaced.
 
 ## Installation
@@ -85,4 +86,4 @@ Gates whose manifest lists `gb10` under `requires:` (for example the `*-silicon`
 - `docs/migration/C-TO-OM-INVENTORY.md`: remaining C to replace.
 - `docs/PIPELINE.md`: how a pull request is tested on the Spark.
 - `CONTRIBUTORS.md`: who built what.
-- The kernel Omega is meant to run on, Aienux: https://interplane.io/drakestapleton/aienux
+- The kernel Omega is meant to run on, Aienux, is in `kernel/` (folded 2026-11-17; aienux's own page: https://interplane.io/drakestapleton/aienux).
