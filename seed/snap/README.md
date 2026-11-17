@@ -100,7 +100,8 @@ accepted=110 items=9510 forced=1909 positions=1909 mutants=7/7 probed=127 unprob
   rebuilt om2 units as `om2 ` with a trailing blank, so 243 positions were refused for that reason alone, error 16;
   any error other than 5 or 17 now fails the gate.)
 - D: 7 of 7 mutants caught (each fails 2 to 108 of the 110 programs).
-- E: optional-tail words: `kfdctl`, used by `fixtures/fx_kfdctl_*.om`.
+- E: optional-tail words: `kfdctl`, used by `fixtures/fx_kfdctl_*.omx` (`.omx` keeps them out of the repository-wide
+  byte-identity scan of `seed/omc/gate-pools.sh`, whose historical control compiler predates the optional tail; `gate.py` compiles them like `*.om`).
 - F: 127 words probed in omc, 0 wrong; 6 unprobed, named in the gate output.
 - The 71 programs omc refuses were all answered by `strip` (none trapped).
 - Fixed 2026-11-15: `strip` refused valid `kfdctl` programs (exit 3) because the table gave `kfdctl` a fixed

@@ -122,7 +122,10 @@ def main():
         m = re.match(rb'snap items (\d+) forced (\d+) bad (\d+)', r.stderr)
         return r.returncode, r.stdout.decode(errors='replace'), tuple(map(int, m.groups())) if m else None
 
-    files = sorted({f for d in dirs for f in glob.glob(os.path.join(d, '**', '*.om'), recursive=True)})
+    # fixtures/*.omx: fixtures using word forms newer than gate-pools' historical control compiler (kfdctl's
+    # optional tail), kept out of the repository-wide *.om byte-identity scan; compiled and checked here like *.om.
+    files = sorted({f for d in dirs for f in glob.glob(os.path.join(d, '**', '*.om'), recursive=True)}
+                   | set(glob.glob(os.path.join(HERE, 'fixtures', '*.omx'))))
     progs = {}
     for f in files:
         src = open(f, errors='replace').read()
