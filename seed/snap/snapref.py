@@ -250,8 +250,6 @@ def strip(src, table):
                 bad.append((n, fo, w))
             else:
                 f += 1; m.feed(w)
-                if w == 'end':            # a forced `end` word is followed by its own (forced) newline
-                    pass
                 continue
         out.append(w if w == '\n' else w + ' '); m.feed(w)
     return ''.join(out).replace(' \n', '\n'), n, f, bad

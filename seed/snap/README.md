@@ -20,7 +20,7 @@ leaves everything else alone. It is the base for two ways of not paying a model 
 `words.table` is one line per compiler word, `NAME ARITY FLAGS`, generated from omega-mcp `data/reference.json`
 for the compiler in use (the reference whose `pin.omc_sha256` is `seed/out/omc`'s sha256; get it with
 `git clone https://interplane.io/drakestapleton/omega-mcp.git` and use `omega-mcp/data/reference.json` at the
-commit whose pin matches (for omc `26540e6d…8991` that is omega-mcp main `44cf6b20`), or make it with that repository's `tools/gen-reference.py` against omega-mv at the
+commit whose pin matches), or make it with that repository's `tools/gen-reference.py` against omega-mv at the
 pinned head) by `gate.py --table REFERENCE_JSON > seed/snap/words.table`; the gate fails when the
 file is stale for that reference or the reference's pin is not the compiler under test. FLAGS: 1 a type word; 2 a word whose
 reference form has an optional tail (`[` in the form) and no rule of its own in snap, today only `kfdctl`,
@@ -30,7 +30,7 @@ a word or line end where an item was forced (omc refuses such a program too). `n
 not checked against a forced `end`, and `om2` with blanks around it is taken as an om2 header (omc takes it only
 alone on its line), so strip can pass a few programs omc refuses and expand can turn them into programs omc
 accepts: compile what `expand` writes before trusting it. Other exits: 64 an unknown mode
-word, 65 a bad table number (also input with no `%%` line, whose mode word is then read as a table row),
+word or no mode word at all (empty input, or a table with nothing after it), 65 a bad table number (also input with no `%%` line, whose mode word is then read as a table row),
 70 memory refused by the host, 71 read error, 72 write error. A mode word with no line end after it is an
 empty program: exit 0, `items 0`. `expand` reports a forced line end at the very end of a strand line as an
 ordinary item, so its `forced` count can be lower than `strip`'s; its output is unaffected.
@@ -88,7 +88,7 @@ Items are words and line ends. Not re-checked here: the token counts below and t
 measured by the SnapPairs lane and their receipts are not in this repository. Tokens were counted with the tokenizer of Qwen3.8-27B-FP8 rev `017b9c7a`
 (tokenizer.json sha256 `0997f410…`). On the bench set the strand is 198 tokens shorter (15.7%).
 
-Gate run on the Spark (Linux AArch64) with the committed `seed/out/omc` (sha256 `26540e6d…8991`, unchanged at
+Gate run on the Spark (Linux AArch64) with the then-committed `seed/out/omc` (sha256 `26540e6d…8991`; the committed omc has moved since, so rerun the gate for current figures; unchanged at
 omega-mv main `e4271abd`), programs from the omega-harness examples, `bench/inference_cost/tasks` (references
 and the 20 deliberately wrong `mutant.om` answers, which still compile) and the fixtures: `SNAPGATE PASS
 accepted=110 items=9510 forced=1909 positions=1909 mutants=7/7 probed=127 unprobed=6 fail=0`.
