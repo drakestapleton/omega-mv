@@ -62,9 +62,9 @@ spaces, path. They are not store keys.
   `build` with a `COMPILER_SHA256` that does not match the compiler file,
   are each refused with `digest-mismatch`, and the store holds the same
   files before and after.
-- Rebuilding the leaf after one byte is appended to its stored module
-  (`build` finds an existing blob of another length) is refused with
-  `digest-mismatch`.
+- In a fresh store, the leaf is built, its `KEY.ref` removed and one byte
+  appended to its stored module; rebuilding it skips the cache hit, finds
+  an existing blob of another length, and is refused with `digest-mismatch`.
 - Linking after the referenced module file is removed from the store
   (its `KEY.ref` still present) is refused with `digest-missing`, and the
   link output is not created.
