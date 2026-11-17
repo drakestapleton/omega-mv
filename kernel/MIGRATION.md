@@ -71,6 +71,10 @@ of `kernel/tests/gates/run.sh` still runs from `kernel/` the same way.
 
 ## What the fold changes for the kernel's own checks
 
+- `scripts/native_package.sh` and `scripts/native_package_test.sh` (`make test`'s `package-test`) assumed
+  the kernel was a repository root. The first now reads a source input from a commit as `$commit:./path`
+  and the second clones the whole repository and works in its `kernel/` prefix; the checks are unchanged.
+  Before that change `package-test` failed here with 23 of 117 checks.
 - `tools/hwgates/gate.sh` treats a register row whose source is `aienux@COMMIT` as naming "a commit of
   this repository" only when `git cat-file` finds COMMIT. The aienux commits are here under their
   rewritten hashes (`import/commit-map`), not their own, so rows that cite aienux commits fail that check
