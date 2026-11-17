@@ -545,7 +545,8 @@ check_record() {
         for f in "${source_inputs[@]}"; do
             key=${f#*:}; f=${f%%:*}
             if [ "$tc" = yes ]; then
-                have=$(git -C "$repo" show "$commit:$f" | sha256sum | cut -d' ' -f1)
+                # "./" resolves $f from $repo, which is kernel/ inside omega-mv (aienux folded there)
+                have=$(git -C "$repo" show "$commit:./$f" | sha256sum | cut -d' ' -f1)
             else
                 have=$(sha256_of "$repo/$f")
             fi
