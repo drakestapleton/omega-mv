@@ -9,7 +9,9 @@
  *                must be written; shapes up to 2^27 multiply-adds are compared in full, larger ones on 4096 sampled
  *                elements plus the last row and column. Speed: 2 M N K / kernel time, as a fraction of the measured
  *                tensor-core ceiling (BF16 HMMA 115.36 TFLOPS, evidence OWN30B-T3-TC-PEAK-BW-5faa0f70-20261013T2236Z;
- *                FP8 QMMA 237.52 TFLOPS, L151 as quoted in evidence/L403-roof-20261022). The mutants must be caught.
+ *                FP8 QMMA 237.52 TFLOPS, measured by our own QMMA peak kernel: omega-mv 3c8ce239 evidence/MACHINE-CEILING-20261020/raw/gpu-qmma.txt line 63,
+ *                copied with its sha256 into evidence/C3-GEMM-CHIP-DRA485/). The mutants must be caught. The marker is busy-polled for
+ *                --spin-us (default 2000), so kernel times are not quantized to the 50 us sleep-poll step; one sample per shape.
  *                --quick: 24 shapes, for a first look. --part N (0..7: type*4 + layout; 8: the red checks and reopen checks only)
  *                splits the run into pieces that each fit one 20-minute timing window; parts 0..8 together are the whole run.
  * Last line: "C3 gemm <tier>: PASS (<checks> checks)" or "... FAIL (<failed> of <checks>)". */
@@ -131,7 +133,7 @@ static void host_only(void) {
     check(!omega_gpu_gemm_cfg_ok(&big), "a tile past the register budget (rt 4 ct 2) refused");
     for (int t = 0; t < 2; t++)
         for (size_t s = 0; s < sizeof shapes / sizeof shapes[0]; s++)
-            for (int mut = 0; mut <= 4; mut++)
+            for (int mut = 0; mut <= 5; mut++)
                 for (int k = 0; k < OMEGA_GEMM_K_COUNT; k++) {
                     OmegaGemmCfg c = shapes[s]; c.type = (OmegaGpuGemmType)t; c.mutant = mut;
                     BlackwellIRProgram *p = calloc(1, sizeof *p);
@@ -231,10 +233,11 @@ static void sim_tier(void) {
             printf("%s\n", w);
             sim_free(&c);
         }
-    /* red checks: each mutant must change a result the real kernels get right; mutant 4 (wrong transpose) in both directions */
+    /* red checks: each mutant must change a result the real kernels get right; mutants 4 and 5 (wrong transpose of A, of B) in both directions */
     for (int t = 0; t < 2; t++)
-        for (int mut = 1; mut <= 4; mut++)
-            for (unsigned lay = 0; lay < (mut == 4 ? 2u : 1u); lay++) {
+        for (int mut = 1; mut <= 5; mut++)
+            for (unsigned li = 0; li < (mut >= 4 ? 2u : 1u); li++) {
+                const unsigned lay = mut == 5 ? li * 2u : li; /* mutant 4: A row, A col; mutant 5: B row, B col */
                 OmegaGemmCfg cfg; omega_gpu_gemm_default_cfg((OmegaGpuGemmType)t, &cfg); cfg.mutant = mut;
                 SimCtx c; memset(&c, 0, sizeof c);
                 const uint32_t M = 65, N = 63, K = 100;
@@ -304,8 +307,9 @@ static void chip_tier(int quick, int part) { /* part: -1 everything; 0..7 only t
     printf("%d shapes%s: %s\n", shapes, part < 0 ? ", both types, all four layouts" : "", g_failed == before ? "PASS" : "FAIL");
     if (part >= 0 && part < 8) { free(A); free(B); free(C); return; }
     for (int t = 0; t < 2; t++)
-        for (int mut = 1; mut <= 4; mut++)
-            for (unsigned lay = 0; lay < (mut == 4 ? 2u : 1u); lay++) {
+        for (int mut = 1; mut <= 5; mut++)
+            for (unsigned li = 0; li < (mut >= 4 ? 2u : 1u); li++) {
+                const unsigned lay = mut == 5 ? li * 2u : li; /* mutant 4: A row, A col; mutant 5: B row, B col */
                 OmegaGemmCfg cfg; omega_gpu_gemm_default_cfg((OmegaGpuGemmType)t, &cfg); cfg.mutant = mut;
                 omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, &cfg);
                 const uint32_t M = 65, N = 63, K = 100;
@@ -326,17 +330,22 @@ static void chip_tier(int quick, int part) { /* part: -1 everything; 0..7 only t
 
 int main(int argc, char **argv) {
     const char *tier = "chip";
-    int quick = 0, part = -1;
+    int quick = 0, part = -1; uint32_t spin = 2000;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host-only")) tier = "host";
         else if (!strcmp(argv[i], "--sim")) tier = "sim";
         else if (!strcmp(argv[i], "--quick")) quick = 1;
-        else if (!strcmp(argv[i], "--part") && i + 1 < argc) part = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--host-only | --sim | --quick | --part 0..8]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--part") && i + 1 < argc) {
+            char *end; long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 0 || v > 8) { fprintf(stderr, "--part takes 0..8\n"); return 2; }
+            part = (int)v;
+        }
+        else if (!strcmp(argv[i], "--spin-us") && i + 1 < argc) spin = (uint32_t)atoi(argv[++i]);
+        else { fprintf(stderr, "usage: %s [--host-only | --sim | --quick | --part 0..8 | --spin-us N]\n", argv[0]); return 2; }
     }
     if (!strcmp(tier, "host")) host_only();
     else if (!strcmp(tier, "sim")) { host_only(); sim_tier(); }
-    else chip_tier(quick, part);
+    else { (void)omega_gpu_session_set_spin_us(spin); chip_tier(quick, part); }
     if (g_failed) printf("C3 gemm %s: FAIL (%d of %d)\n", tier, g_failed, g_checks);
     else printf("C3 gemm %s: PASS (%d checks)\n", tier, g_checks);
     return g_failed ? 1 : 0;
