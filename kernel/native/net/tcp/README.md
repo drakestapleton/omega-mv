@@ -54,7 +54,8 @@ hit the defect; no run has shown it.
 - One connection at a time; no window scaling, SACK or timestamps; receive
   window 65,535 bytes; TIME-WAIT is 1 s (`Tcf 8`), not 2 MSL of minutes. A
   passive block whose SYN-ACK is never answered returns to LISTEN when its
-  retries run out (13 retransmissions, 483 s), as it does on an exact RST.
+  retries run out (12 retransmissions, given up at the 13th timeout, 483 s),
+  as it does on an exact RST.
   Until then every other client's SYN gets a RST, so one unanswered SYN
   every 8 minutes keeps the only listener busy.
 - The minimum RTO is 200 ms (`Tcf 10`), below RFC 6298's 1 s (rule 2.4, a
