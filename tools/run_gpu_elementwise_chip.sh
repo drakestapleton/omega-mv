@@ -36,6 +36,7 @@ fi
     nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo "nvidia-smi: unavailable"
     echo "omega $(git rev-parse HEAD) ($(git status --porcelain | wc -l) uncommitted paths)"
     echo "physics $(git -C "$P" rev-parse HEAD)"
+    echo "binary build/gpu_elementwise_test sha256 $(sha256sum < build/gpu_elementwise_test | cut -c1-64)"
     date -u +%FT%TZ
 } > "$OUT/device.txt"
 ./build/gpu_elementwise_test --out "$OUT/receipt.json" > "$OUT/run.log" 2>&1
