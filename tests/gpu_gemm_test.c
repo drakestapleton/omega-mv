@@ -10,7 +10,8 @@
  *                elements plus the last row and column. Speed: 2 M N K / kernel time, as a fraction of the measured
  *                tensor-core ceiling (BF16 HMMA 115.36 TFLOPS, evidence OWN30B-T3-TC-PEAK-BW-5faa0f70-20261013T2236Z;
  *                FP8 QMMA 237.52 TFLOPS, L151 as quoted in evidence/L403-roof-20261022). The mutants must be caught.
- *                --quick: 24 shapes, for a first look.
+ *                --quick: 24 shapes, for a first look. --part N (0..7: type*4 + layout; 8: the red checks and reopen checks only)
+ *                splits the run into pieces that each fit one 20-minute timing window; parts 0..8 together are the whole run.
  * Last line: "C3 gemm <tier>: PASS (<checks> checks)" or "... FAIL (<failed> of <checks>)". */
 #include "omega_gpu_gemm.h"
 #include "omega_gpu_session.h"
@@ -275,7 +276,7 @@ static void chip_one(OmegaGpuGemmType t, unsigned lay, uint32_t M, uint32_t N, u
     if (rc == 0 && bad == 0) printf("ok: %s\n", w);
 }
 
-static void chip_tier(int quick) {
+static void chip_tier(int quick, int part) { /* part: -1 everything; 0..7 only that (type, layout) cell's shapes; 8 only the red checks and the reopen checks */
     char w[200];
     const size_t need = (size_t)8192 * 8192 * 2 * 2 + (size_t)8192 * 8192 * 4 + ((size_t)8 << 30);
     if (!quick && mem_available() < need * 2) { printf("NOT_RUN: MemAvailable %zu MiB < %zu MiB\n", mem_available() >> 20, need * 2 >> 20); exit(2); }
@@ -293,13 +294,15 @@ static void chip_tier(int quick) {
     int before = g_failed, shapes = 0;
     for (int t = 0; t < 2; t++)
         for (unsigned lay = 0; lay < 4; lay++)
-            for (size_t s = 0; s < nsh; s++) {
+            for (size_t s = 0; s < nsh && part < 8; s++) {
+                if (part >= 0 && part != t * 4 + (int)lay) continue;
                 if (quick && lay != (unsigned)(s % 4)) continue;
                 uint32_t M = sh[s][0] > big ? big : sh[s][0], N = sh[s][1] > big ? big : sh[s][1], K = sh[s][2] > big ? big : sh[s][2];
                 chip_one((OmegaGpuGemmType)t, lay, M, N, K, A, B, C);
                 shapes++;
             }
-    printf("%d shapes, both types, all four layouts: %s\n", shapes, g_failed == before ? "PASS" : "FAIL");
+    printf("%d shapes%s: %s\n", shapes, part < 0 ? ", both types, all four layouts" : "", g_failed == before ? "PASS" : "FAIL");
+    if (part >= 0 && part < 8) { free(A); free(B); free(C); return; }
     for (int t = 0; t < 2; t++)
         for (int mut = 1; mut <= 4; mut++)
             for (unsigned lay = 0; lay < (mut == 4 ? 2u : 1u); lay++) {
@@ -323,16 +326,17 @@ static void chip_tier(int quick) {
 
 int main(int argc, char **argv) {
     const char *tier = "chip";
-    int quick = 0;
+    int quick = 0, part = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host-only")) tier = "host";
         else if (!strcmp(argv[i], "--sim")) tier = "sim";
         else if (!strcmp(argv[i], "--quick")) quick = 1;
-        else { fprintf(stderr, "usage: %s [--host-only | --sim | --quick]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--part") && i + 1 < argc) part = atoi(argv[++i]);
+        else { fprintf(stderr, "usage: %s [--host-only | --sim | --quick | --part 0..8]\n", argv[0]); return 2; }
     }
     if (!strcmp(tier, "host")) host_only();
     else if (!strcmp(tier, "sim")) { host_only(); sim_tier(); }
-    else chip_tier(quick);
+    else chip_tier(quick, part);
     if (g_failed) printf("C3 gemm %s: FAIL (%d of %d)\n", tier, g_failed, g_checks);
     else printf("C3 gemm %s: PASS (%d checks)\n", tier, g_checks);
     return g_failed ? 1 : 0;
