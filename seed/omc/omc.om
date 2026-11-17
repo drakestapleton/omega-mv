@@ -17244,12 +17244,14 @@ writeout 0
 end
 
 note ======== x86efi: UEFI 2.10 PE32+ application (docs/X86-EFI.md) ========
-note efi OP ARG A OFF N -> ulong EFI_STATUS or result. OP is a literal 0..14; A is writable uchar
-note storage, bounds checked before any firmware call; ARG is never a pointer. Errors are 2^63|code.
+note efi OP ARG A OFF N -> ulong EFI_STATUS or result. OP is a literal 0..21; A is writable uchar
+note storage, bounds checked before any firmware call; ARG is never a pointer, except the physical
+note address of the machine operations 20 and 21. Errors are 2^63|code.
 note Private state occupies the first 16 KiB of the PE .bss, below the owned 8 MiB stack. Firmware is
 note called per UEFI 2.3.4.2: RCX/RDX/R8/R9, 32-byte home area, an 80-byte 16-aligned reservation.
 note Language values stay in RBP slots, so integers and floats survive every firmware call.
 note Port of the Allen x86efi fork (operations 0..11) onto main's backend; 12, 13 and 14 are new.
+note 15..21 are machine access (xmach): no firmware call, the application runs in ring 0.
 
 note xp k: 0 LEA r,private+off; 1 load r from private+off; 2 store r to private+off (via R10);
 note 3 call BootServices+off (R11); 4 call method off of the protocol held in private slot r (RCX = This).
@@ -17712,7 +17714,7 @@ end
 x = mul get depth 0 32
 put fr add x 7 get nslot 0
 op = lenval 4
-if gt op 14
+if gt op 21
 fail 25
 end
 harg x 2 5
@@ -17796,7 +17798,140 @@ if eq op 14
 xf14
 ret
 end
+if ge op 15
+xmach op
+ret
+end
 xdev op
+end
+
+note efi 15..21 machine access: privileged instructions of ring 0, no firmware call (Intel SDM volume 2:
+note IN, OUT, RDMSR, WRMSR, MOV from control registers, MOV, MOVZX, REP MOVSB). Nothing is checked beyond
+note the fields below: a port, MSR or address the machine does not have faults or reads garbage there.
+note 15 port read, 16 port write. ARG bits 0..15 port, 16..17 width (0 one byte, 1 two, 2 four); 16 takes
+note the value from bits 32..63, of which the low 1, 2 or 4 bytes go out. Width 3, any of bits 18..63 (15)
+note or 18..31 (16) set is 45, before any I/O. 15 returns the value zero-extended, 16 returns 0. The 0x66
+note operand prefix is jumped over for width 2, so IN/OUT EAX and AX share one opcode byte.
+note 17 RDMSR, 18 WRMSR. ARG the MSR index (2^32 and above is 46); the 64-bit value EDX:EAX is the eight
+note little-endian bytes at A+OFF, written by 17 and read by 18; N below 8 is 5. Result 0.
+note 19 control register ARG = 0, 2, 3 or 4 (else 47) into the eight bytes at A+OFF; N below 8 is 5. Result 0.
+note 20 physical memory at ARG to A+OFF, 21 A+OFF to physical memory at ARG, N bytes, result N. N of
+note 1, 2, 4 or 8 is one MOV of that width (what a device register needs); any other N is CLD, REP MOVSB,
+note ascending byte by byte. N of 0 touches nothing.
+fn xmach op ulong to void
+if le op 16
+xrr 137 2 3
+xrr 137 1 3
+if eq op 16
+xb 72 193 225
+emitb 32
+xb 72 193 233
+emitb 48
+else
+xb 72 193 233
+emitb 16
+end
+ximm 0 2
+xrr 57 1 0
+xer 0 8 45
+if eq op 16
+xrr 137 0 3
+xb 72 193 232
+emitb 32
+else
+ximm 0 0
+end
+io = add 236 mul sub op 15 2
+xrr 133 1 1
+p = xbranch 1
+emitb uchar io
+q = xbranch 14
+xpatch p get oc 0
+xb 72 255 201
+p = xbranch 1
+emitb 102
+xpatch p get oc 0
+emitb uchar add io 1
+xpatch q get oc 0
+if eq op 16
+ximm 0 0
+end
+ret
+end
+if le op 18
+xe 3 8 0
+xrr 137 0 3
+xb 72 193 232
+emitb 32
+xrr 133 0 0
+xer 0 1 46
+xrr 137 1 3
+if eq op 17
+emitb 15
+emitb 50
+xb 72 193 226
+emitb 32
+xrr 9 0 2
+xmem 137 0 12 0
+else
+xmem 139 0 12 0
+xrr 137 2 0
+xb 72 193 234
+emitb 32
+emitb 15
+emitb 48
+end
+ximm 0 0
+ret
+end
+if eq op 19
+xe 3 8 0
+n = ulong 0
+while le n 4
+if ne n 1
+ximm 0 n
+xrr 57 3 0
+p = xbranch 1
+xb 15 32 add 194 mul n 8
+xmem 137 2 12 0
+ximm 0 0
+xer 1 0 0
+xpatch p get oc 0
+end
+n = add n 1
+end
+xer 0 14 47
+ret
+end
+src = ulong 3
+dst = ulong 12
+if eq op 21
+src = ulong 12
+dst = ulong 3
+end
+xrr 137 0 13
+s = ulong 1
+while le s 8
+ximm 2 s
+xrr 57 13 2
+p = xbranch 1
+if eq s 8
+xmem 139 2 src 0
+xmem 137 2 dst 0
+else
+xhraw 2 src 0 s
+xhput 2 dst 0 s
+end
+xer 1 0 0
+xpatch p get oc 0
+s = mul s 2
+end
+xrr 137 6 src
+xrr 137 7 dst
+xrr 137 1 13
+emitb 252
+emitb 243
+emitb 164
 end
 
 note efi 14 machine identity; ARG bits 0..15 sub, 16..63 its parameter. Sub 0: CPUID leaf ARG>>16

@@ -1,0 +1,487 @@
+target x86efi
+om2
+note efi 15..21 machine access (docs/X86-EFI.md). Lines go to the firmware console with efi 13, except
+note the one line after ==B, which is written to COM1 (0x3F8) with port I/O only. Every line states
+note facts (1 = holds; res0 = every result of the calls on that line was 0), never a value that
+note depends on where the firmware put something.
+note ARG of 15/16: port | width<<16 | value<<32. io is the array those two operations do not use.
+note The unit is OM-2 for the text literals and the unsized view that prints them.
+note The PCI, fw_cfg and local APIC facts are those of QEMU q35 (tests/x86efi/run.sh): an emulator test.
+global ms uchar 256
+global ml ulong 1
+global io uchar 8
+global v8 uchar 8
+global pb uchar 16
+global sa uchar 4096
+global da uchar 4096
+note ma is the array the program finds in physical memory: 2 MiB of the period-8 pattern pat, so a
+note probe every 1 MiB lands at least 16 bytes inside it wherever the firmware loaded the image.
+global ma uchar 2097152
+note st: 0 IA32_APIC_BASE, 1 CR3, 2 CR4 (kept for the memory checks)
+global st ulong 3
+
+text tb "==B"
+text te "==E"
+text tcom "OMEGA COM1 PORT IO"
+text tsent "com1 sent all="
+text tpci "pci id32="
+text tid16 " id16="
+text tdev " dev16="
+text tid8 " id8="
+text thi8 " hi8="
+text tcf8 " cf8="
+text tfw "fwcfg sig="
+text tefer "efer lme="
+text tlma " lma="
+text tapic "apic base="
+text ten " en="
+text tbsp " bsp="
+text tx2 " x2="
+text tkgs "kgs set="
+text tgot " got="
+text tback " back="
+text tcr0 "cr0 pe="
+text tpg " pg="
+text tcr2 "cr2 res0="
+text tcr3 "cr3 nz="
+text tcr4 "cr4 pae="
+text tdis "cr distinct="
+text tlap "lapic integrated="
+text tfind "find own array="
+text twalk "walk identity="
+text tmem "mem n="
+text tw " w="
+text tr " r="
+text tr0 " res0="
+
+fn pc c ulong to void
+put ms get ml 0 uchar c
+put ml 0 add get ml 0 1
+end
+
+fn nl to void
+pc 10
+r = efi 13 0 ms 0 get ml 0
+put ml 0 0
+end
+
+fn say s view uchar * to void
+for i ulong len s
+pc ulong get s i
+end
+end
+
+fn hx v ulong n ulong to void
+i = ulong 0
+while lt i n bound 16
+d = and shr v mul sub sub n 1 i 4 15
+if lt d 10
+pc add 48 d
+else
+pc add 87 d
+end
+i = add i 1
+end
+end
+
+note 1 when b holds, else 0
+fn yes b bool to void
+if b
+pc 49
+else
+pc 48
+end
+end
+
+note bit k of v as 0 or 1
+fn bit v ulong k ulong to void
+pc add 48 and shr v k 1
+end
+
+fn line v ulong to void
+hx v 16
+nl
+end
+
+note the eight bytes of v8 as a little-endian ulong, and back
+fn rd8 to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get v8 i mul i 8
+end
+ret v
+end
+
+fn wr8 v ulong to void
+for i ulong 8
+put v8 i uchar and shr v mul i 8 255
+end
+end
+
+note port read and write of width w (0, 1, 2: one, two, four bytes)
+fn pin p ulong w ulong to ulong
+ret efi 15 or p shl w 16 io 0 0
+end
+
+fn pout p ulong w ulong v ulong to ulong
+ret efi 16 or or p shl w 16 shl v 32 io 0 0
+end
+
+note one byte to COM1: wait for line status (0x3FD) bit 5, transmit holding register empty, then write
+note 0x3F8. 1 when sent, 0 when the bit never came up or a port operation was refused.
+fn com c ulong to ulong
+i = ulong 0
+while lt i 1000000 bound 1000001
+if ne and pin 1021 0 32 0
+if eq pout 1016 0 c 0
+ret 1
+end
+ret 0
+end
+i = add i 1
+end
+ret 0
+end
+
+fn comline s view uchar * to ulong
+n = ulong 0
+for i ulong len s
+n = add n com ulong get s i
+end
+n = add n com 13
+n = add n com 10
+ret n
+end
+
+note MSR i through v8; the result of efi 17 or 18
+fn rdmsr i ulong to ulong
+ret efi 17 i v8 0 8
+end
+
+fn wrmsr i ulong to ulong
+ret efi 18 i v8 0 8
+end
+
+note control register n as a value; 2^63|code stays an error because no CR here has bit 63 set
+fn cr n ulong to ulong
+r = efi 19 n v8 0 8
+if ne r 0
+ret r
+end
+ret rd8
+end
+
+note 8 bytes of physical memory at a (one 64-bit MOV)
+fn phys8 a ulong to ulong
+r = efi 20 a v8 0 8
+ret rd8
+end
+
+fn pat i ulong to ulong
+ret and add mul and i 7 37 201 255
+end
+
+note true when pb holds 16 bytes of the pattern at any phase
+fn match to bool
+b = ulong get pb 0
+for j ulong 8
+if eq pat j b
+ok = true
+for k ulong 16
+if ne ulong get pb k pat add j k
+ok = false
+end
+end
+ret ok
+end
+end
+ret false
+end
+
+note p showed the pattern. Write one 0 byte (not a pattern value) there with efi 21 and look for it in
+note ma: index + 1 when it turned up, after putting the pattern back; else the byte that was at p is
+note written back and the result is 0.
+fn probe p ulong to ulong
+old = get pb 0
+put v8 0 0
+r = efi 21 p v8 0 1
+k = ulong 0
+while lt k len ma bound 2097153
+if eq ulong get ma k 0
+put ma k uchar pat k
+ret add k 1
+end
+k = add k 1
+end
+put v8 0 old
+r = efi 21 p v8 0 1
+ret 0
+end
+
+note the physical address of ma[0], or 0: 16-byte reads every 1 MiB from 1 MiB to 2 GiB
+fn find to ulong
+p = ulong 1048576
+while lt p 2147483648 bound 2048
+r = efi 20 p pb 0 16
+if eq r 16
+if match
+k = probe p
+if ne k 0
+ret sub p sub k 1
+end
+end
+end
+p = add p 1048576
+end
+ret 0
+end
+
+note the address va translated through the page tables under cr3 (4 levels, 5 when la is true), every
+note entry read with efi 20; 2^63 when an entry is not present. Entry bits: 0 present, 7 large page,
+note 12..51 address (Intel SDM volume 3, 4.5).
+fn walk va ulong cr3 ulong la bool to ulong
+m = ulong 4503599627366400
+t = and cr3 m
+sh = ulong 39
+if la
+sh = ulong 48
+end
+while ge sh 12 bound 5
+e = phys8 add t mul and shr va sh 511 8
+if eq and e 1 0
+ret 9223372036854775808
+end
+lo = sub shl ulong 1 sh 1
+if eq sh 12
+ret or and e m and va lo
+end
+if and le sh 30 ne and e 128 0
+ret or and and e m not lo and va lo
+end
+t = and e m
+sh = sub sh 9
+end
+ret 9223372036854775808
+end
+
+note n bytes at ma[4099..): efi 21 from sa checked with get (w), then efi 20 into da[1..) of bytes
+note written with put (r); the bytes on both sides must stay as they were. Leaves ma as the pattern.
+fn mem base ulong n ulong to void
+o = ulong 4099
+for i ulong n
+put sa i uchar and add mul i 7 add n 5 255
+end
+r = efi 21 add base o sa 0 n
+w = eq r n
+for i ulong n
+if ne get ma add o i get sa i
+w = false
+end
+end
+if or ne ulong get ma sub o 1 pat sub o 1 ne ulong get ma add o n pat add o n
+w = false
+end
+for i ulong n
+put ma add o i uchar and add mul i 11 add n 3 255
+end
+for i ulong add n 2
+put da i 238
+end
+r = efi 20 add base o da 1 n
+g = eq r n
+for i ulong n
+if ne get da add i 1 get ma add o i
+g = false
+end
+end
+if or ne ulong get da 0 238 ne ulong get da add n 1 238
+g = false
+end
+for i ulong n
+put ma add o i uchar pat add o i
+end
+say tmem
+hx n 4
+say tw
+yes w
+say tr
+yes g
+nl
+end
+
+fn ports to void
+note (a) COM1 by port I/O only: 18 characters, CR, LF
+n = comline tcom
+say tsent
+yes eq n 20
+nl
+note PCI configuration mechanism 1 (0xCF8 address, 0xCFC data): the q35 host bridge 00:00.0 is 8086:29c0.
+note The address register only answers 32-bit access; the narrower reads print all 32 result bits, so a
+note read of the wrong width shows.
+old = pin 3320 2
+r = pout 3320 2 2147483648
+say tpci
+hx pin 3324 2 8
+say tid16
+hx pin 3324 1 8
+say tdev
+hx pin 3326 1 8
+say tid8
+hx pin 3324 0 8
+say thi8
+hx pin 3327 0 8
+say tcf8
+hx pin 3320 2 8
+say tr0
+yes eq or r pout 3320 2 old 0
+nl
+note fw_cfg: a 16-bit write of selector 0 to 0x510, then four byte reads of 0x511 give QEMU
+r = pout 1296 1 0
+say tfw
+for i ulong 4
+c = pin 1297 0
+if and ge c 32 le c 126
+pc c
+else
+pc 63
+end
+end
+nl
+end
+
+fn msrs to void
+note (b) IA32_EFER (0xC0000080): LME bit 8, LMA bit 10
+r = rdmsr 3221225600
+v = rd8
+say tefer
+bit v 8
+say tlma
+bit v 10
+say tr0
+yes eq r 0
+nl
+note IA32_APIC_BASE (0x1B): base bits 12..35, global enable bit 11, x2APIC bit 10, BSP bit 8
+r = rdmsr 27
+ab = rd8
+put st 0 ab
+say tapic
+hx and ab 68719472640 8
+say ten
+bit ab 11
+say tbsp
+bit ab 8
+say tx2
+bit ab 10
+say tr0
+yes eq r 0
+nl
+note efi 18 on IA32_KERNEL_GS_BASE (0xC0000102), unused under UEFI: write 0x123456789abc (both
+note halves of EDX:EAX nonzero), read it back, restore
+r = rdmsr 3221225730
+kg = rd8
+wr8 20015998343868
+r = or r wrmsr 3221225730
+wr8 0
+r = or r rdmsr 3221225730
+say tkgs
+yes eq r 0
+say tgot
+yes eq rd8 20015998343868
+wr8 kg
+r = wrmsr 3221225730
+wr8 0
+r = or r rdmsr 3221225730
+say tback
+yes and eq r 0 eq rd8 kg
+nl
+end
+
+fn crs to void
+note control registers: CR0 PE bit 0, PG bit 31; CR4 PAE bit 5, LA57 bit 12
+c0 = cr 0
+say tcr0
+bit c0 0
+say tpg
+bit c0 31
+nl
+say tcr2
+yes eq efi 19 2 v8 0 8 0
+nl
+c3 = cr 3
+say tcr3
+yes and ne c3 0 lt c3 9223372036854775808
+nl
+c4 = cr 4
+say tcr4
+bit c4 5
+nl
+say tdis
+yes and and ne c0 c3 ne c0 c4 ne c3 c4
+nl
+put st 1 c3
+put st 2 c4
+end
+
+fn memory to void
+ab = get st 0
+c3 = get st 1
+c4 = get st 2
+note the local APIC version register at base + 0x30 needs one 32-bit read (N = 4): an integrated
+note APIC reports version 0x1X in bits 0..7
+r = efi 20 add and ab 68719472640 48 v8 0 4
+say tlap
+yes and eq r 4 eq and ulong get v8 0 240 16
+nl
+note (c) physical memory: find ma, check the address against the page tables, then copy both ways
+for i ulong len ma
+put ma i uchar pat i
+end
+base = find
+say tfind
+yes ne base 0
+nl
+if ne base 0
+say twalk
+yes eq walk add base 4099 c3 ne and c4 4096 0 add base 4099
+nl
+mem base 0
+mem base 1
+mem base 2
+mem base 4
+mem base 8
+mem base 13
+mem base 3000
+end
+end
+
+fn refusals to void
+note (d) refusals. 45: width 3, a bit above the fields (15), a bit between width and value (16); the
+note refused writes would put X on COM1. 46: MSR index 2^32. 47: CR 1, 5, 8. 5: N below 8.
+line efi 15 or 1016 shl ulong 3 16 io 0 0
+line efi 15 or 1016 shl ulong 1 18 io 0 0
+line efi 15 or 1016 shl ulong 1 63 io 0 0
+line efi 16 or or 1016 shl ulong 3 16 shl ulong 88 32 io 0 0
+line efi 16 or or 1016 shl ulong 1 18 shl ulong 88 32 io 0 0
+line efi 16 or or 1016 shl ulong 1 31 shl ulong 88 32 io 0 0
+line efi 17 4294967296 v8 0 8
+line efi 18 4294967296 v8 0 8
+line efi 17 27 v8 0 7
+line efi 18 3221225730 v8 0 7
+line efi 19 1 v8 0 8
+line efi 19 5 v8 0 8
+line efi 19 8 v8 0 8
+line efi 19 0 v8 0 7
+end
+
+fn main to ulong
+say tb
+nl
+ports
+msrs
+crs
+memory
+refusals
+say te
+nl
+ret 0
+end

@@ -5,7 +5,10 @@ Draft aien-dev/aien-train#53 at `e08443c3` records one physical iMac run of an i
 (`b4f45121`, `evidence/OMEGALLM/imac/`): EXERCISED on physical hardware (one machine).
 This repository has no physical-firmware gate. The compiler was built on main `ba5559d9`.
 The x86efi branch (PR #1015) also merged main `f9a9a40b` (#995) and main `19b8340d` (#996). Neither merge changed `seed/omc/omc.om` or `seed/out/omc`.
-Implementation: `seed/omc/omc.om` (functions `xp` through `xf12`, plus hooks in `kw`, the value
+Machine access, efi 15..21 (DRA-937, 2026-11-17), is in `seed/omc/omc.om` but not in the committed
+`seed/out/omc` (`cfd96b48`), which refuses `efi 15` with error 25 until the next reseed. It was
+EXERCISED under emulation only, with a compiler built from this source (below).
+Implementation: `seed/omc/omc.om` (functions `xp` through `xf12` and `xmach`, plus hooks in `kw`, the value
 parser, the driver, `xleave`, `xfinish`, `xlead` and `xeof`). It reuses the x86linux instruction
 selection, register model and SSE2 float code of [X86-LINUX.md](X86-LINUX.md); only the image
 format, entry/exit and the `efi` word are new.
@@ -35,9 +38,9 @@ calibrates it once with Boot Services `Stall(100000)`, so every image pays a 100
 
 ## The `efi` word
 
-`r = efi OP ARG A OFF N`: OP is a literal 0..14, ARG a ulong, A a uchar array with `OFF+N <= len A`
+`r = efi OP ARG A OFF N`: OP is a literal 0..21, ARG a ulong, A a uchar array with `OFF+N <= len A`
 (else trap 3, the same check as `read`/`write`). The result is a ulong; bit 63 set means an error
-whose code is in the low bits.
+whose code is in the low bits. ARG is never a pointer, except the physical address of efi 20 and 21.
 
 | OP | Operation (from the code) | Status |
 |---|---|---|
@@ -55,6 +58,13 @@ whose code is in the low bits.
 | 12 | general file, below | EXERCISED (EMULATED) |
 | 13 | console, below | EXERCISED (EMULATED) |
 | 14 | machine identity, below | EXERCISED (EMULATED) |
+| 15 | port read (IN), 1, 2 or 4 bytes, below | EXERCISED (EMULATED): `tests/x86efi/machine` |
+| 16 | port write (OUT), 1, 2 or 4 bytes | EXERCISED (EMULATED) |
+| 17 | read MSR (RDMSR) | EXERCISED (EMULATED): IA32_EFER, IA32_APIC_BASE, IA32_KERNEL_GS_BASE |
+| 18 | write MSR (WRMSR) | EXERCISED (EMULATED): IA32_KERNEL_GS_BASE only |
+| 19 | read CR0, CR2, CR3 or CR4 | EXERCISED (EMULATED); the CR2 value is not checked |
+| 20 | physical memory to A | EXERCISED (EMULATED): RAM, page table entries, one local APIC register |
+| 21 | A to physical memory | EXERCISED (EMULATED): the program's own array only; a device register is NOT_RUN |
 
 ### efi 13 console
 
@@ -110,6 +120,47 @@ fields it prints; `tests/x86efi/ident/id.om` reads type 1 Manufacturer, Product 
 never the serial number (offset 7) or the UUID (8..23). Error 44 is NOT_RUN: OVMF always installs
 SMBIOS.
 
+### efi 15..21 machine access
+
+A UEFI application runs in ring 0, so these seven operations are single privileged instructions
+with no firmware call (`xmach` in `omc.om`; Intel SDM volume 2: IN, OUT, RDMSR, WRMSR, MOV from
+control registers, MOV, REP MOVSB). They are the first step toward a kernel written in Omega. Only
+the fields below are checked. A port nothing answers, an MSR the processor does not have, or an
+address that is not mapped is the program's responsibility: RDMSR and WRMSR of an absent MSR raise
+#GP and an unmapped address raises #PF (Intel SDM), nothing in the image handles either, and what
+happens next is the firmware's choice. Neither case was run.
+
+| OP | ARG | A[OFF..OFF+N) | Result |
+|---|---|---|---|
+| 15 | port in bits 0..15, width in bits 16..17 (0: 8 bits, 1: 16, 2: 32) | not used | the value read, zero-extended |
+| 16 | port and width as 15, value in bits 32..63 (its low 8, 16 or 32 bits go out) | not used | 0 |
+| 17 | MSR index, below 2^32 | receives the 64-bit value, little-endian; N ≥ 8 | 0 |
+| 18 | MSR index, below 2^32 | holds the 64-bit value to write; N ≥ 8 | 0 |
+| 19 | control register number 0, 2, 3 or 4 | receives the 64-bit value; N ≥ 8 | 0 |
+| 20 | physical address | receives N bytes read from that address | N |
+| 21 | physical address | the N bytes written to that address | N |
+
+The values of 17, 18 and 19 pass through the array because bit 63 of the result is the error flag
+and an MSR or CR value may have it set. Error codes, all raised before the instruction runs:
+
+| Code | Meaning |
+|---|---|
+| 5 | N below 8 for 17, 18 or 19 (the code every operation uses for a short N) |
+| 45 | 15 or 16: width 3, or a bit set outside the fields (bits 18..63 for 15, bits 18..31 for 16) |
+| 46 | 17 or 18: MSR index 2^32 or above |
+| 47 | 19: a register number other than 0, 2, 3, 4 |
+
+For 20 and 21, N of 1, 2, 4 or 8 is one MOV of exactly that width, which is what a memory-mapped
+device register needs; any other N is CLD, REP MOVSB, ascending byte by byte (so an overlapping copy
+toward higher addresses repeats bytes), and N of 0 touches nothing. Under Boot Services the firmware
+maps physical memory one to one (UEFI 2.3.4), which is why a physical address can be used directly; the test
+checks this for one address by walking the page tables under CR3. Omega has no word that gives an
+array's address. A program that needs one finds it as `tests/x86efi/machine/m1.om` does: it fills an
+array with a pattern, probes physical memory with efi 20 and confirms a hit with efi 21.
+
+Not in this step: writes to control registers, CR8, descriptor tables, interrupt control, HLT,
+INVLPG. efi 16 does not refuse a value wider than its width; the upper bits are dropped.
+
 ## GUIDs
 
 GOP, SNP, RNG, Simple Pointer, Absolute Pointer, Simple File System, LoadedImage and FileInfo are
@@ -134,6 +185,13 @@ each check it cannot run and exits 77 when nothing could run).
 | Exit flush (`exit/`) | a file written with sub 3 and left open is on disk with all 10 bytes after `return` and after trap 3. The previous omc (`d0f756d9…`, no exit cleanup) leaves a 0-byte file in both cases |
 | GUIDs | values checked; see above |
 | Machine identity (`ident/`, omc sha256 `3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194`) | under `-smbios type=1,manufacturer=OmegaTest,product=IdentBox,version=7.1,serial=…,uuid=…` and both `smbios-entry-point-type=64` and `=32`: brand `QEMU TCG CPU version 2.5+`, FirmwareVendor `Ubuntu distribution of EDK II`, `sm=OmegaTest/IdentBox/7.1`, a positioned read equal to the table bytes, 8 results (N 0, P past the end, CPUID 16, N 15 → 5, L ≥ 2^32 and three bad subs → 32) match `expected.txt`; FirmwareRevision is 8 hex digits (`00010000` on Ubuntu OVMF); the serial and UUID are not in the output. Negative control: manufacturer `OtherMaker` changes the output. Manual mutants (not in the runner): a wrong SMBIOS 2 GUID gives `sm=-` under the 32-bit entry point and is still correct under the 64-bit one, so the SMBIOS 3 path is the one used there; a wrong SMBIOS 3 GUID still gives the right strings through the SMBIOS 2 fallback, which OVMF also publishes under the 64-bit setting. Every tracked `.om` file (1297), as is and with `target x86linux`, gives the same bytes and status from this omc as from `b4f45121` (2594 compiles) |
+| Machine access (`machine/`, 2026-11-17, omc built from this `omc.om`: AArch64 fixpoint sha256 `a896986fe1257f1d00157245380544e04b4ea26c5feb17c82bbfe5cd639e9b23`, the runs used its x86-64 hosted build `330c55f2d5566e4e7591646f3e78f1d5dac5dfdc8c5596400c5002fba87d2ce8`; QEMU 8.2.2 TCG `-cpu max`, Ubuntu OVMF 2024.02) | `sh tests/x86efi/run.sh OMC` on an x86-64 host: `SUMMARY pass=28 fail=0 not_run=1` (NOT_RUN is the AArch64 float leg), of which the machine section is 4 PASS: `efi 22` is error 25 at its line and the same line with `efi 21` compiles; 36 lines match `expected.txt`; the line `OMEGA COM1 PORT IO` is in the serial log once and was written with efi 15/16 only (line status 0x3FD bit 5, then 0x3F8). Ports: PCI 00:00.0 through 0xCF8/0xCFC reads `29c08086` at 32 bits, `8086` and `29c0` at 16, `86` and `29` at 8; a 16-bit write of selector 0 to fw_cfg 0x510 then four byte reads of 0x511 give `QEMU`. MSRs: EFER LME and LMA set; APIC base `fee00000`, enabled, BSP; IA32_KERNEL_GS_BASE written with `0x123456789abc`, read back, restored. CR0 PE and PG set, CR4 PAE set, CR3 nonzero, the three values distinct. Memory: the local APIC version register read with N = 4 reports an integrated APIC; the program finds its own 2 MiB array in physical memory, the page walk from CR3 (entries read with efi 20) returns the same address, and copies of 0, 1, 2, 4, 8, 13 and 3000 bytes are checked in both directions with the neighbouring bytes unchanged. 14 refusal results match (45, 46, 47, 5), and the refused port writes put nothing on COM1. Negative controls, `sh tests/x86efi/machine/mutants.sh OMC`: the unchanged compiler passes and each of 7 one-line mutants of `xmach` fails the section (IN for OUT, no 0x66 prefix, RDMSR without EDX, every CR read as CR0, efi 21 copying as efi 20, N = 4 and 8 through REP MOVSB, no width check): `SUMMARY pass=8 fail=0`. The 1485 `.om` files tracked before this change, as stored and with `target x86linux`, give the same bytes or the same refusal from this compiler as from `cfd96b48` (`tools/x86efi/corpus_diff.sh`, x86-64 hosted builds of both: 784 identical and 701 same-refusal as stored, 761 and 724 with `target x86linux`) |
+
+NOT_RUN for machine access: any physical machine; KVM; a fault (one manual run on the same QEMU read
+MSR 0x12345 as 0 with no exception, so this emulator cannot show the #GP); an overlapping copy;
+efi 21 on a device register. The PCI,
+fw_cfg and local APIC facts in `expected.txt` are those of QEMU q35, so the test as written is an
+emulator test.
 
 NOT_RUN in this repository's gates: efi ops 0..11, the ConOut NULL refusal, GOP Blt, network,
 entropy, pointer, native x86 execution of the seed. The iMac run cited above is
@@ -141,5 +199,6 @@ EXERCISED on physical hardware (one machine).
 
 ## Limits
 
-The compiler uses 511 of the om4 cap of 512 functions (`seed/omc/size-history.tsv`). Allen's stack (#977, #983, #980, #981) carries
+`omc.om` has 509 functions; the function tables of om4 and omc hold 4096 (`seed/README.md`, rung 4;
+the count for each omc is in `seed/omc/size-history.tsv`). Allen's stack (#977, #983, #980, #981) carries
 an older x86efi on a different base; its register slots and live-slot saves are not ported here.
