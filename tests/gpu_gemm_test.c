@@ -5,14 +5,14 @@
  *                code generator and encoder, register counts
  *   --sim        the real kernels in the warp simulator (tensor-core ops computed with the chip-exact models), small shapes
  *                over every edge case, all four layouts, three tile configurations; the four mutants must be caught
- *   (no flag)    the GB10: at least 200 shapes with M, N, K from 1 to 8192, both types, all four layouts. Every output word
- *                must be written; shapes up to 2^27 multiply-adds are compared in full, larger ones on 4096 sampled
+ *   (no flag)    the GB10: at least 200 distinct shapes (206 triples) with M, N, K from 1 to 8192, each run in both types and all four layouts (1648 cases). Every output word
+ *                must be written; shapes up to 2^27 multiply-adds (and 1000x999x1001) are compared in full, larger ones on 4096 sampled
  *                elements plus about 512 evenly spaced elements of the last row and of the last column. Speed: 2 M N K / kernel time, as a fraction of the measured
  *                tensor-core ceiling (BF16 HMMA 115.36 TFLOPS, evidence OWN30B-T3-TC-PEAK-BW-5faa0f70-20261013T2236Z;
  *                FP8 QMMA 237.52 TFLOPS, measured by our own QMMA peak kernel: omega-mv 3c8ce239 evidence/MACHINE-CEILING-20261020/raw/gpu-qmma.txt line 63,
  *                copied with its sha256 into evidence/C3-GEMM-CHIP-DRA485/). The mutants must be caught. The marker is busy-polled for
  *                --spin-us (default 2000), so kernel times are not quantized to the 50 us sleep-poll step; one sample per shape.
- *                --quick: 24 shapes, for a first look. --part N (0..7: type*4 + layout; 8: the red checks and reopen checks only)
+ *                --quick: 24 cases, for a first look. --part N (0..7: type*4 + layout; 8: the red checks and reopen checks only)
  *                splits the run into pieces that each fit one 20-minute timing window; parts 0..8 together are the whole run.
  * Last line: "C3 gemm <tier>: PASS (<checks> checks)" or "... FAIL (<failed> of <checks>)". */
 #include "omega_gpu_gemm.h"
@@ -74,13 +74,14 @@ static float ref_elem(OmegaGpuGemmType t, unsigned lay, uint32_t M, uint32_t N, 
 
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 
-/* compare: every element when M N K <= 2^27, else 4096 samples + about 512 evenly spaced elements of the last row and of the last column; returns the mismatches */
+/* compare: every element when M N K <= 2^27 (or g_force_full), else 4096 samples + about 512 evenly spaced elements of the last row and of the last column; returns the mismatches */
+static int g_force_full; /* chip tier: compare this shape in full although it is past 2^27 multiply-adds */
 static uint64_t compare(OmegaGpuGemmType t, unsigned lay, uint32_t M, uint32_t N, uint32_t K, const void *A, const void *B, const float *C,
                         uint64_t *checked, char *first, size_t firstn) {
     uint64_t bad = 0; *checked = 0; first[0] = 0;
     #define ONE(mm, nn) do { uint32_t m_ = (mm), n_ = (nn); float w_ = ref_elem(t, lay, M, N, K, A, B, m_, n_), g_ = C[(uint64_t)m_ * N + n_]; (*checked)++; \
         if (f2u(w_) != f2u(g_)) { if (!bad) snprintf(first, firstn, "C[%u][%u] = %08x, model %08x", m_, n_, f2u(g_), f2u(w_)); bad++; } } while (0)
-    if ((uint64_t)M * N * K <= (1ull << 27)) {
+    if ((uint64_t)M * N * K <= (1ull << 27) || g_force_full) {
         for (uint32_t m = 0; m < M; m++) for (uint32_t n = 0; n < N; n++) ONE(m, n);
     } else {
         g_rng = (uint64_t)M * 31 + N * 7 + K;
@@ -270,7 +271,9 @@ static void chip_one(OmegaGpuGemmType t, unsigned lay, uint32_t M, uint32_t N, u
     fill(t, B, (uint64_t)K * N, (uint64_t)M * 11 + N * 13 + K * 17 + lay);
     OmegaGpuGemmInfo info;
     int rc = omega_gpu_gemm(t, lay, M, N, K, A, B, C, &info);
+    g_force_full = M == 1000 && N == 999 && K == 1001; /* one case past 2^27 (1.0e9 multiply-adds) compared in full, per type and layout */
     uint64_t checked = 0, bad = rc == 0 ? compare(t, lay, M, N, K, A, B, C, &checked, first, sizeof first) : 1;
+    g_force_full = 0;
     double flop = 2.0 * M * N * K, tf = info.main_ns ? flop / (double)info.main_ns / 1e3 : 0, tfp = info.main_ns ? flop / (double)(info.main_ns + info.pack_ns) / 1e3 : 0;
     snprintf(w, sizeof w, "%s %ux%ux%u %s: %s, %" PRIu64 " checked, %" PRIu64 " wrong%s%s; kernel %.3f ms %.2f TFLOPS = %.4f of ceiling, with packs %.2f TFLOPS = %.4f%s%s",
              tname(t), M, N, K, lname(lay), omega_gpu_gemm_rc_name(rc), checked, bad, bad && rc == 0 ? ", first " : "", bad && rc == 0 ? first : "",
@@ -287,12 +290,28 @@ static void chip_tier(int quick, int part) { /* part: -1 everything; 0..7 only t
     void *A = malloc((size_t)big * big * 2), *B = malloc((size_t)big * big * 2);
     float *C = malloc((size_t)big * big * 4);
     if (!A || !B || !C) { printf("NOT_RUN: host allocation\n"); exit(2); }
-    /* the shapes: per type and layout, the same list (26 each, 208 in all): edges, odd sizes, skinny, square up to 8192 */
-    static const uint32_t sh[][3] = {
+    /* the shapes: 26 hand-picked triples (edges, odd sizes, skinny, squares up to 8192) plus 180 generated ones (fixed seed, integer arithmetic only:
+     * each dimension is 2^e + a random offset below 2^e with e uniform in 0..12, or 8192 when e is 13): 206 distinct (M, N, K) triples, each run in both types and
+     * all four layouts, 1648 cases. The first 12 triples are the --quick list. */
+    static uint32_t sh[206][3] = {
         { 1, 1, 1 }, { 1, 8192, 1 }, { 8192, 1, 1 }, { 1, 1, 8192 }, { 7, 13, 29 }, { 16, 8, 16 }, { 33, 65, 127 }, { 100, 100, 100 },
         { 128, 64, 64 }, { 255, 257, 511 }, { 1000, 999, 1001 }, { 1, 4096, 4096 }, { 4096, 1, 4096 }, { 4096, 4096, 1 },
         { 17, 8192, 3000 }, { 8192, 17, 3000 }, { 1024, 1024, 1024 }, { 2048, 2048, 2048 }, { 4096, 4096, 4096 }, { 3000, 5000, 700 },
         { 8192, 8192, 64 }, { 64, 8192, 8192 }, { 8192, 64, 8192 }, { 6000, 7000, 8000 }, { 8191, 8191, 8191 }, { 8192, 8192, 8192 } };
+    {
+        size_t n = 26; uint64_t st = 0x5eed485ull;
+        while (n < sizeof sh / sizeof sh[0]) {
+            uint32_t d[3];
+            for (int i = 0; i < 3; i++) {
+                st = st * 6364136223846793005ull + 1442695040888963407ull;
+                uint32_t e = (uint32_t)(st >> 33) % 14u, r = (uint32_t)(st >> 40);
+                d[i] = e == 13 ? 8192u : (1u << e) + r % (1u << e);
+            }
+            int dup = 0;
+            for (size_t q = 0; q < n; q++) dup |= sh[q][0] == d[0] && sh[q][1] == d[1] && sh[q][2] == d[2];
+            if (!dup) { sh[n][0] = d[0]; sh[n][1] = d[1]; sh[n][2] = d[2]; n++; }
+        }
+    }
     const size_t nsh = quick ? 12 : sizeof sh / sizeof sh[0];
     int before = g_failed, shapes = 0;
     for (int t = 0; t < 2; t++)
@@ -304,7 +323,7 @@ static void chip_tier(int quick, int part) { /* part: -1 everything; 0..7 only t
                 chip_one((OmegaGpuGemmType)t, lay, M, N, K, A, B, C);
                 shapes++;
             }
-    printf("%d shapes%s: %s\n", shapes, part < 0 ? ", both types, all four layouts" : "", g_failed == before ? "PASS" : "FAIL");
+    printf("%d cases (%zu distinct shapes%s): %s\n", shapes, nsh, part < 0 ? ", both types, all four layouts" : "", g_failed == before ? "PASS" : "FAIL");
     if (part >= 0 && part < 8) { free(A); free(B); free(C); return; }
     for (int t = 0; t < 2; t++)
         for (int mut = 1; mut <= 5; mut++)
