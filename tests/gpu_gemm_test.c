@@ -4,7 +4,7 @@
  *   --host-only  no device: refusals, every kernel (both types, several shapes of tile, the red-check mutants) through our
  *                code generator and encoder, register counts
  *   --sim        the real kernels in the warp simulator (tensor-core ops computed with the chip-exact models), small shapes
- *                over every edge case, all four layouts, three tile configurations; the three mutants must be caught
+ *                over every edge case, all four layouts, three tile configurations; the four mutants must be caught
  *   (no flag)    the GB10: at least 200 shapes with M, N, K from 1 to 8192, both types, all four layouts. Every output word
  *                must be written; shapes up to 2^27 multiply-adds are compared in full, larger ones on 4096 sampled
  *                elements plus the last row and column. Speed: 2 M N K / kernel time, as a fraction of the measured
@@ -130,7 +130,7 @@ static void host_only(void) {
     check(!omega_gpu_gemm_cfg_ok(&big), "a tile past the register budget (rt 4 ct 2) refused");
     for (int t = 0; t < 2; t++)
         for (size_t s = 0; s < sizeof shapes / sizeof shapes[0]; s++)
-            for (int mut = 0; mut <= 3; mut++)
+            for (int mut = 0; mut <= 4; mut++)
                 for (int k = 0; k < OMEGA_GEMM_K_COUNT; k++) {
                     OmegaGemmCfg c = shapes[s]; c.type = (OmegaGpuGemmType)t; c.mutant = mut;
                     BlackwellIRProgram *p = calloc(1, sizeof *p);
@@ -230,20 +230,21 @@ static void sim_tier(void) {
             printf("%s\n", w);
             sim_free(&c);
         }
-    /* red checks: each mutant must change a result the real kernels get right */
+    /* red checks: each mutant must change a result the real kernels get right; mutant 4 (wrong transpose) in both directions */
     for (int t = 0; t < 2; t++)
-        for (int mut = 1; mut <= 3; mut++) {
-            OmegaGemmCfg cfg; omega_gpu_gemm_default_cfg((OmegaGpuGemmType)t, &cfg); cfg.mutant = mut;
-            SimCtx c; memset(&c, 0, sizeof c);
-            const uint32_t M = 65, N = 63, K = 100;
-            fill(cfg.type, A, M * K, 77); fill(cfg.type, B, K * N, 78);
-            int built = sim_build(&c, &cfg) == 0, rc = built ? sim_gemm(&c, &cfg, 0, M, N, K, A, B, C) : -1;
-            uint64_t checked = 0, bad = rc == 0 ? compare(cfg.type, 0, M, N, K, A, B, C, &checked, first, sizeof first) : 1;
-            snprintf(w, sizeof w, "simulator red check: %s mutant %d is caught (%" PRIu64 " wrong)", tname(cfg.type), mut, bad);
-            check(built && bad > 0, w);
-            printf("%s\n", w);
-            sim_free(&c);
-        }
+        for (int mut = 1; mut <= 4; mut++)
+            for (unsigned lay = 0; lay < (mut == 4 ? 2u : 1u); lay++) {
+                OmegaGemmCfg cfg; omega_gpu_gemm_default_cfg((OmegaGpuGemmType)t, &cfg); cfg.mutant = mut;
+                SimCtx c; memset(&c, 0, sizeof c);
+                const uint32_t M = 65, N = 63, K = 100;
+                fill(cfg.type, A, M * K, 77); fill(cfg.type, B, K * N, 78);
+                int built = sim_build(&c, &cfg) == 0, rc = built ? sim_gemm(&c, &cfg, lay, M, N, K, A, B, C) : -1;
+                uint64_t checked = 0, bad = rc == 0 ? compare(cfg.type, lay, M, N, K, A, B, C, &checked, first, sizeof first) : 1;
+                snprintf(w, sizeof w, "simulator red check: %s mutant %d (%s) is caught (%" PRIu64 " wrong of %" PRIu64 ")", tname(cfg.type), mut, lname(lay), bad, checked);
+                check(built && bad > 0, w);
+                printf("%s\n", w);
+                sim_free(&c);
+            }
     free(A); free(B); free(C);
 }
 
@@ -300,18 +301,19 @@ static void chip_tier(int quick) {
             }
     printf("%d shapes, both types, all four layouts: %s\n", shapes, g_failed == before ? "PASS" : "FAIL");
     for (int t = 0; t < 2; t++)
-        for (int mut = 1; mut <= 3; mut++) {
-            OmegaGemmCfg cfg; omega_gpu_gemm_default_cfg((OmegaGpuGemmType)t, &cfg); cfg.mutant = mut;
-            omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, &cfg);
-            const uint32_t M = 65, N = 63, K = 100;
-            fill((OmegaGpuGemmType)t, A, M * K, 77); fill((OmegaGpuGemmType)t, B, K * N, 78);
-            int rc = omega_gpu_gemm((OmegaGpuGemmType)t, 0, M, N, K, A, B, C, NULL);
-            char first[200]; uint64_t checked = 0, bad = rc == 0 ? compare((OmegaGpuGemmType)t, 0, M, N, K, A, B, C, &checked, first, sizeof first) : 1;
-            snprintf(w, sizeof w, "chip red check: %s mutant %d is caught (%s, %" PRIu64 " wrong)", tname((OmegaGpuGemmType)t), mut, omega_gpu_gemm_rc_name(rc), bad);
-            check(bad > 0, w);
-            printf("%s\n", w);
-            omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, NULL);
-        }
+        for (int mut = 1; mut <= 4; mut++)
+            for (unsigned lay = 0; lay < (mut == 4 ? 2u : 1u); lay++) {
+                OmegaGemmCfg cfg; omega_gpu_gemm_default_cfg((OmegaGpuGemmType)t, &cfg); cfg.mutant = mut;
+                omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, &cfg);
+                const uint32_t M = 65, N = 63, K = 100;
+                fill((OmegaGpuGemmType)t, A, M * K, 77); fill((OmegaGpuGemmType)t, B, K * N, 78);
+                int rc = omega_gpu_gemm((OmegaGpuGemmType)t, lay, M, N, K, A, B, C, NULL);
+                char first[200]; uint64_t checked = 0, bad = rc == 0 ? compare((OmegaGpuGemmType)t, lay, M, N, K, A, B, C, &checked, first, sizeof first) : 1;
+                snprintf(w, sizeof w, "chip red check: %s mutant %d (%s) is caught (%s, %" PRIu64 " wrong of %" PRIu64 ")", tname((OmegaGpuGemmType)t), mut, lname(lay), omega_gpu_gemm_rc_name(rc), bad, checked);
+                check(bad > 0, w);
+                printf("%s\n", w);
+                omega_gpu_gemm_test_set_cfg((OmegaGpuGemmType)t, NULL);
+            }
     for (int t = 0; t < 2; t++) chip_one((OmegaGpuGemmType)t, 3, 65, 63, 100, A, B, C); /* right again after the red checks */
     omega_gpu_session_close(); /* the kernels go with the device (close hook); the next call builds them on a new one */
     printf("after the device closed and opened again:\n");
