@@ -101,7 +101,11 @@ expect_refused "build refuses CK_* passed down in MAKEFLAGS" "CK_SERVICE" env MA
 # A dirty tree is refused: a scratch clone of HEAD with this script and one changed tracked
 # file (the real checkout is never touched). A plain clone into $T, not a worktree: a
 # worktree writes the repository's own git dir, which the local sandbox keeps read-only.
-if git -c core.hooksPath=/dev/null clone -q --no-hardlinks "$repo" "$T/wt" >/dev/null 2>&1; then
+# $repo is kernel/ inside omega-mv (aienux folded there), so the clone is of the whole
+# repository and $T/wt is its kernel/ (the same path when $repo is a repository root).
+top=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) && pfx=$(git -C "$repo" rev-parse --show-prefix)
+if [ -n "${top:-}" ] && git -c core.hooksPath=/dev/null clone -q --no-hardlinks "$top" "$T/wt-top" >/dev/null 2>&1 &&
+   ln -s "$T/wt-top/$pfx" "$T/wt"; then
     cp "$np" "$T/wt/scripts/native_package.sh"
     echo "# dirty" >>"$T/wt/native/kernel/Makefile"
     expect_refused "build refuses a dirty tree" "working tree is dirty" "$T/wt/scripts/native_package.sh" build --out "$T/pd" --generation 7 --variant core
