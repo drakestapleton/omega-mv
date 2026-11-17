@@ -2,7 +2,9 @@ note SPDX-License-Identifier: Apache-2.0
 note tests/run.om: build synapse-board with tools/build.om, then run its positive and negative cases in a
 note fresh directory (replaces tests/run.sh). Built with the pinned omc, from the repository root:
 note   { printf 'om2\n'; cat tests/run.om; } | "$OMEGA_SRC/seed/out/omc" > build/run && chmod 755 build/run
-note usage: run OMEGA_SRC TEST_ROOT [--update-golden]   (from the repository root, after build/build exists)
+note usage: run OMEGA_SRC TEST_ROOT [--update-golden]   (from the repository root)
+note   It first compiles the build driver from OMEGA_SRC/om/tls/sha2.om and tools/build.om into TEST_ROOT/bin/build
+note   (unit TEST_ROOT/build.unit.om, omc's messages TEST_ROOT/build.err), so a stale build/build is never used.
 note   TEST_ROOT must not exist yet; its parent must. It is created and left for inspection.
 note   --update-golden rewrites tests/golden from the fixture render (review the diff before committing).
 note The live serve case runs only when this host has a local address inside 100.64.0.0/10 (read from
@@ -13,7 +15,13 @@ note 1 when a case failed or the build failed; 64 usage or TEST_ROOT already exi
 text tuse "usage: run OMEGA_SRC TEST_ROOT [--update-golden] (from the synapse-board repository root)\n"
 text texists "run: TEST_ROOT exists or cannot be created; give a new path\n"
 text tupd "--update-golden"
-text tbuildp "build/build"
+text tunit "/build.unit.om"
+text tbldb "/bin/build"
+text tblde "/build.err"
+text tsha2 "/om/tls/sha2.om"
+text tbldom "tools/build.om"
+text tomc "/seed/out/omc"
+text tom2 "om2\n"
 text tbin "/bin"
 text tbinb "/bin/synapse-board"
 text tfx "tests/fixtures/"
@@ -74,7 +82,12 @@ text tstderr "  stderr: "
 text tsum "SUMMARY pass="
 text tsumf " fail="
 text tsumn " not_run="
-text tnote "NOTE golden rewritten\n"
+text tnote "NOTE golden rewritten: "
+text tkeep ": render output unreadable, golden kept\n"
+text tnowr ": cannot write the golden in full\n"
+text tfd "  first difference at byte "
+text tlg " (golden "
+text tlr " bytes, rendered "
 text tnot " not in "
 text tdots ".."
 text ton " on "
@@ -88,6 +101,7 @@ text nrender "render-fixture"
 text nrjson "render stdout json"
 text ngold "golden "
 text ntmp "no leftover .tmp"
+text nupd "update-golden "
 text nhs "html has no <script"
 text nms "md has no <script"
 text nhe "html escapes script"
@@ -162,10 +176,12 @@ text kget2 "Connection: close"
 
 global groot uchar 4096
 global gosrc uchar 4096
-global gn ulong 16
+global gn ulong 18
 note gn: 0 TEST_ROOT length, 1 OMEGA_SRC length, 2 gp length, 3 gpk length, 4 pass, 5 fail, 6 not_run,
 note 7 redirect (0 none, 1 out.txt/err.txt, 2 serve.out/serve.err), 8 ga length, 9 gb length, 10 last rc,
-note 11 tailnet address (host order), 12 time before, 13 time after, 14 parsed time, 15 HTTP status
+note 11 tailnet address (host order), 12 time before, 13 time after, 14 parsed time, 15 HTTP status,
+note 16 gp overflow (a byte past 8191 was dropped: openp refuses with -36, ENAMETOOLONG),
+note 17 gpk holds an overflowed item (runk refuses with -1)
 global gp uchar 8192
 global gpk uchar 65536
 global gst uchar 4
@@ -220,12 +236,15 @@ end
 note ======== path scratch gp
 fn pclr to void
 put gn 2 0
+put gn 16 0
 end
 fn pc c uchar to void
 n = get gn 2
 if lt n 8191
 put gp n c
 put gn 2 add n 1
+else
+put gn 16 1
 end
 end
 fn pt t view uchar * to void
@@ -255,6 +274,9 @@ pt d
 pt t
 end
 fn openp flags ulong mode ulong to long
+if ne get gn 16 0
+ret -36
+end
 ret fopen gp 0 get gn 2 int flags int mode
 end
 
@@ -263,11 +285,16 @@ fn k0 to void
 put gpk 0 0
 put gpk 1 0
 put gn 3 2
+put gn 17 0
 end
 note kp: append gp as one item
 fn kp to void
 q = get gn 3
 n = get gn 2
+if or ne get gn 16 0 gt add add q 2 n 65536
+put gn 17 1
+ret
+end
 put gpk q uchar and n 255
 put gpk add q 1 uchar shr n 8
 for i ulong n
@@ -323,8 +350,12 @@ end
 
 note ======== running a child
 fn redir t view uchar * fd int to void
+redirm t fd 524865 420
+end
+note redirm: open TEST_ROOT t with flags and mode as the child's fd
+fn redirm t view uchar * fd int flags ulong mode ulong to void
 pr t
-f = openp 524865 420
+f = openp flags mode
 if lt f 0
 exit 126
 end
@@ -340,11 +371,19 @@ if eq m 2
 redir tsout 1
 redir tserr 2
 end
+if eq m 3
+redirm tunit 0 524288 0
+redirm tbldb 1 524865 493
+redir tblde 2
+end
 r = execprog gpk 0 get gn 3
 exit 127
 end
 note spawn: the child's pid, or negative
 fn spawn to long
+if ne get gn 17 0
+ret -36
+end
 pid = fork
 if eq pid 0
 child
@@ -476,11 +515,9 @@ pt f
 end
 note cmp2: TEST_ROOT/r1/f equals tests/golden/f (gold) or TEST_ROOT/r2/f
 fn cmp2 f view uchar * gold bool to bool
+note both sides are always loaded, so a missing side reads as 0 bytes in diffnote, never a stale length
 pr3 tr1 f
-r = load 0
-if lt r 0
-ret false
-end
+ra = load 0
 if gold
 pclr
 pt tgd
@@ -488,8 +525,8 @@ pt f
 else
 pr3 tr2 f
 end
-r = load 1
-if lt r 0
+rb = load 1
+if or lt ra 0 lt rb 0
 ret false
 end
 ret sameab
@@ -549,7 +586,11 @@ if lt r 0
 ret false
 end
 n = get gn 8
-while and gt n 0 eq get ga sub n 1 10 bound 65536
+note Omega's and is eager, so the index is checked inside the loop, never beside n > 0
+while gt n 0 bound 9223372036854775807
+if ne get ga sub n 1 10
+break
+end
 n = sub n 1
 end
 a = len wjson1
@@ -617,6 +658,17 @@ end
 end
 ret true
 end
+note ogold: print the golden path of file w (0 BOARD.md, 1 index.html)
+fn ogold w ulong to void
+o tgd
+if eq w 0
+o tfbmd
+else
+o tfidx
+end
+end
+note updgold: rewrite each golden from the fixture render; a golden is kept when the render cannot be read,
+note and a write that cannot complete is a FAIL
 fn updgold to void
 for w ulong 2
 pr tr1
@@ -626,6 +678,12 @@ else
 pt tidx
 end
 r = load 0
+if lt r 0
+bad nupd
+ogold w
+o tkeep
+continue
+end
 pclr
 pt tgd
 if eq w 0
@@ -634,12 +692,24 @@ else
 pt tfidx
 end
 fd = openp 524865 420
-if ge fd 0
-x = write int fd ga 0 get gn 8
-c = fclose int fd
+if lt fd 0
+bad nupd
+ogold w
+o tnowr
+continue
 end
+full = wga int fd get gn 8
+c = fclose int fd
+if not full
+bad nupd
+ogold w
+o tnowr
+continue
 end
 o tnote
+ogold w
+onl
+end
 end
 
 fn render1 to void
@@ -656,6 +726,9 @@ else
 bad ngold
 end
 o tfbmd
+if not c
+diffnote
+end
 onl
 c = cmp2 tfidx true
 if c
@@ -664,6 +737,9 @@ else
 bad ngold
 end
 o tfidx
+if not c
+diffnote
+end
 onl
 judge not tmpleft ntmp
 end
@@ -671,20 +747,45 @@ note escaping: the fixture intent carries <script>alert(1)</script>
 fn escapes to void
 pr3 tr1 tfidx
 r = load 0
-judge not has kscript true nhs
-judge has kesc false nhe
-judge not has kjs false njs
-judge has ksafe false nsafe
-judge not has kquo false nquo
-judge not active nact
+k = gt r 0
+judge and k not has kscript true nhs
+judge and k has kesc false nhe
+judge and k not has kjs false njs
+judge and k has ksafe false nsafe
+judge and k not has kquo false nquo
+judge and k not active nact
 pr3 tr1 tfbmd
 r = load 0
-judge not has kscript true nms
-judge has kesc false nme
-judge has kpipe false npipe
-judge has klapsed false nlap
-judge has kinf false ninf
-judge has kcycle false ncyc
+k = gt r 0
+judge and k not has kscript true nms
+judge and k has kesc false nme
+judge and k has kpipe false npipe
+judge and k has klapsed false nlap
+judge and k has kinf false ninf
+judge and k has kcycle false ncyc
+end
+note diffnote: after cmp2, where TEST_ROOT/r1/f (ga) and the golden (gb) first differ
+fn diffnote to void
+a = get gn 8
+b = get gn 9
+m = a
+if lt b m
+m = b
+end
+i = ulong 0
+while lt i m bound 9223372036854775807
+if ne get ga i get gb i
+break
+end
+i = add i 1
+end
+o tfd
+onum i
+o tlg
+onum b
+o tlr
+onum a
+o tclose
 end
 fn active to bool
 if or has kscript true has kiframe true
@@ -733,9 +834,17 @@ note tsfind: copy into gts the [0-9TZ:-]* run between " at " and a "_" that ends
 fn tsfind to bool
 n = get gn 8
 for e ulong n
-if and eq get ga e 95 or eq add e 1 n eq get ga add e 1 10
+if eq get ga e 95
+nl = true
+if lt add e 1 n
+nl = eq get ga add e 1 10
+end
+if nl
 s = e
-while and gt s 0 tsc get ga sub s 1 bound 65536
+while gt s 0 bound 9223372036854775807
+if not tsc get ga sub s 1
+break
+end
 s = sub s 1
 end
 if and ge s 4 lt sub e s 64
@@ -745,6 +854,7 @@ for i ulong sub e s
 put gts i get ga add s i
 end
 ret true
+end
 end
 end
 end
@@ -1251,15 +1361,72 @@ onl
 end
 
 note ======== main
-fn build to bool
-k0
-pclr
-pt tbuildp
-kp
-pclr
+note posrc: append OMEGA_SRC to gp
+fn posrc to void
 for i ulong get gn 1
 pc get gosrc i
 end
+end
+note wga: write ga[0..n) to fd in full
+fn wga fd int n ulong to bool
+p = ulong 0
+while lt p n bound 9223372036854775807
+w = write fd ga p sub n p
+if le w 0
+ret false
+end
+p = add p ulong w
+end
+ret true
+end
+note catto: append the file named by gp to fd
+fn catto fd int to bool
+r = load 0
+if lt r 0
+ret false
+end
+ret wga fd get gn 8
+end
+note mkdriver: compose om2 + OMEGA_SRC/om/tls/sha2.om + tools/build.om into TEST_ROOT/build.unit.om and
+note compile it with OMEGA_SRC's omc into TEST_ROOT/bin/build (omc's messages in TEST_ROOT/build.err), so
+note the build driver is always the one in this tree, never a stale build/build
+fn mkdriver to bool
+pr tunit
+fd = openp 524865 420
+if lt fd 0
+ret false
+end
+w = write int fd tom2 0 len tom2
+okw = eq w 4
+pclr
+posrc
+pt tsha2
+ok1 = catto int fd
+pclr
+pt tbldom
+ok2 = catto int fd
+c = fclose int fd
+if not and okw and ok1 ok2
+ret false
+end
+k0
+pclr
+posrc
+pt tomc
+kp
+put gn 7 3
+rc = runk
+ret eq rc 0
+end
+fn build to bool
+if not mkdriver
+ret false
+end
+k0
+pr tbldb
+kp
+pclr
+posrc
 kp
 pr tbinb
 kp
