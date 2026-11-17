@@ -7,7 +7,7 @@
  *                over every edge case, all four layouts, three tile configurations; the four mutants must be caught
  *   (no flag)    the GB10: at least 200 shapes with M, N, K from 1 to 8192, both types, all four layouts. Every output word
  *                must be written; shapes up to 2^27 multiply-adds are compared in full, larger ones on 4096 sampled
- *                elements plus the last row and column. Speed: 2 M N K / kernel time, as a fraction of the measured
+ *                elements plus about 512 evenly spaced elements of the last row and of the last column. Speed: 2 M N K / kernel time, as a fraction of the measured
  *                tensor-core ceiling (BF16 HMMA 115.36 TFLOPS, evidence OWN30B-T3-TC-PEAK-BW-5faa0f70-20261013T2236Z;
  *                FP8 QMMA 237.52 TFLOPS, measured by our own QMMA peak kernel: omega-mv 3c8ce239 evidence/MACHINE-CEILING-20261020/raw/gpu-qmma.txt line 63,
  *                copied with its sha256 into evidence/C3-GEMM-CHIP-DRA485/). The mutants must be caught. The marker is busy-polled for
@@ -74,7 +74,7 @@ static float ref_elem(OmegaGpuGemmType t, unsigned lay, uint32_t M, uint32_t N, 
 
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 
-/* compare: every element when M N K <= 2^27, else 4096 samples + the last row and column; returns the mismatches */
+/* compare: every element when M N K <= 2^27, else 4096 samples + about 512 evenly spaced elements of the last row and of the last column; returns the mismatches */
 static uint64_t compare(OmegaGpuGemmType t, unsigned lay, uint32_t M, uint32_t N, uint32_t K, const void *A, const void *B, const float *C,
                         uint64_t *checked, char *first, size_t firstn) {
     uint64_t bad = 0; *checked = 0; first[0] = 0;
@@ -340,7 +340,11 @@ int main(int argc, char **argv) {
             if (*end || v < 0 || v > 8) { fprintf(stderr, "--part takes 0..8\n"); return 2; }
             part = (int)v;
         }
-        else if (!strcmp(argv[i], "--spin-us") && i + 1 < argc) spin = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--spin-us") && i + 1 < argc) {
+            char *end; unsigned long v = strtoul(argv[++i], &end, 10);
+            if (*end || argv[i][0] == '-' || v > 1000000ul) { fprintf(stderr, "--spin-us takes 0..1000000\n"); return 2; }
+            spin = (uint32_t)v;
+        }
         else { fprintf(stderr, "usage: %s [--host-only | --sim | --quick | --part 0..8 | --spin-us N]\n", argv[0]); return 2; }
     }
     if (!strcmp(tier, "host")) host_only();
