@@ -1,0 +1,42 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* devices.h -- the devices boot stage (ck_stage_devices) and what it hands
+ * to later stages. */
+#ifndef AIENOS_CK_DEVICES_H
+#define AIENOS_CK_DEVICES_H
+#include "disk.h"
+#include "pci.h"
+/* The AIENOS partition of the bound NVMe disk (a bounds-checked partition
+ * view, dev/disk_part.h), or NULL when the devices stage bound no disk or the
+ * disk has no valid AIENOS partition. */
+const disk_dev *ck_dev_boot_disk(void);
+/* The PCI functions the devices stage enumerated (the boot sequence finds the VM screen and speakers there). */
+const pci_system *ck_dev_pci(void);
+/* The AIENOS image slots partition of the same bound NVMe disk (a second
+ * bounds-checked partition view, P11 cut 2b), or NULL; *rc_out (optional) is
+ * 0, the CK_GPT_* refusal, or CK_DEV_NO_BOOT_DISK. */
+#define CK_DEV_NO_BOOT_DISK (-1)
+const disk_dev *ck_dev_slots_disk(int *rc_out);
+/* The update inbox partition (CK_SLOT_INBOX_TYPE, P11 cut 3), same rules. */
+const disk_dev *ck_dev_inbox_disk(int *rc_out);
+/* Revoke the NVMe function's bus mastering once the last disk user (the
+ * Store stage) is done, or after a failed bind; prints the dma_gate line.
+ * The boot disk is unavailable afterwards. Ownership is returned only when
+ * bus mastering is off and the SMMU stream is back to abort; a refused abort
+ * keeps the stream confined and the function owned, and a later call retries. */
+void ck_dev_nvme_release(void);
+#endif

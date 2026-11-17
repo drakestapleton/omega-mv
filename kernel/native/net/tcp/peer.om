@@ -1,0 +1,299 @@
+note peer.om: host side of the L232 QEMU gate. Seeded Omega over host TCP sockets
+note on 127.0.0.1; QEMU slirp carries each connection into the guest stack.
+note Arguments: MODE PORT FILE LIMIT [OUT]
+note   e: connect, send FILE, close the write side, require the echo to equal FILE
+note   s: connect, send FILE, close the write side, require EOF and no data back
+note   r: listen on PORT, accept one connection, require the stream to equal FILE
+note      and end in EOF; write the received bytes to OUT
+note Prints PEER_PASS or PEER_FAIL with counters; exit 0 only on PEER_PASS.
+global Pbuf uchar 16777216
+global Pin uchar 65536
+global Psa uchar 16
+global Parg uchar 256
+note Pcf: 0 file length, 1 sent, 2 received, 3 mismatched bytes, 4 eof seen,
+note 5 write side shut, 6 out fd (0 none), 7 errors.
+global Pcf ulong 8
+global Pnum uchar 32
+text Mpass "PEER_PASS"
+text Mfail "PEER_FAIL"
+text Msent " sent="
+text Mgot " got="
+text Mbad " bad="
+text Meof " eof="
+text Merr " err="
+text Mnl "\n"
+fn pnum v ulong to void
+i = ulong 32
+while true bound 21
+i = sub i 1
+put Pnum i uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+k = write 1 Pnum i sub 32 i
+end
+fn parg i ulong to ulong
+if ge long i argcnt
+ret 0
+end
+k = argread i Parg 0 255
+if lt k 1
+exit 2
+end
+ret ulong k
+end
+fn pdec n ulong to ulong
+v = ulong 0
+if eq n 0
+exit 2
+end
+for i ulong n bound 20
+c = ulong get Parg i
+if or lt c 48 gt c 57
+exit 2
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+fn pload n ulong to void
+f = fopen Parg 0 n 0 0
+if lt f 0
+exit 3
+end
+o = ulong 0
+while true bound 100000
+k = read int f Pbuf o umin 1048576 sub 16777216 o
+if lt k 0
+exit 3
+end
+if eq k 0
+break
+end
+o = add o ulong k
+if eq o 16777216
+exit 3
+end
+end
+c = fclose int f
+put Pcf 0 o
+end
+fn umin a ulong b ulong to ulong
+if lt a b
+ret a
+end
+ret b
+end
+fn psa port ulong to void
+put Psa 0 2
+put Psa 1 0
+put Psa 2 uchar shr port 8
+put Psa 3 uchar and port 255
+put Psa 4 127
+put Psa 5 0
+put Psa 6 0
+put Psa 7 1
+for i ulong 8
+put Psa add 8 i 0
+end
+end
+fn pnow to ulong
+t = monons
+if lt t 0
+exit 4
+end
+ret div ulong t 1000000
+end
+fn pdial port ulong lim ulong to int
+psa port
+s = socknew 2 526337 0
+if lt s 0
+exit 5
+end
+r = connect int s Psa 0 16
+if and ne r 0 ne r neg long 115
+exit 5
+end
+d = add pnow lim
+while lt pnow d bound 100000000
+w = waitio int s 4 10000000
+if ne and w 24 0
+exit 5
+end
+if ne and w 4 0
+ret int s
+end
+end
+exit 5
+end
+fn paccept port ulong lim ulong to int
+psa port
+s = socknew 2 524289 0
+if lt s 0
+exit 5
+end
+if ne bind int s Psa 0 16 0
+exit 5
+end
+if ne listen int s 1 0
+exit 5
+end
+d = add pnow lim
+while lt pnow d bound 100000000
+w = waitio int s 1 10000000
+if ne and w 1 0
+a = accept int s 526336
+if lt a 0
+exit 5
+end
+c = fclose int s
+ret int a
+end
+end
+exit 5
+end
+note Compare n received bytes with the file at the current receive offset.
+fn pcheck n ulong to void
+g = get Pcf 2
+for i ulong n bound 65536
+j = add g i
+if ge j get Pcf 0
+put Pcf 3 add get Pcf 3 1
+else
+if ne get Pin i get Pbuf j
+put Pcf 3 add get Pcf 3 1
+end
+end
+end
+put Pcf 2 add g n
+end
+fn pout n ulong to void
+f = get Pcf 6
+if eq f 0
+ret
+end
+o = ulong 0
+while lt o n bound 65536
+k = write int f Pin o sub n o
+if le k 0
+exit 3
+end
+o = add o ulong k
+end
+end
+fn psend s int to void
+o = get Pcf 1
+if lt o get Pcf 0
+k = send s Pbuf o umin 65536 sub get Pcf 0 o 64
+if gt k 0
+put Pcf 1 add o ulong k
+else
+if ne k neg long 11
+put Pcf 7 add get Pcf 7 1
+put Pcf 1 get Pcf 0
+end
+end
+end
+end
+fn precv s int to void
+k = recv s Pin 0 65536 64
+if gt k 0
+pout ulong k
+pcheck ulong k
+ret
+end
+if eq k 0
+put Pcf 4 1
+ret
+end
+if ne k neg long 11
+put Pcf 7 add get Pcf 7 1
+put Pcf 4 1
+end
+end
+fn prun s int mode ulong lim ulong to void
+d = add pnow lim
+while lt pnow d bound 100000000
+ev = ulong 1
+if and ne mode 114 lt get Pcf 1 get Pcf 0
+ev = ulong 5
+end
+w = waitio s int ev 10000000
+if ne and w 4 0
+psend s
+end
+if and ne mode 114 eq get Pcf 5 0
+if ge get Pcf 1 get Pcf 0
+r = shutdown int s 1
+put Pcf 5 1
+end
+end
+if ne and w 25 0
+precv s
+end
+if ne get Pcf 4 0
+ret
+end
+end
+put Pcf 7 add get Pcf 7 1
+end
+fn presult mode ulong to bool
+ok = and eq get Pcf 7 0 ne get Pcf 4 0
+ok = and ok eq get Pcf 3 0
+if eq mode 115
+ok = and ok eq get Pcf 2 0
+else
+ok = and ok eq get Pcf 2 get Pcf 0
+end
+if ne mode 114
+ok = and ok eq get Pcf 1 get Pcf 0
+end
+if ok
+k = write 1 Mpass 0 len Mpass
+else
+k = write 1 Mfail 0 len Mfail
+end
+k = write 1 Msent 0 len Msent
+pnum get Pcf 1
+k = write 1 Mgot 0 len Mgot
+pnum get Pcf 2
+k = write 1 Mbad 0 len Mbad
+pnum get Pcf 3
+k = write 1 Meof 0 len Meof
+pnum get Pcf 4
+k = write 1 Merr 0 len Merr
+pnum get Pcf 7
+k = write 1 Mnl 0 len Mnl
+ret ok
+end
+fn main to int
+n = parg 1
+if ne n 1
+exit 2
+end
+mode = ulong get Parg 0
+port = pdec parg 2
+pload parg 3
+lim = mul pdec parg 4 1000
+n = parg 5
+if gt n 0
+f = fopen Parg 0 n 577 420
+if lt f 0
+exit 3
+end
+put Pcf 6 ulong f
+end
+s = int 0
+if eq mode 114
+s = paccept port lim
+else
+s = pdial port lim
+end
+prun s mode lim
+if presult mode
+ret 0
+end
+ret 1
+end

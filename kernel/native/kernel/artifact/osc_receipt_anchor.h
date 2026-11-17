@@ -1,0 +1,39 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* osc_receipt_anchor.h -- receipt trust inputs that are not TEST material (aienos#383).
+ *
+ * osc_rcpt_owner_root_pk: Drake's owner root public key from the aienos#380 ceremony
+ * (docs/native/PI5-8-OWNER-CEREMONY.md; the private key lives on a YubiKey, PIV slot 9c). A release-mode verifier
+ * honours no other owner anchor (omega spec/one-layer-receipts.md section 6 step 2). It is the one OWNER receipt
+ * anchor of both kernel policies (core/osc_admit.c ck_osc_policy, aienos#387): docs/OWNER_KEY_CEREMONY.md
+ * section 7 records that it may sign realization receipts. Nothing in this repository signs with it.
+ * tests/test_osc_receipt.c checks the bytes against the ceremony record and an owner-signed receipt against it.
+ *
+ * osc_rcpt_checker_ids: the accepted checker2 identities (spec section 5). One entry: checker2 of omega
+ * 265ce82a (omega#448), `checker2 version` checker_id. A changed checker2 has a new identity and its receipts are
+ * refused UNTRUSTED_CHECKER until it is added here. */
+#ifndef AIENOS_CK_OSC_RECEIPT_ANCHOR_H
+#define AIENOS_CK_OSC_RECEIPT_ANCHOR_H
+#include <stdint.h>
+static const uint8_t osc_rcpt_owner_root_pk[32] = {
+    0x57, 0x8a, 0xda, 0x3c, 0xb0, 0xc2, 0xd1, 0x54, 0x62, 0x3a, 0xc0, 0x89, 0x19, 0x10, 0x23, 0xc8,
+    0xad, 0x4b, 0xc5, 0xe6, 0x3b, 0x8c, 0xcd, 0x1a, 0x38, 0xdb, 0x2d, 0x67, 0x9b, 0x8c, 0x9e, 0x76};
+#define OSC_RCPT_N_CHECKERS 1u
+static const uint8_t osc_rcpt_checker_ids[OSC_RCPT_N_CHECKERS][32] = { {
+    0xd7, 0xaa, 0xe6, 0x01, 0xe7, 0x32, 0xb4, 0xb1, 0x45, 0xc7, 0x3e, 0x8d, 0x4f, 0x92, 0x76, 0x9f,
+    0x56, 0xda, 0xc2, 0xe6, 0xfb, 0xa5, 0xf7, 0x7a, 0xed, 0x49, 0x0a, 0xec, 0x42, 0x9c, 0xf3, 0xba} };
+#endif

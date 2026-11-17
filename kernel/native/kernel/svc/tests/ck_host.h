@@ -1,0 +1,50 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* ck_host.h -- knobs of the host ck.h shim (tests only). */
+#ifndef AIENOS_CK_HOST_H
+#define AIENOS_CK_HOST_H
+#include <stdint.h>
+extern const void *ck_host_mcfg; /* table returned for ck_acpi_find("MCFG") */
+extern int ck_host_quiet;        /* 1: drop ck_printf output */
+extern int ck_host_try_map_ok;            /* 1: ck_mmio_try_map is identity (default 0: always NULL) */
+extern uint64_t ck_host_try_map_fail;     /* with try_map_ok: this exact phys still fails (0: none) */
+extern int ck_host_unmap_calls;           /* successful ck_mmio_unmap_exclusive calls */
+extern int ck_host_confine_rc;                 /* ck_dma_confine result (default CK_SMMU_ABSENT; 0 models a confining SMMU) */
+extern int ck_host_confine_named_rc;           /* ck_dma_confine_named result (default CK_SMMU_ABSENT; 0 grants) */
+extern int ck_host_unconfine_fail;             /* 1: ck_dma_unconfine refuses the abort (CK_SMMU_FAILED) */
+extern unsigned ck_host_unconfine_allow;       /* with unconfine_fail: this many calls still succeed, then it refuses */
+extern int ck_host_faults_up;                  /* 0 (default): ck_dma_faults returns -1, no SMMU up */
+extern int ck_host_fault_n;                    /* pending fault events for ck_host_fault_sid; drained by one call */
+extern uint32_t ck_host_fault_sid;
+extern struct ck_dma_fault ck_host_fault_first;
+extern unsigned ck_host_fault_calls;           /* ck_dma_faults calls while faults_up */
+extern unsigned ck_host_confine_calls, ck_host_unconfine_calls;
+extern uint32_t ck_host_confine_segment, ck_host_confine_rid;
+extern uint64_t ck_host_confine_phys, ck_host_confine_len;
+/* Device models step here, on the caller's thread, so a register poll sees the model's answer without timing:
+ * the mb hook runs after every ck_mb (drivers fence each register write with it), the udelay hook on every poll wait. */
+extern void (*ck_host_mb_hook)(void);
+extern void (*ck_host_udelay_hook)(void);
+void ck_host_mmio_reset(void);            /* forget every recorded mapping and the counter */
+/* One ACPI platform device the next ck_acpi_platform_devices scan can return.
+ * Cleared: the scan reports no DSDT, as on an unconfigured host. */
+void ck_host_plat_set(const char *name, const char *hid, uint64_t mmio_base, uint64_t mmio_len);
+void ck_host_plat_clear(void);
+void ck_host_capture_start(void);         /* record ck_printf/ck_puts text (even when quiet) */
+const char *ck_host_capture_text(void);   /* NUL-terminated text captured since start */
+void ck_host_capture_stop(void);
+#endif

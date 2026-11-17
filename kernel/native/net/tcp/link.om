@@ -1,0 +1,505 @@
+note link.om: seeded impairment relay for the L232 QEMU gate. Seeded Omega.
+note It joins two QEMU dgram netdevs over AF_UNIX datagram sockets: side A is the
+note guest NIC, side B is the QEMU hub that holds the slirp network. Every frame is
+note one datagram. Per direction it drops, holds back (reorders) and duplicates
+note frames with per-mille rates from a seeded xorshift64 stream, so a run is
+note reproducible from its arguments up to timing. Toward the guest it also
+note injects hostile variants of real frames (see lmutate).
+note Arguments: ABIND APEER BBIND BPEER SEED DROP REORDER DUP HOSTILE IDLE
+note (rates per mille; IDLE seconds of silence after traffic ends the run).
+note Output: one LINK line of counters, one LINKH line of injected kinds.
+global Lfd ulong 2
+global Lcf ulong 8
+global Lsa uchar 128
+global Larg uchar 256
+global Lfr uchar 2048
+global Lmu uchar 2048
+global Lhb uchar 16384
+global Lhl ulong 8
+global Lhc ulong 8
+global Lhd ulong 8
+global Lpf uchar 16
+note Lst: per direction d (A to B d=0, B to A d=1) base 8d: 0 in, 1 out, 2 drop,
+note 3 held, 4 dup, 5 send errors. 16 hostile injected, 17 hostile send errors.
+global Lst ulong 24
+global Lhk ulong 16
+global Lnum uchar 32
+text Mlink "LINK"
+text Mlinkh "LINKH"
+text Msp " "
+text Mnl "\n"
+fn lrnd to ulong
+x = get Lcf 0
+x = xor x shl x 13
+x = xor x shr x 7
+x = xor x shl x 17
+put Lcf 0 x
+ret x
+end
+fn lpm to ulong
+ret rem lrnd 1000
+end
+fn lst k ulong to void
+put Lst k add get Lst k 1
+end
+fn lnum v ulong to void
+i = ulong 32
+while true bound 21
+i = sub i 1
+put Lnum i uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+k = write 1 Lnum i sub 32 i
+end
+fn lsp to void
+k = write 1 Msp 0 len Msp
+end
+fn larg i ulong to ulong
+if ge long i argcnt
+exit 2
+end
+k = argread i Larg 0 255
+if lt k 1
+exit 2
+end
+ret ulong k
+end
+fn ldec n ulong to ulong
+v = ulong 0
+for i ulong n bound 20
+c = ulong get Larg i
+if or lt c 48 gt c 57
+exit 2
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+note sockaddr_un from Larg[0..n) into Lsa; returns its length.
+fn lsun n ulong to ulong
+if gt n 100
+exit 2
+end
+put Lsa 0 1
+put Lsa 1 0
+for i ulong n bound 100
+put Lsa add 2 i get Larg i
+end
+put Lsa add 2 n 0
+ret add 3 n
+end
+fn lnow to ulong
+t = monons
+if lt t 0
+exit 3
+end
+ret div ulong t 1000000
+end
+fn lopen side ulong to void
+s = socknew 1 2 0
+if lt s 0
+exit 4
+end
+n = lsun larg add 1 mul side 2
+if ne bind int s Lsa 0 n 0
+exit 4
+end
+put Lfd side ulong s
+end
+fn lconnect side ulong to void
+n = lsun larg add 2 mul side 2
+for t ulong 3000
+if eq connect int get Lfd side Lsa 0 n 0
+ret
+end
+z = sleepns 10000000
+end
+exit 5
+end
+fn lsend d ulong n ulong to void
+note Lfr frame of n bytes in direction d.
+k = send int get Lfd sub 1 d Lfr 0 n 0
+if eq k long n
+lst add mul d 8 1
+else
+lst add mul d 8 5
+end
+end
+fn lsendh d ulong slot ulong to void
+b = mul add mul d 4 slot 2048
+n = get Lhl add mul d 4 slot
+k = send int get Lfd sub 1 d Lhb b n 0
+if eq k long n
+lst add mul d 8 1
+else
+lst add mul d 8 5
+end
+put Lhl add mul d 4 slot 0
+end
+note Count down held frames of direction d; release at zero or past the deadline.
+fn ltick d ulong frame bool to void
+now = lnow
+for s ulong 4
+j = add mul d 4 s
+if ne get Lhl j 0
+if frame
+put Lhc j sub get Lhc j 1
+end
+if or eq get Lhc j 0 ge now get Lhd j
+lsendh d s
+end
+end
+end
+end
+fn lhold d ulong n ulong to bool
+for s ulong 4
+j = add mul d 4 s
+if eq get Lhl j 0
+b = mul j 2048
+for i ulong n bound 2048
+put Lhb add b i get Lfr i
+end
+put Lhl j n
+put Lhc j add 1 rem lrnd 3
+put Lhd j add lnow 40
+ret true
+end
+end
+ret false
+end
+fn lr16 p ulong to ulong
+ret add shl ulong get Lmu p 8 ulong get Lmu add p 1
+end
+fn lw16 p ulong v ulong to void
+put Lmu p uchar and shr v 8 255
+put Lmu add p 1 uchar and v 255
+end
+fn lw32 p ulong v ulong to void
+lw16 p and shr v 16 65535
+lw16 add p 2 and v 65535
+end
+fn lr32 p ulong to ulong
+ret add shl lr16 p 16 lr16 add p 2
+end
+fn lsum p ulong n ulong to ulong
+s = ulong 0
+while ge n 2 bound 1024
+s = add s lr16 p
+p = add p 2
+n = sub n 2
+end
+if eq n 1
+s = add s shl ulong get Lmu p 8
+end
+ret s
+end
+fn lfold s ulong to ulong
+while gt s 65535 bound 8
+s = add and s 65535 shr s 16
+end
+ret xor s 65535
+end
+note Recompute the IPv4 header and TCP checksums of the frame in Lmu (IHL 5).
+fn lfix to void
+lw16 24 0
+lw16 24 lfold lsum 14 20
+t = sub lr16 16 20
+lw16 50 0
+s = add lsum 26 4 lsum 30 4
+s = add add s 6 t
+lw16 50 lfold add s lsum 34 t
+end
+note True when Lmu[0..n) is IPv4 with IHL 5 carrying a whole TCP segment.
+fn ltcp n ulong to bool
+if lt n 54
+ret false
+end
+if ne lr16 12 2048
+ret false
+end
+if ne get Lmu 14 69
+ret false
+end
+if ne get Lmu 23 6
+ret false
+end
+t = lr16 16
+if or lt t 40 gt add t 14 n
+ret false
+end
+ret true
+end
+fn lxdata n ulong to void
+t = add 14 lr16 16
+h = add 34 mul ulong shr get Lmu 46 4 4
+for i ulong sub t h bound 2048
+p = add h i
+put Lmu p uchar xor get Lmu p 90
+end
+end
+note Hostile kinds: 0 bit flip, 1 truncation, 2 IPv4 length too long, 3 bad
+note version or IHL, 4 fragment bits, 5 bad TCP data offset, 6 SYN added,
+note 7 RST outside the window, 8 altered payload with an ACK of unsent data,
+note 9 wrong destination port, 10 garbage IPv4 frame, 11 garbage ARP frame,
+note 12 random flags outside the window, 13 altered payload beyond the window,
+note 14 altered payload before the window. Kind 2 carries a correct IPv4 header
+note checksum and kinds 3..9 and 12..14 carry correct checksums, so the stack must
+note refuse them on protocol grounds. Kinds 6..8 and 12..14 are only valid
+note forgeries against an established sequence space: on a handshake segment (SYN
+note set or ACK clear) a RST with an acceptable ACK or a SYN with a foreign ISS is
+note legal, so those frames use kinds 0..5 only. Non-TCP frames (ARP has no
+note checksum) get only the garbage kinds 10 and 11.
+fn lmutate n ulong to ulong
+for i ulong n bound 2048
+put Lmu i get Lfr i
+end
+k = rem lrnd 15
+if ltcp n
+f = ulong get Lmu 47
+if or ne and f 2 0 eq and f 16 0
+k = rem lrnd 6
+end
+else
+k = add 10 rem lrnd 2
+end
+put Lhk k add get Lhk k 1
+if eq k 0
+p = add 14 rem lrnd sub n 14
+put Lmu p uchar xor ulong get Lmu p shl 1 rem lrnd 8
+ret n
+end
+if eq k 1
+ret add 14 rem lrnd sub n 14
+end
+if eq k 2
+lw16 16 add lr16 16 add 1 rem lrnd 100
+lw16 24 0
+lw16 24 lfold lsum 14 20
+ret n
+end
+if eq k 3
+v = ulong 68
+if eq rem lrnd 2 0
+v = ulong 101
+end
+put Lmu 14 uchar v
+lw16 24 0
+lw16 24 lfold lsum 14 20
+ret n
+end
+if eq k 4
+lw16 20 or 8192 rem lrnd 8192
+lw16 24 0
+lw16 24 lfold lsum 14 20
+ret n
+end
+ret lmut2 k n
+end
+fn lmut2 k ulong n ulong to ulong
+if eq k 5
+note Offsets 0..4 are below the 20-byte minimum header: invalid at any length.
+o = rem lrnd 5
+put Lmu 46 uchar or shl o 4 and ulong get Lmu 46 15
+lfix
+ret n
+end
+if eq k 6
+put Lmu 47 uchar or get Lmu 47 2
+lfix
+ret n
+end
+if eq k 7
+put Lmu 47 uchar or get Lmu 47 4
+lw32 38 and add lr32 38 2147483648 4294967295
+lfix
+ret n
+end
+if eq k 8
+lw32 42 and add lr32 42 1073741824 4294967295
+lxdata n
+lfix
+ret n
+end
+if eq k 9
+lw16 36 xor lr16 36 add 1 rem lrnd 1000
+lfix
+ret n
+end
+ret lmut3 k n
+end
+fn lmut3 k ulong n ulong to ulong
+if eq k 10
+m = add 14 rem lrnd sub n 13
+for i ulong sub m 14 bound 2048
+put Lmu add 14 i uchar and lrnd 255
+end
+lw16 12 2048
+ret m
+end
+if eq k 11
+m = add 14 rem lrnd 60
+for i ulong sub m 14 bound 64
+put Lmu add 14 i uchar and lrnd 255
+end
+lw16 12 2054
+ret m
+end
+if eq k 12
+put Lmu 47 uchar and lrnd 255
+lw32 38 and add lr32 38 2147483648 4294967295
+lfix
+ret n
+end
+if eq k 13
+note 2^30 away from a real sequence number is outside any 65535-byte window.
+lw32 38 and add lr32 38 1073741824 4294967295
+lxdata n
+lfix
+ret n
+end
+lw32 38 and sub add lr32 38 4294967296 1073741824 4294967295
+lxdata n
+lfix
+ret n
+end
+fn linject n ulong to void
+m = lmutate n
+k = send int get Lfd 0 Lmu 0 m 0
+if eq k long m
+lst 16
+else
+lst 17
+end
+end
+note True when Lfr[0..n) is an IPv4 (IHL 5) TCP segment with SYN set.
+fn lsyn n ulong to bool
+if lt n 54
+ret false
+end
+if or ne get Lfr 12 8 ne get Lfr 13 0
+ret false
+end
+if or ne get Lfr 14 69 ne get Lfr 23 6
+ret false
+end
+ret ne and ulong get Lfr 47 2 0
+end
+note libslirp 4.7.0 (also master in 2026) runs tcp_dooptions on every segment
+note outside LISTEN; an MSS option on a SYN calls tcp_mss, whose sbreserve
+note resets the socket send buffer. A SYN that reaches slirp after it has
+note buffered host data therefore discards that data. SYN segments toward slirp
+note (d = 0) are never held back or duplicated; they may still be dropped.
+fn lframe d ulong n ulong to void
+lst mul d 8
+v = and eq d 0 lsyn n
+note Hostile variants go ahead of the real frame, so a stack that accepted one
+note would keep its bytes (first copy wins) and fail the end-to-end digest.
+if eq d 1
+if lt lpm get Lcf 4
+linject n
+end
+end
+if lt lpm get Lcf 1
+lst add mul d 8 2
+ltick d true
+ret
+end
+if lt lpm get Lcf 2
+if not v
+if lhold d n
+lst add mul d 8 3
+ret
+end
+end
+end
+lsend d n
+if lt lpm get Lcf 3
+if not v
+lst add mul d 8 4
+lsend d n
+end
+end
+ltick d true
+end
+fn lreport to void
+k = write 1 Mlink 0 len Mlink
+for i ulong 18
+lsp
+lnum get Lst i
+end
+k = write 1 Mnl 0 len Mnl
+k = write 1 Mlinkh 0 len Mlinkh
+for i ulong 15
+lsp
+lnum get Lhk i
+end
+k = write 1 Mnl 0 len Mnl
+end
+fn lpoll to ulong
+for d ulong 2
+s = get Lfd d
+put Lpf mul d 8 uchar and s 255
+put Lpf add mul d 8 1 uchar and shr s 8 255
+put Lpf add mul d 8 2 0
+put Lpf add mul d 8 3 0
+put Lpf add mul d 8 4 1
+put Lpf add mul d 8 5 0
+put Lpf add mul d 8 6 0
+put Lpf add mul d 8 7 0
+end
+r = pollfds Lpf 0 16 5000000
+if lt r 0
+exit 6
+end
+ret ulong r
+end
+fn lpump d ulong to ulong
+c = ulong 0
+for i ulong 64
+k = recv int get Lfd d Lfr 0 2048 64
+if le k 0
+ret c
+end
+lframe d ulong k
+c = add c 1
+end
+ret c
+end
+fn main to int
+lopen 0
+lopen 1
+put Lcf 0 ldec larg 5
+if eq get Lcf 0 0
+put Lcf 0 1
+end
+put Lcf 1 ldec larg 6
+put Lcf 2 ldec larg 7
+put Lcf 3 ldec larg 8
+put Lcf 4 ldec larg 9
+idle = mul ldec larg 10 1000
+lconnect 0
+lconnect 1
+last = lnow
+seen = false
+while true bound 1000000000
+r = lpoll
+c = add lpump 0 lpump 1
+now = lnow
+if gt c 0
+last = now
+seen = true
+end
+ltick 0 false
+ltick 1 false
+if seen
+if gt sub now last idle
+lreport
+ret 0
+end
+end
+end
+ret 1
+end

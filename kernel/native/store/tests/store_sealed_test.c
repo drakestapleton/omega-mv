@@ -1,0 +1,1262 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Sealed store tests (M5 envelopes + transaction records + torn_slot anchor),
+ * file-backed through native/disk disk_file, 512 and 4096 geometry. */
+#include "store_test_util.h"
+#include "store_rig.h"
+#include "../argus/sha256.h"
+#include "store_v1.h"
+
+#define SCHECK_EQ(got, want, what)                                                    \
+    do {                                                                              \
+        long long g_ = (long long)(got), w_ = (long long)(want);                      \
+        CHECK(g_ == w_, "%s: got %lld (%s), want %lld (%s)", what, g_, ss_strerror((int)g_), \
+              w_, ss_strerror((int)w_));                                              \
+    } while (0)
+
+static ss_workspace g_ws;
+static uint8_t img_a[RIG_BYTES], img_b[RIG_BYTES], img_c[RIG_BYTES];
+static char g_path[512];
+static uint32_t g_bs;
+static ss_keys K, K_TEST, K_OTHER;
+
+static uint8_t P1[700], P2[9000], P3[16384], P4[1];
+
+static void fill(uint8_t *p, size_t n, uint32_t seed)
+{
+    for (size_t i = 0; i < n; i++) p[i] = (uint8_t)((i * 131u + seed * 7u + (i >> 9)) & 0xff);
+}
+
+static int sopen(rig *r, ss_store *s, const ss_keys *k)
+{
+    if (rig_open(r, g_path, g_bs, 0) != 0) return -9999;
+    int rc = ss_open(s, &r->sdev, &r->tdev, 0, k, &g_ws);
+    return rc;
+}
+
+/* region helpers: anchor = units 0..3, store = units 4.. */
+static void copy_anchor(uint8_t *dst, const uint8_t *src)
+{
+    memcpy(dst, src, (size_t)RIG_ANCHOR_UNITS * 4096u);
+}
+static void copy_store(uint8_t *dst, const uint8_t *src)
+{
+    memcpy(dst + RIG_ANCHOR_UNITS * 4096u, src + RIG_ANCHOR_UNITS * 4096u,
+           (size_t)RIG_STORE_UNITS * 4096u);
+}
+
+static int check_read(ss_store *s, const uint8_t sid[32], const uint8_t *want, size_t n, uint16_t kind)
+{
+    static uint8_t out[SS_MAX_PLAINTEXT];
+    size_t len = 0;
+    uint16_t k = 0;
+    int rc = ss_read(s, sid, out, sizeof out, &len, &k);
+    if (rc != 0) return rc;
+    if (len != n || k != kind || memcmp(out, want, n) != 0) return -1;
+    return 0;
+}
+
+/* Format, commit gen 2 {P1 kind 40, P2 kind 41}. */
+static void make_gen2(uint8_t ids[][32])
+{
+    rig r;
+    CHECK(rig_open(&r, g_path, g_bs, 1) == 0, "rig create");
+    SCHECK_EQ(ss_format(&r.sdev, &r.tdev, 0, RIG_UUID, &K, &g_ws), 0, "format");
+    ss_store s;
+    SCHECK_EQ(ss_open(&s, &r.sdev, &r.tdev, 0, &K, &g_ws), 0, "open genesis");
+    SCHECK_EQ(s.rb, SS_RB_VALID_RESUME, "genesis anchor resumes");
+    ss_object o[2] = {{40, 1, P1, sizeof P1}, {41, 2, P2, sizeof P2}};
+    SCHECK_EQ(ss_transact(&s, o, 2, NULL, NULL, ids), 0, "gen 2 transact");
+    rig_close(&r);
+}
+
+static void advance(const ss_keys *k, uint16_t kind, const uint8_t *p, size_t n, uint8_t id[32], int want)
+{
+    rig r;
+    ss_store s;
+    SCHECK_EQ(sopen(&r, &s, k), 0, "open for advance");
+    ss_object o = {kind, 1, p, n};
+    uint8_t ids[1][32];
+    SCHECK_EQ(ss_transact(&s, &o, 1, NULL, NULL, ids), want, "advance");
+    if (id) memcpy(id, ids[0], 32);
+    rig_close(&r);
+}
+
+static int open_rc(const ss_keys *k)
+{
+    rig r;
+    ss_store s;
+    int rc = sopen(&r, &s, k);
+    rig_close(&r);
+    return rc;
+}
+
+static void test_basic(void)
+{
+    uint8_t ids[2][32];
+    make_gen2(ids);
+    rig r;
+    ss_store s;
+    SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen gen 2");
+    SCHECK_EQ(ss_generation(&s), 2, "generation 2");
+    SCHECK_EQ(s.rb, SS_RB_VALID_RESUME, "anchor current");
+    SCHECK_EQ(check_read(&s, ids[0], P1, sizeof P1, 40), 0, "read P1");
+    SCHECK_EQ(check_read(&s, ids[1], P2, sizeof P2, 41), 0, "read P2");
+    /* every catalog object is sealed: envelopes or one record per generation */
+    uint32_t n;
+    const sv1_entry *e = st_catalog(&s.st, &n);
+    int nenv = 0, ntx = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        nenv += e[i].kind == SS_KIND_ENVELOPE;
+        ntx += e[i].kind == SS_KIND_TXREC;
+    }
+    CHECK(nenv == 2 && ntx == 1 && n == 3, "catalog holds 2 envelopes + 1 record (%d %d %u)", nenv, ntx, n);
+    /* plaintext is not on disk */
+    rig_close(&r);
+    CHECK(file_load(g_path, img_a, RIG_BYTES) == 0, "load");
+    int found = 0;
+    for (size_t i = 0; i + 64 <= RIG_BYTES; i += 1)
+        if (memcmp(img_a + i, P2 + 100, 64) == 0) { found = 1; break; }
+    CHECK(!found, "plaintext bytes absent from the image");
+    /* arguments */
+    SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen");
+    uint8_t out[16];
+    size_t len;
+    SCHECK_EQ(ss_read(&s, ids[1], out, sizeof out, &len, NULL), SS_E_ARG, "read cap too small");
+    uint8_t bogus[32] = {1};
+    SCHECK_EQ(ss_read(&s, bogus, out, sizeof out, &len, NULL), ST_E_INVALID_OBJECT, "read unknown id");
+    ss_object many[SS_MAX_OBJECTS + 1];
+    for (unsigned i = 0; i <= SS_MAX_OBJECTS; i++) many[i] = (ss_object){50, 1, P4, 1};
+    SCHECK_EQ(ss_transact(&s, many, 0, NULL, NULL, NULL), SS_E_ARG, "zero objects");
+    SCHECK_EQ(ss_transact(&s, many, SS_MAX_OBJECTS + 1, NULL, NULL, NULL), SS_E_ARG, "too many objects");
+    static uint8_t big[SS_MAX_PLAINTEXT + 1];
+    ss_object ob = {50, 1, big, sizeof big};
+    SCHECK_EQ(ss_transact(&s, &ob, 1, NULL, NULL, NULL), SS_E_ARG, "object too large");
+    ss_object oz = {0, 1, P4, 1};
+    SCHECK_EQ(ss_transact(&s, &oz, 1, NULL, NULL, NULL), SS_E_ARG, "kind zero");
+    /* max objects, empty and max-size plaintext */
+    for (unsigned i = 0; i < SS_MAX_OBJECTS; i++) many[i] = (ss_object){(uint16_t)(60 + i), 1, P3, i == 0 ? 0 : sizeof P3 / (i + 1)};
+    many[SS_MAX_OBJECTS - 1].len = sizeof P3;
+    uint8_t mids[SS_MAX_OBJECTS][32];
+    SCHECK_EQ(ss_transact(&s, many, SS_MAX_OBJECTS, NULL, NULL, mids), 0, "8-object transaction");
+    rig_close(&r);
+    SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen gen 3");
+    SCHECK_EQ(ss_generation(&s), 3, "generation 3");
+    for (unsigned i = 0; i < SS_MAX_OBJECTS; i++)
+        SCHECK_EQ(check_read(&s, mids[i], P3, many[i].len, (uint16_t)(60 + i)), 0, "read max transaction");
+    SCHECK_EQ(check_read(&s, ids[0], P1, sizeof P1, 40), 0, "gen 2 object still readable");
+    rig_close(&r);
+    /* genesis with an empty anchor region is accepted only at generation 1 */
+    CHECK(rig_open(&r, g_path, g_bs, 1) == 0, "rig create");
+    SCHECK_EQ(st_format(&r.sdev, RIG_UUID), 0, "store-only genesis");
+    SCHECK_EQ(ss_open(&s, &r.sdev, &r.tdev, 0, &K, &g_ws), 0, "empty anchor at genesis");
+    SCHECK_EQ(s.rb, SS_RB_GENESIS, "genesis decision");
+    ss_object o1 = {40, 1, P1, sizeof P1};
+    SCHECK_EQ(ss_transact(&s, &o1, 1, NULL, NULL, NULL), 0, "first transaction catches the anchor up");
+    rig_close(&r);
+    SCHECK_EQ(open_rc(&K), 0, "reopen after genesis catch-up");
+}
+
+static void test_rollback(void)
+{
+    uint8_t ids[2][32];
+    make_gen2(ids);
+    CHECK(file_load(g_path, img_a, RIG_BYTES) == 0, "snapshot gen 2");
+    advance(&K, 42, P1, 10, NULL, 0); /* gen 3 */
+    CHECK(file_load(g_path, img_b, RIG_BYTES) == 0, "snapshot gen 3");
+    advance(&K, 43, P1, 20, NULL, 0); /* gen 4 */
+    CHECK(file_load(g_path, img_c, RIG_BYTES) == 0, "snapshot gen 4");
+    SCHECK_EQ(open_rc(&K), 0, "gen 4 mounts");
+
+    /* Store rolled back one generation under the current anchor */
+    static uint8_t t[RIG_BYTES];
+    memcpy(t, img_c, RIG_BYTES);
+    copy_store(t, img_b);
+    CHECK(file_save(g_path, t, RIG_BYTES) == 0, "write");
+    SCHECK_EQ(open_rc(&K), SS_E_ROLLBACK, "store gen 3 under anchor 4");
+    memcpy(t, img_c, RIG_BYTES);
+    copy_store(t, img_a);
+    CHECK(file_save(g_path, t, RIG_BYTES) == 0, "write");
+    SCHECK_EQ(open_rc(&K), SS_E_ROLLBACK, "store gen 2 under anchor 4");
+    /* anchor replayed: one behind is a crash window (accepted), two behind is not */
+    memcpy(t, img_c, RIG_BYTES);
+    copy_anchor(t, img_b);
+    CHECK(file_save(g_path, t, RIG_BYTES) == 0, "write");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "anchor one behind");
+        SCHECK_EQ(s.rb, SS_RB_PREPARED_ADVANCE, "prepared advance");
+        rig_close(&r);
+    }
+    memcpy(t, img_c, RIG_BYTES);
+    copy_anchor(t, img_a);
+    CHECK(file_save(g_path, t, RIG_BYTES) == 0, "write");
+    SCHECK_EQ(open_rc(&K), SS_E_INCONSISTENT, "replayed anchor two behind");
+    /* anchor missing after genesis */
+    memcpy(t, img_c, RIG_BYTES);
+    memset(t, 0, (size_t)RIG_ANCHOR_UNITS * 4096u);
+    CHECK(file_save(g_path, t, RIG_BYTES) == 0, "write");
+    SCHECK_EQ(open_rc(&K), SS_E_ROLLBACK, "missing anchor at gen 4");
+    /* LIMITATION, whole-image freshness: rolling back both regions together is
+     * NOT detected. It needs a monotonic counter outside the disk (TPM NV,
+     * TRUST-1, aienux#32). The mount succeeds at the stale generation 2 and
+     * reports a valid resume, so a successful mount is never proof of freshness. */
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "write");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "whole-disk rollback mounts (LIMITATION: needs TPM NV, #32)");
+        SCHECK_EQ(ss_generation(&s), 2, "whole-disk rollback: stale generation 2 is served, not 4");
+        SCHECK_EQ(s.rb, SS_RB_VALID_RESUME, "whole-disk rollback reports a valid resume (undetected)");
+        rig_close(&r);
+    }
+
+    /* forked anchor: same counter, different digest, valid MAC */
+    CHECK(file_save(g_path, img_c, RIG_BYTES) == 0, "write");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open gen 4");
+        uint8_t *rec = g_ws.tsrec;
+        memset(rec, 0, 4096);
+        memcpy(rec, "AIENSAN1", 8);
+        rec[8] = 1;
+        rec[10] = K.identity_class;
+        memcpy(rec + 16, RIG_UUID, 16);
+        m5_anchor a = {0};
+        a.identity_class = K.identity_class;
+        memcpy(a.store_uuid, RIG_UUID, 16);
+        a.store_generation = 4;
+        a.key_generation = 1;
+        a.counter = 4;
+        memset(a.commit_digest, 0x77, 32);
+        CHECK(m5_anchor_seal(&a, K.k_root_auth, rec + 32, M5_ANCHOR_LEN) == M5_OK, "seal");
+        CHECK(ts_commit(&s.ts, rec) == TS_OK, "commit forked anchor");
+        rig_close(&r);
+    }
+    SCHECK_EQ(open_rc(&K), SS_E_ROLLBACK, "forked anchor at the same counter");
+
+    /* anchor record naming another store around a valid M5 anchor */
+    CHECK(file_save(g_path, img_c, RIG_BYTES) == 0, "write");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open gen 4");
+        uint8_t *rec = g_ws.tsrec;
+        memset(rec, 0, 4096);
+        memcpy(rec, "AIENSAN1", 8);
+        rec[8] = 1;
+        rec[10] = K.identity_class;
+        memcpy(rec + 16, RIG_UUID, 16);
+        rec[16] ^= 1;
+        m5_anchor a = {0};
+        a.identity_class = K.identity_class;
+        memcpy(a.store_uuid, RIG_UUID, 16);
+        a.store_generation = 4;
+        a.key_generation = 1;
+        a.counter = 4;
+        memcpy(a.commit_digest, s.last_tx_digest, 32);
+        CHECK(m5_anchor_seal(&a, K.k_root_auth, rec + 32, M5_ANCHOR_LEN) == M5_OK, "seal");
+        CHECK(ts_commit(&s.ts, rec) == TS_OK, "commit relabelled anchor");
+        rig_close(&r);
+    }
+    SCHECK_EQ(open_rc(&K), SS_E_IDENTITY, "anchor record names another store");
+
+    /* replayed anchor seq: two valid torn_slot slots claiming one sequence */
+    CHECK(file_save(g_path, img_c, RIG_BYTES) == 0, "write");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open gen 4");
+        uint8_t rec[4096];
+        uint64_t seq;
+        CHECK(ts_recover(&s.ts, rec, &seq, NULL) == TS_OK, "recover");
+        int other = s.ts.newest_slot == 0 ? 1 : 0;
+        uint8_t hdr[4096];
+        memset(hdr, 0, sizeof hdr);
+        ts_encode_commit(hdr, other, seq, rec);
+        uint64_t base = (uint64_t)other * 2u * r.bpu;
+        CHECK(r.d.write(r.d.ctx, base, r.bpu, rec) == 0, "body");
+        CHECK(r.d.write(r.d.ctx, base + r.bpu, r.bpu, hdr) == 0, "header");
+        rig_close(&r);
+    }
+    SCHECK_EQ(open_rc(&K), SS_E_ANCHOR, "duplicate anchor sequence");
+}
+
+static void test_identity(void)
+{
+    uint8_t ids[2][32];
+    make_gen2(ids);
+    SCHECK_EQ(open_rc(&K_TEST), SS_E_IDENTITY, "PRODUCTION store, TEST keys");
+    SCHECK_EQ(open_rc(&K_OTHER), SS_E_TXREC, "same class, other volume key");
+    /* anchor region of another store (other uuid) */
+    CHECK(file_load(g_path, img_a, RIG_BYTES) == 0, "load");
+    {
+        rig r;
+        static const uint8_t U2[16] = {9, 9, 9};
+        CHECK(rig_open(&r, g_path, g_bs, 1) == 0, "create");
+        SCHECK_EQ(ss_format(&r.sdev, &r.tdev, 0, U2, &K, &g_ws), 0, "format other store");
+        rig_close(&r);
+        CHECK(file_load(g_path, img_b, RIG_BYTES) == 0, "load");
+    }
+    copy_anchor(img_a, img_b);
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "write");
+    SCHECK_EQ(open_rc(&K), SS_E_IDENTITY, "anchor of another store");
+    /* TEST-class store refused by PRODUCTION keys at genesis too */
+    rig r;
+    CHECK(rig_open(&r, g_path, g_bs, 1) == 0, "create");
+    SCHECK_EQ(ss_format(&r.sdev, &r.tdev, 0, RIG_UUID, &K_TEST, &g_ws), 0, "format TEST store");
+    rig_close(&r);
+    SCHECK_EQ(open_rc(&K), SS_E_IDENTITY, "TEST genesis, PRODUCTION keys");
+    SCHECK_EQ(open_rc(&K_TEST), 0, "TEST genesis, TEST keys");
+}
+
+/* Forge helper: prepare one object, let edit() change the workspace, commit
+ * with the real Store engine, then return the next mount's result. */
+typedef void (*forge_fn)(ss_store *s, void *arg);
+static int forge_objs(forge_fn edit, void *arg, const ss_object *o, size_t n)
+{
+    rig r;
+    ss_store s;
+    int rc = sopen(&r, &s, &K);
+    if (rc != 0) { rig_close(&r); return -8888; }
+    rc = ss_prepare(&s, o, n);
+    if (rc == 0) {
+        edit(&s, arg);
+        rc = ss_commit_prepared(&s, NULL, NULL);
+    }
+    rig_close(&r);
+    if (rc != 0) return -7777;
+    return open_rc(&K);
+}
+static int forge(forge_fn edit, void *arg)
+{
+    ss_object o[2] = {{44, 1, P1, 300}, {45, 1, P2, 5000}};
+    return forge_objs(edit, arg, o, 2);
+}
+
+static void put64le(uint8_t *p, uint64_t v)
+{
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+static void ed_flip_env(ss_store *s, void *a) { (void)a; s->ws->env[0][100] ^= 1; }
+static void ed_flip_env_rebind(ss_store *s, void *a)
+{
+    (void)a;
+    ss_workspace *w = s->ws;
+    w->env[0][100] ^= 1; /* ciphertext byte: AEAD tag will fail */
+    uint8_t *e = w->tx + SS_TX_HDR;
+    sv1_object_id(SS_KIND_ENVELOPE, 1, w->env[0], w->env_len[0], e);
+    m5_commit c;
+    m5_commit_open(e + 32, M5_COMMIT_LEN, K.k_root_auth, K.identity_class, &c);
+    sha256_hash(w->env[0], w->env_len[0], c.object_id);
+    m5_commit_seal(&c, K.k_root_auth, e + 32);
+    ss_tx_remac(s);
+}
+static uint8_t junk[5000];
+static void ed_extra_env(ss_store *s, void *a)
+{
+    (void)a;
+    s->ws->objs[s->ws->nobjs++] = (st_object){SS_KIND_ENVELOPE, 1, junk, sizeof junk};
+}
+static void ed_plain(ss_store *s, void *a)
+{
+    (void)a;
+    s->ws->objs[s->ws->nobjs++] = (st_object){3, 1, junk, 100};
+}
+static void ed_gen_skip(ss_store *s, void *a)
+{
+    (void)a;
+    uint64_t g = ss_generation(s) + 2;
+    put64le(s->ws->tx + 32, g);
+    put64le(s->ws->tx + 40, g);
+    ss_tx_remac(s);
+}
+static void ed_counter(ss_store *s, void *a)
+{
+    (void)a;
+    put64le(s->ws->tx + 40, ss_generation(s) + 2);
+    ss_tx_remac(s);
+}
+static uint8_t saved_tx[SS_TX_MAX];
+static size_t saved_tx_len;
+static void ed_stale_commit(ss_store *s, void *a)
+{
+    (void)a; /* entry 0 carries the previous generation's commit record */
+    memcpy(s->ws->tx + SS_TX_HDR + 32, saved_tx + SS_TX_HDR + 32, M5_COMMIT_LEN);
+    ss_tx_remac(s);
+}
+static void ed_replay_record(ss_store *s, void *a)
+{
+    (void)a; /* the previous record replayed whole: the Store deduplicates it */
+    memcpy(s->ws->tx, saved_tx, saved_tx_len);
+    s->ws->tx_len = saved_tx_len;
+    s->ws->objs[s->ws->nobjs - 1].len = saved_tx_len;
+}
+static void ed_chain(ss_store *s, void *a)
+{
+    (void)a;
+    s->ws->tx[56] ^= 1;
+    ss_tx_remac(s);
+}
+static void ed_bad_mac(ss_store *s, void *a) { (void)a; s->ws->tx[s->ws->tx_len - 1] ^= 1; }
+static void ed_bad_magic(ss_store *s, void *a) { (void)a; s->ws->tx[0] = 'X'; ss_tx_remac(s); }
+static void ed_tx_class(ss_store *s, void *a) { (void)a; s->ws->tx[10] = M5_ID_TEST; ss_tx_remac(s); }
+static void ed_seq(ss_store *s, void *a)
+{
+    (void)a; /* swap the two commit records: object_sequence no longer matches */
+    uint8_t t[M5_COMMIT_LEN];
+    uint8_t *e0 = s->ws->tx + SS_TX_HDR + 32, *e1 = e0 + SS_TX_ENTRY;
+    memcpy(t, e0, sizeof t);
+    memcpy(e0, e1, sizeof t);
+    memcpy(e1, t, sizeof t);
+    ss_tx_remac(s);
+}
+static uint8_t dup_tx[SS_TX_MAX];
+static void ed_dup_gen(ss_store *s, void *a)
+{
+    (void)a; /* two validly MACed, chain-valid records for the same generation,
+              * each claiming one of the two envelopes once, so only the
+              * one-record-per-generation check can refuse the pair */
+    ss_workspace *w = s->ws;
+    uint8_t *e1 = w->tx + SS_TX_HDR + SS_TX_ENTRY;
+    m5_commit c;
+    m5_commit_open(e1 + 32, M5_COMMIT_LEN, K.k_root_auth, K.identity_class, &c);
+    c.object_sequence = 0;
+    size_t len1 = SS_TX_HDR + SS_TX_ENTRY + 32;
+    memcpy(dup_tx, w->tx, SS_TX_HDR);
+    memcpy(dup_tx + SS_TX_HDR, e1, 32);
+    m5_commit_seal(&c, K.k_root_auth, dup_tx + SS_TX_HDR + 32);
+    dup_tx[12] = 1;
+    dup_tx[13] = 0;
+    w->tx[12] = 1;
+    w->tx[13] = 0;
+    w->tx_len = len1;
+    ss_tx_remac(s); /* the real record now claims envelope 0 only */
+    uint8_t t[SS_TX_MAX];
+    memcpy(t, w->tx, len1);
+    memcpy(w->tx, dup_tx, len1);
+    ss_tx_remac(s);
+    memcpy(dup_tx, w->tx, len1);
+    memcpy(w->tx, t, len1);
+    w->objs[w->nobjs - 1].len = len1;
+    w->objs[w->nobjs++] = (st_object){SS_KIND_TXREC, 1, dup_tx, len1};
+}
+static uint8_t old_sid[32];
+static m5_commit old_commit;
+static void ed_claim_twice(ss_store *s, void *a)
+{
+    (void)a; /* entry 0 re-claims a generation-2 envelope with a fresh, valid commit */
+    m5_commit c = old_commit;
+    c.store_generation = ss_generation(s) + 1;
+    c.counter = c.store_generation;
+    c.object_sequence = 0;
+    uint8_t *e = s->ws->tx + SS_TX_HDR;
+    memcpy(e, old_sid, 32);
+    m5_commit_seal(&c, K.k_root_auth, e + 32);
+    ss_tx_remac(s);
+}
+
+/* re-seal entry i's M5 commit record after an edit, then re-MAC the record */
+static void reseal(ss_store *s, uint32_t i, void (*fix)(m5_commit *))
+{
+    uint8_t *e = s->ws->tx + SS_TX_HDR + (size_t)i * SS_TX_ENTRY;
+    m5_commit c;
+    m5_commit_open(e + 32, M5_COMMIT_LEN, K.k_root_auth, K.identity_class, &c);
+    fix(&c);
+    m5_commit_seal(&c, K.k_root_auth, e + 32);
+    ss_tx_remac(s);
+}
+static void fx_store(m5_commit *c) { c->obj.store_uuid[0] ^= 1; }
+static void fx_gen(m5_commit *c) { c->store_generation += 1; }
+static void fx_counter(m5_commit *c) { c->counter += 1; }
+static void fx_digest(m5_commit *c) { c->object_id[0] ^= 1; }
+static void fx_huge(m5_commit *c) { c->store_generation = c->counter = UINT64_C(1) << 40; }
+static void ed_commit_store(ss_store *s, void *a) { (void)a; reseal(s, 0, fx_store); }
+static void ed_commit_gen(ss_store *s, void *a) { (void)a; reseal(s, 0, fx_gen); }
+static void ed_commit_counter(ss_store *s, void *a) { (void)a; reseal(s, 0, fx_counter); }
+static void ed_commit_digest(ss_store *s, void *a) { (void)a; reseal(s, 0, fx_digest); }
+static void ed_gen_huge(ss_store *s, void *a)
+{
+    (void)a; /* self-consistent record, generation far beyond the Store's */
+    put64le(s->ws->tx + 32, UINT64_C(1) << 40);
+    put64le(s->ws->tx + 40, UINT64_C(1) << 40);
+    reseal(s, 0, fx_huge);
+    reseal(s, 1, fx_huge);
+}
+static void ed_tx_store(ss_store *s, void *a) { (void)a; s->ws->tx[16] ^= 1; ss_tx_remac(s); }
+static void ed_tx_long(ss_store *s, void *a)
+{
+    (void)a; /* 32 trailing bytes inside a valid MAC */
+    ss_workspace *w = s->ws;
+    memset(w->tx + w->tx_len, 0, 32);
+    w->tx_len += 32;
+    w->objs[w->nobjs - 1].len = w->tx_len;
+    ss_tx_remac(s);
+}
+
+static void test_forgery(void)
+{
+    struct { const char *name; forge_fn fn; int want_open; } cases[] = {
+        {"envelope swapped after sealing", ed_flip_env, SS_E_ENVELOPE},
+        {"unclaimed envelope", ed_extra_env, SS_E_ENVELOPE},
+        {"plaintext object in sealed store", ed_plain, SS_E_FOREIGN_KIND},
+        {"generation skip", ed_gen_skip, SS_E_ORDER},
+        {"counter not the generation", ed_counter, SS_E_ORDER},
+        {"stale commit record", ed_stale_commit, SS_E_ORDER},
+        {"replayed transaction record", ed_replay_record, SS_E_ORDER},
+        {"broken record chain", ed_chain, SS_E_ORDER},
+        {"record MAC", ed_bad_mac, SS_E_TXREC},
+        {"record magic", ed_bad_magic, SS_E_TXREC},
+        {"record identity class", ed_tx_class, SS_E_IDENTITY},
+        {"commit sequence order", ed_seq, SS_E_ORDER},
+        {"two records for one generation", ed_dup_gen, SS_E_DUPLICATE},
+        {"envelope claimed twice", ed_claim_twice, SS_E_DUPLICATE},
+        {"record longer than its count", ed_tx_long, SS_E_TXREC},
+        {"record names another store", ed_tx_store, SS_E_IDENTITY},
+        {"commit names another store", ed_commit_store, SS_E_IDENTITY},
+        {"commit generation not the record's", ed_commit_gen, SS_E_ORDER},
+        {"commit counter not the record's", ed_commit_counter, SS_E_ORDER},
+        {"commit digest not the envelope's", ed_commit_digest, SS_E_ENVELOPE},
+        {"record generation beyond the Store", ed_gen_huge, SS_E_ORDER},
+    };
+    uint8_t ids[2][32];
+    make_gen2(ids);
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open gen 2");
+        /* the gen 2 record and one of its claims, for replay cases */
+        uint32_t n;
+        const sv1_entry *e = st_catalog(&s.st, &n);
+        for (uint32_t i = 0; i < n; i++)
+            if (e[i].kind == SS_KIND_TXREC)
+                CHECK(st_read_object(&s.st, e[i].object_id, saved_tx, sizeof saved_tx, &saved_tx_len) == 0, "read rec");
+        memcpy(old_sid, g_ws.claims[0].sid, 32);
+        old_commit = g_ws.claims[0].c;
+        rig_close(&r);
+    }
+    CHECK(file_load(g_path, img_a, RIG_BYTES) == 0, "snapshot gen 2");
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+        int rc = forge(cases[i].fn, NULL);
+        SCHECK_EQ(rc, cases[i].want_open, cases[i].name);
+    }
+    /* digest-consistent but tampered ciphertext: mounts, refused at read */
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    SCHECK_EQ(forge(ed_flip_env_rebind, NULL), 0, "tampered ciphertext with rebound digest mounts");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open");
+        uint8_t out[SS_MAX_PLAINTEXT];
+        size_t len;
+        int refused = 0, ok = 0;
+        for (uint32_t k = 0; k < s.nclaims; k++) {
+            int rc = ss_read(&s, g_ws.claims[k].sid, out, sizeof out, &len, NULL);
+            if (rc == SS_E_ENVELOPE)
+                CHECK(len == 0, "refused read reports zero length (claim %u)", k);
+            refused += rc == SS_E_ENVELOPE;
+            ok += rc == 0;
+        }
+        CHECK(refused == 1 && ok == 3, "AEAD refuses exactly the tampered envelope (%d refused, %d ok)", refused, ok);
+        rig_close(&r);
+    }
+    /* defence in depth at read: a claim whose digest no longer matches the
+     * envelope (here corrupted in memory after mount) is refused */
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open gen 2");
+        uint8_t out[SS_MAX_PLAINTEXT];
+        size_t len;
+        g_ws.claims[0].c.object_id[0] ^= 1;
+        SCHECK_EQ(ss_read(&s, g_ws.claims[0].sid, out, sizeof out, &len, NULL), SS_E_ENVELOPE,
+                  "read refuses a claim digest mismatch");
+        rig_close(&r);
+    }
+    /* on-disk envelope corruption. In the newest generation only: the Store
+     * falls back to the older root and the anchor refuses that as a rollback.
+     * In both roots: the Store itself refuses. */
+    for (int both = 0; both < 2; both++) {
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    if (both) advance(&K, 47, P1, 50, NULL, 0);
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open");
+        uint32_t n;
+        const sv1_entry *e = st_catalog(&s.st, &n);
+        uint64_t unit = 0;
+        for (uint32_t i = 0; i < n; i++)
+            if (e[i].kind == SS_KIND_ENVELOPE && (unit == 0 || e[i].first_unit < unit)) unit = e[i].first_unit;
+        rig_close(&r);
+        CHECK(file_load(g_path, img_b, RIG_BYTES) == 0, "load");
+        img_b[(RIG_ANCHOR_UNITS + unit) * 4096u + 200] ^= 0x10;
+        CHECK(file_save(g_path, img_b, RIG_BYTES) == 0, "write");
+    }
+    SCHECK_EQ(open_rc(&K), both ? ST_M_CORRUPT_RECOVERY_REQUIRED : SS_E_ROLLBACK,
+              both ? "corrupted envelope in both roots" : "corrupted envelope in newest root");
+    }
+}
+
+static rig *g_cut_rig;
+static void cut_before_anchor(void *arg, int cp)
+{
+    (void)arg;
+    if (cp == SS_CP_BEFORE_ANCHOR) disk_file_arm_cut(&g_cut_rig->f, 0);
+}
+
+
+/* ---- KeySlotManifest (kind 21): the one plaintext object, digest-bound ---- */
+
+static uint8_t KSM[SS_KEYSLOT_MIN], KSM2[SS_KEYSLOT_MIN], KSM3[SS_KEYSLOT_MIN], KSM_BAD[SS_KEYSLOT_MIN];
+static void ksm_fill(uint8_t *m, uint64_t seq, const uint8_t uuid[16])
+{
+    memset(m, 0, SS_KEYSLOT_MIN);
+    memcpy(m, "AIENKSL1", 8);
+    m[8] = 1;
+    memcpy(m + 12, uuid, 16);
+    put64le(m + 28, seq);
+    m[76] = 2; /* slot_count; descriptors stay Empty: the sealed layer checks shape only */
+}
+static void ksm_link(uint8_t *m, const uint8_t prev[32]) { memcpy(m + 36, prev, 32); }
+/* Forgery: after prepare, flip the genesis manifest's previous id to nonzero
+ * and re-derive the Store ObjectId and the commit digest so every other
+ * guard passes and only the chain rule can refuse it. */
+static void fx_ks_prev_digest(m5_commit *c) { sha256_hash(KSM, sizeof KSM, c->object_id); }
+static void ed_ks_prev_forged(ss_store *s, void *a)
+{
+    (void)a;
+    KSM[36] = 1;
+    sv1_object_id(SS_KIND_KEYSLOT, 1, KSM, sizeof KSM, s->ws->tx + SS_TX_HDR);
+    reseal(s, 0, fx_ks_prev_digest);
+}
+static st_store ks_scratch;
+static int bootstrap_rc(uint8_t *out, size_t cap, size_t *len)
+{
+    rig r;
+    if (rig_open(&r, g_path, g_bs, 0) != 0) return -9999;
+    int rc = ss_keyslot_bootstrap(&ks_scratch, &r.sdev, &g_ws, out, cap, len);
+    rig_close(&r);
+    return rc;
+}
+static int ks_prepare_rc(const ss_object *o, size_t n)
+{
+    rig r;
+    ss_store s;
+    int rc = sopen(&r, &s, &K);
+    if (rc == 0) rc = ss_prepare(&s, o, n);
+    rig_close(&r);
+    return rc;
+}
+static void ed_ks_digest(ss_store *s, void *a) { (void)a; reseal(s, 0, fx_digest); }
+static void ed_ks_second(ss_store *s, void *a)
+{
+    (void)a;
+    s->ws->objs[s->ws->nobjs++] = (st_object){SS_KIND_KEYSLOT, 1, KSM2, sizeof KSM2};
+}
+static void ed_ks_unclaimed(ss_store *s, void *a)
+{
+    (void)a;
+    s->ws->objs[s->ws->nobjs++] = (st_object){SS_KIND_KEYSLOT, 1, KSM, sizeof KSM};
+}
+static void ed_ks_bad_unclaimed(ss_store *s, void *a)
+{
+    (void)a;
+    s->ws->objs[s->ws->nobjs++] = (st_object){SS_KIND_KEYSLOT, 1, KSM_BAD, sizeof KSM_BAD};
+}
+/* Keep both the structural Store id and the keyed claim valid, so a bad
+ * manifest is rejected by its shape rather than an unrelated digest check. */
+static void ed_ks_bad_shape(ss_store *s, void *a)
+{
+    size_t offset = *(const size_t *)a;
+    KSM[offset] ^= 1;
+    sv1_object_id(SS_KIND_KEYSLOT, 1, KSM, sizeof KSM, s->ws->tx + SS_TX_HDR);
+    reseal(s, 0, fx_ks_prev_digest);
+}
+
+static void test_keyslot(void)
+{
+    uint8_t ids[2][32], out[SS_MAX_PLAINTEXT];
+    size_t len = 0;
+    ksm_fill(KSM, 1, RIG_UUID);
+    ksm_fill(KSM2, 2, RIG_UUID);
+    ksm_fill(KSM_BAD, 3, RIG_UUID);
+    KSM_BAD[0] = 'X';
+    make_gen2(ids);
+    SCHECK_EQ(bootstrap_rc(out, sizeof out, &len), SS_E_KEYSLOT, "no manifest to bootstrap from");
+    CHECK(file_load(g_path, img_a, RIG_BYTES) == 0, "snapshot gen 2 (no keyslot)");
+
+    /* prepare-time refusals: shape, store identity, one per store */
+    {
+        uint8_t m[SS_KEYSLOT_MIN];
+        ss_object o[2] = {{SS_KIND_KEYSLOT, 1, m, sizeof m}, {SS_KIND_KEYSLOT, 1, KSM2, sizeof KSM2}};
+        memcpy(m, KSM, sizeof m); m[0] = 'X';
+        SCHECK_EQ(ks_prepare_rc(o, 1), SS_E_KEYSLOT, "bad magic refused at prepare");
+        memcpy(m, KSM, sizeof m); m[8] = 2;
+        SCHECK_EQ(ks_prepare_rc(o, 1), SS_E_KEYSLOT, "format version 2 refused at prepare");
+        memcpy(m, KSM, sizeof m); m[12] ^= 1;
+        SCHECK_EQ(ks_prepare_rc(o, 1), SS_E_KEYSLOT, "another store's manifest refused at prepare");
+        memcpy(m, KSM, sizeof m); o[0].len = SS_KEYSLOT_MIN - 1;
+        SCHECK_EQ(ks_prepare_rc(o, 1), SS_E_KEYSLOT, "short manifest refused at prepare");
+        o[0].len = sizeof m; o[0].version = 2;
+        SCHECK_EQ(ks_prepare_rc(o, 1), SS_E_KEYSLOT, "manifest version 2 refused at prepare");
+        o[0].version = 1;
+        /* Both independently qualify as the next manifest on this store.
+         * Sequence 2 here would be rejected even without the count guard. */
+        o[1] = o[0];
+        SCHECK_EQ(ks_prepare_rc(o, 2), SS_E_KEYSLOT, "two manifests in one transaction refused");
+        SCHECK_EQ(ks_prepare_rc(o, 1), 0, "one well-formed manifest prepares");
+    }
+
+    /* commit {manifest, object}: bootstrap reads it unkeyed, the keyed open binds it */
+    {
+        rig r;
+        ss_store s;
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "open gen 2");
+        ss_object o[2] = {{SS_KIND_KEYSLOT, 1, KSM, sizeof KSM}, {42, 1, P4, sizeof P4}};
+        uint8_t kid[2][32];
+        SCHECK_EQ(ss_transact(&s, o, 2, NULL, NULL, kid), 0, "gen 3 commits the manifest");
+        CHECK(s.has_keyslot && memcmp(s.keyslot_sid, kid[0], 32) == 0, "manifest bound after commit");
+        rig_close(&r);
+        SCHECK_EQ(bootstrap_rc(out, sizeof out, &len), 0, "bootstrap reads the manifest");
+        CHECK(len == sizeof KSM && memcmp(out, KSM, len) == 0, "bootstrap bytes are the manifest");
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen gen 3");
+        CHECK(s.has_keyslot && memcmp(s.keyslot_sid, kid[0], 32) == 0, "manifest bound at open");
+        uint16_t kind = 0;
+        SCHECK_EQ(ss_read(&s, kid[0], out, sizeof out, &len, &kind), 0, "keyed read of the manifest");
+        CHECK(kind == SS_KIND_KEYSLOT && len == sizeof KSM && memcmp(out, KSM, len) == 0, "read returns plaintext");
+        SCHECK_EQ(check_read(&s, kid[1], P4, sizeof P4, 42), 0, "the envelope beside it opens");
+        CHECK(s.nkeyslot == 1, "chain length 1");
+        /* rotation chain (ADR 0017 section 2.7): the next manifest must be
+         * sequence count + 1 and name the bound manifest; anything else refused */
+        ss_object again = {SS_KIND_KEYSLOT, 1, KSM2, sizeof KSM2};
+        SCHECK_EQ(ss_prepare(&s, &again, 1), SS_E_KEYSLOT, "sequence 2 without the link to sequence 1 refused");
+        ksm_fill(KSM2, 1, RIG_UUID);
+        SCHECK_EQ(ss_prepare(&s, &again, 1), SS_E_KEYSLOT, "a second sequence-1 manifest refused");
+        ksm_fill(KSM2, 2, RIG_UUID);
+        ksm_link(KSM2, kid[1]);
+        SCHECK_EQ(ss_prepare(&s, &again, 1), SS_E_KEYSLOT, "sequence 2 naming an envelope, not the manifest, refused");
+        ksm_link(KSM2, kid[0]);
+        uint8_t kid2[1][32], kid3[1][32];
+        SCHECK_EQ(ss_transact(&s, &again, 1, NULL, NULL, kid2), 0, "gen 4 commits the sequence-2 manifest");
+        CHECK(s.nkeyslot == 2 && memcmp(s.keyslot_sid, kid2[0], 32) == 0, "the newest manifest is bound after rotation");
+        ss_object third = {SS_KIND_KEYSLOT, 1, KSM3, sizeof KSM3};
+        ksm_fill(KSM3, 4, RIG_UUID);
+        ksm_link(KSM3, kid2[0]);
+        SCHECK_EQ(ss_prepare(&s, &third, 1), SS_E_KEYSLOT, "sequence skip (4 after 2) refused");
+        ksm_fill(KSM3, 3, RIG_UUID);
+        ksm_link(KSM3, kid[0]);
+        SCHECK_EQ(ss_prepare(&s, &third, 1), SS_E_KEYSLOT, "sequence 3 naming sequence 1 refused");
+        ksm_fill(KSM3, 2, RIG_UUID);
+        ksm_link(KSM3, kid2[0]);
+        SCHECK_EQ(ss_prepare(&s, &third, 1), SS_E_KEYSLOT, "sequence 2 again refused");
+        ksm_fill(KSM3, 3, RIG_UUID);
+        ksm_link(KSM3, kid2[0]);
+        SCHECK_EQ(ss_transact(&s, &third, 1, NULL, NULL, kid3), 0, "gen 5 commits the sequence-3 manifest");
+        CHECK(s.nkeyslot == 3 && memcmp(s.keyslot_sid, kid3[0], 32) == 0, "sequence 3 bound");
+        rig_close(&r);
+        SCHECK_EQ(bootstrap_rc(out, sizeof out, &len), 0, "bootstrap reads the chain");
+        CHECK(len == sizeof KSM3 && memcmp(out, KSM3, len) == 0, "bootstrap returns the newest manifest");
+        SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen gen 5");
+        CHECK(s.has_keyslot && s.nkeyslot == 3 && memcmp(s.keyslot_sid, kid3[0], 32) == 0, "chain of 3 bound at open");
+        SCHECK_EQ(ss_read(&s, kid[0], out, sizeof out, &len, &kind), 0, "the superseded manifest stays readable");
+        CHECK(len == sizeof KSM && memcmp(out, KSM, len) == 0, "superseded bytes unchanged");
+        /* defence in depth at read: a claim whose digest no longer matches */
+        for (uint32_t k = 0; k < s.nclaims; k++)
+            if (memcmp(g_ws.claims[k].sid, kid[0], 32) == 0) g_ws.claims[k].c.object_id[0] ^= 1;
+        SCHECK_EQ(ss_read(&s, kid[0], out, sizeof out, &len, NULL), SS_E_KEYSLOT, "manifest read with a wrong digest");
+        rig_close(&r);
+    }
+
+    /* forgeries from the no-keyslot snapshot */
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    {
+        ss_object o[2] = {{SS_KIND_KEYSLOT, 1, KSM, sizeof KSM}, {44, 1, P1, 300}};
+        SCHECK_EQ(forge_objs(ed_ks_digest, NULL, o, 2), SS_E_KEYSLOT, "commit digest not the manifest's");
+    }
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    {
+        ss_object o[2] = {{SS_KIND_KEYSLOT, 1, KSM, sizeof KSM}, {44, 1, P1, 300}};
+        ksm_fill(KSM2, 2, RIG_UUID); /* sequence 2 with no link */
+        SCHECK_EQ(forge_objs(ed_ks_second, NULL, o, 2), SS_E_ENVELOPE, "a second manifest unclaimed in the catalog");
+        SCHECK_EQ(bootstrap_rc(out, sizeof out, &len), SS_E_KEYSLOT, "bootstrap refuses a broken chain (sequence 2 without its link)");
+        CHECK(len == 0 && sv1_all_zero(out, sizeof out), "broken bootstrap chain scrubs its output");
+    }
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    {
+        ss_object o[2] = {{SS_KIND_KEYSLOT, 1, KSM, sizeof KSM}, {44, 1, P1, 300}};
+        SCHECK_EQ(forge_objs(ed_ks_prev_forged, NULL, o, 2), SS_E_KEYSLOT, "claimed genesis manifest with a nonzero previous id (chain rule at the keyed open)");
+        SCHECK_EQ(bootstrap_rc(out, sizeof out, &len), SS_E_KEYSLOT, "bootstrap refuses it too");
+        KSM[36] = 0;
+    }
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    SCHECK_EQ(forge(ed_ks_unclaimed, NULL), SS_E_ENVELOPE, "unclaimed manifest");
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+    SCHECK_EQ(forge(ed_ks_bad_unclaimed, NULL), SS_E_ENVELOPE, "unclaimed malformed manifest refused keyed");
+    SCHECK_EQ(bootstrap_rc(out, sizeof out, &len), SS_E_KEYSLOT, "bootstrap refuses a malformed manifest");
+    CHECK(len == 0, "refused bootstrap reports zero length");
+    CHECK(sv1_all_zero(out, sizeof out), "malformed bootstrap scrubs its output");
+    /* Magic, version and store identity each have a valid sequence/link and
+     * freshly sealed claim, isolating the keyed shape check. */
+    static const size_t offsets[] = {0, 8, 12};
+    for (size_t i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
+        CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore for shape forgery");
+        ksm_fill(KSM, 1, RIG_UUID);
+        ss_object o = {SS_KIND_KEYSLOT, 1, KSM, sizeof KSM};
+        SCHECK_EQ(forge_objs(ed_ks_bad_shape, (void *)&offsets[i], &o, 1), SS_E_KEYSLOT,
+                  "digest-bound malformed manifest refused keyed");
+        if (offsets[i] != 12) {
+            SCHECK_EQ(bootstrap_rc(out, sizeof out, &len), SS_E_KEYSLOT,
+                      "valid-chain malformed manifest refused at bootstrap");
+            CHECK(len == 0 && sv1_all_zero(out, sizeof out), "malformed bootstrap has no output");
+        }
+        ksm_fill(KSM, 1, RIG_UUID);
+    }
+    CHECK(file_save(g_path, img_a, RIG_BYTES) == 0, "restore");
+}
+
+static void test_keyslot_limits(void)
+{
+    /* A structural Store can contain hostile, unclaimed manifests. Bootstrap
+     * must stop before writing past its bounded chain workspace, and keyed
+     * open must classify the chain overflow before processing its records. */
+    memdev m;
+    mem_init(&m, 256);
+    st_dev d = mem_dev(&m);
+    st_store raw;
+    static uint8_t manifests[SS_KS_CHAIN_MAX + 1][SS_KEYSLOT_MIN];
+    st_object objects[SS_KS_CHAIN_MAX + 1];
+    uint8_t prev[32] = {0};
+    for (unsigned i = 0; i <= SS_KS_CHAIN_MAX; i++) {
+        ksm_fill(manifests[i], i + 1, RIG_UUID);
+        ksm_link(manifests[i], prev);
+        objects[i] = (st_object){SS_KIND_KEYSLOT, 1, manifests[i], sizeof manifests[i]};
+        CHECK_EQ(sv1_object_id(SS_KIND_KEYSLOT, 1, manifests[i], sizeof manifests[i], prev), 0,
+                 "derive raw manifest id");
+    }
+    CHECK_EQ(st_format(&d, RIG_UUID), 0, "format raw chain store");
+    CHECK_EQ(st_open(&raw, &d, &g_ws.st), 0, "open raw chain store");
+    CHECK_EQ(st_transact(&raw, objects, SS_KS_CHAIN_MAX + 1, NULL, NULL), 0, "write oversized raw chain");
+    uint8_t out[SS_KEYSLOT_MIN];
+    size_t len = 99;
+    memset(g_ws.bygen, 0xa5, sizeof g_ws.bygen);
+    SCHECK_EQ(ss_keyslot_bootstrap(&ks_scratch, &d, &g_ws, out, sizeof out, &len), SS_E_KEYSLOT,
+              "oversized bootstrap chain refused");
+    CHECK(len == 0, "oversized bootstrap returns no manifest");
+    int intact = 1;
+    for (unsigned i = 0; i < ST_CAT_CAP; i++) intact &= g_ws.bygen[i] == UINT32_C(0xa5a5a5a5);
+    CHECK(intact, "oversized bootstrap does not overwrite the adjacent workspace");
+    /* Supply a valid genesis anchor; record verification precedes the
+     * anti-rollback decision about this unclaimed generation-2 Store. */
+    rig r;
+    CHECK_EQ(rig_open(&r, g_path, g_bs, 1), 0, "create anchor fixture");
+    SCHECK_EQ(ss_format(&r.sdev, &r.tdev, 0, RIG_UUID, &K, &g_ws), 0, "format anchor fixture");
+    ss_store s;
+    SCHECK_EQ(ss_open(&s, &d, &r.tdev, 0, &K, &g_ws), SS_E_KEYSLOT,
+              "oversized keyed chain refused before missing records");
+    rig_close(&r);
+    mem_free(&m);
+
+    /* Exercise the real maximum through the sealed service API, on both
+     * disk geometries. The usual 64-unit fixture is too small for rotations. */
+    disk_file f;
+    disk_dev disk;
+    st_disk adapter;
+    st_dev store;
+    ts_device anchor;
+    uint32_t bpu = SV1_UNIT / g_bs;
+    CHECK_EQ(disk_file_open(&f, &disk, g_path, g_bs, 1028u * bpu, 1), 0, "create rotation disk");
+    CHECK_EQ(st_disk_bind(&adapter, &disk, 4u * bpu, 1024, &store), 0, "bind rotation disk");
+    ss_ts_device(&disk, &anchor);
+    SCHECK_EQ(ss_format(&store, &anchor, 0, RIG_UUID, &K, &g_ws), 0, "format rotation store");
+    SCHECK_EQ(ss_open(&s, &store, &anchor, 0, &K, &g_ws), 0, "open rotation store");
+    memset(prev, 0, sizeof prev);
+    uint8_t ids[1][32];
+    for (unsigned i = 0; i < SS_KS_CHAIN_MAX; i++) {
+        ksm_fill(KSM, i + 1, RIG_UUID);
+        ksm_link(KSM, prev);
+        ss_object o = {SS_KIND_KEYSLOT, 1, KSM, sizeof KSM};
+        SCHECK_EQ(ss_transact(&s, &o, 1, NULL, NULL, ids), 0, "commit valid rotation");
+        memcpy(prev, ids[0], sizeof prev);
+    }
+    SCHECK_EQ(ss_open(&s, &store, &anchor, 0, &K, &g_ws), 0, "reopen full rotation chain");
+    CHECK(s.nkeyslot == SS_KS_CHAIN_MAX, "all rotations remain bound after reopen");
+    SCHECK_EQ(ss_keyslot_bootstrap(&ks_scratch, &store, &g_ws, out, sizeof out, &len), 0,
+              "bootstrap full chain succeeds");
+    CHECK(len == sizeof KSM && memcmp(out, KSM, len) == 0, "full-chain bootstrap returns newest manifest");
+    /* Bootstrap reuses the workspace: reopen before any sealed operation. */
+    SCHECK_EQ(ss_open(&s, &store, &anchor, 0, &K, &g_ws), 0, "reopen after bootstrap");
+    ksm_fill(KSM, SS_KS_CHAIN_MAX + 1, RIG_UUID);
+    ksm_link(KSM, prev);
+    ss_object extra = {SS_KIND_KEYSLOT, 1, KSM, sizeof KSM};
+    uint64_t written = f.blocks_written, flushes = f.flushes;
+    SCHECK_EQ(ss_prepare(&s, &extra, 1), SS_E_KEYSLOT, "rotation past chain limit refused at prepare");
+    CHECK(g_ws.nobjs == 0, "refused rotation leaves no prepared transaction");
+    CHECK(f.blocks_written == written && f.flushes == flushes, "refused rotation performs no disk effects");
+    disk_file_close(&f);
+}
+
+static void test_anchor_crash(void)
+{
+    uint8_t ids[2][32];
+    make_gen2(ids);
+    rig r;
+    ss_store s;
+    SCHECK_EQ(sopen(&r, &s, &K), 0, "open");
+    g_cut_rig = &r;
+    ss_object o = {46, 1, P1, 123};
+    uint8_t nid[1][32];
+    SCHECK_EQ(ss_transact(&s, &o, 1, cut_before_anchor, NULL, nid), SS_E_IO, "anchor write cut");
+    disk_file_disarm(&r.f);
+    SCHECK_EQ(ss_transact(&s, &o, 1, NULL, NULL, NULL), SS_E_NEEDS_REOPEN, "needs reopen");
+    rig_close(&r);
+    SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen after crash between Store and anchor");
+    SCHECK_EQ(ss_generation(&s), 3, "Store commit survived");
+    SCHECK_EQ(s.rb, SS_RB_PREPARED_ADVANCE, "anchor one behind");
+    SCHECK_EQ(check_read(&s, nid[0], P1, 123, 46), 0, "new object readable");
+    /* a second crash at the same point: the catch-up keeps the anchor one behind */
+    g_cut_rig = &r;
+    SCHECK_EQ(ss_transact(&s, &o, 1, cut_before_anchor, NULL, NULL), SS_E_IO, "second anchor write cut");
+    disk_file_disarm(&r.f);
+    rig_close(&r);
+    SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen after second crash");
+    SCHECK_EQ(ss_generation(&s), 4, "second Store commit survived");
+    SCHECK_EQ(s.rb, SS_RB_PREPARED_ADVANCE, "anchor still only one behind");
+    SCHECK_EQ(ss_transact(&s, &o, 1, NULL, NULL, NULL), 0, "next transaction catches up");
+    rig_close(&r);
+    SCHECK_EQ(sopen(&r, &s, &K), 0, "reopen");
+    SCHECK_EQ(s.rb, SS_RB_VALID_RESUME, "anchor current again");
+    SCHECK_EQ(ss_generation(&s), 5, "generation 5");
+    rig_close(&r);
+}
+
+static void test_kinds(void)
+{
+    static const uint16_t taken[] = {1, 2, 16, 17, 18, 19, 20, 21, 22, 23};
+    for (size_t i = 0; i < sizeof taken / sizeof taken[0]; i++)
+        CHECK(taken[i] != SS_KIND_ENVELOPE && taken[i] != SS_KIND_TXREC, "kind collides with %u", taken[i]);
+    CHECK(SS_KIND_ENVELOPE != SS_KIND_TXREC, "distinct kinds");
+}
+
+/* ---- nonce safety (Lane 26): envelope id + nonce prefix = V2 rule ---- */
+#define NONCE_ROUNDS 24
+/* (envelope_id || nonce_prefix) of the last envelope sealed into g_ws.env[0] */
+static void last_pair(uint8_t out[24])
+{
+    memcpy(out, g_ws.env[0] + 28, 16);
+    memcpy(out + 16, g_ws.env[0] + 44, 8);
+}
+
+/* ---- independent envelope id oracle (#445) ----
+ * HMAC-SHA256 (RFC 2104) and HKDF-Expand (RFC 5869) written here over the
+ * argus SHA-256 alone, pinned by published vectors, so the expected pair is
+ * computed without envid_derive, aienos_hmac_* or m5_hkdf_expand. The input
+ * layout is the V2 rule as documented above envid_derive (store_sealed.c):
+ * uuid 16 || generation u64 || index u32 || kind u16 || version u16 ||
+ * key_generation u64 || identity_class u8 || plaintext_len u64 ||
+ * SHA-256(plaintext), little-endian, after the domain string and its NUL.
+ * The envelope id (object key input) is bytes 0..15 of the HMAC, the nonce
+ * prefix bytes 16..23; both live in one key scope, the store's k_domain. */
+static void or_hmac(const uint8_t *key, size_t klen, const uint8_t *a, size_t alen, const uint8_t *b,
+                    size_t blen, uint8_t out[32])
+{
+    uint8_t k0[64], pad[64], ih[32];
+    memset(k0, 0, sizeof k0);
+    if (klen > 64) sha256_hash(key, klen, k0);
+    else memcpy(k0, key, klen);
+    sha256_ctx c;
+    for (int i = 0; i < 64; i++) pad[i] = k0[i] ^ 0x36;
+    sha256_init(&c);
+    sha256_update(&c, pad, 64);
+    sha256_update(&c, a, alen);
+    if (blen) sha256_update(&c, b, blen);
+    sha256_final(&c, ih);
+    for (int i = 0; i < 64; i++) pad[i] = k0[i] ^ 0x5c;
+    sha256_init(&c);
+    sha256_update(&c, pad, 64);
+    sha256_update(&c, ih, 32);
+    sha256_final(&c, out);
+}
+
+/* HKDF-Expand, L <= 64, info <= 64 bytes */
+static void or_hkdf_expand(const uint8_t prk[32], const uint8_t *info, size_t ilen, uint8_t *out, size_t L)
+{
+    uint8_t t[32], msg[32 + 64 + 1];
+    size_t got = 0, tl = 0;
+    for (uint8_t i = 1; got < L; i++) {
+        memcpy(msg, t, tl);
+        memcpy(msg + tl, info, ilen);
+        msg[tl + ilen] = i;
+        or_hmac(prk, 32, msg, tl + ilen + 1, NULL, 0, t);
+        tl = 32;
+        size_t n = L - got < 32 ? L - got : 32;
+        memcpy(out + got, t, n);
+        got += n;
+    }
+}
+
+static int hex_eq(const uint8_t *got, const char *hex, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        unsigned v = 0;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1 || got[i] != (uint8_t)v) return 0;
+    }
+    return 1;
+}
+
+static void le(uint8_t *p, uint64_t v, int n)
+{
+    for (int i = 0; i < n; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+/* expected (envelope_id || nonce_prefix) of the object at (gen, index) */
+static void oracle_pair(const ss_keys *k, uint64_t gen, uint32_t index, uint16_t kind, uint16_t version,
+                        const uint8_t *pt, size_t len, uint8_t out[24])
+{
+    static const char info[] = "AIENOS-SEALED-ENVID-KEY-V2", dom[] = "AIENOS-SEALED-ENVID-V2";
+    uint8_t key[32], m[16 + 8 + 4 + 2 + 2 + 8 + 1 + 8 + 32], h[32];
+    or_hkdf_expand(k->k_domain, (const uint8_t *)info, sizeof info, key, sizeof key);
+    memcpy(m, RIG_UUID, 16);
+    le(m + 16, gen, 8);
+    le(m + 24, index, 4);
+    le(m + 28, kind, 2);
+    le(m + 30, version, 2);
+    le(m + 32, k->key_generation, 8);
+    m[40] = k->identity_class;
+    le(m + 41, len, 8);
+    sha256_hash(pt, len, m + 49);
+    or_hmac(key, sizeof key, (const uint8_t *)dom, sizeof dom, m, sizeof m, h);
+    memcpy(out, h, 24);
+}
+
+static void test_envid_oracle(void)
+{
+    /* the oracle's primitives against published vectors */
+    uint8_t h[42];
+    sha256_hash((const uint8_t *)"abc", 3, h);
+    CHECK(hex_eq(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", 32), "SHA-256 FIPS 180 'abc'");
+    uint8_t k0b[20];
+    memset(k0b, 0x0b, sizeof k0b);
+    or_hmac(k0b, sizeof k0b, (const uint8_t *)"Hi There", 8, NULL, 0, h);
+    CHECK(hex_eq(h, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", 32), "HMAC RFC 4231 case 1");
+    or_hmac((const uint8_t *)"Jefe", 4, (const uint8_t *)"what do ya want ", 16, (const uint8_t *)"for nothing?", 12, h);
+    CHECK(hex_eq(h, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", 32), "HMAC RFC 4231 case 2");
+    static const uint8_t prk[32] = {0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf, 0x0d, 0xdc, 0x3f,
+                                    0x0d, 0xc4, 0x7b, 0xba, 0x63, 0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f,
+                                    0x9c, 0x31, 0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2, 0xb3, 0xe5};
+    static const uint8_t info[10] = {0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9};
+    or_hkdf_expand(prk, info, sizeof info, h, 42);
+    CHECK(hex_eq(h, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", 42),
+          "HKDF-Expand RFC 5869 case 1");
+
+    /* gen 2 = {P1 kind 40 v1 at index 0, P2 kind 41 v2 at index 1}: every
+     * bound field is nonzero in object 1, so dropping any one changes it */
+    uint8_t ids[2][32], want[24], got[24];
+    make_gen2(ids);
+    oracle_pair(&K, 2, 0, 40, 1, P1, sizeof P1, want);
+    memcpy(got, g_ws.env[0] + 28, 16);
+    memcpy(got + 16, g_ws.env[0] + 44, 8);
+    CHECK(memcmp(got, want, 24) == 0, "gen 2 object 0 pair equals the independent oracle");
+    oracle_pair(&K, 2, 1, 41, 2, P2, sizeof P2, want);
+    memcpy(got, g_ws.env[1] + 28, 16);
+    memcpy(got + 16, g_ws.env[1] + 44, 8);
+    CHECK(memcmp(got, want, 24) == 0, "gen 2 object 1 pair equals the independent oracle");
+    if (g_bs == 512)
+        printf("envid oracle: key scope k_domain (rig seed 0x11, class %u, key_generation %llu), store RIG_UUID;"
+               " gen 2 index 0 kind 40 v1 %zu B = %u chunk(s), index 1 kind 41 v2 %zu B = %u chunk(s) of %u B\n",
+               (unsigned)K.identity_class, (unsigned long long)K.key_generation, sizeof P1,
+               (unsigned)((sizeof P1 + SS_CHUNK - 1) / SS_CHUNK), sizeof P2,
+               (unsigned)((sizeof P2 + SS_CHUNK - 1) / SS_CHUNK), (unsigned)SS_CHUNK);
+    /* the same object under another key scope is a different pair; pairs are
+     * only required to be new within one scope, never across unrelated keys */
+    uint8_t other[24];
+    oracle_pair(&K_OTHER, 2, 1, 41, 2, P2, sizeof P2, other);
+    CHECK(memcmp(other, want, 24) != 0, "oracle: another k_domain gives another pair");
+}
+
+static void test_nonce(void)
+{
+    uint8_t ids[2][32];
+    make_gen2(ids);
+    static uint8_t snap[RIG_BYTES], q[SS_MAX_PLAINTEXT];
+    CHECK(file_load(g_path, snap, RIG_BYTES) == 0, "snapshot gen 2");
+    /* gen 3 written, then whole-disk rollback to gen 2 and a different gen 3,
+     * NONCE_ROUNDS times: every (key input, nonce) pair must be new */
+    static uint8_t pairs[NONCE_ROUNDS + 1][24];
+    for (int r = 0; r <= NONCE_ROUNDS; r++) {
+        CHECK(file_save(g_path, snap, RIG_BYTES) == 0, "whole-disk rollback");
+        fill(q, 600, 100u + (uint32_t)r);
+        uint8_t id[32];
+        advance(&K, 42, q, 600, id, 0);
+        last_pair(pairs[r]);
+        {
+            uint8_t want[24];
+            oracle_pair(&K, 3, 0, 42, 1, q, 600, want);
+            CHECK(memcmp(pairs[r], want, 24) == 0, "rollback rewrite %d: pair equals the independent oracle", r);
+        }
+        rig rr;
+        ss_store s;
+        SCHECK_EQ(sopen(&rr, &s, &K), 0, "rewritten gen 3 mounts");
+        SCHECK_EQ(ss_generation(&s), 3, "same generation after rollback");
+        SCHECK_EQ(check_read(&s, id, q, 600, 42), 0, "rewritten object reads back");
+        rig_close(&rr);
+        for (int j = 0; j < r; j++) {
+            CHECK(memcmp(pairs[j], pairs[r], 16) != 0, "envelope id (object key input) repeated");
+            CHECK(memcmp(pairs[j] + 16, pairs[r] + 16, 8) != 0, "nonce prefix repeated");
+        }
+        /* the old predictable V1 value is not used */
+        uint8_t m[16 + 8 + 4], v1[32];
+        sha256_ctx c;
+        sha256_init(&c);
+        sha256_update(&c, (const uint8_t *)"AIENOS-SEALED-ENVID-V1", sizeof("AIENOS-SEALED-ENVID-V1"));
+        memcpy(m, RIG_UUID, 16);
+        for (int b = 0; b < 8; b++) m[16 + b] = (uint8_t)((uint64_t)3 >> (8 * b));
+        memset(m + 24, 0, 4);
+        sha256_update(&c, m, sizeof m);
+        sha256_final(&c, v1);
+        CHECK(memcmp(v1, pairs[r], 24) != 0, "V1 predictable id still used");
+    }
+    /* the identical object rewritten at the same place gives the identical
+     * envelope (deterministic; reveals nothing the old image did not) */
+    CHECK(file_save(g_path, snap, RIG_BYTES) == 0, "rollback");
+    fill(q, 600, 100u);
+    advance(&K, 42, q, 600, NULL, 0);
+    uint8_t again[24];
+    last_pair(again);
+    CHECK(memcmp(again, pairs[0], 24) == 0, "identical rewrite is deterministic");
+    /* one byte, kind or version changed gives a new pair */
+    CHECK(file_save(g_path, snap, RIG_BYTES) == 0, "rollback");
+    q[599] ^= 1;
+    advance(&K, 42, q, 600, NULL, 0);
+    last_pair(again);
+    CHECK(memcmp(again, pairs[0], 16) != 0 && memcmp(again + 16, pairs[0] + 16, 8) != 0, "one-bit change, new pair");
+    CHECK(file_save(g_path, snap, RIG_BYTES) == 0, "rollback");
+    q[599] ^= 1;
+    advance(&K, 43, q, 600, NULL, 0);
+    last_pair(again);
+    CHECK(memcmp(again, pairs[0], 16) != 0 && memcmp(again + 16, pairs[0] + 16, 8) != 0, "kind change, new pair");
+
+    /* counter going backwards is refused: Store rolled back under the anchor */
+    CHECK(file_save(g_path, snap, RIG_BYTES) == 0, "rollback");
+    advance(&K, 42, q, 600, NULL, 0); /* gen 3 */
+    static uint8_t g3[RIG_BYTES], t[RIG_BYTES];
+    CHECK(file_load(g_path, g3, RIG_BYTES) == 0, "snapshot gen 3");
+    memcpy(t, g3, RIG_BYTES);
+    copy_store(t, snap);
+    CHECK(file_save(g_path, t, RIG_BYTES) == 0, "write");
+    SCHECK_EQ(open_rc(&K), SS_E_ROLLBACK, "counter went backwards (store 2 under anchor 3)");
+
+    /* a version-1 record (old predictable-id format) is refused, typed */
+    CHECK(file_save(g_path, g3, RIG_BYTES) == 0, "restore gen 3");
+    {
+        rig rr;
+        ss_store s;
+        SCHECK_EQ(sopen(&rr, &s, &K), 0, "open gen 3");
+        ss_object o = {44, 1, P1, sizeof P1};
+        SCHECK_EQ(ss_prepare(&s, &o, 1), 0, "prepare");
+        g_ws.tx[8] = 1;
+        ss_tx_remac(&s);
+        SCHECK_EQ(ss_commit_prepared(&s, NULL, NULL), 0, "commit forged v1 record");
+        rig_close(&rr);
+        SCHECK_EQ(open_rc(&K), SS_E_FORMAT_VERSION, "version-1 record refused");
+    }
+
+    /* a writer that sealed with the old predictable id (valid MACs and
+     * digests) mounts, but the envelope is refused on read */
+    CHECK(file_save(g_path, g3, RIG_BYTES) == 0, "restore gen 3");
+    {
+        rig rr;
+        ss_store s;
+        SCHECK_EQ(sopen(&rr, &s, &K), 0, "open gen 3");
+        ss_object o = {44, 1, P1, sizeof P1};
+        SCHECK_EQ(ss_prepare(&s, &o, 1), 0, "prepare");
+        uint8_t m[16 + 8 + 4], v1[32];
+        sha256_ctx c;
+        sha256_init(&c);
+        sha256_update(&c, (const uint8_t *)"AIENOS-SEALED-ENVID-V1", sizeof("AIENOS-SEALED-ENVID-V1"));
+        memcpy(m, RIG_UUID, 16);
+        for (int b = 0; b < 8; b++) m[16 + b] = (uint8_t)((uint64_t)4 >> (8 * b));
+        memset(m + 24, 0, 4);
+        sha256_update(&c, m, sizeof m);
+        sha256_final(&c, v1);
+        m5_commit mc;
+        uint8_t *e = g_ws.tx + SS_TX_HDR;
+        CHECK(m5_commit_open(e + 32, M5_COMMIT_LEN, K.k_root_auth, K.identity_class, &mc) == M5_OK, "commit open");
+        memcpy(mc.obj.envelope_id, v1, 16);
+        CHECK(m5_envelope_seal(K.k_domain, &mc.obj, v1 + 16, SS_CHUNK, P1, sizeof P1, g_ws.env[0],
+                               SS_ENV_CAP, &g_ws.env_len[0]) == M5_OK, "legacy seal");
+        g_ws.objs[0].len = g_ws.env_len[0];
+        CHECK(sv1_object_id(SS_KIND_ENVELOPE, 1, g_ws.env[0], g_ws.env_len[0], e) == 0, "object id");
+        sha256_hash(g_ws.env[0], g_ws.env_len[0], mc.object_id);
+        CHECK(m5_commit_seal(&mc, K.k_root_auth, e + 32) == M5_OK, "commit seal");
+        ss_tx_remac(&s);
+        uint8_t sid[32];
+        memcpy(sid, e, 32);
+        SCHECK_EQ(ss_commit_prepared(&s, NULL, NULL), 0, "commit legacy-id envelope");
+        rig_close(&rr);
+        SCHECK_EQ(sopen(&rr, &s, &K), 0, "legacy-id envelope mounts (digests valid)");
+        {
+            static uint8_t canary[SS_MAX_PLAINTEXT];
+            memset(canary, 0xaa, sizeof canary);
+            size_t clen = 999;
+            SCHECK_EQ(ss_read(&s, sid, canary, sizeof canary, &clen, NULL), SS_E_ENVELOPE, "legacy-id refused");
+            int z = 1;
+            for (size_t b = 0; b < sizeof canary; b++) z &= canary[b] == 0;
+            CHECK(clen == 0 && z, "whole output buffer wiped on envelope refusal");
+        }
+        SCHECK_EQ(check_read(&s, sid, P1, sizeof P1, 44), SS_E_ENVELOPE, "legacy-id envelope refused on read");
+        rig_close(&rr);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    const char *dir = argc > 1 ? argv[1] : ".";
+    fill(P1, sizeof P1, 1);
+    fill(P2, sizeof P2, 2);
+    fill(P3, sizeof P3, 3);
+    P4[0] = 0x5a;
+    fill(junk, sizeof junk, 9);
+    rig_keys(M5_ID_PRODUCTION, 0x11, &K);
+    rig_keys(M5_ID_TEST, 0x11, &K_TEST);
+    rig_keys(M5_ID_PRODUCTION, 0x22, &K_OTHER);
+    test_kinds();
+    static const uint32_t sizes[2] = {512, 4096};
+    for (int k = 0; k < 2; k++) {
+        g_bs = sizes[k];
+        snprintf(g_path, sizeof g_path, "%s/sealed_%u.img", dir, g_bs);
+        int before = g_failed;
+        test_basic();
+        test_rollback();
+        test_identity();
+        test_forgery();
+        test_keyslot();
+        test_anchor_crash();
+        test_nonce();
+        test_envid_oracle();
+        test_keyslot_limits();
+        printf("sealed store, %u-byte blocks: %s\n", g_bs, g_failed == before ? "ok" : "FAILED");
+        unlink(g_path);
+    }
+    printf("store sealed: %d checks, %d failed\n", g_checks, g_failed);
+    printf("STORE_SEALED: %s\n", g_failed ? "FAIL" : "PASS");
+    return g_failed ? 1 : 0;
+}
