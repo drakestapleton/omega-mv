@@ -96,8 +96,18 @@ grep -qx 'ommod: digest-mismatch' "$work/cd.err" || fail "$u: stderr lacks 'ommo
 printf 'PASS compiler-digest-mismatch refused digest-mismatch\n'
 
 u=wrong-length
-printf 'x' >> "$store/$la.mod"
-run $u "$work/wl.out" "$work/wl.err" "$work/ommod" build "$omc" "$have" debug aarch64-linux "$store" "$leaf" "$lh"
+# A fresh store, so the blob holds no earlier flip; the KEY.ref is removed so build skips the cache
+# hit and reaches the existing-blob check (ensureblob), which finds a blob of another length.
+s2=$work/store2
+mkdir "$s2"
+run $u "$work/wl0.out" "$work/wl0.err" "$work/ommod" build "$omc" "$have" debug aarch64-linux "$s2" "$leaf" "$lh"
+[ "$rc" = 0 ] || fail "$u: leaf build rc=$rc: $(cat "$work/wl0.err")"
+set -- "$s2"/*.ref
+[ "$#" = 1 ] && [ -f "$1" ] || fail "$u: wanted one KEY.ref in a fresh store, found: $*"
+rm -f "$1"
+chmod u+w "$s2/$la.mod"
+printf 'x' >> "$s2/$la.mod"
+run $u "$work/wl.out" "$work/wl.err" "$work/ommod" build "$omc" "$have" debug aarch64-linux "$s2" "$leaf" "$lh"
 [ "$rc" = 24 ] || fail "$u: build rc=$rc, wanted 24: $(cat "$work/wl.err")"
 grep -qx 'ommod: digest-mismatch' "$work/wl.err" || fail "$u: stderr lacks 'ommod: digest-mismatch': $(cat "$work/wl.err")"
 printf 'PASS wrong-length refused digest-mismatch\n'
