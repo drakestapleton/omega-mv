@@ -34,7 +34,7 @@ Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) 
 - `physics.lock`, `aienos.lock`, `argus.lock`: commits of the sibling sources the full build and some gates pin. `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
 - `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0` on `make` builds the host suites without a physics checkout.
 - `OUT_DIR`: per-step build directory; `tests/gates/run.sh` sets it to `build/step-<name>`.
-- `.aien/always` lists the gates every commit must pass (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`); `.aien/verify.pub` is the Spark judge's public key.
+- `.aien/always` lists the gates every commit must pass (read the list there); `.aien/verify.pub` is the Spark judge's public key.
 - `AIEN_OMEGA_FP8_GROUPED_WAVE=1` and `AIEN_OMEGA_FP8_GROUPED_CTAS=n` change the GB10 FP8 grouped expert launch (off by default; see `ENGINEERING-NOTES.md`).
 
 ## Usage
@@ -51,6 +51,7 @@ make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-compiler-quick  # legacy
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-numeric-cpu     # E1 CPU numerics
 make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-realize
 tests/gates/run.sh zero-disk-secrets                                    # no plaintext .env files
+tests/gates/run.sh evidence-generated                                   # generated blocks in changed evidence/docs Markdown equal their generators
 ```
 
 The `make test-*` targets are C/legacy compatibility checks, not commands for the seeded compiler; do not mix compiler binaries or relabel old receipts. The full omegatool build (`make`) links the physics repository at the commit in `physics.lock`.

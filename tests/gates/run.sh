@@ -607,6 +607,14 @@ case "$step" in
     obs evidence_rewrites 0
     echo "evidence/: additions only"
     ;;
+  # DRA-485 RCCA (2026-11-17, REVIEW-LESSONS.md): counts, ranges, medians and acceptance words in evidence and status
+  # Markdown are generated. Every "<!-- generated: tools/NAME ARGS -->" block and "<!-- generated-file: ... -->" marker in a
+  # Markdown file this change adds or modifies under evidence/ or docs/ must equal its generator's output. Base as above.
+  evidence-generated)
+    base="${AIEN_BASE_REF:-origin/main}"
+    obs base_ref "\"$(git rev-parse "$base")\""
+    tools/evidence_generated_check.sh "$base"
+    ;;
   zero-disk-secrets)
     echo "Auditing repository for prohibited plaintext secret files..."
     # Inspect every tracked path, including forced additions under generated dirs.

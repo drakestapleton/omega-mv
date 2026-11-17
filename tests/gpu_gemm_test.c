@@ -4,8 +4,8 @@
  *   --host-only  no device: refusals, every kernel (both types, several shapes of tile, the red-check mutants) through our
  *                code generator and encoder, register counts
  *   --sim        the real kernels in the warp simulator (tensor-core ops computed with the chip-exact models), small shapes
- *                over every edge case, all four layouts, three tile configurations; the four mutants must be caught
- *   (no flag)    the GB10: at least 200 distinct shapes (206 triples) with M, N, K from 1 to 8192, each run in both types and all four layouts (1648 cases). Every output word
+ *                over every edge case, all four layouts, three tile configurations; every red-check mutant must be caught
+ *   (no flag)    the GB10: the chip shape list (at least 200 distinct (M, N, K), each 1 to 8192), each run in both types and all four layouts. Every output word
  *                must be written; shapes up to 2^27 multiply-adds (and 1000x999x1001) are compared in full, larger ones on 4096 sampled
  *                elements plus about 512 evenly spaced elements of the last row and of the last column. Speed: 2 M N K / kernel time, as a fraction of the measured
  *                tensor-core ceiling (BF16 HMMA 115.36 TFLOPS, evidence OWN30B-T3-TC-PEAK-BW-5faa0f70-20261013T2236Z;
@@ -290,10 +290,10 @@ static void chip_tier(int quick, int part) { /* part: -1 everything; 0..7 only t
     void *A = malloc((size_t)big * big * 2), *B = malloc((size_t)big * big * 2);
     float *C = malloc((size_t)big * big * 4);
     if (!A || !B || !C) { printf("NOT_RUN: host allocation\n"); exit(2); }
-    /* the shapes: 26 hand-picked triples (edges, odd sizes, skinny, squares up to 8192) plus 180 generated ones (fixed seed, integer arithmetic only:
-     * each dimension is 2^e + a random offset below 2^e with e uniform in 0..12, or 8192 when e is 13): 206 distinct (M, N, K) triples, each run in both types and
-     * all four layouts, 1648 cases. The first 12 triples are the --quick list. */
-    static uint32_t sh[206][3] = {
+    /* the shapes: hand-picked triples (edges, odd sizes, skinny, squares up to 8192) plus generated ones (fixed seed, integer arithmetic only:
+     * each dimension is 2^e + a random offset below 2^e with e uniform in 0..12, or 8192 when e is 13), each run in both types and
+     * all four layouts; the log's summary line gives the counts. The first 12 triples are the --quick list. */
+    static uint32_t sh[206][3] = { /* the array size is the shape count: the generator below fills every row after the hand-picked ones */
         { 1, 1, 1 }, { 1, 8192, 1 }, { 8192, 1, 1 }, { 1, 1, 8192 }, { 7, 13, 29 }, { 16, 8, 16 }, { 33, 65, 127 }, { 100, 100, 100 },
         { 128, 64, 64 }, { 255, 257, 511 }, { 1000, 999, 1001 }, { 1, 4096, 4096 }, { 4096, 1, 4096 }, { 4096, 4096, 1 },
         { 17, 8192, 3000 }, { 8192, 17, 3000 }, { 1024, 1024, 1024 }, { 2048, 2048, 2048 }, { 4096, 4096, 4096 }, { 3000, 5000, 700 },

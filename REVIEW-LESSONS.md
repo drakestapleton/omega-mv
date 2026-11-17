@@ -71,3 +71,33 @@ The seeded build generates the source line/function counts, encoded word count a
 compiler digest through diaggen size mode, and appends a row only for a new final
 compiler identity. Do not hand-copy those measurements. The independent size-record
 test checks content changes, exact counts and malformed executable refusals.
+
+## DRA-485 evidence-text corrective action, 2026-11-17
+
+The DRA-485 C3 GEMM change took four reviews (all FIX: d83bbc04, e823b59f, 0be0ba36, 0e50400f; verdict files
+`~/handoffs/dra485-finish-20261117.VERDICT*.omega-mv.*.md` on the Spark). The CUDApp half of the same task took
+three (FIX 5dc27c28, FIX 18ac3327, MERGE a283a896). No round found a wrong kernel result; almost every finding was
+about what the evidence text said. A first RCCA after round 3 fixed the cases by hand (numbers recomputed once)
+and round 4 found the same kinds again: a hand-typed range that the data contradicted and stale hand-typed counts.
+A one-time recompute is not a corrective action; a generator and a gate are.
+
+| Kind | Findings (round.number, both repositories) | Why the author and the checks missed it | Corrective action |
+| --- | --- | --- | --- |
+| Derived numbers typed from memory | omega-mv 1.1 "launch floor", 1.3 "every shape" when half were sampled, 2.2 "whole last row", 3.1 "208 shapes" = 26 triples, 4.1 "0.04 to 0.06" range, 4.5 unstated denominator; CUDApp 1.1, 1.2, 2.2, 3.5 | Numbers in README and status text were written after the run, not produced from the log; no gate reads evidence text | `tools/c3_gemm_evidence.sh` produces every count, range, median, repeat and the acceptance word from the chip log; READMEs carry them in `<!-- generated: ... -->` blocks; the always-run gate `tests/gates/run.sh evidence-generated` (OMEGA-EVIDENCE-GENERATED in `.aien/always`) reruns every block and generated file in changed Markdown and fails on any difference |
+| Acceptance unit not checked against the wording | omega-mv 3.1, 3.2; CUDApp 1.3, 3.6 | An inherited convention (shape = triple x type x layout) was repeated; nothing encoded the acceptance sentence | The generator states the acceptance literally (a shape is a distinct (M, N, K); at least 200; 1 to 8192; both types; four layouts; 0 wrong) and prints MET or NOT MET from the data |
+| Hand-maintained copies drift | omega-mv 2.1 and 3.6 (docs/OMEGA.md "chip run pending"), 4.2 and 4.3 (stale counts in comments), 4.4, 4.6; CUDApp 2.4 | Status rows and comments restated evidence numbers, and nobody regenerates a copy | docs/OMEGA.md C3 rows and source comments no longer restate counts; they point at the generated summary. AGENTS.md points at `.aien/always` instead of copying its list |
+| Receipts and provenance | omega-mv 1.2 (ceiling cited to a missing path), 1.4 (excerpt log), 2.3 (control patch did not apply), 2.5 (log without binary sha); CUDApp 1.5, 2.1 (receipts overwritten), 2.5 | Runs were named by label and launched by hand | `tools/run_gpu_gemm_chip.sh` (and CUDApp's `tools/run_gpu_fp8_smallrow_chip.sh`) write a provenance header, name outputs by window id and refuse to overwrite; the generated summary prints the header, so a log without it fails to generate |
+| Instrument condition not inspected | omega-mv 1.1 (50 us sleep-poll quantum), 1.7, 2.4, 3.3, 3.4 (load, one sample); CUDApp 2.3, 3.1 (kernel cache cleared per call), 3.2 (A/A false-call rate) | The first timed run was the first look at the instrument | The chip tier busy-polls by default (`--spin-us`), so times are not quantized by the sleep-poll; the summary generates the run-to-run repeat lines with their denominator, so variance is shown wherever a speed is |
+| Test-tool input checks | omega-mv 1.5 (`--part`), 2.6 (`--spin-us`); CUDApp 1.6, 2.6, 3.3 | Options were added for one run and not given a range | Both options are range-checked and refuse out-of-range values with exit 2 |
+
+Pre-review step for every later change in this repository that adds or edits evidence or status text:
+1. Run `tests/gates/run.sh evidence-generated` (and `evidence-immutable`) and keep the output.
+2. Every number in that text that is computed from a log or table (counts, ranges, medians, fractions, percentages,
+   MET or NOT MET) sits inside a generated block. Prose outside the blocks states method and sources only.
+   An "alarm: new evidence README with no generated block" line from the gate means this step was skipped: fix it
+   before review.
+3. Read the acceptance sentence of the issue and check that the generated acceptance line counts the unit it names.
+
+The checker and generator are POSIX sh and awk, outside Omega's structure (measuring tools). Their Omega replacement
+is a native `.om` evidence tool once the seeded compiler's text and decimal formatting cover it; that is recorded here,
+not claimed.

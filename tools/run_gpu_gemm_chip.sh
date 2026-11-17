@@ -1,5 +1,5 @@
 #!/bin/sh
-# run_gpu_gemm_chip.sh: the C3 GEMM chip tier (208 shapes, both types, four layouts, red checks) in ONE exclusive spark-window, with a
+# run_gpu_gemm_chip.sh: the C3 GEMM chip tier (every shape, both types, four layouts, red checks) in ONE exclusive spark-window, with a
 # provenance header at the top of the log (git head, dirty flag, binary sha256, kernel, driver, memory, buddyinfo). Output names carry
 # the window id and an existing file is never overwritten. usage: tools/run_gpu_gemm_chip.sh OUTDIR [gpu_gemm_test args]
 # (OUTDIR outside the checkout, so the dirty flag in the header is honest)
