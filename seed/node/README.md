@@ -2074,14 +2074,21 @@ run, measured from before the node starts; a trial past that deadline
 (`rc=-110`) fails the check. On this host the cap that first passes is not
 the node's own memory need: `tool` runs each test program through
 `execpure` (`seed/omc/omc.om`), which sets RLIMIT_AS to its own fixed
-ceiling. Under an inherited cap below that ceiling the raise is refused, the
-test program's exec fails (exit 121) and `code-main` reports an explicit
-`CWO` FAIL. So the explicit fails come from caps below execpure's ceiling,
-the passing cap is the first step at or above it, and when 32 times the
+ceiling. Under an inherited cap below that ceiling the raise is refused. At
+the lowest caps the compile step itself cannot run, and `code-main` ends
+`CWO 0 FAIL 17` (tool failed). At the caps above those the test program's
+exec fails (exit 121), the tool reports that exit as the program's result,
+the next prompt differs from the recorded one, and in fake mode the
+recording has no answer for it, so `code-main` ends `CWO 0 FAIL 16`
+(inference failed): a recording miss, not the node noticing a memory
+problem. So the explicit fails come from caps below execpure's ceiling, the
+passing cap is the first step at or above it, and when 32 times the
 `code-main` peak stays below it the check fails whatever the node does. The
-check shows that a cap the node cannot work under fails closed (the job
-file is left unrepaired) and that the node completes under a cap that leaves
-its tools their ceiling; it does not measure how much memory the node needs.
+check shows that under a cap the node cannot work under the run ends in an
+explicit FAIL, and that the node completes under a cap that leaves its tools
+their ceiling. It does not read the job file, so it does not show that a
+failing run leaves that file unchanged, and it does not measure how much
+memory the node needs.
 The host run uses a one-job stand-in for the round40 recording, which is not
 at the path qual reads:
 `seed/node/tests/ra40/final-selected.json`, a small
