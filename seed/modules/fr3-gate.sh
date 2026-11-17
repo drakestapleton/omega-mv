@@ -1,5 +1,5 @@
 #!/bin/sh
-# FR-3: import by source digest. Seven units, from a clean repo root.
+# FR-3: import by source digest. Eight units, from a clean repo root.
 # The driver is Omega (seed/ng/sha256.om + seed/modules/driver.om), built by seed/out/omc.
 # Every unit prints PASS <unit>; a failed unit prints FAIL <unit> and what it saw, then exits 1.
 set -eu
@@ -81,16 +81,26 @@ printf 'PASS missing-digest refused digest-missing\n'
 
 u=source-digest-mismatch
 bad=0000000000000000000000000000000000000000000000000000000000000000
+before=$(ls -A "$store")
 run $u "$work/sd.out" "$work/sd.err" "$work/ommod" build "$omc" "$have" debug aarch64-linux "$store" "$leaf" "$bad"
 [ "$rc" = 24 ] || fail "$u: build rc=$rc, wanted 24: $(cat "$work/sd.err")"
 grep -qx 'ommod: digest-mismatch' "$work/sd.err" || fail "$u: stderr lacks 'ommod: digest-mismatch': $(cat "$work/sd.err")"
+[ "$before" = "$(ls -A "$store")" ] || fail "$u: refused build changed the store"
 printf 'PASS source-digest-mismatch refused digest-mismatch\n'
 
 u=compiler-digest-mismatch
 run $u "$work/cd.out" "$work/cd.err" "$work/ommod" build "$omc" "$bad" debug aarch64-linux "$store" "$leaf" "$lh"
 [ "$rc" = 24 ] || fail "$u: build rc=$rc, wanted 24: $(cat "$work/cd.err")"
 grep -qx 'ommod: digest-mismatch' "$work/cd.err" || fail "$u: stderr lacks 'ommod: digest-mismatch': $(cat "$work/cd.err")"
+[ "$before" = "$(ls -A "$store")" ] || fail "$u: refused build changed the store"
 printf 'PASS compiler-digest-mismatch refused digest-mismatch\n'
+
+u=wrong-length
+printf 'x' >> "$store/$la.mod"
+run $u "$work/wl.out" "$work/wl.err" "$work/ommod" build "$omc" "$have" debug aarch64-linux "$store" "$leaf" "$lh"
+[ "$rc" = 24 ] || fail "$u: build rc=$rc, wanted 24: $(cat "$work/wl.err")"
+grep -qx 'ommod: digest-mismatch' "$work/wl.err" || fail "$u: stderr lacks 'ommod: digest-mismatch': $(cat "$work/wl.err")"
+printf 'PASS wrong-length refused digest-mismatch\n'
 
 u=artifact-absent
 rm -f "$store/$la.mod"

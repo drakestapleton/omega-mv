@@ -214,7 +214,7 @@ for the requested entry. Stderr supplies that numeric code after the line
 
 | What happened | Exit | Stderr name |
 | --- | --- | --- |
-| Bytes do not match the digest that names them: stored artifact bytes (a stored blob of the wrong length included), the source file passed to `build`, the compiler file against `COMPILER_SHA256`, or a dependency artifact against the digest its parent records. A one-byte change is this case. | 24 | `ommod: digest-mismatch` |
+| Bytes do not match the digest that names them: stored artifact bytes (a stored blob of the wrong length included, once it holds a full header; a blob too short for its own header is the malformed-artifact 34, unnamed), the source file passed to `build`, the compiler file against `COMPILER_SHA256`, or a dependency artifact against the digest its parent records. A one-byte change is this case. | 24 | `ommod: digest-mismatch` |
 | The store open returns "no such file": no `KEY.ref` for that source digest under this compiler, profile and target, or the referenced artifact file is absent. | 34 | `ommod: digest-missing` |
 
 Exit 24 is only a digest mismatch, so its name is part of every exit 24.
