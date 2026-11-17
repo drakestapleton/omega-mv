@@ -1,0 +1,472 @@
+note tcpd.om: guest driver for tcp.om (ledger L232). Compose: cat tcp.om tcpd.om | omc.
+note Runs inside the QEMU guest. It brings eth0 up with GRO disabled through
+note rtnetlink (so every frame it sees is one wire frame), opens an AF_PACKET
+note socket on eth0 and runs one TCP task. The guest kernel has no IPv4 address,
+note so only this stack answers for its address.
+note Arguments: MODE PORT IP FILE LIMIT (IP and FILE may be -).
+note   echo PORT - - LIMIT       passive: echo every byte until the peer closes
+note   sink PORT - FILE LIMIT    passive: write the received stream to FILE
+note   send PORT IP FILE LIMIT   active: connect to IP:PORT, send FILE, close
+note Exit 0 only when the connection was established, closed without error and
+note the task finished; it prints TCPD_PASS or TCPD_FAIL with counters.
+global Dfd ulong 4
+global Dcnt ulong 4
+global Dcfg ulong 4
+global Darg uchar 256
+global Dnl uchar 256
+global Dsa uchar 32
+global Dbuf uchar 64
+global Dnum uchar 32
+text Pifx "/sys/class/net/eth0/ifindex"
+text Paddr "/sys/class/net/eth0/address"
+text Mready "TCPD_READY\n"
+text Mpass "TCPD_PASS"
+text Mfail "TCPD_FAIL"
+text Mmode " mode="
+text Mbytes " bytes="
+text Merr " err="
+text Mest " est="
+text Mst " state="
+text Mwhy " why="
+text Mtst "TCPD_TST"
+text Msp " "
+text Mnl "\n"
+fn tlinkout n ulong to void
+k = send int get Dfd 0 Ttx 0 n 0
+if ne k long n
+tstat 30
+end
+end
+fn dputs which ulong to void
+if eq which 0
+k = write 1 Mready 0 len Mready
+end
+if eq which 1
+k = write 1 Mpass 0 len Mpass
+end
+if eq which 2
+k = write 1 Mfail 0 len Mfail
+end
+if eq which 3
+k = write 1 Mmode 0 len Mmode
+end
+if eq which 4
+k = write 1 Mbytes 0 len Mbytes
+end
+if eq which 5
+k = write 1 Merr 0 len Merr
+end
+if eq which 6
+k = write 1 Mest 0 len Mest
+end
+if eq which 7
+k = write 1 Mst 0 len Mst
+end
+if eq which 8
+k = write 1 Mwhy 0 len Mwhy
+end
+if eq which 9
+k = write 1 Mtst 0 len Mtst
+end
+if eq which 10
+k = write 1 Msp 0 len Msp
+end
+if eq which 11
+k = write 1 Mnl 0 len Mnl
+end
+end
+fn dnumout v ulong to void
+i = ulong 32
+while true bound 21
+i = sub i 1
+put Dnum i uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+k = write 1 Dnum i sub 32 i
+end
+note Copy argument i into Darg; returns its length (0 when absent).
+fn darg i ulong to ulong
+if ge long i argcnt
+ret 0
+end
+k = argread i Darg 0 255
+if lt k 0
+exit 2
+end
+ret ulong k
+end
+fn ddec n ulong to ulong
+v = ulong 0
+if eq n 0
+exit 2
+end
+for i ulong n bound 20
+c = ulong get Darg i
+if or lt c 48 gt c 57
+exit 2
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+fn dip n ulong to ulong
+v = ulong 0
+o = ulong 0
+d = ulong 0
+for i ulong n bound 16
+c = ulong get Darg i
+if eq c 46
+if or eq d 0 gt o 255
+exit 2
+end
+v = add shl v 8 o
+o = ulong 0
+d = ulong 0
+continue
+end
+if or lt c 48 gt c 57
+exit 2
+end
+o = add mul o 10 sub c 48
+d = add d 1
+end
+if or eq d 0 gt o 255
+exit 2
+end
+ret add shl v 8 o
+end
+fn dhex c ulong to ulong
+if and ge c 48 le c 57
+ret sub c 48
+end
+if and ge c 97 le c 102
+ret sub c 87
+end
+exit 3
+end
+note Read the interface index and MAC address from sysfs.
+fn dsysfs to ulong
+f = fopen Pifx 0 len Pifx 0 0
+if lt f 0
+exit 3
+end
+k = read int f Dbuf 0 63
+c = fclose int f
+if le k 0
+exit 3
+end
+x = ulong 0
+for i ulong ulong k bound 64
+y = ulong get Dbuf i
+if and ge y 48 le y 57
+x = add mul x 10 sub y 48
+end
+end
+f = fopen Paddr 0 len Paddr 0 0
+if lt f 0
+exit 3
+end
+k = read int f Dbuf 0 63
+c = fclose int f
+if lt k 17
+exit 3
+end
+for j ulong 6
+h = dhex ulong get Dbuf mul j 3
+l = dhex ulong get Dbuf add mul j 3 1
+put Tmac j uchar add shl h 4 l
+end
+ret x
+end
+fn dle p ulong v ulong n ulong to void
+for i ulong n bound 8
+put Dnl add p i uchar and shr v mul i 8 255
+end
+end
+note RTM_NEWLINK: IFF_UP, IFLA_GRO_MAX_SIZE 1, IFLA_GRO_IPV4_MAX_SIZE 1 (no merging).
+fn dlinkup ifx ulong to void
+s = socknew 16 3 0
+if lt s 0
+exit 4
+end
+dle 0 48 4
+dle 4 16 2
+dle 6 5 2
+dle 8 1 4
+dle 12 0 4
+dle 16 0 4
+dle 20 ifx 4
+dle 24 1 4
+dle 28 1 4
+dle 32 8 2
+dle 34 58 2
+dle 36 1 4
+dle 40 8 2
+dle 42 64 2
+dle 44 1 4
+k = send int s Dnl 0 48 0
+if ne k 48
+exit 4
+end
+k = recv int s Dnl 0 256 0
+if lt k 20
+exit 4
+end
+if ne get Dnl 4 2
+exit 4
+end
+for i ulong 4
+if ne get Dnl add 16 i 0
+exit 5
+end
+end
+c = fclose int s
+end
+fn dpacket ifx ulong to void
+s = socknew 17 3 768
+if lt s 0
+exit 6
+end
+put Dsa 0 17
+put Dsa 3 3
+for i ulong 4
+put Dsa add 4 i uchar and shr ifx mul i 8 255
+end
+if ne bind int s Dsa 0 20 0
+exit 6
+end
+put Dfd 0 ulong s
+end
+fn dnow to ulong
+t = monons
+if lt t 0
+exit 7
+end
+ret div ulong t 1000000
+end
+fn dpump to void
+for i ulong 256
+k = recv int get Dfd 0 Trx 0 2048 64
+if le k 0
+ret
+end
+if ne trmac 6 tmymac
+tinput ulong k
+end
+end
+end
+fn dwrall n ulong to void
+o = ulong 0
+while lt o n bound 65536
+k = write int get Dfd 1 Tapp o sub n o
+if le k 0
+exit 8
+end
+o = add o ulong k
+end
+end
+note Mode steps. Dcnt: 0 bytes moved, 1 file at end, 2 close requested.
+fn decho to void
+c = umin get Tcb kRCN sub 65535 get Tcb kSCN
+if gt c 0
+n = tread c
+m = twrite n
+if ne m n
+exit 10
+end
+put Dcnt 0 add get Dcnt 0 n
+end
+if eq get Tcb kST 7
+if eq get Tcb kRCN 0
+if eq get Dcnt 2 0
+put Dcnt 2 1
+tclose
+end
+end
+end
+end
+fn dsink to void
+n = tread 65536
+if gt n 0
+dwrall n
+put Dcnt 0 add get Dcnt 0 n
+end
+if eq get Tcb kST 7
+if eq get Tcb kRCN 0
+if eq get Dcnt 2 0
+put Dcnt 2 1
+tclose
+end
+end
+end
+end
+fn dsend to void
+n = tread 65536
+s = get Tcb kST
+if eq get Dcnt 1 0
+if or eq s 2 or eq s 3 eq s 4
+f = sub 65535 get Tcb kSCN
+if gt f 0
+k = read int get Dfd 1 Tapp 0 f
+if lt k 0
+exit 8
+end
+if eq k 0
+put Dcnt 1 1
+else
+m = twrite ulong k
+if ne m ulong k
+exit 10
+end
+put Dcnt 0 add get Dcnt 0 m
+end
+end
+end
+end
+if ne get Dcnt 1 0
+if eq get Dcnt 2 0
+if eq s 4
+put Dcnt 2 1
+tclose
+end
+end
+end
+end
+fn dreport ok bool mode ulong why ulong to void
+if ok
+dputs 1
+else
+dputs 2
+end
+dputs 3
+dnumout mode
+dputs 4
+dnumout get Dcnt 0
+dputs 5
+dnumout get Tcb kERR
+dputs 6
+dnumout get Tcb kEST
+dputs 7
+dnumout get Tcb kST
+dputs 8
+dnumout why
+dputs 11
+dputs 9
+for i ulong 32
+dputs 10
+dnumout get Tst i
+end
+dputs 11
+end
+note Dcfg: 0 mode letter, 1 port, 2 peer IPv4, 3 limit seconds.
+fn dargs to void
+n = darg 1
+if eq n 0
+exit 2
+end
+put Dcfg 0 ulong get Darg 0
+put Dcfg 1 ddec darg 2
+n = darg 3
+if ne get Darg 0 45
+put Dcfg 2 dip n
+end
+n = darg 4
+if ne get Darg 0 45
+fl = int 0
+if eq get Dcfg 0 114
+fl = int 577
+end
+f = fopen Darg 0 n fl 420
+if lt f 0
+exit 3
+end
+put Dfd 1 ulong f
+end
+put Dcfg 3 ddec darg 5
+end
+fn dseed to void
+k = random Dbuf 0 8 0
+if ne k 8
+exit 7
+end
+for i ulong 8
+put Tcf 5 add shl get Tcf 5 8 ulong get Dbuf i
+end
+end
+fn dstep mode ulong to void
+if eq mode 101
+decho
+end
+if eq mode 114
+dsink
+end
+if eq mode 115
+dsend
+end
+end
+note 0 running, 1 pass, 2 fail.
+fn ddone mode ulong now ulong dl ulong to ulong
+if eq get Tcb kST 0
+if ne get Tcb kEST 0
+ok = and eq get Tcb kERR 0 ne get Dcnt 2 0
+dreport ok mode 0
+if ok
+ret 1
+end
+ret 2
+end
+if ne get Tcb kERR 0
+dreport false mode 1
+ret 2
+end
+end
+if gt now dl
+dreport false mode 2
+ret 2
+end
+ret 0
+end
+fn dloop to int
+mode = get Dcfg 0
+t0 = dnow
+put Tcf 0 t0
+if eq mode 115
+tconnect get Dcfg 2 get Dcfg 1 add 40000 and trnd 16383
+else
+tlisten get Dcfg 1
+end
+dputs 0
+dl = add t0 mul get Dcfg 3 1000
+while true bound 100000000
+r = waitio int get Dfd 0 1 1000000
+now = dnow
+put Tcf 0 now
+dpump
+tstep now
+dstep mode
+tstep now
+v = ddone mode now dl
+if eq v 1
+ret 0
+end
+if eq v 2
+ret 1
+end
+end
+ret 1
+end
+fn main to int
+dargs
+ifx = dsysfs
+put Tcf 1 167772687
+put Tcf 2 167772674
+put Tcf 3 4294967040
+dseed
+tinit
+dlinkup ifx
+dpacket ifx
+ret dloop
+end

@@ -1,0 +1,90 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* rndr.c -- kernel glue for core/entropy.c: the real FEAT_RNG check
+ * (ID_AA64ISAR0_EL1.RNDR, bits [63:60]) and the RNDR read (NZCV.Z set means
+ * no random number was returned). Implements the ck.h entropy services.
+ * There is no other source: without RNDR every request is refused and the
+ * consumer fails closed. Not covered here: firmware that traps RNDR to EL3
+ * (FEAT_RNG_TRAP) and answers with an UNDEFINED exception would fault the
+ * read; that shows as a kernel fault, never as weak bytes.
+ * QEMU is not hardware: GB10 RNDR availability is UNVERIFIED. */
+#include "arch.h"
+#include "ck_internal.h"
+#include "entropy.h"
+#ifdef CK_PI5
+#include "pi5_rng.h"
+#endif
+
+#ifndef CK_PI5
+static int hw_present(void *ctx)
+{
+    (void)ctx;
+    return ((ck_rd(id_aa64isar0_el1) >> 60) & 0xfu) >= 1u;
+}
+
+static int hw_read(void *ctx, uint64_t *out)
+{
+    (void)ctx;
+    uint64_t v, nzcv;
+    /* s3_3_c2_c4_0 = RNDR; read NZCV straight after it. */
+    __asm__ volatile("mrs %0, s3_3_c2_c4_0\n\tmrs %1, nzcv" : "=r"(v), "=r"(nzcv)::"cc");
+    *out = v;
+    return (nzcv & (1ull << 30)) == 0;
+}
+
+static const struct ck_rng_ops hw_ops = { hw_present, hw_read, 0 };
+#endif /* !CK_PI5 */
+static struct ck_rng rng = { 0, CK_RNG_UNPROBED, 0, 0, 0 };
+
+int ck_entropy_init(void)
+{
+#ifdef CK_PI5
+    /* Pi 5: no FEAT_RNG; the only source is the BCM2712 RNG200 block (dev/pi5_rng.c). */
+    return ck_rng_probe(&rng, ck_pi5_rng_ops());
+#else
+    return ck_rng_probe(&rng, &hw_ops);
+#endif
+}
+
+const char *ck_entropy_source(void)
+{
+#ifdef CK_PI5
+    return "rng200";
+#else
+    return "rndr";
+#endif
+}
+
+int ck_entropy_fill(void *buf, size_t len)
+{
+    return ck_rng_fill(&rng, buf, len);
+}
+
+int ck_entropy_status(void)
+{
+    return rng.state;
+}
+
+const char *ck_entropy_reason(void)
+{
+    return ck_rng_reason(rng.state);
+}
+
+uint64_t ck_entropy_retries(void)
+{
+    return rng.retries;
+}

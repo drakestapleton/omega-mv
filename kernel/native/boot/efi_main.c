@@ -1,0 +1,240 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* efi_main.c -- minimal AIENOS UEFI entry stub for the C kernel core.
+ *
+ * Loads nothing and checks nothing: the image already contains the kernel.
+ * It prints the pre-exit report on ConOut, captures the firmware facts the
+ * kernel needs (EL, TTBR0/SCTLR of the firmware regime, RSDP, counter), takes
+ * the final memory map, leaves boot services (retrying when the map key goes
+ * stale) and jumps to ck_kernel_entry with a handoff in the image's BSS.
+ * There are no A/B slots (ADR 0024 Q3; the Rust aienos-boot crate has none
+ * either): rollback is the firmware's one-time BootNext with BootOrder
+ * unchanged (docs/BOOT_HANDOFF_CONTRACT.md section 7). Signature checks are
+ * parked for the C path; see README.md. */
+#include "efi.h"
+#include "../kernel/arch/arch.h"
+#include "../kernel/core/ck_internal.h"
+
+/* TEST-ONLY (AIENOS_CK_SCREEN negative control, native/kernel/Makefile
+ * CK_TEST_STALE_HANDOFF=2): hand the kernel a CHANDOF2 magic. Never in a
+ * hardware staging image. */
+#if defined(CK_TEST_STALE_HANDOFF) && defined(CK_HARDWARE_STAGING)
+#error "CK_TEST_STALE_HANDOFF is TEST-only and cannot be combined with CK_HARDWARE_STAGING"
+#endif
+
+/* TEST-ONLY (CK gate M0_ROLLBACK, native/kernel/Makefile CK_TEST_ROLLBACK=bad-magic):
+ * flip bit 0 of the handoff magic ("CHANDOF3" -> "BHANDOF3") after
+ * ExitBootServices, so the kernel refuses the record with "handoff: bad magic"
+ * and resets. Never in a hardware staging image. */
+#if defined(CK_TEST_ROLLBACK_BAD_MAGIC) && defined(CK_HARDWARE_STAGING)
+#error "CK_TEST_ROLLBACK_BAD_MAGIC is TEST-only and cannot be combined with CK_HARDWARE_STAGING"
+#endif
+
+#define MAP_BYTES (64u << 10)
+#define EXIT_TRIES 8
+
+extern char __image_base[], __image_end[];
+
+static uint64_t map_buf[MAP_BYTES / 8];
+static struct ck_handoff handoff;
+static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *conout;
+
+int ck_boot_model_load(EFI_HANDLE image, EFI_SYSTEM_TABLE *st, struct ck_handoff *h);
+#ifdef CK_PI5_UNLOCK_CARD
+void ck_boot_unlock_req_find(EFI_HANDLE image, EFI_SYSTEM_TABLE *st);
+#endif
+#ifdef CK_PI5_FACT
+void ck_boot_fact_req_find(EFI_HANDLE image, EFI_SYSTEM_TABLE *st);
+#endif
+#ifdef CK_PI5_LIFECYCLE
+void ck_boot_agent_cmd_find(EFI_HANDLE image, EFI_SYSTEM_TABLE *st);
+#endif
+#ifdef CK_ARTIFACT_CARD
+void ck_boot_artifact_card_find(EFI_HANDLE image, EFI_SYSTEM_TABLE *st);
+#endif
+#ifdef CK_ALLEN
+void ck_boot_allen_find(EFI_HANDLE image, EFI_SYSTEM_TABLE *st);
+#endif
+#if defined(CK_KLOG) && defined(CK_PI5) /* the card log slot is Pi 5 only; the Spark RTL8127 build keeps klog in RAM */
+void ck_boot_klog_find(EFI_HANDLE image, EFI_SYSTEM_TABLE *st);
+#endif
+void ck_boot_gop_find(EFI_SYSTEM_TABLE *st, struct ck_handoff *h);
+
+static void efi_write(const char *s, size_t n)
+{
+    CHAR16 buf[130];
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\n')
+            buf[k++] = '\r';
+        buf[k++] = (uint8_t)s[i];
+        if (k >= 128) {
+            buf[k] = 0;
+            conout->OutputString(conout, buf);
+            k = 0;
+        }
+    }
+    if (k) {
+        buf[k] = 0;
+        conout->OutputString(conout, buf);
+    }
+}
+
+static int guid_eq(const EFI_GUID *a, const EFI_GUID *b)
+{
+    return memcmp(a, b, sizeof *a) == 0;
+}
+
+static void vendor_print(const CHAR16 *v)
+{
+    char b[80];
+    size_t i = 0;
+    for (; v && v[i] && i < sizeof b - 1; i++)
+        b[i] = v[i] < 0x80 ? (char)v[i] : '?';
+    b[i] = 0;
+    ck_printf("firmware_vendor: %s\n", b);
+}
+
+EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
+{
+    struct ck_handoff *h = &handoff;
+    unsigned el = ck_current_el();
+    h->magic = CK_HANDOFF_MAGIC;
+    h->firmware_el = el;
+    h->uefi_entry_ticks = ck_rd(cntpct_el0);
+    h->counter_freq_hz = ck_rd(cntfrq_el0);
+    if (el == 2) {
+        h->firmware_ttbr0 = ck_rd(ttbr0_el2);
+        h->firmware_sctlr = ck_rd(sctlr_el2);
+    } else {
+        h->firmware_ttbr0 = ck_rd(ttbr0_el1);
+        h->firmware_sctlr = ck_rd(sctlr_el1);
+    }
+    h->image_base = (uint64_t)(uintptr_t)__image_base;
+    h->image_end = (uint64_t)(uintptr_t)__image_end;
+    h->commit = ck_commit();
+    h->memory_map = (uint64_t)(uintptr_t)map_buf;
+
+    conout = st->ConOut;
+    if (conout)
+        ck_console_set_efi(efi_write);
+    ck_set_stage("firmware_entry");
+    if (st->BootServices->SetWatchdogTimer)
+        st->BootServices->SetWatchdogTimer(0, 0, 0, 0);
+
+    static const EFI_GUID acpi20 = EFI_ACPI_20_TABLE_GUID_INIT;
+    for (uint64_t i = 0; i < st->NumberOfTableEntries; i++)
+        if (guid_eq(&st->ConfigurationTable[i].VendorGuid, &acpi20))
+            h->rsdp = (uint64_t)(uintptr_t)st->ConfigurationTable[i].VendorTable;
+
+    /* SPCR now, so a panic right after ExitBootServices can still print. */
+    struct ck_spcr spcr = {0};
+    int uart_ok = -1;
+    const void *t = h->rsdp ? ck_acpi_lookup(h->rsdp, "SPCR") : 0;
+    if (t && ck_spcr_parse(t, &spcr) == 0)
+        uart_ok = ck_console_set_uart(&spcr);
+
+    ck_puts("\n");
+    ck_report_header("pre_exit");
+    /* The GOP framebuffer for the kernel's screen console (efi_gop.c, CHANDOF3). */
+    ck_boot_gop_find(st, h);
+#ifdef CK_TEST_STALE_HANDOFF
+    ck_puts("handoff: TEST-ONLY stale handoff image: the kernel gets a CHANDOF2 record; never counts toward a PASS\n");
+#endif
+#ifdef CK_TEST_ROLLBACK_BAD_MAGIC
+    ck_puts("rollback_test: TEST-ONLY rollback candidate (bad-magic): the kernel gets a corrupted handoff magic; never counts toward a PASS\n");
+#endif
+    /* The yardstick model from the boot disk, while the firmware drivers are
+     * still up (efi_model.c). Absent map: boot continues without a model. */
+    ck_boot_model_load(image, st, h);
+#if defined(CK_KLOG) && defined(CK_PI5)
+    /* Pi 5 build: find the card's log slot while Block I/O is still up (efi_klog.c). */
+    ck_boot_klog_find(image, st);
+#endif
+#ifdef CK_PI5_UNLOCK_CARD
+    /* Pi qualification unlock image: the throwaway recovery secret request file (efi_unlock.c). */
+    ck_boot_unlock_req_find(image, st);
+#endif
+#ifdef CK_PI5_FACT
+    /* PI5-5 qualification image: the one-fact request file (efi_fact.c). */
+    ck_boot_fact_req_find(image, st);
+#endif
+#ifdef CK_PI5_LIFECYCLE
+    /* PI5-7 cut 2 qualification image: the lifecycle command script (efi_agentcmd.c). */
+    ck_boot_agent_cmd_find(image, st);
+#endif
+#ifdef CK_ARTIFACT_CARD
+    /* PI5-7 cut 3 qualification image: the card artifact bundle (efi_artifact.c). */
+    ck_boot_artifact_card_find(image, st);
+#endif
+#ifdef CK_ALLEN
+    /* PI5-8 cut K ALLEN exam image: the exam case file (efi_allen.c). */
+    ck_boot_allen_find(image, st);
+#endif
+    ck_puts("kernel_impl: c (native/kernel, Lane 18)\n");
+    vendor_print(st->FirmwareVendor);
+    ck_printf("firmware_revision: 0x%x\n", st->FirmwareRevision);
+    ck_printf("firmware_el: EL%u\n", el);
+    ck_printf("counter_frequency_hz: %llu\n", (unsigned long long)h->counter_freq_hz);
+    ck_printf("acpi_rsdp: 0x%llx\n", (unsigned long long)h->rsdp);
+    if (uart_ok == 0)
+        ck_printf("uart: %s spcr type=0x%x base=0x%llx\n", ck_console_uart_name(),
+                  spcr.interface_type, (unsigned long long)spcr.base);
+    else
+        ck_puts("uart: unavailable (no usable SPCR)\n");
+    ck_printf("image: 0x%llx-0x%llx\n", (unsigned long long)h->image_base,
+              (unsigned long long)h->image_end);
+    ck_puts("exiting firmware boot services\n");
+    ck_set_stage("exit_boot_services");
+
+    EFI_BOOT_SERVICES *bs = st->BootServices;
+    EFI_STATUS s = EFI_INVALID_PARAMETER;
+    for (unsigned tries = 1; tries <= EXIT_TRIES; tries++) {
+        uint64_t size = sizeof map_buf, key = 0, dsize = 0;
+        uint32_t dver = 0;
+        s = bs->GetMemoryMap(&size, (EFI_MEMORY_DESCRIPTOR *)map_buf, &key, &dsize, &dver);
+        if (s != EFI_SUCCESS) {
+            ck_printf("exit_boot_services: GetMemoryMap status=0x%llx size=%llu\n",
+                      (unsigned long long)s, (unsigned long long)size);
+            return s;
+        }
+        h->map_size = size;
+        h->desc_size = dsize;
+        h->desc_version = dver;
+        h->exit_attempts = tries;
+        /* No ConOut between here and ExitBootServices: printing may allocate
+         * and change the map key. */
+        s = bs->ExitBootServices(image, key);
+        if (s == EFI_SUCCESS)
+            break;
+    }
+    if (s != EFI_SUCCESS) {
+        ck_printf("exit_boot_services: failed status=0x%llx after %u tries\n",
+                  (unsigned long long)s, EXIT_TRIES);
+        return s;
+    }
+    /* Boot services are gone: ConOut too. */
+    ck_console_set_efi(0);
+    ck_set_stage("kernel_entry");
+#ifdef CK_TEST_STALE_HANDOFF
+    h->magic = CK_HANDOFF_MAGIC_V2;
+#endif
+#ifdef CK_TEST_ROLLBACK_BAD_MAGIC
+    h->magic ^= 1ull;
+#endif
+    ck_kernel_entry(h);
+}

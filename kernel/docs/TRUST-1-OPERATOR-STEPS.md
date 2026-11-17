@@ -1,0 +1,667 @@
+# TRUST-1: the steps only the operator can do
+
+This is the hands-on companion to [TRUST-1-IMPLEMENTATION-PLAN.md](TRUST-1-IMPLEMENTATION-PLAN.md).
+The plan says *what* each gate must prove. This page says *what you physically
+do*, in order: what to type, where to type it, what it changes, and what you
+should see. Agents have already built and tested every script used here.
+
+Ground rules for every step:
+
+- Nothing here changes firmware settings, Secure Boot keys, or the TPM. If a
+  step ever asks you to, stop: that belongs to Gate 6 or Gate 7 and gets its
+  own written approval first.
+- "Terminal" means a terminal window on the Spark, logged in as yourself,
+  unless a step says otherwise.
+- Every command that starts with `sudo` will ask for your Spark password.
+- If anything prints `FAIL` or looks different from "What you should see",
+  stop and hand the output to the orchestrator. Do not retry or improvise.
+
+All commands below assume this folder (the Spark's copy of the AIENOS repository):
+
+```bash
+cd ~/workspace/aienos-recovery-gate
+git pull --ff-only
+```
+
+*What it does:* moves into the repository and downloads the latest scripts.
+*Changes:* only the script files in that folder. *You should see:* a list of
+updated files, or `Already up to date.`
+
+---
+
+## Step 1. Restart the Spark once, with a snapshot before and after (Gate 2, first baseline boot)
+
+Why: Gate 2 needs proof that the security measurements the Spark makes at
+startup come out the same on every normal boot. This restart also rebuilds the
+Spark's device list cleanly after the 2026-09-30 incident in which a test
+script wiped and an agent rebuilt it by hand.
+
+1. Take the "before" snapshot:
+
+   ```bash
+   mkdir -p ~/trust1-evidence
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/boot0-before baseline-before-restart
+   ```
+
+   *What it does:* reads the startup measurements, Secure Boot state and boot
+   menu entries, and saves them in a folder. *Changes:* nothing on the
+   machine; it only writes the new folder. *You should see:* a short summary
+   ending without any `FAIL`.
+
+2. Restart: save your work, then type `sudo reboot`. Do not touch the
+   keyboard during startup. Ubuntu should come back as normal.
+
+3. Take the "after" snapshot and compare:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/boot1-after baseline-after-restart
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/boot0-before ~/trust1-evidence/boot1-after
+   ```
+
+   *Changes:* nothing on the machine. *You should see:* one `SAME` or `CHANGED`
+   line per item and a last line `compared=... changed=...`. `changed=0` means
+   identical. Either result is useful evidence; differences
+   are what Gate 2 exists to explain. Tell the orchestrator which you got.
+
+## Step 2. Pause automatic firmware-update checks during the measurement campaign (recommended)
+
+Why: the plan forbids a firmware update while measurements are being
+collected, because an update changes the measurements and would spoil the
+comparison.
+
+```bash
+sudo systemctl disable --now fwupd-refresh.timer
+```
+
+*What it does:* stops Ubuntu's background check for new firmware. *Changes:*
+one Ubuntu setting; no firmware is touched. *You should see:* a line saying a
+link was removed, or nothing. *To undo later (after Gate 2 ends):*
+`sudo systemctl enable --now fwupd-refresh.timer`.
+
+## Step 3. Create the harmless test file (Gate 1 round trip, part 1)
+
+Why: Gate 1 must prove the recovery stick can open the encrypted private
+storage *without* Ubuntu, using the offline spare. This step proves it with a
+throwaway file whose fingerprint is known, never with real data.
+
+```bash
+sudo -u atlas sh -c 'date -u > /home/atlas/atlas-runtime-setup-20260905/private-data/trust1-roundtrip-test.txt'
+sudo -u atlas sha256sum /home/atlas/atlas-runtime-setup-20260905/private-data/trust1-roundtrip-test.txt
+```
+
+The commands run as the `atlas` account because that account opened the
+private storage, and only it may write there (even the administrator is
+refused). *Changes:* adds one small text file to the private storage. *You should see:*
+the date, then a long fingerprint (64 letters and digits). Write the
+fingerprint down or paste it to the orchestrator; Step 6 checks it.
+
+## Step 4. Rebuild the recovery stick with the authenticated image (needs your approval)
+
+The stick used for the 2026-09-25 read-only boot predates the signed-image
+builder. A newly built recovery image must contain its initrd, kernel and menu
+inside one signed standalone GRUB EFI binary. Secure Boot ON for Ubuntu shim
+and the production kernel alone did not authenticate the old external initrd.
+Do not enter the offline recovery identity or passphrase into the older stick
+on the assumption that its initrd is authenticated.
+
+1. Prepare an offline signing environment with the matching signed production
+   kernel, shim, matching kernel modules, recovery tools and `grub-mkstandalone`,
+   `sbsign`, `sbverify`. The owner signing key stays offline, outside the
+   repository; its certificate must be enrolled in shim trust and not revoked.
+   The builder refuses missing key/certificate inputs. See
+   [RECOVERY_MEDIA_MACHINE1.md](RECOVERY_MEDIA_MACHINE1.md#build-and-verify)
+   for the exact inputs and command.
+2. Plug in the dedicated `AIENOSRECOV` stick. Inspect `lsblk -f` to identify
+   its unmounted FAT partition (for example `/dev/sdX1`). Never use the
+   internal NVMe or the key-backup `ATLAS_RECOV` medium. Obtain operator
+   approval for the selected partition before running the builder; it
+   replaces recovery boot files on that partition but does not format it.
+3. Run the recovery security and tools checks, then the signing/build command
+   from the linked procedure on the offline environment. A host-only
+   `sbverify` result is not proof that the real shim trusts the certificate.
+4. Under an attended hardware window, boot the new USB with Secure Boot ON
+   and verify the signed standalone GRUB enters the RAM rescue environment;
+   do not use the offline unlock identity until that boot path is qualified.
+   Replacing a byte in the embedded initrd must cause signature refusal.
+   The offline throwaway-key test is not that physical qualification.
+
+If the offline signer, enrolled certificate or attended window is unavailable,
+record Gate 1 as BLOCKED_OPERATOR. Do not fall back to the old unsigned-initrd
+builder invocation or claim the 2026-09-25 boot receipt qualifies this image.
+
+## Step 5. Decide where the recovery key lives (decision for you)
+
+**Where things stand.** After Step 4 builds and qualifies the signed recovery
+image, it can open encrypted storage. It needs the *spare* (a locked copy of the storage
+password, already kept on the Spark at
+`~/.config/atlas/offline-spares/atlas-private-storage.passfile.age`) and the
+*identity* (the private key that unlocks the spare). The identity is **not**
+on the Spark, on purpose; it is kept on the MacBook. The orchestrator will
+confirm which MacBook file opens this spare before you copy it. If that file
+is itself passphrase-protected, the recovery prompt will ask for that
+passphrase during Step 6. The spare is useless without the identity, so where
+the identity sits during the test matters.
+
+**The decision.** Where should the identity be when the stick boots?
+
+- **Option A: on a second, separate small USB stick (recommended).**
+  You copy the identity file onto a spare USB stick, plug it in only for the
+  test, then put it away somewhere separate.
+  *Upside:* the recovery stick itself stays secret-free (it is rebuilt from a
+  public repository, and the builder forbids secrets on it); losing one stick
+  never exposes the storage. *Downside:* one more stick to keep track of.
+  *If you pick it:* about 5 extra minutes; fully reversible (wipe the stick).
+- **Option B: on the recovery stick.**
+  *Upside:* one object to carry. *Downside:* anyone holding that stick plus
+  the Spark's drive can open the storage, and it breaks the stick's
+  "no secrets" rule; agents would have to change the builder. *If you pick
+  it:* not recommended; it would need a new rule decision first.
+- **Option C: type it in by hand at the recovery prompt.**
+  *Upside:* nothing to carry. *Downside:* an identity is a long random string;
+  a typo means the test fails, and there is no screen copy-paste in the
+  recovery shell. *If you pick it:* expect several tries.
+
+**Recommendation:** Option A, because it keeps the stick and the key apart,
+which is the whole point of an offline recovery path.
+
+*(Reminder, mentioned once: the identity and the spares should also have a
+second copy somewhere physically separate from the Spark.)*
+
+**Question: Option A (second USB stick), or do you prefer B or C?**
+
+## Step 6. Boot the recovery stick with Secure Boot ON and prove the unlock (Gate 1, attended)
+
+The recovery prompt is a small, separate system on the stick. It has only
+the tools listed in
+[RECOVERY_MEDIA_MACHINE1.md, "What ships"](RECOVERY_MEDIA_MACHINE1.md#what-ships).
+`aien-proof` is not one of them, so type the commands below exactly as shown,
+with nothing in front.
+
+1. Both sticks plugged in (Option A). In the terminal:
+
+   ```bash
+   efibootmgr
+   ```
+
+   Find the line for the USB stick (last time it was `Boot0004* UEFI: USB ...`)
+   and use its number below:
+
+   ```bash
+   sudo efibootmgr --bootnext 0004
+   sudo reboot
+   ```
+
+   *What it does:* tells the firmware to start from the stick **once only**.
+   *Changes:* a one-time setting that the firmware erases itself after use;
+   the normal boot order stays as it is. *You should see:* the AIENOS menu,
+   then the banner `AIENOS Standalone Hardware Recovery Core`.
+
+2. At the recovery prompt, open the internal drive read-only and the key stick:
+
+   ```sh
+   mkdir -p /mnt/root /mnt/esp /mnt/key
+   mount -o ro /dev/nvme0n1p2 /mnt/root
+   mount -o ro /dev/nvme0n1p1 /mnt/esp
+   lsblk -f
+   mount -o ro /dev/sdY1 /mnt/key
+   ```
+
+   Replace `sdY1` with the key stick's name from the `lsblk` list (the one
+   that is not `AIENOSRECOV`). *Changes:* nothing; everything is read-only.
+
+3. Run the evidence collector with the unlock switched on. Replace
+   `IDENTITY-FILE` with the identity's file name on the key stick, `OWNER`
+   with the Spark owner's login name, and `FINGERPRINT` with the value from Step 3:
+
+   ```sh
+   env AIENOS_ESP_MNT=/mnt/esp \
+       AIENOS_UNLOCK_CIPHER=/mnt/root/home/atlas/atlas-runtime-setup-20260905/private-cipher \
+       AIENOS_UNLOCK_SPARE=/mnt/root/home/OWNER/.config/atlas/offline-spares/atlas-private-storage.passfile.age \
+       AIENOS_UNLOCK_IDENTITY=/mnt/key/IDENTITY-FILE \
+       AIENOS_UNLOCK_EXPECT="trust1-roundtrip-test.txt FINGERPRINT" \
+     /usr/local/sbin/collect_recovery_boot_evidence /mnt/root
+   ```
+
+   *What it does:* records Secure Boot state, the startup measurements, the
+   disks, the encrypted stores, every loader's fingerprint and signer; then
+   opens the private storage **read-only**, checks the test file, and closes
+   it. The unlocked password exists only in memory and is deleted straight
+   away. *Changes:* nothing on any disk. *You should see:*
+   `PASS  recovery_unlock_readonly`, `PASS  test_artifact_round_trip`, and
+   finally `RECOVERY_BOOT_GATE: PASS`. Photograph the screen or save the
+   output to the key stick if you can.
+
+4. Return to Ubuntu: type `umount /mnt/key /mnt/esp /mnt/root`, remove both
+   sticks, then `reboot -f`. *You should see:* Ubuntu start normally. Then
+   in a terminal run `mokutil --sb-state` and expect `SecureBoot enabled`.
+   That is the "return to Linux" proof.
+
+## Step 7. Two more normal restarts, fully powered off (Gate 2 baseline)
+
+Repeat Step 1 twice, but instead of `sudo reboot` use `sudo poweroff`, wait 30
+seconds, then press the power button. Use new folder names each time
+(`boot2-before`/`boot2-after`, `boot3-before`/`boot3-after`). Hand the compare
+results to the orchestrator. Agents then prepare the one-change-at-a-time
+experiments (each with its own written steps and undo) and write the Gate 2
+report.
+
+## Step 8. The offline key ceremony (Gate 3; after Steps 1-7)
+
+**Where things stand.** The tool that creates your owner keys
+(`scripts/trust1_key_ceremony.sh`) is written and tested with throwaway keys.
+It creates four keys: the Owner Root (the master key that never touches the
+Spark), the Boot Signer (signs the small startup loader), the Release Signer
+(signs each AIENOS release) and the Operator Approval key (signs your
+approvals). Every private key is locked with a passphrase from the moment it
+is created. Nothing is installed into the Spark's firmware at this gate.
+
+**The decision.** Which machine runs the ceremony? It must be disconnected
+from every network while it runs; the tool refuses to start if it sees a
+network connection.
+
+- **Option A: the MacBook, with Wi-Fi off (recommended for now).**
+  *Upside:* you already have it; nothing to buy. *Downside:* it is a daily,
+  internet-connected machine, so the keys are only as safe as the MacBook
+  was before the ceremony. It needs OpenSSL 3 installed first (one command
+  while still online: `brew install openssl@3`).
+  *If you pick it:* about 30 minutes; the keys can later be replaced through
+  the rotation steps.
+- **Option B: a spare computer (or a fresh live USB system) used only for
+  this.** *Upside:* strongest protection for the master key. *Downside:*
+  needs a spare machine or a new stick and some setup time.
+
+**Recommendation:** Option A for generation 1, with the plan to rotate to a
+dedicated machine later if one becomes available. The rotation path is
+already built and tested.
+
+**Question: MacBook with Wi-Fi off, or a dedicated machine?**
+
+What you will do, once you choose (the orchestrator will walk you through it
+live):
+
+1. Copy `scripts/trust1_key_ceremony.sh` to the ceremony machine while it is
+   still online. Turn off Wi-Fi and unplug network cables.
+2. `bash trust1_key_ceremony.sh preflight` (add
+   `AIENOS_OPENSSL=/opt/homebrew/opt/openssl@3/bin/openssl ` in front on a
+   Mac). *You should see:* `OpenSSL 3...` and `network: offline`.
+3. `bash trust1_key_ceremony.sh generate ~/aienos-ceremony-gen1`. It asks
+   for a passphrase twice: choose a long one and write it on paper stored with
+   the backups. *Changes:* creates that folder only. *You should see:* four
+   `PASS ... matches manifest` lines and a `generated:` line.
+4. Plug in backup stick 1, then
+   `bash trust1_key_ceremony.sh backup ~/aienos-ceremony-gen1 /Volumes/STICK1 backup-A`
+   (use the stick's real name). *You should see:* four `PASS ... decrypts from
+   the backup copy`. Repeat with backup stick 2 as `backup-B`. Store the two
+   sticks in two different places.
+5. `bash trust1_key_ceremony.sh record ~/aienos-ceremony-gen1` writes the
+   ceremony record. Only the `public` folder (public keys, the signed
+   manifest, the record) goes back to the Spark. The `private` folder stays
+   on the ceremony machine and the two backups.
+
+## Gate 2 attended run (written 2026-10-05, aienos main 9d41efc)
+
+Companion to `docs/TRUST-1-GATE2-EXPERIMENTS.md` (the why and the expected effects) and to
+Steps 1, 2 and 7 above (the baseline, already done on 2026-10-03). This is the exact
+runbook for the next three sittings: Experiment 1, Experiment 2 and Experiment 4, the three
+that need no extra hardware. Experiments 3 (USB stick) and 5 (boot order) wait for their own
+written steps and are not part of this run.
+
+**Where things stand.** On 2026-10-03 four boots were captured with Secure Boot OFF
+(`evidence/trust1_gate2_baseline_2026-10-03/`). Two cold boots were identical on all 35
+items [OBSERVED]. One warm restart (`sudo reboot`) differed in PCR1 and PCR10 [OBSERVED].
+A "PCR" is one numbered logbook slot in the TPM chip that records what started up.
+Nothing has been decided about which slots a security policy may use, and this page does not
+decide it.
+
+What this run does and does not change: it never changes firmware settings, Secure Boot,
+keys or the TPM. It only restarts the machine, reads measurements, and (Experiment 2) turns
+one Ubuntu timer on and off. Experiment 4 opens the firmware setup screen and leaves
+without saving. The Spark stays in its current Secure Boot OFF state for the whole run.
+Results therefore describe Secure Boot OFF only (see "What would decide the TPM policy").
+
+### Before the first sitting (once, about 5 minutes)
+
+Type each command in a terminal window on the Spark, logged in as yourself. None of them
+changes anything.
+
+1. Go to the repository copy and look at it. Do NOT run `git pull` here: this copy sits on a
+   work branch, and a pull would move it.
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   sha256sum scripts/tpm_measurement_campaign.sh
+   ```
+
+   *You should see:* `aac103774858f2d4ff1c302883f7784f3948d50b640faa20e2b2c870c3824529`
+   followed by the file name. That is the same script as on `main`. A different number:
+   stop and tell the orchestrator.
+
+2. Check the machine is in the state the baseline had:
+
+   ```bash
+   mokutil --sb-state
+   systemctl is-enabled fwupd-refresh.timer
+   id -nG | tr ' ' '\n' | grep -x tss
+   command -v tpm2_pcrread tpm2_eventlog
+   ```
+
+   *You should see:* `SecureBoot disabled`, `disabled`, `tss`, then two tool paths. Anything
+   else (especially `SecureBoot enabled`): stop and tell the orchestrator; the campaign state
+   has changed.
+
+3. Make sure the evidence folder exists and show what is already in it:
+
+   ```bash
+   mkdir -p ~/trust1-evidence
+   ls ~/trust1-evidence
+   ```
+
+   *You should see:* the four baseline folders (`boot0-before` to `boot3-after`) and some
+   files. The capture tool refuses to overwrite a folder, so every folder name below is new
+   (they start with `g2-`).
+
+**Evidence destination:** `~/trust1-evidence/` on the Spark, one folder per capture. When a
+sitting ends, tell the orchestrator the folder names and paste the `compare` lines. The
+orchestrator copies the folders into the repository under
+`evidence/trust1_gate2_experiments_<date>/` in a pull request. You do not commit anything.
+
+**Stop rules for every sitting.** Stop, do not retry, do not improvise, and send the
+orchestrator the last command and everything it printed, if any of these happens:
+
+- a command prints `FAIL`, `Error`, or something other than "What you should see";
+- Ubuntu does not start normally after a restart, or the encrypted private storage or the
+  vault does not unlock afterwards (a plain power-off, a 30 second wait and the power
+  button once is allowed; nothing else);
+- any PCR other than 1 and 10 changes where the sitting says only those may move,
+  and in particular **any change in PCR 7**: three Ubuntu credentials are sealed to PCR 7
+  alone (`evidence/trust1_gate0_addendum_v1.json`), so a moved PCR 7 means they may refuse
+  to unseal;
+- a firmware update appears to have been installed;
+- a rollback `compare` still shows a PCR different from the "before" capture. That is the
+  plan's UnexpectedState case: no PCR policy is chosen and the orchestrator writes it up.
+
+`compare` ends with `compared=35 changed=N`. It exits with code 3 whenever something
+differs. That is normal and is not an error.
+
+### Sitting 1. Experiment 1: is the warm-restart value stable?
+
+Question: the warm restart changed PCR1 and PCR10 once. Is the warm value always the same?
+This resolves the one [UNKNOWN] of the baseline. The one change to the machine: none. This
+sitting restarts it warm twice and cold once. Four boots.
+
+1. Start from a cold boot so the reference is cold by construction. Save your work, then:
+
+   ```bash
+   sudo poweroff
+   ```
+
+   Wait 30 seconds, press the power button, wait for Ubuntu to start and log in.
+
+2. Reference capture (a cold boot, nothing changed yet):
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp1-before g2-exp1-before
+   ```
+
+   *You should see:* a short summary ending without `FAIL`. *Changes:* nothing on the
+   machine; it only writes the new folder.
+
+3. First warm restart. Do not touch the keyboard during startup:
+
+   ```bash
+   sudo reboot
+   ```
+
+   After Ubuntu is back:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp1-warmA g2-exp1-warmA
+   ```
+
+4. Second warm restart, same way:
+
+   ```bash
+   sudo reboot
+   ```
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp1-warmB g2-exp1-warmB
+   ```
+
+5. Back to a cold boot (this is the rollback). `sudo poweroff`, wait 30 seconds, power
+   button, then:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp1-rollback g2-exp1-rollback
+   ```
+
+6. Compare (nothing here changes the machine):
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/g2-exp1-warmA ~/trust1-evidence/g2-exp1-warmB
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/g2-exp1-before ~/trust1-evidence/g2-exp1-warmA
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/g2-exp1-before ~/trust1-evidence/g2-exp1-rollback
+   ```
+
+*Expected observations (tags show how much is known):*
+
+- `before` vs `warmA`: PCR1, PCR10 and the event log differ, nothing else [OBSERVED once on
+  2026-10-03, so a repeat is expected, not guaranteed].
+- `warmA` vs `warmB`: UNKNOWN, this is the question. Either answer is useful: `changed=0`
+  would mean the warm value is stable and PCR1 could get its own warm baseline; a difference
+  would mean PCR1 cannot be promised after a warm restart.
+- `before` vs `rollback` (cold vs cold): all PCRs identical [OBSERVED on 2026-10-03,
+  `boot2` vs `boot3` changed=0]. The event log bytes may differ even when every PCR is the
+  same [OBSERVED once, `boot0` vs `boot3`].
+
+*Stop conditions:* the common rules above; also any PCR other than 1 and 10 differing
+between `before` and a warm capture.
+*Rollback:* nothing was changed, so nothing to undo. Step 5 returns to a cold boot and its
+`compare` against `g2-exp1-before` is the proof.
+
+### Sitting 2. Experiment 2: turn the firmware-update checker back on
+
+Question: does Ubuntu's background check for new firmware change any measurement? The one
+change: `sudo systemctl enable --now fwupd-refresh.timer`, the undo of Step 2. *Changes:*
+one Ubuntu setting; no firmware is touched. Three boots. Risk: if a firmware update were
+actually installed during this window it would spoil the campaign; step 6 checks.
+
+1. Cold boot: `sudo poweroff`, wait 30 seconds, power button, log in.
+2. Before capture:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp2-before g2-exp2-before
+   ```
+
+3. The one change:
+
+   ```bash
+   sudo systemctl enable --now fwupd-refresh.timer
+   ```
+
+   *You should see:* a line saying a link was created.
+
+4. Cold boot again: `sudo poweroff`, wait 30 seconds, power button, log in. Then:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp2-after g2-exp2-after
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/g2-exp2-before ~/trust1-evidence/g2-exp2-after
+   ```
+
+5. Undo and prove it:
+
+   ```bash
+   sudo systemctl disable --now fwupd-refresh.timer
+   ```
+
+   Cold boot (`sudo poweroff`, 30 seconds, power button), log in, then:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp2-rollback g2-exp2-rollback
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/g2-exp2-before ~/trust1-evidence/g2-exp2-rollback
+   ```
+
+6. Firmware-update check, if the tool is installed (UNVERIFIED that it is):
+
+   ```bash
+   command -v fwupdmgr && fwupdmgr get-history
+   ```
+
+   *You should see:* no update recorded for the last few days. A recorded update: stop and
+   tell the orchestrator.
+
+*Expected observations:* `before` vs `after`: only the `fwupd_refresh_timer` item flips from
+disabled to enabled; every PCR identical [expected from the `boot0` vs `boot3` result, where
+that timer was the only non-event-log difference and all PCRs matched; OBSERVED]. `before` vs
+`rollback`: `changed=0` on every PCR.
+*Stop conditions:* any PCR differs; a firmware update shows in step 6.
+*Rollback:* step 5 (`disable --now`), plus the proving capture.
+
+### Sitting 3. Experiment 4: visit the firmware setup screen and leave without saving
+
+Question: does only entering the firmware setup screen change a measurement? The one
+change: entering the setup screen at startup and exiting with "discard changes" or "exit
+without saving". Three boots. **This is the only sitting where you touch the firmware
+screen. Change nothing there. Do not open any Secure Boot, key or TPM menu.**
+
+1. Cold boot, log in, then before capture:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp4-before g2-exp4-before
+   ```
+
+2. `sudo poweroff`, wait 30 seconds, press the power button, and press the setup key shown
+   on the startup screen (typically Delete or F2; UNVERIFIED for this machine, read what
+   the screen says). Look. Change NOTHING. Choose exit without saving. If you are unsure
+   whether you changed something, power the machine off, do not boot, and tell the
+   orchestrator.
+3. After Ubuntu starts and you log in:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp4-after g2-exp4-after
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/g2-exp4-before ~/trust1-evidence/g2-exp4-after
+   ```
+
+4. Rollback proof (nothing was changed, so this only proves it): `sudo poweroff`, 30
+   seconds, power button, log in, then:
+
+   ```bash
+   cd ~/workspace/aienos-recovery-gate
+   bash scripts/tpm_measurement_campaign.sh capture ~/trust1-evidence/g2-exp4-rollback g2-exp4-rollback
+   bash scripts/tpm_measurement_campaign.sh compare ~/trust1-evidence/g2-exp4-before ~/trust1-evidence/g2-exp4-rollback
+   ```
+
+*Expected observations:* UNKNOWN. Some firmware measures its configuration into PCR1 after a
+setup visit, so PCR1 is the one to watch; no change is also a normal answer [guess,
+confidence low, to be checked against the result]. `before` vs `rollback`: `changed=0` on
+every PCR.
+*Stop conditions:* the common rules; PCR 7 moves; the screen shows anything about
+Secure Boot keys being modified.
+*Rollback:* nothing was changed; Step 4 is the proof. If a setting was changed by mistake,
+restore it by hand to what it was and tell the orchestrator before the next boot.
+
+### What would decide the TPM policy (and why this run does not)
+
+This run does not choose, and must not be read as choosing, any PCR for a policy. Missing
+experiment evidence, in the order it is needed:
+
+1. **Secure Boot ON baseline.** Every capture so far is Secure Boot OFF. PCR 7 holds the
+   Secure Boot state, so its OFF value is not the value a Secure-Boot-ON policy would see.
+   The deciding experiment is at least three cold boots with Secure Boot ON and nothing else
+   changed (the plan's Gate 0 and Gate 2 precondition). Turning Secure Boot ON changes PCR 7
+   and may stop three Ubuntu credentials from unsealing, so it is a firmware-policy change
+   that needs its own written approval, a tested fallback and the recovery stick first. It
+   is NOT part of this run and no agent may do it.
+2. **Warm-restart stability** (Experiment 1 above) decides whether PCR1 may be in a policy
+   at all.
+3. **One-variable experiments with Secure Boot ON** from the plan's Q15 list (kernel, init
+   image, boot order, db addition, owner certificate addition, loader version, loader
+   rehash, signer rotation, recovery boot, tampered image). A PCR becomes a candidate only if
+   it is identical across the cold boots, moves under a security-relevant change, and does
+   not move under harmless ones. This acceptance rule is PROPOSED here; the plan's own text
+   is "no PCR selected by convention" and gives no numeric line (see the
+   `docs/TRUST-1-GATE2-EXPERIMENTS.md` proposal).
+
+Facts that already bound the choice [OBSERVED in the baseline]: PCR 11 is all zero on this
+machine, so the placeholder PCR 11 in the Gate 5 simulation has nothing to measure today;
+PCR 0, 2, 3, 4, 5 and 7 were identical in all four boots; PCR 1 and PCR 10 moved on the one
+warm restart. Which of these mean something for security is exactly what is not yet
+explained.
+
+---
+
+## Known hardware risk: do not boot the C kernel on a disk that holds data
+
+**Do not boot the C kernel on a disk holding data until CK gate `DISK_LAYOUT`
+is PASS on a forge receipt.** Today that gate is **NOT_RUN
+(MISSING_IMPLEMENTATION, fix in progress)**. Nothing in this document's steps
+boots the C kernel, and none of them may be extended to do so before the gate
+passes.
+
+Why: the C kernel treats the whole NVMe disk as its own and knows nothing about
+partitions. On a real GPT disk such as Machine 1's, that overlaps the disk's
+own partition table:
+
+- It writes the last 4 KiB of the whole disk at every boot (a write, read-back
+  and restore probe), `native/kernel/dev/nvme_bind.c:93-127` (called at line
+  224), sized by `native/kernel/dev/disk_layout.h:6-7`. The last sectors of a GPT
+  disk hold the backup partition table. A power cut during the probe leaves
+  that area with probe data.
+- It uses the first 16 KiB (4 units) as the anti-rollback anchor,
+  `native/kernel/dev/disk_layout.h:3,12` and
+  `native/kernel/svc/store_boot.c:164-170` (`anchor_lba = 0`). Sector 0 is the
+  protective MBR and the next sectors hold the primary GPT.
+- The Store region is everything between those two ends
+  (`native/kernel/dev/disk_layout.h:4`, `store_boot.c:169-170`), so a format
+  of the Store would cover every partition on the disk.
+
+Source: `~/handoffs/2026-10-01-review/track4-aienos-trust.md`, row R2.
+This entry is documentation only. It was not tested, and no hardware result is
+claimed. Host, QEMU and hardware status of the fix: all NOT_RUN.
+
+Update 2026-10-05: the CK gate `DISK_LAYOUT` is now PASS in a QEMU-only receipt
+(`evidence/ck_gates_1ecf5bcd303bf88422dd0542f14851c931f5d52276838fa182c812f3c73f3c1b.json`,
+commit 640522a, code identical to 9d41efc), so the "NOT_RUN" wording above is out of date for
+QEMU. Nothing changes for hardware: it is still NOT_RUN on a real disk, and no step in this
+document boots the C kernel on Machine 1.
+
+## Later gates (no action from you yet)
+
+- **Gate 4** (agents): sign the loader with your Boot Signer in the emulator
+  and add the remaining emulator tests.
+- **Gate 5** (agents): the TPM approval rules, tested in a software TPM only.
+- **Gate 6** (you + agents): add a second way to unlock the storage next to
+  the current one. Gets its own written steps and approval.
+- **Gate 7** (you): the single attended hardware boot with Secure Boot on.
+  Gets its own written checklist and approval; nothing above prepares it
+  silently. Before that checklist, an agent or you can run the pre-flight
+  check in a normal terminal:
+
+  ```bash
+  bash scripts/trust1_gate7_preflight.sh
+  ```
+
+  *What it does:* checks the things that can be checked before any restart:
+  the TPM and Secure Boot state can be read, every tool the stick and the
+  snapshot steps need is present, the locked spare and the encrypted storage
+  folder are where this page says, no secret key sits next to the spare, and
+  the recovery image (on the stick if it is plugged in and open, otherwise a
+  private test copy) has every tool. *Changes:* nothing; it needs no
+  password and cleans up its own temporary folder. Takes about 5 seconds.
+  *You should see:* a list of `PASS` lines, a `NOT CHECKED` list (things only
+  your restarts or later gates can prove), and last
+  `GATE7_PREFLIGHT: PASS`. Any `FAIL` line: stop and hand the output to the
+  orchestrator.
+- **Gates 8-9**: observation period, then retiring the old rules only with
+  your approval.

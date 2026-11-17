@@ -1,0 +1,286 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* test_handoff.c -- host tests of core/handoff_check.c against the handoff
+ * contract (docs/BOOT_HANDOFF_CONTRACT.md sections 6 and 9).
+ *
+ * Positive control: a record filled the way native/boot/efi_main.c fills it
+ * (efi_main.c:60-76 and 126-129, static so reserved0 is zero) with a QEMU
+ * AAVMF style map (48-byte descriptors, version 1; UNVERIFIED stand-in
+ * values, the real boot is proven by scripts/qemu_ck_boot_test.sh).
+ * One negative case per refusal reason, each checked for the exact
+ * "handoff: <reason>" line the kernel panics with.
+ *
+ * Mutation: built with -DCK_HANDOFF_MUTANT_SKIP_RESERVED the validator
+ * skips the reserved0 check; this test then FAILS (reserved0 = 1 is
+ * accepted). "make test" builds that mutant and requires it to fail. */
+#include <string.h>
+#include "ck_test.h"
+#include "handoff_check.h"
+
+static uint64_t map_buf[(64u << 10) / 8];
+
+static struct ck_handoff good(void)
+{
+    static const char commit[] = "test";
+    struct ck_handoff h;
+    memset(&h, 0, sizeof h); /* efi_main.c: static handoff, BSS zeroed */
+    h.magic = CK_HANDOFF_MAGIC;
+    h.firmware_el = 2;
+    h.uefi_entry_ticks = 123456;
+    h.counter_freq_hz = 62500000;
+    h.firmware_ttbr0 = 0x13ffff000ull;
+    h.firmware_sctlr = 0x30c5183dull;
+    h.image_base = 0x13c000000ull;
+    h.image_end = 0x13c080000ull;
+    h.commit = commit;
+    h.memory_map = (uint64_t)(uintptr_t)map_buf;
+    h.rsdp = 0x13f5f0018ull;
+    h.desc_size = 48;
+    h.desc_version = 1;
+    h.map_size = 48 * 120;
+    h.exit_attempts = 1;
+    return h;
+}
+
+/* Runs the validator and returns the panic line the kernel would print
+ * ("" on acceptance). */
+static const char *line(const struct ck_handoff *h)
+{
+    static char buf[96];
+    const char *why = (const char *)1;
+    if (ck_handoff_check(h, &why) == 0)
+        return why == 0 ? "" : "accepted but why set";
+    snprintf(buf, sizeof buf, "handoff: %s", why ? why : "(null why)");
+    return buf;
+}
+
+static void expect(const struct ck_handoff *h, const char *want)
+{
+    const char *got = line(h);
+    int ok = strcmp(got, want) == 0;
+    CHECK(ok);
+    if (!ok)
+        printf("    want \"%s\" got \"%s\"\n", want, got);
+}
+
+int main(void)
+{
+    struct ck_handoff h;
+
+    /* 13. positive control; the full 64 KiB map buffer is also accepted. */
+    h = good();
+    expect(&h, "");
+    h.map_size = 48 * 1365; /* 65520, largest multiple of 48 <= 64 KiB */
+    expect(&h, "");
+    h = good();
+    h.firmware_el = 1;
+    expect(&h, "");
+
+    /* 1. NULL record */
+    expect(0, "handoff: null record");
+
+    /* 2. bad magic: one bit off and 0; the previous layouts CHANDOF1 and
+     * CHANDOF2 and a future CHANDOF4 get the "unsupported version" line
+     * (contract section 6), a non-digit version byte is plain bad magic. */
+    h = good();
+    h.magic ^= 1ull << 8;
+    expect(&h, "handoff: bad magic");
+    h = good();
+    h.magic = CK_HANDOFF_MAGIC_V1;
+    expect(&h, "handoff: unsupported version 1 (kernel reads CHANDOF3 only)");
+    h = good();
+    h.magic = CK_HANDOFF_MAGIC_V2;
+    expect(&h, "handoff: unsupported version 2 (kernel reads CHANDOF3 only)");
+    h = good();
+    h.magic = CK_HANDOFF_MAGIC_STEM | (uint64_t)'4' << 56;
+    expect(&h, "handoff: unsupported version 4 (kernel reads CHANDOF3 only)");
+    h = good();
+    h.magic = CK_HANDOFF_MAGIC_STEM | (uint64_t)'X' << 56;
+    expect(&h, "handoff: bad magic");
+    h = good();
+    h.magic = 0;
+    expect(&h, "handoff: bad magic");
+
+    /* 3. reserved0 nonzero (the mutant skips this; must FAIL then) */
+    h = good();
+    h.reserved0 = 1;
+    expect(&h, "handoff: reserved field nonzero");
+    h = good();
+    h.reserved0 = 0x80000000u;
+    expect(&h, "handoff: reserved field nonzero");
+
+    /* 4. descriptor size 0, 39, 41 (not a multiple of 8), 44 */
+    h = good();
+    h.desc_size = 0;
+    expect(&h, "handoff: bad descriptor size 0");
+    h.desc_size = 39;
+    expect(&h, "handoff: bad descriptor size 39");
+    h.desc_size = 41;
+    expect(&h, "handoff: bad descriptor size 41");
+    h.desc_size = 44;
+    expect(&h, "handoff: bad descriptor size 44");
+    h.desc_size = 40; /* smallest accepted stride; 48*120 is a multiple of 40 */
+    expect(&h, "");
+
+    /* 5. descriptor version 0 and 2 */
+    h = good();
+    h.desc_version = 0;
+    expect(&h, "handoff: bad descriptor version 0");
+    h.desc_version = 2;
+    expect(&h, "handoff: bad descriptor version 2");
+
+    /* 6. map size 0, not a multiple of desc_size, 65544 (> 64 KiB) */
+    h = good();
+    h.map_size = 0;
+    expect(&h, "handoff: bad map size 0");
+    h.map_size = 48 * 120 + 8;
+    expect(&h, "handoff: bad map size 5768");
+    h.desc_size = 21848; /* 65544 = 3 * 21848: refused only for > 64 KiB */
+    h.map_size = 65544;
+    expect(&h, "handoff: bad map size 65544");
+    h.desc_size = 64; /* boundary: exactly 64 KiB is accepted */
+    h.map_size = 65536;
+    expect(&h, "");
+    h.desc_size = 65544; /* stride larger than 64 KiB: one descriptor cannot fit */
+    h.map_size = 65544;
+    expect(&h, "handoff: bad map size 65544");
+
+    /* 7. CHANDOF2 model fields (docs/BOOT_HANDOFF_CONTRACT.md 3.2): reserved1,
+     * unknown flags, fields set without the present flag, and the range/
+     * geometry checks on a well-formed disk model (the Spark numbers). */
+    h = good();
+    h.reserved1 = 1;
+    expect(&h, "handoff: reserved1 field nonzero");
+    h = good();
+    h.model_flags = 4;
+    expect(&h, "handoff: bad model flags 4");
+    h = good();
+    h.model_len = 100;
+    expect(&h, "handoff: model fields without model");
+    h = good();
+    h.model_sha256[31] = 1;
+    expect(&h, "handoff: model fields without model");
+    h = good();
+    h.model_flags = CK_HANDOFF_MODEL_BLOCKIO;
+    expect(&h, "handoff: model fields without model");
+    struct ck_handoff m = good();
+    m.model_flags = CK_HANDOFF_MODEL_PRESENT | CK_HANDOFF_MODEL_BLOCKIO;
+    m.model_base = 0x140000000ull;
+    m.model_len = 807694368ull;
+    m.model_extents = 24;
+    m.model_block_size = 512;
+    m.model_disk_last_block = 8001573551ull;
+    m.model_read_us = 1234567;
+    m.model_sha256[0] = 0x3f;
+    expect(&m, "");
+    h = m;
+    h.model_base = 0;
+    expect(&h, "handoff: bad model range 807694368");
+    h = m;
+    h.model_len = 0;
+    expect(&h, "handoff: bad model range 0");
+    h = m;
+    h.model_base = 0x140000800ull;
+    expect(&h, "handoff: model base unaligned 5368711168");
+    h = m;
+    h.model_len = ~0ull;
+    expect(&h, "handoff: model range overflow 18446744073709551615");
+    h = m;
+    h.model_block_size = 1024;
+    expect(&h, "handoff: bad model block size 1024");
+    h = m;
+    h.model_extents = 0;
+    expect(&h, "handoff: bad model extents 0");
+    h = m;
+    h.model_flags = CK_HANDOFF_MODEL_PRESENT;
+    expect(&h, "");
+
+    /* 8. CHANDOF3 framebuffer fields (contract section 3): absent GOP must be
+     * all zero; a GOP without a linear framebuffer carries no range; a
+     * present framebuffer (the Spark's Linux view: 1920x1080, 7680-byte
+     * stride, 32 bpp; QEMU ramfb) passes the geometry checks. */
+    h = good();
+    h.fb_width = 800;
+    expect(&h, "handoff: fb fields without gop");
+    h = good();
+    h.fb_gop_handles = 1;
+    expect(&h, "handoff: fb fields without gop");
+    h = good();
+    h.fb_status = 3;
+    expect(&h, "handoff: bad fb status 3");
+    h = good();
+    h.fb_status = CK_HANDOFF_FB_NO_LINEAR;
+    h.fb_gop_handles = 1;
+    h.fb_format = 3; /* PixelBltOnly, recorded for the report */
+    expect(&h, "");
+    h.fb_base = 0x80000000ull;
+    expect(&h, "handoff: fb range without linear framebuffer 0");
+    h.fb_base = 0;
+    h.fb_gop_handles = 0;
+    expect(&h, "handoff: bad fb gop handles 0");
+    struct ck_handoff f = good();
+    f.fb_status = CK_HANDOFF_FB_PRESENT;
+    f.fb_base = 0x1f0000000ull;
+    f.fb_size = 1920ull * 1080 * 4;
+    f.fb_width = 1920;
+    f.fb_height = 1080;
+    f.fb_pitch = 1920;
+    f.fb_format = CK_HANDOFF_FB_BGRX;
+    f.fb_gop_handles = 1;
+    expect(&f, "");
+    h = f;
+    h.fb_format = CK_HANDOFF_FB_RGBX;
+    expect(&h, "");
+    h = f;
+    h.fb_format = 2; /* PixelBitMask is never PRESENT */
+    expect(&h, "handoff: bad fb format 2");
+    h = f;
+    h.fb_width = 0;
+    expect(&h, "handoff: bad fb width 0");
+    h = f;
+    h.fb_height = 16385;
+    expect(&h, "handoff: bad fb height 16385");
+    h = f;
+    h.fb_pitch = 1919;
+    expect(&h, "handoff: bad fb pitch 1919");
+    h = f;
+    h.fb_pitch = 2048; /* padded scan lines: size must cover pitch, not width */
+    expect(&h, "handoff: fb size too small 8294400");
+    h.fb_size = 2048ull * 1080 * 4;
+    expect(&h, "");
+    h = f;
+    h.fb_base = 0;
+    expect(&h, "handoff: bad fb base 0");
+    h = f;
+    h.fb_base = 0x1f0000002ull;
+    expect(&h, "handoff: bad fb base 8321499138");
+    h = f;
+    h.fb_base = ~0ull - 4095;
+    expect(&h, "handoff: fb range overflow 8294400");
+    h = f;
+    h.fb_gop_handles = 0;
+    expect(&h, "handoff: bad fb gop handles 0");
+
+    /* Check order: the first failing field is reported. */
+    h = good();
+    h.magic = 0;
+    h.reserved0 = 1;
+    h.map_size = 0;
+    expect(&h, "handoff: bad magic");
+
+    return ck_t_verdict("test_handoff");
+}

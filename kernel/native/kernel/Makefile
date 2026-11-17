@@ -1,0 +1,3530 @@
+# AIENOS C kernel core (Lane 18): UEFI entry stub + kernel core as one
+# AArch64 PE32+ image, plus host unit tests. Toolchain: gcc, binutils, make.
+#
+#   make                 core-only image $(OUT)/BOOTAA64.EFI (stages print
+#                        "not linked"; the M1 gate boots this one)
+#   make full            full image with the boot stages (devices, security,
+#                        Store) from stage.mk: $(OUT)/full/BOOTAA64.EFI,
+#                        NVMe DMA SMMU-confined, refused without an SMMU
+#   make full CK_QEMU_UNSAFE_DMA=1
+#                        TEST-ONLY QEMU image with the unconfined NVMe DMA bypass:
+#                        $(OUT)/full-qemu-unsafe-dma/BOOTAA64.EFI (only
+#                        scripts/qemu_ck_store_test.sh sets this; refused
+#                        together with CK_HARDWARE_STAGING=1)
+#   make full CK_HARDWARE_STAGING=1 CK_OWNER_PUBKEYS=<file> CK_MACHINE_ID=<file>
+#                        hardware staging image $(OUT)/full-hardware-staging/:
+#                        no TEST Store keys/uuid/machine id (refused without
+#                        both files; tools/ck_owner_gen.c checks them); its
+#                        Store stage refuses (production key source is
+#                        BLOCKED_OPERATOR). scripts/ck_owner_keys_check.sh
+#   make full CK_SERVICE=1 CK_HARDWARE_STAGING=1 CK_OWNER_PUBKEYS=<file> CK_MACHINE_ID=<file> CK_INFER_LIB=<lib>
+#                        the production service image with resident inference,
+#                        model from the boot disk only (MODEL.MAP, no fw_cfg code):
+#                        $(OUT)/full-service-hardware-staging/. Staged by
+#                        scripts/stage_one_time_boot_ck_service.sh; proof
+#                        scripts/qemu_ck_service_disk_test.sh (aienos#34, gate N3)
+#   make full CK_TEST_XHCI_MUTATION=bm-left-on|no-revoke|grant-no-smmu|no-sweep
+#                        TEST-ONLY image that breaks one xHCI DMA fence row on
+#                        purpose: $(OUT)/full-test-xhci-<name>/ (only
+#                        scripts/qemu_ck_keyboard_test.sh --mutation; refused
+#                        with CK_HARDWARE_STAGING=1 or CK_QEMU_UNSAFE_DMA=1)
+#   make full CK_CONSOLE_SESSION=1 [CK_TEST_CONSOLE_MUTATION=bm-left-on-after-exit]
+#                        TEST-ONLY QEMU image with the final "console" boot stage
+#                        (serial + USB keyboard input until "exit", no time limit):
+#                        $(OUT)/full-console-session/ (the mutation image:
+#                        full-test-console-mutation/, bus master left on after the
+#                        exit); only scripts/qemu_ck_console_test.sh; refused with
+#                        CK_HARDWARE_STAGING=1 or CK_QEMU_UNSAFE_DMA=1
+#   make full CK_TEST_STORE_CRASH=1 [CK_TEST_STORE_CRASH_MUTANT=<name>]
+#                        TEST-ONLY Store crash hook image
+#                        $(OUT)/full-test-store-crash[-mutant-<name>]/ for
+#                        scripts/qemu_ck_store_crash_test.sh (M4_STORE_CRASH);
+#                        refused with CK_HARDWARE_STAGING / CK_QEMU_UNSAFE_DMA
+#   make owner-gen       host tool $(OUT)/host/ck_owner_gen
+#   make [full] CK_TEST_FWCFG_ARTIFACTS=1
+#                        TEST-ONLY: loader takes candidates from the QEMU fw_cfg
+#                        side channel instead of the boot disk Store; own OUT
+#                        (target/native-kernel-test-fwcfg); announces itself and
+#                        never counts toward a PASS. Default images are checked
+#                        to contain no fw_cfg artifact code.
+#   make CK_TEST_ROLLBACK=bad-magic|cpu-fault|hang
+#                        TEST-ONLY M0_ROLLBACK candidates (bad handoff magic, CPU
+#                        fault after "kernel: alive", hang with interrupts masked);
+#                        own OUT (target/native-kernel-test-rollback-<mode>); only
+#                        scripts/qemu_ck_rollback_test.sh; refused with CK_HARDWARE_STAGING
+#   make uefi-vars       host tool $(OUT)/host/ck_uefi_vars: reads BootOrder, BootNext
+#                        and Boot#### from an edk2 vars.fd (read-only, M0_ROLLBACK)
+#   make [full] CK_B7B_PROBE=1 [CK_B7B_PROBE_TEST_SEGMENT0=1]
+#                        B7b preparation probe image (aienos#286): confine the
+#                        GB10 requester once, read SMMU_IDR0/IDR1, unconfine;
+#                        own OUT (target/native-kernel-b7b-probe); the segment-0
+#                        variant is TEST-ONLY (QEMU positive path). Gate:
+#                        scripts/qemu_ck_b7b_probe_test.sh
+#   make CK_TEST_SMP_SKIP_CPU=1
+#                        TEST-ONLY SMP mutation: CPU_ON skipped for one secondary
+#                        core (core/smp.c); own OUT (target/native-kernel-test-smp-skip);
+#                        the SMP gate must FAIL on it (scripts/qemu_ck_smp_test.sh
+#                        --mutation); refused with CK_HARDWARE_STAGING
+#   make store-image     host tool $(OUT)/host/ck_store_image: signed artifacts
+#                        into the sealed Store inside the AIENOS GPT partition
+#                        of an NVMe disk image
+#   make gpt-image       host tool $(OUT)/host/ck_gpt_image: GPT boot-disk images
+#                        (AIENOS partition between two sentinels, hostile variants)
+#                        for the QEMU gates; "find" runs the kernel GPT parser
+#   make full CK_TEST_DISK_XLATE_BYPASS=1
+#                        TEST-ONLY mutation image for the DISK_LAYOUT gate: the
+#                        LBA translation layer (dev/disk_part.c) adds no partition
+#                        offset; $(OUT)/full-test-xlate-bypass/ (refused with
+#                        CK_HARDWARE_STAGING; never counted toward a PASS)
+#   make test            host unit tests            -> CK_CORE_HOST: PASS
+#                        (also builds the handoff_check reserved0 mutant
+#                        and requires test_handoff to FAIL against it)
+#   make sanitize        same under ASan + UBSan    -> CK_CORE_HOST: PASS
+#   make continuity-mutants
+#                        TEST-only -D mutants of svc/continuity_codec.c must
+#                        each fail test_continuity_codec -> CK_CONTINUITY_CODEC_MUTANTS: PASS
+#   make continuity-resolve-mutants
+#                        TEST-only -D mutants of svc/continuity_resolve.c must each fail
+#                        test_continuity_resolve -> CK_CONTINUITY_RESOLVE_MUTANTS: PASS
+#   make continuity-commit-mutants
+#                        TEST-only -D mutants of svc/continuity_commit.c (and MC-11 of the codec) must
+#                        each fail test_continuity_commit -> CK_CONTINUITY_COMMIT_MUTANTS: PASS
+#   make continuity-recovery-mutants
+#                        TEST-only -D mutants of svc/continuity_recovery.c (MR-1, MR-5, MR-6, MR-7, MR-9) must
+#                        each fail test_continuity_recovery -> CK_CONTINUITY_RECOVERY_MUTANTS: PASS
+#   make stage-test | stage-sanitize | stage-free   stage host tests (stage.mk)
+#   make print-kcflags   flags stage code must be built with
+#   make udp-echo        host UDP echo helper for scripts/qemu_ck_net_test.sh:
+#                        $(OUT)/host/ck_udp_echo (hosted, test tooling only)
+#   make slot-loader CK_SLOT_KEYS=<file> | CK_TEST_SLOT_KEY=1
+#                        SLOTLDR.EFI, the signed A/B slot loader in front of the
+#                        unchanged image (native/boot/slot_loader.c, P11 cut 2a):
+#                        $(OUT)/SLOTLDR.EFI; owner keys baked in from CK_SLOT_KEYS,
+#                        or the TEST-ONLY RFC 8032 TEST 1 key; the TEST key is
+#                        refused with CK_HARDWARE_STAGING. Gate:
+#                        scripts/qemu_ck_slot_loader_test.sh
+#   make slot-loader-check  build checks + refusals -> SLOT_LOADER_BUILD: PASS
+#
+#   CK_EXTRA_CFLAGS=... extra kernel flags for one-off checks, e.g.
+#                    -DCK_SELFTEST_EL2_FAULT (brk at EL2: the EL2 fatal path)
+# The stages are weak references in ck.h (the core defines no defaults):
+# with none linked the kernel prints "stage <name>: not linked".
+#
+# Output goes to <repo>/target/native-kernel (ignored by git) unless OUT is set.
+# Builds natively on an aarch64 host, else with the aarch64-linux-gnu- prefix.
+# QEMU is not hardware: nothing built here is physically qualified.
+
+KDIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+NATIVE := $(abspath $(KDIR)/..)
+REPO := $(abspath $(NATIVE)/..)
+BOOT := $(NATIVE)/boot
+
+HOST_ARCH := $(shell uname -m)
+ifeq ($(HOST_ARCH),aarch64)
+CROSS ?=
+else
+CROSS ?= aarch64-linux-gnu-
+endif
+KCC := $(CROSS)gcc
+KLD := $(CROSS)ld
+KOBJCOPY := $(CROSS)objcopy
+KNM := $(CROSS)nm
+KREADELF := $(CROSS)readelf
+HOSTCC ?= cc
+
+# Raspberry Pi 5 board image (CK_PI5=1, "make pi5"): the core image plus
+# core/pi5.c (PM watchdog, microSD bring-up, console log written to the
+# card), core/klog*.c, dev/pi5_wdt.c, the PIO SD driver (native/disk) and the
+# UEFI stub's KLOG.MAP reader (native/boot/efi_klog.c). Own OUT, so it never
+# replaces a default image. Not for the Spark or QEMU: pi5_wdt.c and pi5.c
+# touch BCM2712-only addresses and refuse to build without CK_PI5.
+CK_PI5_STORE ?=
+ifneq ($(strip $(CK_PI5_STORE)),)
+ifneq ($(strip $(CK_PI5_STORE)),1)
+$(error CK_PI5_STORE must be empty or 1)
+endif
+ifneq ($(strip $(CK_SERVICE)$(CK_TEST_STORE_CRASH)$(CK_TEST_CONTINUITY)$(CK_HARDWARE_STAGING)),)
+$(error CK_PI5_STORE is the TEST-key qualification tier (SEED-0B-PI5): it cannot be combined with CK_SERVICE, CK_TEST_STORE_CRASH, CK_TEST_CONTINUITY or CK_HARDWARE_STAGING)
+endif
+CK_PI5 := 1
+OUT ?= $(REPO)/target/native-kernel-pi5-store
+CK_EXTRA_CFLAGS += -DCK_PI5_STORE=1
+endif
+# Pi 5 inference image (CK_PI5_INFER=1, "make pi5-infer", PI5-6 cut 2): the plain Pi image plus
+# the Rust inference unit (CK_INFER_LIB) and core/infer.c as the one-shot boot-disk probe. Model
+# source is MODEL.MAP only (-DCK_INFER_DISK_ONLY=1): no fw_cfg code, and with no map the kernel
+# refuses. No Store stage, no service, no resident session. Own OUT; plain pi5 / pi5-store unchanged.
+CK_PI5_INFER ?=
+ifneq ($(strip $(CK_PI5_INFER)),)
+ifneq ($(strip $(CK_PI5_INFER)),1)
+$(error CK_PI5_INFER must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_UNLOCK)$(CK_PI5_AGENT)$(CK_SERVICE)$(CK_HARDWARE_STAGING)$(CK_TEST_FWCFG_ARTIFACTS)$(CK_RUST_LIBS)),)
+$(error CK_PI5_INFER is the one-shot Pi inference image: it cannot be combined with CK_PI5_STORE, CK_PI5_UNLOCK, CK_PI5_AGENT, CK_SERVICE, CK_HARDWARE_STAGING, CK_TEST_FWCFG_ARTIFACTS or CK_RUST_LIBS)
+endif
+ifeq ($(strip $(CK_INFER_LIB)),)
+$(error CK_PI5_INFER needs CK_INFER_LIB=<libaienos_infer_kernel.a> (use "make pi5-infer", which builds it))
+endif
+CK_PI5 := 1
+OUT ?= $(REPO)/target/native-kernel-pi5-infer
+CK_EXTRA_CFLAGS += -DCK_PI5_INFER=1 -DCK_INFER_DISK_ONLY=1
+endif
+# Pi 5 PCIe/RP1 enumerator image (CK_PI5_PCIE=1, "make pi5-pcie", AIENOS-PI5 network lane step 1): the plain Pi
+# image plus dev/pi5_pcie.c (read-only look at the BCM2712 PCIe2 root complex, RP1's config space and BARs, and
+# the inbound DMA window judged against the ADR 0020 bounce region) and dev/dma_window.c. Own OUT; the plain
+# pi5, pi5-store and pi5-infer images and the default image carry none of this code.
+CK_PI5_PCIE ?=
+ifneq ($(strip $(CK_PI5_PCIE)),)
+ifneq ($(strip $(CK_PI5_PCIE)),1)
+$(error CK_PI5_PCIE must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_NET)$(CK_PI5_STORE)$(CK_PI5_INFER)$(CK_PI5_UNLOCK)$(CK_PI5_AGENT)$(CK_SERVICE)$(CK_HARDWARE_STAGING)),)
+$(error CK_PI5_PCIE is the Pi PCIe/RP1 enumerator image: it cannot be combined with CK_PI5_NET, CK_PI5_STORE, CK_PI5_INFER, CK_PI5_UNLOCK, CK_PI5_AGENT, CK_SERVICE or CK_HARDWARE_STAGING)
+endif
+CK_PI5 := 1
+OUT ?= $(REPO)/target/native-kernel-pi5-pcie
+CK_EXTRA_CFLAGS += -DCK_PI5_PCIE=1
+endif
+
+# Pi 5 network bring-up image (CK_PI5_NET=1, "make pi5-net", AIENOS-PI5 network lane cut 2): the plain Pi image plus
+# dev/pi5_net.c (narrows the BCM2712 PCIe2 inbound DMA window to the ADR 0020 bounce region, then brings RP1's
+# Ethernet up to the PHY and reads the PHY ID; no frames). Own OUT; no other image carries this code.
+CK_PI5_NET ?=
+ifneq ($(strip $(CK_PI5_NET)),)
+ifneq ($(strip $(CK_PI5_NET)),1)
+$(error CK_PI5_NET must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_INFER)$(CK_PI5_UNLOCK)$(CK_PI5_AGENT)$(CK_PI5_FACT)$(CK_PI5_PCIE)$(CK_SERVICE)$(CK_HARDWARE_STAGING)),)
+$(error CK_PI5_NET is the Pi network bring-up image: it cannot be combined with CK_PI5_STORE, CK_PI5_INFER, CK_PI5_UNLOCK, CK_PI5_AGENT, CK_PI5_FACT, CK_PI5_PCIE, CK_SERVICE or CK_HARDWARE_STAGING)
+endif
+CK_PI5 := 1
+OUT ?= $(REPO)/target/native-kernel-pi5-net
+CK_EXTRA_CFLAGS += -DCK_PI5_NET=1
+endif
+
+# Pi unlock image (CK_PI5_UNLOCK=1, "make pi5-unlock", PI5-4 cut 1): the same Store stage, but the Store opens
+# ONLY through the ADR 0017 Slot 1 recovery-secret path (ck_store_unlock_boot, PRODUCTION-class keys).
+# ck_store_test_keys and ck_store_test_uuid are not compiled, so no TEST key or TEST uuid can reach it.
+# It is a separate image from CK_PI5_STORE (TEST keys) and cannot be combined with any other tier flag.
+# PI5-4 cut 2: CK_PI5_UNLOCK_CARD=1 (QUALIFICATION ONLY, "make pi5-unlock-card") adds one secret source to the
+# unlock image: a THROWAWAY recovery secret from \EFI\AIENOS\UNLOCK.REQ on the card (core/unlock_req.h). It
+# needs CK_PI5_UNLOCK=1 and is a separate image with its own OUT. CK_PI5_PRODUCTION is reserved for a future
+# production Pi image; it is not implemented and can never be combined with the card request source.
+CK_PI5_UNLOCK_CARD ?=
+CK_PI5_PRODUCTION ?=
+ifneq ($(strip $(CK_PI5_PRODUCTION)),)
+$(error CK_PI5_PRODUCTION is reserved and not implemented: there is no production Pi image yet)
+endif
+ifneq ($(strip $(CK_PI5_UNLOCK_CARD)),)
+ifneq ($(strip $(CK_PI5_UNLOCK_CARD)),1)
+$(error CK_PI5_UNLOCK_CARD must be empty or 1)
+endif
+ifeq ($(strip $(CK_PI5_UNLOCK)),)
+$(error CK_PI5_UNLOCK_CARD (card request file, throwaway secret, QUALIFICATION ONLY) needs CK_PI5_UNLOCK=1)
+endif
+endif
+CK_PI5_UNLOCK ?=
+ifneq ($(strip $(CK_PI5_UNLOCK)),)
+ifneq ($(strip $(CK_PI5_UNLOCK)),1)
+$(error CK_PI5_UNLOCK must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_STORE)),)
+$(error CK_PI5_UNLOCK (production-class keys from the recovery secret) cannot be combined with CK_PI5_STORE (public TEST keys))
+endif
+ifneq ($(strip $(CK_SERVICE)$(CK_TEST_STORE_CRASH)$(CK_TEST_CONTINUITY)$(CK_HARDWARE_STAGING)$(CK_SERVICE_TEST_KEYS)),)
+$(error CK_PI5_UNLOCK cannot be combined with CK_SERVICE, CK_SERVICE_TEST_KEYS, CK_TEST_STORE_CRASH, CK_TEST_CONTINUITY or CK_HARDWARE_STAGING)
+endif
+CK_PI5 := 1
+OUT ?= $(REPO)/target/native-kernel-pi5-unlock$(if $(strip $(CK_PI5_UNLOCK_CARD)),-card)$(if $(strip $(CK_PI5_FACT)),-fact)$(if $(strip $(CK_PI5_AGENT)),-agent)$(if $(strip $(CK_PI5_LIFECYCLE)),-lifecycle)
+CK_EXTRA_CFLAGS += -DCK_PI5_UNLOCK=1
+ifneq ($(strip $(CK_PI5_UNLOCK_CARD)),)
+CK_EXTRA_CFLAGS += -DCK_PI5_UNLOCK_CARD=1
+endif
+endif
+
+# Pi Cortex fact image (CK_PI5_FACT=1, "make pi5-fact", PI5-5): the Pi unlock-card image (production-class Store
+# opened by the Slot 1 recovery secret from the card request file) plus the Cortex fact stage (svc/pi5_fact.c): a
+# fact from \EFI\AIENOS\FACT.REQ (QUALIFICATION ONLY, core/fact_req.h) is appended to the Cortex journal of the
+# sealed Store, and a boot without that file recalls it. It needs CK_PI5_UNLOCK=1 and CK_PI5_UNLOCK_CARD=1, refuses
+# every other tier flag and has its own OUT.
+CK_PI5_FACT ?=
+ifneq ($(strip $(CK_PI5_FACT)),)
+ifneq ($(strip $(CK_PI5_FACT)),1)
+$(error CK_PI5_FACT must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_UNLOCK))$(strip $(CK_PI5_UNLOCK_CARD)),11)
+$(error CK_PI5_FACT (Cortex fact stage, QUALIFICATION ONLY) needs CK_PI5_UNLOCK=1 and CK_PI5_UNLOCK_CARD=1)
+endif
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_INFER)$(CK_PI5_PCIE)$(CK_PI5_NET)$(CK_PI5_AGENT)$(CK_PI5_LIFECYCLE)),)
+$(error CK_PI5_FACT cannot be combined with CK_PI5_STORE, CK_PI5_INFER, CK_PI5_PCIE, CK_PI5_NET, CK_PI5_AGENT or CK_PI5_LIFECYCLE)
+endif
+CK_EXTRA_CFLAGS += -DCK_PI5_FACT=1
+endif
+
+# Pi agent image (CK_PI5_AGENT=1, "make pi5-agent", PI5-6 final cut, QUALIFICATION ONLY while the secret comes from the card request
+# file): the Pi unlock-card image (production-class Store opened by the Slot 1 recovery secret) plus the resident inference unit
+# (CK_INFER_LIB, model from MODEL.MAP only) plus the agent stage (svc/pi5_agent.c): after the Store opened it recovers the persisted
+# reply, or (no reply yet) generates a bounded reply and commits it as a sealed R1 object. It needs CK_PI5_UNLOCK=1, CK_PI5_UNLOCK_CARD=1
+# and CK_INFER_LIB, refuses every other tier flag (CK_PI5_INFER and CK_PI5_FACT included) and has its own OUT.
+CK_PI5_AGENT ?=
+ifneq ($(strip $(CK_PI5_AGENT)),)
+ifneq ($(strip $(CK_PI5_AGENT)),1)
+$(error CK_PI5_AGENT must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_UNLOCK))$(strip $(CK_PI5_UNLOCK_CARD)),11)
+$(error CK_PI5_AGENT (Store plus inference, QUALIFICATION ONLY) needs CK_PI5_UNLOCK=1 and CK_PI5_UNLOCK_CARD=1)
+endif
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_INFER)$(CK_PI5_PCIE)$(CK_PI5_NET)$(CK_PI5_FACT)$(CK_PI5_LIFECYCLE)$(CK_SERVICE)$(CK_HARDWARE_STAGING)$(CK_TEST_FWCFG_ARTIFACTS)),)
+$(error CK_PI5_AGENT cannot be combined with CK_PI5_STORE, CK_PI5_INFER, CK_PI5_PCIE, CK_PI5_NET, CK_PI5_FACT, CK_PI5_LIFECYCLE, CK_SERVICE, CK_HARDWARE_STAGING or CK_TEST_FWCFG_ARTIFACTS)
+endif
+ifeq ($(strip $(CK_INFER_LIB)),)
+$(error CK_PI5_AGENT needs CK_INFER_LIB=<libaienos_infer_kernel.a> (use "make pi5-agent", which builds it))
+endif
+CK_EXTRA_CFLAGS += -DCK_PI5_AGENT=1 -DCK_INFER_DISK_ONLY=1 -DCK_INFER_RESIDENT=1
+endif
+
+# Pi resident-lifecycle image (CK_PI5_LIFECYCLE=1, "make pi5-lifecycle", PI5-7 cut 2, QUALIFICATION ONLY while the secret comes from the
+# card request file): the Pi unlock-card image (production-class Store opened by the Slot 1 recovery secret) plus the resident
+# production lifecycle (core/lifecycle.c: remember, prefer, update, recall, approve, status, help, N3 context assembly) plus the resident
+# inference unit (CK_INFER_LIB, model from MODEL.MAP only). Nothing reads the Pi's serial port, so the lifecycle takes its lines from the
+# card command script \EFI\AIENOS\AGENT.CMD (core/agent_cmd.h) instead of the console and then runs its stop order. The lifecycle sources
+# are the CK_SERVICE ones (-DCK_SERVICE=1 reaches only the stage sources, see the service block below); the secret still comes from the
+# card (unlock and rotate are not script verbs). Needs CK_PI5_UNLOCK=1, CK_PI5_UNLOCK_CARD=1 and CK_INFER_LIB, refuses every other tier
+# flag and has its own OUT.
+CK_PI5_LIFECYCLE ?=
+ifneq ($(strip $(CK_PI5_LIFECYCLE)),)
+ifneq ($(strip $(CK_PI5_LIFECYCLE)),1)
+$(error CK_PI5_LIFECYCLE must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_UNLOCK))$(strip $(CK_PI5_UNLOCK_CARD)),11)
+$(error CK_PI5_LIFECYCLE (resident lifecycle, QUALIFICATION ONLY) needs CK_PI5_UNLOCK=1 and CK_PI5_UNLOCK_CARD=1)
+endif
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_INFER)$(CK_PI5_PCIE)$(CK_PI5_NET)$(CK_PI5_FACT)$(CK_PI5_AGENT)$(CK_SERVICE)$(CK_SERVICE_TEST_KEYS)$(CK_HARDWARE_STAGING)$(CK_TEST_FWCFG_ARTIFACTS)),)
+$(error CK_PI5_LIFECYCLE cannot be combined with CK_PI5_STORE, CK_PI5_INFER, CK_PI5_PCIE, CK_PI5_NET, CK_PI5_FACT, CK_PI5_AGENT, CK_SERVICE, CK_SERVICE_TEST_KEYS, CK_HARDWARE_STAGING or CK_TEST_FWCFG_ARTIFACTS)
+endif
+ifeq ($(strip $(CK_INFER_LIB)),)
+$(error CK_PI5_LIFECYCLE needs CK_INFER_LIB=<libaienos_infer_kernel.a> (use "make pi5-lifecycle", which builds it))
+endif
+CK_EXTRA_CFLAGS += -DCK_PI5_LIFECYCLE=1 -DCK_INFER_DISK_ONLY=1 -DCK_INFER_RESIDENT=1
+endif
+# EL0 artifact qualification image (CK_ARTIFACT_CARD=1, "make pi5-artifact" for the Pi, PI5-7 cut 3, QUALIFICATION ONLY, TEST keys only):
+# the plain core image (no Store stage, no NVMe) whose signed artifact candidates come from ONE card file, \EFI\AIENOS\ARTIFACT.BND
+# (core/artifact_card.h, read by native/boot/efi_artifact.c), and which trusts the RFC 8032 TEST 1 public key only
+# (CK_SEED0B_TEST_ANCHOR=1, forced by CK_PI5_ARTIFACT=1; the image prints "artifact_trust: ... TEST ONLY"). CK_PI5_ARTIFACT=1 is the Pi
+# image (CK_PI5=1); CK_ARTIFACT_CARD=1 CK_SEED0B_TEST_ANCHOR=1 alone is its QEMU twin (scripts/qemu_ck_artifact_card_test.sh). Both
+# refuse every other tier flag (so the other images refuse it too) and the "full" image (its Store stage owns the same hook), and each
+# has its own OUT. No other image changes: the code is behind -DCK_ARTIFACT_CARD.
+CK_ARTIFACT_CARD ?=
+CK_PI5_ARTIFACT ?=
+ifneq ($(strip $(CK_PI5_ARTIFACT)),)
+ifneq ($(strip $(CK_PI5_ARTIFACT)),1)
+$(error CK_PI5_ARTIFACT must be empty or 1)
+endif
+CK_ARTIFACT_CARD := 1
+CK_PI5 := 1
+CK_SEED0B_TEST_ANCHOR := 1
+OUT ?= $(REPO)/target/native-kernel-pi5-artifact
+endif
+ifneq ($(strip $(CK_ARTIFACT_CARD)),)
+ifneq ($(strip $(CK_ARTIFACT_CARD)),1)
+$(error CK_ARTIFACT_CARD must be empty or 1)
+endif
+ifeq ($(strip $(CK_SEED0B_TEST_ANCHOR)),)
+$(error CK_ARTIFACT_CARD (card artifact bundle, QUALIFICATION ONLY) needs CK_SEED0B_TEST_ANCHOR=1: it only ever trusts the public TEST key)
+endif
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_INFER)$(CK_PI5_PCIE)$(CK_PI5_NET)$(CK_PI5_UNLOCK)$(CK_PI5_UNLOCK_CARD)$(CK_PI5_FACT)$(CK_PI5_AGENT)$(CK_PI5_LIFECYCLE)$(CK_SERVICE)$(CK_SERVICE_TEST_KEYS)$(CK_HARDWARE_STAGING)$(CK_TEST_FWCFG_ARTIFACTS)$(CK_INFER_LIB)),)
+$(error CK_ARTIFACT_CARD / CK_PI5_ARTIFACT cannot be combined with CK_PI5_STORE, CK_PI5_INFER, CK_PI5_PCIE, CK_PI5_NET, CK_PI5_UNLOCK, CK_PI5_UNLOCK_CARD, CK_PI5_FACT, CK_PI5_AGENT, CK_PI5_LIFECYCLE, CK_SERVICE, CK_SERVICE_TEST_KEYS, CK_HARDWARE_STAGING, CK_TEST_FWCFG_ARTIFACTS or CK_INFER_LIB)
+endif
+ifneq ($(filter full,$(MAKECMDGOALS)),)
+$(error CK_ARTIFACT_CARD / CK_PI5_ARTIFACT build the core image only: the "full" image's Store stage owns the artifact hook)
+endif
+OUT ?= $(REPO)/target/native-kernel-artifact-card
+CK_EXTRA_CFLAGS += -DCK_ARTIFACT_CARD=1
+endif
+# Pi 5 ALLEN exam image (CK_PI5_ALLEN=1, "make pi5-allen", PI5-8 cut K, QUALIFICATION ONLY): the plain Pi image plus the
+# ALLEN exam stage (CK_ALLEN below). Own OUT; every other image carries none of this code.
+CK_PI5_ALLEN ?=
+ifneq ($(strip $(CK_PI5_ALLEN)),)
+ifneq ($(strip $(CK_PI5_ALLEN)),1)
+$(error CK_PI5_ALLEN must be empty or 1)
+endif
+CK_ALLEN := 1
+CK_PI5 := 1
+OUT ?= $(REPO)/target/native-kernel-pi5-allen
+endif
+# ALLEN exam stage (CK_ALLEN=1, PI5-8 cut K): links the ALLEN REFLEX decision core (CK_ALLEN_LIB=<liballen_reflex_kernel.a>,
+# crates/allen-reflex-kernel) and compiles core/allen.c, core/allen_gate.c (+ the card command parser and the lifecycle
+# state machine it judges with) and the UEFI stub's exam file reader (native/boot/efi_allen.c). The core image only: no
+# Store stage, no service, nothing written. Without CK_PI5 it is the QEMU twin (scripts/qemu_ck_allen_reflex_test.sh).
+# CK_ALLEN_HEAP_KIB sets the Rust heap region (default 32768 KiB = 32 MiB; the QEMU twin also builds a small one to prove
+# that exhaustion stops the run). Not combinable with another Rust staticlib (CK_INFER_LIB, CK_RUST_LIBS: two Rust
+# staticlibs duplicate compiler_builtins) or with any other tier.
+CK_ALLEN ?=
+CK_ALLEN_HEAP_KIB ?= 32768
+ifneq ($(strip $(CK_ALLEN)),)
+ifneq ($(strip $(CK_ALLEN)),1)
+$(error CK_ALLEN must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_INFER)$(CK_PI5_PCIE)$(CK_PI5_NET)$(CK_PI5_UNLOCK)$(CK_PI5_UNLOCK_CARD)$(CK_PI5_FACT)$(CK_PI5_AGENT)$(CK_PI5_LIFECYCLE)$(CK_PI5_ARTIFACT)$(CK_ARTIFACT_CARD)$(CK_SERVICE)$(CK_SERVICE_TEST_KEYS)$(CK_HARDWARE_STAGING)$(CK_TEST_FWCFG_ARTIFACTS)$(CK_INFER_LIB)$(CK_RUST_LIBS)),)
+$(error CK_ALLEN / CK_PI5_ALLEN cannot be combined with CK_PI5_STORE, CK_PI5_INFER, CK_PI5_PCIE, CK_PI5_NET, CK_PI5_UNLOCK, CK_PI5_UNLOCK_CARD, CK_PI5_FACT, CK_PI5_AGENT, CK_PI5_LIFECYCLE, CK_PI5_ARTIFACT, CK_ARTIFACT_CARD, CK_SERVICE, CK_SERVICE_TEST_KEYS, CK_HARDWARE_STAGING, CK_TEST_FWCFG_ARTIFACTS, CK_INFER_LIB or CK_RUST_LIBS)
+endif
+ifeq ($(strip $(CK_ALLEN_LIB)),)
+$(error CK_ALLEN needs CK_ALLEN_LIB=<liballen_reflex_kernel.a> (use "make pi5-allen", which builds it))
+endif
+ifneq ($(filter full,$(MAKECMDGOALS)),)
+$(error CK_ALLEN / CK_PI5_ALLEN build the core image only: no Store stage)
+endif
+ifeq ($(shell echo '$(CK_ALLEN_HEAP_KIB)' | grep -xE '[1-9][0-9]{0,6}'),)
+$(error CK_ALLEN_HEAP_KIB must be a whole number of KiB, 1..9999999)
+endif
+OUT ?= $(REPO)/target/native-kernel-allen
+CK_EXTRA_CFLAGS += -DCK_ALLEN=1 -DCK_ALLEN_HEAP_KIB=$(CK_ALLEN_HEAP_KIB)
+endif
+CK_PI5 ?=
+ifneq ($(strip $(CK_PI5)),)
+ifneq ($(strip $(CK_PI5)),1)
+$(error CK_PI5 must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_PI5 cannot be combined with CK_HARDWARE_STAGING)
+endif
+OUT ?= $(REPO)/target/native-kernel-pi5
+CK_EXTRA_CFLAGS += -DCK_PI5=1 -DCK_KLOG=1
+endif
+
+# Storage-free attended Spark input image. Compose the existing device stage,
+# never NVMe/Store/Allen. The bounded boot shell is used; the sustained
+# CK_CONSOLE_SESSION image remains QEMU-only.
+CK_SPARK_INPUT ?=
+ifneq ($(strip $(CK_SPARK_INPUT)),)
+ifneq ($(strip $(CK_SPARK_INPUT)),1)
+$(error CK_SPARK_INPUT must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5)$(CK_SERVICE)$(CK_CONSOLE_SESSION)$(CK_B7B_PROBE)$(CK_INFER_LIB)$(CK_RUST_LIBS)$(CK_QEMU_UNSAFE_DMA)$(CK_TEST_XHCI_MUTATION)$(CK_TEST_CONSOLE_MUTATION)$(CK_TEST_FWCFG_ARTIFACTS)$(CK_TEST_STORE_CRASH)$(CK_TEST_CONTINUITY)$(CK_ARTIFACT_CARD)),)
+$(error CK_SPARK_INPUT is storage-free and cannot be combined with another image variant)
+endif
+CK_RTL8127 := 1
+OUT ?= $(REPO)/target/native-kernel-spark-input
+CK_EXTRA_CFLAGS += -DCK_SPARK_INPUT=1
+endif
+
+# Spark attended boot #2 (L198): `make full CK_RTL8127=1` ($(OUT)/full/BOOTAA64.EFI)
+# binds the Realtek RTL8127 10 GbE (dev/rtl8127_bind.c) in the devices stage and sends the console log as UDP
+# broadcasts (tag AIENUX-SPARK-REPORT, port 47031). Empty (default) in every
+# QEMU gate: the binding is compiled but never called.
+ifneq ($(strip $(CK_RTL8127)),)
+ifneq ($(strip $(CK_RTL8127)),1)
+$(error CK_RTL8127 must be empty or 1)
+endif
+ifneq ($(strip $(CK_PI5)),)
+$(error CK_RTL8127 cannot be combined with CK_PI5)
+endif
+CK_EXTRA_CFLAGS += -DCK_RTL8127=1 -DCK_KLOG=1
+endif
+
+# TEST-ONLY artifact source: CK_TEST_FWCFG_ARTIFACTS=1 compiles the QEMU fw_cfg
+# side channel (opt/aienos/artifacts) into the loader instead of the boot disk
+# Store. Every image built without it is checked to contain no fw_cfg artifact
+# code. Such an image announces itself on the console and never counts toward
+# a PASS. Its default OUT is separate so it never replaces a default image.
+CK_TEST_FWCFG_ARTIFACTS ?=
+ifneq ($(strip $(CK_TEST_FWCFG_ARTIFACTS)),)
+ifneq ($(strip $(CK_TEST_FWCFG_ARTIFACTS)),1)
+$(error CK_TEST_FWCFG_ARTIFACTS must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_FWCFG_ARTIFACTS (QEMU fw_cfg test source) cannot be combined with CK_HARDWARE_STAGING)
+endif
+OUT ?= $(REPO)/target/native-kernel-test-fwcfg
+endif
+
+# TEST-ONLY SMP mutation: CK_TEST_SMP_SKIP_CPU=1 builds a kernel that never
+# calls PSCI CPU_ON for one secondary core (core/smp.c) but still waits for
+# it, so the SMP gate must FAIL on it (scripts/qemu_ck_smp_test.sh
+# --mutation). Own OUT; announces itself; refused with CK_HARDWARE_STAGING
+# and with the fw_cfg test source. Default images are checked to carry no
+# trace of it (smp_check).
+CK_TEST_SMP_SKIP_CPU ?=
+ifneq ($(strip $(CK_TEST_SMP_SKIP_CPU)),)
+ifneq ($(strip $(CK_TEST_SMP_SKIP_CPU)),1)
+$(error CK_TEST_SMP_SKIP_CPU must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_SMP_SKIP_CPU (TEST-only SMP mutation) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_TEST_FWCFG_ARTIFACTS)),)
+$(error CK_TEST_SMP_SKIP_CPU cannot be combined with CK_TEST_FWCFG_ARTIFACTS)
+endif
+OUT ?= $(REPO)/target/native-kernel-test-smp-skip
+SMP_TEST_FLAGS := -DCK_TEST_SMP_SKIP_CPU=1
+else
+SMP_TEST_FLAGS :=
+endif
+CK_B7B_PROBE ?=
+CK_B7B_EVENT_READOUT ?=
+ifneq ($(strip $(CK_B7B_EVENT_READOUT)),)
+ifneq ($(strip $(CK_B7B_EVENT_READOUT)),1)
+$(error CK_B7B_EVENT_READOUT must be empty or 1)
+endif
+ifneq ($(strip $(CK_B7B_PROBE)),1)
+$(error CK_B7B_EVENT_READOUT requires CK_B7B_PROBE=1)
+endif
+OUT ?= $(REPO)/target/native-kernel-b7b-events
+SMP_TEST_FLAGS += -DCK_B7B_EVENT_READOUT=1
+endif
+# B7b preparation probe (aienos#286, core/smmu_svc.c): CK_B7B_PROBE=1 builds an
+# image that confines PCI segment 15 requester 0x100 (the Spark's GB10) once on
+# a one-page window, prints the route and SMMU_IDR0/IDR1, and unconfines. Own
+# OUT; allowed with CK_HARDWARE_STAGING (it is meant for the attended B7b
+# window); refused with CK_QEMU_UNSAFE_DMA. CK_B7B_PROBE_TEST_SEGMENT0=1
+# (TEST-ONLY, needs CK_B7B_PROBE=1) probes segment 0 for the QEMU positive path
+# and is refused with CK_HARDWARE_STAGING. Default images are checked to carry
+# no probe (b7b_check). Gate: scripts/qemu_ck_b7b_probe_test.sh.
+CK_B7B_PROBE_TEST_SEGMENT0 ?=
+ifneq ($(strip $(CK_B7B_PROBE_TEST_SEGMENT0)),)
+ifneq ($(strip $(CK_B7B_PROBE_TEST_SEGMENT0)),1)
+$(error CK_B7B_PROBE_TEST_SEGMENT0 must be empty or 1)
+endif
+ifneq ($(strip $(CK_B7B_PROBE)),1)
+$(error CK_B7B_PROBE_TEST_SEGMENT0 needs CK_B7B_PROBE=1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_B7B_PROBE_TEST_SEGMENT0 (TEST-only QEMU positive path) cannot be combined with CK_HARDWARE_STAGING)
+endif
+OUT ?= $(REPO)/target/native-kernel-test-b7b-seg0
+SMP_TEST_FLAGS += -DCK_B7B_PROBE_TEST_SEGMENT0=1
+endif
+ifneq ($(strip $(CK_B7B_PROBE)),)
+ifneq ($(strip $(CK_B7B_PROBE)),1)
+$(error CK_B7B_PROBE must be empty or 1)
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),)
+$(error CK_B7B_PROBE cannot be combined with CK_QEMU_UNSAFE_DMA)
+endif
+OUT ?= $(REPO)/target/native-kernel-b7b-probe
+SMP_TEST_FLAGS += -DCK_B7B_PROBE=1
+endif
+# TEST-ONLY stale handoff (AIENOS_CK_SCREEN negative control,
+# scripts/qemu_ck_screen_test.sh): the stub hands the kernel a CHANDOF2 magic;
+# the kernel must refuse it ("panic: handoff: unsupported version 2 ...").
+# Own OUT; announces itself; refused with CK_HARDWARE_STAGING. The default
+# image is checked to carry no trace of it ($(ELF) rule).
+CK_TEST_STALE_HANDOFF ?=
+ifneq ($(strip $(CK_TEST_STALE_HANDOFF)),)
+ifneq ($(strip $(CK_TEST_STALE_HANDOFF)),2)
+$(error CK_TEST_STALE_HANDOFF must be empty or 2)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_STALE_HANDOFF (TEST-only stale handoff) cannot be combined with CK_HARDWARE_STAGING)
+endif
+OUT ?= $(REPO)/target/native-kernel-test-stale-handoff
+SMP_TEST_FLAGS += -DCK_TEST_STALE_HANDOFF=2
+endif
+# TEST-ONLY rollback candidates (CK gate M0_ROLLBACK,
+# scripts/qemu_ck_rollback_test.sh; docs/BOOT_HANDOFF_CONTRACT.md 7.1 rows 43-44):
+#   bad-magic  the stub flips one bit of the handoff magic after
+#              ExitBootServices; the kernel must panic "handoff: bad magic"
+#   cpu-fault  after "kernel: alive" the kernel executes BRK at EL1; the
+#              fault report must print and the kernel must reset
+#   hang       after "kernel: alive" the kernel prints one marker and spins
+#              with interrupts masked; only an outside reset ends it
+# Own OUT; announces itself; refused with CK_HARDWARE_STAGING. The default
+# image is checked to carry no trace of it (rollback_check).
+CK_TEST_ROLLBACK ?=
+ifneq ($(strip $(CK_TEST_ROLLBACK)),)
+ifeq ($(filter $(strip $(CK_TEST_ROLLBACK)),bad-magic cpu-fault hang),)
+$(error CK_TEST_ROLLBACK must be empty or one of bad-magic cpu-fault hang)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_ROLLBACK (TEST-only rollback candidate) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_TEST_STALE_HANDOFF)),)
+$(error CK_TEST_ROLLBACK cannot be combined with CK_TEST_STALE_HANDOFF)
+endif
+OUT ?= $(REPO)/target/native-kernel-test-rollback-$(strip $(CK_TEST_ROLLBACK))
+SMP_TEST_FLAGS += -DCK_TEST_ROLLBACK_$(subst -,_,$(shell echo '$(strip $(CK_TEST_ROLLBACK))' | tr a-z A-Z))=1
+endif
+# AIENOS-NATIVE-PIPE-1 (aienos-mv#428): CK_PIPE_TEST=1 adds the TEST-ONLY pipe self-test (core/pipe_test.c, gate
+# scripts/qemu_ck_pipe_test.sh): after "kernel: alive" it drives the pipe primitive (core/pipe.c) with a producer and a
+# consumer task through the scheduler and prints pipe_check lines. Own OUT; announces itself; refused with
+# CK_HARDWARE_STAGING and CK_SERVICE. Default images are checked to carry no trace of it (pipe_check).
+CK_PIPE_TEST ?=
+ifneq ($(strip $(CK_PIPE_TEST)),)
+ifneq ($(strip $(CK_PIPE_TEST)),1)
+$(error CK_PIPE_TEST must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_PIPE_TEST (TEST-only pipe self-test) cannot be combined with CK_HARDWARE_STAGING)
+endif
+OUT ?= $(REPO)/target/native-kernel-test-pipe
+SMP_TEST_FLAGS += -DCK_PIPE_TEST=1
+endif
+# SLOTLDR.EFI trusted keys (native v1 plan P11 cut 2a; native/boot/slot_loader.c,
+# make slot-loader):
+#   CK_SLOT_KEYS=<file>  owner public keys, "owner_root_ed25519 <64 hex>" lines
+#                        (tools/ck_owner_gen.c format; ck_slot_tool keys-c refuses
+#                        every known TEST key)
+#   CK_TEST_SLOT_KEY=1   TEST-ONLY: RFC 8032 TEST 1; the loader prints
+#                        "slot_loader: TEST-ONLY key ..."; refused with
+#                        CK_HARDWARE_STAGING and together with CK_SLOT_KEYS.
+# Checked here, before the hardware staging owner-file checks, so the refusal
+# names the TEST key itself.
+CK_SLOT_KEYS ?=
+CK_TEST_SLOT_KEY ?=
+ifneq ($(strip $(CK_TEST_SLOT_KEY)),)
+ifneq ($(strip $(CK_TEST_SLOT_KEY)),1)
+$(error CK_TEST_SLOT_KEY must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_SLOT_KEY (TEST-ONLY slot loader key) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_SLOT_KEYS)),)
+$(error CK_TEST_SLOT_KEY and CK_SLOT_KEYS are exclusive: one trusted key source per slot loader)
+endif
+endif
+
+OUT ?= $(REPO)/target/native-kernel
+# Pi builds only (CK_PI5=1: "make pi5" and anything built on it): when a tracked
+# file differs from HEAD the stamp ends in "-dirty", so the kernel's report
+# ("aienos_commit: <stamp>") and the EFI itself say the image is not the bare
+# commit. Pi hardware runs are cited as evidence; a bare hash on an image built
+# from an edited tree would name a commit that does not contain its source.
+# Untracked files are ignored (build output lives in untracked target/).
+# Non-Pi builds are untouched: the suffix stays empty and git status is not run
+# (the QEMU gates compare "aienos_commit: <HEAD>"). An AIENOS_COMMIT given on
+# the command line or in the environment is used as is, with no suffix.
+AIENOS_COMMIT_SUFFIX :=
+ifeq ($(strip $(CK_PI5)),1)
+ifneq ($(strip $(shell GIT_OPTIONAL_LOCKS=0 git -C $(REPO) status --porcelain --untracked-files=no 2>/dev/null)),)
+AIENOS_COMMIT_SUFFIX := -dirty
+endif
+endif
+AIENOS_COMMIT ?= $(shell git -C $(REPO) rev-parse HEAD 2>/dev/null || echo unknown)$(AIENOS_COMMIT_SUFFIX)
+
+CK_EXTRA_CFLAGS ?=
+# Build-time DMA policy for the full image (see dev/nvme_bind.c):
+# default SMMU-confined or refuse; 1 = TEST-ONLY QEMU unconfined bypass when
+# no SMMU exists. Never with hardware staging.
+CK_QEMU_UNSAFE_DMA ?=
+CK_HARDWARE_STAGING ?=
+
+# FP/SIMD probe (aienos#34 lane 0): CK_RUST_LIBS=<path to libaienos_fpu_probe.a>
+# links that Rust no_std staticlib into the image and compiles core/fpu.c's
+# probe (-DCK_FPU_PROBE=1). The C compile flags stay -mgeneral-regs-only; only
+# the Rust unit uses FP/SIMD. Empty (default) = no Rust, no FP code. QEMU
+# gate only: never combined with hardware staging.
+CK_RUST_LIBS ?=
+ifneq ($(strip $(CK_RUST_LIBS)),)
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_RUST_LIBS (FP probe, QEMU gate only) cannot be combined with CK_HARDWARE_STAGING)
+endif
+CK_EXTRA_CFLAGS += -DCK_FPU_PROBE=1
+endif
+
+# Inference ingest probe (aienos#34 lane 4): CK_INFER_LIB=<path to
+# libaienos_infer_kernel.a> links that Rust no_std staticlib (aienos-infer +
+# bump allocator) and compiles core/infer.c (-DCK_INFER_PROBE=1): the kernel
+# ingests a GGUF from the boot disk (MODEL.MAP, read by the UEFI stub) or, in
+# the QEMU images only, from fw_cfg, and calls the Rust unit. C flags stay
+# -mgeneral-regs-only. Not combinable with CK_RUST_LIBS (two Rust staticlibs
+# would duplicate compiler_builtins).
+# The same image then runs the bounded session API (native v1 P06:
+# open/prompt/step/cancel/close in crates/aienos-infer-kernel/src/session.rs).
+#
+# Hardware staging (native v1 P06 / gate N3, aienos#34): exactly one inference
+# image may be built with CK_HARDWARE_STAGING, the resident production service
+# image
+#   make full CK_SERVICE=1 CK_HARDWARE_STAGING=1 CK_OWNER_PUBKEYS=<file>
+#        CK_MACHINE_ID=<file> CK_INFER_LIB=<lib>
+# It gets -DCK_INFER_DISK_ONLY=1: the QEMU fw_cfg ingest is compiled out (the
+# fwcfg_check below requires no fw_cfg code or string in the image), and with
+# no MODEL.MAP the kernel refuses instead of looking anywhere else. The
+# one-shot probe image (no CK_SERVICE) stays QEMU only.
+CK_INFER_LIB ?=
+ifneq ($(strip $(CK_INFER_LIB)),)
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+ifneq ($(strip $(CK_SERVICE)),1)
+$(error CK_INFER_LIB with CK_HARDWARE_STAGING needs CK_SERVICE=1: only the resident service image (boot-disk model, MODEL.MAP) is a hardware inference image; the one-shot probe stays QEMU only)
+endif
+CK_EXTRA_CFLAGS += -DCK_INFER_DISK_ONLY=1
+endif
+ifneq ($(strip $(CK_RUST_LIBS)),)
+$(error CK_INFER_LIB and CK_RUST_LIBS cannot be combined: two Rust staticlibs duplicate compiler_builtins)
+endif
+CK_EXTRA_CFLAGS += -DCK_INFER_PROBE=1
+# native v1 P06 cut 2: in a service image the model and one bounded session
+# stay resident for the lifecycle's `prompt` verb (core/lifecycle.c) instead
+# of running the one-shot probe. Model source: the boot disk (MODEL.MAP); the
+# QEMU test images also keep the TEST-ONLY fw_cfg fallback.
+ifeq ($(strip $(CK_SERVICE)),1)
+CK_EXTRA_CFLAGS += -DCK_INFER_RESIDENT=1
+endif
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),)
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_QEMU_UNSAFE_DMA (unconfined DMA, QEMU debug only) cannot be combined with CK_HARDWARE_STAGING: no SMMU confinement means no DMA)
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),1)
+$(error CK_QEMU_UNSAFE_DMA must be empty or 1)
+endif
+endif
+
+# TEST-ONLY xHCI DMA fence mutations (dev/xhci_fence.h), for the self-test of
+# scripts/qemu_ck_keyboard_test.sh --mutation only: each one breaks one
+# keyboard DMA-safety row on purpose. Own FULL_NAME, never a hardware image.
+CK_TEST_XHCI_MUTATION ?=
+ifneq ($(strip $(CK_TEST_XHCI_MUTATION)),)
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_XHCI_MUTATION (TEST-ONLY xHCI DMA fence mutation) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),)
+$(error CK_TEST_XHCI_MUTATION cannot be combined with CK_QEMU_UNSAFE_DMA)
+endif
+XHCI_MUT_NUM := $(if $(filter bm-left-on,$(CK_TEST_XHCI_MUTATION)),1,$(if $(filter no-revoke,$(CK_TEST_XHCI_MUTATION)),2,$(if $(filter grant-no-smmu,$(CK_TEST_XHCI_MUTATION)),3,$(if $(filter no-sweep,$(CK_TEST_XHCI_MUTATION)),4,))))
+ifeq ($(XHCI_MUT_NUM),)
+$(error CK_TEST_XHCI_MUTATION must be one of bm-left-on no-revoke grant-no-smmu no-sweep)
+endif
+endif
+
+# TEST-ONLY console session (C3-1a, dev/devices.c ck_stage_console_session):
+# CK_CONSOLE_SESSION=1 adds a final boot stage that keeps taking serial and USB
+# keyboard input until the shell's "exit". QEMU test image only: own FULL_NAME,
+# refused with CK_HARDWARE_STAGING and CK_QEMU_UNSAFE_DMA. The default image
+# carries none of it. CK_TEST_CONSOLE_MUTATION=bm-left-on-after-exit (needs
+# CK_CONSOLE_SESSION=1) leaves the xHCI bus master on after the session exit,
+# for the CONSOLE gate's red-before-green self-test.
+CK_CONSOLE_SESSION ?=
+CK_TEST_CONSOLE_MUTATION ?=
+ifneq ($(strip $(CK_CONSOLE_SESSION)),)
+ifneq ($(strip $(CK_CONSOLE_SESSION)),1)
+$(error CK_CONSOLE_SESSION must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_CONSOLE_SESSION (QEMU test console session) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),)
+$(error CK_CONSOLE_SESSION cannot be combined with CK_QEMU_UNSAFE_DMA)
+endif
+ifneq ($(strip $(CK_TEST_XHCI_MUTATION)),)
+$(error CK_CONSOLE_SESSION cannot be combined with CK_TEST_XHCI_MUTATION)
+endif
+endif
+ifneq ($(strip $(CK_TEST_CONSOLE_MUTATION)),)
+ifneq ($(strip $(CK_TEST_CONSOLE_MUTATION)),bm-left-on-after-exit)
+$(error CK_TEST_CONSOLE_MUTATION must be bm-left-on-after-exit)
+endif
+ifneq ($(strip $(CK_CONSOLE_SESSION)),1)
+$(error CK_TEST_CONSOLE_MUTATION needs CK_CONSOLE_SESSION=1)
+endif
+endif
+
+# CK_SERVICE=1 builds the resident production lifecycle image (core/lifecycle.c,
+# native v1 plan P03): after every boot stage the kernel serves bounded operator
+# requests on the serial console until "shutdown" (Store closed, NVMe released,
+# then reset), instead of resetting at once. Own OUT subdirectory full-service/.
+# Allowed with CK_HARDWARE_STAGING (it is the production entry); refused with
+# every TEST-only flag. The production key source refuses today, so this image
+# stays LOCKED. CK_SERVICE_TEST_KEYS=1 (TEST-ONLY, full-service-testkeys/, only
+# scripts/qemu_ck_lifecycle_test.sh) opens the Store with the TEST keys so the
+# ready/serve/commit paths run in QEMU; refused with CK_HARDWARE_STAGING.
+CK_SERVICE ?=
+CK_SERVICE_TEST_KEYS ?=
+ifneq ($(strip $(CK_SERVICE)),)
+ifneq ($(strip $(CK_SERVICE)),1)
+$(error CK_SERVICE must be empty or 1)
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),)
+$(error CK_SERVICE cannot be combined with CK_QEMU_UNSAFE_DMA)
+endif
+ifneq ($(strip $(CK_CONSOLE_SESSION)),)
+$(error CK_SERVICE cannot be combined with CK_CONSOLE_SESSION)
+endif
+ifneq ($(strip $(CK_TEST_XHCI_MUTATION)$(CK_TEST_STORE_CRASH)$(CK_TEST_CONTINUITY)$(CK_TEST_FWCFG_ARTIFACTS)$(CK_TEST_SMP_SKIP_CPU)$(CK_TEST_ROLLBACK)$(CK_TEST_STALE_HANDOFF)$(CK_TEST_DISK_XLATE_BYPASS)$(CK_PIPE_TEST)),)
+$(error CK_SERVICE cannot be combined with a CK_TEST_* flag)
+endif
+endif
+ifneq ($(strip $(CK_SERVICE_TEST_KEYS)),)
+ifneq ($(strip $(CK_SERVICE_TEST_KEYS)),1)
+$(error CK_SERVICE_TEST_KEYS must be empty or 1)
+endif
+ifneq ($(strip $(CK_SERVICE)),1)
+$(error CK_SERVICE_TEST_KEYS needs CK_SERVICE=1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_SERVICE_TEST_KEYS (TEST keys) cannot be combined with CK_HARDWARE_STAGING)
+endif
+endif
+
+# TEST-ONLY Store crash hook (svc/store_crash.h; only
+# scripts/qemu_ck_store_crash_test.sh sets it): the Store stage reads a crash
+# plan from the scratch unit, runs on a volatile write cache and halts at the
+# planned checkpoint. Own OUT subdirectory; announces itself; never counts
+# toward a PASS of M4_STORE; refused with CK_HARDWARE_STAGING and
+# CK_QEMU_UNSAFE_DMA. CK_TEST_STORE_CRASH_MUTANT (only with it) builds a
+# deliberately broken Store the crash gate must catch:
+#   skip_root_flush      no flush between the commit record and the root write
+#   accept_bad_root_crc  superblock CRC never checked
+CK_TEST_STORE_CRASH ?=
+CK_TEST_STORE_CRASH_MUTANT ?=
+ifneq ($(strip $(CK_TEST_STORE_CRASH)),)
+ifneq ($(strip $(CK_TEST_STORE_CRASH)),1)
+$(error CK_TEST_STORE_CRASH must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_STORE_CRASH (TEST-ONLY Store crash hook) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),)
+$(error CK_TEST_STORE_CRASH (TEST-ONLY Store crash hook) cannot be combined with CK_QEMU_UNSAFE_DMA)
+endif
+endif
+ifneq ($(strip $(CK_TEST_STORE_CRASH_MUTANT)),)
+ifneq ($(strip $(CK_TEST_STORE_CRASH)),1)
+$(error CK_TEST_STORE_CRASH_MUTANT needs CK_TEST_STORE_CRASH=1 (TEST-ONLY))
+endif
+ifeq ($(strip $(CK_TEST_STORE_CRASH_MUTANT)),skip_root_flush)
+STORE_MUTANT_FLAGS := -DCK_TEST_STORE_MUTANT_SKIP_ROOT_FLUSH=1
+else ifeq ($(strip $(CK_TEST_STORE_CRASH_MUTANT)),accept_bad_root_crc)
+STORE_MUTANT_FLAGS := -DCK_TEST_STORE_MUTANT_ACCEPT_BAD_ROOT_CRC=1
+else
+$(error CK_TEST_STORE_CRASH_MUTANT must be skip_root_flush or accept_bad_root_crc)
+endif
+endif
+
+
+# TEST-ONLY continuity / Recovery Core mode selection (svc/continuity_boot.h,
+# contract K-7; only scripts/qemu_ck_continuity_test.sh and
+# scripts/qemu_ck_recovery_test.sh set it): the Store stage reads a mode plan
+# from the scratch unit and runs the continuity or Recovery Core wiring instead
+# of the boot-record commit. Own OUT subdirectory; announces itself; refused
+# with CK_HARDWARE_STAGING, CK_QEMU_UNSAFE_DMA and CK_TEST_STORE_CRASH.
+# CK_TEST_CONTINUITY_MUTANT (only with it) builds a deliberately broken
+# continuity layer the gates must catch:
+#   resume_no_commit             resume does not commit the new incarnation
+#   resume_provisions            resume mints an identity on an unprovisioned Store
+#   degraded_is_unprovisioned    a degraded mount reads as unprovisioned (MR-5)
+#   compare_16                   operator response compared on 16 of 32 bytes
+#   bare_sha256                  operator response is a bare SHA-256, not an HMAC
+#   subject_restore_mints        restore mints an ALLEN subject when it finds none (OS-0018)
+#   subject_accept_foreign       restore accepts a subject bound to another agent (MS-1)
+CK_TEST_CONTINUITY ?=
+CK_TEST_CONTINUITY_MUTANT ?=
+ifneq ($(strip $(CK_TEST_CONTINUITY)),)
+ifneq ($(strip $(CK_TEST_CONTINUITY)),1)
+$(error CK_TEST_CONTINUITY must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_CONTINUITY (TEST-ONLY continuity mode selection) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_QEMU_UNSAFE_DMA)),)
+$(error CK_TEST_CONTINUITY (TEST-ONLY continuity mode selection) cannot be combined with CK_QEMU_UNSAFE_DMA)
+endif
+ifneq ($(strip $(CK_TEST_STORE_CRASH)),)
+$(error CK_TEST_CONTINUITY (TEST-ONLY continuity mode selection) cannot be combined with CK_TEST_STORE_CRASH)
+endif
+endif
+ifneq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),)
+ifneq ($(strip $(CK_TEST_CONTINUITY)),1)
+$(error CK_TEST_CONTINUITY_MUTANT needs CK_TEST_CONTINUITY=1 (TEST-ONLY))
+endif
+ifeq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),resume_no_commit)
+CONT_MUTANT_FLAGS := -DCM_MUTANT_RESUME_NO_COMMIT=1
+else ifeq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),resume_provisions)
+CONT_MUTANT_FLAGS := -DCM_MUTANT_RESUME_PROVISIONS=1
+else ifeq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),degraded_is_unprovisioned)
+CONT_MUTANT_FLAGS := -DRC_MUTANT_DEGRADED_IS_UNPROVISIONED=1
+else ifeq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),compare_16)
+CONT_MUTANT_FLAGS := -DCR_MUTANT_COMPARE_16=1
+else ifeq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),bare_sha256)
+CONT_MUTANT_FLAGS := -DCR_MUTANT_BARE_SHA256=1
+else ifeq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),subject_restore_mints)
+CONT_MUTANT_FLAGS := -DCS_MUTANT_RESTORE_MINTS=1
+else ifeq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),subject_accept_foreign)
+CONT_MUTANT_FLAGS := -DCS_MUTANT_ACCEPT_FOREIGN=1
+else
+$(error CK_TEST_CONTINUITY_MUTANT must be resume_no_commit, resume_provisions, degraded_is_unprovisioned, compare_16, bare_sha256, subject_restore_mints or subject_accept_foreign)
+endif
+endif
+
+# Owner provisioning. The hardware staging image never embeds the TEST Store
+# keys, the TEST store uuid or the TEST machine id: it needs owner PUBLIC
+# material and the machine identity as files (format: tools/ck_owner_gen.c;
+# relative paths are relative to native/kernel), checked and turned into a
+# generated header that refuses every known TEST value. Nothing secret is
+# read: the production Store key source stays BLOCKED_OPERATOR
+# (svc/store_boot.c ck_store_production_keys, TRUST-1 key ceremony).
+CK_OWNER_PUBKEYS ?=
+CK_MACHINE_ID ?=
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+ifneq ($(strip $(CK_HARDWARE_STAGING)),1)
+$(error CK_HARDWARE_STAGING must be empty or 1)
+endif
+ifeq ($(strip $(CK_OWNER_PUBKEYS)),)
+$(error CK_HARDWARE_STAGING refuses the TEST Store keys and TEST machine id: give CK_OWNER_PUBKEYS=<owner public keys file> and CK_MACHINE_ID=<machine id file> (native/kernel/README.md, Owner provisioning))
+endif
+ifeq ($(strip $(CK_MACHINE_ID)),)
+$(error CK_HARDWARE_STAGING refuses the TEST Store keys and TEST machine id: give CK_OWNER_PUBKEYS=<owner public keys file> and CK_MACHINE_ID=<machine id file> (native/kernel/README.md, Owner provisioning))
+endif
+OWNER_PUBKEYS_FILE := $(abspath $(CK_OWNER_PUBKEYS))
+OWNER_MACHINE_FILE := $(abspath $(CK_MACHINE_ID))
+ifeq ($(wildcard $(OWNER_PUBKEYS_FILE)),)
+$(error CK_OWNER_PUBKEYS file not found: $(OWNER_PUBKEYS_FILE))
+endif
+ifeq ($(wildcard $(OWNER_MACHINE_FILE)),)
+$(error CK_MACHINE_ID file not found: $(OWNER_MACHINE_FILE))
+endif
+else
+ifneq ($(strip $(CK_OWNER_PUBKEYS)$(CK_MACHINE_ID)),)
+$(error CK_OWNER_PUBKEYS and CK_MACHINE_ID are only used with CK_HARDWARE_STAGING=1 (the default QEMU build keeps the labelled TEST keys))
+endif
+endif
+
+# TEST-ONLY DISK_LAYOUT mutation (dev/disk_part.h): the partition translation
+# layer is bypassed. Its own FULL_NAME; never with hardware staging.
+CK_TEST_DISK_XLATE_BYPASS ?=
+ifneq ($(strip $(CK_TEST_DISK_XLATE_BYPASS)),)
+ifneq ($(strip $(CK_TEST_DISK_XLATE_BYPASS)),1)
+$(error CK_TEST_DISK_XLATE_BYPASS must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_TEST_DISK_XLATE_BYPASS (TEST-ONLY translation bypass mutation) cannot be combined with CK_HARDWARE_STAGING)
+endif
+endif
+
+# SEED-0B qualification build: trusts the RFC 8032 TEST 1 public key only.
+# TEST ONLY; never combined with hardware staging. Use its own OUT.
+CK_SEED0B_TEST_ANCHOR ?=
+ifneq ($(strip $(CK_SEED0B_TEST_ANCHOR)),)
+ifneq ($(strip $(CK_SEED0B_TEST_ANCHOR)),1)
+$(error CK_SEED0B_TEST_ANCHOR must be empty or 1)
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_SEED0B_TEST_ANCHOR (TEST key trust) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ART_TRUST_FLAGS := -DCK_SEED0B_TEST_ANCHOR=1
+else
+ART_TRUST_FLAGS :=
+endif
+ifeq ($(strip $(CK_TEST_FWCFG_ARTIFACTS)),1)
+ART_TRUST_FLAGS += -DCK_TEST_FWCFG_ARTIFACTS=1
+endif
+# C3-3a: the launch self-test (core/osc_admit.c) runs scripted launches of the admitted units. TEST ONLY.
+CK_OSC_LAUNCH_TEST ?=
+ifeq ($(strip $(CK_OSC_LAUNCH_TEST)),1)
+ifeq ($(strip $(CK_SEED0B_TEST_ANCHOR)),)
+$(error CK_OSC_LAUNCH_TEST needs CK_SEED0B_TEST_ANCHOR=1 (it launches TEST-signed units))
+endif
+ART_TRUST_FLAGS += -DCK_OSC_LAUNCH_TEST=1
+endif
+# aienos#383: the receipt self-test variant of the launch self-test (CK_OSC_LAUNCH_TEST=1 CK_OSC_RECEIPT_TEST=1) runs
+# a fixed script of launches with valid, missing and refused realization receipts instead of the C3-3a script.
+# TEST ONLY, QEMU only.
+# The post-admission code byte flip (variant 3, ck_osc_receipt_test_code_flip in
+# core/osc_admit.c) is compiled only here, and only with its own opt-in
+# -DCK_OSC_RECEIPT_CODE_FLIP=1. Empty by default. -DCK_SEED0B_TEST_ANCHOR does
+# not enable it. Refused in a release build (no CK_SEED0B_TEST_ANCHOR), with
+# CK_HARDWARE_STAGING and with CK_SERVICE. core/osc_admit.c #errors on the same
+# combinations, and also when the receipt-test define arrives without the opt-in.
+CK_OSC_RECEIPT_TEST ?=
+ifeq ($(strip $(CK_OSC_RECEIPT_TEST)),1)
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_OSC_RECEIPT_TEST (TEST-ONLY post-admission code byte flip) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ifneq ($(strip $(CK_SERVICE)),)
+$(error CK_OSC_RECEIPT_TEST (TEST-ONLY post-admission code byte flip) cannot be combined with CK_SERVICE)
+endif
+ifeq ($(strip $(CK_SEED0B_TEST_ANCHOR)),)
+$(error CK_OSC_RECEIPT_TEST (TEST-ONLY post-admission code byte flip) cannot be compiled into a release build)
+endif
+ifneq ($(strip $(CK_OSC_LAUNCH_TEST)),1)
+$(error CK_OSC_RECEIPT_TEST needs CK_OSC_LAUNCH_TEST=1)
+endif
+ART_TRUST_FLAGS += -DCK_OSC_RECEIPT_TEST=1 -DCK_OSC_RECEIPT_CODE_FLIP=1
+endif
+# OSH-AIENOS-0: the shell-core self-test (core/osh_test.c) runs the three osh units over embedded fixture scripts and
+# prints the step trace. TEST ONLY, QEMU only; not combined with the launch self-test.
+CK_OSH_TEST ?=
+OSH_TEST_C :=
+ifeq ($(strip $(CK_OSH_TEST)),1)
+ifeq ($(strip $(CK_SEED0B_TEST_ANCHOR)),)
+$(error CK_OSH_TEST needs CK_SEED0B_TEST_ANCHOR=1 (it launches TEST-signed units))
+endif
+ifeq ($(strip $(CK_OSC_LAUNCH_TEST)),1)
+$(error CK_OSH_TEST and CK_OSC_LAUNCH_TEST are exclusive)
+endif
+ART_TRUST_FLAGS += -DCK_OSH_TEST=1
+OSH_TEST_C := $(KDIR)/core/osh_test.c
+# OSH-AIENOS-OP: instead of the fixture traces, drive a real capability-authorized operation (core/osh_op.c) through the same shell units.
+CK_OSH_OP_TEST ?=
+ifeq ($(strip $(CK_OSH_OP_TEST)),1)
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+$(error CK_OSH_OP_TEST (test-only OSH adapter with injection hooks) cannot be combined with CK_HARDWARE_STAGING)
+endif
+ART_TRUST_FLAGS += -DCK_OSH_OP_TEST=1
+OSH_TEST_C += $(KDIR)/core/osh_op.c
+endif
+endif
+
+# Screen hold before reset (core/console.c ck_console_fb_hold): seconds the
+# GOP framebuffer console keeps the last report on screen before the PSCI
+# reset, so an operator can read or photograph it. 0 (default) in every QEMU
+# gate; scripts/stage_one_time_boot_ck.sh builds the hardware image with 120.
+# CK_BOOT_SHOW=1: the image plays the boot sequence (ui/boot_show.c: the night, the two black holes,
+# the chirp) on its screen after the devices stage: the VM screen (virtio-gpu) and speakers (virtio-sound)
+# when present, else the GOP framebuffer. Compiled into every image; on for the images people use (the
+# aienos-run VM, PC and Spark images), off by default so the QEMU gates keep their timing.
+CK_BOOT_SHOW ?= 0
+ifeq ($(filter 0 1,$(CK_BOOT_SHOW)),)
+$(error CK_BOOT_SHOW must be 0 or 1)
+endif
+CK_FB_HOLD_S ?= 0
+ifeq ($(shell echo '$(CK_FB_HOLD_S)' | grep -Ex '[0-9]{1,4}'),)
+$(error CK_FB_HOLD_S must be 0..9999 seconds)
+endif
+
+KINC := -I$(KDIR)/include -I$(KDIR)/core -I$(KDIR)/mm -I$(KDIR)/arch -I$(BOOT)
+MODULE_INC := -I$(NATIVE)/disk -I$(NATIVE)/store -I$(NATIVE)/m5 -I$(NATIVE)/crypto \
+	-I$(NATIVE)/capability -I$(NATIVE)/argus -I$(NATIVE)/net
+KCFLAGS := -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib -fno-builtin \
+	-fno-stack-protector -fno-tree-loop-distribute-patterns -mstrict-align \
+	-mgeneral-regs-only -mno-outline-atomics -fno-asynchronous-unwind-tables -fpie \
+	-fvisibility=hidden -fno-plt $(KINC) $(SMP_TEST_FLAGS) -DCK_FB_HOLD_S=$(CK_FB_HOLD_S) -DCK_BOOT_SHOW=$(CK_BOOT_SHOW) $(CK_EXTRA_CFLAGS)
+# After CK_EXTRA_CFLAGS. gcc keeps the last -D/-U, so a -U in extra cflags
+# cannot drop this. Set on every build that is not the qualification anchor.
+# Nothing else reads it. osc_admit.c #errors if the code flip is combined with it.
+ifeq ($(strip $(CK_SEED0B_TEST_ANCHOR)),)
+KCFLAGS += -DCK_RELEASE_IMAGE=1
+endif
+KLDFLAGS := -nostdlib -pie --no-dynamic-linker -z norelro -z noexecstack -z max-page-size=4096 --no-warn-rwx-segments \
+	-T $(BOOT)/image.ld
+
+CORE_C := $(BOOT)/efi_main.c $(BOOT)/efi_model.c $(BOOT)/efi_gop.c \
+	$(KDIR)/arch/exception.c $(KDIR)/arch/gic.c $(KDIR)/arch/timer.c \
+	$(KDIR)/core/acpi.c $(KDIR)/core/acpi_dev.c $(KDIR)/core/acpi_platform.c $(KDIR)/core/console.c $(KDIR)/core/fbcon.c $(KDIR)/core/fmt.c \
+	$(KDIR)/core/kmain.c $(KDIR)/core/handoff_check.c $(KDIR)/core/libc_min.c $(KDIR)/core/report.c \
+	$(KDIR)/core/smmu.c $(KDIR)/core/smmu_svc.c $(KDIR)/core/sched.c $(KDIR)/core/ipc.c \
+	$(KDIR)/core/fpu.c $(KDIR)/core/cpufeat.c $(KDIR)/core/infer.c $(KDIR)/core/allen.c $(KDIR)/core/m3.c $(KDIR)/core/entropy.c $(KDIR)/arch/rndr.c $(KDIR)/core/smp.c \
+	$(KDIR)/mm/frames.c $(KDIR)/mm/heap.c $(KDIR)/mm/mmu.c $(KDIR)/mm/pt.c
+ifeq ($(strip $(CK_PI5)),1)
+CORE_C += $(BOOT)/efi_klog.c $(KDIR)/core/pi5.c $(KDIR)/core/pi5_marker.c $(KDIR)/dev/disk_part.c $(KDIR)/core/klog.c $(KDIR)/core/klog_slot.c \
+	$(KDIR)/dev/pi5_wdt.c $(KDIR)/dev/pi5_rng.c $(NATIVE)/disk/disk.c $(NATIVE)/disk/disk_sdhci.c
+endif
+ifeq ($(strip $(CK_RTL8127)),1)
+CORE_C += $(KDIR)/core/klog.c
+endif
+ifeq ($(strip $(CK_PI5_PCIE)),1)
+CORE_C += $(KDIR)/dev/pi5_pcie.c $(KDIR)/dev/dma_window.c
+endif
+ifeq ($(strip $(CK_PI5_NET)),1)
+CORE_C += $(KDIR)/dev/pi5_pcie.c $(KDIR)/dev/dma_window.c $(KDIR)/dev/pi5_net.c $(KDIR)/dev/pi5_gem.c
+endif
+ifneq ($(strip $(CK_PI5_UNLOCK_CARD)),)
+CORE_C += $(BOOT)/efi_unlock.c $(KDIR)/core/unlock_req.c
+endif
+ifneq ($(strip $(CK_PI5_FACT)),)
+CORE_C += $(BOOT)/efi_fact.c $(KDIR)/core/fact_req.c
+endif
+ifneq ($(strip $(CK_PI5_LIFECYCLE)),)
+CORE_C += $(BOOT)/efi_agentcmd.c $(KDIR)/core/agent_cmd.c
+endif
+ifneq ($(strip $(CK_ALLEN)),)
+CORE_C += $(BOOT)/efi_allen.c $(KDIR)/core/allen_gate.c $(KDIR)/core/agent_cmd.c $(KDIR)/core/lifecycle_fsm.c
+endif
+# P2 sealed-artifact loader: format/admission/receipt (artifact/), SHA-256
+# (argus), Ed25519/SHA-512 (sig). Built into the core so every image carries
+# the loader; the TEST-anchor qualification build is CK_SEED0B_TEST_ANCHOR=1.
+ART_C := $(KDIR)/core/artifact_loader.c $(KDIR)/core/osc_admit.c $(KDIR)/core/osc_task.c $(KDIR)/artifact/osc_launch.c $(KDIR)/artifact/format.c $(KDIR)/artifact/admission.c \
+	$(KDIR)/artifact/receipt.c $(KDIR)/artifact/osc_unit.c $(KDIR)/artifact/osc_receipt.c $(NATIVE)/argus/sha256.c $(NATIVE)/sig/sha512.c \
+	$(NATIVE)/sig/ed25519.c $(NATIVE)/sig/ct.c
+ART_INC := -I$(KDIR)/svc/compat -I$(KDIR)/artifact -I$(NATIVE)/sig -I$(NATIVE)/argus
+ART_C += $(OSH_TEST_C)
+ifneq ($(strip $(CK_ARTIFACT_CARD)),)
+ART_C += $(KDIR)/core/artifact_card.c $(KDIR)/core/artifact_card_stage.c
+CORE_C += $(BOOT)/efi_artifact.c
+endif
+CORE_C += $(ART_C)
+ifeq ($(strip $(CK_PIPE_TEST)),1)
+CORE_C += $(KDIR)/core/pipe.c $(KDIR)/core/pipe_test.c
+endif
+CORE_S := $(BOOT)/efi_entry.S $(KDIR)/arch/vectors.S $(KDIR)/arch/m3.S $(KDIR)/arch/smp_entry.S
+HDRS := $(wildcard $(KDIR)/include/*.h $(KDIR)/*/*.h $(BOOT)/*.h)
+
+KOBJ := $(OUT)/obj
+CORE_OBJS := $(patsubst $(NATIVE)/%.c,$(KOBJ)/%.o,$(CORE_C)) \
+	$(patsubst $(NATIVE)/%.S,$(KOBJ)/%.o,$(CORE_S))
+
+.DEFAULT_GOAL := all
+
+# ---- boot stages (stage.mk: STAGE_SRCS, STAGE_CFLAGS, stage-* host targets) ----
+include $(KDIR)/stage.mk
+ifeq ($(strip $(CK_QEMU_UNSAFE_DMA)),1)
+FULL_NAME := full-qemu-unsafe-dma
+STAGE_DMA_FLAGS := -DCK_QEMU_UNSAFE_DMA=1
+else
+FULL_NAME := full
+STAGE_DMA_FLAGS :=
+endif
+ifneq ($(strip $(CK_TEST_XHCI_MUTATION)),)
+FULL_NAME := full-test-xhci-$(strip $(CK_TEST_XHCI_MUTATION))
+STAGE_DMA_FLAGS += -DCK_TEST_XHCI_MUTATION=$(XHCI_MUT_NUM)
+endif
+ifeq ($(strip $(CK_CONSOLE_SESSION)),1)
+FULL_NAME := full-console-session
+STAGE_DMA_FLAGS += -DCK_CONSOLE_SESSION=1
+ifneq ($(strip $(CK_TEST_CONSOLE_MUTATION)),)
+FULL_NAME := full-test-console-mutation
+STAGE_DMA_FLAGS += -DCK_TEST_CONSOLE_MUTATION=1
+endif
+endif
+ifneq ($(strip $(CK_HARDWARE_STAGING)),)
+# Own OUT subdirectory: stage objects built with these flags never mix with
+# the default full image's objects.
+FULL_NAME := full-hardware-staging
+OWNER_HDR := $(OUT)/gen-$(FULL_NAME)/ck_owner_prov.h
+STAGE_DMA_FLAGS += -DCK_HARDWARE_STAGING=1 -I$(dir $(OWNER_HDR))
+else
+OWNER_HDR :=
+endif
+ifeq ($(strip $(CK_TEST_STORE_CRASH)),1)
+# Own OUT subdirectory: TEST hook objects never mix with a default image.
+ifneq ($(strip $(CK_TEST_STORE_CRASH_MUTANT)),)
+FULL_NAME := full-test-store-crash-mutant-$(strip $(CK_TEST_STORE_CRASH_MUTANT))
+else
+FULL_NAME := full-test-store-crash
+endif
+STAGE_DMA_FLAGS += -DCK_TEST_STORE_CRASH=1 $(STORE_MUTANT_FLAGS)
+endif
+ifeq ($(strip $(CK_TEST_CONTINUITY)),1)
+# Own OUT subdirectory: TEST objects never mix with a default image. The
+# continuity layer is linked only here (default images carry none of it).
+ifneq ($(strip $(CK_TEST_CONTINUITY_MUTANT)),)
+FULL_NAME := full-test-continuity-mutant-$(strip $(CK_TEST_CONTINUITY_MUTANT))
+else
+FULL_NAME := full-test-continuity
+endif
+STAGE_DMA_FLAGS += -DCK_TEST_CONTINUITY=1 $(CONT_MUTANT_FLAGS) -I$(KDIR)/core
+STAGE_SRCS += $(KDIR)/svc/continuity_codec.c $(KDIR)/svc/continuity_resolve.c \
+	$(KDIR)/svc/continuity_resolve_sealed.c $(KDIR)/svc/continuity_commit.c $(KDIR)/svc/continuity_recovery.c \
+	$(KDIR)/svc/continuity_boot.c $(KDIR)/svc/continuity_subject.c $(KDIR)/svc/continuity_subject_provision.c
+endif
+ifneq ($(strip $(CK_SERVICE)$(CK_PI5_LIFECYCLE)),)
+SVC_STAGE_BASE := $(STAGE_SRCS)
+# Own OUT subdirectory: service objects never mix with a diagnostic image.
+ifeq ($(strip $(CK_SERVICE_TEST_KEYS)),1)
+FULL_NAME := full-service-testkeys
+STAGE_DMA_FLAGS += -DCK_SERVICE=1 -DCK_SERVICE_TEST_KEYS=1
+else
+FULL_NAME := full-service$(if $(strip $(CK_HARDWARE_STAGING)),-hardware-staging,)
+STAGE_DMA_FLAGS += -DCK_SERVICE=1
+endif
+STAGE_SRCS += $(KDIR)/core/lifecycle.c $(KDIR)/core/lifecycle_fsm.c $(KDIR)/core/line_rx.c
+# N3 (aienos#329): context assembly and the exact approval binding (pure C, host-tested by test_context).
+STAGE_SRCS += $(KDIR)/core/context.c $(KDIR)/core/context_proposal.c
+# P06 cut 3: the canonical Omega Cortex store over the sealed Store (svc/cortex_journal.c).
+STAGE_SRCS += $(STAGE_CORTEX_SRCS)
+# P05 cut 1: production continuity on the service lifecycle (svc/continuity_service.c):
+# the continuity layer without its TEST-ONLY mode selection (continuity_boot.c)
+# and without the Recovery Core (continuity_recovery.c, TEST operator key).
+STAGE_DMA_FLAGS += -I$(KDIR)/core
+STAGE_SRCS += $(KDIR)/svc/continuity_codec.c $(KDIR)/svc/continuity_resolve.c \
+	$(KDIR)/svc/continuity_resolve_sealed.c $(KDIR)/svc/continuity_commit.c \
+	$(KDIR)/svc/continuity_subject.c $(KDIR)/svc/continuity_subject_provision.c $(KDIR)/svc/continuity_service.c
+# P11 cut 2b: kernel-side slot promotion / abandon (svc/slot_service.c) over the shared
+# slot decision rules and control-commit routine of SLOTLDR.EFI (native/boot).
+STAGE_SRCS += $(KDIR)/svc/slot_service.c $(BOOT)/slot_select.c $(BOOT)/slot_control.c
+# P11 cut 3: the inactive-slot updater (svc/slot_service.c verb `update`, native/boot/slot_update.c)
+# verifies the inbox image against the key table SLOTLDR.EFI is built with (ck_slot_tool keys-c):
+# RFC 8032 TEST 1 in the TEST-keys image, the Owner Root (CK_OWNER_PUBKEYS) under CK_HARDWARE_STAGING.
+# The plain service image gets no table and refuses every update.
+STAGE_SRCS += $(BOOT)/slot_update.c
+SVC_SLOT_KEY_SRC := $(if $(strip $(CK_SERVICE_TEST_KEYS)),--test-key,$(if $(strip $(CK_HARDWARE_STAGING)),--keys $(OWNER_PUBKEYS_FILE),))
+ifneq ($(SVC_SLOT_KEY_SRC),)
+SVC_SLOT_KEYS_C := $(OUT)/gen-$(FULL_NAME)/svc_slot_keys.c
+STAGE_SRCS += $(SVC_SLOT_KEYS_C)
+STAGE_DMA_FLAGS += -DCK_SLOT_UPDATE_KEYS=1
+endif
+# The sources this block added: the Pi block below restarts STAGE_SRCS, the lifecycle image takes them over.
+SVC_STAGE_ADDED := $(filter-out $(SVC_STAGE_BASE),$(STAGE_SRCS))
+endif
+ifeq ($(strip $(CK_TEST_DISK_XLATE_BYPASS)),1)
+FULL_NAME := $(FULL_NAME)-test-xlate-bypass
+STAGE_DMA_FLAGS += -DCK_TEST_DISK_XLATE_BYPASS=1
+endif
+# AIENOS-PI5 step 3b: the sealed Store stage on the Pi card, in the TEST-key qualification tier
+# (SEED-0B-PI5, the Pi counterpart of the QEMU full image). Only the Store stage and what it needs
+# are linked: no PCI, NVMe, USB, virtio, SMMU or security stage (none of that hardware is on the
+# Pi path). core/pi5.c supplies ck_dev_boot_disk and ck_dev_nvme_release over the SD partition view.
+FULL_STAGE_SYMS := ck_stage_devices ck_stage_security ck_stage_store ck_stage_quiesce ck_stage_disk_artifacts
+ifneq ($(strip $(CK_PI5_STORE)$(CK_PI5_UNLOCK)),)
+FULL_NAME := $(if $(strip $(CK_PI5_UNLOCK)),full-pi5-unlock$(if $(strip $(CK_PI5_UNLOCK_CARD)),-card)$(if $(strip $(CK_PI5_FACT)),-fact)$(if $(strip $(CK_PI5_AGENT)),-agent)$(if $(strip $(CK_PI5_LIFECYCLE)),-lifecycle),full-pi5-store)
+FULL_STAGE_SYMS := ck_stage_store ck_stage_disk_artifacts
+STAGE_SRCS := $(KDIR)/svc/store_boot.c $(KDIR)/svc/artifact_store.c $(KDIR)/svc/store_crash.c $(KDIR)/svc/ck_compat.c \
+  $(foreach m,store/store_v1 store/store_engine store/store_disk store/store_sealed store/torn_slot m5/m5_keys m5/m5_envelope m5/m5_state crypto/aes crypto/polyval crypto/gcm_siv crypto/hmac crypto/ct argus/sha256,$(NATIVE)/$(m).c)
+ifneq ($(strip $(CK_PI5_FACT)),)
+STAGE_SRCS += $(KDIR)/svc/pi5_fact.c $(STAGE_CORTEX_SRCS)
+endif
+ifneq ($(strip $(CK_PI5_AGENT)),)
+STAGE_SRCS += $(KDIR)/svc/pi5_agent.c
+endif
+ifneq ($(strip $(CK_PI5_LIFECYCLE)),)
+# The NVMe image-slot service is not part of the Pi image: its four hooks are answered by svc/slot_service_pi5.c.
+STAGE_SRCS += $(filter-out $(KDIR)/svc/slot_service.c $(BOOT)/slot_select.c $(BOOT)/slot_control.c $(BOOT)/slot_update.c,$(SVC_STAGE_ADDED)) $(KDIR)/svc/slot_service_pi5.c
+endif
+endif
+# CK_BOOT_SHOW=1 images get their own image directory and stage objects; the one core object
+# that differs, kmain.o, is rebuilt through $(OUT)/boot_show.stamp (below).
+ifeq ($(strip $(CK_BOOT_SHOW)),1)
+FULL_NAME := $(FULL_NAME)-boot-show
+endif
+# The boot sequence runner (core/boot_screen.c) needs the devices stage: full images only.
+STAGE_SRCS += $(KDIR)/core/boot_screen.c
+ifeq ($(strip $(CK_SPARK_INPUT)),1)
+FULL_NAME := spark-input$(if $(strip $(CK_HARDWARE_STAGING)),-hardware-staging,)
+FULL_STAGE_SYMS := ck_stage_devices ck_stage_quiesce
+STAGE_SRCS := $(foreach m,pci devices xhci_fence usb_hid usb_kbd rtl8127_bind,$(KDIR)/dev/$(m).c) \
+  $(NATIVE)/net/aienos_rtl8127.c $(NATIVE)/net/aienos_report.c $(NATIVE)/net/aienos_net.c
+endif
+FULL_OUT := $(OUT)/$(FULL_NAME)
+STAGE_KOBJ := $(OUT)/obj/stage-$(FULL_NAME)
+STAGE_HDRS := $(HDRS) $(wildcard $(NATIVE)/*/*.h $(NATIVE)/argus/bridge/*.h $(KDIR)/svc/compat/*.h)
+STAGE_BUILT := $(foreach s,$(STAGE_SRCS),$(STAGE_KOBJ)/$(subst /,_,$(patsubst $(REPO)/%,%,$(abspath $(s)))).o)
+# STAGE_CFLAGS first: svc/compat must shadow the hosted headers. No fortify.
+STAGE_KCFLAGS := $(STAGE_CFLAGS) $(KCFLAGS) $(MODULE_INC) -U_FORTIFY_SOURCE $(STAGE_DMA_FLAGS)
+# The core already links argus/sha256.c (artifact loader); link it once.
+STAGE_LINK := $(filter-out %/native_argus_sha256.c.o,$(STAGE_BUILT))
+
+ELF := $(OUT)/aienos-ck.elf
+EFI := $(OUT)/BOOTAA64.EFI
+FULL_ELF := $(FULL_OUT)/aienos-ck.elf
+FULL_EFI := $(FULL_OUT)/BOOTAA64.EFI
+
+all: $(EFI)
+full: $(FULL_EFI)
+
+print-kcflags:
+	@echo $(KCFLAGS) $(MODULE_INC)
+
+$(OUT)/commit.stamp: FORCE
+	@mkdir -p $(OUT)
+	@echo '$(AIENOS_COMMIT)' | cmp -s - $@ || echo '$(AIENOS_COMMIT)' > $@
+
+$(KOBJ)/%.o: $(NATIVE)/%.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -c -o $@ $<
+
+$(KOBJ)/kernel/core/report.o: $(KDIR)/core/report.c $(HDRS) $(OUT)/commit.stamp
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -DAIENOS_COMMIT='"$(AIENOS_COMMIT)"' -c -o $@ $<
+
+# kmain.o is shared by the full and full-boot-show images (one $(KOBJ)) but compiles
+# differently under CK_BOOT_SHOW, so it is rebuilt whenever the value changes; without the
+# stamp a warm OUT linked the other image's kmain.o (a boot-show image with no show, or the reverse).
+$(KOBJ)/kernel/core/kmain.o: $(OUT)/boot_show.stamp
+$(OUT)/boot_show.stamp: FORCE
+	@mkdir -p $(OUT)
+	@echo '$(CK_BOOT_SHOW)' | cmp -s - $@ || echo '$(CK_BOOT_SHOW)' > $@
+
+# Artifact loader objects: compat headers for <string.h>, TEST-anchor flag.
+ART_OBJS := $(patsubst $(NATIVE)/%.c,$(KOBJ)/%.o,$(ART_C))
+ART_HDRS := $(wildcard $(NATIVE)/sig/*.h $(NATIVE)/argus/sha256.h $(KDIR)/svc/compat/*.h)
+$(ART_OBJS): KCFLAGS += $(ART_INC)
+$(ART_OBJS): $(ART_HDRS)
+
+# core/pi5.c drives the SD card through native/disk.
+$(KOBJ)/kernel/core/pi5.o: KCFLAGS += -I$(NATIVE)/disk
+$(KOBJ)/kernel/core/pi5_marker.o: KCFLAGS += -I$(NATIVE)/disk
+$(KOBJ)/kernel/arch/rndr.o: KCFLAGS += -I$(KDIR)/dev
+$(KOBJ)/kernel/dev/disk_part.o: KCFLAGS += -I$(NATIVE)/disk
+
+# core/infer.c uses the in-core SHA-256 (argus) to prove the ingested bytes.
+$(KOBJ)/kernel/core/infer.o: KCFLAGS += -I$(NATIVE)/argus
+# core/allen.c prints the SHA-256 of the exam file it read.
+$(KOBJ)/kernel/core/allen.o: KCFLAGS += -I$(NATIVE)/argus
+
+$(OUT)/trust.stamp: FORCE
+	@mkdir -p $(OUT)
+	@echo '$(ART_TRUST_FLAGS)' | cmp -s - $@ || echo '$(ART_TRUST_FLAGS)' > $@
+
+$(KOBJ)/kernel/core/artifact_loader.o: $(KDIR)/core/artifact_loader.c $(HDRS) $(ART_HDRS) \
+		$(OUT)/commit.stamp $(OUT)/trust.stamp
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) $(ART_TRUST_FLAGS) -DAIENOS_COMMIT='"$(AIENOS_COMMIT)"' -c -o $@ $<
+
+$(KOBJ)/kernel/core/osc_admit.o: $(KDIR)/core/osc_admit.c $(HDRS) $(ART_HDRS) $(OUT)/trust.stamp
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) $(ART_TRUST_FLAGS) $(if $(strip $(CK_HARDWARE_STAGING)),-DCK_HARDWARE_STAGING=1,) $(if $(filter 1,$(strip $(CK_SERVICE))),-DCK_SERVICE=1,) $(if $(filter 1,$(strip $(CK_SEED0B_TEST_ANCHOR))),,-DCK_RELEASE_IMAGE=1) -c -o $@ $<
+
+# core/osh_op.c refuses to build without CK_OSH_OP_TEST (and with CK_HARDWARE_STAGING): it takes the trust flags too.
+$(KOBJ)/kernel/core/osh_op.o: $(KDIR)/core/osh_op.c $(KDIR)/core/osh_op.h $(HDRS) $(OUT)/trust.stamp
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) $(ART_TRUST_FLAGS) -c -o $@ $<
+
+# core/osh_test.c reads CK_OSH_OP_TEST, so it takes the trust flags too (and is rebuilt when they change).
+$(KOBJ)/kernel/core/osh_test.o: $(KDIR)/core/osh_test.c $(HDRS) $(ART_HDRS) $(OUT)/trust.stamp
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) $(ART_TRUST_FLAGS) -c -o $@ $<
+
+$(KOBJ)/%.o: $(NATIVE)/%.S
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -c -o $@ $<
+
+define stage_rule
+$(STAGE_KOBJ)/$(subst /,_,$(patsubst $(REPO)/%,%,$(abspath $(1)))).o: $(1) $(STAGE_HDRS) $(OWNER_HDR)
+	@mkdir -p $$(dir $$@)
+	$(KCC) $(STAGE_KCFLAGS) -c -o $$@ $(1)
+endef
+$(foreach s,$(STAGE_SRCS),$(eval $(call stage_rule,$(s))))
+
+# fwcfg_check(elf): a default image (no CK_TEST_FWCFG_ARTIFACTS) must carry no
+# fw_cfg artifact code or strings; a test image must carry its announcement.
+# The QEMU inference images (CK_INFER_LIB without hardware staging, aienos#34
+# lane 4) read their model over fw_cfg when no MODEL.MAP is found: they must
+# carry their own TEST-ONLY announcement instead. The hardware service image
+# with inference (CK_INFER_LIB + CK_HARDWARE_STAGING, boot-disk only) must
+# carry the boot-disk source line, the resident session, and no fw_cfg code.
+define fwcfg_check
+	@if [ -n "$(strip $(CK_INFER_LIB))" ] && [ -z "$(strip $(CK_HARDWARE_STAGING))" ] && [ -z "$(strip $(CK_PI5_INFER))" ] && [ -z "$(strip $(CK_PI5_AGENT))" ] && [ -z "$(strip $(CK_PI5_LIFECYCLE))" ]; then \
+	  grep -aqF "TEST-ONLY QEMU fw_cfg model ingest" $(1) || { echo "inference probe image lacks its TEST-ONLY fw_cfg announcement"; rm -f $(1); exit 1; }; \
+	elif [ "$(strip $(CK_TEST_FWCFG_ARTIFACTS))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY QEMU fw_cfg side channel" $(1) || { echo "test fw_cfg image lacks its TEST-ONLY announcement"; rm -f $(1); exit 1; }; \
+	else \
+	  s=$$(grep -aoE "opt/aienos/artifacts|opt/aienos/model|fw_cfg|QEMU0002" $(1) | sort -u | tr "\n" " "); \
+	  y=$$($(KNM) $(1) | grep -E " (fw_select|fw_read|fw_skip|fw_find|fw_dma_read|fwcfg_from_dsdt|fwcfg_source|fwcfg)$$" | tr "\n" " "); \
+	  if [ -n "$$s$$y" ]; then echo "default image carries fw_cfg artifact code: $$s$$y"; rm -f $(1); exit 1; fi; \
+	  if [ -n "$(strip $(CK_INFER_LIB))" ]; then \
+	    grep -aqF "infer_source_mode: boot-disk model" $(1) || { echo "hardware inference image lacks the boot-disk model source"; rm -f $(1); exit 1; }; \
+	    if [ -z "$(strip $(CK_PI5_INFER))" ]; then grep -aqF "infer: resident open" $(1) || { echo "hardware inference image lacks the resident session"; rm -f $(1); exit 1; }; fi; \
+	    echo "hardware inference image: boot-disk model source only, no fw_cfg code in $(1)"; \
+	  fi; \
+	  echo "no fw_cfg artifact code in $(1)"; \
+	fi
+endef
+
+# console_check(elf): only a CK_CONSOLE_SESSION image may carry the console
+# session code; only a CK_TEST_CONSOLE_MUTATION image its mutation banner.
+define console_check
+	@if [ "$(strip $(CK_CONSOLE_SESSION))" = 1 ]; then \
+	  grep -aqF "console_session: begin" $(1) || { echo "console session image lacks its stage"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "console_session:" $(1); then echo "default image carries the console session"; rm -f $(1); exit 1; fi; \
+	  echo "no console session code in $(1)"; \
+	fi
+	@if [ -n "$(strip $(CK_TEST_CONSOLE_MUTATION))" ]; then \
+	  grep -aqF "TEST-ONLY console session MUTATION BUILD" $(1) || { echo "console mutation image lacks its TEST-ONLY banner"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "TEST-ONLY console session MUTATION" $(1); then echo "image carries the console mutation without asking"; rm -f $(1); exit 1; fi; \
+	fi
+endef
+
+# service_check(elf): only a CK_SERVICE image may carry the resident lifecycle;
+# only a CK_SERVICE_TEST_KEYS image its TEST-ONLY banner.
+define service_check
+	@if [ "$(strip $(CK_SERVICE))" = 1 ] || [ -n "$(strip $(CK_PI5_LIFECYCLE))" ]; then \
+	  grep -aqF "lifecycle: ready" $(1) || { echo "service image lacks the resident lifecycle"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "lifecycle: ready" $(1); then echo "diagnostic image carries the resident lifecycle"; rm -f $(1); exit 1; fi; \
+	  echo "no resident lifecycle in $(1)"; \
+	fi
+	@if [ "$(strip $(CK_SERVICE_TEST_KEYS))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY service image" $(1) || { echo "service test-keys image lacks its TEST-ONLY banner"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "TEST-ONLY service image" $(1); then echo "image carries TEST Store keys without asking"; rm -f $(1); exit 1; fi; \
+	fi
+endef
+
+# xhci_mut_check(elf): only a CK_TEST_XHCI_MUTATION image may carry the
+# TEST-ONLY xHCI mutation banner (and it must carry it).
+define xhci_mut_check
+	@if [ -n "$(strip $(CK_TEST_XHCI_MUTATION))" ]; then \
+	  grep -aqF "TEST-ONLY xHCI MUTATION BUILD" $(1) || { echo "xHCI mutation image lacks its TEST-ONLY banner"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "TEST-ONLY xHCI MUTATION" $(1); then echo "default image carries the TEST-ONLY xHCI mutation"; rm -f $(1); exit 1; fi; \
+	  echo "no xHCI mutation code in $(1)"; \
+	fi
+endef
+
+# owner_check(elf): a hardware staging image must carry no TEST Store label,
+# TEST store uuid, TEST Store print lines or TEST key symbols.
+define owner_check
+	@if [ "$(strip $(CK_HARDWARE_STAGING))" = 1 ]; then \
+	  s=$$(grep -aoE "AIENOS-LANE18-TEST-KVOL-NOT-SECRET|AIEN-TEST-BOOT01|TEST identity, TEST keys|formatted TEST store|TEST machine id 0xA1" $(1) | sort -u | tr "\n" " "); \
+	  y=$$($(KNM) $(1) | grep -E " (ck_store_test_keys|ck_store_test_uuid)$$" | tr "\n" " "); \
+	  if [ -n "$$s$$y" ]; then echo "hardware staging image carries the TEST Store identity: $$s$$y"; rm -f $(1); exit 1; fi; \
+	  echo "no TEST Store label, uuid or key code in $(1)"; \
+	fi
+endef
+
+# rollback_check(elf): only a CK_TEST_ROLLBACK image may carry a TEST-only
+# rollback candidate, and it must announce itself.
+define rollback_check
+	@if [ -n "$(strip $(CK_TEST_ROLLBACK))" ]; then \
+	  grep -aqF "TEST-ONLY rollback candidate ($(strip $(CK_TEST_ROLLBACK)))" $(1) || { echo "rollback test image lacks its TEST-ONLY announcement"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "TEST-ONLY rollback candidate" $(1); then echo "default image carries a TEST-ONLY rollback candidate"; rm -f $(1); exit 1; fi; \
+	fi
+endef
+
+# pipe_check(elf): only a CK_PIPE_TEST image may carry the TEST-only pipe self-test, and it must announce itself.
+define pipe_check
+	@if [ "$(strip $(CK_PIPE_TEST))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY pipe self-test" $(1) || { echo "pipe test image lacks its TEST-ONLY announcement"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "TEST-ONLY pipe self-test" $(1); then echo "default image carries the TEST-ONLY pipe self-test"; rm -f $(1); exit 1; fi; \
+	fi
+endef
+
+# smp_check(elf): only a CK_TEST_SMP_SKIP_CPU image may carry the SMP mutation
+# announcement, and such an image must carry it.
+define smp_check
+	@if [ "$(strip $(CK_TEST_SMP_SKIP_CPU))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY SMP mutation" $(1) || { echo "SMP mutation image lacks its TEST-ONLY announcement"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "TEST-ONLY SMP mutation" $(1); then echo "default image carries the TEST-ONLY SMP mutation"; rm -f $(1); exit 1; fi; \
+	fi
+endef
+
+# b7b_check(elf): only a CK_B7B_PROBE image may carry the B7b probe, and such an
+# image must; only a CK_B7B_PROBE_TEST_SEGMENT0 image may carry the TEST-ONLY
+# segment-0 announcement, and such an image must.
+define b7b_check
+	@if [ "$(strip $(CK_B7B_PROBE))" = 1 ]; then \
+	  grep -aqF "b7b_probe: start segment=" $(1) || { echo "B7b probe image lacks the probe"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "b7b_probe:" $(1); then echo "default image carries the B7b probe"; rm -f $(1); exit 1; fi; \
+	fi
+	@if [ "$(strip $(CK_B7B_PROBE_TEST_SEGMENT0))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY B7b probe on PCI segment 0" $(1) || { echo "segment-0 probe image lacks its TEST-ONLY announcement"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "TEST-ONLY B7b probe" $(1); then echo "image carries the TEST-ONLY segment-0 probe"; rm -f $(1); exit 1; fi; \
+	fi
+	@if [ "$(strip $(CK_B7B_EVENT_READOUT))" = 1 ]; then \
+	  grep -aqF "b7b_events: final begin all_sids=yes" $(1) || { echo "B7b image lacks event readout"; rm -f $(1); exit 1; }; \
+	else \
+	  if grep -aqF "b7b_events:" $(1); then echo "image carries unrequested event readout"; rm -f $(1); exit 1; fi; \
+	fi
+endef
+
+# crash_check(elf): a full image built without CK_TEST_STORE_CRASH must carry
+# no Store crash hook code or strings; a TEST crash image must announce itself.
+# The bare "TEST-ONLY MUTANT" phrase is refused here except in the TEST
+# continuity image, whose own mutants print it (cont_check refuses it in every
+# image built without CK_TEST_CONTINUITY; crash-hook mutants are still caught
+# by their "store_crash:" prefix).
+define crash_check
+	@if [ "$(strip $(CK_TEST_STORE_CRASH))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY Store crash hook image" $(1) || { echo "TEST crash image lacks its TEST-ONLY announcement"; rm -f $(1); exit 1; }; \
+	else \
+	  m="|TEST-ONLY MUTANT"; [ "$(strip $(CK_TEST_CONTINUITY))" = 1 ] && m=""; \
+	  s=$$(grep -aoE "store_crash:|AIENCRSH$$m" $(1) | sort -u | tr "\n" " "); \
+	  y=$$($(KNM) $(1) | grep -E " ck_store_crash_[a-z_]+$$" | tr "\n" " "); \
+	  if [ -n "$$s$$y" ]; then echo "default image carries the TEST Store crash hook: $$s$$y"; rm -f $(1); exit 1; fi; \
+	  echo "no Store crash hook code in $(1)"; \
+	fi
+endef
+
+# cont_check(elf): a full image built without CK_TEST_CONTINUITY must carry no
+# TEST continuity wiring code or strings; a TEST continuity image must announce
+# itself. A CK_SERVICE image carries the production continuity layer (P05 cut 1:
+# cr_provision/cr_resume through svc/continuity_service.c) and must still carry
+# neither the TEST mode selection (ck_cont_boot_stage, AIENCONT plan line) nor
+# the Recovery Core (rc_inspect, the TEST operator key).
+define cont_check
+	@if [ "$(strip $(CK_TEST_CONTINUITY))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY continuity mode selection image" $(1) || { echo "TEST continuity image lacks its TEST-ONLY announcement"; rm -f $(1); exit 1; }; \
+	else \
+	  m="|TEST-ONLY MUTANT"; [ "$(strip $(CK_TEST_STORE_CRASH))" = 1 ] && m=""; \
+	  if [ "$(strip $(CK_SERVICE))" = 1 ] || [ -n "$(strip $(CK_PI5_LIFECYCLE))" ]; then \
+	    s=$$(grep -aoE "AIENCONT|RECOVERY_OPERATOR_KEY|RECOVERY_CORE:|CONTINUITY: $$m" $(1) | sort -u | tr "\n" " "); \
+	    y=$$($(KNM) $(1) | grep -E " (ck_cont_boot_stage|rc_inspect)$$" | tr "\n" " "); \
+	    grep -aqF "continuity: REFUSED" $(1) || { echo "service image lacks the production continuity wiring"; rm -f $(1); exit 1; }; \
+	  else \
+	    s=$$(grep -aoE "AIENCONT|RECOVERY_OPERATOR_KEY|RECOVERY_CORE:|CONTINUITY: |continuity: REFUSED$$m" $(1) | sort -u | tr "\n" " "); \
+	    y=$$($(KNM) $(1) | grep -E " (ck_cont_boot_stage|cr_resume|cr_provision|rc_inspect|ck_cont_service_start)$$" | tr "\n" " "); \
+	  fi; \
+	  if [ -n "$$s$$y" ]; then echo "image carries the TEST continuity wiring: $$s$$y"; rm -f $(1); exit 1; fi; \
+	  echo "no TEST continuity wiring in $(1)"; \
+	fi
+endef
+
+# allen_check(elf): only a CK_ALLEN image carries the ALLEN unit (aienos_allen_* entry points) and its exam stage; it must carry
+# both, plus the gate. Every other core image must carry none of it.
+define allen_check
+	@a=$$($(KNM) $(1) | grep -cE " [Tt] (aienos_allen_decide|aienos_allen_train|ck_allen_gate_judge)$$" || true); \
+	if [ -n "$(strip $(CK_ALLEN))" ]; then \
+	  [ "$$a" = 3 ] && grep -aqF "AIENOS_CK_ALLEN: " $(1) || { echo "ALLEN image lacks the ALLEN unit, gate or exam stage"; rm -f $(1); exit 1; }; \
+	  echo "ALLEN exam image: ALLEN unit + gate + exam stage in $(1)"; \
+	elif [ "$$a" != 0 ] || grep -aqF "AIENOS_CK_ALLEN: " $(1); then echo "image without CK_ALLEN carries ALLEN code"; rm -f $(1); exit 1; fi
+endef
+
+# osc_rehash_check(elf): the post-admission code byte flip is part of a
+# CK_OSC_RECEIPT_TEST image only, and that image must carry the banner and
+# ck_osc_receipt_test_code_flip. Every other image must carry neither.
+define osc_rehash_check
+	@if [ "$(strip $(CK_OSC_RECEIPT_TEST))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY post-admission code byte flip" $(1) || { echo "receipt test image lacks the TEST-ONLY code byte flip"; rm -f $(1); exit 1; }; \
+	  $(KNM) $(1) | grep -q ' ck_osc_receipt_test_code_flip$$' || { echo "receipt test image lacks ck_osc_receipt_test_code_flip"; rm -f $(1); exit 1; }; \
+	else \
+	  s=""; $(KNM) $(1) | grep -q ' ck_osc_receipt_test_code_flip$$' && s="ck_osc_receipt_test_code_flip "; \
+	  grep -aqF "TEST-ONLY post-admission code byte flip" $(1) && s="$${s}banner"; \
+	  if [ -n "$$s" ]; then echo "image carries the TEST-ONLY post-admission code byte flip: $$s"; rm -f $(1); exit 1; fi; \
+	  echo "no post-admission code byte flip in $(1)"; \
+	fi
+endef
+
+# link_image(output elf, objects): refuses undefined symbols (weak stage
+# references excepted) and any relocation other than R_AARCH64_RELATIVE.
+define link_image
+	@mkdir -p $(dir $(1))
+	$(KLD) $(KLDFLAGS) -o $(1) $(2)
+	@u=$$($(KNM) -u $(1) | grep -v ' w ' || true); \
+	if [ -n "$$u" ]; then echo "image has undefined symbols: $$u"; rm -f $(1); exit 1; fi
+	@bad=$$($(KREADELF) -rW $(1) | grep -E '^[0-9a-f]+ ' | grep -v R_AARCH64_RELATIVE || true); \
+	if [ -n "$$bad" ]; then echo "image has non-RELATIVE relocations:"; echo "$$bad"; rm -f $(1); exit 1; fi
+endef
+define pe_image
+	$(KOBJCOPY) -O binary $(1) $(2)
+	@sz=$$(stat -c %s $(2)); pad=$$(( (4096 - sz % 4096) % 4096 )); \
+	if [ $$pad -gt 0 ]; then head -c $$pad /dev/zero >> $(2); fi
+	@[ "$$(head -c 2 $(2))" = "MZ" ] || { echo "not a PE image"; rm -f $(2); exit 1; }
+	@echo "built $(2) (commit $(AIENOS_COMMIT))"
+endef
+
+$(ELF): $(CORE_OBJS) $(BOOT)/image.ld
+	$(call link_image,$@,$(CORE_OBJS) $(CK_RUST_LIBS) $(CK_INFER_LIB) $(CK_ALLEN_LIB))
+	$(call allen_check,$@)
+	@if [ -z "$(strip $(CK_TEST_STALE_HANDOFF))" ] && grep -aqF "TEST-ONLY stale handoff" $@; then \
+	  echo "default image carries the TEST-only stale handoff"; rm -f $@; exit 1; fi
+	$(call rollback_check,$@)
+	$(call pipe_check,$@)
+	@s=$$($(KNM) $@ | grep -E ' [TtDdBbWwVv] ck_stage_(devices|security|store|quiesce)$$' || true); \
+	if [ -n "$$s" ]; then echo "core image defines stage symbols: $$s"; rm -f $@; exit 1; fi
+	$(call fwcfg_check,$@)
+	$(call smp_check,$@)
+	$(call b7b_check,$@)
+	$(call osc_rehash_check,$@)
+
+$(FULL_ELF): $(CORE_OBJS) $(STAGE_BUILT) $(BOOT)/image.ld
+	$(call link_image,$@,$(CORE_OBJS) $(STAGE_LINK) $(CK_RUST_LIBS) $(CK_INFER_LIB) $(CK_ALLEN_LIB))
+	$(call rollback_check,$@)
+	$(call pipe_check,$@)
+	@for s in $(FULL_STAGE_SYMS); do \
+	  $(KNM) $@ | grep -qE " [TW] $$s$$" || { echo "full image lacks $$s"; rm -f $@; exit 1; }; done
+	$(call fwcfg_check,$@)
+	$(call owner_check,$@)
+	$(call xhci_mut_check,$@)
+	$(call console_check,$@)
+	$(call service_check,$@)
+	$(call smp_check,$@)
+	$(call crash_check,$@)
+	$(call b7b_check,$@)
+	$(call cont_check,$@)
+	$(call osc_rehash_check,$@)
+
+$(EFI): $(ELF)
+	$(call pe_image,$<,$@)
+
+$(FULL_EFI): $(FULL_ELF)
+	$(call pe_image,$<,$@)
+
+# ---- host unit tests ----
+HOST_SRCS := $(KDIR)/core/fmt.c $(KDIR)/core/acpi.c $(KDIR)/core/smmu.c $(KDIR)/mm/frames.c \
+	$(KDIR)/mm/pt.c $(KDIR)/mm/heap.c $(KDIR)/core/sched.c $(KDIR)/core/ipc.c $(KDIR)/core/entropy.c \
+	$(KDIR)/core/handoff_check.c $(KDIR)/core/fbcon.c $(KDIR)/core/acpi_dev.c $(KDIR)/core/lifecycle_fsm.c \
+	$(KDIR)/core/line_rx.c $(KDIR)/core/klog.c $(KDIR)/core/klog_slot.c $(KDIR)/core/cpufeat.c $(KDIR)/core/unlock_req.c $(KDIR)/core/agent_cmd.c $(KDIR)/core/artifact_card.c $(KDIR)/core/allen_gate.c
+TESTS := test_fmt test_frames test_pt test_acpi test_dmar test_acpi_dev test_heap test_smmu test_sched test_ipc test_artifact test_osc_unit test_osc_launch test_osc_admit test_osc_receipt test_entropy test_handoff test_fbcon test_osh_op \
+	test_continuity_codec test_continuity_resolve test_continuity_commit test_continuity_recovery test_continuity_geometry \
+	test_continuity_subject test_continuity_subject_provision test_lifecycle test_console_rx test_klog test_klog_slot test_pi5 test_pi5_marker test_pi5_rng test_cpufeat test_dma_window test_pi5_pcie test_pi5_net test_pi5_gem test_unlock_req test_context test_agent_cmd test_artifact_card test_pipe test_allen_gate \
+	test_netboot_text test_gb10_gsp_boot
+TESTS += test_gpu_sim test_gsp_mmio
+TESTS += test_smmu_svc
+TESTS += test_spinlock test_pipe_irq
+HCFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -Werror -I$(KDIR)/core -I$(KDIR)/mm -I$(KDIR)/tests -I$(BOOT)
+SANFLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+
+$(OUT)/host/%: $(KDIR)/tests/%.c $(HOST_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -o $@ $< $(HOST_SRCS)
+
+$(OUT)/host-san/%: $(KDIR)/tests/%.c $(HOST_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -o $@ $< $(HOST_SRCS)
+
+# DMAR is a standalone byte parser; unrelated host tests need not link it.
+DMAR_TEST_SRCS := $(KDIR)/tests/test_dmar.c $(KDIR)/core/dmar.c
+$(OUT)/host/test_dmar: $(DMAR_TEST_SRCS) $(KDIR)/core/dmar.h $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -o $@ $(DMAR_TEST_SRCS)
+$(OUT)/host-san/test_dmar: $(DMAR_TEST_SRCS) $(KDIR)/core/dmar.h $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -o $@ $(DMAR_TEST_SRCS)
+
+# OSH adapter operation layer (core/osh_op.c, aien-architecture#158): pure logic over ipc.c capabilities, SHA-256 for the
+# request digest. Its own rule because it needs the argus SHA-256 source.
+OSH_OP_SRCS := $(KDIR)/core/osh_op.c $(KDIR)/core/ipc.c $(KDIR)/core/fmt.c $(NATIVE)/argus/sha256.c
+$(OUT)/host/test_osh_op: $(KDIR)/tests/test_osh_op.c $(OSH_OP_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_OSH_OP_TEST -I$(NATIVE)/argus -o $@ $< $(OSH_OP_SRCS)
+
+$(OUT)/host-san/test_osh_op: $(KDIR)/tests/test_osh_op.c $(OSH_OP_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -DCK_OSH_OP_TEST -I$(NATIVE)/argus -o $@ $< $(OSH_OP_SRCS)
+
+# TEST-ONLY mutant of core/osh_op.c: the permission check always says OK. test_osh_op must FAIL against it (red before
+# green); "make test" fails if the test stops catching it. Host only (osh_op.c refuses the flag freestanding).
+$(OUT)/host/test_osh_op_mutant: $(KDIR)/tests/test_osh_op.c $(OSH_OP_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_OSH_OP_TEST -I$(NATIVE)/argus -DCK_OSH_OP_MUTANT_SKIP_PERM -o $@ $< $(OSH_OP_SRCS)
+
+osh-op-mutant: $(OUT)/host/test_osh_op_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_osh_op mutant (permission check always OK): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_osh_op: FAIL" $<.log && echo "test_osh_op mutant (permission check always OK): FAILS as required"; fi
+
+# Native pipe primitive (core/pipe.c, aienos-mv#428): pure logic over ipc.c capability tables, driven through sched.c by
+# core/pipe_drive.h. Own rule: the test reads the fixture corpus in tests/fixtures/pipe/.
+PIPE_SRCS := $(KDIR)/core/pipe.c $(KDIR)/core/ipc.c $(KDIR)/core/sched.c
+PIPE_DEPS := $(KDIR)/tests/test_pipe.c $(PIPE_SRCS) $(KDIR)/tests/ck_test.h $(HDRS) $(wildcard $(KDIR)/tests/fixtures/pipe/*)
+PIPE_DEF := -DPIPE_FIXTURE_DIR='"$(abspath $(KDIR)/tests/fixtures/pipe)"'
+# core/ is not a -I ahead of the system headers: <sched.h> must stay POSIX for the
+# pthread host test. Quoted includes still find core/ headers (the sources live there,
+# and -idirafter covers the test file).
+PIPE_HCFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -Werror -I$(KDIR)/mm -I$(KDIR)/tests -I$(BOOT) -idirafter $(KDIR)/core -pthread
+$(OUT)/host/test_pipe: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(PIPE_DEF) -o $@ $< $(PIPE_SRCS)
+
+$(OUT)/host-san/test_pipe: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) $(PIPE_DEF) -o $@ $< $(PIPE_SRCS)
+
+# DRA-556: core/spinlock.h, the one kernel spinlock (fair ticket lock, masks interrupts while held). test_spinlock:
+# mutual exclusion, FIFO order, counter wrap, interrupt deferral. test_pipe_irq: race test, a pipe op from an
+# interrupt (host: SIGUSR1) on the thread that holds the pool lock; before DRA-556 it deadlocks. Both must FAIL
+# against the TEST-ONLY mutant -DCK_SPIN_TEST_NO_IRQ_MASK (interrupts left open). Host only.
+SPIN_DEPS := $(KDIR)/core/spinlock.h
+$(OUT)/host/test_spinlock: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -o $@ $<
+
+$(OUT)/host-san/test_spinlock: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) -o $@ $<
+
+PIPE_IRQ_SRCS := $(KDIR)/core/pipe.c $(KDIR)/core/ipc.c
+PIPE_IRQ_DEPS := $(KDIR)/tests/test_pipe_irq.c $(PIPE_IRQ_SRCS) $(SPIN_DEPS) $(HDRS)
+$(OUT)/host/test_pipe_irq: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -o $@ $< $(PIPE_IRQ_SRCS)
+
+$(OUT)/host-san/test_pipe_irq: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) -o $@ $< $(PIPE_IRQ_SRCS)
+
+SPIN_MUTANTS := NO_IRQ_MASK TICKET_BEFORE_MASK RESTORE_BEFORE_RELEASE
+$(OUT)/host/test_spinlock_mutant_%: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_$* -o $@ $<
+
+$(OUT)/host/test_pipe_irq_mutant: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_NO_IRQ_MASK -o $@ $< $(PIPE_IRQ_SRCS)
+
+spinlock-mutant: $(addprefix $(OUT)/host/test_spinlock_mutant_,$(SPIN_MUTANTS)) $(OUT)/host/test_pipe_irq_mutant
+	@for m in $(SPIN_MUTANTS); do b=$(OUT)/host/test_spinlock_mutant_$$m; \
+	  if $$b > $$b.log 2>&1; then cat $$b.log; echo "test_spinlock mutant $$m: PASSED, test does not catch it"; exit 1; \
+	  else grep -F "test_spinlock: FAIL" $$b.log && echo "test_spinlock mutant $$m: FAILS as required"; fi || exit 1; done
+	@for mp in TICKET_BEFORE_MASK:irq-step-acquire RESTORE_BEFORE_RELEASE:irq-step-release; do m=$${mp%%:*}; ph=$${mp##*:}; \
+	  b=$(OUT)/host/test_spinlock_mutant_$$m; \
+	  if TEST_SPINLOCK_ONLY=$$ph $$b > $$b.$$ph.log 2>&1; then cat $$b.$$ph.log; echo "test_spinlock mutant $$m, phase $$ph alone: PASSED, phase does not catch it"; exit 1; \
+	  else grep -F "test_spinlock: FAIL deadlock (no progress for 5 s) in phase $$ph" $$b.$$ph.log && echo "test_spinlock mutant $$m: phase $$ph alone FAILS as required"; fi || exit 1; done
+	@if $(OUT)/host/test_pipe_irq_mutant > $(OUT)/host/test_pipe_irq_mutant.log 2>&1; then cat $(OUT)/host/test_pipe_irq_mutant.log; \
+	  echo "test_pipe_irq mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe_irq: FAIL" $(OUT)/host/test_pipe_irq_mutant.log && echo "test_pipe_irq mutant (interrupts not masked): FAILS as required"; fi
+
+# DRA-556: the freestanding instruction order of core/spinlock.h, aarch64 (KCC, KCFLAGS) and x86-64 (X86CFLAGS):
+# the interrupt mask comes before the first atomic of the acquire, and the restore after the releasing store.
+# Needs the cross compilers and objdump; not part of "make test". tools/ck_spinlock_asm_check.sh reads the dumps; its
+# --selftest mutates them (mask removed, order swapped, release store to another symbol) and requires each to FAIL.
+spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(SPIN_DEPS)
+	@mkdir -p $(OUT)/spinlock-asm
+	$(KCC) $(KCFLAGS) -c -o $(OUT)/spinlock-asm/a64.o $<
+	$(X86CC) $(X86CFLAGS) -c -o $(OUT)/spinlock-asm/x86.o $<
+	$(CROSS)objdump -dr $(OUT)/spinlock-asm/a64.o > $(OUT)/spinlock-asm/a64.dis
+	$(X86_CROSS)objdump -dr $(OUT)/spinlock-asm/x86.o > $(OUT)/spinlock-asm/x86.dis
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh $(OUT)/spinlock-asm/a64.dis $(OUT)/spinlock-asm/x86.dis
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh --selftest $(OUT)/spinlock-asm/a64.dis $(OUT)/spinlock-asm/x86.dis
+
+# DRA-556: Lean 4 proof of the ticket arithmetic in core/spinlock.h (mutual exclusion, FIFO, wrap). Core Lean only,
+# toolchain pinned in proofs/lean-toolchain. Not part of "make test" (Lean is not a build dependency): prints NOT_RUN
+# without lean, FAIL on any error or "sorry".
+ticketlock-proof:
+	@command -v lean >/dev/null || { echo "CK_TICKETLOCK_PROOF: NOT_RUN (lean not installed)"; exit 3; }
+	@if grep -n "sorry" $(KDIR)/proofs/TicketLock.lean; then echo "CK_TICKETLOCK_PROOF: FAIL (sorry)"; exit 1; fi
+	@cd $(KDIR)/proofs && lean TicketLock.lean && echo "CK_TICKETLOCK_PROOF: PASS"
+
+# TEST-ONLY mutant of core/pipe.c: a write does not check the WRITE right or the end. test_pipe must FAIL against it
+# (red before green); "make test" fails if the test stops catching it. Host only.
+$(OUT)/host/test_pipe_mutant: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(PIPE_DEF) -DCK_PIPE_MUTANT_SKIP_RIGHTS -o $@ $< $(PIPE_SRCS)
+
+pipe-mutant: $(OUT)/host/test_pipe_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (write right not checked): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (write right not checked): FAILS as required"; fi
+
+# TEST-ONLY mutant: ck_pipe_dispatch does not reject a slice outside [user_lo, user_hi). test_pipe must FAIL.
+$(OUT)/host/test_pipe_slice_mutant: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(PIPE_DEF) -DCK_PIPE_MUTANT_SKIP_SLICE -o $@ $< $(PIPE_SRCS)
+
+pipe-slice-mutant: $(OUT)/host/test_pipe_slice_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (user slice not checked): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (user slice not checked): FAILS as required"; fi
+
+# TEST-ONLY mutants for #494. pipe-bounce-mutant: ck_pipe_dispatch hands the caller's slice to the ring copy, which
+# touches it under the pool lock. pipe-top-mutant: a window ending above CK_PIPE_USER_TOP is accepted. test_pipe must
+# FAIL against each.
+$(OUT)/host/test_pipe_bounce_mutant: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(PIPE_DEF) -DCK_PIPE_MUTANT_NO_BOUNCE -o $@ $< $(PIPE_SRCS)
+
+pipe-bounce-mutant: $(OUT)/host/test_pipe_bounce_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (slice copied under the lock): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (slice copied under the lock): FAILS as required"; fi
+
+$(OUT)/host/test_pipe_top_mutant: $(PIPE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) $(PIPE_DEF) -DCK_PIPE_MUTANT_NO_USER_TOP -o $@ $< $(PIPE_SRCS)
+
+pipe-top-mutant: $(OUT)/host/test_pipe_top_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (user-VA top not checked): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (user-VA top not checked): FAILS as required"; fi
+
+# N3 context assembly + approval binding (core/context.c, core/context_proposal.c, aienos#329): pure logic over
+# the argus SHA-256. Own rule (needs sha256.c). The mutant skips the foreign-binding check: test_context must
+# FAIL against it (red before green); "make test" fails if the test stops catching it. Host only (context.c
+# refuses the flag outside CK_CTX_HOST_TEST).
+CONTEXT_SRCS := $(KDIR)/core/context.c $(KDIR)/core/context_proposal.c $(NATIVE)/argus/sha256.c
+$(OUT)/host/test_context: $(KDIR)/tests/test_context.c $(CONTEXT_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_CTX_HOST_TEST -o $@ $< $(CONTEXT_SRCS)
+
+$(OUT)/host-san/test_context: $(KDIR)/tests/test_context.c $(CONTEXT_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -DCK_CTX_HOST_TEST -o $@ $< $(CONTEXT_SRCS)
+
+$(OUT)/host/test_context_mutant: $(KDIR)/tests/test_context.c $(CONTEXT_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_CTX_HOST_TEST -DCK_CTX_MUTANT_SKIP_BINDING -o $@ $< $(CONTEXT_SRCS)
+
+context-mutant: $(OUT)/host/test_context_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_context mutant (foreign binding check skipped): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_context: FAIL" $<.log && echo "test_context mutant (foreign binding check skipped): FAILS as required"; fi
+
+# PI5-7 cut 2 card command script parser (core/agent_cmd.c): the mutant accepts any word as a verb (a script could then carry unlock
+# or rotate); test_agent_cmd must FAIL against it (red before green). Host only, never part of an image.
+$(OUT)/host/test_agent_cmd_mutant: $(KDIR)/tests/test_agent_cmd.c $(KDIR)/core/agent_cmd.c $(KDIR)/core/agent_cmd.h $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_AGENT_CMD_MUTANT_ANY_VERB -o $@ $< $(KDIR)/core/agent_cmd.c
+
+agent-cmd-mutant: $(OUT)/host/test_agent_cmd_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_agent_cmd mutant (any verb allowed): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_agent_cmd: FAIL" $<.log && echo "test_agent_cmd mutant (any verb allowed): FAILS as required"; fi
+
+# PI5-8 cut K ALLEN gate (core/allen_gate.c): the mutant proposes ALLEN's approve/deny/cancel like any other verb (ALLEN
+# would hold approval authority); test_allen_gate must FAIL against it (red before green). Host only, never part of an image.
+ALLEN_GATE_SRCS := $(KDIR)/core/allen_gate.c $(KDIR)/core/agent_cmd.c $(KDIR)/core/lifecycle_fsm.c
+$(OUT)/host/test_allen_gate_mutant: $(KDIR)/tests/test_allen_gate.c $(ALLEN_GATE_SRCS) $(KDIR)/core/allen_gate.h $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_ALLEN_GATE_MUTANT_TRUST_AUTHORITY -o $@ $< $(ALLEN_GATE_SRCS)
+
+allen-gate-mutant: $(OUT)/host/test_allen_gate_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_allen_gate mutant (ALLEN approve proposed): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_allen_gate: FAIL" $<.log && echo "test_allen_gate mutant (ALLEN approve proposed): FAILS as required"; fi
+
+# PI5-7 cut 3 card artifact bundle parser (core/artifact_card.c): the mutant accepts bytes after the last entry (a second, unchecked
+# payload could ride along); test_artifact_card must FAIL against it (red before green). Host only, never part of an image.
+$(OUT)/host/test_artifact_card_mutant: $(KDIR)/tests/test_artifact_card.c $(KDIR)/core/artifact_card.c $(KDIR)/core/artifact_card.h $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_ACARD_MUTANT_TRAILING -o $@ $< $(KDIR)/core/artifact_card.c
+
+artifact-card-mutant: $(OUT)/host/test_artifact_card_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_artifact_card mutant (trailing bytes accepted): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_artifact_card: FAIL" $<.log && echo "test_artifact_card mutant (trailing bytes accepted): FAILS as required"; fi
+
+# TEST-ONLY mutant of core/handoff_check.c (reserved0 check removed): the
+# handoff test must FAIL against it, so "make test" fails if the test stops
+# catching the mutation. Host only (handoff_check.c refuses it freestanding
+# and with CK_HARDWARE_STAGING); never part of an image.
+$(OUT)/host/test_handoff_mutant: $(KDIR)/tests/test_handoff.c $(HOST_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_HANDOFF_MUTANT_SKIP_RESERVED -o $@ $< $(HOST_SRCS)
+
+handoff-mutant: $(OUT)/host/test_handoff_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_handoff mutant (reserved0 check removed): PASSED, test does not catch it"; exit 1; \
+	else grep -F "test_handoff: FAIL" $<.log && echo "test_handoff mutant (reserved0 check removed): FAILS as required"; fi
+
+# TEST-ONLY mutants of core/acpi_dev.c (NEXT-PHASE-3 cut 2): 1 = table
+# signature check removed, 2 = checksum check removed, 3 = length-versus-
+# buffer check removed (truncated table trusted). test_acpi_dev must FAIL
+# against each. Host only (acpi_dev.c refuses CK_AML_MUTANT freestanding).
+acpi-dev-mutant: $(KDIR)/tests/test_acpi_dev.c $(HOST_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+	@mkdir -p $(OUT)/host
+	@for m in 1 2 3; do b=$(OUT)/host/test_acpi_dev_mutant$$m; \
+	  $(HOSTCC) $(HCFLAGS) -DCK_AML_MUTANT=$$m -o $$b $(KDIR)/tests/test_acpi_dev.c $(HOST_SRCS) || exit 1; \
+	  if $$b > $$b.log 2>&1; then cat $$b.log; echo "test_acpi_dev mutant $$m: PASSED, test does not catch it"; exit 1; \
+	  else grep -F "test_acpi_dev: FAIL" $$b.log >/dev/null && echo "test_acpi_dev mutant $$m: FAILS as required" || { cat $$b.log; exit 1; }; fi; done
+
+# TEST-ONLY mutants of the IORT parse/lookup in core/acpi.c: test_smmu must
+# FAIL against each (TRUNCATE: extra mappings dropped instead of the table
+# refused; SEGMENT_BLIND: lookup ignores the PCI segment; OVERLAP_OK:
+# overlapping input ranges in one segment accepted; OTHER_BLIND: mappings to
+# a second SMMUv3 node forgotten, so a GB10-shaped requester reads as "no
+# stream" instead of "behind another SMMU"; RMR_BLIND: RMR nodes ignored, so
+# the GB10 stream would lose its firmware-reserved ranges; RMR_EXCLUSIVE:
+# the RMR stream range read as exclusive, dropping the last stream (the
+# GB10, 0x100); ROUTE_FIRST: every requester routed to the first SMMU, so the
+# GB10 would be programmed on the wrong SMMU). Host only (acpi.c refuses them
+# freestanding and with CK_HARDWARE_STAGING).
+IORT_MUTANTS := CK_IORT_MUTANT_TRUNCATE CK_IORT_MUTANT_SEGMENT_BLIND CK_IORT_MUTANT_OVERLAP_OK CK_IORT_MUTANT_OTHER_BLIND \
+                CK_IORT_MUTANT_RMR_BLIND CK_IORT_MUTANT_RMR_EXCLUSIVE CK_IORT_MUTANT_ROUTE_FIRST
+iort-mutants: $(OUT)/host/test_smmu
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_smmu > $(OUT)/host-mut/iort-base.log 2>&1 || { echo "unmutated test_smmu fails"; fail=1; }; \
+	for m in $(IORT_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_smmu_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) -D$$m -o $$b $(KDIR)/tests/test_smmu.c $(HOST_SRCS); then \
+	    echo "mutant $$m: does not build (FAIL)"; fail=1; continue; fi; \
+	  if $$b > $$b.log 2>&1; then echo "mutant $$m: SURVIVED (FAIL)"; fail=1; \
+	  elif grep -q "^test_smmu: FAIL" $$b.log; then \
+	    echo "mutant $$m: killed ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m: no FAIL verdict (crashed?) (FAIL)"; fail=1; fi; \
+	done; \
+	if $(HOSTCC) $(HCFLAGS) -DCK_HARDWARE_STAGING=1 -DCK_IORT_MUTANT_SEGMENT_BLIND \
+	    -fsyntax-only $(KDIR)/core/acpi.c 2>/dev/null; then \
+	  echo "mutant flag accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	else echo "mutant flag refused under CK_HARDWARE_STAGING"; fi; \
+	if [ $$fail = 0 ]; then echo "CK_IORT_MUTANTS: PASS"; else echo "CK_IORT_MUTANTS: FAIL"; exit 1; fi
+
+# TEST-ONLY mutants of the two-level stream table in core/smmu.c: test_smmu
+# must FAIL against each (SPAN_OVERFLOW: L1STD Span past SPLIT + 1;
+# UNGRANTED_VALID: L1STDs valid before any grant; BAD_L1_PTR: misaligned L1
+# table accepted; L2_NO_FILL: a new L2 page published without abort STEs).
+# Host only (smmu.c refuses them freestanding and with CK_HARDWARE_STAGING).
+# Also kills DROP_EVENT: consuming the queue without visiting its records.
+SMMU_L2_MUTANTS := CK_SMMU_MUTANT_SPAN_OVERFLOW CK_SMMU_MUTANT_UNGRANTED_VALID CK_SMMU_MUTANT_BAD_L1_PTR CK_SMMU_MUTANT_L2_NO_FILL CK_SMMU_MUTANT_DROP_EVENT
+smmu-l2-mutants: $(OUT)/host/test_smmu
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_smmu > $(OUT)/host-mut/smmu-l2-base.log 2>&1 || { echo "unmutated test_smmu fails"; fail=1; }; \
+	for m in $(SMMU_L2_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_smmu_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) -D$$m -o $$b $(KDIR)/tests/test_smmu.c $(HOST_SRCS); then \
+	    echo "mutant $$m: does not build (FAIL)"; fail=1; continue; fi; \
+	  if $$b > $$b.log 2>&1; then echo "mutant $$m: SURVIVED (FAIL)"; fail=1; \
+	  elif grep -q "^test_smmu: FAIL" $$b.log; then \
+	    echo "mutant $$m: killed ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m: no FAIL verdict (crashed?) (FAIL)"; fail=1; fi; \
+	done; \
+	if $(HOSTCC) $(HCFLAGS) -DCK_HARDWARE_STAGING=1 -DCK_SMMU_MUTANT_SPAN_OVERFLOW \
+	    -fsyntax-only $(KDIR)/core/smmu.c 2>/dev/null; then \
+	  echo "mutant flag accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	else echo "mutant flag refused under CK_HARDWARE_STAGING"; fi; \
+	if [ $$fail = 0 ]; then echo "CK_SMMU_L2_MUTANTS: PASS"; else echo "CK_SMMU_L2_MUTANTS: FAIL"; exit 1; fi
+
+test: $(addprefix $(OUT)/host/,$(TESTS)) osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant spinlock-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check
+	@fail=0; for t in $(filter-out osc-receipt-mutants osc-receipt-release osc-code-flip-guard handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants osh-op-mutant pipe-mutant pipe-slice-mutant pipe-bounce-mutant pipe-top-mutant spinlock-mutant context-mutant agent-cmd-mutant allen-gate-mutant artifact-card-mutant artifact-tier-pi5 artifact-tier-mutant test-continuity-subject-restart gsp-fw-inspect-test gsp-cot-test gsp-bindata-test gsp-bootargs-test gsp-rpc-test gb10-gsp-free gb10-gsp-nvhdr-check gb10-gsp-mutants slot-test slot-free package-test slot-loader-check,$^); do $$t || fail=1; done; \
+	if [ $$fail = 0 ]; then echo "CK_CORE_HOST: PASS"; else echo "CK_CORE_HOST: FAIL"; exit 1; fi
+
+sanitize: $(addprefix $(OUT)/host-san/,$(TESTS))
+	@fail=0; for t in $^; do ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 $$t || fail=1; done; \
+	if [ $$fail = 0 ]; then echo "CK_CORE_HOST: PASS (sanitize)"; else echo "CK_CORE_HOST: FAIL (sanitize)"; exit 1; fi
+
+# ---- host tool for the M0_ROLLBACK gate (scripts/qemu_ck_rollback_test.sh) ----
+uefi-vars: $(OUT)/host/ck_uefi_vars
+$(OUT)/host/ck_uefi_vars: $(KDIR)/tools/ck_uefi_vars.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $<
+
+# ---- host tool for the AIENOS_CK_NET gate (scripts/qemu_ck_net_test.sh) ----
+udp-echo: $(OUT)/host/ck_udp_echo
+$(OUT)/host/ck_udp_echo: $(KDIR)/tools/ck_udp_echo.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $<
+
+# ---- receiver for the iMac kernel's network report (run on a machine on the iMac's network) ----
+imac-report-listen: $(OUT)/host/ck_imac_report_listen
+$(OUT)/host/ck_imac_report_listen: $(KDIR)/tools/ck_imac_report_listen.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $<
+
+# Artifact library host test and the in-tree C artifact tool (pack, sign with
+# TEST keys, negative corpus, bundle, receipt check) used by the QEMU gate.
+ART_HOST_SRCS := $(KDIR)/artifact/format.c $(KDIR)/artifact/admission.c $(KDIR)/artifact/receipt.c $(KDIR)/artifact/osc_unit.c $(KDIR)/artifact/osc_receipt.c $(KDIR)/artifact/osc_launch.c \
+	$(NATIVE)/argus/sha256.c $(NATIVE)/sig/sha512.c $(NATIVE)/sig/ed25519.c $(NATIVE)/sig/ct.c
+ART_HOST_INC := -I$(KDIR)/artifact -I$(NATIVE)/sig -I$(NATIVE)/argus
+ART_HOST_DEPS := $(ART_HOST_SRCS) $(wildcard $(KDIR)/artifact/*.h) $(ART_HDRS)
+
+$(OUT)/host/test_artifact: $(KDIR)/tests/test_artifact.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -o $@ $< $(ART_HOST_SRCS)
+
+# PI5-8 Q3: the receipt tier is chosen by the image. test_artifact built with -DCK_PI5 (the Pi image's define) must see
+# SEED-0B-PI5; the mutant (-DCKA_TIER_MUTANT, Pi image still writes the QEMU tier) must make that test FAIL.
+$(OUT)/host/test_artifact_pi5: $(KDIR)/tests/test_artifact.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -DCK_PI5 -o $@ $< $(ART_HOST_SRCS)
+
+$(OUT)/host/test_artifact_pi5_mutant: $(KDIR)/tests/test_artifact.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -DCK_PI5 -DCKA_TIER_MUTANT -o $@ $< $(ART_HOST_SRCS)
+
+artifact-tier-pi5: $(OUT)/host/test_artifact_pi5
+	@$<
+
+artifact-tier-mutant: $(OUT)/host/test_artifact_pi5_mutant
+	@if $< > $<.log 2>&1; then cat $<.log; echo "test_artifact Pi tier mutant (Pi image writes the QEMU tier): PASSED, test does not catch it"; exit 1; \
+	else echo "test_artifact Pi tier mutant (Pi image writes the QEMU tier): FAILS as required"; fi
+
+$(OUT)/host/test_osc_unit: $(KDIR)/tests/test_osc_unit.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -DOSC_FIXTURE_DIR='"$(abspath $(KDIR)/tests/fixtures/osc_unit)"' -o $@ $< $(ART_HOST_SRCS)
+
+$(OUT)/host-san/test_osc_unit: $(KDIR)/tests/test_osc_unit.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(ART_HOST_INC) -DOSC_FIXTURE_DIR='"$(abspath $(KDIR)/tests/fixtures/osc_unit)"' -o $@ $< $(ART_HOST_SRCS)
+
+$(OUT)/host-san/test_artifact: $(KDIR)/tests/test_artifact.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(ART_HOST_INC) -o $@ $< $(ART_HOST_SRCS)
+
+# C3-3a launch: pure parts (artifact/osc_launch.c) plus the spec's own C reference for the argument rule.
+$(OUT)/host/osc-launch-check: $(KDIR)/tests/fixtures/osc_unit/launch/osc-launch-check.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=c99 -O1 -Wall -Wextra -Werror -o $@ $<
+
+$(OUT)/host/test_osc_launch: $(KDIR)/tests/test_osc_launch.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h $(OUT)/host/osc-launch-check
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -DOSC_FIXTURE_DIR='"$(abspath $(KDIR)/tests/fixtures/osc_unit)"' -DOSC_LAUNCH_REF='"$(abspath $(OUT)/host/osc-launch-check)"' -o $@ $< $(ART_HOST_SRCS)
+
+$(OUT)/host-san/test_osc_launch: $(KDIR)/tests/test_osc_launch.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h $(OUT)/host/osc-launch-check
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(ART_HOST_INC) -DOSC_FIXTURE_DIR='"$(abspath $(KDIR)/tests/fixtures/osc_unit)"' -DOSC_LAUNCH_REF='"$(abspath $(OUT)/host/osc-launch-check)"' -o $@ $< $(ART_HOST_SRCS)
+
+# osc_admit.c reporting (oversize Store entry): host test with ck_printf captured.
+$(OUT)/host/test_osc_admit: $(KDIR)/tests/test_osc_admit.c $(KDIR)/core/osc_admit.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -I$(KDIR)/include -o $@ $< $(KDIR)/core/osc_admit.c $(ART_HOST_SRCS)
+
+$(OUT)/host-san/test_osc_admit: $(KDIR)/tests/test_osc_admit.c $(KDIR)/core/osc_admit.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(ART_HOST_INC) -I$(KDIR)/include -o $@ $< $(KDIR)/core/osc_admit.c $(ART_HOST_SRCS)
+
+# aienos#383 realization receipts (artifact/osc_receipt.c): host test over the checker2-minted fixtures
+# (tests/fixtures/osc_receipt) and the kernel's own policy (core/osc_admit.c, release and qualification builds), plus
+# the mutation run: each MUT(n) guard of osc_receipt.c removed in turn (-DOSC_RCPT_MUTANT=n) must make the test FAIL.
+# The run refuses a guard count that differs from OSC_RCPT_MUTANTS, and a kernel-side build of a mutant.
+OSC_RCPT_MUTANTS := 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+OSC_RCPT_TEST_DEF := -DOSC_RCPT_HOST_TEST -I$(KDIR)/include -DOSC_FIXTURE_DIR='"$(abspath $(KDIR)/tests/fixtures)"'
+OSC_RCPT_TEST_SRCS := $(KDIR)/tests/test_osc_receipt.c $(KDIR)/core/osc_admit.c $(ART_HOST_SRCS)
+$(OUT)/host/test_osc_receipt: $(KDIR)/tests/test_osc_receipt.c $(KDIR)/core/osc_admit.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h $(wildcard $(KDIR)/tests/fixtures/osc_receipt/*) $(wildcard $(KDIR)/tests/fixtures/osc_receipt_owner/*)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) $(OSC_RCPT_TEST_DEF) -DCK_SEED0B_TEST_ANCHOR=1 -o $@ $(OSC_RCPT_TEST_SRCS)
+
+$(OUT)/host-san/test_osc_receipt: $(KDIR)/tests/test_osc_receipt.c $(KDIR)/core/osc_admit.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h $(wildcard $(KDIR)/tests/fixtures/osc_receipt/*) $(wildcard $(KDIR)/tests/fixtures/osc_receipt_owner/*)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(ART_HOST_INC) $(OSC_RCPT_TEST_DEF) -DCK_SEED0B_TEST_ANCHOR=1 -o $@ $(OSC_RCPT_TEST_SRCS)
+
+# the same test against the release policy of core/osc_admit.c (no CK_SEED0B_TEST_ANCHOR): every TEST receipt refused
+$(OUT)/host/test_osc_receipt_release: $(KDIR)/tests/test_osc_receipt.c $(KDIR)/core/osc_admit.c $(ART_HOST_DEPS) $(KDIR)/tests/ck_test.h $(wildcard $(KDIR)/tests/fixtures/osc_receipt/*) $(wildcard $(KDIR)/tests/fixtures/osc_receipt_owner/*)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) $(OSC_RCPT_TEST_DEF) -o $@ $(OSC_RCPT_TEST_SRCS)
+
+osc-receipt-release: $(OUT)/host/test_osc_receipt_release
+	@$<
+
+# The code byte flip must be absent from a default object, a seed-anchor object
+# and a launch self-test object. It is present only with CK_OSC_RECEIPT_CODE_FLIP
+# (which also requires CK_OSC_RECEIPT_TEST). The compiler refuses the receipt-test
+# define without that opt-in, the opt-in alone, and the opt-in together with
+# CK_RELEASE_IMAGE, CK_HARDWARE_STAGING, CK_SERVICE, or a release build (no seed
+# anchor). make refuses the make variable for a release build, CK_HARDWARE_STAGING
+# and CK_SERVICE.
+OSC_FLIP_CC := $(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -I$(KDIR)/include
+OSC_FLIP_SRC := $(KDIR)/core/osc_admit.c
+OSC_FLIP_OPT := -DCK_SEED0B_TEST_ANCHOR=1 -DCK_OSC_LAUNCH_TEST=1 -DCK_OSC_RECEIPT_TEST=1 -DCK_OSC_RECEIPT_CODE_FLIP=1
+osc-code-flip-guard:
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	def=$(OUT)/host-mut/osc_admit_default.o; \
+	lau=$(OUT)/host-mut/osc_admit_launch.o; \
+	seed=$(OUT)/host-mut/osc_admit_seed.o; \
+	rcp=$(OUT)/host-mut/osc_admit_receipt.o; \
+	log=$(OUT)/host-mut/osc_flip_guard.log; \
+	if ! $(OSC_FLIP_CC) -c -o $$def $(OSC_FLIP_SRC); then echo "default osc_admit.c failed to compile (FAIL)"; fail=1; \
+	elif grep -aqF "TEST-ONLY post-admission code byte flip" $$def || nm $$def | grep -q ck_osc_receipt_test_code_flip; then \
+	  echo "default osc_admit.o contains the code byte flip (FAIL)"; fail=1; \
+	else echo "default osc_admit.o has no code byte flip"; fi; \
+	if ! $(OSC_FLIP_CC) -DCK_SEED0B_TEST_ANCHOR=1 -c -o $$seed $(OSC_FLIP_SRC); then \
+	  echo "seed-anchor osc_admit.c failed to compile (FAIL)"; fail=1; \
+	elif grep -aqF "TEST-ONLY post-admission code byte flip" $$seed || nm $$seed | grep -q ck_osc_receipt_test_code_flip; then \
+	  echo "CK_SEED0B_TEST_ANCHOR object contains the code byte flip (FAIL)"; fail=1; \
+	else echo "CK_SEED0B_TEST_ANCHOR object has no code byte flip"; fi; \
+	if ! $(OSC_FLIP_CC) -DCK_SEED0B_TEST_ANCHOR=1 -DCK_OSC_LAUNCH_TEST=1 -c -o $$lau $(OSC_FLIP_SRC); then \
+	  echo "launch-test osc_admit.c failed to compile (FAIL)"; fail=1; \
+	elif grep -aqF "TEST-ONLY post-admission code byte flip" $$lau || nm $$lau | grep -q ck_osc_receipt_test_code_flip; then \
+	  echo "CK_OSC_LAUNCH_TEST object contains the code byte flip (FAIL)"; fail=1; \
+	else echo "CK_OSC_LAUNCH_TEST object has no code byte flip"; fi; \
+	if $(OSC_FLIP_CC) -DCK_SEED0B_TEST_ANCHOR=1 -DCK_OSC_LAUNCH_TEST=1 -DCK_OSC_RECEIPT_TEST=1 -fsyntax-only $(OSC_FLIP_SRC) >$$log 2>&1; then \
+	  echo "seed anchor plus CK_OSC_RECEIPT_TEST compiled the flip without CK_OSC_RECEIPT_CODE_FLIP (FAIL)"; fail=1; \
+	elif ! grep -qF "CK_SEED0B_TEST_ANCHOR does not enable the post-admission code byte flip" $$log; then \
+	  echo "missing-opt-in refusal did not name CK_SEED0B_TEST_ANCHOR (FAIL)"; cat $$log; fail=1; \
+	else echo "CK_OSC_RECEIPT_TEST with only the seed anchor refused"; fi; \
+	if ! $(OSC_FLIP_CC) $(OSC_FLIP_OPT) -c -o $$rcp $(OSC_FLIP_SRC); then \
+	  echo "receipt-test osc_admit.c failed to compile (FAIL)"; fail=1; \
+	elif ! grep -aqF "TEST-ONLY post-admission code byte flip" $$rcp || ! nm $$rcp | grep -q ck_osc_receipt_test_code_flip; then \
+	  echo "CK_OSC_RECEIPT_CODE_FLIP object lacks the code byte flip (FAIL)"; fail=1; \
+	else echo "CK_OSC_RECEIPT_CODE_FLIP object contains the code byte flip"; fi; \
+	if $(OSC_FLIP_CC) -DCK_OSC_RECEIPT_CODE_FLIP=1 -fsyntax-only $(OSC_FLIP_SRC) >$$log 2>&1; then \
+	  echo "opt-in alone compiled (FAIL)"; fail=1; \
+	elif ! grep -qF "requires CK_OSC_RECEIPT_TEST" $$log; then \
+	  echo "opt-in-alone refusal did not require CK_OSC_RECEIPT_TEST (FAIL)"; cat $$log; fail=1; \
+	else echo "CK_OSC_RECEIPT_CODE_FLIP alone refused"; fi; \
+	if $(OSC_FLIP_CC) -DCK_OSC_RECEIPT_TEST=1 -DCK_OSC_RECEIPT_CODE_FLIP=1 -fsyntax-only $(OSC_FLIP_SRC) >$$log 2>&1; then \
+	  echo "release build accepted the code byte flip (FAIL)"; fail=1; \
+	elif ! grep -qF "cannot be compiled into a release build" $$log; then \
+	  echo "release refusal did not name the release build (FAIL)"; cat $$log; fail=1; \
+	else echo "code byte flip refused in a release build"; fi; \
+	if $(OSC_FLIP_CC) $(OSC_FLIP_OPT) -DCK_RELEASE_IMAGE=1 -fsyntax-only $(OSC_FLIP_SRC) >$$log 2>&1; then \
+	  echo "CK_RELEASE_IMAGE accepted the code byte flip (FAIL)"; fail=1; \
+	elif ! grep -qF "production or release define is present: CK_RELEASE_IMAGE" $$log; then \
+	  echo "CK_RELEASE_IMAGE refusal did not name CK_RELEASE_IMAGE (FAIL)"; cat $$log; fail=1; \
+	else echo "code byte flip refused with CK_RELEASE_IMAGE"; fi; \
+	if $(OSC_FLIP_CC) $(OSC_FLIP_OPT) -DCK_HARDWARE_STAGING=1 -fsyntax-only $(OSC_FLIP_SRC) >$$log 2>&1; then \
+	  echo "CK_HARDWARE_STAGING accepted the code byte flip (FAIL)"; fail=1; \
+	elif ! grep -qF "production or release define is present: CK_HARDWARE_STAGING" $$log; then \
+	  echo "hardware-staging refusal did not name CK_HARDWARE_STAGING (FAIL)"; cat $$log; fail=1; \
+	else echo "code byte flip refused with CK_HARDWARE_STAGING"; fi; \
+	if $(OSC_FLIP_CC) $(OSC_FLIP_OPT) -DCK_SERVICE=1 -fsyntax-only $(OSC_FLIP_SRC) >$$log 2>&1; then \
+	  echo "CK_SERVICE accepted the code byte flip (FAIL)"; fail=1; \
+	elif ! grep -qF "production or release define is present: CK_SERVICE" $$log; then \
+	  echo "service refusal did not name CK_SERVICE (FAIL)"; cat $$log; fail=1; \
+	else echo "code byte flip refused with CK_SERVICE"; fi; \
+	if $(MAKE) -s -n OUT=$(OUT)/host-mut/flip-mk-rel CK_OSC_RECEIPT_TEST=1 full >$$log 2>&1; then \
+	  echo "make accepted CK_OSC_RECEIPT_TEST on a release build (FAIL)"; fail=1; \
+	elif ! grep -qF "cannot be compiled into a release build" $$log; then \
+	  echo "make release refusal did not name the release build (FAIL)"; cat $$log; fail=1; \
+	else echo "make refuses CK_OSC_RECEIPT_TEST on a release build"; fi; \
+	if $(MAKE) -s -n OUT=$(OUT)/host-mut/flip-mk-hw CK_OSC_RECEIPT_TEST=1 CK_HARDWARE_STAGING=1 CK_OWNER_PUBKEYS=$(KDIR)/tests/fixtures/owner/TEST-FIXTURE-owner-pubkeys.txt CK_MACHINE_ID=$(KDIR)/tests/fixtures/owner/TEST-FIXTURE-machine-id.txt full >$$log 2>&1; then \
+	  echo "make accepted CK_OSC_RECEIPT_TEST with CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	elif ! grep -qF "cannot be combined with CK_HARDWARE_STAGING" $$log; then \
+	  echo "make hardware-staging refusal did not name CK_HARDWARE_STAGING (FAIL)"; cat $$log; fail=1; \
+	else echo "make refuses CK_OSC_RECEIPT_TEST with CK_HARDWARE_STAGING"; fi; \
+	if $(MAKE) -s -n OUT=$(OUT)/host-mut/flip-mk-svc CK_SERVICE=1 CK_OSC_RECEIPT_TEST=1 full >$$log 2>&1; then \
+	  echo "make accepted CK_OSC_RECEIPT_TEST with CK_SERVICE (FAIL)"; fail=1; \
+	elif ! grep -qF "cannot be combined with CK_SERVICE" $$log; then \
+	  echo "make service refusal did not name CK_SERVICE (FAIL)"; cat $$log; fail=1; \
+	else echo "make refuses CK_OSC_RECEIPT_TEST with CK_SERVICE"; fi; \
+	if [ $$fail = 0 ]; then echo "CK_OSC_CODE_FLIP_GUARD: PASS"; else echo "CK_OSC_CODE_FLIP_GUARD: FAIL"; exit 1; fi
+
+osc-receipt-mutants: $(OUT)/host/test_osc_receipt
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	tags=$$(grep -o 'MUT([0-9]*)' $(KDIR)/artifact/osc_receipt.c | sort -u | wc -l); \
+	uses=$$(grep -o 'MUT([0-9]*)' $(KDIR)/artifact/osc_receipt.c | wc -l); \
+	if [ $$tags != $(words $(OSC_RCPT_MUTANTS)) ] || [ $$uses != $$tags ]; then \
+	  echo "guard count: $$uses uses, $$tags distinct, $(words $(OSC_RCPT_MUTANTS)) mutants listed (FAIL)"; fail=1; fi; \
+	$(OUT)/host/test_osc_receipt > $(OUT)/host-mut/osc_receipt_base.log 2>&1 || { echo "unmutated test_osc_receipt fails"; fail=1; }; \
+	killed=0; \
+	for m in $(OSC_RCPT_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_osc_receipt_m$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) $(OSC_RCPT_TEST_DEF) -DCK_SEED0B_TEST_ANCHOR=1 -DOSC_RCPT_MUTANT=$$m -o $$b $(OSC_RCPT_TEST_SRCS); then \
+	    echo "mutant $$m: does not build (FAIL)"; fail=1; continue; fi; \
+	  if $$b > $$b.log 2>&1; then echo "mutant $$m: SURVIVED (FAIL)"; fail=1; \
+	  elif grep -q "^test_osc_receipt: FAIL" $$b.log; then killed=$$((killed + 1)); \
+	    echo "mutant $$m: killed ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m: no FAIL verdict (crashed?) (FAIL)"; fail=1; fi; \
+	done; \
+	if $(HOSTCC) $(HCFLAGS) $(ART_HOST_INC) -DOSC_RCPT_MUTANT=1 -fsyntax-only $(KDIR)/artifact/osc_receipt.c 2>/dev/null; then \
+	  echo "mutant flag accepted without OSC_RCPT_HOST_TEST (FAIL)"; fail=1; \
+	else echo "mutant flag refused without OSC_RCPT_HOST_TEST"; fi; \
+	if [ $$fail = 0 ]; then echo "CK_OSC_RECEIPT_MUTANTS: PASS ($$killed of $(words $(OSC_RCPT_MUTANTS)) killed)"; else echo "CK_OSC_RECEIPT_MUTANTS: FAIL"; exit 1; fi
+
+# Continuity codec (C port cut 1, contract CONTINUITY_RECOVERY_CONTRACT.md,
+# aienos#222): host test plus TEST-only -D mutants, each of which must make
+# the test print its FAIL verdict. Mutant flags are refused under
+# CK_HARDWARE_STAGING (svc/continuity_codec.h).
+CC_HOST_SRCS := $(KDIR)/svc/continuity_codec.c $(NATIVE)/argus/sha256.c $(NATIVE)/store/store_v1.c
+CC_HOST_INC := -I$(KDIR)/svc -I$(NATIVE)/argus -I$(NATIVE)/store
+CC_HOST_DEPS := $(wildcard $(KDIR)/tests/fixtures/continuity_*.txt) $(CC_HOST_SRCS) $(KDIR)/svc/continuity_codec.h $(NATIVE)/argus/sha256.h \
+	$(NATIVE)/store/store_v1.h $(KDIR)/tests/ck_test.h
+# Cut 2 adds UNCHECKED_FORK_SUM (wrapping fork-count sum), MANIFEST_LAST_WAL_ZERO
+# (only the golden vectors see it), SKIP_D1 and SKIP_D2 (test-side: the golden
+# or the decode-agreement comparison is skipped; the test counts its
+# comparisons, so skipping one is a FAIL).
+CC_MUTANTS := CC_MUTANT_SKIP_TAKE_BOUND CC_MUTANT_ACCEPT_RESERVED CC_MUTANT_CHILD_INDEX_LE \
+	CC_MUTANT_TRUNCATE_AT_CAP CC_MUTANT_UNCHECKED_FORK_SUM CC_MUTANT_MANIFEST_LAST_WAL_ZERO \
+	CC_MUTANT_SKIP_D1 CC_MUTANT_SKIP_D2
+# Rust-emitted fixtures (D-1, D-2) read by the test at run time.
+CC_FIXTURES := $(abspath $(KDIR)/tests/fixtures)
+CC_FIXTURE_DEF := -DCC_FIXTURE_DIR='"$(CC_FIXTURES)"'
+
+$(OUT)/host/test_continuity_codec: $(KDIR)/tests/test_continuity_codec.c $(CC_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(CC_HOST_INC) $(CC_FIXTURE_DEF) -o $@ $< $(CC_HOST_SRCS)
+
+$(OUT)/host-san/test_continuity_codec: $(KDIR)/tests/test_continuity_codec.c $(CC_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(CC_HOST_INC) $(CC_FIXTURE_DEF) -o $@ $< $(CC_HOST_SRCS)
+
+continuity-mutants: $(OUT)/host/test_continuity_codec continuity-resolve-mutants continuity-commit-mutants continuity-recovery-mutants continuity-subject-mutants continuity-subject-provision-mutants
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_continuity_codec > $(OUT)/host-mut/base.log 2>&1 || { echo "unmutated test_continuity_codec fails"; fail=1; }; \
+	for m in $(CC_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_continuity_codec_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) $(CC_HOST_INC) $(CC_FIXTURE_DEF) -D$$m -o $$b $(KDIR)/tests/test_continuity_codec.c $(CC_HOST_SRCS); then \
+	    echo "mutant $$m: does not build (FAIL)"; fail=1; continue; fi; \
+	  if $$b > $$b.log 2>&1; then echo "mutant $$m: SURVIVED (FAIL)"; fail=1; \
+	  elif grep -q "^test_continuity_codec: FAIL" $$b.log; then \
+	    echo "mutant $$m: killed ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m: no FAIL verdict (crashed?) (FAIL)"; fail=1; fi; \
+	done; \
+	if $(HOSTCC) $(HCFLAGS) $(CC_HOST_INC) -DCK_HARDWARE_STAGING=1 -DCC_MUTANT_SKIP_TAKE_BOUND \
+	    -fsyntax-only $(KDIR)/svc/continuity_codec.c 2>/dev/null; then \
+	  echo "mutant flag accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	else echo "mutant flag refused under CK_HARDWARE_STAGING"; fi; \
+	if [ $$fail = 0 ]; then echo "CK_CONTINUITY_CODEC_MUTANTS: PASS"; else echo "CK_CONTINUITY_CODEC_MUTANTS: FAIL"; exit 1; fi
+
+# Continuity resolve + challenge/HMAC (C port cut 3): host test over the REAL
+# sealed Store in a file (native/store + m5 + crypto + disk), TEST-only -D
+# mutants, each of which must make the test print its FAIL verdict. Mutant flags
+# are refused under CK_HARDWARE_STAGING (svc/continuity_resolve.h).
+CR_STORE_SRCS := $(NATIVE)/store/store_v1.c $(NATIVE)/store/store_engine.c $(NATIVE)/store/store_disk.c \
+	$(NATIVE)/store/store_sealed.c $(NATIVE)/store/torn_slot.c $(NATIVE)/disk/disk.c $(NATIVE)/disk/disk_file.c \
+	$(NATIVE)/m5/m5_keys.c $(NATIVE)/m5/m5_envelope.c $(NATIVE)/m5/m5_state.c $(NATIVE)/crypto/aes.c \
+	$(NATIVE)/crypto/polyval.c $(NATIVE)/crypto/gcm_siv.c $(NATIVE)/crypto/hmac.c $(NATIVE)/crypto/ct.c
+CR_HOST_SRCS := $(KDIR)/svc/continuity_resolve.c $(KDIR)/svc/continuity_resolve_sealed.c \
+	$(KDIR)/svc/continuity_codec.c $(NATIVE)/argus/sha256.c $(CR_STORE_SRCS)
+CR_HOST_INC := -I$(KDIR)/svc -I$(NATIVE)/argus -I$(NATIVE)/store -I$(NATIVE)/disk -I$(NATIVE)/m5 -I$(NATIVE)/crypto
+CR_HOST_DEPS := $(wildcard $(KDIR)/tests/fixtures/continuity_*.txt) $(CR_HOST_SRCS) $(wildcard $(KDIR)/svc/continuity_*.h) \
+	$(wildcard $(NATIVE)/store/*.h $(NATIVE)/m5/*.h $(NATIVE)/disk/*.h $(NATIVE)/crypto/*.h) $(KDIR)/tests/ck_test.h
+CR_FIXTURE_DEF := -DCR_FIXTURE_DIR='"$(CC_FIXTURES)"'
+# MC-2 orphan check, MC-4 previous, MC-12 conflict, MR-2 digest, MR-3 action,
+# MR-4 16-byte compare, MR-8 bare SHA-256 and no domain.
+CR_MUTANTS := CR_MUTANT_NO_ORPHAN_CHECK CR_MUTANT_IGNORE_PREVIOUS CR_MUTANT_SKIP_CONFLICT \
+	CR_MUTANT_CHALLENGE_NO_DIGEST CR_MUTANT_CHALLENGE_NO_ACTION CR_MUTANT_COMPARE_16 \
+	CR_MUTANT_BARE_SHA256 CR_MUTANT_NO_DOMAIN
+
+$(OUT)/host/test_continuity_resolve: $(KDIR)/tests/test_continuity_resolve.c $(CR_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(CR_HOST_INC) $(CR_FIXTURE_DEF) -o $@ $< $(CR_HOST_SRCS)
+
+$(OUT)/host-san/test_continuity_resolve: $(KDIR)/tests/test_continuity_resolve.c $(CR_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(CR_HOST_INC) $(CR_FIXTURE_DEF) -o $@ $< $(CR_HOST_SRCS)
+
+continuity-resolve-mutants: $(OUT)/host/test_continuity_resolve
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_continuity_resolve > $(OUT)/host-mut/resolve_base.log 2>&1 || { echo "unmutated test_continuity_resolve fails"; fail=1; }; \
+	for m in $(CR_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_continuity_resolve_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) $(CR_HOST_INC) $(CR_FIXTURE_DEF) -D$$m -o $$b $(KDIR)/tests/test_continuity_resolve.c $(CR_HOST_SRCS); then \
+	    echo "mutant $$m: does not build (FAIL)"; fail=1; continue; fi; \
+	  if $$b > $$b.log 2>&1; then echo "mutant $$m: SURVIVED (FAIL)"; fail=1; \
+	  elif grep -q "^test_continuity_resolve: FAIL" $$b.log; then \
+	    echo "mutant $$m: killed ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m: no FAIL verdict (crashed?) (FAIL)"; fail=1; fi; \
+	done; \
+	for m in $(CR_MUTANTS); do \
+	  if $(HOSTCC) $(HCFLAGS) $(CR_HOST_INC) -DCK_HARDWARE_STAGING=1 -D$$m \
+	      -fsyntax-only $(KDIR)/svc/continuity_resolve.c 2>/dev/null; then \
+	    echo "mutant flag $$m accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	  else echo "mutant flag $$m refused under CK_HARDWARE_STAGING"; fi; \
+	done; \
+	if [ $$fail = 0 ]; then echo "CK_CONTINUITY_RESOLVE_MUTANTS: PASS"; else echo "CK_CONTINUITY_RESOLVE_MUTANTS: FAIL"; exit 1; fi
+
+
+# Continuity provision/commit/resume (C port cut 4): host test over the REAL sealed
+# Store in a file with the real ck_rng over a mocked RNDR, power cuts at every
+# checkpoint and block boundary, and TEST-only -D mutants, each of which must make
+# the test print its FAIL verdict. Mutant flags are refused under
+# CK_HARDWARE_STAGING (svc/continuity_commit.h; MC-11 in svc/continuity_codec.h).
+CM_HOST_SRCS := $(KDIR)/svc/continuity_commit.c $(CR_HOST_SRCS) $(KDIR)/core/entropy.c
+CM_HOST_INC := $(CR_HOST_INC) -I$(KDIR)/core
+CM_HOST_DEPS := $(CM_HOST_SRCS) $(wildcard $(KDIR)/svc/continuity_*.h) $(KDIR)/core/entropy.h \
+	$(wildcard $(NATIVE)/store/*.h $(NATIVE)/m5/*.h $(NATIVE)/disk/*.h $(NATIVE)/crypto/*.h) $(KDIR)/tests/ck_test.h
+# MC-1 resume provisions, MC-3 resume skips the commit, MC-7 provision with a root,
+# MC-8 split transaction, MC-9 writable check removed, MC-10 fixed agent id,
+# MC-11 silent truncation (the codec's CC_MUTANT_TRUNCATE_AT_CAP).
+CM_MUTANTS := CM_MUTANT_RESUME_PROVISIONS CM_MUTANT_RESUME_NO_COMMIT CM_MUTANT_PROVISION_WITH_ROOT \
+	CM_MUTANT_SPLIT_TXN CM_MUTANT_NO_WRITABLE_CHECK CM_MUTANT_FIXED_AGENT CC_MUTANT_TRUNCATE_AT_CAP
+
+$(OUT)/host/test_continuity_commit: $(KDIR)/tests/test_continuity_commit.c $(CM_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -o $@ $< $(CM_HOST_SRCS)
+
+$(OUT)/host-san/test_continuity_commit: $(KDIR)/tests/test_continuity_commit.c $(CM_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(CM_HOST_INC) -o $@ $< $(CM_HOST_SRCS)
+
+continuity-commit-mutants: $(OUT)/host/test_continuity_commit
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_continuity_commit > $(OUT)/host-mut/commit_base.log 2>&1 || { echo "unmutated test_continuity_commit fails"; fail=1; }; \
+	for m in $(CM_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_continuity_commit_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -D$$m -o $$b $(KDIR)/tests/test_continuity_commit.c $(CM_HOST_SRCS); then \
+	    echo "mutant $$m: does not build (FAIL)"; fail=1; continue; fi; \
+	  if $$b > $$b.log 2>&1; then echo "mutant $$m: SURVIVED (FAIL)"; fail=1; \
+	  elif grep -q "^test_continuity_commit: FAIL" $$b.log; then \
+	    echo "mutant $$m: killed ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m: no FAIL verdict (crashed?) (FAIL)"; fail=1; fi; \
+	done; \
+	for m in $(CM_MUTANTS); do \
+	  if $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -DCK_HARDWARE_STAGING=1 -D$$m \
+	      -fsyntax-only $(KDIR)/svc/continuity_commit.c 2>/dev/null; then \
+	    echo "mutant flag $$m accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	  else echo "mutant flag $$m refused under CK_HARDWARE_STAGING"; fi; \
+	done; \
+	if [ $$fail = 0 ]; then echo "CK_CONTINUITY_COMMIT_MUTANTS: PASS"; else echo "CK_CONTINUITY_COMMIT_MUTANTS: FAIL"; exit 1; fi
+
+# ALLEN subject state (continuity object kind 24; ARCH-0035 / OS-0018, PROPOSED):
+# host test over the REAL sealed Store in a file, a two-process restart proof
+# (test-continuity-subject-restart) and TEST-only -D mutants, each of which must
+# make the test print its FAIL verdict. Mutant flags are refused under
+# CK_HARDWARE_STAGING (svc/continuity_subject.h).
+CS_HOST_SRCS := $(KDIR)/svc/continuity_subject.c $(CM_HOST_SRCS)
+CS_HOST_DEPS := $(CS_HOST_SRCS) $(wildcard $(KDIR)/svc/continuity_*.h) $(KDIR)/core/entropy.h \
+	$(wildcard $(NATIVE)/store/*.h $(NATIVE)/m5/*.h $(NATIVE)/disk/*.h $(NATIVE)/crypto/*.h) $(KDIR)/tests/ck_test.h
+# MS-1 foreign root/agent accepted at resolve, MS-2 two active intents in one slot
+# accepted, MS-3 intent id derivation not checked, MS-4 chain fork accepted.
+CS_MUTANTS := CS_MUTANT_ACCEPT_FOREIGN CS_MUTANT_ACCEPT_TWO_ACTIVE CS_MUTANT_SKIP_INTENT_ID CS_MUTANT_ACCEPT_FORK
+
+$(OUT)/host/test_continuity_subject: $(KDIR)/tests/test_continuity_subject.c $(CS_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -o $@ $< $(CS_HOST_SRCS)
+
+$(OUT)/host-san/test_continuity_subject: $(KDIR)/tests/test_continuity_subject.c $(CS_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(CM_HOST_INC) -o $@ $< $(CS_HOST_SRCS)
+
+# ALLEN-G2 on the host: the writer process provisions and commits a subject with
+# one standing intent and exits; a second process reopens the same Store image,
+# resolves the same subject object and finds the same intent.
+.PHONY: test-continuity-subject-restart
+test-continuity-subject-restart: $(OUT)/host/test_continuity_subject
+	@mkdir -p $(OUT)/host-subject; img=$(OUT)/host-subject/allen.img; rm -f $$img; \
+	$(OUT)/host/test_continuity_subject --write $$img > $(OUT)/host-subject/write.log || { cat $(OUT)/host-subject/write.log; exit 1; }; \
+	id=$$(sed -n 's/^ALLEN subject id: //p' $(OUT)/host-subject/write.log); \
+	test -n "$$id" || { echo "no subject id from the writer"; exit 1; }; \
+	$(OUT)/host/test_continuity_subject --restore $$img $$id > $(OUT)/host-subject/restore.log || { cat $(OUT)/host-subject/restore.log; exit 1; }; \
+	grep -h '^ALLEN' $(OUT)/host-subject/write.log $(OUT)/host-subject/restore.log; \
+	echo "CK_CONTINUITY_SUBJECT_RESTART: PASS (two processes, sealed Store image $$img)"
+
+continuity-subject-mutants: $(OUT)/host/test_continuity_subject
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_continuity_subject > $(OUT)/host-mut/subject_base.log 2>&1 || { echo "unmutated test_continuity_subject fails"; fail=1; }; \
+	for m in $(CS_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_continuity_subject_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -D$$m -o $$b $(KDIR)/tests/test_continuity_subject.c $(CS_HOST_SRCS); then \
+	    echo "mutant $$m does not build (FAIL)"; fail=1; continue; fi; \
+	  $$b > $$b.log 2>&1; \
+	  if grep -q "^test_continuity_subject: FAIL" $$b.log; then echo "mutant $$m caught"; \
+	  else echo "mutant $$m NOT caught (FAIL)"; fail=1; fi; \
+	  if $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -DCK_HARDWARE_STAGING=1 -D$$m \
+	      -fsyntax-only $(KDIR)/svc/continuity_subject.c 2>/dev/null; then \
+	    echo "mutant flag $$m accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	  else echo "mutant flag $$m refused under CK_HARDWARE_STAGING"; fi; \
+	done; \
+	if [ $$fail = 0 ]; then echo "CK_CONTINUITY_SUBJECT_MUTANTS: PASS"; else echo "CK_CONTINUITY_SUBJECT_MUTANTS: FAIL"; exit 1; fi
+
+# ALLEN genesis at identity provisioning (svc/continuity_subject_provision.c;
+# ARCH-0035 / OS-0018, PROPOSED): identity and genesis subject in ONE Store
+# transaction, power cuts at every checkpoint and block boundary, and the
+# TEST-only split-transaction mutant (MSP-1), which the test must catch. The
+# mutant flag is refused under CK_HARDWARE_STAGING.
+CSP_HOST_SRCS := $(KDIR)/svc/continuity_subject_provision.c $(CS_HOST_SRCS)
+CSP_HOST_DEPS := $(CSP_HOST_SRCS) $(CS_HOST_DEPS)
+CSP_MUTANTS := CS_MUTANT_PROVISION_SPLIT_TXN
+
+$(OUT)/host/test_continuity_subject_provision: $(KDIR)/tests/test_continuity_subject_provision.c $(CSP_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -o $@ $< $(CSP_HOST_SRCS)
+
+$(OUT)/host-san/test_continuity_subject_provision: $(KDIR)/tests/test_continuity_subject_provision.c $(CSP_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(CM_HOST_INC) -o $@ $< $(CSP_HOST_SRCS)
+
+continuity-subject-provision-mutants: $(OUT)/host/test_continuity_subject_provision
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_continuity_subject_provision > $(OUT)/host-mut/subject_provision_base.log 2>&1 || { echo "unmutated test_continuity_subject_provision fails"; fail=1; }; \
+	for m in $(CSP_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_continuity_subject_provision_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -D$$m -o $$b $(KDIR)/tests/test_continuity_subject_provision.c $(CSP_HOST_SRCS); then \
+	    echo "mutant $$m does not build (FAIL)"; fail=1; continue; fi; \
+	  $$b > $$b.log 2>&1; \
+	  if grep -q "^test_continuity_subject_provision: FAIL" $$b.log; then echo "mutant $$m caught ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m NOT caught (FAIL)"; fail=1; fi; \
+	  if $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -DCK_HARDWARE_STAGING=1 -D$$m \
+	      -fsyntax-only $(KDIR)/svc/continuity_subject_provision.c 2>/dev/null; then \
+	    echo "mutant flag $$m accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	  else echo "mutant flag $$m refused under CK_HARDWARE_STAGING"; fi; \
+	done; \
+	if [ $$fail = 0 ]; then echo "CK_CONTINUITY_SUBJECT_PROVISION_MUTANTS: PASS"; else echo "CK_CONTINUITY_SUBJECT_PROVISION_MUTANTS: FAIL"; exit 1; fi
+
+# Continuity Recovery Core (C port cut 5): host test over the REAL sealed Store in a
+# file, TEST-only -D mutants, each of which must make the test print its FAIL verdict.
+# Mutant flags are refused under CK_HARDWARE_STAGING (svc/continuity_recovery.h).
+RC_HOST_SRCS := $(KDIR)/svc/continuity_recovery.c $(CM_HOST_SRCS)
+RC_HOST_DEPS := $(RC_HOST_SRCS) $(wildcard $(KDIR)/svc/continuity_*.h) $(KDIR)/core/entropy.h \
+	$(wildcard $(NATIVE)/store/*.h $(NATIVE)/m5/*.h $(NATIVE)/disk/*.h $(NATIVE)/crypto/*.h) $(KDIR)/tests/ck_test.h
+# MR-1 inspection writes, MR-5 degraded mount read as Unprovisioned, MR-6 repair zeroes the
+# active slot, MR-7 repair without a resolved identity, MR-9 operator provisioning writes
+# source Qualification. (MR-2, MR-3, MR-4, MR-8 are the cut 3 mutants.)
+RC_MUTANTS := RC_MUTANT_INSPECT_WRITES RC_MUTANT_DEGRADED_IS_UNPROVISIONED RC_MUTANT_REPAIR_ACTIVE \
+	RC_MUTANT_REPAIR_NO_IDENTITY RC_MUTANT_PROVISION_QUALIFICATION
+
+$(OUT)/host/test_continuity_recovery: $(KDIR)/tests/test_continuity_recovery.c $(RC_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -o $@ $< $(RC_HOST_SRCS)
+
+$(OUT)/host-san/test_continuity_recovery: $(KDIR)/tests/test_continuity_recovery.c $(RC_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(CM_HOST_INC) -o $@ $< $(RC_HOST_SRCS)
+
+# K-6 region geometry (cut 7): host test over the real sealed Store in a file; needs dev/disk_layout.h.
+$(OUT)/host/test_continuity_geometry: $(KDIR)/tests/test_continuity_geometry.c $(RC_HOST_DEPS) $(KDIR)/dev/disk_layout.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -I$(KDIR)/dev -o $@ $< $(RC_HOST_SRCS)
+
+$(OUT)/host-san/test_continuity_geometry: $(KDIR)/tests/test_continuity_geometry.c $(RC_HOST_DEPS) $(KDIR)/dev/disk_layout.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) $(CM_HOST_INC) -I$(KDIR)/dev -o $@ $< $(RC_HOST_SRCS)
+
+continuity-recovery-mutants: $(OUT)/host/test_continuity_recovery
+	@mkdir -p $(OUT)/host-mut; fail=0; \
+	$(OUT)/host/test_continuity_recovery > $(OUT)/host-mut/recovery_base.log 2>&1 || { echo "unmutated test_continuity_recovery fails"; fail=1; }; \
+	for m in $(RC_MUTANTS); do \
+	  b=$(OUT)/host-mut/test_continuity_recovery_$$m; \
+	  if ! $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -D$$m -o $$b $(KDIR)/tests/test_continuity_recovery.c $(RC_HOST_SRCS); then \
+	    echo "mutant $$m: does not build (FAIL)"; fail=1; continue; fi; \
+	  if $$b > $$b.log 2>&1; then echo "mutant $$m: SURVIVED (FAIL)"; fail=1; \
+	  elif grep -q "^test_continuity_recovery: FAIL" $$b.log; then \
+	    echo "mutant $$m: killed ($$(grep -c '^  FAIL ' $$b.log) checks failed)"; \
+	  else echo "mutant $$m: no FAIL verdict (crashed?) (FAIL)"; fail=1; fi; \
+	done; \
+	for m in $(RC_MUTANTS); do \
+	  if $(HOSTCC) $(HCFLAGS) $(CM_HOST_INC) -DCK_HARDWARE_STAGING=1 -D$$m \
+	      -fsyntax-only $(KDIR)/svc/continuity_recovery.c 2>/dev/null; then \
+	    echo "mutant flag $$m accepted under CK_HARDWARE_STAGING (FAIL)"; fail=1; \
+	  else echo "mutant flag $$m refused under CK_HARDWARE_STAGING"; fi; \
+	done; \
+	if [ $$fail = 0 ]; then echo "CK_CONTINUITY_RECOVERY_MUTANTS: PASS"; else echo "CK_CONTINUITY_RECOVERY_MUTANTS: FAIL"; exit 1; fi
+
+ART_TOOL := $(OUT)/host/ck_artifact_tool
+$(ART_TOOL): $(KDIR)/tools/ck_artifact_tool.c $(ART_HOST_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror $(ART_HOST_INC) -o $@ $< $(ART_HOST_SRCS)
+tool: $(ART_TOOL)
+
+# Boot-disk image tool (scripts/qemu_ck_artifact_test.sh): writes signed artifacts
+# into the sealed Store on a raw NVMe image with the kernel's own Store code
+# (store_boot.c, artifact_store.c). Hosted; never part of an image.
+STORE_IMG_TOOL := $(OUT)/host/ck_store_image
+STORE_IMG_SRCS := $(STAGE_OWN_SRCS) $(KDIR)/core/ipc.c $(STAGE_NATIVE_SRCS) $(NATIVE)/disk/disk_file.c \
+	$(KDIR)/svc/tests/ck_host.c $(KDIR)/tools/ck_store_image.c
+$(STORE_IMG_TOOL): $(STORE_IMG_SRCS) $(STAGE_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(STAGE_HOST_FLAGS) $(STAGE_INC) -o $@ $(STORE_IMG_SRCS)
+store-image: $(STORE_IMG_TOOL)
+
+# N3 memory gate tool (scripts/qemu_ck_memory_test.sh, aienos#329): appends a
+# foreign-bound or a corrupted record to the Cortex journal of a provisioned
+# TEST-keys disk image. Hosted; never part of an image.
+CORTEX_IMG_TOOL := $(OUT)/host/ck_cortex_image
+CORTEX_IMG_SRCS := $(STAGE_OWN_SRCS) $(KDIR)/core/ipc.c $(STAGE_NATIVE_SRCS) $(NATIVE)/disk/disk_file.c \
+	$(KDIR)/svc/tests/ck_host.c $(STAGE_CORTEX_SRCS) $(KDIR)/core/context.c $(KDIR)/tools/ck_cortex_image.c
+$(CORTEX_IMG_TOOL): $(CORTEX_IMG_SRCS) $(STAGE_HDRS) $(KDIR)/core/context.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(STAGE_HOST_FLAGS) $(STAGE_INC) -o $@ $(CORTEX_IMG_SRCS)
+cortex-image: $(CORTEX_IMG_TOOL)
+
+# Continuity / Recovery Core QEMU gate tool (scripts/qemu_ck_continuity_test.sh,
+# scripts/qemu_ck_recovery_test.sh): operator response, degraded-peer injection,
+# AgentRoot corruption on a boot-disk image. Hosted; never part of an image.
+CONT_TOOL := $(OUT)/host/ck_cont_tool
+CONT_TOOL_SRCS := $(STAGE_OWN_SRCS) $(KDIR)/core/ipc.c $(STAGE_NATIVE_SRCS) $(NATIVE)/disk/disk_file.c \
+	$(KDIR)/svc/tests/ck_host.c $(KDIR)/svc/continuity_resolve.c $(KDIR)/svc/continuity_codec.c \
+	$(KDIR)/svc/continuity_resolve_sealed.c $(KDIR)/svc/continuity_subject.c \
+	$(KDIR)/tools/ck_cont_tool.c
+$(CONT_TOOL): $(CONT_TOOL_SRCS) $(STAGE_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(STAGE_HOST_FLAGS) $(STAGE_INC) -idirafter $(KDIR)/core -o $@ $(CONT_TOOL_SRCS)
+cont-tool: $(CONT_TOOL)
+
+# GPT boot-disk image tool (QEMU gates; hosted, never part of an image).
+GPT_IMG_TOOL := $(OUT)/host/ck_gpt_image
+GPT_IMG_SRCS := $(KDIR)/dev/disk_part.c $(NATIVE)/disk/disk.c $(NATIVE)/disk/disk_file.c \
+	$(KDIR)/tools/gpt_write.c $(KDIR)/tools/ck_gpt_image.c
+$(GPT_IMG_TOOL): $(GPT_IMG_SRCS) $(KDIR)/dev/disk_part.h $(KDIR)/tools/gpt_write.h $(NATIVE)/disk/disk.h $(BOOT)/slot_format.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -I$(KDIR)/dev -I$(KDIR)/tools -I$(NATIVE)/disk -o $@ $(GPT_IMG_SRCS)
+gpt-image: $(GPT_IMG_TOOL)
+
+# MODEL.MAP tool (model ingest gate + the attended-boot staging; hosted, never
+# part of an image). SHA-256 is the kernel's own (argus).
+MODEL_MAP_TOOL := $(OUT)/host/ck_model_map
+$(MODEL_MAP_TOOL): $(KDIR)/tools/ck_model_map.c $(NATIVE)/argus/sha256.c $(BOOT)/model_map.h $(NATIVE)/argus/sha256.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -I$(BOOT) -I$(NATIVE)/argus -o $@ $(KDIR)/tools/ck_model_map.c $(NATIVE)/argus/sha256.c
+model-map: $(MODEL_MAP_TOOL)
+
+# GSP firmware container inspector (aienos#286 cut C, host work only: inventory
+# and refusal checks for the NVIDIA GSP-RM ELF container the pinned Linux
+# driver loads for the GB10; docs/GB10_FIRMWARE_INVENTORY.md). Never loads
+# anything. SHA-256 is the kernel's own (argus). The real file is optional:
+# when absent the inspect step is NOT_RUN, the self-test still runs.
+GSP_FW_TOOL := $(OUT)/host/ck_gsp_fw_inspect
+GSP_FW_FILE ?= /lib/firmware/nvidia/580.173.02/gsp_ga10x.bin
+GSP_FW_SHA256 := 32cb7cf3e77f97e92f6e92135939ccb3ba382748144569c0dfccf3338d43d963
+$(GSP_FW_TOOL): $(KDIR)/tools/ck_gsp_fw_inspect.c $(NATIVE)/argus/sha256.c $(NATIVE)/argus/sha256.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -I$(NATIVE)/argus -o $@ $(KDIR)/tools/ck_gsp_fw_inspect.c $(NATIVE)/argus/sha256.c
+gsp-fw-inspect: $(GSP_FW_TOOL)
+gsp-fw-inspect-test: $(GSP_FW_TOOL)
+	$(GSP_FW_TOOL) selftest
+	@if [ -r "$(GSP_FW_FILE)" ]; then \
+	  out=$$($(GSP_FW_TOOL) inspect "$(GSP_FW_FILE)" --family gb10y --expect-version 580.173.02) || { echo "$$out"; echo "CK_GSP_FW_INSPECT_PIN: FAIL (refused)"; exit 1; }; \
+	  echo "$$out" | grep -E '^(fwversion|build_id|signature_section|sha256_file|RESULT)'; \
+	  echo "$$out" | grep -q '^sha256_file $(GSP_FW_SHA256)$$' && echo "CK_GSP_FW_INSPECT_PIN: PASS" || { echo "CK_GSP_FW_INSPECT_PIN: FAIL (digest differs from the pin)"; exit 1; }; \
+	else echo "CK_GSP_FW_INSPECT_PIN: NOT_RUN ($(GSP_FW_FILE) absent)"; fi
+
+# ---- host encoder/decoder for the SEC2 chain-of-trust boot message (aienos#286 cut C/D host work) ----
+# Byte-exact NVDM-over-MCTP packet and GSP_FMC_BOOT_PARAMS layouts from the pinned
+# driver source; self-test = layouts, golden headers, round trips, every mutation refused.
+# Never loads anything. docs/GB10_FIRMWARE_INVENTORY.md section 10.
+GSP_COT_TOOL := $(OUT)/host/ck_gsp_cot_encode
+$(GSP_COT_TOOL): $(KDIR)/tools/ck_gsp_cot_encode.c $(NATIVE)/argus/sha256.c $(NATIVE)/argus/sha256.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -I$(NATIVE)/argus -o $@ $(KDIR)/tools/ck_gsp_cot_encode.c $(NATIVE)/argus/sha256.c
+gsp-cot-encode: $(GSP_COT_TOOL)
+gsp-cot-test: $(GSP_COT_TOOL)
+	$(GSP_COT_TOOL) selftest | grep -E '^CK_GSP_COT_ENCODE_SELFTEST: (PASS|FAIL)' | grep -q PASS || { $(GSP_COT_TOOL) selftest | grep -E 'FAIL|SELFTEST'; exit 1; }
+	@$(GSP_COT_TOOL) selftest | tail -1
+
+# ---- host extractor for the GB10B firmware arrays compiled into the pinned driver (aienos#286 cut C host work) ----
+# Parses the two public generated files g_bindata_kgspGetBinArchive{GspRmBoot,GspRmFmcGfwProdSigned}_GB10B.c
+# (MIT), cross-checks every size/flag/record, inflates the compressed descriptor with our own
+# DEFLATE decoder (CRC-32 + ISIZE trailer verified), checks UCODE_HASH == SHA-384(UCODE_IMAGE)
+# and the RM_RISCV_UCODE_DESC offsets, and writes the arrays as files. Never loads anything.
+# The driver files are optional (fetch them from the 580.173.02 tag into GSP_BINDATA_DIR);
+# when absent the pin step is NOT_RUN, the self-test still runs. docs/GB10_FIRMWARE_INVENTORY.md 3.3 and 11.
+GSP_BINDATA_TOOL := $(OUT)/host/ck_gsp_bindata_extract
+GSP_BINDATA_DIR ?= $(HOME)/.cache/aienos/open-gpu-kernel-modules-580.173.02
+GSP_BINDATA_FMC_IMAGE_SHA256 := b13ead4b9a6b8a0d268f3094cc4f4521d6be8a9a525edbc9a8f3f397c86f1f2e
+GSP_BINDATA_BOOT_PROD_SHA256 := 427a691d8453f02548d395f40ac900eb0d5b8ea864e8f14f958eef890ba400a2
+$(GSP_BINDATA_TOOL): $(KDIR)/tools/ck_gsp_bindata_extract.c $(NATIVE)/argus/sha256.c $(NATIVE)/argus/sha256.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -I$(NATIVE)/argus -o $@ $(KDIR)/tools/ck_gsp_bindata_extract.c $(NATIVE)/argus/sha256.c
+gsp-bindata-extract: $(GSP_BINDATA_TOOL)
+gsp-bindata-test: $(GSP_BINDATA_TOOL)
+	$(GSP_BINDATA_TOOL) selftest | grep -E '^CK_GSP_BINDATA_EXTRACT_SELFTEST: (PASS|FAIL)' | grep -q PASS || { $(GSP_BINDATA_TOOL) selftest | grep -E 'FAIL|SELFTEST'; exit 1; }
+	@$(GSP_BINDATA_TOOL) selftest | tail -1
+	@fmc="$(GSP_BINDATA_DIR)/g_bindata_kgspGetBinArchiveGspRmFmcGfwProdSigned_GB10B.c"; boot="$(GSP_BINDATA_DIR)/g_bindata_kgspGetBinArchiveGspRmBoot_GB10B.c"; \
+	if [ -r "$$fmc" ] && [ -r "$$boot" ]; then \
+	  out=$$($(GSP_BINDATA_TOOL) extract "$$fmc") || { echo "$$out"; echo "CK_GSP_BINDATA_PIN: FAIL (FMC file refused)"; exit 1; }; \
+	  echo "$$out" | grep -E '^(hash384|array .* UCODE_IMAGE |RESULT)'; \
+	  echo "$$out" | grep -q '^array .* UCODE_IMAGE .* size=195912 sha256=$(GSP_BINDATA_FMC_IMAGE_SHA256)$$' || { echo "CK_GSP_BINDATA_PIN: FAIL (FMC image digest differs from the pin)"; exit 1; }; \
+	  out=$$($(GSP_BINDATA_TOOL) extract "$$boot") || { echo "$$out"; echo "CK_GSP_BINDATA_PIN: FAIL (boot file refused)"; exit 1; }; \
+	  echo "$$out" | grep -E '^(desc UCODE_DESC_PROD|array .* UCODE_IMAGE_PROD |RESULT)'; \
+	  echo "$$out" | grep -q '^array .* UCODE_IMAGE_PROD .* size=196608 sha256=$(GSP_BINDATA_BOOT_PROD_SHA256)$$' || { echo "CK_GSP_BINDATA_PIN: FAIL (boot PROD image digest differs from the pin)"; exit 1; }; \
+	  echo "$$out" | grep -q '^desc UCODE_DESC_PROD version=5 manifest=0x0+0xa00 monitor_data=0xa00+0xa600 monitor_code=0xb000+0x24d00 monitor_enabled=1 ' || { echo "CK_GSP_BINDATA_PIN: FAIL (descriptor differs from the pin)"; exit 1; }; \
+	  echo "CK_GSP_BINDATA_PIN: PASS"; \
+	else echo "CK_GSP_BINDATA_PIN: NOT_RUN ($(GSP_BINDATA_DIR) lacks the two GB10B bindata files)"; fi
+
+# ---- host encoder/decoder for the GSP-RM boot-argument blocks (aienos#286 cut C host work) ----
+# Byte-exact GspFwWprMeta (256), libos init-argument page, log-buffer PTE prefix,
+# GSP_ARGUMENTS_CACHED page, RPC shared-buffer page table and radix-3 ELF table, with
+# the GB10B values traced from the pinned driver (heap 133 MiB, 7 logs + RMARGS, 129 PTEs).
+# Self-test = compiler layouts, golden constants, round trips, every mutation refused.
+# Never loads anything. docs/GB10_FIRMWARE_INVENTORY.md section 12.
+GSP_BOOTARGS_TOOL := $(OUT)/host/ck_gsp_boot_args_encode
+$(GSP_BOOTARGS_TOOL): $(KDIR)/tools/ck_gsp_boot_args_encode.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $(KDIR)/tools/ck_gsp_boot_args_encode.c
+gsp-bootargs-encode: $(GSP_BOOTARGS_TOOL)
+gsp-bootargs-test: $(GSP_BOOTARGS_TOOL)
+	$(GSP_BOOTARGS_TOOL) selftest | grep -E '^CK_GSP_BOOT_ARGS_ENCODE_SELFTEST: (PASS|FAIL)' | grep -q PASS || { $(GSP_BOOTARGS_TOOL) selftest | grep -E 'FAIL|SELFTEST'; exit 1; }
+	@$(GSP_BOOTARGS_TOOL) selftest | tail -1
+
+# ---- host encoder/decoder for the GSP-RM message queue (aienos#286 cut C host part 5) ----
+# Byte-exact msgqTxHeader/msgqRxHeader, GSP_MSG_QUEUE_ELEMENT with checksum and sequence
+# rules, rpc_message_header_v03_00, continuation-record plan and PACKED_REGISTRY_TABLE,
+# all from the pinned driver. Self-test = compiler layouts, golden bytes, round trips,
+# every mutation refused. Never touches a device. docs/GB10_FIRMWARE_INVENTORY.md section 13.
+GSP_RPC_TOOL := $(OUT)/host/ck_gsp_rpc_encode
+$(GSP_RPC_TOOL): $(KDIR)/tools/ck_gsp_rpc_encode.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $(KDIR)/tools/ck_gsp_rpc_encode.c
+gsp-rpc-encode: $(GSP_RPC_TOOL)
+gsp-rpc-test: $(GSP_RPC_TOOL)
+	$(GSP_RPC_TOOL) selftest | grep -E '^CK_GSP_RPC_ENCODE_SELFTEST: (PASS|FAIL)' | grep -q PASS || { $(GSP_RPC_TOOL) selftest | grep -E 'FAIL|SELFTEST'; exit 1; }
+	@$(GSP_RPC_TOOL) selftest | tail -1
+
+# ---- GspSystemInfo encoder (L332 rung 2 window 1): the 936 bytes of GSP_SET_SYSTEM_INFO from a
+# "field value" text file. gsp-sysinfo-test = anchors, a known encoding, every refusal.
+# gsp-sysinfo-nvhdr-test = our field list against NVIDIA's own struct text, cut out of the pinned
+# tree (OGKM_DIR) at build time by line range; each cut is checked to start and end where expected.
+GSP_SI_TOOL := $(OUT)/host/ck_gsp_sysinfo_encode
+$(GSP_SI_TOOL): $(KDIR)/tools/ck_gsp_sysinfo_encode.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $<
+gsp-sysinfo-test: $(GSP_SI_TOOL)
+	$(GSP_SI_TOOL) selftest | grep -E '^CK_GSP_SYSINFO_ENCODE_SELFTEST: (PASS|FAIL)' | grep -q PASS || { $(GSP_SI_TOOL) selftest | grep -E 'FAIL|SELFTEST'; exit 1; }
+	@$(GSP_SI_TOOL) selftest | tail -1
+GSP_SI_NV := $(OUT)/host/gsp_sysinfo_nvidia.h
+gsp-sysinfo-nvhdr-test: $(KDIR)/tools/ck_gsp_sysinfo_encode.c
+	@test -d $(OGKM_SRC) || { echo "GSP_SYSINFO_NVHDR: FAIL (no open-gpu-kernel-modules 580.173.02 tree at OGKM_DIR=$(OGKM_DIR))"; exit 1; }
+	@mkdir -p $(OUT)/host
+	@cut() { sed -n "$$2,$$3p" "$(OGKM_SRC)/$$1" > $(GSP_SI_NV).part; \
+	  head -1 $(GSP_SI_NV).part | grep -q "$$4" && tail -1 $(GSP_SI_NV).part | grep -q "$$5" || \
+	  { echo "GSP_SYSINFO_NVHDR: FAIL ($$1:$$2-$$3 is not $$4 .. $$5)"; exit 1; }; cat $(GSP_SI_NV).part >> $(GSP_SI_NV); }; \
+	: > $(GSP_SI_NV); \
+	cut common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h 747 747 'NV0073_CTRL_SYSTEM_ACPI_ID_MAP_MAX_DISPLAYS' '(16U)' && \
+	cut nvidia/inc/kernel/gpu/gpu_acpi_data.h 72 115 'typedef struct DOD_METHOD_DATA' '} ACPI_METHOD_DATA;' && \
+	cut nvidia/generated/g_chipset_nvoc.h 220 227 'typedef struct' '} BUSINFO;' && \
+	cut nvidia/inc/kernel/gpu/gsp/gsp_static_config.h 45 62 'typedef struct GSP_VF_INFO' '} GSP_PCIE_CONFIG_REG;' && \
+	cut nvidia/inc/kernel/gpu/gsp/gsp_static_config.h 172 227 'typedef struct GspSystemInfo' '} GspSystemInfo;'
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror $(OGKM_INC) -DCK_SYSINFO_NVHDR='"$(GSP_SI_NV)"' \
+	  -o $(OUT)/host/ck_gsp_sysinfo_nvhdr $(KDIR)/tools/ck_gsp_sysinfo_encode.c
+	$(OUT)/host/ck_gsp_sysinfo_nvhdr nvhdr
+
+# ---- GB10 GSP boot builder, freestanding (L192, aienos#286 cut C host side) ----
+# dev/gb10_gsp_boot.c composes every block above into one arena plus the SEC2 COT packet and the
+# post-init RPCs (GSP_RM_ALLOC / CONTROL / FREE, GET_GSP_STATIC_INFO). Bytes in memory only: no
+# MMIO, no firmware load. Not linked into any image yet. docs/GB10_FIRMWARE_INVENTORY.md section 14.
+#   test_gb10_gsp_boot (in TESTS): layout, cross-links, ring, refusals, decoded at hand-written offsets
+#   gb10-gsp-free:        compiles with KCFLAGS, no undefined symbols, every frame <= 4 KiB of stack
+#   gb10-gsp-nvhdr-test:  mirrors vs the NVIDIA headers themselves (OGKM_DIR, MIT); FAILS if absent
+#   gb10-gsp-nvhdr-check: same, NOT_RUN when OGKM_DIR is absent (used by make test)
+#   gb10-gsp-mutants:     each test-only mutant must make test_gb10_gsp_boot or the nvhdr test FAIL
+GSPB_SRCS := $(KDIR)/dev/gb10_gsp_boot.c
+GSPB_DEPS := $(KDIR)/tests/test_gb10_gsp_boot.c $(GSPB_SRCS) $(KDIR)/dev/gb10_gsp_boot.h $(KDIR)/tests/ck_test.h
+$(OUT)/host/test_gb10_gsp_boot: $(GSPB_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/dev -o $@ $< $(GSPB_SRCS)
+$(OUT)/host-san/test_gb10_gsp_boot: $(GSPB_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/dev -o $@ $< $(GSPB_SRCS)
+test-gb10-gsp-boot: $(OUT)/host/test_gb10_gsp_boot
+	$<
+gb10-gsp-free: $(GSPB_SRCS) $(KDIR)/dev/gb10_gsp_boot.h
+	@mkdir -p $(OUT)/free
+	$(KCC) $(KCFLAGS) -Wstack-usage=4096 -c $(GSPB_SRCS) -o $(OUT)/free/gb10_gsp_boot.o
+	@bad=$$($(CROSS)nm -u $(OUT)/free/gb10_gsp_boot.o | awk '{print $$2}' | grep -vxF -e _GLOBAL_OFFSET_TABLE_ || true); \
+	if [ -n "$$bad" ]; then echo "GB10_GSP_FREE: FAIL unexpected undefined symbols: $$bad"; exit 1; fi; \
+	echo "GB10_GSP_FREE: PASS (no undefined symbols, stack <= 4096 per function)"
+OGKM_DIR ?= $(HOME)/workspace/_ext/open-gpu-kernel-modules-580.173.02
+OGKM_SRC := $(OGKM_DIR)/src
+OGKM_INC := -I$(OGKM_SRC)/common/sdk/nvidia/inc -I$(OGKM_SRC)/nvidia/arch/nvalloc/common/inc \
+	-I$(OGKM_SRC)/common/uproc/os/common/include -I$(OGKM_SRC)/nvidia/inc/kernel -I$(OGKM_SRC)/nvidia/inc \
+	-I$(OGKM_SRC)/nvidia/generated -I$(OGKM_SRC)/common/shared/msgq/inc -I$(OGKM_SRC)/nvidia/interface \
+	-I$(OGKM_SRC)/common/inc
+GSPB_NV_DEPS := $(KDIR)/tests/test_gb10_gsp_nvhdr.c $(GSPB_SRCS) $(KDIR)/dev/gb10_gsp_boot.h $(KDIR)/tests/ck_test.h
+gb10-gsp-nvhdr-test: $(GSPB_NV_DEPS)
+	@test -r $(OGKM_SRC)/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h || \
+	  { echo "GB10_GSP_NVHDR: FAIL (no open-gpu-kernel-modules 580.173.02 tree at OGKM_DIR=$(OGKM_DIR))"; exit 1; }
+	@mkdir -p $(OUT)/host-san
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/dev $(OGKM_INC) -o $(OUT)/host-san/test_gb10_gsp_nvhdr $< $(GSPB_SRCS)
+	$(OUT)/host-san/test_gb10_gsp_nvhdr
+gb10-gsp-nvhdr-check:
+	@if [ -r $(OGKM_SRC)/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h ]; then $(MAKE) --no-print-directory gb10-gsp-nvhdr-test; \
+	else echo "GB10_GSP_NVHDR: NOT_RUN (no open-gpu-kernel-modules 580.173.02 tree at OGKM_DIR=$(OGKM_DIR))"; fi
+GSPB_MUTANTS := SWAPRX CKSUM RADIX ALLOCLEN
+gb10-gsp-mutants: $(GSPB_DEPS) $(GSPB_NV_DEPS)
+	@mkdir -p $(OUT)/host
+	@fail=0; for m in $(GSPB_MUTANTS); do \
+	  $(HOSTCC) $(HCFLAGS) -DGSP_MUTANT_HOST -DGSP_MUTANT_$$m -I$(KDIR)/dev -o $(OUT)/host/test_gb10_gsp_boot_mut_$$m $(KDIR)/tests/test_gb10_gsp_boot.c $(GSPB_SRCS) || exit 1; \
+	  if $(OUT)/host/test_gb10_gsp_boot_mut_$$m >/dev/null; then echo "MUTANT SURVIVED: $$m"; fail=1; else echo "mutant killed: $$m"; fi; \
+	done; test $$fail -eq 0
+.PHONY: test-gb10-gsp-boot gb10-gsp-free gb10-gsp-nvhdr-test gb10-gsp-nvhdr-check gb10-gsp-mutants
+
+# ---- native image slots: host tool + freestanding check (native v1 plan P11 cut 1, gate N7) ----
+# native/boot/slot_format.h + slot_select.c: the A/B slot manifest, control record and the
+# loader's selection rules (bounded candidate tries, generation floor, no boot loop, an
+# exhausted candidate never boots on its own authority). docs/NATIVE_IMAGE_SLOTS.md.
+# ck_slot_tool builds/signs/verifies manifests and simulates the decision; its self-test
+# is the format's oracle. slot-free proves slot_select.c compiles with the kernel's
+# freestanding flags and needs only the image's own digest/signature primitives.
+# No image code changes in this cut; the loader does not read slots yet.
+SLOT_TOOL := $(OUT)/host/ck_slot_tool
+SLOT_TOOL_SRCS := $(KDIR)/tools/ck_slot_tool.c $(BOOT)/slot_select.c $(BOOT)/slot_control.c $(BOOT)/slot_update.c $(NATIVE)/disk/disk.c $(NATIVE)/sig/sha512.c \
+	$(NATIVE)/sig/ed25519.c $(NATIVE)/sig/ct.c $(NATIVE)/argus/sha256.c $(NATIVE)/store/torn_slot.c
+$(SLOT_TOOL): $(SLOT_TOOL_SRCS) $(BOOT)/slot_format.h $(BOOT)/slot_control.h $(BOOT)/slot_update.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $(SLOT_TOOL_SRCS)
+slot-tool: $(SLOT_TOOL)
+# P11 cut 3: the service image's slot key table (see SVC_SLOT_KEY_SRC above).
+ifneq ($(SVC_SLOT_KEYS_C),)
+$(SVC_SLOT_KEYS_C): $(SLOT_TOOL) FORCE
+	@mkdir -p $(dir $@)
+	@$(SLOT_TOOL) keys-c $(SVC_SLOT_KEY_SRC) --out $@
+endif
+slot-test: $(SLOT_TOOL)
+	$(SLOT_TOOL) selftest | grep -E '^CK_SLOT_TOOL_SELFTEST: (PASS|FAIL)' | grep -q PASS || { $(SLOT_TOOL) selftest | grep -E 'FAIL|SELFTEST'; exit 1; }
+	@$(SLOT_TOOL) selftest | tail -1
+SLOT_FREE_ALLOWED_U := aienos_sha512 aienos_ed25519_verify sha256_hash _GLOBAL_OFFSET_TABLE_
+slot-free: $(BOOT)/slot_select.c $(BOOT)/slot_format.h
+	@mkdir -p $(OUT)/free
+	$(KCC) $(KCFLAGS) -c $(BOOT)/slot_select.c -o $(OUT)/free/slot_select.o
+	@bad=$$($(CROSS)nm -u $(OUT)/free/slot_select.o | awk '{print $$2}' | grep -vxF $(foreach a,$(SLOT_FREE_ALLOWED_U),-e $(a)) || true); \
+	if [ -n "$$bad" ]; then echo "slot-free: FAIL unexpected undefined symbols: $$bad"; exit 1; fi; \
+	echo "SLOT_FREE: PASS (undefined: $(SLOT_FREE_ALLOWED_U))"
+
+# ---- reproducible native package (scripts/native_package.sh, P11 cut 1b) ----
+# Builds the image twice from a clean tree, refuses if they differ, records
+# PACKAGE.txt + SHA256SUMS, binds them into the slot manifest's provenance and
+# verifies the owner signature. package-test = scripts/native_package_test.sh
+# (TEST signer and TEST-FIXTURE owner files only; ~35 s; nothing booted).
+package-test: $(SLOT_TOOL)
+	NATIVE_PACKAGE_TOOL_OUT=$(OUT) bash $(REPO)/scripts/native_package_test.sh | grep -E '^NATIVE_PACKAGE_TEST: (PASS|FAIL)' | grep -q PASS || { NATIVE_PACKAGE_TOOL_OUT=$(OUT) bash $(REPO)/scripts/native_package_test.sh | grep -E '^FAIL|NATIVE_PACKAGE_TEST'; exit 1; }
+	@echo "NATIVE_PACKAGE_TEST: PASS"
+
+# ---- SLOTLDR.EFI: the signed A/B slot loader (native v1 plan P11 cut 2a, gate N7) ----
+# native/boot/slot_loader.c: a separate UEFI application in FRONT of the unchanged
+# stub + kernel image (BOOTAA64.EFI is not touched). It reads the slots partition,
+# verifies both slots against the keys baked in here, applies slot_select.c, commits
+# the control record before a candidate try, then LoadImage + StartImage of the
+# verified bytes. Own object list: no kernel objects (checked), no runtime services,
+# no UEFI variables, no ExitBootServices (checked in the source). Keys: CK_SLOT_KEYS
+# or CK_TEST_SLOT_KEY=1 (see the top of this file). docs/NATIVE_IMAGE_SLOTS.md.
+#   make slot-loader CK_TEST_SLOT_KEY=1        -> $(OUT)/SLOTLDR.EFI (TEST-ONLY key)
+#   make slot-loader CK_SLOT_KEYS=<file>       -> $(OUT)/SLOTLDR.EFI (owner keys)
+#   make slot-loader-check                      build checks + refusals (in make test)
+# QEMU gate: scripts/qemu_ck_slot_loader_test.sh (AIENOS_CK_SLOT_LOADER).
+SLOTLDR_DIR := $(OUT)/slotldr
+SLOTLDR_ELF := $(SLOTLDR_DIR)/slotldr.elf
+SLOTLDR_EFI := $(OUT)/SLOTLDR.EFI
+SLOTLDR_KEYS_C := $(SLOTLDR_DIR)/slot_keys.c
+SLOTLDR_C := $(BOOT)/slot_loader.c $(BOOT)/slot_select.c $(BOOT)/slot_control.c $(NATIVE)/sig/sha512.c $(NATIVE)/sig/ed25519.c \
+	$(NATIVE)/sig/ct.c $(NATIVE)/argus/sha256.c $(NATIVE)/store/torn_slot.c $(KDIR)/core/libc_min.c \
+	$(KDIR)/core/fmt.c
+SLOTLDR_OBJS := $(patsubst $(NATIVE)/%.c,$(SLOTLDR_DIR)/obj/%.o,$(SLOTLDR_C)) \
+	$(SLOTLDR_DIR)/obj/boot/efi_entry.o $(SLOTLDR_DIR)/obj/slot_keys.o
+SLOTLDR_CFLAGS := $(KCFLAGS) $(ART_INC) -I$(NATIVE)/store
+SLOTLDR_HDRS := $(BOOT)/slot_format.h $(BOOT)/slot_control.h $(BOOT)/efi.h $(NATIVE)/store/torn_slot.h $(KDIR)/core/fmt.h $(ART_HDRS)
+SLOTLDR_KEY_SRC := $(if $(strip $(CK_TEST_SLOT_KEY)),--test-key,$(if $(strip $(CK_SLOT_KEYS)),--keys $(abspath $(CK_SLOT_KEYS)),))
+$(SLOTLDR_DIR)/obj/%.o: $(NATIVE)/%.c $(SLOTLDR_HDRS)
+	@mkdir -p $(dir $@)
+	$(KCC) $(SLOTLDR_CFLAGS) -c -o $@ $<
+$(SLOTLDR_DIR)/obj/boot/slot_loader.o: $(BOOT)/slot_loader.c $(SLOTLDR_HDRS) $(OUT)/commit.stamp
+	@mkdir -p $(dir $@)
+	$(KCC) $(SLOTLDR_CFLAGS) -DAIENOS_COMMIT='"$(AIENOS_COMMIT)"' -c -o $@ $<
+$(SLOTLDR_DIR)/obj/boot/efi_entry.o: $(BOOT)/efi_entry.S
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -c -o $@ $<
+# Rewritten only when the key table changes (ck_slot_tool keys-c compares).
+$(SLOTLDR_KEYS_C): $(SLOT_TOOL) FORCE
+	@[ -n "$(SLOTLDR_KEY_SRC)" ] || { echo "slot-loader: give CK_SLOT_KEYS=<owner public keys file> or CK_TEST_SLOT_KEY=1 (TEST only)"; exit 1; }
+	@mkdir -p $(dir $@)
+	@$(SLOT_TOOL) keys-c $(SLOTLDR_KEY_SRC) --out $@
+$(SLOTLDR_DIR)/obj/slot_keys.o: $(SLOTLDR_KEYS_C)
+	@mkdir -p $(dir $@)
+	$(KCC) $(SLOTLDR_CFLAGS) -c -o $@ $<
+$(SLOTLDR_ELF): $(SLOTLDR_OBJS) $(BOOT)/image.ld
+	@if grep -nE -- '->(RuntimeServices|ExitBootServices|SetVariable|GetVariable|SetWatchdogTimer)' $(BOOT)/slot_loader.c; then \
+	  echo "slot_loader.c calls a service the slot loader must never call"; exit 1; fi
+	$(call link_image,$@,$(SLOTLDR_OBJS))
+	@k=$$($(KNM) $@ | grep -E ' [TtDdBbRr] (ck_kernel_entry|kmain|ck_boot_model_load|ck_printf)$$' || true); \
+	if [ -n "$$k" ]; then echo "SLOTLDR links kernel objects: $$k"; rm -f $@; exit 1; fi
+	@if [ "$(strip $(CK_TEST_SLOT_KEY))" = 1 ]; then \
+	  grep -aqF "TEST-ONLY key" $@ || { echo "TEST-key SLOTLDR lacks its TEST-ONLY announcement"; rm -f $@; exit 1; }; \
+	elif grep -aqF "TEST-ONLY" $@; then echo "owner-key SLOTLDR carries a TEST-ONLY note"; rm -f $@; exit 1; fi
+$(SLOTLDR_EFI): $(SLOTLDR_ELF)
+	$(call pe_image,$<,$@)
+slot-loader: $(SLOTLDR_EFI)
+SLOTLDR_FIXTURE_KEYS := $(KDIR)/tests/fixtures/owner/TEST-FIXTURE-owner-pubkeys.txt
+slot-loader-check:
+	@$(MAKE) -s --no-print-directory OUT=$(OUT)/slotldr-check-test CK_TEST_SLOT_KEY=1 slot-loader >/dev/null
+	@grep -aqF "TEST-ONLY key" $(OUT)/slotldr-check-test/SLOTLDR.EFI
+	@$(MAKE) -s --no-print-directory OUT=$(OUT)/slotldr-check-owner CK_SLOT_KEYS=$(SLOTLDR_FIXTURE_KEYS) slot-loader >/dev/null
+	@if grep -aqF "TEST-ONLY" $(OUT)/slotldr-check-owner/SLOTLDR.EFI; then echo "SLOT_LOADER_BUILD: FAIL owner-key loader carries TEST-ONLY"; exit 1; fi
+	@for c in "CK_HARDWARE_STAGING=1 CK_TEST_SLOT_KEY=1|cannot be combined with CK_HARDWARE_STAGING" \
+	          "CK_TEST_SLOT_KEY=1 CK_SLOT_KEYS=$(SLOTLDR_FIXTURE_KEYS)|are exclusive" \
+	          "CK_SLOT_KEYS=$(SLOTLDR_FIXTURE_KEYS:.txt=.missing)|cannot read the keys file" \
+	          "|give CK_SLOT_KEYS"; do \
+	  args=$${c%%|*}; want=$${c#*|}; \
+	  if $(MAKE) -s --no-print-directory OUT=$(OUT)/slotldr-check-refuse $$args slot-loader >$(OUT)/slotldr-refuse.log 2>&1; then \
+	    echo "SLOT_LOADER_BUILD: FAIL not refused: $$args"; exit 1; fi; \
+	  grep -qF -- "$$want" $(OUT)/slotldr-refuse.log || { echo "SLOT_LOADER_BUILD: FAIL refused without '$$want': $$args"; cat $(OUT)/slotldr-refuse.log; exit 1; }; \
+	  echo "slot-loader refused as required: $${args:-no key source} ($$want)"; \
+	done
+	@echo "SLOT_LOADER_BUILD: PASS (TEST-key and owner-key loaders built; TEST key refused with hardware staging)"
+
+# ---- PI5DIAG.EFI: AIENOS-PI5-BOOT-0, the Raspberry Pi 5 firmware diagnostic ----
+# native/boot/diag_main.c: a UEFI application that reports what the firmware shows
+# (ConOut + \EFI\AIENOS\PI5BOOT0.TXT) and returns. Own object list, no kernel, no
+# ExitBootServices (checked). Copy to the card as EFI/BOOT/BOOTAA64.EFI.
+#   make pi5-diag     -> $(OUT)/PI5DIAG.EFI      QEMU test: scripts/qemu_ck_pi5_diag_test.sh
+PI5DIAG_DIR := $(OUT)/pi5diag
+PI5DIAG_ELF := $(PI5DIAG_DIR)/pi5diag.elf
+PI5DIAG_EFI := $(OUT)/PI5DIAG.EFI
+PI5DIAG_OBJS := $(PI5DIAG_DIR)/diag_main.o $(PI5DIAG_DIR)/efi_entry.o $(PI5DIAG_DIR)/fmt.o $(PI5DIAG_DIR)/libc_min.o
+$(PI5DIAG_DIR)/diag_main.o: $(BOOT)/diag_main.c $(BOOT)/diag.h $(BOOT)/efi.h $(KDIR)/core/fmt.h
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -c -o $@ $<
+$(PI5DIAG_DIR)/efi_entry.o: $(BOOT)/efi_entry.S
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -c -o $@ $<
+$(PI5DIAG_DIR)/fmt.o: $(KDIR)/core/fmt.c $(KDIR)/core/fmt.h
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -c -o $@ $<
+$(PI5DIAG_DIR)/libc_min.o: $(KDIR)/core/libc_min.c
+	@mkdir -p $(dir $@)
+	$(KCC) $(KCFLAGS) -c -o $@ $<
+$(PI5DIAG_ELF): $(PI5DIAG_OBJS) $(BOOT)/image.ld
+	@if grep -nE -- '->ExitBootServices' $(BOOT)/diag_main.c || grep -nE -- 'rt->' $(BOOT)/diag_main.c | grep -vE -- 'rt->ResetSystem'; then \
+	  echo "diag_main.c calls a service the diagnostic must never call (only ResetSystem is allowed)"; exit 1; fi
+	$(call link_image,$@,$(PI5DIAG_OBJS))
+	@k=$$($(KNM) $@ | grep -E ' [TtDdBbRr] (ck_kernel_entry|kmain|ck_boot_model_load|ck_printf)$$' || true); \
+	if [ -n "$$k" ]; then echo "PI5DIAG links kernel objects: $$k"; rm -f $@; exit 1; fi
+$(PI5DIAG_EFI): $(PI5DIAG_ELF)
+	$(call pe_image,$<,$@)
+pi5-diag: $(PI5DIAG_EFI)
+
+# ---- IMACDIAG.EFI: AIENOS-IMAC-BOOT-0, the same diagnostic for x86_64 (2017 iMac) ----
+# diag_main.c + diag_x86.c (CPUID, SMBIOS identity, PCI, GOP, disks), report in
+# \EFI\AIENOS\IMACBOOT.TXT, then power off. The only x86_64 image in this tree: its own
+# cross toolchain and flags (-mabi=ms: every function uses the UEFI x64 convention),
+# its own entry (efi_entry_x86_64.S) and PE header (image_x86_64.ld, Machine 0x8664).
+# Copy to a FAT stick as EFI/BOOT/BOOTX64.EFI.
+#   make imac-diag    -> $(OUT)/IMACDIAG.EFI     QEMU test: scripts/qemu_ck_imac_diag_test.sh
+ifeq ($(HOST_ARCH),x86_64)
+X86_CROSS ?=
+else
+X86_CROSS ?= x86_64-linux-gnu-
+endif
+X86CC := $(X86_CROSS)gcc
+X86LD := $(X86_CROSS)ld
+X86OBJCOPY := $(X86_CROSS)objcopy
+X86NM := $(X86_CROSS)nm
+X86READELF := $(X86_CROSS)readelf
+X86CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding -nostdlib -fno-builtin \
+	-fno-stack-protector -fno-tree-loop-distribute-patterns -mgeneral-regs-only -mno-red-zone \
+	-mabi=ms -fcf-protection=none -fno-asynchronous-unwind-tables -fpie -fvisibility=hidden -fno-plt \
+	-I$(KDIR)/core -I$(BOOT)
+X86LDFLAGS := -nostdlib -pie --no-dynamic-linker -z norelro -z noexecstack -z max-page-size=4096 \
+	--no-warn-rwx-segments -T $(BOOT)/image_x86_64.ld
+IMACDIAG_DIR := $(OUT)/imacdiag
+IMACDIAG_ELF := $(IMACDIAG_DIR)/imacdiag.elf
+IMACDIAG_EFI := $(OUT)/IMACDIAG.EFI
+IMACDIAG_OBJS := $(IMACDIAG_DIR)/diag_main.o $(IMACDIAG_DIR)/diag_x86.o $(IMACDIAG_DIR)/efi_entry_x86_64.o \
+	$(IMACDIAG_DIR)/fmt.o $(IMACDIAG_DIR)/libc_min.o
+$(IMACDIAG_DIR)/diag_main.o: $(BOOT)/diag_main.c $(BOOT)/diag.h $(BOOT)/efi.h $(KDIR)/core/fmt.h
+$(IMACDIAG_DIR)/diag_x86.o: $(BOOT)/diag_x86.c $(BOOT)/diag.h $(BOOT)/efi.h
+$(IMACDIAG_DIR)/efi_entry_x86_64.o: $(BOOT)/efi_entry_x86_64.S
+$(IMACDIAG_DIR)/fmt.o: $(KDIR)/core/fmt.c $(KDIR)/core/fmt.h
+$(IMACDIAG_DIR)/libc_min.o: $(KDIR)/core/libc_min.c
+$(IMACDIAG_OBJS):
+	@mkdir -p $(dir $@)
+	$(X86CC) $(X86CFLAGS) -c -o $@ $<
+$(IMACDIAG_ELF): $(IMACDIAG_OBJS) $(BOOT)/image_x86_64.ld
+	@if grep -nE -- '->ExitBootServices' $(BOOT)/diag_main.c $(BOOT)/diag_x86.c || grep -nE -- 'rt->' $(BOOT)/diag_main.c $(BOOT)/diag_x86.c | grep -vE -- 'rt->ResetSystem'; then \
+	  echo "the diagnostic calls a service it must never call (only ResetSystem is allowed)"; exit 1; fi
+	@mkdir -p $(dir $@)
+	$(X86LD) $(X86LDFLAGS) -o $@ $(IMACDIAG_OBJS)
+	@u=$$($(X86NM) -u $@ | grep -v ' w ' || true); \
+	if [ -n "$$u" ]; then echo "image has undefined symbols: $$u"; rm -f $@; exit 1; fi
+	@bad=$$($(X86READELF) -rW $@ | grep -E '^[0-9a-f]+ ' | grep -v R_X86_64_RELATIVE || true); \
+	if [ -n "$$bad" ]; then echo "image has non-RELATIVE relocations:"; echo "$$bad"; rm -f $@; exit 1; fi
+	@k=$$($(X86NM) $@ | grep -E ' [TtDdBbRr] (ck_kernel_entry|kmain|ck_boot_model_load|ck_printf)$$' || true); \
+	if [ -n "$$k" ]; then echo "IMACDIAG links kernel objects: $$k"; rm -f $@; exit 1; fi
+$(IMACDIAG_EFI): $(IMACDIAG_ELF)
+	$(X86OBJCOPY) -O binary $< $@
+	@sz=$$(stat -c %s $@); pad=$$(( (4096 - sz % 4096) % 4096 )); \
+	if [ $$pad -gt 0 ]; then head -c $$pad /dev/zero >> $@; fi
+	@[ "$$(head -c 2 $@)" = "MZ" ] || { echo "not a PE image"; rm -f $@; exit 1; }
+	@[ "$$(od -An -tx1 -j68 -N2 $@ | tr -d ' ')" = "6486" ] || { echo "PE Machine is not x86_64 (0x8664)"; rm -f $@; exit 1; }
+	@echo "built $@ (commit $(AIENOS_COMMIT))"
+imac-diag: $(IMACDIAG_EFI)
+
+# ---- IMACKERN.EFI: AIENOS-KERNEL-0, the C kernel core on x86_64 (2017 iMac) ----
+# x86/efi_x86.c (stub: GOP, RSDP, memory map, ExitBootServices, CHANDOF3) + x86/kmain_x86.c
+# (GDT/TSS/IDT, own page tables, guard page, HPET-timed TSC, local APIC timer, ACPI S5)
+# + x86/pci_x86.c (PCI walk; AHCI via x86/ahci_x86.c and NVMe via ../disk/disk_nvme.c, both
+# read-only, GPT checked by dev/disk_part.c; a look at the Ethernet chip) + x86/smp_x86.S
+# (secondary cores started and parked) + x86/xhci_x86.c (USB boot keyboard, polled, hubs; key
+# decode and line editor from dev/usb_hid.c) + x86/tg3_x86.c (BCM57766 Ethernet: link detection; no
+# transmit in the default image) + ui/allen_ui.c, ui/allen_font.c (Allen's window on the screen, drawn
+# with its own stroke typeface; ui/night.c, the night sky of the startup, and ui/mind.c, Allen's presence, on ui/paint.c;
+# drawn by the secondary cores) + svc/allen_reply.c (Allen's first local answers)
+# + x86/trap.S + x86/console_x86.c (COM1 when present, GOP framebuffer), on the
+# arch-neutral core: fbcon, fmt, acpi, handoff_check, frames, heap. Same toolchain and PE
+# header as IMACDIAG. Copy to a FAT stick as EFI/BOOT/BOOTX64.EFI.
+#   make imac-kernel  -> $(OUT)/IMACKERN.EFI     QEMU test: scripts/qemu_ck_imac_kernel_test.sh
+# The network report is a LAB-ONLY diagnostic, opt-in and default off:
+#   make imac-kernel CK_X86_REPORT=1 -> $(OUT)/IMACKERN-LAB.EFI (own object dir)
+# adds x86/report_x86.c + ../../net/aienos_net.c and tg3 transmit (-DCK_X86_REPORT=1): during the
+# hold it broadcasts only allowlisted console lines (IMACKERN_REPORT_SYMS := ck_x86_report_hold|ck_x86_report_frame|ck_x86_report_filter|ck_x86_report_parts|ck_x86_tg3_send|ck_x86_tg3_drain|ck_x86_tg3_recv|ck_courier_udp_init|net_udp_build, never the raw console)
+# as UDP to port 47031, header "AIENOS-REPORT v=2 auth=none": UNAUTHENTICATED, never a
+# receipt, evidence or a command. Host test scripts/ck_imac_report_test.sh, receiver
+# tools/ck_imac_report_listen.c. The default image, and any resident or service (ALLEN) build,
+# must not contain it: the link step below fails a default image that has a report symbol.
+CK_X86_REPORT ?= 0
+# QEMU test switches (lab builds only; refused otherwise, see below): CK_X86_SWAP_TEST_DISK=1 stages
+# a swap image from a raw disk (scripts/qemu_ck_imac_swap_test.sh); CK_X86_BENCH_TEST=1 replaces the
+# GPU BARs with RAM stand-ins and moves the bench packets to COM1 (scripts/qemu_ck_gpu_bench_test.sh);
+# CK_X86_SWAP_TRAMP_PAD=1 pads the swap trampoline past its page, so the swap must refuse it before
+# it stops anything (scripts/qemu_ck_imac_swap_test.sh run 3).
+CK_X86_SWAP_TEST_DISK ?= 0
+CK_X86_BENCH_TEST ?= 0
+CK_X86_SWAP_TRAMP_PAD ?= 0
+IMACKERN_TRAMP_FLAGS :=
+X86K := $(KDIR)/x86
+# CK_X86_HOSTDESC=1 builds the launcher image (IMACKERN-HOST.EFI): the setup wizard also reads the host
+# description a launcher (aienos-run) hands over as the QEMU fw_cfg file opt/aienos/host
+# (x86/fwcfg_x86.c, read-only). The default and lab images carry no fw_cfg code or string;
+# the link step below checks it, like fwcfg_check for the core images.
+CK_X86_HOSTDESC ?= 0
+ifeq ($(CK_X86_REPORT),1)
+IMACKERN_DIR := $(OUT)/imackern-lab
+IMACKERN_EFI := $(OUT)/IMACKERN-LAB.EFI
+else ifeq ($(CK_X86_REPORT),0)
+IMACKERN_DIR := $(OUT)/imackern
+IMACKERN_EFI := $(OUT)/IMACKERN.EFI
+else
+$(error CK_X86_REPORT must be 0 (default) or 1 (lab-only network report))
+endif
+ifeq ($(CK_X86_HOSTDESC),1)
+IMACKERN_DIR := $(IMACKERN_DIR)-host
+IMACKERN_EFI := $(IMACKERN_EFI:.EFI=-HOST.EFI)
+else ifneq ($(CK_X86_HOSTDESC),0)
+$(error CK_X86_HOSTDESC must be 0 (default) or 1 (launcher image that reads the host description))
+endif
+CK_LOCAL_TEST ?= 0
+ifeq ($(CK_LOCAL_TEST),1)
+IMACKERN_DIR := $(IMACKERN_DIR)-local-test
+IMACKERN_EFI := $(IMACKERN_EFI:.EFI=-LOCAL-TEST.EFI)
+else ifneq ($(CK_LOCAL_TEST),0)
+$(error CK_LOCAL_TEST must be 0 (release) or 1 (hostile QEMU fixtures))
+endif
+CK_LOCAL_MODEL ?= 0
+ifeq ($(CK_LOCAL_MODEL),1)
+IMACKERN_DIR := $(IMACKERN_DIR)-model
+IMACKERN_EFI := $(IMACKERN_EFI:.EFI=-MODEL.EFI)
+else ifneq ($(CK_LOCAL_MODEL),0)
+$(error CK_LOCAL_MODEL must be 0 or 1)
+endif
+IMACKERN_ELF := $(IMACKERN_DIR)/imackern.elf
+IMACKERN_CFLAGS := $(X86CFLAGS) -I$(KDIR)/include -I$(KDIR)/mm -I$(KDIR)/dev -I$(NATIVE)/disk -I$(NATIVE)/net \
+	-I$(NATIVE)/argus -I$(NATIVE)/sig
+IMACKERN_OBJS := $(IMACKERN_DIR)/efi_entry_x86_64.o $(IMACKERN_DIR)/efi_x86.o $(IMACKERN_DIR)/efi_gop.o \
+	$(IMACKERN_DIR)/kmain_x86.o $(IMACKERN_DIR)/console_x86.o $(IMACKERN_DIR)/trap.o \
+	$(IMACKERN_DIR)/local_tools.o $(IMACKERN_DIR)/local_wire.o $(IMACKERN_DIR)/local_enter.o $(IMACKERN_DIR)/local_format.o $(IMACKERN_DIR)/ed25519.o \
+	$(IMACKERN_DIR)/fbcon.o $(IMACKERN_DIR)/fmt.o $(IMACKERN_DIR)/acpi.o $(IMACKERN_DIR)/dmar.o $(IMACKERN_DIR)/dmar_x86.o $(IMACKERN_DIR)/handoff_check.o \
+	$(IMACKERN_DIR)/frames.o $(IMACKERN_DIR)/heap.o $(IMACKERN_DIR)/libc_min.o \
+	$(IMACKERN_DIR)/ahci_x86.o $(IMACKERN_DIR)/disk_part.o $(IMACKERN_DIR)/disk.o \
+	$(IMACKERN_DIR)/pci_x86.o $(IMACKERN_DIR)/smp_x86.o $(IMACKERN_DIR)/disk_nvme.o \
+	$(IMACKERN_DIR)/tg3_x86.o $(IMACKERN_DIR)/xhci_x86.o $(IMACKERN_DIR)/hda_x86.o $(IMACKERN_DIR)/usb_hid.o $(IMACKERN_DIR)/sha256.o \
+	$(IMACKERN_DIR)/allen_ui.o $(IMACKERN_DIR)/allen_font.o $(IMACKERN_DIR)/allen_reply.o $(IMACKERN_DIR)/allen_intent.o $(IMACKERN_DIR)/allen_code.o $(IMACKERN_DIR)/courier_x86.o \
+	$(IMACKERN_DIR)/paint.o $(IMACKERN_DIR)/night.o $(IMACKERN_DIR)/sky_real.o $(IMACKERN_DIR)/sky_data.o $(IMACKERN_DIR)/mind.o $(IMACKERN_DIR)/flow.o $(IMACKERN_DIR)/chirp.o \
+	$(IMACKERN_DIR)/allen_memory.o $(IMACKERN_DIR)/allen_notes.o $(IMACKERN_DIR)/gpt_add.o $(IMACKERN_DIR)/memory_x86.o \
+	$(IMACKERN_DIR)/fat_boot.o $(IMACKERN_DIR)/sha512.o $(IMACKERN_DIR)/ct.o $(IMACKERN_DIR)/panel_x86.o \
+	$(IMACKERN_DIR)/gpu_x86.o $(IMACKERN_DIR)/swap_x86.o $(IMACKERN_DIR)/bench_x86.o \
+	$(IMACKERN_DIR)/setup_inv.o $(IMACKERN_DIR)/setup_wizard.o $(IMACKERN_DIR)/setup_store.o $(IMACKERN_DIR)/setup_x86.o
+# Every image verifies owner signatures before installing a boot image.
+# No configured keys means an empty trust store and no boot-image installation.
+IMACKERN_SLOT_KEYS_C := $(IMACKERN_DIR)/imac_slot_keys.c
+IMACKERN_KEY_SRC := $(if $(strip $(CK_TEST_SLOT_KEY)),--test-key,$(if $(strip $(CK_SLOT_KEYS)),--keys $(abspath $(CK_SLOT_KEYS)),))
+IMACKERN_OBJS += $(IMACKERN_DIR)/slot_select.o $(IMACKERN_DIR)/imac_slot_keys.o
+# Lab-only objects: the report, Ethernet courier and swap trampoline.
+IMACKERN_REPORT_OBJS := $(IMACKERN_DIR)/report_x86.o $(IMACKERN_DIR)/aienos_net.o $(IMACKERN_DIR)/courier_udp_x86.o \
+	$(IMACKERN_DIR)/swap_tramp.o
+# The far side of Allen's Ethernet courier (x86/courier_udp.h): broadcast by default, a lab address overrides.
+CK_COURIER_PEER ?= 255.255.255.255
+# Symbols only the lab image may contain; the default image is checked for them after linking.
+IMACKERN_REPORT_SYMS := ck_x86_report_hold|ck_x86_report_frame|ck_x86_report_filter|ck_x86_report_parts|ck_x86_tg3_send|ck_x86_tg3_drain|ck_x86_tg3_recv|ck_courier_udp_init|net_udp_build
+ifeq ($(CK_X86_REPORT),1)
+IMACKERN_OBJS += $(IMACKERN_REPORT_OBJS)
+IMACKERN_CFLAGS += -DCK_X86_REPORT=1 -DCK_COURIER_PEER_STR=\"$(CK_COURIER_PEER)\" -DCK_X86_SWAP=1 -DCK_X86_BENCH=1 -I$(NATIVE)/sig -I$(BOOT)
+ifeq ($(CK_X86_SWAP_TEST_DISK),1)
+IMACKERN_CFLAGS += -DCK_X86_SWAP_TEST_DISK=1
+endif
+ifeq ($(CK_X86_BENCH_TEST),1)
+IMACKERN_CFLAGS += -DCK_X86_BENCH_TEST=1
+endif
+ifeq ($(CK_X86_SWAP_TRAMP_PAD),1)
+IMACKERN_TRAMP_FLAGS += -DCK_X86_SWAP_TRAMP_PAD=1
+endif
+# Lab swap requires configured owner keys (the default image may have none).
+# CK_TEST_SLOT_KEY=1 embeds RFC 8032 TEST keys, for QEMU only.
+ifeq ($(strip $(IMACKERN_KEY_SRC)),)
+$(error the lab kernel (CK_X86_REPORT=1) needs swap owner keys: give CK_SLOT_KEYS=<owner public keys file>, or CK_TEST_SLOT_KEY=1 (TEST key, QEMU tests only))
+endif
+endif
+ifneq ($(CK_X86_REPORT),1)
+ifneq ($(filter 1,$(CK_X86_SWAP_TEST_DISK) $(CK_X86_BENCH_TEST) $(CK_X86_SWAP_TRAMP_PAD)),)
+$(error CK_X86_SWAP_TEST_DISK, CK_X86_BENCH_TEST and CK_X86_SWAP_TRAMP_PAD are QEMU lab test switches: they need CK_X86_REPORT=1)
+endif
+endif
+ifeq ($(CK_X86_HOSTDESC),1)
+IMACKERN_OBJS += $(IMACKERN_DIR)/fwcfg_x86.o
+IMACKERN_CFLAGS += -DCK_X86_HOSTDESC=1
+endif
+IMACKERN_HDRS := $(X86K)/x86.h $(BOOT)/handoff.h $(BOOT)/efi.h $(KDIR)/core/ck_internal.h $(KDIR)/include/ck.h
+GPU_DIR := $(KDIR)/gpu
+# CK_X86_GPU: drive the AMD GPU (DCE 11.2 page flip, GMC, SMU, gfx/SDMA/compute rings).
+# Default 0 (stubs) until each bring-up step has run on the real iMac through
+# the bench (feat/imac-gpu-bench): a wrong GPU register write can wedge the
+# PCIe link, and only a 4 s power hold (a firmware boot) recovers it. Lab
+# builds opt in with CK_X86_GPU=1. The chip is not present in QEMU (says so once). CK_X86_GPU_UCODE=1 additionally embeds the polaris11
+# firmware blobs fetched by scripts/fetch_gpu_ucode.sh (never committed).
+CK_X86_GPU ?= 0
+ifeq ($(CK_X86_GPU),1)
+IMACKERN_CFLAGS += -DCK_X86_GPU=1
+# The driver itself is linked only when it is on; with it off, gpu_x86.c
+# supplies the stubs (linking both defined every ck_gpu_* entry twice).
+IMACKERN_OBJS += $(IMACKERN_DIR)/amd_display.o $(IMACKERN_DIR)/amd_mc.o $(IMACKERN_DIR)/amd_smu.o \
+	$(IMACKERN_DIR)/amd_ucode.o $(IMACKERN_DIR)/amd_sdma.o $(IMACKERN_DIR)/amd_compute.o
+CK_X86_GPU_UCODE ?= 0
+ifeq ($(CK_X86_GPU_UCODE),1)
+ifeq ($(wildcard $(REPO)/target/native-kernel/gpu_ucode.inc),)
+$(error CK_X86_GPU_UCODE=1 needs $(REPO)/target/native-kernel/gpu_ucode.inc: run sh scripts/fetch_gpu_ucode.sh first)
+endif
+IMACKERN_CFLAGS += -DCK_X86_GPU_UCODE=1 -I$(REPO)/target/native-kernel
+endif
+else ifeq ($(CK_X86_GPU),0)
+IMACKERN_CFLAGS += -DCK_X86_GPU=0
+else
+$(error CK_X86_GPU must be 1 (GPU driver, lab) or 0 (default: stubs))
+endif
+$(IMACKERN_DIR)/efi_entry_x86_64.o: $(BOOT)/efi_entry_x86_64.S
+$(IMACKERN_DIR)/efi_x86.o: $(X86K)/efi_x86.c $(IMACKERN_HDRS) $(BOOT)/netboot_proto.h
+$(IMACKERN_DIR)/efi_gop.o: $(BOOT)/efi_gop.c $(IMACKERN_HDRS)
+$(IMACKERN_DIR)/kmain_x86.o: $(X86K)/kmain_x86.c $(IMACKERN_HDRS) $(KDIR)/core/handoff_check.h $(KDIR)/core/spinlock.h $(KDIR)/mm/frames.h $(KDIR)/mm/heap.h $(KDIR)/ui/allen_ui.h $(KDIR)/svc/allen_reply.h $(KDIR)/svc/allen_intent.h $(KDIR)/svc/allen_code.h $(KDIR)/dev/usb_hid.h $(KDIR)/svc/courier.h $(X86K)/courier_udp.h $(KDIR)/svc/setup_wizard.h $(OUT)/commit.stamp
+$(IMACKERN_DIR)/console_x86.o: $(X86K)/console_x86.c $(IMACKERN_HDRS) $(KDIR)/core/fbcon.h
+$(IMACKERN_DIR)/trap.o: $(X86K)/trap.S
+ifeq ($(CK_LOCAL_MODEL),1)
+IMACKERN_CFLAGS += -DCK_LOCAL_MODEL=1
+IMACKERN_OBJS += $(IMACKERN_DIR)/model_assets.o
+$(IMACKERN_DIR)/model_assets.o: $(X86K)/model/assets.S $(CK_LOCAL_MODEL_FILE) $(CK_LOCAL_TOKENIZER_FILE)
+	@mkdir -p $(@D)
+	$(X86CC) $(IMACKERN_CFLAGS) -DCK_MODEL_FILE='"$(CK_LOCAL_MODEL_FILE)"' -DCK_TOKENIZER_FILE='"$(CK_LOCAL_TOKENIZER_FILE)"' -c $< -o $@
+endif
+$(IMACKERN_DIR)/local_tools.o: $(X86K)/local_tools.c $(X86K)/local_tools.h $(X86K)/local_bundle.h $(X86K)/local_tests.inc
+ifeq ($(CK_LOCAL_MODEL),1)
+$(IMACKERN_DIR)/local_tools.o: $(X86K)/model/model_bundle.h $(X86K)/model/runtime.inc $(X86K)/model/tests.inc
+endif
+$(IMACKERN_DIR)/local_wire.o: $(X86K)/local_wire.c $(X86K)/local_wire.h $(X86K)/local_tools.h
+$(IMACKERN_DIR)/local_enter.o: $(X86K)/local_enter.S
+$(IMACKERN_DIR)/local_format.o: $(KDIR)/artifact/format.c $(KDIR)/artifact/ck_artifact.h
+ifeq ($(CK_LOCAL_TEST),1)
+IMACKERN_CFLAGS += -DCK_LOCAL_TEST=1 -DCK_X86_HOLD_S=1
+endif
+$(IMACKERN_DIR)/fbcon.o: $(KDIR)/core/fbcon.c $(KDIR)/core/fbcon.h $(KDIR)/core/font8x8.h
+$(IMACKERN_DIR)/fmt.o: $(KDIR)/core/fmt.c $(KDIR)/core/fmt.h
+$(IMACKERN_DIR)/acpi.o: $(KDIR)/core/acpi.c $(KDIR)/core/acpi.h
+$(IMACKERN_DIR)/dmar.o: $(KDIR)/core/dmar.c $(KDIR)/core/dmar.h
+$(IMACKERN_DIR)/dmar_x86.o: $(X86K)/dmar_x86.c $(KDIR)/core/dmar.h $(IMACKERN_HDRS)
+$(IMACKERN_DIR)/handoff_check.o: $(KDIR)/core/handoff_check.c $(KDIR)/core/handoff_check.h $(BOOT)/handoff.h
+$(IMACKERN_DIR)/frames.o: $(KDIR)/mm/frames.c $(KDIR)/mm/frames.h
+$(IMACKERN_DIR)/heap.o: $(KDIR)/mm/heap.c $(KDIR)/mm/heap.h
+$(IMACKERN_DIR)/libc_min.o: $(KDIR)/core/libc_min.c
+$(IMACKERN_DIR)/ahci_x86.o: $(X86K)/ahci_x86.c $(IMACKERN_HDRS) $(KDIR)/mm/frames.h $(KDIR)/dev/disk_part.h $(NATIVE)/disk/disk.h
+$(IMACKERN_DIR)/disk_part.o: $(KDIR)/dev/disk_part.c $(KDIR)/dev/disk_part.h $(NATIVE)/disk/disk.h
+$(IMACKERN_DIR)/disk.o: $(NATIVE)/disk/disk.c $(NATIVE)/disk/disk.h
+$(IMACKERN_DIR)/pci_x86.o: $(X86K)/pci_x86.c $(IMACKERN_HDRS) $(KDIR)/mm/frames.h $(KDIR)/dev/disk_part.h $(NATIVE)/disk/disk.h $(NATIVE)/disk/disk_nvme.h
+$(IMACKERN_DIR)/panel_x86.o: $(X86K)/panel_x86.c $(IMACKERN_HDRS)
+$(IMACKERN_DIR)/gpu_x86.o: $(GPU_DIR)/gpu_x86.c $(IMACKERN_HDRS) $(GPU_DIR)/amd_ring.h $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_gpu_regs.h $(KDIR)/mm/frames.h
+$(IMACKERN_DIR)/amd_display.o: $(GPU_DIR)/amd_display.c $(IMACKERN_HDRS) $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_gpu_regs.h
+$(IMACKERN_DIR)/amd_mc.o:      $(GPU_DIR)/amd_mc.c      $(IMACKERN_HDRS) $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_gpu_regs.h
+$(IMACKERN_DIR)/amd_smu.o:     $(GPU_DIR)/amd_smu.c     $(IMACKERN_HDRS) $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_gpu_regs.h
+$(IMACKERN_DIR)/amd_ucode.o:   $(GPU_DIR)/amd_ucode.c   $(IMACKERN_HDRS) $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_gpu_regs.h $(if $(filter 1,$(CK_X86_GPU_UCODE)),$(REPO)/target/native-kernel/gpu_ucode.inc)
+$(IMACKERN_DIR)/amd_sdma.o:    $(GPU_DIR)/amd_sdma.c    $(IMACKERN_HDRS) $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_gpu_regs.h
+$(IMACKERN_DIR)/amd_compute.o: $(GPU_DIR)/amd_compute.c $(IMACKERN_HDRS) $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_gpu_regs.h
+$(IMACKERN_DIR)/swap_x86.o: $(X86K)/swap_x86.c $(X86K)/x86.h $(X86K)/swap_proto.h $(X86K)/swap_x86.h $(BOOT)/slot_format.h
+$(IMACKERN_DIR)/swap_tramp.o: $(X86K)/swap_tramp.S
+	@mkdir -p $(dir $@)
+	$(X86CC) -c $(ASFLAGS) $(IMACKERN_TRAMP_FLAGS) -o $@ $<
+$(IMACKERN_SLOT_KEYS_C): $(SLOT_TOOL) FORCE
+	@mkdir -p $(dir $@)
+	@if [ -n "$(IMACKERN_KEY_SRC)" ]; then $(SLOT_TOOL) keys-c $(IMACKERN_KEY_SRC) --out $@; \
+	else printf '#include <stdint.h>\nconst uint8_t ck_slot_loader_keys[1][32] = {{0}};\nconst unsigned ck_slot_loader_nkeys = 0;\n' > $@.tmp; \
+	  cmp -s $@.tmp $@ || mv $@.tmp $@; rm -f $@.tmp; fi
+$(IMACKERN_DIR)/imac_slot_keys.o: $(IMACKERN_SLOT_KEYS_C)
+$(IMACKERN_DIR)/bench_x86.o: $(X86K)/bench_x86.c $(X86K)/x86.h $(X86K)/bench_proto.h $(X86K)/bench_x86.h $(NATIVE)/argus/sha256.h
+# CK_X86_BENCH_KEY_FILE: a 32-byte key file (on the Spark ~/.config/aienos/imac-bench.key; the Spark tool
+# takes the same file with --key) bound in as the bench console's HMAC key through a header made in the
+# build dir, mode 0600, so the key is never on a command line or in the build output.
+ifdef CK_X86_BENCH_KEY_FILE
+IMACKERN_CFLAGS += -DCK_X86_BENCH_KEY_H='"$(IMACKERN_DIR)/bench_key.h"'
+$(IMACKERN_DIR)/bench_key.h: $(CK_X86_BENCH_KEY_FILE)
+	@mkdir -p $(@D)
+	@test "$$(wc -c < '$<')" -eq 32 || { echo "CK_X86_BENCH_KEY_FILE: $< is not 32 bytes" >&2; exit 1; }
+	@umask 077; { printf '#define CK_X86_BENCH_KEY '; od -An -v -tu1 '$<' | tr -s ' \n' ' ' | sed 's/^ //; s/ $$//; s/ /,/g'; echo; } > $@
+$(IMACKERN_DIR)/bench_x86.o: $(IMACKERN_DIR)/bench_key.h
+endif
+$(IMACKERN_DIR)/slot_select.o: $(BOOT)/slot_select.c $(BOOT)/slot_format.h
+$(IMACKERN_DIR)/ed25519.o: $(NATIVE)/sig/ed25519.c $(NATIVE)/sig/aienos_sig.h
+$(IMACKERN_DIR)/smp_x86.o: $(X86K)/smp_x86.S
+$(IMACKERN_DIR)/disk_nvme.o: $(NATIVE)/disk/disk_nvme.c $(NATIVE)/disk/disk_nvme.h $(NATIVE)/disk/disk.h
+$(IMACKERN_DIR)/tg3_x86.o: $(X86K)/tg3_x86.c $(IMACKERN_HDRS) $(KDIR)/mm/frames.h
+$(IMACKERN_DIR)/xhci_x86.o: $(X86K)/xhci_x86.c $(IMACKERN_HDRS) $(KDIR)/mm/frames.h $(KDIR)/dev/usb_hid.h
+$(IMACKERN_DIR)/hda_x86.o: $(X86K)/hda_x86.c $(IMACKERN_HDRS) $(KDIR)/mm/frames.h $(KDIR)/ui/chirp.h $(KDIR)/ui/night.h
+$(IMACKERN_DIR)/usb_hid.o: $(KDIR)/dev/usb_hid.c $(KDIR)/dev/usb_hid.h $(NATIVE)/argus/sha256.h
+$(IMACKERN_DIR)/sha256.o: $(NATIVE)/argus/sha256.c $(NATIVE)/argus/sha256.h
+$(IMACKERN_DIR)/allen_ui.o: $(KDIR)/ui/allen_ui.c $(KDIR)/ui/allen_ui.h $(KDIR)/core/spinlock.h $(KDIR)/ui/allen_font.h $(KDIR)/ui/night.h $(KDIR)/ui/mind.h $(KDIR)/ui/flow.h $(KDIR)/ui/paint.h $(KDIR)/ui/canvas.h $(KDIR)/svc/allen_code.h
+$(IMACKERN_DIR)/allen_font.o: $(KDIR)/ui/allen_font.c $(KDIR)/ui/allen_font.h
+$(IMACKERN_DIR)/paint.o: $(KDIR)/ui/paint.c $(KDIR)/ui/paint.h $(KDIR)/ui/allen_font.h
+$(IMACKERN_DIR)/night.o: $(KDIR)/ui/night.c $(KDIR)/ui/night.h $(KDIR)/ui/paint.h $(KDIR)/ui/sky_real.h $(KDIR)/ui/sky_data.h
+$(IMACKERN_DIR)/sky_real.o: $(KDIR)/ui/sky_real.c $(KDIR)/ui/sky_real.h $(KDIR)/ui/sky_data.h $(KDIR)/ui/night.h $(KDIR)/ui/paint.h
+$(IMACKERN_DIR)/sky_data.o: $(KDIR)/ui/sky_data.c $(KDIR)/ui/sky_data.h
+$(IMACKERN_DIR)/chirp.o: $(KDIR)/ui/chirp.c $(KDIR)/ui/chirp.h $(KDIR)/ui/night.h
+$(IMACKERN_DIR)/mind.o: $(KDIR)/ui/mind.c $(KDIR)/ui/mind.h $(KDIR)/ui/paint.h
+$(IMACKERN_DIR)/flow.o: $(KDIR)/ui/flow.c $(KDIR)/ui/flow.h $(KDIR)/ui/paint.h
+# Allen's canvas: the scene the model writes (svc/allen_scene.c) and how it is painted (ui/canvas.c).
+IMACKERN_OBJS += $(IMACKERN_DIR)/canvas.o $(IMACKERN_DIR)/allen_scene.o
+$(IMACKERN_DIR)/canvas.o: $(KDIR)/ui/canvas.c $(KDIR)/ui/canvas.h $(KDIR)/ui/paint.h $(KDIR)/ui/flow.h $(KDIR)/ui/allen_font.h $(KDIR)/svc/allen_scene.h
+$(IMACKERN_DIR)/allen_scene.o: $(KDIR)/svc/allen_scene.c $(KDIR)/svc/allen_scene.h
+$(IMACKERN_DIR)/allen_reply.o: $(KDIR)/svc/allen_reply.c $(KDIR)/svc/allen_reply.h $(KDIR)/svc/allen_notes.h
+$(IMACKERN_DIR)/allen_intent.o: $(KDIR)/svc/allen_intent.c $(KDIR)/svc/allen_intent.h $(KDIR)/svc/allen_reply.h
+$(IMACKERN_DIR)/allen_code.o: $(KDIR)/svc/allen_code.c $(KDIR)/svc/allen_code.h
+$(IMACKERN_DIR)/courier_x86.o: $(X86K)/courier_x86.c $(IMACKERN_HDRS) $(KDIR)/svc/courier.h
+$(IMACKERN_DIR)/allen_notes.o: $(KDIR)/svc/allen_notes.c $(KDIR)/svc/allen_notes.h
+$(IMACKERN_DIR)/allen_memory.o: $(KDIR)/svc/allen_memory.c $(KDIR)/svc/allen_memory.h $(KDIR)/svc/allen_reply.h $(KDIR)/svc/allen_notes.h $(NATIVE)/disk/disk.h $(NATIVE)/argus/sha256.h
+$(IMACKERN_DIR)/gpt_add.o: $(KDIR)/dev/gpt_add.c $(KDIR)/dev/gpt_add.h $(KDIR)/dev/disk_part.h $(NATIVE)/disk/disk.h $(NATIVE)/argus/sha256.h
+$(IMACKERN_DIR)/memory_x86.o: $(X86K)/memory_x86.c $(IMACKERN_HDRS) $(KDIR)/svc/allen_memory.h $(KDIR)/svc/allen_notes.h $(KDIR)/dev/gpt_add.h $(KDIR)/dev/disk_part.h \
+	$(KDIR)/dev/fat_boot.h $(BOOT)/netboot_proto.h $(BOOT)/slot_format.h $(NATIVE)/sig/aienos_sig.h $(KDIR)/svc/setup_store.h
+$(IMACKERN_DIR)/fat_boot.o: $(KDIR)/dev/fat_boot.c $(KDIR)/dev/fat_boot.h $(NATIVE)/disk/disk.h
+$(IMACKERN_DIR)/sha512.o: $(NATIVE)/sig/sha512.c $(NATIVE)/sig/aienos_sig.h
+$(IMACKERN_DIR)/ct.o: $(NATIVE)/sig/ct.c $(NATIVE)/sig/aienos_sig.h
+$(IMACKERN_DIR)/setup_inv.o: $(KDIR)/svc/setup_inv.c $(KDIR)/svc/setup_inv.h
+$(IMACKERN_DIR)/setup_wizard.o: $(KDIR)/svc/setup_wizard.c $(KDIR)/svc/setup_wizard.h $(KDIR)/svc/setup_inv.h
+$(IMACKERN_DIR)/setup_store.o: $(KDIR)/svc/setup_store.c $(KDIR)/svc/setup_store.h $(KDIR)/svc/allen_memory.h $(NATIVE)/disk/disk.h $(NATIVE)/argus/sha256.h
+$(IMACKERN_DIR)/setup_x86.o: $(X86K)/setup_x86.c $(IMACKERN_HDRS) $(KDIR)/svc/setup_inv.h $(KDIR)/svc/setup_wizard.h $(KDIR)/svc/setup_store.h \
+	$(KDIR)/ui/setup_view.h $(KDIR)/ui/allen_ui.h $(KDIR)/svc/courier.h $(KDIR)/dev/usb_hid.h
+$(IMACKERN_DIR)/fwcfg_x86.o: $(X86K)/fwcfg_x86.c $(IMACKERN_HDRS) $(KDIR)/core/acpi.h
+$(IMACKERN_DIR)/report_x86.o: $(X86K)/report_x86.c $(X86K)/report_x86.h $(IMACKERN_HDRS) $(NATIVE)/net/aienos_net.h
+$(IMACKERN_DIR)/courier_udp_x86.o: $(X86K)/courier_udp_x86.c $(X86K)/courier_udp.h $(IMACKERN_HDRS) $(NATIVE)/net/aienos_net.h $(KDIR)/svc/courier.h
+$(IMACKERN_DIR)/aienos_net.o: $(NATIVE)/net/aienos_net.c $(NATIVE)/net/aienos_net.h
+$(sort $(filter-out %/swap_tramp.o %/model_assets.o,$(IMACKERN_OBJS) $(IMACKERN_REPORT_OBJS))):
+	@mkdir -p $(dir $@)
+	$(X86CC) $(IMACKERN_CFLAGS) -DAIENOS_COMMIT='"$(AIENOS_COMMIT)"' -c -o $@ $<
+$(IMACKERN_ELF): $(IMACKERN_OBJS) $(BOOT)/image_x86_64.ld
+	@if grep -nE -- 'rt->|RuntimeServices' $(X86K)/*.c; then \
+	  echo "the x86 kernel calls a UEFI runtime service; it must never call one"; exit 1; fi
+	@if grep -nE "define ATA_" $(X86K)/ahci_x86.c | grep -vE "ATA_(IDENTIFY 0xec|READ_DMA_EXT 0x25|WRITE_DMA_EXT 0x35|FLUSH_CACHE_EXT 0xea)$$"; then \
+	  echo "ahci_x86.c defines an ATA command other than IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT"; exit 1; fi
+	@if grep -nE "ck_x86_ahci_allow\(" $(X86K)/*.c | grep -vE "^$(X86K)/(memory_x86\.c|ahci_x86\.c:[0-9]+:int ck_x86_ahci_allow\()"; then \
+	  echo "only memory_x86.c may open a write range on an AHCI disk"; exit 1; fi
+	@if grep -nE "nvme_(write|flush)\(" $(X86K)/*.c; then \
+	  echo "the x86 kernel calls nvme_write or nvme_flush; its disks are read-only"; exit 1; fi
+	@mkdir -p $(dir $@)
+	$(X86LD) $(X86LDFLAGS) -o $@ $(IMACKERN_OBJS)
+	@u=$$($(X86NM) -u $@ | grep -v ' w ' || true); \
+	if [ -n "$$u" ]; then echo "image has undefined symbols: $$u"; rm -f $@; exit 1; fi
+	@bad=$$($(X86READELF) -rW $@ | grep -E '^[0-9a-f]+ ' | grep -v R_X86_64_RELATIVE || true); \
+	if [ -n "$$bad" ]; then echo "image has non-RELATIVE relocations:"; echo "$$bad"; rm -f $@; exit 1; fi
+	@n=$$($(X86NM) $@ | grep -c ' t isr_common$$' || true); s=$$($(X86NM) $@ | grep ' T ck_x86_isr_stubs$$' | cut -c1-16); \
+	e=$$($(X86NM) $@ | grep ' t isr_common$$' | cut -c1-16); \
+	if [ "$$n" != 1 ] || [ $$((0x$$e - 0x$$s)) != 4096 ]; then echo "interrupt stubs are not 256 x 16 bytes"; rm -f $@; exit 1; fi
+	@r=$$($(X86NM) $@ | grep -E ' [TtDdBbRr] ($(IMACKERN_REPORT_SYMS))$$' || true); \
+	if [ "$(CK_X86_REPORT)" = 1 ]; then \
+	  for s in ck_x86_report_hold ck_x86_report_filter ck_x86_report_frame; do \
+	    echo "$$r" | grep -q " $$s$$" || { echo "lab image lacks $$s"; rm -f $@; exit 1; }; done; \
+	elif [ -n "$$r" ]; then \
+	  echo "default iMac image links the lab-only network report (build it with CK_X86_REPORT=1 only):"; \
+	  echo "$$r"; rm -f $@; exit 1; fi
+	@if [ "$(CK_X86_REPORT)" != 1 ] && grep -aq "AIENOS-REPORT" $@; then \
+	  echo "default iMac image carries the report header string"; rm -f $@; exit 1; fi
+	@if [ "$(CK_X86_REPORT)" != 1 ]; then s=$$($(X86NM) $@ | grep -E ' [TtDdBbRr] (ck_x86_swap_tramp|ck_x86_swap_read_inbox)$$' || true); \
+	  if [ -n "$$s" ]; then echo "default iMac image links the swap receiver (lab builds only):"; echo "$$s"; rm -f $@; exit 1; fi; fi
+	@f=$$($(X86NM) $@ | grep -E ' [TtDdBbRr] ck_x86_fwcfg_file$$' || true); s=$$(grep -aoE "opt/aienos/host|QEMU0002" $@ | sort -u | tr "\n" " "); \
+	if [ "$(CK_X86_HOSTDESC)" = 1 ]; then \
+	  [ -n "$$f" ] && grep -aqF "launcher image: the setup wizard reads the host description" $@ || { echo "launcher image lacks the host description reader or its announcement"; rm -f $@; exit 1; }; \
+	elif [ -n "$$f$$s" ]; then echo "default iMac image carries fw_cfg code (build it with CK_X86_HOSTDESC=1 only): $$f $$s"; rm -f $@; exit 1; fi
+	@if [ "$(CK_LOCAL_TEST)" != 1 ] && grep -aq 'local_test:' $@; then \
+	  echo "release image contains hostile local-tool fixtures"; rm -f $@; exit 1; fi
+$(IMACKERN_EFI): $(IMACKERN_ELF)
+	$(X86OBJCOPY) -O binary $< $@
+	@sz=$$(stat -c %s $@); pad=$$(( (4096 - sz % 4096) % 4096 )); \
+	if [ $$pad -gt 0 ]; then head -c $$pad /dev/zero >> $@; fi
+	@[ "$$(head -c 2 $@)" = "MZ" ] || { echo "not a PE image"; rm -f $@; exit 1; }
+	@[ "$$(od -An -tx1 -j68 -N2 $@ | tr -d ' ')" = "6486" ] || { echo "PE Machine is not x86_64 (0x8664)"; rm -f $@; exit 1; }
+	@echo "built $@ (commit $(AIENOS_COMMIT))"
+imac-kernel: $(IMACKERN_EFI)
+
+# ---- AMD GPU driver host test (mock MMIO, no hardware needed) ----
+# Checks register access sequences for display flip, MC, SMU, ring submit
+# and fence against Linux dce_v11_0.c / gmc_v8_0.c / gfx_v8_0.c source paths.
+GPU_TEST_SRC := $(KDIR)/tests/test_amd_gpu.c
+$(OUT)/host/test_amd_gpu: $(GPU_TEST_SRC) $(GPU_DIR)/amd_gpu_regs.h $(GPU_DIR)/amd_ring.h
+	@mkdir -p $(OUT)/host
+	$(CC) -std=c11 -Wall -DAMD_GPU_TEST_HOST=1 -I$(KDIR) -I$(GPU_DIR) -I$(X86K) -o $@ $<
+	@echo "host test: running test_amd_gpu"; $@
+imac-gpu-test: $(OUT)/host/test_amd_gpu $(OUT)/host/test_amd_gpu_ring
+# Ring code under test: the driver's own amd_ucode.c and frames.c; the GPU is a model thread (tests/test_amd_gpu_ring.c).
+GPU_RING_TEST_SRC := $(KDIR)/tests/test_amd_gpu_ring.c
+$(OUT)/host/test_amd_gpu_ring: $(GPU_RING_TEST_SRC) $(GPU_DIR)/amd_ucode.c $(KDIR)/mm/frames.c $(GPU_DIR)/amd_gpu.h $(GPU_DIR)/amd_host_shim.h $(GPU_DIR)/amd_gpu_regs.h $(GPU_DIR)/amd_ring.h $(KDIR)/mm/frames.h
+	@mkdir -p $(OUT)/host
+	$(CC) -std=c11 -Wall -pthread -DAMD_GPU_TEST_HOST=1 -I$(KDIR) -I$(KDIR)/include -I$(KDIR)/mm -I$(BOOT) -I$(GPU_DIR) -I$(X86K) -o $@ $(GPU_RING_TEST_SRC) $(GPU_DIR)/amd_ucode.c $(KDIR)/mm/frames.c
+	@echo "host test: running test_amd_gpu_ring"; $@
+# Host tools for the lab bench/swap (C only, no third-party libraries). Built with cc, not into the image.
+GPU_BENCH_TOOL := $(OUT)/host/ck_gpu_bench
+IMAC_SWAP_TOOL := $(OUT)/host/ck_imac_swap
+$(GPU_BENCH_TOOL): $(KDIR)/tools/ck_gpu_bench.c $(X86K)/bench_proto.h
+	@mkdir -p $(dir $@)
+	cc -O2 -std=c11 -Wall -Wextra -o $@ $<
+$(IMAC_SWAP_TOOL): $(KDIR)/tools/ck_imac_swap.c $(X86K)/swap_proto.h
+	@mkdir -p $(dir $@)
+	cc -O2 -std=c11 -Wall -Wextra -o $@ $<
+.PHONY: ck-gpu-bench ck-imac-swap
+ck-gpu-bench: $(GPU_BENCH_TOOL)
+ck-imac-swap: $(IMAC_SWAP_TOOL)
+# W^X and TLB negative controls (#409, #484, #485), TEST-ONLY, QEMU only, never deployed: IMACKERN_WX_MUTANT=no_nx
+# drops every NX bit, =text_writable leaves the kernel's code writable, =ap_no_wp starts the secondary cores
+# without CR0.WP, =no_shootdown flushes a changed page from the boot core's TLB only. The kernel's W^X and TLB
+# probes (or, for ap_no_wp, the wx_audit core count) must then panic
+# (scripts/qemu_ck_imac_kernel_test.sh builds each into its own OUT). The stamp rebuilds kmain_x86.o and
+# smp_x86.o whenever the setting changes, so a mutant object never lingers in a default build.
+IMACKERN_WX_MUTANT ?=
+ifeq ($(strip $(IMACKERN_WX_MUTANT)),)
+IMACKERN_WX_FLAGS :=
+else ifeq ($(strip $(IMACKERN_WX_MUTANT)),no_nx)
+IMACKERN_WX_FLAGS := -DCK_X86_WX_MUTANT_NO_NX=1
+else ifeq ($(strip $(IMACKERN_WX_MUTANT)),text_writable)
+IMACKERN_WX_FLAGS := -DCK_X86_WX_MUTANT_TEXT_RW=1
+else ifeq ($(strip $(IMACKERN_WX_MUTANT)),ap_no_wp)
+IMACKERN_WX_FLAGS := -DCK_X86_WX_MUTANT_AP_NO_WP=1
+else ifeq ($(strip $(IMACKERN_WX_MUTANT)),no_shootdown)
+IMACKERN_WX_FLAGS := -DCK_X86_WX_MUTANT_NO_SHOOTDOWN=1
+else
+$(error IMACKERN_WX_MUTANT must be empty, no_nx, text_writable, ap_no_wp or no_shootdown)
+endif
+# CK_X86_IDLE_S: seconds without a key before Allen's screen sleeps (kmain_x86.c default 600, 0 never).
+# Set only for test builds (scripts/qemu_ck_imac_keyboard_test.sh uses 25), into their own OUT directory.
+ifdef CK_X86_IDLE_S
+IMACKERN_CFLAGS += -DCK_X86_IDLE_S=$(CK_X86_IDLE_S)u
+endif
+# CK_X86_PANEL_OFF: while Allen rests, switch the display panel off for real through the AMD
+# display chip's panel power sequencer (x86/panel_x86.c; DCE 11.2 registers, Polaris parts only,
+# every write read back, every wait TSC-bounded) and on again when he wakes. Default 1 for
+# `make imac-kernel`. The code finds no such chip in QEMU and says so (`screen: panel: ...`);
+# 0 leaves it out of the image altogether (own OUT directory).
+CK_X86_PANEL_OFF ?= 1
+ifeq ($(CK_X86_PANEL_OFF),1)
+IMACKERN_CFLAGS += -DCK_X86_PANEL_OFF=1
+else ifeq ($(CK_X86_PANEL_OFF),0)
+IMACKERN_CFLAGS += -DCK_X86_PANEL_OFF=0
+else
+$(error CK_X86_PANEL_OFF must be 1 (default: the panel is switched off while Allen rests) or 0)
+endif
+$(IMACKERN_DIR)/kmain_x86.o $(IMACKERN_DIR)/smp_x86.o: IMACKERN_CFLAGS += $(IMACKERN_WX_FLAGS)
+$(IMACKERN_DIR)/kmain_x86.o $(IMACKERN_DIR)/smp_x86.o: $(IMACKERN_DIR)/wx_mutant.stamp
+$(IMACKERN_DIR)/wx_mutant.stamp: FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(strip $(IMACKERN_WX_MUTANT))' | cmp -s - $@ || echo '$(strip $(IMACKERN_WX_MUTANT))' > $@
+
+# ---- NETLDR.EFI: the lab network loader for the 2017 iMac (x86_64) ----
+# native/boot/net_loader.c + netboot_proto.c (wire spec netboot_proto.h). Stays on the stick as
+# EFI/BOOT/BOOTX64.EFI; at every power-on it fetches a kernel from tools/ck_imac_netboot.c over
+# the LAN, verifies it with the SLOTLDR verifier (ck_slot_verify: Ed25519 manifest signature,
+# SHA-512 of the image) against the public keys baked in from CK_NETLDR_KEYS ("owner_root_ed25519
+# <64 hex>" lines; ck_imac_netboot keygen writes one) and only then starts it. No answer for
+# CK_NETLDR_FALLBACK_S seconds: it starts \EFI\AIENOS\IMACKERN.EFI from the stick instead.
+#   make imac-netldr CK_NETLDR_KEYS=<file>  -> $(OUT)/NETLDR.EFI
+#   make imac-netboot-tool                  -> $(OUT)/host/ck_imac_netboot (keygen, sign, serve)
+# QEMU test: scripts/qemu_ck_imac_netboot_test.sh (AIENOS_IMAC_NETBOOT).
+CK_NETLDR_KEYS ?=
+CK_NETLDR_FALLBACK_S ?= 30
+ifeq ($(shell echo '$(CK_NETLDR_FALLBACK_S)' | grep -xE '[1-9][0-9]{0,3}'),)
+$(error CK_NETLDR_FALLBACK_S must be a whole number of seconds, 1..9999)
+endif
+NETLDR_DIR := $(OUT)/netldr
+NETLDR_ELF := $(NETLDR_DIR)/netldr.elf
+NETLDR_EFI := $(OUT)/NETLDR.EFI
+NETLDR_KEYS_C := $(NETLDR_DIR)/netldr_keys.c
+NETLDR_C := $(BOOT)/net_loader.c $(BOOT)/netboot_proto.c $(BOOT)/slot_select.c $(NATIVE)/net/aienos_net.c \
+	$(NATIVE)/sig/sha512.c $(NATIVE)/sig/ed25519.c $(NATIVE)/sig/ct.c $(NATIVE)/argus/sha256.c \
+	$(KDIR)/core/libc_min.c $(KDIR)/core/fmt.c
+NETLDR_OBJS := $(patsubst $(NATIVE)/%.c,$(NETLDR_DIR)/obj/%.o,$(NETLDR_C)) \
+	$(NETLDR_DIR)/obj/efi_entry_x86_64.o $(NETLDR_DIR)/obj/netldr_keys.o
+NETLDR_CFLAGS := $(X86CFLAGS) $(ART_INC) -I$(NATIVE)/net -I$(NATIVE)/store
+NETLDR_HDRS := $(BOOT)/netboot_proto.h $(BOOT)/slot_format.h $(BOOT)/efi.h $(NATIVE)/net/aienos_net.h \
+	$(KDIR)/core/fmt.h $(ART_HDRS)
+$(NETLDR_DIR)/obj/%.o: $(NATIVE)/%.c $(NETLDR_HDRS)
+	@mkdir -p $(dir $@)
+	$(X86CC) $(NETLDR_CFLAGS) -c -o $@ $<
+# The fallback delay is compiled in; the stamp rebuilds the loader when it changes.
+$(NETLDR_DIR)/fallback.stamp: FORCE
+	@mkdir -p $(dir $@)
+	@[ "$$(cat $@ 2>/dev/null)" = "$(CK_NETLDR_FALLBACK_S)" ] || echo "$(CK_NETLDR_FALLBACK_S)" > $@
+$(NETLDR_DIR)/obj/boot/net_loader.o: $(BOOT)/net_loader.c $(NETLDR_HDRS) $(OUT)/commit.stamp $(NETLDR_DIR)/fallback.stamp
+	@mkdir -p $(dir $@)
+	$(X86CC) $(NETLDR_CFLAGS) -DAIENOS_COMMIT='"$(AIENOS_COMMIT)"' -DCK_NETLDR_FALLBACK_S=$(CK_NETLDR_FALLBACK_S)u -c -o $@ $<
+$(NETLDR_DIR)/obj/efi_entry_x86_64.o: $(BOOT)/efi_entry_x86_64.S
+	@mkdir -p $(dir $@)
+	$(X86CC) $(X86CFLAGS) -c -o $@ $<
+$(NETLDR_KEYS_C): $(SLOT_TOOL) FORCE
+	@[ -n "$(strip $(CK_NETLDR_KEYS))" ] || { echo "imac-netldr: give CK_NETLDR_KEYS=<public key file> (ck_imac_netboot keygen writes one)"; exit 1; }
+	@mkdir -p $(dir $@)
+	@$(SLOT_TOOL) keys-c --keys $(abspath $(CK_NETLDR_KEYS)) --out $@
+$(NETLDR_DIR)/obj/netldr_keys.o: $(NETLDR_KEYS_C)
+	@mkdir -p $(dir $@)
+	$(X86CC) $(NETLDR_CFLAGS) -c -o $@ $<
+$(NETLDR_ELF): $(NETLDR_OBJS) $(BOOT)/image_x86_64.ld
+	@if grep -nE -- '->(RuntimeServices|ExitBootServices|SetVariable|GetVariable)|RuntimeServices' $(BOOT)/net_loader.c; then \
+	  echo "net_loader.c calls a service the network loader must never call"; exit 1; fi
+	@mkdir -p $(dir $@)
+	$(X86LD) $(X86LDFLAGS) -o $@ $(NETLDR_OBJS)
+	@u=$$($(X86NM) -u $@ | grep -v ' w ' || true); \
+	if [ -n "$$u" ]; then echo "image has undefined symbols: $$u"; rm -f $@; exit 1; fi
+	@bad=$$($(X86READELF) -rW $@ | grep -E '^[0-9a-f]+ ' | grep -v R_X86_64_RELATIVE || true); \
+	if [ -n "$$bad" ]; then echo "image has non-RELATIVE relocations:"; echo "$$bad"; rm -f $@; exit 1; fi
+	@k=$$($(X86NM) $@ | grep -E ' [TtDdBbRr] (ck_x86_kernel_entry|kernel_main|ck_printf)$$' || true); \
+	if [ -n "$$k" ]; then echo "NETLDR links kernel objects: $$k"; rm -f $@; exit 1; fi
+	@if grep -aqF "TEST-ONLY" $@; then echo "NETLDR carries a TEST-ONLY key note"; rm -f $@; exit 1; fi
+$(NETLDR_EFI): $(NETLDR_ELF)
+	$(X86OBJCOPY) -O binary $< $@
+	@sz=$$(stat -c %s $@); pad=$$(( (4096 - sz % 4096) % 4096 )); \
+	if [ $$pad -gt 0 ]; then head -c $$pad /dev/zero >> $@; fi
+	@[ "$$(head -c 2 $@)" = "MZ" ] || { echo "not a PE image"; rm -f $@; exit 1; }
+	@[ "$$(od -An -tx1 -j68 -N2 $@ | tr -d ' ')" = "6486" ] || { echo "PE Machine is not x86_64 (0x8664)"; rm -f $@; exit 1; }
+	@echo "built $@ (commit $(AIENOS_COMMIT), fallback $(CK_NETLDR_FALLBACK_S) s)"
+imac-netldr: $(NETLDR_EFI)
+NETBOOT_TOOL := $(OUT)/host/ck_imac_netboot
+NETBOOT_TOOL_SRCS := $(KDIR)/tools/ck_imac_netboot.c $(BOOT)/netboot_proto.c $(NATIVE)/net/aienos_net.c \
+	$(NATIVE)/sig/sha512.c $(NATIVE)/sig/ed25519.c $(NATIVE)/sig/ct.c
+$(NETBOOT_TOOL): $(NETBOOT_TOOL_SRCS) $(BOOT)/netboot_proto.h $(NATIVE)/net/aienos_net.h $(NATIVE)/sig/aienos_sig.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -I$(BOOT) -I$(NATIVE)/net -I$(NATIVE)/sig -o $@ $(NETBOOT_TOOL_SRCS)
+# Apple NetBoot answerer (BSDP + one-file TFTP): the iMac starts NETLDR.EFI from the Spark with N held.
+BSDP_TOOL := $(OUT)/host/ck_imac_bsdp
+$(BSDP_TOOL): $(KDIR)/tools/ck_imac_bsdp.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $<
+imac-netboot-tool: $(NETBOOT_TOOL) $(BSDP_TOOL)
+
+# Raspberry Pi 5 board image (see CK_PI5 above): target/native-kernel-pi5/BOOTAA64.EFI
+pi5-store:
+	$(MAKE) CK_PI5_STORE=1 full
+
+# PI5-8 Q1: --remap-path-prefix keeps the build directory out of the Rust panic-location strings, so the three Pi images
+# that link this library are byte-identical when built from different checkout paths (scripts/ck_pi5_repro_check.sh).
+PI5_INFER_LIB := $(REPO)/target/infer-kernel/aarch64-unknown-none/release/libaienos_infer_kernel.a
+pi5-infer:
+	RUSTFLAGS="--remap-path-prefix=$(REPO)=/aienos" CARGO_TARGET_DIR=$(REPO)/target/infer-kernel cargo build -q --release --target aarch64-unknown-none --manifest-path $(REPO)/crates/aienos-infer-kernel/Cargo.toml
+	$(MAKE) CK_PI5_INFER=1 CK_INFER_LIB=$(PI5_INFER_LIB) all
+pi5-unlock:
+	$(MAKE) CK_PI5_UNLOCK=1 full
+
+pi5-unlock-card:
+	$(MAKE) CK_PI5_UNLOCK=1 CK_PI5_UNLOCK_CARD=1 full
+
+pi5-fact:
+	$(MAKE) CK_PI5_UNLOCK=1 CK_PI5_UNLOCK_CARD=1 CK_PI5_FACT=1 full
+
+pi5-agent:
+	RUSTFLAGS="--remap-path-prefix=$(REPO)=/aienos" CARGO_TARGET_DIR=$(REPO)/target/infer-kernel cargo build -q --release --target aarch64-unknown-none --manifest-path $(REPO)/crates/aienos-infer-kernel/Cargo.toml
+	$(MAKE) CK_PI5_UNLOCK=1 CK_PI5_UNLOCK_CARD=1 CK_PI5_AGENT=1 CK_INFER_LIB=$(PI5_INFER_LIB) full
+
+pi5-lifecycle:
+	RUSTFLAGS="--remap-path-prefix=$(REPO)=/aienos" CARGO_TARGET_DIR=$(REPO)/target/infer-kernel cargo build -q --release --target aarch64-unknown-none --manifest-path $(REPO)/crates/aienos-infer-kernel/Cargo.toml
+	$(MAKE) CK_PI5_UNLOCK=1 CK_PI5_UNLOCK_CARD=1 CK_PI5_LIFECYCLE=1 CK_INFER_LIB=$(PI5_INFER_LIB) full
+
+pi5-artifact:
+	$(MAKE) CK_PI5_ARTIFACT=1 all
+
+# PI5-8 cut K: the ALLEN unit (crates/allen-reflex-kernel) for aarch64-unknown-none, same path remap as pi5-infer.
+ALLEN_LIB := $(REPO)/target/allen-kernel/aarch64-unknown-none/release/liballen_reflex_kernel.a
+allen-lib:
+	RUSTFLAGS="--remap-path-prefix=$(REPO)=/aienos" CARGO_TARGET_DIR=$(REPO)/target/allen-kernel cargo build -q --release --locked --target aarch64-unknown-none --manifest-path $(REPO)/crates/allen-reflex-kernel/Cargo.toml
+
+# Raspberry Pi 5 ALLEN exam image (see CK_PI5_ALLEN above): target/native-kernel-pi5-allen/BOOTAA64.EFI
+pi5-allen: allen-lib
+	$(MAKE) CK_PI5_ALLEN=1 CK_ALLEN_LIB=$(ALLEN_LIB) all
+
+pi5:
+	$(MAKE) CK_PI5=1 all
+
+# Raspberry Pi 5 PCIe/RP1 enumerator image (see CK_PI5_PCIE above): target/native-kernel-pi5-pcie/BOOTAA64.EFI
+pi5-net:
+	$(MAKE) CK_PI5_NET=1 all
+
+pi5-pcie:
+	$(MAKE) CK_PI5_PCIE=1 all
+
+# ---- host checker for the AIENOS_CK_SCREEN gate (scripts/qemu_ck_screen_test.sh) ----
+FB_CHECK_TOOL := $(OUT)/host/ck_fb_check
+$(FB_CHECK_TOOL): $(KDIR)/tools/ck_fb_check.c $(KDIR)/core/fbcon.c $(KDIR)/core/fbcon.h $(KDIR)/core/font8x8.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $(KDIR)/tools/ck_fb_check.c $(KDIR)/core/fbcon.c
+fb-check: $(FB_CHECK_TOOL)
+
+# ---- platform xHCI discovery over dumped firmware tables (NEXT-PHASE-3 cut 2) ----
+# Runs the kernel scan (core/acpi_dev.c) and IORT lookup (core/acpi.c) over
+# DSDT/SSDT/IORT files read under Linux and prints the lines the kernel
+# fence prints (dev/xhci_acpi_fmt.h). Hosted; never part of an image.
+ACPI_SCAN_TOOL := $(OUT)/host/ck_acpi_scan
+$(ACPI_SCAN_TOOL): $(KDIR)/tools/ck_acpi_scan.c $(KDIR)/core/acpi_dev.c $(KDIR)/core/acpi.c \
+	$(KDIR)/core/acpi_dev.h $(KDIR)/core/acpi.h $(KDIR)/dev/xhci_acpi_fmt.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -I$(KDIR)/core -I$(KDIR)/dev -I$(BOOT) -o $@ \
+	  $(KDIR)/tools/ck_acpi_scan.c $(KDIR)/core/acpi_dev.c $(KDIR)/core/acpi.c
+acpi-scan: $(ACPI_SCAN_TOOL)
+
+# Owner provisioning generator (hosted; never part of an image) and the
+# generated header for the hardware staging image.
+OWNER_GEN := $(OUT)/host/ck_owner_gen
+$(OWNER_GEN): $(KDIR)/tools/ck_owner_gen.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Werror -o $@ $<
+owner-gen: $(OWNER_GEN)
+ifneq ($(OWNER_HDR),)
+$(OWNER_HDR): $(OWNER_GEN) $(OWNER_PUBKEYS_FILE) $(OWNER_MACHINE_FILE)
+	@mkdir -p $(dir $@)
+	$(OWNER_GEN) $(OWNER_PUBKEYS_FILE) $(OWNER_MACHINE_FILE) $@
+endif
+
+clean:
+	rm -rf $(OUT)
+
+# AIENOS-PI5 RNG200 hardware entropy source: driver logic over a mocked register block, real core/entropy.c rules.
+PI5_RNG_SRCS := $(KDIR)/dev/pi5_rng.c $(KDIR)/core/entropy.c
+$(OUT)/host/test_pi5_rng: $(KDIR)/tests/test_pi5_rng.c $(PI5_RNG_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/dev/pi5_rng.h $(KDIR)/core/entropy.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -DCK_RNG200_SPINS=1000 -I$(KDIR)/dev -o $@ $< $(PI5_RNG_SRCS)
+test-pi5-rng: $(OUT)/host/test_pi5_rng
+	$<
+$(OUT)/host-san/test_pi5_rng: $(KDIR)/tests/test_pi5_rng.c $(PI5_RNG_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/dev/pi5_rng.h $(KDIR)/core/entropy.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -DCK_RNG200_SPINS=1000 -I$(KDIR)/dev -o $@ $< $(PI5_RNG_SRCS)
+
+FORCE:
+.PHONY: uefi-vars slot-loader slot-loader-check pi5-diag imac-diag imac-kernel imac-netldr imac-netboot-tool
+.PHONY: artifact-tier-pi5 artifact-tier-mutant
+.PHONY: osc-receipt-mutants osc-receipt-release osc-code-flip-guard all full pi5 pi5-store pi5-infer pi5-unlock pi5-unlock-card pi5-fact pi5-agent pi5-lifecycle pi5-artifact pi5-allen allen-lib artifact-card-mutant test sanitize context-mutant agent-cmd-mutant allen-gate-mutant cortex-image handoff-mutant acpi-dev-mutant iort-mutants smmu-l2-mutants acpi-scan clean print-kcflags udp-echo tool store-image gpt-image cont-tool owner-gen fb-check continuity-mutants continuity-resolve-mutants FORCE
+
+# AIENOS-PI5 step 3 marker + Pi card GPT test (hosted; a file stands in for the card, QEMU cannot model the Pi SD host).
+PI5_MARKER_SRCS := $(KDIR)/core/pi5_marker.c $(KDIR)/dev/disk_part.c $(NATIVE)/disk/disk.c $(NATIVE)/disk/disk_file.c \
+	$(KDIR)/tools/gpt_write.c
+$(OUT)/host/test_pi5_marker: $(KDIR)/tests/test_pi5_marker.c $(PI5_MARKER_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/core/pi5_marker.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/dev -I$(KDIR)/tools -I$(NATIVE)/disk -o $@ $< $(PI5_MARKER_SRCS)
+test-pi5-marker: $(OUT)/host/test_pi5_marker
+	$<
+$(OUT)/host-san/test_pi5_marker: $(KDIR)/tests/test_pi5_marker.c $(PI5_MARKER_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/core/pi5_marker.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/dev -I$(KDIR)/tools -I$(NATIVE)/disk -o $@ $< $(PI5_MARKER_SRCS)
+
+# AIENOS-PI5 software-only DMA confinement (ADR 0020): host test only, not linked into any image.
+DMAW_SRCS := $(KDIR)/dev/dma_window.c
+DMAW_DEPS := $(KDIR)/tests/test_dma_window.c $(DMAW_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/dev/dma_window.h
+$(OUT)/host/test_dma_window: $(DMAW_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/dev -o $@ $< $(DMAW_SRCS)
+$(OUT)/host-san/test_dma_window: $(DMAW_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/dev -o $@ $< $(DMAW_SRCS)
+test-dma-window: $(OUT)/host/test_dma_window
+	$<
+# Each mutant removes one check; the test must FAIL for every one. (The explicit "addr below base" test is not a
+# mutant: with unsigned arithmetic the end check already refuses it, so it is kept as defence in depth.)
+DMAW_MUTANTS := NO_END WRAP NO_ZERO NO_LATCH NO_STALE NO_ALIGN NO_FRAMECAP NO_GOT NO_INDEX
+dma-window-mutants:
+	@mkdir -p $(OUT)/host
+	@fail=0; for m in $(DMAW_MUTANTS); do \
+	  $(HOSTCC) $(HCFLAGS) -DCK_DMAW_MUTANT_$$m -I$(KDIR)/dev -o $(OUT)/host/test_dma_window_mut_$$m $(KDIR)/tests/test_dma_window.c $(DMAW_SRCS) || exit 1; \
+	  if $(OUT)/host/test_dma_window_mut_$$m >/dev/null; then echo "MUTANT SURVIVED: $$m"; fail=1; else echo "mutant killed: $$m"; fi; \
+	done; test $$fail -eq 0
+.PHONY: test-dma-window dma-window-mutants
+
+# SMMU DMA service refusals (core/smmu_svc.c, #480): the test includes the service source to lay out its static
+# instance table, and stubs the platform hooks itself. Host only.
+SMMU_SVC_SRCS := $(KDIR)/core/fmt.c $(KDIR)/core/acpi.c $(KDIR)/core/smmu.c $(KDIR)/mm/frames.c $(KDIR)/mm/pt.c $(KDIR)/mm/heap.c
+SMMU_SVC_DEPS := $(KDIR)/tests/test_smmu_svc.c $(KDIR)/core/smmu_svc.c $(SMMU_SVC_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
+$(OUT)/host/test_smmu_svc: $(SMMU_SVC_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/include -o $@ $< $(SMMU_SVC_SRCS)
+$(OUT)/host-san/test_smmu_svc: $(SMMU_SVC_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/include -o $@ $< $(SMMU_SVC_SRCS)
+
+# AIENOS-GB10 cut D, host side: GPU page tables, allocator and channel over a simulated GB10
+# (gpu/gpu_sim.c). Host test only, not linked into any image (dependency map: kernel-side D code waits for #163/B).
+GPU_SIM_SRCS := $(KDIR)/gpu/gmmu.c $(KDIR)/gpu/gpu_mem.c $(KDIR)/gpu/gpu_chan.c $(KDIR)/gpu/gpu_sim.c
+GPU_SIM_HDRS := $(KDIR)/gpu/gmmu.h $(KDIR)/gpu/gpu_mem.h $(KDIR)/gpu/gpu_chan.h $(KDIR)/gpu/gpu_sim.h
+GPU_SIM_DEPS := $(KDIR)/tests/test_gpu_sim.c $(GPU_SIM_SRCS) $(GPU_SIM_HDRS) $(KDIR)/tests/ck_test.h
+$(OUT)/host/test_gpu_sim: $(GPU_SIM_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/gpu -o $@ $< $(GPU_SIM_SRCS)
+$(OUT)/host-san/test_gpu_sim: $(GPU_SIM_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/gpu -o $@ $< $(GPU_SIM_SRCS)
+test-gpu-sim: $(OUT)/host/test_gpu_sim
+	$<
+# The three files that would run in the kernel must build with the kernel compiler and KCFLAGS and need no symbol from outside.
+gpu-freestanding:
+	@mkdir -p $(OUT)/host/gpu-fs
+	@for f in gmmu gpu_mem gpu_chan; do \
+	  $(KCC) $(KCFLAGS) -I$(KDIR)/gpu -c -o $(OUT)/host/gpu-fs/$$f.o $(KDIR)/gpu/$$f.c || exit 1; \
+	done; \
+	$(CROSS)ld -r -o $(OUT)/host/gpu-fs/gpu.o $(OUT)/host/gpu-fs/gmmu.o $(OUT)/host/gpu-fs/gpu_mem.o $(OUT)/host/gpu-fs/gpu_chan.o || exit 1; \
+	if nm -u $(OUT)/host/gpu-fs/gpu.o | grep -v " _GLOBAL_OFFSET_TABLE_$$" | grep -q .; then nm -u $(OUT)/host/gpu-fs/gpu.o; echo "gpu-freestanding: FAIL (undefined symbols)"; exit 1; fi; \
+	echo "gpu-freestanding: PASS (gmmu gpu_mem gpu_chan built with KCC/KCFLAGS, linked -r, no undefined symbol except the PIE GOT)"
+# Each mutant removes one check; test_gpu_sim must FAIL for every one.
+GPU_SIM_MUTANTS := NO_OVERLAP NO_PA_RANGE NO_VA_BITS NO_POOL_COUNT NO_INVAL_POLL NO_TIMEOUT_LATCH NO_QUARANTINE \
+	NO_POLLED_UNCACHED NO_GP_VA40 NO_RING_FULL NO_IDLE_QUARANTINE NO_MIXED_PAGES NO_INST_PDB NO_CHID_WIDTH NO_USERD_WIDTH NO_DISABLE \
+	NO_PDE_CHECK NO_POOL_OVERLAP
+gpu-sim-mutants:
+	@mkdir -p $(OUT)/host
+	@fail=0; for m in $(GPU_SIM_MUTANTS); do \
+	  $(HOSTCC) $(HCFLAGS) -DCK_GPU_MUTANT_$$m -I$(KDIR)/gpu -o $(OUT)/host/test_gpu_sim_mut_$$m $(KDIR)/tests/test_gpu_sim.c $(GPU_SIM_SRCS) || exit 1; \
+	  if $(OUT)/host/test_gpu_sim_mut_$$m >/dev/null; then echo "MUTANT SURVIVED: $$m"; fail=1; else echo "mutant killed: $$m"; fi; \
+	done; test $$fail -eq 0
+.PHONY: test-gpu-sim gpu-freestanding gpu-sim-mutants
+
+# L332 rung 1: the same channel as a device contract (gpu/contract/gb10_chan.devc, ADR 0021 class gpu-chan), compiled by
+# crates/aienos-devc into gpu/contract/gen/gch_contract.c (committed; the kernel build never runs cargo). The generated twin
+# must pass test_gpu_sim like the hand one, and the differential trace (every register access and a hash of all simulated
+# memory after each of ~330 operations) must be byte-identical between the two.
+GPU_CONTRACT_C := $(KDIR)/gpu/contract/gen/gch_contract.c
+GPU_SIM_SRCS_CONTRACT := $(filter-out $(KDIR)/gpu/gpu_chan.c,$(GPU_SIM_SRCS)) $(GPU_CONTRACT_C)
+$(OUT)/host/test_gpu_sim_contract: $(KDIR)/tests/test_gpu_sim.c $(GPU_SIM_SRCS_CONTRACT) $(GPU_SIM_HDRS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/gpu -o $@ $< $(GPU_SIM_SRCS_CONTRACT)
+$(OUT)/host-san/test_gpu_sim_contract: $(KDIR)/tests/test_gpu_sim.c $(GPU_SIM_SRCS_CONTRACT) $(GPU_SIM_HDRS) $(KDIR)/tests/ck_test.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/gpu -o $@ $< $(GPU_SIM_SRCS_CONTRACT)
+$(OUT)/host/gpu_chan_trace_hand: $(KDIR)/tests/gpu_chan_trace.c $(GPU_SIM_SRCS) $(GPU_SIM_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/gpu -o $@ $< $(GPU_SIM_SRCS)
+$(OUT)/host/gpu_chan_trace_contract: $(KDIR)/tests/gpu_chan_trace.c $(GPU_SIM_SRCS_CONTRACT) $(GPU_SIM_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/gpu -o $@ $< $(GPU_SIM_SRCS_CONTRACT)
+test-gpu-contract: $(OUT)/host/test_gpu_sim_contract $(OUT)/host-san/test_gpu_sim_contract
+	$(OUT)/host/test_gpu_sim_contract
+	$(OUT)/host-san/test_gpu_sim_contract
+gpu-contract-trace: $(OUT)/host/gpu_chan_trace_hand $(OUT)/host/gpu_chan_trace_contract
+	@$(OUT)/host/gpu_chan_trace_hand > $(OUT)/host/gpu_chan_trace_hand.txt
+	@$(OUT)/host/gpu_chan_trace_contract > $(OUT)/host/gpu_chan_trace_contract.txt
+	@cmp $(OUT)/host/gpu_chan_trace_hand.txt $(OUT)/host/gpu_chan_trace_contract.txt \
+	  && echo "gpu-contract-trace: PASS ($$(wc -l < $(OUT)/host/gpu_chan_trace_hand.txt) lines identical, hand vs contract)"
+gpu-contract-freestanding:
+	@mkdir -p $(OUT)/host/gpu-fs
+	@$(KCC) $(KCFLAGS) -I$(KDIR)/gpu -c -o $(OUT)/host/gpu-fs/gch_contract.o $(GPU_CONTRACT_C) || exit 1; \
+	if nm -u $(OUT)/host/gpu-fs/gch_contract.o | grep -v " _GLOBAL_OFFSET_TABLE_$$" | grep -vE " ck_gmem_(alloc|free|quarantine)$$" | grep -q .; then \
+	  nm -u $(OUT)/host/gpu-fs/gch_contract.o; echo "gpu-contract-freestanding: FAIL"; exit 1; fi; \
+	echo "gpu-contract-freestanding: PASS (gch_contract.c with KCC/KCFLAGS, needs only the ck_gmem allocator)"
+.PHONY: test-gpu-contract gpu-contract-trace gpu-contract-freestanding
+
+# L332 / L346: the GB10B GSP start-up on BAR0 (gpu/gsp_mmio.c, steps and driver-source lines in gsp_mmio.h) against a
+# simulated SEC2 + GSP falcon (gpu/gsp_sim.c). Host only. gsp-mmio-freestanding: gsp_mmio.c with KCC/KCFLAGS, no symbol needed.
+GSP_MMIO_SRCS := $(KDIR)/gpu/gsp_mmio.c $(KDIR)/gpu/gsp_sim.c
+GSP_MMIO_DEPS := $(KDIR)/tests/test_gsp_mmio.c $(GSP_MMIO_SRCS) $(KDIR)/gpu/gsp_mmio.h $(KDIR)/gpu/gsp_sim.h $(KDIR)/gpu/gmmu.h $(KDIR)/tests/ck_test.h
+$(OUT)/host/test_gsp_mmio: $(GSP_MMIO_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/gpu -o $@ $< $(GSP_MMIO_SRCS)
+$(OUT)/host-san/test_gsp_mmio: $(GSP_MMIO_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/gpu -o $@ $< $(GSP_MMIO_SRCS)
+test-gsp-mmio: $(OUT)/host/test_gsp_mmio $(OUT)/host-san/test_gsp_mmio
+	$(OUT)/host/test_gsp_mmio
+	$(OUT)/host-san/test_gsp_mmio
+gsp-mmio-freestanding:
+	@mkdir -p $(OUT)/host/gpu-fs
+	@$(KCC) $(KCFLAGS) -I$(KDIR)/gpu -c -o $(OUT)/host/gpu-fs/gsp_mmio.o $(KDIR)/gpu/gsp_mmio.c || exit 1; \
+	if nm -u $(OUT)/host/gpu-fs/gsp_mmio.o | grep -v " _GLOBAL_OFFSET_TABLE_$$" | grep -q .; then \
+	  nm -u $(OUT)/host/gpu-fs/gsp_mmio.o; echo "gsp-mmio-freestanding: FAIL"; exit 1; fi; \
+	echo "gsp-mmio-freestanding: PASS (gsp_mmio.c with KCC/KCFLAGS, no undefined symbol)"
+.PHONY: test-gsp-mmio gsp-mmio-freestanding
+# The same start-up written from gpu/contract/gb10_gsp.devc (aienos-devc class gpu-boot, branch feat/devc-gpu):
+# gen/gsb_contract.c has the gsp_mmio.h API with the contract's own offsets. It must pass test_gsp_mmio and match
+# the hand twin access for access in every gsp_boot_trace scenario.
+GSP_CONTRACT_C := $(KDIR)/gpu/contract/gen/gsb_contract.c
+GSP_TRACE_DEPS := $(KDIR)/tests/gsp_boot_trace.c $(KDIR)/gpu/gsp_sim.c $(KDIR)/gpu/gsp_mmio.h $(KDIR)/gpu/gsp_sim.h $(KDIR)/gpu/gmmu.h
+$(OUT)/host/test_gsp_mmio_contract: $(GSP_MMIO_DEPS) $(GSP_CONTRACT_C)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/gpu -o $@ $< $(GSP_CONTRACT_C) $(KDIR)/gpu/gsp_sim.c
+$(OUT)/host-san/test_gsp_mmio_contract: $(GSP_MMIO_DEPS) $(GSP_CONTRACT_C)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/gpu -o $@ $< $(GSP_CONTRACT_C) $(KDIR)/gpu/gsp_sim.c
+$(OUT)/host/gsp_boot_trace_hand: $(GSP_TRACE_DEPS) $(KDIR)/gpu/gsp_mmio.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/gpu -o $@ $< $(KDIR)/gpu/gsp_mmio.c $(KDIR)/gpu/gsp_sim.c
+$(OUT)/host/gsp_boot_trace_contract: $(GSP_TRACE_DEPS) $(GSP_CONTRACT_C)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/gpu -o $@ $< $(GSP_CONTRACT_C) $(KDIR)/gpu/gsp_sim.c
+test-gsp-contract: $(OUT)/host/test_gsp_mmio_contract $(OUT)/host-san/test_gsp_mmio_contract
+	$(OUT)/host/test_gsp_mmio_contract
+	$(OUT)/host-san/test_gsp_mmio_contract
+gsp-contract-trace: $(OUT)/host/gsp_boot_trace_hand $(OUT)/host/gsp_boot_trace_contract
+	@$(OUT)/host/gsp_boot_trace_hand > $(OUT)/host/gsp_boot_trace_hand.txt
+	@$(OUT)/host/gsp_boot_trace_contract > $(OUT)/host/gsp_boot_trace_contract.txt
+	@cmp $(OUT)/host/gsp_boot_trace_hand.txt $(OUT)/host/gsp_boot_trace_contract.txt \
+	  && echo "gsp-contract-trace: PASS ($$(wc -l < $(OUT)/host/gsp_boot_trace_hand.txt) lines identical, hand vs contract)"
+gsp-contract-freestanding:
+	@mkdir -p $(OUT)/host/gpu-fs
+	@$(KCC) $(KCFLAGS) -I$(KDIR)/gpu -c -o $(OUT)/host/gpu-fs/gsb_contract.o $(GSP_CONTRACT_C) || exit 1; \
+	if nm -u $(OUT)/host/gpu-fs/gsb_contract.o | grep -v " _GLOBAL_OFFSET_TABLE_$$" | grep -q .; then \
+	  nm -u $(OUT)/host/gpu-fs/gsb_contract.o; echo "gsp-contract-freestanding: FAIL"; exit 1; fi; \
+	echo "gsp-contract-freestanding: PASS (gsb_contract.c with KCC/KCFLAGS, no undefined symbol)"
+.PHONY: test-gsp-contract gsp-contract-trace gsp-contract-freestanding
+
+
+# AIENOS-PI5 PCIe root complex / RP1 enumerator logic over a fake register file. Not the hardware.
+PI5PCIE_SRCS := $(KDIR)/dev/pi5_pcie.c
+PI5PCIE_DEPS := $(KDIR)/tests/test_pi5_pcie.c $(PI5PCIE_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/dev/pi5_pcie.h
+$(OUT)/host/test_pi5_pcie: $(PI5PCIE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/dev -o $@ $< $(PI5PCIE_SRCS)
+$(OUT)/host-san/test_pi5_pcie: $(PI5PCIE_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/dev -o $@ $< $(PI5PCIE_SRCS)
+test-pi5-pcie: $(OUT)/host/test_pi5_pcie
+	$<
+# Each mutant removes one decision; the test must FAIL for every one.
+PI5PCIE_MUTANTS := NO_OUTSIDE NO_FULLCOVER NO_REMAP NO_INDEX NO_ALIGN NO_MERGE
+pi5-pcie-mutants:
+	@mkdir -p $(OUT)/host
+	@fail=0; for m in $(PI5PCIE_MUTANTS); do \
+	  $(HOSTCC) $(HCFLAGS) -DCK_PCIE_MUTANT_$$m -I$(KDIR)/dev -o $(OUT)/host/test_pi5_pcie_mut_$$m $(KDIR)/tests/test_pi5_pcie.c $(PI5PCIE_SRCS) || exit 1; \
+	  if $(OUT)/host/test_pi5_pcie_mut_$$m >/dev/null; then echo "MUTANT SURVIVED: $$m"; fail=1; else echo "mutant killed: $$m"; fi; \
+	done; test $$fail -eq 0
+.PHONY: test-pi5-pcie pi5-pcie-mutants pi5-pcie
+
+# AIENOS-PI5 network cut 2 (inbound window plan, RP1 quiesce, clocks, PHY reset, MDIO, PHY ID) over fake registers.
+PI5NET_SRCS := $(KDIR)/dev/pi5_net.c $(KDIR)/dev/pi5_pcie.c
+PI5NET_DEPS := $(KDIR)/tests/test_pi5_net.c $(PI5NET_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/dev/pi5_net.h $(KDIR)/dev/pi5_pcie.h
+$(OUT)/host/test_pi5_net: $(PI5NET_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/dev -o $@ $< $(PI5NET_SRCS)
+$(OUT)/host-san/test_pi5_net: $(PI5NET_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/dev -o $@ $< $(PI5NET_SRCS)
+test-pi5-net: $(OUT)/host/test_pi5_net
+	$<
+# Each mutant removes one decision; the test must FAIL for every one.
+PI5NET_MUTANTS := NO_STRADDLE NO_REMAP_EN NO_DISABLE_FIRST NO_READBACK NO_RESTORE NO_OTHERS NO_STATUS_MASK NO_QUIESCE_CHECK OB_NO_LIMIT NO_ASSERT NO_HOLD NO_RELEASE NO_HIGH_FIRST NO_IDLE_AFTER NO_MPE TOUCH_ON_CLOCK NO_EXACT_DIV NO_CLK_VERIFY OUI_ORDER BAD_CLASS NO_BOUNDS NO_MDC_DIV PARTIAL_ANY
+pi5-net-mutants:
+	@mkdir -p $(OUT)/host
+	@fail=0; for m in $(PI5NET_MUTANTS); do \
+	  $(HOSTCC) $(HCFLAGS) -DCK_NET_MUTANT_$$m -I$(KDIR)/dev -o $(OUT)/host/test_pi5_net_mut_$$m $(KDIR)/tests/test_pi5_net.c $(PI5NET_SRCS) || exit 1; \
+	  if $(OUT)/host/test_pi5_net_mut_$$m >/dev/null; then echo "MUTANT SURVIVED: $$m"; fail=1; else echo "mutant killed: $$m"; fi; \
+	done; test $$fail -eq 0
+.PHONY: test-pi5-net pi5-net-mutants pi5-net
+
+# AIENOS-PI5 network cut 3 (GEM descriptors, transfer order, bus-master window, PHY loopback) over a fake GEM that checks every DMA it makes.
+PI5GEM_SRCS := $(KDIR)/dev/pi5_gem.c $(KDIR)/dev/pi5_net.c $(KDIR)/dev/pi5_pcie.c $(KDIR)/dev/dma_window.c
+PI5GEM_DEPS := $(KDIR)/tests/test_pi5_gem.c $(PI5GEM_SRCS) $(KDIR)/tests/ck_test.h $(KDIR)/dev/pi5_gem.h $(KDIR)/dev/pi5_net.h $(KDIR)/dev/pi5_pcie.h $(KDIR)/dev/dma_window.h
+$(OUT)/host/test_pi5_gem: $(PI5GEM_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) -I$(KDIR)/dev -o $@ $< $(PI5GEM_SRCS)
+$(OUT)/host-san/test_pi5_gem: $(PI5GEM_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -I$(KDIR)/dev -o $@ $< $(PI5GEM_SRCS)
+test-pi5-gem: $(OUT)/host/test_pi5_gem
+	$<
+# Each mutant removes one decision; the test must FAIL for every one.
+PI5GEM_MUTANTS := NO_VALIDATE BME_EARLY BME_LEFT_ON NO_QUIESCE_WAIT NO_RETE_OFF NO_BARRIER NO_TIEOFF NO_RXLEN_CHECK NO_TX_LAST NO_SENTINEL_USED NO_ADDR64 NO_HWWIN NOT_STICKY NO_FRAMECAP NO_SEQ NO_DIFF MDIO_OP PHYLB_BIT NO_WRAP NO_GBE NO_DRFCS NO_BME_VERIFY NO_LLB_CLEAR
+pi5-gem-mutants:
+	@mkdir -p $(OUT)/host
+	@fail=0; for m in $(PI5GEM_MUTANTS); do \
+	  $(HOSTCC) $(HCFLAGS) -DCK_GEM_MUTANT_$$m -I$(KDIR)/dev -o $(OUT)/host/test_pi5_gem_mut_$$m $(KDIR)/tests/test_pi5_gem.c $(PI5GEM_SRCS) || exit 1; \
+	  if $(OUT)/host/test_pi5_gem_mut_$$m >/dev/null; then echo "MUTANT SURVIVED: $$m"; fail=1; else echo "mutant killed: $$m"; fi; \
+	done; test $$fail -eq 0
+.PHONY: test-pi5-gem pi5-gem-mutants

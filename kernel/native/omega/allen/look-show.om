@@ -1,0 +1,592 @@
+note SPDX-License-Identifier: MIT
+note Allen's look, the show: what the firmware loop draws each frame and where. Native resolution
+note (Lg[0] x Lg[1], the GOP mode), the frame Nfrm (look-paint.om) composed in allen_ui.c's order:
+note night base, lights, the merger flash, Allen's being, his words and the bar; in repository mode
+note the repository screen (repository-screen.om, drawn through surface.om at native scale) on top.
+note Only rectangles that changed are composed; their rows are blitted from two persistent BGRA
+note halves (Efa rows 0..hh-1, Efb rows hh..h-1; each at most 16 MiB, the compiler's array limit).
+note Sh: 0 ms at start, 1 last t, 2 rows per half (hh), 3 full redraw pending, 4 frames drawn,
+note 5 repository screen dirty, 6 last full-screen compose ms, 7 fade strip, 8 the request is
+note with the Spark (thinking), 9 the fade's last full pass is done, 10 the ripple radius last
+note drawn, 11 now (ms), 12 the ripple was on screen last frame, 13 pixels composed this frame,
+note 14 rectangles composed this frame, 15 this frame redrew the whole screen (look-stat.om).
+global Sh long 16
+global Efa uchar 16777216
+global Efb uchar 16777216
+global Shrow uchar 2176
+global Shd long 1280
+global Shdn ulong 1
+global Shr long 4
+global Shl long 10
+global Shb long 20
+global Shbn ulong 1
+const SHRECTS ulong 320
+const SHBORN ulong 12300
+const SHFADE ulong 6800
+const SHMERGE ulong 12000
+const SHGONE ulong 15600
+const SHCOARSE ulong 0
+text Shnet "Spark is not connected yet. Your message is still here."
+fn shfits w ulong h ulong to bool
+if or lt w 640 lt h 400
+ret false
+end
+if or gt w 3840 gt h 2176
+ret false
+end
+hh = div add h 1 2
+ret le mul mul hh w 4 len Efa
+end
+fn shclipr x long y long w long h long to bool
+note Shr becomes (x,y,w,h) held inside the screen; false when nothing is left.
+x1 = add x w
+y1 = add y h
+if lt x 0
+x = 0
+end
+if lt y 0
+y = 0
+end
+if gt x1 get Lg 0
+x1 = get Lg 0
+end
+if gt y1 get Lg 1
+y1 = get Lg 1
+end
+put Shr 0 x
+put Shr 1 y
+put Shr 2 sub x1 x
+put Shr 3 sub y1 y
+if or le sub x1 x 0 le sub y1 y 0
+ret false
+end
+ret true
+end
+fn shmark x long y long w long h long to void
+note Remember a rectangle to compose this frame. Past the list's room, the whole screen is marked.
+if not shclipr x y w h
+ret
+end
+n = get Shdn 0
+if ge n SHRECTS
+put Sh 3 1
+ret
+end
+at = mul n 4
+put Shd at get Shr 0
+put Shd add at 1 get Shr 1
+put Shd add at 2 get Shr 2
+put Shd add at 3 get Shr 3
+put Shdn 0 add n 1
+end
+fn shmarkall to void
+put Sh 3 1
+end
+fn shrowa i ulong at ulong n ulong to void
+note n pixels from Nfrm[i..] as BGRA into Efa[at..] (rows of the upper half).
+for k ulong n
+c = get Nfrm add i k
+put Efa at uchar and c 255
+put Efa add at 1 uchar and shr c 8 255
+put Efa add at 2 uchar and shr c 16 255
+put Efa add at 3 0
+at = add at 4
+end
+end
+fn shrowb i ulong at ulong n ulong to void
+note The same into Efb (rows of the lower half).
+for k ulong n
+c = get Nfrm add i k
+put Efb at uchar and c 255
+put Efb add at 1 uchar and shr c 8 255
+put Efb add at 2 uchar and shr c 16 255
+put Efb add at 3 0
+at = add at 4
+end
+end
+fn shrow y ulong x0 ulong n ulong to void
+note One row's pixels x0..x0+n-1 from Nfrm into the BGRA half that holds row y.
+w = ulong get Lg 0
+hh = ulong get Sh 2
+i = add mul y w x0
+if lt y hh
+shrowa i mul i 4 n
+else
+shrowb i mul add mul sub y hh w x0 4 n
+end
+put Shrow y 1
+end
+fn shconvert x long y long w long h long to void
+note Nfrm -> BGRA for the rectangle, and its rows are remembered for the blit.
+for r ulong ulong h
+shrow add ulong y r ulong x ulong w
+end
+end
+fn shblit y0 ulong rows ulong to bool
+note Rows y0..y0+rows-1 (whole width) to the screen from the half that holds them; a run that
+note crosses the halves is sent as two.
+w = ulong get Lg 0
+hh = ulong get Sh 2
+if and lt y0 hh gt add y0 rows hh
+if not shblit y0 sub hh y0
+ret false
+end
+ret shblit hh sub add y0 rows hh
+end
+arg = or or w shl rows 32 shl y0 48
+n = mul mul w rows 4
+put Stw 10 add get Stw 10 n
+st = ulong 0
+if lt y0 hh
+st = efi 3 arg Efa mul mul y0 w 4 n
+else
+st = efi 3 arg Efb mul mul sub y0 hh w 4 n
+end
+ret eq st 0
+end
+fn shflush to bool
+note Blit every run of rows marked by shrow, then clear the marks.
+h = ulong get Lg 1
+y = ulong 0
+ok = true
+while lt y h bound 2176
+if eq get Shrow y 0
+y = add y 1
+else
+n = ulong 0
+while and lt add y n h ne get Shrow add y n 0 bound 2176
+put Shrow add y n 0
+n = add n 1
+end
+if not shblit y n
+ok = false
+end
+y = add y n
+end
+end
+ret ok
+end
+fn shrepo to void
+note The repository screen, through surface.om at native scale, over the composed sky.
+if ne get Dmo 0 1
+ret
+end
+ok = ghrender
+end
+fn shcompose x long y long w long h long to void
+note allen_ui.c compose: night base, lights, flash, the being, words and bar.
+pkclip x y w h
+ntbase x y w h
+ntlights x y w h 0 0
+hmflash x y w h
+mddraw x y w h
+hmtext x y w h
+end
+fn shfull to void
+note The whole screen, then the repository screen if it is up, then BGRA.
+w = get Lg 0
+h = get Lg 1
+shcompose 0 0 w h
+shrepo
+shconvert 0 0 w h
+put Sh 13 mul w h
+put Sh 14 1
+put Sh 15 1
+put Shdn 0 0
+put Sh 3 0
+end
+fn shrects to void
+note Every marked rectangle: compose and convert. Rectangles may overlap; drawing twice is harmless
+note because every layer is a pure function of position and time.
+n = get Shdn 0
+px = long 0
+for i ulong n
+at = mul i 4
+x = get Shd at
+y = get Shd add at 1
+w = get Shd add at 2
+h = get Shd add at 3
+shcompose x y w h
+shconvert x y w h
+px = add px mul w h
+end
+put Sh 13 px
+put Sh 14 long n
+put Sh 15 0
+put Shdn 0 0
+end
+fn shtwinkles to void
+note The twinkling stars' boxes (ck_night_star_box) as in allen_ui.c: every star, every frame.
+n = ntcount
+for i ulong n
+ntstarbox i
+shmark get Pa 0 get Pa 1 get Pa 2 get Pa 3
+end
+end
+fn shstrip to void
+note The eyes adjust over 6.8 s in slow patches: the screen is composed a sixth at a time, so a
+note frame stays cheap and every part of the sky is refreshed about twice a second.
+h = get Lg 1
+k = rem get Sh 7 6
+y0 = div mul h k 6
+y1 = div mul h add k 1 6
+shmark 0 y0 get Lg 0 sub y1 y0
+put Sh 7 add get Sh 7 1
+end
+fn shchord r long dy long to long
+note Half the width of a circle of radius r at dy from its centre (0 outside).
+if ge dy r
+ret 0
+end
+ret long pkisqrt ulong sub mul r r mul dy dy
+end
+fn shringband hi long lo long ya long yb long to void
+note The ring between radii lo and hi within rows ya..yb-1: one rectangle, or two when the band
+note misses the ring's hollow middle. Distances are from (cx, cy).
+cy = get Lg 4
+cx = get Lg 3
+near = long 0
+if gt ya cy
+near = sub ya cy
+end
+if lt yb cy
+near = sub cy yb
+end
+far = pkmax pkabs sub ya cy pkabs sub yb cy
+xo = shchord hi near
+xi = shchord lo far
+if eq xo 0
+ret
+end
+if eq xi 0
+shmark sub cx xo ya mul xo 2 sub yb ya
+else
+shmark sub cx xo ya sub xo xi sub yb ya
+shmark add cx xi ya sub xo xi sub yb ya
+end
+end
+fn shring to void
+note The ripple bends the sky only within reach of its crest (night.c in_ripple); since the last
+note frame the crest moved out, so the band from the old inner edge to the new outer edge changes.
+r = get Ntrip 0
+w = get Ntrip 1
+if eq w 0
+ret
+end
+reach = add div mul w 22 10 9
+hi = add r reach
+lo = sub get Sh 10 reach
+if or lt lo 0 eq get Sh 10 0
+lo = 0
+end
+put Sh 10 r
+cy = get Lg 4
+ya = sub cy hi
+if lt ya 0
+ya = 0
+end
+yend = add cy hi
+if gt yend get Lg 1
+yend = get Lg 1
+end
+while lt ya yend bound 64
+yb = add ya 64
+if gt yb yend
+yb = yend
+end
+shringband hi lo ya yb
+ya = yb
+end
+end
+fn shbadd x long y long w long h long to void
+note A box onto the list Shb (at most 5: two holes now, two before, one spare).
+n = get Shbn 0
+if ge n 5
+ret
+end
+at = mul n 4
+put Shb at x
+put Shb add at 1 y
+put Shb add at 2 w
+put Shb add at 3 h
+put Shbn 0 add n 1
+end
+fn shbmeet a ulong b ulong to bool
+note Do boxes a and b of Shb overlap (share at least one pixel column and row).
+a = mul a 4
+b = mul b 4
+if ge get Shb a add get Shb b get Shb add b 2
+ret false
+end
+if ge get Shb b add get Shb a get Shb add a 2
+ret false
+end
+if ge get Shb add a 1 add get Shb add b 1 get Shb add b 3
+ret false
+end
+if ge get Shb add b 1 add get Shb add a 1 get Shb add a 3
+ret false
+end
+ret true
+end
+fn shbjoin a ulong b ulong to void
+note Box a becomes the union of a and b; the last box moves into b's place.
+n = get Shbn 0
+a = mul a 4
+b = mul b 4
+x1 = add get Shb a get Shb add a 2
+y1 = add get Shb b get Shb add b 2
+x1 = pkmax x1 y1
+y1 = add get Shb add a 1 get Shb add a 3
+x0 = add get Shb add b 1 get Shb add b 3
+y1 = pkmax y1 x0
+x0 = pkmin get Shb a get Shb b
+put Shb a x0
+x0 = pkmin get Shb add a 1 get Shb add b 1
+put Shb add a 1 x0
+put Shb add a 2 sub x1 get Shb a
+put Shb add a 3 sub y1 get Shb add a 1
+n = sub n 1
+put Shbn 0 n
+n = mul n 4
+for i ulong 4
+put Shb add b i get Shb add n i
+end
+end
+fn shbmerge to void
+note Join overlapping boxes until none overlap: every layer is a pure function of position and
+note time, so one union costs less than two boxes composed twice where they meet.
+for pass ulong 8
+joined = false
+n = get Shbn 0
+for a ulong n
+for b ulong n
+if and lt a b not joined
+if shbmeet a b
+shbjoin a b
+joined = true
+end
+end
+end
+end
+if not joined
+ret
+end
+end
+end
+fn shlens to void
+note The holes' lens boxes now (Shl remembers them for the next frame) and the boxes of the
+note frame before, merged where they meet, then marked.
+put Shbn 0 0
+n = ulong get Shl 8
+for i ulong n
+at = mul i 4
+shbadd get Shl at get Shl add at 1 get Shl add at 2 get Shl add at 3
+end
+put Shl 8 0
+for i ulong ntholes
+if ntholebox i
+shbadd get Pa 0 get Pa 1 get Pa 2 get Pa 3
+k = ulong get Shl 8
+at = mul k 4
+for j ulong 4
+put Shl add at j get Pa j
+end
+put Shl 8 add long k 1
+end
+end
+shbmerge
+n = get Shbn 0
+for i ulong n
+at = mul i 4
+shmark get Shb at get Shb add at 1 get Shb add at 2 get Shb add at 3
+end
+end
+fn shdecide t ulong to void
+note Which parts of the screen change at t (ms since the sky started). Sh[9]: the fade's last
+note full pass is done; Sh[12]: the ripple was on screen last frame; Shl: the lens rect last frame.
+if lt t add SHFADE 400
+shstrip
+else
+if eq get Sh 9 0
+put Sh 9 1
+shmarkall
+end
+end
+if ne get Ntrip 1 0
+shring
+put Sh 12 1
+put Ntcoarse 0 SHCOARSE
+else
+put Ntcoarse 0 0
+if ne get Sh 12 0
+put Sh 12 0
+shmarkall
+end
+end
+note The holes' lens regions now and where they were, Allen, his words and bar, the twinkles.
+shlens
+mddirty
+shmark get Mdbox 0 get Mdbox 1 get Mdbox 2 get Mdbox 3
+shmark get Hmdirty 0 get Hmdirty 1 get Hmdirty 2 get Hmdirty 3
+shtwinkles
+end
+fn shstep now ulong to bool
+note Move the show on to now and draw what changed. False when the screen refused a blit.
+if eq get Sh 0 0
+put Sh 0 long now
+end
+put Sh 11 long now
+t = sub now ulong get Sh 0
+ntat t
+hmstep long t
+mdat long t
+if eq get Dmo 0 1
+note Repository mode: a still picture, redrawn only when the screen says it changed.
+if or ne get Sh 5 0 ne get Sh 3 0
+shfull
+put Sh 5 0
+ret shflush
+end
+ret true
+end
+shdecide t
+if ne get Sh 3 0
+shfull
+else
+shrects
+end
+put Sh 1 long t
+put Sh 4 add get Sh 4 1
+t1 = efms
+ok = shflush
+shstat now t1 efms t
+ret ok
+end
+fn shstat t0 ulong t1 ulong t2 ulong t ulong to void
+note The frame's clocks and what it composed, for the stopwatch (look-stat.om).
+rf = ulong add mul get Sh 14 2 get Sh 15
+stframe t0 t1 t2 t ulong get Sh 13 rf
+end
+fn shsubmit to void
+note Enter in the bar: a recognised repository request opens the repository screen; anything else
+note goes to the Spark through the courier (look-chat.om) and Allen thinks until the answer comes.
+n = get Hminn 0
+if or eq n 0 gt n 159
+ret
+end
+for i ulong n
+put In i get Hmin i
+put Dprm i get Hmin i
+end
+put Inlen 0 n
+put Dprmn 0 n
+if stasked
+hmkey 13
+ret
+end
+if inmatch
+hmkey 13
+ininstall ulong get Sh 11
+ret
+end
+if ghask
+put Dmo 0 1
+put Sh 5 1
+hmkey 13
+ret
+end
+if eq get Es 6 0
+note A disconnected firmware network must not make Enter silently do nothing.
+note Keep the unsent input for retry and give a local answer without claiming it was delivered.
+for i ulong len Shnet
+put Hmsay i get Shnet i
+end
+put Hmsayn 0 len Shnet
+hmsaid
+note The local notice did not consume input; the next frame must still draw that line.
+put Hm 15 add get Hm 15 1
+ret
+end
+if chask ulong get Sh 11
+put Sh 8 1
+hmthink 1
+end
+hmkey 13
+end
+fn shkey key ulong to bool
+note Keys: the repository screen takes them while it is up (Escape closes it); otherwise the bar.
+if eq get Dmo 0 1
+if eq key 27
+put Dmo 0 0
+ghinit
+shmarkall
+ret true
+end
+ghkey key
+put Sh 5 1
+ret true
+end
+if or eq key 10 eq key 13
+shsubmit
+ret true
+end
+hmkey key
+ret true
+end
+fn shanswer to void
+note The courier's visible text becomes what Allen says.
+if ne get Chevent 0 1
+if or eq get Chevent 0 5 eq get Chevent 0 6
+if eq get Chevent 0 6
+hmthink 0
+put Sh 8 0
+end
+put Chevent 0 0
+end
+ret
+end
+n = get Chsayn 0
+if gt n len Hmsay
+n = len Hmsay
+end
+for i ulong n
+put Hmsay i get Chsay i
+end
+put Hmsayn 0 n
+hmsaid
+hmthink 0
+put Sh 8 0
+put Chevent 0 0
+end
+fn shinit now ulong to bool
+note Sizes from the screen (Es), then every module of the look.
+w = get Es 0
+h = get Es 1
+if not shfits w h
+ret false
+end
+put Lg 0 long w
+put Lg 1 long h
+kw = div mul w 256 1920
+kh = div mul h 256 1080
+if lt kh kw
+kw = kh
+end
+put Lg 2 long kw
+put Lg 3 long div w 2
+put Lg 4 long div mul h 40 100
+put Sh 2 long div add h 1 2
+for i ulong 2176
+put Shrow i 0
+end
+put Shdn 0 0
+put Shl 8 0
+pkinit
+ntinit
+mdinit long SHBORN
+hminit
+put Sh 0 long now
+put Sh 3 1
+ret true
+end

@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# AIENOS End-to-End Build and Evidence Verification Harness
+# Enforces sequential integration gates on the host DGX Spark environment.
+# Last line: VERIFY_ALL: PASS only when every step ran; VERIFY_ALL: NOT_RUN if any step
+# was skipped (scripts/lib_verify_summary.sh; test: bash scripts/lib_verify_summary.sh --self-test).
+
+set -euo pipefail
+#
+# AIENOS_STRICT=1 turns every SKIPPED step into a failure, so a green strict
+# run proves every step really ran. AIENOS_LOG_DIR=<dir> makes the QEMU
+# scripts copy their serial logs into <dir> (used by scripts/m3_receipt.sh).
+# Without either variable the behaviour is unchanged.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${AIENOS_LOG_DIR:-}" ]]; then
+    mkdir -p "${AIENOS_LOG_DIR}"
+    AIENOS_LOG_DIR="$(cd "${AIENOS_LOG_DIR}" && pwd)"
+    export AIENOS_LOG_DIR
+fi
+cd "${REPO_ROOT}"
+
+# This harness and the QEMU scripts it calls read build output from target/ in this
+# checkout (for example target/aarch64-unknown-uefi/release/aienos-boot.efi). A caller's
+# CARGO_TARGET_DIR elsewhere (the Spark judge sets a shared one per repository) made the
+# UEFI image check fail with "No such file or directory", and a shared directory can hand
+# a test binary built from another checkout. Build into this checkout's own target/.
+export CARGO_TARGET_DIR="${REPO_ROOT}/target"
+# The Spark judge runs gates with PATH=/var/lib/aien-run/cargo/bin:/usr/local/bin:/usr/bin:/bin, without the sbin
+# directories. Unprivileged tools from there are still needed (the recovery initrd build runs
+# `modprobe --show-depends`), so append them; earlier PATH entries keep precedence.
+export PATH="${PATH}:/usr/sbin:/sbin"
+
+# shellcheck source=scripts/lib_verify_summary.sh
+source "${REPO_ROOT}/scripts/lib_verify_summary.sh"
+
+echo "============================================================"
+echo "AIENOS Integration Verification Harness"
+echo "Host: $(uname -n) | Arch: $(uname -m) | Kernel: $(uname -r)"
+echo "Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+echo "Strict: ${AIENOS_STRICT:-0} | Serial log dir: ${AIENOS_LOG_DIR:-none}"
+echo "============================================================"
+
+# Step 1: Gate 1 Verification (Config A Reference Bundle)
+echo ""
+echo "--- [Gate 1 Verification: Config A Freeze] ---"
+if [[ ! -f "evidence/config_a_reference_bundle.json" ]]; then
+    echo "Running freeze_reality.sh..."
+    ./scripts/freeze_reality.sh
+fi
+./scripts/verify_evidence.sh "evidence/config_a_reference_bundle.json"
+echo "PASS  Gate 1 Config A reference bundle verified"
+
+# Step 1b: Formatting
+echo ""
+echo "--- [Formatting: cargo fmt --check] ---"
+cargo fmt --all --check
+echo "PASS  formatting: cargo fmt --all --check"
+
+# Step 2: Host component test suite
+echo ""
+echo "--- [Host Component Testing: Workspace Crates] ---"
+cargo test --workspace -- --format=pretty
+echo "PASS  host tests: cargo test --workspace -- --format=pretty"
+echo "PASS  ABI conformance: frozen wire format golden bytes and roundtrips verified"
+
+# Step 3: Linting & Zero-Warning Enforcement
+echo ""
+echo "--- [Clippy Verification: -D warnings] ---"
+cargo clippy --workspace --all-targets -- -D warnings
+echo "PASS  clippy: zero warnings with -D warnings"
+
+# Step 3b: target-only code (bare-metal kernel, UEFI images) is invisible to
+# the host clippy run above, so lint each shipped target/feature set too.
+echo ""
+echo "--- [Clippy Verification: AArch64 targets, -D warnings] ---"
+cargo clippy -p aienos-kernel --target aarch64-unknown-none --no-default-features -- -D warnings
+cargo clippy -p aienos-kernel --target aarch64-unknown-none --no-default-features --features seed0b-test-anchor -- -D warnings
+for features in firmware handoff seed0b-qualification usb-keyboard nvme-read nvme-write store-qual continuity-qual recovery-qual; do
+    cargo clippy -p aienos-boot --target aarch64-unknown-uefi --features "${features}" --bins -- -D warnings
+done
+echo "PASS  clippy: aarch64-unknown-none kernel and aarch64-unknown-uefi images, zero warnings"
+
+# Step 3c: TEST-ONLY SEED-0B qualification code paths are feature-gated and
+# so absent from the default runs above; test and lint them explicitly.
+echo ""
+echo "--- [SEED-0B qualification features: tests and clippy] ---"
+cargo test -p aienos-artifact --features seed0b-test-anchor
+cargo test -p aienos-artifact-tool --features seed0b-test-signing
+cargo clippy -p aienos-artifact-tool --all-targets --features seed0b-test-signing -- -D warnings
+if cargo build --release -p aienos-artifact-tool --features seed0b-test-signing >/dev/null 2>&1; then
+    echo "FAIL  release build accepted the TEST-ONLY SEED-0B signing identity" >&2
+    exit 1
+fi
+echo "PASS  SEED-0B qualification features tested and linted; release build refuses the test signing identity"
+
+# Step 4: Bare-metal library compilation check (not a boot test)
+echo ""
+echo "--- [Bare-Metal Target Compilation Check] ---"
+cargo check -p aienos-kernel --target aarch64-unknown-none --no-default-features
+cargo build -p aienos-kernel --target aarch64-unknown-none --no-default-features
+echo "PASS  AArch64 build: aienos-kernel for aarch64-unknown-none"
+
+# Step 5: Build an AArch64 UEFI diagnostic image and inspect its PE header.
+# This verifies the firmware entry artifact format, not a hardware boot.
+echo ""
+echo "--- [AArch64 UEFI Image Builds] ---"
+cargo build --release -p aienos-boot --target aarch64-unknown-uefi --features firmware --bin aienos-boot
+cargo run --quiet --release -p aienos-evidence -- verify-efi "${CARGO_TARGET_DIR:-target}"/aarch64-unknown-uefi/release/aienos-boot.efi
+cargo build --release -p aienos-boot --target aarch64-unknown-uefi --features handoff --bin aienos-handoff
+cargo run --quiet --release -p aienos-evidence -- verify-efi "${CARGO_TARGET_DIR:-target}"/aarch64-unknown-uefi/release/aienos-handoff.efi
+echo "PASS  AArch64 build: aienos-boot.efi and aienos-handoff.efi PE headers verified"
+
+# Step 6: QEMU AArch64 UEFI Boot Verification (Emulator Boot Test)
+echo ""
+echo "--- [QEMU AArch64 UEFI Boot Verification] ---"
+if command -v qemu-system-aarch64 >/dev/null && [[ -r "${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd}" ]]; then
+    ./scripts/qemu_boot_test.sh
+else
+    skipped "qemu-system-aarch64 or AAVMF firmware not present on host."
+fi
+
+# Step 6a: P2-5 Binary Artifact loader. Signed candidates are staged,
+# verified, admitted, run at EL0 from their exact authenticated bytes under
+# W^X, and reclaimed; the ordinary build rejects every one (QEMU only).
+echo ""
+echo "--- [P2-5 Binary Artifact Loader in QEMU] ---"
+if command -v qemu-system-aarch64 >/dev/null && [[ -r "${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd}" ]]; then
+    ./scripts/qemu_artifact_test.sh
+else
+    skipped "qemu-system-aarch64 or AAVMF firmware not present on host."
+fi
+
+# Step 6b: SEED-0A USB keyboard candidate, proven in QEMU only (ADR 0012).
+echo ""
+echo "--- [SEED-0A USB Keyboard in QEMU (input.keyboard.usb)] ---"
+if command -v qemu-system-aarch64 >/dev/null && [[ -r "${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd}" ]]; then
+    # Never an unsafe DMA bypass build here: clear any inherited override.
+    unset AIENOS_UNSAFE_DMA_BYPASS AIENOS_BUILD_FEATURES
+    # Default mode: keyboard DMA only through a QEMU SMMUv3 stream.
+    AIENOS_QEMU_SMMU=1 ./scripts/qemu_keyboard_test.sh
+else
+    skipped "qemu-system-aarch64 or AAVMF firmware not present on host."
+fi
+
+# Step 6c: SMMUv3 DMA confinement of the xHCI keyboard, QEMU only.
+echo ""
+echo "--- [SMMUv3 DMA Confinement in QEMU] ---"
+if command -v qemu-system-aarch64 >/dev/null && [[ -r "${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd}" ]]; then
+    ./scripts/qemu_smmu_test.sh
+    # No SMMU and no bypass: the keyboard must stay unavailable, DMA off.
+    AIENOS_QEMU_SMMU=0 ./scripts/qemu_keyboard_test.sh
+else
+    skipped "qemu-system-aarch64 or AAVMF firmware not present on host."
+fi
+
+# Step 6d: M0 Native-Boot Rollback Verification (QEMU only).
+echo ""
+echo "--- [M0 Native-Boot Rollback Verification in QEMU] ---"
+if command -v qemu-system-aarch64 >/dev/null && [[ -r "${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd}" ]]; then
+    ./scripts/qemu_native_rollback_test.sh
+else
+    skipped "qemu-system-aarch64 or AAVMF firmware not present on host."
+fi
+
+# Step 6e: P3 native NVMe driver and System Store v1 over NVMe (QEMU only).
+# Read and write/flush in both DMA modes (SMMU-confined, and fail-closed with
+# no SMMU), 4K root-write atomicity, the 4K Store crash/reboot campaign and the
+# 512-byte Store campaign, the M4 continuity campaign (ADR 0016) and the
+# Recovery Core campaign (ADR 0006, TEST-ONLY operator key). Never an
+# unsafe DMA bypass build here.
+echo ""
+echo "--- [P3 NVMe + System Store v1 in QEMU] ---"
+if command -v qemu-system-aarch64 >/dev/null && [[ -r "${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd}" ]]; then
+    unset AIENOS_UNSAFE_DMA_BYPASS AIENOS_BUILD_FEATURES
+    AIENOS_QEMU_SMMU=1 ./scripts/qemu_nvme_test.sh
+    AIENOS_QEMU_SMMU=0 ./scripts/qemu_nvme_test.sh
+    AIENOS_QEMU_SMMU=1 ./scripts/qemu_nvme_rw_test.sh
+    AIENOS_QEMU_SMMU=0 ./scripts/qemu_nvme_rw_test.sh
+    ./scripts/qemu_nvme_atomicity_test.sh
+    ./scripts/qemu_store_crash_test.sh
+    ./scripts/qemu_store_512b_crash_test.sh
+    ./scripts/qemu_continuity_test.sh
+    ./scripts/qemu_recovery_test.sh
+else
+    skipped "qemu-system-aarch64 or AAVMF firmware not present on host."
+fi
+
+echo ""
+# Steps 1 to 6e (host checks and QEMU emulator runs) are done. The closing verdict is
+# written once, at the very end, from what actually ran (final_verdict).
+
+# Step 7: TRUST-1 Gate 4 Security Suite (swTPM, Soak, Fault Injection)
+echo ""
+echo "--- [TRUST-1 Gate 4 Security Suite Verification] ---"
+if command -v qemu-system-aarch64 >/dev/null && command -v swtpm >/dev/null && [[ -r "${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd}" ]]; then
+    GATE4_SOAK_RUNS=3 ./scripts/qemu_security_suite.sh
+else
+    skipped "qemu-system-aarch64, swtpm, or AAVMF firmware not present on host."
+fi
+
+# Step 8: TRUST-1 Gate 1 Standalone Recovery Verification (Zero-Disk Boot)
+echo ""
+echo "--- [TRUST-1 Gate 1 Standalone Recovery Verification] ---"
+if command -v qemu-system-aarch64 >/dev/null; then
+    ./scripts/qemu_verify_recovery_media.sh
+else
+    skipped "qemu-system-aarch64 not present on host."
+fi
+
+# Step 9: Recovery Media Tooling Manifest (issue #17; host-side, no real
+# devices, no root -- extracts the built initrd and checks file presence).
+echo ""
+echo "--- [Recovery Media Tooling Manifest] ---"
+if command -v gzip >/dev/null && command -v cpio >/dev/null; then
+    run_or_skip "recovery tool manifest" ./scripts/verify_recovery_tools.sh
+else
+    skipped "gzip or cpio not present on host."
+fi
+
+# Offline recovery media trust boundary (scratch files and throwaway keys).
+# The host-only test does not qualify shim enrollment or physical media.
+echo ""
+echo "--- [Recovery Media Security Regression] ---"
+if command -v mkfs.ext4 >/dev/null && command -v mkfs.vfat >/dev/null &&
+   command -v grub-mkstandalone >/dev/null && command -v sbsign >/dev/null &&
+   command -v sbverify >/dev/null && command -v openssl >/dev/null; then
+    run_or_skip "recovery media security" ./scripts/test_recovery_media_security.sh
+else
+    skipped "mkfs, GRUB standalone builder, OpenSSL or sbsigntool not present on host."
+fi
+
+# Step 10: TRUST-1 Gate 0/2 measurement tools (software TPM, no hardware).
+echo ""
+echo "--- [TRUST-1 Measurement Tools Self-Test] ---"
+# FLAG(sovereignty): tpm2_pcrread gate (tpm2-tools, outside dep) on host; replace with in-house C tool check.
+if command -v swtpm >/dev/null && command -v tpm2_pcrread >/dev/null && command -v xxd >/dev/null; then
+    ./scripts/test_trust1_measurement_tools.sh
+else
+    skipped "swtpm, tpm2-tools, or xxd not present on host."
+fi
+
+# Step 11: TRUST-1 Gate 4 Secure Boot enforcement in QEMU. Firmware with
+# Secure Boot ON and the published Debian "snakeoil" TEST key in PK/KEK/db:
+# signed loader boots, unsigned / one-byte-tampered / wrong-key are refused
+# with Access Denied. No owner key, no hardware.
+echo ""
+echo "--- [TRUST-1 Gate 4 Secure Boot Signing in QEMU] ---"
+if command -v qemu-system-aarch64 >/dev/null && command -v sbsign >/dev/null && command -v sbverify >/dev/null \
+    && [[ -r /usr/share/AAVMF/AAVMF_CODE.snakeoil.fd && -r /usr/share/qemu-efi-aarch64/PkKek-1-snakeoil.key ]]; then
+    ./scripts/qemu_secureboot_signing_test.sh
+else
+    skipped "qemu-system-aarch64, sbsigntool, or snakeoil AAVMF firmware not present on host."
+fi
+
+# Step 12: TRUST-1 Gate 3 key ceremony tool self-test. THROWAWAY keys in a
+# private temp folder only (deleted on exit); never an owner key.
+echo ""
+echo "--- [TRUST-1 Gate 3 Key Ceremony Tool Self-Test] ---"
+if command -v openssl >/dev/null && openssl version | grep -q '^OpenSSL 3\.'; then
+    run_or_skip "TRUST-1 key ceremony self-test" bash -c 'exec ./scripts/test_trust1_key_ceremony.sh 2>/dev/null'
+else
+    skipped "OpenSSL 3 not present on host."
+fi
+
+# Step 13: evidence receipts with hardcoded invariant labels must be amended.
+echo ""
+echo "--- [Evidence Receipt Label Lint] ---"
+run_or_skip "receipt label lint self-test" ./scripts/check_receipt_labels.sh --self-test
+run_or_skip "receipt label lint" ./scripts/check_receipt_labels.sh
+
+final_verdict

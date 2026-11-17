@@ -1,0 +1,402 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* kmain.c -- C kernel core bring-up after the UEFI stub.
+ *
+ * ck_kernel_entry runs at the firmware EL on the firmware's translation:
+ * vectors, PSCI conduit, own address space, then EL2 -> EL1h (ADR 0009) with
+ * the MMU on our tables. ck_el1_main then reports the MMU switch from live
+ * registers, proves the guard pages, brings up GICv3 and the EL1 physical
+ * timer, starts and parks the secondary cores (core/smp.c), runs the M3
+ * isolation checks (core/m3.c) and the linked boot stages,
+ * and ends with the final report and a PSCI reset. QEMU runs of this path
+ * qualify nothing physical. */
+#include "arch.h"
+#include "ck_internal.h"
+#include "entropy.h"
+#include "cpufeat.h"
+#include "handoff_check.h"
+#include "frames.h"
+#if CK_BOOT_SHOW
+#include "boot_screen.h"
+#endif
+#ifdef CK_PI5_NET
+#include "../dev/pi5_net.h"
+#endif
+#ifdef CK_PI5_PCIE
+#include "../dev/pi5_pcie.h"
+#endif
+
+#define TTBR_BADDR_MASK 0x0000fffffffffffeull
+
+static struct ck_handoff *hand;
+const struct ck_handoff *ck_handoff_get(void) { return hand; }
+
+/* ck.h operator shell facts. The conventional-memory total is summed once at
+ * kernel entry, while the firmware memory-map copy is still reachable. */
+static uint64_t conventional_kb;
+unsigned ck_exception_level(void) { return ck_current_el(); }
+uint64_t ck_conventional_memory_kb(void) { return conventional_kb; }
+static void sum_conventional(const struct ck_handoff *h)
+{
+    uint64_t pages = 0;
+    if (!h->memory_map || h->desc_size < sizeof(struct ck_efi_desc)) return;
+    for (uint64_t off = 0; off + h->desc_size <= h->map_size; off += h->desc_size) {
+        const struct ck_efi_desc *d = (const struct ck_efi_desc *)(uintptr_t)(h->memory_map + off);
+        if (d->type == CK_EFI_CONVENTIONAL && d->pages <= (1ull << 36)) pages += d->pages;
+    }
+    conventional_kb = pages * 4u;
+}
+
+const void *ck_acpi_find(const char sig[4])
+{
+    return hand && hand->rsdp ? ck_acpi_lookup(hand->rsdp, sig) : 0;
+}
+
+static void run_stage(const char *name, int (*fn)(void))
+{
+    if (!fn) {
+        ck_printf("stage %s: not linked\n", name);
+        return;
+    }
+    ck_set_stage(name);
+    int rc = fn();
+    ck_irq_cpu_enable(0);
+    if (rc == 0)
+        ck_printf("stage %s: ok\n", name);
+    else
+        ck_printf("stage %s: FAIL rc=%d\n", name, rc);
+}
+
+/* CHANDOF3: put the console on the GOP framebuffer (mapped by ck_mm_build)
+ * or say on the UART why there is no screen. The first line drawn on the
+ * screen is the "screen: gop" line (scripts/qemu_ck_screen_test.sh renders
+ * the serial log from that line on and compares it with a QEMU screendump). */
+static void screen_start(const struct ck_handoff *h, const struct ck_mm_report *mm)
+{
+    if (h->fb_status == CK_HANDOFF_FB_NONE) {
+        ck_puts("screen: none (no UEFI Graphics Output Protocol); report on UART only\n");
+        return;
+    }
+    if (h->fb_status == CK_HANDOFF_FB_NO_LINEAR) {
+        ck_printf("screen: none (GOP handles=%u, none with a linear 32-bit framebuffer); report on UART only\n",
+                  h->fb_gop_handles);
+        return;
+    }
+    if (mm->fb_map != CK_MM_FB_MAPPED) {
+        ck_printf("screen: refused (framebuffer 0x%llx+0x%llx overlaps RAM mapped write-back); report on UART "
+                  "only\n",
+                  (unsigned long long)h->fb_base, (unsigned long long)mm->fb_map_bytes);
+        return;
+    }
+    if (ck_console_set_fb((volatile void *)(uintptr_t)h->fb_base, h->fb_width, h->fb_height, h->fb_pitch,
+                          h->fb_format) != 0) {
+        ck_printf("screen: refused (geometry %ux%u pitch=%u format=%u unusable); report on UART only\n",
+                  h->fb_width, h->fb_height, h->fb_pitch, h->fb_format);
+        return;
+    }
+    uint32_t scale = 0, cols = 0, rows = 0;
+    ck_console_fb_info(&scale, &cols, &rows);
+    ck_printf("screen: gop %ux%u pitch=%u format=%s base=0x%llx bytes=0x%llx scale=%u grid=%ux%u font=8x8 "
+              "mode=half-scroll\n",
+              h->fb_width, h->fb_height, h->fb_pitch, h->fb_format == CK_HANDOFF_FB_RGBX ? "rgbx" : "bgrx",
+              (unsigned long long)h->fb_base, (unsigned long long)mm->fb_map_bytes, scale, cols, rows);
+}
+
+/* TEST-ONLY rollback candidates (CK gate M0_ROLLBACK, Makefile
+ * CK_TEST_ROLLBACK=cpu-fault|hang, scripts/qemu_ck_rollback_test.sh). They
+ * end the candidate boot the two ways a real kernel can fail after
+ * "kernel: alive": a CPU exception (BRK at EL1 -> ck_fault_report -> reset)
+ * or a hang with interrupts masked (no reset; only an outside reset ends it,
+ * docs/BOOT_HANDOFF_CONTRACT.md 7 step 3). Never in a hardware staging image. */
+#if defined(CK_TEST_ROLLBACK_CPU_FAULT) || defined(CK_TEST_ROLLBACK_HANG)
+#if defined(CK_HARDWARE_STAGING)
+#error "CK_TEST_ROLLBACK is TEST-only and cannot be combined with CK_HARDWARE_STAGING"
+#endif
+static __attribute__((noreturn)) void rollback_test_end(void)
+{
+#ifdef CK_TEST_ROLLBACK_CPU_FAULT
+    ck_puts("rollback_test: TEST-ONLY rollback candidate (cpu-fault): brk at EL1 now; never counts toward a PASS\n");
+    __asm__ volatile("brk #0x7b" ::: "memory");
+    ck_panic("rollback_test: brk returned");
+#else
+    ck_puts("rollback_test: TEST-ONLY rollback candidate (hang): spinning with interrupts masked, no reset follows; never counts toward a PASS\n");
+    __asm__ volatile("msr daifset, #0xf" ::: "memory");
+    for (;;)
+        __asm__ volatile("wfe" ::: "memory");
+#endif
+}
+#endif
+
+#ifdef CK_PIPE_TEST
+void ck_pipe_selftest(void);
+#endif
+
+static __attribute__((noreturn)) void ck_el1_main(void *arg)
+{
+    struct ck_handoff *h = arg;
+    ck_set_stage("kernel_el1");
+    ck_mm_el1_ready();
+    const struct ck_mm_report *mm = ck_mm_report();
+    screen_start(h, mm);
+    if (ck_pi5_start)
+        ck_pi5_start();
+
+    ck_puts("\n");
+    ck_report_header("kernel");
+    unsigned el = ck_current_el();
+    uint64_t sctlr = ck_rd(sctlr_el1);
+    int mmu_on = (sctlr & 1) != 0;
+    ck_printf("mmu: %s\n", mmu_on ? "enabled" : "disabled");
+    ck_printf("pt_frames_used: %llu\n", (unsigned long long)mm->pt_tables);
+    uint64_t el1_base = ck_rd(ttbr0_el1) & TTBR_BADDR_MASK;
+    uint64_t fw_base = h->firmware_ttbr0 & TTBR_BADDR_MASK;
+    int switched = el == 1 && mmu_on && el1_base == mm->root && el1_base != fw_base;
+    ck_printf("mmu_switch: firmware=EL%u firmware_mmu=%s firmware_ttbr0=0x%llx aienos_root=0x%llx "
+              "ttbr0_el1=0x%llx switched=%s\n",
+              h->firmware_el, (h->firmware_sctlr & 1) ? "on" : "off", (unsigned long long)fw_base,
+              (unsigned long long)mm->root, (unsigned long long)el1_base, switched ? "yes" : "no");
+    ck_printf("mmu_regs: mair=0x%llx tcr=0x%llx sctlr=0x%llx\n", (unsigned long long)ck_rd(mair_el1),
+              (unsigned long long)ck_rd(tcr_el1), (unsigned long long)sctlr);
+    ck_printf("memory: ram_ranges=%llu free_bytes=%llu stack=0x%llx-0x%llx heap=0x%llx-0x%llx "
+              "dma=0x%llx-0x%llx exit_attempts=%u\n",
+              (unsigned long long)mm->ram_ranges, (unsigned long long)mm->free_bytes,
+              (unsigned long long)mm->stack_lo, (unsigned long long)mm->stack_hi,
+              (unsigned long long)mm->heap_lo, (unsigned long long)mm->heap_hi,
+              (unsigned long long)mm->dma_lo, (unsigned long long)mm->dma_hi, h->exit_attempts);
+
+    /* Heap smoke test. */
+    void *a = ck_alloc(100), *b = ck_alloc(5000);
+    if (!a || !b)
+        ck_panic("heap: allocation failed");
+    ck_free(a);
+    ck_free(b);
+
+    /* Addition over the Rust kernel: the guard pages really fault, and the
+     * fault is contained (handled and resumed, no reset). */
+    char detail[160];
+    ck_set_stage("guard_page");
+    if (ck_mm_guard_selftest(detail, sizeof detail) == 0)
+        ck_printf("guard_page: ok fault=contained (%s) [C kernel addition, not in the Rust kernel]\n",
+                  detail);
+    else
+        ck_printf("guard_page: FAIL %s\n", detail);
+
+    /* GICv3 or GICv2 (arch/gic.c) from the MADT, then the EL1 physical timer window. */
+    ck_set_stage("gic");
+    const void *madt = ck_acpi_find("APIC");
+    struct ck_madt_gic mg;
+    if (!madt || ck_madt_parse(madt, &mg))
+        ck_panic("gic: no usable ACPI MADT");
+    struct ck_gic_report gr;
+    int rc = ck_gic_init(&mg, &gr);
+    if (rc)
+        ck_panic("gic: init failed rc=%d (madt gicd=0x%llx gicr=0x%llx)", rc,
+                 (unsigned long long)mg.gicd, (unsigned long long)mg.gicr);
+    ck_set_stage("timer");
+    struct ck_timer_window tw;
+    if (ck_timer_window(200, &tw))
+        ck_panic("timer: counter frequency is zero");
+    uint64_t f = tw.freq_hz;
+    ck_printf("gic: v%u\n", gr.arch_rev);
+    ck_printf("timer_irq: %llu ticks in %llu ms\n", (unsigned long long)tw.ticks,
+              (unsigned long long)tw.ms);
+    ck_printf("gic_madt: gicd=0x%llx gicr=0x%llx arch_rev=%u icc_sre=%llu\n",
+              (unsigned long long)gr.gicd, (unsigned long long)gr.gicr, gr.arch_rev,
+              (unsigned long long)gr.icc_sre);
+    if (gr.kind == 2)
+        ck_printf("gic_cpu_interface: mmio gicc=0x%llx\n", (unsigned long long)gr.gicc);
+    else
+        ck_printf("gic_redistributor: frame=0x%llx\n", (unsigned long long)gr.rd_frame);
+    ck_printf("timer_stats: intid=30 freq_hz=%llu period_us=%llu min_us=%llu avg_us=%llu max_us=%llu\n",
+              (unsigned long long)f, (unsigned long long)ck_counter_to_us(f / 100, f),
+              (unsigned long long)ck_counter_to_us(tw.min_interval, f),
+              (unsigned long long)(tw.ticks ? ck_counter_to_us(tw.span / tw.ticks, f) : 0),
+              (unsigned long long)ck_counter_to_us(tw.max_interval, f));
+
+    uint64_t spsel = ck_rd(spsel);
+    ck_printf("exception_level: EL%u\n", el);
+    ck_puts("kernel: alive\n");
+    ck_printf("kernel_el: EL%u%s\n", el, (spsel & 1) ? "h" : "t");
+
+#if defined(CK_TEST_ROLLBACK_CPU_FAULT) || defined(CK_TEST_ROLLBACK_HANG)
+    rollback_test_end();
+#endif
+#ifdef CK_PIPE_TEST
+    /* TEST-ONLY pipe self-test (core/pipe_test.c, scripts/qemu_ck_pipe_test.sh); never in a production image. */
+    ck_pipe_selftest();
+#endif
+
+    {
+        struct ck_cpu_features cf;
+        char cfl[96];
+        ck_cpufeat_decode(ck_rd(id_aa64isar0_el1), ck_rd(id_aa64isar1_el1), ck_rd(id_aa64pfr0_el1), &cf);
+        ck_cpufeat_set_boot(&cf);
+        ck_cpufeat_format(&cf, cfl, sizeof cfl);
+        ck_printf("%s\n", cfl); /* boot core only; see core/cpufeat.h */
+    }
+
+    /* Kernel entropy (arch/rndr.c): RNDR or a latched refusal, no fallback.
+     * Probed once here, before the artifact loader and the stages. */
+    ck_set_stage("entropy");
+    int ent = ck_entropy_init();
+    if (ent == CK_RNG_OK)
+#ifdef CK_PI5
+        ck_printf("entropy: source=%s probe_words=2 retries=%llu stuck_test=ok\n", ck_entropy_source(),
+                  (unsigned long long)ck_entropy_retries());
+#else
+        ck_printf("entropy: rndr feat_rng=yes probe_words=2 retries=%llu stuck_test=ok\n",
+                  (unsigned long long)ck_entropy_retries());
+#endif
+    else
+        ck_printf("entropy: unavailable reason=%s (%s); security consumers refuse, fail closed\n",
+                  ck_entropy_reason(),
+#ifdef CK_PI5
+                  ent == CK_RNG_ABSENT ? "source=rng200 not present: block unmapped or not enabled"
+#else
+                  ent == CK_RNG_ABSENT ? "ID_AA64ISAR0_EL1.RNDR=0, no FEAT_RNG"
+#endif
+                  : ent == CK_RNG_FAILED ? "RNDR returned no number within the retry bound"
+                  : ent == CK_RNG_STUCK ? "RNDR repeated a 64-bit word"
+                                        : "probe error");
+
+#ifdef CK_PI5_PCIE
+    /* Pi 5 PCIe2 root complex / RP1 enumerator (dev/pi5_pcie.c): read-only boot report, CK_PI5_PCIE image only. */
+    ck_set_stage("pi5_pcie");
+    ck_pi5pcie_report();
+#endif
+#ifdef CK_PI5_NET
+    /* Pi 5 network cut 2 (dev/pi5_net.c): narrow the PCIe inbound DMA window, bring RP1 Ethernet up to the PHY. CK_PI5_NET image only. */
+    ck_set_stage("pi5_net");
+    ck_pi5net_run();
+#endif
+
+#ifdef CK_B7B_PROBE
+    /* B7b preparation probe (core/smmu_svc.c), probe build only. */
+    ck_b7b_probe();
+#endif
+
+    /* Secondary cores (core/smp.c): PSCI CPU_ON, check in, park in WFE with
+     * interrupts masked; the boot core goes on alone. Lines judged by
+     * scripts/qemu_ck_smp_test.sh (CK gate SMP). */
+    ck_smp_run();
+
+    /* One FP/SIMD-enabled Rust unit (core/fpu.c), probe build only. */
+    ck_fpu_run();
+
+    /* Ingest the GGUF over fw_cfg and call the Rust inference unit (core/infer.c), probe build only.
+     * A CK_INFER_RESIDENT service image opens the session after the store
+     * stage instead (below), so the session's frame accounting (free frames
+     * at open == free frames at close) brackets only its own allocations and
+     * not the NVMe queues the store stage binds for the service lifetime. */
+#ifndef CK_INFER_RESIDENT
+    ck_infer_run();
+#endif
+
+    /* M3 isolation checks (core/m3.c), before any stage registers an IRQ. */
+    ck_m3_run();
+
+    run_stage("devices", ck_stage_devices);
+#if CK_BOOT_SHOW
+    /* The boot sequence (core/boot_screen.c): the night and its chirp on the screen, once. */
+    ck_boot_screen_run();
+#endif
+    run_stage("security", ck_stage_security);
+    run_stage("store", ck_stage_store);
+
+    /* P2 sealed-artifact loader (core/artifact_loader.c). Runs after the store
+     * stage: its default candidate source is the boot disk Store, read by that
+     * stage before the NVMe DMA revoke. No stage registers an IRQ. */
+    ck_artifact_run();
+#if defined(CK_INFER_RESIDENT) && !defined(CK_PI5_AGENT)
+    /* Resident inference session for the lifecycle (core/infer.c): model
+     * ingest and session open after the store stage, before the lifecycle.
+     * Not in the Pi agent image: its stage (svc/pi5_agent.c) opens the session itself, inside the
+     * store stage and only after the Store opened, and closes it before committing. */
+    ck_infer_run();
+#endif
+    /* PI5-8 cut K ALLEN exam stage (core/allen.c): pi5-allen image only, else a no-op. Before mm_usage so the
+     * stack high-water mark below includes the Rust decision core. */
+    ck_allen_run();
+    struct ck_mm_usage mu;
+    ck_mm_usage(&mu);
+    ck_printf("mm_usage: stack_bytes=%llu stack_used=%llu heap_bytes=%llu heap_free=%llu heap_min_free=%llu\n",
+              (unsigned long long)mu.stack_bytes, (unsigned long long)mu.stack_used,
+              (unsigned long long)mu.heap_bytes, (unsigned long long)mu.heap_free,
+              (unsigned long long)mu.heap_min_free);
+
+    /* Optional final boot stage: the operator console session (TEST-ONLY image
+     * built with CK_CONSOLE_SESSION=1; weak, absent and silent otherwise). */
+    if (ck_stage_console_session) {
+        ck_set_stage("console");
+        int crc = ck_stage_console_session();
+        ck_irq_cpu_enable(0);
+        ck_printf("stage console: %s rc=%d\n", crc == 0 ? "ok" : "FAIL", crc);
+    }
+
+    /* Resident production lifecycle (core/lifecycle.c; only a CK_SERVICE=1
+     * image links it, weak and absent otherwise). The product boundary: the
+     * service serves bounded operator requests here until its stop order,
+     * then falls through to the final report and the reset below. */
+    if (ck_lifecycle_run) {
+        ck_set_stage("lifecycle");
+        int lrc = ck_lifecycle_run();
+        ck_irq_cpu_enable(0);
+        ck_printf("stage lifecycle: %s rc=%d\n", lrc == 0 ? "ok" : "FAIL", lrc);
+    }
+
+#ifdef CK_B7B_EVENT_READOUT
+    ck_b7b_event_readout();
+#endif
+    ck_set_stage("final");
+    ck_puts("\n");
+    ck_report_header("final");
+    ck_artifact_final();
+    ck_puts("note: QEMU qualifies nothing physical\n");
+    ck_reset();
+}
+
+void ck_kernel_entry(struct ck_handoff *h)
+{
+    hand = h;
+    unsigned el = ck_current_el();
+    if (el == 2)
+        ck_wr(vbar_el2, (uint64_t)(uintptr_t)ck_vectors_el2);
+    else
+        ck_wr(vbar_el1, (uint64_t)(uintptr_t)ck_vectors);
+    ck_isb();
+#ifdef CK_SELFTEST_EL2_FAULT
+    /* One-off check of the EL2 fatal path (never in a normal build). */
+    if (el == 2)
+        __asm__ volatile("brk #0x2");
+#endif
+    const char *why;
+    if (ck_handoff_check(h, &why) != 0)
+        ck_panic("handoff: %s", why);
+    sum_conventional(h);
+    if (ck_slot_boot_capture) ck_slot_boot_capture(h);
+    ck_psci_configure(ck_acpi_find("FACP"));
+    ck_set_stage("mm_build");
+    uint64_t sp = ck_mm_build(h);
+    ck_set_stage("el1_switch");
+    if (el == 2)
+        ck_enter_el1(ck_mm_report()->root, ck_mm_mair(), ck_mm_tcr(), ck_mm_sctlr(), sp,
+                     ck_el1_main, h);
+    if (el == 1)
+        ck_switch_el1(ck_mm_report()->root, ck_mm_mair(), ck_mm_tcr(), ck_mm_sctlr(), sp,
+                      ck_el1_main, h);
+    ck_panic("kernel entry at unsupported EL%u", el);
+}

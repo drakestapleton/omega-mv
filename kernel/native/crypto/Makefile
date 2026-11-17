@@ -1,0 +1,92 @@
+# AIENOS in-house crypto in C: AES-256, POLYVAL, AES-256-GCM-SIV (RFC 8452),
+# HMAC-SHA-256. Port of crates/aienos-crypto. No outside library: SHA-256 is
+# the in-house copy in ../argus/sha256.c. Library objects import no heap,
+# clock or I/O; the test uses hosted libc.
+#
+#   make            build out/libaienos_crypto.a
+#   make test       known-answer + negative tests (host, not QEMU)
+#   make sanitize   the same test under ASan+UBSan (Linux)
+#   make mutants    remove each GUARD-tagged rule in gcm_siv.c; tests must fail
+#   make clean
+
+CC ?= cc
+AR ?= ar
+CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror -fstack-protector-strong
+OUT ?= out
+
+SRCS = aes.c polyval.c gcm_siv.c hmac.c ct.c
+OBJS = $(SRCS:%.c=$(OUT)/%.o)
+LIB = $(OUT)/libaienos_crypto.a
+TEST = $(OUT)/crypto_test
+HDRS = aienos_crypto.h crypto_internal.h ../argus/sha256.h
+SANFLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all -g
+
+all: $(LIB)
+
+$(OUT):
+	mkdir -p $(OUT)
+
+$(OUT)/%.o: %.c $(HDRS) | $(OUT)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(OUT)/sha256.o: ../argus/sha256.c ../argus/sha256.h | $(OUT)
+	$(CC) $(CFLAGS) -c -o $@ ../argus/sha256.c
+
+$(LIB): $(OBJS) $(OUT)/sha256.o
+	$(AR) rcs $@ $^
+
+$(TEST): tests/crypto_test.c $(LIB) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ tests/crypto_test.c $(LIB)
+
+test: $(TEST) lib-checks
+	./$(TEST)
+
+# The library objects must not allocate, read a clock, or do their own I/O.
+lib-checks: $(OBJS) $(OUT)/sha256.o
+	@bad=$$(nm -u $(OBJS) $(OUT)/sha256.o | awk 'NF {print $$NF}' | sed 's/^_//' | grep -xE 'malloc|calloc|realloc|free|aligned_alloc|posix_memalign|mmap|clock_gettime|time|gettimeofday|open|openat|read|write|pread|pwrite|fopen|fread|fwrite|printf|fprintf|puts|getrandom'); \
+	if [ -n "$$bad" ]; then echo "lib-checks FAIL: library imports $$bad"; exit 1; fi
+	@echo "lib-checks PASS (no heap, clock or direct I/O in libaienos_crypto objects)"
+
+sanitize: | $(OUT)
+ifeq ($(shell uname -s),Linux)
+	$(CC) $(CFLAGS) $(SANFLAGS) -o $(OUT)/crypto_test_asan tests/crypto_test.c $(SRCS) ../argus/sha256.c
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./$(OUT)/crypto_test_asan
+else
+	@echo "sanitize: Linux only"
+endif
+
+# Mutants: delete each GUARD-tagged line of gcm_siv.c in turn. The tests must
+# fail (or crash) for every mutant, or that rule is not tested.
+GUARDS = tag-msb ctr-msb pt-max aad-max-seal ct-max aad-max-open tag-check wipe-on-fail
+
+$(OUT)/t_crypto_test.o: tests/crypto_test.c $(HDRS) | $(OUT)
+	$(CC) $(CFLAGS) -Wno-error -I. -c -o $@ $<
+
+mutants: $(OBJS) $(OUT)/sha256.o $(OUT)/t_crypto_test.o | $(OUT)
+	@ulimit -c 0; fail=0; \
+	dups=$$(printf '%s\n' $(GUARDS) | sort | uniq -d); \
+	[ -z "$$dups" ] || { echo "duplicate guard names (parallel runs would collide):" $$dups; echo "AIENOS_CRYPTO_MUTANTS: FAIL"; exit 1; }; \
+	for g in $(GUARDS); do \
+	  rm -f $(OUT)/mut_$$g.msg $(OUT)/mut_$$g.fail $(OUT)/mut_$$g.killed; \
+	  ( grep -q "GUARD:$$g \*/" gcm_siv.c || { echo "mutant $$g: guard tag missing" > $(OUT)/mut_$$g.msg; echo 1 > $(OUT)/mut_$$g.fail; exit 0; }; \
+	    sed "/GUARD:$$g \*\//d" gcm_siv.c > $(OUT)/mut_$$g.c; \
+	    $(CC) $(CFLAGS) -Wno-error -I. -c -o $(OUT)/mut_$$g.o $(OUT)/mut_$$g.c \
+	      && $(CC) $(CFLAGS) -Wno-error -o $(OUT)/mut_$$g $(OUT)/t_crypto_test.o $(OUT)/mut_$$g.o \
+	        $(OUT)/aes.o $(OUT)/polyval.o $(OUT)/hmac.o $(OUT)/ct.o $(OUT)/sha256.o \
+	      || { echo "mutant $$g: does not compile" > $(OUT)/mut_$$g.msg; echo 1 > $(OUT)/mut_$$g.fail; exit 0; }; \
+	    if ./$(OUT)/mut_$$g > $(OUT)/mut_$$g.log 2>&1; then \
+	      echo "mutant $$g: SURVIVED (FAIL)" > $(OUT)/mut_$$g.msg; echo 1 > $(OUT)/mut_$$g.fail; \
+	    else echo "mutant $$g: killed" > $(OUT)/mut_$$g.msg; : > $(OUT)/mut_$$g.killed; fi \
+	  ) & \
+	done; \
+	wait; \
+	for g in $(GUARDS); do \
+	  if [ -f $(OUT)/mut_$$g.msg ]; then cat $(OUT)/mut_$$g.msg; else echo "mutant $$g: no result recorded (FAIL)"; fi; \
+	  [ -f $(OUT)/mut_$$g.killed ] && [ ! -f $(OUT)/mut_$$g.fail ] || fail=1; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "AIENOS_CRYPTO_MUTANTS: PASS"; else echo "AIENOS_CRYPTO_MUTANTS: FAIL"; exit 1; fi
+
+clean:
+	rm -rf $(OUT)
+
+.PHONY: all test lib-checks sanitize mutants clean
