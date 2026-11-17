@@ -2,10 +2,10 @@
 # Compile the pinned native Omega units and compare with signed embedded code.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-om=${OMEGA_SOURCE:?set OMEGA_SOURCE to the clean pinned Omega checkout}
-[[ $(git -C "$om" rev-parse HEAD) = bf54b19fa590e8ae925c0e80815516dbf41e7326 ]]
-[[ $(sha256sum "$om/seed/out/omc" | cut -d' ' -f1) = 62775d2a391cfef7cde64e387655caa9809a267093112910ec76bfa568f3712b ]]
-[[ $(sha256sum "$om/seed/omc/omc.om" | cut -d' ' -f1) = 96d51b63c8f451661ac715395078e04f39195e50c9e8fe37746cda121e4d7a1e ]]
+# The compiler is omega-mv's own seed/out/omc, checked against seed/out/omc.sha256 at the omega-mv root (kernel/ is
+# folded into omega-mv, Drake 2026-11-17). Until then: omega-mv bf54b19f, omc 62775d2a, omc.om 96d51b63.
+om=${OMEGA_SOURCE:-$(cd .. && pwd)}
+[[ $(sha256sum "$om/seed/out/omc" | cut -d' ' -f1) = $(cut -c1-64 "$om/seed/out/omc.sha256") ]]
 out=${LOCAL_TOOLS_OUT:-$PWD/target/local-tools-host}
 mkdir -p "$out"
 for name in arithmetic text system; do

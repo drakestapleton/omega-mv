@@ -1,13 +1,14 @@
 #!/bin/sh
 # Opt-in firmware build. Does not change the default Allen firmware.
-# Usage: OMEGA_COMPILER=/pinned/omc sh build-local-model.sh AIEN_TRAIN OUT.EFI
+# Usage: [OMEGA_COMPILER=/pinned/omc] sh build-local-model.sh AIEN_TRAIN OUT.EFI (default: omega-mv seed/out/omc)
 set -eu
 [ "$#" = 2 ] || { echo 'usage: build-local-model.sh AIEN_TRAIN OUT.EFI' >&2; exit 64; }
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 train=$1/native/omegallm
 out=$2
-compiler=${OMEGA_COMPILER:?set OMEGA_COMPILER to the pinned x86efi compiler}
-pin=3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194
+compiler=${OMEGA_COMPILER:-"$here/../../../../seed/out/omc"}
+# Pin: omega-mv's own seed/out/omc.sha256 (kernel/ is folded into omega-mv, Drake 2026-11-17); before, omc 3ad9f10f.
+pin=$(cut -c1-64 "$here/../../../../seed/out/omc.sha256")
 [ "$(sha256sum "$compiler" | cut -d' ' -f1)" = "$pin" ] || { echo 'compiler pin mismatch' >&2; exit 65; }
 [ ! -e "$out" ] || { echo 'fresh output required' >&2; exit 73; }
 mkdir -p "$(dirname "$out")"

@@ -183,4 +183,6 @@ that rebuilt the program with another compiler or another pin would need step 8e
 omc sha256 734f0a39319fbfa930bcc62cb30dbf06d47d78e126372b74f5baf478e6126b61 (born by
 `sh seed/omega-from-seed.sh` on aien-dev/omega-mv main 0d72560a). Model sha256
 3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1. The ELF and source hashes of the
-recorded run are in `evidence/shas.txt`.
+recorded run are in `evidence/shas.txt`. Since aienux was folded into omega-mv as `kernel/` (Drake
+2026-11-17), `gate.sh` takes omega-mv's own `seed/out/omc` and its `seed/out/omc.sha256`; it has not been
+run with that compiler (the pinned model file is not on the machine that did the fold).

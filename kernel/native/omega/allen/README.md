@@ -8,35 +8,28 @@ It has no foreign implementation, interpreter, C translator, launcher or fallbac
 It is **not the complete iMac Allen replacement**. The old production C/Rust
 paths remain live. No service, machine, physical disk or boot path was changed.
 
-Build on Linux AArch64 from the pinned public compiler source. These are
-component build instructions, not a released interactive alpha. The compiler is
-omega-mv commit b8bd1d03 on the local branch `fix/imac-net-L974-snp` (L974; a
-compiler change that needs its own review, not yet published), stacked on
-81ab1900, which the tag `allen-omc-pin-81ab1900` holds (the
-`feat/x86efi-file-word` head of #981, stacked on #980 register slots and #977 site
-tables; #980 is not merged, so neither commit is on omega-mv main):
-look-paint.om needs its `const` and `bitcast`, the firmware unit its larger
-trap/exit-site tables, look-install.om its `efi 11` file word, efi-main.om the
-`efi 8` that leaves an adapter refused only for its link initialized (so the
-next attempt sees the link) and reports each scan through `efi 0`, and the x86 back
-end's live-slot calls and register-resident slots make the firmware's per-pixel
-code run. From this repository root, with the branch fetched from its bundle
-(`imac-net-L974-omc.bundle` on the Spark under
-`~/handoffs/imac-boot-repair-20261107/net/`) until it is published:
+Build on Linux AArch64 with omega-mv's own compiler. These are component build
+instructions, not a released interactive alpha. Aienux is folded into omega-mv as
+`kernel/` (Drake 2026-11-17), so the pinned compiler is omega-mv's committed
+`seed/out/omc`, whose SHA-256 is in `seed/out/omc.sha256` at the omega-mv root;
+`build-one.sh`, `build-fw.sh` and `gate.sh` use it by default and refuse any other
+digest. Its self-rebuild (`sh seed/omega-from-seed.sh` in a disposable clone)
+reproduces the same bytes. Self-rebuild equality does not establish diverse
+compiler ancestry; that qualification is a separate claim.
 
-```sh
-git clone https://github.com/aien-dev/omega-mv.git build/allen-toolchain
-git -C build/allen-toolchain fetch PATH/imac-net-L974-omc.bundle fix/imac-net-L974-snp
-git -C build/allen-toolchain checkout --detach b8bd1d03
-sha256sum build/allen-toolchain/seed/out/omc     # expect 2eeab5147deb8320...
-```
+Measured 2026-11-17 at the fold (omc `34d611ca…`): `gate.sh` prints
+`ALLEN_OMEGA_HOST: PASS; target=NOT_RUN; live=NOT_RUN` and `build-fw.sh` writes
+an image. Neither was run on an iMac.
 
-The committed `seed/out/omc` on that branch is the pinned compiler; its
-self-rebuild (`sh seed/omega-from-seed.sh` in a disposable clone) reproduces
-the same bytes. Self-rebuild equality does not establish diverse compiler
-ancestry; that qualification is a separate claim. The expected SHA-256 is
-`2eeab5147deb8320cb1bc7f86a5f3de534955ff89f76be2832155348706e0164`; pass the
-executable as `OMEGA_COMPILER` (on the Spark: `~/work/imac-net-L974-omc/seed/out/omc`).
+Before the fold the pin was omega-mv b8bd1d03 on the local branch
+`fix/imac-net-L974-snp` (L974), stacked on 81ab1900 (tag
+`allen-omc-pin-81ab1900`), omc SHA-256
+`2eeab5147deb8320cb1bc7f86a5f3de534955ff89f76be2832155348706e0164`: look-paint.om
+needs its `const` and `bitcast`, the firmware unit its larger trap/exit-site
+tables, look-install.om its `efi 11` file word, efi-main.om the `efi 8` that
+leaves an adapter refused only for its link initialized (so the next attempt sees
+the link) and reports each scan through `efi 0`, and the x86 back end's live-slot
+calls and register-resident slots make the firmware's per-pixel code run.
 
 The firmware image for the iMac is one unit of every module in the order
 `build-fw.sh` lists (platform, base, sha256, font, the look, surface, GitHub,

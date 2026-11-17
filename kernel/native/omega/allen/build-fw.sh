@@ -6,12 +6,12 @@ set -eu
 [ "$#" = 1 ] || { echo 'usage: build-fw.sh OUT.EFI' >&2; exit 64; }
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 A=$root/native/omega/allen
-compiler=${OMEGA_COMPILER:-"$root/build/allen-toolchain/seed/out/omc"}
+compiler=${OMEGA_COMPILER:-"$root/../seed/out/omc"}
 [ -f "$compiler" ] && [ -x "$compiler" ] || { echo 'pinned compiler missing; follow native/omega/allen/README.md' >&2; exit 69; }
-# Pin: omega-mv b8bd1d03 (local branch fix/imac-net-L974-snp on 81ab1900, tag allen-omc-pin-81ab1900; compiler change
-# pending its own review): register slots, live-slot calls, the efi 11 file word, const/bitcast, the 65536-entry site
-# tables the firmware unit needs, and efi 8 keeping a no-link adapter initialized with its scan report in efi 0.
-[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = 2eeab5147deb8320cb1bc7f86a5f3de534955ff89f76be2832155348706e0164 ] || {
+# Pin: omega-mv's own seed/out/omc, whose sha256 is in seed/out/omc.sha256 at the omega-mv root (kernel/ is folded
+# into omega-mv, Drake 2026-11-17). Until then this was omega-mv b8bd1d03 (omc 2eeab514, branch fix/imac-net-L974-snp,
+# for register slots, live-slot calls, the efi 11 file word, const/bitcast, the site tables and the efi 8 link keep).
+[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = "$(cut -c1-64 "$root/../seed/out/omc.sha256")" ] || {
  echo 'compiler digest differs from the qualified pin' >&2
  exit 65
 }

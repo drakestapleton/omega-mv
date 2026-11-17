@@ -18,10 +18,12 @@ The existing BinaryArtifact parser and Ed25519 implementation are reused. Explic
 
 The local profile permits no capabilities, one zero data-initializer byte, entry offset zero, and fixed resource ceilings. A separate owner public key and whole-artifact SHA-256 allowlist are embedded in `x86/local_bundle.h`. The private signing seed stays outside the repository. Boot verifies signatures and identities; each launch hashes the copied code before mapping it executable. Changing the model or courier cannot expand the allowlist.
 
-Omega compiler repository: `aien-dev/omega-mv`, commit `bf54b19fa590e8ae925c0e80815516dbf41e7326`.
+The signed embedded payloads were compiled by `aien-dev/omega-mv` commit `bf54b19fa590e8ae925c0e80815516dbf41e7326`.
 
 - `seed/out/omc` SHA-256: `62775d2a391cfef7cde64e387655caa9809a267093112910ec76bfa568f3712b`
 - `seed/omc/omc.om` SHA-256: `96d51b63c8f451661ac715395078e04f39195e50c9e8fe37746cda121e4d7a1e`
+
+Since aienux was folded into omega-mv as `kernel/` (Drake 2026-11-17), `scripts/check_local_tools.sh` compiles with omega-mv's own `seed/out/omc`, checked against `seed/out/omc.sha256` at the omega-mv root. Measured 2026-11-17 with omc `34d611ca…`: `LOCAL_ADMISSION: PASS checks=3239 compiled_payloads=3`.
 
 The three sources are `native/kernel/x86/tools/*.om`. The leading `target x86linux` selects the compiler's x86 instruction emitter; absence of `main` selects bare function output. These are raw native functions, not Linux ELF programs, and receive no Linux syscall ABI. The wrapper follows the pinned compiler's private frame-slot ABI: old RBP argument slots, R14 immutable runtime table, R15 stack floor, RAX result length, and runtime slot 2 for a nonlocal trap. Three parameters are fixed-size input/output array views and input length. Arithmetic returns one little-endian signed 64-bit integer; text returns three unsigned 64-bit counts; system returns five unsigned 64-bit fields (cores, available frame-pool RAM bytes, width, height, network state).
 
@@ -39,7 +41,7 @@ The existing lab UDP transport is unauthenticated. It must be treated as hostile
 
 ## Verification and reproduction
 
-`OMEGA_SOURCE=/path/to/pinned/omega bash scripts/check_local_tools.sh` compiles the exact native sources, compares each signed embedded payload, tests signatures/identities/profile refusal/truncation, and runs courier unit tests. Existing ARM artifact tests remain applicable.
+`bash scripts/check_local_tools.sh` (omega-mv's own `seed/out/omc`, checked against its `seed/out/omc.sha256`; `OMEGA_SOURCE` names another omega-mv checkout) compiles the exact native sources, compares each signed embedded payload, tests signatures/identities/profile refusal/truncation, and runs courier unit tests. Existing ARM artifact tests remain applicable.
 
 `bash scripts/qemu_ck_local_tools_test.sh` uses two QEMU CPU profiles. It probes real CPL3 isolation, protected writes, NX execution, guards, privileged instructions, Linux syscall rejection, forged returns, discarded partial output, timeouts, cancellation, replay, request limits, register preservation, and 1,000 repeated runs. A deterministic model oracle then selects all three tools through the real Rust courier and COM2; it verifies the results returned by the emulator kernel. This is an integration oracle, not evidence that a live model selected the right action. The oracle is C (`native/kernel/x86/tests/local_tools_model_oracle.c`); `bash scripts/test_local_tools_udp.sh` runs the same wire checks and three direct-arithmetic jobs against the Rust courier without QEMU.
 

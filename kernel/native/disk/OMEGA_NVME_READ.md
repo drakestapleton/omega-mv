@@ -40,8 +40,9 @@ replace or claim the System Store journal or that consumer.
 
 ## Pins and reproducible acceptance
 
-- Compiler: the omega-mv commit and seeded omc SHA-256 in the repository's `PIN`, read by
-  `tests/omega_nvme_test.sh` and `tests/gates/run.sh`. The first pin was the existing
+- Compiler: omega-mv's committed `seed/out/omc`, whose SHA-256 is in `seed/out/omc.sha256` at the
+  omega-mv root (kernel/ is folded into omega-mv, Drake 2026-11-17; this was the `PIN` file before),
+  read by `tests/omega_nvme_test.sh` and `tests/gates/run.sh`. The first pin was the existing
   omega-gpu-driver `feat/vfio-dma-bar` pin (omega-mv 397e6704), not an invented profile; the
   historical receipt `tests/omega_nvme_receipt.txt` records that build.
 - Existing C reference: `disk_nvme.c`; existing model: `tests/nvme_test.c`.
