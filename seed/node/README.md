@@ -2071,8 +2071,19 @@ trial shows the cap, rc, CWO lines (`n`), class (`c`: 0 explicit fail, 1
 pass, 2 refused at exec, 3 bad), journal state (`j`: 0 none, 1 consistent, 2
 other) and starts (`s`). Each trial waits at most three times the uncapped
 run, measured from before the node starts; a trial past that deadline
-(`rc=-110`) fails the check. The host run uses a one-job stand-in for the
-round40 recording, which is not on this machine:
+(`rc=-110`) fails the check. On this host the cap that first passes is not
+the node's own memory need: `tool` runs each test program through
+`execpure` (`seed/omc/omc.om`), which sets RLIMIT_AS to its own fixed
+ceiling. Under an inherited cap below that ceiling the raise is refused, the
+test program's exec fails (exit 121) and `code-main` reports an explicit
+`CWO` FAIL. So the explicit fails come from caps below execpure's ceiling,
+the passing cap is the first step at or above it, and when 32 times the
+`code-main` peak stays below it the check fails whatever the node does. The
+check shows that a cap the node cannot work under fails closed (the job
+file is left unrepaired) and that the node completes under a cap that leaves
+its tools their ceiling; it does not measure how much memory the node needs.
+The host run uses a one-job stand-in for the round40 recording, which is not
+at the path qual reads:
 `seed/node/tests/ra40/final-selected.json`, a small
 loop repair (id 76666) whose answers were constructed from the node's own
 prompts on this build. It serves only the memory scenario; with it as
