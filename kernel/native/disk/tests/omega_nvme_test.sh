@@ -138,7 +138,7 @@ for c in opcode0 opcode1 opcode8 opcode9 opcode128 opcode132 adminformat; do
  case_run host "$out/probe" "$c"
 done
 
-# Mutants: disposable copies of the composed sources, never source edits or candidate artifacts.
+# Mutants: disposable copies of the composed sources in $out; the sources themselves are not edited.
 # Each must fail its case with the named exit and reason line.
 mutant_awk() {
  awk "$3" "$out/$2.om" > "$out/mutant-$1.om" || { echo "FAIL mutant $1: its source line was not found exactly" >&2; exit 1; }

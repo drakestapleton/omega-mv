@@ -129,9 +129,9 @@ static void peer_check(pid_t p) { if (p == qp) qemu_check(); else candidate_chec
  * between. So one engine wait covers a completion at the loads tried, and the per-loop wait count
  * (QEMU_MAX_WAITS) shows whether the 256-wait budget is being used. The budget itself is checked by
  * the C-model slow and timeout cases and their mutants (omega_nvme_test.sh).
- * A thread that exits between the directory read and the read of its files makes the scan start
- * again (after checking that the process lives); NOT_RUN (exit 3) only when /proc has no task list
- * or a live thread has no schedstat (a kernel without schedstats). */
+ * When a thread exits between the directory read and the read of its files, the scan checks that
+ * the process lives and starts again (NvmeWaits finding 4; no gate control forces that race). It
+ * exits NOT_RUN (3) when /proc has no task list or a live thread has no schedstat. */
 static int snapshot(pid_t p, unsigned long long *ran, unsigned *threads)
 {
     char path[320], buf[512];  /* d_name is at most 255 bytes */
