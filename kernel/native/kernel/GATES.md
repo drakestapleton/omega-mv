@@ -906,21 +906,40 @@ with its `_nomask` forms because the iMac drawing cores keep interrupts on for T
   trylock never jumps the queue, and the interrupt rules in the host model (a thread's interrupt is SIGUSR1; masked = blocked):
   an interrupt raised while held, or exactly between mask and ticket, or exactly between release and restore, runs only after
   the lock is free; nested and pre-masked callers. A host thread waiting for the lock yields its CPU, so the run holds on a
-  one-CPU host. `make spinlock-mutant` (part of `make test`) requires it to FAIL against each TEST-ONLY mutant (mask removed,
-  ticket before mask, restore before release), and each ordering mutant also alone in its own phase
-  (`TEST_SPINLOCK_ONLY=irq-step-acquire|irq-step-release`).
+  one-CPU host. Phase `irq-slot`: two threads with different saved states take the same lock with `ck_spin_lock` /
+  `ck_spin_unlock`; the second enters and writes `l->irq` between the first one's release and restore, and each must get
+  its own state back. `make spinlock-mutant` (part of `make test`) requires it to FAIL against each TEST-ONLY mutant (mask
+  removed, ticket before mask, restore before release, `l->irq` written before entry, `l->irq` read after the release),
+  and each ordering mutant also alone in its own phase (`TEST_SPINLOCK_ONLY=irq-step-acquire|irq-step-release|irq-slot`).
+  The mutant lines it shows are prefixed `control:`.
 - `test_pipe_irq` (HOST, `make test`): race test. A periodic POSIX timer raises SIGUSR1 at the thread that loops on a pipe op
   holding the pool lock (20 us ticks, aimed at that thread, so it lands asynchronously on any number of CPUs), and the handler
   calls a pipe op too. Built against d01b2f19's `core/pipe.c` it deadlocks (FAIL, watchdog on stalled progress); at this
-  change it PASSes and needs at least 1000 interrupts handled; against the mask-removed mutant it FAILs. Host signal model
-  only: no kernel interrupt handler calls a pipe op today.
-- `make spinlock-asm-check` (BUILD, cross compilers): in `objdump -dr` of the freestanding aarch64 and x86-64 code of
-  `core/spinlock.h`, the mask comes before the ticket atomic, the restore after the releasing store, and the atomics touch
-  ticket and serving (register base + 4 on aarch64, relocations on x86-64). `--selftest` mutates the dumps (mask removed, order
-  swapped, release store to another symbol) and requires each to FAIL. One translation unit only (tests/spinlock_tu.c).
-- `make ticketlock-proof` (Lean 4 v4.35.0, `proofs/TicketLock.lean`): from acquire, trylock and release alone, the outstanding
-  tickets are serving..ticket-1 and only the oldest enters (mutual exclusion, FIFO, across the 2^32 wrap); the interrupt
-  ordering in a one-CPU model, each mutant unsafe. Not modelled: memory ordering and several CPUs at once.
+  change it PASSes. The run is counted in interrupts, not rounds: it loops until 1000 interrupts that arrived during a pipe
+  op were handled, however many rounds that takes (before: 200000 rounds had to see 1000, so a fast host could FAIL). Alarms
+  (not caps): no progress for 5 s, or no interrupt for 5 s. `make spinlock-mutant` runs it against the mask-removed mutant
+  (FAIL), with a timer 100 times slower (PASS) and with no timer (FAIL by the alarm). Host signal model only: no kernel
+  interrupt handler calls a pipe op today.
+- `make spinlock-asm-check` (BUILD, cross compilers): `tools/ck_spinlock_asm_check.sh` follows the registers of `objdump
+  -drt` of the freestanding aarch64 and x86-64 code (`tests/spinlock_tu.c`: the explicit pair, and `ck_spin_lock` /
+  `ck_spin_unlock` in separate functions as `core/pipe.c` uses them) and of `core/pipe.c` built for the aarch64 kernel. It
+  checks, on the fields they name: mask before the ticket atomic, acquire load after it, releasing store to serving before
+  the restore, the state restored is the one saved; for `l->irq`, stored after the acquire load and loaded before the
+  releasing store; at every lock site of pipe.c, the same rules (the check prints how many masks, release sites and
+  restores it found). `--selftest` mutates the dumps and requires each mutant to FAIL by the rule it targets. Without a cross compiler:
+  NOT_RUN, exit 3.
+- `make ticketlock-proof` (Lean 4 v4.35.0, `proofs/TicketLock.lean`, checked by `proofs/check.sh`): from acquire, trylock and
+  release alone, the outstanding tickets are serving..ticket-1 and only the oldest enters (mutual exclusion, FIFO, across the
+  2^32 wrap); the interrupt ordering in a one-CPU model, and on two CPUs under every interleaving with an interrupt
+  transition, for both forms (the `l->irq` form included), each mutant unsafe. These are proofs about the listed operation
+  orders, not about spinlock.h as compiled (the asm check covers that link). Not modelled: memory ordering, more than two
+  CPUs or one interrupt per CPU, trylock outside the queue invariant. `proofs/check.sh` passes the file only when lean prints
+  no warning or error, `#print axioms` of every theorem and of every constant it declares lists only propext,
+  Classical.choice and Quot.sound, and the source has no sorry/admit/native_decide/axiom; its `--selftest` requires the four
+  bad edits in `proofs/controls/` to FAIL. Without lean or with another version: NOT_RUN, exit 3.
+- Rows 221c and 221d were hand runs. Since the 2026-11-17 review fixes, `tests/gates/run.sh spinlock` (omega-mv:
+  `tests/gates/run.sh kernel-spinlock`, part of `tests/gates/run.sh kernel`) runs both with their controls and its own
+  NOT_RUN controls (no lean, wrong lean, no x86 compiler); rows 221f-221i.
 - Row 221 (QEMU) runs the pipe primitive with the masking lock; it shows the DAIF save/restore does not break the pipe, not that
   an interrupt is deferred (no interrupt handler takes the pool lock). The iMac kernel QEMU test
   (`scripts/qemu_ck_imac_kernel_test.sh`) runs draw_lock and the note lock on 4 cores with TLB shootdowns. Hardware NOT_RUN.
@@ -933,6 +952,10 @@ with its `_nomask` forms because the iMac drawing cores keep interrupts on for T
 | 221c | `make spinlock-asm-check`: instruction order and targets on aarch64 and x86-64, self-test mutants FAIL | PIPE (DRA-556) | BUILD PASS (2026-11-15, aarch64-linux-gnu-gcc and x86_64-linux-gnu-gcc 13.3.0) |
 | 221d | `make ticketlock-proof` | PIPE (DRA-556) | PROOF PASS (2026-11-15, Lean 4.35.0, no sorry; axioms propext, Quot.sound, Classical.choice) |
 | 221e | iMac kernel QEMU (`scripts/qemu_ck_imac_kernel_test.sh`): draw_lock and the note lock on the shared type, 4 cores drawing, TLB shootdown to every core | PIPE (DRA-556) | QEMU PASS (2026-11-15, base d01b2f19 plus DRA-556, AIENOS_IMAC_KERNEL PASS; hardware NOT_RUN) |
+| 221f | `tests/gates/run.sh spinlock`: `make spinlock-asm-check` (both forms, every pipe.c lock site, dump mutants) and `make ticketlock-proof` (axioms of every constant, bad-proof controls); NOT_RUN without the tools, never PASS | PIPE (DRA-556) | GATED (results in the gate log of each run, not here) |
+| 221g | `test_spinlock` phase `irq-slot` and the `l->irq` mutants (written before entry, read after release) | PIPE (DRA-556) | GATED by `make test` (spinlock-mutant) |
+| 221h | `test_pipe_irq` counted in interrupts; slow-timer control PASS, no-timer control FAIL | PIPE (DRA-556) | GATED by `make test` (spinlock-mutant) |
+| 221i | `TicketLock.lean` two-CPU model with interrupts and the `l->irq` form (slot_safe, pair_safe, slot_pair_safe, five mutants unsafe) | PIPE (DRA-556) | GATED by `tests/gates/run.sh spinlock` (221f) |
 
 
 ## LIFECYCLE: resident production lifecycle (native v1 plan P03, P04 cuts 1-2b, P05 cut 1, P06 cuts 2-4; C-only) -> CK `LIFECYCLE` (scripts/qemu_ck_lifecycle_test.sh)

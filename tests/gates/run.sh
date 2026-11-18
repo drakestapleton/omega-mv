@@ -788,15 +788,18 @@ case "$step" in
   # kernel/MIGRATION.md). kernel-<step> runs the kernel's own runner, kernel/tests/gates/run.sh <step>,
   # which works from kernel/ and compiles with this repository's seed/out/omc after checking it against
   # seed/out/omc.sha256 (hw-gates, omega-nvme and tcp-corpus compile Omega; ck-host-tests starts with
-  # native/kernel's make test sanitize). kernel-make-test is native/kernel's make test alone. `kernel`
-  # runs the five in that order, logs each under $OUT_DIR, prints one line per step with its exit
-  # status and log sha256, and exits 1 when any step did not exit 0 (a NOT_RUN exit 3 is not a pass).
+  # native/kernel's make test sanitize; spinlock checks the compiled order of core/spinlock.h and its
+  # Lean model, and is NOT_RUN, exit 3, without the cross compilers or the pinned lean).
+  # kernel-make-test is native/kernel's make test alone. `kernel` runs the six in the order below,
+  # logs each under $OUT_DIR, prints one line per step with its exit status and log sha256, and exits 1
+  # when any step did not exit 0 (a NOT_RUN exit 3 is not a pass).
   kernel-make-test)   make -C kernel/native/kernel test ;;
-  kernel-ck-host-tests|kernel-hw-gates|kernel-omega-nvme|kernel-tcp-corpus)
+  kernel-ck-host-tests|kernel-hw-gates|kernel-omega-nvme|kernel-tcp-corpus|kernel-spinlock)
     bash kernel/tests/gates/run.sh "${step#kernel-}" ;;
   kernel)
-    kfail=0
-    for s in make-test ck-host-tests hw-gates omega-nvme tcp-corpus; do
+    kfail=0; kn=0
+    for s in make-test ck-host-tests hw-gates omega-nvme tcp-corpus spinlock; do
+      kn=$((kn + 1))
       klog="$OUT_DIR/kernel-$s.log"
       rc=0; bash tests/gates/run.sh "kernel-$s" > "$klog" 2>&1 || rc=$?
       echo "kernel-$s exit=$rc log=$klog sha256=$(sha256sum < "$klog" | cut -c1-64)"
@@ -804,8 +807,8 @@ case "$step" in
       [ "$rc" = 0 ] || kfail=$((kfail + 1))
     done
     obs kernel_steps_failed "$kfail"
-    [ "$kfail" = 0 ] || { echo "KERNEL FAIL: $kfail of 5 steps did not exit 0" >&2; exit 1; }
-    echo "KERNEL PASS: 5 of 5 steps exit 0"
+    [ "$kfail" = 0 ] || { echo "KERNEL FAIL: $kfail of $kn steps did not exit 0" >&2; exit 1; }
+    echo "KERNEL PASS: $kn of $kn steps exit 0"
     ;;
   *) echo "run.sh: unknown step '$step'" >&2; exit 2 ;;
 esac

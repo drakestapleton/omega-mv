@@ -929,8 +929,11 @@ static void help_loop(void)
 }
 
 /* Before text goes back on the screen: the drawing cores finish the frame in
- * hand and stop. Waits at most 200 ms (a panic never hangs here); then the
- * frame lock is held for good, so nothing draws over the text. */
+ * hand and stop, then this core takes the frame lock. Both waits share one
+ * 200 ms limit (a panic never hangs here). If the lock was taken, it is held
+ * for good and nothing draws over the text; if a core still held it when the
+ * time ran out, the text is drawn anyway and that core may draw over it (the
+ * same as the test-and-set lock before DRA-556). */
 static void draw_stop(void)
 {
     __atomic_store_n(&draw_run, 0, __ATOMIC_RELEASE);

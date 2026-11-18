@@ -5,8 +5,11 @@
  * be deferred until the unlock; without the mask it spins on its own ticket forever. A watchdog thread turns that
  * hang into "test_spinlock: FAIL" (an alarm, not a cap: a passing run never waits on it).
  * Ordering is checked deterministically: CK_SPIN_TEST_STEP raises the interrupt between the two steps of acquire
- * (mask, ticket) and of release (release, restore). The TEST-ONLY mutants -DCK_SPIN_TEST_NO_IRQ_MASK,
- * -DCK_SPIN_TEST_TICKET_BEFORE_MASK and -DCK_SPIN_TEST_RESTORE_BEFORE_RELEASE must each FAIL here
+ * (mask, ticket) and of release (release, restore). The saved state kept in the lock (ck_spin_lock / ck_spin_unlock,
+ * l->irq) is checked with two threads whose saved states differ: the next holder enters, and writes its own state,
+ * between the holder's release and its restore; the holder must still get its own state back. The TEST-ONLY
+ * mutants -DCK_SPIN_TEST_NO_IRQ_MASK, -DCK_SPIN_TEST_TICKET_BEFORE_MASK, -DCK_SPIN_TEST_RESTORE_BEFORE_RELEASE,
+ * -DCK_SPIN_TEST_SLOT_WRITE_BEFORE_ENTRY and -DCK_SPIN_TEST_SLOT_READ_AFTER_RELEASE must each FAIL here
  * (make spinlock-mutant). The _nomask forms: mutual exclusion, trylock never jumps the queue, mask untouched.
  */
 #define _GNU_SOURCE
@@ -24,13 +27,22 @@ static void step_hook(struct ck_spinlock *l);
 #define CK_SPIN_TEST_STEP(l) step_hook(l)
 #include "spinlock.h"
 
-/* Armed with a lock: the next acquire or release step on that lock raises the interrupt once. */
-static struct ck_spinlock *volatile step_armed;
+/* Armed with a lock: the next acquire or release step on that lock raises the interrupt once.
+ * slot_armed: the next step on that lock by thread slot_a (its unlock, between release and restore) waits until
+ * the next holder is inside and has written l->irq. */
+static struct ck_spinlock *volatile step_armed, *volatile slot_armed;
+static pthread_t slot_a;
+static volatile int slot_b_in;
 static void step_hook(struct ck_spinlock *l)
 {
     if (l && l == step_armed) {
         step_armed = 0;
         pthread_kill(pthread_self(), CK_SPIN_HOST_IRQ_SIGNAL);
+    }
+    if (l && l == slot_armed && pthread_equal(pthread_self(), slot_a)) {
+        slot_armed = 0;
+        while (!__atomic_load_n(&slot_b_in, __ATOMIC_ACQUIRE))
+            sched_yield();
     }
 }
 
@@ -307,14 +319,75 @@ static void test_nomask(void)
     tick();
 }
 
+/* ---- 5. the saved state kept in the lock (ck_spin_lock / ck_spin_unlock, the form core/pipe.c uses) ----
+ * A (this thread, interrupts open) holds sl; B (interrupts masked before it locks) queues behind it. A's unlock
+ * waits, between its release and its restore, until B is inside and has written its own state to sl.irq. A must
+ * come out with interrupts open and B with them masked. Mutant slot-read-after-release: A reads sl.irq after B
+ * wrote it. Mutant slot-write-before-entry: B writes sl.irq while A still holds. Either way A gets B's "masked". */
+static struct ck_spinlock sl = CK_SPINLOCK_INIT;
+static volatile int slot_a_out;
+
+static void *slot_b(void *arg)
+{
+    (void)arg;
+    sigset_t one;
+    sigemptyset(&one);
+    sigaddset(&one, CK_SPIN_HOST_IRQ_SIGNAL);
+    pthread_sigmask(SIG_BLOCK, &one, 0);
+    ck_spin_lock(&sl);
+    __atomic_store_n(&slot_b_in, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&slot_a_out, __ATOMIC_ACQUIRE)) /* hold until A has restored */
+        sched_yield();
+    ck_spin_unlock(&sl);
+    return (void *)(intptr_t)irq_blocked();
+}
+
+static void test_slot(void)
+{
+    phase = "irq-slot";
+    slot_a = pthread_self();
+    int wrong_a = 0, wrong_b = 0;
+    for (int r = 0; r < 50; r++) {
+        slot_b_in = slot_a_out = 0;
+        CHECK(!irq_blocked());
+        ck_spin_lock(&sl);
+        uint32_t t = __atomic_load_n(&sl.ticket, __ATOMIC_ACQUIRE);
+        pthread_t b;
+        CHECK(pthread_create(&b, 0, slot_b, 0) == 0);
+        wait_ticket(&sl, t + 1u); /* B queued */
+        slot_armed = &sl;
+        ck_spin_unlock(&sl);
+        if (irq_blocked()) { /* A got B's state: put A's back for the next round */
+            wrong_a++;
+            sigset_t one;
+            sigemptyset(&one);
+            sigaddset(&one, CK_SPIN_HOST_IRQ_SIGNAL);
+            pthread_sigmask(SIG_UNBLOCK, &one, 0);
+        }
+        __atomic_store_n(&slot_a_out, 1, __ATOMIC_RELEASE);
+        void *bm = 0;
+        pthread_join(b, &bm);
+        if (!(intptr_t)bm)
+            wrong_b++;
+        CHECK(slot_armed == 0);
+        tick();
+    }
+    CHECK(!ck_spin_busy(&sl));
+    if (wrong_a || wrong_b) {
+        printf("test_spinlock: FAIL irq-slot: of 50 rounds, %d left the first holder masked, %d left the second "
+               "open (a holder restored the other's saved state)\n", wrong_a, wrong_b);
+        failures++;
+    }
+}
+
 int main(void)
 {
     pthread_t wd;
     if (pthread_create(&wd, 0, watchdog, 0) != 0)
         return 2;
     ck_spin_init(&ff);
-    /* TEST_SPINLOCK_ONLY=irq-step-acquire|irq-step-release runs that phase alone (make spinlock-mutant uses it to
-     * show each ordering mutant caught by its own phase). */
+    /* TEST_SPINLOCK_ONLY=irq-step-acquire|irq-step-release|irq-slot runs that phase alone (make spinlock-mutant uses
+     * it to show each ordering mutant caught by its own phase). */
     const char *only = getenv("TEST_SPINLOCK_ONLY");
     if (only && !strcmp(only, "irq-step-acquire")) {
         irq_setup();
@@ -322,6 +395,8 @@ int main(void)
     } else if (only && !strcmp(only, "irq-step-release")) {
         irq_setup();
         step_release();
+    } else if (only && !strcmp(only, "irq-slot")) {
+        test_slot();
     } else if (only) {
         printf("test_spinlock: FAIL unknown TEST_SPINLOCK_ONLY=%s\n", only);
         return 2;
@@ -330,6 +405,7 @@ int main(void)
         test_fifo();
         test_irq();
         test_nomask();
+        test_slot();
     }
     __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
     pthread_join(wd, 0);

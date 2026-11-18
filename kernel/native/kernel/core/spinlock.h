@@ -11,8 +11,10 @@
  *            holder releases by storing serving + 1 (release). Both equal means unlocked.
  *
  * Fair: callers enter in the order they took tickets. Mutual exclusion holds while fewer than 2^32 callers wait on
- * one lock at once (the counters wrap; only equality is compared). Proof of the arithmetic and of the interrupt
- * ordering below: proofs/TicketLock.lean (make ticketlock-proof).
+ * one lock at once (the counters wrap; only equality is compared). A model of the arithmetic and of the interrupt
+ * ordering of both forms below (one CPU, and two CPUs with an interrupt transition): proofs/TicketLock.lean
+ * (make ticketlock-proof); it proves the listed operation orders, and the asm check ties them to the compiled code
+ * (make spinlock-asm-check).
  *
  * Interrupts (the default pair). ck_spin_lock_irqsave masks interrupts on this CPU BEFORE it takes a ticket and
  * returns the previous mask; ck_spin_unlock_irqrestore releases the lock and THEN puts that mask back. So an
@@ -25,7 +27,9 @@
  *                   covered too. SError (A) and debug (D) are not masked.
  *   x86-64 kernel   RFLAGS is saved and "cli" runs; IF is set again only if it was set before. NMI cannot be masked
  *                   by cli: an NMI handler must never take a ck_spinlock. Reading RFLAGS uses pushfq inside inline
- *                   asm, which is safe only because the x86 kernel is built with -mno-red-zone (X86CFLAGS).
+ *                   asm, which is safe only because the x86 kernel is built with -mno-red-zone (X86CFLAGS). No x86
+ *                   kernel code takes a lock with the masking forms today (x86/kmain_x86.c uses the _nomask forms):
+ *                   this path is compiled and its order checked (make spinlock-asm-check), never executed.
  *   hosted build    (host unit tests, __STDC_HOSTED__) a thread's interrupt is the signal CK_SPIN_HOST_IRQ_SIGNAL
  *                   (default SIGUSR1); "masked" means that signal is blocked for the thread, and the saved value
  *                   says whether it already was. Only that one signal is touched: synchronous faults (SIGSEGV,
@@ -54,6 +58,9 @@
  *   CK_SPIN_TEST_NO_IRQ_MASK             mutant: the mask is a no-op.
  *   CK_SPIN_TEST_TICKET_BEFORE_MASK      mutant: the ticket is taken before the mask.
  *   CK_SPIN_TEST_RESTORE_BEFORE_RELEASE  mutant: the mask is restored before the release.
+ *   CK_SPIN_TEST_SLOT_WRITE_BEFORE_ENTRY mutant: ck_spin_lock writes l->irq before it takes a ticket.
+ *   CK_SPIN_TEST_SLOT_READ_AFTER_RELEASE mutant: ck_spin_unlock reads l->irq after the release (CK_SPIN_TEST_STEP
+ *                                        runs between the two).
  */
 #ifndef AIENOS_CK_SPINLOCK_H
 #define AIENOS_CK_SPINLOCK_H
@@ -72,7 +79,8 @@ struct ck_spinlock {
 #define CK_SPINLOCK_INIT { 0u, 0u, 0u }
 
 #if (defined(CK_SPIN_TEST_NO_IRQ_MASK) || defined(CK_SPIN_TEST_TICKET_BEFORE_MASK) ||                                \
-     defined(CK_SPIN_TEST_RESTORE_BEFORE_RELEASE) || defined(CK_SPIN_TEST_STEP)) &&                                    \
+     defined(CK_SPIN_TEST_RESTORE_BEFORE_RELEASE) || defined(CK_SPIN_TEST_SLOT_WRITE_BEFORE_ENTRY) ||                 \
+     defined(CK_SPIN_TEST_SLOT_READ_AFTER_RELEASE) || defined(CK_SPIN_TEST_STEP)) &&                                  \
     !__STDC_HOSTED__
 #error "CK_SPIN_TEST_* are TEST-ONLY host hooks and mutants"
 #endif
@@ -214,13 +222,25 @@ static inline void ck_spin_unlock_irqrestore(struct ck_spinlock *l, ck_irqflags_
 /* The same pair, with the saved state kept in the lock (see the header comment). */
 static inline void ck_spin_lock(struct ck_spinlock *l)
 {
+#if defined(CK_SPIN_TEST_SLOT_WRITE_BEFORE_ENTRY)
+    ck_irqflags_t f = ck_irq_save();
+    l->irq = f;
+    ck_spin_lock_nomask(l);
+#else
     ck_irqflags_t f = ck_spin_lock_irqsave(l);
     l->irq = f;
+#endif
 }
 
 static inline void ck_spin_unlock(struct ck_spinlock *l)
 {
+#if defined(CK_SPIN_TEST_SLOT_READ_AFTER_RELEASE)
+    ck_spin_unlock_nomask(l);
+    CK_SPIN_TEST_STEP(l);
+    ck_irq_restore(l->irq);
+#else
     ck_spin_unlock_irqrestore(l, l->irq);
+#endif
 }
 
 /* 1 while some caller holds or waits for the lock. A snapshot, for assertions and tests only. */
