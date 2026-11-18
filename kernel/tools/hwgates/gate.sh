@@ -27,9 +27,10 @@
 #   - a PASS or FAIL row's source REPO@COMMIT is recorded by tracked files in its receipt's folder;
 #     aienux@COMMIT has exactly one import/commit-map row, naming a commit of the aienux history the
 #     fold brought in (the rewritten aienux main in import/ref-map or an ancestor); the fold rewrote
-#     aienux history, and rows keep the aienux hashes they were written with. The map's bytes are those of the import (evidence_immutable.sh), so a row cannot be
-#     repointed to another commit of that history either. Any other REPO names neither a commit of
-#     this repository nor one the map lists;
+#     aienux history, and rows keep the aienux hashes they were written with. import/ is additions
+#     only (evidence_immutable.sh walks every commit after the import), so a row cannot be repointed
+#     to another commit of that history either. Any other REPO names neither a commit of this
+#     repository nor one the map lists;
 #   - the checker's count line equals the counts of the register, and the checker has no size cap:
 #     it accepts a register and a receipt far past its old tables, and the real register alarms
 #     when it grows past what that control proves;
