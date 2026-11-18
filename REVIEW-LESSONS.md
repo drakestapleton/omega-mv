@@ -83,21 +83,29 @@ A one-time recompute is not a corrective action; a generator and a gate are.
 
 | Kind | Findings (round.number, both repositories) | Why the author and the checks missed it | Corrective action |
 | --- | --- | --- | --- |
-| Derived numbers typed from memory | omega-mv 1.1 "launch floor", 1.3 "every shape" when half were sampled, 2.2 "whole last row", 3.1 "208 shapes" = 26 triples, 4.1 "0.04 to 0.06" range, 4.5 unstated denominator; CUDApp 1.1, 1.2, 2.2, 3.5 | Numbers in README and status text were written after the run, not produced from the log; no gate reads evidence text | `tools/c3_gemm_evidence.sh` produces every count, range, median, repeat and the acceptance word from the chip log; READMEs carry them in `<!-- generated: ... -->` blocks; the always-run gate `tests/gates/run.sh evidence-generated` (OMEGA-EVIDENCE-GENERATED in `.aien/always`) reruns every block and generated file in changed Markdown and fails on any difference |
+| Derived numbers typed from memory | omega-mv 1.1 "launch floor", 1.3 "every shape" when half were sampled, 2.2 "whole last row", 3.1 "208 shapes" = 26 triples, 4.1 "0.04 to 0.06" range, 4.5 unstated denominator; CUDApp 1.1, 1.2, 2.2, 3.5 | Numbers in README and status text were written after the run, not produced from the log; no gate reads evidence text | `tools/c3_gemm_evidence.sh` produces every count, range, median, repeat and the acceptance word from the chip log; READMEs carry them in `<!-- generated: ... -->` blocks; the always-run gate `tests/gates/run.sh evidence-generated` (OMEGA-EVIDENCE-GENERATED in `.aien/always`) reruns every block and generated file in changed Markdown and fails on any difference; since review 5 it also fails a changed evidence README with no generated block and fails typed claims (percent, number range, number after about/above/over/at least/median/best, count of shapes/cases/checks/runs/windows, MET/PARTIAL, typed causes such as memory bound) outside generated blocks in changed evidence READMEs and in the added lines of other changed Markdown; a method constant or source line passes only with an explicit `<!-- typed-ok: REASON -->` marker, which is the review surface; its negative controls are the real sentences of reviews 1 to 5 |
 | Acceptance unit not checked against the wording | omega-mv 3.1, 3.2; CUDApp 1.3, 3.6 | An inherited convention (shape = triple x type x layout) was repeated; nothing encoded the acceptance sentence | The generator states the acceptance literally (a shape is a distinct (M, N, K); at least 200; 1 to 8192; both types; four layouts; 0 wrong) and prints MET or NOT MET from the data |
 | Hand-maintained copies drift | omega-mv 2.1 and 3.6 (docs/OMEGA.md "chip run pending"), 4.2 and 4.3 (stale counts in comments), 4.4, 4.6; CUDApp 2.4 | Status rows and comments restated evidence numbers, and nobody regenerates a copy | docs/OMEGA.md C3 rows and source comments no longer restate counts; they point at the generated summary. AGENTS.md points at `.aien/always` instead of copying its list |
 | Receipts and provenance | omega-mv 1.2 (ceiling cited to a missing path), 1.4 (excerpt log), 2.3 (control patch did not apply), 2.5 (log without binary sha); CUDApp 1.5, 2.1 (receipts overwritten), 2.5 | Runs were named by label and launched by hand | `tools/run_gpu_gemm_chip.sh` (and CUDApp's `tools/run_gpu_fp8_smallrow_chip.sh`) write a provenance header, name outputs by window id and refuse to overwrite; the generated summary prints the header, so a log without it fails to generate |
-| Instrument condition not inspected | omega-mv 1.1 (50 us sleep-poll quantum), 1.7, 2.4, 3.3, 3.4 (load, one sample); CUDApp 2.3, 3.1 (kernel cache cleared per call), 3.2 (A/A false-call rate) | The first timed run was the first look at the instrument | The chip tier busy-polls by default (`--spin-us`), so times are not quantized by the sleep-poll; the summary generates the run-to-run repeat lines with their denominator, so variance is shown wherever a speed is |
+| Instrument condition not inspected | omega-mv 1.1 (50 us sleep-poll quantum), 1.7, 2.4, 3.3, 3.4 (load, one sample); CUDApp 2.3, 3.1 (kernel cache cleared per call), 3.2 (A/A false-call rate) | The first timed run was the first look at the instrument | The chip tier busy-polls by default (`--spin-us`), so times are not quantized by the sleep-poll; the summary generates run-to-run repeat lines with their denominator for the cases common to a history run (the 26 hand-picked shapes only); all other cases carry one sample |
 | Test-tool input checks | omega-mv 1.5 (`--part`), 2.6 (`--spin-us`); CUDApp 1.6, 2.6, 3.3 | Options were added for one run and not given a range | Both options are range-checked and refuse out-of-range values with exit 2 |
+
+Why the first corrective action (review 4 head 5f946b6a) did not hold, found by review 5: it only compared existing generated blocks
+with their generator, so numbers typed outside a block, a README with no block, and docs rows passed (review 5 mutations a, c, d), and
+step 2 below was a human instruction with no mechanism. Its own commit then added a typed "memory bound" claim, a typed load claim,
+a stale hand copy of the always list in AUDIT_SCOPE.md, and an acceptance line that read "every shape correct" as "0 wrong in what
+was checked". The corrective action now fails on those patterns; the search for hand copies of the always list is
+`git grep -n "EVIDENCE-IMMUTABLE\|ZERO-DISK-SECRETS\|EVIDENCE-GENERATED"` and covers AUDIT_SCOPE.md.
 
 Pre-review step for every later change in this repository that adds or edits evidence or status text:
 1. Run `tests/gates/run.sh evidence-generated` (and `evidence-immutable`) and keep the output.
 2. Every number in that text that is computed from a log or table (counts, ranges, medians, fractions, percentages,
-   MET or NOT MET) sits inside a generated block. Prose outside the blocks states method and sources only.
-   An "alarm: new evidence README with no generated block" line from the gate means this step was skipped: fix it
-   before review.
+   MET or PARTIAL) sits inside a generated block. Prose outside the blocks states method and sources only. The gate
+   enforces this by pattern (see the table); a line it flags is moved into a generated block or, if it is a method
+   constant or a source, marked `<!-- typed-ok: REASON -->`.
 3. Read the acceptance sentence of the issue and check that the generated acceptance line counts the unit it names.
 
 The checker and generator are POSIX sh and awk, outside Omega's structure (measuring tools). Their Omega replacement
 is a native `.om` evidence tool once the seeded compiler's text and decimal formatting cover it; that is recorded here,
-not claimed.
+not claimed. Not done: no failing `.om` probe names the exact missing omc capability yet (review 5 finding 7); until one exists
+this note is a limitation, not evidence of a compiler gap.

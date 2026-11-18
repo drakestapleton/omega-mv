@@ -53,7 +53,7 @@ summary)
     FILENAME ~ /final$/ {
       n++; key = $2 "x" $3 "x" $4; tri[key]++; ty[$1]++; ly[$5]++; cell[$1 "|" $5 "|" key]++
       for (k = 2; k <= 4; k++) { if (dmin == "" || $k + 0 < dmin) dmin = $k + 0; if ($k + 0 > dmax) dmax = $k + 0 }
-      wrong += $7; if ($6 + 0 == ($2 + 0) * ($3 + 0)) full++; else samp++
+      wrong += $7; if ($6 + 0 == ($2 + 0) * ($3 + 0)) full++; else { samp++; sampshape[key] = 1 }
       f = $10 + 0; c = $1 "|" $5 "|" key; fr[c] = f
       if (!($1 in best) || f > best[$1]) { best[$1] = f; bestc[$1] = key " " $5 }
       if ($2 == 8192 && $3 == 8192 && $4 == 8192) { if (!($1 in sqlo) || f < sqlo[$1]) sqlo[$1] = f; if (f > sqhi[$1]) sqhi[$1] = f }
@@ -72,7 +72,9 @@ summary)
       printf "- cases: %d = %d distinct (M, N, K) shapes x %d types x %d layouts; every shape in every type/layout cell exactly once: %s\n", n, nt, ntype, nlay, (miss == 0 && n == nt * ntype * nlay) ? "yes" : "NO (" miss " cells missing or repeated)"
       printf "- dimensions: smallest %d, largest %d; wrong outputs in all cases: %d; compared in full (checked = M*N): %d cases, on a sample: %d cases\n", dmin, dmax, wrong, full, samp
       ok = (nt >= 200 && dmin == 1 && dmax == 8192 && ("bf16" in ty) && ("e4m3" in ty) && nlay == 4 && miss == 0 && wrong == 0)
-      printf "- DRA-485 acceptance, read literally (at least 200 shapes, each a distinct (M, N, K), dimensions 1 to 8192, BF16 and FP8, both layouts of A and B, 0 wrong): %s\n", ok ? "MET on the chip" : "NOT MET"
+      ns = 0; for (k in sampshape) ns++
+      verdict = !ok ? "NOT MET" : (ns == 0 ? "MET on the chip, every shape compared in full" : sprintf("PARTIAL: 0 wrong, but %d shapes were compared in full in every cell and %d shapes only on a sample in at least one cell", nt - ns, ns))
+      printf "- DRA-485 acceptance, read literally (at least 200 shapes, each a distinct (M, N, K), dimensions 1 to 8192, BF16 and FP8, both layouts of A and B, every shape correct against a host reference): %s\n", verdict
       for (ti = 1; ti <= NT; ti++) { t = TL[ti]; if (!(t in ty)) continue
         m = 0; for (j = 1; j <= nb[t]; j++) a[j] = bf[t, j]; m = med(a, nb[t])
         printf "- speed %s: best %.4f (%s); 8192^3 %.4f to %.4f; over the %d cases of at least 2^30 multiply-adds median %.4f, lowest %.4f (%s), %d below 0.03\n", t, best[t], bestc[t], sqlo[t], sqhi[t], nb[t], m, lo[t], loc[t], under[t] + 0

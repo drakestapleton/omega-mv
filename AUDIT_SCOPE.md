@@ -119,7 +119,7 @@ make PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-realize
 ```
 
 - Every gate name in `tests/gates/*.gate` is a `run.sh` argument; the Spark runs the touched
-  gates plus `.aien/always` (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`).
+  gates plus the gates listed in `.aien/always`.
 - `evidence-immutable` prints `evidence/: additions only`; `zero-disk-secrets` prints
   `Zero plaintext .env files verified.`
 - Some older milestone gate scripts rewrite their receipts in place; run on a throwaway checkout.
