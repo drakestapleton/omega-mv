@@ -83,8 +83,8 @@ omega-mv `f7a068ec54d67ccad504cf5e5887376916158b7b`; the merge that brought it i
 `d0f9bb23ac321915c987d58ea97cca0fc9392493`. The DRA-606 change (barrier 6 refusal in
 `gpu/nvidia/om/codegen/bw_hazard.om`) regenerated them again with `BASE` =
 `d7c70e4a969a85047630e85385c032a4b652dfba`, run in its own tree, so the list holds that change's files. That is
-recorded here only. DRA-344 (MUFU flush in `src/omega_gpu_elementwise_api.c`/`.h`) and DRA-351 (seat diagnostics in
-`src/runtime/rx_resident_gpu.c`) each regenerated `omega-base.sha256.txt` the same way in their own tree. The lists themselves carry no commit, and
+recorded here only. DRA-344 (MUFU flush in `src/omega_gpu_elementwise_api.c`/`.h`), DRA-351 (seat diagnostics in
+`src/runtime/rx_resident_gpu.c`) and DRA-485 (wrong-transpose red checks in `src/omega_gpu_gemm.c`/`.h`) each regenerated `omega-base.sha256.txt` the same way in their own tree. The lists themselves carry no commit, and
 the gate cannot check the CUDApp commit, because CUDApp is not in this repository.
 
 Then rebuild the inventory and write its output:
