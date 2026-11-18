@@ -275,7 +275,7 @@ case "$step" in
     scripts_verdict || fail=1
     exit ${fail}
     ;;
-  # Not hosted: QEMU tests that need outside inputs. A missing input is a FAIL, never a pass.
+  # Not hosted: QEMU tests that need outside inputs. A missing input is NOT_RUN, exit 3, never a pass.
   #   ALLEN_MODEL            host:port of an OpenAI-shape model server answering /health
   #                          (allen_courier, allen_wizard); no default, so the shared server
   #                          is only ever used when the operator names it
@@ -290,7 +290,7 @@ case "$step" in
       if [ -n "${!v:-}" ] && [ ! -r "${!v}" ]; then echo "::error::$v=${!v} is not a readable file" >&2; missing=$((missing + 1)); fi
     done
     obs inputs_missing "$missing"
-    [ "$missing" = 0 ] || exit 1
+    if [ "$missing" != 0 ]; then echo "ck-qemu-external: NOT_RUN ($missing outside inputs missing, above)"; exit 3; fi
     must_pass allen_courier 'AIENOS_ALLEN_COURIER: PASS' -- bash scripts/qemu_ck_allen_courier_test.sh
     must_pass allen_wizard 'AIENOS_ALLEN_WIZARD: PASS' -- bash scripts/qemu_ck_allen_wizard_test.sh
     must_pass local_model 'LOCAL_MODEL: PASS cpu=qemu64' 'LOCAL_MODEL: PASS cpu=max' \
@@ -436,13 +436,13 @@ case "$step" in
   # Not hosted (the hosted runner has no model file): the real Llama forward comparisons in
   # crates/aienos-infer/tests/forward.rs, release build. The sandbox finds the model at
   # $HOME/models (aien-run-exec bind-mounts the operator's ~/models read-only there).
-  # A missing model or any SKIPPED line is a FAIL, never a silent pass.
+  # A missing model is NOT_RUN, exit 3, never a pass; any SKIPPED line is a FAIL.
   infer-forward)
     model="${AIENOS_MODEL:-$HOME/models/aien-mail/Llama-3.2-1B-Instruct-Q4_K_M.gguf}"
     if [ ! -f "$model" ]; then
-      echo "::error::model file $model not present; infer-forward needs the real model" >&2
+      echo "infer-forward: NOT_RUN (model file $model not present; infer-forward needs the real model)"
       obs model_present false
-      exit 1
+      exit 3
     fi
     obs model_present true
     export AIENOS_MODEL="$model"

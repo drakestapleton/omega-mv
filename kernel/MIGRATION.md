@@ -135,7 +135,8 @@ ck-qemu-gates: `scripts/test_trust1_measurement_tools.sh` picks a random swtpm p
 already in use"; it passed alone. A run is an observation of that commit, not a qualification. Since
 then the software-TPM tests start swtpm through `scripts/swtpm_start.sh`, which takes another port pair
 while one is in use and only a pair its own swtpm listens on (control `scripts/test_trust1_swtpm_port.sh`,
-run by verify-all).
+run by verify-all). And infer-forward and ck-qemu-external now report a missing model file or input as
+NOT_RUN, exit 3, which the judge does not take for a pass either.
 
 ## What the fold changes for the kernel's own checks
 
