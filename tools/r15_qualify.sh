@@ -93,7 +93,9 @@ temps=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | tr '\n' ' ')
 spbm_ver=$(cat /sys/module/aien_spbm_readonly/srcversion 2>/dev/null)
 top=$(ps -eo pcpu,comm --sort=-pcpu | sed -n 2,11p | awk '{printf "%s:%s ", $2, $1}')
 servers=$(ps -eo comm,args | grep -i -E 'astrosage|lm-studio|lmstudio|llama|vllm|ollama' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
-aienos=$(git -C "${AIENOS_R7_DIR:-../aienos-capability-c}" rev-parse HEAD 2>/dev/null)
+# The authority source is the aienos.lock commit: the build proves AIENOS_R7_DIR (or extracts it
+# from kernel/) against it with tools/aienos_lock_source.sh; a directory's HEAD is not that proof.
+aienos=$(awk 'NF && $1 !~ /^#/ {print $1; exit}' aienos.lock)
 physics=$(git -C "${PHYSICS_DIR:-../physics}" rev-parse HEAD 2>/dev/null)
 {
     printf '{"run_id":%s,"mode":%s,"candidate_commit":%s,"tree_dirty":%s,' \

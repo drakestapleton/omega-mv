@@ -20,8 +20,8 @@
 #   tools/effect_cap64_receipt.sh [out-dir]      (default: evidence/EFFECT_CAP64)
 #
 # Runs, on the committed tree only:
-#   - the pinned Aienux capability library, rebuilt from `git archive` of the
-#     commit in aienos.lock (AIENOS_REPO, default ~/workspace/aienos-repo)
+#   - the pinned Aienux capability library, rebuilt from tools/aienos_lock_source.sh materialize of the
+#     commit in aienos.lock (this repository's kernel/, or AIENOS_REPO)
 #   - make test-effect-cap64                         (4 gates, physics-free)
 #   - make test-visor-core, test-visor-world, test-visor-authority
 #   - the non-energy host regression suites CI runs: test (M4 omegatool),
@@ -38,7 +38,9 @@ set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 cd "$HERE" || exit 2
 OUTDIR=${1:-evidence/EFFECT_CAP64}
-AIENOS_REPO=${AIENOS_REPO:-$HOME/workspace/aienos-repo}
+# Empty: this repository, where aienux is kernel/ and kernel/import/commit-map gives the
+# rewritten commit of the locked one (tools/aienos_lock_source.sh); else a repository holding it.
+AIENOS_REPO=${AIENOS_REPO:-}
 PHYSICS_DIR=${PHYSICS_DIR:-$HOME/workspace/physics-r13}
 BENCH_LOCK=${BENCH_LOCK:-$HOME/workspace/.argus-bench.lock}
 Q=build/cap64q
@@ -59,8 +61,10 @@ physics_pin=$(awk 'NF && $1 !~ /^#/ {print $1; exit}' physics.lock)
 physics_head=$(git -C "$PHYSICS_DIR" rev-parse HEAD 2>/dev/null || echo missing)
 [ "$physics_head" = "$physics_pin" ] || REASONS+=("physics checkout $physics_head != physics.lock $physics_pin")
 
-aienos_src_tree=$(git -C "$AIENOS_REPO" rev-parse "$aienos_pin:native/capability" 2>/dev/null || echo missing)
-if git -C "$AIENOS_REPO" archive "$aienos_pin" native/capability | tar -x -C "$Q/aienos" &&
+aienos_lock_src() { AIENOS_LOCK="$aienos_pin" AIENOS_LOCK_REPO="$AIENOS_REPO" AIENOS_R7_DIR= bash tools/aienos_lock_source.sh "$@"; }
+aienos_id=$(aienos_lock_src identity 2>/dev/null)
+aienos_src_tree=$(git -C "$(printf %s "$aienos_id" | jq -r .repo)" rev-parse "$(printf %s "$aienos_id" | jq -r .commit_tree):native/capability" 2>/dev/null || echo missing)
+if aienos_lock_src materialize "$Q/aienos" native/capability &&
    flock "$BENCH_LOCK" make -C "$Q/aienos/native/capability" > "$LOGS/aienos-lib.log" 2>&1; then
     lib_ok=1
 else
@@ -208,7 +212,7 @@ body=$(cat <<EOF
   "tree_stable_during_run": $stable,
   "host": {"uname_m": "$(uname -m)", "uname_r": "$(uname -r)", "product_name": "$(json_str "$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null)")"},
   "hardware_scope": "host-only (CPU); no GPU, no silicon, no energy measurement",
-  "aienos": {"lock": "$aienos_pin", "source": "git archive $aienos_pin native/capability (tree $aienos_src_tree)", "header_sha256": "$hdr_sha", "lib_sha256": "$lib_sha", "lib_built": $([ "$lib_ok" -eq 1 ] && echo true || echo false)},
+  "aienos": {"lock": "$aienos_pin", "source": "tools/aienos_lock_source.sh materialize $aienos_pin native/capability (tree $aienos_src_tree)", "header_sha256": "$hdr_sha", "lib_sha256": "$lib_sha", "lib_built": $([ "$lib_ok" -eq 1 ] && echo true || echo false)},
   "physics": {"lock": "$physics_pin", "checkout_head": "$physics_head"},
   "gates": {$GATES_JSON
   },

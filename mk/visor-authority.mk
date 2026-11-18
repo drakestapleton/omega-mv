@@ -14,7 +14,7 @@
 # definitions are then identical). The library is a prerequisite of the link, so a changed
 # libaienos_capability.a relinks the test. The old default ../aienos-r9 overrode the
 # Makefile's pinned default for every authority target (R7 to R16).
-AIENOS_LOCK_REPO ?= ../aienos-argus-cap
+AIENOS_LOCK_REPO ?=
 AIENOS_LOCK = $(shell head -n 1 aienos.lock)
 AIENOS_R7_DEFAULT = $(OUT_DIR)/aienos-authority/$(AIENOS_LOCK)
 AIENOS_R7_DIR ?= $(AIENOS_R7_DEFAULT)

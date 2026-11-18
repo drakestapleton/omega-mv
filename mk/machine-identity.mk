@@ -14,7 +14,8 @@ test-machine-identity: $(AIEN_MID_TEST)
 
 # ARGUS adapter: with RX_ARGUS_MACHINE_ID set, ARGUS stamps the canonical id into
 # its events (checked in the summary); a malformed one keeps ARGUS from starting.
-# Needs the ARGUS/aienos sources (see ARGUS_REPO, AIENOS_LOCK_REPO); not in CI.
+# Builds against the ARGUS and aienos sources of argus.lock and aienos.lock, taken from
+# kernel/ (see ARGUS_REPO, AIENOS_LOCK_REPO); not in CI.
 .PHONY: test-machine-identity-argus
 test-machine-identity-argus: $(AIEN_MID_TEST)
 	@$(MAKE) --no-print-directory $(ARGUS_R7)

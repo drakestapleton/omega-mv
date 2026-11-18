@@ -29,11 +29,15 @@ sh build-efi.sh BOOTX64.EFI ff17a936719049af35c793860d246003170ade526bc8da4a421b
 `build-efi.sh` writes `target x86efi`, concatenates the twenty sources in the verified order, pipes
 them to the pinned compiler, prints the compiler and output digests, and exits 65 when the digest
 does not match the one you passed. The twenty sources are **not on main**: they are on aienux
-`feat/allen-imac-competition` (`d4ffde3c`), so point `ALLEN_SRC` at a checkout of that branch. On the
-`d4ffde3c` sources with compiler `c99eda24…` it reproduces `ff17a936…` exactly.
+`feat/allen-imac-competition` (`d4ffde3c`), a side branch the fold into omega-mv did not bring
+(`kernel/MIGRATION.md`), so point `ALLEN_SRC` at a directory holding them. The script carries the
+sha256 of each at `d4ffde3c` and refuses (NOT_RUN, exit 3) any source that is missing or differs;
+`native/omega/allen` here differs in six of them. On the `d4ffde3c` sources with compiler
+`c99eda24…` it reproduces `ff17a936…` exactly.
 
-`build-efi.sh` exit status: 0 written, 64 the compiler refused (nothing published), 65 digest
-mismatch, 66 missing sources, 69 no `OMEGA_COMPILER`, 73 `$out` already exists.
+`build-efi.sh` exit status: 0 written, 3 NOT_RUN (a source missing or not the `d4ffde3c` one),
+64 the compiler refused (nothing published), 65 digest mismatch, 69 no `OMEGA_COMPILER`, 73 `$out`
+already exists.
 
 `imac-image` exit status: 0 written, 2 input open, 3 input empty, 4 output open, 5 truncate,
 **10 the EFI is larger than the ESP data area** (191497 clusters, about 98 MB), 6 sync, 7 close

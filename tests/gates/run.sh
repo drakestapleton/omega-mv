@@ -20,11 +20,14 @@
 # evidence-immutable.yml, crumb.yml). Manifests under tests/gates/ name this script plus one
 # step word, so no manifest needs shell expansion (ADR 0028 P6).
 #
-# Pinned sibling sources. The hosted jobs checked out aien-spark/physics at physics.lock,
+# Pinned sources. The hosted jobs checked out aien-spark/physics at physics.lock,
 # aien-dev/aienux at aienos.lock and aien-dev/aienux at
 # argus.lock, as physics-src/, aienos-src/ and aienos-argus/ next to the Makefile, and exclude
-# them from git status. Here the same commits are materialised under build/pins/ (build/ is
-# gitignored) from the sibling local clones ../physics and ../aienos, offline.
+# them from git status. Here physics is materialised under build/pins/ (build/ is gitignored)
+# from the sibling local clone ../physics, offline. Aienux is folded into this repository as
+# kernel/ (Drake 2026-11-17): the aienos.lock sources are materialised from the kernel/ of the
+# commit kernel/import/commit-map gives the locked one, and proven, by tools/aienos_lock_source.sh;
+# the Makefile takes the argus.lock sources the same way. No sibling aienux checkout is read.
 set -euo pipefail
 # Reviewer 2026-11-15 (P1032): an inherited MAKEFLAGS (e.g. -i/-k) or MAKEFILES (e.g. a file with .IGNORE:) would let a failing gate pass; gates run with a clean make.
 unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEFILES
@@ -70,8 +73,23 @@ pin() {
 # the Makefile's check-physics-lock refuses any other commit, so a literal here goes red on
 # the next lock bump (it did for the e95e3ed bump, omega#508, and again for 048e5f5, omega#523).
 physics_pin() { pin physics-src physics "$(lock physics.lock)"; export PHYSICS_DIR="$PINS/physics-src"; }
-aienos_pin()  { pin aienos-src aienos "$(lock aienos.lock)"; export AIENOS_R7_DIR="$PINS/aienos-src"; export AIENOS_COMMIT="$(lock aienos.lock)"; }
-argus_pin()   { pin aienos-argus aienos "$(lock argus.lock)"; export ARGUS_REPO="$PINS/aienos-argus"; }
+# kernel_pin <dir-name> <lock file> <subpath>...: the aienux commit the lock names, from this
+# repository's kernel/, materialised and proven under build/pins/<dir-name>. Exit 3 when this
+# clone cannot give it (no commit map row or no history); exit 1 when the pin differs from it.
+kernel_pin() {
+  local name="$1" sha rc=0
+  sha="$(lock "$2")"; shift 2
+  mkdir -p "$PINS"
+  ( flock -x 9
+    AIENOS_LOCK="$sha" AIENOS_LOCK_REPO= AIENOS_R7_DIR= bash tools/aienos_lock_source.sh materialize "$PINS/$name" "$@"
+  ) 9>"$PINS/.$name.lock" || rc=$?
+  if [ "$rc" = 2 ]; then echo "run.sh: aienux $sha is not available from kernel/ here (kernel/import/commit-map, full history)" >&2; exit 3; fi
+  [ "$rc" = 0 ] || { echo "run.sh: build/pins/$name differs from aienux $sha; delete it" >&2; exit 1; }
+  obs "pin_${name//-/_}" "\"$sha\""
+}
+# Every subpath a build reads under AIENOS_R7_DIR (Makefile, mk/allen.mk).
+aienos_pin()  { unset AIENOS_LOCK_REPO; kernel_pin aienos-src aienos.lock native/capability native/kernel/svc native/kernel/core native/argus native/store; export AIENOS_R7_DIR="$PINS/aienos-src"; export AIENOS_COMMIT="$(lock aienos.lock)"; }
+argus_pin()   { unset ARGUS_REPO; }
 export OMEGA_CANDIDATE_COMMIT="$(git rev-parse HEAD)"
 
 # receipt <file name or glob> <grep pattern>...: the hosted "Show ... receipt" steps.

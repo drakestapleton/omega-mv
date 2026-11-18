@@ -26,8 +26,8 @@
 # gate summary goes to stdout.
 #
 # Steps (all make / test runs wrapped in `flock $BENCH_LOCK`):
-#   0. the Aienux capability library, rebuilt from `git archive` of the commit in
-#      aienos.lock (AIENOS_REPO, default ~/workspace/aienos-repo), as
+#   0. the Aienux capability library, rebuilt from tools/aienos_lock_source.sh materialize of the commit in
+#      aienos.lock (this repository's kernel/, or AIENOS_REPO), as
 #      tools/effect_cap64_receipt.sh and CI do; its identity goes into the receipt
 #   1. physics-free omega binary (build/q8r) + physics-free Visor suites and link checks
 #   2. runtime-linked suites test-visor-world, test-visor-authority (pinned library)
@@ -60,7 +60,9 @@ for a in "$@"; do
     esac
 done
 
-AIENOS_REPO=${AIENOS_REPO:-$HOME/workspace/aienos-repo}
+# Empty: this repository, where aienux is kernel/ and kernel/import/commit-map gives the
+# rewritten commit of the locked one (tools/aienos_lock_source.sh); else a repository holding it.
+AIENOS_REPO=${AIENOS_REPO:-}
 PHYSICS_DIR=${PHYSICS_DIR:-$HOME/workspace/physics-r13}
 BENCH_LOCK=${BENCH_LOCK:-$HOME/workspace/.argus-bench.lock}
 OUT=build/q8r
@@ -101,8 +103,10 @@ physics_pin=$(awk 'NF && $1 !~ /^#/ {print $1; exit}' physics.lock)
 physics_head=$(git -C "$PHYSICS_DIR" rev-parse HEAD 2>/dev/null || echo missing)
 [ "$physics_head" = "$physics_pin" ] || REASONS+=("physics checkout $PHYSICS_DIR at $physics_head != physics.lock $physics_pin")
 
-aienos_src_tree=$(git -C "$AIENOS_REPO" rev-parse "$aienos_pin:native/capability" 2>/dev/null || echo missing)
-if git -C "$AIENOS_REPO" archive "$aienos_pin" native/capability | tar -x -C "$Q/aienos" &&
+aienos_lock_src() { AIENOS_LOCK="$aienos_pin" AIENOS_LOCK_REPO="$AIENOS_REPO" AIENOS_R7_DIR= bash tools/aienos_lock_source.sh "$@"; }
+aienos_id=$(aienos_lock_src identity 2>/dev/null)
+aienos_src_tree=$(git -C "$(printf %s "$aienos_id" | jq -r .repo)" rev-parse "$(printf %s "$aienos_id" | jq -r .commit_tree):native/capability" 2>/dev/null || echo missing)
+if aienos_lock_src materialize "$Q/aienos" native/capability &&
    flock "$BENCH_LOCK" make -C "$Q/aienos/native/capability" > "$LOGS/aienos-lib.log" 2>&1; then
     lib_ok=1
 else
@@ -328,7 +332,7 @@ body=$(cat <<EOF
   "tree_stable_during_run": $stable,
   "physics_commit": "$physics_pin",
   "physics": {"lock": "$physics_pin", "checkout": "$(json_str "$PHYSICS_DIR")", "checkout_head": "$physics_head"},
-  "aienos": {"lock": "$aienos_pin", "source": "git archive $aienos_pin native/capability (tree $aienos_src_tree)", "header_sha256": $hdr_sha, "lib_sha256": $lib_sha, "lib_built": $([ "$lib_ok" -eq 1 ] && echo true || echo false),
+  "aienos": {"lock": "$aienos_pin", "source": "tools/aienos_lock_source.sh materialize $aienos_pin native/capability (tree $aienos_src_tree)", "header_sha256": $hdr_sha, "lib_sha256": $lib_sha, "lib_built": $([ "$lib_ok" -eq 1 ] && echo true || echo false),
     "used_by": "test-visor-authority (VISOR_AUTH_CAP_LIB) and every make run (AIENOS_R7_DIR)"},
   "host": {"uname_m": "$(uname -m)", "uname_r": "$(uname -r)", "product_name": "$(json_str "$product")"},
   "hardware_scope": "host-only: no GPU/silicon claim; no QEMU claim by the Visor (the pre-existing test-m5 gate runs its own QEMU check)",
