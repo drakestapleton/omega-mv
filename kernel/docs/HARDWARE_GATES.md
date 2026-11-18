@@ -50,7 +50,7 @@ To add a physical PASS: run the attended procedure under its own authorization, 
 receipt under `evidence/` with the `HWGATE <id> PHYSICAL PASS` line plus source commit, image
 digest, machine identity and commands, then change the row. The gate refuses the row change when
 no tracked receipt under `evidence/` holds that line or when the receipt's folder does not record
-the row's source commit. It reads nothing else of the receipt: a receipt holding only those two
+the row's source commit. It reads no other field of the receipt: a receipt holding just those two
 passes it. The image digest, machine identity, commands and what
 [`hardware-gates-needs.tsv`](hardware-gates-needs.tsv) asks for are checked by the operator run
 instead: the register is listed in [`tools/gate-anchors.txt`](../../tools/gate-anchors.txt), so a row

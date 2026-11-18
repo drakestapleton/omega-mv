@@ -58,7 +58,8 @@ GATE=OMEGA-GATE-ANCHOR
 ME=tools/gate_anchor.sh
 LIST=tools/gate-anchors.txt
 SELF=$(realpath -e -- "${BASH_SOURCE[0]}") || { echo "GATE-ANCHOR NOT_RUN: cannot resolve the path of this script"; exit 3; }
-# Every control, by name; each must run and give its expected exit (asserted, not only printed).
+# The controls, by name. The run fails unless the controls that pass are this list, once each
+# (compared, not just printed).
 CONTROLS="untouched base-advanced edited deleted renamed-out mode-changed type-changed added-in-folder
 list-entry-dropped list-deleted script-edited bad-entry staged worktree-edit worktree-mode
 untracked-in-folder ack-exact ack-subset ack-superset ack-without-change git-dir-knob replace-ref

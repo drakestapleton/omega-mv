@@ -168,8 +168,8 @@ for r in $(awk -F '\t' '!/^#/ && NF == 7 && $6 != "-" {print $6}' "$REG" | sort 
   fi
 done
 if [ "$bad" = 0 ]; then echo "PASS receipts are tracked regular files under evidence/"; pass "receipts tracked"; else fail=1; fi
-# evidence/ and import/ are additions only, against the base ref, the import and every commit after
-# it, index and work tree included (tools/evidence_immutable.sh, which runs its own controls first)
+# kernel/evidence and kernel/import through tools/evidence_immutable.sh, which runs its controls first;
+# its header lists the changes that fail, each with its control.
 # Against a base ref without kernel/ there is no reviewed kernel/ to compare with: NOT_RUN, not a pass.
 kbase=${AIEN_BASE_REF:-origin/main}
 if ! kb=$(git rev-parse --verify -q "$kbase^{commit}") || ! git cat-file -e "$kb:kernel" 2> /dev/null; then
