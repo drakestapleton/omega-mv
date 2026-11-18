@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <time.h>
+#include <dirent.h>
 
 static int qfd = -1, outfd, infd, errors, published, reported, retained;
 static pid_t qp = -1, child = -1;
@@ -27,17 +28,83 @@ static const char *scenario;
 static int result_code = -1;
 static void die(const char *s) { perror(s); exit(2); }
 static void check(int b, const char *s) { if (!b) { fprintf(stderr,"FAIL %s: %s\n",scenario,s); errors++; } }
+/* Waits have no deadline. The old 3 s poll read a candidate or QEMU that was only descheduled as the
+ * end of its stream. A peer that exits closes its end (EOF or EPIPE), so only a live peer that never
+ * answers keeps a wait going: every 30 s of that prints an ALARM line, and the gate timeout ends it. */
 static int exact(int fd, void *p, size_t n, int writing)
 {
     size_t done = 0;
+    unsigned waited = 0;
     while (done < n) {
         struct pollfd f = {fd, writing ? POLLOUT : POLLIN, 0};
-        if (poll(&f,1,3000) != 1) return -1;
+        int k = poll(&f,1,1000);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0) return -1;
+        if (k == 0) {
+            if (++waited % 30 == 0)
+                fprintf(stderr,"ALARM %s: %u s waiting on the %s, still waiting\n",scenario,waited,fd==qfd?"QEMU qtest socket":"candidate");
+            continue;
+        }
         ssize_t r = writing ? write(fd,(char *)p+done,n-done) : read(fd,(char *)p+done,n-done);
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return -1;
         done += (size_t)r;
+        waited = 0;
     }
     return 0;
+}
+/* QEMU mode. QEMU's NVMe model finishes a read on its own threads (the block layer's thread pool, then
+ * bottom halves on the main loop), so how many register reads the driver makes before a completion
+ * lands depends on host scheduling. The driver polls a fixed 256 times (omega_nvme.om ready and
+ * submit: transport polls, not a time budget); at load average 25 to 30 a starved QEMU thread let that
+ * run out on a healthy disk (result 12, DMA retained, 1 of 40 runs). Before each read the driver
+ * makes, wait until QEMU is idle: every thread asleep (S) in two reads of /proc with no thread run in
+ * between. The emulated device then completes before the next read whatever the load; the driver's
+ * own timeout and DMA retention are the C-model cases (timeout, readytimeout, cfs), not QEMU's. */
+static int qemu_snapshot(unsigned long long *ran, unsigned *threads)
+{
+    char path[320], buf[512];  /* d_name is at most 255 bytes */
+    snprintf(path,sizeof path,"/proc/%ld/task",(long)qp);
+    DIR *d = opendir(path);
+    if (!d) {
+        fprintf(stderr,"NOT_RUN %s: cannot read %s to tell when QEMU is idle\n",scenario,path);
+        exit(3);
+    }
+    int asleep = 1; struct dirent *e;
+    *ran = 0; *threads = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        unsigned long long ns = 0, slices = 0;
+        snprintf(path,sizeof path,"/proc/%ld/task/%s/stat",(long)qp,e->d_name);
+        FILE *f = fopen(path,"r");
+        if (!f) { asleep = 0; continue; }  /* a thread that just exited: read again */
+        size_t k = fread(buf,1,sizeof buf-1,f); fclose(f); buf[k] = 0;
+        char *s = strrchr(buf,')');
+        if (!s || s[1] != ' ' || s[2] != 'S') asleep = 0;
+        snprintf(path,sizeof path,"/proc/%ld/task/%s/schedstat",(long)qp,e->d_name);
+        f = fopen(path,"r");
+        if (!f) {
+            if (access(path,F_OK) == 0) { asleep = 0; continue; }
+            fprintf(stderr,"NOT_RUN %s: no %s (thread run times) to tell when QEMU is idle\n",scenario,path);
+            closedir(d); exit(3);
+        }
+        if (fscanf(f,"%llu %*u %llu",&ns,&slices) != 2) asleep = 0;
+        fclose(f);
+        *ran += ns + slices; (*threads)++;
+    }
+    closedir(d);
+    return asleep && *threads > 0;
+}
+static void qemu_settle(void)
+{
+    struct timespec nap = {0,50000};
+    unsigned long long a, b; unsigned na, nb;
+    for (unsigned long tries = 1;; tries++) {
+        if (qemu_snapshot(&a,&na) && qemu_snapshot(&b,&nb) && a == b && na == nb) return;
+        if (tries % 200000 == 0)
+            fprintf(stderr,"ALARM %s: QEMU not idle after %lu checks, still waiting\n",scenario,tries);
+        nanosleep(&nap,NULL);
+    }
 }
 static void cleanup(void)
 {
@@ -88,12 +155,17 @@ static void start_qemu(void)
     }
     struct sockaddr_un sa={.sun_family=AF_UNIX}; strcpy(sa.sun_path,socketpath);
     struct timespec nap={0,10000000};
-    for (int i=0;i<300;i++) {
+    /* No deadline (was 300 tries, 3 s): wait while QEMU runs; an exited QEMU ends the wait. */
+    for (unsigned tries=1;;tries++) {
         qfd=socket(AF_UNIX,SOCK_STREAM,0);
+        if (qfd<0) die("socket");
         if (connect(qfd,(struct sockaddr *)&sa,sizeof sa)==0) break;
-        close(qfd); qfd=-1; nanosleep(&nap,NULL);
+        close(qfd); qfd=-1;
+        int st=0;
+        if (waitpid(qp,&st,WNOHANG)==qp) { qp=-1; fprintf(stderr,"QEMU exited (status %d) before its qtest socket opened\n",st); exit(2); }
+        if (tries%3000==0) fprintf(stderr,"ALARM %s: QEMU qtest socket not open after %u tries, still waiting\n",scenario,tries);
+        nanosleep(&nap,NULL);
     }
-    if (qfd<0) die("QEMU qtest socket");
     /* virt ECAM, bus0/dev1/function0. PCI binding is verifier setup, not .om NVMe logic. */
     uint64_t ecam=0x4010008000ull;
     check((qt("readl 0x%llx",(unsigned long long)ecam)&0xffff)==0x1b36,"QEMU NVMe vendor");
@@ -116,6 +188,7 @@ static uint64_t access_rpc(uint64_t op,uint64_t addr,uint64_t val)
         check(!(op==5 || (op==3 && addr==0x10000014)), "uncertain DMA is not zeroed/reset/reopened");
     }
     if (qfd>=0) {
+        if (op==1 || op==2) qemu_settle();
         if (op==1) return qt("readl 0x%llx",(unsigned long long)addr);
         if (op==2) return qt("readq 0x%llx",(unsigned long long)addr);
         if (op==3) return qt("writel 0x%llx 0x%llx",(unsigned long long)addr,(unsigned long long)val);
@@ -155,6 +228,7 @@ static void payload(uint64_t addr,uint64_t n)
     if (n>8192) die("payload bound");
     uint8_t b[8192];
     if (qfd>=0) {
+        qemu_settle();
         for (uint64_t i=0;i<n;i+=4) {
             uint32_t v=(uint32_t)qt("readl 0x%llx",(unsigned long long)(addr+i));
             for (uint64_t j=0;j<4 && i+j<n;j++) b[i+j]=(uint8_t)(v>>(j*8));
