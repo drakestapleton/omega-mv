@@ -101,6 +101,19 @@ doubled with a manifest or without a reason, its own manifest removed, and an or
 | --- | --- | --- |
 | `zero-disk-secrets` | REPLACED; not run as its own gate | Omega-mv's always-run OMEGA-ZERO-DISK-SECRETS (`tests/gates/run.sh zero-disk-secrets`) looks for the same name pattern, `.env*`, in every tracked path and every untracked file of the whole checkout except `./.git` and `./build`. Aienux's step (`kernel/tests/gates/run.sh zero-disk-secrets`, still there) looked only in `kernel/`, to depth 4, and skipped `.git`, `target/` and `vendor/` at any depth, so everything it caught the root step catches. The controls in `omega_gate_wiring.sh --self-test` run the root step on a scratch repository with a `.env` file planted under `kernel/`: untracked at its top, tracked in a suite, at depth 6, under `vendor/` and under `target/`; each must FAIL, and the same repository without the plant must pass. |
 
+### Run once, 2026-11-18
+
+At `58191635c` (with the root runner's `kernel-*` and `kernel-gate-wiring` arms of kernel/fix2-gates
+applied), each step in a fresh clone through `tests/gates/run.sh <step>`, on an AArch64 Linux host at load
+15 to 42. Exit 0: `kernel` (all six), `kernel-gate-wiring`, and the kernel steps ck-gate-selftest,
+ck-hold-selftest, ck-owner-keys, crypto-boundary, native-capability, native-sig, native-crypto,
+native-argus, native-net, native-disk, native-m5, store-native, infer-crate, ck-stage-tests, disk-qemu,
+ck-b7b-probe, ck-qemu-gates (59 minutes) and verify-all (24 minutes). Exit 1, failing closed as they did
+in aienux: infer-forward (its model file is not on that host) and ck-qemu-external (`ALLEN_MODEL`,
+`LOCAL_MODEL_WEIGHTS` and `LOCAL_MODEL_TOKENIZER` unset). verify-all failed once beside a concurrent
+ck-qemu-gates: `scripts/test_trust1_measurement_tools.sh` picks a random swtpm port and got "Address
+already in use"; it passed alone. A run is an observation of that commit, not a qualification.
+
 ## What the fold changes for the kernel's own checks
 
 - `scripts/native_package.sh` and `scripts/native_package_test.sh` (`make test`'s `package-test`) assumed
