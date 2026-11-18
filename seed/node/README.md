@@ -1376,7 +1376,7 @@ L="seed/node/transport.om seed/node/pool.om seed/node/super.om seed/node/sched.o
 { printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/tool-replay.om; } | seed/out/omc > build/node/tool-replay
 { printf 'om2\n'; cat seed/json/json.om seed/node/tests/drv.om seed/node/tests/drv-test.om; } | seed/out/omc > build/node/drv-test
 chmod +x build/node/infer build/node/tool build/node/code-main build/node/code-test build/node/tool-replay build/node/drv-test
-build/node/code-test unit build/node/cu   # "code checks=59 fail=0", exit 0
+build/node/code-test unit build/node/cu   # "code checks=60 fail=0", exit 0
 build/node/drv-test /tmp/dvt   # "DRV-TEST pass=40 fail=0 not_run=0", exit 0
 build/node/tool-replay build/node/tool OMC40 ROUND40 build/node/replay   # "TOOL-REPLAY runs=108 pass=108 fail=0 actions=417", exit 0
 ```
@@ -1459,7 +1459,7 @@ env -u OMC ~/work/omega-node-run.sh build/node/qual /tmp/node-qualification
 
 Do not execute a compiler's output when that compilation failed. `HOME` locates
 `work/omega-node-e5b3/seed/out/omc`, `handoffs/tool-omega-20261104/round40`, and
-`.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean`. The round40 compiler is
+`.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean`. The 108-run tool replay requires the original Round40 selection. The view and release scenarios use the four recorded control cases from this checkout. The round40 compiler is
 an input to tool-adapter checks, never the compiler of the qualification driver
 or the Node programs. `build/node/release` and `build/node/tool-replay` must
 already exist. Optional seeded `build/node/view-accept` and
@@ -1650,7 +1650,7 @@ only, so a `\r` makes a line fall outside the grammar where Python's
 
 ### Acceptance and controls
 
-`code-test unit` (59 checks, no child process) feeds crafted model and tool
+`code-test unit` (60 checks, no child process) feeds crafted model and tool
 records to the creator: the round40 prompts byte for byte; every action in
 every state; wrong path; old text absent, twice, many times; an edit outside
 the grammar; `Tests passed.` unverified or after an edit; `File not found.`
@@ -2025,8 +2025,7 @@ restart an objective with a RESULT is reported again (`CWO` with the same
 result and turns) and never resumed: a failure is final, as in DRA-290,
 and an objective that ended UNKNOWN (21) cannot issue its effect again. The
 journal refuses a second RESULT for an objective, result 0 and an index
-past 63 (25) before writing. A result the journal refused is still printed;
-that objective resumes after a restart.
+past 63 (25) before writing. If the journal refuses the result, the creator emits no completion for that objective, stops admission and exits 58 after cleanup. Recovery uses the committed journal.
 
 An inference worker that dies while it holds a job: inference is class 2
 (no external effect), so `au_lost` records it not performed (DONE how 6),
