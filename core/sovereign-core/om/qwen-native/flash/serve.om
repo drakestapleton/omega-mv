@@ -1,0 +1,599 @@
+note flash-serve 38 MODEL_DIR PORT KEYFILE [SLOTS]: one Flash-Next text model behind HTTP/1.1 on 127.0.0.1.
+note Writes `PORT n` to stderr once the model is loaded and the socket listens.
+note   GET /health                 200 application/json
+note   POST /v1/chat/completions   messages, max_tokens (default 256, at most 1024), stream; Authorization: Bearer KEY
+note One request at a time. Each request is a fresh sequence. Greedy decoding, reasoning off.
+text snhealth "/health"
+text snchat "/v1/chat/completions"
+text sget "GET"
+text spost "POST"
+text sjson "application/json"
+text sctype "Content-Type"
+text sauth "authorization"
+text sbearer "Bearer "
+text shealth "{\"status\":\"ok\",\"model\":\"qwen3.8-flash-next-fp8\",\"engine\":\"omega\"}"
+text skmsg "messages"
+text skrole "role"
+text skcontent "content"
+text skmax "max_tokens"
+text skstream "stream"
+text sims "<|im_start|>"
+text sime "<|im_end|>\n"
+text sgen "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+text sport "PORT "
+text sc0 "{\"id\":\"flash-next\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3.8-flash-next-fp8\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+text sc1 "\"},\"finish_reason\":null}]}"
+text sf0 "{\"id\":\"flash-next\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3.8-flash-next-fp8\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\""
+text sf1 "\"}],\"usage\":{\"prompt_tokens\":"
+text sstop "stop"
+text slength "length"
+text su1 ",\"completion_tokens\":"
+text su2 ",\"total_tokens\":"
+text su3 "},\"timings\":{\"first_token_ms\":"
+text su4 ",\"decode_ms\":"
+text su5 ",\"expert_loads\":"
+text su6 ",\"expert_evictions\":"
+text su7 "}}"
+text sdone "[DONE]"
+text sm0 "{\"id\":\"flash-next\",\"object\":\"chat.completion\",\"model\":\"qwen3.8-flash-next-fp8\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""
+text sm1 "\"},\"finish_reason\":\""
+global skey uchar 160
+note sreq: 0 max tokens, 1 stream, 2 rendered bytes, 3 start ns, 4 first-token ns, 5 end ns, 6 completion tokens, 7 stopped at end of turn, 8 key bytes.
+global sreq ulong 9
+global sacc uchar 4096
+global saccn ulong 1
+
+fn sputc c uchar to bool
+n = get sreq 2
+if ge n len input
+r = enlarge input add mul 2 n 4096
+if lt r 0
+ret false
+end
+end
+put input n c
+put sreq 2 add n 1
+ret true
+end
+
+fn sputs t view uchar * to bool
+for i ulong len t
+if not sputc get t i
+ret false
+end
+end
+ret true
+end
+
+note Value token of member name in object obj, or jsnone.
+fn sfind src view uchar 1048576 tape edit uint 262160 obj ulong name view uchar * to ulong
+if ne js_type tape obj jsobj
+ret jsnone
+end
+k = js_first tape obj
+while ne k jsnone bound 4096
+if js_streq src js_off tape k name
+ret add k 1
+end
+k = js_mnext tape k
+end
+ret jsnone
+end
+
+fn smessage src view uchar 1048576 tape edit uint 262160 m ulong txt edit uchar 1048576 to bool
+r = sfind src tape m skrole
+c = sfind src tape m skcontent
+if or eq r jsnone eq c jsnone
+ret false
+end
+if or ne js_type tape r jsstr ne js_type tape c jsstr
+ret false
+end
+n = js_sget src js_off tape r txt
+if or le n 0 gt n 16
+ret false
+end
+ok = sputs sims
+for i ulong ulong n
+ch = get txt i
+if or lt ch 97 gt ch 122
+ret false
+end
+ok = and ok sputc ch
+end
+ok = and ok sputc 10
+n = js_sget src js_off tape c txt
+if lt n 0
+ret false
+end
+for i ulong ulong n
+ok = and ok sputc get txt i
+end
+ret and ok sputs sime
+end
+
+note Parse the request body of nb bytes and render the chat into the tokenizer input. False refuses the request.
+fn srender src view uchar 1048576 tape edit uint 262160 nb ulong txt edit uchar 1048576 to bool
+put sreq 0 256
+put sreq 1 0
+put sreq 2 0
+if lt js_init tape nb 32 0
+ret false
+end
+if lt js_parse src tape nb 0
+ret false
+end
+v = sfind src tape 0 skmax
+if ne v jsnone
+if ne js_type tape v jsnum
+ret false
+end
+if not js_isu src js_off tape v
+ret false
+end
+mx = js_tou src js_off tape v
+if or eq mx 0 gt mx 1024
+ret false
+end
+put sreq 0 mx
+end
+v = sfind src tape 0 skstream
+if ne v jsnone
+if eq js_type tape v jstrue
+put sreq 1 1
+end
+end
+v = sfind src tape 0 skmsg
+if eq v jsnone
+ret false
+end
+if or ne js_type tape v jsarr eq js_nkids tape v 0
+ret false
+end
+m = js_first tape v
+while ne m jsnone bound 4096
+if not smessage src tape m txt
+ret false
+end
+m = js_enext tape m
+end
+ret sputs sgen
+end
+
+fn sdec b edit uchar 8192 p ulong v ulong to ulong
+d = new uchar 20 0
+i = ulong 20
+x = v
+for it ulong 20
+i = sub i 1
+put d i uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+q = p
+for k ulong sub 20 i
+put b q get d add i k
+q = add q 1
+end
+ret q
+end
+
+fn scat b edit uchar 8192 p ulong t view uchar * to ulong
+for i ulong len t
+put b add p i get t i
+end
+ret add p len t
+end
+
+note JSON string escape of one byte into b at p.
+fn sesc b edit uchar 8192 p ulong c uchar to ulong
+if or eq c 34 eq c 92
+put b p 92
+put b add p 1 c
+ret add p 2
+end
+if ge c 32
+put b p c
+ret add p 1
+end
+put b p 92
+put b add p 1 117
+put b add p 2 48
+put b add p 3 48
+put b add p 4 hhexd shr ulong c 4
+put b add p 5 hhexd and ulong c 15
+ret add p 6
+end
+
+note Bytes at the start of sacc that end on a UTF-8 character boundary.
+fn swhole to ulong
+n = get saccn 0
+back = ulong 0
+while and lt back 4 lt back n bound 4
+c = get sacc sub sub n 1 back
+if lt c 128
+ret n
+end
+if ge c 192
+need = ulong 2
+if ge c 224
+need = ulong 3
+end
+if ge c 240
+need = ulong 4
+end
+if ge add back 1 need
+ret n
+end
+ret sub sub n 1 back
+end
+back = add back 1
+end
+ret n
+end
+
+fn stoken id ulong to void
+if ge id len sizes
+ret
+end
+w = ulong get sizes id
+n = get saccn 0
+if gt add n w len sacc
+ret
+end
+o = get starts id
+for j ulong w
+c = get spelling add o j
+put sacc add n j c
+end
+put saccn 0 add n w
+end
+
+note Drop the first k bytes of sacc.
+fn sdrop k ulong to void
+n = get saccn 0
+for j ulong sub n k
+put sacc j get sacc add k j
+end
+put saccn 0 sub n k
+end
+
+note Usage and timing members shared by both response forms, appended to b at p.
+fn susage b edit uchar 8192 p ulong to ulong
+count = get qnids 0
+made = get sreq 6
+q = sdec b p count
+q = scat b q su1
+q = sdec b q made
+q = scat b q su2
+q = sdec b q add count made
+q = scat b q su3
+q = sdec b q div sub get sreq 4 get sreq 3 1000000
+q = scat b q su4
+q = sdec b q div sub get sreq 5 get sreq 4 1000000
+q = scat b q su5
+q = sdec b q get qecfg 4
+q = scat b q su6
+q = sdec b q get qecfg 5
+ret scat b q su7
+end
+
+fn sreason b edit uchar 8192 p ulong to ulong
+if eq get sreq 7 1
+ret scat b p sstop
+end
+ret scat b p slength
+end
+
+note One streamed content event from the whole characters now in sacc.
+fn sevent cs edit ulong 320 io edit uchar 131072 ev edit uchar 8192 to long
+k = swhole
+if eq k 0
+ret 0
+end
+if gt k 1024
+k = 1024
+end
+q = scat ev 0 sc0
+for j ulong k
+q = sesc ev q get sacc j
+end
+q = scat ev q sc1
+sdrop k
+r = hssedat cs io view part ev 0 q
+ret hfe r hsseend cs io
+end
+
+note sst: 0 current token, 1 escaped text bytes gathered in txt.
+global sst ulong 2
+fn sprefill to void
+count = get qnids 0
+put sreq 3 ulong monons
+put sreq 6 0
+put sreq 7 0
+put saccn 0 0
+put sst 1 0
+id = ulong 0
+for j ulong count
+id = qtoken ulong get qids j j eq add j 1 count
+end
+put sst 0 id
+put sreq 4 ulong monons
+end
+
+fn sgather ev edit uchar 8192 txt edit uchar 1048576 to bool
+k = get saccn 0
+n = get sst 1
+if gt add n mul k 6 len txt
+ret false
+end
+q = ulong 0
+for i ulong k
+q = sesc ev q get sacc i
+end
+for i ulong q
+put txt add n i get ev i
+end
+put sst 1 add n q
+put saccn 0 0
+ret true
+end
+
+note Prefill the prompt, then decode. With stream set each token is sent as it is made; otherwise text gathers in txt.
+fn sdecode cs edit ulong 320 io edit uchar 131072 ev edit uchar 8192 txt edit uchar 1048576 to long
+sprefill
+count = get qnids 0
+for j ulong get sreq 0
+id = get sst 0
+if or eq id 248044 eq id 248046
+put sreq 7 1
+break
+end
+put sreq 6 add j 1
+stoken id
+if eq get sreq 1 1
+r = sevent cs io ev
+if lt r 0
+ret r
+end
+else
+if not sgather ev txt
+ret HEBIG
+end
+end
+if lt add j 1 get sreq 0
+put sst 0 qtoken id add count j true
+end
+end
+put sreq 5 ulong monons
+ret long get sst 1
+end
+
+fn sfinish cs edit ulong 320 io edit uchar 131072 ev edit uchar 8192 to long
+q = scat ev 0 sf0
+q = sreason ev q
+q = scat ev q sf1
+q = susage ev q
+r = hssedat cs io view part ev 0 q
+r = hfe r hsseend cs io
+r = hfe r hssedat cs io sdone
+r = hfe r hsseend cs io
+ret hfe r hwfin cs io
+end
+
+fn swhole1 cs edit ulong 320 io edit uchar 131072 ev edit uchar 8192 txt edit uchar 1048576 n ulong to long
+q = scat ev 0 sm1
+q = sreason ev q
+q = scat ev q sf1
+q = susage ev q
+r = hrspst cs io 200
+r = hfe r hhname cs io sctype
+r = hfe r hhval cs io sjson
+r = hfe r hhend cs io 0 add add len sm0 n q
+r = hfe r hput cs io sm0
+r = hfe r hput cs io view part txt 0 n
+r = hfe r hput cs io view part ev 0 q
+ret hfe r hwfin cs io
+end
+
+fn sauthorized cs edit ulong 320 io edit uchar 131072 to bool
+i = hhfind cs io sauth
+if lt i 0
+ret false
+end
+o = hhvoff cs ulong i
+n = hhvlen cs ulong i
+kn = get sreq 8
+if ne n add len sbearer kn
+ret false
+end
+diff = ulong 0
+for j ulong len sbearer
+diff = or diff ulong xor get io add o j get sbearer j
+end
+for j ulong kn
+diff = or diff ulong xor get io add add o len sbearer j get skey j
+end
+ret eq diff 0
+end
+
+fn schat cs edit ulong 320 io edit uchar 131072 body edit uchar 1048576 tape edit uint 262160 to long
+txt = new uchar 1048576 0
+ev = new uchar 8192 0
+if not sauthorized cs io
+ret hrspempty cs io 401
+end
+put cs HBCAP 1048576
+nb = hbodyall cs io body
+if lt nb 0
+if eq nb HEBIG
+ret hrsperr cs io 413
+end
+ret hrsperr cs io 400
+end
+if not srender body tape ulong nb txt
+ret hrsperr cs io 400
+end
+put qnids 0 0
+encodeinput get sreq 2
+count = get qnids 0
+if or eq count 0 gt add count sub get sreq 0 1 2048
+ret hrsperr cs io 413
+end
+if eq get sreq 1 1
+r = hrspsse cs io
+if lt r 0
+ret r
+end
+r = sdecode cs io ev txt
+if lt r 0
+ret r
+end
+r = sevent cs io ev
+ret sfinish cs io ev
+end
+r = sdecode cs io ev txt
+if lt r 0
+ret hrsperr cs io 500
+end
+ret swhole1 cs io ev txt ulong r
+end
+
+fn shealthy cs edit ulong 320 io edit uchar 131072 to long
+r = hrspst cs io 200
+r = hfe r hhname cs io sctype
+r = hfe r hhval cs io sjson
+r = hfe r hhend cs io 0 len shealth
+r = hfe r hput cs io shealth
+ret hfe r hwfin cs io
+end
+
+fn sroute cs edit ulong 320 io edit uchar 131072 body edit uchar 1048576 tape edit uint 262160 to long
+if hispath cs io snhealth
+if hismeth cs io sget
+ret shealthy cs io
+end
+ret hrspempty cs io 405
+end
+if hispath cs io snchat
+if hismeth cs io spost
+ret schat cs io body tape
+end
+ret hrspempty cs io 405
+end
+ret hrspempty cs io 404
+end
+
+fn sserve lf int cs edit ulong 320 io edit uchar 131072 body edit uchar 1048576 tape edit uint 262160 to void
+c = haccept lf 30000000000
+if lt c 0
+ret
+end
+r = hinit cs io int c 1
+if lt r 0
+x = hclose cs
+ret
+end
+hsettmo cs 10000000000 10000000000
+hsetbdl cs 3600000000000
+for k ulong 100
+r = hreqrd cs io
+if le r 0
+if lt r 0
+x = hreject cs io r
+end
+break
+end
+r = sroute cs io body tape
+if lt r 0
+break
+end
+if eq hnext cs io 0
+break
+end
+end
+r = hclose cs
+end
+
+fn skeyload to bool
+path = new uchar 4096 0
+n = argread 4 path 0 4095
+if le n 0
+ret false
+end
+fd = fopen path 0 ulong n 0 0
+if lt fd 0
+ret false
+end
+r = read int fd skey 0 160
+x = fclose int fd
+if lt r 16
+ret false
+end
+k = ulong r
+while gt k 0 bound 160
+c = get skey sub k 1
+if and ne c 10 ne c 13
+break
+end
+k = sub k 1
+end
+if or lt k 16 ge k 160
+ret false
+end
+put sreq 8 k
+ret true
+end
+
+fn main to int
+cs = new ulong 320 0
+io = new uchar 131072 0
+body = new uchar 1048576 0
+tape = new uint 262160 0
+a = new uchar 16 0
+if or lt argcnt 5 gt argcnt 6
+ret 2
+end
+if ne qnumericarg 1 38
+ret 2
+end
+port = qnumericarg 3
+if or lt port 1024 gt port 65535
+ret 2
+end
+slots = ulong 8320
+if eq argcnt 6
+slots = qnumericarg 5
+if or lt slots 16 gt slots 26624
+ret 2
+end
+end
+if not skeyload
+ret 2
+end
+put qecfg 1 slots
+loadmodel
+if ne get qtidentity 0 27
+qwfail 59
+end
+unicodeinit
+qwload 2 48
+qprofile 48
+put qrun 0 38
+qgpuopen
+r = haddr4 a 2130706433 port
+lf = hlisten a 16
+if lt lf 0
+ret 3
+end
+w = write 2 sport 0 len sport
+fstatnum hport a
+nl = new uchar 1 10
+w = write 2 nl 0 1
+while true
+sserve int lf cs io body tape
+end
+ret 0
+end
