@@ -1671,7 +1671,9 @@ spinlock-mutant: $(addprefix $(OUT)/host/test_spinlock_mutant_,$(SPIN_MUTANTS)) 
 # the release. tools/ck_spinlock_asm_check.sh reads the dumps; its --selftest mutates them (mask removed, orders
 # swapped, stores and loads moved to other fields) and requires each to FAIL by its own rule. Needs the cross
 # compilers and objdump: without them it prints CK_SPINLOCK_ASM: NOT_RUN and exits 3. Gate: tests/gates/run.sh
-# spinlock (not "make test").
+# spinlock (not "make test"). core/pipe.c is built a second time with -O0 added, where pool_lock and pool_unlock stay
+# calls: its lock calls per function must equal the reviewed table tools/ck_spinlock_pipe_locks.tsv, and the -O2
+# masks and releases per function must agree with that table [ctl:OMEGA-KERNEL-SPINLOCK/asm-pipe-c-o0-lock-pair-removed].
 spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(KDIR)/core/pipe.c $(SPIN_DEPS)
 	@for t in $(KCC) $(X86CC) $(CROSS)objdump $(X86_CROSS)objdump; do command -v $$t >/dev/null || \
 	  { echo "CK_SPINLOCK_ASM: NOT_RUN ($$t not installed)"; exit 3; }; done
@@ -1679,11 +1681,13 @@ spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(KDIR)/core/pipe.c $(SPIN_DEPS)
 	$(KCC) $(KCFLAGS) -c -o $(OUT)/spinlock-asm/a64.o $<
 	$(X86CC) $(X86CFLAGS) -c -o $(OUT)/spinlock-asm/x86.o $<
 	$(KCC) $(KCFLAGS) -c -o $(OUT)/spinlock-asm/pipe-a64.o $(KDIR)/core/pipe.c
+	$(KCC) $(KCFLAGS) -O0 -c -o $(OUT)/spinlock-asm/pipe-a64-O0.o $(KDIR)/core/pipe.c
 	$(CROSS)objdump -drt $(OUT)/spinlock-asm/a64.o > $(OUT)/spinlock-asm/a64.dis
 	$(X86_CROSS)objdump -drt $(OUT)/spinlock-asm/x86.o > $(OUT)/spinlock-asm/x86.dis
 	$(CROSS)objdump -drt $(OUT)/spinlock-asm/pipe-a64.o > $(OUT)/spinlock-asm/pipe-a64.dis
-	@bash $(REPO)/tools/ck_spinlock_asm_check.sh $(addprefix $(OUT)/spinlock-asm/,a64.dis x86.dis pipe-a64.dis)
-	@bash $(REPO)/tools/ck_spinlock_asm_check.sh --selftest $(addprefix $(OUT)/spinlock-asm/,a64.dis x86.dis pipe-a64.dis)
+	$(CROSS)objdump -drt $(OUT)/spinlock-asm/pipe-a64-O0.o > $(OUT)/spinlock-asm/pipe-a64-O0.dis
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh $(addprefix $(OUT)/spinlock-asm/,a64.dis x86.dis pipe-a64.dis pipe-a64-O0.dis)
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh --selftest $(addprefix $(OUT)/spinlock-asm/,a64.dis x86.dis pipe-a64.dis pipe-a64-O0.dis)
 
 # DRA-556: proofs/TicketLock.lean, Lean 4 model of core/spinlock.h (ticket arithmetic, queue invariant, interrupt
 # ordering of both forms on one and two CPUs). Core Lean only, toolchain pinned in proofs/lean-toolchain.
@@ -1692,10 +1696,11 @@ spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(KDIR)/core/pipe.c $(SPIN_DEPS)
 # (otherwise lean never runs the file); lean compiles it as module TicketLock with no warning or error;
 # leanchecker replays every constant of the .olean through the kernel; every constant it declares uses only
 # propext, Classical.choice and Quot.sound and none is an axiom or unsafe; and those constants (names, kinds, type
-# and definition hashes, theorem statements) equal proofs/TicketLock.pins. --selftest runs proofs/controls/ (12
-# bad edits: the review's #eval that adds an unchecked theorem of False, `True := trivial` statements, a changed
-# definition, an extra theorem, axiom, admit, native_decide, macro, set_option, run_tac, attribute) and requires each
-# to FAIL by the rules it names, five also with the syntax rule off. Without lean or leanchecker, or with a lean
+# and definition hashes, theorem statements) equal proofs/TicketLock.pins. --selftest runs proofs/controls/ (as many
+# bad edits as proofs/controls/COUNT says, 15: the review's #eval that adds an unchecked theorem of False, `True :=
+# trivial` statements, a changed definition, an extra theorem, axiom, admit, native_decide, macro, set_option,
+# run_tac, attribute, and the forged-pin decoy names A1, A1b and A2 of the review of 5cd0af98f) and requires each to
+# FAIL by the rules it names, eight also with the syntax rule off, plus two controls of the pins comparison. Without lean or leanchecker, or with a lean
 # other than the pinned one: CK_TICKETLOCK_PROOF: NOT_RUN, exit 3. Gate: tests/gates/run.sh spinlock (not "make
 # test": Lean is not a build dependency).
 ticketlock-proof:

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include "ck_test.h"
@@ -33,6 +34,132 @@ static int expect(int ok, const char *file, int line, const char *what)
         printf("  FAIL %s:%d: %s\n", file, line, what);
     }
     return ok;
+}
+
+/* ---- deadlock alarm (review of omega-mv 5cd0af98f, LeanSpin finding 4: with a leaked or doubled pool lock this test
+ * hung and printed nothing) ----
+ * A watchdog thread reads the pool lock's ticket and serving counters once a second (atomic loads; core/spinlock.h
+ * writes them atomically). When neither moved for TP_STALL_S seconds it prints "test_pipe: FAIL deadlock: ..." and
+ * exits 1. The cases here take the pool lock many times a second, so a pause that long means a hang. It is an alarm,
+ * not a cap: a run that keeps taking the lock goes on as long as it needs. main first runs two controls of the alarm
+ * in child processes, a lock taken and not released (review S2) and one release more than taken (review S7), and
+ * requires each child to end with exit 1 and that line [ctl:OMEGA-KERNEL-MAKE-TEST/test-pipe-leaked-lock]. */
+#define TP_STALL_S 5
+static int tp_watch_stop;
+
+static void *tp_watchdog(void *arg)
+{
+    struct ck_spinlock *l = arg;
+    uint32_t lt = 0, ls = 0;
+    int still = -1;
+    while (!__atomic_load_n(&tp_watch_stop, __ATOMIC_ACQUIRE)) {
+        sleep(1);
+        uint32_t t = __atomic_load_n(&l->ticket, __ATOMIC_RELAXED);
+        uint32_t sv = __atomic_load_n(&l->serving, __ATOMIC_RELAXED);
+        still = still >= 0 && t == lt && sv == ls ? still + 1 : 0;
+        lt = t;
+        ls = sv;
+        if (still >= TP_STALL_S) {
+            printf("test_pipe: FAIL deadlock: the pool lock did not move for %d s (ticket %u, serving %u: %s)\n", TP_STALL_S,
+                   (unsigned)t, (unsigned)sv,
+                   t != sv ? "taken and not released"
+                           : "free, so a waiter holds a ticket the serving count passed, or the test hangs elsewhere");
+            fflush(stdout);
+            _exit(1);
+        }
+    }
+    return 0;
+}
+
+/* One control child: the pool lock leaked (extra_unlock 0) or released twice (1), then a pool op, which must hang
+ * until the alarm ends the child. Its stdout goes to *out. */
+static pid_t tp_control_start(int extra_unlock, FILE **out)
+{
+    fflush(stdout);
+    *out = tmpfile();
+    if (!*out)
+        return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (dup2(fileno(*out), STDOUT_FILENO) < 0)
+            _exit(2);
+        ck_pipe_pool_init(&pool, 0);
+        pthread_t wd;
+        if (pthread_create(&wd, 0, tp_watchdog, &pool.lock) != 0)
+            _exit(2);
+        if (extra_unlock) {
+            (void)ck_pipe_pool_empty(&pool);
+            ck_spin_unlock(&pool.lock);
+        } else {
+            ck_spin_lock(&pool.lock);
+        }
+        (void)ck_pipe_pool_empty(&pool);
+        printf("test_pipe control: the pool op returned\n");
+        fflush(stdout);
+        _exit(0);
+    }
+    return pid;
+}
+
+static void tp_lock_controls(void)
+{
+    static const char *const what[2] = { "leaked-lock", "double-unlock" };
+    FILE *out[2] = { 0, 0 };
+    pid_t pid[2];
+    int st[2] = { 0, 0 }, done[2] = { 0, 0 }, late = 0;
+    for (int i = 0; i < 2; i++)
+        pid[i] = tp_control_start(i, &out[i]);
+    /* The parent's own alarm: a child the deadlock alarm has not ended after 4 * TP_STALL_S s fails its control. */
+    struct timespec t0, now, nap = { 0, 100000000L };
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        for (int i = 0; i < 2; i++) {
+            int w = 0;
+            if (pid[i] > 0 && !done[i] && waitpid(pid[i], &w, WNOHANG) == pid[i]) {
+                st[i] = w;
+                done[i] = 1;
+            }
+        }
+        if ((done[0] || pid[0] <= 0) && (done[1] || pid[1] <= 0))
+            break;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - t0.tv_sec > 4 * TP_STALL_S) {
+            late = 1;
+            for (int i = 0; i < 2; i++)
+                if (pid[i] > 0 && !done[i]) {
+                    kill(pid[i], SIGKILL);
+                    waitpid(pid[i], &st[i], 0);
+                }
+            break;
+        }
+        nanosleep(&nap, 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        char line[256] = "", got[256] = "";
+        if (out[i]) {
+            rewind(out[i]);
+            while (fgets(line, sizeof line, out[i]))
+                if (!strncmp(line, "test_pipe: FAIL deadlock: ", 26))
+                    memcpy(got, line, sizeof got);
+        }
+        int ok = pid[i] > 0 && done[i] && WIFEXITED(st[i]) && WEXITSTATUS(st[i]) == 1 && got[0];
+        if (ok) {
+            /* without the child's "test_pipe: FAIL" prefix: the mutant targets look for that text in this log */
+            printf("test_pipe control %s: FAILS as required, the child printed: %s", what[i], got + 16);
+            printf("CONTROL OMEGA-KERNEL-MAKE-TEST/test-pipe-%s FAILED_AS_REQUIRED\n", what[i]);
+        } else {
+            printf("test_pipe control %s: the deadlock alarm did not end the child (pid %d, %s, status %d)\n", what[i],
+                   (int)pid[i], late && !done[i] ? "killed after 4 x TP_STALL_S s" : "ended", st[i]);
+            if (out[i]) {
+                rewind(out[i]);
+                while (fgets(line, sizeof line, out[i]))
+                    printf("  child: %s", line);
+            }
+        }
+        expect(ok, __FILE__, __LINE__, "deadlock alarm control");
+        if (out[i])
+            fclose(out[i]);
+    }
 }
 
 /* ---- fixture runner ---- */
@@ -1277,6 +1404,9 @@ int main(int argc, char **argv)
 {
     _Static_assert(CK_PIPE_CAPACITY >= 65536u, "section 8.5 minimum");
     CHECK(osh_err_label(OSH_E_WOULD_BLOCK)[0] == 'W' && !strcmp(osh_err_label(99), "IO"));
+    tp_lock_controls();
+    pthread_t wd;
+    CHECK(pthread_create(&wd, 0, tp_watchdog, &pool.lock) == 0);
     run_fixtures(argc > 1 ? argv[1] : PIPE_FIXTURE_DIR);
     test_transfers();
     test_revoke_midstream(0);
@@ -1292,5 +1422,7 @@ int main(int argc, char **argv)
     test_concurrent();
     pthread_cond_destroy(&host.cv);
     pthread_mutex_destroy(&host.mu);
+    __atomic_store_n(&tp_watch_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(wd, 0);
     return ck_t_verdict("test_pipe");
 }

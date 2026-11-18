@@ -883,6 +883,10 @@ scheduler; BROKEN_PIPE with no reader; a write after revoke refused with 0 bytes
 read succeeding afterwards; a closed handle STALE after its slot is reused; an unknown op and another ABI version NOT_SUPPORTED;
 cancel INTERRUPTED once with no byte moved. Host test `test_pipe` (the 20-case corpus in `tests/fixtures/pipe/` plus the
 scheduler transfers, also under ASan+UBSan); a mutant that skips the write-right check must fail it (`make pipe-mutant`).
+A watchdog thread fails `test_pipe` with `test_pipe: FAIL deadlock` when the pool lock's ticket and serving counters have
+not moved for 5 s (an alarm, not a cap); before its cases `test_pipe` runs two controls of it in child processes, a lock
+taken and not released and a second release, and requires each child to end that way (2026-11-18, review of omega-mv
+5cd0af98f, LeanSpin finding 4) [ctl:OMEGA-KERNEL-MAKE-TEST/test-pipe-leaked-lock].
 `ck_pipe_dispatch` copies the caller's slice through a kernel bounce buffer (at most `CK_PIPE_BOUNCE` = 1024 bytes per call) and
 never touches it with the pool lock held; a window ending above `CK_PIPE_USER_TOP` is INVALID_ARG (aienux#494). Host
 `test_pipe` puts the slice on a page that faults on first touch and checks the pool lock is free at the fault; the mutants
@@ -926,21 +930,40 @@ with its `_nomask` forms because the iMac drawing cores keep interrupts on for T
   checks, on the fields they name: mask before the ticket atomic, acquire load after it, releasing store to serving before
   the restore, the state restored is the one saved; for `l->irq`, stored after the acquire load and loaded before the
   releasing store; at every lock site of pipe.c, the same rules (the check prints how many masks, release sites and
-  restores it found). `--selftest` mutates the dumps and requires each mutant to FAIL by the rule it targets. Without a cross compiler:
-  NOT_RUN, exit 3.
+  restores it found). `--selftest` mutates the dumps and requires each mutant to FAIL by the rule it targets. Lock calls per
+  function (2026-11-18, review of omega-mv 5cd0af98f, LeanSpin finding 2): `core/pipe.c` is also built with `-O0`, where
+  `pool_lock` and `pool_unlock` stay calls, and its calls to `pool_lock`, `pool_unlock`, `ck_spin_*` and `ck_irq_*` per
+  caller must equal the reviewed table `tools/ck_spinlock_pipe_locks.tsv`
+  [ctl:OMEGA-KERNEL-SPINLOCK/asm-pipe-c-o0-lock-pair-removed]. In the `-O2` build a function has as many masks as the
+  table's `pool_lock` calls for it, and from one up to as many releasing stores as its `pool_unlock` calls
+  [ctl:OMEGA-KERNEL-SPINLOCK/asm-pipe-c-o2-lock-moved-to-another-function]. The review's source mutants S1 (the lock pair
+  of `ck_stream_close` removed), S2 (an unlock of `ck_pipe_revoke` dropped) and S7 (a second unlock in
+  `ck_pipe_pool_empty`) fail it; a change of the lock calls in pipe.c needs a reviewed change of the table, a gate anchor
+  (`tools/gate-anchors.txt`). Not checked: that each path through a function releases the lock it took (`test_pipe`'s
+  deadlock alarm sees a leaked or doubled lock at run time). Without a cross compiler: NOT_RUN, exit 3.
 - `make ticketlock-proof` (Lean 4 v4.35.0, `proofs/TicketLock.lean`, checked by `proofs/check.sh`): from acquire, trylock and
   release alone, the outstanding tickets are serving..ticket-1 and only the oldest enters (mutual exclusion, FIFO, across the
   2^32 wrap); the interrupt ordering in a one-CPU model, and on two CPUs under every interleaving with an interrupt
   transition, for both forms (the `l->irq` form included), each mutant unsafe. These are proofs about the listed operation
   orders, not about spinlock.h as compiled (the asm check covers that link). Not modelled: memory ordering, more than two
-  CPUs or one interrupt per CPU, trylock outside the queue invariant. `proofs/check.sh` passes the file only when the source
-  has no banned word, Lean's parser finds only the syntax kinds allowlisted in `proofs/TicketLock.syntax` (no #eval,
-  set_option, macro, attribute or import; otherwise lean never runs the file), lean compiles it with no warning or error,
-  leanchecker replays every constant through the kernel, every constant uses only propext, Classical.choice and
-  Quot.sound, and every constant with its type, definition body and theorem statement equals `proofs/TicketLock.pins`
-  (so the GATED statements of 221i cannot be weakened, and no declaration outside the reviewed source passes). Its
-  `--selftest` requires the 12 bad edits in `proofs/controls/` to FAIL (2026-11-18, review of omega-mv c9e503afd finding
-  2: the #eval that adds an unchecked theorem of False, and `True := trivial` statements). Without lean or with another
+  CPUs or one interrupt per CPU, trylock outside the queue invariant. `proofs/check.sh` passes the file when the source has
+  no banned word, Lean's parser finds no syntax kind missing from the allowlist `proofs/TicketLock.syntax` (no #eval,
+  set_option, macro, attribute or import; with such a kind lean does not run the file), lean compiles it with no warning or
+  error, leanchecker replays each constant of the module through the kernel, the constants use no axiom other than
+  propext, Classical.choice and Quot.sound, `proofs/checker/Inspect.lean` refuses no name (it prints a name whose parts are
+  ASCII letters, digits, _ ' ! ? and refuses the others, such as the review's names holding a tab, a newline and a forged
+  pin record), and the constants (names, kinds, types, definition bodies, theorem statements) equal
+  `proofs/TicketLock.pins` with no name twice and as many constants as pin lines
+  [ctl:OMEGA-KERNEL-SPINLOCK/ticketlock-a1-forged-pin]. So a weaker statement of 221i, or a declaration not in the
+  reviewed source, passes only together with an edit of `proofs/TicketLock.pins`
+  [ctl:OMEGA-KERNEL-SPINLOCK/ticketlock-true-trivial-all]. Such an edit (the review's A3: `slot_safe` given a hypothesis
+  False and the pins regenerated with `--print-pins`) shows in the diff, and `proofs/TicketLock.pins`,
+  `proofs/TicketLock.syntax`, `proofs/check.sh`, `proofs/checker/` and `proofs/controls/` are gate anchors listed in
+  `tools/gate-anchors.txt`, so the anchor check reports GATE-ANCHOR CHANGED for it and a reviewer must accept the pin
+  change. Its `--selftest` requires the 15 bad edits in `proofs/controls/` (the number `proofs/controls/COUNT` pins) to
+  FAIL: among them the #eval that adds an unchecked theorem of False and `True := trivial` statements (2026-11-18, review
+  of omega-mv c9e503afd finding 2), and the decoy names A1, A1b and A2 (review of 5cd0af98f, LeanSpin finding 1); two more
+  controls give the pins comparison a name listed twice. Without lean or with another
   version: NOT_RUN, exit 3.
 - Rows 221c and 221d were hand runs. Since the 2026-11-17 review fixes, `tests/gates/run.sh spinlock` (omega-mv:
   `tests/gates/run.sh kernel-spinlock`, part of `tests/gates/run.sh kernel`) runs both with their controls and its own

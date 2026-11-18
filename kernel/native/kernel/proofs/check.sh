@@ -20,6 +20,15 @@
 #              extra), kinds, elaborated types (sha256 of Lean's repr), definition bodies (sha256) and
 #              theorem statements (pretty-printed). A changed statement, a changed definition a statement
 #              uses, or a declaration that did not come from the reviewed source fails here.
+#   Rule names (run with the constants rule): checker/Inspect.lean prints a module constant's name only when
+#              its string components are ASCII letters, digits, _ ' ! ? and none starts with a digit, and it
+#              prints a CK_REFUSED line instead for each other module constant; each CK_REFUSED line fails the
+#              rule [ctl:OMEGA-KERNEL-SPINLOCK/ticketlock-a1-forged-pin]. A name with a tab or a newline
+#              inside it (review of omega-mv 5cd0af98f, LeanSpin finding 1) is refused that way.
+#   The pins rule also fails a name listed twice by checker/Inspect.lean or pinned twice, and a number of
+#              constants other than the number of pin lines [ctl:OMEGA-KERNEL-SPINLOCK/ticketlock-cmp-duplicate-name].
+#              The pins are reviewed text: an edit of proofs/TicketLock.pins, TicketLock.syntax, this script
+#              or checker/ is a gate-anchor change (tools/gate-anchors.txt), and it needs review.
 # Each broken rule prints "FAIL <rule>: ...". Last line CK_TICKETLOCK_PROOF: PASS (exit 0), FAIL (exit 1), or
 # NOT_RUN (exit 3: no lean or leanchecker, or a lean other than the pinned one; never a pass).
 # proofs/check.sh --print-pins FILE.lean: the pin lines of FILE (after the lean, kernel and constants rules
@@ -28,13 +37,43 @@
 #   "expect:" line names: a .lean control is appended to a copy of FILE, a .sed control is a sed script run
 #   on a copy (it must change it). A control with an "expect-unrestricted:" line is run again with the
 #   syntax rule off (check.sh --control-unrestricted, whose last line is CK_TICKETLOCK_PROOF_CONTROL, never
-#   the PASS line) and must FAIL with those rules too, so the later rules catch it on their own. Last line
-#   CK_TICKETLOCK_PROOF_SELFTEST: PASS|FAIL.
+#   the PASS line) and must FAIL with those rules too, so the later rules catch it on their own. Each control
+#   that fails as required prints CONTROL OMEGA-KERNEL-SPINLOCK/ticketlock-<name>[-unrestricted]
+#   FAILED_AS_REQUIRED (<name> is the file name without its suffix, _ written as -). The number of controls
+#   and of unrestricted runs must equal proofs/controls/COUNT. Last line
+#   CK_TICKETLOCK_PROOF_SELFTEST: PASS|FAIL (N controls, M also with the syntax rule off).
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 usage="usage: proofs/check.sh [--selftest | --print-pins] FILE.lean"
 # The caller's environment does not choose what lean loads or which toolchain elan runs.
 unset LEAN_PATH LEAN_SYSROOT LEAN_SRC_PATH LEAN_CC ELAN_TOOLCHAIN
+
+fail=0
+no() { echo "FAIL $1: $2"; fail=1; }
+# pins_diff WANT NOW NDECL: one line per difference between the pin lines WANT (proofs/TicketLock.pins) and NOW
+# (from checker/Inspect.lean, which counted NDECL constants). Names are compared as whole tab-separated fields.
+pins_diff() {
+    local nw nh
+    cut -f2 "$2" | LC_ALL=C sort | LC_ALL=C uniq -d | sed 's/^/name listed twice by checker\/Inspect.lean: /'
+    cut -f2 "$1" | LC_ALL=C sort | LC_ALL=C uniq -d | sed 's/^/name pinned twice in proofs\/TicketLock.pins: /'
+    nw=$(wc -l < "$1"); nh=$(wc -l < "$2")
+    [[ $nh == "$nw" && $3 == "$nw" ]] || echo "count: constants $3, pin lines made $nh, pinned $nw"
+    awk -F'\t' '
+        NR == FNR { w[$2] = $0; wk[$2] = $1; wt[$2] = $3; wv[$2] = $4; ws[$2] = $5; next }
+        { h[$2] = $0; hk[$2] = $1; ht[$2] = $3; hv[$2] = $4; hs[$2] = $5 }
+        END {
+            for (n in w) if (!(n in h)) print "missing " n " (pinned " wk[n] ")"
+            for (n in h) if (!(n in w)) print "extra " hk[n] " " n " (not in proofs/TicketLock.pins)"
+            for (n in h) if ((n in w) && w[n] != h[n]) {
+                d = ""
+                if (wk[n] != hk[n]) d = d " kind " wk[n] "->" hk[n]
+                if (wt[n] != ht[n]) d = d " type"
+                if (wv[n] != hv[n]) d = d " value"
+                if (ws[n] != hs[n]) d = d " statement now: " hs[n]
+                print "changed " n ":" d
+            }
+        }' "$1" "$2" | LC_ALL=C sort
+}
 
 if [[ "${1:-}" == "--selftest" ]]; then
     src=$(realpath "${2:?$usage}"); t=$(mktemp -d); bad=0; n=0; nu=0
@@ -49,6 +88,7 @@ if [[ "${1:-}" == "--selftest" ]]; then
             echo "NEG FAIL: $name has no expect line"; bad=1
         elif [[ $rc == 1 && -z "$miss" ]] && grep -qx "$last: FAIL" "$t/$name.$sfx"; then
             echo "NEG PASS: $name${flag:+ ($flag)} caught by:$(printf ' %s' "$@")"
+            echo "CONTROL OMEGA-KERNEL-SPINLOCK/ticketlock-${name//_/-}${flag:+-unrestricted} FAILED_AS_REQUIRED"
         else
             cat "$t/$name.$sfx"; echo "NEG FAIL: $name${flag:+ ($flag)} exit $rc, rules not reporting it:${miss:- (none)}"; bad=1
         fi
@@ -70,8 +110,28 @@ if [[ "${1:-}" == "--selftest" ]]; then
             expect "$name" --control-unrestricted unrestricted CK_TICKETLOCK_PROOF_CONTROL $u
         fi
     done
-    [[ $n -ge 12 ]] || { echo "NEG FAIL: $n controls in $here/controls, expected at least 12"; bad=1; }
-    [[ $nu -ge 3 ]] || { echo "NEG FAIL: $nu unrestricted controls, expected at least 3"; bad=1; }
+    cnt() { awk -v k="$1" '$1 == k { print $2 }' "$here/controls/COUNT" 2> /dev/null; }
+    [[ $n == "$(cnt controls)" ]] || { echo "NEG FAIL: $n controls in $here/controls, proofs/controls/COUNT says '$(cnt controls)'"; bad=1; }
+    [[ $nu == "$(cnt unrestricted)" ]] || { echo "NEG FAIL: $nu unrestricted runs, proofs/controls/COUNT says '$(cnt unrestricted)'"; bad=1; }
+    # Comparison controls (LeanSpin finding 1): checker/Inspect.lean refuses the names that made a forged line, so
+    # these give pins_diff the lists such a line made: a second slot_safe line (the forged pinned record after a
+    # weakened one) in the constants, and a pin line written twice. Each must report the duplicate and the count.
+    grep -v '^#' "$here/TicketLock.pins" | sed '/^$/d' > "$t/cmp.want"
+    nw=$(wc -l < "$t/cmp.want")
+    awk -F'\t' -v OFS='\t' '$2 == "slot_safe" { print $1, $2, "0", $4, "True" } { print }' "$t/cmp.want" > "$t/cmp.dupname"
+    awk '{ print } NR == 1 { print }' "$t/cmp.want" > "$t/cmp.dupwant"
+    for c in duplicate-name:"$t/cmp.want $t/cmp.dupname $((nw + 1))":"name listed twice by checker/Inspect.lean: slot_safe" \
+             duplicate-pin:"$t/cmp.dupwant $t/cmp.want $nw":"name pinned twice in proofs/TicketLock.pins: "; do
+        IFS=: read -r cn args want <<< "$c"
+        # shellcheck disable=SC2086
+        out=$(pins_diff $args)
+        if grep -qF "$want" <<< "$out" && grep -q '^count: ' <<< "$out"; then
+            echo "NEG PASS: comparison $cn caught by: pins ($want; count)"
+            echo "CONTROL OMEGA-KERNEL-SPINLOCK/ticketlock-cmp-$cn FAILED_AS_REQUIRED"
+        else
+            echo "$out"; echo "NEG FAIL: comparison $cn not reported"; bad=1
+        fi
+    done
     echo "CK_TICKETLOCK_PROOF_SELFTEST: $([[ $bad == 0 ]] && echo PASS || echo FAIL) ($n controls, $nu also with the syntax rule off)"
     exit $bad
 fi
@@ -95,8 +155,6 @@ LEAN=$prefix/bin/lean; CHECKER=$prefix/bin/leanchecker
 [[ -x $CHECKER ]] || notrun "no leanchecker in the pinned toolchain ($CHECKER)"
 export PATH="$prefix/bin:$PATH"
 
-fail=0
-no() { echo "FAIL $1: $2"; fail=1; }
 t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
 finish() {
     [[ $fail == 0 ]] && { echo "$last: PASS"; exit 0; }
@@ -162,6 +220,11 @@ rc=0; (cd "$here" && LEAN_PATH="$t/build" "$LEAN" --run checker/Inspect.lean Tic
 ndecl=$(grep -c '^CK_DECL	' "$t/inspect.out" || true)
 [[ $rc == 0 ]] && grep -qx "CK_DECLS $ndecl" "$t/inspect.out" && [[ $ndecl -ge 1 ]] ||
     { head -n 20 "$t/inspect.err"; no constants "checker/Inspect.lean exit $rc, $ndecl constants"; }
+while IFS=$'\t' read -r _ dn why; do no names "$dn: $why"; done < <(grep '^CK_REFUSED	' "$t/inspect.out")
+while IFS= read -r l; do no constants "checker/Inspect.lean printed an unexpected line: ${l:0:200}"; done \
+    < <(grep -vE '^(CK_DECL	|CK_REFUSED	|CK_DECLS [0-9]+$)' "$t/inspect.out" | head -n 20)
+while IFS= read -r l; do no constants "a CK_DECL line has $l tab-separated fields, not 7"; done \
+    < <(awk -F'\t' '$1 == "CK_DECL" && NF != 7 { print NF }' "$t/inspect.out" | head -n 20)
 std='^(propext|Classical\.choice|Quot\.sound)$'
 : > "$t/pins.now"
 while IFS=$'\t' read -r tag kind name axs type value stmt; do
@@ -183,21 +246,7 @@ fi
 # pins: the module's constants against proofs/TicketLock.pins (kind, name, type sha256, value sha256, statement).
 grep -v '^#' "$here/TicketLock.pins" | sed '/^$/d' > "$t/pins.want"
 [[ -s $t/pins.want ]] || no pins "proofs/TicketLock.pins has no pin lines"
-awk -F'\t' '
-    NR == FNR { w[$2] = $0; wk[$2] = $1; wt[$2] = $3; wv[$2] = $4; ws[$2] = $5; next }
-    { h[$2] = $0; hk[$2] = $1; ht[$2] = $3; hv[$2] = $4; hs[$2] = $5 }
-    END {
-        for (n in w) if (!(n in h)) print "missing " n " (pinned " wk[n] ")"
-        for (n in h) if (!(n in w)) print "extra " hk[n] " " n " (not in proofs/TicketLock.pins)"
-        for (n in h) if ((n in w) && w[n] != h[n]) {
-            d = ""
-            if (wk[n] != hk[n]) d = d " kind " wk[n] "->" hk[n]
-            if (wt[n] != ht[n]) d = d " type"
-            if (wv[n] != hv[n]) d = d " value"
-            if (ws[n] != hs[n]) d = d " statement now: " hs[n]
-            print "changed " n ":" d
-        }
-    }' "$t/pins.want" "$t/pins.now" | sort > "$t/pins.diff"
+pins_diff "$t/pins.want" "$t/pins.now" "$ndecl" > "$t/pins.diff"
 while IFS= read -r l; do no pins "$l"; done < "$t/pins.diff"
 
 echo "constants $ndecl, pinned $(wc -l < "$t/pins.want"), pin differences $(wc -l < "$t/pins.diff"), lean $have"

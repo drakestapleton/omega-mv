@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ck_spinlock_asm_check.sh A64.dis X86.dis PIPE_A64.dis -- reads `objdump -drt` of native/kernel/tests/spinlock_tu.c
+# ck_spinlock_asm_check.sh A64.dis X86.dis PIPE_A64.dis PIPE_A64_O0.dis -- reads `objdump -drt` of native/kernel/tests/spinlock_tu.c
 # built freestanding for aarch64 and x86-64, and of native/kernel/core/pipe.c built for the aarch64 kernel (make
 # spinlock-asm-check, DRA-556). It follows each function's registers (symbol or argument + offset, and where each
 # value came from: the saved DAIF/RFLAGS, or a load from which field) and checks the orders core/spinlock.h promises
@@ -18,8 +18,23 @@
 #     target, and the register restored was the mrs value or a load from the released lock's +8 field, made before
 #     the stlr ("load or forward l->irq before the stlr"); every store of a mrs value (l->irq = f) comes after an
 #     acquire load that follows that mrs (after entry).
-# Last line: CK_SPINLOCK_ASM: PASS|FAIL. --selftest A64.dis X86.dis PIPE_A64.dis mutates the dumps (instructions
-# moved with their relocations) and requires each mutant to FAIL by the rule it targets.
+#   lock calls of core/pipe.c, per function (review of omega-mv 5cd0af98f, LeanSpin finding 2): PIPE_A64_O0.dis is
+#     core/pipe.c built for the aarch64 kernel with -O0 added, so pool_lock, pool_unlock and the core/spinlock.h
+#     functions stay calls. Its calls (bl or b) to pool_lock, pool_unlock, ck_spin_* and ck_irq_*, from the functions
+#     not named ck_spin_* or ck_irq_*, counted per caller and callee by the compiler's own output and not by reading
+#     C, must equal the reviewed table kernel/tools/ck_spinlock_pipe_locks.tsv line for line, and a reference to one
+#     of those functions other than a call fails [ctl:OMEGA-KERNEL-SPINLOCK/asm-pipe-c-o0-lock-pair-removed]. In
+#     PIPE_A64.dis (-O2, pool_lock and pool_unlock inlined) a function, its GCC clone suffix such as .part.0
+#     removed, must have as many msr daifset #3 as the table has pool_lock calls for it, and from one up to as many
+#     releasing stlr as it has pool_unlock calls (the compiler merges unlock paths); a function with no pool_unlock
+#     call in the table must have no stlr [ctl:OMEGA-KERNEL-SPINLOCK/asm-pipe-c-o2-lock-moved-to-another-function].
+#     A change of the lock calls in pipe.c needs a change of that table, which tools/gate-anchors.txt lists as a
+#     gate anchor, so it is reviewed. Not checked here: that each path through a function releases the lock it
+#     took (test_pipe's deadlock alarm sees a leaked or doubled lock at run time).
+# Last line: CK_SPINLOCK_ASM: PASS|FAIL. --selftest A64.dis X86.dis PIPE_A64.dis PIPE_A64_O0.dis mutates the dumps
+# (instructions moved with their relocations) and requires each mutant to FAIL by the rule it targets; each one that
+# does prints CONTROL OMEGA-KERNEL-SPINLOCK/asm-<name> FAILED_AS_REQUIRED (<name>: the mutant's label up to " (",
+# lower case, each run of other characters than a-z and 0-9 written as -).
 set -uo pipefail
 me=$0
 
@@ -189,6 +204,54 @@ tu() {  # tu ARCH DUMP
     lt "slot $arch: l->irq loaded before the releasing store" "${ld//[^0-9]/}" "$REL"
 }
 
+locks() {  # locks PIPE_A64.dis PIPE_A64_O0.dis: per-function lock calls of core/pipe.c against the reviewed table
+    local o2=$1 o0=$2 tab lt l
+    tab=$(dirname "${BASH_SOURCE[0]}")/ck_spinlock_pipe_locks.tsv
+    [[ -s $tab ]] || { fail_ "pipe.c locks: no table $tab"; return; }
+    lt=$(mktemp -d)
+    grep -v '^#' "$tab" | sed '/^$/d' | LC_ALL=C sort > "$lt/want"
+    awk -F'\t' '
+        /^[0-9a-f]+ <[^>]+>:$/ { f = $0; sub(/^[0-9a-f]+ </, "", f); sub(/>:$/, "", f); next }
+        /^$/ { f = "" }
+        f == "" || f ~ /^(ck_spin_|ck_irq_)/ || $0 ~ /^ +[0-9a-f]+: R_/ { next }
+        match($0, /<(pool_lock|pool_unlock|ck_spin_[A-Za-z0-9_]*|ck_irq_[A-Za-z0-9_]*)([+-]0x[0-9a-f]+)?>/) {
+            c = substr($0, RSTART + 1, RLENGTH - 2)
+            if (($3 == "bl" || $3 == "b") && c !~ /[+-]/) n[f "\t" c]++
+            else print "REF\t" f "\t" $3 " " $4
+        }
+        END { for (k in n) print k "\t" n[k] }' "$o0" | LC_ALL=C sort > "$lt/have"
+    while IFS=$'\t' read -r _ f ins; do fail_ "pipe.c locks: $f refers to a lock function other than by a call: $ins"; done < <(grep '^REF' "$lt/have")
+    grep -v '^REF' "$lt/have" > "$lt/calls"
+    if [[ ! -s $lt/calls ]]; then fail_ "pipe.c locks: no lock call found in $o0"
+    elif l=$(diff "$lt/want" "$lt/calls"); then pass_ "pipe.c locks: -O0 lock calls per function equal the table ($(wc -l < "$lt/want") caller/callee lines)"
+    else
+        while IFS= read -r d; do
+            case "$d" in "<"*) fail_ "pipe.c locks: ${d#< } is in the table, not in the -O0 build";;
+                         ">"*) fail_ "pipe.c locks: ${d#> } is in the -O0 build, not in the table";; esac
+        done <<< "$l"
+    fi
+    awk -F'\t' '
+        NR == FNR { if ($2 == "pool_lock") L[$1] = $3; if ($2 == "pool_unlock") U[$1] = $3; fn[$1] = 1; next }
+        /^[0-9a-f]+ <[^>]+>:$/ { f = $0; sub(/^[0-9a-f]+ </, "", f); sub(/>:$/, "", f)
+            sub(/\.(part|isra|constprop|cold|lto_priv)\.[0-9]+$/, "", f); fn[f] = 1; next }
+        /^$/ { f = "" }
+        f != "" && $3 == "msr" && $4 ~ /^daifset, #0x3$/ { mk[f]++ }
+        f != "" && $3 ~ /^stlr/ { rel[f]++ }
+        END {
+            for (g in fn) {
+                l = L[g] + 0; u = U[g] + 0; m = mk[g] + 0; r = rel[g] + 0
+                if (m != l) print "FAIL  pipe.c locks: " g " has " m " msr daifset #3 at -O2, the table has " l " pool_lock calls for it"
+                if (u == 0 && r > 0) print "FAIL  pipe.c locks: " g " has " r " releasing stlr at -O2, the table has no pool_unlock call for it"
+                if (u > 0 && (r < 1 || r > u)) print "FAIL  pipe.c locks: " g " has " r " releasing stlr at -O2, the table has " u " pool_unlock calls for it (want 1 to " u ")"
+                if (m || r) k++
+            }
+            print "FUNCS " k + 0
+        }' "$lt/want" "$o2" > "$lt/o2"
+    if grep -q '^FAIL' "$lt/o2"; then grep '^FAIL' "$lt/o2"; fail=1
+    else pass_ "pipe.c locks: -O2 masks and releases per function agree with the table ($(sed -n 's/^FUNCS //p' "$lt/o2") functions)"; fi
+    rm -rf "$lt"
+}
+
 pipe() {  # every lock site of core/pipe.c, aarch64
     local d=$1 f A n_mk=0 n_rel=0 n_rs=0 n_st=0 n_ad=0 n_of=0 bad=0 msg
     for f in $(sed -n 's/^[0-9a-f]* <\([^>]*\)>:$/\1/p' "$d"); do
@@ -243,7 +306,7 @@ if [[ "${1:-}" == "--annotate" ]]; then annotate "$2" "$3" "$4"; exit; fi   # --
 if [[ "${1:-}" == "--selftest" ]]; then
     # Negative controls: each mutated dump must FAIL, and by the rule named. Mutations move whole instructions with
     # their relocation and continuation lines inside one function.
-    shift; A=$1; X=$2; P=$3; t=$(mktemp -d); bad=0
+    shift; A=$1; X=$2; P=$3; Q=$4; t=$(mktemp -d); bad=0
     # mut FILE FUNC KIND PATA [PATB|FROM TO]: swap first block matching PATA with the last matching PATB; del: drop the
     # first block matching PATA; sub: replace FROM by TO in the first instruction line matching PATA; ins: insert
     # the line FROM before the first block matching PATA.
@@ -268,10 +331,12 @@ if [[ "${1:-}" == "--selftest" ]]; then
                 if (kind == "sub" && k == bs[i]) { s = l[k]; sub(pb, to, s); print s; continue }
                 print l[k] }
         }' "$1"; }
-    neg() {  # neg NAME RULE-SUBSTRING A X P (a missing file is a mutation that did not apply)
-        local f; for f in "$3" "$4" "$5"; do [[ -s $f ]] || { echo "NEG FAIL: $1: the mutation did not apply"; bad=1; return; }; done
-        if bash "$me" "$3" "$4" "$5" > "$t/out" 2>&1; then cat "$t/out"; echo "NEG FAIL: $1 not caught"; bad=1
+    neg() {  # neg NAME RULE-SUBSTRING A X P [Q] (Q defaults to the -O0 dump; a missing file is a mutation that did not apply)
+        local f q=${6:-$Q} id; for f in "$3" "$4" "$5" "$q"; do [[ -s $f ]] || { echo "NEG FAIL: $1: the mutation did not apply"; bad=1; return; }; done
+        id=$(printf '%s' "${1%% (*}" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9][^a-z0-9]*/-/g; s/^-//; s/-$//')
+        if bash "$me" "$3" "$4" "$5" "$q" > "$t/out" 2>&1; then cat "$t/out"; echo "NEG FAIL: $1 not caught"; bad=1
         elif grep -qF "CK_SPINLOCK_ASM: FAIL" "$t/out" && grep -F "FAIL  " "$t/out" | grep -qF -- "$2"; then echo "NEG PASS: $1 caught by: $2"
+            echo "CONTROL OMEGA-KERNEL-SPINLOCK/asm-$id FAILED_AS_REQUIRED"
         else cat "$t/out"; echo "NEG FAIL: $1 not caught by '$2'"; bad=1; fi; }
     sp='[[:space:]]'
     nm=0
@@ -301,12 +366,32 @@ if [[ "${1:-}" == "--selftest" ]]; then
     neg "pipe.c: mask dropped ($rf)" "has no msr daifset #3 before it" "$A" "$X" "$(m 17 "$P" "$rf" del "daifset")"
     neg "pipe.c: l->irq stored before entry ($rf)" "before any acquire load" "$A" "$X" \
         "$(m 18 "$P" "$rf" swap "${sp}ldxr$sp" "${sp}str${sp}x[0-9]+, [[]x[0-9]+, #8[]]")"
+    # Lock calls per function (LeanSpin finding 2): the review's source mutants as the -O0 dump shows them (S1 the
+    # pool_lock/pool_unlock pair of ck_stream_close removed, S2 an unlock of ck_pipe_revoke dropped, S7 a second
+    # unlock in ck_pipe_pool_empty), a lock function called through a pointer, and at -O2 the lock of
+    # ck_stream_close found in another function and a second release in ck_pipe_pool_empty.
+    neg "pipe.c -O0: lock pair removed (ck_stream_close, S1)" "pipe.c locks: ck_stream_close" "$A" "$X" "$P" \
+        "$(m 19 "$(m 20 "$Q" ck_stream_close del '<pool_lock>$')" ck_stream_close del '<pool_unlock>$')"
+    neg "pipe.c -O0: unlock dropped (ck_pipe_revoke, S2)" "pipe.c locks: ck_pipe_revoke" "$A" "$X" "$P" \
+        "$(m 21 "$Q" ck_pipe_revoke del '<pool_unlock>$')"
+    ul=$(awk '/^[0-9a-f]+ <ck_pipe_pool_empty>:$/{on=1;next} on&&/^$/{exit} on&&/\tbl\t.*<pool_unlock>$/{print; exit}' "$Q")
+    neg "pipe.c -O0: extra unlock (ck_pipe_pool_empty, S7)" "pipe.c locks: ck_pipe_pool_empty" "$A" "$X" "$P" \
+        "$(m 22 "$Q" ck_pipe_pool_empty ins '<pool_unlock>$' "$ul")"
+    neg "pipe.c -O0: lock function taken by address (ck_stream_close)" "refers to a lock function other than by a call" "$A" "$X" "$P" \
+        "$(m 23 "$Q" ck_stream_close sub '<pool_lock>$' '\tbl\t' '\tadr\tx1, ')"
+    sed 's/^\([0-9a-f]* \)<ck_stream_close>:$/\1<ck_stream_close_moved>:/' "$P" > "$t/m24"
+    cmp -s "$P" "$t/m24" && rm -f "$t/m24"
+    neg "pipe.c -O2: lock moved to another function (ck_stream_close)" "pipe.c locks: ck_stream_close" "$A" "$X" "$t/m24"
+    sl=$(awk '/^[0-9a-f]+ <ck_pipe_pool_empty>:$/{on=1;next} on&&/^$/{exit} on&&/\tstlr\t/{print; exit}' "$P")
+    neg "pipe.c -O2: second release (ck_pipe_pool_empty)" "pipe.c locks: ck_pipe_pool_empty has 2 releasing stlr" "$A" "$X" \
+        "$(m 25 "$P" ck_pipe_pool_empty ins "${sp}stlr$sp" "$sl")"
     rm -rf "$t"; echo "CK_SPINLOCK_ASM_SELFTEST: $([[ $bad == 0 ]] && echo PASS || echo FAIL)"; exit $bad
 fi
 
-[[ $# == 3 ]] || { echo "usage: $0 A64.dis X86.dis PIPE_A64.dis | --selftest A64.dis X86.dis PIPE_A64.dis"; exit 2; }
+[[ $# == 4 ]] || { echo "usage: $0 A64.dis X86.dis PIPE_A64.dis PIPE_A64_O0.dis | --selftest A64.dis X86.dis PIPE_A64.dis PIPE_A64_O0.dis"; exit 2; }
 tu a64 "$1"
 tu x86 "$2"
 pipe "$3"
+locks "$3" "$4"
 echo "CK_SPINLOCK_ASM: $([[ $fail == 0 ]] && echo PASS || echo FAIL)"
 exit $fail
