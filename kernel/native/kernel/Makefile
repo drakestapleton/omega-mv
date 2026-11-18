@@ -1687,12 +1687,17 @@ spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(KDIR)/core/pipe.c $(SPIN_DEPS)
 
 # DRA-556: proofs/TicketLock.lean, Lean 4 model of core/spinlock.h (ticket arithmetic, queue invariant, interrupt
 # ordering of both forms on one and two CPUs). Core Lean only, toolchain pinned in proofs/lean-toolchain.
-# proofs/check.sh passes it only when lean elaborates it with no warning or error, `#print axioms` of every theorem
-# and of every other constant it declares lists only propext, Classical.choice and Quot.sound, and the source has
-# no sorry/admit/native_decide/axiom; --selftest appends each proofs/controls/*.lean (axiom of False, admit,
-# native_decide, a theorem hidden in a macro) to a copy and requires each to FAIL by the rules it names. Without
-# lean, or with a lean other than the pinned one: CK_TICKETLOCK_PROOF: NOT_RUN, exit 3. Gate: tests/gates/run.sh
-# spinlock (not "make test": Lean is not a build dependency).
+# proofs/check.sh passes it only when: the source has no banned word (sorry, admit, native_decide, axiom, eval,
+# set_option, macro, import, ...); Lean's parser finds only the syntax kinds allowlisted in proofs/TicketLock.syntax
+# (otherwise lean never runs the file); lean compiles it as module TicketLock with no warning or error;
+# leanchecker replays every constant of the .olean through the kernel; every constant it declares uses only
+# propext, Classical.choice and Quot.sound and none is an axiom or unsafe; and those constants (names, kinds, type
+# and definition hashes, theorem statements) equal proofs/TicketLock.pins. --selftest runs proofs/controls/ (12
+# bad edits: the review's #eval that adds an unchecked theorem of False, `True := trivial` statements, a changed
+# definition, an extra theorem, axiom, admit, native_decide, macro, set_option, run_tac, attribute) and requires each
+# to FAIL by the rules it names, five also with the syntax rule off. Without lean or leanchecker, or with a lean
+# other than the pinned one: CK_TICKETLOCK_PROOF: NOT_RUN, exit 3. Gate: tests/gates/run.sh spinlock (not "make
+# test": Lean is not a build dependency).
 ticketlock-proof:
 	@bash $(KDIR)/proofs/check.sh $(KDIR)/proofs/TicketLock.lean
 	@bash $(KDIR)/proofs/check.sh --selftest $(KDIR)/proofs/TicketLock.lean
@@ -2448,10 +2453,12 @@ gsp-cot-test: $(GSP_COT_TOOL)
 # (MIT), cross-checks every size/flag/record, inflates the compressed descriptor with our own
 # DEFLATE decoder (CRC-32 + ISIZE trailer verified), checks UCODE_HASH == SHA-384(UCODE_IMAGE)
 # and the RM_RISCV_UCODE_DESC offsets, and writes the arrays as files. Never loads anything.
-# The driver files are optional (fetch them from the 580.173.02 tag into GSP_BINDATA_DIR);
-# when absent the pin step is NOT_RUN, the self-test still runs. docs/GB10_FIRMWARE_INVENTORY.md 3.3 and 11.
+# The driver files come from the 580.173.02 tag: by default the generated/ directory of the same
+# open-gpu-kernel-modules tree gb10-gsp-nvhdr-check reads (OGKM_DIR); when absent the pin step prints
+# NOT_RUN (the self-test still runs), and tests/gates/run.sh kernel-make-test then reports the whole step
+# NOT_RUN, exit 3, never PASS. docs/GB10_FIRMWARE_INVENTORY.md 3.3 and 11.
 GSP_BINDATA_TOOL := $(OUT)/host/ck_gsp_bindata_extract
-GSP_BINDATA_DIR ?= $(HOME)/.cache/aienos/open-gpu-kernel-modules-580.173.02
+GSP_BINDATA_DIR ?= $(OGKM_DIR)/src/nvidia/generated
 GSP_BINDATA_FMC_IMAGE_SHA256 := b13ead4b9a6b8a0d268f3094cc4f4521d6be8a9a525edbc9a8f3f397c86f1f2e
 GSP_BINDATA_BOOT_PROD_SHA256 := 427a691d8453f02548d395f40ac900eb0d5b8ea864e8f14f958eef890ba400a2
 $(GSP_BINDATA_TOOL): $(KDIR)/tools/ck_gsp_bindata_extract.c $(NATIVE)/argus/sha256.c $(NATIVE)/argus/sha256.h

@@ -115,29 +115,50 @@ omega_omc() {
   obs omc_sha256 "\"$ps\""
   obs omc_pinned true
 }
-# pin_controls: every place the kernel checks a compiler against omega-mv's pin must refuse, before
-# it compares, when the pin file is missing, empty or not 64 hex digits, or the compiler is missing
-# (before the fold an empty pin and an empty hash compared equal: review of aienux 1f12818d, finding
-# 12). omega_omc runs with AIEN_OMC unset, and each script in PIN_SCRIPTS runs from a copy in a tree
-# that has no compiler; each must exit non-zero with its refusal and write no output. Run before
-# every omega_omc.
+# pin_controls: every place the kernel checks a compiler against omega-mv's pin must reach its own
+# check and refuse for the right reason (review of aienux 1f12818d finding 12, and of omega-mv
+# c9e503afd finding 10: every control tree had no compiler, so a script refused "compiler missing"
+# before its compare, and deleting the compare passed). omega_omc runs with AIEN_OMC unset, and each
+# script in PIN_SCRIPTS from a copy in a tree, in six states. In every state but missing-compiler the
+# tree has a stand-in compiler (a script that records that it ran, then fails):
+#   missing, empty, short   pin file absent, empty, not 64 hex digits: refused with "no sha256";
+#   missing-compiler        a good pin, no compiler: refused with "no compiler at" or "pinned compiler
+#                           missing" (omega_omc: "no omc with sha256");
+#   wrong-compiler          a good pin and the stand-in, whose sha256 differs: refused with "compiler pin
+#                           mismatch" (omega_omc: "no omc with sha256"), so the compare itself refuses;
+#   matching                the pin is the stand-in's sha256: no pin refusal at all (omega_omc accepts),
+#                           so the compare accepts an equal digest and refuses only an unequal one.
+# A refusing state also needs exit non-zero, no output file and a stand-in that never ran.
 PIN_SCRIPTS="native/om/lm1b/gate.sh native/omega/allen/build-fw.sh native/omega/allen/build-one.sh
   native/omega/allen/build-local-model.sh scripts/check_local_tools.sh native/disk/tests/omega_nvme_test.sh"
 pin_controls() {
-  local c d s out rc sh_ args n=0
-  for c in missing empty short pin-without-compiler; do
+  local c d s out rc sh_ args n=0 want owant
+  for c in missing empty short missing-compiler wrong-compiler matching; do
     d="$TMP/pin-control-$c"; mkdir -p "$d/seed/out"
+    if [ "$c" != missing-compiler ]; then
+      printf '#!/bin/sh\necho ran >> "%s/RAN"\nexit 97\n' "$d" > "$d/seed/out/omc"; chmod +x "$d/seed/out/omc"
+    fi
     case "$c" in
-      empty) : > "$d/seed/out/omc.sha256" ;;
-      short) printf 'abc  seed/out/omc\n' > "$d/seed/out/omc.sha256" ;;
-      pin-without-compiler) cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256" ;;
+      missing) want='compiler pin refused: no sha256'; owant='no sha256 in' ;;
+      empty) : > "$d/seed/out/omc.sha256"; want='compiler pin refused: no sha256'; owant='no sha256 in' ;;
+      short) printf 'abc  seed/out/omc\n' > "$d/seed/out/omc.sha256"; want='compiler pin refused: no sha256'; owant='no sha256 in' ;;
+      missing-compiler) cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256"
+        want='no compiler at|pinned compiler missing'; owant='no omc with sha256' ;;
+      wrong-compiler) cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256"
+        want='compiler pin mismatch'; owant='no omc with sha256' ;;
+      matching) (cd "$d" && sha256sum seed/out/omc > seed/out/omc.sha256); want=; owant= ;;
     esac
     rc=0; out=$(OMEGA_ROOT="$d"; unset AIEN_OMC; omega_omc 2>&1) || rc=$?
-    if [ "$rc" != 3 ] || printf '%s\n' "$out" | grep -q 'omc_pinned true'; then
-      printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, accepted; it does not fail closed" >&2; exit 1
+    if [ -n "$owant" ]; then
+      if [ "$rc" != 3 ] || printf '%s\n' "$out" | grep -q 'omc_pinned true' || ! printf '%s\n' "$out" | grep -q "$owant"; then
+        printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, not refused with '$owant'" >&2; exit 1
+      fi
+    elif [ "$rc" != 0 ] || ! printf '%s\n' "$out" | grep -q 'omc_pinned true'; then
+      printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, refused a compiler equal to the pin" >&2; exit 1
     fi
     n=$((n + 1))
     for s in $PIN_SCRIPTS; do
+      rm -f "$d/RAN" "$d/out.efi" "$d/out.bin" "$d/out.tools"
       mkdir -p "$d/kernel/$(dirname "$s")"; cp "$s" "$d/kernel/$s"
       case "$s" in
         */build-fw.sh) args="$d/out.efi" ;;
@@ -148,16 +169,41 @@ pin_controls() {
       case "$(head -n 1 "$s")" in *bash*) sh_=bash ;; *) sh_=sh ;; esac
       # shellcheck disable=SC2086
       rc=0; out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u OMEGA_SOURCE AIEN_OMC="$d/seed/out/omc" \
-        MODEL="$d/no-model" LOCAL_TOOLS_OUT="$d/out.tools" "$sh_" "$d/kernel/$s" $args 2>&1) || rc=$?
-      if [ "$rc" != 0 ] && printf '%s\n' "$out" | grep -qE 'compiler pin refused|pinned compiler missing' &&
-        [ ! -e "$d/out.efi" ] && [ ! -e "$d/out.bin" ] && [ ! -e "$d/out.tools" ]; then
-        n=$((n + 1))
+        MODEL="$d/no-model" LOCAL_TOOLS_OUT="$d/out.tools" OMEGA_NVME_EVIDENCE="$d/nvme-evidence" "$sh_" "$d/kernel/$s" $args 2>&1) || rc=$?
+      if [ -n "$want" ]; then
+        if [ "$rc" != 0 ] && printf '%s\n' "$out" | grep -qE "$want" && [ ! -e "$d/RAN" ] &&
+          [ ! -e "$d/out.efi" ] && [ ! -e "$d/out.bin" ] && [ ! -e "$d/out.tools" ]; then
+          n=$((n + 1))
+        else
+          printf '%s\n' "$out"; [ -e "$d/RAN" ] && echo "(the stand-in compiler ran)"
+          echo "pin control $c: $s exit $rc, not refused with '$want' before running the compiler" >&2; exit 1
+        fi
+      elif printf '%s\n' "$out" | grep -qE 'compiler pin|pinned compiler missing|no compiler at|digest differs'; then
+        printf '%s\n' "$out"; echo "pin control $c: $s refused a compiler equal to the pin" >&2; exit 1
       else
-        printf '%s\n' "$out"; echo "pin control $c: $s exit $rc, not refused before comparing" >&2; exit 1
+        n=$((n + 1))
       fi
     done
   done
-  echo "pin controls: $n refusals as required (omega_omc and $(echo $PIN_SCRIPTS | wc -w) scripts, 4 bad pins)"
+  # OMEGA_SOURCE (scripts/check_local_tools.sh) names where the compiler is, never the pin: a
+  # compiler with its own matching omc.sha256 beside it, with none, or reached by a symlink must be
+  # refused (review of omega-mv c9e503afd, finding 12).
+  for c in own-pin no-pin symlink; do
+    d="$TMP/pin-control-source-$c"; mkdir -p "$d/kernel/scripts" "$d/seed/out" "$d/src/seed/out"
+    cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256"
+    cp scripts/check_local_tools.sh "$d/kernel/scripts/check_local_tools.sh"
+    printf '#!/bin/sh\ncat\n' > "$d/fake-omc"; chmod +x "$d/fake-omc"
+    case "$c" in symlink) ln -s "$d/fake-omc" "$d/src/seed/out/omc" ;; *) cp "$d/fake-omc" "$d/src/seed/out/omc" ;; esac
+    [ "$c" = no-pin ] || (cd "$d/src" && sha256sum seed/out/omc > seed/out/omc.sha256)
+    rc=0; out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u AIEN_OMC OMEGA_SOURCE="$d/src" LOCAL_TOOLS_OUT="$d/out.tools" \
+      bash "$d/kernel/scripts/check_local_tools.sh" 2>&1) || rc=$?
+    if [ "$rc" != 0 ] && printf '%s\n' "$out" | grep -q 'compiler pin refused' && [ ! -e "$d/out.tools" ]; then
+      n=$((n + 1))
+    else
+      printf '%s\n' "$out"; echo "pin control source-$c: check_local_tools.sh exit $rc, ran the compiler OMEGA_SOURCE named" >&2; exit 1
+    fi
+  done
+  echo "pin controls: $n results as required (omega_omc and $(echo $PIN_SCRIPTS | wc -w) scripts in 6 pin states, 3 OMEGA_SOURCE states)"
   obs pin_controls_refused "$n"
 }
 
@@ -265,40 +311,57 @@ case "$step" in
     omega_omc
     sh tools/hwgates/gate.sh
     ;;
-  # Bounded read-only NVMe protocol in seeded Omega (#472): host cases, guard mutants and
-  # disposable-QEMU cases (the test prints its counts). Physical NVMe stays NOT_RUN.
+  # Bounded read-only NVMe protocol in seeded Omega (#472): host cases (with the slow case that holds
+  # every command for half the engine's wait budget), guard mutants, the budget-cut and no-wait
+  # mutants, disposable-QEMU cases and the killed-QEMU control; 48 cases, no ALARM line (an ALARM
+  # fails the test). Physical NVMe stays NOT_RUN.
   omega-nvme)
     pin_controls
     omega_omc
-    must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
+    must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard, budget and wait mutants \+ QEMU death control; cases=48 alarms=0; physical NOT_RUN' \
       -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
     scripts_verdict
     ;;
   # Native TCP stack in seeded Omega (L232): native/net/tcp/gate.sh corpus mode (the hosted hostile
-  # corpus, its exact-state cases and its mutants), built with omega-mv's pinned seed/out/omc. PASS
-  # needs its TCP_CORPUS_GATE PASS line with nonzero counts and killed equal to mutants; gate.sh exit
-  # 3 is NOT_RUN (exit 3 here), never a pass. No QEMU; the QEMU profiles stay in gate.sh.
+  # corpus, its exact-state cases and its mutants), built with omega-mv's pinned seed/out/omc. FUZZ is
+  # set here to the pinned 2000000 frames (gate.sh refuses less), so the caller's environment cannot
+  # lower it. PASS needs its TCP_CORPUS_GATE PASS line with fuzz=2000000, nonzero counts, killed equal
+  # to mutants and gen_killed + survivors equal to generated; gate.sh exit 3 is NOT_RUN (exit 3 here),
+  # never a pass. No QEMU; the QEMU profiles stay in gate.sh.
   tcp-corpus)
     pin_controls
     omega_omc
-    rc=0; sh native/net/tcp/gate.sh corpus "$AIEN_OMC" "$TMP/tcp" 2>&1 | tee "$TMP/tcp-corpus.log" || rc=$?
+    rc=0; env FUZZ=2000000 sh native/net/tcp/gate.sh corpus "$AIEN_OMC" "$TMP/tcp" 2>&1 | tee "$TMP/tcp-corpus.log" || rc=$?
     if [ "$rc" = 3 ]; then echo "tcp-corpus: NOT_RUN (native/net/tcp/gate.sh exit 3)"; obs tcp_corpus_not_run true; exit 3; fi
     [ "$rc" = 0 ] || { echo "tcp-corpus: native/net/tcp/gate.sh exit $rc, not PASS"; exit 1; }
-    line=$(grep -E '^TCP_CORPUS_GATE PASS checks=[1-9][0-9]* mutants=[1-9][0-9]* killed=[1-9][0-9]*$' "$TMP/tcp-corpus.log" | tail -n 1 || true)
-    [ -n "$line" ] || { echo "tcp-corpus: no 'TCP_CORPUS_GATE PASS checks= mutants= killed=' line, not PASS"; exit 1; }
-    mutants=${line#*mutants=}; mutants=${mutants%% *}; killed=${line##*killed=}
+    line=$(grep -E '^TCP_CORPUS_GATE PASS checks=[1-9][0-9]* fuzz=2000000 groups=[1-9][0-9]* mutants=[1-9][0-9]* killed=[1-9][0-9]* generated=[0-9]+ gen_killed=[0-9]+ survivors=[0-9]+ controls=[1-9][0-9]*$' "$TMP/tcp-corpus.log" | tail -n 1 || true)
+    [ -n "$line" ] || { echo "tcp-corpus: no 'TCP_CORPUS_GATE PASS checks= fuzz=2000000 groups= mutants= killed= generated= gen_killed= survivors= controls=' line, not PASS"; exit 1; }
+    field() { local v="${line#* $1=}"; printf '%s\n' "${v%% *}"; }
+    mutants=$(field mutants); killed=$(field killed); generated=$(field generated)
+    gen_killed=$(field gen_killed); survivors=$(field survivors)
     [ "$killed" = "$mutants" ] || { echo "tcp-corpus: killed=$killed of mutants=$mutants, not PASS"; exit 1; }
+    [ $((gen_killed + survivors)) = "$generated" ] || { echo "tcp-corpus: gen_killed=$gen_killed + survivors=$survivors != generated=$generated, not PASS"; exit 1; }
+    obs tcp_corpus_fuzz 2000000
+    obs tcp_corpus_groups "$(field groups)"
     obs tcp_corpus_mutants "$mutants"
     obs tcp_corpus_killed "$killed"
     echo "tcp-corpus: PASS ($line)"
     ;;
   # DRA-556 spinlock (core/spinlock.h): the compiled order of both lock forms and of every lock site
-  # of core/pipe.c, with its dump mutants (make spinlock-asm-check), and the Lean model checked for
-  # sorry/admit/native_decide and non-standard axioms, with its bad-proof controls (make
-  # ticketlock-proof). No cross compiler, no lean, or a lean other than proofs/lean-toolchain:
+  # of core/pipe.c, with its dump mutants (make spinlock-asm-check: $(CROSS)gcc and $(CROSS)objdump for
+  # aarch64, $(X86_CROSS)gcc and $(X86_CROSS)objdump for x86-64, default x86_64-linux-gnu-), and the Lean
+  # model proofs/TicketLock.lean checked by proofs/check.sh (syntax allowlist, compile, leanchecker
+  # kernel replay, axioms of every constant, pinned constants and statements), with its bad-proof
+  # controls (make ticketlock-proof). lean is the elan toolchain proofs/lean-toolchain names; a shell
+  # started by ssh has no ~/.elan/bin on PATH, so when lean is not on PATH this step adds
+  # ${ELAN_HOME:-$HOME/.elan}/bin. No cross compiler, no lean, or a lean other than the pinned one:
   # NOT_RUN, exit 3, never a pass. The NOT_RUN paths are controls here too.
   spinlock)
     spin_fail=0; spin_notrun=0
+    if ! command -v lean > /dev/null; then
+      elan_bin="${ELAN_HOME:-$HOME/.elan}/bin"
+      if [ -x "$elan_bin/lean" ]; then export PATH="$elan_bin:$PATH"; echo "spinlock: lean not on PATH, using $elan_bin"; fi
+    fi
     spin_part() {  # spin_part NAME MAKE-TARGET PASS-LINE...: one target, counted as PASS, FAIL or NOT_RUN
       local name="$1" target="$2" r rc=0 log="$TMP/spin-$1.log"
       shift 2
@@ -313,7 +376,8 @@ case "$step" in
       echo "spinlock $name: PASS"
     }
     spin_part asm spinlock-asm-check 'CK_SPINLOCK_ASM: PASS' 'CK_SPINLOCK_ASM_SELFTEST: PASS'
-    spin_part proof ticketlock-proof 'CK_TICKETLOCK_PROOF: PASS' 'CK_TICKETLOCK_PROOF_SELFTEST: PASS'
+    spin_part proof ticketlock-proof 'CK_TICKETLOCK_PROOF: PASS' \
+      'CK_TICKETLOCK_PROOF_SELFTEST: PASS (12 controls, 5 also with the syntax rule off)'
     # Controls of the NOT_RUN paths: no lean, a lean other than the pinned one, no x86 compiler.
     mkdir -p "$TMP/nolean" "$TMP/oldlean"
     for t in dirname realpath sed; do ln -sf "$(command -v "$t")" "$TMP/nolean/$t"; done

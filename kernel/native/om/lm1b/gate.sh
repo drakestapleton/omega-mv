@@ -15,6 +15,9 @@ OMC_SHA=$(head -n 1 "$ROOT/../seed/out/omc.sha256" 2>/dev/null | cut -c1-64)
 notrun() { echo "NOT_RUN $1"; echo "RC=3"; exit 3; }
 printf '%s\n' "$OMC_SHA" | grep -qxE '[0-9a-f]{64}' || notrun "compiler pin refused: no sha256 in $ROOT/../seed/out/omc.sha256"
 [ -f "$OMC" ] || notrun "compiler pin refused: no compiler at $OMC"
+# A compiler other than the pin stops here, before anything runs it (pin_controls in kernel/tests/gates/run.sh).
+OMC_GOT=$(sha256sum "$OMC" | cut -d' ' -f1)
+[ "$OMC_GOT" = "$OMC_SHA" ] || { echo "FAIL omc-sha: compiler pin mismatch: $OMC has sha256 $OMC_GOT, the pin is $OMC_SHA"; echo "RC=1"; exit 1; }
 [ -f "$MODEL" ] || notrun "model $MODEL not present (set MODEL to the pinned GGUF)"
 MODEL_SHA=3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1
 EOS=128009
