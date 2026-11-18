@@ -26,32 +26,64 @@ static uint8_t expected[8192];
 static size_t wanted;
 static const char *scenario;
 static int result_code = -1;
+/* The engine's wait budget as omega_nvme.om states it: ready() polls CSTS `for i ulong 256` with
+ * `transport_wait 1000` after each miss; submit() polls the completion slot `for i ulong 256` with
+ * `transport_wait 100`. These are the verifier's copy of that specification. A timeout case must
+ * wait exactly ENGINE_POLLS times in its longest loop, with a delay total of ENGINE_POLLS times the
+ * loop's wait length, and a wait of another length fails the case, so an engine whose budget
+ * differs fails here whatever the script says [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-budget255]. */
+#define ENGINE_POLLS 256u
+#define ENGINE_READY_WAIT_US 1000u
+#define ENGINE_CMD_WAIT_US 100u
 /* Engine waits (RPC op 9, transport_wait): the run of waits since the engine last wrote anything is
- * one wait loop; max_waits is the longest. QEMU mode allows QEMU_MAX_WAITS of the engine's 256 per
- * loop: each wait lets QEMU run until idle, so a completion needs one; more means the engine is
- * living on its budget, and the case FAILS (counted, printed as waits= and maxwait=). */
+ * one wait loop. QEMU mode allows QEMU_MAX_WAITS of the engine's 256 per loop: each wait lets QEMU
+ * run until idle, so a completion needs one; more means the engine is living on its budget, and the
+ * case FAILS (printed as waits= and maxwait=) [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-qemu-max-waits]. */
 #define QEMU_MAX_WAITS 8u
-static unsigned waits, run_waits, max_waits;
+static unsigned waits, run_waits, max_waits, min_waits, bad_waits;
+static uint64_t run_delay, max_run_delay;
 /* Slow case (C model): every SQ doorbell takes effect only after SLOW_CMD_US of engine waits, and
- * CSTS.RDY reads 0 for SLOW_READY_US after the enable: 128 of the engine's 256 waits in each loop
- * (100 us per command wait, 1000 us per ready wait), so the budget passes with 2x margin and a
- * budget cut to 1 (or no wait at all) times out, result 12. */
-#define SLOW_CMD_US 12800u
-#define SLOW_READY_US 128000u
+ * CSTS.RDY reads 0 for SLOW_READY_US after the enable: half of each loop's budget (SLOW_HOLD_WAITS
+ * waits of the loop's length). Each wait loop of the case must take exactly SLOW_HOLD_WAITS waits;
+ * a budget cut to 1 (or no wait at all) times out, result 12. */
+#define SLOW_HOLD_WAITS (ENGINE_POLLS / 2u)
+#define SLOW_CMD_US (SLOW_HOLD_WAITS * ENGINE_CMD_WAIT_US)
+#define SLOW_READY_US (SLOW_HOLD_WAITS * ENGINE_READY_WAIT_US)
 static uint64_t hold_us, ready_hold_us;
 static int held;
 static uint32_t held_off, held_val;
 static void die(const char *s) { perror(s); exit(2); }
 static void check(int b, const char *s) { if (!b) { fprintf(stderr,"FAIL %s: %s\n",scenario,s); errors++; } }
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (double)t.tv_sec + t.tv_nsec / 1e9; }
-/* An ALARM line is a failure of the case: the wait that printed it goes on (no deadline, so the log
- * shows how long), but the case result is FAIL and omega_nvme_test.sh refuses any ALARM line. */
+/* A peer (QEMU or the candidate) that has not answered for 30 s prints an ALARM line and ends the
+ * run, exit 2. omega_nvme_test.sh counts ALARM lines in the logs of its runs and fails on one
+ * [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-printed-counted]. */
+#define ALARM_S 30.0
 static void alarm_line(const char *what, double s)
 {
     alarms++;
-    fprintf(stderr,"ALARM %s: %.0f s waiting on %s, still waiting (the case FAILS)\n",scenario,s,what);
+    fprintf(stderr,"ALARM %s: %.0f s waiting on %s (the case FAILS)\n",scenario,s,what);
 }
-/* A QEMU that exited (reaped here) or is a zombie (state Z or X) ends the run at once: exit 2. */
+static void alarm_end(const char *what, double s)
+{
+    alarm_line(what,s);
+    fprintf(stderr,"FAIL %s: PEER_SILENT no answer from %s for %.0f s, run ended\n",scenario,what,s);
+    exit(2);
+}
+/* State letter of /proc/P/stat (the field after the last ')'), or 0 when it cannot be read. */
+static char proc_state(pid_t p)
+{
+    char path[64], buf[512];
+    snprintf(path,sizeof path,"/proc/%ld/stat",(long)p);
+    FILE *f = fopen(path,"r");
+    if (!f) return 0;
+    size_t k = fread(buf,1,sizeof buf-1,f); fclose(f); buf[k] = 0;
+    char *s = strrchr(buf,')');
+    return s && s[1] == ' ' ? s[2] : 0;
+}
+/* A QEMU that exited (reaped here) or is a zombie (state Z or X) ends the run at once: QEMU_DEAD,
+ * exit 2 [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-killed]. A stopped QEMU (state T or t) ends it too:
+ * QEMU_STOPPED, exit 2 [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-stopped]. */
 static void qemu_check(void)
 {
     if (qp <= 0) return;
@@ -63,121 +95,170 @@ static void qemu_check(void)
                 WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
         exit(2);
     }
-    char path[64], buf[512];
-    snprintf(path,sizeof path,"/proc/%ld/stat",(long)qp);
-    FILE *f = fopen(path,"r");
-    if (!f) return;
-    size_t k = fread(buf,1,sizeof buf-1,f); fclose(f); buf[k] = 0;
-    char *s = strrchr(buf,')');
-    if (s && s[1] == ' ' && (s[2] == 'Z' || s[2] == 'X')) {
-        fprintf(stderr,"FAIL %s: QEMU_DEAD QEMU is a zombie (state %c)\n",scenario,s[2]);
+    char c = proc_state(qp);
+    if (c == 'Z' || c == 'X') {
+        fprintf(stderr,"FAIL %s: QEMU_DEAD QEMU is a zombie (state %c)\n",scenario,c);
         kill(qp,SIGKILL); waitpid(qp,NULL,0); qp = -1;
         exit(2);
     }
+    if (c == 'T' || c == 't') {
+        fprintf(stderr,"FAIL %s: QEMU_STOPPED QEMU is stopped (state %c)\n",scenario,c);
+        exit(2);
+    }
 }
-/* Waits have no deadline. The old 3 s poll read a candidate or QEMU that was only descheduled as the
- * end of its stream. A peer that exits closes its end (EOF or EPIPE); QEMU is also checked every
- * second (qemu_check). A live peer that does not answer for 30 s prints an ALARM line, which fails
- * the case; the wait goes on and the gate timeout ends it. */
+/* The candidate stopped (state T or t) ends the run: CANDIDATE_STOPPED, exit 2. Its exit shows as
+ * EOF on its stream and is judged by its exit code. */
+static void candidate_check(void)
+{
+    if (child <= 0) return;
+    char c = proc_state(child);
+    if (c == 'T' || c == 't') {
+        fprintf(stderr,"FAIL %s: CANDIDATE_STOPPED the candidate is stopped (state %c)\n",scenario,c);
+        exit(2);
+    }
+}
+static void peer_check(pid_t p) { if (p == qp) qemu_check(); else candidate_check(); }
+/* Idle test for a peer process (QEMU or the candidate). QEMU's NVMe model finishes a read on its own
+ * threads (the block layer's thread pool, then bottom halves on the main loop), so whether a
+ * completion has landed at a given register read depends on host scheduling. The engine reads
+ * whatever QEMU shows (QEMU stays asynchronous); when it waits (op 9, transport_wait), the runner
+ * waits until QEMU is idle: each thread asleep (S) in two reads of /proc with no thread run in
+ * between. So one engine wait covers a completion at the loads tried, and the per-loop wait count
+ * (QEMU_MAX_WAITS) shows whether the 256-wait budget is being used. The budget itself is checked by
+ * the C-model slow and timeout cases and their mutants (omega_nvme_test.sh).
+ * A thread that exits between the directory read and the read of its files makes the scan start
+ * again (after checking that the process lives); NOT_RUN (exit 3) only when /proc has no task list
+ * or a live thread has no schedstat (a kernel without schedstats). */
+static int snapshot(pid_t p, unsigned long long *ran, unsigned *threads)
+{
+    char path[320], buf[512];  /* d_name is at most 255 bytes */
+    double since = now_s();
+    for (;;) {
+        peer_check(p);
+        char c = proc_state(p);
+        if (!c || c == 'Z' || c == 'X') { peer_check(p); return 0; }  /* the candidate exited: EOF follows */
+        snprintf(path,sizeof path,"/proc/%ld/task",(long)p);
+        DIR *d = opendir(path);
+        if (!d) {
+            peer_check(p);
+            fprintf(stderr,"NOT_RUN %s: cannot read %s to tell when a peer is idle\n",scenario,path);
+            exit(3);
+        }
+        int asleep = 1, vanished = 0; struct dirent *e;
+        *ran = 0; *threads = 0;
+        while (!vanished && (e = readdir(d))) {
+            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+            unsigned long long ns = 0, slices = 0;
+            snprintf(path,sizeof path,"/proc/%ld/task/%s/stat",(long)p,e->d_name);
+            FILE *f = fopen(path,"r");
+            if (!f) { vanished = 1; break; }
+            size_t k = fread(buf,1,sizeof buf-1,f); fclose(f); buf[k] = 0;
+            char *s = strrchr(buf,')');
+            if (!s || s[1] != ' ' || s[2] != 'S') asleep = 0;
+            snprintf(path,sizeof path,"/proc/%ld/task/%s/schedstat",(long)p,e->d_name);
+            f = fopen(path,"r");
+            if (!f) {
+                snprintf(path,sizeof path,"/proc/%ld/task/%s",(long)p,e->d_name);
+                if (access(path,F_OK) != 0) { vanished = 1; break; }
+                snprintf(path,sizeof path,"/proc/%ld/task/%s/schedstat",(long)p,e->d_name);
+                if (access(path,F_OK) == 0) { asleep = 0; continue; }
+                fprintf(stderr,"NOT_RUN %s: no %s (thread run times) to tell when a peer is idle\n",scenario,path);
+                closedir(d); exit(3);
+            }
+            if (fscanf(f,"%llu %*u %llu",&ns,&slices) != 2) asleep = 0;
+            fclose(f);
+            *ran += ns + slices; (*threads)++;
+        }
+        closedir(d);
+        if (!vanished) return asleep && *threads > 0;
+        double w = now_s() - since;
+        if (w >= ALARM_S) alarm_end("a stable thread list in /proc", w);
+    }
+}
+/* A live peer that does not answer while it is idle (snapshot asleep twice, a poll timeout apart,
+ * with no run time between) will not answer: QEMU_MUTE or CANDIDATE_MUTE, exit 2
+ * [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-mute] [ctl:OMEGA-KERNEL-OMEGA-NVME/candidate-mute]. */
+struct idle { int have; unsigned long long ran; unsigned threads; };
+static void mute_check(pid_t p, struct idle *last, const char *doing)
+{
+    unsigned long long ran; unsigned threads;
+    if (p <= 0) return;
+    int asleep = snapshot(p,&ran,&threads);
+    if (asleep && last->have && last->ran == ran && last->threads == threads) {
+        fprintf(stderr,"FAIL %s: %s %s is idle (its %u threads asleep, none ran between two reads 1 s apart) %s\n",
+                scenario,p == qp ? "QEMU_MUTE" : "CANDIDATE_MUTE",p == qp ? "QEMU" : "the candidate",threads,doing);
+        exit(2);
+    }
+    last->have = asleep; last->ran = ran; last->threads = threads;
+}
+/* Waits have no wall-clock deadline while the peer works. A peer that exits closes its end (EOF or
+ * EPIPE); each second without progress the peer is checked: dead, stopped or idle ends the run
+ * (exit 2, above). A peer that is runnable but has not answered for 30 s gets an ALARM line and
+ * the run ends (alarm_end). */
 static int exact(int fd, void *p, size_t n, int writing)
 {
     size_t done = 0;
-    double since = now_s(), next = 30;
+    double since = now_s();
+    struct idle last = {0,0,0};
     while (done < n) {
         struct pollfd f = {fd, writing ? POLLOUT : POLLIN, 0};
         int k = poll(&f,1,1000);
         if (k < 0 && errno == EINTR) continue;
         if (k < 0) return -1;
         if (k == 0) {
-            if (fd == qfd) qemu_check();
+            pid_t peer = fd == qfd ? qp : child;
+            peer_check(peer);
+            mute_check(peer,&last,writing ? "and does not read the runner's request" : "and has not answered");
             double w = now_s() - since;
-            if (w >= next) { alarm_line(fd == qfd ? "the QEMU qtest socket" : "the candidate", w); next += 30; }
+            if (w >= ALARM_S) alarm_end(fd == qfd ? "the QEMU qtest socket" : "the candidate", w);
             continue;
         }
         ssize_t r = writing ? write(fd,(char *)p+done,n-done) : read(fd,(char *)p+done,n-done);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) { if (fd == qfd) qemu_check(); return -1; }
         done += (size_t)r;
-        since = now_s(); next = 30;
+        since = now_s(); last.have = 0;
     }
     return 0;
-}
-/* QEMU mode. QEMU's NVMe model finishes a read on its own threads (the block layer's thread pool, then
- * bottom halves on the main loop), so whether a completion has landed at a given register read
- * depends on host scheduling. The engine reads whatever QEMU shows (QEMU stays asynchronous); when
- * it waits (op 9, transport_wait), the runner waits until QEMU is idle: every thread asleep (S) in
- * two reads of /proc with no thread run in between. So one engine wait covers a completion at any
- * load, and the per-loop wait count (QEMU_MAX_WAITS) shows whether the 256-wait budget is being used.
- * The budget itself is checked by the C-model slow case and its mutants (omega_nvme_test.sh). */
-static int qemu_snapshot(unsigned long long *ran, unsigned *threads)
-{
-    char path[320], buf[512];  /* d_name is at most 255 bytes */
-    qemu_check();
-    snprintf(path,sizeof path,"/proc/%ld/task",(long)qp);
-    DIR *d = opendir(path);
-    if (!d) {
-        qemu_check();
-        fprintf(stderr,"NOT_RUN %s: cannot read %s to tell when QEMU is idle\n",scenario,path);
-        exit(3);
-    }
-    int asleep = 1; struct dirent *e;
-    *ran = 0; *threads = 0;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-        unsigned long long ns = 0, slices = 0;
-        snprintf(path,sizeof path,"/proc/%ld/task/%s/stat",(long)qp,e->d_name);
-        FILE *f = fopen(path,"r");
-        if (!f) { asleep = 0; continue; }  /* a thread that just exited: read again */
-        size_t k = fread(buf,1,sizeof buf-1,f); fclose(f); buf[k] = 0;
-        char *s = strrchr(buf,')');
-        if (s && s[1] == ' ' && (s[2] == 'Z' || s[2] == 'X')) { closedir(d); qemu_check(); asleep = 0; return 0; }
-        if (!s || s[1] != ' ' || s[2] != 'S') asleep = 0;
-        snprintf(path,sizeof path,"/proc/%ld/task/%s/schedstat",(long)qp,e->d_name);
-        f = fopen(path,"r");
-        if (!f) {
-            if (access(path,F_OK) == 0) { asleep = 0; continue; }
-            fprintf(stderr,"NOT_RUN %s: no %s (thread run times) to tell when QEMU is idle\n",scenario,path);
-            closedir(d); exit(3);
-        }
-        if (fscanf(f,"%llu %*u %llu",&ns,&slices) != 2) asleep = 0;
-        fclose(f);
-        *ran += ns + slices; (*threads)++;
-    }
-    closedir(d);
-    return asleep && *threads > 0;
 }
 static void qemu_settle(void)
 {
     struct timespec nap = {0,50000};
     unsigned long long a, b; unsigned na, nb;
-    double since = now_s(), next = 30;
+    double since = now_s();
     for (;;) {
-        if (qemu_snapshot(&a,&na) && qemu_snapshot(&b,&nb) && a == b && na == nb) return;
+        if (snapshot(qp,&a,&na) && snapshot(qp,&b,&nb) && a == b && na == nb) return;
         double w = now_s() - since;
-        if (w >= next) { alarm_line("QEMU to go idle", w); next += 30; }
+        if (w >= ALARM_S) alarm_end("QEMU to go idle", w);
         nanosleep(&nap,NULL);
     }
 }
-/* Reap a child that was signalled: an ALARM every 30 s, and SIGKILL after the first (a disposable
- * QEMU or candidate that ignores SIGTERM). Returns 1 when it alarmed. */
-static int reap(pid_t p, int sig)
+/* Reap a child at the end of the run. A stopped child (state T or t) gets SIGKILL at once and the
+ * run fails (STOPPED, exit 2). Otherwise an ALARM after 30 s, then SIGKILL (a disposable QEMU or
+ * candidate that ignores SIGTERM). Returns 1 when the run must fail. */
+static int reap(pid_t p, int sig, const char *who)
 {
     struct timespec nap = {0,10000000};
-    double since = now_s(), next = 30;
-    int alarmed = 0;
+    double since = now_s(), next = ALARM_S;
+    int failed = 0;
+    char c = proc_state(p);
+    if (c == 'T' || c == 't') {
+        fprintf(stderr,"FAIL %s: STOPPED %s was stopped (state %c) at the end of the run\n",scenario,who,c);
+        failed = 1; sig = SIGKILL;
+    }
     kill(p,sig);
     while (waitpid(p,NULL,WNOHANG) == 0) {
         double w = now_s() - since;
-        if (w >= next) { alarm_line("a signalled child to exit", w); alarmed = 1; next += 30; kill(p,SIGKILL); }
+        if (w >= next) { alarm_line(who, w); failed = 1; next += ALARM_S; kill(p,SIGKILL); }
         nanosleep(&nap,NULL);
     }
-    return alarmed;
+    return failed;
 }
 static void cleanup(void)
 {
     int alarmed = 0;
-    if (child > 0) { alarmed |= reap(child,SIGKILL); child = -1; }
-    if (qp > 0) { alarmed |= reap(qp,SIGTERM); qp = -1; }
+    if (child > 0) { alarmed |= reap(child,SIGKILL,"the candidate"); child = -1; }
+    if (qp > 0) { alarmed |= reap(qp,SIGTERM,"QEMU"); qp = -1; }
     if (qfd >= 0) close(qfd);
     if (*image) unlink(image);
     if (*socketpath) unlink(socketpath);
@@ -224,15 +305,34 @@ static void start_qemu(void)
     }
     struct sockaddr_un sa={.sun_family=AF_UNIX}; strcpy(sa.sun_path,socketpath);
     struct timespec nap={0,10000000};
-    /* No deadline (was 300 tries, 3 s): wait while QEMU runs; an exited QEMU ends the wait. */
-    for (unsigned tries=1;;tries++) {
+    /* No deadline while QEMU works toward its socket. An exited or stopped QEMU ends the wait at
+     * once (qemu_check); one that sits idle for a second without opening the socket ends it with
+     * QEMU_NOT_LISTENING [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-not-listening]; one still runnable after
+     * 30 s gets an ALARM line and ends it [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-printed-counted]. */
+    double since = now_s(), snap = since;
+    struct idle last = {0,0,0};
+    for (;;) {
         qfd=socket(AF_UNIX,SOCK_STREAM,0);
         if (qfd<0) die("socket");
         if (connect(qfd,(struct sockaddr *)&sa,sizeof sa)==0) break;
         close(qfd); qfd=-1;
         int st=0;
-        if (waitpid(qp,&st,WNOHANG)==qp) { qp=-1; fprintf(stderr,"QEMU exited (status %d) before its qtest socket opened\n",st); exit(2); }
-        if (tries%3000==0) fprintf(stderr,"ALARM %s: QEMU qtest socket not open after %u tries, still waiting\n",scenario,tries);
+        if (waitpid(qp,&st,WNOHANG)==qp) {
+            qp=-1;
+            fprintf(stderr,"FAIL %s: QEMU_DEAD QEMU exited (status %d) before its qtest socket opened\n",scenario,st);
+            exit(2);
+        }
+        double t = now_s();
+        if (t - snap >= 1.0) {
+            unsigned long long ran; unsigned threads;
+            int asleep = snapshot(qp,&ran,&threads);
+            if (asleep && last.have && last.ran == ran && last.threads == threads) {
+                fprintf(stderr,"FAIL %s: QEMU_NOT_LISTENING QEMU is idle (its %u threads asleep, none ran between two reads 1 s apart) and its qtest socket is not open\n",scenario,threads);
+                exit(2);
+            }
+            last.have = asleep; last.ran = ran; last.threads = threads; snap = t;
+        }
+        if (t - since >= ALARM_S) alarm_end("QEMU to open its qtest socket", t - since);
         nanosleep(&nap,NULL);
     }
     /* virt ECAM, bus0/dev1/function0. PCI binding is verifier setup, not .om NVMe logic. */
@@ -252,12 +352,18 @@ static void inject_io(void)
     if (iscase("status")) M.inject_sc=0x80;
 }
 /* Op 9: the engine waits val us of device time. QEMU mode: let QEMU run until idle. C model: add to
- * the model's delay total and, in the slow case, count down the held doorbell and the ready hold. */
+ * the model's delay total and, in the slow case, count down the held doorbell and the ready hold.
+ * A wait of another length than the engine's two fails the case; a loop of more than ENGINE_POLLS
+ * waits ends the run (ENGINE_OVER_BUDGET, exit 2) [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-budget257]. */
 static void engine_wait(uint64_t val)
 {
-    check(val > 0 && val <= 1000000, "transport wait between 1 us and 1 s");
+    if (val != ENGINE_READY_WAIT_US && val != ENGINE_CMD_WAIT_US) bad_waits++;
     waits++;
-    if (++run_waits > max_waits) max_waits = run_waits;
+    run_waits++; run_delay += val;
+    if (run_waits > ENGINE_POLLS) {
+        fprintf(stderr,"FAIL %s: ENGINE_OVER_BUDGET %u waits in one loop, the engine's budget is %u\n",scenario,run_waits,ENGINE_POLLS);
+        exit(2);
+    }
     if (qfd>=0) { qemu_settle(); return; }
     M.delay_total += val;
     ready_hold_us = ready_hold_us > val ? ready_hold_us - val : 0;
@@ -266,10 +372,18 @@ static void engine_wait(uint64_t val)
         if (!hold_us) { held = 0; m_write32(NULL,held_off,held_val); }
     }
 }
+/* The engine wrote something (or the run ended): the current wait loop is over. */
+static void end_run(void)
+{
+    if (!run_waits) return;
+    if (run_waits > max_waits) { max_waits = run_waits; max_run_delay = run_delay; }
+    if (!min_waits || run_waits < min_waits) min_waits = run_waits;
+    run_waits = 0; run_delay = 0;
+}
 static uint64_t access_rpc(uint64_t op,uint64_t addr,uint64_t val)
 {
     if (op == 9) { engine_wait(val); return 0; }
-    if (op != 1 && op != 2) run_waits = 0;
+    if (op != 1 && op != 2) end_run();
     if (qfd<0 && M.nlog>0 && (iscase("timeout") || iscase("cfs") || iscase("cid") || iscase("sqid") || iscase("phase") || iscase("sqhead"))) {
         check(!(op==5 || (op==3 && addr==0x10000014)), "uncertain DMA is not zeroed/reset/reopened");
     }
@@ -405,20 +519,25 @@ int main(int argc,char **argv)
     close(input[0]); close(output[1]); infd=input[1]; outfd=output[0];
     if (exact(infd,manifest,sizeof manifest,1)) die("manifest");
     uint8_t request[24], response[8]; unsigned requests=0;
+    /* No RPC cap: the engine's loops are bounded by its source (`for i ulong N`, `while ... bound N`),
+     * and a wait loop longer than the engine's budget ends the run (engine_wait). */
     while (exact(outfd,request,sizeof request,0)==0) {
-        if (++requests>50000) die("RPC budget");
+        requests++;
         uint64_t op=g64(request),addr=g64(request+8),val=g64(request+16),r=0;
         /* qemukill (control): QEMU killed while the runner waits for it to go idle must end the run at
-         * once (QEMU_DEAD, exit 2), never a wait on a zombie. */
+         * once (QEMU_DEAD, exit 2) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-killed]. */
         if (iscase("qemukill") && qfd>=0 && requests==20) {
             kill(qp,SIGKILL);
             qemu_settle();
             fprintf(stderr,"FAIL qemukill: the wait for an idle QEMU returned after QEMU was killed\n");
             exit(1);
         }
+        /* qemustop (control): QEMU stopped (SIGSTOP) before this request; the run must end at the next
+         * wait on QEMU (QEMU_STOPPED, exit 2) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-stopped]. */
+        if (iscase("qemustop") && qfd>=0 && requests==20) kill(qp,SIGSTOP);
         if ((op>=1 && op<=5) || op==9) r=access_rpc(op,addr,val);
         else if (op!=6 && op!=7 && op!=8) die("RPC opcode");
-        else run_waits=0;
+        else end_run();
         p64(response,r); if (exact(infd,response,sizeof response,1)) die("RPC response");
         if (op==6) payload(addr,val);
         if (op==7) {
@@ -429,11 +548,15 @@ int main(int argc,char **argv)
         if (op==8) { result_code=(int)val; retained=(int)addr; reported++; }
     }
     close(infd); close(outfd);
-    /* The candidate closed its output; it exits next. No deadline: an ALARM (case FAIL) every 30 s. */
-    int status=0; double since=now_s(), next=30; struct timespec nap={0,1000000};
+    end_run();
+    /* The candidate closed its output; it exits next. While it works there is no deadline; stopped
+     * or idle for a second ends the run (exit 2), and 30 s gets an ALARM line and ends it. */
+    int status=0; double since=now_s(), snap=since; struct timespec nap={0,1000000};
+    struct idle last = {0,0,0};
     while (waitpid(child,&status,WNOHANG)==0) {
-        double w=now_s()-since;
-        if (w>=next) { alarm_line("the candidate to exit after closing its output",w); next+=30; }
+        double t=now_s();
+        if (t-snap>=1.0) { candidate_check(); mute_check(child,&last,"and has not exited after closing its output"); snap=t; }
+        if (t-since>=ALARM_S) alarm_end("the candidate to exit after closing its output",t-since);
         nanosleep(&nap,NULL);
     }
     child=-1;
@@ -449,11 +572,24 @@ int main(int argc,char **argv)
         if (!expected_code) { check(M.nlog==40,"IO queue wraps twice"); check(M.last_cq_db[1]==8,"CQ head wraps"); check(M.iocq_phase==1,"CQ phase wraps twice"); }
         if (iscase("adminwrap")) { check(M.nadmin==44,"admin commands wrap twice"); check(M.acq_phase==1 && M.last_cq_db[0]==12,"admin CQ phase/head wrap"); }
     }
+    char msg[256];
     if (qfd>=0) {
         qemu_check();
-        check(max_waits<=QEMU_MAX_WAITS,"QEMU: no wait loop used more than QEMU_MAX_WAITS (8) of the engine's 256 waits");
+        snprintf(msg,sizeof msg,"QEMU: a wait loop used %u waits, more than QEMU_MAX_WAITS (%u) of the engine's %u",max_waits,QEMU_MAX_WAITS,ENGINE_POLLS);
+        check(max_waits<=QEMU_MAX_WAITS,msg);
     }
-    if (iscase("slow")) check(max_waits>=100,"slow case: the engine waited through the held commands (100+ waits in one loop)");
+    snprintf(msg,sizeof msg,"%u transport waits were not the engine's %u or %u us",bad_waits,ENGINE_CMD_WAIT_US,ENGINE_READY_WAIT_US);
+    check(bad_waits==0,msg);
+    if (iscase("slow")) {
+        snprintf(msg,sizeof msg,"slow case: wait loops took %u to %u waits, not exactly the %u the device was held for",min_waits,max_waits,SLOW_HOLD_WAITS);
+        check(min_waits==SLOW_HOLD_WAITS && max_waits==SLOW_HOLD_WAITS,msg);
+    }
+    if (expected_code==12) {
+        uint64_t len = iscase("readytimeout") ? ENGINE_READY_WAIT_US : ENGINE_CMD_WAIT_US;
+        snprintf(msg,sizeof msg,"timeout case: the longest wait loop took %u waits, %llu us; the engine's budget is %u waits, %llu us",
+                 max_waits,(unsigned long long)max_run_delay,ENGINE_POLLS,(unsigned long long)(ENGINE_POLLS*len));
+        check(max_waits==ENGINE_POLLS && max_run_delay==ENGINE_POLLS*len,msg);
+    }
     check(alarms==0,"no ALARM line (a wait of 30 s or more)");
     printf("%s case=%s transport=%s result=%d copies=%d retained=%d RPC=%u waits=%u maxwait=%u alarms=%d physical=NOT_RUN\n",errors?"FAIL":"PASS",scenario,qfd<0?"C-model":"QEMU",result_code,published,retained,requests,waits,max_waits,alarms);
     free(dma_mem); free(M.media); free(M.cache); free(M.dirty);

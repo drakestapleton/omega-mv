@@ -10,9 +10,43 @@ printf '%s\n' "$want" | grep -qxE '[0-9a-f]{64}' || { echo 'compiler pin refused
 [ -f "$AIEN_OMC" ] || { echo "compiler pin refused: no compiler at $AIEN_OMC" >&2; exit 2; }
 actual=$(sha256sum "$AIEN_OMC")
 [ "${actual%% *}" = "$want" ] || { echo 'compiler pin mismatch' >&2; exit 2; }
+# A missing tool is NOT_RUN (exit 3), not a FAIL.
+cc_tool=${CC:-cc}
+for tool in qemu-system-aarch64 "${cc_tool%% *}"; do
+ command -v "$tool" > /dev/null 2>&1 || { echo "NOT_RUN omega_nvme: no $tool on PATH"; exit 3; }
+done
 out=${OMEGA_NVME_EVIDENCE:-$(mktemp -d /tmp/omega-nvme-evidence-XXXXXX)}
 mkdir -p "$out"
 case "$out" in /*) ;; *) echo 'evidence directory must be absolute' >&2; exit 2;; esac
+# Controls that must print an ALARM line keep their logs here, apart from $out, whose logs must have
+# none.
+ctl=$(mktemp -d "${TMPDIR:-/tmp}/omega-nvme-controls-XXXXXX")
+# A run that does not end in PASS keeps its evidence: the gate deletes its temporary directory, so
+# $out and $ctl are copied to a new directory named on stderr.
+on_exit() {
+ st=$?
+ trap - EXIT
+ if [ "$st" != 0 ]; then
+  kept=$(mktemp -d "${TMPDIR:-/tmp}/omega-nvme-kept-XXXXXX") &&
+   cp -a "$out" "$kept/evidence" && cp -a "$ctl" "$kept/controls" &&
+   echo "Evidence kept (exit $st): $kept" >&2
+ else
+  rm -rf "$ctl"
+ fi
+ exit "$st"
+}
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+GATE=OMEGA-KERNEL-OMEGA-NVME
+# The controls this script runs; finish refuses a run whose controls.txt lacks one of them.
+CONTROLS='mutant-cid mutant-sqid mutant-status mutant-sqhead mutant-reopen mutant-opcode
+ mutant-retention mutant-budget1 mutant-nowait mutant-budget255 mutant-budget257 mutant-cwait51
+ mutant-rwait501 mutant-qemu-max-waits qemu-killed qemu-stopped qemu-mute qemu-not-listening
+ candidate-mute alarm-printed-counted alarm-planted-host-err alarm-planted-qemu-err
+ alarm-planted-control-qemu-killed-log alarm-planted-control-qemu-killed-err
+ alarm-planted-mutant-cid-log alarm-planted-mutant-cid-err alarm-planted-extra-log'
 base=native/disk
 compose() { cat "$base/omega_nvme.om" "$base/omega_nvme_transport.om" "$1"; }
 compile() { nice -n 15 "$AIEN_OMC" < "$1" > "$2"; chmod +x "$2"; }
@@ -24,18 +58,63 @@ compose "$base/tests/omega_nvme_adminwrap.om" > "$out/adminwrap.om"
 compile "$out/adminwrap.om" "$out/adminwrap"
 compose "$base/tests/omega_nvme_failstop.om" > "$out/failstop.om"
 compile "$out/failstop.om" "$out/failstop"
-${CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror -Wno-unused-function \
+$cc_tool -std=c11 -O2 -Wall -Wextra -Werror -Wno-unused-function \
  "$base/tests/omega_nvme_runner.c" "$base/disk_nvme.c" "$base/disk.c" -o "$out/runner"
-# Every runner's stderr (FAIL detail, ALARM lines) goes to a .err log beside its .log; a case that
-# fails prints its stderr and ends the script, and any ALARM line in a passing run fails it below.
-: > "$out/host.log"; : > "$out/host.err"
-case_run() {
- log=$1; shift
- nice -n 15 "$out/runner" "$@" >> "$out/$log.log" 2>> "$out/$log.err" || {
-  rc=$?; cat "$out/$log.err" >&2; echo "FAIL case $* exit $rc" >&2; exit 1; }
+$cc_tool -std=c11 -O2 -Wall -Wextra -Werror "$base/tests/omega_nvme_fakepeer.c" -o "$out/fakepeer"
+mkdir -p "$out/fakebin"
+cp "$out/fakepeer" "$out/fakebin/qemu-system-aarch64"
+
+# run_logged DIR NAME CMD...: stdout to DIR/NAME.log, stderr to DIR/NAME.err, exit status to
+# DIR/NAME.rc and $rc. For DIR = $out, ALARM lines also go to this script's stderr as they come.
+run_logged() {
+ rl_dir=$1; rl_name=$2; shift 2
+ : >> "$rl_dir/$rl_name.log"; : >> "$rl_dir/$rl_name.err"
+ { rl_rc=0; "$@" 2>&1 >> "$rl_dir/$rl_name.log" || rl_rc=$?; echo "$rl_rc" > "$rl_dir/$rl_name.rc"; } |
+  while IFS= read -r rl_line || [ -n "$rl_line" ]; do
+   printf '%s\n' "$rl_line" >> "$rl_dir/$rl_name.err"
+   case $rl_dir:$rl_line in "$out":ALARM*) printf '%s\n' "$rl_line" >&2 ;; esac
+  done
+ rc=$(cat "$rl_dir/$rl_name.rc")
 }
-# slow: the C model holds every command and the ready bit for 128 of the engine's 256 waits
-# (omega_nvme_runner.c SLOW_CMD_US, SLOW_READY_US), so the engine's wait budget is exercised.
+# has_line PREFIX FILE...: some line of the files starts with PREFIX (a fixed string).
+has_line() { hl_p=$1; shift; cat "$@" | awk -v p="$hl_p" 'index($0, p) == 1 {f = 1} END {exit !f}'; }
+control_line() { echo "CONTROL $GATE/$1 FAILED_AS_REQUIRED" | tee -a "$out/controls.txt"; }
+not_run() { cat "$1" >&2; echo "NOT_RUN omega_nvme: $2 exit 3"; exit 3; }
+# case_run LOG ARGS...: one runner case that must PASS (exit 0).
+case_run() {
+ cr_log=$1; shift
+ run_logged "$out" "$cr_log" nice -n 15 "$out/runner" "$@"
+ [ "$rc" != 0 ] || return 0
+ [ "$rc" != 3 ] || not_run "$out/$cr_log.err" "case $*"
+ cat "$out/$cr_log.err" >&2; echo "FAIL case $* exit $rc" >&2; exit 1
+}
+# expect_fail DIR NAME RC LINE CMD...: the run must exit RC and print a line starting with LINE.
+expect_fail() {
+ ef_dir=$1; ef_name=$2; ef_rc=$3; ef_line=$4; shift 4
+ run_logged "$ef_dir" "$ef_name" "$@"
+ [ "$rc" != 3 ] || not_run "$ef_dir/$ef_name.err" "$ef_name"
+ if [ "$rc" != "$ef_rc" ] || ! has_line "$ef_line" "$ef_dir/$ef_name.log" "$ef_dir/$ef_name.err"; then
+  cat "$ef_dir/$ef_name.log" "$ef_dir/$ef_name.err" >&2
+  echo "FAIL $ef_name: exit $rc (required $ef_rc) or no line starting '$ef_line'" >&2; exit 1
+ fi
+}
+# alarm_count DIR: ALARM lines in the run logs (*.log, *.err) of DIR.
+alarm_count() { cat "$1"/*.log "$1"/*.err 2>/dev/null | grep -c '^ALARM' || true; }
+# finish DIR: refuse ALARM lines in DIR's run logs and missing controls, then print the PASS line.
+finish() {
+ fa=$(alarm_count "$1")
+ if [ "$fa" != 0 ]; then grep -H '^ALARM' "$1"/*.log "$1"/*.err >&2 || true; echo "FAIL $fa ALARM lines in $1" >&2; return 1; fi
+ for fc in $CONTROLS; do
+  grep -qxF "CONTROL $GATE/$fc FAILED_AS_REQUIRED" "$1/controls.txt" 2>/dev/null ||
+   { echo "FAIL control $fc did not run" >&2; return 1; }
+ done
+ fn=$(cat "$1/host.log" "$1/qemu.log" | grep -c '^PASS case=' || true)
+ printf 'PASS Omega NVMe host + QEMU + guard, budget and wait mutants + QEMU death control; cases=%s alarms=%s; physical NOT_RUN\n' "$fn" "$fa"
+}
+: > "$out/controls.txt"
+
+# The C model holds every command and the ready bit in the slow case for half the engine's waits
+# (omega_nvme_runner.c SLOW_HOLD_WAITS); the timeout cases must use the engine's budget exactly.
 for c in healthy slow singlepage lba4k dstrd serial firmware approval nsid extent range before prp zero metadata format nsze sqes cqes cap stride readytimeout readycfs status; do
  case_run host "$out/read" "$c"
 done
@@ -46,65 +125,100 @@ done
 for c in opcode0 opcode1 opcode8 opcode9 opcode128 opcode132 adminformat; do
  case_run host "$out/probe" "$c"
 done
-# Remove exactly the named three-line refusal block in disposable sources.
-# These are verification mutants, never source edits or candidate artifacts.
-mutate() {
- awk -v target="$1" 'BEGIN {skip=0;hits=0} $0==target {skip=3;hits++} skip>0 {skip--;next} {print} END {if(hits!=1)exit 2}' "$2" > "$3"
+
+# Mutants: disposable copies of the composed sources, never source edits or candidate artifacts.
+# Each must fail its case with the named exit and reason line.
+mutant_awk() {
+ awk "$3" "$out/$2.om" > "$out/mutant-$1.om" || { echo "FAIL mutant $1: its source line was not found exactly" >&2; exit 1; }
+ compile "$out/mutant-$1.om" "$out/mutant-$1"
 }
-: > "$out/mutants.log"
+mutant() {
+ mu_name=$1; mu_rc=$2; mu_line=$3; shift 3
+ expect_fail "$out" "mutant-$mu_name" "$mu_rc" "$mu_line" nice -n 15 "$out/runner" "$out/mutant-$mu_name" "$@"
+ control_line "mutant-$mu_name"
+}
 for spec in 'cid|if ne and dw3 65535 cid|cid|read' \
  'sqid|if ne shr dw2 16 q|sqid|read' \
  'status|if ne and shr dw3 17 2047 0|status|read' \
- 'sqhead|if ne and dw2 65535 get tail q|sqhead|read' \
- 'reopen|if gt get st 0 0|timeout|failstop' \
- 'opcode|if not ok|opcode1|probe'; do
+ 'sqhead|if ne and dw2 65535 get tail q|sqhead|read'; do
  name=${spec%%|*}; rest=${spec#*|}; guard=${rest%%|*}; rest=${rest#*|}; case_name=${rest%%|*}; source=${rest#*|}
- mutate "$guard" "$out/$source.om" "$out/mutant-$name.om"
- compile "$out/mutant-$name.om" "$out/mutant-$name"
- if nice -n 15 "$out/runner" "$out/mutant-$name" "$case_name" > "$out/mutant-$name.log" 2>&1; then
-  echo "FAIL mutant survived $name" >&2; exit 1
- fi
- echo "PASS killed guard-removal mutant $name (baseline case passed)" >> "$out/mutants.log"
+ # Remove exactly the named three-line refusal block.
+ mutant_awk "$name" "$source" "BEGIN {skip=0;hits=0} \$0==\"$guard\" {skip=3;hits++} skip>0 {skip--;next} {print} END {if(hits!=1)exit 2}"
+ # The guard gone, the engine accepts the bad completion: result 0, not the refusal.
+ mutant "$name" 1 "FAIL case=$case_name transport=C-model result=0 " "$case_name"
 done
-# Retention negative control: delete only the in-flight ownership marker.
-awk '$0=="put st 1 1" {hits++;next} {print} END {if(hits!=1)exit 2}' "$out/read.om" > "$out/mutant-retention.om"
-compile "$out/mutant-retention.om" "$out/mutant-retention"
-if nice -n 15 "$out/runner" "$out/mutant-retention" timeout > "$out/mutant-retention.log" 2>&1; then
- echo 'FAIL retention mutant survived' >&2; exit 1
-fi
-echo 'PASS killed retention guard-removal mutant' >> "$out/mutants.log"
-# Wait-budget mutants: both 256-poll loops cut to 1 poll, and both transport waits deleted. Each
-# must time out on the slow case (result 12), and the unmutated engine passes it (above).
-budget_mutant() {
- name=$1; prog=$2
- awk "$prog" "$out/read.om" > "$out/mutant-$name.om"
- compile "$out/mutant-$name.om" "$out/mutant-$name"
- if nice -n 15 "$out/runner" "$out/mutant-$name" slow > "$out/mutant-$name.log" 2>&1; then
-  echo "FAIL $name mutant survived the slow case" >&2; exit 1
- fi
- grep -q '^FAIL case=slow transport=C-model result=12 ' "$out/mutant-$name.log" ||
-  { cat "$out/mutant-$name.log" >&2; echo "FAIL $name mutant did not die by timeout (result 12)" >&2; exit 1; }
- echo "PASS killed $name mutant on the slow case (result 12)" >> "$out/mutants.log"
-}
-budget_mutant budget1 '$0=="for i ulong 256" {print "for i ulong 1"; hits++; next} {print} END {if(hits!=2)exit 2}'
-budget_mutant nowait '$0=="transport_wait 1000" || $0=="transport_wait 100" {hits++; next} {print} END {if(hits!=2)exit 2}'
-: > "$out/qemu.log"; : > "$out/qemu.err"
-# Firmware identity is intentionally pinned; a different QEMU version refuses.
+mutant_awk reopen failstop 'BEGIN {skip=0;hits=0} $0=="if gt get st 0 0" {skip=3;hits++} skip>0 {skip--;next} {print} END {if(hits!=1)exit 2}'
+mutant reopen 1 'FAIL timeout: uncertain DMA is not zeroed/reset/reopened' timeout
+mutant_awk opcode probe 'BEGIN {skip=0;hits=0} $0=="if not ok" {skip=3;hits++} skip>0 {skip--;next} {print} END {if(hits!=1)exit 2}'
+mutant opcode 1 'FAIL opcode1: NO WRITE OPCODE REACHABLE' opcode1
+# Retention: delete only the in-flight ownership marker.
+mutant_awk retention read '$0=="put st 1 1" {hits++;next} {print} END {if(hits!=1)exit 2}'
+mutant retention 1 'FAIL timeout: timeout/correlation DMA retention' timeout
+# Wait budget. Both 256-poll loops cut to 1 poll, or both transport waits deleted: timeout on the
+# slow case (result 12). Both loops at 255 or 257 polls: the timeout cases see the budget is not
+# 256. A completion wait of 51 us or a ready wait of 501 us: the wait lengths are not the engine's.
+mutant_awk budget1 read '$0=="for i ulong 256" {print "for i ulong 1"; hits++; next} {print} END {if(hits!=2)exit 2}'
+mutant budget1 1 'FAIL case=slow transport=C-model result=12 ' slow
+mutant_awk nowait read '$0=="transport_wait 1000" || $0=="transport_wait 100" {hits++; next} {print} END {if(hits!=2)exit 2}'
+mutant nowait 1 'FAIL case=slow transport=C-model result=12 ' slow
+mutant_awk budget255 read '$0=="for i ulong 256" {print "for i ulong 255"; hits++; next} {print} END {if(hits!=2)exit 2}'
+mutant budget255 1 'FAIL timeout: timeout case: the longest wait loop took 255 waits, 25500 us;' timeout
+mutant_awk budget257 read '$0=="for i ulong 256" {print "for i ulong 257"; hits++; next} {print} END {if(hits!=2)exit 2}'
+mutant budget257 2 'FAIL readytimeout: ENGINE_OVER_BUDGET 257 waits in one loop' readytimeout
+mutant_awk cwait51 read '$0=="transport_wait 100" {print "transport_wait 51"; hits++; next} {print} END {if(hits!=1)exit 2}'
+mutant cwait51 1 'FAIL slow: slow case: wait loops took 128 to 251 waits,' slow
+mutant_awk rwait501 read '$0=="transport_wait 1000" {print "transport_wait 501"; hits++; next} {print} END {if(hits!=1)exit 2}'
+mutant rwait501 1 'FAIL readytimeout: timeout case: the longest wait loop took 256 waits, 128256 us;' readytimeout
+
+# QEMU. Firmware identity is intentionally pinned; a different QEMU version refuses.
 qemu-system-aarch64 --version > "$out/qemu-version.txt"
+# A runnable peer that never answers is ended only by the runner's 30 s ALARM; it runs beside the
+# QEMU cases, logged in $ctl.
+( run_logged "$ctl" silent env OMEGA_NVME_FAKE=trickle PATH="$out/fakebin:$PATH" nice -n 15 "$out/runner" "$out/read" healthy qemu ) &
+silent=$!
 for c in healthy serial firmware approval nsid extent range before prp zero; do
  case_run qemu "$out/read" "$c" qemu
 done
-# QEMU death control: the runner SIGKILLs QEMU at the 20th RPC and waits for it to go idle; it must
-# see QEMU_DEAD and exit 2 at once. timeout bounds only this control (a hang is exit 124, a FAIL).
-rc=0; timeout 300 nice -n 15 "$out/runner" "$out/read" qemukill qemu > "$out/control-qemukill.log" 2>&1 || rc=$?
-if [ "$rc" != 2 ] || ! grep -q '^FAIL qemukill: QEMU_DEAD ' "$out/control-qemukill.log"; then
- cat "$out/control-qemukill.log" >&2; echo "FAIL QEMU death control: exit $rc, QEMU_DEAD not reported" >&2; exit 1
+# QEMU_MAX_WAITS: nine waits after each SQ doorbell make a wait loop longer than the runner's 8.
+mutant_awk qemu-max-waits read '{print} $0=="ring q 0 get tail q" {for (i = 0; i < 9; i++) print "transport_wait 100"; hits++} END {if(hits!=1)exit 2}'
+mutant qemu-max-waits 1 'FAIL healthy: QEMU: a wait loop used ' healthy qemu
+# Peer controls: each must end the run with exit 2 and its reason.
+expect_fail "$out" control-qemu-killed 2 'FAIL qemukill: QEMU_DEAD ' nice -n 15 "$out/runner" "$out/read" qemukill qemu
+control_line qemu-killed
+expect_fail "$out" control-qemu-stopped 2 'FAIL qemustop: QEMU_STOPPED ' nice -n 15 "$out/runner" "$out/read" qemustop qemu
+control_line qemu-stopped
+expect_fail "$out" control-qemu-mute 2 'FAIL healthy: QEMU_MUTE ' \
+ env OMEGA_NVME_FAKE=mute PATH="$out/fakebin:$PATH" nice -n 15 "$out/runner" "$out/read" healthy qemu
+control_line qemu-mute
+expect_fail "$out" control-qemu-not-listening 2 'FAIL healthy: QEMU_NOT_LISTENING ' \
+ env OMEGA_NVME_FAKE=nolisten PATH="$out/fakebin:$PATH" nice -n 15 "$out/runner" "$out/read" healthy qemu
+control_line qemu-not-listening
+expect_fail "$out" control-candidate-mute 2 'FAIL healthy: CANDIDATE_MUTE ' \
+ env OMEGA_NVME_FAKE=mute nice -n 15 "$out/runner" "$out/fakepeer" healthy
+control_line candidate-mute
+# The runnable silent peer: exit 2 after an ALARM line, and finish refuses its logs for that line.
+wait "$silent" || true
+rc=$(cat "$ctl/silent.rc" 2>/dev/null || echo none)
+if [ "$rc" != 2 ] || ! has_line 'ALARM healthy: ' "$ctl/silent.err" || ! has_line 'FAIL healthy: PEER_SILENT ' "$ctl/silent.err"; then
+ cat "$ctl/silent.log" "$ctl/silent.err" >&2; echo "FAIL silent-peer control: exit $rc, no ALARM line and PEER_SILENT" >&2; exit 1
 fi
-echo "PASS QEMU death control: killed QEMU ended the run, exit 2 (QEMU_DEAD)" >> "$out/mutants.log"
-alarms=$(cat "$out/host.err" "$out/qemu.err" | grep -c '^ALARM' || true)
-[ "$alarms" = 0 ] || { grep '^ALARM' "$out/host.err" "$out/qemu.err" >&2; echo "FAIL $alarms ALARM lines" >&2; exit 1; }
-cases=$(grep -c '^PASS case=' "$out/host.log" "$out/qemu.log" | awk -F: '{s += $2} END {print s}')
-sha256sum "$AIEN_OMC" "$base/omega_nvme.om" "$base/omega_nvme_transport.om" \
- "$base/omega_nvme_main.om" "$base/tests/omega_nvme_runner.c" "$out/read" > "$out/sha256.txt"
-printf 'PASS Omega NVMe host + QEMU + guard, budget and wait mutants + QEMU death control; cases=%s alarms=0; physical NOT_RUN\n' "$cases" | tee "$out/result.txt"
+if (finish "$ctl") > "$ctl/finish.out" 2>&1 || ! has_line 'FAIL 1 ALARM lines' "$ctl/finish.out" || has_line 'PASS Omega' "$ctl/finish.out"; then
+ cat "$ctl/finish.out" >&2; echo "FAIL silent-peer control: finish did not refuse its ALARM line" >&2; exit 1
+fi
+control_line alarm-printed-counted
+# One ALARM line planted in a copy of this run's logs, in each kind of log, and in a log name no
+# run writes: finish must refuse each copy.
+for f in host.err qemu.err control-qemu-killed.log control-qemu-killed.err mutant-cid.log mutant-cid.err extra.log; do
+ d=$ctl/planted-$f; mkdir -p "$d"
+ cp "$out"/*.log "$out"/*.err "$out/controls.txt" "$d/"
+ echo "ALARM planted: one line in $f" >> "$d/$f"
+ if (finish "$d") > "$d/finish.out" 2>&1 || ! has_line 'FAIL 1 ALARM lines' "$d/finish.out" || has_line 'PASS Omega' "$d/finish.out"; then
+  cat "$d/finish.out" >&2; echo "FAIL planted ALARM in $f was not refused" >&2; exit 1
+ fi
+ control_line "alarm-planted-$(printf '%s' "${f%.*}-${f##*.}")"
+done
+sha256sum "$AIEN_OMC" "$base/omega_nvme.om" "$base/omega_nvme_transport.om" "$base/omega_nvme_main.om" \
+ "$base/tests/omega_nvme_runner.c" "$base/tests/omega_nvme_fakepeer.c" "$out/read" > "$out/sha256.txt"
+finish "$out" > "$out/result.txt" || exit 1
+cat "$out/result.txt"
 printf 'Evidence: %s\n' "$out"

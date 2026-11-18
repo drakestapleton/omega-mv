@@ -155,21 +155,46 @@ into the normal read entrypoint.
 - Controller-ready and command waits are bounded to 256 polls, each miss followed
   by a transport wait (RPC op 9, `transport_wait`: 1000 us per ready poll, 100 us
   per completion poll), as the C driver's `delay_us`. The bound is 256 waits of the
-  transport, not a claim of hardware timeout qualification. The verifier keeps QEMU
-  asynchronous: the engine reads whatever QEMU shows, and only when it waits does
-  the verifier wait until QEMU is idle (every thread asleep, none run between two
-  reads of /proc), so one wait covers a completion at any load; a wait loop that
-  needs more than 8 waits in QEMU fails the case. The budget is checked by the
-  C-model `slow` case, which holds every command and the ready bit for 128 of the
-  256 waits, and by two mutants that must time out on it (result 12): both loops
-  cut to 1 poll, and both waits deleted. (Before 2026-11-18 the verifier waited for
-  an idle QEMU before every read, so no budget down to 1 poll ever failed.)
-- The verifier has no wall-clock deadline: it waits while the peer lives. A QEMU
-  that exits or turns zombie ends the run at once (`QEMU_DEAD`, exit 2; the
-  `qemukill` control kills QEMU mid-run and must see that). A wait of 30 s prints
-  an ALARM line, which fails the case, and `tests/omega_nvme_test.sh` refuses any
-  ALARM line in its runner logs.
-  Queue/DMA storage stays alive until the verifier tears down its controller.
+  transport, not a claim of hardware timeout qualification.
+- What the verifier checks of that budget (`tests/omega_nvme_runner.c` holds its
+  own copy of 256, 1000 us and 100 us as the specification): in the C-model timeout
+  cases (`readytimeout`, `timeout`, `phase`) the longest wait loop has exactly 256
+  waits and a delay total of 256 times its wait length; a wait of another length
+  than 100 or 1000 us fails a case; a loop past 256 waits ends the run
+  (`ENGINE_OVER_BUDGET`, exit 2); in the `slow` case, where the model holds each
+  command and the ready bit for 128 waits, each wait loop takes exactly 128 waits.
+  Mutants that must fail with their stated reason: both loops cut to 1 poll and both
+  waits deleted (result 12 on `slow`), both loops at 255 polls
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-budget255] and at 257 polls
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-budget257], a 51 us completion wait
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-cwait51] and a 501 us ready wait
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-rwait501]. An engine change and a matching
+  change to the runner's numbers is a change to a gate file (CA2), not something
+  this test can see.
+- QEMU mode keeps QEMU asynchronous: the engine reads whatever QEMU shows, and when
+  it waits the verifier waits until QEMU is idle (each thread asleep, none run
+  between two reads of /proc). A wait loop of more than 8 waits in QEMU fails the
+  case [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-qemu-max-waits]. (Before 2026-11-18 the
+  verifier waited for an idle QEMU before each read, so a budget of 1 poll passed.)
+- The verifier has no wall-clock deadline while a peer works. A peer that does not
+  answer ends the run with exit 2 and its reason: QEMU exited or a zombie
+  (`QEMU_DEAD`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-killed], stopped (`QEMU_STOPPED`)
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-stopped], idle for a second without answering
+  (`QEMU_MUTE`, `CANDIDATE_MUTE`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-mute]
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/candidate-mute] or without opening its socket
+  (`QEMU_NOT_LISTENING`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-not-listening]. A peer
+  still runnable after 30 s without answering gets an ALARM line and the run ends
+  (`PEER_SILENT`) [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-printed-counted].
+- `tests/omega_nvme_test.sh` writes each runner's output to `<name>.log` and
+  `<name>.err` in its evidence directory (cases, mutants and controls), copies ALARM
+  lines to its stderr as they come, and fails when those logs hold an ALARM line
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-host-err]
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-control-qemu-killed-log]
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-mutant-cid-err]. A run that does not
+  pass copies its evidence to a new `omega-nvme-kept-*` directory under `$TMPDIR`
+  (or /tmp) and names it on stderr. A missing `qemu-system-aarch64` or C compiler
+  is NOT_RUN, exit 3.
+- Queue/DMA storage stays alive until the verifier tears down its controller.
 
 ## Native transport integration contract (not exercised)
 
