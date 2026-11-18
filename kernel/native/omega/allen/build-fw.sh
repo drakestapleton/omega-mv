@@ -14,7 +14,7 @@ compiler=${OMEGA_COMPILER:-"$root/../seed/out/omc"}
 pin=$(head -n 1 "$root/../seed/out/omc.sha256" 2>/dev/null | cut -c1-64)
 printf '%s\n' "$pin" | grep -qxE '[0-9a-f]{64}' || { echo "compiler pin refused: no sha256 in $root/../seed/out/omc.sha256" >&2; exit 65; }
 [ "$(sha256sum "$compiler" | cut -d' ' -f1)" = "$pin" ] || {
- echo 'compiler digest differs from the qualified pin' >&2
+ echo 'compiler pin mismatch: digest differs from the qualified pin' >&2
  exit 65
 }
 out=$1

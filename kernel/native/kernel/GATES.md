@@ -933,10 +933,15 @@ with its `_nomask` forms because the iMac drawing cores keep interrupts on for T
   2^32 wrap); the interrupt ordering in a one-CPU model, and on two CPUs under every interleaving with an interrupt
   transition, for both forms (the `l->irq` form included), each mutant unsafe. These are proofs about the listed operation
   orders, not about spinlock.h as compiled (the asm check covers that link). Not modelled: memory ordering, more than two
-  CPUs or one interrupt per CPU, trylock outside the queue invariant. `proofs/check.sh` passes the file only when lean prints
-  no warning or error, `#print axioms` of every theorem and of every constant it declares lists only propext,
-  Classical.choice and Quot.sound, and the source has no sorry/admit/native_decide/axiom; its `--selftest` requires the four
-  bad edits in `proofs/controls/` to FAIL. Without lean or with another version: NOT_RUN, exit 3.
+  CPUs or one interrupt per CPU, trylock outside the queue invariant. `proofs/check.sh` passes the file only when the source
+  has no banned word, Lean's parser finds only the syntax kinds allowlisted in `proofs/TicketLock.syntax` (no #eval,
+  set_option, macro, attribute or import; otherwise lean never runs the file), lean compiles it with no warning or error,
+  leanchecker replays every constant through the kernel, every constant uses only propext, Classical.choice and
+  Quot.sound, and every constant with its type, definition body and theorem statement equals `proofs/TicketLock.pins`
+  (so the GATED statements of 221i cannot be weakened, and no declaration outside the reviewed source passes). Its
+  `--selftest` requires the 12 bad edits in `proofs/controls/` to FAIL (2026-11-18, review of omega-mv c9e503afd finding
+  2: the #eval that adds an unchecked theorem of False, and `True := trivial` statements). Without lean or with another
+  version: NOT_RUN, exit 3.
 - Rows 221c and 221d were hand runs. Since the 2026-11-17 review fixes, `tests/gates/run.sh spinlock` (omega-mv:
   `tests/gates/run.sh kernel-spinlock`, part of `tests/gates/run.sh kernel`) runs both with their controls and its own
   NOT_RUN controls (no lean, wrong lean, no x86 compiler); rows 221f-221i.

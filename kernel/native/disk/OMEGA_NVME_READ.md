@@ -152,16 +152,23 @@ into the normal read entrypoint.
   checked by subtraction before arithmetic; namespace capacity must cover them.
 - MDTS zero means no advertised limit. With MPSMIN zero, every nonzero MDTS
   permits at least two pages; the fixed 8192-byte software limit cannot exceed it.
-- Controller-ready and command waits are bounded to 256 transport polls. This is
-  a hosted, bounded attempt budget, not a claim of milliseconds or hardware
-  timeout qualification. The verifier has no wall-clock guard: its 3 s poll read a
-  descheduled peer as the end of its stream, and it now waits while the peer lives,
-  with an ALARM line every 30 s. In QEMU mode it waits until QEMU is idle (every
-  thread asleep, none run between two reads of /proc) before each read the engine
-  makes, so the emulated device completes before the next poll; without that, a
-  starved QEMU thread let the 256 polls run out on the healthy case at load average
-  25 to 45 (result 12, DMA retained). The engine's own timeout is exercised by the
-  C-model cases.
+- Controller-ready and command waits are bounded to 256 polls, each miss followed
+  by a transport wait (RPC op 9, `transport_wait`: 1000 us per ready poll, 100 us
+  per completion poll), as the C driver's `delay_us`. The bound is 256 waits of the
+  transport, not a claim of hardware timeout qualification. The verifier keeps QEMU
+  asynchronous: the engine reads whatever QEMU shows, and only when it waits does
+  the verifier wait until QEMU is idle (every thread asleep, none run between two
+  reads of /proc), so one wait covers a completion at any load; a wait loop that
+  needs more than 8 waits in QEMU fails the case. The budget is checked by the
+  C-model `slow` case, which holds every command and the ready bit for 128 of the
+  256 waits, and by two mutants that must time out on it (result 12): both loops
+  cut to 1 poll, and both waits deleted. (Before 2026-11-18 the verifier waited for
+  an idle QEMU before every read, so no budget down to 1 poll ever failed.)
+- The verifier has no wall-clock deadline: it waits while the peer lives. A QEMU
+  that exits or turns zombie ends the run at once (`QEMU_DEAD`, exit 2; the
+  `qemukill` control kills QEMU mid-run and must see that). A wait of 30 s prints
+  an ALARM line, which fails the case, and `tests/omega_nvme_test.sh` refuses any
+  ALARM line in its runner logs.
   Queue/DMA storage stays alive until the verifier tears down its controller.
 
 ## Native transport integration contract (not exercised)

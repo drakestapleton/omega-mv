@@ -808,12 +808,24 @@ case "$step" in
   # seed/out/omc.sha256 (hw-gates, omega-nvme and tcp-corpus compile Omega; ck-host-tests starts with
   # native/kernel's make test sanitize; spinlock checks the compiled order of core/spinlock.h and its
   # Lean model, and is NOT_RUN, exit 3, without the cross compilers or the pinned lean).
-  # kernel-make-test is native/kernel's make test alone. `kernel` runs the six in the order below,
-  # logs each under $OUT_DIR, prints one line per step with its exit status and log sha256, and exits 1
-  # when any step did not exit 0 (a NOT_RUN exit 3 is not a pass).
-  kernel-make-test)   make -C kernel/native/kernel test ;;
-  kernel-ck-host-tests|kernel-hw-gates|kernel-omega-nvme|kernel-tcp-corpus|kernel-spinlock)
-    bash kernel/tests/gates/run.sh "${step#kernel-}" ;;
+  # kernel-make-test is native/kernel's make test alone: PASS only when make exits 0 and its log has no
+  # NOT_RUN line (an input-dependent check such as CK_GSP_BINDATA_PIN, CK_GSP_FW_INSPECT_PIN or
+  # GB10_GSP_NVHDR that did not run makes the step NOT_RUN, exit 3, listing each line). `kernel` runs
+  # the six in the order below, logs each under $OUT_DIR, prints one line per step with its exit status
+  # and log sha256, and exits 1 when any step did not exit 0 (a NOT_RUN exit 3 is not a pass).
+  kernel-make-test)
+    mlog="$OUT_DIR/make-test.log"
+    rc=0; make -C kernel/native/kernel test 2>&1 | tee "$mlog" || rc=$?
+    [ "$rc" = 0 ] || { echo "kernel-make-test: make test exit $rc, not PASS"; exit 1; }
+    nr=$(grep -cE '^[A-Za-z0-9_ -]+: NOT_RUN' "$mlog" || true)
+    obs kernel_make_test_not_run "$nr"
+    if [ "$nr" != 0 ]; then
+      grep -E '^[A-Za-z0-9_ -]+: NOT_RUN' "$mlog" | sed 's/^/kernel-make-test: not run: /'
+      echo "kernel-make-test: NOT_RUN ($nr checks in make test did not run; make test exit 0)"; exit 3
+    fi
+    echo "kernel-make-test: PASS (make test exit 0, no NOT_RUN line in $mlog)" ;;
+  kernel-gate-wiring) bash kernel/scripts/omega_gate_wiring.sh --self-test ;;
+  kernel-*)           bash kernel/tests/gates/run.sh "${step#kernel-}" ;;
   kernel)
     kfail=0; kn=0
     for s in make-test ck-host-tests hw-gates omega-nvme tcp-corpus spinlock; do
