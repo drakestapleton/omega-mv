@@ -13,7 +13,9 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from transformers import AutoConfig
-from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
+from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+    Qwen4ExpTextModel, Qwen4ExpTextNGramEmbedding, Qwen4ExpTextRotaryEmbedding,
+)
 
 
 PREFIX = "model.language_model.layers.1.ple.ple_embedding."
@@ -48,6 +50,28 @@ class ReferenceTable(torch.nn.Module):
         return values.bfloat16().reshape(*indices.shape, 160)
 
 
+def decoder_input(cfg, weight, ids):
+    """Capture the real input to the first Transformers decoder block without loading later blocks."""
+    class ReachedDecoder(Exception):
+        pass
+
+    def capture(_module, args):
+        raise ReachedDecoder(args[0].view(torch.uint16).numpy().tobytes())
+
+    with torch.device("meta"):
+        model = Qwen4ExpTextModel(cfg)
+    model.embed_tokens = torch.nn.Embedding.from_pretrained(weight)
+    model.rotary_emb = Qwen4ExpTextRotaryEmbedding(cfg)
+    model.layers[0].register_forward_pre_hook(capture)
+    masks = {"linear_attention": None, "qwen_sparse_attention": None}
+    try:
+        with torch.inference_mode():
+            model(torch.tensor([ids]), attention_mask=masks, use_cache=False)
+    except ReachedDecoder as result:
+        return result.args[0]
+    raise AssertionError("Transformers did not enter the first decoder block")
+
+
 def check(exe, model):
     index = (model / "model.safetensors.index.json").read_bytes()
     assert hashlib.sha256(index).hexdigest() == INDEX_HASH
@@ -57,6 +81,40 @@ def check(exe, model):
     ids = CHAT + [cfg.eos_token_id, 0, cfg.eos_token_id, cfg.eos_token_id,
                   cfg.vocab_size - 1] + [rng.randrange(cfg.vocab_size) for _ in range(240)]
     data = struct.pack(f"<{len(ids)}I", *ids)
+    with safe_open(model / locations["model.language_model.embed_tokens.weight"], framework="pt") as shard:
+        weight = shard.get_tensor("model.language_model.embed_tokens.weight")
+        assert weight.shape == (cfg.vocab_size, cfg.hidden_size)
+        residual = decoder_input(cfg, weight, ids)
+
+    def input_run(payload, cwd=model, mode="--decoder-input"):
+        return subprocess.run([exe, mode], input=payload, stdout=subprocess.PIPE, cwd=cwd, timeout=60)
+
+    actual = input_run(data)
+    assert actual.returncode == 0 and actual.stdout == residual
+    assert len(residual) == len(ids) * 4 * 5120
+    assert input_run(b"").returncode == 0
+    for bad in (b"x", struct.pack("<I", cfg.vocab_size)):
+        result = input_run(bad)
+        assert (result.returncode, result.stdout) == (3, b"")
+    assert input_run(b"", mode="--decoder-input-extra").returncode == 1
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        assert input_run(data, root).returncode == 2
+        name = locations["model.language_model.embed_tokens.weight"]
+        with (model / name).open("rb") as src:
+            n, = struct.unpack("<Q", src.read(8))
+            header = json.loads(src.read(n))
+        key = "model.language_model.embed_tokens.weight"
+        for field, value in (("dtype", "F16"), ("shape", [cfg.vocab_size - 1, cfg.hidden_size]),
+                             ("data_offsets", [0, 2])):
+            changed = {**header, key: {**header[key], field: value}}
+            raw = json.dumps(changed).encode()
+            with (root / name).open("wb") as out:
+                out.write(struct.pack("<Q", len(raw)) + raw)
+                out.truncate((model / name).stat().st_size - n + len(raw))
+            result = input_run(data, root)
+            assert (result.returncode, result.stdout) == (2, b"")
+    print(f"PASS decoder input: {len(ids)} tokens, {len(residual)} identical BF16 bytes, sha256 {hashlib.sha256(residual).hexdigest()}")
     with contextlib.ExitStack() as stack:
         filenames = {name for key, name in locations.items() if key.startswith(PREFIX)}
         shards = {name: stack.enter_context(safe_open(model / name, framework="pt"))

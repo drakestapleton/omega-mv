@@ -2,6 +2,8 @@
 
 `lookup.om` reads one sequence of little-endian uint32 token IDs from standard input. For each token it emits 2,560 little-endian BF16 values. The first input starts a new sequence. The checkpoint EOS token resets the n-gram history for subsequent tokens.
 
+With `--decoder-input`, the same executable reads only the BF16 vocabulary embedding in checkpoint shard 130. Each token yields the four 2,560-value residual streams that enter the first decoder layer, in their checkpoint order. This mode reads one row per token.
+
 The input profile is Qwen/Qwen3.8-Flash-Next-FP8 revision `7fb48d708ca6cd8eeed8f4db0433be18af96984f`. Run the binary with the verified checkpoint as its working directory. At startup it reads the safetensors headers of files 5 through 37, locates each of the 128 row tensors by name, checks the dtype, shape and byte ranges, and reads the three hash multipliers, head offsets, vocabulary sizes and scale from the checkpoint. At each token it reads 16 FP8 rows by file offset. This host component supplies the n-gram input to the model's PLE layer. GPU execution and text generation require the rest of the model and driver.
 
 Build on AArch64 Linux from the repository root. The executable uses seeded Omega for JSON, file I/O, FP8 conversion and BF16 rounding.
