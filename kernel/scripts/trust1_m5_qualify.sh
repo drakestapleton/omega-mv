@@ -772,8 +772,14 @@ self_test() {
     QUIET_FLAG="${saved_quiet2}"; results=("${saved_results2[@]}"); quiet_flag_seen_at_gates=false
 
     # Dirty-tree refusal, end to end, on a private clone (never this tree).
-    local clone="${tmp}/clone" rc
-    if git clone -q --shared "${repo_root}" "${clone}" 2>/dev/null; then
+    # The checkout is a repository root (aienux alone) or kernel/ inside omega-mv (aienux folded
+    # there, 2026-11-17): clone the whole repository and work in the same prefix, so ${clone}
+    # stands for ${repo_root} either way.
+    local clone="${tmp}/clone" rc top pfx
+    if top="$(git -C "${repo_root}" rev-parse --show-toplevel 2>/dev/null)" \
+        && pfx="$(git -C "${repo_root}" rev-parse --show-prefix)" \
+        && git clone -q --shared "${top}" "${tmp}/clone-top" 2>/dev/null \
+        && ln -s "${tmp}/clone-top/${pfx}" "${clone}"; then
         cp "${BASH_SOURCE[0]}" "${clone}/scripts/trust1_m5_qualify.sh"
         git -C "${clone}" add scripts/trust1_m5_qualify.sh
         git -C "${clone}" -c user.name=t -c user.email=t@t commit -qm selftest --allow-empty
@@ -784,6 +790,14 @@ self_test() {
         echo x >>"${clone}/README.md" 2>/dev/null || echo x >"${clone}/README.md"
         bash "${clone}/scripts/trust1_m5_qualify.sh" --machine-only --out "${tmp}/o2" >/dev/null 2>&1; rc=$?
         [[ ${rc} == 2 ]] && ok "dirty tree (modified tracked file) refused, exit 2" || bad "modified tree gave exit ${rc}, expected 2"
+        # Inside omega-mv a change outside kernel/ is a dirty tree too.
+        if [[ -n ${pfx} ]]; then
+            git -C "${tmp}/clone-top" checkout -q -- .
+            : >"${tmp}/clone-top/untracked_top_junk"
+            bash "${clone}/scripts/trust1_m5_qualify.sh" --machine-only --out "${tmp}/o2b" >/dev/null 2>&1; rc=$?
+            [[ ${rc} == 2 ]] && ok "dirty tree outside ${pfx} (untracked file at the top) refused, exit 2" || bad "untracked file outside ${pfx} gave exit ${rc}, expected 2"
+            rm -f "${tmp}/clone-top/untracked_top_junk"
+        fi
         git -C "${clone}" checkout -q -- . 2>/dev/null; git -C "${clone}" clean -qfd
         # A run that dirties the tree must exit 1.
         AIENOS_QUALIFY_TEST_DIRTY=1 bash "${clone}/scripts/trust1_m5_qualify.sh" --machine-only --out "${tmp}/o3" >/dev/null 2>&1; rc=$?
@@ -792,7 +806,8 @@ self_test() {
         git -C "${clone}" clean -qfd
         bash "${clone}/scripts/trust1_m5_qualify.sh" --machine-only --out "${clone}/evidence/qualify_st" >/dev/null 2>&1; rc=$?
         local added; added="$(git -C "${clone}" status --porcelain --untracked-files=all)"
-        if [[ ${rc} == 0 && "${added}" =~ ^\?\?\ evidence/qualify_st/trust1_m5_qualification_[0-9a-f]{64}\.json$ ]]; then
+        # git status names paths from the repository top: ${pfx} is kernel/ inside omega-mv, empty alone.
+        if [[ ${rc} == 0 && "${added}" =~ ^\?\?\ "${pfx}"evidence/qualify_st/trust1_m5_qualification_[0-9a-f]{64}\.json$ ]]; then
             ok "--out inside the tree: exit 0, receipt is the only new file"
         else
             bad "--out inside the tree: exit ${rc}, tree change: ${added}"
