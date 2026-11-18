@@ -1,0 +1,199 @@
+note Two full layers per bank. One uint packs the BF16 K and V of the same lane.
+global qa_cache0 uint 16777216
+global qa_cache1 uint 16777216
+global qa_cache2 uint 16777216
+global qa_cache3 uint 16777216
+global qa_cache4 uint 16777216
+global qa_cache5 uint 16777216
+global qa_cache6 uint 16777216
+global qa_cache7 uint 16777216
+
+fn qa_cache_get bank ulong idx ulong to uint
+if eq bank 0
+ret get qa_cache0 idx
+end
+if eq bank 1
+ret get qa_cache1 idx
+end
+if eq bank 2
+ret get qa_cache2 idx
+end
+if eq bank 3
+ret get qa_cache3 idx
+end
+if eq bank 4
+ret get qa_cache4 idx
+end
+if eq bank 5
+ret get qa_cache5 idx
+end
+if eq bank 6
+ret get qa_cache6 idx
+end
+ret get qa_cache7 idx
+end
+
+fn qa_cache_put bank ulong idx ulong value uint to void
+if eq bank 0
+put qa_cache0 idx value
+ret
+end
+if eq bank 1
+put qa_cache1 idx value
+ret
+end
+if eq bank 2
+put qa_cache2 idx value
+ret
+end
+if eq bank 3
+put qa_cache3 idx value
+ret
+end
+if eq bank 4
+put qa_cache4 idx value
+ret
+end
+if eq bank 5
+put qa_cache5 idx value
+ret
+end
+if eq bank 6
+put qa_cache6 idx value
+ret
+end
+put qa_cache7 idx value
+ret
+end
+
+global qa_row f32 256
+global qa_cos f32 32
+global qa_sin f32 32
+global qa_score f32 8192
+
+fn qa_angles pos ulong to void
+for i ulong 32
+freq = qb_exp mul f64 i -0.50369048909244749f64
+angle = mul f64 pos freq
+put qa_cos i f32 qb_sc angle true
+put qa_sin i f32 qb_sc angle false
+end
+end
+
+fn qa_prepare x view f32 14336 start ulong w view f32 512 off ulong to void
+s = 0.0f32
+for j ulong 256
+v = get x add start j
+s = add s mul v v
+end
+inv = div 1.0f32 fsqrt add div s 256.0f32 1.0e-6f32
+for j ulong 256
+v = mul get x add start j inv
+put qa_row j mul v add 1.0f32 get w add off j
+end
+for i ulong 32
+a = get qa_row i
+b = get qa_row add i 32
+co = get qa_cos i
+si = get qa_sin i
+put qa_row i sub mul a co mul b si
+put qa_row add i 32 add mul b co mul a si
+end
+end
+
+fn qa_bf x f32 to uint
+bits = bitcast uint x
+ret shr add bits add 32767 and shr bits 16 1 16
+end
+
+fn qa_row_offset slot ulong pos ulong nk ulong h ulong to ulong
+ret mul add mul rem slot 2 32768 add mul pos nk h 256
+end
+
+fn qa_store bank ulong row ulong x view f32 14336 vsrc ulong to void
+for j ulong 256
+k = qa_bf get qa_row j
+v = qa_bf get x add vsrc j
+qa_cache_put bank add row j or shl k 16 v
+end
+end
+
+fn qa_append x view f32 14336 w view f32 512 nh ulong nk ulong slot ulong pos ulong to void
+for h ulong nk
+src = add mul nh 512 mul h 256
+qa_prepare x src w 256
+row = qa_row_offset slot pos nk h
+src = add src mul nk 256
+qa_store div slot 2 row x src
+end
+end
+
+fn qa_dot bank ulong row ulong to f32
+s = 0.0f32
+for j ulong 256
+k = bitcast f32 and qa_cache_get bank add row j 4294901760
+s = add s mul get qa_row j k
+end
+ret div s 16.0f32
+end
+
+fn qa_weighted bank ulong row ulong wt f32 to void
+for j ulong 256
+v = bitcast f32 shl qa_cache_get bank add row j 16
+put qa_row j add get qa_row j mul wt v
+end
+end
+
+fn qa_attend bank ulong first ulong stride ulong span ulong to void
+peak = -3.40282346e38f32
+for p ulong span
+score = qa_dot bank add first mul p stride
+put qa_score p score
+peak = fmax peak score
+end
+for j ulong 256
+put qa_row j 0.0f32
+end
+den = 0.0f32
+for p ulong span
+wt = f32 qb_exp f64 sub get qa_score p peak
+den = add den wt
+row = add first mul p stride
+qa_weighted bank row wt
+end
+for j ulong 256
+put qa_row j div get qa_row j den
+end
+end
+
+fn qa_gate h ulong x view f32 14336 y edit f32 6144 to void
+for j ulong 256
+gate = get x add add mul h 512 256 j
+put y add mul h 256 j mul get qa_row j f32 qb_sig f64 gate
+end
+end
+
+fn qa_query slot ulong h ulong nh ulong nk ulong pos ulong to void
+first = qa_row_offset slot 0 nk div h div nh nk
+qa_attend div slot 2 first mul nk 256 add pos 1
+end
+
+fn qwen_attention_step model ulong layer ulong pos ulong x view f32 14336 w view f32 512 y edit f32 6144 to void
+qb_check model layer pos true
+nh = ulong 24
+nk = ulong 4
+if eq model 35
+nh = ulong 16
+nk = ulong 2
+end
+slot = div layer 4
+qa_angles pos
+qa_append x w nh nk slot pos
+for h ulong nh
+qa_prepare x mul h 512 w 0
+qa_query slot h nh nk pos
+qa_gate h x y
+end
+put qb_model layer model
+put qb_next layer add pos 1
+end

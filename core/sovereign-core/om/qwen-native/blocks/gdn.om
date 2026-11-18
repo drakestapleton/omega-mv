@@ -1,0 +1,173 @@
+note Each bank contains 16 linear layers in compact linear-layer order.
+global qd_state0 f32 12582912
+global qd_state1 f32 12582912
+global qd_state2 f32 12582912
+
+fn qd_state_get bank ulong idx ulong to f32
+if eq bank 0
+ret get qd_state0 idx
+end
+if eq bank 1
+ret get qd_state1 idx
+end
+ret get qd_state2 idx
+end
+
+fn qd_state_put bank ulong idx ulong value f32 to void
+if eq bank 0
+put qd_state0 idx value
+ret
+end
+if eq bank 1
+put qd_state1 idx value
+ret
+end
+put qd_state2 idx value
+ret
+end
+
+global qd_tail f32 1474560
+global qd_mix f32 10240
+global qd_delta f32 128
+global qd_core f32 128
+
+fn qd_channel idx ulong c ulong resetting bool cur f32 w view f32 41184 to void
+total = 0.0f32
+tap = mul c 4
+for j ulong 3
+old = 0.0f32
+if not resetting
+old = get qd_tail add idx mul j 10240
+end
+total = add total mul old get w add tap j
+if gt j 0
+put qd_tail add idx mul sub j 1 10240 old
+end
+end
+put qd_tail add idx 20480 cur
+total = add total mul cur get w add tap 3
+put qd_mix c mul total f32 qb_sig f64 total
+end
+
+fn qd_conv slot ulong p ulong n ulong x view f32 16480 w view f32 41184 to void
+for c ulong n
+qd_channel add mul slot 30720 c c eq p 0 get x c w
+end
+end
+
+fn qd_unit base ulong query bool to void
+s = 0.0f32
+for i ulong 128
+v = get qd_mix add base i
+s = add s mul v v
+end
+inv = div 1.0f32 fsqrt add s 1.0e-6f32
+for i ulong 128
+v = mul get qd_mix add base i inv
+if query
+v = div v fsqrt 128.0f32
+end
+put qd_mix add base i v
+end
+end
+
+fn qd_predict bank ulong base ulong kh ulong decay f32 resetting bool to void
+for j ulong 128
+put qd_delta j 0.0f32
+put qd_core j 0.0f32
+end
+for r ulong 128
+kr = get qd_mix add 2048 add kh r
+row = add base mul r 128
+for j ulong 128
+idx = add row j
+sv = 0.0f32
+if not resetting
+sv = mul decay qd_state_get bank idx
+end
+qd_state_put bank idx sv
+put qd_delta j add get qd_delta j mul sv kr
+end
+end
+end
+
+fn qd_update_row bank ulong row ulong kr f32 qr f32 to void
+for j ulong 128
+idx = add row j
+sv = add qd_state_get bank idx mul kr get qd_delta j
+qd_state_put bank idx sv
+put qd_core j add get qd_core j mul qr sv
+end
+end
+
+fn qd_update bank ulong base ulong kh ulong vh ulong beta f32 to void
+for j ulong 128
+v = get qd_mix add 4096 add mul vh 128 j
+put qd_delta j mul sub v get qd_delta j beta
+end
+for r ulong 128
+kr = get qd_mix add 2048 add kh r
+qr = get qd_mix add kh r
+row = add base mul r 128
+qd_update_row bank row kr qr
+end
+end
+
+fn qd_gated vh ulong n ulong x view f32 16480 w view f32 41184 y edit f32 6144 to void
+s = 0.0f32
+for j ulong 128
+v = get qd_core j
+s = add s mul v v
+end
+inv = div 1.0f32 fsqrt add div s 128.0f32 1.0e-6f32
+for j ulong 128
+i = add mul vh 128 j
+z = get x add n i
+g = mul z f32 qb_sig f64 z
+z = mul get qd_core j inv
+z = mul z get w add 41056 j
+put y i mul z g
+end
+end
+
+fn qd_decay a f32 log_rate f32 bias f32 to f32
+rate = neg f32 qb_exp f64 log_rate
+ret f32 qb_exp f64 mul rate qb_softplus add a bias
+end
+
+global qd_rates f32 2
+fn qd_rates_for h ulong heads ulong x view f32 16480 w view f32 41184 to void
+ab = add add 4096 mul heads 256 mul h 2
+rate = get w add 40960 h
+bias = get w add 41008 h
+put qd_rates 0 qd_decay get x ab rate bias
+put qd_rates 1 f32 qb_sig f64 get x add ab 1
+end
+
+fn qd_head slot ulong resetting bool h ulong heads ulong to void
+kh = mul div h div heads 16 128
+base = mul add mul rem slot 16 48 h 16384
+qd_predict div slot 16 base kh get qd_rates 0 resetting
+qd_update div slot 16 base kh h get qd_rates 1
+end
+
+fn qwen_delta_step model ulong layer ulong pos ulong x view f32 16480 w view f32 41184 y edit f32 6144 to void
+qb_check model layer pos false
+heads = ulong 48
+if eq model 35
+heads = ulong 32
+end
+slot = sub layer div layer 4
+n = add 4096 mul heads 128
+qd_conv slot pos n x w
+for h ulong 32
+qd_unit mul h 128 lt h 16
+end
+for h ulong heads
+qd_rates_for h heads x w
+qd_head slot eq pos 0 h heads
+qd_gated h n x w y
+end
+put qb_model layer model
+put qb_next layer add pos 1
+end
