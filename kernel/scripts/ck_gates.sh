@@ -756,8 +756,14 @@ self_test() {
 
     # Dirty-tree refusal, end to end, on a private clone (never this tree).
     # Both runs stop before any child script (no QEMU).
-    local clone="${tmp}/clone" rc
-    if git clone -q --shared "${repo_root}" "${clone}" 2>/dev/null; then
+    # The checkout is a repository root (aienux alone) or kernel/ inside omega-mv (aienux folded
+    # there, 2026-11-17): clone the whole repository and work in the same prefix, so ${clone}
+    # stands for ${repo_root} either way.
+    local clone="${tmp}/clone" rc top pfx
+    if top="$(git -C "${repo_root}" rev-parse --show-toplevel 2>/dev/null)" \
+        && pfx="$(git -C "${repo_root}" rev-parse --show-prefix)" \
+        && git clone -q --shared "${top}" "${tmp}/clone-top" 2>/dev/null \
+        && ln -s "${tmp}/clone-top/${pfx}" "${clone}"; then
         cp "${BASH_SOURCE[0]}" "${clone}/scripts/ck_gates.sh"
         git -C "${clone}" add scripts/ck_gates.sh
         git -C "${clone}" -c user.name=t -c user.email=t@t commit -qm selftest --allow-empty
@@ -768,6 +774,24 @@ self_test() {
         echo x >>"${clone}/README.md" 2>/dev/null || echo x >"${clone}/README.md"
         bash "${clone}/scripts/ck_gates.sh" --out "${tmp}/o2" >/dev/null 2>&1; rc=$?
         [[ ${rc} == 2 && ! -e "${tmp}/o2" ]] && ok "dirty tree (modified tracked file) refused, exit 2, no receipt" || bad "modified tree gave exit ${rc}"
+        # Inside omega-mv the receipt names an omega-mv commit, so a change outside kernel/ is a
+        # dirty tree too: an untracked file at the repository top is refused the same way.
+        if [[ -n ${pfx} ]]; then
+            git -C "${tmp}/clone-top" checkout -q -- .
+            : >"${tmp}/clone-top/untracked_top_junk"
+            bash "${clone}/scripts/ck_gates.sh" --out "${tmp}/o3" >/dev/null 2>&1; rc=$?
+            [[ ${rc} == 2 && ! -e "${tmp}/o3" ]] && ok "dirty tree outside ${pfx} (untracked file at the top) refused, exit 2, no receipt" || bad "untracked file outside ${pfx} gave exit ${rc}"
+            rm -f "${tmp}/clone-top/untracked_top_junk"
+            # A staged new file and a modified tracked file outside kernel/.
+            : >"${tmp}/clone-top/staged_top_junk"; git -C "${tmp}/clone-top" add staged_top_junk
+            bash "${clone}/scripts/ck_gates.sh" --out "${tmp}/o4" >/dev/null 2>&1; rc=$?
+            [[ ${rc} == 2 && ! -e "${tmp}/o4" ]] && ok "dirty tree outside ${pfx} (staged new file at the top) refused, exit 2, no receipt" || bad "staged file outside ${pfx} gave exit ${rc}"
+            git -C "${tmp}/clone-top" rm -q --cached staged_top_junk; rm -f "${tmp}/clone-top/staged_top_junk"
+            local tf topf; mapfile -t tf < <(git -C "${tmp}/clone-top" ls-files -- ":(exclude)${pfx}"); topf="${tf[0]}"
+            echo x >>"${tmp}/clone-top/${topf}"
+            bash "${clone}/scripts/ck_gates.sh" --out "${tmp}/o5" >/dev/null 2>&1; rc=$?
+            [[ ${rc} == 2 && ! -e "${tmp}/o5" ]] && ok "dirty tree outside ${pfx} (modified ${topf}) refused, exit 2, no receipt" || bad "modified ${topf} outside ${pfx} gave exit ${rc}"
+        fi
     else
         bad "could not make a private clone for the dirty-tree test"
     fi
