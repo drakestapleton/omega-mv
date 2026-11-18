@@ -150,7 +150,10 @@ case because every partial sum is an integer the 24-bit mantissa holds exactly.
 gpu/amd/gfx942/fp8gemv/check.sh
 ```
 
-That hashes `seed/out/omc` against `seed/out/omc.sha256`, assembles both `.s`
+That hashes `seed/out/omc` against `seed/out/omc.sha256` (exit 3, NOT_RUN, when
+the pin is not a 64-hex sha256 or the compiler is missing, checked before the
+compare; planted trees with no pin, an empty pin, a short pin, no compiler and
+a different compiler must each be refused first), assembles both `.s`
 files, packs both `.isa` files, diffs the bytes against `encprobe.golden` and
 `fp8gemv_stream.golden`, recomputes the descriptor fields, and runs `check.om`.
 Both references call `fpfma` from `exec/fma.om` (x86linux rejects the `fma`
