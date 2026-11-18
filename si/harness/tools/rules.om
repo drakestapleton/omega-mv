@@ -5,25 +5,33 @@ note   rules lint SRC [OVL]             check both files; a line of the public S
 note                                    `/home/`, `/Users/`, `/root/`, `/srv/`, `/var/`, `/etc/`, `127.0.0.1`,
 note                                    the host name `spark` (lowercase) or a private repository name
 note                                    (`omega-pearl`, `aien-crypto`), Linear URLs or DRA issue IDs: those go in the overlay
-note   rules render SRC OVL PROG HEAD   the instruction file for PROG, on stdout
+note   rules render SRC OVL PROG HEAD [PATH]   the instruction file for PROG, on stdout
 note   rules targets SRC OVL            `target PROG PATH`, `skills - DIR` and `alarm - FILE` lines
+note   rules fit SRC OVL HEAD           for each OVL `cap CHARS PATH`: render the target with that PATH and count
+note                                    its characters (UTF-8 code points, as a reader that decodes the file
+note                                    counts them); prints `fit PROG PATH N of CHARS ok|OVER`; exit 1 when
+note                                    a render is over its cap or a cap names no target
 note
 note SRC is rules/rules.txt; OVL is the overlay, kept on one machine and never published. Both have one
 note format, one record per line group:
 note   rule ID            begins a rule; ID is lowercase letters, digits and `-`, unique over both files
 note   date YYYY-MM-DD    the date of the statement the rule rests on
 note   said TEXT          Drake's exact words, when they exist (any number of lines; kept, not rendered)
-note   for P ...          the programs it applies to: claude, codex, agents, omp, watchdog; `all` is the
-note                      first four
+note   for P ...          the programs it applies to: claude, codex, agents, omp, watchdog, generic; `all`
+note                      includes claude, codex, agents and omp. A generic reader gets agents and generic
+note                      rules. If its configured cap is exceeded and an agents target is available, it
+note                      gets the rules marked generic plus directions to the full agents file.
 note   order N            where it goes in every file it is rendered into (ascending; ties keep SRC
 note                      before OVL, then file order)
 note   | TEXT  or  |      one line of the rendered rule, or an empty one
 note   end                ends the rule
 note Outside a rule, a line is empty, a comment (`#`), or, in OVL only, `target PROG PATH` (PROG's
-note instruction file on this machine), `skills DIR` (an installed skills directory) or `alarm FILE`
-note (where a failed install is reported). A rendered file is a header naming HEAD (the last commit that
-note changed the rules) and each rule for PROG in order, separated by an empty line. Same inputs, same
-note bytes. Exit 0 done, 1 lint findings, 2 usage, read error or a malformed file.
+note instruction file on this machine), `skills DIR` (an installed skills directory), `alarm FILE`
+note (where a failed install is reported) or `cap CHARS PATH` (the most characters the reader of the
+note target PATH keeps; `fit` and tools/install.sh refuse a render over it). A rendered file is a header
+note naming HEAD (the last commit that changed the rules) and each rule for PROG in order, separated by an
+note empty line. Same inputs, same bytes. Exit 0 done, 1 lint findings or a render over its cap, 2 usage,
+note read error or a malformed file.
 
 global rb uchar 16777216
 global obuf uchar 16777216
@@ -50,15 +58,20 @@ const s_hl ulong 6
 const s_ls ulong 7
 const s_le ulong 8
 const s_al ulong 9
+note allm preserves the shared rules for claude, codex, agents and omp.
+const allm ulong 15
+const genm ulong 32
 
 text a_lint "lint"
 text a_render "render"
 text a_tgts "targets"
+text a_fit "fit"
 text p_claude "claude"
 text p_codex "codex"
 text p_agents "agents"
 text p_omp "omp"
 text p_watch "watchdog"
+text p_gen "generic"
 text p_all "all"
 text w_rule "rule "
 text w_date "date "
@@ -70,6 +83,7 @@ text w_bar "|"
 text w_target "target "
 text w_skills "skills "
 text w_alarm "alarm "
+text w_cap "cap "
 text k_home "~/"
 text k_home2 "/home/"
 text k_users "/Users/"
@@ -84,7 +98,7 @@ text k_var "/var/"
 text k_etc "/etc/"
 text k_linear "linear.app/"
 text k_issue "DRA-"
-text m_use "usage: rules lint SRC [OVL] | rules render SRC OVL PROG HEAD | rules targets SRC OVL\n"
+text m_use "usage: rules lint SRC [OVL] | rules render SRC OVL PROG HEAD [PATH] | rules targets SRC OVL | rules fit SRC OVL HEAD\n"
 text m_read "rules: cannot read "
 text m_full "rules: refused, the rules files fill the 16777216-byte buffer\n"
 text m_many "rules: refused, more than 65536 rules\n"
@@ -93,7 +107,7 @@ text m_prog "rules: unknown program: "
 text f_line ": "
 text f_src "SRC"
 text f_ovl "OVL"
-text f_out "outside a rule, expected rule, a comment or an empty line (OVL also target, skills or alarm)"
+text f_out "outside a rule, expected rule, a comment or an empty line (OVL also target, skills, alarm or cap)"
 text f_in "inside a rule, expected date, said, for, order, | or end"
 text f_noid "a rule ID is lowercase letters, digits and -"
 text f_dup "the rule ID is used twice"
@@ -103,6 +117,13 @@ text f_noord "the rule has no order N"
 text f_notext "the rule has no | line"
 text f_open "the file ends inside a rule"
 text f_priv "the public rules source holds a home path, host path, host name or private name; move it to the overlay"
+text f_tgt "a target line is `target PROG PATH`: one program (claude, codex, agents, omp, watchdog or generic), one space, and a path"
+text f_cap "a cap line is `cap CHARS PATH`: 1 to 18 digits, one space, and a path"
+text t_fit "fit "
+text t_of " of "
+text t_ok " ok\n"
+text t_over " OVER\n"
+text t_notgt "fit: no target line for the cap path "
 text f_rule " rule "
 text f_rules " rules, "
 text f_tg "findings\n"
@@ -113,6 +134,10 @@ text h_3 " and this machine's overlay. Do not edit this file: change the rules s
 text nl "\n"
 text sp " "
 text dash "- "
+text g_1 "\n## Additional standing rules\nRead the full agent instructions at the following location before doing project work:\n"
+text m_dup_target "more than one target uses the same path"
+text m_path "rules: path is not configured for this program\n"
+text m_over "rules: requested render exceeds its configured cap\n"
 
 note ---------------------------------------------------------------- output
 
@@ -335,7 +360,7 @@ end
 ret eq c 45
 end
 
-note word: the program word rb[a, b) as a bit (claude 1, codex 2, agents 4, omp 8, watchdog 16, all 15), else 0
+note word: the program word rb[a, b) as a bit (claude 1, codex 2, agents 4, omp 8, watchdog 16, generic 32, all 15), else 0
 fn wbit a ulong b ulong to ulong
 m = sub b a
 if lis a b p_claude
@@ -354,7 +379,10 @@ if lis a b p_watch
 ret 16
 end
 if lis a b p_all
-ret 15
+ret allm
+end
+if lis a b p_gen
+ret genm
 end
 ret 0
 end
@@ -592,6 +620,26 @@ fnd ovl f_in
 ret txt
 end
 
+note okt: the target line [p, e) is `target PROG PATH`: one known program (not `all`), one space, a path
+fn okt p ulong e ulong to bool
+a = add p len w_target
+q = a
+while lt q e bound 4096
+if eq get rb q 32
+break
+end
+q = add q 1
+end
+b = wbit a q
+if or eq b 0 eq b allm
+ret false
+end
+if ge add q 1 e
+ret false
+end
+ret ne get rb add q 1 32
+end
+
 note outer: a line outside every rule
 fn outer p ulong e ulong ovl bool to void
 if eq p e
@@ -601,11 +649,50 @@ if eq get rb p 35
 ret
 end
 if ovl
-if or lpre p e w_target or lpre p e w_skills lpre p e w_alarm
+if lpre p e w_target
+if not okt p e
+fnd ovl f_tgt
+else
+a = add p len w_target
+while ne get rb a 32 bound 4096
+a = add a 1
+end
+if ne tfind add a 1 e p
+fnd ovl m_dup_target
+end
+end
+ret
+end
+if or lpre p e w_skills lpre p e w_alarm
+ret
+end
+if lpre p e w_cap
+if not okc p e
+fnd ovl f_cap
+end
 ret
 end
 end
 fnd ovl f_out
+end
+
+note okc: the OVL line [p, e) is `cap CHARS PATH`: 1 to 18 digits, one space, a path
+fn okc p ulong e ulong to bool
+a = add p len w_cap
+q = a
+while lt q e bound 4096
+if eq get rb q 32
+break
+end
+q = add q 1
+end
+if eq pnum a q 18446744073709551615
+ret false
+end
+if ge add q 1 e
+ret false
+end
+ret ne get rb add q 1 32
 end
 
 note private: the public SRC holds no home path, host path, host name or private name
@@ -671,7 +758,40 @@ end
 ret best
 end
 
-fn render m ulong to void
+note tprog: the program bit of the OVL `target PROG PATH` line [p, e); 0 for any other line
+fn tprog p ulong e ulong to ulong
+if not lpre p e w_target
+ret 0
+end
+a = add p len w_target
+q = a
+while lt q e bound 4096
+if eq get rb q 32
+break
+end
+q = add q 1
+end
+ret wbit a q
+end
+
+note Print the path of a full agents file, if one exists. Its unchanged render contains all shared and agents-only rules.
+fn agentptr to bool
+p = get st s_ns
+while lt p get st s_n bound 16777216
+e = lend p
+if eq tprog p e 4
+ot g_1
+orb add p len w_target e
+o 10
+ret true
+end
+p = add e 1
+end
+ret false
+end
+
+note build: the file for program bit m into obuf (the header names ab[0, s_al) and hd)
+fn build m ulong compact bool to void
 nr = get st s_nr
 for i ulong nr bound 65536
 put dn i 0
@@ -685,6 +805,15 @@ for k ulong get st s_hl bound 128
 o get hd k
 end
 ot h_3
+if eq m genm
+if not compact
+m = or m 4
+else
+if not agentptr
+m = or m 4
+end
+end
+end
 c = ulong 0
 while true bound 65537
 r = pick m
@@ -696,7 +825,170 @@ o 10
 orule r
 c = add c 1
 end
-flush
+end
+
+
+note ---------------------------------------------------------------- fit
+
+note tfind: the start of the OVL `target PROG PATH` line whose PATH is rb[a, b); s_n when there is none
+fn tfind a ulong b ulong to ulong
+n = get st s_n
+p = get st s_ns
+while lt p n bound 16777216
+e = lend p
+if lpre p e w_target
+s = add p len w_target
+while lt s e bound 4096
+if eq get rb s 32
+break
+end
+s = add s 1
+end
+if lt s e
+if ideq add s 1 e a b
+ret p
+end
+end
+end
+p = add e 1
+end
+ret n
+end
+
+note nchars: the characters of obuf (UTF-8 code points: every byte that is not a continuation byte)
+fn nchars to ulong
+n = get st s_on
+c = ulong 0
+for i ulong n bound 16777216
+if ne and get obuf i 192 128
+c = add c 1
+end
+end
+ret c
+end
+
+note Rebuild only an oversized generic render. The same selection is used by fit and by installation.
+fn boundedbuild m ulong lim ulong to ulong
+put st s_on 0
+build m false
+k = nchars
+if and eq m genm gt k lim
+put st s_on 0
+build m true
+k = nchars
+end
+ret k
+end
+
+note A path comparison uses the complete byte span, including any interior spaces.
+fn patharg a ulong e ulong size ulong to bool
+if ne sub e a size
+ret false
+end
+for i ulong size bound 4096
+if ne get ab i get rb add a i
+ret false
+end
+end
+ret true
+end
+
+note For the exact target and program, return the strictest cap or the maximum ulong if uncapped.
+fn pathlimit size ulong program ulong to ulong
+lim = ulong 18446744073709551615
+found = false
+p = get st s_ns
+while lt p get st s_n bound 16777216
+e = lend p
+cap = lpre p e w_cap
+if or cap eq tprog p e program
+a = add p len w_target
+if cap
+a = add p len w_cap
+end
+q = a
+while lt q e bound 4096
+if eq get rb q 32
+break
+end
+q = add q 1
+end
+if patharg add q 1 e size
+if cap
+v = pnum a q
+if lt v lim
+lim = v
+end
+else
+found = true
+end
+end
+end
+p = add e 1
+end
+if not found
+wfd 2 m_path
+exit 2
+end
+ret lim
+end
+
+note fit: every OVL `cap CHARS PATH` line against the render of its target; a finding for each render over
+note its cap and each cap without a target
+fn fit to void
+n = get st s_n
+p = get st s_ns
+while lt p n bound 16777216
+e = lend p
+if lpre p e w_cap
+a = add p len w_cap
+q = a
+while lt q e bound 4096
+if eq get rb q 32
+break
+end
+q = add q 1
+end
+lim = pnum a q
+t = tfind add q 1 e
+if eq t n
+wfd 1 t_notgt
+wrb 1 add q 1 e
+wfd 1 nl
+put st s_bad add get st s_bad 1
+else
+g = add t len w_target
+h = g
+while lt h e bound 4096
+if eq get rb h 32
+break
+end
+h = add h 1
+end
+for i ulong sub h g bound 4096
+put ab i get rb add g i
+end
+put st s_al sub h g
+k = boundedbuild wbit g h lim
+put st s_on 0
+wfd 1 t_fit
+wrb 1 g h
+wfd 1 sp
+wrb 1 add q 1 e
+wfd 1 sp
+wnum 1 k
+wfd 1 t_of
+wnum 1 lim
+if gt k lim
+wfd 1 t_over
+put st s_bad add get st s_bad 1
+else
+wfd 1 t_ok
+end
+end
+end
+p = add e 1
+end
 end
 
 note ---------------------------------------------------------------- targets
@@ -746,7 +1038,14 @@ end
 if argis a_tgts k
 mode = ulong 2
 end
-if or eq mode 9 or and eq mode 1 ne c 6 and eq mode 2 ne c 4
+if argis a_fit k
+mode = ulong 3
+end
+if and eq mode 1 and ne c 6 ne c 7
+wfd 2 m_use
+ret 2
+end
+if or eq mode 9 or and eq mode 2 ne c 4 and eq mode 3 ne c 5
 wfd 2 m_use
 ret 2
 end
@@ -787,7 +1086,11 @@ if eq mode 2
 targets
 ret 0
 end
-h = ldarg 5
+hi = ulong 5
+if eq mode 3
+hi = ulong 4
+end
+h = ldarg hi
 if gt h 128
 wfd 2 m_use
 ret 2
@@ -796,16 +1099,32 @@ for i ulong h bound 128
 put hd i get ab i
 end
 put st s_hl h
+if eq mode 3
+fit
+if ne get st s_bad 0
+ret 1
+end
+ret 0
+end
+lim = ulong 18446744073709551615
 a = ldarg 4
 m = wbit2 a
-if or eq m 0 eq m 15
+if eq m 0
 wfd 2 m_prog
 z = write 2 ab 0 a
 wfd 2 nl
 ret 2
 end
+if eq c 7
+lim = pathlimit ldarg 6 m
+a = ldarg 4
+end
 put st s_al a
-render m
+if gt boundedbuild m lim lim
+wfd 2 m_over
+ret 1
+end
+flush
 ret 0
 end
 
@@ -825,6 +1144,9 @@ ret 8
 end
 if argis p_watch a
 ret 16
+end
+if argis p_gen a
+ret genm
 end
 ret 0
 end
