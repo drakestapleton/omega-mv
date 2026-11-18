@@ -7,15 +7,16 @@ in the stack or its drivers.
 
 | File | What it is |
 |---|---|
-| `tcp.om` | The stack: Ethernet II, ARP (4 entries), IPv4 (no options sent, fragments refused), and TCP after RFC 9293 with the deviations listed under Limits: RFC 6298 RTO (with the 5.7 restart at 3 s after a SYN timeout), RFC 5681 slow start and congestion avoidance from an RFC 6928 initial window, RFC 6582 NewReno fast retransmit and recovery, RFC 5961 RST/SYN/ACK hardening, RFC 6528 initial sequence numbers (SipHash-2-4 of the 4-tuple under a 128-bit key, plus a clock), out-of-order reassembly into a 64 KiB ring (first copy wins), FIN ordering (a FIN ends the stream: bytes past it are dropped, RFC 9293 3.10.7.4), TIME-WAIT, and zero-window persist probes of one octet. One connection block plus one passive port. The embedding unit supplies `tlinkout`, the clock and the key (`tkey`); without a key no connection opens and `trnd` refuses (trap 8, exit 108). |
-| `tcpd.om` | Guest driver (`cat tcp.om tcpd.om \| omc`). Runs as a process inside a Linux guest: rtnetlink brings `eth0` up with GRO off, an AF_PACKET socket carries raw frames. The guest kernel has no IPv4 address, so this stack alone answers for 10.0.2.15. It takes the 16-byte sequence number key from the guest's `getrandom(2)` and exits 7 if it gets fewer bytes. Modes: echo, receive to file, send a file, and `key` (a host check of the key path for `gate.sh corpus`: it asks for N bytes, prints the installed key words and one `trnd` value, and exits with no network). |
+| `tcp.om` | The stack: Ethernet II, ARP (4 entries), IPv4 (no options sent, received options skipped, fragments refused), and TCP after RFC 9293 with the deviations listed under Limits: RFC 6298 RTO (with the 5.7 restart at 3 s after a SYN timeout), RFC 5681 slow start and congestion avoidance from an RFC 6928 initial window, RFC 6582 NewReno fast retransmit and recovery, RFC 5961 RST/SYN/ACK hardening, RFC 6528 initial sequence numbers (SipHash-2-4 of the 4-tuple under a 128-bit key, plus a clock), out-of-order reassembly into a 64 KiB ring (first copy wins), FIN ordering (a FIN ends the stream: bytes past it are dropped, also when they arrived before it or with it, RFC 9293 3.10.7.4) [ctl:OMEGA-KERNEL-TCP-CORPUS/mutant-fin-before-data], TIME-WAIT, and zero-window persist probes of one octet. One connection block plus one passive port. The embedding unit supplies `tlinkout`, the clock and the key (`tkey`, which refuses a key of 16 zero bytes); without a key no connection opens and `trnd` refuses (trap 8, exit 108). |
+| `tcpd.om` | Guest driver (`cat tcp.om tcpd.om \| omc`). Runs as a process inside a Linux guest: rtnetlink brings `eth0` up with GRO off, an AF_PACKET socket carries raw frames. The guest kernel has no IPv4 address, so this stack alone answers for 10.0.2.15. It takes the 16-byte sequence number key from the guest's `getrandom(2)` and exits 7 if it gets fewer bytes or 16 zero bytes (which `tkey` refuses); key mode installs the key through the same line of `main` as the network modes. Modes: echo, receive to file, send a file, and `key` (a host check of the key path for `gate.sh corpus`: it asks for N bytes, prints the installed key words and one `trnd` value, and exits with no network). |
 | `link.om` | Impairment relay between the guest NIC and QEMU's slirp network: seeded drop, hold-back reordering, duplication, and hostile injection toward the guest (15 kinds, see the `lmutate` note). Hostile variants go ahead of the real frame. |
 | `peer.om` | Host peer on 127.0.0.1 (slirp forwards into the guest): echo check, send, receive and compare. |
-| `corpus.om` | Hosted hostile corpus (`cat tcp.om corpus.om \| omc`): exact-state cases, in 30 case groups, for every mechanism named in the `tcp.om` row (expected values from the RFC formulas, and SipHash outputs from OpenSSL as an independent oracle), with the payload of sent segments checked against the stream written; a seeded fuzz phase with invariants; and a final transfer whose sequence numbers wrap past 2^32. The single-line edits of the congestion, RTO, ACK and FIN code that no case kills are listed under Limits. |
+| `corpus.om` | Hosted hostile corpus (`cat tcp.om corpus.om \| omc`): exact-state cases in the case groups `gate.sh` pins (expected values from the RFC formulas, and SipHash outputs from OpenSSL as an independent oracle), with the payload of sent segments checked against the stream written, and each frame the stack sends checked as a peer would (Ethernet, ARP, IPv4 and TCP header fields and both checksums); a seeded fuzz phase with invariants; and a final transfer whose sequence numbers wrap past 2^32. The behaviour it leaves unchecked is in `unasserted.tsv`. |
 | `nokey.om` | `trnd` with no key installed (`cat tcp.om nokey.om \| omc`): must trap 8. |
-| `mutants.tsv` | Single-line edits of `tcp.om` and `tcpd.om`, at least one per claimed mechanism, each with the check that must fail on it (a corpus check id, `nokey` or `tcpdkey`). |
-| `mutgen.awk` | Generates single-line edits (operator, constant and condition flips, deleted statements) of the functions `gate.sh` names; `gate.sh corpus` runs all of them. |
-| `gate.sh` | The gates (verification rig, POSIX sh). `corpus` mode: pin check, corpus, NOT_RUN controls and mutants. QEMU mode: the corpus mode, then one fresh QEMU guest per profile and scenario. |
+| `mutants.tsv` | Single-line edits of `tcp.om` and `tcpd.om`, the reviewers' among them, each with the check that must fail on it (a corpus check id, `nokey` or `tcpdkey`). |
+| `mutgen.awk` | Generates single-line edits (operator, constant and condition flips, deleted statements) of each `tcp.om` function; `gate.sh corpus` builds and runs each one. |
+| `unasserted.tsv` | The generated edits no check kills, each with its class (survived, trapped, not_built) and, where one was worked out, the reason it changes nothing a case could see; `gate.sh corpus` requires the edits not killed to be exactly these rows [ctl:OMEGA-KERNEL-TCP-CORPUS/unasserted-row-deleted] [ctl:OMEGA-KERNEL-TCP-CORPUS/unasserted-class-changed]. |
+| `gate.sh` | The gates (verification rig, POSIX sh). `corpus` mode: pin check, tables, keys, corpus, controls and mutants. QEMU mode: the corpus mode, then one fresh QEMU guest per profile and scenario. |
 
 ## Gates
 
@@ -25,28 +26,59 @@ sh gate.sh OMC IMAGE BUSYBOX OUTDIR [PROFILES] [SCENARIOS]
 ```
 
 `corpus` (what `tests/gates/run.sh kernel-tcp-corpus` runs). It first checks
-its tables against pins in `gate.sh`: the rows of `mutants.tsv` (all well
-formed, no name or edit twice), the rows `mutgen.awk` makes, and the unasserted
-list below. Then `trnd` without a key must trap 8 (`nokey.om`), and `tcpd key`
-must install two different nonzero keys in two runs, wipe its buffer, and exit 7
-on a 15-byte read. The corpus at fuzz 0 must run exactly the pinned number of
-checks, set of check ids (sha256) and case groups, then at `FUZZ` seeded frames
-(default 2,000,000, the pinned minimum; anything lower fails) print `CORPUS_PASS`
-with that fuzz count. The controls follow: a missing and a wrong compiler must
-each make `gate.sh` exit 3 with NOT_RUN (corpus and QEMU mode); `FUZZ` below the
-pin must fail; changed copies of this directory must each fail their own gate
-(a mutant row deleted, commented out or duplicated, a case group skipped, one
-check deleted, an unasserted row deleted, a generated function dropped, `trnd`
-unrefused, a constant `tcpd` key, `tcpd`'s short read kept); and the kill rule
-must count neither a trap without the row's check failing nor another check's
-failure. Every row of `mutants.tsv`, built and run at fuzz 0, must fail its own
-check: nonzero exit, no `CORPUS_PASS` and `CORPUS_FAIL check=ID`, or `nokey`, or
-`tcpdkey`. Last, every generated edit is built and run at fuzz 0 (and with
-`nokey.om`); exactly the edits listed as unasserted under Limits may survive. It
-ends with `GENERATED rows= built= killed= survived= not_built= kill_rate=` and
-`TCP_CORPUS_GATE PASS checks=N fuzz=F groups=G mutants=M killed=M generated=X
-gen_killed=Y survivors=Z controls=C`, exit 0, only when all of that holds; any
-other result is exit 1.
+its tables against pins in `gate.sh`: the rows of `mutants.tsv` (well formed, no
+name or edit twice), the rows `mutgen.awk` makes of the `tcp.om` functions (their
+count and sha256), and `unasserted.tsv` (well formed, each row a generated edit,
+the count of each class). Then `trnd` without a key must trap 8 (`nokey.om`), and
+`tcpd key` must install two different nonzero keys in two runs, wipe its buffer,
+and exit 7 on a 15-byte read. The corpus at fuzz 0 must run exactly the pinned
+number of checks, set of check ids (sha256) and case groups, then at `FUZZ`
+seeded frames (default 2,000,000, the pinned minimum; a lower count fails
+[ctl:OMEGA-KERNEL-TCP-CORPUS/fuzz-below-pin]) print `CORPUS_PASS` with that fuzz count. In both runs
+`tlinkout` checks each frame the stack sends (checks 4900 to 4919 of
+`corpus.om`): Ethernet source and type, ARP fields, IPv4 version, header length,
+total length, DF, TTL, protocol, header checksum and addresses, the TCP checksum
+over the pseudo-header, ports, data offset, flags, the MSS option, window and
+data [ctl:OMEGA-KERNEL-TCP-CORPUS/mutant-frame-tcp-sum] [ctl:OMEGA-KERNEL-TCP-CORPUS/frame-check-skipped].
+
+The controls follow; each prints `CONTROL OMEGA-KERNEL-TCP-CORPUS/NAME FAILED_AS_REQUIRED`
+when its input failed as it must. A missing and a wrong compiler make `gate.sh`
+exit 3 with NOT_RUN in corpus and QEMU mode [ctl:OMEGA-KERNEL-TCP-CORPUS/no-compiler]
+[ctl:OMEGA-KERNEL-TCP-CORPUS/wrong-compiler] [ctl:OMEGA-KERNEL-TCP-CORPUS/wrong-compiler-qemu]. `FUZZ` below the pin
+fails [ctl:OMEGA-KERNEL-TCP-CORPUS/fuzz-one]. Changed copies of this directory fail their own gate: a
+mutant row deleted, commented out or duplicated, a case group skipped, one check
+deleted, the frame check skipped, an unasserted row deleted or its class
+changed, `mutgen.awk` edited (review 5cd0af98's `if nott`, which kept the row
+count) [ctl:OMEGA-KERNEL-TCP-CORPUS/mutgen-neg], `trnd` unrefused with the generated pins updated
+[ctl:OMEGA-KERNEL-TCP-CORPUS/trnd-unrefused], a constant `tcpd` key, `tcpd`'s short read kept. The
+kill rule counts neither a trap without the row's check failing nor another
+check's failure [ctl:OMEGA-KERNEL-TCP-CORPUS/killrule-trap] [ctl:OMEGA-KERNEL-TCP-CORPUS/killrule-other], and the list
+match tells two different lists apart [ctl:OMEGA-KERNEL-TCP-CORPUS/listrule].
+
+Each row of `mutants.tsv`, built and run at fuzz 0, must fail its own check:
+nonzero exit, no `CORPUS_PASS` and `CORPUS_FAIL check=ID`, or `nokey`, or
+`tcpdkey`; its control is `mutant-NAME`, the row name in lower case. A trap is
+not a kill. Last, each generated edit is built and run at fuzz 0 and with
+`nokey.om`, and classed killed (a `CORPUS_FAIL check=` line, or `nokey`
+failed), survived (both passed), trapped (the corpus ended without passing and
+without a failed check) or not_built; the edits not killed, with their class,
+must be the rows of `unasserted.tsv`. The gate ends with `GENERATED rows= fns=
+built= killed= survived= trapped= not_built= kill_rate=` and `TCP_CORPUS_GATE
+PASS checks=N fuzz=F groups=G mutants=M killed=M generated=X gen_killed=Y
+survivors=Z controls=C`, generated counting the edits that built and survivors
+those that survived or trapped, and exits 0 when each of those holds, else 1.
+
+What that shows, at the head that runs it: the cases of `corpus.om` and the
+edits each named row and control stands for. At omega-mv `kernel/fix3-tcp`
+(review 5cd0af98 findings N1 to N9) the generator makes 3151 edits of the 86
+`tcp.om` functions: 2623 fail a check, 305 survive, 82 end in a trap and 141 do
+not build; `gate.sh` pins the last three counts. 182 rows of `unasserted.tsv`
+give a reason; the other 346 survivors and traps have none, so what they edit
+is behaviour the corpus does not check: 178 of them edit the ARP table (116),
+statistics counters (15), checksum arithmetic and padding (47), and the rest are
+spread over the TCP functions. A mechanism named in the
+`tcp.om` row is checked as far as its `mutants.tsv` rows and its generated
+edits outside `unasserted.tsv` go, no further.
 
 Exit codes in both modes: 3 NOT_RUN (never a pass) when the gate cannot run:
 missing pin, missing or wrong compiler, and in QEMU mode no QEMU, no access to
@@ -153,50 +185,15 @@ hit the defect; no run has shown it.
   long before that.
 - ARP is unauthenticated (RFC 826).
 - QEMU only (see Evidence); not run on hardware.
-- Unasserted edits: the single-line edits `mutgen.awk` makes of the functions
-  `gate.sh` names (`GEN_FNS`) that no corpus case kills. Each is equivalent to the
-  code (the reason follows it) or, where marked, differs in a case the corpus does
-  not build. `gate.sh corpus` requires the survivors to be exactly these rows.
-
-<!-- unasserted -->
-- `tsample` 1: `if lt r s` -> `if le r s`: at R = SRTT the difference is 0 either way.
-- `tsample` 1: `put Tcb kSRT umax add sub w div w 8 r 1` -> `put Tcb kSRT umax add sub w div w 8 r 0`: once kSRT is nonzero, 8 SRTT - SRTT + R is at least 1; the floor only keeps 0 meaning "no sample yet".
-- `tsample` 1: `o = add div get Tcb kSRT 8 umax get Tcb kRVR 1` -> `o = add div get Tcb kSRT 8 umax get Tcb kRVR 0`: RTTVAR is 0 only after 0 ms samples, where SRTT/8 is 0 and the RTO floor (`Tcf 10`, never 0 after `tinit`) gives the same RTO.
-- `tretx1` 1: `if ne get Tcb kFSN 0` -> `if true`: with no data outstanding, `tretx1` runs only while our FIN is the octet outstanding.
-- `tretx1` 1: `if eq u get Tcb kFSQ` -> `if true`: as above; SND.UNA is then the FIN's sequence number.
-- `tnewack` 1: `put Tcb kSYA 1` -> `put Tcb kSYA 2`: a flag only compared with 0.
-- `tnewack` 1: `if gt sub n d 0` -> `if ge sub n d 0`: the guarded line adds n - d, which is 0 where the conditions differ.
-- `tnewack` 1: `if gt sub n d 0` -> `if gt add n d 0`: as above.
-- `tnewack` 1: `if gt sub n d 0` -> `if true`: as above.
-- `tnewack` 1: `if slt get Tcb kNXT get Tcb kUNA` -> `if sle get Tcb kNXT get Tcb kUNA`: at equality the assignment changes nothing.
-- `twinupd` 1: `a = get Tpk 9` -> `a = get Tpk 10`: the SND.WL2 test decides only when SEG.SEQ = SND.WL1, and under the SND.UNA =< SEG.ACK rule SND.WL2 =< SEG.ACK always holds (RFC 9293 still states it); a value read the same way from every segment keeps it true.
-- `twinupd` 1: `a = get Tpk 9` -> `a = get Tpk 8`: as above.
-- `twinupd` 1: `if or slt w1 s and eq w1 s sle get Tcb kWL2 a` -> `if or sle w1 s and eq w1 s sle get Tcb kWL2 a`: as above (at SEG.SEQ = SND.WL1 the SND.WL2 test holds).
-- `twinupd` 1: `put Tcb kWL2 a` -> `note mutant`: as above.
-- `tfinacked` 1: `if eq get Tcb kFSN 0` -> `if false`: `tfinacked` is called only in FIN-WAIT-1, CLOSING and LAST-ACK, after our FIN went out.
-- `tfinacked` 1: `ret false` -> `ret true`: as above.
-- `tackin` 1: `put Tcb kACK 1` -> `put Tcb kACK 2`: a flag only compared with 0.
-- `tackin` 2: `put Tcb kACK 1` -> `put Tcb kACK 2`: as above.
-- `tackin` 2: `st = get Tcb kST` -> `note mutant`: inside `tackin` the state changes only from syn-received to ESTABLISHED, and neither has a FIN of ours to acknowledge.
-- `tfinacc` 1: `put Tcb kPFN 1` -> `put Tcb kPFN 2`: a flag only compared with 0.
-- `tfinacc` 1: `put Tcb kACK 1` -> `put Tcb kACK 2`: as above.
-- `tfinacc` 1: `put Tcb kACK 1` -> `note mutant`: every caller has already set kACK for the same segment.
-- `tfinacc` 1: `if eq st 6` -> `if true`: `tfinacc` runs in states 4 to 6 only, and 4 and 5 return before this line.
-- `tdrain` 1: `while lt c 65535 bound 65536` -> `while le c 65535 bound 65536`: no byte is stored 65535 past the read head (`tstore` stores inside the window), so the extra pass finds none.
-- `tdrain` 1: `while lt c 65535 bound 65536` -> `while lt c 65536 bound 65536`: as above.
-- `tdata` 1: `if or lt st 4 gt st 6` -> `if or lt st 3 gt st 6`: syn-received never reaches `tdata` (`tackin` refuses the segment or moves the block to ESTABLISHED).
-- `tdata` 1: `put Tcb kACK 1` -> `put Tcb kACK 2`: a flag only compared with 0.
-- `tfinin` 1: `put Tcb kACK 1` -> `put Tcb kACK 2`: as above.
-- `tfinin` 2: `put Tcb kACK 1` -> `put Tcb kACK 2`: as above.
-- `tfinin` 2: `put Tcb kACK 1` -> `note mutant`: a FIN past the window comes only on a segment with data (a bare one is unacceptable), for which `tdata` has set kACK.
-- `tfinin` 3: `put Tcb kACK 1` -> `put Tcb kACK 2`: a flag only compared with 0.
-- `ttimeout` 1: `put Tcb kSYT 1` -> `put Tcb kSYT 2`: as above.
-- `ttimeout` 2: `put Tcb kSYT 1` -> `put Tcb kSYT 2`: as above.
-- `tprobe` 1: `if slt get Tcb kMAX get Tcb kNXT` -> `if sle get Tcb kMAX get Tcb kNXT`: at equality the assignment changes nothing.
-- `tpersist` 1: `if not tcansend` -> `if false`: in every state that cannot send, the next checks return (nothing unsent, or SND.UNA < SND.MAX while the SYN is outstanding).
-- `tpersist` 1: `put Tcb kPRS umax add n get Tcb kRTO 1` -> `put Tcb kPRS umax add n get Tcb kRTO 2`: differs only by 1 ms when the clock reads 0 and the RTO floor is 1 ms; no case does that (the floor keeps 0 meaning "not armed").
-- `tpersist` 1: `put Tcb kPRS umax add n get Tcb kRTO 1` -> `put Tcb kPRS umax add n get Tcb kRTO 0`: now + RTO is at least 1, as the RTO floor is.
-- `tpersist` 1: `put Tcb kRAT 0` -> `note mutant`: no RTT measurement runs when the persist timer fires (nothing is outstanding, so the timed segment was acknowledged and kRAT cleared).
-- `tread` 1: `n = umin get Tcb kRCN umin cap 65536` -> `n = umin get Tcb kRCN umin cap 65537`: kRCN is at most 65535 and bounds n first.
-- `tread` 1: `n = umin get Tcb kRCN umin cap 65536` -> `n = umin get Tcb kRCN umin cap 65535`: as above.
-<!-- /unasserted -->
+- Unchecked edits: `unasserted.tsv` lists the generated edits no check kills
+  (counts under Gates); a row without a reason is behaviour the corpus does not
+  check.
+- A zero receive window takes a segment at RCV.NXT with no data and no FIN
+  (RFC 9293 Table 6); data or a FIN there waits for a retransmission once the
+  window opens, while the segment's ACK is still processed.
+- TIME-WAIT restarts its timer for the peer's retransmitted FIN (FIN and ACK
+  ending at RCV.NXT); other segments there get an ACK and leave the timer, a FIN
+  at RCV.NXT too (RFC 9293's eighth check would restart the timer for that one).
+- `tcpd` exits 7 on an all-zero key from `getrandom(2)`; no host case can make
+  `getrandom(2)` return one, so that line is unchecked, while `tkey`'s refusal is
+  checked [ctl:OMEGA-KERNEL-TCP-CORPUS/mutant-zero-key].

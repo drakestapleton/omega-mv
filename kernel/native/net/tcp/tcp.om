@@ -58,7 +58,7 @@ const kSWN ulong 7
 const kWL1 ulong 8
 const kWL2 ulong 9
 const kMAX ulong 10
-const kIRS ulong 11
+note Tcb word 11 is unused.
 const kRNX ulong 12
 const kMSS ulong 13
 const kCWN ulong 14
@@ -194,8 +194,13 @@ s = add s and b 65535
 ret add add s 6 n
 end
 note Install the 128-bit key (two little-endian words) that sequence numbers and
-note trnd are drawn from. The embedder takes it from its entropy source.
+note trnd are drawn from. The embedder takes it from its entropy source. An all-zero
+note key is refused: no key is installed afterwards, as before the first tkey.
 fn tkey a ulong b ulong to void
+put Tkey 2 0
+if and eq a 0 eq b 0
+ret
+end
 put Tkey 0 a
 put Tkey 1 b
 put Tkey 2 1
@@ -257,7 +262,7 @@ ret xor h xor get Tsip 2 get Tsip 3
 end
 note Values an observer must not predict (tcpd's ephemeral port): SipHash of a
 note counter (one byte 1 after it), so without the key past values tell nothing.
-note Without an installed key it refuses: trap 8 (exit 108), never a zero key.
+note Without an installed key (tkey refuses an all-zero one) it refuses: trap 8 (exit 108).
 fn trnd to ulong
 if eq get Tkey 2 0
 trap 8
@@ -530,13 +535,12 @@ if eq get Tcf 13 0
 put Tcf 13 12
 end
 end
+note kMSS and kCWN are set from the peer's SYN (topts) before anything reads them.
 fn tfresh lp ulong to void
 tclear
 put Tcb kLP lp
-put Tcb kMSS 536
 put Tcb kRTO 1000
 put Tcb kSST 262144
-put Tcb kCWN 5360
 end
 note RFC 6528: ISN = M + F(4-tuple, key) modulo 2^32. M is the 4 microsecond clock
 note (250 ticks per millisecond of Tcf 0). F is the low 32 bits of SipHash-2-4 over
@@ -574,18 +578,20 @@ tdrop 4
 ret
 end
 put Tcb kST 2
+note The SYN is timed: tsynsent takes the sample from a SYN-ACK, tnewack (kRSQ) from the
+note ACK that ends a simultaneous open.
 tsend get Tcb kISS 2 0
 tarm
 put Tcb kRSQ sadd get Tcb kISS 1
 put Tcb kRAT umax get Tcf 0 1
 end
+note CLOSED runs no timer (tstep returns below syn-sent) and tfresh clears the block
+note before the next open, so the timers need no clearing here.
 fn tdrop code ulong to void
 if eq get Tcb kERR 0
 put Tcb kERR code
 end
 put Tcb kST 0
-put Tcb kRTX 0
-put Tcb kPRS 0
 end
 fn tclose to void
 s = get Tcb kST
@@ -596,6 +602,8 @@ end
 put Tcb kFWN 1
 end
 note SYN options: maximum segment size; others skipped; malformed lists refuse the SYN.
+note A kind in the last byte reads its length from the byte after the list (inside Trx:
+note the list ends at most 134 bytes in); that length fails one of the two tests below.
 fn topts to bool
 p = add get Tpk 6 20
 e = get Tpk 11
@@ -608,9 +616,6 @@ end
 if eq k 1
 p = add p 1
 continue
-end
-if ge add p 1 e
-ret false
 end
 o = ulong get Trx add p 1
 if lt o 2
@@ -655,7 +660,6 @@ end
 p = get Tpk 6
 put Tcb kRP tr16 p
 put Tcb kRIP get Tpk 4
-put Tcb kIRS get Tpk 8
 put Tcb kRNX sadd get Tpk 8 1
 put Tcb kSWN get Tpk 13
 put Tcb kWL1 get Tpk 8
@@ -822,9 +826,9 @@ ret false
 end
 ret eq get Tcb kUNA sadd get Tcb kFSQ 1
 end
+note TIME-WAIT runs only the 2MSL timer (tstep), so the retransmission timer is left.
 fn ttimewait to void
 put Tcb kST 10
-put Tcb kRTX 0
 put Tcb kTWA add get Tcf 0 get Tcf 8
 end
 note Data transfer begins. A SYN or SYN-ACK that timed out restarts the RTO at 3 s
@@ -905,7 +909,8 @@ end
 fn tinwin s ulong b ulong w ulong to bool
 ret lt sdif s b w
 end
-note First check of RFC 9293 3.10.7.4. A zero window admits only seq = RCV.NXT.
+note First check of RFC 9293 3.10.7.4 (its Table 6). A zero window admits only a segment
+note of length 0 at seq = RCV.NXT; tconn still takes the ACK of other segments then.
 fn tseqok to bool
 s = get Tpk 8
 n = get Tpk 12
@@ -919,7 +924,7 @@ end
 w = trwnd
 r = get Tcb kRNX
 if eq w 0
-ret eq s r
+ret and eq n 0 eq s r
 end
 if eq n 0
 ret tinwin s r w
@@ -1054,11 +1059,10 @@ fn tsynsent to void
 f = get Tpk 10
 a = get Tpk 9
 ha = ne and f 16 0
+note An unacceptable ACK gets a RST (trstout answers no RST itself).
 if ha
 if or sle a get Tcb kISS slt get Tcb kNXT a
-if eq and f 4 0
 trstout
-end
 ret
 end
 end
@@ -1076,7 +1080,6 @@ tstat 15
 ret
 end
 s = get Tpk 8
-put Tcb kIRS s
 put Tcb kRNX sadd s 1
 put Tcb kWL1 s
 put Tcb kWL2 a
@@ -1119,10 +1122,16 @@ if eq and f 22 16
 b = tackin
 end
 end
-note A retransmitted FIN in TIME-WAIT restarts the 2MSL timer (RFC 9293 3.10.7.4).
+note TIME-WAIT restarts the 2MSL timer only for a retransmission of the peer's FIN
+note (RFC 9293 3.10.7.4 fifth check: "the only thing that can arrive in this state"): FIN
+note and ACK, no SYN or RST, ending at the FIN already taken (SEG.SEQ + data length + 1 =
+note RCV.NXT). Other unacceptable segments only get the ACK, and an acceptable FIN (one past
+note the peer's own) is only acknowledged (tfinin), not a restart as in the eighth check.
 if eq st 10
-if eq and f 5 1
+if eq and f 23 17
+if eq sadd s add get Tpk 12 1 get Tcb kRNX
 put Tcb kTWA add get Tcf 0 get Tcf 8
+end
 end
 end
 ret
@@ -1166,11 +1175,13 @@ end
 if not tackin
 ret
 end
-if gt get Tpk 12 0
-tdata
-end
+note The FIN is taken before the data of the same segment, so bytes stored earlier at
+note or past it are cut (tfincut) before tdata drains: no byte past a FIN is delivered.
 if ne and f 1 0
 tfinin
+end
+if gt get Tpk 12 0
+tdata
 end
 end
 fn ttcpin to void
@@ -1359,14 +1370,11 @@ fn tpushfin to void
 if eq get Tcb kFWN 0
 ret
 end
+note The FIN goes at the end of the data (also when retransmitted after a timeout reset
+note SND.NXT); once sent, SND.NXT is past it, so it is not sent again from here.
 x = get Tcb kNXT
 if ne x sadd get Tcb kUNA get Tcb kSCN
 ret
-end
-if ne get Tcb kFSN 0
-if ne x get Tcb kFSQ
-ret
-end
 end
 tsend x 17 0
 put Tcb kFSQ x
@@ -1421,7 +1429,12 @@ tarm
 ret
 end
 m = get Tcb kMSS
-f = sdif get Tcb kNXT get Tcb kUNA
+note RFC 5681 3.1: ssthresh = max(FlightSize/2, 2 SMSS), FlightSize being the data sent
+note and not acknowledged (SND.MAX - SND.UNA). A later timeout of the same segment comes
+note with SND.UNA where it was and cwnd one SMSS since the first, so SND.MAX has moved only
+note if the flight was below one SMSS, where both values are 2 SMSS: ssthresh is held, as
+note 3.1 requires.
+f = sdif get Tcb kMAX get Tcb kUNA
 put Tcb kSST umax div f 2 mul 2 m
 put Tcb kCWN m
 put Tcb kFRX 0
@@ -1510,15 +1523,11 @@ end
 end
 end
 note Application interface. twrite queues Tapp[0..n) and returns the count taken.
+note Refused in CLOSED and LISTEN and after tclose (kFWN): every state from FIN-WAIT-1
+note on is entered only after tclose.
 fn twrite n ulong to ulong
 s = get Tcb kST
-if or lt s 2 gt s 7
-ret 0
-end
-if or eq s 5 eq s 6
-ret 0
-end
-if ne get Tcb kFWN 0
+if or lt s 2 ne get Tcb kFWN 0
 ret 0
 end
 n = umin n sub 65535 get Tcb kSCN
