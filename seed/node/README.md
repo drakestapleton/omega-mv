@@ -27,6 +27,8 @@ view and Spark qualification remain implementation work (DRA-291, DRA-292). The
 [Linear project](https://linear.app/drake-stapleton/project/omega-node-shared-memory-hive-runtime-37058a1eac4b)
 tracks that integration. This is a component contract, not a whole-system master plan.
 
+For the disposable Unix socket control probe and its native stalled-client latency check, see [probe/README.md](probe/README.md).
+
 ## Build and check
 
 Use a Linux AArch64 host and the existing approved seeded compiler. Record its

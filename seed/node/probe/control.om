@@ -1,0 +1,292 @@
+note Disposable local control probe. Compose after transport, pool and super.
+note Eight clients, four input bytes (one overflow sentinel), twelve reply bytes.
+text prefixname "omega-node-n0."
+global sa uchar 110
+global creds uchar 12
+global clients int 8
+global opened long 8
+global have ulong 8
+global writing uchar 8
+global sent ulong 8
+global inbox uchar 32
+global replies uchar 96
+global paused uchar 1
+global drain uchar 1
+global statew uchar 2
+global heartbeat uchar 1
+global inflight uchar 1
+
+fn close_slot k ulong to void
+r = fclose get clients k
+put clients k neg int 1
+end
+
+fn peer_ok fd int to bool
+if ne peercred fd creds 0 12 0
+ret false
+end
+uid = ulong 0
+for i ulong 4
+uid = or uid shl ulong get creds add i 4 mul i 8
+end
+ret eq uid ulong getuid
+end
+
+fn take_client listener int to void
+for k ulong 8
+if lt get clients k 0
+fd = accept listener 526336
+if ge fd 0
+if peer_ok int fd
+put clients k int fd
+put opened k monons
+put have k 0
+for j ulong 4
+put inbox add mul k 4 j 0
+end
+put sent k 0
+put writing k 0
+else
+r = fclose int fd
+end
+end
+ret
+end
+end
+end
+
+fn start_worker c long w ulong to long
+pid = sup_spawn c w
+if ne pid 0
+ret pid
+end
+note Worker 1 receives no work hint and remains blocked in the kernel.
+while true bound 9223372036854775807
+why = sup_wwait c w neg long 1
+if or eq why 2 eq why 3
+exit 0
+end
+if eq why 1
+if lt sup_ack w 0
+exit 2
+end
+else
+if ne why neg long 4
+exit 3
+end
+end
+end
+exit 4
+end
+
+fn update_workers c long to void
+r = sup_pollx c 0 false
+for w ulong 2
+if eq get swpid w 0
+if and eq get statew w 1 eq get swst w 0
+put statew w 2
+else
+if ne get statew w 2
+put statew w 3
+end
+end
+end
+end
+if lt r 0
+if ne r neg long 4
+for w ulong 2
+if gt get swpid w 0
+put statew w 3
+end
+end
+end
+end
+a = sup_take get swack 0
+if gt a 0
+put heartbeat 0 1
+put inflight 0 0
+end
+if and eq get paused 0 0 eq get inflight 0 0
+if eq sup_wake 0 0
+put inflight 0 1
+end
+end
+end
+
+fn valid_frame k ulong to bool
+i = mul k 4
+if ne get have k 3
+ret false
+end
+if ne get inbox i 2
+ret false
+end
+ret eq get inbox add i 1 1
+end
+
+fn reply_frame o ulong op uchar status uchar to void
+put replies o 11
+put replies add o 1 1
+put replies add o 2 op
+put replies add o 3 status
+put replies add o 4 uchar get paused 0
+put replies add o 5 get statew 0
+put replies add o 6 get statew 1
+put replies add o 7 uchar get heartbeat 0
+for j ulong 4
+b = uchar and shr ulong getpid mul j 8 255
+put replies add add o 8 j b
+end
+end
+
+fn apply_frame k ulong to void
+i = mul k 4
+o = mul k 12
+op = get inbox add i 2
+status = uchar 0
+if not valid_frame k
+status = uchar 1
+else
+if or lt op 1 gt op 6
+status = uchar 1
+else
+if eq op 3
+put paused 0 1
+end
+if eq op 4
+put paused 0 0
+end
+if eq op 5
+put drain 0 1
+end
+if eq op 6
+if eq get statew 1 0
+if eq node_notify get swstop 1 0
+put statew 1 1
+else
+put statew 1 3
+end
+end
+end
+end
+end
+reply_frame o op status
+put writing k 1
+end
+
+fn service_slot k ulong to void
+fd = get clients k
+if lt fd 0
+ret
+end
+if ge sub monons get opened k 1000000000
+close_slot k
+ret
+end
+if eq get writing k 0
+n = get have k
+r = recv fd inbox add mul k 4 n sub 4 n 0
+if gt r 0
+n = add n ulong r
+put have k n
+if lt n 4
+ret
+end
+else
+if lt r 0
+if and ne r neg long 11 ne r neg long 4
+close_slot k
+end
+ret
+end
+end
+apply_frame k
+end
+n = get sent k
+r = sendmsg fd replies add mul k 12 n sub 12 n 16384
+if gt r 0
+n = add n ulong r
+put sent k n
+if eq n 12
+close_slot k
+end
+else
+if and ne r neg long 4 ne r neg long 11
+close_slot k
+end
+end
+end
+
+fn serve_probe c long to int
+put sa 0 1
+for i ulong len prefixname
+put sa add i 3 get prefixname i
+end
+n = add len prefixname 3
+for i ulong 4
+put sa add n i uchar and shr ulong getpid mul i 8 255
+end
+fd = socknew 1 526337 0
+if lt fd 0
+ret 10
+end
+if or ne bind int fd sa 0 add n 4 0 ne listen int fd 8 0
+r = fclose int fd
+ret 11
+end
+for k ulong 8
+put clients k neg int 1
+end
+deadline = add monons 60000000000
+while lt monons deadline bound 1000000
+update_workers c
+take_client int fd
+for k ulong 8
+service_slot k
+if ne get drain 0 0
+note Finish only the shutdown reply before teardown, within the original slot deadline.
+while ge get clients k 0 bound 2000
+service_slot k
+if ge get clients k 0
+r = sleepns 1000000
+end
+end
+break
+end
+end
+if ne get drain 0 0
+break
+end
+r = sleepns 1000000
+end
+for k ulong 8
+if ge get clients k 0
+close_slot k
+end
+end
+r = fclose int fd
+ret 0
+end
+
+fn main to int
+c = pool_new 1 2
+if lt c 0
+ret 20
+end
+if ne sup_init c 0
+ret 21
+end
+rc = int 22
+if gt start_worker c 0 0
+if gt start_worker c 1 0
+rc = serve_probe c
+end
+end
+r = sup_stop c 1000000000
+if or lt r 0 ne sup_live c 0
+rc = int 23
+end
+sup_closeall
+r = pool_free c
+ret rc
+end
