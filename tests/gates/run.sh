@@ -607,6 +607,9 @@ case "$step" in
     obs evidence_rewrites 0
     echo "evidence/: additions only"
     ;;
+  # DRA-485: the C3 GEMM chip receipt evidence/C3-GEMM-CHIP-DRA485/ against its generator: the README's generated block,
+  # every per-shape.csv and SHA256SUMS (tools/c3_gemm_evidence.sh check; sh + awk, no build, no GPU). Judges nothing else.
+  c3-gemm-evidence)   sh tools/c3_gemm_evidence.sh check ;;
   zero-disk-secrets)
     echo "Auditing repository for prohibited plaintext secret files..."
     # Inspect every tracked path, including forced additions under generated dirs.
