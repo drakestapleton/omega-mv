@@ -27,6 +27,23 @@ cd "$ROOT"
 step="${1:?usage: tests/gates/run.sh <step>}"
 obs() { printf 'AIEN-OBS %s %s\n' "$1" "$2"; }
 
+# need TOOL...: the programs a step cannot run without; every step starts with it. A tool that is
+# not on PATH makes the step NOT_RUN, exit 3, before anything runs: a missing tool is never a FAIL
+# and never a pass [ctl:OMEGA-KERNEL-GATE-WIRING/no-cargo-crypto-boundary]. With AIENOS_NEED_LIST=1 it prints "NEED <tools>" and exits 3 without running
+# the step. kernel/scripts/omega_gate_wiring.sh --self-test reads each step's list that way, then
+# runs the step once per listed tool with that tool removed from PATH and requires exit 3.
+need() {
+  local t miss=0
+  if [ -n "${AIENOS_NEED_LIST:-}" ]; then echo "NEED $*"; exit 3; fi
+  for t in "$@"; do
+    command -v "$t" > /dev/null 2>&1 || { echo "$step: NOT_RUN ($t is not on PATH)"; miss=$((miss + 1)); }
+  done
+  obs tools_missing "$miss"
+  [ "$miss" = 0 ] || exit 3
+}
+# cc_word: the C compiler make will call (the first word of $CC, default cc).
+cc_word() { set -- ${CC:-cc}; printf '%s' "${1:-cc}"; }
+
 # The removed hosted jobs kept the quiet flag and the QEMU gate lock in the runner's temp dir,
 # never in ~/workspace (ck-kernel.yml, native-suites.yml). Same here.
 TMP="$(mktemp -d /tmp/aienos-gate.XXXXXX)"
@@ -34,35 +51,38 @@ trap 'rm -rf "$TMP"' EXIT
 export AIENOS_QUIET_FLAG="$TMP/spark-quiet"
 export AIENOS_GATE_LOCK="$TMP/qemu-gate-lock"
 
-# native-suites.yml: make must succeed AND every suite must print its own pass marker, and
-# never NOT_RUN. $1 = suite dir, $2 = make targets, $3 = required marker regexes joined by |.
+# native-suites.yml: make must succeed AND the suite must print each marker in $3; a NOT_RUN in its
+# log makes the step NOT_RUN, exit 3. $1 = suite dir (native/<suite>),
+# $2 = make targets, $3 = required marker regexes joined by |.
 native_suite() {
   local suite="$1" targets="$2" req="$3" log="$TMP/suite.log" found=0
   set -o pipefail
   # native/crypto has no .gitignore for its out/ (the other suites do), so the build output
   # would stay in the tree; the hosted job throws its checkout away. Remove an out/ that this
   # step created, and only when git does not already ignore it. The gate itself is unchanged.
-  if [ ! -e "native/$suite/out" ] && ! git check-ignore -q "native/$suite/out"; then
-    CLEAN_OUT="$ROOT/native/$suite/out"
+  if [ ! -e "$suite/out" ] && ! git check-ignore -q "$suite/out"; then
+    CLEAN_OUT="$ROOT/$suite/out"
     trap 'rm -rf "$TMP" "$CLEAN_OUT"' EXIT
   fi
   # shellcheck disable=SC2086
-  make -C "native/$suite" $targets 2>&1 | tee "$log"
+  make -C "$suite" $targets 2>&1 | tee "$log"
   while IFS= read -r m; do
     grep -qE "$m" "$log" || { echo "missing marker: $m"; obs markers_missing 1; exit 1; }
     echo "found: $m"; found=$((found + 1))
   done < <(printf '%s\n' "$req" | tr '|' '\n')
-  if grep -q 'NOT_RUN' "$log"; then echo 'NOT_RUN in log'; obs not_run_in_log true; exit 1; fi
+  if grep -q 'NOT_RUN' "$log"; then echo "$step: NOT_RUN (a NOT_RUN line in the suite log)"; obs not_run_in_log true; exit 3; fi
   obs markers_found "$found"
   obs not_run_in_log false
 }
 
 # One test script inside a step. It counts only when it exits 0 AND prints every required line
-# whole (several print NOT_RUN and exit 0, 2 or 3; that is never a pass). Each failure is
-# counted in $script_fail so the step runs every script and fails at the end.
+# whole (several print NOT_RUN and exit 0, 2 or 3; that is never a pass). Exit 3 (NOT_RUN) or 127
+# (a command it needs is missing) is counted in $script_notrun, another failure in $script_fail;
+# the step goes on to the next script and ends FAIL, else NOT_RUN, else PASS (scripts_verdict).
 # Usage: must_pass NAME LINE_REGEX... -- COMMAND...
 script_pass=0
 script_fail=0
+script_notrun=0
 must_pass() {
   local name="$1" log rc=0 r req=()
   shift
@@ -71,6 +91,9 @@ must_pass() {
   log="$TMP/script-$name.log"
   echo "== $name: $*"
   "$@" 2>&1 | tee "$log" || rc=$?
+  if [ "$rc" = 3 ] || [ "$rc" = 127 ]; then
+    echo "script $name: exit $rc, NOT_RUN"; script_notrun=$((script_notrun + 1)); return 0
+  fi
   if [ "$rc" != 0 ]; then
     echo "script $name: exit $rc, not PASS"; script_fail=$((script_fail + 1)); return 0
   fi
@@ -81,10 +104,14 @@ must_pass() {
   done
   echo "script $name: PASS"; script_pass=$((script_pass + 1))
 }
+# scripts_verdict: returns 1 when a script failed; else 3 (NOT_RUN) when a script exited 3 or 127 (it
+# did not run, or a command it needs is missing); else 0.
 scripts_verdict() {
   obs scripts_pass "$script_pass"
   obs scripts_fail "$script_fail"
-  [ "$script_fail" = 0 ]
+  obs scripts_not_run "$script_notrun"
+  [ "$script_fail" = 0 ] || return 1
+  [ "$script_notrun" = 0 ] || { echo "$step: NOT_RUN ($script_notrun scripts did not run)"; return 3; }
 }
 
 # omega_omc: make AIEN_OMC omega-mv's own committed seeded compiler. Aienux is folded into omega-mv
@@ -119,7 +146,7 @@ omega_omc() {
 # check and refuse for the right reason (review of aienux 1f12818d finding 12, and of omega-mv
 # c9e503afd finding 10: every control tree had no compiler, so a script refused "compiler missing"
 # before its compare, and deleting the compare passed). omega_omc runs with AIEN_OMC unset, and each
-# script in PIN_SCRIPTS from a copy in a tree, in six states. In every state but missing-compiler the
+# script in PIN_SCRIPTS from a copy in a tree, in eight states. In each state but missing-compiler the
 # tree has a stand-in compiler (a script that records that it ran, then fails):
 #   missing, empty, short   pin file absent, empty, not 64 hex digits: refused with "no sha256";
 #   missing-compiler        a good pin, no compiler: refused with "no compiler at" or "pinned compiler
@@ -127,15 +154,35 @@ omega_omc() {
 #   wrong-compiler          a good pin and the stand-in, whose sha256 differs: refused with "compiler pin
 #                           mismatch" (omega_omc: "no omc with sha256"), so the compare itself refuses;
 #   matching                the pin is the stand-in's sha256: no pin refusal at all (omega_omc accepts),
-#                           so the compare accepts an equal digest and refuses only an unequal one.
-# A refusing state also needs exit non-zero, no output file and a stand-in that never ran. Output is
+#                           so the compare accepts an equal digest and refuses only an unequal one;
+#   env-wrong               a good pin; the wrong stand-in in seed/out and a second wrong stand-in
+#                           outside it named by every override (OMEGA_COMPILER, OMC, AIEN_OMC): refused
+#                           with "compiler pin mismatch" (omega_omc: "no omc with sha256"), so a script
+#                           that skips its compare when an override is set, or omega_omc trusting
+#                           AIEN_OMC, runs the stand-in and fails the control;
+#   env-pinbeside           as env-wrong, but the override names alt/seed/out/omc with its own matching
+#                           alt/seed/out/omc.sha256 beside it: refused the same way, so a script that
+#                           reads the pin beside the compiler instead of the checkout's fails the control
+#                           (review of omega-mv 5cd0af98f, WiringRun finding 4)
+#                           [ctl:OMEGA-KERNEL-HW-GATES/pin-env-wrong-omega-omc]
+#                           [ctl:OMEGA-KERNEL-HW-GATES/pin-env-pinbeside-native-omega-allen-build-fw].
+# The root pin itself must be 64 hex digits, as omega_omc requires: otherwise the step is NOT_RUN, exit 3.
+# A refusing state also needs exit non-zero, no output file and a stand-in that did not run; each
+# refusal as required prints CONTROL OMEGA-KERNEL-<STEP>/pin-<state>-<script> FAILED_AS_REQUIRED
+# (script: omega-omc, or its path with / and _ as -, without .sh). Output is
 # matched with here-strings: with pipefail, `printf | grep -q` fails when grep exits before printf ends.
 PIN_SCRIPTS="native/om/lm1b/gate.sh native/omega/allen/build-fw.sh native/omega/allen/build-one.sh
   native/omega/allen/build-local-model.sh scripts/check_local_tools.sh native/disk/tests/omega_nvme_test.sh"
+# pin_ctl NAME: the CONTROL line of a pin state refused as required, under the gate of this step.
+pin_ctl() { echo "CONTROL OMEGA-KERNEL-$(printf '%s' "$step" | tr 'a-z' 'A-Z')/pin-$1 FAILED_AS_REQUIRED"; }
 pin_controls() {
-  local c d s out rc sh_ args n=0 want owant
-  for c in missing empty short missing-compiler wrong-compiler matching; do
-    d="$TMP/pin-control-$c"; mkdir -p "$d/seed/out"
+  local c d s out rc sh_ args n=0 want owant alt ps
+  ps=$(cut -c1-64 "$OMEGA_ROOT/seed/out/omc.sha256" 2>/dev/null | head -n 1)
+  if ! printf '%s\n' "$ps" | grep -qxE '[0-9a-f]{64}'; then
+    echo "$step: NOT_RUN (no sha256 in $OMEGA_ROOT/seed/out/omc.sha256; the pin controls copy it)"; obs omc_pinned false; exit 3
+  fi
+  for c in missing empty short missing-compiler wrong-compiler matching env-wrong env-pinbeside; do
+    d="$TMP/pin-control-$c"; mkdir -p "$d/seed/out"; alt=
     if [ "$c" != missing-compiler ]; then
       printf '#!/bin/sh\necho ran >> "%s/RAN"\nexit 97\n' "$d" > "$d/seed/out/omc"; chmod +x "$d/seed/out/omc"
     fi
@@ -148,8 +195,17 @@ pin_controls() {
       wrong-compiler) cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256"
         want='compiler pin mismatch'; owant='no omc with sha256' ;;
       matching) (cd "$d" && sha256sum seed/out/omc > seed/out/omc.sha256); want=; owant= ;;
+      env-wrong) cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256"; alt="$d/alt/omc"; mkdir -p "$d/alt"
+        printf '#!/bin/sh\n# alt\necho ran >> "%s/RAN"\nexit 96\n' "$d" > "$alt"; chmod +x "$alt"
+        want='compiler pin mismatch'; owant='no omc with sha256' ;;
+      env-pinbeside) cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256"; alt="$d/alt/seed/out/omc"; mkdir -p "$d/alt/seed/out"
+        printf '#!/bin/sh\n# alt\necho ran >> "%s/RAN"\nexit 96\n' "$d" > "$alt"; chmod +x "$alt"
+        (cd "$d/alt" && sha256sum seed/out/omc > seed/out/omc.sha256)
+        want='compiler pin mismatch'; owant='no omc with sha256' ;;
     esac
-    rc=0; out=$(OMEGA_ROOT="$d"; unset AIEN_OMC; omega_omc 2>&1) || rc=$?
+    rc=0
+    if [ -n "$alt" ]; then out=$(OMEGA_ROOT="$d"; export AIEN_OMC="$alt"; omega_omc 2>&1) || rc=$?
+    else out=$(OMEGA_ROOT="$d"; unset AIEN_OMC; omega_omc 2>&1) || rc=$?; fi
     if [ -n "$owant" ]; then
       if [ "$rc" != 3 ] || grep -q 'omc_pinned true' <<< "$out" || ! grep -q "$owant" <<< "$out"; then
         printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, not refused with '$owant'" >&2; exit 1
@@ -157,7 +213,7 @@ pin_controls() {
     elif [ "$rc" != 0 ] || ! grep -q 'omc_pinned true' <<< "$out"; then
       printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, refused a compiler equal to the pin" >&2; exit 1
     fi
-    n=$((n + 1))
+    n=$((n + 1)); [ -z "$owant" ] || pin_ctl "$c-omega-omc"
     for s in $PIN_SCRIPTS; do
       rm -rf "$d/RAN" "$d/out.efi" "$d/out.bin" "$d/out.tools"
       mkdir -p "$d/kernel/$(dirname "$s")"; cp "$s" "$d/kernel/$s"
@@ -169,12 +225,18 @@ pin_controls() {
       esac
       case "$(head -n 1 "$s")" in *bash*) sh_=bash ;; *) sh_=sh ;; esac
       # shellcheck disable=SC2086
-      rc=0; out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u OMEGA_SOURCE AIEN_OMC="$d/seed/out/omc" \
-        MODEL="$d/no-model" LOCAL_TOOLS_OUT="$d/out.tools" OMEGA_NVME_EVIDENCE="$d/nvme-evidence" "$sh_" "$d/kernel/$s" $args 2>&1) || rc=$?
+      rc=0
+      if [ -n "$alt" ]; then
+        out=$(cd "$d" && env -u OMEGA_SOURCE OMEGA_COMPILER="$alt" OMC="$alt" AIEN_OMC="$alt" \
+          MODEL="$d/no-model" LOCAL_TOOLS_OUT="$d/out.tools" OMEGA_NVME_EVIDENCE="$d/nvme-evidence" "$sh_" "$d/kernel/$s" $args 2>&1) || rc=$?
+      else
+        out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u OMEGA_SOURCE AIEN_OMC="$d/seed/out/omc" \
+          MODEL="$d/no-model" LOCAL_TOOLS_OUT="$d/out.tools" OMEGA_NVME_EVIDENCE="$d/nvme-evidence" "$sh_" "$d/kernel/$s" $args 2>&1) || rc=$?
+      fi
       if [ -n "$want" ]; then
         if [ "$rc" != 0 ] && grep -qE "$want" <<< "$out" && [ ! -e "$d/RAN" ] &&
           [ ! -e "$d/out.efi" ] && [ ! -e "$d/out.bin" ] && [ ! -e "$d/out.tools" ]; then
-          n=$((n + 1))
+          n=$((n + 1)); pin_ctl "$c-$(printf '%s' "${s%.sh}" | tr '/_' '--')"
         else
           printf '%s\n' "$out"; [ -e "$d/RAN" ] && echo "(the stand-in compiler ran)"
           echo "pin control $c: $s exit $rc, not refused with '$want' before running the compiler" >&2; exit 1
@@ -199,12 +261,12 @@ pin_controls() {
     rc=0; out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u AIEN_OMC OMEGA_SOURCE="$d/src" LOCAL_TOOLS_OUT="$d/out.tools" \
       bash "$d/kernel/scripts/check_local_tools.sh" 2>&1) || rc=$?
     if [ "$rc" != 0 ] && grep -q 'compiler pin refused' <<< "$out" && [ ! -e "$d/out.tools" ]; then
-      n=$((n + 1))
+      n=$((n + 1)); pin_ctl "source-$c"
     else
       printf '%s\n' "$out"; echo "pin control source-$c: check_local_tools.sh exit $rc, ran the compiler OMEGA_SOURCE named" >&2; exit 1
     fi
   done
-  echo "pin controls: $n results as required (omega_omc and $(echo $PIN_SCRIPTS | wc -w) scripts in 6 pin states, 3 OMEGA_SOURCE states)"
+  echo "pin controls: $n results as required (omega_omc and $(echo $PIN_SCRIPTS | wc -w) scripts in 8 pin states, 3 OMEGA_SOURCE states)"
   obs pin_controls_refused "$n"
 }
 
@@ -213,6 +275,7 @@ case "$step" in
   # workflow, so no gate checks crumb freshness. The .crumb files and crumb.lock stay as history.
   # ck-kernel.yml, host steps (ubuntu-24.04-arm there, AArch64 here)
   ck-host-tests)
+    need make "$(cc_word)"
     make -C native/kernel test sanitize
     bash scripts/ck_swap_disk_bound_test.sh
     bash scripts/ck_imac_lab_services_test.sh
@@ -239,27 +302,35 @@ case "$step" in
     must_pass mind_phases 'AIENOS_MIND_PHASES: PASS' -- sh scripts/ck_mind_phases_test.sh "$TMP/mind-phases"
     scripts_verdict
     ;;
-  ck-stage-tests)     make -C native/kernel stage-test stage-sanitize ;;
-  ck-gate-selftest)   bash scripts/ck_gates.sh --self-test ;;
-  ck-hold-selftest)   bash scripts/gate_hold_selftest.sh ;;
-  ck-owner-keys)      bash scripts/ck_owner_keys_check.sh ;;
+  ck-stage-tests)     need make "$(cc_word)"; make -C native/kernel stage-test stage-sanitize ;;
+  ck-gate-selftest)   need git; bash scripts/ck_gates.sh --self-test ;;
+  ck-hold-selftest)   need flock; bash scripts/gate_hold_selftest.sh ;;
+  ck-owner-keys)      need make "$(cc_word)"; bash scripts/ck_owner_keys_check.sh ;;
   # ck-kernel.yml, QEMU TCG gates: every gate with a C implementation except FPU and INFER
+  #
+  # ck_gates.sh runs the required gates alone (the list passed below): FPU and INFER, and the gates with no C
+  # implementation, print NOT_SELECTED and run nothing, so the log has no NOT_RUN line for a gate
+  # this step does not judge. A required gate that FAILs fails the step; one that reports NOT_RUN
+  # (QEMU lock held, quiet flag) makes the step NOT_RUN, exit 3.
   ck-qemu-gates)
+    need qemu-system-aarch64 make cargo git
+    required=$(sed -n "/^CK_GATE_TABLE='/,/^'/p" scripts/ck_gates.sh | awk -F'|' 'NF==3 && $2!="missing" && $1!="FPU" && $1!="INFER" {print $1}')
+    [ -n "${required}" ] || { echo "could not read the gate table"; exit 1; }
     mkdir -p "$TMP/ck-receipt"
     set +e
-    bash scripts/ck_gates.sh --out "$TMP/ck-receipt" | tee "$TMP/ck-gates.txt"
+    bash scripts/ck_gates.sh --out "$TMP/ck-receipt" --only "$(printf '%s,' ${required})" | tee "$TMP/ck-gates.txt"
     rc=${PIPESTATUS[0]}
     set -e
     echo "ck_gates.sh exit ${rc}"
     [ "${rc}" = 0 ] || exit 1
-    required=$(sed -n "/^CK_GATE_TABLE='/,/^'/p" scripts/ck_gates.sh | awk -F'|' 'NF==3 && $2!="missing" && $1!="FPU" && $1!="INFER" {print $1}')
-    [ -n "${required}" ] || { echo "could not read the gate table"; exit 1; }
-    fail=0; n=0
+    fail=0; notrun=0; n=0
     for g in ${required}; do
       if grep -q "^AIENOS_CK_${g}: PASS" "$TMP/ck-gates.txt"; then echo "required gate ${g}: PASS"; n=$((n + 1))
+      elif grep -q "^AIENOS_CK_${g}: NOT_RUN" "$TMP/ck-gates.txt"; then echo "required gate ${g}: NOT_RUN"; notrun=$((notrun + 1))
       else echo "required gate ${g}: not PASS"; fail=1; fi
     done
     obs required_gates_pass "$n"
+    obs required_gates_not_run "$notrun"
     # Self-contained QEMU tests of the iMac kernel: no model server (allen_code replays its
     # recorded replies), no hardware; gpu_bench's BARs are RAM stand-ins. Each takes the gate lock.
     must_pass allen_memory_qemu 'AIENOS_ALLEN_MEMORY_QEMU: PASS' -- bash scripts/qemu_ck_allen_memory_test.sh
@@ -272,8 +343,9 @@ case "$step" in
     must_pass local_tools 'LOCAL_TOOLS: PASS cpu=qemu64' 'LOCAL_TOOLS: PASS cpu=max' \
       -- env LOCAL_TOOLS_OUT="$TMP/local-tools" bash scripts/qemu_ck_local_tools_test.sh
     must_pass allen_code_qemu 'AIENOS_ALLEN_CODE_QEMU: PASS' -- env ALLEN_CODE_LIVE=0 bash scripts/qemu_ck_allen_code_test.sh
-    scripts_verdict || fail=1
-    exit ${fail}
+    src=0; scripts_verdict || src=$?
+    [ "${fail}" = 0 ] && [ "${src}" != 1 ] || exit 1
+    if [ "${notrun}" != 0 ] || [ "${src}" = 3 ]; then echo "ck-qemu-gates: NOT_RUN (${notrun} required gates and the scripts above did not all run)"; exit 3; fi
     ;;
   # Not hosted: QEMU tests that need outside inputs. A missing input is NOT_RUN, exit 3, never a pass.
   #   ALLEN_MODEL            host:port of an OpenAI-shape model server answering /health
@@ -282,6 +354,7 @@ case "$step" in
   #   LOCAL_MODEL_WEIGHTS    pinned stories15M.bin (local_model checks its sha256)
   #   LOCAL_MODEL_TOKENIZER  pinned tokenizer.bin
   ck-qemu-external)
+    need qemu-system-aarch64
     missing=0
     for v in ALLEN_MODEL LOCAL_MODEL_WEIGHTS LOCAL_MODEL_TOKENIZER; do
       if [ -z "${!v:-}" ]; then echo "::error::ck-qemu-external needs $v" >&2; missing=$((missing + 1)); fi
@@ -298,6 +371,7 @@ case "$step" in
     scripts_verdict
     ;;
   ck-b7b-probe)
+    need qemu-system-aarch64
     bash scripts/qemu_ck_b7b_probe_test.sh --self-test
     bash scripts/qemu_ck_b7b_probe_test.sh
     bash scripts/qemu_ck_b7b_probe_test.sh --positive
@@ -308,6 +382,7 @@ case "$step" in
   # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register, its
   # receipts, a size alarm and planted-bad copies. Needs omega-mv's pinned seed/out/omc.
   hw-gates)
+    need sha256sum
     pin_controls
     omega_omc
     sh tools/hwgates/gate.sh
@@ -317,6 +392,7 @@ case "$step" in
   # mutants, disposable-QEMU cases and the killed-QEMU control; 48 cases, no ALARM line (an ALARM
   # fails the test). Physical NVMe stays NOT_RUN.
   omega-nvme)
+    need sha256sum qemu-system-aarch64 "$(cc_word)"
     pin_controls
     omega_omc
     must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard, budget and wait mutants \+ QEMU death control; cases=48 alarms=0; physical NOT_RUN' \
@@ -330,6 +406,7 @@ case "$step" in
   # to mutants and gen_killed + survivors equal to generated; gate.sh exit 3 is NOT_RUN (exit 3 here),
   # never a pass. No QEMU; the QEMU profiles stay in gate.sh.
   tcp-corpus)
+    need sha256sum
     pin_controls
     omega_omc
     rc=0; env FUZZ=2000000 sh native/net/tcp/gate.sh corpus "$AIEN_OMC" "$TMP/tcp" 2>&1 | tee "$TMP/tcp-corpus.log" || rc=$?
@@ -358,6 +435,7 @@ case "$step" in
   # ${ELAN_HOME:-$HOME/.elan}/bin. No cross compiler, no lean, or a lean other than the pinned one:
   # NOT_RUN, exit 3, never a pass. The NOT_RUN paths are controls here too.
   spinlock)
+    need make
     spin_fail=0; spin_notrun=0
     if ! command -v lean > /dev/null; then
       elan_bin="${ELAN_HOME:-$HOME/.elan}/bin"
@@ -404,14 +482,15 @@ case "$step" in
     echo "AIENOS_SPINLOCK: PASS"
     ;;
   # native-suites.yml matrix
-  native-net)        native_suite net "test sanitize mutants" 'AIENOS_NET_SECURE_TESTS: PASS|NET_SANITIZE: PASS|NET_SECURE_MUTANTS: [0-9]+/[0-9]+ killed' ;;
-  native-sig)        native_suite sig "test sanitize mutants" 'AIENOS_SIG_NATIVE: PASS|AIENOS_SIG_MUTANTS: PASS' ;;
-  native-crypto)     native_suite crypto "test sanitize mutants" 'AIENOS_CRYPTO_NATIVE: PASS|AIENOS_CRYPTO_MUTANTS: PASS' ;;
-  native-m5)         native_suite m5 "test sanitize mutants" 'M5_NATIVE: PASS|M5_NATIVE_MUTANTS: PASS' ;;
-  native-disk)       native_suite disk "test sanitize mutants" 'AIENOS_DISK_NATIVE: PASS|AIENOS_DISK_SANITIZE: PASS|AIENOS_DISK_MUTANTS: PASS' ;;
-  native-argus)      native_suite argus "test sanitize" 'GATE CONTAIN_TEST PASS|GATE CONTAIN_DETERMINISM PASS' ;;
-  native-capability) native_suite capability "mutants" 'AIENOS_CAP_MUTANTS: PASS' ;;
+  native-net)        need make "$(cc_word)"; native_suite native/net "test sanitize mutants" 'AIENOS_NET_SECURE_TESTS: PASS|NET_SANITIZE: PASS|NET_SECURE_MUTANTS: [0-9]+/[0-9]+ killed' ;;
+  native-sig)        need make "$(cc_word)"; native_suite native/sig "test sanitize mutants" 'AIENOS_SIG_NATIVE: PASS|AIENOS_SIG_MUTANTS: PASS' ;;
+  native-crypto)     need make "$(cc_word)"; native_suite native/crypto "test sanitize mutants" 'AIENOS_CRYPTO_NATIVE: PASS|AIENOS_CRYPTO_MUTANTS: PASS' ;;
+  native-m5)         need make "$(cc_word)"; native_suite native/m5 "test sanitize mutants" 'M5_NATIVE: PASS|M5_NATIVE_MUTANTS: PASS' ;;
+  native-disk)       need make "$(cc_word)"; native_suite native/disk "test sanitize mutants" 'AIENOS_DISK_NATIVE: PASS|AIENOS_DISK_SANITIZE: PASS|AIENOS_DISK_MUTANTS: PASS' ;;
+  native-argus)      need make "$(cc_word)"; native_suite native/argus "test sanitize" 'GATE CONTAIN_TEST PASS|GATE CONTAIN_DETERMINISM PASS' ;;
+  native-capability) need make "$(cc_word)"; native_suite native/capability "mutants" 'AIENOS_CAP_MUTANTS: PASS' ;;
   disk-qemu)
+    need qemu-system-aarch64 make "$(cc_word)"
     set -o pipefail
     bash scripts/qemu_native_nvme_test.sh 2>&1 | tee "$TMP/qemu.log"
     # The script exits 0 on NOT_RUN; only an explicit PASS counts.
@@ -419,6 +498,7 @@ case "$step" in
     ;;
   # crypto-boundary.yml (one job, four commands)
   crypto-boundary)
+    need cargo
     cargo test --locked --offline -p aienos-crypto
     cargo test --locked --offline -p aienos-kernel crypto::
     cargo clippy --locked --offline -p aienos-crypto --all-targets -- -D warnings
@@ -426,6 +506,7 @@ case "$step" in
     ;;
   # infer-crate.yml (one job: fmt, clippy, test, no_std build)
   infer-crate)
+    need cargo
     export AIENOS_MODEL="${AIENOS_MODEL:-/nonexistent/no-model.gguf}"  # hosted runner has no model file; forward tests SKIP
     test -f crates/aienos-infer/Cargo.toml
     cargo fmt -p aienos-infer --check
@@ -438,6 +519,7 @@ case "$step" in
   # $HOME/models (aien-run-exec bind-mounts the operator's ~/models read-only there).
   # A missing model is NOT_RUN, exit 3, never a pass; any SKIPPED line is a FAIL.
   infer-forward)
+    need cargo
     model="${AIENOS_MODEL:-$HOME/models/aien-mail/Llama-3.2-1B-Instruct-Q4_K_M.gguf}"
     if [ ! -f "$model" ]; then
       echo "infer-forward: NOT_RUN (model file $model not present; infer-forward needs the real model)"
@@ -455,13 +537,30 @@ case "$step" in
     fi
     obs skipped_in_log false
     ;;
-  # ci.yml (disabled on GitHub since the CK workflow took over): the suites it still names
-  store-native)      make -C native/store test mutants ;;
+  # ci.yml (disabled on GitHub since the CK workflow took over): the suites it still names.
+  # store-native builds the Rust aienos-store-tool first, so the C -> Rust cross-check of make test
+  # runs on a fresh clone too (before, it printed STORE_RUST_CROSSCHECK: NOT_RUN and the step passed:
+  # review of omega-mv 5cd0af98f, WiringRun finding 2); a cross-check that still does not run makes
+  # make test print AIENOS_STORE_NATIVE: NOT_RUN, which the root runner reports as exit 3.
+  store-native)
+    need make "$(cc_word)" cargo
+    # Control: without the tool, make test must end NOT_RUN, never PASS (its log stays out of this one)
+    # [ctl:OMEGA-KERNEL-STORE-NATIVE/crosscheck-absent-not-run].
+    rc=0; make -C native/store test RUST_STORE_TOOL=/nonexistent/aienos-store-tool > "$TMP/store-notool.log" 2>&1 || rc=$?
+    if [ "$rc" = 0 ] && grep -qx 'STORE_RUST_CROSSCHECK: NOT_RUN' "$TMP/store-notool.log" &&
+       grep -q '^AIENOS_STORE_NATIVE: NOT_RUN' "$TMP/store-notool.log" && ! grep -q '^AIENOS_STORE_NATIVE: PASS' "$TMP/store-notool.log"; then
+      echo "CONTROL OMEGA-KERNEL-STORE-NATIVE/crosscheck-absent-not-run FAILED_AS_REQUIRED"
+    else cat "$TMP/store-notool.log"; echo "store-native: control crosscheck-absent-not-run: make test without the Rust tool exit $rc, not NOT_RUN"; exit 1; fi
+    env -u CARGO_TARGET_DIR cargo build --locked --offline --release -p aienos-store-tool
+    make -C native/store test mutants RUST_STORE_TOOL="$ROOT/target/release/aienos-store-tool"
+    ;;
   verify-all)
+    need cargo
     export AIENOS_MODEL="${AIENOS_MODEL:-/nonexistent/no-model.gguf}"  # hosted parity: the debug workspace sweep skips forward tests (they run in infer-forward)
     bash scripts/verify_all.sh
     ;;
   zero-disk-secrets)
+    need find
     echo "Auditing repository for prohibited plaintext secret files..."
     if find . -maxdepth 4 -name ".env*" -not -path "*/.git/*" -not -path "*/target/*" -not -path "*/vendor/*" | grep -q .; then
       echo "::error::Prohibited plaintext .env file found. Use an approved AIEN SecretProvider."

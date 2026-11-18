@@ -87,8 +87,20 @@ compiler moves the kernel's with it; there is no separate repin.
 `kernel-ck-host-tests`, `kernel-hw-gates`, `kernel-omega-nvme`, `kernel-tcp-corpus` and `kernel-spinlock`,
 each of which is also a step of its own; the last five run `kernel/tests/gates/run.sh <step>`.
 `kernel-spinlock` (the compiled order of `core/spinlock.h` and its Lean model) is NOT_RUN, exit 3, without
-the cross compilers or the lean that `native/kernel/proofs/lean-toolchain` names; like every other step, a
-NOT_RUN is not a pass and fails the aggregate.
+the cross compilers or the lean that `native/kernel/proofs/lean-toolchain` names. A NOT_RUN is not a pass
+and fails the aggregate.
+
+Each `kernel-<step>` goes through `kernel_step` in `tests/gates/run.sh` (CA3 of the 2026-11-18
+root-cause analysis). It first needs git and a base ref (`AIEN_BASE_REF`, default `origin/main`) that is a
+commit holding `kernel/`; otherwise the step is NOT_RUN, exit 3 [ctl:OMEGA-KERNEL-GATE-WIRING/base-without-kernel]. On a
+clone whose `origin/main` predates the fold, set `AIEN_BASE_REF` to the branch the head lands on. Exit 3
+or 127 from the step, or exit 0 with a verdict line saying NOT_RUN or SKIP (`LABEL: NOT_RUN`,
+`SKIPPED: ...`), becomes NOT_RUN, exit 3 [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-127-pass] [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-verdict-ignored]
+[ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-skip-ignored]. When `tests/gates/controls/OMEGA-KERNEL-<STEP>.controls` exists, a run
+that does not print `CONTROL OMEGA-KERNEL-<STEP>/<name> FAILED_AS_REQUIRED` for each name in it is FAIL,
+exit 1 [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-controls-ignored]. Each arm of `kernel/tests/gates/run.sh` starts with
+`need TOOL...`: a tool missing from PATH is NOT_RUN, exit 3, before anything runs
+[ctl:OMEGA-KERNEL-GATE-WIRING/no-cargo-crypto-boundary].
 
 Every other gate aienux had is wired the same way, one manifest each: `tests/gates/omega-kernel-<step>.gate`
 runs `tests/gates/run.sh kernel-<step>`, whose `kernel-*` arm runs `kernel/tests/gates/run.sh <step>`. Each
@@ -102,17 +114,25 @@ ck-b7b-probe, disk-qemu, infer-crate, infer-forward and verify-all), and the 25t
 manifests under `kernel/tests/gates/` are aienux's, read by no judge here, and kept as history.
 
 `kernel/scripts/omega_gate_wiring.sh` (step `kernel-gate-wiring`, gate OMEGA-KERNEL-GATE-WIRING, always-run)
-fails unless each of aienux's 25 gates and each step of `kernel/tests/gates/run.sh` has such a manifest, or
-a row in the table below, and not both: the manifest names gate `OMEGA-KERNEL-<STEP>`, exec
-`tests/gates/run.sh` and args `["kernel-<step>"]`; every input is a tracked path and one at least is under
-`kernel/`; the first arm of `tests/gates/run.sh` that matches `kernel-<step>` runs the kernel runner, and
-the kernel runner has the step. It also requires `.aien/always` to list the three always-run gates above
-and no `omega-kernel-*.gate` to name a step nobody runs. It is static and runs no gate. With
-`--self-test` (how the gate runs it) each of its mutant controls must then FAIL: a removed, renamed or
-disabled manifest, args naming another step or commented out, another gate name, exec bypassing the root
-runner, an input without `kernel/` or none under it, a root arm that shadows the step, the `kernel-*` arm
-removed, a kernel step renamed or added without a manifest, an always line dropped, a table row dropped,
-doubled with a manifest or without a reason, its own manifest removed, and an orphan manifest.
+fails unless each of aienux's 25 gates, the steps omega-mv added (make-test, gate-wiring, spinlock) and each
+step of `kernel/tests/gates/run.sh` has such a manifest or a row in the table below, and not both
+[ctl:OMEGA-KERNEL-GATE-WIRING/remove-manifest] [ctl:OMEGA-KERNEL-GATE-WIRING/kernel-step-added] [ctl:OMEGA-KERNEL-GATE-WIRING/migration-and-manifest]. It reads manifests with the grammar
+of the judge's parser (aien-sovereign-core-mv `tools/aien-test/src/manifest.rs`): a duplicate key, an
+unknown key, a tab or a CR is refused [ctl:OMEGA-KERNEL-GATE-WIRING/exec-duplicate] [ctl:OMEGA-KERNEL-GATE-WIRING/exec-decoy-notes] [ctl:OMEGA-KERNEL-GATE-WIRING/manifest-tab]. The
+manifest must name gate `OMEGA-KERNEL-<STEP>`, exec `tests/gates/run.sh` and args `["kernel-<step>"]`,
+expect exit 0 and verdict PASS, require host, qemu, portable or aarch64 and nothing else, and list
+tracked inputs that cover each path the step's arm names [ctl:OMEGA-KERNEL-GATE-WIRING/requires-gb10] [ctl:OMEGA-KERNEL-GATE-WIRING/expects-exit-1] [ctl:OMEGA-KERNEL-GATE-WIRING/inputs-readme-only].
+Routing is decided by bash, not by reading text: the kernel runner's case patterns come from bash itself
+and each arm is dry-run under a DEBUG trap [ctl:OMEGA-KERNEL-GATE-WIRING/kernel-step-indented] [ctl:OMEGA-KERNEL-GATE-WIRING/kernel-step-underscore]; the root
+runner is run against stub kernel runners that exit 0, 1, 3 or 127 or print NOT_RUN, SKIP or control
+lines, and must give the exits `kernel_step` promises [ctl:OMEGA-KERNEL-GATE-WIRING/root-arm-shadow-indented] [ctl:OMEGA-KERNEL-GATE-WIRING/root-arm-or-true].
+It also requires `.aien/always` to list OMEGA-EVIDENCE-IMMUTABLE, OMEGA-ZERO-DISK-SECRETS,
+OMEGA-KERNEL-CRYPTO-BOUNDARY, OMEGA-KERNEL-GATE-WIRING, OMEGA-GATE-ANCHOR and OMEGA-GATE-CLAIMS, each with a
+manifest [ctl:OMEGA-KERNEL-GATE-WIRING/always-anchor-dropped] [ctl:OMEGA-KERNEL-GATE-WIRING/always-claims-dropped], no gate name in two manifests
+[ctl:OMEGA-KERNEL-GATE-WIRING/gate-name-twice], and no `omega-kernel-*.gate` naming a step nobody runs [ctl:OMEGA-KERNEL-GATE-WIRING/orphan-manifest].
+It runs no gate itself. With `--self-test` (how the gate runs it) its mutant controls, and per step one run
+with each tool of the step's `need` list removed from PATH, must give the result required; each prints
+its CONTROL line.
 
 ### Aienux gates without a manifest
 

@@ -20,8 +20,12 @@
 # --self-test` for negative controls.
 #
 # Rule: the last line of verify_all.sh says what actually ran. A skipped step
-# makes the verdict NOT_RUN for that step (never "PASS"), and AIENOS_STRICT=1
-# turns any skipped step into a failure. QEMU steps are emulator evidence only;
+# makes the verdict NOT_RUN and verify_all.sh exit 3 (never "PASS", never exit 0:
+# review of omega-mv 5cd0af98f, WiringRun finding 1)
+# [ctl:OMEGA-KERNEL-VERIFY-ALL/summary-skip-exit-3], and AIENOS_STRICT=1 turns
+# any skipped step into a failure (exit 1) [ctl:OMEGA-KERNEL-VERIFY-ALL/summary-strict-skip-exit-1].
+# The self-test prints CONTROL OMEGA-KERNEL-VERIFY-ALL/summary-<name> FAILED_AS_REQUIRED for
+# each case that must not pass. QEMU steps are emulator evidence only;
 # hardware is never checked by verify_all.sh.
 
 SKIPPED_STEPS=()
@@ -54,6 +58,8 @@ final_verdict() {
     else
         printf 'NOT_RUN  skipped step: %s\n' "${SKIPPED_STEPS[@]}"
         echo "VERIFY_ALL: NOT_RUN (${#SKIPPED_STEPS[@]} step(s) skipped; every step that ran passed; not a full pass)"
+        echo "============================================================"
+        exit 3
     fi
     echo "============================================================"
 }
@@ -62,26 +68,28 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --self-test ]]; then
     lib="${BASH_SOURCE[0]}"; st=0
     ok() { echo "PASS  $*"; }
     bad() { echo "FAIL  $*"; st=1; }
+    ctl() { echo "CONTROL OMEGA-KERNEL-VERIFY-ALL/summary-$1 FAILED_AS_REQUIRED"; }
     # Each case runs in its own shell so exit paths are observable.
     case_out() { AIENOS_STRICT="${STRICT:-0}" bash -c 'source "$1"; shift; eval "$@"' _ "${lib}" "$1" 2>&1; }
 
     out="$(case_out 'final_verdict')"
     grep -qF 'VERIFY_ALL: PASS' <<<"${out}" && ok "no skipped step -> VERIFY_ALL: PASS" || bad "clean run did not print PASS"
 
-    out="$(case_out 'skipped "demo step" >/dev/null; final_verdict')"
-    if grep -qF 'VERIFY_ALL: NOT_RUN (1 step(s) skipped' <<<"${out}" && ! grep -qF 'VERIFY_ALL: PASS' <<<"${out}"; then
-        ok "one skipped step -> VERIFY_ALL: NOT_RUN, never PASS (the old banner said PASSED regardless)"
-    else bad "skipped step verdict wrong: ${out}"; fi
+    rc=0; out="$(case_out 'skipped "demo step" >/dev/null; final_verdict; echo reached')" || rc=$?
+    if [[ "${rc}" == 3 ]] && grep -qF 'VERIFY_ALL: NOT_RUN (1 step(s) skipped' <<<"${out}" && ! grep -qF 'VERIFY_ALL: PASS' <<<"${out}" \
+       && ! grep -qx reached <<<"${out}"; then
+        ok "one skipped step -> VERIFY_ALL: NOT_RUN and exit 3, never PASS or exit 0"; ctl skip-exit-3
+    else bad "skipped step verdict wrong: rc=${rc} ${out}"; fi
     grep -qF 'skipped step: demo step' <<<"${out}" && ok "the skipped step is named in the verdict" || bad "skipped step not named"
 
     rc=0; STRICT=1 case_out 'skipped "demo step"' >/dev/null || rc=$?
-    [[ "${rc}" == 1 ]] && ok "AIENOS_STRICT=1: a skipped step exits 1" || bad "strict skip exited ${rc}"
+    [[ "${rc}" == 1 ]] && { ok "AIENOS_STRICT=1: a skipped step exits 1"; ctl strict-skip-exit-1; } || bad "strict skip exited ${rc}"
 
     rc=0; out="$(case_out 'run_or_skip demo bash -c "exit 3"; final_verdict')" || rc=$?
-    if [[ "${rc}" == 0 ]] && grep -qF 'VERIFY_ALL: NOT_RUN' <<<"${out}"; then ok "a child exiting 3 (NOT_RUN) is a skipped step"; else bad "exit-3 child: rc=${rc}"; fi
+    if [[ "${rc}" == 3 ]] && grep -qF 'VERIFY_ALL: NOT_RUN' <<<"${out}"; then ok "a child exiting 3 (NOT_RUN) is a skipped step: exit 3"; ctl child-exit-3; else bad "exit-3 child: rc=${rc}"; fi
 
     rc=0; case_out 'run_or_skip demo bash -c "exit 1"; echo reached' >/dev/null || rc=$?
-    [[ "${rc}" == 1 ]] && ok "a child exiting 1 stops the harness" || bad "exit-1 child: rc=${rc}"
+    [[ "${rc}" == 1 ]] && { ok "a child exiting 1 stops the harness"; ctl child-exit-1-stops; } || bad "exit-1 child: rc=${rc}"
 
     rc=0; out="$(case_out 'run_or_skip demo true; final_verdict')" || rc=$?
     [[ "${rc}" == 0 ]] && grep -qF 'VERIFY_ALL: PASS' <<<"${out}" && ok "a child exiting 0 is not a skip" || bad "exit-0 child: rc=${rc}"

@@ -6,15 +6,19 @@
 # ../disk. Library objects import no heap, clock or I/O; tests use hosted libc.
 #
 #   make              build out/libtorn_slot.a and out/libaienos_store.a
-#   make test         torn_slot test + every Store test + Rust cross-check
+#   make test         torn_slot test + the Store tests + Rust cross-check
 #                     (host emulation over files, not QEMU, not hardware)
 #   make sanitize     the same tests under ASan+UBSan (Linux)
 #   make mutants      remove each GUARD-tagged rule in turn; tests must fail
 #   make freestanding -ffreestanding -nostdlib build; nm -u must close over
 #                     the sibling native objects
 #   make clean
+#
 # RUST_STORE_TOOL=<path> selects the Rust aienos-store-tool for the
-# cross-check (default ../../target/release/aienos-store-tool; NOT_RUN if absent).
+# cross-check (default ../../target/release/aienos-store-tool). When it is absent the
+# cross-check is NOT_RUN and make test ends AIENOS_STORE_NATIVE: NOT_RUN (exit 0),
+# never PASS [ctl:OMEGA-KERNEL-STORE-NATIVE/crosscheck-absent-not-run]; tests/gates/run.sh
+# store-native builds the tool first.
 
 CC ?= cc
 AR ?= ar
@@ -96,8 +100,11 @@ test: $(TEST) $(STORE_TESTS) $(XCHECK) lib-checks
 	./$(OUT)/store_engine_test $(OUT) || fail=1; \
 	./$(OUT)/store_sealed_test $(OUT) || fail=1; \
 	./$(OUT)/store_powercut_test $(OUT) || fail=1; \
-	RUST_STORE_TOOL=$(RUST_STORE_TOOL) sh tests/rust_crosscheck.sh ./$(XCHECK) $(OUT); xrc=$$?; if [ $$xrc -ne 0 ] && [ $$xrc -ne 2 ]; then fail=1; fi; \
-	if [ $$fail -eq 0 ]; then echo "AIENOS_STORE_NATIVE: PASS"; else echo "AIENOS_STORE_NATIVE: FAIL"; exit 1; fi
+	notrun=0; RUST_STORE_TOOL=$(RUST_STORE_TOOL) sh tests/rust_crosscheck.sh ./$(XCHECK) $(OUT); xrc=$$?; \
+	if [ $$xrc -eq 2 ]; then notrun=1; elif [ $$xrc -ne 0 ]; then fail=1; fi; \
+	if [ $$fail -ne 0 ]; then echo "AIENOS_STORE_NATIVE: FAIL"; exit 1; fi; \
+	if [ $$notrun -ne 0 ]; then echo "AIENOS_STORE_NATIVE: NOT_RUN (the Rust cross-check did not run; every C test passed)"; \
+	else echo "AIENOS_STORE_NATIVE: PASS"; fi
 
 # Library objects must not allocate, read a clock, or do their own I/O.
 LIB_CHECK_OBJS = $(OUT)/torn_slot.o $(STORE_OBJS)

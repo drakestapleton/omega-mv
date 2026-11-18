@@ -16,8 +16,9 @@
 
 # AIENOS End-to-End Build and Evidence Verification Harness
 # Enforces sequential integration gates on the host DGX Spark environment.
-# Last line: VERIFY_ALL: PASS only when every step ran; VERIFY_ALL: NOT_RUN if any step
-# was skipped (scripts/lib_verify_summary.sh; test: bash scripts/lib_verify_summary.sh --self-test).
+# Last line: VERIFY_ALL: PASS only when every step ran; VERIFY_ALL: NOT_RUN and exit 3 if any step
+# was skipped (scripts/lib_verify_summary.sh; test: bash scripts/lib_verify_summary.sh --self-test,
+# which this harness runs first) [ctl:OMEGA-KERNEL-VERIFY-ALL/summary-skip-exit-3].
 
 set -euo pipefail
 #
@@ -47,6 +48,9 @@ export PATH="${PATH}:/usr/sbin:/sbin"
 
 # shellcheck source=scripts/lib_verify_summary.sh
 source "${REPO_ROOT}/scripts/lib_verify_summary.sh"
+
+# The verdict bookkeeping above, checked before the steps use it.
+bash "${REPO_ROOT}/scripts/lib_verify_summary.sh" --self-test
 
 echo "============================================================"
 echo "AIENOS Integration Verification Harness"
@@ -251,6 +255,7 @@ echo "--- [TRUST-1 Measurement Tools Self-Test] ---"
 if command -v swtpm >/dev/null && command -v tpm2_pcrread >/dev/null && command -v xxd >/dev/null; then
     ./scripts/test_trust1_measurement_tools.sh
     ./scripts/test_trust1_swtpm_port.sh
+    bash ./scripts/swtpm_start.sh --self-test
 else
     skipped "swtpm, tpm2-tools, or xxd not present on host."
 fi

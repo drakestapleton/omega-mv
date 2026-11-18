@@ -141,6 +141,90 @@ speed() {
   return "$rc"
 }
 
+# need TOOL...: the programs a step cannot run without. A tool that is not on PATH makes the step
+# NOT_RUN, exit 3, before anything runs. AIENOS_NEED_LIST=1 prints "NEED <tools>" and goes on without
+# checking (kernel/scripts/omega_gate_wiring.sh reads the lists that way, with stub runners).
+need() {
+  local t miss=0
+  if [ -n "${AIENOS_NEED_LIST:-}" ]; then echo "NEED $*"; return 0; fi
+  for t in "$@"; do
+    command -v "$t" > /dev/null 2>&1 || { echo "$step: NOT_RUN ($t is not on PATH)"; miss=$((miss + 1)); }
+  done
+  obs tools_missing "$miss"
+  [ "$miss" = 0 ] || exit 3
+}
+cc_word() { set -- ${CC:-cc}; printf '%s' "${1:-cc}"; }
+
+# kernel_step STEP: the one wrapper each kernel-* step runs through (CA3 of the RCCA of the aienux
+# fold, 2026-11-18). It first requires git and a base ref (AIEN_BASE_REF, default origin/main) that is
+# a commit holding kernel/; otherwise the step is NOT_RUN, exit 3. make-test runs native/kernel's make test, gate-wiring runs
+# kernel/scripts/omega_gate_wiring.sh --self-test, and the other steps run kernel/tests/gates/run.sh STEP.
+# Output goes to the terminal and to a private log. The exit status is decided here:
+#   - exit 127 (a command was not found) or exit 3: NOT_RUN, exit 3;
+#   - exit 0 and a verdict line that says NOT_RUN or SKIP: NOT_RUN, exit 3. A verdict line is
+#     "LABEL: NOT_RUN ..." or "LABEL: SKIP..." with LABEL of capitals, digits, _ and - (AIENOS_CK_INFER:,
+#     STORE_RUST_CROSSCHECK:, VERIFY_ALL:), or a line that starts with NOT_RUN, SKIP or SKIPPED; blanks
+#     before either are allowed. Not verdict lines: a control's report in lower case ("spinlock control
+#     nolean: NOT_RUN exit 3 as required") and NOT_RUN after other words ("PASS ...; physical NOT_RUN");
+#   - exit 0, and tests/gates/controls/<GATE>.controls names a control whose exact line
+#     "CONTROL <GATE>/<name> FAILED_AS_REQUIRED" the step did not print: FAIL, exit 1 (CA1: a claim
+#     that cites a control holds while the gate runs it) [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-controls-ignored].
+#     GATE is OMEGA-KERNEL-<STEP>;
+#   - exit 0 otherwise: PASS. Another nonzero exit is the step's FAIL and is kept (a NOT_RUN line
+#     next to a failure does not turn it into NOT_RUN).
+# kernel/scripts/omega_gate_wiring.sh runs each kernel-* step of this file against stub runners that
+# exit 0, 1, 3 and 127 and print each kind of line, and requires these exits
+# [ctl:OMEGA-KERNEL-GATE-WIRING/root-arm-no-wrapper] [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-127-pass]
+# [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-verdict-ignored] [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-skip-ignored]
+# [ctl:OMEGA-KERNEL-GATE-WIRING/wrapper-any-not-run-word].
+KERNEL_VERDICT_RE='^[[:space:]]*([A-Z][A-Z0-9_-]*: (NOT_RUN|SKIP)|(NOT_RUN|SKIP|SKIPPED)([^A-Za-z0-9_]|$))'
+kernel_step() {
+  local s="$1" kb kc
+  need git
+  # CA2: a kernel step needs a base that holds kernel/, so the gate-integrity anchors
+  # (tools/gate_anchor.sh) compare against a real base [ctl:OMEGA-KERNEL-GATE-WIRING/base-without-kernel].
+  kb=${AIEN_BASE_REF:-origin/main}
+  if ! kc=$(git rev-parse --verify -q "$kb^{commit}") || ! git cat-file -e "$kc:kernel" 2>/dev/null; then
+    echo "NOT_RUN: base ref $kb is not a commit here or has no kernel/ (set AIEN_BASE_REF to the branch this head lands on)"; exit 3
+  fi
+  case "$s" in
+    make-test)   need make "$(cc_word)"; set -- make -C kernel/native/kernel test ;;
+    gate-wiring) set -- bash kernel/scripts/omega_gate_wiring.sh --self-test ;;
+    *)           set -- bash kernel/tests/gates/run.sh "$s" ;;
+  esac
+  step_verdict "OMEGA-KERNEL-$(printf '%s' "$s" | tr 'a-z' 'A-Z')" "kernel-$s" "$@"
+}
+# step_verdict GATE NAME COMMAND...: runs COMMAND and exits with the verdict kernel_step describes
+# (also used by evidence-immutable, gate-anchor and gate-claims). The log is a private temp file, so
+# two runs of one step in one worktree (the judge runs gates side by side) do not share a log.
+STEP_LOG="$(mktemp /tmp/omega-gate-log.XXXXXX)"
+trap 'rm -f "$STEP_MARK" "$STEP_LOG"' EXIT
+step_verdict() {
+  local gate="$1" name="$2" log="$STEP_LOG" rc=0 ctl c miss=0
+  shift 2
+  set +e
+  "$@" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  if [ "$rc" = 127 ] || [ "$rc" = 3 ]; then
+    echo "$name: NOT_RUN (exit $rc)"; obs step_exit 3; exit 3
+  fi
+  if [ "$rc" != 0 ]; then echo "$name: FAIL (exit $rc)"; obs step_exit "$rc"; exit "$rc"; fi
+  if grep -aqE "$KERNEL_VERDICT_RE" "$log"; then
+    grep -aE "$KERNEL_VERDICT_RE" "$log" | sed "s/^/$name: not run: /"
+    echo "$name: NOT_RUN (exit 0 with the NOT_RUN or SKIP verdict lines above)"; obs step_exit 3; exit 3
+  fi
+  ctl="tests/gates/controls/$gate.controls"
+  if [ -f "$ctl" ]; then
+    while IFS= read -r c; do
+      case "$c" in ''|'#'*) continue ;; esac
+      grep -aqxF "CONTROL $gate/$c FAILED_AS_REQUIRED" "$log" || { echo "$name: control $gate/$c did not report FAILED_AS_REQUIRED"; miss=$((miss + 1)); }
+    done < "$ctl"
+    [ "$miss" = 0 ] || { echo "$name: FAIL ($miss controls listed in $ctl did not run as required)"; obs step_exit 1; exit 1; }
+  fi
+  echo "$name: PASS (exit 0, no NOT_RUN or SKIP verdict line)"; obs step_exit 0
+}
+
 case "$step" in
   # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07). Crumb files were removed
   # (2026-11-08) except two already under evidence/, which stay (additions-only). FOLDERS.md keeps the notes.
@@ -613,7 +697,7 @@ case "$step" in
   # OMEGA-EVIDENCE-IMMUTABLE: reviewed evidence is additions only: evidence/, kernel/evidence/ and kernel/import/
   # against the merge base with origin/main (or AIEN_BASE_REF), the kernel/ import and every commit after it
   # (tools/evidence_immutable.sh, which runs its own controls first; exit 3 NOT_RUN without history).
-  evidence-immutable) bash tools/evidence_immutable.sh ;;
+  evidence-immutable) step_verdict OMEGA-EVIDENCE-IMMUTABLE evidence-immutable bash tools/evidence_immutable.sh ;;
   zero-disk-secrets)
     echo "Auditing repository for prohibited plaintext secret files..."
     # Inspect every tracked path, including forced additions under generated dirs.
@@ -792,29 +876,17 @@ case "$step" in
     echo "TRINARY PASS"
     ;;
   # Aienux, the kernel, folded into kernel/ with its history (Drake 2026-11-17; aienux main 1f12818d,
-  # kernel/MIGRATION.md). kernel-<step> runs the kernel's own runner, kernel/tests/gates/run.sh <step>,
-  # which works from kernel/ and compiles with this repository's seed/out/omc after checking it against
-  # seed/out/omc.sha256 (hw-gates, omega-nvme and tcp-corpus compile Omega; ck-host-tests starts with
-  # native/kernel's make test sanitize; spinlock checks the compiled order of core/spinlock.h and its
-  # Lean model, and is NOT_RUN, exit 3, without the cross compilers or the pinned lean).
-  # kernel-make-test is native/kernel's make test alone: PASS only when make exits 0 and its log has no
-  # NOT_RUN line (an input-dependent check such as CK_GSP_BINDATA_PIN, CK_GSP_FW_INSPECT_PIN or
-  # GB10_GSP_NVHDR that did not run makes the step NOT_RUN, exit 3, listing each line). `kernel` runs
-  # the six in the order below, logs each under $OUT_DIR, prints one line per step with its exit status
-  # and log sha256, and exits 1 when any step did not exit 0 (a NOT_RUN exit 3 is not a pass).
-  kernel-make-test)
-    mlog="$OUT_DIR/make-test.log"
-    rc=0; make -C kernel/native/kernel test 2>&1 | tee "$mlog" || rc=$?
-    [ "$rc" = 0 ] || { echo "kernel-make-test: make test exit $rc, not PASS"; exit 1; }
-    nr=$(grep -cE '^[A-Za-z0-9_ -]+: NOT_RUN' "$mlog" || true)
-    obs kernel_make_test_not_run "$nr"
-    if [ "$nr" != 0 ]; then
-      grep -E '^[A-Za-z0-9_ -]+: NOT_RUN' "$mlog" | sed 's/^/kernel-make-test: not run: /'
-      echo "kernel-make-test: NOT_RUN ($nr checks in make test did not run; make test exit 0)"; exit 3
-    fi
-    echo "kernel-make-test: PASS (make test exit 0, no NOT_RUN line in $mlog)" ;;
-  kernel-gate-wiring) bash kernel/scripts/omega_gate_wiring.sh --self-test ;;
-  kernel-*)           bash kernel/tests/gates/run.sh "${step#kernel-}" ;;
+  # kernel/MIGRATION.md). Each kernel-<step> runs through kernel_step (above), which maps a step that
+  # did not fully run to NOT_RUN, exit 3 [ctl:OMEGA-KERNEL-GATE-WIRING/root-arm-no-wrapper]. kernel-<step> runs the kernel's own runner,
+  # kernel/tests/gates/run.sh <step>, which works from kernel/ and compiles with this repository's
+  # seed/out/omc after checking it against seed/out/omc.sha256 (hw-gates, omega-nvme and tcp-corpus
+  # compile Omega; ck-host-tests starts with native/kernel's make test sanitize; spinlock checks the
+  # compiled order of core/spinlock.h and its Lean model). kernel-make-test is native/kernel's make test
+  # alone (an input-dependent check such as CK_GSP_BINDATA_PIN, CK_GSP_FW_INSPECT_PIN or GB10_GSP_NVHDR
+  # that did not run prints its NOT_RUN line, so the step is NOT_RUN, exit 3). `kernel` runs the six in
+  # the order below, logs each under $OUT_DIR, prints one line per step with its exit status and log
+  # sha256, and exits 1 when any step did not exit 0 (a NOT_RUN exit 3 is not a pass).
+  kernel-*)           kernel_step "${step#kernel-}" ;;
   kernel)
     kfail=0; kn=0
     for s in make-test ck-host-tests hw-gates omega-nvme tcp-corpus spinlock; do
@@ -829,5 +901,12 @@ case "$step" in
     [ "$kfail" = 0 ] || { echo "KERNEL FAIL: $kfail of $kn steps did not exit 0" >&2; exit 1; }
     echo "KERNEL PASS: $kn of $kn steps exit 0"
     ;;
+  # OMEGA-GATE-ANCHOR: gate-integrity files (tools/gate-anchors.txt) unchanged against the base, or
+  # each change acknowledged (tools/gate_anchor.sh: exit 1 BLOCKED_OPERATOR, 3 NOT_RUN).
+  gate-anchor)        need git; step_verdict OMEGA-GATE-ANCHOR gate-anchor bash tools/gate_anchor.sh ;;
+  # OMEGA-GATE-CLAIMS: a sentence about a gate with every/any/all/never/cannot/only cites a control
+  # the gate runs (tools/gate_claims_lint.sh, which runs its own planted controls first)
+  # [ctl:OMEGA-GATE-CLAIMS/uncited-claim].
+  gate-claims)        need git; step_verdict OMEGA-GATE-CLAIMS gate-claims bash tools/gate_claims_lint.sh ;;
   *) echo "run.sh: unknown step '$step'" >&2; exit 2 ;;
 esac
