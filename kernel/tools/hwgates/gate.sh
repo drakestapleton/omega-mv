@@ -6,10 +6,15 @@
 #   AIEN_OMC=<omega-mv seed/out/omc> sh tools/hwgates/gate.sh
 # Prints HWGATES-GATE PASS checks=N (exit 0) or HWGATES-GATE FAIL (exit 1). Without the pinned compiler,
 # or without the repository history (not a git work tree, a shallow clone, no base ref for
-# tools/evidence_immutable.sh), it prints HWGATES-GATE NOT_RUN and exits 3. A NOT_RUN is never a pass.
+# tools/evidence_immutable.sh, a base ref without kernel/), it prints HWGATES-GATE NOT_RUN and exits 3.
+# A NOT_RUN is not a pass.
 # Invariants this gate holds:
 #   - a PASS or FAIL row names a tracked, regular receipt file under evidence/ holding its
-#     HWGATE <id> <tier> <status> line (no receipt, no claim);
+#     HWGATE <id> <tier> <status> line (no receipt, no claim). Of the receipt, this gate reads that
+#     line and the source commit (below); it does not read an image digest, a machine identity, the
+#     commands or what docs/hardware-gates-needs.tsv asks a PHYSICAL receipt to show. The register is
+#     listed in tools/gate-anchors.txt, so a row change is GATE-ANCHOR CHANGED and the operator run
+#     checks those fields before it acknowledges it [ctl:OMEGA-GATE-ANCHOR/edited];
 #   - every gate id has exactly one PHYSICAL row, and QEMU is never PHYSICAL;
 #   - a gate id is upper-case letters, digits, '-', '_' or '.', so two ids never differ by case alone;
 #   - a gate whose receipt still names it cannot be deleted from the register;
@@ -20,10 +25,11 @@
 #     it never backs a PASS or FAIL row, whatever receipt or folder the row cites;
 #   - every HWGATE line in a tracked evidence file agrees with the register row for its id and
 #     tier, unless it is withdrawn;
-#   - evidence/ and import/ are additions only: tools/evidence_immutable.sh kernel/evidence
-#     kernel/import, against the base ref, the commit that brought kernel/ in and every commit after
-#     it (deleted, renamed, edited, re-added or merged-in bytes fail, committed or not; its own
-#     controls run first);
+#   - evidence/ and import/ are checked by tools/evidence_immutable.sh kernel/evidence kernel/import
+#     against the base ref, the commit that brought kernel/ in and the commits after it (its header says
+#     which changes fail; the base ref's copy of that script runs as well when its bytes differ). With
+#     a base ref that has no kernel/ (origin/main before the fold lands) this check, and so the gate, is
+#     NOT_RUN [ctl:OMEGA-EVIDENCE-IMMUTABLE/kernel-base-without-script];
 #   - a PASS or FAIL row's source REPO@COMMIT is recorded by tracked files in its receipt's folder;
 #     aienux@COMMIT has exactly one import/commit-map row, naming a commit of the aienux history the
 #     fold brought in (the rewritten aienux main in import/ref-map or an ancestor); the fold rewrote
@@ -34,8 +40,11 @@
 #   - the checker's count line equals the counts of the register, and the checker has no size cap:
 #     it accepts a register and a receipt far past its old tables, and the real register alarms
 #     when it grows past what that control proves;
-#   - every check in tools/hwgates/checks.txt runs and passes, once: N in the PASS line is asserted,
-#     so a check deleted, skipped or run twice in place of another fails the gate.
+#   - the checks that pass are compared with tools/hwgates/checks.txt, once each: N in the PASS line
+#     is asserted, so a check deleted, skipped or run twice in place of another fails the gate
+#     (planted control 12). A check removed from this script and from checks.txt in one commit passes
+#     that comparison; both files are listed in tools/gate-anchors.txt, so tools/gate_anchor.sh reports
+#     them as GATE-ANCHOR CHANGED and the head is BLOCKED_OPERATOR [ctl:OMEGA-GATE-ANCHOR/edited].
 set -eu
 # the environment cannot point git at another repository, index or object store, or rewrite history
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR \
@@ -161,11 +170,17 @@ done
 if [ "$bad" = 0 ]; then echo "PASS receipts are tracked regular files under evidence/"; pass "receipts tracked"; else fail=1; fi
 # evidence/ and import/ are additions only, against the base ref, the import and every commit after
 # it, index and work tree included (tools/evidence_immutable.sh, which runs its own controls first)
-rc=0; bash "$ROOT/../tools/evidence_immutable.sh" kernel/evidence kernel/import > "$W/imm.out" 2>&1 || rc=$?
-cat "$W/imm.out"
-if [ "$rc" = 0 ] && grep -q '^EVIDENCE-IMMUTABLE PASS' "$W/imm.out"; then echo "PASS evidence/ and import/ are additions only"; pass "additions only"
-elif [ "$rc" = 3 ]; then echo "NOT_RUN evidence/ and import/ additions only: no history to compare with (above)"; notrun=1
-else echo "FAIL evidence/ or import/ is not additions only (above), exit $rc"; fail=1; fi
+# Against a base ref without kernel/ there is no reviewed kernel/ to compare with: NOT_RUN, not a pass.
+kbase=${AIEN_BASE_REF:-origin/main}
+if ! kb=$(git rev-parse --verify -q "$kbase^{commit}") || ! git cat-file -e "$kb:kernel" 2> /dev/null; then
+  echo "NOT_RUN evidence/ and import/ additions only: the base ref $kbase is not a commit here or has no kernel/ (set AIEN_BASE_REF to the branch this head lands on)"; notrun=1
+else
+  rc=0; bash "$ROOT/../tools/evidence_immutable.sh" kernel/evidence kernel/import > "$W/imm.out" 2>&1 || rc=$?
+  cat "$W/imm.out"
+  if [ "$rc" = 0 ] && grep -q '^EVIDENCE-IMMUTABLE PASS' "$W/imm.out"; then echo "PASS evidence/ and import/ are additions only"; pass "additions only"
+  elif [ "$rc" = 3 ]; then echo "NOT_RUN evidence/ and import/ additions only: no history to compare with (above)"; notrun=1
+  else echo "FAIL evidence/ or import/ is not additions only (above), exit $rc"; fail=1; fi
+fi
 # withdrawals: every CORRECTS HWGATE <id> <tier> <status> line that a CORRECTION-*.txt anywhere under
 # evidence/ holds in the work tree or held in any commit reachable from HEAD (every blob such a path
 # ever had, merges compared with each parent), so deleting or editing a correction cannot reinstate

@@ -48,8 +48,14 @@ hashes.
 
 To add a physical PASS: run the attended procedure under its own authorization, commit the raw
 receipt under `evidence/` with the `HWGATE <id> PHYSICAL PASS` line plus source commit, image
-digest, machine identity and commands, then change the row. The gate refuses the row change
-without that file.
+digest, machine identity and commands, then change the row. The gate refuses the row change when
+no tracked receipt under `evidence/` holds that line or when the receipt's folder does not record
+the row's source commit. It reads nothing else of the receipt: a receipt holding only those two
+passes it. The image digest, machine identity, commands and what
+[`hardware-gates-needs.tsv`](hardware-gates-needs.tsv) asks for are checked by the operator run
+instead: the register is listed in [`tools/gate-anchors.txt`](../../tools/gate-anchors.txt), so a row
+change prints `GATE-ANCHOR CHANGED kernel/docs/hardware-gates.tsv` and the head stays
+BLOCKED_OPERATOR until that run acknowledges it [ctl:OMEGA-GATE-ANCHOR/edited].
 
 ## Where the statuses are
 
@@ -64,19 +70,21 @@ To read the register as a table: `column -t -s "$(printf '\t')" docs/hardware-ga
 
 ## What a physical receipt needs
 
-[`hardware-gates-needs.tsv`](hardware-gates-needs.tsv) lists every gate id and what its PHYSICAL
-receipt must show before that row can say PASS. The blocker and owner of each gate are field 7
+[`hardware-gates-needs.tsv`](hardware-gates-needs.tsv) lists the gate ids and, for each, what its
+PHYSICAL receipt is to show before the operator run lets that row say PASS (the gate does not read
+these fields; see above). The blocker and owner of each gate are field 7
 of its PHYSICAL row in `hardware-gates.tsv`; this page does not repeat either. The gate
-(`tools/hwgates/gate.sh`) refuses when the id sets of the two files differ, so a gate that has
-no receipt yet cannot leave the inventory without a reviewed change to both files. To read
-them side by side:
+(`tools/hwgates/gate.sh`) refuses when the id sets of the two files differ, and both files are gate
+anchors, so removing a gate that has no receipt yet takes a change to both that the operator run
+acknowledges [ctl:OMEGA-GATE-ANCHOR/edited]. To read them side by side:
 `join -t "$(printf '\t')" <(grep -v '^#' docs/hardware-gates-needs.tsv | sort) <(awk -F '\t' '$4=="PHYSICAL" {print $1 "\t" $7}' docs/hardware-gates.tsv | sort)`.
 
-A receipt is never rewritten, and the gate holds it: `evidence/` and `import/` are additions only
-(`tools/evidence_immutable.sh kernel/evidence kernel/import`, against the base ref, the commit that
-brought `kernel/` in and every commit after it), so a file deleted, renamed or edited, committed or not,
-or other bytes merged in, fails; a shallow clone is NOT_RUN (exit 3), because the history cannot be
-read. When a later review finds that a committed receipt line claims more than it shows, a dated
+The gate checks that receipts are not rewritten: `evidence/` and `import/` go through
+`tools/evidence_immutable.sh kernel/evidence kernel/import` (its header lists the changes that fail,
+each with its control) against the base ref, the commit that brought `kernel/` in and the commits
+after it; the base ref's copy of that script runs as well when its bytes differ. A shallow clone, or
+a base ref without `kernel/` (origin/main until the fold lands there), is NOT_RUN (exit 3)
+[ctl:OMEGA-EVIDENCE-IMMUTABLE/kernel-base-without-script]. When a later review finds that a committed receipt line claims more than it shows, a dated
 `CORRECTION-<date>.txt` under `evidence/` names the line (`CORRECTS HWGATE <id> <tier> <status>`) and
 says why. That withdraws the line everywhere and for good: a correction that any `CORRECTION-*.txt`
 holds or ever held in HEAD's history counts, so deleting or editing it later does not bring the line

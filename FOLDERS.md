@@ -163,7 +163,7 @@ Rules:
 - the kernel compiles Omega with this repository's `seed/out/omc`, checked against `seed/out/omc.sha256`; it has no compiler pin of its own (aienux's `PIN` and `REPIN` are gone)
 - the kernel's gates run from `kernel/` through `kernel/tests/gates/run.sh`; `tests/gates/run.sh kernel` runs six steps from the omega-mv root: `make test` of `native/kernel`, `ck-host-tests`, `hw-gates`, `omega-nvme`, `tcp-corpus` and `spinlock`
 - every gate aienux had reaches omega-mv's judge through `tests/gates/omega-kernel-<step>.gate`, which runs `tests/gates/run.sh kernel-<step>`, or is listed with its reason in `kernel/MIGRATION.md` ("Aienux gates without a manifest"); `kernel/tests/gates/aienos-*.gate` are aienux's manifests, kept as history and read by no judge here. OMEGA-KERNEL-GATE-WIRING (`kernel/scripts/omega_gate_wiring.sh`, always-run) fails when one has neither; OMEGA-KERNEL-CRYPTO-BOUNDARY is always-run, as aienux's was
-- receipts in `kernel/evidence/` are kept as written, as under `evidence/` (the `evidence-immutable` step, `tools/evidence_immutable.sh`, checks `evidence/`, `kernel/evidence/` and `kernel/import/` against the base, the commit that brought `kernel/` in and every commit after it); an aienux hash in a receipt stays the aienux hash, and `kernel/import/commit-map` gives its commit here
+- receipts in `kernel/evidence/` are kept as written, as under `evidence/`: the `evidence-immutable` step (`tools/evidence_immutable.sh`) checks `evidence/`, `kernel/evidence/`, `kernel/import/` and aienux's other receipt folders, `kernel/native/om/lm1b/evidence/`, `kernel/native/net/receipts/` and `kernel/docs/design/boot/receipts/`, against the base, the commit that brought `kernel/` in and the commits after it; with a base ref that has no `tools/evidence_immutable.sh` (origin/main until the fold lands there) its `kernel/` part is NOT_RUN [ctl:OMEGA-EVIDENCE-IMMUTABLE/kernel-base-without-script]. It does not check the other folders named `evidence/`: `om/evidence/`, `om/quantity/evidence/`, `native/control/evidence/`, `research/om-bench/evidence/`, `seed/ng/bench/evidence/`, the `evidence/` folders under `seed/qualification/`, and the gate fixtures `tests/visor/fixtures/evidence/` and `kernel/tools/hwgates/fixtures/evidence/` (the last is a gate anchor, see `tools/`). An aienux hash in a receipt stays the aienux hash, and `kernel/import/commit-map` gives its commit here
 - `kernel/import/` is the record of the move; additions only (the same check), never edited after the landing that wrote it
 
 ## `native/`
@@ -496,6 +496,10 @@ Two unmodified CC-BY-4.0 files from the authors' Zenodo archive 10.5281/zenodo.1
 ## `tests/synapse/`
 
 J1 parity driver for syn_codec.osc against the sealed Rust A1 corpus (aien-dev/synapse j1-codec-corpus), interp and native
+
+## `tools/`
+
+Harnesses and gate scripts. `gate_anchor.sh` (OMEGA-GATE-ANCHOR, always-run) reads `gate-anchors.txt`, the list of gate-integrity files (gate scripts, pins, count pins, control lists). A head that changes a listed path against the base ref prints `GATE-ANCHOR CHANGED <path>` and is BLOCKED_OPERATOR until the operator run that writes the landing receipt lists those paths there and sets `AIEN_GATE_ANCHOR_ACK` to exactly them [ctl:OMEGA-GATE-ANCHOR/ack-subset]. A lane that adds or relies on a gate-integrity file sends its path to whoever keeps the list. `evidence_immutable.sh` is the additions-only check of the receipt folders named under `kernel/`.
 
 ## `tools/dual_experiment/`
 
