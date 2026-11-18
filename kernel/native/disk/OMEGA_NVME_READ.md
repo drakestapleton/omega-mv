@@ -189,7 +189,8 @@ into the normal read entrypoint.
 - `tests/omega_nvme_test.sh` writes each runner's output to `<name>.log` and
   `<name>.err` in its evidence directory (cases, mutants and the killed-QEMU
   control; the controls that must alarm log apart), copies ALARM lines from those
-  runs to its stderr as they come, and fails when those logs hold an ALARM line
+  runs to its stderr as they come [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-to-stderr],
+  and fails when those logs hold an ALARM line
   [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-host-err]
   [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-control-qemu-killed-log]
   [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-mutant-cid-err]. A run that fails

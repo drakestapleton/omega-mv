@@ -55,7 +55,7 @@ GATE=OMEGA-KERNEL-OMEGA-NVME
 CONTROLS='mutant-cid mutant-sqid mutant-status mutant-sqhead mutant-reopen mutant-opcode
  mutant-retention mutant-budget1 mutant-nowait mutant-budget255 mutant-budget257 mutant-cwait51
  mutant-rwait501 mutant-qemu-max-waits qemu-killed qemu-stopped qemu-mute qemu-not-listening
- candidate-mute alarm-printed-counted alarm-planted-host-err alarm-planted-qemu-err
+ candidate-mute alarm-printed-counted alarm-to-stderr alarm-planted-host-err alarm-planted-qemu-err
  alarm-planted-control-qemu-killed-log alarm-planted-control-qemu-killed-err
  alarm-planted-mutant-cid-log alarm-planted-mutant-cid-err alarm-planted-extra-log'
 base=native/disk
@@ -243,6 +243,15 @@ for f in host.err qemu.err control-qemu-killed.log control-qemu-killed.err mutan
  fi
  control_line "alarm-planted-$(printf '%s' "${f%.*}-${f##*.}")"
 done
+# run_logged copies the ALARM lines of $out runs, and only those, to this script's stderr: a run
+# that prints one ALARM line and one other line, with $out pointed at a scratch directory, must put
+# exactly the ALARM line there and both lines in its .err log.
+mkdir -p "$ctl/tee"
+( out=$ctl/tee; run_logged "$out" tee sh -c 'echo "ALARM tee: one planted line" >&2; echo "not an alarm" >&2' ) 2> "$ctl/tee/stderr.txt"
+if [ "$(cat "$ctl/tee/stderr.txt")" != 'ALARM tee: one planted line' ] || [ "$(grep -c . "$ctl/tee/tee.err")" != 2 ]; then
+ cat "$ctl/tee/stderr.txt" "$ctl/tee/tee.err" >&2; echo "FAIL ALARM-to-stderr control: the ALARM line did not reach stderr alone" >&2; exit 1
+fi
+control_line alarm-to-stderr
 sha256sum "$AIEN_OMC" "$base/omega_nvme.om" "$base/omega_nvme_transport.om" "$base/omega_nvme_main.om" \
  "$base/tests/omega_nvme_runner.c" "$base/tests/omega_nvme_fakepeer.c" "$out/read" > "$out/sha256.txt"
 finish "$out" > "$out/result.txt" || exit 1
