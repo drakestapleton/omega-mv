@@ -41,7 +41,7 @@ The existing lab UDP transport is unauthenticated. It must be treated as hostile
 
 ## Verification and reproduction
 
-`bash scripts/check_local_tools.sh` (omega-mv's own `seed/out/omc`, checked against its `seed/out/omc.sha256`; `OMEGA_SOURCE` names another omega-mv checkout) compiles the exact native sources, compares each signed embedded payload, tests signatures/identities/profile refusal/truncation, and runs courier unit tests. Existing ARM artifact tests remain applicable.
+`bash scripts/check_local_tools.sh` (omega-mv's own `seed/out/omc`, checked against its `seed/out/omc.sha256`; `OMEGA_SOURCE` names another omega-mv checkout to take the compiler from; that compiler must still have this checkout's pin, and the other checkout's `omc.sha256` is never read) compiles the exact native sources, compares each signed embedded payload, tests signatures/identities/profile refusal/truncation, and runs courier unit tests. Existing ARM artifact tests remain applicable.
 
 `bash scripts/qemu_ck_local_tools_test.sh` uses two QEMU CPU profiles. It probes real CPL3 isolation, protected writes, NX execution, guards, privileged instructions, Linux syscall rejection, forged returns, discarded partial output, timeouts, cancellation, replay, request limits, register preservation, and 1,000 repeated runs. A deterministic model oracle then selects all three tools through the real Rust courier and COM2; it verifies the results returned by the emulator kernel. This is an integration oracle, not evidence that a live model selected the right action. The oracle is C (`native/kernel/x86/tests/local_tools_model_oracle.c`); `bash scripts/test_local_tools_udp.sh` runs the same wire checks and three direct-arithmetic jobs against the Rust courier without QEMU.
 
