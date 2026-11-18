@@ -154,7 +154,14 @@ into the normal read entrypoint.
   permits at least two pages; the fixed 8192-byte software limit cannot exceed it.
 - Controller-ready and command waits are bounded to 256 transport polls. This is
   a hosted, bounded attempt budget, not a claim of milliseconds or hardware
-  timeout qualification. Blocking RPCs also have the verifier's wall-clock guard.
+  timeout qualification. The verifier has no wall-clock guard: its 3 s poll read a
+  descheduled peer as the end of its stream, and it now waits while the peer lives,
+  with an ALARM line every 30 s. In QEMU mode it waits until QEMU is idle (every
+  thread asleep, none run between two reads of /proc) before each read the engine
+  makes, so the emulated device completes before the next poll; without that, a
+  starved QEMU thread let the 256 polls run out on the healthy case at load average
+  25 to 45 (result 12, DMA retained). The engine's own timeout is exercised by the
+  C-model cases.
   Queue/DMA storage stays alive until the verifier tears down its controller.
 
 ## Native transport integration contract (not exercised)
