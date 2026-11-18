@@ -1,0 +1,441 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Flash-Next FP8 text embedding input. Run in the checkpoint directory.
+note Input is a stream of little-endian u32 token IDs for one sequence.
+note Each complete token yields 16 x 160 BF16 values in head order. No device is opened.
+text ngfile "model-00000-of-00131.safetensors"
+text ngpre "model.language_model.layers.1.ple.ple_embedding."
+text ngrow "ngram_embedding.shard_"
+text ngweight ".weight"
+text ngmulkey "layer_multipliers"
+text ngoffkey "ngram_heads_offsets"
+text ngsizekey "ngram_heads_vocab_sizes"
+text ngscalekey "ngram_embedding.weight_scale"
+text ngdtype "dtype"
+text ngshape "shape"
+text ngspan "data_offsets"
+text ngfp8 "F8_E4M3"
+text ngi64 "I64"
+text ngbf16 "BF16"
+note Each of the 128 row tensors has this shape in checkpoint revision 7fb48d70.
+const ngrows ulong 2500012
+const ngvocab ulong 248320
+const ngeos ulong 248044
+note Current file descriptor, payload start and file length while parsing one shard.
+global ngshard ulong 3
+global ngseen uchar 132
+global ngfds int 132
+global ngpos ulong 132
+note Checkpoint I64 tensors in order: 3 hash multipliers, 16 head offsets, 16 head sizes.
+global ngparams ulong 35
+global ngscale uint 1
+
+fn ng_at s view uchar * n ulong offset ulong needle view uchar * to bool
+if gt offset n
+ret false
+end
+if gt len needle sub n offset
+ret false
+end
+for i ulong len needle
+if ne get s add offset i get needle i
+ret false
+end
+end
+ret true
+end
+
+fn ng_exact s view uchar * n ulong offset ulong needle view uchar * to bool
+ret and eq add offset len needle n ng_at s n offset needle
+end
+
+note Return -1 for an unrelated tensor and -2 for a malformed table shard name.
+fn ng_slot s view uchar * n ulong to long
+if not ng_at s n 0 ngpre
+ret -1
+end
+offset = len ngpre
+if ng_exact s n offset ngmulkey
+ret 128
+end
+if ng_exact s n offset ngoffkey
+ret 129
+end
+if ng_exact s n offset ngsizekey
+ret 130
+end
+if ng_exact s n offset ngscalekey
+ret 131
+end
+if not ng_at s n offset ngrow
+ret -1
+end
+offset = add offset len ngrow
+start = offset
+v = ulong 0
+while lt offset n bound 4
+c = get s offset
+if or lt c 48 gt c 57
+break
+end
+if ge sub offset start 3
+ret -2
+end
+v = add mul v 10 sub ulong c 48
+if gt v 127
+ret -2
+end
+offset = add offset 1
+end
+if or eq start offset not ng_exact s n offset ngweight
+ret -2
+end
+if and gt sub offset start 1 eq get s start 48
+ret -2
+end
+ret long v
+end
+
+fn ng_field s view uchar * t view uint * obj ulong which ulong to ulong
+result = jsnone
+k = js_first t obj
+while ne k jsnone bound 999999
+off = js_off t k
+matchfield = false
+if eq which 0
+matchfield = js_streq s off ngdtype
+end
+if eq which 1
+matchfield = js_streq s off ngshape
+end
+if eq which 2
+matchfield = js_streq s off ngspan
+end
+if matchfield
+if ne result jsnone
+ret jsnone
+end
+result = add k 1
+end
+k = js_mnext t k
+end
+ret result
+end
+
+fn ng_number s view uchar * t view uint * i ulong to ulong
+if ne js_type t i 7
+ret not ulong 0
+end
+off = js_off t i
+if not js_isu s off
+ret not ulong 0
+end
+ret js_tou s off
+end
+
+fn ng_width s view uchar * t view uint * obj ulong slot ulong to ulong
+ty = ng_field s t obj 0
+if ne js_type t ty 6
+ret 0
+end
+dt = js_off t ty
+shape = ng_field s t obj 1
+if ne js_type t shape 3
+ret 0
+end
+first = js_first t shape
+count = ng_number s t first
+if lt slot 128
+if or ne js_nkids t shape 2 not js_streq s dt ngfp8
+ret 0
+end
+if ne count ngrows
+ret 0
+end
+if ne ng_number s t add first 1 160
+ret 0
+end
+ret mul ngrows 160
+end
+if ne js_nkids t shape 1
+ret 0
+end
+if eq slot 131
+if or ne count 1 not js_streq s dt ngbf16
+ret 0
+end
+ret 2
+end
+want = ulong 16
+if eq slot 128
+want = ulong 3
+end
+if or ne count want not js_streq s dt ngi64
+ret 0
+end
+ret mul want 8
+end
+
+fn ng_desc s view uchar * t view uint * obj ulong slot ulong to bool
+if or ne js_type t obj 1 ne get ngseen slot 0
+ret false
+end
+width = ng_width s t obj slot
+if eq width 0
+ret false
+end
+span = ng_field s t obj 2
+if or ne js_type t span 3 ne js_nkids t span 2
+ret false
+end
+first = js_first t span
+a = ng_number s t first
+b = ng_number s t add first 1
+if gt b sub get ngshard 2 get ngshard 1
+ret false
+end
+if or gt a b ne sub b a width
+ret false
+end
+put ngseen slot 1
+put ngfds slot int get ngshard 0
+put ngpos slot add get ngshard 1 a
+ret true
+end
+
+fn ng_read fd int buf edit uchar * n ulong off ulong to bool
+p = ulong 0
+while lt p n bound 999999
+r = pread fd buf p sub n p long add off p
+if lt r 1
+ret false
+end
+p = add p ulong r
+end
+ret true
+end
+
+fn ng_le b view uchar * start ulong n ulong to ulong
+v = ulong 0
+for i ulong n
+v = or v shl ulong get b add i start mul i 8
+end
+ret v
+end
+
+fn ng_header fd int to bool
+st = new uchar 128 0
+if lt fstat fd st 0 128 0
+ret false
+end
+filelen = ng_le st 48 8
+if or gt filelen 9223372036854775807 lt filelen 8
+ret false
+end
+size = new uchar 8 0
+if not ng_read fd size 8 0
+ret false
+end
+n = ng_le size 0 8
+s = new uchar 262144 0
+if or gt n len s gt n sub filelen 8
+ret false
+end
+if not ng_read fd s n 8
+ret false
+end
+t = new uint 131072 0
+if ne js_init t len s 32 0
+ret false
+end
+if lt js_parse s t n 1
+ret false
+end
+if ne js_type t 0 1
+ret false
+end
+put ngshard 0 ulong fd
+put ngshard 1 add 8 n
+put ngshard 2 filelen
+key = new uchar 256 0
+k = js_first t 0
+while ne k jsnone bound 999999
+l = js_sget s js_off t k key
+if lt l 0
+ret false
+end
+slot = ng_slot key ulong l
+if eq slot -2
+ret false
+end
+if ge slot 0
+if not ng_desc s t add k 1 ulong slot
+ret false
+end
+end
+k = js_mnext t k
+end
+ret true
+end
+
+fn ng_load to bool
+path = new uchar 32 0
+for i ulong len ngfile
+put path i get ngfile i
+end
+for i ulong 33
+f = add i 5
+put path 9 uchar add 48 div f 10
+put path 10 uchar add 48 rem f 10
+fd = int fopen path 0 len ngfile 524288 0
+if lt fd 0
+ret false
+end
+if not ng_header fd
+ret false
+end
+end
+for i ulong 132
+if eq get ngseen i 0
+ret false
+end
+end
+buf = new uchar 128 0
+pos = ulong 0
+for i ulong 3
+n = ulong 16
+if eq i 0
+n = ulong 3
+end
+slot = add i 128
+if not ng_read get ngfds slot buf mul n 8 get ngpos slot
+ret false
+end
+for j ulong n
+put ngparams pos ng_le buf mul j 8 8
+pos = add pos 1
+end
+end
+ret ng_checkparams buf
+end
+
+fn ng_checkparams buf edit uchar * to bool
+for i ulong 3
+m = get ngparams i
+if or eq m 0 gt m div ulong 9223372036854775807 sub ngvocab 1
+ret false
+end
+end
+total = ulong 0
+for i ulong 16
+n = get ngparams add 19 i
+if ne get ngparams add 3 i total
+ret false
+end
+if or eq n 0 gt n sub mul ngrows 128 total
+ret false
+end
+total = add total n
+end
+if ge sub mul ngrows 128 total 128
+ret false
+end
+if not ng_read get ngfds 131 buf 2 get ngpos 131
+ret false
+end
+scale = uint ng_le buf 0 2
+if or eq scale 0 ge scale 32640
+ret false
+end
+put ngscale 0 shl scale 16
+ret true
+end
+
+fn ng_head mix ulong head ulong vec edit uchar * to bool
+base = get ngparams add 3 head
+size = get ngparams add 19 head
+row = add base rem mix size
+slot = div row ngrows
+off = add get ngpos slot mul rem row ngrows 160
+raw = new uchar 160 0
+if not ng_read get ngfds slot raw 160 off
+ret false
+end
+ng_convert raw vec mul head 320
+ret true
+end
+
+fn ng_convert raw view uchar * vec edit uchar * pos ulong to void
+scale = bitcast f32 get ngscale 0
+for j ulong 160
+x = mul scale bitcast f32 e4m3bits uint get raw j
+bf = av_rne bitcast uint x
+put vec pos uchar and bf 255
+put vec add pos 1 uchar shr bf 8
+pos = add pos 2
+end
+end
+
+fn ng_gather tokid ulong prev ulong older ulong vec edit uchar * to bool
+bi = xor mul tokid get ngparams 0 mul prev get ngparams 1
+tri = xor bi mul older get ngparams 2
+for i ulong 16
+mix = bi
+if ge i 8
+mix = tri
+end
+if not ng_head mix i vec
+ret false
+end
+end
+ret true
+end
+
+fn main to int
+if ne argcnt 1
+ret 1
+end
+if not ng_load
+ret 2
+end
+prev = ngeos
+older = ngeos
+tokenbuf = new uchar 4 0
+vec = new uchar 5120 0
+while true bound 9223372036854775807
+p = ulong 0
+while lt p 4 bound 4
+r = read 0 tokenbuf p sub 4 p
+if eq r 0
+if eq p 0
+ret 0
+end
+ret 3
+end
+if lt r 0
+ret 3
+end
+p = add p ulong r
+end
+tokid = ng_le tokenbuf 0 4
+if ge tokid ngvocab
+ret 3
+end
+if not ng_gather tokid prev older vec
+ret 4
+end
+p = ulong 0
+while lt p len vec bound 5120
+r = write 1 vec p sub len vec p
+if lt r 1
+ret 5
+end
+p = add p ulong r
+end
+older = prev
+prev = tokid
+if eq tokid ngeos
+older = ngeos
+end
+end
+ret 6
+end
