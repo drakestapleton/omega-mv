@@ -64,10 +64,13 @@ compiler moves the kernel's with it; there is no separate repin.
 
 ## Running the kernel's gates from the omega-mv root
 
-`tests/gates/run.sh kernel` runs `kernel-make-test` (`make -C kernel/native/kernel test`),
-`kernel-ck-host-tests`, `kernel-hw-gates`, `kernel-omega-nvme` and `kernel-tcp-corpus`, each of which is
-also a step of its own; the last four run `kernel/tests/gates/run.sh <step>` unchanged. Every other step
-of `kernel/tests/gates/run.sh` still runs from `kernel/` the same way.
+`tests/gates/run.sh kernel` runs six steps: `kernel-make-test` (`make -C kernel/native/kernel test`),
+`kernel-ck-host-tests`, `kernel-hw-gates`, `kernel-omega-nvme`, `kernel-tcp-corpus` and `kernel-spinlock`,
+each of which is also a step of its own; the last five run `kernel/tests/gates/run.sh <step>`.
+`kernel-spinlock` (the compiled order of `core/spinlock.h` and its Lean model) is NOT_RUN, exit 3, without
+the cross compilers or the lean that `native/kernel/proofs/lean-toolchain` names; like every other step, a
+NOT_RUN is not a pass and fails the aggregate. Every other step of `kernel/tests/gates/run.sh` still runs
+from `kernel/` the same way.
 
 ## What the fold changes for the kernel's own checks
 
@@ -75,9 +78,10 @@ of `kernel/tests/gates/run.sh` still runs from `kernel/` the same way.
   the kernel was a repository root. The first now reads a source input from a commit as `$commit:./path`
   and the second clones the whole repository and works in its `kernel/` prefix; the checks are unchanged.
   Before that change `package-test` failed here with 23 of 117 checks.
-- `tools/hwgates/gate.sh` treats a register row whose source is `aienux@COMMIT` as naming "a commit of
-  this repository" only when `git cat-file` finds COMMIT. The aienux commits are here under their
-  rewritten hashes (`import/commit-map`), not their own, so rows that cite aienux commits fail that check
-  in omega-mv until the gate or the register is changed for the fold.
+- `tools/hwgates/gate.sh` treated a register row whose source is `aienux@COMMIT` as naming "a commit of
+  this repository" only when `git cat-file` found COMMIT. The aienux commits are here under their
+  rewritten hashes (`import/commit-map`), not their own, so rows that cite aienux commits failed that
+  check in omega-mv. The gate now resolves `aienux@COMMIT` through `import/commit-map` to a commit present
+  here; the rows keep their aienux hashes.
 - Omega-mv's `aienos.lock` and `argus.lock` still pin the aienux repository for the `visor` and `argus`
   steps (sibling checkout `../aienos`); this fold does not move them.
