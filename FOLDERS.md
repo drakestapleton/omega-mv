@@ -161,7 +161,7 @@ Aienux, the kernel of AienOS, folded into omega-mv with its history (Drake 2026-
 Rules:
 
 - the kernel compiles Omega with this repository's `seed/out/omc`, checked against `seed/out/omc.sha256`; it has no compiler pin of its own (aienux's `PIN` and `REPIN` are gone)
-- the kernel's gates run from `kernel/` through `kernel/tests/gates/run.sh`; `tests/gates/run.sh kernel` (and `kernel-<step>`) runs `make test` of `native/kernel`, `ck-host-tests`, `hw-gates`, `omega-nvme` and `tcp-corpus` from the omega-mv root
+- the kernel's gates run from `kernel/` through `kernel/tests/gates/run.sh`; `tests/gates/run.sh kernel` (and `kernel-<step>`) runs six steps from the omega-mv root: `make test` of `native/kernel`, `ck-host-tests`, `hw-gates`, `omega-nvme`, `tcp-corpus` and `spinlock`
 - receipts in `kernel/evidence/` are kept as written, as under `evidence/` (the `evidence-immutable` step checks only the top-level `evidence/`); an aienux hash in a receipt stays the aienux hash, and `kernel/import/commit-map` gives its commit here
 - `kernel/import/` is the record of the move; never edited after the landing that wrote it
 
