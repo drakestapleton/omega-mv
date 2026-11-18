@@ -158,7 +158,7 @@ pin_controls() {
     fi
     n=$((n + 1))
     for s in $PIN_SCRIPTS; do
-      rm -f "$d/RAN" "$d/out.efi" "$d/out.bin" "$d/out.tools"
+      rm -rf "$d/RAN" "$d/out.efi" "$d/out.bin" "$d/out.tools"
       mkdir -p "$d/kernel/$(dirname "$s")"; cp "$s" "$d/kernel/$s"
       case "$s" in
         */build-fw.sh) args="$d/out.efi" ;;
