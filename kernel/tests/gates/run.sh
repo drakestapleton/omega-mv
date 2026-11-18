@@ -115,6 +115,51 @@ omega_omc() {
   obs omc_sha256 "\"$ps\""
   obs omc_pinned true
 }
+# pin_controls: every place the kernel checks a compiler against omega-mv's pin must refuse, before
+# it compares, when the pin file is missing, empty or not 64 hex digits, or the compiler is missing
+# (before the fold an empty pin and an empty hash compared equal: review of aienux 1f12818d, finding
+# 12). omega_omc runs with AIEN_OMC unset, and each script in PIN_SCRIPTS runs from a copy in a tree
+# that has no compiler; each must exit non-zero with its refusal and write no output. Run before
+# every omega_omc.
+PIN_SCRIPTS="native/om/lm1b/gate.sh native/omega/allen/build-fw.sh native/omega/allen/build-one.sh
+  native/omega/allen/build-local-model.sh scripts/check_local_tools.sh native/disk/tests/omega_nvme_test.sh"
+pin_controls() {
+  local c d s out rc sh_ args n=0
+  for c in missing empty short pin-without-compiler; do
+    d="$TMP/pin-control-$c"; mkdir -p "$d/seed/out"
+    case "$c" in
+      empty) : > "$d/seed/out/omc.sha256" ;;
+      short) printf 'abc  seed/out/omc\n' > "$d/seed/out/omc.sha256" ;;
+      pin-without-compiler) cp "$OMEGA_ROOT/seed/out/omc.sha256" "$d/seed/out/omc.sha256" ;;
+    esac
+    rc=0; out=$(OMEGA_ROOT="$d"; unset AIEN_OMC; omega_omc 2>&1) || rc=$?
+    if [ "$rc" != 3 ] || printf '%s\n' "$out" | grep -q 'omc_pinned true'; then
+      printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, accepted; it does not fail closed" >&2; exit 1
+    fi
+    n=$((n + 1))
+    for s in $PIN_SCRIPTS; do
+      mkdir -p "$d/kernel/$(dirname "$s")"; cp "$s" "$d/kernel/$s"
+      case "$s" in
+        */build-fw.sh) args="$d/out.efi" ;;
+        */build-one.sh) args="$d/kernel/none.om $d/out.bin" ;;
+        */build-local-model.sh) args="$d/train $d/out.efi" ;;
+        *) args= ;;
+      esac
+      case "$(head -n 1 "$s")" in *bash*) sh_=bash ;; *) sh_=sh ;; esac
+      # shellcheck disable=SC2086
+      rc=0; out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u OMEGA_SOURCE AIEN_OMC="$d/seed/out/omc" \
+        MODEL="$d/no-model" LOCAL_TOOLS_OUT="$d/out.tools" "$sh_" "$d/kernel/$s" $args 2>&1) || rc=$?
+      if [ "$rc" != 0 ] && printf '%s\n' "$out" | grep -qE 'compiler pin refused|pinned compiler missing' &&
+        [ ! -e "$d/out.efi" ] && [ ! -e "$d/out.bin" ] && [ ! -e "$d/out.tools" ]; then
+        n=$((n + 1))
+      else
+        printf '%s\n' "$out"; echo "pin control $c: $s exit $rc, not refused before comparing" >&2; exit 1
+      fi
+    done
+  done
+  echo "pin controls: $n refusals as required (omega_omc and $(echo $PIN_SCRIPTS | wc -w) scripts, 4 bad pins)"
+  obs pin_controls_refused "$n"
+}
 
 case "$step" in
   # crumb-verify (gate CRUMB-VERIFY) is retired (DRA-97, 2026-11-07): Crumbs are off the active
@@ -216,26 +261,82 @@ case "$step" in
   # Hardware-gate register (docs/HARDWARE_GATES.md): fixtures, checker mutants, the register, its
   # receipts, a size alarm and planted-bad copies. Needs omega-mv's pinned seed/out/omc.
   hw-gates)
+    pin_controls
     omega_omc
     sh tools/hwgates/gate.sh
     ;;
   # Bounded read-only NVMe protocol in seeded Omega (#472): host cases, guard mutants and
   # disposable-QEMU cases (the test prints its counts). Physical NVMe stays NOT_RUN.
   omega-nvme)
+    pin_controls
     omega_omc
     must_pass omega_nvme 'PASS Omega NVMe host \+ QEMU \+ guard mutants; physical NOT_RUN' \
       -- env OMEGA_NVME_EVIDENCE="$TMP/omega-nvme" sh native/disk/tests/omega_nvme_test.sh
     scripts_verdict
     ;;
-  # Native TCP stack in seeded Omega (L232): the hosted hostile corpus (exact-state cases plus
-  # 2,000,000 seeded mutated frames), built with omega-mv's pinned seed/out/omc. No QEMU; the
-  # QEMU profiles stay in native/net/tcp/gate.sh.
+  # Native TCP stack in seeded Omega (L232): native/net/tcp/gate.sh corpus mode (the hosted hostile
+  # corpus, its exact-state cases and its mutants), built with omega-mv's pinned seed/out/omc. PASS
+  # needs its TCP_CORPUS_GATE PASS line with nonzero counts and killed equal to mutants; gate.sh exit
+  # 3 is NOT_RUN (exit 3 here), never a pass. No QEMU; the QEMU profiles stay in gate.sh.
   tcp-corpus)
+    pin_controls
     omega_omc
-    cat native/net/tcp/tcp.om native/net/tcp/corpus.om | "$AIEN_OMC" > "$TMP/tcp-corpus"
-    chmod +x "$TMP/tcp-corpus"
-    must_pass tcp_corpus 'CORPUS_PASS checks=[0-9]+ .*' -- "$TMP/tcp-corpus" 2000000
-    scripts_verdict
+    rc=0; sh native/net/tcp/gate.sh corpus "$AIEN_OMC" "$TMP/tcp" 2>&1 | tee "$TMP/tcp-corpus.log" || rc=$?
+    if [ "$rc" = 3 ]; then echo "tcp-corpus: NOT_RUN (native/net/tcp/gate.sh exit 3)"; obs tcp_corpus_not_run true; exit 3; fi
+    [ "$rc" = 0 ] || { echo "tcp-corpus: native/net/tcp/gate.sh exit $rc, not PASS"; exit 1; }
+    line=$(grep -E '^TCP_CORPUS_GATE PASS checks=[1-9][0-9]* mutants=[1-9][0-9]* killed=[1-9][0-9]*$' "$TMP/tcp-corpus.log" | tail -n 1 || true)
+    [ -n "$line" ] || { echo "tcp-corpus: no 'TCP_CORPUS_GATE PASS checks= mutants= killed=' line, not PASS"; exit 1; }
+    mutants=${line#*mutants=}; mutants=${mutants%% *}; killed=${line##*killed=}
+    [ "$killed" = "$mutants" ] || { echo "tcp-corpus: killed=$killed of mutants=$mutants, not PASS"; exit 1; }
+    obs tcp_corpus_mutants "$mutants"
+    obs tcp_corpus_killed "$killed"
+    echo "tcp-corpus: PASS ($line)"
+    ;;
+  # DRA-556 spinlock (core/spinlock.h): the compiled order of both lock forms and of every lock site
+  # of core/pipe.c, with its dump mutants (make spinlock-asm-check), and the Lean model checked for
+  # sorry/admit/native_decide and non-standard axioms, with its bad-proof controls (make
+  # ticketlock-proof). No cross compiler, no lean, or a lean other than proofs/lean-toolchain:
+  # NOT_RUN, exit 3, never a pass. The NOT_RUN paths are controls here too.
+  spinlock)
+    spin_fail=0; spin_notrun=0
+    spin_part() {  # spin_part NAME MAKE-TARGET PASS-LINE...: one target, counted as PASS, FAIL or NOT_RUN
+      local name="$1" target="$2" r rc=0 log="$TMP/spin-$1.log"
+      shift 2
+      make -C native/kernel "$target" 2>&1 | tee "$log" || rc=$?
+      if grep -qE '^CK_[A-Z_]+: NOT_RUN' "$log" && ! grep -qE '^CK_[A-Z_]+: (PASS|FAIL)$' "$log"; then
+        echo "spinlock $name: NOT_RUN"; spin_notrun=$((spin_notrun + 1)); return 0
+      fi
+      [ "$rc" = 0 ] || { echo "spinlock $name: make $target exit $rc, not PASS"; spin_fail=$((spin_fail + 1)); return 0; }
+      for r in "$@"; do
+        grep -qx "$r" "$log" || { echo "spinlock $name: no line '$r', not PASS"; spin_fail=$((spin_fail + 1)); return 0; }
+      done
+      echo "spinlock $name: PASS"
+    }
+    spin_part asm spinlock-asm-check 'CK_SPINLOCK_ASM: PASS' 'CK_SPINLOCK_ASM_SELFTEST: PASS'
+    spin_part proof ticketlock-proof 'CK_TICKETLOCK_PROOF: PASS' 'CK_TICKETLOCK_PROOF_SELFTEST: PASS'
+    # Controls of the NOT_RUN paths: no lean, a lean other than the pinned one, no x86 compiler.
+    mkdir -p "$TMP/nolean" "$TMP/oldlean"
+    for t in dirname realpath sed; do ln -sf "$(command -v "$t")" "$TMP/nolean/$t"; done
+    printf '#!/bin/sh\necho "Lean (version 0.0.1, control)"\n' > "$TMP/oldlean/lean"; chmod +x "$TMP/oldlean/lean"
+    for c in nolean:"$TMP/nolean" oldlean:"$TMP/oldlean:$TMP/nolean"; do
+      rc=0; env PATH="${c#*:}" "$BASH" native/kernel/proofs/check.sh native/kernel/proofs/TicketLock.lean > "$TMP/spin-${c%%:*}.log" 2>&1 || rc=$?
+      if [ "$rc" = 3 ] && grep -qE '^CK_TICKETLOCK_PROOF: NOT_RUN \(.+\)$' "$TMP/spin-${c%%:*}.log"; then
+        echo "spinlock control ${c%%:*}: NOT_RUN exit 3 as required"
+      else
+        cat "$TMP/spin-${c%%:*}.log"; echo "spinlock control ${c%%:*}: exit $rc, not NOT_RUN"; spin_fail=$((spin_fail + 1))
+      fi
+    done
+    rc=0; make -C native/kernel OUT="$TMP/spin-noxcc" X86_CROSS=/nonexistent/ spinlock-asm-check > "$TMP/spin-noxcc.log" 2>&1 || rc=$?
+    if [ "$rc" != 0 ] && grep -qx 'CK_SPINLOCK_ASM: NOT_RUN (/nonexistent/gcc not installed)' "$TMP/spin-noxcc.log"; then
+      echo "spinlock control no-x86-compiler: NOT_RUN as required"
+    else
+      cat "$TMP/spin-noxcc.log"; echo "spinlock control no-x86-compiler: exit $rc, not NOT_RUN"; spin_fail=$((spin_fail + 1))
+    fi
+    obs spinlock_failed "$spin_fail"
+    obs spinlock_not_run "$spin_notrun"
+    [ "$spin_fail" = 0 ] || { echo "AIENOS_SPINLOCK: FAIL"; exit 1; }
+    [ "$spin_notrun" = 0 ] || { echo "AIENOS_SPINLOCK: NOT_RUN"; exit 3; }
+    echo "AIENOS_SPINLOCK: PASS"
     ;;
   # native-suites.yml matrix
   native-net)        native_suite net "test sanitize mutants" 'AIENOS_NET_SECURE_TESTS: PASS|NET_SANITIZE: PASS|NET_SECURE_MUTANTS: [0-9]+/[0-9]+ killed' ;;

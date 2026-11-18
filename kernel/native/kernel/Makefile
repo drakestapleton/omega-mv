@@ -1568,6 +1568,11 @@ $(OUT)/host-san/test_osh_op: $(KDIR)/tests/test_osh_op.c $(OSH_OP_SRCS) $(KDIR)/
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(HCFLAGS) $(SANFLAGS) -DCK_OSH_OP_TEST -I$(NATIVE)/argus -o $@ $< $(OSH_OP_SRCS)
 
+# A mutant control shows the line where its test failed, prefixed "control: " so that the line is never read as a
+# failure of the real test (a test_handoff mutant's "FAIL (2 of 56 checks failed)" was). $(call CONTROL_SAW,TEXT,LOG)
+# prints the LOG lines containing TEXT, prefixed, and fails when there are none.
+CONTROL_SAW = awk -v p="$(1)" 'index($$0, p) { print "control: " $$0; f = 1 } END { exit !f }' $(2)
+
 # TEST-ONLY mutant of core/osh_op.c: the permission check always says OK. test_osh_op must FAIL against it (red before
 # green); "make test" fails if the test stops catching it. Host only (osh_op.c refuses the flag freestanding).
 $(OUT)/host/test_osh_op_mutant: $(KDIR)/tests/test_osh_op.c $(OSH_OP_SRCS) $(KDIR)/tests/ck_test.h $(HDRS)
@@ -1576,7 +1581,7 @@ $(OUT)/host/test_osh_op_mutant: $(KDIR)/tests/test_osh_op.c $(OSH_OP_SRCS) $(KDI
 
 osh-op-mutant: $(OUT)/host/test_osh_op_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_osh_op mutant (permission check always OK): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_osh_op: FAIL" $<.log && echo "test_osh_op mutant (permission check always OK): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_osh_op: FAIL,$<.log) && echo "test_osh_op mutant (permission check always OK): FAILS as required"; fi
 
 # Native pipe primitive (core/pipe.c, aienos-mv#428): pure logic over ipc.c capability tables, driven through sched.c by
 # core/pipe_drive.h. Own rule: the test reads the fixture corpus in tests/fixtures/pipe/.
@@ -1596,9 +1601,10 @@ $(OUT)/host-san/test_pipe: $(PIPE_DEPS)
 	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) $(PIPE_DEF) -o $@ $< $(PIPE_SRCS)
 
 # DRA-556: core/spinlock.h, the one kernel spinlock (fair ticket lock, masks interrupts while held). test_spinlock:
-# mutual exclusion, FIFO order, counter wrap, interrupt deferral. test_pipe_irq: race test, a pipe op from an
-# interrupt (host: SIGUSR1) on the thread that holds the pool lock; before DRA-556 it deadlocks. Both must FAIL
-# against the TEST-ONLY mutant -DCK_SPIN_TEST_NO_IRQ_MASK (interrupts left open). Host only.
+# mutual exclusion, FIFO order, counter wrap, interrupt deferral, the saved state kept in the lock (l->irq).
+# test_pipe_irq: race test, a pipe op from an interrupt (host: SIGUSR1) on the thread that holds the pool lock;
+# before DRA-556 it deadlocks. Both must FAIL against the TEST-ONLY mutant -DCK_SPIN_TEST_NO_IRQ_MASK (interrupts
+# left open), and test_spinlock against every mutant in SPIN_MUTANTS. Host only.
 SPIN_DEPS := $(KDIR)/core/spinlock.h
 $(OUT)/host/test_spinlock: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
 	@mkdir -p $(dir $@)
@@ -1618,7 +1624,7 @@ $(OUT)/host-san/test_pipe_irq: $(PIPE_IRQ_DEPS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(PIPE_HCFLAGS) $(SANFLAGS) -o $@ $< $(PIPE_IRQ_SRCS)
 
-SPIN_MUTANTS := NO_IRQ_MASK TICKET_BEFORE_MASK RESTORE_BEFORE_RELEASE
+SPIN_MUTANTS := NO_IRQ_MASK TICKET_BEFORE_MASK RESTORE_BEFORE_RELEASE SLOT_WRITE_BEFORE_ENTRY SLOT_READ_AFTER_RELEASE
 $(OUT)/host/test_spinlock_mutant_%: $(KDIR)/tests/test_spinlock.c $(SPIN_DEPS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_$* -o $@ $<
@@ -1627,38 +1633,69 @@ $(OUT)/host/test_pipe_irq_mutant: $(PIPE_IRQ_DEPS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(PIPE_HCFLAGS) -DCK_SPIN_TEST_NO_IRQ_MASK -o $@ $< $(PIPE_IRQ_SRCS)
 
-spinlock-mutant: $(addprefix $(OUT)/host/test_spinlock_mutant_,$(SPIN_MUTANTS)) $(OUT)/host/test_pipe_irq_mutant
+# test_pipe_irq controls: a timer 100 times slower (as if the host were 100 times faster) must still PASS, since the
+# run is counted in interrupts, not rounds; no timer at all must FAIL by the timer alarm instead of looping.
+$(OUT)/host/test_pipe_irq_slowtick: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -DTICK_NS=2000000L -o $@ $< $(PIPE_IRQ_SRCS)
+
+$(OUT)/host/test_pipe_irq_notimer: $(PIPE_IRQ_DEPS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(PIPE_HCFLAGS) -DTEST_PIPE_IRQ_NO_TIMER -o $@ $< $(PIPE_IRQ_SRCS)
+
+spinlock-mutant: $(addprefix $(OUT)/host/test_spinlock_mutant_,$(SPIN_MUTANTS)) $(OUT)/host/test_pipe_irq_mutant \
+  $(OUT)/host/test_pipe_irq_slowtick $(OUT)/host/test_pipe_irq_notimer
 	@for m in $(SPIN_MUTANTS); do b=$(OUT)/host/test_spinlock_mutant_$$m; \
 	  if $$b > $$b.log 2>&1; then cat $$b.log; echo "test_spinlock mutant $$m: PASSED, test does not catch it"; exit 1; \
-	  else grep -F "test_spinlock: FAIL" $$b.log && echo "test_spinlock mutant $$m: FAILS as required"; fi || exit 1; done
+	  else $(call CONTROL_SAW,test_spinlock: FAIL,$$b.log) && echo "test_spinlock mutant $$m: FAILS as required"; fi || exit 1; done
 	@for mp in TICKET_BEFORE_MASK:irq-step-acquire RESTORE_BEFORE_RELEASE:irq-step-release; do m=$${mp%%:*}; ph=$${mp##*:}; \
 	  b=$(OUT)/host/test_spinlock_mutant_$$m; \
 	  if TEST_SPINLOCK_ONLY=$$ph $$b > $$b.$$ph.log 2>&1; then cat $$b.$$ph.log; echo "test_spinlock mutant $$m, phase $$ph alone: PASSED, phase does not catch it"; exit 1; \
-	  else grep -F "test_spinlock: FAIL deadlock (no progress for 5 s) in phase $$ph" $$b.$$ph.log && echo "test_spinlock mutant $$m: phase $$ph alone FAILS as required"; fi || exit 1; done
+	  else $(call CONTROL_SAW,test_spinlock: FAIL deadlock (no progress for 5 s) in phase $$ph,$$b.$$ph.log) && echo "test_spinlock mutant $$m: phase $$ph alone FAILS as required"; fi || exit 1; done
+	@for m in SLOT_WRITE_BEFORE_ENTRY SLOT_READ_AFTER_RELEASE; do b=$(OUT)/host/test_spinlock_mutant_$$m; \
+	  if TEST_SPINLOCK_ONLY=irq-slot $$b > $$b.irq-slot.log 2>&1; then cat $$b.irq-slot.log; echo "test_spinlock mutant $$m, phase irq-slot alone: PASSED, phase does not catch it"; exit 1; \
+	  else awk '/^test_spinlock: FAIL irq-slot: of 50 rounds, [1-9][0-9]* left the first holder masked/ { print "control: " $$0; f = 1 } END { exit !f }' $$b.irq-slot.log && echo "test_spinlock mutant $$m: phase irq-slot alone FAILS as required"; fi || exit 1; done
 	@if $(OUT)/host/test_pipe_irq_mutant > $(OUT)/host/test_pipe_irq_mutant.log 2>&1; then cat $(OUT)/host/test_pipe_irq_mutant.log; \
 	  echo "test_pipe_irq mutant (interrupts not masked): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_pipe_irq: FAIL" $(OUT)/host/test_pipe_irq_mutant.log && echo "test_pipe_irq mutant (interrupts not masked): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_pipe_irq: FAIL deadlock,$(OUT)/host/test_pipe_irq_mutant.log) && echo "test_pipe_irq mutant (interrupts not masked): FAILS as required"; fi
+	@$(OUT)/host/test_pipe_irq_slowtick > $(OUT)/host/test_pipe_irq_slowtick.log 2>&1 && grep -E "^test_pipe_irq: PASS " $(OUT)/host/test_pipe_irq_slowtick.log && \
+	  echo "test_pipe_irq control (timer 100 times slower): PASSES as required" || \
+	  { cat $(OUT)/host/test_pipe_irq_slowtick.log; echo "test_pipe_irq control (timer 100 times slower): did not PASS"; exit 1; }
+	@if $(OUT)/host/test_pipe_irq_notimer > $(OUT)/host/test_pipe_irq_notimer.log 2>&1; then cat $(OUT)/host/test_pipe_irq_notimer.log; \
+	  echo "test_pipe_irq control (no timer): PASSED, the timer alarm does not fire"; exit 1; \
+	else $(call CONTROL_SAW,test_pipe_irq: FAIL no interrupt handled,$(OUT)/host/test_pipe_irq_notimer.log) && echo "test_pipe_irq control (no timer): FAILS as required"; fi
 
-# DRA-556: the freestanding instruction order of core/spinlock.h, aarch64 (KCC, KCFLAGS) and x86-64 (X86CFLAGS):
-# the interrupt mask comes before the first atomic of the acquire, and the restore after the releasing store.
-# Needs the cross compilers and objdump; not part of "make test". tools/ck_spinlock_asm_check.sh reads the dumps; its
-# --selftest mutates them (mask removed, order swapped, release store to another symbol) and requires each to FAIL.
-spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(SPIN_DEPS)
+# DRA-556: the freestanding instruction order of core/spinlock.h, aarch64 (KCC, KCFLAGS) and x86-64 (X86CFLAGS), for
+# both forms (tests/spinlock_tu.c), and at every lock site of core/pipe.c built for the aarch64 kernel: the mask before
+# the first atomic of the acquire, the restore after the releasing store, l->irq written after entry and read before
+# the release. tools/ck_spinlock_asm_check.sh reads the dumps; its --selftest mutates them (mask removed, orders
+# swapped, stores and loads moved to other fields) and requires each to FAIL by its own rule. Needs the cross
+# compilers and objdump: without them it prints CK_SPINLOCK_ASM: NOT_RUN and exits 3. Gate: tests/gates/run.sh
+# spinlock (not "make test").
+spinlock-asm-check: $(KDIR)/tests/spinlock_tu.c $(KDIR)/core/pipe.c $(SPIN_DEPS)
+	@for t in $(KCC) $(X86CC) $(CROSS)objdump $(X86_CROSS)objdump; do command -v $$t >/dev/null || \
+	  { echo "CK_SPINLOCK_ASM: NOT_RUN ($$t not installed)"; exit 3; }; done
 	@mkdir -p $(OUT)/spinlock-asm
 	$(KCC) $(KCFLAGS) -c -o $(OUT)/spinlock-asm/a64.o $<
 	$(X86CC) $(X86CFLAGS) -c -o $(OUT)/spinlock-asm/x86.o $<
-	$(CROSS)objdump -dr $(OUT)/spinlock-asm/a64.o > $(OUT)/spinlock-asm/a64.dis
-	$(X86_CROSS)objdump -dr $(OUT)/spinlock-asm/x86.o > $(OUT)/spinlock-asm/x86.dis
-	@bash $(REPO)/tools/ck_spinlock_asm_check.sh $(OUT)/spinlock-asm/a64.dis $(OUT)/spinlock-asm/x86.dis
-	@bash $(REPO)/tools/ck_spinlock_asm_check.sh --selftest $(OUT)/spinlock-asm/a64.dis $(OUT)/spinlock-asm/x86.dis
+	$(KCC) $(KCFLAGS) -c -o $(OUT)/spinlock-asm/pipe-a64.o $(KDIR)/core/pipe.c
+	$(CROSS)objdump -drt $(OUT)/spinlock-asm/a64.o > $(OUT)/spinlock-asm/a64.dis
+	$(X86_CROSS)objdump -drt $(OUT)/spinlock-asm/x86.o > $(OUT)/spinlock-asm/x86.dis
+	$(CROSS)objdump -drt $(OUT)/spinlock-asm/pipe-a64.o > $(OUT)/spinlock-asm/pipe-a64.dis
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh $(addprefix $(OUT)/spinlock-asm/,a64.dis x86.dis pipe-a64.dis)
+	@bash $(REPO)/tools/ck_spinlock_asm_check.sh --selftest $(addprefix $(OUT)/spinlock-asm/,a64.dis x86.dis pipe-a64.dis)
 
-# DRA-556: Lean 4 proof of the ticket arithmetic in core/spinlock.h (mutual exclusion, FIFO, wrap). Core Lean only,
-# toolchain pinned in proofs/lean-toolchain. Not part of "make test" (Lean is not a build dependency): prints NOT_RUN
-# without lean, FAIL on any error or "sorry".
+# DRA-556: proofs/TicketLock.lean, Lean 4 model of core/spinlock.h (ticket arithmetic, queue invariant, interrupt
+# ordering of both forms on one and two CPUs). Core Lean only, toolchain pinned in proofs/lean-toolchain.
+# proofs/check.sh passes it only when lean elaborates it with no warning or error, `#print axioms` of every theorem
+# and of every other constant it declares lists only propext, Classical.choice and Quot.sound, and the source has
+# no sorry/admit/native_decide/axiom; --selftest appends each proofs/controls/*.lean (axiom of False, admit,
+# native_decide, a theorem hidden in a macro) to a copy and requires each to FAIL by the rules it names. Without
+# lean, or with a lean other than the pinned one: CK_TICKETLOCK_PROOF: NOT_RUN, exit 3. Gate: tests/gates/run.sh
+# spinlock (not "make test": Lean is not a build dependency).
 ticketlock-proof:
-	@command -v lean >/dev/null || { echo "CK_TICKETLOCK_PROOF: NOT_RUN (lean not installed)"; exit 3; }
-	@if grep -n "sorry" $(KDIR)/proofs/TicketLock.lean; then echo "CK_TICKETLOCK_PROOF: FAIL (sorry)"; exit 1; fi
-	@cd $(KDIR)/proofs && lean TicketLock.lean && echo "CK_TICKETLOCK_PROOF: PASS"
+	@bash $(KDIR)/proofs/check.sh $(KDIR)/proofs/TicketLock.lean
+	@bash $(KDIR)/proofs/check.sh --selftest $(KDIR)/proofs/TicketLock.lean
 
 # TEST-ONLY mutant of core/pipe.c: a write does not check the WRITE right or the end. test_pipe must FAIL against it
 # (red before green); "make test" fails if the test stops catching it. Host only.
@@ -1668,7 +1705,7 @@ $(OUT)/host/test_pipe_mutant: $(PIPE_DEPS)
 
 pipe-mutant: $(OUT)/host/test_pipe_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (write right not checked): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (write right not checked): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_pipe: FAIL,$<.log) && echo "test_pipe mutant (write right not checked): FAILS as required"; fi
 
 # TEST-ONLY mutant: ck_pipe_dispatch does not reject a slice outside [user_lo, user_hi). test_pipe must FAIL.
 $(OUT)/host/test_pipe_slice_mutant: $(PIPE_DEPS)
@@ -1677,7 +1714,7 @@ $(OUT)/host/test_pipe_slice_mutant: $(PIPE_DEPS)
 
 pipe-slice-mutant: $(OUT)/host/test_pipe_slice_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (user slice not checked): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (user slice not checked): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_pipe: FAIL,$<.log) && echo "test_pipe mutant (user slice not checked): FAILS as required"; fi
 
 # TEST-ONLY mutants for #494. pipe-bounce-mutant: ck_pipe_dispatch hands the caller's slice to the ring copy, which
 # touches it under the pool lock. pipe-top-mutant: a window ending above CK_PIPE_USER_TOP is accepted. test_pipe must
@@ -1688,7 +1725,7 @@ $(OUT)/host/test_pipe_bounce_mutant: $(PIPE_DEPS)
 
 pipe-bounce-mutant: $(OUT)/host/test_pipe_bounce_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (slice copied under the lock): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (slice copied under the lock): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_pipe: FAIL,$<.log) && echo "test_pipe mutant (slice copied under the lock): FAILS as required"; fi
 
 $(OUT)/host/test_pipe_top_mutant: $(PIPE_DEPS)
 	@mkdir -p $(dir $@)
@@ -1696,7 +1733,7 @@ $(OUT)/host/test_pipe_top_mutant: $(PIPE_DEPS)
 
 pipe-top-mutant: $(OUT)/host/test_pipe_top_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_pipe mutant (user-VA top not checked): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_pipe: FAIL" $<.log && echo "test_pipe mutant (user-VA top not checked): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_pipe: FAIL,$<.log) && echo "test_pipe mutant (user-VA top not checked): FAILS as required"; fi
 
 # N3 context assembly + approval binding (core/context.c, core/context_proposal.c, aienos#329): pure logic over
 # the argus SHA-256. Own rule (needs sha256.c). The mutant skips the foreign-binding check: test_context must
@@ -1717,7 +1754,7 @@ $(OUT)/host/test_context_mutant: $(KDIR)/tests/test_context.c $(CONTEXT_SRCS) $(
 
 context-mutant: $(OUT)/host/test_context_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_context mutant (foreign binding check skipped): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_context: FAIL" $<.log && echo "test_context mutant (foreign binding check skipped): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_context: FAIL,$<.log) && echo "test_context mutant (foreign binding check skipped): FAILS as required"; fi
 
 # PI5-7 cut 2 card command script parser (core/agent_cmd.c): the mutant accepts any word as a verb (a script could then carry unlock
 # or rotate); test_agent_cmd must FAIL against it (red before green). Host only, never part of an image.
@@ -1727,7 +1764,7 @@ $(OUT)/host/test_agent_cmd_mutant: $(KDIR)/tests/test_agent_cmd.c $(KDIR)/core/a
 
 agent-cmd-mutant: $(OUT)/host/test_agent_cmd_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_agent_cmd mutant (any verb allowed): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_agent_cmd: FAIL" $<.log && echo "test_agent_cmd mutant (any verb allowed): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_agent_cmd: FAIL,$<.log) && echo "test_agent_cmd mutant (any verb allowed): FAILS as required"; fi
 
 # PI5-8 cut K ALLEN gate (core/allen_gate.c): the mutant proposes ALLEN's approve/deny/cancel like any other verb (ALLEN
 # would hold approval authority); test_allen_gate must FAIL against it (red before green). Host only, never part of an image.
@@ -1738,7 +1775,7 @@ $(OUT)/host/test_allen_gate_mutant: $(KDIR)/tests/test_allen_gate.c $(ALLEN_GATE
 
 allen-gate-mutant: $(OUT)/host/test_allen_gate_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_allen_gate mutant (ALLEN approve proposed): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_allen_gate: FAIL" $<.log && echo "test_allen_gate mutant (ALLEN approve proposed): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_allen_gate: FAIL,$<.log) && echo "test_allen_gate mutant (ALLEN approve proposed): FAILS as required"; fi
 
 # PI5-7 cut 3 card artifact bundle parser (core/artifact_card.c): the mutant accepts bytes after the last entry (a second, unchecked
 # payload could ride along); test_artifact_card must FAIL against it (red before green). Host only, never part of an image.
@@ -1748,7 +1785,7 @@ $(OUT)/host/test_artifact_card_mutant: $(KDIR)/tests/test_artifact_card.c $(KDIR
 
 artifact-card-mutant: $(OUT)/host/test_artifact_card_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_artifact_card mutant (trailing bytes accepted): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_artifact_card: FAIL" $<.log && echo "test_artifact_card mutant (trailing bytes accepted): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_artifact_card: FAIL,$<.log) && echo "test_artifact_card mutant (trailing bytes accepted): FAILS as required"; fi
 
 # TEST-ONLY mutant of core/handoff_check.c (reserved0 check removed): the
 # handoff test must FAIL against it, so "make test" fails if the test stops
@@ -1760,7 +1797,7 @@ $(OUT)/host/test_handoff_mutant: $(KDIR)/tests/test_handoff.c $(HOST_SRCS) $(KDI
 
 handoff-mutant: $(OUT)/host/test_handoff_mutant
 	@if $< > $<.log 2>&1; then cat $<.log; echo "test_handoff mutant (reserved0 check removed): PASSED, test does not catch it"; exit 1; \
-	else grep -F "test_handoff: FAIL" $<.log && echo "test_handoff mutant (reserved0 check removed): FAILS as required"; fi
+	else $(call CONTROL_SAW,test_handoff: FAIL,$<.log) && echo "test_handoff mutant (reserved0 check removed): FAILS as required"; fi
 
 # TEST-ONLY mutants of core/acpi_dev.c (NEXT-PHASE-3 cut 2): 1 = table
 # signature check removed, 2 = checksum check removed, 3 = length-versus-
