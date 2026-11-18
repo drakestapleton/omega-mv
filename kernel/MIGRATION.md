@@ -58,9 +58,8 @@ compiler moves the kernel's with it; there is no separate repin.
   `native/om/lm1b/gate.sh` (before: omc `734f0a39…` at a home-directory path). Their READMEs say what was
   measured with the new compiler.
 - Not changed: `native/omega/platform/gate.sh` takes the compiler and its hash as arguments;
-  `tools/imac-image/build-efi.sh` takes `OMEGA_COMPILER` and builds sources that are on the aienux branch
-  `feat/allen-imac-competition`, not on main. Recorded receipts and their compiler digests are history
-  and stay as written.
+  `tools/imac-image/build-efi.sh` takes `OMEGA_COMPILER` (its sources are outside omega-mv, below).
+  Recorded receipts and their compiler digests are history and stay as written.
 
 ## Running the kernel's gates from the omega-mv root
 
@@ -83,5 +82,18 @@ from `kernel/` the same way.
   rewritten hashes (`import/commit-map`), not their own, so rows that cite aienux commits failed that
   check in omega-mv. The gate now resolves `aienux@COMMIT` through `import/commit-map` to a commit present
   here; the rows keep their aienux hashes.
-- Omega-mv's `aienos.lock` and `argus.lock` still pin the aienux repository for the `visor` and `argus`
-  steps (sibling checkout `../aienos`); this fold does not move them.
+- Omega-mv's `aienos.lock` and `argus.lock` name aienux commits (`b84c0a67`, `b375dcaa`), both on aienux
+  main. They are read from `kernel/` now, not from a sibling `../aienos` checkout:
+  `tools/aienos_lock_source.sh` maps the locked commit through `import/commit-map` (`593c755e`,
+  `b7c5e158`) and extracts and proves the subpaths from that commit's `kernel/` tree, whose
+  `native/capability` and `native/argus` trees have the same ids as in aienux. `tests/gates/run.sh`
+  (`aienos_pin`, `argus_pin`), the Makefile (`AIENOS_LOCK_REPO`, `ARGUS_REPO`, now empty by default) and
+  the receipt tools (`AIENOS_REPO`) use it; a repository holding the aienux commit can still be named.
+
+## Still outside omega-mv
+
+Content the kernel's tools name that is only on aienux side branches was not imported:
+
+| What | Where | Here |
+|---|---|---|
+| The twenty Allen EFI sources `tools/imac-image/build-efi.sh` composes | aienux `feat/allen-imac-competition` `d4ffde3cac2e73b568c0f958a9cefe8cb21f2c07` | Fourteen equal `native/omega/allen`; `platform.om`, `surface.om`, `github.om`, `net.om`, `repository-screen.om` and `efi-main.om` differ. The script carries the sha256 of each at `d4ffde3c` and exits 3 (NOT_RUN) unless `ALLEN_SRC` holds exactly those. |

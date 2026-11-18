@@ -28,11 +28,11 @@ sh seed/omega-from-seed.sh   # or: make omega-from-seed
 
 `omega-from-seed.sh` grows the compiler from `seed/rung0/seed0.hex` (the one outside step is `seed/rung0/load0.sh`, POSIX `printf`), has omc rebuild itself twice to identical bytes, and leaves it at `seed/out/omc` with its sha256 beside it. No C is on that path.
 
-Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) and `../aienos` for the pinned FORGE and kernel sources, `../omega-bridge` for `om-units`, `../aien-train` for `orig4-shadow`. A step whose sibling is missing exits 3 with a message.
+Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) for the pinned FORGE sources, `../omega-bridge` for `om-units`, `../aien-train` for `orig4-shadow`. A step whose sibling is missing exits 3 with a message. The pinned kernel sources need no sibling: they come from `kernel/` (`tools/aienos_lock_source.sh`).
 
 ## Configuration
 
-- `physics.lock`, `aienos.lock`, `argus.lock`: commits of the sibling sources the full build and some gates pin. `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
+- `physics.lock`: the commit of the physics sibling the full build and some gates pin. `aienos.lock`, `argus.lock`: the aienux commits whose capability and ARGUS sources they pin, taken from this repository's `kernel/` at the commit `kernel/import/commit-map` gives each (a full clone is needed). `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
 - `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0` on `make` builds the host suites without a physics checkout.
 - `OUT_DIR`: per-step build directory; `tests/gates/run.sh` sets it to `build/step-<name>`.
 - `.aien/always` lists the gates every commit must pass (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`); `.aien/verify.pub` is the Spark judge's public key.
