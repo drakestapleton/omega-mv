@@ -1680,7 +1680,7 @@ cancelled through `auth_cancel` after MS milliseconds.
 | cancelled read as UNKNOWN | 197 |
 | missing file read as read | 178 |
 | prompt limit raised to 4000 | 203 |
-| refused tool job left waiting (DRA-291) | 206 |
+| refused tool job left waiting (DRA-291) | 208 (check 58) |
 
 ### Live coding workflow under the durable scheduler (DRA-399)
 
