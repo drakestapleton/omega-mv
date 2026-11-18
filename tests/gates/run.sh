@@ -26,7 +26,7 @@
 # them from git status. Here physics is materialised under build/pins/ (build/ is gitignored)
 # from the sibling local clone ../physics, offline. Aienux is folded into this repository as
 # kernel/ (Drake 2026-11-17): the aienos.lock sources are materialised from the kernel/ of the
-# commit kernel/import/commit-map gives the locked one, and proven, by tools/aienos_lock_source.sh;
+# omega-mv commit the lock names, and proven, by tools/aienos_lock_source.sh;
 # the Makefile takes the argus.lock sources the same way. No sibling aienux checkout is read.
 set -euo pipefail
 # Reviewer 2026-11-15 (P1032): an inherited MAKEFLAGS (e.g. -i/-k) or MAKEFILES (e.g. a file with .IGNORE:) would let a failing gate pass; gates run with a clean make.
@@ -73,9 +73,9 @@ pin() {
 # the Makefile's check-physics-lock refuses any other commit, so a literal here goes red on
 # the next lock bump (it did for the e95e3ed bump, omega#508, and again for 048e5f5, omega#523).
 physics_pin() { pin physics-src physics "$(lock physics.lock)"; export PHYSICS_DIR="$PINS/physics-src"; }
-# kernel_pin <dir-name> <lock file> <subpath>...: the aienux commit the lock names, from this
-# repository's kernel/, materialised and proven under build/pins/<dir-name>. Exit 3 when this
-# clone cannot give it (no commit map row or no history); exit 1 when the pin differs from it.
+# kernel_pin <dir-name> <lock file> <subpath>...: the omega-mv commit the lock names, its kernel/
+# materialised and proven under build/pins/<dir-name>. Exit 3 when this clone does not have that
+# commit (a full clone is needed); exit 1 when the pin differs from it.
 kernel_pin() {
   local name="$1" sha rc=0
   sha="$(lock "$2")"; shift 2
@@ -83,8 +83,8 @@ kernel_pin() {
   ( flock -x 9
     AIENOS_LOCK="$sha" AIENOS_LOCK_REPO= AIENOS_R7_DIR= bash tools/aienos_lock_source.sh materialize "$PINS/$name" "$@"
   ) 9>"$PINS/.$name.lock" || rc=$?
-  if [ "$rc" = 2 ]; then echo "run.sh: aienux $sha is not available from kernel/ here (kernel/import/commit-map, full history)" >&2; exit 3; fi
-  [ "$rc" = 0 ] || { echo "run.sh: build/pins/$name differs from aienux $sha; delete it" >&2; exit 1; }
+  if [ "$rc" = 2 ]; then echo "run.sh: commit $sha is not in this clone (a full clone is needed)" >&2; exit 3; fi
+  [ "$rc" = 0 ] || { echo "run.sh: build/pins/$name differs from $sha; delete it" >&2; exit 1; }
   obs "pin_${name//-/_}" "\"$sha\""
 }
 # Every subpath a build reads under AIENOS_R7_DIR (Makefile, mk/allen.mk).
@@ -610,21 +610,10 @@ case "$step" in
     ;;
   # turing-yield.yml
   turing-yield)       make test-turing-yield test-turing-energy test-turing-range-om ;;
-  # evidence-immutable.yml: reviewed evidence is additions-only. Hosted compares the PR base
-  # and head; locally the base is origin/main (or AIEN_BASE_REF).
-  evidence-immutable)
-    base="${AIEN_BASE_REF:-origin/main}"
-    obs base_ref "\"$(git rev-parse "$base")\""
-    changed="$(git diff --name-status --diff-filter=MDRT "$base...HEAD" -- evidence/)"
-    if [ -n "$changed" ]; then
-      echo "These existing evidence files would be changed:"; echo "$changed"
-      echo "Add a new, content-addressed file instead of rewriting reviewed evidence."
-      obs evidence_rewrites "$(printf '%s\n' "$changed" | grep -c .)"
-      exit 1
-    fi
-    obs evidence_rewrites 0
-    echo "evidence/: additions only"
-    ;;
+  # OMEGA-EVIDENCE-IMMUTABLE: reviewed evidence is additions only: evidence/, kernel/evidence/ and kernel/import/
+  # against the merge base with origin/main (or AIEN_BASE_REF), the kernel/ import and every commit after it
+  # (tools/evidence_immutable.sh, which runs its own controls first; exit 3 NOT_RUN without history).
+  evidence-immutable) bash tools/evidence_immutable.sh ;;
   zero-disk-secrets)
     echo "Auditing repository for prohibited plaintext secret files..."
     # Inspect every tracked path, including forced additions under generated dirs.
