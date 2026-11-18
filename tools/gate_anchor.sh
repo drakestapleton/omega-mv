@@ -34,8 +34,8 @@
 #    [ctl:OMEGA-GATE-ANCHOR/worktree-mode] [ctl:OMEGA-GATE-ANCHOR/untracked-in-folder].
 # An entry dropped from the list at HEAD is still read from the base ref and B
 # [ctl:OMEGA-GATE-ANCHOR/list-entry-dropped] [ctl:OMEGA-GATE-ANCHOR/list-deleted].
-# Not read: ignored files, changes the base ref made after B (they are the base's, not this head's
-# [ctl:OMEGA-GATE-ANCHOR/base-advanced]), and paths that no list names.
+# Not read: ignored files, changes the base ref made after B (they are the base's, not this head's),
+# and paths that no list names.
 # Exit 0: no anchor changed, or AIEN_GATE_ANCHOR_ACK (paths separated by white space) is exactly the
 # changed set [ctl:OMEGA-GATE-ANCHOR/ack-subset] [ctl:OMEGA-GATE-ANCHOR/ack-superset]
 # [ctl:OMEGA-GATE-ANCHOR/ack-without-change]. Exit 1: GATE-ANCHOR BLOCKED_OPERATOR (changed and not
