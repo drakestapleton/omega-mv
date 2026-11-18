@@ -1,0 +1,1533 @@
+note SPDX-License-Identifier: Apache-2.0
+note provenance-check: the native policy checks of tests/gates/pre-review.sh.
+note usage: provenance-check MODE [ARGUMENT...] < INPUT
+note exit 0 accepted, 1 refused (one diagnostic on stderr), 2 usage or I/O failure.
+note modes: line NEEDLE, contains NEEDLE, doc, block, identity URL RAWSIZE, raw URL, provider URL, ci, manifest.
+note Every buffer below is sized from a measured machine boundary: one argument is at most
+note 131071 bytes on Linux (32 pages), so a quote, needle or URL never exceeds that, a stored
+note document or projection line is 524288 bytes (a row cannot be longer than its quote plus a
+note fixed head), and a file name is at most 255 bytes (NAME_MAX). A longer row is refused
+note with a diagnostic; a longer free line (Unchecked or heading) is read to its end without
+note being stored.
+om2
+global chunk uchar 65536
+global line uchar 524288
+global aux uchar 524288
+global exp uchar 524288
+global argb uchar 131072
+global prev uchar 256
+global kmp ulong 131073
+note st: 0 line number, 1 in fence, 2 fences, 3 scope lines, 4 public rows, 5 local rows,
+note 6 copy rows, 7 provider rows, 8 replay rows, 9 external rows, 10 unchecked rows,
+note 11 write failed, 12 stored length, 13 total length, 14 control byte seen,
+note 15 mode (0 doc, 1 block, 2 provider, 3 ci, 4 manifest), 16 code lines in fence,
+note 17 argument length, 18 prev name length, 19 lfs entries, 20 plain entries,
+note 21 expected length, 22 ci checkout name seen, 23 emitted rows, 24 cursor
+global st ulong 32
+note ur: 0 owner start, 1 owner end, 2 repo start, 3 repo end, 4 commit start, 5 path start,
+note 6 url end, 8 hex start, 9 quote start
+global ur ulong 16
+
+text t_scope "Scope: input identities only. Evaluation status: NOT_RUN."
+text t_fence "```bash pre-review"
+text t_fence_end "```"
+text t_checked "Checked "
+text t_public "public "
+text t_local "local "
+text t_copy "Copy "
+text t_prov "Provider capture "
+text t_replay "Replay "
+text t_input "Input "
+text t_inputp "PREFLIGHT_INPUT_"
+text t_ext "External-control "
+text t_unch "Unchecked: "
+text t_sha " sha256 "
+text t_sep " :: "
+text t_eq " == "
+text t_curl " curl -fsS '"
+text t_ip "https://interplane.io/"
+text t_blob "blob/"
+text t_hf "https://huggingface.co/api/models/"
+text t_rev "/revision/"
+text t_blobs "?blobs=true"
+text t_schema "forge/blob/1"
+text t_tab "\t"
+text t_nl "\n"
+text t_slash "/"
+text t_sp " "
+text t_runpipe_line "run: |"
+text t_commit "\tcommit\t"
+text t_raw "/raw/"
+text t_k_pub "public\t"
+text t_k_loc "local\t"
+text t_k_cpy "copy\t"
+text t_k_prv "provider\t"
+text t_k_rep "replay\t"
+text t_k_inp "input\t"
+text t_k_ext "external\t"
+text t_k_unc "unchecked\t"
+text t_name "- name: "
+text t_checkout "Checkout Source"
+text t_run "run:"
+text t_rungate "run: tests/gates/run.sh "
+text t_runnopy "run: sh scripts/check-no-python.sh"
+text t_runfetch "run: cargo fetch --locked"
+text t_rundiff "run: git diff --exit-code"
+text t_args "  args: [\""
+text t_args_end "\"]"
+text t_m_prefix "provenance-check: "
+text t_m_line "line "
+text t_m_colon ": "
+text t_mode_line "line"
+text t_mode_contains "contains"
+text t_mode_doc "doc"
+text t_mode_block "block"
+text t_mode_identity "identity"
+text t_mode_raw "raw"
+text t_mode_provider "provider"
+text t_mode_ci "ci"
+text t_mode_manifest "manifest"
+
+text m_ctl "control character in a document line"
+text m_grammar "line is not in the evidence grammar"
+text m_long "row longer than the stored line limit"
+text m_url "expected a canonical immutable Interplane blob URL"
+text m_name "expected a flat evidence file name"
+text m_sha "expected sha256 followed by 64 lowercase hex digits"
+text m_quote "a checked row needs a nonempty quoted whole line after the double-colon separator"
+text m_copy "malformed copy row"
+text m_prov "malformed provider capture row"
+text m_time "provider capture time is not a valid UTC time in the past"
+text m_replay "malformed replay row"
+text m_inputv "malformed input row"
+text m_extrow "malformed external control row"
+text m_unch "unchecked row has no text"
+text m_fence "only the pre-review fence is allowed"
+text m_fence_open "unterminated pre-review fence"
+text m_scope "expected exactly one input-provenance scope line"
+text m_blocks "expected exactly one complete bash pre-review block with a command"
+text m_pub "no public source row"
+text m_provn "no provider capture row"
+text m_payload "expected replay rows or one external control row, not both and not neither"
+text m_ident "public blob identity mismatch"
+text m_idsize "raw size argument is not a decimal number"
+text m_pjson "provider projection is malformed"
+text m_pdup "provider siblings must be unique, flat and in ascending order"
+text m_pkind "provider archive needs one ordinary entry and one LFS entry"
+text m_purl "provider capture URL differs from the archive identity"
+text m_ci "unrecognised CI run step"
+text m_nci "no gate step found"
+
+note ---- output
+fn outv a view uchar * to void
+e = len a
+p = ulong 0
+while lt p e bound 9223372036854775807
+k = write 1 a p sub e p
+if le k 0
+put st 11 1
+ret
+end
+p = add p ulong k
+end
+end
+fn outl s ulong e ulong to void
+p = s
+while lt p e bound 9223372036854775807
+k = write 1 line p sub e p
+if le k 0
+put st 11 1
+ret
+end
+p = add p ulong k
+end
+end
+fn errv a view uchar * to void
+e = len a
+p = ulong 0
+while lt p e bound 9223372036854775807
+k = write 2 a p sub e p
+if le k 0
+ret
+end
+p = add p ulong k
+end
+end
+fn errn v ulong to void
+b = new uchar 24 0
+i = ulong 23
+n = v
+while true bound 20
+put b i uchar add rem n 10 48
+n = div n 10
+if eq n 0
+break
+end
+i = sub i 1
+end
+p = i
+while lt p 24 bound 24
+k = write 2 b p sub 24 p
+if le k 0
+ret
+end
+p = add p ulong k
+end
+end
+note refuse: one diagnostic with the current line number, then status 1
+fn refuse m view uchar * to int
+errv t_m_prefix
+n = get st 0
+if gt n 0
+errv t_m_line
+errn n
+errv t_m_colon
+end
+errv m
+errv t_nl
+ret 1
+end
+
+note ---- character classes
+fn is_digit c uchar to bool
+ret and ge c 48 le c 57
+end
+fn is_alpha c uchar to bool
+if and ge c 65 le c 90
+ret true
+end
+ret and ge c 97 le c 122
+end
+fn is_hex c uchar to bool
+if is_digit c
+ret true
+end
+ret and ge c 97 le c 102
+end
+fn owner_char c uchar to bool
+if is_digit c
+ret true
+end
+if is_alpha c
+ret true
+end
+if eq c 95
+ret true
+end
+ret eq c 45
+end
+fn name_char c uchar to bool
+if owner_char c
+ret true
+end
+ret eq c 46
+end
+
+note ---- scanning the stored line
+fn lit_at p ulong lit view uchar * to bool
+n = get st 12
+l = len lit
+if gt add p l n
+ret false
+end
+i = ulong 0
+while lt i l bound 9223372036854775807
+if ne get line add p i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+fn line_is lit view uchar * to bool
+if ne get st 12 len lit
+ret false
+end
+ret lit_at 0 lit
+end
+note tok_end: the first space at or after p, or the end of the line
+fn tok_end p ulong to ulong
+n = get st 12
+q = p
+while lt q n bound 9223372036854775807
+if eq get line q 32
+ret q
+end
+q = add q 1
+end
+ret n
+end
+fn tab_end p ulong to ulong
+n = get st 12
+q = p
+while lt q n bound 9223372036854775807
+if eq get line q 9
+ret q
+end
+q = add q 1
+end
+ret n
+end
+note hexrun: exactly cnt lowercase hex digits at s, inside the stored line
+fn hexrun s ulong cnt ulong to bool
+if gt add s cnt get st 12
+ret false
+end
+i = ulong 0
+while lt i cnt bound 9223372036854775807
+if not is_hex get line add s i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+note name_ok: a flat file name of 1..255 name characters that is neither . nor ..
+fn name_ok s ulong e ulong to bool
+if ge s e
+ret false
+end
+w = sub e s
+if gt w 255
+ret false
+end
+q = s
+while lt q e bound 255
+if not name_char get line q
+ret false
+end
+q = add q 1
+end
+if eq get line s 46
+if eq w 1
+ret false
+end
+if and eq w 2 eq get line add s 1 46
+ret false
+end
+end
+ret true
+end
+note path_ok: slash-separated flat names, none empty, none . or ..
+fn path_ok s ulong e ulong to bool
+a = s
+q = s
+while true bound 9223372036854775807
+if eq q e
+ret name_ok a q
+end
+if eq get line q 47
+if not name_ok a q
+ret false
+end
+a = add q 1
+end
+q = add q 1
+end
+ret false
+end
+note url_ok: the canonical immutable blob URL in line[s,e); the parts go to ur
+fn url_ok s ulong e ulong to bool
+if not lit_at s t_ip
+ret false
+end
+p = add s len t_ip
+q = p
+while lt q e bound 9223372036854775807
+if not owner_char get line q
+break
+end
+q = add q 1
+end
+if or le q p ge q e
+ret false
+end
+if ne get line q 47
+ret false
+end
+put ur 0 p
+put ur 1 q
+p = add q 1
+q = p
+while lt q e bound 9223372036854775807
+if not name_char get line q
+break
+end
+q = add q 1
+end
+if or le q p ge q e
+ret false
+end
+if ne get line q 47
+ret false
+end
+if not name_ok p q
+ret false
+end
+put ur 2 p
+put ur 3 q
+p = add q 1
+if not lit_at p t_blob
+ret false
+end
+p = add p len t_blob
+if not hexrun p 40
+ret false
+end
+put ur 4 p
+p = add p 40
+if ge p e
+ret false
+end
+if ne get line p 47
+ret false
+end
+p = add p 1
+if not path_ok p e
+ret false
+end
+put ur 5 p
+put ur 6 e
+ret true
+end
+fn digits s ulong e ulong to bool
+if ge s e
+ret false
+end
+q = s
+while lt q e bound 9223372036854775807
+if not is_digit get line q
+ret false
+end
+q = add q 1
+end
+ret true
+end
+note num: the value of the w decimal digits at s
+fn num s ulong w ulong to ulong
+v = ulong 0
+i = ulong 0
+while lt i w bound 9223372036854775807
+v = add mul v 10 ulong sub get line add s i 48
+i = add i 1
+end
+ret v
+end
+note sep_at: the byte at p is the separator c
+fn sep_at p ulong c uchar to bool
+ret eq get line p c
+end
+note ts_shape: YYYY-MM-DDTHH:MM:SSZ and nothing else, ending the stored line at s plus 20
+fn ts_shape s ulong to bool
+if ne get st 12 add s 20
+ret false
+end
+if not digits s add s 4
+ret false
+end
+if not digits add s 5 add s 7
+ret false
+end
+if not digits add s 8 add s 10
+ret false
+end
+if not digits add s 11 add s 13
+ret false
+end
+if not digits add s 14 add s 16
+ret false
+end
+if not digits add s 17 add s 19
+ret false
+end
+if not sep_at add s 4 45
+ret false
+end
+if not sep_at add s 7 45
+ret false
+end
+if not sep_at add s 10 84
+ret false
+end
+if not sep_at add s 13 58
+ret false
+end
+if not sep_at add s 16 58
+ret false
+end
+ret sep_at add s 19 90
+end
+note dim_of: days in month mo of year y, the Gregorian rule
+fn dim_of y ulong mo ulong to ulong
+if or eq mo 4 or eq mo 6 or eq mo 9 eq mo 11
+ret 30
+end
+if ne mo 2
+ret 31
+end
+if eq rem y 400 0
+ret 29
+end
+if eq rem y 100 0
+ret 28
+end
+if eq rem y 4 0
+ret 29
+end
+ret 28
+end
+note civil_days: days since 1970-01-01 of a valid date from 1970 on (Howard Hinnant)
+fn civil_days y ulong mo ulong d ulong to ulong
+yy = y
+mp = add mo 9
+if gt mo 2
+mp = sub mo 3
+else
+yy = sub y 1
+end
+era = div yy 400
+yoe = sub yy mul era 400
+doy = div add mul 153 mp 2 5
+doy = add doy sub d 1
+doe = mul yoe 365
+doe = add doe div yoe 4
+doe = sub doe div yoe 100
+doe = add doe doy
+days = mul era 146097
+ret sub add days doe 719468
+end
+note ts_ok: a real calendar time from 1970 that is not after the host clock
+fn ts_ok s ulong to bool
+if not ts_shape s
+ret false
+end
+y = num s 4
+mo = num add s 5 2
+d = num add s 8 2
+if lt y 1970
+ret false
+end
+if or lt mo 1 gt mo 12
+ret false
+end
+if or lt d 1 gt d dim_of y mo
+ret false
+end
+hh = num add s 11 2
+mi = num add s 14 2
+ss = num add s 17 2
+if or ge hh 24 or ge mi 60 ge ss 60
+ret false
+end
+secs = mul civil_days y mo d 86400
+secs = add secs mul hh 3600
+secs = add secs add mul mi 60 ss
+now = div ulong realns 1000000000
+ret le secs now
+end
+
+note ---- row handlers; each returns 0 accepted or 1 refused
+note tail: after the source token ending at e, expect sha256 HEX and the quoted line
+fn tail e ulong to int
+if not lit_at e t_sha
+ret refuse m_sha
+end
+h = add e len t_sha
+if not hexrun h 64
+ret refuse m_sha
+end
+p = add h 64
+if not lit_at p t_sep
+ret refuse m_quote
+end
+q = add p len t_sep
+if ge q get st 12
+ret refuse m_quote
+end
+put ur 8 h
+put ur 9 q
+ret 0
+end
+fn checked_row to int
+t = len t_checked
+n = get st 12
+if lit_at t t_public
+s = add t len t_public
+e = tok_end s
+if not url_ok s e
+ret refuse m_url
+end
+if ne tail e 0
+ret 1
+end
+outv t_k_pub
+outl s e
+outv t_tab
+h = get ur 8
+outl h add h 64
+outv t_tab
+outl get ur 9 n
+outv t_nl
+put st 4 add get st 4 1
+ret 0
+end
+if lit_at t t_local
+s = add t len t_local
+e = tok_end s
+if not name_ok s e
+ret refuse m_name
+end
+if ne tail e 0
+ret 1
+end
+outv t_k_loc
+outl s e
+outv t_tab
+h = get ur 8
+outl h add h 64
+outv t_tab
+outl get ur 9 n
+outv t_nl
+put st 5 add get st 5 1
+ret 0
+end
+ret refuse m_grammar
+end
+fn copy_row to int
+s = len t_copy
+e = tok_end s
+if not url_ok s e
+ret refuse m_url
+end
+if not lit_at e t_sha
+ret refuse m_sha
+end
+h = add e len t_sha
+if not hexrun h 64
+ret refuse m_sha
+end
+p = add h 64
+if not lit_at p t_eq
+ret refuse m_copy
+end
+f = add p len t_eq
+n = get st 12
+if not name_ok f n
+ret refuse m_name
+end
+outv t_k_cpy
+outl s e
+outv t_tab
+outl h add h 64
+outv t_tab
+outl f n
+outv t_nl
+put st 6 add get st 6 1
+ret 0
+end
+fn provider_row to int
+s = len t_prov
+e = tok_end s
+if not name_ok s e
+ret refuse m_name
+end
+p = add e 1
+if not lit_at e t_sp
+ret refuse m_prov
+end
+if not ts_ok_at p
+ret refuse m_time
+end
+if not lit_at add p 20 t_curl
+ret refuse m_prov
+end
+u = add add p 20 len t_curl
+n = get st 12
+if or ge u n ne get line sub n 1 39
+ret refuse m_prov
+end
+v = sub n 1
+if le v u
+ret refuse m_prov
+end
+q = u
+while lt q v bound 9223372036854775807
+c = get line q
+if or eq c 39 or eq c 32 lt c 33
+ret refuse m_prov
+end
+q = add q 1
+end
+outv t_k_prv
+outl s e
+outv t_tab
+outl p add p 20
+outv t_tab
+outl u v
+outv t_nl
+put st 7 add get st 7 1
+ret 0
+end
+fn ts_ok_at p ulong to bool
+note the timestamp must end where the curl text starts, not at the end of the line
+n = get st 12
+put st 12 add p 20
+ok = ts_ok p
+put st 12 n
+ret ok
+end
+fn replay_row to int
+s = len t_replay
+n = get st 12
+if not name_ok s n
+ret refuse m_replay
+end
+outv t_k_rep
+outl s n
+outv t_nl
+put st 8 add get st 8 1
+ret 0
+end
+fn input_row to int
+s = len t_input
+n = get st 12
+if not lit_at s t_inputp
+ret refuse m_inputv
+end
+q = add s len t_inputp
+if ge q n
+ret refuse m_inputv
+end
+p = q
+while lt p n bound 9223372036854775807
+c = get line p
+if not or is_digit c or and ge c 65 le c 90 eq c 95
+ret refuse m_inputv
+end
+p = add p 1
+end
+outv t_k_inp
+outl s n
+outv t_nl
+ret 0
+end
+fn external_row to int
+s = len t_ext
+e = tok_end s
+if not name_ok s e
+ret refuse m_name
+end
+if not lit_at e t_sha
+ret refuse m_sha
+end
+h = add e len t_sha
+if not hexrun h 64
+ret refuse m_sha
+end
+if ne add h 64 get st 12
+ret refuse m_extrow
+end
+outv t_k_ext
+outl s e
+outv t_tab
+outl h add h 64
+outv t_nl
+put st 9 add get st 9 1
+ret 0
+end
+fn unchecked_row to int
+s = len t_unch
+n = get st 12
+if ge s n
+ret refuse m_unch
+end
+outv t_k_unc
+outl s n
+outv t_nl
+put st 10 add get st 10 1
+ret 0
+end
+fn heading to bool
+p = ulong 0
+n = get st 12
+while lt p n bound 9223372036854775807
+if ne get line p 35
+break
+end
+p = add p 1
+end
+if or eq p 0 gt p 6
+ret false
+end
+if ge p n
+ret false
+end
+ret eq get line p 32
+end
+
+note ---- the document grammar: every line is one of a closed set of forms
+fn code_line to bool
+p = ulong 0
+n = get st 12
+while lt p n bound 9223372036854775807
+c = get line p
+if and ne c 32 ne c 9
+ret ne c 35
+end
+p = add p 1
+end
+ret false
+end
+fn doc_line to int
+n = get st 12
+mode = get st 15
+if eq get st 1 1
+if gt get st 13 n
+ret refuse m_long
+end
+if line_is t_fence_end
+put st 1 0
+ret 0
+end
+if code_line
+put st 16 add get st 16 1
+end
+if eq mode 1
+outl 0 n
+outv t_nl
+end
+ret 0
+end
+if eq mode 1
+if line_is t_fence
+put st 1 1
+put st 2 add get st 2 1
+end
+ret 0
+end
+loose = or lit_at 0 t_unch heading
+if gt get st 13 n
+if not loose
+ret refuse m_long
+end
+end
+if eq get st 14 1
+ret refuse m_ctl
+end
+if eq n 0
+ret 0
+end
+if line_is t_fence
+put st 1 1
+put st 2 add get st 2 1
+ret 0
+end
+if lit_at 0 t_fence_end
+ret refuse m_fence
+end
+if line_is t_scope
+put st 3 add get st 3 1
+ret 0
+end
+if heading
+ret 0
+end
+if lit_at 0 t_unch
+ret unchecked_row
+end
+if lit_at 0 t_checked
+ret checked_row
+end
+if lit_at 0 t_copy
+ret copy_row
+end
+if lit_at 0 t_prov
+ret provider_row
+end
+if lit_at 0 t_replay
+ret replay_row
+end
+if lit_at 0 t_input
+ret input_row
+end
+if lit_at 0 t_ext
+ret external_row
+end
+ret refuse m_grammar
+end
+fn doc_end to int
+put st 0 0
+mode = get st 15
+if eq get st 1 1
+ret refuse m_fence_open
+end
+if or ne get st 2 1 lt get st 16 1
+ret refuse m_blocks
+end
+if eq mode 1
+ret 0
+end
+if ne get st 3 1
+ret refuse m_scope
+end
+pub = add get st 4 get st 6
+if lt pub 1
+ret refuse m_pub
+end
+if lt get st 7 1
+ret refuse m_provn
+end
+rep = gt get st 8 0
+ext = gt get st 9 0
+if or and rep ext not or rep ext
+ret refuse m_payload
+end
+if gt get st 9 1
+ret refuse m_payload
+end
+ret 0
+end
+
+note ---- provider projection: id TAB sha, then one sorted line per sibling
+fn ap_lit lit view uchar * to void
+c = get st 24
+i = ulong 0
+l = len lit
+while lt i l bound 9223372036854775807
+put exp add c i get lit i
+i = add i 1
+end
+put st 24 add c l
+end
+fn ap_line s ulong e ulong to void
+c = get st 24
+i = s
+while lt i e bound 9223372036854775807
+put exp add c sub i s get line i
+i = add i 1
+end
+put st 24 add c sub e s
+end
+fn id_ok s ulong e ulong to bool
+q = s
+while lt q e bound 9223372036854775807
+if eq get line q 47
+break
+end
+q = add q 1
+end
+if ge q e
+ret false
+end
+if not name_ok s q
+ret false
+end
+ret name_ok add q 1 e
+end
+fn prev_less s ulong e ulong to bool
+note true when prev < line[s,e) bytewise
+pl = get st 18
+w = sub e s
+i = ulong 0
+while true bound 9223372036854775807
+if eq i pl
+ret lt i w
+end
+if eq i w
+ret false
+end
+a = get prev i
+b = get line add s i
+if ne a b
+ret lt a b
+end
+i = add i 1
+end
+ret false
+end
+fn prov_first to int
+e1 = tab_end 0
+if not id_ok 0 e1
+ret refuse m_pjson
+end
+p = add e1 1
+e2 = tab_end p
+if or ne e2 get st 12 not hexrun p 40
+ret refuse m_pjson
+end
+put st 24 0
+ap_lit t_hf
+ap_line 0 e1
+ap_lit t_rev
+ap_line p e2
+ap_lit t_blobs
+put st 21 get st 24
+ret 0
+end
+note prov_size: 1..18 decimal digits, no leading zero
+fn prov_size s ulong e ulong to bool
+if not digits s e
+ret false
+end
+if gt sub e s 18
+ret false
+end
+if gt sub e s 1
+ret ne get line s 48
+end
+ret true
+end
+note prov_same: line[s1,e1) and line[s2,e2) are the same bytes
+fn prov_same s1 ulong e1 ulong s2 ulong e2 ulong to bool
+w = sub e1 s1
+if ne w sub e2 s2
+ret false
+end
+j = ulong 0
+while lt j w bound 9223372036854775807
+if ne get line add s1 j get line add s2 j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+note prov_name: the name must be flat and strictly after the previous one; remember it
+fn prov_name e1 ulong to int
+if not name_ok 0 e1
+ret refuse m_pdup
+end
+if not prev_less 0 e1
+ret refuse m_pdup
+end
+i = ulong 0
+while lt i e1 bound 9223372036854775807
+put prev i get line i
+i = add i 1
+end
+put st 18 e1
+ret 0
+end
+fn prov_sibling to int
+e1 = tab_end 0
+if ne prov_name e1 0
+ret 1
+end
+e2 = tab_end add e1 1
+if not prov_size add e1 1 e2
+ret refuse m_pjson
+end
+e3 = tab_end add e2 1
+if ne sub e3 add e2 1 40
+ret refuse m_pjson
+end
+if not hexrun add e2 1 40
+ret refuse m_pjson
+end
+e4 = tab_end add e3 1
+e5 = tab_end add e4 1
+if ne e5 get st 12
+ret refuse m_pjson
+end
+if eq e4 add e3 1
+if ne e5 add e4 1
+ret refuse m_pjson
+end
+put st 20 add get st 20 1
+ret 0
+end
+if ne sub e4 add e3 1 64
+ret refuse m_pjson
+end
+if not hexrun add e3 1 64
+ret refuse m_pjson
+end
+if not prov_same add e4 1 e5 add e1 1 e2
+ret refuse m_pjson
+end
+put st 19 add get st 19 1
+ret 0
+end
+fn provider_line to int
+if eq get st 0 1
+ret prov_first
+end
+ret prov_sibling
+end
+fn provider_end to int
+put st 0 0
+if lt add get st 19 get st 20 1
+ret refuse m_pjson
+end
+if or eq get st 19 0 eq get st 20 0
+ret refuse m_pkind
+end
+al = get st 17
+if ne al get st 21
+ret refuse m_purl
+end
+i = ulong 0
+while lt i al bound 9223372036854775807
+if ne get exp i get argb i
+ret refuse m_purl
+end
+i = add i 1
+end
+ret 0
+end
+
+note ---- CI workflow and gate manifests
+fn ci_line to int
+n = get st 12
+p = ulong 0
+while lt p n bound 9223372036854775807
+if ne get line p 32
+break
+end
+p = add p 1
+end
+note the shifted view of the line starts at p: copy it down so the literals match at 0
+i = p
+while lt i n bound 9223372036854775807
+put line sub i p get line i
+i = add i 1
+end
+put st 12 sub n p
+if lit_at 0 t_name
+put st 22 0
+if eq get st 12 add len t_name len t_checkout
+if lit_at len t_name t_checkout
+put st 22 1
+end
+end
+ret 0
+end
+if not lit_at 0 t_run
+ret 0
+end
+if lit_at 0 t_rungate
+w = len t_rungate
+m = get st 12
+if ge w m
+ret refuse m_ci
+end
+q = w
+while lt q m bound 9223372036854775807
+c = get line q
+if not or and ge c 97 le c 122 eq c 45
+ret refuse m_ci
+end
+q = add q 1
+end
+outl w m
+outv t_nl
+put st 23 add get st 23 1
+ret 0
+end
+ret ci_other
+end
+note the run lines that are not gate steps: the exact CI commands this driver covers
+fn ci_other to int
+if or line_is t_runnopy line_is t_runfetch
+ret 0
+end
+if line_is t_rundiff
+ret 0
+end
+if and line_is t_runpipe_line eq get st 22 1
+ret 0
+end
+ret refuse m_ci
+end
+fn manifest_line to int
+n = get st 12
+if not lit_at 0 t_args
+ret 0
+end
+w = len t_args
+if lt n add add len t_args len t_args_end 1
+ret 0
+end
+if not lit_at sub n len t_args_end t_args_end
+ret 0
+end
+e = sub n len t_args_end
+if ge w e
+ret 0
+end
+q = w
+while lt q e bound 9223372036854775807
+c = get line q
+if not or and ge c 97 le c 122 eq c 45
+ret 0
+end
+q = add q 1
+end
+outl w e
+outv t_nl
+put st 23 add get st 23 1
+ret 0
+end
+
+note ---- the line stream: every mode reads stdin line by line
+fn dispatch to int
+mode = get st 15
+if le mode 1
+ret doc_line
+end
+if eq mode 2
+ret provider_line
+end
+if eq mode 3
+ret ci_line
+end
+ret manifest_line
+end
+fn scan to int
+put st 0 0
+put st 12 0
+put st 13 0
+put st 14 0
+while true bound 9223372036854775807
+got = read 0 chunk 0 len chunk
+if lt got 0
+ret 2
+end
+if eq got 0
+break
+end
+i = ulong 0
+cnt = ulong got
+while lt i cnt bound 65536
+c = get chunk i
+if eq c 10
+put st 0 add get st 0 1
+rc = dispatch
+if ne rc 0
+ret rc
+end
+put st 12 0
+put st 13 0
+put st 14 0
+else
+t = get st 13
+if lt t len line
+put line t c
+put st 12 add t 1
+end
+put st 13 add t 1
+if or lt c 32 eq c 127
+put st 14 1
+end
+end
+i = add i 1
+end
+end
+if gt get st 13 0
+put st 0 add get st 0 1
+rc = dispatch
+if ne rc 0
+ret rc
+end
+end
+mode = get st 15
+if le mode 1
+ret doc_end
+end
+if eq mode 2
+ret provider_end
+end
+if and eq mode 3 eq get st 23 0
+ret refuse m_nci
+end
+ret 0
+end
+
+note ---- line NEEDLE and contains NEEDLE (argument in argb, length st 17)
+fn mode_line to int
+w = get st 17
+matched = ulong 0
+same = true
+while true bound 9223372036854775807
+got = read 0 chunk 0 len chunk
+if lt got 0
+ret 2
+end
+if eq got 0
+if and same eq matched w
+ret 0
+end
+ret 1
+end
+i = ulong 0
+cnt = ulong got
+while lt i cnt bound 65536
+c = get chunk i
+if eq c 10
+if and same eq matched w
+ret 0
+end
+matched = 0
+same = true
+else
+if same
+if eq matched w
+same = false
+else
+if eq c get argb matched
+matched = add matched 1
+else
+same = false
+end
+end
+end
+end
+i = add i 1
+end
+end
+ret 2
+end
+fn mode_contains to int
+w = get st 17
+put kmp 0 0
+k = ulong 0
+i = ulong 1
+while lt i w bound 9223372036854775807
+while gt k 0 bound 9223372036854775807
+if eq get argb k get argb i
+break
+end
+k = get kmp sub k 1
+end
+if eq get argb k get argb i
+k = add k 1
+end
+put kmp i k
+i = add i 1
+end
+k = 0
+while true bound 9223372036854775807
+got = read 0 chunk 0 len chunk
+if lt got 0
+ret 2
+end
+if eq got 0
+ret 1
+end
+j = ulong 0
+cnt = ulong got
+while lt j cnt bound 65536
+c = get chunk j
+while gt k 0 bound 9223372036854775807
+if eq get argb k c
+break
+end
+k = get kmp sub k 1
+end
+if eq get argb k c
+k = add k 1
+end
+if eq k w
+ret 0
+end
+j = add j 1
+end
+end
+ret 2
+end
+
+note ---- identity URL RAWSIZE: the public JSON projection line must be exactly what the URL implies
+fn mode_identity to int
+n = argread 2 line 0 len line
+if le n 0
+ret 2
+end
+put st 12 ulong n
+if not url_ok 0 ulong n
+ret refuse m_url
+end
+sz = argread 3 argb 0 len argb
+if le sz 0
+ret 2
+end
+put st 17 ulong sz
+q = ulong 0
+while lt q ulong sz bound 9223372036854775807
+if not is_digit get argb q
+ret refuse m_idsize
+end
+q = add q 1
+end
+total = ulong 0
+while true bound 9223372036854775807
+got = read 0 aux total sub len aux total
+if lt got 0
+ret 2
+end
+if eq got 0
+break
+end
+total = add total ulong got
+if ge total len aux
+ret refuse m_ident
+end
+end
+if gt total 0
+if eq get aux sub total 1 10
+total = sub total 1
+end
+end
+put st 24 0
+ap_lit t_schema
+ap_lit t_tab
+ap_line get ur 0 get ur 1
+ap_lit t_tab
+ap_line get ur 2 get ur 3
+ap_lit t_tab
+c0 = get ur 4
+ap_line c0 add c0 40
+ap_lit t_tab
+ap_line c0 add c0 40
+ap_lit t_commit
+ap_line get ur 5 get ur 6
+ap_lit t_tab
+ap_lit t_slash
+ap_line get ur 0 get ur 1
+ap_lit t_slash
+ap_line get ur 2 get ur 3
+ap_lit t_raw
+ap_line c0 add c0 40
+ap_lit t_slash
+ap_line get ur 5 get ur 6
+ap_lit t_tab
+c = get st 24
+i = ulong 0
+while lt i ulong sz bound 9223372036854775807
+put exp add c i get argb i
+i = add i 1
+end
+el = add c ulong sz
+if ne el total
+ret refuse m_ident
+end
+i = 0
+while lt i total bound 9223372036854775807
+if ne get exp i get aux i
+ret refuse m_ident
+end
+i = add i 1
+end
+ret 0
+end
+
+note ---- raw URL: the raw-bytes route of a canonical blob URL
+fn mode_raw to int
+n = argread 2 line 0 len line
+if le n 0
+ret 2
+end
+put st 12 ulong n
+if not url_ok 0 ulong n
+ret refuse m_url
+end
+outv t_ip
+outl get ur 0 get ur 1
+outv t_slash
+outl get ur 2 get ur 3
+outv t_raw
+c0 = get ur 4
+outl c0 add c0 40
+outv t_slash
+outl get ur 5 get ur 6
+outv t_nl
+ret 0
+end
+
+note ---- main: the first argument picks the mode
+fn arg_is lit view uchar * k ulong to bool
+if ne len lit k
+ret false
+end
+i = ulong 0
+while lt i k bound 9223372036854775807
+if ne get argb i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+fn run to int
+if lt argcnt 2
+ret 2
+end
+k = argread 1 argb 0 len argb
+if le k 0
+ret 2
+end
+w = ulong k
+if arg_is t_mode_doc w
+put st 15 0
+ret scan
+end
+if arg_is t_mode_block w
+put st 15 1
+ret scan
+end
+if arg_is t_mode_ci w
+put st 15 3
+ret scan
+end
+if arg_is t_mode_manifest w
+put st 15 4
+ret scan
+end
+if arg_is t_mode_identity w
+if ne argcnt 4
+ret 2
+end
+ret mode_identity
+end
+if arg_is t_mode_raw w
+if ne argcnt 3
+ret 2
+end
+ret mode_raw
+end
+if arg_is t_mode_provider w
+if ne argcnt 3
+ret 2
+end
+n = argread 2 argb 0 len argb
+if le n 0
+ret 2
+end
+put st 17 ulong n
+put st 15 2
+ret scan
+end
+if ne argcnt 3
+ret 2
+end
+is_line = arg_is t_mode_line w
+is_contains = arg_is t_mode_contains w
+if not or is_line is_contains
+ret 2
+end
+n = argread 2 argb 0 len argb
+if le n 0
+ret 2
+end
+put st 17 ulong n
+if is_line
+ret mode_line
+end
+ret mode_contains
+end
+fn main to int
+rc = run
+if eq get st 11 1
+ret 2
+end
+ret rc
+end
