@@ -455,8 +455,10 @@ case "$step" in
       echo "spinlock $name: PASS"
     }
     spin_part asm spinlock-asm-check 'CK_SPINLOCK_ASM: PASS' 'CK_SPINLOCK_ASM_SELFTEST: PASS'
+    pc=native/kernel/proofs/controls/COUNT
+    pn=$(awk '$1 == "controls" { print $2 }' "$pc"); pu=$(awk '$1 == "unrestricted" { print $2 }' "$pc")
     spin_part proof ticketlock-proof 'CK_TICKETLOCK_PROOF: PASS' \
-      'CK_TICKETLOCK_PROOF_SELFTEST: PASS (12 controls, 5 also with the syntax rule off)'
+      "CK_TICKETLOCK_PROOF_SELFTEST: PASS ($pn controls, $pu also with the syntax rule off)"
     # Controls of the NOT_RUN paths: no lean, a lean other than the pinned one, no x86 compiler.
     mkdir -p "$TMP/nolean" "$TMP/oldlean"
     for t in dirname realpath sed; do ln -sf "$(command -v "$t")" "$TMP/nolean/$t"; done
