@@ -1,42 +1,142 @@
 #!/bin/sh
-# gate.sh: L232 QEMU gate for the Omega TCP stack (verification rig, not product code).
-# Usage: gate.sh OMC IMAGE BUSYBOX OUTDIR [PROFILES] [SCENARIOS]
+# gate.sh: L232 gates for the Omega TCP stack (verification rig, not product code).
+# Usage: gate.sh corpus OMC OUTDIR
+#        gate.sh OMC IMAGE BUSYBOX OUTDIR [PROFILES] [SCENARIOS]
 #   OMC      pinned seeded omc (sha256 checked against omega-mv's seed/out/omc.sha256)
 #   IMAGE    arm64 Linux Image for the guest (needs virtio-net, AF_PACKET)
 #   BUSYBOX  static aarch64 busybox (guest init, sha256sum, and the g2h payload)
 #   PROFILES default "clean loss reorder hostile"; SCENARIOS default "echo h2g g2h"
-# Each run boots a fresh guest whose only TCP/IP stack is tcpd (tcp.om + tcpd.om),
+# corpus: builds the hosted corpus (tcp.om + corpus.om), runs it on FUZZ seeded frames
+# (default 2000000, at least 1) and requires CORPUS_PASS with the fuzz count it was given
+# and at least as many checks as corpus.om has cck lines. Then the NOT_RUN controls: a
+# missing and a wrong compiler must each make this script exit 3. Then every mutant in
+# mutants.tsv (one edited line of tcp.om) is built with the corpus and run at fuzz 0,
+# so the exact-state cases alone must make each one fail. Last line, exit 0 only when
+# all of that holds:  TCP_CORPUS_GATE PASS checks=N mutants=M killed=M
+# The QEMU mode runs the corpus mode first, then boots a fresh guest per run whose only
+# TCP/IP stack is tcpd (tcp.om + tcpd.om),
 # routes its NIC through link.om (seeded drop / reorder / duplicate / hostile
 # injection) to QEMU slirp, and talks to peer.om on the host. Exit 0 only when
 # every run passes every check. Requires qemu-system-aarch64 with KVM.
+# Exit 3 (NOT_RUN, never a pass) when the gate cannot run: missing pin, missing or
+# wrong compiler, missing QEMU, KVM, IMAGE or BUSYBOX. Exit 2: a unit did not build
+# with the pinned compiler. Exit 1: a check failed.
 set -u
-OMC=$1 IMAGE=$2 BUSYBOX=$3 OUT=$4
-PROFILES=${5:-clean loss reorder hostile}
-SCEN=${6:-echo h2g g2h}
 HERE=$(cd "$(dirname "$0")" && pwd)
 # The compiler pin is omega-mv's own (kernel/ is folded into omega-mv): seed/out/omc.sha256 at its root.
 PINFILE=$HERE/../../../../seed/out/omc.sha256
-PIN=$(cut -c1-64 "$PINFILE" 2>/dev/null)
-printf '%s\n' "$PIN" | grep -qxE '[0-9a-f]{64}' || { echo "GATE_FAIL no sha256 in $PINFILE"; exit 2; }
+notrun() { echo "$1 NOT_RUN $2"; exit 3; }
+# pincheck TAG OMC: the compiler must exist and carry the pinned sha256, else NOT_RUN.
+pincheck() {
+  PIN=$(cut -c1-64 "$PINFILE" 2>/dev/null)
+  printf '%s\n' "$PIN" | grep -qxE '[0-9a-f]{64}' || notrun "$1" "no sha256 in $PINFILE"
+  [ -f "$2" ] && [ -x "$2" ] || notrun "$1" "no executable compiler at $2"
+  have=$(sha256sum "$2" | cut -d' ' -f1)
+  [ "$have" = "$PIN" ] || notrun "$1" "omc sha256 $have is not the pin $PIN"
+}
+# control NAME WANT_RC CMD...: run a negative control; it must exit WANT_RC and print NOT_RUN.
+control() {
+  cn=$1 cw=$2; shift 2
+  "$@" > "$OUT/control-$cn.log" 2>&1; cr=$?
+  if [ $cr -eq "$cw" ] && grep -q 'NOT_RUN' "$OUT/control-$cn.log"; then
+    echo "CONTROL $cn rc=$cr PASS"; ctl_ok=$((ctl_ok + 1))
+  else
+    echo "CONTROL $cn rc=$cr FAIL (wanted rc=$cw and NOT_RUN)"; ctl_bad=$((ctl_bad + 1))
+  fi
+}
+corpus_gate() {
+  T=TCP_CORPUS_GATE
+  [ $# -eq 2 ] || { echo "usage: gate.sh corpus OMC OUTDIR" >&2; exit 2; }
+  OMC=$1 OUT=$2
+  pincheck $T "$OMC"
+  OMC=$(cd "$(dirname "$OMC")" && pwd)/$(basename "$OMC")
+  mkdir -p "$OUT" || notrun $T "cannot create $OUT"
+  OUT=$(cd "$OUT" && pwd)
+  FUZZ=${FUZZ:-2000000}
+  case $FUZZ in
+    ''|*[!0-9]*|0*) echo "$T FAIL FUZZ=$FUZZ is not a positive count"; exit 1 ;;
+  esac
+  cat "$HERE/tcp.om" "$HERE/corpus.om" | "$OMC" > "$OUT/corpus" || { echo "$T FAIL build corpus"; exit 2; }
+  chmod +x "$OUT/corpus"
+  sha256sum "$OMC" "$HERE/tcp.om" "$HERE/corpus.om" "$HERE/mutants.tsv" "$OUT/corpus" > "$OUT/inputs.sha256"
+  fail=""
+  "$OUT/corpus" "$FUZZ" > "$OUT/corpus.log" 2>&1
+  rc=$?
+  line=$(grep -a '^CORPUS_PASS ' "$OUT/corpus.log" | head -1)
+  checks=$(printf '%s\n' "$line" | sed -n 's/^CORPUS_PASS checks=\([0-9][0-9]*\) fuzz=\([0-9][0-9]*\) .*/\1/p')
+  fuzzed=$(printf '%s\n' "$line" | sed -n 's/^CORPUS_PASS checks=\([0-9][0-9]*\) fuzz=\([0-9][0-9]*\) .*/\2/p')
+  # The floor comes from the corpus itself: every cck line runs at least once.
+  sites=$(grep -c '^cck ' "$HERE/corpus.om")
+  [ "$rc" -eq 0 ] || fail="$fail corpus_rc=$rc"
+  [ -n "$checks" ] || { checks=0; fail="$fail no_CORPUS_PASS"; }
+  [ "$sites" -gt 0 ] || fail="$fail no_cck_lines"
+  [ "$checks" -ge "$sites" ] && [ "$checks" -gt 0 ] || fail="$fail checks=$checks<cck_lines=$sites"
+  [ "${fuzzed:-x}" = "$FUZZ" ] || fail="$fail fuzz=${fuzzed:-none}!=$FUZZ"
+  echo "CORPUS rc=$rc cck_lines=$sites $line"
+  # Negative controls (exit 3, NOT_RUN): a missing compiler, then one whose sha256 differs.
+  ctl_ok=0 ctl_bad=0
+  control no-compiler 3 sh "$HERE/gate.sh" corpus "$OUT/no-such-omc" "$OUT/ctl"
+  cat "$OMC" > "$OUT/omc-wrong" && printf '\n' >> "$OUT/omc-wrong" && chmod +x "$OUT/omc-wrong"
+  control wrong-compiler 3 sh "$HERE/gate.sh" corpus "$OUT/omc-wrong" "$OUT/ctl"
+  control wrong-compiler-qemu 3 sh "$HERE/gate.sh" "$OUT/omc-wrong" "$OUT/no-image" "$OUT/no-busybox" "$OUT/ctl"
+  [ $ctl_bad -eq 0 ] && [ $ctl_ok -eq 3 ] || fail="$fail controls=$ctl_ok/3"
+  # Mutants: each is one line of tcp.om replaced; the corpus must fail on every one.
+  M=0 K=0
+  tab=$(printf '\t')
+  while IFS=$tab read -r name fn occ old new; do
+    case $name in ''|'#'*) continue ;; esac
+    M=$((M + 1))
+    D=$OUT/mutant-$name; rm -rf "$D"; mkdir -p "$D"
+    awk -v F="$fn" -v N="$occ" -v O="$old" -v R="$new" '
+      $1 == "fn" { infn = ($2 == F) }
+      infn && !done && $0 == O { seen++; if (seen == N) { print R; done = 1; next } }
+      { print }
+      END { exit done ? 0 : 7 }' "$HERE/tcp.om" > "$D/tcp.om"
+    if [ $? -ne 0 ] || cmp -s "$HERE/tcp.om" "$D/tcp.om"; then
+      echo "MUTANT $name NOT_APPLIED (line not found in fn $fn)"; continue
+    fi
+    if ! cat "$D/tcp.om" "$HERE/corpus.om" | "$OMC" > "$D/corpus" 2> "$D/build.log"; then
+      echo "MUTANT $name NOT_BUILT $(head -1 "$D/build.log")"; continue
+    fi
+    chmod +x "$D/corpus"
+    "$D/corpus" 0 > "$D/corpus.log" 2>&1
+    mrc=$?
+    if [ $mrc -ne 0 ] && ! grep -aq '^CORPUS_PASS' "$D/corpus.log"; then
+      K=$((K + 1)); echo "MUTANT $name KILLED rc=$mrc $(grep -a '^CORPUS_FAIL' "$D/corpus.log" | head -1)"
+    else
+      echo "MUTANT $name SURVIVED rc=$mrc"
+    fi
+  done < "$HERE/mutants.tsv"
+  [ $M -gt 0 ] || fail="$fail no_mutants"
+  [ $K -eq $M ] || fail="$fail survived_or_unapplied=$((M - K))"
+  if [ -z "$fail" ]; then echo "$T PASS checks=$checks mutants=$M killed=$K"; exit 0; fi
+  echo "$T FAIL checks=$checks mutants=$M killed=$K$fail"; exit 1
+}
+if [ "${1:-}" = corpus ]; then shift; corpus_gate "$@"; fi
+[ $# -ge 4 ] || { echo "usage: gate.sh corpus OMC OUTDIR | gate.sh OMC IMAGE BUSYBOX OUTDIR [PROFILES] [SCENARIOS]" >&2; exit 2; }
+OMC=$1 IMAGE=$2 BUSYBOX=$3 OUT=$4
+PROFILES=${5:-clean loss reorder hostile}
+SCEN=${6:-echo h2g g2h}
+pincheck GATE "$OMC"
+[ -r "$IMAGE" ] || notrun GATE "no guest image at $IMAGE"
+[ -r "$BUSYBOX" ] || notrun GATE "no busybox at $BUSYBOX"
+command -v qemu-system-aarch64 > /dev/null || notrun GATE "no qemu-system-aarch64"
+[ -r /dev/kvm ] && [ -w /dev/kvm ] || notrun GATE "no access to /dev/kvm"
 mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd)
-have=$(sha256sum "$OMC" | cut -d' ' -f1)
-if [ "$have" != "$PIN" ]; then echo "GATE_FAIL omc sha256 $have is not the pin $PIN"; exit 2; fi
 B=$OUT/bin; mkdir -p "$B"
 cat "$HERE/tcp.om" "$HERE/tcpd.om" | "$OMC" > "$B/tcpd" || { echo "GATE_FAIL build tcpd"; exit 2; }
 "$OMC" < "$HERE/link.om" > "$B/link" || { echo "GATE_FAIL build link"; exit 2; }
 "$OMC" < "$HERE/peer.om" > "$B/peer" || { echo "GATE_FAIL build peer"; exit 2; }
-cat "$HERE/tcp.om" "$HERE/corpus.om" | "$OMC" > "$B/corpus" || { echo "GATE_FAIL build corpus"; exit 2; }
-chmod +x "$B/tcpd" "$B/link" "$B/peer" "$B/corpus"
-sha256sum "$OMC" "$IMAGE" "$BUSYBOX" "$B/tcpd" "$B/link" "$B/peer" "$B/corpus" > "$OUT/inputs.sha256"
-# Hosted hostile corpus first: exact-state cases plus FUZZ seeded mutated frames.
-FUZZ=${FUZZ:-2000000}
-"$B/corpus" "$FUZZ" > "$OUT/corpus.log" 2>&1
+chmod +x "$B/tcpd" "$B/link" "$B/peer"
+sha256sum "$OMC" "$IMAGE" "$BUSYBOX" "$B/tcpd" "$B/link" "$B/peer" > "$OUT/inputs.sha256"
+# Hosted hostile corpus first, with its mutants and controls (the corpus mode above).
+sh "$HERE/gate.sh" corpus "$OMC" "$OUT/corpus" > "$OUT/corpus.log" 2>&1
 CS=$?
-if [ $CS -ne 0 ] || ! grep -q '^CORPUS_PASS' "$OUT/corpus.log"; then
-  echo "CORPUS_FAIL rc=$CS $(head -3 "$OUT/corpus.log" | tr '\n' ' ')"; corpus_ok=0
+if [ $CS -ne 0 ] || ! grep -q '^TCP_CORPUS_GATE PASS' "$OUT/corpus.log"; then
+  echo "CORPUS_FAIL rc=$CS $(tail -1 "$OUT/corpus.log")"; corpus_ok=0
 else
-  echo "CORPUS_OK $(grep '^CORPUS_PASS' "$OUT/corpus.log")"; corpus_ok=1
+  echo "CORPUS_OK $(grep '^TCP_CORPUS_GATE PASS' "$OUT/corpus.log")"; corpus_ok=1
 fi
 qemu-system-aarch64 --version | head -1 >> "$OUT/inputs.sha256"
 # Payloads: a fixed pseudo-random file (derived from the busybox bytes, so it is
