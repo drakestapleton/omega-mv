@@ -18,4 +18,6 @@ HASHES
 )
 ```
 
-Pass `"$cases"` as the ROUND40 argument of `view-accept` or `release-accept fake`. A fake server answers only the recorded prompts. A new prompt after restart remains unrecorded.
+Pass `"$cases"` as the ROUND40 argument of `view-accept` or `release-accept fake`. A fake server answers only the recorded prompts.
+
+The separate `restart.map` supplies the two additional turns after a restart. The prompt and reply bytes were identical in the archived live Spark crash runs `20261107T085509Z/r/run/crash/run2.out` and `r2/run/crash/run2.out`. The first transcript SHA-256 is `3e4f347e8b06388499784420cf9f5364c4bbc35cb5c1756d916dfbfa2ec0996e`. The release driver uses these turns only for recorded restart and journal compatibility tests.

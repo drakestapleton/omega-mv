@@ -2103,11 +2103,11 @@ ROUND40 every other scenario fails fixture preparation. The driver prints
 not_run=N mode=MODE`; a node output it needs that is missing, unreadable or
 over capacity fails the next check, naming it.
 
-A resumed objective reads the file it edited before the restart, a prompt no
-recording holds: in fake mode the three checks that need it
-(`restart-resumed-completes`, `journal-forward-completes`,
-`journal-rollback-completes`) are NOT_RUN, naming the prompt; any other end
-fails them. Live mode answers it and requires PASS. The driver exits 0 only
+A resumed objective reads the file it edited before the restart. The four-case
+fixture includes two recorded Spark model turns for that continuation in
+`restart.map`. The restart, journal-forward and journal-rollback completion
+checks exercise them. With a fixture lacking those turns, an unrecorded prompt
+is reported as NOT_RUN. Live mode requires the model to complete the task. The driver exits 0 only
 when every check passed, 3 when none failed but some were NOT_RUN, 1 when
 one failed.
 
