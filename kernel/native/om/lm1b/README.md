@@ -123,7 +123,7 @@ layers, width 2048, 32 heads, 8 key/value heads, feed-forward 8192, vocabulary 1
 | `manifest.txt` | the pinned model manifest |
 | `oracle/manifest-dump/` | small Rust tool that prints the manifest with the reference parser |
 | `prompts/` | the two prompts as token ids and the three-job request file |
-| `gate.sh` | reruns everything from a clean checkout and prints `RC=0` |
+| `gate.sh` | reruns everything from a clean checkout and prints `RC=0`; `NOT_RUN` and `RC=3` (exit 3) when the compiler pin is not 64 hex digits or the compiler or model file is missing |
 | `evidence/` | raw logs of the runs quoted here |
 
 Run: `sh gen.sh && omc < lm1b.om > lm1b && chmod +x lm1b && ./lm1b 3< MODEL < prompts/main-jobs.txt`.

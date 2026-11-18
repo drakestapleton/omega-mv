@@ -19,11 +19,19 @@
     the smaller lemmas these use.)
   * the interrupt ordering of core/spinlock.h in a one-CPU model checked by `decide` over the concrete
     lock programs (lockUnlock_safe, nested_safe, lockUnlock_restores), and each TEST-ONLY mutant of the
-    header unsafe (ticketBeforeMask_unsafe, restoreBeforeRelease_unsafe, noMask_unsafe).
-  Not modelled: memory ordering (acquire/release) and several CPUs running at once; the operations are
-  taken as atomic steps. The link to the C is by construction, not extraction: each Op and each Reach2
-  rule names its statement in core/spinlock.h; tests/test_spinlock.c runs the same three mutants (make
-  spinlock-mutant) and tools/ck_spinlock_asm_check.sh checks the compiled order (make spinlock-asm-check).
+    header unsafe (ticketBeforeMask_unsafe, restoreBeforeRelease_unsafe, noMask_unsafe);
+  * the same on two CPUs under every interleaving, with an interrupt transition whose handler takes the
+    same lock, for both forms of the header: the explicit pair and ck_spin_lock / ck_spin_unlock, which
+    keep the saved state in the lock (l->irq) and so must write it after entry and read it before the
+    release (slot_safe, pair_safe, slot_pair_safe; the five mutants *_unsafe fail, see the last section).
+  Not modelled: memory ordering (acquire/release; each operation is one atomic step), more than two CPUs,
+  more than one interrupt per CPU, trylock outside the queue invariant. The link to the C is by
+  construction, not extraction: each Op, SOp and Reach2 rule names its statement in core/spinlock.h, so
+  these theorems are about the listed operation orders, not about spinlock.h as compiled. What ties them
+  to the C: tests/test_spinlock.c runs the same mutants on the host (make spinlock-mutant), and
+  tools/ck_spinlock_asm_check.sh checks the compiled order of both forms and of every lock site in
+  core/pipe.c (make spinlock-asm-check). proofs/check.sh (make ticketlock-proof) refuses this file
+  unless every constant in it uses only propext, Classical.choice and Quot.sound.
   No Mathlib; core Lean 4 only.
 -/
 
@@ -238,3 +246,129 @@ theorem reach_mutual_exclusion (M : Nat) {q : Q2} (h : Reach2 q) (hM : q.ticket 
 theorem reach_nodup {q : Q2} (h : Reach2 q) : q.out.Nodup := by
   rw [(outstanding_eq_range h).2]
   exact List.nodup_range'
+
+/-! ## Two CPUs, interrupts, and the saved state kept in the lock (ck_spin_lock / ck_spin_unlock)
+
+  core/pipe.c takes its pool lock with ck_spin_lock / ck_spin_unlock, which keep the saved interrupt state
+  in the lock (l->irq) instead of in the caller. That adds a rule the one-CPU model above cannot see: only
+  the holder may touch l->irq, so ck_spin_lock writes it after it entered (after the wait) and
+  ck_spin_unlock reads it before the releasing store. Here two CPUs each run a lock program on one lock
+  under every interleaving. Each CPU may also take one interrupt at any point where its interrupts are
+  open; the handler takes and releases the same lock with ck_spin_lock / ck_spin_unlock (so it writes
+  l->irq too). If that CPU has a ticket outstanding the handler spins behind its own CPU and never
+  returns: the run is stuck. A handler that finds the lock held by the other CPU waits for it, which is
+  the same as taking the interrupt after that release, so it is modelled as taken when the lock is free.
+  `runs2` checks, for the four initial mask states and every schedule:
+  * nothing gets stuck: no interrupt lands on a CPU with a ticket outstanding, and some CPU can always
+    step until both programs are done;
+  * mutual exclusion: the two CPUs are never inside at once;
+  * each CPU ends with the mask state it started with (a pre-masked caller stays masked).
+  slot_safe, pair_safe and slot_pair_safe: the header's two forms, alone and mixed, pass. Each ordering
+  the rule forbids fails: l->irq written before the wait (slotWriteBeforeEntry_unsafe) or read after the
+  release (slotReadAfterRelease_unsafe), the TEST-ONLY mutants of the same names in core/spinlock.h; so
+  do the three mutants of the explicit pair (pairTicketBeforeMask_unsafe, pairRestoreBeforeRelease_unsafe,
+  pairNoMask_unsafe). Not modelled: memory ordering (each op is one atomic step), more than two CPUs or
+  one interrupt per CPU, trylock (covered only by the queue invariant above). -/
+
+inductive SOp
+  | save     -- ck_irq_save: reg := the current mask state, then mask
+  | take     -- fetch-add on ticket: me := ticket
+  | wait     -- spin until serving = me (cannot step before that)
+  | stash    -- ck_spin_lock: l->irq := reg
+  | load     -- ck_spin_unlock: reg := l->irq
+  | release  -- store serving + 1
+  | restore  -- ck_irq_restore(reg)
+  deriving DecidableEq
+
+structure Cpu where
+  prog : List SOp   -- left to run
+  init : Bool       -- mask state at the start
+  masked : Bool
+  reg : Bool        -- the saved state the CPU holds in a register
+  me : Nat          -- its ticket
+  holding : Bool    -- has a ticket outstanding (queued or inside)
+  inside : Bool     -- passed the wait, not yet released
+  irqs : Nat        -- interrupts it may still take
+  deriving DecidableEq
+
+/-- The lock: ticket, serving, and l->irq. -/
+structure W where
+  ticket : Nat
+  serving : Nat
+  slot : Bool
+  deriving DecidableEq
+
+/-- The next op of a CPU; `none` when it has nothing left or waits. -/
+def Cpu.next (c : Cpu) (w : W) : Option (Cpu × W) :=
+  match c.prog with
+  | [] => none
+  | o :: p =>
+    let c := { c with prog := p }
+    match o with
+    | .save => some ({ c with reg := c.masked, masked := true }, w)
+    | .take => some ({ c with me := w.ticket, holding := true }, { w with ticket := w.ticket + 1 })
+    | .wait => if w.serving = c.me then some ({ c with inside := true }, w) else none
+    | .stash => some (c, { w with slot := c.reg })
+    | .load => some ({ c with reg := w.slot }, w)
+    | .release => some ({ c with holding := false, inside := false }, { w with serving := w.serving + 1 })
+    | .restore => some ({ c with masked := c.reg }, w)
+
+/-- An interrupt on `c`: `none` when it cannot be taken now (masked, none left, or the lock is busy and the
+    handler would first wait for the other CPU); `some none` when it is stuck (this CPU has a ticket
+    outstanding); otherwise the state after the handler ran ck_spin_lock / ck_spin_unlock: it saved
+    "open", wrote that to l->irq, released, and restored "open". -/
+def Cpu.irq (c : Cpu) (w : W) : Option (Option (Cpu × W)) :=
+  if c.masked || c.irqs == 0 then none
+  else if c.holding then some none
+  else if w.ticket ≠ w.serving then none
+  else some (some ({ c with irqs := c.irqs - 1 }, ⟨w.ticket + 1, w.serving + 1, false⟩))
+
+/-- Every schedule from this state is fine (see above); `f` bounds the steps left. -/
+def runs2 : Nat → Cpu → Cpu → W → Bool
+  | 0, _, _, _ => false
+  | f + 1, a, b, w =>
+    if a.inside && b.inside then false
+    else if a.prog.isEmpty && b.prog.isEmpty && a.holding == false && b.holding == false then
+      a.masked == a.init && b.masked == b.init
+    else
+      let sa : List (Option (Cpu × Cpu × W)) := match a.next w with
+        | some (a', w') => [some (a', b, w')] | none => []
+      let sb : List (Option (Cpu × Cpu × W)) := match b.next w with
+        | some (b', w') => [some (a, b', w')] | none => []
+      let ia : List (Option (Cpu × Cpu × W)) := match a.irq w with
+        | none => [] | some none => [none] | some (some (a', w')) => [some (a', b, w')]
+      let ib : List (Option (Cpu × Cpu × W)) := match b.irq w with
+        | none => [] | some none => [none] | some (some (b', w')) => [some (a, b', w')]
+      let succ := sa ++ sb ++ ia ++ ib
+      !succ.isEmpty && succ.all fun
+        | none => false
+        | some (a', b', w') => runs2 f a' b' w'
+
+def cpu (p : List SOp) (b : Bool) : Cpu := ⟨p, b, b, false, 0, false, false, 1⟩
+
+/-- Both CPUs run `p` and `q` from every initial mask state, one interrupt each. -/
+def safe2 (p q : List SOp) : Bool :=
+  [false, true].all fun b0 => [false, true].all fun b1 =>
+    runs2 (p.length + q.length + 3) (cpu p b0) (cpu q b1) ⟨0, 0, false⟩
+
+/-- ck_spin_lock then ck_spin_unlock (core/spinlock.h, the form core/pipe.c uses). -/
+def slotLU : List SOp := [.save, .take, .wait, .stash, .load, .release, .restore]
+/-- ck_spin_lock_irqsave then ck_spin_unlock_irqrestore (the saved state stays in the caller). -/
+def pairLU : List SOp := [.save, .take, .wait, .release, .restore]
+/-- Mutant CK_SPIN_TEST_SLOT_WRITE_BEFORE_ENTRY: l->irq written before the wait. -/
+def slotWriteBeforeEntry : List SOp := [.save, .stash, .take, .wait, .load, .release, .restore]
+/-- Mutant CK_SPIN_TEST_SLOT_READ_AFTER_RELEASE: l->irq read after the release. -/
+def slotReadAfterRelease : List SOp := [.save, .take, .wait, .stash, .release, .load, .restore]
+def pairTicketBeforeMask : List SOp := [.take, .save, .wait, .release, .restore]
+def pairRestoreBeforeRelease : List SOp := [.save, .take, .wait, .restore, .release]
+def pairNoMask : List SOp := [.take, .wait, .release]
+
+theorem slot_safe : safe2 slotLU slotLU = true := by decide
+theorem pair_safe : safe2 pairLU pairLU = true := by decide
+theorem slot_pair_safe : safe2 slotLU pairLU = true := by decide
+theorem slotWriteBeforeEntry_unsafe : safe2 slotWriteBeforeEntry slotWriteBeforeEntry = false := by decide
+theorem slotReadAfterRelease_unsafe : safe2 slotReadAfterRelease slotReadAfterRelease = false := by decide
+theorem pairTicketBeforeMask_unsafe : safe2 pairTicketBeforeMask pairTicketBeforeMask = false := by decide
+theorem pairRestoreBeforeRelease_unsafe : safe2 pairRestoreBeforeRelease pairRestoreBeforeRelease = false := by
+  decide
+theorem pairNoMask_unsafe : safe2 pairNoMask pairNoMask = false := by decide

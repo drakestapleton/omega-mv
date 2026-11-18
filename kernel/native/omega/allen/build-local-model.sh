@@ -8,7 +8,9 @@ train=$1/native/omegallm
 out=$2
 compiler=${OMEGA_COMPILER:-"$here/../../../../seed/out/omc"}
 # Pin: omega-mv's own seed/out/omc.sha256 (kernel/ is folded into omega-mv, Drake 2026-11-17); before, omc 3ad9f10f.
-pin=$(cut -c1-64 "$here/../../../../seed/out/omc.sha256")
+pin=$(head -n 1 "$here/../../../../seed/out/omc.sha256" 2>/dev/null | cut -c1-64)
+printf '%s\n' "$pin" | grep -qxE '[0-9a-f]{64}' || { echo "compiler pin refused: no sha256 in omega-mv seed/out/omc.sha256" >&2; exit 65; }
+[ -f "$compiler" ] || { echo "compiler pin refused: no compiler at $compiler" >&2; exit 65; }
 [ "$(sha256sum "$compiler" | cut -d' ' -f1)" = "$pin" ] || { echo 'compiler pin mismatch' >&2; exit 65; }
 [ ! -e "$out" ] || { echo 'fresh output required' >&2; exit 73; }
 mkdir -p "$(dirname "$out")"

@@ -5,7 +5,9 @@ set -eu
 cd "$(dirname "$0")/../../.."
 : "${AIEN_OMC:?set AIEN_OMC to omega-mv's pinned seeded compiler (seed/out/omc)}"
 # The pin is omega-mv's own (kernel/ is folded into omega-mv): seed/out/omc.sha256 at its root.
-want=$(cut -c1-64 ../seed/out/omc.sha256)
+want=$(head -n 1 ../seed/out/omc.sha256 2>/dev/null | cut -c1-64)
+printf '%s\n' "$want" | grep -qxE '[0-9a-f]{64}' || { echo 'compiler pin refused: no sha256 in ../seed/out/omc.sha256' >&2; exit 2; }
+[ -f "$AIEN_OMC" ] || { echo "compiler pin refused: no compiler at $AIEN_OMC" >&2; exit 2; }
 actual=$(sha256sum "$AIEN_OMC")
 [ "${actual%% *}" = "$want" ] || { echo 'compiler pin mismatch' >&2; exit 2; }
 out=${OMEGA_NVME_EVIDENCE:-$(mktemp -d /tmp/omega-nvme-evidence-XXXXXX)}

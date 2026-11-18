@@ -10,7 +10,9 @@ compiler=${OMEGA_COMPILER:-"$root/../seed/out/omc"}
 }
 # Pin: omega-mv's own seed/out/omc, whose sha256 is in seed/out/omc.sha256 at the omega-mv root (kernel/ is folded
 # into omega-mv, Drake 2026-11-17). Until then this was omega-mv b8bd1d03 (omc 2eeab514, branch fix/imac-net-L974-snp).
-[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = "$(cut -c1-64 "$root/../seed/out/omc.sha256")" ] || {
+pin=$(head -n 1 "$root/../seed/out/omc.sha256" 2>/dev/null | cut -c1-64)
+printf '%s\n' "$pin" | grep -qxE '[0-9a-f]{64}' || { echo "compiler pin refused: no sha256 in $root/../seed/out/omc.sha256" >&2; exit 65; }
+[ "$(sha256sum "$compiler" | cut -d' ' -f1)" = "$pin" ] || {
  echo 'compiler digest differs from the qualified pin' >&2
  exit 65
 }
