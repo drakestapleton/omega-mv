@@ -257,7 +257,11 @@ ret xor h xor get Tsip 2 get Tsip 3
 end
 note Values an observer must not predict (tcpd's ephemeral port): SipHash of a
 note counter (one byte 1 after it), so without the key past values tell nothing.
+note Without an installed key it refuses: trap 8 (exit 108), never a zero key.
 fn trnd to ulong
+if eq get Tkey 2 0
+trap 8
+end
 c = get Tkey 3
 put Tkey 3 add c 1
 ret tsip c 1 9
@@ -547,6 +551,8 @@ b = or get Tcb kLP shl get Tcb kRP 16
 f = and tsip a b 12 4294967295
 i = and add mul get Tcf 0 250 f 4294967295
 put Tcb kISS i
+note RFC 6582 3.2 step 1: recover starts at the ISS (kREC is recover + 1).
+put Tcb kREC sadd i 1
 put Tcb kUNA i
 put Tcb kNXT sadd i 1
 put Tcb kMAX sadd i 1
@@ -737,9 +743,14 @@ if sle get Tcb kREC ack
 put Tcb kFRX 0
 put Tcb kCWN get Tcb kSST
 else
+note Partial ACK (RFC 6582 3.2 step 5): retransmit the next hole, deflate cwnd by the
+note newly acknowledged bytes, and add one SMSS back if they were at least one SMSS.
 tretx1
 c = sub get Tcb kCWN umin d get Tcb kCWN
-put Tcb kCWN add c get Tcb kMSS
+if ge d get Tcb kMSS
+c = add c get Tcb kMSS
+end
+put Tcb kCWN c
 end
 else
 tgrow d
@@ -773,8 +784,17 @@ tstat 25
 k = add get Tcb kDUP 1
 put Tcb kDUP k
 m = get Tcb kMSS
+note In fast recovery every duplicate ACK inflates cwnd by one SMSS, also those after
+note a partial ACK (RFC 6582 3.2 steps 4 and 5).
+if ne get Tcb kFRX 0
+put Tcb kCWN umin add get Tcb kCWN m 262144
+ret
+end
+note The third enters fast retransmit only when the ACK covers more than recover
+note (RFC 6582 3.2 step 2; kREC is recover + 1): never again for a loss from before
+note the last recovery or retransmission timeout.
 if eq k 3
-if eq get Tcb kFRX 0
+if sle get Tcb kREC get Tcb kUNA
 f = sdif get Tcb kMAX get Tcb kUNA
 put Tcb kSST umax div f 2 mul 2 m
 put Tcb kREC get Tcb kMAX
@@ -783,12 +803,6 @@ put Tcb kRAT 0
 tstat 17
 tretx1
 put Tcb kCWN add get Tcb kSST mul 3 m
-end
-ret
-end
-if gt k 3
-if ne get Tcb kFRX 0
-put Tcb kCWN umin add get Tcb kCWN m 262144
 end
 end
 end
@@ -855,7 +869,10 @@ tdupchk
 end
 end
 w0 = get Tcb kSWN
+note RFC 9293 3.10.7.4: only an ACK in SND.UNA =< SEG.ACK =< SND.NXT updates the window.
+if sle u a
 twinupd
+end
 note While the window stays closed each acknowledgment shows the peer is alive, so
 note the retry count restarts (RFC 1122 4.2.2.17); a window that opens again resends
 note from SND.UNA, an octet the peer did not take included.
@@ -922,18 +939,18 @@ if eq st 4
 put Tcb kST 7
 ret
 end
+note FIN-WAIT-1 here means our FIN is not yet acknowledged: tackin ran first on this
+note segment and moves an acknowledged FIN-WAIT-1 to FIN-WAIT-2.
 if eq st 5
-if tfinacked
-ttimewait
-else
 put Tcb kST 8
-end
 ret
 end
 if eq st 6
 ttimewait
 end
 end
+note Deliver the in-order bytes stored at RCV.NXT; reaching a queued FIN takes it. No
+note byte past a queued FIN is stored (tfincut, and tdata's window), so none is delivered.
 fn tdrain to void
 r = get Tcb kRNX
 c = get Tcb kRCN
@@ -960,11 +977,8 @@ end
 end
 fn tdata to void
 st = get Tcb kST
+note Every state with the peer's FIN taken (kPFN) is above 6.
 if or lt st 4 gt st 6
-tstat 29
-ret
-end
-if ne get Tcb kPFN 0
 tstat 29
 ret
 end
@@ -996,13 +1010,11 @@ tstat 20
 end
 end
 end
+note Called from state 4 up; every state above 6 has the peer's FIN taken (kPFN), and
+note a later FIN is only acknowledged.
 fn tfinin to void
-st = get Tcb kST
 if ne get Tcb kPFN 0
 put Tcb kACK 1
-ret
-end
-if or lt st 4 gt st 6
 ret
 end
 f = sadd get Tpk 8 get Tpk 12
@@ -1020,8 +1032,22 @@ end
 put Tcb kOFF 1
 put Tcb kOFQ f
 put Tcb kACK 1
+tfincut sdif f r
 if eq f r
 tfinacc
+end
+end
+note Bytes already stored at or beyond the FIN offset d0 (from RCV.NXT) are not part
+note of the stream: drop them, counted as outside bytes (Tst 20). The caller keeps
+note d0 below the receive window.
+fn tfincut d0 ulong to void
+b = and add get Tcb kRHD get Tcb kRCN 65535
+for i ulong sub trwnd d0 bound 65536
+q = and add b add d0 i 65535
+if ne get Trmap q 0
+put Trmap q 0
+tstat 20
+end
 end
 end
 fn tsynsent to void
@@ -1400,6 +1426,9 @@ put Tcb kSST umax div f 2 mul 2 m
 put Tcb kCWN m
 put Tcb kFRX 0
 put Tcb kDUP 0
+note RFC 6582 3.2 step 4: recover becomes the highest sequence number sent (kREC =
+note SND.MAX).
+put Tcb kREC get Tcb kMAX
 put Tcb kNXT get Tcb kUNA
 tarm
 end
