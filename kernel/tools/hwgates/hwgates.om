@@ -16,14 +16,17 @@ note   R7 a receipt path starts with evidence/ and holds no .. and no leading /
 note   R8 the register has at least one row
 note   R9 every gate id named by a HWGATE line of a cited receipt has rows in the register, so a whole
 note      gate cannot leave the register while its receipt still names it
+note   R10 a gate id is upper-case letters, digits, '-', '_' or '.' only, so two ids never differ by
+note      case alone (HWGATE lines and the inventory compare ids byte for byte)
 note Exit 0 and HWGATES PASS when no rule fails; exit 1 and HWGATES FAIL otherwise; exit 2 on usage,
-note an unreadable register, or a register larger than the checker's tables (CAP bytes, MAXR rows):
-note that refusal names its table, and tools/hwgates/gate.sh alarms before the register gets there.
-note Every byte loop is bounded: each pass consumes one byte of a buffer of at most CAP bytes.
-note CAP and MAXR exist only because omc has no runtime-sized allocation: every global is a
-note fixed-size table (no heap by design, omega-mv docs/ROADMAP-1.0.md item 10, Decision 24).
-note If omc gains input-sized buffers, size these from the register and receipt lengths and drop
-note both constants; until then gate.sh's alarm at three quarters of each is the guard.
+note an unreadable register, or when the host refuses memory for a table (enlarge < 0).
+note No size cap: the register, each receipt, the claim line and the row tables are run-time pools
+note (OMEGESE 9.15) grown to what the input needs. pb and ab stay 4096-byte arrays because the path
+note words refuse a pool and 4096 is Linux PATH_MAX, the host's own limit on a path (a longer ROOT
+note plus receipt path is R7). A loop over input has bound NOLIM, the largest a while takes: it ends
+note by consuming one byte or one row of its input; loops over the fixed texts keep their lengths.
+note tools/hwgates/gate.sh runs this checker on a register and a receipt far past the old 1024-row
+note and 524288-byte tables, and alarms when the real register grows past what that control proves.
 
 text vocab "HOST\nQEMU\nPHYSICAL\n#PASS\nFAIL\nNOT_RUN\nBLOCKED_HARDWARE\nBLOCKED_OPERATOR\nMISSING_IMPLEMENTATION\n#"
 text hwtag "HWGATE "
@@ -38,27 +41,26 @@ text mnrun " physical_not_pass="
 text mfails "HWGATES FAIL failures="
 text mrows " rows="
 text musage "usage: hwgates REGISTER ROOT\n"
-text mread "HWGATES ERROR cannot read register or it is larger than CAP bytes\n"
-text msize "HWGATES ERROR register has more rows than the row table holds (MAXR)\n"
+text mread "HWGATES ERROR cannot read register\n"
+text mmem "HWGATES ERROR the host refused memory for a table\n"
 text nl "\n"
 
-const CAP ulong 524288
-const MAXR ulong 1024
+const NOLIM ulong 9223372036854775807
 
-global rb uchar 524288
-global eb uchar 524288
+global rb uchar *
+global eb uchar *
 global pb uchar 4096
 global ab uchar 4096
-global nb uchar 1024
+global nb uchar *
 global fs ulong 8
 global fl ulong 8
-global rid ulong 1024
-global ril ulong 1024
-global rti long 1024
-global rst long 1024
-global rln ulong 1024
-global rrs ulong 1024
-global rrl ulong 1024
+global rid ulong *
+global ril ulong *
+global rti long *
+global rst long *
+global rln ulong *
+global rrs ulong *
+global rrl ulong *
 global cnt ulong 8
 
 note cnt: 0 rows, 1 failures, 2 register length, 3 root length, 4 physical rows, 5 physical PASS
@@ -88,63 +90,78 @@ k = write 1 nl 0 len nl
 put cnt 1 add get cnt 1 1
 end
 
-note read the file named by pb[0..n) into rb; returns its length, or -1
+note the host refused memory: a defined refusal (exit 2), never a truncated read
+fn nomem to void
+k = write 2 mmem 0 len mmem
+exit 2
+end
+
+note read the file named by pb[0..n) into the pool rb, grown while the file lasts; returns its
+note length, or -1 when it cannot be opened or read
 fn rdreg n ulong to long
 fd = fopen pb 0 n 0 0
 if lt fd 0
 ret -1
 end
 tot = ulong 0
+bad = false
 c = true
-while c bound 524289
-k = read int fd rb tot sub CAP tot
+while c bound NOLIM
+if lt sub len rb tot 65536
+g = enlarge rb add mul len rb 2 65536
+if lt g 0
+nomem
+end
+end
+k = read int fd rb tot sub len rb tot
 if lt k 0
 c = false
-tot = CAP
+bad = true
 else
 if eq k 0
 c = false
 else
 tot = add tot ulong k
-if ge tot CAP
-c = false
-end
 end
 end
 end
 r = fclose int fd
-if ge tot CAP
+if bad
 ret -1
 end
 ret long tot
 end
 
-note same for eb (a receipt)
+note same for the pool eb (a receipt)
 fn rdrec n ulong to long
 fd = fopen pb 0 n 0 0
 if lt fd 0
 ret -1
 end
 tot = ulong 0
+bad = false
 c = true
-while c bound 524289
-k = read int fd eb tot sub CAP tot
+while c bound NOLIM
+if lt sub len eb tot 65536
+g = enlarge eb add mul len eb 2 65536
+if lt g 0
+nomem
+end
+end
+k = read int fd eb tot sub len eb tot
 if lt k 0
 c = false
-tot = CAP
+bad = true
 else
 if eq k 0
 c = false
 else
 tot = add tot ulong k
-if ge tot CAP
-c = false
-end
 end
 end
 end
 r = fclose int fd
-if ge tot CAP
+if bad
 ret -1
 end
 ret long tot
@@ -153,7 +170,7 @@ end
 note rb[a..a+l) equals rb[b..b+l)
 fn eqrb a ulong b ulong l ulong to bool
 i = ulong 0
-while lt i l bound 524289
+while lt i l bound NOLIM
 if ne get rb add a i get rb add b i
 ret false
 end
@@ -229,7 +246,7 @@ end
 i = add i 1
 end
 i = ulong 0
-while lt add i 1 l bound 4096
+while lt add i 1 l bound NOLIM
 if eq get rb add s i uchar 46
 if eq get rb add s add i 1 uchar 46
 ret false
@@ -240,7 +257,7 @@ end
 ret true
 end
 
-note build ROOT/receipt into pb; returns its length (0 when too long)
+note build ROOT/receipt into pb; returns its length (0 when it does not fit PATH_MAX: R7)
 fn mkpath to ulong
 al = get cnt 3
 s = get fs 5
@@ -265,18 +282,21 @@ end
 note copy rb[s..s+l) into nb at o; returns new offset
 fn ncopy o ulong s ulong l ulong to ulong
 i = ulong 0
-while lt i l bound 1024
+while lt i l bound NOLIM
 put nb add o i get rb add s i
 i = add i 1
 end
 ret add o l
 end
 
-note build HWGATE <id> <tier> <status> into nb; returns its length (0 when too long)
+note build HWGATE <id> <tier> <status> into the pool nb, grown to fit; returns its length
 fn mkneed to ulong
 t = add add add get fl 0 get fl 3 get fl 4 10
-if ge t 1024
-ret 0
+if gt t len nb
+g = enlarge nb t
+if lt g 0
+nomem
+end
 end
 i = ulong 0
 p = len hwtag
@@ -295,7 +315,7 @@ end
 note eb[ls..ls+n) equals nb[0..n)
 fn eqneed ls ulong n ulong to bool
 i = ulong 0
-while lt i n bound 1024
+while lt i n bound NOLIM
 if ne get eb add ls i get nb i
 ret false
 end
@@ -308,7 +328,7 @@ note the receipt eb[0..el) holds nb[0..n) as a whole line
 fn hasline el ulong n ulong to bool
 ls = ulong 0
 i = ulong 0
-while le i el bound 524290
+while le i el bound NOLIM
 eol = true
 if lt i el
 eol = eq get eb i uchar 10
@@ -345,10 +365,6 @@ fail ln 3
 ret false
 end
 n = mkneed
-if eq n 0
-fail ln 3
-ret false
-end
 ok = hasline ulong el n
 if eq ok false
 fail ln 3
@@ -362,7 +378,7 @@ fn split s ulong e ulong to ulong
 k = ulong 0
 fst = s
 i = s
-while le i e bound 524290
+while le i e bound NOLIM
 endf = true
 if lt i e
 endf = eq get rb i uchar 9
@@ -383,6 +399,74 @@ end
 ret k
 end
 
+note R10: field 0 is upper-case letters, digits, '-', '_' or '.' only
+fn idchars to bool
+s = get fs 0
+l = get fl 0
+i = ulong 0
+while lt i l bound NOLIM
+ch = get rb add s i
+ok = false
+if ge ch uchar 65
+if le ch uchar 90
+ok = true
+end
+end
+if ge ch uchar 48
+if le ch uchar 57
+ok = true
+end
+end
+if eq ch uchar 45
+ok = true
+end
+if eq ch uchar 95
+ok = true
+end
+if eq ch uchar 46
+ok = true
+end
+if eq ok false
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note grow the row tables to hold row r and more; each doubles, so n rows cost O(n) copies in all
+fn growrows r ulong to void
+n = add mul r 2 64
+g = enlarge rid n
+if lt g 0
+nomem
+end
+g = enlarge ril n
+if lt g 0
+nomem
+end
+g = enlarge rti n
+if lt g 0
+nomem
+end
+g = enlarge rst n
+if lt g 0
+nomem
+end
+g = enlarge rln n
+if lt g 0
+nomem
+end
+g = enlarge rrs n
+if lt g 0
+nomem
+end
+g = enlarge rrl n
+if lt g 0
+nomem
+end
+end
+
 note check one non-comment line; ln is its 1-based line number
 fn row s ulong e ulong ln ulong to void
 k = split s e
@@ -398,6 +482,11 @@ ret
 end
 f = add f 1
 end
+okid = idchars
+if eq okid false
+fail ln 10
+ret
+end
 ti = vidx get fs 3 get fl 3 0
 si = vidx get fs 4 get fl 4 1
 if lt ti 0
@@ -409,9 +498,8 @@ fail ln 2
 ret
 end
 r = get cnt 0
-if ge r MAXR
-w = write 2 msize 0 len msize
-exit 2
+if ge r len rid
+growrows r
 end
 dup = isdup r ti
 if dup
@@ -444,7 +532,7 @@ fn isdup r ulong ti long to bool
 j = ulong 0
 s = get fs 0
 l = get fl 0
-while lt j r bound 1025
+while lt j r bound NOLIM
 if eq get rti j ti
 if eq get ril j l
 same = eqrb get rid j s l
@@ -458,28 +546,26 @@ end
 ret false
 end
 
-note R5: every distinct id has exactly one PHYSICAL row; returns the number of distinct ids
-fn pairs to ulong
-r = get cnt 0
-g = ulong 0
-i = ulong 0
-while lt i r bound 1025
-first = true
+note an earlier row j < i has the id of row i
+fn seenid i ulong to bool
 j = ulong 0
-while lt j i bound 1025
+while lt j i bound NOLIM
 if eq get ril j get ril i
 same = eqrb get rid j get rid i get ril i
 if same
-first = false
+ret true
 end
 end
 j = add j 1
 end
-if first
-g = add g 1
+ret false
+end
+
+note the number of PHYSICAL rows among the r rows with the id of row i
+fn nphys i ulong r ulong to ulong
 np = ulong 0
 j = ulong 0
-while lt j r bound 1025
+while lt j r bound NOLIM
 if eq get rti j 2
 if eq get ril j get ril i
 same = eqrb get rid j get rid i get ril i
@@ -490,6 +576,19 @@ end
 end
 j = add j 1
 end
+ret np
+end
+
+note R5: every distinct id has exactly one PHYSICAL row; returns the number of distinct ids
+fn pairs to ulong
+r = get cnt 0
+g = ulong 0
+i = ulong 0
+while lt i r bound NOLIM
+seen = seenid i
+if eq seen false
+g = add g 1
+np = nphys i r
 if ne np 1
 fail get rln i 5
 end
@@ -502,7 +601,7 @@ end
 note an earlier PASS/FAIL row i < j cites the same receipt path as row j
 fn samerec j ulong to bool
 i = ulong 0
-while lt i j bound 1025
+while lt i j bound NOLIM
 if le get rst i 1
 if eq get rrl i get rrl j
 same = eqrb get rrs i get rrs j get rrl j
@@ -519,7 +618,7 @@ end
 note rb[a..a+l) equals eb[b..b+l)
 fn eqid a ulong b ulong l ulong to bool
 i = ulong 0
-while lt i l bound 524289
+while lt i l bound NOLIM
 if ne get rb add a i get eb add b i
 ret false
 end
@@ -532,7 +631,7 @@ note the gate id eb[s..s+l) has a row in the register
 fn idknown s ulong l ulong to bool
 r = get cnt 0
 j = ulong 0
-while lt j r bound 1025
+while lt j r bound NOLIM
 if eq get ril j l
 same = eqid get rid j s l
 if same
@@ -560,7 +659,7 @@ end
 note first space in eb[s..e), or e
 fn idend s ulong e ulong to ulong
 i = s
-while lt i e bound 524290
+while lt i e bound NOLIM
 if eq get eb i uchar 32
 ret i
 end
@@ -574,7 +673,7 @@ fn scanids el ulong ln ulong to void
 p = len hwtag
 ls = ulong 0
 i = ulong 0
-while le i el bound 524290
+while le i el bound NOLIM
 eol = true
 if lt i el
 eol = eq get eb i uchar 10
@@ -601,7 +700,7 @@ note R9: read each distinct receipt cited by a PASS/FAIL row once and check its 
 fn receiptids to void
 r = get cnt 0
 j = ulong 0
-while lt j r bound 1025
+while lt j r bound NOLIM
 if le get rst j 1
 seen = samerec j
 if eq seen false
@@ -650,7 +749,7 @@ total = ulong rl
 pos = ulong 0
 ln = ulong 1
 i = ulong 0
-while le i total bound 524290
+while le i total bound NOLIM
 eol = true
 if lt i total
 eol = eq get rb i uchar 10
@@ -675,7 +774,7 @@ r = get cnt 0
 np = ulong 0
 pp = ulong 0
 j = ulong 0
-while lt j r bound 1025
+while lt j r bound NOLIM
 if eq get rti j 2
 np = add np 1
 if eq get rst j 0
