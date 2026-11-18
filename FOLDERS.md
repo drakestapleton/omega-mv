@@ -163,8 +163,8 @@ Rules:
 - the kernel compiles Omega with this repository's `seed/out/omc`, checked against `seed/out/omc.sha256`; it has no compiler pin of its own (aienux's `PIN` and `REPIN` are gone)
 - the kernel's gates run from `kernel/` through `kernel/tests/gates/run.sh`; `tests/gates/run.sh kernel` runs six steps from the omega-mv root: `make test` of `native/kernel`, `ck-host-tests`, `hw-gates`, `omega-nvme`, `tcp-corpus` and `spinlock`
 - every gate aienux had reaches omega-mv's judge through `tests/gates/omega-kernel-<step>.gate`, which runs `tests/gates/run.sh kernel-<step>`, or is listed with its reason in `kernel/MIGRATION.md` ("Aienux gates without a manifest"); `kernel/tests/gates/aienos-*.gate` are aienux's manifests, kept as history and read by no judge here. OMEGA-KERNEL-GATE-WIRING (`kernel/scripts/omega_gate_wiring.sh`, always-run) fails when one has neither; OMEGA-KERNEL-CRYPTO-BOUNDARY is always-run, as aienux's was
-- receipts in `kernel/evidence/` are kept as written, as under `evidence/` (the `evidence-immutable` step checks only the top-level `evidence/`); an aienux hash in a receipt stays the aienux hash, and `kernel/import/commit-map` gives its commit here
-- `kernel/import/` is the record of the move; never edited after the landing that wrote it
+- receipts in `kernel/evidence/` are kept as written, as under `evidence/` (the `evidence-immutable` step, `tools/evidence_immutable.sh`, checks `evidence/`, `kernel/evidence/` and `kernel/import/` against the base, the commit that brought `kernel/` in and every commit after it); an aienux hash in a receipt stays the aienux hash, and `kernel/import/commit-map` gives its commit here
+- `kernel/import/` is the record of the move; additions only (the same check), never edited after the landing that wrote it
 
 ## `native/`
 

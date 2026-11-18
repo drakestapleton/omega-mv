@@ -32,7 +32,7 @@ Some gates expect sibling checkouts next to this one: `../physics` (physics-mv) 
 
 ## Configuration
 
-- `physics.lock`: the commit of the physics sibling the full build and some gates pin. `aienos.lock`, `argus.lock`: the aienux commits whose capability and ARGUS sources they pin, taken from this repository's `kernel/` at the commit `kernel/import/commit-map` gives each (a full clone is needed). `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
+- `physics.lock`: the commit of the physics sibling the full build and some gates pin. `aienos.lock`, `argus.lock`: the omega-mv commits (aienux history folded into `kernel/`) whose `kernel/native/capability` and `kernel/native/argus` sources they pin; `tools/aienos_lock_source.sh` takes them from that commit's `kernel/` tree by the lock id alone, with no commit map (a full clone is needed). `om/omega-bridge.lock`: the omega-bridge commit whose `src/native.om` generates `src/omega_om_units.inc`.
 - `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0` on `make` builds the host suites without a physics checkout.
 - `OUT_DIR`: per-step build directory; `tests/gates/run.sh` sets it to `build/step-<name>`.
 - `.aien/always` lists the gates every commit must pass (`OMEGA-EVIDENCE-IMMUTABLE`, `OMEGA-ZERO-DISK-SECRETS`); `.aien/verify.pub` is the Spark judge's public key.

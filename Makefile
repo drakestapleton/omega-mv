@@ -451,8 +451,8 @@ test-sem-incremental: $(RX_SEM_TEST)
 # The authority source is the FULL commit in aienos.lock, proven by
 # tools/aienos_lock_source.sh from git objects (a directory name, a short SHA or an
 # override is not proof). Default: extracted with `git archive` from this repository,
-# where aienux is folded in as kernel/ and kernel/import/commit-map gives the rewritten
-# commit of the locked one (or from AIENOS_LOCK_REPO, a repository holding that commit,
+# where aienux is folded in as kernel/ and aienos.lock names the omega-mv commit whose
+# kernel/ tree holds the source (or from AIENOS_LOCK_REPO, a repository holding that commit,
 # or the repository around AIENOS_R7_DIR) into
 # $(OUT_DIR)/aienos-authority/<full lock>. An AIENOS_R7_DIR override is used only after
 # the same proof: every tracked file under the subpaths built from has the locked blob
@@ -469,7 +469,7 @@ aienos_source = if [ "$(AIENOS_R7_DIR)" = "$(AIENOS_R7_DEFAULT)" ]; then \
 	else \
 		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_R7_DIR="$(AIENOS_R7_DIR)" bash tools/aienos_lock_source.sh verify-dir "$(AIENOS_R7_DIR)" $(1); \
 	fi || { echo "error: the aienos authority source is not the aienos.lock commit $(AIENOS_LOCK) (see above)."; \
-		echo "  this repository serves it through kernel/import/commit-map (a full clone is needed), or pass AIENOS_LOCK_REPO=<a repository holding that commit>, or AIENOS_R7_DIR=<a clean tree of it>;"; \
+		echo "  this repository holds that commit in the history of kernel/ (a full clone is needed), or pass AIENOS_LOCK_REPO=<a repository holding that commit>, or AIENOS_R7_DIR=<a clean tree of it>;"; \
 		echo "  a modified default cache under $(OUT_DIR)/aienos-authority must be deleted, not reused."; exit 1; }
 RX_R7_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
 	src/runtime/rx_native_bind.c src/omega_om_units.c src/omega_evidence.c \
@@ -1415,8 +1415,8 @@ test-typed-results: $(RX_TYPED_TEST)
 # transitions). Default builds are unchanged (RX_ARGUS undefined = 0: the
 # hooks compile to nothing). This block builds the AEGIS/promotion suites with
 # RX_ARGUS=$(RX_ARGUS) against ARGUS pinned by argus.lock, extracted and proven by
-# tools/aienos_lock_source.sh (never built in place): from this repository, where
-# kernel/import/commit-map gives the argus.lock commit's kernel/ commit, or from
+# tools/aienos_lock_source.sh (never built in place): from this repository, whose
+# argus.lock commit holds it under kernel/, or from
 # ARGUS_REPO when set (a repository holding that commit). ARGUS's sha256.c is
 # Omega's src/omega_om_units.c copied unchanged; Omega's is linked, not both.
 #

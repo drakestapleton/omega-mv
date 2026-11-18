@@ -35,8 +35,8 @@ set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 cd "$HERE" || exit 2
 OUTDIR=${1:-evidence/REALIZE}
-# Empty: this repository, where aienux is kernel/ and kernel/import/commit-map gives the
-# rewritten commit of the locked one (tools/aienos_lock_source.sh); else a repository holding it.
+# Empty: this repository, where aienux is kernel/ and aienos.lock names the omega-mv commit whose
+# kernel/ tree holds the source (tools/aienos_lock_source.sh); else a repository holding that commit.
 AIENOS_REPO=${AIENOS_REPO:-}
 PHYSICS_DIR=${PHYSICS_DIR:-$HOME/workspace/physics-r13}
 BENCH_LOCK=${BENCH_LOCK:-$HOME/workspace/.argus-bench.lock}

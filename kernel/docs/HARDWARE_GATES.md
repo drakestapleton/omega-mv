@@ -40,9 +40,11 @@ that run proves. The comments in `gate.sh` name each check. Without the pinned c
 (NOT_RUN), never 0.
 
 A source `aienux@<commit>` names the aienux commit the row was written against. The fold into
-omega-mv rewrote aienux history, so the gate looks the commit up in
-[`import/commit-map`](../import/commit-map) and requires the rewritten commit to be in this
-repository; a commit the map does not know, or maps to zeros, fails. Rows keep their aienux hashes.
+omega-mv rewrote aienux history, so the gate requires exactly one row for the commit in
+[`import/commit-map`](../import/commit-map), naming a commit of the history the fold brought in (the
+rewritten aienux main in `import/ref-map` or one of its ancestors); a commit the map does not know, or
+maps to zeros, fails. `import/` is additions only, so a row cannot be repointed. Rows keep their aienux
+hashes.
 
 To add a physical PASS: run the attended procedure under its own authorization, commit the raw
 receipt under `evidence/` with the `HWGATE <id> PHYSICAL PASS` line plus source commit, image
@@ -70,13 +72,16 @@ no receipt yet cannot leave the inventory without a reviewed change to both file
 them side by side:
 `join -t "$(printf '\t')" <(grep -v '^#' docs/hardware-gates-needs.tsv | sort) <(awk -F '\t' '$4=="PHYSICAL" {print $1 "\t" $7}' docs/hardware-gates.tsv | sort)`.
 
-A receipt is never rewritten, and the gate holds it: every tracked file in the folder of a cited
-receipt or of a file with `HWGATE` lines, and `import/commit-map`, must have exactly the content of
-the commit that first added it, so a line appended or edited, committed or not, fails (a shallow
-clone fails too, because the adding commit cannot be found). When a later review finds that a
-committed receipt line claims more than it shows, a dated `CORRECTION-<date>.txt` beside the
-receipt names the line (`CORRECTS HWGATE <id> <tier> <status>`) and says why. That withdraws the
-line: it no longer backs a PASS or FAIL row, and the gate refuses a row resting on it. The gate
+A receipt is never rewritten, and the gate holds it: `evidence/` and `import/` are additions only
+(`tools/evidence_immutable.sh kernel/evidence kernel/import`, against the base ref, the commit that
+brought `kernel/` in and every commit after it), so a file deleted, renamed or edited, committed or not,
+or other bytes merged in, fails; a shallow clone is NOT_RUN (exit 3), because the history cannot be
+read. When a later review finds that a committed receipt line claims more than it shows, a dated
+`CORRECTION-<date>.txt` under `evidence/` names the line (`CORRECTS HWGATE <id> <tier> <status>`) and
+says why. That withdraws the line everywhere and for good: a correction that any `CORRECTION-*.txt`
+holds or ever held in HEAD's history counts, so deleting or editing it later does not bring the line
+back. A withdrawn line no longer backs a PASS or FAIL row, whatever receipt or folder the row cites,
+and the gate refuses a row resting on it. The gate
 also refuses a receipt line whose status differs from the register's row for that id and tier
 unless such a correction covers it.
 

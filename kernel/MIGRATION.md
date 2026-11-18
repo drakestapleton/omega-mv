@@ -154,15 +154,18 @@ already in use"; it passed alone. A run is an observation of that commit, not a 
 - `tools/hwgates/gate.sh` treated a register row whose source is `aienux@COMMIT` as naming "a commit of
   this repository" only when `git cat-file` found COMMIT. The aienux commits are here under their
   rewritten hashes (`import/commit-map`), not their own, so rows that cite aienux commits failed that
-  check in omega-mv. The gate now resolves `aienux@COMMIT` through `import/commit-map` to a commit present
-  here; the rows keep their aienux hashes.
-- Omega-mv's `aienos.lock` and `argus.lock` name aienux commits (`b84c0a67`, `b375dcaa`), both on aienux
-  main. They are read from `kernel/` now, not from a sibling `../aienos` checkout:
-  `tools/aienos_lock_source.sh` maps the locked commit through `import/commit-map` (`593c755e`,
-  `b7c5e158`) and extracts and proves the subpaths from that commit's `kernel/` tree, whose
-  `native/capability` and `native/argus` trees have the same ids as in aienux. `tests/gates/run.sh`
-  (`aienos_pin`, `argus_pin`), the Makefile (`AIENOS_LOCK_REPO`, `ARGUS_REPO`, now empty by default) and
-  the receipt tools (`AIENOS_REPO`) use it; a repository holding the aienux commit can still be named.
+  check in omega-mv. The gate now requires `aienux@COMMIT` to have exactly one `import/commit-map` row,
+  naming a commit of the history the fold brought in (the rewritten main in `import/ref-map` or one of
+  its ancestors); `import/` is additions only, so a row cannot be repointed. The rows keep their aienux
+  hashes.
+- Omega-mv's `aienos.lock` and `argus.lock` named aienux commits (`b84c0a67`, `b375dcaa`), both on aienux
+  main. They now name those commits' omega-mv commits (`593c755e`, `b7c5e158`), whose
+  `kernel/native/capability` and `kernel/native/argus` trees have the same ids as in aienux, and are read
+  from `kernel/`, not from a sibling `../aienos` checkout: `tools/aienos_lock_source.sh` extracts and
+  proves the subpaths from the locked commit's `kernel/` tree and reads no commit map, so the lock id
+  alone names the bytes. `tests/gates/run.sh` (`aienos_pin`, `argus_pin`), the Makefile
+  (`AIENOS_LOCK_REPO`, `ARGUS_REPO`, now empty by default) and the receipt tools (`AIENOS_REPO`) use it; a
+  repository holding the locked commit can still be named.
 
 ## Still outside omega-mv
 
