@@ -392,8 +392,8 @@ exit status and diagnostics; the other 8 are the x86 compiles of the ill-typed
 `seed/omc/tests/float/neg_fma_*` refusals, error 9 before and now the AArch64
 error 7 or 11. Gate: `seed/omc/gate8.sh` (`refuse_x86`).
 
-The prlimit 235 host word (branch `seed/prlimit-host-word`, PROPOSED pending
-review; first born as `3c2817a5` on rad main `da8b7e66`, then merged with rad
+The prlimit 235 host word (branch `seed/prlimit-host-word`, now on main as
+keyword 235 of `seed/omc/omc.om`; first born as `3c2817a5` on rad main `da8b7e66`, then merged with rad
 main `408c76b7`) births compiler
 `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`
 from source

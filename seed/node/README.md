@@ -2052,9 +2052,54 @@ second authority, journal compatibility in both directions, and address-space
 caps. Each prints MEASURED latency and seconds; the memory scenario prints
 MEASURED `memory-peak-kB` (VmHWM and VmPeak of `code-main`, `infer` and
 `tool`, sampled from `/proc` every 5 ms) and fails `memory-peak-measured`
-when no `code-main` sample was read. `memory-caps-fail-closed-then-pass` is
-NOT_RUN until a reviewed `prlimit` host word exists (omega-mv
-`seed/prlimit-host-word`); no host tool stands in for it. The driver prints
+when no `code-main` sample was read. `memory-caps-fail-closed-then-pass`
+runs that same one-objective job again under the `prlimit` host word
+(keyword 235, RLIMIT_AS): half the measured `code-main` VmPeak, then that
+peak, then double, up to 32 times the peak. A smaller cap fails closed only
+with an explicit result: one `CWO 0 FAIL` line matching the journaled RESULT and exit 1, or a `code-main`
+refusal exit 50 to 57 with its cause line for that exit on stderr
+(`code-main: WHAT, exit R` with R equal to the exit). A pass is
+one `CWO 0 PASS` line, exit 0 and a consistent journal. The result code and turn count on either line must exactly match the sole RESULT for objective zero. A missing RESULT, a conflicting exit or trailing output on the result line fails the trial. A signal
+death that leaves no journal and nothing on stderr is treated as the kernel
+refusing the exec under the cap (it cannot be told apart from a death after
+the exec but before the node wrote anything) and is reported (`c=2`) and not counted
+either way. A signal death after the node started (a journal or stderr
+exists) is a crash and fails the check. A harness
+failure (exit 97, 126 or 127, an output that cannot be read, a wait error), a
+journal that is torn, unreadable or has more than one start, or any other
+end fails the check. The check passes when one cap passes after at least one
+explicit smaller-cap failure, and only after the uncapped run passed; each
+trial shows the cap, rc, CWO lines (`n`), class (`c`: 0 explicit fail, 1
+pass, 2 refused at exec, 3 bad), journal state (`j`: 0 none, 1 consistent, 2
+other) and starts (`s`). Each trial waits at most three times the uncapped
+run, measured from before the node starts; a trial past that deadline
+(`rc=-110`) fails the check. On this host the cap that first passes is not
+the node's own memory need: `tool` runs each test program through
+`execpure` (`seed/omc/omc.om`), which sets RLIMIT_AS to its own fixed
+ceiling. Under an inherited cap below that ceiling the raise is refused. At
+the lowest caps the compile step itself cannot run, and `code-main` ends
+`CWO 0 FAIL 17` (tool failed). At the caps above those the test program's
+exec fails (exit 121), the tool reports that exit as the program's result,
+the next prompt differs from the recorded one, and in fake mode the
+recording has no answer for it, so `code-main` ends `CWO 0 FAIL 16`
+(inference failed): a recording miss, not the node noticing a memory
+problem. So the explicit fails come from caps below execpure's ceiling, the
+passing cap is the first step at or above it, and when 32 times the
+`code-main` peak stays below it the check fails whatever the node does. The
+check shows that under a cap at which its tools cannot run the run ends in an
+explicit FAIL, and that the node completes under a cap that leaves its tools
+their ceiling. It does not read the job file, so it does not show that a
+failing run leaves that file unchanged, and it does not measure how much
+memory the node needs.
+The one-job stand-in does not exercise the more-than-one-start guard or a
+trial that ends with an exit other than 1 after its single `CWO` line: those
+are guards in the check, not cases observed on this host.
+The host run uses a one-job stand-in for the round40 recording, which is not
+at the path qual reads:
+`seed/node/tests/ra40/final-selected.json`, a small
+loop repair (id 76666) whose answers were constructed from the node's own
+prompts on this build. It serves only the memory scenario; with it as
+ROUND40 every other scenario fails fixture preparation. The driver prints
 `PASS|FAIL|NOT_RUN NAME DETAIL` per check and `RELSUM pass=P fail=F
 not_run=N mode=MODE`; a node output it needs that is missing, unreadable or
 over capacity fails the next check, naming it.
