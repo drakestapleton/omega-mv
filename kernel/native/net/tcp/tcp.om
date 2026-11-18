@@ -1,10 +1,14 @@
 note tcp.om: native TCP over IPv4 and ARP for native/net (ledger L232). Seeded Omega.
 note RFC 9293 TCP, RFC 6298 RTO, RFC 5681 and RFC 6582 congestion control with
 note NewReno recovery, RFC 5961 RST/SYN/ACK hardening, RFC 826 ARP, RFC 791 IPv4.
+note RFC 6528 initial sequence numbers: SipHash-2-4 of the 4-tuple under a 128-bit
+note key plus a 4 microsecond clock (tsetiss).
 note One connection block (Tcb) plus one passive port. No heap: fixed rings.
 note Frames are Ethernet II without FCS, at most 2048 bytes, in Trx (input) and
 note Ttx (output). The embedding unit defines fn tlinkout n ulong to void, which
 note transmits Ttx[0..n). The caller supplies monotonic milliseconds to tstep.
+note The embedding unit calls tkey with 16 bytes from its entropy source before any
+note open; until then tconnect fails with kERR 4 and LISTEN ignores every SYN.
 note Application bytes cross Tapp: twrite copies Tapp[0..n) into the send ring,
 note tread copies received in-order bytes into Tapp[0..n).
 note Limits: no IPv4 options are sent; received options are skipped; fragments
@@ -17,10 +21,16 @@ global Tapp uchar 65536
 global Tsbuf uchar 65536
 global Trbuf uchar 65536
 global Trmap uchar 65536
-note Tcf: 0 now ms, 1 own IPv4, 2 gateway, 3 netmask, 4 next IPv4 id, 5 PRNG state,
+note Tcf: 0 now ms, 1 own IPv4, 2 gateway, 3 netmask, 4 next IPv4 id, 5 unused,
 note 6 gateway ARP due, 7 window being sent, 8 2MSL ms, 9 own MSS, 10 minimum RTO,
 note 11 ARP rotation, 12 address being resolved, 13 maximum retries.
 global Tcf ulong 16
+note Tkey: 0 and 1 the 128-bit SipHash key (little-endian words), 2 key installed
+note (1 after tkey), 3 trnd counter. Tsip holds v0..v3 while hashing; the initial
+note state words are the ASCII text Tsipc read big-endian (SipHash's constants).
+global Tkey ulong 4
+global Tsip ulong 4
+text Tsipc "somepseudorandomlygeneratedbytes"
 note Tarp: four entries of ip, mac (48 bits), valid.
 global Tarp ulong 12
 note Tpk (parsed input): 0 frame length, 4 source, 5 destination, 6 TCP offset,
@@ -82,9 +92,12 @@ const kFRX ulong 41
 const kEST ulong 42
 note kPAS: the block came from LISTEN, so a reset in syn-received returns to LISTEN.
 const kPAS ulong 43
+note kSYT: a SYN or SYN-ACK of this block timed out (RFC 6298 5.7, RFC 5681 3.1).
+const kSYT ulong 44
 note States: 0 closed, 1 listen, 2 syn-sent, 3 syn-received, 4 established,
 note 5 fin-wait-1, 6 fin-wait-2, 7 close-wait, 8 closing, 9 last-ack, 10 time-wait.
-note kERR: 0 none, 1 reset by peer, 2 refused, 3 retransmission limit.
+note kERR: 0 none, 1 reset by peer, 2 refused, 3 retransmission limit, 4 no
+note sequence number key (tkey never called).
 const tNOMAC ulong 281474976710656
 const tBCAST ulong 281474976710655
 fn tstat k ulong to void
@@ -180,16 +193,74 @@ s = add s shr b 16
 s = add s and b 65535
 ret add add s 6 n
 end
-fn trnd to ulong
-x = get Tcf 5
-if eq x 0
-x = ulong 88172645463325252
+note Install the 128-bit key (two little-endian words) that sequence numbers and
+note trnd are drawn from. The embedder takes it from its entropy source.
+fn tkey a ulong b ulong to void
+put Tkey 0 a
+put Tkey 1 b
+put Tkey 2 1
+put Tkey 3 0
 end
-x = xor x shl x 13
-x = xor x shr x 7
-x = xor x shl x 17
-put Tcf 5 x
-ret x
+fn tbe8 o ulong to ulong
+v = ulong 0
+for i ulong 8
+v = add shl v 8 ulong get Tsipc add o i
+end
+ret v
+end
+fn trotl x ulong b ulong to ulong
+ret or shl x b shr x sub 64 b
+end
+fn tsipround to void
+v0 = get Tsip 0
+v1 = get Tsip 1
+v2 = get Tsip 2
+v3 = get Tsip 3
+v0 = add v0 v1
+v1 = xor trotl v1 13 v0
+v0 = trotl v0 32
+v2 = add v2 v3
+v3 = xor trotl v3 16 v2
+v0 = add v0 v3
+v3 = xor trotl v3 21 v0
+v2 = add v2 v1
+v1 = xor trotl v1 17 v2
+v2 = trotl v2 32
+put Tsip 0 v0
+put Tsip 1 v1
+put Tsip 2 v2
+put Tsip 3 v3
+end
+fn tsipword m ulong to void
+put Tsip 3 xor get Tsip 3 m
+tsipround
+tsipround
+put Tsip 0 xor get Tsip 0 m
+end
+note SipHash-2-4 of an n-byte message, n from 8 to 15: the 8 bytes of a, then the
+note low n-8 bytes of b, each word little-endian.
+fn tsip a ulong b ulong n ulong to ulong
+k0 = get Tkey 0
+k1 = get Tkey 1
+put Tsip 0 xor k0 tbe8 0
+put Tsip 1 xor k1 tbe8 8
+put Tsip 2 xor k0 tbe8 16
+put Tsip 3 xor k1 tbe8 24
+tsipword a
+tsipword or b shl n 56
+put Tsip 2 xor get Tsip 2 255
+for i ulong 4
+tsipround
+end
+h = xor get Tsip 0 get Tsip 1
+ret xor h xor get Tsip 2 get Tsip 3
+end
+note Values an observer must not predict (tcpd's ephemeral port): SipHash of a
+note counter (one byte 1 after it), so without the key past values tell nothing.
+fn trnd to ulong
+c = get Tkey 3
+put Tkey 3 add c 1
+ret tsip c 1 9
 end
 note Unicast, routable source: not 0/8, 127/8, multicast, limited or subnet broadcast.
 fn tipok ip ulong to bool
@@ -463,12 +534,23 @@ put Tcb kRTO 1000
 put Tcb kSST 262144
 put Tcb kCWN 5360
 end
-fn tsetiss to void
-i = and trnd 4294967295
+note RFC 6528: ISN = M + F(4-tuple, key) modulo 2^32. M is the 4 microsecond clock
+note (250 ticks per millisecond of Tcf 0). F is the low 32 bits of SipHash-2-4 over
+note own IPv4 and peer IPv4 (32-bit words), then own port and peer port (16-bit).
+note Without an installed key it refuses (false): no fallback source.
+fn tsetiss to bool
+if eq get Tkey 2 0
+ret false
+end
+a = or get Tcf 1 shl get Tcb kRIP 32
+b = or get Tcb kLP shl get Tcb kRP 16
+f = and tsip a b 12 4294967295
+i = and add mul get Tcf 0 250 f 4294967295
 put Tcb kISS i
 put Tcb kUNA i
 put Tcb kNXT sadd i 1
 put Tcb kMAX sadd i 1
+ret true
 end
 fn tarm to void
 put Tcb kRTX add get Tcf 0 get Tcb kRTO
@@ -481,7 +563,10 @@ fn tconnect ip ulong rport ulong lport ulong to void
 tfresh lport
 put Tcb kRIP ip
 put Tcb kRP rport
-tsetiss
+if not tsetiss
+tdrop 4
+ret
+end
 put Tcb kST 2
 tsend get Tcb kISS 2 0
 tarm
@@ -568,7 +653,10 @@ put Tcb kIRS get Tpk 8
 put Tcb kRNX sadd get Tpk 8 1
 put Tcb kSWN get Tpk 13
 put Tcb kWL1 get Tpk 8
-tsetiss
+if not tsetiss
+tlisten get Tcb kLP
+ret
+end
 put Tcb kWL2 get Tcb kISS
 put Tcb kST 3
 put Tcb kPAS 1
@@ -665,6 +753,10 @@ tarm
 end
 end
 fn tdupchk to void
+note A closed window is not a loss signal: its acknowledgments answer persist probes.
+if eq get Tcb kSWN 0
+ret
+end
 if ne get Tpk 12 0
 ret
 end
@@ -721,6 +813,17 @@ put Tcb kST 10
 put Tcb kRTX 0
 put Tcb kTWA add get Tcf 0 get Tcf 8
 end
+note Data transfer begins. A SYN or SYN-ACK that timed out restarts the RTO at 3 s
+note (RFC 6298 5.7) and the initial window at one segment (RFC 5681 3.1, RFC 6928
+note section 2).
+fn testab to void
+put Tcb kST 4
+put Tcb kEST 1
+if ne get Tcb kSYT 0
+put Tcb kRTO 3000
+put Tcb kCWN get Tcb kMSS
+end
+end
 note ACK processing (RFC 9293 3.10.7.4 fifth check, RFC 5961 section 5).
 fn tackin to bool
 st = get Tcb kST
@@ -732,8 +835,7 @@ if or sle a u slt x a
 trstout
 ret false
 end
-put Tcb kST 4
-put Tcb kEST 1
+testab
 end
 if slt x a
 put Tcb kACK 1
@@ -752,7 +854,18 @@ if eq a u
 tdupchk
 end
 end
+w0 = get Tcb kSWN
 twinupd
+note While the window stays closed each acknowledgment shows the peer is alive, so
+note the retry count restarts (RFC 1122 4.2.2.17); a window that opens again resends
+note from SND.UNA, an octet the peer did not take included.
+if eq get Tcb kSWN 0
+put Tcb kTRY 0
+else
+if eq w0 0
+put Tcb kNXT get Tcb kUNA
+end
+end
 st = get Tcb kST
 if eq st 5
 if tfinacked
@@ -945,8 +1058,6 @@ put Tcb kSWN get Tpk 13
 if ha
 put Tcb kUNA a
 put Tcb kSYA 1
-put Tcb kST 4
-put Tcb kEST 1
 put Tcb kACK 1
 put Tcb kRTX 0
 put Tcb kTRY 0
@@ -954,6 +1065,7 @@ if ne get Tcb kRAT 0
 tsample sub get Tcf 0 get Tcb kRAT
 put Tcb kRAT 0
 end
+testab
 ret
 end
 put Tcb kST 3
@@ -1134,13 +1246,22 @@ tstat 1
 ret
 end
 d = trmac 0
+bc = false
 if ne d tmymac
 if ne d tBCAST
 tstat 1
 ret
 end
+bc = true
 end
 y = tr16 12
+note Broadcast is accepted for ARP only: no IPv4 (TCP or other) to ff:ff:ff:ff:ff:ff.
+if bc
+if ne y 2054
+tstat 1
+ret
+end
+end
 put Tpk 0 n
 if eq y 2054
 tarpin n
@@ -1254,12 +1375,22 @@ put Tcb kRTO umin mul get Tcb kRTO 2 60000
 put Tcb kRAT 0
 st = get Tcb kST
 if eq st 2
+put Tcb kSYT 1
 tsend get Tcb kISS 2 0
 tarm
 ret
 end
 if eq st 3
+put Tcb kSYT 1
 tsend get Tcb kISS 18 0
+tarm
+ret
+end
+note A closed window turns the timeout into a persist probe: not a loss, so the
+note congestion state stays (RFC 9293 3.8.6.1).
+if eq get Tcb kSWN 0
+put Tcb kNXT get Tcb kUNA
+tprobe
 tarm
 ret
 end
@@ -1272,9 +1403,23 @@ put Tcb kDUP 0
 put Tcb kNXT get Tcb kUNA
 tarm
 end
-note Zero-window probe: a segment one below SND.UNA forces an ACK with the current window.
+note Zero-window probe (RFC 9293 3.8.6.1, RFC 1122 4.2.2.17): one octet at SND.NXT,
+note which the peer acknowledges with its current window whether or not it takes it.
+fn tprobe to void
+x = get Tcb kNXT
+if slt x sadd get Tcb kUNA get Tcb kSCN
+tsend x 24 1
+put Tcb kNXT sadd x 1
+if slt get Tcb kMAX get Tcb kNXT
+put Tcb kMAX get Tcb kNXT
+end
+end
+end
+note Persist timer: a closed window with unsent data and nothing in flight gets its
+note first probe one RTO later; later probes are retransmissions (ttimeout), backed off.
 fn tpersist to void
 if ne get Tcb kSWN 0
+put Tcb kPRS 0
 ret
 end
 if not tcansend
@@ -1287,11 +1432,17 @@ if ne get Tcb kUNA get Tcb kMAX
 ret
 end
 n = get Tcf 0
+if eq get Tcb kPRS 0
+put Tcb kPRS umax add n get Tcb kRTO 1
+ret
+end
 if lt n get Tcb kPRS
 ret
 end
-put Tcb kPRS add n umax get Tcb kRTO 500
-tsend sdif get Tcb kUNA 1 16 0
+put Tcb kPRS 0
+put Tcb kRAT 0
+tprobe
+tarm
 end
 fn tstep now ulong to void
 put Tcf 0 now
