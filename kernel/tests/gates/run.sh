@@ -128,7 +128,8 @@ omega_omc() {
 #                           mismatch" (omega_omc: "no omc with sha256"), so the compare itself refuses;
 #   matching                the pin is the stand-in's sha256: no pin refusal at all (omega_omc accepts),
 #                           so the compare accepts an equal digest and refuses only an unequal one.
-# A refusing state also needs exit non-zero, no output file and a stand-in that never ran.
+# A refusing state also needs exit non-zero, no output file and a stand-in that never ran. Output is
+# matched with here-strings: with pipefail, `printf | grep -q` fails when grep exits before printf ends.
 PIN_SCRIPTS="native/om/lm1b/gate.sh native/omega/allen/build-fw.sh native/omega/allen/build-one.sh
   native/omega/allen/build-local-model.sh scripts/check_local_tools.sh native/disk/tests/omega_nvme_test.sh"
 pin_controls() {
@@ -150,10 +151,10 @@ pin_controls() {
     esac
     rc=0; out=$(OMEGA_ROOT="$d"; unset AIEN_OMC; omega_omc 2>&1) || rc=$?
     if [ -n "$owant" ]; then
-      if [ "$rc" != 3 ] || printf '%s\n' "$out" | grep -q 'omc_pinned true' || ! printf '%s\n' "$out" | grep -q "$owant"; then
+      if [ "$rc" != 3 ] || grep -q 'omc_pinned true' <<< "$out" || ! grep -q "$owant" <<< "$out"; then
         printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, not refused with '$owant'" >&2; exit 1
       fi
-    elif [ "$rc" != 0 ] || ! printf '%s\n' "$out" | grep -q 'omc_pinned true'; then
+    elif [ "$rc" != 0 ] || ! grep -q 'omc_pinned true' <<< "$out"; then
       printf '%s\n' "$out"; echo "pin control $c: omega_omc exit $rc, refused a compiler equal to the pin" >&2; exit 1
     fi
     n=$((n + 1))
@@ -171,14 +172,14 @@ pin_controls() {
       rc=0; out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u OMEGA_SOURCE AIEN_OMC="$d/seed/out/omc" \
         MODEL="$d/no-model" LOCAL_TOOLS_OUT="$d/out.tools" OMEGA_NVME_EVIDENCE="$d/nvme-evidence" "$sh_" "$d/kernel/$s" $args 2>&1) || rc=$?
       if [ -n "$want" ]; then
-        if [ "$rc" != 0 ] && printf '%s\n' "$out" | grep -qE "$want" && [ ! -e "$d/RAN" ] &&
+        if [ "$rc" != 0 ] && grep -qE "$want" <<< "$out" && [ ! -e "$d/RAN" ] &&
           [ ! -e "$d/out.efi" ] && [ ! -e "$d/out.bin" ] && [ ! -e "$d/out.tools" ]; then
           n=$((n + 1))
         else
           printf '%s\n' "$out"; [ -e "$d/RAN" ] && echo "(the stand-in compiler ran)"
           echo "pin control $c: $s exit $rc, not refused with '$want' before running the compiler" >&2; exit 1
         fi
-      elif printf '%s\n' "$out" | grep -qE 'compiler pin|pinned compiler missing|no compiler at|digest differs'; then
+      elif grep -qE 'compiler pin|pinned compiler missing|no compiler at|digest differs' <<< "$out"; then
         printf '%s\n' "$out"; echo "pin control $c: $s refused a compiler equal to the pin" >&2; exit 1
       else
         n=$((n + 1))
@@ -197,7 +198,7 @@ pin_controls() {
     [ "$c" = no-pin ] || (cd "$d/src" && sha256sum seed/out/omc > seed/out/omc.sha256)
     rc=0; out=$(cd "$d" && env -u OMEGA_COMPILER -u OMC -u AIEN_OMC OMEGA_SOURCE="$d/src" LOCAL_TOOLS_OUT="$d/out.tools" \
       bash "$d/kernel/scripts/check_local_tools.sh" 2>&1) || rc=$?
-    if [ "$rc" != 0 ] && printf '%s\n' "$out" | grep -q 'compiler pin refused' && [ ! -e "$d/out.tools" ]; then
+    if [ "$rc" != 0 ] && grep -q 'compiler pin refused' <<< "$out" && [ ! -e "$d/out.tools" ]; then
       n=$((n + 1))
     else
       printf '%s\n' "$out"; echo "pin control source-$c: check_local_tools.sh exit $rc, ran the compiler OMEGA_SOURCE named" >&2; exit 1
