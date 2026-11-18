@@ -24,18 +24,19 @@
 #     are disabled (GIT_NO_REPLACE_OBJECTS) and every object read is re-hashed, so the
 #     content returned is the content the commit id names;
 #   * aienux is folded into omega-mv as kernel/ with its history (Drake 2026-11-17,
-#     kernel/MIGRATION.md), its commits rewritten: a repository that does not hold the
-#     aienux commit counts when it holds the omega-mv commit that kernel/import/commit-map
-#     (exactly one row) gives it, and the source is that commit's kernel/ tree. That tree is
-#     the aienux commit's tree less the files the fold left out (kernel/MIGRATION.md); the
-#     proof is the tracked map plus the rewritten commit object, both re-hashed here;
+#     kernel/MIGRATION.md), its commits rewritten, so aienos.lock and argus.lock name omega-mv
+#     commits. The source is the locked commit's kernel/ tree when it has one (an omega-mv
+#     commit), otherwise its root tree (an aienux commit, read from a repository that holds
+#     it). Either way the lock id alone names the bytes: no commit map or other file is
+#     read, so an edited kernel/import/commit-map cannot move the source (reviewer finding 4
+#     of omega-mv c9e503afd);
 #   * a directory counts only if every file under the asked subpaths has the raw bytes
 #     (no filters, no attributes) and mode of the locked commit and no other file (build
 #     outputs included) sits beside them.
 #
 # Usage:
-#   aienos_lock_source.sh identity                 one JSON object: lock, repo, tree, status (and
-#                                                  the omega-mv commit when the source is kernel/)
+#   aienos_lock_source.sh identity                 one JSON object: lock, source (omega-mv-kernel
+#                                                  or git-object), repo, tree, status
 #   aienos_lock_source.sh show <path>              file content at the locked commit
 #   aienos_lock_source.sh blob <path>              blob id of <path> at the locked commit
 #   aienos_lock_source.sh verify-dir <dir> <subpath>...   prove <dir> holds the locked subpaths
@@ -50,9 +51,8 @@
 #   AIENOS_LOCK        lock value instead of the file (tests, and argus.lock for the ARGUS
 #                      sources; must still be full 40-hex)
 #   AIENOS_LOCK_REPO   repository to read objects from (default, when unset or empty: this
-#                      omega-mv repository, through kernel/import/commit-map); a place to
-#                      look, not proof: the commit object is the proof
-#   AIENOS_COMMIT_MAP  the aienux-to-omega-mv commit map (default <omega>/kernel/import/commit-map)
+#                      omega-mv repository; a full clone is needed); a place to look, not
+#                      proof: the commit object is the proof
 #   AIENOS_R7_DIR      if it lies inside a git repository, that repository is also tried
 set -u
 export GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/aienos-lock-source-grafts
@@ -71,28 +71,23 @@ rehash() {
     [ "$got" = "$3" ]
 }
 
-# The omega-mv commit the commit map gives LOCK: exactly one row, a full commit id.
-MAPPED=$(awk -v l="$LOCK" '$1 == l {print $2; n++} END {exit n != 1}' "${AIENOS_COMMIT_MAP:-$HERE/kernel/import/commit-map}" 2>/dev/null) || MAPPED=""
-[[ "$MAPPED" =~ ^[0-9a-f]{40}$ ]] || MAPPED=""
-
-REPO="" TREE="" OMEGA_COMMIT=""
+REPO="" TREE="" SOURCE=""
 for cand in "${AIENOS_LOCK_REPO:-$HERE}" \
             "$( [ -n "${AIENOS_R7_DIR:-}" ] && [ -d "$AIENOS_R7_DIR" ] && git -C "$AIENOS_R7_DIR" rev-parse --show-toplevel 2>/dev/null)"; do
     [ -n "$cand" ] && [ -d "$cand" ] || continue
     if [ "$(git -C "$cand" rev-parse --verify -q "$LOCK^{commit}" 2>/dev/null)" = "$LOCK" ] && rehash "$cand" commit "$LOCK"; then
         REPO=$(cd "$cand" && pwd)
-        TREE=$(git -C "$REPO" rev-parse --verify -q "$LOCK^{tree}")
         break
     fi
-    [ -n "$MAPPED" ] || continue
-    [ "$(git -C "$cand" rev-parse --verify -q "$MAPPED^{commit}" 2>/dev/null)" = "$MAPPED" ] || continue
-    rehash "$cand" commit "$MAPPED" || continue
-    t=$(git -C "$cand" rev-parse --verify -q "$MAPPED:kernel" 2>/dev/null) || continue
-    [ "$(git -C "$cand" cat-file -t "$t")" = tree ] || continue
-    REPO=$(cd "$cand" && pwd) TREE=$t OMEGA_COMMIT=$MAPPED
-    break
 done
 if [ -n "$REPO" ]; then
+    root=$(git -C "$REPO" rev-parse --verify -q "$LOCK^{tree}") || die2 "commit $LOCK has no tree in $REPO"
+    rehash "$REPO" tree "$root" || die2 "root tree $root of $LOCK fails its hash in $REPO"
+    if t=$(git -C "$REPO" rev-parse --verify -q "$LOCK:kernel" 2>/dev/null) && [ "$(git -C "$REPO" cat-file -t "$t")" = tree ]; then
+        TREE=$t SOURCE=omega-mv-kernel
+    else
+        TREE=$root SOURCE=git-object
+    fi
     rehash "$REPO" tree "$TREE" || die2 "tree object $TREE of $LOCK fails its hash in $REPO"
 fi
 need_repo() { [ -n "$REPO" ] || die2 "no repository holds commit $LOCK (AIENOS_LOCK_REPO=${AIENOS_LOCK_REPO:-unset})"; }
@@ -110,11 +105,7 @@ cmd=${1:-}; shift || true
 case "$cmd" in
 identity)
     if [ -n "$REPO" ]; then
-        if [ -n "$OMEGA_COMMIT" ]; then
-            printf '{"aienos_lock": "%s", "source": "omega-mv-kernel", "repo": "%s", "omega_commit": "%s", "commit_tree": "%s", "status": "available"}\n' "$LOCK" "$REPO" "$OMEGA_COMMIT" "$TREE"
-        else
-            printf '{"aienos_lock": "%s", "source": "git-object", "repo": "%s", "commit_tree": "%s", "status": "available"}\n' "$LOCK" "$REPO" "$TREE"
-        fi
+        printf '{"aienos_lock": "%s", "source": "%s", "repo": "%s", "commit_tree": "%s", "status": "available"}\n' "$LOCK" "$SOURCE" "$REPO" "$TREE"
     else
         printf '{"aienos_lock": "%s", "source": "none", "repo": "", "commit_tree": "", "status": "unavailable"}\n' "$LOCK"
         exit 2

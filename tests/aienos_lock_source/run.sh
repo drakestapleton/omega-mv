@@ -66,34 +66,78 @@ obj="$CORR/.git/objects/${B:0:2}/${B:2}"
 chmod u+w "$obj" && cp "$CORR/.git/objects/${X:0:2}/${X:2}" "$obj"
 check "altered object bytes: refused (exit 2), never read as content" '[ "$(rc env AIENOS_LOCK_REPO="$CORR" AIENOS_R7_DIR= AIENOS_LOCK=$A bash "$T" show native/capability/aienos_capability.c)" = 2 ]'
 
-# 1b. aienux folded into omega-mv as kernel/, its commits rewritten: a repository without the locked
-# commit counts when it holds the commit the map gives it, and the source is that commit's kernel/.
+# 1b. aienux folded into omega-mv as kernel/: the lock names an omega-mv commit, and the source is
+# that commit's kernel/ tree; a commit without kernel/ is read at its root. No map is read.
 OM=$SCR/omega-fold; mkdir -p "$OM/kernel"
 git -C "$LK" archive "$GOOD" native | tar -x -C "$OM/kernel"
 omg() { git -C "$OM" -c user.name=t -c user.email=t@invalid -c commit.gpgsign=false "$@"; }
 omg init -q && omg add -A && omg commit -qm "kernel/ at GOOD"; OMC=$(git -C "$OM" rev-parse HEAD)
 omg rm -q -r kernel && omg commit -qm "no kernel/"; OMN=$(git -C "$OM" rev-parse HEAD)
-printf 'old new\n%s %s\n' "$GOOD" "$OMC" > "$SCR/map"
-printf '%s %s\n%s %s\n' "$GOOD" "$OMC" "$GOOD" "$OMC" > "$SCR/map-twice"
-printf '%s 0123456789abcdef0123456789abcdef01234567\n' "$GOOD" > "$SCR/map-absent"
-printf '%s %s\n' "$GOOD" "$OMN" > "$SCR/map-nokernel"
-K() { env AIENOS_LOCK_REPO="$OM" AIENOS_R7_DIR= AIENOS_LOCK=$GOOD "$@"; }
-check "kernel/ route: the locked file read from the mapped commit (exit 0)" '[ "$(K AIENOS_COMMIT_MAP=$SCR/map bash "$T" show native/capability/aienos_capability.c)" = "$(git -C "$LK" show $GOOD:native/capability/aienos_capability.c)" ]'
-check "kernel/ route: identity names the omega-mv commit and its kernel/ tree" '[ "$(K AIENOS_COMMIT_MAP=$SCR/map bash "$T" identity | jq -r "[.source, .omega_commit, .commit_tree] | join(\" \")")" = "omega-mv-kernel $OMC $(git -C "$OM" rev-parse $OMC:kernel)" ]'
-check "kernel/ route: two map rows for the lock: exit 2" '[ "$(rc K AIENOS_COMMIT_MAP=$SCR/map-twice bash "$T" identity)" = 2 ]'
-check "kernel/ route: mapped commit absent from the repository: exit 2" '[ "$(rc K AIENOS_COMMIT_MAP=$SCR/map-absent bash "$T" identity)" = 2 ]'
-check "kernel/ route: mapped commit without kernel/: exit 2" '[ "$(rc K AIENOS_COMMIT_MAP=$SCR/map-nokernel bash "$T" identity)" = 2 ]'
-check "kernel/ route: no map: exit 2" '[ "$(rc K AIENOS_COMMIT_MAP=/nonexistent bash "$T" identity)" = 2 ]'
+printf 'old new\n%s %s\n' "$GOOD" "$OMN" > "$SCR/map-elsewhere"
+K() { env AIENOS_LOCK_REPO="$OM" AIENOS_R7_DIR= "$@"; }
+check "kernel/ commit: the locked file read from its kernel/ (exit 0)" '[ "$(K AIENOS_LOCK=$OMC bash "$T" show native/capability/aienos_capability.c)" = "$(git -C "$LK" show $GOOD:native/capability/aienos_capability.c)" ]'
+check "kernel/ commit: identity names the lock and its kernel/ tree" '[ "$(K AIENOS_LOCK=$OMC bash "$T" identity | jq -r "[.source, .aienos_lock, .commit_tree] | join(\" \")")" = "omega-mv-kernel $OMC $(git -C "$OM" rev-parse $OMC:kernel)" ]'
+check "kernel/ commit: a commit map naming another commit is not read (AIENOS_COMMIT_MAP)" '[ "$(K AIENOS_LOCK=$OMC AIENOS_COMMIT_MAP=$SCR/map-elsewhere bash "$T" identity | jq -r .commit_tree)" = "$(git -C "$OM" rev-parse $OMC:kernel)" ]'
+check "kernel/ commit: an aienux lock the repository does not hold is unavailable, map or not: exit 2" '[ "$(rc K AIENOS_LOCK=$GOOD AIENOS_COMMIT_MAP=$SCR/map-elsewhere bash "$T" identity)" = 2 ]'
+check "commit without kernel/: read at its root, where the file is absent: exit 1" '[ "$(rc K AIENOS_LOCK=$OMN bash "$T" show native/capability/aienos_capability.c)" = 1 ]'
 KD=$SCR/kcache
-check "kernel/ route: materialize and verify (exit 0)" '[ "$(rc K AIENOS_COMMIT_MAP=$SCR/map bash "$T" materialize "$KD" native/capability)" = 0 ]'
+check "kernel/ commit: materialize and verify (exit 0)" '[ "$(rc K AIENOS_LOCK=$OMC bash "$T" materialize "$KD" native/capability)" = 0 ]'
 echo 'int edited;' >> "$KD/native/capability/aienos_capability.c"
-check "kernel/ route: an edited materialized file: exit 1" '[ "$(rc K AIENOS_COMMIT_MAP=$SCR/map bash "$T" verify-dir "$KD" native/capability)" = 1 ]'
-# This repository: aienos.lock and argus.lock resolve through kernel/import/commit-map by default
-# (needs the full history, as every clone the gates run in has); an explicit repository is the
-# only one tried.
-check "this repository: aienos.lock through kernel/import/commit-map (exit 0)" '[ "$(env -u AIENOS_LOCK_REPO -u AIENOS_LOCK AIENOS_R7_DIR= bash "$T" identity | jq -r .source)" = omega-mv-kernel ]'
-check "this repository: argus.lock through kernel/import/commit-map (exit 0)" '[ "$(env -u AIENOS_LOCK_REPO AIENOS_R7_DIR= AIENOS_LOCK=$(head -n 1 "$HERE/argus.lock") bash "$T" identity | jq -r .source)" = omega-mv-kernel ]'
+check "kernel/ commit: an edited materialized file: exit 1" '[ "$(rc K AIENOS_LOCK=$OMC bash "$T" verify-dir "$KD" native/capability)" = 1 ]'
+
+# This repository: aienos.lock and argus.lock name omega-mv commits whose kernel/ is the source (a
+# full clone is needed; every clone the gates run in has the history). lockprov DIR LOCKFILE: line 1
+# is a full commit id, the file has exactly one "# aienux H" line, and DIR's kernel/import/commit-map
+# has exactly one row for H, naming line 1. That is a consistency check of the provenance line; the
+# source itself is proven from line 1 alone.
+lockprov() {
+    local c h rows
+    c=$(head -n 1 "$1/$2"); h=$(awk '$1 == "#" && $2 == "aienux" {print $3; n++} END {exit n != 1}' "$1/$2") || return 1
+    [[ "$c" =~ ^[0-9a-f]{40}$ && "$h" =~ ^[0-9a-f]{40}$ ]] || return 1
+    rows=$(awk -v h="$h" 'NR > 1 && $1 == h' "$1/kernel/import/commit-map")
+    [ "$rows" = "$h $c" ]
+}
+for lf in aienos.lock argus.lock; do
+    check "this repository: $lf is an omega-mv commit read at its kernel/ (exit 0)" '[ "$(env -u AIENOS_LOCK_REPO -u AIENOS_COMMIT_MAP AIENOS_R7_DIR= AIENOS_LOCK=$(head -n 1 "$HERE/$lf") bash "$T" identity | jq -r "[.source, .commit_tree] | join(\" \")")" = "omega-mv-kernel $(git -C "$HERE" rev-parse "$(head -n 1 "$HERE/$lf"):kernel")" ]'
+    check "this repository: $lf provenance line agrees with kernel/import/commit-map" 'lockprov "$HERE" $lf'
+done
 check "this repository: an explicit lock repository without the commit is the only one tried: exit 2" '[ "$(rc env -u AIENOS_LOCK AIENOS_LOCK_REPO=/nonexistent AIENOS_R7_DIR= bash "$T" identity)" = 2 ]'
+# Reviewer finding 4 (omega-mv c9e503afd) and variants, on a scratch clone S of this repository with
+# this work tree's tool and locks: E is a commit whose kernel/native/capability/aienos_capability.c
+# gains a line. Each forged state must leave the served source the locked one, or fail lockprov.
+S=$SCR/forge; git clone -q -s -n "$HERE" "$S"
+sg() { git -C "$S" -c user.name=t -c user.email=t@invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
+CAP=kernel/native/capability/aienos_capability.c
+sg checkout -q HEAD -- kernel/import/commit-map "$CAP" && mkdir -p "$S/tools" &&
+    cp "$HERE/tools/aienos_lock_source.sh" "$S/tools/" && cp "$HERE/aienos.lock" "$HERE/argus.lock" "$S/"
+ALOCK=$(head -n 1 "$HERE/aienos.lock"); AUX=$(awk '$1 == "#" && $2 == "aienux" {print $3}' "$HERE/aienos.lock")
+WANTCAP=$(git -C "$HERE" show "$ALOCK:$CAP")
+echo 'int forged_capability;' >> "$S/$CAP"; sg commit -q --no-verify -m "edit capability source" -- "$CAP"; E=$(git -C "$S" rev-parse HEAD)
+TS="$S/tools/aienos_lock_source.sh"
+servedlocked() { [ "$(env -u AIENOS_LOCK -u AIENOS_LOCK_REPO AIENOS_R7_DIR= "$@" bash "$TS" show native/capability/aienos_capability.c)" = "$WANTCAP" ]; }
+cp "$S/kernel/import/commit-map" "$SCR/map-orig"
+awk -v h="$AUX" -v e="$E" '$1 == h {$2 = e} {print}' "$SCR/map-orig" > "$S/kernel/import/commit-map"
+sg commit -q --no-verify -m "repoint map row" -- kernel/import/commit-map
+check "finding 4: map row repointed to an edited capability source: the locked source is still served" 'servedlocked'
+check "finding 4: map row repointed: the provenance check fails" '! lockprov "$S" aienos.lock'
+check "finding 4: map row repointed: verify-dir of the edited kernel/ fails: exit 1" '[ "$(rc env -u AIENOS_LOCK -u AIENOS_LOCK_REPO AIENOS_R7_DIR= bash "$TS" verify-dir "$S/kernel" native/capability)" = 1 ]'
+check "variant: AIENOS_COMMIT_MAP naming the forged map is not read" 'servedlocked AIENOS_COMMIT_MAP="$S/kernel/import/commit-map"'
+cp "$SCR/map-orig" "$S/kernel/import/commit-map"
+{ head -n 1 "$SCR/map-orig"; printf '%s %s\n' "$AUX" "$E"; tail -n +2 "$SCR/map-orig"; } > "$S/kernel/import/commit-map"
+check "variant: a second map row for the locked aienux commit, naming E: the provenance check fails" '! lockprov "$S" aienos.lock'
+check "variant: the second row is not read either" 'servedlocked'
+cp "$SCR/map-orig" "$S/kernel/import/commit-map"
+{ echo "$E"; tail -n +2 "$HERE/aienos.lock"; } > "$S/aienos.lock"
+check "variant: aienos.lock repointed to E, map unchanged: the provenance check fails" '! lockprov "$S" aienos.lock'
+{ echo "$E"; echo "# aienux $(printf 'a%.0s' $(seq 40))"; tail -n +3 "$HERE/aienos.lock"; } > "$S/aienos.lock"
+check "variant: aienos.lock repointed to E with an aienux line no row has: the provenance check fails" '! lockprov "$S" aienos.lock'
+{ echo "$E"; tail -n +3 "$HERE/aienos.lock"; } > "$S/aienos.lock"
+check "variant: aienos.lock repointed to E without its aienux line: the provenance check fails" '! lockprov "$S" aienos.lock'
+cp "$HERE/aienos.lock" "$S/aienos.lock"
+sg replace "$ALOCK" "$E"
+check "variant: a replace ref from the locked commit to E is ignored" 'servedlocked'
+sg replace -d "$ALOCK" > /dev/null
+check "control: the unforged scratch clone passes the provenance check" 'lockprov "$S" aienos.lock && lockprov "$S" argus.lock'
 
 # 2. directories: proven only against the locked commit
 D=$SCR/cache
