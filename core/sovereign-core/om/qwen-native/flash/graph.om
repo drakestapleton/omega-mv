@@ -1,0 +1,564 @@
+note One text sequence on the frozen Qwen3.8-Flash-Next-FP8 model: four residual streams, gated
+note hyper-connections around every block, one lexical n-gram layer, and 512 routed experts per layer.
+note Tensors that the reference stores as BF16 are rounded to BF16 at the same boundaries.
+note Working rows are globals because a global is never passed as an argument. Products go through fin and fout.
+note qrun: 0 model, 1 layer, 2 position, 3 stopped, 4 emitted.
+global qrun ulong 6
+global fh f32 10240
+global fnrm f32 10240
+global fkn f32 10240
+global fgv f32 10240
+global fx f32 2560
+global fdy f32 2560
+global fsh f32 2560
+global fval f32 2560
+global fga f32 640
+global finj f32 4
+global fvp f32 8388608
+global fvo uint 196608
+global fvn ulong 1
+fn qwroleof slot ulong to ulong
+ret ulong get qrole add mul get qrun 1 1600 slot
+end
+
+note Host copy of one small BF16 tensor, widened once. Returns its start in fvp.
+fn fvec id ulong to ulong
+o = ulong get fvo id
+if ne o 0
+ret sub o 1
+end
+if ne get qwdtype id 2
+qwfail 51
+end
+n = get qwcount id
+base = get fvn 0
+if or gt mul n 2 len qbuf gt add base n len fvp
+qwfail 51
+end
+qwread id 0 n
+for j ulong n
+put fvp add base j qbf j
+end
+put fvn 0 add base n
+put fvo id uint add base 1
+ret base
+end
+
+fn fsig x f32 to f32
+ret qrb f32 qb_sig f64 x
+end
+
+fn fsilu x f32 to f32
+ret qrb mul x f32 qb_sig f64 x
+end
+
+note Element i of a normalization source: 0 the residual streams, 1 the last product, 2 the gated lexical value.
+fn fsrc sel ulong i ulong to f32
+if eq sel 0
+ret get fh i
+end
+if eq sel 1
+ret get fout i
+end
+ret get fgv i
+end
+
+note Grouped RMS normalization of four 2560-wide streams with zero-centred gains. The result is fnrm.
+fn fgnorm wid ulong sel ulong to void
+wo = fvec wid
+for s ulong 4
+acc = 0.0f64
+for j ulong 2560
+v = f64 fsrc sel add mul s 2560 j
+acc = add acc mul v v
+end
+inv = div 1.0f64 fsqrt add div acc 2560.0f64 0.000001f64
+for j ulong 2560
+i = add mul s 2560 j
+gain = add 1.0f64 f64 get fvp add wo i
+put fnrm i qrb f32 mul mul f64 fsrc sel i inv gain
+end
+end
+end
+
+fn fnrmin to void
+for j ulong 10240
+put fin j get fnrm j
+end
+end
+
+fn fxin to void
+for j ulong 2560
+put fin j get fx j
+end
+end
+
+note Gated residual input. Reads fh, leaves the mixed block input in fx and, when iid is nonzero, the stream injection weights in finj.
+fn fhyper nid ulong did ulong uid ulong iid ulong to void
+fgnorm nid 0
+if ne iid 0
+fnrmin
+fmat iid
+for s ulong 4
+put finj s mul 2.0f32 fsig qrb mul get fout s 0.25f32
+end
+end
+fnrmin
+fmat did
+for j ulong 320
+put fin j fsilu qrb mul get fout j 0.25f32
+end
+fmat uid
+for j ulong 2560
+acc = 0.0f32
+for s ulong 4
+i = add mul s 2560 j
+acc = add acc qrb mul fsig get fout i get fnrm i
+end
+put fx j qrb mul acc 0.25f32
+end
+end
+
+note fh = fh + injection weight of each stream times the block output in fdy.
+fn fapply to void
+for s ulong 4
+wt = get finj s
+for j ulong 2560
+i = add mul s 2560 j
+put fh i qrb add get fh i qrb mul get fdy j wt
+end
+end
+end
+
+fn foutdy to void
+for j ulong 2560
+put fdy j get fout j
+end
+end
+
+fn fdelta to void
+p = new f32 16480 0.0f32
+w = new f32 41184 0.0f32
+z = new f32 6144 0.0f32
+fxin
+fmat qwroleof 6
+for j ulong 10240
+put p j get fout j
+end
+fmat qwroleof 7
+for j ulong 6144
+put p add 10240 j get fout j
+end
+fmat qwroleof 4
+for j ulong 48
+put p add 16384 mul j 2 get fout j
+end
+fmat qwroleof 5
+for j ulong 48
+put p add 16385 mul j 2 get fout j
+end
+o = fvec qwroleof 10
+for j ulong 40960
+put w j get fvp add o j
+end
+o = fvec qwroleof 2
+for j ulong 48
+put w add 40960 j get fvp add o j
+end
+o = fvec qwroleof 3
+for j ulong 48
+put w add 41008 j get fvp add o j
+end
+o = fvec qwroleof 8
+for j ulong 128
+put w add 41056 j get fvp add o j
+end
+qwen_delta_step 38 get qrun 1 get qrun 2 p w z
+for j ulong 6144
+put fin j qrb get z j
+end
+fmat qwroleof 9
+foutdy
+end
+
+fn fattention to void
+p = new f32 14336 0.0f32
+w = new f32 512 0.0f32
+z = new f32 6144 0.0f32
+fxin
+fmat qwroleof 13
+for j ulong 12288
+put p j get fout j
+end
+fmat qwroleof 14
+for j ulong 512
+put p add 12288 j get fout j
+end
+fmat qwroleof 15
+for j ulong 512
+put p add 12800 j get fout j
+end
+o = fvec qwroleof 11
+for j ulong 256
+put w j get fvp add o j
+end
+o = fvec qwroleof 12
+for j ulong 256
+put w add 256 j get fvp add o j
+end
+qwen_attention_step 38 get qrun 1 get qrun 2 p w z
+for j ulong 6144
+put fin j qrb get z j
+end
+fmat qwroleof 16
+foutdy
+end
+
+global qtop uint 10
+global qprob f32 10
+note Top ten of the 512 router scores now in fout, with their renormalized softmax weights.
+fn froute to void
+den = 0.0f64
+top = 0.0f64
+for rank ulong 10
+best = ulong 512
+for e ulong 512
+used = false
+for j ulong rank
+if eq ulong get qtop j e
+used = true
+end
+end
+if not used
+if eq best 512
+best = e
+else
+if gt get fout e get fout best
+best = e
+end
+end
+end
+end
+put qtop rank uint best
+if eq rank 0
+top = f64 get fout best
+end
+p = qb_exp sub f64 get fout best top
+den = add den p
+put qprob rank f32 p
+end
+for rank ulong 10
+put qprob rank qrb f32 div f64 get qprob rank den
+end
+note The reference accumulates expert outputs in ascending expert order.
+for i ulong 10
+for j ulong sub 9 i
+if gt get qtop j get qtop add j 1
+e = get qtop j
+put qtop j get qtop add j 1
+put qtop add j 1 e
+p = get qprob j
+put qprob j get qprob add j 1
+put qprob add j 1 p
+end
+end
+end
+end
+
+note fin = silu(fga) * fout over the 640 expert channels.
+fn fswiglu to void
+for j ulong 640
+put fin j qrb mul fsilu get fga j get fout j
+end
+end
+
+fn fgate to void
+for j ulong 640
+put fga j get fout j
+end
+end
+
+note Routed expert block. Reads fx, leaves the block output in fdy.
+fn fmoe to void
+layer = get qrun 1
+fxin
+fmat qwroleof 22
+fgate
+fxin
+fmat qwroleof 23
+fswiglu
+fmat qwroleof 24
+for j ulong 2560
+put fsh j get fout j
+put fdy j 0.0f32
+end
+fxin
+fmat qwroleof 20
+froute
+for r ulong 10
+key = mul add mul layer 512 ulong get qtop r 4
+fxin
+fexpert key
+fgate
+fxin
+fexpert add key 1
+fswiglu
+fexpert add key 2
+wt = get qprob r
+for j ulong 2560
+put fdy j qrb add get fdy j qrb mul get fout j wt
+end
+end
+fxin
+fmat qwroleof 21
+sg = fsig get fout 0
+for j ulong 2560
+put fdy j qrb add get fdy j qrb mul get fsh j sg
+end
+end
+
+note Lexical layer state: n-gram parameters, token history and nine past rows of the convolution input.
+note fng: 0-2 multipliers, 3-18 head offsets, 19-34 head sizes, 35 previous token, 36 older token, 37 loaded.
+global fng ulong 40
+global fngscale f32 1
+global fpast f32 92160
+fn fle64 j ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get qbuf add mul j 8 i mul 8 i
+end
+ret v
+end
+
+fn fngload to void
+if eq get fng 37 1
+ret
+end
+qwread qwroleof 42 0 3
+for j ulong 3
+put fng j fle64 j
+end
+qwread qwroleof 43 0 16
+for j ulong 16
+put fng add 3 j fle64 j
+end
+qwread qwroleof 44 0 16
+for j ulong 16
+put fng add 19 j fle64 j
+end
+total = ulong 0
+for j ulong 16
+n = get fng add 19 j
+if or ne get fng add 3 j total eq n 0
+qwfail 47
+end
+total = add total n
+end
+if gt total 320001536
+qwfail 47
+end
+for j ulong 3
+m = get fng j
+if or eq m 0 gt m 37143239288394
+qwfail 47
+end
+end
+qwread qwroleof 45 0 1
+put fngscale 0 qbf 0
+put fng 37 1
+end
+
+note One hashed FP8 row, scaled and rounded to BF16, into fin at head h.
+fn fnghead mix ulong h ulong to void
+row = add get fng add 3 h rem mix get fng add 19 h
+qwread ulong get qngram div row 2500012 mul rem row 2500012 160 160
+scale = get fngscale 0
+for j ulong 160
+put fin add mul h 160 j qrb mul scale bitcast f32 lqbits uint get qbuf j
+end
+end
+
+note The sixteen hashed rows of this token: eight from the bigram and eight from the trigram.
+fn fngather tok ulong to void
+bi = xor mul tok get fng 0 mul get fng 35 get fng 1
+tri = xor bi mul get fng 36 get fng 2
+for h ulong 8
+fnghead bi h
+fnghead tri add h 8
+end
+end
+
+note Signed square-root gate of one stream from its normalized key (fkn) and query (fnrm) rows.
+fn flexgate s ulong to f32
+acc = 0.0f32
+for j ulong 2560
+i = add mul s 2560 j
+acc = add acc qrb mul get fkn i get fnrm i
+end
+g = qrb div qrb acc 50.596442562694072f32
+mag = qrb fsqrt fmax fabs g 0.000001f32
+if lt g 0.0f32
+mag = neg mag
+end
+if eq g 0.0f32
+mag = 0.0f32
+end
+ret fsig mag
+end
+
+note Dilated depthwise convolution of channel c: taps at 9, 6 and 3 rows back, then the current row in fnrm.
+fn flexconv c ulong w ulong to f32
+pos = get qrun 2
+slot = rem pos 9
+tap = add w mul c 4
+total = mul get fnrm c get fvp add tap 3
+for j ulong 3
+if ge pos sub 9 mul j 3
+idx = rem add slot mul j 3 9
+idx = add mul idx 10240 c
+old = get fpast idx
+total = add total mul old get fvp add tap j
+end
+end
+ret fsilu qrb total
+end
+
+fn flexhistory tok ulong to void
+if eq get qrun 2 0
+put fng 35 248044
+put fng 36 248044
+end
+fngather tok
+put fng 36 get fng 35
+if eq tok 248044
+put fng 36 248044
+end
+put fng 35 tok
+end
+
+fn flexical tok ulong to void
+fngload
+flexhistory tok
+note fin holds the n-gram embedding for both projections; products do not modify fin.
+fmat qwroleof 41
+for j ulong 2560
+put fval j get fout j
+end
+fmat qwroleof 37
+fgnorm qwroleof 39 1
+for j ulong 10240
+put fkn j get fnrm j
+end
+fgnorm qwroleof 40 0
+for s ulong 4
+sg = flexgate s
+for j ulong 2560
+put fgv add mul s 2560 j qrb mul sg get fval j
+end
+end
+fgnorm qwroleof 38 2
+w = fvec qwroleof 36
+for c ulong 10240
+put fh c qrb add get fh c qrb add get fgv c flexconv c w
+end
+slot = rem get qrun 2 9
+for c ulong 10240
+put fpast add mul slot 10240 c get fnrm c
+end
+end
+
+fn flayer tok ulong to void
+if eq get qrun 1 1
+flexical tok
+end
+fhyper qwroleof 25 qwroleof 26 qwroleof 27 qwroleof 28
+if eq rem get qrun 1 4 3
+fattention
+else
+fdelta
+end
+fdebughalf
+fapply
+fhyper qwroleof 29 qwroleof 30 qwroleof 31 qwroleof 32
+fmoe
+fdebughalf
+fapply
+end
+
+fn qargmax n ulong to ulong
+best = ulong 0
+for j ulong n
+b = bitcast uint get fout j
+if eq and b 2139095040 2139095040
+qwfail 54
+end
+if gt get fout j get fout best
+best = j
+end
+end
+ret best
+end
+
+note Instrument: with fdebug set, the four residual streams after every layer go to stdout as BF16.
+global fdebug ulong 1
+fn fdebugrow to void
+for j ulong 10240
+bits = shr bitcast uint get fh j 16
+tkpc ulong and bits 255
+tkpc ulong shr bits 8
+end
+end
+
+note Instrument: with fdebug 2, the block input, injection weights and block output of both halves of
+note layers 0 to 3 go to stdout as raw binary32, 5124 values per half.
+fn fdebugword bits uint to void
+tkpc ulong and bits 255
+tkpc ulong and shr bits 8 255
+tkpc ulong and shr bits 16 255
+tkpc ulong shr bits 24
+end
+
+fn fdebughalf to void
+if or ne get fdebug 0 2 ge get qrun 1 4
+ret
+end
+for j ulong 2560
+fdebugword bitcast uint get fx j
+end
+for j ulong 4
+fdebugword bitcast uint get finj j
+end
+for j ulong 2560
+fdebugword bitcast uint get fdy j
+end
+end
+
+note One token through the model. With logits the final mixed row stays in fx and the vocabulary scores in fout.
+fn qtoken tok ulong pos ulong logits bool to ulong
+if or ge tok 248320 ge pos 2048
+qwfail 55
+end
+put qrun 2 pos
+qwread ulong get qglob 0 mul tok 2560 2560
+for j ulong 2560
+v = qbf j
+put fh j v
+put fh add 2560 j v
+put fh add 5120 j v
+put fh add 7680 j v
+end
+for l ulong 48
+put qrun 1 l
+flayer tok
+if eq get fdebug 0 1
+fdebugrow
+end
+end
+if not logits
+ret 0
+end
+fhyper ulong get qglob 2 ulong get qglob 3 ulong get qglob 4 0
+fxin
+fmat ulong get qglob 1
+ret qargmax 248320
+end
