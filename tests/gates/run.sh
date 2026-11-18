@@ -614,6 +614,14 @@ case "$step" in
     base="${AIEN_BASE_REF:-origin/main}"
     obs base_ref "\"$(git rev-parse "$base")\""
     tools/evidence_generated_check.sh "$base"
+    # R5: a change cannot loosen the checker that judges it: when the base ref has the checker and this change edits it,
+    # the base copy also judges this change.
+    if git cat-file -e "$base:tools/evidence_generated_check.sh" 2> /dev/null &&
+       ! git diff --quiet "$base" HEAD -- tools/evidence_generated_check.sh; then
+      egc_base="$(mktemp)"; git show "$base:tools/evidence_generated_check.sh" > "$egc_base"
+      obs evidence_checker_changed 1
+      egc_rc=0; EGC_ROOT="$PWD" bash "$egc_base" "$base" || egc_rc=$?; unlink "$egc_base"; [ "$egc_rc" = 0 ]
+    fi
     ;;
   zero-disk-secrets)
     echo "Auditing repository for prohibited plaintext secret files..."
