@@ -24,13 +24,25 @@ the TRUST-1 owner ceremony first.
   `HWGATE <id> <tier> <status>`. No receipt, no claim.
 
 [`tools/hwgates/hwgates.om`](../tools/hwgates/hwgates.om) (seeded Omega, built with omega-mv's
-[`seed/out/omc`](../../seed/out/omc.sha256)) enforces these as rules R1..R9, refuses an
-empty register (R8) and the deletion of a gate whose receipt still names it (R9), and prints
-`HWGATES PASS rows=… gates=… physical=… physical_pass=… physical_not_pass=…`. The local Spark gate
-`AIENOS-HW-GATES` (`tests/gates/run.sh hw-gates`, which runs `tools/hwgates/gate.sh`) runs the
-checker on the register, its fixtures, mutants and planted-bad copies, and the shell checks that
-the checker cannot do (receipt files, inventory, receipt claims, source commits, size alarm); the
-comments in `gate.sh` name each check. Without the pinned compiler it exits 3 (NOT_RUN), never 0.
+[`seed/out/omc`](../../seed/out/omc.sha256)) enforces these as rules R1..R10, refuses an
+empty register (R8), the deletion of a gate whose receipt still names it (R9) and a gate id with
+anything but upper-case letters, digits, `-`, `_` or `.` (R10, so two ids never differ by case
+alone), and prints `HWGATES PASS rows=… gates=… physical=… physical_pass=… physical_not_pass=…`.
+The checker has no size cap: the register, receipts and row tables are run-time pools grown to the
+input. The gate (`tests/gates/run.sh kernel-hw-gates` from the omega-mv root, which runs
+`kernel/tests/gates/run.sh hw-gates` and so `tools/hwgates/gate.sh`) runs the checker on the
+register, its fixtures (a good fixture must print its exact count line, one of them with an
+accepted PHYSICAL PASS), mutants and planted-bad copies, compares the register's count line with
+counts taken from the register itself, and runs the shell checks the checker cannot do: receipt
+files, inventory, receipt claims, withdrawn lines, unchanged receipts, source commits, a run far
+past the old 1024-row and 524288-byte tables, and a size alarm when the real register passes what
+that run proves. The comments in `gate.sh` name each check. Without the pinned compiler it exits 3
+(NOT_RUN), never 0.
+
+A source `aienux@<commit>` names the aienux commit the row was written against. The fold into
+omega-mv rewrote aienux history, so the gate looks the commit up in
+[`import/commit-map`](../import/commit-map) and requires the rewritten commit to be in this
+repository; a commit the map does not know, or maps to zeros, fails. Rows keep their aienux hashes.
 
 To add a physical PASS: run the attended procedure under its own authorization, commit the raw
 receipt under `evidence/` with the `HWGATE <id> PHYSICAL PASS` line plus source commit, image
@@ -43,7 +55,10 @@ without that file.
 not repeat them. Each PASS or FAIL row there names its receipt, and the receipt holds the exact
 commands and logs (the 2026-11-07 host and QEMU run is
 [`evidence/HWGATES-20261107/RECEIPT.txt`](../evidence/HWGATES-20261107/RECEIPT.txt), with the raw
-logs beside it). To read it as a table: `column -t -s "$(printf '\t')" docs/hardware-gates.tsv`.
+logs beside it; as [`CORRECTION-20261118.txt`](../evidence/HWGATES-20261107/CORRECTION-20261118.txt)
+beside it records, its per-script omega-gpu-driver counts have no tracked log behind them and its
+second omega-gpu-driver compiler is missing from the run's input record).
+To read the register as a table: `column -t -s "$(printf '\t')" docs/hardware-gates.tsv`.
 
 ## What a physical receipt needs
 
@@ -55,10 +70,15 @@ no receipt yet cannot leave the inventory without a reviewed change to both file
 them side by side:
 `join -t "$(printf '\t')" <(grep -v '^#' docs/hardware-gates-needs.tsv | sort) <(awk -F '\t' '$4=="PHYSICAL" {print $1 "\t" $7}' docs/hardware-gates.tsv | sort)`.
 
-A receipt is never rewritten. When a later review finds that a committed receipt line claims
-more than the register allows, a dated `CORRECTION-<date>.txt` beside the receipt names the line
-(`CORRECTS HWGATE <id> <tier> <status>`) and says why. The gate refuses a receipt line whose
-status differs from the register's row for that id and tier unless such a correction covers it.
+A receipt is never rewritten, and the gate holds it: every tracked file in the folder of a cited
+receipt or of a file with `HWGATE` lines, and `import/commit-map`, must have exactly the content of
+the commit that first added it, so a line appended or edited, committed or not, fails (a shallow
+clone fails too, because the adding commit cannot be found). When a later review finds that a
+committed receipt line claims more than it shows, a dated `CORRECTION-<date>.txt` beside the
+receipt names the line (`CORRECTS HWGATE <id> <tier> <status>`) and says why. That withdraws the
+line: it no longer backs a PASS or FAIL row, and the gate refuses a row resting on it. The gate
+also refuses a receipt line whose status differs from the register's row for that id and tier
+unless such a correction covers it.
 
 The native Spark path still runs the GB10 through NVIDIA's `nvidia.ko`/`nvidia-uvm.ko`
 580.173.02; none of the GPU gates replaces it.
