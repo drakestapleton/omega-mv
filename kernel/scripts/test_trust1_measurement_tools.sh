@@ -43,14 +43,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-port=$((20000 + RANDOM % 20000))
-mkdir -p "${work}/tpm"
-swtpm socket --tpm2 --tpmstate dir="${work}/tpm" \
-    --server type=tcp,port="${port}",bindaddr=127.0.0.1 \
-    --ctrl type=tcp,port=$((port + 1)),bindaddr=127.0.0.1 \
-    --flags not-need-init,startup-clear &
-SWTPM_PID=$!
-export TPM2TOOLS_TCTI="swtpm:host=127.0.0.1,port=${port}"
+# A random port pair, another one while the pair is in use, and only a pair this swtpm listens on
+# (scripts/swtpm_start.sh; its control is scripts/test_trust1_swtpm_port.sh).
+# shellcheck source=swtpm_start.sh
+source "${repo_root}/scripts/swtpm_start.sh"
+swtpm_start "${work}" || { echo "FAIL  swtpm did not start (see above)"; exit 1; }
 for _ in $(seq 1 50); do tpm2_pcrread sha256:0 >/dev/null 2>&1 && break; sleep 0.1; done
 tpm2_pcrread sha256:0 >/dev/null
 

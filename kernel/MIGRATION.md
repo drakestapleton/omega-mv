@@ -132,7 +132,10 @@ ck-b7b-probe, ck-qemu-gates (59 minutes) and verify-all (24 minutes). Exit 1, fa
 in aienux: infer-forward (its model file is not on that host) and ck-qemu-external (`ALLEN_MODEL`,
 `LOCAL_MODEL_WEIGHTS` and `LOCAL_MODEL_TOKENIZER` unset). verify-all failed once beside a concurrent
 ck-qemu-gates: `scripts/test_trust1_measurement_tools.sh` picks a random swtpm port and got "Address
-already in use"; it passed alone. A run is an observation of that commit, not a qualification.
+already in use"; it passed alone. A run is an observation of that commit, not a qualification. Since
+then the software-TPM tests start swtpm through `scripts/swtpm_start.sh`, which takes another port pair
+while one is in use and only a pair its own swtpm listens on (control `scripts/test_trust1_swtpm_port.sh`,
+run by verify-all).
 
 ## What the fold changes for the kernel's own checks
 

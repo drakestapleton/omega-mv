@@ -117,24 +117,13 @@ die() {
     exit 1
 }
 
-# ---- swtpm (same pattern as scripts/test_trust1_measurement_tools.sh) ----
-port=""
-for _ in 1 2 3 4 5; do
-    port=$((20000 + RANDOM % 20000))
-    mkdir -p "${work}/tpm"
-    swtpm socket --tpm2 --tpmstate dir="${work}/tpm" \
-        --server type=tcp,port="${port}",bindaddr=127.0.0.1 \
-        --ctrl type=tcp,port=$((port + 1)),bindaddr=127.0.0.1 \
-        --flags not-need-init,startup-clear >"${work}/swtpm.log" 2>&1 &
-    SWTPM_PID=$!
-    export TPM2TOOLS_TCTI="swtpm:host=127.0.0.1,port=${port}"
-    for _ in $(seq 1 50); do tpm2_pcrread sha256:0 >/dev/null 2>&1 && break; sleep 0.1; done
-    tpm2_pcrread sha256:0 >/dev/null 2>&1 && break
-    kill "${SWTPM_PID}" 2>/dev/null || true
-    wait "${SWTPM_PID}" 2>/dev/null || true
-    SWTPM_PID=""
-done
-[[ -n "${SWTPM_PID}" ]] || die "swtpm did not start"
+# ---- swtpm (scripts/swtpm_start.sh, as scripts/test_trust1_measurement_tools.sh) ----
+# shellcheck source=swtpm_start.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/swtpm_start.sh"
+swtpm_start "${work}" || die "swtpm did not start"
+port=${SWTPM_PORT}
+for _ in $(seq 1 50); do tpm2_pcrread sha256:0 >/dev/null 2>&1 && break; sleep 0.1; done
+tpm2_pcrread sha256:0 >/dev/null 2>&1 || die "swtpm on port ${port} does not answer"
 ctrl="127.0.0.1:$((port + 1))"
 log="${work}/tpm2.log"
 q() { "$@" >>"${log}" 2>&1; }
