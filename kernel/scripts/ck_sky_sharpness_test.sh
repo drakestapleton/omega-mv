@@ -43,23 +43,42 @@ cat "$OUT/after.log"
 [ "$status" = 0 ] || exit "$status"
 cp "$WORK/$K/ui/sky_real.c" "$WORK/sky.clean"
 cp "$WORK/$K/ui/night.c" "$WORK/night.clean"
+# Historical sources for static-bloom and quarter-grid: aienux 735c40bf's
+# native/kernel/ui/sky_real.c and night.c, a side-branch commit that is not in
+# this repository. Copies are checked in under scripts/fixtures/ck_sky_sharpness
+# (SOURCE says where from) and used only when both match SHA256SUMS; a copy
+# with one appended line must be refused by the same check.
+FIX=scripts/fixtures/ck_sky_sharpness
+mkdir "$WORK/hist" "$WORK/hist-bad"
+cp "$FIX/sky_real.c" "$FIX/night.c" "$FIX/SHA256SUMS" "$WORK/hist/"
+fixture_ok() {
+    for f in sky_real.c night.c; do
+        grep -qx "[0-9a-f]\{64\}  $f" "$1/SHA256SUMS" || return 1
+    done
+    (cd "$1" && sha256sum --quiet --strict -c SHA256SUMS) > /dev/null 2>&1
+}
+fixture_ok "$WORK/hist" || { echo "SKY_SHARPNESS: FAIL $FIX: sky_real.c or night.c differs from SHA256SUMS"; exit 1; }
+cp "$WORK/hist/"* "$WORK/hist-bad/"
+printf '/* not aienux 735c40bf */\n' >> "$WORK/hist-bad/night.c"
+if fixture_ok "$WORK/hist-bad"; then echo "SKY_SHARPNESS: FAIL control tampered-fixture was accepted"; exit 1; fi
+echo "PASS rejected control: tampered-fixture"
 # Mutate copies, never the checkout. Historical cubic lobes and quarter
-# screen grid are taken verbatim from the rejected pinned source. Each
+# screen grid are taken verbatim from the rejected historical source. Each
 # independent defect must be rejected, as must suppressing the point layer.
 # init-fog and view-fog reintroduce the diffuse Milky Way into the UI sky in
 # ck_night_init and ck_night_view; each must fail its own clear-sky assertion.
 for control in static-bloom dynamic-bloom quarter-grid invisible init-fog view-fog; do
     cp "$WORK/sky.clean" "$WORK/$K/ui/sky_real.c"
     cp "$WORK/night.clean" "$WORK/$K/ui/night.c"
-    python3 - "$WORK/$K/ui" "$control" <<'PY'
+    python3 - "$WORK/$K/ui" "$control" "$WORK/hist" <<'PY'
 from pathlib import Path
-import subprocess, sys
+import sys
 root, control = Path(sys.argv[1]), sys.argv[2]
 sky = (root/'sky_real.c').read_text()
 night = (root/'night.c').read_text()
-pin = '735c40bff7270cc4d2a88f663ba4b663986b468c'
+hist = Path(sys.argv[3])  # aienux 735c40bf, checked against SHA256SUMS above
 def historical(name):
-    return subprocess.check_output(['git','show',pin+':native/kernel/ui/'+name], text=True)
+    return (hist/name).read_text()
 def section(text, start, end):
     return text[text.index(start):text.index(end)]
 def replace_once(text, before, after):
