@@ -2086,6 +2086,8 @@ objective is refused, every later replay keeps it so the objective is never
 resumed, and only a class-2 lost action is recorded not performed. The proof
 covers the model; its correspondence to the `.om` code is by reading.
 
+The [four recorded operator-control cases](tests/recorded-control/README.md) reproduce the original prepared objectives, expected turns and fake-server map for host checks.
+
 ### Release gate
 
 `tests/release-gate.om` checks in Omega that `release stop` makes a durable
