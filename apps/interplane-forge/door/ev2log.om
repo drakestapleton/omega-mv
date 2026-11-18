@@ -1,0 +1,416 @@
+note door/ev2log.om: the event log. evload reads <data>events/log once (at the first page of the stream
+note after a start or a reload), checks every line (seq, field count, the sha256 chain) and indexes
+note it; a line that does not check switches the stream off (503, fail closed) and nothing is appended
+note to a log that did not check. evemit puts one event in the batch of the current pass unless its
+note key (kind, rid, source, x) is already in the log; evflush sorts the batch by time and appends it.
+global gevtb ulong 16
+global gevh2 uchar 32
+fn evload to void
+put gevok 0 2
+evmkdirs
+put gevn 0 0
+put gevoff 0 0
+for i ulong 32
+put gevprv i 0
+end
+for i ulong len gevset
+put gevset i 0
+end
+evpath tevlog
+fd = fopen fpth 0 get fpthl 0 524288 0
+if lt fd 0
+if eq fd -2
+put gevok 0 1
+end
+ret
+end
+pos = ulong 0
+ok = true
+for it ulong 1000000
+r = pread int fd gevrb 0 len gevrb long pos
+if lt r 0
+ok = false
+break
+end
+if eq r 0
+break
+end
+u = evscan ulong r pos
+if lt u 0
+ok = false
+break
+end
+if eq u 0
+evtamper
+ok = false
+break
+end
+pos = add pos ulong u
+end
+x = fclose int fd
+if ok
+put gevok 0 1
+end
+end
+fn evtamper to void
+evgb
+evgt tevlbad
+evgn add get gevn 0 1
+evgout
+end
+note evscan n pos: the complete lines of gevrb[0, n) (read at file offset pos); returns the bytes they
+note take, -1 when a line does not check
+fn evscan n ulong pos ulong to long
+p = ulong 0
+for it ulong 2097152
+if ge p n
+break
+end
+e = p
+for k ulong 2097152
+if ge e n
+break
+end
+if eq get gevrb e 10
+break
+end
+e = add e 1
+end
+if ge e n
+break
+end
+if not evline p e
+evtamper
+ret -1
+end
+k = get gevn 0
+put gevoff k add pos p
+put gevn 0 add k 1
+put gevoff add k 1 add pos add e 1
+p = add e 1
+end
+ret long p
+end
+note evline a e: check the line gevrb[a, e) as line gevn+1, then chain it and add its key
+fn evline a ulong e ulong to bool
+n = sub e a
+if or ge n EVLMAX ge get gevn 0 EVMAX
+ret false
+end
+ln = new uchar 8192 0
+for i ulong n bound 8192
+put ln i get gevrb add a i
+end
+ret evlchk part ln 0 n
+end
+fn evlchk ln view uchar * to bool
+if not evtabs ln
+ret false
+end
+seq = evfnum ln 0
+if ne seq add get gevn 0 1
+ret false
+end
+pv = add get gevtb 9 1
+if ne sub len ln pv 64
+ret false
+end
+for i ulong 32
+b = ulong get gevprv i
+if ne get ln add pv mul i 2 evhexc shr b 4
+ret false
+end
+if ne get ln add add pv mul i 2 1 evhexc and b 15
+ret false
+end
+end
+evclr
+put gevk 0 evfnum ln 2
+evfcopy ln 4 1
+evfcopy ln 5 2
+evfcopy ln 8 3
+evput evkey
+evsha ln
+for i ulong 32
+put gevprv i get gevh2 i
+end
+ret true
+end
+note evtabs ln: the positions of the 10 tabs of a line into gevtb[0..9]; false for another count
+fn evtabs ln view uchar * to bool
+k = ulong 0
+for i ulong len ln bound 8192
+if eq get ln i 9
+if ge k 10
+ret false
+end
+put gevtb k i
+k = add k 1
+end
+end
+ret eq k 10
+end
+note evfa f / evfe f: start and end of field f (0..10) of the line whose tabs are in gevtb
+fn evfa f ulong to ulong
+if eq f 0
+ret 0
+end
+ret add get gevtb sub f 1 1
+end
+fn evfe f ulong ln ulong to ulong
+if ge f 10
+ret ln
+end
+ret get gevtb f
+end
+note evfnum ln f: the decimal number in field f (at most 19 digits), 0 for anything else
+fn evfnum ln view uchar * f ulong to ulong
+a = evfa f
+e = evfe f len ln
+if or eq a e gt sub e a 19
+ret 0
+end
+v = ulong 0
+for i ulong sub e a bound 19
+c = get ln add a i
+if not evdig c
+ret 0
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+note evfcopy ln f w: field f into the event field w (1 rid, 2 source, 3 x)
+fn evfcopy ln view uchar * f ulong w ulong to void
+a = evfa f
+e = evfe f len ln
+for i ulong sub e a bound 8192
+c = get ln add a i
+if eq w 1
+evridc c
+end
+if eq w 2
+evsrcc c
+end
+if eq w 3
+evxc c
+end
+end
+end
+note ---- the batch
+fn evbc c uchar to void
+n = get gevbatl 0
+if lt n len gevbat
+put gevbat n c
+put gevbatl 0 add n 1
+end
+end
+fn evbnum v ulong to void
+d = new uchar 24 0
+k = evdec v d
+for j ulong k bound 24
+evbc get d j
+end
+end
+note evemit: the event built in the gev* fields joins the batch, unless its key is known
+fn evemit to void
+if or eq get gevk 0 0 eq get gevt 0 0
+ret
+end
+k = evkey
+if evhas k
+ret
+end
+if or ge get gevbn 0 EVBMAX gt add get gevbatl 0 4096 len gevbat
+flog tevlbfl
+evflush
+if ne get gevok 0 1
+ret
+end
+end
+evput k
+evsubend
+b = get gevbn 0
+put gevbo b get gevbatl 0
+put gevbt b get gevt 0
+evbnum get gevt 0
+evbc 9
+evbnum get gevk 0
+evbc 9
+for i ulong get gevactl 0 bound 128
+evbc get gevact i
+end
+evbc 9
+for i ulong get gevridl 0 bound 64
+evbc get gevrid i
+end
+evbc 9
+for i ulong get gevsrcl 0 bound 128
+evbc get gevsrc i
+end
+evbc 9
+for i ulong get gevpthl 0 bound 1024
+evbc get gevpth i
+end
+evbc 9
+for i ulong get gevjsl 0 bound 1024
+evbc get gevjs i
+end
+evbc 9
+for i ulong get gevxl 0 bound 192
+evbc get gevx i
+end
+evbc 9
+for i ulong get gevsubl 0 bound 512
+evbc get gevsub i
+end
+put gevbl b sub get gevbatl 0 get gevbo b
+put gevbn 0 add b 1
+put gevpe 0 add get gevpe 0 1
+end
+note evsort: gevbi = the batch indices ordered by time, equal times in batch order (bottom-up merge)
+fn evsort to void
+n = get gevbn 0
+for i ulong n bound 32768
+put gevbi i i
+end
+w = ulong 1
+for pass ulong 20
+if ge w n
+break
+end
+lo = ulong 0
+for it ulong 32768
+if ge lo n
+break
+end
+mid = add lo w
+if gt mid n
+mid = n
+end
+hi = add lo mul w 2
+if gt hi n
+hi = n
+end
+evmerge lo mid hi
+lo = hi
+end
+for i ulong n bound 32768
+put gevbi i get gevbj i
+end
+w = mul w 2
+end
+end
+fn evmerge lo ulong mid ulong hi ulong to void
+i = lo
+j = mid
+for k ulong sub hi lo bound 32768
+if evtakel i mid j hi
+put gevbj add lo k get gevbi i
+i = add i 1
+else
+put gevbj add lo k get gevbi j
+j = add j 1
+end
+end
+end
+note evtakel: the next merged entry comes from the left run (equal times keep batch order)
+fn evtakel i ulong mid ulong j ulong hi ulong to bool
+if ge i mid
+ret false
+end
+if ge j hi
+ret true
+end
+ret le get gevbt get gevbi i get gevbt get gevbi j
+end
+note evflush: append the batch in time order, each line with its seq and the chain, then fsync once
+fn evflush to void
+n = get gevbn 0
+if eq n 0
+ret
+end
+evsort
+evpath tevlog
+fd = fopen fpth 0 get fpthl 0 525377 384
+if lt fd 0
+evwfail
+ret
+end
+ok = true
+for q ulong n bound 32768
+if ge get gevn 0 EVMAX
+break
+end
+b = get gevbi q
+if not evwline int fd b
+ok = false
+break
+end
+end
+x = fsync int fd
+y = fclose int fd
+if not ok
+evwfail
+end
+put gevbn 0 0
+put gevbatl 0 0
+end
+fn evwfail to void
+put gevok 0 2
+flog tevlwr
+end
+note evwline fd b: write batch entry b as line gevn+1 (built in gevln, hashed, written, then indexed)
+fn evwline fd int b ulong to bool
+l = evwbuild b
+if ge l sub EVLMAX 1
+ret false
+end
+ret evwout fd l
+end
+fn evwbuild b ulong to ulong
+put gevlnl 0 0
+evlnum add get gevn 0 1
+evlc 9
+o = get gevbo b
+for i ulong get gevbl b bound 8192
+evlc get gevbat add o i
+end
+evlc 9
+for i ulong 32
+v = ulong get gevprv i
+evlc evhexc shr v 4
+evlc evhexc and v 15
+end
+ret get gevlnl 0
+end
+note evsha ln: sha256 of ln into gevh2
+fn evsha ln view uchar * to void
+c = new ulong 40 0
+h = new uchar 32 0
+sha256_init c
+sha256_update c ln
+sha256_final c h
+for i ulong 32
+put gevh2 i get h i
+end
+end
+fn evwout fd int l ulong to bool
+ln = new uchar 8192 0
+for i ulong l bound 8192
+put ln i get gevln i
+end
+evsha part ln 0 l
+put gevln l 10
+w = write fd gevln 0 add l 1
+if ne w long add l 1
+ret false
+end
+for i ulong 32
+put gevprv i get gevh2 i
+end
+k = get gevn 0
+put gevn 0 add k 1
+put gevoff add k 1 add get gevoff k add l 1
+ret true
+end
