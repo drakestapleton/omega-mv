@@ -176,24 +176,26 @@ into the normal read entrypoint.
   between two reads of /proc). A wait loop of more than 8 waits in QEMU fails the
   case [ctl:OMEGA-KERNEL-OMEGA-NVME/mutant-qemu-max-waits]. (Before 2026-11-18 the
   verifier waited for an idle QEMU before each read, so a budget of 1 poll passed.)
-- The verifier has no wall-clock deadline while a peer works. A peer that does not
-  answer ends the run with exit 2 and its reason: QEMU exited or a zombie
-  (`QEMU_DEAD`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-killed], stopped (`QEMU_STOPPED`)
-  [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-stopped], idle for a second without answering
-  (`QEMU_MUTE`, `CANDIDATE_MUTE`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-mute]
+- The verifier has no wall-clock deadline while a peer works. A dead QEMU ends the
+  run with exit 2 (`QEMU_DEAD`, exited or a zombie)
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-killed]. A live peer that does not answer ends
+  it with exit 2 and an ALARM line and a FAIL line naming the reason: stopped
+  (`QEMU_STOPPED`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-stopped], idle for a second
+  without answering (`QEMU_MUTE`, `CANDIDATE_MUTE`)
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-mute]
   [ctl:OMEGA-KERNEL-OMEGA-NVME/candidate-mute] or without opening its socket
-  (`QEMU_NOT_LISTENING`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-not-listening]. A peer
-  still runnable after 30 s without answering gets an ALARM line and the run ends
-  (`PEER_SILENT`) [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-printed-counted].
+  (`QEMU_NOT_LISTENING`) [ctl:OMEGA-KERNEL-OMEGA-NVME/qemu-not-listening], or still
+  runnable after 30 s (`PEER_SILENT`) [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-printed-counted].
 - `tests/omega_nvme_test.sh` writes each runner's output to `<name>.log` and
-  `<name>.err` in its evidence directory (cases, mutants and controls), copies ALARM
-  lines to its stderr as they come, and fails when those logs hold an ALARM line
+  `<name>.err` in its evidence directory (cases, mutants and the killed-QEMU
+  control; the controls that must alarm log apart), copies ALARM lines from those
+  runs to its stderr as they come, and fails when those logs hold an ALARM line
   [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-host-err]
   [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-control-qemu-killed-log]
-  [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-mutant-cid-err]. A run that does not
-  pass copies its evidence to a new `omega-nvme-kept-*` directory under `$TMPDIR`
-  (or /tmp) and names it on stderr. A missing `qemu-system-aarch64` or C compiler
-  is NOT_RUN, exit 3.
+  [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-planted-mutant-cid-err]. A run that fails
+  after the runner is built copies its evidence to a new `omega-nvme-kept-*`
+  directory under `$TMPDIR` (or /tmp) and names it on stderr. A missing
+  `qemu-system-aarch64`, C compiler or `pkill` is NOT_RUN, exit 3.
 - Queue/DMA storage stays alive until the verifier tears down its controller.
 
 ## Native transport integration contract (not exercised)

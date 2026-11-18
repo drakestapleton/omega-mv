@@ -55,9 +55,10 @@ static uint32_t held_off, held_val;
 static void die(const char *s) { perror(s); exit(2); }
 static void check(int b, const char *s) { if (!b) { fprintf(stderr,"FAIL %s: %s\n",scenario,s); errors++; } }
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (double)t.tv_sec + t.tv_nsec / 1e9; }
-/* A peer (QEMU or the candidate) that has not answered for 30 s prints an ALARM line and ends the
- * run, exit 2. omega_nvme_test.sh counts ALARM lines in the logs of its runs and fails on one
- * [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-printed-counted]. */
+/* A live peer (QEMU or the candidate) that does not answer prints an ALARM line and ends the run,
+ * exit 2: at once when it is stopped or idle (below), after 30 s when it stays runnable.
+ * omega_nvme_test.sh copies ALARM lines to its stderr, counts them in the logs of its runs and fails
+ * on one [ctl:OMEGA-KERNEL-OMEGA-NVME/alarm-printed-counted]. */
 #define ALARM_S 30.0
 static void alarm_line(const char *what, double s)
 {
@@ -70,6 +71,14 @@ static void alarm_end(const char *what, double s)
     fprintf(stderr,"FAIL %s: PEER_SILENT no answer from %s for %.0f s, run ended\n",scenario,what,s);
     exit(2);
 }
+/* WHY is the reason word (QEMU_STOPPED, QEMU_MUTE, ...); the ALARM and FAIL lines carry it. */
+static void peer_alarm(const char *why, const char *detail)
+{
+    alarms++;
+    fprintf(stderr,"ALARM %s: %s %s (the case FAILS)\n",scenario,why,detail);
+    fprintf(stderr,"FAIL %s: %s %s\n",scenario,why,detail);
+}
+static void peer_fail(const char *why, const char *detail) { peer_alarm(why,detail); exit(2); }
 /* State letter of /proc/P/stat (the field after the last ')'), or 0 when it cannot be read. */
 static char proc_state(pid_t p)
 {
@@ -101,10 +110,7 @@ static void qemu_check(void)
         kill(qp,SIGKILL); waitpid(qp,NULL,0); qp = -1;
         exit(2);
     }
-    if (c == 'T' || c == 't') {
-        fprintf(stderr,"FAIL %s: QEMU_STOPPED QEMU is stopped (state %c)\n",scenario,c);
-        exit(2);
-    }
+    if (c == 'T' || c == 't') peer_fail("QEMU_STOPPED","QEMU is stopped (state T)");
 }
 /* The candidate stopped (state T or t) ends the run: CANDIDATE_STOPPED, exit 2. Its exit shows as
  * EOF on its stream and is judged by its exit code. */
@@ -112,10 +118,7 @@ static void candidate_check(void)
 {
     if (child <= 0) return;
     char c = proc_state(child);
-    if (c == 'T' || c == 't') {
-        fprintf(stderr,"FAIL %s: CANDIDATE_STOPPED the candidate is stopped (state %c)\n",scenario,c);
-        exit(2);
-    }
+    if (c == 'T' || c == 't') peer_fail("CANDIDATE_STOPPED","the candidate is stopped (state T)");
 }
 static void peer_check(pid_t p) { if (p == qp) qemu_check(); else candidate_check(); }
 /* Idle test for a peer process (QEMU or the candidate). QEMU's NVMe model finishes a read on its own
@@ -185,9 +188,10 @@ static void mute_check(pid_t p, struct idle *last, const char *doing)
     if (p <= 0) return;
     int asleep = snapshot(p,&ran,&threads);
     if (asleep && last->have && last->ran == ran && last->threads == threads) {
-        fprintf(stderr,"FAIL %s: %s %s is idle (its %u threads asleep, none ran between two reads 1 s apart) %s\n",
-                scenario,p == qp ? "QEMU_MUTE" : "CANDIDATE_MUTE",p == qp ? "QEMU" : "the candidate",threads,doing);
-        exit(2);
+        char d[200];
+        snprintf(d,sizeof d,"%s is idle (its %u threads asleep, none ran between two reads 1 s apart) %s",
+                 p == qp ? "QEMU" : "the candidate",threads,doing);
+        peer_fail(p == qp ? "QEMU_MUTE" : "CANDIDATE_MUTE",d);
     }
     last->have = asleep; last->ran = ran; last->threads = threads;
 }
@@ -243,7 +247,9 @@ static int reap(pid_t p, int sig, const char *who)
     int failed = 0;
     char c = proc_state(p);
     if (c == 'T' || c == 't') {
-        fprintf(stderr,"FAIL %s: STOPPED %s was stopped (state %c) at the end of the run\n",scenario,who,c);
+        char d[120];
+        snprintf(d,sizeof d,"%s was stopped (state T) at the end of the run",who);
+        peer_alarm("STOPPED",d);
         failed = 1; sig = SIGKILL;
     }
     kill(p,sig);
@@ -327,8 +333,9 @@ static void start_qemu(void)
             unsigned long long ran; unsigned threads;
             int asleep = snapshot(qp,&ran,&threads);
             if (asleep && last.have && last.ran == ran && last.threads == threads) {
-                fprintf(stderr,"FAIL %s: QEMU_NOT_LISTENING QEMU is idle (its %u threads asleep, none ran between two reads 1 s apart) and its qtest socket is not open\n",scenario,threads);
-                exit(2);
+                char d[160];
+                snprintf(d,sizeof d,"QEMU is idle (its %u threads asleep, none ran between two reads 1 s apart) and its qtest socket is not open",threads);
+                peer_fail("QEMU_NOT_LISTENING",d);
             }
             last.have = asleep; last.ran = ran; last.threads = threads; snap = t;
         }
