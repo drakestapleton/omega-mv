@@ -53,12 +53,18 @@ replace or claim the System Store journal or that consumer.
   These are read-only verification oracles/orchestration, not production runtime
   dependencies or an adopted replacement language implementation.
 
-From the repository root on this Spark:
+From the omega-mv root on an AArch64 Linux host with QEMU (the gate `OMEGA-KERNEL-OMEGA-NVME`; it
+takes `seed/out/omc` after checking it against `seed/out/omc.sha256` and keeps its evidence under
+its own temporary directory):
 
 ```sh
-AIEN_OMC=/home/drakestapleton/work/OwnDriver/omega-gpu-driver/build/omc \
-OMEGA_NVME_EVIDENCE=/home/drakestapleton/handoffs/spark-five-20261028/QualNvmeOm/replay \
-sh native/disk/tests/omega_nvme_test.sh
+tests/gates/run.sh kernel-omega-nvme
+```
+
+or, from `kernel/`, with the evidence kept in a directory of your choice:
+
+```sh
+AIEN_OMC=../seed/out/omc OMEGA_NVME_EVIDENCE=<evidence dir> sh native/disk/tests/omega_nvme_test.sh
 ```
 
 The gate checks omc's independent hash before compilation. It creates a new,
