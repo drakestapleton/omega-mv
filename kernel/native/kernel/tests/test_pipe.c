@@ -62,8 +62,9 @@ static void *tp_watchdog(void *arg)
         if (still >= TP_STALL_S) {
             printf("test_pipe: FAIL deadlock: the pool lock did not move for %d s (ticket %u, serving %u: %s)\n", TP_STALL_S,
                    (unsigned)t, (unsigned)sv,
-                   t != sv ? "taken and not released"
-                           : "free, so a waiter holds a ticket the serving count passed, or the test hangs elsewhere");
+                   (int32_t)(t - sv) > 0   ? "taken and not released"
+                   : (int32_t)(t - sv) < 0 ? "released more often than taken"
+                                           : "free, so a waiter holds a ticket the serving count passed, or the test hangs elsewhere");
             fflush(stdout);
             _exit(1);
         }
