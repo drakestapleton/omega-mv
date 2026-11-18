@@ -797,6 +797,11 @@ self_test() {
             bash "${clone}/scripts/trust1_m5_qualify.sh" --machine-only --out "${tmp}/o2b" >/dev/null 2>&1; rc=$?
             [[ ${rc} == 2 ]] && ok "dirty tree outside ${pfx} (untracked file at the top) refused, exit 2" || bad "untracked file outside ${pfx} gave exit ${rc}, expected 2"
             rm -f "${tmp}/clone-top/untracked_top_junk"
+            local tf topf; mapfile -t tf < <(git -C "${tmp}/clone-top" ls-files -- ":(exclude)${pfx}"); topf="${tf[0]}"
+            echo x >>"${tmp}/clone-top/${topf}"
+            bash "${clone}/scripts/trust1_m5_qualify.sh" --machine-only --out "${tmp}/o2c" >/dev/null 2>&1; rc=$?
+            [[ ${rc} == 2 ]] && ok "dirty tree outside ${pfx} (modified ${topf}) refused, exit 2" || bad "modified ${topf} outside ${pfx} gave exit ${rc}, expected 2"
+            git -C "${tmp}/clone-top" checkout -q -- "${topf}"
         fi
         git -C "${clone}" checkout -q -- . 2>/dev/null; git -C "${clone}" clean -qfd
         # A run that dirties the tree must exit 1.
