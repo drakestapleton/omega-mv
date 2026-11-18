@@ -273,6 +273,18 @@ static void cleanup(void)
     if (*tempdir) rmdir(tempdir);
     if (alarmed) _exit(2);
 }
+/* TERM, INT or HUP (a gate timeout, an operator): kill the candidate and QEMU, remove the disposable
+ * files and exit 128+sig, so a killed run leaves no peer behind. Async-signal-safe calls only. */
+static void on_signal(int sig)
+{
+    if (child > 0) kill(child,SIGKILL);
+    if (qp > 0) kill(qp,SIGKILL);
+    if (*image) unlink(image);
+    if (*socketpath) unlink(socketpath);
+    if (*qlog) unlink(qlog);
+    if (*tempdir) rmdir(tempdir);
+    _exit(128 + sig);
+}
 static uint64_t qt(const char *fmt,...)
 {
     char line[512], response[256];
@@ -459,6 +471,7 @@ int main(int argc,char **argv)
 {
     if (argc!=3 && argc!=4) { fprintf(stderr,"usage: runner binary case [qemu]\n"); return 2; }
     scenario=argv[2]; atexit(cleanup); signal(SIGPIPE,SIG_IGN);
+    signal(SIGTERM,on_signal); signal(SIGINT,on_signal); signal(SIGHUP,on_signal);
     if (posix_memalign((void **)&dma_mem,4096,DMA_BYTES)) die("oracle memory");
     model_reset();
     if (iscase("lba4k")) M.lbads=12;
