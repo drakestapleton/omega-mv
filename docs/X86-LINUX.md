@@ -561,3 +561,51 @@ is not exhaustive instruction-template proof. The oracle includes an invalid
 opcode control and a valid-but-wrong-immediate control; they must be rejected,
 not merely disassembled. Both controls were exercised and caught. The complete
 differential verdict was FAIL, not a qualification claim.
+
+## Native x86-64 host run, 2026-11-17 (x86 NATIVE, AArch64 EMULATED)
+
+First execution of the x86 output on an x86-64 processor. Host: an x86-64
+Linux container (kernel 6.18.44), not the Spark and not a qualified machine;
+AArch64 programs, including `seed/out/omc`, ran under `qemu-aarch64` 8.2.2
+registered through binfmt. Source: branch head `7182f07c` plus the runner
+change of this section (committed afterwards as part of the same branch).
+
+`sh seed/omega-x86.sh`: **PASS**, RC=0.
+
+- The AArch64 omc (`cfd96b48…`, EMULATED) emits the x86 omc, 5,081,428 bytes.
+- The x86 omc rebuilds itself twice on the processor to the same bytes,
+  sha256 `5287a5aac3e2c5d372fadd6b04a038fbe1278d4c3673650796d178b1f90dba46`,
+  equal to the AArch64-built image and pinned in `seed/out/omc-x86_64.sha256`.
+- Hosted on x86, it emits `seed/out/omc` byte for byte.
+- Controls: wrong pin, missing pin and missing emulator each exit 1.
+
+This is still not a native x86 seed0 chain: the first x86 compiler is emitted
+by the AArch64 one. That row stays **NOT_RUN**.
+
+`python3 seed/omc/qualify-x86.py --x86-native --compiler seed/out/omc --qemu seed/omc/x86-native-launch.sh`:
+**no verdict; the run aborted** after 15,572 rows. The `exec-parent` fixture
+raises `RLIMIT_NOFILE` to 65600 and this container's hard limit is 20000, so
+`preexec_fn` raised and the runner stopped without a summary line. Rows
+recorded before the abort:
+
+| Status | Rows | What they are |
+|---|---:|---|
+| PASS | 8,691 | |
+| FAIL | 6,430 | the frozen OM1 conductor needs the pinned compiler `734f0a39…`, which was not present on this host: a missing input, not a backend result |
+| FAIL | 35 | frozen C2 rows whose pinned AArch64 output differs from what `seed/out/omc` emits now; AArch64 side only, not examined further |
+| FAIL | 8 | `seed/omc/tests/float/neg_fma_*`: the two targets refuse differently |
+| FAIL | 1 | `seed/host/tests/uvmctl.om`: x86 exits 0 on the processor; the emulated AArch64 side exits 80 |
+| MISSING_IMPLEMENTATION | 29 | AArch64 accepts, x86 refuses: `fma`, `dit`, `scrub`, `eventfd`, the VFIO words |
+| BLOCKED | 73 | 49 need `--bridge`; 24 alternate-compiler rows without a reviewed verdict |
+| NOT_RUN | 9 | unreviewed host effects and entryless units, as before |
+| EXCLUDED | 296 | |
+
+`uvmctl` is the invalid-descriptor ioctl case recorded above as an emulator
+artifact (QEMU returns ENOTTY where the kernel returns EBADF). With the x86
+side on the processor the x86 program returns EBADF and passes; the artifact
+is now on the emulated AArch64 side. The runner has no challenge for that
+direction, so the row is reported as FAIL and is not reclassified here.
+
+Open before this mode can give a verdict: provide the pinned OM1 compiler,
+run where the open-file hard limit is at least 65600, and add the AArch64-side
+emulator challenge. Host results only; nothing here is hardware qualification.

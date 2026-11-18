@@ -5,6 +5,7 @@
 # (qemu-system-x86_64, OVMF or mtools absent); else 0. Each QEMU boot is stopped after
 # EFI_TIMEOUT seconds (default 60): the application has returned by then and OVMF sits in its menu.
 # OVMF_CODE / OVMF_VARS override the firmware paths. Results are emulated, not hardware evidence.
+# X86EFI_ONLY=machine runs only the machine section (tests/x86efi/machine/mutants.sh uses it).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -54,6 +55,30 @@ boot() {
 # trapped LOG: OVMF reports the image's EFI_STATUS 2^63|103 (trap 3) as "...: 00000067".
 trapped() { tr -d '\r' < "$1" | grep -q 'failed to start .*: 00000067'; }
 diskfile() { mtype -i "$1" "::/$2" 2> /dev/null; }
+summary() { echo "SUMMARY pass=$pass fail=$fail not_run=$notrun"; [ $fail = 0 ] || exit 1; [ $pass = 0 ] && exit 77; exit 0; }
+
+# machine: efi 15..21 (ports, MSRs, control registers, physical memory). The compile-time refusal needs
+# no firmware: OP 22 is error 25 at its line, and the same line with OP 21 compiles. The boot checks the
+# whole block and, on its own, the one line the program writes to COM1 with port I/O instead of efi 13.
+# The expected PCI, fw_cfg and local APIC facts are those of QEMU q35; this is not a hardware test.
+machine() {
+  M=$here/machine d=$work/machine; mkdir -p "$d"
+  "$omc" < "$M/op22.om" > "$d/op22.efi" 2> "$d/op22.err"; rc=$?
+  if [ $rc = 25 ] && [ "$(cat "$d/op22.err")" = "omc: line 5: error 25" ] && [ ! -s "$d/op22.efi" ]; then
+    if sed 's/^r = efi 22 /r = efi 21 /' "$M/op22.om" | "$omc" > "$d/op21.efi" 2> /dev/null && [ -s "$d/op21.efi" ]; then
+      ok "machine: efi 22 is error 25 at line 5, the same line with efi 21 compiles"
+    else bad "machine: the efi 21 control did not compile"; fi
+  else bad "machine: efi 22 gave status $rc '$(cat "$d/op22.err")', want 25 at line 5 and no output"; fi
+  [ $efi = yes ] || { nr "machine boot: $why"; return; }
+  if boot machine "$M/m1.om"; then
+    if block "$d/serial.log" | cmp -s - "$M/expected.txt"; then ok "machine: $(wc -l < "$M/expected.txt") lines match (ports, MSRs, CR0/2/3/4, physical memory, refusals)"
+    else bad "machine differs (< got, > expected; first lines):"; block "$d/serial.log" | diff - "$M/expected.txt" | grep '^[<>]' | cat -v | head -n 6 | sed 's/^/  /'; fi
+    [ "$(tr -d '\r' < "$d/serial.log" | grep -c '^OMEGA COM1 PORT IO$')" = 1 ] && ok "machine: the COM1 line written with port I/O is in the serial log once" || bad "machine: no single COM1 port I/O line in the serial log"
+    if ! tr -d '\r' < "$d/serial.log" | grep -qx '==E'; then bad "machine: no ==E line"
+    elif trapped "$d/serial.log"; then bad "machine: trap 3"; else ok "machine: finished without a trap"; fi
+  fi
+}
+[ "${X86EFI_ONLY:-}" = machine ] && { machine; summary; }
 
 F=$here/float
 # float: the same body gives the same bit patterns as x86efi, x86linux and AArch64.
@@ -77,7 +102,7 @@ case $(uname -m) in
 esac
 if [ "$(uname -m)" = aarch64 ]; then host "float aarch64" "$F/a64-pre.om" env; else nr "float aarch64: not an AArch64 host"; fi
 
-[ $efi = yes ] || { nr "refusals, file, exit: $why"; echo "SUMMARY pass=$pass fail=$fail not_run=$notrun"; [ $fail = 0 ] || exit 1; [ $pass = 0 ] && exit 77; exit 0; }
+[ $efi = yes ] || { nr "refusals, file, exit: $why"; machine; summary; }
 
 # refusals: every efi 12 refusal code, then an OFF+N past the array traps 3.
 if boot refusals "$here/refusals/g4.om"; then
@@ -169,5 +194,6 @@ boot id-capwalk "$I/id.om" && bnd id-capwalk 'sm=OmegaTest/-/-'
 smb=file=$work/capscan.bin
 boot id-capscan "$I/id.om" && bnd id-capscan 'sm=-'
 mach=q35 cpu=max smb=
+machine
 echo "SUMMARY pass=$pass fail=$fail not_run=$notrun"
 [ $fail = 0 ]

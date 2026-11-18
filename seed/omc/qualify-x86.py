@@ -1492,6 +1492,10 @@ def main():
     parser.add_argument("--compiler", type=Path)
     parser.add_argument("--x86-compiler", type=Path, help="optional x86-hosted paired compiler; otherwise built once from exact current seeded source")
     parser.add_argument("--qemu", default="qemu-x86_64")
+    parser.add_argument("--x86-native", action="store_true",
+                        help="run on Linux x86-64: x86 programs execute natively through the --qemu launcher "
+                             "(seed/omc/x86-native-launch.sh); AArch64 programs then need a registered binfmt emulator "
+                             "and are the EMULATED side")
     parser.add_argument("--bridge", type=Path, help="reviewed x86-capable omega-bridge executable for external ABI drivers")
     parser.add_argument("--bridge-baseline-compiler", type=Path, default=Path("/tmp/bridge-x86-baseline-omc"),
                         help="exact 734f0a39 seeded compiler required by the bridge generator")
@@ -1532,8 +1536,11 @@ def main():
     if not options.inventory:
         if not options.compiler or not options.compiler.is_file():
             parser.error("--compiler must name an existing compiler")
-        if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
-            parser.error("native default baseline requires Linux AArch64")
+        if options.x86_native:
+            if platform.system() != "Linux" or platform.machine() not in ("x86_64", "amd64"):
+                parser.error("--x86-native requires Linux x86-64")
+        elif platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
+            parser.error("native default baseline requires Linux AArch64 (or --x86-native on Linux x86-64)")
         compiler = str(options.compiler.resolve())
         qemu = shutil.which(options.qemu)
         objdump = shutil.which(options.objdump) if options.objdump else next(
@@ -1544,6 +1551,8 @@ def main():
         print(json.dumps({"compiler": compiler, "compiler_sha256": digest(Path(compiler).read_bytes()),
                           "qemu": qemu, "qemu_sha256": digest(Path(qemu).read_bytes()),
                           "qemu_version": run([qemu, "--version"], b"", ROOT, options.timeout)[1].decode().strip(),
+                          "execution": ({"x86_64": "NATIVE", "aarch64": "EMULATED (binfmt user emulation)"} if options.x86_native
+                                        else {"aarch64": "NATIVE", "x86_64": "EMULATED (qemu-user)"}),
                           "objdump": objdump, "platform": platform.platform(), "timeout_seconds": options.timeout,
                           "bridge_big_timeout_seconds": options.bridge_big_timeout}))
     cache = OrderedDict()
@@ -1977,7 +1986,7 @@ def main():
                     raise Failure(f"fixture oracle exit {expected}, observed {arun[0]}")
                 assert_oracle(arun[1], case.stdout_oracle, "runtime stdout", different=case.operation == "kill")
                 assert_oracle(arun[2], case.stderr_oracle, "runtime stderr")
-                reason = "target-adapted ABI differential" if adaptation else "identical-source native-AArch64/qemu-x86 differential"
+                reason = "target-adapted ABI differential" if adaptation else ("identical-source emulated-AArch64/native-x86 differential" if options.x86_native else "identical-source native-AArch64/qemu-x86 differential")
                 if driver == "supervisor-self-signal":
                     reason = "supervisor negative-input control: both children observed SIGKILL, never an ordinary mutant kill"
                 record("PASS", case.name, reason + " + every code byte decoded", run_exit=arun[0],
