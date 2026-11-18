@@ -74,15 +74,15 @@ test checks content changes, exact counts and malformed executable refusals.
 
 ## DRA-485 evidence-text corrective action, 2026-11-17 (revised 2026-11-18 after reviews 5, 6 and 7)
 
-The DRA-485 C3 GEMM change in this repository has had seven reviews, all FIX (d83bbc04, e823b59f, 0be0ba36, 0e50400f,
-5f946b6a, 3b87b07e, 76046707; verdict files `~/handoffs/dra485-finish-20261117.VERDICT*.omega-mv.*.md` on the Spark).
+The DRA-485 C3 GEMM change in this repository had reviews 1 to 7 and 9 (all FIX: d83bbc04, e823b59f, 0be0ba36, 0e50400f,
+5f946b6a, 3b87b07e, 76046707, 3686d5de; review 8 was stopped before a verdict; verdict files `~/handoffs/dra485-finish-20261117.VERDICT*.omega-mv.*.md` on the Spark).
 The CUDApp half took three (FIX 5dc27c28, FIX 18ac3327, MERGE a283a896). No round found a wrong kernel result; almost
 every finding was about what the evidence text said, or about the corrective action meant to stop that.
 
 | Kind | Findings (round.number, both repositories) | Why the author and the checks missed it | Corrective action |
 | --- | --- | --- | --- |
-| Derived numbers and claims typed by hand | omega-mv 1.1 "launch floor", 1.3 "every shape" when half were sampled, 2.2 "whole last row", 3.1 "208 shapes" = 26 triples, 4.1 "0.04 to 0.06", 5.1 "memory bound", 5.4 load1, 7.6 sampling stride; CUDApp 1.1, 1.2, 2.2, 3.5 | Text was written after the run, not produced from the log; no gate read evidence text | `tools/c3_gemm_evidence.sh` produces every count, range, median, repeat and the acceptance line from the chip log into `<!-- generated: ... -->` blocks. The always-run gate `tests/gates/run.sh evidence-generated` (rules R1 to R5 in the header of `tools/evidence_generated_check.sh`): generated text equals its generator, and a generator takes only files of the directory as input; every hand-written line of changed evidence Markdown, and every added line of `docs/OMEGA.md`, carries `<!-- typed-ok HASH: REASON -->` bound to its exact text, and the gate prints each new one (AIEN-OBS typed_ok_added) as the reviewer's list; a changed evidence README has a generated block |
-| Corrective action fitted to its own controls | 5.2, 6.2, 6.3, 6.4, 7.1, 7.3, 7.4, 7.5 | Rounds 5 and 6 judged prose with lists of claim patterns and tested them only on sentences the author wrote; review 7 broke the list again (backticks, lowercase words) and showed two self-test controls never ran the gate's own code | No word list: the gate does not judge what a sentence says, it makes sure each hand line was reviewed as that exact text. The self-test runs the real gate end to end in a scratch git repository, one change per control, and types every author sentence that reviews 1 to 7 quoted into a README by hand; checker mutations (drop the binding check, the manifest check, the block comparison, the argument rule) each make the self-test fail |
+| Derived numbers and claims typed by hand | omega-mv 1.1 "launch floor", 1.3 "every shape" when half were sampled, 2.2 "whole last row", 3.1 "208 shapes" = 26 triples, 4.1 "0.04 to 0.06", 5.1 "memory bound", 5.4 load1, 7.6 sampling stride; CUDApp 1.1, 1.2, 2.2, 3.5 | Text was written after the run, not produced from the log; no gate read evidence text | `tools/c3_gemm_evidence.sh` produces every count, range, median, repeat and the acceptance line from the chip log into `<!-- generated: ... -->` blocks. The always-run gate `tests/gates/run.sh evidence-generated` (rules R1 to R3 in the header of `tools/evidence_generated_check.sh`) checks, in evidence directories that opt in by holding a generated marker, that generated text equals its generator and that a generator takes only files of the directory as input; and in any touched evidence directory with a SHA256SUMS, that the manifest verifies (and, if the directory opted in, lists every data file). Hand-written prose is judged by the exact-head review, not by the gate |
+| Corrective action fitted to its own controls, then over-scoped | 5.2, 6.2, 6.3, 6.4, 7.1, 7.3, 7.4, 7.5, 9.1, 9.2 | Rounds 5 to 7 tried to make a gate judge hand-written prose (word lists, then per-line hash markers) and tested it only on the author's sentences; review 9 showed the always-run version would fail other lanes' ordinary evidence commits and that the line markers bound nothing the exact-head review does not | The gate judges no prose and runs only where a directory opts in or carries a manifest; its self-test runs the real gate end to end in a scratch git repository, including a control that an unrelated lane's evidence directory passes untouched |
 | Acceptance unit not checked against the wording | omega-mv 3.1, 3.2, 5.5; CUDApp 1.3, 3.6 | An inherited convention (shape = triple x type x layout) was repeated; nothing encoded the acceptance sentence | The generator states the acceptance literally and prints MET, PARTIAL (when any shape was compared on a sample only) or NOT MET from the data |
 | Hand-maintained copies drift | omega-mv 2.1, 3.6, 4.2 to 4.6, 5.3, 7.8, 7.9; CUDApp 2.4 | Status rows, comments and process text restated values that change elsewhere | `docs/OMEGA.md` C3 rows point at the generated acceptance line and type no status word for the GEMM run; AGENTS.md and AUDIT_SCOPE.md point at `.aien/always` instead of copying it |
 | Receipts and provenance | omega-mv 1.2, 1.4, 2.3, 2.5, 6.1 (SHA256SUMS broken by an edit); CUDApp 1.5, 2.1, 2.5 | Runs were named by label and launched by hand; nothing checked the manifest | `tools/run_gpu_gemm_chip.sh` writes a provenance header and refuses to overwrite; the gate runs `sha256sum -c` in every touched evidence directory and fails a data file that is not in SHA256SUMS |
@@ -90,20 +90,16 @@ every finding was about what the evidence text said, or about the corrective act
 | Instrument condition not inspected | omega-mv 1.1, 1.7, 2.4, 3.3, 3.4; CUDApp 2.3, 3.1, 3.2 | The first timed run was the first look at the instrument | The chip tier busy-polls by default (`--spin-us`); repeat lines are generated for the cases common to a history run (the 26 hand-picked shapes only); all other cases carry one sample |
 | Test-tool input checks | omega-mv 1.5, 2.6; CUDApp 1.6, 2.6, 3.3 | Options were added for one run and not given a range | Both options are range-checked and refuse out-of-range values with exit 2 |
 
-Why each corrective action did not hold. Action 1 (5f946b6a) compared only existing generated blocks, so typed text outside them
-passed. Action 2 (3b87b07e) and action 3 (76046707) tried to recognise false prose by its words, an allow-by-default list and then a
-deny list, validated only against the author's own sentences; each next review found phrasings outside the list. Cause of the kind:
-a gate that judges natural language is never finished. Action 4 (this head) stops judging: it binds every hand line to a review and
-puts the checker's own controls through its real code path.
-
-Scope, stated: other files under `docs/` (long prose documents many lanes edit) and Markdown at the repository root are not bound
-line by line; the truth of a reviewed line, and of its REASON, stays with the reviewer, who gets the typed_ok_added list.
+Why each corrective action did not hold. Action 1 (5f946b6a) compared only existing generated blocks. Actions 2 and 3 (3b87b07e,
+76046707) tried to recognise false prose by its words and were tested only on the author's sentences. Action 4 (3686d5de) bound every
+hand line to a marker the author made himself, which adds nothing to the exact-head review, and as an always-run gate it would have
+failed other lanes. Cause of the kind: a corrective action sized to the whole repository's prose instead of to the defect. The
+action at this head is the small one: numbers are generated, generated text and manifests are checked, prose stays with review.
 
 Pre-review step for every later change in this repository that adds or edits evidence or `docs/OMEGA.md`:
 1. Run `tests/gates/run.sh evidence-generated` (and `evidence-immutable`) and keep the output.
-2. Put every number or status computed from a log or table in a generated block. For each remaining hand-written line,
-   check it against its source, then add `<!-- typed-ok HASH: REASON -->` with HASH from
-   `tools/evidence_generated_check.sh --hash FILE LINE` and a REASON that names the source (file and line).
+2. Put every number or status computed from a log or table in a generated block; check each remaining hand-written
+   sentence against its source before review.
 3. Read the acceptance sentence of the issue and check that the generated acceptance line counts the unit it names.
 
 Omega: the checker and the generator are bash and POSIX sh with awk. Earlier text here said their Omega replacement waits for
