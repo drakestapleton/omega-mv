@@ -10,9 +10,10 @@ interplane.io (https://interplane.io/drakestapleton/aienux) served `d01b2f19` th
 
 The same method as the moves from CUDApp into `gpu/` (aien-architecture-mv ADR 0047, steps 1 to 4):
 git filter-repo (`import/filter-repo.version`), a host tool used once for this import and not part of any
-build or gate, in one pass over a single-branch clone of aienux main (`import/filter-repo-command.txt`).
-The pass keeps every path except the ones listed below and renames the kept tree under `kernel/`. The
-rewritten branch (666 of aienux's 701 commits; the other 35 touched only left-out paths) was merged
+build or gate, in two passes over a single-branch clone of aienux main. The first pass
+(`import/first-pass.txt`) changes only two documents ("Rebuilt import" below). The second
+(`import/filter-repo-command.txt`) keeps every path except the ones listed below and renames the kept
+tree under `kernel/`. The rewritten branch (666 of aienux's 701 commits; the other 35 touched only left-out paths) was merged
 with `git merge --allow-unrelated-histories`, so `git log -- kernel/<path>` shows the aienux commits of
 that file.
 
@@ -24,7 +25,25 @@ that file.
 Commit messages, authors and dates are kept. An aienux hash named in a message, a receipt or a register
 is still the aienux hash (`--preserve-commit-hashes`); its commit here is the one the commit map names.
 Aienux itself was not changed. The tree at the merge holds the same blobs, path for path, as aienux
-`1f12818d` minus the left-out paths.
+`1f12818d` minus the left-out paths, except `docs/PI5_AIENOS_MAP.md` and `docs/IMAC_AIENOS_MAP.md`.
+
+### Rebuilt import, 2026-11-18
+
+The first import of 2026-11-17, on branches that never landed, carried in the two aienux map documents
+a description of what one operator machine runs, which is not public. The import was rebuilt before
+landing so that no commit of this history holds it. The first pass gives the two files, in each of the 18
+aienux commits that have them (`c9a56739` to `1f12818d`), a version without it: the Pi map takes the
+wording omega-mv commit `8c9a195f3` gives it and the board table's Linux kernel row of a later aienux
+commit; the iMac map takes only that commit's private-network paragraph. The same pass takes out of the
+messages of `c9a56739` and `ea6130ce` the one clause each that described that machine; no other message
+changed. `import/first-pass.txt` has the command and every replaced blob. Nothing else changed: for each
+of the 666 commits the tree equals the
+first import's path for path but for those two files, and the other 648 commits kept
+their hashes (the locked `593c755e` and `b7c5e158` among them). Every omega-mv commit after the import
+was then replayed on it with the same author, dates, message and tree, but for the two files and for
+`import/commit-map` and `import/ref-map`, which are regenerated in the commit that adds them (`import/`
+is additions only); the import merge's message names the two passes. Reviews cited as omega-mv
+`c9e503afd` reviewed the first import's integration head, replayed here as `be64892fd`.
 
 ## Left out, and why
 
@@ -103,7 +122,8 @@ doubled with a manifest or without a reason, its own manifest removed, and an or
 
 ### Run once, 2026-11-18
 
-At `58191635c` (with the root runner's `kernel-*` and `kernel-gate-wiring` arms of kernel/fix2-gates
+At the commit now `ef5843304` (run before the rebuild above, on its first-import twin, whose tree differs
+only in `import/commit-map` and `import/ref-map`; with the root runner's `kernel-*` and `kernel-gate-wiring` arms of kernel/fix2-gates
 applied), each step in a fresh clone through `tests/gates/run.sh <step>`, on an AArch64 Linux host at load
 15 to 42. Exit 0: `kernel` (all six), `kernel-gate-wiring`, and the kernel steps ck-gate-selftest,
 ck-hold-selftest, ck-owner-keys, crypto-boundary, native-capability, native-sig, native-crypto,

@@ -47,7 +47,7 @@
 # from a commit that added a kernel/ file after $IMPORT escapes (3); naming a base that holds that
 # commit (AIEN_BASE_REF) catches it through (1). Untracked files are not evidence and are not read.
 set -u
-IMPORT=98671516302b85dc7c2b6d2a1e8bcf993d13e36f
+IMPORT=67945327139b31a6eb60cff62d0e5823a77249de
 # Every control, by name; each must run and give its expected exit (asserted, not only printed).
 CONTROLS="untouched added no-kernel-untouched base-file-edited base-file-edited-without-kernel
 correction-deleted-decoy-added orphan-merge-receipt orphan-merge-commit-map orphan-first-parent
