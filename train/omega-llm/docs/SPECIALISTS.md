@@ -60,14 +60,36 @@ ollm spens BASE.ck P1.sp P2.sp W1_MILLI PROMPT N TEMPMILLI SEED [MERGES]
 - **`spstack`** vertically stacks `P1`'s layers followed by `P2`'s layers (`L_out <= 16`) with per-pack `(Wo, W2)` residual scaling (`S_MILLI / 1000.0`) and averaged final norm gain `gf`.
 - **`spens`** runs frozen base layers `0..base_L-1` once per step and evaluates `P1` and `P2` in parallel over the shared `H_base`, fusing `w1 * log_softmax(z1) + (1 - w1) * log_softmax(z2)` (Product-of-Experts, works across different initialization basins such as `grow` ⊕ `growpro`).
 
-### 4. Bank-B KV Cache (`okvkv` in `model.om`) & Inference-Time Experiments (`ttteval`, `tttsamp`, `dolaeval`)
+### 4. Multi-Link Merkle Specialist Chains & DNA-Style Multi-Helix Clipping (`spchainapp`, `spchaineval`, `spchainsamp`, `spclip`)
+```sh
+ollm spchainapp BASE.ck OUT.ck K P1.sp ... PK.sp
+ollm spchaineval BASE.ck HELD W MERGES K P1.sp ... PK.sp
+ollm spchainsamp BASE.ck N TEMPMILLI PROMPT SEED MERGES K P1.sp ... PK.sp
+ollm spclip BASE.ck MODE PROMPT N TEMPMILLI SEED MERGES S W1 K1 A1..AK1 W2 K2 B1..BK2 [W3 K3 C1..CK3 [W4 K4 D1..DK4]]
+```
+- **Multi-link Merkle chains (`spchainapp`, `spchaineval`, `spchainsamp`)** load `BASE.ck` and sequentially verify and attach `K` (`1..8`, total `L <= 16`) `OLLMSP01` packs in memory:
+  - Link `i` verifies `P_i.base_L == cur_L`, `P_i.base_hash == FNV1a64(shapes, ow[0..cur_fz))`, exact `n_spec_params`, and `P_i.pack_hash` (`rc=60/61/62` on refusal), then updates `ow[cur_fz .. new_P)` and `cur_L = P_i.spec_L` so Link `i+1` cryptographically pins the exact chain `0..i` beneath it.
+  - Pass `-` for `MERGES` when `V <= 256` (loaded via `obload` when `V > 256`).
+  - `spchainapp` prints `SPCHAPP BASE_L FINAL_L K P` and saves `OUT.ck`; `spchaineval` prints `E step W loss_micro bpb_micro` matching `eval`; `spchainsamp` streams decoded tokens directly from memory.
+- **DNA-style multi-helix chain clipping (`spclip`, `S = 2..4` strands, e.g. double, triple, or quad helix):**
+  - Detects the longest common prefix of identical verified packs across all `S` strands (verifying every strand's pack headers and payload FNV-1a 64 hashes) and runs the shared trunk layers `0..trunk_L-1` **once per token** into cached `H_trunk`.
+  - Evaluates each strand's remaining layers (`trunk_L .. L_s - 1`, supporting asymmetric strand depths up to `L <= 16`) over `H_trunk`, computes `log_softmax` and Shannon entropy `H_s = -sum P_s log P_s`, and fuses all `S` strands in log-probability space:
+    - `MODE=0`: Normalized prior Product-of-Experts (`alpha_s = w_s / sum(w)`).
+    - `MODE=1`: Entropy-gated multi-helix (`u_s = w_s / (H_s + 0.001)`, `alpha_s = u_s / sum(u)`, fused `sum_s alpha_s * log P_s`) so whichever specialized strand is more confident on the current token dominates.
+
+### 5. Bank-B KV Cache (`okvkv` in `model.om`) & Inference-Time Experiments (`ttteval`, `tttsamp`, `dolaeval`)
 - **`okvkv` (`model.om`)** restores/saves only the `oak`/`oau` K/V slices in `oab` for bank-B layers (`l >= LAA`) without clobbering `oahin`, enabling exact KV-cached decode for `L = 8..16` (verified 0 mismatched logits via `ollm kvcmp` on `L=8` and `L=10`).
 - `ollm ttteval CK HELD W PREFIX STEPS LRMICRO LAYER_FROM` — strictly-causal test-time fast-weight adaptation on `[0..PREFIX)`, scored on `[PREFIX..T)`, restoring base weights after every window.
 - `ollm tttsamp CK SEED N TEMPMILLI PROMPT MERGES STEPS LRMICRO LAYER_FROM` — ephemeral test-time adaptation on `PROMPT` before sampling, then restoring base weights.
 - `ollm dolaeval CK HELD W EARLY_LAYER BETA_MILLI` — layer-contrastive decoding evaluation (`log P_final - beta * log P_early`).
 
 ## Measured Host Results (Apple Silicon M2, Darwin 25.6.0 arm64, f64 CPU)
-- **Cross-target build:** compiles cleanly to both Darwin ARM64 Mach-O (with embedded ad-hoc `LC_CODE_SIGNATURE`, zero `codesign`) and Linux AArch64 static ELF (`lio.om`). Linux/x86/UEFI execution and GB10 GPU execution remain `NOT_RUN`.
+- **Cross-target build:** compiles cleanly to Darwin ARM64 Mach-O (`mio.om`, 247,840 B), Linux AArch64 static ELF (`lio.om`, 405,436 B), and `gb10` (`lio.om` + `gpu/*`, 706,536 B) with 0 errors. Linux/x86/UEFI execution and GB10 GPU execution remain `NOT_RUN`.
+- **Multi-link Merkle chains & multi-helix `spclip` (`V=256, T=16, D=32, H=2, F=64, L=2→3→4`):**
+  - Built 2-link chains (`base L=2` → `P1.sp L=2→3` → `P2_{a,b,c}.sp L=3→4` pinned to `base + P1`).
+  - `spchainapp` (`SPCHAPP 2 4 2 41760`) and in-memory `spchaineval` matched the trained 4-layer checkpoint `eval` **bit-identically** (`E 5 4 5492684 7924269`); greedy (`TEMPMILLI=0`) and stochastic (`TEMPMILLI=800`) `spchainsamp` matched `sample` bit-for-bit via `cmp`.
+  - Negative controls caught with exact refusal codes: swapped link order `P2 P1` (`rc=62`), skipped `P1` (`rc=62`), 1-bit flip in `P2` payload (`rc=61`), 1-bit flip in shared trunk `P1` on strand 2 in `spclip` (`rc=61`), truncated pack (`rc=60`), and invalid `S`/`MODE` (`rc=2`).
+  - `spclip` identity & multi-helix checks: double-helix `S=2 (A,A)`, triple-helix `S=3 (A,A,A)`, quad-helix `S=4 (A,A,A,A)`, and zero-weight isolation `(A@1000, B@0)` all matched single-strand `spchainsamp` **bit-identically** in both `MODE=0` and `MODE=1`. Distinct `S=2 (A,B)`, `S=3 (A,B,C)`, `S=4 (A,B,C,trunk)`, asymmetric-depth `(L=3, L=4)`, and direct-base fork (`common_links=0`) all executed cleanly (`rc=0`, finite 32-byte outputs).
 - **Frozen-core preservation (2→3 layer host test):** `trainf` kept 100% of embeddings + layers `0..1` bit-identical while updating layer 2 (`F 5 2 5486997`, identical before and after the `ofzlay` backward-skip optimization). Negative control: standard `train` mutated layers `0..1`.
 - **`spext`/`spapp` round-trip & negative controls:** rebuilt checkpoint matched trained `eval` bit-for-bit (`E 5 5 5445549 7856267` vs `E 0 5 5445549 7856267`). Negative controls caught: wrong base (`rc=62`), 1-bit flipped payload (`rc=61`), truncated pack (`rc=60`), non-frozen checkpoint passed to `spext` (`rc=62`).
 - **v2 (`omega-v2.ck`, 15.8M → 17.6M, 8→9 layers) tool-call specialist run (25 steps, `FREEZE_LAYERS=8`, `B=2`, `lr=0.005`):**
