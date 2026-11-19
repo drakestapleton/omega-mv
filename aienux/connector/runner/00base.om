@@ -1,0 +1,479 @@
+note runner/00base.om -- interplane-runner: state cells, texts and helpers (seeded Omega, OM-2).
+note Composed after the om/tls units, seed/net/http.om and seed/net/https.om (see build.sh).
+note Every name here starts with r: http.om reserves h*, H*; om/tls reserves its module prefixes.
+note A global is never passed as an argument (omc error 19), so helpers that fill a global copy
+note from a local array in a loop.
+
+note rgv: scalar cells, indexed by the constants below
+global rgv ulong 64
+note rph: the last path built by r_path / r_jpath; rhm: the state directory
+global rph uchar 4096
+global rhm uchar 4096
+note rhub: the hub URL as given; rhost: its host name
+global rhub uchar 512
+global rhost uchar 256
+note rmsg: the message being built; rrsp: the last response body. rrsp holds the largest salvage
+note record the hub can serve (the record format caps each field: 16 KiB source, 4 KiB stdin,
+note 4 KiB expected, and the text fields; under 32 KiB in all) with room to spare; a longer body is
+note refused as -413, never cut.
+global rmsg uchar 8192
+global rrsp uchar 65536
+note rsk: the private scalar; rpub: the public point 04 || X || Y; rpubh / rkid: their hex forms
+global rsk uchar 32
+global rpub uchar 65
+global rpubh uchar 130
+global rkid uchar 64
+note rjd: the current job directory; rjf: the job's text fields at the offsets rf* below
+global rjd uchar 4096
+global rjf uchar 512
+
+const rhml ulong 0
+const rphl ulong 1
+const rhstl ulong 2
+const rport ulong 3
+const rtls ulong 4
+const rmsgl ulong 5
+const rrspl ulong 6
+const rrate ulong 7
+const rwhy ulong 8
+const rcode ulong 9
+const rhubl ulong 10
+const rpost ulong 11
+const rjdl ulong 12
+const rexl ulong 13
+const rsrco ulong 14
+const rsrcn ulong 15
+const rstio ulong 16
+const rstin ulong 17
+
+note rjf offsets: job id 32, part 64, compiler 64, binary 64, stdout 64, exit text (rgv rexl bytes)
+const rfjob ulong 0
+const rfpart ulong 32
+const rfcomp ulong 96
+const rfbin ulong 160
+const rfout ulong 224
+const rfexit ulong 288
+
+note open flags (arm64): rdonly|nofollow|cloexec; wronly|creat|excl|nofollow|cloexec;
+note wronly|creat|trunc|nofollow|cloexec; wronly|creat|append|nofollow|cloexec;
+note rdonly|directory|nofollow|cloexec
+const rford int 557056
+const rfonew int 557249
+const rfotr int 557633
+const rfoapp int 558145
+const rfodir int 573440
+
+note the compiler every job must name and every check uses: omc of omega-mv f4df8239, the pin
+note of the interplane-forge salvage collector (run.sh PIN)
+text rtpin "3ad9f10f64309e7acf8a725082b28e23a2a4aeb07e98322fb4dc0fcd8fc93194"
+text rhex "0123456789abcdef"
+text rtnl "\n"
+text rtsp " "
+text renvh "HOME="
+text renvr "INTERPLANE_RUNNER_HOME="
+text rdotd "/.interplane-runner"
+
+fn r_say t view uchar * to void
+w = write 1 t 0 len t
+end
+
+note r_dec: v in decimal into d at o; returns the offset after it
+fn r_dec d edit uchar * o ulong v ulong to ulong
+t = new uchar 20 0
+i = ulong 20
+x = v
+for it ulong 20
+i = sub i 1
+put t i uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+k = o
+for j ulong sub 20 i bound 20
+put d k get t add i j
+k = add k 1
+end
+ret k
+end
+
+fn r_num v ulong to void
+d = new uchar 20 0
+n = r_dec d 0 v
+w = write 1 d 0 n
+end
+
+note r_undec: a decimal of 1..19 digits without a leading zero (or "0"); 2^64-1 when malformed
+fn r_undec s view uchar * to ulong
+bad = ulong 18446744073709551615
+if or eq len s 0 gt len s 19
+ret bad
+end
+if and gt len s 1 eq get s 0 48
+ret bad
+end
+v = ulong 0
+for i ulong len s bound 19
+c = get s i
+if or lt c 48 gt c 57
+ret bad
+end
+v = add mul v 10 sub ulong c 48
+end
+ret v
+end
+
+note r_hex: s as lowercase hex into d at o; returns the offset after it
+fn r_hex s view uchar * d edit uchar * o ulong to ulong
+for i ulong len s bound 8388608
+put d add o mul i 2 get rhex ulong shr get s i 4
+put d add add o mul i 2 1 get rhex ulong and get s i 15
+end
+ret add o mul len s 2
+end
+
+fn r_hv c uchar to ulong
+if and ge c 48 le c 57
+ret sub ulong c 48
+end
+if and ge c 97 le c 102
+ret sub ulong c 87
+end
+ret 16
+end
+
+note r_unhex: exactly 2 * len d lowercase hex characters into d
+fn r_unhex s view uchar * d edit uchar * to bool
+if ne len s mul len d 2
+ret false
+end
+for i ulong len d bound 4194304
+a = r_hv get s mul i 2
+b = r_hv get s add mul i 2 1
+if or gt a 15 gt b 15
+ret false
+end
+put d i uchar or shl a 4 b
+end
+ret true
+end
+
+note r_ishex: s is lowercase hex only
+fn r_ishex s view uchar * to bool
+for i ulong len s bound 16777216
+if gt r_hv get s i 15
+ret false
+end
+end
+ret true
+end
+
+fn r_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+for i ulong len a bound 16777216
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn r_wipe b edit uchar * to void
+for i ulong len b bound 16777216
+put b i 0
+end
+end
+
+fn r_sha m view uchar * h edit uchar * to void
+c = new ulong 40 0
+sha256_init c
+sha256_update c m
+sha256_final c h
+end
+
+note r_envget: the value of the first environment entry that starts with pre, into d; -1 when absent
+fn r_envget pre view uchar * d edit uchar * to long
+b = new uchar 4096 0
+for i ulong ulong envcnt bound 1000000
+n = envread i b 0 4096
+if gt n long len pre
+if r_envcp part b 0 ulong n pre d
+ret sub n long len pre
+end
+end
+end
+ret -1
+end
+
+note r_envcp: b starts with pre and the rest fits d: copy the rest into d
+fn r_envcp b view uchar * pre view uchar * d edit uchar * to bool
+if not r_eq part b 0 len pre pre
+ret false
+end
+m = sub len b len pre
+if gt m len d
+ret false
+end
+for j ulong m bound 4096
+put d j get b add len pre j
+end
+ret true
+end
+
+note r_home: the state directory, $INTERPLANE_RUNNER_HOME when set, else $HOME/.interplane-runner;
+note it must be absolute and free of control bytes
+fn r_home to bool
+b = new uchar 4096 0
+n = r_envget renvr b
+if lt n 0
+n = r_envget renvh b
+if lt n 0
+ret false
+end
+if gt add ulong n len rdotd 4000
+ret false
+end
+for i ulong len rdotd
+put b add ulong n i get rdotd i
+end
+n = add n long len rdotd
+end
+if or lt n 2 gt n 4000
+ret false
+end
+if ne get b 0 47
+ret false
+end
+note the folder's own name must be .interplane-runner (also for INTERPLANE_RUNNER_HOME, which tests
+note use): everything the runner removes is inside a folder of that name
+if lt ulong n len rdotd
+ret false
+end
+if not r_eq part b sub ulong n len rdotd len rdotd rdotd
+ret false
+end
+for i ulong ulong n bound 4096
+c = get b i
+if or lt c 32 eq c 127
+ret false
+end
+put rhm i c
+end
+put rgv rhml ulong n
+ret true
+end
+
+note r_path: rph = state directory + "/" + nm (nm empty: the directory itself); returns the length
+fn r_path nm view uchar * to ulong
+n = get rgv rhml
+for i ulong n bound 4096
+put rph i get rhm i
+end
+if gt len nm 0
+put rph n 47
+for i ulong len nm bound 4000
+put rph add add n 1 i get nm i
+end
+n = add add n 1 len nm
+end
+put rgv rphl n
+ret n
+end
+
+note r_jpath: rph = job directory + "/" + nm
+fn r_jpath nm view uchar * to ulong
+n = get rgv rjdl
+for i ulong n bound 4096
+put rph i get rjd i
+end
+put rph n 47
+for i ulong len nm bound 4000
+put rph add add n 1 i get nm i
+end
+n = add add n 1 len nm
+put rgv rphl n
+ret n
+end
+
+note r_phcp: a copy of rph into d; returns its length
+fn r_phcp d edit uchar * to ulong
+n = get rgv rphl
+for i ulong n bound 4096
+put d i get rph i
+end
+ret n
+end
+
+note r_rd: the whole file at rph into b; its length, -27 when it is longer than b, or -errno
+fn r_rd b edit uchar * to long
+one = new uchar 1 0
+fd = fopen rph 0 get rgv rphl rford 0
+if lt fd 0
+ret fd
+end
+n = ulong 0
+rc = long 0
+while true bound 9223372036854775807
+if eq n len b
+r = read int fd one 0 1
+if ne r 0
+rc = -27
+end
+break
+end
+r = read int fd b n sub len b n
+if lt r 0
+rc = r
+break
+end
+if eq r 0
+break
+end
+n = add n ulong r
+end
+x = fclose int fd
+if lt rc 0
+ret rc
+end
+ret long n
+end
+
+note r_wr: write d to the file at rph opened with flags fl and mode md, then fsync
+fn r_wr d view uchar * fl int md int to bool
+fd = fopen rph 0 get rgv rphl fl md
+if lt fd 0
+ret false
+end
+n = ulong 0
+ok = true
+while lt n len d bound 9223372036854775807
+r = write int fd d n sub len d n
+if le r 0
+ok = false
+break
+end
+n = add n ulong r
+end
+s = fsync int fd
+x = fclose int fd
+ret and ok eq s 0
+end
+
+note r_pk: one packed-list record (u16 length, bytes) at o; returns the offset after it
+fn r_pk p edit uchar * o ulong s view uchar * to ulong
+put p o uchar and len s 255
+put p add o 1 uchar shr len s 8
+for i ulong len s bound 65536
+put p add add o 2 i get s i
+end
+ret add add o 2 len s
+end
+
+text rtnew ".new"
+note r_replace: write d to "<rph>.new" (0600), then rename it over rph
+fn r_replace d view uchar * to bool
+a = new uchar 4100 0
+b = new uchar 4100 0
+p = new uchar 8300 0
+n = r_phcp a
+for i ulong 4
+put b add n i get rtnew i
+end
+for i ulong n bound 4096
+put b i get a i
+end
+for i ulong add n 4 bound 4100
+put rph i get b i
+end
+put rgv rphl add n 4
+if not r_wr d rfotr 384
+ret false
+end
+put p 0 2
+put p 1 0
+k = r_pk p 2 part b 0 add n 4
+k = r_pk p k part a 0 n
+r = renames p 0 k 0
+ret eq r 0
+end
+
+note r_join: q = p + "/" + nm; returns its length (0 when it would not fit)
+fn r_join p view uchar * nm view uchar * q edit uchar * to ulong
+if gt add add len p 1 len nm len q
+ret 0
+end
+for i ulong len p bound 4096
+put q i get p i
+end
+put q len p 47
+for i ulong len nm bound 4096
+put q add add len p 1 i get nm i
+end
+ret add add len p 1 len nm
+end
+
+note r_dotdot: nm is "." or ".."
+fn r_dotdot nm view uchar * to bool
+if eq len nm 1
+ret eq get nm 0 46
+end
+if eq len nm 2
+ret and eq get nm 0 46 eq get nm 1 46
+end
+ret false
+end
+
+note r_rmtree: remove p and everything below it, never following a symbolic link (a link is removed
+note as an entry). True when p is gone afterwards.
+fn r_rmtree p view uchar * to bool
+b = new uchar 8192 0
+q = new uchar 4096 0
+fd = fopen p 0 len p rfodir 0
+if lt fd 0
+r = unlink p 0 len p
+ret or eq r 0 eq r -2
+end
+while true bound 9223372036854775807
+n = getdnts int fd b 0 8192
+if le n 0
+break
+end
+o = ulong 0
+while lt o ulong n bound 8192
+o = add o r_rment p part b o sub ulong n o q
+end
+end
+x = fclose int fd
+r = rmdir p 0 len p
+ret or eq r 0 eq r -2
+end
+
+note r_rment: one getdents64 record at the start of d below the directory p; returns the record
+note length (a removal that fails leaves the directory non-empty, so the caller's rmdir fails)
+fn r_rment p view uchar * d view uchar * q edit uchar * to ulong
+rl = or ulong get d 16 shl ulong get d 17 8
+ty = get d 18
+nl = ulong 0
+while lt add 19 nl rl bound 65536
+if eq get d add 19 nl 0
+break
+end
+nl = add nl 1
+end
+if r_dotdot part d 19 nl
+ret rl
+end
+k = r_join p part d 19 nl q
+if eq k 0
+ret rl
+end
+if or eq ty 4 eq ty 0
+x = r_rmtree part q 0 k
+ret rl
+end
+r = unlink q 0 k
+ret rl
+end

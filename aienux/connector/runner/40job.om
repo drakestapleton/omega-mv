@@ -1,0 +1,333 @@
+note runner/40job.om -- one job: ask the hub, check the compiler, fetch the record, run the cell,
+note sign and post the result. Run by a worker process the supervisor forks for each cycle.
+
+text rtnext "next"
+text rtnonce "nonce"
+text rtokjob "ipcc1 ok job\n"
+text rtoknone "ipcc1 ok none\n"
+text rtjobn "job"
+text rtpartn "part"
+text rtcompn "compiler"
+text rtbinn "binary"
+text rtoutn "stdout"
+text rtexitn "exit"
+text rtresn "result"
+text rtwork "work"
+text rtmagic "IPSLV001"
+text rtlhub "hub: "
+text rtlnone "no work\n"
+text rtlpin "refused: the job names a compiler other than the pinned omc 3ad9f10f\n"
+text rtlomc "refused: bin/omc is not the pinned compiler; run join again\n"
+text rtlrec "refused: the record is missing, is not the revision the job names, or is not a part\n"
+text rtljd "error: could not make the job directory\n"
+text rtlcell "error: the cell could not start a stage\n"
+text rtlres "result "
+text rtlsign "error: could not sign\n"
+text rtlnet "error: hub not reachable, status "
+text rtlarr " -> "
+text rtxneg "-"
+text rtokcnt "ipcc1 ok counted\n"
+text rtokst "ipcc1 ok stored\n"
+text rtlcellp "the cell could not start on this computer (see the result above); checks pause for an hour. Run: interplane-runner selftest\n"
+
+note r_logt: "<unix seconds> " on stdout (the log when running in the background)
+fn r_logt to void
+r_num ulong div realns 1000000000
+r_say rtsp
+end
+
+fn r_lognet s long to void
+r_logt
+r_say rtlnet
+if lt s 0
+r_say rtxneg
+r_num ulong neg s
+else
+r_num ulong s
+end
+r_say rtnl
+end
+
+note r_ask: "next"; 0 with the job in rjf, 1 no work, 2 refused or error
+fn r_ask to ulong
+nb = new uchar 16 0
+nh = new uchar 32 0
+j = new uchar 32 0
+p = new uchar 64 0
+c = new uchar 64 0
+r_mbeg rtnext
+r_mkey
+r_mtime
+x = random nb 0 16 0
+if ne x 16
+ret 2
+end
+k = r_hex nb nh 0
+r_mline rtnonce nh
+if not r_msign
+r_logt
+r_say rtlsign
+ret 2
+end
+s = r_post
+if lt s 0
+r_lognet s
+ret 2
+end
+if r_rspis rtoknone
+ret 1
+end
+if not r_rspis rtokjob
+r_logt
+r_say rtlhub
+r_rspline
+r_say rtnl
+ret 2
+end
+ok = and and r_rspfld rtjobn j r_rspfld rtpartn p r_rspfld rtcompn c
+if not ok
+ret 2
+end
+if not and and r_ishex j r_ishex p r_ishex c
+ret 2
+end
+for i ulong 32
+put rjf add rfjob i get j i
+end
+for i ulong 64
+put rjf add rfpart i get p i
+put rjf add rfcomp i get c i
+end
+ret 0
+end
+
+note r_jfeq: rjf[o, o+len t) equals t
+fn r_jfeq o ulong t view uchar * to bool
+for i ulong len t bound 256
+if ne get rjf add o i get t i
+ret false
+end
+end
+ret true
+end
+
+note r_omcok: <state>/bin/omc hashes to the pin
+fn r_omcok to bool
+h = new uchar 32 0
+x = new uchar 64 0
+n = r_path rtomc
+if not r_fsha h
+ret false
+end
+k = r_hex h x 0
+ret r_eq x rtpin
+end
+
+note r_fetch: GET /salvage/<part>/record into rrsp; its SHA-256 must be the part id and it must
+note parse as a part record (IPSLV001, kind 2, twelve field lengths that add up exactly);
+note sets the source and stdin field offsets
+fn r_fetch to bool
+pth = new uchar 128 0
+p = new uchar 64 0
+k = r_cp pth 0 rtsalv
+for i ulong 64
+put p i get rjf add rfpart i
+end
+k = r_cp pth k p
+k = r_cp pth k rtrecs
+put rgv rpost 0
+s = r_call part pth 0 k
+if ne s 200
+if ne s 404
+r_lognet s
+end
+ret false
+end
+ret r_recok p
+end
+
+fn r_recok p view uchar * to bool
+b = new uchar 65536 0
+h = new uchar 32 0
+x = new uchar 64 0
+n = get rgv rrspl
+for i ulong n bound 65536
+put b i get rrsp i
+end
+r_sha part b 0 n h
+k = r_hex h x 0
+if not r_eq x p
+ret false
+end
+if lt n 64
+ret false
+end
+if not r_eq part b 0 8 rtmagic
+ret false
+end
+if ne get b 8 2
+ret false
+end
+for i ulong 7
+if ne get b add 9 i 0
+ret false
+end
+end
+o = ulong 64
+for f ulong 12
+l = r_u32 b add 16 mul f 4
+if gt l n
+ret false
+end
+if eq f 5
+put rgv rsrco o
+put rgv rsrcn l
+end
+if eq f 7
+put rgv rstio o
+put rgv rstin l
+end
+o = add o l
+end
+ret eq o n
+end
+
+note r_rspfile: rrsp[o, o+n) into the new job file nm
+fn r_rspfile nm view uchar * o ulong n ulong to bool
+b = new uchar 65536 0
+for i ulong n bound 65536
+put b i get rrsp add o i
+end
+k = r_jpath nm
+ret r_wr part b 0 n rfonew 384
+end
+
+note r_jdir: rjd = <state>/work/<job>, a new 0700 directory
+fn r_jdir nm view uchar * to bool
+q = new uchar 4100 0
+n = r_path rtwork
+r = makedir rph 0 n 448
+if and lt r 0 ne r -17
+ret false
+end
+p = new uchar 4100 0
+pl = r_phcp p
+k = r_join part p 0 pl nm q
+if eq k 0
+ret false
+end
+x = r_rmtree part q 0 k
+r = makedir q 0 k 448
+if lt r 0
+ret false
+end
+for i ulong k bound 4100
+put rjd i get q i
+end
+put rgv rjdl k
+ret true
+end
+
+fn r_jdel to void
+q = new uchar 4100 0
+n = get rgv rjdl
+for i ulong n bound 4100
+put q i get rjd i
+end
+x = r_rmtree part q 0 n
+end
+
+note r_result: sign and post the result in rjf; 0 counted, 2 refused or error
+fn r_result to ulong
+r_mbeg rtresn
+r_mkey
+r_mjf rtjobn rfjob 32
+r_mjf rtpartn rfpart 64
+r_mjf rtcompn rfcomp 64
+r_mjf rtbinn rfbin 64
+r_mjf rtoutn rfout 64
+r_mjf rtexitn rfexit get rgv rexl
+r_mtime
+if not r_msign
+r_logt
+r_say rtlsign
+ret 2
+end
+s = r_post
+r_logt
+r_say rtlres
+r_jfsay rfpart 64
+r_say rtsp
+r_jfsay rfexit get rgv rexl
+r_say rtlarr
+if lt s 0
+r_say rtxneg
+r_num ulong neg s
+r_say rtnl
+ret 2
+end
+r_rspline
+r_say rtnl
+if r_rspis rtokcnt
+ret 0
+end
+if r_rspis rtokst
+ret 3
+end
+ret 2
+end
+
+fn r_jfsay o ulong n ulong to void
+d = new uchar 256 0
+for i ulong n bound 256
+put d i get rjf add o i
+end
+w = write 1 d 0 n
+end
+
+note r_job: one whole cycle; 0 a result was counted, 1 no work, 2 refused or error
+fn r_job to ulong
+j = new uchar 32 0
+a = r_ask
+if eq a 1
+r_logt
+r_say rtlnone
+end
+if ne a 0
+ret a
+end
+if not r_jfeq rfcomp rtpin
+r_logt
+r_say rtlpin
+ret 2
+end
+if not r_omcok
+r_logt
+r_say rtlomc
+ret 2
+end
+if not r_fetch
+r_logt
+r_say rtlrec
+ret 2
+end
+for i ulong 32
+put j i get rjf add rfjob i
+end
+if not r_jdir j
+r_logt
+r_say rtljd
+ret 2
+end
+ok = and r_rspfile rtsrc get rgv rsrco get rgv rsrcn r_rspfile rtsin get rgv rstio get rgv rstin
+if ok
+ok = r_check
+end
+r_jdel
+if not ok
+r_logt
+r_say rtlcell
+ret 2
+end
+ret r_result
+end

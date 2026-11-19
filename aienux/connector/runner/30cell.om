@@ -1,0 +1,369 @@
+note runner/30cell.om -- the cell: every byte of brought code runs only through omega-mv execpure.
+note A stage forks a child that opens its three stage files onto descriptors 0..2 and calls
+note execpure on one program. execpure (OMEGESE.md, word 198) closes every descriptor at or above 3,
+note pins the program as descriptor 3, restricts the process with Landlock (read and execute of
+note that program only), PR_SET_NO_NEW_PRIVS, seven prlimits (CPU 1 s soft / 2 s hard, file size
+note 1 MiB, stack 8 MiB, no core, no new process, 4 descriptors, 128 MiB address space) and a
+note seccomp filter that allows only read(0), write(1|2), exit, exit_group and execveat of the
+note pinned program (everything else EPERM, a non-AArch64 call kills), then executes it with an
+note empty environment. The parent kills the stage's process group at the 3 s wall clock.
+note Both stages run in the cell: the compiler too.
+note When the cell cannot start (a stage file does not open, or execpure itself fails) the child
+note writes "E" and the errno to its stage stderr file and exits 125 (r_kfail, r_cfail), so "the
+note cell could not start" is never mistaken for a program's own exit status.
+
+text rtomc "bin/omc"
+text rtsrc "source.om"
+text rtcout "compiler.out"
+text rtcerr "compile.err"
+text rtelf "part.elf"
+text rtsin "stdin"
+text rtsout "stdout"
+text rtserr "stderr"
+const rwall ulong 3000000000
+
+note r_kidio: open the stage file nm onto descriptor t (t 0: read; 1, 2: new file 0600); on failure
+note report the errno as a cell failure (r_kfail)
+fn r_kidio nm view uchar * t int to void
+n = r_jpath nm
+fl = rfonew
+if eq t 0
+fl = rford
+end
+fd = fopen rph 0 n fl 384
+if lt fd 0
+r_kfio t fd
+end
+r = dupfd int fd t 0
+if lt r 0
+r_kfio t r
+end
+if ne fd long t
+x = fclose int fd
+end
+end
+
+note r_kfio: a stage file could not be set up. Without its stderr file the child writes nothing
+note (descriptor 2 is still the runner's own log) and exits 125; the parent then finds no stderr
+note file and reports the cell failure.
+fn r_kfio t int v long to void
+if eq t 2
+exit 125
+end
+r_kfail v
+end
+
+note r_kfail: the cell could not start. execpure closes every descriptor at or above 3 before any
+note step that can fail (close_range first), so the record goes to descriptor 2, the stage's stderr
+note file (opened first; seccomp, when it is already installed, still allows write(2)): "E" and
+note the errno in 7 bytes little endian, then exit 125. The parent counts it as a cell failure
+note only when the status is 125 and the stderr file is exactly such a record or does not exist;
+note a program that imitates it only makes its own result uncounted.
+fn r_kfail v long to void
+e = new uchar 8 0
+put e 0 69
+u = ulong neg v
+for i ulong 7
+put e add i 1 uchar and shr u mul i 8 255
+end
+x = write 2 e 0 8
+exit 125
+end
+
+note r_kid: the stage child. sg 0 compiles source.om with <state>/bin/omc, sg 1 runs part.elf.
+fn r_kid sg ulong to void
+pk = new uchar 4200 0
+r = setpgid 0 0
+n = ulong 0
+if eq sg 0
+r_kidio rtcerr 2
+r_kidio rtsrc 0
+r_kidio rtcout 1
+n = r_path rtomc
+else
+r_kidio rtserr 2
+r_kidio rtsin 0
+r_kidio rtsout 1
+n = r_jpath rtelf
+end
+put pk 0 1
+put pk 1 0
+put pk 2 uchar and n 255
+put pk 3 uchar shr n 8
+for i ulong n bound 4096
+put pk add 4 i get rph i
+end
+v = execpure pk 0 add 4 n
+r_kfail v
+end
+
+fn r_u32 b view uchar * o ulong to ulong
+ret or or ulong get b o shl ulong get b add o 1 8 or shl ulong get b add o 2 16 shl ulong get b add o 3 24
+end
+
+note r_cell: run stage sg; sets rgv rwhy (0 exited with rcode, 1 killed by signal rcode, 2 wall
+note clock, 3 the cell could not start: errno rcode). False when no stage could be started.
+fn r_cell sg ulong to bool
+pid = fork
+if lt pid 0
+ret false
+end
+if eq pid 0
+r_kid sg
+exit 125
+end
+r_cwait pid
+if and eq get rgv rwhy 0 eq get rgv rcode 125
+r_cfail sg
+end
+ret true
+end
+
+note r_cwait: wait for the stage until the wall clock, then kill its process group
+fn r_cwait pid long to void
+st = new uchar 4 0
+dl = add monons long rwall
+put rgv rwhy 9
+put rgv rcode 0
+while true bound 9223372036854775807
+w = waitpid int pid st 0 4 1
+if eq w pid
+r_cstat r_u32 st 0
+ret
+end
+if lt w 0
+ret
+end
+if gt monons dl
+x = killpid int neg pid 9
+x = killpid int pid 9
+w = waitpid int pid st 0 4 0
+put rgv rwhy 2
+ret
+end
+x = sleepns 2000000
+end
+end
+
+fn r_cstat s ulong to void
+if eq and s 127 0
+put rgv rwhy 0
+put rgv rcode and shr s 8 255
+else
+put rgv rwhy 1
+put rgv rcode and s 127
+end
+end
+
+note r_cfail: status 125: the stage's stderr file is absent (it could not be opened) or exactly the
+note 8-byte record "E" + errno that r_kfail writes, then the cell could not start
+fn r_cfail sg ulong to void
+eb = new uchar 9 0
+n = ulong 0
+if eq sg 0
+n = r_jpath rtcerr
+else
+n = r_jpath rtserr
+end
+r = r_rd eb
+if eq r -2
+put rgv rwhy 3
+put rgv rcode 2
+ret
+end
+if and eq r 8 eq get eb 0 69
+put rgv rwhy 3
+put rgv rcode r_u32 eb 1
+end
+end
+
+note r_seal: copy compiler.out to a new inode part.elf, mode 0500 (a fresh inode with no writer)
+fn r_seal to bool
+b = new uchar 65536 0
+p = new uchar 4100 0
+n = r_jpath rtcout
+pl = r_phcp p
+src = fopen p 0 pl rford 0
+if lt src 0
+ret false
+end
+n = r_jpath rtelf
+dst = fopen rph 0 n rfonew 384
+if lt dst 0
+x = fclose int src
+ret false
+end
+ok = false
+while true bound 9223372036854775807
+r = read int src b 0 65536
+if eq r 0
+ok = true
+break
+end
+if lt r 0
+break
+end
+o = ulong 0
+while lt o ulong r bound 65536
+w = write int dst b o sub ulong r o
+if le w 0
+break
+end
+o = add o ulong w
+end
+if lt o ulong r
+break
+end
+end
+x = fclose int src
+s = fsync int dst
+m = fchmod int dst 320
+x = fclose int dst
+ret and and ok eq s 0 eq m 0
+end
+
+note r_fsha: SHA-256 of the file at rph into h (32 bytes)
+fn r_fsha h edit uchar * to bool
+c = new ulong 40 0
+b = new uchar 65536 0
+fd = fopen rph 0 get rgv rphl rford 0
+if lt fd 0
+ret false
+end
+sha256_init c
+ok = false
+while true bound 9223372036854775807
+r = read int fd b 0 65536
+if eq r 0
+ok = true
+break
+end
+if lt r 0
+break
+end
+sha256_update c part b 0 ulong r
+end
+x = fclose int fd
+sha256_final c h
+ret ok
+end
+
+note r_jfhex: SHA-256 of the job file nm as hex into rjf at o
+fn r_jfhex nm view uchar * o ulong to bool
+h = new uchar 32 0
+x = new uchar 64 0
+n = r_jpath nm
+if not r_fsha h
+ret false
+end
+k = r_hex h x 0
+for i ulong 64
+put rjf add o i get x i
+end
+ret true
+end
+
+note r_jfzero: 64 zeros into rjf at o (no binary)
+fn r_jfzero o ulong to void
+for i ulong 64
+put rjf add o i 48
+end
+end
+
+note r_exset: the exit text pre + decimal v (no decimal when v is 2^64-1) into rjf at rfexit
+fn r_exset pre view uchar * v ulong to void
+d = new uchar 40 0
+k = r_cp d 0 pre
+if ne v 18446744073709551615
+k = r_dec d k v
+end
+for i ulong k bound 40
+put rjf add rfexit i get d i
+end
+put rgv rexl k
+end
+
+fn r_cp d edit uchar * o ulong s view uchar * to ulong
+for i ulong len s bound 16777216
+put d add o i get s i
+end
+ret add o len s
+end
+
+text rtxomc "omc"
+text rtxomcs "omcsignal"
+text rtxomct "omctimeout"
+text rtxsig "signal"
+text rtxtmo "timeout"
+text rtxcell "cell"
+text rtxnone ""
+
+note r_outcome: the exit text for the last stage (sg 0 compile, 1 run)
+fn r_outcome sg ulong to void
+why = get rgv rwhy
+c = get rgv rcode
+none = ulong 18446744073709551615
+if eq why 3
+r_exset rtxcell c
+ret
+end
+if eq sg 0
+if eq why 0
+r_exset rtxomc c
+end
+if eq why 1
+r_exset rtxomcs c
+end
+if eq why 2
+r_exset rtxomct none
+end
+ret
+end
+if eq why 0
+r_exset rtxnone c
+end
+if eq why 1
+r_exset rtxsig c
+end
+if eq why 2
+r_exset rtxtmo none
+end
+end
+
+note r_check: compile and run the job directory (source.om, stdin) in the cell; fills binary,
+note stdout and exit in rjf. False only when a stage could not be started at all.
+fn r_check to bool
+if not r_cell 0
+ret false
+end
+if or ne get rgv rwhy 0 ne get rgv rcode 0
+r_outcome 0
+r_jfzero rfbin
+r_jfnil rfout
+ret true
+end
+if not r_jfhex rtcout rfbin
+ret false
+end
+if not r_seal
+ret false
+end
+if not r_cell 1
+ret false
+end
+r_outcome 1
+note LIEPOINT: the gate's lying-runner mutant changes the stdout hash line below
+ret r_jfhex rtsout rfout
+end
+
+note r_jfnil: the SHA-256 of no bytes as hex into rjf at o
+fn r_jfnil o ulong to void
+h = new uchar 32 0
+x = new uchar 64 0
+e = new uchar 1 0
+r_sha part e 0 0 h
+k = r_hex h x 0
+for i ulong 64
+put rjf add o i get x i
+end
+end
