@@ -1,0 +1,602 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/pcie_smmu_test.om: Pure-Omega host/model verification suite for Piece 2
+note (bar0_mmio.om, pcie.om, smmuv3.om, irqbm.om, irq.om iqmode=2, irqcc.om).
+note Compose with:
+note   cat si/directives/om2.om aienux/kernel/hal/iort.om aienux/kernel/hal/bar0_mmio.om \
+note       aienux/kernel/hal/pcie.om aienux/kernel/hal/smmuv3.om gpu/driver/gsp/logdec.om \
+note       gpu/driver/gsp/irqbm.om gpu/driver/gsp/irq.om gpu/driver/gsp/irqcc.om \
+note       aienux/kernel/hal/pcie_smmu_test.om | seed/out/omc > pcie_smmu_test
+
+text ps_pass "PASS "
+text ps_fail "FAIL "
+text ps_nl "\n"
+text ps_t1 "t01_bar0_mmio_exclusive_and_gb20b_id"
+text ps_t2 "t02_pcie_mcfg_and_ecam_ngnrne"
+text ps_t3 "t03_pcie_caps_quiesce_and_flr_guard"
+text ps_t4 "t04_smmu_preconditions_and_fail_closed"
+text ps_t5 "t05_smmu_abc_deterministic_bringup"
+text ps_t6 "t06_smmu_disjoint_dma_and_rmr"
+text ps_t7 "t07_smmu_eventq_fault_drain"
+text ps_t8 "t08_irq_iqmode2_bar0_and_crashcat"
+text ps_sum "PCIE_SMMU_TEST_PASS total=8 failed=0\n"
+text ps_fsum "PCIE_SMMU_TEST_FAIL\n"
+
+global ps_mcfg uchar 128
+global ps_iort uchar 512
+
+fn ps_wstr s view uchar * to void
+n = len s
+r = write 1 s 0 n
+end
+
+fn ps_rep name view uchar * ok bool to ulong
+if ok
+ps_wstr ps_pass
+ps_wstr name
+ps_wstr ps_nl
+ret ulong 0
+end
+ps_wstr ps_fail
+ps_wstr name
+ps_wstr ps_nl
+ret ulong 1
+end
+
+fn ps_mput16 off ulong v ulong to void
+put ps_mcfg off uchar and v 0xff
+put ps_mcfg add off 1 uchar and shr v 8 0xff
+end
+
+fn ps_mput32 off ulong v ulong to void
+ps_mput16 off and v 0xffff
+ps_mput16 add off 2 and shr v 16 0xffff
+end
+
+fn ps_mput64 off ulong v ulong to void
+ps_mput32 off and v 0xffffffff
+ps_mput32 add off 4 and shr v 32 0xffffffff
+end
+
+fn ps_mcfg_checksum n ulong to void
+put ps_mcfg 9 0
+acc = ulong 0
+for i ulong n bound 128
+acc = and add acc ulong get ps_mcfg i 0xff
+end
+put ps_mcfg 9 uchar and sub 256 acc 0xff
+end
+
+fn ps_build_spark_mcfg to ulong
+for i ulong 128
+put ps_mcfg i 0
+end
+put ps_mcfg 0 77
+put ps_mcfg 1 67
+put ps_mcfg 2 70
+put ps_mcfg 3 71
+tlen = ulong 108
+ps_mput32 4 tlen
+note Entry 0: seg 4 (NVMe) base 0xF340000000 bus 0..1
+ps_mput64 44 SPARK_ECAM_SEG4_PA
+ps_mput16 52 4
+put ps_mcfg 54 0
+put ps_mcfg 55 1
+note Entry 1: seg 7 (RTL8127) base 0xF370000000 bus 0..1
+ps_mput64 60 SPARK_ECAM_SEG7_PA
+ps_mput16 68 7
+put ps_mcfg 70 0
+put ps_mcfg 71 1
+note Entry 2: seg 9 (unused Wi-Fi) base 0xF390000000 bus 0..1
+ps_mput64 76 0xf390000000
+ps_mput16 84 9
+put ps_mcfg 86 0
+put ps_mcfg 87 1
+note Entry 3: seg 15 (GB20B) base 0x29000000 bus 0..1
+ps_mput64 92 SPARK_ECAM_SEG15_PA
+ps_mput16 100 15
+put ps_mcfg 102 0
+put ps_mcfg 103 1
+ps_mcfg_checksum tlen
+ret tlen
+end
+
+fn ps_iput16 off ulong v ulong to void
+put ps_iort off uchar and v 0xff
+put ps_iort add off 1 uchar and shr v 8 0xff
+end
+
+fn ps_iput32 off ulong v ulong to void
+ps_iput16 off and v 0xffff
+ps_iput16 add off 2 and shr v 16 0xffff
+end
+
+fn ps_iput64 off ulong v ulong to void
+ps_iput32 off and v 0xffffffff
+ps_iput32 add off 4 and shr v 32 0xffffffff
+end
+
+fn ps_iort_checksum n ulong to void
+put ps_iort 9 0
+acc = ulong 0
+for i ulong n bound 512
+acc = and add acc ulong get ps_iort i 0xff
+end
+put ps_iort 9 uchar and sub 256 acc 0xff
+end
+
+note Build Spark-shape IORT: 3 SMMUs (A=0x13800000, B=0x13000000, C=0x14900000),
+note 3 RCs (seg 4 -> A out=0x50000, seg 7 -> A out=0x80000, seg 15 -> B out=0),
+note 1 RMR on B (SID 0..0x100, 3 Spark ranges). Total 7 nodes.
+fn ps_build_spark_iort to ulong
+for i ulong 512
+put ps_iort i 0
+end
+put ps_iort 0 73
+put ps_iort 1 79
+put ps_iort 2 82
+put ps_iort 3 84
+note Header: 48 bytes, 7 nodes starting at offset 48
+ps_iput32 36 7
+ps_iput32 40 48
+note Node 0 @ 48 (len 24): SMMUv3 A = 0x13800000
+put ps_iort 48 IORT_NODE_SMMUV3
+ps_iput16 49 24
+ps_iput64 64 SPARK_SMMU_A_PA
+note Node 1 @ 72 (len 24): SMMUv3 B = 0x13000000
+put ps_iort 72 IORT_NODE_SMMUV3
+ps_iput16 73 24
+ps_iput64 88 SPARK_SMMU_B_PA
+note Node 2 @ 96 (len 24): SMMUv3 C = 0x14900000
+put ps_iort 96 IORT_NODE_SMMUV3
+ps_iput16 97 24
+ps_iput64 112 SPARK_SMMU_C_PA
+note Node 3 @ 120 (len 52 = 32 hdr + 20 map): RC seg 4 -> SMMUv3 A (off 48), in 0..0xffff -> out 0x50000
+put ps_iort 120 IORT_NODE_RC
+ps_iput16 121 52
+ps_iput32 128 1
+ps_iput32 132 32
+ps_iput32 148 4
+ps_iput32 152 0
+ps_iput32 156 0xffff
+ps_iput32 160 0x50000
+ps_iput32 164 48
+note Node 4 @ 172 (len 52): RC seg 7 -> SMMUv3 A (off 48), in 0..0xffff -> out 0x80000
+put ps_iort 172 IORT_NODE_RC
+ps_iput16 173 52
+ps_iput32 180 1
+ps_iput32 184 32
+ps_iput32 200 7
+ps_iput32 204 0
+ps_iput32 208 0xffff
+ps_iput32 212 0x80000
+ps_iput32 216 48
+note Node 5 @ 224 (len 52): RC seg 15 -> SMMUv3 B (off 72), in 0..0xffff -> out 0
+put ps_iort 224 IORT_NODE_RC
+ps_iput16 225 52
+ps_iput32 232 1
+ps_iput32 236 32
+ps_iput32 252 15
+ps_iput32 256 0
+ps_iput32 260 0xffff
+ps_iput32 264 0
+ps_iput32 268 72
+note Node 6 @ 276 (len 108 = 28 hdr + 60 descs + 20 map): RMR on B (off 72), SID 0..0x100
+put ps_iort 276 IORT_NODE_RMR
+ps_iput16 277 108
+ps_iput32 284 1
+ps_iput32 288 88
+ps_iput32 292 0x10
+ps_iput32 296 3
+ps_iput32 300 28
+note Desc 0 @ 304: 0xa1600000 + 386 MiB (0x18200000)
+ps_iput64 304 0xa1600000
+ps_iput64 312 0x18200000
+note Desc 1 @ 324: 0x280000000 + 2 GiB (0x80000000)
+ps_iput64 324 0x280000000
+ps_iput64 332 0x80000000
+note Desc 2 @ 344: 0x300000000 + 48 MiB (0x3000000)
+ps_iput64 344 0x300000000
+ps_iput64 352 0x3000000
+note Map @ 364: in=0, cnt=0x100, out=0, ref=72 (SMMUv3 B)
+ps_iput32 364 0
+ps_iput32 368 0x100
+ps_iput32 372 0
+ps_iput32 376 72
+tlen = ulong 384
+ps_iput32 4 tlen
+ps_iort_checksum tlen
+ret tlen
+end
+
+fn t01_bar0 to bool
+bmmio_reset
+note Reject non-Device-nGnRnE (attr=1 Device-nGnRE)
+if ne bmmio_register SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ 1 BMMIO_EATTR
+ret false
+end
+hb = bmmio_register SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE
+if le hb 0
+ret false
+end
+note Reject overlapping BAR
+if ne bmmio_register add SPARK_GB20B_BAR0_PA 4096 add SPARK_GB20B_BAR0_PA 4096 4096 BMMIO_ATTR_NGNRNE BMMIO_EOVERLAP
+ret false
+end
+hn = bmmio_register SPARK_NVME_BAR0_PA SPARK_NVME_BAR0_PA SPARK_NVME_BAR0_SZ BMMIO_ATTR_NGNRNE
+hr = bmmio_register SPARK_RTL8127_BAR2_PA SPARK_RTL8127_BAR2_PA SPARK_RTL8127_BAR2_SZ BMMIO_ATTR_NGNRNE
+if or le hn 0 le hr 0
+ret false
+end
+note Reject unaligned & OOB reads
+v1 = bmmio_r32 hb 2
+if ne get bmmio_err 0 BMMIO_EALIGN
+ret false
+end
+v2 = bmmio_r32 hb SPARK_GB20B_BAR0_SZ
+if ne get bmmio_err 0 BMMIO_EBOUNDS
+ret false
+end
+note Verify GB20B BOOT_0 / BOOT_42 identity check
+z1 = bmmio_w32 hb GB20B_OFF_BOOT0 GB20B_VAL_BOOT0
+z2 = bmmio_w32 hb GB20B_OFF_BOOT42 GB20B_VAL_BOOT42
+if not bmmio_verify_gb20b hb
+ret false
+end
+z3 = bmmio_w32 hb GB20B_OFF_BOOT42 0x1ba00000
+if bmmio_verify_gb20b hb
+ret false
+end
+ret true
+end
+
+fn t02_mcfg to bool
+bmmio_reset
+pcie_reset
+n = ps_build_spark_mcfg
+loc = new uchar 128 0
+for i ulong 128
+put loc i get ps_mcfg i
+end
+if ne pcie_mcfg_parse part loc 0 n PCIE_OK
+ret false
+end
+if ne get pcie_nsegs 0 4
+ret false
+end
+note Corrupt checksum must fail closed
+put loc 9 xor get loc 9 1
+if eq pcie_mcfg_parse part loc 0 n PCIE_OK
+ret false
+end
+put loc 9 xor get loc 9 1
+if ne pcie_mcfg_parse part loc 0 n PCIE_OK
+ret false
+end
+note Map ECAM windows for segs 4, 7, 9, 15 as Device-nGnRnE XN
+h4 = pcie_map_seg_ecam 4
+h7 = pcie_map_seg_ecam 7
+h9 = pcie_map_seg_ecam 9
+h15 = pcie_map_seg_ecam 15
+if or le h4 0 or le h7 0 or le h9 0 le h15 0
+ret false
+end
+ret true
+end
+
+fn t03_caps_quiesce to bool
+note Populate GB20B 000f:01:00.0 (PM D0 @ 0x60, MSI-X 9 vecs @ 0x70 BAR0+0x00b90000/0x00ba0000)
+z = pcie_cfg_w32 15 1 0 0 0 0x2e1210de
+z = pcie_cfg_w32 15 1 0 0 4 0x00100003
+z = pcie_cfg_w32 15 1 0 0 52 0x60
+z = pcie_cfg_w32 15 1 0 0 0x60 0x00007001
+z = pcie_cfg_w32 15 1 0 0 0x64 0x00000000
+z = pcie_cfg_w32 15 1 0 0 0x70 0x80080011
+z = pcie_cfg_w32 15 1 0 0 0x74 0x00b90000
+z = pcie_cfg_w32 15 1 0 0 0x78 0x00ba0000
+note Populate unused Wi-Fi 0009:01:00.0 with CMD.BME=1 (0x0006)
+z = pcie_cfg_w32 9 1 0 0 0 0x792514c3
+z = pcie_cfg_w32 9 1 0 0 4 0x00100006
+note Quiesce unused endpoints before GBPA.ABORT
+if ne pcie_quiesce_unused PCIE_OK
+ret false
+end
+if or ne get pcie_quiesced 0 1 ne get pcie_quiesced_cnt 0 1
+ret false
+end
+wcmd = pcie_cfg_r16 9 1 0 0 4
+if ne and wcmd PCIE_CMD_BME 0
+ret false
+end
+note Enable GB20B: verifies D0, masks MSI-X, sets Mem+BME+DisINTx
+if ne pcie_enable_endpoint 15 1 0 0 PCIE_OK
+ret false
+end
+if or ne get pcie_cap_info 3 9 or ne get pcie_cap_info 5 0x00b90000 ne get pcie_cap_info 7 0x00ba0000
+ret false
+end
+mctl = pcie_cfg_r16 15 1 0 0 0x72
+if or ne and mctl PCIE_MSIX_ENABLE 0 eq and mctl PCIE_MSIX_FMASK 0
+ret false
+end
+gcmd = pcie_cfg_r16 15 1 0 0 4
+if ne and gcmd 0x0406 0x0406
+ret false
+end
+note D3 endpoint must be refused
+z = pcie_cfg_w32 4 1 0 0 0 0xa80d144d
+z = pcie_cfg_w32 4 1 0 0 4 0x00100006
+z = pcie_cfg_w32 4 1 0 0 52 0x60
+z = pcie_cfg_w32 4 1 0 0 0x60 0x00000001
+z = pcie_cfg_w32 4 1 0 0 0x64 0x00000003
+if ne pcie_enable_endpoint 4 1 0 0 PCIE_ED3
+ret false
+end
+note GB20B FLR hard refusal (Trap 18)
+if ne pcie_flr_refuse 15 1 0 0 PCIE_EFLR
+ret false
+end
+ret true
+end
+
+fn t04_smmu_neg to bool
+smmu_reset
+note Must refuse before pcie_quiesced==1
+put pcie_quiesced 0 0
+if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_ENOQUIESCE
+ret false
+end
+put pcie_quiesced 0 1
+note Pre-register SMMUv3 A with bad IDR0 (ST_LEVEL=0) -> SMMU_EIDR
+ha = bmmio_register SPARK_SMMU_A_PA SPARK_SMMU_A_PA SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
+put smmu_inst_h 0 ha
+put smmu_inst_base 0 SPARK_SMMU_A_PA
+z = bmmio_w32 ha SMMU_REG_IDR0 0x00000000
+z = bmmio_w32 ha SMMU_REG_IDR1 25
+if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_EIDR
+ret false
+end
+note Good ST_LEVEL=1 (1<<27 = 0x08000000), bad SIDSIZE=16 (< 20 for A) -> SMMU_EIDR
+z = bmmio_w32 ha SMMU_REG_IDR0 0x08000000
+z = bmmio_w32 ha SMMU_REG_IDR1 16
+if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_EIDR
+ret false
+end
+note Inject CMDQ_CONS.ERR[30:24] = 1 (CERROR_ILL) -> SMMU_ECMDERR and SMMUEN stays 0
+z = bmmio_w32 ha SMMU_REG_IDR1 25
+z = bmmio_w32 ha SMMU_REG_CMDQ_CONS 0x01000000
+if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_ECMDERR
+ret false
+end
+if ne and bmmio_r32 ha SMMU_REG_CR0 SMMU_CR0_SMMUEN 0
+ret false
+end
+ret true
+end
+
+fn t05_smmu_abc to bool
+bmmio_reset
+smmu_reset
+put pcie_quiesced 0 1
+ilen = ps_build_spark_iort
+ib = new uchar 512 0
+for i ulong 512
+put ib i get ps_iort i
+end
+if ne iort_parse part ib 0 ilen 1
+ret false
+end
+note Pre-seed IDR0 (ST_LEVEL=1) and IDR1 (SIDSIZE=25) on A and B
+ha = bmmio_register SPARK_SMMU_A_PA SPARK_SMMU_A_PA SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
+hb = bmmio_register SPARK_SMMU_B_PA SPARK_SMMU_B_PA SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
+put smmu_inst_h 0 ha
+put smmu_inst_base 0 SPARK_SMMU_A_PA
+put smmu_inst_h 1 hb
+put smmu_inst_base 1 SPARK_SMMU_B_PA
+z = bmmio_w32 ha SMMU_REG_IDR0 0x08000000
+z = bmmio_w32 ha SMMU_REG_IDR1 25
+z = bmmio_w32 hb SMMU_REG_IDR0 0x08000000
+z = bmmio_w32 hb SMMU_REG_IDR1 25
+if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_OK
+ret false
+end
+if ne smmu_init_instance 1 SPARK_SMMU_B_PA 9 0x10300000 0x10400000 0x10500000 SMMU_OK
+ret false
+end
+if ne smmu_abort_only 2 SPARK_SMMU_C_PA SMMU_OK
+ret false
+end
+note Verify all 7 deterministic bring-up stages (0x7f) and CR0==0x0d on A and B, ABORT_ONLY on C
+if or ne get smmu_trace 0 0x7f ne get smmu_trace 1 0x7f
+ret false
+end
+if or ne bmmio_r32 ha SMMU_REG_CR0 SMMU_CR0_ALL ne bmmio_r32 hb SMMU_REG_CR0 SMMU_CR0_ALL
+ret false
+end
+if ne get smmu_inst_state 2 2
+ret false
+end
+ret true
+end
+
+fn t06_smmu_dma to bool
+note Open GB20B SID 0x100 on SMMUv3 B -> auto-maps 3 mandatory Spark RMRs
+sgpu = smmu_open_stream 15 0x0100 0x11000000 0x11001000
+if le sgpu 0
+ret false
+end
+note Open NVMe SID 0x50100 and RTL8127 SID 0x80100 on SMMUv3 A
+snvme = smmu_open_stream 4 0x0100 0x11002000 0x11003000
+snic = smmu_open_stream 7 0x0100 0x11004000 0x11005000
+if or le snvme 0 le snic 0
+ret false
+end
+note Verify STE V=1|Config=5 (low 4 bits == 0xb) and CD MAIR0 == 0x440004ff
+if or ne and get smmu_ste_words 0 0xf 0xb ne get smmu_cd_words 3 SMMU_CD_MAIR0
+ret false
+end
+note Map disjoint spans: GB20B GSP arena 80 MiB, NVMe weights dest 64 MiB, RTL8127 rdma 72 KiB
+if ne smmu_map_span sgpu 0x340000000 0x5000000 0 SMMU_OK
+ret false
+end
+if ne smmu_map_span snvme 0x400000000 0x4000000 0 SMMU_OK
+ret false
+end
+if ne smmu_map_span snic 0x380000000 0x12000 0 SMMU_OK
+ret false
+end
+note Cross-stream overlap (GB20B trying to map NVMe's weights dest before unmap) MUST FAIL
+if ne smmu_map_span sgpu 0x400000000 0x4000000 0 SMMU_EOVERLAP
+ret false
+end
+note Wildcard RAM (>32 GiB) and >=40-bit PA MUST FAIL
+if ne smmu_map_span sgpu 0x500000000 0x1000000000 0 SMMU_EWILDCARD
+ret false
+end
+if ne smmu_map_span sgpu 0x10000000000 0x1000 0 SMMU_EWILDCARD
+ret false
+end
+note Unmap RMR MUST FAIL
+if ne smmu_unmap_span sgpu 0xa1600000 0x18200000 SMMU_EARG
+ret false
+end
+note Unmap weights dest from NVMe -> then GB20B maps it -> SUCCEEDS!
+if ne smmu_unmap_span snvme 0x400000000 0x4000000 SMMU_OK
+ret false
+end
+if ne smmu_map_span sgpu 0x400000000 0x4000000 0 SMMU_OK
+ret false
+end
+ret true
+end
+
+fn t07_eventq to bool
+hb = get smmu_inst_h 1
+note Inject F_TRANSLATION (code=0x10, SID=0x100) at SMMUv3 B eventq slot 0
+put smmu_evtq_buf 32 or ulong 0x10 shl ulong 0x100 32
+z = bmmio_w32 hb SMMU_REG_EVTQ_PROD 1
+n = smmu_drain_events 1
+if or ne n 1 ne get smmu_inst_evt_cnt 1 1
+ret false
+end
+if ne and get smmu_inst_last_evt 1 0xff 0x10
+ret false
+end
+ret eq bmmio_r32 hb SMMU_REG_EVTQ_CONS 1
+end
+
+fn ps_ccput64 o ulong v ulong to void
+for i ulong 8
+put ccbuf add o i uchar and shr v mul i 8 0xff
+end
+end
+
+fn t08_irq_bm to bool
+bmmio_reset
+ibm_reset
+hg = bmmio_register SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE
+if ne ibm_bind hg 1 0
+ret false
+end
+note Reset irq.om state
+put iqmode 0 1
+put iqstate 0 0
+put iqgen 0 0
+put iqdone 0 0
+put iqpend 0 0
+put iqhalt 0 0
+if ne iqinit 1 0
+ret false
+end
+note iqmode=1 must still return -9
+if ne iqservice 1 8 -9
+ret false
+end
+note Switch to bare-metal GB20B polling mode (iqmode=2)
+put iqmode 0 2
+note Seed verified GB20B IRQ regs: RISCV_IRQMASK=0x50 (0x111528), RISCV_IRQDEST=0x50 (0x11152c), FALCON_IRQSTAT=0x40 (0x110008)
+z = bmmio_w32 hg IBM_RVMASK 0x50
+z = bmmio_w32 hg IBM_RVDEST 0x50
+z = bmmio_w32 hg IBM_IRQSTAT 0x40
+put ibm_rpc_avail 0 2
+r1 = iqservicecc 1 8 -1 8
+if or ne r1 2 or ne get ibm_clears 0 1 ne get ibm_order_err 0 0
+ret false
+end
+if ne bmmio_r32 hg IBM_IRQSTAT 0
+ret false
+end
+note Inject HALT (0x10) + valid CrashCat V1 report packet (48 bytes) in ccbuf
+for i ulong 48
+put ccbuf i 0
+end
+ps_ccput64 0 14587176806713922100
+ps_ccput64 8 0x1234
+ps_ccput64 16 0x6f
+ps_ccput64 24 0xde
+ps_ccput64 32 0x14d
+ps_ccput64 40 0x1bc
+if ne iqccbind 1 0x340000000 48 0
+ret false
+end
+z = bmmio_w32 hg IBM_IRQSTAT 0x10
+if ne iqservicecc 1 8 -1 8 -13
+ret false
+end
+if ne get iqhalt 0 1
+ret false
+end
+if ne get ibm_masks 0 1
+ret false
+end
+if ne get iqccpkts 0 1
+ret false
+end
+note Verify sticky lockdown stops ALL further BAR0 accesses
+put iqstate 0 0
+put iqgen 0 0
+put iqhalt 0 0
+put ibm_locked 0 0
+if ne iqinit 2 0
+ret false
+end
+z = bmmio_w32 hg IBM_IRQSTAT 0x40
+put ibm_rpc_avail 0 2
+put ibm_rpc_lock_at 0 1
+put ibm_rpc_done 0 0
+if ne iqservicecc 2 8 -1 8 1
+ret false
+end
+if ne get iqstate 0 3
+ret false
+end
+if ne get ibm_locked 0 1
+ret false
+end
+rd_before = get bmmio_rd_ops 0
+wr_before = get bmmio_wr_ops 0
+if ne iqservicecc 2 8 -1 8 -14
+ret false
+end
+if ne get bmmio_rd_ops 0 rd_before
+ret false
+end
+ret eq get bmmio_wr_ops 0 wr_before
+end
+
+fn main to int
+fail = ulong 0
+fail = add fail ps_rep ps_t1 t01_bar0
+fail = add fail ps_rep ps_t2 t02_mcfg
+fail = add fail ps_rep ps_t3 t03_caps_quiesce
+fail = add fail ps_rep ps_t4 t04_smmu_neg
+fail = add fail ps_rep ps_t5 t05_smmu_abc
+fail = add fail ps_rep ps_t6 t06_smmu_dma
+fail = add fail ps_rep ps_t7 t07_eventq
+fail = add fail ps_rep ps_t8 t08_irq_bm
+if eq fail 0
+ps_wstr ps_sum
+ret 0
+end
+ps_wstr ps_fsum
+ret 1
+end

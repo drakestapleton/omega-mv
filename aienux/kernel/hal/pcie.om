@@ -1,0 +1,494 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/pcie.om: Pure-Omega multi-segment ACPI MCFG parser, ECAM Device-nGnRnE
+note mapper, PCIe capability walker (PM D0 + MSI-X mask), unused-device CMD.BME=0 quiesce,
+note and GB20B FLR hard refusal (Trap 18).
+note Compose with: si/directives/om2.om aienux/kernel/hal/bar0_mmio.om aienux/kernel/hal/pcie.om ...
+
+const PCIE_MAX_SEGS ulong 16
+const PCIE_MCFG_HDR ulong 44
+const PCIE_MCFG_ENT ulong 16
+const PCIE_CMD_MEM uint 0x0002
+const PCIE_CMD_BME uint 0x0004
+const PCIE_CMD_DISINTX uint 0x0400
+const PCIE_STAT_CAP uint 0x0010
+const PCIE_CAP_PM uint 0x01
+const PCIE_CAP_MSIX uint 0x11
+const PCIE_MSIX_FMASK uint 0x4000
+const PCIE_MSIX_ENABLE uint 0x8000
+
+const PCIE_OK long 0
+const PCIE_EARG long -1
+const PCIE_EMCFG long -2
+const PCIE_EOVERLAP long -3
+const PCIE_EFULL long -4
+const PCIE_ENODEV long -5
+const PCIE_EMMIO long -6
+const PCIE_ECAP long -7
+const PCIE_ED3 long -8
+const PCIE_EFLR long -9
+
+global pcie_nsegs ulong 1
+global pcie_seg_base ulong 16
+global pcie_seg_id uint 16
+global pcie_seg_bus0 uchar 16
+global pcie_seg_bus1 uchar 16
+global pcie_seg_h long 16
+
+note Quiesce state: smmuv3.om requires pcie_quiesced[0] == 1 before GBPA.ABORT
+global pcie_quiesced ulong 1
+global pcie_quiesced_cnt ulong 1
+
+note Last probed endpoint info:
+note 0=vendor, 1=device, 2=cmd, 3=status, 4=class_rev, 5=bar0_lo, 6=bar0_hi, 7=bar2_lo, 8=bar2_hi
+global pcie_dev_info ulong 9
+note Last cap walk result:
+note 0=pm_off, 1=pm_state, 2=msix_off, 3=msix_vecs, 4=msix_bir, 5=msix_tbl_off, 6=msix_pba_bir, 7=msix_pba_off
+global pcie_cap_info ulong 8
+
+fn pcie_reset to void
+put pcie_nsegs 0 0
+put pcie_quiesced 0 0
+put pcie_quiesced_cnt 0 0
+for i ulong PCIE_MAX_SEGS
+put pcie_seg_base i 0
+put pcie_seg_id i 0
+put pcie_seg_bus0 i 0
+put pcie_seg_bus1 i 0
+put pcie_seg_h i 0
+end
+for j ulong 9
+put pcie_dev_info j 0
+end
+for k ulong 8
+put pcie_cap_info k 0
+end
+end
+
+fn pcie_rd16_buf buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = shl uint get buf add off 1 8
+ret or b0 b1
+end
+
+fn pcie_rd32_buf buf view uchar * off ulong to uint
+lo = pcie_rd16_buf buf off
+hi = shl pcie_rd16_buf buf add off 2 16
+ret or lo hi
+end
+
+fn pcie_rd64_buf buf view uchar * off ulong to ulong
+lo = ulong pcie_rd32_buf buf off
+hi = shl ulong pcie_rd32_buf buf add off 4 32
+ret or lo hi
+end
+
+fn pcie_acpi_sum_ok buf view uchar * n ulong to bool
+if or lt n 36 gt n len buf
+ret false
+end
+acc = uint 0
+i = ulong 0
+while lt i n bound 4096
+acc = and add acc uint get buf i 0xff
+i = add i 1
+end
+ret eq acc 0
+end
+
+fn pcie_mcfg_sig_ok tbl view uchar * to bool
+if ne get tbl 0 77
+ret false
+end
+if ne get tbl 1 67
+ret false
+end
+if ne get tbl 2 70
+ret false
+end
+ret eq get tbl 3 71
+end
+
+fn pcie_mcfg_add_ent base ulong seg uint b0 uchar b1 uchar idx ulong to long
+if or eq base 0 ne and base 0xfffff 0
+ret PCIE_EMCFG
+end
+if gt b0 b1
+ret PCIE_EMCFG
+end
+span = shl add ulong b1 1 20
+if lt add base span base
+ret PCIE_EMCFG
+end
+for j ulong idx bound 16
+if eq get pcie_seg_id j seg
+ob0 = get pcie_seg_bus0 j
+ob1 = get pcie_seg_bus1 j
+if and le b0 ob1 le ob0 b1
+ret PCIE_EOVERLAP
+end
+end
+end
+put pcie_seg_base idx base
+put pcie_seg_id idx seg
+put pcie_seg_bus0 idx b0
+put pcie_seg_bus1 idx b1
+put pcie_seg_h idx 0
+ret PCIE_OK
+end
+
+note Parse ACPI MCFG table (header + 16-byte allocation entries). Fail-closed on any violation.
+fn pcie_mcfg_parse tbl view uchar * to long
+put pcie_nsegs 0 0
+n = len tbl
+if lt n 60
+ret PCIE_EMCFG
+end
+if not pcie_mcfg_sig_ok tbl
+ret PCIE_EMCFG
+end
+tlen = ulong pcie_rd32_buf tbl 4
+if or lt tlen 60 gt tlen n
+ret PCIE_EMCFG
+end
+if not pcie_acpi_sum_ok tbl tlen
+ret PCIE_EMCFG
+end
+remb = sub tlen PCIE_MCFG_HDR
+if ne rem remb PCIE_MCFG_ENT 0
+ret PCIE_EMCFG
+end
+cnt = div remb PCIE_MCFG_ENT
+if gt cnt PCIE_MAX_SEGS
+ret PCIE_EFULL
+end
+for i ulong cnt bound 16
+off = add PCIE_MCFG_HDR mul i PCIE_MCFG_ENT
+base = pcie_rd64_buf tbl off
+seg = pcie_rd16_buf tbl add off 8
+b0 = get tbl add off 10
+b1 = get tbl add off 11
+rc = pcie_mcfg_add_ent base seg b0 b1 i
+if ne rc PCIE_OK
+put pcie_nsegs 0 0
+ret rc
+end
+end
+put pcie_nsegs 0 cnt
+ret PCIE_OK
+end
+
+note Find MCFG table index for segment, or -1 if absent.
+fn pcie_find_seg seg uint to long
+n = get pcie_nsegs 0
+for i ulong n bound 16
+if eq get pcie_seg_id i seg
+ret long i
+end
+end
+ret -1
+end
+
+note Map a parsed segment's ECAM window as exclusive Device-nGnRnE (attr=0) XN via bar0_mmio.om.
+fn pcie_map_seg_ecam seg uint to long
+idx = pcie_find_seg seg
+if lt idx 0
+ret PCIE_ENODEV
+end
+u = ulong idx
+if gt get pcie_seg_h u 0
+ret get pcie_seg_h u
+end
+base = get pcie_seg_base u
+b0 = ulong get pcie_seg_bus0 u
+b1 = ulong get pcie_seg_bus1 u
+pa = add base shl b0 20
+sz = shl add sub b1 b0 1 20
+h = bmmio_register pa pa sz BMMIO_ATTR_NGNRNE
+if lt h 0
+ret PCIE_EMMIO
+end
+put pcie_seg_h u h
+ret h
+end
+
+note Compute ECAM offset within segment's mapped window for (bus, dev, fn, reg_off), or -1 on error.
+fn pcie_ecam_off seg_idx ulong bus ulong dev ulong fn_num ulong off ulong to long
+b0 = ulong get pcie_seg_bus0 seg_idx
+b1 = ulong get pcie_seg_bus1 seg_idx
+if lt bus b0
+ret -1
+end
+if gt bus b1
+ret -1
+end
+if ge dev 32
+ret -1
+end
+if ge fn_num 8
+ret -1
+end
+if ge off 4096
+ret -1
+end
+bpart = shl sub bus b0 20
+dpart = shl dev 15
+fpart = shl fn_num 12
+ret long add add bpart dpart add fpart off
+end
+
+fn pcie_cfg_r32 seg uint bus ulong dev ulong fn_num ulong off ulong to ulong
+if ne and off 3 0
+put bmmio_err 0 BMMIO_EALIGN
+ret ulong 0xffffffff
+end
+idx = pcie_find_seg seg
+if lt idx 0
+put bmmio_err 0 BMMIO_EARG
+ret ulong 0xffffffff
+end
+h = get pcie_seg_h ulong idx
+if le h 0
+put bmmio_err 0 BMMIO_EARG
+ret ulong 0xffffffff
+end
+eoff = pcie_ecam_off ulong idx bus dev fn_num off
+if lt eoff 0
+put bmmio_err 0 BMMIO_EBOUNDS
+ret ulong 0xffffffff
+end
+ret bmmio_r32 h ulong eoff
+end
+
+fn pcie_cfg_w32 seg uint bus ulong dev ulong fn_num ulong off ulong val ulong to long
+if ne and off 3 0
+ret PCIE_EARG
+end
+idx = pcie_find_seg seg
+if lt idx 0
+ret PCIE_ENODEV
+end
+h = get pcie_seg_h ulong idx
+if le h 0
+ret PCIE_EMMIO
+end
+eoff = pcie_ecam_off ulong idx bus dev fn_num off
+if lt eoff 0
+ret PCIE_EARG
+end
+ret bmmio_w32 h ulong eoff val
+end
+
+fn pcie_cfg_r16 seg uint bus ulong dev ulong fn_num ulong off ulong to uint
+if ne and off 1 0
+ret uint 0xffff
+end
+dw = pcie_cfg_r32 seg bus dev fn_num and off 4092
+if ne and off 2 0
+ret uint and shr dw 16 0xffff
+end
+ret uint and dw 0xffff
+end
+
+fn pcie_cfg_w16 seg uint bus ulong dev ulong fn_num ulong off ulong val uint to long
+if ne and off 1 0
+ret PCIE_EARG
+end
+aligned = and off 4092
+cur = pcie_cfg_r32 seg bus dev fn_num aligned
+if ne get bmmio_err 0 BMMIO_OK
+ret PCIE_EMMIO
+end
+nv = ulong 0
+if ne and off 2 0
+nv = or and cur 0xffff shl ulong val 16
+else
+nv = or and cur 0xffff0000 ulong val
+end
+ret pcie_cfg_w32 seg bus dev fn_num aligned nv
+end
+
+note Read-only probe of one PCIe function; populates pcie_dev_info[0..8].
+fn pcie_probe_dev seg uint bus ulong dev ulong fn_num ulong to long
+v = pcie_cfg_r32 seg bus dev fn_num 0
+if ne get bmmio_err 0 BMMIO_OK
+ret PCIE_EMMIO
+end
+ven = and v 0xffff
+if or eq ven 0xffff eq ven 0
+ret PCIE_ENODEV
+end
+put pcie_dev_info 0 ven
+put pcie_dev_info 1 and shr v 16 0xffff
+v = pcie_cfg_r32 seg bus dev fn_num 4
+put pcie_dev_info 2 and v 0xffff
+put pcie_dev_info 3 and shr v 16 0xffff
+put pcie_dev_info 4 pcie_cfg_r32 seg bus dev fn_num 8
+put pcie_dev_info 5 pcie_cfg_r32 seg bus dev fn_num 16
+put pcie_dev_info 6 pcie_cfg_r32 seg bus dev fn_num 20
+put pcie_dev_info 7 pcie_cfg_r32 seg bus dev fn_num 24
+put pcie_dev_info 8 pcie_cfg_r32 seg bus dev fn_num 28
+ret PCIE_OK
+end
+
+fn pcie_cap_record seg uint bus ulong dev ulong fn_num ulong cp ulong hdr ulong to void
+cid = uint and hdr 0xff
+if eq cid PCIE_CAP_PM
+pmcsr = pcie_cfg_r32 seg bus dev fn_num add cp 4
+put pcie_cap_info 0 cp
+put pcie_cap_info 1 and pmcsr 3
+end
+if eq cid PCIE_CAP_MSIX
+put pcie_cap_info 2 cp
+put pcie_cap_info 3 add and shr hdr 16 0x7ff 1
+tbl = pcie_cfg_r32 seg bus dev fn_num add cp 4
+put pcie_cap_info 4 and tbl 7
+put pcie_cap_info 5 and tbl 0xfffffff8
+pba = pcie_cfg_r32 seg bus dev fn_num add cp 8
+put pcie_cap_info 6 and pba 7
+put pcie_cap_info 7 and pba 0xfffffff8
+end
+end
+
+note Walk PCIe capability list (bounded, cycle-guarded) to find PM (0x01) and MSI-X (0x11).
+fn pcie_walk_caps seg uint bus ulong dev ulong fn_num ulong to long
+for i ulong 8
+put pcie_cap_info i 0
+end
+cs = pcie_cfg_r32 seg bus dev fn_num 4
+if ne get bmmio_err 0 BMMIO_OK
+ret PCIE_EMMIO
+end
+if eq and uint and shr cs 16 0xffff PCIE_STAT_CAP 0
+ret PCIE_OK
+end
+cp = and pcie_cfg_r32 seg bus dev fn_num 52 0xfc
+visited = ulong 0
+steps = ulong 0
+while and ne cp 0 lt steps 48 bound 48
+if or lt cp 64 ge cp 256
+ret PCIE_ECAP
+end
+bit = shl ulong 1 shr sub cp 64 2
+if ne and visited bit 0
+ret PCIE_ECAP
+end
+visited = or visited bit
+hdr = pcie_cfg_r32 seg bus dev fn_num cp
+if ne get bmmio_err 0 BMMIO_OK
+ret PCIE_EMMIO
+end
+pcie_cap_record seg bus dev fn_num cp hdr
+cp = and shr hdr 8 0xfc
+steps = add steps 1
+end
+ret PCIE_OK
+end
+
+note Mask MSI-X (set Function Mask bit 14, clear Enable bit 15) for Phase 2A polling.
+fn pcie_mask_msix seg uint bus ulong dev ulong fn_num ulong to long
+moff = get pcie_cap_info 2
+if eq moff 0
+ret PCIE_OK
+end
+ctl = pcie_cfg_r16 seg bus dev fn_num add moff 2
+nctl = or and ctl not PCIE_MSIX_ENABLE PCIE_MSIX_FMASK
+ret pcie_cfg_w16 seg bus dev fn_num add moff 2 nctl
+end
+
+note Active allowlist check: GB20B (seg 15 bus 0..1), NVMe (seg 4 bus 0..1), RTL8127 (seg 7 bus 0..1).
+fn pcie_is_allowlisted seg uint bus ulong dev ulong fn_num ulong to bool
+if or ne dev 0 ne fn_num 0
+ret false
+end
+if gt bus 1
+ret false
+end
+if or eq seg 15 or eq seg 4 eq seg 7
+ret true
+end
+ret false
+end
+
+fn pcie_quiesce_one seg uint bus ulong to long
+if pcie_is_allowlisted seg bus 0 0
+ret 0
+end
+ven = and pcie_cfg_r32 seg bus 0 0 0 0xffff
+if or eq ven 0xffff eq ven 0
+ret 0
+end
+cmd = pcie_cfg_r16 seg bus 0 0 4
+if eq and cmd PCIE_CMD_BME 0
+ret 0
+end
+ncmd = and cmd not PCIE_CMD_BME
+rc = pcie_cfg_w16 seg bus 0 0 4 ncmd
+if ne rc PCIE_OK
+ret rc
+end
+ret 1
+end
+
+note Quiesce all unused present PCIe endpoints (clear CMD.BME=0) across mapped MCFG segments
+note BEFORE smmuv3.om sets GBPA.ABORT. Sets pcie_quiesced[0] = 1 on success.
+fn pcie_quiesce_unused to long
+qcnt = ulong 0
+n = get pcie_nsegs 0
+for i ulong n bound 16
+if gt get pcie_seg_h i 0
+seg = get pcie_seg_id i
+bus = ulong get pcie_seg_bus0 i
+b1 = ulong get pcie_seg_bus1 i
+while le bus b1 bound 256
+r = pcie_quiesce_one seg bus
+if lt r 0
+ret r
+end
+qcnt = add qcnt ulong r
+bus = add bus 1
+end
+end
+end
+put pcie_quiesced 0 1
+put pcie_quiesced_cnt 0 qcnt
+ret PCIE_OK
+end
+
+note Verify D0 power state, enable MemSpace+BusMaster+DisINTx, and mask MSI-X on an active endpoint.
+fn pcie_enable_endpoint seg uint bus ulong dev ulong fn_num ulong to long
+pr = pcie_probe_dev seg bus dev fn_num
+if ne pr PCIE_OK
+ret pr
+end
+cr = pcie_walk_caps seg bus dev fn_num
+if ne cr PCIE_OK
+ret cr
+end
+if and ne get pcie_cap_info 0 0 ne get pcie_cap_info 1 0
+ret PCIE_ED3
+end
+mr = pcie_mask_msix seg bus dev fn_num
+if ne mr PCIE_OK
+ret mr
+end
+cmd = pcie_cfg_r16 seg bus dev fn_num 4
+ncmd = or cmd or PCIE_CMD_MEM or PCIE_CMD_BME PCIE_CMD_DISINTX
+ret pcie_cfg_w16 seg bus dev fn_num 4 ncmd
+end
+
+note Hard safety guard (nvidia-gb10 Trap 18): PCIe FLR on GB20B (000f:01:00.0) reboots the entire SoC.
+fn pcie_flr_refuse seg uint bus ulong dev ulong fn_num ulong to long
+if ne seg 15
+ret PCIE_OK
+end
+if ne bus 1
+ret PCIE_OK
+end
+if ne dev 0
+ret PCIE_OK
+end
+if ne fn_num 0
+ret PCIE_OK
+end
+ret PCIE_EFLR
+end

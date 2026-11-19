@@ -1,0 +1,358 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/bar0_mmio.om: Pure-Omega exclusive Device-nGnRnE MMIO registry
+note and ordered 32/64-bit register accessors for bare-metal DGX Spark (GB20B/NVMe/RTL8127/ECAM/SMMU).
+note Dual-compatible OM-1/OM-2 (decimal literals only, no hex). Library unit: no fn main.
+note Mode 0 = host/QEMU sparse register model (default); Mode 1 = bare-metal Device-nGnRnE MMIO seam.
+note Hardware status: HOST_MODEL_ONLY (Spark silicon NOT_RUN).
+
+const BMMIO_MAX_REGIONS ulong 16
+const BMMIO_SIM_SLOTS ulong 512
+const BMMIO_ATTR_NGNRNE ulong 0
+
+note Verified Spark physical bases and sizes (decimal; hex in comments):
+note GB20B BAR0: 0x24000000 (603979776), 64 MiB (67108864)
+note NVMe BAR0:  0x62100000 (1645215744), 16 KiB (16384)
+note RTL8127 B2: 0x6e900000 (1854930944), 256 KiB (262144)
+note ECAM seg 4: 0xF340000000 (1044750794752), 2 MiB (2097152)
+note ECAM seg 7: 0xF370000000 (1045556101120), 2 MiB (2097152)
+note ECAM seg15: 0x29000000 (687865856), 2 MiB (2097152)
+note SMMUv3 A:   0x13800000 (327155712), 128 KiB (131072)
+note SMMUv3 B:   0x13000000 (318767104), 128 KiB (131072)
+note SMMUv3 C:   0x14900000 (344981504), 128 KiB (131072)
+const SPARK_GB20B_BAR0_PA ulong 603979776
+const SPARK_GB20B_BAR0_SZ ulong 67108864
+const SPARK_NVME_BAR0_PA ulong 1645215744
+const SPARK_NVME_BAR0_SZ ulong 16384
+const SPARK_RTL8127_BAR2_PA ulong 1854930944
+const SPARK_RTL8127_BAR2_SZ ulong 262144
+const SPARK_ECAM_SEG4_PA ulong 1044750794752
+const SPARK_ECAM_SEG7_PA ulong 1045556101120
+const SPARK_ECAM_SEG15_PA ulong 687865856
+const SPARK_ECAM_WIN_SZ ulong 2097152
+const SPARK_SMMU_A_PA ulong 327155712
+const SPARK_SMMU_B_PA ulong 318767104
+const SPARK_SMMU_C_PA ulong 344981504
+const SPARK_SMMU_SZ ulong 131072
+
+note GB20B identity registers: BOOT_0=0x0000 (0x1bb000a1=464519329), BOOT_42=0x0a00 (0x1bba1000=465178624)
+const GB20B_OFF_BOOT0 ulong 0
+const GB20B_OFF_BOOT42 ulong 2560
+const GB20B_VAL_BOOT0 ulong 464519329
+const GB20B_VAL_BOOT42 ulong 465178624
+
+const BMMIO_OK long 0
+const BMMIO_EARG long -1
+const BMMIO_EATTR long -2
+const BMMIO_EOVERLAP long -3
+const BMMIO_EFULL long -4
+const BMMIO_EBOUNDS long -5
+const BMMIO_EALIGN long -6
+const BMMIO_ELOCKED long -7
+const BMMIO_EMODE long -8
+
+note Global state:
+note bmmio_mode: 0 = host model, 1 = bare-metal (requires Piece 1 Device-nGnRnE mapping)
+global bmmio_mode ulong 1
+global bmmio_count ulong 1
+global bmmio_err long 1
+global bmmio_rd_ops ulong 1
+global bmmio_wr_ops ulong 1
+
+note Region table (up to 16 exclusive regions)
+global bmmio_pa ulong 16
+global bmmio_va ulong 16
+global bmmio_sz ulong 16
+global bmmio_attr ulong 16
+global bmmio_live ulong 16
+global bmmio_locked ulong 16
+
+note Host-model sparse register store (key = (region_id << 40) | offset, value = 64-bit word)
+global bmmio_sim_n ulong 1
+global bmmio_sim_k ulong 512
+global bmmio_sim_v ulong 512
+
+note Last access trace for audit/testing (0=region, 1=off, 2=width, 3=is_write, 4=val)
+global bmmio_last ulong 5
+
+fn bmmio_reset to void
+put bmmio_mode 0 0
+put bmmio_count 0 0
+put bmmio_err 0 0
+put bmmio_rd_ops 0 0
+put bmmio_wr_ops 0 0
+put bmmio_sim_n 0 0
+for i ulong BMMIO_MAX_REGIONS
+put bmmio_pa i 0
+put bmmio_va i 0
+put bmmio_sz i 0
+put bmmio_attr i 0
+put bmmio_live i 0
+put bmmio_locked i 0
+end
+for j ulong 5
+put bmmio_last j 0
+end
+end
+
+fn bmmio_ranges_overlap a ulong asz ulong b ulong bsz ulong to bool
+if or eq asz 0 eq bsz 0
+ret false
+end
+aend = add a asz
+bend = add b bsz
+if or lt aend a lt bend b
+ret true
+end
+if le aend b
+ret false
+end
+if le bend a
+ret false
+end
+ret true
+end
+
+note Register an exclusive Device-nGnRnE (attr==0) XN MMIO region.
+note Returns region handle (1..16) on success, or negative BMMIO_E* error.
+fn bmmio_register pa ulong va ulong sz ulong attr ulong to long
+if or eq pa 0 eq sz 0
+put bmmio_err 0 BMMIO_EARG
+ret BMMIO_EARG
+end
+if or ne and pa 4095 0 ne and sz 4095 0
+put bmmio_err 0 BMMIO_EALIGN
+ret BMMIO_EALIGN
+end
+if ne attr BMMIO_ATTR_NGNRNE
+put bmmio_err 0 BMMIO_EATTR
+ret BMMIO_EATTR
+end
+if lt add pa sz pa
+put bmmio_err 0 BMMIO_EARG
+ret BMMIO_EARG
+end
+n = get bmmio_count 0
+if ge n BMMIO_MAX_REGIONS
+put bmmio_err 0 BMMIO_EFULL
+ret BMMIO_EFULL
+end
+for i ulong n bound 16
+if ne get bmmio_live i 0
+if bmmio_ranges_overlap pa sz get bmmio_pa i get bmmio_sz i
+put bmmio_err 0 BMMIO_EOVERLAP
+ret BMMIO_EOVERLAP
+end
+end
+end
+put bmmio_pa n pa
+put bmmio_va n va
+put bmmio_sz n sz
+put bmmio_attr n attr
+put bmmio_live n 1
+put bmmio_locked n 0
+put bmmio_count 0 add n 1
+put bmmio_err 0 BMMIO_OK
+ret long add n 1
+end
+
+fn bmmio_lock h long to long
+if or le h 0 gt ulong h get bmmio_count 0
+ret BMMIO_EARG
+end
+idx = sub ulong h 1
+put bmmio_locked idx 1
+ret BMMIO_OK
+end
+
+fn bmmio_is_live h long to bool
+if or le h 0 gt ulong h get bmmio_count 0
+ret false
+end
+idx = sub ulong h 1
+if eq get bmmio_live idx 0
+ret false
+end
+ret eq get bmmio_locked idx 0
+end
+
+fn bmmio_check h long off ulong width ulong to long
+if or le h 0 gt ulong h get bmmio_count 0
+ret BMMIO_EARG
+end
+idx = sub ulong h 1
+if eq get bmmio_live idx 0
+ret BMMIO_EARG
+end
+if ne get bmmio_locked idx 0
+ret BMMIO_ELOCKED
+end
+if and ne width 4 ne width 8
+ret BMMIO_EALIGN
+end
+if ne rem off width 0
+ret BMMIO_EALIGN
+end
+endoff = add off width
+if or lt endoff off gt endoff get bmmio_sz idx
+ret BMMIO_EBOUNDS
+end
+ret BMMIO_OK
+end
+
+fn bmmio_sim_key h long off ulong to ulong
+ret or shl ulong h 40 and off 1099511627775
+end
+
+fn bmmio_sim_get h long off ulong to ulong
+k = bmmio_sim_key h off
+n = get bmmio_sim_n 0
+for i ulong n bound 512
+if eq get bmmio_sim_k i k
+ret get bmmio_sim_v i
+end
+end
+ret ulong 0
+end
+
+fn bmmio_sim_set h long off ulong v ulong to long
+k = bmmio_sim_key h off
+n = get bmmio_sim_n 0
+for i ulong n bound 512
+if eq get bmmio_sim_k i k
+put bmmio_sim_v i v
+ret BMMIO_OK
+end
+end
+if ge n BMMIO_SIM_SLOTS
+ret BMMIO_EFULL
+end
+put bmmio_sim_k n k
+put bmmio_sim_v n v
+put bmmio_sim_n 0 add n 1
+ret BMMIO_OK
+end
+
+note Ordered 32-bit MMIO read (DSB SY before and after). Returns value; sets bmmio_err.
+fn bmmio_r32 h long off ulong to ulong
+rc = bmmio_check h off 4
+if ne rc BMMIO_OK
+put bmmio_err 0 rc
+ret ulong 0
+end
+m = get bmmio_mode 0
+if ne m 0
+put bmmio_err 0 BMMIO_EMODE
+ret ulong 0
+end
+cpufence
+v = and bmmio_sim_get h off 4294967295
+cpufence
+put bmmio_rd_ops 0 add get bmmio_rd_ops 0 1
+put bmmio_last 0 ulong h
+put bmmio_last 1 off
+put bmmio_last 2 4
+put bmmio_last 3 0
+put bmmio_last 4 v
+put bmmio_err 0 BMMIO_OK
+ret v
+end
+
+note Ordered 32-bit MMIO write (DSB SY before and after). Returns BMMIO_OK or negative error.
+fn bmmio_w32 h long off ulong val ulong to long
+rc = bmmio_check h off 4
+if ne rc BMMIO_OK
+put bmmio_err 0 rc
+ret rc
+end
+m = get bmmio_mode 0
+if ne m 0
+put bmmio_err 0 BMMIO_EMODE
+ret BMMIO_EMODE
+end
+v = and val 4294967295
+cpufence
+sr = bmmio_sim_set h off v
+cpufence
+if ne sr BMMIO_OK
+put bmmio_err 0 sr
+ret sr
+end
+put bmmio_wr_ops 0 add get bmmio_wr_ops 0 1
+put bmmio_last 0 ulong h
+put bmmio_last 1 off
+put bmmio_last 2 4
+put bmmio_last 3 1
+put bmmio_last 4 v
+put bmmio_err 0 BMMIO_OK
+ret BMMIO_OK
+end
+
+note Ordered 64-bit MMIO read (two aligned 32-bit halves or 64-bit register, DSB SY before and after).
+fn bmmio_r64 h long off ulong to ulong
+rc = bmmio_check h off 8
+if ne rc BMMIO_OK
+put bmmio_err 0 rc
+ret ulong 0
+end
+m = get bmmio_mode 0
+if ne m 0
+put bmmio_err 0 BMMIO_EMODE
+ret ulong 0
+end
+cpufence
+v = bmmio_sim_get h off
+cpufence
+put bmmio_rd_ops 0 add get bmmio_rd_ops 0 1
+put bmmio_last 0 ulong h
+put bmmio_last 1 off
+put bmmio_last 2 8
+put bmmio_last 3 0
+put bmmio_last 4 v
+put bmmio_err 0 BMMIO_OK
+ret v
+end
+
+note Ordered 64-bit MMIO write (DSB SY before and after).
+fn bmmio_w64 h long off ulong val ulong to long
+rc = bmmio_check h off 8
+if ne rc BMMIO_OK
+put bmmio_err 0 rc
+ret rc
+end
+m = get bmmio_mode 0
+if ne m 0
+put bmmio_err 0 BMMIO_EMODE
+ret BMMIO_EMODE
+end
+cpufence
+sr = bmmio_sim_set h off val
+cpufence
+if ne sr BMMIO_OK
+put bmmio_err 0 sr
+ret sr
+end
+put bmmio_wr_ops 0 add get bmmio_wr_ops 0 1
+put bmmio_last 0 ulong h
+put bmmio_last 1 off
+put bmmio_last 2 8
+put bmmio_last 3 1
+put bmmio_last 4 val
+put bmmio_err 0 BMMIO_OK
+ret BMMIO_OK
+end
+
+note Verify GB20B identity registers: BOOT_0 == 0x1bb000a1 and BOOT_42 == 0x1bba1000.
+fn bmmio_verify_gb20b h long to bool
+if not bmmio_is_live h
+ret false
+end
+b0 = bmmio_r32 h GB20B_OFF_BOOT0
+if ne get bmmio_err 0 BMMIO_OK
+ret false
+end
+b42 = bmmio_r32 h GB20B_OFF_BOOT42
+if ne get bmmio_err 0 BMMIO_OK
+ret false
+end
+ret and eq b0 GB20B_VAL_BOOT0 eq b42 GB20B_VAL_BOOT42
+end

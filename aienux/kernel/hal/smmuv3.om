@@ -1,0 +1,628 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/smmuv3.om: Pure-Omega multi-instance ARM SMMUv3 A/B/C driver
+note for bare-metal DGX Spark (consumes iort.om, bar0_mmio.om, pcie.om).
+note Enforces: pcie_quiesced before GBPA.ABORT, IDR0.ST_LEVEL==1, IDR1.SIDSIZE>=min_bits,
+note deterministic CR0/GBPA/STRTAB/CMDQ/EVENTQ/CFGI_ALL/TLBI/CMD_SYNC/ERR==0/SMMUEN bring-up,
+note SMMUv3 C abort-only, strict per-stream disjoint Normal-NC DMA (<40-bit PA, zero wildcard RAM),
+note and auto-mapping of the 3 mandatory GB20B IORT RMR ranges on SMMUv3 B SID 0x100.
+note Compose with: si/directives/om2.om aienux/kernel/hal/iort.om aienux/kernel/hal/bar0_mmio.om aienux/kernel/hal/pcie.om aienux/kernel/hal/smmuv3.om ...
+
+const SMMU_MAX_INST ulong 3
+const SMMU_MAX_STREAMS ulong 8
+const SMMU_MAX_SPANS ulong 32
+const SMMU_PA_40_LIMIT ulong 0x10000000000
+const SMMU_MAX_SPAN_BYTES ulong 0x800000000
+const SMMU_POLL_MAX ulong 1024
+
+note ARM SMMUv3 register offsets (IHI 0070H.a)
+const SMMU_REG_IDR0 ulong 0x0000
+const SMMU_REG_IDR1 ulong 0x0004
+const SMMU_REG_CR0 ulong 0x0020
+const SMMU_REG_CR0ACK ulong 0x0024
+const SMMU_REG_GBPA ulong 0x0044
+const SMMU_REG_STRTAB_BASE ulong 0x0080
+const SMMU_REG_STRTAB_CFG ulong 0x0088
+const SMMU_REG_CMDQ_BASE ulong 0x0090
+const SMMU_REG_CMDQ_PROD ulong 0x0098
+const SMMU_REG_CMDQ_CONS ulong 0x009c
+const SMMU_REG_EVTQ_BASE ulong 0x00a0
+const SMMU_REG_EVTQ_PROD ulong 0x00a8
+const SMMU_REG_EVTQ_CONS ulong 0x00ac
+
+const SMMU_CR0_SMMUEN ulong 0x01
+const SMMU_CR0_EVTQEN ulong 0x04
+const SMMU_CR0_CMDQEN ulong 0x08
+const SMMU_CR0_QUEUES ulong 0x0c
+const SMMU_CR0_ALL ulong 0x0d
+const SMMU_GBPA_UPDATE ulong 0x80000000
+const SMMU_GBPA_ABORT ulong 0x00100000
+const SMMU_BASE_RA ulong 0x4000000000000000
+const SMMU_Q_LOG2SIZE ulong 4
+const SMMU_Q_ENTRIES ulong 16
+
+note SMMUv3 command opcodes
+const SMMU_CMD_CFGI_STE ulong 0x03
+const SMMU_CMD_CFGI_ALL ulong 0x04
+const SMMU_CMD_TLBI_NH_ALL ulong 0x10
+const SMMU_CMD_TLBI_NSNH_ALL ulong 0x30
+const SMMU_CMD_SYNC ulong 0x46
+
+note Stage-1 PTE leaf attributes:
+note Normal-NC (MAIR slot 3 = 0x44): AttrIdx=3<<2 (0xc) | AP[1]=1 (0x40) | SH=3 (0x300) | AF (0x400) | PXN|UXN (0x60000000000000)
+const SMMU_PTE_NORMAL_NC ulong 0x006000000000074c
+note Device-nGnRnE (MAIR slot 2 = 0x00) for ITS MSI doorbell only: AttrIdx=2<<2 (0x8) | AP[1]=1 (0x40) | AF (0x400) | PXN|UXN
+const SMMU_PTE_DEV_ITS ulong 0x0060000000000448
+const SMMU_ITS_DB_BASE ulong 0x08000000
+const SMMU_ITS_DB_END ulong 0x08100000
+const SMMU_CD_MAIR0 ulong 0x440004ff
+
+note Return codes
+const SMMU_OK long 0
+const SMMU_EARG long -1
+const SMMU_EIDR long -2
+const SMMU_ECR0 long -3
+const SMMU_EGBPA long -4
+const SMMU_ECMDERR long -5
+const SMMU_EABORTONLY long -6
+const SMMU_ERMRATTR long -7
+const SMMU_EOVERLAP long -8
+const SMMU_EFULL long -9
+const SMMU_ENOQUIESCE long -10
+const SMMU_ENOTFOUND long -11
+const SMMU_EWILDCARD long -12
+
+note Per-instance state (0=off, 1=up, 2=abort_only)
+global smmu_inst_state ulong 3
+global smmu_inst_h long 3
+global smmu_inst_base ulong 3
+global smmu_inst_sidbits ulong 3
+global smmu_inst_cmd_prod ulong 3
+global smmu_inst_evt_cnt ulong 3
+global smmu_inst_last_evt ulong 3
+
+note Host-model command queue buffer (3 instances * 16 cmds * 2 u64 words = 96 u64)
+global smmu_cmdq_buf ulong 96
+note Host-model event queue buffer (3 instances * 16 evts * 2 u64 words = 96 u64)
+global smmu_evtq_buf ulong 96
+
+note Active stream table (up to 8 streams)
+global smmu_str_n ulong 1
+global smmu_str_live ulong 8
+global smmu_str_inst ulong 8
+global smmu_str_sid ulong 8
+global smmu_str_ttbr ulong 8
+note Encoded STE[0..7] and CD[0..7] for each stream (8 streams * 8 u64 = 64 u64)
+global smmu_ste_words ulong 64
+global smmu_cd_words ulong 64
+
+note Per-stream disjoint DMA span table (up to 32 active spans)
+global smmu_sp_live ulong 32
+global smmu_sp_stream ulong 32
+global smmu_sp_pa ulong 32
+global smmu_sp_len ulong 32
+global smmu_sp_pte ulong 32
+global smmu_sp_rmr ulong 32
+
+note Bring-up step trace (bitmask per instance for deterministic ordering verification)
+global smmu_trace ulong 3
+global smmu_cmd_count ulong 3
+
+fn smmu_reset to void
+put smmu_str_n 0 0
+for i ulong SMMU_MAX_INST
+put smmu_inst_state i 0
+put smmu_inst_h i 0
+put smmu_inst_base i 0
+put smmu_inst_sidbits i 0
+put smmu_inst_cmd_prod i 0
+put smmu_inst_evt_cnt i 0
+put smmu_inst_last_evt i 0
+put smmu_trace i 0
+put smmu_cmd_count i 0
+end
+for j ulong SMMU_MAX_STREAMS
+put smmu_str_live j 0
+put smmu_str_inst j 0
+put smmu_str_sid j 0
+put smmu_str_ttbr j 0
+end
+for k ulong SMMU_MAX_SPANS
+put smmu_sp_live k 0
+put smmu_sp_stream k 0
+put smmu_sp_pa k 0
+put smmu_sp_len k 0
+put smmu_sp_pte k 0
+put smmu_sp_rmr k 0
+end
+for m ulong 64
+put smmu_ste_words m 0
+put smmu_cd_words m 0
+end
+for q ulong 96
+put smmu_cmdq_buf q 0
+put smmu_evtq_buf q 0
+end
+end
+
+fn smmu_poll_eq h long reg ulong mask ulong want ulong to bool
+for i ulong SMMU_POLL_MAX
+v = bmmio_r32 h reg
+if ne get bmmio_err 0 BMMIO_OK
+ret false
+end
+if eq and v mask want
+ret true
+end
+cpurelax
+end
+ret false
+end
+
+fn smmu_cmd_push inst ulong w0 ulong w1 ulong to void
+prod = get smmu_inst_cmd_prod inst
+slot = and prod sub SMMU_Q_ENTRIES 1
+base_idx = add mul inst 32 mul slot 2
+put smmu_cmdq_buf base_idx w0
+put smmu_cmdq_buf add base_idx 1 w1
+put smmu_inst_cmd_prod inst and add prod 1 0xfffff
+put smmu_cmd_count inst add get smmu_cmd_count inst 1
+end
+
+note Flush command queue with CMD_SYNC and enforce CMDQ_CONS.ERR[30:24] == 0.
+fn smmu_cmd_sync inst ulong to long
+h = get smmu_inst_h inst
+note CMD_SYNC: op=0x46, CS=0 (no IRQ), MSH=3 (Inner Shareable, bits 23:22)
+smmu_cmd_push inst or SMMU_CMD_SYNC shl ulong 3 22 0
+cpufence
+prod = get smmu_inst_cmd_prod inst
+rc = bmmio_w32 h SMMU_REG_CMDQ_PROD prod
+if ne rc BMMIO_OK
+ret SMMU_ECMDERR
+end
+note In host model mode 0, model auto-advances CONS unless fault-injected in bits 30:24.
+if eq get bmmio_mode 0 0
+cur = bmmio_r32 h SMMU_REG_CMDQ_CONS
+err_bits = and shr cur 24 0x7f
+if ne err_bits 0
+ret SMMU_ECMDERR
+end
+sr = bmmio_w32 h SMMU_REG_CMDQ_CONS prod
+if ne sr BMMIO_OK
+ret SMMU_ECMDERR
+end
+end
+ok = smmu_poll_eq h SMMU_REG_CMDQ_CONS 0xfffff prod
+if not ok
+ret SMMU_ECMDERR
+end
+cons = bmmio_r32 h SMMU_REG_CMDQ_CONS
+err = and shr cons 24 0x7f
+if ne err 0
+ret SMMU_ECMDERR
+end
+ret SMMU_OK
+end
+
+note Bring up an SMMUv3 node into ABORT-only state (used for SMMUv3 C at 0x14900000).
+fn smmu_abort_only inst ulong base ulong to long
+if eq get pcie_quiesced 0 0
+ret SMMU_ENOQUIESCE
+end
+if or ge inst SMMU_MAX_INST eq base 0
+ret SMMU_EARG
+end
+h = get smmu_inst_h inst
+if le h 0
+h = bmmio_register base base SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
+if lt h 0
+ret SMMU_EARG
+end
+put smmu_inst_h inst h
+put smmu_inst_base inst base
+end
+rc = bmmio_w32 h SMMU_REG_CR0 0
+if ne rc BMMIO_OK
+ret SMMU_ECR0
+end
+if eq get bmmio_mode 0 0
+z = bmmio_w32 h SMMU_REG_CR0ACK 0
+end
+if not smmu_poll_eq h SMMU_REG_CR0ACK 0xffffffff 0
+ret SMMU_ECR0
+end
+gbpa = or SMMU_GBPA_UPDATE SMMU_GBPA_ABORT
+rc = bmmio_w32 h SMMU_REG_GBPA gbpa
+if ne rc BMMIO_OK
+ret SMMU_EGBPA
+end
+if eq get bmmio_mode 0 0
+z = bmmio_w32 h SMMU_REG_GBPA SMMU_GBPA_ABORT
+end
+if not smmu_poll_eq h SMMU_REG_GBPA SMMU_GBPA_UPDATE 0
+ret SMMU_EGBPA
+end
+put smmu_inst_state inst 2
+put smmu_trace inst or get smmu_trace inst 0x03
+ret SMMU_OK
+end
+
+fn smmu_init_prog_queues inst ulong log2sz ulong strtab_pa ulong cmdq_pa ulong evtq_pa ulong to void
+h = get smmu_inst_h inst
+cfg = or shl ulong 1 16 or shl ulong 6 6 log2sz
+z = bmmio_w64 h SMMU_REG_STRTAB_BASE or strtab_pa SMMU_BASE_RA
+z = bmmio_w32 h SMMU_REG_STRTAB_CFG cfg
+z = bmmio_w64 h SMMU_REG_CMDQ_BASE or or cmdq_pa SMMU_BASE_RA SMMU_Q_LOG2SIZE
+z = bmmio_w32 h SMMU_REG_CMDQ_PROD 0
+z = bmmio_w64 h SMMU_REG_EVTQ_BASE or or evtq_pa SMMU_BASE_RA SMMU_Q_LOG2SIZE
+z = bmmio_w32 h SMMU_REG_EVTQ_PROD 0
+z = bmmio_w32 h SMMU_REG_EVTQ_CONS 0
+put smmu_inst_cmd_prod inst 0
+cpufence
+end
+
+fn smmu_init_enable inst ulong log2sz ulong to long
+h = get smmu_inst_h inst
+rc = bmmio_w32 h SMMU_REG_CR0 SMMU_CR0_QUEUES
+if ne rc BMMIO_OK
+ret SMMU_ECR0
+end
+if eq get bmmio_mode 0 0
+z = bmmio_w32 h SMMU_REG_CR0ACK SMMU_CR0_QUEUES
+end
+if not smmu_poll_eq h SMMU_REG_CR0ACK SMMU_CR0_QUEUES SMMU_CR0_QUEUES
+ret SMMU_ECR0
+end
+put smmu_trace inst or get smmu_trace inst 0x10
+smmu_cmd_push inst SMMU_CMD_CFGI_ALL 31
+smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
+sr = smmu_cmd_sync inst
+if ne sr SMMU_OK
+ret sr
+end
+put smmu_trace inst or get smmu_trace inst 0x20
+rc = bmmio_w32 h SMMU_REG_CR0 SMMU_CR0_ALL
+if ne rc BMMIO_OK
+ret SMMU_ECR0
+end
+if eq get bmmio_mode 0 0
+z = bmmio_w32 h SMMU_REG_CR0ACK SMMU_CR0_ALL
+end
+if not smmu_poll_eq h SMMU_REG_CR0ACK SMMU_CR0_ALL SMMU_CR0_ALL
+ret SMMU_ECR0
+end
+put smmu_inst_sidbits inst log2sz
+put smmu_inst_state inst 1
+put smmu_trace inst or get smmu_trace inst 0x40
+ret SMMU_OK
+end
+
+fn smmu_pa_valid pa ulong to bool
+if eq pa 0
+ret false
+end
+if ne and pa 4095 0
+ret false
+end
+ret lt pa SMMU_PA_40_LIMIT
+end
+
+note Deterministic SMMUv3 bring-up (instances A=0 and B=1; refuses C=2 which must stay abort-only).
+note Exact sequence: quiesce check -> IDR0.ST_LEVEL==1 & IDR1.SIDSIZE>=min_bits ->
+note CR0=0 -> CR0ACK==0 -> GBPA.ABORT|Update -> GBPA.Update==0 ->
+note 2-level STRTAB/CMDQ/EVENTQ -> DSB SY -> CR0=CMDQEN|EVTQEN -> CR0ACK ->
+note CFGI_ALL + TLBI_NSNH_ALL + CMD_SYNC + CMDQ_CONS.ERR==0 -> CR0=SMMUEN|CMDQEN|EVTQEN -> CR0ACK.
+fn smmu_init_instance inst ulong base ulong min_bits ulong strtab_pa ulong cmdq_pa ulong evtq_pa ulong to long
+if eq get pcie_quiesced 0 0
+ret SMMU_ENOQUIESCE
+end
+if ge inst 2
+ret SMMU_EARG
+end
+if or eq base 0 lt min_bits 8
+ret SMMU_EARG
+end
+if not smmu_pa_valid strtab_pa
+ret SMMU_EARG
+end
+if not smmu_pa_valid cmdq_pa
+ret SMMU_EARG
+end
+if not smmu_pa_valid evtq_pa
+ret SMMU_EARG
+end
+h = get smmu_inst_h inst
+if le h 0
+h = bmmio_register base base SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
+if lt h 0
+ret SMMU_EARG
+end
+put smmu_inst_h inst h
+put smmu_inst_base inst base
+end
+idr0 = bmmio_r32 h SMMU_REG_IDR0
+idr1 = bmmio_r32 h SMMU_REG_IDR1
+if ne and shr idr0 27 3 1
+ret SMMU_EIDR
+end
+if lt and idr1 0x3f min_bits
+ret SMMU_EIDR
+end
+put smmu_trace inst 0x01
+rc = bmmio_w32 h SMMU_REG_CR0 0
+if ne rc BMMIO_OK
+ret SMMU_ECR0
+end
+if eq get bmmio_mode 0 0
+z = bmmio_w32 h SMMU_REG_CR0ACK 0
+end
+if not smmu_poll_eq h SMMU_REG_CR0ACK 0xffffffff 0
+ret SMMU_ECR0
+end
+put smmu_trace inst or get smmu_trace inst 0x02
+rc = bmmio_w32 h SMMU_REG_GBPA or SMMU_GBPA_UPDATE SMMU_GBPA_ABORT
+if ne rc BMMIO_OK
+ret SMMU_EGBPA
+end
+if eq get bmmio_mode 0 0
+z = bmmio_w32 h SMMU_REG_GBPA SMMU_GBPA_ABORT
+end
+if not smmu_poll_eq h SMMU_REG_GBPA SMMU_GBPA_UPDATE 0
+ret SMMU_EGBPA
+end
+put smmu_trace inst or get smmu_trace inst 0x04
+log2sz = min_bits
+if lt log2sz 12
+log2sz = ulong 12
+end
+smmu_init_prog_queues inst log2sz strtab_pa cmdq_pa evtq_pa
+put smmu_trace inst or get smmu_trace inst 0x08
+ret smmu_init_enable inst log2sz
+end
+
+note Internal helper: add one disjoint span to stream slot (0..7) with explicit PTE attrs.
+fn smmu_add_span_raw slot ulong pa ulong sz ulong pte_attr ulong is_rmr ulong to long
+if or eq pa 0 eq sz 0
+ret SMMU_EARG
+end
+if or ne and pa 4095 0 ne and sz 4095 0
+ret SMMU_EARG
+end
+if gt sz SMMU_MAX_SPAN_BYTES
+ret SMMU_EWILDCARD
+end
+endpa = add pa sz
+if or lt endpa pa gt endpa SMMU_PA_40_LIMIT
+ret SMMU_EWILDCARD
+end
+note Enforce strict disjointness across ALL active spans of ALL streams
+free_idx = ulong SMMU_MAX_SPANS
+for i ulong SMMU_MAX_SPANS
+if ne get smmu_sp_live i 0
+if bmmio_ranges_overlap pa sz get smmu_sp_pa i get smmu_sp_len i
+ret SMMU_EOVERLAP
+end
+else
+if eq free_idx SMMU_MAX_SPANS
+free_idx = i
+end
+end
+end
+if eq free_idx SMMU_MAX_SPANS
+ret SMMU_EFULL
+end
+put smmu_sp_live free_idx 1
+put smmu_sp_stream free_idx slot
+put smmu_sp_pa free_idx pa
+put smmu_sp_len free_idx sz
+put smmu_sp_pte free_idx pte_attr
+put smmu_sp_rmr free_idx is_rmr
+ret SMMU_OK
+end
+
+note Encode 64-byte CD (V=1, EPD1=1, T0SZ=24, TG0=0, IPS=2, MAIR0=0x440004ff) and STE (V=1, Config=5).
+fn smmu_encode_ste_cd slot ulong cd_pa ulong ttbr0_pa ulong to void
+base = mul slot 8
+note CD word 0: T0SZ=24 | SH0=3<<12 | EPD1=1<<30 | V=1<<31 | IPS=2<<32 | A=1<<40 | AA64=1<<41
+cd0 = or ulong 24 shl ulong 3 12
+cd0 = or cd0 shl ulong 3 30
+cd0 = or cd0 shl ulong 2 32
+cd0 = or cd0 shl ulong 3 40
+put smmu_cd_words base cd0
+put smmu_cd_words add base 1 ttbr0_pa
+put smmu_cd_words add base 2 0
+put smmu_cd_words add base 3 SMMU_CD_MAIR0
+note STE word 0: V=1 | Config=5<<1 (Stage-1 translate) | S1ContextPtr=(cd_pa & ~0x3f)
+ste0 = or ulong 11 and cd_pa 0x000fffffffffffc0
+note STE word 1: S1DSS=2 | S1CIR=1<<2 | S1COR=1<<4 | S1CSH=3<<6 = 0xd6
+put smmu_ste_words base ste0
+put smmu_ste_words add base 1 0xd6
+end
+
+fn smmu_map_one_rmr slot ulong r ulong to long
+fl = ulong get iort_rmr_flags r
+mattr = and shr fl 2 0xff
+if ne mattr 4
+if ne mattr 5
+if ne fl 0x10
+ret SMMU_ERMRATTR
+end
+end
+end
+nrng = ulong get iort_rmr_nrng r
+for k ulong nrng bound 4
+ridx = add mul r IORT_MAX_RMR_RANGES k
+ar = smmu_add_span_raw slot get iort_rmr_rbase ridx get iort_rmr_rlen ridx SMMU_PTE_NORMAL_NC 1
+if ne ar SMMU_OK
+ret ar
+end
+end
+ret SMMU_OK
+end
+
+fn smmu_map_rmrs slot ulong inst ulong sid ulong to long
+nrmr = get iort_meta 3
+for r ulong nrmr bound 4
+if eq ulong get iort_rmr_sidx r inst
+if ge sid ulong get iort_rmr_slo r
+if le sid ulong get iort_rmr_shi r
+rc = smmu_map_one_rmr slot r
+if ne rc SMMU_OK
+ret rc
+end
+end
+end
+end
+end
+ret SMMU_OK
+end
+
+note Open a confined stream for PCI (seg, rid) via iort.om, auto-mapping any covering IORT RMRs.
+note Returns stream handle (1..8) on success, or negative SMMU_E* error.
+fn smmu_open_stream seg uint rid uint cd_pa ulong ttbr0_pa ulong to long
+if or eq cd_pa 0 eq ttbr0_pa 0
+ret SMMU_EARG
+end
+if or ne and cd_pa 63 0 ne and ttbr0_pa 4095 0
+ret SMMU_EARG
+end
+if or ge cd_pa SMMU_PA_40_LIMIT ge ttbr0_pa SMMU_PA_40_LIMIT
+ret SMMU_EARG
+end
+if ne iort_route_rid seg rid 0
+ret SMMU_ENOTFOUND
+end
+inst = get iort_qres 0
+sid = get iort_qres 3
+if ge inst SMMU_MAX_INST
+ret SMMU_ENOTFOUND
+end
+if eq get smmu_inst_state inst 2
+ret SMMU_EABORTONLY
+end
+if ne get smmu_inst_state inst 1
+ret SMMU_EARG
+end
+if ge sid shl ulong 1 get smmu_inst_sidbits inst
+ret SMMU_EIDR
+end
+n = get smmu_str_n 0
+if ge n SMMU_MAX_STREAMS
+ret SMMU_EFULL
+end
+for i ulong n bound 8
+if ne get smmu_str_live i 0
+if eq get smmu_str_inst i inst
+if eq get smmu_str_sid i sid
+ret SMMU_EOVERLAP
+end
+end
+end
+end
+rr = smmu_map_rmrs n inst sid
+if ne rr SMMU_OK
+ret rr
+end
+smmu_encode_ste_cd n cd_pa ttbr0_pa
+put smmu_str_live n 1
+put smmu_str_inst n inst
+put smmu_str_sid n sid
+put smmu_str_ttbr n ttbr0_pa
+put smmu_str_n 0 add n 1
+cpufence
+smmu_cmd_push inst or SMMU_CMD_CFGI_STE shl sid 32 1
+smmu_cmd_push inst SMMU_CMD_TLBI_NH_ALL 0
+sr = smmu_cmd_sync inst
+if ne sr SMMU_OK
+put smmu_str_live n 0
+ret sr
+end
+ret long add n 1
+end
+
+note Map one disjoint DMA span for an open stream handle (1..8).
+note is_its_db == 0: Normal-NC | AP[1]=1 | PXN | UXN; is_its_db == 1: ITS doorbell only (0x08000000..0x08100000, SID 0x100).
+fn smmu_map_span sh long pa ulong sz ulong is_its_db ulong to long
+if or le sh 0 gt ulong sh get smmu_str_n 0
+ret SMMU_EARG
+end
+slot = sub ulong sh 1
+if eq get smmu_str_live slot 0
+ret SMMU_EARG
+end
+inst = get smmu_str_inst slot
+pte = SMMU_PTE_NORMAL_NC
+if ne is_its_db 0
+if ne inst 1
+ret SMMU_EARG
+end
+if ne get smmu_str_sid slot 0x100
+ret SMMU_EARG
+end
+if or lt pa SMMU_ITS_DB_BASE gt add pa sz SMMU_ITS_DB_END
+ret SMMU_EARG
+end
+pte = SMMU_PTE_DEV_ITS
+end
+ar = smmu_add_span_raw slot pa sz pte 0
+if ne ar SMMU_OK
+ret ar
+end
+cpufence
+smmu_cmd_push inst SMMU_CMD_TLBI_NH_ALL 0
+ret smmu_cmd_sync inst
+end
+
+note Unmap one non-RMR DMA span from an open stream (e.g. NVMe unmaps loaded weights before GB20B maps them).
+fn smmu_unmap_span sh long pa ulong sz ulong to long
+if or le sh 0 gt ulong sh get smmu_str_n 0
+ret SMMU_EARG
+end
+slot = sub ulong sh 1
+if eq get smmu_str_live slot 0
+ret SMMU_EARG
+end
+inst = get smmu_str_inst slot
+for i ulong SMMU_MAX_SPANS
+if ne get smmu_sp_live i 0
+if eq get smmu_sp_stream i slot
+if and eq get smmu_sp_pa i pa eq get smmu_sp_len i sz
+if ne get smmu_sp_rmr i 0
+ret SMMU_EARG
+end
+put smmu_sp_live i 0
+cpufence
+smmu_cmd_push inst SMMU_CMD_TLBI_NH_ALL 0
+ret smmu_cmd_sync inst
+end
+end
+end
+end
+ret SMMU_ENOTFOUND
+end
+
+note Drain SMMUv3 EVENTQ faults for instance inst; returns number of events drained.
+fn smmu_drain_events inst ulong to long
+if ge inst SMMU_MAX_INST
+ret SMMU_EARG
+end
+h = get smmu_inst_h inst
+if le h 0
+ret SMMU_EARG
+end
+prod = and bmmio_r32 h SMMU_REG_EVTQ_PROD 0xfffff
+cons = and bmmio_r32 h SMMU_REG_EVTQ_CONS 0xfffff
+cnt = ulong 0
+while and ne cons prod lt cnt SMMU_Q_ENTRIES bound 16
+slot = and cons sub SMMU_Q_ENTRIES 1
+eidx = add mul inst 32 mul slot 2
+w0 = get smmu_evtq_buf eidx
+put smmu_inst_last_evt inst w0
+cons = and add cons 1 0xfffff
+cnt = add cnt 1
+end
+if gt cnt 0
+z = bmmio_w32 h SMMU_REG_EVTQ_CONS cons
+put smmu_inst_evt_cnt inst add get smmu_inst_evt_cnt inst cnt
+end
+ret long cnt
+end

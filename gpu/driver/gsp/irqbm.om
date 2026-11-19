@@ -1,0 +1,140 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/driver/gsp/irqbm.om: Pure-Omega bare-metal GB20B BAR0 polling peer for irq.om + irqcc.om (iqmode=2).
+note Dual-compatible OM-1/OM-2 (decimal literals only). Requires bar0_mmio.om before it and irq.om after it.
+note Verified GB20B offsets (open-gpu-kernel-modules 580.173.02):
+note   blackwell/gb202/dev_riscv_pri.h:30-31, gb20b/dev_gsp.h:27, tu102/dev_falcon_v4.h:26,31,38
+note   NV_PGSP=0x110000 (1114112), riscvBase=0x111000 (1118208)
+note   FALCON_IRQSCLR = 0x110004 (1114116, W)
+note   FALCON_IRQSTAT = 0x110008 (1114120, R)
+note   FALCON_IRQMCLR = 0x110014 (1114132, -W-4R, used by iqmask)
+note   RISCV_IRQMASK  = 0x111528 (1119528, R--4R)
+note   RISCV_IRQDEST  = 0x11152c (1119532, R--4R)
+note Hardware status: HOST_MODEL_ONLY (Spark silicon NOT_RUN).
+
+const IBM_IRQSCLR ulong 1114116
+const IBM_IRQSTAT ulong 1114120
+const IBM_IRQMCLR ulong 1114132
+const IBM_RVMASK ulong 1119528
+const IBM_RVDEST ulong 1119532
+const IBM_MASKALL ulong 4294967295
+
+note Bare-metal IRQ peer state:
+note ibm_bar: bar0_mmio handle (1..16); ibm_d0: 1 if PCIe PM D0 verified; ibm_locked: sticky lockdown deny
+global ibm_bar long 1
+global ibm_d0 ulong 1
+global ibm_locked ulong 1
+note RPC queue simulation/handoff counters for iqready/iqrecv:
+note ibm_rpc_avail: remaining ready messages; ibm_rpc_lock_at: 1-based msg index that signals lockdown (0=none)
+global ibm_rpc_avail ulong 1
+global ibm_rpc_lock_at ulong 1
+global ibm_rpc_done ulong 1
+note Audit counters: reads, clears, masks, order_err (nonzero if clear happened after recv)
+global ibm_reads ulong 1
+global ibm_clears ulong 1
+global ibm_masks ulong 1
+global ibm_order_err ulong 1
+
+fn ibm_reset to void
+put ibm_bar 0 0
+put ibm_d0 0 0
+put ibm_locked 0 0
+put ibm_rpc_avail 0 0
+put ibm_rpc_lock_at 0 0
+put ibm_rpc_done 0 0
+put ibm_reads 0 0
+put ibm_clears 0 0
+put ibm_masks 0 0
+put ibm_order_err 0 0
+end
+
+fn ibm_bind bar_h long d0_ok ulong to long
+if not bmmio_is_live bar_h
+ret -1
+end
+put ibm_bar 0 bar_h
+put ibm_d0 0 d0_ok
+put ibm_locked 0 0
+ret 0
+end
+
+fn iqpm to bool
+if eq get ibm_d0 0 0
+ret false
+end
+if ne get ibm_locked 0 0
+ret false
+end
+ret bmmio_is_live get ibm_bar 0
+end
+
+note Pending = FALCON_IRQSTAT & RISCV_IRQMASK & RISCV_IRQDEST (kernel_falcon_ga102.c:318-320)
+fn iqread to uint
+if ne get ibm_locked 0 0
+ret uint 0
+end
+h = get ibm_bar 0
+st = bmmio_r32 h IBM_IRQSTAT
+if ne get bmmio_err 0 BMMIO_OK
+ret uint 0
+end
+mk = bmmio_r32 h IBM_RVMASK
+if ne get bmmio_err 0 BMMIO_OK
+ret uint 0
+end
+ds = bmmio_r32 h IBM_RVDEST
+if ne get bmmio_err 0 BMMIO_OK
+ret uint 0
+end
+put ibm_reads 0 add get ibm_reads 0 1
+ret uint and st and mk ds
+end
+
+note Clear edge SWGEN0 BEFORE draining RPC (kernel_gsp_tu102.c:1188-1203)
+fn iqclear v uint to void
+if ne get ibm_locked 0 0
+ret
+end
+if gt get ibm_rpc_done 0 0
+put ibm_order_err 0 add get ibm_order_err 0 1
+end
+h = get ibm_bar 0
+r = bmmio_w32 h IBM_IRQSCLR ulong v
+note In host model mode 0, reflect write-1-to-clear on FALCON_IRQSTAT
+if and eq get bmmio_mode 0 0 eq r BMMIO_OK
+cur = bmmio_sim_get h IBM_IRQSTAT
+z = bmmio_sim_set h IBM_IRQSTAT and cur not ulong v
+end
+put ibm_clears 0 add get ibm_clears 0 1
+end
+
+note Mask Falcon IRQs via FALCON_IRQMCLR (0x110014); forbidden once sticky lockdown is set.
+fn iqmask to void
+if ne get ibm_locked 0 0
+ret
+end
+h = get ibm_bar 0
+r = bmmio_w32 h IBM_IRQMCLR IBM_MASKALL
+put ibm_masks 0 add get ibm_masks 0 1
+end
+
+fn iqready to bool
+ret gt get ibm_rpc_avail 0 0
+end
+
+fn iqrecv to long
+av = get ibm_rpc_avail 0
+if eq av 0
+ret 0
+end
+put ibm_rpc_avail 0 sub av 1
+done = add get ibm_rpc_done 0 1
+put ibm_rpc_done 0 done
+la = get ibm_rpc_lock_at 0
+if and ne la 0 eq done la
+note Lockdown notification: install sticky deny BEFORE returning so zero further BAR0 accesses occur
+put ibm_locked 0 1
+z = bmmio_lock get ibm_bar 0
+ret 2
+end
+ret 1
+end
