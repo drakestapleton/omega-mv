@@ -29,6 +29,6 @@ Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`)
 
 Other in-tree consumers: `core/sovereign-core/om/golden/ollm/` builds a pinned aien-train snapshot by its upstream paths; `gpu/nvidia/om/gemm-any/ollm.om` and `gpu/nvidia/om/kgen/attention_ollm.om` are GPU kernels shaped for Omega LLM.
 
-## Follow-ups (not qualified by this import)
+## Follow-ups
 
-The tools under `tools/` still use aien-train-relative paths (for example `native/omegallm/`); their host compilation is gated, but running them from an omega-mv checkout needs a separate path port and behavioural qualification. Likewise, future imports of other aien-train code must exclude the migrated Omega LLM folders (see `train/import/aien-train/README.md`); an automated guard against accidental re-import is follow-up work.
+`tools/wpatch/wpbuild.om` has been ported to `omega-mv` paths (`/train/omega-llm/native/`, `/train/omega-llm/tools/`, including `spec.om`), `train/import/aien-train/paths.txt` excludes the migrated `omegallm/` folders, and `train/units-gate.om` fails if any `train/aien-train/{native,tests,tools,docs}/omegallm` directory reappears. End-to-end behavioural runs of the tools from an `omega-mv` checkout and Darwin Mach-O / hardware target builds remain `NOT_RUN`.
