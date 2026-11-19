@@ -1,6 +1,6 @@
 # Omega `.om`: what is done, what completion still needs
 
-Status: 2026-10-23, compiler numbers rechecked 2026-11-10 at main `a59a425b`. This file is the audit trail for the objective "complete and evolve the `.om`
+Status: 2026-10-23, compiler numbers rechecked 2026-11-10 at main `a59a425b` and 2026-11-19 at main `100a9a914`. This file is the audit trail for the objective "complete and evolve the `.om`
 language". It separates work that is implemented and gated from work that is blocked on a decision or
 on an external store. It is not a claim that the language is complete. Its counts and pins are those of
 2026-10-23 and are not refreshed here; OM-2 (section 9.13 of OMEGESE.md) has landed since, and the 1.0
@@ -29,6 +29,9 @@ Compiler: 7,208 lines, 251 functions, sha256
 Rechecked 2026-11-10 at main `a59a425b`: `seed/omc/omc.om` is 19,052 lines
 with 510 top-level `fn` (source sha256 `7995e0e3...7189`); the committed `seed/out/omc` is 664,944 bytes,
 sha256 `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`, as `seed/out/omc.sha256` records.
+Rechecked 2026-11-19 at main `100a9a914`: `seed/omc/omc.om` is 25,250 lines (587,337 bytes) with 653 top-level `fn`
+(source sha256 `d8a9cdc0...c833`); the committed `seed/out/omc` is 937,288 bytes, sha256
+`b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2`, matching `seed/out/omc.sha256`.
 The error registry still lists codes 1..25 and 27..30 with 26 unused.
 
 Benchmark parity: 103 authored `.om` sources and 53 build-plan targets compile to identical bytes

@@ -30,9 +30,11 @@ has not been run yet.
 | Part | Where it stands | Read more |
 | --- | --- | --- |
 | The compiler, written in Omega | Works. It is rebuilt from the seed and makes programs for 64-bit Arm Linux. | [seed/README.md](seed/README.md) |
+| Programs for 64-bit Arm UEFI firmware (`target a64efi`) | Implemented. Exercised on one physical DGX Spark and under QEMU/EDK2. | [docs/A64-EFI.md](docs/A64-EFI.md) |
 | Programs for Intel and AMD processors | Candidate. This project's own checks of the Linux programs ran in an emulator only. One firmware program ran once on a real iMac, recorded in [docs/X86-EFI.md](docs/X86-EFI.md). | [docs/X86-LINUX.md](docs/X86-LINUX.md) |
 | Output for web browsers (WebAssembly) and for SPIR-V, a common format for programs that run on graphics cards | In the compiler chain. The SPIR-V output has run on a processor only, not on a graphics card. | [docs/SPIRV.md](docs/SPIRV.md) |
-| The GPU layer, "Omega GPU" | Moving here from CUDA++, my earlier GPU project, one piece at a time, as Omega only. | [gpu/README.md](gpu/README.md) |
+| The GPU layer, "Omega GPU" | Moving here from CUDA++, my earlier GPU project, one piece at a time, as Omega only (AMD, NVIDIA, SPIR-V, HW, driver and runtime slices are here). | [gpu/README.md](gpu/README.md) |
+| Sovereign Intelligence pure-Omega layers | Integrated here as pure `.om` units built by `seed/out/omc`, indexed in [si/STACK.tsv](si/STACK.tsv). | [si/README.md](si/README.md) |
 | Older C code | Still here. Each piece is replaced by Omega and then removed. | [The list of what is left](docs/migration/C-TO-OM-INVENTORY.md) |
 | Earlier runtime and numeric results | History. Each one is tied to the exact version in its receipt, the saved record of a check. | [ENGINEERING-NOTES.md](ENGINEERING-NOTES.md) |
 
@@ -108,7 +110,8 @@ These are what the project is built toward. The notes under each say how far it 
 | Folder | What it holds |
 | --- | --- |
 | `seed/` | The compiler chain, from the hand-written seed up to `omc`. |
-| `gpu/` | Omega GPU: the code that drives graphics cards, and the checks for it. |
+| `gpu/` | Omega GPU: the pure-Omega GPU layer (AMD, NVIDIA, SPIR-V, HW, driver and runtime slices) and its checks. |
+| `aienux/`, `core/`, `bridge/`, `protocol/`, `train/`, `apps/`, `si/` | Pure-Omega Sovereign Intelligence layers (OS, runtime/agent core, compatibility, networking/protocols, training/Omega LLM, apps/sites, front-door/ledger), each gated by its `units-gate.om`. |
 | `spec/`, `docs/` | The language and its documents. |
 | `tests/` | The gates. A gate is a check that must pass before a change lands. |
 | `evidence/` | Receipts, each tied to an exact version. |

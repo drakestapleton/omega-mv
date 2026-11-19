@@ -8,7 +8,9 @@ this repository's own compiler, `seed/out/omc`, plus the data tables those units
 The GPU layer is moving here from CUDApp one piece at a time (aien-architecture-mv ADR 0047, accepted by
 Drake on 2026-11-14). Only Omega moves in (Drake, 2026-11-14: "make sure it's pure omega when it's in
 there"): a C, Python, shell or other file is rewritten in Omega first, or it stays in CUDApp and is listed
-as not yet Omega. Only the AMD back end has moved so far; NVIDIA and the rest are not here yet.
+as not yet Omega. The AMD (`gpu/amd/`), NVIDIA (`gpu/nvidia/`), SPIR-V (`gpu/spirv/`), hardware-manifest
+(`gpu/hw/`), runtime-slice (`gpu/runtime/`), and extra pure-Omega driver/adapter/compute units are now here;
+see [`gpu/UNITS.md`](UNITS.md) and [`gpu/nvidia/README.md`](nvidia/README.md) for what remains in CUDApp.
 
 ## Layout
 
@@ -24,7 +26,7 @@ as not yet Omega. Only the AMD back end has moved so far; NVIDIA and the rest ar
 | `gpu/adapters/` | Pure-Omega hardware accelerator adapter and provider router (converted from `spark-adapters`, `da269adf5ff1`, 3 `.om` files). |
 | `gpu/head-to-head/` | Pure-Omega paired A/B GPU benchmark comparator and parity verifier (converted from `gpu-head-to-head`, `48e331f2cf5e`, 3 `.om` files). |
 | `gpu/forge/` | Pure-Omega FORGE hardware descriptor, envelope, provider and realization engine (converted from `physics-mv`, `29039514eaf8`, 6 `.om` files). |
-| `gpu/extra-units.tsv`, `gpu/extra-units-gate.om` | Compile-reproducibility gate (`OMEGA-GPU-EXTRA-UNITS`, 17 units) for `gpu/driver/`, `gpu/cuda-crack/`, `gpu/adapters/`, `gpu/head-to-head/`, and `gpu/forge/`, kept separate so `gpu/units.tsv` (405 units, `OMEGA-GPU-UNITS`) stays unchanged. |
+| `gpu/extra-units.tsv`, `gpu/extra-units-gate.om` | Compile-reproducibility gate (`OMEGA-GPU-EXTRA-UNITS`, 22 units) for `gpu/driver/`, `gpu/cuda-crack/`, `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, and `gpu/turing/`, kept separate so `gpu/units.tsv` (405 units, `OMEGA-GPU-UNITS`) stays unchanged. |
 
 A moved back end keeps the history of its Omega files: `git log --follow gpu/amd/gfx942/hsaco.om` shows
 its CUDApp commits. To find the new commit for a CUDApp commit, look it up in
@@ -37,7 +39,10 @@ anything. The digest is read from `seed/out/omc.sha256`. No back end carries a c
 
 ## Gates
 
-`tests/gates/run.sh gpu-amd` (manifest `tests/gates/omega-gpu-amd.gate`) builds and runs
-`gpu/amd/gate.om`. See `gpu/amd/README.md`. Host results are never hardware qualification. A hardware
-result applies to a later revision only for the bytes that are still identical, and `card.tsv` says
-which bytes those are.
+- `tests/gates/run.sh gpu-amd` (manifest `tests/gates/omega-gpu-amd.gate`) builds and runs `gpu/amd/gate.om`. See `gpu/amd/README.md`.
+- `tests/gates/run.sh gpu-units` (`OMEGA-GPU-UNITS`) builds and runs `gpu/units-gate.om` over the 405 units in `gpu/units.tsv`. See `gpu/UNITS.md`.
+- `gpu/extra-units-gate.om` (`OMEGA-GPU-EXTRA-UNITS`) checks the 22 units in `gpu/extra-units.tsv`.
+- `tests/gates/run.sh gpu-driver`, `gpu-runtime`, `gpu-checks`, and `gpu-amd-rest` run the corresponding Omega gates under `gpu/nvidia/driver/`, `gpu/runtime/`, `gpu/nvidia/checks/`, and `gpu/amd/rest/`.
+- `OMC=seed/out/omc sh gpu/spirv/check.sh` runs `spirv-val`, mutant and host-conform checks over `gpu/spirv/` (also run by `./uxl-run.sh`).
+
+Host results are never hardware qualification. A hardware result applies to a later revision only for the bytes that are still identical, and `card.tsv` says which bytes those are.

@@ -1,10 +1,10 @@
-# bridge/: Pure-Omega units (175 verified units)
+# bridge/: Pure-Omega units (176 verified units)
 
-This layer integrates **217 pure-Omega (`.om`) files** from **4 canonical Interplane repositories** with full Git history preserved under `bridge/import/<repo>/`.
+This layer integrates **217 pure-Omega (`.om`) files** from **4 canonical Interplane repositories** with full Git history preserved under `bridge/import/<repo>/`, plus `bridge/core/`.
 
 ## Unit table and gate
 
-[`bridge/units.tsv`](units.tsv) lists **175 units** (`NAME` followed by ordered `.om` parts, single spaces). [`bridge/units-gate.om`](units-gate.om) (`OMEGA-BRIDGE-UNITS`, mirroring `gpu/units-gate.om`) checks `seed/out/omc.sha256`, compiles every unit twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Every hardware row stays `NOT_RUN`.
+[`bridge/units.tsv`](units.tsv) lists **176 units** (`NAME` followed by ordered `.om` parts, single spaces), including `bridge_abi_ggml_test`. [`bridge/units-gate.om`](units-gate.om) (`OMEGA-BRIDGE-UNITS`, mirroring `gpu/units-gate.om`) checks `seed/out/omc.sha256`, compiles every unit twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Every hardware row stays `NOT_RUN`.
 
 Note: existing CUDApp compatibility slices (`bridge/cuda/`, `bridge/nvml/`, `bridge/shlib/`) retain their existing gates untouched; `bridge/units.tsv` covers the newly integrated pure-Omega units from `omega-bridge`, `omega-bridge-kit`, `ggml-omega`, and `babel`.
 

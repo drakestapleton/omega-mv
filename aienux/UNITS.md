@@ -16,11 +16,12 @@ One additional 1-line Omega directive file, `aienux/allen/target-x86efi.om` (`ta
 
 ## The units and their gate
 
-`aienux/units.tsv` lists **73 units** (`NAME` followed by ordered `.om` parts, single spaces):
+`aienux/units.tsv` lists **78 units** (`NAME` followed by ordered `.om` parts, single spaces):
 
 - 48 core Aienux units (`tcp_*` 4, `nvme_*` 4, `x86_*` 4, `lm1b` 1, `platform_unit` 1, `spark_image`/`imac_image`/`hwgates` 3, `allen_fw` `target x86efi` + `allen_main` + `allen_provider` + `allen_stdio_overflow` + 27 `allen_test_*` = 31)
 - 19 OS-layer sibling units from `rtl8127-omega` (`rtl8127_probe`, `rtl8127_driver`), `spark-supervisor` (`aien_supervise`, `aien_supervise_root`, `aien_watch`, `supervisor_tests_load`), and `spark-connector` (`connector_signer`, `connector_celldrv`, plus 11 standalone gate/runner units).
 - 6 converted pure-Omega OS-layer units (9 `.om` files): `atlas_main`/`atlas_test` (`aienux/atlas/`), `pi_register_main`/`pi_register_test` (`aienux/pi-register/`), and `debugger_main`/`debugger_test` (`aienux/debugger/`).
+- 5 converted pure-Omega kernel/security units: `capability_test` (`aienux/capability/`), `argus_test` (`aienux/argus/`), `kernel_core_test` (`aienux/kernel/core/`), `kernel_hal_test` (`aienux/kernel/hal/`), and `aegis_test` (`aienux/aegis/`).
 
 Remaining non-Omega files from the three OS sibling repos (64 files) are listed in `aienux/NOT-YET-OMEGA-EXTRAS.tsv`; their import records are under `aienux/import/{rtl8127-omega,spark-supervisor,spark-connector}/`.
 

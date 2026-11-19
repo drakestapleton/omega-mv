@@ -7,7 +7,7 @@ Two crumb files already under evidence/ stay, because existing evidence is never
 
 ## `aienux/`
 
-Aienux, the OS layer of Sovereign Intelligence (SI), mirroring `gpu/`: pure-Omega units moved here from canonical Aienux (`rad:z2Q6ob2gL6Qo5oUMpyehukayVF7mN`, `1f12818d`) plus its OS-layer siblings `rtl8127-omega`, `spark-supervisor`, and `spark-connector` with full Git history, and pure-Omega conversions of `atlas` (`aienux/atlas/`), `pi-register` (`aienux/pi-register/`), and `spark-debugger` (`aienux/debugger/`). `aienux/README.md` gives the layout and `aienux/UNITS.md` lists the 73 verified units.
+Aienux, the OS layer of Sovereign Intelligence (SI), mirroring `gpu/`: pure-Omega units moved here from canonical Aienux (`rad:z2Q6ob2gL6Qo5oUMpyehukayVF7mN`, `1f12818d`) plus its OS-layer siblings `rtl8127-omega`, `spark-supervisor`, and `spark-connector` with full Git history, and pure-Omega conversions of `atlas` (`aienux/atlas/`), `pi-register` (`aienux/pi-register/`), `spark-debugger` (`aienux/debugger/`), `capability`, `argus`, `kernel/core`, `kernel/hal`, and `aegis`. `aienux/README.md` gives the layout and `aienux/UNITS.md` lists the 78 verified units.
 
 Rules:
 
@@ -18,23 +18,23 @@ Rules:
 
 ## `apps/`
 
-User-facing Sovereign Intelligence applications, Forge, web generators and publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex` moved with full Git history under `apps/import/`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, and `aien-translate`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 127 units). Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
+User-facing Sovereign Intelligence applications, Forge, web generators and publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex` moved with full Git history under `apps/import/`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, `aien-translate`, `apps/core/`, and `apps/site_builder/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 129 units). Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
 
 ## `bridge/`
 
-Compatibility, conversion and ecosystem bindings of Sovereign Intelligence: existing CUDApp compatibility slices (`bridge/cuda/`, `bridge/nvml/`, `bridge/shlib/`) plus pure-Omega units moved with history from `omega-bridge`, `omega-bridge-kit`, `ggml-omega`, and `babel` (`bridge/import/`), gated by `bridge/units-gate.om` (`OMEGA-BRIDGE-UNITS`, 175 units). Remaining non-Omega files stay upstream (`bridge/NOT-YET-OMEGA.tsv`).
+Compatibility, conversion and ecosystem bindings of Sovereign Intelligence: existing CUDApp compatibility slices (`bridge/cuda/`, `bridge/nvml/`, `bridge/shlib/`) plus pure-Omega units moved with history from `omega-bridge`, `omega-bridge-kit`, `ggml-omega`, and `babel` (`bridge/import/`) and `bridge/core/`, gated by `bridge/units-gate.om` (`OMEGA-BRIDGE-UNITS`, 176 units). Remaining non-Omega files stay upstream (`bridge/NOT-YET-OMEGA.tsv`).
 
 ## `core/`
 
-Runtime, memory, recursive self-improvement, mission orchestration and agent core of Sovereign Intelligence (`aien-sovereign-core-mv`, `aien`, `cortex`, `spark-rsi-mv`, `omega-mission`, `hive-view` moved with full Git history under `core/import/`, plus pure-Omega conversions of `hive-not-swarm`, `spark-dream`, `spark-hive`, `mobhub`, `openclaw-rs`, and `aegis-runtime-mv`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `core/units-gate.om` (`OMEGA-CORE-UNITS`, 44 units). Remaining non-Omega files stay upstream (`core/NOT-YET-OMEGA.tsv`).
+Runtime, memory, recursive self-improvement, mission orchestration and agent core of Sovereign Intelligence (`aien-sovereign-core-mv`, `aien`, `cortex`, `spark-rsi-mv`, `omega-mission`, `hive-view` moved with full Git history under `core/import/`, plus pure-Omega conversions of `hive-not-swarm`, `spark-dream`, `spark-hive`, `mobhub`, `openclaw-rs`, and `aegis-runtime-mv`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `core/units-gate.om` (`OMEGA-CORE-UNITS`, 51 units). Remaining non-Omega files stay upstream (`core/NOT-YET-OMEGA.tsv`).
 
 ## `protocol/`
 
-Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp` moved with full Git history under `protocol/import/`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity`, and `synapse` under `protocol/synapse/core/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 23 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
+Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp` moved with full Git history under `protocol/import/`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity`, and `synapse` under `protocol/synapse/core/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 28 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
 
 ## `si/`
 
-Sovereign Intelligence front-door tools, architecture/benchmark/receipt checkers, Omega MCP server, harness examples, Rosetta corpus, editor fixtures and master integration ledger (`si/STACK.tsv`), mirroring `gpu/`: pure-Omega `.om` units only (`sovereign-intelligence`, `aien-architecture-mv`, `benchmarks-mv`, `aien-receipts`, `omega-mcp`, `omega-harness`, `omega-rosetta`, `tree-sitter-omega`, `vscode-omega`, `omega-packages` moved with full Git history under `si/import/`, plus pure-Omega conversions of `omega-seed-challenge`, `homebrew-omega`, `harvester`, `aien-harness`, `agent-archive`, and `spark-inquisitor`), gated by `si/units-gate.om` (`OMEGA-SI-UNITS`, 499 units). `si/directives/` holds shared 1-line `.om` directives (`om2.om`, `target-*.om`). Every public SI repository is classified in `si/STACK.tsv`, and remaining non-Omega upstream files are indexed in `si/NOT-YET-OMEGA.tsv`.
+Sovereign Intelligence front-door tools, architecture/benchmark/receipt checkers, Omega MCP server, harness examples, Rosetta corpus, editor fixtures and master integration ledger (`si/STACK.tsv`), mirroring `gpu/`: pure-Omega `.om` units only (`sovereign-intelligence`, `aien-architecture-mv`, `benchmarks-mv`, `aien-receipts`, `omega-mcp`, `omega-harness`, `omega-rosetta`, `tree-sitter-omega`, `vscode-omega`, `omega-packages` moved with full Git history under `si/import/`, plus pure-Omega conversions of `omega-seed-challenge`, `homebrew-omega`, `harvester`, `aien-harness`, `agent-archive`, and `spark-inquisitor`), gated by `si/units-gate.om` (`OMEGA-SI-UNITS`, 501 units). `si/directives/` holds shared 1-line `.om` directives (`om2.om`, `target-*.om`). Every public SI repository is classified in `si/STACK.tsv`, and remaining non-Omega upstream files are indexed in `si/NOT-YET-OMEGA.tsv`.
 
 ## `train/`
 
@@ -100,9 +100,13 @@ M21 OMEGA_AUTODIFF scope, op and error-contract table, status (not qualified)
 
 DUAL (ARCH-0031) documents in omega: applicability experiment method and findings (APPLICABILITY_EXPERIMENT.md). Experimental; no production gate.
 
+## `docs/baremetal/`
+
+DGX Spark bare-metal live-boot operator runbook (`SPARK-LIVE-BOOT.md`) covering unified `SPARK.EFI` build, offline `OMFWBND1` bundle packing, and fail-closed `BootNext` staging rules.
+
 ## `docs/gpu/`
 
-Clean-room GPU driver wire-format and bring-up references (`GSP_RPC_REGISTRY_REFERENCE.md`: GSP-RM RPCs, RM class/control IDs, registry table format, and GB20B compute bring-up stages). Documentation only; pure-Omega driver units live under `gpu/driver/`.
+Clean-room GPU driver wire-format, bring-up, and silicon benchmark references (`GSP_RPC_REGISTRY_REFERENCE.md`, `PI_DRIVE_27B_SPARK.md`, `Q38_27B_GB10_STRESS_20261119.md`). Documentation only; pure-Omega driver units live under `gpu/driver/`.
 
 ## `docs/reservoir/`
 
@@ -122,7 +126,7 @@ Immutable receipts of learner development runs (seeds 1..5 per level, HOLDOUT/TR
 
 ## `gpu/`
 
-Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047): one directory per back end (`gpu/amd/`, `gpu/nvidia/`, `gpu/spirv/`, `gpu/hw/`), moved here from CUDApp one piece per landing with the history of its Omega files (`gpu/units.tsv`, 405 units, `OMEGA-GPU-UNITS`), plus `gpu/driver/`, `gpu/cuda-crack/`, and pure-Omega conversions `gpu/adapters/`, `gpu/head-to-head/`, and `gpu/forge/` (gated separately by `gpu/extra-units.tsv` / `gpu/extra-units-gate.om`, 17 units, `OMEGA-GPU-EXTRA-UNITS`). `gpu/README.md` gives the layout.
+Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047): one directory per back end (`gpu/amd/`, `gpu/nvidia/`, `gpu/spirv/`, `gpu/hw/`), moved here from CUDApp one piece per landing with the history of its Omega files (`gpu/units.tsv`, 405 units, `OMEGA-GPU-UNITS`), plus `gpu/driver/`, `gpu/cuda-crack/`, and pure-Omega conversions `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, and `gpu/turing/` (gated separately by `gpu/extra-units.tsv` / `gpu/extra-units-gate.om`, 22 units, `OMEGA-GPU-EXTRA-UNITS`). `gpu/README.md` gives the layout.
 
 Rules:
 
@@ -524,6 +528,10 @@ Two unmodified CC-BY-4.0 files from the authors' Zenodo archive 10.5281/zenodo.1
 
 J1 parity driver for syn_codec.osc against the sealed Rust A1 corpus (aien-dev/synapse j1-codec-corpus), interp and native
 
+## `tools/codebook/`
+
+Signed 3-digit layered codebook (`codebook.om`, `main.om`, `codebook.tsv`, Lean 4 proof `proof/CodebookProof.lean`, tests and mutants) for `ocb2:` HMAC-SHA256 inbox authentication (T-002). See `tools/codebook/README.md`.
+
 ## `tools/dual_experiment/`
 
 Runner for the DUAL applicability experiment: runs the pre-registered campaign and writes results.csv, params.txt and results.md under evidence/DUAL/applicability/. make dual-applic-run.
@@ -531,6 +539,10 @@ Runner for the DUAL applicability experiment: runs the pre-registered campaign a
 ## `tools/reservoir/`
 
 Gate 2 tooling for the reservoir (omega#440): in-house zlib inflate and MAT v5 reader, the archived-reference comparison (res_qualify), benchmarks and timing (res_bench), and qualify_reservoir.sh, which writes the content-addressed receipt under evidence/RESERVOIR. No Python; reads the untrusted archive as data only.
+
+## `tools/trit/`
+
+Trinary Doctrine wake-signal tool (`trit`, T-002) in seeded OM-2 sharing `tools/codebook/codebook.om`, with Lean 4 legacy proof `proof/TritSignal.lean`, host/daily tests and mutants (`tests/gates/omega-trinary.gate`). See `tools/trit/README.md`.
 
 ## `seed/omc/tests/struct-bool/`
 

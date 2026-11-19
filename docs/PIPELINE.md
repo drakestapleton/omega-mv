@@ -1,5 +1,10 @@
 # Pull requests, Spark qualification and Alpha verification
 
+> **Note (2026-11-19):** Interplane (`https://interplane.io/drakestapleton/omega-mv`) is the canonical
+> forge (standing rule, 2026-11-11). The `aien-dev` GitHub organization is frozen history; GitHub
+> workflow and `aien-receipts` links below reflect the 2026-10-26 snapshot and are retained as historical
+> context alongside the Spark operator and `tests/gates/` rules that still govern local qualification.
+
 This runbook follows `.github/workflows/aien-verification.yml` and `AGENTS.md`.
 The retired signed-bundle-before-every-merge process is not the current contract.
 Source snapshot: `ec07d25d5506d33567adbd4d9b518177b7933bad` (2026-10-26).

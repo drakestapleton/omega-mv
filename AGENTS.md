@@ -8,9 +8,10 @@ Shared rules: read https://www.aienos.com/agents/RULES.md first. This file adds 
 
 - Applies to the whole repository.
 - `seed/`: the seeded compiler chain (rungs 0 to 4, `seed/omc/omc.om`, host checks in `seed/host/`). The language is specified in `docs/one_layer/OMEGESE.md`.
+- `gpu/`, `aienux/`, `apps/`, `bridge/`, `core/`, `protocol/`, `si/`, `train/`: pure-Omega Sovereign Intelligence layers built by `seed/out/omc`, each with its `README.md`, `UNITS.md`, `units.tsv` and `units-gate.om` (master ledger: `si/STACK.tsv`).
 - `om/`: Omega implementations behind C entry points (`om/sha256`, `om/blake3`), bound into the C build through the generated `src/omega_om_units.inc`.
 - `src/`: existing core and the C compiler awaiting replacement (`src/compiler/`), the reaction runtime (`src/runtime/`), the host-only fabric interface (`src/fabric/`), the Physics Zero apparatus (`src/physics0/`).
-- `spec/`, `docs/`: specifications. `tests/`: gate suites; `tests/gates/*.gate` are the manifests the DGX Spark judge runs. `tools/`: harnesses. `mk/`: make fragments included by the `Makefile`.
+- `spec/`, `docs/`: specifications. `tests/`: gate suites; `tests/gates/*.gate` are the manifests the DGX Spark judge runs. `tools/`: harnesses (including `tools/trit/`, `tools/codebook/`, `tools/uxl/`, invoked via `./uxl-run.sh` or `.\uxl-run.ps1`). `mk/`: make fragments included by the `Makefile`.
 - `bench/prime_race/`, `calibration/`, `research/`, `doctrine/`: benchmark, Turing calibration, experiments, the Milestone 4 doctrine.
 - `evidence/`: content-addressed receipts, additions only.
 - `docs/migration/C-TO-OM-INVENTORY.md` lists the C that remains to be replaced.
@@ -84,5 +85,8 @@ Gates whose manifest lists `gb10` under `requires:` (for example the `*-silicon`
 - `docs/ROADMAP-1.0.md`: the Omega 1.0 readiness audit, milestones RM1..RM11 and their acceptance gates (live status stays with aien-architecture).
 - `docs/migration/C-TO-OM-INVENTORY.md`: remaining C to replace.
 - `docs/PIPELINE.md`: how a pull request is tested on the Spark.
+- `docs/UXL.md`: one-command UXL verification (`./uxl-run.sh`, `.\uxl-run.ps1`).
+- `docs/A64-EFI.md`, `docs/SPIRV.md`, `docs/baremetal/SPARK-LIVE-BOOT.md`: AArch64 UEFI backend, SPIR-V OpenCL kernel emitter, and bare-metal Spark boot runbook.
+- `si/STACK.tsv`: master ledger of Sovereign Intelligence pure-Omega layers in this repository.
 - `CONTRIBUTORS.md`: who built what.
 - The kernel Omega is meant to run on, Aienux: https://interplane.io/drakestapleton/aienux

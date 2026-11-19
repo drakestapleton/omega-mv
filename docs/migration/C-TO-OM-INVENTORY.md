@@ -4,6 +4,8 @@ Snapshot: `aien-dev/omega-mv` main **d863780eb42bd940349eba61a3d1c78b0b819941**,
 
 Rechecked 2026-11-10 at main `a59a425b`: the totals below and the CSV are the 2026-10-24 snapshot and I have not re-triaged them per file. The tree now tracks **899 `.c` + 359 `.h` = 1,258** paths and **1,629 `.om`** (`git ls-files '*.c' | wc -l` and the same for `*.h`, `*.om`), so "no tracked `.om`" no longer holds. 568 of the `.c`/`.h` paths are under `src/` and 159 under `evidence/`. Subsystem rows changed only in two places: `src/` root files 195 -> 236, remaining families 78 -> 79 (`src/synapse` 1 is new). Every other row in the subsystem table matches today's count.
 
+Rechecked 2026-11-19 at main `100a9a914`: the tree now tracks **910 `.c` + 362 `.h` = 1,272** paths (568 under `src/` and 163 under `evidence/`) and **5,421 `.om`** paths (including the integrated pure-Omega Sovereign Intelligence layers `gpu/`, `aienux/`, `apps/`, `bridge/`, `core/`, `protocol/`, `si/`, and `train/`). The per-file role triage below remains the historical 2026-10-24 snapshot.
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage
