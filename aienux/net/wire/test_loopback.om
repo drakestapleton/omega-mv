@@ -1,0 +1,932 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/wire/test_loopback.om: Host loopback integration test for wire_loop.om + omtk.om + tcp.om.
+note Compose:
+note   { printf 'om2\n'; cat aienux/net/tcp/tcp.om aienux/net/wire/omtk.om aienux/net/wire/wire_loop.om aienux/net/wire/test_loopback.om; } | seed/out/omc > /tmp/test_loopback
+note Strictly host-only (NOT_RUN on Spark silicon).
+
+note Simulated hardware & peer state
+note sim_g: 0 cntvct, 1 cntfrq, 2 dsb_cnt, 3 kicks, 4 quar_cnt, 5 sem_ready,
+note        6 irq_rc (signed in sim_irq), 7 ver_rc (signed in sim_ver), 8 next_tok,
+note        9 stop_flag, 10 reset_kicks, 11 stage_cnt, 12 last_reset_keep, 13 reclaim_cnt,
+note        14 out_tok (poisoned to 0xFFFFFFFF on mode=0 MODE_PREFILL per Piece 5 #20)
+global sim_g ulong 16
+global sim_irq long 1
+global sim_ver long 1
+
+note Simulated NIC RX queue (Peer -> Spark): 4 slots of 2048 B
+global srx_buf uchar 8192
+global srx_len ulong 4
+global srx_hd ulong 1
+global srx_cnt ulong 1
+
+note Captured TCP payload bytes sent by Spark -> Peer (reassembled from Ttx frames)
+global cap_buf uchar 65536
+global cap_len ulong 1
+global cap_pos ulong 1
+
+note Peer TCP sequence tracking: 0 peer_seq, 1 peer_ack, 2 peer_port, 3 spark_isn, 4 fin_seen
+global peer_st ulong 8
+global pkt_tmp uchar 2048
+global app_tmp uchar 16400
+
+text Tpass "WIRE_LOOP_LOOPBACK PASS cases=18\n"
+text Tfail "WIRE_LOOP_LOOPBACK FAIL case="
+text Tnl "\n"
+global tnum uchar 32
+
+fn tput_num v ulong to void
+i = ulong 32
+while true bound 21
+i = sub i 1
+put tnum i uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+k = write 1 tnum i sub 32 i
+end
+
+fn tfail c ulong to void
+k = write 1 Tfail 0 len Tfail
+tput_num c
+k = write 1 Tnl 0 len Tnl
+exit int c
+end
+
+note ---- Seam implementations required by wire_loop.om ----
+fn wl_cntvct to ulong
+ret get sim_g 0
+end
+
+fn wl_cntfrq to ulong
+ret get sim_g 1
+end
+
+fn wl_dsb_ish to void
+put sim_g 2 add get sim_g 2 1
+end
+
+fn wl_nic_rx to ulong
+cnt = get srx_cnt 0
+if eq cnt 0
+ret 0
+end
+hd = get srx_hd 0
+n = get srx_len hd
+base = mul hd 2048
+i = ulong 0
+while lt i n bound 2048
+put Trx i get srx_buf add base i
+i = add i 1
+end
+put srx_hd 0 rem add hd 1 4
+put srx_cnt 0 sub cnt 1
+ret n
+end
+
+note Helper: read big-endian u16/u32 from Ttx
+fn tx_r16 off ulong to ulong
+a = ulong get Ttx off
+b = ulong get Ttx add off 1
+ret or shl a 8 b
+end
+
+fn tx_r32 off ulong to ulong
+a = tx_r16 off
+b = tx_r16 add off 2
+ret or shl a 16 b
+end
+
+fn tx_cap doff2 ulong dlen ulong to void
+cl = get cap_len 0
+i = ulong 0
+while lt i dlen bound 2048
+if lt add cl i 65536
+put cap_buf add cl i get Ttx add doff2 i
+end
+i = add i 1
+end
+put cap_len 0 add cl dlen
+end
+
+note Capture Spark -> Peer frames from Ttx: track SYN-ACK ISN, TCP payload bytes, and FIN.
+fn wl_nic_tx n ulong to long
+if lt n 54
+ret 0
+end
+if ne tx_r16 12 2048
+ret 0
+end
+if ne ulong get Ttx 23 6
+ret 0
+end
+tot = tx_r16 16
+ihl = mul and ulong get Ttx 14 15 4
+toff = add 14 ihl
+doff = mul shr ulong get Ttx add toff 12 4 4
+fl = ulong get Ttx add toff 13
+seq = tx_r32 add toff 4
+if ne and fl 2 0
+put peer_st 3 seq
+put peer_st 1 and add seq 1 4294967295
+end
+if ne and fl 1 0
+put peer_st 4 1
+end
+if gt tot add ihl doff
+dlen = sub tot add ihl doff
+tx_cap add toff doff dlen
+put peer_st 1 and add seq dlen 4294967295
+end
+ret 0
+end
+
+fn wl_nic_reclaim to void
+put sim_g 13 add get sim_g 13 1
+end
+
+fn wl_q38_reset_kv keep_pos ulong to long
+put sim_g 12 keep_pos
+if gt keep_pos 0
+ret -2
+end
+put sim_g 10 add get sim_g 10 1
+ret 128
+end
+
+fn wl_q38_stage_step tok_in uint kv_pos uint mode uchar to long
+put sim_g 11 add get sim_g 11 1
+if eq mode 0
+put sim_g 14 4294967295
+else
+t = get sim_g 8
+put sim_g 14 t
+put sim_g 8 add t 1
+end
+ret 256
+end
+
+fn wl_q38_verify_step to long
+ret get sim_ver 0
+end
+
+fn wl_q38_read_tok to uint
+ret uint get sim_g 14
+end
+
+fn wl_gpu_kick pb_words uint to long
+put sim_g 3 add get sim_g 3 1
+ret 0
+end
+
+fn wl_gpu_poll to long
+if eq get sim_g 5 0
+ret 0
+end
+ret 1
+end
+
+fn wl_gpu_irq_check to long
+ret get sim_irq 0
+end
+
+fn wl_gpu_quarantine to void
+put sim_g 4 add get sim_g 4 1
+end
+
+fn wl_should_stop to ulong
+ret get sim_g 9
+end
+
+note ---- Peer Ethernet/IPv4/TCP frame builder ----
+fn pw16 off ulong v ulong to void
+put pkt_tmp off uchar and shr v 8 255
+put pkt_tmp add off 1 uchar and v 255
+end
+
+fn pw32 off ulong v ulong to void
+pw16 off and shr v 16 65535
+pw16 add off 2 and v 65535
+end
+
+fn psum off ulong n ulong to ulong
+s = ulong 0
+while ge n 2 bound 1024
+a = ulong get pkt_tmp off
+b = ulong get pkt_tmp add off 1
+s = add s or shl a 8 b
+off = add off 2
+n = sub n 2
+end
+if eq n 1
+s = add s shl ulong get pkt_tmp off 8
+end
+ret s
+end
+
+fn pfold s ulong to ulong
+while gt s 65535 bound 8
+s = add and s 65535 shr s 16
+end
+ret xor s 65535
+end
+
+note Enqueue pkt_tmp[0..n) into Spark's NIC RX ring.
+fn penq n ulong to void
+cnt = get srx_cnt 0
+if ge cnt 4
+tfail 90
+end
+slot = rem add get srx_hd 0 cnt 4
+base = mul slot 2048
+i = ulong 0
+while lt i n bound 2048
+put srx_buf add base i get pkt_tmp i
+i = add i 1
+end
+put srx_len slot n
+put srx_cnt 0 add cnt 1
+end
+
+note Send one TCP segment from Peer (10.0.0.1:peer_port) to Spark (10.0.0.2:18100).
+note Payload bytes come from app_tmp[off..off+dlen).
+fn psend flags ulong off ulong dlen ulong to void
+note Dst MAC = Spark MAC (02:00:00:00:00:02), Src MAC = Peer MAC (02:00:00:00:00:01)
+put pkt_tmp 0 2
+put pkt_tmp 1 0
+put pkt_tmp 2 0
+put pkt_tmp 3 0
+put pkt_tmp 4 0
+put pkt_tmp 5 2
+put pkt_tmp 6 2
+put pkt_tmp 7 0
+put pkt_tmp 8 0
+put pkt_tmp 9 0
+put pkt_tmp 10 0
+put pkt_tmp 11 1
+pw16 12 2048
+note IPv4 header at 14..34
+tot = add 40 dlen
+put pkt_tmp 14 69
+put pkt_tmp 15 0
+pw16 16 tot
+pw16 18 1
+pw16 20 16384
+put pkt_tmp 22 64
+put pkt_tmp 23 6
+pw16 24 0
+pw32 26 167772161
+pw32 30 167772162
+pw16 24 pfold psum 14 20
+note TCP header at 34..54
+pw16 34 get peer_st 2
+pw16 36 18100
+seq = get peer_st 0
+pw32 38 seq
+pw32 42 get peer_st 1
+put pkt_tmp 46 80
+put pkt_tmp 47 uchar and flags 255
+pw16 48 65535
+pw16 50 0
+pw16 52 0
+i = ulong 0
+while lt i dlen bound 1500
+put pkt_tmp add 54 i get app_tmp add off i
+i = add i 1
+end
+tlen = add 20 dlen
+ps = ulong 5123
+ps = add ps add 6 tlen
+ps = add ps psum 34 tlen
+pw16 50 pfold ps
+if ne and flags 2 0
+put peer_st 0 and add seq 1 4294967295
+else
+put peer_st 0 and add seq dlen 4294967295
+end
+flen = add 54 dlen
+if lt flen 60
+j = flen
+while lt j 60 bound 60
+put pkt_tmp j 0
+j = add j 1
+end
+flen = 60
+end
+penq flen
+end
+
+note Send app_tmp[0..n) over TCP in <= 1024 B chunks, ticking wire_loop after each.
+fn psend_data n ulong to void
+off = ulong 0
+while lt off n bound 32
+ch = sub n off
+if gt ch 1024
+ch = 1024
+end
+psend 24 off ch
+wl_tick
+off = add off ch
+end
+end
+
+note Helper: write LE u16/u32 into app_tmp
+fn aw16 off ulong v ulong to void
+put app_tmp off uchar and v 255
+put app_tmp add off 1 uchar and shr v 8 255
+end
+
+fn aw32 off ulong v ulong to void
+put app_tmp off uchar and v 255
+put app_tmp add off 1 uchar and shr v 8 255
+put app_tmp add off 2 uchar and shr v 16 255
+put app_tmp add off 3 uchar and shr v 24 255
+end
+
+fn amkhdr op ulong flg ulong req ulong plen ulong to void
+aw32 0 OMK_MAGIC
+put app_tmp 4 uchar OMK_VER
+put app_tmp 5 uchar op
+aw16 6 flg
+aw32 8 req
+aw32 12 plen
+end
+
+note Helper: read LE u32 from cap_buf at cap_pos + off
+fn cr32 off ulong to ulong
+p = add get cap_pos 0 off
+a = ulong get cap_buf p
+b = ulong get cap_buf add p 1
+c = ulong get cap_buf add p 2
+d = ulong get cap_buf add p 3
+ret or or or a shl b 8 shl c 16 shl d 24
+end
+
+fn cr16 off ulong to ulong
+p = add get cap_pos 0 off
+a = ulong get cap_buf p
+b = ulong get cap_buf add p 1
+ret or a shl b 8
+end
+
+note Verify next captured OMTK frame has expected op, req_id, plen; advance cap_pos only via cap_adv.
+fn cap_avail to ulong
+ret sub get cap_len 0 get cap_pos 0
+end
+
+fn cap_chk op ulong req ulong plen ulong tc ulong to void
+if lt cap_avail add 16 plen
+tfail tc
+end
+if ne cr32 0 OMK_MAGIC
+tfail tc
+end
+p = get cap_pos 0
+if ne ulong get cap_buf add p 4 OMK_VER
+tfail tc
+end
+if ne ulong get cap_buf add p 5 op
+tfail tc
+end
+if ne cr32 8 req
+tfail tc
+end
+if ne cr32 12 plen
+tfail tc
+end
+end
+
+fn cap_adv n ulong to void
+put cap_pos 0 add get cap_pos 0 n
+end
+
+note Reset simulator + TCP + wire_loop and perform 3-way TCP handshake.
+fn setup_conn port ulong to void
+put sim_g 0 1000000000
+put sim_g 1 1000000000
+put sim_g 2 0
+put sim_g 3 0
+put sim_g 4 0
+put sim_g 5 1
+put sim_g 8 50
+put sim_g 9 0
+put sim_g 10 0
+put sim_g 11 0
+put sim_g 12 0
+put sim_g 13 0
+put sim_irq 0 0
+put sim_ver 0 0
+put srx_hd 0 0
+put srx_cnt 0 0
+put cap_len 0 0
+put cap_pos 0 0
+put peer_st 0 1000
+put peer_st 1 0
+put peer_st 2 port
+put peer_st 3 0
+put peer_st 4 0
+put Tmac 0 2
+put Tmac 1 0
+put Tmac 2 0
+put Tmac 3 0
+put Tmac 4 0
+put Tmac 5 2
+put Tcf 1 167772162
+put Tcf 2 167772161
+put Tcf 3 4294967040
+put Tcf 5 1234567
+tarpset 167772161 2199023255553 true
+wl_init 18100 262144 248320
+psend 2 0 0
+wl_tick
+psend 16 0 0
+wl_tick
+if ne get Tcb kST 4
+tfail 91
+end
+end
+
+note Advance simulated CNTVCT_EL0 by ms milliseconds (at 1 GHz = ms * 1000000).
+fn adv_ms ms ulong to void
+put sim_g 0 add get sim_g 0 mul ms 1000000
+end
+
+fn main to int
+note Case 1: Overflow-safe CNTVCT_EL0 -> ms conversion (5e18 ticks @ 1 GHz = 5e12 ms)
+put sim_g 0 5000000000000000000
+put sim_g 1 1000000000
+if ne wl_now_ms 5000000000000
+tfail 1
+end
+
+note Case 2: TCP handshake + PING -> PONG
+setup_conn 40001
+amkhdr OMK_PING 0 0 0
+psend_data 16
+wl_tick
+cap_chk OMK_PONG 0 16 2
+if ne cr32 16 WL_IDLE
+tfail 2
+end
+if ne cr32 20 0
+tfail 2
+end
+if ne cr32 24 262144
+tfail 2
+end
+cap_adv 32
+
+note Case 3: PREFILL (3 tokens) -> 3 GPU kicks + 3 dsb ish + DONE(kv=3, PREFILL_OK)
+amkhdr OMK_PREFILL 0 101 12
+aw32 16 10
+aw32 20 20
+aw32 24 30
+psend_data 28
+for s ulong 12
+wl_tick
+end
+cap_chk OMK_DONE 101 8 3
+if ne cr32 16 3
+tfail 3
+end
+if ne cr32 20 OMK_RPREF
+tfail 3
+end
+if ne get sim_g 3 3
+tfail 3
+end
+if ne get sim_g 2 3
+tfail 3
+end
+cap_adv 24
+
+note Case 4: DECODE (max=4, eos=52; final prefill produced first token 50 with HASFIRST=1,
+note then 2 GPU decode steps emit 51 and 52(EOS), final kv=5)
+if ne get wl_st WL_S_HASFIRST 1
+tfail 4
+end
+amkhdr OMK_DECODE 0 102 16
+aw32 16 4
+aw32 20 52
+aw32 24 0
+aw32 28 42
+psend_data 32
+for s ulong 12
+wl_tick
+end
+cap_chk OMK_TOKEN 102 8 4
+if ne cr32 16 0
+tfail 4
+end
+if ne cr32 20 50
+tfail 4
+end
+cap_adv 24
+cap_chk OMK_TOKEN 102 8 4
+if ne cr32 16 1
+tfail 4
+end
+if ne cr32 20 51
+tfail 4
+end
+cap_adv 24
+cap_chk OMK_TOKEN 102 8 4
+if ne cr16 6 OMK_FEOS
+tfail 4
+end
+if ne cr32 16 2
+tfail 4
+end
+if ne cr32 20 52
+tfail 4
+end
+cap_adv 24
+cap_chk OMK_DONE 102 8 4
+if ne cr32 16 5
+tfail 4
+end
+if ne cr32 20 OMK_REOS
+tfail 4
+end
+cap_adv 24
+
+note Case 5: RESET_KV(keep_pos=2) -> ERR(E_UNSUP), kv_pos stays 5, 0 extra kicks
+k_before = get sim_g 3
+amkhdr OMK_RESET 0 103 4
+aw32 16 2
+psend_data 20
+wl_tick
+cap_chk OMK_ERR 103 8 5
+if ne cr32 16 OMK_EUNSUP
+tfail 5
+end
+if ne get wl_st WL_S_KVPOS 5
+tfail 5
+end
+if ne get sim_g 3 k_before
+tfail 5
+end
+cap_adv 24
+
+note Case 6: RESET_KV(keep_pos=0) -> MUST wait for GPU semaphore before DONE(kv=0, RESET_OK)
+put sim_g 5 0
+amkhdr OMK_RESET 0 0 4
+aw32 16 0
+psend_data 20
+wl_tick
+wl_tick
+if ne cap_avail 0
+tfail 6
+end
+if ne get wl_st WL_S_STATE WL_WAIT
+tfail 6
+end
+if ne get sim_g 10 1
+tfail 6
+end
+put sim_g 5 1
+wl_tick
+cap_chk OMK_DONE 0 8 6
+if ne cr32 16 0
+tfail 6
+end
+if ne cr32 20 OMK_RRESET
+tfail 6
+end
+cap_adv 24
+
+note Case 7: CANCEL mid-DECODE while in WL_WAIT; PING still responds while waiting
+put wl_st WL_S_KVPOS 1
+put wl_st WL_S_LASTTOK 50
+put sim_g 5 0
+amkhdr OMK_DECODE 0 104 16
+aw32 16 10
+aw32 20 999
+aw32 24 0
+aw32 28 0
+psend_data 32
+wl_tick
+if ne get wl_st WL_S_STATE WL_WAIT
+tfail 7
+end
+amkhdr OMK_PING 0 105 0
+psend_data 16
+wl_tick
+cap_chk OMK_PONG 105 16 7
+if ne cr32 16 WL_WAIT
+tfail 7
+end
+cap_adv 32
+amkhdr OMK_CANCEL 0 104 0
+psend_data 16
+wl_tick
+put sim_g 5 1
+wl_tick
+cap_chk OMK_TOKEN 104 8 7
+cap_adv 24
+cap_chk OMK_DONE 104 8 7
+if ne cr32 20 OMK_RCANCEL
+tfail 7
+end
+cap_adv 24
+
+note Case 8: MAX_CTX overflow-safe refusal + E_BAD_TOK + temp_milli > 0 E_UNSUP
+put wl_st WL_S_KVPOS 262143
+k_b8 = get sim_g 3
+amkhdr OMK_PREFILL 0 106 8
+aw32 16 1
+aw32 20 2
+psend_data 24
+wl_tick
+cap_chk OMK_ERR 106 8 8
+if ne cr32 16 OMK_ERANGE
+tfail 8
+end
+cap_adv 24
+put wl_st WL_S_KVPOS 0
+amkhdr OMK_PREFILL 0 107 4
+aw32 16 248320
+psend_data 20
+wl_tick
+cap_chk OMK_ERR 107 8 8
+if ne cr32 16 OMK_EBADTOK
+tfail 8
+end
+cap_adv 24
+amkhdr OMK_DECODE 0 108 16
+aw32 16 4
+aw32 20 1
+aw32 24 700
+aw32 28 0
+psend_data 32
+wl_tick
+cap_chk OMK_ERR 108 8 8
+if ne cr32 16 OMK_EUNSUP
+tfail 8
+end
+if ne get sim_g 3 k_b8
+tfail 8
+end
+cap_adv 24
+
+note Case 9: Malformed frame (bad magic / reserved flag / >16384 payload) -> ERR + close
+aw32 0 12345
+put app_tmp 4 1
+put app_tmp 5 1
+aw16 6 0
+aw32 8 109
+aw32 12 0
+psend_data 16
+wl_tick
+cap_chk OMK_ERR 109 8 9
+if ne cr32 16 OMK_EBADMAG
+tfail 9
+end
+if eq get peer_st 4 0
+tfail 9
+end
+cap_adv 24
+
+note Case 10: 30s idle timeout -> tdrop + re-arm tlisten(18100)
+setup_conn 40002
+d0 = get wl_st WL_S_DROPS
+adv_ms 29999
+wl_tick
+if ne get wl_st WL_S_DROPS d0
+tfail 10
+end
+adv_ms 2
+wl_tick
+if ne get wl_st WL_S_DROPS add d0 1
+tfail 10
+end
+if ne get Tcb kST 1
+tfail 10
+end
+
+note Case 11: Trap #13 guard (q38_verify_step returns -1) -> NO TOKEN, quarantine, ERR(E_GPU_VERIFY), FAULT
+setup_conn 40003
+put wl_st WL_S_KVPOS 1
+put wl_st WL_S_LASTTOK 50
+put sim_ver 0 -1
+amkhdr OMK_DECODE 0 110 16
+aw32 16 2
+aw32 20 999
+aw32 24 0
+aw32 28 0
+psend_data 32
+for s ulong 6
+wl_tick
+end
+cap_chk OMK_ERR 110 8 11
+if ne cr32 16 OMK_EGVER
+tfail 11
+end
+if ne get sim_g 4 1
+tfail 11
+end
+if ne get wl_st WL_S_STATE WL_FAULT
+tfail 11
+end
+cap_adv 24
+amkhdr OMK_PREFILL 0 111 4
+aw32 16 5
+psend_data 20
+wl_tick
+cap_chk OMK_ERR 111 8 11
+if ne cr32 16 OMK_EFAULT
+tfail 11
+end
+cap_adv 24
+
+note Case 12: GSP HALT (iqservice returns -13) during WL_WAIT -> quarantine + ERR(E_GPU_HALT, 13) + FAULT
+setup_conn 40004
+put wl_st WL_S_KVPOS 1
+put wl_st WL_S_LASTTOK 50
+put sim_g 5 0
+amkhdr OMK_DECODE 0 112 16
+aw32 16 2
+aw32 20 999
+aw32 24 0
+aw32 28 0
+psend_data 32
+wl_tick
+put sim_irq 0 -13
+wl_tick
+cap_chk OMK_ERR 112 8 12
+if ne cr32 16 OMK_EGHALT
+tfail 12
+end
+if ne cr32 20 13
+tfail 12
+end
+if ne get sim_g 4 1
+tfail 12
+end
+if ne get wl_st WL_S_STATE WL_FAULT
+tfail 12
+end
+cap_adv 24
+
+note Case 13: Truncated TCP frame split across 2 segments + wl_run nested bound entry
+setup_conn 40005
+amkhdr OMK_PREFILL 0 113 8
+aw32 16 7
+aw32 20 8
+psend 24 0 10
+wl_tick
+if ne cap_avail 0
+tfail 13
+end
+if ne get sim_g 3 0
+tfail 13
+end
+psend 24 10 14
+for s ulong 8
+wl_tick
+end
+cap_chk OMK_DONE 113 8 13
+if ne cr32 16 2
+tfail 13
+end
+cap_adv 24
+put sim_g 9 1
+wl_run
+
+note Case 14: Reserved flag bit (flags=4 -> E_BAD_FLAGS) and oversize payload (16388 -> E_TOO_BIG)
+setup_conn 40006
+amkhdr OMK_PING 4 114 0
+psend_data 16
+wl_tick
+cap_chk OMK_ERR 114 8 14
+if ne cr32 16 OMK_EBADFLG
+tfail 14
+end
+cap_adv 24
+setup_conn 40007
+aw32 0 OMK_MAGIC
+put app_tmp 4 uchar OMK_VER
+put app_tmp 5 uchar OMK_PREFILL
+aw16 6 0
+aw32 8 115
+aw32 12 16388
+psend_data 16
+wl_tick
+cap_chk OMK_ERR 115 8 14
+if ne cr32 16 OMK_ETOOBIG
+tfail 14
+end
+cap_adv 24
+
+note Case 15: Disconnect during WL_WAIT -> defer tlisten until GPU drains, zero frame leak to next peer
+setup_conn 40008
+put wl_st WL_S_KVPOS 1
+put wl_st WL_S_LASTTOK 50
+put sim_g 5 0
+amkhdr OMK_DECODE 0 116 16
+aw32 16 4
+aw32 20 999
+aw32 24 0
+aw32 28 0
+psend_data 32
+wl_tick
+if ne get wl_st WL_S_STATE WL_WAIT
+tfail 15
+end
+tdrop 0
+wl_tick
+if ne get Tcb kST 0
+tfail 15
+end
+if ne get wl_st WL_S_REARM 1
+tfail 15
+end
+put sim_g 5 1
+wl_tick
+wl_tick
+if ne cap_avail 0
+tfail 15
+end
+if ne get wl_st WL_S_STATE WL_IDLE
+tfail 15
+end
+if ne get wl_st WL_S_REARM 0
+tfail 15
+end
+if ne get Tcb kST 1
+tfail 15
+end
+if ne get wl_st WL_S_CANCEL 0
+tfail 15
+end
+
+note Case 16: wl_txq backpressure -> stay in WL_SUBMIT while < 64 B free, kick once space freed
+setup_conn 40009
+k_b16 = get sim_g 3
+amkhdr OMK_PREFILL 0 117 4
+aw32 16 7
+psend 24 0 20
+n16 = wl_nic_rx
+tinput n16
+wl_pump_tcp wl_now_ms
+if ne get wl_st WL_S_STATE WL_SUBMIT
+tfail 16
+end
+put wl_st WL_S_TXN 4060
+wl_gpu_submit wl_now_ms
+if ne get sim_g 3 k_b16
+tfail 16
+end
+if ne get wl_st WL_S_STATE WL_SUBMIT
+tfail 16
+end
+put wl_st WL_S_TXN 0
+put wl_st WL_S_TXH 0
+for s ulong 6
+wl_tick
+end
+cap_chk OMK_DONE 117 8 16
+if ne cr32 16 1
+tfail 16
+end
+cap_adv 24
+
+note Case 17: RESET_KV(keep > kv_pos) -> ERR(OMK_ERANGE) before calling q38_reset_kv
+put wl_st WL_S_KVPOS 2
+put sim_g 12 0
+amkhdr OMK_RESET 0 118 4
+aw32 16 5
+psend_data 20
+wl_tick
+cap_chk OMK_ERR 118 8 17
+if ne cr32 16 OMK_ERANGE
+tfail 17
+end
+if ne get sim_g 12 0
+tfail 17
+end
+cap_adv 24
+
+note Case 18: Empty-KV DECODE refusal -> ERR(OMK_ERANGE), 0 GPU kicks
+setup_conn 40010
+k_b18 = get sim_g 3
+amkhdr OMK_DECODE 0 119 16
+aw32 16 4
+aw32 20 99
+aw32 24 0
+aw32 28 0
+psend_data 32
+wl_tick
+cap_chk OMK_ERR 119 8 18
+if ne cr32 16 OMK_ERANGE
+tfail 18
+end
+if ne get sim_g 3 k_b18
+tfail 18
+end
+cap_adv 24
+
+k = write 1 Tpass 0 len Tpass
+ret 0
+end
