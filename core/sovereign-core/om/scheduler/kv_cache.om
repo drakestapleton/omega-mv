@@ -1,0 +1,653 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/scheduler/kv_cache.om
+note Pure OM-2 conversion of aien-sovereign-core-mv/crates/aien-kv-cache/src/lib.rs.
+note Physical paged KV-cache layout math, IEEE-754 BF16 round-to-nearest-even conversion,
+note reference-counted copy-on-write (CoW) block allocator, and transactional rollback.
+
+const KV_DTYPE_FP4 ulong 0
+const KV_DTYPE_FP8 ulong 1
+const KV_DTYPE_BF16 ulong 2
+const KV_DTYPE_FP16 ulong 3
+const KV_DTYPE_FP32 ulong 4
+
+const KV_OK ulong 0
+const KV_ERR_INVALID_DTYPE ulong 1
+const KV_ERR_OOM ulong 2
+const KV_ERR_NOT_FOUND ulong 3
+const KV_ERR_DUPLICATE_SEQ ulong 4
+const KV_ERR_TABLE_FULL ulong 5
+const KV_ERR_SEQ_BLOCKS_FULL ulong 6
+const KV_ERR_OUT_OF_RANGE ulong 7
+const KV_ERR_INVALID_CFG ulong 8
+
+const KV_MAX_BLOCKS ulong 256
+const KV_MAX_SEQS ulong 64
+const KV_MAX_SEQ_BLOCKS ulong 32
+const KV_SEQ_BLOCKS_TOTAL ulong 2048
+const KV_INVALID_IDX ulong 18446744073709551615
+
+note Canonical physical KV layout descriptor (mirrors KvLayout / KvLayoutDesc).
+struct KvLayout block_stride ulong layer_stride ulong kv_plane_stride ulong token_stride ulong head_stride ulong elem_bytes ulong total_bytes ulong num_blocks ulong num_layers ulong block_size ulong num_kv_heads ulong head_dim ulong valid ulong end
+
+note Result of kv_append_token: status, allocated/updated block_id, token slot, and whether CoW occurred.
+struct KvAppendRes status ulong block_id ulong slot ulong was_cow ulong end
+
+note Global KV manager metadata:
+note [0]=total_blocks, [1]=block_size, [2]=free_top, [3]=active_seqs, [4]=cow_faults, [5]=block_bytes, [6]=tx_active
+global kv_meta ulong 8
+
+note Physical block table (0..KV_MAX_BLOCKS-1)
+global kv_free_stack ulong 256
+global kv_blk_ref ulong 256
+global kv_blk_tokens ulong 256
+global kv_blk_shared ulong 256
+
+note Sequence block table slots (0..KV_MAX_SEQS-1)
+global kv_seq_used ulong 64
+global kv_seq_id ulong 64
+global kv_seq_nblks ulong 64
+global kv_seq_total_toks ulong 64
+global kv_seq_blks ulong 2048
+
+note Transactional snapshot arrays (mirrors KvTransactionSnapshot)
+global kv_snap_meta ulong 8
+global kv_snap_free ulong 256
+global kv_snap_ref ulong 256
+global kv_snap_tokens ulong 256
+global kv_snap_shared ulong 256
+global kv_snap_seq_used ulong 64
+global kv_snap_seq_id ulong 64
+global kv_snap_seq_nblks ulong 64
+global kv_snap_seq_total_toks ulong 64
+global kv_snap_seq_blks ulong 2048
+
+note Exact IEEE-754 f32 -> bfloat16 round-to-nearest-even (mirrors f32_to_bf16_bits).
+fn kv_f32_to_bf16 val f32 to ushort
+u = bitcast uint val
+lsb = and shr u uint 16 uint 1
+bias = add uint 0x7fff lsb
+rounded = add u bias
+ret ushort shr rounded uint 16
+end
+
+note Exact bfloat16 -> IEEE-754 f32 (mirrors bf16_bits_to_f32).
+fn kv_bf16_to_f32 bits ushort to f32
+u = shl uint bits uint 16
+ret bitcast f32 u
+end
+
+note Compute canonical KvLayout from model dimensions and dtype.
+note Refuses FP4 (sub-byte packed layout) and zero dimensions by setting valid=0.
+fn kv_layout_from_cfg lay edit KvLayout num_blocks ulong block_size ulong num_layers ulong num_kv_heads ulong head_dim ulong to ulong
+put lay valid 0
+if eq num_blocks 0
+ret KV_ERR_INVALID_CFG
+end
+if eq block_size 0
+ret KV_ERR_INVALID_CFG
+end
+if eq num_layers 0
+ret KV_ERR_INVALID_CFG
+end
+if eq num_kv_heads 0
+ret KV_ERR_INVALID_CFG
+end
+if eq head_dim 0
+ret KV_ERR_INVALID_CFG
+end
+eb = get lay elem_bytes
+if eq eb 0
+ret KV_ERR_INVALID_DTYPE
+end
+head_stride = mul head_dim eb
+token_stride = mul num_kv_heads head_stride
+kv_plane = mul block_size token_stride
+layer_stride = mul ulong 2 kv_plane
+block_stride = mul num_layers layer_stride
+total_b = mul num_blocks block_stride
+put lay head_stride head_stride
+put lay token_stride token_stride
+put lay kv_plane_stride kv_plane
+put lay layer_stride layer_stride
+put lay block_stride block_stride
+put lay total_bytes total_b
+put lay num_blocks num_blocks
+put lay num_layers num_layers
+put lay block_size block_size
+put lay num_kv_heads num_kv_heads
+put lay head_dim head_dim
+put lay valid 1
+ret KV_OK
+end
+
+note Set dtype element byte width before calling kv_layout_from_cfg.
+fn kv_layout_set_dtype lay edit KvLayout dtype ulong to ulong
+if eq dtype KV_DTYPE_FP4
+put lay elem_bytes 0
+put lay valid 0
+ret KV_ERR_INVALID_DTYPE
+end
+if eq dtype KV_DTYPE_FP8
+put lay elem_bytes 1
+ret KV_OK
+end
+if or eq dtype KV_DTYPE_BF16 eq dtype KV_DTYPE_FP16
+put lay elem_bytes 2
+ret KV_OK
+end
+if eq dtype KV_DTYPE_FP32
+put lay elem_bytes 4
+ret KV_OK
+end
+put lay elem_bytes 0
+put lay valid 0
+ret KV_ERR_INVALID_DTYPE
+end
+
+note Compute byte offset of a single K/V element; returns KV_INVALID_IDX on out-of-range.
+fn kv_layout_elem_offset lay view KvLayout blk ulong layer ulong is_val ulong tok ulong head ulong to ulong
+if eq get lay valid 0
+ret KV_INVALID_IDX
+end
+if ge blk get lay num_blocks
+ret KV_INVALID_IDX
+end
+if ge layer get lay num_layers
+ret KV_INVALID_IDX
+end
+if gt is_val 1
+ret KV_INVALID_IDX
+end
+if ge tok get lay block_size
+ret KV_INVALID_IDX
+end
+if ge head get lay num_kv_heads
+ret KV_INVALID_IDX
+end
+off = mul blk get lay block_stride
+off = add off mul layer get lay layer_stride
+off = add off mul is_val get lay kv_plane_stride
+off = add off mul tok get lay token_stride
+off = add off mul head get lay head_stride
+ret off
+end
+
+note Add dimension offset inside a head vector; returns KV_INVALID_IDX on out-of-range.
+fn kv_layout_dim_offset lay view KvLayout base_off ulong dim ulong to ulong
+if or eq base_off KV_INVALID_IDX ge dim get lay head_dim
+ret KV_INVALID_IDX
+end
+ret add base_off mul dim get lay elem_bytes
+end
+
+note Compute byte offset of a physical block; returns KV_INVALID_IDX on out-of-range.
+fn kv_layout_block_offset lay view KvLayout blk ulong to ulong
+if or eq get lay valid 0 ge blk get lay num_blocks
+ret KV_INVALID_IDX
+end
+ret mul blk get lay block_stride
+end
+
+note Initialize the global KV-cache manager with total_blocks (<= KV_MAX_BLOCKS), block_size (> 0), and block_bytes.
+fn kv_init total_blocks ulong block_size ulong block_bytes ulong to ulong
+if or eq total_blocks 0 or gt total_blocks KV_MAX_BLOCKS eq block_size 0
+ret KV_ERR_INVALID_CFG
+end
+for i ulong 8
+put kv_meta i 0
+end
+put kv_meta 0 total_blocks
+put kv_meta 1 block_size
+put kv_meta 2 total_blocks
+put kv_meta 5 block_bytes
+for i ulong KV_MAX_BLOCKS
+put kv_blk_ref i 0
+put kv_blk_tokens i 0
+put kv_blk_shared i 0
+put kv_free_stack i 0
+end
+note Push block IDs in reverse (total_blocks-1 .. 0) so pop yields 0, 1, 2... (matches Rust AienKvManager::new).
+for i ulong total_blocks bound 256
+put kv_free_stack i sub sub total_blocks 1 i
+end
+for i ulong KV_MAX_SEQS
+put kv_seq_used i 0
+put kv_seq_id i 0
+put kv_seq_nblks i 0
+put kv_seq_total_toks i 0
+end
+for i ulong KV_SEQ_BLOCKS_TOTAL
+put kv_seq_blks i 0
+end
+ret KV_OK
+end
+
+fn kv_total_blocks to ulong
+ret get kv_meta 0
+end
+
+fn kv_block_size to ulong
+ret get kv_meta 1
+end
+
+fn kv_available_blocks to ulong
+ret get kv_meta 2
+end
+
+fn kv_allocated_blocks to ulong
+ret sub get kv_meta 0 get kv_meta 2
+end
+
+fn kv_active_seqs to ulong
+ret get kv_meta 3
+end
+
+fn kv_cow_faults to ulong
+ret get kv_meta 4
+end
+
+fn kv_blk_get_ref blk ulong to ulong
+if ge blk get kv_meta 0
+ret 0
+end
+ret get kv_blk_ref blk
+end
+
+fn kv_blk_get_tokens blk ulong to ulong
+if ge blk get kv_meta 0
+ret 0
+end
+ret get kv_blk_tokens blk
+end
+
+fn kv_blk_is_shared blk ulong to bool
+if ge blk get kv_meta 0
+ret false
+end
+ret ne get kv_blk_shared blk 0
+end
+
+note Find slot index for seq_id, or KV_INVALID_IDX if not present.
+fn kv_find_seq seq_id ulong to ulong
+for i ulong KV_MAX_SEQS
+if ne get kv_seq_used i 0
+if eq get kv_seq_id i seq_id
+ret i
+end
+end
+end
+ret KV_INVALID_IDX
+end
+
+note Find an unused sequence table slot, or KV_INVALID_IDX if full.
+fn kv_find_free_seq_slot to ulong
+for i ulong KV_MAX_SEQS
+if eq get kv_seq_used i 0
+ret i
+end
+end
+ret KV_INVALID_IDX
+end
+
+fn kv_has_sequence seq_id ulong to bool
+ret ne kv_find_seq seq_id KV_INVALID_IDX
+end
+
+fn kv_seq_block_count seq_id ulong to ulong
+slot = kv_find_seq seq_id
+if eq slot KV_INVALID_IDX
+ret 0
+end
+ret get kv_seq_nblks slot
+end
+
+fn kv_seq_token_count seq_id ulong to ulong
+slot = kv_find_seq seq_id
+if eq slot KV_INVALID_IDX
+ret 0
+end
+ret get kv_seq_total_toks slot
+end
+
+fn kv_seq_block_at seq_id ulong idx ulong to ulong
+slot = kv_find_seq seq_id
+if eq slot KV_INVALID_IDX
+ret KV_INVALID_IDX
+end
+if ge idx get kv_seq_nblks slot
+ret KV_INVALID_IDX
+end
+ret get kv_seq_blks add mul slot KV_MAX_SEQ_BLOCKS idx
+end
+
+note Allocate a single physical block from the free stack; returns KV_INVALID_IDX on OOM.
+fn kv_alloc_block to ulong
+top = get kv_meta 2
+if eq top 0
+ret KV_INVALID_IDX
+end
+ntop = sub top 1
+put kv_meta 2 ntop
+blk = get kv_free_stack ntop
+put kv_blk_ref blk 1
+put kv_blk_tokens blk 0
+put kv_blk_shared blk 0
+ret blk
+end
+
+note Allocate blocks for a new sequence with num_tokens prompt tokens.
+note Checks capacity up front so OOM never leaks partial blocks.
+fn kv_allocate_sequence seq_id ulong num_tokens ulong to ulong
+if ne kv_find_seq seq_id KV_INVALID_IDX
+ret KV_ERR_DUPLICATE_SEQ
+end
+slot = kv_find_free_seq_slot
+if eq slot KV_INVALID_IDX
+ret KV_ERR_TABLE_FULL
+end
+bsize = get kv_meta 1
+needed = ulong 0
+if gt num_tokens 0
+needed = div add num_tokens sub bsize 1 bsize
+end
+if gt needed KV_MAX_SEQ_BLOCKS
+ret KV_ERR_SEQ_BLOCKS_FULL
+end
+if lt get kv_meta 2 needed
+ret KV_ERR_OOM
+end
+base = mul slot KV_MAX_SEQ_BLOCKS
+rem_toks = num_tokens
+for i ulong needed bound 32
+blk = kv_alloc_block
+if eq blk KV_INVALID_IDX
+ret KV_ERR_OOM
+end
+take = rem_toks
+if gt take bsize
+take = bsize
+end
+put kv_blk_tokens blk take
+rem_toks = sub rem_toks take
+put kv_seq_blks add base i blk
+end
+put kv_seq_used slot 1
+put kv_seq_id slot seq_id
+put kv_seq_nblks slot needed
+put kv_seq_total_toks slot num_tokens
+put kv_meta 3 add get kv_meta 3 1
+ret KV_OK
+end
+
+note Zero-copy copy-on-write fork: shares parent's physical blocks and increments ref_count.
+fn kv_fork_seq parent_id ulong child_id ulong to ulong
+pslot = kv_find_seq parent_id
+if eq pslot KV_INVALID_IDX
+ret KV_ERR_NOT_FOUND
+end
+if ne kv_find_seq child_id KV_INVALID_IDX
+ret KV_ERR_DUPLICATE_SEQ
+end
+cslot = kv_find_free_seq_slot
+if eq cslot KV_INVALID_IDX
+ret KV_ERR_TABLE_FULL
+end
+nblks = get kv_seq_nblks pslot
+pbase = mul pslot KV_MAX_SEQ_BLOCKS
+cbase = mul cslot KV_MAX_SEQ_BLOCKS
+for i ulong nblks bound 32
+blk = get kv_seq_blks add pbase i
+put kv_blk_ref blk add get kv_blk_ref blk 1
+put kv_blk_shared blk 1
+put kv_seq_blks add cbase i blk
+end
+put kv_seq_used cslot 1
+put kv_seq_id cslot child_id
+put kv_seq_nblks cslot nblks
+put kv_seq_total_toks cslot get kv_seq_total_toks pslot
+put kv_meta 3 add get kv_meta 3 1
+ret KV_OK
+end
+
+note Append one token to seq_id, performing copy-on-write if the tail block is shared and not full.
+fn kv_append_token seq_id ulong res edit KvAppendRes to ulong
+put res status KV_ERR_NOT_FOUND
+put res block_id KV_INVALID_IDX
+put res slot 0
+put res was_cow 0
+sslot = kv_find_seq seq_id
+if eq sslot KV_INVALID_IDX
+ret KV_ERR_NOT_FOUND
+end
+bsize = get kv_meta 1
+nblks = get kv_seq_nblks sslot
+base = mul sslot KV_MAX_SEQ_BLOCKS
+if eq nblks 0
+nblk = kv_alloc_block
+if eq nblk KV_INVALID_IDX
+put res status KV_ERR_OOM
+ret KV_ERR_OOM
+end
+put kv_seq_blks base nblk
+put kv_seq_nblks sslot 1
+put kv_seq_total_toks sslot 1
+put kv_blk_tokens nblk 1
+put res status KV_OK
+put res block_id nblk
+put res slot 0
+ret KV_OK
+end
+last_idx = sub nblks 1
+last_blk = get kv_seq_blks add base last_idx
+ntoks = get kv_blk_tokens last_blk
+shared = get kv_blk_shared last_blk
+if ne shared 0
+if lt ntoks bsize
+nblk = kv_alloc_block
+if eq nblk KV_INVALID_IDX
+put res status KV_ERR_OOM
+ret KV_ERR_OOM
+end
+put kv_meta 4 add get kv_meta 4 1
+oref = sub get kv_blk_ref last_blk 1
+put kv_blk_ref last_blk oref
+if eq oref 1
+put kv_blk_shared last_blk 0
+end
+put kv_blk_tokens nblk add ntoks 1
+put kv_blk_shared nblk 0
+put kv_seq_blks add base last_idx nblk
+put kv_seq_total_toks sslot add get kv_seq_total_toks sslot 1
+put res status KV_OK
+put res block_id nblk
+put res slot ntoks
+put res was_cow 1
+ret KV_OK
+end
+if ge nblks KV_MAX_SEQ_BLOCKS
+put res status KV_ERR_SEQ_BLOCKS_FULL
+ret KV_ERR_SEQ_BLOCKS_FULL
+end
+nblk = kv_alloc_block
+if eq nblk KV_INVALID_IDX
+put res status KV_ERR_OOM
+ret KV_ERR_OOM
+end
+put kv_seq_blks add base nblks nblk
+put kv_seq_nblks sslot add nblks 1
+put kv_seq_total_toks sslot add get kv_seq_total_toks sslot 1
+put kv_blk_tokens nblk 1
+put kv_blk_shared nblk 0
+put res status KV_OK
+put res block_id nblk
+put res slot 0
+ret KV_OK
+end
+if lt ntoks bsize
+put kv_blk_tokens last_blk add ntoks 1
+put kv_seq_total_toks sslot add get kv_seq_total_toks sslot 1
+put res status KV_OK
+put res block_id last_blk
+put res slot ntoks
+ret KV_OK
+end
+if ge nblks KV_MAX_SEQ_BLOCKS
+put res status KV_ERR_SEQ_BLOCKS_FULL
+ret KV_ERR_SEQ_BLOCKS_FULL
+end
+nblk = kv_alloc_block
+if eq nblk KV_INVALID_IDX
+put res status KV_ERR_OOM
+ret KV_ERR_OOM
+end
+put kv_seq_blks add base nblks nblk
+put kv_seq_nblks sslot add nblks 1
+put kv_seq_total_toks sslot add get kv_seq_total_toks sslot 1
+put kv_blk_tokens nblk 1
+put res status KV_OK
+put res block_id nblk
+put res slot 0
+ret KV_OK
+end
+
+note Free a sequence and decrement ref_count on its physical blocks, returning 0-ref blocks to free stack.
+fn kv_free_sequence seq_id ulong to ulong
+sslot = kv_find_seq seq_id
+if eq sslot KV_INVALID_IDX
+ret KV_ERR_NOT_FOUND
+end
+nblks = get kv_seq_nblks sslot
+base = mul sslot KV_MAX_SEQ_BLOCKS
+for i ulong nblks bound 32
+blk = get kv_seq_blks add base i
+rc = get kv_blk_ref blk
+if gt rc 0
+nrc = sub rc 1
+put kv_blk_ref blk nrc
+if eq nrc 0
+put kv_blk_shared blk 0
+put kv_blk_tokens blk 0
+top = get kv_meta 2
+put kv_free_stack top blk
+put kv_meta 2 add top 1
+else
+if eq nrc 1
+put kv_blk_shared blk 0
+end
+end
+end
+put kv_seq_blks add base i 0
+end
+put kv_seq_used sslot 0
+put kv_seq_id sslot 0
+put kv_seq_nblks sslot 0
+put kv_seq_total_toks sslot 0
+put kv_meta 3 sub get kv_meta 3 1
+ret KV_OK
+end
+
+note Snapshot full KV state for transactional token reservation (mirrors begin_transaction).
+fn kv_begin_tx to void
+for i ulong 8
+put kv_snap_meta i get kv_meta i
+end
+for i ulong KV_MAX_BLOCKS
+put kv_snap_free i get kv_free_stack i
+put kv_snap_ref i get kv_blk_ref i
+put kv_snap_tokens i get kv_blk_tokens i
+put kv_snap_shared i get kv_blk_shared i
+end
+for i ulong KV_MAX_SEQS
+put kv_snap_seq_used i get kv_seq_used i
+put kv_snap_seq_id i get kv_seq_id i
+put kv_snap_seq_nblks i get kv_seq_nblks i
+put kv_snap_seq_total_toks i get kv_seq_total_toks i
+end
+for i ulong KV_SEQ_BLOCKS_TOTAL
+put kv_snap_seq_blks i get kv_seq_blks i
+end
+put kv_meta 6 1
+end
+
+fn kv_commit_tx to void
+put kv_meta 6 0
+end
+
+note Roll back KV state to the active snapshot (mirrors rollback_transaction).
+fn kv_rollback_tx to void
+if eq get kv_meta 6 0
+ret
+end
+for i ulong 8
+put kv_meta i get kv_snap_meta i
+end
+for i ulong KV_MAX_BLOCKS
+put kv_free_stack i get kv_snap_free i
+put kv_blk_ref i get kv_snap_ref i
+put kv_blk_tokens i get kv_snap_tokens i
+put kv_blk_shared i get kv_snap_shared i
+end
+for i ulong KV_MAX_SEQS
+put kv_seq_used i get kv_snap_seq_used i
+put kv_seq_id i get kv_snap_seq_id i
+put kv_seq_nblks i get kv_snap_seq_nblks i
+put kv_seq_total_toks i get kv_snap_seq_total_toks i
+end
+for i ulong KV_SEQ_BLOCKS_TOTAL
+put kv_seq_blks i get kv_snap_seq_blks i
+end
+put kv_meta 6 0
+end
+
+note Metrics queries mirroring KvMetrics.
+fn kv_metrics_physical_pages to ulong
+tot = get kv_meta 0
+cnt = ulong 0
+for i ulong tot bound 256
+if gt get kv_blk_ref i 0
+cnt = add cnt 1
+end
+end
+ret cnt
+end
+
+fn kv_metrics_logical_pages to ulong
+cnt = ulong 0
+for i ulong KV_MAX_SEQS
+if ne get kv_seq_used i 0
+cnt = add cnt get kv_seq_nblks i
+end
+end
+ret cnt
+end
+
+fn kv_metrics_shared_pages to ulong
+tot = get kv_meta 0
+cnt = ulong 0
+for i ulong tot bound 256
+if gt get kv_blk_ref i 1
+cnt = add cnt 1
+end
+end
+ret cnt
+end
+
+fn kv_metrics_private_pages to ulong
+tot = get kv_meta 0
+cnt = ulong 0
+for i ulong tot bound 256
+if eq get kv_blk_ref i 1
+cnt = add cnt 1
+end
+end
+ret cnt
+end
+
+fn kv_metrics_bytes_saved to ulong
+phys = kv_metrics_physical_pages
+logi = kv_metrics_logical_pages
+if le logi phys
+ret 0
+end
+ret mul sub logi phys get kv_meta 5
+end

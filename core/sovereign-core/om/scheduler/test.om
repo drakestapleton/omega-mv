@@ -1,0 +1,533 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/scheduler/test.om
+note Comprehensive behavioral test suite with negative/refusal controls for the
+note pure-Omega KV-cache and continuous-batching scheduler.
+note Compose with:
+note   si/directives/om2.om core/sovereign-core/om/scheduler/kv_cache.om
+note   core/sovereign-core/om/scheduler/scheduler.om core/sovereign-core/om/scheduler/test.om
+
+text t_pass "PASS "
+text t_fail "FAIL "
+text t_nl "\n"
+text t_all_ok "SOVEREIGN-CORE SCHEDULER TEST SUITE PASS\n"
+text t_all_bad "SOVEREIGN-CORE SCHEDULER TEST SUITE FAIL\n"
+
+text t_n1 "kv_layout_strides_and_bf16_roundtrip"
+text t_n2 "kv_layout_negative_fp4_and_oob_refused"
+text t_n3 "kv_alloc_cow_fork_and_metrics"
+text t_n4 "kv_tx_rollback_and_negative_oom"
+text t_n5 "seq_id_and_arena_stale_negative"
+text t_n6 "sched_chunked_prefill_and_decode_lifecycle"
+text t_n7 "sched_watermark_preemption_and_headroom"
+text t_n8 "sched_zero_copy_fork_and_stale_purge"
+
+global t_fails ulong 1
+
+fn t_w s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 256
+k = write 1 s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn t_report name view uchar * ok bool to void
+if ok
+t_w t_pass
+else
+t_w t_fail
+put t_fails 0 add get t_fails 0 1
+end
+t_w name
+t_w t_nl
+end
+
+note Test 1: Canonical KvLayout stride math (Qwen2.5-7B BF16) and BF16 round-to-nearest-even.
+fn test_kv_layout_and_bf16 to bool
+lay = new KvLayout 0 0 0 0 0 0 0 0 0 0 0 0 0
+st1 = kv_layout_set_dtype lay KV_DTYPE_BF16
+if ne st1 KV_OK
+ret false
+end
+note Qwen2.5-7B: 64 blocks, block_size=16, 28 layers, 4 kv_heads, head_dim=128, BF16 (2 bytes)
+st2 = kv_layout_from_cfg lay 64 16 28 4 128
+if ne st2 KV_OK
+ret false
+end
+note head_stride = 128*2 = 256
+note token_stride = 4*256 = 1024
+note kv_plane_stride = 16*1024 = 16384
+note layer_stride = 2*16384 = 32768
+note block_stride = 28*32768 = 917504
+note total_bytes = 64*917504 = 58720256
+if ne get lay head_stride 256
+ret false
+end
+if ne get lay token_stride 1024
+ret false
+end
+if ne get lay kv_plane_stride 16384
+ret false
+end
+if ne get lay layer_stride 32768
+ret false
+end
+if ne get lay block_stride 917504
+ret false
+end
+if ne get lay total_bytes 58720256
+ret false
+end
+note Check element offset: blk=3, layer=5, is_val=1, tok=7, head=2, dim=10
+base = kv_layout_elem_offset lay 3 5 1 7 2
+off = kv_layout_dim_offset lay base 10
+exp = mul ulong 3 917504
+exp = add exp mul ulong 5 32768
+exp = add exp ulong 16384
+exp = add exp mul ulong 7 1024
+exp = add exp mul ulong 2 256
+exp = add exp ulong 20
+if ne off exp
+ret false
+end
+note BF16 exact roundtrip for 1.5f32 (0x3fc00000 -> 0x3fc0)
+b1 = kv_f32_to_bf16 1.5f32
+if ne b1 ushort 0x3fc0
+ret false
+end
+f1 = kv_bf16_to_f32 b1
+if ne bitcast uint f1 uint 0x3fc00000
+ret false
+end
+note BF16 tie-to-even: 0x3f808000 (even LSB=0) -> 0x3f80; 0x3f818000 (odd LSB=1) -> 0x3f82
+b_even = kv_f32_to_bf16 bitcast f32 uint 0x3f808000
+b_odd = kv_f32_to_bf16 bitcast f32 uint 0x3f818000
+if or ne b_even ushort 0x3f80 ne b_odd ushort 0x3f82
+ret false
+end
+ret true
+end
+
+note Test 2 (NEGATIVE): FP4 sub-byte layout refused, zero dims refused, out-of-range offsets refused.
+fn test_kv_layout_negative to bool
+lay = new KvLayout 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne kv_layout_set_dtype lay KV_DTYPE_FP4 KV_ERR_INVALID_DTYPE
+ret false
+end
+if ne kv_layout_from_cfg lay 16 16 2 2 64 KV_ERR_INVALID_DTYPE
+ret false
+end
+if ne kv_layout_set_dtype lay KV_DTYPE_FP32 KV_OK
+ret false
+end
+if ne kv_layout_from_cfg lay 0 16 2 2 64 KV_ERR_INVALID_CFG
+ret false
+end
+if ne kv_layout_from_cfg lay 8 16 2 4 64 KV_OK
+ret false
+end
+note Out-of-range block, layer, is_val, tok, head, dim must all return KV_INVALID_IDX
+if ne kv_layout_elem_offset lay 8 0 0 0 0 KV_INVALID_IDX
+ret false
+end
+if ne kv_layout_elem_offset lay 0 2 0 0 0 KV_INVALID_IDX
+ret false
+end
+if ne kv_layout_elem_offset lay 0 0 2 0 0 KV_INVALID_IDX
+ret false
+end
+if ne kv_layout_elem_offset lay 0 0 0 16 0 KV_INVALID_IDX
+ret false
+end
+if ne kv_layout_elem_offset lay 0 0 0 0 4 KV_INVALID_IDX
+ret false
+end
+b = kv_layout_elem_offset lay 0 0 0 0 0
+if ne kv_layout_dim_offset lay b 64 KV_INVALID_IDX
+ret false
+end
+if ne kv_layout_block_offset lay 8 KV_INVALID_IDX
+ret false
+end
+ret true
+end
+
+note Test 3: Paged allocation, zero-copy CoW fork, CoW fault on append, and metrics accounting.
+fn test_kv_alloc_cow_fork to bool
+if ne kv_init 16 4 4096 KV_OK
+ret false
+end
+note Allocate seq 10 with 6 tokens -> 2 blocks (blk 0 has 4 toks, blk 1 has 2 toks)
+if ne kv_allocate_sequence 10 6 KV_OK
+ret false
+end
+if or ne kv_available_blocks 14 ne kv_seq_block_count 10 2
+ret false
+end
+b0 = kv_seq_block_at 10 0
+b1 = kv_seq_block_at 10 1
+if or ne kv_blk_get_tokens b0 4 ne kv_blk_get_tokens b1 2
+ret false
+end
+note Zero-copy fork seq 10 -> child seq 20: 0 extra physical blocks, 2 shared pages
+if ne kv_fork_seq 10 20 KV_OK
+ret false
+end
+if or ne kv_available_blocks 14 ne kv_metrics_physical_pages 2
+ret false
+end
+if or ne kv_metrics_logical_pages 4 ne kv_metrics_shared_pages 2
+ret false
+end
+if ne kv_metrics_bytes_saved 8192
+ret false
+end
+note Append token to child seq 20: tail block b1 is shared and has 2 < 4 tokens -> CoW fault!
+ares = new KvAppendRes 0 0 0 0
+if ne kv_append_token 20 ares KV_OK
+ret false
+end
+if or ne get ares was_cow 1 ne kv_cow_faults 1
+ret false
+end
+if or ne get ares slot 2 ne kv_seq_token_count 20 7
+ret false
+end
+note New child tail block is distinct from b1; b1 ref_count dropped to 1 and is no longer shared
+cb1 = kv_seq_block_at 20 1
+if or eq cb1 b1 ne kv_blk_get_ref b1 1
+ret false
+end
+if kv_blk_is_shared b1
+ret false
+end
+if ne kv_blk_get_tokens cb1 3
+ret false
+end
+note Free both parent and child -> all 16 blocks must be back on free stack
+if ne kv_free_sequence 10 KV_OK
+ret false
+end
+if ne kv_free_sequence 20 KV_OK
+ret false
+end
+if or ne kv_available_blocks 16 ne kv_active_seqs 0
+ret false
+end
+ret true
+end
+
+note Test 4 (NEGATIVE + TX): Transactional rollback restores state; OOM & invalid ops refused atomically.
+fn test_kv_tx_and_negative_oom to bool
+if ne kv_init 4 4 1024 KV_OK
+ret false
+end
+if ne kv_allocate_sequence 1 6 KV_OK
+ret false
+end
+if ne kv_fork_seq 1 2 KV_OK
+ret false
+end
+note Begin tx, trigger CoW append on seq 2, then roll back -> state must match pre-tx
+kv_begin_tx
+ares = new KvAppendRes 0 0 0 0
+if ne kv_append_token 2 ares KV_OK
+ret false
+end
+if or ne kv_cow_faults 1 ne kv_available_blocks 1
+ret false
+end
+kv_rollback_tx
+if or ne kv_cow_faults 0 ne kv_available_blocks 2
+ret false
+end
+if ne kv_seq_token_count 2 6
+ret false
+end
+note NEGATIVE: OOM allocation (needs 3 blocks, only 2 free) must fail with 0 leaked blocks
+if ne kv_allocate_sequence 3 12 KV_ERR_OOM
+ret false
+end
+if or ne kv_available_blocks 2 kv_has_sequence 3
+ret false
+end
+note NEGATIVE: duplicate seq, fork unknown parent, free unknown seq, append unknown seq
+if ne kv_allocate_sequence 1 4 KV_ERR_DUPLICATE_SEQ
+ret false
+end
+if ne kv_fork_seq 999 4 KV_ERR_NOT_FOUND
+ret false
+end
+if ne kv_free_sequence 999 KV_ERR_NOT_FOUND
+ret false
+end
+if ne kv_append_token 999 ares KV_ERR_NOT_FOUND
+ret false
+end
+ret true
+end
+
+note Test 5 (NEGATIVE): SequenceId generation-0 invalid, and arena stale-handle detection after cancel.
+fn test_seq_id_and_stale_negative to bool
+if seq_id_is_valid SEQ_ID_INVALID
+ret false
+end
+if ne seq_id_make 0 0 SEQ_ID_INVALID
+ret false
+end
+if ne seq_id_make 64 1 SEQ_ID_INVALID
+ret false
+end
+if ne kv_init 16 16 1024 KV_OK
+ret false
+end
+sched_init 8 1024 512 128 1 2
+id1 = sched_submit 32 4 PRIO_NORMAL 100
+if or eq id1 SEQ_ID_INVALID arena_is_stale id1
+ret false
+end
+note Cancel bumps generation -> old handle becomes stale immediately
+if ne sched_cancel id1 SCHED_OK
+ret false
+end
+if not arena_is_stale id1
+ret false
+end
+note Double-cancel and fork of stale handle must both fail
+if ne sched_cancel id1 SCHED_ERR_STALE
+ret false
+end
+if ne sched_fork_seq id1 SEQ_ID_INVALID
+ret false
+end
+note Re-inserting reuses slot 0 with generation 2; id1 remains stale while id2 is live
+id2 = sched_submit 16 2 PRIO_NORMAL 200
+if or ne seq_id_slot id2 0 ne seq_id_gen id2 2
+ret false
+end
+if or not arena_is_stale id1 arena_is_stale id2
+ret false
+end
+ret true
+end
+
+note Test 6: Multi-chunk prefill (120 tokens in 50+50+20 chunks) -> decode -> finish & KV free.
+fn test_sched_chunked_prefill_lifecycle to bool
+if ne kv_init 16 16 1024 KV_OK
+ret false
+end
+note max_bs=8, max_bt=1024, max_pt=512, chunk_sz=50, chunk_on=1, watermark=2
+sched_init 8 1024 512 50 1 2
+sid = sched_submit 120 3 PRIO_NORMAL 1000
+if eq sid SEQ_ID_INVALID
+ret false
+end
+note Step 1: admit + prefill chunk [0..50) (120 tokens -> 8 KV blocks allocated)
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_count 1 ne sched_batch_decode_count 0
+ret false
+end
+if or ne sched_batch_prefill_start 0 0 ne sched_batch_prefill_len 0 50
+ret false
+end
+if ne kv_allocated_blocks 8
+ret false
+end
+if ne sched_complete_step SCHED_OK
+ret false
+end
+if ne arena_get_prefilled sid 50
+ret false
+end
+note Step 2: prefill chunk [50..100)
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_start 0 50 ne sched_batch_prefill_len 0 50
+ret false
+end
+if ne sched_complete_step SCHED_OK
+ret false
+end
+note Step 3: final prefill chunk [100..120) -> transitions to PHASE_DECODE
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_start 0 100 ne sched_batch_prefill_len 0 20
+ret false
+end
+if ne sched_complete_step SCHED_OK
+ret false
+end
+if ne arena_get_phase sid PHASE_DECODE
+ret false
+end
+note Steps 4, 5, 6: decode 3 tokens -> finishes and frees all 8 KV blocks
+for d ulong 3
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_count 0 ne sched_batch_decode_count 1
+ret false
+end
+if ne sched_batch_decode_pos 0 add ulong 120 d
+ret false
+end
+if ne sched_complete_step SCHED_OK
+ret false
+end
+end
+if or ne sched_finished_count 1 ne kv_available_blocks 16
+ret false
+end
+if or ne sched_prefill_tokens_total 120 ne sched_decode_tokens_total 3
+ret false
+end
+note Next batch must be empty
+if sched_build_batch
+ret false
+end
+ret true
+end
+
+note Test 7: Watermark memory-pressure preemption & anti-thrashing headroom.
+fn test_sched_watermark_preemption to bool
+note 10 blocks total, block_size=16, watermark=3
+if ne kv_init 10 16 1024 KV_OK
+ret false
+end
+sched_init 8 1024 512 512 1 3
+note Submit background seq (4 blocks = 64 toks) and realtime seq (4 blocks = 64 toks)
+low_id = sched_submit 64 5 PRIO_BACKGROUND 100
+hi_id = sched_submit 64 2 PRIO_REALTIME 101
+note Step 1 admits both (8 blocks used -> 2 blocks free < watermark 3!)
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_count 2 ne kv_available_blocks 2
+ret false
+end
+if ne sched_complete_step SCHED_OK
+ret false
+end
+note Step 2: available (2) < watermark (3) -> preempts lowest priority (low_id), keeps hi_id!
+if not sched_build_batch
+ret false
+end
+if or ne sched_preempted_total 1 ne sched_preempted_count 1
+ret false
+end
+if ne arena_get_phase low_id PHASE_PREEMPTED
+ret false
+end
+if or ne sched_batch_decode_count 1 ne sched_batch_decode_seq 0 hi_id
+ret false
+end
+note Freeing low_id gave 4 blocks back -> available=6; hi_id needs 1 more decode step to finish
+if ne sched_complete_step SCHED_OK
+ret false
+end
+note Step 3: low_id needs req_blks(4) + watermark(3) = 7 blocks, only 6 available -> NOT re-admitted yet!
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_count 0 ne sched_batch_decode_count 1
+ret false
+end
+if ne sched_preempted_count 1
+ret false
+end
+note Complete step 3 -> hi_id reaches max_toks=2, finishes and frees its 4 blocks -> available=10 >= 7
+if ne sched_complete_step SCHED_OK
+ret false
+end
+if ne kv_available_blocks 10
+ret false
+end
+note Step 4: now available(10) >= 7 -> low_id is cleanly re-admitted from preempted_queue!
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_count 1 ne sched_batch_prefill_seq 0 low_id
+ret false
+end
+if ne sched_preempted_count 0
+ret false
+end
+ret true
+end
+
+note Test 8: Zero-copy fork skips redundant prefill & cancelled waiting seq is purged cleanly.
+fn test_sched_fork_and_stale_purge to bool
+if ne kv_init 16 16 1024 KV_OK
+ret false
+end
+sched_init 8 1024 512 512 1 2
+note Submit parent (32 toks = 2 blocks) and a doomed waiting seq
+p_id = sched_submit 32 4 PRIO_NORMAL 10
+doomed = sched_submit 32 4 PRIO_NORMAL 11
+note Cancel doomed before it is ever admitted
+if ne sched_cancel doomed SCHED_OK
+ret false
+end
+note Step 1: doomed is purged without allocating KV blocks; only p_id is admitted and prefilled
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_count 1 ne sched_batch_prefill_seq 0 p_id
+ret false
+end
+if ne kv_allocated_blocks 2
+ret false
+end
+if ne sched_complete_step SCHED_OK
+ret false
+end
+note Fork p_id -> child shares the 2 physical blocks and enters Decode directly with 0 prefill
+c_id = sched_fork_seq p_id
+if eq c_id SEQ_ID_INVALID
+ret false
+end
+if or ne kv_allocated_blocks 2 ne kv_metrics_shared_pages 2
+ret false
+end
+note Step 2: both p_id and c_id are scheduled in Decode (0 prefill spans)
+if not sched_build_batch
+ret false
+end
+if or ne sched_batch_prefill_count 0 ne sched_batch_decode_count 2
+ret false
+end
+if ne sched_complete_step SCHED_OK
+ret false
+end
+note Both p_id and c_id appended a token (blk 1 was full at 16 toks -> each allocated a fresh block)
+if or ne arena_get_toks_gen p_id 1 ne arena_get_toks_gen c_id 1
+ret false
+end
+ret true
+end
+
+fn main to int
+put t_fails 0 0
+t_report t_n1 test_kv_layout_and_bf16
+t_report t_n2 test_kv_layout_negative
+t_report t_n3 test_kv_alloc_cow_fork
+t_report t_n4 test_kv_tx_and_negative_oom
+t_report t_n5 test_seq_id_and_stale_negative
+t_report t_n6 test_sched_chunked_prefill_lifecycle
+t_report t_n7 test_sched_watermark_preemption
+t_report t_n8 test_sched_fork_and_stale_purge
+if eq get t_fails 0 0
+t_w t_all_ok
+ret 0
+end
+t_w t_all_bad
+ret 1
+end
