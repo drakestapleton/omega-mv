@@ -99,3 +99,21 @@ Tested `AIEN_OMEGA_Q38_OVERLAP_AB=1`, `AIEN_OMEGA_Q38_BUF_CACHED=1`, `AIEN_OMEGA
 | `tools/pi-drive-27b/tree20.om` (live across all 20 Spark ARM64 cores `0..19`) | `2.6 KB` ELF, `1,640 KB` RSS | **`PASS`** (`20/20` cores, `2,000,000` cand. tok in `1.52 s` = **`1,314,134 tok/s`** / `65,707` 20-tok trees/s) | 20-core parallel L2-resident (`64 KiB/core`) speculative 20-node token-tree + `20x20` causal attention mask generator (`~15 us/tree` vs `128 ms` GPU step) |
 
 
+
+---
+
+## 5. Server-side CPU+GPU levers for the 27B: integration and live GPU gate (2026-11-19)
+
+Source: `aien-sovereign-core-mv`, branch `feat/q38-integ` @ `0fe20f567` on the Spark git store (`~/git/aien-sovereign-core-mv.git`), merging four tracks with no conflicts. Receipts on the Spark: `~/work/q38-gate/`.
+
+| Track | Host gate | GPU gate | Verdict |
+|---|---|---|---|
+| Speculative decoding (`AIEN_SERVE_SPEC=ngram`, default off) | 14/14 stub tests incl. 2 negative controls | **FAIL.** Golden prompt 24/24 identical, but a 3,929-token code-edit prompt diverges from plain greedy at generated index 41 in all 3 runs | Do not enable. Verify uses a host `lm_head` argmax, not the chip's two-pass head, so it is not bit-exact once drafts are accepted or rolled back |
+| Speculative decoding speed (temp 0, 128 tok, 3 runs each) | | plain **7.92 tok/s** (16.1 s decode), spec **5.68 tok/s** (22.5 s decode) = **28% slower** (177 vs 127 ms/token) | Slower and wrong. No acceptance counter is logged |
+| Batch door (`--batch-slots`, off by default) | 13/13 incl. 3 negative controls | NOT_RUN | Batched dense decode is **BLOCKED**: the pinned `libomega_gpu.a` has a single-head dense graph and lacks `omega_gpu_q38_graph_create_heads`, `_set_head_state`, `_stroke`. A serialized fallback exists. 8 slots x 128k context do not fit in memory |
+| Prefix pool (64 sessions, FNV-1a chain, LRU) | 7/7 incl. collision negative control | NOT_RUN | Pool is built and tested; the engine hook (`put`/`lookup`) is not wired. Snapshot = 156,893,184 B + 65,536 B/token |
+| Device argmax | docs only | NOT_RUN | Already present and used: `Q38Graph::token` (`gen_argmax`), greedy path has no logit readback. The sampled path still copies about 1 MB/token and no device sampler exists |
+
+Unchanged from earlier: plain 27B decode is 7.9 to 8.1 tok/s at short context (about 0.79 of the 10.15 tok/s DRAM ceiling). The remaining gap is Omega kernel bandwidth in down-proj and lm_head, which needs work in the Omega repository, not the server.
+
+The pure-Omega drafters in `tools/pi-drive-27b/` (`specdraft.om`, `tree20.om`, `omguard.om`) pass their own AArch64 tests, but the live engine gate above shows the Rust port is not yet usable. `tree20.om`'s 1.31M candidate tok/s figure is draft generation only; no draft was accepted by the 27B in that measurement.
