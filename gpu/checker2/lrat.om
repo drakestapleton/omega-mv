@@ -1,0 +1,634 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/checker2/lrat.om: pure-Omega DIMACS CNF parser & RUP-only LRAT proof checker
+note (replaces src/checker2/c2_lrat.{h,c}, trusted kernel of checker2).
+note Fails closed on every malformed input, RAT negative hint, unknown/deleted clause,
+note non-unit hint, missing conflict, ID order/range violation, or missing empty clause.
+note Compose: si/directives/om2.om gpu/checker2/lrat.om gpu/checker2/test.om
+
+const C2_MAX_VARS int 4096
+const C2_MAX_CLAUSES ulong 8192
+const C2_MAX_LITS ulong 65536
+const C2_MAX_DB ulong 16384
+const C2_MAX_DB_LITS ulong 131072
+const C2_LRAT_MAX_ID long 100000000
+
+note Stable rule codes matching src/checker2/c2_lrat.c
+const C2_OK int 0
+const C2_E_CNF_HEADER int 1
+const C2_E_CNF_LITERAL int 2
+const C2_E_CNF_COUNT int 3
+const C2_E_CNF_TOO_LONG int 4
+const C2_E_CNF_RESOURCE int 5
+const C2_E_LRAT_SYNTAX int 10
+const C2_E_LRAT_DELETE_UNKNOWN int 11
+const C2_E_LRAT_ID_ORDER int 12
+const C2_E_LRAT_ID_RANGE int 13
+const C2_E_LRAT_LITERAL int 14
+const C2_E_LRAT_RAT_UNSUPPORTED int 15
+const C2_E_LRAT_HINT_UNKNOWN int 16
+const C2_E_LRAT_HINT_NOT_UNIT int 17
+const C2_E_LRAT_NO_CONFLICT int 18
+const C2_E_LRAT_NO_EMPTY_CLAUSE int 19
+const C2_E_LRAT_RESOURCE int 20
+
+struct C2Lx pos ulong line long end
+struct C2IntRes st int val long end
+struct C2LratRes ok int rule int line long steps long dels long end
+
+note Bounded static arenas (zero heap, deterministic)
+global g_cnf_lits int 65536
+global g_cnf_start ulong 8192
+global g_cnf_meta ulong 4
+global g_db_lits int 131072
+global g_db_off ulong 16384
+global g_db_meta ulong 4
+global g_val byte 4097
+global g_assigned int 4097
+global g_cl_buf int 4098
+
+note ---- lexer helpers ----
+
+fn c2_is_ws b uchar to bool
+if eq b 32
+ret true
+end
+if eq b 9
+ret true
+end
+if eq b 13
+ret true
+end
+if eq b 10
+ret true
+end
+ret false
+end
+
+fn c2_skip_ws src view uchar * lx edit C2Lx to void
+n = len src
+i = get lx pos
+ln = get lx line
+done = false
+while eq done false bound 65536
+while lt i n bound 65536
+ch = get src i
+if eq c2_is_ws ch false
+break
+end
+if eq ch 10
+ln = add ln 1
+end
+i = add i 1
+end
+if lt i n
+if eq get src i 99
+note 'c' comment to end of line
+while lt i n bound 65536
+if eq get src i 10
+break
+end
+i = add i 1
+end
+else
+done = true
+end
+else
+done = true
+end
+end
+put lx pos i
+put lx line ln
+ret
+end
+
+note rd_int: st = 0 ok, 1 eof, -1 malformed/overflow
+fn c2_rd_int src view uchar * lx edit C2Lx res edit C2IntRes to int
+c2_skip_ws src lx
+n = len src
+i = get lx pos
+if ge i n
+put res st 1
+put res val 0
+ret 1
+end
+is_neg = false
+if eq get src i 45
+is_neg = true
+i = add i 1
+end
+if ge i n
+put res st -1
+ret -1
+end
+ch0 = get src i
+if or lt ch0 48 gt ch0 57
+put res st -1
+ret -1
+end
+v = long 0
+while lt i n bound 32
+ch = get src i
+if or lt ch 48 gt ch 57
+break
+end
+v = add mul v 10 long sub uint ch 48
+if gt v C2_LRAT_MAX_ID
+put res st -1
+ret -1
+end
+i = add i 1
+end
+if lt i n
+if eq c2_is_ws get src i false
+put res st -1
+ret -1
+end
+end
+put lx pos i
+if is_neg
+put res val neg v
+else
+put res val v
+end
+put res st 0
+ret 0
+end
+
+note ---- CNF builder & DIMACS parser ----
+
+fn c2_cnf_reset to void
+put g_cnf_meta 0 ulong 0
+put g_cnf_meta 1 ulong 0
+put g_cnf_meta 2 ulong 0
+ret
+end
+
+fn c2_cnf_add lits view int * cnt ulong to int
+nc = get g_cnf_meta 1
+nl = get g_cnf_meta 2
+nv = int get g_cnf_meta 0
+if ge nc C2_MAX_CLAUSES
+ret C2_E_CNF_RESOURCE
+end
+if gt add add nl cnt 1 C2_MAX_LITS
+ret C2_E_CNF_RESOURCE
+end
+put g_cnf_start nc nl
+k = ulong 0
+while lt k cnt bound 4096
+lit = get lits k
+if eq lit 0
+ret C2_E_CNF_LITERAL
+end
+v = lit
+if lt v 0
+v = neg v
+end
+if gt v C2_MAX_VARS
+ret C2_E_CNF_LITERAL
+end
+if gt v nv
+nv = v
+end
+put g_cnf_lits add nl k lit
+k = add k 1
+end
+put g_cnf_lits add nl cnt int 0
+put g_cnf_meta 0 ulong nv
+put g_cnf_meta 1 add nc 1
+put g_cnf_meta 2 add add nl cnt 1
+ret C2_OK
+end
+
+fn c2_match_pcnf src view uchar * pos ulong to bool
+if lt sub len src pos 6
+ret false
+end
+if ne get src pos 112
+ret false
+end
+if ne get src add pos 1 32
+ret false
+end
+if ne get src add pos 2 99
+ret false
+end
+if ne get src add pos 3 110
+ret false
+end
+if ne get src add pos 4 102
+ret false
+end
+if ne get src add pos 5 32
+ret false
+end
+ret true
+end
+
+fn c2_cnf_parse src view uchar * to int
+c2_cnf_reset
+lx = new C2Lx ulong 0 long 1
+ir = new C2IntRes 0 0
+c2_skip_ws src edit lx
+if eq c2_match_pcnf src get lx pos false
+ret C2_E_CNF_HEADER
+end
+put lx pos add get lx pos 6
+if ne c2_rd_int src edit lx edit ir 0
+ret C2_E_CNF_HEADER
+end
+nv = get ir val
+if ne c2_rd_int src edit lx edit ir 0
+ret C2_E_CNF_HEADER
+end
+nc = get ir val
+if or or lt nv 0 lt nc 0 gt nv long C2_MAX_VARS
+ret C2_E_CNF_HEADER
+end
+buf = new int 4096 0
+cnt = ulong 0
+done = false
+while eq done false bound 65536
+st = c2_rd_int src edit lx edit ir
+if eq st 1
+done = true
+else
+if lt st 0
+c2_cnf_reset
+ret C2_E_CNF_LITERAL
+end
+lv = get ir val
+if or gt lv nv lt lv neg nv
+c2_cnf_reset
+ret C2_E_CNF_LITERAL
+end
+if eq lv 0
+rc = c2_cnf_add view buf cnt
+if ne rc C2_OK
+c2_cnf_reset
+ret rc
+end
+cnt = ulong 0
+else
+if ge cnt 4096
+c2_cnf_reset
+ret C2_E_CNF_TOO_LONG
+end
+put buf cnt int lv
+cnt = add cnt 1
+end
+end
+end
+if or ne cnt 0 ne get g_cnf_meta 1 ulong nc
+c2_cnf_reset
+ret C2_E_CNF_COUNT
+end
+put g_cnf_meta 0 ulong nv
+ret C2_OK
+end
+
+note ---- LRAT clause DB & RUP checker ----
+
+fn c2_db_reset to void
+for i ulong 16384
+put g_db_off i ulong 0
+end
+put g_db_meta 0 ulong 0
+put g_db_meta 1 ulong 0
+ret
+end
+
+fn c2_db_put_clause id ulong src_off ulong cnt ulong to int
+if or eq id 0 ge id C2_MAX_DB
+ret C2_E_LRAT_RESOURCE
+end
+used = get g_db_meta 0
+if gt add add used cnt 1 C2_MAX_DB_LITS
+ret C2_E_LRAT_RESOURCE
+end
+k = ulong 0
+while lt k cnt bound 4096
+put g_db_lits add used k get g_cl_buf add src_off k
+k = add k 1
+end
+put g_db_lits add used cnt int 0
+note store 1-based offset so 0 means absent/deleted
+put g_db_off id add used 1
+put g_db_meta 0 add add used cnt 1
+ret C2_OK
+end
+
+fn c2_db_load_cnf to int
+nc = get g_cnf_meta 1
+i = ulong 0
+while lt i nc bound 8192
+st = get g_cnf_start i
+cnt = ulong 0
+while ne get g_cnf_lits add st cnt 0 bound 4096
+put g_cl_buf cnt get g_cnf_lits add st cnt
+cnt = add cnt 1
+end
+rc = c2_db_put_clause add i 1 ulong 0 cnt
+if ne rc C2_OK
+ret rc
+end
+i = add i 1
+end
+ret C2_OK
+end
+
+fn c2_lrat_fail res edit C2LratRes rule int ln long to int
+put res ok int 0
+put res rule rule
+put res line ln
+ret rule
+end
+
+fn c2_undo_assign na ulong to void
+k = ulong 0
+while lt k na bound 4097
+v = ulong get g_assigned k
+put g_val v byte 0
+k = add k 1
+end
+ret
+end
+
+note Check a single hint clause h against current g_val assignment.
+note Returns: 0 = unit (assigns literal, increments na via res_na[0]), 1 = conflict (falsified),
+note <0 = negative of C2_E_* error code.
+fn c2_check_hint h long na_ref edit ulong 1 to int
+if lt h 0
+ret neg C2_E_LRAT_RAT_UNSUPPORTED
+end
+if ge ulong h C2_MAX_DB
+ret neg C2_E_LRAT_HINT_UNKNOWN
+end
+off1 = get g_db_off ulong h
+if eq off1 0
+ret neg C2_E_LRAT_HINT_UNKNOWN
+end
+off = sub off1 1
+unit = int 0
+nfree = int 0
+sat = false
+k = ulong 0
+while ne get g_db_lits add off k 0 bound 4096
+lit = get g_db_lits add off k
+v = lit
+if lt v 0
+v = neg v
+end
+cur = int get g_val ulong v
+if ne cur 0
+is_pos = gt lit 0
+val_pos = gt cur 0
+if eq is_pos val_pos
+sat = true
+break
+end
+else
+nfree = add nfree 1
+unit = lit
+end
+k = add k 1
+end
+if or sat gt nfree 1
+ret neg C2_E_LRAT_HINT_NOT_UNIT
+end
+if eq nfree 0
+ret 1
+end
+uv = unit
+if lt uv 0
+uv = neg uv
+end
+if gt unit 0
+put g_val ulong uv byte 1
+else
+put g_val ulong uv byte -1
+end
+na = get na_ref 0
+put g_assigned na uv
+put na_ref 0 add na 1
+ret 0
+end
+
+fn c2_handle_delete proof view uchar * lx edit C2Lx res edit C2LratRes ln long to int
+ir = new C2IntRes 0 0
+done = false
+while eq done false bound 8192
+if ne c2_rd_int proof lx edit ir 0
+ret c2_lrat_fail res C2_E_LRAT_SYNTAX ln
+end
+del = get ir val
+if eq del 0
+done = true
+else
+if or lt del 0 ge ulong del C2_MAX_DB
+ret c2_lrat_fail res C2_E_LRAT_DELETE_UNKNOWN ln
+end
+if eq get g_db_off ulong del 0
+ret c2_lrat_fail res C2_E_LRAT_DELETE_UNKNOWN ln
+end
+put g_db_off ulong del ulong 0
+put res dels add get res dels 1
+end
+end
+ret C2_OK
+end
+
+note Assign negation of g_cl_buf[0..cnt) into g_val; sets na_ref[0]. Returns 1 if tautology, 0 else.
+fn c2_assign_neg_clause cnt ulong na_ref edit ulong 1 to int
+taut = int 0
+na = ulong 0
+k = ulong 0
+while lt k cnt bound 4096
+lit = get g_cl_buf k
+v = lit
+if lt v 0
+v = neg v
+end
+want = int -1
+if lt lit 0
+want = int 1
+end
+cur = int get g_val ulong v
+if eq cur neg want
+taut = int 1
+end
+if eq cur 0
+put g_val ulong v byte want
+put g_assigned na v
+na = add na 1
+end
+k = add k 1
+end
+put na_ref 0 na
+ret taut
+end
+
+fn c2_read_clause_lits proof view uchar * lx edit C2Lx nv long cnt_ref edit ulong 1 to int
+ir = new C2IntRes 0 0
+cnt = ulong 0
+done = false
+while eq done false bound 4098
+if ne c2_rd_int proof lx edit ir 0
+ret C2_E_LRAT_SYNTAX
+end
+lv = get ir val
+if eq lv 0
+done = true
+else
+if or gt lv nv lt lv neg nv
+ret C2_E_LRAT_LITERAL
+end
+if gt cnt ulong nv
+ret C2_E_LRAT_SYNTAX
+end
+put g_cl_buf cnt int lv
+cnt = add cnt 1
+end
+end
+put cnt_ref 0 cnt
+ret C2_OK
+end
+
+fn c2_read_and_check_hints proof view uchar * lx edit C2Lx taut int na_ref edit ulong 1 to int
+ir = new C2IntRes 0 0
+proved = eq taut 1
+done = false
+while eq done false bound 8192
+if ne c2_rd_int proof lx edit ir 0
+ret C2_E_LRAT_SYNTAX
+end
+hv = get ir val
+if eq hv 0
+done = true
+else
+if eq proved false
+hr = c2_check_hint hv na_ref
+if lt hr 0
+ret neg hr
+end
+if eq hr 1
+proved = true
+end
+end
+end
+end
+if eq proved false
+ret C2_E_LRAT_NO_CONFLICT
+end
+ret C2_OK
+end
+
+fn c2_count_newlines proof view uchar * to long
+cnt = long 0
+i = ulong 0
+n = len proof
+while lt i n bound 65536
+if eq get proof i 10
+cnt = add cnt 1
+end
+i = add i 1
+end
+ret cnt
+end
+
+note Handle one LRAT clause-addition step; returns 0=ok (continue), 1=empty clause derived, <0=neg(err).
+fn c2_handle_add_step proof view uchar * lx edit C2Lx id long res edit C2LratRes to int
+ln = get lx line
+nv = long get g_cnf_meta 0
+cnt_ref = new ulong 1 0
+na_ref = new ulong 1 0
+rc = c2_read_clause_lits proof lx nv edit cnt_ref
+if ne rc C2_OK
+ret neg c2_lrat_fail res rc ln
+end
+cnt = get cnt_ref 0
+taut = c2_assign_neg_clause cnt edit na_ref
+rc = c2_read_and_check_hints proof lx taut edit na_ref
+c2_undo_assign get na_ref 0
+if ne rc C2_OK
+ret neg c2_lrat_fail res rc ln
+end
+rc = c2_db_put_clause ulong id ulong 0 cnt
+if ne rc C2_OK
+ret neg c2_lrat_fail res rc ln
+end
+put res steps add get res steps 1
+if eq cnt 0
+put res ok int 1
+put res rule C2_OK
+ret 1
+end
+ret 0
+end
+
+fn c2_is_del_tok proof view uchar * lx edit C2Lx to bool
+c2_skip_ws proof lx
+p = get lx pos
+if lt p len proof
+if eq get proof p 100
+put lx pos add p 1
+ret true
+end
+end
+ret false
+end
+
+fn c2_lrat_check proof view uchar * res edit C2LratRes to int
+put res ok int 0
+put res rule C2_OK
+put res line long 0
+put res steps long 0
+put res dels long 0
+for i ulong 4097
+put g_val i byte 0
+end
+c2_db_reset
+rc = c2_db_load_cnf
+if ne rc C2_OK
+ret c2_lrat_fail res rc long 0
+end
+put g_db_meta 1 ulong add add long get g_cnf_meta 1 1 c2_count_newlines proof
+put g_db_meta 2 get g_cnf_meta 1
+lx = new C2Lx ulong 0 long 1
+ir = new C2IntRes 0 0
+done = false
+while eq done false bound 16384
+st = c2_rd_int proof edit lx edit ir
+if eq st 1
+done = true
+else
+ln = get lx line
+id = get ir val
+if or lt st 0 lt id 1
+ret c2_lrat_fail res C2_E_LRAT_SYNTAX ln
+end
+if c2_is_del_tok proof edit lx
+rc = c2_handle_delete proof edit lx res ln
+if ne rc C2_OK
+ret rc
+end
+else
+if le id long get g_db_meta 2
+ret c2_lrat_fail res C2_E_LRAT_ID_ORDER ln
+end
+if gt id long get g_db_meta 1
+ret c2_lrat_fail res C2_E_LRAT_ID_RANGE ln
+end
+put g_db_meta 2 ulong id
+ar = c2_handle_add_step proof edit lx id res
+if lt ar 0
+ret neg ar
+end
+if eq ar 1
+ret C2_OK
+end
+end
+end
+end
+ret c2_lrat_fail res C2_E_LRAT_NO_EMPTY_CLAUSE get lx line
+end
