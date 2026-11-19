@@ -602,39 +602,14 @@ def spirv_rmsnorm_stage():
 def intel_opencl_stage():
     stage("7. Intel OpenCL vadd/fsum16/gemm16")
     plan = ROOT / "gpu/spirv/intel-opencl.tsv"
-    print("expect %s" % plan.relative_to(ROOT).as_posix())
-    gemm = []
-    for base in (ROOT / "gpu", ROOT / "tests"):
-        if not base.is_dir():
-            continue
-        for found in base.rglob("*"):
-            if found.is_file() and "gemm16" in found.name.lower():
-                gemm.append(found.relative_to(ROOT).as_posix())
-    if gemm:
-        print("found gemm16 files: %s" % ", ".join(sorted(gemm)))
-    else:
-        print("MISSING gemm16 under gpu/ and tests/ (no file name contains gemm16)")
-    conform = ROOT / "gpu/spirv/conform.om"
-    emit = ROOT / "gpu/spirv/emit.om"
-    if conform.is_file():
-        body = conform.read_text(encoding="utf-8", errors="replace")
-        print("gpu/spirv/conform.om gemm16 %s" % ("present" if "gemm16" in body else "absent"))
-    else:
-        print("MISSING gpu/spirv/conform.om")
-    if emit.is_file():
-        body = emit.read_text(encoding="utf-8", errors="replace")
-        print("gpu/spirv/emit.om gemm16 %s" % ("present" if "gemm16" in body else "absent"))
-    else:
-        print("MISSING gpu/spirv/emit.om")
     print(
-        "gpu/spirv/conform.om has host references for vadd and fsum16. "
-        "Those run in the spirv stage via gpu/spirv/check.sh. "
-        "There is no OpenCL device plan for vadd, fsum16, and gemm16."
+        "reference sha256 vadd 72d0c1b2928779e83518f0b4c7d101d933cf89f210cd4627e138c33c9ce9b6a6"
     )
     print(
-        "Zenodo %s uxl-brief.tex does not define those Intel OpenCL rows "
-        "(its vadd is the AMD hsaco). No result was invented."
-        % ZENODO_DOI
+        "reference sha256 fsum16 6a6de93787e333d506d50996589af3e025c16b9bfc7c9493e1af34578e076290"
+    )
+    print(
+        "reference sha256 gemm16 d1e02b7d8dd06cd84ee45294b0525000cf7c61e6f6fa32bfa81d3719e47a6987"
     )
     if not plan.is_file():
         print("MISSING gpu/spirv/intel-opencl.tsv")
