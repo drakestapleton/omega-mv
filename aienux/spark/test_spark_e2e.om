@@ -13,24 +13,25 @@ note               PREFILL([7, 42]) -> DONE(kv=2), DECODE(max=2, eos=999, temp=0
 note Strictly host-only (Spark silicon NOT_RUN). Zero real firmware bytes, zero GPU access.
 
 const E2E_RAM_BASE ulong 2147483648
-const E2E_RAM_SZ ulong 13631488
+const E2E_RAM_SZ ulong 14680064
 const E2E_HEAP_PA ulong 3221225472
 const E2E_HEAP_SZ ulong 139460608
 const E2E_FRQ ulong 1000000000
 
-text e2e_pass "SPARK_E2E_PASS stages=6 checks=ALL (bar0_mode1+sccfg+marker_va16+reset_kv+prefill+decode+omtk)\n"
-text e2e_t1 "PASS e2e_01_bar0_mode1_and_irqbm\n"
-text e2e_t2 "PASS e2e_02_sha256_and_fw_arena_sccfg\n"
-text e2e_t3 "PASS e2e_03_gmmu_rmchan_cmbind_marker_plus_16\n"
+text e2e_pass "SPARK_E2E_PASS stages=6 checks=ALL (bus1_pcie+smmu_abc+bar0_mode1+omfwbnd1_sha256+siencode+sccfg+boot9+bsetpd+idmap_mkva+marker_va16+omtk)\n"
+text e2e_t1 "PASS e2e_01_bus1_pcie_smmu_bar0_mode1_and_irqbm\n"
+text e2e_t2 "PASS e2e_02_omfwbnd1_toc_sha256_fw_arena_siencode_sccfg_boot9\n"
+text e2e_t3 "PASS e2e_03_gmmu_idmap_bsetpd_rmchan_cmbind_marker_plus_16\n"
 text e2e_t4 "PASS e2e_04_q38_marker1_neg_and_marker2_complete\n"
 text e2e_t5 "PASS e2e_05_omtk_ping_reset_prefill_decode_e2e\n"
 
-note 13 MiB simulated Normal-NC physical RAM at 0x80000000
-global e2e_ram uchar 13631488
-note Simulated BAR0 sparse register store for mode 1 (arm64_mmio_r32/w32)
-global e2e_bar_k ulong 64
-global e2e_bar_v ulong 64
+note 14 MiB simulated Normal-NC physical RAM at 0x80000000
+global e2e_ram uchar 14680064
+note Simulated BAR0/ECAM/SMMU sparse register store for mode 1 (arm64_mmio_r32/w32)
+global e2e_bar_k ulong 256
+global e2e_bar_v ulong 256
 global e2e_bar_n ulong 1
+global e2e_rmseq ulong 1
 note E2E state: 0=bar_h, 1=tick, 2=gen, 3=mk_pa, 4=pb_pa, 5=kicks, 6=db_val, 7=flushes, 8=stop
 global e2e_st ulong 16
 global e2e_next_tok ulong 4
@@ -64,9 +65,16 @@ note ========================================================================
 note Cross-Slice Host Simulation Seams (matching spark_main.om bare-metal seams)
 note ========================================================================
 
+fn ext4_read_lba lba ulong to int
+ret 0
+end
+
+fn ext4_sink off ulong b uchar to void
+end
+
 fn arm64_mmio_r32 addr ulong to ulong
 n = get e2e_bar_n 0
-for i ulong n bound 64
+for i ulong n bound 256
 if eq get e2e_bar_k i addr
 ret and get e2e_bar_v i 4294967295
 end
@@ -75,16 +83,21 @@ ret ulong 0
 end
 
 fn arm64_mmio_w32 addr ulong val ulong to void
+note Simulate hardware self-clear of GB20B MMU_INVALIDATE_TRIGGER (BAR0 + 0x100cb8) bit 31
+v = and val 4294967295
+if eq addr add SPARK_GB20B_BAR0_PA MMRINV
+v = and v 2147483647
+end
 n = get e2e_bar_n 0
-for i ulong n bound 64
+for i ulong n bound 256
 if eq get e2e_bar_k i addr
-put e2e_bar_v i and val 4294967295
+put e2e_bar_v i v
 ret
 end
 end
-if lt n 64
+if lt n 256
 put e2e_bar_k n addr
-put e2e_bar_v n and val 4294967295
+put e2e_bar_v n v
 put e2e_bar_n 0 add n 1
 end
 end
@@ -460,13 +473,49 @@ end
 end
 
 note ========================================================================
-note Test 1: Slice B bar0_mmio mode 1 (fwops hook) + GB20B ID + irqbm iqmode=2
+note Test 1: Slice B Bus-1 PCIe probe + bar0_mmio mode 1 + GB20B ID + irqbm iqmode=2
 note ========================================================================
 
 fn e2e_test_01 to void
 bmmio_reset
+pcie_reset
+smmu_reset
 ibm_reset
 put bmmio_mode 0 1
+note Register Spark ECAM segments 15 (GB20B), 4 (NVMe), 7 (RTL8127) with Bus 0..1
+put pcie_nsegs 0 3
+put pcie_seg_base 0 SPARK_ECAM_SEG15_PA
+put pcie_seg_id 0 15
+put pcie_seg_bus0 0 0
+put pcie_seg_bus1 0 1
+put pcie_seg_base 1 SPARK_ECAM_SEG4_PA
+put pcie_seg_id 1 4
+put pcie_seg_bus0 1 0
+put pcie_seg_bus1 1 1
+put pcie_seg_base 2 SPARK_ECAM_SEG7_PA
+put pcie_seg_id 2 7
+put pcie_seg_bus0 2 0
+put pcie_seg_bus1 2 1
+e2e_ck gt pcie_map_seg_ecam 15 0
+e2e_ck gt pcie_map_seg_ecam 4 0
+e2e_ck gt pcie_map_seg_ecam 7 0
+note Seed Bus 1 endpoints (000f:01:00.0 GB20B, 0004:01:00.0 NVMe, 0007:01:00.0 RTL8127)
+note Bus 0 is empty (0xffffffff); Bus 1 holds all 3 Spark endpoints!
+e2e_ck eq pcie_cfg_w32 15 0 0 0 0 0xffffffff BMMIO_OK
+e2e_ck eq pcie_cfg_w32 15 1 0 0 0 0x2e1210de BMMIO_OK
+e2e_ck eq pcie_cfg_w32 15 1 0 0 16 SPARK_GB20B_BAR0_PA BMMIO_OK
+e2e_ck eq pcie_cfg_w32 4 1 0 0 0 0x50181987 BMMIO_OK
+e2e_ck eq pcie_cfg_w32 4 1 0 0 8 0x01080200 BMMIO_OK
+e2e_ck eq pcie_cfg_w32 7 1 0 0 0 0x812710ec BMMIO_OK
+e2e_ck eq pcie_probe_dev 15 0 0 0 PCIE_ENODEV
+e2e_ck eq pcie_probe_dev 15 1 0 0 PCIE_OK
+e2e_ck eq get pcie_dev_info 0 0x10de
+e2e_ck eq pcie_probe_dev 4 1 0 0 PCIE_OK
+e2e_ck eq shr get pcie_dev_info 4 8 0x010802
+e2e_ck eq pcie_probe_dev 7 1 0 0 PCIE_OK
+e2e_ck eq get pcie_dev_info 0 0x10ec
+e2e_ck eq get pcie_dev_info 1 0x8127
+note GB20B BAR0 mode 1 (fwops hook) + BOOT_0/BOOT_42 + irqbm iqmode=2
 hb = bmmio_register SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE
 e2e_ck gt hb 0
 put e2e_st 0 ulong hb
@@ -484,7 +533,7 @@ e2e_puts e2e_t1
 end
 
 note ========================================================================
-note Test 2: Slice D SHA-256 + Slice C fw_bm + abbuild + sccfg(abpa 1, fbappver)
+note Test 2: OMFWBND1 TOC+SHA-256 + fw_bm + siencode + abbuild + sccfg + boot->9
 note ========================================================================
 
 fn e2e_wr_shdr pa ulong nm ulong ty ulong of ulong sz ulong to void
@@ -501,20 +550,155 @@ bmmemwr8 add pa 2 c2
 bmmemwr8 add pa 3 c3
 end
 
-fn e2e_test_02 to void
-note Verify sha256_bare on empty input: e3b0c442...
+fn e2e_toc_w32 off ulong v ulong to void
+put e4_toc off uchar and v 255
+put e4_toc add off 1 uchar and shr v 8 255
+put e4_toc add off 2 uchar and shr v 16 255
+put e4_toc add off 3 uchar and shr v 24 255
+end
+
+fn e2e_toc_w64 off ulong v ulong to void
+e2e_toc_w32 off and v 4294967295
+e2e_toc_w32 add off 4 shr v 32
+end
+
+fn e2e_toc_add_ent idx ulong kind ulong boff ulong bsz ulong to void
 s256_init
+pa = add E2E_RAM_BASE boff
+remn = bsz
+cur = pa
+while gt remn 0 bound 256
+ch = remn
+if gt ch 4096
+ch = ulong 4096
+end
+j = ulong 0
+while lt j ch bound 4096
+s256_byte bmrmemrd8 add cur j
+j = add j 1
+end
+cur = add cur ch
+remn = sub remn ch
+end
 s256_fin
-e2e_ck eq get s2_out 0 0xe3
-e2e_ck eq get s2_out 1 0xb0
-e2e_ck eq get s2_out 2 0xc4
-e2e_ck eq get s2_out 3 0x42
-note Init bm_hal over 12 MiB simulated Normal-NC RAM at 0x80000000
-e2e_ck eq bminit 0 SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ E2E_RAM_BASE E2E_RAM_SZ E2E_FRQ BMOK
-put gspmode 0 2
-put gspd0ok 0 1
-note Build minimal valid synthetic ELF64 for fw_bm.om at E2E_RAM_BASE + 0 (16 KiB)
-elf = E2E_RAM_BASE
+base = add 32 mul idx 64
+e2e_toc_w32 base kind
+e2e_toc_w32 add base 4 0
+e2e_toc_w64 add base 8 boff
+e2e_toc_w64 add base 16 bsz
+e2e_toc_w64 add base 24 0
+for b ulong 32
+put e4_toc add add base 32 b get s2_out b
+end
+end
+
+fn e2e_verify_toc_sha idx ulong to bool
+s256_init
+pa = add E2E_RAM_BASE get e4_bnd_off idx
+remn = get e4_bnd_size idx
+cur = pa
+while gt remn 0 bound 256
+ch = remn
+if gt ch 4096
+ch = ulong 4096
+end
+j = ulong 0
+while lt j ch bound 4096
+s256_byte bmrmemrd8 add cur j
+j = add j 1
+end
+cur = add cur ch
+remn = sub remn ch
+end
+s256_fin
+sb = mul idx 32
+for b ulong 32
+if ne get s2_out b get e4_bnd_sha add sb b
+ret false
+end
+end
+ret true
+end
+
+fn e2e_statpub e ulong to void
+spa = get abstatpa 0
+wr = bmmemrd32 add spa 16
+for s ulong e bound 4
+slot = rem add wr s RQCOUNT
+dst = add spa mul add slot 1 RQSLOT
+src = mul s RQSLOT
+for j ulong RQSLOT
+bmmemwr8 add dst j get rqtmp add src j
+end
+end
+bmmemwr32 add spa 16 rem add wr e RQCOUNT
+end
+
+fn e2e_statpush fnid ulong seqnum ulong res ulong priv ulong n ulong to void
+e = div add n 4175 4096
+for i ulong mul e 4096 bound 16384
+put rqtmp i 0
+end
+rqput32 2 36 ulong get e2e_rmseq 0
+put e2e_rmseq 0 add get e2e_rmseq 0 1
+rqput32 2 40 e
+rqput32 2 48 RQVER
+rqput32 2 52 RQSIG
+logn = n
+if eq fnid 103
+logn = ulong 32
+end
+rqput32 2 56 add 32 logn
+rqput32 2 60 fnid
+rqput32 2 64 res
+rqput32 2 68 priv
+rqput32 2 72 seqnum
+for i ulong n bound 4096
+put rqtmp add 80 i get rqpay i
+end
+rqput32 2 32 rqsum 2 mul div add logn 87 8 8
+e2e_statpub e
+end
+
+fn e2e_test_02_boot to void
+note Initialize statq header and attach tbattach(abcmdpa, abstatpa) at bstate==4 -> bpoll/bguest/bstatic -> bstate==9
+spa = get abstatpa 0
+bmmemwr32 spa 0
+bmmemwr32 add spa 4 RQQSZ
+bmmemwr32 add spa 8 RQSLOT
+bmmemwr32 add spa 12 RQCOUNT
+bmmemwr32 add spa 16 0
+bmmemwr32 add spa 20 1
+bmmemwr32 add spa 24 32
+bmmemwr32 add spa 28 RQSLOT
+bmmemwr32 add spa 32 0
+put bstate 0 4
+put bbudget 0 64
+put bstaticn 0 64
+put bgen 0 1
+e2e_ck eq tbattach get abcmdpa 0 spa uint GB20B_VAL_BOOT42 0
+note Inject 0x1001 GSP_INIT_DONE -> bstate=5 -> bguest -> bstate=7 -> bstatic -> bstate=9 (REPLAY_READY)
+rqclear 4
+e2e_statpush 4097 0 0 0 4
+e2e_ck eq bpoll 1
+e2e_ck eq get bstate 0 5
+rqclear 792
+rqput32 4 0 580
+rqput32 4 4 173
+e2e_ck eq bguest 0
+e2e_statpush 1 ulong get rqsent 0 0 0 792
+e2e_ck eq bpoll 1
+e2e_ck eq get bstate 0 7
+e2e_ck eq bstatic 0
+rqclear 64
+e2e_statpush 65 ulong get rqsent 0 0 0 64
+e2e_ck eq bpoll 1
+e2e_ck eq get bstate 0 9
+end
+
+fn e2e_test_02_elf to void
+note Build minimal valid synthetic ELF64 at bundle offset +4096 (after 4096 B OMFWBND1 TOC)
+elf = add E2E_RAM_BASE 4096
 bmmemzero elf 16384
 bmmemwr8 elf 127
 bmmemwr8 add elf 1 69
@@ -527,8 +711,6 @@ bmmemwr32 add elf 16 or 1 shl ulong 243 16
 bmmemwr64 add elf 40 64
 bmmemwr32 add elf 56 shl ulong 64 16
 bmmemwr32 add elf 60 or 6 shl ulong 1 16
-note shstrtab at +1024:
-note   1:.fwimage  10:.fwversion  21:.note.gnu.build-id  40:.fwsignature_gb20y
 st = add elf 1024
 e2e_wr_cstr add st 1 46 102 119 105
 e2e_wr_cstr add st 5 109 97 103 101
@@ -548,7 +730,6 @@ e2e_wr_cstr add st 48 116 117 114 101
 e2e_wr_cstr add st 52 95 103 98 50
 bmmemwr8 add st 56 48
 bmmemwr8 add st 57 121
-note Section data: .fwversion (+2048), .note (+2112), .fwsignature_gb20y (+4096, 4096B), .fwimage (+8192, 8192B)
 e2e_wr_cstr add elf 2048 53 56 48 46
 e2e_wr_cstr add elf 2052 49 55 51 46
 bmmemwr8 add elf 2056 48
@@ -565,34 +746,101 @@ e2e_wr_shdr add sh 128 1 1 8192 8192
 e2e_wr_shdr add sh 192 10 1 2048 11
 e2e_wr_shdr add sh 256 21 7 2112 36
 e2e_wr_shdr add sh 320 40 1 4096 4096
-e2e_ck eq fbparseelf elf 16384 FBOK
-note Bind synthetic bl/fmc/hash/pubkey/sig blobs at +16384..+458752
-blpa = add E2E_RAM_BASE 16384
-fmcpa = add E2E_RAM_BASE 229376
-hshpa = add E2E_RAM_BASE 442368
-pkpa = add E2E_RAM_BASE 446464
-sigpa = add E2E_RAM_BASE 450560
-e2e_ck eq fbbindblobs blpa 212992 fmcpa 212296 hshpa pkpa 0
-e2e_ck eq fbbindsig sigpa 58017302 0
+end
+
+fn e2e_bind_from_toc to void
+p1 = add E2E_RAM_BASE get e4_bnd_off 0
+s1 = get e4_bnd_size 0
+e2e_ck eq fbparseelf p1 s1 FBOK
+p2 = add E2E_RAM_BASE get e4_bnd_off 1
+s2 = get e4_bnd_size 1
+p3 = add E2E_RAM_BASE get e4_bnd_off 2
+s3 = get e4_bnd_size 2
+p4 = add E2E_RAM_BASE get e4_bnd_off 3
+p5 = add E2E_RAM_BASE get e4_bnd_off 4
+e2e_ck eq fbbindblobs p2 s2 p3 s3 p4 p5 FBOK
+p6 = add E2E_RAM_BASE get e4_bnd_off 5
+e2e_ck eq fbbindsig p6 get e4_bnd_meta 1 FBOK
+end
+
+fn e2e_test_02 to void
+note Init bm_hal over 14 MiB simulated Normal-NC RAM at 0x80000000
+e2e_ck eq bminit 0 SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ E2E_RAM_BASE E2E_RAM_SZ E2E_FRQ BMOK
+put gspmode 0 2
+put gspd0ok 0 1
+note Encode real GspSystemInfo payload (RPC 72, 936 B) via sysinfo.om
+sireset
+e2e_ck eq siseti 0 SPARK_GB20B_BAR0_PA SIEOK
+e2e_ck eq siseti 2 add SPARK_GB20B_BAR0_PA 7340032 SIEOK
+e2e_ck eq siseti 4 64424509696 SIEOK
+siencode
+e2e_test_02_elf
+note Populate OMFWBND1 TOC in e4_toc[] for entries 1..6 and verify via bundle_parse_toc + SHA-256
+for z ulong 4096
+put e4_toc z 0
+end
+put e4_toc 0 79
+put e4_toc 1 77
+put e4_toc 2 70
+put e4_toc 3 87
+put e4_toc 4 66
+put e4_toc 5 78
+put e4_toc 6 68
+put e4_toc 7 49
+e2e_toc_w32 8 1
+e2e_toc_w32 12 58017302
+e2e_toc_w32 16 6
+e2e_toc_add_ent 0 1 4096 16384
+e2e_toc_add_ent 1 2 20480 212992
+e2e_toc_add_ent 2 3 233472 212296
+e2e_toc_add_ent 3 4 446464 48
+e2e_toc_add_ent 4 5 450560 384
+e2e_toc_add_ent 5 6 454656 384
+e2e_ck eq bundle_parse_toc 524288 0
+e2e_ck eq get e4_bnd_meta 0 1
+e2e_ck eq get e4_bnd_meta 1 58017302
+e2e_ck eq get e4_bnd_meta 2 6
+for ei ulong 6
+e2e_ck e2e_verify_toc_sha ei
+end
+note Parse entry 1 (gsp.bin) + bind entries 2..6 (bl, fmc, hash, pubkey, sig) from parsed TOC!
+e2e_bind_from_toc
 note Build GB20B Profile 2 arena at +524288 (2.5 MiB) and invoke #77 sccfg(abpa 1, fbappver)
 arenapa = add E2E_RAM_BASE 524288
 e2e_ck eq abbuild arenapa 2621440 E2E_HEAP_PA E2E_HEAP_SZ ABOK
 sccfg abpa 1 get fbappver 0
 e2e_ck eq get sclibospa 0 abpa 1
 e2e_ck eq get scappver 0 58017302
+e2e_test_02_boot
 e2e_puts e2e_t2
 end
 
 note ========================================================================
-note Test 3: Slice C GMMU + mem + chan + complete(cmbind marker_va + 16!)
+note Test 3: Slice C GMMU identity map (VA==PA) + bsetpd + cmbind(marker_va + 16)
 note ========================================================================
 
 fn e2e_test_03 to void
 e2e_ck eq mmwinit E2E_RAM_BASE E2E_RAM_SZ 0
 gmmu_pool = add E2E_RAM_BASE 3145728
 e2e_ck eq mmasinit gmmu_pool 64 0
-gmbuf_pa = add E2E_RAM_BASE 3407872
-e2e_ck eq gminit 8 gmbuf_pa 64 8589934592 GMOK
+note 2 MiB-aligned gmbuf_pa (0x80400000) -> gminit VA == PA so mk_va == mk_pa!
+gmbuf_pa = add E2E_RAM_BASE 4194304
+e2e_ck eq gminit 8 gmbuf_pa 64 gmbuf_pa GMOK
+note RPC 54 SET_PAGE_DIRECTORY via bsetpd with GMMU root PDB
+for pi ulong 11
+put pain pi 0
+end
+put pain 0 1001
+put pain 1 1002
+put pain 3 get mmroot 0
+put pain 4 512
+put pain 5 2
+put pain 7 1004
+e2e_ck eq pasetpd 48
+e2e_ck eq bsetpd 8 0
+e2e_statpush 54 ulong get rqsent 0 0 0 48
+e2e_ck eq bpoll 1
+e2e_ck eq get bstate 0 9
 chinit
 e2e_ck eq chprep 0 42 3 64 CHOK
 e2e_ck eq cminit CMOK
@@ -600,6 +848,7 @@ e2e_ck eq gmalloc 4096 1 GMHPOLL GMOK
 semslot = get gmout 0
 mk_pa = get gmbpa semslot
 mk_va = get gmbva semslot
+e2e_ck eq mk_va mk_pa
 put e2e_st 3 mk_pa
 gen = get mmwgen 0
 put e2e_st 2 gen
@@ -608,11 +857,12 @@ put iqgen 0 0
 put iqhalt 0 0
 put iqmode 0 2
 e2e_ck eq iqinit gen 0
-note #77 reminder: bind completion semaphore to marker_va + 16!
+note #77 reminder: bind completion semaphore to marker_va + 16 (with VA == PA)!
 e2e_ck eq cmbind 0 semslot 16 gen CMOK
 e2e_ck eq get cmpa 0 add mk_pa 16
-e2e_ck eq get cmva 0 add mk_va 16
+e2e_ck eq get cmva 0 add mk_pa 16
 e2e_ck eq mmwpublish gen 0
+e2e_ck eq mminval 4 MMOK
 e2e_puts e2e_t3
 end
 
@@ -621,9 +871,9 @@ note Test 4: Slice E q38_run.om + marker1-only negative control vs marker2 (+16)
 note ========================================================================
 
 fn e2e_setup_q38_base to void
-nc_base = add E2E_RAM_BASE 4194304
-wb_base = add E2E_RAM_BASE 11534336
-pb_pa = add E2E_RAM_BASE 12058624
+nc_base = add E2E_RAM_BASE 4718592
+wb_base = add E2E_RAM_BASE 12058624
+pb_pa = add E2E_RAM_BASE 12582912
 mk_pa = get e2e_st 3
 put e2e_st 4 pb_pa
 cbpbinit
@@ -631,7 +881,7 @@ e2e_ck eq cbpbsetup18 uint CBCCMP CBOK
 e2e_ck eq q3_init nc_base wb_base pb_pa mk_pa 4096 Q3OK
 e2e_ck eq mmrd32 mk_pa 0
 e2e_ck eq mmrd32 add mk_pa 16 0
-code_base = add E2E_RAM_BASE 12124160
+code_base = add E2E_RAM_BASE 12648448
 for k ulong Q3KCOUNT
 sm = uint 0
 if eq k Q3KBF16_5120
@@ -648,7 +898,7 @@ end
 end
 
 fn e2e_setup_q38_weights to void
-emb_va = add E2E_RAM_BASE 12189696
+emb_va = add E2E_RAM_BASE 12713984
 hi_base = add Q3LPDDRLO 17179869184
 e2e_ck eq q3_set_model emb_va hi_base add hi_base 4294967296 Q3OK
 gdn_base = add hi_base 8589934592

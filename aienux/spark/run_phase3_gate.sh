@@ -94,6 +94,7 @@ E2E_UNITS="
   $ROOT/gpu/driver/gsp/irqbm.om
   $ROOT/gpu/driver/gsp/irq.om
   $ROOT/aienux/disk/sha256_bare.om
+  $ROOT/aienux/disk/ext4_ro.om
   $ROOT/aienux/net/tcp/tcp.om
   $ROOT/gpu/driver/gsp/bm_hal.om
   $ROOT/gpu/driver/gsp/profile.om

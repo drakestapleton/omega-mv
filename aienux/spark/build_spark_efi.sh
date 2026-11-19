@@ -7,7 +7,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
-OUT="${1:-$ROOT/build/SPARK.EFI}"
+OUT="${1:-$ROOT/build/spark/SPARK.EFI}"
 OMC="${OMC:-$ROOT/seed/out/omc}"
 if [ ! -x "$OMC" ]; then
   echo "FAIL: omc compiler not executable at $OMC (set OMC=/path/to/omc)" >&2
