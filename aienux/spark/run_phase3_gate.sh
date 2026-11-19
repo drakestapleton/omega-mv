@@ -50,10 +50,10 @@ compile_host_om1() {
   sign_bin "$out"
 }
 
-echo "=== [1/9] Unified SPARK.EFI PE32+ Build (target a64efi) ==="
+echo "=== [1/11] Unified SPARK.EFI PE32+ Build (target a64efi) ==="
 OMC="$EFI_OMC" sh "$ROOT/aienux/spark/build_spark_efi.sh" "$TMP/SPARK.EFI"
 
-echo "=== [2/9] Boot Unified SPARK.EFI in 20-core 4 GiB QEMU virt EDK2 ==="
+echo "=== [2/11] Boot Unified SPARK.EFI in 20-core 4 GiB QEMU virt EDK2 ==="
 code=${A64EFI_CODE:-}
 for f in /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
          /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
@@ -85,7 +85,7 @@ if grep -q 'PANIC' "$TMP/qemu.log"; then
 fi
 echo "PASS qemu_20core_unified_spark_efi (Stage 1 20/20 SMP + Stage 2 fail-closed on absent GB20B)"
 
-echo "=== [3/9] Full-Stack Host E2E Simulation (test_spark_e2e.om + Linux ELF compile) ==="
+echo "=== [3/11] Full-Stack Host E2E Simulation (test_spark_e2e.om + Linux ELF compile) ==="
 E2E_UNITS="
   $ROOT/aienux/kernel/hal/iort.om
   $ROOT/aienux/kernel/hal/bar0_mmio.om
@@ -128,7 +128,7 @@ compile_host_om2 "$TMP/test_spark_e2e" $E2E_UNITS
 { printf 'om2\n'; cat $E2E_UNITS; } | "$EFI_OMC" > "$TMP/test_spark_e2e.elf"
 echo "PASS test_spark_e2e (host run + Linux AArch64 ELF compile $(wc -c < "$TMP/test_spark_e2e.elf" | tr -d ' ') B)"
 
-echo "=== [4/9] Slice A Regression (host_test.om) ==="
+echo "=== [4/11] Slice A Regression (host_test.om) ==="
 compile_host_om2 "$TMP/slice_a_host" \
   "$ROOT/aienux/kernel/core/scheduler.om" \
   "$ROOT/aienux/kernel/core/ipc.om" \
@@ -136,7 +136,7 @@ compile_host_om2 "$TMP/slice_a_host" \
   "$ROOT/aienux/kernel/arm64/host_test.om"
 "$TMP/slice_a_host"
 
-echo "=== [5/9] Slice B Regression (pcie_smmu_test.om) ==="
+echo "=== [5/11] Slice B Regression (pcie_smmu_test.om) ==="
 compile_host_om2 "$TMP/pcie_smmu_test" \
   "$ROOT/aienux/kernel/hal/iort.om" \
   "$ROOT/aienux/kernel/hal/bar0_mmio.om" \
@@ -149,7 +149,7 @@ compile_host_om2 "$TMP/pcie_smmu_test" \
   "$ROOT/aienux/kernel/hal/pcie_smmu_test.om"
 "$TMP/pcie_smmu_test"
 
-echo "=== [6/9] Slice C Regression (slice_c_gate.om) ==="
+echo "=== [6/11] Slice C Regression (slice_c_gate.om) ==="
 compile_host_om1 "$TMP/slice_c_gate" \
   "$ROOT/gpu/driver/gsp/bm_hal.om" \
   "$ROOT/gpu/driver/gsp/profile.om" \
@@ -173,10 +173,10 @@ compile_host_om1 "$TMP/slice_c_gate" \
   "$ROOT/gpu/driver/tests/slice_c_gate.om"
 "$TMP/slice_c_gate"
 
-echo "=== [7/9] Slice D Regression (run_slice_d.sh 7/7) ==="
+echo "=== [7/11] Slice D Regression (run_slice_d.sh 7/7) ==="
 OMC="$HOST_OMC" sh "$ROOT/aienux/disk/tests/run_slice_d.sh"
 
-echo "=== [8/9] Slice E Regression (q38_run_test.om + q38_sass_parity.sh) ==="
+echo "=== [8/11] Slice E Regression (q38_run_test.om + q38_sass_parity.sh) ==="
 compile_host_om1 "$TMP/q38_run_test" \
   "$ROOT/gpu/driver/tests/q38_run_shim.om" \
   "$ROOT/gpu/driver/gsp/compute.om" \
@@ -185,7 +185,7 @@ compile_host_om1 "$TMP/q38_run_test" \
 "$TMP/q38_run_test"
 (cd "$ROOT" && OMC="$HOST_OMC" sh gpu/driver/tests/q38_sass_parity.sh)
 
-echo "=== [9/9] Slice F Regression (test_loopback.om) ==="
+echo "=== [9/11] Slice F Regression (test_loopback.om) ==="
 compile_host_om2 "$TMP/test_loopback" \
   "$ROOT/aienux/net/tcp/tcp.om" \
   "$ROOT/aienux/net/wire/omtk.om" \
@@ -193,4 +193,10 @@ compile_host_om2 "$TMP/test_loopback" \
   "$ROOT/aienux/net/wire/test_loopback.om"
 "$TMP/test_loopback"
 
-echo "PHASE_3_SPARK_GLUE_GATE_PASS 9/9"
+echo "=== [10/11] SMMUv3 mode-1 on QEMU virt,iommu=smmuv3 (smmu_qemu_test.om + edu DMA) ==="
+sh "$ROOT/aienux/kernel/hal/run_smmu_qemu.sh" "$EFI_OMC"
+
+echo "=== [11/11] Real spark_main.om under QEMU (PLAT=qemu: Stage 1-3 + SMMUv3 + NVMe/GPT/ext4/bundle) ==="
+sh "$ROOT/aienux/spark/run_spark_qemu_e2e.sh" "$EFI_OMC"
+
+echo "PHASE_3_SPARK_GLUE_GATE_PASS 11/11"

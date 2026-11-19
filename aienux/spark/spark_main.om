@@ -48,6 +48,7 @@ const SPK_E_GB20B_ID ulong 203
 const SPK_E_QUIESCE ulong 204
 const SPK_E_SMMU ulong 205
 const SPK_E_IRQ_BIND ulong 206
+const SPK_E_PCIE_EN ulong 207
 const SPK_E_NVME_INIT ulong 301
 const SPK_E_GPT ulong 302
 const SPK_E_EXT4 ulong 303
@@ -106,6 +107,8 @@ text spk_fail_a "[SPARK FAIL stage="
 text spk_fail_b " code="
 text spk_fail_c "]\n"
 text spk_bnd_path "/aienos/spark-bundle.img"
+text spk_q_s3net "[SPARK QEMU] stage 3 bundle verified; RTL8127/TCP STUB (no QEMU model)\n"
+text spk_q_stop "SPARK_QEMU_E2E_PASS real=stage1,stage2(pcie+smmuv3+streams+bme),stage3(nvme+gpt+ext4+omfwbnd1-sha256) stubbed=gb20b-regs,stage3-net,stage4,stage5,stage6\n"
 
 note ========================================================================
 note Cross-Slice Bare-Metal Seam Implementations (Pieces 1 <-> 2 <-> 3 <-> 4 <-> 5 <-> 6)
@@ -482,31 +485,63 @@ end
 ret mapped
 end
 
-fn spk_record_dev to bool
-vid = get pcie_dev_info 0
-did = get pcie_dev_info 1
-cls = shr get pcie_dev_info 4 8
-if eq vid SPK_GB20B_VID
-bar0 = or and get pcie_dev_info 5 0xfffffff0 shl get pcie_dev_info 6 32
+note spk_dev: 0=gpu seg, 1=gpu rid, 2=nvme seg, 3=nvme rid, 4=rtl seg, 5=rtl rid,
+note 6=found mask (1 = GPU, 2 = NVMe, 4 = RTL8127). Streams and endpoint enables use the probed BDFs.
+global spk_dev ulong 8
+
+note Decode a memory BAR at pcie_dev_info[lo] (+ upper half at [lo+1] only when it is a 64-bit BAR,
+note type bits [2:1] == 0b10, PCIe Base r6.0 §7.5.1.2.1).
+fn spk_bar lo ulong to ulong
+b = get pcie_dev_info lo
+bar = and b 0xfffffff0
+if eq and b 6 4
+bar = or bar shl get pcie_dev_info add lo 1 32
+end
+ret bar
+end
+
+fn spk_mark k ulong seg uint bus ulong d ulong to void
+put spk_dev mul k 2 ulong seg
+put spk_dev add mul k 2 1 or shl bus 8 shl d 3
+put spk_dev 6 or get spk_dev 6 shl ulong 1 k
+end
+
+fn spk_record_gpu seg uint bus ulong d ulong to bool
+bar0 = spk_bar 5
 if eq bar0 0
-bar0 = SPARK_GB20B_BAR0_PA
+bar0 = SPK_PLAT_GPU_BAR_FALLBACK
+end
+if eq bar0 0
+ret false
 end
 put spk_gb20b_bar 0 bar0
+spk_mark 0 seg bus d
 ret true
 end
+
+fn spk_record_dev seg uint bus ulong d ulong to bool
+vid = get pcie_dev_info 0
+did = get pcie_dev_info 1
+if spk_plat_is_gpu vid did
+ret spk_record_gpu seg bus d
+end
 if and eq vid SPK_RTL_VID eq did SPK_RTL_DID
-bar2 = or and get pcie_dev_info 7 0xfffffff0 shl get pcie_dev_info 8 32
+bar2 = spk_bar 7
 if eq bar2 0
 bar2 = SPARK_RTL8127_BAR2_PA
 end
 put spk_rtl_bar 0 bar2
+spk_mark 2 seg bus d
 end
-if eq cls 0x010802
-nbar = or and get pcie_dev_info 5 0xfffffff0 shl get pcie_dev_info 6 32
+if eq shr get pcie_dev_info 4 8 0x010802
+if eq and get spk_dev 6 2 0
+nbar = spk_bar 5
 if eq nbar 0
 nbar = SPARK_NVME_BAR0_PA
 end
 put spk_nvme_bar 0 nbar
+spk_mark 1 seg bus d
+end
 end
 ret false
 end
@@ -518,7 +553,7 @@ found = false
 d = ulong 0
 while lt d 32 bound 32
 if eq pcie_probe_dev seg bus d 0 PCIE_OK
-if spk_record_dev
+if spk_record_dev seg bus d
 found = true
 end
 end
@@ -576,9 +611,20 @@ end
 ret eq smmu_init_instance inst base min_bits st_p cq_p eq_p SMMU_OK
 end
 
+note Stage-1 table / L2-STE pool for the mode-1 SMMUv3 back end (4 MiB Normal-NC; GB10 RMRs use 2 MiB blocks).
+const SPK_SMMU_PT_PAGES ulong 1024
+
 fn spk_init_smmu_abc to bool
 if not spk_init_iort
 ret false
+end
+pool = dma_alloc_nc SPK_SMMU_PT_PAGES 4096
+if ne smmu_set_pt_pool pool SPK_SMMU_PT_PAGES SMMU_OK
+ret false
+end
+if eq SPK_PLAT_QEMU 1
+note QEMU virt iommu=smmuv3: a single SMMUv3 from IORT node 0 (IDR1.SIDSIZE = 16).
+ret spk_init_smmu_one 0 get iort_smmu_base 0 16
 end
 if not spk_init_smmu_one 0 SPARK_SMMU_A_PA 20
 ret false
@@ -606,14 +652,43 @@ put spk_st st_slot ulong sh
 ret true
 end
 
+fn spk_open_dev_stream k ulong st_slot ulong to bool
+ret spk_open_one_stream uint get spk_dev mul k 2 uint get spk_dev add mul k 2 1 st_slot
+end
+
+note Streams for the probed GPU (slot 1), NVMe (slot 2) and RTL8127 (slot 15, when present).
 fn spk_open_smmu_streams to bool
-if not spk_open_one_stream 15 0x0100 1
+if not spk_open_dev_stream 0 1
 ret false
 end
-if not spk_open_one_stream 4 0x0100 2
+if not spk_open_dev_stream 1 2
 ret false
 end
-ret spk_open_one_stream 7 0x0100 15
+if eq and get spk_dev 6 4 0
+ret true
+end
+ret spk_open_dev_stream 2 15
+end
+
+note Enable MemSpace + BusMaster (+ DisINTx, MSI-X masked) on each used endpoint only AFTER its SMMUv3
+note stream is live: pcie_quiesce_unused may have cleared BME, and firmware may leave it clear post-EBS.
+fn spk_enable_dev k ulong to bool
+seg = uint get spk_dev mul k 2
+rid = get spk_dev add mul k 2 1
+ret eq pcie_enable_endpoint seg shr rid 8 and shr rid 3 31 and rid 7 PCIE_OK
+end
+
+fn spk_enable_endpoints to bool
+if not spk_enable_dev 0
+ret false
+end
+if not spk_enable_dev 1
+ret false
+end
+if eq and get spk_dev 6 4 0
+ret true
+end
+ret spk_enable_dev 2
 end
 
 fn spk_stage2 to bool
@@ -625,8 +700,11 @@ ibm_reset
 note Switch bar0_mmio.om to bare-metal mode 1 (fwld/fwst + dsb sy via fwops.om).
 put bmmio_mode 0 1
 put spk_gb20b_bar 0 0
-put spk_nvme_bar 0 SPARK_NVME_BAR0_PA
-put spk_rtl_bar 0 SPARK_RTL8127_BAR2_PA
+put spk_nvme_bar 0 0
+put spk_rtl_bar 0 0
+for di ulong 8
+put spk_dev di 0
+end
 nsegs = spk_register_mcfg_segs
 if eq nsegs 0
 spk_fail 2 SPK_E_NO_MCFG
@@ -638,25 +716,40 @@ spk_fail 2 SPK_E_NO_GB20B
 ret false
 end
 gbar = get spk_gb20b_bar 0
-if not mmio_map_device gbar SPARK_GB20B_BAR0_SZ
+if not mmio_map_device gbar SPK_PLAT_GPU_BAR_SZ
 spk_fail 2 SPK_E_BAR0_MAP
 ret false
 end
-hb = bmmio_register gbar gbar SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE
+hb = bmmio_register gbar gbar SPK_PLAT_GPU_BAR_SZ BMMIO_ATTR_NGNRNE
 if le hb 0
 spk_fail 2 SPK_E_BAR0_MAP
 ret false
 end
 put spk_st 0 ulong hb
-if not bmmio_verify_gb20b hb
+if not spk_plat_verify_gpu hb
 spk_fail 2 SPK_E_GB20B_ID
 ret false
 end
-nbar = get spk_nvme_bar 0
-rbar = get spk_rtl_bar 0
-if or not mmio_map_device nbar SPARK_NVME_BAR0_SZ not mmio_map_device rbar SPARK_RTL8127_BAR2_SZ
+note NVMe is mandatory everywhere; RTL8127 is mandatory on GB10 (SPK_PLAT_NEED_RTL). No device found ->
+note fail closed instead of touching a hard-coded BAR.
+if eq and get spk_dev 6 2 0
 spk_fail 2 SPK_E_BAR0_MAP
 ret false
+end
+if not mmio_map_device get spk_nvme_bar 0 SPARK_NVME_BAR0_SZ
+spk_fail 2 SPK_E_BAR0_MAP
+ret false
+end
+if eq and get spk_dev 6 4 0
+if eq SPK_PLAT_NEED_RTL 1
+spk_fail 2 SPK_E_BAR0_MAP
+ret false
+end
+else
+if not mmio_map_device get spk_rtl_bar 0 SPARK_RTL8127_BAR2_SZ
+spk_fail 2 SPK_E_BAR0_MAP
+ret false
+end
 end
 if lt pcie_quiesce_unused 0
 spk_fail 2 SPK_E_QUIESCE
@@ -672,9 +765,16 @@ if not spk_open_smmu_streams
 spk_fail 2 SPK_E_SMMU
 ret false
 end
+spk_plat_note_stage2
+if not spk_enable_endpoints
+spk_fail 2 SPK_E_PCIE_EN
+ret false
+end
+if eq SPK_PLAT_QEMU 0
 if ne ibm_bind hb 1 0
 spk_fail 2 SPK_E_IRQ_BIND
 ret false
+end
 end
 put iqmode 0 2
 ret true
@@ -867,6 +967,10 @@ end
 if not spk_stage3_bundle
 ret false
 end
+if eq SPK_PLAT_QEMU 1
+uart_puts spk_q_s3net
+ret true
+end
 ret spk_stage3_net
 end
 
@@ -1028,6 +1132,14 @@ sg = long get spk_st 1
 ret eq smmu_map_span sg pa sz 0 SMMU_OK
 end
 
+fn spk_gpu_span_wb pa ulong sz ulong to bool
+if eq pa 0
+ret false
+end
+sg = long get spk_st 1
+ret eq smmu_map_span_wb sg pa sz SMMU_OK
+end
+
 fn spk_stage4_gmmu_init to bool
 gmmu_pool = dma_alloc_nc 512 4096
 gmbuf_pa = dma_alloc_nc 64 2097152
@@ -1060,7 +1172,9 @@ end
 if not spk_gpu_span nc_base 8388608
 ret false
 end
-if not spk_gpu_span wb_base 2097152
+note wb_base comes from frames_alloc (CPU Normal-WB, ISH): map it Normal-WB on the SMMU too, and only on an
+note IO-coherent (IORT CCA=1) path (smmu_map_span_wb refuses otherwise) -- never an NC alias of WB memory.
+if not spk_gpu_span_wb wb_base 2097152
 ret false
 end
 if not spk_gpu_span code_pa 2097152
@@ -1336,6 +1450,12 @@ if not spk_stage2
 ret
 end
 if not spk_stage3
+ret
+end
+if eq SPK_PLAT_QEMU 1
+note QEMU has no GB20B: stop after the last stage QEMU can model and exit via PSCI SYSTEM_RESET.
+uart_puts spk_q_stop
+arm64_psci_reset get acpi_info 7
 ret
 end
 if not spk_stage4

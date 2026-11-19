@@ -9,6 +9,19 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 OUT="${1:-$ROOT/build/spark/SPARK.EFI}"
 OMC="${OMC:-$ROOT/seed/out/omc}"
+# Platform profile (aienux/spark/plat_$PLAT.om): gb10 = production SPARK.EFI (default);
+# qemu = gate-only QEMU virt test image (GPU stand-in, stops after stage 3). The QEMU image
+# must never be written to the default production path.
+PLAT="${PLAT:-gb10}"
+PLAT_OM="$ROOT/aienux/spark/plat_$PLAT.om"
+if [ ! -f "$PLAT_OM" ]; then
+  echo "FAIL: unknown PLAT=$PLAT (no $PLAT_OM)" >&2
+  exit 1
+fi
+if [ "$PLAT" != "gb10" ] && [ "$(basename "$OUT")" = "SPARK.EFI" ]; then
+  echo "FAIL: PLAT=$PLAT is a test profile; refusing to write it as SPARK.EFI" >&2
+  exit 1
+fi
 if [ ! -x "$OMC" ]; then
   echo "FAIL: omc compiler not executable at $OMC (set OMC=/path/to/omc)" >&2
   exit 1
@@ -109,13 +122,13 @@ PY
   cat "$ROOT/aienux/net/wire/omtk.om" \
       "$ROOT/aienux/net/wire/wire_loop.om"
   # Phase 3 Unified Entry & Cross-Slice Wiring
-  cat "$ROOT/aienux/spark/spark_main.om"
+  cat "$PLAT_OM" "$ROOT/aienux/spark/spark_main.om"
 } > "$TMP/spark_unified.om"
 
 "$OMC" < "$TMP/spark_unified.om" > "$OUT"
 
 # Verify PE32+ header & compact SizeOfImage
-python3 - "$OUT" <<'PY'
+python3 - "$OUT" "$PLAT" <<'PY'
 import hashlib, struct, sys
 
 path = sys.argv[1]
@@ -134,7 +147,7 @@ subsys = struct.unpack_from("<H", data, opt_off + 68)[0]
 assert subsys == 10, f"unexpected subsystem {subsys} (want 10 EFI_APPLICATION)"
 assert size_of_image < 16 * 1024 * 1024, f"SizeOfImage bloated: {size_of_image} B"
 sha = hashlib.sha256(data).hexdigest()
-print(f"PASS build_spark_efi: {path}")
+print(f"PASS build_spark_efi: {path} (PLAT={sys.argv[2]})")
 print(f"  PE32+ Machine=0x{machine:04x} Subsystem=EFI_APP FileSize={len(data)} B SizeOfImage={size_of_image} B ({size_of_image/1048576:.2f} MiB)")
 print(f"  sha256={sha}")
 PY
