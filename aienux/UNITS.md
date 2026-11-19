@@ -27,7 +27,7 @@ Remaining non-Omega files from the three OS sibling repos (64 files) are listed 
 
 `aienux/units-gate.om` (`OMEGA-AIENUX-UNITS`) mirrors `gpu/units-gate.om`: it refuses any compiler whose SHA-256 differs from `seed/out/omc.sha256` (exit 69), composes each row in `aienux/units.tsv`, compiles it twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Every hardware row stays `NOT_RUN`.
 
-The gate also runs every unit named in [`aienux/units-run.tsv`](units-run.tsv) (`tests/gates/run.sh aienux-units`): a `run` row must exit 0 from the repository root with stdin `/dev/null`, write no stderr, and end its stdout with the recorded line; a `not_run` row is built only, printed `NOT_RUN` with its reason and never counted as a pass. Every `*_test` unit needs a row. Today: 3 run, 0 not_run.
+The gate also runs every unit named in [`aienux/units-run.tsv`](units-run.tsv) (`tests/gates/run.sh aienux-units`): a `run` row must exit 0 from the repository root with stdin `/dev/null`, write no stderr, and end its stdout with the recorded line; a `not_run` row is built only, printed `NOT_RUN` with its reason and never counted as a pass. Every `*_test` unit needs a row. Today: 8 run, 0 not_run. Units whose names do not end in `_test` (fixtures, harness parts, and test-named units such as `allen_test_*`, `cortex_tests_*`, `rsi_tests_*`, `aien_train_tests_*` or `omega_bridge_tests_*`) need no row and stay compile-only unless a row names them.
 
 This gate verifies deterministic compilation with `seed/out/omc`. It does not run QEMU, boot firmware, or execute the behavioral oracles that still live in Aienux as C, Rust, shell, or Python.
 

@@ -229,13 +229,13 @@ case "$step" in
   gpu-units|gpu-extra-units|aienux-units|apps-units|bridge-units|core-units|protocol-units|si-units|train-units)
     case "$step" in
       gpu-units)       src=gpu/units-gate.om;       want="OMEGA-GPU-UNITS PASS units=405 runs=0 not_run=0 controls=1 caught=1 hardware=NOT_RUN" ;;
-      gpu-extra-units) src=gpu/extra-units-gate.om; want="OMEGA-GPU-EXTRA-UNITS PASS units=17 runs=3 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
-      aienux-units)    src=aienux/units-gate.om;    want="OMEGA-AIENUX-UNITS PASS units=73 runs=3 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
-      apps-units)      src=apps/units-gate.om;      want="OMEGA-APPS-UNITS PASS units=127 runs=4 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
-      bridge-units)    src=bridge/units-gate.om;    want="OMEGA-BRIDGE-UNITS PASS units=175 runs=0 not_run=1 controls=1 caught=1 hardware=NOT_RUN" ;;
-      core-units)      src=core/units-gate.om;      want="OMEGA-CORE-UNITS PASS units=44 runs=6 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
-      protocol-units)  src=protocol/units-gate.om;  want="OMEGA-PROTOCOL-UNITS PASS units=23 runs=3 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
-      si-units)        src=si/units-gate.om;        want="OMEGA-SI-UNITS PASS units=499 runs=8 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      gpu-extra-units) src=gpu/extra-units-gate.om; want="OMEGA-GPU-EXTRA-UNITS PASS units=22 runs=8 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      aienux-units)    src=aienux/units-gate.om;    want="OMEGA-AIENUX-UNITS PASS units=78 runs=8 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      apps-units)      src=apps/units-gate.om;      want="OMEGA-APPS-UNITS PASS units=129 runs=6 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      bridge-units)    src=bridge/units-gate.om;    want="OMEGA-BRIDGE-UNITS PASS units=176 runs=1 not_run=1 controls=2 caught=2 hardware=NOT_RUN" ;;
+      core-units)      src=core/units-gate.om;      want="OMEGA-CORE-UNITS PASS units=51 runs=13 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      protocol-units)  src=protocol/units-gate.om;  want="OMEGA-PROTOCOL-UNITS PASS units=28 runs=6 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      si-units)        src=si/units-gate.om;        want="OMEGA-SI-UNITS PASS units=501 runs=10 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
       train-units)     src=train/units-gate.om;     want="OMEGA-TRAIN-UNITS PASS units=78 runs=0 not_run=0 controls=1 caught=1 hardware=NOT_RUN" ;;
     esac
     tag="${want%% *}"
