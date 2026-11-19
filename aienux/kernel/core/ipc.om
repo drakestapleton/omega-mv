@@ -1,0 +1,269 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/core/ipc.om: Pure-Omega Aienux Kernel Capability-Gated IPC Channels
+note and Kernel-Owned Object Authority with Tree Revocation.
+note Converted from upstream aienux crates/aienos-kernel/src/ipc.rs and caps.rs.
+
+const IPC_OK int 0
+const IPC_ERR_CH_FULL int -1
+const IPC_ERR_CH_EMPTY int -2
+const IPC_ERR_MISSING_RIGHTS int -3
+const IPC_ERR_INVALID_HANDLE int -4
+const IPC_ERR_WRONG_RESOURCE int -5
+const IPC_ERR_DELEG_FAILED int -6
+
+const IPC_RIGHT_READ uint 0x1
+const IPC_RIGHT_WRITE uint 0x2
+const IPC_RIGHT_DERIVE uint 0x4
+const IPC_RIGHT_REVOKE uint 0x8
+
+const IPC_RES_CHANNEL uint 0x49504348
+const IPC_RES_OBJECT uint 0x49504f42
+
+const IPC_PRINCIPAL_A uint 0
+const IPC_PRINCIPAL_B uint 1
+const IPC_PRINCIPALS ulong 2
+const IPC_TAB_CAP ulong 8
+const IPC_TOTAL_CAPS ulong 16
+const IPC_CH_CAP ulong 8
+const IPC_OBJ_SLOTS ulong 4
+const IPC_PARENT_NONE uint 0xffffffff
+
+note Channel 0 FIFO ring (8 messages)
+note ch_meta: 0=head, 1=len
+global ipc_ch_meta ulong 4
+global ipc_ch_tag uint 8
+global ipc_ch_sender uint 8
+global ipc_ch_arg0 ulong 8
+global ipc_ch_arg1 ulong 8
+
+note Kernel-owned object (4 u64 words)
+global ipc_object ulong 4
+
+note Per-principal capability tables (2 principals * 8 slots = 16 slots)
+note Global slot index = principal * 8 + local_slot
+global ipc_cap_live uchar 16
+global ipc_cap_gen ulong 16
+global ipc_cap_res uint 16
+global ipc_cap_rgt uint 16
+global ipc_cap_par uint 16
+global ipc_cap_pgen ulong 16
+global ipc_next_gen ulong 2
+
+fn ipc_reset h_send edit ulong 1 h_obj edit ulong 1 h_recv edit ulong 1 to void
+put ipc_ch_meta 0 0
+put ipc_ch_meta 1 0
+put ipc_object 0 0xc0ffee01
+put ipc_object 1 0x0badc0de
+put ipc_object 2 0x12345678
+put ipc_object 3 0x9abcdef0
+for i ulong 16
+put ipc_cap_live i 0
+put ipc_cap_gen i 0
+put ipc_cap_res i 0
+put ipc_cap_rgt i 0
+put ipc_cap_par i IPC_PARENT_NONE
+put ipc_cap_pgen i 0
+end
+g = add get ipc_next_gen 0 1
+if eq g 0
+g = ulong 1
+end
+note Principal A slot 0: CHANNEL WRITE
+put ipc_cap_live 0 1
+put ipc_cap_gen 0 g
+put ipc_cap_res 0 IPC_RES_CHANNEL
+put ipc_cap_rgt 0 IPC_RIGHT_WRITE
+put h_send 0 or shl g 8 0
+g = add g 1
+note Principal A slot 1: OBJECT READ|WRITE|DERIVE|REVOKE
+put ipc_cap_live 1 1
+put ipc_cap_gen 1 g
+put ipc_cap_res 1 IPC_RES_OBJECT
+put ipc_cap_rgt 1 or or IPC_RIGHT_READ IPC_RIGHT_WRITE or IPC_RIGHT_DERIVE IPC_RIGHT_REVOKE
+put h_obj 0 or shl g 8 1
+g = add g 1
+note Principal B slot 0 (global slot 8): CHANNEL READ
+put ipc_cap_live 8 1
+put ipc_cap_gen 8 g
+put ipc_cap_res 8 IPC_RES_CHANNEL
+put ipc_cap_rgt 8 IPC_RIGHT_READ
+put h_recv 0 or shl g 8 0
+put ipc_next_gen 0 add g 1
+end
+
+fn ipc_handle_slot h ulong to ulong
+ret and h 0xff
+end
+
+fn ipc_handle_gen h ulong to ulong
+ret shr h 8
+end
+
+fn ipc_gated princ uint h ulong need uint want_res uint to int
+if ge ulong princ IPC_PRINCIPALS
+ret IPC_ERR_INVALID_HANDLE
+end
+lslot = ipc_handle_slot h
+if ge lslot IPC_TAB_CAP
+ret IPC_ERR_INVALID_HANDLE
+end
+gslot = add mul ulong princ IPC_TAB_CAP lslot
+if eq get ipc_cap_live gslot 0
+ret IPC_ERR_INVALID_HANDLE
+end
+if ne get ipc_cap_gen gslot ipc_handle_gen h
+ret IPC_ERR_INVALID_HANDLE
+end
+if ne and get ipc_cap_rgt gslot need need
+ret IPC_ERR_MISSING_RIGHTS
+end
+if ne get ipc_cap_res gslot want_res
+ret IPC_ERR_WRONG_RESOURCE
+end
+ret IPC_OK
+end
+
+fn ipc_channel_send princ uint h ulong msg view IpcMsg to int
+rc = ipc_gated princ h IPC_RIGHT_WRITE IPC_RES_CHANNEL
+if ne rc IPC_OK
+ret rc
+end
+clen = get ipc_ch_meta 1
+if eq clen IPC_CH_CAP
+ret IPC_ERR_CH_FULL
+end
+head = get ipc_ch_meta 0
+tail = rem add head clen IPC_CH_CAP
+put ipc_ch_tag tail get msg tag
+put ipc_ch_sender tail get msg sender
+put ipc_ch_arg0 tail get msg arg0
+put ipc_ch_arg1 tail get msg arg1
+put ipc_ch_meta 1 add clen 1
+ret IPC_OK
+end
+
+fn ipc_channel_recv princ uint h ulong dst edit IpcMsg to int
+rc = ipc_gated princ h IPC_RIGHT_READ IPC_RES_CHANNEL
+if ne rc IPC_OK
+ret rc
+end
+clen = get ipc_ch_meta 1
+if eq clen 0
+ret IPC_ERR_CH_EMPTY
+end
+head = get ipc_ch_meta 0
+put dst tag get ipc_ch_tag head
+put dst sender get ipc_ch_sender head
+put dst arg0 get ipc_ch_arg0 head
+put dst arg1 get ipc_ch_arg1 head
+put ipc_ch_meta 0 rem add head 1 IPC_CH_CAP
+put ipc_ch_meta 1 sub clen 1
+ret IPC_OK
+end
+
+fn ipc_object_read princ uint h ulong off ulong val_out edit ulong 1 to int
+rc = ipc_gated princ h IPC_RIGHT_READ IPC_RES_OBJECT
+if ne rc IPC_OK
+ret rc
+end
+if ge off IPC_OBJ_SLOTS
+ret IPC_ERR_WRONG_RESOURCE
+end
+put val_out 0 get ipc_object off
+ret IPC_OK
+end
+
+fn ipc_object_write princ uint h ulong off ulong val ulong to int
+rc = ipc_gated princ h IPC_RIGHT_WRITE IPC_RES_OBJECT
+if ne rc IPC_OK
+ret rc
+end
+if ge off IPC_OBJ_SLOTS
+ret IPC_ERR_WRONG_RESOURCE
+end
+put ipc_object off val
+ret IPC_OK
+end
+
+note Delegate an object capability from src_p to dst_p with attenuated rights.
+note Refuses rights outside READ|WRITE or rights not held by source; links child to parent for tree revocation.
+fn ipc_delegate_object src_p uint h ulong dst_p uint new_rgt uint h_out edit ulong 1 to int
+if or ge ulong src_p IPC_PRINCIPALS ge ulong dst_p IPC_PRINCIPALS
+ret IPC_ERR_INVALID_HANDLE
+end
+if eq src_p dst_p
+ret IPC_ERR_INVALID_HANDLE
+end
+rc = ipc_gated src_p h or IPC_RIGHT_READ IPC_RIGHT_DERIVE IPC_RES_OBJECT
+if ne rc IPC_OK
+ret rc
+end
+rw_mask = or IPC_RIGHT_READ IPC_RIGHT_WRITE
+if ne and new_rgt xor rw_mask 0xffffffff 0
+ret IPC_ERR_MISSING_RIGHTS
+end
+src_gslot = add mul ulong src_p IPC_TAB_CAP ipc_handle_slot h
+src_rgt = get ipc_cap_rgt src_gslot
+if ne and new_rgt xor src_rgt 0xffffffff 0
+ret IPC_ERR_MISSING_RIGHTS
+end
+base = mul ulong dst_p IPC_TAB_CAP
+free_lslot = IPC_TAB_CAP
+for i ulong 8
+if eq get ipc_cap_live add base i 0
+free_lslot = i
+break
+end
+end
+if ge free_lslot IPC_TAB_CAP
+ret IPC_ERR_DELEG_FAILED
+end
+dst_gslot = add base free_lslot
+g = get ipc_next_gen 0
+put ipc_next_gen 0 add g 1
+put ipc_cap_live dst_gslot 1
+put ipc_cap_gen dst_gslot g
+put ipc_cap_res dst_gslot IPC_RES_OBJECT
+put ipc_cap_rgt dst_gslot new_rgt
+put ipc_cap_par dst_gslot uint src_gslot
+put ipc_cap_pgen dst_gslot get ipc_cap_gen src_gslot
+put h_out 0 or shl g 8 free_lslot
+ret IPC_OK
+end
+
+fn ipc_cascade_revoke to void
+for pass ulong 16
+changed = false
+for i ulong 16
+if ne get ipc_cap_live i 0
+par = get ipc_cap_par i
+if ne par IPC_PARENT_NONE
+pidx = ulong par
+dead = eq get ipc_cap_live pidx 0
+if ne get ipc_cap_gen pidx get ipc_cap_pgen i
+dead = true
+end
+if dead
+put ipc_cap_live i 0
+changed = true
+end
+end
+end
+end
+if not changed
+break
+end
+end
+end
+
+note Revoke a capability and cascade-revoke every derived descendant across all principal tables.
+fn ipc_revoke princ uint h ulong to int
+rc = ipc_gated princ h IPC_RIGHT_REVOKE IPC_RES_OBJECT
+if ne rc IPC_OK
+ret rc
+end
+root_gslot = add mul ulong princ IPC_TAB_CAP ipc_handle_slot h
+put ipc_cap_live root_gslot 0
+ipc_cascade_revoke
+ret IPC_OK
+end

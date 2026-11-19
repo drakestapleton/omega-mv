@@ -1,0 +1,389 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/core/scheduler.om: Pure-Omega Aienux Kernel Scheduler (MADT CPU placement,
+note fair priority + least-served run queues, anti-starvation background reservation, work stealing).
+note Converted from upstream aienux crates/aienos-kernel/src/scheduler.rs.
+note Compose with: si/directives/om2.om aienux/kernel/core/scheduler.om aienux/kernel/core/ipc.om aienux/kernel/core/pagetable.om <test.om>
+
+note Shared kernel core structs (declared before first fn per OM-2 rule)
+struct IpcMsg tag uint sender uint arg0 ulong arg1 ulong end
+
+struct PtFlags attr uchar writable uchar user uchar executable uchar shareable uchar global_flag uchar end
+
+struct PtTrans pa ulong page_size ulong attr uchar writable uchar user uchar executable uchar shareable uchar global_flag uchar end
+
+note Scheduler priorities
+const SCHED_PRIO_BG uchar 0
+const SCHED_PRIO_NORMAL uchar 1
+const SCHED_PRIO_LATENCY uchar 2
+
+note Scheduler return / error codes
+const SCHED_OK int 0
+const SCHED_ERR_NO_CPUS int -1
+const SCHED_ERR_FULL int -2
+const SCHED_ERR_DUP_TASK int -3
+const SCHED_ERR_BAD_CPU int -4
+const SCHED_ERR_UNKNOWN int -5
+
+const SCHED_MAX_CPUS ulong 8
+const SCHED_MAX_TASKS ulong 64
+const SCHED_SLOT_NONE uint 0xffffffff
+
+note Scheduler metadata: 0=ncpus, 1=bg_interval, 2=cursor
+global sched_meta ulong 4
+global sched_classes uchar 8
+global sched_qlen ulong 8
+global sched_bg_wait ulong 8
+note Queues: 8 CPUs * 64 slots = 512 entries
+global sched_queues uint 512
+
+note Task table (64 slots)
+global sched_t_used uchar 64
+global sched_t_id uint 64
+global sched_t_prio uchar 64
+global sched_t_cpu ulong 64
+global sched_t_ticks ulong 64
+
+fn sched_init ncpus ulong bg_interval ulong classes view uchar * to int
+if or eq ncpus 0 or gt ncpus SCHED_MAX_CPUS lt len classes ncpus
+ret SCHED_ERR_NO_CPUS
+end
+bgi = bg_interval
+if eq bgi 0
+bgi = ulong 1
+end
+put sched_meta 0 ncpus
+put sched_meta 1 bgi
+put sched_meta 2 0
+for c ulong 8
+put sched_classes c 0
+put sched_qlen c 0
+put sched_bg_wait c 0
+end
+i = ulong 0
+while lt i ncpus bound 8
+put sched_classes i get classes i
+i = add i 1
+end
+for q ulong 512
+put sched_queues q SCHED_SLOT_NONE
+end
+for t ulong 64
+put sched_t_used t 0
+put sched_t_id t 0
+put sched_t_prio t 0
+put sched_t_cpu t 0
+put sched_t_ticks t 0
+end
+ret SCHED_OK
+end
+
+fn sched_place prio uchar cpu_out edit ulong 1 to int
+ncpus = get sched_meta 0
+if eq ncpus 0
+ret SCHED_ERR_NO_CPUS
+end
+cur = rem get sched_meta 2 ncpus
+if eq prio SCHED_PRIO_NORMAL
+best = cur
+best_len = get sched_qlen best
+off = ulong 1
+while lt off ncpus bound 8
+c = rem add cur off ncpus
+ql = get sched_qlen c
+if lt ql best_len
+best = c
+best_len = ql
+end
+off = add off 1
+end
+put cpu_out 0 best
+ret SCHED_OK
+end
+best_cls = get sched_classes 0
+i = ulong 1
+while lt i ncpus bound 8
+cl = get sched_classes i
+if eq prio SCHED_PRIO_LATENCY
+if gt cl best_cls
+best_cls = cl
+end
+else
+if lt cl best_cls
+best_cls = cl
+end
+end
+i = add i 1
+end
+off = ulong 0
+while lt off ncpus bound 8
+c = rem add cur off ncpus
+if eq get sched_classes c best_cls
+put cpu_out 0 c
+ret SCHED_OK
+end
+off = add off 1
+end
+ret SCHED_ERR_NO_CPUS
+end
+
+fn sched_enqueue tid uint prio uchar cpu_out edit ulong 1 to int
+ncpus = get sched_meta 0
+if eq ncpus 0
+ret SCHED_ERR_NO_CPUS
+end
+for i ulong 64
+if ne get sched_t_used i 0
+if eq get sched_t_id i tid
+ret SCHED_ERR_DUP_TASK
+end
+end
+end
+slot = ulong 64
+for i ulong 64
+if eq get sched_t_used i 0
+slot = i
+break
+end
+end
+if ge slot SCHED_MAX_TASKS
+ret SCHED_ERR_FULL
+end
+cbox = new ulong 1 0
+rc = sched_place prio cbox
+if ne rc SCHED_OK
+ret rc
+end
+cpu = get cbox 0
+put sched_meta 2 rem add cpu 1 ncpus
+ql = get sched_qlen cpu
+put sched_queues add mul cpu 64 ql uint slot
+put sched_qlen cpu add ql 1
+put sched_t_used slot 1
+put sched_t_id slot tid
+put sched_t_prio slot prio
+put sched_t_cpu slot cpu
+put sched_t_ticks slot 0
+put cpu_out 0 cpu
+ret SCHED_OK
+end
+
+fn sched_queue_remove_at c ulong pos ulong to void
+ql = get sched_qlen c
+base = mul c 64
+last = sub ql 1
+k = pos
+while lt k last bound 64
+nxt = get sched_queues add base add k 1
+put sched_queues add base k nxt
+k = add k 1
+end
+put sched_queues add base last SCHED_SLOT_NONE
+put sched_qlen c last
+end
+
+fn sched_remove tid uint to int
+slot = ulong 64
+for i ulong 64
+if ne get sched_t_used i 0
+if eq get sched_t_id i tid
+slot = i
+break
+end
+end
+end
+if ge slot SCHED_MAX_TASKS
+ret SCHED_ERR_UNKNOWN
+end
+ncpus = get sched_meta 0
+c = ulong 0
+while lt c ncpus bound 8
+ql = get sched_qlen c
+base = mul c 64
+found = ulong 64
+j = ulong 0
+while lt j ql bound 64
+if eq get sched_queues add base j uint slot
+found = j
+break
+end
+j = add j 1
+end
+if lt found ql
+sched_queue_remove_at c found
+break
+end
+c = add c 1
+end
+put sched_t_used slot 0
+ret SCHED_OK
+end
+
+fn sched_steal_pick donor ulong to ulong
+base = mul donor 64
+dlen = get sched_qlen donor
+cand_pos = ulong 0
+cand_slot = ulong get sched_queues base
+j = ulong 1
+while lt j dlen bound 64
+sl = ulong get sched_queues add base j
+sp = get sched_t_prio sl
+cp = get sched_t_prio cand_slot
+better = lt sp cp
+if eq sp cp
+if gt get sched_t_ticks sl get sched_t_ticks cand_slot
+better = true
+end
+end
+if better
+cand_pos = j
+cand_slot = sl
+end
+j = add j 1
+end
+ret cand_pos
+end
+
+fn sched_steal idle_cpu ulong stole_out edit uchar 1 to int
+ncpus = get sched_meta 0
+if ge idle_cpu ncpus
+ret SCHED_ERR_BAD_CPU
+end
+put stole_out 0 0
+if ne get sched_qlen idle_cpu 0
+ret SCHED_OK
+end
+donor = ulong 8
+best_len = ulong 1
+c = ulong 0
+while lt c ncpus bound 8
+if ne c idle_cpu
+ql = get sched_qlen c
+if gt ql best_len
+donor = c
+best_len = ql
+end
+end
+c = add c 1
+end
+if ge donor ncpus
+ret SCHED_OK
+end
+cand_pos = sched_steal_pick donor
+cand_slot = ulong get sched_queues add mul donor 64 cand_pos
+sched_queue_remove_at donor cand_pos
+put sched_queues mul idle_cpu 64 uint cand_slot
+put sched_qlen idle_cpu 1
+put sched_t_cpu cand_slot idle_cpu
+put stole_out 0 1
+ret SCHED_OK
+end
+
+fn sched_select_slot cpu ulong force_bg bool to ulong
+base = mul cpu 64
+ql = get sched_qlen cpu
+sel = ulong get sched_queues base
+j = ulong 1
+while lt j ql bound 64
+sl = ulong get sched_queues add base j
+sp = get sched_t_prio sl
+op = get sched_t_prio sel
+wins = false
+if force_bg
+if eq sp SCHED_PRIO_BG
+if ne op SCHED_PRIO_BG
+wins = true
+end
+end
+if eq sp op
+if lt get sched_t_ticks sl get sched_t_ticks sel
+wins = true
+end
+end
+else
+if gt sp op
+wins = true
+end
+if eq sp op
+if lt get sched_t_ticks sl get sched_t_ticks sel
+wins = true
+end
+end
+end
+if wins
+sel = sl
+end
+j = add j 1
+end
+ret sel
+end
+
+note Account one tick on cpu. Sets ran_out[0]=1 and tid_out[0]=task id if a task ran.
+fn sched_tick cpu ulong ran_out edit uchar 1 tid_out edit uint 1 to int
+ncpus = get sched_meta 0
+if ge cpu ncpus
+ret SCHED_ERR_BAD_CPU
+end
+put ran_out 0 0
+put tid_out 0 0
+stole = new uchar 1 0
+if eq get sched_qlen cpu 0
+rc = sched_steal cpu stole
+if ne rc SCHED_OK
+ret rc
+end
+if eq get stole 0 0
+ret SCHED_OK
+end
+end
+base = mul cpu 64
+ql = get sched_qlen cpu
+has_bg = false
+has_hi = false
+j = ulong 0
+while lt j ql bound 64
+sl = ulong get sched_queues add base j
+pr = get sched_t_prio sl
+if eq pr SCHED_PRIO_BG
+has_bg = true
+else
+has_hi = true
+end
+j = add j 1
+end
+force_bg = false
+if and has_bg has_hi
+bw = add get sched_bg_wait cpu 1
+put sched_bg_wait cpu bw
+if ge bw get sched_meta 1
+force_bg = true
+end
+else
+put sched_bg_wait cpu 0
+end
+sel = sched_select_slot cpu force_bg
+if eq get sched_t_prio sel SCHED_PRIO_BG
+put sched_bg_wait cpu 0
+end
+put sched_t_ticks sel add get sched_t_ticks sel 1
+put ran_out 0 1
+put tid_out 0 get sched_t_id sel
+ret SCHED_OK
+end
+
+fn sched_task_ticks tid uint to ulong
+for i ulong 64
+if ne get sched_t_used i 0
+if eq get sched_t_id i tid
+ret get sched_t_ticks i
+end
+end
+end
+ret 0
+end
+
+fn sched_queue_len cpu ulong to ulong
+if ge cpu SCHED_MAX_CPUS
+ret 0
+end
+ret get sched_qlen cpu
+end

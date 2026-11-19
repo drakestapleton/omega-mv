@@ -23,7 +23,8 @@ The OS layer is moving here from Aienux (`https://interplane.io/drakestapleton/a
 | `aienux/debugger/` | Pure-Omega continuous watchdog, metric triage and JSON-RPC dispatcher (converted from `spark-debugger`, `f35b24e0e8e8`, 3 `.om` files). |
 | `aienux/capability/` | Pure-Omega AIENOS 64-bit generation capability authority (converted from `aienux` `native/capability/aienos_capability.{h,c}` and `crates/aienos-capability`, 2 `.om` files). |
 | `aienux/argus/` | Pure-Omega ARGUS v1.2 event ABI, class-gated admission ring, shadow-state hard-invariant detectors, and containment state machine I1..I5 (converted from `aienux` `native/argus/`, 4 `.om` files). |
-| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit and its ordered parts (75 units). |
+| `aienux/kernel/core/` | Pure-Omega Aienux kernel core: MADT/fair work-stealing scheduler, capability-gated IPC with tree revocation, and AArch64 Stage-1 48-bit 4-level page-table builder/walker with W^X & Device-NX (converted from `crates/aienos-kernel/src/{scheduler,ipc,caps,mem/pagetable}.rs`, 4 `.om` files). |
+| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit and its ordered parts (76 units). |
 | `aienux/units-gate.om` | Seeded-Omega compile-reproducibility gate (`OMEGA-AIENUX-UNITS`). |
 | `aienux/NOT-YET-OMEGA.tsv` | Generated inventory of every non-Omega first-party file still in Aienux awaiting rewrite or retirement. |
 | `aienux/import/` | How each slice came here: `git filter-repo` command, `paths.txt`, `commit-map` and `ref-map`. |
