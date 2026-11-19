@@ -115,14 +115,13 @@ check-physics-lock:
 			echo "error: physics.lock not found at repo root" >&2; exit 1; \
 		fi; \
 		locked=$$(tr -d '[:space:]' < physics.lock); \
-		actual=$$(git -C $(PHYSICS_DIR) rev-parse HEAD 2>/dev/null); \
-		if [ -z "$$actual" ]; then \
-			echo "error: could not read HEAD of PHYSICS_DIR=$(PHYSICS_DIR) (git -C $(PHYSICS_DIR) rev-parse HEAD failed)" >&2; \
-			exit 1; \
-		fi; \
-		if [ "$$actual" != "$$locked" ]; then \
-			echo "error: PHYSICS_DIR=$(PHYSICS_DIR) is at commit $$actual but physics.lock pins $$locked." >&2; \
-			echo "       Checkout the pinned physics commit, or override with PHYSICS_LOCK_CHECK=0." >&2; \
+		case "$$locked" in \
+			[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; \
+			*) echo "error: physics.lock must contain exactly one lowercase 40-hex commit" >&2; exit 1 ;; \
+		esac; \
+		if ! tools/pinned_checkout.sh verify "$(PHYSICS_DIR)" "$$locked" >/dev/null; then \
+			printf '%s\n' "error: PHYSICS_DIR=$(PHYSICS_DIR) is not an exact worktree of physics.lock ($$locked)." >&2; \
+			echo "       Use an unmodified checkout at the pin, or override with PHYSICS_LOCK_CHECK=0." >&2; \
 			exit 1; \
 		fi; \
 	fi
@@ -138,8 +137,9 @@ $(OUT_DIR)/%.o: src/%.c | $(OUT_DIR)
 # path for exactly these). They must be rebuilt when PHYSICS_DIR points at another tree, not only
 # when a file there is newer, and none may compile before check-physics-lock passes (#488).
 # The stamp records the resolved PHYSICS_DIR and its git HEAD and is rewritten only when that
-# text changes, so an unchanged PHYSICS_DIR rebuilds nothing. Its phony prerequisite runs the
-# lock check first: when the check refuses, the stamp is not made and no physics object compiles.
+# text changes, so an unchanged PHYSICS_DIR rebuilds nothing. Its phony prerequisite proves the
+# commit, every tree/blob and the raw worktree bytes and modes first: when that proof refuses,
+# the stamp is not made and no physics object compiles.
 # The other objects take nothing from PHYSICS_DIR and are shared with physics-free builds
 # (crumbline-learner, omega, test-program-id), so they stay ungated.
 PHYSICS_STAMP = $(OUT_DIR)/physics.stamp
@@ -260,6 +260,13 @@ test-gate14-combine:
 .PHONY: test-gate-physics-pin
 test-gate-physics-pin:
 	tools/test_gate_physics_pin.sh
+	tools/test_pinned_checkout.sh
+
+# Host-only self-test of exact pinned-checkout materialization and verification:
+# dirty sources and replace refs cannot affect output; byte, mode and extra-path mutants refuse.
+.PHONY: test-pinned-checkout
+test-pinned-checkout:
+	tools/test_pinned_checkout.sh
 
 # Host-only self-test of the E1 closure combiner (tools/e1_combine.sh): good
 # synthetic constituent set accepted, every hostile mutant refused. No GPU.
