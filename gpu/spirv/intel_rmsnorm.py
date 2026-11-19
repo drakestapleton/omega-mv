@@ -135,10 +135,12 @@ def opencl_run(prereq, module, x, w):
             raise RuntimeError("%s returned %d" % (what, rc))
 
     nplat = u32(0)
-    check(clGetPlatformIDs(0, None, ctypes.byref(nplat)), "clGetPlatformIDs")
-    if nplat.value == 0:
+    # -1001 is CL_PLATFORM_NOT_FOUND_KHR: the loader is installed and no vendor platform is.
+    rc = clGetPlatformIDs(0, None, ctypes.byref(nplat))
+    if rc == -1001 or (rc == 0 and nplat.value == 0):
         sys.stdout.write("NOT_RUN rmsnorm %s: no OpenCL platform\n" % prereq)
         return 2
+    check(rc, "clGetPlatformIDs")
     Platform = ctypes.c_void_p * nplat.value
     plats = Platform()
     check(clGetPlatformIDs(nplat, ctypes.cast(plats, ctypes.POINTER(vp)), None), "clGetPlatformIDs")
