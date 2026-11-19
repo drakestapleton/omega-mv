@@ -21,7 +21,7 @@ result=subprocess.run([str(compiler)],input=program,capture_output=True,timeout=
 if result.returncode:raise SystemExit('C_EXPORT_COMPILE_FAILED: '+result.stderr.decode(errors='replace'))
 binary=result.stdout
 assert len(binary)>64 and binary[:4]==b'\x7fELF' and struct.unpack_from('<HH',binary,16)==(2,183),'C_EXPORT_NOT_AARCH64_EXEC'
-report={'schema':'omega.c-u64-export.build.v1','contract':'spec/universal/translation-v1.md','compiler_sha256':expected,'seed_source_archive':'0fc7d8662cb799e7c206b17c18ea4c3ec2b8fea9','birth_seed':'29b12760','inputs':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in parts},'combined_source_sha256':hashlib.sha256(program).hexdigest(),'binary_sha256':hashlib.sha256(binary).hexdigest(),'host_orchestration':'Python process/filesystem only; no C/Rust/Python generator or compute fallback in native artifact'}
+report={'schema':'omega.c-u64-export.build.v1','contract':'spec/universal/translation-v1.md','compiler_sha256':expected,'seed_source_archive':'0fc7d8662cb799e7c206b17c18ea4c3ec2b8fea9','birth_seed':'29b12760','inputs':{p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in parts},'combined_source_sha256':hashlib.sha256(program).hexdigest(),'binary_sha256':hashlib.sha256(binary).hexdigest(),'host_orchestration':'Python process/filesystem only; no C/Rust/Python generator or compute fallback in native artifact'}
 with tempfile.TemporaryDirectory(prefix='.c-export-build-',dir=build) as temp:
     t=Path(temp)
     (t/'program.om').write_bytes(program);(t/'c-export').write_bytes(binary);(t/'c-export').chmod(0o700)

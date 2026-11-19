@@ -357,7 +357,7 @@ def load_fixtures():
             info[lang] = 'absent'
             continue
         d = json.loads(path.read_text())
-        info[lang] = {'path': str(path.relative_to(ROOT)), 'sha256': sha(path.read_bytes()),
+        info[lang] = {'path': path.relative_to(ROOT).as_posix(), 'sha256': sha(path.read_bytes()),
                       'positives': len(d['positives']), 'controls': len(d.get('controls', [])),
                       'extra_positives': len(d.get('extra_positives', [])), 'refusals': len(d.get('refusals', []))}
         for p in d['positives']:
@@ -737,7 +737,7 @@ def main():
             tinfo[name] = {'sha256': sha(p.read_bytes())}
             for bj in sorted(repo.glob('build/**/build.json')):
                 if (bj.parent / name).is_file():
-                    tinfo[name].update({'build': str(bj.parent.relative_to(repo)), 'binary_sha256': sha((bj.parent / name).read_bytes())})
+                    tinfo[name].update({'build': bj.parent.relative_to(repo).as_posix(), 'binary_sha256': sha((bj.parent / name).read_bytes())})
         else:
             tinfo[name] = 'ABSENT'
     head = G.run(['git', '-C', repo, 'rev-parse', 'HEAD'])

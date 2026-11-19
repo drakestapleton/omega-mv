@@ -92,7 +92,7 @@ for n in (0, 1, 55, 56, 63, 64, 65, 4096, 65535, 65536, 65537, 131072):
 case('environment-refusal', bad, {'OMC_MEMORY_MAX': 'bad'})
 case('partial-input', bad + b'note ' + b'x' * 300000 + b'\n', {'OMC_MEMORY_MAX': '1'})
 for fixture in sorted((root / 'seed/omc/sites').glob('*.om')):
-    case(str(fixture.relative_to(root)), fixture.read_bytes())
+    case(fixture.relative_to(root).as_posix(), fixture.read_bytes())
 
 with tempfile.TemporaryDirectory(prefix='omc-d2-') as temp:
     d = Path(temp)

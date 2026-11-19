@@ -7,10 +7,17 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
+
+host_sys = platform.system()
+host_arch = platform.machine()
+if host_sys != 'Linux' or not Path('/usr/include/linux/kfd_ioctl.h').is_file():
+    print(f'NOT_RUN tests/kfd/check.py: requires Linux with /usr/include/linux/kfd_ioctl.h (host: {host_sys}/{host_arch})', file=sys.stderr)
+    sys.exit(77)
 
 root = Path(__file__).resolve().parents[2]
 os.chdir(root)
@@ -274,7 +281,7 @@ end
         execute(label,compile_case(label,'fn main to int\nr = '+expr+'\nret 0\nend\n',target),target,103)
 
 # Native trace oracle observes the syscall boundary, independently of errno.
-if os.uname().machine=='aarch64':
+if host_arch == 'aarch64':
     p=run(['cc','-Wall','-Wextra','-Werror',root/'tests/kfd/trace.c','-o',out/'trace'])
     record('trace oracle compile',p.returncode,0,p.stderr.decode())
     if not p.returncode:
