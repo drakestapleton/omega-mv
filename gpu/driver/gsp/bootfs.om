@@ -1,0 +1,388 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/driver/gsp/bootfs.om: Pure-Omega (OM-1) GB20B .fwimage BootFS 0x6d000 directory parser.
+note Host-only parser over caller-supplied 01_file_directory.bin bytes; never opens devices or MMIO.
+note Reference: nvidia-gb10/references/gsp-firmware-580-173-02.md (lines 18-20, MEASURED):
+note   .fwimage total size: 74,969,088 B (0x477f000)
+note   00_libos_root_boot_code.bin: 0x0..0x6c000 (442,368 B)
+note   01_file_directory.bin: 0x6c000..0x6e000 (8,192 B):
+note     4,096 B zero guard page (0x6c000..0x6d000)
+note     1,832 B BootFS directory at 0x6d000 (magic 0x81b26a705c10e14d, 12 records / 23 mappings)
+note     2,264 B zero tail (0x6d728..0x6e000)
+note   Remaining .fwimage payload: 0x6e000..0x477f000 (74,518,528 B), tiled with 0 gaps / 0 overlaps.
+note Clean-room wire note (NOT DETERMINED from gsp-firmware-580-173-02.md):
+note   Beyond +0 magic (u64 LE) and total directory size (1,832 B), internal header/record/mapping
+note   field offsets of NVIDIA's LibosBootfs structs are NOT DETERMINED in gsp-firmware-580-173-02.md.
+note   This unit defines an explicit self-describing little-endian record/mapping layout at 0x6d000:
+note     Header (16 B): +0 u64 magic, +8 u32 dir_bytes (16..4096), +12 u32 rec_count (1..64).
+note     Record (rec_size B, 8B-aligned, >= 16 B):
+note       +0 u32 rec_size, +4 u32 map_count (1..64), +8 u32 name_len, +12 u32 rec_flags,
+note       +16 map_count * 24 B mappings (each: +0 u64 fw_off, +8 u64 fw_len, +16 u64 va_attr),
+note       followed by optional name bytes (name_len) and zero padding to rec_size.
+note Prefix bf. Library unit: no fn main.
+
+note ---- MEASURED 580.173.02 .fwimage / 01_file_directory.bin constants ----
+const BFFWIMG ulong 74969088
+const BFDOFF ulong 442368
+const BFDEND ulong 450560
+const BFDSZ ulong 8192
+const BFGUARD ulong 4096
+const BFBOFF ulong 446464
+const BFDLEN ulong 1832
+const BFTAIL ulong 2264
+const BFMAGIC ulong 9345649207560692045
+const BFREMLEN ulong 74518528
+const BFEXPREC ulong 12
+const BFEXPMAP ulong 23
+
+note ---- Clean-room directory record/mapping layout constants (NOT DETERMINED vs NVIDIA struct) ----
+const BFHDRSZ ulong 16
+const BFRECSZ ulong 16
+const BFMAPSZ ulong 24
+const BFMAXR ulong 64
+const BFMAXM ulong 64
+
+note ---- Caller input buffer and parsed directory state ----
+global bfbuf uchar 8192
+global bfdirsz ulong 1
+global bfrcnt ulong 1
+global bfmcnt ulong 1
+global bfcov ulong 1
+global bfroff ulong 64
+global bfrlen ulong 64
+global bfrmcnt ulong 64
+global bfrnlen ulong 64
+global bfrflg ulong 64
+global bfmrec ulong 64
+global bfmoff ulong 64
+global bfmlen ulong 64
+global bfmva ulong 64
+global bford ulong 64
+
+note ---- Little-endian readers over bfbuf (bounds-checked by callers) ----
+fn bfu32 o ulong to ulong
+v = ulong 0
+for i ulong 4
+b = ulong get bfbuf add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+fn bfu64 o ulong to ulong
+v = ulong 0
+for i ulong 8
+b = ulong get bfbuf add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+note ---- State reset ----
+fn bfreset to void
+put bfdirsz 0 0
+put bfrcnt 0 0
+put bfmcnt 0 0
+put bfcov 0 0
+end
+
+note ---- Zero-region verifier over bfbuf[start .. start + count) ----
+fn bfchkzero start ulong count ulong to bool
+if gt start BFDSZ
+ret false
+end
+if gt count sub BFDSZ start
+ret false
+end
+for i ulong count
+if ne get bfbuf add start i 0
+ret false
+end
+end
+ret true
+end
+
+note ---- Stage 1: verify 4,096 B zero guard page (0x6c000..0x6d000) ----
+fn bfchkguard to long
+if not bfchkzero 0 BFGUARD
+ret -2
+end
+ret 0
+end
+
+note ---- Stage 2: verify BootFS directory header at 0x6d000 (bfbuf + 4096) ----
+fn bfchkhdr to long
+if ne bfu64 BFGUARD BFMAGIC
+ret -3
+end
+dsz = bfu32 add BFGUARD 8
+if or lt dsz BFHDRSZ gt dsz sub BFDSZ BFGUARD
+ret -4
+end
+rc = bfu32 add BFGUARD 12
+if or eq rc 0 gt rc BFMAXR
+ret -5
+end
+put bfdirsz 0 dsz
+put bfrcnt 0 rc
+ret 0
+end
+
+note ---- Stage 3: verify zero tail (0x6d000 + dir_bytes .. 0x6e000) ----
+fn bfchktail to long
+dsz = get bfdirsz 0
+tstart = add BFGUARD dsz
+tlen = sub BFDSZ tstart
+if not bfchkzero tstart tlen
+ret -6
+end
+ret 0
+end
+
+note ---- Stage 4: parse one record at bfbuf[cur .. endpos) ----
+fn bfwalkrec ridx ulong cur ulong endpos ulong to long
+if gt cur endpos
+ret -7
+end
+remb = sub endpos cur
+if lt remb BFRECSZ
+ret -7
+end
+rsz = bfu32 cur
+mc = bfu32 add cur 4
+nlen = bfu32 add cur 8
+if or lt rsz BFRECSZ gt rsz remb
+ret -7
+end
+if ne and rsz 7 0
+ret -7
+end
+if or eq mc 0 gt mc BFMAXM
+ret -7
+end
+mbase = get bfmcnt 0
+if gt add mbase mc BFMAXM
+ret -7
+end
+need = add BFRECSZ mul mc BFMAPSZ
+if gt need rsz
+ret -7
+end
+if gt nlen sub rsz need
+ret -7
+end
+put bfroff ridx cur
+put bfrlen ridx rsz
+put bfrmcnt ridx mc
+put bfrnlen ridx nlen
+put bfrflg ridx bfu32 add cur 12
+for j ulong mc
+mo = add cur add BFRECSZ mul j BFMAPSZ
+mi = add mbase j
+put bfmrec mi ridx
+put bfmoff mi bfu64 mo
+put bfmlen mi bfu64 add mo 8
+put bfmva mi bfu64 add mo 16
+end
+put bfmcnt 0 add mbase mc
+ret long rsz
+end
+
+note ---- Stage 4 driver: walk all bfrcnt records inside [4096 + 16 .. 4096 + bfdirsz) ----
+fn bfwalk to long
+rc = get bfrcnt 0
+cur = add BFGUARD BFHDRSZ
+endpos = add BFGUARD get bfdirsz 0
+for r ulong rc
+step = bfwalkrec r cur endpos
+if lt step 0
+ret step
+end
+cur = add cur ulong step
+end
+if ne cur endpos
+ret -7
+end
+mc = get bfmcnt 0
+if eq mc 0
+ret -7
+end
+ret long mc
+end
+
+note ---- Sort mapping indices 0..bfmcnt-1 by ascending bfmoff into bford ----
+fn bfsort to void
+mc = get bfmcnt 0
+for i ulong mc
+put bford i i
+end
+i = ulong 1
+while lt i mc bound 64
+key = get bford i
+koff = get bfmoff key
+j = i
+while gt j 0 bound 64
+prev = get bford sub j 1
+if le get bfmoff prev koff
+break
+end
+put bford j prev
+j = sub j 1
+end
+put bford j key
+i = add i 1
+end
+end
+
+note ---- Stage 5: verify bounds, non-overlap, and zero-gap tiling of [base .. base + span) ----
+note Returns 0 on exact tiling, -8 bounds violation, -9 overlap, -10 gap.
+fn bftilechk base ulong span ulong to long
+if eq span 0
+ret -8
+end
+mc = get bfmcnt 0
+if eq mc 0
+ret -8
+end
+lim = add base span
+for i ulong mc
+mo = get bfmoff i
+ml = get bfmlen i
+if eq ml 0
+ret -8
+end
+if or lt mo base gt mo lim
+ret -8
+end
+if gt ml sub lim mo
+ret -8
+end
+end
+bfsort
+expect = base
+tot = ulong 0
+for i ulong mc
+idx = get bford i
+mo = get bfmoff idx
+ml = get bfmlen idx
+if lt mo expect
+ret -9
+end
+if gt mo expect
+ret -10
+end
+expect = add mo ml
+tot = add tot ml
+end
+if ne expect lim
+ret -10
+end
+if ne tot span
+ret -10
+end
+put bfcov 0 tot
+ret 0
+end
+
+note ---- Full parser/validator over bfbuf[0..n) for .fwimage of total size fwsz ----
+note Returns mapping count (>= 1) on success, or negative error:
+note   -1 truncated buffer (n < 8192) or invalid fwsz (<= 0x6e000)
+note   -2 non-zero byte in 4,096 B guard page (0x6c000..0x6d000)
+note   -3 bad BootFS magic at 0x6d000 (not 0x81b26a705c10e14d)
+note   -4 invalid directory byte size (< 16 or > 4096)
+note   -5 invalid record count (0 or > 64)
+note   -6 non-zero byte in zero tail (0x6d000 + dir_bytes .. 0x6e000)
+note   -7 malformed or truncated record/mapping table or trailing dir bytes
+note   -8 mapping out of [0x6e000 .. fwsz) bounds or zero length
+note   -9 overlapping mappings
+note  -10 gap in tiling of [0x6e000 .. fwsz)
+fn bfparse n ulong fwsz ulong to long
+bfreset
+if or lt n BFDSZ le fwsz BFDEND
+ret -1
+end
+r = bfchkguard
+if lt r 0
+ret r
+end
+r = bfchkhdr
+if lt r 0
+ret r
+end
+r = bfchktail
+if lt r 0
+ret r
+end
+r = bfwalk
+if lt r 0
+ret r
+end
+t = bftilechk BFDEND sub fwsz BFDEND
+if lt t 0
+ret t
+end
+ret r
+end
+
+note ---- Pinned 580.173.02 validator: checks exact 74,969,088 B .fwimage, 1,832 B dir, 12 rec / 23 maps ----
+note Returns 23 on success, -1..-10 from bfparse, or -11 if 580.173.02 counts/sizes differ.
+fn bfparse580 n ulong to long
+r = bfparse n BFFWIMG
+if lt r 0
+ret r
+end
+if ne get bfdirsz 0 BFDLEN
+ret -11
+end
+if ne get bfrcnt 0 BFEXPREC
+ret -11
+end
+if ne get bfmcnt 0 BFEXPMAP
+ret -11
+end
+ret r
+end
+
+note ---- Read-only accessors ----
+fn bfdirlen to ulong
+ret get bfdirsz 0
+end
+
+fn bfrecn to ulong
+ret get bfrcnt 0
+end
+
+fn bfmapn to ulong
+ret get bfmcnt 0
+end
+
+fn bfcovered to ulong
+ret get bfcov 0
+end
+
+fn bfmapoff i ulong to ulong
+if ge i get bfmcnt 0
+ret 0
+end
+ret get bfmoff i
+end
+
+fn bfmaplen i ulong to ulong
+if ge i get bfmcnt 0
+ret 0
+end
+ret get bfmlen i
+end
+
+fn bfmapva i ulong to ulong
+if ge i get bfmcnt 0
+ret 0
+end
+ret get bfmva i
+end
+
+fn bfmaprec i ulong to ulong
+if ge i get bfmcnt 0
+ret 0
+end
+ret get bfmrec i
+end

@@ -1,0 +1,278 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/driver/tests/bootfs_trace.om: Host-only self-test suite for gsp/bootfs.om (OM-1).
+note Build: cat gpu/driver/gsp/bootfs.om gpu/driver/tests/bootfs_trace.om | seed/out/omc > bootfs_trace
+note Never opens a device, maps MMIO, or reads external firmware blobs. Synthetic fixtures only.
+
+text BTPASS "BOOTFS TEST PASS 9/9\n"
+
+note ---- Fixture writers into bfbuf ----
+fn btput32 o ulong v ulong to void
+for i ulong 4
+put bfbuf add o i uchar and shr v mul i 8 255
+end
+end
+
+fn btput64 o ulong v ulong to void
+for i ulong 8
+put bfbuf add o i uchar and shr v mul i 8 255
+end
+end
+
+fn btclear to void
+for i ulong BFDSZ
+put bfbuf i 0
+end
+end
+
+note Build valid 580.173.02-shaped synthetic 01_file_directory.bin:
+note   4,096 B zero guard page (0..4096)
+note   1,832 B BootFS directory (4096..5928): magic + 12 records / 23 mappings
+note     11 records x 152 B (2 maps each) + 1 record x 144 B (1 map) = 1816 B + 16 B hdr = 1832 B
+note     22 maps x 3,200,000 B + 1 map x 4,118,528 B = 74,518,528 B tiling [450560..74969088)
+note   2,264 B zero tail (5928..8192)
+fn btbuild580 to void
+btclear
+btput64 BFGUARD BFMAGIC
+btput32 add BFGUARD 8 BFDLEN
+btput32 add BFGUARD 12 BFEXPREC
+cur = add BFGUARD BFHDRSZ
+fwo = BFDEND
+for r ulong 11
+btput32 cur 152
+btput32 add cur 4 2
+btput32 add cur 8 8
+btput32 add cur 12 r
+btput64 add cur 16 fwo
+btput64 add cur 24 3200000
+btput64 add cur 32 add 16777216 mul r 65536
+fwo = add fwo 3200000
+btput64 add cur 40 fwo
+btput64 add cur 48 3200000
+btput64 add cur 56 add 67108864 mul r 65536
+fwo = add fwo 3200000
+cur = add cur 152
+end
+btput32 cur 144
+btput32 add cur 4 1
+btput32 add cur 8 8
+btput32 add cur 12 11
+btput64 add cur 16 fwo
+btput64 add cur 24 4118528
+btput64 add cur 32 71303168
+end
+
+note ---- Test 1: valid 580.173.02 directory & zero-gap tiling ----
+fn bttest1 to bool
+btbuild580
+rc = bfparse580 BFDSZ
+if ne rc 23
+ret false
+end
+if ne bfdirlen BFDLEN
+ret false
+end
+if ne bfrecn BFEXPREC
+ret false
+end
+if ne bfmapn BFEXPMAP
+ret false
+end
+if ne bfcovered BFREMLEN
+ret false
+end
+if ne bfmapoff 0 BFDEND
+ret false
+end
+if ne bfmaplen 0 3200000
+ret false
+end
+if ne bfmapoff 22 70850560
+ret false
+end
+if ne bfmaplen 22 4118528
+ret false
+end
+if ne bfmaprec 22 11
+ret false
+end
+ret true
+end
+
+note ---- Test 2: unsorted mapping order still validates exact tiling ----
+fn bttest2 to bool
+btbuild580
+note Swap mapping 0 (at 4112+16=4128) and mapping 22 (at 5784+16=5800)
+btput64 4128 70850560
+btput64 4136 4118528
+btput64 5800 BFDEND
+btput64 5808 3200000
+rc = bfparse580 BFDSZ
+if ne rc 23
+ret false
+end
+if ne bfcovered BFREMLEN
+ret false
+end
+ret true
+end
+
+note ---- Test 3: negative control - bad magic at 0x6d000 ----
+fn bttest3 to bool
+btbuild580
+btput64 BFGUARD xor BFMAGIC 1
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -3
+ret false
+end
+ret true
+end
+
+note ---- Test 4: negative control - non-zero guard page (0x6c000..0x6d000) ----
+fn bttest4 to bool
+btbuild580
+put bfbuf 0 1
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -2
+ret false
+end
+btbuild580
+put bfbuf 4095 255
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -2
+ret false
+end
+ret true
+end
+
+note ---- Test 5: negative control - non-zero tail (0x6d728..0x6e000) ----
+fn bttest5 to bool
+btbuild580
+put bfbuf 5928 1
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -6
+ret false
+end
+btbuild580
+put bfbuf 8191 1
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -6
+ret false
+end
+ret true
+end
+
+note ---- Test 6: negative control - truncated buffer & truncated directory ----
+fn bttest6 to bool
+btbuild580
+rc = bfparse 8191 BFFWIMG
+if ne rc -1
+ret false
+end
+btbuild580
+btput32 add BFGUARD 8 sub BFDLEN 8
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -7
+ret false
+end
+ret true
+end
+
+note ---- Test 7: negative control - overlapping mappings refused ----
+fn bttest7 to bool
+btbuild580
+note Extend mapping 0 length by 4096 B so it overlaps mapping 1
+btput64 4136 add 3200000 4096
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -9
+ret false
+end
+ret true
+end
+
+note ---- Test 8: negative control - leading, interior, and trailing gaps refused ----
+fn bttest8 to bool
+note Leading gap: shift mapping 0 start up by 4096 B
+btbuild580
+btput64 4128 add BFDEND 4096
+btput64 4136 sub 3200000 4096
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -10
+ret false
+end
+note Interior gap: shrink mapping 0 length by 4096 B
+btbuild580
+btput64 4136 sub 3200000 4096
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -10
+ret false
+end
+note Trailing gap: shrink last mapping (at 5800) length by 4096 B
+btbuild580
+btput64 5808 sub 4118528 4096
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -10
+ret false
+end
+ret true
+end
+
+note ---- Test 9: negative control - out-of-bounds and zero-length mappings refused ----
+fn bttest9 to bool
+note Below 0x6e000
+btbuild580
+btput64 4128 sub BFDEND 4096
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -8
+ret false
+end
+note Zero length
+btbuild580
+btput64 4136 0
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -8
+ret false
+end
+note Past end of .fwimage
+btbuild580
+btput64 5808 add 4118528 4096
+rc = bfparse BFDSZ BFFWIMG
+if ne rc -8
+ret false
+end
+ret true
+end
+
+fn main to int
+if not bttest1
+ret 1
+end
+if not bttest2
+ret 2
+end
+if not bttest3
+ret 3
+end
+if not bttest4
+ret 4
+end
+if not bttest5
+ret 5
+end
+if not bttest6
+ret 6
+end
+if not bttest7
+ret 7
+end
+if not bttest8
+ret 8
+end
+if not bttest9
+ret 9
+end
+w = write 1 BTPASS 0 len BTPASS
+if ne w long len BTPASS
+ret 20
+end
+ret 0
+end
