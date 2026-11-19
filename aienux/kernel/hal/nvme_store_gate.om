@@ -1,0 +1,530 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/nvme_store_gate.om: Pure-Omega GPT/AIENOS partition discovery,
+note single-layer NVMe write confinement, Store key admissibility, and single-transaction
+note continuity subject provisioning gate.
+note Converted from aienux native/kernel/dev/{disk_part,nvme_bind}.{h,c} and
+note native/kernel/svc/{store_boot,continuity_subject_provision}.{h,c}.
+note Compose with: si/directives/om2.om aienux/kernel/hal/iort.om aienux/kernel/hal/nvme_store_gate.om ...
+
+const HAL_GPT_OK int 0
+const HAL_GPT_EGEOM int -402
+const HAL_GPT_ENOMBR int -403
+const HAL_GPT_ESIG int -404
+const HAL_GPT_EHDR_CRC int -405
+const HAL_GPT_EHDR int -406
+const HAL_GPT_EENT_CRC int -407
+const HAL_GPT_EENT int -408
+const HAL_GPT_EBACKUP int -409
+const HAL_GPT_EOUTSIDE int -410
+const HAL_GPT_EOVERLAP int -411
+const HAL_GPT_ENOPART int -412
+const HAL_GPT_EMULTI int -413
+const HAL_GPT_ETOOMANY int -414
+
+const HAL_DISK_OK int 0
+const HAL_DISK_ESTATE int -201
+const HAL_DISK_EARG int -202
+const HAL_DISK_ERANGE int -203
+
+const HAL_NVME_OK int 0
+const HAL_NVME_ESTATE int -301
+const HAL_NVME_ESTUCK int -302
+const HAL_NVME_EUNCONFINED int -303
+
+const HAL_SB_OK int 0
+const HAL_SB_E_TEST_KEYS int -2001
+const HAL_SB_E_BLOCKED_OPERATOR int -2002
+const HAL_SB_E_KEYSLOT_BAD int -2006
+
+const HAL_CR_RESOLVED int 0
+const HAL_CR_E_ARG int -501
+const HAL_CR_CORRUPT int -502
+const HAL_CR_ALREADY_PROVISIONED int -503
+const HAL_CR_LIMIT int -504
+const HAL_CR_SPLIT_TXN int -505
+
+const HAL_KEY_TEST ulong 0
+const HAL_KEY_PROD ulong 1
+const HAL_ORIGIN_OPERATOR uchar 1
+const HAL_ORIGIN_PROMOTED uchar 2
+
+note Partition state: 0=valid, 1=first_lba, 2=blocks, 3=parent_blocks, 4=used, 5=part_index,
+note 6=first_usable, 7=last_usable
+global hal_part ulong 8
+global hal_used_lo ulong 128
+global hal_used_hi ulong 128
+
+note NVMe bind state: 0=claimed, 1=stuck, 2=confined, 3=stream_id, 4=seg, 5=rid
+global hal_nvme ulong 6
+
+note Provisioning state: 0=txn_count, 1=committed_objs, 2=subject_seq, 3=provisioned
+global hal_prov ulong 4
+
+note Test-only mutant hooks (default 0): 0=bypass_xlate, 1=split_txn
+global hal_mut ulong 2
+
+fn hal_set_mutants bypass_xlate ulong split_txn ulong to void
+put hal_mut 0 bypass_xlate
+put hal_mut 1 split_txn
+end
+
+fn hal_rd32 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = uint get buf add off 1
+b2 = uint get buf add off 2
+b3 = uint get buf add off 3
+lo = or b0 shl b1 8
+hi = or shl b2 16 shl b3 24
+ret or lo hi
+end
+
+fn hal_rd64 buf view uchar * off ulong to ulong
+lo = ulong hal_rd32 buf off
+hi = ulong hal_rd32 buf add off 4
+ret or lo shl hi 32
+end
+
+note IEEE 802.3 CRC32 (reflected 0xedb88320, init/xorout 0xffffffff).
+fn hal_crc32_slice buf view uchar * off ulong n ulong to uint
+crc = uint 0xffffffff
+i = ulong 0
+note Covers GPT headers (92..512 B) and entry arrays (up to 16384 B).
+while lt i n bound 65536
+b = uint get buf add off i
+crc = xor crc b
+for bit ulong 8
+if ne and crc 1 0
+crc = xor shr crc 1 0xedb88320
+else
+crc = shr crc 1
+end
+end
+i = add i 1
+end
+ret xor crc 0xffffffff
+end
+
+note CRC32 of a GPT header with the 4-byte HeaderCRC32 field at +16 treated as zero.
+fn hal_gpt_hdr_crc buf view uchar * off ulong hsize ulong to uint
+crc = uint 0xffffffff
+i = ulong 0
+while lt i hsize bound 4096
+b = uint 0
+if or lt i 16 ge i 20
+b = uint get buf add off i
+end
+crc = xor crc b
+for bit ulong 8
+if ne and crc 1 0
+crc = xor shr crc 1 0xedb88320
+else
+crc = shr crc 1
+end
+end
+i = add i 1
+end
+ret xor crc 0xffffffff
+end
+
+fn hal_part_reset to void
+for i ulong 8
+put hal_part i 0
+end
+end
+
+fn hal_is_gpt_sig buf view uchar * off ulong to bool
+note "EFI PART" = 69 70 73 32 80 65 82 84
+if or ne get buf off 69 ne get buf add off 1 70
+ret false
+end
+if or ne get buf add off 2 73 ne get buf add off 3 32
+ret false
+end
+if or ne get buf add off 4 80 ne get buf add off 5 65
+ret false
+end
+if or ne get buf add off 6 82 ne get buf add off 7 84
+ret false
+end
+ret true
+end
+
+fn hal_guid_is_zero buf view uchar * off ulong to bool
+i = ulong 0
+while lt i 16 bound 16
+if ne get buf add off i 0
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn hal_guid_eq_same buf view uchar * aoff ulong boff ulong to bool
+i = ulong 0
+while lt i 16 bound 16
+if ne get buf add aoff i get buf add boff i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn hal_guid_eq_buf a view uchar * aoff ulong b view uchar * boff ulong to bool
+i = ulong 0
+while lt i 16 bound 16
+if ne get a add aoff i get b add boff i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn hal_check_pmbr disk view uchar * to bool
+if or ne get disk 510 0x55 ne get disk 511 0xaa
+ret false
+end
+found_ee = false
+for p ulong 4
+ptype = get disk add add 446 mul p 16 4
+if eq ptype 0xee
+found_ee = true
+end
+end
+ret found_ee
+end
+
+fn hal_used_overlaps flba ulong llba ulong used ulong to bool
+j = ulong 0
+while lt j used bound 128
+ulo = get hal_used_lo j
+uhi = get hal_used_hi j
+if and le flba uhi le ulo llba
+ret true
+end
+j = add j 1
+end
+ret false
+end
+
+fn hal_scan_one_entry disk view uchar * cur ulong idx ulong want view uchar 16 to int
+if hal_guid_is_zero disk cur
+ret 0
+end
+used = get hal_part 4
+if ge used 128
+ret HAL_GPT_ETOOMANY
+end
+flba = hal_rd64 disk add cur 32
+llba = hal_rd64 disk add cur 40
+if or gt flba llba lt flba get hal_part 6
+ret HAL_GPT_EOUTSIDE
+end
+if gt llba get hal_part 7
+ret HAL_GPT_EOUTSIDE
+end
+if hal_used_overlaps flba llba used
+ret HAL_GPT_EOVERLAP
+end
+put hal_used_lo used flba
+put hal_used_hi used llba
+put hal_part 4 add used 1
+if hal_guid_eq_buf disk cur want 0
+put hal_part 1 flba
+put hal_part 2 add sub llba flba 1
+put hal_part 5 idx
+ret 1
+end
+ret 0
+end
+
+fn hal_scan_gpt_entries disk view uchar * eoff ulong entries ulong esize ulong want view uchar 16 to int
+matches = ulong 0
+i = ulong 0
+while lt i entries bound 1024
+cur = add eoff mul i esize
+rc = hal_scan_one_entry disk cur i want
+if lt rc 0
+ret rc
+end
+if eq rc 1
+matches = add matches 1
+end
+i = add i 1
+end
+if eq matches 0
+ret HAL_GPT_ENOPART
+end
+if gt matches 1
+ret HAL_GPT_EMULTI
+end
+put hal_part 0 1
+ret HAL_GPT_OK
+end
+
+fn hal_gpt_check_primary_ent disk view uchar * bsz ulong to int
+entries = ulong hal_rd32 disk add bsz 80
+esize = ulong hal_rd32 disk add bsz 84
+if or eq entries 0 gt entries 1024
+ret HAL_GPT_EENT
+end
+if or lt esize 128 gt esize 512
+ret HAL_GPT_EENT
+end
+pe_lba = hal_rd64 disk add bsz 72
+ebytes = mul entries esize
+if lt pe_lba 2
+ret HAL_GPT_EENT
+end
+if gt add mul pe_lba bsz ebytes len disk
+ret HAL_GPT_EENT
+end
+if ne hal_crc32_slice disk mul pe_lba bsz ebytes hal_rd32 disk add bsz 88
+ret HAL_GPT_EENT_CRC
+end
+ret HAL_GPT_OK
+end
+
+fn hal_gpt_check_primary disk view uchar * bsz ulong last_lba ulong to int
+if not hal_is_gpt_sig disk bsz
+ret HAL_GPT_ESIG
+end
+rev = hal_rd32 disk add bsz 8
+hsz = ulong hal_rd32 disk add bsz 12
+if ne rev 0x00010000
+ret HAL_GPT_ESIG
+end
+if or lt hsz 92 gt hsz bsz
+ret HAL_GPT_ESIG
+end
+if ne hal_gpt_hdr_crc disk bsz hsz hal_rd32 disk add bsz 16
+ret HAL_GPT_EHDR_CRC
+end
+if or ne hal_rd64 disk add bsz 24 1 ne hal_rd64 disk add bsz 32 last_lba
+ret HAL_GPT_EHDR
+end
+first_u = hal_rd64 disk add bsz 40
+last_u = hal_rd64 disk add bsz 48
+if or gt first_u last_u ge last_u last_lba
+ret HAL_GPT_EHDR
+end
+put hal_part 6 first_u
+put hal_part 7 last_u
+ret hal_gpt_check_primary_ent disk bsz
+end
+
+fn hal_gpt_check_backup_ent disk view uchar * bsz ulong b1 ulong to int
+entries = ulong hal_rd32 disk add bsz 80
+esize = ulong hal_rd32 disk add bsz 84
+ecrc = hal_rd32 disk add bsz 88
+if or ne ulong hal_rd32 disk add b1 80 entries ne ulong hal_rd32 disk add b1 84 esize
+ret HAL_GPT_EBACKUP
+end
+if ne hal_rd32 disk add b1 88 ecrc
+ret HAL_GPT_EBACKUP
+end
+be_lba = hal_rd64 disk add b1 72
+ebytes = mul entries esize
+if le be_lba get hal_part 7
+ret HAL_GPT_EBACKUP
+end
+if gt add mul be_lba bsz ebytes b1
+ret HAL_GPT_EBACKUP
+end
+if ne hal_crc32_slice disk mul be_lba bsz ebytes ecrc
+ret HAL_GPT_EBACKUP
+end
+ret HAL_GPT_OK
+end
+
+fn hal_gpt_check_backup disk view uchar * bsz ulong last_lba ulong to int
+b1 = mul last_lba bsz
+if not hal_is_gpt_sig disk b1
+ret HAL_GPT_EBACKUP
+end
+hsz = ulong hal_rd32 disk add bsz 12
+if or ne hal_rd32 disk add b1 8 0x00010000 ne ulong hal_rd32 disk add b1 12 hsz
+ret HAL_GPT_EBACKUP
+end
+if ne hal_gpt_hdr_crc disk b1 hsz hal_rd32 disk add b1 16
+ret HAL_GPT_EBACKUP
+end
+if or ne hal_rd64 disk add b1 24 last_lba ne hal_rd64 disk add b1 32 1
+ret HAL_GPT_EBACKUP
+end
+if not hal_guid_eq_same disk add bsz 56 add b1 56
+ret HAL_GPT_EBACKUP
+end
+ret hal_gpt_check_backup_ent disk bsz b1
+end
+
+note Parse and strictly validate protective MBR + primary/backup GPT + single target partition.
+fn hal_gpt_find_type disk view uchar * bsz ulong bcnt ulong want view uchar 16 to int
+hal_part_reset
+if or lt bsz 512 or gt bsz 4096 lt bcnt 6
+ret HAL_GPT_EGEOM
+end
+if gt mul bcnt bsz len disk
+ret HAL_GPT_EGEOM
+end
+if not hal_check_pmbr disk
+ret HAL_GPT_ENOMBR
+end
+last_lba = sub bcnt 1
+rc1 = hal_gpt_check_primary disk bsz last_lba
+if ne rc1 HAL_GPT_OK
+ret rc1
+end
+rc2 = hal_gpt_check_backup disk bsz last_lba
+if ne rc2 HAL_GPT_OK
+ret rc2
+end
+put hal_part 3 bcnt
+pe_lba = hal_rd64 disk add bsz 72
+entries = ulong hal_rd32 disk add bsz 80
+esize = ulong hal_rd32 disk add bsz 84
+ret hal_scan_gpt_entries disk mul pe_lba bsz entries esize want
+end
+
+note Single-layer partition translation (ck_part_xlate): partition-relative -> absolute LBA.
+fn hal_part_xlate lba ulong count uint abs_out edit ulong 1 to int
+if ne get hal_mut 0 0
+note Mutant: bypass partition translation and bounds check
+put abs_out 0 lba
+ret HAL_DISK_OK
+end
+if eq get hal_part 0 0
+ret HAL_DISK_ESTATE
+end
+if eq count 0
+ret HAL_DISK_EARG
+end
+pblocks = get hal_part 2
+if ge lba pblocks
+ret HAL_DISK_ERANGE
+end
+cnt64 = ulong count
+if gt cnt64 sub pblocks lba
+ret HAL_DISK_ERANGE
+end
+flba = get hal_part 1
+abs = add flba lba
+if lt abs flba
+ret HAL_DISK_ERANGE
+end
+parent_b = get hal_part 3
+if gt add abs cnt64 parent_b
+ret HAL_DISK_ERANGE
+end
+put abs_out 0 abs
+ret HAL_DISK_OK
+end
+
+note ---- NVMe ownership & DMA confinement gate ----
+
+fn hal_nvme_reset to void
+for i ulong 6
+put hal_nvme i 0
+end
+end
+
+fn hal_nvme_claim seg uint rid uint smmu_confined ulong stream_id uint bm_sticky ulong to int
+if ne get hal_nvme 0 0
+ret HAL_NVME_ESTATE
+end
+put hal_nvme 0 1
+put hal_nvme 4 ulong seg
+put hal_nvme 5 ulong rid
+if ne bm_sticky 0
+note Fail closed: device stays owned/stuck so no subsequent bind can proceed
+put hal_nvme 1 1
+ret HAL_NVME_ESTUCK
+end
+put hal_nvme 2 smmu_confined
+put hal_nvme 3 ulong stream_id
+ret HAL_NVME_OK
+end
+
+fn hal_nvme_release to int
+if ne get hal_nvme 1 0
+note Stuck device stays owned through release (fail closed)
+ret HAL_NVME_ESTUCK
+end
+hal_nvme_reset
+ret HAL_NVME_OK
+end
+
+fn hal_nvme_authorize_write lba ulong count uint abs_out edit ulong 1 to int
+if or eq get hal_nvme 0 0 ne get hal_nvme 1 0
+ret HAL_NVME_ESTATE
+end
+if eq get hal_nvme 2 0
+ret HAL_NVME_EUNCONFINED
+end
+ret hal_part_xlate lba count abs_out
+end
+
+note ---- Store key admissibility & single-transaction subject provisioning gate ----
+
+fn hal_store_key_admissible key_class ulong hw_staging ulong to int
+if eq key_class HAL_KEY_PROD
+ret HAL_SB_OK
+end
+if eq key_class HAL_KEY_TEST
+if ne hw_staging 0
+ret HAL_SB_E_TEST_KEYS
+end
+ret HAL_SB_OK
+end
+ret HAL_SB_E_KEYSLOT_BAD
+end
+
+fn hal_all_zero32 buf view uchar 32 to bool
+for i ulong 32
+if ne get buf i 0
+ret false
+end
+end
+ret true
+end
+
+fn hal_prov_reset to void
+for i ulong 4
+put hal_prov i 0
+end
+end
+
+note Single-transaction identity + ALLEN genesis subject provisioning gate.
+fn hal_store_provision_gate prov view uchar 32 cortex view uchar 32 origin uchar existing_roots uint existing_subjs uint base_objs uint to int
+hal_prov_reset
+if or hal_all_zero32 prov hal_all_zero32 cortex
+ret HAL_CR_E_ARG
+end
+if and ne origin HAL_ORIGIN_OPERATOR ne origin HAL_ORIGIN_PROMOTED
+ret HAL_CR_E_ARG
+end
+if and gt existing_subjs 0 eq existing_roots 0
+ret HAL_CR_CORRUPT
+end
+if gt existing_roots 0
+ret HAL_CR_ALREADY_PROVISIONED
+end
+if or eq base_objs 0 gt add base_objs 1 16
+ret HAL_CR_LIMIT
+end
+if ne get hal_mut 1 0
+note Mutant: split root and subject across two transactions
+put hal_prov 0 2
+put hal_prov 1 ulong add base_objs 1
+put hal_prov 2 1
+put hal_prov 3 1
+ret HAL_CR_SPLIT_TXN
+end
+put hal_prov 0 1
+put hal_prov 1 ulong add base_objs 1
+put hal_prov 2 1
+put hal_prov 3 1
+ret HAL_CR_RESOLVED
+end
