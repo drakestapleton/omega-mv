@@ -1,0 +1,705 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/wire/wire_loop.om: Zero-userspace in-kernel polled TCP <-> GPU wire loop (Piece 6).
+note Pure seeded Omega (OM-2). Zero Linux syscalls, zero heap, fixed globals only.
+note Composes after: aienux/net/tcp/tcp.om, aienux/net/wire/omtk.om, and a platform/NIC/GPU seam unit
+note defining:
+note   wl_cntvct -> ulong                         Piece 1 CNTVCT_EL0 counter
+note   wl_cntfrq -> ulong                         Piece 1 CNTFRQ_EL0 frequency (Hz)
+note   wl_dsb_ish -> void                         Piece 1 ARM64 dsb ish barrier
+note   wl_nic_rx -> ulong                         Piece 4 poll 1 Ethernet frame into Trx[0..n), 0 if none
+note   wl_nic_tx n ulong -> long                  Piece 4 transmit Ttx[0..n), 0 ok, <0 err
+note   wl_nic_reclaim -> void                     Piece 4 reclaim completed TX descriptors
+note   wl_q38_reset_kv keep_pos ulong -> long     Piece 5 q38_reset_kv (pb_words > 0, or -2 E_UNSUP)
+note   wl_q38_stage_step tok uint kv uint mode uchar -> long  Piece 5 q38_stage_step (pb_words > 0)
+note   wl_q38_verify_step -> long                 Piece 5 q38_verify_step (0 ok, <0 Trap #13 guard)
+note   wl_q38_read_tok -> uint                    Piece 5 read verified output tok_id from Normal-NC
+note   wl_gpu_kick pb_words uint -> long          Piece 3 cbgpent + cbkickbar0 (DSB SY chain) + cmsub
+note   wl_gpu_poll -> long                        Piece 3 non-blocking cmpoll (>0 done, 0 wait, <0 err)
+note   wl_gpu_irq_check -> long                   Piece 3 iqservice (>=0 ok, -13 HALT, -14 lockdown)
+note   wl_gpu_quarantine -> void                  Piece 3 cmquar quarantine latch
+note   wl_should_stop -> ulong                    0 on bare-metal forever; nonzero exits host test
+
+note Loop states
+const WL_IDLE ulong 0
+const WL_SUBMIT ulong 1
+const WL_WAIT ulong 2
+const WL_FAULT ulong 3
+
+note In-flight GPU operation kinds
+const WL_OPNONE ulong 0
+const WL_OPRESET ulong 1
+const WL_OPPREF ulong 2
+const WL_OPDEC ulong 3
+
+note State vector indices (wl_st[0..31])
+const WL_S_STATE ulong 0
+const WL_S_OP ulong 1
+const WL_S_PORT ulong 2
+const WL_S_MAXCTX ulong 3
+const WL_S_VOCAB ulong 4
+const WL_S_KVPOS ulong 5
+const WL_S_REQID ulong 6
+const WL_S_CANCEL ulong 7
+const WL_S_SUBMS ulong 8
+const WL_S_ACTMS ulong 9
+const WL_S_CONN ulong 10
+const WL_S_PFIDX ulong 11
+const WL_S_PFCNT ulong 12
+const WL_S_DCSEQ ulong 13
+const WL_S_DCMAX ulong 14
+const WL_S_DCEOS ulong 15
+const WL_S_CURTOK ulong 16
+const WL_S_GERR ulong 17
+const WL_S_RXN ulong 18
+const WL_S_RXDROP ulong 19
+const WL_S_LASTTOK ulong 20
+const WL_S_IDLETMO ulong 21
+const WL_S_STEPTMO ulong 22
+const WL_S_TXH ulong 23
+const WL_S_TXN ulong 24
+const WL_S_DROPS ulong 25
+
+const WL_DEFPORT ulong 18100
+const WL_DEFCTX ulong 262144
+const WL_DEFVOC ulong 248320
+const WL_DEFIDLE ulong 30000
+const WL_DEFSTEP ulong 5000
+const WL_DECMAX ulong 16384
+const WL_TXCAP ulong 4096
+
+global wl_st ulong 32
+global wl_rx uchar 16400
+global wl_ptoks uint 4096
+global wl_txq uchar 4096
+
+note Required by aienux/net/tcp/tcp.om: transmit Ttx[0..n) through Piece 4 NIC.
+fn tlinkout n ulong to void
+rc = wl_nic_tx n
+if lt rc 0
+tstat 30
+end
+end
+
+note Overflow-safe monotonic millisecond clock from Piece 1 CNTVCT_EL0 / CNTFRQ_EL0.
+note Uses (t / frq) * 1000 + ((t % frq) * 1000) / frq (zero u64 overflow for frq <= 1.8e16 Hz).
+fn wl_now_ms to ulong
+t = wl_cntvct
+frq = wl_cntfrq
+if eq frq 0
+ret 0
+end
+sec_ms = mul div t frq 1000
+rem_ms = div mul rem t frq 1000 frq
+ret add sec_ms rem_ms
+end
+
+fn wl_err_u32 rc long to ulong
+if lt rc 0
+ret ulong sub 0 rc
+end
+ret ulong rc
+end
+
+note Initialize wire loop state and arm tcp.om passive listener on port.
+fn wl_init port ulong max_ctx ulong vocab_sz ulong to void
+for i ulong 32
+put wl_st i 0
+end
+if eq port 0
+port = WL_DEFPORT
+end
+if eq max_ctx 0
+max_ctx = WL_DEFCTX
+end
+if eq vocab_sz 0
+vocab_sz = WL_DEFVOC
+end
+put wl_st WL_S_PORT port
+put wl_st WL_S_MAXCTX max_ctx
+put wl_st WL_S_VOCAB vocab_sz
+put wl_st WL_S_IDLETMO WL_DEFIDLE
+put wl_st WL_S_STEPTMO WL_DEFSTEP
+now = wl_now_ms
+put Tcf 0 now
+put wl_st WL_S_ACTMS now
+tinit
+tlisten port
+end
+
+note Queue omktx[0..omktxn) into bounded wl_txq ring (4096 B).
+fn wl_qtx to void
+n = get omktxn 0
+if eq n 0
+ret
+end
+cur = get wl_st WL_S_TXN
+if gt n sub WL_TXCAP cur
+ret
+end
+h = get wl_st WL_S_TXH
+tail = rem add h cur WL_TXCAP
+i = ulong 0
+while lt i n bound 64
+put wl_txq rem add tail i WL_TXCAP get omktx i
+i = add i 1
+end
+put wl_st WL_S_TXN add cur n
+end
+
+note Drain queued reply bytes from wl_txq into tcp.om send ring via twrite.
+fn wl_flush_tx to void
+n = get wl_st WL_S_TXN
+if eq n 0
+ret
+end
+h = get wl_st WL_S_TXH
+i = ulong 0
+while lt i n bound 4096
+put Tapp i get wl_txq rem add h i WL_TXCAP
+i = add i 1
+end
+w = twrite n
+if gt w 0
+put wl_st WL_S_TXH rem add h w WL_TXCAP
+put wl_st WL_S_TXN sub n w
+end
+end
+
+fn wl_send_err req_id ulong ecode ulong detail ulong to void
+rc = omk_enc_err req_id ecode detail
+if eq rc OMK_OK
+wl_qtx
+end
+end
+
+fn wl_send_done req_id ulong flags ulong kv ulong reason ulong to void
+rc = omk_enc_done req_id flags kv reason
+if eq rc OMK_OK
+wl_qtx
+end
+end
+
+fn wl_send_tok req_id ulong flags ulong seq ulong tok ulong to void
+rc = omk_enc_token req_id flags seq tok
+if eq rc OMK_OK
+wl_qtx
+end
+end
+
+fn wl_send_pong req_id ulong to void
+st = get wl_st WL_S_STATE
+kv = get wl_st WL_S_KVPOS
+mc = get wl_st WL_S_MAXCTX
+ge_ = get wl_st WL_S_GERR
+rc = omk_enc_pong req_id st kv mc ge_
+if eq rc OMK_OK
+wl_qtx
+end
+end
+
+note Enter quarantined FAULT state: latch cmquar, emit ERR, refuse future compute.
+fn wl_fault req_id ulong ecode ulong detail ulong to void
+wl_gpu_quarantine
+put wl_st WL_S_STATE WL_FAULT
+put wl_st WL_S_OP WL_OPNONE
+put wl_st WL_S_CANCEL 0
+put wl_st WL_S_GERR ecode
+wl_send_err req_id ecode detail
+end
+
+note Little-endian u32/u16 readers from wl_rx.
+fn wl_rx_r16 off ulong to ulong
+a = ulong get wl_rx off
+b = ulong get wl_rx add off 1
+ret or a shl b 8
+end
+
+fn wl_rx_r32 off ulong to ulong
+a = ulong get wl_rx off
+b = ulong get wl_rx add off 1
+c = ulong get wl_rx add off 2
+d = ulong get wl_rx add off 3
+ret or or or a shl b 8 shl c 16 shl d 24
+end
+
+note Unpack wl_rx[0..16) into omkhdr[0..5] and validate.
+fn wl_parse_rx_hdr to ulong
+put omkhdr 0 wl_rx_r32 0
+put omkhdr 1 ulong get wl_rx 4
+put omkhdr 2 ulong get wl_rx 5
+put omkhdr 3 wl_rx_r16 6
+put omkhdr 4 wl_rx_r32 8
+put omkhdr 5 wl_rx_r32 12
+ret omk_chk_hdr
+end
+
+note Consume n bytes from the front of wl_rx.
+fn wl_rx_consume n ulong to void
+cur = get wl_st WL_S_RXN
+if ge n cur
+put wl_st WL_S_RXN 0
+ret
+end
+remn = sub cur n
+i = ulong 0
+while lt i remn bound 16400
+put wl_rx i get wl_rx add i n
+i = add i 1
+end
+put wl_st WL_S_RXN remn
+end
+
+note Reset per-connection framing buffers and re-arm passive TCP listen.
+fn wl_rearm now ulong to void
+put wl_st WL_S_RXN 0
+put wl_st WL_S_RXDROP 0
+put wl_st WL_S_TXH 0
+put wl_st WL_S_TXN 0
+put wl_st WL_S_CONN 0
+put wl_st WL_S_ACTMS now
+if ne get wl_st WL_S_STATE WL_IDLE
+if ne get wl_st WL_S_STATE WL_FAULT
+put wl_st WL_S_CANCEL 1
+end
+end
+tlisten get wl_st WL_S_PORT
+end
+
+note Handle RESET_KV (op=3): keep_pos == 0 routes through GPU_SUBMIT -> GPU_WAIT;
+note keep_pos > 0 calls q38_reset_kv and propagates ERR(E_UNSUP) on -2.
+fn wl_do_reset req_id ulong to void
+st = get wl_st WL_S_STATE
+if eq st WL_FAULT
+wl_send_err req_id OMK_EFAULT get wl_st WL_S_GERR
+ret
+end
+if ne st WL_IDLE
+wl_send_err req_id OMK_EBUSY 0
+ret
+end
+keep = wl_rx_r32 16
+if gt keep 0
+rc = wl_q38_reset_kv keep
+if eq rc -2
+wl_send_err req_id OMK_EUNSUP keep
+ret
+end
+if lt rc 0
+wl_send_err req_id OMK_EGSTAGE wl_err_u32 rc
+ret
+end
+if eq rc 0
+put wl_st WL_S_KVPOS keep
+wl_send_done req_id 0 keep OMK_RRESET
+ret
+end
+end
+put wl_st WL_S_REQID req_id
+put wl_st WL_S_OP WL_OPRESET
+put wl_st WL_S_CANCEL 0
+put wl_st WL_S_STATE WL_SUBMIT
+end
+
+note Handle PREFILL (op=4): overflow-safe MAX_CTX check + vocab check before GPU submit.
+fn wl_do_prefill req_id ulong plen ulong to void
+st = get wl_st WL_S_STATE
+if eq st WL_FAULT
+wl_send_err req_id OMK_EFAULT get wl_st WL_S_GERR
+ret
+end
+if ne st WL_IDLE
+wl_send_err req_id OMK_EBUSY 0
+ret
+end
+ntok = div plen 4
+mctx = get wl_st WL_S_MAXCTX
+kv = get wl_st WL_S_KVPOS
+if gt ntok mctx
+wl_send_err req_id OMK_ERANGE ntok
+ret
+end
+if gt kv sub mctx ntok
+wl_send_err req_id OMK_ERANGE kv
+ret
+end
+voc = get wl_st WL_S_VOCAB
+i = ulong 0
+while lt i ntok bound 4096
+tok = wl_rx_r32 add OMK_HDR mul i 4
+if ge tok voc
+wl_send_err req_id OMK_EBADTOK tok
+ret
+end
+put wl_ptoks i uint tok
+i = add i 1
+end
+put wl_st WL_S_REQID req_id
+put wl_st WL_S_PFIDX 0
+put wl_st WL_S_PFCNT ntok
+put wl_st WL_S_OP WL_OPPREF
+put wl_st WL_S_CANCEL 0
+put wl_st WL_S_STATE WL_SUBMIT
+end
+
+note Handle DECODE (op=5): bounds, temp==0 check, overflow-safe MAX_CTX check.
+fn wl_do_decode req_id ulong to void
+st = get wl_st WL_S_STATE
+if eq st WL_FAULT
+wl_send_err req_id OMK_EFAULT get wl_st WL_S_GERR
+ret
+end
+if ne st WL_IDLE
+wl_send_err req_id OMK_EBUSY 0
+ret
+end
+mtok = wl_rx_r32 16
+eos = wl_rx_r32 20
+tmp = wl_rx_r32 24
+if or eq mtok 0 gt mtok WL_DECMAX
+wl_send_err req_id OMK_ERANGE mtok
+ret
+end
+if ne tmp 0
+wl_send_err req_id OMK_EUNSUP tmp
+ret
+end
+if ge eos get wl_st WL_S_VOCAB
+wl_send_err req_id OMK_EBADTOK eos
+ret
+end
+kv = get wl_st WL_S_KVPOS
+if ge kv get wl_st WL_S_MAXCTX
+wl_send_err req_id OMK_ERANGE kv
+ret
+end
+put wl_st WL_S_REQID req_id
+put wl_st WL_S_DCSEQ 0
+put wl_st WL_S_DCMAX mtok
+put wl_st WL_S_DCEOS eos
+put wl_st WL_S_CURTOK get wl_st WL_S_LASTTOK
+put wl_st WL_S_OP WL_OPDEC
+put wl_st WL_S_CANCEL 0
+put wl_st WL_S_STATE WL_SUBMIT
+end
+
+note Handle CANCEL (op=8).
+fn wl_do_cancel req_id ulong to void
+st = get wl_st WL_S_STATE
+if or eq st WL_SUBMIT eq st WL_WAIT
+put wl_st WL_S_CANCEL 1
+ret
+end
+wl_send_done req_id 0 get wl_st WL_S_KVPOS OMK_RCANCEL
+end
+
+note Parse and dispatch at most one complete OMTK v1 frame from wl_rx.
+note Returns 1 if a frame was consumed, 0 if incomplete or dropped.
+fn wl_dispatch_one now ulong to ulong
+if ne get wl_st WL_S_RXDROP 0
+ret 0
+end
+rxn = get wl_st WL_S_RXN
+if lt rxn OMK_HDR
+ret 0
+end
+rc = wl_parse_rx_hdr
+req = get omkhdr 4
+if ne rc OMK_OK
+wl_send_err req rc 0
+wl_flush_tx
+tstep now
+tclose
+put wl_st WL_S_RXDROP 1
+put wl_st WL_S_RXN 0
+ret 0
+end
+plen = get omkhdr 5
+need = add OMK_HDR plen
+if lt rxn need
+ret 0
+end
+op = get omkhdr 2
+if eq op OMK_PING
+wl_send_pong req
+wl_rx_consume need
+ret 1
+end
+if eq op OMK_RESET
+wl_do_reset req
+wl_rx_consume need
+ret 1
+end
+if eq op OMK_PREFILL
+wl_do_prefill req plen
+wl_rx_consume need
+ret 1
+end
+if eq op OMK_DECODE
+wl_do_decode req
+wl_rx_consume need
+ret 1
+end
+if eq op OMK_CANCEL
+wl_do_cancel req
+wl_rx_consume need
+ret 1
+end
+wl_send_err req OMK_EBADOP op
+wl_flush_tx
+tstep now
+tclose
+put wl_st WL_S_RXDROP 1
+put wl_st WL_S_RXN 0
+ret 0
+end
+
+note Pump incoming TCP bytes from tcp.om into wl_rx and dispatch complete frames.
+fn wl_pump_tcp now ulong to void
+if ne get wl_st WL_S_RXDROP 0
+ret
+end
+rxn = get wl_st WL_S_RXN
+room = sub OMK_MAXFRM rxn
+if gt room 0
+n = tread room
+if gt n 0
+put wl_st WL_S_ACTMS now
+i = ulong 0
+while lt i n bound 16400
+put wl_rx add rxn i get Tapp i
+i = add i 1
+end
+put wl_st WL_S_RXN add rxn n
+end
+end
+k = ulong 0
+while lt k 8 bound 8
+got = wl_dispatch_one now
+if eq got 0
+break
+end
+k = add k 1
+end
+end
+
+note Stage and kick one GPU op (WL_SUBMIT -> WL_WAIT).
+fn wl_gpu_submit now ulong to void
+req = get wl_st WL_S_REQID
+op = get wl_st WL_S_OP
+if ne get wl_st WL_S_CANCEL 0
+if ne op WL_OPRESET
+wl_send_done req 0 get wl_st WL_S_KVPOS OMK_RCANCEL
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+put wl_st WL_S_CANCEL 0
+ret
+end
+end
+pbw = long 0
+if eq op WL_OPRESET
+pbw = wl_q38_reset_kv 0
+else
+if eq op WL_OPPREF
+idx = get wl_st WL_S_PFIDX
+tok = get wl_ptoks idx
+kv = get wl_st WL_S_KVPOS
+pbw = wl_q38_stage_step tok uint kv 0
+else
+if eq op WL_OPDEC
+kv = get wl_st WL_S_KVPOS
+if ge kv get wl_st WL_S_MAXCTX
+wl_send_done req 0 kv OMK_RMAX
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+ret
+end
+tok = uint get wl_st WL_S_CURTOK
+pbw = wl_q38_stage_step tok uint kv 1
+end
+end
+end
+if le pbw 0
+wl_send_err req OMK_EGSTAGE wl_err_u32 pbw
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+ret
+end
+krc = wl_gpu_kick uint pbw
+if lt krc 0
+wl_fault req OMK_EGKICK wl_err_u32 krc
+ret
+end
+put wl_st WL_S_SUBMS now
+put wl_st WL_S_STATE WL_WAIT
+end
+
+note Handle completed prefill or decode step after semaphore retirement.
+fn wl_finish_step req ulong op ulong to void
+wl_dsb_ish
+vrc = wl_q38_verify_step
+if ne vrc 0
+wl_fault req OMK_EGVER wl_err_u32 vrc
+ret
+end
+otok = ulong wl_q38_read_tok
+if ge otok get wl_st WL_S_VOCAB
+wl_fault req OMK_EGVER otok
+ret
+end
+kv = add get wl_st WL_S_KVPOS 1
+put wl_st WL_S_KVPOS kv
+put wl_st WL_S_LASTTOK otok
+if eq op WL_OPPREF
+idx = add get wl_st WL_S_PFIDX 1
+put wl_st WL_S_PFIDX idx
+if ne get wl_st WL_S_CANCEL 0
+wl_send_done req 0 kv OMK_RCANCEL
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+put wl_st WL_S_CANCEL 0
+ret
+end
+if ge idx get wl_st WL_S_PFCNT
+wl_send_done req 0 kv OMK_RPREF
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+ret
+end
+put wl_st WL_S_STATE WL_SUBMIT
+ret
+end
+seq = get wl_st WL_S_DCSEQ
+eos = get wl_st WL_S_DCEOS
+tflg = ulong 0
+if eq otok eos
+tflg = OMK_FEOS
+end
+wl_send_tok req tflg seq otok
+seq = add seq 1
+put wl_st WL_S_DCSEQ seq
+put wl_st WL_S_CURTOK otok
+if eq otok eos
+wl_send_done req OMK_FEOS kv OMK_REOS
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+ret
+end
+if ne get wl_st WL_S_CANCEL 0
+wl_send_done req 0 kv OMK_RCANCEL
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+put wl_st WL_S_CANCEL 0
+ret
+end
+if or ge seq get wl_st WL_S_DCMAX ge kv get wl_st WL_S_MAXCTX
+wl_send_done req 0 kv OMK_RMAX
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+ret
+end
+put wl_st WL_S_STATE WL_SUBMIT
+end
+
+note Non-blocking GPU completion poll + GSP HALT/lockdown check + step timeout.
+fn wl_gpu_wait now ulong to void
+req = get wl_st WL_S_REQID
+irq = wl_gpu_irq_check
+if lt irq 0
+wl_fault req OMK_EGHALT wl_err_u32 irq
+ret
+end
+pr = wl_gpu_poll
+if lt pr 0
+wl_fault req OMK_ESEM wl_err_u32 pr
+ret
+end
+if eq pr 0
+subms = get wl_st WL_S_SUBMS
+tmo = get wl_st WL_S_STEPTMO
+if ge now subms
+if ge sub now subms tmo
+wl_fault req OMK_EGTMO tmo
+end
+end
+ret
+end
+put wl_st WL_S_ACTMS now
+op = get wl_st WL_S_OP
+if eq op WL_OPRESET
+put wl_st WL_S_KVPOS 0
+put wl_st WL_S_LASTTOK 0
+wl_send_done req 0 0 OMK_RRESET
+put wl_st WL_S_STATE WL_IDLE
+put wl_st WL_S_OP WL_OPNONE
+ret
+end
+wl_finish_step req op
+end
+
+note Execute one complete poll iteration: NIC RX -> TCP -> OMTK -> GPU -> idle check -> NIC reclaim.
+fn wl_tick to void
+b = ulong 0
+while lt b 16 bound 16
+n = wl_nic_rx
+if eq n 0
+break
+end
+tinput n
+b = add b 1
+end
+now = wl_now_ms
+tstep now
+tst = get Tcb kST
+if eq tst 0
+wl_rearm now
+else
+if eq tst 4
+if eq get wl_st WL_S_CONN 0
+put wl_st WL_S_CONN 1
+put wl_st WL_S_ACTMS now
+end
+wl_pump_tcp now
+else
+if eq tst 7
+wl_pump_tcp now
+if eq get wl_st WL_S_TXN 0
+tclose
+end
+end
+end
+end
+st = get wl_st WL_S_STATE
+if eq st WL_SUBMIT
+wl_gpu_submit now
+else
+if eq st WL_WAIT
+wl_gpu_wait now
+end
+end
+wl_flush_tx
+tstep now
+tst2 = get Tcb kST
+if ge tst2 4
+if ne get wl_st WL_S_STATE WL_WAIT
+act = get wl_st WL_S_ACTMS
+itmo = get wl_st WL_S_IDLETMO
+if ge now act
+if ge sub now act itmo
+tdrop 0
+put wl_st WL_S_DROPS add get wl_st WL_S_DROPS 1
+wl_rearm now
+end
+end
+end
+end
+wl_nic_reclaim
+end
+
+note Bare-metal EL1 kernel main loop: nested bound 9223372036854775807 (no 1M-pass Trap 4).
+fn wl_run to void
+while eq wl_should_stop 0 bound 9223372036854775807
+while eq wl_should_stop 0 bound 9223372036854775807
+wl_tick
+end
+end
+end

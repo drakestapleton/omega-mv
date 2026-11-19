@@ -1,0 +1,273 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/wire/omtk.om: OMTK v1 binary wire frame codec and validator for Pi 5 <-> Spark.
+note Library unit: no fn main, no Linux syscalls, no heap. Prefix omk / OMK.
+note All multi-byte integers are unsigned little-endian. Fixed 16-byte header:
+note   0..3  u32 magic       = 0x4B544D4F ("OMTK" LE = 1263816015)
+note   4     u8  ver         = 1
+note   5     u8  op          = 1..9 (PING,PONG,RESET_KV,PREFILL,DECODE,TOKEN,DONE,CANCEL,ERR)
+note   6..7  u16 flags       = bit0 F_EOS (1), bit1 F_GREEDY (2); bits 2..15 must be 0
+note   8..11 u32 req_id      = nonzero for PREFILL/DECODE/TOKEN/CANCEL; 0 allowed for PING/PONG/RESET_KV/DONE/ERR
+note   12..15 u32 payload_len = 0..16384 (OMK_MAXPAY)
+
+const OMK_HDR ulong 16
+const OMK_MAXPAY ulong 16384
+const OMK_MAXFRM ulong 16400
+const OMK_MAXTOK ulong 4096
+const OMK_MAGIC ulong 1263816015
+const OMK_VER ulong 1
+
+note Opcodes
+const OMK_PING ulong 1
+const OMK_PONG ulong 2
+const OMK_RESET ulong 3
+const OMK_PREFILL ulong 4
+const OMK_DECODE ulong 5
+const OMK_TOKEN ulong 6
+const OMK_DONE ulong 7
+const OMK_CANCEL ulong 8
+const OMK_ERR ulong 9
+
+note Flags (only bits 0..1 valid)
+const OMK_FEOS ulong 1
+const OMK_FGREEDY ulong 2
+const OMK_FMASK ulong 3
+
+note DONE reasons
+const OMK_RMAX ulong 0
+const OMK_REOS ulong 1
+const OMK_RCANCEL ulong 2
+const OMK_RPREF ulong 3
+const OMK_RRESET ulong 4
+
+note Error codes
+const OMK_OK ulong 0
+const OMK_EBADMAG ulong 1
+const OMK_EBADVER ulong 2
+const OMK_EBADOP ulong 3
+const OMK_EBADFLG ulong 4
+const OMK_ETOOBIG ulong 5
+const OMK_EBADLEN ulong 6
+const OMK_EBADREQ ulong 7
+const OMK_EBADTOK ulong 8
+const OMK_ERANGE ulong 9
+const OMK_EBUSY ulong 10
+const OMK_EUNSUP ulong 11
+const OMK_EGSTAGE ulong 12
+const OMK_EGKICK ulong 13
+const OMK_EGTMO ulong 14
+const OMK_EGHALT ulong 15
+const OMK_ESEM ulong 16
+const OMK_EGVER ulong 17
+const OMK_EFAULT ulong 18
+
+note Parsed header fields (omkhdr): 0 magic, 1 ver, 2 op, 3 flags, 4 req_id, 5 payload_len
+global omkhdr ulong 8
+note Scratch staging buffer for encoding/decoding single frames (16 B hdr + up to 16384 B payload)
+global omktx uchar 16400
+global omktxn ulong 1
+
+fn omk_r16 buf view uchar * off ulong to ulong
+a = ulong get buf off
+b = ulong get buf add off 1
+ret or a shl b 8
+end
+
+fn omk_r32 buf view uchar * off ulong to ulong
+a = ulong get buf off
+b = ulong get buf add off 1
+c = ulong get buf add off 2
+d = ulong get buf add off 3
+ret or or or a shl b 8 shl c 16 shl d 24
+end
+
+fn omk_w16 buf edit uchar * off ulong v ulong to void
+put buf off uchar and v 255
+put buf add off 1 uchar and shr v 8 255
+end
+
+fn omk_w32 buf edit uchar * off ulong v ulong to void
+put buf off uchar and v 255
+put buf add off 1 uchar and shr v 8 255
+put buf add off 2 uchar and shr v 16 255
+put buf add off 3 uchar and shr v 24 255
+end
+
+note Global-buffer LE helpers (for omktx and rx accumulators without passing globals)
+fn omk_txw16 off ulong v ulong to void
+put omktx off uchar and v 255
+put omktx add off 1 uchar and shr v 8 255
+end
+
+fn omk_txw32 off ulong v ulong to void
+put omktx off uchar and v 255
+put omktx add off 1 uchar and shr v 8 255
+put omktx add off 2 uchar and shr v 16 255
+put omktx add off 3 uchar and shr v 24 255
+end
+
+note Write 16-byte OMTK v1 header into omktx[0..16); sets omktxn = 16 + plen.
+fn omk_mkhdr op ulong flags ulong req_id ulong plen ulong to ulong
+if gt plen OMK_MAXPAY
+ret OMK_ETOOBIG
+end
+omk_txw32 0 OMK_MAGIC
+put omktx 4 uchar OMK_VER
+put omktx 5 uchar and op 255
+omk_txw16 6 and flags 65535
+omk_txw32 8 req_id
+omk_txw32 12 plen
+put omktxn 0 add OMK_HDR plen
+ret OMK_OK
+end
+
+note Validate header fields already unpacked into omkhdr[0..5]. Returns OMK_OK or OMK_E*.
+fn omk_chk_hdr to ulong
+mag = get omkhdr 0
+if ne mag OMK_MAGIC
+ret OMK_EBADMAG
+end
+ver = get omkhdr 1
+if ne ver OMK_VER
+ret OMK_EBADVER
+end
+op = get omkhdr 2
+if or lt op OMK_PING gt op OMK_ERR
+ret OMK_EBADOP
+end
+flg = get omkhdr 3
+if ne and flg not OMK_FMASK 0
+ret OMK_EBADFLG
+end
+req = get omkhdr 4
+plen = get omkhdr 5
+if gt plen OMK_MAXPAY
+ret OMK_ETOOBIG
+end
+if eq op OMK_PING
+if ne plen 0
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_PONG
+if and ne plen 0 ne plen 16
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_RESET
+if ne plen 4
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_PREFILL
+if eq req 0
+ret OMK_EBADREQ
+end
+if or lt plen 4 ne rem plen 4 0
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_DECODE
+if eq req 0
+ret OMK_EBADREQ
+end
+if ne plen 16
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_TOKEN
+if eq req 0
+ret OMK_EBADREQ
+end
+if ne plen 8
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_DONE
+if ne plen 8
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_CANCEL
+if eq req 0
+ret OMK_EBADREQ
+end
+if ne plen 0
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+if eq op OMK_ERR
+if ne plen 8
+ret OMK_EBADLEN
+end
+ret OMK_OK
+end
+ret OMK_EBADOP
+end
+
+note Parse 16-byte header from a view buffer at offset off into omkhdr[0..5] and validate.
+fn omk_parse_hdr buf view uchar * off ulong to ulong
+if gt off len buf
+ret OMK_EBADLEN
+end
+if lt sub len buf off OMK_HDR
+ret OMK_EBADLEN
+end
+put omkhdr 0 omk_r32 buf off
+put omkhdr 1 ulong get buf add off 4
+put omkhdr 2 ulong get buf add off 5
+put omkhdr 3 omk_r16 buf add off 6
+put omkhdr 4 omk_r32 buf add off 8
+put omkhdr 5 omk_r32 buf add off 12
+ret omk_chk_hdr
+end
+
+note Encode standard Spark -> Pi replies into omktx[0..omktxn).
+fn omk_enc_pong req_id ulong st ulong kv ulong mctx ulong gerr ulong to ulong
+rc = omk_mkhdr OMK_PONG 0 req_id 16
+if ne rc OMK_OK
+ret rc
+end
+omk_txw32 16 st
+omk_txw32 20 kv
+omk_txw32 24 mctx
+omk_txw32 28 gerr
+ret OMK_OK
+end
+
+fn omk_enc_token req_id ulong flags ulong seq ulong tok ulong to ulong
+rc = omk_mkhdr OMK_TOKEN flags req_id 8
+if ne rc OMK_OK
+ret rc
+end
+omk_txw32 16 seq
+omk_txw32 20 tok
+ret OMK_OK
+end
+
+fn omk_enc_done req_id ulong flags ulong kv ulong reason ulong to ulong
+rc = omk_mkhdr OMK_DONE flags req_id 8
+if ne rc OMK_OK
+ret rc
+end
+omk_txw32 16 kv
+omk_txw32 20 reason
+ret OMK_OK
+end
+
+fn omk_enc_err req_id ulong ecode ulong detail ulong to ulong
+rc = omk_mkhdr OMK_ERR 0 req_id 8
+if ne rc OMK_OK
+ret rc
+end
+omk_txw32 16 ecode
+omk_txw32 20 detail
+ret OMK_OK
+end
