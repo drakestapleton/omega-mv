@@ -49,7 +49,8 @@
 #   observed, aienos and physics commits are recorded and equal the pins in
 #   aienos.lock/physics.lock at the run commit, and every required correctness
 #   rerun is PASS. Anything else is FAIL, with the reasons listed.
-# Shell and coreutils only (sha256sum, grep, sed, git). No jq, no Python.
+# Shell, coreutils, git and the seeded Omega compiler. No jq, Python or C is
+# introduced on this path; reruns.json is parsed by seed/json/json.om.
 set -u
 
 RAW=${1:?raw run directory}
@@ -138,11 +139,50 @@ if [ -z "$PHYSICS" ]; then fail "physics_commit not recorded in machine.json"
 elif [ "$PHYSICS" != "$PHYSICS_LOCK" ]; then fail "physics_commit $PHYSICS != physics.lock $PHYSICS_LOCK"; fi
 
 # ---- correctness reruns (§14, §16 item 9)
+# Parse before embedding. The schema-specific Omega validator composes the
+# repository's strict RFC 8259 reader and rejects non-root, missing, extra,
+# duplicate or non-PASS members (including escaped spellings of a duplicate).
 if [ -n "$RERUNS" ] && [ -s "$RERUNS" ]; then
-    RERUN_JSON=$(tr -d '\n' < "$RERUNS")
-    for k in $REQUIRED_RERUNS; do
-        printf '%s' "$RERUN_JSON" | grep -q "\"$k\":\"PASS\"" || fail "correctness rerun $k not PASS"
+    OMC=$HERE/seed/out/omc
+    JSON_UNIT=$HERE/seed/json/json.om
+    RERUN_UNIT=$HERE/tools/r15_reruns_validate.om
+    for f in "$OMC" "$HERE/seed/out/omc.sha256" "$JSON_UNIT" "$RERUN_UNIT"; do
+        [ -s "$f" ] || { echo "r15_receipt: missing $f" >&2; exit 2; }
     done
+    [ -x "$OMC" ] || { echo "r15_receipt: seeded compiler $OMC is not executable" >&2; exit 2; }
+    (cd "$HERE" && sha256sum --quiet -c seed/out/omc.sha256) || {
+        echo "r15_receipt: seeded compiler does not match seed/out/omc.sha256" >&2
+        exit 2
+    }
+    # omc and the programs it emits are AArch64. The digest above binds the
+    # compiler bytes. On any other machine, qemu-user runs those same bytes.
+    OM_PFX=()
+    if [ "$(uname -m)" != aarch64 ]; then
+        command -v qemu-aarch64 >/dev/null 2>&1 || {
+            echo "r15_receipt: seeded compiler is AArch64 and qemu-aarch64 is not installed" >&2
+            exit 2
+        }
+        OM_PFX=(qemu-aarch64 -L /usr/aarch64-linux-gnu)
+    fi
+    RERUN_CHECK=$(mktemp "$OUTDIR/.r15-reruns-check.XXXXXX") || exit 2
+    if ! { printf 'om2\n'; cat "$JSON_UNIT" "$RERUN_UNIT"; } | "${OM_PFX[@]}" "$OMC" > "$RERUN_CHECK"; then
+        rm -f "$RERUN_CHECK"
+        echo "r15_receipt: cannot build strict rerun validator" >&2
+        exit 2
+    fi
+    chmod 700 "$RERUN_CHECK" || { rm -f "$RERUN_CHECK"; exit 2; }
+    "${OM_PFX[@]}" "$RERUN_CHECK" < "$RERUNS"
+    RERUN_RC=$?
+    rm -f "$RERUN_CHECK"
+    if [ "$RERUN_RC" = 0 ]; then
+        RERUN_JSON=$(tr -d '\r\n' < "$RERUNS")
+    elif [ "$RERUN_RC" = 1 ]; then
+        RERUN_JSON='{"status":"invalid"}'
+        fail "correctness reruns must be one exact root object with every required key once and string value PASS"
+    else
+        echo "r15_receipt: rerun validator failed with exit $RERUN_RC" >&2
+        exit 2
+    fi
 else
     RERUN_JSON='{"status":"not done"}'
     fail "correctness reruns (§14) not recorded"
