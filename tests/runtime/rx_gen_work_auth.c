@@ -227,10 +227,57 @@ static void test_path_prefix(void) {
     rx_gen_close(b);
 }
 
+/* The finish resource must be the length-prefixed encoding
+ *   sha256("omega.rx.generation.work.finish.v1" || le64(len(dir)) || dir ||
+ *          le64(parent) || le64(candidate) || le64(work))[0..8) little-endian, 0 -> UINT64_MAX.
+ * A real two-store collision of the raw encoding cannot be built: the fields after the
+ * directory are a fixed 24 bytes, so equal raw messages imply equal directories and ids.
+ * The length prefix is therefore pinned by this known-answer check, which fails if the
+ * prefix is dropped (the resource then equals the raw-encoding value checked below). */
+static void le64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint64_t resource_of(const char *dir, uint64_t parent, uint64_t cand, uint64_t work,
+                            int prefixed) {
+    static const uint8_t domain[] = "omega.rx.generation.work.finish.v1";
+    uint8_t len[8], ids[24], digest[32];
+    le64(len, strlen(dir));
+    le64(ids, parent);
+    le64(ids + 8, cand);
+    le64(ids + 16, work);
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, domain, sizeof domain - 1);
+    if (prefixed) sha256_update(&ctx, len, sizeof len);
+    sha256_update(&ctx, (const uint8_t *)dir, strlen(dir));
+    sha256_update(&ctx, ids, sizeof ids);
+    sha256_final(&ctx, digest);
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)digest[i] << (8 * i);
+    return v ? v : UINT64_MAX;
+}
+
+static void test_resource_encoding(void) {
+    char dir[] = "/tmp/omega-wk-XXXXXX";
+    RxGenStore *g = NULL;
+    expect_int("kat open", open_store(dir, &g), RX_GEN_OK);
+    if (!g) return;
+    uint64_t parent = 0, lineage = 0, cand = 0, res = 0;
+    expect_int("kat active", rx_gen_active(g, &parent, &lineage), RX_GEN_OK);
+    const uint8_t ev[] = "k";
+    expect_int("kat propose", propose(g, 1, NULL, 0, ev, 1, &cand), RX_GEN_OK);
+    expect_int("kat resource", rx_gen_work_resource(g, cand, 3, &res), RX_GEN_OK);
+    expect_int("resource is the length-prefixed encoding", res == resource_of(dir, parent, cand, 3, 1), 1);
+    expect_int("resource is not the raw encoding", res != resource_of(dir, parent, cand, 3, 0), 1);
+    rx_gen_close(g);
+}
+
 int main(void) {
     test_unbound();
     test_bound();
     test_path_prefix();
+    test_resource_encoding();
     if (failures) {
         printf("rx_gen_work_auth: FAIL %d\n", failures);
         return 1;
