@@ -63,6 +63,12 @@ uint32_t omega2_cg_bf16_ok_i(uint64_t *result, const uint64_t *o_sp, uint64_t o_
 uint32_t omega2_cg_bf16_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
 /* export fn cg_bf16_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_bf16_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_gemm "omega-ident 1 unit=cg_gemm abi=2 profile=OM-2 src=d6df76ecf7af7debb482257d615fc206a9f8bfb0925ada0ca65465decca491e0 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_gemm(void);
+/* export fn cg_gemm_ok sp view ulong 8 to ulong */
+uint32_t omega2_cg_gemm_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
+/* export fn cg_gemm_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_gemm_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 #ifdef __cplusplus
 }
 #endif

@@ -56,6 +56,10 @@ uint64_t cg_bf16_ok_i(const uint64_t o_sp[8]);
 uint64_t cg_bf16_ok(const uint64_t o_sp[8]);
 /* export fn cg_bf16_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_bf16_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_gemm_ok sp view ulong 8 to ulong */
+uint64_t cg_gemm_ok(const uint64_t o_sp[8]);
+/* export fn cg_gemm_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_gemm_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 #ifdef __cplusplus
 }
 #endif
