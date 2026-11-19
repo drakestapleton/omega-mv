@@ -3,6 +3,8 @@
 Status (2026-11-04): **IMPLEMENTED; EXERCISED under emulation (QEMU q35 + OVMF)**; not QUALIFIED on hardware.
 Draft aien-dev/aien-train#53 at `e08443c3` records one physical iMac run of an image built with this omc
 (`b4f45121`, `evidence/OMEGALLM/imac/`): EXERCISED on physical hardware (one machine).
+Omega LLM's `.om` sources now live in this repository at [`train/omega-llm/`](../train/omega-llm/) (unit `ollm_x86efi`);
+the aien-train references here are the historical record of that run.
 This repository has no physical-firmware gate. The compiler was built on main `ba5559d9`.
 The x86efi branch (PR #1015) also merged main `f9a9a40b` (#995) and main `19b8340d` (#996). Neither merge changed `seed/omc/omc.om` or `seed/out/omc`.
 Implementation: `seed/omc/omc.om` (functions `xp` through `xf12`, plus hooks in `kw`, the value
