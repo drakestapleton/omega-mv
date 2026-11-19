@@ -102,6 +102,14 @@ static RxObjRef mkobj(Env *e, uint64_t resource) {
 /* Publishes nothing: the only propagation wave is the stimulus's. */
 static int fn_quiet(RxCtx *c) { (void)c; return 0; }
 
+typedef struct { RxObjRef out; } FullLogWrite;
+
+static int fn_full_log_write(RxCtx *c) {
+    const FullLogWrite *a = c->user;
+    c->out[c->n_out++] = (RxMutation){ a->out, 0, c->in[0].field[0] + 1 };
+    return 0;
+}
+
 static uint32_t add_listener(Env *e, RxObjRef src, uint64_t mask, RxCapRef rd) {
     RxReactionDesc d;
     memset(&d, 0, sizeof(d));
@@ -295,9 +303,74 @@ static void t_long_log(void) {
     rx_world_create(&small, 1, RX_PERSIST_RESIDENT, RES_SRC, init, &s2);
     RxMutation m2 = {s2, 0, 1};
     int64_t last = 1;
-    for (int i = 0; i < 40 && last > 0; i++) { m2.value = (uint64_t)i + 2; last = rx_world_publish_external(&small, ext, &m2, 1); }
-    CHECK(last <= 0 && small.stats.crumb_overflow > 0, "a full log did not refuse the publication");
+    RxObject before, after;
+    uint64_t crumbs_before = 0, externals_before = 0;
+    for (int i = 0; i < 40 && last > 0; i++) {
+        m2.value = (uint64_t)i + 2;
+        rx_world_read(&small, s2, &before);
+        crumbs_before = small.n_crumbs;
+        externals_before = small.stats.externals;
+        last = rx_world_publish_external(&small, ext, &m2, 1);
+    }
+    rx_world_read(&small, s2, &after);
+    CHECK(last == RX_ERR_FULL && small.stats.crumb_overflow > 0,
+          "a full log did not refuse the publication with RX_ERR_FULL");
+    CHECK(small.n_crumbs == crumbs_before && small.stats.externals == externals_before &&
+          after.version == before.version &&
+          memcmp(after.field, before.field, sizeof after.field) == 0 &&
+          memcmp(after.field_version, before.field_version, sizeof after.field_version) == 0 &&
+          memcmp(after.field_writer, before.field_writer, sizeof after.field_writer) == 0 &&
+          memcmp(after.digest, before.digest, sizeof after.digest) == 0,
+          "a refused external publication changed object state or claimed a receipt");
     rx_world_destroy(&small);
+
+    /* Two CREATE crumbs leave one slot. The EXTERNAL stimulus legitimately
+     * takes it; the reaction it wakes must not publish without a fourth slot. */
+    static RxWorld reaction;
+    CHECK(rx_world_init(&reaction, &root, 1, 3) == RX_OK, "reaction-full world");
+    reaction.external_subject = SUBJ_EXTERNAL;
+    RxObjRef rsrc = {UINT32_MAX, 0}, rout = {UINT32_MAX, 0};
+    CHECK(rx_world_create(&reaction, 1, RX_PERSIST_RESIDENT, RES_SRC, init, &rsrc) == RX_OK &&
+          rx_world_create(&reaction, 1, RX_PERSIST_RESIDENT, RES_OUT, init, &rout) == RX_OK,
+          "reaction-full objects");
+    mm.subject = SUBJ_WORK; mm.resource = RES_SRC; mm.rights = RX_RIGHT_READ;
+    RxCapRef rd = {UINT32_MAX, 0}, wr = {UINT32_MAX, 0};
+    CHECK(rx_capadmin_mint(&admin, &mm, &rd) == RX_CAP_OK, "reaction-full read cap");
+    mm.resource = RES_OUT; mm.rights = RX_RIGHT_WRITE;
+    CHECK(rx_capadmin_mint(&admin, &mm, &wr) == RX_CAP_OK, "reaction-full write cap");
+    FullLogWrite arg = { rout };
+    RxReactionDesc d;
+    memset(&d, 0, sizeof d);
+    d.name = "r15.full-log-writer";
+    d.faculty = RX_FACULTY_OMEGA;
+    d.subject = SUBJ_WORK;
+    d.priority = RX_PRIO_FOREGROUND;
+    d.fn = fn_full_log_write;
+    d.user = &arg;
+    d.triggers[d.n_triggers++] = (RxDep){ rsrc, RX_FIELD(0) };
+    d.writes[d.n_writes++] = (RxDep){ rout, RX_FIELD(0) };
+    d.caps[d.n_caps++] = (RxCapNeed){ rd, RES_SRC, RX_RIGHT_READ };
+    d.caps[d.n_caps++] = (RxCapNeed){ wr, RES_OUT, RX_RIGHT_WRITE };
+    uint32_t rid = UINT32_MAX;
+    CHECK(rx_world_add_reaction(&reaction, &d, &rid) == RX_OK, "reaction-full add writer");
+    RxObject out_before, out_after, src_after;
+    rx_world_read(&reaction, rout, &out_before);
+    RxMutation trigger = { rsrc, 0, 9 };
+    CHECK(rx_world_publish_external(&reaction, ext, &trigger, 1) == 3,
+          "last slot still accepts a recorded external publication");
+    CHECK(rx_world_wait_quiescent(&reaction, 5000) == RX_OK, "reaction-full quiet");
+    rx_world_read(&reaction, rout, &out_after);
+    rx_world_read(&reaction, rsrc, &src_after);
+    CHECK(src_after.field[0] == 9 && src_after.field_writer[0] == 3,
+          "recorded external publication was not preserved");
+    CHECK(reaction.n_crumbs == 3 && reaction.stats.crumb_overflow > 0 &&
+          reaction.reactions[rid].commits == 0 && out_after.version == out_before.version &&
+          memcmp(out_after.field, out_before.field, sizeof out_after.field) == 0 &&
+          memcmp(out_after.field_version, out_before.field_version, sizeof out_after.field_version) == 0 &&
+          memcmp(out_after.field_writer, out_before.field_writer, sizeof out_after.field_writer) == 0 &&
+          memcmp(out_after.digest, out_before.digest, sizeof out_after.digest) == 0,
+          "a reaction published object state after causal capacity was exhausted");
+    rx_world_destroy(&reaction);
     rx_caproot_stop(&root, &admin);
 }
 
