@@ -5,6 +5,15 @@ note Enforces: pcie_quiesced before GBPA.ABORT, IDR0.ST_LEVEL==1, IDR1.SIDSIZE>=
 note deterministic CR0/GBPA/STRTAB/CMDQ/EVENTQ/CFGI_ALL/TLBI/CMD_SYNC/ERR==0/SMMUEN bring-up,
 note SMMUv3 C abort-only, strict per-stream disjoint Normal-NC DMA (<40-bit PA, zero wildcard RAM),
 note and auto-mapping of the 3 mandatory GB20B IORT RMR ranges on SMMUv3 B SID 0x100.
+note
+note Two back ends share one API (bmmio_mode, bar0_mmio.om):
+note   mode 0 (host model): commands/STEs/CDs/events live in globals; bmmio_sim registers (unit tests).
+note   mode 1 (bare metal): everything the SMMU reads is materialised in physically contiguous,
+note     aligned Normal-NC memory (VA == PA): 2-level stream table (L1STD + 64-STE L2 tables),
+note     64-byte STE + CD, VMSAv8-64 4 KiB-granule stage-1 tables (VA == PA, 2 MiB blocks where
+note     aligned), 16-entry CMDQ and EVENTQ with real PROD/CONS, CMD_SYNC completion polled with a
+note     bounded fail-closed timeout plus CMDQ_CONS.ERR and GERROR.CMDQ_ERR checks.
+note   Spec references are Arm IHI 0070 (SMMUv3) section numbers; page tables follow Arm ARM D8 (VMSAv8-64).
 note Compose with: si/directives/om2.om aienux/kernel/hal/iort.om aienux/kernel/hal/bar0_mmio.om aienux/kernel/hal/pcie.om aienux/kernel/hal/smmuv3.om ...
 
 const SMMU_MAX_INST ulong 3
@@ -13,12 +22,19 @@ const SMMU_MAX_SPANS ulong 32
 const SMMU_PA_40_LIMIT ulong 0x10000000000
 const SMMU_MAX_SPAN_BYTES ulong 0x800000000
 const SMMU_POLL_MAX ulong 1024
+note Mode 1 poll budget (~seconds of Device-nGnRnE reads); exceeding it fails closed.
+const SMMU_POLL_HW ulong 4000000
 
 note ARM SMMUv3 register offsets (IHI 0070H.a)
 const SMMU_REG_IDR0 ulong 0x0000
 const SMMU_REG_IDR1 ulong 0x0004
 const SMMU_REG_CR0 ulong 0x0020
 const SMMU_REG_CR0ACK ulong 0x0024
+note IHI 0070 §6.3.10 SMMU_CR1, §6.3.12 SMMU_CR2, §6.3.14/§6.3.15 SMMU_GERROR/GERRORN
+const SMMU_REG_CR1 ulong 0x0028
+const SMMU_REG_CR2 ulong 0x002c
+const SMMU_REG_GERROR ulong 0x0060
+const SMMU_REG_GERRORN ulong 0x0064
 const SMMU_REG_GBPA ulong 0x0044
 const SMMU_REG_STRTAB_BASE ulong 0x0080
 const SMMU_REG_STRTAB_CFG ulong 0x0088
@@ -38,6 +54,20 @@ const SMMU_CR0_ALL ulong 0x0d
 const SMMU_GBPA_UPDATE ulong 0x80000000
 const SMMU_GBPA_ABORT ulong 0x00100000
 const SMMU_BASE_RA ulong 0x4000000000000000
+note CR1 (§6.3.10): QUEUE_IC/OC=0 (Normal-NC), QUEUE_SH[5:4]=2 (OSH), TABLE_IC/OC=0, TABLE_SH[11:10]=2.
+note Matches the Normal-NC pool the queues/tables live in (CPU MAIR attr3 = 0x44).
+const SMMU_CR1_NC_OSH ulong 0x820
+note CR2 (§6.3.12): E2H[0]=0, RECINVSID[1]=1 (record C_BAD_STREAMID), PTM[2]=1 (no broadcast TLBI).
+const SMMU_CR2_VAL ulong 0x6
+note GERROR.CMDQ_ERR is bit 0 (§6.3.14); active when GERROR[0] != GERRORN[0].
+const SMMU_GERR_CMDQ ulong 0x1
+note L1STD (§5.1.2): L2Ptr[51:6] | Span[4:0]; Span = SPLIT + 1 = 7 -> 2^(7-1) = 64 STEs per 4 KiB L2 table.
+const SMMU_STRTAB_SPLIT ulong 6
+const SMMU_L1_SPAN ulong 7
+const SMMU_L2PTR_MASK ulong 0x000fffffffffffc0
+note VMSAv8-64 output-address mask for 4 KiB granule table/page descriptors (Arm ARM D8.3).
+const SMMU_PT_OA_MASK ulong 0x0000fffffffff000
+const SMMU_BLK_2M ulong 0x200000
 const SMMU_Q_LOG2SIZE ulong 4
 const SMMU_Q_ENTRIES ulong 16
 note For LOG2SIZE=4, index bits [3:0] + wrap bit 4 -> mask = (1 << 5) - 1 = 0x1f (IHI 0070H.a §3.5.1)
@@ -56,6 +86,9 @@ note Normal-NC (MAIR slot 3 = 0x44): AttrIdx=3<<2 (0xc) | AP[1]=1 (0x40) | SH=2 
 const SMMU_PTE_NORMAL_NC ulong 0x006000000000064c
 note Device-nGnRnE (MAIR slot 2 = 0x00) for ITS MSI doorbell only: AttrIdx=2<<2 (0x8) | AP[1]=1 (0x40) | AF (0x400) | PXN|UXN
 const SMMU_PTE_DEV_ITS ulong 0x0060000000000448
+note Normal WB (MAIR slot 0 = 0xff): AttrIdx=0 | AP[1]=1 (0x40) | SH=3 Inner-Shareable (0x300) | AF (0x400) | PXN|UXN.
+note Only for streams whose IORT root-complex node reports CCA=1 (IO-coherent); see smmu_map_span_wb.
+const SMMU_PTE_NORMAL_WB ulong 0x0060000000000740
 const SMMU_ITS_DB_BASE ulong 0x08000000
 const SMMU_ITS_DB_END ulong 0x08100000
 const SMMU_CD_MAIR0 ulong 0x440004ff
@@ -74,6 +107,7 @@ const SMMU_EFULL long -9
 const SMMU_ENOQUIESCE long -10
 const SMMU_ENOTFOUND long -11
 const SMMU_EWILDCARD long -12
+const SMMU_EATTR long -13
 
 note Per-instance state (0=off, 1=up, 2=abort_only)
 global smmu_inst_state ulong 3
@@ -107,6 +141,19 @@ global smmu_sp_len ulong 32
 global smmu_sp_pte ulong 32
 global smmu_sp_rmr ulong 32
 
+note Mode 1 per-instance memory: STRTAB PA, STRTAB LOG2SIZE, CMDQ PA, EVTQ PA, commands since last SYNC,
+note last event InputAddr.
+global smmu_inst_strtab ulong 3
+global smmu_inst_l2sz ulong 3
+global smmu_inst_cmdq ulong 3
+global smmu_inst_evtq ulong 3
+global smmu_inst_pend ulong 3
+global smmu_inst_last_addr ulong 3
+note Per-stream IORT CCA (1 = IO-coherent root complex)
+global smmu_str_cca ulong 8
+note Mode 1 page-table/L2-STE page pool: 0=base PA, 1=pages, 2=used
+global smmu_pt_pool ulong 3
+
 note Bring-up step trace (bitmask per instance for deterministic ordering verification)
 global smmu_trace ulong 3
 global smmu_cmd_count ulong 3
@@ -126,12 +173,22 @@ put smmu_inst_last_evt i 0
 put smmu_trace i 0
 put smmu_cmd_count i 0
 put smmu_sim_cmd_err i 0
+put smmu_inst_strtab i 0
+put smmu_inst_l2sz i 0
+put smmu_inst_cmdq i 0
+put smmu_inst_evtq i 0
+put smmu_inst_pend i 0
+put smmu_inst_last_addr i 0
+end
+for p ulong 3
+put smmu_pt_pool p 0
 end
 for j ulong SMMU_MAX_STREAMS
 put smmu_str_live j 0
 put smmu_str_inst j 0
 put smmu_str_sid j 0
 put smmu_str_ttbr j 0
+put smmu_str_cca j 0
 end
 for k ulong SMMU_MAX_SPANS
 put smmu_sp_live k 0
@@ -153,8 +210,17 @@ put smmu_evtq_buf e 0
 end
 end
 
+fn smmu_hw to bool
+ret eq get bmmio_mode 0 1
+end
+
 fn smmu_poll_eq h long reg ulong mask ulong want ulong to bool
-for i ulong SMMU_POLL_MAX
+lim = SMMU_POLL_MAX
+if smmu_hw
+lim = SMMU_POLL_HW
+end
+i = ulong 0
+while lt i lim bound 4000000
 v = bmmio_r32 h reg
 if ne get bmmio_err 0 BMMIO_OK
 ret false
@@ -163,8 +229,154 @@ if eq and v mask want
 ret true
 end
 cpurelax
+i = add i 1
 end
 ret false
+end
+
+note ---- Mode 1 memory back end (Normal-NC, VA == PA; arm64_mmio_* = fwld/fwst bracketed by DSB SY) ----
+fn smmu_mw pa ulong v ulong to void
+arm64_mmio_w64 pa v
+end
+
+fn smmu_mr pa ulong to ulong
+ret arm64_mmio_r64 pa
+end
+
+fn smmu_zero pa ulong nbytes ulong to void
+o = ulong 0
+while lt o nbytes bound 131072
+smmu_mw add pa o 0
+o = add o 8
+end
+end
+
+note Register the page pool used for stage-1 tables and L2 stream tables (mode 1). 4 KiB aligned, < 40-bit.
+fn smmu_set_pt_pool pa ulong pages ulong to long
+if or eq pa 0 or ne and pa 4095 0 eq pages 0
+ret SMMU_EARG
+end
+if or gt pages 65536 gt add pa mul pages 4096 SMMU_PA_40_LIMIT
+ret SMMU_EARG
+end
+put smmu_pt_pool 0 pa
+put smmu_pt_pool 1 pages
+put smmu_pt_pool 2 0
+ret SMMU_OK
+end
+
+fn smmu_pt_alloc to ulong
+used = get smmu_pt_pool 2
+if or eq get smmu_pt_pool 0 0 ge used get smmu_pt_pool 1
+ret 0
+end
+pa = add get smmu_pt_pool 0 mul used 4096
+put smmu_pt_pool 2 add used 1
+smmu_zero pa 4096
+ret pa
+end
+
+note Walk a VMSAv8-64 4 KiB-granule, T0SZ=16 (4-level, start level 0) stage-1 table rooted at root
+note (Arm ARM D8.2: L0 index VA[47:39], L1 [38:30], L2 [29:21], L3 [20:12]) down to level lvl.
+note mk=true creates zeroed next-level tables (descriptor = table PA | 0b11, D8.3.1) from the pool;
+note mk=false (unmap) never allocates. Returns the PA of the level-lvl descriptor, or 0 when the pool is
+note exhausted, a block/invalid entry is in the way, or (mk=false) the table does not exist.
+fn smmu_pt_idx va ulong lvl ulong to ulong
+ret mul and shr va sub 39 mul lvl 9 511 8
+end
+
+fn smmu_pt_slot root ulong va ulong lvl ulong mk bool to ulong
+tbl = root
+l = ulong 0
+while lt l lvl bound 4
+dpa = add tbl smmu_pt_idx va l
+d = smmu_mr dpa
+if eq d 0
+if not mk
+ret 0
+end
+nt = smmu_pt_alloc
+if eq nt 0
+ret 0
+end
+d = or nt 3
+smmu_mw dpa d
+end
+if ne and d 3 3
+ret 0
+end
+tbl = and d SMMU_PT_OA_MASK
+l = add l 1
+end
+ret add tbl smmu_pt_idx va lvl
+end
+
+note Map: the descriptor must be empty (else SMMU_EOVERLAP, nothing written). Unmap (val 0): a missing
+note table means nothing is mapped there.
+fn smmu_pt_put root ulong va ulong lvl ulong val ulong to long
+mk = ne val 0
+s = smmu_pt_slot root va lvl mk
+if eq s 0
+if mk
+ret SMMU_EFULL
+end
+ret SMMU_OK
+end
+if mk
+if ne smmu_mr s 0
+ret SMMU_EOVERLAP
+end
+end
+smmu_mw s val
+ret SMMU_OK
+end
+
+note Bytes of the last smmu_pt_span_raw call that were processed successfully.
+global smmu_pt_done ulong 1
+
+note Map (pte != 0) or unmap (pte == 0) [pa, pa+sz) at VA == PA. 2 MiB-aligned 2 MiB chunks use L2 block
+note descriptors (bits[1:0]=0b01, OA[47:21]); everything else uses L3 page descriptors (bits[1:0]=0b11).
+note Unmap mirrors the identical block/page decision, so it clears exactly the descriptors map wrote.
+fn smmu_pt_span_raw root ulong pa ulong sz ulong pte ulong to long
+put smmu_pt_done 0 0
+off = ulong 0
+while lt off sz bound 1048576
+cur = add pa off
+lvl = ulong 3
+step = ulong 4096
+dt = ulong 3
+if eq and cur sub SMMU_BLK_2M 1 0
+if ge sub sz off SMMU_BLK_2M
+lvl = ulong 2
+step = SMMU_BLK_2M
+dt = ulong 1
+end
+end
+v = ulong 0
+if ne pte 0
+v = or or cur pte dt
+end
+r = smmu_pt_put root cur lvl v
+if ne r SMMU_OK
+ret r
+end
+off = add off step
+put smmu_pt_done 0 off
+end
+ret SMMU_OK
+end
+
+note A failed map rolls back only the descriptors it wrote ([pa, pa + done)), so an SMMU_EOVERLAP never
+note clears a descriptor that belongs to another span.
+fn smmu_pt_span root ulong pa ulong sz ulong pte ulong to long
+r = smmu_pt_span_raw root pa sz pte
+if and ne r SMMU_OK ne pte 0
+done = get smmu_pt_done 0
+if gt done 0
+z = smmu_pt_span_raw root pa done 0
+end
+end
+ret r
 end
 
 fn smmu_cmd_push inst ulong w0 ulong w1 ulong to void
@@ -173,6 +385,13 @@ slot = and prod sub SMMU_Q_ENTRIES 1
 base_idx = add mul inst 32 mul slot 2
 put smmu_cmdq_buf base_idx w0
 put smmu_cmdq_buf add base_idx 1 w1
+if smmu_hw
+note §4.1: 16-byte command at CMDQ_BASE + (PROD.WR & (2^LOG2SIZE - 1)) * 16
+cpa = add get smmu_inst_cmdq inst mul slot 16
+smmu_mw cpa w0
+smmu_mw add cpa 8 w1
+put smmu_inst_pend inst add get smmu_inst_pend inst 1
+end
 put smmu_inst_cmd_prod inst and add prod 1 SMMU_Q_IDX_MASK
 put smmu_cmd_count inst add get smmu_cmd_count inst 1
 end
@@ -180,6 +399,15 @@ end
 note Flush command queue with CMD_SYNC and enforce CMDQ_CONS.ERR[30:24] == 0.
 fn smmu_cmd_sync inst ulong to long
 h = get smmu_inst_h inst
+if smmu_hw
+note Fail closed instead of overrunning the 16-entry queue (one SYNC slot is always reserved).
+if ge get smmu_inst_pend inst sub SMMU_Q_ENTRIES 1
+ret SMMU_ECMDERR
+end
+if eq get smmu_inst_cmdq inst 0
+ret SMMU_ECMDERR
+end
+end
 note CMD_SYNC: op=0x46, CS=0 (no IRQ), MSH=3 (Inner Shareable, bits 23:22)
 smmu_cmd_push inst or SMMU_CMD_SYNC shl ulong 3 22 0
 cpufence
@@ -212,6 +440,14 @@ cons = bmmio_r32 h SMMU_REG_CMDQ_CONS
 err = and shr cons 24 0x7f
 if ne err 0
 ret SMMU_ECMDERR
+end
+if smmu_hw
+put smmu_inst_pend inst 0
+ge0 = bmmio_r32 h SMMU_REG_GERROR
+ge1 = bmmio_r32 h SMMU_REG_GERRORN
+if ne and xor ge0 ge1 SMMU_GERR_CMDQ 0
+ret SMMU_ECMDERR
+end
 end
 ret SMMU_OK
 end
@@ -259,9 +495,25 @@ put smmu_trace inst or get smmu_trace inst 0x03
 ret SMMU_OK
 end
 
+note §6.3.24 STRTAB_BASE (ADDR[51:6], RA[62]); §6.3.25 STRTAB_BASE_CFG: FMT[17:16]=1 (2-level),
+note SPLIT[10:6]=6, LOG2SIZE[5:0]; §6.3.26/§6.3.29 CMDQ_BASE/EVENTQ_BASE: ADDR[51:5] | LOG2SIZE[4:0] | RA/WA[62].
+note CR1/CR2 are written while SMMUEN=0 (§6.3.10: CR1 is RO when CR0.SMMUEN or queues enabled).
+note Mode 1 zeroes the L1 stream table (all L1STD.Span=0 -> C_BAD_STREAMID), CMDQ and EVENTQ before enable.
 fn smmu_init_prog_queues inst ulong log2sz ulong strtab_pa ulong cmdq_pa ulong evtq_pa ulong to void
 h = get smmu_inst_h inst
-cfg = or shl ulong 1 16 or shl ulong 6 6 log2sz
+if smmu_hw
+smmu_zero strtab_pa mul shl ulong 1 sub log2sz SMMU_STRTAB_SPLIT 8
+smmu_zero cmdq_pa mul SMMU_Q_ENTRIES 16
+smmu_zero evtq_pa mul SMMU_Q_ENTRIES 32
+end
+put smmu_inst_strtab inst strtab_pa
+put smmu_inst_l2sz inst log2sz
+put smmu_inst_cmdq inst cmdq_pa
+put smmu_inst_evtq inst evtq_pa
+put smmu_inst_pend inst 0
+z = bmmio_w32 h SMMU_REG_CR1 SMMU_CR1_NC_OSH
+z = bmmio_w32 h SMMU_REG_CR2 SMMU_CR2_VAL
+cfg = or shl ulong 1 16 or shl SMMU_STRTAB_SPLIT 6 log2sz
 z = bmmio_w64 h SMMU_REG_STRTAB_BASE or strtab_pa SMMU_BASE_RA
 z = bmmio_w32 h SMMU_REG_STRTAB_CFG cfg
 z = bmmio_w64 h SMMU_REG_CMDQ_BASE or or cmdq_pa SMMU_BASE_RA SMMU_Q_LOG2SIZE
@@ -465,6 +717,12 @@ end
 if eq free_idx SMMU_MAX_SPANS
 ret SMMU_EFULL
 end
+if smmu_hw
+pr = smmu_pt_span get smmu_str_ttbr slot pa sz pte_attr
+if ne pr SMMU_OK
+ret pr
+end
+end
 put smmu_sp_live free_idx 1
 put smmu_sp_stream free_idx slot
 put smmu_sp_pa free_idx pa
@@ -531,6 +789,50 @@ end
 ret SMMU_OK
 end
 
+note Mode 1: write the 64-byte CD (§5.4) at cd_pa and the 64-byte STE (§5.2) into the 2-level stream
+note table. L1 index = SID >> SPLIT, L2 index = SID & (2^SPLIT - 1) (§3.3.3). A missing L2 table is
+note allocated (zeroed: every other STE stays V=0) and published with L1STD = L2Ptr | Span (§5.1.2).
+note Words 1..7 are written before word 0 (CD.V / STE.V), each fwst bracketed by DSB SY.
+fn smmu_hw_put_cd dst ulong base ulong to void
+for w ulong 7
+smmu_mw add dst mul add w 1 8 get smmu_cd_words add base add w 1
+end
+smmu_mw dst get smmu_cd_words base
+end
+
+fn smmu_hw_put_ste dst ulong base ulong to void
+for w ulong 7
+smmu_mw add dst mul add w 1 8 get smmu_ste_words add base add w 1
+end
+smmu_mw dst get smmu_ste_words base
+end
+
+fn smmu_hw_l2_for inst ulong sid ulong to ulong
+l1 = add get smmu_inst_strtab inst mul shr sid SMMU_STRTAB_SPLIT 8
+d = smmu_mr l1
+if eq d 0
+l2 = smmu_pt_alloc
+if eq l2 0
+ret 0
+end
+d = or l2 SMMU_L1_SPAN
+smmu_mw l1 d
+end
+ret and d SMMU_L2PTR_MASK
+end
+
+fn smmu_hw_write_ste inst ulong sid ulong n ulong cd_pa ulong to long
+base = mul n 8
+smmu_hw_put_cd cd_pa base
+l2 = smmu_hw_l2_for inst sid
+if eq l2 0
+ret SMMU_EFULL
+end
+ste = add l2 mul and sid sub shl ulong 1 SMMU_STRTAB_SPLIT 1 64
+smmu_hw_put_ste ste base
+ret SMMU_OK
+end
+
 note Open a confined stream for PCI (seg, rid) via iort.om, auto-mapping any covering IORT RMRs.
 note Returns stream handle (1..8) on success, or negative SMMU_E* error.
 fn smmu_open_stream seg uint rid uint cd_pa ulong ttbr0_pa ulong to long
@@ -573,18 +875,35 @@ end
 end
 end
 end
+put smmu_str_ttbr n ttbr0_pa
+put smmu_str_cca n get iort_qres 8
+if smmu_hw
+smmu_zero ttbr0_pa 4096
+smmu_zero cd_pa 64
+end
 rr = smmu_map_rmrs n inst sid
 if ne rr SMMU_OK
 ret rr
 end
 smmu_encode_ste_cd n cd_pa ttbr0_pa
+if smmu_hw
+wr = smmu_hw_write_ste inst sid n cd_pa
+if ne wr SMMU_OK
+ret wr
+end
+end
 put smmu_str_live n 1
 put smmu_str_inst n inst
 put smmu_str_sid n sid
-put smmu_str_ttbr n ttbr0_pa
 put smmu_str_n 0 add n 1
 cpufence
-smmu_cmd_push inst or SMMU_CMD_CFGI_STE shl sid 32 1
+note CMD_CFGI_STE (§4.3.1): op 0x03, StreamID[63:32]; word1 Leaf[0] (mode 1 uses Leaf=0 so the
+note L1STD is also re-fetched). CMD_CFGI_CD_ALL (§4.3.4): op 0x06, StreamID[63:32].
+lf = ulong 1
+if smmu_hw
+lf = ulong 0
+end
+smmu_cmd_push inst or SMMU_CMD_CFGI_STE shl sid 32 lf
 smmu_cmd_push inst or SMMU_CMD_CFGI_CD_ALL shl sid 32 0
 smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 sr = smmu_cmd_sync inst
@@ -632,6 +951,31 @@ smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 ret smmu_cmd_sync inst
 end
 
+note Map one disjoint Normal-WB Inner-Shareable span (for CPU-WB memory, e.g. frames_alloc RAM).
+note Refused (SMMU_EATTR) unless the stream's IORT root complex reports CCA=1 (IORT spec, Memory Access
+note Properties): a WB device mapping on a non-coherent path, or an NC mapping of CPU-WB memory, would be
+note a mismatched-attribute alias (Arm ARM B2.16) and lose coherency. Fail closed instead.
+fn smmu_map_span_wb sh long pa ulong sz ulong to long
+if or le sh 0 gt ulong sh get smmu_str_n 0
+ret SMMU_EARG
+end
+slot = sub ulong sh 1
+if eq get smmu_str_live slot 0
+ret SMMU_EARG
+end
+if ne get smmu_str_cca slot 1
+ret SMMU_EATTR
+end
+ar = smmu_add_span_raw slot pa sz SMMU_PTE_NORMAL_WB 0
+if ne ar SMMU_OK
+ret ar
+end
+inst = get smmu_str_inst slot
+cpufence
+smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
+ret smmu_cmd_sync inst
+end
+
 note Unmap one non-RMR DMA span from an open stream (e.g. NVMe unmaps loaded weights before GB20B maps them).
 fn smmu_unmap_span sh long pa ulong sz ulong to long
 if or le sh 0 gt ulong sh get smmu_str_n 0
@@ -649,6 +993,12 @@ if and eq get smmu_sp_pa i pa eq get smmu_sp_len i sz
 if ne get smmu_sp_rmr i 0
 ret SMMU_EARG
 end
+if smmu_hw
+ur = smmu_pt_span get smmu_str_ttbr slot pa sz 0
+if ne ur SMMU_OK
+ret ur
+end
+end
 put smmu_sp_live i 0
 cpufence
 smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
@@ -658,6 +1008,14 @@ end
 end
 end
 ret SMMU_ENOTFOUND
+end
+
+note §7.3: 32-byte record at EVENTQ_BASE + slot*32; word0 = type[7:0] | StreamID[63:32];
+note word2 (+16) = InputAddr for F_TRANSLATION (0x10, §7.3.12).
+fn smmu_hw_evt inst ulong slot ulong to ulong
+epa = add get smmu_inst_evtq inst mul slot 32
+put smmu_inst_last_addr inst smmu_mr add epa 16
+ret smmu_mr epa
 end
 
 note Drain SMMUv3 EVENTQ faults (Page 1 0x100a8/0x100ac, 32 B/record, wrap mask 0x1f, OVFLG/OVACKFLG bit 31).
@@ -679,6 +1037,9 @@ while and ne cons prod lt cnt SMMU_Q_ENTRIES bound 16
 slot = and cons sub SMMU_Q_ENTRIES 1
 eidx = add mul inst 64 mul slot 4
 w0 = get smmu_evtq_buf eidx
+if smmu_hw
+w0 = smmu_hw_evt inst slot
+end
 put smmu_inst_last_evt inst w0
 cons = and add cons 1 SMMU_Q_IDX_MASK
 cnt = add cnt 1

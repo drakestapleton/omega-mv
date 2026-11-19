@@ -1,0 +1,410 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/smmu_qemu_test.om: target a64efi QEMU proof of the mode-1 (memory-backed) SMMUv3
+note back end in smmuv3.om. Runs under qemu-system-aarch64 -M virt,iommu=smmuv3 with -device edu:
+note   1. IORT -> SMMUv3 base; smmu_init_instance (zeroed 2-level STRTAB, CR1/CR2, GBPA.ABORT, CMDQ/EVENTQ,
+note      CFGI_ALL + TLBI_NSNH_ALL + CMD_SYNC completion, SMMUEN) -> SYNC must complete (CONS == PROD, ERR == 0).
+note   2. smmu_open_stream for the edu RID (CD + L1STD + L2 STE in memory, CFGI_STE/CFGI_CD_ALL/TLBI/SYNC).
+note   3. smmu_map_span one 8 KiB Normal-NC buffer (VA == PA stage-1 tables) and run the edu DMA engine
+note      RAM -> device -> RAM through it: the bytes must round-trip (mapped DMA succeeds).
+note   4. edu DMA device -> an UNMAPPED page: the page must stay untouched and the EVENTQ must hold an
+note      F_TRANSLATION (0x10) record whose StreamID and InputAddr match (unmapped DMA faults + is recorded).
+note   5. smmu_map_span_wb (CCA from IORT) + an extra TLBI + CMD_SYNC must complete.
+note Prints SMMU_QEMU_PASS or SMMU_QEMU_FAIL step=N, then PSCI SYSTEM_RESET (QEMU -no-reboot exits).
+note QEMU-only: never run on Spark silicon (no edu device; refuses anything but vendor 0x1234/0x11e8).
+
+const SQ_EFI_MMAP_CAP ulong 65536
+const SQ_EDU_VID ulong 0x1234
+const SQ_EDU_DID ulong 0x11e8
+const SQ_EDU_BAR_SZ ulong 1048576
+const SQ_EDU_BUF ulong 0x40000
+const SQ_DMA_LEN ulong 256
+const SQ_SENT ulong 0x5a5a5a5a5a5a5a5a
+
+global efi_mmap uchar 65536
+global efi_mm_out uchar 64
+note sq_st: 0=edu dev, 1=edu bar0, 2=smmu base, 3=sid, 4=stream handle, 5=buf pa, 6=unmapped pa
+global sq_st ulong 8
+
+text sq_hdr "\n[SMMUQ] mode-1 SMMUv3 on QEMU virt iommu=smmuv3 + edu DMA\n"
+text sq_up "SMMUQ_UP base=0x"
+text sq_cmds " cmds="
+text sq_sid "SMMUQ_STREAM sid=0x"
+text sq_okdma "SMMUQ_MAPPED_DMA_OK bytes="
+text sq_evt "SMMUQ_FAULT type=0x"
+text sq_esid " sid=0x"
+text sq_eaddr " addr=0x"
+text sq_pass "SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete\n"
+text sq_fail "SMMU_QEMU_FAIL step="
+text sq_nl "\n"
+
+fn efi_find_acpi2_rsdp to ulong
+ret efcfg 0x11d3e4f18868e871 0x81883cc7800022bc
+end
+
+fn efi_exit_boot_services to bool
+bs = efbs
+ih = fwsys 0
+x = fwcall fwld add bs 256 8 0 0 0 0 0 0
+outp = fwadr efi_mm_out 0 64
+x = fwst add outp 40 8 efi_find_acpi2_rsdp
+x = fwst add outp 48 8 arm64_current_el
+gmm = fwld add bs 56 8
+ebs = fwld add bs 232 8
+mp = fwadr efi_mmap 0 SQ_EFI_MMAP_CAP
+att = ulong 0
+while lt att 8 bound 8
+x = fwst outp 8 SQ_EFI_MMAP_CAP
+s = fwcall gmm outp mp add outp 8 add outp 16 add outp 24 0
+if ne s 0
+ret false
+end
+s2 = fwcall ebs ih fwld add outp 8 8 0 0 0 0
+att = add att 1
+if eq s2 0
+ret true
+end
+end
+ret false
+end
+
+fn sq_halt to void
+arm64_psci_reset get acpi_info 7
+i = ulong 0
+while lt i 9223372036854775807 bound 9223372036854775807
+arm64_wfe
+end
+end
+
+fn sq_die step ulong v ulong to void
+uart_puts sq_fail
+uart_putdec step
+uart_puts sq_esid
+uart_puthex v
+uart_puts sq_nl
+sq_halt
+end
+
+note Same ECAM registration as spark_main.om spk_register_mcfg_segs (Bus 0..1, 2 MiB Device-nGnRnE window).
+fn sq_mcfg to ulong
+nm = get acpi_info 12
+if gt nm PCIE_MAX_SEGS
+nm = PCIE_MAX_SEGS
+end
+mapped = ulong 0
+i = ulong 0
+while lt i nm bound 16
+base = get acpi_mcfg_base i
+if ne base 0
+if mmio_map_device base SPARK_ECAM_WIN_SZ
+put pcie_seg_base mapped base
+put pcie_seg_id mapped uint get acpi_mcfg_seg i
+put pcie_seg_bus0 mapped uchar and get acpi_mcfg_sbus i 255
+put pcie_seg_bus1 mapped uchar 1
+mapped = add mapped 1
+end
+end
+i = add i 1
+end
+put pcie_nsegs 0 mapped
+j = ulong 0
+while lt j mapped bound 16
+h = pcie_map_seg_ecam get pcie_seg_id j
+j = add j 1
+end
+ret mapped
+end
+
+note Find edu on segment 0 bus 0; BAR0 is a 32-bit non-prefetchable memory BAR (type bits [2:1] = 0).
+fn sq_find_edu to bool
+d = ulong 0
+while lt d 32 bound 32
+if eq pcie_probe_dev 0 0 d 0 PCIE_OK
+if and eq get pcie_dev_info 0 SQ_EDU_VID eq get pcie_dev_info 1 SQ_EDU_DID
+b = get pcie_dev_info 5
+bar = and b 0xfffffff0
+if eq and b 6 4
+bar = or bar shl get pcie_dev_info 6 32
+end
+if eq bar 0
+ret false
+end
+put sq_st 0 d
+put sq_st 1 bar
+ret true
+end
+end
+d = add d 1
+end
+ret false
+end
+
+fn sq_iort to bool
+ib = new uchar 4096 0
+ipa = get acpi_info 10
+ilen = get acpi_info 11
+if or eq ipa 0 or lt ilen 48 gt ilen 4096
+ret false
+end
+k = ulong 0
+while lt k ilen bound 4096
+put ib k uchar and fwld add ipa k 1 255
+k = add k 1
+end
+ret eq iort_parse part ib 0 ilen 1
+end
+
+fn sq_smmu_up to long
+base = get iort_smmu_base 0
+put sq_st 2 base
+if not mmio_map_device base SPARK_SMMU_SZ
+ret -100
+end
+st = dma_alloc_nc 2 8192
+cq = dma_alloc_nc 1 4096
+eq0 = dma_alloc_nc 1 4096
+pool = dma_alloc_nc 64 4096
+if or or eq st 0 eq cq 0 or eq eq0 0 eq pool 0
+ret -101
+end
+if ne smmu_set_pt_pool pool 64 SMMU_OK
+ret -102
+end
+ret smmu_init_instance 0 base 16 st cq eq0
+end
+
+fn sq_edu_w64 off ulong v ulong to void
+arm64_mmio_w64 add get sq_st 1 off v
+end
+
+fn sq_edu_r32 off ulong to ulong
+ret arm64_mmio_r32 add get sq_st 1 off
+end
+
+note edu DMA (QEMU hw/misc/edu.c): 0x80 src, 0x88 dst, 0x90 count, 0x98 cmd (bit0 RUN, bit1 1 = device->RAM).
+fn sq_edu_dma src ulong dst ulong to_ram ulong to bool
+sq_edu_w64 0x80 src
+sq_edu_w64 0x88 dst
+sq_edu_w64 0x90 SQ_DMA_LEN
+cmd = ulong 1
+if ne to_ram 0
+cmd = ulong 3
+end
+arm64_mmio_w32 add get sq_st 1 0x98 cmd
+i = ulong 0
+while lt i 200000000 bound 200000000
+if eq and sq_edu_r32 0x98 1 0
+ret true
+end
+cpurelax
+i = add i 1
+end
+ret false
+end
+
+fn sq_fill pa ulong v ulong n ulong to void
+o = ulong 0
+while lt o n bound 1024
+arm64_mmio_w64 add pa o add v o
+o = add o 8
+end
+end
+
+fn sq_same pa ulong v ulong n ulong to bool
+o = ulong 0
+while lt o n bound 1024
+if ne arm64_mmio_r64 add pa o add v o
+ret false
+end
+o = add o 8
+end
+ret true
+end
+
+fn sq_untouched pa ulong n ulong to bool
+o = ulong 0
+while lt o n bound 1024
+if ne arm64_mmio_r64 add pa o SQ_SENT
+ret false
+end
+o = add o 8
+end
+ret true
+end
+
+fn sq_stream to bool
+d = get sq_st 0
+rid = uint shl d 3
+cd = dma_alloc_nc 1 4096
+tt = dma_alloc_nc 1 4096
+if or eq cd 0 eq tt 0
+ret false
+end
+sh = smmu_open_stream 0 rid cd tt
+if le sh 0
+ret false
+end
+put sq_st 3 get iort_qres 3
+put sq_st 4 ulong sh
+uart_puts sq_sid
+uart_puthex get sq_st 3
+uart_puts sq_nl
+ret true
+end
+
+fn sq_dma_tests to ulong
+buf = dma_alloc_nc 2 4096
+bad = dma_alloc_nc 1 4096
+if or eq buf 0 eq bad 0
+ret 30
+end
+put sq_st 5 buf
+put sq_st 6 bad
+if ne smmu_map_span long get sq_st 4 buf 8192 0 SMMU_OK
+ret 31
+end
+sq_fill buf 0x0123456789abcdef SQ_DMA_LEN
+for z ulong 32
+arm64_mmio_w64 add add buf 4096 mul z 8 SQ_SENT
+arm64_mmio_w64 add bad mul z 8 SQ_SENT
+end
+if ne pcie_enable_endpoint 0 0 get sq_st 0 0 PCIE_OK
+ret 32
+end
+if not mmio_map_device get sq_st 1 SQ_EDU_BAR_SZ
+ret 33
+end
+if not sq_edu_dma buf SQ_EDU_BUF 0
+ret 34
+end
+if not sq_edu_dma SQ_EDU_BUF add buf 4096 1
+ret 35
+end
+if not sq_same add buf 4096 0x0123456789abcdef SQ_DMA_LEN
+ret 36
+end
+uart_puts sq_okdma
+uart_putdec SQ_DMA_LEN
+uart_puts sq_nl
+if not sq_edu_dma SQ_EDU_BUF bad 1
+ret 37
+end
+if not sq_untouched bad SQ_DMA_LEN
+ret 38
+end
+ret 0
+end
+
+fn sq_check_fault to ulong
+n = smmu_drain_events 0
+if le n 0
+ret 40
+end
+w0 = get smmu_inst_last_evt 0
+uart_puts sq_evt
+uart_puthex and w0 255
+uart_puts sq_esid
+uart_puthex shr w0 32
+uart_puts sq_eaddr
+uart_puthex get smmu_inst_last_addr 0
+uart_puts sq_nl
+if ne and w0 255 0x10
+ret 41
+end
+if ne shr w0 32 get sq_st 3
+ret 42
+end
+if ne and get smmu_inst_last_addr 0 0xfffffffffffff000 get sq_st 6
+ret 43
+end
+ret 0
+end
+
+fn el1main el1_arg ulong to void
+uart_puts sq_hdr
+bmmio_reset
+pcie_reset
+smmu_reset
+put bmmio_mode 0 1
+if eq sq_mcfg 0
+sq_die 1 0
+end
+if not sq_find_edu
+sq_die 2 0
+end
+if lt pcie_quiesce_unused 0
+sq_die 3 0
+end
+if not sq_iort
+sq_die 4 get acpi_info 11
+end
+r = sq_smmu_up
+if ne r SMMU_OK
+sq_die 5 ulong r
+end
+uart_puts sq_up
+uart_puthex get sq_st 2
+uart_puts sq_cmds
+uart_putdec get smmu_cmd_count 0
+uart_puts sq_nl
+if not sq_stream
+sq_die 6 0
+end
+t = sq_dma_tests
+if ne t 0
+sq_die t 0
+end
+f = sq_check_fault
+if ne f 0
+sq_die f 0
+end
+wb = dma_alloc_nc 1 4096
+if ne smmu_map_span_wb long get sq_st 4 wb 4096 SMMU_OK
+sq_die 50 get iort_qres 8
+end
+smmu_cmd_push 0 SMMU_CMD_TLBI_NSNH_ALL 0
+if ne smmu_cmd_sync 0 SMMU_OK
+sq_die 51 0
+end
+uart_puts sq_pass
+sq_halt
+end
+
+fn main to int
+if not efi_exit_boot_services
+ret 1
+end
+arm64_daif_mask
+arm64_post_ebs_set UART_SPARK_16550_PA PSCI_CONDUIT_NONE
+outp = fwadr efi_mm_out 0 64
+rsdp = fwld add outp 40 8
+ok_acpi = acpi_parse_rsdp rsdp
+conduit = get acpi_info 7
+if ne get acpi_info 8 0
+uart_init get acpi_info 8 get acpi_info 9 conduit
+else
+uart_init UART_SPARK_16550_PA UART_KIND_16550_32 conduit
+end
+arm64_post_ebs_set uart_base conduit
+frames_init
+mp = fwadr efi_mmap 0 SQ_EFI_MMAP_CAP
+cnt = frames_ingest_efi_raw mp fwld outp 8 fwld add outp 16 8
+if eq cnt 0
+trap 8
+end
+ib = arm64_meta 0
+bss = arm64_meta 1
+ie = arm64_meta 2
+frames_reserve ib ie
+if ne rsdp 0
+frames_reserve rsdp add rsdp 4096
+end
+if not mmu_build_initial ib bss ie
+trap 8
+end
+e1 = arm64_meta 4
+if eq e1 0
+trap 8
+end
+mmu_enter_el1 e1 rsdp
+ret 0
+end
