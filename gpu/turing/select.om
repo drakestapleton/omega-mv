@@ -1,0 +1,666 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/turing/select.om: TURING ranking core, control arm, Field selector v1, retired v0 (K.6 kill-test) & oracle.
+note Converted from src/turing/{history_selector.c,field_select.c,field_select_v0_retired.c,replay.c}.
+
+note Global store arrays (program mode):
+note ts_meta[0]=contract_id, [1]=nspec, [2]=nev, [3]=nreceipt
+global ts_meta ulong 4
+global tr_ok int 8
+
+global ts_cid ulong 8
+global ts_maxn ulong 8
+global ts_exact int 8
+global ts_isref int 8
+
+global te_spec uint 64
+global te_n ulong 64
+global te_m ulong 64
+global te_spar uint 64
+global te_rcpt uint 64
+global te_tier uint 64
+global te_ver int 64
+global te_forced uint 64
+global te_med ulong 64
+global te_pack ulong 64
+global te_nppm uint 64
+global te_pnppm uint 64
+global te_id ulong 64
+
+fn turing_store_reset contract_id ulong to void
+put ts_meta 0 contract_id
+put ts_meta 1 ulong 0
+put ts_meta 2 ulong 0
+put ts_meta 3 ulong 0
+for i ulong 8
+put tr_ok i 0
+put ts_cid i ulong 0
+put ts_maxn i ulong 0
+put ts_exact i 0
+put ts_isref i 0
+end
+ret
+end
+
+fn turing_store_add_receipt ok int to uint
+idx = get ts_meta 3
+if ge idx TURING_MAX_RCPT
+trap 8
+end
+put tr_ok idx ok
+put ts_meta 3 add idx ulong 1
+ret uint idx
+end
+
+fn turing_store_add_spec cid ulong max_n ulong exact int is_ref int to uint
+idx = get ts_meta 1
+if ge idx TURING_MAX_SPECS
+trap 8
+end
+put ts_cid idx cid
+put ts_maxn idx max_n
+put ts_exact idx exact
+put ts_isref idx is_ref
+put ts_meta 1 add idx ulong 1
+ret uint idx
+end
+
+fn turing_store_add_ev spec_idx uint n ulong m ulong spar uint rcpt uint tier uint to uint
+idx = get ts_meta 2
+if ge idx TURING_MAX_EV
+trap 8
+end
+put te_spec idx spec_idx
+put te_n idx n
+put te_m idx m
+put te_spar idx spar
+put te_rcpt idx rcpt
+put te_tier idx tier
+put te_ver idx 1
+put te_forced idx uint 0
+put te_med idx ulong 0
+put te_pack idx ulong 0
+put te_nppm idx uint 0
+put te_pnppm idx uint 0
+put te_id idx add ulong 1000 idx
+put ts_meta 2 add idx ulong 1
+ret uint idx
+end
+
+fn turing_store_set_ev_meas idx uint ver int forced uint med ulong pcost ulong nppm uint to void
+i = ulong idx
+put te_ver i ver
+put te_forced i forced
+put te_med i med
+put te_pack i pcost
+put te_nppm i nppm
+put te_pnppm i uint 0
+ret
+end
+
+fn turing_ev_cost i ulong pack int to ulong
+if eq pack TURING_PACK_PER_CALL
+ret add get te_med i get te_pack i
+end
+ret get te_med i
+end
+
+fn turing_row_noise i ulong pack int to f64
+c = f64 turing_ev_cost i pack
+if and eq pack TURING_PACK_PER_CALL gt c 0.0f64
+a = mul div f64 get te_nppm i 1000000.0f64 f64 get te_med i
+b = mul div f64 get te_pnppm i 1000000.0f64 f64 get te_pack i
+ret div add a b c
+end
+ret div f64 get te_nppm i 1000000.0f64
+end
+
+fn turing_tier_ok t uint to int
+if or eq t TURING_TIER_E2 or eq t TURING_TIER_E3 eq t TURING_TIER_E4
+ret 1
+end
+ret 0
+end
+
+note ---- Ranking core (history_selector.c) ----
+
+fn turing_bucket_reset b edit TuringBucket n ulong m ulong pack int to void
+put b n n
+put b m m
+put b pack pack
+put b cursor uint 0
+for k ulong 8
+put b count k uint 0
+put b mean_ps k 0.0f64
+put b order k uint k
+end
+ret
+end
+
+fn turing_bucket_observe b edit TuringBucket k ulong cost_ps ulong to void
+c = add get b count k uint 1
+put b count k c
+old_m = get b mean_ps k
+delta = div sub f64 cost_ps old_m f64 c
+put b mean_ps k add old_m delta
+ret
+end
+
+fn turing_rank_min_cost b view TuringBucket allowed view int 8 nspec ulong to int
+best = int -1
+for k ulong nspec bound 8
+if ne get allowed k 0
+if gt get b count k uint 0
+if lt best 0
+best = int k
+else
+if lt get b mean_ps k get b mean_ps ulong best
+best = int k
+end
+end
+end
+end
+end
+ret best
+end
+
+fn turing_rank_min_cost_mutant b view TuringBucket allowed view int 8 nspec ulong to int
+note Mutant M1: inverted comparator (picks maximum cost instead of minimum)
+best = int -1
+for k ulong nspec bound 8
+if ne get allowed k 0
+if gt get b count k uint 0
+if lt best 0
+best = int k
+else
+if gt get b mean_ps k get b mean_ps ulong best
+best = int k
+end
+end
+end
+end
+end
+ret best
+end
+
+fn turing_bucket_shuffle b edit TuringBucket seed ulong nspec ulong to void
+if le nspec ulong 1
+ret
+end
+r = new ulong 1 0
+s0 = xor seed mul get b n ulong 0x100000001b3
+s1 = xor s0 shl get b m 20
+put r 0 xor s1 ulong get b pack
+k = nspec
+while gt k ulong 1 bound 8
+j = rem turing_splitmix64 edit r k
+km1 = sub k ulong 1
+tmp = get b order km1
+put b order km1 get b order j
+put b order j tmp
+k = km1
+end
+ret
+end
+
+note ---- Control arm (turing_history_select) ----
+
+fn turing_history_select b edit TuringBucket q view TuringQuery d edit TuringDecision to int
+nspec = get ts_meta 1
+put d n get q n
+put d m get q m
+put d sparsity_milli get q sparsity_milli
+put d pack get q pack
+put d cell_n get q n
+put d cell_m get q m
+put d exact_cell 0
+put d ncand uint nspec
+put d chosen -1
+put d verdict TURING_V_NONE
+put d ncite uint 0
+put d margin_ppm uint 0
+put d band_ppm uint 0
+can = new int 8 0
+for k ulong nspec bound 8
+if le get q n get ts_maxn k
+put can k 1
+put d reason k TURING_R_RANKED
+if gt get b count k uint 0
+put d cost_ps k ulong add get b mean_ps k 0.5f64
+else
+put d cost_ps k ulong 0
+end
+else
+put can k 0
+put d reason k TURING_R_MAX_N
+put d cost_ps k ulong 0
+end
+end
+cur = ulong get b cursor
+for t ulong nspec bound 8
+idx = rem add cur t nspec
+k = ulong get b order idx
+if ne get can k 0
+if eq get b count k uint 0
+put b cursor uint rem add add cur t ulong 1 nspec
+put d chosen int k
+put d reason k TURING_R_EXPLORE
+put d verdict TURING_V_EXPLORE
+ret int k
+end
+end
+end
+best = turing_rank_min_cost view b view can nspec
+if lt best 0
+ret -1
+end
+put d chosen best
+put d reason ulong best TURING_R_CHOSEN
+put d verdict TURING_V_CHOSEN
+ret best
+end
+
+note ---- Field selector v1 (field_select.c) ----
+
+fn turing_is_excluded q view TuringQuery i ulong to int
+if eq get q exclude_exact_cell 0
+ret 0
+end
+if ne get te_n i get q n
+ret 0
+end
+if ne get te_m i get q m
+ret 0
+end
+if ne get te_spar i get q sparsity_milli
+ret 0
+end
+ret 1
+end
+
+fn turing_field_init_dec q view TuringQuery d edit TuringDecision to void
+nspec = get ts_meta 1
+put d n get q n
+put d m get q m
+put d sparsity_milli get q sparsity_milli
+put d pack get q pack
+put d cell_n ulong 0
+put d cell_m ulong 0
+put d exact_cell 0
+put d ncand uint nspec
+put d chosen -1
+put d verdict TURING_V_NONE
+put d margin_ppm uint 0
+put d band_ppm uint 0
+put d ncite uint 0
+for k ulong 8
+put d reason k TURING_R_NO_EVIDENCE
+put d cost_ps k ulong 0
+end
+for c ulong 16
+put d cite c ulong 0
+end
+ret
+end
+
+fn turing_field_filter_specs q view TuringQuery d edit TuringDecision elig edit int 8 to void
+nspec = get ts_meta 1
+cid = get ts_meta 0
+for k ulong nspec bound 8
+put elig k 0
+if ne get ts_cid k cid
+put d reason k TURING_R_CONTRACT_MISMATCH
+else
+if ne get ts_exact k 1
+put d reason k TURING_R_NOT_EXACT
+else
+if gt get q n get ts_maxn k
+put d reason k TURING_R_MAX_N
+else
+put d reason k TURING_R_NO_EVIDENCE
+put elig k 1
+end
+end
+end
+end
+ret
+end
+
+fn turing_ev_foot_dist q view TuringQuery i ulong to f64
+ret turing_foot_dist get q n get q m get te_n i get te_m i
+end
+
+fn turing_foot_better have int dd f64 best f64 i ulong d view TuringDecision to int
+if eq have 0
+ret 1
+end
+if lt dd sub best 0.000000000001f64
+ret 1
+end
+if le fabs sub dd best 0.000000000001f64
+en = get te_n i
+em = get te_m i
+if lt en get d cell_n
+ret 1
+end
+if and eq en get d cell_n lt em get d cell_m
+ret 1
+end
+end
+ret 0
+end
+
+fn turing_field_find_foot q view TuringQuery usable view int 64 d edit TuringDecision to int
+nev = get ts_meta 2
+have = int 0
+best = 0.0f64
+for i ulong nev bound 64
+if ne get usable i 0
+dd = turing_ev_foot_dist q i
+if ne turing_foot_better have dd best i view d 0
+have = 1
+best = dd
+put d cell_n get te_n i
+put d cell_m get te_m i
+end
+end
+end
+if ne have 0
+if eq get d cell_n get q n
+if eq get d cell_m get q m
+put d exact_cell 1
+end
+end
+end
+ret have
+end
+
+fn turing_field_usable q view TuringQuery elig view int 8 usable edit int 64 unrcpt edit int 8 drop_rcpt int to void
+nev = get ts_meta 2
+nrcpt = get ts_meta 3
+for i ulong nev bound 64
+put usable i 0
+if eq turing_is_excluded q i 0
+k = ulong get te_spec i
+ri = ulong get te_rcpt i
+ok = int 0
+if ne drop_rcpt 0
+ok = 1
+else
+if lt ri nrcpt
+ok = get tr_ok ri
+end
+end
+if eq ok 0
+put unrcpt k 1
+else
+if ne get elig k 0
+put usable i 1
+end
+end
+end
+end
+ret
+end
+
+fn turing_ev_in_foot i ulong d view TuringDecision to int
+if ne get te_n i get d cell_n
+ret 0
+end
+if ne get te_m i get d cell_m
+ret 0
+end
+ret 1
+end
+
+fn turing_field_rank_foot usable view int 64 ranked view int 8 q view TuringQuery b edit TuringBucket d edit TuringDecision to void
+nev = get ts_meta 2
+turing_bucket_reset b get d cell_n get d cell_m get q pack
+for i ulong nev bound 64
+if ne get usable i 0
+if ne turing_ev_in_foot i view d 0
+k = ulong get te_spec i
+if ne get ranked k 0
+turing_bucket_observe b k turing_ev_cost i get q pack
+nc = ulong get d ncite
+if lt nc TURING_MAX_CITE
+put d cite nc get te_id i
+put d ncite uint add nc ulong 1
+end
+end
+end
+end
+end
+ret
+end
+
+fn turing_find_runner ranked view int 8 b view TuringBucket chosen int to int
+nspec = get ts_meta 1
+runner = int -1
+for k ulong nspec bound 8
+if and ne get ranked k 0 ne int k chosen
+if lt runner 0
+runner = int k
+else
+if lt get b mean_ps k get b mean_ps ulong runner
+runner = int k
+end
+end
+end
+end
+ret runner
+end
+
+fn turing_field_margin usable view int 64 ranked view int 8 b view TuringBucket d edit TuringDecision to int
+chosen = get d chosen
+runner = turing_find_runner ranked b chosen
+band = 0.0f64
+nev = get ts_meta 2
+for i ulong nev bound 64
+if ne get usable i 0
+if ne turing_ev_in_foot i view d 0
+ks = int get te_spec i
+if or eq ks chosen eq ks runner
+w = turing_row_noise i get d pack
+if gt w band
+band = w
+end
+end
+end
+end
+end
+put d band_ppm uint add mul band 1000000.0f64 0.5f64
+if ge runner 0
+rm = get b mean_ps ulong runner
+cm = get b mean_ps ulong chosen
+ratio = sub div rm cm 1.0f64
+if gt ratio 0.0f64
+put d margin_ppm uint add mul ratio 1000000.0f64 0.5f64
+end
+end
+ret runner
+end
+
+fn turing_field_filter_foot usable view int 64 elig view int 8 unrcpt view int 8 d edit TuringDecision ranked edit int 8 to void
+rows = new int 8 0
+bad = new int 8 -1
+nev = get ts_meta 2
+for i ulong nev bound 64
+if ne get usable i 0
+if ne turing_ev_in_foot i view d 0
+k = ulong get te_spec i
+put rows k add get rows k 1
+if eq get te_ver i 0
+put bad k int TURING_R_UNVERIFIED_RUN
+else
+if ne get te_forced i uint 0
+put bad k int TURING_R_CONTENTION_FORCED
+else
+if eq turing_tier_ok get te_tier i 0
+put bad k int TURING_R_TIER
+end
+end
+end
+end
+end
+end
+nspec = get ts_meta 1
+for k ulong nspec bound 8
+if ne get elig k 0
+if eq get rows k 0
+if ne get unrcpt k 0
+put d reason k TURING_R_RECEIPT_UNVERIFIED
+else
+put d reason k TURING_R_NO_EVIDENCE
+end
+else
+if ge get bad k 0
+put d reason k uint get bad k
+else
+put ranked k 1
+put d reason k TURING_R_RANKED
+end
+end
+end
+end
+ret
+end
+
+fn turing_mark_unrcpt elig view int 8 unrcpt view int 8 d edit TuringDecision to void
+nspec = get ts_meta 1
+for k ulong nspec bound 8
+if ne get elig k 0
+if ne get unrcpt k 0
+put d reason k TURING_R_RECEIPT_UNVERIFIED
+end
+end
+end
+ret
+end
+
+fn turing_field_finish usable view int 64 ranked view int 8 b view TuringBucket d edit TuringDecision retired_v0 int to int
+nspec = get ts_meta 1
+chosen = turing_rank_min_cost b ranked nspec
+if lt chosen 0
+put d ncite uint 0
+ret 1
+end
+for k ulong nspec bound 8
+if ne get ranked k 0
+put d cost_ps k ulong add get b mean_ps k 0.5f64
+end
+end
+put d chosen chosen
+runner = turing_field_margin usable ranked b d
+if and ne retired_v0 0 ge runner 0
+if le get d margin_ppm get d band_ppm
+for k ulong nspec bound 8
+if ne get ranked k 0
+if ne get ts_isref k 0
+put d reason ulong chosen TURING_R_TIED
+put d chosen int k
+put d reason k TURING_R_CHOSEN
+put d verdict TURING_V_TIE
+ret 0
+end
+end
+end
+end
+end
+put d reason ulong chosen TURING_R_CHOSEN
+put d verdict TURING_V_CHOSEN
+ret 0
+end
+
+fn turing_field_select_impl q view TuringQuery d edit TuringDecision retired_v0 int drop_rcpt int to int
+if or eq get q n ulong 0 eq get q m ulong 0
+ret -1
+end
+turing_field_init_dec q d
+elig = new int 8 0
+unrcpt = new int 8 0
+usable = new int 64 0
+ranked = new int 8 0
+b = new TuringBucket 0 0 0 0 0.0f64 0 0
+turing_field_filter_specs q d edit elig
+turing_field_usable q view elig edit usable edit unrcpt drop_rcpt
+if eq turing_field_find_foot q view usable d 0
+turing_mark_unrcpt view elig view unrcpt d
+ret 1
+end
+turing_field_filter_foot view usable view elig view unrcpt d edit ranked
+turing_field_rank_foot view usable view ranked q edit b d
+ret turing_field_finish view usable view ranked view b d retired_v0
+end
+
+fn turing_field_select q view TuringQuery d edit TuringDecision to int
+ret turing_field_select_impl q d 0 0
+end
+
+fn turing_field_select_v0_retired q view TuringQuery d edit TuringDecision to int
+ret turing_field_select_impl q d 1 0
+end
+
+note ---- Oracle & Regret (replay.c) ----
+
+fn turing_cell_cost k ulong q view TuringQuery to f64
+nev = get ts_meta 2
+sum = 0.0f64
+rows = ulong 0
+for i ulong nev bound 64
+if eq get te_n i get q n
+if eq get te_m i get q m
+if eq get te_spar i get q sparsity_milli
+if eq ulong get te_spec i k
+if eq get te_ver i 0
+ret -1.0f64
+end
+sum = add sum f64 turing_ev_cost i get q pack
+rows = add rows ulong 1
+end
+end
+end
+end
+end
+if eq rows ulong 0
+ret -1.0f64
+end
+ret div sum f64 rows
+end
+
+fn turing_oracle q view TuringQuery to int
+nspec = get ts_meta 1
+best = int -1
+bc = 0.0f64
+for k ulong nspec bound 8
+if and ne get ts_exact k 0 le get q n get ts_maxn k
+c = turing_cell_cost k q
+if ge c 0.0f64
+if or lt best 0 lt c bc
+best = int k
+bc = c
+end
+end
+end
+end
+ret best
+end
+
+fn turing_regret_ppm chosen int q view TuringQuery to ulong
+if lt chosen 0
+ret ulong 1000000000
+end
+ok = turing_oracle q
+if lt ok 0
+ret ulong 1000000000
+end
+oc = turing_cell_cost ulong ok q
+cc = turing_cell_cost ulong chosen q
+if or le oc 0.0f64 lt cc 0.0f64
+ret ulong 1000000000
+end
+r = sub div cc oc 1.0f64
+if le r 0.0f64
+ret ulong 0
+end
+ret ulong add mul r 1000000.0f64 0.5f64
+end
