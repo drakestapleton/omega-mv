@@ -1,0 +1,1056 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gsp/logdec.om: Pure-Omega (OM-1) LibosLog and CrashCat decoder for GB20B GSP bring-up.
+note Host-only decoder over caller-supplied memory images; never opens a device, maps MMIO, or performs DMA.
+note Verified GB20B arena layout reference: gpu/driver/gsp/arena.om (arlogs, arlogpt, arnames).
+note LibosMemoryRegionInitArgument: 32 bytes/entry (+0 id8 BE-ASCII, +8 pa, +16 size, +24 kind=1, +25 loc=1).
+note Verified 8 GB20B region IDs (arena.om:42,271-289):
+note   LOGINIT=0x004c4f47494e4954 (64 KiB), LOGINTR=0x004c4f47494e5452 (64 KiB),
+note   LOGRM=0x0000004c4f47524d (64 KiB),   LOGMNOC=0x004c4f474d4e4f43 (64 KiB),
+note   LOGDBG=0x00004c4f47444247 (64 KiB),  LOGROOT=0x004c4f47524f4f54 (4 KiB),
+note   LOGKRNL=0x004c4f474b524e4c (64 KiB), RMARGS=0x0000524d41524753 (4 KiB).
+note Verified paged log-buffer header (arena.om:260-270 arlogpt):
+note   Page 0 (4096 bytes): +0 u64 LE put (monotonic byte offset), +8..+8+8*n page_table[0..n-1] (pa + j*4096).
+note   Pages 1..n-1 (size - 4096 bytes): circular u64-slot ring data (61440 bytes = 7680 qwords for 64 KiB).
+note   LOGROOT (4096 bytes) has 0 data bytes and is handled without division by zero.
+note CrashCat V1 wire format (NVIDIA open-gpu-kernel-modules 580.173.02 nv-crashcat.h):
+note   NvCrashCatPacketHeader_V1 (u64 LE): [63:48] sig=0xCA70 (51824), [47:44] ver=1,
+note   [43:40] type (0=REPORT,1=STACK_TRACE,2=REG32,3=REG64,4=IO32,5=IO64,6=RV64_CSR,7=RV64_GPR,8=RV64_TRACE),
+note   [39:32] payload_qwords (0..255), [31:0] header_data.
+note Prefix lg (LibosLog/RMARGS/formatter) and cc (CrashCat). Library unit: no main.
+
+note ---- Region ID constants (verified via Python from ASCII big-endian packing in arena.om:274-278) ----
+const LGIDINIT ulong 21479265821149524
+const LGIDINTR ulong 21479265821152338
+const LGIDRM ulong 327747588685
+const LGIDMNOC ulong 21479265888259907
+const LGIDDBG ulong 83903381783111
+const LGIDROOT ulong 21479265972211540
+const LGIDKRNL ulong 21479265854967372
+const LGIDARGS ulong 90491761870675
+
+note ---- Buffer and limit constants ----
+const LGPAGE ulong 4096
+const LGBMAX ulong 65536
+const LGTMAX ulong 32
+const LGMAXA ulong 20
+const LGOCAP ulong 4096
+const LGU32 ulong 4294967295
+const LGFMTM ulong 281474976710655
+const LGWPRMAG ulong 15869187694674993331
+const LGWPRSZ ulong 256
+const LGRMASZ ulong 128
+const LGCCQPA ulong 224
+const LGCCQSZ ulong 232
+
+note ---- CrashCat V1 constants (0xCA70 = 51824) ----
+const CCSIG ulong 51824
+const CCVER1 ulong 1
+const CCTRPT ulong 0
+const CCTSTK ulong 1
+const CCTR32 ulong 2
+const CCTR64 ulong 3
+const CCTI32 ulong 4
+const CCTI64 ulong 5
+const CCTCSR ulong 6
+const CCTGPR ulong 7
+const CCTTRC ulong 8
+const CCMAXT ulong 8
+const CCMAXP ulong 256
+const CCRMIN ulong 5
+const CCGPRN ulong 31
+
+note ---- WPR meta (256 B) and RMARGS (128 B) inspection state ----
+global lgwpr uchar 256
+global lgccqpa ulong 1
+global lgccqsz ulong 1
+global lgrma uchar 128
+note lgrmout: 0 sharedPA, 1 ptCount, 2 cmdOff, 3 statOff, 4 gpuInst, 5 passthru, 6 heapPA, 7 heapBytes
+global lgrmout ulong 8
+
+note ---- LibosMemoryRegionInitArgument table state ----
+global lgtbuf uchar 4096
+global lgtcnt ulong 1
+global lgtid ulong 32
+global lgtpa ulong 32
+global lgtsz ulong 32
+global lgtkl ulong 32
+
+note ---- LibosLog ring buffer and decoded record state ----
+global lgbuf uchar 65536
+global lgsize ulong 1
+global lghdr ulong 1
+global lgdata ulong 1
+global lgput ulong 1
+global lgget ulong 1
+global lgdrop ulong 1
+global lgwrap ulong 1
+global lgrcnt ulong 1
+global lgfmt ulong 1
+global lgts ulong 1
+global lgargc ulong 1
+global lglvl ulong 1
+global lgflg ulong 1
+global lgargs ulong 20
+
+note ---- CrashCat linear buffer and decoded packet state ----
+global ccbuf uchar 65536
+global cclen ulong 1
+global ccpos ulong 1
+global ccver ulong 1
+global cctype ulong 1
+global ccplen ulong 1
+global cchdat ulong 1
+global ccpay ulong 256
+global ccrsrc ulong 1
+global ccrcse ulong 1
+global ccrext ulong 1
+global ccrts ulong 1
+global ccrver ulong 1
+
+note ---- Buffered diagnostic formatter state (stdout/caller fd) ----
+global lgob uchar 4096
+global lgon ulong 1
+global lgofd int 1
+global lgoerr ulong 1
+text LGHEX "0123456789abcdef"
+text LGREG0 "LOGINIT"
+text LGREG1 "LOGINTR"
+text LGREG2 "LOGRM"
+text LGREG3 "LOGMNOC"
+text LGREG4 "LOGDBG"
+text LGREG5 "LOGROOT"
+text LGREG6 "LOGKRNL"
+text LGREG7 "RMARGS"
+text LGREGU "UNKNOWN"
+text LGKREG "REGION "
+text LGKPA " pa=0x"
+text LGKSZ " size=0x"
+text LGKKD " kind="
+text LGKLC " loc="
+text LGKLOG "LOG ts=0x"
+text LGKLVL " lvl="
+text LGKFMT " fmt=0x"
+text LGKARC " argc="
+text LGKARG " args=["
+text LGKCC "CRASHCAT "
+text LGKVER " ver="
+text LGKHD " hdata=0x"
+text LGKSRC " src=0x"
+text LGKCSE " cause=0x"
+text LGKEXT " extra=0x"
+text LGKTS " ts=0x"
+text LGKRVR " rver=0x"
+text LGKCNT " count="
+text LGKOFF " off=0x"
+text LGKVAL " val=0x"
+text LGK0X "0x"
+text LGCT0 "REPORT"
+text LGCT1 "STACK_TRACE"
+text LGCT2 "REGISTER32"
+text LGCT3 "REGISTER64"
+text LGCT4 "IO32_STATE"
+text LGCT5 "IO64_STATE"
+text LGCT6 "RISCV64_CSR"
+text LGCT7 "RISCV64_GPR"
+text LGCT8 "RISCV64_TRACE"
+
+note ==== Low-level little-endian readers (bounds-checked by callers) ====
+
+fn lgu64t o ulong to ulong
+v = ulong 0
+for i ulong 8
+b = ulong get lgtbuf add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+fn lgu64w o ulong to ulong
+v = ulong 0
+for i ulong 8
+b = ulong get lgwpr add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+fn lgu64r o ulong to ulong
+v = ulong 0
+for i ulong 8
+b = ulong get lgrma add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+fn lgu32r o ulong to ulong
+v = ulong 0
+for i ulong 4
+b = ulong get lgrma add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+note ==== GspFwWprMeta CrashCat queue locator (gb20b-gsp-boot.md:17, arena.om:312-325) ====
+note Verifies lgwpr[0..256): +0 magic==0xdc3aae21371a60b3, +8 rev==1,
+note extracts +224 sysmemAddrOfCrashReportQueue and +232 sizeOfCrashReportQueue.
+note Returns:
+note   1  CrashCat queue present (lgccqpa, lgccqsz populated; page-aligned and non-zero)
+note   0  WPR meta valid, CrashCat queue absent (both +224 and +232 are 0)
+note  -1  bad magic or revision
+note  -2  malformed CrashCat queue descriptor (unaligned PA/size, size > LGBMAX, or one zero)
+
+fn lgwprparse to long
+put lgccqpa 0 0
+put lgccqsz 0 0
+if ne lgu64w 0 LGWPRMAG
+ret -1
+end
+if ne lgu64w 8 1
+ret -1
+end
+pa = lgu64w LGCCQPA
+sz = lgu64w LGCCQSZ
+if and eq pa 0 eq sz 0
+ret 0
+end
+if or eq pa 0 eq sz 0
+ret -2
+end
+if or ne and pa 4095 0 ne and sz 4095 0
+ret -2
+end
+if gt sz LGBMAX
+ret -2
+end
+put lgccqpa 0 pa
+put lgccqsz 0 sz
+ret 1
+end
+
+note ==== RMARGS (GSP_ARGUMENTS_CACHED) parser (arena.om:294-303) ====
+note Extracts sharedMemPhysAddr (+0), ptCount (+8 u32), cmdQueueOffset (+16),
+note statQueueOffset (+24), gpuInstance (+44 u32), bIsPassthru (+48 u8),
+note heapPA (+72), heapBytes (+80) from lgrma[0..128) into lgrmout[0..7].
+note Returns 0 on valid GB20B/arena.om shape, -1 on alignment/offset violation.
+
+fn lgrmargs to long
+for i ulong 8
+put lgrmout i 0
+end
+spa = lgu64r 0
+ptc = lgu32r 8
+cmdo = lgu64r 16
+stato = lgu64r 24
+if or eq spa 0 ne and spa 4095 0
+ret -1
+end
+if eq ptc 0
+ret -1
+end
+if or ne cmdo LGPAGE lt stato cmdo
+ret -1
+end
+hpa = lgu64r 72
+hsz = lgu64r 80
+if or ne and hpa 4095 0 ne and hsz 4095 0
+ret -1
+end
+put lgrmout 0 spa
+put lgrmout 1 ptc
+put lgrmout 2 cmdo
+put lgrmout 3 stato
+put lgrmout 4 lgu32r 44
+put lgrmout 5 ulong get lgrma 48
+put lgrmout 6 hpa
+put lgrmout 7 hsz
+ret 0
+end
+
+fn lgu64b o ulong to ulong
+v = ulong 0
+for i ulong 8
+b = ulong get lgbuf add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+fn ccu64b o ulong to ulong
+v = ulong 0
+for i ulong 8
+b = ulong get ccbuf add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+note ==== Region ID classification ====
+
+fn lgkind id ulong to long
+if eq id LGIDINIT
+ret 0
+end
+if eq id LGIDINTR
+ret 1
+end
+if eq id LGIDRM
+ret 2
+end
+if eq id LGIDMNOC
+ret 3
+end
+if eq id LGIDDBG
+ret 4
+end
+if eq id LGIDROOT
+ret 5
+end
+if eq id LGIDKRNL
+ret 6
+end
+if eq id LGIDARGS
+ret 7
+end
+ret -1
+end
+
+note ==== LibosMemoryRegionInitArgument table parser ====
+note Reads up to LGTMAX (32) 32-byte entries from lgtbuf[0..n).
+note Stops at the first zero id8 terminator or when n bytes are consumed.
+note Returns entry count (>=0) on success, or negative error:
+note   -1 bad table length (not multiple of 32 or > 4096)
+note   -2 non-zero reserved bytes (+26..+31)
+note   -3 invalid kind/loc (must be kind=1, loc=1) or unaligned/zero pa/size
+note   -4 exceeds LGTMAX entries without terminator
+
+fn lgtabparse n ulong to long
+put lgtcnt 0 0
+if or eq n 0 gt n LGPAGE
+ret -1
+end
+if ne rem n 32 0
+ret -1
+end
+maxe = div n 32
+cnt = ulong 0
+for i ulong maxe
+off = mul i 32
+id = lgu64t off
+if eq id 0
+break
+end
+if ge cnt LGTMAX
+ret -4
+end
+for r ulong 6
+if ne get lgtbuf add off add 26 r 0
+ret -2
+end
+end
+pa = lgu64t add off 8
+sz = lgu64t add off 16
+if or ne get lgtbuf add off 24 1 ne get lgtbuf add off 25 1
+ret -3
+end
+if eq sz 0
+ret -3
+end
+if or ne and pa 4095 0 ne and sz 4095 0
+ret -3
+end
+put lgtid cnt id
+put lgtpa cnt pa
+put lgtsz cnt sz
+put lgtkl cnt 257
+cnt = add cnt 1
+end
+put lgtcnt 0 cnt
+ret long cnt
+end
+
+note ==== Paged LibosLog page-table validator (matches arena.om:arlogpt) ====
+note Verifies lgbuf[0..total_size) page 0 page table entries at +8..+8+8*npages
+note equal base_pa + j*4096 for j in 0..npages-1.
+note Returns 0 on success, -1 invalid size/alignment, -2 page-table entry mismatch.
+
+fn lgptchk basepa ulong totsize ulong to long
+if or lt totsize LGPAGE gt totsize LGBMAX
+ret -1
+end
+if or ne and totsize 4095 0 ne and basepa 4095 0
+ret -1
+end
+np = div totsize LGPAGE
+if gt np 511
+ret -1
+end
+for j ulong np
+off = add 8 mul j 8
+want = add basepa mul j LGPAGE
+got = lgu64b off
+if ne got want
+ret -2
+end
+end
+ret 0
+end
+
+note ==== LibosLog ring buffer control and wrap-around reader ====
+note lgrinit configures a ring buffer in lgbuf[0..totsize) with data starting at hdrsize.
+note Standard arena.om paged buffers use hdrsize=4096 (data=61440 for 64 KiB, data=0 for LOGROOT 4 KiB).
+note Linear header-only buffers may use hdrsize=8.
+note Returns 0 on success, -1 invalid geometry.
+
+fn lgrinit totsize ulong hdrsize ulong to long
+put lgsize 0 0
+put lghdr 0 0
+put lgdata 0 0
+put lgput 0 0
+put lgget 0 0
+put lgdrop 0 0
+put lgwrap 0 0
+put lgrcnt 0 0
+if or lt totsize 8 gt totsize LGBMAX
+ret -1
+end
+if or lt hdrsize 8 gt hdrsize totsize
+ret -1
+end
+if ne and hdrsize 7 0
+ret -1
+end
+dat = sub totsize hdrsize
+if ne and dat 7 0
+ret -1
+end
+put lgsize 0 totsize
+put lghdr 0 hdrsize
+put lgdata 0 dat
+ret 0
+end
+
+note lgrsetget allows a caller to restore a saved host cursor (must be 8-byte aligned).
+fn lgrsetget g ulong to long
+if ne and g 7 0
+ret -3
+end
+put lgget 0 g
+ret 0
+end
+
+note lgrsync reads the firmware put pointer at lgbuf[0..8), validates it against lgget,
+note and handles ring wrap-around overflow by advancing lgget to (put - lgdata) and
+note accumulating dropped byte count in lgdrop and wrap count in lgwrap.
+note Returns available unread bytes (>=0) on success, or negative error:
+note   -1 ring not initialized (lgsize < 8)
+note   -2 put < get (cursor regression or reset)
+note   -3 put not 8-byte aligned
+note   -4 non-zero put in a zero-data buffer (e.g. 4 KiB LOGROOT)
+
+fn lgrsync to long
+sz = get lgsize 0
+if lt sz 8
+ret -1
+end
+p = lgu64b 0
+if ne and p 7 0
+ret -3
+end
+g = get lgget 0
+if lt p g
+ret -2
+end
+put lgput 0 p
+dat = get lgdata 0
+if eq dat 0
+if gt p 0
+ret -4
+end
+ret 0
+end
+avail = sub p g
+if gt avail dat
+dropped = sub avail dat
+put lgdrop 0 add get lgdrop 0 dropped
+put lgwrap 0 add get lgwrap 0 1
+g = sub p dat
+put lgget 0 g
+avail = dat
+end
+ret long avail
+end
+
+note lgrqword reads one 64-bit LE word at logical byte offset pos (8-byte aligned),
+note wrapping modulo lgdata inside lgbuf[lghdr .. lghdr + lgdata).
+note Caller must guarantee lgdata >= 8 and pos is 8-byte aligned.
+
+fn lgrqword pos ulong to ulong
+dat = get lgdata 0
+if lt dat 8
+ret 0
+end
+off = add get lghdr 0 rem pos dat
+if gt add off 8 get lgsize 0
+ret 0
+end
+ret lgu64b off
+end
+
+note lgpeek inspects the next u64 word (format ID / meta_va) without advancing lgget.
+note Returns 1 if a word is available (stored in lgfmt), 0 if empty, or negative error from lgrsync.
+
+fn lgpeek to long
+av = lgrsync
+if le av 0
+ret av
+end
+if lt av 8
+ret -6
+end
+put lgfmt 0 lgrqword get lgget 0
+ret 1
+end
+
+note lgnext decodes one self-describing framed LibosLog record from the ring buffer.
+note Slot 0 (meta word):
+note   [47:0]  format_id (48-bit metadata VA / format ID)
+note   [55:48] argc (0..20)
+note   [59:56] level (0..15)
+note   [63:60] flags (bit 0 = has_timestamp)
+note Slot 1 (if flags & 1 != 0): 64-bit PTIMER timestamp (ns).
+note Next argc slots: u64 arguments stored in lgargs[0..argc-1].
+note Returns:
+note   1  record decoded (lgfmt, lgts, lgargc, lglvl, lgflg, lgargs updated; lgget advanced)
+note   0  empty (no unread bytes)
+note  -1..-4 sync errors from lgrsync
+note  -5 argc > LGMAXA (20)
+note  -6 truncated record (not enough unread bytes; lgget unchanged)
+
+fn lgnext to long
+av = lgrsync
+if le av 0
+ret av
+end
+if lt av 8
+ret -6
+end
+pos = get lgget 0
+meta = lgrqword pos
+argc = and shr meta 48 255
+if gt argc LGMAXA
+ret -5
+end
+hasts = and shr meta 60 1
+needb = mul add 1 add hasts argc 8
+if lt ulong av needb
+ret -6
+end
+put lgfmt 0 and meta LGFMTM
+put lgargc 0 argc
+put lglvl 0 and shr meta 56 15
+put lgflg 0 and shr meta 60 15
+pos = add pos 8
+if eq hasts 1
+put lgts 0 lgrqword pos
+pos = add pos 8
+else
+put lgts 0 0
+end
+for i ulong argc
+put lgargs i lgrqword pos
+pos = add pos 8
+end
+put lgget 0 pos
+put lgrcnt 0 add get lgrcnt 0 1
+ret 1
+end
+
+note lgnextraw decodes one ELF-metadata-linked LibosLog record where the caller supplies
+note argc (0..20) and hasts (0 or 1) obtained from the firmware .logging section for lgfmt.
+note Slot 0 is stored verbatim as the full 64-bit meta_va in lgfmt.
+note Returns 1 decoded, 0 empty, -1..-4 sync errors, -5 bad argc, -6 truncated.
+
+fn lgnextraw argc ulong hasts ulong to long
+if gt argc LGMAXA
+ret -5
+end
+if gt hasts 1
+ret -5
+end
+av = lgrsync
+if le av 0
+ret av
+end
+needw = add 1 add hasts argc
+needb = mul needw 8
+if lt ulong av needb
+ret -6
+end
+pos = get lgget 0
+put lgfmt 0 lgrqword pos
+put lgargc 0 argc
+put lglvl 0 0
+put lgflg 0 hasts
+pos = add pos 8
+if eq hasts 1
+put lgts 0 lgrqword pos
+pos = add pos 8
+else
+put lgts 0 0
+end
+for i ulong argc
+put lgargs i lgrqword pos
+pos = add pos 8
+end
+put lgget 0 pos
+put lgrcnt 0 add get lgrcnt 0 1
+ret 1
+end
+
+note ==== CrashCat V1 packet and report decoder ====
+note ccinit initializes linear CrashCat decoding over ccbuf[0..n).
+
+fn ccinit n ulong to long
+put cclen 0 0
+put ccpos 0 0
+if gt n LGBMAX
+ret -1
+end
+put cclen 0 n
+ret 0
+end
+
+note ccchk validates a CrashCat V1 header word and stores parsed header fields.
+note Returns total packet byte length (>0) on success, or negative error:
+note   -10 bad signature (not 0xCA70)
+note   -11 unsupported format version (not 1)
+note   -12 unknown packet type (> 8)
+note   -14 invalid payload qword count for typed packet
+
+fn ccchk hdr ulong to long
+sig = and shr hdr 48 65535
+if ne sig CCSIG
+ret -10
+end
+ver = and shr hdr 44 15
+if ne ver CCVER1
+ret -11
+end
+pt = and shr hdr 40 15
+if gt pt CCMAXT
+ret -12
+end
+plen = and shr hdr 32 255
+if eq pt CCTRPT
+if lt plen CCRMIN
+ret -14
+end
+end
+if eq pt CCTGPR
+if ne plen CCGPRN
+ret -14
+end
+end
+if eq pt CCTCSR
+if eq plen 0
+ret -14
+end
+end
+if or eq pt CCTR64 eq pt CCTI64
+if ne and plen 1 0
+ret -14
+end
+end
+put ccver 0 ver
+put cctype 0 pt
+put ccplen 0 plen
+put cchdat 0 and hdr LGU32
+ret long mul add 1 plen 8
+end
+
+note ccfinal populates structured report fields when cctype == CCTRPT.
+fn ccfinal to void
+if eq get cctype 0 CCTRPT
+put ccrsrc 0 get ccpay 0
+put ccrcse 0 get ccpay 1
+put ccrext 0 get ccpay 2
+put ccrts 0 get ccpay 3
+put ccrver 0 get ccpay 4
+else
+put ccrsrc 0 0
+put ccrcse 0 0
+put ccrext 0 0
+put ccrts 0 0
+put ccrver 0 0
+end
+end
+
+note ccnext decodes one CrashCat V1 packet from linear ccbuf[ccpos..cclen).
+note Returns:
+note   1  packet decoded (ccver, cctype, ccplen, cchdat, ccpay, and ccr* if REPORT updated; ccpos advanced)
+note   0  end of buffer (ccpos == cclen)
+note  -10..-12, -14 header/shape errors from ccchk
+note  -13 truncated header or payload (ccpos unchanged)
+
+fn ccnext to long
+p = get ccpos 0
+n = get cclen 0
+if ge p n
+ret 0
+end
+av = sub n p
+if lt av 8
+ret -13
+end
+hdr = ccu64b p
+need = ccchk hdr
+if lt need 0
+ret need
+end
+if lt av ulong need
+ret -13
+end
+plen = get ccplen 0
+q = add p 8
+for i ulong plen
+put ccpay i ccu64b q
+q = add q 8
+end
+ccfinal
+put ccpos 0 add p ulong need
+ret 1
+end
+
+note ccnextring decodes one CrashCat V1 packet directly from the wrapped LibosLog ring buffer.
+note Advances lgget only after full validation and extraction.
+note Returns 1 decoded, 0 empty, -1..-4 ring sync error, -10..-14 CrashCat error.
+
+fn ccnextring to long
+av = lgrsync
+if le av 0
+ret av
+end
+if lt av 8
+ret -13
+end
+p = get lgget 0
+hdr = lgrqword p
+need = ccchk hdr
+if lt need 0
+ret need
+end
+if lt ulong av ulong need
+ret -13
+end
+plen = get ccplen 0
+q = add p 8
+for i ulong plen
+put ccpay i lgrqword q
+q = add q 8
+end
+ccfinal
+put lgget 0 add p ulong need
+ret 1
+end
+
+note Helper accessors for REGISTER32 / IO32_STATE packed pairs (low32=offset, high32=value).
+fn ccpair_off i ulong to ulong
+if ge i get ccplen 0
+ret 0
+end
+ret and get ccpay i LGU32
+end
+
+fn ccpair_val i ulong to ulong
+if ge i get ccplen 0
+ret 0
+end
+ret and shr get ccpay i 32 LGU32
+end
+
+note ==== Buffered diagnostic text formatter (stdout / caller fd) ====
+
+fn lgoinit fd int to void
+put lgon 0 0
+put lgofd 0 fd
+put lgoerr 0 0
+end
+
+fn lgoflush to long
+n = get lgon 0
+p = ulong 0
+while lt p n bound 4096
+r = write get lgofd 0 lgob p sub n p
+if le r 0
+put lgoerr 0 1
+put lgon 0 0
+ret -5
+end
+p = add p ulong r
+end
+put lgon 0 0
+ret 0
+end
+
+fn lgoc c uchar to void
+if ge get lgon 0 LGOCAP
+z = lgoflush
+end
+n = get lgon 0
+put lgob n c
+put lgon 0 add n 1
+end
+
+fn lgodec v ulong to void
+d = new uchar 24 0
+n = ulong 0
+x = v
+while lt n 24 bound 24
+put d n add uchar rem x 10 48
+n = add n 1
+x = div x 10
+if eq x 0
+break
+end
+end
+while gt n 0 bound 24
+n = sub n 1
+lgoc get d n
+end
+end
+
+fn lgohex v ulong to void
+d = new uchar 16 0
+n = ulong 0
+x = v
+while lt n 16 bound 16
+put d n get LGHEX and x 15
+n = add n 1
+x = shr x 4
+if eq x 0
+break
+end
+end
+while gt n 0 bound 16
+n = sub n 1
+lgoc get d n
+end
+end
+
+fn lgoregname k long to void
+if eq k 0
+for i ulong len LGREG0
+lgoc get LGREG0 i
+end
+ret
+end
+if eq k 1
+for i ulong len LGREG1
+lgoc get LGREG1 i
+end
+ret
+end
+if eq k 2
+for i ulong len LGREG2
+lgoc get LGREG2 i
+end
+ret
+end
+if eq k 3
+for i ulong len LGREG3
+lgoc get LGREG3 i
+end
+ret
+end
+if eq k 4
+for i ulong len LGREG4
+lgoc get LGREG4 i
+end
+ret
+end
+if eq k 5
+for i ulong len LGREG5
+lgoc get LGREG5 i
+end
+ret
+end
+if eq k 6
+for i ulong len LGREG6
+lgoc get LGREG6 i
+end
+ret
+end
+if eq k 7
+for i ulong len LGREG7
+lgoc get LGREG7 i
+end
+ret
+end
+for i ulong len LGREGU
+lgoc get LGREGU i
+end
+end
+
+fn lgcctname t ulong to void
+if eq t 0
+for i ulong len LGCT0
+lgoc get LGCT0 i
+end
+ret
+end
+if eq t 1
+for i ulong len LGCT1
+lgoc get LGCT1 i
+end
+ret
+end
+if eq t 2
+for i ulong len LGCT2
+lgoc get LGCT2 i
+end
+ret
+end
+if eq t 3
+for i ulong len LGCT3
+lgoc get LGCT3 i
+end
+ret
+end
+if eq t 4
+for i ulong len LGCT4
+lgoc get LGCT4 i
+end
+ret
+end
+if eq t 5
+for i ulong len LGCT5
+lgoc get LGCT5 i
+end
+ret
+end
+if eq t 6
+for i ulong len LGCT6
+lgoc get LGCT6 i
+end
+ret
+end
+if eq t 7
+for i ulong len LGCT7
+lgoc get LGCT7 i
+end
+ret
+end
+for i ulong len LGCT8
+lgoc get LGCT8 i
+end
+end
+
+fn lgfmtreg idx ulong to void
+if ge idx get lgtcnt 0
+ret
+end
+for i ulong len LGKREG
+lgoc get LGKREG i
+end
+lgoregname lgkind get lgtid idx
+for i ulong len LGKPA
+lgoc get LGKPA i
+end
+lgohex get lgtpa idx
+for i ulong len LGKSZ
+lgoc get LGKSZ i
+end
+lgohex get lgtsz idx
+kl = get lgtkl idx
+for i ulong len LGKKD
+lgoc get LGKKD i
+end
+lgodec and kl 255
+for i ulong len LGKLC
+lgoc get LGKLC i
+end
+lgodec and shr kl 8 255
+lgoc 10
+end
+
+fn lgfmtlog to void
+for i ulong len LGKLOG
+lgoc get LGKLOG i
+end
+lgohex get lgts 0
+for i ulong len LGKLVL
+lgoc get LGKLVL i
+end
+lgodec get lglvl 0
+for i ulong len LGKFMT
+lgoc get LGKFMT i
+end
+lgohex get lgfmt 0
+for i ulong len LGKARC
+lgoc get LGKARC i
+end
+lgodec get lgargc 0
+for i ulong len LGKARG
+lgoc get LGKARG i
+end
+ac = get lgargc 0
+for i ulong ac
+if gt i 0
+lgoc 44
+end
+for j ulong len LGK0X
+lgoc get LGK0X j
+end
+lgohex get lgargs i
+end
+lgoc 93
+lgoc 10
+end
+
+fn lgfmtcc to void
+for i ulong len LGKCC
+lgoc get LGKCC i
+end
+t = get cctype 0
+lgcctname t
+for i ulong len LGKVER
+lgoc get LGKVER i
+end
+lgodec get ccver 0
+for i ulong len LGKHD
+lgoc get LGKHD i
+end
+lgohex get cchdat 0
+if eq t CCTRPT
+for i ulong len LGKSRC
+lgoc get LGKSRC i
+end
+lgohex get ccrsrc 0
+for i ulong len LGKCSE
+lgoc get LGKCSE i
+end
+lgohex get ccrcse 0
+for i ulong len LGKEXT
+lgoc get LGKEXT i
+end
+lgohex get ccrext 0
+for i ulong len LGKTS
+lgoc get LGKTS i
+end
+lgohex get ccrts 0
+for i ulong len LGKRVR
+lgoc get LGKRVR i
+end
+lgohex get ccrver 0
+lgoc 10
+ret
+end
+for i ulong len LGKCNT
+lgoc get LGKCNT i
+end
+pn = get ccplen 0
+lgodec pn
+lgoc 10
+end
