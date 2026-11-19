@@ -1,0 +1,178 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gsp/seqcore.om: Falcon/RISC-V core opcodes 5..8 for GSP_RUN_CPU_SEQUENCER (0x1002).
+note Implements sqcorefn(op) for gsp/seq.om & gsp/dispatch.om over gsprd/gspwr/gsppause.
+note Source of record: NVIDIA open-gpu-kernel-modules 580.173.02 GB20B HALs:
+note   kernel_gsp.c:5403-5432, g_kernel_gsp_nvoc.c:1045,1091,
+note   kernel_gsp_gb100.c:50-87 (kgspResetHw_GB100), kernel_gsp_gh100.c:108-150 (kgspResetHw_GH100),
+note   kernel_gsp_ga102.c:136-200 (kgspExecuteSequencerCommand_GA102),
+note   kernel_falcon_tu102.c:236-269 (kflcnStartCpu_TU102, kflcnDisableCtxReq_TU102),
+note   gb20b/dev_gsp.h, tu102/dev_falcon_v4.h, gb202/dev_riscv_pri.h.
+note Library unit, no fn main. Compose after gsp/mmio.om (or mmio_bm.om) and gsp/seq.om.
+
+const SCFALCTL ulong 1114368
+const SCFALCTLA ulong 1114416
+const SCFALDMA ulong 1114380
+const SCFALENG ulong 1115072
+const SCRSTPLM ulong 1115076
+const SCFBIFCTL ulong 1115684
+const SCBCRCTL ulong 1119848
+const SCSECCTL ulong 8651008
+const SCSECCTLA ulong 8651056
+const SCBSISCR14 ulong 1147128
+
+const SCSTART ulong 2
+const SCHALT ulong 16
+const SCALIASEN ulong 64
+const SCPLMLVL0 ulong 17
+const SCRSTMSK ulong 1792
+const SCRSTDEAS ulong 512
+const SCSCRUB ulong 4096
+const SCNOCTX ulong 128
+const SCBCRVAL ulong 273
+const SCSTG3DN ulong 67108864
+
+global sccount ulong 4
+global sclibospa ulong 1
+global scappver ulong 1
+
+fn sccfg libospa ulong appver ulong to void
+put sclibospa 0 libospa
+put scappver 0 appver
+end
+
+fn scwaitval off ulong mask ulong want ulong budget ulong to bool
+n = budget
+if eq n 0
+n = 1
+end
+for i ulong add n 1
+if eq and gsprd off mask want
+ret true
+end
+if lt i n
+gsppause
+end
+end
+ret false
+end
+
+fn scwaitset off ulong mask ulong budget ulong to bool
+n = budget
+if eq n 0
+n = 1
+end
+for i ulong add n 1
+if ne and gsprd off mask 0
+ret true
+end
+if lt i n
+gsppause
+end
+end
+ret false
+end
+
+note kflcnStartCpu_TU102: check CPUCTL.ALIAS_EN (bit 6); write STARTCPU=2 to ALIAS if set, else CPUCTL.
+fn scstartflcn ctl ulong alias ulong to void
+if ne and gsprd ctl SCALIASEN 0
+gspwr alias SCSTART
+else
+gspwr ctl SCSTART
+end
+end
+
+note kgspResetHw_GB100 -> kgspResetHw_GH100 + kflcnWaitForResetToFinish_GA102
+fn scresethw to long
+b = get sqbud 0
+if not scwaitval SCRSTPLM SCPLMLVL0 SCPLMLVL0 b
+ret -1
+end
+gspwr SCFALENG 1
+if not scwaitval SCFALENG SCRSTMSK 0 b
+ret -1
+end
+gspwr SCFALENG 0
+if not scwaitval SCFALENG SCRSTMSK SCRSTDEAS b
+ret -1
+end
+if not scwaitval GHWCFG2 SCSCRUB 0 b
+ret -1
+end
+ret 0
+end
+
+note Opcode 5: CORE_RESET (kgspResetHw_GB100 + kflcnWaitForResetToFinish + kflcnDisableCtxReq_TU102)
+fn sccorerst to long
+r = scresethw
+if ne r 0
+ret r
+end
+fb = gsprd SCFBIFCTL
+gspwr SCFBIFCTL or fb SCNOCTX
+gspwr SCFALDMA 0
+put sccount 0 add get sccount 0 1
+ret 0
+end
+
+note Opcode 6: CORE_START (kflcnStartCpu_TU102 on GSP)
+fn sccorestr to long
+scstartflcn SCFALCTL SCFALCTLA
+put sccount 1 add get sccount 1 1
+ret 0
+end
+
+note Opcode 7: CORE_WAIT_FOR_HALT (kflcnWaitForHalt on GSP)
+fn sccorehlt to long
+if not scwaitset SCFALCTL SCHALT get sqbud 0
+ret -1
+end
+put sccount 2 add get sccount 2 1
+ret 0
+end
+
+note Opcode 8: CORE_RESUME (kgspExecuteSequencerCommand_GA102):
+note   1. kflcnResetIntoRiscv_GA102(GSP) + RISCV_BCR_CTRL = 0x111
+note   2. kgspProgramLibosBootArgsAddr_TU102 (GSP MAILBOX0/1 = libosArgsPA)
+note   3. kflcnStartCpu(SEC2)
+note   4. Poll BSI_SECURE_SCRATCH_14 bit 26 (BOOT_STAGE_3_HANDOFF_VALUE_DONE) + SEC2 MAILBOX0 == 0
+note   5. Write GSP FALCON_OS = appVersion + verify RISCV_CPUCTL.ACTIVE_STAT
+fn sccorersm to long
+b = get sqbud 0
+r = scresethw
+if ne r 0
+ret r
+end
+gspwr SCBCRCTL SCBCRVAL
+pa = get sclibospa 0
+gspwr GMB0 and pa M32
+gspwr GMB1 shr pa 32
+scstartflcn SCSECCTL SCSECCTLA
+if not scwaitset SCBSISCR14 SCSTG3DN b
+ret -1
+end
+if ne gsprd S2MB0 0
+ret -1
+end
+gspwr GOS get scappver 0
+if eq and gsprd GCPUCTL CPUACT 0
+ret -1
+end
+put sccount 3 add get sccount 3 1
+ret 0
+end
+
+fn sqcorefn op ulong to long
+if eq op 5
+ret sccorerst
+end
+if eq op 6
+ret sccorestr
+end
+if eq op 7
+ret sccorehlt
+end
+if eq op 8
+ret sccorersm
+end
+ret -1
+end

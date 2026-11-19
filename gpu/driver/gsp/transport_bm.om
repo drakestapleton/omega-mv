@@ -1,0 +1,195 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gsp/transport_bm.om: Zero-BSS bare-metal direct-DMA RPC transport & BAR0 notify for boot.om.
+note Drop-in replacement for gsp/transport.om + gsp/notify.om in SPARK.EFI (no mapget/mapset).
+note Uses bm_hal.om Normal-NC DMA reads/writes + explicit DSB SY ordering + BAR0 PGSP_QUEUE_HEAD(0)
+note (0x110c00 = 1117184). Compose after: gsp/bm_hal.om, gsp/profile.om, gsp/rpc.om, gsp/boot.om.
+note Prefix tb / TB. Library unit, no fn main.
+
+global tbstate ulong 1
+global tbcmdpa ulong 1
+global tbstatpa ulong 1
+
+fn tbinpool pa ulong sz ulong to bool
+b = get bmdmabase 0
+s = get bmdmasz 0
+if or eq pa 0 lt pa b
+ret false
+end
+o = sub pa b
+if gt o s
+ret false
+end
+ret le sz sub s o
+end
+
+fn tbattach cmdpa ulong statpa ulong boot42 uint to long
+if ne get tbstate 0 0
+ret -6
+end
+if ne gpclass boot42 2
+ret -95
+end
+if or eq cmdpa 0 eq statpa 0
+ret -1
+end
+if or ne and cmdpa 4095 0 ne and statpa 4095 0
+ret -1
+end
+if or ge cmdpa BMPALIM ge statpa BMPALIM
+ret -1
+end
+if or gt RQQSZ sub BMPALIM cmdpa gt RQQSZ sub BMPALIM statpa
+ret -1
+end
+if and lt cmdpa add statpa RQQSZ lt statpa add cmdpa RQQSZ
+ret -1
+end
+if or not tbinpool cmdpa RQQSZ not tbinpool statpa RQQSZ
+ret -1
+end
+if ne get bstate 0 4
+ret -6
+end
+if not rqshape 0
+ret -1
+end
+if ne bmmemrd32 add cmdpa 16 rqget32 0 16
+ret -1
+end
+if ne bmmemrd32 add cmdpa 32 rqget32 0 32
+ret -1
+end
+put tbcmdpa 0 cmdpa
+put tbstatpa 0 statpa
+put tbstate 0 1
+ret 0
+end
+
+fn tblose to void
+put tbstate 0 2
+put rqdead 0 1
+put bstate 0 12
+end
+
+fn bcanrst to bool
+ret eq get tbstate 0 0
+end
+
+fn blost to void
+tblose
+end
+
+fn tbcopytx cpa ulong wr ulong e ulong to void
+for s ulong e
+slot = rem add wr s RQCOUNT
+dst = add cpa mul add slot 1 RQSLOT
+src = mul s RQSLOT
+for j ulong RQSLOT
+bmmemwr8 add dst j get rqtmp add src j
+end
+end
+end
+
+fn tbcopyrx spa ulong rd ulong e ulong to void
+for s ulong sub e 1
+slot = rem add add rd s 1 RQCOUNT
+so = mul add slot 1 RQSLOT
+for j ulong RQSLOT
+put rqstat add so j bmmemrd8 add spa add so j
+end
+end
+end
+
+note Direct-DMA send: copy payload slots -> DSB SY -> update cmdq.writePtr -> DSB SY -> PGSP_QUEUE_HEAD(0)=0.
+fn bemit f ulong n ulong p ulong sync bool to long
+if ne get tbstate 0 1
+ret -6
+end
+cpa = get tbcmdpa 0
+spa = get tbstatpa 0
+rd = bmmemrd32 add spa 32
+bmdsb
+if ge rd RQCOUNT
+tblose
+ret -1
+end
+for i ulong 32
+put rqstat i bmmemrd8 add spa i
+end
+if and ne get rqlink 0 0 not rqshape 1
+tblose
+ret -1
+end
+rqput32 1 32 rd
+r = rqprep f n p sync
+if ne r 0
+if ne r -2
+tblose
+end
+ret r
+end
+wr = get rqpwr 0
+e = get rqpcnt 0
+tok = get rqptok 0
+tbcopytx cpa wr e
+bmdsb
+bmmemwr32 add cpa 16 rem add wr e RQCOUNT
+r = rqcommit tok
+if ne r 0
+tblose
+ret r
+end
+bmdsb
+bmbarwr32 GPNOTIF 0
+ret 0
+end
+
+note Direct-DMA receive: acquire statq.writePtr -> DSB SY -> copy slots -> rqrecv -> DSB SY -> ack cmdq.readPtr.
+fn bpull to long
+if ne get tbstate 0 1
+ret -6
+end
+cpa = get tbcmdpa 0
+spa = get tbstatpa 0
+wr = bmmemrd32 add spa 16
+bmdsb
+for i ulong 32
+put rqstat i bmmemrd8 add spa i
+end
+if and ne get rqlink 0 0 not rqshape 1
+tblose
+ret -1
+end
+rqput32 1 16 wr
+rd = rqget32 0 32
+if or ge wr RQCOUNT ge rd RQCOUNT
+tblose
+ret -1
+end
+avail = rem sub add wr RQCOUNT rd RQCOUNT
+if eq avail 0
+ret 0
+end
+o = add RQSLOT mul rd RQSLOT
+for j ulong RQSLOT
+put rqstat add o j bmmemrd8 add spa add o j
+end
+e = rqget32 1 add o 40
+if or eq e 0 or gt e 16 gt e avail
+tblose
+ret -1
+end
+tbcopyrx spa rd e
+r = rqrecv
+if lt r 0
+tblose
+ret r
+end
+if eq r 0
+ret 0
+end
+bmdsb
+bmmemwr32 add cpa 32 rqget32 0 32
+bmdsb
+ret 1
+end

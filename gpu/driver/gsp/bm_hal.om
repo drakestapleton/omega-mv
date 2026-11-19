@@ -1,0 +1,334 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gsp/bm_hal.om: Zero-BSS bare-metal BAR0 MMIO, Normal-NC physical DMA, CNTVCT_EL0 deadline
+note timer, and DSB SY submission chain for GB20B on Aienux ARM64 (SPARK.EFI).
+note Zero Linux syscalls (no sleepns/fopen/mapget/mapset); safe for target a64efi and host replay.
+note In host replay (bmmode == 0), BAR0 and Normal-NC accesses dispatch to caller-supplied
+note replay callbacks (bmrbarrd/bmrbarwr/bmrmemrd8/bmrmemwr8/bmrcntvct) with exact barrier
+note trace logging (bmbtrace) so every DSB SY transition is verifiable on host.
+note Prefix bm / BM. Library unit, no fn main.
+
+const BMOK long 0
+const BMEINVAL long -1
+const BMERANGE long -2
+const BMEALIGN long -3
+const BMESTATE long -4
+const BMETIME long -5
+
+const BMPALIM ulong 1099511627776
+const BMBARDB ulong 12255376
+const BMGPPUT ulong 140
+const BMDBEN uint 1073741824
+const BMRLINV uint 127
+const BMCHMAX uint 4095
+const BMLENMX uint 2097151
+const BMVAMSK ulong 18446744073709551612
+const BMGPB41 ulong 2199023255552
+const BMM32 ulong 4294967295
+
+note bmmode: 0 = host replay callbacks, 1 = bare-metal Aienux (wired to Piece 1/2 MMIO/NC hooks)
+global bmmode ulong 1
+global bmbarbase ulong 1
+global bmbarsz ulong 1
+global bmdmabase ulong 1
+global bmdmasz ulong 1
+global bmfrq ulong 1
+global bmfences ulong 1
+global bmbarops ulong 1
+global bmdmaops ulong 1
+note Barrier trace log for host verification: 1=PB, 2=FENCE, 3=GPFIFO, 4=USERD, 5=DOORBELL
+global bmtrc uchar 64
+global bmtrcn ulong 1
+global bmsubtok ulong 1
+
+const BMFRQMAX ulong 18000000000000
+
+fn bminit mode ulong barbase ulong barsz ulong dmabase ulong dmasz ulong frq ulong to long
+if gt mode 1
+ret BMEINVAL
+end
+if or eq frq 0 gt frq BMFRQMAX
+ret BMEINVAL
+end
+if or eq barsz 0 lt barsz 12255488
+ret BMERANGE
+end
+if eq mode 1
+if or eq barbase 0 ne and barbase 4095 0
+ret BMEALIGN
+end
+if gt barsz sub not ulong 0 barbase
+ret BMERANGE
+end
+end
+if eq dmabase 0
+ret BMEINVAL
+end
+if or eq dmasz 0 gt dmasz BMPALIM
+ret BMERANGE
+end
+if or ge dmabase BMPALIM gt dmasz sub BMPALIM dmabase
+ret BMERANGE
+end
+if ne and dmabase 4095 0
+ret BMEALIGN
+end
+put bmmode 0 mode
+put bmbarbase 0 barbase
+put bmbarsz 0 barsz
+put bmdmabase 0 dmabase
+put bmdmasz 0 dmasz
+put bmfrq 0 frq
+put bmfences 0 0
+put bmbarops 0 0
+put bmdmaops 0 0
+put bmtrcn 0 0
+ret BMOK
+end
+
+fn bmtrcadd ev uchar to void
+n = get bmtrcn 0
+if lt n 64
+put bmtrc n ev
+put bmtrcn 0 add n 1
+end
+end
+
+fn bmdsb to void
+cpufence
+put bmfences 0 add get bmfences 0 1
+bmtrcadd 2
+end
+
+note Overflow-safe CNTVCT_EL0 -> milliseconds: (t / frq) * 1000 + ((t % frq) * 1000) / frq
+fn bmticks2ms ticks ulong to ulong
+frq = get bmfrq 0
+if eq frq 0
+ret 0
+end
+sec = div ticks frq
+r = rem ticks frq
+ret add mul sec 1000 div mul r 1000 frq
+end
+
+note Overflow-safe CNTVCT_EL0 -> microseconds: (t / frq) * 1000000 + ((t % frq) * 1000000) / frq
+fn bmticks2us ticks ulong to ulong
+frq = get bmfrq 0
+if eq frq 0
+ret 0
+end
+sec = div ticks frq
+r = rem ticks frq
+ret add mul sec 1000000 div mul r 1000000 frq
+end
+
+fn bmnowms to ulong
+ret bmticks2ms bmrcntvct
+end
+
+fn bmnowus to ulong
+ret bmticks2us bmrcntvct
+end
+
+note Busy-wait us microseconds using CNTVCT_EL0 ticks (nested bounded loop: never traps 4 on Grace).
+fn bmdelayus us ulong to long
+if eq us 0
+ret BMOK
+end
+frq = get bmfrq 0
+if or eq frq 0 gt frq BMFRQMAX
+ret BMESTATE
+end
+sec = div us 1000000
+ru = rem us 1000000
+dt = add mul sec frq div add mul ru frq 999999 1000000
+if eq dt 0
+dt = ulong 1
+end
+t0 = bmrcntvct
+for o ulong 1000
+for i ulong 100000
+if ge sub bmrcntvct t0 dt
+ret BMOK
+end
+cpurelax
+end
+end
+ret BMETIME
+end
+
+note Checked BAR0 32-bit read with DSB SY ordering.
+fn bmbarrd32 off ulong to ulong
+if ne and off 3 0
+trap 3
+end
+if ge off get bmbarsz 0
+trap 3
+end
+if gt 4 sub get bmbarsz 0 off
+trap 3
+end
+put bmbarops 0 add get bmbarops 0 1
+v = bmrbarrd off
+cpufence
+ret and v BMM32
+end
+
+note Checked BAR0 32-bit write with DSB SY ordering before and after Device-nGnRnE store.
+fn bmbarwr32 off ulong v ulong to void
+if ne and off 3 0
+trap 3
+end
+if ge off get bmbarsz 0
+trap 3
+end
+if gt 4 sub get bmbarsz 0 off
+trap 3
+end
+put bmbarops 0 add get bmbarops 0 1
+cpufence
+bmrbarwr off and v BMM32
+cpufence
+end
+
+note Checked Normal-NC physical DMA byte read/write (<40-bit PA inside registered pool).
+fn bmchkpa pa ulong n ulong to void
+b = get bmdmabase 0
+s = get bmdmasz 0
+if lt pa b
+trap 3
+end
+o = sub pa b
+if gt o s
+trap 3
+end
+if gt n sub s o
+trap 3
+end
+end
+
+fn bmmemrd8 pa ulong to uchar
+bmchkpa pa 1
+put bmdmaops 0 add get bmdmaops 0 1
+ret bmrmemrd8 pa
+end
+
+fn bmmemwr8 pa ulong v uchar to void
+bmchkpa pa 1
+put bmdmaops 0 add get bmdmaops 0 1
+bmrmemwr8 pa v
+end
+
+fn bmmemrd16 pa ulong to ulong
+bmchkpa pa 2
+lo = ulong bmrmemrd8 pa
+hi = ulong bmrmemrd8 add pa 1
+ret or lo shl hi 8
+end
+
+fn bmmemrd32 pa ulong to ulong
+bmchkpa pa 4
+v = ulong 0
+for i ulong 4
+v = or v shl ulong bmrmemrd8 add pa i mul i 8
+end
+ret v
+end
+
+fn bmmemwr32 pa ulong v ulong to void
+bmchkpa pa 4
+for i ulong 4
+bmrmemwr8 add pa i uchar and shr v mul i 8 255
+end
+end
+
+fn bmmemrd64 pa ulong to ulong
+bmchkpa pa 8
+v = ulong 0
+for i ulong 8
+v = or v shl ulong bmrmemrd8 add pa i mul i 8
+end
+ret v
+end
+
+fn bmmemwr64 pa ulong v ulong to void
+bmchkpa pa 8
+for i ulong 8
+bmrmemwr8 add pa i uchar and shr v mul i 8 255
+end
+end
+
+fn bmmemzero pa ulong n ulong to void
+if eq n 0
+ret
+end
+bmchkpa pa n
+o = ulong 0
+while lt o n bound 9223372036854775807
+if and eq and add pa o 7 0 ge sub n o 8
+bmmemwr64 add pa o 0
+o = add o 8
+else
+bmmemwr8 add pa o 0
+o = add o 1
+end
+end
+end
+
+note Checked GB20B work-submit token: strictly rejects rl >= 127 (RUNLIST_ID_INVALID_RUNLIST)
+note and chid > 4095, sets bit 30 RUNLIST_DOORBELL_ENABLE (0x40000000).
+fn bmtokgb20 rl uint chid uint to long
+if or ge rl BMRLINV gt chid BMCHMAX
+ret BMERANGE
+end
+tok = or BMDBEN or shl rl 16 chid
+ret long ulong tok
+end
+
+note Strict ARM64 Normal-NC submission chain:
+note   PB/QMD already written -> DSB SY -> GPFIFO -> DSB SY -> USERD.GPPut -> DSB SY -> BAR0 0x00BB0090.
+note Returns nextput = (gpput + 1) % ent, or negative error.
+fn bmsubmit gppa ulong userdpa ulong pbva ulong pbwds uint gpput uint ent uint to long
+if or or lt ent 2 gt ent 65536 ne and ent sub ent 1 0
+ret BMEINVAL
+end
+if or ne and gppa 7 0 ne and userdpa 3 0
+ret BMEALIGN
+end
+if or ne and pbva 3 0 ge pbva BMPALIM
+ret BMERANGE
+end
+if or eq pbwds 0 gt pbwds BMLENMX
+ret BMERANGE
+end
+tok = get bmsubtok 0
+if eq and tok ulong BMDBEN 0
+ret BMESTATE
+end
+rl = and shr tok 16 127
+if ge rl ulong BMRLINV
+ret BMERANGE
+end
+gpent = or or and pbva BMVAMSK shl and ulong pbwds ulong BMLENMX 42 BMGPB41
+idx = ulong rem gpput ent
+nextput = rem add gpput 1 ent
+bmtrcadd 1
+bmdsb
+bmmemwr64 add gppa mul idx 8 gpent
+bmtrcadd 3
+bmdsb
+bmmemwr32 add userdpa BMGPPUT ulong nextput
+bmtrcadd 4
+bmdsb
+bmbarwr32 BMBARDB tok
+bmtrcadd 5
+ret long ulong nextput
+end
+
+fn bmsettok rl uint chid uint to long
+t = bmtokgb20 rl chid
+if lt t 0
+ret t
+end
+put bmsubtok 0 ulong t
+ret BMOK
+end

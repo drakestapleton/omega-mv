@@ -1,0 +1,195 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gsp/mmio_bm.om: Zero-syscall bare-metal MMIO seam for GB20B SEC2/GSP boot & sequencer.
+note Drop-in replacement for gsp/mmio.om in SPARK.EFI (no mapget/mapset/fopen/sleepns).
+note Requires gsp/bm_hal.om before it; provides gsprd/gspwr/gsppm/gsppause/gspdelay/gspfinish/
+note gspnotify/pollstep/ememdw/gspfail for sec2.om, seq.om, seqcore.om, and dispatch.om.
+note gspmode = 2 selects bare-metal bm_hal.om BAR0 + CNTVCT_EL0 deadline timer.
+
+const S2MB0 ulong 8650816
+const S2MB1 ulong 8650820
+const S2EMC ulong 8653504
+const S2EMD ulong 8653508
+const S2QH ulong 8653824
+const S2QT ulong 8653828
+const GMB0 ulong 1114176
+const GMB1 ulong 1114180
+const GOS ulong 1114240
+const GHWCFG2 ulong 1114356
+const GQH ulong 1117184
+const GCPUCTL ulong 1119112
+
+const AINCW ulong 16777216
+const DWBLK ulong 64
+const CHBYTES ulong 1024
+const CMDBUSY ulong 3221342974
+const PRIVLCK ulong 3135193344
+const PRIVMSK ulong 4294967040
+const LOCKDN ulong 8192
+const CPUACT ulong 128
+const M32 ulong 4294967295
+
+const EOK long 0
+const EARG long -1
+const EBUSY long -2
+const EEMEM long -3
+const ESEC2 long -4
+const EMASK long -5
+const ELOCK long -6
+const EFMC long -7
+const ERISCV long -8
+const EPM long -9
+
+global gspmode ulong 1
+global gsppns long 1
+global gspd0ok ulong 1
+global gpkt uchar 1024
+global gin ulong 7
+global gstage long 1
+global gout ulong 12
+
+fn gsprd off ulong to ulong
+if ne get gspmode 0 2
+trap 9
+end
+ret bmbarrd32 off
+end
+
+fn gspwr off ulong v ulong to void
+if ne get gspmode 0 2
+trap 9
+end
+bmbarwr32 off v
+end
+
+fn gsppause to void
+us = ulong 10
+if gt get gsppns 0 0
+us = div add ulong get gsppns 0 999 1000
+end
+r = bmdelayus us
+end
+
+fn gspdelay us ulong to long
+ret bmdelayus us
+end
+
+fn ememdw c ulong to ulong
+ret add mul and shr c 8 255 DWBLK and shr c 2 63
+end
+
+fn maskrel h ulong to bool
+if eq h 0
+ret false
+end
+ret ne and h PRIVMSK PRIVLCK
+end
+
+note Bare-metal D0 check: Piece 2 pcie.om verifies PCIe PMCSR D0 before GSP boot and sets gspd0ok=1.
+fn gsppm to bool
+ret eq get gspd0ok 0 1
+end
+
+fn lockdone to bool
+m0 = gsprd GMB0
+put gout 9 m0
+pa = get gin 1
+if ne m0 0
+if eq m0 and pa M32
+m1 = gsprd GMB1
+put gout 10 m1
+if eq m1 shr pa 32
+ret false
+end
+end
+end
+h = gsprd GHWCFG2
+put gout 8 h
+if not maskrel h
+ret false
+end
+if eq and m0 PRIVMSK PRIVLCK
+ret false
+end
+ret or eq and h LOCKDN 0 ne m0 0
+end
+
+fn pollonce k ulong to bool
+if eq k 0
+hd = gsprd S2QH
+ret eq hd gsprd S2QT
+end
+if eq k 1
+mb = gsprd S2MB0
+put gout 6 mb
+ret ne mb CMDBUSY
+end
+if eq k 2
+hw = gsprd GHWCFG2
+put gout 8 hw
+ret maskrel hw
+end
+ret lockdone
+end
+
+fn pollstep k ulong to bool
+b = get gin add 3 k
+n = ulong 0
+ok = false
+stop = false
+while not stop bound 4400
+c = ulong 0
+while true bound 999999
+if pollonce k
+ok = true
+stop = true
+break
+end
+if ge n b
+stop = true
+break
+end
+gsppause
+n = add n 1
+c = add c 1
+if eq c 999998
+break
+end
+end
+end
+put gout k n
+ret ok
+end
+
+fn gspfail e long to long
+put gstage 0 e
+ret e
+end
+
+note Shared GSP FMC completion after SEC2 COTv2 reply.
+fn gspfinish to long
+if not pollstep 2
+ret gspfail EMASK
+end
+if not pollstep 3
+put gout 10 gsprd GMB1
+ret gspfail ELOCK
+end
+m0 = gsprd GMB0
+put gout 9 m0
+if ne m0 0
+ret gspfail EFMC
+end
+gspwr GOS get gin 2
+cp = gsprd GCPUCTL
+put gout 11 cp
+if eq and cp CPUACT 0
+ret gspfail ERISCV
+end
+ret gspfail EOK
+end
+
+note Announce new cmdq elements to GSP-RM: PGSP_QUEUE_HEAD(0) = 0 after DSB SY.
+fn gspnotify to void
+bmdsb
+gspwr GQH 0
+end
