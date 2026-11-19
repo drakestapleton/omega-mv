@@ -117,3 +117,9 @@ Source: `aien-sovereign-core-mv`, branch `feat/q38-integ` @ `0fe20f567` on the S
 Unchanged from earlier: plain 27B decode is 7.9 to 8.1 tok/s at short context (about 0.79 of the 10.15 tok/s DRAM ceiling). The remaining gap is Omega kernel bandwidth in down-proj and lm_head, which needs work in the Omega repository, not the server.
 
 The pure-Omega drafters in `tools/pi-drive-27b/` (`specdraft.om`, `tree20.om`, `omguard.om`) pass their own AArch64 tests, but the live engine gate above shows the Rust port is not yet usable. `tree20.om`'s 1.31M candidate tok/s figure is draft generation only; no draft was accepted by the 27B in that measurement.
+
+---
+
+## 6. Follow-Up: Multi-Head Batched Dense Decode & Exact Two-Pass Head on GB10 (2026-11-19)
+
+The missing `libomega_gpu.a` multi-head dense graph APIs (`omega_gpu_q38_graph_create_heads`, `_set_head_state`, `_stroke`, `_set_batch`, `K <= 32768` FP8 GEMM for `17408` `down_proj`) and the HUM L314 exact two-pass `lm_head` (`H = 5120`, `XBOUND` parameterized up to width `8192`) were subsequently implemented in `omega-mv` (`f7d147c21`, `799adb6d8`), bound in `aien-sovereign-core-mv` (`feat/q38-integ` @ `572a9142`), and qualified on live GB10 silicon (`gpu_q38_graph_test` `24/24 PASS`, `gpu_q38_stroke_exact_test` `71/71 PASS`, `gpu_q38_stress_bench` `134/134 PASS`). Full scaling, PTIMER, output-head, and hardware telemetry metrics are published in [Q38_27B_GB10_STRESS_20261119.md](Q38_27B_GB10_STRESS_20261119.md).
