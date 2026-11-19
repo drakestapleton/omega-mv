@@ -1,0 +1,297 @@
+note SPDX-License-Identifier: Apache-2.0
+note apps/core/site_forge.om: pure-Omega port of aienos.com static site/consent/CSP
+note verifier and interplane-forge/hop ref, archive allowlist, and frame-bound validators.
+note Compose after si/directives/om2.om and om/tls/sha2.om.
+
+const APP_OK ulong 0
+const APP_ERR_CSP_MISSING_DEFAULT ulong 1
+const APP_ERR_CSP_UNSAFE ulong 2
+const APP_ERR_BAD_ROUTE ulong 3
+const APP_ERR_CONSENT_VIOLATION ulong 4
+const APP_ERR_BAD_REF ulong 5
+const APP_ERR_BAD_EXT ulong 6
+const APP_ERR_FRAME_KIND ulong 7
+const APP_ERR_FRAME_CAP ulong 8
+const APP_ERR_FRAME_SEQ ulong 9
+
+const HOP_KIND_DATA ulong 1
+const HOP_KIND_PING ulong 2
+const HOP_KIND_ACK ulong 3
+const HOP_KIND_CLOSE ulong 4
+
+text app_csp_def "default-src 'self'"
+text app_csp_ui "'unsafe-inline'"
+text app_csp_ue "'unsafe-eval'"
+text app_csp_http "http:"
+text app_ext_tgz ".tar.gz"
+text app_ext_zip ".zip"
+text app_ref_lock ".lock"
+
+note --- Basic helpers ---
+
+fn app_slice_eq a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+if gt na ulong 4096
+ret false
+end
+i = ulong 0
+while lt i na bound 4096
+if ne get a i get b i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn app_contains hay view uchar * needle view uchar * to bool
+nh = len hay
+nn = len needle
+if eq nn ulong 0
+ret true
+end
+if lt nh nn
+ret false
+end
+if gt nh ulong 4096
+ret false
+end
+lim = sub nh nn
+i = ulong 0
+while le i lim bound 4097
+if app_slice_eq part hay i nn needle
+ret true
+end
+i = add i ulong 1
+end
+ret false
+end
+
+fn app_ends_with s view uchar * sfx view uchar * to bool
+ns = len s
+nx = len sfx
+if lt ns nx
+ret false
+end
+ret app_slice_eq part s sub ns nx nx sfx
+end
+
+fn app_write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn app_digest_eq a view uchar 32 b view uchar 32 to bool
+for i ulong 32
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note --- aienos.com CSP, Route & Consent Verifiers ---
+
+fn app_validate_csp hdr view uchar * to ulong
+n = len hdr
+if eq n ulong 0
+ret APP_ERR_CSP_MISSING_DEFAULT
+end
+if gt n ulong 2048
+ret APP_ERR_CSP_UNSAFE
+end
+i = ulong 0
+while lt i n bound 2048
+b = get hdr i
+if or lt b uchar 32 ge b uchar 127
+ret APP_ERR_CSP_UNSAFE
+end
+if eq b uchar 42
+ret APP_ERR_CSP_UNSAFE
+end
+i = add i ulong 1
+end
+if not app_contains hdr app_csp_def
+ret APP_ERR_CSP_MISSING_DEFAULT
+end
+if app_contains hdr app_csp_ui
+ret APP_ERR_CSP_UNSAFE
+end
+if app_contains hdr app_csp_ue
+ret APP_ERR_CSP_UNSAFE
+end
+if app_contains hdr app_csp_http
+ret APP_ERR_CSP_UNSAFE
+end
+ret APP_OK
+end
+
+fn app_is_path_ch b uchar to bool
+if and ge b uchar 97 le b uchar 122
+ret true
+end
+if and ge b uchar 65 le b uchar 90
+ret true
+end
+if and ge b uchar 48 le b uchar 57
+ret true
+end
+if eq b uchar 47
+ret true
+end
+if eq b uchar 95
+ret true
+end
+if eq b uchar 45
+ret true
+end
+if eq b uchar 46
+ret true
+end
+ret false
+end
+
+note Strict route path: starts with '/', [a-zA-Z0-9/_.-], no "..", no "//", no "/." hidden file, no '%'
+fn app_validate_route path view uchar * to ulong
+n = len path
+if eq n ulong 0
+ret APP_ERR_BAD_ROUTE
+end
+if gt n ulong 512
+ret APP_ERR_BAD_ROUTE
+end
+if ne get path 0 uchar 47
+ret APP_ERR_BAD_ROUTE
+end
+prev = uchar 0
+i = ulong 0
+while lt i n bound 512
+b = get path i
+if not app_is_path_ch b
+ret APP_ERR_BAD_ROUTE
+end
+if and eq prev uchar 46 eq b uchar 46
+ret APP_ERR_BAD_ROUTE
+end
+if and eq prev uchar 47 eq b uchar 47
+ret APP_ERR_BAD_ROUTE
+end
+if and eq prev uchar 47 eq b uchar 46
+ret APP_ERR_BAD_ROUTE
+end
+prev = b
+i = add i ulong 1
+end
+ret APP_OK
+end
+
+note Consent/DNT fail-closed gate: analytics_enabled requires user_consented=true AND dnt_header=false.
+fn app_check_consent analytics_enabled bool user_consented bool dnt_header bool to ulong
+if analytics_enabled
+if dnt_header
+ret APP_ERR_CONSENT_VIOLATION
+end
+if not user_consented
+ret APP_ERR_CONSENT_VIOLATION
+end
+end
+ret APP_OK
+end
+
+note --- interplane-forge Git Ref & Archive Extension Validators ---
+note Rejects leading '-' (option injection), "..", "@{", "~", "^", ":", spaces, control chars, trailing ".lock".
+
+fn forge_validate_ref r view uchar * to ulong
+n = len r
+if eq n ulong 0
+ret APP_ERR_BAD_REF
+end
+if gt n ulong 128
+ret APP_ERR_BAD_REF
+end
+first = get r 0
+last = get r sub n ulong 1
+if or eq first uchar 45 or eq first uchar 46 eq first uchar 47
+ret APP_ERR_BAD_REF
+end
+if or eq last uchar 46 eq last uchar 47
+ret APP_ERR_BAD_REF
+end
+if app_ends_with r app_ref_lock
+ret APP_ERR_BAD_REF
+end
+prev = uchar 0
+i = ulong 0
+while lt i n bound 128
+b = get r i
+if not app_is_path_ch b
+ret APP_ERR_BAD_REF
+end
+if and eq prev uchar 46 eq b uchar 46
+ret APP_ERR_BAD_REF
+end
+if and eq prev uchar 47 eq b uchar 47
+ret APP_ERR_BAD_REF
+end
+prev = b
+i = add i ulong 1
+end
+ret APP_OK
+end
+
+note Archive download allowlist: only ".tar.gz" and ".zip" permitted.
+fn forge_validate_ext ext view uchar * to ulong
+if app_slice_eq ext app_ext_tgz
+ret APP_OK
+end
+if app_slice_eq ext app_ext_zip
+ret APP_OK
+end
+ret APP_ERR_BAD_EXT
+end
+
+note --- hop Frame & Sequence Validator ---
+
+fn hop_validate_frame kind ulong payload_len ulong max_cap ulong prev_seq ulong seq ulong to ulong
+if or lt kind HOP_KIND_DATA gt kind HOP_KIND_CLOSE
+ret APP_ERR_FRAME_KIND
+end
+if gt payload_len max_cap
+ret APP_ERR_FRAME_CAP
+end
+if le seq prev_seq
+ret APP_ERR_FRAME_SEQ
+end
+ret APP_OK
+end
+
+note Canonical SHA-256 manifest digest over (route, csp_hdr).
+fn app_manifest_digest route view uchar * csp_hdr view uchar * dst edit uchar 32 to void
+ctx = new ulong 40 0
+sep = new uchar 1 0
+put sep 0 uchar 10
+sha256_init ctx
+sha256_update ctx route
+sha256_update ctx sep
+sha256_update ctx csp_hdr
+sha256_final ctx dst
+end

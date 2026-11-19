@@ -1,0 +1,256 @@
+note SPDX-License-Identifier: Apache-2.0
+note bridge/core/abi_ggml.om: pure-Omega port of omega-bridge Native ABI v2 validator
+note (slot budget, layout bounds, aliasing/single-edit, trap status mapping) and
+note ggml-omega tensor-bridge descriptor, stride, alignment, tiling, and op dispatch.
+note Compose after si/directives/om2.om.
+
+const BR_OK ulong 0
+const BR_ERR_SLOT_OVERFLOW ulong 1
+const BR_ERR_BAD_LAYOUT_SIZE ulong 2
+const BR_ERR_BAD_FIELD_COUNT ulong 3
+const BR_ERR_FIELD_OOB ulong 4
+const BR_ERR_FIELD_OVERLAP ulong 5
+const BR_ERR_ALIAS_OVERLAP ulong 6
+const BR_ERR_BAD_DTYPE ulong 7
+const BR_ERR_BAD_BLOCK_ALIGN ulong 8
+const BR_ERR_BAD_STRIDE ulong 9
+const BR_ERR_UNSUPPORTED_OP ulong 10
+const BR_ERR_BAD_TILE ulong 11
+const BR_ERR_OMEGA_TRAP ulong 12
+const BR_ERR_HOST_FAILURE ulong 13
+
+const BR_MAX_SLOTS ulong 6
+const BR_MAX_LAYOUT_BYTES ulong 4096
+
+const GGML_F32 ulong 0
+const GGML_F16 ulong 1
+const GGML_Q8_0 ulong 8
+
+const GGML_OP_ADD ulong 1
+const GGML_OP_MUL ulong 2
+const GGML_OP_SUB ulong 3
+const GGML_OP_DIV ulong 4
+const GGML_OP_RMS_NORM ulong 5
+const GGML_OP_SCALE ulong 6
+const GGML_OP_SILU ulong 7
+const GGML_OP_SOFT_MAX ulong 8
+const GGML_OP_MUL_MAT ulong 9
+const GGML_OP_CPY ulong 10
+
+note --- Basic I/O helper ---
+
+fn br_write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+note --- omega-bridge Native ABI v2 Validators ---
+note OM-2 parameter slot budget: scalar=1, sized array/struct=1, unsized view/edit=2; total <= 6.
+
+fn br_check_param_slots n_scalars ulong n_sized ulong n_unsized ulong to ulong
+if or gt n_scalars ulong 16 or gt n_sized ulong 16 gt n_unsized ulong 16
+ret BR_ERR_SLOT_OVERFLOW
+end
+slots = add add n_scalars n_sized mul n_unsized ulong 2
+if gt slots BR_MAX_SLOTS
+ret BR_ERR_SLOT_OVERFLOW
+end
+ret BR_OK
+end
+
+note OM-2 layout bounds: size in 1..4096, count in 1..4096, field fits within layout size.
+fn br_validate_layout_field layout_size ulong field_off ulong elem_size ulong count ulong to ulong
+if or eq layout_size ulong 0 gt layout_size BR_MAX_LAYOUT_BYTES
+ret BR_ERR_BAD_LAYOUT_SIZE
+end
+if or eq count ulong 0 gt count BR_MAX_LAYOUT_BYTES
+ret BR_ERR_BAD_FIELD_COUNT
+end
+if or eq elem_size ulong 0 gt elem_size ulong 64
+ret BR_ERR_FIELD_OOB
+end
+flen = mul elem_size count
+if gt field_off layout_size
+ret BR_ERR_FIELD_OOB
+end
+if gt flen sub layout_size field_off
+ret BR_ERR_FIELD_OOB
+end
+ret BR_OK
+end
+
+note Two half-open byte intervals [off1, off1+len1) and [off2, off2+len2) must not overlap.
+fn br_spans_disjoint off1 ulong len1 ulong off2 ulong len2 ulong to bool
+if or eq len1 ulong 0 eq len2 ulong 0
+ret true
+end
+if le add off1 len1 off2
+ret true
+end
+if le add off2 len2 off1
+ret true
+end
+ret false
+end
+
+fn br_check_single_edit dst_base ulong dst_len ulong src_base ulong src_len ulong to ulong
+if not br_spans_disjoint dst_base dst_len src_base src_len
+ret BR_ERR_ALIAS_OVERLAP
+end
+ret BR_OK
+end
+
+note Trap-to-status mapping: exit 0 -> BR_OK, exit 101..114 -> BR_ERR_OMEGA_TRAP, other -> BR_ERR_HOST_FAILURE.
+fn br_check_exit_status code ulong to ulong
+if eq code ulong 0
+ret BR_OK
+end
+if and ge code ulong 101 le code ulong 114
+ret BR_ERR_OMEGA_TRAP
+end
+ret BR_ERR_HOST_FAILURE
+end
+
+note --- ggml-omega Tensor-Bridge Descriptor, Stride, Tiling & Op Dispatch ---
+
+fn ggml_dtype_valid dt ulong to bool
+if eq dt GGML_F32
+ret true
+end
+if eq dt GGML_F16
+ret true
+end
+if eq dt GGML_Q8_0
+ret true
+end
+ret false
+end
+
+note Exact row byte size for a ggml tensor row of ne0 elements.
+note F32 = 4*ne0, F16 = 2*ne0, Q8_0 = 34*(ne0/32) with ne0 % 32 == 0. Returns 0 on invalid/misaligned.
+fn ggml_row_bytes dt ulong ne0 ulong to ulong
+if eq ne0 ulong 0
+ret ulong 0
+end
+if gt ne0 ulong 1073741824
+ret ulong 0
+end
+if eq dt GGML_F32
+ret mul ne0 ulong 4
+end
+if eq dt GGML_F16
+ret mul ne0 ulong 2
+end
+if eq dt GGML_Q8_0
+if ne rem ne0 ulong 32 ulong 0
+ret ulong 0
+end
+ret mul div ne0 ulong 32 ulong 34
+end
+ret ulong 0
+end
+
+fn ggml_validate_tensor dt ulong ne0 ulong ne1 ulong nb0 ulong nb1 ulong to ulong
+if not ggml_dtype_valid dt
+ret BR_ERR_BAD_DTYPE
+end
+if or eq ne0 ulong 0 eq ne1 ulong 0
+ret BR_ERR_BAD_STRIDE
+end
+rbytes = ggml_row_bytes dt ne0
+if eq rbytes ulong 0
+ret BR_ERR_BAD_BLOCK_ALIGN
+end
+min_nb0 = ulong 4
+if eq dt GGML_F16
+min_nb0 = ulong 2
+end
+if eq dt GGML_Q8_0
+min_nb0 = ulong 34
+end
+if lt nb0 min_nb0
+ret BR_ERR_BAD_STRIDE
+end
+if lt nb1 rbytes
+ret BR_ERR_BAD_STRIDE
+end
+ret BR_OK
+end
+
+note Exact ggml-omega supports_op claim table (mirrors ggml-omega.c).
+fn ggml_supports_op op ulong src0_dt ulong src1_dt ulong dst_dt ulong ne0 ulong to ulong
+if eq ne0 ulong 0
+ret BR_ERR_BAD_STRIDE
+end
+if and ge op GGML_OP_ADD le op GGML_OP_DIV
+if and eq src0_dt GGML_F32 and eq src1_dt GGML_F32 eq dst_dt GGML_F32
+ret BR_OK
+end
+ret BR_ERR_UNSUPPORTED_OP
+end
+if and ge op GGML_OP_RMS_NORM le op GGML_OP_SOFT_MAX
+if and eq src0_dt GGML_F32 eq dst_dt GGML_F32
+ret BR_OK
+end
+ret BR_ERR_UNSUPPORTED_OP
+end
+if eq op GGML_OP_MUL_MAT
+if or ne src1_dt GGML_F32 ne dst_dt GGML_F32
+ret BR_ERR_UNSUPPORTED_OP
+end
+if not ggml_dtype_valid src0_dt
+ret BR_ERR_BAD_DTYPE
+end
+if eq src0_dt GGML_Q8_0
+if ne rem ne0 ulong 32 ulong 0
+ret BR_ERR_BAD_BLOCK_ALIGN
+end
+end
+ret BR_OK
+end
+if eq op GGML_OP_CPY
+if not ggml_dtype_valid src0_dt
+ret BR_ERR_BAD_DTYPE
+end
+if eq dst_dt GGML_Q8_0
+ret BR_ERR_UNSUPPORTED_OP
+end
+if or eq dst_dt GGML_F32 eq dst_dt GGML_F16
+if eq src0_dt GGML_Q8_0
+if ne rem ne0 ulong 32 ulong 0
+ret BR_ERR_BAD_BLOCK_ALIGN
+end
+end
+ret BR_OK
+end
+ret BR_ERR_UNSUPPORTED_OP
+end
+ret BR_ERR_UNSUPPORTED_OP
+end
+
+note Computes fixed-width tiling plan (plan[0]=full_tiles, plan[1]=tail) for ggml-omega row kernels.
+fn ggml_tile_plan ne0 ulong tile_w ulong plan edit ulong 2 to ulong
+if eq tile_w ulong 0
+ret BR_ERR_BAD_TILE
+end
+full = div ne0 tile_w
+tail = rem ne0 tile_w
+put plan 0 full
+put plan 1 tail
+ret BR_OK
+end
