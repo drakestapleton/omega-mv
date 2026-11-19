@@ -96,5 +96,6 @@ Tested `AIEN_OMEGA_Q38_OVERLAP_AB=1`, `AIEN_OMEGA_Q38_BUF_CACHED=1`, `AIEN_OMEGA
 |---|---|---|---|
 | `tools/pi-drive-27b/specdraft.om` + `specdraft_trace.om` | `12 KB` ELF, `400 KB` RSS, `0.00 s` | **`PASS`** (`SPECDRAFT TEST PASS 8/8`, `rc=0`) | L2-resident (`64.17 KiB` state, 0 DRAM contention) 4/3/2/1-gram prompt-lookup speculative drafter + exact verification/rollback (`1..8` tokens/step) |
 | `tools/pi-drive-27b/omguard.om` + `omguard_trace.om` | `20 KB` ELF, `400 KB` RSS, `0.00 s` | **`PASS`** (`OMGUARD TEST PASS 8/8`, `rc=0`) | Incremental mid-decode OM-1 syntax/register guard (`0x`, `>6` params, `>16` locals / `error 12`, missing `bound`, unbalanced `end`) + 64-slot FNV-1a unified-RAM prefix-pool index with LRU eviction |
+| `tools/pi-drive-27b/tree20.om` (live across all 20 Spark ARM64 cores `0..19`) | `2.6 KB` ELF, `1,640 KB` RSS | **`PASS`** (`20/20` cores, `2,000,000` cand. tok in `1.52 s` = **`1,314,134 tok/s`** / `65,707` 20-tok trees/s) | 20-core parallel L2-resident (`64 KiB/core`) speculative 20-node token-tree + `20x20` causal attention mask generator (`~15 us/tree` vs `128 ms` GPU step) |
 
 
