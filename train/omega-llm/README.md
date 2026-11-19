@@ -11,11 +11,11 @@ Since 2026-11-19 this directory is the source of truth for Omega LLM `.om` code 
 | `tools/` | `tools/omegallm/**/*.om` |
 | `docs/` | `docs/omegallm/*.md` (contracts V1-V3 and BF16, specialists, bundles, WSP) |
 
-Stays in aien-train (listed in `train/NOT-YET-OMEGA.tsv`): the shell/Python harness `tests/omegallm/` (`build.sh`, `oracle.py`, `pre-review.py`, ...), `evidence/OMEGALLM/` receipts, and the C++ llama.cpp UI bridge `tools/omegallm-ui/`. The docs here still cite those upstream paths and commits.
+Stays in aien-train (listed in `train/NOT-YET-OMEGA.tsv`): the shell/Python harness `tests/omegallm/` (`build.sh`, `oracle.py`, `pre-review.py`, ...), `evidence/OMEGALLM/` receipts, and the C++ llama.cpp UI bridge `tools/omegallm-ui/`. The docs here still cite those upstream paths and commits. Unless a citation names a different commit, upstream paths refer to aien-train `f1bebdf3c5b08ec624005e5bc39d0427a87f9537`; they are not local omega-mv paths.
 
 ## Units
 
-Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`):
+Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`); `build.sh` has no Darwin target, so the `ollm_darwin` row follows upstream `tests/omegallm/ollm_metrics_bench.py` (`darwin-arm64`):
 
 | Unit | Target line | Platform unit |
 | --- | --- | --- |
@@ -28,3 +28,7 @@ Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`)
 `ollm_darwin` is the Darwin `<plat>` slot. `seed/out/omc` has no `target a64macos` (error 25), so this row compiles the Darwin composition for the compiler's default Linux AArch64 target; a Darwin Mach-O build and every hardware row are `NOT_RUN` here. Host compilation proves reproducible building only; behaviour checks are still the upstream harness.
 
 Other in-tree consumers: `core/sovereign-core/om/golden/ollm/` builds a pinned aien-train snapshot by its upstream paths; `gpu/nvidia/om/gemm-any/ollm.om` and `gpu/nvidia/om/kgen/attention_ollm.om` are GPU kernels shaped for Omega LLM.
+
+## Follow-ups (not qualified by this import)
+
+The tools under `tools/` still use aien-train-relative paths (for example `native/omegallm/`); their host compilation is gated, but running them from an omega-mv checkout needs a separate path port and behavioural qualification. Likewise, future imports of other aien-train code must exclude the migrated Omega LLM folders (see `train/import/aien-train/README.md`); an automated guard against accidental re-import is follow-up work.

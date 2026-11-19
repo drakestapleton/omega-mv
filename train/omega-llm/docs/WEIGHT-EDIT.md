@@ -100,5 +100,5 @@ The completed first search found only a 0.016192% fresh final-loss reduction; th
 second search rejected every BF16/f32 blend on calibration and selected the unchanged
 baseline. Retain the original training checkpoint. The small-gain copy is an optional
 inference experiment. Numerical records and limitations are in
-[`evidence/OMEGALLM/weight-edit-20261104`](../../evidence/OMEGALLM/weight-edit-20261104/README.md).
+aien-train `evidence/OMEGALLM/weight-edit-20261104/README.md` (upstream, not in omega-mv).
 No installed skill, existing build command, or production model route is changed.

@@ -13,7 +13,7 @@ The browser launchers now expose this checkpoint in the existing llama UI:
 under x86-64 emulation. Open **Omega LLM.command** or **Aienux Omega.command**
 in Applications/Omega. Select **Omega-Astra-2026-11-04** or
 **Omega-Astra-Aienux**, respectively. The adapter and its limits are documented
-in [the UI experiment](../../tools/omegallm-ui/README.md). It is temporary host
+in the UI experiment (aien-train `tools/omegallm-ui/README.md`, upstream, not in omega-mv). It is temporary host
 C++ compatibility code, not a native Omega macOS runtime. The firmware guest
 does model inference without Linux; it is not the standalone Aienux kernel.
 
@@ -24,7 +24,7 @@ from [the weight-edit experiment](WEIGHT-EDIT.md), with final gain 1.00.
 The original `omega-v2.ck` is preserved alongside it. The tokenizer is unchanged.
 The interactive runner flushes each decoded token and exposes a resident-model
 sampling entry point; greedy and seeded samples match the prior runner in
-[the parity receipt](../../evidence/OMEGALLM/macbook-ui-20261106/parity.json).
+the parity receipt (aien-train `evidence/OMEGALLM/macbook-ui-20261106/parity.json`, upstream).
 No new training or change to the repository's recommended
 training checkpoint is implied.
 
