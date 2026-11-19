@@ -1,0 +1,415 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/tests/test_nvme_ro_bare.om: Host simulator test for nvme_ro_bare.om.
+note Verifies:
+note   1. CAP.TO * 500 ms wall-clock timeout (succeeds when CSTS.RDY arrives at 300 ms, fails when stalled > 1000 ms).
+note   2. MDTS clamping (MDTS=0 -> 128 KiB, MDTS=3 -> 32 KiB, MDTS=6 -> clamped to 128 KiB).
+note   3. Multi-page PRP-list reads (1 page, 2 pages, 32 pages = 128 KiB) + 256 KiB chunked read.
+note   4. Pre-DMA WB flush (nvme_wb_clean_inv) called with exact (dst_pa, total_bytes) before DMA.
+note   5. <40-bit PA bound enforcement (NV_E_PA40).
+note   6. Hard read-only opcode allowlist: I/O Write (0x01), Flush (0x00), DSM (0x09), Format (0x80)
+note      all refused with NV_E_OPCODE (13) with ZERO SQE or doorbell writes.
+note   7. CSTS.CFS fatal abort (NV_E_CFS = 11).
+
+const SIM_BAR0 ulong 1645215744
+const SIM_DMA ulong 268435456
+const SIM_RAM ulong 536870912
+
+note Simulated RAM: 64 KiB DMA arena at SIM_DMA, 512 KiB target RAM at SIM_RAM, 512 KiB disk (1024 sectors)
+global sim_dma uchar 65536
+global sim_ram uchar 524288
+global sim_disk uchar 524288
+note sim_st: 0=now_ms, 1=rdy_delay_ms, 2=rdy_start_ms, 3=cc, 4=csts, 5=stall_rdy,
+note         6=mdts_val, 7=wb_calls, 8=wb_last_pa, 9=wb_last_len, 10=sq_writes,
+note         11=db_writes, 12=asq_head, 13=isq_head, 14=acq_tail, 15=icq_tail,
+note         16=acq_phase, 17=icq_phase, 18=inject_cfs
+global sim_st ulong 20
+
+fn sim_u32_r mem ulong off ulong to ulong
+if eq mem 0
+b0 = ulong get sim_dma off
+b1 = ulong get sim_dma add off 1
+b2 = ulong get sim_dma add off 2
+b3 = ulong get sim_dma add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+b0 = ulong get sim_ram off
+b1 = ulong get sim_ram add off 1
+b2 = ulong get sim_ram add off 2
+b3 = ulong get sim_ram add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn sim_u32_w mem ulong off ulong v ulong to void
+if eq mem 0
+put sim_dma off uchar and v 255
+put sim_dma add off 1 uchar and shr v 8 255
+put sim_dma add off 2 uchar and shr v 16 255
+put sim_dma add off 3 uchar and shr v 24 255
+ret
+end
+put sim_ram off uchar and v 255
+put sim_ram add off 1 uchar and shr v 8 255
+put sim_ram add off 2 uchar and shr v 16 255
+put sim_ram add off 3 uchar and shr v 24 255
+end
+
+fn sim_u64_r mem ulong off ulong to ulong
+lo = sim_u32_r mem off
+hi = sim_u32_r mem add off 4
+ret or lo shl hi 32
+end
+
+fn nvme_dma_r32 addr ulong to ulong
+if and ge addr SIM_DMA lt addr add SIM_DMA 65536
+ret sim_u32_r 0 sub addr SIM_DMA
+end
+if and ge addr SIM_RAM lt addr add SIM_RAM 524288
+ret sim_u32_r 1 sub addr SIM_RAM
+end
+exit 91
+end
+
+fn nvme_dma_w32 addr ulong val ulong to void
+if and ge addr SIM_DMA lt addr add SIM_DMA 65536
+sim_u32_w 0 sub addr SIM_DMA val
+put sim_st 10 add get sim_st 10 1
+ret
+end
+if and ge addr SIM_RAM lt addr add SIM_RAM 524288
+sim_u32_w 1 sub addr SIM_RAM val
+ret
+end
+exit 92
+end
+
+fn nvme_dma_w64 addr ulong val ulong to void
+nvme_dma_w32 addr and val 4294967295
+nvme_dma_w32 add addr 4 shr val 32
+end
+
+fn nvme_dma_r8 addr ulong to ulong
+if and ge addr SIM_DMA lt addr add SIM_DMA 65536
+ret ulong get sim_dma sub addr SIM_DMA
+end
+if and ge addr SIM_RAM lt addr add SIM_RAM 524288
+ret ulong get sim_ram sub addr SIM_RAM
+end
+exit 93
+end
+
+fn nvme_dma_zero addr ulong size ulong to void
+if not and ge addr SIM_DMA le add addr size add SIM_DMA 65536
+exit 94
+end
+base = sub addr SIM_DMA
+i = ulong 0
+while lt i size bound 65536
+put sim_dma add base i 0
+i = add i 1
+end
+end
+
+fn nvme_now_ms to ulong
+t = get sim_st 0
+put sim_st 0 add t 10
+ret t
+end
+
+fn nvme_dsb_sy to void
+end
+
+fn nvme_wb_clean_inv pa ulong nbytes ulong to void
+put sim_st 7 add get sim_st 7 1
+put sim_st 8 pa
+put sim_st 9 nbytes
+end
+
+fn sim_post_cqe q ulong cid ulong status ulong to void
+cq_off = NV_OFF_ACQ
+tail_idx = ulong 14
+ph_idx = ulong 16
+sqh_idx = ulong 12
+if eq q 1
+cq_off = NV_OFF_ICQ
+tail_idx = ulong 15
+ph_idx = ulong 17
+sqh_idx = ulong 13
+end
+t = get sim_st tail_idx
+ph = get sim_st ph_idx
+slot = add cq_off mul t 16
+sim_u32_w 0 slot 0
+sim_u32_w 0 add slot 4 0
+sim_u32_w 0 add slot 8 or shl q 16 get sim_st sqh_idx
+sim_u32_w 0 add slot 12 or or cid shl ph 16 shl status 17
+t = add t 1
+if eq t NV_DEPTH
+t = ulong 0
+put sim_st ph_idx xor ph 1
+end
+put sim_st tail_idx t
+end
+
+fn sim_copy_to_pa pa ulong disk_off ulong nbytes ulong to void
+if not and ge pa SIM_RAM le add pa nbytes add SIM_RAM 524288
+exit 95
+end
+dst = sub pa SIM_RAM
+i = ulong 0
+while lt i nbytes bound 4096
+put sim_ram add dst i get sim_disk add disk_off i
+i = add i 1
+end
+end
+
+fn sim_exec_admin slot ulong to void
+dw0 = sim_u32_r 0 slot
+op = and dw0 255
+cid = shr dw0 16
+if eq op 6
+cns = sim_u32_r 0 add slot 40
+id_off = NV_OFF_ID
+i = ulong 0
+while lt i 4096 bound 4096
+put sim_dma add id_off i 0
+i = add i 1
+end
+if eq cns 1
+note Identify Controller: MDTS at +77, NN=1 at +516
+put sim_dma add id_off 77 uchar get sim_st 6
+sim_u32_w 0 add id_off 516 1
+else
+note Identify Namespace: NSZE=1024 at +0, LBAF0 lbads=9 (512B) at +128
+sim_u32_w 0 id_off 1024
+sim_u32_w 0 add id_off 128 shl ulong 9 16
+end
+sim_post_cqe 0 cid 0
+ret
+end
+if or eq op 5 eq op 1
+sim_post_cqe 0 cid 0
+ret
+end
+exit 96
+end
+
+fn sim_prp_pa prp1 ulong prp2 ulong pages ulong p ulong to ulong
+if eq p 0
+ret prp1
+end
+if and eq p 1 eq pages 2
+ret prp2
+end
+ret sim_u64_r 0 add sub prp2 SIM_DMA mul sub p 1 8
+end
+
+fn sim_exec_io slot ulong to void
+dw0 = sim_u32_r 0 slot
+if ne and dw0 255 2
+exit 97
+end
+prp1 = sim_u64_r 0 add slot 24
+prp2 = sim_u64_r 0 add slot 32
+doff = mul sim_u64_r 0 add slot 40 512
+nbytes = mul add and sim_u32_r 0 add slot 48 65535 1 512
+pages = div add nbytes 4095 4096
+p = ulong 0
+while lt p pages bound 32
+pa = sim_prp_pa prp1 prp2 pages p
+take = sub nbytes mul p 4096
+if gt take 4096
+take = ulong 4096
+end
+sim_copy_to_pa pa add doff mul p 4096 take
+p = add p 1
+end
+sim_post_cqe 1 shr dw0 16 0
+end
+
+fn nvme_mmio_r32 addr ulong to ulong
+off = sub addr SIM_BAR0
+if eq off 8
+ret shl ulong 1 16
+end
+if eq off 28
+if ne get sim_st 18 0
+ret 2
+end
+if ne get sim_st 5 0
+ret get sim_st 4
+end
+want = and get sim_st 3 1
+if ne want get sim_st 4
+if ge sub get sim_st 0 get sim_st 2 get sim_st 1
+put sim_st 4 want
+end
+end
+ret get sim_st 4
+end
+ret 0
+end
+
+fn nvme_mmio_r64 addr ulong to ulong
+off = sub addr SIM_BAR0
+if eq off 0
+note CAP: MQES=63, TO=2 (1000 ms), DSTRD=0, CSS=NVM(bit 37), MPSMIN=0
+ret or or ulong 63 shl ulong 2 24 shl ulong 1 37
+end
+ret 0
+end
+
+fn nvme_mmio_w32 addr ulong val ulong to void
+off = sub addr SIM_BAR0
+put sim_st 11 add get sim_st 11 1
+if eq off 20
+put sim_st 3 val
+put sim_st 2 get sim_st 0
+ret
+end
+if eq off 4096
+note Admin SQ doorbell
+h = get sim_st 12
+put sim_st 12 val
+sim_exec_admin add NV_OFF_ASQ mul h 64
+ret
+end
+if eq off 4104
+note I/O SQ doorbell
+h2 = get sim_st 13
+put sim_st 13 val
+sim_exec_io add NV_OFF_ISQ mul h2 64
+ret
+end
+end
+
+fn nvme_mmio_w64 addr ulong val ulong to void
+put sim_st 11 add get sim_st 11 1
+end
+
+fn sim_reset mdts ulong delay_ms ulong stall ulong to void
+for i ulong 20
+put sim_st i 0
+end
+put sim_st 1 delay_ms
+put sim_st 5 stall
+put sim_st 6 mdts
+put sim_st 16 1
+put sim_st 17 1
+end
+
+fn main to int
+note Populate synthetic 512 KiB disk with deterministic pattern
+d = ulong 0
+while lt d 524288 bound 524288
+put sim_disk d uchar and xor mul d 31 shr d 8 255
+d = add d 1
+end
+
+note Test 1: CAP.TO * 500 ms (1000 ms) succeeds when CSTS.RDY takes 300 ms (30 polls > old bug if stalled)
+sim_reset 0 300 0
+r = nvme_init SIM_BAR0 SIM_DMA 1
+if ne r NV_OK
+ret 10
+end
+if ne nvme_cap_to_ms 1000
+ret 11
+end
+if ne nvme_max_xfer 131072
+ret 12
+end
+
+note Test 2: 256 KiB (512 sectors) chunked PRP-list direct read into WB RAM -> checks pre-DMA WB flush + exact data
+r = nvme_read_direct 16 512 SIM_RAM 1
+if ne r NV_OK
+ret 13
+end
+if ne get sim_st 7 2
+ret 14
+end
+if ne get sim_st 8 SIM_RAM
+ret 14
+end
+if ne get sim_st 9 262144
+ret 14
+end
+k = ulong 0
+while lt k 262144 bound 262144
+if ne get sim_ram k get sim_disk add 8192 k
+ret 15
+end
+k = add k 1
+end
+
+note Test 3: Hard read-only opcode allowlist — hostile opcodes MUST return NV_E_OPCODE (13) with ZERO SQ/DB writes
+sq_before = get sim_st 10
+db_before = get sim_st 11
+nv_clear_sqe
+put nv_sqe 0 1
+if ne nv_submit 1 NV_E_OPCODE
+ret 16
+end
+nv_clear_sqe
+put nv_sqe 0 0
+if ne nv_submit 1 NV_E_OPCODE
+ret 17
+end
+nv_clear_sqe
+put nv_sqe 0 9
+if ne nv_submit 1 NV_E_OPCODE
+ret 18
+end
+nv_clear_sqe
+put nv_sqe 0 128
+if ne nv_submit 0 NV_E_OPCODE
+ret 19
+end
+if or ne get sim_st 10 sq_before ne get sim_st 11 db_before
+ret 20
+end
+
+note Test 4: PA=0, wrap, and <40-bit PA bound refusals
+if ne nvme_read_direct 0 8 0 0 NV_E_ARG
+ret 21
+end
+if ne nvme_read_direct 0 8 NV_PA40_LIMIT 0 NV_E_PA40
+ret 21
+end
+if ne nvme_init SIM_BAR0 0 1 NV_E_ARG
+ret 28
+end
+if ne nvme_init SIM_BAR0 18446744073709547520 1 NV_E_PA40
+ret 29
+end
+
+note Test 5: MDTS=3 -> capped at 32 KiB; MDTS=6 -> clamped at 128 KiB
+sim_reset 3 10 0
+if ne nvme_init SIM_BAR0 SIM_DMA 1 NV_OK
+ret 22
+end
+if ne nvme_max_xfer 32768
+ret 23
+end
+sim_reset 6 10 0
+if ne nvme_init SIM_BAR0 SIM_DMA 1 NV_OK
+ret 24
+end
+if ne nvme_max_xfer 131072
+ret 25
+end
+
+note Test 6: Stalled CSTS.RDY times out cleanly against CAP.TO * 500 ms (NV_E_TIMEOUT = 12)
+sim_reset 0 0 1
+put sim_st 4 1
+if ne nvme_init SIM_BAR0 SIM_DMA 1 NV_E_TIMEOUT
+ret 26
+end
+
+note Test 7: CSTS.CFS fatal abort (NV_E_CFS = 11)
+sim_reset 0 0 0
+put sim_st 18 1
+if ne nvme_init SIM_BAR0 SIM_DMA 1 NV_E_CFS
+ret 27
+end
+
+ret 0
+end

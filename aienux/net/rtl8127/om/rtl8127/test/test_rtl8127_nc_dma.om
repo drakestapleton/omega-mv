@@ -1,0 +1,168 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/rtl8127/om/rtl8127/test/test_rtl8127_nc_dma.om: Regression test proving
+note rtl8127.om operates DIRECTLY on Normal-NC physical memory (sim_nc[]) without touching
+note .bss rdma[] (which is poisoned with 0xCC).
+note Verifies:
+note   1. rtlinit() writes RX ring descriptors (OWN=1, DEOR=1 on slot 15) into sim_nc[] BEFORE CHIPCMD TXEN|RXEN.
+note   2. rtltx() writes TX descriptor + payload into sim_nc[] BEFORE SWTAIL0 doorbell.
+note   3. RX frame written directly into sim_nc[] is observed by rtlrx() and delivered to obuf[].
+
+const NC_PA ulong 268435456
+
+global sim_nc uchar 69632
+global sim_st ulong 12
+global sim_tx_snap uchar 64
+
+fn nc_rd32 off ulong to ulong
+b0 = ulong get sim_nc off
+b1 = ulong get sim_nc add off 1
+b2 = ulong get sim_nc add off 2
+b3 = ulong get sim_nc add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn nc_wr32 off ulong v ulong to void
+put sim_nc off uchar and v 255
+put sim_nc add off 1 uchar and shr v 8 255
+put sim_nc add off 2 uchar and shr v 16 255
+put sim_nc add off 3 uchar and shr v 24 255
+end
+
+fn rtldma_r8 off ulong to ulong
+if ge off 69632
+exit 91
+end
+ret ulong get sim_nc off
+end
+
+fn rtldma_w8 off ulong v ulong to void
+if ge off 69632
+exit 92
+end
+put sim_nc off uchar and v 255
+end
+
+fn rtldly us ulong to void
+end
+
+fn rtlbar to void
+put sim_st 5 add get sim_st 5 1
+end
+
+fn rtlrd off ulong w ulong to ulong
+if eq off TCR
+ret or TCRID 1048576
+end
+if eq off PHYSTAT
+ret or or 16384 PHYSLNK PHYSFD
+end
+if eq off MCUCMD
+ret or MCUTXE MCURXE
+end
+if eq off LLFIFO
+ret 512
+end
+if eq off INTRMIT
+ret 259
+end
+if eq off BAKADR0
+ret 857870664
+end
+if eq off BAKADR1
+ret 21828
+end
+if eq off HWCLO0
+ret get sim_st 4
+end
+ret 0
+end
+
+fn rtlwr off ulong w ulong v ulong to void
+if eq off CHIPCMD
+if eq and v or CMDTXEN CMDRXEN or CMDTXEN CMDRXEN
+note Verify RX slot 0 OWN=1 and slot 15 OWN|DEOR are ALREADY in sim_nc[] before TXEN|RXEN!
+d0 = nc_rd32 OFFRXD
+d15 = nc_rd32 add OFFRXD 240
+if eq and d0 DOWN 0
+exit 71
+end
+if ne and d15 or DOWN DEOR or DOWN DEOR
+exit 72
+end
+put sim_st 0 1
+end
+ret
+end
+if eq off SWTAIL0
+note Verify TX desc 0 OWN|DFS|DLS and payload are ALREADY in sim_nc[] before SWTAIL0 doorbell!
+td0 = nc_rd32 OFFTXD
+if ne and td0 or or DOWN DFS DLS or or DOWN DFS DLS
+exit 73
+end
+for k ulong 64
+put sim_tx_snap k get sim_nc add OFFTXB k
+end
+put sim_st 1 1
+put sim_st 4 v
+ret
+end
+end
+
+fn main to int
+note Poison .bss rdma[] with 0xCC to prove rtl8127.om never touches it!
+i = ulong 0
+while lt i 69632 bound 69632
+put rdma i 204
+i = add i 1
+end
+
+if ne rtlinit NC_PA 0
+ret 10
+end
+if ne get sim_st 0 1
+ret 11
+end
+
+note Verify .bss rdma[] is still 0xCC (untouched)
+if or ne get rdma 0 204 ne get rdma OFFRXD 204
+ret 12
+end
+
+note Transmit 64-byte frame -> must land in sim_nc[] before SWTAIL0
+for k ulong 64
+put fbuf k uchar add 32 k
+end
+if ne rtltx 64 0
+ret 13
+end
+if ne get sim_st 1 1
+ret 14
+end
+for k2 ulong 64
+if ne get sim_tx_snap k2 uchar add 32 k2
+ret 15
+end
+end
+
+note Inject 64-byte RX frame (+ 4-byte FCS = 68) directly into sim_nc[] RX slot 0
+for k3 ulong 64
+put sim_nc add OFFRXB k3 uchar add 96 k3
+end
+for fcs ulong 4
+put sim_nc add add OFFRXB 64 fcs 204
+end
+nc_wr32 OFFRXD or or DFS DLS 68
+if ne rtlrx 0
+ret 16
+end
+if ne get rs S_RXLEN 64
+ret 17
+end
+for k4 ulong 64
+if ne get obuf k4 uchar add 96 k4
+ret 18
+end
+end
+
+ret 0
+end

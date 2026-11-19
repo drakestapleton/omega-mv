@@ -1,0 +1,376 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/gpt_ro.om: Standalone strictly read-only GPT partition discovery (Slice D / Piece 4).
+note ZERO write paths — never links hal_nvme_authorize_write or nvme_store_gate.om.
+note Expects a read-only sector reader callback:
+note   gpt_read_lba(lba ulong) -> int  (reads 512-byte sector into global gpt_sec[0..512), 0 = OK)
+
+const GPT_OK int 0
+const GPT_E_IO int -401
+const GPT_E_GEOM int -402
+const GPT_E_NOMBR int -403
+const GPT_E_SIG int -404
+const GPT_E_HDR_CRC int -405
+const GPT_E_HDR int -406
+const GPT_E_ENT_CRC int -407
+const GPT_E_ENT int -408
+const GPT_E_BACKUP int -409
+const GPT_E_OUTSIDE int -410
+const GPT_E_OVERLAP int -411
+const GPT_E_NOPART int -412
+
+global gpt_sec uchar 512
+global gpt_ents uchar 16384
+note gpt_st: 0=valid, 1=first_usable, 2=last_usable, 3=num_ents, 4=ent_size,
+note         5=found_first_lba, 6=found_sectors, 7=found_index
+global gpt_st ulong 8
+global gpt_lo ulong 128
+global gpt_hi ulong 128
+
+fn gpt_rd32_sec off ulong to uint
+b0 = uint get gpt_sec off
+b1 = uint get gpt_sec add off 1
+b2 = uint get gpt_sec add off 2
+b3 = uint get gpt_sec add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn gpt_rd64_sec off ulong to ulong
+lo = ulong gpt_rd32_sec off
+hi = ulong gpt_rd32_sec add off 4
+ret or lo shl hi 32
+end
+
+fn gpt_rd32_ent off ulong to uint
+b0 = uint get gpt_ents off
+b1 = uint get gpt_ents add off 1
+b2 = uint get gpt_ents add off 2
+b3 = uint get gpt_ents add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn gpt_rd64_ent off ulong to ulong
+lo = ulong gpt_rd32_ent off
+hi = ulong gpt_rd32_ent add off 4
+ret or lo shl hi 32
+end
+
+fn gpt_crc32_hdr hsize ulong to uint
+crc = uint 4294967295
+i = ulong 0
+while lt i hsize bound 512
+b = uint 0
+if or lt i 16 ge i 20
+b = uint get gpt_sec i
+end
+crc = xor crc b
+for bit ulong 8
+if ne and crc 1 0
+crc = xor shr crc 1 3988292384
+else
+crc = shr crc 1
+end
+end
+i = add i 1
+end
+ret xor crc 4294967295
+end
+
+fn gpt_crc32_ents n ulong to uint
+crc = uint 4294967295
+i = ulong 0
+while lt i n bound 16384
+b = uint get gpt_ents i
+crc = xor crc b
+for bit ulong 8
+if ne and crc 1 0
+crc = xor shr crc 1 3988292384
+else
+crc = shr crc 1
+end
+end
+i = add i 1
+end
+ret xor crc 4294967295
+end
+
+fn gpt_is_sig to bool
+if or ne get gpt_sec 0 69 ne get gpt_sec 1 70
+ret false
+end
+if or ne get gpt_sec 2 73 ne get gpt_sec 3 32
+ret false
+end
+if or ne get gpt_sec 4 80 ne get gpt_sec 5 65
+ret false
+end
+if or ne get gpt_sec 6 82 ne get gpt_sec 7 84
+ret false
+end
+ret true
+end
+
+fn gpt_ent_nonzero off ulong to bool
+for i ulong 16
+if ne get gpt_ents add off i 0
+ret true
+end
+end
+ret false
+end
+
+note Linux filesystem GUID: 0FC63DAF-8483-4772-8E79-3D69D8477DE4
+note Little-endian bytes: af 3d c6 0f 83 84 72 47 8e 79 3d 69 d8 47 7d e4
+fn gpt_is_linux_fs off ulong to bool
+if or ne get gpt_ents off 175 ne get gpt_ents add off 1 61
+ret false
+end
+if or ne get gpt_ents add off 2 198 ne get gpt_ents add off 3 15
+ret false
+end
+if or ne get gpt_ents add off 4 131 ne get gpt_ents add off 5 132
+ret false
+end
+if or ne get gpt_ents add off 6 114 ne get gpt_ents add off 7 71
+ret false
+end
+if or ne get gpt_ents add off 8 142 ne get gpt_ents add off 9 121
+ret false
+end
+if or ne get gpt_ents add off 10 61 ne get gpt_ents add off 11 105
+ret false
+end
+if or ne get gpt_ents add off 12 216 ne get gpt_ents add off 13 71
+ret false
+end
+if or ne get gpt_ents add off 14 125 ne get gpt_ents add off 15 228
+ret false
+end
+ret true
+end
+
+fn gpt_check_mbr to int
+r = gpt_read_lba 0
+if ne r 0
+ret GPT_E_IO
+end
+if or ne get gpt_sec 510 85 ne get gpt_sec 511 170
+ret GPT_E_NOMBR
+end
+has_ee = false
+for p ulong 4
+if eq get gpt_sec add 446 add mul p 16 4 238
+has_ee = true
+end
+end
+if not has_ee
+ret GPT_E_NOMBR
+end
+ret GPT_OK
+end
+
+fn gpt_load_ents ent_lba ulong ent_bytes ulong want_ecrc uint to int
+ent_secs = div add ent_bytes 511 512
+s = ulong 0
+while lt s ent_secs bound 32
+r = gpt_read_lba add ent_lba s
+if ne r 0
+ret GPT_E_IO
+end
+base = mul s 512
+for b ulong 512
+if lt add base b ent_bytes
+put gpt_ents add base b get gpt_sec b
+end
+end
+s = add s 1
+end
+if ne gpt_crc32_ents ent_bytes want_ecrc
+ret GPT_E_ENT_CRC
+end
+ret GPT_OK
+end
+
+fn gpt_check_backup bak_lba ulong want_ecrc uint to int
+r = gpt_read_lba bak_lba
+if ne r 0
+ret GPT_E_IO
+end
+if not gpt_is_sig
+ret GPT_E_BACKUP
+end
+bhsize = ulong gpt_rd32_sec 12
+if or lt bhsize 92 gt bhsize 512
+ret GPT_E_BACKUP
+end
+if ne gpt_crc32_hdr bhsize gpt_rd32_sec 16
+ret GPT_E_BACKUP
+end
+if or ne gpt_rd64_sec 24 bak_lba ne gpt_rd64_sec 32 1
+ret GPT_E_BACKUP
+end
+if ne gpt_rd32_sec 88 want_ecrc
+ret GPT_E_BACKUP
+end
+ret GPT_OK
+end
+
+fn gpt_check_overlap num_ents ulong first_u ulong last_u ulong to int
+used = ulong 0
+idx = ulong 0
+while lt idx num_ents bound 128
+off = mul idx 128
+if gpt_ent_nonzero off
+fl = gpt_rd64_ent add off 32
+ll = gpt_rd64_ent add off 40
+if or lt fl first_u gt ll last_u
+ret GPT_E_OUTSIDE
+end
+if gt fl ll
+ret GPT_E_OUTSIDE
+end
+j = ulong 0
+while lt j used bound 128
+if le fl get gpt_hi j
+if ge ll get gpt_lo j
+ret GPT_E_OVERLAP
+end
+end
+j = add j 1
+end
+put gpt_lo used fl
+put gpt_hi used ll
+used = add used 1
+end
+idx = add idx 1
+end
+ret GPT_OK
+end
+
+note Parse and verify Protective MBR + Primary GPT + Backup GPT + Partition Entry Array.
+note total_sectors: total 512-byte sectors on the NVMe namespace.
+fn gpt_ro_parse total_sectors ulong to int
+for i ulong 8
+put gpt_st i 0
+end
+if lt total_sectors 68
+ret GPT_E_GEOM
+end
+r = gpt_check_mbr
+if ne r GPT_OK
+ret r
+end
+r = gpt_read_lba 1
+if ne r 0
+ret GPT_E_IO
+end
+if not gpt_is_sig
+ret GPT_E_SIG
+end
+hsize = ulong gpt_rd32_sec 12
+if or lt hsize 92 gt hsize 512
+ret GPT_E_HDR
+end
+if ne gpt_crc32_hdr hsize gpt_rd32_sec 16
+ret GPT_E_HDR_CRC
+end
+bak_lba = gpt_rd64_sec 32
+if or ne gpt_rd64_sec 24 1 ne bak_lba sub total_sectors 1
+ret GPT_E_HDR
+end
+first_u = gpt_rd64_sec 40
+last_u = gpt_rd64_sec 48
+if or lt first_u 34 ge last_u bak_lba
+ret GPT_E_HDR
+end
+if gt first_u last_u
+ret GPT_E_HDR
+end
+num_ents = ulong gpt_rd32_sec 80
+if or eq num_ents 0 gt num_ents 128
+ret GPT_E_ENT
+end
+if ne ulong gpt_rd32_sec 84 128
+ret GPT_E_ENT
+end
+ent_lba = gpt_rd64_sec 72
+ent_secs = div add mul num_ents 128 511 512
+if or lt ent_lba 2 lt add ent_lba ent_secs ent_lba
+ret GPT_E_ENT
+end
+if gt add ent_lba ent_secs first_u
+ret GPT_E_ENT
+end
+want_ecrc = gpt_rd32_sec 88
+r = gpt_load_ents ent_lba mul num_ents 128 want_ecrc
+if ne r GPT_OK
+ret r
+end
+r = gpt_check_backup bak_lba want_ecrc
+if ne r GPT_OK
+ret r
+end
+r = gpt_check_overlap num_ents first_u last_u
+if ne r GPT_OK
+ret r
+end
+put gpt_st 0 1
+put gpt_st 1 first_u
+put gpt_st 2 last_u
+put gpt_st 3 num_ents
+put gpt_st 4 128
+ret GPT_OK
+end
+
+note Locate 1-based partition index (e.g., 2 for nvme0n1p2).
+fn gpt_ro_select_index part_idx ulong to int
+if eq get gpt_st 0 0
+ret GPT_E_HDR
+end
+if or eq part_idx 0 gt part_idx get gpt_st 3
+ret GPT_E_NOPART
+end
+off = mul sub part_idx 1 128
+if not gpt_ent_nonzero off
+ret GPT_E_NOPART
+end
+fl = gpt_rd64_ent add off 32
+ll = gpt_rd64_ent add off 40
+put gpt_st 5 fl
+put gpt_st 6 add sub ll fl 1
+put gpt_st 7 part_idx
+ret GPT_OK
+end
+
+note Locate first Linux Filesystem GUID partition (0FC63DAF-8483-4772-8E79-3D69D8477DE4).
+fn gpt_ro_select_linux_root to int
+if eq get gpt_st 0 0
+ret GPT_E_HDR
+end
+num_ents = get gpt_st 3
+idx = ulong 0
+while lt idx num_ents bound 128
+off = mul idx 128
+if gpt_is_linux_fs off
+fl = gpt_rd64_ent add off 32
+ll = gpt_rd64_ent add off 40
+put gpt_st 5 fl
+put gpt_st 6 add sub ll fl 1
+put gpt_st 7 add idx 1
+ret GPT_OK
+end
+idx = add idx 1
+end
+ret GPT_E_NOPART
+end
+
+fn gpt_ro_first_lba to ulong
+ret get gpt_st 5
+end
+
+fn gpt_ro_sectors to ulong
+ret get gpt_st 6
+end
+
+fn gpt_ro_part_index to ulong
+ret get gpt_st 7
+end

@@ -1,0 +1,697 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/ext4_ro.om: Strictly read-only ext4 filesystem reader & GspFwBundle TOC verifier.
+note Safety invariants enforced (Slice D / Piece 4, #23/#27/#30):
+note   - Zero write paths (read-only sector callback ext4_read_blk only).
+note   - Handles 64-bit block group descriptors (s_desc_size = 32 or 64, bg_inode_table_hi).
+note   - Handles 48-bit extent physical blocks (ee_start_hi, ei_leaf_hi) and depth 0..5 trees.
+note   - Validates extent header magic 0xF30A on every node; fails closed on corruption.
+note   - Zero-fills unwritten extents (ee_len > 32768) and sparse holes.
+note   - Fails closed on inline-data (0x10000000), encrypted (0x800), and non-extent inodes.
+note   - Verifies SHA-256 via sha256_bare.om (compose with sha256_bare.om).
+note
+note Platform callbacks required from caller:
+note   ext4_read_lba(lba ulong) -> int   (reads one 512-byte sector into e4_sec[0..512), 0 = OK)
+note   ext4_sink(off ulong, b uchar) -> void  (receives each file byte at offset off)
+
+const E4_OK int 0
+const E4_E_IO int -501
+const E4_E_MAGIC int -502
+const E4_E_BLKSIZE int -503
+const E4_E_FEATURE int -504
+const E4_E_DESC int -505
+const E4_E_INO int -506
+const E4_E_INLINE int -510
+const E4_E_ENCRYPT int -511
+const E4_E_NOEXTENT int -512
+const E4_E_EXT_MAGIC int -513
+const E4_E_EXT_CORRUPT int -514
+const E4_E_DIR int -515
+const E4_E_NOENT int -516
+const E4_E_RANGE int -517
+const E4_E_SHA int -518
+const E4_E_TOC int -519
+
+const E4_FLAG_ENCRYPT ulong 2048
+const E4_FLAG_EXTENTS ulong 524288
+const E4_FLAG_INLINE ulong 268435456
+const E4_EXT_MAGIC ulong 62218
+const E4_INCOMPAT_EXTENTS ulong 64
+const E4_INCOMPAT_64BIT ulong 128
+note Unsupported incompat features: COMPRESSION(0x1) | META_BG(0x10) | INLINE_DATA(0x8000) | ENCRYPT(0x10000) = 98321
+const E4_INCOMPAT_UNSUP ulong 98321
+
+global e4_sec uchar 512
+global e4_blk uchar 4096
+global e4_node uchar 4096
+global e4_iblk uchar 60
+global e4_path uchar 512
+global e4_comp uchar 256
+global e4_want_sha uchar 32
+global e4_toc uchar 4096
+
+note Superblock state e4_sb:
+note   0=mounted, 1=part_lba, 2=part_secs, 3=blk_size, 4=secs_per_blk,
+note   5=inodes_count, 6=blocks_count, 7=blocks_per_grp, 8=inodes_per_grp,
+note   9=inode_size, 10=desc_size, 11=gdt_blk, 12=incompat
+global e4_sb ulong 16
+
+note Current inode state e4_ino:
+note   0=ino_num, 1=mode, 2=size, 3=flags
+global e4_ino ulong 4
+
+note Extent lookup result e4_map:
+note   0=phys_blk, 1=is_hole, 2=run_blks (contiguous blocks from lblock to end of extent)
+global e4_map ulong 3
+
+note GspFwBundle TOC parsed state (up to 8 entries):
+note   e4_bnd_meta: 0=valid, 1=app_version, 2=num_entries
+global e4_bnd_meta ulong 4
+global e4_bnd_kind ulong 8
+global e4_bnd_off ulong 8
+global e4_bnd_size ulong 8
+global e4_bnd_sha uchar 256
+
+fn e4_u16_blk off ulong to ulong
+b0 = ulong get e4_blk off
+b1 = ulong get e4_blk add off 1
+ret or b0 shl b1 8
+end
+
+fn e4_u32_blk off ulong to ulong
+b0 = ulong get e4_blk off
+b1 = ulong get e4_blk add off 1
+b2 = ulong get e4_blk add off 2
+b3 = ulong get e4_blk add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn e4_u16_node off ulong to ulong
+b0 = ulong get e4_node off
+b1 = ulong get e4_node add off 1
+ret or b0 shl b1 8
+end
+
+fn e4_u32_node off ulong to ulong
+b0 = ulong get e4_node off
+b1 = ulong get e4_node add off 1
+b2 = ulong get e4_node add off 2
+b3 = ulong get e4_node add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn e4_u32_toc off ulong to ulong
+b0 = ulong get e4_toc off
+b1 = ulong get e4_toc add off 1
+b2 = ulong get e4_toc add off 2
+b3 = ulong get e4_toc add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn e4_u64_toc off ulong to ulong
+lo = e4_u32_toc off
+hi = e4_u32_toc add off 4
+ret or lo shl hi 32
+end
+
+note Read one ext4 filesystem block (blk_size bytes) into e4_blk[0..blk_size).
+fn e4_read_fs_block blk ulong to int
+if ge blk get e4_sb 6
+ret E4_E_RANGE
+end
+spb = get e4_sb 4
+if ge blk div get e4_sb 2 spb
+ret E4_E_RANGE
+end
+rel_lba = mul blk spb
+base_lba = add get e4_sb 1 rel_lba
+s = ulong 0
+while lt s spb bound 8
+r = ext4_read_lba add base_lba s
+if ne r 0
+ret E4_E_IO
+end
+dst = mul s 512
+for b ulong 512
+put e4_blk add dst b get e4_sec b
+end
+s = add s 1
+end
+ret E4_OK
+end
+
+note Mount a read-only ext4 partition starting at part_lba with part_secs 512B sectors.
+fn ext4_ro_mount part_lba ulong part_secs ulong to int
+for i ulong 16
+put e4_sb i 0
+end
+if lt part_secs 8
+ret E4_E_RANGE
+end
+r = ext4_read_lba add part_lba 2
+if ne r 0
+ret E4_E_IO
+end
+for b ulong 512
+put e4_blk b get e4_sec b
+end
+r = ext4_read_lba add part_lba 3
+if ne r 0
+ret E4_E_IO
+end
+for b2 ulong 512
+put e4_blk add 512 b2 get e4_sec b2
+end
+if ne e4_u16_blk 56 61267
+ret E4_E_MAGIC
+end
+v = e4_u32_blk 24
+if gt v 2
+ret E4_E_BLKSIZE
+end
+bs = shl ulong 1024 v
+put e4_sb 3 bs
+put e4_sb 4 div bs 512
+put e4_sb 5 e4_u32_blk 0
+v = e4_u32_blk 32
+if eq v 0
+ret E4_E_MAGIC
+end
+put e4_sb 7 v
+v = e4_u32_blk 40
+if eq v 0
+ret E4_E_MAGIC
+end
+put e4_sb 8 v
+v = e4_u16_blk 88
+if or lt v 128 gt v 1024
+ret E4_E_MAGIC
+end
+put e4_sb 9 v
+inc = e4_u32_blk 96
+if eq and inc E4_INCOMPAT_EXTENTS 0
+ret E4_E_FEATURE
+end
+if ne and inc E4_INCOMPAT_UNSUP 0
+ret E4_E_FEATURE
+end
+put e4_sb 12 inc
+put e4_sb 10 32
+put e4_sb 6 e4_u32_blk 4
+if ne and inc E4_INCOMPAT_64BIT 0
+v = e4_u16_blk 254
+if or lt v 64 gt v 1024
+ret E4_E_DESC
+end
+put e4_sb 10 v
+put e4_sb 6 or e4_u32_blk 4 shl e4_u32_blk 336 32
+end
+put e4_sb 11 1
+if eq bs 1024
+put e4_sb 11 2
+end
+put e4_sb 1 part_lba
+put e4_sb 2 part_secs
+put e4_sb 0 1
+ret E4_OK
+end
+
+note Load and validate inode `ino` (1-based). Fails closed on inline/encrypted/non-extent inodes.
+fn e4_read_itbl_blk grp ulong to long
+desc_sz = get e4_sb 10
+bs = get e4_sb 3
+gbyte = mul grp desc_sz
+gblk = add get e4_sb 11 div gbyte bs
+goff = rem gbyte bs
+if gt add goff desc_sz bs
+ret long E4_E_DESC
+end
+r = e4_read_fs_block gblk
+if ne r E4_OK
+ret long r
+end
+lo = e4_u32_blk add goff 8
+hi = ulong 0
+if ge desc_sz 64
+hi = e4_u32_blk add goff 40
+end
+ret long or lo shl hi 32
+end
+
+fn ext4_ro_load_inode ino ulong to int
+if eq get e4_sb 0 0
+ret E4_E_MAGIC
+end
+if or eq ino 0 gt ino get e4_sb 5
+ret E4_E_INO
+end
+itbl = e4_read_itbl_blk div sub ino 1 get e4_sb 8
+if lt itbl 0
+ret int itbl
+end
+ibyte = mul rem sub ino 1 get e4_sb 8 get e4_sb 9
+bs = get e4_sb 3
+ioff = rem ibyte bs
+if gt add ioff 128 bs
+ret E4_E_INO
+end
+r = e4_read_fs_block add ulong itbl div ibyte bs
+if ne r E4_OK
+ret r
+end
+mode = e4_u16_blk ioff
+flags = e4_u32_blk add ioff 32
+if ne and flags E4_FLAG_INLINE 0
+ret E4_E_INLINE
+end
+if ne and flags E4_FLAG_ENCRYPT 0
+ret E4_E_ENCRYPT
+end
+if eq and flags E4_FLAG_EXTENTS 0
+ret E4_E_NOEXTENT
+end
+fsize = e4_u32_blk add ioff 4
+if eq and mode 61440 32768
+fsize = or fsize shl e4_u32_blk add ioff 108 32
+end
+for k ulong 60
+put e4_iblk k get e4_blk add add ioff 40 k
+end
+put e4_ino 0 ino
+put e4_ino 1 mode
+put e4_ino 2 fsize
+put e4_ino 3 flags
+ret E4_OK
+end
+
+fn e4_map_leaf lblock ulong entries ulong to int
+i = ulong 0
+while lt i entries bound 340
+eoff = add 12 mul i 12
+ee_blk = e4_u32_node eoff
+ee_len = e4_u16_node add eoff 4
+unw = ulong 0
+if gt ee_len 32768
+unw = ulong 1
+ee_len = sub ee_len 32768
+end
+if gt ee_len 0
+if ge lblock ee_blk
+if lt lblock add ee_blk ee_len
+rem_run = sub add ee_blk ee_len lblock
+if ne unw 0
+put e4_map 0 0
+put e4_map 1 1
+put e4_map 2 rem_run
+ret E4_OK
+end
+pblk = add or e4_u32_node add eoff 8 shl e4_u16_node add eoff 6 32 sub lblock ee_blk
+if ge pblk get e4_sb 6
+ret E4_E_RANGE
+end
+if gt rem_run sub get e4_sb 6 pblk
+ret E4_E_RANGE
+end
+put e4_map 0 pblk
+put e4_map 1 0
+put e4_map 2 rem_run
+ret E4_OK
+end
+end
+end
+i = add i 1
+end
+put e4_map 0 0
+put e4_map 1 1
+put e4_map 2 1
+ret E4_OK
+end
+
+fn e4_find_idx lblock ulong entries ulong to long
+found = false
+child = ulong 0
+j = ulong 0
+while lt j entries bound 340
+ioff = add 12 mul j 12
+if le e4_u32_node ioff lblock
+child = or e4_u32_node add ioff 4 shl e4_u16_node add ioff 8 32
+found = true
+else
+break
+end
+j = add j 1
+end
+if not found
+ret -1
+end
+ret long child
+end
+
+fn e4_copy_iblk_to_node to void
+for k ulong 60
+put e4_node k get e4_iblk k
+end
+end
+
+fn e4_copy_blk_to_node to void
+bs = get e4_sb 3
+b = ulong 0
+while lt b bs bound 4096
+put e4_node b get e4_blk b
+b = add b 1
+end
+end
+
+note Map logical file block `lblock` through the current inode's 48-bit extent tree (depth 0..5).
+note Writes result to e4_map[0]=phys_blk, e4_map[1]=is_hole (1 if sparse or unwritten ee_len>32768).
+fn ext4_ro_map_block lblock ulong to int
+put e4_map 0 0
+put e4_map 1 1
+put e4_map 2 1
+e4_copy_iblk_to_node
+max_lim = ulong 4
+prev_d = ulong 99
+step = ulong 0
+while lt step 6 bound 6
+if ne e4_u16_node 0 E4_EXT_MAGIC
+ret E4_E_EXT_MAGIC
+end
+entries = e4_u16_node 2
+eh_max = e4_u16_node 4
+depth = e4_u16_node 6
+if or gt entries eh_max gt eh_max max_lim
+ret E4_E_EXT_CORRUPT
+end
+if gt depth 5
+ret E4_E_EXT_CORRUPT
+end
+if ne prev_d 99
+if ne add depth 1 prev_d
+ret E4_E_EXT_CORRUPT
+end
+end
+if eq depth 0
+ret e4_map_leaf lblock entries
+end
+ch = e4_find_idx lblock entries
+if lt ch 0
+put e4_map 0 0
+put e4_map 1 1
+put e4_map 2 1
+ret E4_OK
+end
+r = e4_read_fs_block ulong ch
+if ne r E4_OK
+ret r
+end
+e4_copy_blk_to_node
+max_lim = div sub get e4_sb 3 12 12
+prev_d = depth
+step = add step 1
+end
+ret E4_E_EXT_CORRUPT
+end
+
+fn e4_name_eq base ulong clen ulong to bool
+c = ulong 0
+while lt c clen bound 256
+if ne get e4_blk add base c get e4_comp c
+ret false
+end
+c = add c 1
+end
+ret true
+end
+
+fn e4_dir_scan_blk clen ulong to long
+bs = get e4_sb 3
+off = ulong 0
+while lt off bs bound 512
+if gt add off 8 bs
+ret long E4_E_DIR
+end
+e_ino = e4_u32_blk off
+rlen = e4_u16_blk add off 4
+nlen = ulong get e4_blk add off 6
+if or lt rlen 8 gt add off rlen bs
+ret long E4_E_DIR
+end
+if ne e_ino 0
+if eq nlen clen
+if le add 8 nlen rlen
+if e4_name_eq add off 8 clen
+ret long e_ino
+end
+end
+end
+end
+off = add off rlen
+end
+ret 0
+end
+
+note Lookup single component e4_comp[0..clen) inside currently loaded directory inode.
+fn e4_dir_find clen ulong to long
+if ne and get e4_ino 1 61440 16384
+ret long E4_E_DIR
+end
+bs = get e4_sb 3
+nblks = div add get e4_ino 2 sub bs 1 bs
+lb = ulong 0
+while lt lb nblks bound 4096
+r = ext4_ro_map_block lb
+if ne r E4_OK
+ret long r
+end
+if eq get e4_map 1 0
+r = e4_read_fs_block get e4_map 0
+if ne r E4_OK
+ret long r
+end
+hit = e4_dir_scan_blk clen
+if ne hit 0
+ret hit
+end
+end
+lb = add lb 1
+end
+ret 0
+end
+
+note Resolve absolute path in e4_path[0..plen) starting from root inode 2.
+note On success, leaves target inode loaded in e4_ino/e4_iblk and returns E4_OK.
+fn ext4_ro_lookup plen ulong to int
+r = ext4_ro_load_inode 2
+if ne r E4_OK
+ret r
+end
+p = ulong 0
+while lt p plen bound 512
+while lt p plen bound 512
+if ne get e4_path p 47
+break
+end
+p = add p 1
+end
+if ge p plen
+break
+end
+clen = ulong 0
+while lt p plen bound 256
+ch = get e4_path p
+if eq ch 47
+break
+end
+if ge clen 255
+ret E4_E_NOENT
+end
+put e4_comp clen ch
+clen = add clen 1
+p = add p 1
+end
+nxt = e4_dir_find clen
+if lt nxt 0
+ret int nxt
+end
+if eq nxt 0
+ret E4_E_NOENT
+end
+r = ext4_ro_load_inode ulong nxt
+if ne r E4_OK
+ret r
+end
+end
+ret E4_OK
+end
+
+fn e4_emit_zeros done ulong take ulong hash_on ulong to void
+k = ulong 0
+while lt k take bound 4096
+ext4_sink add done k 0
+if ne hash_on 0
+s256_byte 0
+end
+k = add k 1
+end
+end
+
+fn e4_emit_blk done ulong boff ulong take ulong hash_on ulong to void
+k = ulong 0
+while lt k take bound 4096
+bv = get e4_blk add boff k
+ext4_sink add done k bv
+if ne hash_on 0
+s256_byte bv
+end
+k = add k 1
+end
+end
+
+note Stream [file_off .. file_off+nbytes) of current inode through ext4_sink and SHA-256.
+note Fails closed if not mounted or current inode is not a regular file (S_IFREG = 0x8000).
+fn ext4_ro_stream file_off ulong nbytes ulong hash_on ulong to int
+if eq get e4_sb 0 0
+ret E4_E_MAGIC
+end
+if ne and get e4_ino 1 61440 32768
+ret E4_E_INO
+end
+fsize = get e4_ino 2
+if or gt file_off fsize gt nbytes sub fsize file_off
+ret E4_E_RANGE
+end
+if ne hash_on 0
+s256_init
+end
+bs = get e4_sb 3
+done = ulong 0
+while lt done nbytes bound 9223372036854775807
+pos = add file_off done
+boff = rem pos bs
+take = sub bs boff
+if gt take sub nbytes done
+take = sub nbytes done
+end
+r = ext4_ro_map_block div pos bs
+if ne r E4_OK
+ret r
+end
+if ne get e4_map 1 0
+e4_emit_zeros done take hash_on
+else
+r = e4_read_fs_block get e4_map 0
+if ne r E4_OK
+ret r
+end
+e4_emit_blk done boff take hash_on
+end
+done = add done take
+end
+if ne hash_on 0
+s256_fin
+end
+ret E4_OK
+end
+
+fn ext4_ro_verify_sha to int
+for i ulong 32
+if ne get s2_out i get e4_want_sha i
+ret E4_E_SHA
+end
+end
+ret E4_OK
+end
+
+fn bundle_check_overlap i ulong off ulong sz ulong to int
+j = ulong 0
+while lt j i bound 8
+po = get e4_bnd_off j
+ps = get e4_bnd_size j
+if lt off add po ps
+if lt po add off sz
+ret E4_E_TOC
+end
+end
+j = add j 1
+end
+ret E4_OK
+end
+
+fn bundle_parse_entry i ulong bundle_len ulong to int
+eo = add 32 mul i 64
+off = e4_u64_toc add eo 8
+sz = e4_u64_toc add eo 16
+if or eq sz 0 or lt off 4096 ne and off 4095 0
+ret E4_E_TOC
+end
+if or gt off bundle_len gt sz sub bundle_len off
+ret E4_E_TOC
+end
+r = bundle_check_overlap i off sz
+if ne r E4_OK
+ret r
+end
+put e4_bnd_kind i e4_u32_toc eo
+put e4_bnd_off i off
+put e4_bnd_size i sz
+for s ulong 32
+put e4_bnd_sha add mul i 32 s get e4_toc add add eo 32 s
+end
+ret E4_OK
+end
+
+note Parse 4 KiB OMFWBND1 GspFwBundle TOC from e4_toc[0..4096).
+note Header: "OMFWBND1" (8B), version=1 (u32), app_version (u32), num_entries (u32, 1..8), reserved (u32).
+note Entries at +32 + i*64: kind(u32), flags(u32), offset(u64), size(u64), pad(u64), sha256(32B).
+fn bundle_parse_toc bundle_len ulong to int
+for z ulong 4
+put e4_bnd_meta z 0
+end
+if lt bundle_len 4096
+ret E4_E_TOC
+end
+if or ne get e4_toc 0 79 ne get e4_toc 1 77
+ret E4_E_TOC
+end
+if or ne get e4_toc 2 70 ne get e4_toc 3 87
+ret E4_E_TOC
+end
+if or ne get e4_toc 4 66 ne get e4_toc 5 78
+ret E4_E_TOC
+end
+if or ne get e4_toc 6 68 ne get e4_toc 7 49
+ret E4_E_TOC
+end
+if ne e4_u32_toc 8 1
+ret E4_E_TOC
+end
+nent = e4_u32_toc 16
+if or eq nent 0 gt nent 8
+ret E4_E_TOC
+end
+i = ulong 0
+while lt i nent bound 8
+r = bundle_parse_entry i bundle_len
+if ne r E4_OK
+ret r
+end
+i = add i 1
+end
+put e4_bnd_meta 0 1
+put e4_bnd_meta 1 e4_u32_toc 12
+put e4_bnd_meta 2 nent
+ret E4_OK
+end
+
+fn ext4_ro_file_size to ulong
+ret get e4_ino 2
+end
+
+note Contiguous extent-run helper for Phase 3 128 KiB nvme_read_direct bursts:
+note Maps lblock and exposes (e4_map[0]=phys_blk, e4_map[1]=is_hole, e4_map[2]=run_blks).
+fn ext4_ro_map_extent lblock ulong to int
+ret ext4_ro_map_block lblock
+end
+
+fn ext4_ro_run_blks to ulong
+ret get e4_map 2
+end

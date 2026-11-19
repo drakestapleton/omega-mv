@@ -1,0 +1,212 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/rtl8127/om/rtl8127/test/test_tcp_glue.om: End-to-end host test for
+note rtl8127.om + model.om + tcp.om + tcp_glue.om.
+note Verifies:
+note   1. RTL8127 init + MAC binding into tcp.om.
+note   2. ARP request injected on RTL8127 RX ring -> ARP reply transmitted on TX ring.
+note   3. Full TCP 3-way handshake (SYN -> SYN-ACK -> ACK), payload receive ("HELLO-SPARK-27B"),
+note      and payload transmit ("ACK-TOKEN-42") over the RTL8127 chip model.
+
+global pfr uchar 2048
+global tmsg uchar 32
+
+text M_IN "HELLO-SPARK-27B"
+text M_OUT "ACK-TOKEN-42"
+
+fn pw16 o ulong v ulong to void
+put pfr o uchar and shr v 8 255
+put pfr add o 1 uchar and v 255
+end
+
+fn pw32 o ulong v ulong to void
+pw16 o and shr v 16 65535
+pw16 add o 2 and v 65535
+end
+
+fn psum o ulong n ulong to ulong
+s = ulong 0
+i = ulong 0
+while lt add i 1 n bound 1024
+w = add shl ulong get pfr add o i 8 ulong get pfr add o add i 1
+s = add s w
+i = add i 2
+end
+if ne rem n 2 0
+s = add s shl ulong get pfr add o sub n 1 8
+end
+while gt s 65535 bound 16
+s = add and s 65535 shr s 16
+end
+ret and not s 65535
+end
+
+note Inject pfr[0..n) into RTL8127 model RX ring (model.om mrxin).
+fn inject_rx n ulong to void
+i = ulong 0
+while lt i n bound 2048
+put mrxf i get pfr i
+i = add i 1
+end
+z = mrxin n 0 0
+if ne z 0
+exit 88
+end
+end
+
+fn tcp_csum tcplen ulong to ulong
+ps = ulong 0
+ps = add ps add shr ulong 3232235786 16 and ulong 3232235786 65535
+ps = add ps add shr ulong 3232235884 16 and ulong 3232235884 65535
+ps = add ps add 6 tcplen
+j = ulong 0
+while lt add j 1 tcplen bound 1024
+w = add shl ulong get pfr add 34 j 8 ulong get pfr add 34 add j 1
+ps = add ps w
+j = add j 2
+end
+if ne rem tcplen 2 0
+ps = add ps shl ulong get pfr add 34 sub tcplen 1 8
+end
+while gt ps 65535 bound 16
+ps = add and ps 65535 shr ps 16
+end
+ret and not ps 65535
+end
+
+note Build Ethernet II + IPv4 + TCP frame from peer 192.168.1.10:50000 -> Spark 192.168.1.108:9000.
+fn send_peer_tcp seq ulong ack ulong flags ulong plen ulong to void
+for i ulong 6
+put pfr i get Tmac i
+end
+put pfr 6 2
+put pfr 7 0
+put pfr 8 0
+put pfr 9 0
+put pfr 10 0
+put pfr 11 5
+pw16 12 2048
+put pfr 14 69
+put pfr 15 0
+pw16 16 add 40 plen
+pw16 18 1
+pw16 20 16384
+put pfr 22 64
+put pfr 23 6
+pw16 24 0
+pw32 26 3232235786
+pw32 30 3232235884
+pw16 24 psum 14 20
+pw16 34 50000
+pw16 36 9000
+pw32 38 seq
+pw32 42 ack
+put pfr 46 80
+put pfr 47 uchar flags
+pw16 48 65535
+pw16 50 0
+pw16 52 0
+if gt plen 0
+for k ulong plen
+put pfr add 54 k get M_IN k
+end
+end
+pw16 50 tcp_csum add 20 plen
+inject_rx add 54 plen
+end
+
+fn main to int
+note 1. Init RTL8127 chip model with dma=4096
+mchip 4096
+if ne rtlinit 4096 0
+ret 10
+end
+rtltcp_bind_mac
+note Configure tcp.om: own=192.168.1.108, gw=192.168.1.1, mask=255.255.255.0
+tinit
+put Tcf 1 3232235884
+put Tcf 2 3232235777
+put Tcf 3 4294967040
+put Tcf 5 12345
+tlisten 9000
+
+note 2. Inject ARP request for 192.168.1.108 -> expect ARP reply on RTL8127 TX wire
+for i ulong 6
+put pfr i 255
+end
+put pfr 6 2
+put pfr 7 0
+put pfr 8 0
+put pfr 9 0
+put pfr 10 0
+put pfr 11 5
+pw16 12 2054
+pw16 14 1
+pw16 16 2048
+put pfr 18 6
+put pfr 19 4
+pw16 20 1
+put pfr 22 2
+put pfr 23 0
+put pfr 24 0
+put pfr 25 0
+put pfr 26 0
+put pfr 27 5
+pw32 28 3232235786
+for z ulong 6
+put pfr add 32 z 0
+end
+pw32 38 3232235884
+inject_rx 42
+rxn = rtltcp_poll 100
+if or ne rxn 1 eq get rtg_st 0 0
+ret 11
+end
+
+note 3. TCP SYN -> SYN-ACK
+tx_before = get rtg_st 0
+send_peer_tcp 1000 0 2 0
+rxn = rtltcp_poll 110
+if or ne rxn 1 le get rtg_st 0 tx_before
+ret 12
+end
+if ne get Tcb kST 3
+ret 13
+end
+
+note 4. TCP ACK -> ESTABLISHED
+iss = get Tcb kISS
+send_peer_tcp 1001 add iss 1 16 0
+rxn = rtltcp_poll 120
+if ne get Tcb kST 4
+ret 14
+end
+
+note 5. Receive "HELLO-SPARK-27B" from peer -> verify exact bytes via tread
+send_peer_tcp 1001 add iss 1 24 len M_IN
+rxn = rtltcp_poll 130
+got = tread 64
+if ne got len M_IN
+ret 15
+end
+for c ulong len M_IN
+if ne get Tapp c get M_IN c
+ret 16
+end
+end
+
+note 6. Transmit "ACK-TOKEN-42" back via twrite + rtltcp_poll -> verify TX frame sent on RTL8127
+tx_before2 = get rtg_st 0
+for c2 ulong len M_OUT
+put Tapp c2 get M_OUT c2
+end
+w = twrite len M_OUT
+if ne w len M_OUT
+ret 17
+end
+rxn = rtltcp_poll 140
+if le get rtg_st 0 tx_before2
+ret 18
+end
+
+ret 0
+end
