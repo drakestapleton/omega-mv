@@ -37,12 +37,18 @@
 #define ROOT_BYTES 512
 #define ROOT_SUM   480
 #define ROOT_AUTH_GEN_HI 432   /* after the excluded ids, before the sum */
+#define ROOT_WORK_LEN 436
+#define ROOT_WORK_DIGEST 444
+#define ROOT_WORK_COUNT 476
 #define PTR_BYTES  128
 #define PTR_SUM    96
 #define JRN_BYTES  128
 #define JRN_SUM    96
 #define RCT_BYTES  256
 #define RCT_SUM    224
+#define WORK_HEADER_BYTES 16u
+#define WORK_ROW_BYTES    80u
+#define WORK_BLOB_BYTES   (WORK_HEADER_BYTES + RX_GEN_MAX_WORK * WORK_ROW_BYTES)
 #define MAX_BLOB   65536u
 #define MAX_CAND   4
 
@@ -78,6 +84,9 @@ typedef struct {
     uint8_t digest[DIG_COUNT][32];
     uint64_t external_ids[RX_GEN_MAX_EXTERNAL];
     uint64_t excluded_ids[RX_GEN_MAX_EXCLUDED];
+    uint64_t work_len;
+    uint8_t work_digest[32];
+    uint32_t n_work;
 } RootView;
 
 typedef struct {
@@ -260,6 +269,38 @@ static Candidate *find_cand(RxGenStore *store, uint64_t id) {
     return NULL;
 }
 
+static uint64_t work_resource_value(const RxGenStore *store, const Candidate *c,
+                                    uint64_t work_id) {
+    static const uint8_t domain[] = "omega.rx.generation.work.finish.v1";
+    uint8_t ids[24], digest[32];
+    put_u64(ids, c->parent_id);
+    put_u64(ids + 8, c->id);
+    put_u64(ids + 16, work_id);
+    /* Length-prefix the directory. A raw concatenation aliases a longer path
+     * with a shorter path whose next hashed bytes continue it. */
+    uint64_t dir_len = strlen(store->dir);
+    uint8_t dir_len_le[8];
+    put_u64(dir_len_le, dir_len);
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, domain, sizeof domain - 1);
+    sha256_update(&ctx, dir_len_le, sizeof dir_len_le);
+    sha256_update(&ctx, (const uint8_t *)store->dir, (size_t)dir_len);
+    sha256_update(&ctx, ids, sizeof ids);
+    sha256_final(&ctx, digest);
+    uint64_t resource = get_u64(digest);
+    return resource ? resource : UINT64_MAX;
+}
+
+int rx_gen_work_resource(const RxGenStore *store, uint64_t candidate, uint64_t work_id,
+                         uint64_t *out_resource) {
+    if (!store || !out_resource) return RX_GEN_ERR_ARG;
+    Candidate *c = find_cand((RxGenStore *)store, candidate);
+    if (!c) return RX_GEN_ERR_ARG;
+    *out_resource = work_resource_value(store, c, work_id);
+    return RX_GEN_OK;
+}
+
 static int copy_blob(uint8_t **dst, size_t *dst_n, const uint8_t *src, size_t n) {
     if (n > MAX_BLOB) return RX_GEN_ERR_ARG;
     uint8_t *p = NULL;
@@ -276,7 +317,7 @@ static int copy_blob(uint8_t **dst, size_t *dst_n, const uint8_t *src, size_t n)
 
 static void encode_root(const RootView *v, uint8_t out[ROOT_BYTES]) {
     memset(out, 0, ROOT_BYTES);
-    memcpy(out, "R9ROOT2", 7);
+    memcpy(out, "R9ROOT3", 7);
     put_u64(out + 8, v->id);
     put_u64(out + 16, v->parent);
     put_u64(out + 24, v->lineage);
@@ -295,13 +336,17 @@ static void encode_root(const RootView *v, uint8_t out[ROOT_BYTES]) {
     for (uint32_t i = 0; i < v->n_excluded && i < RX_GEN_MAX_EXCLUDED; i++)
         put_u64(out + 368 + (size_t)i * 8, v->excluded_ids[i]);
     put_u32(out + ROOT_AUTH_GEN_HI, (uint32_t)(v->authority_generation >> 32));
+    put_u64(out + ROOT_WORK_LEN, v->work_len);
+    memcpy(out + ROOT_WORK_DIGEST, v->work_digest, sizeof v->work_digest);
+    put_u32(out + ROOT_WORK_COUNT, v->n_work);
     checksum(out, ROOT_SUM, out + ROOT_SUM);
 }
 
 static int decode_root(const uint8_t in[ROOT_BYTES], RootView *v) {
-    /* Version 2 keeps the high half of the 64-bit authority generation at
-     * ROOT_AUTH_GEN_HI. Version 1 had none; its high half reads as zero. */
-    int v2 = memcmp(in, "R9ROOT2", 7) == 0;
+    /* Version 2 keeps the high half of the 64-bit authority generation;
+     * version 3 also commits the durable work-completion provenance. */
+    int v3 = memcmp(in, "R9ROOT3", 7) == 0;
+    int v2 = v3 || memcmp(in, "R9ROOT2", 7) == 0;
     if (!v2 && memcmp(in, "R9ROOT1", 7) != 0) return RX_GEN_ERR_TORN;
     uint8_t sum[32];
     checksum(in, ROOT_SUM, sum);
@@ -327,6 +372,14 @@ static int decode_root(const uint8_t in[ROOT_BYTES], RootView *v) {
         v->external_ids[i] = get_u64(in + 304 + (size_t)i * 8);
     for (uint32_t i = 0; i < v->n_excluded; i++)
         v->excluded_ids[i] = get_u64(in + 368 + (size_t)i * 8);
+    if (v3) {
+        v->work_len = get_u64(in + ROOT_WORK_LEN);
+        memcpy(v->work_digest, in + ROOT_WORK_DIGEST, sizeof v->work_digest);
+        v->n_work = get_u32(in + ROOT_WORK_COUNT);
+        if (v->n_work > RX_GEN_MAX_WORK ||
+            v->work_len != WORK_HEADER_BYTES + (uint64_t)v->n_work * WORK_ROW_BYTES)
+            return RX_GEN_ERR_TORN;
+    }
     return RX_GEN_OK;
 }
 
@@ -468,6 +521,11 @@ static int root_reachable(const char *dir, const RootView *view) {
         int rc = file_matches(path, view->digest[i], view->lengths[i]);
         if (rc != RX_GEN_OK) return rc;
     }
+    if (view->work_len) {
+        if (path_join(path, sizeof path, folder, "work") != 0) return RX_GEN_ERR_IO;
+        int rc = file_matches(path, view->work_digest, view->work_len);
+        if (rc != RX_GEN_OK) return rc;
+    }
     return RX_GEN_OK;
 }
 
@@ -544,7 +602,7 @@ static int write_receipt_file(RxGenStore *store, const RootView *view, uint32_t 
                               uint32_t cap_id, uint64_t cap_gen) {
     uint8_t raw[RCT_BYTES];
     memset(raw, 0, sizeof raw);
-    memcpy(raw, "R9RCT02", 7);
+    memcpy(raw, "R9RCT03", 7);
     put_u64(raw + 8, view->id);
     put_u64(raw + 16, view->lineage);
     put_u64(raw + 24, view->parent);
@@ -560,6 +618,9 @@ static int write_receipt_file(RxGenStore *store, const RootView *view, uint32_t 
     put_u32(raw + 68, cap_id);
     put_u32(raw + 72, (uint32_t)cap_gen);
     put_u32(raw + 76, (uint32_t)(cap_gen >> 32));
+    put_u64(raw + 80, view->work_len);
+    memcpy(raw + 88, view->work_digest, sizeof view->work_digest);
+    put_u32(raw + 120, view->n_work);
     checksum(raw, RCT_SUM, raw + RCT_SUM);
     if (path_join(path, sizeof path, folder, "receipt") != 0) return RX_GEN_ERR_IO;
     return commit_file(store, path, raw, sizeof raw, RX_CRASH_NONE);
@@ -599,6 +660,31 @@ static int objects_bytes(const Candidate *c, uint8_t **out, size_t *out_n) {
 
 static void hash_buf(const uint8_t *p, size_t n, uint8_t out[32]) {
     sha256_hash(p ? p : (const uint8_t *)"", n, out);
+}
+
+/* R9WORK1 is a root-committed audit record. Every row is fixed-width LE:
+ * id, class, state, required, worker, cap id, completer, cap generation,
+ * scoped finish resource, and the evidence digest observed at completion. */
+static size_t encode_work(const Candidate *c, uint8_t out[WORK_BLOB_BYTES]) {
+    memset(out, 0, WORK_BLOB_BYTES);
+    memcpy(out, "R9WORK1", 7);
+    put_u32(out + 8, c->n_work);
+    put_u32(out + 12, WORK_ROW_BYTES);
+    for (uint32_t i = 0; i < c->n_work; i++) {
+        const RxGenWork *w = &c->work[i];
+        uint8_t *row = out + WORK_HEADER_BYTES + (size_t)i * WORK_ROW_BYTES;
+        put_u64(row, w->id);
+        put_u32(row + 8, w->class);
+        put_u32(row + 12, w->state);
+        put_u32(row + 16, (uint32_t)w->required);
+        put_u32(row + 20, w->worker);
+        put_u32(row + 24, w->finish_cap_id);
+        put_u32(row + 28, w->completer);
+        put_u64(row + 32, w->finish_cap_generation);
+        put_u64(row + 40, w->finish_resource);
+        memcpy(row + 48, w->evidence_digest, sizeof w->evidence_digest);
+    }
+    return WORK_HEADER_BYTES + (size_t)c->n_work * WORK_ROW_BYTES;
 }
 
 static int release_lock(RxGenStore *store) {
@@ -664,6 +750,15 @@ static int install_genesis(RxGenStore *store) {
         view.lengths[i] = lens[i];
         hash_buf(blobs[i], lens[i], view.digest[i]);
     }
+    Candidate empty;
+    uint8_t work[WORK_BLOB_BYTES];
+    memset(&empty, 0, sizeof empty);
+    view.work_len = encode_work(&empty, work);
+    view.n_work = 0;
+    hash_buf(work, (size_t)view.work_len, view.work_digest);
+    if (write_named_blob(store, folder, "work", work, (size_t)view.work_len, RX_CRASH_NONE) !=
+        RX_GEN_OK)
+        return RX_GEN_ERR_IO;
     uint8_t root[ROOT_BYTES];
     encode_root(&view, root);
     char root_path[512];
@@ -770,27 +865,31 @@ int rx_gen_read_blob(const RxGenStore *store, uint64_t id, const char *name, uin
     int which = -1;
     for (int i = 0; i < DIG_COUNT; i++)
         if (strcmp(name, BLOB_NAME[i]) == 0) which = i;
-    if (which < 0) return RX_GEN_ERR_ARG;
+    int work = strcmp(name, "work") == 0;
+    if (which < 0 && !work) return RX_GEN_ERR_ARG;
     RootView view;
     uint8_t root_digest[32];
     int rc = load_root_file(store->dir, id, &view, root_digest);
     if (rc != RX_GEN_OK) return rc;
     if (view.id != id) return RX_GEN_ERR_TORN;
-    if (view.lengths[which] > cap) return RX_GEN_ERR_ARG;
+    uint64_t length = work ? view.work_len : view.lengths[which];
+    const uint8_t *digest = work ? view.work_digest : view.digest[which];
+    const char *stored_name = work ? "work" : BLOB_NAME[which];
+    if (length > cap) return RX_GEN_ERR_ARG;
     char folder[512], path[512];
-    /* BLOB_NAME[which], not the caller's string: the name opened is the table's, never the input's */
+    /* stored_name comes from a fixed table/literal, never from the input. */
     if (gen_dir(store->dir, id, folder, sizeof folder) != 0 ||
-        path_join(path, sizeof path, folder, BLOB_NAME[which]) != 0) return RX_GEN_ERR_IO;
-    rc = file_matches(path, view.digest[which], view.lengths[which]);
+        path_join(path, sizeof path, folder, stored_name) != 0) return RX_GEN_ERR_IO;
+    rc = file_matches(path, digest, length);
     if (rc != RX_GEN_OK) return rc;
-    if (view.lengths[which] && read_full(path, buf, (size_t)view.lengths[which]) != 0)
+    if (length && read_full(path, buf, (size_t)length) != 0)
         return RX_GEN_ERR_IO;
     /* The bytes read must be the bytes the root names, not whatever the file
      * became after the check above. */
     uint8_t got[32];
-    hash_buf(buf, (size_t)view.lengths[which], got);
-    if (memcmp(got, view.digest[which], 32) != 0) return RX_GEN_ERR_TORN;
-    *out_len = (size_t)view.lengths[which];
+    hash_buf(buf, (size_t)length, got);
+    if (memcmp(got, digest, 32) != 0) return RX_GEN_ERR_TORN;
+    *out_len = (size_t)length;
     return RX_GEN_OK;
 }
 
@@ -948,7 +1047,31 @@ int rx_gen_add_work_as(RxGenStore *store, uint32_t subject, const RxCallerCred *
      * marks it done, and only classify cancels it. */
     int starts_open = work->state == RX_WORK_PENDING || work->state == RX_WORK_ISSUED;
     if (!starts_open) return RX_GEN_ERR_ARG;
-    c->work[c->n_work++] = *work;
+    for (uint32_t i = 0; i < c->n_work; i++)
+        if (c->work[i].id == work->id) return RX_GEN_ERR_ARG;
+    RxGenWork accepted = *work;
+    accepted.completer = 0;
+    memset(accepted.evidence_digest, 0, sizeof accepted.evidence_digest);
+    accepted.finish_resource = 0;
+    if (store_bound(store)) {
+        /* Candidate ownership authorizes assignment; it does not let an
+         * arbitrary enrolled subject manufacture work for someone else's
+         * candidate. worker_set marks the proposer's explicit delegate. */
+        if (subject != c->proposer) return RX_GEN_ERR_AUTHORITY;
+        accepted.worker = work->worker_set ? work->worker : c->proposer;
+        accepted.worker_set = 1;
+        accepted.finish_resource = work_resource_value(store, c, work->id);
+        int arc = store->bound_auth(store->bound_auth_ctx, work->finish_cap_id,
+                                    work->finish_cap_generation, accepted.worker,
+                                    accepted.finish_resource, RX_GEN_RIGHT_FINISH);
+        if (arc != 0) return RX_GEN_ERR_AUTHORITY;
+    } else {
+        accepted.worker = 0;
+        accepted.worker_set = 0;
+        accepted.finish_cap_id = 0;
+        accepted.finish_cap_generation = 0;
+    }
+    c->work[c->n_work++] = accepted;
     return RX_GEN_OK;
 }
 
@@ -968,7 +1091,20 @@ int rx_gen_finish_work_as(RxGenStore *store, uint32_t subject, const RxCallerCre
     if (!c) return RX_GEN_ERR_ARG;
     for (uint32_t i = 0; i < c->n_work; i++) {
         if (c->work[i].id == work_id) {
-            c->work[i].state = RX_WORK_DONE;
+            RxGenWork *work = &c->work[i];
+            if (store_bound(store)) {
+                uint64_t resource = work_resource_value(store, c, work_id);
+                if (work->worker != subject || work->finish_resource != resource)
+                    return RX_GEN_ERR_AUTHORITY;
+                int arc = store->bound_auth(store->bound_auth_ctx, work->finish_cap_id,
+                                            work->finish_cap_generation, subject, resource,
+                                            RX_GEN_RIGHT_FINISH);
+                if (arc != 0) return RX_GEN_ERR_AUTHORITY;
+            }
+            work->state = RX_WORK_DONE;
+            work->completer = subject;
+            hash_buf(c->blob[DIG_EVIDENCE], c->blob_len[DIG_EVIDENCE],
+                     work->evidence_digest);
             return RX_GEN_OK;
         }
     }
@@ -1022,9 +1158,14 @@ static int classify(RxGenStore *store, Candidate *c, RxGenDrainFn drain, void *d
                     return RX_GEN_ERR_VERIFY;
                 }
                 excluded[(*n_excluded)++] = w->id;
-            } else if (c->blob_len[DIG_EVIDENCE] == 0) {
-                c->draining = 0;
-                return RX_GEN_ERR_VERIFY;
+            } else {
+                uint8_t evidence_digest[32];
+                hash_buf(c->blob[DIG_EVIDENCE], c->blob_len[DIG_EVIDENCE], evidence_digest);
+                if (c->blob_len[DIG_EVIDENCE] == 0 ||
+                    memcmp(evidence_digest, w->evidence_digest, sizeof evidence_digest) != 0) {
+                    c->draining = 0;
+                    return RX_GEN_ERR_VERIFY;
+                }
             }
             continue;
         }
@@ -1164,6 +1305,12 @@ int rx_gen_promote(RxGenStore *store, const RxPromotionRequest *request, RxGenAu
         view.lengths[i] = c->blob_len[i];
         hash_buf(c->blob[i], c->blob_len[i], view.digest[i]);
     }
+    uint8_t work[WORK_BLOB_BYTES];
+    view.work_len = encode_work(c, work);
+    view.n_work = c->n_work;
+    hash_buf(work, (size_t)view.work_len, view.work_digest);
+    rc = write_named_blob(store, folder, "work", work, (size_t)view.work_len, RX_CRASH_NONE);
+    if (rc != RX_GEN_OK) goto done;
     store->phases.blobs_ns = monotonic_ns();
     uint8_t root[ROOT_BYTES];
     encode_root(&view, root);
