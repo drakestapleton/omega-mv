@@ -58,6 +58,8 @@ const WL_S_STEPTMO ulong 22
 const WL_S_TXH ulong 23
 const WL_S_TXN ulong 24
 const WL_S_DROPS ulong 25
+const WL_S_HASFIRST ulong 26
+const WL_S_CURMODE ulong 27
 
 const WL_DEFPORT ulong 18100
 const WL_DEFCTX ulong 262144
@@ -336,12 +338,15 @@ end
 put wl_st WL_S_REQID req_id
 put wl_st WL_S_PFIDX 0
 put wl_st WL_S_PFCNT ntok
+put wl_st WL_S_HASFIRST 0
 put wl_st WL_S_OP WL_OPPREF
 put wl_st WL_S_CANCEL 0
 put wl_st WL_S_STATE WL_SUBMIT
 end
 
 note Handle DECODE (op=5): bounds, temp==0 check, overflow-safe MAX_CTX check.
+note If final PREFILL already computed the first predicted token (WL_S_HASFIRST == 1),
+note emit it immediately as TOKEN(seq=0) before stepping CURTOK at kv_pos.
 fn wl_do_decode req_id ulong to void
 st = get wl_st WL_S_STATE
 if eq st WL_FAULT
@@ -368,17 +373,42 @@ wl_send_err req_id OMK_EBADTOK eos
 ret
 end
 kv = get wl_st WL_S_KVPOS
+hasf = get wl_st WL_S_HASFIRST
+if eq hasf 0
 if ge kv get wl_st WL_S_MAXCTX
 wl_send_err req_id OMK_ERANGE kv
 ret
 end
+end
 put wl_st WL_S_REQID req_id
-put wl_st WL_S_DCSEQ 0
 put wl_st WL_S_DCMAX mtok
 put wl_st WL_S_DCEOS eos
+put wl_st WL_S_CANCEL 0
+if ne hasf 0
+otok = get wl_st WL_S_LASTTOK
+put wl_st WL_S_HASFIRST 0
+put wl_st WL_S_CURTOK otok
+tflg = ulong 0
+if eq otok eos
+tflg = OMK_FEOS
+end
+wl_send_tok req_id tflg 0 otok
+if eq otok eos
+wl_send_done req_id OMK_FEOS kv OMK_REOS
+ret
+end
+if or le mtok 1 ge kv get wl_st WL_S_MAXCTX
+wl_send_done req_id 0 kv OMK_RMAX
+ret
+end
+put wl_st WL_S_DCSEQ 1
+put wl_st WL_S_OP WL_OPDEC
+put wl_st WL_S_STATE WL_SUBMIT
+ret
+end
+put wl_st WL_S_DCSEQ 0
 put wl_st WL_S_CURTOK get wl_st WL_S_LASTTOK
 put wl_st WL_S_OP WL_OPDEC
-put wl_st WL_S_CANCEL 0
 put wl_st WL_S_STATE WL_SUBMIT
 end
 
@@ -497,13 +527,20 @@ end
 end
 pbw = long 0
 if eq op WL_OPRESET
+put wl_st WL_S_CURMODE 0
 pbw = wl_q38_reset_kv 0
 else
 if eq op WL_OPPREF
 idx = get wl_st WL_S_PFIDX
+cnt = get wl_st WL_S_PFCNT
 tok = get wl_ptoks idx
 kv = get wl_st WL_S_KVPOS
-pbw = wl_q38_stage_step tok uint kv 0
+md = uchar 0
+if eq add idx 1 cnt
+md = uchar 1
+end
+put wl_st WL_S_CURMODE ulong md
+pbw = wl_q38_stage_step tok uint kv md
 else
 if eq op WL_OPDEC
 kv = get wl_st WL_S_KVPOS
@@ -514,6 +551,7 @@ put wl_st WL_S_OP WL_OPNONE
 ret
 end
 tok = uint get wl_st WL_S_CURTOK
+put wl_st WL_S_CURMODE 1
 pbw = wl_q38_stage_step tok uint kv 1
 end
 end
@@ -534,6 +572,8 @@ put wl_st WL_S_STATE WL_WAIT
 end
 
 note Handle completed prefill or decode step after semaphore retirement.
+note For mode=0 (non-final PREFILL), Piece 5 poisons out_tok_pa=0xFFFFFFFF and skips lm_head,
+note so run dsb ish + q38_verify_step but skip wl_q38_read_tok.
 fn wl_finish_step req ulong op ulong to void
 wl_dsb_ish
 vrc = wl_q38_verify_step
@@ -541,18 +581,23 @@ if ne vrc 0
 wl_fault req OMK_EGVER wl_err_u32 vrc
 ret
 end
+kv = add get wl_st WL_S_KVPOS 1
+put wl_st WL_S_KVPOS kv
+md = get wl_st WL_S_CURMODE
+if eq op WL_OPPREF
+if ne md 0
 otok = ulong wl_q38_read_tok
 if ge otok get wl_st WL_S_VOCAB
 wl_fault req OMK_EGVER otok
 ret
 end
-kv = add get wl_st WL_S_KVPOS 1
-put wl_st WL_S_KVPOS kv
 put wl_st WL_S_LASTTOK otok
-if eq op WL_OPPREF
+put wl_st WL_S_HASFIRST 1
+end
 idx = add get wl_st WL_S_PFIDX 1
 put wl_st WL_S_PFIDX idx
 if ne get wl_st WL_S_CANCEL 0
+put wl_st WL_S_HASFIRST 0
 wl_send_done req 0 kv OMK_RCANCEL
 put wl_st WL_S_STATE WL_IDLE
 put wl_st WL_S_OP WL_OPNONE
@@ -568,6 +613,12 @@ end
 put wl_st WL_S_STATE WL_SUBMIT
 ret
 end
+otok = ulong wl_q38_read_tok
+if ge otok get wl_st WL_S_VOCAB
+wl_fault req OMK_EGVER otok
+ret
+end
+put wl_st WL_S_LASTTOK otok
 seq = get wl_st WL_S_DCSEQ
 eos = get wl_st WL_S_DCEOS
 tflg = ulong 0
@@ -628,6 +679,7 @@ op = get wl_st WL_S_OP
 if eq op WL_OPRESET
 put wl_st WL_S_KVPOS 0
 put wl_st WL_S_LASTTOK 0
+put wl_st WL_S_HASFIRST 0
 wl_send_done req 0 0 OMK_RRESET
 put wl_st WL_S_STATE WL_IDLE
 put wl_st WL_S_OP WL_OPNONE
