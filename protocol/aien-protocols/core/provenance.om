@@ -1,0 +1,183 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/aien-protocols/core/provenance.om: pure-Omega port of aien-provenance
+note Implements compute_sha256, combine_digests, GrantPermissions bitflags,
+note SourceGrant unsigned digest, license/permission/expiration verification, and verify_all.
+note Compose after si/directives/om2.om, om/tls/sha2.om, and protocol/aien-protocols/core/types.om.
+
+const PERM_READ uint 1
+const PERM_EVALUATE uint 2
+const PERM_TRAIN uint 4
+const PERM_DISTILL uint 8
+const PERM_REDISTRIBUTE uint 16
+const PERM_COMMERCIAL uint 32
+const PERM_ALL_MASK uint 63
+
+const PROV_OK ulong 0
+const PROV_ERR_PERM_DENIED ulong 1
+const PROV_ERR_BAD_LICENSE ulong 2
+const PROV_ERR_EXPIRED ulong 3
+const PROV_ERR_MISSING_SIG ulong 4
+const PROV_ERR_BAD_SIG_FMT ulong 5
+const PROV_ERR_SIG_FAILED ulong 6
+const PROV_ERR_BAD_PERMS ulong 7
+
+text prov_exp_present "exp:present"
+text prov_exp_none "exp:none"
+
+note --- SHA-256 wrappers (backed by om/tls/sha2.om) ---
+
+fn prov_compute_sha256 msg view uchar * dst edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx msg
+sha256_final ctx dst
+end
+
+fn prov_combine_digests d1 view uchar 32 d2 view uchar 32 dst edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx d1
+sha256_update ctx d2
+sha256_final ctx dst
+end
+
+note --- GrantPermissions bitflag operations ---
+
+fn perm_is_valid bits uint to bool
+extra = and bits not PERM_ALL_MASK
+ret eq extra uint 0
+end
+
+fn perm_contains granted uint required uint to bool
+ret eq and granted required required
+end
+
+note --- SourceGrant deterministic unsigned digest ---
+note Matches aien-provenance::SourceGrant::compute_unsigned_digest byte-for-byte:
+note   grant_id[16] || source_uri || license_spdx || perms_u32_le || issuer ||
+note   ("exp:present" || exp_u64_le  OR  "exp:none")
+
+fn grant_hash_header ctx edit ulong 40 gid view uchar 16 uri view uchar * to void
+sha256_init ctx
+sha256_update ctx gid
+sha256_update ctx uri
+end
+
+fn grant_hash_policy ctx edit ulong 40 lic view uchar * perms uint issuer view uchar * to void
+pb = new uchar 4 0
+w = pt_put_u32_le pb ulong 0 perms
+if ne w ulong 4
+trap 8
+end
+sha256_update ctx lic
+sha256_update ctx pb
+sha256_update ctx issuer
+end
+
+fn grant_hash_finish ctx edit ulong 40 has_exp bool exp_sec ulong dst edit uchar 32 to void
+eb = new uchar 8 0
+if has_exp
+sha256_update ctx prov_exp_present
+w = pt_put_u64_le eb ulong 0 exp_sec
+if ne w ulong 8
+trap 8
+end
+sha256_update ctx eb
+else
+sha256_update ctx prov_exp_none
+end
+sha256_final ctx dst
+end
+
+note --- SourceGrant verification rules ---
+
+fn grant_verify_permission granted uint required uint to ulong
+if not perm_is_valid granted
+ret PROV_ERR_BAD_PERMS
+end
+if not perm_is_valid required
+ret PROV_ERR_BAD_PERMS
+end
+if perm_contains granted required
+ret PROV_OK
+end
+ret PROV_ERR_PERM_DENIED
+end
+
+fn grant_verify_validity has_exp bool exp_sec ulong now_sec ulong to ulong
+if has_exp
+if gt now_sec exp_sec
+ret PROV_ERR_EXPIRED
+end
+end
+ret PROV_OK
+end
+
+note allowed_csv is a comma-separated list of SPDX identifiers, e.g. "Apache-2.0,MIT"
+fn grant_verify_license_csv lic view uchar * allowed_csv view uchar * to ulong
+nl = len lic
+nc = len allowed_csv
+if eq nl ulong 0
+ret PROV_ERR_BAD_LICENSE
+end
+if eq nc ulong 0
+ret PROV_ERR_BAD_LICENSE
+end
+if gt nc ulong 4096
+ret PROV_ERR_BAD_LICENSE
+end
+start = ulong 0
+i = ulong 0
+while le i nc bound 4097
+at_sep = false
+if eq i nc
+at_sep = true
+else
+if eq get allowed_csv i uchar 44
+at_sep = true
+end
+end
+if at_sep
+seg_len = sub i start
+if gt seg_len ulong 0
+if pt_slice_eq_ascii_ci lic part allowed_csv start seg_len
+ret PROV_OK
+end
+end
+start = add i ulong 1
+end
+i = add i ulong 1
+end
+ret PROV_ERR_BAD_LICENSE
+end
+
+fn grant_verify_sig_present has_sig bool sig_len ulong to ulong
+if not has_sig
+ret PROV_ERR_MISSING_SIG
+end
+if ne sig_len ulong 64
+ret PROV_ERR_BAD_SIG_FMT
+end
+ret PROV_OK
+end
+
+note Complete policy verification order matches Rust SourceGrant::verify_all:
+note 1) license  2) permissions  3) expiration  4) signature presence/format (when required)
+fn grant_verify_policy lic view uchar * allowed_csv view uchar * granted uint required uint to ulong
+rc = grant_verify_license_csv lic allowed_csv
+if ne rc PROV_OK
+ret rc
+end
+ret grant_verify_permission granted required
+end
+
+fn grant_verify_window has_exp bool exp_sec ulong now_sec ulong req_sig bool has_sig bool sig_len ulong to ulong
+rc = grant_verify_validity has_exp exp_sec now_sec
+if ne rc PROV_OK
+ret rc
+end
+if req_sig
+ret grant_verify_sig_present has_sig sig_len
+end
+ret PROV_OK
+end

@@ -1,0 +1,184 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/aien-protocols/core/action_event.om: pure-Omega port of aien-action-protocol,
+note aien-event-protocol, and aien-agent-state-abi execution/budget/containment invariants.
+note Compose after si/directives/om2.om, om/tls/sha2.om, types.om, and provenance.om.
+
+const AE_OK ulong 0
+const AE_ERR_CONTAINMENT_WEAK ulong 1
+const AE_ERR_CAP_EXPIRED ulong 2
+const AE_ERR_CAP_BAD_WINDOW ulong 3
+const AE_ERR_CAP_EMPTY ulong 4
+const AE_ERR_BAD_TRANSITION ulong 5
+const AE_ERR_BAD_STATUS ulong 6
+const AE_ERR_SEQ_REGRESS ulong 7
+const AE_ERR_BUDGET_TOKENS ulong 8
+const AE_ERR_BUDGET_COST ulong 9
+const AE_ERR_BUDGET_DURATION ulong 10
+const AE_ERR_BUDGET_SUBAGENTS ulong 11
+
+const SECCOMP_NONE ulong 0
+const SECCOMP_STRICT ulong 1
+const SECCOMP_PERMISSIVE ulong 2
+
+const EXEC_IDLE ulong 0
+const EXEC_RUNNING ulong 1
+const EXEC_SUSPENDED ulong 2
+const EXEC_AWAITING_APPROVAL ulong 3
+const EXEC_TERMINATED ulong 4
+
+note --- ContainmentState (strict default: isolated_network=true, read_only_fs=true, seccomp=strict) ---
+
+fn containment_is_strict iso_net bool ro_fs bool seccomp ulong subproc_cnt ulong to bool
+if not iso_net
+ret false
+end
+if not ro_fs
+ret false
+end
+if ne seccomp SECCOMP_STRICT
+ret false
+end
+ret eq subproc_cnt ulong 0
+end
+
+fn containment_require_strict iso_net bool ro_fs bool seccomp ulong subproc_cnt ulong to ulong
+if containment_is_strict iso_net ro_fs seccomp subproc_cnt
+ret AE_OK
+end
+ret AE_ERR_CONTAINMENT_WEAK
+end
+
+note --- CapabilityGrant validation ---
+
+fn cap_grant_check cap view uchar * scope view uchar * to ulong
+if eq len cap ulong 0
+ret AE_ERR_CAP_EMPTY
+end
+if eq len scope ulong 0
+ret AE_ERR_CAP_EMPTY
+end
+ret AE_OK
+end
+
+fn cap_grant_window_check granted_us ulong has_exp bool exp_us ulong now_us ulong to ulong
+if has_exp
+if lt exp_us granted_us
+ret AE_ERR_CAP_BAD_WINDOW
+end
+if gt now_us exp_us
+ret AE_ERR_CAP_EXPIRED
+end
+end
+ret AE_OK
+end
+
+note --- AgentExecutionStatus state-machine invariants ---
+note Valid transitions:
+note   Idle -> Running | Terminated
+note   Running -> Idle | Suspended | AwaitingApproval | Terminated
+note   Suspended -> Running | Terminated
+note   AwaitingApproval -> Running | Idle | Terminated
+note   Terminated -> (absorbing: no transitions allowed, not even to Terminated)
+
+fn exec_status_valid s ulong to bool
+ret le s EXEC_TERMINATED
+end
+
+fn exec_transition_check cur ulong nxt ulong to ulong
+if not exec_status_valid cur
+ret AE_ERR_BAD_STATUS
+end
+if not exec_status_valid nxt
+ret AE_ERR_BAD_STATUS
+end
+if eq cur EXEC_TERMINATED
+ret AE_ERR_BAD_TRANSITION
+end
+if eq cur EXEC_IDLE
+if or eq nxt EXEC_RUNNING eq nxt EXEC_TERMINATED
+ret AE_OK
+end
+ret AE_ERR_BAD_TRANSITION
+end
+if eq cur EXEC_RUNNING
+if or eq nxt EXEC_IDLE or eq nxt EXEC_SUSPENDED or eq nxt EXEC_AWAITING_APPROVAL eq nxt EXEC_TERMINATED
+ret AE_OK
+end
+ret AE_ERR_BAD_TRANSITION
+end
+if eq cur EXEC_SUSPENDED
+if or eq nxt EXEC_RUNNING eq nxt EXEC_TERMINATED
+ret AE_OK
+end
+ret AE_ERR_BAD_TRANSITION
+end
+if eq cur EXEC_AWAITING_APPROVAL
+if or eq nxt EXEC_RUNNING or eq nxt EXEC_IDLE eq nxt EXEC_TERMINATED
+ret AE_OK
+end
+ret AE_ERR_BAD_TRANSITION
+end
+ret AE_ERR_BAD_TRANSITION
+end
+
+note --- EventEnvelope sequence monotonicity & canonical digest ---
+
+fn event_seq_check prev_seq ulong next_seq ulong to ulong
+if le next_seq prev_seq
+ret AE_ERR_SEQ_REGRESS
+end
+ret AE_OK
+end
+
+fn event_hash_meta ctx edit ulong * eid view uchar 16 topic view uchar * to void
+sha256_init ctx
+sha256_update ctx eid
+sha256_update ctx topic
+end
+
+fn event_hash_body ctx edit ulong * producer view uchar * seq ulong ts_us ulong to void
+buf = new uchar 16 0
+w1 = pt_put_u64_le buf ulong 0 seq
+w2 = pt_put_u64_le buf ulong 8 ts_us
+if or ne w1 ulong 8 ne w2 ulong 16
+trap 8
+end
+sha256_update ctx producer
+sha256_update ctx buf
+end
+
+fn event_hash_finish ctx edit ulong * payload_dig view uchar 32 dst edit uchar 32 to void
+sha256_update ctx payload_dig
+sha256_final ctx dst
+end
+
+note --- ResourceBudget enforcement ---
+note A limit value of 0 means unbounded (None in Rust Option<u64>).
+
+fn budget_check_tokens used ulong max_lim ulong to ulong
+if and gt max_lim ulong 0 gt used max_lim
+ret AE_ERR_BUDGET_TOKENS
+end
+ret AE_OK
+end
+
+fn budget_check_cost used_micro_usd ulong max_lim ulong to ulong
+if and gt max_lim ulong 0 gt used_micro_usd max_lim
+ret AE_ERR_BUDGET_COST
+end
+ret AE_OK
+end
+
+fn budget_check_duration elapsed_s ulong max_lim ulong to ulong
+if and gt max_lim ulong 0 gt elapsed_s max_lim
+ret AE_ERR_BUDGET_DURATION
+end
+ret AE_OK
+end
+
+fn budget_check_subagents active ulong max_lim ulong to ulong
+if and gt max_lim ulong 0 gt active max_lim
+ret AE_ERR_BUDGET_SUBAGENTS
+end
+ret AE_OK
+end
