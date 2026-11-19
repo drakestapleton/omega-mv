@@ -33,7 +33,10 @@ text sq_okdma "SMMUQ_MAPPED_DMA_OK bytes="
 text sq_evt "SMMUQ_FAULT type=0x"
 text sq_esid " sid=0x"
 text sq_eaddr " addr=0x"
-text sq_pass "SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete\n"
+text sq_pass "SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete wb=ok cmdq_limit=ok\n"
+text sq_wbmock "SMMUQ_WB_MOCK_CCA0_REFUSED (test-only: stream CCA forced to 0)\n"
+text sq_wbok "SMMUQ_WB_DMA_OK frames_alloc WB page, IORT CCA=1, bytes="
+text sq_qlim "SMMUQ_CMDQ_LIMIT_OK refused=15th recovered=yes\n"
 text sq_fail "SMMU_QEMU_FAIL step="
 text sq_nl "\n"
 
@@ -319,6 +322,67 @@ end
 ret 0
 end
 
+note WB attribute check on memory that really is CPU Normal-WB (frames_alloc RAM, mapped WB by mmu.om):
+note (a) TEST-ONLY mock: force this stream's recorded CCA to 0 -> smmu_map_span_wb must refuse (SMMU_EATTR);
+note (b) real IORT CCA (QEMU virt RC reports CCA=1) -> WB map, edu device->RAM DMA lands, CPU reads it back.
+fn sq_wb_tests to ulong
+wb = frames_alloc 1 4096 SMMU_PA_40_LIMIT
+if eq wb 0
+ret 50
+end
+sh = long get sq_st 4
+slot = sub get sq_st 4 1
+cca = get smmu_str_cca slot
+put smmu_str_cca slot 0
+r = smmu_map_span_wb sh wb 4096
+put smmu_str_cca slot cca
+if ne r SMMU_EATTR
+ret 51
+end
+uart_puts sq_wbmock
+if ne cca 1
+ret 52
+end
+for z ulong 32
+arm64_mmio_w64 add wb mul z 8 SQ_SENT
+end
+if ne smmu_map_span_wb sh wb 4096 SMMU_OK
+ret 53
+end
+if not sq_edu_dma SQ_EDU_BUF wb 1
+ret 54
+end
+if not sq_same wb 0x0123456789abcdef SQ_DMA_LEN
+ret 55
+end
+uart_puts sq_wbok
+uart_putdec SQ_DMA_LEN
+uart_puts sq_nl
+ret 0
+end
+
+note CMDQ in-flight limit (mode 1): 14 commands + SYNC is the maximum batch; a 15th non-SYNC command is
+note refused by smmu_cmd_push, the next SYNC fails closed (batch dropped), and the queue then recovers.
+fn sq_qlimit to ulong
+for k ulong 15
+smmu_cmd_push 0 SMMU_CMD_TLBI_NSNH_ALL 0
+end
+if ne smmu_cmd_sync 0 SMMU_ECMDERR
+ret 60
+end
+if ne smmu_cmd_sync 0 SMMU_OK
+ret 61
+end
+for j ulong 14
+smmu_cmd_push 0 SMMU_CMD_TLBI_NSNH_ALL 0
+end
+if ne smmu_cmd_sync 0 SMMU_OK
+ret 62
+end
+uart_puts sq_qlim
+ret 0
+end
+
 fn el1main el1_arg ulong to void
 uart_puts sq_hdr
 bmmio_reset
@@ -357,13 +421,13 @@ f = sq_check_fault
 if ne f 0
 sq_die f 0
 end
-wb = dma_alloc_nc 1 4096
-if ne smmu_map_span_wb long get sq_st 4 wb 4096 SMMU_OK
-sq_die 50 get iort_qres 8
+w = sq_wb_tests
+if ne w 0
+sq_die w get iort_qres 8
 end
-smmu_cmd_push 0 SMMU_CMD_TLBI_NSNH_ALL 0
-if ne smmu_cmd_sync 0 SMMU_OK
-sq_die 51 0
+q = sq_qlimit
+if ne q 0
+sq_die q 0
 end
 uart_puts sq_pass
 sq_halt

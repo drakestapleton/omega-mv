@@ -5,7 +5,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
-OMC="${OMC:-/Users/drakestapleton/workspace/omega-mv-macos/seed/out/omc-macos}"
+OMC="${OMC:-${OMEGA_MACOS_ROOT:-$HOME/workspace/omega-mv-macos}/seed/out/omc-macos}"
 if [ ! -x "$OMC" ]; then
   OMC="$ROOT/seed/out/omc"
 fi

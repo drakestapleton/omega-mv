@@ -108,6 +108,8 @@ const SMMU_ENOQUIESCE long -10
 const SMMU_ENOTFOUND long -11
 const SMMU_EWILDCARD long -12
 const SMMU_EATTR long -13
+note IORT-routed SMMU base does not match the base this instance was brought up at.
+const SMMU_EBASE long -14
 
 note Per-instance state (0=off, 1=up, 2=abort_only)
 global smmu_inst_state ulong 3
@@ -149,6 +151,11 @@ global smmu_inst_cmdq ulong 3
 global smmu_inst_evtq ulong 3
 global smmu_inst_pend ulong 3
 global smmu_inst_last_addr ulong 3
+note Mode 1: sticky "a command was refused by smmu_cmd_push" flag; the next smmu_cmd_sync drops the batch
+note and fails closed.
+global smmu_inst_qerr ulong 3
+note Mode 1: last CMDQ PROD value actually written to SMMU_CMDQ_PROD (commands up to here are issued).
+global smmu_inst_hwprod ulong 3
 note Per-stream IORT CCA (1 = IO-coherent root complex)
 global smmu_str_cca ulong 8
 note Mode 1 page-table/L2-STE page pool: 0=base PA, 1=pages, 2=used
@@ -179,6 +186,8 @@ put smmu_inst_cmdq i 0
 put smmu_inst_evtq i 0
 put smmu_inst_pend i 0
 put smmu_inst_last_addr i 0
+put smmu_inst_qerr i 0
+put smmu_inst_hwprod i 0
 end
 for p ulong 3
 put smmu_pt_pool p 0
@@ -379,7 +388,22 @@ end
 ret r
 end
 
+note Mode 1 in-flight limit: at most 15 of the 16 CMDQ entries between CMD_SYNCs (14 commands + the SYNC),
+note so PROD never laps CONS (§3.5: full = same index, wrap bits differ). An over-limit command is not
+note written; smmu_inst_qerr is set and the next smmu_cmd_sync fails closed.
+const SMMU_CMDQ_MAX_PEND ulong 15
+
 fn smmu_cmd_push inst ulong w0 ulong w1 ulong to void
+if smmu_hw
+lim = sub SMMU_CMDQ_MAX_PEND 1
+if eq and w0 0xff SMMU_CMD_SYNC
+lim = SMMU_CMDQ_MAX_PEND
+end
+if ge get smmu_inst_pend inst lim
+put smmu_inst_qerr inst 1
+ret
+end
+end
 prod = get smmu_inst_cmd_prod inst
 slot = and prod sub SMMU_Q_ENTRIES 1
 base_idx = add mul inst 32 mul slot 2
@@ -396,26 +420,47 @@ put smmu_inst_cmd_prod inst and add prod 1 SMMU_Q_IDX_MASK
 put smmu_cmd_count inst add get smmu_cmd_count inst 1
 end
 
+note Mode 1: if smmu_cmd_push refused a command, drop the un-issued batch -- every command after the last
+note PROD actually written to the SMMU (smmu_inst_hwprod) -- and fail. smmu_inst_pend keeps counting the
+note issued-but-not-yet-confirmed commands (it only resets after a successful SYNC), so after a failed SYNC
+note the in-flight limit still covers entries the SMMU may not have consumed.
+fn smmu_q_ok inst ulong to bool
+if eq get smmu_inst_qerr inst 0
+ret true
+end
+hp = get smmu_inst_hwprod inst
+unissued = and sub add get smmu_inst_cmd_prod inst 32 hp SMMU_Q_IDX_MASK
+put smmu_inst_cmd_prod inst hp
+put smmu_inst_pend inst sub get smmu_inst_pend inst unissued
+put smmu_inst_qerr inst 0
+ret false
+end
+
 note Flush command queue with CMD_SYNC and enforce CMDQ_CONS.ERR[30:24] == 0.
 fn smmu_cmd_sync inst ulong to long
 h = get smmu_inst_h inst
 if smmu_hw
-note Fail closed instead of overrunning the 16-entry queue (one SYNC slot is always reserved).
-if ge get smmu_inst_pend inst sub SMMU_Q_ENTRIES 1
+if eq get smmu_inst_cmdq inst 0
 ret SMMU_ECMDERR
 end
-if eq get smmu_inst_cmdq inst 0
+if not smmu_q_ok inst
 ret SMMU_ECMDERR
 end
 end
 note CMD_SYNC: op=0x46, CS=0 (no IRQ), MSH=3 (Inner Shareable, bits 23:22)
 smmu_cmd_push inst or SMMU_CMD_SYNC shl ulong 3 22 0
+if smmu_hw
+if not smmu_q_ok inst
+ret SMMU_ECMDERR
+end
+end
 cpufence
 prod = get smmu_inst_cmd_prod inst
 rc = bmmio_w32 h SMMU_REG_CMDQ_PROD prod
 if ne rc BMMIO_OK
 ret SMMU_ECMDERR
 end
+put smmu_inst_hwprod inst prod
 note In host model mode 0, model auto-advances CONS unless fault-injected in smmu_sim_cmd_err / bits 30:24.
 if eq get bmmio_mode 0 0
 inj = get smmu_sim_cmd_err inst
@@ -523,6 +568,7 @@ z = bmmio_w64 h SMMU_REG_EVTQ_BASE or or evtq_pa SMMU_BASE_RA SMMU_Q_LOG2SIZE
 z = bmmio_w32 h SMMU_REG_EVTQ_PROD 0
 z = bmmio_w32 h SMMU_REG_EVTQ_CONS 0
 put smmu_inst_cmd_prod inst 0
+put smmu_inst_hwprod inst 0
 cpufence
 end
 
@@ -833,6 +879,51 @@ smmu_hw_put_ste ste base
 ret SMMU_OK
 end
 
+note Mode 1: invalidate the STE for sid (word 0 / V first), then CFGI_STE + TLBI + SYNC (best effort).
+fn smmu_hw_clear_ste inst ulong sid ulong to void
+l1 = add get smmu_inst_strtab inst mul shr sid SMMU_STRTAB_SPLIT 8
+d = smmu_mr l1
+if eq d 0
+ret
+end
+ste = add and d SMMU_L2PTR_MASK mul and sid sub shl ulong 1 SMMU_STRTAB_SPLIT 1 64
+for w ulong 8
+smmu_mw add ste mul w 8 0
+end
+cpufence
+smmu_cmd_push inst or SMMU_CMD_CFGI_STE shl sid 32 0
+smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
+z = smmu_cmd_sync inst
+end
+
+note Error-path teardown for a partially opened stream slot n: remove every span of the slot (RMR spans
+note included) and its stage-1 descriptors, clear the slot's CD/STE words, and in mode 1 invalidate the
+note STE. Leaves the slot not live so the error code returned by smmu_open_stream is the whole outcome.
+fn smmu_abandon_stream n ulong inst ulong sid ulong to void
+for k ulong SMMU_MAX_SPANS
+if ne get smmu_sp_live k 0
+if eq get smmu_sp_stream k n
+if smmu_hw
+z = smmu_pt_span get smmu_str_ttbr n get smmu_sp_pa k get smmu_sp_len k 0
+end
+put smmu_sp_live k 0
+put smmu_sp_rmr k 0
+end
+end
+end
+base = mul n 8
+for w ulong 8
+put smmu_ste_words add base w 0
+put smmu_cd_words add base w 0
+end
+if smmu_hw
+smmu_hw_clear_ste inst sid
+end
+put smmu_str_live n 0
+put smmu_str_ttbr n 0
+put smmu_str_cca n 0
+end
+
 note Open a confined stream for PCI (seg, rid) via iort.om, auto-mapping any covering IORT RMRs.
 note Returns stream handle (1..8) on success, or negative SMMU_E* error.
 fn smmu_open_stream seg uint rid uint cd_pa ulong ttbr0_pa ulong to long
@@ -859,6 +950,10 @@ end
 if ne get smmu_inst_state inst 1
 ret SMMU_EARG
 end
+note The IORT SMMUv3 node that owns this RID must be the one this instance was brought up at.
+if ne get iort_qres 1 get smmu_inst_base inst
+ret SMMU_EBASE
+end
 if ge sid shl ulong 1 get smmu_inst_sidbits inst
 ret SMMU_EIDR
 end
@@ -883,12 +978,14 @@ smmu_zero cd_pa 64
 end
 rr = smmu_map_rmrs n inst sid
 if ne rr SMMU_OK
+smmu_abandon_stream n inst sid
 ret rr
 end
 smmu_encode_ste_cd n cd_pa ttbr0_pa
 if smmu_hw
 wr = smmu_hw_write_ste inst sid n cd_pa
 if ne wr SMMU_OK
+smmu_abandon_stream n inst sid
 ret wr
 end
 end
@@ -908,7 +1005,8 @@ smmu_cmd_push inst or SMMU_CMD_CFGI_CD_ALL shl sid 32 0
 smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 sr = smmu_cmd_sync inst
 if ne sr SMMU_OK
-put smmu_str_live n 0
+put smmu_str_n 0 n
+smmu_abandon_stream n inst sid
 ret sr
 end
 ret long add n 1

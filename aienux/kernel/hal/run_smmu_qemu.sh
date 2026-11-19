@@ -46,5 +46,8 @@ if grep -q 'PANIC' "$TMP/qemu.log"; then echo "FAIL: PANIC" >&2; exit 1; fi
 grep -q 'SMMU_QEMU_FAIL' "$TMP/qemu.log" && { echo "FAIL: smmu_qemu_test" >&2; exit 1; }
 grep -q 'SMMUQ_MAPPED_DMA_OK bytes=256' "$TMP/qemu.log"
 grep -q 'SMMUQ_FAULT type=0x0000000000000010' "$TMP/qemu.log" || grep -q 'SMMUQ_FAULT type=0x10' "$TMP/qemu.log"
-grep -q 'SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete' "$TMP/qemu.log"
-echo "PASS smmu_qemu_edu (mode-1 SMMUv3: mapped DMA ok, unmapped DMA -> EVENTQ F_TRANSLATION, CMD_SYNC complete)"
+grep -q 'SMMUQ_WB_MOCK_CCA0_REFUSED' "$TMP/qemu.log"
+grep -q 'SMMUQ_WB_DMA_OK' "$TMP/qemu.log"
+grep -q 'SMMUQ_CMDQ_LIMIT_OK' "$TMP/qemu.log"
+grep -q 'SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete wb=ok cmdq_limit=ok' "$TMP/qemu.log"
+echo "PASS smmu_qemu_edu (mode-1 SMMUv3: mapped NC DMA ok, unmapped DMA -> EVENTQ F_TRANSLATION, CMD_SYNC complete, WB DMA on real WB RAM + mock CCA=0 refusal, CMDQ 15-pending limit)"

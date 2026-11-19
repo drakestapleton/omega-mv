@@ -112,7 +112,8 @@ find_omc() {
     "${OMC:-}" \
     "$HOME/.local/bin/omc" \
     "$REPO_ROOT/seed/out/omc" \
-    "/Users/drakestapleton/workspace/omega-mv-macos/seed/out/omc-macos"; do
+    "$REPO_ROOT/seed/out/omc-macos" \
+    "${OMEGA_MACOS_ROOT:-$HOME/workspace/omega-mv-macos}/seed/out/omc-macos"; do
     if [ -n "$cand" ] && [ -x "$cand" ]; then
       # Ensure the compiler binary can execute on this host architecture
       if "$cand" </dev/null >/dev/null 2>&1 || [ $? -ne 126 ]; then

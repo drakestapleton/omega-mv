@@ -208,8 +208,9 @@ if [ "$SKIP_SSH" -eq 1 ]; then
 fi
 
 # 2. Strictly read-only pre-check on Spark (runs for both dry-run and apply)
-PRE_OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$SPARK_HOST" 'sh -s' <<'REMOTE_PRE'
+PRE_OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$SPARK_HOST" "sh -s -- $APPLY" <<'REMOTE_PRE'
 set -eu
+PRE_APPLY="${1:-0}"
 echo "SECTION:EFI"
 efibootmgr -v
 echo "SECTION:ESP"
@@ -220,8 +221,11 @@ df -B1 /boot/efi | tail -n 1
 test -f /boot/efi/EFI/ubuntu/shimaa64.efi && echo "UBUNTU_SHIM=OK" || echo "UBUNTU_SHIM=MISSING"
 echo "SECTION:GPUBUSY"
 # Read-only procfs symlink inspection — NEVER opens /dev/nvidia*
-# Fail closed if sudo -n fails (never falsely report NONE).
-if BUSY=$(sudo -n sh -c '
+# Dry-run never invokes sudo (not even sudo -n): the check is reported as not run.
+# Apply mode fails closed if sudo -n fails (never falsely report NONE).
+if [ "$PRE_APPLY" != "1" ]; then
+  echo "GPU_OPEN_PROCS=NOT_CHECKED_DRY_RUN"
+elif BUSY=$(sudo -n sh -c '
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     for fd in "$p"/fd/*; do
@@ -288,8 +292,13 @@ if [ "$UBUNTU_SHIM" != "OK" ]; then
   exit 1
 fi
 
-if [ -z "$ESP_AVAIL" ] || [ "$ESP_AVAIL" -lt "$MIN_ESP_FREE_BYTES" ] 2>/dev/null; then
-  echo "FAIL: Spark ESP /boot/efi free space insufficient (${ESP_AVAIL:-unknown} B < 64 MiB); refusing." >&2
+case "$ESP_AVAIL" in
+  ''|*[!0-9]*)
+    echo "FAIL: Spark ESP /boot/efi free space is not a number (got: ${ESP_AVAIL:-missing}); refusing." >&2
+    exit 1 ;;
+esac
+if [ "$ESP_AVAIL" -lt "$MIN_ESP_FREE_BYTES" ]; then
+  echo "FAIL: Spark ESP /boot/efi free space insufficient (${ESP_AVAIL} B < 64 MiB); refusing." >&2
   exit 1
 fi
 
@@ -306,7 +315,11 @@ if [ "$GPU_BUSY" != "NONE" ]; then
     echo "         Zero changes were made to Spark ESP or NVRAM." >&2
     exit 3
   fi
-  echo "[WARN] /dev/nvidia* status: ${GPU_BUSY:-UNKNOWN}"
+  if [ "$APPLY" -ne 1 ] && [ "$GPU_BUSY" = "NOT_CHECKED_DRY_RUN" ]; then
+    echo "[INFO] /dev/nvidia* open-process check needs sudo; not run in dry-run (apply mode runs it, fail-closed)"
+  else
+    echo "[WARN] /dev/nvidia* status: ${GPU_BUSY:-UNKNOWN}"
+  fi
 else
   echo "[OK] Spark /dev/nvidia* idle (no open processes)"
 fi
@@ -418,9 +431,12 @@ POST_0001=$(printf '%s\n' "$POST_EFI" | grep -E '^Boot0001' | head -n 1 || true)
 POST_0001_SHA=$(printf '%s' "$POST_0001" | sha256sum | awk '{print $1}')
 
 if [ "$POST_ORDER" != "$ORIG_ORDER" ]; then
-  echo "EMERGENCY: BootOrder changed from $ORIG_ORDER to $POST_ORDER; restoring immediately!" >&2
-  sudo -n efibootmgr -o "$ORIG_ORDER" >/dev/null
-  sudo -n efibootmgr -N >/dev/null
+  # Never rewrite BootOrder from this tool (not even to "restore" it): clear the one-shot BootNext only
+  # and hand the BootOrder decision to the operator at the console.
+  echo "EMERGENCY: BootOrder changed from $ORIG_ORDER to $POST_ORDER; clearing BootNext only." >&2
+  echo "           BootOrder was NOT rewritten. Inspect at the console; to restore manually:" >&2
+  echo "             sudo efibootmgr -o $ORIG_ORDER" >&2
+  sudo -n efibootmgr -N >/dev/null || true
   exit 1
 fi
 
