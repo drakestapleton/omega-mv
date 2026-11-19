@@ -5,7 +5,7 @@
 # Zero Spark GPU usage, zero CUDA, zero NVRM.
 set -eu
 
-OMC="${OMC:-/Users/drakestapleton/.local/bin/omc}"
+OMC="${OMC:-$HOME/.local/bin/omc}"
 if [ ! -x "$OMC" ]; then
     OMC="./seed/out/omc"
 fi

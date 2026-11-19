@@ -18,11 +18,34 @@ text ps_t5 "t05_smmu_abc_deterministic_bringup"
 text ps_t6 "t06_smmu_disjoint_dma_and_rmr"
 text ps_t7 "t07_smmu_eventq_fault_drain"
 text ps_t8 "t08_irq_iqmode2_bar0_and_crashcat"
-text ps_sum "PCIE_SMMU_TEST_PASS total=8 failed=0\n"
+text ps_t9 "t09_smmu_open_teardown_and_iort_base_check"
+text ps_sum "PCIE_SMMU_TEST_PASS total=9 failed=0\n"
 text ps_fsum "PCIE_SMMU_TEST_FAIL\n"
 
 global ps_mcfg uchar 128
 global ps_iort uchar 512
+global ps_mmio_stub ulong 4
+
+note Host-side stubs for bar0_mmio.om mode 1 (bare-metal uses fwops.om fwld/fwst + dsb sy).
+fn arm64_mmio_r32 addr ulong to ulong
+put ps_mmio_stub 0 addr
+ret and get ps_mmio_stub 1 4294967295
+end
+
+fn arm64_mmio_w32 addr ulong val ulong to void
+put ps_mmio_stub 0 addr
+put ps_mmio_stub 1 and val 4294967295
+end
+
+fn arm64_mmio_r64 addr ulong to ulong
+put ps_mmio_stub 2 addr
+ret get ps_mmio_stub 3
+end
+
+fn arm64_mmio_w64 addr ulong val ulong to void
+put ps_mmio_stub 2 addr
+put ps_mmio_stub 3 val
+end
 
 fn ps_wstr s view uchar * to void
 n = len s
@@ -649,6 +672,53 @@ end
 ret eq get bmmio_wr_ops 0 wr_before
 end
 
+fn ps_live_spans to ulong
+c = ulong 0
+for k ulong SMMU_MAX_SPANS
+if ne get smmu_sp_live k 0
+c = add c 1
+end
+end
+ret c
+end
+
+note Error-path teardown: a GB20B open whose CMD_SYNC fails must leave no stream, no live span (RMRs
+note included) and zeroed STE/CD words, so a retry reuses slot 0 and re-maps the RMRs cleanly.
+note IORT base cross-check: an instance brought up at a base other than the IORT node's -> SMMU_EBASE.
+fn t09_teardown to bool
+if not t05_smmu_abc
+ret false
+end
+put smmu_sim_cmd_err 1 1
+if ne smmu_open_stream 15 0x0100 0x11000000 0x11001000 SMMU_ECMDERR
+ret false
+end
+put smmu_sim_cmd_err 1 0
+if or ne get smmu_str_n 0 0 ne get smmu_str_live 0 0
+ret false
+end
+if or ne ps_live_spans 0 ne get smmu_ste_words 0 0
+ret false
+end
+if ne get smmu_cd_words 0 0
+ret false
+end
+note Model hardware recovery: clear CONS.ERR (real HW: GERROR/GERRORN ack + CONS resume).
+z = bmmio_w32 get smmu_inst_h 1 SMMU_REG_CMDQ_CONS get smmu_inst_cmd_prod 1
+if ne smmu_open_stream 15 0x0100 0x11000000 0x11001000 1
+ret false
+end
+if eq ps_live_spans 0
+ret false
+end
+put smmu_inst_base 0 0x12345000
+if ne smmu_open_stream 4 0x0100 0x11002000 0x11003000 SMMU_EBASE
+ret false
+end
+put smmu_inst_base 0 SPARK_SMMU_A_PA
+ret gt smmu_open_stream 4 0x0100 0x11002000 0x11003000 0
+end
+
 fn main to int
 fail = ulong 0
 fail = add fail ps_rep ps_t1 t01_bar0
@@ -659,6 +729,7 @@ fail = add fail ps_rep ps_t5 t05_smmu_abc
 fail = add fail ps_rep ps_t6 t06_smmu_dma
 fail = add fail ps_rep ps_t7 t07_eventq
 fail = add fail ps_rep ps_t8 t08_irq_bm
+fail = add fail ps_rep ps_t9 t09_teardown
 if eq fail 0
 ps_wstr ps_sum
 ret 0
