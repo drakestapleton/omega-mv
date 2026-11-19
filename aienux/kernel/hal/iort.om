@@ -1,0 +1,718 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/iort.om: Pure-Omega ACPI SDT checksum and IORT SMMUv3 route parser.
+note Converted from aienux native/kernel/core/acpi.{h,c} (ck_acpi_sum_ok, ck_iort_parse,
+note ck_iort_stream_id, ck_iort_other_stream, ck_iort_route_rid, ck_iort_named, RMR ranges).
+note Compose with: si/directives/om2.om aienux/kernel/hal/iort.om ...
+
+const IORT_SDT_HDR ulong 36
+const IORT_TABLE_HDR ulong 48
+const IORT_NODE_HDR ulong 16
+const IORT_MAP_BYTES ulong 20
+const IORT_RC_SEGMENT ulong 28
+const IORT_RMR_HDR ulong 28
+const IORT_RMR_DESC_BYTES ulong 20
+const IORT_NAMED_NAME_OFF ulong 29
+
+const IORT_NODE_NAMED uchar 1
+const IORT_NODE_RC uchar 2
+const IORT_NODE_SMMUV3 uchar 4
+const IORT_NODE_RMR uchar 6
+const IORT_MAP_SINGLE uint 1
+
+const IORT_MAX_SMMUS ulong 8
+const IORT_MAX_MAPS ulong 16
+const IORT_MAX_OTHER ulong 8
+const IORT_MAX_RMR ulong 4
+const IORT_MAX_RMR_RANGES ulong 4
+
+note Metadata slots: 0=nsmmus, 1=nmaps, 2=nother, 3=nrmr, 4=primary_base, 5=primary_off,
+note 6=mutant_route_first (0=off, 1=route all to smmu 0), 7=mutant_rmr_excl (0=inclusive, 1=exclusive)
+global iort_meta ulong 8
+global iort_smmu_base ulong 8
+global iort_smmu_off uint 8
+
+global iort_map_seg uint 16
+global iort_map_in uint 16
+global iort_map_cnt uint 16
+global iort_map_out uint 16
+
+global iort_oth_seg uint 8
+global iort_oth_in uint 8
+global iort_oth_cnt uint 8
+global iort_oth_out uint 8
+global iort_oth_base ulong 8
+global iort_oth_off uint 8
+
+global iort_rmr_off uint 4
+global iort_rmr_sidx uint 4
+global iort_rmr_slo uint 4
+global iort_rmr_shi uint 4
+global iort_rmr_flags uint 4
+global iort_rmr_nrng uint 4
+global iort_rmr_rbase ulong 16
+global iort_rmr_rlen ulong 16
+global iort_tmp_rb ulong 4
+global iort_tmp_rl ulong 4
+
+note Route query result slots: 0=smmu_index, 1=smmu_base, 2=smmu_off, 3=sid, 4=rmr_hits,
+note 5=rmr_first_flags, 6=named_node_off, 7=named_sid
+global iort_qres ulong 8
+
+fn iort_rd16 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = uint get buf add off 1
+ret or b0 shl b1 8
+end
+
+fn iort_rd32 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = uint get buf add off 1
+b2 = uint get buf add off 2
+b3 = uint get buf add off 3
+lo = or b0 shl b1 8
+hi = or shl b2 16 shl b3 24
+ret or lo hi
+end
+
+fn iort_rd64 buf view uchar * off ulong to ulong
+lo = ulong iort_rd32 buf off
+hi = ulong iort_rd32 buf add off 4
+ret or lo shl hi 32
+end
+
+fn acpi_sum_ok buf view uchar * n ulong to bool
+if or lt n IORT_SDT_HDR gt n len buf
+ret false
+end
+acc = uint 0
+i = ulong 0
+note ACPI tables are bounded in size; 65536 covers all IORT/MADT/SDT tables.
+while lt i n bound 65536
+acc = and add acc uint get buf i 0xff
+i = add i 1
+end
+ret eq acc 0
+end
+
+fn iort_reset to void
+for i ulong 8
+put iort_meta i 0
+put iort_smmu_base i 0
+put iort_smmu_off i 0
+put iort_oth_seg i 0
+put iort_oth_in i 0
+put iort_oth_cnt i 0
+put iort_oth_out i 0
+put iort_oth_base i 0
+put iort_oth_off i 0
+put iort_qres i 0
+end
+for j ulong 16
+put iort_map_seg j 0
+put iort_map_in j 0
+put iort_map_cnt j 0
+put iort_map_out j 0
+put iort_rmr_rbase j 0
+put iort_rmr_rlen j 0
+end
+for k ulong 4
+put iort_rmr_off k 0
+put iort_rmr_sidx k 0
+put iort_rmr_slo k 0
+put iort_rmr_shi k 0
+put iort_rmr_flags k 0
+put iort_rmr_nrng k 0
+end
+end
+
+fn iort_set_mutants route_first ulong rmr_excl ulong to void
+put iort_meta 6 route_first
+put iort_meta 7 rmr_excl
+end
+
+fn iort_find_smmu_idx off uint to ulong
+ns = get iort_meta 0
+i = ulong 0
+while lt i ns bound 8
+if eq get iort_smmu_off i off
+ret i
+end
+i = add i 1
+end
+ret IORT_MAX_SMMUS
+end
+
+fn iort_u32_add_overflow a uint b uint to bool
+s = add a b
+ret lt s a
+end
+
+fn iort_u64_add_overflow a ulong b ulong to bool
+s = add a b
+ret lt s a
+end
+
+fn iort_ranges_overlap a_lo uint a_cnt uint b_lo uint b_cnt uint to bool
+a_hi = add a_lo a_cnt
+b_hi = add b_lo b_cnt
+if lt a_hi b_lo
+ret false
+end
+if lt b_hi a_lo
+ret false
+end
+ret true
+end
+
+fn iort_check_hdr buf view uchar * to long
+blen = len buf
+if lt blen IORT_TABLE_HDR
+ret -1
+end
+note Signature "IORT" = 0x49 0x4f 0x52 0x54
+if or ne get buf 0 73 ne get buf 1 79
+ret -1
+end
+if or ne get buf 2 82 ne get buf 3 84
+ret -1
+end
+tlen = ulong iort_rd32 buf 4
+if or lt tlen IORT_TABLE_HDR gt tlen blen
+ret -1
+end
+if not acpi_sum_ok buf tlen
+ret -1
+end
+ncnt = ulong iort_rd32 buf 36
+noff = ulong iort_rd32 buf 40
+if eq ncnt 0
+ret -1
+end
+if or lt noff IORT_TABLE_HDR gt noff tlen
+ret -1
+end
+ret long tlen
+end
+
+fn iort_load_rmr_descs buf view uchar * start ulong rcount ulong to int
+d = ulong 0
+while lt d rcount bound 4
+doff = add start mul d IORT_RMR_DESC_BYTES
+b = iort_rd64 buf doff
+l = iort_rd64 buf add doff 8
+if eq l 0
+ret -1
+end
+if or ne and b 0xfff 0 ne and l 0xfff 0
+ret -1
+end
+if iort_u64_add_overflow b l
+ret -1
+end
+put iort_tmp_rb d b
+put iort_tmp_rl d l
+d = add d 1
+end
+ret 0
+end
+
+fn iort_bind_rmr_one off ulong sidx ulong ob uint cnt uint flags uint rcount ulong to int
+nr = get iort_meta 3
+if ge nr IORT_MAX_RMR
+ret -1
+end
+if iort_u32_add_overflow ob cnt
+ret -1
+end
+shi = add ob cnt
+if ne get iort_meta 7 0
+note Mutant: treat id_count as exclusive count instead of inclusive (number of IDs - 1)
+if gt cnt 0
+shi = sub add ob cnt 1
+else
+shi = ob
+end
+end
+put iort_rmr_off nr uint off
+put iort_rmr_sidx nr uint sidx
+put iort_rmr_slo nr ob
+put iort_rmr_shi nr shi
+put iort_rmr_flags nr flags
+put iort_rmr_nrng nr uint rcount
+k = ulong 0
+while lt k rcount bound 4
+rslot = add mul nr 4 k
+put iort_rmr_rbase rslot get iort_tmp_rb k
+put iort_rmr_rlen rslot get iort_tmp_rl k
+k = add k 1
+end
+put iort_meta 3 add nr 1
+ret 0
+end
+
+fn iort_bind_rmr_maps buf view uchar * off ulong mcount ulong moff ulong to int
+flags = iort_rd32 buf add off 16
+rcount = ulong iort_rd32 buf add off 20
+m = ulong 0
+while lt m mcount bound 64
+eoff = add add off moff mul m IORT_MAP_BYTES
+ref = iort_rd32 buf add eoff 12
+sidx = iort_find_smmu_idx ref
+if lt sidx IORT_MAX_SMMUS
+cnt = iort_rd32 buf add eoff 4
+ob = iort_rd32 buf add eoff 8
+if ne iort_bind_rmr_one off sidx ob cnt flags rcount 0
+ret -1
+end
+end
+m = add m 1
+end
+ret 0
+end
+
+fn iort_parse_rmr buf view uchar * off ulong nlen ulong mcount ulong moff ulong to int
+if lt nlen IORT_RMR_HDR
+ret -1
+end
+rcount = ulong iort_rd32 buf add off 20
+roff = ulong iort_rd32 buf add off 24
+if or eq rcount 0 gt rcount IORT_MAX_RMR_RANGES
+ret -1
+end
+if or lt roff IORT_RMR_HDR gt roff nlen
+ret -1
+end
+if gt mul rcount IORT_RMR_DESC_BYTES sub nlen roff
+ret -1
+end
+if ne iort_load_rmr_descs buf add off roff rcount 0
+ret -1
+end
+ret iort_bind_rmr_maps buf off mcount moff
+end
+
+fn iort_add_primary_map seg uint inb uint cnt uint ob uint to int
+if or iort_u32_add_overflow inb cnt iort_u32_add_overflow ob cnt
+ret -1
+end
+nm = get iort_meta 1
+if ge nm IORT_MAX_MAPS
+ret -1
+end
+i = ulong 0
+while lt i nm bound 16
+if eq get iort_map_seg i seg
+if iort_ranges_overlap get iort_map_in i get iort_map_cnt i inb cnt
+ret -1
+end
+end
+i = add i 1
+end
+put iort_map_seg nm seg
+put iort_map_in nm inb
+put iort_map_cnt nm cnt
+put iort_map_out nm ob
+put iort_meta 1 add nm 1
+ret 0
+end
+
+fn iort_add_other_map seg uint inb uint cnt uint ob uint sidx ulong to int
+if or iort_u32_add_overflow inb cnt iort_u32_add_overflow ob cnt
+ret -1
+end
+no = get iort_meta 2
+if ge no IORT_MAX_OTHER
+ret -1
+end
+i = ulong 0
+while lt i no bound 8
+if eq get iort_oth_seg i seg
+if iort_ranges_overlap get iort_oth_in i get iort_oth_cnt i inb cnt
+ret -1
+end
+end
+i = add i 1
+end
+put iort_oth_seg no seg
+put iort_oth_in no inb
+put iort_oth_cnt no cnt
+put iort_oth_out no ob
+put iort_oth_base no get iort_smmu_base sidx
+put iort_oth_off no get iort_smmu_off sidx
+put iort_meta 2 add no 1
+ret 0
+end
+
+fn iort_parse_rc_map buf view uchar * eoff ulong seg uint to int
+inb = iort_rd32 buf eoff
+cnt = iort_rd32 buf add eoff 4
+ob = iort_rd32 buf add eoff 8
+ref = iort_rd32 buf add eoff 12
+prim_off = uint get iort_meta 5
+if eq ref prim_off
+ret iort_add_primary_map seg inb cnt ob
+end
+sidx = iort_find_smmu_idx ref
+if lt sidx IORT_MAX_SMMUS
+ret iort_add_other_map seg inb cnt ob sidx
+end
+ret 0
+end
+
+fn iort_parse_rc buf view uchar * off ulong nlen ulong mcount ulong moff ulong to int
+if lt nlen add IORT_RC_SEGMENT 4
+ret -1
+end
+seg = iort_rd32 buf add off IORT_RC_SEGMENT
+m = ulong 0
+while lt m mcount bound 64
+eoff = add add off moff mul m IORT_MAP_BYTES
+if ne iort_parse_rc_map buf eoff seg 0
+ret -1
+end
+m = add m 1
+end
+ret 0
+end
+
+fn iort_parse_pass0 buf view uchar * tlen ulong ncnt ulong noff ulong to int
+off = noff
+i = ulong 0
+while lt i ncnt bound 128
+if or lt off IORT_TABLE_HDR gt off tlen
+ret -1
+end
+if lt sub tlen off IORT_NODE_HDR
+ret -1
+end
+ntype = get buf off
+nlen = ulong iort_rd16 buf add off 1
+if or lt nlen IORT_NODE_HDR gt nlen sub tlen off
+ret -1
+end
+if eq ntype IORT_NODE_SMMUV3
+if lt nlen 24
+ret -1
+end
+base = iort_rd64 buf add off 16
+if eq base 0
+ret -1
+end
+ns = get iort_meta 0
+if ge ns IORT_MAX_SMMUS
+ret -1
+end
+put iort_smmu_base ns base
+put iort_smmu_off ns uint off
+if eq ns 0
+put iort_meta 4 base
+put iort_meta 5 off
+end
+put iort_meta 0 add ns 1
+end
+off = add off nlen
+i = add i 1
+end
+if eq get iort_meta 0 0
+ret 0
+end
+ret 1
+end
+
+fn iort_parse_pass1 buf view uchar * tlen ulong ncnt ulong noff ulong to int
+off = noff
+i = ulong 0
+while lt i ncnt bound 128
+ntype = get buf off
+nlen = ulong iort_rd16 buf add off 1
+mcount = ulong iort_rd32 buf add off 8
+moff = ulong iort_rd32 buf add off 12
+if gt mcount 0
+if or lt moff IORT_NODE_HDR gt moff nlen
+ret -1
+end
+if gt mul mcount IORT_MAP_BYTES sub nlen moff
+ret -1
+end
+end
+if eq ntype IORT_NODE_RC
+if ne iort_parse_rc buf off nlen mcount moff 0
+ret -1
+end
+end
+if eq ntype IORT_NODE_RMR
+if ne iort_parse_rmr buf off nlen mcount moff 0
+ret -1
+end
+end
+off = add off nlen
+i = add i 1
+end
+ret 1
+end
+
+note Parse an ACPI IORT table buffer. Preserves mutant flags across reset.
+note Returns 1 if at least one SMMUv3 node was found, 0 if none, -1 if malformed.
+fn iort_parse buf view uchar * to int
+m0 = get iort_meta 6
+m1 = get iort_meta 7
+iort_reset
+put iort_meta 6 m0
+put iort_meta 7 m1
+tl = iort_check_hdr buf
+if lt tl 0
+ret -1
+end
+tlen = ulong tl
+ncnt = ulong iort_rd32 buf 36
+noff = ulong iort_rd32 buf 40
+p0 = iort_parse_pass0 buf tlen ncnt noff
+if le p0 0
+ret p0
+end
+ret iort_parse_pass1 buf tlen ncnt noff
+end
+
+fn iort_count_rmr_for sidx ulong sid uint to ulong
+nr = get iort_meta 3
+hits = ulong 0
+i = ulong 0
+while lt i nr bound 4
+if eq ulong get iort_rmr_sidx i sidx
+lo = get iort_rmr_slo i
+hi = get iort_rmr_shi i
+if and ge sid lo le sid hi
+if eq hits 0
+put iort_qres 5 ulong get iort_rmr_flags i
+end
+hits = add hits 1
+end
+end
+i = add i 1
+end
+ret hits
+end
+
+note Route (segment, rid) across primary and other SMMUv3 nodes.
+note Returns 0 on match (results in iort_qres[0..5]), -1 if uncovered.
+fn iort_route_rid seg uint rid uint to int
+for z ulong 6
+put iort_qres z 0
+end
+nm = get iort_meta 1
+i = ulong 0
+while lt i nm bound 16
+if eq get iort_map_seg i seg
+inb = get iort_map_in i
+if ge rid inb
+rel = sub rid inb
+if le rel get iort_map_cnt i
+sid = add get iort_map_out i rel
+put iort_qres 0 0
+put iort_qres 1 get iort_meta 4
+put iort_qres 2 get iort_meta 5
+put iort_qres 3 ulong sid
+put iort_qres 4 iort_count_rmr_for 0 sid
+ret 0
+end
+end
+end
+i = add i 1
+end
+no = get iort_meta 2
+j = ulong 0
+while lt j no bound 8
+if eq get iort_oth_seg j seg
+inb = get iort_oth_in j
+if ge rid inb
+rel = sub rid inb
+if le rel get iort_oth_cnt j
+sid = add get iort_oth_out j rel
+sidx = iort_find_smmu_idx get iort_oth_off j
+if ge sidx IORT_MAX_SMMUS
+ret -1
+end
+if ne get iort_meta 6 0
+note Mutant: route every other-SMMU requester to SMMU 0
+sidx = ulong 0
+end
+put iort_qres 0 sidx
+put iort_qres 1 get iort_smmu_base sidx
+put iort_qres 2 ulong get iort_smmu_off sidx
+put iort_qres 3 ulong sid
+put iort_qres 4 iort_count_rmr_for sidx sid
+ret 0
+end
+end
+end
+j = add j 1
+end
+ret -1
+end
+
+fn iort_last_seg4 buf view uchar * start ulong lim ulong dest edit uchar 4 to int
+seg_start = start
+q = start
+while lt q lim bound 64
+c = get buf q
+if eq c 0
+break
+end
+if or eq c 46 or eq c 92 eq c 94
+seg_start = add q 1
+end
+q = add q 1
+end
+i = ulong 0
+s = seg_start
+while and lt s lim lt i 4 bound 5
+c = get buf s
+if eq c 0
+break
+end
+put dest i c
+i = add i 1
+s = add s 1
+end
+if eq i 0
+ret -1
+end
+if lt s lim
+if ne get buf s 0
+ret -1
+end
+end
+while lt i 4 bound 4
+put dest i 95
+i = add i 1
+end
+ret 0
+end
+
+fn iort_named_bind_smmu buf view uchar * map_start ulong mcount ulong to int
+tlen = ulong iort_rd32 buf 4
+m = ulong 0
+while lt m mcount bound 64
+eoff = add map_start mul m IORT_MAP_BYTES
+ref = ulong iort_rd32 buf add eoff 12
+if or lt ref IORT_TABLE_HDR gt ref tlen
+ret -1
+end
+if lt sub tlen ref IORT_NODE_HDR
+ret -1
+end
+if eq get buf ref IORT_NODE_SMMUV3
+is_single = ne and iort_rd32 buf add eoff 16 IORT_MAP_SINGLE 0
+is_one = eq iort_rd32 buf add eoff 4 0
+if or is_single is_one
+put iort_qres 7 ulong iort_rd32 buf add eoff 8
+t_nlen = ulong iort_rd16 buf add ref 1
+if and ge t_nlen 24 le t_nlen sub tlen ref
+put iort_qres 1 iort_rd64 buf add ref 16
+end
+ret 0
+end
+end
+m = add m 1
+end
+ret 0
+end
+
+fn iort_named_match buf view uchar * off ulong nlen ulong mcount ulong moff ulong to int
+if le nlen IORT_NAMED_NAME_OFF
+ret -1
+end
+nend = add off nlen
+if gt mcount 0
+nend = add off moff
+end
+nstart = add off IORT_NAMED_NAME_OFF
+if le nend nstart
+ret -1
+end
+s4 = new uchar 4 0
+if ne iort_last_seg4 buf nstart nend s4 0
+ret 0
+end
+for k ulong 4
+if ne ulong get s4 k get iort_tmp_rb k
+ret 0
+end
+end
+ret 1
+end
+
+fn iort_named_scan buf view uchar * tlen ulong ncnt ulong noff ulong to int
+found = ulong 0
+off = noff
+i = ulong 0
+while lt i ncnt bound 128
+if or lt off IORT_TABLE_HDR gt off tlen
+ret -1
+end
+if lt sub tlen off IORT_NODE_HDR
+ret -1
+end
+ntype = get buf off
+nlen = ulong iort_rd16 buf add off 1
+if or lt nlen IORT_NODE_HDR gt nlen sub tlen off
+ret -1
+end
+mcount = ulong iort_rd32 buf add off 8
+moff = ulong iort_rd32 buf add off 12
+if gt mcount 0
+if or lt moff IORT_NODE_HDR gt moff nlen
+ret -1
+end
+if gt mul mcount IORT_MAP_BYTES sub nlen moff
+ret -1
+end
+end
+if eq ntype IORT_NODE_NAMED
+mr = iort_named_match buf off nlen mcount moff
+if lt mr 0
+ret -1
+end
+if eq mr 1
+if ne found 0
+ret -2
+end
+found = ulong 1
+put iort_qres 6 off
+if ne iort_named_bind_smmu buf add off moff mcount 0
+ret -1
+end
+end
+end
+off = add off nlen
+i = add i 1
+end
+if eq found 0
+ret 0
+end
+ret 1
+end
+
+note Lookup a Named Component node by its final 4-char ACPI segment (padded with '_').
+note Returns 1 if found (iort_qres[6]=node_off, [7]=stream_id, [1]=target_base),
+note 0 if not found, -1 if malformed, -2 if duplicate named component matches.
+fn iort_named_route buf view uchar * want view uchar * to int
+put iort_qres 6 0
+put iort_qres 7 0
+put iort_qres 1 0
+tl = iort_check_hdr buf
+if lt tl 0
+ret -1
+end
+w4 = new uchar 4 0
+if ne iort_last_seg4 want 0 len want w4 0
+ret -1
+end
+for k ulong 4
+put iort_tmp_rb k ulong get w4 k
+end
+tlen = ulong tl
+ncnt = ulong iort_rd32 buf 36
+noff = ulong iort_rd32 buf 40
+ret iort_named_scan buf tlen ncnt noff
+end

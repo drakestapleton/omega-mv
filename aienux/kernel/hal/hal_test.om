@@ -1,0 +1,747 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/hal/hal_test.om: Pure-Omega test suite for Aienux Kernel HAL
+note (ACPI/IORT SMMUv3 route parser, GPT/NVMe write confinement, Store key/provisioning gate).
+note Compose with: si/directives/om2.om aienux/kernel/hal/iort.om aienux/kernel/hal/nvme_store_gate.om aienux/kernel/hal/hal_test.om
+
+text h_pass "PASS "
+text h_fail "FAIL "
+text h_nl "\n"
+text h_t01 "hal_acpi_checksum_pos_neg"
+text h_t02 "hal_iort_multi_smmu_route_and_seg_iso"
+text h_t03 "hal_iort_overlap_its_and_malformed_refused"
+text h_t04 "hal_iort_rmr_inclusive_and_align_checks"
+text h_t05 "hal_iort_named_component_and_dup_refused"
+text h_t06 "hal_iort_mutant_controls_route_first_rmr_excl"
+text h_t07 "hal_gpt_crc32_and_valid_aienos_partition"
+text h_t08 "hal_gpt_negative_controls_corrupt_multi_overlap"
+text h_t09 "hal_part_xlate_bounds_and_bypass_mutant"
+text h_t10 "hal_nvme_claim_sticky_and_confinement_gate"
+text h_t11 "hal_store_key_policy_and_provision_split_mutant"
+text h_sum "KERNEL_HAL_TEST_PASS total=11 failed=0\n"
+text h_fsum "KERNEL_HAL_TEST_FAIL\n"
+text h_crc_vec "123456789"
+text h_usb_path "\\_SB_.USB0"
+text h_usb_want "USB0"
+text h_usb_miss "USB1"
+
+fn hwrite_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn hreport name view uchar * ok bool to uint
+if ok
+w1 = hwrite_all 1 h_pass
+w2 = hwrite_all 1 name
+w3 = hwrite_all 1 h_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = hwrite_all 1 h_fail
+w2 = hwrite_all 1 name
+w3 = hwrite_all 1 h_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn wr16 buf edit uchar * off ulong v uint to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+end
+
+fn wr32 buf edit uchar * off ulong v uint to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn wr64 buf edit uchar * off ulong v ulong to void
+wr32 buf off uint and v 0xffffffff
+wr32 buf add off 4 uint and shr v 32 0xffffffff
+end
+
+fn fix_acpi_sum buf edit uchar * n ulong to void
+put buf 9 0
+acc = uint 0
+i = ulong 0
+while lt i n bound 4096
+acc = and add acc uint get buf i 0xff
+i = add i 1
+end
+put buf 9 uchar and sub 256 acc 0xff
+end
+
+fn init_iort_hdr buf edit uchar * tlen uint ncnt uint noff uint to void
+put buf 0 73
+put buf 1 79
+put buf 2 82
+put buf 3 84
+wr32 buf 4 tlen
+wr32 buf 36 ncnt
+wr32 buf 40 noff
+end
+
+fn put_smmu_node buf edit uchar * off ulong base ulong to void
+put buf off IORT_NODE_SMMUV3
+wr16 buf add off 1 24
+wr32 buf add off 8 0
+wr32 buf add off 12 0
+wr64 buf add off 16 base
+end
+
+fn put_map_entry buf edit uchar 512 off ulong inb uint cnt uint ob uint ref uint to void
+wr32 buf off inb
+wr32 buf add off 4 cnt
+wr32 buf add off 8 ob
+wr32 buf add off 12 ref
+wr32 buf add off 16 0
+end
+
+note Build a DGX Spark-like IORT table:
+note   48: SMMUv3 #0 (base 0x12000000), len 24
+note   72: SMMUv3 #1 (base 0x13000000), len 24
+note   96: RC seg 0 -> SMMU #0 (in 0, cnt 0xff, out 0x1000) + ITS ref 48+1000 ignored, len 32+20=52
+note  148: RC seg 15 -> SMMU #1 (in 0x100, cnt 0xff, out 0x0), len 52
+note  200: RMR node -> SMMU #1 (sid 0x0..=0x100, flags 0x10), 1 range 0x280000000 + 0x10000, len 28+20+20=68
+note Total length = 268 bytes
+fn build_spark_iort buf edit uchar 512 to void
+for i ulong 512
+put buf i 0
+end
+init_iort_hdr buf 268 5 48
+put_smmu_node buf 48 0x12000000
+put_smmu_node buf 72 0x13000000
+note RC seg 0 at 96
+put buf 96 IORT_NODE_RC
+wr16 buf 97 52
+wr32 buf 104 1
+wr32 buf 108 32
+wr32 buf 124 0
+put_map_entry buf 128 0 0xff 0x1000 48
+note RC seg 15 at 148
+put buf 148 IORT_NODE_RC
+wr16 buf 149 52
+wr32 buf 156 1
+wr32 buf 160 32
+wr32 buf 176 15
+put_map_entry buf 180 0x100 0xff 0 72
+note RMR node at 200: hdr 28, desc at +28 (20 bytes), map at +48 (20 bytes)
+put buf 200 IORT_NODE_RMR
+wr16 buf 201 68
+wr32 buf 208 1
+wr32 buf 212 48
+wr32 buf 216 0x10
+wr32 buf 220 1
+wr32 buf 224 28
+wr64 buf 228 0x280000000
+wr64 buf 236 0x10000
+put_map_entry buf 248 0 0x100 0 72
+fix_acpi_sum buf 268
+end
+
+fn test_01_acpi_checksum to bool
+buf = new uchar 64 0
+init_iort_hdr buf 48 1 48
+fix_acpi_sum buf 48
+if not acpi_sum_ok buf 48
+ret false
+end
+note Corrupt 1 byte -> checksum must fail
+put buf 20 1
+if acpi_sum_ok buf 48
+ret false
+end
+note Too short (< 36) must fail
+if acpi_sum_ok buf 35
+ret false
+end
+ret true
+end
+
+fn test_02_iort_multi_smmu to bool
+iort_set_mutants 0 0
+buf = new uchar 512 0
+build_spark_iort buf
+if ne iort_parse buf 1
+ret false
+end
+if or ne get iort_meta 0 2 ne get iort_meta 1 1
+ret false
+end
+if or ne get iort_meta 2 1 ne get iort_meta 3 1
+ret false
+end
+note Route seg 0 rid 0x12 -> SMMU 0, base 0x12000000, sid 0x1012, rmr_hits 0
+if ne iort_route_rid 0 0x12 0
+ret false
+end
+if or ne get iort_qres 0 0 ne get iort_qres 1 0x12000000
+ret false
+end
+if or ne get iort_qres 3 0x1012 ne get iort_qres 4 0
+ret false
+end
+note Route seg 15 rid 0x105 -> SMMU 1, base 0x13000000, sid 0x5, rmr_hits 1, flags 0x10
+if ne iort_route_rid 15 0x105 0
+ret false
+end
+if or ne get iort_qres 0 1 ne get iort_qres 1 0x13000000
+ret false
+end
+if or ne get iort_qres 3 5 ne get iort_qres 4 1
+ret false
+end
+if ne get iort_qres 5 0x10
+ret false
+end
+note Segment isolation negative: seg 1 rid 0x12 and seg 15 rid 0x50 uncovered
+if ne iort_route_rid 1 0x12 -1
+ret false
+end
+if ne iort_route_rid 15 0x50 -1
+ret false
+end
+ret true
+end
+
+fn test_03_iort_overlap_and_malformed to bool
+iort_set_mutants 0 0
+buf = new uchar 512 0
+note Overlapping input ranges in same segment must be refused
+init_iort_hdr buf 144 2 48
+put_smmu_node buf 48 0x12000000
+put buf 72 IORT_NODE_RC
+wr16 buf 73 72
+wr32 buf 80 2
+wr32 buf 84 32
+wr32 buf 100 0
+put_map_entry buf 104 0x10 0x20 0x100 48
+put_map_entry buf 124 0x20 0x10 0x200 48
+fix_acpi_sum buf 144
+if ne iort_parse buf -1
+ret false
+end
+note Bad signature must be refused
+put buf 0 88
+fix_acpi_sum buf 144
+if ne iort_parse buf -1
+ret false
+end
+note Non-SMMU (ITS ref=9999) mapping is ignored, table with 1 SMMU still parses
+for z ulong 256
+put buf z 0
+end
+init_iort_hdr buf 124 2 48
+put_smmu_node buf 48 0x12000000
+put buf 72 IORT_NODE_RC
+wr16 buf 73 52
+wr32 buf 80 1
+wr32 buf 84 32
+wr32 buf 100 0
+put_map_entry buf 104 0 0x10 0 9999
+fix_acpi_sum buf 124
+if ne iort_parse buf 1
+ret false
+end
+if ne get iort_meta 1 0
+ret false
+end
+ret true
+end
+
+fn test_04_iort_rmr_boundaries to bool
+iort_set_mutants 0 0
+buf = new uchar 512 0
+build_spark_iort buf
+if ne iort_parse buf 1
+ret false
+end
+note Inclusive boundary: seg 15 rid 0x200 -> sid 0x100? Wait: map is in=0x100 cnt=0xff (max rid 0x1ff, sid 0xff).
+note Let's adjust RC seg 15 cnt to 0x105 so we can test sid=0x100 (inclusive) and sid=0x101 (outside).
+wr32 buf 184 0x105
+fix_acpi_sum buf 268
+if ne iort_parse buf 1
+ret false
+end
+note sid 0x100 (rid 0x200) MUST match RMR (inclusive)
+if ne iort_route_rid 15 0x200 0
+ret false
+end
+if or ne get iort_qres 3 0x100 ne get iort_qres 4 1
+ret false
+end
+note sid 0x101 (rid 0x201) MUST NOT match RMR
+if ne iort_route_rid 15 0x201 0
+ret false
+end
+if or ne get iort_qres 3 0x101 ne get iort_qres 4 0
+ret false
+end
+note Unaligned RMR base (0x280000100) must be rejected
+wr64 buf 228 0x280000100
+fix_acpi_sum buf 268
+if ne iort_parse buf -1
+ret false
+end
+ret true
+end
+
+fn put_named_node buf edit uchar 512 off ulong path view uchar * smmu_ref uint sid uint to void
+note Named node header: type(1) len(2) rev(1) res(4) mcount(4) moff(4) flags(4) memprop(8) addrsize(1) name(11) = 40, map at 40 (20 bytes) -> nlen 60
+put buf off IORT_NODE_NAMED
+wr16 buf add off 1 60
+wr32 buf add off 8 1
+wr32 buf add off 12 40
+plen = len path
+i = ulong 0
+while lt i plen bound 16
+put buf add add off IORT_NAMED_NAME_OFF i get path i
+i = add i 1
+end
+put buf add add off IORT_NAMED_NAME_OFF plen 0
+wr32 buf add off 40 0
+wr32 buf add off 44 0
+wr32 buf add off 48 sid
+wr32 buf add off 52 smmu_ref
+wr32 buf add off 56 IORT_MAP_SINGLE
+end
+
+fn test_05_iort_named_component to bool
+buf = new uchar 512 0
+init_iort_hdr buf 132 2 48
+put_smmu_node buf 48 0x14000000
+put_named_node buf 72 h_usb_path 48 0x77
+fix_acpi_sum buf 132
+if ne iort_named_route buf h_usb_want 1
+ret false
+end
+if or ne get iort_qres 6 72 ne get iort_qres 7 0x77
+ret false
+end
+if ne get iort_qres 1 0x14000000
+ret false
+end
+note Missing name returns 0
+if ne iort_named_route buf h_usb_miss 0
+ret false
+end
+note Duplicate named component returns -2
+init_iort_hdr buf 192 3 48
+put_smmu_node buf 48 0x14000000
+put_named_node buf 72 h_usb_path 48 0x77
+put_named_node buf 132 h_usb_path 48 0x78
+fix_acpi_sum buf 192
+if ne iort_named_route buf h_usb_want -2
+ret false
+end
+ret true
+end
+
+fn test_06_iort_mutants to bool
+buf = new uchar 512 0
+build_spark_iort buf
+wr32 buf 184 0x105
+fix_acpi_sum buf 268
+note Mutant 1: route_first=1 must misroute seg 15 to SMMU 0 (caught by assertion!)
+iort_set_mutants 1 0
+if ne iort_parse buf 1
+iort_set_mutants 0 0
+ret false
+end
+if ne iort_route_rid 15 0x105 0
+iort_set_mutants 0 0
+ret false
+end
+if eq get iort_qres 0 1
+iort_set_mutants 0 0
+ret false
+end
+note Mutant 2: rmr_excl=1 must miss boundary sid 0x100 (caught by assertion!)
+iort_set_mutants 0 1
+if ne iort_parse buf 1
+iort_set_mutants 0 0
+ret false
+end
+if ne iort_route_rid 15 0x200 0
+iort_set_mutants 0 0
+ret false
+end
+if ne get iort_qres 4 0
+iort_set_mutants 0 0
+ret false
+end
+iort_set_mutants 0 0
+ret true
+end
+
+note ---- GPT / NVMe / Store Tests (07..11) ----
+
+fn fill_aienos_guid g edit uchar 16 to void
+put g 0 0x41
+put g 1 0x49
+put g 2 0x45
+put g 3 0x4e
+put g 4 0x4f
+put g 5 0x53
+put g 6 0x01
+put g 7 0x02
+put g 8 0x03
+put g 9 0x04
+put g 10 0x05
+put g 11 0x06
+put g 12 0x07
+put g 13 0x08
+put g 14 0x09
+put g 15 0x0a
+end
+
+fn write_gpt_sig disk edit uchar * off ulong to void
+put disk off 69
+put disk add off 1 70
+put disk add off 2 73
+put disk add off 3 32
+put disk add off 4 80
+put disk add off 5 65
+put disk add off 6 82
+put disk add off 7 84
+end
+
+note Build a valid 16-block (8192-byte, 512 B/block) GPT disk:
+note   LBA 0: protective MBR (0x55 0xaa, 0xee)
+note   LBA 1: primary GPT header (first_usable=4, last_usable=12, entries=4, esize=128, pe_lba=2)
+note   LBA 2: primary entry array (512 B = 4 entries of 128 B), entry 0 = AIENOS [4..11]
+note   LBA 14: backup entry array (copy of LBA 2)
+note   LBA 15: backup GPT header
+fn build_valid_gpt_disk disk edit uchar 8192 guid view uchar 16 to void
+for i ulong 8192
+put disk i 0
+end
+note Protective MBR at LBA 0
+put disk 450 0xee
+put disk 510 0x55
+put disk 511 0xaa
+note Entry 0 at LBA 2 (offset 1024): AIENOS partition LBA 4..11 (8 blocks)
+for g ulong 16
+put disk add 1024 g get guid g
+end
+wr64 disk 1056 4
+wr64 disk 1064 11
+note Copy primary entry array to backup at LBA 14 (offset 7168)
+for e ulong 512
+put disk add 7168 e get disk add 1024 e
+end
+ecrc = hal_crc32_slice disk 1024 512
+note Primary header at LBA 1 (offset 512)
+write_gpt_sig disk 512
+wr32 disk 520 0x00010000
+wr32 disk 524 92
+wr64 disk 536 1
+wr64 disk 544 15
+wr64 disk 552 4
+wr64 disk 560 12
+put disk 568 0xde
+put disk 569 0xad
+wr64 disk 584 2
+wr32 disk 592 4
+wr32 disk 596 128
+wr32 disk 600 ecrc
+phcrc = hal_gpt_hdr_crc disk 512 92
+wr32 disk 528 phcrc
+note Backup header at LBA 15 (offset 7680)
+write_gpt_sig disk 7680
+wr32 disk 7688 0x00010000
+wr32 disk 7692 92
+wr64 disk 7704 15
+wr64 disk 7712 1
+wr64 disk 7720 4
+wr64 disk 7728 12
+put disk 7736 0xde
+put disk 7737 0xad
+wr64 disk 7752 14
+wr32 disk 7760 4
+wr32 disk 7764 128
+wr32 disk 7768 ecrc
+bhcrc = hal_gpt_hdr_crc disk 7680 92
+wr32 disk 7696 bhcrc
+end
+
+fn test_07_gpt_crc32_and_valid to bool
+if ne hal_crc32_slice h_crc_vec 0 9 0xcbf43926
+ret false
+end
+guid = new uchar 16 0
+fill_aienos_guid guid
+disk = new uchar 8192 0
+build_valid_gpt_disk disk guid
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_OK
+ret false
+end
+if or ne get hal_part 0 1 ne get hal_part 1 4
+ret false
+end
+if or ne get hal_part 2 8 ne get hal_part 4 1
+ret false
+end
+ret true
+end
+
+fn resign_gpt_entries disk edit uchar 8192 to void
+for e ulong 512
+put disk add 7168 e get disk add 1024 e
+end
+ecrc = hal_crc32_slice disk 1024 512
+wr32 disk 600 ecrc
+wr32 disk 7768 ecrc
+wr32 disk 528 hal_gpt_hdr_crc disk 512 92
+wr32 disk 7696 hal_gpt_hdr_crc disk 7680 92
+end
+
+fn test_08_gpt_negatives to bool
+guid = new uchar 16 0
+fill_aienos_guid guid
+disk = new uchar 8192 0
+note 1. Missing protective MBR
+build_valid_gpt_disk disk guid
+put disk 450 0x00
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_ENOMBR
+ret false
+end
+note 2. Corrupted primary header CRC
+build_valid_gpt_disk disk guid
+put disk 528 xor get disk 528 1
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_EHDR_CRC
+ret false
+end
+note 3. Missing AIENOS partition (change entry 0 type byte)
+build_valid_gpt_disk disk guid
+put disk 1024 0x99
+resign_gpt_entries disk
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_ENOPART
+ret false
+end
+note 4. Duplicate AIENOS partitions
+build_valid_gpt_disk disk guid
+for g ulong 16
+put disk add 1152 g get guid g
+end
+wr64 disk 1184 12
+wr64 disk 1192 12
+resign_gpt_entries disk
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_EMULTI
+ret false
+end
+note 5. Overlapping partitions
+build_valid_gpt_disk disk guid
+put disk 1152 0x77
+wr64 disk 1184 10
+wr64 disk 1192 12
+resign_gpt_entries disk
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_EOVERLAP
+ret false
+end
+note 6. Partition outside usable range (last_lba=13 > last_usable=12)
+build_valid_gpt_disk disk guid
+wr64 disk 1064 13
+resign_gpt_entries disk
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_EOUTSIDE
+ret false
+end
+ret true
+end
+
+fn test_09_part_xlate_and_mutant to bool
+hal_set_mutants 0 0
+guid = new uchar 16 0
+fill_aienos_guid guid
+disk = new uchar 8192 0
+build_valid_gpt_disk disk guid
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_OK
+ret false
+end
+abs = new ulong 1 0
+note Positive: LBA 0 -> disk LBA 4, LBA 7 count 1 -> disk LBA 11
+if ne hal_part_xlate 0 1 abs HAL_DISK_OK
+ret false
+end
+if ne get abs 0 4
+ret false
+end
+if ne hal_part_xlate 7 1 abs HAL_DISK_OK
+ret false
+end
+if ne get abs 0 11
+ret false
+end
+note Negative: past end (8, 1), straddling (7, 2), overflow (0xffffffffffffffff, 1), count 0
+if ne hal_part_xlate 8 1 abs HAL_DISK_ERANGE
+ret false
+end
+if ne hal_part_xlate 7 2 abs HAL_DISK_ERANGE
+ret false
+end
+if ne hal_part_xlate 0xffffffffffffffff 1 abs HAL_DISK_ERANGE
+ret false
+end
+if ne hal_part_xlate 0 0 abs HAL_DISK_EARG
+ret false
+end
+note Mutant control: bypass_xlate=1 fails to refuse past-end write (caught!)
+hal_set_mutants 1 0
+rc_mut = hal_part_xlate 8 1 abs
+hal_set_mutants 0 0
+if eq rc_mut HAL_DISK_ERANGE
+ret false
+end
+ret true
+end
+
+fn test_10_nvme_confinement_gate to bool
+hal_set_mutants 0 0
+hal_nvme_reset
+guid = new uchar 16 0
+fill_aienos_guid guid
+disk = new uchar 8192 0
+build_valid_gpt_disk disk guid
+if ne hal_gpt_find_type disk 512 16 guid HAL_GPT_OK
+ret false
+end
+abs = new ulong 1 0
+note Unclaimed write refused
+if ne hal_nvme_authorize_write 0 1 abs HAL_NVME_ESTATE
+ret false
+end
+note Claim unconfined (smmu_confined=0) -> write refused
+if ne hal_nvme_claim 0 0x10 0 0 0 HAL_NVME_OK
+ret false
+end
+if ne hal_nvme_authorize_write 0 1 abs HAL_NVME_EUNCONFINED
+ret false
+end
+note Double-claim refused
+if ne hal_nvme_claim 0 0x10 1 5 0 HAL_NVME_ESTATE
+ret false
+end
+note Release and re-claim confined (smmu_confined=1) -> write authorized at abs LBA 4
+if ne hal_nvme_release HAL_NVME_OK
+ret false
+end
+if ne hal_nvme_claim 0 0x10 1 0x1010 0 HAL_NVME_OK
+ret false
+end
+if ne hal_nvme_authorize_write 0 1 abs HAL_DISK_OK
+ret false
+end
+if ne get abs 0 4
+ret false
+end
+note Sticky bus-master fails closed even after release
+if ne hal_nvme_release HAL_NVME_OK
+ret false
+end
+if ne hal_nvme_claim 0 0x10 1 0x1010 1 HAL_NVME_ESTUCK
+ret false
+end
+if ne hal_nvme_release HAL_NVME_ESTUCK
+ret false
+end
+if ne hal_nvme_claim 0 0x10 1 0x1010 0 HAL_NVME_ESTATE
+ret false
+end
+hal_nvme_reset
+ret true
+end
+
+fn test_11_store_key_and_provision to bool
+hal_set_mutants 0 0
+note Key admissibility: hardware staging refuses TEST keys, allows PROD
+if ne hal_store_key_admissible HAL_KEY_TEST 1 HAL_SB_E_TEST_KEYS
+ret false
+end
+if ne hal_store_key_admissible HAL_KEY_TEST 0 HAL_SB_OK
+ret false
+end
+if ne hal_store_key_admissible HAL_KEY_PROD 1 HAL_SB_OK
+ret false
+end
+if ne hal_store_key_admissible 99 0 HAL_SB_E_KEYSLOT_BAD
+ret false
+end
+prov = new uchar 32 0
+ctx = new uchar 32 0
+z32 = new uchar 32 0
+put prov 0 0xaa
+put ctx 0 0xbb
+note Negative: zero provenance or zero cortex or bad origin refused
+if ne hal_store_provision_gate z32 ctx HAL_ORIGIN_OPERATOR 0 0 3 HAL_CR_E_ARG
+ret false
+end
+if ne hal_store_provision_gate prov z32 HAL_ORIGIN_OPERATOR 0 0 3 HAL_CR_E_ARG
+ret false
+end
+if ne hal_store_provision_gate prov ctx 9 0 0 3 HAL_CR_E_ARG
+ret false
+end
+note Negative: orphan subject without root refused (CR_CORRUPT)
+if ne hal_store_provision_gate prov ctx HAL_ORIGIN_OPERATOR 0 1 3 HAL_CR_CORRUPT
+ret false
+end
+note Negative: already provisioned refused
+if ne hal_store_provision_gate prov ctx HAL_ORIGIN_OPERATOR 1 1 3 HAL_CR_ALREADY_PROVISIONED
+ret false
+end
+note Positive: atomic single-transaction provisioning (3 base + 1 subject = 4 objs, txn_count=1)
+if ne hal_store_provision_gate prov ctx HAL_ORIGIN_OPERATOR 0 0 3 HAL_CR_RESOLVED
+ret false
+end
+if or ne get hal_prov 0 1 ne get hal_prov 1 4
+ret false
+end
+if ne get hal_prov 2 1
+ret false
+end
+note Mutant control: split_txn=1 splits into 2 transactions -> caught (HAL_CR_SPLIT_TXN)
+hal_set_mutants 0 1
+rc_mut = hal_store_provision_gate prov ctx HAL_ORIGIN_PROMOTED 0 0 3
+hal_set_mutants 0 0
+if or ne rc_mut HAL_CR_SPLIT_TXN ne get hal_prov 0 2
+ret false
+end
+ret true
+end
+
+fn main to int
+fails = uint 0
+fails = add fails hreport h_t01 test_01_acpi_checksum
+fails = add fails hreport h_t02 test_02_iort_multi_smmu
+fails = add fails hreport h_t03 test_03_iort_overlap_and_malformed
+fails = add fails hreport h_t04 test_04_iort_rmr_boundaries
+fails = add fails hreport h_t05 test_05_iort_named_component
+fails = add fails hreport h_t06 test_06_iort_mutants
+fails = add fails hreport h_t07 test_07_gpt_crc32_and_valid
+fails = add fails hreport h_t08 test_08_gpt_negatives
+fails = add fails hreport h_t09 test_09_part_xlate_and_mutant
+fails = add fails hreport h_t10 test_10_nvme_confinement_gate
+fails = add fails hreport h_t11 test_11_store_key_and_provision
+if eq fails 0
+w = hwrite_all 1 h_sum
+if w
+ret 0
+end
+ret 1
+end
+w2 = hwrite_all 1 h_fsum
+ret 1
+end

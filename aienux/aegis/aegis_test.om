@@ -1,0 +1,416 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/aegis/aegis_test.om: Pure-Omega test suite for AIENOS AEGIS
+note (Capability Graph, Path Confinement, Intent/Grant Crypto, J-Space Worlds, Policy & Broker).
+note Compose with: si/directives/om2.om om/tls/sha2.om aienux/aegis/aegis.om aienux/aegis/aegis_test.om
+
+text a_pass "PASS "
+text a_fail "FAIL "
+text a_nl "\n"
+text a_t01 "aegis_lexical_path_confinement"
+text a_t02 "aegis_cap_issue_sig_tamper_and_expiry"
+text a_t03 "aegis_attenuated_delegation_and_depth_limit"
+text a_t04 "aegis_cascading_subtree_revocation"
+text a_t05 "aegis_intent_boundaries_and_operator_grant_crypto"
+text a_t06 "aegis_standing_fetch_fs_read_and_negatives"
+text a_t07 "aegis_high_impact_boundary_requires_grant"
+text a_t08 "aegis_jspace_world_delta_and_rollback"
+text a_t09 "aegis_broker_audit_ledger_integrity"
+text a_t10 "aegis_mutant_control_skip_grant_caught"
+text a_sum "AEGIS_TEST_PASS total=10 failed=0\n"
+text a_fsum "AEGIS_TEST_FAIL\n"
+
+text p_ws "/workspace"
+text p_ws_eq "/workspace"
+text p_ws_sub "/workspace/project/file.om"
+text p_ws_sub2 "/workspace/project"
+text p_ws_sib "/workspace2/file.om"
+text p_ws_trav "/workspace/../etc/passwd"
+text p_rel "workspace/file.om"
+text p_root "/"
+text p_etc "/etc/passwd"
+text p_host_ok "interplane.io"
+text p_host_bad "evil.example"
+text p_host_star "*"
+text p_op_drake "operator-drake"
+text p_k_ab "ab"
+text p_v_c "c"
+text p_k_a "a"
+text p_v_bc "bc"
+text p_dev_nvme "/dev/nvme0n1"
+text p_empty ""
+
+fn awrite_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn areport name view uchar * ok bool to uint
+if ok
+w1 = awrite_all 1 a_pass
+w2 = awrite_all 1 name
+w3 = awrite_all 1 a_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = awrite_all 1 a_fail
+w2 = awrite_all 1 name
+w3 = awrite_all 1 a_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn init_test_aegis op_sec edit uchar 32 cap_sec edit uchar 32 to void
+for i ulong 32
+put op_sec i uchar add 0x10 and i 0x3f
+put cap_sec i uchar add 0x80 and i 0x3f
+end
+aegis_reset op_sec cap_sec
+end
+
+fn test_a01_path_within to bool
+if not aegis_path_within p_ws_sub p_ws
+ret false
+end
+if not aegis_path_within p_ws_eq p_ws
+ret false
+end
+if not aegis_path_within p_ws_sub p_root
+ret false
+end
+note Prefix sibling /workspace2 must NOT match /workspace
+if aegis_path_within p_ws_sib p_ws
+ret false
+end
+note Parent-dir traversal .. must be rejected
+if aegis_path_within p_ws_trav p_ws
+ret false
+end
+note Relative path must be rejected
+if aegis_path_within p_rel p_ws
+ret false
+end
+ret true
+end
+
+fn test_a02_cap_sig_and_expiry to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+init_test_aegis op cs
+s = aegis_cap_issue 100 AEGIS_SCOPE_FS 0 0 1000
+if lt s 0
+ret false
+end
+su = ulong s
+aegis_cap_set_strings su p_ws part p_empty 0 0
+note Valid before expiry
+if ne aegis_cap_validate su 500 AEGIS_OK
+ret false
+end
+note Expired at 1001
+if ne aegis_cap_validate su 1001 AEGIS_ERR_EXPIRED
+ret false
+end
+note Tamper 1 byte of stored signature -> must fail AEGIS_ERR_BAD_SIG
+sb = mul su 32
+put aegis_cap_sig sb xor get aegis_cap_sig sb 0x01
+if ne aegis_cap_validate su 500 AEGIS_ERR_BAD_SIG
+ret false
+end
+ret true
+end
+
+fn test_a03_delegation_attenuation to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+init_test_aegis op cs
+note Root RW cap on /workspace
+r = aegis_cap_issue 100 AEGIS_SCOPE_FS 0 0 0
+if lt r 0
+ret false
+end
+ru = ulong r
+aegis_cap_set_strings ru p_ws part p_empty 0 0
+note Attenuate to subdir /workspace/project, RO=1 -> OK
+c1 = aegis_cap_delegate_scoped ru 200 AEGIS_SCOPE_FS 1 p_ws_sub2
+if lt c1 0
+ret false
+end
+note Attempt RO -> RW escalation from c1 -> REFUSED
+if ne aegis_cap_delegate_scoped ulong c1 300 AEGIS_SCOPE_FS 0 p_ws_sub2 AEGIS_ERR_SCOPE
+ret false
+end
+note Attempt directory escape /etc/passwd -> REFUSED
+if ne aegis_cap_delegate_scoped ru 300 AEGIS_SCOPE_FS 1 p_etc AEGIS_ERR_SCOPE
+ret false
+end
+note Chain up to max depth (4), 5th delegation -> AEGIS_ERR_DEPTH
+c2 = aegis_cap_delegate_scoped ulong c1 201 AEGIS_SCOPE_FS 1 p_ws_sub2
+c3 = aegis_cap_delegate_scoped ulong c2 202 AEGIS_SCOPE_FS 1 p_ws_sub2
+c4 = aegis_cap_delegate_scoped ulong c3 203 AEGIS_SCOPE_FS 1 p_ws_sub2
+if or lt c2 0 or lt c3 0 lt c4 0
+ret false
+end
+if ne aegis_cap_delegate_scoped ulong c4 204 AEGIS_SCOPE_FS 1 p_ws_sub2 AEGIS_ERR_DEPTH
+ret false
+end
+ret true
+end
+
+fn test_a04_subtree_revocation to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+init_test_aegis op cs
+root = aegis_cap_issue 100 AEGIS_SCOPE_FS 0 0 0
+aegis_cap_set_strings ulong root p_ws part p_empty 0 0
+sib = aegis_cap_issue 101 AEGIS_SCOPE_FS 1 0 0
+aegis_cap_set_strings ulong sib p_ws part p_empty 0 0
+child = aegis_cap_delegate_scoped ulong root 200 AEGIS_SCOPE_FS 0 p_ws_sub2
+gchild = aegis_cap_delegate_scoped ulong child 300 AEGIS_SCOPE_FS 1 p_ws_sub2
+if or lt child 0 lt gchild 0
+ret false
+end
+if ne aegis_cap_revoke ulong root AEGIS_OK
+ret false
+end
+if ne aegis_cap_validate ulong root 0 AEGIS_ERR_REVOKED
+ret false
+end
+if ne aegis_cap_validate ulong child 0 AEGIS_ERR_REVOKED
+ret false
+end
+if ne aegis_cap_validate ulong gchild 0 AEGIS_ERR_REVOKED
+ret false
+end
+note Unrelated sibling remains valid
+if ne aegis_cap_validate ulong sib 0 AEGIS_OK
+ret false
+end
+ret true
+end
+
+fn test_a05_intent_and_grant_crypto to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+bad = new uchar 32 0x77
+init_test_aegis op cs
+note Parameter boundary separation: ("ab","c") != ("a","bc")
+aegis_intent_hash_kv 42 p_k_ab p_v_c
+id1 = new uchar 16 0
+for i ulong 16
+put id1 i get aegis_cur_iid i
+end
+aegis_intent_hash_kv 42 p_k_a p_v_bc
+id2 = new uchar 16 0
+for j ulong 16
+put id2 j get aegis_cur_iid j
+end
+if aegis_eq16 id1 id2
+ret false
+end
+note Valid grant verifies
+aegis_grant_issue_with_secret p_op_drake 1700000000 op
+if ne aegis_grant_verify_current AEGIS_OK
+ret false
+end
+note Grant signed with wrong secret rejected
+aegis_grant_issue_with_secret p_op_drake 1700000000 bad
+if ne aegis_grant_verify_current AEGIS_ERR_GRANT_SIG
+ret false
+end
+note Grant for different intent rejected
+aegis_grant_issue_with_secret p_op_drake 1700000000 op
+put aegis_cur_iid 0 xor get aegis_cur_iid 0 0xff
+if ne aegis_grant_verify_current AEGIS_ERR_GRANT_INTENT
+ret false
+end
+ret true
+end
+
+fn test_a06_standing_fetch_and_fs_read to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+init_test_aegis op cs
+aegis_grant_clear
+sf = aegis_cap_issue 10 AEGIS_SCOPE_STANDING_FETCH 0 0 0
+aegis_cap_set_strings ulong sf p_host_ok part p_empty 0 0
+fs = aegis_cap_issue 10 AEGIS_SCOPE_FS 1 0 0
+aegis_cap_set_strings ulong fs p_ws part p_empty 0 0
+aegis_dispatch_ctx 0 0 100 0
+note StandingFetch to interplane.io approved autonomously without grant
+if ne aegis_broker_dispatch 10 ulong sf aegis_act_net_fetch p_host_ok AEGIS_OK
+ret false
+end
+note Wrong host refused
+if ne aegis_broker_dispatch 10 ulong sf aegis_act_net_fetch p_host_bad AEGIS_ERR_SCOPE
+ret false
+end
+note Wrong holder refused
+if ne aegis_broker_dispatch 99 ulong sf aegis_act_net_fetch p_host_ok AEGIS_ERR_HOLDER
+ret false
+end
+note fs.read within /workspace approved autonomously
+if ne aegis_broker_dispatch 10 ulong fs aegis_act_fs_read p_ws_sub AEGIS_OK
+ret false
+end
+note fs.write on RO cap refused by scope
+if ne aegis_broker_dispatch 10 ulong fs aegis_act_fs_write p_ws_sub AEGIS_ERR_SCOPE
+ret false
+end
+ret true
+end
+
+fn test_a07_high_impact_requires_grant to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+bad = new uchar 32 0x55
+init_test_aegis op cs
+aegis_grant_clear
+adm = aegis_cap_issue 20 AEGIS_SCOPE_SYSADMIN 0 0 0
+aegis_dispatch_ctx 0 0 200 0
+note disk.format without grant -> AEGIS_ERR_MISSING_GRANT + DEC_REQUIRES_OP
+if ne aegis_broker_dispatch 20 ulong adm aegis_act_disk_format p_dev_nvme AEGIS_ERR_MISSING_GRANT
+ret false
+end
+if ne get aegis_last_dec 0 AEGIS_DEC_REQUIRES_OP
+ret false
+end
+note Forged grant -> AEGIS_ERR_GRANT_SIG + DEC_REJECTED
+aegis_compute_intent_id 20 ulong adm aegis_act_disk_format p_dev_nvme
+aegis_grant_issue_with_secret p_op_drake 200 bad
+if ne aegis_broker_dispatch 20 ulong adm aegis_act_disk_format p_dev_nvme AEGIS_ERR_GRANT_SIG
+ret false
+end
+if ne get aegis_last_dec 0 AEGIS_DEC_REJECTED
+ret false
+end
+note Valid operator grant -> AEGIS_OK + DEC_APPROVED
+aegis_compute_intent_id 20 ulong adm aegis_act_disk_format p_dev_nvme
+aegis_grant_issue_with_secret p_op_drake 200 op
+if ne aegis_broker_dispatch 20 ulong adm aegis_act_disk_format p_dev_nvme AEGIS_OK
+ret false
+end
+if ne get aegis_last_dec 0 AEGIS_DEC_APPROVED
+ret false
+end
+ret true
+end
+
+fn test_a08_jspace_world_delta to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+init_test_aegis op cs
+aegis_grant_clear
+fs = aegis_cap_issue 30 AEGIS_SCOPE_FS 0 0 0
+aegis_cap_set_strings ulong fs p_ws part p_empty 0 0
+wi = aegis_world_create 777
+if lt wi 0
+ret false
+end
+note Reversible fs.write to active World 777 approved without grant!
+aegis_dispatch_ctx 777 1 300 0
+if ne aegis_broker_dispatch 30 ulong fs aegis_act_fs_write p_ws_sub AEGIS_OK
+ret false
+end
+if or ne get aegis_w_deltas ulong wi 1 ne get aegis_w_writes ulong wi 1
+ret false
+end
+note Rollback clears deltas and transitions World to ROLLEDBACK
+if ne aegis_world_rollback 777 AEGIS_OK
+ret false
+end
+if or ne get aegis_w_deltas ulong wi 0 ne get aegis_w_status ulong wi AEGIS_WORLD_ROLLEDBACK
+ret false
+end
+note Dispatching again to rolled-back World falls back to requiring OperatorGrant!
+if ne aegis_broker_dispatch 30 ulong fs aegis_act_fs_write p_ws_sub AEGIS_ERR_MISSING_GRANT
+ret false
+end
+ret true
+end
+
+fn test_a09_audit_ledger to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+init_test_aegis op cs
+aegis_grant_clear
+fs = aegis_cap_issue 40 AEGIS_SCOPE_FS 0 0 0
+aegis_cap_set_strings ulong fs p_ws part p_empty 0 0
+aegis_dispatch_ctx 0 0 401 0
+r1 = aegis_broker_dispatch 40 ulong fs aegis_act_fs_read p_ws_sub
+aegis_dispatch_ctx 0 0 402 0
+r2 = aegis_broker_dispatch 40 ulong fs aegis_act_fs_write p_ws_sub
+aegis_dispatch_ctx 0 0 403 0
+r3 = aegis_broker_dispatch 40 ulong fs aegis_act_fs_read p_etc
+if or ne r1 AEGIS_OK or ne r2 AEGIS_ERR_MISSING_GRANT ne r3 AEGIS_ERR_SCOPE
+ret false
+end
+if ne get aegis_audit_cnt 0 3
+ret false
+end
+if or ne get aegis_audit_dec 0 AEGIS_DEC_APPROVED ne get aegis_audit_exec 0 1
+ret false
+end
+if or ne get aegis_audit_dec 1 AEGIS_DEC_REQUIRES_OP ne get aegis_audit_exec 1 0
+ret false
+end
+if or ne get aegis_audit_dec 2 AEGIS_DEC_REJECTED ne get aegis_audit_ts 2 403
+ret false
+end
+ret true
+end
+
+fn test_a10_mutant_skip_grant to bool
+op = new uchar 32 0
+cs = new uchar 32 0
+init_test_aegis op cs
+aegis_grant_clear
+adm = aegis_cap_issue 50 AEGIS_SCOPE_SYSADMIN 0 0 0
+aegis_dispatch_ctx 0 0 500 0
+note With mutant OFF: kernel.replace without grant MUST be refused
+if ne aegis_broker_dispatch 50 ulong adm aegis_act_kern_rep p_dev_nvme AEGIS_ERR_MISSING_GRANT
+ret false
+end
+note With mutant ON (skip_grant=1): unapproved kernel.replace slips through -> mutant detected!
+aegis_set_mutant_skip_grant 1
+rc_mut = aegis_broker_dispatch 50 ulong adm aegis_act_kern_rep p_dev_nvme
+aegis_set_mutant_skip_grant 0
+if eq rc_mut AEGIS_ERR_MISSING_GRANT
+ret false
+end
+ret true
+end
+
+fn main to int
+fails = uint 0
+fails = add fails areport a_t01 test_a01_path_within
+fails = add fails areport a_t02 test_a02_cap_sig_and_expiry
+fails = add fails areport a_t03 test_a03_delegation_attenuation
+fails = add fails areport a_t04 test_a04_subtree_revocation
+fails = add fails areport a_t05 test_a05_intent_and_grant_crypto
+fails = add fails areport a_t06 test_a06_standing_fetch_and_fs_read
+fails = add fails areport a_t07 test_a07_high_impact_requires_grant
+fails = add fails areport a_t08 test_a08_jspace_world_delta
+fails = add fails areport a_t09 test_a09_audit_ledger
+fails = add fails areport a_t10 test_a10_mutant_skip_grant
+if eq fails 0
+w = awrite_all 1 a_sum
+if w
+ret 0
+end
+ret 1
+end
+w2 = awrite_all 1 a_fsum
+ret 1
+end
