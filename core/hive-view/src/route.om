@@ -1,0 +1,426 @@
+note ==== route.om: POST /send from the HTML form, the route table and the per-connection loop
+note ---- POST /send: application/x-www-form-urlencoded fields s (session), k (form key), r (return
+note page: q = the overview, s = the session page), a (line, enter, escape) and t (the text). The
+note decoded fields are laid out as "NAME<LF>ACTION<LF>TEXT" for vwsendp (which checks the name,
+note the action, the text and the live session, types it and logs it); the browser is then sent
+note back to the page it came from with the result in the query (?m=CODE&a=ACTION&b=BYTES).
+global gfl ulong 8
+global gres ulong 3
+text tfns "s"
+text tfnk "k"
+text tfnr "r"
+text tfna "a"
+text tfnt "t"
+text tlocq "/?m="
+text tlocs "/s/"
+text tlocm "?m="
+text tloca "&a="
+text tlocb "&b="
+text tlocn "&s="
+note vwfdst / vwfcap: where field k is decoded inside buf (past the 16384-byte body) and its limit
+fn vwfdst k ulong to ulong
+if eq k 4
+ret 24576
+end
+ret add 20000 mul k 256
+end
+fn vwfcap k ulong to ulong
+if eq k 4
+ret 8192
+end
+if eq k 2
+ret 4
+end
+if eq k 3
+ret 8
+end
+ret 64
+end
+note vwfdec: percent-decode buf[p, q) ('+' is a space) to buf[d, ...); 1000000 when malformed or over cap
+fn vwfdec buf edit uchar 262144 p ulong q ulong d ulong cap ulong to ulong
+n = ulong 0
+i = p
+for it ulong 65536
+if ge i q
+ret n
+end
+if ge n cap
+ret 1000000
+end
+c = get buf i
+if eq c 43
+c = 32
+end
+if eq c 37
+if gt add i 3 q
+ret 1000000
+end
+h = hhexv get buf add i 1
+l = hhexv get buf add i 2
+if or gt h 15 gt l 15
+ret 1000000
+end
+c = uchar add mul h 16 l
+i = add i 2
+end
+put buf add d n c
+n = add n 1
+i = add i 1
+end
+ret 1000000
+end
+fn vwfidx buf edit uchar 262144 p ulong to ulong
+c = get buf p
+if eq c get tfns 0
+ret 0
+end
+if eq c get tfnk 0
+ret 1
+end
+if eq c get tfnr 0
+ret 2
+end
+if eq c get tfna 0
+ret 3
+end
+if eq c get tfnt 0
+ret 4
+end
+ret 9
+end
+note vwfparse: every field is one of s k r a t, present at most once, and decodes cleanly
+fn vwfparse buf edit uchar 262144 n ulong to bool
+for i ulong 8
+put gfl i 0
+end
+p = ulong 0
+for it ulong 16
+if ge p n
+ret true
+end
+q = n
+for i ulong sub n p
+if eq get buf add p i 38
+q = add p i
+break
+end
+end
+if or lt sub q p 2 ne get buf add p 1 61
+ret false
+end
+k = vwfidx buf p
+if gt k 4
+ret false
+end
+if ne get gfl k 0
+ret false
+end
+l = vwfdec buf add p 2 q vwfdst k vwfcap k
+if ge l 1000000
+ret false
+end
+put gfl k add l 1
+p = add q 1
+end
+ret false
+end
+note vwfkey: field k is exactly the form key (compared in time independent of the contents)
+fn vwfkey buf edit uchar 262144 to bool
+if ne get gfl 1 65
+ret false
+end
+vwcsrfk
+d = uchar 0
+b = vwfdst 1
+for i ulong 64
+d = or d xor get buf add b i get gcsrf i
+end
+ret eq d 0
+end
+fn vwfis buf edit uchar 262144 k ulong t view uchar * to bool
+if ne get gfl k add len t 1
+ret false
+end
+b = vwfdst k
+for i ulong len t
+if ne get buf add b i get t i
+ret false
+end
+end
+ret true
+end
+note vwfact: 0 line, 1 enter, 2 escape, 9 anything else
+fn vwfact buf edit uchar 262144 to ulong
+if vwfis buf 3 taline
+ret 0
+end
+if vwfis buf 3 taenter
+ret 1
+end
+if vwfis buf 3 taesc
+ret 2
+end
+ret 9
+end
+note vwfbuild: "NAME<LF>ACTION<LF>TEXT" at buf[0, ...) from the decoded fields; the text is kept
+note only for a line (the Enter and Escape buttons ignore whatever is in the box). Returns its length.
+fn vwfbuild buf edit uchar 262144 act ulong to ulong
+m = ulong 0
+ns = vwfdst 0
+nl = sub hmax get gfl 0 1 1
+for i ulong nl
+put buf m get buf add ns i
+m = add m 1
+end
+put buf m 10
+m = add m 1
+as = vwfdst 3
+al = sub hmax get gfl 3 1 1
+for i ulong al
+put buf m get buf add as i
+m = add m 1
+end
+put buf m 10
+m = add m 1
+if eq act 0
+ts = vwfdst 4
+tl = sub hmax get gfl 4 1 1
+for i ulong tl
+put buf m get buf add ts i
+m = add m 1
+end
+end
+ret m
+end
+fn vwnameb buf edit uchar 262144 to bool
+n = sub hmax get gfl 0 1 1
+if or eq n 0 gt n 63
+ret false
+end
+b = vwfdst 0
+for i ulong n
+if not vwnamec get buf add b i
+ret false
+end
+end
+ret true
+end
+fn vwlc2 loc edit uchar 256 n ulong t view uchar * to ulong
+k = n
+for i ulong len t
+if lt k 256
+put loc k get t i
+k = add k 1
+end
+end
+ret k
+end
+fn vwld2 loc edit uchar 256 n ulong v ulong to ulong
+d = new uchar 20 0
+k = ulong 0
+x = v
+for it ulong 20
+put d k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+m = n
+for i ulong k
+if lt m 256
+put loc m get d sub sub k 1 i
+m = add m 1
+end
+end
+ret m
+end
+fn vwlname loc edit uchar 256 n ulong buf edit uchar 262144 to ulong
+m = n
+b = vwfdst 0
+for i ulong sub hmax get gfl 0 1 1
+if lt m 256
+put loc m get buf add b i
+m = add m 1
+end
+end
+ret m
+end
+fn vwsendf cs edit ulong 320 io edit uchar 131072 buf edit uchar 262144 to long
+if not vworigin cs io
+ret vwtext cs io 403 tnoorig
+end
+n = hbodyall cs io buf
+if lt n 0
+if eq n HEBIG
+ret vwtext cs io 413 tbigbody
+end
+ret vwtext cs io 400 tbadbody
+end
+ok = vwfparse buf ulong n
+if and ok not vwfkey buf
+ret vwtext cs io 403 tbadkey
+end
+code = ulong 1
+act = ulong 9
+nb = ulong 0
+if ok
+act = vwfact buf
+if eq act 0
+nb = sub hmax get gfl 4 1 1
+end
+code = vwsendp buf vwfbuild buf act
+end
+put gres 0 code
+put gres 1 act
+put gres 2 nb
+ret vwredir cs io buf ok
+end
+note vwredir: 302 back to the page the form was on, with gres (code, action, bytes) in the query
+fn vwredir cs edit ulong 320 io edit uchar 131072 buf edit uchar 262144 ok bool to long
+okn = false
+tos = false
+if ok
+okn = vwnameb buf
+tos = vwfis buf 2 tfns
+end
+code = get gres 0
+act = get gres 1
+nb = get gres 2
+loc = new uchar 256 0
+k = ulong 0
+if and okn tos
+k = vwlc2 loc k tlocs
+k = vwlname loc k buf
+k = vwlc2 loc k tlocm
+else
+k = vwlc2 loc k tlocq
+end
+k = vwld2 loc k code
+if lt act 3
+k = vwlc2 loc k tloca
+k = vwld2 loc k act
+end
+k = vwlc2 loc k tlocb
+k = vwld2 loc k nb
+if okn
+k = vwlc2 loc k tlocn
+k = vwlname loc k buf
+end
+r = hrspst cs io 302
+r = hfe r vwsech cs io
+r = hfe r hhname cs io tloc
+r = hfe r hhval cs io view part loc 0 k
+r = hfe r hhend cs io 0 0
+ret hfe r hwfin cs io
+end
+note ---- routing
+note vwlogq: the request target is "/?t=..." (the one-time link), not a result query like "/?m=0"
+fn vwlogq cs edit ulong 320 io edit uchar 131072 to bool
+tg = get cs HTOFF
+tl = get cs HTLEN
+if lt tl 3
+ret false
+end
+ret and eq get io add tg 1 63 eq get io add tg 2 116
+end
+fn vwpanel cs edit ulong 320 io edit uchar 131072 buf edit uchar 262144 to long
+if hispath cs io tstatp
+ret vwpstat cs io buf
+end
+if hispath cs io tpane
+ret vwppane cs io buf
+end
+if hispath cs io ttiles
+ret vwptiles cs io buf
+end
+if hispath cs io thermp
+ret vwphermes cs io buf
+end
+if hispath cs io tmachp
+ret vwpmach cs io buf
+end
+if hispath cs io tboardp
+ret vwpboard cs io buf
+end
+if hispath cs io tentp
+ret vwpents cs io buf
+end
+if vwsname cs io
+ret vwpsess cs io buf
+end
+ret vwtext cs io 404 tnotfnd
+end
+fn vwroute cs edit ulong 320 io edit uchar 131072 buf edit uchar 262144 to long
+if not vwhostok cs io
+ret vwtext cs io 400 tbadhost
+end
+isget = hismeth cs io tget
+if hispath cs io tphealth
+ret vwtext cs io 200 tok200
+end
+if hispath cs io tpsend
+if not hismeth cs io tpost
+ret vwtext cs io 405 tmeth
+end
+if not vwauth cs io
+ret vwtext cs io 403 tnoauth
+end
+ret vwsendf cs io buf
+end
+if not isget
+ret vwtext cs io 405 tmeth
+end
+if hispath cs io tpcss
+ret vwcss cs io buf
+end
+if hispath cs io tpalp
+ret vwpal cs io buf
+end
+if hispath cs io troot
+if vwlogq cs io
+ret vwlogin cs io
+end
+if not vwauth cs io
+ret vwpsignout cs io buf
+end
+ret vwptop cs io buf
+end
+if not vwauth cs io
+ret vwpsignout cs io buf
+end
+ret vwpanel cs io buf
+end
+fn vwconn c long to void
+cs = new ulong 320 0
+io = new uchar 131072 0
+buf = new uchar 262144 0
+r = hinit cs io int c 1
+if lt r 0
+x = hclose cs
+ret
+end
+hsettmo cs 30000000000 10000000000
+hsetbdl cs 10000000000
+note the only request body hive-view accepts is the 16 KiB send form; a larger declared
+note Content-Length is refused with 413 as soon as the head is read
+put cs HBCAP 16384
+for k ulong 1000
+r = hreqrd cs io
+if le r 0
+if lt r 0
+x = hreject cs io r
+end
+break
+end
+r = vwroute cs io buf
+if lt r 0
+break
+end
+if eq hnext cs io 0
+break
+end
+end
+x = hclose cs
+end
