@@ -68,6 +68,20 @@ uint64_t cg_moe2_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_m
 uint64_t cg_moe_ok(const uint64_t o_sp[8]);
 /* export fn cg_moe_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_moe_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_qmma_probe sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_qmma_probe(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_qmma_peak sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_qmma_peak(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_f2e4_probe ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_f2e4_probe(uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_rl_ok sp view ulong 8 to ulong */
+uint64_t cg_rl_ok(const uint64_t o_sp[8]);
+/* export fn cg_rl_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_rl_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_mc_ok sp view ulong 8 to ulong */
+uint64_t cg_mc_ok(const uint64_t o_sp[8]);
+/* export fn cg_mc_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_mc_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 #ifdef __cplusplus
 }
 #endif

@@ -18,7 +18,9 @@
 #include "omega_blackwell_codegen_qmma.h"
 #include "omega_bw_em.h"
 #include "omega_bw_em_q.h"
+#include "omega_bw_om_ir.h"
 #include "omega_gpu_fmt.h"
+#include "omega_native.h"
 
 static uint32_t rd32q(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static void wr32q(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
@@ -83,72 +85,24 @@ int omega_qmma_patch_selftest(char *msg, size_t msgn) {
 }
 
 int omega_blackwell_codegen_qmma_probe_prog(int mutant, uint32_t wait_nops, BlackwellIRProgram *prog) {
-    if (!prog || mutant < 0 || mutant > 1 || wait_nops > 16) return -1;
-    omega_bw_ir_init(prog);
-    Em em; memset(&em, 0, sizeof em); em.p = prog; Em *e = &em;
-    int udesc = UV64(e), pin = V64(e), pout = V64(e), tid = V(e), cx = V(e), pa = V64(e), po = V64(e), pcase = V64(e), pb = V64(e);
-    int a = V128(e), b = V64(e), c = V128(e), d = V128(e);
-    if (e->err) return -1;
-    ldcu64(e, udesc, 0x358);
-    ldc64(e, pin, 0x380); ldc64(e, pout, 0x388);
-    s2r(e, tid, BW_SR_TID_X); s2r(e, cx, BW_SR_CTAID_X);
-    imadw(e, pcase, cx, 1280u, pin); imadw(e, pa, tid, 16, pcase); imadw(e, pb, tid, 8, pcase);
-    imadw(e, po, cx, 512u, pout); imadw(e, po, tid, 16, po);
-    ldg_wide(e, BW_IR_LDG_E_128, a, pa, 0, udesc, 1);
-    ldg_wide(e, BW_IR_LDG_E_128, c, pa, 768, udesc, 0);
-    ldg_wide(e, BW_IR_LDG_E_64, b, pb, 512, udesc, 0);
-    qmma(e, d, a, b, mutant == 1 ? NOREG : c, 15);
-    for (uint32_t i = 0; i < wait_nops; i++) nop(e, 15);
-    for (unsigned q = 0; q < 4; q++) { BlackwellIRInsn i = I0(BW_IR_STG_E); i.src1_vreg = po; i.src2_vreg = d; i.src2_subreg = (uint8_t)q; i.imm = 4u * q; i.ureg = udesc; emit(e, i, K_STORE); }
-    tail(e);
-    if (e->err) return -1;
-    return omega_bw_regalloc_solve(prog);
+    if (!prog) return -1;
+    uint64_t sp[8] = { (uint64_t)(uint32_t)mutant, wait_nops, 0, 0, 0, 0, 0, 0 };
+    uint64_t ins[8192], meta[512], rc = 1;
+    if (omega2_cg_qmma_probe(&rc, sp, 8u, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
+    return omega_bw_ir_from_om(ins, meta, prog);
 }
 
 int omega_blackwell_codegen_qmma_peak_prog(uint32_t iters, uint32_t chains, uint32_t stall, uint32_t threads, BlackwellIRProgram *prog) {
-    if (!prog || iters == 0 || chains == 0 || chains > 16 || stall == 0 || stall > 15 || threads == 0 || threads % 32 || threads > 1024) return -1;
-    omega_bw_ir_init(prog);
-    Em em; memset(&em, 0, sizeof em); em.p = prog; Em *e = &em;
-    int udesc = UV64(e), py = V64(e), tid = V(e), cta = V(e), one = V(e), cnt = V(e), a = V128(e), b = V64(e), acc[16];
-    for (uint32_t c = 0; c < chains; c++) acc[c] = V128(e);
-    if (e->err) return -1;
-    ldcu64(e, udesc, 0x358); ldc64(e, py, 0x380); s2r(e, tid, BW_SR_TID_X); s2r(e, cta, BW_SR_CTAID_X);
-    movi(e, one, 1);
-    for (unsigned q = 0; q < 4; q++) { BlackwellIRInsn m = I0(BW_IR_MOV_IMM); m.dst_vreg = a; m.dst_subreg = (uint8_t)q; m.imm = 0x38383838u; emit(e, m, K_FIXED); }
-    for (unsigned q = 0; q < 2; q++) { BlackwellIRInsn m = I0(BW_IR_MOV_IMM); m.dst_vreg = b; m.dst_subreg = (uint8_t)q; m.imm = 0x38383838u; emit(e, m, K_FIXED); }
-    for (uint32_t c = 0; c < chains; c++) for (unsigned q = 0; q < 4; q++) { BlackwellIRInsn mz = I0(BW_IR_MOV_RZ); mz.dst_vreg = acc[c]; mz.dst_subreg = (uint8_t)q; emit(e, mz, K_FIXED); }
-    movi(e, cnt, iters);
-    const int L = here(e);
-    loop_begin(e);
-    for (uint32_t c = 0; c < chains; c++) qmma(e, acc[c], a, b, acc[c], stall);
-    imadi(e, cnt, one, 0, 0xffffffffu, cnt);
-    isetp_ge_u32(e, cnt, one);
-    bra_if_p0(e, L);
-    loop_end(e);
-    nop(e, 15); nop(e, 15); nop(e, 15); nop(e, 15);
-    {   int t = V(e); if (e->err) return -1;
-        imadi(e, t, cta, 0, threads, tid); imadw(e, py, t, 16u * chains, py);
-        for (uint32_t c = 0; c < chains; c++) for (unsigned q = 0; q < 4; q++) { BlackwellIRInsn st = I0(BW_IR_STG_E); st.src1_vreg = py; st.src2_vreg = acc[c]; st.src2_subreg = (uint8_t)q; st.imm = c * 16u + 4u * q; st.ureg = udesc; emit(e, st, K_STORE); }
-    }
-    tail(e);
-    if (e->err) return -1;
-    return omega_bw_regalloc_solve(prog);
+    if (!prog) return -1;
+    uint64_t sp[8] = { iters, chains, stall, threads, 0, 0, 0, 0 };
+    uint64_t ins[8192], meta[512], rc = 1;
+    if (omega2_cg_qmma_peak(&rc, sp, 8u, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
+    return omega_bw_ir_from_om(ins, meta, prog);
 }
 
 int omega_blackwell_codegen_f2e4_probe_prog(BlackwellIRProgram *prog) {
     if (!prog) return -1;
-    omega_bw_ir_init(prog);
-    Em em; memset(&em, 0, sizeof em); em.p = prog; Em *e = &em;
-    int udesc = UV64(e), px = V64(e), py = V64(e), tid = V(e), cx = V(e), gi = V(e), x = V64(e), d = V(e);
-    if (e->err) return -1;
-    ldcu64(e, udesc, 0x358); ldc64(e, px, 0x380); ldc64(e, py, 0x388);
-    s2r(e, tid, BW_SR_TID_X); s2r(e, cx, BW_SR_CTAID_X);
-    imadi(e, gi, cx, 0, 128u, tid);
-    imadw(e, px, gi, 8u, px); imadw(e, py, gi, 4u, py);
-    ldg_wide(e, BW_IR_LDG_E_64, x, px, 0, udesc, 1);
-    f2e4(e, d, x, 0, x, 1);
-    stg(e, py, 0, d, udesc);
-    tail(e);
-    if (e->err) return -1;
-    return omega_bw_regalloc_solve(prog);
+    uint64_t ins[8192], meta[512], rc = 1;
+    if (omega2_cg_f2e4_probe(&rc, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
+    return omega_bw_ir_from_om(ins, meta, prog);
 }
