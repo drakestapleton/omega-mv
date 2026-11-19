@@ -1,0 +1,907 @@
+note SPDX-License-Identifier: Apache-2.0
+note flow.om (DRA-190): trace replay of the spark-window GPU queue under five dispatch arms at
+note equal resources (one window slot, the same arrivals, the same per-window service and the
+note same external eligibility times). Compiler: the omc named in omc.pin (gate.sh checks it); the
+note held-out run's compiler is in evidence/heldout/IDENTITY.txt, which records this file before
+note later header edits.
+note   flow FILE D0      FILE: integer TSV from export-windows.sh (11 columns); D0: the time the
+note                     slot is free before the first row (0 for a trace start).
+note Arms (PREREG.md section 4 is normative):
+note   A   current: FCFS, observed service, the front window holds the line while it waits.
+note   B   plain queueing baseline: A with each service capped at its own lease.
+note   Cr  B plus bounded retry: the second and later retries of one failure chain are parked.
+note   Ch  B plus backpressure: a window whose external condition is not met does not hold the
+note       line (eligible-first, FCFS among eligible).
+note   C   Ch plus bounded retry.
+note Output: QF lines of integers only. Every ratio, mean and threshold is evaluated outside
+note this program (Wolfram, PREREG.md section 6). Exit 0 ok, 2 usage, 3 I/O or malformed
+note input, 4 more than 4096 rows.
+om2
+
+const MAXN ulong 4096
+const RMAX long 1
+const RWIN long 3600
+const HARM long 60
+const GAPMAX long 3
+
+global arg uchar 1024
+global buf uchar 1048576
+global ob uchar 8192
+global st ulong 16
+global num uchar 24
+global ca long 4096
+global cs long 4096
+global ce long 4096
+global cl long 4096
+global cc long 4096
+global cv long 4096
+global co long 4096
+global el long 4096
+global sv long 4096
+global fo long 4096
+global ar long 4096
+global gp long 4096
+global sq long 4096
+global ac long 4096
+global rc long 4096
+global xs long 20480
+global xd long 20480
+global xv long 20480
+global xa long 20480
+global hl long 8
+global wk long 4096
+global row long 16
+global gv long 16
+
+text t_usage "usage: flow FILE D0\n"
+text t_ioerr "QF error io\n"
+text t_bad "QF error malformed line "
+text t_big "QF error rows > 4096\n"
+text t_nl "\n"
+text t_sp " "
+text t_trace "QF trace rows="
+text t_held " held="
+text t_anom " anomalies="
+text t_rty " retries="
+text t_d0 " d0="
+text t_arm "QF arm="
+text t_srv " served="
+text t_acc " acc="
+text t_drop " dropped="
+text t_lost " lostacc="
+text t_busy " busy="
+text t_use " useful="
+text t_hol " hol="
+text t_mina " mina="
+text t_maxd " maxdep="
+text t_soj " soj="
+text t_viol " viol="
+text t_ovl " overlap="
+text t_maxq " maxq="
+text t_rep " replayerr="
+text t_k "QF K arm="
+text t_n " n="
+text t_sumw " sumw="
+text t_p95 " p95="
+text t_maxw " maxw="
+text t_cmp "QF cmp x="
+text t_y " y="
+text t_worse " worse60="
+text t_bett " better60="
+text t_an "A"
+text t_bn "B"
+text t_crn "Cr"
+text t_chn "Ch"
+text t_cn "C"
+
+fn pr t view uchar * to void
+w = write 1 t 0 len t
+end
+
+fn argn i ulong to ulong
+if ge i ulong argcnt
+ret 0
+end
+n = argread i arg 0 len arg
+if le n 0
+ret 0
+end
+ret ulong n
+end
+
+fn oreset to void
+put st 2 0
+end
+
+fn obyte b uchar to void
+p = get st 2
+if lt p 8192
+put ob p b
+put st 2 add p 1
+end
+end
+
+fn otext t view uchar * to void
+for i ulong len t
+obyte get t i
+end
+end
+
+fn onum v ulong to void
+k = ulong 0
+x = v
+while true bound 21
+put num k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong k
+obyte get num sub sub k 1 i
+end
+end
+
+note Signed decimal.
+fn osnum v long to void
+if lt v 0
+obyte 45
+onum ulong neg v
+ret
+end
+onum ulong v
+end
+
+fn oflush to void
+w = write 1 ob 0 get st 2
+put st 2 0
+end
+
+fn lmax a long b long to long
+if gt a b
+ret a
+end
+ret b
+end
+
+note Read the file named by argument 1 into buf; its length, or -1.
+fn slurp to long
+n = argn 1
+if eq n 0
+ret -1
+end
+if ge n 1023
+ret -1
+end
+fd = int fopen arg 0 n 0 0
+if lt fd 0
+ret -1
+end
+tot = ulong 0
+while true bound 999999
+if ge tot len buf
+c = fclose fd
+ret -1
+end
+k = read fd buf tot sub len buf tot
+if lt k 0
+c2 = fclose fd
+ret -1
+end
+if eq k 0
+break
+end
+tot = add tot ulong k
+end
+c3 = fclose fd
+ret long tot
+end
+
+note Parse one signed decimal field of buf from p (st[4] is set to the position after it, which is
+note the tab, newline or end). Returns the value; st[5] = 1 when the field was malformed.
+fn pfield p ulong e ulong to long
+i = p
+s = long 1
+if lt i e
+if eq get buf i 45
+s = long -1
+i = add i 1
+end
+end
+v = long 0
+nd = ulong 0
+while true bound 32
+if ge i e
+break
+end
+b = get buf i
+if or lt b 48 gt b 57
+break
+end
+if gt nd 17
+put st 5 1
+break
+end
+v = add mul v 10 long sub b 48
+nd = add nd 1
+i = add i 1
+end
+if eq nd 0
+put st 5 1
+end
+put st 4 i
+ret mul s v
+end
+
+note Parse the trace into the column arrays. Returns the row count, or -1 malformed (st[6] = the
+note 1-based line), or -2 too many rows.
+fn parse e ulong to long
+p = ulong 0
+r = ulong 0
+while true bound 999999
+if ge p e
+break
+end
+if ge r MAXN
+ret -2
+end
+put st 5 0
+for c ulong 11
+v = pfield p e
+put row c v
+q = get st 4
+if lt c 10
+if ge q e
+put st 5 1
+else
+if ne get buf q 9
+put st 5 1
+end
+end
+end
+p = add q 1
+end
+if ne get st 5 0
+put st 6 add r 1
+ret -1
+end
+q2 = sub p 1
+if lt q2 e
+if ne get buf q2 10
+put st 6 add r 1
+ret -1
+end
+end
+put ca r get row 0
+put cs r get row 1
+put ce r get row 2
+put cl r get row 3
+put cc r get row 6
+put cv r get row 7
+put co r get row 8
+r = add r 1
+end
+ret long r
+end
+
+fn held i ulong to bool
+ret gt get cs i 0
+end
+
+note Observed derivation: front time, external eligibility time (optimistic), service, accepted.
+note Returns the anomaly count (a window starting before it reached the front, or ending before
+note it started).
+fn accobs i ulong to long
+if ne get cc i 0
+ret 0
+end
+if eq get cv i 1
+ret 0
+end
+ret 1
+end
+
+fn derheld i ulong f long to ulong
+s = get cs i
+e = get ce i
+an = ulong 0
+if lt s f
+an = add an 1
+end
+if gt s f
+put el i s
+else
+put el i get ar i
+end
+put sv i sub e s
+if lt e s
+an = add an 1
+end
+put ac i accobs i
+ret an
+end
+
+note In-line windows: spark-window writes <id>/requested only when a --wait ticket reaches the
+note head of the line, so a window requested 0..GAPMAX s after the previous departure was waiting
+note before it was recorded. Model (PREREG 4.2): it shares the arrival ar of the window before it
+note in request order and keeps the observed poll gap gp after the departure. When both windows
+note have the same owner it is a sequential leg (sq = 1): it cannot start before that window left.
+fn arrive i ulong d long to void
+a = get ca i
+g = sub a d
+put gp i 0
+put sq i 0
+put ar i a
+if gt d 0
+if ge g 0
+if le g GAPMAX
+put gp i g
+if gt i 0
+put ar i get ar sub i 1
+if eq get co i get co sub i 1
+put sq i 1
+end
+end
+end
+end
+end
+end
+
+fn derive n ulong d0 long to ulong
+d = d0
+an = ulong 0
+for i ulong n
+arrive i d
+f = lmax get ca i d
+put fo i f
+if held i
+an = add an derheld i f
+d = get ce i
+else
+put el i get ar i
+put sv i 0
+put ac i 0
+if gt get ce i f
+d = get ce i
+end
+end
+end
+ret an
+end
+
+note Retry chains on the observed outcomes: window i is a retry when the previous window of the same
+note owner was not accepted and i was requested 0..RWIN s after that window ended.
+fn prevown i ulong to ulong
+o = get co i
+j = i
+while gt j 0 bound 4096
+j = sub j 1
+if eq get co j o
+ret j
+end
+end
+ret MAXN
+end
+
+fn chains n ulong to ulong
+nr = ulong 0
+for i ulong n
+put rc i 0
+p = prevown i
+if lt p MAXN
+g = sub get ca i get ce p
+if eq get ac p 0
+if ge g 0
+if le g RWIN
+put rc i add get rc p 1
+nr = add nr 1
+end
+end
+end
+end
+end
+ret nr
+end
+
+note Service of window i under a cap flag (cap 1: at most its own lease when it has one).
+fn svc i ulong cap ulong to long
+s = get sv i
+l = get cl i
+if eq cap 1
+if gt l 0
+if gt s l
+ret l
+end
+end
+end
+ret s
+end
+
+fn dropped i ulong rty ulong to bool
+if eq rty 1
+ret gt get rc i RMAX
+end
+ret false
+end
+
+fn accarm i ulong cap ulong rty ulong to long
+if eq get ac i 0
+ret 0
+end
+if dropped i rty
+ret 0
+end
+if eq cap 1
+l = get cl i
+if gt l 0
+if gt get sv i l
+ret 0
+end
+end
+end
+ret 1
+end
+
+fn park k ulong i ulong to void
+put xs k 0
+put xd k get ca i
+put xv k 0
+put xa k 0
+end
+
+note Front time of window i when the slot is free at d: its arrival, or d plus its poll gap.
+fn frontt i ulong d long to long
+ret lmax get ar i add d get gp i
+end
+
+note FCFS arm m: the window at the front holds the line until its eligibility time.
+fn fcfs m ulong n ulong cap ulong rty ulong d0 long to void
+d = d0
+h = long 0
+for i ulong n
+k = add mul m MAXN i
+if dropped i rty
+park k i
+continue
+end
+f = frontt i d
+if held i
+s = lmax f get el i
+h = add h sub s f
+t = add s svc i cap
+put xs k s
+put xd k t
+put xv k 1
+put xa k accarm i cap rty
+d = t
+else
+e = get ce i
+if gt e f
+h = add h sub e f
+d = e
+end
+put xs k 0
+put xd k e
+put xv k 0
+put xa k 0
+end
+end
+put hl m h
+end
+
+note Candidate start of pending window j in the eligible-first arm m when the slot is free at t.
+note A sequential leg (sq) cannot start before the leg before it has departed plus its poll gap.
+fn ctime m ulong j ulong t long to long
+c = lmax t lmax get ar j get el j
+if eq get sq j 1
+kp = add mul m MAXN sub j 1
+if eq get xv kp -1
+ret 9223372036854775807
+end
+c = lmax c add get xd kp get gp j
+end
+ret c
+end
+
+note Next window for the eligible-first arm: the pending window with the smallest candidate
+note start (ctime), ties to the earlier request. n when none is pending.
+fn pick m ulong n ulong t long to ulong
+best = n
+bt = long 9223372036854775807
+for j ulong n
+k = add mul m MAXN j
+if eq get xv k -1
+c = ctime m j t
+if lt c bt
+bt = c
+best = j
+end
+end
+end
+put gv 0 bt
+ret best
+end
+
+note Eligible-first arm m: a window waits for its eligibility time without holding the line.
+fn elig m ulong n ulong cap ulong rty ulong d0 long to void
+for i ulong n
+k = add mul m MAXN i
+if dropped i rty
+park k i
+continue
+end
+if held i
+put xv k -1
+else
+put xs k 0
+put xd k get ce i
+put xv k 0
+put xa k 0
+end
+end
+t = d0
+for r ulong n
+b = pick m n t
+if ge b n
+break
+end
+k = add mul m MAXN b
+s = get gv 0
+u = add s svc b cap
+put xs k s
+put xd k u
+put xv k 1
+put xa k accarm b cap rty
+t = u
+end
+put hl m 0
+end
+
+note Pairwise overlap of served intervals of arm m (zero-length services never overlap).
+fn overlap m ulong n ulong to ulong
+c = ulong 0
+for i ulong n
+k = add mul m MAXN i
+if eq get xv k 1
+c = add c ovlone m n i
+end
+end
+ret c
+end
+
+fn ovlone m ulong n ulong i ulong to ulong
+k = add mul m MAXN i
+a = get xs k
+b = get xd k
+c = ulong 0
+for j ulong n
+if gt j i
+kj = add mul m MAXN j
+if eq get xv kj 1
+if lt a get xd kj
+if lt get xs kj b
+c = add c 1
+end
+end
+end
+end
+end
+ret c
+end
+
+note Largest number of windows in the system: at some request time a_i, the count of j with
+note a_j <= a_i < dep_j.
+fn maxq m ulong n ulong to ulong
+mq = ulong 0
+for i ulong n
+a = get ar i
+c = ulong 0
+for j ulong n
+if le get ar j a
+if lt a get xd add mul m MAXN j
+c = add c 1
+end
+end
+end
+if gt c mq
+mq = c
+end
+end
+ret mq
+end
+
+fn armname m ulong to void
+if eq m 0
+otext t_an
+end
+if eq m 1
+otext t_bn
+end
+if eq m 2
+otext t_crn
+end
+if eq m 3
+otext t_chn
+end
+if eq m 4
+otext t_cn
+end
+end
+
+note Accumulate per-arm sums into gv: 1 served, 2 acc, 3 dropped, 4 lostacc, 5 busy, 6 useful,
+note 7 maxdep, 8 soj, 9 viol, 10 replayerr.
+fn sums m ulong n ulong to void
+for z ulong 11
+put gv z 0
+end
+put gv 7 -9223372036854775807
+for i ulong n
+k = add mul m MAXN i
+v = get xv k
+d = get xd k
+put gv 8 add get gv 8 sub d get ar i
+if lt d get ar i
+put gv 9 add get gv 9 1
+end
+if gt d get gv 7
+put gv 7 d
+end
+if eq v 1
+put gv 1 add get gv 1 1
+put gv 5 add get gv 5 sub d get xs k
+if eq get xa k 1
+put gv 2 add get gv 2 1
+put gv 6 add get gv 6 sub d get xs k
+end
+end
+if eq get ac i 1
+if eq get xa k 0
+put gv 4 add get gv 4 1
+end
+end
+if eq m 0
+if held i
+if ne get xs k get cs i
+put gv 10 add get gv 10 1
+end
+end
+end
+end
+end
+
+note Retry flag of arm m: Cr (2) and C (4) bound retries.
+fn armrty m ulong to ulong
+if eq m 2
+ret 1
+end
+if eq m 4
+ret 1
+end
+ret 0
+end
+
+note Windows parked by the retry bound in arm m (held or not).
+fn countdrop m ulong n ulong to long
+r = armrty m
+c = long 0
+for i ulong n
+if dropped i r
+c = add c 1
+end
+end
+ret c
+end
+
+fn armline m ulong n ulong mina long to void
+sums m n
+oreset
+otext t_arm
+armname m
+otext t_srv
+osnum get gv 1
+otext t_acc
+osnum get gv 2
+otext t_drop
+osnum countdrop m n
+otext t_lost
+osnum get gv 4
+otext t_busy
+osnum get gv 5
+otext t_use
+osnum get gv 6
+otext t_hol
+osnum get hl m
+otext t_mina
+osnum mina
+otext t_maxd
+osnum get gv 7
+otext t_soj
+osnum get gv 8
+otext t_viol
+osnum get gv 9
+otext t_ovl
+onum overlap m n
+otext t_maxq
+onum maxq m n
+otext t_rep
+osnum get gv 10
+otext t_nl
+oflush
+end
+
+note In K: accepted in every arm.
+fn ink i ulong to bool
+for m ulong 5
+if eq get xa add mul m MAXN i 0
+ret false
+end
+end
+ret true
+end
+
+fn sortwk n ulong to void
+for i ulong n
+j = i
+while gt j 0 bound 4096
+x = get wk j
+y = get wk sub j 1
+if ge x y
+break
+end
+put wk j y
+put wk sub j 1 x
+j = sub j 1
+end
+end
+end
+
+note K-set waits of arm m: n, sum, nearest-rank p95 (rank ceil(0.95 n)), max.
+fn kline m ulong n ulong to void
+c = ulong 0
+sw = long 0
+for i ulong n
+if ink i
+w = sub get xs add mul m MAXN i get ca i
+put wk c w
+sw = add sw w
+c = add c 1
+end
+end
+sortwk c
+oreset
+otext t_k
+armname m
+otext t_n
+onum c
+otext t_sumw
+osnum sw
+if gt c 0
+rk = div add mul c 95 99 100
+otext t_p95
+osnum get wk sub rk 1
+otext t_maxw
+osnum get wk sub c 1
+end
+otext t_nl
+oflush
+end
+
+note Over K: windows whose wait under arm x exceeds arm y by more than HARM s, and the reverse.
+fn cmpline x ulong y ulong n ulong to void
+wo = ulong 0
+be = ulong 0
+for i ulong n
+if ink i
+wx = get xs add mul x MAXN i
+wy = get xs add mul y MAXN i
+if gt sub wx wy HARM
+wo = add wo 1
+end
+if gt sub wy wx HARM
+be = add be 1
+end
+end
+end
+oreset
+otext t_cmp
+armname x
+otext t_y
+armname y
+otext t_worse
+onum wo
+otext t_bett
+onum be
+otext t_nl
+oflush
+end
+
+fn parsed0 to long
+n = argn 2
+if eq n 0
+ret -1
+end
+for i ulong n
+put buf i get arg i
+end
+put st 5 0
+v = pfield 0 n
+if ne get st 5 0
+ret -1
+end
+if ne get st 4 n
+ret -1
+end
+ret v
+end
+
+fn main to int
+if ne argcnt 3
+pr t_usage
+ret 2
+end
+d0 = parsed0
+if lt d0 0
+pr t_usage
+ret 2
+end
+sz = slurp
+if lt sz 0
+pr t_ioerr
+ret 3
+end
+r = parse ulong sz
+if eq r -2
+pr t_big
+ret 4
+end
+if lt r 0
+oreset
+otext t_bad
+onum get st 6
+otext t_nl
+oflush
+ret 3
+end
+n = ulong r
+an = derive n d0
+nr = chains n
+nh = ulong 0
+mina = long 9223372036854775807
+for i ulong n
+if held i
+nh = add nh 1
+end
+if lt get ca i mina
+mina = get ca i
+end
+end
+oreset
+otext t_trace
+onum n
+otext t_held
+onum nh
+otext t_anom
+onum an
+otext t_rty
+onum nr
+otext t_d0
+osnum d0
+otext t_nl
+oflush
+fcfs 0 n 0 0 d0
+fcfs 1 n 1 0 d0
+fcfs 2 n 1 1 d0
+elig 3 n 1 0 d0
+elig 4 n 1 1 d0
+for m ulong 5
+armline m n mina
+end
+for m ulong 5
+kline m n
+end
+cmpline 4 1 n
+cmpline 3 1 n
+cmpline 1 0 n
+ret 0
+end
