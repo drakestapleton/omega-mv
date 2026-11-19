@@ -210,8 +210,17 @@ end
 
 fn t01_bar0 to bool
 bmmio_reset
-note Reject non-Device-nGnRnE (attr=1 Device-nGnRE)
+note Reject non-Device-nGnRnE (attr=1 Device-nGnRE), va==0, unaligned va, va+sz wrap
 if ne bmmio_register SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ 1 BMMIO_EATTR
+ret false
+end
+if ne bmmio_register SPARK_GB20B_BAR0_PA 0 SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE BMMIO_EARG
+ret false
+end
+if ne bmmio_register SPARK_GB20B_BAR0_PA add SPARK_GB20B_BAR0_PA 1 SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE BMMIO_EALIGN
+ret false
+end
+if ne bmmio_register SPARK_GB20B_BAR0_PA 0xfffffffffffff000 0x2000 BMMIO_ATTR_NGNRNE BMMIO_EARG
 ret false
 end
 hb = bmmio_register SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE
@@ -285,29 +294,44 @@ end
 
 fn t03_caps_quiesce to bool
 note Populate GB20B 000f:01:00.0 (PM D0 @ 0x60, MSI-X 9 vecs @ 0x70 BAR0+0x00b90000/0x00ba0000)
+note Seed STATUS=0x0010 (CapList) + RW1C error bit 0x8000 -> must NOT be written back as 1 when updating COMMAND!
 z = pcie_cfg_w32 15 1 0 0 0 0x2e1210de
-z = pcie_cfg_w32 15 1 0 0 4 0x00100003
+z = pcie_cfg_w32 15 1 0 0 4 0x80100003
 z = pcie_cfg_w32 15 1 0 0 52 0x60
 z = pcie_cfg_w32 15 1 0 0 0x60 0x00007001
 z = pcie_cfg_w32 15 1 0 0 0x64 0x00000000
 z = pcie_cfg_w32 15 1 0 0 0x70 0x80080011
 z = pcie_cfg_w32 15 1 0 0 0x74 0x00b90000
 z = pcie_cfg_w32 15 1 0 0 0x78 0x00ba0000
-note Populate unused Wi-Fi 0009:01:00.0 with CMD.BME=1 (0x0006)
+note Populate unused Wi-Fi 0009:01:00.0 (BME=1) + multi-function 0009:01:02.0 (HTYPE=0x80) / 0009:01:02.1 (BME=1)
 z = pcie_cfg_w32 9 1 0 0 0 0x792514c3
 z = pcie_cfg_w32 9 1 0 0 4 0x00100006
-note Quiesce unused endpoints before GBPA.ABORT
+z = pcie_cfg_w32 9 1 2 0 0 0x123410de
+z = pcie_cfg_w32 9 1 2 0 4 0x00000006
+z = pcie_cfg_w32 9 1 2 0 12 0x00800000
+z = pcie_cfg_w32 9 1 2 1 0 0x123510de
+z = pcie_cfg_w32 9 1 2 1 4 0x00000006
+note off>=4096 must fail (no wrap to 0)
+if ne pcie_cfg_r16 15 1 0 0 4096 0xffff
+ret false
+end
+if ne pcie_cfg_w16 15 1 0 0 4096 0 PCIE_EARG
+ret false
+end
+note Quiesce unused endpoints before GBPA.ABORT (must quiesce 3: 0009:01:00.0, 0009:01:02.0, 0009:01:02.1)
 if ne pcie_quiesce_unused PCIE_OK
 ret false
 end
-if or ne get pcie_quiesced 0 1 ne get pcie_quiesced_cnt 0 1
+if or ne get pcie_quiesced 0 1 ne get pcie_quiesced_cnt 0 3
 ret false
 end
-wcmd = pcie_cfg_r16 9 1 0 0 4
-if ne and wcmd PCIE_CMD_BME 0
+if ne and pcie_cfg_r16 9 1 0 0 4 PCIE_CMD_BME 0
 ret false
 end
-note Enable GB20B: verifies D0, masks MSI-X, sets Mem+BME+DisINTx
+if ne and pcie_cfg_r16 9 1 2 1 4 PCIE_CMD_BME 0
+ret false
+end
+note Enable GB20B: verifies D0, masks MSI-X, sets Mem+BME+DisINTx, writes 0 to RW1C STATUS upper 16 bits
 if ne pcie_enable_endpoint 15 1 0 0 PCIE_OK
 ret false
 end
@@ -318,8 +342,20 @@ mctl = pcie_cfg_r16 15 1 0 0 0x72
 if or ne and mctl PCIE_MSIX_ENABLE 0 eq and mctl PCIE_MSIX_FMASK 0
 ret false
 end
-gcmd = pcie_cfg_r16 15 1 0 0 4
-if ne and gcmd 0x0406 0x0406
+note Verify RW1C STATUS upper 16 bits were written as 0 (not 0x8010 echoed back)
+cs_after = pcie_cfg_r32 15 1 0 0 4
+if ne shr cs_after 16 0
+ret false
+end
+if ne and cs_after 0x0406 0x0406
+ret false
+end
+note Out-of-bounds cap pointer (cp=252 for PM cap needs cp+4=256) must fail PCIE_ECAP
+z = pcie_cfg_w32 7 1 0 0 0 0x812710ec
+z = pcie_cfg_w32 7 1 0 0 4 0x00100006
+z = pcie_cfg_w32 7 1 0 0 52 252
+z = pcie_cfg_w32 7 1 0 0 252 0x00000001
+if ne pcie_walk_caps 7 1 0 0 PCIE_ECAP
 ret false
 end
 note D3 endpoint must be refused
@@ -346,28 +382,33 @@ if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 S
 ret false
 end
 put pcie_quiesced 0 1
-note Pre-register SMMUv3 A with bad IDR0 (ST_LEVEL=0) -> SMMU_EIDR
+note Misaligned L1 STRTAB_BASE (4 KiB aligned but not 128 KiB aligned for log2sz=20) -> SMMU_EARG
+if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10001000 0x10100000 0x10200000 SMMU_EARG
+ret false
+end
+note Pre-register SMMUv3 A with missing S1P (bit 1==0) -> SMMU_EIDR
 ha = bmmio_register SPARK_SMMU_A_PA SPARK_SMMU_A_PA SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
 put smmu_inst_h 0 ha
 put smmu_inst_base 0 SPARK_SMMU_A_PA
-z = bmmio_w32 ha SMMU_REG_IDR0 0x00000000
-z = bmmio_w32 ha SMMU_REG_IDR1 25
-if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_EIDR
-ret false
-end
-note Good ST_LEVEL=1 (1<<27 = 0x08000000), bad SIDSIZE=16 (< 20 for A) -> SMMU_EIDR
 z = bmmio_w32 ha SMMU_REG_IDR0 0x08000000
-z = bmmio_w32 ha SMMU_REG_IDR1 16
+z = bmmio_w32 ha SMMU_REG_IDR1 0x00840019
 if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_EIDR
 ret false
 end
-note Inject CMDQ_CONS.ERR[30:24] = 1 (CERROR_ILL) -> SMMU_ECMDERR and SMMUEN stays 0
-z = bmmio_w32 ha SMMU_REG_IDR1 25
-z = bmmio_w32 ha SMMU_REG_CMDQ_CONS 0x01000000
+note Good IDR0 (ST_LEVEL=1 | S1P=1 = 0x08000002), bad SIDSIZE=16 (< 20 for A) -> SMMU_EIDR
+z = bmmio_w32 ha SMMU_REG_IDR0 0x08000002
+z = bmmio_w32 ha SMMU_REG_IDR1 0x00840010
+if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_EIDR
+ret false
+end
+note Inject CMDQ_CONS.ERR[30:24] = 1 (CERROR_ILL) -> SMMU_ECMDERR and CR0 rolled back to 0
+z = bmmio_w32 ha SMMU_REG_IDR1 0x00840019
+put smmu_sim_cmd_err 0 1
 if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_ECMDERR
 ret false
 end
-if ne and bmmio_r32 ha SMMU_REG_CR0 SMMU_CR0_SMMUEN 0
+put smmu_sim_cmd_err 0 0
+if ne bmmio_r32 ha SMMU_REG_CR0 0
 ret false
 end
 ret true
@@ -385,17 +426,17 @@ end
 if ne iort_parse part ib 0 ilen 1
 ret false
 end
-note Pre-seed IDR0 (ST_LEVEL=1) and IDR1 (SIDSIZE=25) on A and B
+note Pre-seed IDR0 (ST_LEVEL=1 | S1P=1 = 0x08000002) and IDR1 (CMDQS=4 | EVENTQS=4 | SIDSIZE=25 = 0x00840019) on A and B
 ha = bmmio_register SPARK_SMMU_A_PA SPARK_SMMU_A_PA SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
 hb = bmmio_register SPARK_SMMU_B_PA SPARK_SMMU_B_PA SPARK_SMMU_SZ BMMIO_ATTR_NGNRNE
 put smmu_inst_h 0 ha
 put smmu_inst_base 0 SPARK_SMMU_A_PA
 put smmu_inst_h 1 hb
 put smmu_inst_base 1 SPARK_SMMU_B_PA
-z = bmmio_w32 ha SMMU_REG_IDR0 0x08000000
-z = bmmio_w32 ha SMMU_REG_IDR1 25
-z = bmmio_w32 hb SMMU_REG_IDR0 0x08000000
-z = bmmio_w32 hb SMMU_REG_IDR1 25
+z = bmmio_w32 ha SMMU_REG_IDR0 0x08000002
+z = bmmio_w32 ha SMMU_REG_IDR1 0x00840019
+z = bmmio_w32 hb SMMU_REG_IDR0 0x08000002
+z = bmmio_w32 hb SMMU_REG_IDR1 0x00840019
 if ne smmu_init_instance 0 SPARK_SMMU_A_PA 20 0x10000000 0x10100000 0x10200000 SMMU_OK
 ret false
 end
@@ -430,8 +471,17 @@ snic = smmu_open_stream 7 0x0100 0x11004000 0x11005000
 if or le snvme 0 le snic 0
 ret false
 end
-note Verify STE V=1|Config=5 (low 4 bits == 0xb) and CD MAIR0 == 0x440004ff
-if or ne and get smmu_ste_words 0 0xf 0xb ne get smmu_cd_words 3 SMMU_CD_MAIR0
+note Verify exact CD word 0 (ENDI==0, AA64==1, R==1, A==1, T0SZ==16, NC walk), STE word 1 == 0 (S1CIR/COR/CSH==0), and PTE SH=2
+if ne get smmu_cd_words 0 0x00006202c0000010
+ret false
+end
+if or ne and get smmu_ste_words 0 0xf 0xb ne get smmu_ste_words 1 0
+ret false
+end
+if ne get smmu_cd_words 3 SMMU_CD_MAIR0
+ret false
+end
+if ne get smmu_sp_pte 0 0x006000000000064c
 ret false
 end
 note Map disjoint spans: GB20B GSP arena 80 MiB, NVMe weights dest 64 MiB, RTL8127 rdma 72 KiB
@@ -466,14 +516,21 @@ end
 if ne smmu_map_span sgpu 0x400000000 0x4000000 0 SMMU_OK
 ret false
 end
+note Regression: CMDQ wrap past 32 commands (mask 0x1f) must succeed cleanly
+for w ulong 35
+if ne smmu_cmd_sync 1 SMMU_OK
+ret false
+end
+end
 ret true
 end
 
 fn t07_eventq to bool
 hb = get smmu_inst_h 1
-note Inject F_TRANSLATION (code=0x10, SID=0x100) at SMMUv3 B eventq slot 0
-put smmu_evtq_buf 32 or ulong 0x10 shl ulong 0x100 32
-z = bmmio_w32 hb SMMU_REG_EVTQ_PROD 1
+note Inject F_TRANSLATION (code=0x10, SID=0x100) at SMMUv3 B eventq slot 0 (Page 1 0x100a8/0x100ac, 32 B/record stride=4 u64 -> inst*64=64)
+note Also set OVFLG (bit 31 = 0x80000000) in PROD to verify OVACKFLG preservation/ack in CONS
+put smmu_evtq_buf 64 or ulong 0x10 shl ulong 0x100 32
+z = bmmio_w32 hb SMMU_REG_EVTQ_PROD 0x80000001
 n = smmu_drain_events 1
 if or ne n 1 ne get smmu_inst_evt_cnt 1 1
 ret false
@@ -481,7 +538,7 @@ end
 if ne and get smmu_inst_last_evt 1 0xff 0x10
 ret false
 end
-ret eq bmmio_r32 hb SMMU_REG_EVTQ_CONS 1
+ret eq bmmio_r32 hb SMMU_REG_EVTQ_CONS 0x80000001
 end
 
 fn ps_ccput64 o ulong v ulong to void
@@ -523,6 +580,15 @@ if or ne r1 2 or ne get ibm_clears 0 1 ne get ibm_order_err 0 0
 ret false
 end
 if ne bmmio_r32 hg IBM_IRQSTAT 0
+ret false
+end
+note Regression: 2nd iqservicecc call with SWGEN0 must keep ibm_order_err == 0
+z = bmmio_w32 hg IBM_IRQSTAT 0x40
+put ibm_rpc_avail 0 1
+if ne iqservicecc 1 8 -1 8 1
+ret false
+end
+if or ne get ibm_clears 0 2 ne get ibm_order_err 0 0
 ret false
 end
 note Inject HALT (0x10) + valid CrashCat V1 report packet (48 bytes) in ccbuf

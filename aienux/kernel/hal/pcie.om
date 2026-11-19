@@ -279,7 +279,7 @@ ret bmmio_w32 h ulong eoff val
 end
 
 fn pcie_cfg_r16 seg uint bus ulong dev ulong fn_num ulong off ulong to uint
-if ne and off 1 0
+if or ge off 4096 ne and off 1 0
 ret uint 0xffff
 end
 dw = pcie_cfg_r32 seg bus dev fn_num and off 4092
@@ -290,7 +290,7 @@ ret uint and dw 0xffff
 end
 
 fn pcie_cfg_w16 seg uint bus ulong dev ulong fn_num ulong off ulong val uint to long
-if ne and off 1 0
+if or ge off 4096 ne and off 1 0
 ret PCIE_EARG
 end
 aligned = and off 4092
@@ -302,7 +302,12 @@ nv = ulong 0
 if ne and off 2 0
 nv = or and cur 0xffff shl ulong val 16
 else
+note When writing COMMAND (off==4), mask upper 16-bit STATUS (RW1C) to 0 so error bits are never clobbered.
+if eq aligned 4
+nv = ulong val
+else
 nv = or and cur 0xffff0000 ulong val
+end
 end
 ret pcie_cfg_w32 seg bus dev fn_num aligned nv
 end
@@ -330,14 +335,20 @@ put pcie_dev_info 8 pcie_cfg_r32 seg bus dev fn_num 28
 ret PCIE_OK
 end
 
-fn pcie_cap_record seg uint bus ulong dev ulong fn_num ulong cp ulong hdr ulong to void
+fn pcie_cap_record seg uint bus ulong dev ulong fn_num ulong cp ulong hdr ulong to long
 cid = uint and hdr 0xff
 if eq cid PCIE_CAP_PM
+if gt add cp 4 252
+ret PCIE_ECAP
+end
 pmcsr = pcie_cfg_r32 seg bus dev fn_num add cp 4
 put pcie_cap_info 0 cp
 put pcie_cap_info 1 and pmcsr 3
 end
 if eq cid PCIE_CAP_MSIX
+if gt add cp 8 252
+ret PCIE_ECAP
+end
 put pcie_cap_info 2 cp
 put pcie_cap_info 3 add and shr hdr 16 0x7ff 1
 tbl = pcie_cfg_r32 seg bus dev fn_num add cp 4
@@ -347,6 +358,7 @@ pba = pcie_cfg_r32 seg bus dev fn_num add cp 8
 put pcie_cap_info 6 and pba 7
 put pcie_cap_info 7 and pba 0xfffffff8
 end
+ret PCIE_OK
 end
 
 note Walk PCIe capability list (bounded, cycle-guarded) to find PM (0x01) and MSI-X (0x11).
@@ -377,7 +389,10 @@ hdr = pcie_cfg_r32 seg bus dev fn_num cp
 if ne get bmmio_err 0 BMMIO_OK
 ret PCIE_EMMIO
 end
-pcie_cap_record seg bus dev fn_num cp hdr
+cr = pcie_cap_record seg bus dev fn_num cp hdr
+if ne cr PCIE_OK
+ret cr
+end
 cp = and shr hdr 8 0xfc
 steps = add steps 1
 end
@@ -409,44 +424,77 @@ end
 ret false
 end
 
-fn pcie_quiesce_one seg uint bus ulong to long
-if pcie_is_allowlisted seg bus 0 0
+fn pcie_quiesce_fn seg uint bus ulong dev ulong fn_num ulong to long
+if pcie_is_allowlisted seg bus dev fn_num
 ret 0
 end
-ven = and pcie_cfg_r32 seg bus 0 0 0 0xffff
+ven = and pcie_cfg_r32 seg bus dev fn_num 0 0xffff
 if or eq ven 0xffff eq ven 0
 ret 0
 end
-cmd = pcie_cfg_r16 seg bus 0 0 4
+cmd = pcie_cfg_r16 seg bus dev fn_num 4
 if eq and cmd PCIE_CMD_BME 0
 ret 0
 end
 ncmd = and cmd not PCIE_CMD_BME
-rc = pcie_cfg_w16 seg bus 0 0 4 ncmd
+rc = pcie_cfg_w16 seg bus dev fn_num 4 ncmd
 if ne rc PCIE_OK
 ret rc
 end
 ret 1
 end
 
-note Quiesce all unused present PCIe endpoints (clear CMD.BME=0) across mapped MCFG segments
-note BEFORE smmuv3.om sets GBPA.ABORT. Sets pcie_quiesced[0] = 1 on success.
+fn pcie_quiesce_dev seg uint bus ulong dev ulong to long
+ven = and pcie_cfg_r32 seg bus dev 0 0 0xffff
+if or eq ven 0xffff eq ven 0
+ret 0
+end
+cnt = pcie_quiesce_fn seg bus dev 0
+if lt cnt 0
+ret cnt
+end
+htype = and shr pcie_cfg_r32 seg bus dev 0 12 16 0xff
+if eq and htype 0x80 0
+ret cnt
+end
+for f ulong 7
+r = pcie_quiesce_fn seg bus dev add f 1
+if lt r 0
+ret r
+end
+cnt = add cnt r
+end
+ret cnt
+end
+
+note Quiesce all unused present PCIe endpoints (clear CMD.BME=0) across ALL parsed MCFG segments
+note BEFORE smmuv3.om sets GBPA.ABORT. Fails closed if any parsed segment is unmapped.
+note Scans multi-device (dev 0..31) and multi-function (fn 0..7 when Header Type bit 7 is set).
 fn pcie_quiesce_unused to long
-qcnt = ulong 0
+put pcie_quiesced 0 0
 n = get pcie_nsegs 0
+if eq n 0
+ret PCIE_EMCFG
+end
+for c ulong n bound 16
+if le get pcie_seg_h c 0
+ret PCIE_EMMIO
+end
+end
+qcnt = ulong 0
 for i ulong n bound 16
-if gt get pcie_seg_h i 0
 seg = get pcie_seg_id i
 bus = ulong get pcie_seg_bus0 i
 b1 = ulong get pcie_seg_bus1 i
 while le bus b1 bound 256
-r = pcie_quiesce_one seg bus
+for d ulong 32
+r = pcie_quiesce_dev seg bus d
 if lt r 0
 ret r
 end
 qcnt = add qcnt ulong r
-bus = add bus 1
 end
+bus = add bus 1
 end
 end
 put pcie_quiesced 0 1

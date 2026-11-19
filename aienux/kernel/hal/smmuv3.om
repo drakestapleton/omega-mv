@@ -26,8 +26,9 @@ const SMMU_REG_CMDQ_BASE ulong 0x0090
 const SMMU_REG_CMDQ_PROD ulong 0x0098
 const SMMU_REG_CMDQ_CONS ulong 0x009c
 const SMMU_REG_EVTQ_BASE ulong 0x00a0
-const SMMU_REG_EVTQ_PROD ulong 0x00a8
-const SMMU_REG_EVTQ_CONS ulong 0x00ac
+note ARM IHI 0070H.a §6.3: EVENTQ_PROD/CONS are on Page 1 (0x100a8 / 0x100ac), NOT Page 0!
+const SMMU_REG_EVTQ_PROD ulong 0x100a8
+const SMMU_REG_EVTQ_CONS ulong 0x100ac
 
 const SMMU_CR0_SMMUEN ulong 0x01
 const SMMU_CR0_EVTQEN ulong 0x04
@@ -39,17 +40,20 @@ const SMMU_GBPA_ABORT ulong 0x00100000
 const SMMU_BASE_RA ulong 0x4000000000000000
 const SMMU_Q_LOG2SIZE ulong 4
 const SMMU_Q_ENTRIES ulong 16
+note For LOG2SIZE=4, index bits [3:0] + wrap bit 4 -> mask = (1 << 5) - 1 = 0x1f (IHI 0070H.a §3.5.1)
+const SMMU_Q_IDX_MASK ulong 0x1f
+const SMMU_EVTQ_OVFLG ulong 0x80000000
 
 note SMMUv3 command opcodes
 const SMMU_CMD_CFGI_STE ulong 0x03
 const SMMU_CMD_CFGI_ALL ulong 0x04
-const SMMU_CMD_TLBI_NH_ALL ulong 0x10
+const SMMU_CMD_CFGI_CD_ALL ulong 0x06
 const SMMU_CMD_TLBI_NSNH_ALL ulong 0x30
 const SMMU_CMD_SYNC ulong 0x46
 
 note Stage-1 PTE leaf attributes:
-note Normal-NC (MAIR slot 3 = 0x44): AttrIdx=3<<2 (0xc) | AP[1]=1 (0x40) | SH=3 (0x300) | AF (0x400) | PXN|UXN (0x60000000000000)
-const SMMU_PTE_NORMAL_NC ulong 0x006000000000074c
+note Normal-NC (MAIR slot 3 = 0x44): AttrIdx=3<<2 (0xc) | AP[1]=1 (0x40) | SH=2 Outer-Shareable (0x200) | AF (0x400) | PXN|UXN
+const SMMU_PTE_NORMAL_NC ulong 0x006000000000064c
 note Device-nGnRnE (MAIR slot 2 = 0x00) for ITS MSI doorbell only: AttrIdx=2<<2 (0x8) | AP[1]=1 (0x40) | AF (0x400) | PXN|UXN
 const SMMU_PTE_DEV_ITS ulong 0x0060000000000448
 const SMMU_ITS_DB_BASE ulong 0x08000000
@@ -82,8 +86,8 @@ global smmu_inst_last_evt ulong 3
 
 note Host-model command queue buffer (3 instances * 16 cmds * 2 u64 words = 96 u64)
 global smmu_cmdq_buf ulong 96
-note Host-model event queue buffer (3 instances * 16 evts * 2 u64 words = 96 u64)
-global smmu_evtq_buf ulong 96
+note Host-model event queue buffer (3 instances * 16 evts * 4 u64 words = 192 u64, 32 B/record per IHI 0070H.a §7.3)
+global smmu_evtq_buf ulong 192
 
 note Active stream table (up to 8 streams)
 global smmu_str_n ulong 1
@@ -106,6 +110,8 @@ global smmu_sp_rmr ulong 32
 note Bring-up step trace (bitmask per instance for deterministic ordering verification)
 global smmu_trace ulong 3
 global smmu_cmd_count ulong 3
+note Host-model fault injector (mode 0 only): if nonzero, sets CMDQ_CONS.ERR[30:24] during CMD_SYNC
+global smmu_sim_cmd_err ulong 3
 
 fn smmu_reset to void
 put smmu_str_n 0 0
@@ -119,6 +125,7 @@ put smmu_inst_evt_cnt i 0
 put smmu_inst_last_evt i 0
 put smmu_trace i 0
 put smmu_cmd_count i 0
+put smmu_sim_cmd_err i 0
 end
 for j ulong SMMU_MAX_STREAMS
 put smmu_str_live j 0
@@ -140,7 +147,9 @@ put smmu_cd_words m 0
 end
 for q ulong 96
 put smmu_cmdq_buf q 0
-put smmu_evtq_buf q 0
+end
+for e ulong 192
+put smmu_evtq_buf e 0
 end
 end
 
@@ -164,7 +173,7 @@ slot = and prod sub SMMU_Q_ENTRIES 1
 base_idx = add mul inst 32 mul slot 2
 put smmu_cmdq_buf base_idx w0
 put smmu_cmdq_buf add base_idx 1 w1
-put smmu_inst_cmd_prod inst and add prod 1 0xfffff
+put smmu_inst_cmd_prod inst and add prod 1 SMMU_Q_IDX_MASK
 put smmu_cmd_count inst add get smmu_cmd_count inst 1
 end
 
@@ -179,19 +188,23 @@ rc = bmmio_w32 h SMMU_REG_CMDQ_PROD prod
 if ne rc BMMIO_OK
 ret SMMU_ECMDERR
 end
-note In host model mode 0, model auto-advances CONS unless fault-injected in bits 30:24.
+note In host model mode 0, model auto-advances CONS unless fault-injected in smmu_sim_cmd_err / bits 30:24.
 if eq get bmmio_mode 0 0
+inj = get smmu_sim_cmd_err inst
+if ne inj 0
+sr = bmmio_w32 h SMMU_REG_CMDQ_CONS or shl and inj 0x7f 24 prod
+else
 cur = bmmio_r32 h SMMU_REG_CMDQ_CONS
 err_bits = and shr cur 24 0x7f
-if ne err_bits 0
-ret SMMU_ECMDERR
-end
+if eq err_bits 0
 sr = bmmio_w32 h SMMU_REG_CMDQ_CONS prod
 if ne sr BMMIO_OK
 ret SMMU_ECMDERR
 end
 end
-ok = smmu_poll_eq h SMMU_REG_CMDQ_CONS 0xfffff prod
+end
+end
+ok = smmu_poll_eq h SMMU_REG_CMDQ_CONS SMMU_Q_IDX_MASK prod
 if not ok
 ret SMMU_ECMDERR
 end
@@ -253,6 +266,7 @@ z = bmmio_w64 h SMMU_REG_STRTAB_BASE or strtab_pa SMMU_BASE_RA
 z = bmmio_w32 h SMMU_REG_STRTAB_CFG cfg
 z = bmmio_w64 h SMMU_REG_CMDQ_BASE or or cmdq_pa SMMU_BASE_RA SMMU_Q_LOG2SIZE
 z = bmmio_w32 h SMMU_REG_CMDQ_PROD 0
+z = bmmio_w32 h SMMU_REG_CMDQ_CONS 0
 z = bmmio_w64 h SMMU_REG_EVTQ_BASE or or evtq_pa SMMU_BASE_RA SMMU_Q_LOG2SIZE
 z = bmmio_w32 h SMMU_REG_EVTQ_PROD 0
 z = bmmio_w32 h SMMU_REG_EVTQ_CONS 0
@@ -260,16 +274,26 @@ put smmu_inst_cmd_prod inst 0
 cpufence
 end
 
+fn smmu_rollback_cr0 h long to void
+z = bmmio_w32 h SMMU_REG_CR0 0
+if eq get bmmio_mode 0 0
+z = bmmio_w32 h SMMU_REG_CR0ACK 0
+end
+ok = smmu_poll_eq h SMMU_REG_CR0ACK 0xffffffff 0
+end
+
 fn smmu_init_enable inst ulong log2sz ulong to long
 h = get smmu_inst_h inst
 rc = bmmio_w32 h SMMU_REG_CR0 SMMU_CR0_QUEUES
 if ne rc BMMIO_OK
+smmu_rollback_cr0 h
 ret SMMU_ECR0
 end
 if eq get bmmio_mode 0 0
 z = bmmio_w32 h SMMU_REG_CR0ACK SMMU_CR0_QUEUES
 end
 if not smmu_poll_eq h SMMU_REG_CR0ACK SMMU_CR0_QUEUES SMMU_CR0_QUEUES
+smmu_rollback_cr0 h
 ret SMMU_ECR0
 end
 put smmu_trace inst or get smmu_trace inst 0x10
@@ -277,17 +301,20 @@ smmu_cmd_push inst SMMU_CMD_CFGI_ALL 31
 smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 sr = smmu_cmd_sync inst
 if ne sr SMMU_OK
+smmu_rollback_cr0 h
 ret sr
 end
 put smmu_trace inst or get smmu_trace inst 0x20
 rc = bmmio_w32 h SMMU_REG_CR0 SMMU_CR0_ALL
 if ne rc BMMIO_OK
+smmu_rollback_cr0 h
 ret SMMU_ECR0
 end
 if eq get bmmio_mode 0 0
 z = bmmio_w32 h SMMU_REG_CR0ACK SMMU_CR0_ALL
 end
 if not smmu_poll_eq h SMMU_REG_CR0ACK SMMU_CR0_ALL SMMU_CR0_ALL
+smmu_rollback_cr0 h
 ret SMMU_ECR0
 end
 put smmu_inst_sidbits inst log2sz
@@ -306,10 +333,40 @@ end
 ret lt pa SMMU_PA_40_LIMIT
 end
 
+note ARM IHI 0070H.a §6.3.24: L1 STRTAB_BASE alignment = max(64, (1 << (log2sz - 6)) * 8)
+note For log2sz=20 (SMMUv3 A): 131072 B (128 KiB).
+fn smmu_strtab_aligned pa ulong log2sz ulong to bool
+l1_sz = mul shl ulong 1 sub log2sz 6 8
+if lt l1_sz 64
+l1_sz = ulong 64
+end
+ret eq and pa sub l1_sz 1 0
+end
+
+fn smmu_idr_ok h long min_bits ulong to bool
+idr0 = bmmio_r32 h SMMU_REG_IDR0
+idr1 = bmmio_r32 h SMMU_REG_IDR1
+note Require IDR0.S1P (bit 1 == 1) and IDR0.ST_LEVEL == 1 (bits 28:27)
+if eq and idr0 2 0
+ret false
+end
+if ne and shr idr0 27 3 1
+ret false
+end
+note Require IDR1.SIDSIZE >= min_bits, IDR1.CMDQS[25:21] >= 4, IDR1.EVENTQS[20:16] >= 4
+if lt and idr1 0x3f min_bits
+ret false
+end
+if lt and shr idr1 21 0x1f SMMU_Q_LOG2SIZE
+ret false
+end
+ret ge and shr idr1 16 0x1f SMMU_Q_LOG2SIZE
+end
+
 note Deterministic SMMUv3 bring-up (instances A=0 and B=1; refuses C=2 which must stay abort-only).
-note Exact sequence: quiesce check -> IDR0.ST_LEVEL==1 & IDR1.SIDSIZE>=min_bits ->
+note Exact sequence: quiesce check -> IDR0.S1P==1 & ST_LEVEL==1 & IDR1.SIDSIZE>=min_bits & CMDQS/EVENTQS>=4 ->
 note CR0=0 -> CR0ACK==0 -> GBPA.ABORT|Update -> GBPA.Update==0 ->
-note 2-level STRTAB/CMDQ/EVENTQ -> DSB SY -> CR0=CMDQEN|EVTQEN -> CR0ACK ->
+note 2-level aligned STRTAB/CMDQ/EVENTQ -> DSB SY -> CR0=CMDQEN|EVTQEN -> CR0ACK ->
 note CFGI_ALL + TLBI_NSNH_ALL + CMD_SYNC + CMDQ_CONS.ERR==0 -> CR0=SMMUEN|CMDQEN|EVTQEN -> CR0ACK.
 fn smmu_init_instance inst ulong base ulong min_bits ulong strtab_pa ulong cmdq_pa ulong evtq_pa ulong to long
 if eq get pcie_quiesced 0 0
@@ -321,7 +378,14 @@ end
 if or eq base 0 lt min_bits 8
 ret SMMU_EARG
 end
+log2sz = min_bits
+if lt log2sz 12
+log2sz = ulong 12
+end
 if not smmu_pa_valid strtab_pa
+ret SMMU_EARG
+end
+if not smmu_strtab_aligned strtab_pa log2sz
 ret SMMU_EARG
 end
 if not smmu_pa_valid cmdq_pa
@@ -339,12 +403,7 @@ end
 put smmu_inst_h inst h
 put smmu_inst_base inst base
 end
-idr0 = bmmio_r32 h SMMU_REG_IDR0
-idr1 = bmmio_r32 h SMMU_REG_IDR1
-if ne and shr idr0 27 3 1
-ret SMMU_EIDR
-end
-if lt and idr1 0x3f min_bits
+if not smmu_idr_ok h min_bits
 ret SMMU_EIDR
 end
 put smmu_trace inst 0x01
@@ -370,10 +429,6 @@ if not smmu_poll_eq h SMMU_REG_GBPA SMMU_GBPA_UPDATE 0
 ret SMMU_EGBPA
 end
 put smmu_trace inst or get smmu_trace inst 0x04
-log2sz = min_bits
-if lt log2sz 12
-log2sz = ulong 12
-end
 smmu_init_prog_queues inst log2sz strtab_pa cmdq_pa evtq_pa
 put smmu_trace inst or get smmu_trace inst 0x08
 ret smmu_init_enable inst log2sz
@@ -419,23 +474,23 @@ put smmu_sp_rmr free_idx is_rmr
 ret SMMU_OK
 end
 
-note Encode 64-byte CD (V=1, EPD1=1, T0SZ=24, TG0=0, IPS=2, MAIR0=0x440004ff) and STE (V=1, Config=5).
+note Encode 64-byte CD (IHI 0070H.a §5.4, smmu.c:142) and STE (IHI 0070H.a §5.2, smmu.c:130):
+note CD word 0: T0SZ=16 (4-level 48-bit matching pagetable.om) | TG0=0 (4K) | IRGN0=0 | ORGN0=0 | SH0=0 (NC) |
+note   EPD1=1<<30 | V=1<<31 | IPS=2<<32 (40-bit) | ENDI=0 (little-endian!) | AA64=1<<41 | R=1<<45 | A=1<<46
+note   = 0x00006202c0000010.
+note STE word 0: V=1 | Config=5<<1 (Stage-1 translate) | S1ContextPtr=(cd_pa & ~0x3f).
+note STE words 1..7: 0 (S1CIR=0, S1COR=0, S1CSH=0 -> Normal-NC CD, no WB attribute mismatch).
 fn smmu_encode_ste_cd slot ulong cd_pa ulong ttbr0_pa ulong to void
 base = mul slot 8
-note CD word 0: T0SZ=24 | SH0=3<<12 | EPD1=1<<30 | V=1<<31 | IPS=2<<32 | A=1<<40 | AA64=1<<41
-cd0 = or ulong 24 shl ulong 3 12
-cd0 = or cd0 shl ulong 3 30
-cd0 = or cd0 shl ulong 2 32
-cd0 = or cd0 shl ulong 3 40
-put smmu_cd_words base cd0
+put smmu_cd_words base 0x00006202c0000010
 put smmu_cd_words add base 1 ttbr0_pa
 put smmu_cd_words add base 2 0
 put smmu_cd_words add base 3 SMMU_CD_MAIR0
-note STE word 0: V=1 | Config=5<<1 (Stage-1 translate) | S1ContextPtr=(cd_pa & ~0x3f)
 ste0 = or ulong 11 and cd_pa 0x000fffffffffffc0
-note STE word 1: S1DSS=2 | S1CIR=1<<2 | S1COR=1<<4 | S1CSH=3<<6 = 0xd6
 put smmu_ste_words base ste0
-put smmu_ste_words add base 1 0xd6
+for w ulong 7
+put smmu_ste_words add base add w 1 0
+end
 end
 
 fn smmu_map_one_rmr slot ulong r ulong to long
@@ -530,7 +585,8 @@ put smmu_str_ttbr n ttbr0_pa
 put smmu_str_n 0 add n 1
 cpufence
 smmu_cmd_push inst or SMMU_CMD_CFGI_STE shl sid 32 1
-smmu_cmd_push inst SMMU_CMD_TLBI_NH_ALL 0
+smmu_cmd_push inst or SMMU_CMD_CFGI_CD_ALL shl sid 32 0
+smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 sr = smmu_cmd_sync inst
 if ne sr SMMU_OK
 put smmu_str_live n 0
@@ -540,7 +596,8 @@ ret long add n 1
 end
 
 note Map one disjoint DMA span for an open stream handle (1..8).
-note is_its_db == 0: Normal-NC | AP[1]=1 | PXN | UXN; is_its_db == 1: ITS doorbell only (0x08000000..0x08100000, SID 0x100).
+note is_its_db == 0: Normal-NC | AP[1]=1 | SH=2 Outer-Shareable | PXN | UXN;
+note is_its_db == 1: ITS doorbell only (0x08000000..0x08100000, SID 0x100).
 fn smmu_map_span sh long pa ulong sz ulong is_its_db ulong to long
 if or le sh 0 gt ulong sh get smmu_str_n 0
 ret SMMU_EARG
@@ -558,6 +615,9 @@ end
 if ne get smmu_str_sid slot 0x100
 ret SMMU_EARG
 end
+if lt add pa sz pa
+ret SMMU_EARG
+end
 if or lt pa SMMU_ITS_DB_BASE gt add pa sz SMMU_ITS_DB_END
 ret SMMU_EARG
 end
@@ -568,7 +628,7 @@ if ne ar SMMU_OK
 ret ar
 end
 cpufence
-smmu_cmd_push inst SMMU_CMD_TLBI_NH_ALL 0
+smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 ret smmu_cmd_sync inst
 end
 
@@ -591,7 +651,7 @@ ret SMMU_EARG
 end
 put smmu_sp_live i 0
 cpufence
-smmu_cmd_push inst SMMU_CMD_TLBI_NH_ALL 0
+smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 ret smmu_cmd_sync inst
 end
 end
@@ -600,7 +660,7 @@ end
 ret SMMU_ENOTFOUND
 end
 
-note Drain SMMUv3 EVENTQ faults for instance inst; returns number of events drained.
+note Drain SMMUv3 EVENTQ faults (Page 1 0x100a8/0x100ac, 32 B/record, wrap mask 0x1f, OVFLG/OVACKFLG bit 31).
 fn smmu_drain_events inst ulong to long
 if ge inst SMMU_MAX_INST
 ret SMMU_EARG
@@ -609,19 +669,22 @@ h = get smmu_inst_h inst
 if le h 0
 ret SMMU_EARG
 end
-prod = and bmmio_r32 h SMMU_REG_EVTQ_PROD 0xfffff
-cons = and bmmio_r32 h SMMU_REG_EVTQ_CONS 0xfffff
+prod_raw = bmmio_r32 h SMMU_REG_EVTQ_PROD
+cons_raw = bmmio_r32 h SMMU_REG_EVTQ_CONS
+ovflg = and prod_raw SMMU_EVTQ_OVFLG
+prod = and prod_raw SMMU_Q_IDX_MASK
+cons = and cons_raw SMMU_Q_IDX_MASK
 cnt = ulong 0
 while and ne cons prod lt cnt SMMU_Q_ENTRIES bound 16
 slot = and cons sub SMMU_Q_ENTRIES 1
-eidx = add mul inst 32 mul slot 2
+eidx = add mul inst 64 mul slot 4
 w0 = get smmu_evtq_buf eidx
 put smmu_inst_last_evt inst w0
-cons = and add cons 1 0xfffff
+cons = and add cons 1 SMMU_Q_IDX_MASK
 cnt = add cnt 1
 end
-if gt cnt 0
-z = bmmio_w32 h SMMU_REG_EVTQ_CONS cons
+if or gt cnt 0 ne ovflg and cons_raw SMMU_EVTQ_OVFLG
+z = bmmio_w32 h SMMU_REG_EVTQ_CONS or cons ovflg
 put smmu_inst_evt_cnt inst add get smmu_inst_evt_cnt inst cnt
 end
 ret long cnt
