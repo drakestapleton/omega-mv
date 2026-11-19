@@ -102,6 +102,24 @@ uint64_t cg_tgemm_emit(const uint64_t o_sp[10], uint64_t o_ins[8192], uint64_t o
 uint64_t cg_tc2_spec_ok(const uint64_t o_sp[10]);
 /* export fn cg_tc2_emit sp view ulong 10 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_tc2_emit(const uint64_t o_sp[10], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_pq_spec_ok sp view ulong 8 to ulong */
+uint64_t cg_pq_spec_ok(const uint64_t o_sp[8]);
+/* export fn cg_pq_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_pq_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_qg_spec_ok sp view ulong 10 to ulong */
+uint64_t cg_qg_spec_ok(const uint64_t o_sp[10]);
+/* export fn cg_qgemm_emit sp view ulong 10 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_qgemm_emit(const uint64_t o_sp[10], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_tc_probe_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_tc_probe_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_tcgemm_spec_ok sp view ulong 8 to ulong */
+uint64_t cg_tcgemm_spec_ok(const uint64_t o_sp[8]);
+/* export fn cg_tcgemm_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_tcgemm_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_tc_peak_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_tc_peak_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_tc_bw_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_tc_bw_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t o_meta[512]);
 #ifdef __cplusplus
 }
 #endif

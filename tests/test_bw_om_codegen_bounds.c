@@ -18,6 +18,8 @@
 #include "omega_blackwell_codegen_qmma.h"
 #include "omega_blackwell_codegen_tgemm.h"
 #include "omega_blackwell_codegen_tc2.h"
+#include "omega_blackwell_codegen_qg.h"
+#include "omega_blackwell_codegen_tc.h"
 #include "sha256.h"
 
 static int g_pass = 0, g_fail = 0;
@@ -293,6 +295,75 @@ static void test_max_size_legal_inputs(void) {
         CHK(omega_blackwell_codegen_tc2_prog(&s, &p) == 0, "max legal tc2 swiglu rt8 w16");
         check_max_headroom("max_tc2_swiglu_rt8_w16", &p);
     }
+    {
+        OmegaPqSpec s = { .k = 32768, .in_type = OMEGA_QG_IN_BF16, .mutant = 0, .groups = 32 };
+        CHK(omega_blackwell_codegen_pq_prog(&s, &p) == 0, "max legal pq k32768 bf16 g32");
+        check_max_headroom("max_pq_k32768_bf16_g32", &p);
+    }
+    {
+        OmegaQgSpec s = { .k = 2048, .rt = 4, .warps = 8, .epi = OMEGA_QG_EPI_SWIGLU, .direct = 0, .n = 1536, .wait = 24, .mutant = 0 };
+        CHK(omega_blackwell_codegen_qgemm_prog(&s, &p) == 0, "max legal qgemm swiglu rt4 w8");
+        check_max_headroom("max_qgemm_swiglu_rt4_w8", &p);
+    }
+    {
+        OmegaTcGemmSpec s = { .k = 2048, .rt = 4, .ct = 2, .warps = 8, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tcgemm_prog(&s, &p) == 0, "max legal tcgemm rt4 ct2 w8");
+        check_max_headroom("max_tcgemm_rt4_ct2_w8", &p);
+    }
+}
+
+static void test_qg_and_tc_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_pq_prog(NULL, &prog) != 0 && prog.count == 0, "pq NULL spec");
+    OmegaPqSpec pq_bad[] = {
+        { .k = 64,   .in_type = 0, .mutant = 0,  .groups = 0 },
+        { .k = 128,  .in_type = 2, .mutant = 0,  .groups = 0 },
+        { .k = 128,  .in_type = 0, .mutant = -1, .groups = 0 },
+        { .k = 128,  .in_type = 0, .mutant = 4,  .groups = 0 },
+        { .k = 5120, .in_type = 0, .mutant = 0,  .groups = 0 },
+    };
+    for (size_t i = 0; i < sizeof(pq_bad) / sizeof(pq_bad[0]); i++) {
+        prog.count = 44;
+        CHK(omega_blackwell_codegen_pq_prog(&pq_bad[i], &prog) != 0 && prog.count == 0, "pq invalid spec");
+    }
+    CHK(omega_blackwell_codegen_qgemm_prog(NULL, &prog) != 0 && prog.count == 0, "qgemm NULL spec");
+    OmegaQgSpec qg_bad[] = {
+        { .k = 64,  .rt = 4, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 8, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 4, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 8, .epi = 2, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 121,.mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = -1 },
+    };
+    for (size_t i = 0; i < sizeof(qg_bad) / sizeof(qg_bad[0]); i++) {
+        prog.count = 45;
+        CHK(omega_blackwell_codegen_qgemm_prog(&qg_bad[i], &prog) != 0 && prog.count == 0, "qgemm invalid spec");
+        CHK(omega_qg_shared_bytes(&qg_bad[i]) == 0 && omega_qg_span(&qg_bad[i]) == 0, "qg helpers 0");
+    }
+    prog.count = 46;
+    CHK(omega_blackwell_codegen_tc_probe_prog(-1, &prog) != 0 && prog.count == 0, "tc_probe mutant -1");
+    prog.count = 46;
+    CHK(omega_blackwell_codegen_tc_probe_prog(2, &prog) != 0 && prog.count == 0, "tc_probe mutant 2");
+    prog.count = 47;
+    CHK(omega_blackwell_codegen_tc_peak_prog(0, 4, 8, 32, &prog) != 0 && prog.count == 0, "tc_peak iters 0");
+    prog.count = 47;
+    CHK(omega_blackwell_codegen_tc_peak_prog(16, 17, 8, 32, &prog) != 0 && prog.count == 0, "tc_peak chains 17");
+    prog.count = 48;
+    CHK(omega_blackwell_codegen_tc_bw_prog(0, 1, 32, &prog) != 0 && prog.count == 0, "tc_bw iters 0");
+    prog.count = 48;
+    CHK(omega_blackwell_codegen_tc_bw_prog(16, 1, 16, &prog) != 0 && prog.count == 0, "tc_bw threads 16");
+    CHK(omega_blackwell_codegen_tcgemm_prog(NULL, &prog) != 0 && prog.count == 0, "tcgemm NULL spec");
+    OmegaTcGemmSpec tc_bad[] = {
+        { .k = 64,  .rt = 2, .ct = 2, .warps = 4, .mutant = 0 },
+        { .k = 128, .rt = 1, .ct = 2, .warps = 4, .mutant = 0 },
+        { .k = 128, .rt = 2, .ct = 2, .warps = 4, .mutant = -1 },
+        { .k = 128, .rt = 2, .ct = 2, .warps = 4, .mutant = 5 },
+    };
+    for (size_t i = 0; i < sizeof(tc_bad) / sizeof(tc_bad[0]); i++) {
+        prog.count = 49;
+        CHK(omega_blackwell_codegen_tcgemm_prog(&tc_bad[i], &prog) != 0 && prog.count == 0, "tcgemm invalid spec");
+        CHK(omega_tcgemm_shared_bytes(&tc_bad[i]) == 0 && omega_tcgemm_span(&tc_bad[i]) == 0, "tcgemm helpers 0");
+    }
 }
 
 static void test_tgemm_and_tc2_error_paths(void) {
@@ -456,6 +527,38 @@ static void dump_metrics(void) {
         CHK(omega_blackwell_codegen_tc2_prog(&s, &p) == 0, "tc2 swiglu direct k2048 rt8 w16");
         report_kernel("tc2_swiglu_d1_k2048_rt8_w16", &p, 16);
     }
+    {
+        OmegaPqSpec s = { .k = 2048, .in_type = OMEGA_QG_IN_BF16, .mutant = 0, .groups = 0 };
+        CHK(omega_blackwell_codegen_pq_prog(&s, &p) == 0, "pq bf16 k2048");
+        report_kernel("qg_pq_bf16_k2048", &p, 16);
+    }
+    {
+        OmegaQgSpec s = { .k = 2048, .rt = 4, .warps = 8, .epi = OMEGA_QG_EPI_F32, .direct = 0, .n = 2048, .wait = 24, .mutant = 0 };
+        CHK(omega_blackwell_codegen_qgemm_prog(&s, &p) == 0, "qgemm f32 k2048 rt4 w8");
+        report_kernel("qg_qgemm_f32_k2048_rt4_w8", &p, 8);
+    }
+    {
+        OmegaQgSpec s = { .k = 2048, .rt = 4, .warps = 8, .epi = OMEGA_QG_EPI_SWIGLU, .direct = 1, .n = 1536, .wait = 24, .mutant = 0 };
+        CHK(omega_blackwell_codegen_qgemm_prog(&s, &p) == 0, "qgemm swiglu d1 k2048 rt4 w8");
+        report_kernel("qg_qgemm_swiglu_d1_k2048", &p, 8);
+    }
+    {
+        CHK(omega_blackwell_codegen_tc_probe_prog(0, &p) == 0, "tc_probe");
+        report_kernel("tc_probe_m0", &p, 1);
+    }
+    {
+        OmegaTcGemmSpec s = { .k = 2048, .rt = 4, .ct = 2, .warps = 8, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tcgemm_prog(&s, &p) == 0, "tcgemm k2048 rt4 ct2 w8");
+        report_kernel("tc_tcgemm_k2048_rt4_ct2_w8", &p, 8);
+    }
+    {
+        CHK(omega_blackwell_codegen_tc_peak_prog(64, 8, 8, 256, &p) == 0, "tc_peak");
+        report_kernel("tc_peak_c8_s8_t256", &p, 8);
+    }
+    {
+        CHK(omega_blackwell_codegen_tc_bw_prog(64, 4, 256, &p) == 0, "tc_bw");
+        report_kernel("tc_bw_g4_t256", &p, 8);
+    }
 }
 
 int main(void) {
@@ -463,6 +566,7 @@ int main(void) {
     test_gemm_error_paths();
     test_qmma_and_pfhost_error_paths();
     test_tgemm_and_tc2_error_paths();
+    test_qg_and_tc_error_paths();
     test_max_size_legal_inputs();
     dump_metrics();
     printf("test_bw_om_codegen_bounds: %d passed, %d failed: %s\n", g_pass, g_fail, g_fail ? "FAIL" : "PASS");
