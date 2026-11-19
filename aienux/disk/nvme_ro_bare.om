@@ -1,0 +1,454 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/nvme_ro_bare.om: Bare-metal strictly read-only NVMe SQ/CQ driver (Slice D / Piece 4).
+note Safety invariants enforced:
+note   1. Hard opcode allowlist: Admin queue permits ONLY 0x06 (Identify), 0x05 (Create IOCQ),
+note      0x01 (Create IOSQ); I/O queue permits ONLY 0x02 (Read). Zero write/flush/format paths.
+note   2. Wall-clock CNTVCT_EL0 deadlines via nvme_now_ms(): CSTS.RDY uses CAP.TO * 500 ms;
+note      Admin/I/O CQE polls use 5000 ms, checking CSTS.CFS on every iteration.
+note   3. MDTS enforcement capped at <= 128 KiB (32 x 4 KiB pages via PRP list), matching Spark
+note      Samsung MZALC4T0HBL1-00B07 max_hw_sectors_kb=128.
+note   4. Pre-DMA Write-Back cache clean+invalidate (nvme_wb_clean_inv) before DMA into any WB span.
+note   5. <40-bit PA bound (0x10000000000) enforced for SMMUv3 A StreamID 0x50100 confinement.
+note
+note Compose with a platform backend defining:
+note   nvme_mmio_r32(addr) -> ulong
+note   nvme_mmio_r64(addr) -> ulong
+note   nvme_mmio_w32(addr, val) -> void
+note   nvme_mmio_w64(addr, val) -> void
+note   nvme_dma_r32(addr) -> ulong
+note   nvme_dma_w32(addr, val) -> void
+note   nvme_dma_w64(addr, val) -> void
+note   nvme_dma_r8(addr) -> ulong
+note   nvme_dma_zero(addr, size) -> void
+note   nvme_now_ms() -> ulong
+note   nvme_dsb_sy() -> void
+note   nvme_wb_clean_inv(pa, len) -> void
+
+const NV_PAGE ulong 4096
+const NV_DEPTH ulong 16
+const NV_MAX_XFER ulong 131072
+const NV_IO_TMO_MS ulong 5000
+const NV_PA40_LIMIT ulong 1099511627776
+
+note DMA arena layout (128 KiB, 4 KiB-aligned Normal-NC):
+note   +0     Admin SQ (16 * 64 = 1024 B, 1 page)
+note   +4096  Admin CQ (16 * 16 = 256 B, 1 page)
+note   +8192  Identify 4 KiB buffer
+note   +12288 I/O SQ (16 * 64 = 1024 B, 1 page)
+note   +16384 I/O CQ (16 * 16 = 256 B, 1 page)
+note   +20480 PRP-list page (up to 32 entries * 8 B = 256 B, 1 page)
+note   +24576 Scratch 4 KiB bounce page (for small sector reads)
+const NV_OFF_ASQ ulong 0
+const NV_OFF_ACQ ulong 4096
+const NV_OFF_ID ulong 8192
+const NV_OFF_ISQ ulong 12288
+const NV_OFF_ICQ ulong 16384
+const NV_OFF_PRP ulong 20480
+const NV_OFF_SCR ulong 24576
+
+note Error codes
+const NV_OK int 0
+const NV_E_FAILED int 10
+const NV_E_CFS int 11
+const NV_E_TIMEOUT int 12
+const NV_E_OPCODE int 13
+const NV_E_CID int 14
+const NV_E_SQID int 15
+const NV_E_SQHD int 16
+const NV_E_STATUS int 17
+const NV_E_CAP int 20
+const NV_E_GEOM int 21
+const NV_E_ARG int 30
+const NV_E_RANGE int 31
+const NV_E_PA40 int 32
+
+note State array nv_st:
+note   0=failed, 1=ready, 2=cid, 3=db_stride, 4=nsid, 5=blk_bytes,
+note   6=ns_blocks, 7=max_xfer, 8=bar0, 9=dma_pa, 10=cap_to_ms, 11=last_cqe_sc
+global nv_st ulong 12
+global nv_tail ulong 2
+global nv_head ulong 2
+global nv_phase ulong 2
+global nv_sqe uint 16
+
+fn nv_fatal code int to int
+put nv_st 0 1
+put nv_st 1 0
+ret code
+end
+
+fn nv_clear_sqe to void
+for i ulong 16
+put nv_sqe i 0
+end
+end
+
+fn nv_dma off ulong to ulong
+ret add get nv_st 9 off
+end
+
+fn nv_id32 off ulong to ulong
+a = nv_dma add NV_OFF_ID off
+b0 = nvme_dma_r8 a
+b1 = nvme_dma_r8 add a 1
+b2 = nvme_dma_r8 add a 2
+b3 = nvme_dma_r8 add a 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn nv_id64 off ulong to ulong
+lo = nv_id32 off
+hi = nv_id32 add off 4
+ret or lo shl hi 32
+end
+
+fn nv_ring q ulong is_cq ulong val ulong to void
+idx = add mul q 2 is_cq
+off = add 4096 mul idx get nv_st 3
+nvme_dsb_sy
+nvme_mmio_w32 add get nv_st 8 off val
+nvme_dsb_sy
+end
+
+fn nv_wait_rdy want ulong to int
+bar0 = get nv_st 8
+tmo = get nv_st 10
+t0 = nvme_now_ms
+while true bound 9223372036854775807
+csts = nvme_mmio_r32 add bar0 28
+if ne and csts 2 0
+ret nv_fatal NV_E_CFS
+end
+if eq and csts 1 want
+ret NV_OK
+end
+now = nvme_now_ms
+if ge now t0
+if gt sub now t0 tmo
+ret nv_fatal NV_E_TIMEOUT
+end
+end
+end
+ret nv_fatal NV_E_TIMEOUT
+end
+
+note Hard read-only opcode gate: Admin permits 0x06/0x05/0x01; I/O permits 0x02 ONLY.
+fn nv_opcode_allowed q ulong op ulong to bool
+if eq q 0
+if or eq op 6 or eq op 5 eq op 1
+ret true
+end
+ret false
+end
+if eq q 1
+ret eq op 2
+end
+ret false
+end
+
+fn nv_enqueue q ulong cid ulong to void
+put nv_sqe 0 uint or and ulong get nv_sqe 0 65535 shl cid 16
+sq_base = nv_dma NV_OFF_ASQ
+if eq q 1
+sq_base = nv_dma NV_OFF_ISQ
+end
+sq_slot = add sq_base mul get nv_tail q 64
+for i ulong 16
+nvme_dma_w32 add sq_slot mul i 4 ulong get nv_sqe i
+end
+nt = rem add get nv_tail q 1 NV_DEPTH
+put nv_tail q nt
+nv_ring q 0 nt
+end
+
+fn nv_submit q ulong to int
+if ne get nv_st 0 0
+ret NV_E_FAILED
+end
+op = and ulong get nv_sqe 0 255
+if not nv_opcode_allowed q op
+ret NV_E_OPCODE
+end
+cid = get nv_st 2
+put nv_st 2 and add cid 1 65535
+nv_enqueue q cid
+cq_slot = add nv_dma NV_OFF_ACQ mul get nv_head q 16
+if eq q 1
+cq_slot = add nv_dma NV_OFF_ICQ mul get nv_head q 16
+end
+t0 = nvme_now_ms
+seen = false
+dw3 = ulong 0
+while true bound 9223372036854775807
+nvme_dsb_sy
+dw3 = nvme_dma_r32 add cq_slot 12
+if eq and shr dw3 16 1 get nv_phase q
+seen = true
+break
+end
+if ne and nvme_mmio_r32 add get nv_st 8 28 2 0
+ret nv_fatal NV_E_CFS
+end
+now = nvme_now_ms
+if ge now t0
+if gt sub now t0 NV_IO_TMO_MS
+break
+end
+end
+end
+if not seen
+ret nv_fatal NV_E_TIMEOUT
+end
+if ne and dw3 65535 cid
+ret nv_fatal NV_E_CID
+end
+if ne shr nvme_dma_r32 add cq_slot 8 16 q
+ret nv_fatal NV_E_SQID
+end
+nh = add get nv_head q 1
+if eq nh NV_DEPTH
+nh = ulong 0
+put nv_phase q xor get nv_phase q 1
+end
+put nv_head q nh
+nv_ring q 1 nh
+sc = and shr dw3 17 2047
+put nv_st 11 sc
+if ne sc 0
+ret NV_E_STATUS
+end
+ret NV_OK
+end
+
+fn nv_identify cns ulong nsid ulong to int
+nv_clear_sqe
+put nv_sqe 0 6
+put nv_sqe 1 uint nsid
+id_pa = nv_dma NV_OFF_ID
+put nv_sqe 6 uint and id_pa 4294967295
+put nv_sqe 7 uint shr id_pa 32
+put nv_sqe 10 uint cns
+ret nv_submit 0
+end
+
+fn nv_create_ioq to int
+nv_clear_sqe
+put nv_sqe 0 5
+pa = nv_dma NV_OFF_ICQ
+put nv_sqe 6 uint and pa 4294967295
+put nv_sqe 7 uint shr pa 32
+put nv_sqe 10 983041
+put nv_sqe 11 1
+r = nv_submit 0
+if ne r NV_OK
+ret r
+end
+nv_clear_sqe
+put nv_sqe 0 1
+pa = nv_dma NV_OFF_ISQ
+put nv_sqe 6 uint and pa 4294967295
+put nv_sqe 7 uint shr pa 32
+put nv_sqe 10 983041
+put nv_sqe 11 65537
+r = nv_submit 0
+if ne r NV_OK
+ret r
+end
+put nv_st 1 1
+ret NV_OK
+end
+
+fn nv_init_ns_ioq nsid ulong to int
+r = nv_identify 1 0
+if ne r NV_OK
+ret r
+end
+if gt nsid nv_id32 516
+ret nv_fatal NV_E_GEOM
+end
+mdts = nvme_dma_r8 add nv_dma NV_OFF_ID 77
+max_xfer = NV_MAX_XFER
+if and ne mdts 0 lt mdts 5
+max_xfer = shl NV_PAGE mdts
+end
+put nv_st 7 max_xfer
+r = nv_identify 0 nsid
+if ne r NV_OK
+ret r
+end
+nsze = nv_id64 0
+if eq nsze 0
+ret nv_fatal NV_E_GEOM
+end
+put nv_st 6 nsze
+fmt = and nvme_dma_r8 add nv_dma NV_OFF_ID 26 15
+lbaf = nv_id32 add 128 mul fmt 4
+if ne and lbaf 65535 0
+ret nv_fatal NV_E_GEOM
+end
+lbads = and shr lbaf 16 255
+if not or eq lbads 9 eq lbads 12
+ret nv_fatal NV_E_GEOM
+end
+put nv_st 5 shl ulong 1 lbads
+ret nv_create_ioq
+end
+
+note Initialize NVMe controller strictly read-only.
+note bar0: physical BAR0 address (Spark 0004:01:00.0 = 0x62100000).
+note dma_pa: 4 KiB-aligned Normal-NC DMA arena (>= 32 KiB, < 40-bit PA).
+note nsid: namespace ID (typically 1).
+fn nvme_init bar0 ulong dma_pa ulong nsid ulong to int
+for i ulong 12
+put nv_st i 0
+end
+put nv_tail 0 0
+put nv_tail 1 0
+put nv_head 0 0
+put nv_head 1 0
+put nv_phase 0 1
+put nv_phase 1 1
+if or eq bar0 0 ne and dma_pa 4095 0
+ret nv_fatal NV_E_ARG
+end
+if or ge add dma_pa 32768 NV_PA40_LIMIT eq nsid 0
+ret nv_fatal NV_E_PA40
+end
+put nv_st 8 bar0
+put nv_st 9 dma_pa
+put nv_st 2 1
+put nv_st 4 nsid
+cap = nvme_mmio_r64 bar0
+ver = shr nvme_mmio_r32 add bar0 8 16
+if not or eq ver 1 eq ver 2
+ret nv_fatal NV_E_CAP
+end
+if lt and cap 65535 sub NV_DEPTH 1
+ret nv_fatal NV_E_CAP
+end
+if eq and shr cap 37 1 0
+ret nv_fatal NV_E_CAP
+end
+if ne and shr cap 48 15 0
+ret nv_fatal NV_E_CAP
+end
+dstrd = and shr cap 32 15
+if gt dstrd 12
+ret nv_fatal NV_E_CAP
+end
+put nv_st 3 shl ulong 4 dstrd
+to_raw = and shr cap 24 255
+if eq to_raw 0
+to_raw = ulong 1
+end
+put nv_st 10 mul to_raw 500
+nvme_mmio_w32 add bar0 20 0
+nvme_dsb_sy
+r = nv_wait_rdy 0
+if ne r NV_OK
+ret r
+end
+nvme_dma_zero dma_pa 32768
+nvme_dsb_sy
+nvme_mmio_w32 add bar0 36 or shl sub NV_DEPTH 1 16 sub NV_DEPTH 1
+nvme_mmio_w64 add bar0 40 nv_dma NV_OFF_ASQ
+nvme_mmio_w64 add bar0 48 nv_dma NV_OFF_ACQ
+nvme_mmio_w32 add bar0 20 4587521
+nvme_dsb_sy
+r = nv_wait_rdy 1
+if ne r NV_OK
+ret r
+end
+ret nv_init_ns_ioq nsid
+end
+
+note Issue one bounded Read command (<= max_xfer bytes) directly into 4 KiB-aligned dst_pa.
+fn nv_read_chunk lba ulong nblocks ulong dst_pa ulong to int
+blk = get nv_st 5
+bytes = mul nblocks blk
+pages = div add bytes sub NV_PAGE 1 NV_PAGE
+if or eq pages 0 gt pages 32
+ret NV_E_ARG
+end
+nv_clear_sqe
+put nv_sqe 0 2
+put nv_sqe 1 uint get nv_st 4
+put nv_sqe 6 uint and dst_pa 4294967295
+put nv_sqe 7 uint shr dst_pa 32
+if eq pages 2
+p2 = add dst_pa NV_PAGE
+put nv_sqe 8 uint and p2 4294967295
+put nv_sqe 9 uint shr p2 32
+end
+if gt pages 2
+prp_pa = nv_dma NV_OFF_PRP
+for i ulong sub pages 1
+pg = add dst_pa mul add i 1 NV_PAGE
+nvme_dma_w64 add prp_pa mul i 8 pg
+end
+nvme_dsb_sy
+put nv_sqe 8 uint and prp_pa 4294967295
+put nv_sqe 9 uint shr prp_pa 32
+end
+put nv_sqe 10 uint and lba 4294967295
+put nv_sqe 11 uint shr lba 32
+put nv_sqe 12 uint sub nblocks 1
+ret nv_submit 1
+end
+
+note Read arbitrary contiguous LBA range directly into 4 KiB-aligned dst_pa.
+note If dst_is_wb != 0, performs pre-DMA WB clean+invalidate (DC CIVAC + DSB SY) before DMA.
+fn nvme_read_direct lba ulong nblocks ulong dst_pa ulong dst_is_wb ulong to int
+if or ne get nv_st 0 0 eq get nv_st 1 0
+ret NV_E_FAILED
+end
+if or eq nblocks 0 ne and dst_pa 4095 0
+ret NV_E_ARG
+end
+ns_blocks = get nv_st 6
+if or ge lba ns_blocks gt nblocks sub ns_blocks lba
+ret NV_E_RANGE
+end
+blk = get nv_st 5
+total_bytes = mul nblocks blk
+if or lt add dst_pa total_bytes dst_pa gt add dst_pa total_bytes NV_PA40_LIMIT
+ret NV_E_PA40
+end
+if ne dst_is_wb 0
+nvme_wb_clean_inv dst_pa total_bytes
+end
+max_blks = div get nv_st 7 blk
+done = ulong 0
+while lt done nblocks bound 9223372036854775807
+rem_blks = sub nblocks done
+chunk = rem_blks
+if gt chunk max_blks
+chunk = max_blks
+end
+r = nv_read_chunk add lba done chunk add dst_pa mul done blk
+if ne r NV_OK
+ret r
+end
+done = add done chunk
+end
+if ne dst_is_wb 0
+nvme_wb_clean_inv dst_pa total_bytes
+end
+ret NV_OK
+end
+
+fn nvme_blk_bytes to ulong
+ret get nv_st 5
+end
+
+fn nvme_ns_blocks to ulong
+ret get nv_st 6
+end
+
+fn nvme_max_xfer to ulong
+ret get nv_st 7
+end
+
+fn nvme_cap_to_ms to ulong
+ret get nv_st 10
+end

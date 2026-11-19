@@ -1,0 +1,111 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/rtl8127/om/rtl8127/bare_a64efi.om: Bare-metal target a64efi backend for rtl8127.om.
+note Provides exact 1-, 2-, and 4-byte BAR2 Device-nGnRnE MMIO accessors via fwld/fwst,
+note CNTVCT_EL0 microsecond delay, DSB SY barrier, and Normal-NC physical DMA staging helpers.
+note Spark 0007:01:00.0 (10ec:8127 rev 05): BAR2 = 0x6e900000 (256 KiB), SMMUv3 A StreamID 0x80100.
+note
+note Requires Piece 1 platform hooks:
+note   a64_dsb_sy() -> void
+note   a64_dc_civac_range(pa ulong, len ulong) -> void
+
+const RTL_SPARK_BAR2 ulong 1854930944
+const RTL_PA40_LIMIT ulong 1099511627776
+
+note rtl_hw: 0=bar2_pa, 1=rdma_pa (4 KiB-aligned Normal-NC physical DMA buffer, 69632 B)
+global rtl_hw ulong 2
+
+fn rtl_bare_setup bar2_pa ulong rdma_pa ulong to int
+if or eq bar2_pa 0 ne and rdma_pa 4095 0
+ret 1
+end
+if ge add rdma_pa 69632 RTL_PA40_LIMIT
+ret 2
+end
+put rtl_hw 0 bar2_pa
+put rtl_hw 1 rdma_pa
+ret 0
+end
+
+note Exact 1-, 2-, or 4-byte BAR2 MMIO read (no 32-bit RMW side effects).
+fn rtlrd off ulong w ulong to ulong
+a = add get rtl_hw 0 off
+a64_dsb_sy
+v = fwld a w
+a64_dsb_sy
+if eq w 1
+ret and v 255
+end
+if eq w 2
+ret and v 65535
+end
+ret and v 4294967295
+end
+
+note Exact 1-, 2-, or 4-byte BAR2 MMIO write (safe for ChipCmd 0x37, Cfg9346 0x50, RxMaxSize 0xDA).
+fn rtlwr off ulong w ulong v ulong to void
+a = add get rtl_hw 0 off
+a64_dsb_sy
+z = fwst a w v
+a64_dsb_sy
+end
+
+note Overflow-safe CNTVCT_EL0 microsecond delay.
+fn rtldly us ulong to void
+if eq us 0
+ret
+end
+frq = fwsys 3
+if eq frq 0
+ret
+end
+ticks = add mul div us 1000000 frq div mul rem us 1000000 frq 1000000
+if eq ticks 0
+ticks = ulong 1
+end
+t0 = fwsys 2
+while true bound 9223372036854775807
+t1 = fwsys 2
+if ge t1 t0
+if ge sub t1 t0 ticks
+break
+end
+end
+end
+end
+
+fn rtlbar to void
+a64_dsb_sy
+end
+
+note Pre-DMA WB clean+invalidate helper for any WB buffer handed toward NIC DMA.
+fn rtl_wb_clean_inv pa ulong nbytes ulong to void
+a64_dc_civac_range pa nbytes
+a64_dsb_sy
+end
+
+note Sync rdma global <-> Normal-NC physical DMA buffer at rtl_hw[1] (when rdma_pa != 0).
+fn rtl_sync_tx_to_nc off ulong n ulong to void
+base = get rtl_hw 1
+if eq base 0
+ret
+end
+i = ulong 0
+while lt i n bound 69632
+z = fwst add base add off i 1 ulong get rdma add off i
+i = add i 1
+end
+a64_dsb_sy
+end
+
+fn rtl_sync_rx_from_nc off ulong n ulong to void
+base = get rtl_hw 1
+if eq base 0
+ret
+end
+a64_dsb_sy
+i = ulong 0
+while lt i n bound 69632
+put rdma add off i uchar and fwld add base add off i 1 255
+i = add i 1
+end
+end
