@@ -1,6 +1,6 @@
 # train/: Pure-Omega units (78 verified units)
 
-This layer integrates **193 pure-Omega (`.om`) files** from **5 canonical Interplane repositories** with full Git history preserved under `train/import/<repo>/`.
+This layer integrates **195 pure-Omega (`.om`) files** from **5 canonical Interplane repositories** with full Git history preserved under `train/import/<repo>/`.
 
 ## Unit table and gate
 
@@ -12,4 +12,4 @@ Files imported under `train/` that are library parts composed only by external h
 
 ## Not here yet
 
-All **1740** non-Omega first-party files (outside `evidence/` and `vendor/`) from these repositories stayed upstream and are catalogued in [`train/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv).
+All **1730** non-Omega first-party files (outside `evidence/` and `vendor/`) from these repositories stayed upstream and are catalogued in [`train/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv).
