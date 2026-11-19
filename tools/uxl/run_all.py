@@ -457,6 +457,22 @@ def parse_plan(path):
     return rows, None
 
 
+def omc_did_not_start(lines):
+    text = "\n".join(lines)
+    if "NOT_RUN rmsnorm: cannot execute" in text:
+        return True
+    if "seed/out/omc" in text or "Exec format error" in text:
+        if (
+            "Exec format error" in text
+            or "Errno 8" in text
+            or "WinError 193" in text
+            or "not a valid Win32 application" in text
+            or "cannot execute" in text
+        ):
+            return True
+    return False
+
+
 def row_argv(command):
     argv = shlex.split(command)
     if argv and argv[0] in ("python3", "python", "py"):
@@ -489,12 +505,17 @@ def run_plan(path):
         code, lines = stream(argv, ROOT)
         digest = sha_from_lines(lines)
         computed = digest if digest else "NONE"
-        if code == 2:
+        if code == 2 or omc_did_not_start(lines):
+            why = "prerequisite %s missing" % (prereq or "runtime")
+            if omc_did_not_start(lines):
+                why = "omc cannot run"
+                if not any(qemu_install_line() in line for line in lines):
+                    print(qemu_install_line())
             print(
                 "HASH %s expected %s computed NOT_RUN NOT_RUN" % (name, expected or "sha256"),
                 flush=True,
             )
-            print("NOT_RUN %s exit 2 (prerequisite %s missing; not a pass)" % (name, prereq or "runtime"))
+            print("NOT_RUN %s exit %s (%s; not a pass)" % (name, code, why))
             not_run += 1
             continue
         phrase_ok = (not stdout_need) or any(stdout_need in line for line in lines)

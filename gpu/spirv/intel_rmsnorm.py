@@ -5,8 +5,9 @@ Usage: python3 gpu/spirv/intel_rmsnorm.py <prerequisite>
 
 prerequisite is one of: opencl-intel, opencl-pocl, levelzero, vulkan.
 Exit 0 prints PASS and means every output byte matched conform.om.
-Exit 2 is NOT_RUN (the prerequisite runtime or device is not on this machine).
-Exit 1 is a mismatch or a runtime failure after the device was opened.
+Exit 2 is NOT_RUN: the prerequisite device is missing, or omc cannot execute
+(Exec format error, missing qemu, or a non-Linux host).
+Exit 1 is a mismatch or a failure after omc has actually run.
 No shell is involved. omc is taken from OMC or seed/out/omc, relative to the repo root.
 """
 
@@ -20,6 +21,14 @@ import tempfile
 NROWS = 65536
 ROW = 16
 NOUT = NROWS * ROW
+# Same sentence as tools/uxl/run_all.py qemu_install_line().
+OMC_INSTALL = (
+    "omc is the pinned AArch64 binary sha256 "
+    "34d611ca0415eab1728d3234911d90e74af17ba9ab0c581d559f48274d7ca6d3. "
+    "On x86 Linux install qemu-user-static and binfmt-support, mount binfmt_misc, "
+    "and register /usr/lib/binfmt.d/qemu-aarch64.conf so the kernel runs qemu-aarch64. "
+    "On Windows, use WSL with that binfmt setup."
+)
 
 
 def repo_root():
@@ -28,9 +37,21 @@ def repo_root():
 
 def run_omc(root, src, out):
     omc = os.environ.get("OMC", os.path.join(root, "seed", "out", "omc"))
+    if sys.platform != "linux":
+        sys.stdout.write(
+            "NOT_RUN rmsnorm: cannot execute %s (non-Linux host %s). %s\n"
+            % (omc, sys.platform, OMC_INSTALL)
+        )
+        return "noexec"
     with open(src, "rb") as f:
         data = f.read()
-    r = subprocess.run([omc], input=data, stdout=subprocess.PIPE)
+    try:
+        r = subprocess.run([omc], input=data, stdout=subprocess.PIPE)
+    except OSError as exc:
+        sys.stdout.write(
+            "NOT_RUN rmsnorm: cannot execute %s (%s). %s\n" % (omc, exc, OMC_INSTALL)
+        )
+        return "noexec"
     if r.returncode != 0 or not r.stdout:
         sys.stderr.write("intel_rmsnorm: omc failed on %s\n" % src)
         return False
@@ -43,10 +64,15 @@ def run_omc(root, src, out):
 def build_module(root, tmp, env):
     emit = os.path.join(tmp, "emit")
     conform = os.path.join(tmp, "conform")
-    if not run_omc(root, os.path.join(root, "gpu", "spirv", "emit.om"), emit):
-        return None
-    if not run_omc(root, os.path.join(root, "gpu", "spirv", "conform.om"), conform):
-        return None
+    for src, dest in (
+        (os.path.join(root, "gpu", "spirv", "emit.om"), emit),
+        (os.path.join(root, "gpu", "spirv", "conform.om"), conform),
+    ):
+        got = run_omc(root, src, dest)
+        if got == "noexec":
+            return "noexec"
+        if not got:
+            return None
     spv = os.path.join(tmp, "rmsnorm.%s.spv" % env)
     xbin = os.path.join(tmp, "x.bin")
     wbin = os.path.join(tmp, "w.bin")
@@ -879,6 +905,8 @@ def main(argv):
     env = "vk" if prereq == "vulkan" else "cl"
     tmp = tempfile.mkdtemp(prefix="rmsnorm-")
     built = build_module(root, tmp, env)
+    if built == "noexec":
+        return 2
     if built is None:
         return 1
     module, x, w, want = built
