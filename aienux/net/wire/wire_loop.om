@@ -60,6 +60,7 @@ const WL_S_TXN ulong 24
 const WL_S_DROPS ulong 25
 const WL_S_HASFIRST ulong 26
 const WL_S_CURMODE ulong 27
+const WL_S_REARM ulong 28
 
 const WL_DEFPORT ulong 18100
 const WL_DEFCTX ulong 262144
@@ -68,6 +69,8 @@ const WL_DEFIDLE ulong 30000
 const WL_DEFSTEP ulong 5000
 const WL_DECMAX ulong 16384
 const WL_TXCAP ulong 4096
+const WL_U32MAX ulong 4294967295
+const WL_CBLENMAX long 2097151
 
 global wl_st ulong 32
 global wl_rx uchar 16400
@@ -83,11 +86,11 @@ end
 end
 
 note Overflow-safe monotonic millisecond clock from Piece 1 CNTVCT_EL0 / CNTFRQ_EL0.
-note Uses (t / frq) * 1000 + ((t % frq) * 1000) / frq (zero u64 overflow for frq <= 1.8e16 Hz).
+note Returns 0 if frq < 1000 so (t / frq) * 1000 cannot overflow u64 for any t.
 fn wl_now_ms to ulong
 t = wl_cntvct
 frq = wl_cntfrq
-if eq frq 0
+if lt frq 1000
 ret 0
 end
 sec_ms = mul div t frq 1000
@@ -96,6 +99,9 @@ ret add sec_ms rem_ms
 end
 
 fn wl_err_u32 rc long to ulong
+if eq rc -9223372036854775808
+ret 9223372036854775808
+end
 if lt rc 0
 ret ulong sub 0 rc
 end
@@ -113,8 +119,14 @@ end
 if eq max_ctx 0
 max_ctx = WL_DEFCTX
 end
+if gt max_ctx WL_U32MAX
+max_ctx = WL_U32MAX
+end
 if eq vocab_sz 0
 vocab_sz = WL_DEFVOC
+end
+if gt vocab_sz WL_U32MAX
+vocab_sz = WL_U32MAX
 end
 put wl_st WL_S_PORT port
 put wl_st WL_S_MAXCTX max_ctx
@@ -129,9 +141,13 @@ tlisten port
 end
 
 note Queue omktx[0..omktxn) into bounded wl_txq ring (4096 B).
+note Suppresses emission if peer is disconnected (WL_S_CONN == 0) to prevent cross-connection leaks.
 fn wl_qtx to void
+if eq get wl_st WL_S_CONN 0
+ret
+end
 n = get omktxn 0
-if eq n 0
+if or eq n 0 gt n 64
 ret
 end
 cur = get wl_st WL_S_TXN
@@ -251,7 +267,7 @@ end
 put wl_st WL_S_RXN remn
 end
 
-note Reset per-connection framing buffers and re-arm passive TCP listen.
+note Reset per-connection framing buffers; defer tlisten until any in-flight GPU op drains.
 fn wl_rearm now ulong to void
 put wl_st WL_S_RXN 0
 put wl_st WL_S_RXDROP 0
@@ -259,16 +275,18 @@ put wl_st WL_S_TXH 0
 put wl_st WL_S_TXN 0
 put wl_st WL_S_CONN 0
 put wl_st WL_S_ACTMS now
-if ne get wl_st WL_S_STATE WL_IDLE
-if ne get wl_st WL_S_STATE WL_FAULT
+st = get wl_st WL_S_STATE
+if or eq st WL_SUBMIT eq st WL_WAIT
 put wl_st WL_S_CANCEL 1
+put wl_st WL_S_REARM 1
+ret
 end
-end
+put wl_st WL_S_REARM 0
 tlisten get wl_st WL_S_PORT
 end
 
-note Handle RESET_KV (op=3): keep_pos == 0 routes through GPU_SUBMIT -> GPU_WAIT;
-note keep_pos > 0 calls q38_reset_kv and propagates ERR(E_UNSUP) on -2.
+note Handle RESET_KV (op=3): validate keep <= kv_pos; keep_pos == 0 routes through GPU_SUBMIT -> GPU_WAIT;
+note keep_pos > 0 calls q38_reset_kv and propagates ERR(E_UNSUP) on -2 (never falls through to full wipe).
 fn wl_do_reset req_id ulong to void
 st = get wl_st WL_S_STATE
 if eq st WL_FAULT
@@ -280,6 +298,10 @@ wl_send_err req_id OMK_EBUSY 0
 ret
 end
 keep = wl_rx_r32 16
+if gt keep get wl_st WL_S_KVPOS
+wl_send_err req_id OMK_ERANGE keep
+ret
+end
 if gt keep 0
 rc = wl_q38_reset_kv keep
 if eq rc -2
@@ -292,9 +314,12 @@ ret
 end
 if eq rc 0
 put wl_st WL_S_KVPOS keep
+put wl_st WL_S_HASFIRST 0
 wl_send_done req_id 0 keep OMK_RRESET
 ret
 end
+wl_send_err req_id OMK_EUNSUP keep
+ret
 end
 put wl_st WL_S_REQID req_id
 put wl_st WL_S_OP WL_OPRESET
@@ -375,7 +400,7 @@ end
 kv = get wl_st WL_S_KVPOS
 hasf = get wl_st WL_S_HASFIRST
 if eq hasf 0
-if ge kv get wl_st WL_S_MAXCTX
+if or eq kv 0 ge kv get wl_st WL_S_MAXCTX
 wl_send_err req_id OMK_ERANGE kv
 ret
 end
@@ -513,7 +538,13 @@ end
 end
 
 note Stage and kick one GPU op (WL_SUBMIT -> WL_WAIT).
+note Applies TX backpressure (>= 64 B free in wl_txq) so TOKEN/DONE/ERR frames are never dropped.
 fn wl_gpu_submit now ulong to void
+if ne get wl_st WL_S_CONN 0
+if lt sub WL_TXCAP get wl_st WL_S_TXN 64
+ret
+end
+end
 req = get wl_st WL_S_REQID
 op = get wl_st WL_S_OP
 if ne get wl_st WL_S_CANCEL 0
@@ -556,7 +587,7 @@ pbw = wl_q38_stage_step tok uint kv 1
 end
 end
 end
-if le pbw 0
+if or le pbw 0 gt pbw WL_CBLENMAX
 wl_send_err req OMK_EGSTAGE wl_err_u32 pbw
 put wl_st WL_S_STATE WL_IDLE
 put wl_st WL_S_OP WL_OPNONE
@@ -677,9 +708,11 @@ end
 put wl_st WL_S_ACTMS now
 op = get wl_st WL_S_OP
 if eq op WL_OPRESET
+wl_dsb_ish
 put wl_st WL_S_KVPOS 0
 put wl_st WL_S_LASTTOK 0
 put wl_st WL_S_HASFIRST 0
+put wl_st WL_S_CANCEL 0
 wl_send_done req 0 0 OMK_RRESET
 put wl_st WL_S_STATE WL_IDLE
 put wl_st WL_S_OP WL_OPNONE
@@ -696,14 +729,24 @@ n = wl_nic_rx
 if eq n 0
 break
 end
+if le n 2048
 tinput n
+end
 b = add b 1
 end
 now = wl_now_ms
 tstep now
 tst = get Tcb kST
 if eq tst 0
+if eq get wl_st WL_S_REARM 0
 wl_rearm now
+else
+st0 = get wl_st WL_S_STATE
+if or eq st0 WL_IDLE eq st0 WL_FAULT
+put wl_st WL_S_REARM 0
+tlisten get wl_st WL_S_PORT
+end
+end
 else
 if eq tst 4
 if eq get wl_st WL_S_CONN 0
