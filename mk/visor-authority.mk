@@ -15,7 +15,7 @@
 # libaienos_capability.a relinks the test. The old default ../aienos-r9 overrode the
 # Makefile's pinned default for every authority target (R7 to R16).
 AIENOS_LOCK_REPO ?= ../aienos-argus-cap
-AIENOS_LOCK = $(shell head -n 1 aienos.lock)
+# AIENOS_LOCK: the validated commit parsed at the top of the Makefile (before this include).
 AIENOS_R7_DEFAULT = $(OUT_DIR)/aienos-authority/$(AIENOS_LOCK)
 AIENOS_R7_DIR ?= $(AIENOS_R7_DEFAULT)
 AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/$(AIENOS_LOCK)/libaienos_capability.a

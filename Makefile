@@ -2,6 +2,13 @@ CC ?= gcc
 .DEFAULT_GOAL := all
 PHYSICS_DIR ?= ../physics
 OUT_DIR ?= build
+# aienos.lock is code-adjacent input: parse it as data before mk/*.mk or any recipe sees it.
+# Exactly one lowercase 40-hex commit line (final newline optional), else make stops;
+# `override` so a command-line or environment AIENOS_LOCK cannot replace the parsed value.
+override AIENOS_LOCK := $(shell LC_ALL=C awk 'NR == 1 && length($$0) == 40 && $$0 ~ /^[0-9a-f]+$$/ { commit = $$0; next } { invalid = 1 } END { if (!invalid && NR == 1) print commit; else exit 1 }' aienos.lock 2>/dev/null)
+ifneq ($(words $(AIENOS_LOCK)),1)
+$(error aienos.lock must contain exactly one lowercase 40-hex commit)
+endif
 -include mk/*.mk
 PHYSICS_LOCK_CHECK ?= 1
 
@@ -464,16 +471,16 @@ test-sem-incremental: $(RX_SEM_TEST)
 # and no unignored extra file sits beside them. The proof runs on every build (phony
 # prerequisite), so a source edited after extraction stops the build.
 AIENOS_LOCK_REPO ?= ../aienos-argus-cap
-AIENOS_LOCK = $(shell head -n 1 aienos.lock)
+# AIENOS_LOCK is the validated commit parsed at the top of this Makefile.
 AIENOS_R7_DEFAULT = $(OUT_DIR)/aienos-authority/$(AIENOS_LOCK)
 AIENOS_R7_DIR ?= $(AIENOS_R7_DEFAULT)
 AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/$(AIENOS_LOCK)/libaienos_capability.a
 # $(call aienos_source,<subpaths>): materialize into the default cache, or prove the override.
 aienos_source = if [ "$(AIENOS_R7_DIR)" = "$(AIENOS_R7_DEFAULT)" ]; then \
-		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_R7_DIR= bash tools/aienos_lock_source.sh materialize "$(AIENOS_R7_DIR)" $(1); \
+		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_LOCK='$(AIENOS_LOCK)' AIENOS_R7_DIR= bash tools/aienos_lock_source.sh materialize "$(AIENOS_R7_DIR)" $(1); \
 	else \
-		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_R7_DIR="$(AIENOS_R7_DIR)" bash tools/aienos_lock_source.sh verify-dir "$(AIENOS_R7_DIR)" $(1); \
-	fi || { echo "error: the aienos authority source is not the aienos.lock commit $(AIENOS_LOCK) (see above)."; \
+		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_LOCK='$(AIENOS_LOCK)' AIENOS_R7_DIR="$(AIENOS_R7_DIR)" bash tools/aienos_lock_source.sh verify-dir "$(AIENOS_R7_DIR)" $(1); \
+	fi || { echo 'error: the aienos authority source is not the aienos.lock commit $(AIENOS_LOCK) (see above).'; \
 		echo "  pass AIENOS_LOCK_REPO=<an aienos clone holding that commit>, or AIENOS_R7_DIR=<a clean tree of it inside such a clone>;"; \
 		echo "  a modified default cache under $(OUT_DIR)/aienos-authority must be deleted, not reused."; exit 1; }
 RX_R7_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
@@ -1466,6 +1473,12 @@ check-argus-lock:
 
 test-argus-lock:
 	bash tests/argus_lock_validation.sh
+
+# aienos.lock is parsed at the top of this Makefile; this prints the parsed commit
+# (hostile shapes: tests/aienos_lock_source/run.sh section 4).
+.PHONY: check-aienos-lock
+check-aienos-lock:
+	@printf '%s\n' '$(AIENOS_LOCK)'
 
 $(ARGUS_STAMP):
 	mkdir -p "$(OUT_DIR)/argus-src/$(ARGUS_SHORT)"

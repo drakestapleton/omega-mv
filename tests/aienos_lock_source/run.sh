@@ -136,5 +136,55 @@ rm -rf "$CL/native/capability/out"
 check "make: clean checkout of the locked commit as override builds" '[ "$(M AIENOS_R7_DIR="$CL" build/aienos-cap/$GOOD/libaienos_capability.a)" = 0 ]'
 check "make: lock repository missing the commit refused" '[ "$(make -s -C "$W" AIENOS_LOCK_REPO=/nonexistent AIENOS_R7_DIR="$UNREL" build/aienos-cap/$GOOD/libaienos_capability.a >/dev/null 2>&1; echo $?)" != 0 ]'
 
+# 4. aienos.lock is data: the Makefile parses exactly one lowercase 40-hex line before any
+# recipe sees it, refuses every other shape at load, ignores command-line and environment
+# AIENOS_LOCK, and no payload in the file or the override ever runs. Each refusal is driven
+# through aienos-authority-capability (lock repo absent), the recipe whose error message
+# used to interpolate the lock inside a double-quoted echo.
+V=$SCR/omega-lock; mkdir -p "$V"
+cp -r "$HERE/Makefile" "$HERE/mk" "$HERE/tools" "$V/"
+cp "$HERE/physics.lock" "$HERE/argus.lock" "$V/" 2>/dev/null || true
+PWNED=$SCR/aienos-lock-payload-ran
+LREAL=$(tr -d '\n' < "$HERE/aienos.lock")
+lock_reject() {
+    rm -f "$PWNED"; printf '%s' "$2" > "$V/aienos.lock"
+    make -s -C "$V" AIENOS_LOCK_REPO=/nonexistent aienos-authority-capability >"$SCR/lock.log" 2>&1; local r=$?
+    local ran=no; [ -e "$PWNED" ] && ran=yes
+    check "aienos.lock refused at load: $1 (payload ran: $ran)" '[ "$r" != 0 ] && grep -q "aienos.lock must contain exactly one lowercase 40-hex commit" "$SCR/lock.log" && [ "$ran" = no ]'
+}
+lock_accept() {
+    printf '%s' "$2" > "$V/aienos.lock"
+    check "aienos.lock accepted: $1" '[ "$(make -s -C "$V" check-aienos-lock 2>&1)" = "$LREAL" ]'
+}
+lock_accept "one lowercase commit" "$LREAL"$'\n'
+lock_accept "commit without final newline" "$LREAL"
+lock_reject "double quote breaks out of echo" "$LREAL\"; touch $PWNED; echo \""
+lock_reject "double quote then \$(...) (ran pre-fix)" "$LREAL\"\$(touch $PWNED)\""
+lock_reject "single quote" "$LREAL'; touch $PWNED; echo '"
+lock_reject "command substitution \$(...)" "\$(touch $PWNED)"
+lock_reject "backtick substitution" "\`touch $PWNED\`"
+lock_reject "semicolon payload after commit" "$LREAL; touch $PWNED"
+lock_reject "second line" "$LREAL"$'\n'"$LREAL"$'\n'
+lock_reject "newline inside the commit" "${LREAL:0:20}"$'\n'"${LREAL:20}"$'\n'
+lock_reject "uppercase hex" "${LREAL^^}"$'\n'
+lock_reject "39 chars" "${LREAL:0:39}"$'\n'
+lock_reject "41 chars" "${LREAL}0"$'\n'
+lock_reject "empty file" ""
+lock_reject "CRLF line ending" "$LREAL"$'\r\n'
+lock_reject "leading space" " $LREAL"$'\n'
+lock_reject "trailing blank line" "$LREAL"$'\n\n'
+printf '%s\n' "$LREAL" > "$V/aienos.lock"
+EVIL="$LREAL\"; touch $PWNED; echo \""
+rm -f "$PWNED"
+check "command-line AIENOS_LOCK cannot replace the parsed lock" '[ "$(make -s -C "$V" check-aienos-lock AIENOS_LOCK="$EVIL" 2>&1)" = "$LREAL" ]'
+make -s -C "$V" AIENOS_LOCK_REPO=/nonexistent AIENOS_LOCK="$EVIL" aienos-authority-capability >"$SCR/lock.log" 2>&1; OR=$?
+check "command-line AIENOS_LOCK payload never runs in the recipe" '[ "$OR" != 0 ] && [ ! -e "$PWNED" ] && grep -q "not the aienos.lock commit $LREAL" "$SCR/lock.log"'
+rm -f "$PWNED"
+make -s -C "$V" AIENOS_LOCK_REPO=/nonexistent AIENOS_LOCK="\`touch $PWNED\`" aienos-authority-capability >"$SCR/lock.log" 2>&1; BR=$?
+check "command-line backtick AIENOS_LOCK never runs (ran pre-fix)" '[ "$BR" != 0 ] && [ ! -e "$PWNED" ]'
+rm -f "$PWNED"
+AIENOS_LOCK="$EVIL" make -s -C "$V" AIENOS_LOCK_REPO=/nonexistent aienos-authority-capability >"$SCR/lock.log" 2>&1; ER=$?
+check "environment AIENOS_LOCK payload never runs and is not used" '[ "$ER" != 0 ] && [ ! -e "$PWNED" ] && grep -q "not the aienos.lock commit $LREAL" "$SCR/lock.log"'
+
 if [ "$FAILS" -ne 0 ]; then echo "aienos lock source test: $FAILS FAILED"; exit 1; fi
 echo "aienos lock source test: PASS"

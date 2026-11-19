@@ -49,7 +49,7 @@ $(ALLEN_STAMP): aienos.lock aienos-authority-allen
 	@mkdir -p $(ALLEN_DIR)
 	@test -f "$(ALLEN_AIENOS_SVC)/continuity_subject.h" || { \
 		echo "AIENOS_R7_DIR=$(AIENOS_R7_DIR) has no native/kernel/svc/continuity_subject.h (aienos.lock too old?)"; exit 1; }
-	@echo "$(AIENOS_LOCK)" | cmp -s - $@ || echo "$(AIENOS_LOCK)" > $@
+	@echo '$(AIENOS_LOCK)' | cmp -s - $@ || echo '$(AIENOS_LOCK)' > $@
 
 $(ALLEN_BIND_OBJ): src/allen/allen_bind.c $(ALLEN_HDRS) $(ALLEN_STAMP)
 	$(CC) $(CFLAGS) $(ALLEN_AIENOS_INC) -c -o $@ src/allen/allen_bind.c

@@ -7,6 +7,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/omega-argus-lock.XXXXXX") || exit 2
 trap 'rm -rf "$TMP"' EXIT INT TERM
 GOOD=$(tr -d '\n' < "$ROOT/argus.lock")
+# The Makefile also parses aienos.lock at load; give the fixture the real one.
+cp "$ROOT/aienos.lock" "$TMP/aienos.lock"
 FAILS=0
 
 accept() {
