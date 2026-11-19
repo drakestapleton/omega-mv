@@ -37,6 +37,8 @@ const E4_FLAG_INLINE ulong 268435456
 const E4_EXT_MAGIC ulong 62218
 const E4_INCOMPAT_EXTENTS ulong 64
 const E4_INCOMPAT_64BIT ulong 128
+note Unsupported incompat features: COMPRESSION(0x1) | META_BG(0x10) | INLINE_DATA(0x8000) | ENCRYPT(0x10000) = 98321
+const E4_INCOMPAT_UNSUP ulong 98321
 
 global e4_sec uchar 512
 global e4_blk uchar 4096
@@ -58,8 +60,8 @@ note   0=ino_num, 1=mode, 2=size, 3=flags
 global e4_ino ulong 4
 
 note Extent lookup result e4_map:
-note   0=phys_blk, 1=is_hole
-global e4_map ulong 2
+note   0=phys_blk, 1=is_hole, 2=run_blks (contiguous blocks from lblock to end of extent)
+global e4_map ulong 3
 
 note GspFwBundle TOC parsed state (up to 8 entries):
 note   e4_bnd_meta: 0=valid, 1=app_version, 2=num_entries
@@ -117,10 +119,10 @@ if ge blk get e4_sb 6
 ret E4_E_RANGE
 end
 spb = get e4_sb 4
-rel_lba = mul blk spb
-if gt add rel_lba spb get e4_sb 2
+if ge blk div get e4_sb 2 spb
 ret E4_E_RANGE
 end
+rel_lba = mul blk spb
 base_lba = add get e4_sb 1 rel_lba
 s = ulong 0
 while lt s spb bound 8
@@ -187,6 +189,9 @@ end
 put e4_sb 9 v
 inc = e4_u32_blk 96
 if eq and inc E4_INCOMPAT_EXTENTS 0
+ret E4_E_FEATURE
+end
+if ne and inc E4_INCOMPAT_UNSUP 0
 ret E4_E_FEATURE
 end
 put e4_sb 12 inc
@@ -292,17 +297,23 @@ end
 if gt ee_len 0
 if ge lblock ee_blk
 if lt lblock add ee_blk ee_len
+rem_run = sub add ee_blk ee_len lblock
 if ne unw 0
 put e4_map 0 0
 put e4_map 1 1
+put e4_map 2 rem_run
 ret E4_OK
 end
 pblk = add or e4_u32_node add eoff 8 shl e4_u16_node add eoff 6 32 sub lblock ee_blk
 if ge pblk get e4_sb 6
 ret E4_E_RANGE
 end
+if gt rem_run sub get e4_sb 6 pblk
+ret E4_E_RANGE
+end
 put e4_map 0 pblk
 put e4_map 1 0
+put e4_map 2 rem_run
 ret E4_OK
 end
 end
@@ -311,6 +322,7 @@ i = add i 1
 end
 put e4_map 0 0
 put e4_map 1 1
+put e4_map 2 1
 ret E4_OK
 end
 
@@ -354,6 +366,7 @@ note Writes result to e4_map[0]=phys_blk, e4_map[1]=is_hole (1 if sparse or unwr
 fn ext4_ro_map_block lblock ulong to int
 put e4_map 0 0
 put e4_map 1 1
+put e4_map 2 1
 e4_copy_iblk_to_node
 max_lim = ulong 4
 prev_d = ulong 99
@@ -383,6 +396,7 @@ ch = e4_find_idx lblock entries
 if lt ch 0
 put e4_map 0 0
 put e4_map 1 1
+put e4_map 2 1
 ret E4_OK
 end
 r = e4_read_fs_block ulong ch
@@ -533,8 +547,14 @@ end
 end
 
 note Stream [file_off .. file_off+nbytes) of current inode through ext4_sink and SHA-256.
-note If hash_on != 0, initializes and updates sha256_bare (caller calls s256_fin or check_sha).
+note Fails closed if not mounted or current inode is not a regular file (S_IFREG = 0x8000).
 fn ext4_ro_stream file_off ulong nbytes ulong hash_on ulong to int
+if eq get e4_sb 0 0
+ret E4_E_MAGIC
+end
+if ne and get e4_ino 1 61440 32768
+ret E4_E_INO
+end
 fsize = get e4_ino 2
 if or gt file_off fsize gt nbytes sub fsize file_off
 ret E4_E_RANGE
@@ -581,15 +601,34 @@ end
 ret E4_OK
 end
 
+fn bundle_check_overlap i ulong off ulong sz ulong to int
+j = ulong 0
+while lt j i bound 8
+po = get e4_bnd_off j
+ps = get e4_bnd_size j
+if lt off add po ps
+if lt po add off sz
+ret E4_E_TOC
+end
+end
+j = add j 1
+end
+ret E4_OK
+end
+
 fn bundle_parse_entry i ulong bundle_len ulong to int
 eo = add 32 mul i 64
 off = e4_u64_toc add eo 8
 sz = e4_u64_toc add eo 16
-if or lt off 4096 ne and off 4095 0
+if or eq sz 0 or lt off 4096 ne and off 4095 0
 ret E4_E_TOC
 end
 if or gt off bundle_len gt sz sub bundle_len off
 ret E4_E_TOC
+end
+r = bundle_check_overlap i off sz
+if ne r E4_OK
+ret r
 end
 put e4_bnd_kind i e4_u32_toc eo
 put e4_bnd_off i off
@@ -606,6 +645,9 @@ note Entries at +32 + i*64: kind(u32), flags(u32), offset(u64), size(u64), pad(u
 fn bundle_parse_toc bundle_len ulong to int
 for z ulong 4
 put e4_bnd_meta z 0
+end
+if lt bundle_len 4096
+ret E4_E_TOC
 end
 if or ne get e4_toc 0 79 ne get e4_toc 1 77
 ret E4_E_TOC
@@ -642,4 +684,14 @@ end
 
 fn ext4_ro_file_size to ulong
 ret get e4_ino 2
+end
+
+note Contiguous extent-run helper for Phase 3 128 KiB nvme_read_direct bursts:
+note Maps lblock and exposes (e4_map[0]=phys_blk, e4_map[1]=is_hole, e4_map[2]=run_blks).
+fn ext4_ro_map_extent lblock ulong to int
+ret ext4_ro_map_block lblock
+end
+
+fn ext4_ro_run_blks to ulong
+ret get e4_map 2
 end

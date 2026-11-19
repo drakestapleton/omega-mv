@@ -38,7 +38,7 @@ compile_linux() {
   cat "$@" | "$OMC" > "$out"
 }
 
-echo "=== [1/6] NVMe Read-Only Bare-Metal Simulator Test ==="
+echo "=== [1/7] NVMe Read-Only Bare-Metal Simulator Test ==="
 compile_host "$TMP/test_nvme_ro_bare" \
   "$ROOT/aienux/disk/nvme_ro_bare.om" \
   "$ROOT/aienux/disk/tests/test_nvme_ro_bare.om"
@@ -48,7 +48,7 @@ compile_linux "$TMP/test_nvme_ro_bare.elf" \
   "$ROOT/aienux/disk/tests/test_nvme_ro_bare.om"
 echo "PASS: test_nvme_ro_bare (host run + Linux AArch64 ELF compile)"
 
-echo "=== [2/6] Offline OMFWBND1 Bundle Packer (Synthetic Blobs Only) ==="
+echo "=== [2/7] Offline OMFWBND1 Bundle Packer (Synthetic Blobs Only) ==="
 compile_host "$TMP/pack_bundle" \
   "$ROOT/aienux/disk/sha256_bare.om" \
   "$ROOT/aienux/disk/pack_bundle.om"
@@ -79,9 +79,20 @@ PY
   5 "$TMP/fmc.pubkey" \
   6 "$TMP/fmc.sig" \
   7 "$TMP/bl_desc"
-echo "PASS: pack_bundle produced $(wc -c < "$TMP/spark-bundle.img") byte synthetic OMFWBND1 bundle"
+# Regression: pack_bundle MUST reject u64 overflow (> 2^64-1) and >20-digit args with exit 2
+set +e
+"$TMP/pack_bundle" "$TMP/bad1.img" 18446744073709551616 1 "$TMP/gsp.bin"
+rc1=$?
+"$TMP/pack_bundle" "$TMP/bad2.img" 123456789012345678901 1 "$TMP/gsp.bin"
+rc2=$?
+set -e
+if [ "$rc1" -ne 2 ] || [ "$rc2" -ne 2 ]; then
+  echo "FAIL: pack_bundle bad-arg rejection (rc1=$rc1 rc2=$rc2)" >&2
+  exit 1
+fi
+echo "PASS: pack_bundle produced $(wc -c < "$TMP/spark-bundle.img") byte synthetic OMFWBND1 bundle + overflow/length rejection"
 
-echo "=== [3/6] Synthetic GPT + 64-bit ext4 Image & Read-Only Test ==="
+echo "=== [3/7] Synthetic GPT + 64-bit ext4 Image & Read-Only Test ==="
 python3 - "$TMP/spark-bundle.img" "$TMP/disk.img" <<'PY'
 import struct, sys, zlib
 
@@ -216,20 +227,30 @@ write_inode(19, 0x81A4, 4096, 0x80000, ext_hdr(1, 4, 0, magic=0xDEAD) + ext_leaf
 open(sys.argv[2], "wb").write(img)
 PY
 
+# Also build a META_BG (0x10) superblock copy to verify E4_E_FEATURE fail-closed refusal
+python3 - "$TMP/disk.img" "$TMP/disk_metabg.img" <<'PY'
+import struct, sys
+img = bytearray(open(sys.argv[1], "rb").read())
+sb = 64 * 512 + 1024
+inc = struct.unpack_from("<I", img, sb + 96)[0]
+struct.pack_into("<I", img, sb + 96, inc | 0x10)
+open(sys.argv[2], "wb").write(img)
+PY
+
 compile_host "$TMP/test_gpt_ext4_ro" \
   "$ROOT/aienux/disk/sha256_bare.om" \
   "$ROOT/aienux/disk/gpt_ro.om" \
   "$ROOT/aienux/disk/ext4_ro.om" \
   "$ROOT/aienux/disk/tests/test_gpt_ext4_ro.om"
-"$TMP/test_gpt_ext4_ro" "$TMP/disk.img"
+"$TMP/test_gpt_ext4_ro" "$TMP/disk.img" "$TMP/disk_metabg.img"
 compile_linux "$TMP/test_gpt_ext4_ro.elf" \
   "$ROOT/aienux/disk/sha256_bare.om" \
   "$ROOT/aienux/disk/gpt_ro.om" \
   "$ROOT/aienux/disk/ext4_ro.om" \
   "$ROOT/aienux/disk/tests/test_gpt_ext4_ro.om"
-echo "PASS: test_gpt_ext4_ro (GPT + 64-bit ext4 + depth-1/unwritten/sparse + OMFWBND1 SHA-256 + 5 hostile refusals)"
+echo "PASS: test_gpt_ext4_ro (GPT + 64-bit ext4 + depth-1/unwritten/sparse/extent-run + OMFWBND1 overlap/SHA-256 + META_BG/S_IFREG/hostile refusals)"
 
-echo "=== [4/6] RTL8127 + TCP Glue End-to-End Model Test ==="
+echo "=== [4/7] RTL8127 + TCP Glue End-to-End Model Test & Existing Driver Regression ==="
 compile_host "$TMP/test_tcp_glue" \
   "$ROOT/aienux/net/rtl8127/om/rtl8127/rtl8127.om" \
   "$ROOT/aienux/net/rtl8127/om/rtl8127/model.om" \
@@ -243,9 +264,24 @@ compile_linux "$TMP/test_tcp_glue.elf" \
   "$ROOT/aienux/net/tcp/tcp.om" \
   "$ROOT/aienux/net/rtl8127/om/rtl8127/tcp_glue.om" \
   "$ROOT/aienux/net/rtl8127/om/rtl8127/test/test_tcp_glue.om"
-echo "PASS: test_tcp_glue (RTL8127 + ARP + TCP handshake + bidirectional stream)"
+compile_host "$TMP/rtl8127_driver_test" \
+  "$ROOT/aienux/net/rtl8127/om/rtl8127/rtl8127.om" \
+  "$ROOT/aienux/net/rtl8127/om/rtl8127/model.om" \
+  "$ROOT/aienux/net/rtl8127/om/rtl8127/test/driver.om"
+"$TMP/rtl8127_driver_test"
+echo "PASS: test_tcp_glue + existing rtl8127 driver.om regression"
 
-echo "=== [5/6] Bare-Metal target a64efi PE32+ Compile Check (NVMe + GPT + ext4 + SHA-256) ==="
+echo "=== [5/7] RTL8127 Direct Normal-NC Physical DMA Regression Test ==="
+compile_host "$TMP/test_rtl8127_nc_dma" \
+  "$ROOT/aienux/net/rtl8127/om/rtl8127/rtl8127.om" \
+  "$ROOT/aienux/net/rtl8127/om/rtl8127/test/test_rtl8127_nc_dma.om"
+"$TMP/test_rtl8127_nc_dma"
+compile_linux "$TMP/test_rtl8127_nc_dma.elf" \
+  "$ROOT/aienux/net/rtl8127/om/rtl8127/rtl8127.om" \
+  "$ROOT/aienux/net/rtl8127/om/rtl8127/test/test_rtl8127_nc_dma.om"
+echo "PASS: test_rtl8127_nc_dma (direct Normal-NC RX/TX ring + payload before doorbell, .bss rdma untouched)"
+
+echo "=== [6/7] Bare-Metal target a64efi PE32+ Compile Check (NVMe + GPT + ext4 + SHA-256) ==="
 cat <<'OM' > "$TMP/efi_nvme_stub.om"
 fn a64_dsb_sy to void
 end
@@ -280,7 +316,7 @@ OM
       "$TMP/efi_nvme_stub.om"; } | "$OMC" > "$TMP/nvme_storage.efi"
 echo "PASS: target a64efi NVMe+GPT+ext4+SHA256 PE32+ compiled ($(wc -c < "$TMP/nvme_storage.efi") bytes)"
 
-echo "=== [6/6] Bare-Metal target a64efi PE32+ Compile Check (RTL8127 + TCP) ==="
+echo "=== [7/7] Bare-Metal target a64efi PE32+ Compile Check (RTL8127 + TCP) ==="
 cat <<'OM' > "$TMP/efi_net_stub.om"
 fn a64_dsb_sy to void
 end
@@ -314,4 +350,4 @@ OM
       "$TMP/efi_net_stub.om"; } | "$OMC" > "$TMP/rtl8127_tcp.efi"
 echo "PASS: target a64efi RTL8127+TCP PE32+ compiled ($(wc -c < "$TMP/rtl8127_tcp.efi") bytes)"
 
-echo "SLICE D ALL 6 CHECKS PASSED"
+echo "SLICE D ALL 7 CHECKS PASSED"
