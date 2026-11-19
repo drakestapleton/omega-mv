@@ -50,10 +50,13 @@ uint32_t omega_fp8gemm_shared_bytes(const OmegaFp8GemmSpec *spec) {
 
 int omega_blackwell_codegen_fp8gemm_prog(const OmegaFp8GemmSpec *spec, BlackwellIRProgram *prog) {
     if (!spec || !prog) return -1;
+    omega_bw_ir_init(prog);
     uint64_t sp[8], ins[8192], meta[512], rc = 1;
+    memset(ins, 0, sizeof ins);
+    memset(meta, 0, sizeof meta);
     gemm_pack_spec(spec, sp);
     if (omega2_cg_gemm_emit(&rc, sp, 8u, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
-    if (omega_bw_ir_from_om(ins, meta, prog) != 0) return -1;
+    if (omega_bw_ir_from_om(ins, meta, prog) != 0) { omega_bw_ir_init(prog); return -1; }
     const size_t n = prog->count;
     uint64_t phys[BW_MAX_VREGS], bsz[BW_MAX_VREGS];
     for (int v = 0; v < BW_MAX_VREGS; v++) {
@@ -61,8 +64,10 @@ int omega_blackwell_codegen_fp8gemm_prog(const OmegaFp8GemmSpec *spec, Blackwell
         bsz[v] = (v < prog->regalloc.num_vregs && prog->regalloc.intervals[v].bundle_size) ? prog->regalloc.intervals[v].bundle_size : 1u;
     }
     uint64_t res = 1;
-    if (omega2_bw_sched_stalls(&res, ins, 8192u, phys, BW_MAX_VREGS, bsz, BW_MAX_VREGS, (uint64_t)n) != OMEGA_OK || res != 0)
+    if (omega2_bw_sched_stalls(&res, ins, 8192u, phys, BW_MAX_VREGS, bsz, BW_MAX_VREGS, (uint64_t)n) != OMEGA_OK || res != 0) {
+        omega_bw_ir_init(prog);
         return -1;
+    }
     for (size_t i = 0; i < n; i++) prog->insns[i].control = (uint32_t)(ins[i * 8u + 6u] >> 32);
     return 0;
 }
