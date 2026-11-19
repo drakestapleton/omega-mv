@@ -1,0 +1,884 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/argus/test.om: Comprehensive Pure-Omega test suite for ARGUS Event ABI,
+note Class-Gated Admission Ring, Shadow-State Detectors, and Containment Invariants (I1..I5).
+note Compose with: si/directives/om2.om aienux/argus/event.om aienux/argus/ring.om aienux/argus/contain.om aienux/argus/test.om om/tls/sha2.om
+
+text s_pass "PASS "
+text s_fail "FAIL "
+text s_nl "\n"
+text s_t01 "event_wire_roundtrip_and_sha256_chain"
+text s_t02 "event_validate_class_floor_and_version"
+text s_t03 "event_validate_consumer_flag_and_external_effect"
+text s_t04 "event_validate_containment_v12_and_i2"
+text s_t05 "creq_152_byte_wire_roundtrip_and_negatives"
+text s_t06 "ring_watermarks_and_conservation"
+text s_t07 "ring_malformed_push_and_drop_synthesis"
+text s_t08 "core_forged_revoked_stale_subject_detectors"
+text s_t09 "core_sequence_anomaly_and_authority_replay"
+text s_t10 "core_world_provenance_and_telemetry_loss"
+text s_t11 "contain_full_lifecycle_confirmed"
+text s_t12 "contain_i2_synthetic_and_i3b_rate_limit"
+text s_t13 "contain_i5d_unauthorized_execution"
+text s_t14 "contain_i1b_scope_exceeded"
+text s_t15 "contain_unmatched_echo_and_unconfirmed"
+text s_t16 "contain_escalate_then_deny_lifecycle"
+text s_sum "ARGUS_TEST_PASS total=16 failed=0\n"
+text s_fsum "ARGUS_TEST_FAIL\n"
+
+fn argus_write_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+note Each write advances off by at least 1 byte on progress; 4096 covers test output lines.
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn report name view uchar * ok bool to uint
+if ok
+w1 = argus_write_all 1 s_pass
+w2 = argus_write_all 1 name
+w3 = argus_write_all 1 s_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = argus_write_all 1 s_fail
+w2 = argus_write_all 1 name
+w3 = argus_write_all 1 s_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn mk_ev dst edit ArgusEvent cls uchar k ushort oc uchar seq ulong to void
+put dst version ARGUS_ABI_VERSION
+put dst class_ cls
+put dst kind k
+put dst effect_class ARGUS_EFFECT_NONE
+put dst outcome oc
+put dst flags 0
+put dst sequence seq
+put dst tick 10
+put dst principal 7
+put dst code 0
+put dst cap_id 1
+put dst object_id 0
+put dst cap_generation 100
+put dst world_generation 0
+put dst resource 42
+end
+
+fn test_01_chain_part ev view ArgusEvent mach view uchar 32 edig view uchar 32 to bool
+d1 = new uchar 32 0
+d2 = new uchar 32 0
+argus_event_digest ev mach edig d1
+ev2 = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev2 ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 1
+put ev2 code -5
+argus_event_digest ev2 mach edig d2
+if not argus_eq32 d1 d2
+ret false
+end
+note 1-bit flip in event changes digest
+put ev2 resource 43
+argus_event_digest ev2 mach edig d2
+if argus_eq32 d1 d2
+ret false
+end
+note Chain extend is deterministic and non-zero
+c1 = new uchar 32 0
+c2 = new uchar 32 0
+argus_chain_extend c1 ev mach edig
+argus_chain_extend c2 ev mach edig
+if not argus_eq32 c1 c2
+ret false
+end
+zero = new uchar 32 0
+if argus_eq32 c1 zero
+ret false
+end
+ret true
+end
+
+fn test_01_wire_and_chain to bool
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 1
+put ev code -5
+mach = new uchar 32 0x11
+edig = new uchar 32 0x22
+wire = new uchar 128 0
+if ne argus_event_encode ev mach edig wire ARGUS_OK
+ret false
+end
+ev2 = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mach2 = new uchar 32 0
+edig2 = new uchar 32 0
+if ne argus_event_decode wire ev2 mach2 edig2 ARGUS_OK
+ret false
+end
+if ne get ev2 kind ARGUS_EV_CAPABILITY_GRANTED
+ret false
+end
+if ne get ev2 code -5
+ret false
+end
+if ne get ev2 cap_generation 100
+ret false
+end
+if not argus_eq32 mach mach2
+ret false
+end
+if not argus_eq32 edig edig2
+ret false
+end
+ret test_01_chain_part ev mach edig
+end
+
+fn test_02_class_floor_and_version to bool
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 1
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+note Stronger class (CRITICAL for SECURITY kind) accepted
+put ev class_ ARGUS_CLASS_CRITICAL
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+note Weaker class (AUDIT for SECURITY kind) refused
+put ev class_ ARGUS_CLASS_AUDIT
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+note Wrong version -> ARGUS_ERR_VERSION
+put ev class_ ARGUS_CLASS_SECURITY
+put ev version 2
+if ne argus_event_validate ev ARGUS_ERR_VERSION
+ret false
+end
+note Sequence 0 and U64_MAX refused
+put ev version ARGUS_ABI_VERSION
+put ev sequence 0
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+put ev sequence ARGUS_U64_MAX
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+note Unknown kind refused
+put ev sequence 1
+put ev kind 999
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+ret true
+end
+
+fn test_03_consumer_and_external to bool
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 1
+note CONSUMER flag on non-consumer kind refused
+put ev flags ARGUS_FLAG_CONSUMER
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+note TELEMETRY_DROPPED requires CONSUMER flag
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_TELEMETRY_DROPPED ARGUS_OUTCOME_ERROR 2
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+put ev flags ARGUS_FLAG_CONSUMER
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+note EXTERNAL_EFFECT_COMMITTED requires effect_class EXTERNAL
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_EXTERNAL_EFFECT_COMMITTED ARGUS_OUTCOME_OK 3
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+put ev effect_class ARGUS_EFFECT_EXTERNAL
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+note CAPABILITY_USE_SUMMARY requires outcome OK and world_gen (MIN) <= cap_gen (MAX)
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USE_SUMMARY ARGUS_OUTCOME_OK 4
+put ev world_generation 101
+put ev cap_generation 100
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+put ev world_generation 90
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+put ev outcome ARGUS_OUTCOME_DENIED
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+ret true
+end
+
+fn test_04_containment_v12_and_i2 to bool
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+note 90 PROPOSED requires CONSUMER flag, request_id != 0, status PROPOSED, outcome OK
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_PROPOSED ARGUS_OUTCOME_OK 1
+put ev flags ARGUS_FLAG_CONSUMER
+put ev world_generation 1
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_PROPOSED ARGUS_F_REVOKED_CAPABILITY_USED
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+note request_id == 0 refused
+put ev world_generation 0
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+note 92 EXECUTED DONE on REVOKE_CAPABILITY without SYNTHETIC is OK (live executor)
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_EXECUTED ARGUS_OUTCOME_OK 2
+put ev world_generation 1
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_DONE ARGUS_F_REVOKED_CAPABILITY_USED
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+note I2: 92 EXECUTED DONE on FREEZE_PRINCIPAL without SYNTHETIC is REFUSED
+put ev object_id argus_contain_pack ARGUS_CONTAIN_FREEZE_PRINCIPAL ARGUS_CSTATUS_DONE ARGUS_F_REVOKED_CAPABILITY_USED
+if ne argus_event_validate ev ARGUS_ERR_MALFORMED
+ret false
+end
+note With SYNTHETIC flag it is accepted
+put ev flags ARGUS_FLAG_SYNTHETIC
+if ne argus_event_validate ev ARGUS_OK
+ret false
+end
+ret true
+end
+
+fn test_05_creq_wire_roundtrip to bool
+req = new ArgusContainReq 10 ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_SEV_CRITICAL ARGUS_F_REVOKED_CAPABILITY_USED 7 3 55 1 9 0 0 0 ARGUS_CONTAIN_REQ_VERSION 0
+mach = new uchar 32 0x33
+fdig = new uchar 32 0x44
+tdig = new uchar 32 0x55
+wire = new uchar 152 0
+if ne argus_creq_encode req mach fdig tdig wire ARGUS_OK
+ret false
+end
+req2 = new ArgusContainReq 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+m2 = new uchar 32 0
+f2 = new uchar 32 0
+t2 = new uchar 32 0
+if ne argus_creq_decode wire req2 m2 f2 t2 ARGUS_OK
+ret false
+end
+if ne get req2 request_id 1
+ret false
+end
+if ne get req2 target_cap_gen 55
+ret false
+end
+if ne get req2 finding_sequence 9
+ret false
+end
+note Negative controls: bad version, nonzero reserved, unknown flags, zero request_id
+put wire 150 9
+if ne argus_creq_decode wire req2 m2 f2 t2 ARGUS_ERR_VERSION
+ret false
+end
+put wire 150 ARGUS_CONTAIN_REQ_VERSION
+put wire 151 1
+if ne argus_creq_decode wire req2 m2 f2 t2 ARGUS_ERR_MALFORMED
+ret false
+end
+put wire 151 0
+put wire 148 0x04
+if ne argus_creq_decode wire req2 m2 f2 t2 ARGUS_ERR_MALFORMED
+ret false
+end
+ret true
+end
+
+fn test_06_ring_watermarks_conservation to bool
+note Capacity 16: INFO=8, AUDIT=12, SECURITY=15, CRITICAL=16
+if ne argus_ring_init 16 ARGUS_OK
+ret false
+end
+if ne argus_ring_saturation_point 16 ARGUS_CLASS_INFORMATIONAL 8
+ret false
+end
+if ne argus_ring_saturation_point 16 ARGUS_CLASS_AUDIT 12
+ret false
+end
+if ne argus_ring_saturation_point 16 ARGUS_CLASS_SECURITY 15
+ret false
+end
+if ne argus_ring_saturation_point 16 ARGUS_CLASS_CRITICAL 16
+ret false
+end
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mach = new uchar 32 0
+edig = new uchar 32 0
+note Push 12 AUDIT events -> all 12 succeed, 13th is refused FULL
+i = ulong 1
+while le i 12 bound 16
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK i
+if ne argus_ring_push ev mach edig ARGUS_OK
+ret false
+end
+i = add i 1
+end
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK 13
+if ne argus_ring_push ev mach edig ARGUS_ERR_FULL
+ret false
+end
+note Push 3 SECURITY events (depth 12->15) succeed, 4th refused FULL
+i = ulong 14
+while le i 16 bound 8
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK i
+if ne argus_ring_push ev mach edig ARGUS_OK
+ret false
+end
+i = add i 1
+end
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 17
+if ne argus_ring_push ev mach edig ARGUS_ERR_FULL
+ret false
+end
+note Push 1 CRITICAL event (depth 15->16) succeeds, 2nd triggers critical_overflow
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 18
+if ne argus_ring_push ev mach edig ARGUS_OK
+ret false
+end
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 19
+if ne argus_ring_push ev mach edig ARGUS_ERR_FULL
+ret false
+end
+note Check conservation: 19 attempts = 16 pushed + 0 mal + 0 crit_ref + 1 sec_ref + 1 audit_ref + 0 info_ref + 1 crit_overflow
+st = new ArgusRingStats 0 0 0 0 0 0 0 0 0 0
+argus_ring_stats st
+if ne get st pushed 16
+ret false
+end
+if ne get st critical_overflow 1
+ret false
+end
+if ne get st ref_sec 1
+ret false
+end
+if ne get st ref_audit 1
+ret false
+end
+note Pop FIFO check
+pop_ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne argus_ring_pop pop_ev mach edig ARGUS_OK
+ret false
+end
+if ne get pop_ev sequence 1
+ret false
+end
+ret true
+end
+
+fn test_07_ring_malformed_and_drops to bool
+if ne argus_ring_init 4 ARGUS_OK
+ret false
+end
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mach = new uchar 32 0
+edig = new uchar 32 0
+note Malformed: kind 90 CONTAINMENT_PROPOSED refused by ring
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_PROPOSED ARGUS_OUTCOME_OK 1
+if ne argus_ring_push ev mach edig ARGUS_ERR_MALFORMED
+ret false
+end
+note Malformed: weakened class (AUDIT on CRITICAL kind) refused
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 2
+if ne argus_ring_push ev mach edig ARGUS_ERR_MALFORMED
+ret false
+end
+st = new ArgusRingStats 0 0 0 0 0 0 0 0 0 0
+argus_ring_stats st
+if ne get st ref_malformed 2
+ret false
+end
+note Fill ring to 4 and trigger drops on AUDIT and CRITICAL
+i = ulong 1
+while le i 4 bound 8
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK i
+if ne argus_ring_push ev mach edig ARGUS_OK
+ret false
+end
+i = add i 1
+end
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK 5
+rc_a = argus_ring_push ev mach edig
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 6
+rc_c = argus_ring_push ev mach edig
+if or ne rc_a ARGUS_ERR_FULL ne rc_c ARGUS_ERR_FULL
+ret false
+end
+note Drain drops: CRITICAL MUST come before AUDIT
+nseq = new ulong 1 1
+drop1 = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+drop2 = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne argus_ring_drain_one drop1 nseq ARGUS_OK
+ret false
+end
+if ne argus_ring_drain_one drop2 nseq ARGUS_OK
+ret false
+end
+if ne get drop1 object_id uint ARGUS_CLASS_CRITICAL
+ret false
+end
+if ne get drop2 object_id uint ARGUS_CLASS_AUDIT
+ret false
+end
+note Synthesized drop events must pass argus_event_validate!
+if ne argus_event_validate drop1 ARGUS_OK
+ret false
+end
+if ne argus_event_validate drop2 ARGUS_OK
+ret false
+end
+note No more drops pending
+if ne argus_ring_drain_one drop1 nseq ARGUS_ERR_STATE
+ret false
+end
+ret true
+end
+
+fn test_08_core_cap_detectors to bool
+argus_core_init
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+f = new ArgusFinding 0 0 0 0 0 0 0 0 0 0 0
+mach = new uchar 32 0
+edig = new uchar 32 0
+note 1. Use of unseen slot -> FORGED_CAPABILITY
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK 1
+put ev cap_id 5
+put ev cap_generation 10
+if ne argus_core_ingest ev mach edig f ARGUS_F_FORGED_CAPABILITY
+ret false
+end
+note 2. Grant slot 5 gen 10 subject 7 -> clean
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 2
+put ev cap_id 5
+put ev cap_generation 10
+put ev principal 7
+if ne argus_core_ingest ev mach edig f ARGUS_F_NONE
+ret false
+end
+note 3. Valid use -> clean
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK 3
+put ev cap_id 5
+put ev cap_generation 10
+put ev principal 7
+if ne argus_core_ingest ev mach edig f ARGUS_F_NONE
+ret false
+end
+note 4. Stale generation use -> STALE_GENERATION
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK 4
+put ev cap_id 5
+put ev cap_generation 9
+put ev principal 7
+if ne argus_core_ingest ev mach edig f ARGUS_F_STALE_GENERATION
+ret false
+end
+note 5. Subject mismatch -> SUBJECT_MISMATCH
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK 5
+put ev cap_id 5
+put ev cap_generation 10
+put ev principal 99
+if ne argus_core_ingest ev mach edig f ARGUS_F_SUBJECT_MISMATCH
+ret false
+end
+note 6. Revoke slot 5 -> clean, then use -> REVOKED_CAPABILITY_USED
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 6
+put ev cap_id 5
+put ev cap_generation 10
+if ne argus_core_ingest ev mach edig f ARGUS_F_NONE
+ret false
+end
+mk_ev ev ARGUS_CLASS_AUDIT ARGUS_EV_CAPABILITY_USED ARGUS_OUTCOME_OK 7
+put ev cap_id 5
+put ev cap_generation 10
+put ev principal 7
+if ne argus_core_ingest ev mach edig f ARGUS_F_REVOKED_CAPABILITY_USED
+ret false
+end
+ret true
+end
+
+fn test_09_sequence_and_replay to bool
+argus_core_init
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+f = new ArgusFinding 0 0 0 0 0 0 0 0 0 0 0
+mach = new uchar 32 0
+edig = new uchar 32 0
+note Revoke unseen slot -> AUTHORITY_REPLAY and NOT applied
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 1
+put ev cap_id 2
+put ev cap_generation 5
+if ne argus_core_ingest ev mach edig f ARGUS_F_AUTHORITY_REPLAY
+ret false
+end
+note Grant slot 2 gen 5 -> clean
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 2
+put ev cap_id 2
+put ev cap_generation 5
+if ne argus_core_ingest ev mach edig f ARGUS_F_NONE
+ret false
+end
+note Re-grant same gen 5 -> AUTHORITY_REPLAY
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 3
+put ev cap_id 2
+put ev cap_generation 5
+if ne argus_core_ingest ev mach edig f ARGUS_F_AUTHORITY_REPLAY
+ret false
+end
+note Replayed sequence 3 -> SEQUENCE_ANOMALY
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_CAPABILITY_GRANTED ARGUS_OUTCOME_OK 3
+put ev cap_id 2
+put ev cap_generation 6
+if ne argus_core_ingest ev mach edig f ARGUS_F_SEQUENCE_ANOMALY
+ret false
+end
+if ne argus_core_not_applied 3
+ret false
+end
+ret true
+end
+
+fn test_10_world_and_telemetry_loss to bool
+argus_core_init
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+f = new ArgusFinding 0 0 0 0 0 0 0 0 0 0 0
+mach = new uchar 32 0
+edig = new uchar 32 0
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_WORLD_COMMITTED ARGUS_OUTCOME_OK 1
+put ev object_id 1
+put ev world_generation 1
+if ne argus_core_ingest ev mach edig f ARGUS_F_NONE
+ret false
+end
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_WORLD_COMMITTED ARGUS_OUTCOME_OK 2
+put ev object_id 1
+put ev world_generation 2
+if ne argus_core_ingest ev mach edig f ARGUS_F_NONE
+ret false
+end
+note Skipped generation 2 -> 4 raises WORLD_PROVENANCE_INCONSISTENT
+mk_ev ev ARGUS_CLASS_SECURITY ARGUS_EV_WORLD_COMMITTED ARGUS_OUTCOME_OK 3
+put ev object_id 1
+put ev world_generation 4
+if ne argus_core_ingest ev mach edig f ARGUS_F_WORLD_PROVENANCE_INCONSISTENT
+ret false
+end
+note TELEMETRY_DROPPED for CRITICAL raises TELEMETRY_LOSS
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_TELEMETRY_DROPPED ARGUS_OUTCOME_ERROR 1
+put ev flags ARGUS_FLAG_CONSUMER
+put ev object_id uint ARGUS_CLASS_CRITICAL
+put ev resource 3
+if ne argus_core_ingest ev mach edig f ARGUS_F_TELEMETRY_LOSS
+ret false
+end
+ret true
+end
+
+fn test_11_contain_confirmed to bool
+argus_contain_init
+req = new ArgusContainReq 1 ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_SEV_CRITICAL ARGUS_F_REVOKED_CAPABILITY_USED 7 5 10 0 7 0 0 0 ARGUS_CONTAIN_REQ_VERSION 0
+mach = new uchar 32 0
+fdig = new uchar 32 0xaa
+tdig = new uchar 32 0
+rdig = new uchar 32 0
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_OK
+ret false
+end
+rid = get req request_id
+note 1. DECIDED GRANT
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_DECIDED ARGUS_OUTCOME_OK 10
+put ev principal 7
+put ev cap_id 5
+put ev cap_generation 10
+put ev world_generation rid
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_GRANT ARGUS_F_REVOKED_CAPABILITY_USED
+if ne argus_contain_observe ev rdig ARGUS_F_NONE
+ret false
+end
+note 2. Matching kind 4 CAPABILITY_REVOKED on (5, 10)
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 11
+put ev cap_id 5
+put ev cap_generation 10
+if ne argus_contain_observe ev rdig ARGUS_F_NONE
+ret false
+end
+note 3. EXECUTED DONE with resource = 1 -> CONFIRMED
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_EXECUTED ARGUS_OUTCOME_OK 12
+put ev principal 7
+put ev cap_id 5
+put ev cap_generation 10
+put ev world_generation rid
+put ev resource 1
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_DONE ARGUS_F_REVOKED_CAPABILITY_USED
+if ne argus_contain_observe ev rdig ARGUS_F_NONE
+ret false
+end
+h = new ArgusContainHealth 0 0 0 0 0 0 0 0 0 0
+argus_contain_health h
+if ne get h proposed 1
+ret false
+end
+if ne get h granted 1
+ret false
+end
+if ne get h confirmed 1
+ret false
+end
+ret true
+end
+
+fn test_12_contain_i2_and_rate_limit to bool
+argus_contain_init
+mach = new uchar 32 0
+fdig = new uchar 32 0
+tdig = new uchar 32 0
+rdig = new uchar 32 0
+note I2: non-live FREEZE_PRINCIPAL without SYNTHETIC refused
+req = new ArgusContainReq 1 ARGUS_CONTAIN_FREEZE_PRINCIPAL ARGUS_SEV_HIGH ARGUS_F_SUBJECT_MISMATCH 7 5 10 0 1 0 0 0 ARGUS_CONTAIN_REQ_VERSION 0
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_ERR_MALFORMED
+ret false
+end
+note I3.b: 16 live proposals succeed, 17th in same window returns ARGUS_ERR_FULL
+put req containment ARGUS_CONTAIN_REVOKE_CAPABILITY
+i = uint 0
+while lt i ARGUS_CONTAIN_WINDOW_MAX bound 32
+put req target_cap_id add 1 i
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_OK
+ret false
+end
+i = add i 1
+end
+put req target_cap_id 50
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_ERR_FULL
+ret false
+end
+h = new ArgusContainHealth 0 0 0 0 0 0 0 0 0 0
+argus_contain_health h
+if ne get h rate_limited 1
+ret false
+end
+ret true
+end
+
+fn test_13_contain_i5d_unauth_exec to bool
+argus_contain_init
+req = new ArgusContainReq 1 ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_SEV_CRITICAL ARGUS_F_FORGED_CAPABILITY 7 6 20 0 1 0 0 0 ARGUS_CONTAIN_REQ_VERSION 0
+mach = new uchar 32 0
+fdig = new uchar 32 0
+tdig = new uchar 32 0
+rdig = new uchar 32 0
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_OK
+ret false
+end
+rid = get req request_id
+note EXECUTED DONE before GRANT -> EXECUTION_UNAUTHORIZED
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_EXECUTED ARGUS_OUTCOME_OK 2
+put ev principal 7
+put ev cap_id 6
+put ev cap_generation 20
+put ev world_generation rid
+put ev resource 1
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_DONE ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev rdig ARGUS_F_CONTAINMENT_EXECUTION_UNAUTHORIZED
+ret false
+end
+note kind 4 revoke on target while still PROPOSED -> EXECUTION_UNAUTHORIZED
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CAPABILITY_REVOKED ARGUS_OUTCOME_OK 3
+put ev cap_id 6
+put ev cap_generation 20
+if ne argus_contain_observe ev rdig ARGUS_F_CONTAINMENT_EXECUTION_UNAUTHORIZED
+ret false
+end
+ret true
+end
+
+fn test_14_contain_i1b_scope_exceeded to bool
+argus_contain_init
+req = new ArgusContainReq 1 ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_SEV_CRITICAL ARGUS_F_FORGED_CAPABILITY 7 8 30 0 1 0 0 0 ARGUS_CONTAIN_REQ_VERSION 0
+mach = new uchar 32 0
+fdig = new uchar 32 0
+tdig = new uchar 32 0
+rdig = new uchar 32 0
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_OK
+ret false
+end
+rid = get req request_id
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_DECIDED ARGUS_OUTCOME_OK 2
+put ev principal 7
+put ev cap_id 8
+put ev cap_generation 30
+put ev world_generation rid
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_GRANT ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev rdig ARGUS_F_NONE
+ret false
+end
+note EXECUTED DONE reporting 2 slots revoked -> SCOPE_EXCEEDED
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_EXECUTED ARGUS_OUTCOME_OK 3
+put ev principal 7
+put ev cap_id 8
+put ev cap_generation 30
+put ev world_generation rid
+put ev resource 2
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_DONE ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev rdig ARGUS_F_CONTAINMENT_SCOPE_EXCEEDED
+ret false
+end
+h = new ArgusContainHealth 0 0 0 0 0 0 0 0 0 0
+argus_contain_health h
+if ne get h failed_scope 1
+ret false
+end
+ret true
+end
+
+fn test_15_contain_unmatched_and_unconfirmed to bool
+argus_contain_init
+req = new ArgusContainReq 1 ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_SEV_CRITICAL ARGUS_F_FORGED_CAPABILITY 7 9 40 0 1 0 0 0 ARGUS_CONTAIN_REQ_VERSION 0
+mach = new uchar 32 0
+fdig = new uchar 32 0
+tdig = new uchar 32 0
+rdig = new uchar 32 0
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_OK
+ret false
+end
+rid = get req request_id
+bad_dig = new uchar 32 0
+for i ulong 32
+put bad_dig i get rdig i
+end
+put bad_dig 0 xor get bad_dig 0 1
+note Flipped echo digest in DECIDED -> DECISION_UNMATCHED
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_DECIDED ARGUS_OUTCOME_OK 2
+put ev principal 7
+put ev cap_id 9
+put ev cap_generation 40
+put ev world_generation rid
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_GRANT ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev bad_dig ARGUS_F_CONTAINMENT_DECISION_UNMATCHED
+ret false
+end
+note Valid GRANT then DONE without prior kind 4 -> EXECUTION_UNCONFIRMED
+if ne argus_contain_observe ev rdig ARGUS_F_NONE
+ret false
+end
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_EXECUTED ARGUS_OUTCOME_OK 3
+put ev principal 7
+put ev cap_id 9
+put ev cap_generation 40
+put ev world_generation rid
+put ev resource 1
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_DONE ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev rdig ARGUS_F_CONTAINMENT_EXECUTION_UNCONFIRMED
+ret false
+end
+ret true
+end
+
+fn test_16_contain_escalate_deny to bool
+argus_contain_init
+req = new ArgusContainReq 1 ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_SEV_CRITICAL ARGUS_F_FORGED_CAPABILITY 7 11 50 0 1 0 0 0 ARGUS_CONTAIN_REQ_VERSION 0
+mach = new uchar 32 0
+fdig = new uchar 32 0
+tdig = new uchar 32 0
+rdig = new uchar 32 0
+if ne argus_contain_propose req mach fdig tdig rdig ARGUS_OK
+ret false
+end
+rid = get req request_id
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+note PROPOSED -> ESCALATED -> DENIED
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_DECIDED ARGUS_OUTCOME_ERROR 2
+put ev principal 7
+put ev cap_id 11
+put ev cap_generation 50
+put ev world_generation rid
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_ESCALATE ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev rdig ARGUS_F_NONE
+ret false
+end
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_DECIDED ARGUS_OUTCOME_DENIED 3
+put ev principal 7
+put ev cap_id 11
+put ev cap_generation 50
+put ev world_generation rid
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_DENY ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev rdig ARGUS_F_NONE
+ret false
+end
+note Subsequent decision on closed DENIED request -> DECISION_UNMATCHED
+mk_ev ev ARGUS_CLASS_CRITICAL ARGUS_EV_CONTAINMENT_DECIDED ARGUS_OUTCOME_OK 4
+put ev principal 7
+put ev cap_id 11
+put ev cap_generation 50
+put ev world_generation rid
+put ev object_id argus_contain_pack ARGUS_CONTAIN_REVOKE_CAPABILITY ARGUS_CSTATUS_GRANT ARGUS_F_FORGED_CAPABILITY
+if ne argus_contain_observe ev rdig ARGUS_F_CONTAINMENT_DECISION_UNMATCHED
+ret false
+end
+h = new ArgusContainHealth 0 0 0 0 0 0 0 0 0 0
+argus_contain_health h
+if ne get h escalated 1
+ret false
+end
+if ne get h denied 1
+ret false
+end
+if ne get h decisions_unmatched 1
+ret false
+end
+ret true
+end
+
+fn main to int
+failed = uint 0
+failed = add failed report s_t01 test_01_wire_and_chain
+failed = add failed report s_t02 test_02_class_floor_and_version
+failed = add failed report s_t03 test_03_consumer_and_external
+failed = add failed report s_t04 test_04_containment_v12_and_i2
+failed = add failed report s_t05 test_05_creq_wire_roundtrip
+failed = add failed report s_t06 test_06_ring_watermarks_conservation
+failed = add failed report s_t07 test_07_ring_malformed_and_drops
+failed = add failed report s_t08 test_08_core_cap_detectors
+failed = add failed report s_t09 test_09_sequence_and_replay
+failed = add failed report s_t10 test_10_world_and_telemetry_loss
+failed = add failed report s_t11 test_11_contain_confirmed
+failed = add failed report s_t12 test_12_contain_i2_and_rate_limit
+failed = add failed report s_t13 test_13_contain_i5d_unauth_exec
+failed = add failed report s_t14 test_14_contain_i1b_scope_exceeded
+failed = add failed report s_t15 test_15_contain_unmatched_and_unconfirmed
+failed = add failed report s_t16 test_16_contain_escalate_deny
+if eq failed 0
+w = argus_write_all 1 s_sum
+if w
+ret 0
+end
+ret 1
+end
+w = argus_write_all 1 s_fsum
+if w
+ret 1
+end
+ret 1
+end

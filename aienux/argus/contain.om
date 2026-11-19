@@ -1,0 +1,574 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/argus/contain.om: Pure-Omega ARGUS Deterministic Shadow-State Core,
+note Hard-Invariant Detectors, and Containment State Machine (Invariants I1..I5).
+note Converted from upstream aienux native/argus/argus_core.c, argus_detect.c, and argus_contain.c.
+
+note Shadow capability slot states
+const ARGUS_SH_UNSEEN uchar 0
+const ARGUS_SH_LIVE uchar 1
+const ARGUS_SH_REVOKED uchar 2
+
+note Containment pending states
+const ARGUS_ST_FREE uchar 0
+const ARGUS_ST_PROPOSED uchar 1
+const ARGUS_ST_GRANTED uchar 2
+const ARGUS_ST_ESCALATED uchar 3
+const ARGUS_ST_CONFIRMED uchar 4
+const ARGUS_ST_DENIED uchar 5
+const ARGUS_ST_FAILED uchar 6
+const ARGUS_ST_FAILED_SCOPE uchar 7
+const ARGUS_ST_EXPIRED uchar 8
+
+const ARGUS_CONTAIN_PENDING ulong 32
+const ARGUS_CONTAIN_WINDOW_EVENTS ulong 4096
+const ARGUS_CONTAIN_WINDOW_MAX uint 16
+const ARGUS_STREAMS_MAX ulong 32
+const ARGUS_WORLDS_MAX ulong 8
+
+note Shadow capability table (256 slots)
+global argus_sh_state uchar 256
+global argus_sh_gen ulong 256
+global argus_sh_subj uint 256
+global argus_sh_rgt uint 256
+global argus_sh_res ulong 256
+global argus_sh_seq ulong 256
+
+note Producer sequence stream table (32 streams)
+global argus_strm_used uchar 32
+global argus_strm_key uint 32
+global argus_strm_seq ulong 32
+
+note World lineage table (8 stores)
+global argus_wld_used uchar 8
+global argus_wld_id uint 8
+global argus_wld_gen ulong 8
+
+note Core health & SHA-256 event hash chain
+note meta: 0=received, 1=rejected, 2=findings, 3=not_applied
+global argus_core_meta ulong 8
+global argus_core_chain uchar 32
+
+note Containment state machine globals (32 pending slots)
+note cmeta: 0=events, 1=next_req_id, 2=win_start, 3=win_count
+global argus_cmeta ulong 8
+note chealth: 0=proposed, 1=granted, 2=denied, 3=escalated, 4=confirmed,
+note          5=failed_scope, 6=unmatched, 7=unauth, 8=unconfirmed, 9=rate_limited
+global argus_chealth ulong 10
+
+global argus_pend_st uchar 32
+global argus_pend_typ uchar 32
+global argus_pend_fcode ushort 32
+global argus_pend_princ uint 32
+global argus_pend_cid uint 32
+global argus_pend_cgen ulong 32
+global argus_pend_rid ulong 32
+global argus_pend_k4 uchar 32
+note 32 pending slots * 32-byte canonical request digest = 1024 bytes
+global argus_pend_dig uchar 1024
+
+note ---- Core Initialization & Helpers ----
+
+fn argus_core_init to void
+for i ulong 256
+put argus_sh_state i ARGUS_SH_UNSEEN
+put argus_sh_gen i 0
+put argus_sh_subj i 0
+put argus_sh_rgt i 0
+put argus_sh_res i 0
+put argus_sh_seq i 0
+end
+for i ulong 32
+put argus_strm_used i 0
+put argus_strm_key i 0
+put argus_strm_seq i 0
+put argus_core_chain i 0
+end
+for i ulong 8
+put argus_wld_used i 0
+put argus_wld_id i 0
+put argus_wld_gen i 0
+put argus_core_meta i 0
+end
+end
+
+fn argus_core_get_chain dst edit uchar 32 to void
+for i ulong 32
+put dst i get argus_core_chain i
+end
+end
+
+fn argus_core_not_applied to ulong
+ret get argus_core_meta 3
+end
+
+fn argus_check_stream flags ushort seq ulong to bool
+sid = uint argus_stream_of flags
+is_cons = uint 0
+if ne and flags ARGUS_FLAG_CONSUMER 0
+is_cons = uint 1
+end
+key = or shl sid 1 is_cons
+for i ulong 32
+if ne get argus_strm_used i 0
+if eq get argus_strm_key i key
+prev = get argus_strm_seq i
+if le seq prev
+ret false
+end
+put argus_strm_seq i seq
+ret true
+end
+end
+end
+for i ulong 32
+if eq get argus_strm_used i 0
+put argus_strm_used i 1
+put argus_strm_key i key
+put argus_strm_seq i seq
+ret true
+end
+end
+ret true
+end
+
+fn argus_check_world_commit store_id uint wgen ulong to bool
+for i ulong 8
+if ne get argus_wld_used i 0
+if eq get argus_wld_id i store_id
+prev = get argus_wld_gen i
+if ne wgen add prev 1
+ret false
+end
+put argus_wld_gen i wgen
+ret true
+end
+end
+end
+for i ulong 8
+if eq get argus_wld_used i 0
+put argus_wld_used i 1
+put argus_wld_id i store_id
+put argus_wld_gen i wgen
+ret true
+end
+end
+ret false
+end
+
+fn argus_set_finding dst edit ArgusFinding fcode ushort sev uchar ev view ArgusEvent prior ulong to void
+put dst code fcode
+put dst severity sev
+put dst confidence ARGUS_CONF_DETERMINISTIC
+put dst sync_allowed 0
+put dst containment ARGUS_CONTAIN_NONE
+put dst detector fcode
+put dst sequence get ev sequence
+put dst prior_sequence prior
+put dst principal get ev principal
+put dst cap_id get ev cap_id
+put dst cap_generation get ev cap_generation
+put argus_core_meta 2 add get argus_core_meta 2 1
+end
+
+fn argus_detect_cap_use ev view ArgusEvent dst edit ArgusFinding to ushort
+if ne get ev outcome ARGUS_OUTCOME_OK
+ret ARGUS_F_NONE
+end
+cid = get ev cap_id
+if ge cid ARGUS_CAP_MAX
+ret ARGUS_F_NONE
+end
+idx = ulong cid
+st = get argus_sh_state idx
+sgen = get argus_sh_gen idx
+sseq = get argus_sh_seq idx
+if eq st ARGUS_SH_UNSEEN
+argus_set_finding dst ARGUS_F_FORGED_CAPABILITY ARGUS_SEV_CRITICAL ev 0
+put dst containment ARGUS_CONTAIN_REVOKE_CAPABILITY
+ret ARGUS_F_FORGED_CAPABILITY
+end
+if eq st ARGUS_SH_REVOKED
+if le get ev cap_generation sgen
+argus_set_finding dst ARGUS_F_REVOKED_CAPABILITY_USED ARGUS_SEV_CRITICAL ev sseq
+put dst containment ARGUS_CONTAIN_REVOKE_CAPABILITY
+ret ARGUS_F_REVOKED_CAPABILITY_USED
+end
+argus_set_finding dst ARGUS_F_FORGED_CAPABILITY ARGUS_SEV_CRITICAL ev sseq
+put dst containment ARGUS_CONTAIN_REVOKE_CAPABILITY
+ret ARGUS_F_FORGED_CAPABILITY
+end
+note LIVE slot: check generation (summary checks world_generation as MIN)
+chk_gen = get ev cap_generation
+if eq get ev kind ARGUS_EV_CAPABILITY_USE_SUMMARY
+chk_gen = get ev world_generation
+end
+if lt chk_gen sgen
+argus_set_finding dst ARGUS_F_STALE_GENERATION ARGUS_SEV_CRITICAL ev sseq
+put dst containment ARGUS_CONTAIN_REVOKE_CAPABILITY
+ret ARGUS_F_STALE_GENERATION
+end
+if ne get ev principal get argus_sh_subj idx
+argus_set_finding dst ARGUS_F_SUBJECT_MISMATCH ARGUS_SEV_HIGH ev sseq
+put dst containment ARGUS_CONTAIN_REVOKE_CAPABILITY
+ret ARGUS_F_SUBJECT_MISMATCH
+end
+ret ARGUS_F_NONE
+end
+
+fn argus_core_apply ev view ArgusEvent dst edit ArgusFinding to ushort
+k = get ev kind
+if eq k ARGUS_EV_TELEMETRY_DROPPED
+lost = get ev object_id
+if or eq lost uint ARGUS_CLASS_CRITICAL eq lost uint ARGUS_CLASS_SECURITY
+argus_set_finding dst ARGUS_F_TELEMETRY_LOSS ARGUS_SEV_CRITICAL ev 0
+ret ARGUS_F_TELEMETRY_LOSS
+end
+ret ARGUS_F_NONE
+end
+if eq k ARGUS_EV_CAPABILITY_GRANTED
+cid = get ev cap_id
+if ge cid ARGUS_CAP_MAX
+ret ARGUS_F_NONE
+end
+idx = ulong cid
+st = get argus_sh_state idx
+if and ne st ARGUS_SH_UNSEEN le get ev cap_generation get argus_sh_gen idx
+put argus_core_meta 3 add get argus_core_meta 3 1
+argus_set_finding dst ARGUS_F_AUTHORITY_REPLAY ARGUS_SEV_CRITICAL ev get argus_sh_seq idx
+ret ARGUS_F_AUTHORITY_REPLAY
+end
+put argus_sh_state idx ARGUS_SH_LIVE
+put argus_sh_gen idx get ev cap_generation
+put argus_sh_subj idx get ev principal
+put argus_sh_rgt idx get ev object_id
+put argus_sh_res idx get ev resource
+put argus_sh_seq idx get ev sequence
+ret ARGUS_F_NONE
+end
+if eq k ARGUS_EV_CAPABILITY_REVOKED
+cid = get ev cap_id
+if ge cid ARGUS_CAP_MAX
+ret ARGUS_F_NONE
+end
+idx = ulong cid
+if eq get argus_sh_state idx ARGUS_SH_UNSEEN
+put argus_core_meta 3 add get argus_core_meta 3 1
+argus_set_finding dst ARGUS_F_AUTHORITY_REPLAY ARGUS_SEV_CRITICAL ev 0
+ret ARGUS_F_AUTHORITY_REPLAY
+end
+put argus_sh_state idx ARGUS_SH_REVOKED
+put argus_sh_gen idx get ev cap_generation
+put argus_sh_seq idx get ev sequence
+ret ARGUS_F_NONE
+end
+if or eq k ARGUS_EV_CAPABILITY_USED eq k ARGUS_EV_CAPABILITY_USE_SUMMARY
+ret argus_detect_cap_use ev dst
+end
+if eq k ARGUS_EV_WORLD_COMMITTED
+if not argus_check_world_commit get ev object_id get ev world_generation
+put argus_core_meta 3 add get argus_core_meta 3 1
+argus_set_finding dst ARGUS_F_WORLD_PROVENANCE_INCONSISTENT ARGUS_SEV_CRITICAL ev 0
+ret ARGUS_F_WORLD_PROVENANCE_INCONSISTENT
+end
+ret ARGUS_F_NONE
+end
+ret ARGUS_F_NONE
+end
+
+note Ingest one event: validate -> chain -> detect -> apply.
+note Returns finding code (ARGUS_F_NONE if clean) and populates dst on finding.
+fn argus_core_ingest ev view ArgusEvent mach view uchar 32 evdig view uchar 32 dst edit ArgusFinding to ushort
+put argus_core_meta 0 add get argus_core_meta 0 1
+vrc = argus_event_validate ev
+if ne vrc ARGUS_OK
+put argus_core_meta 1 add get argus_core_meta 1 1
+put argus_core_meta 3 add get argus_core_meta 3 1
+argus_set_finding dst ARGUS_F_MALFORMED_EVENT ARGUS_SEV_HIGH ev 0
+ret ARGUS_F_MALFORMED_EVENT
+end
+note Extend SHA-256 event hash chain
+tmp_chain = new uchar 32 0
+for i ulong 32
+put tmp_chain i get argus_core_chain i
+end
+argus_chain_extend tmp_chain ev mach evdig
+for i ulong 32
+put argus_core_chain i get tmp_chain i
+end
+note Sequence monotonicity check: anomaly is detected and NOT applied
+if not argus_check_stream get ev flags get ev sequence
+put argus_core_meta 3 add get argus_core_meta 3 1
+argus_set_finding dst ARGUS_F_SEQUENCE_ANOMALY ARGUS_SEV_HIGH ev 0
+ret ARGUS_F_SEQUENCE_ANOMALY
+end
+ret argus_core_apply ev dst
+end
+
+note ---- Containment State Machine (Invariants I1..I5) ----
+
+fn argus_contain_init to void
+for i ulong 8
+put argus_cmeta i 0
+end
+put argus_cmeta 1 1
+for i ulong 10
+put argus_chealth i 0
+end
+for i ulong 32
+put argus_pend_st i ARGUS_ST_FREE
+put argus_pend_typ i 0
+put argus_pend_fcode i 0
+put argus_pend_princ i 0
+put argus_pend_cid i 0
+put argus_pend_cgen i 0
+put argus_pend_rid i 0
+put argus_pend_k4 i 0
+end
+for i ulong 1024
+put argus_pend_dig i 0
+end
+end
+
+fn argus_contain_health dst edit ArgusContainHealth to void
+put dst proposed get argus_chealth 0
+put dst granted get argus_chealth 1
+put dst denied get argus_chealth 2
+put dst escalated get argus_chealth 3
+put dst confirmed get argus_chealth 4
+put dst failed_scope get argus_chealth 5
+put dst decisions_unmatched get argus_chealth 6
+put dst executions_unauthorized get argus_chealth 7
+put dst executions_unconfirmed get argus_chealth 8
+put dst rate_limited get argus_chealth 9
+end
+
+fn argus_pend_is_open st uchar to bool
+ret or eq st ARGUS_ST_PROPOSED or eq st ARGUS_ST_GRANTED eq st ARGUS_ST_ESCALATED
+end
+
+fn argus_pend_find_rid rid ulong to int
+for i ulong 32
+if ne get argus_pend_st i ARGUS_ST_FREE
+if eq get argus_pend_rid i rid
+ret int i
+end
+end
+end
+ret -1
+end
+
+fn argus_pend_echo_matches slot ulong ev view ArgusEvent evdig view uchar 32 to bool
+obj = get ev object_id
+if ne argus_contain_type_of obj get argus_pend_typ slot
+ret false
+end
+if ne argus_contain_code_of obj get argus_pend_fcode slot
+ret false
+end
+if ne get ev principal get argus_pend_princ slot
+ret false
+end
+if ne get ev cap_id get argus_pend_cid slot
+ret false
+end
+if ne get ev cap_generation get argus_pend_cgen slot
+ret false
+end
+if ne get ev world_generation get argus_pend_rid slot
+ret false
+end
+base = mul slot 32
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get argus_pend_dig add base i get evdig i
+end
+ret eq diff 0
+end
+
+note Propose a containment request: enforces I1.c, I2, I3.b, computes canonical 152-byte digest.
+fn argus_contain_propose req edit ArgusContainReq mach view uchar 32 fdig view uchar 32 tdig view uchar 32 dig_out edit uchar 32 to int
+ct = get req containment
+if or lt ct 1 gt ct ARGUS_CONTAIN_MAX
+ret ARGUS_ERR_MALFORMED
+end
+if eq get req finding_sequence 0
+ret ARGUS_ERR_MALFORMED
+end
+note I2: only REVOKE_CAPABILITY has a live executor; non-live types require SYNTHETIC
+if ne ct ARGUS_CONTAIN_REVOKE_CAPABILITY
+if eq and get req flags ARGUS_CREQ_SYNTHETIC 0
+ret ARGUS_ERR_MALFORMED
+end
+end
+note I3.b: global proposal budget per window
+wcnt = get argus_cmeta 3
+if ge wcnt ulong ARGUS_CONTAIN_WINDOW_MAX
+put argus_chealth 9 add get argus_chealth 9 1
+ret ARGUS_ERR_FULL
+end
+slot = int -1
+for i ulong 32
+if eq get argus_pend_st i ARGUS_ST_FREE
+slot = int i
+break
+end
+end
+if lt slot 0
+ret ARGUS_ERR_FULL
+end
+rid = get argus_cmeta 1
+put argus_cmeta 1 add rid 1
+put req request_id rid
+put req version ARGUS_CONTAIN_REQ_VERSION
+put req reserved 0
+argus_creq_digest req mach fdig tdig dig_out
+idx = ulong slot
+put argus_pend_st idx ARGUS_ST_PROPOSED
+put argus_pend_typ idx ct
+put argus_pend_fcode idx get req finding_code
+put argus_pend_princ idx get req principal
+put argus_pend_cid idx get req target_cap_id
+put argus_pend_cgen idx get req target_cap_gen
+put argus_pend_rid idx rid
+put argus_pend_k4 idx 0
+base = mul idx 32
+for i ulong 32
+put argus_pend_dig add base i get dig_out i
+end
+put argus_cmeta 3 add wcnt 1
+put argus_chealth 0 add get argus_chealth 0 1
+ret ARGUS_OK
+end
+
+fn argus_contain_observe_revoke ev view ArgusEvent to ushort
+cid = get ev cap_id
+cgen = get ev cap_generation
+for i ulong 32
+st = get argus_pend_st i
+if argus_pend_is_open st
+if and eq get argus_pend_cid i cid eq get argus_pend_cgen i cgen
+if ne st ARGUS_ST_GRANTED
+put argus_chealth 7 add get argus_chealth 7 1
+ret ARGUS_F_CONTAINMENT_EXECUTION_UNAUTHORIZED
+end
+k4 = add get argus_pend_k4 i 1
+put argus_pend_k4 i k4
+if gt k4 1
+put argus_pend_st i ARGUS_ST_FAILED_SCOPE
+put argus_chealth 5 add get argus_chealth 5 1
+ret ARGUS_F_CONTAINMENT_SCOPE_EXCEEDED
+end
+ret ARGUS_F_NONE
+end
+end
+end
+ret ARGUS_F_NONE
+end
+
+fn argus_contain_observe_decided idx ulong ev view ArgusEvent to ushort
+st = get argus_pend_st idx
+cst = argus_contain_status_of get ev object_id
+if eq st ARGUS_ST_PROPOSED
+if eq cst ARGUS_CSTATUS_GRANT
+put argus_pend_st idx ARGUS_ST_GRANTED
+put argus_chealth 1 add get argus_chealth 1 1
+ret ARGUS_F_NONE
+end
+if eq cst ARGUS_CSTATUS_DENY
+put argus_pend_st idx ARGUS_ST_DENIED
+put argus_chealth 2 add get argus_chealth 2 1
+ret ARGUS_F_NONE
+end
+if eq cst ARGUS_CSTATUS_ESCALATE
+put argus_pend_st idx ARGUS_ST_ESCALATED
+put argus_chealth 3 add get argus_chealth 3 1
+ret ARGUS_F_NONE
+end
+end
+if eq st ARGUS_ST_ESCALATED
+if eq cst ARGUS_CSTATUS_GRANT
+put argus_pend_st idx ARGUS_ST_GRANTED
+put argus_chealth 1 add get argus_chealth 1 1
+ret ARGUS_F_NONE
+end
+if eq cst ARGUS_CSTATUS_DENY
+put argus_pend_st idx ARGUS_ST_DENIED
+put argus_chealth 2 add get argus_chealth 2 1
+ret ARGUS_F_NONE
+end
+end
+put argus_chealth 6 add get argus_chealth 6 1
+ret ARGUS_F_CONTAINMENT_DECISION_UNMATCHED
+end
+
+fn argus_contain_observe_executed idx ulong ev view ArgusEvent to ushort
+st = get argus_pend_st idx
+cst = argus_contain_status_of get ev object_id
+if ne st ARGUS_ST_GRANTED
+if or eq cst ARGUS_CSTATUS_DONE eq cst ARGUS_CSTATUS_PARTIAL
+put argus_chealth 7 add get argus_chealth 7 1
+ret ARGUS_F_CONTAINMENT_EXECUTION_UNAUTHORIZED
+end
+put argus_chealth 6 add get argus_chealth 6 1
+ret ARGUS_F_CONTAINMENT_DECISION_UNMATCHED
+end
+lo32 = uint and get ev resource 0xffffffff
+bad_scope = eq cst ARGUS_CSTATUS_FAILED_SCOPE
+if and eq cst ARGUS_CSTATUS_DONE ne lo32 1
+bad_scope = true
+end
+if and eq cst ARGUS_CSTATUS_PARTIAL gt lo32 1
+bad_scope = true
+end
+if bad_scope
+put argus_pend_st idx ARGUS_ST_FAILED_SCOPE
+put argus_chealth 5 add get argus_chealth 5 1
+ret ARGUS_F_CONTAINMENT_SCOPE_EXCEEDED
+end
+if eq cst ARGUS_CSTATUS_DONE
+if eq get argus_pend_k4 idx 1
+put argus_pend_st idx ARGUS_ST_CONFIRMED
+put argus_chealth 4 add get argus_chealth 4 1
+ret ARGUS_F_NONE
+end
+put argus_chealth 8 add get argus_chealth 8 1
+ret ARGUS_F_CONTAINMENT_EXECUTION_UNCONFIRMED
+end
+if or eq cst ARGUS_CSTATUS_FAILED eq cst ARGUS_CSTATUS_UNAVAILABLE
+put argus_pend_st idx ARGUS_ST_FAILED
+ret ARGUS_F_NONE
+end
+ret ARGUS_F_NONE
+end
+
+note Observe an event for containment lifecycle tracking. Returns finding code (ARGUS_F_NONE if clean).
+fn argus_contain_observe ev view ArgusEvent evdig view uchar 32 to ushort
+evs = add get argus_cmeta 0 1
+put argus_cmeta 0 evs
+wstart = get argus_cmeta 2
+if gt evs add wstart ARGUS_CONTAIN_WINDOW_EVENTS
+put argus_cmeta 2 mul div sub evs 1 ARGUS_CONTAIN_WINDOW_EVENTS ARGUS_CONTAIN_WINDOW_EVENTS
+put argus_cmeta 3 0
+end
+k = get ev kind
+if eq k ARGUS_EV_CAPABILITY_REVOKED
+ret argus_contain_observe_revoke ev
+end
+if or eq k ARGUS_EV_CONTAINMENT_DECIDED eq k ARGUS_EV_CONTAINMENT_EXECUTED
+ix = argus_pend_find_rid get ev world_generation
+if lt ix 0
+put argus_chealth 6 add get argus_chealth 6 1
+ret ARGUS_F_CONTAINMENT_DECISION_UNMATCHED
+end
+idx = ulong ix
+if or not argus_pend_is_open get argus_pend_st idx not argus_pend_echo_matches idx ev evdig
+put argus_chealth 6 add get argus_chealth 6 1
+ret ARGUS_F_CONTAINMENT_DECISION_UNMATCHED
+end
+if eq k ARGUS_EV_CONTAINMENT_DECIDED
+ret argus_contain_observe_decided idx ev
+end
+ret argus_contain_observe_executed idx ev
+end
+ret ARGUS_F_NONE
+end

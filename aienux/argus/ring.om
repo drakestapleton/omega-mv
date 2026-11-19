@@ -1,0 +1,202 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/argus/ring.om: Pure-Omega ARGUS Class-Gated Admission Ring & Drop Synthesizer.
+note Converted from upstream aienux native/argus/argus_ring.c.
+note Enforces 50%/75%/90%/100% per-class saturation watermarks, sticky critical_overflow,
+note malformed push accounting (never drained as drops), and priority-ordered TELEMETRY_DROPPED synthesis.
+
+const ARGUS_RING_MIN_CAP uint 4
+const ARGUS_RING_MAX_CAP uint 256
+
+note Ring metadata: 0=head, 1=tail, 2=capacity, 3=mask, 4=critical_overflow, 5=init
+global argus_ring_meta ulong 8
+global argus_ring_refused ulong 5
+global argus_ring_pending ulong 5
+global argus_ring_limit ulong 5
+note 256 slots * 128 wire bytes = 32768 bytes
+global argus_ring_slots uchar 32768
+
+fn argus_is_pow2 v uint to bool
+if eq v 0
+ret false
+end
+ret eq and v sub v 1 0
+end
+
+fn argus_ring_saturation_point cap_pow2 uint cls uchar to uint
+if or lt cap_pow2 ARGUS_RING_MIN_CAP gt cap_pow2 ARGUS_RING_MAX_CAP
+ret 0
+end
+if not argus_is_pow2 cap_pow2
+ret 0
+end
+if eq cls ARGUS_CLASS_CRITICAL
+ret cap_pow2
+end
+if eq cls ARGUS_CLASS_SECURITY
+note 90% rounded up to a whole slot: (cap * 9 + 9) / 10
+ret uint div add mul ulong cap_pow2 9 9 10
+end
+if eq cls ARGUS_CLASS_AUDIT
+note 75%
+ret uint div mul ulong cap_pow2 3 4
+end
+if eq cls ARGUS_CLASS_INFORMATIONAL
+note 50%
+ret uint div ulong cap_pow2 2
+end
+ret 0
+end
+
+fn argus_ring_init cap_pow2 uint to int
+if or lt cap_pow2 ARGUS_RING_MIN_CAP gt cap_pow2 ARGUS_RING_MAX_CAP
+ret ARGUS_ERR_ARG
+end
+if not argus_is_pow2 cap_pow2
+ret ARGUS_ERR_ARG
+end
+put argus_ring_meta 0 0
+put argus_ring_meta 1 0
+put argus_ring_meta 2 ulong cap_pow2
+put argus_ring_meta 3 ulong sub cap_pow2 1
+put argus_ring_meta 4 0
+put argus_ring_meta 5 1
+for c ulong 5
+put argus_ring_refused c 0
+put argus_ring_pending c 0
+put argus_ring_limit c ulong argus_ring_saturation_point cap_pow2 uchar c
+end
+ret ARGUS_OK
+end
+
+fn argus_ring_admit ev view ArgusEvent to int
+if eq get argus_ring_meta 5 0
+ret ARGUS_ERR_STATE
+end
+cls = get ev class_
+k = get ev kind
+minc = argus_event_min_class k
+bad_cls = or lt cls ARGUS_CLASS_CRITICAL gt cls ARGUS_CLASS_MAX
+weaker = and ne minc 0 gt cls minc
+is_prop = eq k ARGUS_EV_CONTAINMENT_PROPOSED
+if or bad_cls or weaker is_prop
+put argus_ring_refused 0 add get argus_ring_refused 0 1
+ret ARGUS_ERR_MALFORMED
+end
+h = get argus_ring_meta 0
+t = get argus_ring_meta 1
+lim = get argus_ring_limit ulong cls
+if ge sub h t lim
+if eq cls ARGUS_CLASS_CRITICAL
+put argus_ring_meta 4 add get argus_ring_meta 4 1
+else
+put argus_ring_refused ulong cls add get argus_ring_refused ulong cls 1
+end
+put argus_ring_pending ulong cls add get argus_ring_pending ulong cls 1
+ret ARGUS_ERR_FULL
+end
+ret ARGUS_OK
+end
+
+fn argus_ring_push ev view ArgusEvent mach view uchar 32 evdig view uchar 32 to int
+rc = argus_ring_admit ev
+if ne rc ARGUS_OK
+ret rc
+end
+wire = new uchar 128 0
+rc = argus_event_encode ev mach evdig wire
+if ne rc ARGUS_OK
+ret rc
+end
+h = get argus_ring_meta 0
+slot = and h get argus_ring_meta 3
+base = mul slot 128
+for i ulong 128
+put argus_ring_slots add base i get wire i
+end
+put argus_ring_meta 0 add h 1
+ret ARGUS_OK
+end
+
+fn argus_ring_pop dst edit ArgusEvent mach edit uchar 32 evdig edit uchar 32 to int
+if eq get argus_ring_meta 5 0
+ret ARGUS_ERR_STATE
+end
+h = get argus_ring_meta 0
+t = get argus_ring_meta 1
+if eq h t
+ret ARGUS_ERR_STATE
+end
+slot = and t get argus_ring_meta 3
+base = mul slot 128
+wire = new uchar 128 0
+for i ulong 128
+put wire i get argus_ring_slots add base i
+end
+put argus_ring_meta 1 add t 1
+argus_event_decode_fields wire dst
+for i ulong 32
+put mach i get wire add 64 i
+put evdig i get wire add 96 i
+end
+ret ARGUS_OK
+end
+
+fn argus_ring_stats dst edit ArgusRingStats to void
+h = get argus_ring_meta 0
+t = get argus_ring_meta 1
+cap = get argus_ring_meta 2
+put dst pushed h
+put dst popped t
+put dst critical_overflow get argus_ring_meta 4
+d = ulong 0
+if ge h t
+d = sub h t
+end
+if gt d cap
+d = cap
+end
+put dst depth uint d
+put dst capacity uint cap
+put dst ref_malformed get argus_ring_refused 0
+put dst ref_crit get argus_ring_refused 1
+put dst ref_sec get argus_ring_refused 2
+put dst ref_audit get argus_ring_refused 3
+put dst ref_info get argus_ring_refused 4
+end
+
+note Drain the highest-priority pending drop class (CRITICAL -> SECURITY -> AUDIT -> INFORMATIONAL).
+note Returns ARGUS_OK and populates dst if a drop event was synthesized, else ARGUS_ERR_STATE.
+fn argus_ring_drain_one dst edit ArgusEvent next_seq edit ulong 1 to int
+if eq get argus_ring_meta 5 0
+ret ARGUS_ERR_STATE
+end
+for c ulong 4
+cls = add c 1
+cnt = get argus_ring_pending cls
+if gt cnt 0
+put argus_ring_pending cls 0
+seq = get next_seq 0
+if eq seq 0
+seq = ulong 1
+end
+put next_seq 0 add seq 1
+put dst version ARGUS_ABI_VERSION
+put dst class_ ARGUS_CLASS_CRITICAL
+put dst kind ARGUS_EV_TELEMETRY_DROPPED
+put dst effect_class ARGUS_EFFECT_NONE
+put dst outcome ARGUS_OUTCOME_ERROR
+put dst flags ARGUS_FLAG_CONSUMER
+put dst sequence seq
+put dst tick 0
+put dst principal 0
+put dst code ARGUS_ERR_FULL
+put dst cap_id ARGUS_CAP_NONE
+put dst object_id uint cls
+put dst cap_generation 0
+put dst world_generation 0
+put dst resource cnt
+ret ARGUS_OK
+end
+end
+ret ARGUS_ERR_STATE
+end
