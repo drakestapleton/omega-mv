@@ -1,0 +1,275 @@
+note SPDX-License-Identifier: Apache-2.0
+note si/architecture/verify/authority.om: pure-Omega port of aien-architecture-mv
+note verification engine: ADR/plan authority validator, capability register verifier,
+note architectural layer & evidence immutability invariant checker.
+note Compose after si/directives/om2.om and om/tls/sha2.om.
+
+const ARCH_OK ulong 0
+const ARCH_ERR_BAD_ADR_ID ulong 1
+const ARCH_ERR_NOT_BINDING ulong 2
+const ARCH_ERR_CYCLE_SUPERSEDE ulong 3
+const ARCH_ERR_UNQUALIFIED_REL ulong 4
+const ARCH_ERR_BAD_SHA ulong 5
+const ARCH_ERR_EMULATOR_AS_HW ulong 6
+const ARCH_ERR_DIRTY_TREE ulong 7
+const ARCH_ERR_NON_OMEGA_NEW ulong 8
+const ARCH_ERR_LAYER_INVERSION ulong 9
+const ARCH_ERR_BAD_LAYER ulong 10
+const ARCH_ERR_EVIDENCE_MUTATION ulong 11
+const ARCH_ERR_MISSING_RECEIPT ulong 12
+const ARCH_ERR_BAD_STATUS ulong 13
+
+const AUTH_PROPOSED ulong 0
+const AUTH_ACCEPTED ulong 1
+const AUTH_SUPERSEDED ulong 2
+const AUTH_DEPRECATED ulong 3
+const AUTH_REJECTED ulong 4
+
+const CAP_PLANNED ulong 0
+const CAP_IMPLEMENTED ulong 1
+const CAP_VERIFIED ulong 2
+const CAP_QUALIFIED_HW ulong 3
+const CAP_BLOCKED ulong 4
+
+const HW_HOST_EMULATOR ulong 0
+const HW_GB10 ulong 1
+const HW_BARE_METAL ulong 2
+
+const LANG_OMEGA ulong 1
+const LANG_C_LEGACY ulong 2
+const LANG_RUST_LEGACY ulong 3
+
+const EV_OP_ADD ulong 1
+const EV_OP_MODIFY ulong 2
+const EV_OP_RENAME ulong 3
+const EV_OP_DELETE ulong 4
+
+const LAYER_SEED ulong 0
+const LAYER_AIENUX ulong 1
+const LAYER_GPU ulong 2
+const LAYER_BRIDGE ulong 3
+const LAYER_CORE ulong 4
+const LAYER_PROTOCOL ulong 5
+const LAYER_APPS ulong 6
+const LAYER_SI ulong 7
+
+text arch_adr_pfx "ADR-"
+
+note --- Basic helpers ---
+
+fn arch_write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn arch_put_u64_le dst edit uchar * pos ulong v ulong to ulong
+if gt add pos ulong 8 len dst
+ret pos
+end
+for i ulong 8
+sh = mul i ulong 8
+put dst add pos i uchar and shr v sh ulong 255
+end
+ret add pos ulong 8
+end
+
+fn arch_is_lower_hex s view uchar * expected_len ulong to bool
+if ne len s expected_len
+ret false
+end
+if gt expected_len ulong 128
+ret false
+end
+i = ulong 0
+while lt i expected_len bound 128
+b = get s i
+ok = false
+if and ge b uchar 48 le b uchar 57
+ok = true
+end
+if and ge b uchar 97 le b uchar 102
+ok = true
+end
+if not ok
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn arch_digest_eq a view uchar 32 b view uchar 32 to bool
+for i ulong 32
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note --- ADR & Plan Authority Validator ---
+note Validates "ADR-NNNN" (exact 8 bytes, 4 ASCII digits, value in 1..9999). Returns number or -1.
+
+fn arch_parse_adr_id s view uchar * to long
+if ne len s ulong 8
+ret long -1
+end
+for i ulong 4
+if ne get s i get arch_adr_pfx i
+ret long -1
+end
+end
+acc = ulong 0
+for j ulong 4
+b = get s add ulong 4 j
+if or lt b uchar 48 gt b uchar 57
+ret long -1
+end
+acc = add mul acc ulong 10 sub ulong b ulong 48
+end
+if eq acc ulong 0
+ret long -1
+end
+ret long acc
+end
+
+note Validates ADR status & supersession invariants (no self/backward supersession cycles).
+fn arch_validate_adr adr_id view uchar * status ulong superseded_by ulong to ulong
+num = arch_parse_adr_id adr_id
+if lt num long 0
+ret ARCH_ERR_BAD_ADR_ID
+end
+if gt status AUTH_REJECTED
+ret ARCH_ERR_BAD_STATUS
+end
+if eq status AUTH_SUPERSEDED
+if le superseded_by ulong num
+ret ARCH_ERR_CYCLE_SUPERSEDE
+end
+else
+if ne superseded_by ulong 0
+ret ARCH_ERR_CYCLE_SUPERSEDE
+end
+end
+ret ARCH_OK
+end
+
+note Only ACCEPTED ADRs govern live implementation; PROPOSED/open PR is never binding or qualified.
+fn arch_adr_is_binding status ulong to bool
+ret eq status AUTH_ACCEPTED
+end
+
+fn arch_check_release_authority status ulong commit_sha view uchar * dirty bool to ulong
+if dirty
+ret ARCH_ERR_DIRTY_TREE
+end
+if not arch_is_lower_hex commit_sha ulong 40
+ret ARCH_ERR_BAD_SHA
+end
+if ne status AUTH_ACCEPTED
+ret ARCH_ERR_UNQUALIFIED_REL
+end
+ret ARCH_OK
+end
+
+note --- Capability Register Verifier ---
+note Enforces:
+note   - Valid capability status & language rule (new capabilities must be pure Omega)
+note   - Dirty tree refused
+note   - VERIFIED / QUALIFIED_HW require valid 40-char commit SHA & 64-char receipt SHA-256
+note   - QUALIFIED_HW refuses HW_HOST_EMULATOR (host/emulator pass != hardware qualification)
+
+fn arch_verify_cap_lang is_new bool lang_class ulong to ulong
+if is_new
+if ne lang_class LANG_OMEGA
+ret ARCH_ERR_NON_OMEGA_NEW
+end
+end
+ret ARCH_OK
+end
+
+fn arch_verify_cap_receipts cap_status ulong commit_sha view uchar * receipt_sha view uchar * to ulong
+if gt cap_status CAP_BLOCKED
+ret ARCH_ERR_BAD_STATUS
+end
+if or eq cap_status CAP_VERIFIED eq cap_status CAP_QUALIFIED_HW
+if not arch_is_lower_hex commit_sha ulong 40
+ret ARCH_ERR_BAD_SHA
+end
+if not arch_is_lower_hex receipt_sha ulong 64
+ret ARCH_ERR_MISSING_RECEIPT
+end
+end
+ret ARCH_OK
+end
+
+fn arch_verify_cap_hw cap_status ulong hw_target ulong dirty bool to ulong
+if gt cap_status CAP_BLOCKED
+ret ARCH_ERR_BAD_STATUS
+end
+if dirty
+ret ARCH_ERR_DIRTY_TREE
+end
+if eq cap_status CAP_QUALIFIED_HW
+if eq hw_target HW_HOST_EMULATOR
+ret ARCH_ERR_EMULATOR_AS_HW
+end
+if gt hw_target HW_BARE_METAL
+ret ARCH_ERR_EMULATOR_AS_HW
+end
+end
+ret ARCH_OK
+end
+
+note --- Architectural Layer Dependency & Evidence Immutability Invariants ---
+note Layer ordering: 0=seed < 1=aienux < 2=gpu < 3=bridge < 4=core < 5=protocol < 6=apps < 7=si
+note A layer may depend only on itself or lower layers (to_layer <= from_layer).
+
+fn arch_layer_dep_check from_layer ulong to_layer ulong to ulong
+if or gt from_layer LAYER_SI gt to_layer LAYER_SI
+ret ARCH_ERR_BAD_LAYER
+end
+if gt to_layer from_layer
+ret ARCH_ERR_LAYER_INVERSION
+end
+ret ARCH_OK
+end
+
+note Evidence tree is additions-only: MODIFY, RENAME, DELETE are forbidden.
+fn arch_evidence_op_check op ulong to ulong
+if eq op EV_OP_ADD
+ret ARCH_OK
+end
+ret ARCH_ERR_EVIDENCE_MUTATION
+end
+
+note Canonical SHA-256 digest of an authority record (adr_num, status, cap_status, commit_sha).
+fn arch_record_digest adr_num ulong status ulong cap_status ulong commit_sha view uchar * dst edit uchar 32 to void
+ctx = new ulong 40 0
+hdr = new uchar 24 0
+w1 = arch_put_u64_le hdr ulong 0 adr_num
+w2 = arch_put_u64_le hdr ulong 8 status
+w3 = arch_put_u64_le hdr ulong 16 cap_status
+if or ne w1 ulong 8 or ne w2 ulong 16 ne w3 ulong 24
+trap 8
+end
+sha256_init ctx
+sha256_update ctx hdr
+sha256_update ctx commit_sha
+sha256_final ctx dst
+end
