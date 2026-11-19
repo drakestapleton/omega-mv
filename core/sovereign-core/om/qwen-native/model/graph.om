@@ -1,0 +1,215 @@
+note One text sequence on the frozen 27B dense or 35B routed model. Device projections share a resident weight mapping per layer.
+global qrun ulong 6
+fn qwroleof slot ulong to ulong
+ret ulong get qrole add mul get qrun 1 1600 slot
+end
+
+fn qinvnorm x view f32 * h ulong to f64
+s = 0.0f64
+for j ulong h
+v = f64 get x j
+s = add s mul v v
+end
+ret div 1.0f64 fsqrt add div s f64 h 0.000001f64
+end
+
+fn qnorm id ulong x view f32 * y edit f32 * to void
+h = get qcfg 1
+w = new f32 5120 0.0f32
+qreadrow id 0 w 0 h
+inv = qinvnorm x h
+for j ulong h
+a = mul f64 get x j inv
+gain = add 1.0f64 f64 get w j
+put y j f32 mul a gain
+end
+end
+
+fn qresid x edit f32 * delta view f32 * to void
+for j ulong get qcfg 1
+put x j add get x j get delta j
+end
+end
+
+fn qab x view f32 * pack edit f32 * start ulong to void
+a = new f32 48 0.0f32
+b = new f32 48 0.0f32
+qproject qwroleof 4 x a 0
+qproject qwroleof 5 x b 0
+heads = div get qcfg 3 128
+for j ulong heads
+p = add start mul j 2
+put pack p get a j
+put pack add p 1 get b j
+end
+end
+
+fn qdweights w edit f32 * to void
+qreadrow qwroleof 10 0 w 0 get qwcount qwroleof 10
+heads = div get qcfg 3 128
+qreadrow qwroleof 2 0 w 40960 heads
+qreadrow qwroleof 3 0 w 41008 heads
+qreadrow qwroleof 8 0 w 41056 128
+end
+
+fn qdelta x view f32 * y edit f32 * to void
+p = new f32 16480 0.0f32
+w = new f32 41184 0.0f32
+z = new f32 6144 0.0f32
+n = add 4096 get qcfg 3
+qproject qwroleof 6 x p 0
+qproject qwroleof 7 x p n
+qab x p add n get qcfg 3
+qdweights w
+qwen_delta_step get qrun 0 get qrun 1 get qrun 2 p w z
+qproject qwroleof 9 z y 0
+end
+
+fn qattention x view f32 * y edit f32 * to void
+p = new f32 14336 0.0f32
+w = new f32 512 0.0f32
+z = new f32 6144 0.0f32
+n = mul get qcfg 4 2
+qproject qwroleof 13 x p 0
+qproject qwroleof 14 x p n
+qproject qwroleof 15 x p add n get qcfg 5
+qreadrow qwroleof 11 0 w 0 256
+qreadrow qwroleof 12 0 w 256 256
+qwen_attention_step get qrun 0 get qrun 1 get qrun 2 p w z
+qproject qwroleof 16 z y 0
+end
+
+fn qswiglu a edit f32 * b view f32 * n ulong to void
+for j ulong n
+v = get a j
+gate = mul v f32 qb_sig f64 v
+put a j mul gate get b j
+end
+end
+
+fn qfeed slot ulong x view f32 * y edit f32 * to void
+g = new f32 17408 0.0f32
+u = new f32 17408 0.0f32
+qproject qwroleof slot x g 0
+qproject qwroleof add slot 1 x u 0
+qswiglu g u get qcfg 6
+qproject qwroleof add slot 2 g y 0
+end
+
+global qtop uint 8
+global qprob f32 8
+fn qroute scores view f32 * to void
+den = 0.0f64
+top = 0.0f64
+for rank ulong 8
+best = ulong 256
+for e ulong 256
+used = false
+for j ulong rank
+if eq ulong get qtop j e
+used = true
+end
+end
+if not used
+if eq best 256
+best = e
+else
+if gt get scores e get scores best
+best = e
+end
+end
+end
+end
+put qtop rank uint best
+if eq rank 0
+top = f64 get scores best
+end
+p = qb_exp sub f64 get scores best top
+den = add den p
+put qprob rank f32 p
+end
+for rank ulong 8
+put qprob rank f32 div f64 get qprob rank den
+end
+end
+
+fn qaddexpert y edit f32 * e view f32 * alpha f32 to void
+for j ulong get qcfg 1
+put y j add get y j mul alpha get e j
+end
+end
+
+fn qmoe x view f32 * y edit f32 * to void
+router = new f32 256 0.0f32
+gate = new f32 1 0.0f32
+expert = new f32 2048 0.0f32
+qproject qwroleof 20 x router 0
+qroute router
+qproject qwroleof 21 x gate 0
+qfeed 22 x expert
+for j ulong 2048
+put y j 0.0f32
+end
+qaddexpert y expert f32 qb_sig f64 get gate 0
+for j ulong 8
+slot = add 32 mul 3 ulong get qtop j
+qfeed slot x expert
+qaddexpert y expert get qprob j
+end
+end
+
+fn qlayer x edit f32 * to void
+xn = new f32 5120 0.0f32
+dy = new f32 5120 0.0f32
+qnorm qwroleof 0 x xn
+if eq rem get qrun 1 4 3
+qattention xn dy
+else
+qdelta xn dy
+end
+qresid x dy
+qnorm qwroleof 1 x xn
+if eq get qrun 0 27
+qfeed 17 xn dy
+else
+qmoe xn dy
+end
+qresid x dy
+end
+
+fn qargmax scores view f32 * n ulong to ulong
+best = ulong 0
+for j ulong n
+b = bitcast uint get scores j
+if eq and b 2139095040 2139095040
+qwfail 54
+end
+if gt get scores j get scores best
+best = j
+end
+end
+ret best
+end
+
+fn qtoken tok ulong pos ulong logits bool to ulong
+if or ge tok 248320 ge pos 8192
+qwfail 55
+end
+x = new f32 5120 0.0f32
+xn = new f32 5120 0.0f32
+s = new f32 248320 0.0f32
+qdiskrecheck
+put qrun 2 pos
+qreadrow ulong get qrole 1020 mul tok get qcfg 1 x 0 get qcfg 1
+for l ulong get qcfg 0
+put qrun 1 l
+qlayer x
+end
+if not logits
+ret 0
+end
+qnorm ulong get qrole 1022 x xn
+qproject ulong get qrole 1021 xn s 0
+qdiskrecheck
+ret qargmax s 248320
+end

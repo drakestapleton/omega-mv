@@ -1,0 +1,330 @@
+note SPDX-License-Identifier: Apache-2.0
+note om/golden/ollm/gdec.om: greedy decoding of the own Omega LLM for the golden-token gate (DRA-52,
+note Core #853). This is not a stand-alone unit. gate.sh builds an aien-train tree with its own
+note tests/omegallm/build.sh (TARGET=gb10), renames gpu/gg.om's `fn main to int` (exactly one line)
+note to `fn oggmain to int`, and appends this unit, so both decoders call the candidate tree's own
+note model.om (CPU, f64) and gpu/ kernels (GB10, f32) unchanged. Every other command still reaches
+note the aien-train mains through oggmain.
+note Commands (argv[1]; packing as cli.om: little-endian u64 of the bytes, Wolfram
+note FromDigits[Reverse[ToCharacterCode[w]],256]): gtcpu 504396739687, gtgpu 504397001831.
+note   gtcpu CK MERGES N P0 [P1 ..]  greedy on the CPU forward (model.om ofwd, f64)
+note   gtgpu CK MERGES N P0 [P1 ..]  greedy on the GB10 forward (gpu/gg.om ggfwd, f32), all prompts
+note                                 in one batch, one ggfwd per step
+note Context of prompt k: token 0, then Pk (its BPE encoding when V > 256, its bytes otherwise),
+note exactly as cli.om cmdsamp builds it; a generated token 0 ends prompt k after it is printed.
+note The step reads the logits of the last context position. 1 + |Pk| + N must not exceed T, so the
+note window never slides (positions are 0 .. in both decoders). MERGES is read only when V > 256.
+note Output, one line per generated token, then a summary line:
+note   T k s id top1_e9 margin_e9     (id = argmax, lowest index on ties, as cli.om oargmax)
+note   GTE cpu|gpu prompts steps ns
+note top1 is the largest logit; margin is its distance to the second largest, both times 10^9,
+note truncated toward zero. gtcpu reads them from the f64 logits. gtgpu reads the CE kernel's row
+note output (gpu/gr.om id 21, L <- (e/sum - [c = y]) sc with y = 0 here and sc = 1/(T B)): p_c =
+note L_c / sc, p_0 = L_0 / sc + 1, the argmax over p, top1 = the kernel's row max m (stats word 0)
+note and margin = log(p_best / p_second). No judgment is made here: om/golden/ollm/gate.om
+note compares a gtgpu run with the committed gtcpu reference.
+note Exit: 2 usage (argument count, N outside 1 .. 4096, more prompts than 64 or than the batch B,
+note context past T); the aien-train refusals of ockload (10-15), obload (27) and the GPU (ggdie,
+note 84) are unchanged.
+
+global zgct ulong 32768
+global zgcn ulong 64
+global zgdn ulong 64
+global zgst ulong 2
+global zgv f64 2
+
+text zgtcp "cpu"
+text zgtgp "gpu"
+
+note argument checks and loads; returns N
+fn zgargs to ulong
+na = oargc
+if lt na 6
+exit 2
+end
+if gt sub na 5 64
+exit 2
+end
+ockload 2
+v = get og 0
+if gt v 256
+obload 3 v
+end
+nn = oargu 4
+if or eq nn 0 gt nn 4096
+exit 2
+end
+if gt get og 1 512
+exit 2
+end
+ret nn
+end
+
+fn zgput b ulong i ulong v ulong to void
+put zgct add b add 1 i v
+end
+
+note prompt tokens of argument ai after token 0 at zgct[b + 1 ..); returns the context length
+fn zgldp ai ulong b ulong to ulong
+if gt get og 0 256
+np = obprompt ai
+for i ulong np
+zgput b i get obtk i
+end
+ret add 1 np
+end
+r = oargr ai
+if or lt r 1 gt r 4000
+exit 2
+end
+for i ulong ulong r
+zgput b i ulong get oarg i
+end
+ret add 1 ulong r
+end
+
+note context of prompt k into zgct[k 512 ..): token 0, then the prompt (argument 5 + k)
+fn zgload k ulong nn ulong to void
+b = mul k 512
+put zgct b 0
+n = zgldp add 5 k b
+if gt add n nn get og 1
+exit 2
+end
+put zgcn k n
+put zgdn k 0
+end
+
+fn zgpush k ulong c ulong to void
+n = get zgcn k
+put zgct add mul k 512 n c
+put zgcn k add n 1
+end
+
+fn zge9 x f64 to long
+ret long mul x 1000000000.0f64
+end
+
+fn zgline k ulong s ulong c ulong a f64 m f64 to void
+oputc 84
+oputc 32
+oputu k
+oputc 32
+oputu s
+oputc 32
+oputu c
+oputc 32
+oputl zge9 a
+oputc 32
+oputl zge9 m
+oputc 10
+end
+
+fn zgsum which ulong np ulong ns ulong to void
+oputc 71
+oputc 84
+oputc 69
+oputc 32
+if eq which 0
+for i ulong 3
+oputc ulong get zgtcp i
+end
+else
+for i ulong 3
+oputc ulong get zgtgp i
+end
+end
+oputc 32
+oputu np
+oputc 32
+oputu get zgst 0
+oputc 32
+oputu ns
+oputc 10
+oflush
+end
+
+fn zgcset k ulong to void
+n = get zgcn k
+b = mul k 512
+for i ulong n
+put obx i get zgct add b i
+end
+put og 9 n
+end
+
+note the largest of oa[TMP + c] over c != best
+fn zgcsec best ulong to f64
+tm = get og 27
+sv = bitcast f64 ulong 18442240474082181120
+for c ulong get og 0
+if ne c best
+sv = fmax sv get oa add tm c
+end
+end
+ret sv
+end
+
+note CPU step of prompt k: the f64 logits of its last position in oa[TMP ..), the argmax (cli.om
+note oargmax: lowest index on ties) and the largest logit over the other indices; prints the T
+note line, returns the id
+fn zgcstep k ulong s ulong to ulong
+zgcset k
+lf = ofwd 0
+olast
+best = oargmax
+bv = get oa add get og 27 best
+sv = zgcsec best
+zgline k s best bv sub bv sv
+ret best
+end
+
+fn zgcpu to void
+t0 = monons
+nn = zgargs
+np = sub oargc 5
+put zgst 0 0
+for k ulong np
+zgload k nn
+for s ulong nn
+c = zgcstep k s
+put zgst 0 add get zgst 0 1
+zgpush k c
+if eq c 0
+break
+end
+end
+end
+zgsum 0 np ulong sub monons t0
+end
+
+note GPU batch rows: row b < np holds prompt b's context, then zeros; every other row and every
+note target is 0
+fn zgfill np ulong to void
+tt = get og 1
+for b ulong get og 6
+n = ulong 0
+if lt b np
+n = get zgcn b
+end
+for t ulong tt
+x = ulong 0
+if lt t n
+x = get zgct add mul b 512 t
+end
+put obx add mul b tt t x
+put oby add mul b tt t 0
+end
+end
+end
+
+note p_c of row r from the CE kernel output (see the header)
+fn zgp r ulong c ulong sc f64 to f64
+v = get og 0
+o = add get gga 11 mul 4 add mul r v c
+p = div ggf o sc
+if eq c 0
+p = add p 1.0f64
+end
+ret p
+end
+
+note argmax of p over row r (lowest index on ties); its p in zgv[0]
+fn zgpbest r ulong sc f64 to ulong
+best = ulong 0
+bp = zgp r 0 sc
+for c ulong get og 0
+p = zgp r c sc
+if gt p bp
+bp = p
+best = c
+end
+end
+put zgv 0 bp
+ret best
+end
+
+fn zgpsec r ulong best ulong sc f64 to f64
+sp = bitcast f64 ulong 18442240474082181120
+for c ulong get og 0
+if ne c best
+sp = fmax sp zgp r c sc
+end
+end
+ret sp
+end
+
+note GPU step of prompt k after one ggfwd: argmax of p over the row of its last position, second p,
+note the kernel's row max; prints the T line, returns the id
+fn zggstep k ulong s ulong sc f64 to ulong
+r = add mul k get og 1 sub get zgcn k 1
+best = zgpbest r sc
+sp = zgpsec r best sc
+m = ggf add get gga 12 mul r 12
+mg = 1000.0f64
+if gt sp 0.0f64
+mg = flog div get zgv 0 sp
+end
+zgline k s best m mg
+ret best
+end
+
+fn zgglive np ulong to bool
+for k ulong np
+if eq get zgdn k 0
+ret true
+end
+end
+ret false
+end
+
+fn zggpu to void
+t0 = monons
+nn = zgargs
+np = sub oargc 5
+if gt np get og 6
+exit 2
+end
+put zgst 0 0
+for k ulong np
+zgload k nn
+end
+ggopen
+ggupw
+sc = div 1.0f64 f64 mul get og 1 get og 6
+for s ulong nn
+if not zgglive np
+break
+end
+zgfill np
+ggupb
+ggfwd
+for k ulong np
+if eq get zgdn k 0
+c = zggstep k s sc
+put zgst 0 add get zgst 0 1
+zgpush k c
+if eq c 0
+put zgdn k 1
+end
+end
+end
+end
+zgsum 1 np ulong sub monons t0
+end
+
+fn main to int
+if lt oargc 2
+exit 2
+end
+w = ocmdw
+if eq w 504396739687
+zgcpu
+ret 0
+end
+if eq w 504397001831
+zggpu
+ret 0
+end
+ret oggmain
+end

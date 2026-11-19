@@ -1,0 +1,333 @@
+note Flash-Next matrix layer on GB10. Dense BF16 matrices stay resident in bump arenas.
+note Routed experts occupy fixed device slots, least recently used first out. Host mode computes the same products on the CPU.
+global qxy long 2
+global qdarena long 8
+global qdused ulong 8
+global qdcur ulong 1
+global qgoff ulong 196608
+global qearena long 32
+global qemap uint 24576
+global qeown uint 26624
+global qestamp ulong 26624
+note qecfg: 0 host mode, 1 slot limit, 2 clock, 3 slots filled, 4 expert loads, 5 evictions, 6 device launches.
+global qecfg ulong 8
+const qdsize ulong 2147483648
+const qeslots ulong 832
+const qestride ulong 4919296
+fn qtransfer fd int origin ulong n ulong dev long devoff ulong to void
+off = ulong 0
+while lt off n bound 65536
+w = sub n off
+if gt w len qbuf
+w = len qbuf
+end
+if ne pread fd qbuf 0 w long add origin off long w
+qwfail 48
+end
+if ne mapwrite dev add devoff off qbuf 0 w long w
+qwfail 48
+end
+off = add off w
+end
+end
+
+fn qfdof id ulong to int
+ret int get qwfd ulong get qwfile id
+end
+
+fn qdense id ulong to ulong
+g = get qgoff id
+if ne g 0
+ret sub g 1
+end
+bytes = mul get qwcount id ulong get qwdtype id
+need = mul div add bytes 4095 4096 4096
+if gt need qdsize
+qwfail 49
+end
+a = get qdcur 0
+if gt add get qdused a need qdsize
+a = add a 1
+put qdcur 0 a
+end
+if ge a 8
+qwfail 49
+end
+h = get qdarena a
+if le h 0
+h = nvalloc qdsize true
+if le h 0
+qwfail 50
+end
+put qdarena a h
+end
+off = get qdused a
+qtransfer qfdof id get qwoff id bytes h off
+put qdused a add off need
+loc = or shl a 40 off
+put qgoff id add loc 1
+ret loc
+end
+
+fn qvictim to ulong
+total = get qecfg 1
+used = get qecfg 3
+if lt used total
+put qecfg 3 add used 1
+ret used
+end
+slot = ulong 0
+best = get qestamp 0
+for i ulong total
+if lt get qestamp i best
+best = get qestamp i
+slot = i
+end
+end
+old = ulong get qeown slot
+if eq old 0
+qwfail 49
+end
+put qemap sub old 1 0
+put qecfg 5 add get qecfg 5 1
+ret slot
+end
+
+fn qeput h long base ulong id ulong j ulong to void
+qtransfer qfdof id get qwoff id 1638400 h add base mul j 1638400
+sid = ulong get qscale id
+qtransfer qfdof sid get qwoff sid 200 h add add base 4915200 mul j 200
+end
+
+fn qefill layer ulong e ulong slot ulong to void
+a = div slot qeslots
+h = get qearena a
+if le h 0
+h = nvalloc mul qeslots qestride false
+if le h 0
+qwfail 50
+end
+put qearena a h
+end
+first = add add mul layer 1600 64 mul e 3
+for j ulong 3
+qeput h mul rem slot qeslots qestride ulong get qrole add first j j
+end
+end
+
+fn qexpert layer ulong e ulong to ulong
+key = add mul layer 512 e
+clock = add get qecfg 2 1
+put qecfg 2 clock
+s = ulong get qemap key
+if ne s 0
+put qestamp sub s 1 clock
+ret sub s 1
+end
+slot = qvictim
+qefill layer e slot
+put qemap key uint add slot 1
+put qeown slot uint add key 1
+put qestamp slot clock
+put qecfg 4 add get qecfg 4 1
+ret slot
+end
+
+fn qgpuopen to void
+if not lqopen
+qwfail 50
+end
+x = nvalloc 1048576 true
+if le x 0
+qwfail 50
+end
+put qxy 0 x
+y = nvalloc 1048576 true
+if le y 0
+qwfail 50
+end
+put qxy 1 y
+end
+
+fn qbf j ulong to f32
+a = mul j 2
+bits = or uint get qbuf a shl uint get qbuf add a 1 8
+ret bitcast f32 shl bits 16
+end
+
+note Round a binary32 value to the nearest BF16 value, ties to even, as the reference tensors store it.
+fn qrb x f32 to f32
+u = bitcast uint x
+a = and u 2139095040
+if eq a 2139095040
+ret x
+end
+ret bitcast f32 shl shr add add u 32767 and shr u 16 1 16 16
+end
+
+note Matrix products read their input from fin and leave BF16-rounded results in fout.
+global fin f32 10240
+global fout f32 248320
+fn qfillinput n ulong to void
+if gt n len fin
+qwfail 52
+end
+for j ulong n
+bits = bitcast uint get fin j
+if ne mapset get qxy 0 mul j 4 4 ulong bits 0
+qwfail 52
+end
+end
+end
+
+note One device product y[pos..pos+m] = W[m,k] x. W and its scale tiles lie in one mapping.
+note qmvarg: 0 mapping, 1 weight offset, 2 scale offset, 3 format, 4 rows, 5 columns.
+global qmvarg ulong 6
+fn qmv to void
+h = long get qmvarg 0
+fmt = uint get qmvarg 3
+m = uint get qmvarg 4
+k = uint get qmvarg 5
+if gt ulong m len fout
+qwfail 52
+end
+qfillinput ulong k
+sr = uint 0
+sc = uint 0
+put lqmap 0 h
+put lqoff 0 get qmvarg 1
+put lqlen 0 mul mul ulong m ulong k sub 2 ulong fmt
+put lqlen 1 0
+if eq fmt 1
+sr = add div sub m 1 128 1
+sc = add div sub k 1 128 1
+put lqmap 1 h
+put lqoff 1 get qmvarg 2
+put lqlen 1 mul mul ulong sr ulong sc 2
+end
+put lqmap 2 get qxy 0
+put lqmap 3 get qxy 1
+put lqoff 2 0
+put lqoff 3 0
+put lqlen 2 mul ulong k 4
+put lqlen 3 mul ulong m 4
+if not lqrun fmt m k sr sc
+qwfail 53
+end
+put qecfg 6 add get qecfg 6 1
+for j ulong ulong m
+bits = uint mapget get qxy 1 mul j 4 4
+put fout j qrb bitcast f32 bits
+end
+end
+
+note Host product with binary64 accumulation. Rows are read from the checkpoint in bounded batches.
+note qhs: 0 rows, 1 columns, 2 element bytes, 3 scale columns, 4 first row of the batch in qbuf.
+global qhscale f32 512
+global qhs ulong 5
+fn qhrow i ulong to f32
+k = get qhs 1
+base = mul i mul k get qhs 2
+acc = 0.0f64
+if eq get qhs 2 2
+base = div base 2
+for j ulong k
+acc = add acc mul f64 qbf add base j f64 get fin j
+end
+ret qrb f32 acc
+end
+tile = mul div add get qhs 4 i 128 get qhs 3
+for j ulong k
+wv = mul bitcast f32 lqbits uint get qbuf add base j get qhscale add tile div j 128
+acc = add acc mul f64 wv f64 get fin j
+end
+ret qrb f32 acc
+end
+
+fn qhscales id ulong to void
+put qhs 3 0
+sid = ulong get qscale id
+if eq sid 0
+ret
+end
+n = get qwcount sid
+if gt n 512
+qwfail 52
+end
+put qhs 3 get qwshape add mul sid 4 1
+qwread sid 0 n
+for j ulong n
+put qhscale j qbf j
+end
+end
+
+fn qhostmv id ulong to void
+m = get qwshape mul id 4
+k = get qwshape add mul id 4 1
+put qhs 0 m
+put qhs 1 k
+put qhs 2 ulong get qwdtype id
+if or gt m len fout gt k len fin
+qwfail 52
+end
+qhscales id
+per = div len qbuf mul k get qhs 2
+if eq per 0
+qwfail 52
+end
+r = ulong 0
+while lt r m bound 1048576
+nr = sub m r
+if gt nr per
+nr = per
+end
+qwread id mul r k mul nr k
+put qhs 4 r
+for i ulong nr
+put fout add r i qhrow i
+end
+r = add r nr
+end
+end
+
+fn fmat id ulong to void
+if eq get qecfg 0 1
+qhostmv id
+ret
+end
+if ne get qwdtype id 2
+qwfail 52
+end
+a = mul id 4
+loc = qdense id
+put qmvarg 0 ulong get qdarena shr loc 40
+put qmvarg 1 and loc 1099511627775
+put qmvarg 2 0
+put qmvarg 3 0
+put qmvarg 4 get qwshape a
+put qmvarg 5 get qwshape add a 1
+qmv
+end
+
+note Product with one matrix of a routed expert. The key is (layer * 512 + expert) * 4 + matrix (0 gate, 1 up, 2 down).
+fn fexpert key ulong to void
+j = rem key 4
+e = rem div key 4 512
+layer = div key 2048
+id = ulong get qrole add add mul layer 1600 64 add mul e 3 j
+if eq get qecfg 0 1
+qhostmv id
+ret
+end
+slot = qexpert layer e
+h = get qearena div slot qeslots
+base = mul rem slot qeslots qestride
+a = mul id 4
+put qmvarg 0 ulong h
+put qmvarg 1 add base mul j 1638400
+put qmvarg 2 add add base 4915200 mul j 200
+put qmvarg 3 1
+put qmvarg 4 get qwshape a
+put qmvarg 5 get qwshape add a 1
+qmv
+end
