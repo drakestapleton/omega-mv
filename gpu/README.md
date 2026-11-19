@@ -19,6 +19,9 @@ as not yet Omega. Only the AMD back end has moved so far; NVIDIA and the rest ar
 | `gpu/<vendor>/card.tsv` | The bytes the receipts record, written once from the receipts it names: what ran on hardware, and host-built references marked as such. |
 | `gpu/<vendor>/import/` | How the back end came here: the filter-repo command and its commit map. |
 | `gpu/targets.om` | The shared target table and code-object loader checks. |
+| `gpu/driver/` | Pure-Omega GB10 VFIO/GSP GPU driver moved from `omega-gpu-driver` (`81b579e4c371`, 88 `.om` files; import record `gpu/import/omega-gpu-driver/`). |
+| `gpu/cuda-crack/` | Pure-Omega sm_121 ISA table generator and reencoder moved from `cuda-crack` (`8efa1bb3f4cf`, 3 `.om` files; import record `gpu/import/cuda-crack/`). |
+| `gpu/extra-units.tsv`, `gpu/extra-units-gate.om` | Compile-reproducibility gate (`OMEGA-GPU-EXTRA-UNITS`, 11 units) for `gpu/driver/` and `gpu/cuda-crack/`, kept separate so `gpu/units.tsv` (405 units, `OMEGA-GPU-UNITS`) stays unchanged. |
 
 A moved back end keeps the history of its Omega files: `git log --follow gpu/amd/gfx942/hsaco.om` shows
 its CUDApp commits. To find the new commit for a CUDApp commit, look it up in

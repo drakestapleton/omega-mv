@@ -9,6 +9,9 @@ The OS layer is moving here from Aienux (`https://interplane.io/drakestapleton/a
 | Path | Contents |
 | --- | --- |
 | `aienux/net/tcp/` | Native TCP/IPv4/ARP/Ethernet stack (`tcp.om`, `tcpd.om`, `link.om`, `peer.om`, `corpus.om`). |
+| `aienux/net/rtl8127/` | Native RTL8127 Ethernet driver (`rtl8127-omega`, `f53059a181a2`). |
+| `aienux/supervisor/` | Native OS service supervisor replacing systemd (`spark-supervisor`, `60c0c046b629`). |
+| `aienux/connector/` | Sovereign verification connector and runner (`spark-connector`, `f9b6d0b500d7`). |
 | `aienux/disk/` | Native NVMe protocol engine, transport, CLI and test drivers (`omega_nvme*.om`). |
 | `aienux/allen/` | Pure-Omega bare-metal UEFI graphical UI (`surface.om`, `paint.om`, `font*.om`, `look-*.om`, `scene*.om`, `efi-main.om`), bare-metal TCP/TLS/HTTP (`net.om`, `http.om`, `tls*.om`), runtime/memory/session/courier/intent/application, and `.om` test suites. |
 | `aienux/platform/` | Platform telemetry and readback units (`readback.om`, `unit.om`). |

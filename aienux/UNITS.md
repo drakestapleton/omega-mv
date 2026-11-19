@@ -16,15 +16,12 @@ One additional 1-line Omega directive file, `aienux/allen/target-x86efi.om` (`ta
 
 ## The units and their gate
 
-`aienux/units.tsv` lists 48 units (`NAME` followed by ordered `.om` parts, single spaces):
+`aienux/units.tsv` lists **67 units** (`NAME` followed by ordered `.om` parts, single spaces):
 
-- 4 TCP units (`tcp_tcpd`, `tcp_corpus`, `tcp_link`, `tcp_peer`)
-- 4 NVMe units (`nvme_main`, `nvme_probe`, `nvme_adminwrap`, `nvme_failstop`)
-- 4 x86-64 kernel units (`x86_llama`, `x86_arithmetic`, `x86_system`, `x86_text`)
-- 1 Llama-1B unit (`lm1b`)
-- 1 platform unit (`platform_unit`)
-- 3 tool units (`spark_image`, `imac_image`, `hwgates`)
-- 31 Allen units (`allen_fw` for `target x86efi`, `allen_main`, `allen_provider`, `allen_stdio_overflow`, and 27 `allen_test_*` suites from `native/omega/allen/gate.sh`)
+- 48 core Aienux units (`tcp_*` 4, `nvme_*` 4, `x86_*` 4, `lm1b` 1, `platform_unit` 1, `spark_image`/`imac_image`/`hwgates` 3, `allen_fw` `target x86efi` + `allen_main` + `allen_provider` + `allen_stdio_overflow` + 27 `allen_test_*` = 31)
+- 19 OS-layer sibling units from `rtl8127-omega` (`rtl8127_probe`, `rtl8127_driver`), `spark-supervisor` (`aien_supervise`, `aien_supervise_root`, `aien_watch`, `supervisor_tests_load`), and `spark-connector` (`connector_signer`, `connector_celldrv`, plus 11 standalone gate/runner units).
+
+Remaining non-Omega files from the three OS sibling repos (64 files) are listed in `aienux/NOT-YET-OMEGA-EXTRAS.tsv`; their import records are under `aienux/import/{rtl8127-omega,spark-supervisor,spark-connector}/`.
 
 `aienux/units-gate.om` (`OMEGA-AIENUX-UNITS`) mirrors `gpu/units-gate.om`: it refuses any compiler whose SHA-256 differs from `seed/out/omc.sha256` (exit 69), composes each row in `aienux/units.tsv`, compiles it twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Every hardware row stays `NOT_RUN`.
 
