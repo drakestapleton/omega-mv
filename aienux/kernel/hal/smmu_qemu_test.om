@@ -8,7 +8,11 @@ note   3. smmu_map_span one 8 KiB Normal-NC buffer (VA == PA stage-1 tables) and
 note      RAM -> device -> RAM through it: the bytes must round-trip (mapped DMA succeeds).
 note   4. edu DMA device -> an UNMAPPED page: the page must stay untouched and the EVENTQ must hold an
 note      F_TRANSLATION (0x10) record whose StreamID and InputAddr match (unmapped DMA faults + is recorded).
-note   5. smmu_map_span_wb (CCA from IORT) + an extra TLBI + CMD_SYNC must complete.
+note   5. smmu_map_span_wb on frames_alloc (CPU Normal-WB) RAM: refused under a TEST-ONLY mock CCA=0, then
+note      mapped with the real IORT CCA=1 and an edu device -> RAM DMA must land in it.
+note   6. CMDQ in-flight limit: a 15th non-SYNC command is refused, the SYNC fails closed, the queue recovers.
+note   7. Failed open (mode 1): CMDQ pre-filled so the open's CFGI is refused -> SMMU_ECMDERR; the STE written
+note      to memory must be invalidated (word 0 == 0), the slot not live, and a retry of the same RID succeeds.
 note Prints SMMU_QEMU_PASS or SMMU_QEMU_FAIL step=N, then PSCI SYSTEM_RESET (QEMU -no-reboot exits).
 note QEMU-only: never run on Spark silicon (no edu device; refuses anything but vendor 0x1234/0x11e8).
 
@@ -33,10 +37,11 @@ text sq_okdma "SMMUQ_MAPPED_DMA_OK bytes="
 text sq_evt "SMMUQ_FAULT type=0x"
 text sq_esid " sid=0x"
 text sq_eaddr " addr=0x"
-text sq_pass "SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete wb=ok cmdq_limit=ok\n"
+text sq_pass "SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete wb=ok cmdq_limit=ok failopen=teardown\n"
 text sq_wbmock "SMMUQ_WB_MOCK_CCA0_REFUSED (test-only: stream CCA forced to 0)\n"
 text sq_wbok "SMMUQ_WB_DMA_OK frames_alloc WB page, IORT CCA=1, bytes="
 text sq_qlim "SMMUQ_CMDQ_LIMIT_OK refused=15th recovered=yes\n"
+text sq_fo "SMMUQ_FAILOPEN_TEARDOWN_OK rid=0x10 ecmderr=yes ste_invalidated=yes retry=ok\n"
 text sq_fail "SMMU_QEMU_FAIL step="
 text sq_nl "\n"
 
@@ -383,6 +388,52 @@ uart_puts sq_qlim
 ret 0
 end
 
+note Word 0 of the in-memory STE for sid on instance 0 (0 when no L2 table exists yet).
+fn sq_ste_w0 sid ulong to ulong
+d = arm64_mmio_r64 add get smmu_inst_strtab 0 mul shr sid SMMU_STRTAB_SPLIT 8
+if eq d 0
+ret 0
+end
+ret arm64_mmio_r64 add and d SMMU_L2PTR_MASK mul and sid 63 64
+end
+
+note Mode-1 failed open: 14 un-issued commands make the open's CFGI_STE over-limit, so its CMD_SYNC fails
+note (SMMU_ECMDERR) after the STE was already written to memory. The teardown must invalidate that STE,
+note leave the slot unused and the instance up, and a retry of the same RID must succeed.
+fn sq_failopen to ulong
+cd = dma_alloc_nc 1 4096
+tt = dma_alloc_nc 1 4096
+if or eq cd 0 eq tt 0
+ret 70
+end
+n0 = get smmu_str_n 0
+for k ulong 14
+smmu_cmd_push 0 SMMU_CMD_TLBI_NSNH_ALL 0
+end
+r = smmu_open_stream 0 0x0010 cd tt
+if ne r SMMU_ECMDERR
+sq_die 71 ulong sub 0 r
+end
+sid = get iort_qres 3
+if or ne get smmu_str_n 0 n0 ne get smmu_str_live n0 0
+ret 72
+end
+if ne sq_ste_w0 sid 0
+ret 73
+end
+if ne get smmu_inst_state 0 1
+ret 74
+end
+if le smmu_open_stream 0 0x0010 cd tt 0
+ret 75
+end
+if eq and sq_ste_w0 sid 1 0
+ret 76
+end
+uart_puts sq_fo
+ret 0
+end
+
 fn el1main el1_arg ulong to void
 uart_puts sq_hdr
 bmmio_reset
@@ -428,6 +479,10 @@ end
 q = sq_qlimit
 if ne q 0
 sq_die q 0
+end
+fo = sq_failopen
+if ne fo 0
+sq_die fo 0
 end
 uart_puts sq_pass
 sq_halt

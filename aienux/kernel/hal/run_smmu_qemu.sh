@@ -49,5 +49,6 @@ grep -q 'SMMUQ_FAULT type=0x0000000000000010' "$TMP/qemu.log" || grep -q 'SMMUQ_
 grep -q 'SMMUQ_WB_MOCK_CCA0_REFUSED' "$TMP/qemu.log"
 grep -q 'SMMUQ_WB_DMA_OK' "$TMP/qemu.log"
 grep -q 'SMMUQ_CMDQ_LIMIT_OK' "$TMP/qemu.log"
-grep -q 'SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete wb=ok cmdq_limit=ok' "$TMP/qemu.log"
-echo "PASS smmu_qemu_edu (mode-1 SMMUv3: mapped NC DMA ok, unmapped DMA -> EVENTQ F_TRANSLATION, CMD_SYNC complete, WB DMA on real WB RAM + mock CCA=0 refusal, CMDQ 15-pending limit)"
+grep -q 'SMMUQ_FAILOPEN_TEARDOWN_OK' "$TMP/qemu.log"
+grep -q 'SMMU_QEMU_PASS mapped_dma=ok unmapped_dma=F_TRANSLATION evtq=recorded cmd_sync=complete wb=ok cmdq_limit=ok failopen=teardown' "$TMP/qemu.log"
+echo "PASS smmu_qemu_edu (mode-1 SMMUv3: mapped NC DMA ok, unmapped DMA -> EVENTQ F_TRANSLATION, CMD_SYNC complete, WB DMA on real WB RAM + mock CCA=0 refusal, CMDQ 15-pending limit, failed-open STE teardown)"

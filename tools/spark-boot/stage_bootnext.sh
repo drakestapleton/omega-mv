@@ -373,6 +373,16 @@ ORIG_0001_SHA="$4"
 cleanup() { rm -rf "$RDIR"; }
 trap cleanup EXIT
 
+# Error-path BootNext clear: report the real outcome (never claim success that did not happen).
+clear_bootnext() {
+  if sudo -n efibootmgr -N >/dev/null 2>&1; then
+    echo "           BootNext cleared (efibootmgr -N succeeded)." >&2
+  else
+    echo "           BootNext clear FAILED: a one-shot BootNext may still be armed." >&2
+    echo "           At the console run: sudo efibootmgr -N   and verify with: efibootmgr -v" >&2
+  fi
+}
+
 GOT_SHA=$(sha256sum "$RTMP" | awk '{print $1}')
 if [ "$GOT_SHA" != "$WANT_SHA" ]; then
   echo "FAIL: transferred SPARK.EFI SHA-256 mismatch (got=$GOT_SHA want=$WANT_SHA)" >&2
@@ -436,19 +446,19 @@ if [ "$POST_ORDER" != "$ORIG_ORDER" ]; then
   echo "EMERGENCY: BootOrder changed from $ORIG_ORDER to $POST_ORDER; clearing BootNext only." >&2
   echo "           BootOrder was NOT rewritten. Inspect at the console; to restore manually:" >&2
   echo "             sudo efibootmgr -o $ORIG_ORDER" >&2
-  sudo -n efibootmgr -N >/dev/null || true
+  clear_bootnext
   exit 1
 fi
 
 if [ "$POST_NEXT" != "$BOOTNUM" ]; then
   echo "FAIL: BootNext verification failed (got=$POST_NEXT want=$BOOTNUM)" >&2
-  sudo -n efibootmgr -N >/dev/null || true
+  clear_bootnext
   exit 1
 fi
 
 if [ "$POST_0001_SHA" != "$ORIG_0001_SHA" ]; then
-  echo "FAIL: Boot0001 changed after staging (sha got=$POST_0001_SHA want=$ORIG_0001_SHA); clearing BootNext!" >&2
-  sudo -n efibootmgr -N >/dev/null || true
+  echo "FAIL: Boot0001 changed after staging (sha got=$POST_0001_SHA want=$ORIG_0001_SHA); clearing BootNext." >&2
+  clear_bootnext
   exit 1
 fi
 

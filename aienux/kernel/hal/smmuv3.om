@@ -569,6 +569,7 @@ z = bmmio_w32 h SMMU_REG_EVTQ_PROD 0
 z = bmmio_w32 h SMMU_REG_EVTQ_CONS 0
 put smmu_inst_cmd_prod inst 0
 put smmu_inst_hwprod inst 0
+put smmu_inst_qerr inst 0
 cpufence
 end
 
@@ -879,12 +880,13 @@ smmu_hw_put_ste ste base
 ret SMMU_OK
 end
 
-note Mode 1: invalidate the STE for sid (word 0 / V first), then CFGI_STE + TLBI + SYNC (best effort).
-fn smmu_hw_clear_ste inst ulong sid ulong to void
+note Mode 1: invalidate the STE for sid (word 0 / V first), then CFGI_STE + TLBI + SYNC.
+note Returns false only if the invalidation could not be confirmed by CMD_SYNC.
+fn smmu_hw_clear_ste inst ulong sid ulong to bool
 l1 = add get smmu_inst_strtab inst mul shr sid SMMU_STRTAB_SPLIT 8
 d = smmu_mr l1
 if eq d 0
-ret
+ret true
 end
 ste = add and d SMMU_L2PTR_MASK mul and sid sub shl ulong 1 SMMU_STRTAB_SPLIT 1 64
 for w ulong 8
@@ -893,13 +895,22 @@ end
 cpufence
 smmu_cmd_push inst or SMMU_CMD_CFGI_STE shl sid 32 0
 smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
-z = smmu_cmd_sync inst
+ret eq smmu_cmd_sync inst SMMU_OK
 end
 
-note Error-path teardown for a partially opened stream slot n: remove every span of the slot (RMR spans
-note included) and its stage-1 descriptors, clear the slot's CD/STE words, and in mode 1 invalidate the
-note STE. Leaves the slot not live so the error code returned by smmu_open_stream is the whole outcome.
-fn smmu_abandon_stream n ulong inst ulong sid ulong to void
+note Error-path teardown for a partially opened stream slot n. Mode 1 first invalidates the STE (V=0,
+note CFGI_STE + TLBI + SYNC) and only then clears the CD and the slot's stage-1 descriptors; if that
+note invalidation cannot be confirmed the SMMU may still hold a cached valid STE, so the whole instance
+note is taken down (smmu_inst_state 0: every later open/bring-up on it is refused -> fail closed).
+note Then every span of the slot (RMR spans included) is dropped and the slot's CD/STE words are zeroed.
+note Page-table pool pages are not returned (bump allocator).
+fn smmu_abandon_stream n ulong inst ulong sid ulong cd_pa ulong to void
+if smmu_hw
+if not smmu_hw_clear_ste inst sid
+put smmu_inst_state inst 0
+end
+smmu_zero cd_pa 64
+end
 for k ulong SMMU_MAX_SPANS
 if ne get smmu_sp_live k 0
 if eq get smmu_sp_stream k n
@@ -915,9 +926,6 @@ base = mul n 8
 for w ulong 8
 put smmu_ste_words add base w 0
 put smmu_cd_words add base w 0
-end
-if smmu_hw
-smmu_hw_clear_ste inst sid
 end
 put smmu_str_live n 0
 put smmu_str_ttbr n 0
@@ -978,14 +986,14 @@ smmu_zero cd_pa 64
 end
 rr = smmu_map_rmrs n inst sid
 if ne rr SMMU_OK
-smmu_abandon_stream n inst sid
+smmu_abandon_stream n inst sid cd_pa
 ret rr
 end
 smmu_encode_ste_cd n cd_pa ttbr0_pa
 if smmu_hw
 wr = smmu_hw_write_ste inst sid n cd_pa
 if ne wr SMMU_OK
-smmu_abandon_stream n inst sid
+smmu_abandon_stream n inst sid cd_pa
 ret wr
 end
 end
@@ -1006,7 +1014,7 @@ smmu_cmd_push inst SMMU_CMD_TLBI_NSNH_ALL 0
 sr = smmu_cmd_sync inst
 if ne sr SMMU_OK
 put smmu_str_n 0 n
-smmu_abandon_stream n inst sid
+smmu_abandon_stream n inst sid cd_pa
 ret sr
 end
 ret long add n 1

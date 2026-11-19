@@ -48,7 +48,7 @@ echo "efibootmgr $*" >> "$STUB_LOG"
 case "${1:-}" in
   --create-only) HAS=1 ;;
   --bootnext) NEXT=$2; [ "${STUB_MUTATE_ORDER:-0}" = 1 ] && ORDER="0002,$ORDER" ;;
-  -N) NEXT= ;;
+  -N) [ "${STUB_FAIL_CLEAR:-0}" = 1 ] && { echo "stub: -N refused" >&2; exit 1; }; NEXT= ;;
   -o) ORDER=$2 ;;
 esac
 printf 'ORDER=%s\nNEXT=%s\nHAS=%s\n' "$ORDER" "$NEXT" "$HAS" > "$STUB_ROOT/efi.state"
@@ -131,10 +131,18 @@ if run t5_apply_order_changed_no_rewrite 1 536870912 1 --apply --i-am-at-the-con
   elif ! grep -q 'efibootmgr -N' "$STUB_LOG"; then bad t5_apply_order_changed_no_rewrite "BootNext not cleared"
   elif ! grep -q '^NEXT=$' "$STUB_ROOT/efi.state"; then bad t5_apply_order_changed_no_rewrite "BootNext still set"
   elif ! grep -q 'BootOrder was NOT rewritten' "$T/out"; then bad t5_apply_order_changed_no_rewrite "missing operator notice"
+  elif ! grep -q 'BootNext cleared (efibootmgr -N succeeded)' "$T/out"; then bad t5_apply_order_changed_no_rewrite "clear result not reported"
   else ok t5_apply_order_changed_no_rewrite; fi
 fi
+if STUB_FAIL_CLEAR=1 run t7_apply_clear_failure_reported 1 536870912 1 --apply --i-am-at-the-console; then
+  if grep -q 'efibootmgr -o' "$STUB_LOG"; then bad t7_apply_clear_failure_reported "BootOrder rewritten"
+  elif grep -q 'BootNext cleared' "$T/out"; then bad t7_apply_clear_failure_reported "claimed a clear that failed"
+  elif ! grep -q 'BootNext clear FAILED' "$T/out"; then bad t7_apply_clear_failure_reported "failure not reported"
+  else ok t7_apply_clear_failure_reported; fi
+fi
+unset STUB_FAIL_CLEAR # POSIX sh may keep a prefix assignment on a function call
 if run t6_apply_requires_console 2 536870912 0 --apply; then
   if [ -s "$STUB_LOG" ]; then bad t6_apply_requires_console "touched stubs"; else ok t6_apply_requires_console; fi
 fi
 if [ "$fails" -ne 0 ]; then echo "STAGE_BOOTNEXT_TEST_FAIL failed=$fails"; exit 1; fi
-echo "STAGE_BOOTNEXT_TEST_PASS total=10 failed=0"
+echo "STAGE_BOOTNEXT_TEST_PASS total=11 failed=0"

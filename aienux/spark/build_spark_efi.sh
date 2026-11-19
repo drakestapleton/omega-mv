@@ -22,6 +22,18 @@ if [ "$PLAT" != "gb10" ] && [ "$(basename "$OUT")" = "SPARK.EFI" ]; then
   echo "FAIL: PLAT=$PLAT is a test profile; refusing to write it as SPARK.EFI" >&2
   exit 1
 fi
+# Gate-only negative controls may substitute a modified test profile. Never for the production profile.
+if [ -n "${PLAT_OM_OVERRIDE:-}" ]; then
+  if [ "$PLAT" = "gb10" ]; then
+    echo "FAIL: PLAT_OM_OVERRIDE is refused for PLAT=gb10 (production profile)" >&2
+    exit 1
+  fi
+  if [ ! -f "$PLAT_OM_OVERRIDE" ]; then
+    echo "FAIL: PLAT_OM_OVERRIDE=$PLAT_OM_OVERRIDE not found" >&2
+    exit 1
+  fi
+  PLAT_OM="$PLAT_OM_OVERRIDE"
+fi
 if [ ! -x "$OMC" ]; then
   echo "FAIL: omc compiler not executable at $OMC (set OMC=/path/to/omc)" >&2
   exit 1
