@@ -1,0 +1,144 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/smp.om: Pure-Omega 20-core Grace SMP bring-up via PSCI CPU_ON (0xC4000003).
+note Supports up to SMP_MAX=64 cores (removes C reference's 16-core cap!).
+note Cleans page tables + per-core SmpBootBlock to PoC (DC CVAC + DSB SY) before PSCI CPU_ON.
+note Secondary cores drop EL2 -> EL1h with shared TTBR0_EL1, init per-core GICR, check in via STLR + DSB ISH + SEV.
+
+const SMP_MAX ulong 64
+const SMP_STACK_PAGES ulong 4
+const SMP_TIMEOUT_MS ulong 5000
+const SMP_IDLE ulong 0
+const SMP_ON_CALLED ulong 1
+const SMP_CHECKED_IN ulong 2
+
+note Per-core SmpBootBlock: 16 u64s (128 bytes, cacheline-aligned) per core:
+note   [0]root [1]mair [2]tcr [3]sctlr [4]sp_top [5]entry(smpmain) [6]core_idx [7]stack_floor
+note   [8]bss_base(X27) [9]target_mpidr [10]state(atomic) [11]seen_mpidr [12]seen_el [13]seen_sctlr [14]seen_ttbr0 [15]gic_ok
+global smp_blocks uchar 8192
+note smp_stats: 0=online_count, 1=expected_count, 2=failed_count
+global smp_stats ulong 4
+
+fn smp_blk_pa idx ulong fld ulong to ulong
+off = add mul idx 128 mul fld 8
+ret fwadr smp_blocks off 8
+end
+
+fn smp_blk_get idx ulong fld ulong to ulong
+ret fwld smp_blk_pa idx fld 8
+end
+
+fn smp_blk_put idx ulong fld ulong v ulong to void
+x = fwst smp_blk_pa idx fld 8 v
+end
+
+note smpmain: executed on each secondary core at EL1h with MMU on, shared TTBR0_EL1, own 16 KiB stack.
+fn smpmain idx ulong to void
+gok = ulong 0
+if gicv3_init_cpu
+gok = ulong 1
+end
+smp_blk_put idx 11 arm64_mpidr_aff
+smp_blk_put idx 12 arm64_current_el
+smp_blk_put idx 13 arm64_sysrd SYSREG_SCTLR_EL1
+smp_blk_put idx 14 and arm64_sysrd SYSREG_TTBR0_EL1 0x0000fffffffffffe
+smp_blk_put idx 15 gok
+arm64_stlr smp_blk_pa idx 10 SMP_CHECKED_IN
+arm64_dsb_ish
+arm64_sev
+note Park secondary core in WFE with DAIF masked until scheduler work is dispatched.
+i = ulong 0
+while lt i 9223372036854775807 bound 9223372036854775807
+arm64_wfe
+end
+end
+
+fn smp_start_one i ulong mpidr ulong conduit ulong to bool
+stk = frames_alloc SMP_STACK_PAGES MMU_PAGE FR_PA_40BIT_LIMIT
+if eq stk 0
+ret false
+end
+smp_blk_put i 0 get mmu_state 0
+smp_blk_put i 1 MMU_MAIR_EL1
+smp_blk_put i 2 get mmu_state 2
+smp_blk_put i 3 get mmu_state 3
+smp_blk_put i 4 add stk mul SMP_STACK_PAGES MMU_PAGE
+smp_blk_put i 5 arm64_meta 5
+smp_blk_put i 6 i
+smp_blk_put i 7 add stk 4096
+smp_blk_put i 8 arm64_meta 1
+smp_blk_put i 9 mpidr
+smp_blk_put i 10 SMP_ON_CALLED
+bpa = smp_blk_pa i 0
+arm64_dc_cvac_range bpa 128
+rc = arm64_psci_cpu_on conduit mpidr arm64_meta 6 bpa
+if ne rc 0
+smp_blk_put i 10 SMP_IDLE
+ret false
+end
+ret true
+end
+
+note Bring up all secondary cores listed in ACPI MADT (acpi_cpu_mpidr[0..ncpus)).
+note Returns number of online cores (including boot core).
+fn smp_bringup to ulong
+conduit = get acpi_info 7
+ncpus = get acpi_info 6
+if gt ncpus SMP_MAX
+ncpus = SMP_MAX
+end
+put smp_stats 0 1
+put smp_stats 1 ncpus
+put smp_stats 2 0
+if or le ncpus 1 eq conduit PSCI_CONDUIT_NONE
+ret 1
+end
+if or eq arm64_meta 6 0 eq arm64_meta 5 0
+put smp_stats 2 sub ncpus 1
+ret 1
+end
+boot_mpidr = arm64_mpidr_aff
+note Clean all live page-table frames to PoC once before starting secondaries.
+mmu_clean_tables_poc
+i = ulong 0
+while lt i ncpus bound 64
+mpidr = get acpi_cpu_mpidr i
+if ne mpidr boot_mpidr
+if not smp_start_one i mpidr conduit
+put smp_stats 2 add get smp_stats 2 1
+end
+end
+i = add i 1
+end
+note Wait up to SMP_TIMEOUT_MS (overflow-safe CNTVCT_EL0 deadline) for all started cores to check in.
+deadline = arm64_deadline_ticks SMP_TIMEOUT_MS
+i = ulong 0
+while lt i ncpus bound 64
+st = smp_blk_get i 10
+if eq st SMP_ON_CALLED
+spa = smp_blk_pa i 10
+done = false
+w = ulong 0
+while and not done lt w 100000000 bound 100000000
+if eq arm64_ldar spa SMP_CHECKED_IN
+done = true
+else
+if ge fwsys 2 deadline
+break
+end
+end
+w = add w 1
+end
+if done
+put smp_stats 0 add get smp_stats 0 1
+else
+put smp_stats 2 add get smp_stats 2 1
+end
+else
+if eq st SMP_CHECKED_IN
+put smp_stats 0 add get smp_stats 0 1
+end
+end
+i = add i 1
+end
+ret get smp_stats 0
+end

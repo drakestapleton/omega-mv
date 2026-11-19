@@ -1,0 +1,270 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/frames.om: Pure-Omega 121.69+ GiB unified LPDDR5x interval frame allocator
+note + pre-carved Normal-NC DMA pool allocator (ported from aienux-macbook@5e0c797:mm/frames.c).
+note Ingests ONLY EfiConventionalMemory (type 7) and reserves all non-conventional regions,
+note image, UEFI memory map, ACPI tables, Normal-NC DMA pool, and GB10 IORT RMR carveouts.
+
+const FR_PAGE ulong 4096
+const FR_MAX_RANGES ulong 256
+const FR_EFI_CONVENTIONAL ulong 7
+const FR_PA_40BIT_LIMIT ulong 0x0000010000000000
+
+note fr_meta: 0=count, 1=dropped, 2=total_pages_ingested, 3=nc_base, 4=nc_cur, 5=nc_end
+global fr_meta ulong 8
+global fr_base ulong 256
+global fr_end ulong 256
+
+fn fr_align_up v ulong a ulong to ulong
+m = sub a 1
+ret and add v m xor 0xffffffffffffffff m
+end
+
+fn fr_align_down v ulong a ulong to ulong
+m = sub a 1
+ret and v xor 0xffffffffffffffff m
+end
+
+fn frames_init to void
+for i ulong 8
+put fr_meta i 0
+end
+for j ulong 256
+put fr_base j 0
+put fr_end j 0
+end
+end
+
+fn fr_insert_at idx ulong b ulong e ulong to int
+n = get fr_meta 0
+if ge n FR_MAX_RANGES
+put fr_meta 1 add get fr_meta 1 1
+ret -1
+end
+j = n
+while gt j idx bound 256
+put fr_base j get fr_base sub j 1
+put fr_end j get fr_end sub j 1
+j = sub j 1
+end
+put fr_base idx b
+put fr_end idx e
+put fr_meta 0 add n 1
+ret 0
+end
+
+fn fr_remove_at idx ulong to void
+n = get fr_meta 0
+j = idx
+while lt add j 1 n bound 256
+put fr_base j get fr_base add j 1
+put fr_end j get fr_end add j 1
+j = add j 1
+end
+put fr_meta 0 sub n 1
+end
+
+fn frames_reserve base ulong end_pa ulong to void
+b = fr_align_down base FR_PAGE
+e = fr_align_up end_pa FR_PAGE
+if le e b
+ret
+end
+i = ulong 0
+while lt i get fr_meta 0 bound 512
+rb = get fr_base i
+re = get fr_end i
+if or le re b ge rb e
+i = add i 1
+else
+if and ge rb b le re e
+fr_remove_at i
+else
+if and lt rb b gt re e
+put fr_end i b
+rc = fr_insert_at add i 1 e re
+if ne rc 0
+ret
+end
+i = add i 2
+else
+if lt rb b
+put fr_end i b
+else
+put fr_base i e
+end
+i = add i 1
+end
+end
+end
+end
+end
+
+fn frames_add base ulong end_pa ulong to int
+b = fr_align_up base FR_PAGE
+e = fr_align_down end_pa FR_PAGE
+if le e b
+ret 0
+end
+frames_reserve b e
+n = get fr_meta 0
+i = ulong 0
+while lt i n bound 256
+if ge get fr_base i b
+break
+end
+i = add i 1
+end
+if gt i 0
+if eq get fr_end sub i 1 b
+put fr_end sub i 1 e
+if lt i n
+if eq get fr_base i e
+put fr_end sub i 1 get fr_end i
+fr_remove_at i
+end
+end
+ret 0
+end
+end
+if lt i n
+if eq get fr_base i e
+put fr_base i b
+ret 0
+end
+end
+ret fr_insert_at i b e
+end
+
+note Allocate pages * 4 KiB aligned to align (power of 2, >= 4096) with end <= max_pa (0 = no cap).
+note Returns physical base address, or 0 on failure (never returns page 0).
+fn frames_alloc pages ulong align ulong max_pa ulong to ulong
+if eq pages 0
+ret 0
+end
+a = align
+if lt a FR_PAGE
+a = FR_PAGE
+end
+bytes = mul pages FR_PAGE
+n = get fr_meta 0
+i = ulong 0
+while lt i n bound 256
+rb = get fr_base i
+re = get fr_end i
+cand = fr_align_up rb a
+if eq cand 0
+cand = a
+end
+if lt cand re
+if le bytes sub re cand
+cend = add cand bytes
+ok_cap = true
+if ne max_pa 0
+if gt cend max_pa
+ok_cap = false
+end
+end
+if ok_cap
+frames_reserve cand cend
+ret cand
+end
+end
+end
+i = add i 1
+end
+ret 0
+end
+
+fn frames_free_bytes to ulong
+total = ulong 0
+n = get fr_meta 0
+i = ulong 0
+while lt i n bound 256
+total = add total sub get fr_end i get fr_base i
+i = add i 1
+end
+ret total
+end
+
+fn frames_region_count to ulong
+ret get fr_meta 0
+end
+
+note Pre-carved Normal-NC DMA pool (registered before SCTLR_EL1.M=1).
+fn dma_pool_init base ulong length ulong to void
+put fr_meta 3 base
+put fr_meta 4 base
+put fr_meta 5 add base length
+end
+
+fn dma_pool_base to ulong
+ret get fr_meta 3
+end
+
+fn dma_pool_size to ulong
+ret sub get fr_meta 5 get fr_meta 3
+end
+
+note Allocate from the pre-carved Normal-NC DMA pool (aligned to align, >= 4096). Returns PA or 0.
+fn dma_alloc_nc pages ulong align ulong to ulong
+if eq pages 0
+ret 0
+end
+a = align
+if lt a FR_PAGE
+a = FR_PAGE
+end
+cur = fr_align_up get fr_meta 4 a
+bytes = mul pages FR_PAGE
+limit = get fr_meta 5
+if or eq cur 0 gt cur limit
+ret 0
+end
+if gt bytes sub limit cur
+ret 0
+end
+put fr_meta 4 add cur bytes
+ret cur
+end
+
+note Ingest UEFI memory map from raw physical buffer (map_pa, map_size, desc_size).
+note Only type 7 (EfiConventionalMemory) is added; page 0 is always reserved; all non-7 types are reserved.
+fn frames_ingest_efi_raw map_pa ulong map_size ulong desc_size ulong to ulong
+if or eq map_pa 0 or lt desc_size 40 eq map_size 0
+ret 0
+end
+cnt = ulong 0
+off = ulong 0
+while le add off desc_size map_size bound 4096
+d = add map_pa off
+mtype = fwld d 4
+pstart = fwld add d 8 8
+npages = fwld add d 24 8
+if gt npages 0
+bytes = mul npages FR_PAGE
+pend = add pstart bytes
+if eq mtype FR_EFI_CONVENTIONAL
+rc = frames_add pstart pend
+if eq rc 0
+cnt = add cnt npages
+end
+end
+end
+off = add off desc_size
+end
+note Second pass: explicitly reserve every non-EfiConventionalMemory descriptor + page 0.
+frames_reserve 0 FR_PAGE
+off = ulong 0
+while le add off desc_size map_size bound 4096
+d = add map_pa off
+mtype = fwld d 4
+pstart = fwld add d 8 8
+npages = fwld add d 24 8
+if and gt npages 0 ne mtype FR_EFI_CONVENTIONAL
+frames_reserve pstart add pstart mul npages FR_PAGE
+end
+off = add off desc_size
+end
+put fr_meta 2 cnt
+ret cnt
+end

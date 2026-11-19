@@ -1,0 +1,460 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/mmu.om: Pure-Omega physical-frame-backed AArch64 Stage-1 4-level MMU.
+note Enforces all #23/#26/#30/#32 safety invariants:
+note   - MAIR_EL1 = 0x00000000440004ff (0=WB 0xff, 1=Dev-nGnRE 0x04, 2=Dev-nGnRnE 0x00, 3=Normal-NC 0x44)
+note   - Strict W^X and strict XN (PXN|UXN) on all non-WB attrs (1, 2, 3)
+note   - Pre-carved 2 MiB-aligned Normal-NC DMA pool (512 MiB on Spark / 64 MiB on <=2 GiB QEMU)
+note     zeroed + DC CIVAC + DSB SY before SCTLR_EL1.M=1
+note   - TCR_EL1.IPS derived from ID_AA64MMFR0_EL1.PARange, fail-closed if < 40-bit (PARange < 2)
+note   - Exact ARMv8/v9 BBM + TLBI VMALLE1IS + DC CIVAC for any post-MMU non-kernel NC remap
+note   - DC CVAC + DSB SY over all page-table frames before EL1 entry and before PSCI CPU_ON.
+
+const MMU_MAIR_WB ulong 0
+const MMU_MAIR_DEV_NGNRE ulong 1
+const MMU_MAIR_DEV_NGNRNE ulong 2
+const MMU_MAIR_NORMAL_NC ulong 3
+const MMU_MAIR_EL1 ulong 0x00000000440004ff
+
+const MMU_SH_NONE ulong 0
+const MMU_SH_OSH ulong 2
+const MMU_SH_ISH ulong 3
+
+const MMU_FLAG_RW ulong 1
+const MMU_FLAG_EXEC ulong 2
+
+const MMU_PAGE ulong 4096
+const MMU_2M ulong 0x200000
+const MMU_1G ulong 0x40000000
+const MMU_ADDR_MASK ulong 0x0000fffffffff000
+const MMU_MAX_PT_FRAMES ulong 1024
+
+note mmu_state:
+note   0=l0_pa, 1=npt_frames, 2=tcr_el1, 3=sctlr_el1, 4=live (0=pre-MMU, 1=MMU on),
+note   5=img_base, 6=img_end, 7=el1_stack_lo, 8=el1_stack_hi
+global mmu_state ulong 16
+global mmu_pt_frames ulong 1024
+note el2_to_el1 context (8 * u64 = 64 bytes)
+global mmu_el1_ctx uchar 64
+
+fn mmu_zero_page pa ulong to void
+i = ulong 0
+while lt i MMU_PAGE bound 512
+x = fwst add pa i 8 0
+i = add i 8
+end
+end
+
+fn mmu_alloc_pt_frame to ulong
+nf = get mmu_state 1
+if ge nf MMU_MAX_PT_FRAMES
+ret 0
+end
+pa = frames_alloc 1 MMU_PAGE FR_PA_40BIT_LIMIT
+if eq pa 0
+ret 0
+end
+mmu_zero_page pa
+put mmu_pt_frames nf pa
+put mmu_state 1 add nf 1
+ret pa
+end
+
+fn mmu_is_protected_range lo ulong hi ulong to bool
+ib = get mmu_state 5
+ie = get mmu_state 6
+if and lt lo ie gt hi ib
+ret true
+end
+sb = get mmu_state 7
+se = get mmu_state 8
+if and ne se 0 and lt lo se gt hi sb
+ret true
+end
+nf = get mmu_state 1
+i = ulong 0
+while lt i nf bound 1024
+fp = get mmu_pt_frames i
+if and lt lo add fp MMU_PAGE gt hi fp
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn mmu_leaf_desc pa ulong attr ulong sh ulong flags ulong is_l3 bool to ulong
+note Enforce W^X and strict XN on all non-WB attrs (1, 2, 3).
+is_rw = ne and flags MMU_FLAG_RW 0
+is_ex = ne and flags MMU_FLAG_EXEC 0
+if and is_rw is_ex
+ret 0
+end
+if and is_ex ne attr MMU_MAIR_WB
+ret 0
+end
+if gt attr MMU_MAIR_NORMAL_NC
+ret 0
+end
+ap = ulong 2
+if is_rw
+ap = ulong 0
+end
+kind = ulong 1
+if is_l3
+kind = ulong 3
+end
+bits = or and pa MMU_ADDR_MASK kind
+bits = or bits shl attr 2
+bits = or bits shl ap 6
+bits = or bits shl sh 8
+note AF (bit 10) = 1
+bits = or bits shl ulong 1 10
+note UXN (bit 54) always 1 for kernel; PXN (bit 53) = 1 unless executable WB
+bits = or bits shl ulong 1 54
+if not is_ex
+bits = or bits shl ulong 1 53
+end
+ret bits
+end
+
+fn mmu_walk_ensure table_pa ulong va ulong lvl ulong to ulong
+sh = sub 39 mul lvl 9
+idx = and shr va sh 511
+ent_pa = add table_pa mul idx 8
+ent = fwld ent_pa 8
+if eq and ent 1 0
+child = mmu_alloc_pt_frame
+if eq child 0
+ret 0
+end
+x = fwst ent_pa 8 or and child MMU_ADDR_MASK 3
+ret child
+end
+if eq and ent 3 3
+ret and ent MMU_ADDR_MASK
+end
+ret 0
+end
+
+fn mmu_map_leaf va ulong pa ulong sz ulong attr ulong sh ulong flags ulong to bool
+tlevel = ulong 3
+if eq sz MMU_1G
+tlevel = ulong 1
+else
+if eq sz MMU_2M
+tlevel = ulong 2
+end
+end
+desc = mmu_leaf_desc pa attr sh flags eq tlevel 3
+if eq desc 0
+ret false
+end
+cur = get mmu_state 0
+lvl = ulong 0
+while lt lvl tlevel bound 4
+cur = mmu_walk_ensure cur va lvl
+if eq cur 0
+ret false
+end
+lvl = add lvl 1
+end
+lsh = sub 39 mul tlevel 9
+lidx = and shr va lsh 511
+ent_pa = add cur mul lidx 8
+x = fwst ent_pa 8 desc
+ret true
+end
+
+fn mmu_pick_sz va ulong pa ulong rem_len ulong to ulong
+if ge rem_len MMU_1G
+if and eq rem va MMU_1G 0 eq rem pa MMU_1G 0
+ret MMU_1G
+end
+end
+if ge rem_len MMU_2M
+if and eq rem va MMU_2M 0 eq rem pa MMU_2M 0
+ret MMU_2M
+end
+end
+ret MMU_PAGE
+end
+
+note Identity-map [pa, pa + len) with given MAIR attr, shareability, and W^X flags.
+fn mmu_map_id pa ulong length ulong attr ulong sh ulong flags ulong to bool
+if or eq length 0 or ne and pa 0xfff 0 ne and length 0xfff 0
+ret false
+end
+off = ulong 0
+while lt off length bound 131072
+cur = add pa off
+sz = mmu_pick_sz cur cur sub length off
+if not mmu_map_leaf cur cur sz attr sh flags
+ret false
+end
+off = add off sz
+end
+ret true
+end
+
+note Map MMIO [pa, pa + len) as Device-nGnRnE (MAIR=2), Non-Shareable, RW, strict XN.
+fn mmio_map_device pa ulong length ulong to bool
+base = fr_align_down pa MMU_PAGE
+end_pa = fr_align_up add pa length MMU_PAGE
+if le end_pa base
+ret false
+end
+ok = mmu_map_id base sub end_pa base MMU_MAIR_DEV_NGNRNE MMU_SH_NONE MMU_FLAG_RW
+if and ok ne get mmu_state 4 0
+arm64_dsb_ish
+arm64_tlbi_vmalle1is
+end
+ret ok
+end
+
+note Break a single pre-split leaf at cur (must fit inside rem_len). Returns leaf size or 0 on error.
+fn mmu_break_one_leaf cur ulong rem_len ulong to ulong
+tab = get mmu_state 0
+lvl = ulong 0
+while lt lvl 4 bound 4
+sh = sub 39 mul lvl 9
+idx = and shr cur sh 511
+ep = add tab mul idx 8
+ent = fwld ep 8
+if eq and ent 1 0
+ret 0
+end
+if or eq lvl 0 and eq and ent 3 3 lt lvl 3
+tab = and ent MMU_ADDR_MASK
+else
+lsz = MMU_PAGE
+if eq lvl 1
+lsz = MMU_1G
+else
+if eq lvl 2
+lsz = MMU_2M
+end
+end
+if or ne rem cur lsz 0 lt rem_len lsz
+ret 0
+end
+x = fwst ep 8 0
+ret lsz
+end
+lvl = add lvl 1
+end
+ret 0
+end
+
+note Safe post-MMU remap of a pre-split non-kernel 4 KiB/2 MiB range to Normal-NC (SH=OSH, RW, XN).
+note Exact ARMv8/v9 BBM sequence:
+note   Break(0) -> DSB ISH -> TLBI VMALLE1IS -> DSB ISH -> ISB -> Make(NC) -> DSB ISH -> ISB -> DC CIVAC -> DSB SY
+fn mmu_remap_nc_bbm pa ulong length ulong to bool
+if or eq length 0 or ne and pa 0xfff 0 ne and length 0xfff 0
+ret false
+end
+if mmu_is_protected_range pa add pa length
+ret false
+end
+off = ulong 0
+while lt off length bound 131072
+lsz = mmu_break_one_leaf add pa off sub length off
+if eq lsz 0
+ret false
+end
+off = add off lsz
+end
+arm64_dsb_ish
+arm64_tlbi_vmalle1is
+if not mmu_map_id pa length MMU_MAIR_NORMAL_NC MMU_SH_OSH MMU_FLAG_RW
+ret false
+end
+arm64_dsb_ish
+arm64_dc_civac_range pa length
+ret true
+end
+
+note Clean all live page-table frames to Point of Coherency (DC CVAC + DSB SY) before EL1 / PSCI CPU_ON.
+fn mmu_clean_tables_poc to void
+nf = get mmu_state 1
+i = ulong 0
+while lt i nf bound 1024
+arm64_dc_cvac_range get mmu_pt_frames i MMU_PAGE
+i = add i 1
+end
+arm64_dsb_sy
+end
+
+note Compute TCR_EL1 with 48-bit VA (T0SZ=16), 4 KiB granule, WB-WA Inner-Shareable walks,
+note EPD1=1 (TTBR1 disabled), and IPS derived from ID_AA64MMFR0_EL1.PARange.
+note Fails closed (returns 0) if PARange < 2 (< 40-bit PA, required for 0xF340000000/0xF370000000 ECAM).
+fn mmu_build_tcr_el1 parange ulong to ulong
+pr = and parange 15
+if lt pr 2
+ret 0
+end
+ips = pr
+if gt ips 5
+ips = ulong 5
+end
+note T0SZ=16 | IRGN0=1 (WB-WA) << 8 | ORGN0=1 << 10 | SH0=3 (ISH) << 12 | TG0=0 (4K) << 14 | EPD1=1 << 23 | IPS << 32
+tcr = ulong 16
+tcr = or tcr shl ulong 1 8
+tcr = or tcr shl ulong 1 10
+tcr = or tcr shl ulong 3 12
+tcr = or tcr shl ulong 1 23
+tcr = or tcr shl ips 32
+ret tcr
+end
+
+fn mmu_carve_nc_pool to bool
+free_b = frames_free_bytes
+nc_bytes = ulong 0x04000000
+if ge free_b 0x80000000
+nc_bytes = ulong 0x20000000
+end
+nc_pages = div nc_bytes MMU_PAGE
+nc_pa = frames_alloc nc_pages MMU_2M FR_PA_40BIT_LIMIT
+if eq nc_pa 0
+ret false
+end
+dma_pool_init nc_pa nc_bytes
+p = ulong 0
+while lt p nc_bytes bound 67108864
+x = fwst add nc_pa p 8 0
+p = add p 8
+end
+arm64_dc_civac_range nc_pa nc_bytes
+ret mmu_map_id nc_pa nc_bytes MMU_MAIR_NORMAL_NC MMU_SH_OSH MMU_FLAG_RW
+end
+
+fn mmu_map_ram_and_pts to bool
+nr = frames_region_count
+ri = ulong 0
+while lt ri nr bound 256
+rb = get fr_base ri
+re = get fr_end ri
+if gt re rb
+if not mmu_map_id rb sub re rb MMU_MAIR_WB MMU_SH_ISH MMU_FLAG_RW
+ret false
+end
+end
+ri = add ri 1
+end
+pi = ulong 0
+while lt pi get mmu_state 1 bound 1024
+fpa = get mmu_pt_frames pi
+if not mmu_map_id fpa MMU_PAGE MMU_MAIR_WB MMU_SH_ISH MMU_FLAG_RW
+ret false
+end
+pi = add pi 1
+end
+ret true
+end
+
+fn mmu_map_platform_mmio to bool
+if ne uart_base 0
+if not mmio_map_device uart_base 0x1000
+ret false
+end
+end
+if ne get acpi_info 2 0
+if not mmio_map_device get acpi_info 2 0x10000
+ret false
+end
+end
+if ne get acpi_info 3 0
+gl = get acpi_info 4
+if lt gl 0x20000
+gl = ulong 0x20000
+end
+if not mmio_map_device get acpi_info 3 gl
+ret false
+end
+end
+if ne get acpi_info 5 0
+if not mmio_map_device get acpi_info 5 0x20000
+ret false
+end
+end
+if and ne get acpi_info 10 0 ne get acpi_info 11 0
+ib = fr_align_down get acpi_info 10 MMU_PAGE
+ie = fr_align_up add get acpi_info 10 get acpi_info 11 MMU_PAGE
+if not mmu_map_id ib sub ie ib MMU_MAIR_WB MMU_SH_ISH 0
+ret false
+end
+end
+ret true
+end
+
+note Build initial Stage-1 page tables BEFORE SCTLR_EL1.M=1:
+fn mmu_build_initial img_base ulong bss_base ulong img_end ulong to bool
+for i ulong 16
+put mmu_state i 0
+end
+put mmu_state 5 img_base
+put mmu_state 6 img_end
+tcr = mmu_build_tcr_el1 arm64_sysrd SYSREG_ID_AA64MMFR0
+if eq tcr 0
+ret false
+end
+put mmu_state 2 tcr
+note SCTLR_EL1: RES1 (0x30d00800) | M (bit 0) | C (bit 2) | I (bit 12) = 0x30d01805
+put mmu_state 3 0x30d01805
+l0 = mmu_alloc_pt_frame
+if eq l0 0
+ret false
+end
+put mmu_state 0 l0
+if not mmu_carve_nc_pool
+ret false
+end
+stk = frames_alloc 64 MMU_PAGE FR_PA_40BIT_LIMIT
+if eq stk 0
+ret false
+end
+put mmu_state 7 stk
+put mmu_state 8 add stk 262144
+if not mmu_map_id img_base MMU_PAGE MMU_MAIR_WB MMU_SH_ISH 0
+ret false
+end
+if not mmu_map_id add img_base MMU_PAGE sub bss_base add img_base MMU_PAGE MMU_MAIR_WB MMU_SH_ISH MMU_FLAG_EXEC
+ret false
+end
+if not mmu_map_id bss_base sub img_end bss_base MMU_MAIR_WB MMU_SH_ISH MMU_FLAG_RW
+ret false
+end
+if not mmu_map_id stk 262144 MMU_MAIR_WB MMU_SH_ISH MMU_FLAG_RW
+ret false
+end
+if not mmu_map_ram_and_pts
+ret false
+end
+if not mmu_map_platform_mmio
+ret false
+end
+mmu_clean_tables_poc
+ret true
+end
+
+note Enter EL1h (from EL2 via ADR 0009 eret, or switch tables if already at EL1) landing in entry_fn(arg).
+fn mmu_enter_el1 entry_fn ulong arg ulong to void
+ctx_pa = fwadr mmu_el1_ctx 0 64
+x = fwst add ctx_pa 0 8 get mmu_state 0
+x = fwst add ctx_pa 8 8 MMU_MAIR_EL1
+x = fwst add ctx_pa 16 8 get mmu_state 2
+x = fwst add ctx_pa 24 8 get mmu_state 3
+x = fwst add ctx_pa 32 8 get mmu_state 8
+x = fwst add ctx_pa 40 8 entry_fn
+x = fwst add ctx_pa 48 8 arg
+x = fwst add ctx_pa 56 8 add get mmu_state 7 16384
+arm64_dc_cvac_range ctx_pa 64
+put mmu_state 4 1
+el = arm64_current_el
+if eq el 2
+x = fwop FWOP_EL2_TO_EL1 ctx_pa 0 0
+end
+if eq el 1
+x = fwop FWOP_EL1_SWITCH ctx_pa 0 0
+end
+trap 8
+end

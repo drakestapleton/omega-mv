@@ -1,0 +1,263 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/acpi.om: Pure-Omega ACPI 2.0 RSDP/XSDT walker + MADT/FADT/SPCR/MCFG/IORT discovery.
+note Discovers: up to 64 GICC MPIDRs (20 Grace cores on Spark), GICD, GICR, GITS (MADT type 0x0f),
+note FADT PSCI conduit (SMC vs HVC), SPCR UART (16550 @ 0x16A00000 or PL011), MCFG segs 0..15, and IORT PA/len.
+
+const ACPI_MAX_CPUS ulong 64
+const ACPI_MAX_MCFG ulong 16
+
+note acpi_info slots:
+note   0=rsdp_pa, 1=xsdt_pa, 2=gicd_pa, 3=gicr_pa, 4=gicr_len, 5=gits_pa,
+note   6=ncpus, 7=psci_conduit (0=none,1=SMC,2=HVC), 8=spcr_base, 9=spcr_kind (1=16550,2=PL011),
+note   10=iort_pa, 11=iort_len, 12=nmcfg, 13=madt_pa, 14=madt_len, 15=fadt_pa
+global acpi_info ulong 16
+global acpi_cpu_mpidr ulong 64
+global acpi_cpu_class ulong 64
+global acpi_mcfg_base ulong 16
+global acpi_mcfg_seg ulong 16
+global acpi_mcfg_sbus ulong 16
+global acpi_mcfg_ebus ulong 16
+
+fn acpi_reset to void
+for i ulong 16
+put acpi_info i 0
+put acpi_mcfg_base i 0
+put acpi_mcfg_seg i 0
+put acpi_mcfg_sbus i 0
+put acpi_mcfg_ebus i 0
+end
+for j ulong 64
+put acpi_cpu_mpidr j 0
+put acpi_cpu_class j 0
+end
+end
+
+fn acpi_raw_sum_ok pa ulong n ulong to bool
+if or eq pa 0 lt n 20
+ret false
+end
+acc = ulong 0
+i = ulong 0
+while lt i n bound 65536
+acc = and add acc fwld add pa i 1 0xff
+i = add i 1
+end
+ret eq acc 0
+end
+
+fn acpi_parse_madt pa ulong length ulong to bool
+if lt length 44
+ret false
+end
+if not acpi_raw_sum_ok pa length
+ret false
+end
+put acpi_info 13 pa
+put acpi_info 14 length
+pos = ulong 44
+while lt pos length bound 4096
+if gt add pos 2 length
+ret false
+end
+etype = fwld add pa pos 1
+elen = fwld add pa add pos 1 1
+if or lt elen 2 gt add pos elen length
+ret false
+end
+e = add pa pos
+if eq etype 0x0b
+note GICC (length >= 76): +12 flags, +60 GICR base, +68 MPIDR, +72 efficiency class (byte)
+if ge elen 76
+flags = fwld add e 12 4
+if ne and flags 9 0
+nc = get acpi_info 6
+if lt nc ACPI_MAX_CPUS
+mpidr = and fwld add e 68 8 0x000000ff00ffffff
+put acpi_cpu_mpidr nc mpidr
+if ge elen 73
+put acpi_cpu_class nc fwld add e 72 1
+end
+put acpi_info 6 add nc 1
+end
+if eq get acpi_info 3 0
+gcr = fwld add e 60 8
+if ne gcr 0
+put acpi_info 3 gcr
+put acpi_info 4 0x20000
+end
+end
+end
+end
+else
+if eq etype 0x0c
+note GICD (length >= 24): +8 Physical Base Address
+if ge elen 24
+put acpi_info 2 fwld add e 8 8
+end
+else
+if eq etype 0x0e
+note GICR Redistributor Discovery Range (length >= 16): +4 base, +12 length
+if ge elen 16
+put acpi_info 3 fwld add e 4 8
+put acpi_info 4 fwld add e 12 4
+end
+else
+if eq etype 0x0f
+note GIC ITS (length >= 20): +8 Physical Base Address (strictly MADT-discovered)
+if ge elen 20
+if eq get acpi_info 5 0
+put acpi_info 5 fwld add e 8 8
+end
+end
+end
+end
+end
+end
+pos = add pos elen
+end
+ret ne get acpi_info 2 0
+end
+
+fn acpi_parse_fadt pa ulong length ulong to void
+if lt length 131
+ret
+end
+if not acpi_raw_sum_ok pa length
+ret
+end
+put acpi_info 15 pa
+note FADT ARM_BOOT_ARCH at offset 129 (2 bytes): bit 0 PSCI_COMPLIANT, bit 1 PSCI_USE_HVC
+arch = fwld add pa 129 2
+if ne and arch 1 0
+if ne and arch 2 0
+put acpi_info 7 2
+else
+put acpi_info 7 1
+end
+end
+end
+
+fn acpi_parse_spcr pa ulong length ulong to void
+if lt length 52
+ret
+end
+if not acpi_raw_sum_ok pa length
+ret
+end
+itype = fwld add pa 36 1
+base = fwld add pa 44 8
+if eq base 0
+ret
+end
+put acpi_info 8 base
+if eq itype 3
+put acpi_info 9 2
+else
+if or eq itype 0 or eq itype 1 eq itype 18
+put acpi_info 9 1
+end
+end
+end
+
+fn acpi_parse_mcfg pa ulong length ulong to void
+if lt length 44
+ret
+end
+if not acpi_raw_sum_ok pa length
+ret
+end
+pos = ulong 44
+while le add pos 16 length bound 32
+idx = get acpi_info 12
+if lt idx ACPI_MAX_MCFG
+e = add pa pos
+put acpi_mcfg_base idx fwld e 8
+put acpi_mcfg_seg idx fwld add e 8 2
+put acpi_mcfg_sbus idx fwld add e 10 1
+put acpi_mcfg_ebus idx fwld add e 11 1
+put acpi_info 12 add idx 1
+end
+pos = add pos 16
+end
+end
+
+note Walk ACPI 2.0 RSDP -> XSDT and parse APIC (MADT), FACP (FADT), SPCR, MCFG, IORT.
+fn acpi_parse_rsdp rsdp_pa ulong to bool
+acpi_reset
+if eq rsdp_pa 0
+ret false
+end
+note "RSD PTR " = 0x2052545020445352 LE
+if ne fwld rsdp_pa 8 0x2052545020445352
+ret false
+end
+if not acpi_raw_sum_ok rsdp_pa 20
+ret false
+end
+rev = fwld add rsdp_pa 15 1
+if lt rev 2
+ret false
+end
+rlen = fwld add rsdp_pa 20 4
+if or lt rlen 36 not acpi_raw_sum_ok rsdp_pa rlen
+ret false
+end
+xsdt = fwld add rsdp_pa 24 8
+if eq xsdt 0
+ret false
+end
+note "XSDT" = 0x54445358 LE
+if ne fwld xsdt 4 0x54445358
+ret false
+end
+xlen = fwld add xsdt 4 4
+if or lt xlen 36 not acpi_raw_sum_ok xsdt xlen
+ret false
+end
+put acpi_info 0 rsdp_pa
+put acpi_info 1 xsdt
+nents = div sub xlen 36 8
+i = ulong 0
+while lt i nents bound 128
+tpa = fwld add add xsdt 36 mul i 8 8
+if ne tpa 0
+sig = fwld tpa 4
+tlen = fwld add tpa 4 4
+if ge tlen 36
+note "APIC"=0x43495041, "FACP"=0x50434146, "SPCR"=0x52435053, "MCFG"=0x4746434d, "IORT"=0x54524f49
+if eq sig 0x43495041
+ok = acpi_parse_madt tpa tlen
+end
+if eq sig 0x50434146
+acpi_parse_fadt tpa tlen
+end
+if eq sig 0x52435053
+acpi_parse_spcr tpa tlen
+end
+if eq sig 0x4746434d
+acpi_parse_mcfg tpa tlen
+end
+if eq sig 0x54524f49
+if acpi_raw_sum_ok tpa tlen
+put acpi_info 10 tpa
+put acpi_info 11 tlen
+end
+end
+end
+end
+i = add i 1
+end
+ret ne get acpi_info 2 0
+end
+
+fn acpi_mcfg_ecam_for_seg seg ulong to ulong
+n = get acpi_info 12
+i = ulong 0
+while lt i n bound 16
+if eq get acpi_mcfg_seg i seg
+ret get acpi_mcfg_base i
+end
+i = add i 1
+end
+ret 0
+end

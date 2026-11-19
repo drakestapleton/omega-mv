@@ -1,0 +1,124 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/uart.om: Polled bare-metal UART console (Spark 16550 @ 0x16A00000 & QEMU PL011)
+note plus post-EBS panic hook (panichk) that NEVER calls dead UEFI Boot/Runtime Services.
+
+const UART_KIND_NONE ulong 0
+const UART_KIND_16550_32 ulong 1
+const UART_KIND_PL011 ulong 2
+const UART_SPARK_16550_PA ulong 0x16a00000
+const UART_QEMU_PL011_PA ulong 0x09000000
+
+note uart_state: 0=base_pa, 1=kind (1=16550 dword-stride, 2=PL011), 2=psci_conduit
+global uart_state ulong 4
+
+text u_hex "0123456789abcdef"
+text u_panic_hdr "\nPANIC post-EBS code=0x"
+text u_panic_esr " esr=0x"
+text u_panic_elr " elr=0x"
+text u_panic_far " far=0x"
+text u_nl "\n"
+
+fn uart_init base_pa ulong kind ulong conduit ulong to void
+put uart_state 0 base_pa
+put uart_state 1 kind
+put uart_state 2 conduit
+end
+
+fn uart_base to ulong
+ret get uart_state 0
+end
+
+fn uart_kind to ulong
+ret get uart_state 1
+end
+
+fn uart_putc ch ulong to void
+base = get uart_state 0
+kind = get uart_state 1
+if or eq base 0 eq kind UART_KIND_NONE
+ret
+end
+if eq kind UART_KIND_PL011
+note PL011: FR at +0x18, TXFF = bit 5 (0x20); DR at +0x00
+i = ulong 0
+while lt i 100000 bound 100000
+fr = fwld add base 0x18 4
+if eq and fr 0x20 0
+break
+end
+i = add i 1
+end
+x = fwst base 4 and ch 0xff
+ret
+end
+note 16550 dword-spaced (Spark MTKI0511:00 @ 0x16A00000): LSR at +0x14 (5*4), THRE = bit 5 (0x20); THR at +0x00
+i = ulong 0
+while lt i 100000 bound 100000
+lsr = fwld add base 0x14 4
+if ne and lsr 0x20 0
+break
+end
+i = add i 1
+end
+x = fwst base 4 and ch 0xff
+end
+
+fn uart_puts s view uchar * to void
+n = len s
+i = ulong 0
+while lt i n bound 4096
+b = ulong get s i
+if eq b 10
+uart_putc 13
+end
+uart_putc b
+i = add i 1
+end
+end
+
+fn uart_puthex v ulong to void
+i = ulong 0
+while lt i 16 bound 16
+sh = mul sub 15 i 4
+d = and shr v sh 15
+uart_putc ulong get u_hex d
+i = add i 1
+end
+end
+
+fn uart_putdec v ulong to void
+if eq v 0
+uart_putc 48
+ret
+end
+buf = new uchar 24 0
+k = ulong 0
+cur = v
+while gt cur 0 bound 24
+put buf k uchar add 48 rem cur 10
+cur = div cur 10
+k = add k 1
+end
+while gt k 0 bound 24
+k = sub k 1
+uart_putc ulong get buf k
+end
+end
+
+note panichk: invoked by aefx/vbar_el1 after ExitBootServices(). Logs crash state to UART;
+note aefx then invokes PSCI SYSTEM_RESET or parks in WFE. Never touches UEFI services.
+fn panichk code ulong esr ulong elr ulong far ulong to void
+if eq get uart_state 0 0
+put uart_state 0 UART_SPARK_16550_PA
+put uart_state 1 UART_KIND_16550_32
+end
+uart_puts u_panic_hdr
+uart_puthex code
+uart_puts u_panic_esr
+uart_puthex esr
+uart_puts u_panic_elr
+uart_puthex elr
+uart_puts u_panic_far
+uart_puthex far
+uart_puts u_nl
+end

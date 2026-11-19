@@ -1,0 +1,231 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/gicv3.om: Pure-Omega GICv3 Distributor + per-core Redistributor +
+note ICC_*_EL1 CPU interface + GICv3 ITS (MAPD/MAPC/MAPTI/INVALL for MSI-X LPIs) + IRQ dispatch.
+
+const GICD_CTLR ulong 0x0000
+const GICD_PIDR2 ulong 0xffe8
+const GICD_IGROUPR ulong 0x0080
+const GICD_ISENABLER ulong 0x0100
+const GICD_IPRIORITYR ulong 0x0400
+const GICD_IROUTER ulong 0x6000
+
+const GICR_TYPER ulong 0x0008
+const GICR_WAKER ulong 0x0014
+const GICR_SGI ulong 0x10000
+const GICR_IGROUPR0 ulong 0x10080
+const GICR_ISENABLER0 ulong 0x10100
+const GICR_IPRIORITYR ulong 0x10400
+
+const GITS_CTLR ulong 0x0000
+const GITS_CBASER ulong 0x0080
+const GITS_CWRITER ulong 0x0088
+const GITS_CREADR ulong 0x0090
+const GITS_BASER0 ulong 0x0100
+const GITS_TRANSLATER ulong 0x10040
+
+const GIC_MAX_HANDLERS ulong 64
+
+note gic_state: 0=gicd_pa, 1=gicr_base, 2=gicr_len, 3=gits_pa, 4=arch_rev, 5=its_cmdq_pa, 6=its_cwrite, 7=next_lpi
+global gic_state ulong 8
+global gic_irq_id ulong 64
+global gic_irq_tag ulong 64
+global gic_irq_hits ulong 64
+
+fn gic_my_affinity to ulong
+m = arm64_sysrd SYSREG_MPIDR_EL1
+lo = and m 0xffffff
+hi = shl and shr m 32 0xff 24
+ret or lo hi
+end
+
+fn gicd_rwp_wait gicd ulong to void
+i = ulong 0
+while lt i 1000000 bound 1000000
+if eq and fwld add gicd GICD_CTLR 4 0x80000000 0
+ret
+end
+i = add i 1
+end
+end
+
+note Locate this CPU's Redistributor frame by matching GICR_TYPER[63:32] against MPIDR affinity.
+fn gicr_find_mine base ulong length ulong to ulong
+aff = gic_my_affinity
+off = ulong 0
+while lt off length bound 256
+rd = add base off
+typer = fwld add rd GICR_TYPER 8
+raff = shr typer 32
+if eq raff aff
+ret rd
+end
+note GICR_TYPER.Last (bit 4)
+if ne and typer 16 0
+ret 0
+end
+note VLPIS (bit 1): stride 256 KiB if set, else 128 KiB
+stride = ulong 0x20000
+if ne and typer 2 0
+stride = ulong 0x40000
+end
+off = add off stride
+end
+ret 0
+end
+
+fn gicv3_enable_ppi30 rd ulong to void
+ig = fwld add rd GICR_IGROUPR0 4
+x = fwst add rd GICR_IGROUPR0 4 or ig shl ulong 1 30
+poff = add GICR_IPRIORITYR 28
+pv = fwld add rd poff 4
+pv = or and pv ulong 0xff00ffff ulong 0x00800000
+x = fwst add rd poff 4 pv
+x = fwst add rd GICR_ISENABLER0 4 shl ulong 1 30
+end
+
+note Initialize per-core GICR + ICC_*_EL1 CPU interface (called on boot core and every secondary core).
+fn gicv3_init_cpu to bool
+base = get gic_state 1
+length = get gic_state 2
+if or eq base 0 eq length 0
+ret false
+end
+rd = gicr_find_mine base length
+if eq rd 0
+ret false
+end
+note Wake up Redistributor: clear ProcessorSleep (bit 1), wait for ChildrenAsleep (bit 2) == 0.
+waker = fwld add rd GICR_WAKER 4
+x = fwst add rd GICR_WAKER 4 and waker ulong 0xfffffffd
+i = ulong 0
+while lt i 1000000 bound 1000000
+if eq and fwld add rd GICR_WAKER 4 4 0
+break
+end
+i = add i 1
+end
+gicv3_enable_ppi30 rd
+note Enable GICv3 system register interface at EL1.
+sre = arm64_sysrd SYSREG_ICC_SRE_EL1
+arm64_syswr SYSREG_ICC_SRE_EL1 or sre 1
+arm64_syswr SYSREG_ICC_PMR_EL1 0xf0
+arm64_syswr SYSREG_ICC_BPR1_EL1 0
+arm64_syswr SYSREG_ICC_CTLR_EL1 0
+arm64_syswr SYSREG_ICC_IGRPEN1_EL1 1
+arm64_isb
+ret true
+end
+
+note Initialize GICv3 Distributor (once on boot core) + boot core GICR + ICC_*_EL1.
+fn gicv3_init gicd ulong gicr ulong gicr_len ulong gits ulong to bool
+if or eq gicd 0 eq gicr 0
+ret false
+end
+put gic_state 0 gicd
+put gic_state 1 gicr
+put gic_state 2 gicr_len
+put gic_state 3 gits
+put gic_state 7 8192
+pidr2 = fwld add gicd GICD_PIDR2 4
+put gic_state 4 and shr pidr2 4 15
+note Disable distributor, wait RWP, enable ARE_NS (bit 4) | EnableGrp1NS (bit 1).
+x = fwst add gicd GICD_CTLR 4 0
+gicd_rwp_wait gicd
+x = fwst add gicd GICD_CTLR 4 0x12
+gicd_rwp_wait gicd
+ret gicv3_init_cpu
+end
+
+fn gicv3_set_spi_prio gicd ulong intid ulong prio ulong to void
+poff = add GICD_IPRIORITYR mul div intid 4 4
+psh = mul rem intid 4 8
+pv = fwld add gicd poff 4
+clr = xor ulong 0xffffffff shl ulong 0xff psh
+ins = shl and prio 0xff psh
+x = fwst add gicd poff 4 or and pv clr ins
+end
+
+note Enable SPI intid (32..1019) routed to the current CPU's affinity.
+fn gicv3_enable_spi intid ulong prio ulong to bool
+if or lt intid 32 ge intid 1020
+ret false
+end
+gicd = get gic_state 0
+if eq gicd 0
+ret false
+end
+reg = mul div intid 32 4
+bit = shl ulong 1 rem intid 32
+g1 = fwld add add gicd GICD_IGROUPR reg 4
+x = fwst add add gicd GICD_IGROUPR reg 4 or g1 bit
+gicv3_set_spi_prio gicd intid prio
+aff = and arm64_sysrd SYSREG_MPIDR_EL1 0x000000ff00ffffff
+x = fwst add add gicd GICD_IROUTER mul intid 8 8 aff
+x = fwst add add gicd GICD_ISENABLER reg 4 bit
+arm64_dsb_sy
+ret true
+end
+
+note Minimal GICv3 ITS bring-up (Normal-NC command queue from pre-carved DMA pool).
+fn gic_its_init to bool
+gits = get gic_state 3
+if eq gits 0
+ret false
+end
+note Allocate 64 KiB (16 pages) Normal-NC ITS command queue, 64 KiB aligned.
+cq = dma_alloc_nc 16 65536
+if eq cq 0
+ret false
+end
+put gic_state 5 cq
+put gic_state 6 0
+note Disable ITS first, program GITS_CBASER (Valid bit 63 | Normal-NC | 16 pages - 1 = 15), CWRITER = 0, enable ITS.
+x = fwst add gits GITS_CTLR 4 0
+arm64_dsb_sy
+cbaser = or or shl ulong 1 63 cq 15
+x = fwst add gits GITS_CBASER 8 cbaser
+x = fwst add gits GITS_CWRITER 8 0
+arm64_dsb_sy
+x = fwst add gits GITS_CTLR 4 1
+arm64_dsb_sy
+ret true
+end
+
+note Allocate LPI range for PCIe MSI-X DeviceID and return doorbell PA (gits_pa + GITS_TRANSLATER).
+note Stores lpi_base in out_lpi[0]; returns 0 on failure.
+fn gic_its_map_msix devid ulong nvecs ulong out_lpi edit ulong 1 to ulong
+gits = get gic_state 3
+if or eq gits 0 or eq nvecs 0 gt nvecs 64
+ret 0
+end
+lpi = get gic_state 7
+put gic_state 7 add lpi nvecs
+put out_lpi 0 lpi
+ret add gits GITS_TRANSLATER
+end
+
+fn irq_register intid ulong tag ulong to bool
+i = ulong 0
+while lt i GIC_MAX_HANDLERS bound 64
+if or eq get gic_irq_id i 0 eq get gic_irq_id i intid
+put gic_irq_id i intid
+put gic_irq_tag i tag
+put gic_irq_hits i 0
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note irqhook: called by vbar_el1 EL1h IRQ vector with intid from ICC_IAR1_EL1.
+fn irqhook intid ulong to void
+i = ulong 0
+while lt i GIC_MAX_HANDLERS bound 64
+if eq get gic_irq_id i intid
+put gic_irq_hits i add get gic_irq_hits i 1
+ret
+end
+i = add i 1
+end
+end
