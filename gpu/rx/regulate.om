@@ -1,0 +1,189 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/rx/regulate.om: pure-Omega ADAPTIVE-M4 bounded resource regulation (replaces src/runtime/rx_regulate.{h,c}).
+note Hysteresis + dwell regime state machine, authority-independent envelope enforcement,
+note fairness preservation, idempotent condition seq, and emergency-stop refusal.
+note Compose: si/directives/om2.om gpu/rx/regulate.om gpu/rx/skillroute.om gpu/rx/test.om
+
+const RX_OK int 0
+const RX_NOOP int 1
+const RX_ERR_ARG int -1
+const RX_ERR_BOUNDS int -2
+const RX_ERR_HALTED int -3
+
+const RX_REG_NOMINAL uint 0
+const RX_REG_EXPAND uint 1
+const RX_REG_PROTECT uint 2
+
+const SR_OK int 0
+const SR_E_ARG int -40
+const SR_E_NO_CANDIDATE int -41
+const SR_E_REMOTE int -42
+const SR_E_STALE int -45
+const SR_E_WITHDRAWN int -46
+const SR_E_UNAVAILABLE int -47
+const SR_E_MACHINE int -48
+
+const SR_WHY_GONE uint 0x001
+const SR_WHY_UNAVAILABLE uint 0x002
+const SR_WHY_AUTHORITY uint 0x004
+const SR_WHY_NOT_SKILL uint 0x008
+const SR_WHY_NOT_EXECUTABLE uint 0x010
+const SR_WHY_DIGEST uint 0x020
+const SR_WHY_REMOTE_REFUSED uint 0x040
+const SR_WHY_PIN uint 0x080
+const SR_WHY_MACHINE uint 0x100
+const SR_WHY_MACHINE_UNKNOWN uint 0x200
+
+note All structs for gpu/rx/ declared before first fn (required by omc).
+struct RxBudget slots uint mem ulong energy ulong starv ulong loc uint end
+struct RxEnv smin uint smax uint mmin ulong mmax ulong emin ulong emax ulong chi ulong clo ulong phi ulong plo ulong dwell ulong end
+struct RxPolicy ver ulong slots ulong mem ulong energy ulong regime ulong cseq ulong dwell ulong flips ulong end
+struct RxRegState app_ver ulong refused ulong halted int end
+struct SrReq op uint req_held int local_only int pin_ver uint pin_dlo ulong pin_dhi ulong pin_mset int pin_mid uint prio_cost int end
+struct SrRoute verdict int entry_idx int skill_id uint ver uint machine_id uint remote int gen ulong why uint n_adm uint end
+
+note ---- rx_regulate envelope & decision ----
+
+fn rx_regulate_envelope_ok e view RxEnv base view RxBudget to int
+if or eq get e smin 0 gt get e smin get e smax
+ret RX_ERR_ARG
+end
+if or gt get e mmin get e mmax gt get e emin get e emax
+ret RX_ERR_ARG
+end
+if or lt get base slots get e smin gt get base slots get e smax
+ret RX_ERR_ARG
+end
+if or lt get base mem get e mmin gt get base mem get e mmax
+ret RX_ERR_ARG
+end
+if or lt get base energy get e emin gt get base energy get e emax
+ret RX_ERR_ARG
+end
+if ge get e clo get e chi
+ret RX_ERR_ARG
+end
+if or ge get e plo get e phi gt get e phi 100
+ret RX_ERR_ARG
+end
+if eq get e dwell 0
+ret RX_ERR_ARG
+end
+ret RX_OK
+end
+
+fn rx_regulate_policy_for e view RxEnv base view RxBudget regime uint dst edit RxBudget to void
+put dst slots get base slots
+put dst mem get base mem
+put dst energy get base energy
+put dst starv get base starv
+put dst loc get base loc
+if eq regime RX_REG_EXPAND
+put dst slots get e smax
+put dst mem get e mmax
+put dst energy get e emax
+else
+if eq regime RX_REG_PROTECT
+put dst slots get e smin
+put dst mem get e mmin
+put dst energy get e emin
+end
+end
+ret
+end
+
+fn rx_regulate_decide e view RxEnv regime uint cur_dwell ulong contention ulong pressure ulong to uint
+settled = ge cur_dwell get e dwell
+note Protection enters immediately and takes precedence over expansion.
+if ge pressure get e phi
+ret RX_REG_PROTECT
+end
+if eq regime RX_REG_PROTECT
+if or eq settled false gt pressure get e plo
+ret RX_REG_PROTECT
+end
+if ge contention get e chi
+ret RX_REG_EXPAND
+end
+ret RX_REG_NOMINAL
+end
+if eq regime RX_REG_EXPAND
+if or eq settled false gt contention get e clo
+ret RX_REG_EXPAND
+end
+ret RX_REG_NOMINAL
+end
+if ge contention get e chi
+ret RX_REG_EXPAND
+end
+ret RX_REG_NOMINAL
+end
+
+note Reaction step: decides next regime from condition (cseq, contention, pressure).
+note Same cseq is an idempotent no-op (returns RX_NOOP).
+fn rx_regulate_step e view RxEnv base view RxBudget pol edit RxPolicy cseq ulong contention ulong pressure ulong to int
+if eq cseq get pol cseq
+ret RX_NOOP
+end
+reg = uint get pol regime
+dw = get pol dwell
+nxt = rx_regulate_decide e reg dw contention pressure
+put pol cseq cseq
+if eq nxt reg
+put pol dwell add dw 1
+ret RX_OK
+end
+b = new RxBudget 0 0 0 0 0
+rx_regulate_policy_for e base nxt edit b
+put pol ver add get pol ver 1
+put pol slots ulong get b slots
+put pol mem get b mem
+put pol energy get b energy
+put pol regime ulong nxt
+put pol dwell ulong 0
+put pol flips add get pol flips 1
+ret RX_OK
+end
+
+fn rx_policy_in_envelope e view RxEnv pol view RxPolicy to bool
+if gt get pol slots ulong 0xffffffff
+ret false
+end
+sl = uint get pol slots
+if or lt sl get e smin gt sl get e smax
+ret false
+end
+if or lt get pol mem get e mmin gt get pol mem get e mmax
+ret false
+end
+if or lt get pol energy get e emin gt get pol energy get e emax
+ret false
+end
+if gt get pol regime ulong RX_REG_PROTECT
+ret false
+end
+ret true
+end
+
+note Host step: installs policy into applied budget iff not halted, version is new, and within envelope.
+note Fairness fields (starv, loc) always come from base budget and are never regulated away.
+fn rx_regulate_apply e view RxEnv base view RxBudget pol view RxPolicy st edit RxRegState app edit RxBudget to int
+if ne get st halted 0
+put st refused add get st refused 1
+ret RX_ERR_HALTED
+end
+if eq get pol ver get st app_ver
+ret RX_NOOP
+end
+if eq rx_policy_in_envelope e pol false
+put st refused add get st refused 1
+ret RX_ERR_BOUNDS
+end
+put app slots uint get pol slots
+put app mem get pol mem
+put app energy get pol energy
+put app starv get base starv
+put app loc get base loc
+put st app_ver get pol ver
+ret RX_OK
+end
