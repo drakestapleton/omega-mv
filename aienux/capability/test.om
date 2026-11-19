@@ -1,0 +1,863 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/capability/test.om: Pure-Omega test suite for AIENOS 64-bit Capability Authority.
+note Covers all positive invariants and negative controls from native/capability/tests/capability_test.c
+note plus resource width checks and constant-time office token authorization.
+note Compose with: si/directives/om2.om aienux/capability/lib.om aienux/capability/test.om
+
+text s_pass "PASS "
+text s_fail "FAIL "
+text s_nl "\n"
+text s_t01 "high_half_resource_and_width"
+text s_t02 "forged_stale_subject_resource_rights_fail_closed"
+text s_t03 "amplification_lease_epoch_revoked_ancestor_fail"
+text s_t04 "child_lease_cannot_outlive_parent"
+text s_t05 "privileged_rights_not_delegable_and_office_stays"
+text s_t06 "promote_right_cannot_be_delegated"
+text s_t07 "generation_exhaustion_fails_closed"
+text s_t08 "kill_restart_invalidates_and_cognition_refused"
+text s_t09 "reclaimed_ref_stays_dead_after_restart"
+text s_t10 "generation_above_32_bits_is_kept"
+text s_t11 "ordinary_cap_cannot_admin_and_depth_stops"
+text s_t12 "table_fills_then_refuses"
+text s_t13 "observer_ops_cascade_refusals_and_silence"
+text s_t14 "validate_needs_every_requested_right"
+text s_t15 "lease_ends_exactly_at_expiry_tick_and_overflow"
+text s_t16 "validate_refuses_corrupt_non_live_parent"
+text s_t17 "control_resource_cap_cannot_operate_authority"
+text s_t18 "office_token_authorize_and_restart_rotation"
+text s_sum "CAPABILITY_TEST_PASS total=18 failed=0\n"
+text s_fsum "CAPABILITY_TEST_FAIL\n"
+
+fn report name view uchar * ok bool to uint
+if ok
+w1 = cap_write_all 1 s_pass
+w2 = cap_write_all 1 name
+w3 = cap_write_all 1 s_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = cap_write_all 1 s_fail
+w2 = cap_write_all 1 name
+w3 = cap_write_all 1 s_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn mk_root_req subj uint res ulong rgt uint ticks ulong off view CapRef dst edit CapMint to void
+put dst issuer 1
+put dst subject subj
+put dst resource res
+put dst rights rgt
+put dst lease_ticks ticks
+put dst parent_id CAP_PARENT_NONE
+put dst parent_generation 0
+put dst auth_id get off cap_id
+put dst auth_generation get off generation
+end
+
+fn mk_deleg_req subj uint res ulong rgt uint ticks ulong par view CapRef dst edit CapMint to void
+put dst issuer 2
+put dst subject subj
+put dst resource res
+put dst rights rgt
+put dst lease_ticks ticks
+put dst parent_id get par cap_id
+put dst parent_generation get par generation
+put dst auth_id get par cap_id
+put dst auth_generation get par generation
+end
+
+fn test_01_high_half_resource to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+hi_res = ulong 0x123456789abcdef0
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 42 hi_res CAP_RIGHT_READ 0 off req
+cref = new CapRef 0 0
+if ne cap_mint req cref CAP_OK
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate cref 42 hi_res CAP_RIGHT_READ ent CAP_OK
+ret false
+end
+if ne get ent resource hi_res
+ret false
+end
+note Low-32 collision must fail closed
+if ne cap_validate cref 42 0x9abcdef0 CAP_RIGHT_READ ent CAP_ERR_RESOURCE
+ret false
+end
+note Widen / narrow resource checks
+if ne cap_widen_resource 0xdeadbeef 0xdeadbeef
+ret false
+end
+n32 = new uint 1 0
+if ne cap_narrow_resource 0xdeadbeef n32 CAP_OK
+ret false
+end
+if ne get n32 0 0xdeadbeef
+ret false
+end
+if ne cap_narrow_resource hi_res n32 CAP_ERR_RESOURCE
+ret false
+end
+ret true
+end
+
+fn test_02_forged_stale_fail_closed to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+rc0 = cap_office off
+if ne rc0 CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 7 100 CAP_RIGHT_READ 0 off req
+cref = new CapRef 0 0
+if ne cap_mint req cref CAP_OK
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+note Out of bounds cap_id
+oob = new CapRef 256 get cref generation
+if ne cap_validate oob 7 100 CAP_RIGHT_READ ent CAP_ERR_BOUNDS
+ret false
+end
+if ne cap_inspect oob ent CAP_ERR_BOUNDS
+ret false
+end
+note Stale generation
+stale = new CapRef get cref cap_id add get cref generation 1
+if ne cap_validate stale 7 100 CAP_RIGHT_READ ent CAP_ERR_STALE_GEN
+ret false
+end
+if ne cap_inspect stale ent CAP_ERR_STALE_GEN
+ret false
+end
+note Free slot inspect refused
+free_ref = new CapRef 99 get off generation
+if ne cap_inspect free_ref ent CAP_ERR_STATE
+ret false
+end
+note Wrong subject, resource, rights
+if ne cap_validate cref 8 100 CAP_RIGHT_READ ent CAP_ERR_SUBJECT
+ret false
+end
+if ne cap_validate cref 7 101 CAP_RIGHT_READ ent CAP_ERR_RESOURCE
+ret false
+end
+if ne cap_validate cref 7 100 CAP_RIGHT_WRITE ent CAP_ERR_RIGHTS
+ret false
+end
+ret true
+end
+
+fn test_03_amplification_lease_epoch_revoke to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+r_rd = or CAP_RIGHT_READ CAP_RIGHT_DELEGATE
+mk_root_req 10 555 r_rd 100 off req
+par = new CapRef 0 0
+if ne cap_mint req par CAP_OK
+ret false
+end
+note Delegation narrowing succeeds
+mk_deleg_req 11 555 CAP_RIGHT_READ 50 par req
+ch = new CapRef 0 0
+if ne cap_mint req ch CAP_OK
+ret false
+end
+note Rights amplification refused
+mk_deleg_req 12 555 or CAP_RIGHT_READ CAP_RIGHT_WRITE 50 par req
+bad = new CapRef 0 0
+if ne cap_mint req bad CAP_ERR_AMPLIFY
+ret false
+end
+note Resource change during delegation refused
+mk_deleg_req 12 556 CAP_RIGHT_READ 50 par req
+if ne cap_mint req bad CAP_ERR_RESOURCE
+ret false
+end
+note Revoking parent cascades to child
+if ne cap_revoke off par CAP_OK
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate par 10 555 CAP_RIGHT_READ ent CAP_ERR_REVOKED
+ret false
+end
+if ne cap_validate ch 11 555 CAP_RIGHT_READ ent CAP_ERR_REVOKED
+ret false
+end
+note Epoch bump invalidates previously minted cap
+mk_root_req 13 777 CAP_RIGHT_READ 0 off req
+ep_cap = new CapRef 0 0
+if ne cap_mint req ep_cap CAP_OK
+ret false
+end
+if ne cap_bump_epoch off CAP_OK
+ret false
+end
+if ne cap_validate ep_cap 13 777 CAP_RIGHT_READ ent CAP_ERR_EPOCH
+ret false
+end
+ret true
+end
+
+fn test_04_child_lease_bound to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 10 200 or CAP_RIGHT_READ CAP_RIGHT_DELEGATE 50 off req
+par = new CapRef 0 0
+if ne cap_mint req par CAP_OK
+ret false
+end
+note Unbounded child lease refused when parent is bounded
+mk_deleg_req 11 200 CAP_RIGHT_READ 0 par req
+ch = new CapRef 0 0
+if ne cap_mint req ch CAP_ERR_AMPLIFY
+ret false
+end
+note Longer child lease refused
+mk_deleg_req 11 200 CAP_RIGHT_READ 51 par req
+if ne cap_mint req ch CAP_ERR_AMPLIFY
+ret false
+end
+note Equal child lease succeeds
+mk_deleg_req 11 200 CAP_RIGHT_READ 50 par req
+if ne cap_mint req ch CAP_OK
+ret false
+end
+ret true
+end
+
+fn test_05_privileged_not_delegable to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+note Privileged + DELEGATE refused
+mk_root_req 1 CAP_RES_AUTHORITY or CAP_RIGHT_MINT CAP_RIGHT_DELEGATE 0 off req
+bad = new CapRef 0 0
+if ne cap_mint req bad CAP_ERR_NOT_DELEGABLE
+ret false
+end
+note Sub-office with only REVOKE cannot revoke office with all privileged rights
+mk_root_req 2 CAP_RES_AUTHORITY CAP_RIGHT_REVOKE 0 off req
+sub_rev = new CapRef 0 0
+if ne cap_mint req sub_rev CAP_OK
+ret false
+end
+if ne cap_revoke sub_rev off CAP_ERR_UNAUTHORIZED
+ret false
+end
+note Office stays live
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate off 0 CAP_RES_AUTHORITY CAP_RIGHT_MINT ent CAP_OK
+ret false
+end
+ret true
+end
+
+fn test_06_promote_not_delegable to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 5 CAP_RES_AUTHORITY or CAP_RIGHT_PROMOTE CAP_RIGHT_DELEGATE 0 off req
+bad = new CapRef 0 0
+if ne cap_mint req bad CAP_ERR_NOT_DELEGABLE
+ret false
+end
+note Minting PROMOTE without DELEGATE succeeds
+mk_root_req 5 CAP_RES_AUTHORITY CAP_RIGHT_PROMOTE 0 off req
+prom = new CapRef 0 0
+if ne cap_mint req prom CAP_OK
+ret false
+end
+note Cannot delegate from PROMOTE cap
+mk_deleg_req 6 CAP_RES_AUTHORITY CAP_RIGHT_PROMOTE 0 prom req
+if ne cap_mint req bad CAP_ERR_NOT_DELEGABLE
+ret false
+end
+ret true
+end
+
+fn test_07_generation_exhaustion to bool
+nxt = new ulong 1 0
+if ne cap_generation_advance CAP_U64_MAX nxt CAP_ERR_EXHAUSTED
+ret false
+end
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 1 10 CAP_RIGHT_READ 0 off req
+c1 = new CapRef 0 0
+if ne cap_mint req c1 CAP_OK
+ret false
+end
+note Force generation on live slot refused
+if ne cap_force_generation get c1 cap_id CAP_U64_MAX CAP_ERR_STATE
+ret false
+end
+note Force generation to 0 refused
+if ne cap_force_generation 2 0 CAP_ERR_EXHAUSTED
+ret false
+end
+note Revoke slot 1, force its gen to U64_MAX -> reclaim must fail closed
+if ne cap_revoke off c1 CAP_OK
+ret false
+end
+if ne cap_force_generation get c1 cap_id CAP_U64_MAX CAP_OK
+ret false
+end
+if ne cap_reclaim off get c1 cap_id CAP_ERR_EXHAUSTED
+ret false
+end
+note Exhaust all free slots (2..255) -> mint must return CAP_ERR_EXHAUSTED
+i = uint 2
+while lt i CAP_MAX bound 256
+if ne cap_force_generation i CAP_U64_MAX CAP_OK
+ret false
+end
+i = add i 1
+end
+c2 = new CapRef 0 0
+if ne cap_mint req c2 CAP_ERR_EXHAUSTED
+ret false
+end
+ret true
+end
+
+fn test_08_kill_restart_cognition to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 9 99 CAP_RIGHT_READ 0 off req
+c1 = new CapRef 0 0
+if ne cap_mint req c1 CAP_OK
+ret false
+end
+note Cognition calls always fail closed
+tok = new uchar 32 0
+cap_copy_token tok
+if ne cap_cognition_mint req tok CAP_ERR_UNAUTHORIZED
+ret false
+end
+if ne cap_cognition_admin 1 off c1 CAP_ERR_UNAUTHORIZED
+ret false
+end
+note Kill stops all mutating operations with CAP_ERR_IO
+if ne cap_kill CAP_OK
+ret false
+end
+c2 = new CapRef 0 0
+if ne cap_mint req c2 CAP_ERR_IO
+ret false
+end
+if ne cap_revoke off c1 CAP_ERR_IO
+ret false
+end
+if ne cap_advance_clock off 1 CAP_ERR_IO
+ret false
+end
+if ne cap_bump_epoch off CAP_ERR_IO
+ret false
+end
+note Restart brings authority back with strictly higher generation
+old_gen = get off generation
+if ne cap_restart CAP_OK
+ret false
+end
+off2 = new CapRef 0 0
+if ne cap_office off2 CAP_OK
+ret false
+end
+if le get off2 generation old_gen
+ret false
+end
+note Old reference is stale after restart
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate c1 9 99 CAP_RIGHT_READ ent CAP_ERR_STALE_GEN
+ret false
+end
+ret true
+end
+
+fn test_09_reclaimed_stays_dead_after_restart to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 3 33 CAP_RIGHT_READ 0 off req
+c1 = new CapRef 0 0
+if ne cap_mint req c1 CAP_OK
+ret false
+end
+if ne cap_revoke off c1 CAP_OK
+ret false
+end
+if ne cap_reclaim off get c1 cap_id CAP_OK
+ret false
+end
+if ne cap_restart CAP_OK
+ret false
+end
+off2 = new CapRef 0 0
+if ne cap_office off2 CAP_OK
+ret false
+end
+if le get off2 generation add get c1 generation 1
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate c1 3 33 CAP_RIGHT_READ ent CAP_ERR_STALE_GEN
+ret false
+end
+ret true
+end
+
+fn test_10_gen_above_32_bits to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+hi_gen = ulong 0x0000000100000005
+if ne cap_force_generation 1 hi_gen CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 4 44 CAP_RIGHT_READ 0 off req
+c1 = new CapRef 0 0
+if ne cap_mint req c1 CAP_OK
+ret false
+end
+if ne get c1 cap_id 1
+ret false
+end
+if ne get c1 generation hi_gen
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate c1 4 44 CAP_RIGHT_READ ent CAP_OK
+ret false
+end
+note Low-32 truncated generation fails closed
+trunc = new CapRef 1 5
+if ne cap_validate trunc 4 44 CAP_RIGHT_READ ent CAP_ERR_STALE_GEN
+ret false
+end
+ret true
+end
+
+fn test_11_ordinary_no_admin_and_depth to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+r_rd = or CAP_RIGHT_READ CAP_RIGHT_DELEGATE
+mk_root_req 1 500 r_rd 0 off req
+cur = new CapRef 0 0
+if ne cap_mint req cur CAP_OK
+ret false
+end
+note Ordinary cap cannot revoke, reclaim, advance clock, or bump epoch
+if ne cap_revoke cur off CAP_ERR_UNAUTHORIZED
+ret false
+end
+if ne cap_reclaim cur 2 CAP_ERR_UNAUTHORIZED
+ret false
+end
+if ne cap_advance_clock cur 1 CAP_ERR_UNAUTHORIZED
+ret false
+end
+if ne cap_bump_epoch cur CAP_ERR_UNAUTHORIZED
+ret false
+end
+note Chain up to CAP_MAX_DEPTH = 8 succeeds
+nxt = new CapRef 0 0
+d = uint 0
+while lt d CAP_MAX_DEPTH bound 16
+mk_deleg_req add 2 d 500 r_rd 0 cur req
+if ne cap_mint req nxt CAP_OK
+ret false
+end
+put cur cap_id get nxt cap_id
+put cur generation get nxt generation
+d = add d 1
+end
+note 9th hop must fail with CAP_ERR_CHAIN
+mk_deleg_req 99 500 CAP_RIGHT_READ 0 cur req
+too_deep = new CapRef 0 0
+if ne cap_mint req too_deep CAP_ERR_CHAIN
+ret false
+end
+ret true
+end
+
+fn test_12_table_fills_then_refuses to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 1 100 CAP_RIGHT_READ 0 off req
+c = new CapRef 0 0
+note Slot 0 is office; slots 1..255 = 255 mints succeed
+i = uint 1
+while lt i CAP_MAX bound 256
+if ne cap_mint req c CAP_OK
+ret false
+end
+i = add i 1
+end
+note 256th mint fails with CAP_ERR_FULL
+if ne cap_mint req c CAP_ERR_FULL
+ret false
+end
+ret true
+end
+
+fn check_obs_rev idx ulong exp_id uint to bool
+ev = new CapObsEvent 0 0 0 0 0 0 0 0 0
+if not cap_obs_get idx ev
+ret false
+end
+if ne get ev op CAP_OBS_REVOKE
+ret false
+end
+if ne get ev cap_id exp_id
+ret false
+end
+ret true
+end
+
+fn check_obs_refusal idx ulong exp_op uint exp_rc int to bool
+ev = new CapObsEvent 0 0 0 0 0 0 0 0 0
+if not cap_obs_get idx ev
+ret false
+end
+if ne get ev op exp_op
+ret false
+end
+if ne get ev rc exp_rc
+ret false
+end
+if ne get ev has_entry 0
+ret false
+end
+ret true
+end
+
+fn test_13_observer_semantics to bool
+if ne cap_start CAP_OK
+ret false
+end
+cap_obs_clear
+cap_set_observer true
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+r_rd = or CAP_RIGHT_READ CAP_RIGHT_DELEGATE
+mk_root_req 1 888 r_rd 0 off req
+p = new CapRef 0 0
+if ne cap_mint req p CAP_OK
+ret false
+end
+mk_deleg_req 2 888 r_rd 0 p req
+c = new CapRef 0 0
+if ne cap_mint req c CAP_OK
+ret false
+end
+mk_deleg_req 3 888 CAP_RIGHT_READ 0 c req
+gc = new CapRef 0 0
+if ne cap_mint req gc CAP_OK
+ret false
+end
+note 3 MINT events
+if ne cap_obs_count 3
+ret false
+end
+note Validate (even denied) must NEVER emit an observer event
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate gc 999 888 CAP_RIGHT_READ ent CAP_ERR_SUBJECT
+ret false
+end
+if ne cap_obs_count 3
+ret false
+end
+note Cascade revoke must announce p, then c, then gc (ancestor first)
+if ne cap_revoke off p CAP_OK
+ret false
+end
+if ne cap_obs_count 6
+ret false
+end
+if not check_obs_rev 3 get p cap_id
+ret false
+end
+if not check_obs_rev 4 get c cap_id
+ret false
+end
+if not check_obs_rev 5 get gc cap_id
+ret false
+end
+note Refused admin op reports has_entry=0 and exact refusal code
+if ne cap_reclaim off 200 CAP_ERR_STATE
+ret false
+end
+if not check_obs_refusal 6 CAP_OBS_RECLAIM CAP_ERR_STATE
+ret false
+end
+note Disable observer -> silent on subsequent ops
+cap_set_observer false
+if ne cap_advance_clock off 5 CAP_OK
+ret false
+end
+if ne cap_obs_count 7
+ret false
+end
+ret true
+end
+
+fn test_14_validate_needs_all_rights to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 5 600 CAP_RIGHT_READ 0 off req
+c1 = new CapRef 0 0
+if ne cap_mint req c1 CAP_OK
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate c1 5 600 or CAP_RIGHT_READ CAP_RIGHT_WRITE ent CAP_ERR_RIGHTS
+ret false
+end
+mk_root_req 5 600 or CAP_RIGHT_READ CAP_RIGHT_WRITE 0 off req
+c2 = new CapRef 0 0
+if ne cap_mint req c2 CAP_OK
+ret false
+end
+if ne cap_validate c2 5 600 or CAP_RIGHT_READ CAP_RIGHT_WRITE ent CAP_OK
+ret false
+end
+ret true
+end
+
+fn test_15_lease_exact_tick_and_overflow to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 7 700 CAP_RIGHT_READ 10 off req
+c = new CapRef 0 0
+if ne cap_mint req c CAP_OK
+ret false
+end
+if ne cap_advance_clock off 9 CAP_OK
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate c 7 700 CAP_RIGHT_READ ent CAP_OK
+ret false
+end
+if ne cap_advance_clock off 1 CAP_OK
+ret false
+end
+if ne cap_validate c 7 700 CAP_RIGHT_READ ent CAP_ERR_EXPIRED
+ret false
+end
+note Clock overflow fails closed
+if ne cap_advance_clock off CAP_U64_MAX CAP_ERR_OVERFLOW
+ret false
+end
+if ne cap_clock 10
+ret false
+end
+ret true
+end
+
+fn test_16_corrupt_non_live_parent to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+mk_root_req 1 900 or CAP_RIGHT_READ CAP_RIGHT_DELEGATE 0 off req
+p = new CapRef 0 0
+if ne cap_mint req p CAP_OK
+ret false
+end
+mk_deleg_req 2 900 CAP_RIGHT_READ 0 p req
+c = new CapRef 0 0
+if ne cap_mint req c CAP_OK
+ret false
+end
+note Corrupt parent to REVOKED directly without cascading child
+if ne cap_corrupt_slot_state get p cap_id CAP_STATE_REVOKED CAP_OK
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate c 2 900 CAP_RIGHT_READ ent CAP_ERR_CHAIN
+ret false
+end
+ret true
+end
+
+fn test_17_control_resource_cannot_admin to bool
+if ne cap_start CAP_OK
+ret false
+end
+off = new CapRef 0 0
+if ne cap_office off CAP_OK
+ret false
+end
+req = new CapMint 0 0 0 0 0 0 0 0 0
+note Capability carrying CAP_RIGHT_EPOCH on non-authority resource 0x999
+mk_root_req 8 0x999 CAP_RIGHT_EPOCH 0 off req
+ctrl = new CapRef 0 0
+if ne cap_mint req ctrl CAP_OK
+ret false
+end
+if ne cap_bump_epoch ctrl CAP_ERR_RESOURCE
+ret false
+end
+ret true
+end
+
+fn test_18_office_token_auth_and_rotation to bool
+if ne cap_start CAP_OK
+ret false
+end
+t1 = new uchar 32 0
+cap_copy_token t1
+if ne cap_authorize t1 CAP_OK
+ret false
+end
+note Flip 1 bit -> must fail closed
+bad = new uchar 32 0
+for i ulong 32
+put bad i get t1 i
+end
+put bad 15 xor get bad 15 1
+if ne cap_authorize bad CAP_ERR_UNAUTHORIZED
+ret false
+end
+note Restart rotates token -> old token rejected, new token accepted
+if ne cap_restart CAP_OK
+ret false
+end
+if ne cap_authorize t1 CAP_ERR_UNAUTHORIZED
+ret false
+end
+t2 = new uchar 32 0
+cap_copy_token t2
+if ne cap_authorize t2 CAP_OK
+ret false
+end
+ret true
+end
+
+fn main to int
+failed = uint 0
+failed = add failed report s_t01 test_01_high_half_resource
+failed = add failed report s_t02 test_02_forged_stale_fail_closed
+failed = add failed report s_t03 test_03_amplification_lease_epoch_revoke
+failed = add failed report s_t04 test_04_child_lease_bound
+failed = add failed report s_t05 test_05_privileged_not_delegable
+failed = add failed report s_t06 test_06_promote_not_delegable
+failed = add failed report s_t07 test_07_generation_exhaustion
+failed = add failed report s_t08 test_08_kill_restart_cognition
+failed = add failed report s_t09 test_09_reclaimed_stays_dead_after_restart
+failed = add failed report s_t10 test_10_gen_above_32_bits
+failed = add failed report s_t11 test_11_ordinary_no_admin_and_depth
+failed = add failed report s_t12 test_12_table_fills_then_refuses
+failed = add failed report s_t13 test_13_observer_semantics
+failed = add failed report s_t14 test_14_validate_needs_all_rights
+failed = add failed report s_t15 test_15_lease_exact_tick_and_overflow
+failed = add failed report s_t16 test_16_corrupt_non_live_parent
+failed = add failed report s_t17 test_17_control_resource_cannot_admin
+failed = add failed report s_t18 test_18_office_token_auth_and_rotation
+if eq failed 0
+w = cap_write_all 1 s_sum
+if w
+ret 0
+end
+ret 1
+end
+w = cap_write_all 1 s_fsum
+if w
+ret 1
+end
+ret 1
+end

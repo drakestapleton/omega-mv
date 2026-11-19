@@ -1,0 +1,934 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/capability/lib.om: Pure-Omega AIENOS 64-bit Generation Capability Authority.
+note Faithful OM-2 library (no om2 line, no fn main) converted from upstream aienux
+note native/capability/aienos_capability.{h,c} and crates/aienos-capability/src/lib.rs.
+note Compose with: si/directives/om2.om aienux/capability/lib.om <test.om|main.om>
+
+struct CapRef cap_id uint generation ulong end
+
+struct CapEntry cap_id uint generation ulong state uint issuer uint subject uint rights uint resource ulong epoch ulong lease_expiry ulong parent_id uint parent_generation ulong minted_by_id uint minted_by_generation ulong end
+
+struct CapMint issuer uint subject uint resource ulong rights uint lease_ticks ulong parent_id uint parent_generation ulong auth_id uint auth_generation ulong end
+
+struct CapObsEvent op uint rc int has_entry uint cap_id uint generation ulong state uint rights uint resource ulong parent_id uint end
+
+note Constants matching native/capability/aienos_capability.h
+const CAP_MAX uint 256
+const CAP_MAX_U ulong 256
+const CAP_MAX_DEPTH uint 8
+const CAP_TOKEN_LEN ulong 32
+const CAP_RES_AUTHORITY ulong 0
+const CAP_PARENT_NONE uint 0xffffffff
+const CAP_U32_MAX ulong 0xffffffff
+const CAP_U64_MAX ulong 0xffffffffffffffff
+const CAP_OBS_MAX ulong 512
+
+note Return / refusal codes
+const CAP_OK int 0
+const CAP_ERR_BOUNDS int -1
+const CAP_ERR_STALE_GEN int -2
+const CAP_ERR_REVOKED int -3
+const CAP_ERR_EPOCH int -4
+const CAP_ERR_SUBJECT int -5
+const CAP_ERR_RESOURCE int -6
+const CAP_ERR_RIGHTS int -7
+const CAP_ERR_EXPIRED int -8
+const CAP_ERR_CHAIN int -9
+const CAP_ERR_AMPLIFY int -10
+const CAP_ERR_NOT_DELEGABLE int -11
+const CAP_ERR_FULL int -12
+const CAP_ERR_IO int -13
+const CAP_ERR_STATE int -14
+const CAP_ERR_UNAUTHORIZED int -15
+const CAP_ERR_OVERFLOW int -16
+const CAP_ERR_EXHAUSTED int -17
+
+note Capability rights bitmask
+const CAP_RIGHT_READ uint 0x1
+const CAP_RIGHT_WRITE uint 0x2
+const CAP_RIGHT_EFFECT uint 0x4
+const CAP_RIGHT_DELEGATE uint 0x8
+const CAP_RIGHT_MINT uint 0x10
+const CAP_RIGHT_REVOKE uint 0x20
+const CAP_RIGHT_RECLAIM uint 0x40
+const CAP_RIGHT_EPOCH uint 0x80
+const CAP_RIGHT_CLOCK uint 0x100
+const CAP_RIGHT_PROMOTE uint 0x200
+const CAP_RIGHT_PRIVILEGED uint 0x3f0
+const CAP_RIGHT_KNOWN uint 0x3ff
+
+note Slot states
+const CAP_STATE_FREE uint 0
+const CAP_STATE_LIVE uint 1
+const CAP_STATE_REVOKED uint 2
+
+note Observer operation codes
+const CAP_OBS_MINT uint 1
+const CAP_OBS_REVOKE uint 2
+const CAP_OBS_RECLAIM uint 3
+const CAP_OBS_EPOCH uint 4
+const CAP_OBS_CLOCK uint 5
+const CAP_OBS_KILL uint 6
+const CAP_OBS_RESTART uint 7
+const CAP_OBS_VALIDATE_DENIED uint 8
+
+note Authority metadata indices in cap_meta
+const CAP_META_BOOT_GEN ulong 0
+const CAP_META_EPOCH ulong 1
+const CAP_META_CLOCK ulong 2
+const CAP_META_ALIVE ulong 3
+const CAP_META_LAST_BOOT ulong 4
+const CAP_META_OBS_ON ulong 5
+const CAP_META_OBS_CNT ulong 6
+const CAP_META_TOKEN_SEQ ulong 7
+
+note Authority state tables (256 slots)
+global cap_meta ulong 8
+global cap_gen ulong 256
+global cap_state uint 256
+global cap_issuer uint 256
+global cap_subject uint 256
+global cap_rights uint 256
+global cap_res ulong 256
+global cap_epoch ulong 256
+global cap_expiry ulong 256
+global cap_pid uint 256
+global cap_pgen ulong 256
+global cap_mbid uint 256
+global cap_mbgen ulong 256
+global cap_deliv uchar 256
+
+note Office token kept outside the capability table
+global cap_token uchar 32
+
+note Scratch array for cascade revoke slot IDs
+global cap_rev_ids uint 256
+
+note Observer event log (512 entries)
+global cap_obs_op uint 512
+global cap_obs_rc int 512
+global cap_obs_has uint 512
+global cap_obs_cid uint 512
+global cap_obs_gen ulong 512
+global cap_obs_st uint 512
+global cap_obs_rgt uint 512
+global cap_obs_res ulong 512
+global cap_obs_pid uint 512
+
+note ---- Checked arithmetic and resource width helpers ----
+
+fn cap_widen_resource id uint to ulong
+ret ulong id
+end
+
+fn cap_narrow_resource id ulong dst edit uint 1 to int
+if gt id CAP_U32_MAX
+ret CAP_ERR_RESOURCE
+end
+put dst 0 uint id
+ret CAP_OK
+end
+
+fn cap_generation_advance gen ulong dst edit ulong 1 to int
+if eq gen CAP_U64_MAX
+ret CAP_ERR_EXHAUSTED
+end
+put dst 0 add gen 1
+ret CAP_OK
+end
+
+fn cap_add_u64 a ulong b ulong dst edit ulong 1 to int
+if gt b sub CAP_U64_MAX a
+ret CAP_ERR_OVERFLOW
+end
+put dst 0 add a b
+ret CAP_OK
+end
+
+note ---- Internal table and observer helpers ----
+
+fn cap_slot_expired idx ulong to bool
+exp = get cap_expiry idx
+if eq exp 0
+ret false
+end
+clk = get cap_meta CAP_META_CLOCK
+ret ge clk exp
+end
+
+fn cap_load_entry idx ulong dst edit CapEntry to void
+put dst cap_id uint idx
+put dst generation get cap_gen idx
+put dst state get cap_state idx
+put dst issuer get cap_issuer idx
+put dst subject get cap_subject idx
+put dst rights get cap_rights idx
+put dst resource get cap_res idx
+put dst epoch get cap_epoch idx
+put dst lease_expiry get cap_expiry idx
+put dst parent_id get cap_pid idx
+put dst parent_generation get cap_pgen idx
+put dst minted_by_id get cap_mbid idx
+put dst minted_by_generation get cap_mbgen idx
+end
+
+fn cap_obs_emit_none op uint rc int to void
+if eq get cap_meta CAP_META_OBS_ON 0
+ret
+end
+cnt = get cap_meta CAP_META_OBS_CNT
+if ge cnt CAP_OBS_MAX
+ret
+end
+put cap_obs_op cnt op
+put cap_obs_rc cnt rc
+put cap_obs_has cnt 0
+put cap_obs_cid cnt 0
+put cap_obs_gen cnt 0
+put cap_obs_st cnt 0
+put cap_obs_rgt cnt 0
+put cap_obs_res cnt 0
+put cap_obs_pid cnt CAP_PARENT_NONE
+put cap_meta CAP_META_OBS_CNT add cnt 1
+end
+
+fn cap_obs_emit_slot op uint idx ulong rc int to void
+if eq get cap_meta CAP_META_OBS_ON 0
+ret
+end
+cnt = get cap_meta CAP_META_OBS_CNT
+if ge cnt CAP_OBS_MAX
+ret
+end
+put cap_obs_op cnt op
+put cap_obs_rc cnt rc
+put cap_obs_has cnt 1
+put cap_obs_cid cnt uint idx
+put cap_obs_gen cnt get cap_gen idx
+put cap_obs_st cnt get cap_state idx
+put cap_obs_rgt cnt get cap_rights idx
+put cap_obs_res cnt get cap_res idx
+put cap_obs_pid cnt get cap_pid idx
+put cap_meta CAP_META_OBS_CNT add cnt 1
+end
+
+fn cap_set_observer enabled bool to void
+if enabled
+put cap_meta CAP_META_OBS_ON 1
+else
+put cap_meta CAP_META_OBS_ON 0
+end
+end
+
+fn cap_obs_clear to void
+put cap_meta CAP_META_OBS_CNT 0
+end
+
+fn cap_obs_count to ulong
+ret get cap_meta CAP_META_OBS_CNT
+end
+
+fn cap_obs_get idx ulong dst edit CapObsEvent to bool
+cnt = get cap_meta CAP_META_OBS_CNT
+if ge idx cnt
+ret false
+end
+put dst op get cap_obs_op idx
+put dst rc get cap_obs_rc idx
+put dst has_entry get cap_obs_has idx
+put dst cap_id get cap_obs_cid idx
+put dst generation get cap_obs_gen idx
+put dst state get cap_obs_st idx
+put dst rights get cap_obs_rgt idx
+put dst resource get cap_obs_res idx
+put dst parent_id get cap_obs_pid idx
+ret true
+end
+
+fn cap_fill_token to void
+seq = add get cap_meta CAP_META_TOKEN_SEQ 1
+put cap_meta CAP_META_TOKEN_SEQ seq
+bgen = get cap_meta CAP_META_BOOT_GEN
+state = xor mul seq 0x9e3779b97f4a7c15 bgen
+for i ulong 32
+state = xor state shr state 12
+state = xor state shl state 25
+state = xor state shr state 27
+mix = mul state 0x2545f4914f6cdd1d
+put cap_token i uchar and shr mix 56 0xff
+end
+end
+
+fn cap_take_boot_gen floor ulong dst edit ulong 1 to int
+cur = get cap_meta CAP_META_LAST_BOOT
+if eq cur CAP_U64_MAX
+ret CAP_ERR_EXHAUSTED
+end
+nxt = add cur 1
+if gt floor nxt
+nxt = floor
+end
+if eq nxt CAP_U64_MAX
+ret CAP_ERR_EXHAUSTED
+end
+put cap_meta CAP_META_LAST_BOOT nxt
+put dst 0 nxt
+ret CAP_OK
+end
+
+fn cap_table_floor to ulong
+top = get cap_meta CAP_META_BOOT_GEN
+for i ulong 256
+g = get cap_gen i
+if gt g top
+top = g
+end
+pg = get cap_pgen i
+if gt pg top
+top = pg
+end
+mg = get cap_mbgen i
+if gt mg top
+top = mg
+end
+end
+if eq top CAP_U64_MAX
+ret CAP_U64_MAX
+end
+ret add top 1
+end
+
+fn cap_bootstrap boot_gen ulong to int
+if or eq boot_gen 0 eq boot_gen CAP_U64_MAX
+ret CAP_ERR_EXHAUSTED
+end
+put cap_meta CAP_META_BOOT_GEN boot_gen
+put cap_meta CAP_META_EPOCH 1
+put cap_meta CAP_META_CLOCK 0
+put cap_meta CAP_META_ALIVE 1
+for i ulong 256
+put cap_gen i boot_gen
+put cap_state i CAP_STATE_FREE
+put cap_issuer i 0
+put cap_subject i 0
+put cap_rights i 0
+put cap_res i 0
+put cap_epoch i 0
+put cap_expiry i 0
+put cap_pid i CAP_PARENT_NONE
+put cap_pgen i 0
+put cap_mbid i 0
+put cap_mbgen i 0
+put cap_deliv i 0
+end
+put cap_state 0 CAP_STATE_LIVE
+put cap_res 0 CAP_RES_AUTHORITY
+put cap_rights 0 CAP_RIGHT_PRIVILEGED
+put cap_epoch 0 1
+put cap_deliv 0 1
+ret CAP_OK
+end
+
+fn cap_chain_ok entry_id uint to int
+cur = entry_id
+depth = uint 0
+note At most CAP_MAX_DEPTH + 1 hops before returning CAP_ERR_CHAIN.
+while true bound 16
+idx = ulong cur
+pid = get cap_pid idx
+if eq pid CAP_PARENT_NONE
+ret CAP_OK
+end
+depth = add depth 1
+if gt depth CAP_MAX_DEPTH
+ret CAP_ERR_CHAIN
+end
+if ge pid CAP_MAX
+ret CAP_ERR_CHAIN
+end
+pidx = ulong pid
+if ne get cap_gen pidx get cap_pgen idx
+ret CAP_ERR_CHAIN
+end
+if ne get cap_state pidx CAP_STATE_LIVE
+ret CAP_ERR_CHAIN
+end
+cur = pid
+end
+ret CAP_ERR_CHAIN
+end
+
+fn cap_ancestor_hops entry_id uint to uint
+cur = entry_id
+hops = uint 0
+note Stops once parent is NONE or hops exceeds CAP_MAX_DEPTH.
+while true bound 16
+idx = ulong cur
+pid = get cap_pid idx
+if eq pid CAP_PARENT_NONE
+ret hops
+end
+if gt hops CAP_MAX_DEPTH
+ret hops
+end
+if ge pid CAP_MAX
+ret add CAP_MAX_DEPTH 1
+end
+hops = add hops 1
+cur = pid
+end
+ret add CAP_MAX_DEPTH 1
+end
+
+fn cap_auth_use auth_id uint auth_gen ulong need uint to int
+if ge auth_id CAP_MAX
+ret CAP_ERR_UNAUTHORIZED
+end
+idx = ulong auth_id
+if eq get cap_deliv idx 0
+ret CAP_ERR_UNAUTHORIZED
+end
+if ne get cap_gen idx auth_gen
+ret CAP_ERR_STALE_GEN
+end
+if ne get cap_state idx CAP_STATE_LIVE
+ret CAP_ERR_REVOKED
+end
+if ne get cap_epoch idx get cap_meta CAP_META_EPOCH
+ret CAP_ERR_EPOCH
+end
+if cap_slot_expired idx
+ret CAP_ERR_EXPIRED
+end
+rc = cap_chain_ok auth_id
+if ne rc CAP_OK
+ret rc
+end
+rgt = get cap_rights idx
+if ne and rgt need need
+ret CAP_ERR_UNAUTHORIZED
+end
+if ne and need CAP_RIGHT_PRIVILEGED 0
+if ne get cap_res idx CAP_RES_AUTHORITY
+ret CAP_ERR_RESOURCE
+end
+end
+ret CAP_OK
+end
+
+fn cap_lease_expiry ticks ulong dst edit ulong 1 to int
+if eq ticks 0
+put dst 0 0
+ret CAP_OK
+end
+clk = get cap_meta CAP_META_CLOCK
+ret cap_add_u64 clk ticks dst
+end
+
+note ---- Public Capability Authority API ----
+
+fn cap_start to int
+b = new ulong 1 0
+rc = cap_take_boot_gen 0 b
+if ne rc CAP_OK
+ret rc
+end
+rc = cap_bootstrap get b 0
+if ne rc CAP_OK
+ret rc
+end
+cap_fill_token
+ret CAP_OK
+end
+
+fn cap_office dst edit CapRef to int
+put dst cap_id 0
+put dst generation get cap_gen 0
+ret CAP_OK
+end
+
+fn cap_clock to ulong
+ret get cap_meta CAP_META_CLOCK
+end
+
+fn cap_epoch_now to ulong
+ret get cap_meta CAP_META_EPOCH
+end
+
+fn cap_copy_token dst edit uchar 32 to void
+for i ulong 32
+put dst i get cap_token i
+end
+end
+
+fn cap_authorize presented view uchar 32 to int
+diff = uchar 0
+for i ulong 32
+x = xor get cap_token i get presented i
+diff = or diff x
+end
+if eq diff 0
+ret CAP_OK
+end
+ret CAP_ERR_UNAUTHORIZED
+end
+
+fn cap_inspect cap view CapRef dst edit CapEntry to int
+cid = get cap cap_id
+if ge cid CAP_MAX
+ret CAP_ERR_BOUNDS
+end
+idx = ulong cid
+if ne get cap_gen idx get cap generation
+ret CAP_ERR_STALE_GEN
+end
+if eq get cap_state idx CAP_STATE_FREE
+ret CAP_ERR_STATE
+end
+cap_load_entry idx dst
+ret CAP_OK
+end
+
+fn cap_validate_chain cap view CapRef to int
+cid = get cap cap_id
+if ge cid CAP_MAX
+ret CAP_ERR_BOUNDS
+end
+chain = new uint 9 0
+n = uint 0
+cur = cid
+note Walk up to CAP_MAX_DEPTH + 1 slots; cycle or depth > 8 returns CAP_ERR_CHAIN.
+while ne cur CAP_PARENT_NONE bound 16
+if gt n CAP_MAX_DEPTH
+ret CAP_ERR_CHAIN
+end
+if ge cur CAP_MAX
+ret CAP_ERR_CHAIN
+end
+put chain ulong n cur
+cur = get cap_pid ulong cur
+n = add n 1
+end
+eidx = ulong get chain 0
+if ne get cap_gen eidx get cap generation
+ret CAP_ERR_STALE_GEN
+end
+if ne get cap_state eidx CAP_STATE_LIVE
+ret CAP_ERR_REVOKED
+end
+cur_ep = get cap_meta CAP_META_EPOCH
+if ne get cap_epoch eidx cur_ep
+ret CAP_ERR_EPOCH
+end
+if cap_slot_expired eidx
+ret CAP_ERR_EXPIRED
+end
+i = uint 1
+while lt i n bound 16
+pidx = ulong get chain ulong i
+cidx = ulong get chain ulong sub i 1
+if ne get cap_gen pidx get cap_pgen cidx
+ret CAP_ERR_CHAIN
+end
+if ne get cap_state pidx CAP_STATE_LIVE
+ret CAP_ERR_CHAIN
+end
+if ne get cap_epoch pidx cur_ep
+ret CAP_ERR_CHAIN
+end
+if cap_slot_expired pidx
+ret CAP_ERR_CHAIN
+end
+i = add i 1
+end
+ret CAP_OK
+end
+
+fn cap_validate cap view CapRef subj uint res ulong req_rights uint dst edit CapEntry to int
+rc = cap_validate_chain cap
+if ne rc CAP_OK
+ret rc
+end
+eidx = ulong get cap cap_id
+if ne get cap_subject eidx subj
+ret CAP_ERR_SUBJECT
+end
+if ne get cap_res eidx res
+ret CAP_ERR_RESOURCE
+end
+if ne and get cap_rights eidx req_rights req_rights
+ret CAP_ERR_RIGHTS
+end
+cap_load_entry eidx dst
+ret CAP_OK
+end
+
+fn cap_mint_check_root req view CapMint to int
+aid = get req auth_id
+agen = get req auth_generation
+rc = cap_auth_use aid agen CAP_RIGHT_MINT
+if ne rc CAP_OK
+ret rc
+end
+arights = get cap_rights ulong aid
+req_priv = and get req rights CAP_RIGHT_PRIVILEGED
+missing = and req_priv xor arights 0xffffffff
+if ne missing 0
+ret CAP_ERR_UNAUTHORIZED
+end
+ret CAP_OK
+end
+
+fn cap_mint_check_deleg req view CapMint to int
+cexp = new ulong 1 0
+aid = get req auth_id
+agen = get req auth_generation
+pid = get req parent_id
+pgen = get req parent_generation
+if ne aid pid
+ret CAP_ERR_UNAUTHORIZED
+end
+if ne agen pgen
+ret CAP_ERR_UNAUTHORIZED
+end
+rc = cap_auth_use aid agen 0
+if ne rc CAP_OK
+ret rc
+end
+aidx = ulong aid
+arights = get cap_rights aidx
+if eq and arights CAP_RIGHT_DELEGATE 0
+ret CAP_ERR_NOT_DELEGABLE
+end
+if ge pid CAP_MAX
+ret CAP_ERR_BOUNDS
+end
+if ne get cap_res aidx get req resource
+ret CAP_ERR_RESOURCE
+end
+rgt = get req rights
+if ne and rgt xor arights 0xffffffff 0
+ret CAP_ERR_AMPLIFY
+end
+if ne and rgt CAP_RIGHT_PRIVILEGED 0
+ret CAP_ERR_NOT_DELEGABLE
+end
+if ge cap_ancestor_hops pid CAP_MAX_DEPTH
+ret CAP_ERR_CHAIN
+end
+aexp = get cap_expiry aidx
+if ne aexp 0
+rc = cap_lease_expiry get req lease_ticks cexp
+if ne rc CAP_OK
+ret rc
+end
+cval = get cexp 0
+if or eq cval 0 gt cval aexp
+ret CAP_ERR_AMPLIFY
+end
+end
+ret CAP_OK
+end
+
+fn cap_mint_alloc req view CapMint expiry ulong dst edit CapRef to int
+aid = get req auth_id
+aidx = ulong aid
+amb_id = aid
+amb_gen = get cap_gen aidx
+pid = get req parent_id
+pgen = ulong 0
+if ne pid CAP_PARENT_NONE
+pgen = get req parent_generation
+end
+saw_exh = false
+for i ulong 256
+if eq get cap_state i CAP_STATE_FREE
+g = get cap_gen i
+if eq g CAP_U64_MAX
+saw_exh = true
+else
+put cap_state i CAP_STATE_LIVE
+put cap_issuer i get req issuer
+put cap_subject i get req subject
+put cap_res i get req resource
+put cap_rights i get req rights
+put cap_epoch i get cap_meta CAP_META_EPOCH
+put cap_expiry i expiry
+put cap_pid i pid
+put cap_pgen i pgen
+put cap_mbid i amb_id
+put cap_mbgen i amb_gen
+put cap_deliv i 1
+put dst cap_id uint i
+put dst generation g
+ret CAP_OK
+end
+end
+end
+if saw_exh
+ret CAP_ERR_EXHAUSTED
+end
+ret CAP_ERR_FULL
+end
+
+fn cap_mint req view CapMint dst edit CapRef to int
+if eq get cap_meta CAP_META_ALIVE 0
+cap_obs_emit_none CAP_OBS_MINT CAP_ERR_IO
+ret CAP_ERR_IO
+end
+rgt = get req rights
+inv_known = xor CAP_RIGHT_KNOWN 0xffffffff
+if or eq rgt 0 ne and rgt inv_known 0
+cap_obs_emit_none CAP_OBS_MINT CAP_ERR_RIGHTS
+ret CAP_ERR_RIGHTS
+end
+if and ne and rgt CAP_RIGHT_PRIVILEGED 0 ne and rgt CAP_RIGHT_DELEGATE 0
+cap_obs_emit_none CAP_OBS_MINT CAP_ERR_NOT_DELEGABLE
+ret CAP_ERR_NOT_DELEGABLE
+end
+rc = int 0
+if eq get req parent_id CAP_PARENT_NONE
+rc = cap_mint_check_root req
+else
+rc = cap_mint_check_deleg req
+end
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_MINT rc
+ret rc
+end
+exp = new ulong 1 0
+rc = cap_lease_expiry get req lease_ticks exp
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_MINT rc
+ret rc
+end
+rc = cap_mint_alloc req get exp 0 dst
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_MINT rc
+ret rc
+end
+cap_obs_emit_slot CAP_OBS_MINT ulong get dst cap_id CAP_OK
+ret CAP_OK
+end
+
+fn cap_cascade_revoke start_n uint to uint
+n = start_n
+for guard uint 256
+changed = false
+for i ulong 256
+if eq get cap_state i CAP_STATE_LIVE
+pid = get cap_pid i
+if ne pid CAP_PARENT_NONE
+if lt pid CAP_MAX
+pidx = ulong pid
+if and eq get cap_gen pidx get cap_pgen i eq get cap_state pidx CAP_STATE_REVOKED
+put cap_state i CAP_STATE_REVOKED
+if lt n CAP_MAX
+put cap_rev_ids ulong n uint i
+n = add n 1
+end
+changed = true
+end
+end
+end
+end
+end
+if not changed
+break
+end
+end
+ret n
+end
+
+fn cap_revoke auth view CapRef target view CapRef to int
+if eq get cap_meta CAP_META_ALIVE 0
+cap_obs_emit_none CAP_OBS_REVOKE CAP_ERR_IO
+ret CAP_ERR_IO
+end
+rc = cap_auth_use get auth cap_id get auth generation CAP_RIGHT_REVOKE
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_REVOKE rc
+ret rc
+end
+tid = get target cap_id
+if ge tid CAP_MAX
+cap_obs_emit_none CAP_OBS_REVOKE CAP_ERR_BOUNDS
+ret CAP_ERR_BOUNDS
+end
+tidx = ulong tid
+if ne get cap_gen tidx get target generation
+cap_obs_emit_none CAP_OBS_REVOKE CAP_ERR_STALE_GEN
+ret CAP_ERR_STALE_GEN
+end
+if ne get cap_state tidx CAP_STATE_LIVE
+cap_obs_emit_none CAP_OBS_REVOKE CAP_ERR_STATE
+ret CAP_ERR_STATE
+end
+arights = get cap_rights ulong get auth cap_id
+tpriv = and get cap_rights tidx CAP_RIGHT_PRIVILEGED
+if ne and tpriv xor arights 0xffffffff 0
+cap_obs_emit_none CAP_OBS_REVOKE CAP_ERR_UNAUTHORIZED
+ret CAP_ERR_UNAUTHORIZED
+end
+put cap_state tidx CAP_STATE_REVOKED
+put cap_rev_ids 0 tid
+n = cap_cascade_revoke 1
+k = uint 0
+note At most CAP_MAX slots can be revoked in one cascade.
+while lt k n bound 256
+sid = get cap_rev_ids ulong k
+cap_obs_emit_slot CAP_OBS_REVOKE ulong sid CAP_OK
+k = add k 1
+end
+ret CAP_OK
+end
+
+fn cap_reclaim auth view CapRef cid uint to int
+if eq get cap_meta CAP_META_ALIVE 0
+cap_obs_emit_none CAP_OBS_RECLAIM CAP_ERR_IO
+ret CAP_ERR_IO
+end
+rc = cap_auth_use get auth cap_id get auth generation CAP_RIGHT_RECLAIM
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_RECLAIM rc
+ret rc
+end
+if ge cid CAP_MAX
+cap_obs_emit_none CAP_OBS_RECLAIM CAP_ERR_BOUNDS
+ret CAP_ERR_BOUNDS
+end
+idx = ulong cid
+if ne get cap_state idx CAP_STATE_REVOKED
+cap_obs_emit_none CAP_OBS_RECLAIM CAP_ERR_STATE
+ret CAP_ERR_STATE
+end
+nxt = new ulong 1 0
+rc = cap_generation_advance get cap_gen idx nxt
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_RECLAIM rc
+ret rc
+end
+put cap_gen idx get nxt 0
+put cap_state idx CAP_STATE_FREE
+put cap_rights idx 0
+put cap_expiry idx 0
+put cap_pid idx CAP_PARENT_NONE
+put cap_pgen idx 0
+put cap_deliv idx 0
+cap_obs_emit_slot CAP_OBS_RECLAIM idx CAP_OK
+ret CAP_OK
+end
+
+fn cap_advance_clock auth view CapRef ticks ulong to int
+if eq get cap_meta CAP_META_ALIVE 0
+cap_obs_emit_none CAP_OBS_CLOCK CAP_ERR_IO
+ret CAP_ERR_IO
+end
+rc = cap_auth_use get auth cap_id get auth generation CAP_RIGHT_CLOCK
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_CLOCK rc
+ret rc
+end
+nxt = new ulong 1 0
+rc = cap_add_u64 get cap_meta CAP_META_CLOCK ticks nxt
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_CLOCK rc
+ret rc
+end
+put cap_meta CAP_META_CLOCK get nxt 0
+cap_obs_emit_slot CAP_OBS_CLOCK ulong get auth cap_id CAP_OK
+ret CAP_OK
+end
+
+fn cap_bump_epoch auth view CapRef to int
+if eq get cap_meta CAP_META_ALIVE 0
+cap_obs_emit_none CAP_OBS_EPOCH CAP_ERR_IO
+ret CAP_ERR_IO
+end
+rc = cap_auth_use get auth cap_id get auth generation CAP_RIGHT_EPOCH
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_EPOCH rc
+ret rc
+end
+nxt = new ulong 1 0
+rc = cap_add_u64 get cap_meta CAP_META_EPOCH 1 nxt
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_EPOCH rc
+ret rc
+end
+put cap_meta CAP_META_EPOCH get nxt 0
+cap_obs_emit_slot CAP_OBS_EPOCH ulong get auth cap_id CAP_OK
+ret CAP_OK
+end
+
+fn cap_kill to int
+put cap_meta CAP_META_ALIVE 0
+cap_obs_emit_none CAP_OBS_KILL CAP_OK
+ret CAP_OK
+end
+
+fn cap_restart to int
+fl = cap_table_floor
+b = new ulong 1 0
+rc = cap_take_boot_gen fl b
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_RESTART rc
+ret rc
+end
+rc = cap_bootstrap get b 0
+if ne rc CAP_OK
+cap_obs_emit_none CAP_OBS_RESTART rc
+ret rc
+end
+cap_fill_token
+cap_obs_emit_slot CAP_OBS_RESTART 0 CAP_OK
+ret CAP_OK
+end
+
+fn cap_cognition_mint req view CapMint tok view uchar 32 to int
+ret CAP_ERR_UNAUTHORIZED
+end
+
+fn cap_cognition_admin op uint auth view CapRef target view CapRef to int
+ret CAP_ERR_UNAUTHORIZED
+end
+
+fn cap_force_generation cid uint gen ulong to int
+if ge cid CAP_MAX
+ret CAP_ERR_BOUNDS
+end
+idx = ulong cid
+if eq get cap_state idx CAP_STATE_LIVE
+ret CAP_ERR_STATE
+end
+if eq gen 0
+ret CAP_ERR_EXHAUSTED
+end
+put cap_gen idx gen
+ret CAP_OK
+end
+
+note Test seam for corrupt-table negative control (simulates non-live parent with live child)
+fn cap_corrupt_slot_state cid uint st uint to int
+if ge cid CAP_MAX
+ret CAP_ERR_BOUNDS
+end
+put cap_state ulong cid st
+ret CAP_OK
+end
+
+note ---- Small I/O helpers for test drivers ----
+
+fn cap_write_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+note Each write advances off by at least 1 byte on progress; 4096 covers small test lines.
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
