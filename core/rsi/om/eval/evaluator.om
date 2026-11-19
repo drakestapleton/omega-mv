@@ -1,0 +1,157 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/rsi/om/eval/evaluator.om
+note Pure OM-2 conversion of spark-rsi-mv/src/evaluator/{mod,metrics,stats,layers/*}.rs.
+note Deterministic multi-layer candidate evaluator: correctness, security, longitudinal
+note replay, performance delta (bps), resource efficiency delta (bps), and style bounds.
+note Compose immediately after si/directives/om2.om (before om/tls/sha2.om because of struct).
+
+note Evaluator verdicts
+const EV_PASS ulong 0
+const EV_DENY_UNINIT ulong 1
+const EV_DENY_INVALID_SAMPLE ulong 2
+const EV_DENY_CORRECTNESS ulong 3
+const EV_DENY_SECURITY ulong 4
+const EV_DENY_REPLAY ulong 5
+const EV_DENY_PERF_REGRESS ulong 6
+const EV_DENY_RES_REGRESS ulong 7
+const EV_DENY_STYLE ulong 8
+
+const EV_BPS_SCALE ulong 10000
+const EV_MAX_SAFE_METRIC ulong 900000000000000
+
+struct EvalSample cand_id ulong tests_passed ulong tests_total ulong sec_critical ulong sec_high ulong base_ns ulong cand_ns ulong base_mem_kb ulong cand_mem_kb ulong replay_ok ulong style_violations ulong end
+
+note Config: [0]=init(0/1), [1]=min_corr_bps, [2]=max_sec_high, [3]=max_perf_reg_bps, [4]=max_res_reg_bps, [5]=max_style
+global ev_cfg ulong 8
+
+note Last computed metrics & counters: [0]=evaluated, [1]=passed, [2]=denied, [3]=last_corr_bps
+global ev_stats ulong 4
+note Signed deltas: [0]=last_perf_delta_bps, [1]=last_res_delta_bps
+global ev_deltas long 2
+
+fn ev_init min_corr_bps ulong max_sec_high ulong max_perf_reg_bps ulong max_res_reg_bps ulong max_style ulong to void
+put ev_cfg 0 1
+put ev_cfg 1 min_corr_bps
+put ev_cfg 2 max_sec_high
+put ev_cfg 3 max_perf_reg_bps
+put ev_cfg 4 max_res_reg_bps
+put ev_cfg 5 max_style
+for i ulong 4
+put ev_stats i 0
+end
+put ev_deltas 0 long 0
+put ev_deltas 1 long 0
+end
+
+fn ev_evaluated to ulong
+ret get ev_stats 0
+end
+
+fn ev_passed to ulong
+ret get ev_stats 1
+end
+
+fn ev_denied to ulong
+ret get ev_stats 2
+end
+
+fn ev_last_corr_bps to ulong
+ret get ev_stats 3
+end
+
+fn ev_last_perf_delta_bps to long
+ret get ev_deltas 0
+end
+
+fn ev_last_res_delta_bps to long
+ret get ev_deltas 1
+end
+
+note Compute improvement delta in basis points: positive when cand < base, negative when cand > base.
+fn ev_compute_delta_bps base_v ulong cand_v ulong to long
+if ge base_v cand_v
+diff = sub base_v cand_v
+if gt diff EV_MAX_SAFE_METRIC
+ret long 10000
+end
+ret long div mul diff EV_BPS_SCALE base_v
+else
+diff = sub cand_v base_v
+if gt diff EV_MAX_SAFE_METRIC
+ret long -100000
+end
+mag = div mul diff EV_BPS_SCALE base_v
+if gt mag 100000
+ret long -100000
+end
+ret neg long mag
+end
+end
+
+fn ev_record v ulong to ulong
+put ev_stats 0 add get ev_stats 0 1
+if eq v EV_PASS
+put ev_stats 1 add get ev_stats 1 1
+else
+put ev_stats 2 add get ev_stats 2 1
+end
+ret v
+end
+
+note Evaluate candidate sample across all 6 fail-closed evaluator layers.
+fn ev_evaluate s view EvalSample to ulong
+if eq get ev_cfg 0 0
+ret ev_record EV_DENY_UNINIT
+end
+tot = get s tests_total
+passed = get s tests_passed
+bns = get s base_ns
+cns = get s cand_ns
+bmem = get s base_mem_kb
+cmem = get s cand_mem_kb
+if or eq tot 0 gt passed tot
+ret ev_record EV_DENY_INVALID_SAMPLE
+end
+if or eq bns 0 eq cns 0
+ret ev_record EV_DENY_INVALID_SAMPLE
+end
+if or eq bmem 0 eq cmem 0
+ret ev_record EV_DENY_INVALID_SAMPLE
+end
+note Layer 1: Security (zero critical, bounded high)
+if gt get s sec_critical 0
+ret ev_record EV_DENY_SECURITY
+end
+if gt get s sec_high get ev_cfg 2
+ret ev_record EV_DENY_SECURITY
+end
+note Layer 2: Correctness floor
+corr_bps = div mul passed EV_BPS_SCALE tot
+put ev_stats 3 corr_bps
+if lt corr_bps get ev_cfg 1
+ret ev_record EV_DENY_CORRECTNESS
+end
+note Layer 3: Longitudinal replay
+if eq get s replay_ok 0
+ret ev_record EV_DENY_REPLAY
+end
+note Layer 4: Performance regression guard
+pdelta = ev_compute_delta_bps bns cns
+put ev_deltas 0 pdelta
+max_preg_neg = neg long get ev_cfg 3
+if lt pdelta max_preg_neg
+ret ev_record EV_DENY_PERF_REGRESS
+end
+note Layer 5: Resource efficiency regression guard
+rdelta = ev_compute_delta_bps bmem cmem
+put ev_deltas 1 rdelta
+max_rreg_neg = neg long get ev_cfg 4
+if lt rdelta max_rreg_neg
+ret ev_record EV_DENY_RES_REGRESS
+end
+note Layer 6: Style violations bound
+if gt get s style_violations get ev_cfg 5
+ret ev_record EV_DENY_STYLE
+end
+ret ev_record EV_PASS
+end

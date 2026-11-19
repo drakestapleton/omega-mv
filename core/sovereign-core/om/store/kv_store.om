@@ -1,0 +1,512 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/store/kv_store.om
+note Pure OM-2 conversion of aien-kv-store (record, index, pin, seal, holder, coalesce).
+note Durable KV and session store with SHA-256 per-record integrity hashes,
+note atomic transaction snapshot/commit/rollback, key/value bounds enforcement,
+note record sealing/pinning, and fail-closed corruption refusal.
+note Compose after si/directives/om2.om and om/tls/sha2.om.
+
+const KV_MAX_SLOTS ulong 32
+const KV_KEY_MAX ulong 32
+const KV_VAL_MAX ulong 64
+const KV_KEY_TOTAL ulong 1024
+const KV_VAL_TOTAL ulong 2048
+const KV_HASH_BYTES ulong 32
+const KV_HASH_TOTAL ulong 1024
+const KV_MAX_SESSIONS ulong 16
+const KV_NONE ulong 18446744073709551615
+
+note Status and refusal codes
+const KV_OK ulong 0
+const KV_ERR_FULL ulong 1
+const KV_ERR_NOT_FOUND ulong 2
+const KV_ERR_KEY_BOUNDS ulong 3
+const KV_ERR_VAL_BOUNDS ulong 4
+const KV_ERR_CORRUPT ulong 5
+const KV_ERR_TX_ACTIVE ulong 6
+const KV_ERR_NO_TX ulong 7
+const KV_ERR_SEALED ulong 8
+const KV_ERR_BAD_SESSION ulong 9
+const KV_ERR_DST_SMALL ulong 10
+
+text kv_rec_dom "AIEN-KV-RECORD-V1"
+
+note Metadata: [0]=active_count, [1]=next_ver, [2]=tx_active(0/1), [3]=next_session_id, [4]=tx_commits, [5]=tx_rollbacks
+global kv_meta ulong 8
+
+note Session state: 0=unused, 1=active, 2=closed
+global kv_sess_state ulong 16
+
+note Live KV slot arrays (0..31)
+global kv_used ulong 32
+global kv_sess ulong 32
+global kv_ver ulong 32
+global kv_pinned ulong 32
+global kv_klen ulong 32
+global kv_vlen ulong 32
+global kv_keys uchar 1024
+global kv_vals uchar 2048
+global kv_hashes uchar 1024
+
+note Transaction snapshot arrays for atomic rollback
+global kv_snap_meta ulong 8
+global kv_snap_used ulong 32
+global kv_snap_sess ulong 32
+global kv_snap_ver ulong 32
+global kv_snap_pinned ulong 32
+global kv_snap_klen ulong 32
+global kv_snap_vlen ulong 32
+global kv_snap_keys uchar 1024
+global kv_snap_vals uchar 2048
+global kv_snap_hashes uchar 1024
+
+fn kv_init to void
+for i ulong 8
+put kv_meta i 0
+put kv_snap_meta i 0
+end
+put kv_meta 1 1
+put kv_meta 3 1
+for i ulong KV_MAX_SESSIONS
+put kv_sess_state i 0
+end
+for i ulong KV_MAX_SLOTS
+put kv_used i 0
+put kv_sess i 0
+put kv_ver i 0
+put kv_pinned i 0
+put kv_klen i 0
+put kv_vlen i 0
+put kv_snap_used i 0
+put kv_snap_sess i 0
+put kv_snap_ver i 0
+put kv_snap_pinned i 0
+put kv_snap_klen i 0
+put kv_snap_vlen i 0
+end
+for i ulong KV_KEY_TOTAL
+put kv_keys i uchar 0
+put kv_snap_keys i uchar 0
+end
+for i ulong KV_VAL_TOTAL
+put kv_vals i uchar 0
+put kv_snap_vals i uchar 0
+end
+for i ulong KV_HASH_TOTAL
+put kv_hashes i uchar 0
+put kv_snap_hashes i uchar 0
+end
+end
+
+fn kv_count to ulong
+ret get kv_meta 0
+end
+
+fn kv_tx_active to bool
+ret ne get kv_meta 2 0
+end
+
+fn kv_commits to ulong
+ret get kv_meta 4
+end
+
+fn kv_rollbacks to ulong
+ret get kv_meta 5
+end
+
+note Create a new active session. Returns session id (1..16) or 0 if full.
+fn kv_session_create to ulong
+sid = get kv_meta 3
+if gt sid KV_MAX_SESSIONS
+ret 0
+end
+idx = sub sid 1
+put kv_sess_state idx 1
+put kv_meta 3 add sid 1
+ret sid
+end
+
+note Close an active session.
+fn kv_session_close sid ulong to ulong
+if or eq sid 0 gt sid KV_MAX_SESSIONS
+ret KV_ERR_BAD_SESSION
+end
+idx = sub sid 1
+if ne get kv_sess_state idx 1
+ret KV_ERR_BAD_SESSION
+end
+put kv_sess_state idx 2
+ret KV_OK
+end
+
+fn kv_session_is_active sid ulong to bool
+if or eq sid 0 gt sid KV_MAX_SESSIONS
+ret false
+end
+idx = sub sid 1
+ret eq get kv_sess_state idx 1
+end
+
+fn kv_put_u64 buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul i 8
+put buf add off i uchar and shr v sh ulong 255
+end
+end
+
+fn kv_hash_eq a view uchar 32 b view uchar 32 to bool
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get a i get b i
+end
+ret eq diff uchar 0
+end
+
+note Compute canonical SHA-256 integrity hash for slot into digest_out[0..32).
+fn kv_compute_slot_hash slot ulong digest_out edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx kv_rec_dom
+hdr = new uchar 32 0
+kv_put_u64 hdr 0 get kv_sess slot
+kv_put_u64 hdr 8 get kv_ver slot
+klen = get kv_klen slot
+vlen = get kv_vlen slot
+kv_put_u64 hdr 16 klen
+kv_put_u64 hdr 24 vlen
+sha256_update ctx hdr
+kbuf = new uchar 32 0
+kbase = mul slot KV_KEY_MAX
+if le klen KV_KEY_MAX
+for i ulong klen bound 32
+put kbuf i get kv_keys add kbase i
+end
+sha256_update ctx part kbuf 0 klen
+end
+vbuf = new uchar 64 0
+vbase = mul slot KV_VAL_MAX
+if le vlen KV_VAL_MAX
+for i ulong vlen bound 64
+put vbuf i get kv_vals add vbase i
+end
+sha256_update ctx part vbuf 0 vlen
+end
+sha256_final ctx digest_out
+end
+
+note Verify SHA-256 integrity hash and bounds of an occupied slot.
+fn kv_verify_slot slot ulong to ulong
+if ge slot KV_MAX_SLOTS
+ret KV_ERR_NOT_FOUND
+end
+if eq get kv_used slot 0
+ret KV_ERR_NOT_FOUND
+end
+klen = get kv_klen slot
+vlen = get kv_vlen slot
+if or eq klen 0 gt klen KV_KEY_MAX
+ret KV_ERR_CORRUPT
+end
+if gt vlen KV_VAL_MAX
+ret KV_ERR_CORRUPT
+end
+calc = new uchar 32 0
+kv_compute_slot_hash slot calc
+stored = new uchar 32 0
+hbase = mul slot KV_HASH_BYTES
+for i ulong 32
+put stored i get kv_hashes add hbase i
+end
+if not kv_hash_eq calc stored
+ret KV_ERR_CORRUPT
+end
+ret KV_OK
+end
+
+note Verify integrity of all occupied slots in the store.
+fn kv_verify_all to ulong
+for i ulong KV_MAX_SLOTS
+if ne get kv_used i 0
+st = kv_verify_slot i
+if ne st KV_OK
+ret st
+end
+end
+end
+ret KV_OK
+end
+
+fn kv_key_matches slot ulong key view uchar * to bool
+klen = len key
+if ne get kv_klen slot klen
+ret false
+end
+kbase = mul slot KV_KEY_MAX
+for i ulong klen bound 32
+if ne get kv_keys add kbase i get key i
+ret false
+end
+end
+ret true
+end
+
+fn kv_find_slot key view uchar * to ulong
+klen = len key
+if or eq klen 0 gt klen KV_KEY_MAX
+ret KV_NONE
+end
+for i ulong KV_MAX_SLOTS
+if ne get kv_used i 0
+if kv_key_matches i key
+ret i
+end
+end
+end
+ret KV_NONE
+end
+
+fn kv_find_free to ulong
+for i ulong KV_MAX_SLOTS
+if eq get kv_used i 0
+ret i
+end
+end
+ret KV_NONE
+end
+
+fn kv_copy_key slot ulong key view uchar * to void
+klen = len key
+kbase = mul slot KV_KEY_MAX
+for i ulong KV_KEY_MAX
+put kv_keys add kbase i uchar 0
+end
+for i ulong klen bound 32
+put kv_keys add kbase i get key i
+end
+put kv_klen slot klen
+end
+
+fn kv_copy_val slot ulong val view uchar * to void
+vlen = len val
+vbase = mul slot KV_VAL_MAX
+for i ulong KV_VAL_MAX
+put kv_vals add vbase i uchar 0
+end
+for i ulong vlen bound 64
+put kv_vals add vbase i get val i
+end
+put kv_vlen slot vlen
+end
+
+fn kv_seal_slot slot ulong to void
+dig = new uchar 32 0
+kv_compute_slot_hash slot dig
+hbase = mul slot KV_HASH_BYTES
+for i ulong 32
+put kv_hashes add hbase i get dig i
+end
+end
+
+note Put (insert or update) key -> val under an active session with SHA-256 integrity sealing.
+fn kv_put sid ulong key view uchar * val view uchar * to ulong
+if not kv_session_is_active sid
+ret KV_ERR_BAD_SESSION
+end
+if or eq len key 0 gt len key KV_KEY_MAX
+ret KV_ERR_KEY_BOUNDS
+end
+if gt len val KV_VAL_MAX
+ret KV_ERR_VAL_BOUNDS
+end
+slot = kv_find_slot key
+is_new = false
+if eq slot KV_NONE
+slot = kv_find_free
+if eq slot KV_NONE
+ret KV_ERR_FULL
+end
+is_new = true
+else
+if ne get kv_pinned slot 0
+ret KV_ERR_SEALED
+end
+end
+put kv_used slot 1
+put kv_sess slot sid
+nver = get kv_meta 1
+put kv_ver slot nver
+put kv_meta 1 add nver 1
+kv_copy_key slot key
+kv_copy_val slot val
+kv_seal_slot slot
+if is_new
+put kv_meta 0 add get kv_meta 0 1
+end
+ret KV_OK
+end
+
+note Get value for key into dst, verifying SHA-256 integrity before copying.
+note Writes actual value length into vlen_out[0]. Fail-closed on corruption.
+fn kv_get key view uchar * dst edit uchar * vlen_out edit ulong 1 to ulong
+put vlen_out 0 0
+klen = len key
+if or eq klen 0 gt klen KV_KEY_MAX
+ret KV_ERR_KEY_BOUNDS
+end
+slot = kv_find_slot key
+if eq slot KV_NONE
+ret KV_ERR_NOT_FOUND
+end
+st = kv_verify_slot slot
+if ne st KV_OK
+ret st
+end
+vlen = get kv_vlen slot
+if lt len dst vlen
+ret KV_ERR_DST_SMALL
+end
+vbase = mul slot KV_VAL_MAX
+for i ulong vlen bound 64
+put dst i get kv_vals add vbase i
+end
+put vlen_out 0 vlen
+ret KV_OK
+end
+
+note Pin/seal an existing valid entry so it cannot be overwritten or deleted.
+fn kv_pin key view uchar * to ulong
+klen = len key
+if or eq klen 0 gt klen KV_KEY_MAX
+ret KV_ERR_KEY_BOUNDS
+end
+slot = kv_find_slot key
+if eq slot KV_NONE
+ret KV_ERR_NOT_FOUND
+end
+st = kv_verify_slot slot
+if ne st KV_OK
+ret st
+end
+put kv_pinned slot 1
+ret KV_OK
+end
+
+note Delete an unpinned entry and scrub its key/value/hash bytes.
+fn kv_del key view uchar * to ulong
+klen = len key
+if or eq klen 0 gt klen KV_KEY_MAX
+ret KV_ERR_KEY_BOUNDS
+end
+slot = kv_find_slot key
+if eq slot KV_NONE
+ret KV_ERR_NOT_FOUND
+end
+if ne get kv_pinned slot 0
+ret KV_ERR_SEALED
+end
+put kv_used slot 0
+put kv_sess slot 0
+put kv_ver slot 0
+put kv_pinned slot 0
+put kv_klen slot 0
+put kv_vlen slot 0
+kbase = mul slot KV_KEY_MAX
+for i ulong KV_KEY_MAX
+put kv_keys add kbase i uchar 0
+end
+vbase = mul slot KV_VAL_MAX
+for i ulong KV_VAL_MAX
+put kv_vals add vbase i uchar 0
+end
+hbase = mul slot KV_HASH_BYTES
+for i ulong 32
+put kv_hashes add hbase i uchar 0
+end
+cnt = get kv_meta 0
+if gt cnt 0
+put kv_meta 0 sub cnt 1
+end
+ret KV_OK
+end
+
+note Snapshot live store state into rollback buffers and begin an atomic transaction.
+fn kv_begin_tx to ulong
+if ne get kv_meta 2 0
+ret KV_ERR_TX_ACTIVE
+end
+st = kv_verify_all
+if ne st KV_OK
+ret st
+end
+for i ulong 8
+put kv_snap_meta i get kv_meta i
+end
+for i ulong KV_MAX_SLOTS
+put kv_snap_used i get kv_used i
+put kv_snap_sess i get kv_sess i
+put kv_snap_ver i get kv_ver i
+put kv_snap_pinned i get kv_pinned i
+put kv_snap_klen i get kv_klen i
+put kv_snap_vlen i get kv_vlen i
+end
+for i ulong KV_KEY_TOTAL
+put kv_snap_keys i get kv_keys i
+end
+for i ulong KV_VAL_TOTAL
+put kv_snap_vals i get kv_vals i
+end
+for i ulong KV_HASH_TOTAL
+put kv_snap_hashes i get kv_hashes i
+end
+put kv_meta 2 1
+ret KV_OK
+end
+
+note Atomically restore pre-transaction snapshot and end the active transaction.
+fn kv_rollback to ulong
+if eq get kv_meta 2 0
+ret KV_ERR_NO_TX
+end
+rbs = add get kv_meta 5 1
+cmts = get kv_meta 4
+for i ulong 8
+put kv_meta i get kv_snap_meta i
+end
+put kv_meta 2 0
+put kv_meta 4 cmts
+put kv_meta 5 rbs
+for i ulong KV_MAX_SLOTS
+put kv_used i get kv_snap_used i
+put kv_sess i get kv_snap_sess i
+put kv_ver i get kv_snap_ver i
+put kv_pinned i get kv_snap_pinned i
+put kv_klen i get kv_snap_klen i
+put kv_vlen i get kv_snap_vlen i
+end
+for i ulong KV_KEY_TOTAL
+put kv_keys i get kv_snap_keys i
+end
+for i ulong KV_VAL_TOTAL
+put kv_vals i get kv_snap_vals i
+end
+for i ulong KV_HASH_TOTAL
+put kv_hashes i get kv_snap_hashes i
+end
+ret KV_OK
+end
+
+note Commit the active transaction after verifying integrity of all live records.
+note Automatically rolls back if corruption is detected (fail-closed).
+fn kv_commit to ulong
+if eq get kv_meta 2 0
+ret KV_ERR_NO_TX
+end
+st = kv_verify_all
+if ne st KV_OK
+rb_st = kv_rollback
+ret st
+end
+put kv_meta 2 0
+put kv_meta 4 add get kv_meta 4 1
+ret KV_OK
+end

@@ -1,0 +1,316 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/rsi/om/eval/eval_test.om
+note Positive, negative, and mutant test suite for core/rsi/om/eval/{evaluator,canary,rollback}.om.
+note Compose with:
+note   si/directives/om2.om core/rsi/om/eval/evaluator.om om/tls/sha2.om
+note   core/rsi/om/eval/canary.om core/rsi/om/eval/rollback.om core/rsi/om/eval/eval_test.om
+
+text ev_t_pass "PASS "
+text ev_t_fail "FAIL "
+text ev_t_nl "\n"
+text ev_t_all_ok "RSI EVAL CANARY ROLLBACK TEST SUITE PASS\n"
+text ev_t_all_bad "RSI EVAL CANARY ROLLBACK TEST SUITE FAIL\n"
+
+text ev_t_n1 "rsi_eval_pos_end_to_end_commit"
+text ev_t_n2 "rsi_eval_neg_evaluator_layers_and_invalid_samples"
+text ev_t_n3 "rsi_eval_neg_canary_synthetic_crash_error_latency_window"
+text ev_t_n4 "rsi_eval_neg_rollback_on_eval_and_canary_failure"
+text ev_t_n5 "rsi_eval_mutant_rot_identity_and_audit_chain_tamper"
+
+text ev_base_art "rsi-baseline-v1"
+text ev_cand1_art "rsi-candidate-101-kernel-opt"
+text ev_cand2_art "rsi-candidate-102-regressed"
+
+global ev_t_fails ulong 1
+
+fn ev_t_w s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 256
+k = write 1 s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn ev_t_rep name view uchar * ok bool to void
+if ok
+ev_t_w ev_t_pass
+else
+ev_t_w ev_t_fail
+put ev_t_fails 0 add get ev_t_fails 0 1
+end
+ev_t_w name
+ev_t_w ev_t_nl
+end
+
+fn ev_t_sha msg view uchar * out_h edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx msg
+sha256_final ctx out_h
+end
+
+note Test 1 (POSITIVE): End-to-end valid candidate passes evaluator, canary, and commits through rollback gate.
+fn test_ev_pos_e2e to bool
+ev_init 10000 0 50 50 0
+cnr_init 100 50 100
+base_d = new uchar 32 0
+cand_d = new uchar 32 0
+ev_t_sha ev_base_art base_d
+ev_t_sha ev_cand1_art cand_d
+if ne rb_init 1 base_d RB_COMMITTED
+ret false
+end
+if ne rb_stage 101 cand_d RB_COMMITTED
+ret false
+end
+note Evaluator: 50/50 tests, 0 sec, base_ns=10000 -> cand_ns=9000 (+1000 bps), mem 4096 -> 3891, replay ok, 0 style
+s = new EvalSample 101 50 50 0 0 10000 9000 4096 3891 1 0
+ev_v = ev_evaluate s
+if ne ev_v EV_PASS
+ret false
+end
+if or ne ev_last_corr_bps 10000 ne ev_last_perf_delta_bps long 1000
+ret false
+end
+note Canary: measured host, 2 batches totaling 120 reqs, 0 err, 0 crash, p99=9100 <= 10000
+if ne cnr_begin 101 CNR_PROV_CANARY_HOST 10000 cand_d CNR_PASS
+ret false
+end
+if ne cnr_observe 60 0 0 9100 CNR_PASS
+ret false
+end
+if ne cnr_observe 60 0 0 9050 CNR_PASS
+ret false
+end
+cnr_v = cnr_evaluate 101 cand_d
+if ne cnr_v CNR_PASS
+ret false
+end
+note Rollback gate commits candidate 101 -> active_id=101, gen=2, commits=1, audit intact
+if ne rb_gate_decide ev_v cnr_v RB_COMMITTED
+ret false
+end
+if or ne rb_active_id 101 ne rb_active_gen 2
+ret false
+end
+if or ne rb_commit_count 1 ne rb_rollback_count 0
+ret false
+end
+if not rb_verify_rot
+ret false
+end
+if ne rb_verify_audit_chain RB_COMMITTED
+ret false
+end
+ret true
+end
+
+note Test 2 (NEGATIVE): Evaluator refuses invalid samples, security, correctness, replay, perf/res regression, style.
+fn test_ev_neg_evaluator to bool
+ev_init 10000 0 50 50 2
+s_inv = new EvalSample 200 10 0 0 0 10000 9500 1000 1000 1 0
+if ne ev_evaluate s_inv EV_DENY_INVALID_SAMPLE
+ret false
+end
+s_sec = new EvalSample 201 50 50 1 0 10000 9500 1000 1000 1 0
+if ne ev_evaluate s_sec EV_DENY_SECURITY
+ret false
+end
+s_corr = new EvalSample 202 49 50 0 0 10000 9500 1000 1000 1 0
+if ne ev_evaluate s_corr EV_DENY_CORRECTNESS
+ret false
+end
+s_rep = new EvalSample 203 50 50 0 0 10000 9500 1000 1000 0 0
+if ne ev_evaluate s_rep EV_DENY_REPLAY
+ret false
+end
+note Perf regression: 10000 -> 10100 (-100 bps < -50 bps)
+s_preg = new EvalSample 204 50 50 0 0 10000 10100 1000 1000 1 0
+if ne ev_evaluate s_preg EV_DENY_PERF_REGRESS
+ret false
+end
+note Resource regression: 1000 -> 1020 (-200 bps < -50 bps)
+s_rreg = new EvalSample 205 50 50 0 0 10000 9900 1000 1020 1 0
+if ne ev_evaluate s_rreg EV_DENY_RES_REGRESS
+ret false
+end
+note Style violations: 3 > 2
+s_sty = new EvalSample 206 50 50 0 0 10000 9900 1000 1000 1 3
+if ne ev_evaluate s_sty EV_DENY_STYLE
+ret false
+end
+if or ne ev_denied 7 ne ev_passed 0
+ret false
+end
+ret true
+end
+
+note Test 3 (NEGATIVE): Canary refuses synthetic provenance, zero digest, insufficient window, crash, error rate, latency.
+fn test_ev_neg_canary to bool
+cnr_init 100 50 100
+zero_d = new uchar 32 0
+cand_d = new uchar 32 0
+ev_t_sha ev_cand1_art cand_d
+if ne cnr_begin 301 CNR_PROV_SYNTHETIC 10000 cand_d CNR_DENY_SYNTHETIC
+ret false
+end
+if ne cnr_begin 302 CNR_PROV_CANARY_HOST 10000 zero_d CNR_DENY_UNBOUND_ID
+ret false
+end
+note Insufficient samples -> HOLD
+if ne cnr_begin 303 CNR_PROV_CANARY_HOST 10000 cand_d CNR_PASS
+ret false
+end
+if ne cnr_observe 50 0 0 10000 CNR_PASS
+ret false
+end
+if ne cnr_evaluate 303 cand_d CNR_HOLD_INSUFFICIENT_SAMPLES
+ret false
+end
+note Crash -> DENY_CRASH
+if ne cnr_observe 60 0 1 10000 CNR_PASS
+ret false
+end
+if ne cnr_evaluate 303 cand_d CNR_DENY_CRASH
+ret false
+end
+note Error rate: 2 / 200 = 100 bps > 50 bps -> DENY_ERROR_RATE
+if ne cnr_begin 304 CNR_PROV_SILICON 10000 cand_d CNR_PASS
+ret false
+end
+if ne cnr_observe 200 2 0 10000 CNR_PASS
+ret false
+end
+if ne cnr_evaluate 304 cand_d CNR_DENY_ERROR_RATE
+ret false
+end
+note Latency regression: 10000 -> 10200 (+200 bps > 100 bps) -> DENY_LATENCY
+if ne cnr_begin 305 CNR_PROV_SILICON 10000 cand_d CNR_PASS
+ret false
+end
+if ne cnr_observe 200 0 0 10200 CNR_PASS
+ret false
+end
+if ne cnr_evaluate 305 cand_d CNR_DENY_LATENCY
+ret false
+end
+ret true
+end
+
+note Test 4 (NEGATIVE): Rollback gate automatically rolls back on evaluator or canary failure and preserves baseline.
+fn test_ev_neg_rollback to bool
+base_d = new uchar 32 0
+cand_d = new uchar 32 0
+ev_t_sha ev_base_art base_d
+ev_t_sha ev_cand2_art cand_d
+if ne rb_init 10 base_d RB_COMMITTED
+ret false
+end
+note No staged candidate -> RB_DENY_NO_STAGED
+if ne rb_gate_decide EV_PASS CNR_PASS RB_DENY_NO_STAGED
+ret false
+end
+note Stage candidate 201, fail evaluator -> RB_ROLLED_BACK_EVAL, baseline stays 10 gen 1
+if ne rb_stage 201 cand_d RB_COMMITTED
+ret false
+end
+if ne rb_gate_decide EV_DENY_PERF_REGRESS CNR_PASS RB_ROLLED_BACK_EVAL
+ret false
+end
+if or ne rb_active_id 10 ne rb_active_gen 1
+ret false
+end
+if rb_has_staged
+ret false
+end
+note Stage candidate 202, pass evaluator, fail canary -> RB_ROLLED_BACK_CANARY, baseline still 10 gen 1
+if ne rb_stage 202 cand_d RB_COMMITTED
+ret false
+end
+if ne rb_gate_decide EV_PASS CNR_DENY_CRASH RB_ROLLED_BACK_CANARY
+ret false
+end
+if or ne rb_active_id 10 ne rb_rollback_count 2
+ret false
+end
+if ne rb_audit_count 2
+ret false
+end
+if ne rb_verify_audit_chain RB_COMMITTED
+ret false
+end
+ret true
+end
+
+note Test 5 (MUTANT CONTROLS): Tampered canary artifact digest, tampered ROT, and tampered audit chain are caught.
+fn test_ev_mutant_controls to bool
+cnr_init 100 50 100
+base_d = new uchar 32 0
+cand_d = new uchar 32 0
+mut_d = new uchar 32 0
+ev_t_sha ev_base_art base_d
+ev_t_sha ev_cand1_art cand_d
+for i ulong 32
+put mut_d i get cand_d i
+end
+put mut_d 0 xor get mut_d 0 uchar 1
+note Mutant A: canary bound to cand_d, evaluated with 1-bit mutated mut_d -> CNR_DENY_ID_MISMATCH
+if ne cnr_begin 401 CNR_PROV_SILICON 10000 cand_d CNR_PASS
+ret false
+end
+if ne cnr_observe 150 0 0 9900 CNR_PASS
+ret false
+end
+if ne cnr_evaluate 401 mut_d CNR_DENY_ID_MISMATCH
+ret false
+end
+note Mutant B: flip 1 bit in active root-of-trust digest -> rb_gate_decide refuses RB_DENY_CORRUPT_ROT
+if ne rb_init 50 base_d RB_COMMITTED
+ret false
+end
+if ne rb_stage 401 cand_d RB_COMMITTED
+ret false
+end
+orig_rot = get rb_active_rot 7
+put rb_active_rot 7 xor orig_rot uchar 1
+if ne rb_gate_decide EV_PASS CNR_PASS RB_DENY_CORRUPT_ROT
+ret false
+end
+put rb_active_rot 7 orig_rot
+if ne rb_stage 401 cand_d RB_COMMITTED
+ret false
+end
+if ne rb_gate_decide EV_PASS CNR_PASS RB_COMMITTED
+ret false
+end
+note Mutant C: flip 1 bit in audit chain hash -> rb_verify_audit_chain returns RB_DENY_AUDIT_CORRUPT
+orig_ah = get rb_aud_hash 3
+put rb_aud_hash 3 xor orig_ah uchar 1
+if ne rb_verify_audit_chain RB_DENY_AUDIT_CORRUPT
+ret false
+end
+put rb_aud_hash 3 orig_ah
+if ne rb_verify_audit_chain RB_COMMITTED
+ret false
+end
+ret true
+end
+
+fn main to int
+put ev_t_fails 0 0
+ev_t_rep ev_t_n1 test_ev_pos_e2e
+ev_t_rep ev_t_n2 test_ev_neg_evaluator
+ev_t_rep ev_t_n3 test_ev_neg_canary
+ev_t_rep ev_t_n4 test_ev_neg_rollback
+ev_t_rep ev_t_n5 test_ev_mutant_controls
+if eq get ev_t_fails 0 0
+ev_t_w ev_t_all_ok
+ret 0
+end
+ev_t_w ev_t_all_bad
+ret 1
+end

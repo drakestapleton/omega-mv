@@ -1,0 +1,313 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/rsi/om/eval/rollback.om
+note Pure OM-2 conversion of spark-rsi-mv/src/isolation/{rollback,root_of_trust,manifest}.rs.
+note Isolation rollback gate with SHA-256 root-of-trust checkpoint sealing,
+note automatic rollback on evaluator or canary failure, and hash-chained audit trail.
+note Compose after evaluator.om, om/tls/sha2.om, and canary.om.
+
+const RB_MAX_AUDIT ulong 32
+const RB_HASH_BYTES ulong 32
+const RB_AUDIT_HASH_TOTAL ulong 1024
+
+note Rollback gate decision codes
+const RB_COMMITTED ulong 0
+const RB_ROLLED_BACK_EVAL ulong 1
+const RB_ROLLED_BACK_CANARY ulong 2
+const RB_DENY_UNINIT ulong 10
+const RB_DENY_NO_STAGED ulong 11
+const RB_DENY_CORRUPT_ROT ulong 12
+const RB_DENY_ZERO_DIGEST ulong 13
+const RB_DENY_AUDIT_CORRUPT ulong 14
+
+text rb_rot_dom "RSI-ROT-CHECKPOINT-V1"
+text rb_aud_dom "RSI-ROLLBACK-AUDIT-V1"
+
+note Active baseline & staging metadata:
+note [0]=init(0/1), [1]=active_id, [2]=active_gen, [3]=staged_valid(0/1), [4]=staged_id,
+note [5]=commit_cnt, [6]=rollback_cnt, [7]=audit_cnt
+global rb_meta ulong 8
+
+note Active baseline digest and root-of-trust seal, plus staged candidate digest
+global rb_active_dig uchar 32
+global rb_active_rot uchar 32
+global rb_staged_dig uchar 32
+
+note Hash-chained rollback/commit audit trail (0..31)
+global rb_aud_seq ulong 32
+global rb_aud_cand ulong 32
+global rb_aud_code ulong 32
+global rb_aud_prev uchar 1024
+global rb_aud_hash uchar 1024
+
+fn rb_is_zero_hash h view uchar 32 to bool
+acc = uchar 0
+for i ulong 32
+acc = or acc get h i
+end
+ret eq acc uchar 0
+end
+
+fn rb_hash_eq a view uchar 32 b view uchar 32 to bool
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get a i get b i
+end
+ret eq diff uchar 0
+end
+
+fn rb_put_u64 buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul i 8
+put buf add off i uchar and shr v sh ulong 255
+end
+end
+
+note Compute root-of-trust seal over (active_id, active_gen, active_dig).
+fn rb_compute_rot aid ulong agen ulong dig view uchar 32 out_rot edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx rb_rot_dom
+hdr = new uchar 16 0
+rb_put_u64 hdr 0 aid
+rb_put_u64 hdr 8 agen
+sha256_update ctx hdr
+sha256_update ctx dig
+sha256_final ctx out_rot
+end
+
+note Verify active baseline root-of-trust integrity.
+fn rb_verify_rot to bool
+if eq get rb_meta 0 0
+ret false
+end
+dig = new uchar 32 0
+cur = new uchar 32 0
+for i ulong 32
+put dig i get rb_active_dig i
+put cur i get rb_active_rot i
+end
+if rb_is_zero_hash dig
+ret false
+end
+calc = new uchar 32 0
+rb_compute_rot get rb_meta 1 get rb_meta 2 dig calc
+ret rb_hash_eq calc cur
+end
+
+note Initialize isolation rollback gate with a trusted baseline checkpoint.
+fn rb_init base_id ulong base_dig view uchar 32 to ulong
+for i ulong 8
+put rb_meta i 0
+end
+for i ulong 32
+put rb_active_dig i uchar 0
+put rb_active_rot i uchar 0
+put rb_staged_dig i uchar 0
+put rb_aud_seq i 0
+put rb_aud_cand i 0
+put rb_aud_code i 0
+end
+for i ulong RB_AUDIT_HASH_TOTAL
+put rb_aud_prev i uchar 0
+put rb_aud_hash i uchar 0
+end
+if rb_is_zero_hash base_dig
+ret RB_DENY_ZERO_DIGEST
+end
+for i ulong 32
+put rb_active_dig i get base_dig i
+end
+rot = new uchar 32 0
+rb_compute_rot base_id 1 base_dig rot
+for i ulong 32
+put rb_active_rot i get rot i
+end
+put rb_meta 0 1
+put rb_meta 1 base_id
+put rb_meta 2 1
+ret RB_COMMITTED
+end
+
+fn rb_active_id to ulong
+ret get rb_meta 1
+end
+
+fn rb_active_gen to ulong
+ret get rb_meta 2
+end
+
+fn rb_commit_count to ulong
+ret get rb_meta 5
+end
+
+fn rb_rollback_count to ulong
+ret get rb_meta 6
+end
+
+fn rb_audit_count to ulong
+ret get rb_meta 7
+end
+
+fn rb_has_staged to bool
+ret ne get rb_meta 3 0
+end
+
+note Stage an isolated candidate artifact for evaluation and canary gating.
+fn rb_stage cand_id ulong cand_dig view uchar 32 to ulong
+if eq get rb_meta 0 0
+ret RB_DENY_UNINIT
+end
+if not rb_verify_rot
+ret RB_DENY_CORRUPT_ROT
+end
+if rb_is_zero_hash cand_dig
+ret RB_DENY_ZERO_DIGEST
+end
+put rb_meta 3 1
+put rb_meta 4 cand_id
+for i ulong 32
+put rb_staged_dig i get cand_dig i
+end
+ret RB_COMMITTED
+end
+
+fn rb_compute_audit_hash idx ulong out_h edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx rb_aud_dom
+hdr = new uchar 24 0
+rb_put_u64 hdr 0 get rb_aud_seq idx
+rb_put_u64 hdr 8 get rb_aud_cand idx
+rb_put_u64 hdr 16 get rb_aud_code idx
+sha256_update ctx hdr
+prev = new uchar 32 0
+pbase = mul idx RB_HASH_BYTES
+for i ulong 32
+put prev i get rb_aud_prev add pbase i
+end
+sha256_update ctx prev
+sha256_final ctx out_h
+end
+
+fn rb_append_audit cand_id ulong code ulong to void
+cnt = get rb_meta 7
+if ge cnt RB_MAX_AUDIT
+ret
+end
+put rb_aud_seq cnt add cnt 1
+put rb_aud_cand cnt cand_id
+put rb_aud_code cnt code
+pbase = mul cnt RB_HASH_BYTES
+if eq cnt 0
+for i ulong 32
+put rb_aud_prev add pbase i uchar 0
+end
+else
+prev_base = mul sub cnt 1 RB_HASH_BYTES
+for i ulong 32
+put rb_aud_prev add pbase i get rb_aud_hash add prev_base i
+end
+end
+dig = new uchar 32 0
+rb_compute_audit_hash cnt dig
+for i ulong 32
+put rb_aud_hash add pbase i get dig i
+end
+put rb_meta 7 add cnt 1
+end
+
+fn rb_clear_staged to void
+put rb_meta 3 0
+put rb_meta 4 0
+for i ulong 32
+put rb_staged_dig i uchar 0
+end
+end
+
+note Execute isolation rollback gate decision: commit only if ROT valid, eval PASS, and canary PASS.
+note Otherwise discard staged candidate, keep baseline checkpoint intact, and record rollback audit.
+fn rb_gate_decide eval_verdict ulong canary_verdict ulong to ulong
+if eq get rb_meta 0 0
+ret RB_DENY_UNINIT
+end
+if not rb_verify_rot
+rb_clear_staged
+ret RB_DENY_CORRUPT_ROT
+end
+if eq get rb_meta 3 0
+ret RB_DENY_NO_STAGED
+end
+cid = get rb_meta 4
+if ne eval_verdict EV_PASS
+rb_clear_staged
+put rb_meta 6 add get rb_meta 6 1
+rb_append_audit cid RB_ROLLED_BACK_EVAL
+ret RB_ROLLED_BACK_EVAL
+end
+if ne canary_verdict CNR_PASS
+rb_clear_staged
+put rb_meta 6 add get rb_meta 6 1
+rb_append_audit cid RB_ROLLED_BACK_CANARY
+ret RB_ROLLED_BACK_CANARY
+end
+note Both evaluator and canary passed: promote staged candidate to active baseline with new ROT seal.
+new_gen = add get rb_meta 2 1
+dig = new uchar 32 0
+for i ulong 32
+b = get rb_staged_dig i
+put dig i b
+put rb_active_dig i b
+end
+rot = new uchar 32 0
+rb_compute_rot cid new_gen dig rot
+for i ulong 32
+put rb_active_rot i get rot i
+end
+put rb_meta 1 cid
+put rb_meta 2 new_gen
+put rb_meta 5 add get rb_meta 5 1
+rb_clear_staged
+rb_append_audit cid RB_COMMITTED
+ret RB_COMMITTED
+end
+
+fn rb_verify_audit_entry idx ulong to bool
+prev = new uchar 32 0
+exp_prev = new uchar 32 0
+calc = new uchar 32 0
+stored = new uchar 32 0
+if ne get rb_aud_seq idx add idx 1
+ret false
+end
+pbase = mul idx RB_HASH_BYTES
+for j ulong 32
+put prev j get rb_aud_prev add pbase j
+put stored j get rb_aud_hash add pbase j
+end
+if eq idx 0
+if not rb_is_zero_hash prev
+ret false
+end
+else
+pb = mul sub idx 1 RB_HASH_BYTES
+for j ulong 32
+put exp_prev j get rb_aud_hash add pb j
+end
+if not rb_hash_eq prev exp_prev
+ret false
+end
+end
+rb_compute_audit_hash idx calc
+ret rb_hash_eq calc stored
+end
+
+note Verify entire SHA-256 hash-chained rollback audit trail.
+fn rb_verify_audit_chain to ulong
+cnt = get rb_meta 7
+for i ulong cnt bound 32
+if not rb_verify_audit_entry i
+ret RB_DENY_AUDIT_CORRUPT
+end
+end
+ret RB_COMMITTED
+end

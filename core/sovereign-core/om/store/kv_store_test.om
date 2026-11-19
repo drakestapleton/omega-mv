@@ -1,0 +1,387 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/store/kv_store_test.om
+note Positive, negative, and mutant test suite for core/sovereign-core/om/store/kv_store.om.
+note Compose with:
+note   si/directives/om2.om om/tls/sha2.om core/sovereign-core/om/store/kv_store.om
+note   core/sovereign-core/om/store/kv_store_test.om
+
+text kv_t_pass "PASS "
+text kv_t_fail "FAIL "
+text kv_t_nl "\n"
+text kv_t_all_ok "KV STORE TEST SUITE PASS\n"
+text kv_t_all_bad "KV STORE TEST SUITE FAIL\n"
+
+text kv_t_n1 "kv_pos_put_get_update_delete"
+text kv_t_n2 "kv_pos_atomic_tx_commit_and_rollback"
+text kv_t_n3 "kv_neg_bounds_session_seal_and_tx_errors"
+text kv_t_n4 "kv_neg_capacity_full_refusal"
+text kv_t_n5 "kv_neg_corruption_and_commit_auto_rollback"
+text kv_t_n6 "kv_mutant_version_and_hash_tamper_controls"
+
+text kv_k_alpha "session:alpha"
+text kv_k_beta "session:beta"
+text kv_k_gamma "session:gamma"
+text kv_k_pinned "pinned:root"
+text kv_k_long "012345678901234567890123456789012"
+text kv_v_one "payload-one-verified"
+text kv_v_two "payload-two-updated"
+text kv_v_three "payload-three-tx"
+text kv_v_long "01234567890123456789012345678901234567890123456789012345678901234"
+
+global kv_t_fails ulong 1
+
+fn kv_t_w s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 256
+k = write 1 s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn kv_t_rep name view uchar * ok bool to void
+if ok
+kv_t_w kv_t_pass
+else
+kv_t_w kv_t_fail
+put kv_t_fails 0 add get kv_t_fails 0 1
+end
+kv_t_w name
+kv_t_w kv_t_nl
+end
+
+fn kv_t_buf_eq a view uchar * alen ulong b view uchar * to bool
+if ne alen len b
+ret false
+end
+for i ulong alen bound 64
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note Test 1 (POSITIVE): Put, get, update, integrity verify, and delete.
+fn test_kv_pos_crud to bool
+kv_init
+sid = kv_session_create
+if ne sid 1
+ret false
+end
+if ne kv_put sid kv_k_alpha kv_v_one KV_OK
+ret false
+end
+if ne kv_count 1
+ret false
+end
+dst = new uchar 64 0
+vlen = new ulong 1 0
+if ne kv_get kv_k_alpha dst vlen KV_OK
+ret false
+end
+if not kv_t_buf_eq dst get vlen 0 kv_v_one
+ret false
+end
+note Update existing key and verify version incremented and new bytes returned
+if ne kv_put sid kv_k_alpha kv_v_two KV_OK
+ret false
+end
+if ne kv_count 1
+ret false
+end
+if ne kv_get kv_k_alpha dst vlen KV_OK
+ret false
+end
+if not kv_t_buf_eq dst get vlen 0 kv_v_two
+ret false
+end
+if ne kv_verify_all KV_OK
+ret false
+end
+note Delete key and confirm KV_ERR_NOT_FOUND
+if ne kv_del kv_k_alpha KV_OK
+ret false
+end
+if ne kv_count 0
+ret false
+end
+if ne kv_get kv_k_alpha dst vlen KV_ERR_NOT_FOUND
+ret false
+end
+ret true
+end
+
+note Test 2 (POSITIVE): Atomic transaction commit and rollback.
+fn test_kv_pos_tx to bool
+kv_init
+sid = kv_session_create
+if ne kv_put sid kv_k_alpha kv_v_one KV_OK
+ret false
+end
+note Commit transaction adding beta
+if ne kv_begin_tx KV_OK
+ret false
+end
+if not kv_tx_active
+ret false
+end
+if ne kv_put sid kv_k_beta kv_v_two KV_OK
+ret false
+end
+if ne kv_commit KV_OK
+ret false
+end
+if kv_tx_active
+ret false
+end
+if or ne kv_count 2 ne kv_commits 1
+ret false
+end
+note Second transaction modifies alpha, adds gamma, deletes beta, then rolls back
+if ne kv_begin_tx KV_OK
+ret false
+end
+if ne kv_put sid kv_k_alpha kv_v_three KV_OK
+ret false
+end
+if ne kv_put sid kv_k_gamma kv_v_three KV_OK
+ret false
+end
+if ne kv_del kv_k_beta KV_OK
+ret false
+end
+if ne kv_rollback KV_OK
+ret false
+end
+if or ne kv_count 2 ne kv_rollbacks 1
+ret false
+end
+dst = new uchar 64 0
+vlen = new ulong 1 0
+if ne kv_get kv_k_alpha dst vlen KV_OK
+ret false
+end
+if not kv_t_buf_eq dst get vlen 0 kv_v_one
+ret false
+end
+if ne kv_get kv_k_beta dst vlen KV_OK
+ret false
+end
+if not kv_t_buf_eq dst get vlen 0 kv_v_two
+ret false
+end
+if ne kv_get kv_k_gamma dst vlen KV_ERR_NOT_FOUND
+ret false
+end
+ret true
+end
+
+note Test 3 (NEGATIVE): Key/val bounds, bad/closed session, sealed entry, tx state errors, small dst.
+fn test_kv_neg_bounds_session_seal to bool
+kv_init
+sid = kv_session_create
+empty_k = new uchar 1 0
+note Empty key via part 0 0
+if ne kv_put sid part empty_k 0 0 kv_v_one KV_ERR_KEY_BOUNDS
+ret false
+end
+note Oversized key (33 > 32)
+if ne kv_put sid kv_k_long kv_v_one KV_ERR_KEY_BOUNDS
+ret false
+end
+note Oversized value (65 > 64)
+if ne kv_put sid kv_k_alpha kv_v_long KV_ERR_VAL_BOUNDS
+ret false
+end
+note Unknown session id 0 and 99
+if ne kv_put 0 kv_k_alpha kv_v_one KV_ERR_BAD_SESSION
+ret false
+end
+if ne kv_put 99 kv_k_alpha kv_v_one KV_ERR_BAD_SESSION
+ret false
+end
+note Pin/seal entry and refuse overwrite or delete
+if ne kv_put sid kv_k_pinned kv_v_one KV_OK
+ret false
+end
+if ne kv_pin kv_k_pinned KV_OK
+ret false
+end
+if ne kv_put sid kv_k_pinned kv_v_two KV_ERR_SEALED
+ret false
+end
+if ne kv_del kv_k_pinned KV_ERR_SEALED
+ret false
+end
+note Small output buffer refused
+small_dst = new uchar 4 0
+vlen = new ulong 1 0
+if ne kv_get kv_k_pinned small_dst vlen KV_ERR_DST_SMALL
+ret false
+end
+note Close session and refuse subsequent put
+if ne kv_session_close sid KV_OK
+ret false
+end
+if ne kv_put sid kv_k_beta kv_v_one KV_ERR_BAD_SESSION
+ret false
+end
+note Tx errors: commit/rollback outside tx, nested begin_tx
+if ne kv_commit KV_ERR_NO_TX
+ret false
+end
+if ne kv_rollback KV_ERR_NO_TX
+ret false
+end
+if ne kv_begin_tx KV_OK
+ret false
+end
+if ne kv_begin_tx KV_ERR_TX_ACTIVE
+ret false
+end
+if ne kv_rollback KV_OK
+ret false
+end
+ret true
+end
+
+note Test 4 (NEGATIVE): Store capacity full refusal at 33rd unique key.
+fn test_kv_neg_full to bool
+kv_init
+sid = kv_session_create
+kbuf = new uchar 4 0
+put kbuf 0 uchar 107
+put kbuf 1 uchar 95
+for i ulong KV_MAX_SLOTS
+put kbuf 2 uchar add 65 div i 10
+put kbuf 3 uchar add 48 rem i 10
+if ne kv_put sid kbuf kv_v_one KV_OK
+ret false
+end
+end
+if ne kv_count KV_MAX_SLOTS
+ret false
+end
+put kbuf 2 uchar 90
+put kbuf 3 uchar 90
+if ne kv_put sid kbuf kv_v_one KV_ERR_FULL
+ret false
+end
+ret true
+end
+
+note Test 5 (NEGATIVE): Bit-flip corruption in value refused fail-closed, and commit auto-rolls back.
+fn test_kv_neg_corruption to bool
+kv_init
+sid = kv_session_create
+if ne kv_put sid kv_k_alpha kv_v_one KV_OK
+ret false
+end
+if ne kv_begin_tx KV_OK
+ret false
+end
+if ne kv_put sid kv_k_beta kv_v_two KV_OK
+ret false
+end
+slot_b = kv_find_slot kv_k_beta
+if eq slot_b KV_NONE
+ret false
+end
+note Flip 1 bit in stored value of beta
+vbase = mul slot_b KV_VAL_MAX
+orig = get kv_vals vbase
+put kv_vals vbase xor orig uchar 1
+dst = new uchar 64 0
+put dst 0 uchar 0xaa
+vlen = new ulong 1 0
+if ne kv_get kv_k_beta dst vlen KV_ERR_CORRUPT
+ret false
+end
+note Confirm fail-closed: dst untouched and vlen=0
+if or ne get dst 0 uchar 0xaa ne get vlen 0 0
+ret false
+end
+if ne kv_verify_all KV_ERR_CORRUPT
+ret false
+end
+note Commit must detect corruption, auto-rollback beta, and preserve clean alpha
+if ne kv_commit KV_ERR_CORRUPT
+ret false
+end
+if kv_tx_active
+ret false
+end
+if ne kv_count 1
+ret false
+end
+if ne kv_get kv_k_beta dst vlen KV_ERR_NOT_FOUND
+ret false
+end
+if ne kv_get kv_k_alpha dst vlen KV_OK
+ret false
+end
+if not kv_t_buf_eq dst get vlen 0 kv_v_one
+ret false
+end
+ret true
+end
+
+note Test 6 (MUTANT CONTROLS): Tampering version metadata or stored SHA-256 hash is caught.
+fn test_kv_mutant_controls to bool
+kv_init
+sid = kv_session_create
+if ne kv_put sid kv_k_alpha kv_v_one KV_OK
+ret false
+end
+slot = kv_find_slot kv_k_alpha
+if eq slot KV_NONE
+ret false
+end
+note Mutant A: tamper version metadata by +1 -> SHA-256 check must fail
+orig_ver = get kv_ver slot
+put kv_ver slot add orig_ver 1
+dst = new uchar 64 0
+vlen = new ulong 1 0
+if ne kv_get kv_k_alpha dst vlen KV_ERR_CORRUPT
+ret false
+end
+put kv_ver slot orig_ver
+if ne kv_get kv_k_alpha dst vlen KV_OK
+ret false
+end
+note Mutant B: flip last bit of stored SHA-256 digest -> must fail
+hbase = add mul slot KV_HASH_BYTES 31
+orig_h = get kv_hashes hbase
+put kv_hashes hbase xor orig_h uchar 1
+if ne kv_verify_all KV_ERR_CORRUPT
+ret false
+end
+if ne kv_get kv_k_alpha dst vlen KV_ERR_CORRUPT
+ret false
+end
+put kv_hashes hbase orig_h
+if ne kv_verify_all KV_OK
+ret false
+end
+ret true
+end
+
+fn main to int
+put kv_t_fails 0 0
+kv_t_rep kv_t_n1 test_kv_pos_crud
+kv_t_rep kv_t_n2 test_kv_pos_tx
+kv_t_rep kv_t_n3 test_kv_neg_bounds_session_seal
+kv_t_rep kv_t_n4 test_kv_neg_full
+kv_t_rep kv_t_n5 test_kv_neg_corruption
+kv_t_rep kv_t_n6 test_kv_mutant_controls
+if eq get kv_t_fails 0 0
+kv_t_w kv_t_all_ok
+ret 0
+end
+kv_t_w kv_t_all_bad
+ret 1
+end

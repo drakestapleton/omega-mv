@@ -1,0 +1,322 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/store/closure.om
+note Pure OM-2 conversion of aien-closure (manifest, digest, graph, declare, verify).
+note Verified closure and artifact pin checker refusing missing/mismatched SHA-256
+note digests, dirty workspace or artifact flags, missing dependencies, and cycles.
+note Compose after si/directives/om2.om and om/tls/sha2.om.
+
+const CLS_MAX_PINS ulong 32
+const CLS_MAX_EDGES ulong 64
+const CLS_HASH_BYTES ulong 32
+const CLS_HASH_TOTAL ulong 1024
+const CLS_NONE ulong 18446744073709551615
+
+note Status and refusal codes
+const CLS_OK ulong 0
+const CLS_ERR_FULL ulong 1
+const CLS_ERR_DUP_PIN ulong 2
+const CLS_ERR_NOT_FOUND ulong 3
+const CLS_ERR_DIRTY_TREE ulong 4
+const CLS_ERR_MISSING_DIGEST ulong 5
+const CLS_ERR_DIGEST_MISMATCH ulong 6
+const CLS_ERR_MISSING_DEP ulong 7
+const CLS_ERR_CYCLE ulong 8
+const CLS_ERR_EMPTY ulong 9
+const CLS_ERR_UNOBSERVED ulong 10
+
+text cls_root_dom "AIEN-CLOSURE-V1"
+
+note Metadata: [0]=pin_cnt, [1]=edge_cnt, [2]=workspace_dirty(0/1), [3]=ok_cnt, [4]=deny_cnt
+global cls_meta ulong 8
+
+note Pinned artifact table (0..31)
+global cls_pin_id ulong 32
+global cls_pin_dirty ulong 32
+global cls_pin_obs ulong 32
+global cls_exp_hash uchar 1024
+global cls_obs_hash uchar 1024
+
+note Dependency graph edges (0..63)
+global cls_edge_from ulong 64
+global cls_edge_to ulong 64
+
+note Scratch arrays for Kahn's cycle detection
+global cls_indeg ulong 32
+global cls_done ulong 32
+
+fn cls_init to void
+for i ulong 8
+put cls_meta i 0
+end
+for i ulong CLS_MAX_PINS
+put cls_pin_id i 0
+put cls_pin_dirty i 0
+put cls_pin_obs i 0
+put cls_indeg i 0
+put cls_done i 0
+end
+for i ulong CLS_HASH_TOTAL
+put cls_exp_hash i uchar 0
+put cls_obs_hash i uchar 0
+end
+for i ulong CLS_MAX_EDGES
+put cls_edge_from i 0
+put cls_edge_to i 0
+end
+end
+
+fn cls_set_workspace_dirty dirty ulong to void
+put cls_meta 2 dirty
+end
+
+fn cls_pin_count to ulong
+ret get cls_meta 0
+end
+
+fn cls_edge_count to ulong
+ret get cls_meta 1
+end
+
+fn cls_ok_count to ulong
+ret get cls_meta 3
+end
+
+fn cls_deny_count to ulong
+ret get cls_meta 4
+end
+
+fn cls_is_zero_hash h view uchar 32 to bool
+acc = uchar 0
+for i ulong 32
+acc = or acc get h i
+end
+ret eq acc uchar 0
+end
+
+fn cls_hash_eq a view uchar 32 b view uchar 32 to bool
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get a i get b i
+end
+ret eq diff uchar 0
+end
+
+fn cls_put_u64 buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul i 8
+put buf add off i uchar and shr v sh ulong 255
+end
+end
+
+fn cls_find_pin art_id ulong to ulong
+cnt = get cls_meta 0
+for i ulong cnt bound 32
+if eq get cls_pin_id i art_id
+ret i
+end
+end
+ret CLS_NONE
+end
+
+note Register a pinned artifact with its expected SHA-256 digest and per-artifact dirty flag.
+fn cls_add_pin art_id ulong exp_hash view uchar 32 dirty ulong to ulong
+if cls_is_zero_hash exp_hash
+ret CLS_ERR_MISSING_DIGEST
+end
+if ne cls_find_pin art_id CLS_NONE
+ret CLS_ERR_DUP_PIN
+end
+cnt = get cls_meta 0
+if ge cnt CLS_MAX_PINS
+ret CLS_ERR_FULL
+end
+put cls_pin_id cnt art_id
+put cls_pin_dirty cnt dirty
+put cls_pin_obs cnt 0
+hbase = mul cnt CLS_HASH_BYTES
+for i ulong 32
+put cls_exp_hash add hbase i get exp_hash i
+put cls_obs_hash add hbase i uchar 0
+end
+put cls_meta 0 add cnt 1
+ret CLS_OK
+end
+
+note Register a directed dependency edge from_id -> to_id.
+fn cls_add_dep from_id ulong to_id ulong to ulong
+ecnt = get cls_meta 1
+if ge ecnt CLS_MAX_EDGES
+ret CLS_ERR_FULL
+end
+put cls_edge_from ecnt from_id
+put cls_edge_to ecnt to_id
+put cls_meta 1 add ecnt 1
+ret CLS_OK
+end
+
+note Record an observed 32-byte SHA-256 digest for a pinned artifact.
+fn cls_observe_digest art_id ulong obs_hash view uchar 32 to ulong
+idx = cls_find_pin art_id
+if eq idx CLS_NONE
+ret CLS_ERR_NOT_FOUND
+end
+if cls_is_zero_hash obs_hash
+ret CLS_ERR_MISSING_DIGEST
+end
+hbase = mul idx CLS_HASH_BYTES
+for i ulong 32
+put cls_obs_hash add hbase i get obs_hash i
+end
+put cls_pin_obs idx 1
+ret CLS_OK
+end
+
+note Hash payload bytes with SHA-256 and record as the observed digest for art_id.
+fn cls_observe_payload art_id ulong payload view uchar * to ulong
+idx = cls_find_pin art_id
+if eq idx CLS_NONE
+ret CLS_ERR_NOT_FOUND
+end
+dig = new uchar 32 0
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx payload
+sha256_final ctx dig
+ret cls_observe_digest art_id dig
+end
+
+note Verify one pinned artifact slot: clean flag, observed, non-zero, constant-time digest match.
+fn cls_check_pin idx ulong to ulong
+if ne get cls_pin_dirty idx 0
+ret CLS_ERR_DIRTY_TREE
+end
+if eq get cls_pin_obs idx 0
+ret CLS_ERR_UNOBSERVED
+end
+exp_h = new uchar 32 0
+obs_h = new uchar 32 0
+hbase = mul idx CLS_HASH_BYTES
+for i ulong 32
+put exp_h i get cls_exp_hash add hbase i
+put obs_h i get cls_obs_hash add hbase i
+end
+if or cls_is_zero_hash exp_h cls_is_zero_hash obs_h
+ret CLS_ERR_MISSING_DIGEST
+end
+if not cls_hash_eq exp_h obs_h
+ret CLS_ERR_DIGEST_MISMATCH
+end
+ret CLS_OK
+end
+
+note Decrement in-degrees of all targets reachable from node u_idx.
+fn cls_peel_node u_idx ulong ecnt ulong to void
+uid = get cls_pin_id u_idx
+for e ulong ecnt bound 64
+if eq get cls_edge_from e uid
+v_idx = cls_find_pin get cls_edge_to e
+if ne v_idx CLS_NONE
+deg = get cls_indeg v_idx
+if gt deg 0
+put cls_indeg v_idx sub deg 1
+end
+end
+end
+end
+end
+
+note Verify dependency graph: every edge endpoint exists and the graph is acyclic (Kahn's sort).
+fn cls_check_graph to ulong
+cnt = get cls_meta 0
+ecnt = get cls_meta 1
+for i ulong cnt bound 32
+put cls_indeg i 0
+put cls_done i 0
+end
+for e ulong ecnt bound 64
+u_idx = cls_find_pin get cls_edge_from e
+v_idx = cls_find_pin get cls_edge_to e
+if or eq u_idx CLS_NONE eq v_idx CLS_NONE
+ret CLS_ERR_MISSING_DEP
+end
+put cls_indeg v_idx add get cls_indeg v_idx 1
+end
+removed = ulong 0
+for step ulong cnt bound 32
+found = CLS_NONE
+for i ulong cnt bound 32
+if and eq get cls_done i 0 eq get cls_indeg i 0
+found = i
+break
+end
+end
+if eq found CLS_NONE
+ret CLS_ERR_CYCLE
+end
+put cls_done found 1
+removed = add removed 1
+cls_peel_node found ecnt
+end
+if ne removed cnt
+ret CLS_ERR_CYCLE
+end
+ret CLS_OK
+end
+
+note Compute deterministic SHA-256 closure root over all verified pins.
+fn cls_compute_root out_root edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx cls_root_dom
+cnt = get cls_meta 0
+hdr = new uchar 8 0
+cls_put_u64 hdr 0 cnt
+sha256_update ctx hdr
+hbuf = new uchar 32 0
+for i ulong cnt bound 32
+cls_put_u64 hdr 0 get cls_pin_id i
+sha256_update ctx hdr
+hbase = mul i CLS_HASH_BYTES
+for j ulong 32
+put hbuf j get cls_exp_hash add hbase j
+end
+sha256_update ctx hbuf
+end
+sha256_final ctx out_root
+end
+
+fn cls_record_verdict st ulong to ulong
+if eq st CLS_OK
+put cls_meta 3 add get cls_meta 3 1
+else
+put cls_meta 4 add get cls_meta 4 1
+end
+ret st
+end
+
+note Fail-closed closure verification: checks emptiness, dirty flags, all pin digests, and DAG acyclicity.
+note Writes 32-byte canonical closure root into out_root only on CLS_OK (zeroes out_root on failure).
+fn cls_verify_closure out_root edit uchar 32 to ulong
+for i ulong 32
+put out_root i uchar 0
+end
+cnt = get cls_meta 0
+if eq cnt 0
+ret cls_record_verdict CLS_ERR_EMPTY
+end
+if ne get cls_meta 2 0
+ret cls_record_verdict CLS_ERR_DIRTY_TREE
+end
+for i ulong cnt bound 32
+st = cls_check_pin i
+if ne st CLS_OK
+ret cls_record_verdict st
+end
+end
+gst = cls_check_graph
+if ne gst CLS_OK
+ret cls_record_verdict gst
+end
+cls_compute_root out_root
+ret cls_record_verdict CLS_OK
+end

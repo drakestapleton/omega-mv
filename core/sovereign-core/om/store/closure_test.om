@@ -1,0 +1,312 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/store/closure_test.om
+note Positive, negative, and mutant test suite for core/sovereign-core/om/store/closure.om.
+note Compose with:
+note   si/directives/om2.om om/tls/sha2.om core/sovereign-core/om/store/closure.om
+note   core/sovereign-core/om/store/closure_test.om
+
+text cls_t_pass "PASS "
+text cls_t_fail "FAIL "
+text cls_t_nl "\n"
+text cls_t_all_ok "CLOSURE TEST SUITE PASS\n"
+text cls_t_all_bad "CLOSURE TEST SUITE FAIL\n"
+
+text cls_t_n1 "cls_pos_verified_dag_and_deterministic_root"
+text cls_t_n2 "cls_neg_dirty_workspace_and_dirty_artifact"
+text cls_t_n3 "cls_neg_missing_unobserved_and_mismatched_digest"
+text cls_t_n4 "cls_neg_empty_missing_dep_and_cycle_detection"
+text cls_t_n5 "cls_mutant_pin_tamper_and_root_sensitivity"
+
+text cls_art_a "artifact:alpha:v1:seed-omc"
+text cls_art_b "artifact:beta:v1:runtime-core"
+text cls_art_c "artifact:gamma:v1:closure-leaf"
+text cls_art_b_bad "artifact:beta:v1:runtime-corX"
+
+global cls_t_fails ulong 1
+
+fn cls_t_w s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 256
+k = write 1 s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn cls_t_rep name view uchar * ok bool to void
+if ok
+cls_t_w cls_t_pass
+else
+cls_t_w cls_t_fail
+put cls_t_fails 0 add get cls_t_fails 0 1
+end
+cls_t_w name
+cls_t_w cls_t_nl
+end
+
+fn cls_t_sha msg view uchar * out_h edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx msg
+sha256_final ctx out_h
+end
+
+note Test 1 (POSITIVE): 3-node DAG (10 -> 20 -> 30), clean tree, matching SHA-256 digests, deterministic root.
+fn test_cls_pos_dag to bool
+cls_init
+ha = new uchar 32 0
+hb = new uchar 32 0
+hc = new uchar 32 0
+cls_t_sha cls_art_a ha
+cls_t_sha cls_art_b hb
+cls_t_sha cls_art_c hc
+if ne cls_add_pin 10 ha 0 CLS_OK
+ret false
+end
+if ne cls_add_pin 20 hb 0 CLS_OK
+ret false
+end
+if ne cls_add_pin 30 hc 0 CLS_OK
+ret false
+end
+if ne cls_add_dep 10 20 CLS_OK
+ret false
+end
+if ne cls_add_dep 20 30 CLS_OK
+ret false
+end
+if ne cls_observe_payload 10 cls_art_a CLS_OK
+ret false
+end
+if ne cls_observe_payload 20 cls_art_b CLS_OK
+ret false
+end
+if ne cls_observe_payload 30 cls_art_c CLS_OK
+ret false
+end
+r1 = new uchar 32 0
+r2 = new uchar 32 0
+if ne cls_verify_closure r1 CLS_OK
+ret false
+end
+if cls_is_zero_hash r1
+ret false
+end
+if ne cls_verify_closure r2 CLS_OK
+ret false
+end
+if not cls_hash_eq r1 r2
+ret false
+end
+if ne cls_ok_count 2
+ret false
+end
+ret true
+end
+
+note Test 2 (NEGATIVE): Dirty workspace flag and per-artifact dirty flag both refused.
+fn test_cls_neg_dirty to bool
+cls_init
+ha = new uchar 32 0
+cls_t_sha cls_art_a ha
+if ne cls_add_pin 10 ha 0 CLS_OK
+ret false
+end
+if ne cls_observe_payload 10 cls_art_a CLS_OK
+ret false
+end
+cls_set_workspace_dirty 1
+root = new uchar 32 0
+if ne cls_verify_closure root CLS_ERR_DIRTY_TREE
+ret false
+end
+if not cls_is_zero_hash root
+ret false
+end
+note Clear workspace dirty, add a dirty artifact -> still refused
+cls_set_workspace_dirty 0
+hb = new uchar 32 0
+cls_t_sha cls_art_b hb
+if ne cls_add_pin 20 hb 1 CLS_OK
+ret false
+end
+if ne cls_observe_payload 20 cls_art_b CLS_OK
+ret false
+end
+if ne cls_verify_closure root CLS_ERR_DIRTY_TREE
+ret false
+end
+if ne cls_deny_count 2
+ret false
+end
+ret true
+end
+
+note Test 3 (NEGATIVE): Missing/zero digest, duplicate pin, unobserved pin, mismatched payload digest.
+fn test_cls_neg_digests to bool
+cls_init
+zero_h = new uchar 32 0
+if ne cls_add_pin 10 zero_h 0 CLS_ERR_MISSING_DIGEST
+ret false
+end
+ha = new uchar 32 0
+hb = new uchar 32 0
+cls_t_sha cls_art_a ha
+cls_t_sha cls_art_b hb
+if ne cls_add_pin 10 ha 0 CLS_OK
+ret false
+end
+if ne cls_add_pin 10 ha 0 CLS_ERR_DUP_PIN
+ret false
+end
+if ne cls_observe_digest 10 zero_h CLS_ERR_MISSING_DIGEST
+ret false
+end
+if ne cls_observe_digest 999 ha CLS_ERR_NOT_FOUND
+ret false
+end
+note Unobserved pin must fail verification
+root = new uchar 32 0
+if ne cls_verify_closure root CLS_ERR_UNOBSERVED
+ret false
+end
+note Observe tampered payload -> CLS_ERR_DIGEST_MISMATCH
+if ne cls_observe_payload 10 cls_art_b_bad CLS_OK
+ret false
+end
+if ne cls_verify_closure root CLS_ERR_DIGEST_MISMATCH
+ret false
+end
+if not cls_is_zero_hash root
+ret false
+end
+ret true
+end
+
+note Test 4 (NEGATIVE): Empty closure, missing dependency node, and 3-node cycle refusal.
+fn test_cls_neg_graph to bool
+cls_init
+root = new uchar 32 0
+if ne cls_verify_closure root CLS_ERR_EMPTY
+ret false
+end
+ha = new uchar 32 0
+hb = new uchar 32 0
+hc = new uchar 32 0
+cls_t_sha cls_art_a ha
+cls_t_sha cls_art_b hb
+cls_t_sha cls_art_c hc
+if ne cls_add_pin 1 ha 0 CLS_OK
+ret false
+end
+if ne cls_add_pin 2 hb 0 CLS_OK
+ret false
+end
+if ne cls_observe_payload 1 cls_art_a CLS_OK
+ret false
+end
+if ne cls_observe_payload 2 cls_art_b CLS_OK
+ret false
+end
+note Missing dep node 99
+if ne cls_add_dep 1 99 CLS_OK
+ret false
+end
+if ne cls_verify_closure root CLS_ERR_MISSING_DEP
+ret false
+end
+note Rebuild with 3-node cycle 1 -> 2 -> 3 -> 1
+cls_init
+if ne cls_add_pin 1 ha 0 CLS_OK
+ret false
+end
+if ne cls_add_pin 2 hb 0 CLS_OK
+ret false
+end
+if ne cls_add_pin 3 hc 0 CLS_OK
+ret false
+end
+if ne cls_observe_payload 1 cls_art_a CLS_OK
+ret false
+end
+if ne cls_observe_payload 2 cls_art_b CLS_OK
+ret false
+end
+if ne cls_observe_payload 3 cls_art_c CLS_OK
+ret false
+end
+if ne cls_add_dep 1 2 CLS_OK
+ret false
+end
+if ne cls_add_dep 2 3 CLS_OK
+ret false
+end
+if ne cls_add_dep 3 1 CLS_OK
+ret false
+end
+if ne cls_verify_closure root CLS_ERR_CYCLE
+ret false
+end
+ret true
+end
+
+note Test 5 (MUTANT CONTROLS): 1-bit tamper in pinned expected digest fails; changed artifact changes root.
+fn test_cls_mutant_controls to bool
+cls_init
+ha = new uchar 32 0
+hb = new uchar 32 0
+cls_t_sha cls_art_a ha
+cls_t_sha cls_art_b hb
+if ne cls_add_pin 10 ha 0 CLS_OK
+ret false
+end
+if ne cls_observe_payload 10 cls_art_a CLS_OK
+ret false
+end
+r1 = new uchar 32 0
+if ne cls_verify_closure r1 CLS_OK
+ret false
+end
+note Mutant A: flip 1 bit in stored expected hash of pin 0 -> mismatch
+orig = get cls_exp_hash 15
+put cls_exp_hash 15 xor orig uchar 1
+r_bad = new uchar 32 0
+if ne cls_verify_closure r_bad CLS_ERR_DIGEST_MISMATCH
+ret false
+end
+put cls_exp_hash 15 orig
+note Mutant B: replace artifact 10 with beta (matching pin & payload) -> root must differ
+cls_init
+if ne cls_add_pin 10 hb 0 CLS_OK
+ret false
+end
+if ne cls_observe_payload 10 cls_art_b CLS_OK
+ret false
+end
+r2 = new uchar 32 0
+if ne cls_verify_closure r2 CLS_OK
+ret false
+end
+if cls_hash_eq r1 r2
+ret false
+end
+ret true
+end
+
+fn main to int
+put cls_t_fails 0 0
+cls_t_rep cls_t_n1 test_cls_pos_dag
+cls_t_rep cls_t_n2 test_cls_neg_dirty
+cls_t_rep cls_t_n3 test_cls_neg_digests
+cls_t_rep cls_t_n4 test_cls_neg_graph
+cls_t_rep cls_t_n5 test_cls_mutant_controls
+if eq get cls_t_fails 0 0
+cls_t_w cls_t_all_ok
+ret 0
+end
+cls_t_w cls_t_all_bad
+ret 1
+end

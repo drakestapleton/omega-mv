@@ -1,0 +1,170 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/rsi/om/eval/canary.om
+note Pure OM-2 conversion of spark-rsi-mv/src/canary/{admission,identity,observation,workload}.rs.
+note Canary identity binding (SHA-256), non-synthetic provenance enforcement,
+note observation window accumulation, and fail-closed canary admission gate.
+note Compose after om/tls/sha2.om.
+
+note Canary provenance
+const CNR_PROV_SYNTHETIC ulong 0
+const CNR_PROV_CANARY_HOST ulong 1
+const CNR_PROV_SILICON ulong 2
+
+note Canary verdicts
+const CNR_PASS ulong 0
+const CNR_HOLD_INSUFFICIENT_SAMPLES ulong 1
+const CNR_DENY_UNINIT ulong 10
+const CNR_DENY_UNBOUND_ID ulong 11
+const CNR_DENY_SYNTHETIC ulong 12
+const CNR_DENY_CRASH ulong 13
+const CNR_DENY_ERROR_RATE ulong 14
+const CNR_DENY_LATENCY ulong 15
+const CNR_DENY_ID_MISMATCH ulong 16
+
+text cnr_id_dom "RSI-CANARY-ID-V1"
+
+note Config: [0]=init, [1]=min_samples, [2]=max_err_bps, [3]=max_p99_reg_bps
+global cnr_cfg ulong 8
+
+note Active canary session state:
+note [0]=bound(0/1), [1]=cand_id, [2]=provenance, [3]=samples, [4]=errors, [5]=crashes, [6]=base_p99_ns, [7]=max_obs_p99_ns
+global cnr_state ulong 8
+global cnr_id_hash uchar 32
+
+fn cnr_init min_samples ulong max_err_bps ulong max_p99_reg_bps ulong to void
+put cnr_cfg 0 1
+put cnr_cfg 1 min_samples
+put cnr_cfg 2 max_err_bps
+put cnr_cfg 3 max_p99_reg_bps
+for i ulong 8
+put cnr_state i 0
+end
+for i ulong 32
+put cnr_id_hash i uchar 0
+end
+end
+
+fn cnr_is_zero_hash h view uchar 32 to bool
+acc = uchar 0
+for i ulong 32
+acc = or acc get h i
+end
+ret eq acc uchar 0
+end
+
+fn cnr_hash_eq a view uchar 32 b view uchar 32 to bool
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get a i get b i
+end
+ret eq diff uchar 0
+end
+
+fn cnr_put_u64 buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul i 8
+put buf add off i uchar and shr v sh ulong 255
+end
+end
+
+note Compute canonical SHA-256 canary identity binding from cand_id and artifact digest.
+fn cnr_compute_identity cand_id ulong art_digest view uchar 32 out_id edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx cnr_id_dom
+hdr = new uchar 8 0
+cnr_put_u64 hdr 0 cand_id
+sha256_update ctx hdr
+sha256_update ctx art_digest
+sha256_final ctx out_id
+end
+
+note Admit a candidate into the canary observation window with cryptographic identity binding.
+fn cnr_begin cand_id ulong provenance ulong base_p99_ns ulong art_digest view uchar 32 to ulong
+if eq get cnr_cfg 0 0
+ret CNR_DENY_UNINIT
+end
+if or eq provenance CNR_PROV_SYNTHETIC gt provenance CNR_PROV_SILICON
+ret CNR_DENY_SYNTHETIC
+end
+if or eq base_p99_ns 0 cnr_is_zero_hash art_digest
+ret CNR_DENY_UNBOUND_ID
+end
+for i ulong 8
+put cnr_state i 0
+end
+id_h = new uchar 32 0
+cnr_compute_identity cand_id art_digest id_h
+for i ulong 32
+put cnr_id_hash i get id_h i
+end
+put cnr_state 0 1
+put cnr_state 1 cand_id
+put cnr_state 2 provenance
+put cnr_state 6 base_p99_ns
+ret CNR_PASS
+end
+
+note Record one canary workload observation batch.
+fn cnr_observe reqs ulong errs ulong crashes ulong obs_p99_ns ulong to ulong
+if eq get cnr_state 0 0
+ret CNR_DENY_UNBOUND_ID
+end
+put cnr_state 3 add get cnr_state 3 reqs
+put cnr_state 4 add get cnr_state 4 errs
+put cnr_state 5 add get cnr_state 5 crashes
+if gt obs_p99_ns get cnr_state 7
+put cnr_state 7 obs_p99_ns
+end
+ret CNR_PASS
+end
+
+note Verify canary identity binding and evaluate all canary admission criteria.
+fn cnr_evaluate cand_id ulong art_digest view uchar 32 to ulong
+if eq get cnr_cfg 0 0
+ret CNR_DENY_UNINIT
+end
+if eq get cnr_state 0 0
+ret CNR_DENY_UNBOUND_ID
+end
+if ne get cnr_state 1 cand_id
+ret CNR_DENY_ID_MISMATCH
+end
+exp_id = new uchar 32 0
+cnr_compute_identity cand_id art_digest exp_id
+cur_id = new uchar 32 0
+for i ulong 32
+put cur_id i get cnr_id_hash i
+end
+if not cnr_hash_eq exp_id cur_id
+ret CNR_DENY_ID_MISMATCH
+end
+prov = get cnr_state 2
+if or eq prov CNR_PROV_SYNTHETIC gt prov CNR_PROV_SILICON
+ret CNR_DENY_SYNTHETIC
+end
+if gt get cnr_state 5 0
+ret CNR_DENY_CRASH
+end
+samples = get cnr_state 3
+if lt samples get cnr_cfg 1
+ret CNR_HOLD_INSUFFICIENT_SAMPLES
+end
+errs = get cnr_state 4
+if gt errs samples
+ret CNR_DENY_ERROR_RATE
+end
+err_bps = div mul errs 10000 samples
+if gt err_bps get cnr_cfg 2
+ret CNR_DENY_ERROR_RATE
+end
+base_p99 = get cnr_state 6
+obs_p99 = get cnr_state 7
+if gt obs_p99 base_p99
+reg_bps = div mul sub obs_p99 base_p99 10000 base_p99
+if gt reg_bps get cnr_cfg 3
+ret CNR_DENY_LATENCY
+end
+end
+ret CNR_PASS
+end
