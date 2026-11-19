@@ -2,15 +2,13 @@
 
 ## UXL one command
 
-One line per machine. Paste it as a single line. It is safe to run again: the package install accepts what is already present, `omega-mv` is removed, then the clone and the full run start over. The run writes `omega-mv/uxl-run.log` and its own `uxl-run-<host>-<UTC>.log`. What the run checks is in [docs/UXL.md](docs/UXL.md).
+```sh
+git clone https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh
+```
 
-| Machine | Line | Note |
-| --- | --- | --- |
-| x86-64 Linux (Debian/Ubuntu) | `cd "$HOME" && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates python3 qemu-user-static binfmt-support spirv-tools mesa-vulkan-drivers ocl-icd-libopencl1 && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1` | Installs qemu-user-static, binfmt-support, spirv-tools, python3, mesa-vulkan-drivers, and ocl-icd-libopencl1. qemu-user-static is what runs the AArch64 `omc`. On a normal Ubuntu or Debian install that package registers the interpreter. |
-| arm64 Linux (Debian/Ubuntu) | `cd "$HOME" && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates python3 spirv-tools mesa-vulkan-drivers ocl-icd-libopencl1 && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1` | No qemu. `omc` is an AArch64 Linux binary and runs natively. |
-| macOS | `brew install git python spirv-tools && cd "$HOME" && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1` | Homebrew installs git, Python 3, and spirv-tools. omc stages are NOT_RUN unless a Linux VM is available: `omc` is an AArch64 Linux binary and macOS has no binfmt. |
-| Windows PowerShell (native) | `winget install -e --id Git.Git --accept-package-agreements --accept-source-agreements --disable-interactivity; winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements --disable-interactivity; $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User'); Set-Location $env:USERPROFILE; if (Test-Path omega-mv) { Remove-Item -Recurse -Force omega-mv }; git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git; Set-Location omega-mv; powershell -ExecutionPolicy Bypass -File .\uxl-run.ps1 *> uxl-run.log` | winget installs Git and Python 3.12 when they are missing, then clones and runs `.\uxl-run.ps1`. `omc` cannot exec here. The script prints the WSL rerun line, and the omc stages are NOT_RUN. |
-| Windows WSL2 Ubuntu | `wsl -d Ubuntu -- bash -lc 'cd "$HOME" && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates python3 qemu-user-static binfmt-support spirv-tools mesa-vulkan-drivers ocl-icd-libopencl1 && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1'` | The x86-64 Linux line, run inside WSL2 Ubuntu. Paste this in Windows PowerShell. The log is `~/omega-mv/uxl-run.log` in that Ubuntu home. |
+On Windows, the same clone, then `.\uxl-run.ps1`. If WSL2 is installed, that script runs `./uxl-run.sh` inside it. If not, it runs the same checks here.
+
+`./uxl-run.sh` detects the OS, the CPU, and which backends are present, prints that at the top of the log, and adapts. x86 Linux uses qemu-aarch64 when binfmt is registered. arm64 Linux runs `omc` natively. macOS runs the checks that do not need `omc` and marks the rest NOT_RUN. Native Windows without WSL does the same, and the hint is `wsl --install -d Ubuntu`. When a toolchain package is missing, the log prints one install command for that distro and does not run sudo. `./uxl-run.sh --install-deps` is the switch that runs it. The process exits 0 when nothing FAILed. NOT_RUN is not a failure. What the run checks is in [docs/UXL.md](docs/UXL.md).
 
 
 
