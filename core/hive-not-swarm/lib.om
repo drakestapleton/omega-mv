@@ -1,0 +1,662 @@
+note core/hive-not-swarm/lib.om: pure Omega exact rational concurrency model for Hive, Not Swarm.
+note Upstream source: hive-not-swarm/verify_model.py, model_grid.csv, sensitivity_grid.csv, verify_main_model.wl.
+note Compose after si/directives/om2.om; no target line, no fn main.
+
+const HNS_OK int 0
+const HNS_ERR_INFEASIBLE int 1
+const HNS_ERR_BAD_AGENTS int 2
+const HNS_ERR_BAD_WORK int 3
+const HNS_ERR_BAD_COST int 4
+const HNS_ERR_BAD_PROB int 5
+const HNS_ERR_BAD_DEN int 6
+const HNS_MAX_P ulong 64
+
+struct Rat num long den long end
+struct HiveModel anum long aden long snum long sden long bnum long bden long cnum long cden long r0num long r0den long rnum long rden long end
+struct HiveLimits hnum long hden long pnum long pden long epsnum long epsden long maxp ulong end
+struct EvalRow agents ulong tnum long tden long revnum long revden long commnum long commden long risk f64 tput f64 revok bool riskok bool feas bool end
+struct SolveRes found bool err int optn ulong opttnum long opttden long optrnum long optrden long optrisk f64 uncn ulong swn ulong swtnum long swtden long swrisk f64 feascnt ulong speedup f64 end
+
+global hns_obuf uchar 32768
+global hns_olen ulong 1
+
+text t_hns_nl "\n"
+text t_hns_sp " "
+text t_hns_sl "/"
+text t_hns_dot "."
+text t_hns_minus "-"
+text t_hns_true "true"
+text t_hns_false "false"
+text t_hns_hdr "n  T_exact     T_min     comm_min  rev_min  risk      tput     feasible\n"
+text t_hns_sep "------------------------------------------------------------------------\n"
+text t_hns_sc "scenario="
+text t_hns_optn " opt_n="
+text t_hns_tex " T_exact="
+text t_hns_tmin " T_min="
+text t_hns_rev " rev="
+text t_hns_rsk " risk="
+text t_hns_spd " speedup="
+text t_hns_unc " uncon_n="
+text t_hns_swm " swarm_n="
+text t_hns_swt " swarm_T="
+text t_hns_infeas " INFEASIBLE\n"
+
+note ---- buffered stdout writer
+
+fn hns_ob_reset to void
+put hns_olen 0 0
+end
+
+fn hns_ob_byte c uchar to void
+n = get hns_olen 0
+if lt n len hns_obuf
+put hns_obuf n c
+put hns_olen 0 add n 1
+end
+end
+
+fn hns_ob_str s view uchar * to void
+for i ulong len s
+hns_ob_byte get s i
+end
+end
+
+fn hns_ob_u64 v ulong to void
+d = new uchar 24 0
+pos = ulong 24
+x = v
+for it ulong 24
+pos = sub pos 1
+put d pos uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+for k ulong sub 24 pos
+hns_ob_byte get d add pos k
+end
+end
+
+fn hns_ob_i64 v long to void
+if lt v 0
+hns_ob_str t_hns_minus
+hns_ob_u64 ulong neg v
+else
+hns_ob_u64 ulong v
+end
+end
+
+fn hns_ob_rat num long den long to void
+hns_ob_i64 num
+hns_ob_str t_hns_sl
+hns_ob_i64 den
+end
+
+fn hns_ob_f64_4 v f64 to void
+x = v
+if lt x 0.0f64
+hns_ob_str t_hns_minus
+x = neg x
+end
+scaled = ulong add mul x 10000.0f64 0.5f64
+whole = div scaled 10000
+frac = rem scaled 10000
+hns_ob_u64 whole
+hns_ob_str t_hns_dot
+d3 = div frac 1000
+r3 = rem frac 1000
+d2 = div r3 100
+r2 = rem r3 100
+d1 = div r2 10
+d0 = rem r2 10
+hns_ob_byte uchar add d3 48
+hns_ob_byte uchar add d2 48
+hns_ob_byte uchar add d1 48
+hns_ob_byte uchar add d0 48
+end
+
+fn hns_ob_flush to void
+total = get hns_olen 0
+off = ulong 0
+note each iteration writes at least 1 byte or aborts, bounded by buffer size 32768
+while lt off total bound 32768
+k = write 1 hns_obuf off sub total off
+if le k 0
+break
+end
+off = add off ulong k
+end
+put hns_olen 0 0
+end
+
+note ---- exact rational arithmetic
+
+fn rat_abs v long to ulong
+if lt v 0
+ret ulong neg v
+end
+ret ulong v
+end
+
+fn rat_gcd a ulong b ulong to ulong
+x = a
+y = b
+note Euclidean algorithm on 64-bit unsigned terminates in at most 128 steps
+while ne y 0 bound 128
+r = rem x y
+x = y
+y = r
+end
+if eq x 0
+ret 1
+end
+ret x
+end
+
+fn rat_norm num long den long dst edit Rat to void
+n = num
+d = den
+if lt d 0
+n = neg n
+d = neg d
+end
+if eq n 0
+put dst num 0
+put dst den 1
+ret
+end
+g = rat_gcd rat_abs n ulong d
+put dst num div n long g
+put dst den div d long g
+end
+
+fn rat_add a view Rat b view Rat dst edit Rat to void
+ad = get a den
+bd = get b den
+g = rat_gcd ulong ad ulong bd
+adg = div ad long g
+bdg = div bd long g
+an = mul get a num bdg
+bn = mul get b num adg
+rat_norm add an bn mul adg bd dst
+end
+
+fn rat_sub a view Rat b view Rat dst edit Rat to void
+nb = new Rat neg get b num get b den
+rat_add a view nb dst
+end
+
+fn rat_mul a view Rat b view Rat dst edit Rat to void
+an = get a num
+ad = get a den
+bn = get b num
+bd = get b den
+g1 = rat_gcd rat_abs an ulong bd
+an = div an long g1
+bd = div bd long g1
+g2 = rat_gcd rat_abs bn ulong ad
+bn = div bn long g2
+ad = div ad long g2
+rat_norm mul an bn mul ad bd dst
+end
+
+fn rat_div a view Rat b view Rat dst edit Rat to void
+inv = new Rat get b den get b num
+rat_mul a view inv dst
+end
+
+fn rat_lt a view Rat b view Rat to bool
+ad = get a den
+bd = get b den
+g = rat_gcd ulong ad ulong bd
+lhs = mul get a num div bd long g
+rhs = mul get b num div ad long g
+ret lt lhs rhs
+end
+
+fn rat_le a view Rat b view Rat to bool
+ad = get a den
+bd = get b den
+g = rat_gcd ulong ad ulong bd
+lhs = mul get a num div bd long g
+rhs = mul get b num div ad long g
+ret le lhs rhs
+end
+
+fn rat_eq a view Rat b view Rat to bool
+na = new Rat 0 1
+nb = new Rat 0 1
+rat_norm get a num get a den edit na
+rat_norm get b num get b den edit nb
+ret and eq get na num get nb num eq get na den get nb den
+end
+
+fn rat_to_f64 num long den long to f64
+ret div f64 num f64 den
+end
+
+note ---- model parameters and validation
+
+fn hive_base_params m edit HiveModel lim edit HiveLimits to void
+put m anum 120
+put m aden 1
+put m snum 10
+put m sden 1
+put m bnum 4
+put m bden 5
+put m cnum 3
+put m cden 20
+put m r0num 3
+put m r0den 1
+put m rnum 1
+put m rden 2
+put lim hnum 6
+put lim hden 1
+put lim pnum 1
+put lim pden 100
+put lim epsnum 2
+put lim epsden 25
+put lim maxp 16
+end
+
+fn hive_validate_dens m view HiveModel lim view HiveLimits to bool
+if le get m aden 0
+ret false
+end
+if le get m sden 0
+ret false
+end
+if le get m bden 0
+ret false
+end
+if le get m cden 0
+ret false
+end
+if le get m r0den 0
+ret false
+end
+if le get m rden 0
+ret false
+end
+if le get lim hden 0
+ret false
+end
+if le get lim pden 0
+ret false
+end
+if le get lim epsden 0
+ret false
+end
+ret true
+end
+
+fn hive_validate_params m view HiveModel lim view HiveLimits to int
+if not hive_validate_dens m lim
+ret HNS_ERR_BAD_DEN
+end
+if or eq get lim maxp 0 gt get lim maxp HNS_MAX_P
+ret HNS_ERR_BAD_AGENTS
+end
+if or le get m anum 0 lt get m snum 0
+ret HNS_ERR_BAD_WORK
+end
+if lt get m bnum 0
+ret HNS_ERR_BAD_COST
+end
+if lt get m cnum 0
+ret HNS_ERR_BAD_COST
+end
+if lt get m r0num 0
+ret HNS_ERR_BAD_COST
+end
+if lt get m rnum 0
+ret HNS_ERR_BAD_COST
+end
+if lt get lim hnum 0
+ret HNS_ERR_BAD_COST
+end
+if or lt get lim pnum 0 gt get lim pnum get lim pden
+ret HNS_ERR_BAD_PROB
+end
+if or lt get lim epsnum 0 gt get lim epsnum get lim epsden
+ret HNS_ERR_BAD_PROB
+end
+ret HNS_OK
+end
+
+note ---- core equations from verify_model.py and verify_main_model.wl
+note T(n) = S + A/n + b*(n-1) + c*n*(n-1)/2 + r0 + r*n
+note review(n) = r0 + r*n
+note risk(n) = 1 - (1 - p)^n
+
+fn hive_risk_f64 pnum long pden long n ulong to f64
+one_minus_p = sub 1.0f64 div f64 pnum f64 pden
+prod = f64 1.0f64
+for i ulong n bound 64
+prod = mul prod one_minus_p
+end
+ret sub 1.0f64 prod
+end
+
+fn hive_comm_overhead m view HiveModel n ulong dst edit Rat to void
+nm1 = new Rat sub long n 1 1
+rb = new Rat get m bnum get m bden
+lin = new Rat 0 1
+rat_mul view rb view nm1 edit lin
+pairs = new Rat div mul long n sub long n 1 2 1
+rc = new Rat get m cnum get m cden
+quad = new Rat 0 1
+rat_mul view rc view pairs edit quad
+rat_add view lin view quad dst
+end
+
+fn hive_review_cost m view HiveModel n ulong dst edit Rat to void
+rr0 = new Rat get m r0num get m r0den
+rr = new Rat get m rnum get m rden
+rn = new Rat long n 1
+rterm = new Rat 0 1
+rat_mul view rr view rn edit rterm
+rat_add view rr0 view rterm dst
+end
+
+fn hive_work_cost m view HiveModel n ulong dst edit Rat to void
+rs = new Rat get m snum get m sden
+ra = new Rat get m anum get m aden
+rn = new Rat long n 1
+an = new Rat 0 1
+rat_div view ra view rn edit an
+rat_add view rs view an dst
+end
+
+fn hive_eval_rev_ok lim view HiveLimits row view EvalRow to bool
+rev = new Rat get row revnum get row revden
+rh = new Rat get lim hnum get lim hden
+ret rat_le view rev view rh
+end
+
+fn hive_eval_tput m view HiveModel row view EvalRow to f64
+ws = rat_to_f64 get m snum get m sden
+wa = rat_to_f64 get m anum get m aden
+tf = rat_to_f64 get row tnum get row tden
+ret div add ws wa tf
+end
+
+fn hive_eval_metrics m view HiveModel lim view HiveLimits n ulong row edit EvalRow to void
+rev_ok = hive_eval_rev_ok lim view row
+rsk = hive_risk_f64 get lim pnum get lim pden n
+rsk_ok = le rsk rat_to_f64 get lim epsnum get lim epsden
+put row risk rsk
+put row tput hive_eval_tput m view row
+put row revok rev_ok
+put row riskok rsk_ok
+put row feas and rev_ok rsk_ok
+end
+
+fn hive_eval_n m view HiveModel lim view HiveLimits n ulong row edit EvalRow to int
+v = hive_validate_params m lim
+if ne v HNS_OK
+ret v
+end
+if or eq n 0 gt n get lim maxp
+ret HNS_ERR_BAD_AGENTS
+end
+work_t = new Rat 0 1
+hive_work_cost m n edit work_t
+comm = new Rat 0 1
+hive_comm_overhead m n edit comm
+rev = new Rat 0 1
+hive_review_cost m n edit rev
+ttot = new Rat 0 1
+rat_add view work_t view comm edit ttot
+rat_add view ttot view rev edit work_t
+put row agents n
+put row tnum get work_t num
+put row tden get work_t den
+put row revnum get rev num
+put row revden get rev den
+put row commnum get comm num
+put row commden get comm den
+hive_eval_metrics m lim n row
+ret HNS_OK
+end
+
+note ---- algebraic invariants: discrete first difference and strict convexity
+
+fn hive_discrete_rhs m view HiveModel n ulong dst edit Rat to void
+a1 = new Rat get m bnum get m bden
+a2 = new Rat get m rnum get m rden
+acc = new Rat 0 1
+rat_add view a1 view a2 edit acc
+put a1 num get m cnum
+put a1 den get m cden
+put a2 num long n
+put a2 den 1
+tmp = new Rat 0 1
+rat_mul view a1 view a2 edit tmp
+rat_add view acc view tmp edit a1
+put a2 num get m anum
+put a2 den get m aden
+put acc num mul long n add long n 1
+put acc den 1
+rat_div view a2 view acc edit tmp
+rat_sub view a1 view tmp dst
+end
+
+fn hive_discrete_diff_ok m view HiveModel lim view HiveLimits n ulong to bool
+r1 = new EvalRow 0 0 1 0 1 0 1 0.0f64 0.0f64 false false false
+r2 = new EvalRow 0 0 1 0 1 0 1 0.0f64 0.0f64 false false false
+e1 = hive_eval_n m lim n edit r1
+e2 = hive_eval_n m lim add n 1 edit r2
+if or ne e1 HNS_OK ne e2 HNS_OK
+ret false
+end
+t1 = new Rat get r1 tnum get r1 tden
+t2 = new Rat get r2 tnum get r2 tden
+lhs = new Rat 0 1
+rat_sub view t2 view t1 edit lhs
+rhs = new Rat 0 1
+hive_discrete_rhs m n edit rhs
+ret rat_eq view lhs view rhs
+end
+
+fn hive_eval_t m view HiveModel lim view HiveLimits n ulong dst edit Rat to int
+r = new EvalRow 0 0 1 0 1 0 1 0.0f64 0.0f64 false false false
+e = hive_eval_n m lim n edit r
+if ne e HNS_OK
+ret e
+end
+put dst num get r tnum
+put dst den get r tden
+ret HNS_OK
+end
+
+fn hive_convexity_ok m view HiveModel lim view HiveLimits n ulong to bool
+t0 = new Rat 0 1
+t1 = new Rat 0 1
+t2 = new Rat 0 1
+if ne hive_eval_t m lim n edit t0 HNS_OK
+ret false
+end
+if ne hive_eval_t m lim add n 1 edit t1 HNS_OK
+ret false
+end
+if ne hive_eval_t m lim add n 2 edit t2 HNS_OK
+ret false
+end
+d1 = new Rat 0 1
+d2 = new Rat 0 1
+rat_sub view t1 view t0 edit d1
+rat_sub view t2 view t1 edit d2
+ret rat_lt view d1 view d2
+end
+
+note ---- constrained Hive solver vs unconstrained / Swarm collapse comparison
+
+fn hive_solve_init res edit SolveRes to void
+put res found false
+put res err HNS_OK
+put res optn 0
+put res opttnum 0
+put res opttden 1
+put res optrnum 0
+put res optrden 1
+put res optrisk 0.0f64
+put res uncn 0
+put res swn 0
+put res swtnum 0
+put res swtden 1
+put res swrisk 0.0f64
+put res feascnt 0
+put res speedup 0.0f64
+end
+
+fn rat_lt_raw an long ad long bn long bd long to bool
+g = rat_gcd ulong ad ulong bd
+lhs = mul an div bd long g
+rhs = mul bn div ad long g
+ret lt lhs rhs
+end
+
+fn hive_solve_record_opt row view EvalRow res edit SolveRes to void
+put res found true
+put res optn get row agents
+put res opttnum get row tnum
+put res opttden get row tden
+put res optrnum get row revnum
+put res optrden get row revden
+put res optrisk get row risk
+end
+
+fn hive_solve_step row view EvalRow maxp ulong res edit SolveRes unc edit Rat to void
+n = get row agents
+if eq n 1
+put res uncn n
+put unc num get row tnum
+put unc den get row tden
+else
+if rat_lt_raw get row tnum get row tden get unc num get unc den
+put res uncn n
+put unc num get row tnum
+put unc den get row tden
+end
+end
+if eq n maxp
+put res swn n
+put res swtnum get row tnum
+put res swtden get row tden
+put res swrisk get row risk
+end
+if get row feas
+put res feascnt add get res feascnt 1
+if not get res found
+hive_solve_record_opt row res
+else
+if rat_lt_raw get row tnum get row tden get res opttnum get res opttden
+hive_solve_record_opt row res
+end
+end
+end
+end
+
+fn hive_solve m view HiveModel lim view HiveLimits res edit SolveRes to int
+hive_solve_init res
+v = hive_validate_params m lim
+if ne v HNS_OK
+put res err v
+ret v
+end
+t1_f = f64 0.0f64
+unc = new Rat 0 1
+row = new EvalRow 0 0 1 0 1 0 1 0.0f64 0.0f64 false false false
+maxp = get lim maxp
+for idx ulong maxp bound 64
+n = add idx 1
+ev = hive_eval_n m lim n edit row
+if ne ev HNS_OK
+put res err ev
+ret ev
+end
+if eq n 1
+t1_f = rat_to_f64 get row tnum get row tden
+end
+hive_solve_step view row maxp res edit unc
+end
+if not get res found
+put res err HNS_ERR_INFEASIBLE
+ret HNS_ERR_INFEASIBLE
+end
+opt_f = rat_to_f64 get res opttnum get res opttden
+put res speedup div t1_f opt_f
+ret HNS_OK
+end
+
+note ---- deterministic experiment reporting
+
+fn hive_print_grid m view HiveModel lim view HiveLimits to void
+hns_ob_reset
+hns_ob_str t_hns_hdr
+hns_ob_str t_hns_sep
+row = new EvalRow 0 0 1 0 1 0 1 0.0f64 0.0f64 false false false
+for idx ulong get lim maxp bound 64
+n = add idx 1
+ev = hive_eval_n m lim n edit row
+if ne ev HNS_OK
+break
+end
+hns_ob_u64 n
+hns_ob_str t_hns_sp
+hns_ob_rat get row tnum get row tden
+hns_ob_str t_hns_sp
+hns_ob_f64_4 rat_to_f64 get row tnum get row tden
+hns_ob_str t_hns_sp
+hns_ob_f64_4 rat_to_f64 get row commnum get row commden
+hns_ob_str t_hns_sp
+hns_ob_f64_4 rat_to_f64 get row revnum get row revden
+hns_ob_str t_hns_sp
+hns_ob_f64_4 get row risk
+hns_ob_str t_hns_sp
+hns_ob_f64_4 get row tput
+hns_ob_str t_hns_sp
+if get row feas
+hns_ob_str t_hns_true
+else
+hns_ob_str t_hns_false
+end
+hns_ob_str t_hns_nl
+end
+hns_ob_flush
+end
+
+fn hive_print_scenario name view uchar * m view HiveModel lim view HiveLimits to void
+res = new SolveRes false 0 0 0 1 0 1 0.0f64 0 0 0 1 0.0f64 0 0.0f64
+st = hive_solve m lim edit res
+hns_ob_reset
+hns_ob_str t_hns_sc
+hns_ob_str name
+if ne st HNS_OK
+hns_ob_str t_hns_infeas
+hns_ob_flush
+ret
+end
+hns_ob_str t_hns_optn
+hns_ob_u64 get res optn
+hns_ob_str t_hns_tex
+hns_ob_rat get res opttnum get res opttden
+hns_ob_str t_hns_tmin
+hns_ob_f64_4 rat_to_f64 get res opttnum get res opttden
+hns_ob_str t_hns_rev
+hns_ob_f64_4 rat_to_f64 get res optrnum get res optrden
+hns_ob_str t_hns_rsk
+hns_ob_f64_4 get res optrisk
+hns_ob_str t_hns_spd
+hns_ob_f64_4 get res speedup
+hns_ob_str t_hns_unc
+hns_ob_u64 get res uncn
+hns_ob_str t_hns_swm
+hns_ob_u64 get res swn
+hns_ob_str t_hns_swt
+hns_ob_f64_4 rat_to_f64 get res swtnum get res swtden
+hns_ob_str t_hns_nl
+hns_ob_flush
+end

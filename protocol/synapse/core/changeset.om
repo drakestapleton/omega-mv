@@ -1,0 +1,966 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/synapse/core/changeset.om: content-addressed changeset model, canonical serialization,
+note SHA-256 identity computation (via om/tls/sha2.om), repository-relative path validation,
+note exact & directory-prefix path overlap detector, and shared arena/encoding utilities.
+note Composed OM-2 library unit (no om2 directive, no main).
+
+note ======== status & refusal codes ========
+const SYN_OK ulong 0
+const SYN_ERR_MALFORMED ulong 1
+const SYN_ERR_LEASE_CONFLICT ulong 2
+const SYN_ERR_NOT_FOUND ulong 3
+const SYN_ERR_CYCLE ulong 4
+const SYN_ERR_NOT_HOLDER ulong 5
+const SYN_ERR_LEASE_CLOSED ulong 6
+const SYN_ERR_SELF_REVIEW ulong 7
+const SYN_ERR_STALE_HEAD ulong 8
+const SYN_ERR_REVIEW_BLOCKED ulong 9
+const SYN_ERR_NON_FF ulong 10
+const SYN_ERR_STATE_INVALID ulong 11
+const SYN_ERR_LEDGER_TAMPER ulong 12
+const SYN_ERR_CAPACITY ulong 13
+const SYN_ERR_DUPLICATE ulong 14
+const SYN_ERR_VERDICT_INVALID ulong 15
+
+const SYN_NONE ulong 18446744073709551615
+const SYN_STR_CAP ulong 262144
+
+note ======== changeset states ========
+const CS_STATE_DRAFT ulong 0
+const CS_STATE_PROPOSED ulong 1
+const CS_STATE_REVIEWED ulong 2
+const CS_STATE_LANDED ulong 3
+const CS_STATE_ABANDONED ulong 4
+
+note ======== changeset capacities & meta layout ========
+const CS_MAX ulong 256
+const CS_MAX_PATHS ulong 16
+const CS_PATH_POOL ulong 4096
+const CS_FIELDS ulong 12
+
+const CSF_AUTH_OFF ulong 0
+const CSF_AUTH_LEN ulong 1
+const CSF_BR_OFF ulong 2
+const CSF_BR_LEN ulong 3
+const CSF_STATE ulong 4
+const CSF_PSTART ulong 5
+const CSF_PCNT ulong 6
+const CSF_TS ulong 7
+const CSF_PIDX ulong 8
+const CSF_SUM_OFF ulong 9
+const CSF_SUM_LEN ulong 10
+const CSF_USED ulong 11
+
+note ======== globals ========
+global g_syn_str uchar 262144
+global g_syn_strn ulong 4
+
+global g_cs_id uchar 8192
+global g_cs_parent uchar 8192
+global g_cs_meta ulong 3072
+global g_cs_paths ulong 8192
+global g_cs_hdr ulong 16
+
+note staging area for building one changeset cleanly without exceeding 6 parameter slots
+global g_cs_stg_par uchar 32
+global g_cs_stg_meta ulong 16
+global g_cs_stg_paths ulong 32
+
+text t_cs_dom "SYNAPSE_CHANGESET_V1"
+text t_hex "0123456789abcdef"
+text t_st_draft "DRAFT"
+text t_st_prop "PROPOSED"
+text t_st_rev "REVIEWED"
+text t_st_land "LANDED"
+text t_st_abnd "ABANDONED"
+text t_br_main "main"
+
+note ======== shared byte, hex, arena & I/O helpers ========
+
+fn syn_arena_reset to void
+put g_syn_strn 0 0
+end
+
+fn syn_arena_put s view uchar * to ulong
+n = len s
+cur = get g_syn_strn 0
+if gt add cur n SYN_STR_CAP
+ret SYN_NONE
+end
+for i ulong n
+put g_syn_str add cur i get s i
+end
+put g_syn_strn 0 add cur n
+ret cur
+end
+
+fn syn_arena_eq ao ulong al ulong bo ulong bl ulong to bool
+if ne al bl
+ret false
+end
+for i ulong al
+if ne get g_syn_str add ao i get g_syn_str add bo i
+ret false
+end
+end
+ret true
+end
+
+fn syn_arena_eq_view ao ulong al ulong v view uchar * to bool
+if ne al len v
+ret false
+end
+for i ulong al
+if ne get g_syn_str add ao i get v i
+ret false
+end
+end
+ret true
+end
+
+note lexicographic compare of two arena strings: 0 eq, 1 a<b, 2 a>b
+fn syn_arena_cmp ao ulong al ulong bo ulong bl ulong to ulong
+m = al
+if lt bl m
+m = bl
+end
+for i ulong m
+ca = get g_syn_str add ao i
+cb = get g_syn_str add bo i
+if lt ca cb
+ret 1
+end
+if gt ca cb
+ret 2
+end
+end
+if lt al bl
+ret 1
+end
+if gt al bl
+ret 2
+end
+ret 0
+end
+
+fn syn_arena_copy ao ulong al ulong dst edit uchar * to ulong
+lim = al
+if gt lim len dst
+lim = len dst
+end
+for i ulong lim
+put dst i get g_syn_str add ao i
+end
+ret lim
+end
+
+fn syn_digest_eq a view uchar * b view uchar * to bool
+if ne len a 32
+ret false
+end
+if ne len b 32
+ret false
+end
+for i ulong 32
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn syn_digest_is_zero d view uchar * to bool
+if ne len d 32
+ret false
+end
+for i ulong 32
+if ne get d i 0
+ret false
+end
+end
+ret true
+end
+
+fn syn_put_u16_le dst edit uchar * off ulong v ulong to void
+put dst off uchar and v 0xff
+put dst add off 1 uchar and shr v 8 0xff
+end
+
+fn syn_put_u32_le dst edit uchar * off ulong v ulong to void
+put dst off uchar and v 0xff
+put dst add off 1 uchar and shr v 8 0xff
+put dst add off 2 uchar and shr v 16 0xff
+put dst add off 3 uchar and shr v 24 0xff
+end
+
+fn syn_put_u64_le dst edit uchar * off ulong v ulong to void
+for i ulong 8
+put dst add off i uchar and shr v mul i 8 0xff
+end
+end
+
+fn syn_sha_u16 ctx edit ulong * v ulong to void
+b = new uchar 2 0
+syn_put_u16_le b 0 v
+sha256_update ctx b
+end
+
+fn syn_sha_u32 ctx edit ulong * v ulong to void
+b = new uchar 4 0
+syn_put_u32_le b 0 v
+sha256_update ctx b
+end
+
+fn syn_sha_u64 ctx edit ulong * v ulong to void
+b = new uchar 8 0
+syn_put_u64_le b 0 v
+sha256_update ctx b
+end
+
+fn syn_sha_arena ctx edit ulong * off ulong slen ulong to void
+blk = new uchar 256 0
+pos = ulong 0
+while lt pos slen bound 4096
+k = sub slen pos
+if gt k 256
+k = 256
+end
+for i ulong k
+put blk i get g_syn_str add add off pos i
+end
+sha256_update ctx part blk 0 k
+pos = add pos k
+end
+end
+
+fn syn_sha_arena_str ctx edit ulong * off ulong slen ulong to void
+syn_sha_u32 ctx slen
+if gt slen 0
+syn_sha_arena ctx off slen
+end
+end
+
+fn syn_hex_val c uchar to ulong
+if and ge c 48 le c 57
+ret ulong sub c 48
+end
+if and ge c 97 le c 102
+ret add ulong sub c 97 10
+end
+ret 99
+end
+
+fn syn_hex_encode src view uchar * dst edit uchar * to void
+n = len src
+for i ulong n
+b = get src i
+hi = ulong shr b 4
+lo = ulong and b 15
+put dst mul i 2 get t_hex hi
+put dst add mul i 2 1 get t_hex lo
+end
+end
+
+fn syn_hex_decode src view uchar * dst edit uchar * to bool
+if ne len src 64
+ret false
+end
+if lt len dst 32
+ret false
+end
+for i ulong 32
+hi = syn_hex_val get src mul i 2
+lo = syn_hex_val get src add mul i 2 1
+if or gt hi 15 gt lo 15
+ret false
+end
+put dst i uchar or shl hi 4 lo
+end
+ret true
+end
+
+fn syn_write_all fd int buf view uchar * n ulong to bool
+pos = ulong 0
+while lt pos n bound 65536
+k = write fd buf pos sub n pos
+if le k 0
+ret false
+end
+pos = add pos ulong k
+end
+ret true
+end
+
+fn syn_write_text fd int t view uchar * to void
+ok = syn_write_all fd t len t
+if ok
+ret
+end
+end
+
+fn syn_write_arena fd int off ulong slen ulong to void
+blk = new uchar 256 0
+pos = ulong 0
+while lt pos slen bound 4096
+k = sub slen pos
+if gt k 256
+k = 256
+end
+for i ulong k
+put blk i get g_syn_str add add off pos i
+end
+ok = syn_write_all fd blk k
+if eq ok false
+ret
+end
+pos = add pos k
+end
+end
+
+fn syn_write_u64 fd int v ulong to void
+buf = new uchar 24 0
+if eq v 0
+put buf 0 48
+ok = syn_write_all fd buf 1
+if ok
+ret
+end
+ret
+end
+tmp = new uchar 24 0
+cnt = ulong 0
+x = v
+while gt x 0 bound 32
+d = rem x 10
+put tmp cnt uchar add 48 d
+x = div x 10
+cnt = add cnt 1
+end
+for i ulong cnt
+put buf i get tmp sub sub cnt 1 i
+end
+ok2 = syn_write_all fd buf cnt
+if ok2
+ret
+end
+end
+
+fn syn_write_hex32 fd int d view uchar * to void
+hx = new uchar 64 0
+syn_hex_encode d hx
+ok = syn_write_all fd hx 64
+if ok
+ret
+end
+end
+
+note ======== path validation & overlap detection ========
+
+note Validates repository-relative POSIX path per Synapse validate_repo_relative_path:
+note 1..=256 bytes, no leading/trailing '/', no '//', no '\\', no NUL, no '.', '..', '.git' segments.
+fn cs_path_valid p view uchar * to bool
+n = len p
+if or eq n 0 gt n 256
+ret false
+end
+if or eq get p 0 47 eq get p sub n 1 47
+ret false
+end
+seg_start = ulong 0
+for i ulong add n 1
+is_sep = false
+if eq i n
+is_sep = true
+else
+c = get p i
+if or eq c 0 eq c 92
+ret false
+end
+if eq c 47
+is_sep = true
+end
+end
+if is_sep
+seg_len = sub i seg_start
+if eq seg_len 0
+ret false
+end
+if eq seg_len 1
+if eq get p seg_start 46
+ret false
+end
+end
+if eq seg_len 2
+if and eq get p seg_start 46 eq get p add seg_start 1 46
+ret false
+end
+end
+if eq seg_len 4
+if eq get p seg_start 46
+if eq get p add seg_start 1 103
+if eq get p add seg_start 2 105
+if eq get p add seg_start 3 116
+ret false
+end
+end
+end
+end
+end
+seg_start = add i 1
+end
+end
+ret true
+end
+
+note Path overlap between two arena paths:
+note 0 = disjoint, 1 = exact match, 2 = directory prefix overlap (a is dir prefix of b or b of a)
+fn cs_paths_overlap_arena ao ulong al ulong bo ulong bl ulong to ulong
+if syn_arena_eq ao al bo bl
+ret 1
+end
+if lt al bl
+if eq get g_syn_str add bo al 47
+if syn_arena_eq ao al bo al
+ret 2
+end
+end
+end
+if lt bl al
+if eq get g_syn_str add ao bl 47
+if syn_arena_eq ao bl bo bl
+ret 2
+end
+end
+end
+ret 0
+end
+
+note Path overlap between two uchar views (0 disjoint, 1 exact, 2 dir prefix)
+fn cs_paths_overlap_view a view uchar * b view uchar * to ulong
+al = len a
+bl = len b
+if eq al bl
+for i ulong al
+if ne get a i get b i
+ret 0
+end
+end
+ret 1
+end
+if lt al bl
+if eq get b al 47
+for i ulong al
+if ne get a i get b i
+ret 0
+end
+end
+ret 2
+end
+ret 0
+end
+if eq get a bl 47
+for i ulong bl
+if ne get a i get b i
+ret 0
+end
+end
+ret 2
+end
+ret 0
+end
+
+note ======== changeset table accessors ========
+
+fn cs_reset to void
+put g_cs_hdr 0 0
+put g_cs_hdr 1 0
+put g_cs_stg_meta 0 0
+end
+
+fn cs_count to ulong
+ret get g_cs_hdr 0
+end
+
+fn cs_mget idx ulong f ulong to ulong
+ret get g_cs_meta add mul idx CS_FIELDS f
+end
+
+fn cs_mput idx ulong f ulong v ulong to void
+put g_cs_meta add mul idx CS_FIELDS f v
+end
+
+fn cs_get_id idx ulong dst edit uchar * to void
+base = mul idx 32
+for i ulong 32
+put dst i get g_cs_id add base i
+end
+end
+
+fn cs_get_parent idx ulong dst edit uchar * to void
+base = mul idx 32
+for i ulong 32
+put dst i get g_cs_parent add base i
+end
+end
+
+fn cs_get_state idx ulong to ulong
+ret cs_mget idx CSF_STATE
+end
+
+fn cs_get_parent_idx idx ulong to ulong
+ret cs_mget idx CSF_PIDX
+end
+
+fn cs_get_author_off idx ulong to ulong
+ret cs_mget idx CSF_AUTH_OFF
+end
+
+fn cs_get_author_len idx ulong to ulong
+ret cs_mget idx CSF_AUTH_LEN
+end
+
+fn cs_get_branch_off idx ulong to ulong
+ret cs_mget idx CSF_BR_OFF
+end
+
+fn cs_get_branch_len idx ulong to ulong
+ret cs_mget idx CSF_BR_LEN
+end
+
+fn cs_get_ts idx ulong to ulong
+ret cs_mget idx CSF_TS
+end
+
+fn cs_get_path_cnt idx ulong to ulong
+ret cs_mget idx CSF_PCNT
+end
+
+fn cs_get_path_off idx ulong pi ulong to ulong
+slot = add cs_mget idx CSF_PSTART pi
+ret get g_cs_paths mul slot 2
+end
+
+fn cs_get_path_len idx ulong pi ulong to ulong
+slot = add cs_mget idx CSF_PSTART pi
+ret get g_cs_paths add mul slot 2 1
+end
+
+fn cs_find_by_id id view uchar * to ulong
+if ne len id 32
+ret SYN_NONE
+end
+cnt = get g_cs_hdr 0
+for i ulong cnt
+base = mul i 32
+eq_ok = true
+for j ulong 32
+if ne get g_cs_id add base j get id j
+eq_ok = false
+break
+end
+end
+if eq_ok
+ret i
+end
+end
+ret SYN_NONE
+end
+
+note Pairwise path overlap between changesets idx_a and idx_b: 0 disjoint, 1 exact, 2 prefix
+fn cs_changesets_overlap idx_a ulong idx_b ulong to ulong
+na = cs_mget idx_a CSF_PCNT
+nb = cs_mget idx_b CSF_PCNT
+best = ulong 0
+for i ulong na
+ao = cs_get_path_off idx_a i
+al = cs_get_path_len idx_a i
+for j ulong nb
+bo = cs_get_path_off idx_b j
+bl = cs_get_path_len idx_b j
+ov = cs_paths_overlap_arena ao al bo bl
+if eq ov 1
+ret 1
+end
+if eq ov 2
+best = 2
+end
+end
+end
+ret best
+end
+
+note ======== canonical serialization & SHA-256 identity ========
+
+note Computes domain-separated SHA-256 over canonical serialization of changeset idx into out_id[32].
+note Layout: "SYNAPSE_CHANGESET_V1\0" | u16_le(1) | parent_id[32] | str(author) | str(branch) |
+note         str(summary) | u64_le(created_ts) | u32_le(path_cnt) | str(path_i)* (sorted)
+fn cs_compute_id idx ulong dst edit uchar * to void
+ctx = new ulong 40 0
+par = new uchar 32 0
+nul = new uchar 1 0
+sha256_init ctx
+sha256_update ctx t_cs_dom
+sha256_update ctx nul
+syn_sha_u16 ctx 1
+cs_get_parent idx par
+sha256_update ctx par
+syn_sha_arena_str ctx cs_mget idx CSF_AUTH_OFF cs_mget idx CSF_AUTH_LEN
+syn_sha_arena_str ctx cs_mget idx CSF_BR_OFF cs_mget idx CSF_BR_LEN
+syn_sha_arena_str ctx cs_mget idx CSF_SUM_OFF cs_mget idx CSF_SUM_LEN
+syn_sha_u64 ctx cs_mget idx CSF_TS
+pcnt = cs_mget idx CSF_PCNT
+syn_sha_u32 ctx pcnt
+for i ulong pcnt
+syn_sha_arena_str ctx cs_get_path_off idx i cs_get_path_len idx i
+end
+sha256_final ctx dst
+end
+
+note Helper to append bytes to a flat buffer at *pos, returning new pos (or SYN_NONE on overflow).
+fn cs_buf_put_bytes dst edit uchar * pos ulong src view uchar * to ulong
+n = len src
+if gt add pos n len dst
+ret SYN_NONE
+end
+for i ulong n
+put dst add pos i get src i
+end
+ret add pos n
+end
+
+fn cs_buf_put_arena_str dst edit uchar * pos ulong off ulong slen ulong to ulong
+if gt add add pos 4 slen len dst
+ret SYN_NONE
+end
+syn_put_u32_le dst pos slen
+p = add pos 4
+for i ulong slen
+put dst add p i get g_syn_str add off i
+end
+ret add p slen
+end
+
+note Serializes changeset idx into canonical bytes in dst; returns byte length or SYN_NONE if dst too small.
+fn cs_canonical_serialize idx ulong dst edit uchar * to ulong
+par = new uchar 32 0
+pos = ulong 0
+pos = cs_buf_put_bytes dst pos t_cs_dom
+if eq pos SYN_NONE
+ret SYN_NONE
+end
+if ge add pos 3 len dst
+ret SYN_NONE
+end
+put dst pos 0
+pos = add pos 1
+syn_put_u16_le dst pos 1
+pos = add pos 2
+cs_get_parent idx par
+pos = cs_buf_put_bytes dst pos par
+if eq pos SYN_NONE
+ret SYN_NONE
+end
+pos = cs_buf_put_arena_str dst pos cs_mget idx CSF_AUTH_OFF cs_mget idx CSF_AUTH_LEN
+if eq pos SYN_NONE
+ret SYN_NONE
+end
+pos = cs_buf_put_arena_str dst pos cs_mget idx CSF_BR_OFF cs_mget idx CSF_BR_LEN
+if eq pos SYN_NONE
+ret SYN_NONE
+end
+pos = cs_buf_put_arena_str dst pos cs_mget idx CSF_SUM_OFF cs_mget idx CSF_SUM_LEN
+if eq pos SYN_NONE
+ret SYN_NONE
+end
+if gt add pos 12 len dst
+ret SYN_NONE
+end
+syn_put_u64_le dst pos cs_mget idx CSF_TS
+pos = add pos 8
+pcnt = cs_mget idx CSF_PCNT
+syn_put_u32_le dst pos pcnt
+pos = add pos 4
+for i ulong pcnt
+pos = cs_buf_put_arena_str dst pos cs_get_path_off idx i cs_get_path_len idx i
+if eq pos SYN_NONE
+ret SYN_NONE
+end
+end
+ret pos
+end
+
+note ======== changeset staging & creation ========
+
+fn cs_stage_begin author view uchar * branch view uchar * ts ulong to ulong
+if or eq len author 0 gt len author 128
+ret SYN_ERR_MALFORMED
+end
+if or eq len branch 0 gt len branch 128
+ret SYN_ERR_MALFORMED
+end
+ao = syn_arena_put author
+if eq ao SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+bo = syn_arena_put branch
+if eq bo SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+put g_cs_stg_meta 0 1
+put g_cs_stg_meta 1 ao
+put g_cs_stg_meta 2 len author
+put g_cs_stg_meta 3 bo
+put g_cs_stg_meta 4 len branch
+put g_cs_stg_meta 5 ts
+put g_cs_stg_meta 6 0
+put g_cs_stg_meta 7 0
+put g_cs_stg_meta 8 0
+for i ulong 32
+put g_cs_stg_par i 0
+end
+ret SYN_OK
+end
+
+fn cs_stage_set_parent par view uchar * to ulong
+if ne len par 32
+ret SYN_ERR_MALFORMED
+end
+for i ulong 32
+put g_cs_stg_par i get par i
+end
+ret SYN_OK
+end
+
+fn cs_stage_set_summary summ view uchar * to ulong
+if gt len summ 512
+ret SYN_ERR_MALFORMED
+end
+so = syn_arena_put summ
+if eq so SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+put g_cs_stg_meta 7 so
+put g_cs_stg_meta 8 len summ
+ret SYN_OK
+end
+
+fn cs_stage_shift_right cnt ulong ins ulong to void
+k = cnt
+while gt k ins bound 32
+prev = sub k 1
+v0 = get g_cs_stg_paths mul prev 2
+v1 = get g_cs_stg_paths add mul prev 2 1
+put g_cs_stg_paths mul k 2 v0
+put g_cs_stg_paths add mul k 2 1 v1
+k = prev
+end
+end
+
+note Adds a validated path into the staged path list, maintaining strict sorted order and rejecting duplicates.
+fn cs_stage_add_path p view uchar * to ulong
+if eq cs_path_valid p false
+ret SYN_ERR_MALFORMED
+end
+cnt = get g_cs_stg_meta 6
+if ge cnt CS_MAX_PATHS
+ret SYN_ERR_CAPACITY
+end
+po = syn_arena_put p
+if eq po SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+pl = len p
+note find insertion index while rejecting duplicates
+ins = cnt
+for i ulong cnt
+eo = get g_cs_stg_paths mul i 2
+el = get g_cs_stg_paths add mul i 2 1
+cmp = syn_arena_cmp po pl eo el
+if eq cmp 0
+ret SYN_ERR_DUPLICATE
+end
+if eq cmp 1
+ins = i
+break
+end
+end
+cs_stage_shift_right cnt ins
+put g_cs_stg_paths mul ins 2 po
+put g_cs_stg_paths add mul ins 2 1 pl
+put g_cs_stg_meta 6 add cnt 1
+ret SYN_OK
+end
+
+fn cs_stage_write_slot idx ulong pidx ulong pused ulong pcnt ulong to void
+cs_mput idx CSF_AUTH_OFF get g_cs_stg_meta 1
+cs_mput idx CSF_AUTH_LEN get g_cs_stg_meta 2
+cs_mput idx CSF_BR_OFF get g_cs_stg_meta 3
+cs_mput idx CSF_BR_LEN get g_cs_stg_meta 4
+cs_mput idx CSF_STATE CS_STATE_DRAFT
+cs_mput idx CSF_PSTART pused
+cs_mput idx CSF_PCNT pcnt
+cs_mput idx CSF_TS get g_cs_stg_meta 5
+cs_mput idx CSF_PIDX pidx
+cs_mput idx CSF_SUM_OFF get g_cs_stg_meta 7
+cs_mput idx CSF_SUM_LEN get g_cs_stg_meta 8
+cs_mput idx CSF_USED 1
+base = mul idx 32
+for i ulong 32
+put g_cs_parent add base i get g_cs_stg_par i
+end
+for i ulong pcnt
+slot = add pused i
+v0 = get g_cs_stg_paths mul i 2
+v1 = get g_cs_stg_paths add mul i 2 1
+put g_cs_paths mul slot 2 v0
+put g_cs_paths add mul slot 2 1 v1
+end
+end
+
+note Commits staged changeset, computes SHA-256 digest, links into DAG, invalidates prior branch reviews,
+note and records CS_CREATE in the ledger. Writes new index to g_cs_hdr[2] and returns SYN_OK or error.
+fn cs_stage_commit to ulong
+par = new uchar 32 0
+id = new uchar 32 0
+if ne get g_cs_stg_meta 0 1
+ret SYN_ERR_MALFORMED
+end
+pcnt = get g_cs_stg_meta 6
+if eq pcnt 0
+ret SYN_ERR_MALFORMED
+end
+idx = get g_cs_hdr 0
+if ge idx CS_MAX
+ret SYN_ERR_CAPACITY
+end
+pused = get g_cs_hdr 1
+if gt add pused pcnt CS_PATH_POOL
+ret SYN_ERR_CAPACITY
+end
+for i ulong 32
+put par i get g_cs_stg_par i
+end
+pidx = SYN_NONE
+if eq syn_digest_is_zero par false
+pidx = cs_find_by_id par
+if eq pidx SYN_NONE
+ret SYN_ERR_NOT_FOUND
+end
+end
+cs_stage_write_slot idx pidx pused pcnt
+cs_compute_id idx id
+if ne cs_find_by_id id SYN_NONE
+cs_mput idx CSF_USED 0
+ret SYN_ERR_DUPLICATE
+end
+base = mul idx 32
+for i ulong 32
+put g_cs_id add base i get id i
+end
+put g_cs_hdr 0 add idx 1
+put g_cs_hdr 1 add pused pcnt
+put g_cs_hdr 2 idx
+put g_cs_stg_meta 0 0
+if ne pidx SYN_NONE
+rc = gr_link_parent idx pidx
+if ne rc SYN_OK
+ret rc
+end
+end
+rv_invalidate_branch cs_mget idx CSF_BR_OFF cs_mget idx CSF_BR_LEN idx
+if eq syn_arena_eq_view cs_mget idx CSF_BR_OFF cs_mget idx CSF_BR_LEN t_br_main false
+br_rc = gr_branch_set_arena cs_mget idx CSF_BR_OFF cs_mget idx CSF_BR_LEN idx
+if ne br_rc SYN_OK
+ret br_rc
+end
+end
+lg_set_subject id
+seq = lg_append_arena 1 cs_mget idx CSF_TS cs_mget idx CSF_AUTH_OFF cs_mget idx CSF_AUTH_LEN cs_mget idx CSF_BR_OFF cs_mget idx CSF_BR_LEN
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end
+
+fn cs_last_idx to ulong
+ret get g_cs_hdr 2
+end
+
+note State transition rule:
+note Allowed forward edges:
+note   DRAFT(0) -> PROPOSED(1) | ABANDONED(4)
+note   PROPOSED(1) -> REVIEWED(2) | ABANDONED(4)
+note   REVIEWED(2) -> LANDED(3) | ABANDONED(4)
+note LANDED and ABANDONED are terminal; backward and skip moves are refused.
+fn cs_state_move_allowed cur ulong nxt ulong to bool
+if eq cur CS_STATE_DRAFT
+ret or eq nxt CS_STATE_PROPOSED eq nxt CS_STATE_ABANDONED
+end
+if eq cur CS_STATE_PROPOSED
+ret or eq nxt CS_STATE_REVIEWED eq nxt CS_STATE_ABANDONED
+end
+if eq cur CS_STATE_REVIEWED
+ret or eq nxt CS_STATE_LANDED eq nxt CS_STATE_ABANDONED
+end
+ret false
+end
+
+fn cs_write_state_name fd int st ulong to void
+if eq st CS_STATE_DRAFT
+syn_write_text fd t_st_draft
+ret
+end
+if eq st CS_STATE_PROPOSED
+syn_write_text fd t_st_prop
+ret
+end
+if eq st CS_STATE_REVIEWED
+syn_write_text fd t_st_rev
+ret
+end
+if eq st CS_STATE_LANDED
+syn_write_text fd t_st_land
+ret
+end
+syn_write_text fd t_st_abnd
+end
+
+fn cs_transition idx ulong nxt ulong ts ulong to ulong
+id = new uchar 32 0
+if ge idx get g_cs_hdr 0
+ret SYN_ERR_NOT_FOUND
+end
+cur = cs_mget idx CSF_STATE
+if eq cs_state_move_allowed cur nxt false
+ret SYN_ERR_STATE_INVALID
+end
+cs_mput idx CSF_STATE nxt
+cs_get_id idx id
+lg_set_subject id
+if eq nxt CS_STATE_PROPOSED
+seq = lg_append_view 2 ts cs_mget idx CSF_AUTH_OFF cs_mget idx CSF_AUTH_LEN t_st_prop
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end
+if eq nxt CS_STATE_REVIEWED
+seq = lg_append_view 2 ts cs_mget idx CSF_AUTH_OFF cs_mget idx CSF_AUTH_LEN t_st_rev
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end
+if eq nxt CS_STATE_LANDED
+seq = lg_append_view 2 ts cs_mget idx CSF_AUTH_OFF cs_mget idx CSF_AUTH_LEN t_st_land
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end
+seq = lg_append_view 2 ts cs_mget idx CSF_AUTH_OFF cs_mget idx CSF_AUTH_LEN t_st_abnd
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end

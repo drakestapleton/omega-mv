@@ -1,0 +1,471 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/atlas/main.om: Atlas Stage-0 Boot Verification CLI.
+note Reads either a raw binary Atlas boot image (64-byte header + stage payload) or
+note an ATLAS_MANIFEST text manifest on stdin, verifies alignment, bounds, epoch
+note anti-rollback, memory-map disjointness, and constant-time SHA-256 digest.
+note Emits canonical ATLAS checkpoints and verified handoff descriptor, or halts
+note fail-closed with nonzero exit status on any violation.
+note Compose with: si/directives/om2.om aienux/atlas/lib.om aienux/atlas/main.om
+
+text m_awaken "ATLAS: AWAKEN\n"
+text m_verify "ATLAS: VERIFY\n"
+text m_handoff "ATLAS: HANDOFF\n"
+text m_refuse "ATLAS: REFUSE\n"
+text m_halt "ATLAS: HALT code="
+text m_reason " reason="
+text m_nl "\n"
+
+text m_r_short "short_header"
+text m_r_magic "bad_magic"
+text m_r_ver "bad_version"
+text m_r_slen "invalid_stage_len"
+text m_r_align "bad_alignment"
+text m_r_entry "entry_out_of_bounds"
+text m_r_trunc "truncated_payload"
+text m_r_roll "epoch_rollback"
+text m_r_mmap "memmap_violation"
+text m_r_hash "digest_mismatch"
+text m_r_parse "malformed_manifest"
+text m_r_io "stdin_read_error"
+
+text m_k_desc "desc_addr="
+text m_k_ram " ram_base="
+text m_k_rsz " ram_size="
+text m_k_uart "\nuart_base="
+text m_k_pbase " payload_base="
+text m_k_psize " payload_size="
+text m_k_entry "\nentry_addr="
+text m_k_epoch " epoch="
+text m_k_cookie " cookie="
+text m_k_sha "\nsha256="
+
+text m_hdr_man "ATLAS_MANIFEST"
+text m_arg_me "--min-epoch"
+
+text m_p_ver "version="
+text m_p_ep "epoch="
+text m_p_mep "min_epoch="
+text m_p_eoff "entry_off="
+text m_p_sha "sha256="
+text m_p_pay "payload_hex="
+
+fn atlas_eq_slice a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+i = ulong 0
+n = len a
+while lt i n bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn atlas_starts_with a view uchar * pfx view uchar * to bool
+if lt len a len pfx
+ret false
+end
+ret atlas_eq_slice part a 0 len pfx pfx
+end
+
+fn atlas_parse_u64 s view uchar * dst edit ulong 1 to bool
+n = len s
+if eq n 0
+ret false
+end
+if gt n 20
+ret false
+end
+acc = ulong 0
+i = ulong 0
+while lt i n bound 24
+c = get s i
+if lt c 48
+ret false
+end
+if gt c 57
+ret false
+end
+d = ulong sub c 48
+if gt acc 1844674407370955161
+ret false
+end
+m = mul acc 10
+if atlas_add_overflow m d
+ret false
+end
+acc = add m d
+i = add i 1
+end
+put dst 0 acc
+ret true
+end
+
+fn atlas_print_reason fd int rc uint to void
+ok = false
+if eq rc ATLAS_ERR_SHORT_HDR
+ok = atlas_write_all fd m_r_short
+else
+if eq rc ATLAS_ERR_MAGIC
+ok = atlas_write_all fd m_r_magic
+else
+if eq rc ATLAS_ERR_VERSION
+ok = atlas_write_all fd m_r_ver
+else
+if eq rc ATLAS_ERR_STAGE_LEN
+ok = atlas_write_all fd m_r_slen
+else
+if eq rc ATLAS_ERR_ALIGN
+ok = atlas_write_all fd m_r_align
+else
+if eq rc ATLAS_ERR_ENTRY_OOB
+ok = atlas_write_all fd m_r_entry
+else
+if eq rc ATLAS_ERR_TRUNCATED
+ok = atlas_write_all fd m_r_trunc
+else
+if eq rc ATLAS_ERR_ROLLBACK
+ok = atlas_write_all fd m_r_roll
+else
+if eq rc ATLAS_ERR_MEMMAP
+ok = atlas_write_all fd m_r_mmap
+else
+if eq rc ATLAS_ERR_DIGEST
+ok = atlas_write_all fd m_r_hash
+else
+ok = atlas_write_all fd m_r_parse
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+if not ok
+exit 2
+end
+end
+
+fn atlas_print_halt rc uint to void
+ok = atlas_write_all 1 m_refuse
+if not ok
+exit 2
+end
+ok = atlas_write_all 1 m_halt
+if not ok
+exit 2
+end
+ok = atlas_write_u64 1 ulong rc
+if not ok
+exit 2
+end
+ok = atlas_write_all 1 m_reason
+if not ok
+exit 2
+end
+atlas_print_reason 1 rc
+ok = atlas_write_all 1 m_nl
+if not ok
+exit 2
+end
+end
+
+fn atlas_print_handoff desc view AtlasBootDesc comp view uchar 32 to bool
+if not atlas_write_all 1 m_handoff
+ret false
+end
+if not atlas_write_all 1 m_k_desc
+ret false
+end
+if not atlas_write_hex64 1 get desc desc_addr
+ret false
+end
+if not atlas_write_all 1 m_k_ram
+ret false
+end
+if not atlas_write_hex64 1 get desc ram_base
+ret false
+end
+if not atlas_write_all 1 m_k_rsz
+ret false
+end
+if not atlas_write_hex64 1 get desc ram_size
+ret false
+end
+if not atlas_write_all 1 m_k_uart
+ret false
+end
+if not atlas_write_hex64 1 get desc uart_base
+ret false
+end
+if not atlas_write_all 1 m_k_pbase
+ret false
+end
+if not atlas_write_hex64 1 get desc payload_base
+ret false
+end
+if not atlas_write_all 1 m_k_psize
+ret false
+end
+if not atlas_write_u64 1 get desc payload_size
+ret false
+end
+if not atlas_write_all 1 m_k_entry
+ret false
+end
+if not atlas_write_hex64 1 get desc entry_addr
+ret false
+end
+if not atlas_write_all 1 m_k_epoch
+ret false
+end
+if not atlas_write_u64 1 get desc epoch
+ret false
+end
+if not atlas_write_all 1 m_k_cookie
+ret false
+end
+if not atlas_write_hex64 1 get desc cookie
+ret false
+end
+if not atlas_write_all 1 m_k_sha
+ret false
+end
+if not atlas_write_digest 1 comp
+ret false
+end
+ret atlas_write_all 1 m_nl
+end
+
+fn atlas_read_stdin dst edit uchar * got edit ulong 1 to bool
+cap = len dst
+tot = ulong 0
+while lt tot cap bound 65536
+k = read 0 dst tot sub cap tot
+if lt k 0
+ret false
+end
+if eq k 0
+break
+end
+tot = add tot ulong k
+end
+put got 0 tot
+ret true
+end
+
+fn atlas_parse_line_meta line view uchar * hdr edit AtlasHeader exp edit uchar 32 meta edit ulong 4 to int
+note meta[0]=total_len, meta[1]=min_epoch, meta[2]=has_sha, meta[3]=has_pay
+tmp = new ulong 1 0
+llen = len line
+if atlas_starts_with line m_p_ver
+if not atlas_parse_u64 part line 8 sub llen 8 tmp
+ret -1
+end
+if gt get tmp 0 0xffffffff
+ret -1
+end
+put hdr ver uint get tmp 0
+ret 1
+end
+if atlas_starts_with line m_p_ep
+if not atlas_parse_u64 part line 6 sub llen 6 tmp
+ret -1
+end
+put hdr epoch get tmp 0
+ret 1
+end
+if atlas_starts_with line m_p_mep
+if not atlas_parse_u64 part line 10 sub llen 10 tmp
+ret -1
+end
+put meta 1 get tmp 0
+ret 1
+end
+if atlas_starts_with line m_p_eoff
+if not atlas_parse_u64 part line 10 sub llen 10 tmp
+ret -1
+end
+put hdr entry_off get tmp 0
+ret 1
+end
+if atlas_starts_with line m_p_sha
+if ne sub llen 7 64
+ret -1
+end
+if not atlas_parse_hex_bytes part line 7 64 exp
+ret -1
+end
+put meta 2 1
+ret 1
+end
+ret 0
+end
+
+fn atlas_parse_line_pay line view uchar * img edit uchar * hdr edit AtlasHeader meta edit ulong 4 to int
+llen = len line
+if not atlas_starts_with line m_p_pay
+ret 0
+end
+hlen = sub llen 12
+if ne and hlen 1 0
+ret -1
+end
+plen = shr hlen 1
+if gt add ATLAS_HDR_SIZE plen len img
+ret -1
+end
+if not atlas_parse_hex_bytes part line 12 hlen part img ATLAS_HDR_SIZE plen
+ret -1
+end
+put hdr stage_len plen
+put meta 0 add ATLAS_HDR_SIZE plen
+put meta 3 1
+ret 1
+end
+
+fn atlas_find_nl src view uchar * start ulong to ulong
+n = len src
+p = start
+while lt p n bound 65536
+if eq get src p 10
+ret p
+end
+p = add p 1
+end
+ret n
+end
+
+fn atlas_parse_manifest src view uchar * img edit uchar * meta edit ulong 4 to bool
+exp = new uchar 32 0
+hdr = new AtlasHeader ATLAS_MAGIC_LE ATLAS_HDR_VER 0 0 0
+n = len src
+pos = atlas_find_nl src 0
+if lt pos n
+pos = add pos 1
+end
+while lt pos n bound 1024
+lend = atlas_find_nl src pos
+nextp = lend
+if lt nextp n
+nextp = add nextp 1
+end
+if gt lend pos
+if eq get src sub lend 1 13
+lend = sub lend 1
+end
+end
+llen = sub lend pos
+if gt llen 0
+r1 = atlas_parse_line_meta part src pos llen hdr exp meta
+if lt r1 0
+ret false
+end
+if eq r1 0
+r2 = atlas_parse_line_pay part src pos llen img hdr meta
+if lt r2 0
+ret false
+end
+end
+end
+pos = nextp
+end
+if ne get meta 2 1
+ret false
+end
+if ne get meta 3 1
+ret false
+end
+ret atlas_header_encode img hdr exp
+end
+
+fn atlas_read_min_epoch dst edit ulong 1 to bool
+abuf = new uchar 64 0
+vbuf = new uchar 64 0
+put dst 0 0
+ac = argcnt
+if le ac 1
+ret true
+end
+if ne ac 3
+ret false
+end
+k1 = argread 1 abuf 0 64
+if le k1 0
+ret false
+end
+if not atlas_eq_slice part abuf 0 ulong k1 m_arg_me
+ret false
+end
+k2 = argread 2 vbuf 0 64
+if le k2 0
+ret false
+end
+ret atlas_parse_u64 part vbuf 0 ulong k2 dst
+end
+
+fn atlas_exec_image img view uchar * min_ep ulong to int
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+wire = new uchar 64 0
+rc = atlas_verify_image img min_ep hdr desc comp
+if ne rc ATLAS_OK
+atlas_print_halt rc
+ret int rc
+end
+if not atlas_emit_desc_bytes desc wire
+atlas_print_halt ATLAS_ERR_MEMMAP
+ret int ATLAS_ERR_MEMMAP
+end
+if not atlas_print_handoff desc comp
+ret 2
+end
+ret 0
+end
+
+fn atlas_exec_manifest raw view uchar * min_ep ulong to int
+img = new uchar 65536 0
+meta = new ulong 4 0
+put meta 1 min_ep
+if not atlas_parse_manifest raw img meta
+atlas_print_halt 11
+ret 11
+end
+ret atlas_exec_image part img 0 get meta 0 get meta 1
+end
+
+fn main to int
+raw = new uchar 65536 0
+got = new ulong 1 0
+mep = new ulong 1 0
+if not atlas_write_all 1 m_awaken
+ret 2
+end
+if not atlas_read_min_epoch mep
+atlas_print_halt 11
+ret 11
+end
+if not atlas_read_stdin raw got
+ok = atlas_write_all 2 m_r_io
+if ok
+ret 12
+end
+ret 12
+end
+if not atlas_write_all 1 m_verify
+ret 2
+end
+rlen = get got 0
+min_ep = get mep 0
+if atlas_starts_with part raw 0 rlen m_hdr_man
+ret atlas_exec_manifest part raw 0 rlen min_ep
+end
+ret atlas_exec_image part raw 0 rlen min_ep
+end

@@ -1,0 +1,490 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/aegis/dag.om: Dependency-aware task workflow DAG engine (pure OM-2 library unit).
+note Converted from aegis-runtime-mv/src/orchestration/workflow.rs.
+note Task states: PENDING(0), READY(1), RUNNING(2), DONE(3), FAILED(4), BLOCKED(5), CANCELLED(6).
+note Bounded edge list, topological readiness solver, explicit cycle detection and refusal,
+note transitive failure/cancellation propagation (BLOCKED downstream), and deterministic
+note priority selection (highest priority first, lowest insertion slot breaks ties).
+
+const DAG_MAX_TASKS ulong 128
+const DAG_MAX_EDGES ulong 512
+
+const TASK_PENDING ulong 0
+const TASK_READY ulong 1
+const TASK_RUNNING ulong 2
+const TASK_DONE ulong 3
+const TASK_FAILED ulong 4
+const TASK_BLOCKED ulong 5
+const TASK_CANCELLED ulong 6
+
+const DAG_OK ulong 0
+const DAG_ERR_FULL ulong 1
+const DAG_ERR_DUPLICATE_TASK ulong 2
+const DAG_ERR_UNKNOWN_TASK ulong 3
+const DAG_ERR_SELF_DEP ulong 4
+const DAG_ERR_DUPLICATE_EDGE ulong 5
+const DAG_ERR_CYCLE ulong 6
+const DAG_ERR_INVALID_TRANSITION ulong 7
+const DAG_ERR_EMPTY_ID ulong 8
+const DAG_ERR_EDGE_FULL ulong 9
+
+note dag_meta: [0]=task_cnt, [1]=edge_cnt, [2]=cur_running, [3]=peak_running, [4]=seq
+global dag_meta ulong 8
+global dag_tid ulong 128
+global dag_state ulong 128
+global dag_prio ulong 128
+global dag_kind ulong 128
+global dag_blocked_by ulong 128
+global dag_fail_code ulong 128
+global dag_edge_pre ulong 512
+global dag_edge_dep ulong 512
+
+fn dag_reset to void
+for i ulong 8
+put dag_meta i 0
+end
+for i ulong 128
+put dag_tid i 0
+put dag_state i 0
+put dag_prio i 0
+put dag_kind i 0
+put dag_blocked_by i 0
+put dag_fail_code i 0
+end
+for i ulong 512
+put dag_edge_pre i 0
+put dag_edge_dep i 0
+end
+end
+
+fn dag_task_count to ulong
+ret get dag_meta 0
+end
+
+fn dag_edge_count to ulong
+ret get dag_meta 1
+end
+
+fn dag_cur_running to ulong
+ret get dag_meta 2
+end
+
+fn dag_peak_running to ulong
+ret get dag_meta 3
+end
+
+fn dag_find_slot tid ulong to long
+if eq tid 0
+ret -1
+end
+n = get dag_meta 0
+for i ulong n bound 128
+if eq get dag_tid i tid
+ret long i
+end
+end
+ret -1
+end
+
+fn dag_slot_tid slot ulong to ulong
+if ge slot get dag_meta 0
+ret 0
+end
+ret get dag_tid slot
+end
+
+fn dag_slot_state slot ulong to ulong
+if ge slot get dag_meta 0
+ret TASK_CANCELLED
+end
+ret get dag_state slot
+end
+
+fn dag_slot_prio slot ulong to ulong
+if ge slot get dag_meta 0
+ret 0
+end
+ret get dag_prio slot
+end
+
+fn dag_slot_blocked_by slot ulong to ulong
+if ge slot get dag_meta 0
+ret 0
+end
+ret get dag_blocked_by slot
+end
+
+fn dag_get_state tid ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret 99
+end
+ret get dag_state ulong s
+end
+
+fn dag_get_blocked_by tid ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret 0
+end
+ret get dag_blocked_by ulong s
+end
+
+fn dag_get_fail_code tid ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret 0
+end
+ret get dag_fail_code ulong s
+end
+
+fn dag_is_terminal st ulong to bool
+if eq st TASK_DONE
+ret true
+end
+if eq st TASK_FAILED
+ret true
+end
+if eq st TASK_BLOCKED
+ret true
+end
+if eq st TASK_CANCELLED
+ret true
+end
+ret false
+end
+
+fn dag_count_state st ulong to ulong
+n = get dag_meta 0
+acc = ulong 0
+for i ulong n bound 128
+if eq get dag_state i st
+acc = add acc 1
+end
+end
+ret acc
+end
+
+fn dag_add_task tid ulong prio ulong kind ulong to ulong
+if eq tid 0
+ret DAG_ERR_EMPTY_ID
+end
+if ge dag_find_slot tid 0
+ret DAG_ERR_DUPLICATE_TASK
+end
+n = get dag_meta 0
+if ge n DAG_MAX_TASKS
+ret DAG_ERR_FULL
+end
+put dag_tid n tid
+put dag_state n TASK_PENDING
+put dag_prio n prio
+put dag_kind n kind
+put dag_blocked_by n 0
+put dag_fail_code n 0
+put dag_meta 0 add n 1
+ret DAG_OK
+end
+
+note Bounded BFS reachability: true iff dst_slot is reachable from src_slot along pre->dep edges.
+fn dag_reachable src_slot ulong dst_slot ulong to bool
+vis = new uchar 128 0
+que = new ulong 128 0
+if eq src_slot dst_slot
+ret true
+end
+put vis src_slot 1
+put que 0 src_slot
+qhead = ulong 0
+qtail = ulong 1
+ecnt = get dag_meta 1
+while lt qhead qtail bound 128
+cur = get que qhead
+qhead = add qhead 1
+for e ulong ecnt bound 512
+if eq get dag_edge_pre e cur
+nxt = get dag_edge_dep e
+if eq nxt dst_slot
+ret true
+end
+if eq get vis nxt 0
+put vis nxt 1
+if lt qtail DAG_MAX_TASKS
+put que qtail nxt
+qtail = add qtail 1
+end
+end
+end
+end
+end
+ret false
+end
+
+note Add dependency: task_tid depends on prereq_tid (edge prereq_slot -> task_slot).
+note Refuses self-dependencies, unknown tasks, duplicate edges, non-pending target, and ANY cycle.
+fn dag_add_dep task_tid ulong prereq_tid ulong to ulong
+if eq task_tid prereq_tid
+ret DAG_ERR_SELF_DEP
+end
+ts = dag_find_slot task_tid
+if lt ts 0
+ret DAG_ERR_UNKNOWN_TASK
+end
+ps = dag_find_slot prereq_tid
+if lt ps 0
+ret DAG_ERR_UNKNOWN_TASK
+end
+tslot = ulong ts
+pslot = ulong ps
+ecnt = get dag_meta 1
+for e ulong ecnt bound 512
+if and eq get dag_edge_pre e pslot eq get dag_edge_dep e tslot
+ret DAG_ERR_DUPLICATE_EDGE
+end
+end
+if ge ecnt DAG_MAX_EDGES
+ret DAG_ERR_EDGE_FULL
+end
+note Adding pslot -> tslot forms a cycle iff pslot is already reachable from tslot.
+if dag_reachable tslot pslot
+ret DAG_ERR_CYCLE
+end
+if ne get dag_state tslot TASK_PENDING
+ret DAG_ERR_INVALID_TRANSITION
+end
+put dag_edge_pre ecnt pslot
+put dag_edge_dep ecnt tslot
+put dag_meta 1 add ecnt 1
+ret DAG_OK
+end
+
+note Kahn topological sort verification and order extraction.
+note Writes task IDs into out_tids if len out_tids >= task_count; returns peeled count.
+fn dag_topo_order dst_tids edit ulong * to ulong
+indeg = new ulong 128 0
+que = new ulong 128 0
+n = get dag_meta 0
+ecnt = get dag_meta 1
+for e ulong ecnt bound 512
+dep = get dag_edge_dep e
+put indeg dep add get indeg dep 1
+end
+qhead = ulong 0
+qtail = ulong 0
+for i ulong n bound 128
+if eq get indeg i 0
+put que qtail i
+qtail = add qtail 1
+end
+end
+peeled = ulong 0
+while lt qhead qtail bound 128
+cur = get que qhead
+qhead = add qhead 1
+if lt peeled len dst_tids
+put dst_tids peeled get dag_tid cur
+end
+peeled = add peeled 1
+for e ulong ecnt bound 512
+if eq get dag_edge_pre e cur
+dep = get dag_edge_dep e
+d = sub get indeg dep 1
+put indeg dep d
+if eq d 0
+if lt qtail DAG_MAX_TASKS
+put que qtail dep
+qtail = add qtail 1
+end
+end
+end
+end
+end
+ret peeled
+end
+
+fn dag_validate_kahn to ulong
+tmp = new ulong 128 0
+peeled = dag_topo_order tmp
+if ne peeled get dag_meta 0
+ret DAG_ERR_CYCLE
+end
+ret DAG_OK
+end
+
+note Evaluate one pending slot: returns 1 if promoted to READY, 2 if BLOCKED, 0 if unchanged.
+fn dag_eval_pending_slot slot ulong to ulong
+ecnt = get dag_meta 1
+all_done = true
+for e ulong ecnt bound 512
+if eq get dag_edge_dep e slot
+pre = get dag_edge_pre e
+pst = get dag_state pre
+if or eq pst TASK_FAILED or eq pst TASK_BLOCKED eq pst TASK_CANCELLED
+put dag_state slot TASK_BLOCKED
+put dag_blocked_by slot get dag_tid pre
+ret 2
+end
+if ne pst TASK_DONE
+all_done = false
+end
+end
+end
+if all_done
+put dag_state slot TASK_READY
+ret 1
+end
+ret 0
+end
+
+note Fixed-point topological readiness and failure/cancellation propagation solver.
+note Returns count of tasks in TASK_READY after solving.
+fn dag_solve_ready to ulong
+n = get dag_meta 0
+changed = true
+while changed bound 128
+changed = false
+for i ulong n bound 128
+if eq get dag_state i TASK_PENDING
+ev = dag_eval_pending_slot i
+if ne ev 0
+changed = true
+end
+end
+end
+end
+ret dag_count_state TASK_READY
+end
+
+note Deterministic priority selection among READY tasks:
+note highest dag_prio wins; ties broken by lowest insertion slot index.
+fn dag_select_next to long
+n = get dag_meta 0
+best_slot = long -1
+best_prio = ulong 0
+for i ulong n bound 128
+if eq get dag_state i TASK_READY
+p = get dag_prio i
+if lt best_slot 0
+best_slot = long i
+best_prio = p
+else
+if gt p best_prio
+best_slot = long i
+best_prio = p
+end
+end
+end
+end
+ret best_slot
+end
+
+fn dag_start_task tid ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret DAG_ERR_UNKNOWN_TASK
+end
+slot = ulong s
+if ne get dag_state slot TASK_READY
+ret DAG_ERR_INVALID_TRANSITION
+end
+put dag_state slot TASK_RUNNING
+cur = add get dag_meta 2 1
+put dag_meta 2 cur
+if gt cur get dag_meta 3
+put dag_meta 3 cur
+end
+put dag_meta 4 add get dag_meta 4 1
+ret DAG_OK
+end
+
+fn dag_complete_task tid ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret DAG_ERR_UNKNOWN_TASK
+end
+slot = ulong s
+if ne get dag_state slot TASK_RUNNING
+ret DAG_ERR_INVALID_TRANSITION
+end
+put dag_state slot TASK_DONE
+cur = get dag_meta 2
+if gt cur 0
+put dag_meta 2 sub cur 1
+end
+put dag_meta 4 add get dag_meta 4 1
+rdy = dag_solve_ready
+if gt rdy DAG_MAX_TASKS
+ret DAG_ERR_FULL
+end
+ret DAG_OK
+end
+
+fn dag_fail_task tid ulong fail_code ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret DAG_ERR_UNKNOWN_TASK
+end
+slot = ulong s
+st = get dag_state slot
+if and ne st TASK_RUNNING ne st TASK_READY
+ret DAG_ERR_INVALID_TRANSITION
+end
+if eq st TASK_RUNNING
+cur = get dag_meta 2
+if gt cur 0
+put dag_meta 2 sub cur 1
+end
+end
+put dag_state slot TASK_FAILED
+put dag_fail_code slot fail_code
+put dag_meta 4 add get dag_meta 4 1
+rdy = dag_solve_ready
+if gt rdy DAG_MAX_TASKS
+ret DAG_ERR_FULL
+end
+ret DAG_OK
+end
+
+fn dag_cancel_task tid ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret DAG_ERR_UNKNOWN_TASK
+end
+slot = ulong s
+st = get dag_state slot
+if dag_is_terminal st
+ret DAG_ERR_INVALID_TRANSITION
+end
+if eq st TASK_RUNNING
+cur = get dag_meta 2
+if gt cur 0
+put dag_meta 2 sub cur 1
+end
+end
+put dag_state slot TASK_CANCELLED
+put dag_meta 4 add get dag_meta 4 1
+rdy = dag_solve_ready
+if gt rdy DAG_MAX_TASKS
+ret DAG_ERR_FULL
+end
+ret DAG_OK
+end
+
+note Requeue a RUNNING task back to READY (used when an expired lease reclaims an abandoned task).
+fn dag_requeue_task tid ulong to ulong
+s = dag_find_slot tid
+if lt s 0
+ret DAG_ERR_UNKNOWN_TASK
+end
+slot = ulong s
+if ne get dag_state slot TASK_RUNNING
+ret DAG_ERR_INVALID_TRANSITION
+end
+put dag_state slot TASK_READY
+cur = get dag_meta 2
+if gt cur 0
+put dag_meta 2 sub cur 1
+end
+put dag_meta 4 add get dag_meta 4 1
+ret DAG_OK
+end

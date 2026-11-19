@@ -1,0 +1,459 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/aegis/journal.om: Append-only SHA-256 hash-chained event/task journal (pure OM-2 library unit).
+note Composes with om/tls/sha2.om (FIPS 180-4 SHA-256) and core/aegis/dag.om for replay.
+note Guarantees: strict sequence monotonicity (1..N), cryptographic hash chaining from genesis,
+note replay reconstruction into DAG state (refusing tampered/torn logs), and binary wire
+note encoding/decoding with torn-record and magic/commit sentinel detection.
+
+const JRN_MAX_RECORDS ulong 128
+const JRN_PAYLOAD_MAX ulong 64
+const JRN_WIRE_REC_SIZE ulong 192
+
+const JRN_MAGIC ulong 0x4145474a
+const JRN_COMMIT_END ulong 0x454e4431
+
+note Journal event kinds
+const EVT_TASK_SUBMITTED ulong 1
+const EVT_TASK_DEP ulong 2
+const EVT_TASK_STARTED ulong 3
+const EVT_TASK_DONE ulong 4
+const EVT_TASK_FAILED ulong 5
+const EVT_TASK_BLOCKED ulong 6
+const EVT_TASK_CANCELLED ulong 7
+const EVT_LEASE_ACQUIRED ulong 8
+const EVT_LEASE_RECLAIMED ulong 9
+const EVT_HEARTBEAT_TICK ulong 10
+const EVT_POLICY_DENIED ulong 11
+
+note Journal status and integrity error codes
+const JRN_OK ulong 0
+const JRN_ERR_FULL ulong 1
+const JRN_ERR_PAYLOAD_TOO_LONG ulong 2
+const JRN_ERR_BAD_MAGIC ulong 3
+const JRN_ERR_SEQ_GAP ulong 4
+const JRN_ERR_PREV_HASH_MISMATCH ulong 5
+const JRN_ERR_HASH_MISMATCH ulong 6
+const JRN_ERR_TORN_RECORD ulong 7
+const JRN_ERR_NOT_FOUND ulong 8
+
+note jrn_meta: [0]=record_cnt, [1]=last_seq
+global jrn_meta ulong 8
+global jrn_magic ulong 128
+global jrn_seq ulong 128
+global jrn_tick ulong 128
+global jrn_kind ulong 128
+global jrn_task_id ulong 128
+global jrn_aux ulong 128
+global jrn_plen ulong 128
+global jrn_commit ulong 128
+global jrn_payload uchar 8192
+global jrn_prev_hash uchar 4096
+global jrn_hash uchar 4096
+
+text jrn_domain "AEGIS-JRN-V1"
+
+fn jrn_reset to void
+for i ulong 8
+put jrn_meta i 0
+end
+for i ulong 128
+put jrn_magic i 0
+put jrn_seq i 0
+put jrn_tick i 0
+put jrn_kind i 0
+put jrn_task_id i 0
+put jrn_aux i 0
+put jrn_plen i 0
+put jrn_commit i 0
+end
+for i ulong 8192
+put jrn_payload i 0
+end
+for i ulong 4096
+put jrn_prev_hash i 0
+put jrn_hash i 0
+end
+end
+
+fn jrn_count to ulong
+ret get jrn_meta 0
+end
+
+fn jrn_last_seq to ulong
+ret get jrn_meta 1
+end
+
+fn jrn_rec_seq idx ulong to ulong
+if ge idx get jrn_meta 0
+ret 0
+end
+ret get jrn_seq idx
+end
+
+fn jrn_rec_tick idx ulong to ulong
+if ge idx get jrn_meta 0
+ret 0
+end
+ret get jrn_tick idx
+end
+
+fn jrn_rec_kind idx ulong to ulong
+if ge idx get jrn_meta 0
+ret 0
+end
+ret get jrn_kind idx
+end
+
+fn jrn_rec_task_id idx ulong to ulong
+if ge idx get jrn_meta 0
+ret 0
+end
+ret get jrn_task_id idx
+end
+
+fn jrn_rec_aux idx ulong to ulong
+if ge idx get jrn_meta 0
+ret 0
+end
+ret get jrn_aux idx
+end
+
+fn jrn_copy_hash idx ulong dst edit uchar 32 to ulong
+if ge idx get jrn_meta 0
+ret JRN_ERR_NOT_FOUND
+end
+base = mul idx 32
+for i ulong 32
+put dst i get jrn_hash add base i
+end
+ret JRN_OK
+end
+
+fn jrn_put_be32 buf edit uchar * off ulong v ulong to void
+put buf add off 0 uchar and shr v 24 0xff
+put buf add off 1 uchar and shr v 16 0xff
+put buf add off 2 uchar and shr v 8 0xff
+put buf add off 3 uchar and v 0xff
+end
+
+fn jrn_put_be64 buf edit uchar * off ulong v ulong to void
+put buf add off 0 uchar and shr v 56 0xff
+put buf add off 1 uchar and shr v 48 0xff
+put buf add off 2 uchar and shr v 40 0xff
+put buf add off 3 uchar and shr v 32 0xff
+put buf add off 4 uchar and shr v 24 0xff
+put buf add off 5 uchar and shr v 16 0xff
+put buf add off 6 uchar and shr v 8 0xff
+put buf add off 7 uchar and v 0xff
+end
+
+fn jrn_get_be32 buf view uchar * off ulong to ulong
+b0 = ulong get buf add off 0
+b1 = ulong get buf add off 1
+b2 = ulong get buf add off 2
+b3 = ulong get buf add off 3
+ret or shl b0 24 or shl b1 16 or shl b2 8 b3
+end
+
+fn jrn_get_be64 buf view uchar * off ulong to ulong
+hi = jrn_get_be32 buf off
+lo = jrn_get_be32 buf add off 4
+ret or shl hi 32 lo
+end
+
+note Compute canonical SHA-256 digest of record idx into dst_hash[32].
+note Covers: domain(12) | magic(4) | seq(8) | tick(8) | kind(8) | task_id(8) | aux(8) |
+note         plen(4) | prev_hash(32) | commit(4) | payload(plen).
+fn jrn_compute_record_hash idx ulong dst_hash edit uchar 32 to void
+ctx = new ulong 40 0
+hdr = new uchar 96 0
+pl = new uchar 64 0
+for i ulong 12
+put hdr i get jrn_domain i
+end
+jrn_put_be32 hdr 12 get jrn_magic idx
+jrn_put_be64 hdr 16 get jrn_seq idx
+jrn_put_be64 hdr 24 get jrn_tick idx
+jrn_put_be64 hdr 32 get jrn_kind idx
+jrn_put_be64 hdr 40 get jrn_task_id idx
+jrn_put_be64 hdr 48 get jrn_aux idx
+plen = get jrn_plen idx
+jrn_put_be32 hdr 56 plen
+hbase = mul idx 32
+for i ulong 32
+put hdr add 60 i get jrn_prev_hash add hbase i
+end
+jrn_put_be32 hdr 92 get jrn_commit idx
+sha256_init ctx
+sha256_update ctx part hdr 0 96
+if and gt plen 0 le plen JRN_PAYLOAD_MAX
+pbase = mul idx JRN_PAYLOAD_MAX
+for i ulong plen bound 64
+put pl i get jrn_payload add pbase i
+end
+sha256_update ctx part pl 0 plen
+end
+sha256_final ctx dst_hash
+for i ulong 40
+put ctx i 0
+end
+end
+
+fn jrn_store_payload idx ulong payload view uchar * to void
+pbase = mul idx JRN_PAYLOAD_MAX
+for i ulong JRN_PAYLOAD_MAX
+put jrn_payload add pbase i 0
+end
+plen = len payload
+for i ulong plen bound 64
+put jrn_payload add pbase i get payload i
+end
+end
+
+fn jrn_link_and_seal idx ulong to void
+dig = new uchar 32 0
+hbase = mul idx 32
+if eq idx 0
+for i ulong 32
+put jrn_prev_hash add hbase i 0
+end
+else
+prev_base = mul sub idx 1 32
+for i ulong 32
+put jrn_prev_hash add hbase i get jrn_hash add prev_base i
+end
+end
+jrn_compute_record_hash idx dig
+for i ulong 32
+put jrn_hash add hbase i get dig i
+end
+end
+
+note Append a new hash-chained event record. Returns JRN_OK or error code.
+fn jrn_append kind ulong task_id ulong aux ulong tick ulong payload view uchar * to ulong
+idx = get jrn_meta 0
+if ge idx JRN_MAX_RECORDS
+ret JRN_ERR_FULL
+end
+plen = len payload
+if gt plen JRN_PAYLOAD_MAX
+ret JRN_ERR_PAYLOAD_TOO_LONG
+end
+seq = add get jrn_meta 1 1
+put jrn_magic idx JRN_MAGIC
+put jrn_seq idx seq
+put jrn_tick idx tick
+put jrn_kind idx kind
+put jrn_task_id idx task_id
+put jrn_aux idx aux
+put jrn_plen idx plen
+put jrn_commit idx JRN_COMMIT_END
+jrn_store_payload idx payload
+jrn_link_and_seal idx
+put jrn_meta 0 add idx 1
+put jrn_meta 1 seq
+ret JRN_OK
+end
+
+note Verify a single record's prev_hash linkage against record idx-1 (or all-zero genesis).
+fn jrn_check_prev_link idx ulong to bool
+hbase = mul idx 32
+if eq idx 0
+for i ulong 32
+if ne get jrn_prev_hash add hbase i 0
+ret false
+end
+end
+ret true
+end
+prev_base = mul sub idx 1 32
+for i ulong 32
+if ne get jrn_prev_hash add hbase i get jrn_hash add prev_base i
+ret false
+end
+end
+ret true
+end
+
+note Full cryptographic chain audit: checks magic, commit sentinel, strict sequence
+note monotonicity (1..N), payload length bounds, prev_hash continuity, and SHA-256 integrity.
+fn jrn_verify_chain to ulong
+n = get jrn_meta 0
+dig = new uchar 32 0
+for i ulong n bound 128
+if ne get jrn_magic i JRN_MAGIC
+ret JRN_ERR_BAD_MAGIC
+end
+if ne get jrn_commit i JRN_COMMIT_END
+ret JRN_ERR_TORN_RECORD
+end
+if ne get jrn_seq i add i 1
+ret JRN_ERR_SEQ_GAP
+end
+if gt get jrn_plen i JRN_PAYLOAD_MAX
+ret JRN_ERR_TORN_RECORD
+end
+if not jrn_check_prev_link i
+ret JRN_ERR_PREV_HASH_MISMATCH
+end
+jrn_compute_record_hash i dig
+hbase = mul i 32
+for b ulong 32
+if ne get dig b get jrn_hash add hbase b
+ret JRN_ERR_HASH_MISMATCH
+end
+end
+end
+ret JRN_OK
+end
+
+note Replay verified journal into DAG state. Refuses to replay if chain verification fails.
+fn jrn_replay_to_dag to ulong
+chk = jrn_verify_chain
+if ne chk JRN_OK
+ret chk
+end
+dag_reset
+n = get jrn_meta 0
+for i ulong n bound 128
+k = get jrn_kind i
+tid = get jrn_task_id i
+ax = get jrn_aux i
+if eq k EVT_TASK_SUBMITTED
+prio = and ax 0xffffffff
+tkind = shr ax 32
+rc = dag_add_task tid prio tkind
+if ne rc DAG_OK
+ret JRN_ERR_TORN_RECORD
+end
+end
+if eq k EVT_TASK_DEP
+rc = dag_add_dep tid ax
+if ne rc DAG_OK
+ret JRN_ERR_TORN_RECORD
+end
+end
+if eq k EVT_TASK_STARTED
+rdy = dag_solve_ready
+if gt rdy DAG_MAX_TASKS
+ret JRN_ERR_TORN_RECORD
+end
+rc = dag_start_task tid
+if ne rc DAG_OK
+ret JRN_ERR_TORN_RECORD
+end
+end
+if eq k EVT_TASK_DONE
+rc = dag_complete_task tid
+if ne rc DAG_OK
+ret JRN_ERR_TORN_RECORD
+end
+end
+if eq k EVT_TASK_FAILED
+rdy = dag_solve_ready
+if gt rdy DAG_MAX_TASKS
+ret JRN_ERR_TORN_RECORD
+end
+rc = dag_fail_task tid ax
+if ne rc DAG_OK
+ret JRN_ERR_TORN_RECORD
+end
+end
+if eq k EVT_TASK_CANCELLED
+rc = dag_cancel_task tid
+if ne rc DAG_OK
+ret JRN_ERR_TORN_RECORD
+end
+end
+if eq k EVT_LEASE_RECLAIMED
+if eq dag_get_state tid TASK_RUNNING
+rc = dag_requeue_task tid
+if ne rc DAG_OK
+ret JRN_ERR_TORN_RECORD
+end
+end
+end
+end
+rdy2 = dag_solve_ready
+if gt rdy2 DAG_MAX_TASKS
+ret JRN_ERR_TORN_RECORD
+end
+ret JRN_OK
+end
+
+note Encode record idx into 192-byte wire format at dst[off..off+192].
+note Layout: magic(4) | seq(8) | tick(8) | kind(8) | task_id(8) | aux(8) | plen(4) |
+note         payload(64) | prev_hash(32) | hash(32) | commit(4) | reserved(12) = 192 bytes.
+fn jrn_encode_record idx ulong dst edit uchar * off ulong to ulong
+if ge idx get jrn_meta 0
+ret JRN_ERR_NOT_FOUND
+end
+if gt add off JRN_WIRE_REC_SIZE len dst
+ret JRN_ERR_TORN_RECORD
+end
+jrn_put_be32 dst add off 0 get jrn_magic idx
+jrn_put_be64 dst add off 4 get jrn_seq idx
+jrn_put_be64 dst add off 12 get jrn_tick idx
+jrn_put_be64 dst add off 20 get jrn_kind idx
+jrn_put_be64 dst add off 28 get jrn_task_id idx
+jrn_put_be64 dst add off 36 get jrn_aux idx
+jrn_put_be32 dst add off 44 get jrn_plen idx
+pbase = mul idx JRN_PAYLOAD_MAX
+for i ulong JRN_PAYLOAD_MAX
+put dst add off add 48 i get jrn_payload add pbase i
+end
+hbase = mul idx 32
+for i ulong 32
+put dst add off add 112 i get jrn_prev_hash add hbase i
+put dst add off add 144 i get jrn_hash add hbase i
+end
+jrn_put_be32 dst add off 176 get jrn_commit idx
+for i ulong 12
+put dst add off add 180 i 0
+end
+ret JRN_OK
+end
+
+fn jrn_decode_one idx ulong src view uchar * off ulong to void
+put jrn_magic idx jrn_get_be32 src add off 0
+put jrn_seq idx jrn_get_be64 src add off 4
+put jrn_tick idx jrn_get_be64 src add off 12
+put jrn_kind idx jrn_get_be64 src add off 20
+put jrn_task_id idx jrn_get_be64 src add off 28
+put jrn_aux idx jrn_get_be64 src add off 36
+put jrn_plen idx jrn_get_be32 src add off 44
+pbase = mul idx JRN_PAYLOAD_MAX
+for i ulong JRN_PAYLOAD_MAX
+put jrn_payload add pbase i get src add off add 48 i
+end
+hbase = mul idx 32
+for i ulong 32
+put jrn_prev_hash add hbase i get src add off add 112 i
+put jrn_hash add hbase i get src add off add 144 i
+end
+put jrn_commit idx jrn_get_be32 src add off 176
+end
+
+note Decode a binary journal stream of nbytes from src into the journal and verify its chain.
+note Refuses truncated/torn trailing bytes (nbytes % 192 != 0), bad magic, missing commit, or hash mismatch.
+fn jrn_decode_stream src view uchar * nbytes ulong to ulong
+if gt nbytes len src
+ret JRN_ERR_TORN_RECORD
+end
+if ne rem nbytes JRN_WIRE_REC_SIZE 0
+ret JRN_ERR_TORN_RECORD
+end
+nrec = div nbytes JRN_WIRE_REC_SIZE
+if gt nrec JRN_MAX_RECORDS
+ret JRN_ERR_FULL
+end
+jrn_reset
+for idx ulong nrec bound 128
+jrn_decode_one idx src mul idx JRN_WIRE_REC_SIZE
+end
+put jrn_meta 0 nrec
+if gt nrec 0
+put jrn_meta 1 get jrn_seq sub nrec 1
+end
+ret jrn_verify_chain
+end

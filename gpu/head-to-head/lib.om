@@ -1,0 +1,849 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/head-to-head/lib.om: pure-Omega paired GPU benchmark comparator and verification harness.
+note Derived from gpu-head-to-head (paired A/B timing statistics, numerical parity gate with NaN/Inf
+note refusal, IQR non-overlap comparison, bandwidth GB/s, control-mutant verification, deterministic
+note PASS/FAIL/NOT_RUN verdict emission). Library unit: no om2 directive, no fn main.
+
+const H2H_VERDICT_PASS ulong 0
+const H2H_VERDICT_FAIL ulong 1
+const H2H_VERDICT_NOT_RUN ulong 2
+
+const H2H_REASON_OK ulong 0
+const H2H_REASON_NO_PAIRS ulong 1
+const H2H_REASON_NO_ELEMS ulong 2
+const H2H_REASON_BAD_TIMING ulong 3
+const H2H_REASON_PARITY_FAIL ulong 4
+const H2H_REASON_MUTANT_NOT_RUN ulong 5
+const H2H_REASON_MUTANT_ESCAPED ulong 6
+const H2H_REASON_BAD_TOL ulong 7
+
+const H2H_CALL_OVERLAPPING ulong 0
+const H2H_CALL_B_FASTER ulong 1
+const H2H_CALL_A_FASTER ulong 2
+
+const H2H_MAX_SAMPLES ulong 4096
+const H2H_MAX_ELEMS ulong 65536
+
+struct H2hTol atol f64 rtol f64 end
+struct H2hParity ok ulong elem_n ulong mismatches ulong nan_cnt ulong inf_cnt ulong max_abs f64 max_rel f64 end
+struct H2hStats ok ulong n ulong min_ns ulong q1_ns ulong med_ns f64 q3_ns ulong iqr_ns ulong p95_ns ulong max_ns ulong end
+struct H2hSummary verdict ulong reason ulong bytes_moved ulong speedup f64 bw_a_gbps f64 bw_b_gbps f64 iqr_call ulong parity_ok ulong mutant_checked ulong mutant_caught ulong end
+
+text h2h_t_pass "PASS"
+text h2h_t_fail "FAIL"
+text h2h_t_notrun "NOT_RUN"
+text h2h_t_verdict "VERDICT="
+text h2h_t_reason " REASON="
+text h2h_t_nl "\n"
+text h2h_t_arma "ARM_A "
+text h2h_t_armb "ARM_B "
+text h2h_t_n "n="
+text h2h_t_min " min_ns="
+text h2h_t_q1 " q1_ns="
+text h2h_t_med " median_ns="
+text h2h_t_q3 " q3_ns="
+text h2h_t_iqr " iqr_ns="
+text h2h_t_p95 " p95_ns="
+text h2h_t_max " max_ns="
+text h2h_t_cmp "COMPARE speedup="
+text h2h_t_bwa " bw_a_gbps="
+text h2h_t_bwb " bw_b_gbps="
+text h2h_t_call " iqr_call="
+text h2h_t_call_ov "OVERLAPPING"
+text h2h_t_call_bf "ARM_B_FASTER"
+text h2h_t_call_af "ARM_A_FASTER"
+text h2h_t_par "PARITY ok="
+text h2h_t_elems " elems="
+text h2h_t_mis " mismatches="
+text h2h_t_nan " nan="
+text h2h_t_inf " inf="
+text h2h_t_mabs " max_abs="
+text h2h_t_mrel " max_rel="
+text h2h_t_mut "MUTANT checked="
+text h2h_t_caught " caught="
+text h2h_t_nan_str "NaN"
+text h2h_t_inf_str "Inf"
+text h2h_t_ninf_str "-Inf"
+text h2h_t_minus "-"
+text h2h_t_dot "."
+text h2h_t_r_ok "ok"
+text h2h_t_r_nopairs "no_pairs"
+text h2h_t_r_noelems "no_elems"
+text h2h_t_r_badtime "bad_timing"
+text h2h_t_r_parfail "parity_failed"
+text h2h_t_r_mutnr "mutant_not_run"
+text h2h_t_r_mutesc "mutant_escaped"
+text h2h_t_r_badtol "bad_tolerance"
+
+fn h2h_write_all fd int buf view uchar * to bool
+n = len buf
+pos = ulong 0
+while lt pos n bound 65536
+k = write fd buf pos sub n pos
+if le k 0
+ret false
+end
+pos = add pos ulong k
+end
+ret true
+end
+
+fn h2h_write_u64 fd int v ulong to void
+digits = new uchar 24 0
+if eq v 0
+put digits 0 uchar 48
+ok0 = h2h_write_all fd part digits 0 1
+if ok0
+ret
+end
+ret
+end
+tmp = new uchar 24 0
+cnt = ulong 0
+x = v
+while gt x 0 bound 24
+d = rem x 10
+put tmp cnt uchar add 48 d
+cnt = add cnt 1
+x = div x 10
+end
+i = ulong 0
+while lt i cnt bound 24
+put digits i get tmp sub sub cnt 1 i
+i = add i 1
+end
+ok1 = h2h_write_all fd part digits 0 cnt
+if ok1
+ret
+end
+end
+
+fn h2h_f64_is_nan x f64 to bool
+bits = bitcast ulong x
+exp = and shr bits 52 0x7ff
+frac = and bits 0xfffffffffffff
+ret and eq exp 0x7ff ne frac 0
+end
+
+fn h2h_f64_is_inf x f64 to bool
+bits = bitcast ulong x
+exp = and shr bits 52 0x7ff
+frac = and bits 0xfffffffffffff
+ret and eq exp 0x7ff eq frac 0
+end
+
+fn h2h_f64_is_finite x f64 to bool
+bits = bitcast ulong x
+exp = and shr bits 52 0x7ff
+ret ne exp 0x7ff
+end
+
+fn h2h_f64_is_neg x f64 to bool
+bits = bitcast ulong x
+ret ne shr bits 63 0
+end
+
+fn h2h_write_f64_6 fd int x f64 to void
+if h2h_f64_is_nan x
+okn = h2h_write_all fd h2h_t_nan_str
+if okn
+ret
+end
+ret
+end
+if h2h_f64_is_inf x
+if h2h_f64_is_neg x
+okni = h2h_write_all fd h2h_t_ninf_str
+if okni
+ret
+end
+else
+okpi = h2h_write_all fd h2h_t_inf_str
+if okpi
+ret
+end
+end
+ret
+end
+val = x
+if lt val 0.0f64
+okm = h2h_write_all fd h2h_t_minus
+if okm
+val = neg val
+else
+val = neg val
+end
+end
+scaled = ulong add mul val 1000000.0f64 0.5f64
+whole = div scaled 1000000
+frac = rem scaled 1000000
+h2h_write_u64 fd whole
+okd = h2h_write_all fd h2h_t_dot
+fbuf = new uchar 6 48
+p = ulong 5
+remf = frac
+for k ulong 6
+d = rem remf 10
+put fbuf p uchar add 48 d
+remf = div remf 10
+if gt p 0
+p = sub p 1
+end
+end
+okf = h2h_write_all fd part fbuf 0 6
+if and okd okf
+ret
+end
+end
+
+fn h2h_tol_valid tol view H2hTol to bool
+a = get tol atol
+r = get tol rtol
+if not h2h_f64_is_finite a
+ret false
+end
+if not h2h_f64_is_finite r
+ret false
+end
+if lt a 0.0f64
+ret false
+end
+if lt r 0.0f64
+ret false
+end
+ret true
+end
+
+fn h2h_parity_step va f64 vb f64 tol view H2hTol res edit H2hParity to void
+bad_nf = false
+if h2h_f64_is_nan va
+put res nan_cnt add get res nan_cnt 1
+bad_nf = true
+end
+if h2h_f64_is_nan vb
+put res nan_cnt add get res nan_cnt 1
+bad_nf = true
+end
+if h2h_f64_is_inf va
+put res inf_cnt add get res inf_cnt 1
+bad_nf = true
+end
+if h2h_f64_is_inf vb
+put res inf_cnt add get res inf_cnt 1
+bad_nf = true
+end
+if bad_nf
+put res mismatches add get res mismatches 1
+ret
+end
+diff = fabs sub va vb
+scale = fmax fabs va fabs vb
+rel = 0.0f64
+if gt scale 0.0f64
+rel = div diff scale
+end
+if gt diff get res max_abs
+put res max_abs diff
+end
+if gt rel get res max_rel
+put res max_rel rel
+end
+lim = add get tol atol mul get tol rtol scale
+if gt diff lim
+put res mismatches add get res mismatches 1
+end
+end
+
+fn h2h_check_parity a view f64 * b view f64 * tol view H2hTol res edit H2hParity to void
+put res ok ulong 0
+put res elem_n ulong 0
+put res mismatches ulong 0
+put res nan_cnt ulong 0
+put res inf_cnt ulong 0
+put res max_abs 0.0f64
+put res max_rel 0.0f64
+na = len a
+if eq na 0
+ret
+end
+if ne na len b
+ret
+end
+if gt na H2H_MAX_ELEMS
+ret
+end
+if not h2h_tol_valid tol
+ret
+end
+put res elem_n na
+i = ulong 0
+while lt i na bound 65536
+h2h_parity_step get a i get b i tol res
+i = add i 1
+end
+if eq get res mismatches 0
+if eq get res nan_cnt 0
+if eq get res inf_cnt 0
+put res ok ulong 1
+end
+end
+end
+end
+
+fn h2h_sort_u64 arr edit ulong * n ulong to void
+i = ulong 1
+while lt i n bound 4096
+key = get arr i
+j = i
+while gt j 0 bound 4096
+prev = get arr sub j 1
+if gt prev key
+put arr j prev
+j = sub j 1
+else
+break
+end
+end
+put arr j key
+i = add i 1
+end
+end
+
+fn h2h_pct_idx n ulong pct ulong to ulong
+num = add mul pct n 99
+rank = div num 100
+if eq rank 0
+ret ulong 0
+end
+idx = sub rank 1
+if ge idx n
+ret sub n 1
+end
+ret idx
+end
+
+fn h2h_compute_stats raw view ulong * scratch edit ulong * st edit H2hStats to bool
+put st ok ulong 0
+put st n ulong 0
+put st min_ns ulong 0
+put st q1_ns ulong 0
+put st med_ns 0.0f64
+put st q3_ns ulong 0
+put st iqr_ns ulong 0
+put st p95_ns ulong 0
+put st max_ns ulong 0
+n = len raw
+if eq n 0
+ret false
+end
+if gt n H2H_MAX_SAMPLES
+ret false
+end
+if gt n len scratch
+ret false
+end
+i = ulong 0
+while lt i n bound 4096
+v = get raw i
+if eq v 0
+ret false
+end
+put scratch i v
+i = add i 1
+end
+h2h_sort_u64 scratch n
+minv = get scratch 0
+maxv = get scratch sub n 1
+half = div n 2
+med = 0.0f64
+if eq rem n 2 1
+med = f64 get scratch half
+else
+lo = f64 get scratch sub half 1
+hi = f64 get scratch half
+med = mul 0.5f64 add lo hi
+end
+q1 = get scratch h2h_pct_idx n 25
+q3 = get scratch h2h_pct_idx n 75
+p95 = get scratch h2h_pct_idx n 95
+put st ok ulong 1
+put st n n
+put st min_ns minv
+put st q1_ns q1
+put st med_ns med
+put st q3_ns q3
+put st iqr_ns sub q3 q1
+put st p95_ns p95
+put st max_ns maxv
+ret true
+end
+
+fn h2h_iqr_call sa view H2hStats sb view H2hStats to ulong
+if lt get sb q3_ns get sa q1_ns
+ret H2H_CALL_B_FASTER
+end
+if lt get sa q3_ns get sb q1_ns
+ret H2H_CALL_A_FASTER
+end
+ret H2H_CALL_OVERLAPPING
+end
+
+fn h2h_speedup med_a f64 med_b f64 to f64
+if le med_b 0.0f64
+ret 0.0f64
+end
+if not h2h_f64_is_finite med_a
+ret 0.0f64
+end
+if not h2h_f64_is_finite med_b
+ret 0.0f64
+end
+ret div med_a med_b
+end
+
+fn h2h_bw_gbps bytes_moved ulong med_ns f64 to f64
+if le med_ns 0.0f64
+ret 0.0f64
+end
+if not h2h_f64_is_finite med_ns
+ret 0.0f64
+end
+note bytes per nanosecond equals decimal GB/s (1e9 bytes/s)
+ret div f64 bytes_moved med_ns
+end
+
+fn h2h_make_wrong_kernel_mutant ref_a view f64 * dst edit f64 * to ulong
+n = len ref_a
+if gt n len dst
+ret ulong 0
+end
+if gt n H2H_MAX_ELEMS
+ret ulong 0
+end
+note Deliberate wrong-kernel control: poisons output like coldstart --skip-run / offset error
+i = ulong 0
+while lt i n bound 65536
+v = get ref_a i
+put dst i add neg v 1337.25f64
+i = add i 1
+end
+ret n
+end
+
+fn h2h_verify_mutant ref_a view f64 * mut_b view f64 * tol view H2hTol mres edit H2hParity to bool
+na = len ref_a
+nb = len mut_b
+if or eq na 0 ne na nb
+ret false
+end
+if not h2h_tol_valid tol
+ret false
+end
+h2h_check_parity ref_a mut_b tol mres
+note Control succeeds only when the deliberate wrong kernel FAILS parity
+ret eq get mres ok 0
+end
+
+fn h2h_finalize_summary sa view H2hStats sb view H2hStats par view H2hParity mchk ulong mcaught ulong sum edit H2hSummary to void
+put sum verdict H2H_VERDICT_NOT_RUN
+put sum reason H2H_REASON_OK
+put sum speedup 0.0f64
+put sum bw_a_gbps 0.0f64
+put sum bw_b_gbps 0.0f64
+put sum iqr_call H2H_CALL_OVERLAPPING
+put sum parity_ok get par ok
+put sum mutant_checked mchk
+put sum mutant_caught mcaught
+if or eq get sa n 0 eq get sb n 0
+if or eq get sa ok 0 eq get sb ok 0
+put sum verdict H2H_VERDICT_NOT_RUN
+put sum reason H2H_REASON_NO_PAIRS
+ret
+end
+end
+if or eq get sa ok 0 eq get sb ok 0
+put sum verdict H2H_VERDICT_FAIL
+put sum reason H2H_REASON_BAD_TIMING
+ret
+end
+if ne get sa n get sb n
+put sum verdict H2H_VERDICT_FAIL
+put sum reason H2H_REASON_BAD_TIMING
+ret
+end
+bm = get sum bytes_moved
+put sum speedup h2h_speedup get sa med_ns get sb med_ns
+put sum bw_a_gbps h2h_bw_gbps bm get sa med_ns
+put sum bw_b_gbps h2h_bw_gbps bm get sb med_ns
+put sum iqr_call h2h_iqr_call sa sb
+if eq get par elem_n 0
+put sum verdict H2H_VERDICT_NOT_RUN
+put sum reason H2H_REASON_NO_ELEMS
+ret
+end
+if eq get par ok 0
+put sum verdict H2H_VERDICT_FAIL
+put sum reason H2H_REASON_PARITY_FAIL
+ret
+end
+if eq mchk 0
+put sum verdict H2H_VERDICT_NOT_RUN
+put sum reason H2H_REASON_MUTANT_NOT_RUN
+ret
+end
+if eq mcaught 0
+put sum verdict H2H_VERDICT_FAIL
+put sum reason H2H_REASON_MUTANT_ESCAPED
+ret
+end
+put sum verdict H2H_VERDICT_PASS
+put sum reason H2H_REASON_OK
+end
+
+fn h2h_write_reason fd int reason ulong to void
+ok = false
+if eq reason H2H_REASON_OK
+ok = h2h_write_all fd h2h_t_r_ok
+else
+if eq reason H2H_REASON_NO_PAIRS
+ok = h2h_write_all fd h2h_t_r_nopairs
+else
+if eq reason H2H_REASON_NO_ELEMS
+ok = h2h_write_all fd h2h_t_r_noelems
+else
+if eq reason H2H_REASON_BAD_TIMING
+ok = h2h_write_all fd h2h_t_r_badtime
+else
+if eq reason H2H_REASON_PARITY_FAIL
+ok = h2h_write_all fd h2h_t_r_parfail
+else
+if eq reason H2H_REASON_MUTANT_NOT_RUN
+ok = h2h_write_all fd h2h_t_r_mutnr
+else
+if eq reason H2H_REASON_MUTANT_ESCAPED
+ok = h2h_write_all fd h2h_t_r_mutesc
+else
+ok = h2h_write_all fd h2h_t_r_badtol
+end
+end
+end
+end
+end
+end
+end
+if ok
+ret
+end
+end
+
+fn h2h_write_stats_line fd int is_b ulong st view H2hStats to void
+ok = false
+if eq is_b 0
+ok = h2h_write_all fd h2h_t_arma
+else
+ok = h2h_write_all fd h2h_t_armb
+end
+ok = and ok h2h_write_all fd h2h_t_n
+h2h_write_u64 fd get st n
+ok = and ok h2h_write_all fd h2h_t_min
+h2h_write_u64 fd get st min_ns
+ok = and ok h2h_write_all fd h2h_t_q1
+h2h_write_u64 fd get st q1_ns
+ok = and ok h2h_write_all fd h2h_t_med
+h2h_write_f64_6 fd get st med_ns
+ok = and ok h2h_write_all fd h2h_t_q3
+h2h_write_u64 fd get st q3_ns
+ok = and ok h2h_write_all fd h2h_t_iqr
+h2h_write_u64 fd get st iqr_ns
+ok = and ok h2h_write_all fd h2h_t_p95
+h2h_write_u64 fd get st p95_ns
+ok = and ok h2h_write_all fd h2h_t_max
+h2h_write_u64 fd get st max_ns
+ok = and ok h2h_write_all fd h2h_t_nl
+if ok
+ret
+end
+end
+
+fn h2h_emit_report fd int sa view H2hStats sb view H2hStats par view H2hParity sum view H2hSummary to void
+ok = h2h_write_all fd h2h_t_verdict
+v = get sum verdict
+if eq v H2H_VERDICT_PASS
+ok = and ok h2h_write_all fd h2h_t_pass
+else
+if eq v H2H_VERDICT_FAIL
+ok = and ok h2h_write_all fd h2h_t_fail
+else
+ok = and ok h2h_write_all fd h2h_t_notrun
+end
+end
+ok = and ok h2h_write_all fd h2h_t_reason
+h2h_write_reason fd get sum reason
+ok = and ok h2h_write_all fd h2h_t_nl
+h2h_write_stats_line fd 0 sa
+h2h_write_stats_line fd 1 sb
+ok = and ok h2h_write_all fd h2h_t_cmp
+h2h_write_f64_6 fd get sum speedup
+ok = and ok h2h_write_all fd h2h_t_bwa
+h2h_write_f64_6 fd get sum bw_a_gbps
+ok = and ok h2h_write_all fd h2h_t_bwb
+h2h_write_f64_6 fd get sum bw_b_gbps
+ok = and ok h2h_write_all fd h2h_t_call
+ic = get sum iqr_call
+if eq ic H2H_CALL_B_FASTER
+ok = and ok h2h_write_all fd h2h_t_call_bf
+else
+if eq ic H2H_CALL_A_FASTER
+ok = and ok h2h_write_all fd h2h_t_call_af
+else
+ok = and ok h2h_write_all fd h2h_t_call_ov
+end
+end
+ok = and ok h2h_write_all fd h2h_t_nl
+ok = and ok h2h_write_all fd h2h_t_par
+h2h_write_u64 fd get par ok
+ok = and ok h2h_write_all fd h2h_t_elems
+h2h_write_u64 fd get par elem_n
+ok = and ok h2h_write_all fd h2h_t_mis
+h2h_write_u64 fd get par mismatches
+ok = and ok h2h_write_all fd h2h_t_nan
+h2h_write_u64 fd get par nan_cnt
+ok = and ok h2h_write_all fd h2h_t_inf
+h2h_write_u64 fd get par inf_cnt
+ok = and ok h2h_write_all fd h2h_t_mabs
+h2h_write_f64_6 fd get par max_abs
+ok = and ok h2h_write_all fd h2h_t_mrel
+h2h_write_f64_6 fd get par max_rel
+ok = and ok h2h_write_all fd h2h_t_nl
+ok = and ok h2h_write_all fd h2h_t_mut
+h2h_write_u64 fd get sum mutant_checked
+ok = and ok h2h_write_all fd h2h_t_caught
+h2h_write_u64 fd get sum mutant_caught
+ok = and ok h2h_write_all fd h2h_t_nl
+if ok
+ret
+end
+end
+
+fn h2h_is_ws b uchar to bool
+ret or eq b 32 or eq b 9 eq b 13
+end
+
+fn h2h_skip_ws buf view uchar * pos ulong endpos ulong to ulong
+p = pos
+while lt p endpos bound 1024
+if not h2h_is_ws get buf p
+break
+end
+p = add p 1
+end
+ret p
+end
+
+fn h2h_next_tok_end buf view uchar * pos ulong endpos ulong to ulong
+p = pos
+while lt p endpos bound 1024
+if h2h_is_ws get buf p
+break
+end
+p = add p 1
+end
+ret p
+end
+
+fn h2h_tok_eq buf view uchar * s ulong e ulong lit view uchar * to bool
+ln = len lit
+if ne sub e s ln
+ret false
+end
+i = ulong 0
+while lt i ln bound 64
+if ne get buf add s i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn h2h_parse_u64_ok buf view uchar * s ulong e ulong to bool
+if ge s e
+ret false
+end
+if gt sub e s 20
+ret false
+end
+i = s
+while lt i e bound 24
+c = get buf i
+if or lt c 48 gt c 57
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn h2h_parse_u64_val buf view uchar * s ulong e ulong to ulong
+acc = ulong 0
+i = s
+while lt i e bound 24
+d = ulong sub get buf i 48
+acc = add mul acc 10 d
+i = add i 1
+end
+ret acc
+end
+
+fn h2h_parse_f64_ok buf view uchar * s ulong e ulong to bool
+if ge s e
+ret false
+end
+if gt sub e s 32
+ret false
+end
+i = s
+if or eq get buf i 45 eq get buf i 43
+i = add i 1
+end
+if ge i e
+ret false
+end
+digits = ulong 0
+dots = ulong 0
+while lt i e bound 32
+c = get buf i
+if and ge c 48 le c 57
+digits = add digits 1
+else
+if eq c 46
+dots = add dots 1
+if gt dots 1
+ret false
+end
+else
+if or eq c 101 eq c 69
+if eq digits 0
+ret false
+end
+i = add i 1
+if lt i e
+if or eq get buf i 45 eq get buf i 43
+i = add i 1
+end
+end
+edig = ulong 0
+while lt i e bound 16
+ec = get buf i
+if or lt ec 48 gt ec 57
+ret false
+end
+edig = add edig 1
+i = add i 1
+end
+ret gt edig 0
+else
+ret false
+end
+end
+end
+i = add i 1
+end
+ret gt digits 0
+end
+
+fn h2h_pow10_f64 exp int to f64
+res = 1.0f64
+if gt exp 0
+e = ulong exp
+if gt e 300
+e = ulong 300
+end
+i = ulong 0
+while lt i e bound 301
+res = mul res 10.0f64
+i = add i 1
+end
+else
+if lt exp 0
+e = ulong neg exp
+if gt e 300
+e = ulong 300
+end
+i = ulong 0
+while lt i e bound 301
+res = div res 10.0f64
+i = add i 1
+end
+end
+end
+ret res
+end
+
+fn h2h_parse_exp buf view uchar * pos ulong e ulong to int
+i = pos
+sgn = int 1
+if lt i e
+if eq get buf i 45
+sgn = int -1
+i = add i 1
+else
+if eq get buf i 43
+i = add i 1
+end
+end
+end
+ev = int 0
+while lt i e bound 16
+ed = int sub get buf i 48
+ev = add mul ev 10 ed
+i = add i 1
+end
+ret mul sgn ev
+end
+
+fn h2h_parse_f64_val buf view uchar * s ulong e ulong to f64
+i = s
+is_neg = false
+if eq get buf i 45
+is_neg = true
+i = add i 1
+else
+if eq get buf i 43
+i = add i 1
+end
+end
+val = 0.0f64
+frac_div = 1.0f64
+in_frac = false
+exp_total = int 0
+while lt i e bound 32
+c = get buf i
+if and ge c 48 le c 57
+d = f64 sub c 48
+if in_frac
+frac_div = mul frac_div 10.0f64
+val = add val div d frac_div
+else
+val = add mul val 10.0f64 d
+end
+else
+if eq c 46
+in_frac = true
+else
+if or eq c 101 eq c 69
+exp_total = h2h_parse_exp buf add i 1 e
+break
+end
+end
+end
+i = add i 1
+end
+if ne exp_total 0
+val = mul val h2h_pow10_f64 exp_total
+end
+if is_neg
+val = neg val
+end
+ret val
+end

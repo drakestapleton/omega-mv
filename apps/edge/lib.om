@@ -1,0 +1,964 @@
+note aien-edge: pure Omega static edge HTTP router, path sanitizer, security header builder, and HTML renderer.
+note Ported from upstream aien-edge (src/site.rs, src/handler.rs, src/config.rs).
+note Compose with si/directives/om2.om before this file.
+
+const EDGE_METHOD_BAD ulong 0
+const EDGE_METHOD_GET ulong 1
+const EDGE_METHOD_HEAD ulong 2
+const EDGE_METHOD_OTHER ulong 3
+
+const EDGE_SCHEME_HTTP ulong 0
+const EDGE_SCHEME_REDIRECT ulong 1
+const EDGE_SCHEME_HTTPS ulong 2
+
+const EDGE_ENC_IDENTITY ulong 0
+const EDGE_ENC_GZIP ulong 1
+const EDGE_ENC_BR ulong 2
+
+struct EdgeReq method ulong path_off ulong path_len ulong ok ulong end
+struct EdgeResp status ulong body_len ulong no_script ulong is_html ulong is_asset ulong end
+
+text edge_t_get "GET"
+text edge_t_head "HEAD"
+text edge_t_post "POST"
+text edge_t_put "PUT"
+text edge_t_del "DELETE"
+text edge_t_http11 "HTTP/1.1"
+text edge_t_http10 "HTTP/1.0"
+text edge_t_wellknown ".well-known"
+text edge_t_map ".map"
+text edge_t_assets "assets/"
+text edge_t_hive_board "hive/board"
+text edge_t_hive_board_idx "hive/board/index.html"
+text edge_t_index "index.html"
+text edge_t_health "health"
+text edge_t_app_css "assets/app.css"
+text edge_t_sec_txt ".well-known/security.txt"
+
+text edge_t_amp "&amp;"
+text edge_t_lt "&lt;"
+text edge_t_gt "&gt;"
+text edge_t_quot "&quot;"
+text edge_t_apos "&#39;"
+
+text edge_h_200 "HTTP/1.1 200 OK"
+text edge_h_400 "HTTP/1.1 400 Bad Request"
+text edge_h_403 "HTTP/1.1 403 Forbidden"
+text edge_h_404 "HTTP/1.1 404 Not Found"
+text edge_h_405 "HTTP/1.1 405 Method Not Allowed"
+text edge_h_allow "Allow: GET, HEAD"
+
+text edge_h_srv "Server: aien-edge"
+text edge_h_nosniff "X-Content-Type-Options: nosniff"
+text edge_h_ref "Referrer-Policy: strict-origin-when-cross-origin"
+text edge_h_xfo "X-Frame-Options: DENY"
+text edge_h_perm "Permissions-Policy: camera=(), microphone=(), geolocation=()"
+text edge_h_vary "Vary: Accept-Encoding"
+text edge_h_hsts "Strict-Transport-Security: max-age=31536000"
+text edge_h_csp_default "Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'none'"
+text edge_h_csp_noscript "Content-Security-Policy: default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; script-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+text edge_h_cc_asset "Cache-Control: public, max-age=31536000, immutable"
+text edge_h_cc_html "Cache-Control: public, max-age=0, must-revalidate"
+text edge_h_cc_other "Cache-Control: public, max-age=3600"
+text edge_h_ct_html "Content-Type: text/html; charset=utf-8"
+text edge_h_ct_text "Content-Type: text/plain; charset=utf-8"
+text edge_h_ct_css "Content-Type: text/css; charset=utf-8"
+text edge_h_cl "Content-Length: "
+
+text edge_p_head1 "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>"
+text edge_p_head2 "</title></head>\n<body><h1>"
+text edge_p_mid "</h1><p>"
+text edge_p_foot "</p></body>\n</html>\n"
+
+text edge_t_home_title "AIEN Edge"
+text edge_t_home_body "Deterministic pure-Omega static edge server."
+text edge_t_board_title "Hive Board"
+text edge_t_board_body "Read-only Hive Board surface served under strict no-script CSP."
+text edge_t_400_title "400 Bad Request"
+text edge_t_400_body "Request rejected by strict edge parser or path sanitizer."
+text edge_t_403_title "403 Forbidden"
+text edge_t_403_body "Access to traversal, hidden dotfile, or sourcemap path refused."
+text edge_t_404_title "404 Not Found"
+text edge_t_404_prefix "Resource not found: "
+text edge_t_405_title "405 Method Not Allowed"
+text edge_t_405_body "Only GET and HEAD methods are permitted."
+text edge_t_health_body "ok\n"
+text edge_t_css_body "body{font:16px/1.5 system-ui,sans-serif;margin:2rem auto;max-width:44rem}\n"
+text edge_t_sec_body "Contact: mailto:security@aienos.com\nPreferred-Languages: en\n"
+
+text edge_t_br "br"
+text edge_t_gzip "gzip"
+text edge_t_q0 "q=0"
+text edge_t_q00 "q=0.0"
+text edge_t_q000 "q=0.00"
+text edge_t_q0000 "q=0.000"
+
+fn edge_to_lower c uchar to uchar
+if ge c 65
+if le c 90
+ret add c 32
+end
+end
+ret c
+end
+
+fn edge_hex_val c uchar to int
+if ge c 48
+if le c 57
+ret int sub c 48
+end
+end
+if ge c 97
+if le c 102
+ret int add sub c 97 10
+end
+end
+if ge c 65
+if le c 70
+ret int add sub c 65 10
+end
+end
+ret -1
+end
+
+fn edge_eq_bytes a view uchar * b view uchar * to bool
+n = len a
+if ne n len b
+ret false
+end
+i = ulong 0
+while lt i n bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn edge_eq_ci a view uchar * b view uchar * to bool
+n = len a
+if ne n len b
+ret false
+end
+i = ulong 0
+while lt i n bound 65536
+if ne edge_to_lower get a i edge_to_lower get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn edge_starts_with a view uchar * pfx view uchar * to bool
+pn = len pfx
+if lt len a pn
+ret false
+end
+i = ulong 0
+while lt i pn bound 65536
+if ne get a i get pfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn edge_ends_with a view uchar * sfx view uchar * to bool
+sn = len sfx
+an = len a
+if lt an sn
+ret false
+end
+base = sub an sn
+i = ulong 0
+while lt i sn bound 65536
+if ne get a add base i get sfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn edge_append dst edit uchar * pos ulong src view uchar * to long
+n = len src
+if gt add pos n len dst
+ret -1
+end
+i = ulong 0
+while lt i n bound 65536
+put dst add pos i get src i
+i = add i 1
+end
+ret long add pos n
+end
+
+fn edge_append_u64 dst edit uchar * pos ulong val ulong to long
+tmp = new uchar 24 0
+cnt = ulong 0
+v = val
+if eq v 0
+put tmp 0 uchar 48
+cnt = ulong 1
+else
+while gt v 0 bound 24
+d = rem v 10
+put tmp cnt uchar add d 48
+v = div v 10
+cnt = add cnt 1
+end
+end
+if gt add pos cnt len dst
+ret -1
+end
+i = ulong 0
+while lt i cnt bound 24
+put dst add pos i get tmp sub sub cnt 1 i
+i = add i 1
+end
+ret long add pos cnt
+end
+
+fn edge_escape_html dst edit uchar * pos ulong src view uchar * to long
+n = len src
+p = pos
+i = ulong 0
+while lt i n bound 65536
+c = get src i
+if eq c 38
+np = edge_append dst p edge_t_amp
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 60
+np = edge_append dst p edge_t_lt
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 62
+np = edge_append dst p edge_t_gt
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 34
+np = edge_append dst p edge_t_quot
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 39
+np = edge_append dst p edge_t_apos
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if ge p len dst
+ret -1
+end
+put dst p c
+p = add p 1
+end
+end
+end
+end
+end
+i = add i 1
+end
+ret long p
+end
+
+fn edge_bad_path_byte b uchar to bool
+if lt b 32
+ret true
+end
+if eq b 127
+ret true
+end
+if eq b 92
+ret true
+end
+ret false
+end
+
+fn edge_decode_pct raw view uchar * i ulong to int
+if gt add i 3 len raw
+ret -1
+end
+hi = edge_hex_val get raw add i 1
+if lt hi 0
+ret -1
+end
+lo = edge_hex_val get raw add i 2
+if lt lo 0
+ret -1
+end
+ret add mul hi 16 lo
+end
+
+note Percent-decode raw URI path up to '?' or '#'.
+note Returns decoded length >= 0, -1 malformed %XX, -2 NUL/control/backslash, -4 overflow.
+fn edge_percent_decode raw view uchar * dst edit uchar * to long
+n = len raw
+i = ulong 0
+w = ulong 0
+while lt i n bound 8192
+c = get raw i
+if eq c 63
+break
+end
+if eq c 35
+break
+end
+b = c
+if eq c 37
+v = edge_decode_pct raw i
+if lt v 0
+ret -1
+end
+b = uchar v
+i = add i 3
+else
+i = add i 1
+end
+if edge_bad_path_byte b
+ret -2
+end
+if ge w len dst
+ret -4
+end
+put dst w b
+w = add w 1
+end
+ret long w
+end
+
+note Check one decoded path segment: 0=skip, 1=keep, -3=refuse (.. or hidden dotfile except .well-known).
+fn edge_check_segment seg view uchar * to int
+n = len seg
+if eq n 0
+ret 0
+end
+if eq n 1
+if eq get seg 0 46
+ret 0
+end
+ret 1
+end
+if eq n 2
+if eq get seg 0 46
+if eq get seg 1 46
+ret -3
+end
+end
+end
+if eq get seg 0 46
+if edge_eq_bytes seg edge_t_wellknown
+ret 1
+end
+ret -3
+end
+ret 1
+end
+
+note Normalize URL path: percent-decode, reject NUL/control/backslash/traversal/hidden/.map.
+note Returns normalized length >= 0, -1 bad hex (400), -2 NUL/ctrl/backslash (400), -3 traversal/hidden/map (403), -4 overflow.
+fn edge_normalize_path raw view uchar * dst edit uchar * to long
+dec = new uchar 2048 0
+dlen = edge_percent_decode raw dec
+if lt dlen 0
+ret dlen
+end
+dn = ulong dlen
+w = ulong 0
+i = ulong 0
+while lt i dn bound 2048
+start = i
+while lt i dn bound 2048
+if eq get dec i 47
+break
+end
+i = add i 1
+end
+slen = sub i start
+if lt i dn
+i = add i 1
+end
+verdict = edge_check_segment part dec start slen
+if lt verdict 0
+ret long verdict
+end
+if eq verdict 1
+if gt w 0
+if ge w len dst
+ret -4
+end
+put dst w uchar 47
+w = add w 1
+end
+nw = edge_append dst w part dec start slen
+if lt nw 0
+ret -4
+end
+w = ulong nw
+end
+end
+if edge_ends_with part dst 0 w edge_t_map
+ret -3
+end
+ret long w
+end
+
+note Normalize Host header: strip :port, strip trailing '.', lowercase ASCII.
+note Returns length >= 0, or -1 if invalid.
+fn edge_normalize_host raw view uchar * dst edit uchar * to long
+n = len raw
+if eq n 0
+ret -1
+end
+colon = n
+i = ulong 0
+while lt i n bound 512
+c = get raw i
+if le c 32
+ret -1
+end
+if eq c 127
+ret -1
+end
+if eq c 47
+ret -1
+end
+if eq c 58
+colon = i
+end
+i = add i 1
+end
+endp = n
+if lt colon n
+all_dig = true
+j = add colon 1
+if eq j n
+all_dig = false
+end
+while lt j n bound 16
+dc = get raw j
+if lt dc 48
+all_dig = false
+end
+if gt dc 57
+all_dig = false
+end
+j = add j 1
+end
+if all_dig
+endp = colon
+end
+end
+while gt endp 0 bound 512
+if ne get raw sub endp 1 46
+break
+end
+endp = sub endp 1
+end
+if eq endp 0
+ret -1
+end
+if gt endp len dst
+ret -1
+end
+k = ulong 0
+while lt k endp bound 512
+put dst k edge_to_lower get raw k
+k = add k 1
+end
+ret long endp
+end
+
+note Check if Accept-Encoding header allows encoding `name` without q=0.
+fn edge_tok_allows tok view uchar * name view uchar * to bool
+tn = len tok
+start = ulong 0
+while lt start tn bound 256
+if ne get tok start 32
+if ne get tok start 9
+break
+end
+end
+start = add start 1
+end
+semi = start
+while lt semi tn bound 256
+if eq get tok semi 59
+break
+end
+semi = add semi 1
+end
+cend = semi
+while gt cend start bound 256
+c = get tok sub cend 1
+if ne c 32
+if ne c 9
+break
+end
+end
+cend = sub cend 1
+end
+if not edge_eq_ci part tok start sub cend start name
+ret false
+end
+if ge semi tn
+ret true
+end
+p = add semi 1
+while lt p tn bound 256
+while lt p tn bound 256
+if ne get tok p 32
+if ne get tok p 9
+break
+end
+end
+p = add p 1
+end
+qend = p
+while lt qend tn bound 256
+if eq get tok qend 59
+break
+end
+qend = add qend 1
+end
+te = qend
+while gt te p bound 256
+c = get tok sub te 1
+if ne c 32
+if ne c 9
+break
+end
+end
+te = sub te 1
+end
+if edge_eq_ci part tok p sub te p edge_t_q0
+ret false
+end
+if edge_eq_ci part tok p sub te p edge_t_q00
+ret false
+end
+if edge_eq_ci part tok p sub te p edge_t_q000
+ret false
+end
+if edge_eq_ci part tok p sub te p edge_t_q0000
+ret false
+end
+p = add qend 1
+end
+ret true
+end
+
+fn edge_accept_allows hdr view uchar * name view uchar * to bool
+n = len hdr
+i = ulong 0
+while lt i n bound 1024
+start = i
+while lt i n bound 1024
+if eq get hdr i 44
+break
+end
+i = add i 1
+end
+if edge_tok_allows part hdr start sub i start name
+ret true
+end
+if lt i n
+i = add i 1
+end
+end
+ret false
+end
+
+fn edge_pick_encoding hdr view uchar * has_br bool has_gzip bool to ulong
+if has_br
+if edge_accept_allows hdr edge_t_br
+ret EDGE_ENC_BR
+end
+end
+if has_gzip
+if edge_accept_allows hdr edge_t_gzip
+ret EDGE_ENC_GZIP
+end
+end
+ret EDGE_ENC_IDENTITY
+end
+
+fn edge_find_sp line view uchar * start ulong n ulong to long
+i = start
+while lt i n bound 2048
+c = get line i
+if lt c 32
+ret -1
+end
+if eq c 127
+ret -1
+end
+if eq c 32
+ret long i
+end
+i = add i 1
+end
+ret -1
+end
+
+fn edge_classify_method m view uchar * to ulong
+if edge_eq_bytes m edge_t_get
+ret EDGE_METHOD_GET
+end
+if edge_eq_bytes m edge_t_head
+ret EDGE_METHOD_HEAD
+end
+if edge_eq_bytes m edge_t_post
+ret EDGE_METHOD_OTHER
+end
+if edge_eq_bytes m edge_t_put
+ret EDGE_METHOD_OTHER
+end
+if edge_eq_bytes m edge_t_del
+ret EDGE_METHOD_OTHER
+end
+ret EDGE_METHOD_BAD
+end
+
+fn edge_valid_http_ver v view uchar * to bool
+if edge_eq_bytes v edge_t_http11
+ret true
+end
+ret edge_eq_bytes v edge_t_http10
+end
+
+note Parse HTTP request line: "METHOD TARGET HTTP/1.1"
+fn edge_parse_req_line line view uchar * req edit EdgeReq to bool
+put req ok ulong 0
+put req method EDGE_METHOD_BAD
+n = len line
+if gt n 0
+if eq get line sub n 1 10
+n = sub n 1
+end
+end
+if gt n 0
+if eq get line sub n 1 13
+n = sub n 1
+end
+end
+if lt n 12
+ret false
+end
+s1 = edge_find_sp line 0 n
+if le s1 0
+ret false
+end
+s2 = edge_find_sp line add ulong s1 1 n
+if le s2 add s1 1
+ret false
+end
+voff = add ulong s2 1
+if not edge_valid_http_ver part line voff sub n voff
+ret false
+end
+m = edge_classify_method part line 0 ulong s1
+if eq m EDGE_METHOD_BAD
+ret false
+end
+put req method m
+put req path_off add ulong s1 1
+put req path_len sub ulong s2 add ulong s1 1
+put req ok ulong 1
+ret true
+end
+
+note Deterministic HTML page renderer with strict escaping of title and body.
+fn edge_render_html dst edit uchar * title view uchar * body view uchar * to long
+p = edge_append dst 0 edge_p_head1
+if lt p 0
+ret -1
+end
+p = edge_escape_html dst ulong p title
+if lt p 0
+ret -1
+end
+p = edge_append dst ulong p edge_p_head2
+if lt p 0
+ret -1
+end
+p = edge_escape_html dst ulong p title
+if lt p 0
+ret -1
+end
+p = edge_append dst ulong p edge_p_mid
+if lt p 0
+ret -1
+end
+p = edge_escape_html dst ulong p body
+if lt p 0
+ret -1
+end
+ret edge_append dst ulong p edge_p_foot
+end
+
+note Check if normalized path is under /hive/board/ (requires strict no-script CSP).
+fn edge_is_hive_board norm view uchar * to bool
+if edge_eq_bytes norm edge_t_hive_board
+ret true
+end
+if edge_starts_with norm edge_t_hive_board
+if gt len norm 10
+if eq get norm 10 47
+ret true
+end
+end
+end
+ret false
+end
+
+fn edge_append_crlf dst edit uchar * pos ulong to long
+if gt add pos 2 len dst
+ret -1
+end
+put dst pos uchar 13
+put dst add pos 1 uchar 10
+ret long add pos 2
+end
+
+fn edge_append_line dst edit uchar * pos ulong src view uchar * to long
+p = edge_append dst pos src
+if lt p 0
+ret -1
+end
+ret edge_append_crlf dst ulong p
+end
+
+note Emit HTTP response headers including security headers, CSP, Cache-Control, Content-Type, Content-Length.
+fn edge_emit_sec_lines dst edit uchar * pos ulong to long
+p = edge_append_line dst pos edge_h_srv
+if lt p 0
+ret -1
+end
+p = edge_append_line dst ulong p edge_h_nosniff
+if lt p 0
+ret -1
+end
+p = edge_append_line dst ulong p edge_h_ref
+if lt p 0
+ret -1
+end
+p = edge_append_line dst ulong p edge_h_xfo
+if lt p 0
+ret -1
+end
+p = edge_append_line dst ulong p edge_h_perm
+if lt p 0
+ret -1
+end
+ret edge_append_line dst ulong p edge_h_vary
+end
+
+fn edge_emit_headers dst edit uchar * meta view EdgeResp scheme ulong to long
+st = get meta status
+p = long 0
+if eq st 200
+p = edge_append_line dst 0 edge_h_200
+else
+if eq st 400
+p = edge_append_line dst 0 edge_h_400
+else
+if eq st 403
+p = edge_append_line dst 0 edge_h_403
+else
+if eq st 404
+p = edge_append_line dst 0 edge_h_404
+else
+p = edge_append_line dst 0 edge_h_405
+if lt p 0
+ret -1
+end
+p = edge_append_line dst ulong p edge_h_allow
+end
+end
+end
+end
+if lt p 0
+ret -1
+end
+p = edge_emit_sec_lines dst ulong p
+if lt p 0
+ret -1
+end
+if eq scheme EDGE_SCHEME_HTTPS
+p = edge_append_line dst ulong p edge_h_hsts
+if lt p 0
+ret -1
+end
+end
+if eq get meta no_script 1
+p = edge_append_line dst ulong p edge_h_csp_noscript
+else
+p = edge_append_line dst ulong p edge_h_csp_default
+end
+if lt p 0
+ret -1
+end
+if eq get meta is_asset 1
+p = edge_append_line dst ulong p edge_h_cc_asset
+else
+if eq get meta is_html 1
+p = edge_append_line dst ulong p edge_h_cc_html
+else
+p = edge_append_line dst ulong p edge_h_cc_other
+end
+end
+if lt p 0
+ret -1
+end
+if eq get meta is_html 1
+p = edge_append_line dst ulong p edge_h_ct_html
+else
+if eq get meta is_asset 1
+p = edge_append_line dst ulong p edge_h_ct_css
+else
+p = edge_append_line dst ulong p edge_h_ct_text
+end
+end
+if lt p 0
+ret -1
+end
+p = edge_append dst ulong p edge_h_cl
+if lt p 0
+ret -1
+end
+p = edge_append_u64 dst ulong p get meta body_len
+if lt p 0
+ret -1
+end
+ret edge_append_crlf dst ulong p
+end
+
+note Build 404 body with strict HTML escaping of the requested path.
+fn edge_build_404_body dst edit uchar * norm view uchar * to long
+msg = new uchar 2200 0
+m = edge_append msg 0 edge_t_404_prefix
+if lt m 0
+ret -1
+end
+m = edge_append msg ulong m norm
+if lt m 0
+ret -1
+end
+ret edge_render_html dst edge_t_404_title part msg 0 ulong m
+end
+
+fn edge_dispatch_norm norm view uchar * body edit uchar * meta edit EdgeResp to long
+if edge_is_hive_board norm
+put meta no_script ulong 1
+end
+if eq len norm 0
+put meta status ulong 200
+ret edge_render_html body edge_t_home_title edge_t_home_body
+end
+if edge_eq_bytes norm edge_t_index
+put meta status ulong 200
+ret edge_render_html body edge_t_home_title edge_t_home_body
+end
+if edge_eq_bytes norm edge_t_hive_board
+put meta status ulong 200
+ret edge_render_html body edge_t_board_title edge_t_board_body
+end
+if edge_eq_bytes norm edge_t_hive_board_idx
+put meta status ulong 200
+ret edge_render_html body edge_t_board_title edge_t_board_body
+end
+if edge_eq_bytes norm edge_t_health
+put meta status ulong 200
+put meta is_html ulong 0
+ret edge_append body 0 edge_t_health_body
+end
+if edge_eq_bytes norm edge_t_app_css
+put meta status ulong 200
+put meta is_html ulong 0
+put meta is_asset ulong 1
+ret edge_append body 0 edge_t_css_body
+end
+if edge_eq_bytes norm edge_t_sec_txt
+put meta status ulong 200
+put meta is_html ulong 0
+ret edge_append body 0 edge_t_sec_body
+end
+put meta status ulong 404
+ret edge_build_404_body body norm
+end
+
+fn edge_route_path raw_path view uchar * body edit uchar * meta edit EdgeResp to long
+norm = new uchar 2048 0
+nlen = edge_normalize_path raw_path norm
+if lt nlen 0
+if eq nlen -3
+put meta status ulong 403
+ret edge_render_html body edge_t_403_title edge_t_403_body
+end
+put meta status ulong 400
+ret edge_render_html body edge_t_400_title edge_t_400_body
+end
+ret edge_dispatch_norm part norm 0 ulong nlen body meta
+end
+
+note Route an HTTP request line and emit complete deterministic HTTP/1.1 response.
+note Returns response byte length >= 0 (and populates meta.status), or -1 on buffer overflow.
+fn edge_handle_request req_line view uchar * scheme ulong resp edit uchar * meta edit EdgeResp to long
+put meta status ulong 400
+put meta body_len ulong 0
+put meta no_script ulong 0
+put meta is_html ulong 1
+put meta is_asset ulong 0
+req = new EdgeReq 0 0 0 0
+body = new uchar 4096 0
+blen = long 0
+is_head = false
+if not edge_parse_req_line req_line req
+put meta status ulong 400
+blen = edge_render_html body edge_t_400_title edge_t_400_body
+else
+m = get req method
+if eq m EDGE_METHOD_OTHER
+put meta status ulong 405
+blen = edge_render_html body edge_t_405_title edge_t_405_body
+else
+if eq m EDGE_METHOD_HEAD
+is_head = true
+end
+blen = edge_route_path part req_line get req path_off get req path_len body meta
+end
+end
+if lt blen 0
+ret -1
+end
+put meta body_len ulong blen
+hp = edge_emit_headers resp meta scheme
+if lt hp 0
+ret -1
+end
+hp = edge_append_crlf resp ulong hp
+if lt hp 0
+ret -1
+end
+if is_head
+ret hp
+end
+ret edge_append resp ulong hp part body 0 ulong blen
+end

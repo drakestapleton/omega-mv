@@ -7,7 +7,7 @@ Two crumb files already under evidence/ stay, because existing evidence is never
 
 ## `aienux/`
 
-Aienux, the OS layer of Sovereign Intelligence (SI), mirroring `gpu/`: pure-Omega units moved here from canonical Aienux (`rad:z2Q6ob2gL6Qo5oUMpyehukayVF7mN`, `1f12818d`) plus its OS-layer siblings `rtl8127-omega`, `spark-supervisor`, and `spark-connector` with full Git history. `aienux/README.md` gives the layout and `aienux/UNITS.md` lists the 67 verified units.
+Aienux, the OS layer of Sovereign Intelligence (SI), mirroring `gpu/`: pure-Omega units moved here from canonical Aienux (`rad:z2Q6ob2gL6Qo5oUMpyehukayVF7mN`, `1f12818d`) plus its OS-layer siblings `rtl8127-omega`, `spark-supervisor`, and `spark-connector` with full Git history, and pure-Omega conversions of `atlas` (`aienux/atlas/`), `pi-register` (`aienux/pi-register/`), and `spark-debugger` (`aienux/debugger/`). `aienux/README.md` gives the layout and `aienux/UNITS.md` lists the 73 verified units.
 
 Rules:
 
@@ -18,7 +18,7 @@ Rules:
 
 ## `apps/`
 
-User-facing Sovereign Intelligence applications, Forge, web generators and publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex`), mirroring `gpu/`: pure-Omega `.om` units only, moved with full Git history (`apps/import/`), gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 119 units). Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
+User-facing Sovereign Intelligence applications, Forge, web generators and publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex` moved with full Git history under `apps/import/`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, and `aien-translate`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 127 units). Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
 
 ## `bridge/`
 
@@ -26,15 +26,15 @@ Compatibility, conversion and ecosystem bindings of Sovereign Intelligence: exis
 
 ## `core/`
 
-Runtime, memory, recursive self-improvement, mission orchestration and agent core of Sovereign Intelligence (`aien-sovereign-core-mv`, `aien`, `cortex`, `spark-rsi-mv`, `omega-mission`, `hive-view`), mirroring `gpu/`: pure-Omega `.om` units only, moved with full Git history (`core/import/`), gated by `core/units-gate.om` (`OMEGA-CORE-UNITS`, 32 units). Remaining non-Omega files stay upstream (`core/NOT-YET-OMEGA.tsv`).
+Runtime, memory, recursive self-improvement, mission orchestration and agent core of Sovereign Intelligence (`aien-sovereign-core-mv`, `aien`, `cortex`, `spark-rsi-mv`, `omega-mission`, `hive-view` moved with full Git history under `core/import/`, plus pure-Omega conversions of `hive-not-swarm`, `spark-dream`, `spark-hive`, `mobhub`, `openclaw-rs`, and `aegis-runtime-mv`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `core/units-gate.om` (`OMEGA-CORE-UNITS`, 44 units). Remaining non-Omega files stay upstream (`core/NOT-YET-OMEGA.tsv`).
 
 ## `protocol/`
 
-Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp`), mirroring `gpu/`: pure-Omega `.om` units only, moved with full Git history (`protocol/import/`), gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 17 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
+Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp` moved with full Git history under `protocol/import/`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity`, and `synapse` under `protocol/synapse/core/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 23 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
 
 ## `si/`
 
-Sovereign Intelligence front-door tools, architecture/benchmark/receipt checkers, Omega MCP server, harness examples, Rosetta corpus, editor fixtures and master integration ledger (`si/STACK.tsv`), mirroring `gpu/`: pure-Omega `.om` units only (`sovereign-intelligence`, `aien-architecture-mv`, `benchmarks-mv`, `aien-receipts`, `omega-mcp`, `omega-harness`, `omega-rosetta`, `tree-sitter-omega`, `vscode-omega`, `omega-packages`), moved with full Git history (`si/import/`), gated by `si/units-gate.om` (`OMEGA-SI-UNITS`, 487 units). `si/directives/` holds shared 1-line `.om` directives (`om2.om`, `target-*.om`). Remaining non-Omega files and zero-`.om` SI repositories are indexed in `si/STACK.tsv` and `si/NOT-YET-OMEGA.tsv`.
+Sovereign Intelligence front-door tools, architecture/benchmark/receipt checkers, Omega MCP server, harness examples, Rosetta corpus, editor fixtures and master integration ledger (`si/STACK.tsv`), mirroring `gpu/`: pure-Omega `.om` units only (`sovereign-intelligence`, `aien-architecture-mv`, `benchmarks-mv`, `aien-receipts`, `omega-mcp`, `omega-harness`, `omega-rosetta`, `tree-sitter-omega`, `vscode-omega`, `omega-packages` moved with full Git history under `si/import/`, plus pure-Omega conversions of `omega-seed-challenge`, `homebrew-omega`, `harvester`, `aien-harness`, `agent-archive`, and `spark-inquisitor`), gated by `si/units-gate.om` (`OMEGA-SI-UNITS`, 499 units). `si/directives/` holds shared 1-line `.om` directives (`om2.om`, `target-*.om`). Every public SI repository is classified in `si/STACK.tsv`, and remaining non-Omega upstream files are indexed in `si/NOT-YET-OMEGA.tsv`.
 
 ## `train/`
 
@@ -118,7 +118,7 @@ Immutable receipts of learner development runs (seeds 1..5 per level, HOLDOUT/TR
 
 ## `gpu/`
 
-Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047): one directory per back end (`gpu/amd/` so far), moved here from CUDApp one piece per landing with the history of its Omega files. `gpu/README.md` gives the layout.
+Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047): one directory per back end (`gpu/amd/`, `gpu/nvidia/`, `gpu/spirv/`, `gpu/hw/`), moved here from CUDApp one piece per landing with the history of its Omega files (`gpu/units.tsv`, 405 units, `OMEGA-GPU-UNITS`), plus `gpu/driver/`, `gpu/cuda-crack/`, and pure-Omega conversions `gpu/adapters/`, `gpu/head-to-head/`, and `gpu/forge/` (gated separately by `gpu/extra-units.tsv` / `gpu/extra-units-gate.om`, 17 units, `OMEGA-GPU-EXTRA-UNITS`). `gpu/README.md` gives the layout.
 
 Rules:
 

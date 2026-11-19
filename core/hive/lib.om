@@ -1,0 +1,936 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/hive/lib.om: Pure-Omega Sovereign Agent Hive Engine with 2D Axial Hexagonal Geometry.
+note Faithful OM-2 library (no om2 line, no fn main) derived from upstream spark-hive
+note (geometry.rs, store.rs, emission.rs).
+note Compose with: si/directives/om2.om core/hive/lib.om <main.om|test.om>
+
+struct HexCoord q int r int end
+
+struct CubeCoord x int y int z int end
+
+struct HiveBounds min_q int max_q int min_r int max_r int cnt uint max_dist int end
+
+note Geometry constants (matching spark-hive/src/geometry.rs)
+const HIVE_DEFAULT_RADIUS f64 88.0
+const HIVE_SQRT3 f64 1.7320508075688773
+
+note Fixed lattice & registry bounds (radius <= 8 -> 17x17 = 289 grid slots)
+const HIVE_GRID_R int 8
+const HIVE_GRID_SPAN int 17
+const HIVE_GRID_CAP ulong 289
+const HIVE_MAX_AGENTS ulong 128
+const HIVE_MAX_TASKS ulong 128
+
+note Cell occupancy states
+const HIVE_CELL_EMPTY uchar 0
+const HIVE_CELL_OCC uchar 1
+const HIVE_CELL_BLOCKED uchar 2
+
+note Agent roles
+const HIVE_ROLE_COORD uchar 0
+const HIVE_ROLE_RESEARCH uchar 1
+const HIVE_ROLE_SOCRATIC uchar 2
+const HIVE_ROLE_VERIFIER uchar 3
+const HIVE_ROLE_ADAPTER uchar 4
+const HIVE_ROLE_WORKER uchar 5
+
+note Placement intents
+const HIVE_INTENT_INDEP uchar 0
+const HIVE_INTENT_JOIN uchar 1
+const HIVE_INTENT_BRANCH uchar 2
+const HIVE_INTENT_MEET uchar 3
+
+note Zoom detail tiers
+const HIVE_TIER_DOT uint 0
+const HIVE_TIER_COMPACT uint 1
+const HIVE_TIER_FULL uint 2
+
+note Forge task states
+const HIVE_TASK_NONE uchar 0
+const HIVE_TASK_OPEN uchar 1
+const HIVE_TASK_CLAIMED uchar 2
+const HIVE_TASK_SUBMITTED uchar 3
+const HIVE_TASK_VERIFIED uchar 4
+const HIVE_TASK_FAILED uchar 5
+
+note Fail-closed status / refusal codes
+const HIVE_OK uint 0
+const HIVE_ERR_OOB uint 1
+const HIVE_ERR_COLLISION uint 2
+const HIVE_ERR_BLOCKED uint 3
+const HIVE_ERR_DUP_AGENT uint 4
+const HIVE_ERR_CAPACITY uint 5
+const HIVE_ERR_NOT_FOUND uint 6
+const HIVE_ERR_NO_ROUTE uint 7
+const HIVE_ERR_CLAIMED uint 8
+const HIVE_ERR_UNAUTH uint 9
+const HIVE_ERR_BAD_ARG uint 10
+
+note Global lattice, agent registry, and task lease state (program-mode state)
+note g_meta: [0]=max_radius [1]=max_agents [2]=agent_cnt [3]=max_tasks [4]=task_cnt [5]=blocked_cnt [6]=revision
+global g_meta int 8
+global g_clock ulong 1
+global g_cell_st uchar 289
+global g_cell_ag uint 289
+global g_ag_act uchar 129
+global g_ag_q int 129
+global g_ag_r int 129
+global g_ag_role uchar 129
+global g_ag_load uint 129
+global g_ag_cap uint 129
+global g_tk_st uchar 129
+global g_tk_q int 129
+global g_tk_r int 129
+global g_tk_ring uint 129
+global g_tk_own uint 129
+global g_tk_exp ulong 129
+
+note ---- 2D Axial & Cube Hexagonal Geometry ----
+
+fn hive_abs x int to int
+if lt x 0
+ret neg x
+end
+ret x
+end
+
+fn hive_max2 a int b int to int
+if gt a b
+ret a
+end
+ret b
+end
+
+fn hive_axial_to_cube q int r int dst edit CubeCoord to void
+put dst x q
+put dst y neg add q r
+put dst z r
+end
+
+fn hive_cube_valid c view CubeCoord to bool
+s = add add get c x get c y get c z
+ret eq s 0
+end
+
+fn hive_hex_dist q1 int r1 int q2 int r2 int to int
+dq = sub q1 q2
+dr = sub r1 r2
+ds = add dq dr
+m = hive_max2 hive_abs dq hive_abs dr
+ret hive_max2 m hive_abs ds
+end
+
+fn hive_cube_dist a view CubeCoord b view CubeCoord to int
+dx = hive_abs sub get a x get b x
+dy = hive_abs sub get a y get b y
+dz = hive_abs sub get a z get b z
+ret div add add dx dy dz 2
+end
+
+note 6 canonical axial directions (spark-hive/src/geometry.rs):
+note 0: (+1, 0) East       1: (+1,-1) Northeast  2: ( 0,-1) Northwest
+note 3: (-1, 0) West       4: (-1,+1) Southwest  5: ( 0,+1) Southeast
+
+fn hive_dir_dq d uint to int
+if eq d 0
+ret 1
+end
+if eq d 1
+ret 1
+end
+if eq d 2
+ret 0
+end
+if eq d 3
+ret -1
+end
+if eq d 4
+ret -1
+end
+if eq d 5
+ret 0
+end
+ret 0
+end
+
+fn hive_dir_dr d uint to int
+if eq d 0
+ret 0
+end
+if eq d 1
+ret -1
+end
+if eq d 2
+ret -1
+end
+if eq d 3
+ret 0
+end
+if eq d 4
+ret 1
+end
+if eq d 5
+ret 1
+end
+ret 0
+end
+
+fn hive_neighbor q int r int d uint dst edit HexCoord to bool
+if ge d 6
+ret false
+end
+put dst q add q hive_dir_dq d
+put dst r add r hive_dir_dr d
+ret true
+end
+
+fn hive_neighbors q int r int qs edit int 6 rs edit int 6 to void
+for d ulong 6
+du = uint d
+put qs d add q hive_dir_dq du
+put rs d add r hive_dir_dr du
+end
+end
+
+fn hive_f64_round x f64 to int
+if ge x 0.0f64
+ret int add x 0.5f64
+end
+ret int sub x 0.5f64
+end
+
+fn hive_axial_to_pixel_x q int r int rad f64 to f64
+qf = f64 q
+rf = f64 r
+ret mul mul rad HIVE_SQRT3 add qf div rf 2.0f64
+end
+
+fn hive_axial_to_pixel_y r int rad f64 to f64
+ret mul mul rad 1.5f64 f64 r
+end
+
+fn hive_round_axial cx f64 cz f64 dst edit HexCoord to void
+cy = sub neg cx cz
+rx = f64 hive_f64_round cx
+ry = f64 hive_f64_round cy
+rz = f64 hive_f64_round cz
+dx = fabs sub rx cx
+dy = fabs sub ry cy
+dz = fabs sub rz cz
+if and gt dx dy gt dx dz
+rx = sub neg ry rz
+else
+if gt dz dy
+rz = sub neg rx ry
+end
+end
+put dst q int rx
+put dst r int rz
+end
+
+fn hive_pixel_to_axial x f64 y f64 rad f64 dst edit HexCoord to bool
+if le rad 0.0f64
+ret false
+end
+q = div sub mul div HIVE_SQRT3 3.0f64 x div y 3.0f64 rad
+r = div mul div 2.0f64 3.0f64 y rad
+hive_round_axial q r dst
+ret true
+end
+
+fn hive_detail_tier zoom f64 to uint
+if ge zoom 0.62f64
+ret HIVE_TIER_FULL
+end
+if ge zoom 0.34f64
+ret HIVE_TIER_COMPACT
+end
+ret HIVE_TIER_DOT
+end
+
+note ---- Hex Ring & Spiral Enumeration ----
+
+fn hive_ring ctr view HexCoord k uint qs edit int * rs edit int * to uint
+if eq k 0
+if or lt len qs 1 lt len rs 1
+ret 0
+end
+put qs 0 get ctr q
+put rs 0 get ctr r
+ret 1
+end
+if gt k 32
+ret 0
+end
+if or lt len qs ulong mul k 6 lt len rs ulong mul k 6
+ret 0
+end
+cur_q = add get ctr q mul hive_dir_dq 4 int k
+cur_r = add get ctr r mul hive_dir_dr 4 int k
+idx = ulong 0
+for d ulong 6
+step = uint 0
+while lt step k bound 32
+put qs idx cur_q
+put rs idx cur_r
+idx = add idx 1
+cur_q = add cur_q hive_dir_dq uint d
+cur_r = add cur_r hive_dir_dr uint d
+step = add step 1
+end
+end
+ret uint idx
+end
+
+fn hive_spiral ctr view HexCoord max_k uint qs edit int * rs edit int * to uint
+if gt max_k 16
+ret 0
+end
+tot = ulong 0
+k = uint 0
+while le k max_k bound 17
+need = ulong 1
+if gt k 0
+need = ulong mul k 6
+end
+if or gt add tot need len qs gt add tot need len rs
+ret 0
+end
+got = hive_ring ctr k part qs tot need part rs tot need
+if eq got 0
+ret 0
+end
+tot = add tot ulong got
+k = add k 1
+end
+ret uint tot
+end
+
+note ---- Lattice State, Bounds, Occupancy & Agent Registry ----
+
+fn hive_init max_rad int max_ag uint max_tk uint to uint
+if or lt max_rad 1 gt max_rad HIVE_GRID_R
+ret HIVE_ERR_BAD_ARG
+end
+if or eq max_ag 0 gt ulong max_ag HIVE_MAX_AGENTS
+ret HIVE_ERR_BAD_ARG
+end
+if or eq max_tk 0 gt ulong max_tk HIVE_MAX_TASKS
+ret HIVE_ERR_BAD_ARG
+end
+put g_meta 0 max_rad
+put g_meta 1 int max_ag
+put g_meta 2 0
+put g_meta 3 int max_tk
+put g_meta 4 0
+put g_meta 5 0
+put g_meta 6 0
+put g_clock 0 0
+for i ulong 289
+put g_cell_st i HIVE_CELL_EMPTY
+put g_cell_ag i 0
+end
+for i ulong 129
+put g_ag_act i 0
+put g_ag_q i 0
+put g_ag_r i 0
+put g_ag_role i 0
+put g_ag_load i 0
+put g_ag_cap i 0
+put g_tk_st i HIVE_TASK_NONE
+put g_tk_q i 0
+put g_tk_r i 0
+put g_tk_ring i 0
+put g_tk_own i 0
+put g_tk_exp i 0
+end
+ret HIVE_OK
+end
+
+fn hive_in_bounds q int r int to bool
+if or lt q neg HIVE_GRID_R gt q HIVE_GRID_R
+ret false
+end
+if or lt r neg HIVE_GRID_R gt r HIVE_GRID_R
+ret false
+end
+mrad = get g_meta 0
+ret le hive_hex_dist 0 0 q r mrad
+end
+
+fn hive_slot q int r int to ulong
+qq = add q HIVE_GRID_R
+rr = add r HIVE_GRID_R
+ret ulong add mul qq HIVE_GRID_SPAN rr
+end
+
+fn hive_slot_q sl ulong to int
+ret sub int div sl ulong HIVE_GRID_SPAN HIVE_GRID_R
+end
+
+fn hive_slot_r sl ulong to int
+ret sub int rem sl ulong HIVE_GRID_SPAN HIVE_GRID_R
+end
+
+fn hive_cell_state q int r int to uchar
+if not hive_in_bounds q r
+ret 255
+end
+ret get g_cell_st hive_slot q r
+end
+
+fn hive_cell_agent q int r int to uint
+if not hive_in_bounds q r
+ret 0
+end
+ret get g_cell_ag hive_slot q r
+end
+
+fn hive_block_cell q int r int to uint
+if not hive_in_bounds q r
+ret HIVE_ERR_OOB
+end
+sl = hive_slot q r
+st = get g_cell_st sl
+if eq st HIVE_CELL_OCC
+ret HIVE_ERR_COLLISION
+end
+if eq st HIVE_CELL_BLOCKED
+ret HIVE_ERR_BLOCKED
+end
+put g_cell_st sl HIVE_CELL_BLOCKED
+put g_cell_ag sl 0
+put g_meta 5 add get g_meta 5 1
+put g_meta 6 add get g_meta 6 1
+ret HIVE_OK
+end
+
+fn hive_unblock_cell q int r int to uint
+if not hive_in_bounds q r
+ret HIVE_ERR_OOB
+end
+sl = hive_slot q r
+if ne get g_cell_st sl HIVE_CELL_BLOCKED
+ret HIVE_ERR_BAD_ARG
+end
+put g_cell_st sl HIVE_CELL_EMPTY
+put g_meta 5 sub get g_meta 5 1
+put g_meta 6 add get g_meta 6 1
+ret HIVE_OK
+end
+
+fn hive_place_agent aid uint q int r int role uchar cap uint to uint
+if or eq aid 0 gt ulong aid HIVE_MAX_AGENTS
+ret HIVE_ERR_BAD_ARG
+end
+if eq cap 0
+ret HIVE_ERR_BAD_ARG
+end
+if not hive_in_bounds q r
+ret HIVE_ERR_OOB
+end
+aidx = ulong aid
+if ne get g_ag_act aidx 0
+ret HIVE_ERR_DUP_AGENT
+end
+if ge get g_meta 2 get g_meta 1
+ret HIVE_ERR_CAPACITY
+end
+sl = hive_slot q r
+st = get g_cell_st sl
+if eq st HIVE_CELL_BLOCKED
+ret HIVE_ERR_BLOCKED
+end
+if eq st HIVE_CELL_OCC
+ret HIVE_ERR_COLLISION
+end
+put g_cell_st sl HIVE_CELL_OCC
+put g_cell_ag sl aid
+put g_ag_act aidx 1
+put g_ag_q aidx q
+put g_ag_r aidx r
+put g_ag_role aidx role
+put g_ag_load aidx 0
+put g_ag_cap aidx cap
+put g_meta 2 add get g_meta 2 1
+put g_meta 6 add get g_meta 6 1
+ret HIVE_OK
+end
+
+fn hive_remove_agent aid uint to uint
+if or eq aid 0 gt ulong aid HIVE_MAX_AGENTS
+ret HIVE_ERR_BAD_ARG
+end
+aidx = ulong aid
+if eq get g_ag_act aidx 0
+ret HIVE_ERR_NOT_FOUND
+end
+if gt get g_ag_load aidx 0
+ret HIVE_ERR_CLAIMED
+end
+sl = hive_slot get g_ag_q aidx get g_ag_r aidx
+put g_cell_st sl HIVE_CELL_EMPTY
+put g_cell_ag sl 0
+put g_ag_act aidx 0
+put g_meta 2 sub get g_meta 2 1
+put g_meta 6 add get g_meta 6 1
+ret HIVE_OK
+end
+
+fn hive_find_free parent_id uint dst edit HexCoord to uint
+rqs = new int 96 0
+rrs = new int 96 0
+ctr = new HexCoord 0 0
+if ne parent_id 0
+if gt ulong parent_id HIVE_MAX_AGENTS
+ret HIVE_ERR_NOT_FOUND
+end
+pidx = ulong parent_id
+if eq get g_ag_act pidx 0
+ret HIVE_ERR_NOT_FOUND
+end
+put ctr q get g_ag_q pidx
+put ctr r get g_ag_r pidx
+end
+if hive_in_bounds get ctr q get ctr r
+if eq get g_cell_st hive_slot get ctr q get ctr r HIVE_CELL_EMPTY
+put dst q get ctr q
+put dst r get ctr r
+ret HIVE_OK
+end
+end
+max_k = uint mul get g_meta 0 2
+k = uint 1
+while le k max_k bound 16
+cnt = hive_ring ctr k rqs rrs
+i = uint 0
+while lt i cnt bound 96
+cand_q = get rqs ulong i
+cand_r = get rrs ulong i
+if hive_in_bounds cand_q cand_r
+if eq get g_cell_st hive_slot cand_q cand_r HIVE_CELL_EMPTY
+put dst q cand_q
+put dst r cand_r
+ret HIVE_OK
+end
+end
+i = add i 1
+end
+k = add k 1
+end
+ret HIVE_ERR_CAPACITY
+end
+
+fn hive_place_auto aid uint parent_id uint role uchar cap uint dst edit HexCoord to uint
+rc = hive_find_free parent_id dst
+if ne rc HIVE_OK
+ret rc
+end
+ret hive_place_agent aid get dst q get dst r role cap
+end
+
+fn hive_compute_bounds dst edit HiveBounds to void
+first = true
+mn_q = int 0
+mx_q = int 0
+mn_r = int 0
+mx_r = int 0
+md = int 0
+cnt = uint 0
+i = ulong 1
+while le i HIVE_MAX_AGENTS bound 128
+if ne get g_ag_act i 0
+aq = get g_ag_q i
+ar = get g_ag_r i
+if first
+mn_q = aq
+mx_q = aq
+mn_r = ar
+mx_r = ar
+first = false
+else
+if lt aq mn_q
+mn_q = aq
+end
+if gt aq mx_q
+mx_q = aq
+end
+if lt ar mn_r
+mn_r = ar
+end
+if gt ar mx_r
+mx_r = ar
+end
+end
+d = hive_hex_dist 0 0 aq ar
+if gt d md
+md = d
+end
+cnt = add cnt 1
+end
+i = add i 1
+end
+put dst min_q mn_q
+put dst max_q mx_q
+put dst min_r mn_r
+put dst max_r mx_r
+put dst cnt cnt
+put dst max_dist md
+end
+
+note ---- Shortest-Hop Peer Routing Across Hex Cells (BFS) ----
+
+fn hive_bfs_expand cur ulong vis edit uchar 289 par edit ushort 289 que edit ushort 289 tail edit ulong 1 to void
+cq = hive_slot_q cur
+cr = hive_slot_r cur
+for d ulong 6
+nq = add cq hive_dir_dq uint d
+nr = add cr hive_dir_dr uint d
+if hive_in_bounds nq nr
+nsl = hive_slot nq nr
+if ne get g_cell_st nsl HIVE_CELL_BLOCKED
+if eq get vis nsl 0
+put vis nsl 1
+put par nsl ushort cur
+t = get tail 0
+put que t ushort nsl
+put tail 0 add t 1
+end
+end
+end
+end
+end
+
+fn hive_walk_back ends view ulong 2 par view ushort 289 rev edit ushort 289 to ulong
+src_sl = get ends 0
+cur = get ends 1
+n = ulong 0
+while true bound 289
+put rev n ushort cur
+n = add n 1
+if eq cur src_sl
+break
+end
+cur = ulong get par cur
+end
+ret n
+end
+
+fn hive_reconstruct_path ends view ulong 2 par view ushort 289 path_q edit int * path_r edit int * to int
+rev = new ushort 289 0
+n = hive_walk_back ends par rev
+if or lt len path_q n lt len path_r n
+ret neg int HIVE_ERR_CAPACITY
+end
+i = ulong 0
+while lt i n bound 289
+sl = ulong get rev sub sub n 1 i
+put path_q i hive_slot_q sl
+put path_r i hive_slot_r sl
+i = add i 1
+end
+ret int sub n 1
+end
+
+fn hive_bfs_run ends view ulong 2 par edit ushort 289 to bool
+vis = new uchar 289 0
+que = new ushort 289 0
+tail = new ulong 1 0
+src_sl = get ends 0
+dst_sl = get ends 1
+put vis src_sl 1
+put par src_sl ushort src_sl
+put que 0 ushort src_sl
+put tail 0 1
+head = ulong 0
+while lt head get tail 0 bound 289
+cur = ulong get que head
+head = add head 1
+if eq cur dst_sl
+ret true
+end
+hive_bfs_expand cur vis par que tail
+end
+ret false
+end
+
+fn hive_route src view HexCoord dst view HexCoord path_q edit int * path_r edit int * to int
+par = new ushort 289 0
+ends = new ulong 2 0
+if not hive_in_bounds get src q get src r
+ret neg int HIVE_ERR_OOB
+end
+if not hive_in_bounds get dst q get dst r
+ret neg int HIVE_ERR_OOB
+end
+src_sl = hive_slot get src q get src r
+dst_sl = hive_slot get dst q get dst r
+if eq get g_cell_st src_sl HIVE_CELL_BLOCKED
+ret neg int HIVE_ERR_BLOCKED
+end
+if eq get g_cell_st dst_sl HIVE_CELL_BLOCKED
+ret neg int HIVE_ERR_BLOCKED
+end
+if eq src_sl dst_sl
+if or lt len path_q 1 lt len path_r 1
+ret neg int HIVE_ERR_CAPACITY
+end
+put path_q 0 get src q
+put path_r 0 get src r
+ret 0
+end
+put ends 0 src_sl
+put ends 1 dst_sl
+if not hive_bfs_run ends par
+ret neg int HIVE_ERR_NO_ROUTE
+end
+ret hive_reconstruct_path ends par path_q path_r
+end
+
+note ---- Task Assignment, Lease Lifecycle & Capacity Bounds ----
+
+fn hive_task_create tid uint q int r int ring uint to uint
+if or eq tid 0 gt ulong tid HIVE_MAX_TASKS
+ret HIVE_ERR_BAD_ARG
+end
+if not hive_in_bounds q r
+ret HIVE_ERR_OOB
+end
+if eq get g_cell_st hive_slot q r HIVE_CELL_BLOCKED
+ret HIVE_ERR_BLOCKED
+end
+tidx = ulong tid
+if ne get g_tk_st tidx HIVE_TASK_NONE
+ret HIVE_ERR_COLLISION
+end
+if ge get g_meta 4 get g_meta 3
+ret HIVE_ERR_CAPACITY
+end
+put g_tk_st tidx HIVE_TASK_OPEN
+put g_tk_q tidx q
+put g_tk_r tidx r
+put g_tk_ring tidx ring
+put g_tk_own tidx 0
+put g_tk_exp tidx 0
+put g_meta 4 add get g_meta 4 1
+ret HIVE_OK
+end
+
+fn hive_task_claim tid uint aid uint ttl ulong to uint
+if or eq tid 0 gt ulong tid HIVE_MAX_TASKS
+ret HIVE_ERR_BAD_ARG
+end
+if or eq aid 0 gt ulong aid HIVE_MAX_AGENTS
+ret HIVE_ERR_BAD_ARG
+end
+if eq ttl 0
+ret HIVE_ERR_BAD_ARG
+end
+tidx = ulong tid
+aidx = ulong aid
+tst = get g_tk_st tidx
+if eq tst HIVE_TASK_NONE
+ret HIVE_ERR_NOT_FOUND
+end
+if eq get g_ag_act aidx 0
+ret HIVE_ERR_NOT_FOUND
+end
+now = get g_clock 0
+if eq tst HIVE_TASK_CLAIMED
+old_own = get g_tk_own tidx
+if gt get g_tk_exp tidx now
+if ne old_own aid
+ret HIVE_ERR_CLAIMED
+end
+put g_tk_exp tidx add now ttl
+ret HIVE_OK
+end
+if ne old_own 0
+oidx = ulong old_own
+if gt get g_ag_load oidx 0
+put g_ag_load oidx sub get g_ag_load oidx 1
+end
+end
+else
+if ne tst HIVE_TASK_OPEN
+ret HIVE_ERR_CLAIMED
+end
+end
+if ge get g_ag_load aidx get g_ag_cap aidx
+ret HIVE_ERR_CAPACITY
+end
+put g_tk_st tidx HIVE_TASK_CLAIMED
+put g_tk_own tidx aid
+put g_tk_exp tidx add now ttl
+put g_ag_load aidx add get g_ag_load aidx 1
+ret HIVE_OK
+end
+
+fn hive_task_heartbeat tid uint aid uint ttl ulong to uint
+if or eq tid 0 gt ulong tid HIVE_MAX_TASKS
+ret HIVE_ERR_BAD_ARG
+end
+if eq ttl 0
+ret HIVE_ERR_BAD_ARG
+end
+tidx = ulong tid
+if ne get g_tk_st tidx HIVE_TASK_CLAIMED
+ret HIVE_ERR_NOT_FOUND
+end
+if ne get g_tk_own tidx aid
+ret HIVE_ERR_UNAUTH
+end
+put g_tk_exp tidx add get g_clock 0 ttl
+ret HIVE_OK
+end
+
+fn hive_tick delta ulong to uint
+now = add get g_clock 0 delta
+put g_clock 0 now
+reclaimed = uint 0
+i = ulong 1
+while le i HIVE_MAX_TASKS bound 128
+if eq get g_tk_st i HIVE_TASK_CLAIMED
+if le get g_tk_exp i now
+owner = get g_tk_own i
+if ne owner 0
+oidx = ulong owner
+if gt get g_ag_load oidx 0
+put g_ag_load oidx sub get g_ag_load oidx 1
+end
+end
+put g_tk_st i HIVE_TASK_OPEN
+put g_tk_own i 0
+put g_tk_exp i 0
+reclaimed = add reclaimed 1
+end
+end
+i = add i 1
+end
+ret reclaimed
+end
+
+fn hive_task_submit tid uint aid uint to uint
+if or eq tid 0 gt ulong tid HIVE_MAX_TASKS
+ret HIVE_ERR_BAD_ARG
+end
+tidx = ulong tid
+if ne get g_tk_st tidx HIVE_TASK_CLAIMED
+ret HIVE_ERR_NOT_FOUND
+end
+if ne get g_tk_own tidx aid
+ret HIVE_ERR_UNAUTH
+end
+put g_tk_st tidx HIVE_TASK_SUBMITTED
+ret HIVE_OK
+end
+
+fn hive_task_verify tid uint passed bool to uint
+if or eq tid 0 gt ulong tid HIVE_MAX_TASKS
+ret HIVE_ERR_BAD_ARG
+end
+tidx = ulong tid
+if ne get g_tk_st tidx HIVE_TASK_SUBMITTED
+ret HIVE_ERR_NOT_FOUND
+end
+owner = get g_tk_own tidx
+if ne owner 0
+oidx = ulong owner
+if gt get g_ag_load oidx 0
+put g_ag_load oidx sub get g_ag_load oidx 1
+end
+end
+if passed
+put g_tk_st tidx HIVE_TASK_VERIFIED
+else
+put g_tk_st tidx HIVE_TASK_FAILED
+end
+ret HIVE_OK
+end
+
+fn hive_assign_nearest tid uint ttl ulong assigned edit uint 1 to uint
+pq = new int 289 0
+pr = new int 289 0
+src = new HexCoord 0 0
+dst = new HexCoord 0 0
+put assigned 0 0
+if or eq tid 0 gt ulong tid HIVE_MAX_TASKS
+ret HIVE_ERR_BAD_ARG
+end
+tidx = ulong tid
+if ne get g_tk_st tidx HIVE_TASK_OPEN
+ret HIVE_ERR_CLAIMED
+end
+put dst q get g_tk_q tidx
+put dst r get g_tk_r tidx
+best_aid = uint 0
+best_hops = int 1000000
+i = ulong 1
+while le i HIVE_MAX_AGENTS bound 128
+if ne get g_ag_act i 0
+if lt get g_ag_load i get g_ag_cap i
+put src q get g_ag_q i
+put src r get g_ag_r i
+hops = hive_route src dst pq pr
+if ge hops 0
+if lt hops best_hops
+best_hops = hops
+best_aid = uint i
+end
+end
+end
+end
+i = add i 1
+end
+if eq best_aid 0
+ret HIVE_ERR_NO_ROUTE
+end
+rc = hive_task_claim tid best_aid ttl
+if eq rc HIVE_OK
+put assigned 0 best_aid
+end
+ret rc
+end
+
+note ---- I/O and integer formatting helpers ----
+
+fn hive_write_all fd int buf view uchar * to bool
+n = len buf
+off = ulong 0
+while lt off n bound 65536
+k = write fd buf off sub n off
+if le k 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn hive_write_u64 fd int v ulong to bool
+buf = new uchar 24 0
+if eq v 0
+put buf 0 uchar 48
+ret hive_write_all fd part buf 0 1
+end
+cur = v
+pos = ulong 24
+while gt cur 0 bound 24
+pos = sub pos 1
+put buf pos add uchar 48 uchar rem cur 10
+cur = div cur 10
+end
+ret hive_write_all fd part buf pos sub 24 pos
+end
+
+fn hive_write_i32 fd int v int to bool
+neg_ch = new uchar 1 45
+if lt v 0
+if not hive_write_all fd neg_ch
+ret false
+end
+mag = ulong sub long 0 long v
+ret hive_write_u64 fd mag
+end
+ret hive_write_u64 fd ulong v
+end

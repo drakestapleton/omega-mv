@@ -1,0 +1,364 @@
+note aien-edge unit tests: router, path sanitizer, security headers, CSP, escaping, status codes.
+note Compose: si/directives/om2.om + apps/edge/lib.om + apps/edge/test.om
+
+text edge_ts_pass "PASS "
+text edge_ts_fail "FAIL "
+text edge_ts_nl "\n"
+text edge_ts_ok "SUMMARY aien-edge PASS all=9 fail=0\n"
+text edge_ts_bad "SUMMARY aien-edge FAIL\n"
+
+text edge_tn_1 "normalize_valid_paths"
+text edge_tn_2 "normalize_refuse_traversal_ctrl"
+text edge_tn_3 "normalize_host"
+text edge_tn_4 "encoding_negotiation"
+text edge_tn_5 "route_200_and_head"
+text edge_tn_6 "route_hive_board_noscript_csp"
+text edge_tn_7 "route_400_403_405"
+text edge_tn_8 "route_404_xss_escaped"
+text edge_tn_9 "https_hsts_vs_http"
+
+text edge_p1 "/a//b/./c?x=1#top"
+text edge_p1_exp "a/b/c"
+text edge_p2 "/"
+text edge_p3 "/%68ive/board/"
+text edge_p3_exp "hive/board"
+text edge_p4 "/.well-known/security.txt"
+text edge_p4_exp ".well-known/security.txt"
+
+text edge_bad1 "/a/../b"
+text edge_bad2 "/%2e%2e/etc/passwd"
+text edge_bad3 "/a%5cb"
+text edge_bad4 "/a%00b"
+text edge_bad5 "/a%07b"
+text edge_bad6 "/bad%ZZ"
+text edge_bad7 "/.env"
+text edge_bad8 "/assets/app.js.map"
+
+text edge_h1 "Example.COM.:443"
+text edge_h1_exp "example.com"
+text edge_h_bad "evil.com/path"
+
+text edge_ae1 "gzip, deflate, br"
+text edge_ae2 "br;q=0, gzip"
+text edge_ae3 "gzip;q=0.00"
+
+text edge_req_root "GET / HTTP/1.1\n"
+text edge_req_head "HEAD / HTTP/1.1\n"
+text edge_req_board "GET /hive/board/ HTTP/1.1\n"
+text edge_req_asset "GET /assets/app.css HTTP/1.1\n"
+text edge_req_400 "GET /bad%ZZ HTTP/1.1\n"
+text edge_req_400_nul "GET /a%00b HTTP/1.1\n"
+text edge_req_403_trav "GET /%2e%2e/etc/passwd HTTP/1.1\n"
+text edge_req_403_env "GET /.env HTTP/1.1\n"
+text edge_req_405 "POST / HTTP/1.1\n"
+text edge_req_404_xss "GET /<script>alert(1)</script> HTTP/1.1\n"
+
+text edge_chk_nosniff "X-Content-Type-Options: nosniff"
+text edge_chk_noscript "script-src 'none'"
+text edge_chk_hsts "Strict-Transport-Security: max-age=31536000"
+text edge_chk_allow "Allow: GET, HEAD"
+text edge_chk_imm "immutable"
+text edge_chk_esc "&lt;script&gt;alert(1)&lt;/script&gt;"
+text edge_chk_raw_script "<script>"
+
+fn edge_t_print s view uchar * to void
+k = write 1 s 0 len s
+if lt k 0
+exit 2
+end
+end
+
+fn edge_t_report name view uchar * ok bool to int
+if ok
+edge_t_print edge_ts_pass
+edge_t_print name
+edge_t_print edge_ts_nl
+ret 0
+end
+edge_t_print edge_ts_fail
+edge_t_print name
+edge_t_print edge_ts_nl
+ret 1
+end
+
+fn edge_match_at hay view uchar * pos ulong ned view uchar * to bool
+nl = len ned
+j = ulong 0
+while lt j nl bound 256
+if ne get hay add pos j get ned j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+fn edge_contains hay view uchar * ned view uchar * to bool
+hl = len hay
+nl = len ned
+if eq nl 0
+ret true
+end
+if lt hl nl
+ret false
+end
+lim = add sub hl nl 1
+i = ulong 0
+while lt i lim bound 8192
+if edge_match_at hay i ned
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn edge_t_norm_ok to bool
+dst = new uchar 256 0
+n1 = edge_normalize_path edge_p1 dst
+if lt n1 0
+ret false
+end
+if not edge_eq_bytes part dst 0 ulong n1 edge_p1_exp
+ret false
+end
+n2 = edge_normalize_path edge_p2 dst
+if ne n2 0
+ret false
+end
+n3 = edge_normalize_path edge_p3 dst
+if lt n3 0
+ret false
+end
+if not edge_eq_bytes part dst 0 ulong n3 edge_p3_exp
+ret false
+end
+n4 = edge_normalize_path edge_p4 dst
+if lt n4 0
+ret false
+end
+ret edge_eq_bytes part dst 0 ulong n4 edge_p4_exp
+end
+
+fn edge_t_norm_bad to bool
+dst = new uchar 256 0
+if ne edge_normalize_path edge_bad1 dst -3
+ret false
+end
+if ne edge_normalize_path edge_bad2 dst -3
+ret false
+end
+if ne edge_normalize_path edge_bad3 dst -2
+ret false
+end
+if ne edge_normalize_path edge_bad4 dst -2
+ret false
+end
+if ne edge_normalize_path edge_bad5 dst -2
+ret false
+end
+if ne edge_normalize_path edge_bad6 dst -1
+ret false
+end
+if ne edge_normalize_path edge_bad7 dst -3
+ret false
+end
+if ne edge_normalize_path edge_bad8 dst -3
+ret false
+end
+raw_nul = new uchar 4 97
+put raw_nul 0 uchar 47
+put raw_nul 2 uchar 0
+if ne edge_normalize_path raw_nul dst -2
+ret false
+end
+ret true
+end
+
+fn edge_t_host to bool
+dst = new uchar 128 0
+n = edge_normalize_host edge_h1 dst
+if lt n 0
+ret false
+end
+if not edge_eq_bytes part dst 0 ulong n edge_h1_exp
+ret false
+end
+if ge edge_normalize_host edge_h_bad dst 0
+ret false
+end
+ret true
+end
+
+fn edge_t_enc to bool
+if ne edge_pick_encoding edge_ae1 true true EDGE_ENC_BR
+ret false
+end
+if ne edge_pick_encoding edge_ae2 true true EDGE_ENC_GZIP
+ret false
+end
+if ne edge_pick_encoding edge_ae3 true true EDGE_ENC_IDENTITY
+ret false
+end
+ret true
+end
+
+fn edge_t_200_head to bool
+resp1 = new uchar 4096 0
+resp2 = new uchar 4096 0
+m1 = new EdgeResp 0 0 0 0 0
+m2 = new EdgeResp 0 0 0 0 0
+n1 = edge_handle_request edge_req_root EDGE_SCHEME_HTTPS resp1 m1
+n2 = edge_handle_request edge_req_head EDGE_SCHEME_HTTPS resp2 m2
+if lt n1 0
+ret false
+end
+if lt n2 0
+ret false
+end
+if ne get m1 status 200
+ret false
+end
+if ne get m2 status 200
+ret false
+end
+if ne get m1 body_len get m2 body_len
+ret false
+end
+if ge n2 n1
+ret false
+end
+if not edge_contains part resp1 0 ulong n1 edge_chk_nosniff
+ret false
+end
+resp3 = new uchar 4096 0
+m3 = new EdgeResp 0 0 0 0 0
+n3 = edge_handle_request edge_req_asset EDGE_SCHEME_HTTPS resp3 m3
+if lt n3 0
+ret false
+end
+if ne get m3 status 200
+ret false
+end
+ret edge_contains part resp3 0 ulong n3 edge_chk_imm
+end
+
+fn edge_t_board_csp to bool
+resp = new uchar 4096 0
+meta = new EdgeResp 0 0 0 0 0
+n = edge_handle_request edge_req_board EDGE_SCHEME_HTTPS resp meta
+if lt n 0
+ret false
+end
+if ne get meta status 200
+ret false
+end
+if ne get meta no_script 1
+ret false
+end
+if not edge_contains part resp 0 ulong n edge_chk_noscript
+ret false
+end
+ret edge_contains part resp 0 ulong n edge_chk_nosniff
+end
+
+fn edge_t_400_403_405 to bool
+resp = new uchar 4096 0
+meta = new EdgeResp 0 0 0 0 0
+n1 = edge_handle_request edge_req_400 EDGE_SCHEME_HTTPS resp meta
+if lt n1 0
+ret false
+end
+if ne get meta status 400
+ret false
+end
+n2 = edge_handle_request edge_req_400_nul EDGE_SCHEME_HTTPS resp meta
+if lt n2 0
+ret false
+end
+if ne get meta status 400
+ret false
+end
+n3 = edge_handle_request edge_req_403_trav EDGE_SCHEME_HTTPS resp meta
+if lt n3 0
+ret false
+end
+if ne get meta status 403
+ret false
+end
+n4 = edge_handle_request edge_req_403_env EDGE_SCHEME_HTTPS resp meta
+if lt n4 0
+ret false
+end
+if ne get meta status 403
+ret false
+end
+n5 = edge_handle_request edge_req_405 EDGE_SCHEME_HTTPS resp meta
+if lt n5 0
+ret false
+end
+if ne get meta status 405
+ret false
+end
+ret edge_contains part resp 0 ulong n5 edge_chk_allow
+end
+
+fn edge_t_404_xss to bool
+resp = new uchar 4096 0
+meta = new EdgeResp 0 0 0 0 0
+n = edge_handle_request edge_req_404_xss EDGE_SCHEME_HTTPS resp meta
+if lt n 0
+ret false
+end
+if ne get meta status 404
+ret false
+end
+if not edge_contains part resp 0 ulong n edge_chk_esc
+ret false
+end
+if edge_contains part resp 0 ulong n edge_chk_raw_script
+ret false
+end
+ret true
+end
+
+fn edge_t_hsts to bool
+r_https = new uchar 4096 0
+r_http = new uchar 4096 0
+m1 = new EdgeResp 0 0 0 0 0
+m2 = new EdgeResp 0 0 0 0 0
+n1 = edge_handle_request edge_req_root EDGE_SCHEME_HTTPS r_https m1
+n2 = edge_handle_request edge_req_root EDGE_SCHEME_HTTP r_http m2
+if lt n1 0
+ret false
+end
+if lt n2 0
+ret false
+end
+if not edge_contains part r_https 0 ulong n1 edge_chk_hsts
+ret false
+end
+if edge_contains part r_http 0 ulong n2 edge_chk_hsts
+ret false
+end
+ret true
+end
+
+fn main to int
+fails = int 0
+fails = add fails edge_t_report edge_tn_1 edge_t_norm_ok
+fails = add fails edge_t_report edge_tn_2 edge_t_norm_bad
+fails = add fails edge_t_report edge_tn_3 edge_t_host
+fails = add fails edge_t_report edge_tn_4 edge_t_enc
+fails = add fails edge_t_report edge_tn_5 edge_t_200_head
+fails = add fails edge_t_report edge_tn_6 edge_t_board_csp
+fails = add fails edge_t_report edge_tn_7 edge_t_400_403_405
+fails = add fails edge_t_report edge_tn_8 edge_t_404_xss
+fails = add fails edge_t_report edge_tn_9 edge_t_hsts
+if eq fails 0
+edge_t_print edge_ts_ok
+ret 0
+end
+edge_t_print edge_ts_bad
+ret 1
+end

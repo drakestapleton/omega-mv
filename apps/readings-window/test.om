@@ -1,0 +1,333 @@
+note readings-window unit tests: ring wrap, monotonicity refusal, stats/percentiles, alarms, auth, clamp, format.
+note Compose: si/directives/om2.om + apps/readings-window/lib.om + apps/readings-window/test.om
+
+text rw_ts_pass "PASS "
+text rw_ts_fail "FAIL "
+text rw_ts_nl "\n"
+text rw_ts_ok "SUMMARY readings-window PASS all=8 fail=0\n"
+text rw_ts_bad "SUMMARY readings-window FAIL\n"
+
+text rw_tn_1 "ring_wrap_bounded"
+text rw_tn_2 "monotonicity_and_bounds_refusal"
+text rw_tn_3 "stats_sorted_p50_p95_and_cutoff"
+text rw_tn_4 "threshold_alarms"
+text rw_tn_5 "constant_time_bearer_auth"
+text rw_tn_6 "query_clamps_hours_lines"
+text rw_tn_7 "exposure_and_agent_allowlist"
+text rw_tn_8 "deterministic_json_and_text_format"
+
+text rw_tok "spark-secret-token-2026"
+text rw_hdr_ok "Bearer spark-secret-token-2026"
+text rw_hdr_bad "Bearer spark-secret-token-2025"
+text rw_hdr_nopfx "spark-secret-token-2026"
+
+text rw_q_h5 "hours=5"
+text rw_q_h0 "hours=0"
+text rw_q_hmax "hours=99999"
+text rw_q_hbad "hours=abc"
+text rw_q_l0 "lines=0"
+text rw_q_lmax "lines=60000"
+text rw_q_linj "lines=1;rm"
+
+text rw_ag_bad1 "other"
+text rw_ag_bad2 "../claude"
+text rw_ag_bad3 "Claude"
+
+text rw_exp_json "{\"count\":10,\"min\":10,\"max\":100,\"sum\":550,\"mean\":55,\"p50\":50,\"p95\":100,\"alarms\":3}\n"
+text rw_exp_text "count=10 min=10 max=100 sum=550 mean=55 p50=50 p95=100 alarms=3\n"
+
+fn rw_t_print s view uchar * to void
+k = write 1 s 0 len s
+if lt k 0
+exit 2
+end
+end
+
+fn rw_t_report name view uchar * ok bool to int
+if ok
+rw_t_print rw_ts_pass
+rw_t_print name
+rw_t_print rw_ts_nl
+ret 0
+end
+rw_t_print rw_ts_fail
+rw_t_print name
+rw_t_print rw_ts_nl
+ret 1
+end
+
+fn rw_t_ring_wrap to bool
+ring = new RwRing 0 0 0 0 0
+rbuf = new ulong 512 0
+rw_ring_init ring
+s = new RwSample 0 0 0 0 0 0 0
+i = ulong 1
+while le i 80 bound 100
+put s ts mul i 10
+put s gpu_util rem i 100
+put s gpu_temp add 30 rem i 40
+put s gpu_power add 100 i
+put s cpu_temp ulong 45
+put s mem_used ulong 4096
+put s mem_total ulong 128000
+if ne rw_ingest ring rbuf s 0
+ret false
+end
+i = add i 1
+end
+if ne get ring cnt RW_CAP
+ret false
+end
+if ne get ring total 80
+ret false
+end
+if ne get ring last_ts 800
+ret false
+end
+stats = new RwStats 0 0 0 0 0 0 0
+if not rw_compute_stats ring rbuf RW_METRIC_GPU_POWER 0 stats
+ret false
+end
+if ne get stats n 64
+ret false
+end
+if ne get stats vmin 117
+ret false
+end
+if ne get stats vmax 180
+ret false
+end
+ret true
+end
+
+fn rw_t_refusals to bool
+ring = new RwRing 0 0 0 0 0
+rbuf = new ulong 512 0
+rw_ring_init ring
+s = new RwSample 0 50 60 120 55 8000 128000
+if ne rw_ingest ring rbuf s -1
+ret false
+end
+put s ts ulong 1000
+if ne rw_ingest ring rbuf s 0
+ret false
+end
+put s ts ulong 999
+if ne rw_ingest ring rbuf s -2
+ret false
+end
+put s ts ulong 1010
+put s gpu_util ulong 101
+if ne rw_ingest ring rbuf s -3
+ret false
+end
+put s gpu_util ulong 50
+put s mem_used ulong 200000
+if ne rw_ingest ring rbuf s -4
+ret false
+end
+put s mem_used ulong 8000
+put s gpu_temp ulong 200
+if ne rw_ingest ring rbuf s -5
+ret false
+end
+if ne get ring cnt 1
+ret false
+end
+ret true
+end
+
+fn rw_t_stats to bool
+ring = new RwRing 0 0 0 0 0
+rbuf = new ulong 512 0
+rw_ring_init ring
+temps = new ulong 10 0
+put temps 0 ulong 70
+put temps 1 ulong 20
+put temps 2 ulong 100
+put temps 3 ulong 40
+put temps 4 ulong 10
+put temps 5 ulong 90
+put temps 6 ulong 30
+put temps 7 ulong 80
+put temps 8 ulong 50
+put temps 9 ulong 60
+s = new RwSample 0 50 0 150 50 10000 128000
+i = ulong 0
+while lt i 10 bound 16
+put s ts add 1000 mul i 60
+put s gpu_temp get temps i
+if ne rw_ingest ring rbuf s 0
+ret false
+end
+i = add i 1
+end
+st = new RwStats 0 0 0 0 0 0 0
+if not rw_compute_stats ring rbuf RW_METRIC_GPU_TEMP 0 st
+ret false
+end
+if ne get st n 10
+ret false
+end
+if ne get st vmin 10
+ret false
+end
+if ne get st vmax 100
+ret false
+end
+if ne get st vsum 550
+ret false
+end
+if ne get st vmean 55
+ret false
+end
+if ne get st vp50 50
+ret false
+end
+if ne get st vp95 100
+ret false
+end
+note Time-window cutoff test: ts >= 1360 selects indices 6..9 (30, 80, 50, 60).
+st2 = new RwStats 0 0 0 0 0 0 0
+if not rw_compute_stats ring rbuf RW_METRIC_GPU_TEMP 1360 st2
+ret false
+end
+if ne get st2 n 4
+ret false
+end
+if ne get st2 vmin 30
+ret false
+end
+if ne get st2 vmax 80
+ret false
+end
+ret true
+end
+
+fn rw_t_alarms to bool
+ring = new RwRing 0 0 0 0 0
+rbuf = new ulong 512 0
+rw_ring_init ring
+th = new RwThresh 85 250 90 98 115000
+s1 = new RwSample 100 50 65 180 60 32000 128000
+if ne rw_ingest ring rbuf s1 0
+ret false
+end
+if ne rw_check_alarms ring rbuf th 0
+ret false
+end
+s2 = new RwSample 200 99 88 260 65 120000 128000
+if ne rw_ingest ring rbuf s2 0
+ret false
+end
+note Tripped: gpu_temp(1) + gpu_power(2) + gpu_util(8) + mem_used(16) = 27.
+if ne rw_check_alarms ring rbuf th 27
+ret false
+end
+ret true
+end
+
+fn rw_t_auth to bool
+if not rw_auth_ok rw_hdr_ok rw_tok
+ret false
+end
+if rw_auth_ok rw_hdr_bad rw_tok
+ret false
+end
+if rw_auth_ok rw_hdr_nopfx rw_tok
+ret false
+end
+ret true
+end
+
+fn rw_t_clamps to bool
+if ne rw_clamp_hours rw_q_h5 5
+ret false
+end
+if ne rw_clamp_hours rw_q_h0 1
+ret false
+end
+if ne rw_clamp_hours rw_q_hmax 720
+ret false
+end
+if ne rw_clamp_hours rw_q_hbad 24
+ret false
+end
+if ne rw_clamp_lines rw_q_l0 1
+ret false
+end
+if ne rw_clamp_lines rw_q_lmax 50000
+ret false
+end
+if ne rw_clamp_lines rw_q_linj 500
+ret false
+end
+ret true
+end
+
+fn rw_t_exp_agents to bool
+if ne rw_exposure_state 9940 RW_EXP_OK 10000 RW_EXP_OK
+ret false
+end
+if ne rw_exposure_state 9940 RW_EXP_CHANGED 10000 RW_EXP_CHANGED
+ret false
+end
+if ne rw_exposure_state 6000 RW_EXP_OK 10000 RW_EXP_UNKNOWN
+ret false
+end
+if ne rw_exposure_state 0 RW_EXP_OK 10000 RW_EXP_UNKNOWN
+ret false
+end
+if not rw_chat_agent_allowed rw_t_ag_claude
+ret false
+end
+if not rw_chat_agent_allowed rw_t_ag_muse
+ret false
+end
+if rw_chat_agent_allowed rw_ag_bad1
+ret false
+end
+if rw_chat_agent_allowed rw_ag_bad2
+ret false
+end
+if rw_chat_agent_allowed rw_ag_bad3
+ret false
+end
+ret true
+end
+
+fn rw_t_format to bool
+st = new RwStats 10 10 100 550 55 50 100
+jb = new uchar 256 0
+tb = new uchar 256 0
+jn = rw_format_stats_json jb st 3
+if lt jn 0
+ret false
+end
+if not rw_eq_bytes part jb 0 ulong jn rw_exp_json
+ret false
+end
+tn = rw_format_stats_text tb st 3
+if lt tn 0
+ret false
+end
+ret rw_eq_bytes part tb 0 ulong tn rw_exp_text
+end
+
+fn main to int
+fails = int 0
+fails = add fails rw_t_report rw_tn_1 rw_t_ring_wrap
+fails = add fails rw_t_report rw_tn_2 rw_t_refusals
+fails = add fails rw_t_report rw_tn_3 rw_t_stats
+fails = add fails rw_t_report rw_tn_4 rw_t_alarms
+fails = add fails rw_t_report rw_tn_5 rw_t_auth
+fails = add fails rw_t_report rw_tn_6 rw_t_clamps
+fails = add fails rw_t_report rw_tn_7 rw_t_exp_agents
+fails = add fails rw_t_report rw_tn_8 rw_t_format
+if eq fails 0
+rw_t_print rw_ts_ok
+ret 0
+end
+rw_t_print rw_ts_bad
+ret 1
+end

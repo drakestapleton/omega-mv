@@ -18,7 +18,10 @@ The OS layer is moving here from Aienux (`https://interplane.io/drakestapleton/a
 | `aienux/kernel/x86/` | Native x86-64 `.om` kernel model and tool units (`llama.om`, `arithmetic.om`, `system.om`, `text.om`). |
 | `aienux/lm1b/` | Seeded `.om` Llama-1B runner and SHA-256 (`lm1b.om`, `lm1b.in.om`, `sha256.om`). |
 | `aienux/tools/` | Seeded `.om` GPT/FAT32 UEFI image writers (`spark-image.om`, `imac-image.om`) and hardware-gate checker (`hwgates.om`). |
-| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit and its ordered parts. |
+| `aienux/atlas/` | Pure-Omega Stage-0 boot verifier and SHA-256 contract engine (converted from `atlas`, `10b8ddfd6cbf`, 3 `.om` files). |
+| `aienux/pi-register/` | Pure-Omega service registry parser, conflict detector and renderer (converted from `pi-register`, `4a7954c27b2a`, 3 `.om` files). |
+| `aienux/debugger/` | Pure-Omega continuous watchdog, metric triage and JSON-RPC dispatcher (converted from `spark-debugger`, `f35b24e0e8e8`, 3 `.om` files). |
+| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit and its ordered parts (73 units). |
 | `aienux/units-gate.om` | Seeded-Omega compile-reproducibility gate (`OMEGA-AIENUX-UNITS`). |
 | `aienux/NOT-YET-OMEGA.tsv` | Generated inventory of every non-Omega first-party file still in Aienux awaiting rewrite or retirement. |
 | `aienux/import/` | How each slice came here: `git filter-repo` command, `paths.txt`, `commit-map` and `ref-map`. |

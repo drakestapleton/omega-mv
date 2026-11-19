@@ -1,0 +1,869 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/aegis/test.om: Comprehensive AEGIS runtime behavioral test suite (pure OM-2).
+note Compose with:
+note   si/directives/om2.om om/tls/sha2.om core/aegis/dag.om core/aegis/heartbeat.om
+note   core/aegis/policy.om core/aegis/journal.om core/aegis/gateway.om core/aegis/test.om
+note
+note Covers all 5 modules + positive workflows + all required negative/refusal controls:
+note   1. DAG: diamond topology, priority selection, Kahn order, failure/cancel BLOCKED propagation
+note   2. DAG NEGATIVE: self-dependency, 2-cycle, 3-cycle, duplicate task/edge, unknown prereq refused
+note   3. Heartbeat & Lease: registration, monotonic tick, exclusive lease, renewal, release, concurrency cap
+note   4. Heartbeat NEGATIVE: expired heartbeat reclaims lease, stale lease generation refused, non-monotonic tick refused
+note   5. Policy & Auth: fail-closed unconfigured token, short/invalid token refused, constant-time verify,
+note      unverified envelope & replay nonce refused, privilege escalation refused, skill/cmd allowlist, emergency stop
+note   6. Journal: SHA-256 hash chain, sequence monotonicity, replay reconstruction to DAG
+note   7. Journal NEGATIVE: tampered payload caught, broken prev_hash caught, torn commit marker caught,
+note      truncated wire stream caught, replay refuses tampered chain
+note   8. Gateway E2E: /health, /tasks, /tasks/submit (201 + 409 cycle + 401 unauth + 403 escalation + 400 bad),
+note      /heartbeat (tick + lease reclaim), /events (SSE with SHA-256 hashes), WS frames
+
+text t_pass "PASS "
+text t_fail "FAIL "
+text t_nl "\n"
+text t_done_ok "AEGIS TEST SUITE PASS\n"
+text t_done_bad "AEGIS TEST SUITE FAIL\n"
+
+text t_n1 "dag_diamond_priority_and_kahn"
+text t_n2 "dag_failure_and_cancel_propagation"
+text t_n3 "dag_negative_cycles_and_duplicates_refused"
+text t_n4 "heartbeat_lease_lifecycle_and_concurrency_cap"
+text t_n5 "heartbeat_negative_expiry_reclaims_and_stale_gen_refused"
+text t_n6 "policy_auth_envelopes_escalation_and_allowlist"
+text t_n7 "journal_sha256_chain_and_dag_replay"
+text t_n8 "journal_negative_tamper_and_torn_records_caught"
+text t_n9 "gateway_routes_auth_sse_ws_and_negative_controls"
+
+text t_tok_good "aegis_operator_token_0123456789abcdef"
+text t_tok_bad "aegis_operator_token_0123456789abcdee"
+text t_tok_short "too_short_token"
+text t_tok_space "aegis_operator_token_0123456789a bcdef"
+text t_tok_empty ""
+
+text t_m_get "GET"
+text t_m_post "POST"
+text t_p_health "/health"
+text t_p_tasks "/tasks"
+text t_p_submit "/tasks/submit"
+text t_p_hb "/heartbeat"
+text t_p_events "/events"
+text t_p_bad "/nonexistent"
+text t_p_trav "/tasks/../health"
+
+text t_b_empty ""
+text t_b_sub1 "id=101 prio=10 kind=1"
+text t_b_sub2 "id=102 prio=25 kind=1 prereq=101"
+text t_b_cyc "id=101 prio=10 prereq=102"
+text t_b_bad "id=abc prio=10"
+text t_b_hb_reg "tick=1 agent=7 cap=2"
+text t_b_hb_exp "tick=6"
+
+text t_sk_ok "read_file"
+text t_sk_bad "Bash_eval"
+text t_sk_unk "exec"
+text t_cmd_ok "git status"
+text t_cmd_rm "rm -rf / --no-preserve-root"
+text t_cmd_semi "ls;id"
+text t_env_p1 "payload-alpha"
+text t_env_p2 "payload-tampered"
+text t_jrn_p "ev-data"
+text t_ws_ping "ping"
+text t_ws_bad "shell_escape"
+
+text t_s_healthy "\"status\":\"healthy\""
+text t_s_created "\"status\":\"created\""
+text t_s_cycle "\"dependency_cycle_refused\""
+text t_s_sse_ev "event: "
+text t_s_sse_hash "\"hash\":\""
+text t_s_pong "\"type\":\"pong\""
+
+global t_fails ulong 1
+
+fn t_w s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 256
+k = write 1 s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn t_report name view uchar * ok bool to void
+if ok
+t_w t_pass
+else
+t_w t_fail
+put t_fails 0 add get t_fails 0 1
+end
+t_w name
+t_w t_nl
+end
+
+note Check if needle appears inside gw_resp[0..gw_resp_len).
+fn t_resp_contains needle view uchar * to bool
+rlen = gw_resp_len
+nlen = len needle
+if or eq nlen 0 gt nlen rlen
+ret false
+end
+lim = add sub rlen nlen 1
+for i ulong lim bound 8192
+matched = true
+for j ulong nlen bound 128
+if ne get gw_resp add i j get needle j
+matched = false
+break
+end
+end
+if matched
+ret true
+end
+end
+ret false
+end
+
+note Test 1: Diamond DAG (1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4), priority selection, Kahn order.
+fn test_dag_diamond to bool
+dag_reset
+if ne dag_add_task 1 10 1 DAG_OK
+ret false
+end
+if ne dag_add_task 2 20 1 DAG_OK
+ret false
+end
+if ne dag_add_task 3 50 1 DAG_OK
+ret false
+end
+if ne dag_add_task 4 100 1 DAG_OK
+ret false
+end
+if ne dag_add_dep 2 1 DAG_OK
+ret false
+end
+if ne dag_add_dep 3 1 DAG_OK
+ret false
+end
+if ne dag_add_dep 4 2 DAG_OK
+ret false
+end
+if ne dag_add_dep 4 3 DAG_OK
+ret false
+end
+if ne dag_validate_kahn DAG_OK
+ret false
+end
+order = new ulong 8 0
+peeled = dag_topo_order order
+if ne peeled 4
+ret false
+end
+if or ne get order 0 1 ne get order 3 4
+ret false
+end
+rdy = dag_solve_ready
+if ne rdy 1
+ret false
+end
+if or ne dag_get_state 1 TASK_READY ne dag_get_state 2 TASK_PENDING
+ret false
+end
+if ne dag_start_task 1 DAG_OK
+ret false
+end
+if ne dag_complete_task 1 DAG_OK
+ret false
+end
+note Now both 2 (prio 20) and 3 (prio 50) are READY; 4 is still PENDING.
+if or ne dag_get_state 2 TASK_READY ne dag_get_state 3 TASK_READY
+ret false
+end
+if ne dag_get_state 4 TASK_PENDING
+ret false
+end
+note Priority selection must pick task 3 (slot 2, prio 50) ahead of task 2 (slot 1, prio 20).
+nxt = dag_select_next
+if ne nxt 2
+ret false
+end
+if ne dag_start_task 3 DAG_OK
+ret false
+end
+if ne dag_complete_task 3 DAG_OK
+ret false
+end
+note Task 4 must STILL be PENDING because task 2 is not done yet.
+if ne dag_get_state 4 TASK_PENDING
+ret false
+end
+if ne dag_select_next 1
+ret false
+end
+if ne dag_start_task 2 DAG_OK
+ret false
+end
+if ne dag_complete_task 2 DAG_OK
+ret false
+end
+note Now task 4 must be READY!
+if ne dag_get_state 4 TASK_READY
+ret false
+end
+if ne dag_start_task 4 DAG_OK
+ret false
+end
+if ne dag_complete_task 4 DAG_OK
+ret false
+end
+ret eq dag_count_state TASK_DONE 4
+end
+
+note Test 2: Transitive failure and cancellation propagation to BLOCKED downstream tasks.
+fn test_dag_propagation to bool
+dag_reset
+rc = dag_add_task 10 10 1
+rc = or rc dag_add_task 11 10 1
+rc = or rc dag_add_task 12 10 1
+rc = or rc dag_add_task 13 10 1
+rc = or rc dag_add_task 14 10 1
+rc = or rc dag_add_task 15 10 1
+rc = or rc dag_add_task 16 10 1
+if ne rc DAG_OK
+ret false
+end
+note Chain 10 -> 11 -> 12, fan-out 10 -> 13, independent 14, cancel chain 15 -> 16.
+if ne dag_add_dep 11 10 DAG_OK
+ret false
+end
+if ne dag_add_dep 12 11 DAG_OK
+ret false
+end
+if ne dag_add_dep 13 10 DAG_OK
+ret false
+end
+if ne dag_add_dep 16 15 DAG_OK
+ret false
+end
+rdy = dag_solve_ready
+if ne rdy 3
+ret false
+end
+if ne dag_start_task 10 DAG_OK
+ret false
+end
+if ne dag_fail_task 10 77 DAG_OK
+ret false
+end
+if ne dag_get_state 10 TASK_FAILED
+ret false
+end
+if ne dag_get_fail_code 10 77
+ret false
+end
+note 11, 12, 13 must all be BLOCKED; independent 14 must stay READY!
+if or ne dag_get_state 11 TASK_BLOCKED ne dag_get_state 12 TASK_BLOCKED
+ret false
+end
+if or ne dag_get_state 13 TASK_BLOCKED ne dag_get_state 14 TASK_READY
+ret false
+end
+if or ne dag_get_blocked_by 11 10 ne dag_get_blocked_by 12 11
+ret false
+end
+note Cancelling 15 must block downstream 16.
+if ne dag_cancel_task 15 DAG_OK
+ret false
+end
+if or ne dag_get_state 15 TASK_CANCELLED ne dag_get_state 16 TASK_BLOCKED
+ret false
+end
+ret eq dag_get_blocked_by 16 15
+end
+
+note Test 3 (NEGATIVE): Self-dependency, 2-cycle, 3-cycle, duplicate task/edge, unknown prereq refused.
+fn test_dag_negative_cycles to bool
+dag_reset
+if ne dag_add_task 0 1 1 DAG_ERR_EMPTY_ID
+ret false
+end
+if ne dag_add_task 20 1 1 DAG_OK
+ret false
+end
+if ne dag_add_task 20 1 1 DAG_ERR_DUPLICATE_TASK
+ret false
+end
+if ne dag_add_dep 20 20 DAG_ERR_SELF_DEP
+ret false
+end
+if ne dag_add_dep 20 999 DAG_ERR_UNKNOWN_TASK
+ret false
+end
+if ne dag_add_task 21 1 1 DAG_OK
+ret false
+end
+if ne dag_add_task 22 1 1 DAG_OK
+ret false
+end
+if ne dag_add_dep 21 20 DAG_OK
+ret false
+end
+if ne dag_add_dep 21 20 DAG_ERR_DUPLICATE_EDGE
+ret false
+end
+note 2-node cycle: 20 -> 21 exists, so 20 depending on 21 MUST be refused!
+if ne dag_add_dep 20 21 DAG_ERR_CYCLE
+ret false
+end
+note 3-node cycle: add 21 -> 22, then 20 depending on 22 MUST be refused!
+if ne dag_add_dep 22 21 DAG_OK
+ret false
+end
+if ne dag_add_dep 20 22 DAG_ERR_CYCLE
+ret false
+end
+note Graph must remain intact and acyclic with exactly 2 edges.
+if ne dag_edge_count 2
+ret false
+end
+ret eq dag_validate_kahn DAG_OK
+end
+
+note Test 4: Heartbeat scheduler lease lifecycle, exclusive lease, renewal, release, concurrency cap.
+fn test_hb_lifecycle to bool
+if ne hb_init 2 3 4 HB_OK
+ret false
+end
+if ne hb_register_agent 1 2 HB_OK
+ret false
+end
+if ne hb_register_agent 2 2 HB_OK
+ret false
+end
+if ne hb_register_agent 1 2 HB_ERR_DUPLICATE
+ret false
+end
+g1 = new ulong 1 0
+g2 = new ulong 1 0
+g3 = new ulong 1 0
+if ne hb_acquire_lease 501 1 g1 HB_OK
+ret false
+end
+if eq get g1 0 0
+ret false
+end
+note Exclusive lease: agent 2 cannot lease task 501 while agent 1 holds it.
+if ne hb_acquire_lease 501 2 g2 HB_ERR_ALREADY_LEASED
+ret false
+end
+note Agent 2 leases task 502; now active_leases == 2 == max_concurrency.
+if ne hb_acquire_lease 502 2 g2 HB_OK
+ret false
+end
+if ne hb_active_leases 2
+ret false
+end
+note Concurrency cap: 3rd lease MUST be refused!
+if ne hb_acquire_lease 503 1 g3 HB_ERR_CONCURRENCY_CAP
+ret false
+end
+note Advance tick to 2, send heartbeats, renew lease 501 so it extends to tick 6.
+if ne hb_tick 2 HB_OK
+ret false
+end
+if ne hb_heartbeat 1 2 HB_OK
+ret false
+end
+if ne hb_heartbeat 2 2 HB_OK
+ret false
+end
+if ne hb_renew_lease 501 1 get g1 0 HB_OK
+ret false
+end
+note Wrong owner cannot renew or release task 501.
+if ne hb_renew_lease 501 2 get g1 0 HB_ERR_WRONG_OWNER
+ret false
+end
+note Release task 502, then 503 can be leased!
+if ne hb_release_lease 502 2 get g2 0 HB_OK
+ret false
+end
+if ne hb_active_leases 1
+ret false
+end
+if ne hb_acquire_lease 503 1 g3 HB_OK
+ret false
+end
+ret gt get g3 0 get g2 0
+end
+
+note Test 5 (NEGATIVE): Expired heartbeat reclaims lease; stale lease generation refused; non-monotonic tick refused.
+fn test_hb_negative_expiry_and_stale to bool
+if ne hb_init 4 2 5 HB_OK
+ret false
+end
+if ne hb_register_agent 10 2 HB_OK
+ret false
+end
+if ne hb_register_agent 20 2 HB_OK
+ret false
+end
+g1 = new ulong 1 0
+g2 = new ulong 1 0
+if ne hb_acquire_lease 700 10 g1 HB_OK
+ret false
+end
+note Tick 1 and 2: agent 20 heartbeats, agent 10 goes silent.
+if ne hb_tick 1 HB_OK
+ret false
+end
+if ne hb_heartbeat 20 1 HB_OK
+ret false
+end
+if ne hb_tick 2 HB_OK
+ret false
+end
+if ne hb_heartbeat 20 2 HB_OK
+ret false
+end
+note Non-monotonic tick MUST be refused!
+if ne hb_tick 1 HB_ERR_NON_MONOTONIC
+ret false
+end
+note Tick 3: agent 10 gap = 3 - 0 = 3 > agent_ttl(2) -> EXPIRED and lease 700 reclaimed!
+if ne hb_tick 3 HB_OK
+ret false
+end
+if ne hb_agent_status 10 AGENT_EXPIRED
+ret false
+end
+if ne hb_agent_status 20 AGENT_ALIVE
+ret false
+end
+if or ne hb_last_reclaimed 1 ne hb_get_reclaimed 0 700
+ret false
+end
+if ne hb_active_leases 0
+ret false
+end
+if not hb_is_degraded
+ret false
+end
+note Stale generation refusal #1: agent 10 tries to renew/verify/release with g1 -> REFUSED!
+if ne hb_renew_lease 700 10 get g1 0 HB_ERR_STALE_GEN
+ret false
+end
+if ne hb_verify_lease 700 10 get g1 0 HB_ERR_STALE_GEN
+ret false
+end
+note Agent 20 now acquires task 700 with a strictly higher fencing generation g2 > g1!
+if ne hb_acquire_lease 700 20 g2 HB_OK
+ret false
+end
+if le get g2 0 get g1 0
+ret false
+end
+note Even if agent 10 re-registers, its old generation g1 MUST STILL be refused!
+if ne hb_register_agent 10 2 HB_OK
+ret false
+end
+if ne hb_verify_lease 700 10 get g1 0 HB_ERR_STALE_GEN
+ret false
+end
+if ne hb_release_lease 700 10 get g1 0 HB_ERR_STALE_GEN
+ret false
+end
+ret eq hb_verify_lease 700 20 get g2 0 HB_OK
+end
+
+note Test 6: Policy gate, fail-closed auth, envelope MAC + anti-replay, escalation, allowlist, containment.
+fn test_policy_gate to bool
+pol_reset
+note Fail-closed when no operator token configured: public /health allowed, protected /tasks denied!
+if ne pol_authorize_request METHOD_GET ROUTE_HEALTH 0 CAP_NONE false false POL_ALLOW
+ret false
+end
+if ne pol_authorize_request METHOD_GET ROUTE_TASKS 0 ROLE_OPERATOR true true POL_DENY_NO_TOKEN_CONFIG
+ret false
+end
+note Token validation rules from auth.rs: short or space-containing tokens refused.
+if ne pol_set_operator_token t_tok_short POL_DENY_BAD_TOKEN
+ret false
+end
+if ne pol_set_operator_token t_tok_space POL_DENY_BAD_TOKEN
+ret false
+end
+if ne pol_set_operator_token t_tok_good POL_ALLOW
+ret false
+end
+if not pol_verify_token t_tok_good
+ret false
+end
+if pol_verify_token t_tok_bad
+ret false
+end
+if pol_verify_token t_tok_empty
+ret false
+end
+note Register worker principal (id=5) with ROLE_WORKER (no CAP_TASK_SUBMIT or CAP_POLICY_ADMIN).
+key = new uchar 32 0
+for i ulong 32
+put key i uchar add 0x30 i
+end
+if ne pol_register_principal 5 ROLE_WORKER key POL_ALLOW
+ret false
+end
+note Seal and verify signed action envelope with monotonic nonce=1.
+mac = new uchar 32 0
+if ne pol_seal_envelope 5 ROUTE_HEARTBEAT 1 t_env_p1 mac POL_ALLOW
+ret false
+end
+if ne pol_verify_envelope 5 ROUTE_HEARTBEAT 1 t_env_p1 mac POL_ALLOW
+ret false
+end
+note Replay of same nonce=1 MUST be refused!
+if ne pol_verify_envelope 5 ROUTE_HEARTBEAT 1 t_env_p1 mac POL_DENY_UNVERIFIED_ENV
+ret false
+end
+note Tampered payload with fresh nonce=2 and old mac MUST be refused!
+if ne pol_verify_envelope 5 ROUTE_HEARTBEAT 2 t_env_p2 mac POL_DENY_UNVERIFIED_ENV
+ret false
+end
+note Unverified envelope on protected route MUST be refused!
+if ne pol_authorize_request METHOD_POST ROUTE_HEARTBEAT 5 ROLE_WORKER true false POL_DENY_UNVERIFIED_ENV
+ret false
+end
+note Privilege escalation: worker (ROLE_WORKER) requesting CAP_TASK_SUBMIT or CAP_POLICY_ADMIN MUST be refused!
+if ne pol_authorize_request METHOD_POST ROUTE_TASKS_SUBMIT 5 or ROLE_WORKER CAP_TASK_SUBMIT true true POL_DENY_ESCALATION
+ret false
+end
+if ne pol_check_escalation ROLE_WORKER CAP_POLICY_ADMIN POL_DENY_ESCALATION
+ret false
+end
+note Worker authorized for /heartbeat with valid token + verified envelope + within its caps.
+if ne pol_authorize_request METHOD_POST ROUTE_HEARTBEAT 5 ROLE_WORKER true true POL_ALLOW
+ret false
+end
+note Skill and command allowlist (from enforcement.rs).
+if ne pol_check_skill t_sk_ok POL_ALLOW
+ret false
+end
+if ne pol_check_skill t_sk_bad POL_DENY_ESCALATION
+ret false
+end
+if ne pol_check_skill t_sk_unk POL_DENY_ESCALATION
+ret false
+end
+if ne pol_check_local_cmd t_cmd_ok POL_ALLOW
+ret false
+end
+if ne pol_check_local_cmd t_cmd_rm POL_DENY_ESCALATION
+ret false
+end
+if ne pol_check_local_cmd t_cmd_semi POL_DENY_ESCALATION
+ret false
+end
+note Emergency stop containment blocks protected routes while keeping /health readable.
+pol_set_containment CONTAIN_EMERGENCY_STOP
+if ne pol_authorize_request METHOD_GET ROUTE_HEALTH 0 CAP_NONE false false POL_ALLOW
+ret false
+end
+if ne pol_authorize_request METHOD_POST ROUTE_HEARTBEAT 5 ROLE_WORKER true true POL_DENY_CONTAINED
+ret false
+end
+pol_set_containment CONTAIN_OBSERVE
+ret true
+end
+
+note Test 7: SHA-256 hash-chained journal + replay reconstruction into DAG state.
+fn test_journal_chain_and_replay to bool
+jrn_reset
+dag_reset
+if ne jrn_append EVT_TASK_SUBMITTED 1 10 1 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_append EVT_TASK_SUBMITTED 2 20 1 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_append EVT_TASK_SUBMITTED 3 30 1 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_append EVT_TASK_DEP 2 1 1 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_append EVT_TASK_DEP 3 2 1 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_append EVT_TASK_STARTED 1 7 2 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_append EVT_TASK_FAILED 1 99 3 t_jrn_p JRN_OK
+ret false
+end
+if or ne jrn_count 7 ne jrn_last_seq 7
+ret false
+end
+if ne jrn_verify_chain JRN_OK
+ret false
+end
+note Verify hashes of record 0 and record 1 are non-zero and distinct.
+h0 = new uchar 32 0
+h1 = new uchar 32 0
+if or ne jrn_copy_hash 0 h0 JRN_OK ne jrn_copy_hash 1 h1 JRN_OK
+ret false
+end
+nz = ulong 0
+diff = ulong 0
+for i ulong 32
+nz = or nz ulong get h0 i
+diff = or diff ulong xor get h0 i get h1 i
+end
+if or eq nz 0 eq diff 0
+ret false
+end
+note Replay into fresh DAG and confirm task 1=FAILED, task 2=BLOCKED, task 3=BLOCKED!
+if ne jrn_replay_to_dag JRN_OK
+ret false
+end
+if ne dag_get_state 1 TASK_FAILED
+ret false
+end
+if or ne dag_get_state 2 TASK_BLOCKED ne dag_get_state 3 TASK_BLOCKED
+ret false
+end
+ret true
+end
+
+note Test 8 (NEGATIVE): Tampered payload, broken chain, torn commit sentinel, and truncated wire stream caught!
+fn test_journal_negative_tamper_and_torn to bool
+jrn_reset
+if ne jrn_append EVT_TASK_SUBMITTED 40 5 1 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_append EVT_TASK_SUBMITTED 41 6 2 t_jrn_p JRN_OK
+ret false
+end
+if ne jrn_verify_chain JRN_OK
+ret false
+end
+note Encode intact 2-record wire stream (384 bytes) for wire-level tests.
+wire = new uchar 384 0
+if ne jrn_encode_record 0 wire 0 JRN_OK
+ret false
+end
+if ne jrn_encode_record 1 wire 192 JRN_OK
+ret false
+end
+note Negative 1: flip 1 byte in record 0 payload -> JRN_ERR_HASH_MISMATCH + replay REFUSED!
+orig = get jrn_payload 0
+put jrn_payload 0 xor orig 0x01
+if ne jrn_verify_chain JRN_ERR_HASH_MISMATCH
+ret false
+end
+if ne jrn_replay_to_dag JRN_ERR_HASH_MISMATCH
+ret false
+end
+put jrn_payload 0 orig
+if ne jrn_verify_chain JRN_OK
+ret false
+end
+note Negative 2: corrupt sequence monotonicity -> JRN_ERR_SEQ_GAP!
+put jrn_seq 1 99
+if ne jrn_verify_chain JRN_ERR_SEQ_GAP
+ret false
+end
+put jrn_seq 1 2
+note Negative 3: torn commit sentinel -> JRN_ERR_TORN_RECORD!
+put jrn_commit 1 0
+if ne jrn_verify_chain JRN_ERR_TORN_RECORD
+ret false
+end
+put jrn_commit 1 JRN_COMMIT_END
+note Negative 4: break prev_hash link on record 1 -> JRN_ERR_PREV_HASH_MISMATCH!
+orig_ph = get jrn_prev_hash 32
+put jrn_prev_hash 32 xor orig_ph 0xff
+if ne jrn_verify_chain JRN_ERR_PREV_HASH_MISMATCH
+ret false
+end
+put jrn_prev_hash 32 orig_ph
+note Negative 5: truncated wire stream (370 bytes, not multiple of 192) -> JRN_ERR_TORN_RECORD!
+if ne jrn_decode_stream wire 370 JRN_ERR_TORN_RECORD
+ret false
+end
+note Positive wire round-trip of full 384 bytes succeeds and verifies!
+if ne jrn_decode_stream wire 384 JRN_OK
+ret false
+end
+ret eq jrn_count 2
+end
+
+note Test 9: Gateway E2E routes (/health, /tasks, /tasks/submit, /heartbeat, /events, WS) + negative controls.
+fn test_gateway_e2e to bool
+dag_reset
+pol_reset
+jrn_reset
+gw_reset
+if ne hb_init 4 2 5 HB_OK
+ret false
+end
+if ne pol_set_operator_token t_tok_good POL_ALLOW
+ret false
+end
+key = new uchar 32 0
+for i ulong 32
+put key i uchar add 0x50 i
+end
+if ne pol_register_principal 8 ROLE_WORKER key POL_ALLOW
+ret false
+end
+note 1) Public GET /health -> 200 OK with healthy JSON.
+rt = gw_req_begin t_m_get t_p_health
+gw_req_auth 0 CAP_NONE t_tok_empty false
+if ne gw_req_dispatch t_b_empty HTTP_OK
+ret false
+end
+if not t_resp_contains t_s_healthy
+ret false
+end
+note 2) NEGATIVE: POST /health -> 405 Method Not Allowed.
+rt = gw_req_begin t_m_post t_p_health
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_empty HTTP_METHOD_NOT_ALLOWED
+ret false
+end
+note 3) NEGATIVE: Unauthorized GET /tasks (no token) -> 401 Unauthorized.
+rt = gw_req_begin t_m_get t_p_tasks
+gw_req_auth 0 ROLE_OPERATOR t_tok_empty true
+if ne gw_req_dispatch t_b_empty HTTP_UNAUTHORIZED
+ret false
+end
+note 4) NEGATIVE: Unauthorized POST /tasks/submit (bad token) -> 401 Unauthorized.
+rt = gw_req_begin t_m_post t_p_submit
+gw_req_auth 0 ROLE_OPERATOR t_tok_bad true
+if ne gw_req_dispatch t_b_sub1 HTTP_UNAUTHORIZED
+ret false
+end
+note 5) NEGATIVE: Privilege escalation on POST /tasks/submit by worker principal 8 -> 403 Forbidden.
+rt = gw_req_begin t_m_post t_p_submit
+gw_req_auth 8 or ROLE_WORKER CAP_TASK_SUBMIT t_tok_good true
+if ne gw_req_dispatch t_b_sub1 HTTP_FORBIDDEN
+ret false
+end
+note 6) NEGATIVE: Bad body on POST /tasks/submit -> 400 Bad Request.
+rt = gw_req_begin t_m_post t_p_submit
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_bad HTTP_BAD_REQUEST
+ret false
+end
+note 7) Positive POST /tasks/submit for 101 and 102 (102 depends on 101) -> 201 Created.
+rt = gw_req_begin t_m_post t_p_submit
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_sub1 HTTP_CREATED
+ret false
+end
+if not t_resp_contains t_s_created
+ret false
+end
+rt = gw_req_begin t_m_post t_p_submit
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_sub2 HTTP_CREATED
+ret false
+end
+note 8) NEGATIVE: Cyclic dependency 101 -> 102 via POST /tasks/submit -> 409 Conflict (dependency_cycle_refused)!
+rt = gw_req_begin t_m_post t_p_submit
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_cyc HTTP_CONFLICT
+ret false
+end
+if not t_resp_contains t_s_cycle
+ret false
+end
+note 9) Authorized GET /tasks -> 200 OK.
+rt = gw_req_begin t_m_get t_p_tasks
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_empty HTTP_OK
+ret false
+end
+note 10) POST /heartbeat registers agent 7 at tick 1, lease task 101, then tick 6 reclaims lease!
+rt = gw_req_begin t_m_post t_p_hb
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_hb_reg HTTP_OK
+ret false
+end
+gen = new ulong 1 0
+if ne hb_acquire_lease 101 7 gen HB_OK
+ret false
+end
+if ne dag_start_task 101 DAG_OK
+ret false
+end
+rt = gw_req_begin t_m_post t_p_hb
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_hb_exp HTTP_OK
+ret false
+end
+note Reclaimed lease must have returned task 101 to READY!
+if ne dag_get_state 101 TASK_READY
+ret false
+end
+note 11) Public GET /events -> 200 OK SSE stream with event lines and SHA-256 hash fields.
+rt = gw_req_begin t_m_get t_p_events
+gw_req_auth 0 CAP_NONE t_tok_empty false
+if ne gw_req_dispatch t_b_empty HTTP_OK
+ret false
+end
+if ne gw_content_type GW_CT_SSE
+ret false
+end
+if not and t_resp_contains t_s_sse_ev t_resp_contains t_s_sse_hash
+ret false
+end
+note 12) Unknown route -> 404, traversal path -> 400.
+rt = gw_req_begin t_m_get t_p_bad
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_empty HTTP_NOT_FOUND
+ret false
+end
+rt = gw_req_begin t_m_get t_p_trav
+gw_req_auth 0 ROLE_OPERATOR t_tok_good true
+if ne gw_req_dispatch t_b_empty HTTP_BAD_REQUEST
+ret false
+end
+note 13) WS frame routing: unauthorized refused (401), ping allowed (200), unknown refused (400).
+if ne gw_ws_frame 0 ROLE_OPERATOR false t_ws_ping HTTP_UNAUTHORIZED
+ret false
+end
+if ne gw_ws_frame 0 ROLE_OPERATOR true t_ws_ping HTTP_OK
+ret false
+end
+if not t_resp_contains t_s_pong
+ret false
+end
+if ne gw_ws_frame 0 ROLE_OPERATOR true t_ws_bad HTTP_BAD_REQUEST
+ret false
+end
+note Final check: entire journal chain logged during E2E run is cryptographically valid!
+if gt rt 999
+ret false
+end
+ret eq jrn_verify_chain JRN_OK
+end
+
+fn main to int
+put t_fails 0 0
+t_report t_n1 test_dag_diamond
+t_report t_n2 test_dag_propagation
+t_report t_n3 test_dag_negative_cycles
+t_report t_n4 test_hb_lifecycle
+t_report t_n5 test_hb_negative_expiry_and_stale
+t_report t_n6 test_policy_gate
+t_report t_n7 test_journal_chain_and_replay
+t_report t_n8 test_journal_negative_tamper_and_torn
+t_report t_n9 test_gateway_e2e
+if eq get t_fails 0 0
+t_w t_done_ok
+ret 0
+end
+t_w t_done_bad
+ret 1
+end

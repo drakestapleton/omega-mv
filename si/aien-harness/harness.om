@@ -1,0 +1,919 @@
+om2
+note si/aien-harness/harness.om: Change-management schema validator, workflow engine, and eval reliability gate.
+note Faithful pure-Omega conversion of aien-harness (src/lib.rs, schemas/*.json, evals.json, workflows.json)
+note plus strict 6-word verdict vocabulary, multi-run flakiness detection, and fail-closed gate decisions.
+note Input protocol on stdin (one record per line; # comments and blank lines ignored):
+note   schema <engineering_fix|harness_change|research_handoff|python_result>
+note   field <key> <value>
+note   text <body text checked by slop_gate>
+note   workflow <workflow_type> <from_state> <to_state>
+note   eval <eval_name> <PASS|FAIL|NOT_RUN|BLOCKED_HARDWARE|BLOCKED_OPERATOR|MISSING_IMPLEMENTATION>
+note Exit codes: 0 = GATE PASS, 1 = GATE FAIL (fail-closed refusal), 2 = I/O error or unknown/missing schema.
+
+global inbuf uchar 32768
+global rdbuf uchar 4096
+global decbuf uchar 32
+global fldcnt ulong 16
+global evalnames uchar 4096
+global evallens ulong 64
+global evalfirst ulong 64
+global evalflaky ulong 64
+global st ulong 20
+
+note st indices
+const s_inlen ulong 0
+const s_schema ulong 1
+const s_badprop ulong 2
+const s_badlen ulong 3
+const s_missfld ulong 4
+const s_slop ulong 5
+const s_badwf ulong 6
+const s_runs ulong 7
+const s_passruns ulong 8
+const s_nonpass ulong 9
+const s_badverd ulong 10
+const s_flaky ulong 11
+const s_evalcnt ulong 12
+const s_badline ulong 13
+
+note Schema IDs
+const sch_none ulong 0
+const sch_eng ulong 1
+const sch_hc ulong 2
+const sch_res ulong 3
+const sch_py ulong 4
+
+note Verdict codes (0 = INVALID)
+const v_inv ulong 0
+const v_pass ulong 1
+const v_fail ulong 2
+const v_notrun ulong 3
+const v_bhw ulong 4
+const v_bop ulong 5
+const v_miss ulong 6
+
+note Line prefixes
+text p_schema "schema "
+text p_field "field "
+text p_text "text "
+text p_wf "workflow "
+text p_eval "eval "
+
+note Schema names
+text sn_eng "engineering_fix"
+text sn_hc "harness_change"
+text sn_res "research_handoff"
+text sn_py "python_result"
+text sn_pywf "python_pipeline"
+
+note Field keys
+text fk_bug "bug"
+text fk_repro "reproduction_steps"
+text fk_fev "failure_evidence"
+text fk_rtest "regression_test"
+text fk_diff "diff_summary"
+text fk_ret "retest_evidence"
+text fk_chg "change"
+text fk_why "why"
+text fk_rep "replay_report"
+text fk_evr "eval_results"
+text fk_rbk "rollback"
+text fk_q "question"
+text fk_clm "claims"
+text fk_src "sources"
+text fk_oq "open_questions"
+text fk_goal "goal"
+text fk_code "code"
+text fk_out "stdout"
+text fk_ok "ok"
+text fk_ev "evidence"
+
+note Verdict vocabulary (exact 6 words)
+text vv_pass "PASS"
+text vv_fail "FAIL"
+text vv_notrun "NOT_RUN"
+text vv_bhw "BLOCKED_HARDWARE"
+text vv_bop "BLOCKED_OPERATOR"
+text vv_miss "MISSING_IMPLEMENTATION"
+
+note Workflow state names
+text ws_repro "reproduce"
+text ws_rfail "regression_fail"
+text ws_impl "implement"
+text ws_retest "retest"
+text ws_rev "review"
+text ws_done "done"
+text ws_col "collect"
+text ws_val "validate"
+text ws_esrc "eval_sources"
+text ws_del "deliver"
+text ws_prop "propose"
+text ws_rply "replay"
+text ws_app "apply"
+text ws_ver "verify"
+text ws_wr "write"
+text ws_run "run"
+text ws_eval "eval"
+text ws_rem "remember"
+text ws_ref "refine"
+
+note Slop gate forbidden phrases (evals.json)
+text sl_01 "this is the part where"
+text sl_02 "the part everyone's missing"
+text sl_03 "the part everyone is missing"
+text sl_04 "in today's fast-paced"
+text sl_05 "game-changer"
+text sl_06 "delve into"
+text sl_07 "unlock the power"
+text sl_08 "at the end of the day"
+text sl_09 "it is important to note"
+text sl_10 "in conclusion,"
+text sl_not "not "
+text sl_its "it's "
+text sl_itis "it is "
+
+note Output messages
+text m_pass1 "GATE PASS runs="
+text m_pass2 " evals="
+text m_fail1 "GATE FAIL schema_err="
+text m_fail2 " slop="
+text m_fail3 " wf_err="
+text m_fail4 " bad_verdict="
+text m_fail5 " flaky="
+text m_fail6 " nonpass="
+text m_fail7 " runs="
+text m_bad_sch "harness: missing or unknown schema\n"
+text m_io "harness: failed to read stdin\n"
+text t_nl "\n"
+
+fn write_all fd int src view uchar * off ulong n ulong to void
+p = ulong 0
+while lt p n bound 4096
+k = write fd src add off p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn wstr fd int s view uchar * to void
+write_all fd s 0 len s
+end
+
+fn wdec fd int v ulong to void
+i = ulong 32
+n = v
+while true bound 24
+i = sub i 1
+put decbuf i uchar add rem n 10 48
+n = div n 10
+if eq n 0
+break
+end
+end
+p = i
+while lt p 32 bound 32
+k = write fd decbuf p sub 32 p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn to_lower c uchar to uchar
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+fn is_word_ch c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 97 le c 122
+ret true
+end
+ret or eq c 95 eq c 45
+end
+
+fn in_eq off ulong n ulong lit view uchar * to bool
+if ne n len lit
+ret false
+end
+i = ulong 0
+while lt i n bound 256
+if ne get inbuf add off i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn in_starts off ulong lim ulong pfx view uchar * to bool
+pl = len pfx
+if gt add off pl lim
+ret false
+end
+i = ulong 0
+while lt i pl bound 256
+if ne get inbuf add off i get pfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn in_starts_ci off ulong lim ulong pat view uchar * to bool
+pl = len pat
+if gt add off pl lim
+ret false
+end
+i = ulong 0
+while lt i pl bound 256
+if ne to_lower get inbuf add off i to_lower get pat i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn in_contains_ci off ulong lim ulong pat view uchar * to bool
+pl = len pat
+if lt sub lim off pl
+ret false
+end
+endp = add sub lim pl 1
+p = off
+while lt p endp bound 4096
+if in_starts_ci p lim pat
+ret true
+end
+p = add p 1
+end
+ret false
+end
+
+fn find_sp pos ulong lim ulong to ulong
+p = pos
+while lt p lim bound 4096
+if eq get inbuf p 32
+ret p
+end
+p = add p 1
+end
+ret lim
+end
+
+note Antithesis detector: \bnot <word/space chars>, (it's|it is) 
+fn has_antithesis off ulong lim ulong to bool
+p = off
+while lt p lim bound 4096
+ok_wb = true
+if gt p off
+if is_word_ch get inbuf sub p 1
+ok_wb = false
+end
+end
+if and ok_wb in_starts_ci p lim sl_not
+q = add p 4
+saw_w = false
+while lt q lim bound 128
+c = get inbuf q
+if eq c 44
+if saw_w
+r = add q 1
+while lt r lim bound 16
+if ne get inbuf r 32
+break
+end
+r = add r 1
+end
+if or in_starts_ci r lim sl_its in_starts_ci r lim sl_itis
+ret true
+end
+end
+break
+end
+if is_word_ch c
+saw_w = true
+else
+if ne c 32
+break
+end
+end
+q = add q 1
+end
+end
+p = add p 1
+end
+ret false
+end
+
+fn check_slop off ulong lim ulong to bool
+if in_contains_ci off lim sl_01
+ret true
+end
+if in_contains_ci off lim sl_02
+ret true
+end
+if in_contains_ci off lim sl_03
+ret true
+end
+if in_contains_ci off lim sl_04
+ret true
+end
+if in_contains_ci off lim sl_05
+ret true
+end
+if in_contains_ci off lim sl_06
+ret true
+end
+if in_contains_ci off lim sl_07
+ret true
+end
+if in_contains_ci off lim sl_08
+ret true
+end
+if in_contains_ci off lim sl_09
+ret true
+end
+if in_contains_ci off lim sl_10
+ret true
+end
+ret has_antithesis off lim
+end
+
+fn parse_verdict off ulong n ulong to ulong
+if in_eq off n vv_pass
+ret v_pass
+end
+if in_eq off n vv_fail
+ret v_fail
+end
+if in_eq off n vv_notrun
+ret v_notrun
+end
+if in_eq off n vv_bhw
+ret v_bhw
+end
+if in_eq off n vv_bop
+ret v_bop
+end
+if in_eq off n vv_miss
+ret v_miss
+end
+ret v_inv
+end
+
+fn eval_name_eq idx ulong off ulong n ulong to bool
+if ne get evallens idx n
+ret false
+end
+base = mul idx 64
+i = ulong 0
+while lt i n bound 64
+if ne get evalnames add base i get inbuf add off i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn record_eval_run noff ulong nlen ulong vcode ulong to void
+put st s_runs add get st s_runs 1
+if eq vcode v_inv
+put st s_badverd add get st s_badverd 1
+ret
+end
+if eq vcode v_pass
+put st s_passruns add get st s_passruns 1
+else
+put st s_nonpass add get st s_nonpass 1
+end
+clen = nlen
+if gt clen 64
+clen = ulong 64
+end
+cnt = get st s_evalcnt
+idx = ulong 0
+while lt idx cnt bound 64
+if eval_name_eq idx noff clen
+if ne get evalfirst idx vcode
+if eq get evalflaky idx 0
+put evalflaky idx 1
+put st s_flaky add get st s_flaky 1
+end
+end
+ret
+end
+idx = add idx 1
+end
+if lt cnt 64
+base = mul cnt 64
+i = ulong 0
+while lt i clen bound 64
+put evalnames add base i get inbuf add noff i
+i = add i 1
+end
+put evallens cnt clen
+put evalfirst cnt vcode
+put evalflaky cnt 0
+put st s_evalcnt add cnt 1
+end
+end
+
+fn wf_eng_ok fo ulong fnl ulong to_o ulong tn ulong to bool
+if in_eq fo fnl ws_repro
+ret in_eq to_o tn ws_rfail
+end
+if in_eq fo fnl ws_rfail
+ret in_eq to_o tn ws_impl
+end
+if in_eq fo fnl ws_impl
+ret in_eq to_o tn ws_retest
+end
+if in_eq fo fnl ws_retest
+ret or in_eq to_o tn ws_rev in_eq to_o tn ws_impl
+end
+if in_eq fo fnl ws_rev
+ret or in_eq to_o tn ws_done in_eq to_o tn ws_impl
+end
+ret false
+end
+
+fn wf_res_ok fo ulong fnl ulong to_o ulong tn ulong to bool
+if in_eq fo fnl ws_col
+ret in_eq to_o tn ws_val
+end
+if in_eq fo fnl ws_val
+ret or in_eq to_o tn ws_esrc in_eq to_o tn ws_col
+end
+if in_eq fo fnl ws_esrc
+ret or in_eq to_o tn ws_del in_eq to_o tn ws_col
+end
+if in_eq fo fnl ws_del
+ret in_eq to_o tn ws_done
+end
+ret false
+end
+
+fn wf_hc_ok fo ulong fnl ulong to_o ulong tn ulong to bool
+if in_eq fo fnl ws_prop
+ret in_eq to_o tn ws_rply
+end
+if in_eq fo fnl ws_rply
+ret or in_eq to_o tn ws_app in_eq to_o tn ws_prop
+end
+if in_eq fo fnl ws_app
+ret in_eq to_o tn ws_ver
+end
+if in_eq fo fnl ws_ver
+ret or in_eq to_o tn ws_done in_eq to_o tn ws_prop
+end
+ret false
+end
+
+fn wf_py_ok fo ulong fnl ulong to_o ulong tn ulong to bool
+if in_eq fo fnl ws_wr
+ret in_eq to_o tn ws_run
+end
+if in_eq fo fnl ws_run
+ret in_eq to_o tn ws_eval
+end
+if in_eq fo fnl ws_eval
+ret or in_eq to_o tn ws_del in_eq to_o tn ws_rem
+end
+if in_eq fo fnl ws_rem
+ret in_eq to_o tn ws_ref
+end
+if in_eq fo fnl ws_ref
+ret in_eq to_o tn ws_run
+end
+if in_eq fo fnl ws_del
+ret in_eq to_o tn ws_done
+end
+ret false
+end
+
+fn check_wf_line ls ulong lim ulong to void
+p1 = add ls 9
+s1 = find_sp p1 lim
+if ge s1 lim
+put st s_badwf add get st s_badwf 1
+ret
+end
+p2 = add s1 1
+s2 = find_sp p2 lim
+if ge s2 lim
+put st s_badwf add get st s_badwf 1
+ret
+end
+p3 = add s2 1
+ok = false
+if in_eq p1 sub s1 p1 sn_eng
+ok = wf_eng_ok p2 sub s2 p2 p3 sub lim p3
+else
+if in_eq p1 sub s1 p1 sn_res
+ok = wf_res_ok p2 sub s2 p2 p3 sub lim p3
+else
+if in_eq p1 sub s1 p1 sn_hc
+ok = wf_hc_ok p2 sub s2 p2 p3 sub lim p3
+else
+if in_eq p1 sub s1 p1 sn_pywf
+ok = wf_py_ok p2 sub s2 p2 p3 sub lim p3
+end
+end
+end
+end
+if not ok
+put st s_badwf add get st s_badwf 1
+end
+end
+
+fn apply_field_eng ko ulong kl ulong vl ulong to void
+slot = ulong 99
+minl = ulong 0
+if in_eq ko kl fk_bug
+slot = ulong 0
+minl = ulong 8
+else
+if in_eq ko kl fk_repro
+slot = ulong 1
+minl = ulong 4
+else
+if in_eq ko kl fk_fev
+slot = ulong 2
+minl = ulong 8
+else
+if in_eq ko kl fk_rtest
+slot = ulong 3
+minl = ulong 4
+else
+if in_eq ko kl fk_diff
+slot = ulong 4
+minl = ulong 8
+else
+if in_eq ko kl fk_ret
+slot = ulong 5
+minl = ulong 8
+end
+end
+end
+end
+end
+end
+if eq slot 99
+put st s_badprop add get st s_badprop 1
+ret
+end
+if lt vl minl
+put st s_badlen add get st s_badlen 1
+ret
+end
+put fldcnt slot add get fldcnt slot 1
+end
+
+fn apply_field_hc ko ulong kl ulong vl ulong to void
+slot = ulong 99
+minl = ulong 0
+if in_eq ko kl fk_chg
+slot = ulong 0
+minl = ulong 8
+else
+if in_eq ko kl fk_why
+slot = ulong 1
+minl = ulong 8
+else
+if in_eq ko kl fk_rep
+slot = ulong 2
+minl = ulong 8
+else
+if in_eq ko kl fk_evr
+slot = ulong 3
+minl = ulong 4
+else
+if in_eq ko kl fk_rbk
+slot = ulong 4
+minl = ulong 8
+end
+end
+end
+end
+end
+if eq slot 99
+put st s_badprop add get st s_badprop 1
+ret
+end
+if lt vl minl
+put st s_badlen add get st s_badlen 1
+ret
+end
+put fldcnt slot add get fldcnt slot 1
+end
+
+fn apply_field_res ko ulong kl ulong vl ulong to void
+slot = ulong 99
+minl = ulong 0
+if in_eq ko kl fk_q
+slot = ulong 0
+minl = ulong 8
+else
+if in_eq ko kl fk_clm
+slot = ulong 1
+minl = ulong 12
+else
+if in_eq ko kl fk_src
+slot = ulong 2
+minl = ulong 8
+else
+if in_eq ko kl fk_oq
+slot = ulong 3
+minl = ulong 0
+end
+end
+end
+end
+if eq slot 99
+put st s_badprop add get st s_badprop 1
+ret
+end
+if lt vl minl
+put st s_badlen add get st s_badlen 1
+ret
+end
+put fldcnt slot add get fldcnt slot 1
+end
+
+fn apply_field_py ko ulong kl ulong vl ulong to void
+slot = ulong 99
+minl = ulong 0
+if in_eq ko kl fk_goal
+slot = ulong 0
+minl = ulong 4
+else
+if in_eq ko kl fk_code
+slot = ulong 1
+minl = ulong 4
+else
+if in_eq ko kl fk_out
+slot = ulong 2
+minl = ulong 0
+else
+if in_eq ko kl fk_ok
+slot = ulong 3
+minl = ulong 2
+else
+if in_eq ko kl fk_ev
+slot = ulong 4
+minl = ulong 2
+end
+end
+end
+end
+end
+if eq slot 99
+put st s_badprop add get st s_badprop 1
+ret
+end
+if lt vl minl
+put st s_badlen add get st s_badlen 1
+ret
+end
+put fldcnt slot add get fldcnt slot 1
+end
+
+fn handle_field_line ls ulong lim ulong to void
+ko = add ls 6
+sp = find_sp ko lim
+kl = sub sp ko
+vo = sp
+if lt sp lim
+vo = add sp 1
+end
+vl = sub lim vo
+sid = get st s_schema
+if eq sid sch_eng
+apply_field_eng ko kl vl
+else
+if eq sid sch_hc
+apply_field_hc ko kl vl
+else
+if eq sid sch_res
+apply_field_res ko kl vl
+else
+if eq sid sch_py
+apply_field_py ko kl vl
+else
+put st s_badprop add get st s_badprop 1
+end
+end
+end
+end
+end
+
+fn handle_eval_line ls ulong lim ulong to void
+p1 = add ls 5
+sp = find_sp p1 lim
+if or eq sp p1 ge sp lim
+put st s_badverd add get st s_badverd 1
+ret
+end
+p2 = add sp 1
+vc = parse_verdict p2 sub lim p2
+record_eval_run p1 sub sp p1 vc
+end
+
+fn evaluate_loaded to int
+tot = get st s_inlen
+for i ulong 14
+if ne i s_inlen
+put st i 0
+end
+end
+for j ulong 16
+put fldcnt j 0
+end
+pos = ulong 0
+while lt pos tot bound 32768
+ls = pos
+while lt pos tot bound 32768
+if eq get inbuf pos 10
+break
+end
+pos = add pos 1
+end
+ll = sub pos ls
+if gt ll 0
+if ne get inbuf ls 35
+if in_starts ls pos p_schema
+so = add ls 7
+sl = sub pos so
+if in_eq so sl sn_eng
+put st s_schema sch_eng
+else
+if in_eq so sl sn_hc
+put st s_schema sch_hc
+else
+if in_eq so sl sn_res
+put st s_schema sch_res
+else
+if in_eq so sl sn_py
+put st s_schema sch_py
+else
+put st s_schema sch_none
+put st s_badline add get st s_badline 1
+end
+end
+end
+end
+else
+if in_starts ls pos p_field
+handle_field_line ls pos
+else
+if in_starts ls pos p_text
+if check_slop add ls 5 pos
+put st s_slop add get st s_slop 1
+end
+else
+if in_starts ls pos p_wf
+check_wf_line ls pos
+else
+if in_starts ls pos p_eval
+handle_eval_line ls pos
+else
+put st s_badline add get st s_badline 1
+end
+end
+end
+end
+end
+end
+end
+if lt pos tot
+pos = add pos 1
+end
+end
+sid = get st s_schema
+if or eq sid sch_none gt get st s_badline 0
+ret 2
+end
+req = ulong 0
+if eq sid sch_eng
+req = ulong 6
+else
+if eq sid sch_hc
+req = ulong 5
+else
+if eq sid sch_res
+req = ulong 4
+else
+req = ulong 5
+end
+end
+end
+i = ulong 0
+while lt i req bound 8
+if eq get fldcnt i 0
+put st s_missfld add get st s_missfld 1
+end
+i = add i 1
+end
+sch_err = add add get st s_missfld get st s_badprop get st s_badlen
+if gt sch_err 0
+ret 1
+end
+if gt get st s_slop 0
+ret 1
+end
+if gt get st s_badwf 0
+ret 1
+end
+if eq get st s_runs 0
+ret 1
+end
+if gt get st s_badverd 0
+ret 1
+end
+if gt get st s_flaky 0
+ret 1
+end
+if gt get st s_nonpass 0
+ret 1
+end
+ret 0
+end
+
+fn read_stdin to bool
+tot = ulong 0
+while true bound 256
+k = read 0 rdbuf 0 4096
+if lt k 0
+ret false
+end
+if eq k 0
+break
+end
+kn = ulong k
+i = ulong 0
+while lt i kn bound 4096
+c = get rdbuf i
+if ne c 13
+if ge tot 32768
+ret false
+end
+put inbuf tot c
+tot = add tot 1
+end
+i = add i 1
+end
+end
+put st s_inlen tot
+ret true
+end
+
+fn main to int
+if not read_stdin
+wstr 2 m_io
+ret 2
+end
+rc = evaluate_loaded
+if eq rc 2
+wstr 2 m_bad_sch
+ret 2
+end
+if eq rc 0
+wstr 1 m_pass1
+wdec 1 get st s_runs
+wstr 1 m_pass2
+wdec 1 get st s_evalcnt
+wstr 1 t_nl
+ret 0
+end
+sch_err = add add get st s_missfld get st s_badprop get st s_badlen
+wstr 1 m_fail1
+wdec 1 sch_err
+wstr 1 m_fail2
+wdec 1 get st s_slop
+wstr 1 m_fail3
+wdec 1 get st s_badwf
+wstr 1 m_fail4
+wdec 1 get st s_badverd
+wstr 1 m_fail5
+wdec 1 get st s_flaky
+wstr 1 m_fail6
+wdec 1 get st s_nonpass
+wstr 1 m_fail7
+wdec 1 get st s_runs
+wstr 1 t_nl
+ret 1
+end

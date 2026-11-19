@@ -1,0 +1,880 @@
+note omega-projects: pure Omega project validator, TSV metadata parser, and HTML index emitter.
+note Ported from upstream omega-projects (.github/check_projects.py and index.html).
+note Compose with si/directives/om2.om before this file.
+
+const OP_MAX_SLUG ulong 40
+const OP_MAX_TITLE ulong 120
+const OP_MAX_DESC ulong 400
+const OP_MAX_SAVED ulong 32
+
+struct OpMeta h_off ulong h_len ulong s_off ulong s_len ulong t_off ulong t_len ulong d_off ulong d_len ulong v_off ulong v_len ulong valid ulong end
+
+text op_t_anon "anon-"
+text op_t_projects "projects/"
+text op_t_idxhtml "index.html"
+text op_t_readme "README.md"
+text op_t_metajson "meta.json"
+text op_t_amp "&amp;"
+text op_t_lt "&lt;"
+text op_t_gt "&gt;"
+text op_t_quot "&quot;"
+text op_t_apos "&#39;"
+
+text op_t_ghp "ghp_"
+text op_t_gho "gho_"
+text op_t_ghu "ghu_"
+text op_t_ghs "ghs_"
+text op_t_ghr "ghr_"
+text op_t_ghpat "github_pat_"
+text op_t_sk "sk-"
+text op_t_akia "AKIA"
+text op_t_aiza "AIza"
+text op_t_privkey "PRIVATE KEY-----"
+text op_t_jwt "eyJ"
+
+text op_t_ext_script "<script"
+text op_t_ext_iframe "<iframe"
+text op_t_ext_link "<link"
+text op_t_ext_object "<object"
+text op_t_ext_embed "<embed"
+text op_t_ext_base "<base"
+text op_t_ext_http "http://"
+text op_t_ext_https "https://"
+text op_t_ext_fetch "fetch("
+text op_t_ext_xhr "xmlhttprequest"
+text op_t_ext_ws "websocket"
+text op_t_ext_beacon "sendbeacon"
+
+text op_t_page_head "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; script-src 'none'; style-src 'unsafe-inline'\">\n<title>Omega projects</title>\n<style>\nbody{font:16px/1.5 system-ui,sans-serif;max-width:44rem;margin:2rem auto;padding:0 1rem;color:#1b1b1b}\na{color:#0b57d0}\n</style>\n</head>\n<body>\n<h1>Omega projects</h1>\n<ul id=\"projects\">\n"
+text op_t_page_empty "<li>No projects are live yet.</li>\n"
+text op_t_page_foot "</ul>\n<p>Each live project is served at <code>projects/&lt;handle&gt;/&lt;project&gt;/</code>.</p>\n</body>\n</html>\n"
+
+text op_t_card_a "<li class=\"project-card\" data-handle=\""
+text op_t_card_b "\" data-slug=\""
+text op_t_card_c "\"><a href=\"projects/"
+text op_t_card_d "/\"><strong>"
+text op_t_card_e "</strong></a> <span class=\"meta\">by "
+text op_t_card_f " ("
+text op_t_card_g ")</span><p>"
+text op_t_card_h "</p></li>\n"
+
+fn op_is_lower c uchar to bool
+if lt c 97
+ret false
+end
+if gt c 122
+ret false
+end
+ret true
+end
+
+fn op_is_digit c uchar to bool
+if lt c 48
+ret false
+end
+if gt c 57
+ret false
+end
+ret true
+end
+
+fn op_is_alnum_lower c uchar to bool
+if op_is_lower c
+ret true
+end
+ret op_is_digit c
+end
+
+fn op_is_hex_lower c uchar to bool
+if op_is_digit c
+ret true
+end
+if lt c 97
+ret false
+end
+if gt c 102
+ret false
+end
+ret true
+end
+
+fn op_to_lower c uchar to uchar
+if ge c 65
+if le c 90
+ret add c 32
+end
+end
+ret c
+end
+
+fn op_slice_eq a view uchar * aoff ulong alen ulong b view uchar * to bool
+if ne alen len b
+ret false
+end
+if gt add aoff alen len a
+ret false
+end
+i = ulong 0
+while lt i alen bound 65536
+if ne get a add aoff i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn op_match_at_ci hay view uchar * pos ulong ned view uchar * to bool
+nlen = len ned
+j = ulong 0
+while lt j nlen bound 256
+hc = op_to_lower get hay add pos j
+nc = op_to_lower get ned j
+if ne hc nc
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+fn op_has_substr_ci hay view uchar * hoff ulong hlen ulong ned view uchar * to bool
+nlen = len ned
+if eq nlen 0
+ret true
+end
+if lt hlen nlen
+ret false
+end
+if gt add hoff hlen len hay
+ret false
+end
+limit = add sub hlen nlen 1
+i = ulong 0
+while lt i limit bound 65536
+if op_match_at_ci hay add hoff i ned
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn op_match_at hay view uchar * pos ulong ned view uchar * to bool
+nlen = len ned
+j = ulong 0
+while lt j nlen bound 256
+if ne get hay add pos j get ned j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+fn op_has_substr hay view uchar * hoff ulong hlen ulong ned view uchar * to bool
+nlen = len ned
+if eq nlen 0
+ret true
+end
+if lt hlen nlen
+ret false
+end
+if gt add hoff hlen len hay
+ret false
+end
+limit = add sub hlen nlen 1
+i = ulong 0
+while lt i limit bound 65536
+if op_match_at hay add hoff i ned
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note Check control characters: refuse < 32 except tab(9), lf(10), cr(13), and refuse DEL(127).
+fn op_has_bad_text buf view uchar * off ulong n ulong to bool
+if gt add off n len buf
+ret true
+end
+i = ulong 0
+while lt i n bound 65536
+c = get buf add off i
+if eq c 127
+ret true
+end
+if lt c 32
+if ne c 9
+if ne c 10
+if ne c 13
+ret true
+end
+end
+end
+end
+i = add i 1
+end
+ret false
+end
+
+note Validate project slug: [a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])? (1..40 bytes).
+note Refuses path traversal (.., /), uppercase, spaces, control chars, HTML chars.
+fn op_valid_slug buf view uchar * off ulong n ulong to bool
+if eq n 0
+ret false
+end
+if gt n OP_MAX_SLUG
+ret false
+end
+if gt add off n len buf
+ret false
+end
+first = get buf off
+if not op_is_alnum_lower first
+ret false
+end
+last = get buf sub add off n 1
+if not op_is_alnum_lower last
+ret false
+end
+i = ulong 0
+while lt i n bound 64
+c = get buf add off i
+if not op_is_alnum_lower c
+if ne c 45
+ret false
+end
+end
+i = add i 1
+end
+ret true
+end
+
+note Validate builder handle:
+note   anon-[0-9a-f]{10}  OR  [a-z](?:[a-z0-9]|-(?=[a-z0-9])){1,23}-[0-9a-f]{8}
+fn op_valid_handle buf view uchar * off ulong n ulong to bool
+if gt add off n len buf
+ret false
+end
+if eq n 15
+if op_slice_eq buf off 5 op_t_anon
+i = ulong 5
+while lt i 15 bound 16
+if not op_is_hex_lower get buf add off i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+end
+if lt n 11
+ret false
+end
+if gt n 33
+ret false
+end
+if not op_is_lower get buf off
+ret false
+end
+dash_pos = sub n 9
+if ne get buf add off dash_pos 45
+ret false
+end
+j = ulong 1
+prev_dash = false
+while lt j dash_pos bound 32
+c = get buf add off j
+if eq c 45
+if prev_dash
+ret false
+end
+if eq add j 1 dash_pos
+ret false
+end
+prev_dash = true
+else
+if not op_is_alnum_lower c
+ret false
+end
+prev_dash = false
+end
+j = add j 1
+end
+k = add dash_pos 1
+while lt k n bound 16
+if not op_is_hex_lower get buf add off k
+ret false
+end
+k = add k 1
+end
+ret true
+end
+
+note Validate project file name:
+note   index.html | README.md | meta.json | [a-z0-9][a-z0-9_-]{0,39}.(om|js|css|md|txt|patch)
+fn op_valid_ext buf view uchar * off ulong n ulong to bool
+if eq n 2
+c0 = get buf off
+c1 = get buf add off 1
+if eq c0 111
+if eq c1 109
+ret true
+end
+end
+if eq c0 106
+if eq c1 115
+ret true
+end
+end
+if eq c0 109
+if eq c1 100
+ret true
+end
+end
+ret false
+end
+if eq n 3
+c0 = get buf off
+c1 = get buf add off 1
+c2 = get buf add off 2
+if eq c0 99
+if eq c1 115
+if eq c2 115
+ret true
+end
+end
+end
+if eq c0 116
+if eq c1 120
+if eq c2 116
+ret true
+end
+end
+end
+ret false
+end
+if eq n 5
+if eq get buf off 112
+if eq get buf add off 1 97
+if eq get buf add off 2 116
+if eq get buf add off 3 99
+if eq get buf add off 4 104
+ret true
+end
+end
+end
+end
+end
+end
+ret false
+end
+
+fn op_valid_filename buf view uchar * off ulong n ulong to bool
+if eq n 0
+ret false
+end
+if gt n 46
+ret false
+end
+if gt add off n len buf
+ret false
+end
+if op_slice_eq buf off n op_t_idxhtml
+ret true
+end
+if op_slice_eq buf off n op_t_readme
+ret true
+end
+if op_slice_eq buf off n op_t_metajson
+ret true
+end
+dot = ulong 0
+found_dot = false
+i = ulong 0
+while lt i n bound 64
+c = get buf add off i
+if eq c 46
+if found_dot
+ret false
+end
+dot = i
+found_dot = true
+end
+i = add i 1
+end
+if not found_dot
+ret false
+end
+if eq dot 0
+ret false
+end
+if gt dot 40
+ret false
+end
+if not op_is_alnum_lower get buf off
+ret false
+end
+j = ulong 1
+while lt j dot bound 64
+c = get buf add off j
+if not op_is_alnum_lower c
+if ne c 45
+if ne c 95
+ret false
+end
+end
+end
+j = add j 1
+end
+ext_off = add add off dot 1
+ext_len = sub sub n dot 1
+ret op_valid_ext buf ext_off ext_len
+end
+
+note Validate full repository path: projects/<handle>/<slug>/<filename>
+fn op_valid_project_path buf view uchar * off ulong n ulong to bool
+if lt n 12
+ret false
+end
+if gt add off n len buf
+ret false
+end
+if not op_slice_eq buf off 9 op_t_projects
+ret false
+end
+p1 = ulong 9
+slash1 = ulong 0
+found1 = false
+i = p1
+while lt i n bound 256
+if eq get buf add off i 47
+slash1 = i
+found1 = true
+break
+end
+i = add i 1
+end
+if not found1
+ret false
+end
+if not op_valid_handle buf add off p1 sub slash1 p1
+ret false
+end
+p2 = add slash1 1
+slash2 = ulong 0
+found2 = false
+j = p2
+while lt j n bound 256
+if eq get buf add off j 47
+slash2 = j
+found2 = true
+break
+end
+j = add j 1
+end
+if not found2
+ret false
+end
+if not op_valid_slug buf add off p2 sub slash2 p2
+ret false
+end
+p3 = add slash2 1
+if ge p3 n
+ret false
+end
+ret op_valid_filename buf add off p3 sub n p3
+end
+
+note Detect secret patterns matching upstream check_projects.py
+fn op_has_secret buf view uchar * off ulong n ulong to bool
+if op_has_substr buf off n op_t_ghp
+ret true
+end
+if op_has_substr buf off n op_t_gho
+ret true
+end
+if op_has_substr buf off n op_t_ghu
+ret true
+end
+if op_has_substr buf off n op_t_ghs
+ret true
+end
+if op_has_substr buf off n op_t_ghr
+ret true
+end
+if op_has_substr buf off n op_t_ghpat
+ret true
+end
+if op_has_substr buf off n op_t_sk
+ret true
+end
+if op_has_substr buf off n op_t_akia
+ret true
+end
+if op_has_substr buf off n op_t_aiza
+ret true
+end
+if op_has_substr buf off n op_t_privkey
+ret true
+end
+if op_has_substr buf off n op_t_jwt
+ret true
+end
+ret false
+end
+
+note Detect external web references matching upstream check_projects.py
+fn op_has_external_web buf view uchar * off ulong n ulong to bool
+if op_has_substr_ci buf off n op_t_ext_script
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_iframe
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_link
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_object
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_embed
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_base
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_http
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_https
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_fetch
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_xhr
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_ws
+ret true
+end
+if op_has_substr_ci buf off n op_t_ext_beacon
+ret true
+end
+ret false
+end
+
+note Validate saved timestamp field (e.g. 2026-11-18 or 2026-11-18T12:00:00Z).
+fn op_valid_saved buf view uchar * off ulong n ulong to bool
+if lt n 4
+ret false
+end
+if gt n OP_MAX_SAVED
+ret false
+end
+if gt add off n len buf
+ret false
+end
+i = ulong 0
+while lt i n bound 64
+c = get buf add off i
+ok = op_is_digit c
+if eq c 45
+ok = true
+end
+if eq c 58
+ok = true
+end
+if eq c 84
+ok = true
+end
+if eq c 90
+ok = true
+end
+if eq c 46
+ok = true
+end
+if not ok
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn op_validate_meta src view uchar * meta edit OpMeta to int
+if not op_valid_handle src get meta h_off get meta h_len
+ret -2
+end
+if not op_valid_slug src get meta s_off get meta s_len
+ret -3
+end
+tlen = get meta t_len
+if eq tlen 0
+ret -4
+end
+if gt tlen OP_MAX_TITLE
+ret -4
+end
+dlen = get meta d_len
+if gt dlen OP_MAX_DESC
+ret -5
+end
+if not op_valid_saved src get meta v_off get meta v_len
+ret -6
+end
+if op_has_bad_text src get meta t_off tlen
+ret -7
+end
+if op_has_bad_text src get meta d_off dlen
+ret -7
+end
+if op_has_secret src get meta t_off tlen
+ret -7
+end
+if op_has_secret src get meta d_off dlen
+ret -7
+end
+put meta valid ulong 1
+ret 0
+end
+
+note Parse TSV project metadata row: handle\tslug\ttitle\tdescription\tsaved
+note Returns 0 on success, negative error code on refusal:
+note   -1: bad column count (must be 5)
+note   -2: invalid handle
+note   -3: invalid slug
+note   -4: invalid title (empty or too long)
+note   -5: invalid description (too long)
+note   -6: invalid saved timestamp
+note   -7: control character or secret detected
+fn op_parse_tsv_line src view uchar * off ulong n ulong meta edit OpMeta to int
+put meta valid ulong 0
+if gt add off n len src
+ret -1
+end
+eff = n
+if gt eff 0
+if eq get src sub add off eff 1 10
+eff = sub eff 1
+end
+end
+if gt eff 0
+if eq get src sub add off eff 1 13
+eff = sub eff 1
+end
+end
+tabs = new ulong 5 0
+tcnt = ulong 0
+i = ulong 0
+while lt i eff bound 4096
+if eq get src add off i 9
+if lt tcnt 5
+put tabs tcnt i
+end
+tcnt = add tcnt 1
+end
+i = add i 1
+end
+if ne tcnt 4
+ret -1
+end
+put meta h_off off
+put meta h_len get tabs 0
+put meta s_off add add off get tabs 0 1
+put meta s_len sub sub get tabs 1 get tabs 0 1
+put meta t_off add add off get tabs 1 1
+put meta t_len sub sub get tabs 2 get tabs 1 1
+put meta d_off add add off get tabs 2 1
+put meta d_len sub sub get tabs 3 get tabs 2 1
+put meta v_off add add off get tabs 3 1
+put meta v_len sub sub eff get tabs 3 1
+ret op_validate_meta src meta
+end
+
+note Append slice src[0..len src] to dst at pos. Returns new pos or -1 on overflow.
+fn op_append_raw dst edit uchar * pos ulong src view uchar * to long
+n = len src
+if gt add pos n len dst
+ret -1
+end
+i = ulong 0
+while lt i n bound 65536
+put dst add pos i get src i
+i = add i 1
+end
+ret long add pos n
+end
+
+note Strict HTML escape: &, <, >, ", ' -> HTML entities. Refuses control bytes (<32 except \t\n\r, or 127).
+note Returns new pos (>= 0), -1 on buffer overflow, -2 on forbidden control byte.
+fn op_escape_html dst edit uchar * pos ulong src view uchar * to long
+n = len src
+p = pos
+i = ulong 0
+while lt i n bound 65536
+c = get src i
+if eq c 127
+ret -2
+end
+if lt c 32
+if ne c 9
+if ne c 10
+if ne c 13
+ret -2
+end
+end
+end
+end
+if eq c 38
+np = op_append_raw dst p op_t_amp
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 60
+np = op_append_raw dst p op_t_lt
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 62
+np = op_append_raw dst p op_t_gt
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 34
+np = op_append_raw dst p op_t_quot
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if eq c 39
+np = op_append_raw dst p op_t_apos
+if lt np 0
+ret -1
+end
+p = ulong np
+else
+if ge p len dst
+ret -1
+end
+put dst p c
+p = add p 1
+end
+end
+end
+end
+end
+i = add i 1
+end
+ret long p
+end
+
+fn op_emit_card_head dst edit uchar * pos ulong src view uchar * meta view OpMeta to long
+p = op_append_raw dst pos op_t_card_a
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p part src get meta h_off get meta h_len
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p op_t_card_b
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p part src get meta s_off get meta s_len
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p op_t_card_c
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p part src get meta h_off get meta h_len
+if lt p 0
+ret -1
+end
+if ge ulong p len dst
+ret -1
+end
+put dst ulong p uchar 47
+p = add p 1
+p = op_append_raw dst ulong p part src get meta s_off get meta s_len
+if lt p 0
+ret -1
+end
+ret op_append_raw dst ulong p op_t_card_d
+end
+
+fn op_emit_card_body dst edit uchar * pos ulong src view uchar * meta view OpMeta to long
+p = op_escape_html dst pos part src get meta t_off get meta t_len
+if lt p 0
+ret p
+end
+p = op_append_raw dst ulong p op_t_card_e
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p part src get meta h_off get meta h_len
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p op_t_card_f
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p part src get meta v_off get meta v_len
+if lt p 0
+ret -1
+end
+p = op_append_raw dst ulong p op_t_card_g
+if lt p 0
+ret -1
+end
+p = op_escape_html dst ulong p part src get meta d_off get meta d_len
+if lt p 0
+ret p
+end
+ret op_append_raw dst ulong p op_t_card_h
+end
+
+note Emit one deterministic HTML index card with strict HTML escaping.
+note Re-validates handle and slug before emitting. Returns new pos or negative error.
+fn op_emit_card dst edit uchar * pos ulong src view uchar * meta view OpMeta to long
+if ne get meta valid ulong 1
+ret -2
+end
+if not op_valid_handle src get meta h_off get meta h_len
+ret -2
+end
+if not op_valid_slug src get meta s_off get meta s_len
+ret -3
+end
+p = op_emit_card_head dst pos src meta
+if lt p 0
+ret p
+end
+ret op_emit_card_body dst ulong p src meta
+end
+
+fn op_emit_index_header dst edit uchar * pos ulong to long
+ret op_append_raw dst pos op_t_page_head
+end
+
+fn op_emit_index_empty dst edit uchar * pos ulong to long
+ret op_append_raw dst pos op_t_page_empty
+end
+
+fn op_emit_index_footer dst edit uchar * pos ulong to long
+ret op_append_raw dst pos op_t_page_foot
+end

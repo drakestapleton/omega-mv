@@ -1,0 +1,453 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/forge/provider.om: Request-bound FORGE provider registry & admission engine.
+note Matches declared computational contracts to eligible hardware providers.
+note Enforces honest qualification discipline (BLOCKED_HARDWARE / NOT_RUN never
+note promoted to QUALIFIED), strict substrate binding (no silent fallback to an
+note unrequested backend), FORGE V2 calibration freshness & envelope checks,
+note error-kind dominance, and eligible-set digital fallback admission.
+note Composable OM-2 library module (compose after hardware.om and envelope.om).
+
+note ---- Provider Qualification Statuses ----
+const FG_QUAL_QUALIFIED uint 1
+const FG_QUAL_EXERCISED uint 2
+const FG_QUAL_SIMULATED uint 3
+const FG_QUAL_BLOCKED_HW uint 4
+const FG_QUAL_NOT_RUN uint 5
+const FG_QUAL_FAULTED uint 6
+
+note ---- FORGE V2 Acceptable Error Kinds ----
+const FG_ERRK_EXACT uint 1
+const FG_ERRK_BOUNDED_DET uint 2
+const FG_ERRK_BOUNDED_STOCH uint 3
+const FG_ERRK_MEASURED_DIST uint 4
+
+note ---- FORGE V2 Fault States ----
+const FG_FAULT_NONE uint 0
+const FG_FAULT_TRANSIENT uint 1
+const FG_FAULT_PERSISTENT uint 2
+const FG_FAULT_UNAVAILABLE uint 3
+
+note ---- FORGE Lowering Kinds (forge_types.h) ----
+const FG_LOW_NONE uint 0
+const FG_LOW_SIMULATED uint 1
+const FG_LOW_COMPILED uint 2
+
+note ---- Admission Decision Status Codes ----
+const FG_ADMIT_OK uint 0
+const FG_ADMIT_BLOCKED_HARDWARE uint 1
+const FG_ADMIT_NOT_RUN uint 2
+const FG_ADMIT_NO_PROVIDER uint 3
+const FG_ADMIT_ENVELOPE_VIOL uint 4
+const FG_ADMIT_CAL_STALE uint 5
+const FG_ADMIT_CAL_ENVELOPE uint 6
+const FG_ADMIT_FAULTED uint 7
+const FG_ADMIT_ERROR_KIND uint 8
+const FG_ADMIT_NO_DIGITAL_FB uint 9
+const FG_ADMIT_QUEUE_FULL uint 10
+
+const FG_MAX_PROVIDERS uint 16
+
+note ---- Provider Registry Storage (globals accessed directly inside module) ----
+global fg_reg_cnt uint 1
+global fg_reg_pid uint 16
+global fg_reg_hwid uint 16
+global fg_reg_sub uint 16
+global fg_reg_qual uint 16
+global fg_reg_errk uint 16
+global fg_reg_creq uint 16
+global fg_reg_cepoch ulong 16
+global fg_reg_cwin ulong 16
+global fg_reg_ctmin int 16
+global fg_reg_ctmax int 16
+global fg_reg_fault uint 16
+global fg_reg_qact uint 16
+global fg_reg_low uint 16
+
+fn fg_reg_clear to void
+put fg_reg_cnt 0 uint 0
+for i ulong 16
+put fg_reg_pid i uint 0
+put fg_reg_hwid i uint 0
+put fg_reg_sub i uint 0
+put fg_reg_qual i uint 0
+put fg_reg_errk i uint 0
+put fg_reg_creq i uint 0
+put fg_reg_cepoch i ulong 0
+put fg_reg_cwin i ulong 0
+put fg_reg_ctmin i int 0
+put fg_reg_ctmax i int 0
+put fg_reg_fault i uint 0
+put fg_reg_qact i uint 0
+put fg_reg_low i uint 0
+end
+ret
+end
+
+fn fg_reg_count to uint
+ret get fg_reg_cnt 0
+end
+
+fn fg_reg_add p view ForgeProvider to bool
+n = get fg_reg_cnt 0
+if ge n FG_MAX_PROVIDERS
+ret false
+end
+idx = ulong n
+put fg_reg_pid idx get p prov_id
+put fg_reg_hwid idx get p hw_id
+put fg_reg_sub idx get p substrate_class
+put fg_reg_qual idx get p qual_status
+put fg_reg_errk idx get p error_kind
+put fg_reg_creq idx get p cal_req
+put fg_reg_cepoch idx get p cal_epoch_s
+put fg_reg_cwin idx get p cal_window_s
+put fg_reg_ctmin idx get p cal_tmin_mc
+put fg_reg_ctmax idx get p cal_tmax_mc
+put fg_reg_fault idx get p fault_state
+put fg_reg_qact idx get p active_queues
+put fg_reg_low idx get p lowering_kind
+put fg_reg_cnt 0 add n 1
+ret true
+end
+
+fn fg_reg_get idx uint dst edit ForgeProvider to bool
+n = get fg_reg_cnt 0
+if ge idx n
+ret false
+end
+k = ulong idx
+put dst prov_id get fg_reg_pid k
+put dst hw_id get fg_reg_hwid k
+put dst substrate_class get fg_reg_sub k
+put dst qual_status get fg_reg_qual k
+put dst error_kind get fg_reg_errk k
+put dst cal_req get fg_reg_creq k
+put dst cal_epoch_s get fg_reg_cepoch k
+put dst cal_window_s get fg_reg_cwin k
+put dst cal_tmin_mc get fg_reg_ctmin k
+put dst cal_tmax_mc get fg_reg_ctmax k
+put dst fault_state get fg_reg_fault k
+put dst active_queues get fg_reg_qact k
+put dst lowering_kind get fg_reg_low k
+ret true
+end
+
+fn fg_reg_find_by_id pid uint dst edit ForgeProvider to bool
+n = get fg_reg_cnt 0
+i = uint 0
+while lt i n bound 16
+if eq get fg_reg_pid ulong i pid
+ret fg_reg_get i dst
+end
+i = add i 1
+end
+ret false
+end
+
+fn fg_reg_set_fault idx uint fstate uint to bool
+if ge idx get fg_reg_cnt 0
+ret false
+end
+put fg_reg_fault ulong idx fstate
+ret true
+end
+
+fn fg_reg_set_queues idx uint qact uint to bool
+if ge idx get fg_reg_cnt 0
+ret false
+end
+put fg_reg_qact ulong idx qact
+ret true
+end
+
+note Populate standard FORGE providers (GB10, Grace CPU, Generic CPU, Analog Sim, Unqual GPU, Optical)
+fn fg_reg_load_defaults to void
+fg_reg_clear
+p = new ForgeProvider 1 FG_HW_GB10_SM121 FG_SUB_DIGITAL_GPU FG_QUAL_QUALIFIED FG_ERRK_EXACT 0 0 0 0 0 FG_FAULT_NONE 0 FG_LOW_COMPILED
+ok = fg_reg_add p
+put p prov_id uint 2
+put p hw_id FG_HW_AARCH64_GRACE
+put p substrate_class FG_SUB_DIGITAL_CPU
+put p qual_status FG_QUAL_QUALIFIED
+put p error_kind FG_ERRK_EXACT
+put p cal_req uint 0
+put p lowering_kind FG_LOW_COMPILED
+ok = and ok fg_reg_add p
+put p prov_id uint 3
+put p hw_id FG_HW_GENERIC_CPU
+put p substrate_class FG_SUB_DIGITAL_CPU
+put p qual_status FG_QUAL_EXERCISED
+put p error_kind FG_ERRK_EXACT
+put p cal_req uint 0
+put p lowering_kind FG_LOW_COMPILED
+ok = and ok fg_reg_add p
+put p prov_id uint 4
+put p hw_id FG_HW_ANALOG_SIM
+put p substrate_class FG_SUB_ANALOG_IN_MEMORY
+put p qual_status FG_QUAL_SIMULATED
+put p error_kind FG_ERRK_BOUNDED_DET
+put p cal_req uint 1
+put p cal_epoch_s ulong 1000
+put p cal_window_s ulong 3600
+put p cal_tmin_mc int 15000
+put p cal_tmax_mc int 65000
+put p lowering_kind FG_LOW_SIMULATED
+ok = and ok fg_reg_add p
+put p prov_id uint 5
+put p hw_id FG_HW_UNQUAL_GPU
+put p substrate_class FG_SUB_DIGITAL_GPU
+put p qual_status FG_QUAL_BLOCKED_HW
+put p error_kind FG_ERRK_EXACT
+put p cal_req uint 0
+put p cal_epoch_s ulong 0
+put p cal_window_s ulong 0
+put p cal_tmin_mc int 0
+put p cal_tmax_mc int 0
+put p lowering_kind FG_LOW_NONE
+ok = and ok fg_reg_add p
+put p prov_id uint 6
+put p hw_id FG_HW_OPTICAL_SIM
+put p substrate_class FG_SUB_OPTICAL_PHOTONIC
+put p qual_status FG_QUAL_NOT_RUN
+put p error_kind FG_ERRK_BOUNDED_STOCH
+put p cal_req uint 1
+put p cal_epoch_s ulong 1000
+put p cal_window_s ulong 600
+put p cal_tmin_mc int 20000
+put p cal_tmax_mc int 40000
+put p lowering_kind FG_LOW_NONE
+ok = and ok fg_reg_add p
+if not ok
+trap 8
+end
+ret
+end
+
+note ---- Calibration & Single-Provider Eligibility Checks (FORGE V2) ----
+
+fn fg_prov_check_cal p view ForgeProvider bud view ForgeBudget to uint
+if eq get p cal_req 0
+ret FG_ADMIT_OK
+end
+now_s = get bud now_epoch_s
+ep = get p cal_epoch_s
+win = get p cal_window_s
+if eq win 0
+ret FG_ADMIT_CAL_STALE
+end
+if lt now_s ep
+ret FG_ADMIT_CAL_STALE
+end
+if ge sub now_s ep win
+ret FG_ADMIT_CAL_STALE
+end
+tmc = get bud temp_mc
+if lt tmc get p cal_tmin_mc
+ret FG_ADMIT_CAL_ENVELOPE
+end
+if gt tmc get p cal_tmax_mc
+ret FG_ADMIT_CAL_ENVELOPE
+end
+ret FG_ADMIT_OK
+end
+
+fn fg_prov_eval_one p view ForgeProvider req view ForgeContract bud view ForgeBudget env edit ForgeEnvCheck to uint
+fg_env_reset env
+if ne get p fault_state FG_FAULT_NONE
+ret FG_ADMIT_FAULTED
+end
+qs = get p qual_status
+if eq qs FG_QUAL_FAULTED
+ret FG_ADMIT_FAULTED
+end
+if eq qs FG_QUAL_BLOCKED_HW
+ret FG_ADMIT_BLOCKED_HARDWARE
+end
+if eq qs FG_QUAL_NOT_RUN
+ret FG_ADMIT_NOT_RUN
+end
+if eq get req req_qual 1
+if ne qs FG_QUAL_QUALIFIED
+ret FG_ADMIT_BLOCKED_HARDWARE
+end
+end
+rk = get req error_kind
+if eq rk 0
+rk = FG_ERRK_EXACT
+end
+if gt get p error_kind rk
+ret FG_ADMIT_ERROR_KIND
+end
+crc = fg_prov_check_cal p bud
+if ne crc FG_ADMIT_OK
+ret crc
+end
+hid = new ForgeHwId 0 0 0 0 0 0 0 0 0 0 0 0
+hcap = new ForgeHwCap 0 0 0 0 0.0f64 0.0f64 0 0 0 0.0f64 0 0
+if not fg_hw_load_profile get p hw_id hid hcap
+ret FG_ADMIT_NO_PROVIDER
+end
+if ge get p active_queues get hcap max_queues
+ret FG_ADMIT_QUEUE_FULL
+end
+erc = fg_env_check hid hcap req bud env
+if ne erc FG_ENV_OK
+ret FG_ADMIT_ENVELOPE_VIOL
+end
+ret FG_ADMIT_OK
+end
+
+fn fg_env_copy dst edit ForgeEnvCheck src view ForgeEnvCheck to void
+put dst ok get src ok
+put dst violation get src violation
+put dst ws_bytes get src ws_bytes
+put dst traffic_bytes get src traffic_bytes
+put dst flops get src flops
+put dst eff_ctas get src eff_ctas
+put dst eff_thr get src eff_thr
+put dst waves get src waves
+put dst arith_int get src arith_int
+put dst comp_us get src comp_us
+put dst bw_us get src bw_us
+put dst roof_us get src roof_us
+put dst est_power_w get src est_power_w
+put dst est_energy_mj get src est_energy_mj
+put dst compute_bound get src compute_bound
+ret
+end
+
+note Refusal priority: prefer specific envelope/cal/error/qual reasons over generic NO_PROVIDER
+fn fg_refuse_prio code uint to uint
+if eq code FG_ADMIT_ENVELOPE_VIOL
+ret uint 10
+end
+if eq code FG_ADMIT_CAL_STALE
+ret uint 9
+end
+if eq code FG_ADMIT_CAL_ENVELOPE
+ret uint 9
+end
+if eq code FG_ADMIT_ERROR_KIND
+ret uint 8
+end
+if eq code FG_ADMIT_QUEUE_FULL
+ret uint 7
+end
+if eq code FG_ADMIT_BLOCKED_HARDWARE
+ret uint 6
+end
+if eq code FG_ADMIT_NOT_RUN
+ret uint 5
+end
+if eq code FG_ADMIT_FAULTED
+ret uint 4
+end
+ret uint 1
+end
+
+note Check whether any registered digital provider can satisfy the contract (FORGE V2 §10)
+fn fg_has_digital_fallback req view ForgeContract bud view ForgeBudget to uint
+n = get fg_reg_cnt 0
+p = new ForgeProvider 0 0 0 0 0 0 0 0 0 0 0 0 0
+tmp_env = new ForgeEnvCheck 0 0 0 0 0 0 0 0 0.0f64 0.0f64 0.0f64 0.0f64 0.0f64 0.0f64 0
+i = uint 0
+while lt i n bound 16
+if fg_reg_get i p
+if fg_sub_is_digital get p substrate_class
+rc = fg_prov_eval_one p req bud tmp_env
+if eq rc FG_ADMIT_OK
+ret uint 1
+end
+end
+end
+i = add i 1
+end
+ret uint 0
+end
+
+fn fg_admit_reset adm edit ForgeAdmit to void
+put adm admitted uint 0
+put adm status FG_ADMIT_NO_PROVIDER
+put adm prov_id uint 0
+put adm hw_id uint 0
+put adm env_viol FG_ENV_OK
+put adm has_dig_fb uint 0
+put adm elig_cnt uint 0
+ret
+end
+
+fn fg_prov_better cur view ForgeEnvCheck best view ForgeEnvCheck pid uint best_pid uint ec uint to bool
+if eq ec 0
+ret true
+end
+if lt get cur roof_us get best roof_us
+ret true
+end
+if eq get cur roof_us get best roof_us
+if lt pid best_pid
+ret true
+end
+end
+ret false
+end
+
+fn fg_prov_try_one idx uint req view ForgeContract bud view ForgeBudget adm edit ForgeAdmit best_env edit ForgeEnvCheck to void
+p = new ForgeProvider 0 0 0 0 0 0 0 0 0 0 0 0 0
+if not fg_reg_get idx p
+ret
+end
+if ne get req req_substrate 0
+if ne get p substrate_class get req req_substrate
+ret
+end
+end
+cur_env = new ForgeEnvCheck 0 0 0 0 0 0 0 0 0.0f64 0.0f64 0.0f64 0.0f64 0.0f64 0.0f64 0
+rc = fg_prov_eval_one p req bud cur_env
+if eq rc FG_ADMIT_OK
+ec = get adm elig_cnt
+if fg_prov_better cur_env best_env get p prov_id get adm prov_id ec
+put adm prov_id get p prov_id
+put adm hw_id get p hw_id
+fg_env_copy best_env cur_env
+end
+put adm elig_cnt add ec 1
+else
+if gt fg_refuse_prio rc fg_refuse_prio get adm status
+put adm status rc
+put adm env_viol get cur_env violation
+end
+end
+ret
+end
+
+note Request-bound provider admission engine (deterministic minimum-roofline selection)
+fn fg_prov_admit req view ForgeContract bud view ForgeBudget adm edit ForgeAdmit best_env edit ForgeEnvCheck to uint
+fg_admit_reset adm
+fg_env_reset best_env
+i = uint 0
+while lt i get fg_reg_cnt 0 bound 16
+fg_prov_try_one i req bud adm best_env
+i = add i 1
+end
+dig_fb = fg_has_digital_fallback req bud
+put adm has_dig_fb dig_fb
+if eq get adm elig_cnt 0
+put adm admitted uint 0
+ret get adm status
+end
+win = new ForgeProvider 0 0 0 0 0 0 0 0 0 0 0 0 0
+if fg_reg_find_by_id get adm prov_id win
+if not fg_sub_is_digital get win substrate_class
+if eq dig_fb 0
+put adm admitted uint 0
+put adm status FG_ADMIT_NO_DIGITAL_FB
+put adm env_viol FG_ENV_OK
+ret FG_ADMIT_NO_DIGITAL_FB
+end
+end
+end
+put adm admitted uint 1
+put adm status FG_ADMIT_OK
+put adm env_viol FG_ENV_OK
+ret FG_ADMIT_OK
+end

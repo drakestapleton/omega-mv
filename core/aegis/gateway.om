@@ -1,0 +1,902 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/aegis/gateway.om: AEGIS control-plane gateway router and JSON/SSE/WS formatter (pure OM-2).
+note Converted from aegis-runtime-mv/src/gateway.rs and src/auth.rs.
+note Routes: /health, /tasks, /tasks/submit, /heartbeat, /events, plus WS frame dispatch.
+note Enforces policy.om fail-closed authority gate on every request, strict input validation,
+note deterministic HTTP status codes, JSON/SSE response formatting, and journal auditing.
+
+const GW_RESP_CAP ulong 8192
+const GW_CT_JSON ulong 1
+const GW_CT_SSE ulong 2
+
+const HTTP_OK ulong 200
+const HTTP_CREATED ulong 201
+const HTTP_BAD_REQUEST ulong 400
+const HTTP_UNAUTHORIZED ulong 401
+const HTTP_FORBIDDEN ulong 403
+const HTTP_NOT_FOUND ulong 404
+const HTTP_METHOD_NOT_ALLOWED ulong 405
+const HTTP_CONFLICT ulong 409
+const HTTP_SERVICE_UNAVAILABLE ulong 503
+
+note gw_meta: [0]=status, [1]=resp_len, [2]=content_type, [3]=req_method, [4]=req_route,
+note          [5]=req_actor, [6]=req_caps, [7]=req_tok_ok, [8]=req_env_ok, [9]=req_path_bad
+global gw_meta ulong 16
+global gw_resp uchar 8192
+
+text gw_m_get "GET"
+text gw_m_head "HEAD"
+text gw_m_post "POST"
+
+text gw_p_health "/health"
+text gw_p_tasks "/tasks"
+text gw_p_submit "/tasks/submit"
+text gw_p_hb "/heartbeat"
+text gw_p_events "/events"
+
+text gw_hex_digits "0123456789abcdef"
+
+text gw_st_pending "pending"
+text gw_st_ready "ready"
+text gw_st_running "running"
+text gw_st_done "done"
+text gw_st_failed "failed"
+text gw_st_blocked "blocked"
+text gw_st_cancelled "cancelled"
+text gw_st_unknown "unknown"
+
+text gw_ev_sub "task_submitted"
+text gw_ev_dep "task_dep"
+text gw_ev_start "task_started"
+text gw_ev_done "task_done"
+text gw_ev_fail "task_failed"
+text gw_ev_blk "task_blocked"
+text gw_ev_can "task_cancelled"
+text gw_ev_lacq "lease_acquired"
+text gw_ev_lrec "lease_reclaimed"
+text gw_ev_hb "heartbeat_tick"
+text gw_ev_pden "policy_denied"
+
+text gw_j_health0 "{\"status\":\"healthy\",\"engine\":\"aegis-runtime-om/0.2.0\",\"tick\":"
+text gw_j_health1 ",\"tasks\":"
+text gw_j_health2 ",\"active_leases\":"
+text gw_j_health3 ",\"journal_seq\":"
+text gw_j_health4 ",\"degraded\":"
+text gw_j_health5 ",\"zero_disk_secrets\":true}"
+
+text gw_j_true "true"
+text gw_j_false "false"
+text gw_j_tasks0 "{\"tasks\":["
+text gw_j_tasks1 "]}"
+text gw_j_titem0 "{\"id\":"
+text gw_j_titem1 ",\"state\":\""
+text gw_j_titem2 "\",\"priority\":"
+text gw_j_titem3 ",\"blocked_by\":"
+text gw_j_titem4 ",\"lease_owner\":"
+text gw_j_titem5 "}"
+
+text gw_j_sub0 "{\"status\":\"created\",\"task_id\":"
+text gw_j_sub1 ",\"state\":\""
+text gw_j_sub2 "\",\"journal_seq\":"
+text gw_j_sub3 "}"
+
+text gw_j_hb0 "{\"status\":\""
+text gw_j_hb_nom "nominal"
+text gw_j_hb_deg "degraded"
+text gw_j_hb1 "\",\"tick\":"
+text gw_j_hb2 ",\"pulse\":"
+text gw_j_hb3 ",\"reclaimed\":"
+text gw_j_hb4 ",\"active_leases\":"
+text gw_j_hb5 "}"
+
+text gw_sse_id "id: "
+text gw_sse_ev "\nevent: "
+text gw_sse_d0 "\ndata: {\"seq\":"
+text gw_sse_d1 ",\"tick\":"
+text gw_sse_d2 ",\"kind\":\""
+text gw_sse_d3 "\",\"task_id\":"
+text gw_sse_d4 ",\"aux\":"
+text gw_sse_d5 ",\"hash\":\""
+text gw_sse_d6 "\"}\n\n"
+
+text gw_err0 "{\"error\":\""
+text gw_err1 "\",\"decision_code\":"
+text gw_err2 "}"
+
+text gw_em_notok "operator_token_not_configured"
+text gw_em_unauth "operator_token_required"
+text gw_em_cap "missing_required_capability"
+text gw_em_env "unverified_action_envelope"
+text gw_em_esc "privilege_escalation_refused"
+text gw_em_cont "containment_active"
+text gw_em_route "route_not_found"
+text gw_em_meth "method_not_allowed"
+text gw_em_appr "operator_approval_required"
+text gw_em_badreq "invalid_request_payload"
+text gw_em_cycle "dependency_cycle_refused"
+text gw_em_dup "duplicate_task_id"
+text gw_em_conflict "state_conflict"
+text gw_em_full "runtime_capacity_exhausted"
+
+text gw_k_id "id"
+text gw_k_prio "prio"
+text gw_k_kind "kind"
+text gw_k_prereq "prereq"
+text gw_k_tick "tick"
+text gw_k_agent "agent"
+text gw_k_cap "cap"
+
+text gw_ws_ping "ping"
+text gw_ws_hb "heartbeat"
+text gw_ws_tasks "tasks"
+text gw_ws_pong0 "{\"type\":\"pong\",\"tick\":"
+text gw_ws_pong1 "}"
+text gw_ws_err "{\"type\":\"error\",\"error\":\"unknown_ws_frame\"}"
+text gw_jrn_gw "gw"
+
+fn gw_reset to void
+for i ulong 16
+put gw_meta i 0
+end
+end
+
+fn gw_status to ulong
+ret get gw_meta 0
+end
+
+fn gw_resp_len to ulong
+ret get gw_meta 1
+end
+
+fn gw_content_type to ulong
+ret get gw_meta 2
+end
+
+fn gw_buf_reset to void
+put gw_meta 1 0
+end
+
+fn gw_put_byte b uchar to void
+p = get gw_meta 1
+if lt p GW_RESP_CAP
+put gw_resp p b
+put gw_meta 1 add p 1
+end
+end
+
+fn gw_put_bytes s view uchar * to void
+n = len s
+for i ulong n bound 8192
+gw_put_byte get s i
+end
+end
+
+fn gw_put_u64 v ulong to void
+if eq v 0
+gw_put_byte uchar 48
+ret
+end
+digs = new uchar 24 0
+cnt = ulong 0
+x = v
+while gt x 0 bound 24
+d = rem x 10
+put digs cnt uchar add 48 d
+cnt = add cnt 1
+x = div x 10
+end
+while gt cnt 0 bound 24
+cnt = sub cnt 1
+gw_put_byte get digs cnt
+end
+end
+
+fn gw_put_hex32 h view uchar 32 to void
+for i ulong 32
+b = get h i
+hi = ulong shr b 4
+lo = ulong and b 15
+gw_put_byte get gw_hex_digits hi
+gw_put_byte get gw_hex_digits lo
+end
+end
+
+fn gw_put_task_state st ulong to void
+if eq st TASK_PENDING
+gw_put_bytes gw_st_pending
+ret
+end
+if eq st TASK_READY
+gw_put_bytes gw_st_ready
+ret
+end
+if eq st TASK_RUNNING
+gw_put_bytes gw_st_running
+ret
+end
+if eq st TASK_DONE
+gw_put_bytes gw_st_done
+ret
+end
+if eq st TASK_FAILED
+gw_put_bytes gw_st_failed
+ret
+end
+if eq st TASK_BLOCKED
+gw_put_bytes gw_st_blocked
+ret
+end
+if eq st TASK_CANCELLED
+gw_put_bytes gw_st_cancelled
+ret
+end
+gw_put_bytes gw_st_unknown
+end
+
+fn gw_put_event_kind k ulong to void
+if eq k EVT_TASK_SUBMITTED
+gw_put_bytes gw_ev_sub
+ret
+end
+if eq k EVT_TASK_DEP
+gw_put_bytes gw_ev_dep
+ret
+end
+if eq k EVT_TASK_STARTED
+gw_put_bytes gw_ev_start
+ret
+end
+if eq k EVT_TASK_DONE
+gw_put_bytes gw_ev_done
+ret
+end
+if eq k EVT_TASK_FAILED
+gw_put_bytes gw_ev_fail
+ret
+end
+if eq k EVT_TASK_BLOCKED
+gw_put_bytes gw_ev_blk
+ret
+end
+if eq k EVT_TASK_CANCELLED
+gw_put_bytes gw_ev_can
+ret
+end
+if eq k EVT_LEASE_ACQUIRED
+gw_put_bytes gw_ev_lacq
+ret
+end
+if eq k EVT_LEASE_RECLAIMED
+gw_put_bytes gw_ev_lrec
+ret
+end
+if eq k EVT_HEARTBEAT_TICK
+gw_put_bytes gw_ev_hb
+ret
+end
+if eq k EVT_POLICY_DENIED
+gw_put_bytes gw_ev_pden
+ret
+end
+gw_put_bytes gw_st_unknown
+end
+
+fn gw_set_error status ulong msg view uchar * code ulong to ulong
+gw_buf_reset
+put gw_meta 0 status
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_err0
+gw_put_bytes msg
+gw_put_bytes gw_err1
+gw_put_u64 code
+gw_put_bytes gw_err2
+ret status
+end
+
+fn gw_parse_method m view uchar * to ulong
+if pol_str_eq m gw_m_get
+ret METHOD_GET
+end
+if pol_str_eq m gw_m_head
+ret METHOD_HEAD
+end
+if pol_str_eq m gw_m_post
+ret METHOD_POST
+end
+ret METHOD_UNKNOWN
+end
+
+note Strict path validation: non-empty, <=128 bytes, printable ASCII without spaces/controls, no "..".
+fn gw_path_valid p view uchar * to bool
+n = len p
+if or eq n 0 gt n 128
+ret false
+end
+if ne get p 0 uchar 47
+ret false
+end
+prev_dot = false
+for i ulong n bound 128
+c = get p i
+if or lt c 0x21 gt c 0x7e
+ret false
+end
+if eq c uchar 46
+if prev_dot
+ret false
+end
+prev_dot = true
+else
+prev_dot = false
+end
+end
+ret true
+end
+
+fn gw_parse_route p view uchar * to ulong
+if not gw_path_valid p
+ret ROUTE_UNKNOWN
+end
+if pol_str_eq p gw_p_health
+ret ROUTE_HEALTH
+end
+if pol_str_eq p gw_p_tasks
+ret ROUTE_TASKS
+end
+if pol_str_eq p gw_p_submit
+ret ROUTE_TASKS_SUBMIT
+end
+if pol_str_eq p gw_p_hb
+ret ROUTE_HEARTBEAT
+end
+if pol_str_eq p gw_p_events
+ret ROUTE_EVENTS
+end
+ret ROUTE_UNKNOWN
+end
+
+note Validate request body has no NUL or unsafe control characters and fits within 512 bytes.
+fn gw_body_valid b view uchar * to bool
+n = len b
+if gt n 512
+ret false
+end
+for i ulong n bound 512
+c = get b i
+if and lt c 32 and ne c 10 and ne c 13 ne c 9
+ret false
+end
+if gt c 126
+ret false
+end
+end
+ret true
+end
+
+fn gw_is_key_delim c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 44
+ret true
+end
+if eq c 123
+ret true
+end
+if eq c 34
+ret true
+end
+if eq c 38
+ret true
+end
+ret false
+end
+
+fn gw_is_val_delim c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 44
+ret true
+end
+if eq c 125
+ret true
+end
+if eq c 38
+ret true
+end
+if or eq c 10 eq c 13
+ret true
+end
+ret false
+end
+
+note Check whether key matches body starting at pos, followed by '=' or '":' or ':'.
+note Returns offset right after separator, or -1 if no match.
+fn gw_match_key_at body view uchar * pos ulong key view uchar * to long
+nb = len body
+nk = len key
+if gt add pos nk nb
+ret -1
+end
+note Require boundary before key (start, space, comma, '{', '"', '&').
+if gt pos 0
+prev = get body sub pos 1
+if not gw_is_key_delim prev
+ret -1
+end
+end
+for i ulong nk bound 32
+if ne get body add pos i get key i
+ret -1
+end
+end
+p = add pos nk
+if lt p nb
+if eq get body p 34
+p = add p 1
+end
+end
+if ge p nb
+ret -1
+end
+sep = get body p
+if and ne sep 61 ne sep 58
+ret -1
+end
+p = add p 1
+while lt p nb bound 16
+if eq get body p 32
+p = add p 1
+else
+break
+end
+end
+ret long p
+end
+
+note Parse decimal u64 starting at offset p in body. Returns 1 if valid (written to dst[0]), 2 if malformed.
+fn gw_parse_u64_at body view uchar * p0 ulong dst edit ulong 1 to ulong
+nb = len body
+p = p0
+if ge p nb
+ret 2
+end
+first = get body p
+if or lt first 48 gt first 57
+ret 2
+end
+val = ulong 0
+digits = ulong 0
+while lt p nb bound 32
+c = get body p
+if and ge c 48 le c 57
+if gt digits 18
+ret 2
+end
+val = add mul val 10 ulong sub c 48
+digits = add digits 1
+p = add p 1
+else
+if gw_is_val_delim c
+break
+end
+ret 2
+end
+end
+put dst 0 val
+ret 1
+end
+
+note Extract a strict non-negative decimal u64 for `key` from `body`.
+note Returns: 0 = not found, 1 = found valid (written to dst[0]), 2 = malformed number.
+fn gw_extract_u64 body view uchar * key view uchar * dst edit ulong 1 to ulong
+put dst 0 0
+nb = len body
+for pos ulong nb bound 512
+m = gw_match_key_at body pos key
+if ge m 0
+ret gw_parse_u64_at body ulong m dst
+end
+end
+ret 0
+end
+
+note Stage 1: Parse and validate HTTP method and route path.
+fn gw_req_begin method view uchar * path view uchar * to ulong
+put gw_meta 3 gw_parse_method method
+put gw_meta 4 gw_parse_route path
+if gw_path_valid path
+put gw_meta 9 0
+else
+put gw_meta 9 1
+end
+put gw_meta 5 0
+put gw_meta 6 CAP_NONE
+put gw_meta 7 0
+put gw_meta 8 0
+ret get gw_meta 4
+end
+
+note Stage 2: Attach caller credentials and verify operator token in constant time.
+fn gw_req_auth actor_id ulong req_caps ulong token view uchar * env_ok bool to void
+put gw_meta 5 actor_id
+put gw_meta 6 req_caps
+if pol_verify_token token
+put gw_meta 7 1
+else
+put gw_meta 7 0
+end
+if env_ok
+put gw_meta 8 1
+else
+put gw_meta 8 0
+end
+end
+
+fn gw_handle_health to ulong
+gw_buf_reset
+put gw_meta 0 HTTP_OK
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_j_health0
+gw_put_u64 hb_current_tick
+gw_put_bytes gw_j_health1
+gw_put_u64 dag_task_count
+gw_put_bytes gw_j_health2
+gw_put_u64 hb_active_leases
+gw_put_bytes gw_j_health3
+gw_put_u64 jrn_last_seq
+gw_put_bytes gw_j_health4
+if hb_is_degraded
+gw_put_bytes gw_j_true
+else
+gw_put_bytes gw_j_false
+end
+gw_put_bytes gw_j_health5
+ret HTTP_OK
+end
+
+fn gw_handle_tasks to ulong
+gw_buf_reset
+put gw_meta 0 HTTP_OK
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_j_tasks0
+n = dag_task_count
+for i ulong n bound 128
+if gt i 0
+gw_put_byte uchar 44
+end
+tid = dag_slot_tid i
+gw_put_bytes gw_j_titem0
+gw_put_u64 tid
+gw_put_bytes gw_j_titem1
+gw_put_task_state dag_slot_state i
+gw_put_bytes gw_j_titem2
+gw_put_u64 dag_slot_prio i
+gw_put_bytes gw_j_titem3
+gw_put_u64 dag_slot_blocked_by i
+gw_put_bytes gw_j_titem4
+gw_put_u64 hb_lease_owner tid
+gw_put_bytes gw_j_titem5
+end
+gw_put_bytes gw_j_tasks1
+ret HTTP_OK
+end
+
+fn gw_submit_apply tid ulong prio ulong kind ulong pre ulong to ulong
+exists = dag_find_slot tid
+if lt exists 0
+rc = dag_add_task tid prio kind
+if eq rc DAG_ERR_FULL
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_full rc
+end
+if ne rc DAG_OK
+ret gw_set_error HTTP_CONFLICT gw_em_dup rc
+end
+aux = or shl kind 32 and prio 0xffffffff
+jrc = jrn_append EVT_TASK_SUBMITTED tid aux hb_current_tick gw_jrn_gw
+if ne jrc JRN_OK
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_full jrc
+end
+else
+if eq pre 0
+ret gw_set_error HTTP_CONFLICT gw_em_dup DAG_ERR_DUPLICATE_TASK
+end
+end
+if gt pre 0
+drc = dag_add_dep tid pre
+if eq drc DAG_ERR_CYCLE
+ret gw_set_error HTTP_CONFLICT gw_em_cycle drc
+end
+if ne drc DAG_OK
+ret gw_set_error HTTP_CONFLICT gw_em_conflict drc
+end
+jrc2 = jrn_append EVT_TASK_DEP tid pre hb_current_tick gw_jrn_gw
+if ne jrc2 JRN_OK
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_full jrc2
+end
+end
+rdy = dag_solve_ready
+if gt rdy DAG_MAX_TASKS
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_full DAG_ERR_FULL
+end
+gw_buf_reset
+put gw_meta 0 HTTP_CREATED
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_j_sub0
+gw_put_u64 tid
+gw_put_bytes gw_j_sub1
+gw_put_task_state dag_get_state tid
+gw_put_bytes gw_j_sub2
+gw_put_u64 jrn_last_seq
+gw_put_bytes gw_j_sub3
+ret HTTP_CREATED
+end
+
+fn gw_handle_submit body view uchar * to ulong
+v = new ulong 1 0
+if eq len body 0
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 100
+end
+r = gw_extract_u64 body gw_k_id v
+if or ne r 1 eq get v 0 0
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 101
+end
+tid = get v 0
+r = gw_extract_u64 body gw_k_prio v
+if eq r 2
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 102
+end
+prio = get v 0
+if gt prio 1000
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 103
+end
+r = gw_extract_u64 body gw_k_kind v
+if eq r 2
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 104
+end
+kind = get v 0
+r = gw_extract_u64 body gw_k_prereq v
+if eq r 2
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 105
+end
+pre = get v 0
+ret gw_submit_apply tid prio kind pre
+end
+
+fn gw_hb_apply tk ulong ag ulong cp ulong to ulong
+if and gt ag 0 gt cp 0
+rrc = hb_register_agent ag cp
+if and ne rrc HB_OK ne rrc HB_ERR_DUPLICATE
+ret gw_set_error HTTP_CONFLICT gw_em_conflict rrc
+end
+end
+if gt ag 0
+hrc = hb_heartbeat ag tk
+if ne hrc HB_OK
+ret gw_set_error HTTP_CONFLICT gw_em_conflict hrc
+end
+end
+trc = hb_tick tk
+if ne trc HB_OK
+ret gw_set_error HTTP_CONFLICT gw_em_conflict trc
+end
+recl = hb_last_reclaimed
+for i ulong recl bound 128
+rtid = hb_get_reclaimed i
+if eq dag_get_state rtid TASK_RUNNING
+q = dag_requeue_task rtid
+if eq q DAG_OK
+j1 = jrn_append EVT_LEASE_RECLAIMED rtid tk tk gw_jrn_gw
+if ne j1 JRN_OK
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_full j1
+end
+end
+end
+end
+j2 = jrn_append EVT_HEARTBEAT_TICK 0 recl tk gw_jrn_gw
+if ne j2 JRN_OK
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_full j2
+end
+gw_buf_reset
+put gw_meta 0 HTTP_OK
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_j_hb0
+if hb_is_degraded
+gw_put_bytes gw_j_hb_deg
+else
+gw_put_bytes gw_j_hb_nom
+end
+gw_put_bytes gw_j_hb1
+gw_put_u64 hb_current_tick
+gw_put_bytes gw_j_hb2
+gw_put_u64 hb_pulse_count
+gw_put_bytes gw_j_hb3
+gw_put_u64 recl
+gw_put_bytes gw_j_hb4
+gw_put_u64 hb_active_leases
+gw_put_bytes gw_j_hb5
+ret HTTP_OK
+end
+
+fn gw_handle_heartbeat body view uchar * to ulong
+v = new ulong 1 0
+if eq len body 0
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 200
+end
+r = gw_extract_u64 body gw_k_tick v
+if ne r 1
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 201
+end
+tk = get v 0
+r = gw_extract_u64 body gw_k_agent v
+if eq r 2
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 202
+end
+ag = get v 0
+r = gw_extract_u64 body gw_k_cap v
+if eq r 2
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 203
+end
+cp = get v 0
+ret gw_hb_apply tk ag cp
+end
+
+fn gw_handle_events to ulong
+gw_buf_reset
+put gw_meta 0 HTTP_OK
+put gw_meta 2 GW_CT_SSE
+h = new uchar 32 0
+n = jrn_count
+for i ulong n bound 128
+gw_put_bytes gw_sse_id
+gw_put_u64 jrn_rec_seq i
+gw_put_bytes gw_sse_ev
+gw_put_event_kind jrn_rec_kind i
+gw_put_bytes gw_sse_d0
+gw_put_u64 jrn_rec_seq i
+gw_put_bytes gw_sse_d1
+gw_put_u64 jrn_rec_tick i
+gw_put_bytes gw_sse_d2
+gw_put_event_kind jrn_rec_kind i
+gw_put_bytes gw_sse_d3
+gw_put_u64 jrn_rec_task_id i
+gw_put_bytes gw_sse_d4
+gw_put_u64 jrn_rec_aux i
+gw_put_bytes gw_sse_d5
+rc = jrn_copy_hash i h
+if eq rc JRN_OK
+gw_put_hex32 h
+end
+gw_put_bytes gw_sse_d6
+end
+ret HTTP_OK
+end
+
+note Map policy denial code to HTTP status and record EVT_POLICY_DENIED in journal.
+fn gw_reject_policy route ulong dec ulong to ulong
+jrc = jrn_append EVT_POLICY_DENIED route dec hb_current_tick gw_jrn_gw
+if gt jrc 999
+ret HTTP_SERVICE_UNAVAILABLE
+end
+if eq dec POL_DENY_NO_TOKEN_CONFIG
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_notok dec
+end
+if eq dec POL_DENY_UNAUTHORIZED
+ret gw_set_error HTTP_UNAUTHORIZED gw_em_unauth dec
+end
+if eq dec POL_DENY_MISSING_CAP
+ret gw_set_error HTTP_FORBIDDEN gw_em_cap dec
+end
+if eq dec POL_DENY_UNVERIFIED_ENV
+ret gw_set_error HTTP_FORBIDDEN gw_em_env dec
+end
+if eq dec POL_DENY_ESCALATION
+ret gw_set_error HTTP_FORBIDDEN gw_em_esc dec
+end
+if eq dec POL_DENY_CONTAINED
+ret gw_set_error HTTP_FORBIDDEN gw_em_cont dec
+end
+if eq dec POL_REQUIRE_APPROVAL
+ret gw_set_error HTTP_FORBIDDEN gw_em_appr dec
+end
+if eq dec POL_DENY_METHOD_NOT_ALLOWED
+ret gw_set_error HTTP_METHOD_NOT_ALLOWED gw_em_meth dec
+end
+ret gw_set_error HTTP_NOT_FOUND gw_em_route dec
+end
+
+note Stage 3: Authorize staged request via policy.om and route to handler.
+fn gw_req_dispatch body view uchar * to ulong
+if ne get gw_meta 9 0
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 300
+end
+meth = get gw_meta 3
+if eq meth METHOD_UNKNOWN
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 301
+end
+if not gw_body_valid body
+ret gw_set_error HTTP_BAD_REQUEST gw_em_badreq 302
+end
+route = get gw_meta 4
+actor = get gw_meta 5
+caps = get gw_meta 6
+tok_ok = ne get gw_meta 7 0
+env_ok = ne get gw_meta 8 0
+dec = pol_authorize_request meth route actor caps tok_ok env_ok
+if ne dec POL_ALLOW
+ret gw_reject_policy route dec
+end
+if eq route ROUTE_HEALTH
+ret gw_handle_health
+end
+if eq route ROUTE_EVENTS
+ret gw_handle_events
+end
+if eq route ROUTE_TASKS
+ret gw_handle_tasks
+end
+if eq route ROUTE_TASKS_SUBMIT
+ret gw_handle_submit body
+end
+if eq route ROUTE_HEARTBEAT
+ret gw_handle_heartbeat body
+end
+ret gw_set_error HTTP_NOT_FOUND gw_em_route POL_DENY_INVALID_ROUTE
+end
+
+note WebSocket control-plane frame router (requires authenticated operator/worker token).
+fn gw_ws_frame actor_id ulong req_caps ulong tok_ok bool frame view uchar * to ulong
+if not pol_is_configured
+ret gw_set_error HTTP_SERVICE_UNAVAILABLE gw_em_notok POL_DENY_NO_TOKEN_CONFIG
+end
+if not tok_ok
+ret gw_set_error HTTP_UNAUTHORIZED gw_em_unauth POL_DENY_UNAUTHORIZED
+end
+if pol_str_eq frame gw_ws_ping
+gw_buf_reset
+put gw_meta 0 HTTP_OK
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_ws_pong0
+gw_put_u64 hb_current_tick
+gw_put_bytes gw_ws_pong1
+ret HTTP_OK
+end
+if pol_str_eq frame gw_ws_tasks
+dec = pol_authorize_request METHOD_GET ROUTE_TASKS actor_id req_caps tok_ok true
+if ne dec POL_ALLOW
+ret gw_reject_policy ROUTE_TASKS dec
+end
+ret gw_handle_tasks
+end
+if pol_str_eq frame gw_ws_hb
+dec2 = pol_authorize_request METHOD_POST ROUTE_HEARTBEAT actor_id req_caps tok_ok true
+if ne dec2 POL_ALLOW
+ret gw_reject_policy ROUTE_HEARTBEAT dec2
+end
+trc = hb_tick add hb_current_tick 1
+if ne trc HB_OK
+ret gw_set_error HTTP_CONFLICT gw_em_conflict trc
+end
+gw_buf_reset
+put gw_meta 0 HTTP_OK
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_j_hb0
+gw_put_bytes gw_j_hb_nom
+gw_put_bytes gw_j_hb1
+gw_put_u64 hb_current_tick
+gw_put_bytes gw_j_hb2
+gw_put_u64 hb_pulse_count
+gw_put_bytes gw_j_hb3
+gw_put_u64 hb_last_reclaimed
+gw_put_bytes gw_j_hb4
+gw_put_u64 hb_active_leases
+gw_put_bytes gw_j_hb5
+ret HTTP_OK
+end
+gw_buf_reset
+put gw_meta 0 HTTP_BAD_REQUEST
+put gw_meta 2 GW_CT_JSON
+gw_put_bytes gw_ws_err
+ret HTTP_BAD_REQUEST
+end

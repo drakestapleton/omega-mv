@@ -1,0 +1,1464 @@
+note aienux/pi-register/lib.om: pure-Omega service registry parser, validator, lookup, and renderer
+note Faithful port of upstream pi-register with port range (1..65535), protocol/status validation,
+note duplicate name/port conflict detection, wildcard ignore matching, filtered lookup,
+note and deterministic plain-text and JSONL rendering.
+note Compose with si/directives/om2.om ahead of this file.
+
+const PI_MAX_SVC ulong 64
+const PI_NAME_SLOT ulong 64
+const PI_PURP_SLOT ulong 128
+const PI_OWN_SLOT ulong 64
+const PI_UNIT_SLOT ulong 64
+const PI_CAT_SLOT ulong 32
+
+const PI_OK ulong 0
+const PI_ERR_SYNTAX ulong 1
+const PI_ERR_MISSING_FIELD ulong 2
+const PI_ERR_BAD_PORT ulong 3
+const PI_ERR_BAD_PROTO ulong 4
+const PI_ERR_BAD_STATUS ulong 5
+const PI_ERR_DUP_NAME ulong 6
+const PI_ERR_DUP_PORT ulong 7
+const PI_ERR_FULL ulong 8
+const PI_ERR_TOO_LONG ulong 9
+
+const PROTO_TCP ulong 1
+const PROTO_UDP ulong 2
+const PROTO_HTTP ulong 3
+const PROTO_HTTPS ulong 4
+const PROTO_UNIX ulong 5
+const PROTO_NONE ulong 6
+
+const STAT_ACTIVE ulong 1
+const STAT_INACTIVE ulong 2
+const STAT_DEGRADED ulong 3
+const STAT_DISABLED ulong 4
+const STAT_MISSING ulong 5
+const STAT_UNKNOWN ulong 6
+
+const FILT_ALL ulong 0
+const FILT_OWNER ulong 1
+const FILT_PROTO ulong 2
+const FILT_STATUS ulong 3
+const FILT_CAT ulong 4
+const FILT_PORT ulong 5
+const FILT_BOOT ulong 6
+
+struct PiParseInfo code ulong line ulong svc_n ulong end
+
+note Global flat service registry tables (up to 64 services)
+global g_pi_n ulong 1
+global g_pi_name uchar 4096
+global g_pi_name_len ulong 64
+global g_pi_purp uchar 8192
+global g_pi_purp_len ulong 64
+global g_pi_own uchar 4096
+global g_pi_own_len ulong 64
+global g_pi_unit uchar 4096
+global g_pi_unit_len ulong 64
+global g_pi_cat uchar 2048
+global g_pi_cat_len ulong 64
+global g_pi_port ulong 64
+global g_pi_proto ulong 64
+global g_pi_status ulong 64
+global g_pi_boot ulong 64
+
+text p_sec_hdr "[[service]]"
+text p_k_name "name"
+text p_k_purpose "purpose"
+text p_k_owner "owner"
+text p_k_port "port"
+text p_k_proto "protocol"
+text p_k_status "status"
+text p_k_unit "unit"
+text p_k_cat "category"
+text p_k_boot "boot"
+text p_k_deps "depends_on"
+text p_k_files "files"
+text p_k_secrets "secrets"
+text p_k_health "health"
+text p_k_notes "notes"
+
+text p_pr_tcp "tcp"
+text p_pr_udp "udp"
+text p_pr_http "http"
+text p_pr_https "https"
+text p_pr_unix "unix"
+text p_pr_none "none"
+
+text p_st_active "active"
+text p_st_inactive "inactive"
+text p_st_degraded "degraded"
+text p_st_disabled "disabled"
+text p_st_missing "missing"
+text p_st_unknown "unknown"
+
+text p_v_true "true"
+text p_v_false "false"
+text p_v_yes "yes"
+text p_v_no "no"
+text p_v_dash "-"
+text p_v_null "null"
+text p_v_general "general"
+
+text p_sfx_svc ".service"
+text p_sfx_sock ".socket"
+text p_sfx_tmr ".timer"
+text p_sfx_tgt ".target"
+text p_sfx_mnt ".mount"
+text p_sfx_pth ".path"
+
+note Base-system ignore patterns from upstream pi-register
+text p_ig_01 "systemd-*"
+text p_ig_02 "getty@*"
+text p_ig_03 "serial-getty@*"
+text p_ig_04 "dbus*"
+text p_ig_05 "ssh.service"
+text p_ig_06 "sshd.service"
+text p_ig_07 "cron.service"
+text p_ig_08 "rsyslog.service"
+text p_ig_09 "networkd-dispatcher.service"
+text p_ig_10 "polkit.service"
+text p_ig_11 "apparmor.service"
+text p_ig_12 "e2scrub*"
+text p_ig_13 "fstrim.*"
+text p_ig_14 "logrotate.*"
+text p_ig_15 "apt-*"
+text p_ig_16 "unattended-upgrades.service"
+text p_ig_17 "ufw.service"
+text p_ig_18 "snapd*"
+text p_ig_19 "lvm2*"
+text p_ig_20 "cloud-*"
+text p_ig_21 "NetworkManager*"
+text p_ig_22 "user@*"
+text p_ig_23 "udev*"
+text p_ig_24 "chrony.service"
+text p_ig_25 "piboot-*"
+text p_ig_26 "containerd.service"
+text p_ig_27 "postfix.service"
+text p_ig_28 "ubuntu-fan.service"
+text p_ig_29 "pi-register*"
+text p_ig_30 "avahi-daemon.*"
+
+text p_tbl_hdr "NAME             PORT   PROTO  OWNER            STATUS     UNIT                 BOOT  PURPOSE\n"
+text p_sh_name "Name:       "
+text p_sh_purp "Purpose:    "
+text p_sh_unit "Unit:       "
+text p_sh_cat  "Category:   "
+text p_sh_own  "Owner:      "
+text p_sh_port "Port:       "
+text p_sh_prot "Protocol:   "
+text p_sh_stat "Status:     "
+text p_sh_boot "Boot:       "
+text p_nl "\n"
+
+text p_jl_name "{\"name\":\""
+text p_jl_port "\",\"port\":"
+text p_jl_prot ",\"protocol\":\""
+text p_jl_own  "\",\"owner\":\""
+text p_jl_purp "\",\"purpose\":\""
+text p_jl_stat "\",\"status\":\""
+text p_jl_unit "\",\"unit\":\""
+text p_jl_cat  "\",\"category\":\""
+text p_jl_boot "\",\"boot\":"
+text p_jl_end  "}\n"
+
+note --- Byte, string, and output helpers ---
+
+fn pi_is_ws b uchar to bool
+if eq b uchar 32
+ret true
+end
+if eq b uchar 9
+ret true
+end
+if eq b uchar 13
+ret true
+end
+if eq b uchar 10
+ret true
+end
+ret false
+end
+
+fn pi_trim_l s view uchar * to ulong
+n = len s
+if gt n ulong 65536
+ret n
+end
+i = ulong 0
+while lt i n bound 65536
+if not pi_is_ws get s i
+ret i
+end
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_trim_r s view uchar * to ulong
+n = len s
+if gt n ulong 65536
+ret ulong 0
+end
+e = n
+while gt e ulong 0 bound 65536
+idx = sub e ulong 1
+if not pi_is_ws get s idx
+ret e
+end
+e = idx
+end
+ret ulong 0
+end
+
+fn pi_eq a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+if gt na ulong 65536
+ret false
+end
+i = ulong 0
+while lt i na bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn pi_starts_with s view uchar * pfx view uchar * to bool
+ns = len s
+np = len pfx
+if lt ns np
+ret false
+end
+if gt np ulong 4096
+ret false
+end
+i = ulong 0
+while lt i np bound 4096
+if ne get s i get pfx i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn pi_ends_with s view uchar * sfx view uchar * to bool
+ns = len s
+np = len sfx
+if lt ns np
+ret false
+end
+if gt np ulong 4096
+ret false
+end
+off = sub ns np
+i = ulong 0
+while lt i np bound 4096
+if ne get s add off i get sfx i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn pi_write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn pi_put_b dst edit uchar * pos ulong b uchar to ulong
+if ge pos len dst
+ret pos
+end
+put dst pos b
+ret add pos ulong 1
+end
+
+fn pi_put_s dst edit uchar * pos ulong src view uchar * to ulong
+ns = len src
+if gt ns ulong 65536
+ret pos
+end
+cap = len dst
+p = pos
+i = ulong 0
+while lt i ns bound 65536
+if ge p cap
+ret p
+end
+put dst p get src i
+p = add p ulong 1
+i = add i ulong 1
+end
+ret p
+end
+
+fn pi_put_u64 dst edit uchar * pos ulong v ulong to ulong
+tmp = new uchar 24 0
+n = ulong 0
+cur = v
+if eq cur ulong 0
+put tmp 0 uchar 48
+n = ulong 1
+else
+while gt cur ulong 0 bound 24
+d = rem cur ulong 10
+put tmp n uchar add d ulong 48
+cur = div cur ulong 10
+n = add n ulong 1
+end
+end
+p = pos
+i = n
+while gt i ulong 0 bound 24
+i = sub i ulong 1
+p = pi_put_b dst p get tmp i
+end
+ret p
+end
+
+fn pi_put_pad dst edit uchar * pos ulong src view uchar * width ulong to ulong
+p = pi_put_s dst pos src
+n = len src
+if lt n width
+pad = sub width n
+if gt pad ulong 64
+pad = ulong 64
+end
+i = ulong 0
+while lt i pad bound 64
+p = pi_put_b dst p uchar 32
+i = add i ulong 1
+end
+else
+p = pi_put_b dst p uchar 32
+end
+ret p
+end
+
+fn pi_put_json_esc dst edit uchar * pos ulong src view uchar * to ulong
+ns = len src
+if gt ns ulong 65536
+ret pos
+end
+p = pos
+i = ulong 0
+while lt i ns bound 65536
+b = get src i
+if eq b uchar 34
+p = pi_put_b dst p uchar 92
+p = pi_put_b dst p uchar 34
+else
+if eq b uchar 92
+p = pi_put_b dst p uchar 92
+p = pi_put_b dst p uchar 92
+else
+if eq b uchar 10
+p = pi_put_b dst p uchar 92
+p = pi_put_b dst p uchar 110
+else
+if eq b uchar 9
+p = pi_put_b dst p uchar 92
+p = pi_put_b dst p uchar 116
+else
+p = pi_put_b dst p b
+end
+end
+end
+end
+i = add i ulong 1
+end
+ret p
+end
+
+note --- Wildcard ignore matching & unit normalization (upstream pi-register) ---
+
+fn pi_pattern_matches pat view uchar * unit view uchar * to bool
+np = len pat
+nu = len unit
+if gt np ulong 256
+ret false
+end
+star = np
+i = ulong 0
+while lt i np bound 256
+if eq get pat i uchar 42
+star = i
+break
+end
+i = add i ulong 1
+end
+if eq star np
+ret pi_eq pat unit
+end
+sfx_len = sub sub np star ulong 1
+if lt nu add star sfx_len
+ret false
+end
+if gt star ulong 0
+if not pi_starts_with unit part pat 0 star
+ret false
+end
+end
+if gt sfx_len ulong 0
+if not pi_ends_with unit part pat add star ulong 1 sfx_len
+ret false
+end
+end
+ret true
+end
+
+fn pi_is_ignored_a unit view uchar * to bool
+if pi_pattern_matches p_ig_01 unit
+ret true
+end
+if pi_pattern_matches p_ig_02 unit
+ret true
+end
+if pi_pattern_matches p_ig_03 unit
+ret true
+end
+if pi_pattern_matches p_ig_04 unit
+ret true
+end
+if pi_pattern_matches p_ig_05 unit
+ret true
+end
+if pi_pattern_matches p_ig_06 unit
+ret true
+end
+if pi_pattern_matches p_ig_07 unit
+ret true
+end
+if pi_pattern_matches p_ig_08 unit
+ret true
+end
+if pi_pattern_matches p_ig_09 unit
+ret true
+end
+if pi_pattern_matches p_ig_10 unit
+ret true
+end
+if pi_pattern_matches p_ig_11 unit
+ret true
+end
+if pi_pattern_matches p_ig_12 unit
+ret true
+end
+if pi_pattern_matches p_ig_13 unit
+ret true
+end
+if pi_pattern_matches p_ig_14 unit
+ret true
+end
+if pi_pattern_matches p_ig_15 unit
+ret true
+end
+ret false
+end
+
+fn pi_is_ignored_b unit view uchar * to bool
+if pi_pattern_matches p_ig_16 unit
+ret true
+end
+if pi_pattern_matches p_ig_17 unit
+ret true
+end
+if pi_pattern_matches p_ig_18 unit
+ret true
+end
+if pi_pattern_matches p_ig_19 unit
+ret true
+end
+if pi_pattern_matches p_ig_20 unit
+ret true
+end
+if pi_pattern_matches p_ig_21 unit
+ret true
+end
+if pi_pattern_matches p_ig_22 unit
+ret true
+end
+if pi_pattern_matches p_ig_23 unit
+ret true
+end
+if pi_pattern_matches p_ig_24 unit
+ret true
+end
+if pi_pattern_matches p_ig_25 unit
+ret true
+end
+if pi_pattern_matches p_ig_26 unit
+ret true
+end
+if pi_pattern_matches p_ig_27 unit
+ret true
+end
+if pi_pattern_matches p_ig_28 unit
+ret true
+end
+if pi_pattern_matches p_ig_29 unit
+ret true
+end
+if pi_pattern_matches p_ig_30 unit
+ret true
+end
+ret false
+end
+
+fn pi_is_ignored unit view uchar * to bool
+if pi_is_ignored_a unit
+ret true
+end
+ret pi_is_ignored_b unit
+end
+
+fn pi_has_unit_suffix unit view uchar * to bool
+if pi_ends_with unit p_sfx_svc
+ret true
+end
+if pi_ends_with unit p_sfx_sock
+ret true
+end
+if pi_ends_with unit p_sfx_tmr
+ret true
+end
+if pi_ends_with unit p_sfx_tgt
+ret true
+end
+if pi_ends_with unit p_sfx_mnt
+ret true
+end
+if pi_ends_with unit p_sfx_pth
+ret true
+end
+ret false
+end
+
+fn pi_full_unit unit view uchar * dst edit uchar * to ulong
+p = pi_put_s dst ulong 0 unit
+if not pi_has_unit_suffix unit
+p = pi_put_s dst p p_sfx_svc
+end
+ret p
+end
+
+note --- Protocol / status / port validation ---
+
+fn pi_parse_proto s view uchar * to ulong
+if pi_eq s p_pr_tcp
+ret PROTO_TCP
+end
+if pi_eq s p_pr_udp
+ret PROTO_UDP
+end
+if pi_eq s p_pr_http
+ret PROTO_HTTP
+end
+if pi_eq s p_pr_https
+ret PROTO_HTTPS
+end
+if pi_eq s p_pr_unix
+ret PROTO_UNIX
+end
+if pi_eq s p_pr_none
+ret PROTO_NONE
+end
+ret ulong 0
+end
+
+fn pi_proto_family proto ulong to ulong
+if eq proto PROTO_TCP
+ret ulong 1
+end
+if eq proto PROTO_HTTP
+ret ulong 1
+end
+if eq proto PROTO_HTTPS
+ret ulong 1
+end
+if eq proto PROTO_UDP
+ret ulong 2
+end
+ret ulong 0
+end
+
+fn pi_put_proto dst edit uchar * pos ulong proto ulong to ulong
+if eq proto PROTO_TCP
+ret pi_put_s dst pos p_pr_tcp
+end
+if eq proto PROTO_UDP
+ret pi_put_s dst pos p_pr_udp
+end
+if eq proto PROTO_HTTP
+ret pi_put_s dst pos p_pr_http
+end
+if eq proto PROTO_HTTPS
+ret pi_put_s dst pos p_pr_https
+end
+if eq proto PROTO_UNIX
+ret pi_put_s dst pos p_pr_unix
+end
+ret pi_put_s dst pos p_pr_none
+end
+
+fn pi_parse_status s view uchar * to ulong
+if pi_eq s p_st_active
+ret STAT_ACTIVE
+end
+if pi_eq s p_st_inactive
+ret STAT_INACTIVE
+end
+if pi_eq s p_st_degraded
+ret STAT_DEGRADED
+end
+if pi_eq s p_st_disabled
+ret STAT_DISABLED
+end
+if pi_eq s p_st_missing
+ret STAT_MISSING
+end
+if pi_eq s p_st_unknown
+ret STAT_UNKNOWN
+end
+ret ulong 0
+end
+
+fn pi_put_status dst edit uchar * pos ulong st ulong to ulong
+if eq st STAT_ACTIVE
+ret pi_put_s dst pos p_st_active
+end
+if eq st STAT_INACTIVE
+ret pi_put_s dst pos p_st_inactive
+end
+if eq st STAT_DEGRADED
+ret pi_put_s dst pos p_st_degraded
+end
+if eq st STAT_DISABLED
+ret pi_put_s dst pos p_st_disabled
+end
+if eq st STAT_MISSING
+ret pi_put_s dst pos p_st_missing
+end
+ret pi_put_s dst pos p_st_unknown
+end
+
+fn pi_parse_port s view uchar * ok edit ulong 1 to ulong
+put ok 0 ulong 0
+n = len s
+if or eq n ulong 0 gt n ulong 5
+ret ulong 0
+end
+acc = ulong 0
+i = ulong 0
+while lt i n bound 6
+b = get s i
+if or lt b uchar 48 gt b uchar 57
+ret ulong 0
+end
+acc = add mul acc ulong 10 ulong sub b uchar 48
+i = add i ulong 1
+end
+if or eq acc ulong 0 gt acc ulong 65535
+ret ulong 0
+end
+put ok 0 ulong 1
+ret acc
+end
+
+note --- Registry table helpers ---
+
+fn pi_reg_reset to void
+put g_pi_n 0 ulong 0
+end
+
+fn pi_svc_count to ulong
+ret get g_pi_n 0
+end
+
+fn pi_init_slot idx ulong to void
+put g_pi_name_len idx ulong 0
+put g_pi_purp_len idx ulong 0
+put g_pi_own_len idx ulong 0
+put g_pi_unit_len idx ulong 0
+put g_pi_cat_len idx ulong 0
+put g_pi_port idx ulong 0
+put g_pi_proto idx PROTO_TCP
+put g_pi_status idx STAT_ACTIVE
+put g_pi_boot idx ulong 0
+end
+
+fn pi_set_name idx ulong s view uchar * to ulong
+n = len s
+if gt n PI_NAME_SLOT
+ret PI_ERR_TOO_LONG
+end
+off = mul idx PI_NAME_SLOT
+i = ulong 0
+while lt i n bound 64
+put g_pi_name add off i get s i
+i = add i ulong 1
+end
+put g_pi_name_len idx n
+ret PI_OK
+end
+
+fn pi_set_purp idx ulong s view uchar * to ulong
+n = len s
+if gt n PI_PURP_SLOT
+ret PI_ERR_TOO_LONG
+end
+off = mul idx PI_PURP_SLOT
+i = ulong 0
+while lt i n bound 128
+put g_pi_purp add off i get s i
+i = add i ulong 1
+end
+put g_pi_purp_len idx n
+ret PI_OK
+end
+
+fn pi_set_own idx ulong s view uchar * to ulong
+n = len s
+if gt n PI_OWN_SLOT
+ret PI_ERR_TOO_LONG
+end
+off = mul idx PI_OWN_SLOT
+i = ulong 0
+while lt i n bound 64
+put g_pi_own add off i get s i
+i = add i ulong 1
+end
+put g_pi_own_len idx n
+ret PI_OK
+end
+
+fn pi_set_unit idx ulong s view uchar * to ulong
+n = len s
+if gt n PI_UNIT_SLOT
+ret PI_ERR_TOO_LONG
+end
+off = mul idx PI_UNIT_SLOT
+i = ulong 0
+while lt i n bound 64
+put g_pi_unit add off i get s i
+i = add i ulong 1
+end
+put g_pi_unit_len idx n
+ret PI_OK
+end
+
+fn pi_set_cat idx ulong s view uchar * to ulong
+n = len s
+if gt n PI_CAT_SLOT
+ret PI_ERR_TOO_LONG
+end
+off = mul idx PI_CAT_SLOT
+i = ulong 0
+while lt i n bound 32
+put g_pi_cat add off i get s i
+i = add i ulong 1
+end
+put g_pi_cat_len idx n
+ret PI_OK
+end
+
+fn pi_get_name idx ulong dst edit uchar * to ulong
+n = get g_pi_name_len idx
+off = mul idx PI_NAME_SLOT
+i = ulong 0
+while lt i n bound 64
+if ge i len dst
+ret i
+end
+put dst i get g_pi_name add off i
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_get_purp idx ulong dst edit uchar * to ulong
+n = get g_pi_purp_len idx
+off = mul idx PI_PURP_SLOT
+i = ulong 0
+while lt i n bound 128
+if ge i len dst
+ret i
+end
+put dst i get g_pi_purp add off i
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_get_own idx ulong dst edit uchar * to ulong
+n = get g_pi_own_len idx
+off = mul idx PI_OWN_SLOT
+i = ulong 0
+while lt i n bound 64
+if ge i len dst
+ret i
+end
+put dst i get g_pi_own add off i
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_get_unit idx ulong dst edit uchar * to ulong
+n = get g_pi_unit_len idx
+off = mul idx PI_UNIT_SLOT
+i = ulong 0
+while lt i n bound 64
+if ge i len dst
+ret i
+end
+put dst i get g_pi_unit add off i
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_get_cat idx ulong dst edit uchar * to ulong
+n = get g_pi_cat_len idx
+off = mul idx PI_CAT_SLOT
+i = ulong 0
+while lt i n bound 32
+if ge i len dst
+ret i
+end
+put dst i get g_pi_cat add off i
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_names_eq a ulong b ulong to bool
+la = get g_pi_name_len a
+lb = get g_pi_name_len b
+if ne la lb
+ret false
+end
+oa = mul a PI_NAME_SLOT
+ob = mul b PI_NAME_SLOT
+i = ulong 0
+while lt i la bound 64
+if ne get g_pi_name add oa i get g_pi_name add ob i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn pi_finalize_slot idx ulong to ulong
+nbuf = new uchar 64 0
+if eq get g_pi_name_len idx ulong 0
+ret PI_ERR_MISSING_FIELD
+end
+if eq get g_pi_purp_len idx ulong 0
+ret PI_ERR_MISSING_FIELD
+end
+if eq get g_pi_own_len idx ulong 0
+ret PI_ERR_MISSING_FIELD
+end
+if eq get g_pi_unit_len idx ulong 0
+nl = pi_get_name idx nbuf
+rc = pi_set_unit idx part nbuf 0 nl
+if ne rc PI_OK
+ret rc
+end
+end
+if eq get g_pi_cat_len idx ulong 0
+rc2 = pi_set_cat idx p_v_general
+if ne rc2 PI_OK
+ret rc2
+end
+end
+note Check duplicate name and duplicate (port, transport family) conflicts against earlier slots
+p_cur = get g_pi_port idx
+f_cur = pi_proto_family get g_pi_proto idx
+j = ulong 0
+while lt j idx bound 64
+if pi_names_eq j idx
+ret PI_ERR_DUP_NAME
+end
+if and gt p_cur ulong 0 gt f_cur ulong 0
+if eq get g_pi_port j p_cur
+if eq pi_proto_family get g_pi_proto j f_cur
+ret PI_ERR_DUP_PORT
+end
+end
+end
+j = add j ulong 1
+end
+ret PI_OK
+end
+
+note --- TOML-style [[service]] parser ---
+
+fn pi_strip_comment line view uchar * to ulong
+n = len line
+if gt n ulong 4096
+ret ulong 0
+end
+in_q = false
+esc = false
+i = ulong 0
+while lt i n bound 4096
+b = get line i
+if esc
+esc = false
+else
+if in_q
+if eq b uchar 92
+esc = true
+else
+if eq b uchar 34
+in_q = false
+end
+end
+else
+if eq b uchar 34
+in_q = true
+else
+if eq b uchar 35
+ret i
+end
+end
+end
+end
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_unquote raw view uchar * dst edit uchar * ok edit ulong 1 to ulong
+put ok 0 ulong 0
+n = len raw
+if lt n ulong 2
+ret ulong 0
+end
+if gt n ulong 512
+ret ulong 0
+end
+if ne get raw 0 uchar 34
+ret ulong 0
+end
+if ne get raw sub n ulong 1 uchar 34
+ret ulong 0
+end
+p = ulong 0
+cap = len dst
+i = ulong 1
+lim = sub n ulong 1
+while lt i lim bound 512
+b = get raw i
+if eq b uchar 92
+i = add i ulong 1
+if ge i lim
+ret ulong 0
+end
+e = get raw i
+if eq e uchar 110
+b = uchar 10
+else
+if eq e uchar 116
+b = uchar 9
+else
+b = e
+end
+end
+end
+if ge p cap
+ret ulong 0
+end
+put dst p b
+p = add p ulong 1
+i = add i ulong 1
+end
+put ok 0 ulong 1
+ret p
+end
+
+fn pi_apply_kv idx ulong key view uchar * val view uchar * to ulong
+ubuf = new uchar 256 0
+ok = new ulong 1 0
+if pi_eq key p_k_name
+ul = pi_unquote val ubuf ok
+if or eq get ok 0 ulong 0 eq ul ulong 0
+ret PI_ERR_SYNTAX
+end
+ret pi_set_name idx part ubuf 0 ul
+end
+if pi_eq key p_k_purpose
+ul = pi_unquote val ubuf ok
+if or eq get ok 0 ulong 0 eq ul ulong 0
+ret PI_ERR_SYNTAX
+end
+ret pi_set_purp idx part ubuf 0 ul
+end
+if pi_eq key p_k_owner
+ul = pi_unquote val ubuf ok
+if or eq get ok 0 ulong 0 eq ul ulong 0
+ret PI_ERR_SYNTAX
+end
+ret pi_set_own idx part ubuf 0 ul
+end
+if pi_eq key p_k_unit
+ul = pi_unquote val ubuf ok
+if or eq get ok 0 ulong 0 eq ul ulong 0
+ret PI_ERR_SYNTAX
+end
+ret pi_set_unit idx part ubuf 0 ul
+end
+if pi_eq key p_k_cat
+ul = pi_unquote val ubuf ok
+if or eq get ok 0 ulong 0 eq ul ulong 0
+ret PI_ERR_SYNTAX
+end
+ret pi_set_cat idx part ubuf 0 ul
+end
+if pi_eq key p_k_port
+pv = pi_parse_port val ok
+if eq get ok 0 ulong 0
+ret PI_ERR_BAD_PORT
+end
+put g_pi_port idx pv
+ret PI_OK
+end
+if pi_eq key p_k_proto
+ul = pi_unquote val ubuf ok
+if eq get ok 0 ulong 0
+ret PI_ERR_BAD_PROTO
+end
+pr = pi_parse_proto part ubuf 0 ul
+if eq pr ulong 0
+ret PI_ERR_BAD_PROTO
+end
+put g_pi_proto idx pr
+ret PI_OK
+end
+if pi_eq key p_k_status
+ul = pi_unquote val ubuf ok
+if eq get ok 0 ulong 0
+ret PI_ERR_BAD_STATUS
+end
+st = pi_parse_status part ubuf 0 ul
+if eq st ulong 0
+ret PI_ERR_BAD_STATUS
+end
+put g_pi_status idx st
+ret PI_OK
+end
+if pi_eq key p_k_boot
+if pi_eq val p_v_true
+put g_pi_boot idx ulong 1
+ret PI_OK
+end
+if pi_eq val p_v_false
+put g_pi_boot idx ulong 0
+ret PI_OK
+end
+ret PI_ERR_SYNTAX
+end
+if or pi_eq key p_k_deps or pi_eq key p_k_files or pi_eq key p_k_secrets or pi_eq key p_k_health pi_eq key p_k_notes
+ret PI_OK
+end
+ret PI_ERR_SYNTAX
+end
+
+fn pi_find_eq line view uchar * to ulong
+n = len line
+if gt n ulong 4096
+ret n
+end
+i = ulong 0
+while lt i n bound 4096
+if eq get line i uchar 61
+ret i
+end
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_copy_trimmed s view uchar * dst edit uchar * to ulong
+ts = pi_trim_l s
+te = pi_trim_r s
+if ge ts te
+ret ulong 0
+end
+n = sub te ts
+if gt n len dst
+ret ulong 0
+end
+i = ulong 0
+while lt i n bound 256
+put dst i get s add ts i
+i = add i ulong 1
+end
+ret n
+end
+
+fn pi_parse_kv_line idx ulong line view uchar * to ulong
+kbuf = new uchar 64 0
+eqp = pi_find_eq line
+if or eq eqp ulong 0 ge add eqp ulong 1 len line
+ret PI_ERR_SYNTAX
+end
+kl = pi_copy_trimmed part line 0 eqp kbuf
+if eq kl ulong 0
+ret PI_ERR_SYNTAX
+end
+voff = add eqp ulong 1
+vs = pi_trim_l part line voff sub len line voff
+ve = pi_trim_r part line voff sub len line voff
+if ge vs ve
+ret PI_ERR_SYNTAX
+end
+ret pi_apply_kv idx part kbuf 0 kl part line add voff vs sub ve vs
+end
+
+fn pi_process_line line view uchar * st edit ulong 2 to ulong
+ce = pi_strip_comment line
+ts = pi_trim_l part line 0 ce
+te = pi_trim_r part line 0 ce
+if ge ts te
+ret PI_OK
+end
+tlen = sub te ts
+in_svc = get st 0
+cur = get st 1
+if pi_eq part line ts tlen p_sec_hdr
+if eq in_svc ulong 1
+fc = pi_finalize_slot cur
+if ne fc PI_OK
+ret fc
+end
+cur = add cur ulong 1
+end
+if ge cur PI_MAX_SVC
+ret PI_ERR_FULL
+end
+pi_init_slot cur
+put st 0 ulong 1
+put st 1 cur
+ret PI_OK
+end
+if eq in_svc ulong 0
+ret PI_ERR_SYNTAX
+end
+ret pi_parse_kv_line cur part line ts tlen
+end
+
+fn pi_parse_register src view uchar * info edit PiParseInfo to ulong
+st = new ulong 2 0
+pi_reg_reset
+put info code PI_OK
+put info line ulong 0
+put info svc_n ulong 0
+n = len src
+if gt n ulong 65536
+put info code PI_ERR_TOO_LONG
+ret PI_ERR_TOO_LONG
+end
+pos = ulong 0
+lno = ulong 0
+while lt pos n bound 65536
+ls = pos
+while lt pos n bound 65536
+if eq get src pos uchar 10
+break
+end
+pos = add pos ulong 1
+end
+ll = sub pos ls
+if lt pos n
+pos = add pos ulong 1
+end
+lno = add lno ulong 1
+rc = pi_process_line part src ls ll st
+if ne rc PI_OK
+put info code rc
+put info line lno
+ret rc
+end
+end
+if eq get st 0 ulong 1
+cur = get st 1
+fc = pi_finalize_slot cur
+if ne fc PI_OK
+put info code fc
+put info line lno
+ret fc
+end
+put g_pi_n 0 add cur ulong 1
+end
+put info svc_n get g_pi_n 0
+ret PI_OK
+end
+
+note --- Lookup and filtered search ---
+
+fn pi_find_by_name name view uchar * to long
+nbuf = new uchar 64 0
+cnt = get g_pi_n 0
+i = ulong 0
+while lt i cnt bound 64
+nl = pi_get_name i nbuf
+if pi_eq part nbuf 0 nl name
+ret long i
+end
+i = add i ulong 1
+end
+ret long -1
+end
+
+fn pi_find_by_port port ulong to long
+if eq port ulong 0
+ret long -1
+end
+cnt = get g_pi_n 0
+i = ulong 0
+while lt i cnt bound 64
+if eq get g_pi_port i port
+ret long i
+end
+i = add i ulong 1
+end
+ret long -1
+end
+
+fn pi_matches_filter idx ulong fkind ulong fval view uchar * to bool
+buf = new uchar 64 0
+ok = new ulong 1 0
+if eq fkind FILT_ALL
+ret true
+end
+if eq fkind FILT_OWNER
+l = pi_get_own idx buf
+ret pi_eq part buf 0 l fval
+end
+if eq fkind FILT_CAT
+l = pi_get_cat idx buf
+ret pi_eq part buf 0 l fval
+end
+if eq fkind FILT_PROTO
+pr = pi_parse_proto fval
+if eq pr ulong 0
+ret false
+end
+ret eq get g_pi_proto idx pr
+end
+if eq fkind FILT_STATUS
+st = pi_parse_status fval
+if eq st ulong 0
+ret false
+end
+ret eq get g_pi_status idx st
+end
+if eq fkind FILT_PORT
+pv = pi_parse_port fval ok
+if eq get ok 0 ulong 0
+ret false
+end
+ret eq get g_pi_port idx pv
+end
+if eq fkind FILT_BOOT
+if pi_eq fval p_v_true
+ret eq get g_pi_boot idx ulong 1
+end
+if pi_eq fval p_v_false
+ret eq get g_pi_boot idx ulong 0
+end
+ret false
+end
+ret false
+end
+
+fn pi_count_matching fkind ulong fval view uchar * to ulong
+cnt = get g_pi_n 0
+hits = ulong 0
+i = ulong 0
+while lt i cnt bound 64
+if pi_matches_filter i fkind fval
+hits = add hits ulong 1
+end
+i = add i ulong 1
+end
+ret hits
+end
+
+note --- Deterministic plain-text table, show, and JSONL rendering ---
+
+fn pi_render_table_row idx ulong dst edit uchar * pos ulong to ulong
+buf = new uchar 128 0
+fub = new uchar 80 0
+p = pos
+n = pi_get_name idx buf
+p = pi_put_pad dst p part buf 0 n ulong 17
+pv = get g_pi_port idx
+if eq pv ulong 0
+p = pi_put_pad dst p p_v_dash ulong 7
+else
+n = pi_put_u64 buf ulong 0 pv
+p = pi_put_pad dst p part buf 0 n ulong 7
+end
+n = pi_put_proto buf ulong 0 get g_pi_proto idx
+p = pi_put_pad dst p part buf 0 n ulong 7
+n = pi_get_own idx buf
+p = pi_put_pad dst p part buf 0 n ulong 17
+n = pi_put_status buf ulong 0 get g_pi_status idx
+p = pi_put_pad dst p part buf 0 n ulong 11
+n = pi_get_unit idx buf
+ful = pi_full_unit part buf 0 n fub
+p = pi_put_pad dst p part fub 0 ful ulong 21
+if eq get g_pi_boot idx ulong 1
+p = pi_put_pad dst p p_v_yes ulong 6
+else
+p = pi_put_pad dst p p_v_no ulong 6
+end
+n = pi_get_purp idx buf
+p = pi_put_s dst p part buf 0 n
+p = pi_put_b dst p uchar 10
+ret p
+end
+
+fn pi_render_table fkind ulong fval view uchar * dst edit uchar * to ulong
+p = pi_put_s dst ulong 0 p_tbl_hdr
+cnt = get g_pi_n 0
+i = ulong 0
+while lt i cnt bound 64
+if pi_matches_filter i fkind fval
+p = pi_render_table_row i dst p
+end
+i = add i ulong 1
+end
+ret p
+end
+
+fn pi_render_jsonl_row idx ulong dst edit uchar * pos ulong to ulong
+buf = new uchar 128 0
+fub = new uchar 80 0
+p = pos
+p = pi_put_s dst p p_jl_name
+n = pi_get_name idx buf
+p = pi_put_json_esc dst p part buf 0 n
+p = pi_put_s dst p p_jl_port
+pv = get g_pi_port idx
+if eq pv ulong 0
+p = pi_put_s dst p p_v_null
+else
+p = pi_put_u64 dst p pv
+end
+p = pi_put_s dst p p_jl_prot
+p = pi_put_proto dst p get g_pi_proto idx
+p = pi_put_s dst p p_jl_own
+n = pi_get_own idx buf
+p = pi_put_json_esc dst p part buf 0 n
+p = pi_put_s dst p p_jl_purp
+n = pi_get_purp idx buf
+p = pi_put_json_esc dst p part buf 0 n
+p = pi_put_s dst p p_jl_stat
+p = pi_put_status dst p get g_pi_status idx
+p = pi_put_s dst p p_jl_unit
+n = pi_get_unit idx buf
+ful = pi_full_unit part buf 0 n fub
+p = pi_put_json_esc dst p part fub 0 ful
+p = pi_put_s dst p p_jl_cat
+n = pi_get_cat idx buf
+p = pi_put_json_esc dst p part buf 0 n
+p = pi_put_s dst p p_jl_boot
+if eq get g_pi_boot idx ulong 1
+p = pi_put_s dst p p_v_true
+else
+p = pi_put_s dst p p_v_false
+end
+p = pi_put_s dst p p_jl_end
+ret p
+end
+
+fn pi_render_jsonl fkind ulong fval view uchar * dst edit uchar * to ulong
+p = ulong 0
+cnt = get g_pi_n 0
+i = ulong 0
+while lt i cnt bound 64
+if pi_matches_filter i fkind fval
+p = pi_render_jsonl_row i dst p
+end
+i = add i ulong 1
+end
+ret p
+end
+
+fn pi_render_show idx ulong dst edit uchar * to ulong
+buf = new uchar 128 0
+fub = new uchar 80 0
+p = ulong 0
+p = pi_put_s dst p p_sh_name
+n = pi_get_name idx buf
+p = pi_put_s dst p part buf 0 n
+p = pi_put_s dst p p_nl
+p = pi_put_s dst p p_sh_purp
+n = pi_get_purp idx buf
+p = pi_put_s dst p part buf 0 n
+p = pi_put_s dst p p_nl
+p = pi_put_s dst p p_sh_unit
+n = pi_get_unit idx buf
+ful = pi_full_unit part buf 0 n fub
+p = pi_put_s dst p part fub 0 ful
+p = pi_put_s dst p p_nl
+p = pi_put_s dst p p_sh_cat
+n = pi_get_cat idx buf
+p = pi_put_s dst p part buf 0 n
+p = pi_put_s dst p p_nl
+p = pi_put_s dst p p_sh_own
+n = pi_get_own idx buf
+p = pi_put_s dst p part buf 0 n
+p = pi_put_s dst p p_nl
+pv = get g_pi_port idx
+if gt pv ulong 0
+p = pi_put_s dst p p_sh_port
+p = pi_put_u64 dst p pv
+p = pi_put_s dst p p_nl
+end
+p = pi_put_s dst p p_sh_prot
+p = pi_put_proto dst p get g_pi_proto idx
+p = pi_put_s dst p p_nl
+p = pi_put_s dst p p_sh_stat
+p = pi_put_status dst p get g_pi_status idx
+p = pi_put_s dst p p_nl
+p = pi_put_s dst p p_sh_boot
+if eq get g_pi_boot idx ulong 1
+p = pi_put_s dst p p_v_yes
+else
+p = pi_put_s dst p p_v_no
+end
+p = pi_put_s dst p p_nl
+ret p
+end

@@ -1,0 +1,645 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/hive/main.om: Sovereign Agent Hive CLI.
+note Reads hex hive commands line-by-line on stdin and emits state, geometry,
+note routing, and task-lease results on stdout. Exits nonzero on any refused
+note or malformed command.
+note Compose with: si/directives/om2.om core/hive/lib.om core/hive/main.om
+
+text h_cmd_init "INIT"
+text h_cmd_place "PLACE"
+text h_cmd_auto "AUTO"
+text h_cmd_block "BLOCK"
+text h_cmd_unblk "UNBLOCK"
+text h_cmd_dist "DIST"
+text h_cmd_nbrs "NEIGHBORS"
+text h_cmd_ring "RING"
+text h_cmd_route "ROUTE"
+text h_cmd_task "TASK"
+text h_cmd_claim "CLAIM"
+text h_cmd_asgn "ASSIGN"
+text h_cmd_tick "TICK"
+text h_cmd_stat "STAT"
+
+text h_ok_init "OK INIT\n"
+text h_ok_place "OK PLACE aid="
+text h_ok_auto "OK AUTO aid="
+text h_ok_blk "OK BLOCK "
+text h_ok_unblk "OK UNBLOCK "
+text h_ok_dist "OK DIST d="
+text h_ok_nbrs "OK NEIGHBORS"
+text h_ok_ring "OK RING k="
+text h_ok_route "OK ROUTE hops="
+text h_ok_task "OK TASK tid="
+text h_ok_claim "OK CLAIM tid="
+text h_ok_asgn "OK ASSIGN tid="
+text h_ok_tick "OK TICK reclaimed="
+text h_ok_stat "OK STAT agents="
+text h_err_pfx "ERR code="
+text h_sp " "
+text h_lp "("
+text h_cm ","
+text h_rp ")"
+text h_nl "\n"
+text h_k_aid " aid="
+text h_k_q " q="
+text h_k_r " r="
+text h_k_cnt " cells="
+text h_k_blk " blocked="
+text h_k_tk " tasks="
+text h_k_md " max_dist="
+
+fn h_eq_slice a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+n = len a
+i = ulong 0
+while lt i n bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn h_is_space c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 9
+ret true
+end
+ret eq c 13
+end
+
+fn h_next_tok line view uchar * pos edit ulong 1 dst edit ulong 2 to bool
+note dst[0]=start, dst[1]=len
+n = len line
+p = get pos 0
+while lt p n bound 1024
+if not h_is_space get line p
+break
+end
+p = add p 1
+end
+if ge p n
+put pos 0 p
+ret false
+end
+st = p
+while lt p n bound 1024
+if h_is_space get line p
+break
+end
+p = add p 1
+end
+put dst 0 st
+put dst 1 sub p st
+put pos 0 p
+ret true
+end
+
+fn h_parse_i32 tok view uchar * dst edit int 1 to bool
+n = len tok
+if eq n 0
+ret false
+end
+if gt n 11
+ret false
+end
+idx = ulong 0
+is_neg = false
+if eq get tok 0 45
+is_neg = true
+idx = ulong 1
+if eq n 1
+ret false
+end
+end
+acc = long 0
+while lt idx n bound 12
+c = get tok idx
+if or lt c 48 gt c 57
+ret false
+end
+acc = add mul acc 10 long sub c 48
+if gt acc 2147483648
+ret false
+end
+idx = add idx 1
+end
+if is_neg
+acc = sub 0 acc
+else
+if gt acc 2147483647
+ret false
+end
+end
+put dst 0 int acc
+ret true
+end
+
+fn h_read_ints line view uchar * pos edit ulong 1 vals edit int 8 want uint to bool
+tok = new ulong 2 0
+v = new int 1 0
+i = uint 0
+while lt i want bound 8
+if not h_next_tok line pos tok
+ret false
+end
+if not h_parse_i32 part line get tok 0 get tok 1 v
+ret false
+end
+put vals ulong i get v 0
+i = add i 1
+end
+ret true
+end
+
+fn h_emit_err code uint to void
+w1 = hive_write_all 1 h_err_pfx
+w2 = hive_write_u64 1 ulong code
+w3 = hive_write_all 1 h_nl
+if and w1 and w2 w3
+ret
+end
+exit 2
+end
+
+fn h_emit_pair q int r int to void
+w1 = hive_write_all 1 h_lp
+w2 = hive_write_i32 1 q
+w3 = hive_write_all 1 h_cm
+w4 = hive_write_i32 1 r
+w5 = hive_write_all 1 h_rp
+if and w1 and w2 and w3 and w4 w5
+ret
+end
+exit 2
+end
+
+fn h_cmd_do_route args view int 8 to bool
+src = new HexCoord get args 0 get args 1
+dst = new HexCoord get args 2 get args 3
+pq = new int 289 0
+pr = new int 289 0
+hops = hive_route src dst pq pr
+if lt hops 0
+h_emit_err uint neg hops
+ret false
+end
+w1 = hive_write_all 1 h_ok_route
+w2 = hive_write_i32 1 hops
+if not and w1 w2
+exit 2
+end
+n = add ulong hops 1
+i = ulong 0
+while lt i n bound 289
+w = hive_write_all 1 h_sp
+if not w
+exit 2
+end
+h_emit_pair get pq i get pr i
+i = add i 1
+end
+wn = hive_write_all 1 h_nl
+if not wn
+exit 2
+end
+ret true
+end
+
+fn h_cmd_do_ring args view int 8 to bool
+ctr = new HexCoord get args 0 get args 1
+rqs = new int 192 0
+rrs = new int 192 0
+if lt get args 2 0
+h_emit_err HIVE_ERR_BAD_ARG
+ret false
+end
+k = uint get args 2
+cnt = hive_ring ctr k rqs rrs
+if eq cnt 0
+h_emit_err HIVE_ERR_BAD_ARG
+ret false
+end
+w1 = hive_write_all 1 h_ok_ring
+w2 = hive_write_u64 1 ulong k
+w3 = hive_write_all 1 h_k_cnt
+w4 = hive_write_u64 1 ulong cnt
+if not and w1 and w2 and w3 w4
+exit 2
+end
+i = ulong 0
+while lt i ulong cnt bound 192
+w = hive_write_all 1 h_sp
+if not w
+exit 2
+end
+h_emit_pair get rqs i get rrs i
+i = add i 1
+end
+wn = hive_write_all 1 h_nl
+if not wn
+exit 2
+end
+ret true
+end
+
+fn h_cmd_do_nbrs args view int 8 to bool
+qs = new int 6 0
+rs = new int 6 0
+hive_neighbors get args 0 get args 1 qs rs
+w0 = hive_write_all 1 h_ok_nbrs
+if not w0
+exit 2
+end
+for i ulong 6
+ws = hive_write_all 1 h_sp
+if not ws
+exit 2
+end
+h_emit_pair get qs i get rs i
+end
+wn = hive_write_all 1 h_nl
+if not wn
+exit 2
+end
+ret true
+end
+
+fn h_must ok bool to void
+if not ok
+exit 2
+end
+end
+
+fn h_cmd_do_stat to bool
+bd = new HiveBounds 0 0 0 0 0 0
+hive_compute_bounds bd
+h_must hive_write_all 1 h_ok_stat
+h_must hive_write_u64 1 ulong get bd cnt
+h_must hive_write_all 1 h_k_blk
+h_must hive_write_i32 1 get g_meta 5
+h_must hive_write_all 1 h_k_tk
+h_must hive_write_i32 1 get g_meta 4
+h_must hive_write_all 1 h_k_md
+h_must hive_write_i32 1 get bd max_dist
+h_must hive_write_all 1 h_nl
+ret true
+end
+
+fn h_exec_geom cmd view uchar * line view uchar * pos edit ulong 1 to int
+note returns 0=not handled, 1=ok, -1=err
+args = new int 8 0
+if h_eq_slice cmd h_cmd_dist
+if not h_read_ints line pos args 4
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+d = hive_hex_dist get args 0 get args 1 get args 2 get args 3
+w1 = hive_write_all 1 h_ok_dist
+w2 = hive_write_i32 1 d
+w3 = hive_write_all 1 h_nl
+if and w1 and w2 w3
+ret 1
+end
+exit 2
+end
+if h_eq_slice cmd h_cmd_nbrs
+if not h_read_ints line pos args 2
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if h_cmd_do_nbrs args
+ret 1
+end
+ret -1
+end
+if h_eq_slice cmd h_cmd_ring
+if not h_read_ints line pos args 3
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if h_cmd_do_ring args
+ret 1
+end
+ret -1
+end
+if h_eq_slice cmd h_cmd_route
+if not h_read_ints line pos args 4
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if h_cmd_do_route args
+ret 1
+end
+ret -1
+end
+ret 0
+end
+
+fn h_exec_grid cmd view uchar * line view uchar * pos edit ulong 1 to int
+args = new int 8 0
+pt = new HexCoord 0 0
+if h_eq_slice cmd h_cmd_init
+if not h_read_ints line pos args 3
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if or lt get args 1 1 lt get args 2 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_init get args 0 uint get args 1 uint get args 2
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+if hive_write_all 1 h_ok_init
+ret 1
+end
+exit 2
+end
+if h_eq_slice cmd h_cmd_place
+if not h_read_ints line pos args 5
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if lt get args 0 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if or lt get args 3 0 gt get args 3 255
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if lt get args 4 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_place_agent uint get args 0 get args 1 get args 2 uchar get args 3 uint get args 4
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+h_must hive_write_all 1 h_ok_place
+h_must hive_write_i32 1 get args 0
+h_must hive_write_all 1 h_k_q
+h_must hive_write_i32 1 get args 1
+h_must hive_write_all 1 h_k_r
+h_must hive_write_i32 1 get args 2
+h_must hive_write_all 1 h_nl
+ret 1
+end
+if h_eq_slice cmd h_cmd_auto
+if not h_read_ints line pos args 4
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if or lt get args 0 1 lt get args 1 0
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if or lt get args 2 0 gt get args 2 255
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if lt get args 3 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_place_auto uint get args 0 uint get args 1 uchar get args 2 uint get args 3 pt
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+h_must hive_write_all 1 h_ok_auto
+h_must hive_write_i32 1 get args 0
+h_must hive_write_all 1 h_k_q
+h_must hive_write_i32 1 get pt q
+h_must hive_write_all 1 h_k_r
+h_must hive_write_i32 1 get pt r
+h_must hive_write_all 1 h_nl
+ret 1
+end
+if h_eq_slice cmd h_cmd_block
+if not h_read_ints line pos args 2
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_block_cell get args 0 get args 1
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+w1 = hive_write_all 1 h_ok_blk
+if not w1
+exit 2
+end
+h_emit_pair get args 0 get args 1
+if hive_write_all 1 h_nl
+ret 1
+end
+exit 2
+end
+if h_eq_slice cmd h_cmd_unblk
+if not h_read_ints line pos args 2
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_unblock_cell get args 0 get args 1
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+w1 = hive_write_all 1 h_ok_unblk
+if not w1
+exit 2
+end
+h_emit_pair get args 0 get args 1
+if hive_write_all 1 h_nl
+ret 1
+end
+exit 2
+end
+ret 0
+end
+
+fn h_exec_task cmd view uchar * line view uchar * pos edit ulong 1 to int
+args = new int 8 0
+asg = new uint 1 0
+if h_eq_slice cmd h_cmd_task
+if not h_read_ints line pos args 4
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if or lt get args 0 1 lt get args 3 0
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_task_create uint get args 0 get args 1 get args 2 uint get args 3
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+w1 = hive_write_all 1 h_ok_task
+w2 = hive_write_i32 1 get args 0
+w3 = hive_write_all 1 h_nl
+if and w1 and w2 w3
+ret 1
+end
+exit 2
+end
+if h_eq_slice cmd h_cmd_claim
+if not h_read_ints line pos args 3
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if or lt get args 0 1 lt get args 1 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if lt get args 2 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_task_claim uint get args 0 uint get args 1 ulong get args 2
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+h_must hive_write_all 1 h_ok_claim
+h_must hive_write_i32 1 get args 0
+h_must hive_write_all 1 h_k_aid
+h_must hive_write_i32 1 get args 1
+h_must hive_write_all 1 h_nl
+ret 1
+end
+if h_eq_slice cmd h_cmd_asgn
+if not h_read_ints line pos args 2
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if or lt get args 0 1 lt get args 1 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rc = hive_assign_nearest uint get args 0 ulong get args 1 asg
+if ne rc HIVE_OK
+h_emit_err rc
+ret -1
+end
+h_must hive_write_all 1 h_ok_asgn
+h_must hive_write_i32 1 get args 0
+h_must hive_write_all 1 h_k_aid
+h_must hive_write_u64 1 ulong get asg 0
+h_must hive_write_all 1 h_nl
+ret 1
+end
+if h_eq_slice cmd h_cmd_tick
+if not h_read_ints line pos args 1
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+if lt get args 0 0
+h_emit_err HIVE_ERR_BAD_ARG
+ret -1
+end
+rec = hive_tick ulong get args 0
+h_must hive_write_all 1 h_ok_tick
+h_must hive_write_u64 1 ulong rec
+h_must hive_write_all 1 h_nl
+ret 1
+end
+if h_eq_slice cmd h_cmd_stat
+if h_cmd_do_stat
+ret 1
+end
+ret -1
+end
+ret 0
+end
+
+fn h_dispatch_line line view uchar * to bool
+pos = new ulong 1 0
+tok = new ulong 2 0
+cbuf = new uchar 16 0
+if not h_next_tok line pos tok
+ret true
+end
+cs = get tok 0
+cl = get tok 1
+if eq get line cs 35
+ret true
+end
+if gt cl 16
+h_emit_err HIVE_ERR_BAD_ARG
+ret false
+end
+i = ulong 0
+while lt i cl bound 16
+put cbuf i get line add cs i
+i = add i 1
+end
+r1 = h_exec_geom part cbuf 0 cl line pos
+if ne r1 0
+ret gt r1 0
+end
+r2 = h_exec_grid part cbuf 0 cl line pos
+if ne r2 0
+ret gt r2 0
+end
+r3 = h_exec_task part cbuf 0 cl line pos
+if ne r3 0
+ret gt r3 0
+end
+h_emit_err HIVE_ERR_BAD_ARG
+ret false
+end
+
+fn h_find_nl buf view uchar * start ulong to ulong
+n = len buf
+p = start
+while lt p n bound 65536
+if eq get buf p 10
+ret p
+end
+p = add p 1
+end
+ret n
+end
+
+fn main to int
+raw = new uchar 65536 0
+rc0 = hive_init 6 64 64
+if ne rc0 HIVE_OK
+ret 2
+end
+tot = ulong 0
+while lt tot 65536 bound 65536
+k = read 0 raw tot sub 65536 tot
+if lt k 0
+ret 2
+end
+if eq k 0
+break
+end
+tot = add tot ulong k
+end
+had_err = false
+pos = ulong 0
+while lt pos tot bound 4096
+lend = h_find_nl part raw 0 tot pos
+if not h_dispatch_line part raw pos sub lend pos
+had_err = true
+end
+pos = add lend 1
+end
+if had_err
+ret 1
+end
+ret 0
+end

@@ -1,0 +1,191 @@
+note agent-archive CLI: reads TSV records (ts_ms\tagent\trole\tpriv\ttext) from stdin,
+note builds SHA-256 hash-chained archive, verifies chain integrity, and exports public redacted JSONL.
+note Compose: si/directives/om2.om + si/agent-archive/lib.om + si/agent-archive/main.om
+
+text aa_cli_err_parse "agent-archive: malformed TSV record\n"
+text aa_cli_err_chain "agent-archive: archive append or chain verification failed\n"
+
+fn aa_write_all fd int buf view uchar * n ulong to bool
+done = ulong 0
+while lt done n bound 65536
+k = write fd buf done sub n done
+if le k 0
+ret false
+end
+done = add done ulong k
+end
+ret true
+end
+
+fn aa_read_stdin dst edit uchar * to long
+got = ulong 0
+cap = len dst
+while lt got cap bound 65536
+k = read 0 dst got sub cap got
+if lt k 0
+ret -1
+end
+if eq k 0
+break
+end
+got = add got ulong k
+end
+ret long got
+end
+
+fn aa_trim_eol line view uchar * to ulong
+n = len line
+if gt n 0
+if eq get line sub n 1 10
+n = sub n 1
+end
+end
+if gt n 0
+if eq get line sub n 1 13
+n = sub n 1
+end
+end
+ret n
+end
+
+fn aa_parse_tsv_rec line view uchar * rec edit AaChainEntry to long
+n = aa_trim_eol line
+tabs = new ulong 5 0
+tc = ulong 0
+i = ulong 0
+while lt i n bound 4096
+if eq get line i 9
+if lt tc 5
+put tabs tc i
+end
+tc = add tc 1
+end
+i = add i 1
+end
+if ne tc 4
+ret -1
+end
+v = aa_parse_u64 part line 0 get tabs 0
+if lt v 0
+ret -1
+end
+put rec ts_ms ulong v
+v = aa_parse_agent part line add get tabs 0 1 sub sub get tabs 1 get tabs 0 1
+if lt v 0
+ret -1
+end
+put rec agent_id ulong v
+v = aa_parse_role part line add get tabs 1 1 sub sub get tabs 2 get tabs 1 1
+if lt v 0
+ret -1
+end
+put rec role_id ulong v
+v = aa_parse_u64 part line add get tabs 2 1 sub sub get tabs 3 get tabs 2 1
+if lt v 0
+ret -1
+end
+put rec is_priv ulong v
+ret long add get tabs 3 1
+end
+
+fn aa_cli_stage_line line view uchar * src_pos ulong meta edit AaArchiveMeta rec edit AaChainEntry text_buf edit uchar 16384 to int
+toff_rel = aa_parse_tsv_rec line rec
+if lt toff_rel 0
+ret -10
+end
+eff = aa_trim_eol line
+if lt eff ulong toff_rel
+ret -10
+end
+put rec src_pos src_pos
+ret aa_stage_record meta rec part line ulong toff_rel sub eff ulong toff_rel text_buf
+end
+
+fn aa_cli_export_all cnt ulong entries view ulong 288 hashes view uchar 4096 text_buf view uchar 16384 to int
+rec = new AaChainEntry 0 0 0 0 0 0 0 0 0
+outln = new uchar 2048 0
+i = ulong 0
+while lt i cnt bound 64
+aa_load_entry entries i rec
+en = aa_export_jsonl rec hashes text_buf false outln
+if gt en 0
+if not aa_write_all 1 outln ulong en
+ret 1
+end
+end
+i = add i 1
+end
+ret 0
+end
+
+fn aa_cli_ingest_all inbuf view uchar 16384 total ulong meta edit AaArchiveMeta entries edit ulong 288 hashes edit uchar 4096 text_buf edit uchar 16384 to int
+rec = new AaChainEntry 0 0 0 0 0 0 0 0 0
+cur = ulong 0
+while lt cur total bound 16384
+ls = cur
+while lt cur total bound 16384
+if eq get inbuf cur 10
+cur = add cur 1
+break
+end
+cur = add cur 1
+end
+ll = sub cur ls
+if eq ll 0
+continue
+end
+if eq get inbuf ls 10
+continue
+end
+st = aa_cli_stage_line part inbuf ls ll ls meta rec text_buf
+if ne st 0
+ret st
+end
+idx = get meta cnt
+cm = aa_commit_record meta rec entries
+if lt cm 0
+ret cm
+end
+if eq cm 0
+if not aa_link_record idx rec hashes text_buf
+ret -4
+end
+end
+end
+ret 0
+end
+
+fn main to int
+inbuf = new uchar 16384 0
+nread = aa_read_stdin inbuf
+if lt nread 0
+ret 1
+end
+meta = new AaArchiveMeta 0 0 0
+entries = new ulong 288 0
+hashes = new uchar 4096 0
+text_buf = new uchar 16384 0
+rc = aa_cli_ingest_all inbuf ulong nread meta entries hashes text_buf
+if eq rc -10
+w = aa_write_all 2 aa_cli_err_parse len aa_cli_err_parse
+if not w
+ret 2
+end
+ret 1
+end
+if ne rc 0
+w = aa_write_all 2 aa_cli_err_chain len aa_cli_err_chain
+if not w
+ret 2
+end
+ret 1
+end
+if ne aa_verify_chain get meta cnt entries hashes text_buf 0
+w = aa_write_all 2 aa_cli_err_chain len aa_cli_err_chain
+if not w
+ret 2
+end
+ret 1
+end
+ret aa_cli_export_all get meta cnt entries hashes text_buf
+end

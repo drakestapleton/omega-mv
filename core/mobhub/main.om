@@ -1,0 +1,456 @@
+note core/mobhub/main.om: CLI reading structured faction operations commands on stdin
+note and reporting JSON results on stdout.
+note Compose with: si/directives/om2.om core/mobhub/lib.om core/mobhub/main.om
+note
+note Supported stdin line commands:
+note   VALUATION <respect> <rate> <armory> <cash>
+note   GYM <stat> <start_stat> <happy> <energy> <e_per_train> <dots_x10>
+note   PARSE_NEWS <raw_torn_html_news_line>
+note   REDACT <raw_log_or_url_line>
+note   MEMBER <torn_id> <flat_respect_x100> <war_hits> <assists> <outside_hits>
+note   PAYOUT <flat_rate|pool_share> <cache_value>
+note   RESET
+
+global mh_m_in uchar 4096
+global mh_m_line uchar 4096
+global mh_m_out uchar 4096
+global mh_m_olen ulong 1
+global mh_m_nums long 8
+
+text mhm_c_val "VALUATION"
+text mhm_c_gym "GYM"
+text mhm_c_news "PARSE_NEWS"
+text mhm_c_red "REDACT"
+text mhm_c_mem "MEMBER"
+text mhm_c_pay "PAYOUT"
+text mhm_c_rst "RESET"
+text mhm_m_flat "flat_rate"
+text mhm_m_pool "pool_share"
+
+text mhm_j_err "{\"ok\":false,\"error\":\"invalid_or_refused\",\"code\":"
+text mhm_j_end "}\n"
+text mhm_j_rst "{\"ok\":true,\"op\":\"reset\"}\n"
+text mhm_j_mem "{\"ok\":true,\"op\":\"member\",\"count\":"
+text mhm_j_val_1 "{\"ok\":true,\"op\":\"valuation\",\"respect_value\":"
+text mhm_j_val_2 ",\"armory_value\":"
+text mhm_j_val_3 ",\"faction_cash_value\":"
+text mhm_j_val_4 ",\"total_value\":"
+text mhm_j_gym_1 "{\"ok\":true,\"op\":\"gym\",\"trains\":"
+text mhm_j_gym_2 ",\"total_gain_x100\":"
+text mhm_j_gym_3 ",\"end_stat_x100\":"
+text mhm_j_gym_4 ",\"end_happy_x100\":"
+text mhm_j_news_1 "{\"ok\":true,\"op\":\"parse_news\",\"torn_id\":"
+text mhm_j_news_2 ",\"amount\":"
+text mhm_j_red_1 "{\"ok\":true,\"op\":\"redact\",\"text\":\""
+text mhm_j_red_2 "\"}\n"
+text mhm_j_pay_1 "{\"ok\":true,\"op\":\"payout\",\"members_pool\":"
+text mhm_j_pay_2 ",\"faction_fund\":"
+text mhm_j_pay_3 ",\"member_payout_total\":"
+text mhm_j_pay_4 ",\"grand_total\":"
+text mhm_j_pay_5 ",\"unallocated\":"
+
+fn mhm_reset_out to void
+put mh_m_olen 0 0
+end
+
+fn mhm_byte b uchar to void
+p = get mh_m_olen 0
+if lt p 4096
+put mh_m_out p b
+put mh_m_olen 0 add p 1
+end
+end
+
+fn mhm_text s view uchar * to void
+n = len s
+i = ulong 0
+while lt i n bound 256
+mhm_byte get s i
+i = add i 1
+end
+end
+
+fn mhm_i64 v long to void
+digs = new uchar 24 0
+if eq v 0
+mhm_byte 48
+ret
+end
+x = v
+if lt x 0
+mhm_byte 45
+x = neg x
+end
+u = ulong x
+k = ulong 0
+while gt u 0 bound 24
+put digs k uchar add 48 rem u 10
+u = div u 10
+k = add k 1
+end
+while gt k 0 bound 24
+k = sub k 1
+mhm_byte get digs k
+end
+end
+
+fn mhm_flush to bool
+n = get mh_m_olen 0
+off = ulong 0
+while lt off n bound 256
+w = write 1 mh_m_out off sub n off
+if le w 0
+ret false
+end
+off = add off ulong w
+end
+ret true
+end
+
+fn mhm_emit_err code ulong to bool
+mhm_reset_out
+mhm_text mhm_j_err
+mhm_i64 long code
+mhm_text mhm_j_end
+ret mhm_flush
+end
+
+fn mhm_skip_sp buf view uchar * pos ulong blen ulong to ulong
+p = pos
+while lt p blen bound 4096
+if ne get buf p 32
+if ne get buf p 9
+break
+end
+end
+p = add p 1
+end
+ret p
+end
+
+fn mhm_tok_end buf view uchar * pos ulong blen ulong to ulong
+p = pos
+while lt p blen bound 4096
+if or eq get buf p 32 eq get buf p 9
+break
+end
+p = add p 1
+end
+ret p
+end
+
+note Parse signed decimal integer in buf[pos..endp]. Returns false on error.
+fn mhm_parse_i64 buf view uchar * pos ulong endp ulong dst edit long 1 to bool
+if ge pos endp
+ret false
+end
+p = pos
+negf = false
+if eq get buf p 45
+negf = true
+p = add p 1
+if ge p endp
+ret false
+end
+end
+v = long 0
+while lt p endp bound 32
+c = get buf p
+if not mh_is_digit c
+ret false
+end
+v = add mul v 10 long sub c 48
+p = add p 1
+end
+if negf
+v = neg v
+end
+put dst 0 v
+ret true
+end
+
+fn mhm_parse_n_i64 lbuf view uchar * pos ulong llen ulong cnt ulong to bool
+tmp = new long 1 0
+k = ulong 0
+cur = pos
+while lt k cnt bound 8
+cur = mhm_skip_sp lbuf cur llen
+e = mhm_tok_end lbuf cur llen
+if not mhm_parse_i64 lbuf cur e tmp
+ret false
+end
+put mh_m_nums k get tmp 0
+cur = e
+k = add k 1
+end
+ret true
+end
+
+fn mhm_run_valuation to ulong
+a0 = f64 get mh_m_nums 0
+a1 = f64 get mh_m_nums 1
+a2 = f64 get mh_m_nums 2
+a3 = f64 get mh_m_nums 3
+ret mh_compute_valuation a0 a1 a2 a3
+end
+
+fn mhm_cmd_valuation lbuf view uchar * p ulong llen ulong to bool
+if not mhm_parse_n_i64 lbuf p llen 4
+ret mhm_emit_err MH_ERR_PARSE
+end
+rc = mhm_run_valuation
+if ne rc MH_OK
+ret mhm_emit_err rc
+end
+mhm_reset_out
+mhm_text mhm_j_val_1
+mhm_i64 get mh_g_val_resp 0
+mhm_text mhm_j_val_2
+mhm_i64 get mh_g_val_armory 0
+mhm_text mhm_j_val_3
+mhm_i64 get mh_g_val_cash 0
+mhm_text mhm_j_val_4
+mhm_i64 get mh_g_val_total 0
+mhm_text mhm_j_end
+ret mhm_flush
+end
+
+fn mhm_run_gym sid ulong to ulong
+mh_gym_reset_opts
+a0 = f64 get mh_m_nums 0
+a1 = f64 get mh_m_nums 1
+a2 = f64 get mh_m_nums 2
+a3 = f64 get mh_m_nums 3
+a4 = div f64 get mh_m_nums 4 10.0f64
+ret mh_gym_simulate sid a0 a1 a2 a3 a4
+end
+
+fn mhm_cmd_gym lbuf view uchar * p ulong llen ulong to bool
+cur = mhm_skip_sp lbuf p llen
+e = mhm_tok_end lbuf cur llen
+sid = mh_stat_parse lbuf cur sub e cur
+if eq sid MH_STAT_INVALID
+ret mhm_emit_err MH_ERR_BAD_STAT
+end
+if not mhm_parse_n_i64 lbuf e llen 5
+ret mhm_emit_err MH_ERR_PARSE
+end
+rc = mhm_run_gym sid
+if ne rc MH_OK
+ret mhm_emit_err rc
+end
+mhm_reset_out
+mhm_text mhm_j_gym_1
+mhm_i64 long get mh_g_gym_trains 0
+mhm_text mhm_j_gym_2
+mhm_i64 mh_round_i64 mul get mh_g_gym_tgain 0 100.0f64
+mhm_text mhm_j_gym_3
+mhm_i64 mh_round_i64 mul get mh_g_gym_estat 0 100.0f64
+mhm_text mhm_j_gym_4
+mhm_i64 mh_round_i64 mul get mh_g_gym_ehappy 0 100.0f64
+mhm_text mhm_j_end
+ret mhm_flush
+end
+
+fn mhm_run_member to ulong
+t = get mh_m_nums 0
+r = div f64 get mh_m_nums 1 100.0f64
+w = get mh_m_nums 2
+a = get mh_m_nums 3
+o = get mh_m_nums 4
+ret mh_member_add t r w a o
+end
+
+fn mhm_cmd_member lbuf view uchar * p ulong llen ulong to bool
+if not mhm_parse_n_i64 lbuf p llen 5
+ret mhm_emit_err MH_ERR_PARSE
+end
+rc = mhm_run_member
+if ne rc MH_OK
+ret mhm_emit_err rc
+end
+mhm_reset_out
+mhm_text mhm_j_mem
+mhm_i64 long get mh_g_in_cnt 0
+mhm_text mhm_j_end
+ret mhm_flush
+end
+
+fn mhm_cmd_payout lbuf view uchar * p ulong llen ulong to bool
+cur = mhm_skip_sp lbuf p llen
+e = mhm_tok_end lbuf cur llen
+mlen = sub e cur
+if mh_eq_ci lbuf cur mlen mhm_m_flat
+put mh_g_pol_model 0 MH_MODEL_FLAT_RATE
+else
+if mh_eq_ci lbuf cur mlen mhm_m_pool
+put mh_g_pol_model 0 MH_MODEL_POOL_SHARE
+else
+ret mhm_emit_err MH_ERR_BAD_MODEL
+end
+end
+cur = mhm_skip_sp lbuf e llen
+e2 = mhm_tok_end lbuf cur llen
+tmp = new long 1 0
+if not mhm_parse_i64 lbuf cur e2 tmp
+ret mhm_emit_err MH_ERR_PARSE
+end
+rc = mh_compute_payout get tmp 0
+if ne rc MH_OK
+ret mhm_emit_err rc
+end
+mhm_reset_out
+mhm_text mhm_j_pay_1
+mhm_i64 get mh_g_res_mpool 0
+mhm_text mhm_j_pay_2
+mhm_i64 get mh_g_res_ffund 0
+mhm_text mhm_j_pay_3
+mhm_i64 get mh_g_res_mpay_tot 0
+mhm_text mhm_j_pay_4
+mhm_i64 get mh_g_res_grand 0
+mhm_text mhm_j_pay_5
+mhm_i64 get mh_g_res_unalloc 0
+mhm_text mhm_j_end
+ret mhm_flush
+end
+
+fn mhm_cmd_news lbuf view uchar * p ulong llen ulong to bool
+cur = mhm_skip_sp lbuf p llen
+if ge cur llen
+ret mhm_emit_err MH_ERR_NO_MATCH
+end
+rc = mh_parse_money_log part lbuf cur sub llen cur sub llen cur
+if ne rc MH_OK
+ret mhm_emit_err rc
+end
+mhm_reset_out
+mhm_text mhm_j_news_1
+mhm_i64 get mh_g_parse_tid 0
+mhm_text mhm_j_news_2
+mhm_i64 get mh_g_parse_amt 0
+mhm_text mhm_j_end
+ret mhm_flush
+end
+
+fn mhm_cmd_redact lbuf view uchar * p ulong llen ulong to bool
+cur = mhm_skip_sp lbuf p llen
+if ge cur llen
+ret mhm_emit_err MH_ERR_PARSE
+end
+n = mh_redact_secrets part lbuf cur sub llen cur sub llen cur
+mhm_reset_out
+mhm_text mhm_j_red_1
+i = ulong 0
+while lt i n bound 4000
+c = get mh_g_buf i
+if or eq c 34 eq c 92
+mhm_byte 92
+end
+mhm_byte c
+i = add i 1
+end
+mhm_text mhm_j_red_2
+ret mhm_flush
+end
+
+fn mhm_dispatch llen ulong to bool
+lbuf = new uchar 4096 0
+if eq llen 0
+ret true
+end
+i = ulong 0
+while lt i llen bound 4096
+put lbuf i get mh_m_line i
+i = add i 1
+end
+s = mhm_skip_sp lbuf 0 llen
+if ge s llen
+ret true
+end
+e = mhm_tok_end lbuf s llen
+clen = sub e s
+if mh_eq_ci lbuf s clen mhm_c_rst
+mh_policy_default_flat
+mh_members_reset
+mhm_reset_out
+mhm_text mhm_j_rst
+ret mhm_flush
+end
+if mh_eq_ci lbuf s clen mhm_c_val
+ret mhm_cmd_valuation lbuf e llen
+end
+if mh_eq_ci lbuf s clen mhm_c_gym
+ret mhm_cmd_gym lbuf e llen
+end
+if mh_eq_ci lbuf s clen mhm_c_mem
+ret mhm_cmd_member lbuf e llen
+end
+if mh_eq_ci lbuf s clen mhm_c_pay
+ret mhm_cmd_payout lbuf e llen
+end
+if mh_eq_ci lbuf s clen mhm_c_news
+ret mhm_cmd_news lbuf e llen
+end
+if mh_eq_ci lbuf s clen mhm_c_red
+ret mhm_cmd_redact lbuf e llen
+end
+ret mhm_emit_err MH_ERR_PARSE
+end
+
+fn main to int
+mh_policy_default_flat
+mh_members_reset
+llen = ulong 0
+over = false
+done = false
+while not done bound 100000
+n = read 0 mh_m_in 0 4096
+if lt n 0
+ret 1
+end
+if eq n 0
+if gt llen 0
+if over
+if not mhm_emit_err MH_ERR_CAPACITY
+ret 2
+end
+else
+if not mhm_dispatch llen
+ret 2
+end
+end
+end
+done = true
+break
+end
+rn = ulong n
+i = ulong 0
+while lt i rn bound 4096
+b = get mh_m_in i
+if eq b 10
+if over
+if not mhm_emit_err MH_ERR_CAPACITY
+ret 2
+end
+else
+if not mhm_dispatch llen
+ret 2
+end
+end
+llen = 0
+over = false
+else
+if ne b 13
+if lt llen 4096
+put mh_m_line llen b
+llen = add llen 1
+else
+over = true
+end
+end
+end
+i = add i 1
+end
+end
+ret 0
+end

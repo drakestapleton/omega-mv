@@ -1,0 +1,464 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/forge/main.om: FORGE CLI entrypoint.
+note Reads realization requests on stdin (KAT, PROFILES, PLAN, REQ) and emits
+note deterministic plans, physical envelope refusals, and canonical receipts on stdout.
+note Compose as: si/directives/om2.om hardware.om envelope.om provider.om realize.om main.om
+
+text fg_m_kat_pass "FORGE_KAT PASS 10d63d05f888eaba4fe473c5f17febe22f462f543ae0c2b005a9a8e5417e09fd\n"
+text fg_m_kat_fail "FORGE_KAT FAIL\n"
+text fg_m_bad "FORGE_ERROR malformed_request\n"
+text fg_m_prov_hdr "PROVIDER id="
+text fg_m_cmd_kat "KAT"
+text fg_m_cmd_prof "PROFILES"
+text fg_m_cmd_plan "PLAN"
+text fg_m_cmd_req "REQ"
+text fg_m_sub_any "ANY"
+
+fn fg_is_space c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 9
+ret true
+end
+if eq c 13
+ret true
+end
+ret false
+end
+
+fn fg_tok_eq tok view uchar 64 tlen ulong lit view uchar * to bool
+if ne tlen len lit
+ret false
+end
+i = ulong 0
+while lt i tlen bound 64
+if ne get tok i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn fg_next_tok line view uchar * cur edit ulong 1 tok edit uchar 64 to ulong
+n = len line
+p = get cur 0
+while lt p n bound 512
+if not fg_is_space get line p
+break
+end
+p = add p 1
+end
+tlen = ulong 0
+while lt p n bound 512
+c = get line p
+if fg_is_space c
+break
+end
+if lt tlen 64
+put tok tlen c
+tlen = add tlen 1
+end
+p = add p 1
+end
+put cur 0 p
+ret tlen
+end
+
+fn fg_parse_u64 tok view uchar 64 tlen ulong ok edit uint 1 to ulong
+if eq tlen 0
+put ok 0 uint 0
+ret ulong 0
+end
+v = ulong 0
+i = ulong 0
+while lt i tlen bound 64
+c = get tok i
+if lt c 48
+put ok 0 uint 0
+ret ulong 0
+end
+if gt c 57
+put ok 0 uint 0
+ret ulong 0
+end
+d = ulong sub c 48
+if gt v div sub FG_U64_MAX d 10
+put ok 0 uint 0
+ret ulong 0
+end
+v = add mul v 10 d
+i = add i 1
+end
+put ok 0 uint 1
+ret v
+end
+
+fn fg_parse_op tok view uchar 64 tlen ulong to uint
+if fg_tok_eq tok tlen fg_t_op_mv
+ret FG_OP_MATVEC
+end
+if fg_tok_eq tok tlen fg_t_op_mm
+ret FG_OP_MATMUL
+end
+if fg_tok_eq tok tlen fg_t_op_cv
+ret FG_OP_CONV
+end
+if fg_tok_eq tok tlen fg_t_op_ew
+ret FG_OP_ELEMENTWISE
+end
+if fg_tok_eq tok tlen fg_t_op_rd
+ret FG_OP_REDUCTION
+end
+if fg_tok_eq tok tlen fg_t_op_sp
+ret FG_OP_SPIKE_INT
+end
+if fg_tok_eq tok tlen fg_t_op_tr
+ret FG_OP_TRANSFORM
+end
+if fg_tok_eq tok tlen fg_t_op_sm
+ret FG_OP_SAMPLE
+end
+if fg_tok_eq tok tlen fg_t_op_gn
+ret FG_OP_GENERAL
+end
+ret uint 0
+end
+
+fn fg_parse_dt tok view uchar 64 tlen ulong to uint
+if fg_tok_eq tok tlen fg_t_dt_f32
+ret FG_DT_FP32
+end
+if fg_tok_eq tok tlen fg_t_dt_f16
+ret FG_DT_FP16
+end
+if fg_tok_eq tok tlen fg_t_dt_bf16
+ret FG_DT_BF16
+end
+if fg_tok_eq tok tlen fg_t_dt_f8
+ret FG_DT_FP8
+end
+if fg_tok_eq tok tlen fg_t_dt_i8
+ret FG_DT_INT8
+end
+if fg_tok_eq tok tlen fg_t_dt_i32
+ret FG_DT_INT32
+end
+if fg_tok_eq tok tlen fg_t_dt_u64
+ret FG_DT_U64
+end
+if fg_tok_eq tok tlen fg_t_dt_f64
+ret FG_DT_FP64
+end
+ret uint 0
+end
+
+fn fg_parse_sub tok view uchar 64 tlen ulong ok edit uint 1 to uint
+put ok 0 uint 1
+if fg_tok_eq tok tlen fg_m_sub_any
+ret uint 0
+end
+if fg_tok_eq tok tlen fg_t_sub_cpu
+ret FG_SUB_DIGITAL_CPU
+end
+if fg_tok_eq tok tlen fg_t_sub_gpu
+ret FG_SUB_DIGITAL_GPU
+end
+if fg_tok_eq tok tlen fg_t_sub_ana
+ret FG_SUB_ANALOG_IN_MEMORY
+end
+if fg_tok_eq tok tlen fg_t_sub_neu
+ret FG_SUB_NEUROMORPHIC
+end
+if fg_tok_eq tok tlen fg_t_sub_fpg
+ret FG_SUB_FPGA_CGRA
+end
+if fg_tok_eq tok tlen fg_t_sub_opt
+ret FG_SUB_OPTICAL_PHOTONIC
+end
+put ok 0 uint 0
+ret uint 0
+end
+
+fn fg_cli_profiles to void
+p = new ForgeProvider 0 0 0 0 0 0 0 0 0 0 0 0 0
+n = fg_reg_count
+i = uint 0
+while lt i n bound 16
+if fg_reg_get i p
+fg_write_all 1 fg_m_prov_hdr
+fg_write_u64 1 ulong get p prov_id
+fg_write_all 1 fg_t_sp_hw
+fg_emit_hw_name 1 get p hw_id
+fg_write_all 1 fg_t_sp_sub
+fg_emit_sub_name 1 get p substrate_class
+fg_write_all 1 fg_t_sp_qual
+fg_emit_qual_name 1 get p qual_status
+fg_write_all 1 fg_t_sp_low
+fg_emit_low_name 1 get p lowering_kind
+fg_write_all 1 fg_t_nl
+end
+i = add i 1
+end
+ret
+end
+
+fn fg_cli_run_plan req view ForgeContract bud view ForgeBudget to void
+plan = new ForgePlan 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+env = new ForgeEnvCheck 0 0 0 0 0 0 0 0 0.0f64 0.0f64 0.0f64 0.0f64 0.0f64 0.0f64 0
+seals = new ForgeSeals 0 0 0 0
+rc = fg_realize_plan req bud plan env seals
+if ne rc FG_ADMIT_OK
+fg_emit_receipt 1 req plan env seals
+ret
+end
+fg_emit_receipt 1 req plan env seals
+ret
+end
+
+fn fg_cli_parse_plan line view uchar * cur edit ulong 1 seq ulong to bool
+tok = new uchar 64 0
+ok = new uint 1 0
+req = new ForgeContract seq 0 0 0 0 0 1 0 0 0 32 0 FG_ERRK_EXACT 0 1 0
+bud = new ForgeBudget 0.0f64 0.0f64 0.0f64 45000 1200 1000000
+tl = fg_next_tok line cur tok
+op = fg_parse_op tok tl
+if eq op 0
+ret false
+end
+put req op_class op
+tl = fg_next_tok line cur tok
+dt = fg_parse_dt tok tl
+if eq dt 0
+ret false
+end
+put req dtype dt
+tl = fg_next_tok line cur tok
+dm = fg_parse_u64 tok tl ok
+if eq get ok 0 0
+ret false
+end
+put req dim_m dm
+tl = fg_next_tok line cur tok
+dn = fg_parse_u64 tok tl ok
+if eq get ok 0 0
+ret false
+end
+put req dim_n dn
+tl = fg_next_tok line cur tok
+dk = fg_parse_u64 tok tl ok
+if eq get ok 0 0
+ret false
+end
+put req dim_k dk
+fg_cli_run_plan req bud
+ret true
+end
+
+fn fg_cli_read_u32 line view uchar * cur edit ulong 1 ok edit uint 1 to uint
+tok = new uchar 64 0
+tl = fg_next_tok line cur tok
+v = fg_parse_u64 tok tl ok
+if eq get ok 0 0
+ret uint 0
+end
+if gt v ulong 0xffffffff
+put ok 0 uint 0
+ret uint 0
+end
+ret uint v
+end
+
+fn fg_cli_read_u64 line view uchar * cur edit ulong 1 ok edit uint 1 to ulong
+tok = new uchar 64 0
+tl = fg_next_tok line cur tok
+ret fg_parse_u64 tok tl ok
+end
+
+fn fg_cli_parse_req_tail line view uchar * cur edit ulong 1 req edit ForgeContract bud edit ForgeBudget to bool
+ok = new uint 1 0
+tok = new uchar 64 0
+put req cta_req fg_cli_read_u32 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req thr_req fg_cli_read_u32 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req smem_req fg_cli_read_u32 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req gpr_req fg_cli_read_u32 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req extra_ws fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+tmc = fg_cli_read_u32 line cur ok
+if eq get ok 0 0
+ret false
+end
+if gt tmc uint 200000
+ret false
+end
+put bud temp_mc int tmc
+lat = fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+put bud lat_us f64 lat
+eng = fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+put bud energy_mj f64 eng
+pw = fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+put bud power_w f64 pw
+tl = fg_next_tok line cur tok
+subc = fg_parse_sub tok tl ok
+if eq get ok 0 0
+ret false
+end
+put req req_substrate subc
+put req req_qual fg_cli_read_u32 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req req_wave_cap fg_cli_read_u32 line cur ok
+if eq get ok 0 0
+ret false
+end
+ret true
+end
+
+fn fg_cli_parse_req line view uchar * cur edit ulong 1 to bool
+tok = new uchar 64 0
+ok = new uint 1 0
+req = new ForgeContract 0 0 0 0 0 0 1 0 0 0 0 0 FG_ERRK_EXACT 0 1 0
+bud = new ForgeBudget 0.0f64 0.0f64 0.0f64 45000 1200 1000000
+put req req_id fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+tl = fg_next_tok line cur tok
+op = fg_parse_op tok tl
+if eq op 0
+ret false
+end
+put req op_class op
+tl = fg_next_tok line cur tok
+dt = fg_parse_dt tok tl
+if eq dt 0
+ret false
+end
+put req dtype dt
+put req dim_m fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req dim_n fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req dim_k fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+put req batch fg_cli_read_u64 line cur ok
+if eq get ok 0 0
+ret false
+end
+if not fg_cli_parse_req_tail line cur req bud
+ret false
+end
+fg_cli_run_plan req bud
+ret true
+end
+
+fn fg_cli_handle_line line view uchar * seq ulong to int
+cur = new ulong 1 0
+tok = new uchar 64 0
+tl = fg_next_tok line cur tok
+if eq tl 0
+ret int 0
+end
+if eq get tok 0 35
+ret int 0
+end
+if fg_tok_eq tok tl fg_m_cmd_kat
+if fg_hw_v1_kat
+fg_write_all 1 fg_m_kat_pass
+ret int 0
+end
+fg_write_all 1 fg_m_kat_fail
+ret int 1
+end
+if fg_tok_eq tok tl fg_m_cmd_prof
+fg_cli_profiles
+ret int 0
+end
+if fg_tok_eq tok tl fg_m_cmd_plan
+if fg_cli_parse_plan line cur seq
+ret int 0
+end
+fg_write_all 1 fg_m_bad
+ret int 2
+end
+if fg_tok_eq tok tl fg_m_cmd_req
+if fg_cli_parse_req line cur
+ret int 0
+end
+fg_write_all 1 fg_m_bad
+ret int 2
+end
+fg_write_all 1 fg_m_bad
+ret int 2
+end
+
+fn main to int
+fg_reg_load_defaults
+inbuf = new uchar 16384 0
+got = ulong 0
+while lt got 16384 bound 16384
+k = read 0 inbuf got sub 16384 got
+if lt k 0
+ret int 3
+end
+if eq k 0
+break
+end
+got = add got ulong k
+end
+pos = ulong 0
+seq = ulong 1
+rc = int 0
+while lt pos got bound 1024
+start = pos
+while lt pos got bound 512
+if eq get inbuf pos 10
+break
+end
+pos = add pos 1
+end
+llen = sub pos start
+if gt llen 0
+lrc = fg_cli_handle_line part inbuf start llen seq
+if ne lrc 0
+rc = lrc
+end
+seq = add seq 1
+end
+if lt pos got
+pos = add pos 1
+end
+end
+ret rc
+end

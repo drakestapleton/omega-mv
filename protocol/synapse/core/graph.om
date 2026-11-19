@@ -1,0 +1,356 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/synapse/core/graph.om: changeset DAG and ancestry engine:
+note parent/child links, cycle refusal, reachability / fast-forward check (gr_is_ancestor),
+note lowest common ancestor (merge-base) finder (gr_lca), concurrent branch path-conflict
+note detector (gr_branches_conflict), and branch head registry.
+note Composed OM-2 library unit (no om2 directive, no main).
+
+const GR_MAX_PARENTS ulong 8
+const GR_MAX_CHILDREN ulong 32
+const GR_MAX_BRANCHES ulong 64
+
+global g_gr_pcnt ulong 256
+global g_gr_pars ulong 2048
+global g_gr_ccnt ulong 256
+global g_gr_chld ulong 8192
+global g_gr_br ulong 192
+global g_gr_hdr ulong 8
+
+fn gr_reset to void
+for i ulong 256
+put g_gr_pcnt i 0
+put g_gr_ccnt i 0
+end
+put g_gr_hdr 0 0
+put g_gr_hdr 1 SYN_NONE
+put g_gr_hdr 2 SYN_NONE
+end
+
+fn gr_parent_count idx ulong to ulong
+if ge idx CS_MAX
+ret 0
+end
+ret get g_gr_pcnt idx
+end
+
+fn gr_parent_at idx ulong k ulong to ulong
+if ge idx CS_MAX
+ret SYN_NONE
+end
+if ge k get g_gr_pcnt idx
+ret SYN_NONE
+end
+ret get g_gr_pars add mul idx GR_MAX_PARENTS k
+end
+
+fn gr_child_count idx ulong to ulong
+if ge idx CS_MAX
+ret 0
+end
+ret get g_gr_ccnt idx
+end
+
+fn gr_child_at idx ulong k ulong to ulong
+if ge idx CS_MAX
+ret SYN_NONE
+end
+if ge k get g_gr_ccnt idx
+ret SYN_NONE
+end
+ret get g_gr_chld add mul idx GR_MAX_CHILDREN k
+end
+
+note BFS reachability from desc_idx upward along parent links to test if anc_idx is an ancestor of desc_idx.
+note Reflexive: gr_is_ancestor(x, x) is true for valid x.
+fn gr_is_ancestor anc_idx ulong desc_idx ulong to bool
+vis = new uchar 256 0
+que = new ulong 256 0
+cnt = cs_count
+if or ge anc_idx cnt ge desc_idx cnt
+ret false
+end
+if eq anc_idx desc_idx
+ret true
+end
+put vis desc_idx 1
+put que 0 desc_idx
+qh = ulong 0
+qt = ulong 1
+while lt qh qt bound 512
+cur = get que qh
+qh = add qh 1
+pc = get g_gr_pcnt cur
+base = mul cur GR_MAX_PARENTS
+for i ulong pc
+p = get g_gr_pars add base i
+if eq p anc_idx
+ret true
+end
+if lt p CS_MAX
+if eq get vis p 0
+put vis p 1
+if lt qt 256
+put que qt p
+qt = add qt 1
+end
+end
+end
+end
+end
+ret false
+end
+
+note Links child_idx -> parent_idx in the DAG, refusing self-links and any edge that would close a cycle.
+fn gr_link_parent child_idx ulong parent_idx ulong to ulong
+cnt = cs_count
+if or ge child_idx cnt ge parent_idx cnt
+ret SYN_ERR_NOT_FOUND
+end
+if eq child_idx parent_idx
+ret SYN_ERR_CYCLE
+end
+pc = get g_gr_pcnt child_idx
+pbase = mul child_idx GR_MAX_PARENTS
+for i ulong pc
+if eq get g_gr_pars add pbase i parent_idx
+ret SYN_OK
+end
+end
+note Cycle check: if child_idx is already an ancestor of parent_idx, linking child->parent creates a cycle.
+if gr_is_ancestor child_idx parent_idx
+ret SYN_ERR_CYCLE
+end
+cc = get g_gr_ccnt parent_idx
+if or ge pc GR_MAX_PARENTS ge cc GR_MAX_CHILDREN
+ret SYN_ERR_CAPACITY
+end
+put g_gr_pars add pbase pc parent_idx
+put g_gr_pcnt child_idx add pc 1
+cbase = mul parent_idx GR_MAX_CHILDREN
+put g_gr_chld add cbase cc child_idx
+put g_gr_ccnt parent_idx add cc 1
+ret SYN_OK
+end
+
+note Fast-forward check: true when base_idx is SYN_NONE (initial landing) or base_idx is an ancestor of head_idx.
+fn gr_is_fast_forward base_idx ulong head_idx ulong to bool
+if eq base_idx SYN_NONE
+ret true
+end
+ret gr_is_ancestor base_idx head_idx
+end
+
+note BFS from start_idx recording (distance + 1) in dist[0..256); 0 means not an ancestor.
+fn gr_collect_ancestors start_idx ulong dist edit ulong 256 to void
+que = new ulong 256 0
+for i ulong 256
+put dist i 0
+end
+if ge start_idx cs_count
+ret
+end
+put dist start_idx 1
+put que 0 start_idx
+qh = ulong 0
+qt = ulong 1
+while lt qh qt bound 512
+cur = get que qh
+qh = add qh 1
+dcur = get dist cur
+pc = get g_gr_pcnt cur
+base = mul cur GR_MAX_PARENTS
+for i ulong pc
+p = get g_gr_pars add base i
+if lt p CS_MAX
+if eq get dist p 0
+put dist p add dcur 1
+if lt qt 256
+put que qt p
+qt = add qt 1
+end
+end
+end
+end
+end
+end
+
+fn gr_has_lower_common u ulong cnt ulong da view ulong 256 db view ulong 256 to bool
+for v ulong cnt
+if ne v u
+if gt get da v 0
+if gt get db v 0
+if gr_is_ancestor u v
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+note Lowest Common Ancestor (merge-base) of idx_a and idx_b.
+note Returns a common ancestor that is not a strict ancestor of any other common ancestor,
+note breaking ties by minimal combined distance; returns SYN_NONE if disjoint.
+fn gr_lca idx_a ulong idx_b ulong to ulong
+da = new ulong 256 0
+db = new ulong 256 0
+cnt = cs_count
+if or ge idx_a cnt ge idx_b cnt
+ret SYN_NONE
+end
+gr_collect_ancestors idx_a da
+gr_collect_ancestors idx_b db
+best = SYN_NONE
+best_sum = SYN_NONE
+for u ulong cnt
+if gt get da u 0
+if gt get db u 0
+if eq gr_has_lower_common u cnt da db false
+s = add get da u get db u
+if or eq best SYN_NONE lt s best_sum
+best = u
+best_sum = s
+end
+end
+end
+end
+end
+ret best
+end
+
+fn gr_scan_conflict u ulong cnt ulong db view ulong 256 da view ulong 256 to ulong
+best = ulong 0
+for v ulong cnt
+if gt get db v 0
+if eq get da v 0
+ov = cs_changesets_overlap u v
+if eq ov 1
+put g_gr_hdr 1 u
+put g_gr_hdr 2 v
+ret 1
+end
+if eq ov 2
+if eq best 0
+best = 2
+put g_gr_hdr 1 u
+put g_gr_hdr 2 v
+end
+end
+end
+end
+end
+ret best
+end
+
+note Detects conflicting paths across concurrent branches head_a and head_b relative to their merge-base.
+note Returns 0 (disjoint or non-concurrent), 1 (exact path conflict), or 2 (directory prefix conflict).
+note Records the conflicting changeset indices in g_gr_hdr[1] and g_gr_hdr[2].
+fn gr_branches_conflict head_a ulong head_b ulong to ulong
+da = new ulong 256 0
+db = new ulong 256 0
+cnt = cs_count
+put g_gr_hdr 1 SYN_NONE
+put g_gr_hdr 2 SYN_NONE
+if or ge head_a cnt ge head_b cnt
+ret 0
+end
+if or gr_is_ancestor head_a head_b gr_is_ancestor head_b head_a
+ret 0
+end
+gr_collect_ancestors head_a da
+gr_collect_ancestors head_b db
+best = ulong 0
+for u ulong cnt
+if gt get da u 0
+if eq get db u 0
+ov = gr_scan_conflict u cnt db da
+if eq ov 1
+ret 1
+end
+if eq ov 2
+best = 2
+end
+end
+end
+end
+ret best
+end
+
+fn gr_conflict_cs_a to ulong
+ret get g_gr_hdr 1
+end
+
+fn gr_conflict_cs_b to ulong
+ret get g_gr_hdr 2
+end
+
+note ======== branch head registry ========
+
+fn gr_branch_find_arena no ulong nl ulong to ulong
+cnt = get g_gr_hdr 0
+for i ulong cnt
+base = mul i 3
+if syn_arena_eq get g_gr_br base get g_gr_br add base 1 no nl
+ret i
+end
+end
+ret SYN_NONE
+end
+
+fn gr_branch_get name view uchar * to ulong
+cnt = get g_gr_hdr 0
+for i ulong cnt
+base = mul i 3
+if syn_arena_eq_view get g_gr_br base get g_gr_br add base 1 name
+ret get g_gr_br add base 2
+end
+end
+ret SYN_NONE
+end
+
+fn gr_branch_set_arena no ulong nl ulong head_idx ulong to ulong
+pos = gr_branch_find_arena no nl
+if ne pos SYN_NONE
+put g_gr_br add mul pos 3 2 head_idx
+ret SYN_OK
+end
+cnt = get g_gr_hdr 0
+if ge cnt GR_MAX_BRANCHES
+ret SYN_ERR_CAPACITY
+end
+base = mul cnt 3
+put g_gr_br base no
+put g_gr_br add base 1 nl
+put g_gr_br add base 2 head_idx
+put g_gr_hdr 0 add cnt 1
+ret SYN_OK
+end
+
+fn gr_branch_set name view uchar * head_idx ulong to ulong
+cnt = get g_gr_hdr 0
+for i ulong cnt
+base = mul i 3
+if syn_arena_eq_view get g_gr_br base get g_gr_br add base 1 name
+put g_gr_br add base 2 head_idx
+ret SYN_OK
+end
+end
+if ge cnt GR_MAX_BRANCHES
+ret SYN_ERR_CAPACITY
+end
+no = syn_arena_put name
+if eq no SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+base = mul cnt 3
+put g_gr_br base no
+put g_gr_br add base 1 len name
+put g_gr_br add base 2 head_idx
+put g_gr_hdr 0 add cnt 1
+ret SYN_OK
+end
+
+fn gr_main_head to ulong
+ret gr_branch_get t_br_main
+end

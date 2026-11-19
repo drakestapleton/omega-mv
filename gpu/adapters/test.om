@@ -1,0 +1,340 @@
+note gpu/adapters/test.om: comprehensive positive and negative/refusal tests for spark-adapters.
+note Tests hardware capability matching, scoring, strict refusals (VRAM, precision, CC, offline, bad req),
+note upstream provider catalog route resolution, sovereign unslop/secret/delimiter verifier, and distillation.
+note Compose: si/directives/om2.om gpu/adapters/lib.om gpu/adapters/test.om
+
+text at_q_res "atlas-lightning-omni"
+text at_q_anth "anthropic/claude-3-7-sonnet"
+text at_q_o3 "openai/o3-mini"
+text at_q_pre "groq/mixtral-custom"
+text at_q_unk "unknown-local-seat"
+
+text at_v_clean "Implementation verified with zero allocations."
+text at_v_cliche "We will delve into this crucial topic."
+text at_v_syco "Certainly! Great question! Here is code."
+text at_v_secret "token=sk-proj-deadbeef1234567890"
+text at_v_code_ok "pub fn add(a: i32, b: i32) -> i32 { a + b }"
+text at_v_code_bad "pub fn add(a: i32, b: i32] { a + b }"
+text at_v_code_str "pub fn msg() { let s = \")]]\"; }"
+text at_v_json_ok "payload: {\"status\": \"ok\", \"count\": 3}"
+text at_v_json_bad "payload: {\"status\": \"ok\""
+
+text at_ok_hw "PASS hardware capability match & scoring (6/6)\n"
+text at_ok_rf "PASS hardware strict refusals (8/8 refused)\n"
+text at_ok_rt "PASS upstream provider catalog & route resolution (5/5)\n"
+text at_ok_vr "PASS sovereign verifier: unslop, dashes, secrets, delimiters, json (9/9)\n"
+text at_ok_ds "PASS distillation preference & Cortex commit gating (3/3)\n"
+text at_all "ALL PASS spark-adapters\n"
+text at_fail "FAIL spark-adapters code="
+
+fn at_fail_ret code int to int
+ad_ob_reset
+ad_ob_str at_fail
+ad_ob_i64 long code
+ad_ob_str ta_nl
+ad_ob_flush
+ret code
+end
+
+fn test_hw_matching to int
+adapter_init_default_devices
+sel = new AdapterSel false 0 0 0 0 0
+
+note 1. NVFP4 + 96 GiB -> only GB10 (dev 0) supports NVFP4
+r1 = new WorkloadReq mul 96 AD_GIB or CAP_NVFP4 CAP_FP8 12 1 VENDOR_ANY true
+if ne adapter_select view r1 edit sel AD_OK
+ret 1
+end
+if or ne get sel dev_id 0 ne get sel eligible 1
+ret 2
+end
+
+note 2. 64 GiB FP8 + BF16 (any vendor) -> MI300X (dev 4) wins highest score (192 GiB, 1307 TFLOPS, 5300 GB/s)
+r2 = new WorkloadReq mul 64 AD_GIB or CAP_FP8 CAP_BF16 8 0 VENDOR_ANY false
+if ne adapter_select view r2 edit sel AD_OK
+ret 3
+end
+if or ne get sel dev_id 4 ne get sel eligible 3
+ret 4
+end
+
+note 3. Same 64 GiB FP8 + BF16 with NVIDIA preference -> H100 (dev 1) beats GB10 (dev 0) on compute+BW
+r3 = new WorkloadReq mul 64 AD_GIB or CAP_FP8 CAP_BF16 9 0 VENDOR_NVIDIA false
+if ne adapter_select view r3 edit sel AD_OK
+ret 5
+end
+if ne get sel dev_id 1
+ret 6
+end
+
+note 4. 16 GiB TF32 + FP8 -> MI300X lacks TF32, A100 lacks FP8, M4 lacks both -> NVIDIA H100 (dev 1) wins among {GB10, H100, 4090}
+r4 = new WorkloadReq mul 16 AD_GIB or CAP_TF32 CAP_FP8 8 0 VENDOR_ANY false
+if ne adapter_select view r4 edit sel AD_OK
+ret 7
+end
+if or ne get sel dev_id 1 ne get sel eligible 3
+ret 8
+end
+
+note 5. 48 GiB unified memory + BF16 -> GB10 (dev 0) vs M4 Max (dev 5), GB10 wins
+r5 = new WorkloadReq mul 48 AD_GIB or CAP_UNIFIED CAP_BF16 4 0 VENDOR_ANY true
+if ne adapter_select view r5 edit sel AD_OK
+ret 9
+end
+if or ne get sel dev_id 0 ne get sel eligible 2
+ret 10
+end
+
+note 6. Taking H100 offline causes NVIDIA 64 GiB FP8 workload to deterministically fail over to GB10 (dev 0)
+adapter_set_perf 1 989 3350 false
+if ne adapter_select view r3 edit sel AD_OK
+ret 11
+end
+if ne get sel dev_id 0
+ret 12
+end
+
+ret 0
+end
+
+fn test_hw_refusals to int
+adapter_init_default_devices
+sel = new AdapterSel false 0 0 0 0 0
+
+note 1. VRAM exceeds all hardware (512 GiB > max 192 GiB) -> AD_ERR_VRAM_EXCEEDED
+r1 = new WorkloadReq mul 512 AD_GIB CAP_BF16 8 0 VENDOR_ANY false
+if ne adapter_select view r1 edit sel AD_ERR_VRAM_EXCEEDED
+ret 20
+end
+if get sel ok
+ret 21
+end
+
+note 2. Precision unsupported on A100-only table (FP8 requested on A100 40G) -> AD_ERR_PRECISION
+adapter_reset_devices
+a_rc = adapter_add_device VENDOR_NVIDIA ARCH_A100_SM80 40 8 0 0x1b
+if ne a_rc AD_OK
+ret 22
+end
+r2 = new WorkloadReq mul 16 AD_GIB CAP_FP8 8 0 VENDOR_ANY false
+if ne adapter_select view r2 edit sel AD_ERR_PRECISION
+ret 23
+end
+
+note 3. Precision unsupported on MI300X-only table (TF32 requested on AMD MI300X) -> AD_ERR_PRECISION
+adapter_reset_devices
+m_rc = adapter_add_device VENDOR_AMD ARCH_MI300X_GFX942 192 9 4 0x0f
+if ne m_rc AD_OK
+ret 24
+end
+r3 = new WorkloadReq mul 32 AD_GIB CAP_TF32 9 0 VENDOR_ANY false
+if ne adapter_select view r3 edit sel AD_ERR_PRECISION
+ret 25
+end
+
+note 4. Compute capability too low (SM 12.1 required on H100 SM 9.0) -> AD_ERR_CC_LOW
+adapter_reset_devices
+h_rc = adapter_add_device VENDOR_NVIDIA ARCH_H100_SM90 80 9 0 0x1f
+if ne h_rc AD_OK
+ret 26
+end
+r4 = new WorkloadReq mul 32 AD_GIB CAP_FP8 12 1 VENDOR_ANY false
+if ne adapter_select view r4 edit sel AD_ERR_CC_LOW
+ret 27
+end
+
+note 5. All devices offline -> AD_ERR_OFFLINE
+adapter_set_perf 0 989 3350 false
+r5 = new WorkloadReq mul 16 AD_GIB CAP_FP16 8 0 VENDOR_ANY false
+if ne adapter_select view r5 edit sel AD_ERR_OFFLINE
+ret 28
+end
+
+note 6. Empty device table -> AD_ERR_NO_DEVICES
+adapter_reset_devices
+if ne adapter_select view r5 edit sel AD_ERR_NO_DEVICES
+ret 29
+end
+
+note 7. Invalid request: zero VRAM -> AD_ERR_BAD_REQ
+adapter_init_default_devices
+r7 = new WorkloadReq 0 CAP_FP16 8 0 VENDOR_ANY false
+if ne adapter_select view r7 edit sel AD_ERR_BAD_REQ
+ret 30
+end
+
+note 8. Invalid request: unknown capability bit 0x80 -> AD_ERR_BAD_REQ
+r8 = new WorkloadReq mul 16 AD_GIB 0x80 8 0 VENDOR_ANY false
+if ne adapter_select view r8 edit sel AD_ERR_BAD_REQ
+ret 31
+end
+
+ret 0
+end
+
+fn test_provider_routing to int
+rr = new RouteRes 0 0 false false false 0
+
+adapter_resolve_route at_q_res edit rr
+if or ne get rr provider PROV_LOCAL_MAX not get rr is_resident
+ret 40
+end
+
+adapter_resolve_route at_q_anth edit rr
+if or ne get rr provider PROV_ANTHROPIC or ne get rr ctx_len 200000 not get rr requires_key
+ret 41
+end
+
+adapter_resolve_route at_q_o3 edit rr
+if or ne get rr provider PROV_OPENAI ne get rr ctx_len 200000
+ret 42
+end
+
+adapter_resolve_route at_q_pre edit rr
+if or ne get rr provider PROV_GROQ get rr matched_catalog
+ret 43
+end
+
+adapter_resolve_route at_q_unk edit rr
+if or ne get rr provider PROV_LOCAL_MAX not get rr is_resident
+ret 44
+end
+
+ret 0
+end
+
+fn test_sovereign_verifier to int
+vr = new VerifRes false false 0.0f64 0 false
+
+note 1. Clean response passes with 1.0
+adapter_verify at_v_clean VERIF_UNSLOP_STRICT edit vr
+if or not get vr passed or ne get vr score 1.0f64 ne get vr violations 0
+ret 50
+end
+
+note 2. Banned AI cliches ("delve", "crucial") caught and capped <= 0.5 under UnslopStrict
+adapter_verify at_v_cliche VERIF_UNSLOP_STRICT edit vr
+if or get vr passed or ne get vr violations 2 gt get vr score 0.5f64
+ret 51
+end
+
+note 3. Sycophancy phrases caught
+adapter_verify at_v_syco VERIF_UNSLOP_STRICT edit vr
+if or get vr passed lt get vr violations 2
+ret 52
+end
+
+note 4. UTF-8 em-dash (0xe2 0x80 0x94) detected and rejected under UnslopStrict
+em = new uchar 7 65
+put em 2 0xe2
+put em 3 0x80
+put em 4 0x94
+adapter_verify view em VERIF_UNSLOP_STRICT edit vr
+if or get vr passed ne get vr violations 1
+ret 53
+end
+
+note 5. Secret leak signature ("sk-proj-") triggers critical failure, score 0.0
+adapter_verify at_v_secret VERIF_DUAL_CONSENSUS edit vr
+if or get vr passed or not get vr critical ne get vr score 0.0f64
+ret 54
+end
+
+note 6. Balanced Rust code passes CompilerCheck
+adapter_verify at_v_code_ok VERIF_COMPILER edit vr
+if or not get vr passed or not get vr delim_ok ne get vr score 1.0f64
+ret 55
+end
+
+note 7. Unbalanced delimiter caught by CompilerCheck
+adapter_verify at_v_code_bad VERIF_COMPILER edit vr
+if or get vr delim_ok eq get vr violations 0
+ret 56
+end
+
+note 8. Delimiters inside string literals are ignored cleanly
+adapter_verify at_v_code_str VERIF_COMPILER edit vr
+if or not get vr passed not get vr delim_ok
+ret 57
+end
+
+note 9. JSON brace structure check (valid vs unclosed)
+adapter_verify at_v_json_ok VERIF_JSON edit vr
+if not get vr passed
+ret 58
+end
+adapter_verify at_v_json_bad VERIF_JSON edit vr
+if get vr delim_ok
+ret 59
+end
+
+ret 0
+end
+
+fn test_distillation_selector to int
+dd = new DistillDec 0 0.0f64 false
+
+note 1. Teacher passes with 0.95 > student 0.70 -> TEACHER chosen, commit_cortex true
+adapter_distill_select true 0.95f64 true 0.70f64 true edit dd
+if or ne get dd chosen CHOSEN_TEACHER or not get dd commit_cortex gt fabs sub get dd pref_delta 0.25f64 0.0001f64
+ret 60
+end
+
+note 2. Teacher fails, student passes -> STUDENT chosen, commit_cortex false
+adapter_distill_select false 0.40f64 true 0.90f64 true edit dd
+if or ne get dd chosen CHOSEN_STUDENT get dd commit_cortex
+ret 61
+end
+
+note 3. Teacher passes with 0.80 (< 0.85 Cortex threshold) -> TEACHER chosen, commit_cortex false
+adapter_distill_select true 0.80f64 false 0.30f64 true edit dd
+if or ne get dd chosen CHOSEN_TEACHER get dd commit_cortex
+ret 62
+end
+
+ret 0
+end
+
+fn main to int
+c1 = test_hw_matching
+if ne c1 0
+ret at_fail_ret c1
+end
+ad_ob_reset
+ad_ob_str at_ok_hw
+ad_ob_flush
+
+c2 = test_hw_refusals
+if ne c2 0
+ret at_fail_ret c2
+end
+ad_ob_reset
+ad_ob_str at_ok_rf
+ad_ob_flush
+
+c3 = test_provider_routing
+if ne c3 0
+ret at_fail_ret c3
+end
+ad_ob_reset
+ad_ob_str at_ok_rt
+ad_ob_flush
+
+c4 = test_sovereign_verifier
+if ne c4 0
+ret at_fail_ret c4
+end
+ad_ob_reset
+ad_ob_str at_ok_vr
+ad_ob_flush
+
+c5 = test_distillation_selector
+if ne c5 0
+ret at_fail_ret c5
+end
+ad_ob_reset
+ad_ob_str at_ok_ds
+ad_ob_str at_all
+ad_ob_flush
+ret 0
+end

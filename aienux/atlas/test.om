@@ -1,0 +1,464 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/atlas/test.om: Comprehensive pure-Omega test suite for Atlas stage-0 boot verifier.
+note Covers NIST FIPS 180-4 SHA-256 KATs, canonical 256-byte PHYSICS-0 staging payload,
+note exhaustive 256-offset 1-bit payload mutation sweep, bad magic/version/alignment,
+note entry_off bounds, stage_len overflow, epoch rollback, truncation, memmap disjointness,
+note and fail-closed descriptor emitter refusal.
+note Compose with: si/directives/om2.om aienux/atlas/lib.om aienux/atlas/test.om
+
+text t_abc "abc"
+text t_56 "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+text t_112 "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopqabcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+
+text h_empty "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+text h_abc "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+text h_56 "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+text h_112 "59f109d9533b2b70e7c3b814a2bd218f78ea5d3714455bc67987cf0d664399cf"
+text h_phys0 "e1d89bb1e0854ebaccd2be5c756c8a2ff8c5ecc8c0f90b4abd461fb7bf98374c"
+
+note First 160 non-zero bytes of canonical upstream physics-0.bin (remaining 96 bytes are 0x00)
+text p0_hex0 "430400585f0003eb81010054240400581f0004eb210100543f0004f1e1000054"
+text p0_hex1 "050840f9a6010010c714403827010034a70000b9fdffff170503005886010070"
+text p0_hex2 "c714403867000034a70000b9fdffff175f2003d5ffffff17504859534943532d"
+text p0_hex3 "303a20415554484f52495a45440a00504859534943532d303a2044454e494544"
+text p0_hex4 "0a00000000000000305343495359485000e01f40000000000000000900000000"
+
+text s_pass "PASS "
+text s_fail "FAIL "
+text s_nl "\n"
+text s_k1 "kat_sha256_empty"
+text s_k2 "kat_sha256_abc"
+text s_k3 "kat_sha256_56bytes"
+text s_k4 "kat_sha256_112bytes"
+text s_k5 "kat_sha256_physics0_256bytes"
+text s_t1 "verify_valid_physics0_handoff"
+text s_t2 "verify_valid_nonzero_entry_off"
+text s_t3 "refuse_256_single_bit_payload_flips"
+text s_t4 "refuse_1bit_flipped_header_digest"
+text s_t5 "refuse_bad_magic"
+text s_t6 "refuse_bad_version"
+text s_t7 "refuse_bad_alignment"
+text s_t8 "refuse_entry_out_of_bounds"
+text s_t9 "refuse_invalid_stage_len_and_overflow"
+text s_t10 "refuse_epoch_rollback"
+text s_t11 "refuse_short_header_and_truncated_payload"
+text s_t12 "refuse_memmap_disjointness_violations"
+text s_t13 "refuse_halted_descriptor_emit"
+text s_sum "ATLAS_TEST_PASS total=18 failed=0\n"
+text s_fsum "ATLAS_TEST_FAIL\n"
+
+fn report name view uchar * ok bool to uint
+if ok
+w1 = atlas_write_all 1 s_pass
+w2 = atlas_write_all 1 name
+w3 = atlas_write_all 1 s_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = atlas_write_all 1 s_fail
+w2 = atlas_write_all 1 name
+w3 = atlas_write_all 1 s_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn load_physics0 dst edit uchar 256 to bool
+for i ulong 256
+put dst i 0
+end
+if not atlas_parse_hex_bytes p0_hex0 part dst 0 32
+ret false
+end
+if not atlas_parse_hex_bytes p0_hex1 part dst 32 32
+ret false
+end
+if not atlas_parse_hex_bytes p0_hex2 part dst 64 32
+ret false
+end
+if not atlas_parse_hex_bytes p0_hex3 part dst 96 32
+ret false
+end
+ret atlas_parse_hex_bytes p0_hex4 part dst 128 32
+end
+
+fn build_valid_img img edit uchar * pay view uchar 256 epoch ulong eoff ulong to bool
+exp = new uchar 32 0
+hdr = new AtlasHeader ATLAS_MAGIC_LE ATLAS_HDR_VER 256 eoff epoch
+if lt len img 320
+ret false
+end
+atlas_sha256_compute pay exp
+if not atlas_header_encode img hdr exp
+ret false
+end
+for i ulong 256
+put img add 64 i get pay i
+end
+ret true
+end
+
+fn check_kat msg view uchar * exp_hex view uchar * to bool
+got = new uchar 32 0
+exp = new uchar 32 0
+if not atlas_parse_hex_bytes exp_hex exp
+ret false
+end
+atlas_sha256_compute msg got
+ret atlas_ct_eq32 got exp
+end
+
+fn check_fail_closed desc view AtlasBootDesc code uint to bool
+if ne get desc verdict code
+ret false
+end
+if ne get desc halted 1
+ret false
+end
+if ne get desc cookie 0
+ret false
+end
+ret eq get desc entry_addr 0
+end
+
+fn test_valid_physics0 pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+wire = new uchar 64 0
+if not build_valid_img img pay 1 0
+ret false
+end
+rc = atlas_verify_image img 1 hdr desc comp
+if ne rc ATLAS_OK
+ret false
+end
+if ne get desc halted 0
+ret false
+end
+if ne get desc cookie ATLAS_COOKIE
+ret false
+end
+if ne get desc entry_addr ATLAS_PAYLOAD_BASE
+ret false
+end
+if ne get desc payload_size 256
+ret false
+end
+if ne get desc epoch 1
+ret false
+end
+if not atlas_emit_desc_bytes desc wire
+ret false
+end
+if ne atlas_le64 wire 0 ATLAS_RAM_BASE
+ret false
+end
+if ne atlas_le64 wire 8 ATLAS_RAM_SIZE
+ret false
+end
+if ne atlas_le64 wire 16 ATLAS_UART_BASE
+ret false
+end
+if ne atlas_le64 wire 24 ATLAS_PAYLOAD_BASE
+ret false
+end
+if ne atlas_le64 wire 32 256
+ret false
+end
+if ne atlas_le64 wire 40 ATLAS_PAYLOAD_BASE
+ret false
+end
+if ne atlas_le64 wire 48 1
+ret false
+end
+ret eq atlas_le64 wire 56 ATLAS_COOKIE
+end
+
+fn test_valid_nonzero_entry pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 7 16
+ret false
+end
+rc = atlas_verify_image img 5 hdr desc comp
+if ne rc ATLAS_OK
+ret false
+end
+if ne get desc entry_addr add ATLAS_PAYLOAD_BASE 16
+ret false
+end
+ret eq get desc epoch 7
+end
+
+fn test_256_bit_flips pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 1 0
+ret false
+end
+for i ulong 256
+pos = add 64 i
+orig = get img pos
+put img pos xor orig uchar 1
+rc = atlas_verify_image img 1 hdr desc comp
+put img pos orig
+if ne rc ATLAS_ERR_DIGEST
+ret false
+end
+if not check_fail_closed desc ATLAS_ERR_DIGEST
+ret false
+end
+end
+ret true
+end
+
+fn test_flipped_header_digest pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 1 0
+ret false
+end
+put img 63 xor get img 63 uchar 1
+rc = atlas_verify_image img 1 hdr desc comp
+if ne rc ATLAS_ERR_DIGEST
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_DIGEST
+end
+
+fn test_bad_magic pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 1 0
+ret false
+end
+put img 0 uchar 0x58
+rc = atlas_verify_image img 1 hdr desc comp
+if ne rc ATLAS_ERR_MAGIC
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_MAGIC
+end
+
+fn test_bad_version pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 1 0
+ret false
+end
+atlas_put_le32 img 4 uint 0
+rc0 = atlas_verify_image img 1 hdr desc comp
+if ne rc0 ATLAS_ERR_VERSION
+ret false
+end
+if not check_fail_closed desc ATLAS_ERR_VERSION
+ret false
+end
+atlas_put_le32 img 4 uint 2
+rc2 = atlas_verify_image img 1 hdr desc comp
+if ne rc2 ATLAS_ERR_VERSION
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_VERSION
+end
+
+fn test_bad_alignment pay view uchar 256 to bool
+img = new uchar 324 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img part img 0 320 pay 1 0
+ret false
+end
+note Unaligned stage_len = 257
+atlas_put_le64 img 8 257
+rc1 = atlas_verify_image img 1 hdr desc comp
+if ne rc1 ATLAS_ERR_ALIGN
+ret false
+end
+if not check_fail_closed desc ATLAS_ERR_ALIGN
+ret false
+end
+note Restore stage_len = 256, set unaligned entry_off = 2
+atlas_put_le64 img 8 256
+atlas_put_le64 img 16 2
+rc2 = atlas_verify_image img 1 hdr desc comp
+if ne rc2 ATLAS_ERR_ALIGN
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_ALIGN
+end
+
+fn test_entry_oob pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 1 0
+ret false
+end
+atlas_put_le64 img 16 256
+rc1 = atlas_verify_image img 1 hdr desc comp
+if ne rc1 ATLAS_ERR_ENTRY_OOB
+ret false
+end
+if not check_fail_closed desc ATLAS_ERR_ENTRY_OOB
+ret false
+end
+atlas_put_le64 img 16 512
+rc2 = atlas_verify_image img 1 hdr desc comp
+if ne rc2 ATLAS_ERR_ENTRY_OOB
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_ENTRY_OOB
+end
+
+fn test_invalid_stage_len pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 1 0
+ret false
+end
+atlas_put_le64 img 8 0
+rc0 = atlas_verify_image img 1 hdr desc comp
+if ne rc0 ATLAS_ERR_STAGE_LEN
+ret false
+end
+atlas_put_le64 img 8 0xfffffffffffffffc
+rc1 = atlas_verify_image img 1 hdr desc comp
+if ne rc1 ATLAS_ERR_STAGE_LEN
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_STAGE_LEN
+end
+
+fn test_epoch_rollback pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 4 0
+ret false
+end
+rc = atlas_verify_image img 5 hdr desc comp
+if ne rc ATLAS_ERR_ROLLBACK
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_ROLLBACK
+end
+
+fn test_truncation pay view uchar 256 to bool
+img = new uchar 320 0
+hdr = new AtlasHeader 0 0 0 0 0
+desc = new AtlasBootDesc 0 0 0 0 0 0 0 0 0 0 0 1
+comp = new uchar 32 0
+if not build_valid_img img pay 1 0
+ret false
+end
+rc_hdr = atlas_verify_image part img 0 63 1 hdr desc comp
+if ne rc_hdr ATLAS_ERR_SHORT_HDR
+ret false
+end
+if not check_fail_closed desc ATLAS_ERR_SHORT_HDR
+ret false
+end
+rc_tr = atlas_verify_image part img 0 319 1 hdr desc comp
+if ne rc_tr ATLAS_ERR_TRUNCATED
+ret false
+end
+ret check_fail_closed desc ATLAS_ERR_TRUNCATED
+end
+
+fn test_memmap_violations to bool
+note Valid M1 contract must pass
+if not atlas_check_memmap ATLAS_STACK_BASE ATLAS_STACK_TOP ATLAS_DESC_ADDR ATLAS_PAYLOAD_BASE 256
+ret false
+end
+note Insufficient guard gap (stack_top touches descriptor)
+if atlas_check_memmap ATLAS_STACK_BASE ATLAS_DESC_ADDR ATLAS_DESC_ADDR ATLAS_PAYLOAD_BASE 256
+ret false
+end
+note Unaligned stack_top
+if atlas_check_memmap ATLAS_STACK_BASE add ATLAS_STACK_TOP 4 ATLAS_DESC_ADDR ATLAS_PAYLOAD_BASE 256
+ret false
+end
+note Descriptor overlaps payload
+if atlas_check_memmap ATLAS_STACK_BASE ATLAS_STACK_TOP ATLAS_PAYLOAD_BASE ATLAS_PAYLOAD_BASE 256
+ret false
+end
+note Stage overflows RAM top
+if atlas_check_memmap ATLAS_STACK_BASE ATLAS_STACK_TOP ATLAS_DESC_ADDR ATLAS_PAYLOAD_BASE ATLAS_RAM_SIZE
+ret false
+end
+ret true
+end
+
+fn test_halted_desc_emit to bool
+desc = new AtlasBootDesc ATLAS_RAM_BASE ATLAS_RAM_SIZE ATLAS_UART_BASE ATLAS_PAYLOAD_BASE 256 ATLAS_PAYLOAD_BASE ATLAS_DESC_ADDR ATLAS_STACK_TOP ATLAS_COOKIE 1 ATLAS_ERR_DIGEST 1
+wire = new uchar 64 0xff
+if atlas_emit_desc_bytes desc wire
+ret false
+end
+for i ulong 64
+if ne get wire i 0
+ret false
+end
+end
+ret true
+end
+
+fn main to int
+empty_buf = new uchar 1 0
+pay = new uchar 256 0
+if not load_physics0 pay
+ret 1
+end
+fails = uint 0
+fails = add fails report s_k1 check_kat part empty_buf 0 0 h_empty
+fails = add fails report s_k2 check_kat t_abc h_abc
+fails = add fails report s_k3 check_kat t_56 h_56
+fails = add fails report s_k4 check_kat t_112 h_112
+fails = add fails report s_k5 check_kat pay h_phys0
+fails = add fails report s_t1 test_valid_physics0 pay
+fails = add fails report s_t2 test_valid_nonzero_entry pay
+fails = add fails report s_t3 test_256_bit_flips pay
+fails = add fails report s_t4 test_flipped_header_digest pay
+fails = add fails report s_t5 test_bad_magic pay
+fails = add fails report s_t6 test_bad_version pay
+fails = add fails report s_t7 test_bad_alignment pay
+fails = add fails report s_t8 test_entry_oob pay
+fails = add fails report s_t9 test_invalid_stage_len pay
+fails = add fails report s_t10 test_epoch_rollback pay
+fails = add fails report s_t11 test_truncation pay
+fails = add fails report s_t12 test_memmap_violations
+fails = add fails report s_t13 test_halted_desc_emit
+if eq fails 0
+ok = atlas_write_all 1 s_sum
+if ok
+ret 0
+end
+ret 2
+end
+ok = atlas_write_all 1 s_fsum
+if ok
+ret 1
+end
+ret 1
+end

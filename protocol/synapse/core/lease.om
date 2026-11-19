@@ -1,0 +1,372 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/synapse/core/lease.om: exclusive coordination lease table over branch: and path: targets
+note with monotonic timestamps, TTL expiry, strict overlap refusal (status 2), holder-only renewal,
+note explicit release with final status word, and ledger recording.
+note Composed OM-2 library unit (no om2 directive, no main).
+
+const LS_MAX ulong 256
+const LS_FIELDS ulong 14
+
+const LS_KIND_BRANCH ulong 1
+const LS_KIND_PATH ulong 2
+
+const LS_ST_ACTIVE ulong 1
+const LS_ST_RELEASED ulong 2
+const LS_ST_EXPIRED ulong 3
+
+const LSF_ID ulong 0
+const LSF_KIND ulong 1
+const LSF_HOLD_OFF ulong 2
+const LSF_HOLD_LEN ulong 3
+const LSF_TGT_OFF ulong 4
+const LSF_TGT_LEN ulong 5
+const LSF_NORM_OFF ulong 6
+const LSF_NORM_LEN ulong 7
+const LSF_STATUS ulong 8
+const LSF_CREATED ulong 9
+const LSF_EXPIRES ulong 10
+const LSF_CLOSED ulong 11
+const LSF_FIN_OFF ulong 12
+const LSF_FIN_LEN ulong 13
+
+global g_ls_tab ulong 3584
+global g_ls_hdr ulong 8
+
+text t_ls_pbr "branch:"
+text t_ls_ppath "path:"
+text t_ls_wild "*"
+
+fn ls_reset to void
+put g_ls_hdr 0 0
+put g_ls_hdr 1 SYN_NONE
+put g_ls_hdr 2 0
+end
+
+fn ls_count to ulong
+ret get g_ls_hdr 0
+end
+
+fn ls_last_id to ulong
+ret get g_ls_hdr 2
+end
+
+fn ls_conflict_idx to ulong
+ret get g_ls_hdr 1
+end
+
+fn ls_mget idx ulong f ulong to ulong
+ret get g_ls_tab add mul idx LS_FIELDS f
+end
+
+fn ls_mput idx ulong f ulong v ulong to void
+put g_ls_tab add mul idx LS_FIELDS f v
+end
+
+fn ls_find_by_id lid ulong to ulong
+cnt = get g_ls_hdr 0
+for i ulong cnt
+if eq ls_mget i LSF_ID lid
+ret i
+end
+end
+ret SYN_NONE
+end
+
+fn ls_holder_off idx ulong to ulong
+ret ls_mget idx LSF_HOLD_OFF
+end
+
+fn ls_holder_len idx ulong to ulong
+ret ls_mget idx LSF_HOLD_LEN
+end
+
+fn ls_target_off idx ulong to ulong
+ret ls_mget idx LSF_TGT_OFF
+end
+
+fn ls_target_len idx ulong to ulong
+ret ls_mget idx LSF_TGT_LEN
+end
+
+fn ls_final_off idx ulong to ulong
+ret ls_mget idx LSF_FIN_OFF
+end
+
+fn ls_final_len idx ulong to ulong
+ret ls_mget idx LSF_FIN_LEN
+end
+
+fn ls_status idx ulong now ulong to ulong
+if ge idx get g_ls_hdr 0
+ret 0
+end
+st = ls_mget idx LSF_STATUS
+if eq st LS_ST_ACTIVE
+if ge now ls_mget idx LSF_EXPIRES
+ret LS_ST_EXPIRED
+end
+end
+ret st
+end
+
+fn ls_is_active lid ulong now ulong to bool
+idx = ls_find_by_id lid
+if eq idx SYN_NONE
+ret false
+end
+ret eq ls_status idx now LS_ST_ACTIVE
+end
+
+fn ls_make_subj lid ulong dst edit uchar * to void
+for i ulong 32
+put dst i 0
+end
+put dst 0 76
+put dst 1 69
+put dst 2 65
+put dst 3 83
+put dst 4 69
+syn_put_u64_le dst 8 lid
+end
+
+fn ls_has_prefix s view uchar * pref view uchar * to bool
+if lt len s len pref
+ret false
+end
+for i ulong len pref
+if ne get s i get pref i
+ret false
+end
+end
+ret true
+end
+
+note Parses and validates target: returns LS_KIND_BRANCH (1), LS_KIND_PATH (2), or 0 if invalid.
+note Writes normalized suffix (off, len) into g_ls_hdr[4..5] (for path: strips trailing '/*' if present).
+fn ls_parse_target target view uchar * to ulong
+n = len target
+if ls_has_prefix target t_ls_pbr
+if or le n 7 gt n 135
+ret 0
+end
+for i ulong sub n 7
+c = get target add 7 i
+if or le c 32 gt c 126
+ret 0
+end
+end
+no = syn_arena_put part target 7 sub n 7
+if eq no SYN_NONE
+ret 0
+end
+put g_ls_hdr 4 no
+put g_ls_hdr 5 sub n 7
+ret LS_KIND_BRANCH
+end
+if ls_has_prefix target t_ls_ppath
+if or le n 5 gt n 261
+ret 0
+end
+plen = sub n 5
+if and eq plen 1 eq get target 5 42
+no = syn_arena_put t_ls_wild
+if eq no SYN_NONE
+ret 0
+end
+put g_ls_hdr 4 no
+put g_ls_hdr 5 1
+ret LS_KIND_PATH
+end
+if ge plen 2
+if and eq get target sub n 2 47 eq get target sub n 1 42
+plen = sub plen 2
+end
+end
+if eq cs_path_valid part target 5 plen false
+ret 0
+end
+no = syn_arena_put part target 5 plen
+if eq no SYN_NONE
+ret 0
+end
+put g_ls_hdr 4 no
+put g_ls_hdr 5 plen
+ret LS_KIND_PATH
+end
+ret 0
+end
+
+note Overlap test between two normalized targets (same kind).
+fn ls_norm_overlap kind ulong ao ulong al ulong bo ulong bl ulong to bool
+if eq kind LS_KIND_BRANCH
+ret syn_arena_eq ao al bo bl
+end
+if eq kind LS_KIND_PATH
+if or syn_arena_eq_view ao al t_ls_wild syn_arena_eq_view bo bl t_ls_wild
+ret true
+end
+ret ne cs_paths_overlap_arena ao al bo bl 0
+end
+ret false
+end
+
+note Sweep and mark all expired active leases as LS_ST_EXPIRED at monotonic timestamp now.
+fn ls_expire_sweep now ulong to ulong
+cnt = get g_ls_hdr 0
+expired = ulong 0
+for i ulong cnt
+if eq ls_mget i LSF_STATUS LS_ST_ACTIVE
+if ge now ls_mget i LSF_EXPIRES
+ls_mput i LSF_STATUS LS_ST_EXPIRED
+ls_mput i LSF_CLOSED ls_mget i LSF_EXPIRES
+expired = add expired 1
+end
+end
+end
+ret expired
+end
+
+note Scans for an active overlapping lease at timestamp now; expires stale leases along the way.
+note Returns conflicting lease index or SYN_NONE.
+fn ls_find_conflict kind ulong norm_off ulong norm_len ulong now ulong to ulong
+cnt = get g_ls_hdr 0
+for i ulong cnt
+if eq ls_mget i LSF_STATUS LS_ST_ACTIVE
+if ge now ls_mget i LSF_EXPIRES
+ls_mput i LSF_STATUS LS_ST_EXPIRED
+ls_mput i LSF_CLOSED ls_mget i LSF_EXPIRES
+else
+if eq ls_mget i LSF_KIND kind
+if ls_norm_overlap kind ls_mget i LSF_NORM_OFF ls_mget i LSF_NORM_LEN norm_off norm_len
+ret i
+end
+end
+end
+end
+end
+ret SYN_NONE
+end
+
+note Claims an exclusive lease on target (branch:... or path:...) for holder at now with ttl > 0.
+note Strictly refuses with SYN_ERR_LEASE_CONFLICT (2) when an active overlapping lease exists.
+note Expired leases are automatically transitioned to LS_ST_EXPIRED and reclaimed.
+fn ls_claim holder view uchar * target view uchar * now ulong ttl ulong to ulong
+subj = new uchar 32 0
+if or eq len holder 0 gt len holder 128
+ret SYN_ERR_MALFORMED
+end
+if eq ttl 0
+ret SYN_ERR_MALFORMED
+end
+kind = ls_parse_target target
+if eq kind 0
+ret SYN_ERR_MALFORMED
+end
+put g_ls_hdr 1 SYN_NONE
+cidx = ls_find_conflict kind get g_ls_hdr 4 get g_ls_hdr 5 now
+if ne cidx SYN_NONE
+put g_ls_hdr 1 cidx
+ret SYN_ERR_LEASE_CONFLICT
+end
+cnt = get g_ls_hdr 0
+if ge cnt LS_MAX
+ret SYN_ERR_CAPACITY
+end
+ho = syn_arena_put holder
+if eq ho SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+to_off = syn_arena_put target
+if eq to_off SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+lid = add cnt 1
+ls_mput cnt LSF_ID lid
+ls_mput cnt LSF_KIND kind
+ls_mput cnt LSF_HOLD_OFF ho
+ls_mput cnt LSF_HOLD_LEN len holder
+ls_mput cnt LSF_TGT_OFF to_off
+ls_mput cnt LSF_TGT_LEN len target
+ls_mput cnt LSF_NORM_OFF get g_ls_hdr 4
+ls_mput cnt LSF_NORM_LEN get g_ls_hdr 5
+ls_mput cnt LSF_STATUS LS_ST_ACTIVE
+ls_mput cnt LSF_CREATED now
+ls_mput cnt LSF_EXPIRES add now ttl
+ls_mput cnt LSF_CLOSED 0
+ls_mput cnt LSF_FIN_OFF 0
+ls_mput cnt LSF_FIN_LEN 0
+put g_ls_hdr 0 lid
+put g_ls_hdr 2 lid
+ls_make_subj lid subj
+lg_set_subject subj
+seq = lg_append_arena 3 now ho len holder to_off len target
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end
+
+note Renews an active lease; strictly requires holder == current holder and lease not expired/released.
+fn ls_renew lid ulong holder view uchar * now ulong ttl ulong to ulong
+subj = new uchar 32 0
+if eq ttl 0
+ret SYN_ERR_MALFORMED
+end
+idx = ls_find_by_id lid
+if eq idx SYN_NONE
+ret SYN_ERR_NOT_FOUND
+end
+if ne ls_mget idx LSF_STATUS LS_ST_ACTIVE
+ret SYN_ERR_LEASE_CLOSED
+end
+if ge now ls_mget idx LSF_EXPIRES
+ls_mput idx LSF_STATUS LS_ST_EXPIRED
+ls_mput idx LSF_CLOSED ls_mget idx LSF_EXPIRES
+ret SYN_ERR_LEASE_CLOSED
+end
+if eq syn_arena_eq_view ls_mget idx LSF_HOLD_OFF ls_mget idx LSF_HOLD_LEN holder false
+ret SYN_ERR_NOT_HOLDER
+end
+ls_mput idx LSF_EXPIRES add now ttl
+ls_make_subj lid subj
+lg_set_subject subj
+seq = lg_append_arena 4 now ls_mget idx LSF_HOLD_OFF ls_mget idx LSF_HOLD_LEN ls_mget idx LSF_TGT_OFF ls_mget idx LSF_TGT_LEN
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end
+
+note Releases an active lease with an explicit final status word (e.g. MERGED, ABANDONED, DONE).
+note Strictly requires holder == current holder.
+fn ls_release lid ulong holder view uchar * final_st view uchar * now ulong to ulong
+subj = new uchar 32 0
+if or eq len final_st 0 gt len final_st 64
+ret SYN_ERR_MALFORMED
+end
+idx = ls_find_by_id lid
+if eq idx SYN_NONE
+ret SYN_ERR_NOT_FOUND
+end
+if ne ls_mget idx LSF_STATUS LS_ST_ACTIVE
+ret SYN_ERR_LEASE_CLOSED
+end
+if eq syn_arena_eq_view ls_mget idx LSF_HOLD_OFF ls_mget idx LSF_HOLD_LEN holder false
+ret SYN_ERR_NOT_HOLDER
+end
+fo = syn_arena_put final_st
+if eq fo SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+ls_mput idx LSF_STATUS LS_ST_RELEASED
+ls_mput idx LSF_CLOSED now
+ls_mput idx LSF_FIN_OFF fo
+ls_mput idx LSF_FIN_LEN len final_st
+ls_make_subj lid subj
+lg_set_subject subj
+seq = lg_append_arena 5 now ls_mget idx LSF_HOLD_OFF ls_mget idx LSF_HOLD_LEN fo len final_st
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end

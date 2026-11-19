@@ -1,0 +1,1352 @@
+note core/openclaw/lib.om: pure-Omega compiled agent runtime loop
+note Faithful port of openclaw-rs (AgentEngine, SkillRegistry, VaultResolver,
+note context window pruning, deterministic turn state machine, policy allowlist,
+note capability bitmasks, and append-only chained audit log).
+note Composed after si/directives/om2.om; no om2 header and no fn main in this unit.
+
+note Capability bitmasks
+const CAP_NONE ulong 0
+const CAP_READ ulong 1
+const CAP_WRITE ulong 2
+const CAP_EXEC ulong 4
+const CAP_NET ulong 8
+
+note Deterministic turn state machine states
+const ST_IDLE ulong 0
+const ST_PLAN ulong 1
+const ST_POLICY_CHECK ulong 2
+const ST_DISPATCH ulong 3
+const ST_RECORD ulong 4
+const ST_DONE ulong 5
+const ST_REFUSED ulong 6
+
+note Refusal / error codes
+const ERR_NONE ulong 0
+const ERR_MALFORMED ulong 1
+const ERR_UNKNOWN_TOOL ulong 2
+const ERR_CAP_DENIED ulong 3
+const ERR_BUDGET_EXHAUSTED ulong 4
+const ERR_PRIV_ESCALATION ulong 5
+const ERR_ARG_POLICY ulong 6
+
+note Built-in tool handler kinds
+const TK_READ_FILE ulong 1
+const TK_LIST_DIR ulong 2
+const TK_GIT_STATUS ulong 3
+const TK_CORTEX_RECALL ulong 4
+const TK_TELEM_PING ulong 5
+const TK_WRITE_FILE ulong 6
+const TK_BASH_EVAL ulong 7
+const TK_HTTP_FETCH ulong 8
+const TK_CUSTOM ulong 9
+
+note Capacity bounds
+const OC_MAX_TOOLS ulong 16
+const OC_TNAME_CAP ulong 32
+const OC_CTX_CAP ulong 16
+const OC_CTX_SLOT ulong 128
+const OC_MAX_AUDIT ulong 64
+const OC_VAULT_CAP ulong 8
+const OC_VAULT_SLOT ulong 64
+const OC_ENV_CAP ulong 4096
+const OC_OUT_CAP ulong 4096
+const OC_RES_CAP ulong 512
+
+note Session state globals
+global oc_sess_caps ulong 1
+global oc_sess_turns ulong 1
+global oc_sess_max_turns ulong 1
+global oc_sess_tokens ulong 1
+global oc_sess_tok_budget ulong 1
+global oc_sess_steps ulong 1
+global oc_sess_step_budget ulong 1
+global oc_sess_ctx_budget ulong 1
+global oc_dispatch_cnt ulong 1
+global oc_refuse_cnt ulong 1
+global oc_chain_hash ulong 1
+
+note Current turn state machine & parsed envelope
+global oc_state ulong 1
+global oc_trace ulong 8
+global oc_trace_len ulong 1
+global oc_trace_mask ulong 1
+
+global oc_env uchar 4096
+global oc_env_len ulong 1
+global oc_call_id uchar 64
+global oc_call_id_len ulong 1
+global oc_req_tool uchar 64
+global oc_req_tool_len ulong 1
+global oc_req_arg uchar 256
+global oc_req_arg_len ulong 1
+global oc_req_cost ulong 1
+global oc_cur_err ulong 1
+global oc_cur_tid ulong 1
+global oc_cur_found ulong 1
+global oc_cur_req_caps ulong 1
+global oc_cur_tok_delta ulong 1
+
+note Tool result and JSONL output buffers
+global oc_res uchar 512
+global oc_res_len ulong 1
+global oc_tmp uchar 512
+global oc_tmp_len ulong 1
+global oc_out uchar 4096
+global oc_out_len ulong 1
+
+note Tool registry globals
+global oc_t_cnt ulong 1
+global oc_t_name uchar 512
+global oc_t_nlen ulong 16
+global oc_t_caps ulong 16
+global oc_t_cost ulong 16
+global oc_t_kind ulong 16
+global oc_t_enabled ulong 16
+
+note Context / memory ring globals (slot 0=system, slot 1=goal pinned)
+global oc_ctx_cnt ulong 1
+global oc_ctx_pruned ulong 1
+global oc_ctx_buf uchar 2048
+global oc_ctx_len ulong 16
+global oc_ctx_role ulong 16
+global oc_ctx_tok ulong 16
+
+note Vault in-memory secret cache globals
+global oc_v_cnt ulong 1
+global oc_v_buf uchar 512
+global oc_v_len ulong 8
+
+note Append-only turn audit log globals
+global oc_aud_cnt ulong 1
+global oc_aud_turn ulong 64
+global oc_aud_final ulong 64
+global oc_aud_tmask ulong 64
+global oc_aud_err ulong 64
+global oc_aud_tid ulong 64
+global oc_aud_reqc ulong 64
+global oc_aud_sesc ulong 64
+global oc_aud_toks ulong 64
+global oc_aud_hash ulong 64
+
+text oc_hex "0123456789abcdef"
+text oc_redact_mark "[REDACTED_BY_ATLAS_VAULT]"
+text oc_def_sys "You are OpenClaw sovereign agent runtime."
+text oc_def_goal "Execute authorized workspace turns under policy."
+
+note Built-in tool names
+text tn_read "read_file"
+text tn_list "list_dir"
+text tn_git "git_status"
+text tn_cortex "cortex_recall"
+text tn_ping "telemetry_ping"
+text tn_write "write_file"
+text tn_bash "bash_eval"
+text tn_http "http_fetch"
+
+note Envelope JSON field keys
+text fk_id "\"id\""
+text fk_tool "\"tool\""
+text fk_arg "\"arg\""
+text fk_cost "\"cost\""
+
+note Escalation / injection detection keys and payloads
+text ek_caps "\"caps\""
+text ek_grant "\"grant\""
+text ek_override "\"override_policy\""
+text ek_escalate "\"escalate\""
+text ek_setcaps "\"set_caps\""
+text ek_allowall "\"allow_all\""
+text inj_1 "ignore previous instructions"
+text inj_2 "ignore all previous"
+text inj_3 "override policy"
+text inj_4 "grant_cap"
+text inj_5 "elevate_caps"
+text inj_6 "bypass policy"
+text inj_7 "disable_policy"
+text inj_8 "sudo "
+text inj_9 "chmod +s"
+text inj_10 "setcap "
+
+note Argument safety patterns
+text ap_env ".env"
+text ap_shadow "/etc/shadow"
+text ap_dotdot ".."
+text ap_evid "evidence/"
+text ap_aien ".aien/"
+text ap_gates "tests/gates/"
+text ap_find_r1 "find / "
+text ap_find_r2 "find / -"
+text ap_find_r3 "find /"
+text ap_rm_root "rm -rf /"
+text ap_local1 "http://127.0.0.1"
+text ap_local2 "http://localhost"
+
+note State names
+text sn_idle "IDLE"
+text sn_plan "PLAN"
+text sn_policy "POLICY_CHECK"
+text sn_dispatch "DISPATCH"
+text sn_record "RECORD"
+text sn_done "DONE"
+text sn_refused "REFUSED"
+text sn_gt ">"
+
+note Error names
+text en_none "NONE"
+text en_mal "MALFORMED"
+text en_unk "UNKNOWN_TOOL"
+text en_cap "CAP_DENIED"
+text en_bud "BUDGET_EXHAUSTED"
+text en_esc "PRIV_ESCALATION"
+text en_arg "ARG_POLICY"
+
+note Dispatch & refusal message fragments
+text dm_read "read_ok:"
+text dm_list "list_ok:"
+text dm_git "git_clean:"
+text dm_cortex "cortex_recalled:"
+text dm_ping "{\"status\":\"healthy\",\"architecture\":\"aarch64\",\"target\":\"gb10\"}"
+text dm_write "write_ok:"
+text dm_bash "exec_ok:"
+text dm_http "http_ok:"
+text dm_custom "custom_ok:"
+
+text rm_mal "refused: malformed tool-call envelope"
+text rm_unk "refused: unknown or disabled tool"
+text rm_cap "refused: unauthorized capability"
+text rm_bud "refused: session turn or token budget exhausted"
+text rm_esc "refused: privilege escalation or prompt injection blocked"
+text rm_arg "refused: argument violates tool safety policy"
+
+note JSONL formatting tokens
+text jl_1 "{\"turn\":"
+text jl_2 ",\"id\":\""
+text jl_3 "\",\"state\":\""
+text jl_4 "\",\"trace\":\""
+text jl_5 "\",\"tool\":\""
+text jl_6 "\",\"req_caps\":"
+text jl_7 ",\"sess_caps\":"
+text jl_8 ",\"tokens\":"
+text jl_9 ",\"budget\":"
+text jl_10 ",\"err\":\""
+text jl_11 "\",\"hash\":\""
+text jl_12 "\",\"out\":\""
+text jl_13 "\"}\n"
+
+fn oc_to_lower c uchar to uchar
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+fn oc_fnv_byte h ulong b uchar to ulong
+x = xor h ulong b
+ret mul x ulong 0x100000001b3
+end
+
+fn oc_fnv_u64 h ulong v ulong to ulong
+x = h
+for i ulong 8
+b = uchar and shr v mul i 8 255
+x = oc_fnv_byte x b
+end
+ret x
+end
+
+fn oc_est_tokens nbytes ulong to ulong
+note Word/byte token estimator matching upstream (~1 token per 4 bytes + 4 overhead)
+ret add div add nbytes 3 4 4
+end
+
+fn oc_ctx_total_tokens to ulong
+n = get oc_ctx_cnt 0
+tot = ulong 0
+for i ulong n bound 16
+tot = add tot get oc_ctx_tok i
+end
+ret tot
+end
+
+fn oc_ctx_set_slot idx ulong role ulong s view uchar * to void
+n = len s
+if gt n OC_CTX_SLOT
+n = OC_CTX_SLOT
+end
+base = mul idx OC_CTX_SLOT
+for i ulong n bound 128
+put oc_ctx_buf add base i get s i
+end
+put oc_ctx_len idx n
+put oc_ctx_role idx role
+put oc_ctx_tok idx oc_est_tokens n
+end
+
+fn oc_ctx_evict_oldest to bool
+n = get oc_ctx_cnt 0
+if le n 2
+ret false
+end
+note Preserve slot 0 (system) and slot 1 (goal), evict slot 2 and shift down
+lim = sub n 1
+for i ulong lim bound 16
+if ge i 2
+src_b = mul add i 1 OC_CTX_SLOT
+dst_b = mul i OC_CTX_SLOT
+slen = get oc_ctx_len add i 1
+for j ulong slen bound 128
+put oc_ctx_buf add dst_b j get oc_ctx_buf add src_b j
+end
+put oc_ctx_len i slen
+put oc_ctx_role i get oc_ctx_role add i 1
+put oc_ctx_tok i get oc_ctx_tok add i 1
+end
+end
+put oc_ctx_cnt 0 lim
+put oc_ctx_pruned 0 add get oc_ctx_pruned 0 1
+ret true
+end
+
+fn oc_ctx_prune to ulong
+pruned = ulong 0
+bud = get oc_sess_ctx_budget 0
+while gt get oc_ctx_cnt 0 2 bound 16
+if le oc_ctx_total_tokens bud
+break
+end
+if oc_ctx_evict_oldest
+pruned = add pruned 1
+else
+break
+end
+end
+ret pruned
+end
+
+fn oc_ctx_push_res role ulong to void
+if ge get oc_ctx_cnt 0 OC_CTX_CAP
+ev = oc_ctx_evict_oldest
+if not ev
+ret
+end
+end
+idx = get oc_ctx_cnt 0
+n = get oc_res_len 0
+if gt n OC_CTX_SLOT
+n = OC_CTX_SLOT
+end
+base = mul idx OC_CTX_SLOT
+for i ulong n bound 128
+put oc_ctx_buf add base i get oc_res i
+end
+put oc_ctx_len idx n
+put oc_ctx_role idx role
+put oc_ctx_tok idx oc_est_tokens n
+put oc_ctx_cnt 0 add idx 1
+p = oc_ctx_prune
+if gt p 16
+ret
+end
+end
+
+fn oc_vault_clear to void
+put oc_v_cnt 0 0
+end
+
+fn oc_vault_cache_secret sec view uchar * to bool
+c = get oc_v_cnt 0
+if ge c OC_VAULT_CAP
+ret false
+end
+n = len sec
+if or lt n 4 gt n OC_VAULT_SLOT
+ret false
+end
+base = mul c OC_VAULT_SLOT
+for i ulong n bound 64
+put oc_v_buf add base i get sec i
+end
+put oc_v_len c n
+put oc_v_cnt 0 add c 1
+ret true
+end
+
+fn oc_res_match_secret pos ulong vidx ulong to bool
+vlen = get oc_v_len vidx
+vbase = mul vidx OC_VAULT_SLOT
+for j ulong vlen bound 64
+if ne get oc_res add pos j get oc_v_buf add vbase j
+ret false
+end
+end
+ret true
+end
+
+fn oc_tmp_push b uchar to void
+p = get oc_tmp_len 0
+if lt p OC_RES_CAP
+put oc_tmp p b
+put oc_tmp_len 0 add p 1
+end
+end
+
+fn oc_tmp_push_str s view uchar * to void
+n = len s
+for i ulong n bound 128
+oc_tmp_push get s i
+end
+end
+
+fn oc_vault_redact_one vidx ulong to void
+vlen = get oc_v_len vidx
+rlen = get oc_res_len 0
+if or lt vlen 4 lt rlen vlen
+ret
+end
+put oc_tmp_len 0 0
+pos = ulong 0
+while lt pos rlen bound 512
+matched = false
+if le add pos vlen rlen
+if oc_res_match_secret pos vidx
+matched = true
+end
+end
+if matched
+oc_tmp_push_str oc_redact_mark
+pos = add pos vlen
+else
+oc_tmp_push get oc_res pos
+pos = add pos 1
+end
+end
+tlen = get oc_tmp_len 0
+for i ulong tlen bound 512
+put oc_res i get oc_tmp i
+end
+put oc_res_len 0 tlen
+end
+
+fn oc_vault_redact_res to void
+vc = get oc_v_cnt 0
+for i ulong vc bound 8
+oc_vault_redact_one i
+end
+end
+
+fn oc_reg_tool name view uchar * req_caps ulong cost ulong kind ulong to bool
+c = get oc_t_cnt 0
+if ge c OC_MAX_TOOLS
+ret false
+end
+n = len name
+if or eq n 0 gt n OC_TNAME_CAP
+ret false
+end
+base = mul c OC_TNAME_CAP
+for i ulong n bound 32
+put oc_t_name add base i get name i
+end
+put oc_t_nlen c n
+put oc_t_caps c req_caps
+put oc_t_cost c cost
+put oc_t_kind c kind
+put oc_t_enabled c 1
+put oc_t_cnt 0 add c 1
+ret true
+end
+
+fn oc_register_builtins to void
+put oc_t_cnt 0 0
+r1 = oc_reg_tool tn_read CAP_READ 12 TK_READ_FILE
+r2 = oc_reg_tool tn_list CAP_READ 8 TK_LIST_DIR
+r3 = oc_reg_tool tn_git CAP_READ 10 TK_GIT_STATUS
+r4 = oc_reg_tool tn_cortex CAP_READ 14 TK_CORTEX_RECALL
+r5 = oc_reg_tool tn_ping CAP_NONE 4 TK_TELEM_PING
+r6 = oc_reg_tool tn_write CAP_WRITE 16 TK_WRITE_FILE
+r7 = oc_reg_tool tn_bash CAP_EXEC 24 TK_BASH_EVAL
+r8 = oc_reg_tool tn_http CAP_NET 20 TK_HTTP_FETCH
+if not and r1 and r2 and r3 and r4 and r5 and r6 and r7 r8
+trap 8
+end
+end
+
+fn oc_session_init caps ulong max_turns ulong tok_budget ulong step_budget ulong to void
+put oc_sess_caps 0 caps
+put oc_sess_turns 0 0
+put oc_sess_max_turns 0 max_turns
+put oc_sess_tokens 0 0
+put oc_sess_tok_budget 0 tok_budget
+put oc_sess_steps 0 0
+put oc_sess_step_budget 0 step_budget
+put oc_sess_ctx_budget 0 256
+put oc_dispatch_cnt 0 0
+put oc_refuse_cnt 0 0
+put oc_chain_hash 0 ulong 0xcbf29ce484222325
+put oc_state 0 ST_IDLE
+put oc_trace_len 0 0
+put oc_trace_mask 0 0
+put oc_aud_cnt 0 0
+put oc_ctx_cnt 0 2
+put oc_ctx_pruned 0 0
+oc_ctx_set_slot 0 0 oc_def_sys
+oc_ctx_set_slot 1 1 oc_def_goal
+oc_vault_clear
+oc_register_builtins
+end
+
+fn oc_set_ctx_budget bud ulong to void
+put oc_sess_ctx_budget 0 bud
+end
+
+fn oc_transition_legal cur ulong nxt ulong to bool
+if eq cur ST_IDLE
+ret eq nxt ST_PLAN
+end
+if eq cur ST_PLAN
+ret or eq nxt ST_POLICY_CHECK eq nxt ST_RECORD
+end
+if eq cur ST_POLICY_CHECK
+ret or eq nxt ST_DISPATCH eq nxt ST_RECORD
+end
+if eq cur ST_DISPATCH
+ret eq nxt ST_RECORD
+end
+if eq cur ST_RECORD
+ret or eq nxt ST_DONE eq nxt ST_REFUSED
+end
+ret false
+end
+
+fn oc_turn_reset_sm to void
+put oc_state 0 ST_IDLE
+put oc_trace 0 ST_IDLE
+put oc_trace_len 0 1
+put oc_trace_mask 0 shl ulong 1 ST_IDLE
+put oc_cur_err 0 ERR_NONE
+put oc_cur_tid 0 0
+put oc_cur_found 0 0
+put oc_cur_req_caps 0 0
+put oc_cur_tok_delta 0 0
+put oc_res_len 0 0
+put oc_call_id_len 0 0
+put oc_req_tool_len 0 0
+put oc_req_arg_len 0 0
+put oc_req_cost 0 0
+end
+
+fn oc_tr_state nxt ulong to void
+cur = get oc_state 0
+if not oc_transition_legal cur nxt
+trap 8
+end
+put oc_state 0 nxt
+tl = get oc_trace_len 0
+if lt tl 8
+put oc_trace tl nxt
+put oc_trace_len 0 add tl 1
+end
+bit = shl ulong 1 nxt
+put oc_trace_mask 0 or get oc_trace_mask 0 bit
+end
+
+fn oc_env_match_ci pos ulong pat view uchar * to bool
+pl = len pat
+for j ulong pl bound 64
+c1 = oc_to_lower get oc_env add pos j
+c2 = oc_to_lower get pat j
+if ne c1 c2
+ret false
+end
+end
+ret true
+end
+
+fn oc_env_contains_ci pat view uchar * to bool
+n = get oc_env_len 0
+pl = len pat
+if or eq pl 0 lt n pl
+ret false
+end
+lim = add sub n pl 1
+for i ulong lim bound 4096
+if oc_env_match_ci i pat
+ret true
+end
+end
+ret false
+end
+
+fn oc_env_find_key pat view uchar * to long
+n = get oc_env_len 0
+pl = len pat
+if or eq pl 0 lt n pl
+ret long -1
+end
+lim = add sub n pl 1
+for i ulong lim bound 4096
+if oc_env_match_ci i pat
+ret long add i pl
+end
+end
+ret long -1
+end
+
+fn oc_arg_match_ci pos ulong pat view uchar * to bool
+pl = len pat
+for j ulong pl bound 64
+c1 = oc_to_lower get oc_req_arg add pos j
+c2 = oc_to_lower get pat j
+if ne c1 c2
+ret false
+end
+end
+ret true
+end
+
+fn oc_arg_contains_ci pat view uchar * to bool
+n = get oc_req_arg_len 0
+pl = len pat
+if or eq pl 0 lt n pl
+ret false
+end
+lim = add sub n pl 1
+for i ulong lim bound 256
+if oc_arg_match_ci i pat
+ret true
+end
+end
+ret false
+end
+
+fn oc_arg_starts_ci pat view uchar * to bool
+n = get oc_req_arg_len 0
+pl = len pat
+if lt n pl
+ret false
+end
+ret oc_arg_match_ci 0 pat
+end
+
+fn oc_parse_str_field key view uchar * dst_kind ulong to bool
+note dst_kind: 0=call_id, 1=req_tool, 2=req_arg
+kpos = oc_env_find_key key
+if lt kpos 0
+ret false
+end
+pos = ulong kpos
+n = get oc_env_len 0
+while lt pos n bound 4096
+c = get oc_env pos
+if or eq c 32 or eq c 9 eq c 58
+pos = add pos 1
+else
+break
+end
+end
+if ge pos n
+ret false
+end
+if ne get oc_env pos 34
+ret false
+end
+pos = add pos 1
+cnt = ulong 0
+cap = ulong 64
+if eq dst_kind 2
+cap = ulong 256
+end
+while lt pos n bound 4096
+c = get oc_env pos
+if eq c 34
+break
+end
+if eq c 92
+pos = add pos 1
+if ge pos n
+ret false
+end
+c = get oc_env pos
+end
+if lt cnt cap
+if eq dst_kind 0
+put oc_call_id cnt c
+else
+if eq dst_kind 1
+put oc_req_tool cnt c
+else
+put oc_req_arg cnt c
+end
+end
+cnt = add cnt 1
+end
+pos = add pos 1
+end
+if ge pos n
+ret false
+end
+if eq dst_kind 0
+put oc_call_id_len 0 cnt
+else
+if eq dst_kind 1
+put oc_req_tool_len 0 cnt
+else
+put oc_req_arg_len 0 cnt
+end
+end
+ret true
+end
+
+fn oc_parse_u64_field key view uchar * to ulong
+kpos = oc_env_find_key key
+if lt kpos 0
+ret 0
+end
+pos = ulong kpos
+n = get oc_env_len 0
+while lt pos n bound 4096
+c = get oc_env pos
+if or eq c 32 or eq c 9 eq c 58
+pos = add pos 1
+else
+break
+end
+end
+val = ulong 0
+while lt pos n bound 32
+c = get oc_env pos
+if and ge c 48 le c 57
+val = add mul val 10 ulong sub c 48
+pos = add pos 1
+else
+break
+end
+end
+ret val
+end
+
+fn oc_env_is_json_obj to bool
+n = get oc_env_len 0
+if lt n 2
+ret false
+end
+s = ulong 0
+while lt s n bound 4096
+c = get oc_env s
+if or eq c 32 or eq c 9 eq c 13
+s = add s 1
+else
+break
+end
+end
+e = n
+while gt e s bound 4096
+c = get oc_env sub e 1
+if or eq c 32 or eq c 9 or eq c 13 eq c 10
+e = sub e 1
+else
+break
+end
+end
+if lt sub e s 2
+ret false
+end
+if ne get oc_env s 123
+ret false
+end
+if ne get oc_env sub e 1 125
+ret false
+end
+ret true
+end
+
+fn oc_detect_escalation to bool
+if oc_env_contains_ci ek_caps
+ret true
+end
+if oc_env_contains_ci ek_grant
+ret true
+end
+if oc_env_contains_ci ek_override
+ret true
+end
+if oc_env_contains_ci ek_escalate
+ret true
+end
+if oc_env_contains_ci ek_setcaps
+ret true
+end
+if oc_env_contains_ci ek_allowall
+ret true
+end
+if oc_env_contains_ci inj_1
+ret true
+end
+if oc_env_contains_ci inj_2
+ret true
+end
+if oc_env_contains_ci inj_3
+ret true
+end
+if oc_env_contains_ci inj_4
+ret true
+end
+if oc_env_contains_ci inj_5
+ret true
+end
+if oc_env_contains_ci inj_6
+ret true
+end
+if oc_env_contains_ci inj_7
+ret true
+end
+if oc_env_contains_ci inj_8
+ret true
+end
+if oc_env_contains_ci inj_9
+ret true
+end
+if oc_env_contains_ci inj_10
+ret true
+end
+ret false
+end
+
+fn oc_tool_name_eq tid ulong to bool
+tl = get oc_t_nlen tid
+if ne tl get oc_req_tool_len 0
+ret false
+end
+base = mul tid OC_TNAME_CAP
+for j ulong tl bound 32
+if ne get oc_t_name add base j get oc_req_tool j
+ret false
+end
+end
+ret true
+end
+
+fn oc_lookup_tool to long
+cnt = get oc_t_cnt 0
+for i ulong cnt bound 16
+if eq get oc_t_enabled i 1
+if oc_tool_name_eq i
+ret long i
+end
+end
+end
+ret long -1
+end
+
+fn oc_check_arg_policy kind ulong to bool
+alen = get oc_req_arg_len 0
+if eq kind TK_READ_FILE
+if eq alen 0
+ret false
+end
+if or oc_arg_contains_ci ap_env or oc_arg_contains_ci ap_shadow oc_arg_contains_ci ap_dotdot
+ret false
+end
+ret true
+end
+if eq kind TK_WRITE_FILE
+if eq alen 0
+ret false
+end
+if or oc_arg_contains_ci ap_env or oc_arg_contains_ci ap_dotdot oc_arg_contains_ci ap_evid
+ret false
+end
+if or oc_arg_contains_ci ap_aien oc_arg_contains_ci ap_gates
+ret false
+end
+ret true
+end
+if eq kind TK_BASH_EVAL
+if eq alen 0
+ret false
+end
+if or oc_arg_contains_ci ap_find_r1 or oc_arg_contains_ci ap_find_r2 oc_arg_contains_ci ap_rm_root
+ret false
+end
+if and eq alen 6 oc_arg_starts_ci ap_find_r3
+ret false
+end
+ret true
+end
+if eq kind TK_HTTP_FETCH
+if eq alen 0
+ret false
+end
+if or oc_arg_starts_ci ap_local1 oc_arg_starts_ci ap_local2
+ret true
+end
+ret false
+end
+ret true
+end
+
+fn oc_res_clear to void
+put oc_res_len 0 0
+end
+
+fn oc_res_push b uchar to void
+p = get oc_res_len 0
+if lt p OC_RES_CAP
+put oc_res p b
+put oc_res_len 0 add p 1
+end
+end
+
+fn oc_res_push_str s view uchar * to void
+n = len s
+for i ulong n bound 256
+oc_res_push get s i
+end
+end
+
+fn oc_res_push_arg to void
+n = get oc_req_arg_len 0
+for i ulong n bound 256
+oc_res_push get oc_req_arg i
+end
+end
+
+fn oc_dispatch_tool kind ulong to void
+oc_res_clear
+if eq kind TK_READ_FILE
+oc_res_push_str dm_read
+oc_res_push_arg
+else
+if eq kind TK_LIST_DIR
+oc_res_push_str dm_list
+oc_res_push_arg
+else
+if eq kind TK_GIT_STATUS
+oc_res_push_str dm_git
+oc_res_push_arg
+else
+if eq kind TK_CORTEX_RECALL
+oc_res_push_str dm_cortex
+oc_res_push_arg
+else
+if eq kind TK_TELEM_PING
+oc_res_push_str dm_ping
+else
+if eq kind TK_WRITE_FILE
+oc_res_push_str dm_write
+oc_res_push_arg
+else
+if eq kind TK_BASH_EVAL
+oc_res_push_str dm_bash
+oc_res_push_arg
+else
+if eq kind TK_HTTP_FETCH
+oc_res_push_str dm_http
+oc_res_push_arg
+else
+oc_res_push_str dm_custom
+oc_res_push_arg
+end
+end
+end
+end
+end
+end
+end
+end
+oc_vault_redact_res
+end
+
+fn oc_set_refusal_msg err ulong to void
+oc_res_clear
+if eq err ERR_MALFORMED
+oc_res_push_str rm_mal
+ret
+end
+if eq err ERR_UNKNOWN_TOOL
+oc_res_push_str rm_unk
+ret
+end
+if eq err ERR_CAP_DENIED
+oc_res_push_str rm_cap
+ret
+end
+if eq err ERR_BUDGET_EXHAUSTED
+oc_res_push_str rm_bud
+ret
+end
+if eq err ERR_PRIV_ESCALATION
+oc_res_push_str rm_esc
+ret
+end
+oc_res_push_str rm_arg
+end
+
+fn oc_compute_audit_hash prev ulong turn_id ulong fin ulong tmask ulong err ulong to ulong
+h = oc_fnv_u64 prev turn_id
+h = oc_fnv_u64 h fin
+h = oc_fnv_u64 h tmask
+h = oc_fnv_u64 h err
+ret h
+end
+
+fn oc_audit_append fin ulong to void
+idx = get oc_aud_cnt 0
+tnum = get oc_sess_turns 0
+tmask = get oc_trace_mask 0
+err = get oc_cur_err 0
+prev = get oc_chain_hash 0
+nh = oc_compute_audit_hash prev tnum fin tmask err
+nh = oc_fnv_u64 nh get oc_cur_req_caps 0
+nh = oc_fnv_u64 nh get oc_sess_caps 0
+nh = oc_fnv_u64 nh get oc_sess_tokens 0
+put oc_chain_hash 0 nh
+if lt idx OC_MAX_AUDIT
+put oc_aud_turn idx tnum
+put oc_aud_final idx fin
+put oc_aud_tmask idx tmask
+put oc_aud_err idx err
+put oc_aud_tid idx get oc_cur_tid 0
+put oc_aud_reqc idx get oc_cur_req_caps 0
+put oc_aud_sesc idx get oc_sess_caps 0
+put oc_aud_toks idx get oc_sess_tokens 0
+put oc_aud_hash idx nh
+put oc_aud_cnt 0 add idx 1
+end
+end
+
+fn oc_verify_audit_chain to bool
+cnt = get oc_aud_cnt 0
+h = ulong 0xcbf29ce484222325
+for i ulong cnt bound 64
+h = oc_compute_audit_hash h get oc_aud_turn i get oc_aud_final i get oc_aud_tmask i get oc_aud_err i
+h = oc_fnv_u64 h get oc_aud_reqc i
+h = oc_fnv_u64 h get oc_aud_sesc i
+h = oc_fnv_u64 h get oc_aud_toks i
+if ne h get oc_aud_hash i
+ret false
+end
+end
+ret eq h get oc_chain_hash 0
+end
+
+fn oc_load_envelope s view uchar * to ulong
+n = len s
+if gt n OC_ENV_CAP
+n = OC_ENV_CAP
+end
+for i ulong n bound 4096
+put oc_env i get s i
+end
+put oc_env_len 0 n
+ret n
+end
+
+fn oc_run_turn to ulong
+oc_turn_reset_sm
+put oc_sess_turns 0 add get oc_sess_turns 0 1
+
+note Phase 1: IDLE -> PLAN (parse structured tool-call envelope)
+oc_tr_state ST_PLAN
+if not oc_env_is_json_obj
+put oc_cur_err 0 ERR_MALFORMED
+oc_set_refusal_msg ERR_MALFORMED
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+got_id = oc_parse_str_field fk_id 0
+got_tool = oc_parse_str_field fk_tool 1
+got_arg = oc_parse_str_field fk_arg 2
+if and not got_id not got_arg
+put oc_req_cost 0 oc_parse_u64_field fk_cost
+else
+put oc_req_cost 0 oc_parse_u64_field fk_cost
+end
+if or not got_tool eq get oc_req_tool_len 0 0
+put oc_cur_err 0 ERR_MALFORMED
+oc_set_refusal_msg ERR_MALFORMED
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+
+note Phase 2: PLAN -> POLICY_CHECK (model requests NEVER bypass runtime policy)
+oc_tr_state ST_POLICY_CHECK
+
+note 2a. Detect prompt-injected privilege escalation before any tool lookup/dispatch
+if oc_detect_escalation
+put oc_cur_err 0 ERR_PRIV_ESCALATION
+oc_set_refusal_msg ERR_PRIV_ESCALATION
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+
+note 2b. Verify tool exists and is enabled in explicit allowlist registry
+tid_l = oc_lookup_tool
+if lt tid_l 0
+put oc_cur_err 0 ERR_UNKNOWN_TOOL
+oc_set_refusal_msg ERR_UNKNOWN_TOOL
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+tid = ulong tid_l
+put oc_cur_tid 0 tid
+put oc_cur_found 0 1
+req_c = get oc_t_caps tid
+put oc_cur_req_caps 0 req_c
+
+note 2c. Verify session holds all required capability bits
+ses_c = get oc_sess_caps 0
+if ne and req_c ses_c req_c
+put oc_cur_err 0 ERR_CAP_DENIED
+oc_set_refusal_msg ERR_CAP_DENIED
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+
+note 2d. Verify turn, step, and token budgets
+cost = add get oc_t_cost tid get oc_req_cost 0
+put oc_cur_tok_delta 0 cost
+if gt get oc_sess_turns 0 get oc_sess_max_turns 0
+put oc_cur_err 0 ERR_BUDGET_EXHAUSTED
+oc_set_refusal_msg ERR_BUDGET_EXHAUSTED
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+if ge get oc_sess_steps 0 get oc_sess_step_budget 0
+put oc_cur_err 0 ERR_BUDGET_EXHAUSTED
+oc_set_refusal_msg ERR_BUDGET_EXHAUSTED
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+if gt add get oc_sess_tokens 0 cost get oc_sess_tok_budget 0
+put oc_cur_err 0 ERR_BUDGET_EXHAUSTED
+oc_set_refusal_msg ERR_BUDGET_EXHAUSTED
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+
+note 2e. Verify argument safety policy
+kind = get oc_t_kind tid
+if not oc_check_arg_policy kind
+put oc_cur_err 0 ERR_ARG_POLICY
+oc_set_refusal_msg ERR_ARG_POLICY
+oc_tr_state ST_RECORD
+oc_audit_append ST_REFUSED
+put oc_refuse_cnt 0 add get oc_refuse_cnt 0 1
+oc_tr_state ST_REFUSED
+ret ST_REFUSED
+end
+
+note Phase 3: POLICY_CHECK -> DISPATCH (authorized execution)
+oc_tr_state ST_DISPATCH
+put oc_sess_steps 0 add get oc_sess_steps 0 1
+put oc_sess_tokens 0 add get oc_sess_tokens 0 cost
+put oc_dispatch_cnt 0 add get oc_dispatch_cnt 0 1
+oc_dispatch_tool kind
+
+note Phase 4: DISPATCH -> RECORD -> DONE
+oc_tr_state ST_RECORD
+oc_ctx_push_res 2
+oc_audit_append ST_DONE
+oc_tr_state ST_DONE
+ret ST_DONE
+end
+
+fn oc_out_byte b uchar to void
+p = get oc_out_len 0
+if lt p OC_OUT_CAP
+put oc_out p b
+put oc_out_len 0 add p 1
+end
+end
+
+fn oc_out_str s view uchar * to void
+n = len s
+for i ulong n bound 256
+oc_out_byte get s i
+end
+end
+
+fn oc_out_esc_byte b uchar to void
+if or eq b 34 eq b 92
+oc_out_byte 92
+oc_out_byte b
+ret
+end
+if eq b 10
+oc_out_byte 92
+oc_out_byte 110
+ret
+end
+if eq b 9
+oc_out_byte 92
+oc_out_byte 116
+ret
+end
+oc_out_byte b
+end
+
+fn oc_out_u64 v ulong to void
+if eq v 0
+oc_out_byte 48
+ret
+end
+buf = new uchar 24 0
+k = ulong 0
+x = v
+while gt x 0 bound 24
+d = rem x 10
+put buf k uchar add 48 d
+x = div x 10
+k = add k 1
+end
+while gt k 0 bound 24
+k = sub k 1
+oc_out_byte get buf k
+end
+end
+
+fn oc_out_hex64 v ulong to void
+for i ulong 16
+sh = mul sub 15 i 4
+nib = and shr v sh 15
+oc_out_byte get oc_hex nib
+end
+end
+
+fn oc_out_state_name st ulong to void
+if eq st ST_IDLE
+oc_out_str sn_idle
+ret
+end
+if eq st ST_PLAN
+oc_out_str sn_plan
+ret
+end
+if eq st ST_POLICY_CHECK
+oc_out_str sn_policy
+ret
+end
+if eq st ST_DISPATCH
+oc_out_str sn_dispatch
+ret
+end
+if eq st ST_RECORD
+oc_out_str sn_record
+ret
+end
+if eq st ST_DONE
+oc_out_str sn_done
+ret
+end
+oc_out_str sn_refused
+end
+
+fn oc_out_err_name err ulong to void
+if eq err ERR_NONE
+oc_out_str en_none
+ret
+end
+if eq err ERR_MALFORMED
+oc_out_str en_mal
+ret
+end
+if eq err ERR_UNKNOWN_TOOL
+oc_out_str en_unk
+ret
+end
+if eq err ERR_CAP_DENIED
+oc_out_str en_cap
+ret
+end
+if eq err ERR_BUDGET_EXHAUSTED
+oc_out_str en_bud
+ret
+end
+if eq err ERR_PRIV_ESCALATION
+oc_out_str en_esc
+ret
+end
+oc_out_str en_arg
+end
+
+fn oc_format_turn_jsonl to ulong
+put oc_out_len 0 0
+oc_out_str jl_1
+oc_out_u64 get oc_sess_turns 0
+oc_out_str jl_2
+id_n = get oc_call_id_len 0
+for i ulong id_n bound 64
+oc_out_esc_byte get oc_call_id i
+end
+oc_out_str jl_3
+oc_out_state_name get oc_state 0
+oc_out_str jl_4
+tl = get oc_trace_len 0
+for t ulong tl bound 8
+if gt t 0
+oc_out_str sn_gt
+end
+oc_out_state_name get oc_trace t
+end
+oc_out_str jl_5
+tn_l = get oc_req_tool_len 0
+for j ulong tn_l bound 64
+oc_out_esc_byte get oc_req_tool j
+end
+oc_out_str jl_6
+oc_out_u64 get oc_cur_req_caps 0
+oc_out_str jl_7
+oc_out_u64 get oc_sess_caps 0
+oc_out_str jl_8
+oc_out_u64 get oc_sess_tokens 0
+oc_out_str jl_9
+oc_out_u64 get oc_sess_tok_budget 0
+oc_out_str jl_10
+oc_out_err_name get oc_cur_err 0
+oc_out_str jl_11
+oc_out_hex64 get oc_chain_hash 0
+oc_out_str jl_12
+rn = get oc_res_len 0
+for r ulong rn bound 512
+oc_out_esc_byte get oc_res r
+end
+oc_out_str jl_13
+ret get oc_out_len 0
+end
+
+fn oc_write_out fd int total ulong to bool
+sent = ulong 0
+while lt sent total bound 4096
+k = write fd oc_out sent sub total sent
+if le k 0
+ret false
+end
+sent = add sent ulong k
+end
+ret true
+end

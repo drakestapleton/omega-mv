@@ -1,8 +1,8 @@
 # protocol: security networking, wire protocols and Synapse coordination of Sovereign Intelligence (SI)
 
-Mirrors [gpu/README.md](../gpu/README.md) for the protocol, networking and coordination layer (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp`).
+Mirrors [gpu/README.md](../gpu/README.md) for the protocol, networking and coordination layer (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity`, and `synapse`).
 
-Everything moved under `protocol/` is pure seeded Omega (`.om`) built by `omega-mv`'s own `seed/out/omc`, plus provenance records (`protocol/import/`) and tables listing what compiles and what remains non-Omega upstream (`protocol/NOT-YET-OMEGA.tsv`). **Only pure Omega moved in.**
+Everything under `protocol/` is pure seeded Omega (`.om`) built by `omega-mv`'s own `seed/out/omc`, plus provenance records (`protocol/import/`) and tables listing what compiles and what remains non-Omega upstream (`protocol/NOT-YET-OMEGA.tsv`). **Only pure Omega lives here.**
 
 ## Layout
 
@@ -16,8 +16,11 @@ Everything moved under `protocol/` is pure seeded Omega (`.om`) built by `omega-
 | `protocol/synapse/claims/` | `synapse-claims` (`rad:z49HbHSymTiZKMLfpMKRHJcuq2NQv`) | `27b8023f1fe5` | 7 | 5 | 15 |
 | `protocol/synapse/pulse/` | `synapse-pulse` (`rad:z3aHmQm9aSg8rD5jEcxJFCSQRh21i`) | `f4d088e97048` | 3 | 5 | 14 |
 | `protocol/synapse/mcp/` | `synapse-mcp` (`rad:z3WKv88a3DbKEkvxsu2uDSR7a22ap`) | `bcd37a1ceb8a` | 2 | 2 | 18 |
+| `protocol/rad-id-sync/` | `rad-id-sync` (`rad:z4YVa7BSf1MGTrHoJewK8iWQcyHbC`) | `cd94ae76281a` | 3 | converted | 22 |
+| `protocol/open-humanity/` | `open-humanity` (`rad:z2jftNw1LLYTNgj8DNoh1TGGNmEmP`) | `54778b62acf7` | 3 | converted | 42 |
+| `protocol/synapse/core/` | `synapse` (`rad:zMGRREr2tmtRqpo4mMjpzkZdUGXN`) | `f9aebaa73925` | 7 | converted | 755 |
 
-Total imported in `protocol/`: **82 `.om` files** across **42 history-preserving commits** (5818 non-`.om` first-party files stayed upstream and are listed in [`protocol/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
+Total in `protocol/`: **95 `.om` files** (82 imported across 42 history-preserving commits + 13 newly converted pure-Omega `.om` files across 3 repositories; non-`.om` upstream files for the imported repos are listed in [`protocol/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
 
 ## One compiler
 

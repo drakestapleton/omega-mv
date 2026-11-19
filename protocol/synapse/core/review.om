@@ -1,0 +1,307 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/synapse/core/review.om: exact-head review and landing policy engine:
+note binds reviewer verdicts (MERGE, CHANGES_REQUESTED, REJECT) to exact 32-byte changeset digests,
+note automatically invalidates prior verdicts when a new head arrives on a branch, refuses self-review,
+note refuses stale-head verdicts, blocks landing on any non-MERGE verdict or missing exact-head MERGE,
+note enforces strict fast-forward from main (never automerges), and logs transitions to ledger.
+note Composed OM-2 library unit (no om2 directive, no main).
+
+const RV_MAX ulong 512
+const RV_FIELDS ulong 8
+
+const RV_MERGE ulong 1
+const RV_CHANGES_REQUESTED ulong 2
+const RV_REJECT ulong 3
+
+const RVF_CS_IDX ulong 0
+const RVF_REV_OFF ulong 1
+const RVF_REV_LEN ulong 2
+const RVF_VERDICT ulong 3
+const RVF_TS ulong 4
+const RVF_VALID ulong 5
+const RVF_BR_OFF ulong 6
+const RVF_BR_LEN ulong 7
+
+global g_rv_tab ulong 4096
+global g_rv_head uchar 16384
+global g_rv_hdr ulong 8
+
+text t_rv_merge "MERGE"
+text t_rv_chg "CHANGES_REQUESTED"
+text t_rv_rej "REJECT"
+text t_rv_land "LAND_MAIN"
+
+fn rv_reset to void
+put g_rv_hdr 0 0
+put g_rv_hdr 1 0
+end
+
+fn rv_count to ulong
+ret get g_rv_hdr 0
+end
+
+fn rv_set_time ts ulong to void
+put g_rv_hdr 1 ts
+end
+
+fn rv_mget idx ulong f ulong to ulong
+ret get g_rv_tab add mul idx RV_FIELDS f
+end
+
+fn rv_mput idx ulong f ulong v ulong to void
+put g_rv_tab add mul idx RV_FIELDS f v
+end
+
+fn rv_head_matches ridx ulong target_id view uchar * to bool
+if ne len target_id 32
+ret false
+end
+base = mul ridx 32
+for i ulong 32
+if ne get g_rv_head add base i get target_id i
+ret false
+end
+end
+ret true
+end
+
+note Called automatically when a new changeset head is committed on a branch:
+note invalidates all prior review verdicts whose branch matches and whose bound head differs.
+fn rv_invalidate_branch bo ulong bl ulong new_cs_idx ulong to void
+new_id = new uchar 32 0
+cs_get_id new_cs_idx new_id
+cnt = get g_rv_hdr 0
+for i ulong cnt
+if eq rv_mget i RVF_VALID 1
+if syn_arena_eq rv_mget i RVF_BR_OFF rv_mget i RVF_BR_LEN bo bl
+if eq rv_head_matches i new_id false
+rv_mput i RVF_VALID 0
+end
+end
+end
+end
+end
+
+note Counts valid exact-head MERGE verdicts for cs_idx.
+fn rv_valid_merge_count cs_idx ulong to ulong
+cur_id = new uchar 32 0
+if ge cs_idx cs_count
+ret 0
+end
+cs_get_id cs_idx cur_id
+cnt = get g_rv_hdr 0
+merges = ulong 0
+for i ulong cnt
+if eq rv_mget i RVF_VALID 1
+if eq rv_mget i RVF_CS_IDX cs_idx
+if rv_head_matches i cur_id
+if eq rv_mget i RVF_VERDICT RV_MERGE
+merges = add merges 1
+end
+end
+end
+end
+end
+ret merges
+end
+
+note Counts valid exact-head blocking verdicts (CHANGES_REQUESTED or REJECT) for cs_idx.
+fn rv_valid_block_count cs_idx ulong to ulong
+cur_id = new uchar 32 0
+if ge cs_idx cs_count
+ret 0
+end
+cs_get_id cs_idx cur_id
+cnt = get g_rv_hdr 0
+blocks = ulong 0
+for i ulong cnt
+if eq rv_mget i RVF_VALID 1
+if eq rv_mget i RVF_CS_IDX cs_idx
+if rv_head_matches i cur_id
+if ne rv_mget i RVF_VERDICT RV_MERGE
+blocks = add blocks 1
+end
+end
+end
+end
+end
+ret blocks
+end
+
+fn rv_log_verdict cs_id view uchar * ro ulong rl ulong verdict ulong ts ulong to ulong
+lg_set_subject cs_id
+if eq verdict RV_MERGE
+ret lg_append_view 6 ts ro rl t_rv_merge
+end
+if eq verdict RV_CHANGES_REQUESTED
+ret lg_append_view 6 ts ro rl t_rv_chg
+end
+ret lg_append_view 6 ts ro rl t_rv_rej
+end
+
+note Internal commit of a verified review verdict for cs_idx (already validated against exact head).
+fn rv_store_verdict cs_idx ulong reviewer view uchar * verdict ulong ts ulong to ulong
+cur_id = new uchar 32 0
+if or eq len reviewer 0 gt len reviewer 128
+ret SYN_ERR_MALFORMED
+end
+if or lt verdict RV_MERGE gt verdict RV_REJECT
+ret SYN_ERR_VERDICT_INVALID
+end
+st = cs_get_state cs_idx
+if and ne st CS_STATE_PROPOSED ne st CS_STATE_REVIEWED
+ret SYN_ERR_STATE_INVALID
+end
+note Self-review refusal: author cannot review their own changeset.
+if syn_arena_eq_view cs_get_author_off cs_idx cs_get_author_len cs_idx reviewer
+ret SYN_ERR_SELF_REVIEW
+end
+cnt = get g_rv_hdr 0
+if ge cnt RV_MAX
+ret SYN_ERR_CAPACITY
+end
+ro = syn_arena_put reviewer
+if eq ro SYN_NONE
+ret SYN_ERR_CAPACITY
+end
+cs_get_id cs_idx cur_id
+base = mul cnt 32
+for i ulong 32
+put g_rv_head add base i get cur_id i
+end
+rv_mput cnt RVF_CS_IDX cs_idx
+rv_mput cnt RVF_REV_OFF ro
+rv_mput cnt RVF_REV_LEN len reviewer
+rv_mput cnt RVF_VERDICT verdict
+rv_mput cnt RVF_TS ts
+rv_mput cnt RVF_VALID 1
+rv_mput cnt RVF_BR_OFF cs_get_branch_off cs_idx
+rv_mput cnt RVF_BR_LEN cs_get_branch_len cs_idx
+put g_rv_hdr 0 add cnt 1
+seq = rv_log_verdict cur_id ro len reviewer verdict ts
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+if eq verdict RV_MERGE
+if eq st CS_STATE_PROPOSED
+if eq rv_valid_block_count cs_idx 0
+rc = cs_transition cs_idx CS_STATE_REVIEWED ts
+if ne rc SYN_OK
+ret rc
+end
+end
+end
+end
+ret SYN_OK
+end
+
+note Records a review verdict bound to exact 32-byte head_id.
+note Refuses unknown changeset, stale branch head (superseded by newer head), self-review,
+note invalid verdict, or non-PROPOSED/REVIEWED state.
+fn rv_record head_id view uchar * reviewer view uchar * verdict ulong ts ulong to ulong
+if ne len head_id 32
+ret SYN_ERR_MALFORMED
+end
+cs_idx = cs_find_by_id head_id
+if eq cs_idx SYN_NONE
+ret SYN_ERR_NOT_FOUND
+end
+note Check if this non-main branch already moved to a newer head (stale-head refusal).
+bo = cs_get_branch_off cs_idx
+bl = cs_get_branch_len cs_idx
+if eq syn_arena_eq_view bo bl t_br_main false
+bpos = gr_branch_find_arena bo bl
+if ne bpos SYN_NONE
+bhead = get g_gr_br add mul bpos 3 2
+if ne bhead cs_idx
+ret SYN_ERR_STALE_HEAD
+end
+end
+end
+ret rv_store_verdict cs_idx reviewer verdict ts
+end
+
+note Records a review verdict explicitly checking expected_head against cs_idx's exact digest.
+note Uses timestamp from rv_set_time (or cs_ts + 1 if unset). Refuses with SYN_ERR_STALE_HEAD on mismatch.
+fn rv_record_bound cs_idx ulong expected_head view uchar * reviewer view uchar * verdict ulong to ulong
+cur_id = new uchar 32 0
+if ge cs_idx cs_count
+ret SYN_ERR_NOT_FOUND
+end
+cs_get_id cs_idx cur_id
+if eq syn_digest_eq cur_id expected_head false
+ret SYN_ERR_STALE_HEAD
+end
+ts = get g_rv_hdr 1
+if eq ts 0
+ts = add cs_get_ts cs_idx 1
+end
+ret rv_store_verdict cs_idx reviewer verdict ts
+end
+
+note Strict landing policy check without mutating state.
+note Requires:
+note   1. cs_idx exists and is not already LANDED or ABANDONED
+note   2. expected_head matches cs_id(cs_idx) byte-for-byte
+note   3. At least one valid exact-head MERGE verdict and ZERO blocking verdicts
+note   4. Current main head (if any) is an ancestor of cs_idx (strict fast-forward; never automerges)
+fn rv_can_land cs_idx ulong expected_head view uchar * to ulong
+cur_id = new uchar 32 0
+if ge cs_idx cs_count
+ret SYN_ERR_NOT_FOUND
+end
+st = cs_get_state cs_idx
+if or eq st CS_STATE_LANDED eq st CS_STATE_ABANDONED
+ret SYN_ERR_STATE_INVALID
+end
+cs_get_id cs_idx cur_id
+if eq syn_digest_eq cur_id expected_head false
+ret SYN_ERR_STALE_HEAD
+end
+if gt rv_valid_block_count cs_idx 0
+ret SYN_ERR_REVIEW_BLOCKED
+end
+if eq rv_valid_merge_count cs_idx 0
+ret SYN_ERR_REVIEW_BLOCKED
+end
+mh = gr_main_head
+if ne mh SYN_NONE
+if eq gr_is_fast_forward mh cs_idx false
+ret SYN_ERR_NON_FF
+end
+end
+ret SYN_OK
+end
+
+note Executes strict landing policy: verifies exact-head MERGE receipt, zero blocking verdicts,
+note and fast-forward from main (never automerges). Advances state to LANDED, updates main head,
+note and appends LG_EV_LAND (7) to the hash-chained ledger.
+fn rv_land cs_idx ulong expected_head view uchar * ts ulong to ulong
+cur_id = new uchar 32 0
+rc = rv_can_land cs_idx expected_head
+if ne rc SYN_OK
+ret rc
+end
+st = cs_get_state cs_idx
+if eq st CS_STATE_PROPOSED
+rc2 = cs_transition cs_idx CS_STATE_REVIEWED ts
+if ne rc2 SYN_OK
+ret rc2
+end
+end
+rc3 = cs_transition cs_idx CS_STATE_LANDED ts
+if ne rc3 SYN_OK
+ret rc3
+end
+rc4 = gr_branch_set t_br_main cs_idx
+if ne rc4 SYN_OK
+ret rc4
+end
+cs_get_id cs_idx cur_id
+lg_set_subject cur_id
+seq = lg_append_view 7 ts cs_get_author_off cs_idx cs_get_author_len cs_idx t_rv_land
+if eq seq 0
+ret SYN_ERR_CAPACITY
+end
+ret SYN_OK
+end

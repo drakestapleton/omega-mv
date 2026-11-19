@@ -1,0 +1,1056 @@
+note agent-archive: pure Omega append-only provenance archive with SHA-256 hash-chaining,
+note FNV-1a deduplication, secret redaction, privacy filtering, and tamper verification.
+note Ported from upstream agent-archive (src/core.rs, src/main.rs).
+note Compose with si/directives/om2.om before this file.
+
+const AA_MAX_RECS ulong 32
+const AA_AGENT_CLAUDE ulong 0
+const AA_AGENT_CODEX ulong 1
+const AA_AGENT_OPENCODE ulong 2
+const AA_AGENT_GEMINI ulong 3
+const AA_AGENT_MUSE ulong 4
+const AA_AGENT_OMP ulong 5
+
+const AA_ROLE_USER ulong 0
+const AA_ROLE_ASSISTANT ulong 1
+const AA_ROLE_SYSTEM ulong 2
+
+struct AaShaState h uint 8 end
+struct AaChainEntry seq ulong ts_ms ulong agent_id ulong role_id ulong is_priv ulong src_pos ulong dedup_key ulong text_off ulong text_len ulong end
+struct AaArchiveMeta cnt ulong last_ts ulong text_used ulong end
+
+text aa_t_hex "0123456789abcdef"
+text aa_t_redacted "[REDACTED]"
+text aa_t_ag_claude "claude"
+text aa_t_ag_codex "codex"
+text aa_t_ag_opencode "opencode"
+text aa_t_ag_gemini "gemini"
+text aa_t_ag_muse "muse"
+text aa_t_ag_omp "omp"
+text aa_t_role_user "user"
+text aa_t_role_asst "assistant"
+text aa_t_role_sys "system"
+
+text aa_p_bearer "Bearer "
+text aa_p_ghp "ghp_"
+text aa_p_gho "gho_"
+text aa_p_ghpat "github_pat_"
+text aa_p_sk "sk-"
+text aa_p_akia "AKIA"
+text aa_p_eyj "eyJ"
+text aa_p_xoxb "xoxb-"
+text aa_p_tok "token="
+text aa_p_pwd "password="
+text aa_p_sec "secret="
+text aa_p_key "api_key="
+
+text aa_c_1 "v1|seq="
+text aa_c_2 "|ts="
+text aa_c_3 "|agent="
+text aa_c_4 "|role="
+text aa_c_5 "|priv="
+text aa_c_6 "|pos="
+text aa_c_7 "|prev="
+text aa_c_8 "|text="
+
+text aa_j_1 "{\"seq\":"
+text aa_j_2 ",\"ts_ms\":"
+text aa_j_3 ",\"agent\":\""
+text aa_j_4 "\",\"role\":\""
+text aa_j_5 "\",\"prev\":\""
+text aa_j_6 "\",\"hash\":\""
+text aa_j_7 "\",\"text\":\""
+text aa_j_8 "\"}\n"
+
+fn aa_to_lower c uchar to uchar
+if ge c 65
+if le c 90
+ret add c 32
+end
+end
+ret c
+end
+
+fn aa_eq_bytes a view uchar * b view uchar * to bool
+n = len a
+if ne n len b
+ret false
+end
+i = ulong 0
+while lt i n bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn aa_ct_eq a view uchar * b view uchar * to bool
+n = len a
+if ne n len b
+ret false
+end
+acc = uchar 0
+i = ulong 0
+while lt i n bound 4096
+acc = or acc xor get a i get b i
+i = add i 1
+end
+ret eq acc 0
+end
+
+fn aa_append dst edit uchar * pos ulong src view uchar * to long
+n = len src
+if gt add pos n len dst
+ret -1
+end
+i = ulong 0
+while lt i n bound 65536
+put dst add pos i get src i
+i = add i 1
+end
+ret long add pos n
+end
+
+fn aa_append_u64 dst edit uchar * pos ulong val ulong to long
+tmp = new uchar 24 0
+cnt = ulong 0
+v = val
+if eq v 0
+put tmp 0 uchar 48
+cnt = ulong 1
+else
+while gt v 0 bound 24
+d = rem v 10
+put tmp cnt uchar add d 48
+v = div v 10
+cnt = add cnt 1
+end
+end
+if gt add pos cnt len dst
+ret -1
+end
+i = ulong 0
+while lt i cnt bound 24
+put dst add pos i get tmp sub sub cnt 1 i
+i = add i 1
+end
+ret long add pos cnt
+end
+
+note ---- Pure-Omega FIPS 180-4 SHA-256 ----
+
+fn aa_sha_init_k k edit uint 64 to void
+put k 0 uint 0x428a2f98
+put k 1 uint 0x71374491
+put k 2 uint 0xb5c0fbcf
+put k 3 uint 0xe9b5dba5
+put k 4 uint 0x3956c25b
+put k 5 uint 0x59f111f1
+put k 6 uint 0x923f82a4
+put k 7 uint 0xab1c5ed5
+put k 8 uint 0xd807aa98
+put k 9 uint 0x12835b01
+put k 10 uint 0x243185be
+put k 11 uint 0x550c7dc3
+put k 12 uint 0x72be5d74
+put k 13 uint 0x80deb1fe
+put k 14 uint 0x9bdc06a7
+put k 15 uint 0xc19bf174
+put k 16 uint 0xe49b69c1
+put k 17 uint 0xefbe4786
+put k 18 uint 0x0fc19dc6
+put k 19 uint 0x240ca1cc
+put k 20 uint 0x2de92c6f
+put k 21 uint 0x4a7484aa
+put k 22 uint 0x5cb0a9dc
+put k 23 uint 0x76f988da
+put k 24 uint 0x983e5152
+put k 25 uint 0xa831c66d
+put k 26 uint 0xb00327c8
+put k 27 uint 0xbf597fc7
+put k 28 uint 0xc6e00bf3
+put k 29 uint 0xd5a79147
+put k 30 uint 0x06ca6351
+put k 31 uint 0x14292967
+put k 32 uint 0x27b70a85
+put k 33 uint 0x2e1b2138
+put k 34 uint 0x4d2c6dfc
+put k 35 uint 0x53380d13
+put k 36 uint 0x650a7354
+put k 37 uint 0x766a0abb
+put k 38 uint 0x81c2c92e
+put k 39 uint 0x92722c85
+put k 40 uint 0xa2bfe8a1
+put k 41 uint 0xa81a664b
+put k 42 uint 0xc24b8b70
+put k 43 uint 0xc76c51a3
+put k 44 uint 0xd192e819
+put k 45 uint 0xd6990624
+put k 46 uint 0xf40e3585
+put k 47 uint 0x106aa070
+put k 48 uint 0x19a4c116
+put k 49 uint 0x1e376c08
+put k 50 uint 0x2748774c
+put k 51 uint 0x34b0bcb5
+put k 52 uint 0x391c0cb3
+put k 53 uint 0x4ed8aa4a
+put k 54 uint 0x5b9cca4f
+put k 55 uint 0x682e6ff3
+put k 56 uint 0x748f82ee
+put k 57 uint 0x78a5636f
+put k 58 uint 0x84c87814
+put k 59 uint 0x8cc70208
+put k 60 uint 0x90befffa
+put k 61 uint 0xa4506ceb
+put k 62 uint 0xbef9a3f7
+put k 63 uint 0xc67178f2
+end
+
+fn aa_sha_load_be32 blk view uchar 64 off ulong to uint
+b0 = uint get blk off
+b1 = uint get blk add off 1
+b2 = uint get blk add off 2
+b3 = uint get blk add off 3
+ret or or shl b0 24 shl b1 16 or shl b2 8 b3
+end
+
+fn aa_sha_expand blk view uchar 64 w edit uint 64 to void
+i = ulong 0
+while lt i 16 bound 16
+put w i aa_sha_load_be32 blk mul i 4
+i = add i 1
+end
+while lt i 64 bound 64
+x = get w sub i 15
+s0 = xor xor rotr x 7 rotr x 18 shr x 3
+y = get w sub i 2
+s1 = xor xor rotr y 17 rotr y 19 shr y 10
+put w i add add get w sub i 16 s0 add get w sub i 7 s1
+i = add i 1
+end
+end
+
+fn aa_sha_t1 e uint f uint g uint h uint ki uint wi uint to uint
+s1 = xor xor rotr e 6 rotr e 11 rotr e 25
+ch = xor and e f and not e g
+ret add add add add h s1 ch ki wi
+end
+
+fn aa_sha_t2 a uint b uint c uint to uint
+s0 = xor xor rotr a 2 rotr a 13 rotr a 22
+maj = xor xor and a b and a c and b c
+ret add s0 maj
+end
+
+fn aa_sha_round st edit uint 8 ki uint wi uint to void
+t1 = aa_sha_t1 get st 4 get st 5 get st 6 get st 7 ki wi
+t2 = aa_sha_t2 get st 0 get st 1 get st 2
+put st 7 get st 6
+put st 6 get st 5
+put st 5 get st 4
+put st 4 add get st 3 t1
+put st 3 get st 2
+put st 2 get st 1
+put st 1 get st 0
+put st 0 add t1 t2
+end
+
+fn aa_sha_compress hv edit uint 8 blk view uchar 64 k view uint 64 to void
+w = new uint 64 0
+aa_sha_expand blk w
+wv = new uint 8 0
+i = ulong 0
+while lt i 8 bound 8
+put wv i get hv i
+i = add i 1
+end
+r = ulong 0
+while lt r 64 bound 64
+aa_sha_round wv get k r get w r
+r = add r 1
+end
+j = ulong 0
+while lt j 8 bound 8
+put hv j add get hv j get wv j
+j = add j 1
+end
+end
+
+fn aa_sha_store_digest hv view uint 8 digest edit uchar 32 to void
+i = ulong 0
+while lt i 8 bound 8
+v = get hv i
+off = mul i 4
+put digest off uchar and shr v 24 255
+put digest add off 1 uchar and shr v 16 255
+put digest add off 2 uchar and shr v 8 255
+put digest add off 3 uchar and v 255
+i = add i 1
+end
+end
+
+fn aa_sha256 msg view uchar * digest edit uchar 32 to void
+k = new uint 64 0
+aa_sha_init_k k
+hv = new uint 8 0
+put hv 0 uint 0x6a09e667
+put hv 1 uint 0xbb67ae85
+put hv 2 uint 0x3c6ef372
+put hv 3 uint 0xa54ff53a
+put hv 4 uint 0x510e527f
+put hv 5 uint 0x9b05688c
+put hv 6 uint 0x1f83d9ab
+put hv 7 uint 0x5be0cd19
+blk = new uchar 64 0
+n = len msg
+pos = ulong 0
+while ge sub n pos 64 bound 4096
+j = ulong 0
+while lt j 64 bound 64
+put blk j get msg add pos j
+j = add j 1
+end
+aa_sha_compress hv blk k
+pos = add pos 64
+end
+remn = sub n pos
+j = ulong 0
+while lt j 64 bound 64
+put blk j uchar 0
+j = add j 1
+end
+j = ulong 0
+while lt j remn bound 64
+put blk j get msg add pos j
+j = add j 1
+end
+put blk remn uchar 0x80
+if ge remn 56
+aa_sha_compress hv blk k
+j = ulong 0
+while lt j 64 bound 64
+put blk j uchar 0
+j = add j 1
+end
+end
+bits = mul n 8
+put blk 56 uchar and shr bits 56 255
+put blk 57 uchar and shr bits 48 255
+put blk 58 uchar and shr bits 40 255
+put blk 59 uchar and shr bits 32 255
+put blk 60 uchar and shr bits 24 255
+put blk 61 uchar and shr bits 16 255
+put blk 62 uchar and shr bits 8 255
+put blk 63 uchar and bits 255
+aa_sha_compress hv blk k
+aa_sha_store_digest hv digest
+end
+
+fn aa_hex_encode src view uchar 32 dst edit uchar 64 to void
+i = ulong 0
+while lt i 32 bound 32
+b = get src i
+hi = ulong shr b 4
+lo = ulong and b 15
+put dst mul i 2 get aa_t_hex hi
+put dst add mul i 2 1 get aa_t_hex lo
+i = add i 1
+end
+end
+
+note ---- Upstream FNV-1a 64-bit record dedup key (src/core.rs Record::key) ----
+
+fn aa_fnv_feed h ulong data view uchar * to ulong
+cur = h
+n = len data
+i = ulong 0
+while lt i n bound 8192
+cur = xor cur ulong get data i
+cur = mul cur ulong 0x100000001b3
+i = add i 1
+end
+cur = mul cur ulong 0x100000001b3
+ret cur
+end
+
+fn aa_record_dedup_key agent_id ulong role_id ulong src_pos ulong msg view uchar * to ulong
+h = ulong 0xcbf29ce484222325
+h = mul xor h agent_id ulong 0x100000001b3
+h = mul xor h role_id ulong 0x100000001b3
+h = aa_fnv_feed h msg
+b = ulong 0
+while lt b 8 bound 8
+by = and shr src_pos mul b 8 255
+h = mul xor h by ulong 0x100000001b3
+b = add b 1
+end
+ret h
+end
+
+note ---- Upstream allowlists and Unix private mode guard ----
+
+fn aa_parse_agent name view uchar * to long
+if aa_eq_bytes name aa_t_ag_claude
+ret long AA_AGENT_CLAUDE
+end
+if aa_eq_bytes name aa_t_ag_codex
+ret long AA_AGENT_CODEX
+end
+if aa_eq_bytes name aa_t_ag_opencode
+ret long AA_AGENT_OPENCODE
+end
+if aa_eq_bytes name aa_t_ag_gemini
+ret long AA_AGENT_GEMINI
+end
+if aa_eq_bytes name aa_t_ag_muse
+ret long AA_AGENT_MUSE
+end
+if aa_eq_bytes name aa_t_ag_omp
+ret long AA_AGENT_OMP
+end
+ret -1
+end
+
+fn aa_parse_role name view uchar * to long
+if aa_eq_bytes name aa_t_role_user
+ret long AA_ROLE_USER
+end
+if aa_eq_bytes name aa_t_role_asst
+ret long AA_ROLE_ASSISTANT
+end
+if aa_eq_bytes name aa_t_role_sys
+ret long AA_ROLE_SYSTEM
+end
+ret -1
+end
+
+fn aa_append_agent dst edit uchar * pos ulong agent_id ulong to long
+if eq agent_id AA_AGENT_CLAUDE
+ret aa_append dst pos aa_t_ag_claude
+end
+if eq agent_id AA_AGENT_CODEX
+ret aa_append dst pos aa_t_ag_codex
+end
+if eq agent_id AA_AGENT_OPENCODE
+ret aa_append dst pos aa_t_ag_opencode
+end
+if eq agent_id AA_AGENT_GEMINI
+ret aa_append dst pos aa_t_ag_gemini
+end
+if eq agent_id AA_AGENT_MUSE
+ret aa_append dst pos aa_t_ag_muse
+end
+if eq agent_id AA_AGENT_OMP
+ret aa_append dst pos aa_t_ag_omp
+end
+ret -1
+end
+
+fn aa_append_role dst edit uchar * pos ulong role_id ulong to long
+if eq role_id AA_ROLE_USER
+ret aa_append dst pos aa_t_role_user
+end
+if eq role_id AA_ROLE_ASSISTANT
+ret aa_append dst pos aa_t_role_asst
+end
+if eq role_id AA_ROLE_SYSTEM
+ret aa_append dst pos aa_t_role_sys
+end
+ret -1
+end
+
+note Upstream private_check invariant: owner matches euid, no group/other mode bits (mode & 077 == 0), not symlink.
+fn aa_path_is_private owner_uid ulong euid ulong mode ulong is_symlink bool to bool
+if is_symlink
+ret false
+end
+if ne owner_uid euid
+ret false
+end
+if ne and mode 63 0
+ret false
+end
+ret true
+end
+
+note ---- Secret/token redaction filter ----
+
+fn aa_is_tok_char c uchar to bool
+if ge c 48
+if le c 57
+ret true
+end
+end
+if ge c 65
+if le c 90
+ret true
+end
+end
+if ge c 97
+if le c 122
+ret true
+end
+end
+if eq c 95
+ret true
+end
+if eq c 45
+ret true
+end
+if eq c 46
+ret true
+end
+ret false
+end
+
+fn aa_match_prefix_ci src view uchar * pos ulong pfx view uchar * to bool
+pn = len pfx
+if gt add pos pn len src
+ret false
+end
+i = ulong 0
+while lt i pn bound 64
+if ne aa_to_lower get src add pos i aa_to_lower get pfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn aa_match_prefix src view uchar * pos ulong pfx view uchar * to bool
+pn = len pfx
+if gt add pos pn len src
+ret false
+end
+i = ulong 0
+while lt i pn bound 64
+if ne get src add pos i get pfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note If src[pos..] starts a secret/token pattern, return how many prefix chars to keep (0 to redact whole token, >0 for "Bearer " / "token="), else -1.
+fn aa_secret_keep_prefix src view uchar * pos ulong to long
+if aa_match_prefix src pos aa_p_bearer
+ret long len aa_p_bearer
+end
+if aa_match_prefix src pos aa_p_ghp
+ret 0
+end
+if aa_match_prefix src pos aa_p_gho
+ret 0
+end
+if aa_match_prefix src pos aa_p_ghpat
+ret 0
+end
+if aa_match_prefix src pos aa_p_sk
+ret 0
+end
+if aa_match_prefix src pos aa_p_akia
+ret 0
+end
+if aa_match_prefix src pos aa_p_eyj
+ret 0
+end
+if aa_match_prefix src pos aa_p_xoxb
+ret 0
+end
+if aa_match_prefix_ci src pos aa_p_tok
+ret long len aa_p_tok
+end
+if aa_match_prefix_ci src pos aa_p_pwd
+ret long len aa_p_pwd
+end
+if aa_match_prefix_ci src pos aa_p_sec
+ret long len aa_p_sec
+end
+if aa_match_prefix_ci src pos aa_p_key
+ret long len aa_p_key
+end
+ret -1
+end
+
+note Copy src into dst while redacting secret/token values to "[REDACTED]".
+note Returns redacted length >= 0, or -1 on buffer overflow.
+fn aa_redact_text src view uchar * dst edit uchar * to long
+n = len src
+i = ulong 0
+w = ulong 0
+while lt i n bound 8192
+keep = aa_secret_keep_prefix src i
+if ge keep 0
+k = ulong keep
+if gt k 0
+nw = aa_append dst w part src i k
+if lt nw 0
+ret -1
+end
+w = ulong nw
+i = add i k
+end
+skipped = ulong 0
+while lt i n bound 8192
+if not aa_is_tok_char get src i
+break
+end
+i = add i 1
+skipped = add skipped 1
+end
+if gt skipped 0
+nw = aa_append dst w aa_t_redacted
+if lt nw 0
+ret -1
+end
+w = ulong nw
+end
+else
+if ge w len dst
+ret -1
+end
+put dst w get src i
+w = add w 1
+i = add i 1
+end
+end
+ret long w
+end
+
+note ---- Canonical encoding, hash-chain linking, export, and tamper verification ----
+
+fn aa_escape_text dst edit uchar * pos ulong src view uchar * to long
+n = len src
+p = pos
+i = ulong 0
+while lt i n bound 8192
+c = get src i
+if eq c 10
+if gt add p 2 len dst
+ret -1
+end
+put dst p uchar 92
+put dst add p 1 uchar 110
+p = add p 2
+else
+if eq c 13
+i = add i 1
+continue
+else
+if eq c 34
+if gt add p 2 len dst
+ret -1
+end
+put dst p uchar 92
+put dst add p 1 uchar 34
+p = add p 2
+else
+if eq c 92
+if gt add p 2 len dst
+ret -1
+end
+put dst p uchar 92
+put dst add p 1 uchar 92
+p = add p 2
+else
+if ge p len dst
+ret -1
+end
+put dst p c
+p = add p 1
+end
+end
+end
+end
+i = add i 1
+end
+ret long p
+end
+
+note Encode canonical provenance record for hashing:
+note   v1|seq=S|ts=T|agent=A|role=R|priv=P|pos=O|prev=HEX64|text=ESCAPED
+fn aa_encode_canonical entry view AaChainEntry prev_hex view uchar 64 txt view uchar * dst edit uchar * to long
+p = aa_append dst 0 aa_c_1
+if lt p 0
+ret -1
+end
+p = aa_append_u64 dst ulong p get entry seq
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_c_2
+if lt p 0
+ret -1
+end
+p = aa_append_u64 dst ulong p get entry ts_ms
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_c_3
+if lt p 0
+ret -1
+end
+p = aa_append_agent dst ulong p get entry agent_id
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_c_4
+if lt p 0
+ret -1
+end
+p = aa_append_role dst ulong p get entry role_id
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_c_5
+if lt p 0
+ret -1
+end
+p = aa_append_u64 dst ulong p get entry is_priv
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_c_6
+if lt p 0
+ret -1
+end
+p = aa_append_u64 dst ulong p get entry src_pos
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_c_7
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p prev_hex
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_c_8
+if lt p 0
+ret -1
+end
+ret aa_escape_text dst ulong p txt
+end
+
+note Compute SHA-256 hex digest of one canonical record.
+fn aa_hash_entry entry view AaChainEntry prev_hex view uchar 64 txt view uchar * out_hex edit uchar 64 to bool
+canon = new uchar 4096 0
+clen = aa_encode_canonical entry prev_hex txt canon
+if lt clen 0
+ret false
+end
+dig = new uchar 32 0
+aa_sha256 part canon 0 ulong clen dig
+aa_hex_encode dig out_hex
+ret true
+end
+
+fn aa_export_jsonl_head entry view AaChainEntry hashes view uchar 4096 dst edit uchar 2048 to long
+idx = get entry seq
+hoff = mul idx 128
+if gt add hoff 128 4096
+ret -1
+end
+p = aa_append dst 0 aa_j_1
+if lt p 0
+ret -1
+end
+p = aa_append_u64 dst ulong p idx
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_j_2
+if lt p 0
+ret -1
+end
+p = aa_append_u64 dst ulong p get entry ts_ms
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_j_3
+if lt p 0
+ret -1
+end
+p = aa_append_agent dst ulong p get entry agent_id
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_j_4
+if lt p 0
+ret -1
+end
+p = aa_append_role dst ulong p get entry role_id
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_j_5
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p part hashes hoff 64
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p aa_j_6
+if lt p 0
+ret -1
+end
+p = aa_append dst ulong p part hashes add hoff 64 64
+if lt p 0
+ret -1
+end
+ret aa_append dst ulong p aa_j_7
+end
+
+fn aa_export_jsonl_text dst edit uchar 2048 pos ulong txt view uchar * to long
+red = new uchar 2048 0
+rlen = aa_redact_text txt red
+if lt rlen 0
+ret -1
+end
+p = aa_escape_text dst pos part red 0 ulong rlen
+if lt p 0
+ret -1
+end
+ret aa_append dst ulong p aa_j_8
+end
+
+note Format one JSONL record for export.
+note Refuses private records (is_priv != 0) unless allow_private is true (returns -2).
+note Redacts secrets/tokens before emitting JSONL.
+fn aa_export_jsonl entry view AaChainEntry hashes view uchar 4096 text_buf view uchar * allow_private bool dst edit uchar 2048 to long
+if ne get entry is_priv 0
+if not allow_private
+ret -2
+end
+end
+toff = get entry text_off
+tlen = get entry text_len
+if gt add toff tlen len text_buf
+ret -1
+end
+p = aa_export_jsonl_head entry hashes dst
+if lt p 0
+ret -1
+end
+ret aa_export_jsonl_text dst ulong p part text_buf toff tlen
+end
+
+note Flat storage helpers for append-only chain archive:
+note   entries:  ulong[288]  (AA_MAX_RECS=32 * 9 fields per AaChainEntry)
+note   hashes:   uchar[4096] (AA_MAX_RECS=32 * 128 bytes: 64-byte prev_hex + 64-byte hash_hex)
+note   text_buf: uchar[*]    (concatenated message text bytes)
+
+fn aa_store_entry entries edit ulong 288 idx ulong e view AaChainEntry to void
+b = mul idx 9
+put entries b get e seq
+put entries add b 1 get e ts_ms
+put entries add b 2 get e agent_id
+put entries add b 3 get e role_id
+put entries add b 4 get e is_priv
+put entries add b 5 get e src_pos
+put entries add b 6 get e dedup_key
+put entries add b 7 get e text_off
+put entries add b 8 get e text_len
+end
+
+fn aa_load_entry entries view ulong 288 idx ulong e edit AaChainEntry to void
+b = mul idx 9
+put e seq get entries b
+put e ts_ms get entries add b 1
+put e agent_id get entries add b 2
+put e role_id get entries add b 3
+put e is_priv get entries add b 4
+put e src_pos get entries add b 5
+put e dedup_key get entries add b 6
+put e text_off get entries add b 7
+put e text_len get entries add b 8
+end
+
+fn aa_has_dedup_key entries view ulong 288 cnt ulong key ulong to bool
+i = ulong 0
+while lt i cnt bound 64
+if eq get entries add mul i 9 6 key
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn aa_fill_prev_hex hashes view uchar 4096 idx ulong prev_hex edit uchar 64 to void
+if eq idx 0
+i = ulong 0
+while lt i 64 bound 64
+put prev_hex i uchar 48
+i = add i 1
+end
+else
+src_off = add mul sub idx 1 128 64
+i = ulong 0
+while lt i 64 bound 64
+put prev_hex i get hashes add src_off i
+i = add i 1
+end
+end
+end
+
+fn aa_store_pair hashes edit uchar 4096 idx ulong prev_hex view uchar 64 cur_hex view uchar 64 to void
+off = mul idx 128
+i = ulong 0
+while lt i 64 bound 64
+put hashes add off i get prev_hex i
+put hashes add add off 64 i get cur_hex i
+i = add i 1
+end
+end
+
+note Step 1: aa_stage_record stages text into text_buf and populates rec fields (dedup_key, seq, text_off, text_len).
+fn aa_stage_record meta edit AaArchiveMeta rec edit AaChainEntry txt view uchar * text_buf edit uchar * to int
+if ge get meta cnt AA_MAX_RECS
+ret -1
+end
+if gt get rec agent_id AA_AGENT_OMP
+ret -2
+end
+if gt get rec role_id AA_ROLE_SYSTEM
+ret -2
+end
+if gt get meta cnt 0
+if lt get rec ts_ms get meta last_ts
+ret -3
+end
+end
+if gt add get meta text_used len txt len text_buf
+ret -4
+end
+if lt aa_append text_buf get meta text_used txt 0
+ret -4
+end
+put rec seq get meta cnt
+put rec text_off get meta text_used
+put rec text_len len txt
+put rec dedup_key aa_record_dedup_key get rec agent_id get rec role_id get rec src_pos txt
+ret 0
+end
+
+note Step 2: aa_commit_record checks dedup and commits entry metadata.
+fn aa_commit_record meta edit AaArchiveMeta rec view AaChainEntry entries edit ulong 288 to int
+cnt = get meta cnt
+if ge cnt AA_MAX_RECS
+ret -1
+end
+if aa_has_dedup_key entries cnt get rec dedup_key
+ret 1
+end
+aa_store_entry entries cnt rec
+put meta cnt add cnt 1
+put meta last_ts get rec ts_ms
+put meta text_used add get rec text_off get rec text_len
+ret 0
+end
+
+note Step 3: Link record SHA-256 hash into hashes[idx] using prev_hash and text_buf.
+fn aa_link_record idx ulong rec view AaChainEntry hashes edit uchar 4096 text_buf view uchar * to bool
+prev_hex = new uchar 64 0
+cur_hex = new uchar 64 0
+aa_fill_prev_hex hashes idx prev_hex
+toff = get rec text_off
+tlen = get rec text_len
+if gt add toff tlen len text_buf
+ret false
+end
+if not aa_hash_entry rec prev_hex part text_buf toff tlen cur_hex
+ret false
+end
+aa_store_pair hashes idx prev_hex cur_hex
+ret true
+end
+
+note Verify one entry at index `idx` in the hash chain.
+note Returns:
+note   0: intact
+note  -2: sequence mismatch
+note  -3: prev_hash link mismatch
+note  -4: SHA-256 digest mismatch (tampered payload)
+note  -5: timestamp rollback
+fn aa_verify_one idx ulong rec view AaChainEntry hashes view uchar 4096 text_buf view uchar * to int
+if ne get rec seq idx
+ret -2
+end
+hoff = mul idx 128
+if gt add hoff 128 4096
+ret -1
+end
+exp_prev = new uchar 64 0
+aa_fill_prev_hex hashes idx exp_prev
+if not aa_ct_eq part hashes hoff 64 exp_prev
+ret -3
+end
+toff = get rec text_off
+tlen = get rec text_len
+if gt add toff tlen len text_buf
+ret -4
+end
+calc_hex = new uchar 64 0
+if not aa_hash_entry rec exp_prev part text_buf toff tlen calc_hex
+ret -4
+end
+if not aa_ct_eq part hashes add hoff 64 64 calc_hex
+ret -4
+end
+ret 0
+end
+
+note Verify the entire append-only hash chain (0..cnt-1).
+note Returns 0 if every link, sequence, timestamp, and SHA-256 digest is intact, else negative error code.
+fn aa_verify_chain cnt ulong entries view ulong 288 hashes view uchar 4096 text_buf view uchar * to int
+rec = new AaChainEntry 0 0 0 0 0 0 0 0 0
+prev_ts = ulong 0
+i = ulong 0
+while lt i cnt bound 64
+aa_load_entry entries i rec
+if gt i 0
+if lt get rec ts_ms prev_ts
+ret -5
+end
+end
+v = aa_verify_one i rec hashes text_buf
+if ne v 0
+ret v
+end
+prev_ts = get rec ts_ms
+i = add i 1
+end
+ret 0
+end
+
+note Parse unsigned integer decimal string.
+fn aa_parse_u64 s view uchar * to long
+n = len s
+if eq n 0
+ret -1
+end
+if gt n 18
+ret -1
+end
+v = ulong 0
+i = ulong 0
+while lt i n bound 32
+c = get s i
+if lt c 48
+ret -1
+end
+if gt c 57
+ret -1
+end
+v = add mul v 10 ulong sub c 48
+i = add i 1
+end
+ret long v
+end

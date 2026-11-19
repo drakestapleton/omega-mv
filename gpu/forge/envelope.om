@@ -1,0 +1,521 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/forge/envelope.om: FORGE physical feasibility & roofline envelope checker.
+note Validates working-set memory, CTA/wave sizing, shared memory, register pressure,
+note theoretical compute vs bandwidth roofline (f64), thermal/power ceilings, and
+note latency/energy budgets. Fail-closed with named physical violation codes.
+note Composable OM-2 library module (compose after hardware.om).
+
+note ---- Physical Envelope Violation Codes ----
+const FG_ENV_OK uint 0
+const FG_ENV_ERR_INVALID_HW uint 1
+const FG_ENV_ERR_INVALID_DIMS uint 2
+const FG_ENV_ERR_UNSUPPORTED_OP uint 3
+const FG_ENV_ERR_UNSUPPORTED_DTYPE uint 4
+const FG_ENV_ERR_OOM_WORKING_SET uint 5
+const FG_ENV_ERR_SMEM_EXCEEDED uint 6
+const FG_ENV_ERR_GPR_EXCEEDED uint 7
+const FG_ENV_ERR_THREADS_EXCEEDED uint 8
+const FG_ENV_ERR_WAVE_SM_CAP uint 9
+const FG_ENV_ERR_THERMAL_CEILING uint 10
+const FG_ENV_ERR_POWER_CEILING uint 11
+const FG_ENV_ERR_LATENCY_BUDGET uint 12
+const FG_ENV_ERR_ENERGY_BUDGET uint 13
+
+const FG_U64_MAX ulong 0xffffffffffffffff
+const FG_GPU_REGS_PER_SM ulong 65536
+
+note ---- Bit, Overflow & Dtype Helpers ----
+
+fn fg_single_bit v uint to bool
+if eq v 0
+ret false
+end
+ret eq and v sub v 1 0
+end
+
+fn fg_mul_ovf a ulong b ulong to bool
+if eq a 0
+ret false
+end
+if eq b 0
+ret false
+end
+ret gt a div FG_U64_MAX b
+end
+
+fn fg_add_ovf a ulong b ulong to bool
+ret gt b sub FG_U64_MAX a
+end
+
+fn fg_dtype_bytes dt uint to ulong
+if eq dt FG_DT_FP8
+ret ulong 1
+end
+if eq dt FG_DT_INT8
+ret ulong 1
+end
+if eq dt FG_DT_FP16
+ret ulong 2
+end
+if eq dt FG_DT_BF16
+ret ulong 2
+end
+if eq dt FG_DT_FP32
+ret ulong 4
+end
+if eq dt FG_DT_INT32
+ret ulong 4
+end
+if eq dt FG_DT_U64
+ret ulong 8
+end
+if eq dt FG_DT_FP64
+ret ulong 8
+end
+ret ulong 0
+end
+
+fn fg_dtype_scale hcap view ForgeHwCap dt uint to f64
+has_tc = ne and get hcap feature_flags FG_FEAT_TENSOR_CORES 0
+if eq dt FG_DT_FP8
+if has_tc
+ret 8.0f64
+end
+ret 1.0f64
+end
+if eq dt FG_DT_INT8
+if has_tc
+ret 8.0f64
+end
+ret 4.0f64
+end
+if eq dt FG_DT_FP16
+if has_tc
+ret 4.0f64
+end
+ret 2.0f64
+end
+if eq dt FG_DT_BF16
+if has_tc
+ret 4.0f64
+end
+ret 2.0f64
+end
+if eq dt FG_DT_FP64
+ret 0.5f64
+end
+ret 1.0f64
+end
+
+note Single-wave clamp helper: clamps CTA count to [1, sm_count]
+fn fg_env_clamp_wave ctas uint sm_count uint to uint
+if eq sm_count 0
+ret uint 0
+end
+if eq ctas 0
+ret uint 1
+end
+if gt ctas sm_count
+ret sm_count
+end
+ret ctas
+end
+
+fn fg_env_reset env edit ForgeEnvCheck to void
+put env ok uint 0
+put env violation FG_ENV_OK
+put env ws_bytes ulong 0
+put env traffic_bytes ulong 0
+put env flops ulong 0
+put env eff_ctas uint 0
+put env eff_thr uint 0
+put env waves uint 0
+put env arith_int 0.0f64
+put env comp_us 0.0f64
+put env bw_us 0.0f64
+put env roof_us 0.0f64
+put env est_power_w 0.0f64
+put env est_energy_mj 0.0f64
+put env compute_bound uint 0
+ret
+end
+
+fn fg_env_fail env edit ForgeEnvCheck code uint to uint
+put env ok uint 0
+put env violation code
+ret code
+end
+
+fn fg_env_wl_matmul req view ForgeContract eb ulong env edit ForgeEnvCheck to bool
+dm = get req dim_m
+dn = get req dim_n
+dk = get req dim_k
+db = get req batch
+if fg_mul_ovf dm dk
+ret false
+end
+mk = mul dm dk
+if fg_mul_ovf dk dn
+ret false
+end
+kn = mul dk dn
+if fg_mul_ovf dm dn
+ret false
+end
+mn = mul dm dn
+if fg_add_ovf mk kn
+ret false
+end
+elems = add mk kn
+if fg_add_ovf elems mn
+ret false
+end
+elems = add elems mn
+if fg_mul_ovf elems db
+ret false
+end
+elems = mul elems db
+if fg_mul_ovf elems eb
+ret false
+end
+put env traffic_bytes mul elems eb
+if fg_mul_ovf mn dk
+ret false
+end
+fl = mul mn dk
+if fg_mul_ovf fl db
+ret false
+end
+fl = mul fl db
+if fg_mul_ovf fl 2
+ret false
+end
+put env flops mul fl 2
+ret true
+end
+
+fn fg_env_wl_matvec req view ForgeContract eb ulong env edit ForgeEnvCheck to bool
+dm = get req dim_m
+dk = get req dim_k
+db = get req batch
+if fg_mul_ovf dm dk
+ret false
+end
+mk = mul dm dk
+if fg_add_ovf mk dk
+ret false
+end
+elems = add mk dk
+if fg_add_ovf elems dm
+ret false
+end
+elems = add elems dm
+if fg_mul_ovf elems db
+ret false
+end
+elems = mul elems db
+if fg_mul_ovf elems eb
+ret false
+end
+put env traffic_bytes mul elems eb
+if fg_mul_ovf mk db
+ret false
+end
+fl = mul mk db
+if fg_mul_ovf fl 2
+ret false
+end
+put env flops mul fl 2
+ret true
+end
+
+fn fg_env_wl_elem req view ForgeContract eb ulong env edit ForgeEnvCheck to bool
+dm = get req dim_m
+dn = get req dim_n
+db = get req batch
+if fg_mul_ovf dm dn
+ret false
+end
+mn = mul dm dn
+if fg_mul_ovf mn db
+ret false
+end
+bmn = mul mn db
+put env flops bmn
+if fg_mul_ovf bmn 3
+ret false
+end
+elems = mul bmn 3
+if fg_mul_ovf elems eb
+ret false
+end
+put env traffic_bytes mul elems eb
+ret true
+end
+
+fn fg_env_wl_red req view ForgeContract eb ulong env edit ForgeEnvCheck to bool
+dm = get req dim_m
+dn = get req dim_n
+db = get req batch
+if fg_mul_ovf dm dn
+ret false
+end
+mn = mul dm dn
+if fg_mul_ovf mn db
+ret false
+end
+put env flops mul mn db
+if fg_add_ovf mn dm
+ret false
+end
+elems = add mn dm
+if fg_mul_ovf elems db
+ret false
+end
+elems = mul elems db
+if fg_mul_ovf elems eb
+ret false
+end
+put env traffic_bytes mul elems eb
+ret true
+end
+
+note Compute overflow-safe working-set bytes, memory traffic bytes, and FLOPs
+fn fg_env_calc_workload req view ForgeContract env edit ForgeEnvCheck to bool
+op = get req op_class
+eb = fg_dtype_bytes get req dtype
+if eq eb 0
+ret false
+end
+ok = false
+if eq op FG_OP_MATMUL
+ok = fg_env_wl_matmul req eb env
+else
+if eq op FG_OP_MATVEC
+ok = fg_env_wl_matvec req eb env
+else
+if eq op FG_OP_ELEMENTWISE
+ok = fg_env_wl_elem req eb env
+else
+if eq op FG_OP_REDUCTION
+ok = fg_env_wl_red req eb env
+else
+ok = fg_env_wl_matmul req eb env
+end
+end
+end
+end
+if not ok
+ret false
+end
+tr_fin = get env traffic_bytes
+ex = get req extra_ws
+if fg_add_ovf tr_fin ex
+ret false
+end
+put env ws_bytes add tr_fin ex
+ret true
+end
+
+fn fg_env_auto_tile hid view ForgeHwId dt uint to ulong
+if eq get hid substrate_class FG_SUB_DIGITAL_GPU
+if or eq dt FG_DT_FP8 eq dt FG_DT_INT8
+ret ulong 128
+end
+if or eq dt FG_DT_FP16 eq dt FG_DT_BF16
+ret ulong 128
+end
+if or eq dt FG_DT_FP32 eq dt FG_DT_INT32
+ret ulong 64
+end
+ret ulong 32
+end
+ret ulong 64
+end
+
+note Validate CTA geometry, threads/CTA, shared memory, register pressure, and wave cap
+fn fg_env_check_geom hid view ForgeHwId hcap view ForgeHwCap req view ForgeContract env edit ForgeEnvCheck to uint
+if gt get req smem_req get hcap smem_cta
+ret fg_env_fail env FG_ENV_ERR_SMEM_EXCEEDED
+end
+if gt get req gpr_req get hid max_gpr
+ret fg_env_fail env FG_ENV_ERR_GPR_EXCEEDED
+end
+thr = get req thr_req
+if eq thr 0
+if eq get hid substrate_class FG_SUB_DIGITAL_GPU
+if ge get hid max_thr_cta 256
+thr = uint 256
+else
+thr = get hid max_thr_cta
+end
+else
+thr = uint 1
+end
+end
+if gt thr get hid max_thr_cta
+ret fg_env_fail env FG_ENV_ERR_THREADS_EXCEEDED
+end
+note Per-SM register file pressure check on GPU (64K 32-bit regs/SM)
+if eq get hid substrate_class FG_SUB_DIGITAL_GPU
+if gt get req gpr_req 0
+regs_cta = mul ulong thr ulong get req gpr_req
+if gt regs_cta FG_GPU_REGS_PER_SM
+ret fg_env_fail env FG_ENV_ERR_GPR_EXCEEDED
+end
+end
+end
+put env eff_thr thr
+sm = get hid sm_count
+ctas = get req cta_req
+if eq ctas 0
+ts = fg_env_auto_tile hid get req dtype
+tiles_m = div add get req dim_m sub ts 1 ts
+tiles_n = div add get req dim_n sub ts 1 ts
+if fg_mul_ovf tiles_m tiles_n
+ctas = sm
+else
+tot_t = mul tiles_m tiles_n
+if gt tot_t ulong 65536
+ctas = uint 65536
+else
+ctas = uint tot_t
+end
+end
+if eq ctas 0
+ctas = uint 1
+end
+if eq get req req_wave_cap 1
+ctas = fg_env_clamp_wave ctas sm
+end
+else
+if eq get req req_wave_cap 1
+if gt ctas sm
+ret fg_env_fail env FG_ENV_ERR_WAVE_SM_CAP
+end
+end
+end
+put env eff_ctas ctas
+wv = div add ctas sub sm 1 sm
+if eq wv 0
+wv = uint 1
+end
+put env waves wv
+ret FG_ENV_OK
+end
+
+fn fg_env_calc_roofline hcap view ForgeHwCap env edit ForgeEnvCheck dt uint to void
+scale = fg_dtype_scale hcap dt
+peak_tf = mul get hcap peak_fp32_tf scale
+fl_f = f64 get env flops
+tr_f = f64 get env traffic_bytes
+comp_us = div fl_f mul peak_tf 1.0e6f64
+bw_us = div tr_f mul get hcap bw_gbps 1.0e3f64
+roof_us = fmax comp_us bw_us
+ai = 0.0f64
+if gt tr_f 0.0f64
+ai = div fl_f tr_f
+end
+put env arith_int ai
+put env comp_us comp_us
+put env bw_us bw_us
+put env roof_us roof_us
+is_cb = uint 0
+if ge comp_us bw_us
+is_cb = uint 1
+end
+put env compute_bound is_cb
+ret
+end
+
+fn fg_env_check_thermal hid view ForgeHwId hcap view ForgeHwCap bud view ForgeBudget env edit ForgeEnvCheck to uint
+if gt get bud temp_mc get hcap max_temp_mc
+ret fg_env_fail env FG_ENV_ERR_THERMAL_CEILING
+end
+sm_f = f64 get hid sm_count
+cta_f = f64 get env eff_ctas
+util = 1.0f64
+if lt cta_f sm_f
+util = div cta_f sm_f
+end
+regime = 0.85f64
+if eq get env compute_bound 1
+regime = 1.0f64
+end
+pw_frac = add 0.35f64 mul 0.65f64 util
+est_pw = mul mul get hcap max_power_w pw_frac regime
+put env est_power_w est_pw
+pcap = get hcap max_power_w
+if gt get bud power_w 0.0f64
+if lt get bud power_w pcap
+pcap = get bud power_w
+end
+end
+if gt est_pw pcap
+ret fg_env_fail env FG_ENV_ERR_POWER_CEILING
+end
+est_mj = mul est_pw mul get env roof_us 1.0e-3f64
+put env est_energy_mj est_mj
+if gt get bud lat_us 0.0f64
+if gt get env roof_us get bud lat_us
+ret fg_env_fail env FG_ENV_ERR_LATENCY_BUDGET
+end
+end
+if gt get bud energy_mj 0.0f64
+if gt est_mj get bud energy_mj
+ret fg_env_fail env FG_ENV_ERR_ENERGY_BUDGET
+end
+end
+put env ok uint 1
+put env violation FG_ENV_OK
+ret FG_ENV_OK
+end
+
+note Compute theoretical compute vs bandwidth roofline, thermal, power, latency & energy
+fn fg_env_check_roofline hid view ForgeHwId hcap view ForgeHwCap bud view ForgeBudget env edit ForgeEnvCheck dt uint to uint
+fg_env_calc_roofline hcap env dt
+ret fg_env_check_thermal hid hcap bud env
+end
+
+note Primary entry point: full fail-closed physical feasibility & roofline check
+fn fg_env_check hid view ForgeHwId hcap view ForgeHwCap req view ForgeContract bud view ForgeBudget env edit ForgeEnvCheck to uint
+fg_env_reset env
+if ne fg_hw_validate hid hcap FG_HWVAL_OK
+ret fg_env_fail env FG_ENV_ERR_INVALID_HW
+end
+if not fg_single_bit get req op_class
+ret fg_env_fail env FG_ENV_ERR_INVALID_DIMS
+end
+if not fg_single_bit get req dtype
+ret fg_env_fail env FG_ENV_ERR_INVALID_DIMS
+end
+if eq get req dim_m 0
+ret fg_env_fail env FG_ENV_ERR_INVALID_DIMS
+end
+if eq get req dim_n 0
+ret fg_env_fail env FG_ENV_ERR_INVALID_DIMS
+end
+if eq get req dim_k 0
+ret fg_env_fail env FG_ENV_ERR_INVALID_DIMS
+end
+if eq get req batch 0
+ret fg_env_fail env FG_ENV_ERR_INVALID_DIMS
+end
+if eq and get hcap op_flags get req op_class 0
+ret fg_env_fail env FG_ENV_ERR_UNSUPPORTED_OP
+end
+if eq and get hcap dtype_flags get req dtype 0
+ret fg_env_fail env FG_ENV_ERR_UNSUPPORTED_DTYPE
+end
+if not fg_env_calc_workload req env
+ret fg_env_fail env FG_ENV_ERR_OOM_WORKING_SET
+end
+if gt get env ws_bytes get hcap mem_avail
+ret fg_env_fail env FG_ENV_ERR_OOM_WORKING_SET
+end
+grc = fg_env_check_geom hid hcap req env
+if ne grc FG_ENV_OK
+ret grc
+end
+ret fg_env_check_roofline hid hcap bud env get req dtype
+end

@@ -1,0 +1,429 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/aegis/heartbeat.om: Deterministic heartbeat and lease scheduler (pure OM-2 library unit).
+note Converted from aegis-runtime-mv/src/heartbeat.rs and src/persistence/task_lifecycle.rs.
+note Agent registration, monotonic tick evaluation, missed-heartbeat liveness expiry,
+note exclusive task lease assignment/renewal/release, fencing stale-generation refusal,
+note and bounded global + per-agent concurrency cap.
+
+const HB_MAX_AGENTS ulong 64
+const HB_MAX_LEASES ulong 128
+
+const AGENT_UNUSED ulong 0
+const AGENT_ALIVE ulong 1
+const AGENT_EXPIRED ulong 2
+const AGENT_DEREGISTERED ulong 3
+
+const LEASE_FREE ulong 0
+const LEASE_ACTIVE ulong 1
+const LEASE_RELEASED ulong 2
+const LEASE_EXPIRED ulong 3
+
+const HB_OK ulong 0
+const HB_ERR_FULL ulong 1
+const HB_ERR_DUPLICATE ulong 2
+const HB_ERR_UNKNOWN_AGENT ulong 3
+const HB_ERR_AGENT_EXPIRED ulong 4
+const HB_ERR_CONCURRENCY_CAP ulong 5
+const HB_ERR_ALREADY_LEASED ulong 6
+const HB_ERR_UNKNOWN_LEASE ulong 7
+const HB_ERR_STALE_GEN ulong 8
+const HB_ERR_WRONG_OWNER ulong 9
+const HB_ERR_NON_MONOTONIC ulong 10
+const HB_ERR_INVALID_PARAM ulong 11
+
+note hb_meta:
+note   [0]=current_tick, [1]=agent_cnt, [2]=lease_cnt, [3]=max_conc, [4]=active_leases,
+note   [5]=agent_ttl, [6]=lease_ttl, [7]=next_gen, [8]=pulse_cnt,
+note   [9]=last_reclaimed, [10]=last_expired_agents, [11]=total_reclaimed, [12]=degraded
+global hb_meta ulong 16
+
+global hb_agent_id ulong 64
+global hb_agent_state ulong 64
+global hb_agent_last_tick ulong 64
+global hb_agent_missed ulong 64
+global hb_agent_cap ulong 64
+global hb_agent_active ulong 64
+global hb_agent_epoch ulong 64
+
+global hb_lease_task ulong 128
+global hb_lease_agent ulong 128
+global hb_lease_gen ulong 128
+global hb_lease_state ulong 128
+global hb_lease_expires ulong 128
+global hb_lease_acquired ulong 128
+
+global hb_reclaimed_tasks ulong 128
+
+fn hb_init max_conc ulong agent_ttl ulong lease_ttl ulong to ulong
+if or eq max_conc 0 or eq agent_ttl 0 eq lease_ttl 0
+ret HB_ERR_INVALID_PARAM
+end
+if gt max_conc HB_MAX_LEASES
+ret HB_ERR_INVALID_PARAM
+end
+for i ulong 16
+put hb_meta i 0
+end
+put hb_meta 3 max_conc
+put hb_meta 5 agent_ttl
+put hb_meta 6 lease_ttl
+put hb_meta 7 1
+for i ulong 64
+put hb_agent_id i 0
+put hb_agent_state i AGENT_UNUSED
+put hb_agent_last_tick i 0
+put hb_agent_missed i 0
+put hb_agent_cap i 0
+put hb_agent_active i 0
+put hb_agent_epoch i 0
+end
+for i ulong 128
+put hb_lease_task i 0
+put hb_lease_agent i 0
+put hb_lease_gen i 0
+put hb_lease_state i LEASE_FREE
+put hb_lease_expires i 0
+put hb_lease_acquired i 0
+put hb_reclaimed_tasks i 0
+end
+ret HB_OK
+end
+
+fn hb_current_tick to ulong
+ret get hb_meta 0
+end
+
+fn hb_max_concurrency to ulong
+ret get hb_meta 3
+end
+
+fn hb_active_leases to ulong
+ret get hb_meta 4
+end
+
+fn hb_pulse_count to ulong
+ret get hb_meta 8
+end
+
+fn hb_last_reclaimed to ulong
+ret get hb_meta 9
+end
+
+fn hb_last_expired_agents to ulong
+ret get hb_meta 10
+end
+
+fn hb_total_reclaimed to ulong
+ret get hb_meta 11
+end
+
+fn hb_is_degraded to bool
+ret ne get hb_meta 12 0
+end
+
+fn hb_get_reclaimed idx ulong to ulong
+if ge idx get hb_meta 9
+ret 0
+end
+ret get hb_reclaimed_tasks idx
+end
+
+fn hb_find_agent agent_id ulong to long
+if eq agent_id 0
+ret -1
+end
+n = get hb_meta 1
+for i ulong n bound 64
+if eq get hb_agent_id i agent_id
+ret long i
+end
+end
+ret -1
+end
+
+fn hb_find_lease task_id ulong to long
+if eq task_id 0
+ret -1
+end
+n = get hb_meta 2
+for i ulong n bound 128
+if eq get hb_lease_task i task_id
+ret long i
+end
+end
+ret -1
+end
+
+fn hb_agent_status agent_id ulong to ulong
+s = hb_find_agent agent_id
+if lt s 0
+ret AGENT_UNUSED
+end
+ret get hb_agent_state ulong s
+end
+
+fn hb_lease_owner task_id ulong to ulong
+s = hb_find_lease task_id
+if lt s 0
+ret 0
+end
+slot = ulong s
+if ne get hb_lease_state slot LEASE_ACTIVE
+ret 0
+end
+ret get hb_lease_agent slot
+end
+
+fn hb_lease_current_gen task_id ulong to ulong
+s = hb_find_lease task_id
+if lt s 0
+ret 0
+end
+ret get hb_lease_gen ulong s
+end
+
+fn hb_register_agent agent_id ulong agent_cap ulong to ulong
+if or eq agent_id 0 eq agent_cap 0
+ret HB_ERR_INVALID_PARAM
+end
+s = hb_find_agent agent_id
+if ge s 0
+slot = ulong s
+if eq get hb_agent_state slot AGENT_ALIVE
+ret HB_ERR_DUPLICATE
+end
+note Re-registering an expired/deregistered agent bumps its epoch; prior lease generations stay fenced.
+put hb_agent_state slot AGENT_ALIVE
+put hb_agent_last_tick slot get hb_meta 0
+put hb_agent_missed slot 0
+put hb_agent_cap slot agent_cap
+put hb_agent_active slot 0
+put hb_agent_epoch slot add get hb_agent_epoch slot 1
+ret HB_OK
+end
+n = get hb_meta 1
+if ge n HB_MAX_AGENTS
+ret HB_ERR_FULL
+end
+put hb_agent_id n agent_id
+put hb_agent_state n AGENT_ALIVE
+put hb_agent_last_tick n get hb_meta 0
+put hb_agent_missed n 0
+put hb_agent_cap n agent_cap
+put hb_agent_active n 0
+put hb_agent_epoch n 1
+put hb_meta 1 add n 1
+ret HB_OK
+end
+
+fn hb_record_reclaim task_id ulong to void
+rc = get hb_meta 9
+if lt rc HB_MAX_LEASES
+put hb_reclaimed_tasks rc task_id
+put hb_meta 9 add rc 1
+end
+put hb_meta 11 add get hb_meta 11 1
+put hb_meta 12 1
+end
+
+fn hb_reclaim_lease_slot lslot ulong to void
+if ne get hb_lease_state lslot LEASE_ACTIVE
+ret
+end
+aid = get hb_lease_agent lslot
+tid = get hb_lease_task lslot
+put hb_lease_state lslot LEASE_EXPIRED
+act = get hb_meta 4
+if gt act 0
+put hb_meta 4 sub act 1
+end
+aslot = hb_find_agent aid
+if ge aslot 0
+aidx = ulong aslot
+aa = get hb_agent_active aidx
+if gt aa 0
+put hb_agent_active aidx sub aa 1
+end
+end
+hb_record_reclaim tid
+end
+
+fn hb_reclaim_agent_leases agent_id ulong to void
+lcnt = get hb_meta 2
+for j ulong lcnt bound 128
+if eq get hb_lease_state j LEASE_ACTIVE
+if eq get hb_lease_agent j agent_id
+hb_reclaim_lease_slot j
+end
+end
+end
+end
+
+fn hb_heartbeat agent_id ulong tick ulong to ulong
+if lt tick get hb_meta 0
+ret HB_ERR_NON_MONOTONIC
+end
+s = hb_find_agent agent_id
+if lt s 0
+ret HB_ERR_UNKNOWN_AGENT
+end
+slot = ulong s
+if ne get hb_agent_state slot AGENT_ALIVE
+ret HB_ERR_AGENT_EXPIRED
+end
+put hb_agent_last_tick slot tick
+put hb_agent_missed slot 0
+ret HB_OK
+end
+
+note Deterministic monotonic tick evaluation:
+note 1) Expire any ALIVE agent whose silence (new_tick - last_tick) exceeds agent_ttl,
+note    reclaiming all leases held by that expired agent.
+note 2) Expire and reclaim any remaining ACTIVE lease whose deadline <= new_tick.
+fn hb_tick new_tick ulong to ulong
+if lt new_tick get hb_meta 0
+ret HB_ERR_NON_MONOTONIC
+end
+put hb_meta 0 new_tick
+put hb_meta 8 add get hb_meta 8 1
+put hb_meta 9 0
+put hb_meta 10 0
+put hb_meta 12 0
+attl = get hb_meta 5
+acnt = get hb_meta 1
+for i ulong acnt bound 64
+if eq get hb_agent_state i AGENT_ALIVE
+last = get hb_agent_last_tick i
+gap = ulong 0
+if gt new_tick last
+gap = sub new_tick last
+end
+put hb_agent_missed i gap
+if gt gap attl
+put hb_agent_state i AGENT_EXPIRED
+put hb_meta 10 add get hb_meta 10 1
+put hb_meta 12 1
+hb_reclaim_agent_leases get hb_agent_id i
+end
+end
+end
+lcnt = get hb_meta 2
+for j ulong lcnt bound 128
+if eq get hb_lease_state j LEASE_ACTIVE
+if ge new_tick get hb_lease_expires j
+hb_reclaim_lease_slot j
+end
+end
+end
+ret HB_OK
+end
+
+note Acquire an exclusive task lease for agent_id. Writes strictly monotonic generation into dst_gen[0].
+fn hb_acquire_lease task_id ulong agent_id ulong dst_gen edit ulong 1 to ulong
+put dst_gen 0 0
+if or eq task_id 0 eq agent_id 0
+ret HB_ERR_INVALID_PARAM
+end
+aslot = hb_find_agent agent_id
+if lt aslot 0
+ret HB_ERR_UNKNOWN_AGENT
+end
+aidx = ulong aslot
+if ne get hb_agent_state aidx AGENT_ALIVE
+ret HB_ERR_AGENT_EXPIRED
+end
+if ge get hb_meta 4 get hb_meta 3
+ret HB_ERR_CONCURRENCY_CAP
+end
+if ge get hb_agent_active aidx get hb_agent_cap aidx
+ret HB_ERR_CONCURRENCY_CAP
+end
+lfind = hb_find_lease task_id
+lslot = ulong 0
+if ge lfind 0
+lslot = ulong lfind
+if eq get hb_lease_state lslot LEASE_ACTIVE
+ret HB_ERR_ALREADY_LEASED
+end
+else
+lslot = get hb_meta 2
+if ge lslot HB_MAX_LEASES
+ret HB_ERR_FULL
+end
+put hb_meta 2 add lslot 1
+end
+gen = get hb_meta 7
+put hb_meta 7 add gen 1
+now = get hb_meta 0
+put hb_lease_task lslot task_id
+put hb_lease_agent lslot agent_id
+put hb_lease_gen lslot gen
+put hb_lease_state lslot LEASE_ACTIVE
+put hb_lease_acquired lslot now
+put hb_lease_expires lslot add now get hb_meta 6
+put hb_meta 4 add get hb_meta 4 1
+put hb_agent_active aidx add get hb_agent_active aidx 1
+put dst_gen 0 gen
+ret HB_OK
+end
+
+note Verify an actor still owns the active lease at the exact fencing generation.
+fn hb_verify_lease task_id ulong agent_id ulong gen ulong to ulong
+lfind = hb_find_lease task_id
+if lt lfind 0
+ret HB_ERR_UNKNOWN_LEASE
+end
+lslot = ulong lfind
+if ne get hb_lease_state lslot LEASE_ACTIVE
+ret HB_ERR_STALE_GEN
+end
+if ne get hb_lease_gen lslot gen
+ret HB_ERR_STALE_GEN
+end
+if ne get hb_lease_agent lslot agent_id
+ret HB_ERR_WRONG_OWNER
+end
+aslot = hb_find_agent agent_id
+if lt aslot 0
+ret HB_ERR_UNKNOWN_AGENT
+end
+if ne get hb_agent_state ulong aslot AGENT_ALIVE
+ret HB_ERR_AGENT_EXPIRED
+end
+ret HB_OK
+end
+
+fn hb_renew_lease task_id ulong agent_id ulong gen ulong to ulong
+chk = hb_verify_lease task_id agent_id gen
+if ne chk HB_OK
+ret chk
+end
+lfind = hb_find_lease task_id
+lslot = ulong lfind
+now = get hb_meta 0
+put hb_lease_expires lslot add now get hb_meta 6
+ret HB_OK
+end
+
+fn hb_release_lease task_id ulong agent_id ulong gen ulong to ulong
+chk = hb_verify_lease task_id agent_id gen
+if ne chk HB_OK
+ret chk
+end
+lfind = hb_find_lease task_id
+lslot = ulong lfind
+put hb_lease_state lslot LEASE_RELEASED
+act = get hb_meta 4
+if gt act 0
+put hb_meta 4 sub act 1
+end
+aslot = hb_find_agent agent_id
+if ge aslot 0
+aidx = ulong aslot
+aa = get hb_agent_active aidx
+if gt aa 0
+put hb_agent_active aidx sub aa 1
+end
+end
+ret HB_OK
+end

@@ -1,0 +1,395 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/open-humanity/main.om: CLI processing peer assistance protocol commands and
+note distress envelopes on stdin, printing policy-checked protocol responses on stdout.
+note Compose with: si/directives/om2.om protocol/open-humanity/lib.om protocol/open-humanity/main.om
+note Stdin line grammar (comments start with #):
+note   OPTIN <0|1>
+note   NOW <ms_u64>
+note   DISTRESS <version> <peer_id> <consent> <category> <created_ms> <ttl_ms> <cap_flags> <payload...>
+note   RESOLVE <req_id> <helper_peer_id> <consent> <cap_flags> <solution...>
+note   SWEEP
+note   AUDIT
+
+text oh_cmd_optin "OPTIN"
+text oh_cmd_now "NOW"
+text oh_cmd_distress "DISTRESS"
+text oh_cmd_resolve "RESOLVE"
+text oh_cmd_sweep "SWEEP"
+text oh_cmd_audit "AUDIT"
+
+text oh_out_ok_optin "OK OPTIN="
+text oh_out_ok_now "OK NOW="
+text oh_out_ok_enq "OK ENQUEUED req_id="
+text oh_out_dig " digest="
+text oh_out_ok_res "OK RESOLVED req_id="
+text oh_out_ok_swp "OK SWEPT count="
+text oh_out_ref "REFUSED code="
+text oh_out_rsn " reason="
+text oh_out_aud_hdr "AUDIT entries="
+text oh_out_aud_pend " pending="
+text oh_out_aud_row "AUDIT_ROW seq="
+text oh_out_aud_k " kind="
+text oh_out_aud_p " peer="
+text oh_out_aud_r " req="
+text oh_out_aud_c " code="
+text oh_out_err "ERROR bad command line\n"
+text oh_out_nl "\n"
+
+global oh_inbuf uchar 65536
+
+fn oh_read_stdin to long
+total = ulong 0
+while lt total 65536 bound 65536
+k = read 0 oh_inbuf total sub 65536 total
+if lt k 0
+ret k
+end
+if eq k 0
+break
+end
+total = add total ulong k
+end
+ret long total
+end
+
+fn oh_is_ws c uchar to bool
+ret or eq c 32 or eq c 9 eq c 13
+end
+
+fn oh_skip_ws buf view uchar * pos ulong n ulong to ulong
+p = pos
+while lt p n bound 1024
+if not oh_is_ws get buf p
+break
+end
+p = add p 1
+end
+ret p
+end
+
+fn oh_tok_end buf view uchar * pos ulong n ulong to ulong
+p = pos
+while lt p n bound 1024
+if oh_is_ws get buf p
+break
+end
+p = add p 1
+end
+ret p
+end
+
+fn oh_tok_eq buf view uchar * s ulong e ulong lit view uchar * to bool
+ln = len lit
+if ne sub e s ln
+ret false
+end
+i = ulong 0
+while lt i ln bound 64
+if ne get buf add s i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn oh_parse_u64_ok buf view uchar * s ulong e ulong to bool
+if ge s e
+ret false
+end
+if gt sub e s 20
+ret false
+end
+i = s
+while lt i e bound 24
+c = get buf i
+if or lt c 48 gt c 57
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn oh_parse_u64_val buf view uchar * s ulong e ulong to ulong
+acc = ulong 0
+i = s
+while lt i e bound 24
+d = ulong sub get buf i 48
+acc = add mul acc 10 d
+i = add i 1
+end
+ret acc
+end
+
+fn oh_next_u64 line view uchar * pos edit ulong 1 dst edit ulong 1 to bool
+n = len line
+p = oh_skip_ws line get pos 0 n
+e = oh_tok_end line p n
+if not oh_parse_u64_ok line p e
+ret false
+end
+put dst 0 oh_parse_u64_val line p e
+put pos 0 e
+ret true
+end
+
+fn oh_emit_refused code ulong to void
+ok = oh_write_all 1 oh_out_ref
+oh_write_u64 1 code
+ok = and ok oh_write_all 1 oh_out_rsn
+oh_write_reason 1 code
+ok = and ok oh_write_all 1 oh_out_nl
+if ok
+ret
+end
+end
+
+fn oh_wire_submit pol edit OhPolicy env view OhEnv payload view uchar * to void
+wire = new uchar 560 0
+parsed = new OhEnv 0 0 0 0 0 0 0 0 0
+pbuf = new uchar 512 0
+req_out = new ulong 1 0
+wn = oh_serialize_envelope env payload wire
+if eq wn 0
+oh_emit_refused OH_ERR_TRUNCATED
+ret
+end
+prc = oh_parse_envelope part wire 0 wn parsed pbuf
+if ne prc OH_OK
+oh_emit_refused prc
+ret
+end
+rc = oh_submit_distress pol parsed part pbuf 0 get parsed payload_len req_out
+if eq rc OH_OK
+ok = oh_write_all 1 oh_out_ok_enq
+oh_write_u64 1 get req_out 0
+ok = and ok oh_write_all 1 oh_out_dig
+oh_write_hex64 1 get parsed digest
+ok = and ok oh_write_all 1 oh_out_nl
+if ok
+ret
+end
+ret
+end
+oh_emit_refused rc
+end
+
+fn oh_handle_distress line view uchar * start ulong pol edit OhPolicy to bool
+pos = new ulong 1 start
+tmp = new ulong 1 0
+env = new OhEnv 0 0 0 0 0 0 0 0 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put env version get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put env peer_id get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put env consent get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put env category get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put env created_ms get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put env ttl_ms get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put env cap_flags get tmp 0
+n = len line
+ps = oh_skip_ws line get pos 0 n
+plen = ulong 0
+if lt ps n
+plen = sub n ps
+end
+if gt plen OH_MAX_PAYLOAD
+plen = OH_MAX_PAYLOAD
+end
+oh_wire_submit pol env part line ps plen
+ret true
+end
+
+fn oh_handle_resolve line view uchar * start ulong pol edit OhPolicy to bool
+pos = new ulong 1 start
+tmp = new ulong 1 0
+helper = new OhEnv OH_VERSION 0 0 0 0 0 0 0 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+req_id = get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put helper peer_id get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put helper consent get tmp 0
+if not oh_next_u64 line pos tmp
+ret false
+end
+put helper cap_flags get tmp 0
+n = len line
+ps = oh_skip_ws line get pos 0 n
+plen = ulong 0
+if lt ps n
+plen = sub n ps
+end
+if gt plen OH_MAX_PAYLOAD
+plen = OH_MAX_PAYLOAD
+end
+rc = oh_resolve_distress pol req_id helper part line ps plen
+if eq rc OH_OK
+ok = oh_write_all 1 oh_out_ok_res
+oh_write_u64 1 req_id
+ok = and ok oh_write_all 1 oh_out_nl
+if ok
+ret true
+end
+ret true
+end
+oh_emit_refused rc
+ret true
+end
+
+fn oh_emit_audit to void
+cnt = oh_audit_count
+pend = oh_queue_pending_count
+ok = oh_write_all 1 oh_out_aud_hdr
+oh_write_u64 1 cnt
+ok = and ok oh_write_all 1 oh_out_aud_pend
+oh_write_u64 1 pend
+ok = and ok oh_write_all 1 oh_out_nl
+i = ulong 0
+while lt i cnt bound 64
+ok = and ok oh_write_all 1 oh_out_aud_row
+oh_write_u64 1 get oh_aud_seq i
+ok = and ok oh_write_all 1 oh_out_aud_k
+oh_write_u64 1 get oh_aud_kind i
+ok = and ok oh_write_all 1 oh_out_aud_p
+oh_write_u64 1 get oh_aud_peer i
+ok = and ok oh_write_all 1 oh_out_aud_r
+oh_write_u64 1 get oh_aud_req i
+ok = and ok oh_write_all 1 oh_out_aud_c
+oh_write_u64 1 get oh_aud_code i
+ok = and ok oh_write_all 1 oh_out_nl
+i = add i 1
+end
+if ok
+ret
+end
+end
+
+fn oh_process_line line view uchar * pol edit OhPolicy to bool
+pos = new ulong 1 0
+tmp = new ulong 1 0
+n = len line
+p = oh_skip_ws line 0 n
+if ge p n
+ret true
+end
+if eq get line p 35
+ret true
+end
+e = oh_tok_end line p n
+put pos 0 e
+if oh_tok_eq line p e oh_cmd_optin
+if not oh_next_u64 line pos tmp
+ret false
+end
+v = get tmp 0
+if gt v 1
+ret false
+end
+put pol opt_in v
+ok = oh_write_all 1 oh_out_ok_optin
+oh_write_u64 1 v
+ok = and ok oh_write_all 1 oh_out_nl
+ret ok
+end
+if oh_tok_eq line p e oh_cmd_now
+if not oh_next_u64 line pos tmp
+ret false
+end
+put pol now_ms get tmp 0
+ok = oh_write_all 1 oh_out_ok_now
+oh_write_u64 1 get tmp 0
+ok = and ok oh_write_all 1 oh_out_nl
+ret ok
+end
+if oh_tok_eq line p e oh_cmd_distress
+ret oh_handle_distress line e pol
+end
+if oh_tok_eq line p e oh_cmd_resolve
+ret oh_handle_resolve line e pol
+end
+if oh_tok_eq line p e oh_cmd_sweep
+sw = oh_queue_sweep_expired pol
+ok = oh_write_all 1 oh_out_ok_swp
+oh_write_u64 1 sw
+ok = and ok oh_write_all 1 oh_out_nl
+ret ok
+end
+if oh_tok_eq line p e oh_cmd_audit
+oh_emit_audit
+ret true
+end
+ret false
+end
+
+fn oh_copy_line pos ulong total ulong dst edit uchar 768 to ulong
+cnt = ulong 0
+p = pos
+while lt p total bound 768
+c = get oh_inbuf p
+if eq c 10
+break
+end
+if lt cnt 768
+put dst cnt c
+cnt = add cnt 1
+end
+p = add p 1
+end
+ret cnt
+end
+
+fn main to int
+got = oh_read_stdin
+if lt got 0
+ret 1
+end
+total = ulong got
+pol = new OhPolicy 0 0 1 0 0
+oh_reset_state pol
+line = new uchar 768 0
+pos = ulong 0
+while lt pos total bound 65536
+ln = oh_copy_line pos total line
+if not oh_process_line part line 0 ln pol
+oke = oh_write_all 2 oh_out_err
+if oke
+ret 1
+end
+ret 1
+end
+pos = add pos ln
+if lt pos total
+if eq get oh_inbuf pos 10
+pos = add pos 1
+end
+end
+end
+ret 0
+end

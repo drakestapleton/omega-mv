@@ -1,0 +1,654 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/aegis/main.om: Standalone AEGIS runtime CLI entrypoint over stdin/stdout (pure OM-2).
+note Compose with:
+note   si/directives/om2.om om/tls/sha2.om core/aegis/dag.om core/aegis/heartbeat.om
+note   core/aegis/policy.om core/aegis/journal.om core/aegis/gateway.om core/aegis/main.om
+note
+note Line commands (stdin):
+note   INIT <max_conc> <agent_ttl> <lease_ttl>
+note   TOKEN <32..64_ascii_token>
+note   AGENT <agent_id> <cap>
+note   REQ <METHOD> <PATH> <TOKEN_OR_-> [BODY...]
+note   LEASE <task_id> <agent_id>
+note   RENEW <task_id> <agent_id> <gen>
+note   DONE <task_id> <agent_id> <gen>
+note   FAIL <task_id> <agent_id> <gen> <fail_code>
+note   TICK <tick>
+note   VERIFY
+note   QUIT
+
+text cli_cmd_init "INIT"
+text cli_cmd_tok "TOKEN"
+text cli_cmd_agent "AGENT"
+text cli_cmd_req "REQ"
+text cli_cmd_lease "LEASE"
+text cli_cmd_renew "RENEW"
+text cli_cmd_done "DONE"
+text cli_cmd_fail "FAIL"
+text cli_cmd_tick "TICK"
+text cli_cmd_verify "VERIFY"
+text cli_cmd_quit "QUIT"
+text cli_dash "-"
+text cli_ok "OK\n"
+text cli_err "ERR "
+text cli_status "STATUS "
+text cli_leased "LEASED gen="
+text cli_tick_out "TICK "
+text cli_recl " reclaimed="
+text cli_chain_ok "CHAIN OK seq="
+text cli_chain_err "CHAIN ERR "
+text cli_nl "\n"
+text cli_jrn_cli "cli"
+
+global cli_line uchar 1024
+global cli_inbuf uchar 1024
+global cli_outbuf uchar 256
+
+fn cli_write_all buf view uchar * n ulong to void
+off = ulong 0
+while lt off n bound 1024
+k = write 1 buf off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn cli_write_u64 v ulong to void
+buf = new uchar 24 0
+if eq v 0
+put buf 0 uchar 48
+cli_write_all part buf 0 1 1
+ret
+end
+tmp = new uchar 24 0
+cnt = ulong 0
+x = v
+while gt x 0 bound 24
+put tmp cnt uchar add 48 rem x 10
+cnt = add cnt 1
+x = div x 10
+end
+for i ulong cnt bound 24
+put buf i get tmp sub sub cnt 1 i
+end
+cli_write_all part buf 0 cnt cnt
+end
+
+fn cli_print_err code ulong to void
+cli_write_all cli_err len cli_err
+cli_write_u64 code
+cli_write_all cli_nl len cli_nl
+end
+
+fn cli_write_gw_resp to void
+n = gw_resp_len
+off = ulong 0
+while lt off n bound 1024
+k = write 1 gw_resp off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+cli_write_all cli_nl len cli_nl
+end
+
+note Skip spaces starting at pos in cli_line[0..llen).
+fn cli_skip_sp pos ulong llen ulong to ulong
+p = pos
+while lt p llen bound 1024
+if or eq get cli_line p 32 eq get cli_line p 9
+p = add p 1
+else
+break
+end
+end
+ret p
+end
+
+note Find end of whitespace-delimited token starting at pos.
+fn cli_tok_end pos ulong llen ulong to ulong
+p = pos
+while lt p llen bound 1024
+c = get cli_line p
+if or eq c 32 or eq c 9 or eq c 10 eq c 13
+break
+end
+p = add p 1
+end
+ret p
+end
+
+fn cli_tok_eq start ulong endp ulong s view uchar * to bool
+tlen = sub endp start
+if ne tlen len s
+ret false
+end
+for i ulong tlen bound 64
+if ne get cli_line add start i get s i
+ret false
+end
+end
+ret true
+end
+
+note Parse decimal u64 from cli_line[start..endp). Writes value to dst[0]; returns true iff valid.
+fn cli_parse_u64 start ulong endp ulong dst edit ulong 1 to bool
+put dst 0 0
+if ge start endp
+ret false
+end
+n = sub endp start
+if gt n 19
+ret false
+end
+v = ulong 0
+for i ulong n bound 20
+c = get cli_line add start i
+if or lt c 48 gt c 57
+ret false
+end
+v = add mul v 10 ulong sub c 48
+end
+put dst 0 v
+ret true
+end
+
+fn cli_exec_init p0 ulong llen ulong to void
+a1 = new ulong 1 0
+a2 = new ulong 1 0
+a3 = new ulong 1 0
+p = cli_skip_sp p0 llen
+e1 = cli_tok_end p llen
+if not cli_parse_u64 p e1 a1
+cli_print_err 1
+ret
+end
+p = cli_skip_sp e1 llen
+e2 = cli_tok_end p llen
+if not cli_parse_u64 p e2 a2
+cli_print_err 1
+ret
+end
+p = cli_skip_sp e2 llen
+e3 = cli_tok_end p llen
+if not cli_parse_u64 p e3 a3
+cli_print_err 1
+ret
+end
+dag_reset
+jrn_reset
+gw_reset
+rc = hb_init get a1 0 get a2 0 get a3 0
+if ne rc HB_OK
+cli_print_err rc
+ret
+end
+cli_write_all cli_ok len cli_ok
+end
+
+fn cli_exec_token p0 ulong llen ulong to void
+p = cli_skip_sp p0 llen
+e = cli_tok_end p llen
+tlen = sub e p
+if or eq tlen 0 gt tlen 64
+cli_print_err POL_DENY_BAD_TOKEN
+ret
+end
+tb = new uchar 64 0
+for i ulong tlen bound 64
+put tb i get cli_line add p i
+end
+rc = pol_set_operator_token part tb 0 tlen
+if ne rc POL_ALLOW
+cli_print_err rc
+ret
+end
+cli_write_all cli_ok len cli_ok
+end
+
+fn cli_exec_agent p0 ulong llen ulong to void
+a1 = new ulong 1 0
+a2 = new ulong 1 0
+p = cli_skip_sp p0 llen
+e1 = cli_tok_end p llen
+if not cli_parse_u64 p e1 a1
+cli_print_err 1
+ret
+end
+p = cli_skip_sp e1 llen
+e2 = cli_tok_end p llen
+if not cli_parse_u64 p e2 a2
+cli_print_err 1
+ret
+end
+rc = hb_register_agent get a1 0 get a2 0
+if ne rc HB_OK
+cli_print_err rc
+ret
+end
+cli_write_all cli_ok len cli_ok
+end
+
+fn cli_req_stage1 p0 ulong llen ulong to long
+mb = new uchar 16 0
+pb = new uchar 128 0
+p = cli_skip_sp p0 llen
+e1 = cli_tok_end p llen
+mlen = sub e1 p
+if or eq mlen 0 gt mlen 16
+cli_print_err 400
+ret -1
+end
+for i ulong mlen bound 16
+put mb i get cli_line add p i
+end
+p = cli_skip_sp e1 llen
+e2 = cli_tok_end p llen
+plen = sub e2 p
+if or eq plen 0 gt plen 128
+cli_print_err 400
+ret -1
+end
+for i ulong plen bound 128
+put pb i get cli_line add p i
+end
+rt = gw_req_begin part mb 0 mlen part pb 0 plen
+if gt rt 999
+cli_print_err 400
+ret -1
+end
+ret long e2
+end
+
+fn cli_req_stage2 p0 ulong llen ulong to long
+tb = new uchar 64 0
+p = cli_skip_sp p0 llen
+e3 = cli_tok_end p llen
+tlen = sub e3 p
+if gt tlen 64
+cli_print_err 401
+ret -1
+end
+if cli_tok_eq p e3 cli_dash
+tlen = 0
+else
+for i ulong tlen bound 64
+put tb i get cli_line add p i
+end
+end
+gw_req_auth 0 ROLE_OPERATOR part tb 0 tlen true
+ret long e3
+end
+
+fn cli_exec_req p0 ulong llen ulong to void
+bb = new uchar 512 0
+n1 = cli_req_stage1 p0 llen
+if lt n1 0
+ret
+end
+n2 = cli_req_stage2 ulong n1 llen
+if lt n2 0
+ret
+end
+p = cli_skip_sp ulong n2 llen
+blen = sub llen p
+if gt blen 512
+blen = 512
+end
+for i ulong blen bound 512
+put bb i get cli_line add p i
+end
+st = gw_req_dispatch part bb 0 blen
+cli_write_all cli_status len cli_status
+cli_write_u64 st
+cli_write_all cli_nl len cli_nl
+cli_write_gw_resp
+end
+
+fn cli_lease_apply tid ulong aid ulong to void
+gen = new ulong 1 0
+rdy = dag_solve_ready
+if gt rdy DAG_MAX_TASKS
+cli_print_err 1
+ret
+end
+if ne dag_get_state tid TASK_READY
+cli_print_err DAG_ERR_INVALID_TRANSITION
+ret
+end
+lrc = hb_acquire_lease tid aid gen
+if ne lrc HB_OK
+cli_print_err lrc
+ret
+end
+src = dag_start_task tid
+if ne src DAG_OK
+rl = hb_release_lease tid aid get gen 0
+if gt rl 999
+cli_print_err rl
+ret
+end
+cli_print_err src
+ret
+end
+j1 = jrn_append EVT_LEASE_ACQUIRED tid get gen 0 hb_current_tick cli_jrn_cli
+if ne j1 JRN_OK
+cli_print_err JRN_ERR_FULL
+ret
+end
+j2 = jrn_append EVT_TASK_STARTED tid aid hb_current_tick cli_jrn_cli
+if ne j2 JRN_OK
+cli_print_err JRN_ERR_FULL
+ret
+end
+cli_write_all cli_leased len cli_leased
+cli_write_u64 get gen 0
+cli_write_all cli_nl len cli_nl
+end
+
+fn cli_exec_lease p0 ulong llen ulong to void
+a = new ulong 1 0
+p = cli_skip_sp p0 llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+tid = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+cli_lease_apply tid get a 0
+end
+
+fn cli_exec_renew p0 ulong llen ulong to void
+a = new ulong 1 0
+p = cli_skip_sp p0 llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+tid = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+aid = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+rc = hb_renew_lease tid aid get a 0
+if ne rc HB_OK
+cli_print_err rc
+ret
+end
+cli_write_all cli_ok len cli_ok
+end
+
+fn cli_done_apply tid ulong aid ulong gen ulong to void
+vrc = hb_verify_lease tid aid gen
+if ne vrc HB_OK
+cli_print_err vrc
+ret
+end
+drc = dag_complete_task tid
+if ne drc DAG_OK
+cli_print_err drc
+ret
+end
+rrc = hb_release_lease tid aid gen
+if ne rrc HB_OK
+cli_print_err rrc
+ret
+end
+jrc = jrn_append EVT_TASK_DONE tid gen hb_current_tick cli_jrn_cli
+if ne jrc JRN_OK
+cli_print_err jrc
+ret
+end
+cli_write_all cli_ok len cli_ok
+end
+
+fn cli_exec_done p0 ulong llen ulong to void
+a = new ulong 1 0
+p = cli_skip_sp p0 llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+tid = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+aid = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+cli_done_apply tid aid get a 0
+end
+
+fn cli_fail_apply tid ulong aid ulong gen ulong fc ulong to void
+vrc = hb_verify_lease tid aid gen
+if ne vrc HB_OK
+cli_print_err vrc
+ret
+end
+drc = dag_fail_task tid fc
+if ne drc DAG_OK
+cli_print_err drc
+ret
+end
+rrc = hb_release_lease tid aid gen
+if ne rrc HB_OK
+cli_print_err rrc
+ret
+end
+jrc = jrn_append EVT_TASK_FAILED tid fc hb_current_tick cli_jrn_cli
+if ne jrc JRN_OK
+cli_print_err jrc
+ret
+end
+cli_write_all cli_ok len cli_ok
+end
+
+fn cli_exec_fail p0 ulong llen ulong to void
+a = new ulong 1 0
+p = cli_skip_sp p0 llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+tid = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+aid = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+gen = get a 0
+p = cli_skip_sp e llen
+e = cli_tok_end p llen
+if not cli_parse_u64 p e a
+cli_print_err 1
+ret
+end
+cli_fail_apply tid aid gen get a 0
+end
+
+fn cli_exec_tick p0 ulong llen ulong to void
+a1 = new ulong 1 0
+p = cli_skip_sp p0 llen
+e1 = cli_tok_end p llen
+if not cli_parse_u64 p e1 a1
+cli_print_err 1
+ret
+end
+tk = get a1 0
+rc = hb_tick tk
+if ne rc HB_OK
+cli_print_err rc
+ret
+end
+recl = hb_last_reclaimed
+for i ulong recl bound 128
+rtid = hb_get_reclaimed i
+if eq dag_get_state rtid TASK_RUNNING
+q = dag_requeue_task rtid
+if eq q DAG_OK
+j1 = jrn_append EVT_LEASE_RECLAIMED rtid tk tk cli_jrn_cli
+if ne j1 JRN_OK
+cli_print_err j1
+ret
+end
+end
+end
+end
+j2 = jrn_append EVT_HEARTBEAT_TICK 0 recl tk cli_jrn_cli
+if ne j2 JRN_OK
+cli_print_err j2
+ret
+end
+cli_write_all cli_tick_out len cli_tick_out
+cli_write_u64 tk
+cli_write_all cli_recl len cli_recl
+cli_write_u64 recl
+cli_write_all cli_nl len cli_nl
+end
+
+fn cli_exec_verify to void
+rc = jrn_verify_chain
+if ne rc JRN_OK
+cli_write_all cli_chain_err len cli_chain_err
+cli_write_u64 rc
+cli_write_all cli_nl len cli_nl
+ret
+end
+cli_write_all cli_chain_ok len cli_chain_ok
+cli_write_u64 jrn_last_seq
+cli_write_all cli_nl len cli_nl
+end
+
+note Process one line in cli_line[0..llen). Returns true if QUIT requested.
+fn cli_process_line llen ulong to bool
+p = cli_skip_sp 0 llen
+if ge p llen
+ret false
+end
+e = cli_tok_end p llen
+if cli_tok_eq p e cli_cmd_quit
+ret true
+end
+if cli_tok_eq p e cli_cmd_init
+cli_exec_init e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_tok
+cli_exec_token e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_agent
+cli_exec_agent e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_req
+cli_exec_req e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_lease
+cli_exec_lease e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_renew
+cli_exec_renew e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_done
+cli_exec_done e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_fail
+cli_exec_fail e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_tick
+cli_exec_tick e llen
+ret false
+end
+if cli_tok_eq p e cli_cmd_verify
+cli_exec_verify
+ret false
+end
+cli_print_err 400
+ret false
+end
+
+fn main to int
+dag_reset
+pol_reset
+jrn_reset
+gw_reset
+init_rc = hb_init 4 3 5
+if ne init_rc HB_OK
+ret 1
+end
+llen = ulong 0
+done = false
+while not done bound 4096
+k = read 0 cli_inbuf 0 1024
+if le k 0
+if gt llen 0
+q = cli_process_line llen
+if q
+done = true
+end
+end
+break
+end
+cnt = ulong k
+for i ulong cnt bound 1024
+b = get cli_inbuf i
+if eq b 10
+if cli_process_line llen
+done = true
+break
+end
+llen = 0
+else
+if ne b 13
+if lt llen 1024
+put cli_line llen b
+llen = add llen 1
+end
+end
+end
+end
+end
+ret 0
+end

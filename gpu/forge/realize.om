@@ -1,0 +1,880 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/forge/realize.om: Deterministic FORGE realization planner, AEGIS
+note integrity token sealing/verification, and canonical receipt emitter.
+note Ported from physics-mv (forge/forge_realize.{h,c}, forge/v2/forge_substrate_v2.c).
+note Composable OM-2 library module (compose after hardware.om, envelope.om, provider.om).
+
+note ---- Canonical Output Text Labels ----
+text fg_t_rcpt_hdr "FORGE_RECEIPT_V1\n"
+text fg_t_rcpt_end "FORGE_RECEIPT_END\n"
+text fg_t_dec_adm "decision=ADMITTED\n"
+text fg_t_dec_ref "decision=REFUSED\n"
+text fg_t_status "status="
+text fg_t_viol "violation="
+text fg_t_req_id "req_id="
+text fg_t_sp_op " op="
+text fg_t_sp_dt " dtype="
+text fg_t_sp_sh " shape="
+text fg_t_x "x"
+text fg_t_nl "\n"
+text fg_t_dot "."
+text fg_t_prov "provider="
+text fg_t_sp_hw " hw="
+text fg_t_sp_sub " substrate="
+text fg_t_sp_qual " qual="
+text fg_t_sp_low " lowering="
+text fg_t_geom "geometry tile="
+text fg_t_sp_grid " grid="
+text fg_t_sp_blk " block="
+text fg_t_sp_ctas " ctas="
+text fg_t_sp_wav " waves="
+text fg_t_phys "physics ws_bytes="
+text fg_t_sp_tr " traffic_bytes="
+text fg_t_sp_fl " flops="
+text fg_t_sp_bnd " bound="
+text fg_t_comp "COMPUTE\n"
+text fg_t_bw "BANDWIDTH\n"
+text fg_t_roof "roofline time_us="
+text fg_t_sp_ai " ai_flops_per_byte="
+text fg_t_sp_pw " power_w="
+text fg_t_sp_en " energy_mj="
+text fg_t_reqd "req_digest="
+text fg_t_descd "desc_digest="
+text fg_t_planid "plan_id="
+text fg_t_seal "aegis_seal="
+
+text fg_t_s_ok "OK"
+text fg_t_s_bhw "BLOCKED_HARDWARE"
+text fg_t_s_nr "NOT_RUN"
+text fg_t_s_np "NO_MATCHING_PROVIDER"
+text fg_t_s_env "ENVELOPE_VIOLATION"
+text fg_t_s_cst "CAL_STALE"
+text fg_t_s_cen "CAL_OUT_OF_ENVELOPE"
+text fg_t_s_flt "PROVIDER_FAULTED"
+text fg_t_s_erk "ERROR_KIND_TOO_LOOSE"
+text fg_t_s_ndf "NO_DIGITAL_FALLBACK"
+text fg_t_s_qfl "QUEUE_EXHAUSTED"
+text fg_t_s_unk "UNKNOWN"
+
+text fg_t_v_none "NONE"
+text fg_t_v_ihw "INVALID_HW_DESC"
+text fg_t_v_idim "INVALID_DIMS"
+text fg_t_v_uop "UNSUPPORTED_OP"
+text fg_t_v_udt "UNSUPPORTED_DTYPE"
+text fg_t_v_oom "OOM_WORKING_SET"
+text fg_t_v_smem "SMEM_EXCEEDED"
+text fg_t_v_gpr "GPR_EXCEEDED"
+text fg_t_v_thr "THREADS_EXCEEDED"
+text fg_t_v_wav "WAVE_SM_CAP_EXCEEDED"
+text fg_t_v_thm "THERMAL_CEILING_EXCEEDED"
+text fg_t_v_pwr "POWER_CEILING_EXCEEDED"
+text fg_t_v_lat "LATENCY_BUDGET_EXCEEDED"
+text fg_t_v_eng "ENERGY_BUDGET_EXCEEDED"
+
+text fg_t_op_mv "MATVEC"
+text fg_t_op_mm "MATMUL"
+text fg_t_op_cv "CONV"
+text fg_t_op_ew "ELEMENTWISE"
+text fg_t_op_rd "REDUCTION"
+text fg_t_op_sp "SPIKE_INTEGRATE"
+text fg_t_op_tr "TRANSFORM"
+text fg_t_op_sm "SAMPLE"
+text fg_t_op_gn "GENERAL"
+
+text fg_t_dt_f32 "FP32"
+text fg_t_dt_f16 "FP16"
+text fg_t_dt_bf16 "BF16"
+text fg_t_dt_f8 "FP8"
+text fg_t_dt_i8 "INT8"
+text fg_t_dt_i32 "INT32"
+text fg_t_dt_u64 "U64"
+text fg_t_dt_f64 "FP64"
+
+text fg_t_hw_gb10 "dgx-spark-gb10-sm_121"
+text fg_t_hw_grace "aarch64-grace-cpu"
+text fg_t_hw_gcpu "generic-aarch64-cpu"
+text fg_t_hw_asim "analog-in-memory-sim"
+text fg_t_hw_ugpu "unqualified-discrete-gpu"
+text fg_t_hw_opt "optical-photonic-sim"
+text fg_t_hw_none "none"
+
+text fg_t_sub_cpu "DIGITAL_CPU"
+text fg_t_sub_gpu "DIGITAL_GPU"
+text fg_t_sub_ana "ANALOG_IN_MEMORY"
+text fg_t_sub_neu "NEUROMORPHIC_SPIKING"
+text fg_t_sub_fpg "FPGA_CGRA_DATAFLOW"
+text fg_t_sub_opt "OPTICAL_PHOTONIC"
+
+text fg_t_q_qual "QUALIFIED"
+text fg_t_q_exer "EXERCISED"
+text fg_t_q_sim "SIMULATED"
+text fg_t_q_bhw "BLOCKED_HARDWARE"
+text fg_t_q_nr "NOT_RUN"
+text fg_t_q_flt "FAULTED"
+
+text fg_t_l_none "NONE"
+text fg_t_l_sim "SIMULATED"
+text fg_t_l_cmp "COMPILED"
+
+note ---- Safe I/O & Formatting Helpers ----
+
+fn fg_write_all fd int buf view uchar * to void
+n = len buf
+off = ulong 0
+while lt off n bound 4096
+k = write fd buf off sub n off
+if le k 0
+ret
+end
+off = add off ulong k
+end
+ret
+end
+
+fn fg_write_u64 fd int v ulong to void
+buf = new uchar 24 0
+if eq v 0
+put buf 0 uchar 48
+fg_write_all fd part buf 0 1
+ret
+end
+tmp = new uchar 24 0
+cnt = ulong 0
+x = v
+while gt x 0 bound 24
+d = rem x 10
+put tmp cnt uchar add d 48
+x = div x 10
+cnt = add cnt 1
+end
+i = ulong 0
+while lt i cnt bound 24
+put buf i get tmp sub sub cnt 1 i
+i = add i 1
+end
+fg_write_all fd part buf 0 cnt
+ret
+end
+
+fn fg_write_f64_3 fd int v f64 to void
+val = v
+if lt val 0.0f64
+val = 0.0f64
+end
+sc = ulong add mul val 1000.0f64 0.5f64
+wh = div sc 1000
+fr = rem sc 1000
+fg_write_u64 fd wh
+fg_write_all fd fg_t_dot
+d = new uchar 3 0
+put d 0 uchar add div fr 100 48
+put d 1 uchar add rem div fr 10 10 48
+put d 2 uchar add rem fr 10 48
+fg_write_all fd d
+ret
+end
+
+fn fg_write_f64_2 fd int v f64 to void
+val = v
+if lt val 0.0f64
+val = 0.0f64
+end
+sc = ulong add mul val 100.0f64 0.5f64
+wh = div sc 100
+fr = rem sc 100
+fg_write_u64 fd wh
+fg_write_all fd fg_t_dot
+d = new uchar 2 0
+put d 0 uchar add div fr 10 48
+put d 1 uchar add rem fr 10 48
+fg_write_all fd d
+ret
+end
+
+fn fg_write_hex32 fd int d view uchar 32 to void
+hex = new uchar 64 0
+fg_digest_to_hex d hex
+fg_write_all fd hex
+ret
+end
+
+note ---- Canonical Request, Plan & AEGIS Seal Digests ----
+
+fn fg_req_digest req view ForgeContract bud view ForgeBudget dst edit uchar 32 to void
+buf = new uchar 128 0
+put buf 0 uchar 70
+put buf 1 uchar 71
+put buf 2 uchar 45
+put buf 3 uchar 82
+put buf 4 uchar 69
+put buf 5 uchar 81
+put buf 6 uchar 45
+put buf 7 uchar 49
+fg_put_u64 buf 8 get req req_id
+fg_put_u32 buf 16 get req op_class
+fg_put_u32 buf 20 get req dtype
+fg_put_u64 buf 24 get req dim_m
+fg_put_u64 buf 32 get req dim_n
+fg_put_u64 buf 40 get req dim_k
+fg_put_u64 buf 48 get req batch
+fg_put_u32 buf 56 get req cta_req
+fg_put_u32 buf 60 get req thr_req
+fg_put_u32 buf 64 get req smem_req
+fg_put_u32 buf 68 get req gpr_req
+fg_put_u64 buf 72 get req extra_ws
+fg_put_u32 buf 80 get req error_kind
+fg_put_u32 buf 84 get req req_substrate
+fg_put_u32 buf 88 get req req_qual
+fg_put_u32 buf 92 get req req_wave_cap
+fg_put_u64 buf 96 ulong mul get bud lat_us 1000.0f64
+fg_put_u64 buf 104 ulong mul get bud energy_mj 1000.0f64
+fg_put_u32 buf 112 uint get bud temp_mc
+fg_put_u32 buf 116 uint ulong mul get bud power_w 1000.0f64
+fg_put_u64 buf 120 get bud now_epoch_s
+fg_sha256 buf dst
+ret
+end
+
+note AEGIS domain-separation token matching physics-mv/forge/forge_realize.c:31-51
+fn fg_aegis_compute_token plan view ForgePlan seals view ForgeSeals dst edit uchar 32 to void
+buf = new uchar 116 0
+put buf 0 uchar 0xae
+put buf 1 uchar 0x91
+put buf 2 uchar 0x50
+put buf 3 uchar 0x24
+put buf 4 uchar 0x76
+put buf 5 uchar 0x65
+put buf 6 uchar 0x72
+put buf 7 uchar 0x69
+put buf 8 uchar 0x66
+put buf 9 uchar 0x69
+put buf 10 uchar 0x65
+put buf 11 uchar 0x64
+put buf 12 uchar 0x63
+put buf 13 uchar 0x6f
+put buf 14 uchar 0x64
+put buf 15 uchar 0x65
+pid = new uchar 32 0
+dh = new uchar 32 0
+rh = new uchar 32 0
+fg_seals_get_plan seals pid
+fg_seals_get_desc seals dh
+fg_seals_get_req seals rh
+fg_copy_bytes buf 16 pid 32
+fg_copy_bytes buf 48 dh 32
+fg_copy_bytes buf 80 rh 32
+fg_put_u32 buf 112 get plan lowering_kind
+fg_sha256 buf dst
+ret
+end
+
+fn fg_aegis_verify_seal plan view ForgePlan seals view ForgeSeals to bool
+if ne get plan admitted 1
+ret false
+end
+if gt get plan lowering_kind FG_LOW_COMPILED
+ret false
+end
+exp = new uchar 32 0
+got = new uchar 32 0
+fg_aegis_compute_token plan seals exp
+fg_seals_get_tok seals got
+ret fg_bytes_eq exp got 32
+end
+
+fn fg_plan_compute_id plan view ForgePlan env view ForgeEnvCheck seals edit ForgeSeals to void
+buf = new uchar 160 0
+put buf 0 uchar 70
+put buf 1 uchar 79
+put buf 2 uchar 82
+put buf 3 uchar 71
+put buf 4 uchar 69
+put buf 5 uchar 45
+put buf 6 uchar 80
+put buf 7 uchar 76
+put buf 8 uchar 65
+put buf 9 uchar 78
+put buf 10 uchar 45
+put buf 11 uchar 86
+put buf 12 uchar 49
+put buf 13 uchar 0
+put buf 14 uchar 0
+put buf 15 uchar 0
+rh = new uchar 32 0
+dh = new uchar 32 0
+fg_seals_get_req seals rh
+fg_seals_get_desc seals dh
+fg_copy_bytes buf 16 rh 32
+fg_copy_bytes buf 48 dh 32
+fg_put_u32 buf 80 get plan admitted
+fg_put_u32 buf 84 get plan status
+fg_put_u32 buf 88 get plan violation
+fg_put_u32 buf 92 get plan prov_id
+fg_put_u32 buf 96 get plan hw_id
+fg_put_u32 buf 100 get plan tile_m
+fg_put_u32 buf 104 get plan tile_n
+fg_put_u32 buf 108 get plan tile_k
+fg_put_u32 buf 112 get plan grid_x
+fg_put_u32 buf 116 get plan grid_y
+fg_put_u32 buf 120 get plan block_x
+fg_put_u32 buf 124 get plan waves
+fg_put_u64 buf 128 get env ws_bytes
+fg_put_u64 buf 136 get env traffic_bytes
+fg_put_u64 buf 144 get env flops
+fg_put_u32 buf 152 get plan lowering_kind
+fg_put_u32 buf 156 get plan qual_status
+pid = new uchar 32 0
+fg_sha256 buf pid
+fg_seals_put_plan seals pid
+ret
+end
+
+note ---- Deterministic Tile & Wave Launch Geometry ----
+
+fn fg_plan_reset plan edit ForgePlan to void
+put plan admitted uint 0
+put plan status FG_ADMIT_NO_PROVIDER
+put plan violation FG_ENV_OK
+put plan prov_id uint 0
+put plan hw_id uint 0
+put plan substrate_class uint 0
+put plan qual_status uint 0
+put plan lowering_kind FG_LOW_NONE
+put plan tile_m uint 0
+put plan tile_n uint 0
+put plan tile_k uint 0
+put plan grid_x uint 0
+put plan grid_y uint 0
+put plan block_x uint 0
+put plan waves uint 0
+put plan compute_bound uint 0
+ret
+end
+
+fn fg_seals_zero seals edit ForgeSeals to void
+z = new uchar 32 0
+fg_seals_put_plan seals z
+fg_seals_put_desc seals z
+fg_seals_put_req seals z
+fg_seals_put_tok seals z
+ret
+end
+
+fn fg_plan_tiles hid view ForgeHwId req view ForgeContract plan edit ForgePlan to void
+sc = get hid substrate_class
+dt = get req dtype
+tm = uint 64
+tn = uint 64
+tk = uint 32
+if eq sc FG_SUB_DIGITAL_GPU
+if or eq dt FG_DT_FP8 eq dt FG_DT_INT8
+tm = uint 128
+tn = uint 128
+tk = uint 64
+else
+if or eq dt FG_DT_FP16 eq dt FG_DT_BF16
+tm = uint 128
+tn = uint 128
+tk = uint 32
+else
+if or eq dt FG_DT_FP32 eq dt FG_DT_INT32
+tm = uint 64
+tn = uint 64
+tk = uint 16
+else
+tm = uint 32
+tn = uint 32
+tk = uint 8
+end
+end
+end
+else
+if eq sc FG_SUB_ANALOG_IN_MEMORY
+tm = uint 64
+tn = uint 64
+tk = uint 64
+end
+end
+put plan tile_m tm
+put plan tile_n tn
+put plan tile_k tk
+ret
+end
+
+fn fg_plan_geometry hid view ForgeHwId req view ForgeContract env view ForgeEnvCheck plan edit ForgePlan to void
+fg_plan_tiles hid req plan
+tm = ulong get plan tile_m
+tn = ulong get plan tile_n
+gx64 = div add get req dim_n sub tn 1 tn
+gy64 = div add get req dim_m sub tm 1 tm
+if eq gx64 0
+gx64 = ulong 1
+end
+if eq gy64 0
+gy64 = ulong 1
+end
+gx = uint 65535
+if lt gx64 65535
+gx = uint gx64
+end
+gy = uint 65535
+if lt gy64 65535
+gy = uint gy64
+end
+sm = get hid sm_count
+if eq get req req_wave_cap 1
+if gt mul ulong gx ulong gy ulong sm
+gx = sm
+gy = uint 1
+end
+end
+put plan grid_x gx
+put plan grid_y gy
+put plan block_x get env eff_thr
+put plan waves get env waves
+put plan compute_bound get env compute_bound
+ret
+end
+
+fn fg_realize_finalize req view ForgeContract adm view ForgeAdmit plan edit ForgePlan env view ForgeEnvCheck seals edit ForgeSeals to void
+win = new ForgeProvider 0 0 0 0 0 0 0 0 0 0 0 0 0
+hid = new ForgeHwId 0 0 0 0 0 0 0 0 0 0 0 0
+hcap = new ForgeHwCap 0 0 0 0 0.0f64 0.0f64 0 0 0 0.0f64 0 0
+dh = new uchar 32 0
+tok = new uchar 32 0
+put plan prov_id get adm prov_id
+put plan hw_id get adm hw_id
+if fg_reg_find_by_id get adm prov_id win
+put plan substrate_class get win substrate_class
+put plan qual_status get win qual_status
+put plan lowering_kind get win lowering_kind
+end
+if fg_hw_load_profile get adm hw_id hid hcap
+fg_hw_digest hid hcap dh
+fg_seals_put_desc seals dh
+fg_plan_geometry hid req env plan
+end
+fg_plan_compute_id plan env seals
+fg_aegis_compute_token plan seals tok
+fg_seals_put_tok seals tok
+ret
+end
+
+note Main deterministic realization planner entry point
+fn fg_realize_plan req view ForgeContract bud view ForgeBudget plan edit ForgePlan env edit ForgeEnvCheck seals edit ForgeSeals to uint
+fg_plan_reset plan
+fg_seals_zero seals
+adm = new ForgeAdmit 0 0 0 0 0 0 0
+rh = new uchar 32 0
+rc = fg_prov_admit req bud adm env
+fg_req_digest req bud rh
+fg_seals_put_req seals rh
+put plan admitted get adm admitted
+put plan status get adm status
+put plan violation get adm env_viol
+if eq get adm admitted 1
+fg_realize_finalize req adm plan env seals
+else
+fg_plan_compute_id plan env seals
+end
+ret rc
+end
+
+note ---- Named Token Printers for Canonical Receipts ----
+
+fn fg_emit_status_name fd int st uint to void
+if eq st FG_ADMIT_OK
+fg_write_all fd fg_t_s_ok
+ret
+end
+if eq st FG_ADMIT_BLOCKED_HARDWARE
+fg_write_all fd fg_t_s_bhw
+ret
+end
+if eq st FG_ADMIT_NOT_RUN
+fg_write_all fd fg_t_s_nr
+ret
+end
+if eq st FG_ADMIT_NO_PROVIDER
+fg_write_all fd fg_t_s_np
+ret
+end
+if eq st FG_ADMIT_ENVELOPE_VIOL
+fg_write_all fd fg_t_s_env
+ret
+end
+if eq st FG_ADMIT_CAL_STALE
+fg_write_all fd fg_t_s_cst
+ret
+end
+if eq st FG_ADMIT_CAL_ENVELOPE
+fg_write_all fd fg_t_s_cen
+ret
+end
+if eq st FG_ADMIT_FAULTED
+fg_write_all fd fg_t_s_flt
+ret
+end
+if eq st FG_ADMIT_ERROR_KIND
+fg_write_all fd fg_t_s_erk
+ret
+end
+if eq st FG_ADMIT_NO_DIGITAL_FB
+fg_write_all fd fg_t_s_ndf
+ret
+end
+if eq st FG_ADMIT_QUEUE_FULL
+fg_write_all fd fg_t_s_qfl
+ret
+end
+fg_write_all fd fg_t_s_unk
+ret
+end
+
+fn fg_emit_viol_name fd int v uint to void
+if eq v FG_ENV_OK
+fg_write_all fd fg_t_v_none
+ret
+end
+if eq v FG_ENV_ERR_INVALID_HW
+fg_write_all fd fg_t_v_ihw
+ret
+end
+if eq v FG_ENV_ERR_INVALID_DIMS
+fg_write_all fd fg_t_v_idim
+ret
+end
+if eq v FG_ENV_ERR_UNSUPPORTED_OP
+fg_write_all fd fg_t_v_uop
+ret
+end
+if eq v FG_ENV_ERR_UNSUPPORTED_DTYPE
+fg_write_all fd fg_t_v_udt
+ret
+end
+if eq v FG_ENV_ERR_OOM_WORKING_SET
+fg_write_all fd fg_t_v_oom
+ret
+end
+if eq v FG_ENV_ERR_SMEM_EXCEEDED
+fg_write_all fd fg_t_v_smem
+ret
+end
+if eq v FG_ENV_ERR_GPR_EXCEEDED
+fg_write_all fd fg_t_v_gpr
+ret
+end
+if eq v FG_ENV_ERR_THREADS_EXCEEDED
+fg_write_all fd fg_t_v_thr
+ret
+end
+if eq v FG_ENV_ERR_WAVE_SM_CAP
+fg_write_all fd fg_t_v_wav
+ret
+end
+if eq v FG_ENV_ERR_THERMAL_CEILING
+fg_write_all fd fg_t_v_thm
+ret
+end
+if eq v FG_ENV_ERR_POWER_CEILING
+fg_write_all fd fg_t_v_pwr
+ret
+end
+if eq v FG_ENV_ERR_LATENCY_BUDGET
+fg_write_all fd fg_t_v_lat
+ret
+end
+if eq v FG_ENV_ERR_ENERGY_BUDGET
+fg_write_all fd fg_t_v_eng
+ret
+end
+fg_write_all fd fg_t_s_unk
+ret
+end
+
+fn fg_emit_op_name fd int op uint to void
+if eq op FG_OP_MATVEC
+fg_write_all fd fg_t_op_mv
+ret
+end
+if eq op FG_OP_MATMUL
+fg_write_all fd fg_t_op_mm
+ret
+end
+if eq op FG_OP_CONV
+fg_write_all fd fg_t_op_cv
+ret
+end
+if eq op FG_OP_ELEMENTWISE
+fg_write_all fd fg_t_op_ew
+ret
+end
+if eq op FG_OP_REDUCTION
+fg_write_all fd fg_t_op_rd
+ret
+end
+if eq op FG_OP_SPIKE_INT
+fg_write_all fd fg_t_op_sp
+ret
+end
+if eq op FG_OP_TRANSFORM
+fg_write_all fd fg_t_op_tr
+ret
+end
+if eq op FG_OP_SAMPLE
+fg_write_all fd fg_t_op_sm
+ret
+end
+if eq op FG_OP_GENERAL
+fg_write_all fd fg_t_op_gn
+ret
+end
+fg_write_all fd fg_t_s_unk
+ret
+end
+
+fn fg_emit_dt_name fd int dt uint to void
+if eq dt FG_DT_FP32
+fg_write_all fd fg_t_dt_f32
+ret
+end
+if eq dt FG_DT_FP16
+fg_write_all fd fg_t_dt_f16
+ret
+end
+if eq dt FG_DT_BF16
+fg_write_all fd fg_t_dt_bf16
+ret
+end
+if eq dt FG_DT_FP8
+fg_write_all fd fg_t_dt_f8
+ret
+end
+if eq dt FG_DT_INT8
+fg_write_all fd fg_t_dt_i8
+ret
+end
+if eq dt FG_DT_INT32
+fg_write_all fd fg_t_dt_i32
+ret
+end
+if eq dt FG_DT_U64
+fg_write_all fd fg_t_dt_u64
+ret
+end
+if eq dt FG_DT_FP64
+fg_write_all fd fg_t_dt_f64
+ret
+end
+fg_write_all fd fg_t_s_unk
+ret
+end
+
+fn fg_emit_hw_name fd int hid uint to void
+if eq hid FG_HW_GB10_SM121
+fg_write_all fd fg_t_hw_gb10
+ret
+end
+if eq hid FG_HW_AARCH64_GRACE
+fg_write_all fd fg_t_hw_grace
+ret
+end
+if eq hid FG_HW_GENERIC_CPU
+fg_write_all fd fg_t_hw_gcpu
+ret
+end
+if eq hid FG_HW_ANALOG_SIM
+fg_write_all fd fg_t_hw_asim
+ret
+end
+if eq hid FG_HW_UNQUAL_GPU
+fg_write_all fd fg_t_hw_ugpu
+ret
+end
+if eq hid FG_HW_OPTICAL_SIM
+fg_write_all fd fg_t_hw_opt
+ret
+end
+fg_write_all fd fg_t_hw_none
+ret
+end
+
+fn fg_emit_sub_name fd int sc uint to void
+if eq sc FG_SUB_DIGITAL_CPU
+fg_write_all fd fg_t_sub_cpu
+ret
+end
+if eq sc FG_SUB_DIGITAL_GPU
+fg_write_all fd fg_t_sub_gpu
+ret
+end
+if eq sc FG_SUB_ANALOG_IN_MEMORY
+fg_write_all fd fg_t_sub_ana
+ret
+end
+if eq sc FG_SUB_NEUROMORPHIC
+fg_write_all fd fg_t_sub_neu
+ret
+end
+if eq sc FG_SUB_FPGA_CGRA
+fg_write_all fd fg_t_sub_fpg
+ret
+end
+if eq sc FG_SUB_OPTICAL_PHOTONIC
+fg_write_all fd fg_t_sub_opt
+ret
+end
+fg_write_all fd fg_t_hw_none
+ret
+end
+
+fn fg_emit_qual_name fd int qs uint to void
+if eq qs FG_QUAL_QUALIFIED
+fg_write_all fd fg_t_q_qual
+ret
+end
+if eq qs FG_QUAL_EXERCISED
+fg_write_all fd fg_t_q_exer
+ret
+end
+if eq qs FG_QUAL_SIMULATED
+fg_write_all fd fg_t_q_sim
+ret
+end
+if eq qs FG_QUAL_BLOCKED_HW
+fg_write_all fd fg_t_q_bhw
+ret
+end
+if eq qs FG_QUAL_NOT_RUN
+fg_write_all fd fg_t_q_nr
+ret
+end
+if eq qs FG_QUAL_FAULTED
+fg_write_all fd fg_t_q_flt
+ret
+end
+fg_write_all fd fg_t_hw_none
+ret
+end
+
+fn fg_emit_low_name fd int lk uint to void
+if eq lk FG_LOW_COMPILED
+fg_write_all fd fg_t_l_cmp
+ret
+end
+if eq lk FG_LOW_SIMULATED
+fg_write_all fd fg_t_l_sim
+ret
+end
+fg_write_all fd fg_t_l_none
+ret
+end
+
+fn fg_emit_receipt_seals fd int seals view ForgeSeals to void
+d = new uchar 32 0
+fg_write_all fd fg_t_reqd
+fg_seals_get_req seals d
+fg_write_hex32 fd d
+fg_write_all fd fg_t_nl
+fg_write_all fd fg_t_descd
+fg_seals_get_desc seals d
+fg_write_hex32 fd d
+fg_write_all fd fg_t_nl
+fg_write_all fd fg_t_planid
+fg_seals_get_plan seals d
+fg_write_hex32 fd d
+fg_write_all fd fg_t_nl
+fg_write_all fd fg_t_seal
+fg_seals_get_tok seals d
+fg_write_hex32 fd d
+fg_write_all fd fg_t_nl
+ret
+end
+
+fn fg_emit_receipt_metrics fd int plan view ForgePlan env view ForgeEnvCheck to void
+fg_write_all fd fg_t_prov
+fg_write_u64 fd ulong get plan prov_id
+fg_write_all fd fg_t_sp_hw
+fg_emit_hw_name fd get plan hw_id
+fg_write_all fd fg_t_sp_sub
+fg_emit_sub_name fd get plan substrate_class
+fg_write_all fd fg_t_sp_qual
+fg_emit_qual_name fd get plan qual_status
+fg_write_all fd fg_t_sp_low
+fg_emit_low_name fd get plan lowering_kind
+fg_write_all fd fg_t_nl
+fg_write_all fd fg_t_geom
+fg_write_u64 fd ulong get plan tile_m
+fg_write_all fd fg_t_x
+fg_write_u64 fd ulong get plan tile_n
+fg_write_all fd fg_t_x
+fg_write_u64 fd ulong get plan tile_k
+fg_write_all fd fg_t_sp_grid
+fg_write_u64 fd ulong get plan grid_x
+fg_write_all fd fg_t_x
+fg_write_u64 fd ulong get plan grid_y
+fg_write_all fd fg_t_sp_blk
+fg_write_u64 fd ulong get plan block_x
+fg_write_all fd fg_t_sp_ctas
+fg_write_u64 fd ulong get env eff_ctas
+fg_write_all fd fg_t_sp_wav
+fg_write_u64 fd ulong get plan waves
+fg_write_all fd fg_t_nl
+fg_write_all fd fg_t_phys
+fg_write_u64 fd get env ws_bytes
+fg_write_all fd fg_t_sp_tr
+fg_write_u64 fd get env traffic_bytes
+fg_write_all fd fg_t_sp_fl
+fg_write_u64 fd get env flops
+fg_write_all fd fg_t_sp_bnd
+if eq get plan compute_bound 1
+fg_write_all fd fg_t_comp
+else
+fg_write_all fd fg_t_bw
+end
+fg_write_all fd fg_t_roof
+fg_write_f64_3 fd get env roof_us
+fg_write_all fd fg_t_sp_ai
+fg_write_f64_3 fd get env arith_int
+fg_write_all fd fg_t_sp_pw
+fg_write_f64_2 fd get env est_power_w
+fg_write_all fd fg_t_sp_en
+fg_write_f64_3 fd get env est_energy_mj
+fg_write_all fd fg_t_nl
+ret
+end
+
+note Emit full canonical receipt block to fd
+fn fg_emit_receipt fd int req view ForgeContract plan view ForgePlan env view ForgeEnvCheck seals view ForgeSeals to void
+fg_write_all fd fg_t_rcpt_hdr
+if eq get plan admitted 1
+fg_write_all fd fg_t_dec_adm
+else
+fg_write_all fd fg_t_dec_ref
+end
+fg_write_all fd fg_t_status
+fg_emit_status_name fd get plan status
+fg_write_all fd fg_t_nl
+fg_write_all fd fg_t_viol
+fg_emit_viol_name fd get plan violation
+fg_write_all fd fg_t_nl
+fg_write_all fd fg_t_req_id
+fg_write_u64 fd get req req_id
+fg_write_all fd fg_t_sp_op
+fg_emit_op_name fd get req op_class
+fg_write_all fd fg_t_sp_dt
+fg_emit_dt_name fd get req dtype
+fg_write_all fd fg_t_sp_sh
+fg_write_u64 fd get req dim_m
+fg_write_all fd fg_t_x
+fg_write_u64 fd get req dim_n
+fg_write_all fd fg_t_x
+fg_write_u64 fd get req dim_k
+fg_write_all fd fg_t_x
+fg_write_u64 fd get req batch
+fg_write_all fd fg_t_nl
+fg_emit_receipt_metrics fd plan env
+fg_emit_receipt_seals fd seals
+fg_write_all fd fg_t_rcpt_end
+ret
+end

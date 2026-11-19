@@ -1,0 +1,687 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/synapse/core/main.om: stdin/stdout JSONL CLI driver for the Synapse core subsystem
+note (changesets, DAG ancestry/LCA/conflicts, exclusive leases, exact-head review/landing,
+note and hash-chained event ledger).
+note Composed OM-2 entrypoint unit (compose after si/directives/om2.om, om/tls/sha2.om, and core modules).
+
+const CLI_IN_CAP ulong 65536
+const CLI_MAX_TOK ulong 12
+
+global g_cli_in uchar 65536
+global g_cli_tok ulong 24
+global g_cli_hdr ulong 8
+
+text tc_cs "CHANGESET"
+text tc_prop "PROPOSE"
+text tc_abnd "ABANDON"
+text tc_initm "INIT_MAIN"
+text tc_anc "ANCESTOR"
+text tc_lca "LCA"
+text tc_conf "CONFLICT"
+text tc_lcl "LEASE_CLAIM"
+text tc_lrn "LEASE_RENEW"
+text tc_lrl "LEASE_RELEASE"
+text tc_rev "REVIEW"
+text tc_land "LAND"
+text tc_lver "LEDGER_VERIFY"
+text tc_ldmp "LEDGER_DUMP"
+text tc_zero "ZERO"
+text tc_none "NONE"
+text tc_true "true"
+text tc_false "false"
+
+text tj_ok "{\"ok\":true,\"cmd\":\""
+text tj_err "{\"ok\":false,\"cmd\":\""
+text tj_code "\",\"code\":"
+text tj_hold ",\"holder\":\""
+text tj_id "\",\"id\":\""
+text tj_lid "\",\"lease_id\":"
+text tj_seq ",\"seq\":"
+text tj_st "\",\"state\":\""
+text tj_anc "\",\"ancestor\":"
+text tj_ov "\",\"overlap\":"
+text tj_ent "\",\"entries\":"
+text tj_hd ",\"head\":\""
+text tj_qend "\"}\n"
+text tj_end "}\n"
+
+fn cli_tok_eq idx ulong w view uchar * to bool
+if ge idx get g_cli_hdr 1
+ret false
+end
+to_off = get g_cli_tok mul idx 2
+to_len = get g_cli_tok add mul idx 2 1
+if ne to_len len w
+ret false
+end
+for i ulong to_len
+if ne get g_cli_in add to_off i get w i
+ret false
+end
+end
+ret true
+end
+
+fn cli_tok_copy idx ulong dst edit uchar * to ulong
+if ge idx get g_cli_hdr 1
+ret 0
+end
+to_off = get g_cli_tok mul idx 2
+to_len = get g_cli_tok add mul idx 2 1
+lim = to_len
+if gt lim len dst
+lim = len dst
+end
+for i ulong lim
+put dst i get g_cli_in add to_off i
+end
+ret lim
+end
+
+fn cli_tok_u64 idx ulong to ulong
+if ge idx get g_cli_hdr 1
+ret SYN_NONE
+end
+to_off = get g_cli_tok mul idx 2
+to_len = get g_cli_tok add mul idx 2 1
+if or eq to_len 0 gt to_len 20
+ret SYN_NONE
+end
+v = ulong 0
+for i ulong to_len
+c = get g_cli_in add to_off i
+if or lt c 48 gt c 57
+ret SYN_NONE
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn cli_tok_hex32 idx ulong dst edit uchar * to bool
+hx = new uchar 64 0
+n = cli_tok_copy idx hx
+if ne n 64
+ret false
+end
+ret syn_hex_decode hx dst
+end
+
+fn cli_emit_err cmd view uchar * code ulong to void
+syn_write_text 1 tj_err
+syn_write_text 1 cmd
+syn_write_text 1 tj_code
+syn_write_u64 1 code
+syn_write_text 1 tj_end
+end
+
+fn cli_emit_ok_simple cmd view uchar * to void
+syn_write_text 1 tj_ok
+syn_write_text 1 cmd
+syn_write_text 1 tj_qend
+end
+
+note Tokenize g_cli_in[lo..hi) by spaces/tabs into g_cli_tok; count stored in g_cli_hdr[1].
+fn cli_tokenize lo ulong hi ulong to ulong
+cnt = ulong 0
+p = lo
+while lt p hi bound 8192
+while lt p hi bound 8192
+c = get g_cli_in p
+if and ne c 32 ne c 9
+break
+end
+p = add p 1
+end
+if ge p hi
+break
+end
+st = p
+while lt p hi bound 8192
+c2 = get g_cli_in p
+if or eq c2 32 eq c2 9
+break
+end
+p = add p 1
+end
+if lt cnt CLI_MAX_TOK
+put g_cli_tok mul cnt 2 st
+put g_cli_tok add mul cnt 2 1 sub p st
+cnt = add cnt 1
+end
+end
+put g_cli_hdr 1 cnt
+ret cnt
+end
+
+note Parses comma-separated path list from token idx and adds each to staged changeset.
+fn cli_stage_csv_paths idx ulong to ulong
+pbuf = new uchar 256 0
+if ge idx get g_cli_hdr 1
+ret SYN_ERR_MALFORMED
+end
+base = get g_cli_tok mul idx 2
+plen = get g_cli_tok add mul idx 2 1
+if eq plen 0
+ret SYN_ERR_MALFORMED
+end
+pos = ulong 0
+while lt pos plen bound 4096
+seg = pos
+while lt pos plen bound 4096
+if eq get g_cli_in add base pos 44
+break
+end
+pos = add pos 1
+end
+slen = sub pos seg
+if or eq slen 0 gt slen 256
+ret SYN_ERR_MALFORMED
+end
+for i ulong slen
+put pbuf i get g_cli_in add add base seg i
+end
+rc = cs_stage_add_path part pbuf 0 slen
+if ne rc SYN_OK
+ret rc
+end
+if lt pos plen
+pos = add pos 1
+end
+end
+ret SYN_OK
+end
+
+fn cli_cmd_changeset to ulong
+auth = new uchar 128 0
+br = new uchar 128 0
+par = new uchar 32 0
+id = new uchar 32 0
+if lt get g_cli_hdr 1 6
+cli_emit_err tc_cs SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+al = cli_tok_copy 1 auth
+bl = cli_tok_copy 2 br
+ts = cli_tok_u64 4
+if eq ts SYN_NONE
+cli_emit_err tc_cs SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+rc = cs_stage_begin part auth 0 al part br 0 bl ts
+if ne rc SYN_OK
+cli_emit_err tc_cs rc
+ret rc
+end
+if eq cli_tok_eq 3 tc_zero false
+if eq cli_tok_hex32 3 par false
+cli_emit_err tc_cs SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+rc2 = cs_stage_set_parent par
+if ne rc2 SYN_OK
+cli_emit_err tc_cs rc2
+ret rc2
+end
+end
+rc3 = cli_stage_csv_paths 5
+if ne rc3 SYN_OK
+cli_emit_err tc_cs rc3
+ret rc3
+end
+rc4 = cs_stage_commit
+if ne rc4 SYN_OK
+cli_emit_err tc_cs rc4
+ret rc4
+end
+idx = cs_last_idx
+cs_get_id idx id
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_cs
+syn_write_text 1 tj_id
+syn_write_hex32 1 id
+syn_write_text 1 tj_st
+cs_write_state_name 1 cs_get_state idx
+syn_write_text 1 tj_qend
+ret SYN_OK
+end
+
+fn cli_cmd_state cmd view uchar * target_st ulong to ulong
+id = new uchar 32 0
+if lt get g_cli_hdr 1 3
+cli_emit_err cmd SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if eq cli_tok_hex32 1 id false
+cli_emit_err cmd SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+ts = cli_tok_u64 2
+if eq ts SYN_NONE
+cli_emit_err cmd SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+idx = cs_find_by_id id
+if eq idx SYN_NONE
+cli_emit_err cmd SYN_ERR_NOT_FOUND
+ret SYN_ERR_NOT_FOUND
+end
+rc = cs_transition idx target_st ts
+if ne rc SYN_OK
+cli_emit_err cmd rc
+ret rc
+end
+syn_write_text 1 tj_ok
+syn_write_text 1 cmd
+syn_write_text 1 tj_id
+syn_write_hex32 1 id
+syn_write_text 1 tj_st
+cs_write_state_name 1 cs_get_state idx
+syn_write_text 1 tj_qend
+ret SYN_OK
+end
+
+fn cli_cmd_init_main to ulong
+id = new uchar 32 0
+if lt get g_cli_hdr 1 2
+cli_emit_err tc_initm SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if eq cli_tok_hex32 1 id false
+cli_emit_err tc_initm SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if ne gr_main_head SYN_NONE
+cli_emit_err tc_initm SYN_ERR_STATE_INVALID
+ret SYN_ERR_STATE_INVALID
+end
+idx = cs_find_by_id id
+if eq idx SYN_NONE
+cli_emit_err tc_initm SYN_ERR_NOT_FOUND
+ret SYN_ERR_NOT_FOUND
+end
+rc = gr_branch_set t_br_main idx
+if ne rc SYN_OK
+cli_emit_err tc_initm rc
+ret rc
+end
+cli_emit_ok_simple tc_initm
+ret SYN_OK
+end
+
+fn cli_cmd_ancestor to ulong
+ida = new uchar 32 0
+idb = new uchar 32 0
+if lt get g_cli_hdr 1 3
+cli_emit_err tc_anc SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if or eq cli_tok_hex32 1 ida false eq cli_tok_hex32 2 idb false
+cli_emit_err tc_anc SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+ia = cs_find_by_id ida
+ib = cs_find_by_id idb
+if or eq ia SYN_NONE eq ib SYN_NONE
+cli_emit_err tc_anc SYN_ERR_NOT_FOUND
+ret SYN_ERR_NOT_FOUND
+end
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_anc
+syn_write_text 1 tj_anc
+if gr_is_ancestor ia ib
+syn_write_text 1 tc_true
+else
+syn_write_text 1 tc_false
+end
+syn_write_text 1 tj_end
+ret SYN_OK
+end
+
+fn cli_cmd_lca to ulong
+ida = new uchar 32 0
+idb = new uchar 32 0
+idl = new uchar 32 0
+if lt get g_cli_hdr 1 3
+cli_emit_err tc_lca SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if or eq cli_tok_hex32 1 ida false eq cli_tok_hex32 2 idb false
+cli_emit_err tc_lca SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+ia = cs_find_by_id ida
+ib = cs_find_by_id idb
+if or eq ia SYN_NONE eq ib SYN_NONE
+cli_emit_err tc_lca SYN_ERR_NOT_FOUND
+ret SYN_ERR_NOT_FOUND
+end
+lca = gr_lca ia ib
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_lca
+syn_write_text 1 tj_id
+if eq lca SYN_NONE
+syn_write_text 1 tc_none
+else
+cs_get_id lca idl
+syn_write_hex32 1 idl
+end
+syn_write_text 1 tj_qend
+ret SYN_OK
+end
+
+fn cli_cmd_conflict to ulong
+ida = new uchar 32 0
+idb = new uchar 32 0
+if lt get g_cli_hdr 1 3
+cli_emit_err tc_conf SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if or eq cli_tok_hex32 1 ida false eq cli_tok_hex32 2 idb false
+cli_emit_err tc_conf SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+ia = cs_find_by_id ida
+ib = cs_find_by_id idb
+if or eq ia SYN_NONE eq ib SYN_NONE
+cli_emit_err tc_conf SYN_ERR_NOT_FOUND
+ret SYN_ERR_NOT_FOUND
+end
+ov = gr_branches_conflict ia ib
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_conf
+syn_write_text 1 tj_ov
+syn_write_u64 1 ov
+syn_write_text 1 tj_end
+ret SYN_OK
+end
+
+fn cli_cmd_lease_claim to ulong
+hbuf = new uchar 128 0
+tbuf = new uchar 256 0
+if lt get g_cli_hdr 1 5
+cli_emit_err tc_lcl SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+hl = cli_tok_copy 1 hbuf
+tl = cli_tok_copy 2 tbuf
+now = cli_tok_u64 3
+ttl = cli_tok_u64 4
+if or eq now SYN_NONE eq ttl SYN_NONE
+cli_emit_err tc_lcl SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+rc = ls_claim part hbuf 0 hl part tbuf 0 tl now ttl
+if eq rc SYN_ERR_LEASE_CONFLICT
+cidx = ls_conflict_idx
+syn_write_text 1 tj_err
+syn_write_text 1 tc_lcl
+syn_write_text 1 tj_code
+syn_write_u64 1 rc
+if ne cidx SYN_NONE
+syn_write_text 1 tj_hold
+syn_write_arena 1 ls_holder_off cidx ls_holder_len cidx
+syn_write_text 1 tj_qend
+else
+syn_write_text 1 tj_end
+end
+ret rc
+end
+if ne rc SYN_OK
+cli_emit_err tc_lcl rc
+ret rc
+end
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_lcl
+syn_write_text 1 tj_lid
+syn_write_u64 1 ls_last_id
+syn_write_text 1 tj_end
+ret SYN_OK
+end
+
+fn cli_cmd_lease_renew to ulong
+hbuf = new uchar 128 0
+if lt get g_cli_hdr 1 5
+cli_emit_err tc_lrn SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+lid = cli_tok_u64 1
+hl = cli_tok_copy 2 hbuf
+now = cli_tok_u64 3
+ttl = cli_tok_u64 4
+if or or eq lid SYN_NONE eq now SYN_NONE eq ttl SYN_NONE
+cli_emit_err tc_lrn SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+rc = ls_renew lid part hbuf 0 hl now ttl
+if ne rc SYN_OK
+cli_emit_err tc_lrn rc
+ret rc
+end
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_lrn
+syn_write_text 1 tj_lid
+syn_write_u64 1 lid
+syn_write_text 1 tj_end
+ret SYN_OK
+end
+
+fn cli_cmd_lease_release to ulong
+hbuf = new uchar 128 0
+fbuf = new uchar 64 0
+if lt get g_cli_hdr 1 5
+cli_emit_err tc_lrl SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+lid = cli_tok_u64 1
+hl = cli_tok_copy 2 hbuf
+fl = cli_tok_copy 3 fbuf
+now = cli_tok_u64 4
+if or eq lid SYN_NONE eq now SYN_NONE
+cli_emit_err tc_lrl SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+rc = ls_release lid part hbuf 0 hl part fbuf 0 fl now
+if ne rc SYN_OK
+cli_emit_err tc_lrl rc
+ret rc
+end
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_lrl
+syn_write_text 1 tj_lid
+syn_write_u64 1 lid
+syn_write_text 1 tj_end
+ret SYN_OK
+end
+
+fn cli_cmd_review to ulong
+id = new uchar 32 0
+rbuf = new uchar 128 0
+if lt get g_cli_hdr 1 5
+cli_emit_err tc_rev SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if eq cli_tok_hex32 1 id false
+cli_emit_err tc_rev SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+rl = cli_tok_copy 2 rbuf
+verdict = ulong 0
+if cli_tok_eq 3 t_rv_merge
+verdict = RV_MERGE
+else
+if cli_tok_eq 3 t_rv_chg
+verdict = RV_CHANGES_REQUESTED
+else
+if cli_tok_eq 3 t_rv_rej
+verdict = RV_REJECT
+end
+end
+end
+ts = cli_tok_u64 4
+if or eq verdict 0 eq ts SYN_NONE
+cli_emit_err tc_rev SYN_ERR_VERDICT_INVALID
+ret SYN_ERR_VERDICT_INVALID
+end
+rc = rv_record id part rbuf 0 rl verdict ts
+if ne rc SYN_OK
+cli_emit_err tc_rev rc
+ret rc
+end
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_rev
+syn_write_text 1 tj_id
+syn_write_hex32 1 id
+syn_write_text 1 tj_qend
+ret SYN_OK
+end
+
+fn cli_cmd_land to ulong
+id = new uchar 32 0
+if lt get g_cli_hdr 1 3
+cli_emit_err tc_land SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+if eq cli_tok_hex32 1 id false
+cli_emit_err tc_land SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+ts = cli_tok_u64 2
+if eq ts SYN_NONE
+cli_emit_err tc_land SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+idx = cs_find_by_id id
+if eq idx SYN_NONE
+cli_emit_err tc_land SYN_ERR_NOT_FOUND
+ret SYN_ERR_NOT_FOUND
+end
+rc = rv_land idx id ts
+if ne rc SYN_OK
+cli_emit_err tc_land rc
+ret rc
+end
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_land
+syn_write_text 1 tj_id
+syn_write_hex32 1 id
+syn_write_text 1 tj_st
+cs_write_state_name 1 cs_get_state idx
+syn_write_text 1 tj_qend
+ret SYN_OK
+end
+
+fn cli_cmd_ledger_verify to ulong
+hd = new uchar 32 0
+rc = lg_verify
+if ne rc SYN_OK
+cli_emit_err tc_lver rc
+ret rc
+end
+lg_head hd
+syn_write_text 1 tj_ok
+syn_write_text 1 tc_lver
+syn_write_text 1 tj_ent
+syn_write_u64 1 lg_count
+syn_write_text 1 tj_hd
+syn_write_hex32 1 hd
+syn_write_text 1 tj_qend
+ret SYN_OK
+end
+
+fn cli_dispatch lo ulong hi ulong to ulong
+if eq cli_tokenize lo hi 0
+ret SYN_OK
+end
+t0 = get g_cli_tok 0
+if eq get g_cli_in t0 35
+ret SYN_OK
+end
+if cli_tok_eq 0 tc_cs
+ret cli_cmd_changeset
+end
+if cli_tok_eq 0 tc_prop
+ret cli_cmd_state tc_prop CS_STATE_PROPOSED
+end
+if cli_tok_eq 0 tc_abnd
+ret cli_cmd_state tc_abnd CS_STATE_ABANDONED
+end
+if cli_tok_eq 0 tc_initm
+ret cli_cmd_init_main
+end
+if cli_tok_eq 0 tc_anc
+ret cli_cmd_ancestor
+end
+if cli_tok_eq 0 tc_lca
+ret cli_cmd_lca
+end
+if cli_tok_eq 0 tc_conf
+ret cli_cmd_conflict
+end
+if cli_tok_eq 0 tc_lcl
+ret cli_cmd_lease_claim
+end
+if cli_tok_eq 0 tc_lrn
+ret cli_cmd_lease_renew
+end
+if cli_tok_eq 0 tc_lrl
+ret cli_cmd_lease_release
+end
+if cli_tok_eq 0 tc_rev
+ret cli_cmd_review
+end
+if cli_tok_eq 0 tc_land
+ret cli_cmd_land
+end
+if cli_tok_eq 0 tc_lver
+ret cli_cmd_ledger_verify
+end
+if cli_tok_eq 0 tc_ldmp
+lg_dump_jsonl 1
+ret SYN_OK
+end
+cli_emit_err tc_cs SYN_ERR_MALFORMED
+ret SYN_ERR_MALFORMED
+end
+
+fn cli_read_stdin to ulong
+tot = ulong 0
+while lt tot CLI_IN_CAP bound 65536
+k = read 0 g_cli_in tot sub CLI_IN_CAP tot
+if le k 0
+break
+end
+tot = add tot ulong k
+end
+ret tot
+end
+
+fn main to int
+syn_reset_all
+n = cli_read_stdin
+pos = ulong 0
+last_err = ulong 0
+while lt pos n bound 65536
+lo = pos
+while lt pos n bound 65536
+if eq get g_cli_in pos 10
+break
+end
+pos = add pos 1
+end
+hi = pos
+if gt hi lo
+if eq get g_cli_in sub hi 1 13
+hi = sub hi 1
+end
+end
+rc = cli_dispatch lo hi
+if ne rc SYN_OK
+last_err = rc
+end
+if lt pos n
+pos = add pos 1
+end
+end
+ret int last_err
+end

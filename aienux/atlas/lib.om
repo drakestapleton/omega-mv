@@ -1,0 +1,617 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/atlas/lib.om: Pure-Omega Atlas Stage-0 Boot Verification Engine.
+note Faithful OM-2 library (no om2 line, no fn main) derived from upstream atlas
+note (CONTRACT-QEMU-VIRT-AARCH64-M1, atlas.s, sha256_clean.c, machine_contract.json).
+note Compose with: si/directives/om2.om aienux/atlas/lib.om <main.om|test.om>
+
+struct AtlasHeader magic uint ver uint stage_len ulong entry_off ulong epoch ulong end
+
+struct AtlasBootDesc ram_base ulong ram_size ulong uart_base ulong payload_base ulong payload_size ulong entry_addr ulong desc_addr ulong stack_top ulong cookie ulong epoch ulong verdict uint halted uint end
+
+note Contract constants (CONTRACT-QEMU-VIRT-AARCH64-M1)
+const ATLAS_MAGIC_LE uint 0x534c5441
+const ATLAS_HDR_VER uint 1
+const ATLAS_HDR_SIZE ulong 64
+const ATLAS_RAM_BASE ulong 0x40000000
+const ATLAS_RAM_SIZE ulong 0x08000000
+const ATLAS_UART_BASE ulong 0x09000000
+const ATLAS_STACK_BASE ulong 0x401f0000
+const ATLAS_STACK_TOP ulong 0x401fc000
+const ATLAS_GUARD_GAP ulong 8192
+const ATLAS_DESC_ADDR ulong 0x401fe000
+const ATLAS_DESC_SIZE ulong 64
+const ATLAS_PAYLOAD_BASE ulong 0x40200000
+const ATLAS_MAX_STAGE ulong 0x04000000
+const ATLAS_COOKIE ulong 0x5048595349435330
+
+note Verification status / fail-closed refusal codes
+const ATLAS_OK uint 0
+const ATLAS_ERR_SHORT_HDR uint 1
+const ATLAS_ERR_MAGIC uint 2
+const ATLAS_ERR_VERSION uint 3
+const ATLAS_ERR_STAGE_LEN uint 4
+const ATLAS_ERR_ALIGN uint 5
+const ATLAS_ERR_ENTRY_OOB uint 6
+const ATLAS_ERR_TRUNCATED uint 7
+const ATLAS_ERR_ROLLBACK uint 8
+const ATLAS_ERR_MEMMAP uint 9
+const ATLAS_ERR_DIGEST uint 10
+
+note ---- Self-contained FIPS 180-4 SHA-256 (matching upstream sha256_clean.c) ----
+
+fn atlas_sha256_k k edit uint 64 to void
+put k 0 0x428a2f98
+put k 1 0x71374491
+put k 2 0xb5c0fbcf
+put k 3 0xe9b5dba5
+put k 4 0x3956c25b
+put k 5 0x59f111f1
+put k 6 0x923f82a4
+put k 7 0xab1c5ed5
+put k 8 0xd807aa98
+put k 9 0x12835b01
+put k 10 0x243185be
+put k 11 0x550c7dc3
+put k 12 0x72be5d74
+put k 13 0x80deb1fe
+put k 14 0x9bdc06a7
+put k 15 0xc19bf174
+put k 16 0xe49b69c1
+put k 17 0xefbe4786
+put k 18 0x0fc19dc6
+put k 19 0x240ca1cc
+put k 20 0x2de92c6f
+put k 21 0x4a7484aa
+put k 22 0x5cb0a9dc
+put k 23 0x76f988da
+put k 24 0x983e5152
+put k 25 0xa831c66d
+put k 26 0xb00327c8
+put k 27 0xbf597fc7
+put k 28 0xc6e00bf3
+put k 29 0xd5a79147
+put k 30 0x06ca6351
+put k 31 0x14292967
+put k 32 0x27b70a85
+put k 33 0x2e1b2138
+put k 34 0x4d2c6dfc
+put k 35 0x53380d13
+put k 36 0x650a7354
+put k 37 0x766a0abb
+put k 38 0x81c2c92e
+put k 39 0x92722c85
+put k 40 0xa2bfe8a1
+put k 41 0xa81a664b
+put k 42 0xc24b8b70
+put k 43 0xc76c51a3
+put k 44 0xd192e819
+put k 45 0xd6990624
+put k 46 0xf40e3585
+put k 47 0x106aa070
+put k 48 0x19a4c116
+put k 49 0x1e376c08
+put k 50 0x2748774c
+put k 51 0x34b0bcb5
+put k 52 0x391c0cb3
+put k 53 0x4ed8aa4a
+put k 54 0x5b9cca4f
+put k 55 0x682e6ff3
+put k 56 0x748f82ee
+put k 57 0x78a5636f
+put k 58 0x84c87814
+put k 59 0x8cc70208
+put k 60 0x90befffa
+put k 61 0xa4506ceb
+put k 62 0xbef9a3f7
+put k 63 0xc67178f2
+end
+
+fn atlas_be32 buf view uchar * off ulong to uint
+b0 = shl uint get buf off 24
+b1 = shl uint get buf add off 1 16
+b2 = shl uint get buf add off 2 8
+b3 = uint get buf add off 3
+ret or or b0 b1 or b2 b3
+end
+
+fn atlas_s0 x uint to uint
+ret xor xor rotr x 7 rotr x 18 shr x 3
+end
+
+fn atlas_s1 x uint to uint
+ret xor xor rotr x 17 rotr x 19 shr x 10
+end
+
+fn atlas_cap0 x uint to uint
+ret xor xor rotr x 2 rotr x 13 rotr x 22
+end
+
+fn atlas_cap1 x uint to uint
+ret xor xor rotr x 6 rotr x 11 rotr x 25
+end
+
+fn atlas_ch x uint y uint z uint to uint
+ret xor and x y and not x z
+end
+
+fn atlas_maj x uint y uint z uint to uint
+ret xor xor and x y and x z and y z
+end
+
+fn atlas_sha256_sched w edit uint 64 blk view uchar * boff ulong to void
+for i ulong 16
+put w i atlas_be32 blk add boff mul i 4
+end
+i = ulong 16
+while lt i 64 bound 64
+t0 = atlas_s0 get w sub i 15
+t1 = atlas_s1 get w sub i 2
+val = add add get w sub i 16 t0 add get w sub i 7 t1
+put w i val
+i = add i 1
+end
+end
+
+fn atlas_sha256_compress st edit uint 8 w view uint 64 k view uint 64 to void
+v = new uint 8 0
+for i ulong 8
+put v i get st i
+end
+for i ulong 64
+t1 = add get v 7 atlas_cap1 get v 4
+t1 = add t1 atlas_ch get v 4 get v 5 get v 6
+t1 = add t1 get k i
+t1 = add t1 get w i
+t2 = add atlas_cap0 get v 0 atlas_maj get v 0 get v 1 get v 2
+put v 7 get v 6
+put v 6 get v 5
+put v 5 get v 4
+put v 4 add get v 3 t1
+put v 3 get v 2
+put v 2 get v 1
+put v 1 get v 0
+put v 0 add t1 t2
+end
+for i ulong 8
+put st i add get st i get v i
+put v i 0
+end
+end
+
+fn atlas_sha256_block st edit uint 8 k view uint 64 blk view uchar * boff ulong to void
+w = new uint 64 0
+atlas_sha256_sched w blk boff
+atlas_sha256_compress st w k
+for i ulong 64
+put w i 0
+end
+end
+
+fn atlas_put_be64 buf edit uchar 128 off ulong v ulong to void
+for j ulong 8
+sh = mul sub 7 j 8
+b = uchar and shr v sh 0xff
+put buf add off j b
+end
+end
+
+fn atlas_sha256_pad_fill pad edit uchar 128 msg view uchar * off ulong to ulong
+n = len msg
+remn = sub n off
+i = ulong 0
+while lt i remn bound 64
+put pad i get msg add off i
+i = add i 1
+end
+put pad remn uchar 0x80
+pblks = ulong 1
+if ge remn 56
+pblks = ulong 2
+end
+atlas_put_be64 pad sub mul pblks 64 8 shl n 3
+ret pblks
+end
+
+fn atlas_sha256_pad_final st edit uint 8 k view uint 64 msg view uchar * off ulong to void
+pad = new uchar 128 0
+pblks = atlas_sha256_pad_fill pad msg off
+atlas_sha256_block st k pad 0
+if eq pblks 2
+atlas_sha256_block st k pad 64
+end
+for j ulong 128
+put pad j 0
+end
+end
+
+fn atlas_sha256_emit st edit uint 8 digest edit uchar 32 to void
+for j ulong 8
+wd = get st j
+bo = mul j 4
+put digest bo uchar and shr wd 24 0xff
+put digest add bo 1 uchar and shr wd 16 0xff
+put digest add bo 2 uchar and shr wd 8 0xff
+put digest add bo 3 uchar and wd 0xff
+put st j 0
+end
+end
+
+fn atlas_sha256_compute msg view uchar * digest edit uchar 32 to void
+st = new uint 8 0
+k = new uint 64 0
+atlas_sha256_k k
+put st 0 0x6a09e667
+put st 1 0xbb67ae85
+put st 2 0x3c6ef372
+put st 3 0xa54ff53a
+put st 4 0x510e527f
+put st 5 0x9b05688c
+put st 6 0x1f83d9ab
+put st 7 0x5be0cd19
+off = ulong 0
+remn = len msg
+note Each iteration consumes 64 bytes; bound 1048576 supports up to 64 MiB stages.
+while ge remn 64 bound 1048576
+atlas_sha256_block st k msg off
+off = add off 64
+remn = sub remn 64
+end
+atlas_sha256_pad_final st k msg off
+atlas_sha256_emit st digest
+end
+
+note ---- Constant-time 32-byte digest comparison (zero early exit, zero secret branches) ----
+
+fn atlas_ct_eq32 a view uchar * b view uchar * to bool
+if ne len a 32
+ret false
+end
+if ne len b 32
+ret false
+end
+acc = uint 0
+for i ulong 32
+da = uint get a i
+db = uint get b i
+acc = or acc xor da db
+end
+ret eq acc 0
+end
+
+note ---- Little-endian wire encoding/decoding ----
+
+fn atlas_le32 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = shl uint get buf add off 1 8
+b2 = shl uint get buf add off 2 16
+b3 = shl uint get buf add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn atlas_le64 buf view uchar * off ulong to ulong
+lo = ulong atlas_le32 buf off
+hi = ulong atlas_le32 buf add off 4
+ret or lo shl hi 32
+end
+
+fn atlas_put_le32 buf edit uchar * off ulong v uint to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn atlas_put_le64 buf edit uchar * off ulong v ulong to void
+for i ulong 8
+put buf add off i uchar and shr v mul i 8 0xff
+end
+end
+
+note ---- Atlas Header encode/parse ----
+
+fn atlas_header_encode buf edit uchar * hdr view AtlasHeader exp view uchar 32 to bool
+if lt len buf ATLAS_HDR_SIZE
+ret false
+end
+atlas_put_le32 buf 0 get hdr magic
+atlas_put_le32 buf 4 get hdr ver
+atlas_put_le64 buf 8 get hdr stage_len
+atlas_put_le64 buf 16 get hdr entry_off
+atlas_put_le64 buf 24 get hdr epoch
+for i ulong 32
+put buf add 32 i get exp i
+end
+ret true
+end
+
+fn atlas_header_parse buf view uchar * hdr edit AtlasHeader exp edit uchar 32 to uint
+if lt len buf ATLAS_HDR_SIZE
+ret ATLAS_ERR_SHORT_HDR
+end
+put hdr magic atlas_le32 buf 0
+put hdr ver atlas_le32 buf 4
+put hdr stage_len atlas_le64 buf 8
+put hdr entry_off atlas_le64 buf 16
+put hdr epoch atlas_le64 buf 24
+for i ulong 32
+put exp i get buf add 32 i
+end
+if ne get hdr magic ATLAS_MAGIC_LE
+ret ATLAS_ERR_MAGIC
+end
+if ne get hdr ver ATLAS_HDR_VER
+ret ATLAS_ERR_VERSION
+end
+ret ATLAS_OK
+end
+
+note ---- Memory map & disjointness proof check (CONTRACT-QEMU-VIRT-AARCH64-M1) ----
+
+fn atlas_add_overflow a ulong b ulong to bool
+s = add a b
+ret lt s a
+end
+
+fn atlas_check_memmap stack_base ulong stack_top ulong desc_addr ulong payload_base ulong stage_len ulong to bool
+if ge stack_base stack_top
+ret false
+end
+if ne and stack_top 15 0
+ret false
+end
+if ne and desc_addr 63 0
+ret false
+end
+if ne and payload_base 63 0
+ret false
+end
+if atlas_add_overflow stack_top ATLAS_GUARD_GAP
+ret false
+end
+if gt add stack_top ATLAS_GUARD_GAP desc_addr
+ret false
+end
+if atlas_add_overflow desc_addr ATLAS_DESC_SIZE
+ret false
+end
+if gt add desc_addr ATLAS_DESC_SIZE payload_base
+ret false
+end
+if lt payload_base ATLAS_RAM_BASE
+ret false
+end
+if atlas_add_overflow payload_base stage_len
+ret false
+end
+if atlas_add_overflow ATLAS_RAM_BASE ATLAS_RAM_SIZE
+ret false
+end
+if gt add payload_base stage_len add ATLAS_RAM_BASE ATLAS_RAM_SIZE
+ret false
+end
+ret true
+end
+
+note ---- Fail-closed descriptor zeroing & full stage-0 verification ----
+
+fn atlas_desc_halt desc edit AtlasBootDesc code uint to void
+put desc ram_base 0
+put desc ram_size 0
+put desc uart_base 0
+put desc payload_base 0
+put desc payload_size 0
+put desc entry_addr 0
+put desc desc_addr 0
+put desc stack_top 0
+put desc cookie 0
+put desc epoch 0
+put desc verdict code
+put desc halted 1
+end
+
+fn atlas_validate_hdr hdr view AtlasHeader img_len ulong min_epoch ulong to uint
+slen = get hdr stage_len
+eoff = get hdr entry_off
+ep = get hdr epoch
+if eq slen 0
+ret ATLAS_ERR_STAGE_LEN
+end
+if gt slen ATLAS_MAX_STAGE
+ret ATLAS_ERR_STAGE_LEN
+end
+if ne and slen 3 0
+ret ATLAS_ERR_ALIGN
+end
+if ne and eoff 3 0
+ret ATLAS_ERR_ALIGN
+end
+if ge eoff slen
+ret ATLAS_ERR_ENTRY_OOB
+end
+if atlas_add_overflow ATLAS_HDR_SIZE slen
+ret ATLAS_ERR_STAGE_LEN
+end
+if lt img_len add ATLAS_HDR_SIZE slen
+ret ATLAS_ERR_TRUNCATED
+end
+if lt ep min_epoch
+ret ATLAS_ERR_ROLLBACK
+end
+if not atlas_check_memmap ATLAS_STACK_BASE ATLAS_STACK_TOP ATLAS_DESC_ADDR ATLAS_PAYLOAD_BASE slen
+ret ATLAS_ERR_MEMMAP
+end
+ret ATLAS_OK
+end
+
+fn atlas_desc_fill desc edit AtlasBootDesc hdr view AtlasHeader to void
+put desc ram_base ATLAS_RAM_BASE
+put desc ram_size ATLAS_RAM_SIZE
+put desc uart_base ATLAS_UART_BASE
+put desc payload_base ATLAS_PAYLOAD_BASE
+put desc payload_size get hdr stage_len
+put desc entry_addr add ATLAS_PAYLOAD_BASE get hdr entry_off
+put desc desc_addr ATLAS_DESC_ADDR
+put desc stack_top ATLAS_STACK_TOP
+put desc cookie ATLAS_COOKIE
+put desc epoch get hdr epoch
+put desc verdict ATLAS_OK
+put desc halted 0
+end
+
+fn atlas_verify_image img view uchar * min_epoch ulong hdr edit AtlasHeader desc edit AtlasBootDesc comp edit uchar 32 to uint
+exp = new uchar 32 0
+atlas_desc_halt desc ATLAS_ERR_SHORT_HDR
+for i ulong 32
+put comp i 0
+end
+rc = atlas_header_parse img hdr exp
+if ne rc ATLAS_OK
+atlas_desc_halt desc rc
+ret rc
+end
+rc = atlas_validate_hdr hdr len img min_epoch
+if ne rc ATLAS_OK
+atlas_desc_halt desc rc
+ret rc
+end
+atlas_sha256_compute part img ATLAS_HDR_SIZE get hdr stage_len comp
+if not atlas_ct_eq32 comp exp
+atlas_desc_halt desc ATLAS_ERR_DIGEST
+ret ATLAS_ERR_DIGEST
+end
+atlas_desc_fill desc hdr
+ret ATLAS_OK
+end
+
+note ---- Machine Boot Descriptor 64-byte wire emitter (matches atlas.s offsets) ----
+note +0: ram_base, +8: ram_size, +16: uart_base, +24: payload_base,
+note +32: payload_size, +40: entry_addr, +48: epoch, +56: cookie
+
+fn atlas_emit_desc_bytes desc view AtlasBootDesc dst edit uchar 64 to bool
+for i ulong 64
+put dst i 0
+end
+if ne get desc verdict ATLAS_OK
+ret false
+end
+if ne get desc halted 0
+ret false
+end
+if ne get desc cookie ATLAS_COOKIE
+ret false
+end
+atlas_put_le64 dst 0 get desc ram_base
+atlas_put_le64 dst 8 get desc ram_size
+atlas_put_le64 dst 16 get desc uart_base
+atlas_put_le64 dst 24 get desc payload_base
+atlas_put_le64 dst 32 get desc payload_size
+atlas_put_le64 dst 40 get desc entry_addr
+atlas_put_le64 dst 48 get desc epoch
+atlas_put_le64 dst 56 get desc cookie
+ret true
+end
+
+note ---- I/O and hex formatting helpers ----
+
+fn atlas_write_all fd int buf view uchar * to bool
+n = len buf
+off = ulong 0
+while lt off n bound 65536
+k = write fd buf off sub n off
+if le k 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn atlas_hex_nibble v uchar to uchar
+x = and v 15
+if lt x 10
+ret add 48 x
+end
+ret add 87 x
+end
+
+fn atlas_parse_hex_nibble c uchar to int
+if ge c 48
+if le c 57
+ret int sub c 48
+end
+end
+if ge c 97
+if le c 102
+ret add 10 int sub c 97
+end
+end
+if ge c 65
+if le c 70
+ret add 10 int sub c 65
+end
+end
+ret -1
+end
+
+fn atlas_parse_hex_bytes hex view uchar * dst edit uchar * to bool
+hlen = len hex
+if ne and hlen 1 0
+ret false
+end
+need = shr hlen 1
+if lt len dst need
+ret false
+end
+i = ulong 0
+while lt i need bound 65536
+hi = atlas_parse_hex_nibble get hex mul i 2
+lo = atlas_parse_hex_nibble get hex add mul i 2 1
+if lt hi 0
+ret false
+end
+if lt lo 0
+ret false
+end
+put dst i uchar or shl hi 4 lo
+i = add i 1
+end
+ret true
+end
+
+fn atlas_write_hex64 fd int v ulong to bool
+buf = new uchar 18 0
+put buf 0 uchar 48
+put buf 1 uchar 120
+for i ulong 16
+sh = mul sub 15 i 4
+nib = uchar and shr v sh 15
+put buf add 2 i atlas_hex_nibble nib
+end
+ret atlas_write_all fd buf
+end
+
+fn atlas_write_digest fd int d view uchar 32 to bool
+buf = new uchar 64 0
+for i ulong 32
+b = get d i
+put buf mul i 2 atlas_hex_nibble shr b 4
+put buf add mul i 2 1 atlas_hex_nibble and b 15
+end
+ret atlas_write_all fd buf
+end
+
+fn atlas_write_u64 fd int v ulong to bool
+buf = new uchar 24 0
+if eq v 0
+put buf 0 uchar 48
+ret atlas_write_all fd part buf 0 1
+end
+cur = v
+pos = ulong 24
+while gt cur 0 bound 24
+pos = sub pos 1
+put buf pos add uchar 48 uchar rem cur 10
+cur = div cur 10
+end
+ret atlas_write_all fd part buf pos sub 24 pos
+end

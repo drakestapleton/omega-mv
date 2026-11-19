@@ -1,0 +1,485 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/aegis/policy.om: AEGIS invariant and authority gate (pure OM-2 library unit).
+note Converted from aegis-runtime-mv/src/auth.rs, src/enforcement.rs, src/policy_guard.rs,
+note and src/defense/decision.rs.
+note Fail-closed capability verification per route/action, constant-time operator token check,
+note SHA-256 keyed envelope authentication with monotonic anti-replay nonces, privilege
+note escalation refusal, skill/command allowlist membrane, and containment levels.
+
+const POL_MIN_TOKEN_LEN ulong 32
+const POL_MAX_TOKEN_LEN ulong 64
+const POL_MAX_PRINCIPALS ulong 32
+
+note Deterministic policy decision codes
+const POL_ALLOW ulong 0
+const POL_ALLOW_RESTRICTED ulong 1
+const POL_REQUIRE_APPROVAL ulong 2
+const POL_DENY_NO_TOKEN_CONFIG ulong 10
+const POL_DENY_UNAUTHORIZED ulong 11
+const POL_DENY_MISSING_CAP ulong 12
+const POL_DENY_UNVERIFIED_ENV ulong 13
+const POL_DENY_ESCALATION ulong 14
+const POL_DENY_CONTAINED ulong 15
+const POL_DENY_INVALID_ROUTE ulong 16
+const POL_DENY_BAD_TOKEN ulong 17
+const POL_DENY_METHOD_NOT_ALLOWED ulong 18
+
+note Capability bitmask
+const CAP_NONE ulong 0
+const CAP_HEALTH_READ ulong 1
+const CAP_EVENTS_READ ulong 2
+const CAP_TASK_READ ulong 4
+const CAP_TASK_SUBMIT ulong 8
+const CAP_HEARTBEAT_WRITE ulong 16
+const CAP_JOURNAL_ADMIN ulong 32
+const CAP_SKILL_EXEC ulong 64
+const CAP_POLICY_ADMIN ulong 128
+
+const ROLE_PUBLIC ulong 3
+const ROLE_WORKER ulong 23
+const ROLE_OPERATOR ulong 255
+
+note Methods and routes
+const METHOD_UNKNOWN ulong 0
+const METHOD_GET ulong 1
+const METHOD_HEAD ulong 2
+const METHOD_POST ulong 3
+
+const ROUTE_UNKNOWN ulong 0
+const ROUTE_HEALTH ulong 1
+const ROUTE_EVENTS ulong 2
+const ROUTE_TASKS ulong 3
+const ROUTE_TASKS_SUBMIT ulong 4
+const ROUTE_HEARTBEAT ulong 5
+
+note Containment levels (from defense/decision.rs)
+const CONTAIN_OBSERVE ulong 0
+const CONTAIN_RESTRICT ulong 1
+const CONTAIN_SUSPEND ulong 2
+const CONTAIN_EMERGENCY_STOP ulong 3
+
+note pol_meta: [0]=tok_configured, [1]=tok_len, [2]=containment, [3]=princ_cnt, [4]=deny_cnt, [5]=allow_cnt
+global pol_meta ulong 8
+global pol_token uchar 64
+
+global pol_princ_id ulong 32
+global pol_princ_caps ulong 32
+global pol_princ_nonce ulong 32
+global pol_princ_key uchar 1024
+
+text pol_env_dom "AEGIS-ENV-V1"
+text pol_sk_bash "bash_eval"
+text pol_sk_read "read_file"
+text pol_sk_write "write_file"
+text pol_sk_list "list_dir"
+text pol_sk_gstat "git_status"
+text pol_sk_tele "telemetry_ping"
+
+text pol_cmd_gstat "git status"
+text pol_cmd_gdiff "git diff"
+text pol_cmd_glog "git log -1 --oneline"
+text pol_cmd_ls "ls"
+
+fn pol_reset to void
+for i ulong 8
+put pol_meta i 0
+end
+for i ulong 64
+put pol_token i 0
+end
+for i ulong 32
+put pol_princ_id i 0
+put pol_princ_caps i 0
+put pol_princ_nonce i 0
+end
+for i ulong 1024
+put pol_princ_key i 0
+end
+end
+
+fn pol_is_configured to bool
+ret ne get pol_meta 0 0
+end
+
+fn pol_containment to ulong
+ret get pol_meta 2
+end
+
+fn pol_set_containment lvl ulong to void
+if le lvl CONTAIN_EMERGENCY_STOP
+put pol_meta 2 lvl
+end
+end
+
+fn pol_deny_count to ulong
+ret get pol_meta 4
+end
+
+fn pol_allow_count to ulong
+ret get pol_meta 5
+end
+
+fn pol_disable_token to void
+put pol_meta 0 0
+put pol_meta 1 0
+for i ulong 64
+put pol_token i 0
+end
+end
+
+note Configure operator token: must be 32..64 printable ASCII graphic bytes (0x21..0x7e).
+fn pol_set_operator_token tok view uchar * to ulong
+n = len tok
+if or lt n POL_MIN_TOKEN_LEN gt n POL_MAX_TOKEN_LEN
+ret POL_DENY_BAD_TOKEN
+end
+for i ulong n bound 64
+c = get tok i
+if or lt c 0x21 gt c 0x7e
+ret POL_DENY_BAD_TOKEN
+end
+end
+for i ulong 64
+put pol_token i 0
+end
+for i ulong n bound 64
+put pol_token i get tok i
+end
+put pol_meta 1 n
+put pol_meta 0 1
+ret POL_ALLOW
+end
+
+note Constant-time byte slice equality (matches auth::constant_time_eq).
+fn pol_ct_eq a view uchar * b view uchar * to bool
+na = len a
+if ne na len b
+ret false
+end
+diff = uchar 0
+for i ulong na bound 1024
+diff = or diff xor get a i get b i
+end
+ret eq diff 0
+end
+
+note Constant-time check of presented operator token against configured token.
+fn pol_verify_token presented view uchar * to bool
+if eq get pol_meta 0 0
+ret false
+end
+tlen = get pol_meta 1
+if ne len presented tlen
+ret false
+end
+diff = uchar 0
+for i ulong tlen bound 64
+diff = or diff xor get pol_token i get presented i
+end
+ret eq diff 0
+end
+
+fn pol_find_principal actor_id ulong to long
+if eq actor_id 0
+ret -1
+end
+n = get pol_meta 3
+for i ulong n bound 32
+if eq get pol_princ_id i actor_id
+ret long i
+end
+end
+ret -1
+end
+
+fn pol_register_principal actor_id ulong caps ulong key view uchar 32 to ulong
+if eq actor_id 0
+ret POL_DENY_UNAUTHORIZED
+end
+s = pol_find_principal actor_id
+slot = ulong 0
+if ge s 0
+slot = ulong s
+else
+slot = get pol_meta 3
+if ge slot POL_MAX_PRINCIPALS
+ret POL_DENY_CONTAINED
+end
+put pol_meta 3 add slot 1
+end
+put pol_princ_id slot actor_id
+put pol_princ_caps slot caps
+put pol_princ_nonce slot 0
+base = mul slot 32
+for i ulong 32
+put pol_princ_key add base i get key i
+end
+ret POL_ALLOW
+end
+
+fn pol_actor_caps actor_id ulong to ulong
+s = pol_find_principal actor_id
+if lt s 0
+ret CAP_NONE
+end
+ret get pol_princ_caps ulong s
+end
+
+note Refuse any capability delegation or request exceeding actor's granted ceiling.
+fn pol_check_escalation granted_caps ulong requested_caps ulong to ulong
+extra = and requested_caps xor granted_caps 0xffffffffffffffff
+if ne extra 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_ESCALATION
+end
+ret POL_ALLOW
+end
+
+fn pol_put_be64 buf edit uchar * off ulong v ulong to void
+put buf add off 0 uchar and shr v 56 0xff
+put buf add off 1 uchar and shr v 48 0xff
+put buf add off 2 uchar and shr v 40 0xff
+put buf add off 3 uchar and shr v 32 0xff
+put buf add off 4 uchar and shr v 24 0xff
+put buf add off 5 uchar and shr v 16 0xff
+put buf add off 6 uchar and shr v 8 0xff
+put buf add off 7 uchar and v 0xff
+end
+
+note Compute 32-byte keyed SHA-256 envelope MAC:
+note MAC = SHA256("AEGIS-ENV-V1" || key[32] || be64(actor_id) || be64(route) || be64(nonce) || payload)
+fn pol_compute_env_mac slot ulong route ulong nonce ulong payload view uchar * dst_mac edit uchar 32 to void
+ctx = new ulong 40 0
+hdr = new uchar 68 0
+for i ulong 12
+put hdr i get pol_env_dom i
+end
+base = mul slot 32
+for i ulong 32
+put hdr add 12 i get pol_princ_key add base i
+end
+pol_put_be64 hdr 44 get pol_princ_id slot
+pol_put_be64 hdr 52 route
+pol_put_be64 hdr 60 nonce
+sha256_init ctx
+sha256_update ctx part hdr 0 68
+if gt len payload 0
+sha256_update ctx payload
+end
+sha256_final ctx dst_mac
+for i ulong 40
+put ctx i 0
+end
+for i ulong 68
+put hdr i 0
+end
+end
+
+fn pol_seal_envelope actor_id ulong route ulong nonce ulong payload view uchar * dst_mac edit uchar 32 to ulong
+if eq nonce 0
+ret POL_DENY_UNVERIFIED_ENV
+end
+s = pol_find_principal actor_id
+if lt s 0
+ret POL_DENY_UNAUTHORIZED
+end
+pol_compute_env_mac ulong s route nonce payload dst_mac
+ret POL_ALLOW
+end
+
+note Verify signed envelope MAC in constant time and enforce strictly increasing nonce per actor.
+fn pol_verify_envelope actor_id ulong route ulong nonce ulong payload view uchar * mac view uchar 32 to ulong
+if eq nonce 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_UNVERIFIED_ENV
+end
+s = pol_find_principal actor_id
+if lt s 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_UNAUTHORIZED
+end
+slot = ulong s
+if le nonce get pol_princ_nonce slot
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_UNVERIFIED_ENV
+end
+expected = new uchar 32 0
+pol_compute_env_mac slot route nonce payload expected
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get expected i get mac i
+end
+if ne diff 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_UNVERIFIED_ENV
+end
+put pol_princ_nonce slot nonce
+ret POL_ALLOW
+end
+
+note Exact-match byte equality helper for allowlist checks.
+fn pol_str_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+n = len a
+for i ulong n bound 256
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note Deterministic skill dispatch allowlist (from enforcement.rs).
+fn pol_check_skill name view uchar * to ulong
+if eq len name 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_ESCALATION
+end
+if pol_str_eq name pol_sk_bash
+ret POL_ALLOW
+end
+if pol_str_eq name pol_sk_read
+ret POL_ALLOW
+end
+if pol_str_eq name pol_sk_write
+ret POL_ALLOW
+end
+if pol_str_eq name pol_sk_list
+ret POL_ALLOW
+end
+if pol_str_eq name pol_sk_gstat
+ret POL_ALLOW
+end
+if pol_str_eq name pol_sk_tele
+ret POL_ALLOW
+end
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_ESCALATION
+end
+
+note Deterministic local command allowlist (from enforcement.rs / security.rs).
+fn pol_check_local_cmd cmd view uchar * to ulong
+if eq len cmd 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_ESCALATION
+end
+if pol_str_eq cmd pol_cmd_gstat
+ret POL_ALLOW
+end
+if pol_str_eq cmd pol_cmd_gdiff
+ret POL_ALLOW
+end
+if pol_str_eq cmd pol_cmd_glog
+ret POL_ALLOW
+end
+if pol_str_eq cmd pol_cmd_ls
+ret POL_ALLOW
+end
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_ESCALATION
+end
+
+note Required capability bit for (method, route). Returns 0 if route/method invalid.
+fn pol_route_required_cap method ulong route ulong to ulong
+if eq route ROUTE_HEALTH
+if or eq method METHOD_GET eq method METHOD_HEAD
+ret CAP_HEALTH_READ
+end
+ret 0
+end
+if eq route ROUTE_EVENTS
+if or eq method METHOD_GET eq method METHOD_HEAD
+ret CAP_EVENTS_READ
+end
+ret 0
+end
+if eq route ROUTE_TASKS
+if eq method METHOD_GET
+ret CAP_TASK_READ
+end
+ret 0
+end
+if eq route ROUTE_TASKS_SUBMIT
+if eq method METHOD_POST
+ret CAP_TASK_SUBMIT
+end
+ret 0
+end
+if eq route ROUTE_HEARTBEAT
+if eq method METHOD_POST
+ret CAP_HEARTBEAT_WRITE
+end
+ret 0
+end
+ret 0
+end
+
+fn pol_is_public_route method ulong route ulong to bool
+if and ne method METHOD_GET ne method METHOD_HEAD
+ret false
+end
+if or eq route ROUTE_HEALTH eq route ROUTE_EVENTS
+ret true
+end
+ret false
+end
+
+note Master fail-closed route authority gate.
+note Evaluates containment, route/method validity, public read allowlist, operator token,
+note envelope verification, privilege escalation ceiling, and required route capability.
+fn pol_authorize_request method ulong route ulong actor_id ulong req_caps ulong tok_ok bool env_ok bool to ulong
+cont = get pol_meta 2
+if and eq cont CONTAIN_EMERGENCY_STOP ne route ROUTE_HEALTH
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_CONTAINED
+end
+if eq route ROUTE_UNKNOWN
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_INVALID_ROUTE
+end
+need_cap = pol_route_required_cap method route
+if eq need_cap 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_METHOD_NOT_ALLOWED
+end
+if pol_is_public_route method route
+put pol_meta 5 add get pol_meta 5 1
+ret POL_ALLOW
+end
+if ge cont CONTAIN_SUSPEND
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_CONTAINED
+end
+if eq get pol_meta 0 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_NO_TOKEN_CONFIG
+end
+if not tok_ok
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_UNAUTHORIZED
+end
+if not env_ok
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_UNVERIFIED_ENV
+end
+granted = ROLE_OPERATOR
+if ne actor_id 0
+granted = pol_actor_caps actor_id
+end
+esc = pol_check_escalation granted req_caps
+if ne esc POL_ALLOW
+ret esc
+end
+if eq and req_caps need_cap 0
+put pol_meta 4 add get pol_meta 4 1
+ret POL_DENY_MISSING_CAP
+end
+if and eq cont CONTAIN_RESTRICT eq method METHOD_POST
+put pol_meta 4 add get pol_meta 4 1
+ret POL_REQUIRE_APPROVAL
+end
+put pol_meta 5 add get pol_meta 5 1
+ret POL_ALLOW
+end

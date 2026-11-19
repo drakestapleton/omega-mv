@@ -1,0 +1,1313 @@
+note protocol/rad-id-sync/lib.om: pure-Omega Radicle identity validation and synchronization engine
+note Faithful port of upstream rad-id-sync (identity anchor, SHA-256 fingerprints, key validation)
+note extended with Radicle RID, delegate did:key:z6Mk, threshold/quorum, and diff/sync policy checks.
+note Compose with si/directives/om2.om ahead of this file.
+
+const RAD_MAX_DEL ulong 16
+const RAD_DID_SLOT ulong 64
+const RAD_DEL_BUF ulong 1024
+const RAD_RID_CAP ulong 64
+const RAD_KEY_CAP ulong 256
+
+const RAD_OK ulong 0
+const RAD_ERR_BAD_RID ulong 1
+const RAD_ERR_BAD_DID ulong 2
+const RAD_ERR_BAD_THRESH ulong 3
+const RAD_ERR_DUP_DEL ulong 4
+const RAD_ERR_TOO_MANY ulong 5
+const RAD_ERR_RID_MISMATCH ulong 6
+const RAD_ERR_UNAUTH_DEL ulong 7
+const RAD_ERR_NO_QUORUM ulong 8
+const RAD_ERR_BAD_KEY ulong 9
+const RAD_ERR_PARSE ulong 10
+
+const SYNC_IN_SYNC ulong 0
+const SYNC_UPDATE_OK ulong 1
+const SYNC_ROTATED ulong 2
+const SYNC_REFUSED ulong 3
+
+const ENTITY_AGENT ulong 0
+const ENTITY_HUMAN ulong 1
+const ENTITY_BRIDGE ulong 2
+
+struct RadDiff code ulong decision ulong added ulong removed ulong common ulong thresh_chg ulong end
+struct AnchorSync code ulong in_sync ulong rotated ulong rad_chg ulong ssh_chg ulong hist_n ulong end
+
+note Global buffers for base and remote Radicle identity documents
+global g_base_rid uchar 64
+global g_base_rid_len ulong 1
+global g_base_dels uchar 1024
+global g_base_del_lens ulong 16
+global g_base_del_n ulong 1
+global g_base_thresh ulong 1
+
+global g_rem_rid uchar 64
+global g_rem_rid_len ulong 1
+global g_rem_dels uchar 1024
+global g_rem_del_lens ulong 16
+global g_rem_del_n ulong 1
+global g_rem_thresh ulong 1
+
+note Global state for IdentityAnchor (upstream identity.rs + keys.rs)
+global g_anc_did uchar 64
+global g_anc_did_len ulong 1
+global g_anc_name uchar 64
+global g_anc_name_len ulong 1
+global g_anc_etype ulong 1
+global g_anc_rad_key uchar 256
+global g_anc_rad_len ulong 1
+global g_anc_ssh_key uchar 256
+global g_anc_ssh_len ulong 1
+global g_anc_rad_fp uchar 64
+global g_anc_ssh_fp uchar 64
+global g_anc_hist_n ulong 1
+
+note Global scratch for SHA-256 state and schedule
+global g_sha_k uint 64
+global g_sha_k_init ulong 1
+global g_sha_h uint 8
+global g_sha_w uint 64
+global g_sha_blk uchar 64
+
+text txt_rad_pfx "rad:z"
+text txt_did_key_pfx "did:key:z6Mk"
+text txt_did_rad_pfx "did:rad:"
+text txt_ssh_pfx "ssh-ed25519 "
+text txt_hex_digits "0123456789abcdef"
+
+text txt_def_did "did:rad:aien:spark-master"
+text txt_def_name "AIEN"
+
+text txt_j_open "{\"anchor_did\":\""
+text txt_j_name "\",\"entity_name\":\""
+text txt_j_insync "\",\"in_sync\":"
+text txt_j_rot ",\"rotated\":"
+text txt_j_hist ",\"key_history_len\":"
+text txt_j_radfp ",\"radicle_fp\":\""
+text txt_j_sshfp "\",\"ssh_fp\":\""
+text txt_j_msg "\",\"message\":\""
+text txt_j_close "\"}\n"
+text txt_true "true"
+text txt_false "false"
+text txt_msg_synced "Keys are already synchronized with Identity Anchor."
+text txt_msg_rad_rot "Detected rotated Radicle public key; updated Identity Anchor."
+text txt_msg_ssh_rot "Detected updated SSH public key; updated Identity Anchor."
+text txt_msg_both_rot "Detected updated Radicle and SSH public keys; updated Identity Anchor."
+text txt_msg_none "No local keys bound to Identity Anchor."
+
+note --- Basic byte and slice helpers ---
+
+fn is_space_b b uchar to bool
+if eq b uchar 32
+ret true
+end
+if eq b uchar 9
+ret true
+end
+if eq b uchar 10
+ret true
+end
+if eq b uchar 13
+ret true
+end
+ret false
+end
+
+fn trim_start s view uchar * to ulong
+n = len s
+i = ulong 0
+note bound 65536 covers max supported input line/key length
+if gt n ulong 65536
+ret n
+end
+while lt i n bound 65536
+b = get s i
+if not is_space_b b
+ret i
+end
+i = add i ulong 1
+end
+ret n
+end
+
+fn trim_end s view uchar * to ulong
+n = len s
+if eq n ulong 0
+ret ulong 0
+end
+if gt n ulong 65536
+ret ulong 0
+end
+e = n
+while gt e ulong 0 bound 65536
+idx = sub e ulong 1
+b = get s idx
+if not is_space_b b
+ret e
+end
+e = idx
+end
+ret ulong 0
+end
+
+fn slice_eq a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+if gt na ulong 65536
+ret false
+end
+i = ulong 0
+while lt i na bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn slice_starts_with s view uchar * pfx view uchar * to bool
+ns = len s
+np = len pfx
+if lt ns np
+ret false
+end
+if gt np ulong 4096
+ret false
+end
+i = ulong 0
+while lt i np bound 4096
+if ne get s i get pfx i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn append_bytes dst edit uchar * pos ulong src view uchar * to ulong
+cap = len dst
+ns = len src
+if gt ns ulong 65536
+ret pos
+end
+i = ulong 0
+p = pos
+while lt i ns bound 65536
+if ge p cap
+ret p
+end
+put dst p get src i
+p = add p ulong 1
+i = add i ulong 1
+end
+ret p
+end
+
+fn append_byte dst edit uchar * pos ulong b uchar to ulong
+if ge pos len dst
+ret pos
+end
+put dst pos b
+ret add pos ulong 1
+end
+
+fn append_u64 dst edit uchar * pos ulong v ulong to ulong
+tmp = new uchar 24 0
+n = ulong 0
+cur = v
+if eq cur ulong 0
+put tmp 0 uchar 48
+n = ulong 1
+else
+while gt cur ulong 0 bound 24
+d = rem cur ulong 10
+put tmp n uchar add d ulong 48
+cur = div cur ulong 10
+n = add n ulong 1
+end
+end
+p = pos
+i = n
+while gt i ulong 0 bound 24
+i = sub i ulong 1
+p = append_byte dst p get tmp i
+end
+ret p
+end
+
+note --- SHA-256 (FIPS 180-4) ---
+
+fn sha256_init_k to void
+if eq get g_sha_k_init 0 ulong 1
+ret
+end
+put g_sha_k 0 uint 0x428a2f98
+put g_sha_k 1 uint 0x71374491
+put g_sha_k 2 uint 0xb5c0fbcf
+put g_sha_k 3 uint 0xe9b5dba5
+put g_sha_k 4 uint 0x3956c25b
+put g_sha_k 5 uint 0x59f111f1
+put g_sha_k 6 uint 0x923f82a4
+put g_sha_k 7 uint 0xab1c5ed5
+put g_sha_k 8 uint 0xd807aa98
+put g_sha_k 9 uint 0x12835b01
+put g_sha_k 10 uint 0x243185be
+put g_sha_k 11 uint 0x550c7dc3
+put g_sha_k 12 uint 0x72be5d74
+put g_sha_k 13 uint 0x80deb1fe
+put g_sha_k 14 uint 0x9bdc06a7
+put g_sha_k 15 uint 0xc19bf174
+put g_sha_k 16 uint 0xe49b69c1
+put g_sha_k 17 uint 0xefbe4786
+put g_sha_k 18 uint 0x0fc19dc6
+put g_sha_k 19 uint 0x240ca1cc
+put g_sha_k 20 uint 0x2de92c6f
+put g_sha_k 21 uint 0x4a7484aa
+put g_sha_k 22 uint 0x5cb0a9dc
+put g_sha_k 23 uint 0x76f988da
+put g_sha_k 24 uint 0x983e5152
+put g_sha_k 25 uint 0xa831c66d
+put g_sha_k 26 uint 0xb00327c8
+put g_sha_k 27 uint 0xbf597fc7
+put g_sha_k 28 uint 0xc6e00bf3
+put g_sha_k 29 uint 0xd5a79147
+put g_sha_k 30 uint 0x06ca6351
+put g_sha_k 31 uint 0x14292967
+put g_sha_k 32 uint 0x27b70a85
+put g_sha_k 33 uint 0x2e1b2138
+put g_sha_k 34 uint 0x4d2c6dfc
+put g_sha_k 35 uint 0x53380d13
+put g_sha_k 36 uint 0x650a7354
+put g_sha_k 37 uint 0x766a0abb
+put g_sha_k 38 uint 0x81c2c92e
+put g_sha_k 39 uint 0x92722c85
+put g_sha_k 40 uint 0xa2bfe8a1
+put g_sha_k 41 uint 0xa81a664b
+put g_sha_k 42 uint 0xc24b8b70
+put g_sha_k 43 uint 0xc76c51a3
+put g_sha_k 44 uint 0xd192e819
+put g_sha_k 45 uint 0xd6990624
+put g_sha_k 46 uint 0xf40e3585
+put g_sha_k 47 uint 0x106aa070
+put g_sha_k 48 uint 0x19a4c116
+put g_sha_k 49 uint 0x1e376c08
+put g_sha_k 50 uint 0x2748774c
+put g_sha_k 51 uint 0x34b0bcb5
+put g_sha_k 52 uint 0x391c0cb3
+put g_sha_k 53 uint 0x4ed8aa4a
+put g_sha_k 54 uint 0x5b9cca4f
+put g_sha_k 55 uint 0x682e6ff3
+put g_sha_k 56 uint 0x748f82ee
+put g_sha_k 57 uint 0x78a5636f
+put g_sha_k 58 uint 0x84c87814
+put g_sha_k 59 uint 0x8cc70208
+put g_sha_k 60 uint 0x90befffa
+put g_sha_k 61 uint 0xa4506ceb
+put g_sha_k 62 uint 0xbef9a3f7
+put g_sha_k 63 uint 0xc67178f2
+put g_sha_k_init 0 ulong 1
+end
+
+fn sha256_reset to void
+sha256_init_k
+put g_sha_h 0 uint 0x6a09e667
+put g_sha_h 1 uint 0xbb67ae85
+put g_sha_h 2 uint 0x3c6ef372
+put g_sha_h 3 uint 0xa54ff53a
+put g_sha_h 4 uint 0x510e527f
+put g_sha_h 5 uint 0x9b05688c
+put g_sha_h 6 uint 0x1f83d9ab
+put g_sha_h 7 uint 0x5be0cd19
+end
+
+fn sha256_load_w to void
+for i ulong 16
+o = mul i ulong 4
+b0 = uint get g_sha_blk o
+b1 = uint get g_sha_blk add o ulong 1
+b2 = uint get g_sha_blk add o ulong 2
+b3 = uint get g_sha_blk add o ulong 3
+w = or or shl b0 uint 24 shl b1 uint 16 or shl b2 uint 8 b3
+put g_sha_w i w
+end
+i = ulong 16
+while lt i ulong 64 bound 48
+w15 = get g_sha_w sub i ulong 15
+w2 = get g_sha_w sub i ulong 2
+s0 = xor xor rotr w15 uint 7 rotr w15 uint 18 shr w15 uint 3
+s1 = xor xor rotr w2 uint 17 rotr w2 uint 19 shr w2 uint 10
+w16 = get g_sha_w sub i ulong 16
+w7 = get g_sha_w sub i ulong 7
+put g_sha_w i add add w16 s0 add w7 s1
+i = add i ulong 1
+end
+end
+
+fn sha256_step_t1 e uint f uint g uint h uint idx ulong to uint
+s1 = xor xor rotr e uint 6 rotr e uint 11 rotr e uint 25
+ch = xor and e f and not e g
+kw = add get g_sha_k idx get g_sha_w idx
+ret add add h s1 add ch kw
+end
+
+fn sha256_step_t2 a uint b uint c uint to uint
+s0 = xor xor rotr a uint 2 rotr a uint 13 rotr a uint 22
+maj = xor xor and a b and a c and b c
+ret add s0 maj
+end
+
+fn sha256_compress to void
+sha256_load_w
+a = get g_sha_h 0
+b = get g_sha_h 1
+c = get g_sha_h 2
+d = get g_sha_h 3
+e = get g_sha_h 4
+f = get g_sha_h 5
+g = get g_sha_h 6
+h = get g_sha_h 7
+for i ulong 64
+t1 = sha256_step_t1 e f g h i
+t2 = sha256_step_t2 a b c
+h = g
+g = f
+f = e
+e = add d t1
+d = c
+c = b
+b = a
+a = add t1 t2
+end
+put g_sha_h 0 add get g_sha_h 0 a
+put g_sha_h 1 add get g_sha_h 1 b
+put g_sha_h 2 add get g_sha_h 2 c
+put g_sha_h 3 add get g_sha_h 3 d
+put g_sha_h 4 add get g_sha_h 4 e
+put g_sha_h 5 add get g_sha_h 5 f
+put g_sha_h 6 add get g_sha_h 6 g
+put g_sha_h 7 add get g_sha_h 7 h
+end
+
+fn sha256_blk_zero to void
+for i ulong 64
+put g_sha_blk i uchar 0
+end
+end
+
+fn sha256_put_len bits ulong to void
+for i ulong 8
+sh = mul sub ulong 7 i ulong 8
+v = and shr bits sh ulong 255
+put g_sha_blk add ulong 56 i uchar v
+end
+end
+
+fn sha256_digest msg view uchar * digest edit uchar 32 to void
+sha256_reset
+n = len msg
+if gt n ulong 65536
+n = ulong 65536
+end
+off = ulong 0
+note bound 1025 covers up to 65536 bytes in 64-byte blocks
+while le add off ulong 64 n bound 1025
+for j ulong 64
+put g_sha_blk j get msg add off j
+end
+sha256_compress
+off = add off ulong 64
+end
+sha256_blk_zero
+remn = sub n off
+j = ulong 0
+while lt j remn bound 64
+put g_sha_blk j get msg add off j
+j = add j ulong 1
+end
+put g_sha_blk remn uchar 0x80
+if gt remn ulong 55
+sha256_compress
+sha256_blk_zero
+end
+bits = mul n ulong 8
+sha256_put_len bits
+sha256_compress
+for i ulong 8
+w = get g_sha_h i
+o = mul i ulong 4
+put digest o uchar and shr w uint 24 uint 255
+put digest add o ulong 1 uchar and shr w uint 16 uint 255
+put digest add o ulong 2 uchar and shr w uint 8 uint 255
+put digest add o ulong 3 uchar and w uint 255
+end
+end
+
+fn sha256_hex msg view uchar * hexbuf edit uchar 64 to void
+dig = new uchar 32 0
+sha256_digest msg dig
+for i ulong 32
+b = ulong get dig i
+hi = shr b ulong 4
+lo = and b ulong 15
+put hexbuf mul i ulong 2 get txt_hex_digits hi
+put hexbuf add mul i ulong 2 ulong 1 get txt_hex_digits lo
+end
+end
+
+fn key_fingerprint key_str view uchar * hexbuf edit uchar 64 to void
+s = trim_start key_str
+e = trim_end key_str
+if ge s e
+sha256_hex part key_str 0 0 hexbuf
+ret
+end
+sha256_hex part key_str s sub e s hexbuf
+end
+
+note --- Base58BTC, RID, DID, and Public Key validation ---
+
+fn is_base58btc b uchar to bool
+if and ge b uchar 49 le b uchar 57
+ret true
+end
+if and ge b uchar 65 le b uchar 72
+ret true
+end
+if and ge b uchar 74 le b uchar 78
+ret true
+end
+if and ge b uchar 80 le b uchar 90
+ret true
+end
+if and ge b uchar 97 le b uchar 107
+ret true
+end
+if and ge b uchar 109 le b uchar 122
+ret true
+end
+ret false
+end
+
+fn is_base64_ch b uchar to bool
+if and ge b uchar 65 le b uchar 90
+ret true
+end
+if and ge b uchar 97 le b uchar 122
+ret true
+end
+if and ge b uchar 48 le b uchar 57
+ret true
+end
+if eq b uchar 43
+ret true
+end
+if eq b uchar 47
+ret true
+end
+if eq b uchar 61
+ret true
+end
+ret false
+end
+
+fn validate_rid rid view uchar * to ulong
+n = len rid
+note Real Radicle RID is rad:z + 27..58 base58btc characters (total 32..63)
+if lt n ulong 32
+ret RAD_ERR_BAD_RID
+end
+if gt n ulong 63
+ret RAD_ERR_BAD_RID
+end
+if not slice_starts_with rid txt_rad_pfx
+ret RAD_ERR_BAD_RID
+end
+i = ulong 5
+while lt i n bound 64
+if not is_base58btc get rid i
+ret RAD_ERR_BAD_RID
+end
+i = add i ulong 1
+end
+ret RAD_OK
+end
+
+fn validate_delegate_did did view uchar * to ulong
+n = len did
+note Ed25519 did:key:z6Mk... has 12-byte prefix + 42..46 base58btc chars (total 54..58)
+if lt n ulong 54
+ret RAD_ERR_BAD_DID
+end
+if gt n ulong 58
+ret RAD_ERR_BAD_DID
+end
+if not slice_starts_with did txt_did_key_pfx
+ret RAD_ERR_BAD_DID
+end
+i = ulong 12
+while lt i n bound 64
+if not is_base58btc get did i
+ret RAD_ERR_BAD_DID
+end
+i = add i ulong 1
+end
+ret RAD_OK
+end
+
+fn validate_anchor_did did view uchar * to ulong
+n = len did
+if lt n ulong 10
+ret RAD_ERR_BAD_DID
+end
+if gt n ulong 63
+ret RAD_ERR_BAD_DID
+end
+if slice_starts_with did txt_did_key_pfx
+ret validate_delegate_did did
+end
+if not slice_starts_with did txt_did_rad_pfx
+ret RAD_ERR_BAD_DID
+end
+i = ulong 8
+while lt i n bound 64
+b = get did i
+ok = false
+if and ge b uchar 97 le b uchar 122
+ok = true
+end
+if and ge b uchar 65 le b uchar 90
+ok = true
+end
+if and ge b uchar 48 le b uchar 57
+ok = true
+end
+if or eq b uchar 58 or eq b uchar 45 eq b uchar 95
+ok = true
+end
+if not ok
+ret RAD_ERR_BAD_DID
+end
+i = add i ulong 1
+end
+ret RAD_OK
+end
+
+fn validate_ssh_ed25519 key_str view uchar * to ulong
+s = trim_start key_str
+e = trim_end key_str
+if ge s e
+ret RAD_ERR_BAD_KEY
+end
+tn = sub e s
+if gt tn ulong 1024
+ret RAD_ERR_BAD_KEY
+end
+if not slice_starts_with part key_str s tn txt_ssh_pfx
+ret RAD_ERR_BAD_KEY
+end
+p = add s ulong 12
+while lt p e bound 1024
+if not is_space_b get key_str p
+break
+end
+p = add p ulong 1
+end
+tok_start = p
+while lt p e bound 1024
+if is_space_b get key_str p
+break
+end
+if not is_base64_ch get key_str p
+ret RAD_ERR_BAD_KEY
+end
+p = add p ulong 1
+end
+tok_len = sub p tok_start
+if lt tok_len ulong 32
+ret RAD_ERR_BAD_KEY
+end
+ret RAD_OK
+end
+
+fn validate_radicle_key key_str view uchar * to ulong
+s = trim_start key_str
+e = trim_end key_str
+if ge s e
+ret RAD_ERR_BAD_KEY
+end
+tn = sub e s
+if gt tn ulong 1024
+ret RAD_ERR_BAD_KEY
+end
+if slice_starts_with part key_str s tn txt_ssh_pfx
+ret validate_ssh_ed25519 part key_str s tn
+end
+if slice_starts_with part key_str s tn txt_rad_pfx
+ret validate_rid part key_str s tn
+end
+if slice_starts_with part key_str s tn txt_did_key_pfx
+ret validate_delegate_did part key_str s tn
+end
+if lt tn ulong 32
+ret RAD_ERR_BAD_KEY
+end
+i = s
+while lt i e bound 1024
+if is_space_b get key_str i
+ret RAD_ERR_BAD_KEY
+end
+i = add i ulong 1
+end
+ret RAD_OK
+end
+
+note --- Threshold and quorum validation ---
+
+fn check_quorum del_n ulong thresh ulong approvals ulong to ulong
+if eq del_n ulong 0
+ret RAD_ERR_BAD_THRESH
+end
+if gt del_n RAD_MAX_DEL
+ret RAD_ERR_TOO_MANY
+end
+if eq thresh ulong 0
+ret RAD_ERR_BAD_THRESH
+end
+if gt thresh del_n
+ret RAD_ERR_BAD_THRESH
+end
+if lt approvals thresh
+ret RAD_ERR_NO_QUORUM
+end
+ret RAD_OK
+end
+
+note --- Base & Remote Identity Document management ---
+
+fn base_doc_reset to void
+put g_base_rid_len 0 ulong 0
+put g_base_del_n 0 ulong 0
+put g_base_thresh 0 ulong 0
+end
+
+fn remote_doc_reset to void
+put g_rem_rid_len 0 ulong 0
+put g_rem_del_n 0 ulong 0
+put g_rem_thresh 0 ulong 0
+end
+
+fn base_doc_set_rid rid view uchar * to ulong
+n = len rid
+if gt n RAD_RID_CAP
+ret RAD_ERR_BAD_RID
+end
+i = ulong 0
+while lt i n bound 64
+put g_base_rid i get rid i
+i = add i ulong 1
+end
+put g_base_rid_len 0 n
+ret RAD_OK
+end
+
+fn remote_doc_set_rid rid view uchar * to ulong
+n = len rid
+if gt n RAD_RID_CAP
+ret RAD_ERR_BAD_RID
+end
+i = ulong 0
+while lt i n bound 64
+put g_rem_rid i get rid i
+i = add i ulong 1
+end
+put g_rem_rid_len 0 n
+ret RAD_OK
+end
+
+fn base_doc_set_threshold t ulong to void
+put g_base_thresh 0 t
+end
+
+fn remote_doc_set_threshold t ulong to void
+put g_rem_thresh 0 t
+end
+
+fn base_doc_add_delegate did view uchar * to ulong
+idx = get g_base_del_n 0
+if ge idx RAD_MAX_DEL
+ret RAD_ERR_TOO_MANY
+end
+n = len did
+if gt n RAD_DID_SLOT
+ret RAD_ERR_BAD_DID
+end
+base = mul idx RAD_DID_SLOT
+i = ulong 0
+while lt i n bound 64
+put g_base_dels add base i get did i
+i = add i ulong 1
+end
+put g_base_del_lens idx n
+put g_base_del_n 0 add idx ulong 1
+ret RAD_OK
+end
+
+fn remote_doc_add_delegate did view uchar * to ulong
+idx = get g_rem_del_n 0
+if ge idx RAD_MAX_DEL
+ret RAD_ERR_TOO_MANY
+end
+n = len did
+if gt n RAD_DID_SLOT
+ret RAD_ERR_BAD_DID
+end
+base = mul idx RAD_DID_SLOT
+i = ulong 0
+while lt i n bound 64
+put g_rem_dels add base i get did i
+i = add i ulong 1
+end
+put g_rem_del_lens idx n
+put g_rem_del_n 0 add idx ulong 1
+ret RAD_OK
+end
+
+fn base_del_eq_idx a ulong b ulong to bool
+la = get g_base_del_lens a
+lb = get g_base_del_lens b
+if ne la lb
+ret false
+end
+oa = mul a RAD_DID_SLOT
+ob = mul b RAD_DID_SLOT
+i = ulong 0
+while lt i la bound 64
+if ne get g_base_dels add oa i get g_base_dels add ob i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn rem_del_eq_idx a ulong b ulong to bool
+la = get g_rem_del_lens a
+lb = get g_rem_del_lens b
+if ne la lb
+ret false
+end
+oa = mul a RAD_DID_SLOT
+ob = mul b RAD_DID_SLOT
+i = ulong 0
+while lt i la bound 64
+if ne get g_rem_dels add oa i get g_rem_dels add ob i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn base_rem_del_eq bi ulong ri ulong to bool
+lb = get g_base_del_lens bi
+lr = get g_rem_del_lens ri
+if ne lb lr
+ret false
+end
+ob = mul bi RAD_DID_SLOT
+or_off = mul ri RAD_DID_SLOT
+i = ulong 0
+while lt i lb bound 64
+if ne get g_base_dels add ob i get g_rem_dels add or_off i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn rids_match to bool
+lb = get g_base_rid_len 0
+lr = get g_rem_rid_len 0
+if ne lb lr
+ret false
+end
+i = ulong 0
+while lt i lb bound 64
+if ne get g_base_rid i get g_rem_rid i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn validate_base_doc to ulong
+rl = get g_base_rid_len 0
+if eq rl ulong 0
+ret RAD_ERR_BAD_RID
+end
+rbuf = new uchar 64 0
+i = ulong 0
+while lt i rl bound 64
+put rbuf i get g_base_rid i
+i = add i ulong 1
+end
+rc = validate_rid part rbuf 0 rl
+if ne rc RAD_OK
+ret rc
+end
+dn = get g_base_del_n 0
+th = get g_base_thresh 0
+if eq dn ulong 0
+ret RAD_ERR_BAD_THRESH
+end
+if gt dn RAD_MAX_DEL
+ret RAD_ERR_TOO_MANY
+end
+if or eq th ulong 0 gt th dn
+ret RAD_ERR_BAD_THRESH
+end
+dbuf = new uchar 64 0
+d = ulong 0
+while lt d dn bound 16
+dl = get g_base_del_lens d
+off = mul d RAD_DID_SLOT
+j = ulong 0
+while lt j dl bound 64
+put dbuf j get g_base_dels add off j
+j = add j ulong 1
+end
+dc = validate_delegate_did part dbuf 0 dl
+if ne dc RAD_OK
+ret dc
+end
+k = add d ulong 1
+while lt k dn bound 16
+if base_del_eq_idx d k
+ret RAD_ERR_DUP_DEL
+end
+k = add k ulong 1
+end
+d = add d ulong 1
+end
+ret RAD_OK
+end
+
+fn validate_remote_doc to ulong
+rl = get g_rem_rid_len 0
+if eq rl ulong 0
+ret RAD_ERR_BAD_RID
+end
+rbuf = new uchar 64 0
+i = ulong 0
+while lt i rl bound 64
+put rbuf i get g_rem_rid i
+i = add i ulong 1
+end
+rc = validate_rid part rbuf 0 rl
+if ne rc RAD_OK
+ret rc
+end
+dn = get g_rem_del_n 0
+th = get g_rem_thresh 0
+if eq dn ulong 0
+ret RAD_ERR_BAD_THRESH
+end
+if gt dn RAD_MAX_DEL
+ret RAD_ERR_TOO_MANY
+end
+if or eq th ulong 0 gt th dn
+ret RAD_ERR_BAD_THRESH
+end
+dbuf = new uchar 64 0
+d = ulong 0
+while lt d dn bound 16
+dl = get g_rem_del_lens d
+off = mul d RAD_DID_SLOT
+j = ulong 0
+while lt j dl bound 64
+put dbuf j get g_rem_dels add off j
+j = add j ulong 1
+end
+dc = validate_delegate_did part dbuf 0 dl
+if ne dc RAD_OK
+ret dc
+end
+k = add d ulong 1
+while lt k dn bound 16
+if rem_del_eq_idx d k
+ret RAD_ERR_DUP_DEL
+end
+k = add k ulong 1
+end
+d = add d ulong 1
+end
+ret RAD_OK
+end
+
+fn rad_doc_count_common to ulong
+bn = get g_base_del_n 0
+rn = get g_rem_del_n 0
+common_n = ulong 0
+bi = ulong 0
+while lt bi bn bound 16
+found = false
+ri = ulong 0
+while lt ri rn bound 16
+if base_rem_del_eq bi ri
+found = true
+break
+end
+ri = add ri ulong 1
+end
+if found
+common_n = add common_n ulong 1
+end
+bi = add bi ulong 1
+end
+ret common_n
+end
+
+fn rad_doc_diff_sync approvals ulong allow_add ulong diff edit RadDiff to void
+put diff code RAD_OK
+put diff decision SYNC_REFUSED
+put diff added ulong 0
+put diff removed ulong 0
+put diff common ulong 0
+put diff thresh_chg ulong 0
+vc = validate_base_doc
+if ne vc RAD_OK
+put diff code vc
+ret
+end
+vc = validate_remote_doc
+if ne vc RAD_OK
+put diff code vc
+ret
+end
+if not rids_match
+put diff code RAD_ERR_RID_MISMATCH
+ret
+end
+bn = get g_base_del_n 0
+rn = get g_rem_del_n 0
+common_n = rad_doc_count_common
+rem_n = sub bn common_n
+add_n = sub rn common_n
+tchg = ulong 0
+if ne get g_base_thresh 0 get g_rem_thresh 0
+tchg = ulong 1
+end
+put diff added add_n
+put diff removed rem_n
+put diff common common_n
+put diff thresh_chg tchg
+any_chg = add add add_n rem_n tchg
+if eq any_chg ulong 0
+put diff code RAD_OK
+put diff decision SYNC_IN_SYNC
+ret
+end
+if and gt add_n ulong 0 eq allow_add ulong 0
+put diff code RAD_ERR_UNAUTH_DEL
+put diff decision SYNC_REFUSED
+ret
+end
+vc = check_quorum bn get g_base_thresh 0 approvals
+if ne vc RAD_OK
+put diff code vc
+put diff decision SYNC_REFUSED
+ret
+end
+put diff code RAD_OK
+if or gt add_n ulong 0 gt rem_n ulong 0
+put diff decision SYNC_ROTATED
+else
+put diff decision SYNC_UPDATE_OK
+end
+end
+
+note --- Identity Anchor (upstream identity.rs + keys.rs) ---
+
+fn anchor_init_default to void
+dn = len txt_def_did
+i = ulong 0
+while lt i dn bound 64
+put g_anc_did i get txt_def_did i
+i = add i ulong 1
+end
+put g_anc_did_len 0 dn
+nn = len txt_def_name
+j = ulong 0
+while lt j nn bound 64
+put g_anc_name j get txt_def_name j
+j = add j ulong 1
+end
+put g_anc_name_len 0 nn
+put g_anc_etype 0 ENTITY_AGENT
+put g_anc_rad_len 0 ulong 0
+put g_anc_ssh_len 0 ulong 0
+put g_anc_hist_n 0 ulong 0
+for k ulong 64
+put g_anc_rad_fp k uchar 0
+put g_anc_ssh_fp k uchar 0
+end
+end
+
+fn anchor_set_identity did view uchar * name view uchar * etype ulong to ulong
+dc = validate_anchor_did did
+if ne dc RAD_OK
+ret dc
+end
+dn = len did
+nn = len name
+if or eq nn ulong 0 gt nn ulong 63
+ret RAD_ERR_PARSE
+end
+i = ulong 0
+while lt i dn bound 64
+put g_anc_did i get did i
+i = add i ulong 1
+end
+put g_anc_did_len 0 dn
+j = ulong 0
+while lt j nn bound 64
+put g_anc_name j get name j
+j = add j ulong 1
+end
+put g_anc_name_len 0 nn
+put g_anc_etype 0 etype
+ret RAD_OK
+end
+
+fn anchor_rad_matches key_str view uchar * to bool
+cur = get g_anc_rad_len 0
+if ne cur len key_str
+ret false
+end
+i = ulong 0
+while lt i cur bound 256
+if ne get g_anc_rad_key i get key_str i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn anchor_ssh_matches key_str view uchar * to bool
+cur = get g_anc_ssh_len 0
+if ne cur len key_str
+ret false
+end
+i = ulong 0
+while lt i cur bound 256
+if ne get g_anc_ssh_key i get key_str i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn anchor_sync_rad_key rad_key view uchar * st edit AnchorSync to ulong
+fp = new uchar 64 0
+rs = trim_start rad_key
+re = trim_end rad_key
+if ge rs re
+ret RAD_OK
+end
+rlen = sub re rs
+if gt rlen RAD_KEY_CAP
+ret RAD_ERR_BAD_KEY
+end
+rc = validate_radicle_key part rad_key rs rlen
+if ne rc RAD_OK
+ret rc
+end
+if not anchor_rad_matches part rad_key rs rlen
+if gt get g_anc_rad_len 0 ulong 0
+put st rotated ulong 1
+end
+put st rad_chg ulong 1
+i = ulong 0
+while lt i rlen bound 256
+put g_anc_rad_key i get rad_key add rs i
+i = add i ulong 1
+end
+put g_anc_rad_len 0 rlen
+key_fingerprint part rad_key rs rlen fp
+for f ulong 64
+put g_anc_rad_fp f get fp f
+end
+put g_anc_hist_n 0 add get g_anc_hist_n 0 ulong 1
+end
+ret RAD_OK
+end
+
+fn anchor_sync_ssh_key ssh_key view uchar * st edit AnchorSync to ulong
+fp = new uchar 64 0
+ss = trim_start ssh_key
+se = trim_end ssh_key
+if ge ss se
+ret RAD_OK
+end
+slen = sub se ss
+if gt slen RAD_KEY_CAP
+ret RAD_ERR_BAD_KEY
+end
+sc = validate_ssh_ed25519 part ssh_key ss slen
+if ne sc RAD_OK
+ret sc
+end
+if not anchor_ssh_matches part ssh_key ss slen
+if gt get g_anc_ssh_len 0 ulong 0
+put st rotated ulong 1
+end
+put st ssh_chg ulong 1
+j = ulong 0
+while lt j slen bound 256
+put g_anc_ssh_key j get ssh_key add ss j
+j = add j ulong 1
+end
+put g_anc_ssh_len 0 slen
+key_fingerprint part ssh_key ss slen fp
+for f ulong 64
+put g_anc_ssh_fp f get fp f
+end
+put g_anc_hist_n 0 add get g_anc_hist_n 0 ulong 1
+end
+ret RAD_OK
+end
+
+fn anchor_sync_keys rad_key view uchar * ssh_key view uchar * st edit AnchorSync to void
+put st code RAD_OK
+put st in_sync ulong 0
+put st rotated ulong 0
+put st rad_chg ulong 0
+put st ssh_chg ulong 0
+put st hist_n get g_anc_hist_n 0
+rc = anchor_sync_rad_key rad_key st
+if ne rc RAD_OK
+put st code rc
+ret
+end
+sc = anchor_sync_ssh_key ssh_key st
+if ne sc RAD_OK
+put st code sc
+ret
+end
+if or gt get g_anc_rad_len 0 ulong 0 gt get g_anc_ssh_len 0 ulong 0
+put st in_sync ulong 1
+end
+put st hist_n get g_anc_hist_n 0
+end
+
+fn anchor_render_json st view AnchorSync dst edit uchar * to ulong
+p = ulong 0
+p = append_bytes dst p txt_j_open
+dl = get g_anc_did_len 0
+i = ulong 0
+while lt i dl bound 64
+p = append_byte dst p get g_anc_did i
+i = add i ulong 1
+end
+p = append_bytes dst p txt_j_name
+nl = get g_anc_name_len 0
+j = ulong 0
+while lt j nl bound 64
+p = append_byte dst p get g_anc_name j
+j = add j ulong 1
+end
+p = append_bytes dst p txt_j_insync
+if eq get st in_sync ulong 1
+p = append_bytes dst p txt_true
+else
+p = append_bytes dst p txt_false
+end
+p = append_bytes dst p txt_j_rot
+if eq get st rotated ulong 1
+p = append_bytes dst p txt_true
+else
+p = append_bytes dst p txt_false
+end
+p = append_bytes dst p txt_j_hist
+p = append_u64 dst p get st hist_n
+p = append_bytes dst p txt_j_radfp
+if gt get g_anc_rad_len 0 ulong 0
+for k ulong 64
+p = append_byte dst p get g_anc_rad_fp k
+end
+end
+p = append_bytes dst p txt_j_sshfp
+if gt get g_anc_ssh_len 0 ulong 0
+for k2 ulong 64
+p = append_byte dst p get g_anc_ssh_fp k2
+end
+end
+p = append_bytes dst p txt_j_msg
+if eq get st in_sync ulong 0
+p = append_bytes dst p txt_msg_none
+else
+if eq get st rotated ulong 1
+if and eq get st rad_chg ulong 1 eq get st ssh_chg ulong 1
+p = append_bytes dst p txt_msg_both_rot
+else
+if eq get st rad_chg ulong 1
+p = append_bytes dst p txt_msg_rad_rot
+else
+p = append_bytes dst p txt_msg_ssh_rot
+end
+end
+else
+p = append_bytes dst p txt_msg_synced
+end
+end
+p = append_bytes dst p txt_j_close
+ret p
+end
+
+fn parse_u64_strict s view uchar * ok edit ulong 1 to ulong
+put ok 0 ulong 0
+n = len s
+if or eq n ulong 0 gt n ulong 18
+ret ulong 0
+end
+acc = ulong 0
+i = ulong 0
+while lt i n bound 20
+b = get s i
+if or lt b uchar 48 gt b uchar 57
+ret ulong 0
+end
+acc = add mul acc ulong 10 ulong sub b uchar 48
+i = add i ulong 1
+end
+put ok 0 ulong 1
+ret acc
+end

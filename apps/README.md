@@ -1,8 +1,8 @@
 # apps: Interplane Forge, sites, Hop and publishing tools of Sovereign Intelligence (SI)
 
-Mirrors [gpu/README.md](../gpu/README.md) for the user-facing applications, sites and publishing layer (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex`).
+Mirrors [gpu/README.md](../gpu/README.md) for the user-facing applications, sites and publishing layer (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, and `aien-translate`).
 
-Everything moved under `apps/` is pure seeded Omega (`.om`) built by `omega-mv`'s own `seed/out/omc`, plus provenance records (`apps/import/`) and tables listing what compiles and what remains non-Omega upstream (`apps/NOT-YET-OMEGA.tsv`). **Only pure Omega moved in.**
+Everything under `apps/` is pure seeded Omega (`.om`) built by `omega-mv`'s own `seed/out/omc`, plus provenance records (`apps/import/`) and tables listing what compiles and what remains non-Omega upstream (`apps/NOT-YET-OMEGA.tsv`). **Only pure Omega lives here.**
 
 ## Layout
 
@@ -13,8 +13,12 @@ Everything moved under `apps/` is pure seeded Omega (`.om`) built by `omega-mv`'
 | `apps/interplane-site/` | `interplane.io` (`rad:z399yKvnXcBQNkKoq86iBDgTvQ5QV`) | `4573e1d996e0` | 4 | 27 | 140 |
 | `apps/hop/` | `hop` (`interplane:hop`) | `59208f4d3b4a` | 28 | 38 | 129 |
 | `apps/omtex/` | `omtex` (`rad:zcBSb6QfXYD2tVRHF6GmXBALFx66`) | `6f01dcf896a3` | 5 | 1 | 17 |
+| `apps/omega-projects/` | `omega-projects` (`rad:z4Yun5Auii2oWtmDnHrm2V4wcZkhU`) | `e97e46efbb7b` | 3 | converted | 13 |
+| `apps/edge/` | `aien-edge` (`rad:z2Ajufz3KS3GompMJ2SJmAz8mRnk6`) | `8ad4253d8855` | 3 | converted | 20 |
+| `apps/readings-window/` | `readings-window` (`rad:z2Jhza2V51dFcMFUhNiFcXHpE5Ewy`) | `1f2f34702c2a` | 3 | converted | 22 |
+| `apps/translate/` | `aien-translate` (`rad:z49FTK9M33MFjenns3vqDqqN66zj7`) | `cfcd35fbd150` | 3 | converted | 33 |
 
-Total imported in `apps/`: **395 `.om` files** across **530 history-preserving commits** (1976 non-`.om` first-party files stayed upstream and are listed in [`apps/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
+Total in `apps/`: **407 `.om` files** (395 imported across 530 history-preserving commits + 12 newly converted pure-Omega `.om` files across 4 repositories; non-`.om` upstream files for the imported repos are listed in [`apps/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
 
 ## One compiler
 

@@ -1,0 +1,1153 @@
+note aienux/debugger/lib.om: pure-Omega continuous watchdog, metric triage, and JSON-RPC dispatcher
+note Faithful port of upstream spark-debugger (audit, watchdog daemon hysteresis, MCP JSON-RPC stdio)
+note with strict metric snapshot parsing, deterministic OK/WARN/DEGRADED/CRITICAL classification,
+note debounce/hysteresis counters, unslop check, and JSON-RPC 2.0 request/response dispatch.
+note Compose with si/directives/om2.om ahead of this file.
+
+const SEV_OK ulong 0
+const SEV_WARN ulong 1
+const SEV_DEGRADED ulong 2
+const SEV_CRITICAL ulong 3
+
+const RSN_LOAD ulong 1
+const RSN_MEM ulong 2
+const RSN_DISK ulong 4
+const RSN_GPU_TEMP ulong 8
+const RSN_GPU_MEM ulong 16
+const RSN_SERVICES ulong 32
+const RSN_ENV_LEAK ulong 64
+const RSN_BUILD ulong 128
+
+const DBG_OK ulong 0
+const DBG_ERR_EMPTY ulong 1
+const DBG_ERR_SYNTAX ulong 2
+const DBG_ERR_RANGE ulong 3
+const DBG_ERR_SVC_STATE ulong 4
+const DBG_ERR_UNKNOWN_KEY ulong 5
+
+struct MetricSnap load_x100 ulong mem_pct ulong disk_free ulong gpu_temp ulong gpu_mem ulong svc_total ulong svc_up ulong env_leaks ulong build_ok ulong seen_n ulong end
+struct TriageRes sev ulong reasons ulong healthy ulong end
+struct Watchdog committed ulong raise_streak ulong clear_streak ulong raise_need ulong clear_need ulong crit_fast ulong consec_fail ulong incidents ulong samples ulong last_raw ulong last_reasons ulong end
+struct StepOut raw_sev ulong committed_sev ulong escalated ulong recovered ulong emit_incident ulong reasons ulong end
+
+text d_sev_ok "OK"
+text d_sev_warn "WARN"
+text d_sev_deg "DEGRADED"
+text d_sev_crit "CRITICAL"
+
+text d_k_load "load"
+text d_k_mem "mem"
+text d_k_mem_pct "mem_pct"
+text d_k_disk "disk_free"
+text d_k_gtemp "gpu_temp"
+text d_k_gmem "gpu_mem"
+text d_k_stotal "services_total"
+text d_k_sup "services_up"
+text d_k_sstate "service_state"
+text d_k_env "env_leaks"
+text d_k_build "build_ok"
+
+text d_v_up "up"
+text d_v_ok "ok"
+text d_v_deg "degraded"
+text d_v_down "down"
+text d_v_true "true"
+text d_v_false "false"
+text d_v_null "null"
+
+text d_rpc_20 "2.0"
+text d_kf_jsonrpc "jsonrpc"
+text d_kf_id "id"
+text d_kf_method "method"
+text d_kf_snapshot "snapshot"
+
+text d_m_diag "diagnose"
+text d_m_status "status"
+text d_m_triage "triage"
+text d_m_init "initialize"
+text d_m_notif "notifications/initialized"
+text d_m_tlist "tools/list"
+
+text d_j_pre "{\"jsonrpc\":\"2.0\",\"id\":"
+text d_j_res ",\"result\":"
+text d_j_err_parse "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n"
+text d_j_err_req ",\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}\n"
+text d_j_err_mth ",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}\n"
+text d_j_err_prm ",\"error\":{\"code\":-32602,\"message\":\"Invalid params\"}}\n"
+
+text d_j_init "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"spark-debugger\",\"version\":\"0.1.0\"}}}\n"
+text d_j_tlist "{\"tools\":[{\"name\":\"debug_scan\",\"description\":\"Complete diagnostic scan\"},{\"name\":\"debug_check_services\",\"description\":\"Probe SparkOS services\"},{\"name\":\"debug_audit_invariants\",\"description\":\"Audit vault and unslop invariants\"}]}}\n"
+
+text d_jd_1 "{\"severity\":\""
+text d_jd_2 "\",\"severity_code\":"
+text d_jd_3 ",\"healthy\":"
+text d_jd_4 ",\"reasons\":"
+text d_jd_5 ",\"load_x100\":"
+text d_jd_6 ",\"mem_pct\":"
+text d_jd_7 ",\"disk_free\":"
+text d_jd_8 ",\"gpu_temp\":"
+text d_jd_9 ",\"gpu_mem\":"
+text d_jd_10 ",\"services_up\":"
+text d_jd_11 ",\"services_total\":"
+text d_jd_12 ",\"env_leaks\":"
+text d_jd_13 ",\"build_ok\":"
+text d_j_end2 "}}\n"
+
+text d_js_1 "{\"committed_severity\":\""
+text d_js_2 "\",\"committed_code\":"
+text d_js_3 ",\"last_raw_severity\":\""
+text d_js_4 "\",\"consec_fail\":"
+text d_js_5 ",\"raise_streak\":"
+text d_js_6 ",\"clear_streak\":"
+text d_js_7 ",\"incidents\":"
+text d_js_8 ",\"samples\":"
+
+text d_jt_1 "{\"raw_severity\":\""
+text d_jt_2 "\",\"committed_severity\":\""
+text d_jt_3 "\",\"escalated\":"
+text d_jt_4 ",\"recovered\":"
+text d_jt_5 ",\"emit_incident\":"
+text d_jt_6 ",\"reasons\":"
+text d_jt_7 ",\"consec_fail\":"
+text d_jt_8 ",\"incidents\":"
+
+note --- Basic helpers ---
+
+fn dbg_is_ws b uchar to bool
+if eq b uchar 32
+ret true
+end
+if eq b uchar 9
+ret true
+end
+if eq b uchar 10
+ret true
+end
+if eq b uchar 13
+ret true
+end
+ret false
+end
+
+fn dbg_is_sep b uchar to bool
+if dbg_is_ws b
+ret true
+end
+if eq b uchar 59
+ret true
+end
+if eq b uchar 44
+ret true
+end
+ret false
+end
+
+fn dbg_eq a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+if gt na ulong 65536
+ret false
+end
+i = ulong 0
+while lt i na bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn dbg_starts_with s view uchar * pfx view uchar * to bool
+ns = len s
+np = len pfx
+if lt ns np
+ret false
+end
+if gt np ulong 4096
+ret false
+end
+i = ulong 0
+while lt i np bound 4096
+if ne get s i get pfx i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn dbg_contains s view uchar * needle view uchar * to bool
+ns = len s
+nn = len needle
+if or eq nn ulong 0 gt nn ns
+ret false
+end
+if gt ns ulong 16384
+ret false
+end
+lim = add sub ns nn ulong 1
+i = ulong 0
+while lt i lim bound 16384
+if dbg_starts_with part s i sub ns i needle
+ret true
+end
+i = add i ulong 1
+end
+ret false
+end
+
+fn dbg_write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn dbg_put_b dst edit uchar * pos ulong b uchar to ulong
+if ge pos len dst
+ret pos
+end
+put dst pos b
+ret add pos ulong 1
+end
+
+fn dbg_put_s dst edit uchar * pos ulong src view uchar * to ulong
+ns = len src
+if gt ns ulong 65536
+ret pos
+end
+cap = len dst
+p = pos
+i = ulong 0
+while lt i ns bound 65536
+if ge p cap
+ret p
+end
+put dst p get src i
+p = add p ulong 1
+i = add i ulong 1
+end
+ret p
+end
+
+fn dbg_put_u64 dst edit uchar * pos ulong v ulong to ulong
+tmp = new uchar 24 0
+n = ulong 0
+cur = v
+if eq cur ulong 0
+put tmp 0 uchar 48
+n = ulong 1
+else
+while gt cur ulong 0 bound 24
+d = rem cur ulong 10
+put tmp n uchar add d ulong 48
+cur = div cur ulong 10
+n = add n ulong 1
+end
+end
+p = pos
+i = n
+while gt i ulong 0 bound 24
+i = sub i ulong 1
+p = dbg_put_b dst p get tmp i
+end
+ret p
+end
+
+fn dbg_put_bool dst edit uchar * pos ulong v ulong to ulong
+if ne v ulong 0
+ret dbg_put_s dst pos d_v_true
+end
+ret dbg_put_s dst pos d_v_false
+end
+
+fn dbg_put_sev dst edit uchar * pos ulong sev ulong to ulong
+if eq sev SEV_CRITICAL
+ret dbg_put_s dst pos d_sev_crit
+end
+if eq sev SEV_DEGRADED
+ret dbg_put_s dst pos d_sev_deg
+end
+if eq sev SEV_WARN
+ret dbg_put_s dst pos d_sev_warn
+end
+ret dbg_put_s dst pos d_sev_ok
+end
+
+fn dbg_parse_u64 s view uchar * ok edit ulong 1 to ulong
+put ok 0 ulong 0
+n = len s
+if or eq n ulong 0 gt n ulong 12
+ret ulong 0
+end
+acc = ulong 0
+i = ulong 0
+while lt i n bound 16
+b = get s i
+if or lt b uchar 48 gt b uchar 57
+ret ulong 0
+end
+acc = add mul acc ulong 10 ulong sub b uchar 48
+i = add i ulong 1
+end
+put ok 0 ulong 1
+ret acc
+end
+
+fn dbg_parse_load_x100 s view uchar * ok edit ulong 1 to ulong
+put ok 0 ulong 0
+n = len s
+if or eq n ulong 0 gt n ulong 10
+ret ulong 0
+end
+whole = ulong 0
+frac = ulong 0
+fdig = ulong 0
+seen_dot = false
+seen_dig = false
+i = ulong 0
+while lt i n bound 12
+b = get s i
+if eq b uchar 46
+if seen_dot
+ret ulong 0
+end
+seen_dot = true
+else
+if or lt b uchar 48 gt b uchar 57
+ret ulong 0
+end
+seen_dig = true
+d = ulong sub b uchar 48
+if not seen_dot
+whole = add mul whole ulong 10 d
+if gt whole ulong 1000
+ret ulong 0
+end
+else
+if lt fdig ulong 2
+frac = add mul frac ulong 10 d
+fdig = add fdig ulong 1
+else
+ret ulong 0
+end
+end
+end
+i = add i ulong 1
+end
+if not seen_dig
+ret ulong 0
+end
+if eq fdig ulong 1
+frac = mul frac ulong 10
+end
+put ok 0 ulong 1
+ret add mul whole ulong 100 frac
+end
+
+note --- Unslop invariant check (UTF-8 em-dash E2 80 94 / en-dash E2 80 93) ---
+
+fn dbg_count_unslop buf view uchar * to ulong
+n = len buf
+if lt n ulong 3
+ret ulong 0
+end
+if gt n ulong 65536
+ret ulong 0
+end
+hits = ulong 0
+lim = sub n ulong 2
+i = ulong 0
+while lt i lim bound 65536
+if eq get buf i uchar 0xe2
+if eq get buf add i ulong 1 uchar 0x80
+b2 = get buf add i ulong 2
+if or eq b2 uchar 0x94 eq b2 uchar 0x93
+hits = add hits ulong 1
+end
+end
+end
+i = add i ulong 1
+end
+ret hits
+end
+
+note --- Metric snapshot initialization and parser ---
+
+fn dbg_snap_init snap edit MetricSnap to void
+put snap load_x100 ulong 0
+put snap mem_pct ulong 0
+put snap disk_free ulong 100
+put snap gpu_temp ulong 40
+put snap gpu_mem ulong 0
+put snap svc_total ulong 5
+put snap svc_up ulong 5
+put snap env_leaks ulong 0
+put snap build_ok ulong 1
+put snap seen_n ulong 0
+end
+
+fn dbg_parse_svc_ratio val view uchar * snap edit MetricSnap to ulong
+ok = new ulong 1 0
+n = len val
+slash = n
+i = ulong 0
+while lt i n bound 32
+if eq get val i uchar 47
+slash = i
+break
+end
+i = add i ulong 1
+end
+if or eq slash ulong 0 ge add slash ulong 1 n
+ret DBG_ERR_SYNTAX
+end
+up = dbg_parse_u64 part val 0 slash ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+tot = dbg_parse_u64 part val add slash ulong 1 sub sub n slash ulong 1 ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if or gt tot ulong 64 gt up tot
+ret DBG_ERR_SVC_STATE
+end
+put snap svc_up up
+put snap svc_total tot
+ret DBG_OK
+end
+
+fn dbg_apply_metric k view uchar * v view uchar * snap edit MetricSnap to ulong
+ok = new ulong 1 0
+if dbg_eq k d_k_load
+lv = dbg_parse_load_x100 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+put snap load_x100 lv
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if or dbg_eq k d_k_mem dbg_eq k d_k_mem_pct
+mv = dbg_parse_u64 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if gt mv ulong 100
+ret DBG_ERR_RANGE
+end
+put snap mem_pct mv
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if dbg_eq k d_k_disk
+dv = dbg_parse_u64 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if gt dv ulong 100
+ret DBG_ERR_RANGE
+end
+put snap disk_free dv
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if dbg_eq k d_k_gtemp
+tv = dbg_parse_u64 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if gt tv ulong 200
+ret DBG_ERR_RANGE
+end
+put snap gpu_temp tv
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if dbg_eq k d_k_gmem
+gv = dbg_parse_u64 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if gt gv ulong 100
+ret DBG_ERR_RANGE
+end
+put snap gpu_mem gv
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if dbg_eq k d_k_stotal
+sv = dbg_parse_u64 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if gt sv ulong 64
+ret DBG_ERR_RANGE
+end
+put snap svc_total sv
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if dbg_eq k d_k_sup
+uv = dbg_parse_u64 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if gt uv ulong 64
+ret DBG_ERR_RANGE
+end
+put snap svc_up uv
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if dbg_eq k d_k_sstate
+put snap seen_n add get snap seen_n ulong 1
+if or dbg_eq v d_v_up dbg_eq v d_v_ok
+put snap svc_up get snap svc_total
+ret DBG_OK
+end
+if dbg_eq v d_v_down
+put snap svc_up ulong 0
+ret DBG_OK
+end
+if dbg_eq v d_v_deg
+tot = get snap svc_total
+if gt tot ulong 1
+put snap svc_up sub tot ulong 1
+else
+put snap svc_up ulong 0
+end
+ret DBG_OK
+end
+ret dbg_parse_svc_ratio v snap
+end
+if dbg_eq k d_k_env
+ev = dbg_parse_u64 v ok
+if eq get ok 0 ulong 0
+ret DBG_ERR_SYNTAX
+end
+if gt ev ulong 1000
+ret DBG_ERR_RANGE
+end
+put snap env_leaks ev
+put snap seen_n add get snap seen_n ulong 1
+ret DBG_OK
+end
+if dbg_eq k d_k_build
+put snap seen_n add get snap seen_n ulong 1
+if dbg_eq v d_v_true
+put snap build_ok ulong 1
+ret DBG_OK
+end
+if dbg_eq v d_v_false
+put snap build_ok ulong 0
+ret DBG_OK
+end
+bv = dbg_parse_u64 v ok
+if or eq get ok 0 ulong 0 gt bv ulong 1
+ret DBG_ERR_SYNTAX
+end
+put snap build_ok bv
+ret DBG_OK
+end
+ret DBG_ERR_UNKNOWN_KEY
+end
+
+fn dbg_parse_kv_tok tok view uchar * snap edit MetricSnap to ulong
+kbuf = new uchar 32 0
+n = len tok
+if gt n ulong 128
+ret DBG_ERR_SYNTAX
+end
+eqp = n
+i = ulong 0
+while lt i n bound 128
+if eq get tok i uchar 61
+eqp = i
+break
+end
+i = add i ulong 1
+end
+if or eq eqp ulong 0 or gt eqp ulong 32 ge add eqp ulong 1 n
+ret DBG_ERR_SYNTAX
+end
+j = ulong 0
+while lt j eqp bound 32
+put kbuf j get tok j
+j = add j ulong 1
+end
+voff = add eqp ulong 1
+ret dbg_apply_metric part kbuf 0 eqp part tok voff sub n voff snap
+end
+
+fn dbg_parse_snapshot src view uchar * snap edit MetricSnap to ulong
+dbg_snap_init snap
+n = len src
+if gt n ulong 4096
+ret DBG_ERR_SYNTAX
+end
+pos = ulong 0
+while lt pos n bound 4096
+while lt pos n bound 4096
+if not dbg_is_sep get src pos
+break
+end
+pos = add pos ulong 1
+end
+if ge pos n
+break
+end
+ts = pos
+while lt pos n bound 4096
+if dbg_is_sep get src pos
+break
+end
+pos = add pos ulong 1
+end
+tl = sub pos ts
+rc = dbg_parse_kv_tok part src ts tl snap
+if ne rc DBG_OK
+ret rc
+end
+end
+if eq get snap seen_n ulong 0
+ret DBG_ERR_EMPTY
+end
+if gt get snap svc_up get snap svc_total
+ret DBG_ERR_SVC_STATE
+end
+ret DBG_OK
+end
+
+note --- Deterministic severity and triage classifier ---
+
+fn dbg_max_sev a ulong b ulong to ulong
+if gt b a
+ret b
+end
+ret a
+end
+
+fn dbg_classify snap view MetricSnap res edit TriageRes to void
+sev = SEV_OK
+rsn = ulong 0
+if gt get snap env_leaks ulong 0
+rsn = or rsn RSN_ENV_LEAK
+sev = dbg_max_sev sev SEV_CRITICAL
+end
+df = get snap disk_free
+if lt df ulong 5
+rsn = or rsn RSN_DISK
+sev = dbg_max_sev sev SEV_CRITICAL
+else
+if lt df ulong 12
+rsn = or rsn RSN_DISK
+sev = dbg_max_sev sev SEV_DEGRADED
+else
+if lt df ulong 20
+rsn = or rsn RSN_DISK
+sev = dbg_max_sev sev SEV_WARN
+end
+end
+end
+gtmp = get snap gpu_temp
+if ge gtmp ulong 90
+rsn = or rsn RSN_GPU_TEMP
+sev = dbg_max_sev sev SEV_CRITICAL
+else
+if ge gtmp ulong 82
+rsn = or rsn RSN_GPU_TEMP
+sev = dbg_max_sev sev SEV_DEGRADED
+else
+if ge gtmp ulong 75
+rsn = or rsn RSN_GPU_TEMP
+sev = dbg_max_sev sev SEV_WARN
+end
+end
+end
+mp = get snap mem_pct
+if ge mp ulong 95
+rsn = or rsn RSN_MEM
+sev = dbg_max_sev sev SEV_CRITICAL
+else
+if ge mp ulong 88
+rsn = or rsn RSN_MEM
+sev = dbg_max_sev sev SEV_DEGRADED
+else
+if ge mp ulong 75
+rsn = or rsn RSN_MEM
+sev = dbg_max_sev sev SEV_WARN
+end
+end
+end
+gm = get snap gpu_mem
+if ge gm ulong 98
+rsn = or rsn RSN_GPU_MEM
+sev = dbg_max_sev sev SEV_CRITICAL
+else
+if ge gm ulong 92
+rsn = or rsn RSN_GPU_MEM
+sev = dbg_max_sev sev SEV_DEGRADED
+else
+if ge gm ulong 80
+rsn = or rsn RSN_GPU_MEM
+sev = dbg_max_sev sev SEV_WARN
+end
+end
+end
+ld = get snap load_x100
+if ge ld ulong 1600
+rsn = or rsn RSN_LOAD
+sev = dbg_max_sev sev SEV_DEGRADED
+else
+if ge ld ulong 800
+rsn = or rsn RSN_LOAD
+sev = dbg_max_sev sev SEV_WARN
+end
+end
+st = get snap svc_total
+su = get snap svc_up
+if gt st ulong 0
+if eq su ulong 0
+rsn = or rsn RSN_SERVICES
+sev = dbg_max_sev sev SEV_CRITICAL
+else
+if lt su st
+rsn = or rsn RSN_SERVICES
+sev = dbg_max_sev sev SEV_DEGRADED
+end
+end
+end
+if eq get snap build_ok ulong 0
+rsn = or rsn RSN_BUILD
+sev = dbg_max_sev sev SEV_DEGRADED
+end
+put res sev sev
+put res reasons rsn
+if eq sev SEV_OK
+put res healthy ulong 1
+else
+put res healthy ulong 0
+end
+end
+
+note --- Anomaly hysteresis / debounce watchdog engine ---
+
+fn dbg_wd_init wd edit Watchdog r_need ulong c_need ulong crit_fast ulong to void
+rn = r_need
+if eq rn ulong 0
+rn = ulong 1
+end
+cn = c_need
+if eq cn ulong 0
+cn = ulong 1
+end
+put wd committed SEV_OK
+put wd raise_streak ulong 0
+put wd clear_streak ulong 0
+put wd raise_need rn
+put wd clear_need cn
+put wd crit_fast crit_fast
+put wd consec_fail ulong 0
+put wd incidents ulong 0
+put wd samples ulong 0
+put wd last_raw SEV_OK
+put wd last_reasons ulong 0
+end
+
+fn dbg_wd_step wd edit Watchdog snap view MetricSnap st edit StepOut to void
+tr = new TriageRes 0 0 0
+dbg_classify snap tr
+raw = get tr sev
+rsn = get tr reasons
+put wd samples add get wd samples ulong 1
+put wd last_raw raw
+put wd last_reasons rsn
+if gt raw SEV_OK
+put wd consec_fail add get wd consec_fail ulong 1
+else
+put wd consec_fail ulong 0
+end
+put st raw_sev raw
+put st escalated ulong 0
+put st recovered ulong 0
+put st emit_incident ulong 0
+put st reasons rsn
+cur = get wd committed
+if gt raw cur
+put wd clear_streak ulong 0
+rs = add get wd raise_streak ulong 1
+put wd raise_streak rs
+fast = and eq raw SEV_CRITICAL ne get wd crit_fast ulong 0
+if or fast ge rs get wd raise_need
+put wd committed raw
+put wd raise_streak ulong 0
+put wd incidents add get wd incidents ulong 1
+put st escalated ulong 1
+put st emit_incident ulong 1
+end
+else
+if lt raw cur
+put wd raise_streak ulong 0
+cs = add get wd clear_streak ulong 1
+put wd clear_streak cs
+if ge cs get wd clear_need
+put wd committed raw
+put wd clear_streak ulong 0
+put st recovered ulong 1
+end
+else
+put wd raise_streak ulong 0
+put wd clear_streak ulong 0
+if gt cur SEV_OK
+cf = get wd consec_fail
+if and gt cf ulong 0 eq rem cf ulong 5 ulong 0
+put wd incidents add get wd incidents ulong 1
+put st emit_incident ulong 1
+end
+end
+end
+end
+put st committed_sev get wd committed
+end
+
+note --- JSON-RPC 2.0 extractor helpers ---
+
+fn dbg_json_find_key src view uchar * key view uchar * to ulong
+n = len src
+kn = len key
+if or gt n ulong 8192 gt kn ulong 64
+ret n
+end
+i = ulong 0
+while lt i n bound 8192
+if eq get src i uchar 34
+ks = add i ulong 1
+if le add ks add kn ulong 1 n
+if dbg_starts_with part src ks sub n ks key
+qend = add ks kn
+if eq get src qend uchar 34
+j = add qend ulong 1
+while lt j n bound 8192
+if not dbg_is_ws get src j
+break
+end
+j = add j ulong 1
+end
+if lt j n
+if eq get src j uchar 58
+j = add j ulong 1
+while lt j n bound 8192
+if not dbg_is_ws get src j
+ret j
+end
+j = add j ulong 1
+end
+end
+end
+end
+end
+end
+end
+i = add i ulong 1
+end
+ret n
+end
+
+fn dbg_json_extract_str src view uchar * key view uchar * dst edit uchar * to long
+vpos = dbg_json_find_key src key
+n = len src
+if ge vpos n
+ret long -1
+end
+if ne get src vpos uchar 34
+ret long -1
+end
+p = ulong 0
+cap = len dst
+i = add vpos ulong 1
+while lt i n bound 4096
+b = get src i
+if eq b uchar 34
+ret long p
+end
+if eq b uchar 92
+i = add i ulong 1
+if ge i n
+ret long -1
+end
+b = get src i
+end
+if ge p cap
+ret long -1
+end
+put dst p b
+p = add p ulong 1
+i = add i ulong 1
+end
+ret long -1
+end
+
+fn dbg_json_extract_id src view uchar * dst edit uchar * to ulong
+vpos = dbg_json_find_key src d_kf_id
+n = len src
+if ge vpos n
+ret dbg_put_s dst ulong 0 d_v_null
+end
+b0 = get src vpos
+if eq b0 uchar 34
+p = dbg_put_b dst ulong 0 uchar 34
+i = add vpos ulong 1
+while lt i n bound 128
+b = get src i
+p = dbg_put_b dst p b
+if eq b uchar 34
+ret p
+end
+i = add i ulong 1
+end
+ret dbg_put_s dst ulong 0 d_v_null
+end
+p = ulong 0
+i = vpos
+while lt i n bound 64
+b = get src i
+if or dbg_is_ws b or eq b uchar 44 eq b uchar 125
+break
+end
+p = dbg_put_b dst p b
+i = add i ulong 1
+end
+if eq p ulong 0
+ret dbg_put_s dst ulong 0 d_v_null
+end
+ret p
+end
+
+note --- JSON-RPC response renderers ---
+
+fn dbg_render_diag_json id_tok view uchar * snap view MetricSnap tr view TriageRes dst edit uchar * to ulong
+p = dbg_put_s dst ulong 0 d_j_pre
+p = dbg_put_s dst p id_tok
+p = dbg_put_s dst p d_j_res
+p = dbg_put_s dst p d_jd_1
+p = dbg_put_sev dst p get tr sev
+p = dbg_put_s dst p d_jd_2
+p = dbg_put_u64 dst p get tr sev
+p = dbg_put_s dst p d_jd_3
+p = dbg_put_bool dst p get tr healthy
+p = dbg_put_s dst p d_jd_4
+p = dbg_put_u64 dst p get tr reasons
+p = dbg_put_s dst p d_jd_5
+p = dbg_put_u64 dst p get snap load_x100
+p = dbg_put_s dst p d_jd_6
+p = dbg_put_u64 dst p get snap mem_pct
+p = dbg_put_s dst p d_jd_7
+p = dbg_put_u64 dst p get snap disk_free
+p = dbg_put_s dst p d_jd_8
+p = dbg_put_u64 dst p get snap gpu_temp
+p = dbg_put_s dst p d_jd_9
+p = dbg_put_u64 dst p get snap gpu_mem
+p = dbg_put_s dst p d_jd_10
+p = dbg_put_u64 dst p get snap svc_up
+p = dbg_put_s dst p d_jd_11
+p = dbg_put_u64 dst p get snap svc_total
+p = dbg_put_s dst p d_jd_12
+p = dbg_put_u64 dst p get snap env_leaks
+p = dbg_put_s dst p d_jd_13
+p = dbg_put_bool dst p get snap build_ok
+p = dbg_put_s dst p d_j_end2
+ret p
+end
+
+fn dbg_render_status_json id_tok view uchar * wd view Watchdog dst edit uchar * to ulong
+p = dbg_put_s dst ulong 0 d_j_pre
+p = dbg_put_s dst p id_tok
+p = dbg_put_s dst p d_j_res
+p = dbg_put_s dst p d_js_1
+p = dbg_put_sev dst p get wd committed
+p = dbg_put_s dst p d_js_2
+p = dbg_put_u64 dst p get wd committed
+p = dbg_put_s dst p d_js_3
+p = dbg_put_sev dst p get wd last_raw
+p = dbg_put_s dst p d_js_4
+p = dbg_put_u64 dst p get wd consec_fail
+p = dbg_put_s dst p d_js_5
+p = dbg_put_u64 dst p get wd raise_streak
+p = dbg_put_s dst p d_js_6
+p = dbg_put_u64 dst p get wd clear_streak
+p = dbg_put_s dst p d_js_7
+p = dbg_put_u64 dst p get wd incidents
+p = dbg_put_s dst p d_js_8
+p = dbg_put_u64 dst p get wd samples
+p = dbg_put_s dst p d_j_end2
+ret p
+end
+
+fn dbg_render_triage_json id_tok view uchar * st view StepOut wd view Watchdog dst edit uchar * to ulong
+p = dbg_put_s dst ulong 0 d_j_pre
+p = dbg_put_s dst p id_tok
+p = dbg_put_s dst p d_j_res
+p = dbg_put_s dst p d_jt_1
+p = dbg_put_sev dst p get st raw_sev
+p = dbg_put_s dst p d_jt_2
+p = dbg_put_sev dst p get st committed_sev
+p = dbg_put_s dst p d_jt_3
+p = dbg_put_bool dst p get st escalated
+p = dbg_put_s dst p d_jt_4
+p = dbg_put_bool dst p get st recovered
+p = dbg_put_s dst p d_jt_5
+p = dbg_put_bool dst p get st emit_incident
+p = dbg_put_s dst p d_jt_6
+p = dbg_put_u64 dst p get st reasons
+p = dbg_put_s dst p d_jt_7
+p = dbg_put_u64 dst p get wd consec_fail
+p = dbg_put_s dst p d_jt_8
+p = dbg_put_u64 dst p get wd incidents
+p = dbg_put_s dst p d_j_end2
+ret p
+end
+
+fn dbg_render_err_json id_tok view uchar * err_tail view uchar * dst edit uchar * to ulong
+p = dbg_put_s dst ulong 0 d_j_pre
+p = dbg_put_s dst p id_tok
+p = dbg_put_s dst p err_tail
+ret p
+end
+
+fn dbg_rpc_is_object req view uchar * to bool
+n = len req
+if lt n ulong 2
+ret false
+end
+if gt n ulong 8192
+ret false
+end
+s = ulong 0
+while lt s n bound 8192
+if not dbg_is_ws get req s
+break
+end
+s = add s ulong 1
+end
+e = n
+while gt e ulong 0 bound 8192
+idx = sub e ulong 1
+if not dbg_is_ws get req idx
+break
+end
+e = idx
+end
+if lt sub e s ulong 2
+ret false
+end
+if ne get req s uchar 123
+ret false
+end
+if ne get req sub e ulong 1 uchar 125
+ret false
+end
+ret true
+end
+
+fn dbg_rpc_handle_diag req view uchar * dst edit uchar * to ulong
+ibuf = new uchar 64 0
+sbuf = new uchar 512 0
+snap = new MetricSnap 0 0 100 40 0 5 5 0 1 0
+tr = new TriageRes 0 0 0
+il = dbg_json_extract_id req ibuf
+sl = dbg_json_extract_str req d_kf_snapshot sbuf
+if ge sl long 0
+rc = dbg_parse_snapshot part sbuf 0 ulong sl snap
+if ne rc DBG_OK
+ret dbg_render_err_json part ibuf 0 il d_j_err_prm dst
+end
+else
+dbg_snap_init snap
+end
+dbg_classify snap tr
+ret dbg_render_diag_json part ibuf 0 il snap tr dst
+end
+
+fn dbg_rpc_handle_triage req view uchar * wd edit Watchdog dst edit uchar * to ulong
+ibuf = new uchar 64 0
+sbuf = new uchar 512 0
+snap = new MetricSnap 0 0 100 40 0 5 5 0 1 0
+st = new StepOut 0 0 0 0 0 0
+il = dbg_json_extract_id req ibuf
+sl = dbg_json_extract_str req d_kf_snapshot sbuf
+if lt sl long 0
+ret dbg_render_err_json part ibuf 0 il d_j_err_prm dst
+end
+rc = dbg_parse_snapshot part sbuf 0 ulong sl snap
+if ne rc DBG_OK
+ret dbg_render_err_json part ibuf 0 il d_j_err_prm dst
+end
+dbg_wd_step wd snap st
+ret dbg_render_triage_json part ibuf 0 il st wd dst
+end
+
+fn dbg_rpc_dispatch req view uchar * wd edit Watchdog dst edit uchar * to ulong
+vbuf = new uchar 16 0
+mbuf = new uchar 64 0
+ibuf = new uchar 64 0
+if not dbg_rpc_is_object req
+ret dbg_put_s dst ulong 0 d_j_err_parse
+end
+il = dbg_json_extract_id req ibuf
+vl = dbg_json_extract_str req d_kf_jsonrpc vbuf
+if lt vl long 0
+ret dbg_render_err_json part ibuf 0 il d_j_err_req dst
+end
+if not dbg_eq part vbuf 0 ulong vl d_rpc_20
+ret dbg_render_err_json part ibuf 0 il d_j_err_req dst
+end
+ml = dbg_json_extract_str req d_kf_method mbuf
+if lt ml long 0
+ret dbg_render_err_json part ibuf 0 il d_j_err_req dst
+end
+um = ulong ml
+if dbg_eq part mbuf 0 um d_m_notif
+ret ulong 0
+end
+if dbg_eq part mbuf 0 um d_m_init
+p = dbg_put_s dst ulong 0 d_j_pre
+p = dbg_put_s dst p part ibuf 0 il
+p = dbg_put_s dst p d_j_res
+ret dbg_put_s dst p d_j_init
+end
+if dbg_eq part mbuf 0 um d_m_tlist
+p = dbg_put_s dst ulong 0 d_j_pre
+p = dbg_put_s dst p part ibuf 0 il
+p = dbg_put_s dst p d_j_res
+ret dbg_put_s dst p d_j_tlist
+end
+if dbg_eq part mbuf 0 um d_m_status
+ret dbg_render_status_json part ibuf 0 il wd dst
+end
+if dbg_eq part mbuf 0 um d_m_diag
+ret dbg_rpc_handle_diag req dst
+end
+if dbg_eq part mbuf 0 um d_m_triage
+ret dbg_rpc_handle_triage req wd dst
+end
+ret dbg_render_err_json part ibuf 0 il d_j_err_mth dst
+end

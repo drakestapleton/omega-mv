@@ -1,0 +1,285 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/head-to-head/main.om: CLI reading paired benchmark records on stdin and printing verified
+note comparison statistics, numerical parity results, mutant-control verification, and verdict on stdout.
+note Compose with: si/directives/om2.om gpu/head-to-head/lib.om gpu/head-to-head/main.om
+note Stdin line grammar (comments start with #):
+note   BYTES <u64>
+note   TOL <atol_f64> <rtol_f64>
+note   PAIR <arm_a_ns_u64> <arm_b_ns_u64>
+note   ELEM <arm_a_f64> <arm_b_f64>
+note   MUTANT <mutant_f64>
+
+text h2h_cli_bytes "BYTES"
+text h2h_cli_tol "TOL"
+text h2h_cli_pair "PAIR"
+text h2h_cli_elem "ELEM"
+text h2h_cli_mut "MUTANT"
+text h2h_cli_err "ERROR invalid input on stdin\n"
+text h2h_cli_nan "NaN"
+text h2h_cli_inf "Inf"
+text h2h_cli_ninf "-Inf"
+
+global h2h_inbuf uchar 65536
+global h2h_arm_a_ns ulong 512
+global h2h_arm_b_ns ulong 512
+global h2h_arm_a_f f64 1024
+global h2h_arm_b_f f64 1024
+global h2h_mut_f f64 1024
+
+fn h2h_read_stdin to long
+total = ulong 0
+while lt total 65536 bound 65536
+k = read 0 h2h_inbuf total sub 65536 total
+if lt k 0
+ret k
+end
+if eq k 0
+break
+end
+total = add total ulong k
+end
+ret long total
+end
+
+fn h2h_parse_f64_or_special line view uchar * s ulong e ulong dst edit f64 1 to bool
+if h2h_tok_eq line s e h2h_cli_nan
+put dst 0 bitcast f64 ulong 0x7ff8000000000000
+ret true
+end
+if h2h_tok_eq line s e h2h_cli_inf
+put dst 0 bitcast f64 ulong 0x7ff0000000000000
+ret true
+end
+if h2h_tok_eq line s e h2h_cli_ninf
+put dst 0 bitcast f64 ulong 0xfff0000000000000
+ret true
+end
+if not h2h_parse_f64_ok line s e
+ret false
+end
+put dst 0 h2h_parse_f64_val line s e
+ret true
+end
+
+fn h2h_parse_line line view uchar * state edit ulong 4 tol edit H2hTol to bool
+note state[0]=bytes_moved state[1]=n_pairs state[2]=n_elems state[3]=n_mut
+v1 = new f64 1 0.0f64
+v2 = new f64 1 0.0f64
+n = len line
+p = h2h_skip_ws line 0 n
+if ge p n
+ret true
+end
+if eq get line p 35
+ret true
+end
+t0e = h2h_next_tok_end line p n
+if h2h_tok_eq line p t0e h2h_cli_bytes
+p1 = h2h_skip_ws line t0e n
+t1e = h2h_next_tok_end line p1 n
+if not h2h_parse_u64_ok line p1 t1e
+ret false
+end
+put state 0 h2h_parse_u64_val line p1 t1e
+ret true
+end
+if h2h_tok_eq line p t0e h2h_cli_tol
+p1 = h2h_skip_ws line t0e n
+t1e = h2h_next_tok_end line p1 n
+p2 = h2h_skip_ws line t1e n
+t2e = h2h_next_tok_end line p2 n
+if not h2h_parse_f64_or_special line p1 t1e v1
+ret false
+end
+if not h2h_parse_f64_or_special line p2 t2e v2
+ret false
+end
+put tol atol get v1 0
+put tol rtol get v2 0
+ret true
+end
+if h2h_tok_eq line p t0e h2h_cli_pair
+p1 = h2h_skip_ws line t0e n
+t1e = h2h_next_tok_end line p1 n
+p2 = h2h_skip_ws line t1e n
+t2e = h2h_next_tok_end line p2 n
+if not h2h_parse_u64_ok line p1 t1e
+ret false
+end
+if not h2h_parse_u64_ok line p2 t2e
+ret false
+end
+idx = get state 1
+if ge idx 512
+ret false
+end
+put h2h_arm_a_ns idx h2h_parse_u64_val line p1 t1e
+put h2h_arm_b_ns idx h2h_parse_u64_val line p2 t2e
+put state 1 add idx 1
+ret true
+end
+if h2h_tok_eq line p t0e h2h_cli_elem
+p1 = h2h_skip_ws line t0e n
+t1e = h2h_next_tok_end line p1 n
+p2 = h2h_skip_ws line t1e n
+t2e = h2h_next_tok_end line p2 n
+if not h2h_parse_f64_or_special line p1 t1e v1
+ret false
+end
+if not h2h_parse_f64_or_special line p2 t2e v2
+ret false
+end
+idx = get state 2
+if ge idx 1024
+ret false
+end
+put h2h_arm_a_f idx get v1 0
+put h2h_arm_b_f idx get v2 0
+put state 2 add idx 1
+ret true
+end
+if h2h_tok_eq line p t0e h2h_cli_mut
+p1 = h2h_skip_ws line t0e n
+t1e = h2h_next_tok_end line p1 n
+if not h2h_parse_f64_or_special line p1 t1e v1
+ret false
+end
+idx = get state 3
+if ge idx 1024
+ret false
+end
+put h2h_mut_f idx get v1 0
+put state 3 add idx 1
+ret true
+end
+ret false
+end
+
+fn h2h_copy_line pos ulong total ulong dst edit uchar 512 to ulong
+cnt = ulong 0
+p = pos
+while lt p total bound 512
+c = get h2h_inbuf p
+if eq c 10
+break
+end
+if lt cnt 512
+put dst cnt c
+cnt = add cnt 1
+end
+p = add p 1
+end
+ret cnt
+end
+
+fn h2h_eval_timings np ulong sa edit H2hStats sb edit H2hStats to void
+ta = new ulong 512 0
+tb = new ulong 512 0
+scr = new ulong 512 0
+i = ulong 0
+while lt i np bound 512
+put ta i get h2h_arm_a_ns i
+put tb i get h2h_arm_b_ns i
+i = add i 1
+end
+oka = h2h_compute_stats part ta 0 np scr sa
+okb = h2h_compute_stats part tb 0 np scr sb
+if and oka okb
+ret
+end
+end
+
+fn h2h_eval_parity_mut nel ulong nm ulong tol view H2hTol par edit H2hParity to ulong
+fa = new f64 1024 0.0f64
+fb = new f64 1024 0.0f64
+fm = new f64 1024 0.0f64
+mpar = new H2hParity 0 0 0 0 0 0.0f64 0.0f64
+j = ulong 0
+while lt j nel bound 1024
+put fa j get h2h_arm_a_f j
+put fb j get h2h_arm_b_f j
+j = add j 1
+end
+h2h_check_parity part fa 0 nel part fb 0 nel tol par
+if eq nel 0
+ret ulong 0
+end
+if eq nm 0
+mn = h2h_make_wrong_kernel_mutant part fa 0 nel fm
+if eq mn nel
+if h2h_verify_mutant part fa 0 nel part fm 0 nel tol mpar
+ret ulong 2
+end
+end
+ret ulong 1
+end
+k = ulong 0
+while lt k nm bound 1024
+put fm k get h2h_mut_f k
+k = add k 1
+end
+if h2h_verify_mutant part fa 0 nel part fm 0 nm tol mpar
+ret ulong 2
+end
+ret ulong 1
+end
+
+fn h2h_run_eval np ulong nel ulong nm ulong bytes_moved ulong tol view H2hTol to int
+sa = new H2hStats 0 0 0 0 0.0f64 0 0 0 0
+sb = new H2hStats 0 0 0 0 0.0f64 0 0 0 0
+par = new H2hParity 0 0 0 0 0 0.0f64 0.0f64
+sum = new H2hSummary 2 0 bytes_moved 0.0f64 0.0f64 0.0f64 0 0 0 0
+h2h_eval_timings np sa sb
+mst = h2h_eval_parity_mut nel nm tol par
+mchk = ulong 0
+mcaught = ulong 0
+if gt mst 0
+mchk = ulong 1
+end
+if eq mst 2
+mcaught = ulong 1
+end
+h2h_finalize_summary sa sb par mchk mcaught sum
+h2h_emit_report 1 sa sb par sum
+v = get sum verdict
+if eq v H2H_VERDICT_PASS
+ret 0
+end
+if eq v H2H_VERDICT_FAIL
+ret 1
+end
+ret 2
+end
+
+fn main to int
+got = h2h_read_stdin
+if lt got 0
+okw = h2h_write_all 2 h2h_cli_err
+if okw
+ret 2
+end
+ret 2
+end
+total = ulong got
+state = new ulong 4 0
+tol = new H2hTol 0.000001f64 0.00001f64
+line = new uchar 512 0
+pos = ulong 0
+while lt pos total bound 65536
+ln = h2h_copy_line pos total line
+if not h2h_parse_line part line 0 ln state tol
+oke = h2h_write_all 2 h2h_cli_err
+if oke
+ret 2
+end
+ret 2
+end
+pos = add pos ln
+if lt pos total
+if eq get h2h_inbuf pos 10
+pos = add pos 1
+end
+end
+end
+ret h2h_run_eval get state 1 get state 2 get state 3 get state 0 tol
+end

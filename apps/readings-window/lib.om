@@ -1,0 +1,690 @@
+note readings-window: pure Omega read-only telemetry ring buffer, stats, alarms, auth, and formatters.
+note Ported from upstream readings-window (src/main.rs).
+note Compose with si/directives/om2.om before this file.
+
+const RW_CAP ulong 64
+const RW_STRIDE ulong 8
+const RW_BUF_LEN ulong 512
+const RW_DEFAULT_HOURS ulong 24
+const RW_MAX_HOURS ulong 720
+const RW_DEFAULT_LINES ulong 500
+const RW_MAX_LINES ulong 50000
+const RW_EXPOSURE_STALE ulong 3600
+
+const RW_METRIC_GPU_TEMP ulong 0
+const RW_METRIC_GPU_POWER ulong 1
+const RW_METRIC_GPU_UTIL ulong 2
+const RW_METRIC_CPU_TEMP ulong 3
+const RW_METRIC_MEM_USED ulong 4
+
+const RW_EXP_UNKNOWN ulong 0
+const RW_EXP_OK ulong 1
+const RW_EXP_CHANGED ulong 2
+
+struct RwSample ts ulong gpu_util ulong gpu_temp ulong gpu_power ulong cpu_temp ulong mem_used ulong mem_total ulong end
+struct RwRing head ulong cnt ulong total ulong last_ts ulong has_ts ulong end
+struct RwStats n ulong vmin ulong vmax ulong vsum ulong vmean ulong vp50 ulong vp95 ulong end
+struct RwThresh max_gpu_temp ulong max_gpu_power ulong max_cpu_temp ulong max_gpu_util ulong max_mem_used ulong end
+
+text rw_t_bearer "Bearer "
+text rw_t_hours "hours="
+text rw_t_lines "lines="
+text rw_t_ag_claude "claude"
+text rw_t_ag_codex "codex"
+text rw_t_ag_opencode "opencode"
+text rw_t_ag_gemini "gemini"
+text rw_t_ag_muse "muse"
+
+text rw_j_1 "{\"count\":"
+text rw_j_2 ",\"min\":"
+text rw_j_3 ",\"max\":"
+text rw_j_4 ",\"sum\":"
+text rw_j_5 ",\"mean\":"
+text rw_j_6 ",\"p50\":"
+text rw_j_7 ",\"p95\":"
+text rw_j_8 ",\"alarms\":"
+text rw_j_9 "}\n"
+
+text rw_tx_1 "count="
+text rw_tx_2 " min="
+text rw_tx_3 " max="
+text rw_tx_4 " sum="
+text rw_tx_5 " mean="
+text rw_tx_6 " p50="
+text rw_tx_7 " p95="
+text rw_tx_8 " alarms="
+text rw_tx_9 "\n"
+
+fn rw_eq_bytes a view uchar * b view uchar * to bool
+n = len a
+if ne n len b
+ret false
+end
+i = ulong 0
+while lt i n bound 4096
+if ne get a i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note Constant-time byte comparison (length check only, no early exit on byte mismatch).
+fn rw_ct_eq a view uchar * b view uchar * to bool
+n = len a
+if ne n len b
+ret false
+end
+acc = uchar 0
+i = ulong 0
+while lt i n bound 4096
+acc = or acc xor get a i get b i
+i = add i 1
+end
+ret eq acc 0
+end
+
+note Verify "Authorization: Bearer <token>" using constant-time comparison.
+fn rw_auth_ok hdr view uchar * tok view uchar * to bool
+hlen = len hdr
+if lt hlen 7
+ret false
+end
+if not rw_eq_bytes part hdr 0 7 rw_t_bearer
+ret false
+end
+start = ulong 7
+endp = hlen
+while lt start endp bound 4096
+c = get hdr start
+if ne c 32
+if ne c 9
+break
+end
+end
+start = add start 1
+end
+while gt endp start bound 4096
+c = get hdr sub endp 1
+if ne c 32
+if ne c 9
+if ne c 13
+if ne c 10
+break
+end
+end
+end
+end
+endp = sub endp 1
+end
+ret rw_ct_eq part hdr start sub endp start tok
+end
+
+note Parse strict unsigned decimal integer; returns -1 on empty/non-digit/overflow.
+fn rw_parse_u64 s view uchar * to long
+n = len s
+if eq n 0
+ret -1
+end
+if gt n 18
+ret -1
+end
+v = ulong 0
+i = ulong 0
+while lt i n bound 32
+c = get s i
+if lt c 48
+ret -1
+end
+if gt c 57
+ret -1
+end
+v = add mul v 10 ulong sub c 48
+i = add i 1
+end
+ret long v
+end
+
+note Find query param `key` (including '=') in query string and parse u64; returns -1 if absent/invalid.
+fn rw_query_u64 q view uchar * key view uchar * to long
+qn = len q
+kn = len key
+i = ulong 0
+while lt i qn bound 4096
+start = i
+while lt i qn bound 4096
+if eq get q i 38
+break
+end
+i = add i 1
+end
+seg_len = sub i start
+if lt i qn
+i = add i 1
+end
+if ge seg_len kn
+if rw_eq_bytes part q start kn key
+ret rw_parse_u64 part q add start kn sub seg_len kn
+end
+end
+end
+ret -1
+end
+
+fn rw_clamp_hours q view uchar * to ulong
+v = rw_query_u64 q rw_t_hours
+if lt v 0
+ret RW_DEFAULT_HOURS
+end
+u = ulong v
+if lt u 1
+ret ulong 1
+end
+if gt u RW_MAX_HOURS
+ret RW_MAX_HOURS
+end
+ret u
+end
+
+fn rw_clamp_lines q view uchar * to ulong
+v = rw_query_u64 q rw_t_lines
+if lt v 0
+ret RW_DEFAULT_LINES
+end
+u = ulong v
+if lt u 1
+ret ulong 1
+end
+if gt u RW_MAX_LINES
+ret RW_MAX_LINES
+end
+ret u
+end
+
+note Check exposure freshness: stale (> 3600s) or ts == 0 or invalid status -> RW_EXP_UNKNOWN.
+fn rw_exposure_state ts ulong status ulong now_s ulong to ulong
+if eq ts 0
+ret RW_EXP_UNKNOWN
+end
+if lt now_s ts
+ret RW_EXP_UNKNOWN
+end
+if gt sub now_s ts RW_EXPOSURE_STALE
+ret RW_EXP_UNKNOWN
+end
+if eq status RW_EXP_OK
+ret RW_EXP_OK
+end
+if eq status RW_EXP_CHANGED
+ret RW_EXP_CHANGED
+end
+ret RW_EXP_UNKNOWN
+end
+
+note Exact allow-list of Spark chat agents matching upstream readings-window.
+fn rw_chat_agent_allowed name view uchar * to bool
+if rw_eq_bytes name rw_t_ag_claude
+ret true
+end
+if rw_eq_bytes name rw_t_ag_codex
+ret true
+end
+if rw_eq_bytes name rw_t_ag_opencode
+ret true
+end
+if rw_eq_bytes name rw_t_ag_gemini
+ret true
+end
+if rw_eq_bytes name rw_t_ag_muse
+ret true
+end
+ret false
+end
+
+note Reset ring buffer to empty state.
+fn rw_ring_init ring edit RwRing to void
+put ring head ulong 0
+put ring cnt ulong 0
+put ring total ulong 0
+put ring last_ts ulong 0
+put ring has_ts ulong 0
+end
+
+note Ingest one telemetry sample into the bounded ring buffer (64 slots x 8 ulongs in buf).
+note Slot layout: [0]=ts [1]=gpu_util [2]=gpu_temp [3]=gpu_power [4]=cpu_temp [5]=mem_used [6]=mem_total.
+note Refuses:
+note   -1: ts == 0
+note   -2: backward timestamp (ts < last_ts)
+note   -3: gpu_util > 100
+note   -4: mem_used > mem_total (when mem_total > 0)
+note   -5: implausible temperature (> 150 C)
+note   -6: buffer too small (< 512 ulongs)
+fn rw_ingest ring edit RwRing buf edit ulong * sample view RwSample to int
+if lt len buf RW_BUF_LEN
+ret -6
+end
+ts = get sample ts
+if eq ts 0
+ret -1
+end
+if eq get ring has_ts 1
+if lt ts get ring last_ts
+ret -2
+end
+end
+if gt get sample gpu_util 100
+ret -3
+end
+mt = get sample mem_total
+if gt mt 0
+if gt get sample mem_used mt
+ret -4
+end
+end
+if gt get sample gpu_temp 150
+ret -5
+end
+if gt get sample cpu_temp 150
+ret -5
+end
+idx = get ring head
+base = mul idx RW_STRIDE
+put buf base ts
+put buf add base 1 get sample gpu_util
+put buf add base 2 get sample gpu_temp
+put buf add base 3 get sample gpu_power
+put buf add base 4 get sample cpu_temp
+put buf add base 5 get sample mem_used
+put buf add base 6 mt
+next_head = add idx 1
+if ge next_head RW_CAP
+next_head = ulong 0
+end
+put ring head next_head
+c = get ring cnt
+if lt c RW_CAP
+put ring cnt add c 1
+end
+put ring total add get ring total 1
+put ring last_ts ts
+put ring has_ts ulong 1
+ret 0
+end
+
+fn rw_ring_metric buf view ulong * slot ulong metric ulong to ulong
+base = mul slot RW_STRIDE
+if eq metric RW_METRIC_GPU_TEMP
+ret get buf add base 2
+end
+if eq metric RW_METRIC_GPU_POWER
+ret get buf add base 3
+end
+if eq metric RW_METRIC_GPU_UTIL
+ret get buf add base 1
+end
+if eq metric RW_METRIC_CPU_TEMP
+ret get buf add base 4
+end
+ret get buf add base 5
+end
+
+note Insertion sort on vals[0..n-1] ascending.
+fn rw_sort_u64 vals edit ulong * n ulong to void
+if le n 1
+ret
+end
+i = ulong 1
+while lt i n bound 64
+key = get vals i
+j = i
+while gt j 0 bound 64
+prev = get vals sub j 1
+if le prev key
+break
+end
+put vals j prev
+j = sub j 1
+end
+put vals j key
+i = add i 1
+end
+end
+
+note Compute nearest-rank percentile index for 1 <= p <= 100 on n >= 1 sorted items.
+fn rw_pct_index n ulong p ulong to ulong
+rank = div add mul p n 99 100
+if eq rank 0
+ret ulong 0
+end
+idx = sub rank 1
+if ge idx n
+ret sub n 1
+end
+ret idx
+end
+
+fn rw_slot_of ring view RwRing i ulong to ulong
+if eq get ring cnt RW_CAP
+ret rem add get ring head i RW_CAP
+end
+ret i
+end
+
+fn rw_finalize_stats vals edit ulong * m ulong stats edit RwStats to void
+vsum = ulong 0
+i = ulong 0
+while lt i m bound 64
+vsum = add vsum get vals i
+i = add i 1
+end
+rw_sort_u64 vals m
+put stats n m
+put stats vmin get vals 0
+put stats vmax get vals sub m 1
+put stats vsum vsum
+put stats vmean div vsum m
+put stats vp50 get vals rw_pct_index m 50
+put stats vp95 get vals rw_pct_index m 95
+end
+
+note Compute window statistics for `metric` over samples with ts >= cutoff.
+note Returns true if >= 1 sample matched, false if empty.
+fn rw_compute_stats ring view RwRing buf view ulong * metric ulong cutoff ulong stats edit RwStats to bool
+put stats n ulong 0
+put stats vmin ulong 0
+put stats vmax ulong 0
+put stats vsum ulong 0
+put stats vmean ulong 0
+put stats vp50 ulong 0
+put stats vp95 ulong 0
+if lt len buf RW_BUF_LEN
+ret false
+end
+cnt = get ring cnt
+if eq cnt 0
+ret false
+end
+vals = new ulong 64 0
+m = ulong 0
+i = ulong 0
+while lt i cnt bound 64
+slot = rw_slot_of ring i
+if ge get buf mul slot RW_STRIDE cutoff
+put vals m rw_ring_metric buf slot metric
+m = add m 1
+end
+i = add i 1
+end
+if eq m 0
+ret false
+end
+rw_finalize_stats vals m stats
+ret true
+end
+
+note Check latest ingested sample against thresholds; returns bitmask (0 = OK):
+note   bit 0 (1): gpu_temp >= max_gpu_temp
+note   bit 1 (2): gpu_power >= max_gpu_power
+note   bit 2 (4): cpu_temp >= max_cpu_temp
+note   bit 3 (8): gpu_util >= max_gpu_util
+note   bit 4 (16): mem_used >= max_mem_used
+fn rw_check_alarms ring view RwRing buf view ulong * th view RwThresh to ulong
+if lt len buf RW_BUF_LEN
+ret ulong 0
+end
+cnt = get ring cnt
+if eq cnt 0
+ret ulong 0
+end
+head = get ring head
+last = ulong 0
+if eq head 0
+last = sub RW_CAP 1
+else
+last = sub head 1
+end
+base = mul last RW_STRIDE
+flags = ulong 0
+if ge get buf add base 2 get th max_gpu_temp
+flags = or flags 1
+end
+if ge get buf add base 3 get th max_gpu_power
+flags = or flags 2
+end
+if ge get buf add base 4 get th max_cpu_temp
+flags = or flags 4
+end
+if ge get buf add base 1 get th max_gpu_util
+flags = or flags 8
+end
+if ge get buf add base 5 get th max_mem_used
+flags = or flags 16
+end
+ret flags
+end
+
+fn rw_append dst edit uchar * pos ulong src view uchar * to long
+n = len src
+if gt add pos n len dst
+ret -1
+end
+i = ulong 0
+while lt i n bound 4096
+put dst add pos i get src i
+i = add i 1
+end
+ret long add pos n
+end
+
+fn rw_append_u64 dst edit uchar * pos ulong val ulong to long
+tmp = new uchar 24 0
+cnt = ulong 0
+v = val
+if eq v 0
+put tmp 0 uchar 48
+cnt = ulong 1
+else
+while gt v 0 bound 24
+d = rem v 10
+put tmp cnt uchar add d 48
+v = div v 10
+cnt = add cnt 1
+end
+end
+if gt add pos cnt len dst
+ret -1
+end
+i = ulong 0
+while lt i cnt bound 24
+put dst add pos i get tmp sub sub cnt 1 i
+i = add i 1
+end
+ret long add pos cnt
+end
+
+fn rw_format_stats_json dst edit uchar * stats view RwStats alarms ulong to long
+p = rw_append dst 0 rw_j_1
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats n
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_j_2
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vmin
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_j_3
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vmax
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_j_4
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vsum
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_j_5
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vmean
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_j_6
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vp50
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_j_7
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vp95
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_j_8
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p alarms
+if lt p 0
+ret -1
+end
+ret rw_append dst ulong p rw_j_9
+end
+
+fn rw_format_stats_text dst edit uchar * stats view RwStats alarms ulong to long
+p = rw_append dst 0 rw_tx_1
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats n
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_tx_2
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vmin
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_tx_3
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vmax
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_tx_4
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vsum
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_tx_5
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vmean
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_tx_6
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vp50
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_tx_7
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p get stats vp95
+if lt p 0
+ret -1
+end
+p = rw_append dst ulong p rw_tx_8
+if lt p 0
+ret -1
+end
+p = rw_append_u64 dst ulong p alarms
+if lt p 0
+ret -1
+end
+ret rw_append dst ulong p rw_tx_9
+end
+
+note Parse TSV telemetry line: ts\tgpu_util\tgpu_temp\tgpu_power\tcpu_temp\tmem_used\tmem_total
+fn rw_parse_tsv_sample line view uchar * sample edit RwSample to bool
+n = len line
+if gt n 0
+if eq get line sub n 1 10
+n = sub n 1
+end
+end
+if gt n 0
+if eq get line sub n 1 13
+n = sub n 1
+end
+end
+vals = new ulong 7 0
+col = ulong 0
+i = ulong 0
+while lt i n bound 1024
+start = i
+while lt i n bound 1024
+if eq get line i 9
+break
+end
+i = add i 1
+end
+if ge col 7
+ret false
+end
+v = rw_parse_u64 part line start sub i start
+if lt v 0
+ret false
+end
+put vals col ulong v
+col = add col 1
+if lt i n
+i = add i 1
+end
+end
+if ne col 7
+ret false
+end
+put sample ts get vals 0
+put sample gpu_util get vals 1
+put sample gpu_temp get vals 2
+put sample gpu_power get vals 3
+put sample cpu_temp get vals 4
+put sample mem_used get vals 5
+put sample mem_total get vals 6
+ret true
+end

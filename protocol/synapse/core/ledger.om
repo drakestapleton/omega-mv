@@ -1,0 +1,307 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/synapse/core/ledger.om: append-only SHA-256 hash-chained event ledger
+note recording every changeset, lease, review, and landing transition with chain-integrity
+note verification, tamper refusal, and JSONL serialization.
+note Composed OM-2 library unit (no om2 directive, no main).
+
+const LG_MAX ulong 1024
+const LG_FIELDS ulong 7
+
+const LG_EV_CS_CREATE ulong 1
+const LG_EV_CS_STATE ulong 2
+const LG_EV_LEASE_CLAIM ulong 3
+const LG_EV_LEASE_RENEW ulong 4
+const LG_EV_LEASE_RELEASE ulong 5
+const LG_EV_REVIEW ulong 6
+const LG_EV_LAND ulong 7
+
+const LGF_SEQ ulong 0
+const LGF_KIND ulong 1
+const LGF_TS ulong 2
+const LGF_ACT_OFF ulong 3
+const LGF_ACT_LEN ulong 4
+const LGF_DET_OFF ulong 5
+const LGF_DET_LEN ulong 6
+
+global g_lg_meta ulong 7168
+global g_lg_subj uchar 32768
+global g_lg_prev uchar 32768
+global g_lg_hash uchar 32768
+global g_lg_head uchar 32
+global g_lg_stg uchar 32
+global g_lg_hdr ulong 8
+
+text t_lg_dom "SYNAPSE_LEDGER_ENTRY_V1"
+text t_ev_csc "CS_CREATE"
+text t_ev_css "CS_STATE"
+text t_ev_lcl "LEASE_CLAIM"
+text t_ev_lrn "LEASE_RENEW"
+text t_ev_lrl "LEASE_RELEASE"
+text t_ev_rev "REVIEW"
+text t_ev_lnd "LAND"
+text t_ev_unk "UNKNOWN"
+
+text t_lj1 "{\"seq\":"
+text t_lj2 ",\"kind\":\""
+text t_lj3 "\",\"ts\":"
+text t_lj4 ",\"actor\":\""
+text t_lj5 "\",\"detail\":\""
+text t_lj6 "\",\"subject\":\""
+text t_lj7 "\",\"prev\":\""
+text t_lj8 "\",\"hash\":\""
+text t_lj9 "\"}\n"
+
+fn lg_reset to void
+put g_lg_hdr 0 0
+put g_lg_hdr 1 0
+for i ulong 32
+put g_lg_head i 0
+put g_lg_stg i 0
+end
+end
+
+fn syn_reset_all to void
+syn_arena_reset
+cs_reset
+gr_reset
+ls_reset
+rv_reset
+lg_reset
+end
+
+fn lg_count to ulong
+ret get g_lg_hdr 0
+end
+
+fn lg_bad_seq to ulong
+ret get g_lg_hdr 1
+end
+
+fn lg_head dst edit uchar * to void
+for i ulong 32
+put dst i get g_lg_head i
+end
+end
+
+fn lg_mget idx ulong f ulong to ulong
+ret get g_lg_meta add mul idx LG_FIELDS f
+end
+
+fn lg_mput idx ulong f ulong v ulong to void
+put g_lg_meta add mul idx LG_FIELDS f v
+end
+
+fn lg_set_subject subj view uchar * to void
+n = len subj
+if gt n 32
+n = 32
+end
+for i ulong 32
+if lt i n
+put g_lg_stg i get subj i
+else
+put g_lg_stg i 0
+end
+end
+end
+
+note Computes domain-separated SHA-256 of ledger entry idx into dst[32].
+fn lg_compute_entry_hash idx ulong dst edit uchar * to void
+ctx = new ulong 40 0
+blk = new uchar 32 0
+nul = new uchar 1 0
+sha256_init ctx
+sha256_update ctx t_lg_dom
+sha256_update ctx nul
+syn_sha_u64 ctx lg_mget idx LGF_SEQ
+syn_sha_u64 ctx lg_mget idx LGF_KIND
+syn_sha_u64 ctx lg_mget idx LGF_TS
+base = mul idx 32
+for i ulong 32
+put blk i get g_lg_subj add base i
+end
+sha256_update ctx blk
+syn_sha_arena_str ctx lg_mget idx LGF_ACT_OFF lg_mget idx LGF_ACT_LEN
+syn_sha_arena_str ctx lg_mget idx LGF_DET_OFF lg_mget idx LGF_DET_LEN
+for i ulong 32
+put blk i get g_lg_prev add base i
+end
+sha256_update ctx blk
+sha256_final ctx dst
+end
+
+note Appends one hash-chained ledger event using staged subject and arena actor/detail slices.
+note Returns monotonic sequence number (1..), or 0 if ledger is at capacity.
+fn lg_append_arena kind ulong ts ulong ao ulong al ulong doff ulong dlen ulong to ulong
+h = new uchar 32 0
+cnt = get g_lg_hdr 0
+if ge cnt LG_MAX
+ret 0
+end
+seq = add cnt 1
+base = mul cnt 32
+lg_mput cnt LGF_SEQ seq
+lg_mput cnt LGF_KIND kind
+lg_mput cnt LGF_TS ts
+lg_mput cnt LGF_ACT_OFF ao
+lg_mput cnt LGF_ACT_LEN al
+lg_mput cnt LGF_DET_OFF doff
+lg_mput cnt LGF_DET_LEN dlen
+for i ulong 32
+put g_lg_subj add base i get g_lg_stg i
+put g_lg_prev add base i get g_lg_head i
+end
+lg_compute_entry_hash cnt h
+for i ulong 32
+put g_lg_hash add base i get h i
+put g_lg_head i get h i
+end
+put g_lg_hdr 0 seq
+ret seq
+end
+
+note Convenience wrapper: arena actor + uchar view detail.
+fn lg_append_view kind ulong ts ulong ao ulong al ulong det view uchar * to ulong
+doff = syn_arena_put det
+if eq doff SYN_NONE
+ret 0
+end
+ret lg_append_arena kind ts ao al doff len det
+end
+
+note Verifies entire hash-chained ledger from seq 1 to head.
+note Checks sequence continuity, prev_hash chaining from [0; 32], recomputed SHA-256 of every entry,
+note and final head digest match. Returns SYN_OK (0) or SYN_ERR_LEDGER_TAMPER (12).
+fn lg_verify to ulong
+exp_prev = new uchar 32 0
+calc = new uchar 32 0
+put g_lg_hdr 1 0
+cnt = get g_lg_hdr 0
+for i ulong cnt
+exp_seq = add i 1
+if ne lg_mget i LGF_SEQ exp_seq
+put g_lg_hdr 1 exp_seq
+ret SYN_ERR_LEDGER_TAMPER
+end
+base = mul i 32
+for j ulong 32
+if ne get g_lg_prev add base j get exp_prev j
+put g_lg_hdr 1 exp_seq
+ret SYN_ERR_LEDGER_TAMPER
+end
+end
+lg_compute_entry_hash i calc
+for j ulong 32
+if ne get g_lg_hash add base j get calc j
+put g_lg_hdr 1 exp_seq
+ret SYN_ERR_LEDGER_TAMPER
+end
+put exp_prev j get calc j
+end
+end
+for j ulong 32
+if ne get g_lg_head j get exp_prev j
+put g_lg_hdr 1 cnt
+ret SYN_ERR_LEDGER_TAMPER
+end
+end
+ret SYN_OK
+end
+
+note Controlled tamper-injection helpers for negative-control verification.
+fn lg_tamper_xor_subj idx ulong byte_pos ulong mask uchar to void
+if and lt idx get g_lg_hdr 0 lt byte_pos 32
+pos = add mul idx 32 byte_pos
+put g_lg_subj pos xor get g_lg_subj pos mask
+end
+end
+
+fn lg_tamper_xor_prev idx ulong byte_pos ulong mask uchar to void
+if and lt idx get g_lg_hdr 0 lt byte_pos 32
+pos = add mul idx 32 byte_pos
+put g_lg_prev pos xor get g_lg_prev pos mask
+end
+end
+
+fn lg_tamper_xor_hash idx ulong byte_pos ulong mask uchar to void
+if and lt idx get g_lg_hdr 0 lt byte_pos 32
+pos = add mul idx 32 byte_pos
+put g_lg_hash pos xor get g_lg_hash pos mask
+end
+end
+
+fn lg_tamper_set_seq idx ulong new_seq ulong to void
+if lt idx get g_lg_hdr 0
+lg_mput idx LGF_SEQ new_seq
+end
+end
+
+fn lg_write_kind fd int kind ulong to void
+if eq kind LG_EV_CS_CREATE
+syn_write_text fd t_ev_csc
+ret
+end
+if eq kind LG_EV_CS_STATE
+syn_write_text fd t_ev_css
+ret
+end
+if eq kind LG_EV_LEASE_CLAIM
+syn_write_text fd t_ev_lcl
+ret
+end
+if eq kind LG_EV_LEASE_RENEW
+syn_write_text fd t_ev_lrn
+ret
+end
+if eq kind LG_EV_LEASE_RELEASE
+syn_write_text fd t_ev_lrl
+ret
+end
+if eq kind LG_EV_REVIEW
+syn_write_text fd t_ev_rev
+ret
+end
+if eq kind LG_EV_LAND
+syn_write_text fd t_ev_lnd
+ret
+end
+syn_write_text fd t_ev_unk
+end
+
+fn lg_dump_entry_jsonl fd int idx ulong to void
+buf = new uchar 32 0
+base = mul idx 32
+syn_write_text fd t_lj1
+syn_write_u64 fd lg_mget idx LGF_SEQ
+syn_write_text fd t_lj2
+lg_write_kind fd lg_mget idx LGF_KIND
+syn_write_text fd t_lj3
+syn_write_u64 fd lg_mget idx LGF_TS
+syn_write_text fd t_lj4
+syn_write_arena fd lg_mget idx LGF_ACT_OFF lg_mget idx LGF_ACT_LEN
+syn_write_text fd t_lj5
+syn_write_arena fd lg_mget idx LGF_DET_OFF lg_mget idx LGF_DET_LEN
+syn_write_text fd t_lj6
+for j ulong 32
+put buf j get g_lg_subj add base j
+end
+syn_write_hex32 fd buf
+syn_write_text fd t_lj7
+for j ulong 32
+put buf j get g_lg_prev add base j
+end
+syn_write_hex32 fd buf
+syn_write_text fd t_lj8
+for j ulong 32
+put buf j get g_lg_hash add base j
+end
+syn_write_hex32 fd buf
+syn_write_text fd t_lj9
+end
+
+fn lg_dump_jsonl fd int to void
+cnt = get g_lg_hdr 0
+for i ulong cnt
+lg_dump_entry_jsonl fd i
+end
+end

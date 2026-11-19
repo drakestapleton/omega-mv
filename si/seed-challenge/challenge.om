@@ -1,0 +1,1171 @@
+om2
+note si/seed-challenge/challenge.om: Pure-Omega seed-ladder pin table and challenge log verifier.
+note Faithful OM-2 conversion of omega-seed-challenge (check-result.sh + seed0->hex1->asm2->om4->omc ladder).
+note Implements FIPS 180-4 SHA-256, strict 40-hex commit pin and 64-hex digest validation,
+note 5-rung chain completeness verification, challenge log auditing (including stage1..stage3 omc fixpoint),
+note and fail-closed refusal diagnostics.
+note Usage:
+note   challenge <expected.txt> <challenge.log>   (verify two files)
+note   challenge < combined.txt                   (stdin with '---' line separating expected table and log)
+note Exit codes: 0 = RESULT ACCEPTED, 1 = RESULT REFUSED, 2 = usage / I/O / malformed expected table.
+
+global expbuf uchar 16384
+global logbuf uchar 32768
+global pinbuf uchar 64
+global omcsha uchar 64
+global patbuf uchar 512
+global decbuf uchar 32
+global argbuf uchar 512
+global rdbuf uchar 4096
+global rungseen ulong 8
+global gmeta ulong 12
+global shastate uint 8
+global shak uint 64
+global shaw uint 64
+global shablk uchar 64
+global shadig uchar 32
+global shahex uchar 64
+
+note gmeta indices
+const m_elen ulong 0
+const m_llen ulong 1
+const m_plen ulong 2
+const m_olen ulong 3
+const m_bad ulong 4
+const m_patlen ulong 5
+const m_expe ulong 6
+const m_lastch ulong 7
+
+note rungseen indices: 0..4 are seed0, hex1, asm2, om4, omc; 5=pin, 6=inputs, 7=rungs
+const r_seed0 ulong 0
+const r_hex1 ulong 1
+const r_asm2 ulong 2
+const r_om4 ulong 3
+const r_omc ulong 4
+const r_pin ulong 5
+const r_incnt ulong 6
+const r_rcnt ulong 7
+
+text khex "0123456789abcdef"
+text t_nl "\n"
+text t_sp " "
+text t_pin "pin "
+text t_input "input "
+text t_rung "rung "
+text t_seed0 "seed0"
+text t_hex1 "hex1"
+text t_asm2 "asm2"
+text t_om4 "om4"
+text t_omc "omc"
+text t_host "host "
+text t_a64 "aarch64"
+text t_pass_in "PASS input "
+text t_pass_rg "PASS rung "
+text t_st1 "stage1 "
+text t_st2 "stage2 "
+text t_st3 "stage3 "
+text t_fail "FAIL "
+text t_notrun "NOT_RUN "
+text t_ch_pfx "CHALLENGE "
+text t_ch_pass "CHALLENGE PASS pin="
+text t_ch_omc " omc="
+text t_sep "---"
+text t_ref_pfx "REFUSED "
+text t_ref_pin "log does not name expected pin\n"
+text t_ref_host "host line does not say aarch64\n"
+text t_ref_in "input line missing or mismatched in log\n"
+text t_ref_rg "rung line missing or mismatched in log\n"
+text t_ref_st "omc stage1..3 fixpoint line missing or mismatched in log\n"
+text t_ref_fn "log contains FAIL or NOT_RUN lines\n"
+text t_ref_last "final CHALLENGE line does not match CHALLENGE PASS pin=<pin> omc=<omc>\n"
+text t_ref_chain "expected table missing required seed ladder rung (seed0/hex1/asm2/om4/omc)\n"
+text t_ref_expe "expected table contains malformed pin, digest, or entry\n"
+text t_acc1 "RESULT ACCEPTED pin="
+text t_acc2 " omc="
+text t_rej1 "RESULT REFUSED reasons="
+text t_usage "usage: challenge <expected.txt> <challenge.log> (or stdin with --- separator)\n"
+text t_ioerr "challenge: failed to read input file\n"
+
+fn write_all fd int src view uchar * off ulong n ulong to void
+p = ulong 0
+while lt p n bound 65536
+k = write fd src add off p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn wstr fd int s view uchar * to void
+write_all fd s 0 len s
+end
+
+fn wdec fd int v ulong to void
+i = ulong 32
+n = v
+while true bound 24
+i = sub i 1
+put decbuf i uchar add rem n 10 48
+n = div n 10
+if eq n 0
+break
+end
+end
+p = i
+while lt p 32 bound 32
+k = write fd decbuf p sub 32 p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn wpin fd int to void
+n = get gmeta m_plen
+p = ulong 0
+while lt p n bound 64
+k = write fd pinbuf p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn womc fd int to void
+n = get gmeta m_olen
+p = ulong 0
+while lt p n bound 64
+k = write fd omcsha p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn is_hex_ch c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+if and ge c 97 le c 102
+ret true
+end
+ret false
+end
+
+fn is_dig_ch c uchar to bool
+ret and ge c 48 le c 57
+end
+
+fn is_hex_exp off ulong n ulong to bool
+if eq n 0
+ret false
+end
+if gt add off n 16384
+ret false
+end
+i = ulong 0
+while lt i n bound 128
+if not is_hex_ch get expbuf add off i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn is_dec_exp off ulong n ulong to bool
+if eq n 0
+ret false
+end
+if gt n 20
+ret false
+end
+if gt add off n 16384
+ret false
+end
+nz = false
+i = ulong 0
+while lt i n bound 32
+c = get expbuf add off i
+if not is_dig_ch c
+ret false
+end
+if ne c 48
+nz = true
+end
+i = add i 1
+end
+ret nz
+end
+
+fn is_hex_view s view uchar * n ulong to bool
+if ne len s n
+ret false
+end
+i = ulong 0
+while lt i n bound 128
+if not is_hex_ch get s i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note FIPS 180-4 SHA-256 constants and block compression
+fn sha_kinit to void
+put shak 0 0x428a2f98
+put shak 1 0x71374491
+put shak 2 0xb5c0fbcf
+put shak 3 0xe9b5dba5
+put shak 4 0x3956c25b
+put shak 5 0x59f111f1
+put shak 6 0x923f82a4
+put shak 7 0xab1c5ed5
+put shak 8 0xd807aa98
+put shak 9 0x12835b01
+put shak 10 0x243185be
+put shak 11 0x550c7dc3
+put shak 12 0x72be5d74
+put shak 13 0x80deb1fe
+put shak 14 0x9bdc06a7
+put shak 15 0xc19bf174
+put shak 16 0xe49b69c1
+put shak 17 0xefbe4786
+put shak 18 0x0fc19dc6
+put shak 19 0x240ca1cc
+put shak 20 0x2de92c6f
+put shak 21 0x4a7484aa
+put shak 22 0x5cb0a9dc
+put shak 23 0x76f988da
+put shak 24 0x983e5152
+put shak 25 0xa831c66d
+put shak 26 0xb00327c8
+put shak 27 0xbf597fc7
+put shak 28 0xc6e00bf3
+put shak 29 0xd5a79147
+put shak 30 0x06ca6351
+put shak 31 0x14292967
+put shak 32 0x27b70a85
+put shak 33 0x2e1b2138
+put shak 34 0x4d2c6dfc
+put shak 35 0x53380d13
+put shak 36 0x650a7354
+put shak 37 0x766a0abb
+put shak 38 0x81c2c92e
+put shak 39 0x92722c85
+put shak 40 0xa2bfe8a1
+put shak 41 0xa81a664b
+put shak 42 0xc24b8b70
+put shak 43 0xc76c51a3
+put shak 44 0xd192e819
+put shak 45 0xd6990624
+put shak 46 0xf40e3585
+put shak 47 0x106aa070
+put shak 48 0x19a4c116
+put shak 49 0x1e376c08
+put shak 50 0x2748774c
+put shak 51 0x34b0bcb5
+put shak 52 0x391c0cb3
+put shak 53 0x4ed8aa4a
+put shak 54 0x5b9cca4f
+put shak 55 0x682e6ff3
+put shak 56 0x748f82ee
+put shak 57 0x78a5636f
+put shak 58 0x84c87814
+put shak 59 0x8cc70208
+put shak 60 0x90befffa
+put shak 61 0xa4506ceb
+put shak 62 0xbef9a3f7
+put shak 63 0xc67178f2
+end
+
+fn sha_iv to void
+put shastate 0 0x6a09e667
+put shastate 1 0xbb67ae85
+put shastate 2 0x3c6ef372
+put shastate 3 0xa54ff53a
+put shastate 4 0x510e527f
+put shastate 5 0x9b05688c
+put shastate 6 0x1f83d9ab
+put shastate 7 0x5be0cd19
+end
+
+fn sha_sched to void
+for i ulong 16
+q = mul i 4
+x = uint get shablk q
+x = or shl x 8 uint get shablk add q 1
+x = or shl x 8 uint get shablk add q 2
+put shaw i or shl x 8 uint get shablk add q 3
+end
+for i ulong 48
+x = get shaw add i 1
+y = get shaw add i 14
+s0 = xor xor rotr x 7 rotr x 18 shr x 3
+s1 = xor xor rotr y 17 rotr y 19 shr y 10
+put shaw add i 16 add add get shaw i get shaw add i 9 add s0 s1
+end
+end
+
+fn sha_compress to void
+sha_sched
+a = get shastate 0
+b = get shastate 1
+c = get shastate 2
+d = get shastate 3
+e = get shastate 4
+f = get shastate 5
+g = get shastate 6
+h = get shastate 7
+t = uint 0
+for i ulong 64
+h = add h get shak i
+h = add h get shaw i
+t = xor rotr e 6 rotr e 11
+t = xor t rotr e 25
+h = add h t
+h = add h xor g and e xor f g
+d = add d h
+t = xor rotr a 2 rotr a 13
+t = xor t rotr a 22
+h = add h t
+h = add h or and a b and c or a b
+t = h
+h = g
+g = f
+f = e
+e = d
+d = c
+c = b
+b = a
+a = t
+end
+put shastate 0 add get shastate 0 a
+put shastate 1 add get shastate 1 b
+put shastate 2 add get shastate 2 c
+put shastate 3 add get shastate 3 d
+put shastate 4 add get shastate 4 e
+put shastate 5 add get shastate 5 f
+put shastate 6 add get shastate 6 g
+put shastate 7 add get shastate 7 h
+end
+
+fn sha256_bytes src view uchar * dlen ulong to void
+sha_kinit
+sha_iv
+off = ulong 0
+while ge sub dlen off 64 bound 65536
+for j ulong 64
+put shablk j get src add off j
+end
+sha_compress
+off = add off 64
+end
+remn = sub dlen off
+for j ulong 64
+if lt j remn
+put shablk j get src add off j
+else
+put shablk j 0
+end
+end
+put shablk remn 0x80
+if gt remn 55
+sha_compress
+for j ulong 64
+put shablk j 0
+end
+end
+bits = mul dlen 8
+put shablk 56 uchar and shr bits 56 255
+put shablk 57 uchar and shr bits 48 255
+put shablk 58 uchar and shr bits 40 255
+put shablk 59 uchar and shr bits 32 255
+put shablk 60 uchar and shr bits 24 255
+put shablk 61 uchar and shr bits 16 255
+put shablk 62 uchar and shr bits 8 255
+put shablk 63 uchar and bits 255
+sha_compress
+for i ulong 8
+w = get shastate i
+b0 = uchar and shr w 24 255
+b1 = uchar and shr w 16 255
+b2 = uchar and shr w 8 255
+b3 = uchar and w 255
+q = mul i 4
+put shadig q b0
+put shadig add q 1 b1
+put shadig add q 2 b2
+put shadig add q 3 b3
+end
+for i ulong 32
+bv = ulong get shadig i
+put shahex mul i 2 get khex shr bv 4
+put shahex add mul i 2 1 get khex and bv 15
+end
+end
+
+fn verify_rung_bytes src view uchar * dlen ulong exphex view uchar * to bool
+if not is_hex_view exphex 64
+ret false
+end
+sha256_bytes src dlen
+for i ulong 64
+if ne get shahex i get exphex i
+ret false
+end
+end
+ret true
+end
+
+note Pattern buffer helpers
+fn pat_clear to void
+put gmeta m_patlen 0
+end
+
+fn pat_push_ch c uchar to void
+n = get gmeta m_patlen
+if lt n 512
+put patbuf n c
+put gmeta m_patlen add n 1
+end
+end
+
+fn pat_push_lit s view uchar * to void
+sl = len s
+i = ulong 0
+while lt i sl bound 512
+pat_push_ch get s i
+i = add i 1
+end
+end
+
+fn pat_push_exp off ulong n ulong to void
+i = ulong 0
+while lt i n bound 512
+if lt add off i 16384
+pat_push_ch get expbuf add off i
+end
+i = add i 1
+end
+end
+
+fn pat_push_pin to void
+n = get gmeta m_plen
+i = ulong 0
+while lt i n bound 64
+pat_push_ch get pinbuf i
+i = add i 1
+end
+end
+
+fn pat_push_omc to void
+n = get gmeta m_olen
+i = ulong 0
+while lt i n bound 64
+pat_push_ch get omcsha i
+i = add i 1
+end
+end
+
+note Compare expbuf slice against literal
+fn exp_eq off ulong n ulong lit view uchar * to bool
+if ne n len lit
+ret false
+end
+i = ulong 0
+while lt i n bound 512
+if ne get expbuf add off i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn exp_starts off ulong elen ulong pfx view uchar * to bool
+pl = len pfx
+if lt elen pl
+ret false
+end
+i = ulong 0
+while lt i pl bound 512
+if ne get expbuf add off i get pfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn log_starts off ulong llen ulong pfx view uchar * to bool
+pl = len pfx
+if lt llen pl
+ret false
+end
+i = ulong 0
+while lt i pl bound 512
+if ne get logbuf add off i get pfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn log_contains off ulong llen ulong needle view uchar * to bool
+nl = len needle
+if gt nl llen
+ret false
+end
+lim = add sub llen nl 1
+i = ulong 0
+while lt i lim bound 1024
+if log_starts add off i sub llen i needle
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note Check if logbuf[off..off+llen) equals patbuf[0..patlen) exactly, or with optional " <digits>ms" suffix
+fn log_line_matches_pat off ulong llen ulong allow_ms bool to bool
+pl = get gmeta m_patlen
+if lt llen pl
+ret false
+end
+i = ulong 0
+while lt i pl bound 512
+if ne get logbuf add off i get patbuf i
+ret false
+end
+i = add i 1
+end
+if eq llen pl
+ret true
+end
+if not allow_ms
+ret false
+end
+if lt sub llen pl 4
+ret false
+end
+if ne get logbuf add off pl 32
+ret false
+end
+if ne get logbuf add off sub llen 2 109
+ret false
+end
+if ne get logbuf add off sub llen 1 115
+ret false
+end
+pos = add pl 1
+endpos = sub llen 2
+if ge pos endpos
+ret false
+end
+while lt pos endpos bound 32
+if not is_dig_ch get logbuf add off pos
+ret false
+end
+pos = add pos 1
+end
+ret true
+end
+
+fn log_has_pat allow_ms bool to bool
+tot = get gmeta m_llen
+pos = ulong 0
+while lt pos tot bound 32768
+ls = pos
+while lt pos tot bound 32768
+if eq get logbuf pos 10
+break
+end
+pos = add pos 1
+end
+ll = sub pos ls
+if log_line_matches_pat ls ll allow_ms
+ret true
+end
+if lt pos tot
+pos = add pos 1
+end
+end
+ret false
+end
+
+fn log_has_aarch64_host to bool
+tot = get gmeta m_llen
+pos = ulong 0
+while lt pos tot bound 32768
+ls = pos
+while lt pos tot bound 32768
+if eq get logbuf pos 10
+break
+end
+pos = add pos 1
+end
+ll = sub pos ls
+if log_starts ls ll t_host
+if log_contains ls ll t_a64
+ret true
+end
+end
+if lt pos tot
+pos = add pos 1
+end
+end
+ret false
+end
+
+fn log_has_fail_or_notrun to bool
+tot = get gmeta m_llen
+pos = ulong 0
+while lt pos tot bound 32768
+ls = pos
+while lt pos tot bound 32768
+if eq get logbuf pos 10
+break
+end
+pos = add pos 1
+end
+ll = sub pos ls
+off = ls
+remn = ll
+if log_starts ls ll t_st1
+off = add ls 7
+remn = sub ll 7
+else
+if log_starts ls ll t_st2
+off = add ls 7
+remn = sub ll 7
+else
+if log_starts ls ll t_st3
+off = add ls 7
+remn = sub ll 7
+end
+end
+end
+if log_starts off remn t_fail
+ret true
+end
+if log_starts off remn t_notrun
+ret true
+end
+if lt pos tot
+pos = add pos 1
+end
+end
+ret false
+end
+
+fn log_check_last_challenge to bool
+pat_clear
+pat_push_lit t_ch_pass
+pat_push_pin
+pat_push_lit t_ch_omc
+pat_push_omc
+tot = get gmeta m_llen
+pos = ulong 0
+found = false
+matched = false
+while lt pos tot bound 32768
+ls = pos
+while lt pos tot bound 32768
+if eq get logbuf pos 10
+break
+end
+pos = add pos 1
+end
+ll = sub pos ls
+if log_starts ls ll t_ch_pfx
+found = true
+matched = log_line_matches_pat ls ll false
+end
+if lt pos tot
+pos = add pos 1
+end
+end
+if not found
+ret false
+end
+ret matched
+end
+
+fn record_refusal msg view uchar * quiet bool to void
+put gmeta m_bad add get gmeta m_bad 1
+if not quiet
+wstr 1 t_ref_pfx
+wstr 1 msg
+end
+end
+
+fn find_space_exp pos ulong lim ulong to ulong
+p = pos
+while lt p lim bound 512
+if eq get expbuf p 32
+ret p
+end
+p = add p 1
+end
+ret lim
+end
+
+fn check_input_line ls ulong le_pos ulong quiet bool to void
+p1 = add ls 6
+s1 = find_space_exp p1 le_pos
+if or eq s1 p1 ge s1 le_pos
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+p2 = add s1 1
+s2 = find_space_exp p2 le_pos
+if or ne sub s2 p2 64 ge s2 le_pos
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+if not is_hex_exp p2 64
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+p3 = add s2 1
+b3 = sub le_pos p3
+if not is_dec_exp p3 b3
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+put rungseen r_incnt add get rungseen r_incnt 1
+pat_clear
+pat_push_lit t_pass_in
+pat_push_exp p1 sub le_pos p1
+if not log_has_pat false
+record_refusal t_ref_in quiet
+end
+end
+
+fn identify_rung p1 ulong nlen ulong to ulong
+if exp_eq p1 nlen t_seed0
+ret r_seed0
+end
+if exp_eq p1 nlen t_hex1
+ret r_hex1
+end
+if exp_eq p1 nlen t_asm2
+ret r_asm2
+end
+if exp_eq p1 nlen t_om4
+ret r_om4
+end
+if exp_eq p1 nlen t_omc
+ret r_omc
+end
+ret 99
+end
+
+fn check_omc_stages p1 ulong remn ulong quiet bool to void
+pat_clear
+pat_push_lit t_st1
+pat_push_lit t_pass_rg
+pat_push_exp p1 remn
+ok = log_has_pat true
+pat_clear
+pat_push_lit t_st2
+pat_push_lit t_pass_rg
+pat_push_exp p1 remn
+if not log_has_pat true
+ok = false
+end
+pat_clear
+pat_push_lit t_st3
+pat_push_lit t_pass_rg
+pat_push_exp p1 remn
+if not log_has_pat true
+ok = false
+end
+if not ok
+record_refusal t_ref_st quiet
+end
+end
+
+fn check_rung_line ls ulong le_pos ulong quiet bool to void
+p1 = add ls 5
+s1 = find_space_exp p1 le_pos
+nlen = sub s1 p1
+if or eq nlen 0 ge s1 le_pos
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+p2 = add s1 1
+s2 = find_space_exp p2 le_pos
+if or ne sub s2 p2 64 ge s2 le_pos
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+if not is_hex_exp p2 64
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+p3 = add s2 1
+if not is_dec_exp p3 sub le_pos p3
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+ridx = identify_rung p1 nlen
+if eq ridx 99
+put gmeta m_expe add get gmeta m_expe 1
+ret
+end
+put rungseen ridx 1
+put rungseen r_rcnt add get rungseen r_rcnt 1
+if eq ridx r_omc
+for i ulong 64
+put omcsha i get expbuf add p2 i
+end
+put gmeta m_olen 64
+check_omc_stages p1 sub le_pos p1 quiet
+else
+pat_clear
+pat_push_lit t_pass_rg
+pat_push_exp p1 sub le_pos p1
+if not log_has_pat true
+record_refusal t_ref_rg quiet
+end
+end
+end
+
+fn verify_loaded quiet bool to int
+for i ulong 8
+put rungseen i 0
+end
+put gmeta m_plen 0
+put gmeta m_olen 0
+put gmeta m_bad 0
+put gmeta m_expe 0
+etot = get gmeta m_elen
+pos = ulong 0
+while lt pos etot bound 16384
+ls = pos
+while lt pos etot bound 16384
+if eq get expbuf pos 10
+break
+end
+pos = add pos 1
+end
+ll = sub pos ls
+if gt ll 0
+if ne get expbuf ls 35
+if exp_starts ls ll t_pin
+plen = sub ll 4
+if and eq plen 40 is_hex_exp add ls 4 40
+for j ulong 40
+put pinbuf j get expbuf add add ls 4 j
+end
+put gmeta m_plen 40
+put rungseen r_pin 1
+else
+put gmeta m_expe add get gmeta m_expe 1
+end
+else
+if exp_starts ls ll t_input
+check_input_line ls pos quiet
+else
+if exp_starts ls ll t_rung
+check_rung_line ls pos quiet
+else
+put gmeta m_expe add get gmeta m_expe 1
+end
+end
+end
+end
+end
+if lt pos etot
+pos = add pos 1
+end
+end
+if gt get gmeta m_expe 0
+record_refusal t_ref_expe quiet
+ret 2
+end
+if eq get rungseen r_pin 0
+record_refusal t_ref_expe quiet
+ret 2
+end
+chain_ok = true
+for r ulong 5
+if eq get rungseen r 0
+chain_ok = false
+end
+end
+if not chain_ok
+record_refusal t_ref_chain quiet
+end
+pat_clear
+pat_push_lit t_pin
+pat_push_pin
+if not log_has_pat false
+record_refusal t_ref_pin quiet
+end
+if not log_has_aarch64_host
+record_refusal t_ref_host quiet
+end
+if log_has_fail_or_notrun
+record_refusal t_ref_fn quiet
+end
+if not log_check_last_challenge
+record_refusal t_ref_last quiet
+end
+if eq get gmeta m_bad 0
+ret 0
+end
+ret 1
+end
+
+fn read_file_into_exp plen ulong to bool
+fd = fopen argbuf 0 plen 0 0
+if lt fd 0
+ret false
+end
+tot = ulong 0
+while true bound 256
+k = read int fd rdbuf 0 4096
+if lt k 0
+cl = fclose int fd
+if lt cl 0
+ret false
+end
+ret false
+end
+if eq k 0
+break
+end
+kn = ulong k
+i = ulong 0
+while lt i kn bound 4096
+c = get rdbuf i
+if ne c 13
+if ge tot 16384
+cl2 = fclose int fd
+if lt cl2 0
+ret false
+end
+ret false
+end
+put expbuf tot c
+tot = add tot 1
+end
+i = add i 1
+end
+end
+cl3 = fclose int fd
+if lt cl3 0
+ret false
+end
+put gmeta m_elen tot
+ret true
+end
+
+fn read_file_into_log plen ulong to bool
+fd = fopen argbuf 0 plen 0 0
+if lt fd 0
+ret false
+end
+tot = ulong 0
+while true bound 256
+k = read int fd rdbuf 0 4096
+if lt k 0
+cl = fclose int fd
+if lt cl 0
+ret false
+end
+ret false
+end
+if eq k 0
+break
+end
+kn = ulong k
+i = ulong 0
+while lt i kn bound 4096
+c = get rdbuf i
+if ne c 13
+if ge tot 32768
+cl2 = fclose int fd
+if lt cl2 0
+ret false
+end
+ret false
+end
+put logbuf tot c
+tot = add tot 1
+end
+i = add i 1
+end
+end
+cl3 = fclose int fd
+if lt cl3 0
+ret false
+end
+put gmeta m_llen tot
+ret true
+end
+
+fn is_sep_line lpos ulong to bool
+if ne lpos 3
+ret false
+end
+if ne get patbuf 0 45
+ret false
+end
+if ne get patbuf 1 45
+ret false
+end
+ret eq get patbuf 2 45
+end
+
+fn flush_pat_line in_log bool lpos ulong add_nl bool to bool
+j = ulong 0
+if not in_log
+etot = get gmeta m_elen
+while lt j lpos bound 512
+if ge etot 16384
+ret false
+end
+put expbuf etot get patbuf j
+etot = add etot 1
+j = add j 1
+end
+if add_nl
+if ge etot 16384
+ret false
+end
+put expbuf etot 10
+etot = add etot 1
+end
+put gmeta m_elen etot
+ret true
+end
+ltot = get gmeta m_llen
+while lt j lpos bound 512
+if ge ltot 32768
+ret false
+end
+put logbuf ltot get patbuf j
+ltot = add ltot 1
+j = add j 1
+end
+if add_nl
+if ge ltot 32768
+ret false
+end
+put logbuf ltot 10
+ltot = add ltot 1
+end
+put gmeta m_llen ltot
+ret true
+end
+
+fn read_stdin_split to bool
+put gmeta m_elen 0
+put gmeta m_llen 0
+in_log = false
+lpos = ulong 0
+while true bound 256
+k = read 0 rdbuf 0 4096
+if lt k 0
+ret false
+end
+if eq k 0
+break
+end
+kn = ulong k
+i = ulong 0
+while lt i kn bound 4096
+c = get rdbuf i
+if ne c 13
+if eq c 10
+sep = false
+if not in_log
+sep = is_sep_line lpos
+end
+if sep
+in_log = true
+lpos = ulong 0
+else
+if not flush_pat_line in_log lpos true
+ret false
+end
+lpos = ulong 0
+end
+else
+if lt lpos 512
+put patbuf lpos c
+lpos = add lpos 1
+end
+end
+end
+i = add i 1
+end
+end
+if gt lpos 0
+if not flush_pat_line in_log lpos false
+ret false
+end
+end
+ret in_log
+end
+
+fn main to int
+ac = argcnt
+if eq ac 3
+n1 = argread 1 argbuf 0 512
+if le n1 0
+wstr 2 t_usage
+ret 2
+end
+if not read_file_into_exp ulong n1
+wstr 2 t_ioerr
+ret 2
+end
+n2 = argread 2 argbuf 0 512
+if le n2 0
+wstr 2 t_usage
+ret 2
+end
+if not read_file_into_log ulong n2
+wstr 2 t_ioerr
+ret 2
+end
+else
+if eq ac 1
+if not read_stdin_split
+wstr 2 t_usage
+ret 2
+end
+else
+wstr 2 t_usage
+ret 2
+end
+end
+rc = verify_loaded false
+if eq rc 0
+wstr 1 t_acc1
+wpin 1
+wstr 1 t_acc2
+womc 1
+wstr 1 t_nl
+ret 0
+end
+if eq rc 2
+ret 2
+end
+wstr 1 t_rej1
+wdec 1 get gmeta m_bad
+wstr 1 t_nl
+ret 1
+end

@@ -1,0 +1,1011 @@
+om2
+note si/harvester/harvester.om: Zero-telemetry documentation & reasoning harvester in pure OM-2.
+note Faithful conversion of harvester (extractor.rs, filter.rs, export.rs) + markdown doc extraction:
+note - Reads markdown/text on stdin (zero network, zero disk secrets, zero telemetry)
+note - Extracts # / ## / ### headings outside fenced code blocks
+note - Counts fenced code blocks (``` fences)
+note - Extracts [text](url) markdown links, rejects telemetry/tracking domains & unsafe schemes,
+note   strips tracking query parameters (utm_*, fbclid, gclid, mc_eid), deduplicates links via SHA-256
+note - Extracts key metadata lines (title, author, license, pin, source, date, version, provider, model)
+note - Extracts <think>...</think> and <thought>...</thought> reasoning blocks with quality scoring
+note - Emits deterministic JSONL records on stdout with RFC 8259 string escaping.
+
+global inbuf uchar 32768
+global rdbuf uchar 4096
+global outbuf uchar 32768
+global urlbuf uchar 512
+global cleanurl uchar 512
+global decbuf uchar 32
+global stats ulong 16
+global shastate uint 8
+global shak uint 64
+global shaw uint 64
+global shablk uchar 64
+global shadig uchar 32
+global shahex uchar 64
+global seenfp uchar 4096
+
+note stats indices
+const st_inlen ulong 0
+const st_outlen ulong 1
+const st_heads ulong 2
+const st_blocks ulong 3
+const st_links ulong 4
+const st_telrej ulong 5
+const st_strip ulong 6
+const st_meta ulong 7
+const st_reas ulong 8
+const st_qual ulong 9
+const st_clen ulong 10
+const st_seencnt ulong 11
+const st_dedup ulong 12
+
+text khex "0123456789abcdef"
+text j_head1 "{\"type\":\"heading\",\"level\":"
+text j_text ",\"text\":\""
+text j_link1 "{\"type\":\"link\",\"text\":\""
+text j_url "\",\"url\":\""
+text j_meta1 "{\"type\":\"meta\",\"key\":\""
+text j_val "\",\"value\":\""
+text j_reas1 "{\"type\":\"reasoning\",\"tokens\":"
+text j_qm ",\"quality_milli\":"
+text j_sum1 "{\"type\":\"summary\",\"headings\":"
+text j_sum2 ",\"code_blocks\":"
+text j_sum3 ",\"links\":"
+text j_sum4 ",\"telemetry_rejected\":"
+text j_sum5 ",\"tracking_stripped\":"
+text j_sum6 ",\"meta\":"
+text j_sum7 ",\"reasoning\":"
+text j_sum8 ",\"quality_milli\":"
+text j_sum9 ",\"sha256\":\""
+text j_end "\"}\n"
+
+text t_fence "```"
+text t_think_o "<think>"
+text t_think_c "</think>"
+text t_thought_o "<thought>"
+text t_thought_c "</thought>"
+text t_kw_step "step"
+text t_kw_ver "verify"
+text t_kw_bigo "O("
+
+note Metadata keys
+text mk_title "title:"
+text mk_author "author:"
+text mk_lic "license:"
+text mk_pin "pin:"
+text mk_src "source:"
+text mk_date "date:"
+text mk_ver "version:"
+text mk_prov "provider:"
+text mk_mod "model:"
+
+note Telemetry/tracking domain patterns and unsafe schemes
+text td_ga "google-analytics.com"
+text td_gtm "googletagmanager.com"
+text td_dc "doubleclick.net"
+text td_mp "mixpanel.com"
+text td_sg1 "segment.io"
+text td_sg2 "segment.com"
+text td_amp "amplitude.com"
+text td_hj "hotjar.com"
+text td_fb "facebook.com/tr"
+text td_tel "telemetry."
+text td_ana "analytics."
+text td_pix "pixel."
+text td_bea "beacon."
+text td_js "javascript:"
+text td_dat "data:"
+
+note Tracking query param prefixes
+text qp_utm "utm_"
+text qp_fb "fbclid="
+text qp_gc "gclid="
+text qp_mc "mc_eid="
+
+text e_io "harvester: failed to read stdin\n"
+
+fn write_all fd int src view uchar * off ulong n ulong to void
+p = ulong 0
+while lt p n bound 32768
+k = write fd src add off p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn wstr fd int s view uchar * to void
+write_all fd s 0 len s
+end
+
+fn to_lower c uchar to uchar
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+fn out_push_ch c uchar to void
+p = get stats st_outlen
+if lt p 32768
+put outbuf p c
+put stats st_outlen add p 1
+end
+end
+
+fn out_push_lit s view uchar * to void
+sl = len s
+i = ulong 0
+while lt i sl bound 1024
+out_push_ch get s i
+i = add i 1
+end
+end
+
+fn out_push_dec v ulong to void
+i = ulong 32
+n = v
+while true bound 24
+i = sub i 1
+put decbuf i uchar add rem n 10 48
+n = div n 10
+if eq n 0
+break
+end
+end
+p = i
+while lt p 32 bound 32
+out_push_ch get decbuf p
+p = add p 1
+end
+end
+
+fn out_push_json_ch c uchar to void
+if eq c 34
+out_push_ch 92
+out_push_ch 34
+ret
+end
+if eq c 92
+out_push_ch 92
+out_push_ch 92
+ret
+end
+if eq c 10
+out_push_ch 92
+out_push_ch 110
+ret
+end
+if eq c 13
+out_push_ch 92
+out_push_ch 114
+ret
+end
+if eq c 9
+out_push_ch 92
+out_push_ch 116
+ret
+end
+if ge c 32
+out_push_ch c
+end
+end
+
+fn out_push_in_json off ulong n ulong to void
+i = ulong 0
+while lt i n bound 4096
+if lt add off i 32768
+out_push_json_ch get inbuf add off i
+end
+i = add i 1
+end
+end
+
+fn out_push_cleanurl_json to void
+n = get stats st_clen
+i = ulong 0
+while lt i n bound 512
+out_push_json_ch get cleanurl i
+i = add i 1
+end
+end
+
+fn out_push_shahex to void
+for i ulong 64
+out_push_ch get shahex i
+end
+end
+
+note FIPS 180-4 SHA-256
+fn sha_kinit to void
+put shak 0 0x428a2f98
+put shak 1 0x71374491
+put shak 2 0xb5c0fbcf
+put shak 3 0xe9b5dba5
+put shak 4 0x3956c25b
+put shak 5 0x59f111f1
+put shak 6 0x923f82a4
+put shak 7 0xab1c5ed5
+put shak 8 0xd807aa98
+put shak 9 0x12835b01
+put shak 10 0x243185be
+put shak 11 0x550c7dc3
+put shak 12 0x72be5d74
+put shak 13 0x80deb1fe
+put shak 14 0x9bdc06a7
+put shak 15 0xc19bf174
+put shak 16 0xe49b69c1
+put shak 17 0xefbe4786
+put shak 18 0x0fc19dc6
+put shak 19 0x240ca1cc
+put shak 20 0x2de92c6f
+put shak 21 0x4a7484aa
+put shak 22 0x5cb0a9dc
+put shak 23 0x76f988da
+put shak 24 0x983e5152
+put shak 25 0xa831c66d
+put shak 26 0xb00327c8
+put shak 27 0xbf597fc7
+put shak 28 0xc6e00bf3
+put shak 29 0xd5a79147
+put shak 30 0x06ca6351
+put shak 31 0x14292967
+put shak 32 0x27b70a85
+put shak 33 0x2e1b2138
+put shak 34 0x4d2c6dfc
+put shak 35 0x53380d13
+put shak 36 0x650a7354
+put shak 37 0x766a0abb
+put shak 38 0x81c2c92e
+put shak 39 0x92722c85
+put shak 40 0xa2bfe8a1
+put shak 41 0xa81a664b
+put shak 42 0xc24b8b70
+put shak 43 0xc76c51a3
+put shak 44 0xd192e819
+put shak 45 0xd6990624
+put shak 46 0xf40e3585
+put shak 47 0x106aa070
+put shak 48 0x19a4c116
+put shak 49 0x1e376c08
+put shak 50 0x2748774c
+put shak 51 0x34b0bcb5
+put shak 52 0x391c0cb3
+put shak 53 0x4ed8aa4a
+put shak 54 0x5b9cca4f
+put shak 55 0x682e6ff3
+put shak 56 0x748f82ee
+put shak 57 0x78a5636f
+put shak 58 0x84c87814
+put shak 59 0x8cc70208
+put shak 60 0x90befffa
+put shak 61 0xa4506ceb
+put shak 62 0xbef9a3f7
+put shak 63 0xc67178f2
+end
+
+fn sha_iv to void
+put shastate 0 0x6a09e667
+put shastate 1 0xbb67ae85
+put shastate 2 0x3c6ef372
+put shastate 3 0xa54ff53a
+put shastate 4 0x510e527f
+put shastate 5 0x9b05688c
+put shastate 6 0x1f83d9ab
+put shastate 7 0x5be0cd19
+end
+
+fn sha_sched to void
+for i ulong 16
+q = mul i 4
+x = uint get shablk q
+x = or shl x 8 uint get shablk add q 1
+x = or shl x 8 uint get shablk add q 2
+put shaw i or shl x 8 uint get shablk add q 3
+end
+for i ulong 48
+x = get shaw add i 1
+y = get shaw add i 14
+s0 = xor xor rotr x 7 rotr x 18 shr x 3
+s1 = xor xor rotr y 17 rotr y 19 shr y 10
+put shaw add i 16 add add get shaw i get shaw add i 9 add s0 s1
+end
+end
+
+fn sha_compress to void
+sha_sched
+a = get shastate 0
+b = get shastate 1
+c = get shastate 2
+d = get shastate 3
+e = get shastate 4
+f = get shastate 5
+g = get shastate 6
+h = get shastate 7
+t = uint 0
+for i ulong 64
+h = add h get shak i
+h = add h get shaw i
+t = xor rotr e 6 rotr e 11
+t = xor t rotr e 25
+h = add h t
+h = add h xor g and e xor f g
+d = add d h
+t = xor rotr a 2 rotr a 13
+t = xor t rotr a 22
+h = add h t
+h = add h or and a b and c or a b
+t = h
+h = g
+g = f
+f = e
+e = d
+d = c
+c = b
+b = a
+a = t
+end
+put shastate 0 add get shastate 0 a
+put shastate 1 add get shastate 1 b
+put shastate 2 add get shastate 2 c
+put shastate 3 add get shastate 3 d
+put shastate 4 add get shastate 4 e
+put shastate 5 add get shastate 5 f
+put shastate 6 add get shastate 6 g
+put shastate 7 add get shastate 7 h
+end
+
+fn sha_finalize_hex to void
+for i ulong 8
+w = get shastate i
+q = mul i 4
+put shadig q uchar and shr w 24 255
+put shadig add q 1 uchar and shr w 16 255
+put shadig add q 2 uchar and shr w 8 255
+put shadig add q 3 uchar and w 255
+end
+for i ulong 32
+bv = ulong get shadig i
+put shahex mul i 2 get khex shr bv 4
+put shahex add mul i 2 1 get khex and bv 15
+end
+end
+
+fn sha256_inbuf to void
+dlen = get stats st_inlen
+sha_kinit
+sha_iv
+off = ulong 0
+while ge sub dlen off 64 bound 1024
+for j ulong 64
+put shablk j get inbuf add off j
+end
+sha_compress
+off = add off 64
+end
+remn = sub dlen off
+for j ulong 64
+if lt j remn
+put shablk j get inbuf add off j
+else
+put shablk j 0
+end
+end
+put shablk remn 0x80
+if gt remn 55
+sha_compress
+for j ulong 64
+put shablk j 0
+end
+end
+bits = mul dlen 8
+put shablk 56 uchar and shr bits 56 255
+put shablk 57 uchar and shr bits 48 255
+put shablk 58 uchar and shr bits 40 255
+put shablk 59 uchar and shr bits 32 255
+put shablk 60 uchar and shr bits 24 255
+put shablk 61 uchar and shr bits 16 255
+put shablk 62 uchar and shr bits 8 255
+put shablk 63 uchar and bits 255
+sha_compress
+sha_finalize_hex
+end
+
+fn sha256_cleanurl to void
+dlen = get stats st_clen
+sha_kinit
+sha_iv
+off = ulong 0
+while ge sub dlen off 64 bound 16
+for j ulong 64
+put shablk j to_lower get cleanurl add off j
+end
+sha_compress
+off = add off 64
+end
+remn = sub dlen off
+for j ulong 64
+if lt j remn
+put shablk j to_lower get cleanurl add off j
+else
+put shablk j 0
+end
+end
+put shablk remn 0x80
+if gt remn 55
+sha_compress
+for j ulong 64
+put shablk j 0
+end
+end
+bits = mul dlen 8
+put shablk 56 uchar and shr bits 56 255
+put shablk 57 uchar and shr bits 48 255
+put shablk 58 uchar and shr bits 40 255
+put shablk 59 uchar and shr bits 32 255
+put shablk 60 uchar and shr bits 24 255
+put shablk 61 uchar and shr bits 16 255
+put shablk 62 uchar and shr bits 8 255
+put shablk 63 uchar and bits 255
+sha_compress
+sha_finalize_hex
+end
+
+note Deduplication check against seenfp (up to 64 unique 64-byte hex fingerprints)
+fn dedup_insert_cleanurl to bool
+sha256_cleanurl
+cnt = get stats st_seencnt
+k = ulong 0
+while lt k cnt bound 64
+base = mul k 64
+same = true
+for i ulong 64
+if ne get seenfp add base i get shahex i
+same = false
+end
+end
+if same
+put stats st_dedup add get stats st_dedup 1
+ret false
+end
+k = add k 1
+end
+if lt cnt 64
+base2 = mul cnt 64
+for i ulong 64
+put seenfp add base2 i get shahex i
+end
+put stats st_seencnt add cnt 1
+end
+ret true
+end
+
+note String matching helpers on inbuf and urlbuf
+fn in_starts_ci off ulong lim ulong pat view uchar * to bool
+pl = len pat
+if gt add off pl lim
+ret false
+end
+i = ulong 0
+while lt i pl bound 64
+if ne to_lower get inbuf add off i to_lower get pat i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn in_contains_ci off ulong lim ulong pat view uchar * to bool
+pl = len pat
+if lt sub lim off pl
+ret false
+end
+endp = add sub lim pl 1
+p = off
+while lt p endp bound 32768
+if in_starts_ci p lim pat
+ret true
+end
+p = add p 1
+end
+ret false
+end
+
+fn url_starts_ci pos ulong ulen ulong pat view uchar * to bool
+pl = len pat
+if gt add pos pl ulen
+ret false
+end
+i = ulong 0
+while lt i pl bound 64
+if ne to_lower get urlbuf add pos i to_lower get pat i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn url_contains_ci ulen ulong pat view uchar * to bool
+pl = len pat
+if gt pl ulen
+ret false
+end
+lim = add sub ulen pl 1
+i = ulong 0
+while lt i lim bound 512
+if url_starts_ci i ulen pat
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn is_telemetry_url ulen ulong to bool
+if url_starts_ci 0 ulen td_js
+ret true
+end
+if url_starts_ci 0 ulen td_dat
+ret true
+end
+if url_contains_ci ulen td_ga
+ret true
+end
+if url_contains_ci ulen td_gtm
+ret true
+end
+if url_contains_ci ulen td_dc
+ret true
+end
+if url_contains_ci ulen td_mp
+ret true
+end
+if url_contains_ci ulen td_sg1
+ret true
+end
+if url_contains_ci ulen td_sg2
+ret true
+end
+if url_contains_ci ulen td_amp
+ret true
+end
+if url_contains_ci ulen td_hj
+ret true
+end
+if url_contains_ci ulen td_fb
+ret true
+end
+if url_contains_ci ulen td_tel
+ret true
+end
+if url_contains_ci ulen td_ana
+ret true
+end
+if url_contains_ci ulen td_pix
+ret true
+end
+ret url_contains_ci ulen td_bea
+end
+
+fn is_tracking_param pos ulong lim ulong to bool
+if url_starts_ci pos lim qp_utm
+ret true
+end
+if url_starts_ci pos lim qp_fb
+ret true
+end
+if url_starts_ci pos lim qp_gc
+ret true
+end
+ret url_starts_ci pos lim qp_mc
+end
+
+note Strip tracking query params from urlbuf[0..ulen) into cleanurl[0..st_clen)
+fn strip_tracking_params ulen ulong to void
+qpos = ulen
+i = ulong 0
+while lt i ulen bound 512
+if eq get urlbuf i 63
+qpos = i
+break
+end
+i = add i 1
+end
+cl = ulong 0
+j = ulong 0
+while lt j qpos bound 512
+put cleanurl cl get urlbuf j
+cl = add cl 1
+j = add j 1
+end
+if eq qpos ulen
+put stats st_clen cl
+ret
+end
+first_q = true
+pos = add qpos 1
+while lt pos ulen bound 512
+ps = pos
+while lt pos ulen bound 512
+if eq get urlbuf pos 38
+break
+end
+pos = add pos 1
+end
+if is_tracking_param ps pos
+put stats st_strip add get stats st_strip 1
+else
+if gt pos ps
+if first_q
+put cleanurl cl 63
+cl = add cl 1
+first_q = false
+else
+put cleanurl cl 38
+cl = add cl 1
+end
+k = ps
+while lt k pos bound 512
+if lt cl 512
+put cleanurl cl get urlbuf k
+cl = add cl 1
+end
+k = add k 1
+end
+end
+end
+if lt pos ulen
+pos = add pos 1
+end
+end
+put stats st_clen cl
+end
+
+fn extract_links_on_line ls ulong le_pos ulong to void
+p = ls
+while lt p le_pos bound 1024
+if eq get inbuf p 91
+ts = add p 1
+te = ts
+while lt te le_pos bound 512
+if eq get inbuf te 93
+break
+end
+te = add te 1
+end
+if and lt add te 2 le_pos eq get inbuf add te 1 40
+us = add te 2
+ue = us
+while lt ue le_pos bound 512
+if eq get inbuf ue 41
+break
+end
+ue = add ue 1
+end
+if and lt ue le_pos gt ue us
+ul = sub ue us
+if gt ul 511
+ul = ulong 511
+end
+k = ulong 0
+while lt k ul bound 512
+put urlbuf k get inbuf add us k
+k = add k 1
+end
+if is_telemetry_url ul
+put stats st_telrej add get stats st_telrej 1
+else
+strip_tracking_params ul
+if dedup_insert_cleanurl
+put stats st_links add get stats st_links 1
+out_push_lit j_link1
+out_push_in_json ts sub te ts
+out_push_lit j_url
+out_push_cleanurl_json
+out_push_lit j_end
+end
+end
+p = ue
+end
+end
+end
+p = add p 1
+end
+end
+
+fn try_meta_key ls ulong le_pos ulong key view uchar * to bool
+kl = len key
+if not in_starts_ci ls le_pos key
+ret false
+end
+vs = add ls kl
+while lt vs le_pos bound 64
+if ne get inbuf vs 32
+break
+end
+vs = add vs 1
+end
+ve = le_pos
+while gt ve vs bound 64
+if ne get inbuf sub ve 1 32
+break
+end
+ve = sub ve 1
+end
+if eq ve vs
+ret false
+end
+put stats st_meta add get stats st_meta 1
+out_push_lit j_meta1
+out_push_in_json ls sub kl 1
+out_push_lit j_val
+out_push_in_json vs sub ve vs
+out_push_lit j_end
+ret true
+end
+
+fn check_meta_line ls ulong le_pos ulong to bool
+if try_meta_key ls le_pos mk_title
+ret true
+end
+if try_meta_key ls le_pos mk_author
+ret true
+end
+if try_meta_key ls le_pos mk_lic
+ret true
+end
+if try_meta_key ls le_pos mk_pin
+ret true
+end
+if try_meta_key ls le_pos mk_src
+ret true
+end
+if try_meta_key ls le_pos mk_date
+ret true
+end
+if try_meta_key ls le_pos mk_ver
+ret true
+end
+if try_meta_key ls le_pos mk_prov
+ret true
+end
+ret try_meta_key ls le_pos mk_mod
+end
+
+fn check_heading_line ls ulong le_pos ulong to bool
+ll = sub le_pos ls
+if lt ll 3
+ret false
+end
+if ne get inbuf ls 35
+ret false
+end
+lvl = ulong 0
+while and lt lvl 3 lt add ls lvl le_pos bound 4
+if ne get inbuf add ls lvl 35
+break
+end
+lvl = add lvl 1
+end
+if eq lvl 0
+ret false
+end
+if ge add ls lvl le_pos
+ret false
+end
+if ne get inbuf add ls lvl 32
+ret false
+end
+ts = add add ls lvl 1
+while lt ts le_pos bound 64
+if ne get inbuf ts 32
+break
+end
+ts = add ts 1
+end
+ve = le_pos
+while gt ve ts bound 64
+if ne get inbuf sub ve 1 32
+break
+end
+ve = sub ve 1
+end
+put stats st_heads add get stats st_heads 1
+out_push_lit j_head1
+out_push_dec lvl
+out_push_lit j_text
+out_push_in_json ts sub ve ts
+out_push_lit j_end
+ret true
+end
+
+note Extract <think>...</think> or <thought>...</thought> reasoning blocks (upstream extractor.rs)
+fn extract_reasoning_blocks to void
+tot = get stats st_inlen
+has_code = gt get stats st_blocks 0
+base_q = ulong 500
+if has_code
+base_q = add base_q 100
+end
+put stats st_qual base_q
+pos = ulong 0
+while lt pos tot bound 32768
+rs = ulong 0
+re = ulong 0
+found = false
+if in_starts_ci pos tot t_think_o
+rs = add pos 7
+q = rs
+while lt q tot bound 32768
+if in_starts_ci q tot t_think_c
+re = q
+found = true
+pos = add q 8
+break
+end
+q = add q 1
+end
+else
+if in_starts_ci pos tot t_thought_o
+rs = add pos 9
+q = rs
+while lt q tot bound 32768
+if in_starts_ci q tot t_thought_c
+re = q
+found = true
+pos = add q 10
+break
+end
+q = add q 1
+end
+end
+end
+if found
+rlen = sub re rs
+qm = ulong 500
+if gt rlen 0
+qm = add qm 200
+end
+if gt rlen 50
+qm = add qm 100
+end
+if or in_contains_ci rs re t_kw_step or in_contains_ci rs re t_kw_ver in_contains_ci rs re t_kw_bigo
+qm = add qm 100
+end
+if has_code
+qm = add qm 100
+end
+if gt qm 1000
+qm = ulong 1000
+end
+if gt qm get stats st_qual
+put stats st_qual qm
+end
+put stats st_reas add get stats st_reas 1
+out_push_lit j_reas1
+out_push_dec div tot 4
+out_push_lit j_qm
+out_push_dec qm
+out_push_lit j_text
+out_push_in_json rs rlen
+out_push_lit j_end
+else
+pos = add pos 1
+end
+end
+end
+
+fn harvest_loaded to void
+tot = get stats st_inlen
+for i ulong 13
+if ne i st_inlen
+put stats i 0
+end
+end
+in_fence = false
+pos = ulong 0
+while lt pos tot bound 32768
+ls = pos
+while lt pos tot bound 32768
+if eq get inbuf pos 10
+break
+end
+pos = add pos 1
+end
+if in_starts_ci ls pos t_fence
+if not in_fence
+in_fence = true
+put stats st_blocks add get stats st_blocks 1
+else
+in_fence = false
+end
+else
+if not in_fence
+if not check_heading_line ls pos
+is_m = check_meta_line ls pos
+if not is_m
+extract_links_on_line ls pos
+end
+end
+end
+end
+if lt pos tot
+pos = add pos 1
+end
+end
+extract_reasoning_blocks
+sha256_inbuf
+out_push_lit j_sum1
+out_push_dec get stats st_heads
+out_push_lit j_sum2
+out_push_dec get stats st_blocks
+out_push_lit j_sum3
+out_push_dec get stats st_links
+out_push_lit j_sum4
+out_push_dec get stats st_telrej
+out_push_lit j_sum5
+out_push_dec get stats st_strip
+out_push_lit j_sum6
+out_push_dec get stats st_meta
+out_push_lit j_sum7
+out_push_dec get stats st_reas
+out_push_lit j_sum8
+out_push_dec get stats st_qual
+out_push_lit j_sum9
+out_push_shahex
+out_push_lit j_end
+end
+
+fn read_stdin to bool
+tot = ulong 0
+while true bound 256
+k = read 0 rdbuf 0 4096
+if lt k 0
+ret false
+end
+if eq k 0
+break
+end
+kn = ulong k
+i = ulong 0
+while lt i kn bound 4096
+c = get rdbuf i
+if ne c 13
+if ge tot 32768
+ret false
+end
+put inbuf tot c
+tot = add tot 1
+end
+i = add i 1
+end
+end
+put stats st_inlen tot
+ret true
+end
+
+fn flush_out to void
+n = get stats st_outlen
+p = ulong 0
+while lt p n bound 32768
+k = write 1 outbuf p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn main to int
+if not read_stdin
+wstr 2 e_io
+ret 2
+end
+harvest_loaded
+flush_out
+ret 0
+end

@@ -1,0 +1,1198 @@
+note core/dream/lib.om: pure Omega dynamic dream-cycle session memory consolidation engine.
+note Upstream source: spark-dream/src/lib.rs and src/main.rs.
+note Compose after si/directives/om2.om; no target line, no fn main.
+
+const DREAM_OK int 0
+const DREAM_ERR_EMPTY int 1
+const DREAM_ERR_NOT_IDLE int 2
+const DREAM_ERR_BAD_CONFIG int 3
+const DREAM_ERR_BAD_IMP int 4
+const DREAM_ERR_POOL_FULL int 5
+const DREAM_ERR_NON_MD int 6
+
+const DREAM_LAYOUT_FRONTMATTER ulong 1
+const DREAM_LAYOUT_HEADING ulong 2
+const DREAM_LAYOUT_BULLET ulong 3
+const DREAM_LAYOUT_RAW ulong 4
+
+const DREAM_TYPE_DISCOVERY ulong 1
+const DREAM_TYPE_LESSON ulong 2
+const DREAM_TYPE_PROCEDURE ulong 3
+const DREAM_TYPE_FACT ulong 4
+const DREAM_TYPE_PROPOSAL ulong 5
+
+const DREAM_ST_PENDING ulong 0
+const DREAM_ST_COMMITTED ulong 1
+const DREAM_ST_STAGED ulong 2
+const DREAM_ST_REJECTED ulong 3
+const DREAM_ST_DEDUPED ulong 4
+
+const DREAM_MAX_EP ulong 32
+const DREAM_NAME_CAP ulong 128
+const DREAM_BODY_CAP ulong 512
+const DREAM_EMB_DIM ulong 8
+const DREAM_IDLE_THRESH_DEF ulong 900
+const DREAM_LN2 f64 0.6931471805599453
+
+struct DreamConfig gpu_util ulong idle_secs ulong idle_thresh ulong require_idle bool half_life ulong dedup_sim f64 commit_thr f64 stage_thr f64 reinforce f64 end
+struct DreamState ok bool err int cycles ulong ingested ulong clusters ulong deduped ulong committed ulong staged ulong rejected ulong end
+struct SliceRange off ulong cnt ulong end
+
+global dm_obuf uchar 32768
+global dm_olen ulong 1
+
+global dm_ep_cnt ulong 1
+global dm_name_buf uchar 4096
+global dm_name_len ulong 32
+global dm_body_buf uchar 16384
+global dm_body_len ulong 32
+global dm_layout ulong 32
+global dm_itype ulong 32
+global dm_tags ulong 32
+global dm_age ulong 32
+global dm_imp f64 32
+global dm_score f64 32
+global dm_emb f64 256
+global dm_status ulong 32
+global dm_rep ulong 32
+global dm_csize ulong 32
+global dm_order ulong 32
+
+text td_nl "\n"
+text td_sp " "
+text td_dot "."
+text td_minus "-"
+text td_parked "parked-"
+text td_md ".md"
+text td_fence "---"
+text td_h1 "# "
+text td_p_disc1 "Discovery:"
+text td_p_disc2 "discovery:"
+text td_p_les1 "Lesson:"
+text td_p_les2 "lesson:"
+text td_p_proc1 "Procedure:"
+text td_p_proc2 "procedure:"
+text td_b_find1 "- Finding:"
+text td_b_find2 "- finding:"
+text td_b_find3 "* Finding:"
+text td_k_title "title"
+text td_k_cname "canonical_name"
+text td_k_name "name"
+text td_k_type "type"
+text td_k_etype "entity_type"
+text td_k_kind "kind"
+text td_k_tags "tags"
+text td_v_lesson "lesson"
+text td_v_proc "learned_procedure"
+text td_v_proc_s "procedure"
+text td_v_fact "operational_fact"
+text td_v_prop "soul_proposal"
+text td_v_disc "discovery"
+text td_l_fm "frontmatter"
+text td_l_hd "heading"
+text td_l_bl "bullet_finding"
+text td_l_rw "raw"
+text td_s_com "COMMITTED"
+text td_s_stg "STAGED"
+text td_s_rej "REJECTED"
+text td_s_dup "DEDUPED"
+text td_s_pnd "PENDING"
+text td_st_hdr "{\"daemon_running\":true,\"current_phase\":\"idle\",\"cycles_completed\":"
+text td_st_ing ",\"episodes_ingested\":"
+text td_st_cls ",\"clusters_formed\":"
+text td_st_dup ",\"duplicates_merged\":"
+text td_st_com ",\"facts_committed\":"
+text td_st_stg ",\"proposals_staged\":"
+text td_st_rej ",\"facts_rejected\":"
+text td_st_end "}\n"
+text td_rec_id "ep="
+text td_rec_st " status="
+text td_rec_ty " type="
+text td_rec_ly " layout="
+text td_rec_sc " score="
+text td_rec_cs " cluster_size="
+text td_rec_rp " rep="
+text td_rec_nm " name="
+
+note ---- stdout buffer helpers
+
+fn dm_ob_reset to void
+put dm_olen 0 0
+end
+
+fn dm_ob_byte c uchar to void
+n = get dm_olen 0
+if lt n len dm_obuf
+put dm_obuf n c
+put dm_olen 0 add n 1
+end
+end
+
+fn dm_ob_str s view uchar * to void
+for i ulong len s
+dm_ob_byte get s i
+end
+end
+
+fn dm_ob_u64 v ulong to void
+d = new uchar 24 0
+pos = ulong 24
+x = v
+for it ulong 24
+pos = sub pos 1
+put d pos uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+for k ulong sub 24 pos
+dm_ob_byte get d add pos k
+end
+end
+
+fn dm_ob_i64 v long to void
+if lt v 0
+dm_ob_str td_minus
+dm_ob_u64 ulong neg v
+else
+dm_ob_u64 ulong v
+end
+end
+
+fn dm_ob_f64_4 v f64 to void
+x = v
+if lt x 0.0f64
+dm_ob_str td_minus
+x = neg x
+end
+scaled = ulong add mul x 10000.0f64 0.5f64
+whole = div scaled 10000
+frac = rem scaled 10000
+dm_ob_u64 whole
+dm_ob_str td_dot
+d3 = div frac 1000
+r3 = rem frac 1000
+d2 = div r3 100
+r2 = rem r3 100
+d1 = div r2 10
+d0 = rem r2 10
+dm_ob_byte uchar add d3 48
+dm_ob_byte uchar add d2 48
+dm_ob_byte uchar add d1 48
+dm_ob_byte uchar add d0 48
+end
+
+fn dm_ob_flush to void
+total = get dm_olen 0
+off = ulong 0
+note writes advance by at least 1 byte or stop, bounded by dm_obuf capacity 32768
+while lt off total bound 32768
+k = write 1 dm_obuf off sub total off
+if le k 0
+break
+end
+off = add off ulong k
+end
+put dm_olen 0 0
+end
+
+note ---- byte and ASCII helpers
+
+fn dm_is_ws c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 9
+ret true
+end
+if eq c 10
+ret true
+end
+if eq c 13
+ret true
+end
+ret false
+end
+
+fn dm_low c uchar to uchar
+if and ge c 65 le c 90
+ret uchar add c 32
+end
+ret c
+end
+
+fn dm_trim_range buf view uchar * off ulong cnt ulong dst edit SliceRange to void
+s = off
+e = add off cnt
+note scan forward at most cnt bytes
+while lt s e bound 8192
+if not dm_is_ws get buf s
+break
+end
+s = add s 1
+end
+note scan backward at most cnt bytes
+while gt e s bound 8192
+if not dm_is_ws get buf sub e 1
+break
+end
+e = sub e 1
+end
+put dst off s
+put dst cnt sub e s
+end
+
+fn dm_starts_at buf view uchar * off ulong cnt ulong pat view uchar * to bool
+pl = len pat
+if lt cnt pl
+ret false
+end
+for i ulong pl bound 128
+if ne get buf add off i get pat i
+ret false
+end
+end
+ret true
+end
+
+fn dm_eq_ci buf view uchar * off ulong cnt ulong pat view uchar * to bool
+if ne cnt len pat
+ret false
+end
+for i ulong cnt bound 128
+if ne dm_low get buf add off i dm_low get pat i
+ret false
+end
+end
+ret true
+end
+
+fn dm_contains_ci buf view uchar * off ulong cnt ulong pat view uchar * to bool
+pl = len pat
+if or eq pl 0 lt cnt pl
+ret false
+end
+lim = add sub cnt pl 1
+for i ulong lim bound 4096
+ok = true
+for j ulong pl bound 128
+if ne dm_low get buf add off add i j dm_low get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn dm_find_byte buf view uchar * off ulong cnt ulong ch uchar to long
+for i ulong cnt bound 8192
+if eq get buf add off i ch
+ret long add off i
+end
+end
+ret -1
+end
+
+fn dm_strip_quotes buf view uchar * dst edit SliceRange to void
+s = get dst off
+n = get dst cnt
+if ge n 2
+c0 = get buf s
+c1 = get buf sub add s n 1
+if or and eq c0 34 eq c1 34 and eq c0 39 eq c1 39
+put dst off add s 1
+put dst cnt sub n 2
+end
+end
+end
+
+note ---- upstream idle window gate and markdown path filter
+
+fn dream_is_idle gpu_util ulong idle_secs ulong idle_threshold ulong to bool
+ret and le gpu_util 5 ge idle_secs idle_threshold
+end
+
+fn dream_is_markdown_path path view uchar * to bool
+n = len path
+if le n 3
+ret false
+end
+if ne get path sub n 3 46
+ret false
+end
+if ne get path sub n 2 109
+ret false
+end
+if ne get path sub n 1 100
+ret false
+end
+ret true
+end
+
+note ---- episode storage helpers
+
+fn dream_reset to void
+put dm_ep_cnt 0 0
+end
+
+fn dm_set_name slot ulong buf view uchar * off ulong cnt ulong to void
+n = cnt
+if gt n DREAM_NAME_CAP
+n = DREAM_NAME_CAP
+end
+base = mul slot DREAM_NAME_CAP
+for i ulong n bound 128
+put dm_name_buf add base i get buf add off i
+end
+put dm_name_len slot n
+end
+
+fn dm_set_parked_name slot ulong path view uchar * to void
+note extract file stem after last '/' and before last '.'
+pl = len path
+start = ulong 0
+for i ulong pl bound 512
+if eq get path i 47
+start = add i 1
+end
+end
+stop = pl
+for i ulong sub pl start bound 512
+idx = add start i
+if eq get path idx 46
+stop = idx
+end
+end
+base = mul slot DREAM_NAME_CAP
+pos = ulong 0
+for i ulong len td_parked bound 16
+put dm_name_buf add base pos get td_parked i
+pos = add pos 1
+end
+for i ulong sub stop start bound 120
+if ge pos DREAM_NAME_CAP
+break
+end
+put dm_name_buf add base pos get path add start i
+pos = add pos 1
+end
+put dm_name_len slot pos
+end
+
+fn dm_set_body slot ulong buf view uchar * off ulong cnt ulong to void
+n = cnt
+if gt n DREAM_BODY_CAP
+n = DREAM_BODY_CAP
+end
+base = mul slot DREAM_BODY_CAP
+for i ulong n bound 512
+put dm_body_buf add base i get buf add off i
+end
+put dm_body_len slot n
+end
+
+fn dream_name_eq slot ulong pat view uchar * to bool
+if ne get dm_name_len slot len pat
+ret false
+end
+base = mul slot DREAM_NAME_CAP
+for i ulong len pat bound 128
+if ne get dm_name_buf add base i get pat i
+ret false
+end
+end
+ret true
+end
+
+fn dm_parse_itype buf view uchar * off ulong cnt ulong to ulong
+if dm_eq_ci buf off cnt td_v_lesson
+ret DREAM_TYPE_LESSON
+end
+if dm_eq_ci buf off cnt td_v_proc
+ret DREAM_TYPE_PROCEDURE
+end
+if dm_eq_ci buf off cnt td_v_proc_s
+ret DREAM_TYPE_PROCEDURE
+end
+if dm_eq_ci buf off cnt td_v_fact
+ret DREAM_TYPE_FACT
+end
+if dm_eq_ci buf off cnt td_v_prop
+ret DREAM_TYPE_PROPOSAL
+end
+ret DREAM_TYPE_DISCOVERY
+end
+
+fn dm_is_tag_ch c uchar to bool
+if dm_is_ws c
+ret false
+end
+if eq c 34
+ret false
+end
+if eq c 39
+ret false
+end
+ret true
+end
+
+fn dm_count_tags buf view uchar * off ulong cnt ulong to ulong
+s = off
+n = cnt
+if ge n 2
+if eq get buf s 91
+s = add s 1
+n = sub n 1
+end
+if gt n 0
+if eq get buf sub add s n 1 93
+n = sub n 1
+end
+end
+end
+if eq n 0
+ret 0
+end
+tc = ulong 0
+in_tok = false
+for i ulong n bound 256
+c = get buf add s i
+if eq c 44
+in_tok = false
+else
+if dm_is_tag_ch c
+if not in_tok
+tc = add tc 1
+in_tok = true
+end
+end
+end
+end
+ret tc
+end
+
+note ---- Layout 1: YAML frontmatter parser (with unclosed fence fallthrough)
+
+fn dm_find_close_fence buf view uchar * off ulong cnt ulong to long
+if lt cnt 4
+ret -1
+end
+lim = sub cnt 3
+for i ulong lim bound 4096
+p = add off i
+if eq get buf p 10
+if eq get buf add p 1 45
+if eq get buf add p 2 45
+if eq get buf add p 3 45
+ret long p
+end
+end
+end
+end
+end
+ret -1
+end
+
+fn dm_is_title_key raw view uchar * off ulong cnt ulong to bool
+if dm_eq_ci raw off cnt td_k_title
+ret true
+end
+if dm_eq_ci raw off cnt td_k_cname
+ret true
+end
+ret dm_eq_ci raw off cnt td_k_name
+end
+
+fn dm_is_type_key raw view uchar * off ulong cnt ulong to bool
+if dm_eq_ci raw off cnt td_k_type
+ret true
+end
+if dm_eq_ci raw off cnt td_k_etype
+ret true
+end
+ret dm_eq_ci raw off cnt td_k_kind
+end
+
+fn dm_apply_fm_kv slot ulong raw view uchar * kr view SliceRange vr view SliceRange has_t edit SliceRange to void
+if dm_is_title_key raw get kr off get kr cnt
+dm_set_name slot raw get vr off get vr cnt
+put has_t cnt 1
+ret
+end
+if dm_is_type_key raw get kr off get kr cnt
+put dm_itype slot dm_parse_itype raw get vr off get vr cnt
+ret
+end
+if dm_eq_ci raw get kr off get kr cnt td_k_tags
+put dm_tags slot dm_count_tags raw get vr off get vr cnt
+end
+end
+
+fn dm_parse_fm_line slot ulong raw view uchar * ls ulong ln ulong has_t edit SliceRange to void
+tr = new SliceRange 0 0
+dm_trim_range raw ls ln edit tr
+if eq get tr cnt 0
+ret
+end
+if eq get raw get tr off 35
+ret
+end
+col = dm_find_byte raw get tr off get tr cnt 58
+if lt col 0
+ret
+end
+kr = new SliceRange 0 0
+vr = new SliceRange 0 0
+ls = get tr off
+ln = sub ulong col ls
+dm_trim_range raw ls ln edit kr
+ls = add ulong col 1
+ln = sub add get tr off get tr cnt ls
+dm_trim_range raw ls ln edit vr
+dm_strip_quotes raw edit vr
+dm_apply_fm_kv slot raw view kr view vr has_t
+end
+
+fn dm_scan_fm_lines slot ulong raw view uchar * start ulong fend ulong has_t edit SliceRange to void
+cur = start
+note each iteration advances past a newline or reaches fend, bounded by 4096
+while lt cur fend bound 4096
+nl = dm_find_byte raw cur sub fend cur 10
+lpos = fend
+if ge nl 0
+lpos = ulong nl
+end
+dm_parse_fm_line slot raw cur sub lpos cur has_t
+if lt nl 0
+break
+end
+cur = add lpos 1
+end
+end
+
+fn dm_set_fm_body slot ulong raw view uchar * after ulong fend ulong bend ulong to void
+br = new SliceRange 0 0
+boff = add fend 4
+if lt boff bend
+dm_trim_range raw boff sub bend boff edit br
+end
+if gt get br cnt 0
+dm_set_body slot raw get br off get br cnt
+else
+dm_trim_range raw after sub fend after edit br
+dm_set_body slot raw get br off get br cnt
+end
+end
+
+fn dm_try_frontmatter slot ulong path view uchar * raw view uchar * tr view SliceRange to bool
+if not dm_starts_at raw get tr off get tr cnt td_fence
+ret false
+end
+after = add get tr off 3
+cidx = dm_find_close_fence raw after sub get tr cnt 3
+if lt cidx 0
+ret false
+end
+put dm_layout slot DREAM_LAYOUT_FRONTMATTER
+put dm_itype slot DREAM_TYPE_DISCOVERY
+put dm_tags slot 0
+has_t = new SliceRange 0 0
+dm_scan_fm_lines slot raw after ulong cidx edit has_t
+if eq get has_t cnt 0
+dm_set_parked_name slot path
+end
+dm_set_fm_body slot raw after ulong cidx add get tr off get tr cnt
+ret true
+end
+
+note ---- Layout 2: Markdown heading parser (# Heading)
+
+fn dm_strip_heading_prefix raw view uchar * r edit SliceRange to void
+if dm_starts_at raw get r off get r cnt td_p_disc1
+put r off add get r off len td_p_disc1
+put r cnt sub get r cnt len td_p_disc1
+end
+if dm_starts_at raw get r off get r cnt td_p_disc2
+put r off add get r off len td_p_disc2
+put r cnt sub get r cnt len td_p_disc2
+end
+if dm_starts_at raw get r off get r cnt td_p_les1
+put r off add get r off len td_p_les1
+put r cnt sub get r cnt len td_p_les1
+end
+if dm_starts_at raw get r off get r cnt td_p_les2
+put r off add get r off len td_p_les2
+put r cnt sub get r cnt len td_p_les2
+end
+if dm_starts_at raw get r off get r cnt td_p_proc1
+put r off add get r off len td_p_proc1
+put r cnt sub get r cnt len td_p_proc1
+end
+if dm_starts_at raw get r off get r cnt td_p_proc2
+put r off add get r off len td_p_proc2
+put r cnt sub get r cnt len td_p_proc2
+end
+end
+
+fn dm_apply_heading slot ulong path view uchar * raw view uchar * lr view SliceRange to void
+hr = new SliceRange 0 0
+dm_trim_range raw add get lr off 2 sub get lr cnt 2 edit hr
+itype = DREAM_TYPE_DISCOVERY
+if dm_contains_ci raw get hr off get hr cnt td_v_lesson
+itype = DREAM_TYPE_LESSON
+else
+if dm_contains_ci raw get hr off get hr cnt td_v_proc_s
+itype = DREAM_TYPE_PROCEDURE
+end
+end
+dm_strip_heading_prefix raw edit hr
+out_r = new SliceRange 0 0
+dm_trim_range raw get hr off get hr cnt edit out_r
+put dm_layout slot DREAM_LAYOUT_HEADING
+put dm_itype slot itype
+put dm_tags slot 0
+if gt get out_r cnt 0
+dm_set_name slot raw get out_r off get out_r cnt
+else
+dm_set_parked_name slot path
+end
+end
+
+fn dm_try_heading slot ulong path view uchar * raw view uchar * tr view SliceRange to bool
+cur = get tr off
+stop = add cur get tr cnt
+lr = new SliceRange 0 0
+note scan lines of trimmed note, bounded by 4096
+while lt cur stop bound 4096
+nl = dm_find_byte raw cur sub stop cur 10
+lend = stop
+if ge nl 0
+lend = ulong nl
+end
+dm_trim_range raw cur sub lend cur edit lr
+if dm_starts_at raw get lr off get lr cnt td_h1
+dm_apply_heading slot path raw view lr
+dm_set_body slot raw get tr off get tr cnt
+ret true
+end
+if lt nl 0
+break
+end
+cur = add lend 1
+end
+ret false
+end
+
+note ---- Layout 3: Bullet finding parser (- Finding: / * Finding:)
+
+fn dm_is_bullet_line raw view uchar * lr view SliceRange to bool
+if dm_starts_at raw get lr off get lr cnt td_b_find1
+ret true
+end
+if dm_starts_at raw get lr off get lr cnt td_b_find2
+ret true
+end
+ret dm_starts_at raw get lr off get lr cnt td_b_find3
+end
+
+fn dm_apply_bullet slot ulong raw view uchar * lr view SliceRange to bool
+col = dm_find_byte raw get lr off get lr cnt 58
+if lt col 0
+ret false
+end
+vr = new SliceRange 0 0
+voff = add ulong col 1
+vlen = sub add get lr off get lr cnt voff
+dm_trim_range raw voff vlen edit vr
+put dm_layout slot DREAM_LAYOUT_BULLET
+put dm_itype slot DREAM_TYPE_DISCOVERY
+put dm_tags slot 0
+dm_set_name slot raw get vr off get vr cnt
+ret true
+end
+
+fn dm_try_bullet slot ulong raw view uchar * tr view SliceRange to bool
+cur = get tr off
+stop = add cur get tr cnt
+lr = new SliceRange 0 0
+note scan lines for bullet finding prefix, bounded by 4096
+while lt cur stop bound 4096
+nl = dm_find_byte raw cur sub stop cur 10
+lend = stop
+if ge nl 0
+lend = ulong nl
+end
+dm_trim_range raw cur sub lend cur edit lr
+if dm_is_bullet_line raw view lr
+if dm_apply_bullet slot raw view lr
+dm_set_body slot raw get tr off get tr cnt
+ret true
+end
+end
+if lt nl 0
+break
+end
+cur = add lend 1
+end
+ret false
+end
+
+note ---- deterministic 8-D text embedding and cosine/dot similarity
+
+fn dm_hash_mix slot ulong h ulong weight f64 to void
+base_e = mul slot DREAM_EMB_DIM
+b1 = rem h DREAM_EMB_DIM
+s1 = and shr h 3 1
+idx1 = add base_e b1
+if eq s1 0
+put dm_emb idx1 add get dm_emb idx1 weight
+else
+put dm_emb idx1 sub get dm_emb idx1 weight
+end
+h2 = xor h shr h 13
+b2 = rem h2 DREAM_EMB_DIM
+s2 = and shr h2 4 1
+idx2 = add base_e b2
+if eq s2 0
+put dm_emb idx2 add get dm_emb idx2 mul weight 0.5f64
+else
+put dm_emb idx2 sub get dm_emb idx2 mul weight 0.5f64
+end
+end
+
+fn dm_is_alnum c ulong to bool
+if and ge c 97 le c 122
+ret true
+end
+ret and ge c 48 le c 57
+end
+
+fn dm_embed_words_buf slot ulong is_name bool weight f64 to void
+base = ulong 0
+nlen = ulong 0
+if is_name
+base = mul slot DREAM_NAME_CAP
+nlen = get dm_name_len slot
+else
+base = mul slot DREAM_BODY_CAP
+nlen = get dm_body_len slot
+end
+h = ulong 2166136261
+wlen = ulong 0
+for i ulong nlen bound 512
+c = ulong 0
+if is_name
+c = ulong dm_low get dm_name_buf add base i
+else
+c = ulong dm_low get dm_body_buf add base i
+end
+if dm_is_alnum c
+h = mul xor h c 16777619
+wlen = add wlen 1
+else
+if gt wlen 0
+dm_hash_mix slot h weight
+h = 2166136261
+wlen = 0
+end
+end
+end
+if gt wlen 0
+dm_hash_mix slot h weight
+end
+end
+
+fn dream_embed_from_text slot ulong to void
+base_e = mul slot DREAM_EMB_DIM
+for d ulong DREAM_EMB_DIM
+put dm_emb add base_e d 0.0f64
+end
+dm_embed_words_buf slot false 1.0f64
+dm_embed_words_buf slot true 2.0f64
+sq = f64 0.0f64
+for d ulong DREAM_EMB_DIM
+v = get dm_emb add base_e d
+sq = add sq mul v v
+end
+if gt sq 0.000000000001f64
+inv = div 1.0f64 fsqrt sq
+for d ulong DREAM_EMB_DIM
+idx = add base_e d
+put dm_emb idx mul get dm_emb idx inv
+end
+end
+end
+
+fn dream_set_embedding slot ulong vec view f64 8 to void
+base_e = mul slot DREAM_EMB_DIM
+for d ulong DREAM_EMB_DIM
+put dm_emb add base_e d get vec d
+end
+end
+
+fn dream_dot a ulong b ulong to f64
+ba = mul a DREAM_EMB_DIM
+bb = mul b DREAM_EMB_DIM
+acc = f64 0.0f64
+for d ulong DREAM_EMB_DIM
+acc = add acc mul get dm_emb add ba d get dm_emb add bb d
+end
+ret acc
+end
+
+fn dream_norm a ulong to f64
+ret fsqrt dream_dot a a
+end
+
+fn dream_cosine a ulong b ulong to f64
+na = dream_norm a
+nb = dream_norm b
+if or le na 0.000000000001f64 le nb 0.000000000001f64
+ret 0.0f64
+end
+ret div dream_dot a b mul na nb
+end
+
+note ---- exponential recency decay and episode ingestion
+
+fn dream_exp_neg x f64 to f64
+if le x 0.0f64
+ret 1.0f64
+end
+if gt x 700.0f64
+ret 0.0f64
+end
+k = ulong div x DREAM_LN2
+r = sub x mul f64 k DREAM_LN2
+note degree-6 Taylor polynomial for exp(-r) on [0, ln2): max error < 1e-7
+nr = neg r
+t = f64 1.0f64
+s = f64 1.0f64
+t = mul t nr
+s = add s t
+t = div mul t nr 2.0f64
+s = add s t
+t = div mul t nr 3.0f64
+s = add s t
+t = div mul t nr 4.0f64
+s = add s t
+t = div mul t nr 5.0f64
+s = add s t
+t = div mul t nr 6.0f64
+s = add s t
+t = div mul t nr 7.0f64
+s = add s t
+t = div mul t nr 8.0f64
+s = add s t
+scale = f64 1.0f64
+for i ulong k bound 1024
+scale = mul scale 0.5f64
+end
+ret mul s scale
+end
+
+fn dream_decay_score importance f64 age_secs ulong half_life ulong to f64
+if eq half_life 0
+ret 0.0f64
+end
+x = div mul DREAM_LN2 f64 age_secs f64 half_life
+ret mul importance dream_exp_neg x
+end
+
+fn dream_ingest_markdown path view uchar * raw view uchar * age_secs ulong importance f64 to int
+if not dream_is_markdown_path path
+ret DREAM_ERR_NON_MD
+end
+if or lt importance 0.0f64 gt importance 1.0f64
+ret DREAM_ERR_BAD_IMP
+end
+cnt = get dm_ep_cnt 0
+if ge cnt DREAM_MAX_EP
+ret DREAM_ERR_POOL_FULL
+end
+tr = new SliceRange 0 0
+dm_trim_range raw 0 len raw edit tr
+if eq get tr cnt 0
+ret DREAM_ERR_EMPTY
+end
+ok = dm_try_frontmatter cnt path raw view tr
+if not ok
+ok = dm_try_heading cnt path raw view tr
+end
+if not ok
+ok = dm_try_bullet cnt raw view tr
+end
+if not ok
+put dm_layout cnt DREAM_LAYOUT_RAW
+put dm_itype cnt DREAM_TYPE_DISCOVERY
+put dm_tags cnt 0
+dm_set_parked_name cnt path
+dm_set_body cnt raw get tr off get tr cnt
+end
+put dm_age cnt age_secs
+put dm_imp cnt importance
+put dm_score cnt 0.0f64
+put dm_status cnt DREAM_ST_PENDING
+put dm_rep cnt cnt
+put dm_csize cnt 1
+dream_embed_from_text cnt
+put dm_ep_cnt 0 add cnt 1
+ret DREAM_OK
+end
+
+note ---- consolidation cycle: validation, scoring, deterministic sort, clustering, promotion
+
+fn dream_default_config cfg edit DreamConfig to void
+put cfg gpu_util 0
+put cfg idle_secs 1200
+put cfg idle_thresh DREAM_IDLE_THRESH_DEF
+put cfg require_idle true
+put cfg half_life 3600
+put cfg dedup_sim 0.85f64
+put cfg commit_thr 0.65f64
+put cfg stage_thr 0.35f64
+put cfg reinforce 0.15f64
+end
+
+fn dream_validate_config cfg view DreamConfig to int
+if eq get cfg half_life 0
+ret DREAM_ERR_BAD_CONFIG
+end
+if or le get cfg dedup_sim 0.0f64 gt get cfg dedup_sim 1.0f64
+ret DREAM_ERR_BAD_CONFIG
+end
+if or le get cfg commit_thr 0.0f64 gt get cfg commit_thr 1.0f64
+ret DREAM_ERR_BAD_CONFIG
+end
+if or lt get cfg stage_thr 0.0f64 gt get cfg stage_thr get cfg commit_thr
+ret DREAM_ERR_BAD_CONFIG
+end
+if or lt get cfg reinforce 0.0f64 gt get cfg reinforce 0.5f64
+ret DREAM_ERR_BAD_CONFIG
+end
+if get cfg require_idle
+if not dream_is_idle get cfg gpu_util get cfg idle_secs get cfg idle_thresh
+ret DREAM_ERR_NOT_IDLE
+end
+end
+ret DREAM_OK
+end
+
+fn dm_ep_better a ulong b ulong to bool
+sa = get dm_score a
+sb = get dm_score b
+if gt sa sb
+ret true
+end
+if eq sa sb
+ret lt a b
+end
+ret false
+end
+
+fn dm_sort_by_score cnt ulong to void
+for i ulong cnt bound 32
+put dm_order i i
+end
+for i ulong cnt bound 32
+best = i
+for j ulong sub cnt i bound 32
+pos = add i j
+if dm_ep_better get dm_order pos get dm_order best
+best = pos
+end
+end
+if ne best i
+tmp = get dm_order i
+put dm_order i get dm_order best
+put dm_order best tmp
+end
+end
+end
+
+fn dm_cluster_step ep ulong reps view ulong 32 rep_cnt ulong cfg view DreamConfig to bool
+for r ulong rep_cnt bound 32
+rep_ep = get reps r
+sim = dream_cosine ep rep_ep
+if ge sim get cfg dedup_sim
+put dm_status ep DREAM_ST_DEDUPED
+put dm_rep ep rep_ep
+put dm_csize rep_ep add get dm_csize rep_ep 1
+boost = add get dm_score rep_ep mul get cfg reinforce get dm_score ep
+put dm_score rep_ep fmin 1.0f64 boost
+ret true
+end
+end
+ret false
+end
+
+fn dream_run_cycle cfg view DreamConfig st edit DreamState to int
+put st ok false
+put st err DREAM_OK
+put st cycles 0
+put st ingested get dm_ep_cnt 0
+put st clusters 0
+put st deduped 0
+put st committed 0
+put st staged 0
+put st rejected 0
+v = dream_validate_config cfg
+if ne v DREAM_OK
+put st err v
+ret v
+end
+cnt = get dm_ep_cnt 0
+for i ulong cnt bound 32
+sc = dream_decay_score get dm_imp i get dm_age i get cfg half_life
+put dm_score i sc
+put dm_status i DREAM_ST_PENDING
+put dm_rep i i
+put dm_csize i 0
+end
+dm_sort_by_score cnt
+reps = new ulong 32 0
+rep_cnt = ulong 0
+for idx ulong cnt bound 32
+ep = get dm_order idx
+if dm_cluster_step ep view reps rep_cnt cfg
+put st deduped add get st deduped 1
+else
+put reps rep_cnt ep
+rep_cnt = add rep_cnt 1
+put dm_rep ep ep
+put dm_csize ep 1
+end
+end
+put st clusters rep_cnt
+for r ulong rep_cnt bound 32
+rep_ep = get reps r
+sc = get dm_score rep_ep
+if ge sc get cfg commit_thr
+put dm_status rep_ep DREAM_ST_COMMITTED
+put st committed add get st committed 1
+else
+if ge sc get cfg stage_thr
+put dm_status rep_ep DREAM_ST_STAGED
+put st staged add get st staged 1
+else
+put dm_status rep_ep DREAM_ST_REJECTED
+put st rejected add get st rejected 1
+end
+end
+end
+put st ok true
+put st cycles 1
+ret DREAM_OK
+end
+
+note ---- deterministic state & record output
+
+fn dm_ob_layout ly ulong to void
+if eq ly DREAM_LAYOUT_FRONTMATTER
+dm_ob_str td_l_fm
+ret
+end
+if eq ly DREAM_LAYOUT_HEADING
+dm_ob_str td_l_hd
+ret
+end
+if eq ly DREAM_LAYOUT_BULLET
+dm_ob_str td_l_bl
+ret
+end
+dm_ob_str td_l_rw
+end
+
+fn dm_ob_itype ty ulong to void
+if eq ty DREAM_TYPE_LESSON
+dm_ob_str td_v_lesson
+ret
+end
+if eq ty DREAM_TYPE_PROCEDURE
+dm_ob_str td_v_proc
+ret
+end
+if eq ty DREAM_TYPE_FACT
+dm_ob_str td_v_fact
+ret
+end
+if eq ty DREAM_TYPE_PROPOSAL
+dm_ob_str td_v_prop
+ret
+end
+dm_ob_str td_v_disc
+end
+
+fn dm_ob_status st ulong to void
+if eq st DREAM_ST_COMMITTED
+dm_ob_str td_s_com
+ret
+end
+if eq st DREAM_ST_STAGED
+dm_ob_str td_s_stg
+ret
+end
+if eq st DREAM_ST_REJECTED
+dm_ob_str td_s_rej
+ret
+end
+if eq st DREAM_ST_DEDUPED
+dm_ob_str td_s_dup
+ret
+end
+dm_ob_str td_s_pnd
+end
+
+fn dream_print_state st view DreamState to void
+dm_ob_reset
+dm_ob_str td_st_hdr
+dm_ob_u64 get st cycles
+dm_ob_str td_st_ing
+dm_ob_u64 get st ingested
+dm_ob_str td_st_cls
+dm_ob_u64 get st clusters
+dm_ob_str td_st_dup
+dm_ob_u64 get st deduped
+dm_ob_str td_st_com
+dm_ob_u64 get st committed
+dm_ob_str td_st_stg
+dm_ob_u64 get st staged
+dm_ob_str td_st_rej
+dm_ob_u64 get st rejected
+dm_ob_str td_st_end
+dm_ob_flush
+end
+
+fn dream_print_records to void
+cnt = get dm_ep_cnt 0
+dm_ob_reset
+for i ulong cnt bound 32
+dm_ob_str td_rec_id
+dm_ob_u64 i
+dm_ob_str td_rec_st
+dm_ob_status get dm_status i
+dm_ob_str td_rec_ty
+dm_ob_itype get dm_itype i
+dm_ob_str td_rec_ly
+dm_ob_layout get dm_layout i
+dm_ob_str td_rec_sc
+dm_ob_f64_4 get dm_score i
+dm_ob_str td_rec_cs
+dm_ob_u64 get dm_csize i
+dm_ob_str td_rec_rp
+dm_ob_u64 get dm_rep i
+dm_ob_str td_rec_nm
+base = mul i DREAM_NAME_CAP
+nlen = get dm_name_len i
+for k ulong nlen bound 128
+dm_ob_byte get dm_name_buf add base k
+end
+dm_ob_str td_nl
+end
+dm_ob_flush
+end

@@ -1,0 +1,2175 @@
+note apps/translate/lib.om: pure-Omega translation service core (converted from aien-translate).
+note Composable OM-2 library unit (no om2 line, no fn main).
+note Compose with: si/directives/om2.om om/tls/sha2.om apps/translate/lib.om <main.om|test.om>
+note
+note Implements:
+note   - ISO-639 and translate.js allowlist validator for all 31 supported languages + auto source
+note   - Strict RFC 3629 UTF-8 validator, codepoint counter, and NUL/size payload guards
+note   - UTF-8-aware paragraph/sentence/word chunker (never splits multi-byte code points)
+note   - Lead/core/trail splitter preserving whitespace and split URL edge fragments (split_ws)
+note   - Protected-token & keep-list translation guard (URLs, code spans, placeholders, tags, keep words)
+note   - Deterministic SHA-256 keyed bounded LRU cache (keyed by prompt_ver/model/src/dst/text)
+note   - Strict JSONL request parser and escaped JSONL response serializer
+
+const TR_MAX_BYTES ulong 16384
+const TR_MAX_CHARS ulong 3000
+const TR_MAX_TEXTS ulong 40
+const TR_MAX_CHUNKS ulong 64
+
+const TR_LANG_COUNT ulong 31
+const TR_LANG_AUTO ulong 31
+const TR_LANG_INVALID ulong 255
+
+const TR_OK ulong 0
+const TR_ERR_EMPTY ulong 1
+const TR_ERR_OVERSIZE ulong 2
+const TR_ERR_UTF8 ulong 3
+const TR_ERR_NUL ulong 4
+const TR_ERR_LANG ulong 5
+const TR_ERR_JSON ulong 6
+const TR_ERR_GUARD ulong 7
+const TR_ERR_CHUNK ulong 8
+
+const TR_CACHE_MAX_SLOTS ulong 32
+const TR_CACHE_VAL_CAP ulong 512
+
+note Cache globals (bounded LRU, full 32-byte SHA-256 keys)
+global tr_g_cache_cap ulong 1
+global tr_g_cache_used ulong 32
+global tr_g_cache_tick ulong 32
+global tr_g_cache_clock ulong 1
+global tr_g_cache_key uchar 1024
+global tr_g_cache_src ulong 32
+global tr_g_cache_dst ulong 32
+global tr_g_cache_vlen ulong 32
+global tr_g_cache_val uchar 16384
+global tr_g_cache_hits ulong 1
+global tr_g_cache_misses ulong 1
+global tr_g_cache_evicts ulong 1
+global tr_g_cache_cnt ulong 1
+
+note Chunker & split_ws output globals
+global tr_g_chk_off ulong 64
+global tr_g_chk_len ulong 64
+global tr_g_chk_cnt ulong 1
+global tr_g_sw_lead ulong 1
+global tr_g_sw_core_end ulong 1
+
+note Parsed request globals
+global tr_g_req_from uchar 64
+global tr_g_req_from_len ulong 1
+global tr_g_req_to uchar 64
+global tr_g_req_to_len ulong 1
+global tr_g_req_model uchar 64
+global tr_g_req_model_len ulong 1
+global tr_g_req_text uchar 16385
+global tr_g_req_text_len ulong 1
+global tr_g_req_maxc ulong 1
+
+note Scratch & JSONL response globals
+global tr_g_key_buf uchar 32
+global tr_g_tmp_out uchar 1024
+global tr_g_tmp_out_len ulong 1
+global tr_g_resp uchar 32768
+global tr_g_resp_len ulong 1
+global tr_g_item_buf uchar 1024
+global tr_g_item_len ulong 1
+
+note Prompt version & default model
+text tr_t_pver "p6"
+text tr_t_defmodel "aien-local"
+text tr_t_auto "auto"
+
+note 31 translate.js language ids (exact match to upstream src/langs.rs)
+text tr_lid_0 "english"
+text tr_lid_1 "chinese_simplified"
+text tr_lid_2 "chinese_traditional"
+text tr_lid_3 "japanese"
+text tr_lid_4 "korean"
+text tr_lid_5 "spanish"
+text tr_lid_6 "french"
+text tr_lid_7 "deutsch"
+text tr_lid_8 "portuguese"
+text tr_lid_9 "italian"
+text tr_lid_10 "russian"
+text tr_lid_11 "ukrainian"
+text tr_lid_12 "polish"
+text tr_lid_13 "dutch"
+text tr_lid_14 "swedish"
+text tr_lid_15 "danish"
+text tr_lid_16 "norwegian"
+text tr_lid_17 "finnish"
+text tr_lid_18 "czech"
+text tr_lid_19 "romanian"
+text tr_lid_20 "hungarian"
+text tr_lid_21 "greek"
+text tr_lid_22 "turkish"
+text tr_lid_23 "arabic"
+text tr_lid_24 "persian"
+text tr_lid_25 "hindi"
+text tr_lid_26 "bengali"
+text tr_lid_27 "thai"
+text tr_lid_28 "vietnamese"
+text tr_lid_29 "indonesian"
+text tr_lid_30 "malay"
+
+note 31 canonical ISO-639 codes (exact match to upstream src/langs.rs)
+text tr_iso_0 "en"
+text tr_iso_1 "zh-CN"
+text tr_iso_2 "zh-TW"
+text tr_iso_3 "ja"
+text tr_iso_4 "ko"
+text tr_iso_5 "es"
+text tr_iso_6 "fr"
+text tr_iso_7 "de"
+text tr_iso_8 "pt"
+text tr_iso_9 "it"
+text tr_iso_10 "ru"
+text tr_iso_11 "uk"
+text tr_iso_12 "pl"
+text tr_iso_13 "nl"
+text tr_iso_14 "sv"
+text tr_iso_15 "da"
+text tr_iso_16 "no"
+text tr_iso_17 "fi"
+text tr_iso_18 "cs"
+text tr_iso_19 "ro"
+text tr_iso_20 "hu"
+text tr_iso_21 "el"
+text tr_iso_22 "tr"
+text tr_iso_23 "ar"
+text tr_iso_24 "fa"
+text tr_iso_25 "hi"
+text tr_iso_26 "bn"
+text tr_iso_27 "th"
+text tr_iso_28 "vi"
+text tr_iso_29 "id"
+text tr_iso_30 "ms"
+
+note Built-in DEFAULT_KEEP terms from upstream src/lib.rs
+text tr_kp_0 "AIEN"
+text tr_kp_1 "AienOS"
+text tr_kp_2 "Aienux"
+text tr_kp_3 "AIENOS"
+text tr_kp_4 "Aienix"
+text tr_kp_5 "Aien"
+text tr_kp_6 "Omega"
+text tr_kp_7 "OMEGA"
+text tr_kp_8 "Interplane"
+text tr_kp_9 "Allen"
+text tr_kp_10 "Synapse"
+text tr_kp_11 "Atlas"
+text tr_kp_12 "Cortex"
+text tr_kp_13 "Radicle"
+text tr_kp_14 "Spark"
+text tr_kp_15 "DGX"
+text tr_kp_16 "GB10"
+text tr_kp_17 "NVIDIA"
+text tr_kp_18 "translate.js"
+text tr_kp_19 "GitHub"
+text tr_kp_20 "Rust"
+text tr_kp_21 "Linux"
+
+note JSON keys and fragments
+text tr_jk_from "from"
+text tr_jk_src "src"
+text tr_jk_to "to"
+text tr_jk_dst "dst"
+text tr_jk_text "text"
+text tr_jk_model "model"
+text tr_jk_maxc "max_chunk"
+text tr_t_http "http://"
+text tr_t_https "https://"
+text tr_t_https_col "https:"
+text tr_t_http_col "http:"
+text tr_t_hex "0123456789abcdef"
+
+text tr_e_empty "empty text"
+text tr_e_over "request payload oversize"
+text tr_e_utf8 "invalid utf-8 sequence"
+text tr_e_nul "nul byte refused"
+text tr_e_lang "unsupported language code"
+text tr_e_json "malformed json request"
+text tr_e_guard "translation guard failed"
+text tr_e_chunk "chunking refused"
+
+text tr_j_ok_pre "{\"result\":1,\"from\":\""
+text tr_j_to "\",\"to\":\""
+text tr_j_chunks "\",\"chunks\":"
+text tr_j_fc ",\"from_cache\":"
+text tr_j_ms ",\"misses\":"
+text tr_j_ev ",\"evictions\":"
+text tr_j_items ",\"items\":["
+text tr_j_end "]}\n"
+text tr_j_err_pre "{\"result\":0,\"code\":"
+text tr_j_err_msg ",\"error\":\""
+text tr_j_err_end "\"}\n"
+
+note --- Character & byte classification ---
+
+fn tr_ascii_lower b uchar to uchar
+if and ge b 65 le b 90
+ret add b 32
+end
+ret b
+end
+
+fn tr_is_ws b uchar to bool
+if eq b 32
+ret true
+end
+if eq b 9
+ret true
+end
+if eq b 10
+ret true
+end
+if eq b 13
+ret true
+end
+ret false
+end
+
+fn tr_is_digit b uchar to bool
+ret and ge b 48 le b 57
+end
+
+fn tr_is_alpha b uchar to bool
+if and ge b 65 le b 90
+ret true
+end
+if and ge b 97 le b 122
+ret true
+end
+ret false
+end
+
+fn tr_is_alnum b uchar to bool
+if tr_is_alpha b
+ret true
+end
+ret tr_is_digit b
+end
+
+fn tr_eq_ci_slice a view uchar * aoff ulong alen ulong b view uchar * to bool
+if ne alen len b
+ret false
+end
+i = ulong 0
+while lt i alen bound 64
+ca = tr_ascii_lower get a add aoff i
+cb = tr_ascii_lower get b i
+if ne ca cb
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn tr_eq_exact_slice a view uchar * aoff ulong alen ulong b view uchar * to bool
+if ne alen len b
+ret false
+end
+i = ulong 0
+while lt i alen bound 1024
+if ne get a add aoff i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note Helper: compare hay[i..i+nlen] against ndl[0..nlen]
+fn tr_sub_match_at hay view uchar * i ulong ndl view uchar * nlen ulong to bool
+j = ulong 0
+while lt j nlen bound 1024
+if ne get hay add i j get ndl j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+note Find exact substring ndl[0..nlen] inside hay[0..hlen]. Returns index or hlen+1 if absent.
+fn tr_find_sub hay view uchar * hlen ulong ndl view uchar * nlen ulong to ulong
+if eq nlen 0
+ret 0
+end
+if gt nlen hlen
+ret add hlen 1
+end
+lim = add sub hlen nlen 1
+i = ulong 0
+while lt i lim bound 16385
+if tr_sub_match_at hay i ndl nlen
+ret i
+end
+i = add i 1
+end
+ret add hlen 1
+end
+
+note Helper: compare hay[i..i+nlen] against ndl[noff..noff+nlen] (nlen from tr_g_item_len)
+fn tr_slice_match_at hay view uchar * i ulong ndl view uchar * noff ulong to bool
+nlen = get tr_g_item_len 0
+j = ulong 0
+while lt j nlen bound 1024
+a = get hay add i j
+b = get ndl add noff j
+if ne a b
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+note Find slice ndl[noff..noff+nlen] inside hay[0..hlen]. Returns true if found.
+fn tr_has_slice hay view uchar * hlen ulong ndl view uchar * noff ulong to bool
+nlen = get tr_g_item_len 0
+if eq nlen 0
+ret true
+end
+if gt nlen hlen
+ret false
+end
+lim = add sub hlen nlen 1
+i = ulong 0
+while lt i lim bound 16385
+if tr_slice_match_at hay i ndl noff
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note Check if whole word ndl appears in hay[0..hlen] (not glued to ASCII alnum bytes).
+fn tr_contains_word hay view uchar * hlen ulong ndl view uchar * to bool
+nlen = len ndl
+if eq nlen 0
+ret false
+end
+if gt nlen hlen
+ret false
+end
+lim = add sub hlen nlen 1
+i = ulong 0
+while lt i lim bound 16385
+ok = true
+j = ulong 0
+while lt j nlen bound 64
+if ne get hay add i j get ndl j
+ok = false
+break
+end
+j = add j 1
+end
+if ok
+left_ok = true
+if gt i 0
+if tr_is_alnum get hay sub i 1
+left_ok = false
+end
+end
+right_ok = true
+ep = add i nlen
+if lt ep hlen
+if tr_is_alnum get hay ep
+right_ok = false
+end
+end
+if and left_ok right_ok
+ret true
+end
+end
+i = add i 1
+end
+ret false
+end
+
+note --- ISO-639 & translate.js Language Allowlist (all 31 upstream languages) ---
+
+fn tr_lang_match_pair buf view uchar * off ulong slen ulong idx ulong to bool
+if eq idx 0
+ret or tr_eq_ci_slice buf off slen tr_lid_0 tr_eq_ci_slice buf off slen tr_iso_0
+end
+if eq idx 1
+ret or tr_eq_ci_slice buf off slen tr_lid_1 tr_eq_ci_slice buf off slen tr_iso_1
+end
+if eq idx 2
+ret or tr_eq_ci_slice buf off slen tr_lid_2 tr_eq_ci_slice buf off slen tr_iso_2
+end
+if eq idx 3
+ret or tr_eq_ci_slice buf off slen tr_lid_3 tr_eq_ci_slice buf off slen tr_iso_3
+end
+if eq idx 4
+ret or tr_eq_ci_slice buf off slen tr_lid_4 tr_eq_ci_slice buf off slen tr_iso_4
+end
+if eq idx 5
+ret or tr_eq_ci_slice buf off slen tr_lid_5 tr_eq_ci_slice buf off slen tr_iso_5
+end
+if eq idx 6
+ret or tr_eq_ci_slice buf off slen tr_lid_6 tr_eq_ci_slice buf off slen tr_iso_6
+end
+if eq idx 7
+ret or tr_eq_ci_slice buf off slen tr_lid_7 tr_eq_ci_slice buf off slen tr_iso_7
+end
+if eq idx 8
+ret or tr_eq_ci_slice buf off slen tr_lid_8 tr_eq_ci_slice buf off slen tr_iso_8
+end
+if eq idx 9
+ret or tr_eq_ci_slice buf off slen tr_lid_9 tr_eq_ci_slice buf off slen tr_iso_9
+end
+if eq idx 10
+ret or tr_eq_ci_slice buf off slen tr_lid_10 tr_eq_ci_slice buf off slen tr_iso_10
+end
+if eq idx 11
+ret or tr_eq_ci_slice buf off slen tr_lid_11 tr_eq_ci_slice buf off slen tr_iso_11
+end
+if eq idx 12
+ret or tr_eq_ci_slice buf off slen tr_lid_12 tr_eq_ci_slice buf off slen tr_iso_12
+end
+if eq idx 13
+ret or tr_eq_ci_slice buf off slen tr_lid_13 tr_eq_ci_slice buf off slen tr_iso_13
+end
+if eq idx 14
+ret or tr_eq_ci_slice buf off slen tr_lid_14 tr_eq_ci_slice buf off slen tr_iso_14
+end
+if eq idx 15
+ret or tr_eq_ci_slice buf off slen tr_lid_15 tr_eq_ci_slice buf off slen tr_iso_15
+end
+ret false
+end
+
+fn tr_lang_match_pair2 buf view uchar * off ulong slen ulong idx ulong to bool
+if eq idx 16
+ret or tr_eq_ci_slice buf off slen tr_lid_16 tr_eq_ci_slice buf off slen tr_iso_16
+end
+if eq idx 17
+ret or tr_eq_ci_slice buf off slen tr_lid_17 tr_eq_ci_slice buf off slen tr_iso_17
+end
+if eq idx 18
+ret or tr_eq_ci_slice buf off slen tr_lid_18 tr_eq_ci_slice buf off slen tr_iso_18
+end
+if eq idx 19
+ret or tr_eq_ci_slice buf off slen tr_lid_19 tr_eq_ci_slice buf off slen tr_iso_19
+end
+if eq idx 20
+ret or tr_eq_ci_slice buf off slen tr_lid_20 tr_eq_ci_slice buf off slen tr_iso_20
+end
+if eq idx 21
+ret or tr_eq_ci_slice buf off slen tr_lid_21 tr_eq_ci_slice buf off slen tr_iso_21
+end
+if eq idx 22
+ret or tr_eq_ci_slice buf off slen tr_lid_22 tr_eq_ci_slice buf off slen tr_iso_22
+end
+if eq idx 23
+ret or tr_eq_ci_slice buf off slen tr_lid_23 tr_eq_ci_slice buf off slen tr_iso_23
+end
+if eq idx 24
+ret or tr_eq_ci_slice buf off slen tr_lid_24 tr_eq_ci_slice buf off slen tr_iso_24
+end
+if eq idx 25
+ret or tr_eq_ci_slice buf off slen tr_lid_25 tr_eq_ci_slice buf off slen tr_iso_25
+end
+if eq idx 26
+ret or tr_eq_ci_slice buf off slen tr_lid_26 tr_eq_ci_slice buf off slen tr_iso_26
+end
+if eq idx 27
+ret or tr_eq_ci_slice buf off slen tr_lid_27 tr_eq_ci_slice buf off slen tr_iso_27
+end
+if eq idx 28
+ret or tr_eq_ci_slice buf off slen tr_lid_28 tr_eq_ci_slice buf off slen tr_iso_28
+end
+if eq idx 29
+ret or tr_eq_ci_slice buf off slen tr_lid_29 tr_eq_ci_slice buf off slen tr_iso_29
+end
+if eq idx 30
+ret or tr_eq_ci_slice buf off slen tr_lid_30 tr_eq_ci_slice buf off slen tr_iso_30
+end
+ret false
+end
+
+fn tr_lang_find buf view uchar * off ulong slen ulong to ulong
+if gt slen 64
+ret TR_LANG_INVALID
+end
+s = off
+e = add off slen
+while lt s e bound 64
+if not tr_is_ws get buf s
+break
+end
+s = add s 1
+end
+while gt e s bound 64
+if not tr_is_ws get buf sub e 1
+break
+end
+e = sub e 1
+end
+tlen = sub e s
+if eq tlen 0
+ret TR_LANG_INVALID
+end
+i = ulong 0
+while lt i 16 bound 16
+if tr_lang_match_pair buf s tlen i
+ret i
+end
+i = add i 1
+end
+while lt i TR_LANG_COUNT bound 16
+if tr_lang_match_pair2 buf s tlen i
+ret i
+end
+i = add i 1
+end
+ret TR_LANG_INVALID
+end
+
+fn tr_lang_find_src buf view uchar * off ulong slen ulong to ulong
+if gt slen 64
+ret TR_LANG_INVALID
+end
+s = off
+e = add off slen
+while lt s e bound 64
+if not tr_is_ws get buf s
+break
+end
+s = add s 1
+end
+while gt e s bound 64
+if not tr_is_ws get buf sub e 1
+break
+end
+e = sub e 1
+end
+tlen = sub e s
+if eq tlen 0
+ret TR_LANG_AUTO
+end
+if tr_eq_ci_slice buf s tlen tr_t_auto
+ret TR_LANG_AUTO
+end
+ret tr_lang_find buf s tlen
+end
+
+fn tr_copy_text dst edit uchar * doff ulong src view uchar * to ulong
+n = len src
+i = ulong 0
+while lt i n bound 64
+put dst add doff i get src i
+i = add i 1
+end
+ret n
+end
+
+fn tr_lang_code_write lid ulong dst edit uchar * doff ulong to ulong
+if eq lid 0
+ret tr_copy_text dst doff tr_iso_0
+end
+if eq lid 1
+ret tr_copy_text dst doff tr_iso_1
+end
+if eq lid 2
+ret tr_copy_text dst doff tr_iso_2
+end
+if eq lid 3
+ret tr_copy_text dst doff tr_iso_3
+end
+if eq lid 4
+ret tr_copy_text dst doff tr_iso_4
+end
+if eq lid 5
+ret tr_copy_text dst doff tr_iso_5
+end
+if eq lid 6
+ret tr_copy_text dst doff tr_iso_6
+end
+if eq lid 7
+ret tr_copy_text dst doff tr_iso_7
+end
+if eq lid 8
+ret tr_copy_text dst doff tr_iso_8
+end
+if eq lid 9
+ret tr_copy_text dst doff tr_iso_9
+end
+if eq lid 10
+ret tr_copy_text dst doff tr_iso_10
+end
+if eq lid 11
+ret tr_copy_text dst doff tr_iso_11
+end
+if eq lid 12
+ret tr_copy_text dst doff tr_iso_12
+end
+if eq lid 13
+ret tr_copy_text dst doff tr_iso_13
+end
+if eq lid 14
+ret tr_copy_text dst doff tr_iso_14
+end
+if eq lid 15
+ret tr_copy_text dst doff tr_iso_15
+end
+ret tr_lang_code_write2 lid dst doff
+end
+
+fn tr_lang_code_write2 lid ulong dst edit uchar * doff ulong to ulong
+if eq lid 16
+ret tr_copy_text dst doff tr_iso_16
+end
+if eq lid 17
+ret tr_copy_text dst doff tr_iso_17
+end
+if eq lid 18
+ret tr_copy_text dst doff tr_iso_18
+end
+if eq lid 19
+ret tr_copy_text dst doff tr_iso_19
+end
+if eq lid 20
+ret tr_copy_text dst doff tr_iso_20
+end
+if eq lid 21
+ret tr_copy_text dst doff tr_iso_21
+end
+if eq lid 22
+ret tr_copy_text dst doff tr_iso_22
+end
+if eq lid 23
+ret tr_copy_text dst doff tr_iso_23
+end
+if eq lid 24
+ret tr_copy_text dst doff tr_iso_24
+end
+if eq lid 25
+ret tr_copy_text dst doff tr_iso_25
+end
+if eq lid 26
+ret tr_copy_text dst doff tr_iso_26
+end
+if eq lid 27
+ret tr_copy_text dst doff tr_iso_27
+end
+if eq lid 28
+ret tr_copy_text dst doff tr_iso_28
+end
+if eq lid 29
+ret tr_copy_text dst doff tr_iso_29
+end
+if eq lid 30
+ret tr_copy_text dst doff tr_iso_30
+end
+if eq lid TR_LANG_AUTO
+ret tr_copy_text dst doff tr_t_auto
+end
+ret 0
+end
+
+note --- Strict RFC 3629 UTF-8 validation & codepoint stepping ---
+
+fn tr_is_cont b uchar to bool
+ret and ge b 0x80 le b 0xbf
+end
+
+note Returns UTF-8 sequence byte length (1..4), or 0 if invalid UTF-8 at pos.
+fn tr_utf8_step buf view uchar * pos ulong blen ulong to ulong
+if ge pos blen
+ret 0
+end
+b0 = get buf pos
+if lt b0 0x80
+ret 1
+end
+if and ge b0 0xc2 le b0 0xdf
+if ge add pos 1 blen
+ret 0
+end
+if tr_is_cont get buf add pos 1
+ret 2
+end
+ret 0
+end
+if and ge b0 0xe0 le b0 0xef
+if ge add pos 2 blen
+ret 0
+end
+b1 = get buf add pos 1
+b2 = get buf add pos 2
+if not tr_is_cont b2
+ret 0
+end
+if eq b0 0xe0
+if and ge b1 0xa0 le b1 0xbf
+ret 3
+end
+ret 0
+end
+if eq b0 0xed
+if and ge b1 0x80 le b1 0x9f
+ret 3
+end
+ret 0
+end
+if tr_is_cont b1
+ret 3
+end
+ret 0
+end
+if and ge b0 0xf0 le b0 0xf4
+if ge add pos 3 blen
+ret 0
+end
+b1 = get buf add pos 1
+b2 = get buf add pos 2
+b3 = get buf add pos 3
+if not and tr_is_cont b2 tr_is_cont b3
+ret 0
+end
+if eq b0 0xf0
+if and ge b1 0x90 le b1 0xbf
+ret 4
+end
+ret 0
+end
+if eq b0 0xf4
+if and ge b1 0x80 le b1 0x8f
+ret 4
+end
+ret 0
+end
+if tr_is_cont b1
+ret 4
+end
+ret 0
+end
+ret 0
+end
+
+fn tr_utf8_valid buf view uchar * blen ulong to bool
+if gt blen TR_MAX_BYTES
+ret false
+end
+pos = ulong 0
+while lt pos blen bound 16385
+step = tr_utf8_step buf pos blen
+if eq step 0
+ret false
+end
+pos = add pos step
+end
+ret true
+end
+
+fn tr_utf8_chars buf view uchar * blen ulong to ulong
+if gt blen TR_MAX_BYTES
+ret 0
+end
+pos = ulong 0
+cnt = ulong 0
+while lt pos blen bound 16385
+step = tr_utf8_step buf pos blen
+if eq step 0
+ret 0
+end
+pos = add pos step
+cnt = add cnt 1
+end
+ret cnt
+end
+
+note Strict request text validation: rejects empty, oversize, NUL byte, invalid UTF-8.
+fn tr_validate_text buf view uchar * blen ulong to ulong
+if eq blen 0
+ret TR_ERR_EMPTY
+end
+if gt blen TR_MAX_BYTES
+ret TR_ERR_OVERSIZE
+end
+pos = ulong 0
+chars = ulong 0
+nonws = false
+while lt pos blen bound 16385
+b0 = get buf pos
+if eq b0 0
+ret TR_ERR_NUL
+end
+step = tr_utf8_step buf pos blen
+if eq step 0
+ret TR_ERR_UTF8
+end
+if eq step 1
+if not tr_is_ws b0
+nonws = true
+end
+else
+nonws = true
+end
+pos = add pos step
+chars = add chars 1
+end
+if gt chars TR_MAX_CHARS
+ret TR_ERR_OVERSIZE
+end
+if not nonws
+ret TR_ERR_EMPTY
+end
+ret TR_OK
+end
+
+note --- UTF-8-aware paragraph/sentence/word chunker (never splits multi-byte code points) ---
+
+fn tr_is_cjk_sent buf view uchar * pos ulong blen ulong to bool
+if gt add pos 3 blen
+ret false
+end
+b0 = get buf pos
+b1 = get buf add pos 1
+b2 = get buf add pos 2
+note U+3002 IDEOGRAPHIC FULL STOP (e3 80 82)
+if and eq b0 0xe3 and eq b1 0x80 eq b2 0x82
+ret true
+end
+note U+FF01 FULLWIDTH EXCLAMATION (ef bc 81) or U+FF1F FULLWIDTH QUESTION (ef bc 9f)
+if and eq b0 0xef eq b1 0xbc
+if or eq b2 0x81 eq b2 0x9f
+ret true
+end
+end
+ret false
+end
+
+fn tr_is_sent_punct b uchar to bool
+if eq b 46
+ret true
+end
+if eq b 33
+ret true
+end
+ret eq b 63
+end
+
+fn tr_pick_chunk_end buf view uchar * pos ulong blen ulong maxb ulong to ulong
+bests = new ulong 4 0
+if le sub blen pos maxb
+ret blen
+end
+lim = add pos maxb
+cur = pos
+last_cp = pos
+while lt cur lim bound 16385
+step = tr_utf8_step buf cur blen
+if eq step 0
+ret 0
+end
+nxt = add cur step
+if gt nxt lim
+break
+end
+last_cp = nxt
+if eq step 1
+b = get buf cur
+if eq b 10
+put bests 1 nxt
+if lt nxt lim
+if eq get buf nxt 10
+put bests 0 add nxt 1
+end
+end
+end
+if tr_is_sent_punct b
+if lt nxt blen
+if tr_is_ws get buf nxt
+put bests 2 nxt
+end
+end
+end
+if eq b 32
+put bests 3 nxt
+end
+if eq b 9
+put bests 3 nxt
+end
+else
+if eq step 3
+if tr_is_cjk_sent buf cur blen
+put bests 2 nxt
+end
+end
+end
+cur = nxt
+end
+if gt get bests 0 pos
+ret get bests 0
+end
+if gt get bests 1 pos
+ret get bests 1
+end
+if gt get bests 2 pos
+ret get bests 2
+end
+if gt get bests 3 pos
+ret get bests 3
+end
+ret last_cp
+end
+
+note Splits buf[0..blen] into UTF-8-safe chunks <= maxb bytes each.
+note Writes offsets/lengths into tr_g_chk_off / tr_g_chk_len and count into tr_g_chk_cnt[0].
+fn tr_chunk_utf8 buf view uchar * blen ulong maxb ulong to ulong
+put tr_g_chk_cnt 0 0
+if lt maxb 4
+ret TR_ERR_CHUNK
+end
+verr = tr_validate_text buf blen
+if ne verr TR_OK
+ret verr
+end
+pos = ulong 0
+k = ulong 0
+while lt pos blen bound 65
+if ge k TR_MAX_CHUNKS
+ret TR_ERR_CHUNK
+end
+endp = tr_pick_chunk_end buf pos blen maxb
+if le endp pos
+ret TR_ERR_UTF8
+end
+put tr_g_chk_off k pos
+put tr_g_chk_len k sub endp pos
+k = add k 1
+pos = endp
+end
+put tr_g_chk_cnt 0 k
+ret TR_OK
+end
+
+note --- Lead / Core / Trail splitter (upstream split_ws) ---
+
+fn tr_split_ws buf view uchar * blen ulong to void
+a = ulong 0
+b = blen
+while lt a b bound 16385
+if not tr_is_ws get buf a
+break
+end
+a = add a 1
+end
+while gt b a bound 16385
+if not tr_is_ws get buf sub b 1
+break
+end
+b = sub b 1
+end
+note Preserve translate.js split URL tail ("https:" or "http:") at end of core
+clen = sub b a
+if ge clen 6
+if tr_eq_ci_slice buf sub b 6 6 tr_t_https_col
+ok_tail = true
+if gt clen 6
+if tr_is_alnum get buf sub b 7
+ok_tail = false
+end
+end
+if ok_tail
+b = sub b 6
+while gt b a bound 64
+if not tr_is_ws get buf sub b 1
+break
+end
+b = sub b 1
+end
+end
+end
+else
+if ge clen 5
+if tr_eq_ci_slice buf sub b 5 5 tr_t_http_col
+ok_tail2 = true
+if gt clen 5
+if tr_is_alnum get buf sub b 6
+ok_tail2 = false
+end
+end
+if ok_tail2
+b = sub b 5
+while gt b a bound 64
+if not tr_is_ws get buf sub b 1
+break
+end
+b = sub b 1
+end
+end
+end
+end
+end
+put tr_g_sw_lead 0 a
+put tr_g_sw_core_end 0 b
+end
+
+note --- Translation Guard & Protection Engine (upstream src/guard.rs) ---
+
+fn tr_keep_check_one src view uchar * slen ulong trn view uchar * tlen ulong to ulong
+if tr_contains_word src slen tr_kp_0
+if not tr_contains_word trn tlen tr_kp_0
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_1
+if not tr_contains_word trn tlen tr_kp_1
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_2
+if not tr_contains_word trn tlen tr_kp_2
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_3
+if not tr_contains_word trn tlen tr_kp_3
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_4
+if not tr_contains_word trn tlen tr_kp_4
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_5
+if not tr_contains_word trn tlen tr_kp_5
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_6
+if not tr_contains_word trn tlen tr_kp_6
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_7
+if not tr_contains_word trn tlen tr_kp_7
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_8
+if not tr_contains_word trn tlen tr_kp_8
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_9
+if not tr_contains_word trn tlen tr_kp_9
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_10
+if not tr_contains_word trn tlen tr_kp_10
+ret TR_ERR_GUARD
+end
+end
+ret TR_OK
+end
+
+fn tr_keep_check_two src view uchar * slen ulong trn view uchar * tlen ulong to ulong
+if tr_contains_word src slen tr_kp_11
+if not tr_contains_word trn tlen tr_kp_11
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_12
+if not tr_contains_word trn tlen tr_kp_12
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_13
+if not tr_contains_word trn tlen tr_kp_13
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_14
+if not tr_contains_word trn tlen tr_kp_14
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_15
+if not tr_contains_word trn tlen tr_kp_15
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_16
+if not tr_contains_word trn tlen tr_kp_16
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_17
+if not tr_contains_word trn tlen tr_kp_17
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_18
+if not tr_contains_word trn tlen tr_kp_18
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_19
+if not tr_contains_word trn tlen tr_kp_19
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_20
+if not tr_contains_word trn tlen tr_kp_20
+ret TR_ERR_GUARD
+end
+end
+if tr_contains_word src slen tr_kp_21
+if not tr_contains_word trn tlen tr_kp_21
+ret TR_ERR_GUARD
+end
+end
+ret TR_OK
+end
+
+fn tr_is_url_stop c uchar to bool
+if tr_is_ws c
+ret true
+end
+if eq c 60
+ret true
+end
+if eq c 62
+ret true
+end
+if eq c 40
+ret true
+end
+if eq c 41
+ret true
+end
+if eq c 91
+ret true
+end
+ret eq c 93
+end
+
+fn tr_is_url_trail c uchar to bool
+if eq c 46
+ret true
+end
+if eq c 44
+ret true
+end
+if eq c 59
+ret true
+end
+if eq c 58
+ret true
+end
+if eq c 33
+ret true
+end
+ret eq c 63
+end
+
+fn tr_url_end buf view uchar * pos ulong blen ulong to ulong
+e = pos
+while lt e blen bound 1024
+if tr_is_url_stop get buf e
+break
+end
+e = add e 1
+end
+while gt e pos bound 64
+if tr_is_url_trail get buf sub e 1
+e = sub e 1
+else
+break
+end
+end
+ret e
+end
+
+fn tr_scan_bt_end src view uchar * i ulong slen ulong to ulong
+j = add i 1
+while lt j slen bound 1024
+cj = get src j
+if eq cj 10
+ret 0
+end
+if eq cj 96
+ret add j 1
+end
+j = add j 1
+end
+ret 0
+end
+
+fn tr_scan_ph_end src view uchar * i ulong slen ulong to ulong
+j = add i 1
+while lt j slen bound 128
+cj = get src j
+if eq cj 125
+if gt j add i 1
+ret add j 1
+end
+ret 0
+end
+if not tr_is_alnum cj
+if ne cj 95
+ret 0
+end
+end
+j = add j 1
+end
+ret 0
+end
+
+fn tr_scan_tag_end src view uchar * i ulong slen ulong to ulong
+if ge add i 2 slen
+ret 0
+end
+b1 = get src add i 1
+ok_lead = false
+if eq b1 103
+ok_lead = true
+end
+if eq b1 120
+ok_lead = true
+end
+if eq b1 47
+ok_lead = true
+end
+if not ok_lead
+ret 0
+end
+j = add i 1
+while lt j slen bound 16
+if eq get src j 62
+e = add j 1
+if le sub e i 10
+ret e
+end
+ret 0
+end
+j = add j 1
+end
+ret 0
+end
+
+fn tr_scan_url_end src view uchar * i ulong slen ulong to ulong
+if le add i 8 slen
+if tr_eq_exact_slice src i 8 tr_t_https
+ue = tr_url_end src i slen
+if gt ue add i 8
+ret ue
+end
+end
+end
+if le add i 7 slen
+if tr_eq_exact_slice src i 7 tr_t_http
+ue2 = tr_url_end src i slen
+if gt ue2 add i 7
+ret ue2
+end
+end
+end
+ret 0
+end
+
+note Verify URLs, backtick spans, {placeholders}, %s/%d, and <gN>/</gN>/<xN/> survive in trn.
+fn tr_guard_tokens src view uchar * slen ulong trn view uchar * tlen ulong to ulong
+i = ulong 0
+while lt i slen bound 16385
+c = get src i
+e = ulong 0
+if eq c 96
+e = tr_scan_bt_end src i slen
+end
+if eq c 104
+e = tr_scan_url_end src i slen
+end
+if eq c 123
+e = tr_scan_ph_end src i slen
+end
+if eq c 60
+e = tr_scan_tag_end src i slen
+end
+if eq c 37
+if lt add i 1 slen
+nx = get src add i 1
+if or eq nx 115 eq nx 100
+e = add i 2
+end
+end
+end
+if gt e i
+put tr_g_item_len 0 sub e i
+if not tr_has_slice trn tlen src i
+ret TR_ERR_GUARD
+end
+i = e
+else
+i = add i 1
+end
+end
+ret TR_OK
+end
+
+note Full guard check matching upstream guard::check(source, translated, keep).
+fn tr_guard_check src view uchar * slen ulong trn view uchar * tlen ulong to ulong
+note 1. Reject empty or whitespace-only translation
+has_nw = false
+i = ulong 0
+while lt i tlen bound 16385
+if not tr_is_ws get trn i
+has_nw = true
+break
+end
+i = add i 1
+end
+if not has_nw
+ret TR_ERR_GUARD
+end
+note 2. Reject runaway output: tr_chars > src_chars * 4 + 80
+sc = tr_utf8_chars src slen
+tc = tr_utf8_chars trn tlen
+if eq tc 0
+ret TR_ERR_GUARD
+end
+lim = add mul sc 4 80
+if gt tc lim
+ret TR_ERR_GUARD
+end
+note 3. Protected keep-list words & tokens
+e1 = tr_keep_check_one src slen trn tlen
+if ne e1 TR_OK
+ret e1
+end
+e2 = tr_keep_check_two src slen trn tlen
+if ne e2 TR_OK
+ret e2
+end
+ret tr_guard_tokens src slen trn tlen
+end
+
+note Upstream guard::tidy: trim whitespace, strip spurious backticks if source had none.
+fn tr_tidy src view uchar * slen ulong trn view uchar * tlen ulong to ulong
+src_has_bt = false
+i = ulong 0
+while lt i slen bound 16385
+if eq get src i 96
+src_has_bt = true
+break
+end
+i = add i 1
+end
+s = ulong 0
+e = tlen
+while lt s e bound 16385
+if not tr_is_ws get trn s
+break
+end
+s = add s 1
+end
+while gt e s bound 16385
+if not tr_is_ws get trn sub e 1
+break
+end
+e = sub e 1
+end
+w = ulong 0
+k = s
+while lt k e bound 1024
+c = get trn k
+if or src_has_bt ne c 96
+if lt w 1024
+put tr_g_tmp_out w c
+w = add w 1
+end
+end
+k = add k 1
+end
+put tr_g_tmp_out_len 0 w
+ret w
+end
+
+note Upstream engine::list_closed: true once JSON array [...] closes outside strings.
+fn tr_list_closed buf view uchar * blen ulong to bool
+start = blen
+i = ulong 0
+while lt i blen bound 16385
+if eq get buf i 91
+start = i
+break
+end
+i = add i 1
+end
+if eq start blen
+ret false
+end
+depth = ulong 0
+in_str = false
+esc = false
+pos = start
+while lt pos blen bound 16385
+c = get buf pos
+if in_str
+if esc
+esc = false
+else
+if eq c 92
+esc = true
+else
+if eq c 34
+in_str = false
+end
+end
+end
+else
+if eq c 34
+in_str = true
+else
+if or eq c 91 eq c 123
+depth = add depth 1
+else
+if or eq c 93 eq c 125
+if gt depth 0
+depth = sub depth 1
+end
+if eq depth 0
+ret true
+end
+end
+end
+end
+end
+pos = add pos 1
+end
+ret false
+end
+
+note --- Deterministic SHA-256 Keyed Bounded LRU Cache (upstream src/cache.rs) ---
+
+fn tr_cache_init cap ulong to void
+c = cap
+if eq c 0
+c = 1
+end
+if gt c TR_CACHE_MAX_SLOTS
+c = TR_CACHE_MAX_SLOTS
+end
+put tr_g_cache_cap 0 c
+put tr_g_cache_clock 0 0
+put tr_g_cache_hits 0 0
+put tr_g_cache_misses 0 0
+put tr_g_cache_evicts 0 0
+put tr_g_cache_cnt 0 0
+i = ulong 0
+while lt i TR_CACHE_MAX_SLOTS bound 32
+put tr_g_cache_used i 0
+put tr_g_cache_tick i 0
+put tr_g_cache_vlen i 0
+i = add i 1
+end
+end
+
+note Computes SHA-256(p6\0 model\0 src_code\0 dst_code\0 txt\0) into tr_g_key_buf.
+fn tr_cache_compute_key src_id ulong dst_id ulong txt view uchar * tlen ulong to void
+ctx = new ulong 40 0
+nul = new uchar 1 0
+wbuf = new uchar 64 0
+sha256_init ctx
+sha256_update ctx tr_t_pver
+sha256_update ctx nul
+n = get tr_g_req_model_len 0
+if eq n 0
+sha256_update ctx tr_t_defmodel
+else
+if gt n 64
+n = 64
+end
+i = ulong 0
+while lt i n bound 64
+put wbuf i get tr_g_req_model i
+i = add i 1
+end
+sha256_update ctx part wbuf 0 n
+end
+sha256_update ctx nul
+n = tr_lang_code_write src_id wbuf 0
+sha256_update ctx part wbuf 0 n
+sha256_update ctx nul
+n = tr_lang_code_write dst_id wbuf 0
+sha256_update ctx part wbuf 0 n
+sha256_update ctx nul
+if gt tlen 0
+sha256_update ctx part txt 0 tlen
+end
+sha256_update ctx nul
+sha256_final ctx wbuf
+j = ulong 0
+while lt j 32 bound 32
+put tr_g_key_buf j get wbuf j
+j = add j 1
+end
+end
+
+fn tr_cache_key_match slot ulong to bool
+base = mul slot 32
+i = ulong 0
+while lt i 32 bound 32
+if ne get tr_g_cache_key add base i get tr_g_key_buf i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn tr_cache_find_slot cap ulong src_id ulong dst_id ulong to ulong
+i = ulong 0
+while lt i cap bound 32
+if eq get tr_g_cache_used i 1
+if and eq get tr_g_cache_src i src_id eq get tr_g_cache_dst i dst_id
+if tr_cache_key_match i
+ret i
+end
+end
+end
+i = add i 1
+end
+ret cap
+end
+
+fn tr_cache_read_slot slot ulong to void
+clk = add get tr_g_cache_clock 0 1
+put tr_g_cache_clock 0 clk
+put tr_g_cache_tick slot clk
+put tr_g_cache_hits 0 add get tr_g_cache_hits 0 1
+vlen = get tr_g_cache_vlen slot
+vbase = mul slot TR_CACHE_VAL_CAP
+j = ulong 0
+while lt j vlen bound 512
+put tr_g_tmp_out j get tr_g_cache_val add vbase j
+j = add j 1
+end
+put tr_g_tmp_out_len 0 vlen
+end
+
+note Look up (src_id, dst_id, txt[0..tlen]) in cache.
+note On hit: copies cached output into tr_g_tmp_out, sets tr_g_tmp_out_len, returns 1.
+note On miss: increments misses, returns 0.
+fn tr_cache_get src_id ulong dst_id ulong txt view uchar * tlen ulong to ulong
+cap = get tr_g_cache_cap 0
+if eq cap 0
+tr_cache_init 16
+cap = 16
+end
+tr_cache_compute_key src_id dst_id txt tlen
+slot = tr_cache_find_slot cap src_id dst_id
+if lt slot cap
+tr_cache_read_slot slot
+ret 1
+end
+put tr_g_cache_misses 0 add get tr_g_cache_misses 0 1
+ret 0
+end
+
+fn tr_cache_pick_slot cap ulong src_id ulong dst_id ulong to ulong
+slot = tr_cache_find_slot cap src_id dst_id
+if lt slot cap
+ret slot
+end
+j = ulong 0
+while lt j cap bound 32
+if eq get tr_g_cache_used j 0
+put tr_g_cache_cnt 0 add get tr_g_cache_cnt 0 1
+ret j
+end
+j = add j 1
+end
+best = ulong 0
+best_t = get tr_g_cache_tick 0
+k = ulong 1
+while lt k cap bound 32
+tk = get tr_g_cache_tick k
+if lt tk best_t
+best = k
+best_t = tk
+end
+k = add k 1
+end
+put tr_g_cache_evicts 0 add get tr_g_cache_evicts 0 1
+ret best
+end
+
+fn tr_cache_write_slot slot ulong src_id ulong dst_id ulong to void
+clk = add get tr_g_cache_clock 0 1
+put tr_g_cache_clock 0 clk
+put tr_g_cache_used slot 1
+put tr_g_cache_tick slot clk
+put tr_g_cache_src slot src_id
+put tr_g_cache_dst slot dst_id
+kbase = mul slot 32
+ki = ulong 0
+while lt ki 32 bound 32
+put tr_g_cache_key add kbase ki get tr_g_key_buf ki
+ki = add ki 1
+end
+vlen = get tr_g_tmp_out_len 0
+if gt vlen TR_CACHE_VAL_CAP
+vlen = TR_CACHE_VAL_CAP
+end
+put tr_g_cache_vlen slot vlen
+vbase = mul slot TR_CACHE_VAL_CAP
+vi = ulong 0
+while lt vi vlen bound 512
+put tr_g_cache_val add vbase vi get tr_g_tmp_out vi
+vi = add vi 1
+end
+end
+
+note Store tr_g_tmp_out[0..tr_g_tmp_out_len] under (src_id, dst_id, txt[0..tlen]).
+note Performs deterministic LRU eviction when cache is at capacity.
+fn tr_cache_put src_id ulong dst_id ulong txt view uchar * tlen ulong to void
+cap = get tr_g_cache_cap 0
+if eq cap 0
+tr_cache_init 16
+cap = 16
+end
+tr_cache_compute_key src_id dst_id txt tlen
+slot = tr_cache_pick_slot cap src_id dst_id
+tr_cache_write_slot slot src_id dst_id
+end
+
+note --- JSONL Response Builder ---
+
+fn tr_resp_reset to void
+put tr_g_resp_len 0 0
+end
+
+fn tr_resp_byte b uchar to void
+p = get tr_g_resp_len 0
+if lt p 32768
+put tr_g_resp p b
+put tr_g_resp_len 0 add p 1
+end
+end
+
+fn tr_resp_text s view uchar * to void
+n = len s
+i = ulong 0
+while lt i n bound 256
+tr_resp_byte get s i
+i = add i 1
+end
+end
+
+fn tr_resp_u64 v ulong to void
+digs = new uchar 24 0
+if eq v 0
+tr_resp_byte 48
+ret
+end
+x = v
+k = ulong 0
+while gt x 0 bound 24
+d = rem x 10
+put digs k uchar add 48 d
+x = div x 10
+k = add k 1
+end
+while gt k 0 bound 24
+k = sub k 1
+tr_resp_byte get digs k
+end
+end
+
+fn tr_resp_json_str_g len_val ulong to void
+note Writes tr_g_tmp_out[0..len_val] as a JSON-escaped string (with enclosing quotes)
+tr_resp_byte 34
+i = ulong 0
+while lt i len_val bound 1024
+c = get tr_g_tmp_out i
+if eq c 34
+tr_resp_byte 92
+tr_resp_byte 34
+else
+if eq c 92
+tr_resp_byte 92
+tr_resp_byte 92
+else
+if eq c 10
+tr_resp_byte 92
+tr_resp_byte 110
+else
+if eq c 13
+tr_resp_byte 92
+tr_resp_byte 114
+else
+if eq c 9
+tr_resp_byte 92
+tr_resp_byte 116
+else
+tr_resp_byte c
+end
+end
+end
+end
+end
+i = add i 1
+end
+tr_resp_byte 34
+end
+
+fn tr_resp_error code ulong to void
+tr_resp_reset
+tr_resp_text tr_j_err_pre
+tr_resp_u64 code
+tr_resp_text tr_j_err_msg
+if eq code TR_ERR_EMPTY
+tr_resp_text tr_e_empty
+end
+if eq code TR_ERR_OVERSIZE
+tr_resp_text tr_e_over
+end
+if eq code TR_ERR_UTF8
+tr_resp_text tr_e_utf8
+end
+if eq code TR_ERR_NUL
+tr_resp_text tr_e_nul
+end
+if eq code TR_ERR_LANG
+tr_resp_text tr_e_lang
+end
+if eq code TR_ERR_JSON
+tr_resp_text tr_e_json
+end
+if eq code TR_ERR_GUARD
+tr_resp_text tr_e_guard
+end
+if eq code TR_ERR_CHUNK
+tr_resp_text tr_e_chunk
+end
+tr_resp_text tr_j_err_end
+end
+
+note --- Strict JSONL Request Parser ---
+
+fn tr_skip_ws buf view uchar * pos ulong blen ulong to ulong
+p = pos
+while lt p blen bound 16385
+if not tr_is_ws get buf p
+break
+end
+p = add p 1
+end
+ret p
+end
+
+note Parses a JSON string starting at buf[pos]=='"', storing unescaped bytes into target kind:
+note kind 0=key(tr_g_item_buf), 1=from, 2=to, 3=model, 4=text.
+note Returns new position after closing '"', or 0 on syntax/nul/oversize error.
+fn tr_parse_jstr buf view uchar * pos ulong blen ulong kind ulong to ulong
+if ge pos blen
+ret 0
+end
+if ne get buf pos 34
+ret 0
+end
+p = add pos 1
+w = ulong 0
+cap = ulong 64
+if eq kind 4
+cap = TR_MAX_BYTES
+end
+while lt p blen bound 16385
+c = get buf p
+if eq c 0
+ret 0
+end
+if eq c 34
+if eq kind 0
+put tr_g_item_len 0 w
+end
+if eq kind 1
+put tr_g_req_from_len 0 w
+end
+if eq kind 2
+put tr_g_req_to_len 0 w
+end
+if eq kind 3
+put tr_g_req_model_len 0 w
+end
+if eq kind 4
+put tr_g_req_text_len 0 w
+end
+ret add p 1
+end
+outb = c
+if eq c 92
+p = add p 1
+if ge p blen
+ret 0
+end
+e = get buf p
+if eq e 34
+outb = 34
+else
+if eq e 92
+outb = 92
+else
+if eq e 110
+outb = 10
+else
+if eq e 114
+outb = 13
+else
+if eq e 116
+outb = 9
+else
+if eq e 47
+outb = 47
+else
+ret 0
+end
+end
+end
+end
+end
+end
+else
+if lt c 32
+ret 0
+end
+end
+if ge w cap
+ret 0
+end
+if eq kind 0
+put tr_g_item_buf w outb
+end
+if eq kind 1
+put tr_g_req_from w outb
+end
+if eq kind 2
+put tr_g_req_to w outb
+end
+if eq kind 3
+put tr_g_req_model w outb
+end
+if eq kind 4
+put tr_g_req_text w outb
+end
+w = add w 1
+p = add p 1
+end
+ret 0
+end
+
+fn tr_key_kind to ulong
+klen = get tr_g_item_len 0
+kb = new uchar 32 0
+if gt klen 32
+ret 99
+end
+i = ulong 0
+while lt i klen bound 32
+put kb i get tr_g_item_buf i
+i = add i 1
+end
+if or tr_eq_exact_slice kb 0 klen tr_jk_from tr_eq_exact_slice kb 0 klen tr_jk_src
+ret 1
+end
+if or tr_eq_exact_slice kb 0 klen tr_jk_to tr_eq_exact_slice kb 0 klen tr_jk_dst
+ret 2
+end
+if tr_eq_exact_slice kb 0 klen tr_jk_model
+ret 3
+end
+if tr_eq_exact_slice kb 0 klen tr_jk_text
+ret 4
+end
+if tr_eq_exact_slice kb 0 klen tr_jk_maxc
+ret 5
+end
+ret 99
+end
+
+fn tr_parse_maxc line view uchar * pos ulong llen ulong to ulong
+p = pos
+val = ulong 0
+digits = ulong 0
+while lt p llen bound 16
+dc = get line p
+if not tr_is_digit dc
+break
+end
+val = add mul val 10 ulong sub dc 48
+digits = add digits 1
+p = add p 1
+end
+if eq digits 0
+ret 0
+end
+put tr_g_req_maxc 0 val
+ret p
+end
+
+fn tr_parse_req_line line view uchar * llen ulong to ulong
+put tr_g_req_from_len 0 0
+put tr_g_req_to_len 0 0
+put tr_g_req_model_len 0 0
+put tr_g_req_text_len 0 0
+put tr_g_req_maxc 0 512
+if eq llen 0
+ret TR_ERR_EMPTY
+end
+if gt llen TR_MAX_BYTES
+ret TR_ERR_OVERSIZE
+end
+ni = ulong 0
+while lt ni llen bound 16385
+if eq get line ni 0
+ret TR_ERR_NUL
+end
+ni = add ni 1
+end
+p = tr_skip_ws line 0 llen
+if ge p llen
+ret TR_ERR_EMPTY
+end
+if ne get line p 123
+ret TR_ERR_JSON
+end
+p = tr_skip_ws line add p 1 llen
+got_to = false
+got_text = false
+fields = ulong 0
+while lt fields 16 bound 16
+if ge p llen
+ret TR_ERR_JSON
+end
+if eq get line p 125
+p = tr_skip_ws line add p 1 llen
+if ne p llen
+ret TR_ERR_JSON
+end
+break
+end
+p = tr_parse_jstr line p llen 0
+if eq p 0
+ret TR_ERR_JSON
+end
+kk = tr_key_kind
+p = tr_skip_ws line p llen
+if ge p llen
+ret TR_ERR_JSON
+end
+if ne get line p 58
+ret TR_ERR_JSON
+end
+p = tr_skip_ws line add p 1 llen
+if ge p llen
+ret TR_ERR_JSON
+end
+if and ge kk 1 le kk 4
+p = tr_parse_jstr line p llen kk
+if eq p 0
+ret TR_ERR_JSON
+end
+if eq kk 2
+got_to = true
+end
+if eq kk 4
+got_text = true
+end
+else
+if eq kk 5
+p = tr_parse_maxc line p llen
+if eq p 0
+ret TR_ERR_JSON
+end
+else
+ret TR_ERR_JSON
+end
+end
+p = tr_skip_ws line p llen
+if ge p llen
+ret TR_ERR_JSON
+end
+if eq get line p 44
+p = tr_skip_ws line add p 1 llen
+else
+if ne get line p 125
+ret TR_ERR_JSON
+end
+end
+fields = add fields 1
+end
+if not and got_to got_text
+ret TR_ERR_JSON
+end
+ret TR_OK
+end
+
+note --- End-to-End Request Pipeline (validate -> chunk -> cache -> guard -> JSONL) ---
+
+fn tr_resp_lang_code lid ulong to void
+lcode = new uchar 16 0
+n = tr_lang_code_write lid lcode 0
+i = ulong 0
+while lt i n bound 16
+tr_resp_byte get lcode i
+i = add i 1
+end
+end
+
+fn tr_emit_one_item src_id ulong dst_id ulong idx ulong to void
+cbuf = new uchar 512 0
+coff = get tr_g_chk_off idx
+clen = get tr_g_chk_len idx
+if gt clen 512
+clen = 512
+end
+ci = ulong 0
+while lt ci clen bound 512
+put cbuf ci get tr_g_req_text add coff ci
+ci = add ci 1
+end
+h2 = tr_cache_get src_id dst_id part cbuf 0 clen clen
+if eq h2 1
+put tr_g_cache_hits 0 sub get tr_g_cache_hits 0 1
+tr_resp_json_str_g get tr_g_tmp_out_len 0
+else
+put tr_g_cache_misses 0 sub get tr_g_cache_misses 0 1
+ci2 = ulong 0
+while lt ci2 clen bound 512
+put tr_g_tmp_out ci2 get cbuf ci2
+ci2 = add ci2 1
+end
+tr_resp_json_str_g clen
+end
+end
+
+fn tr_emit_ok_resp src_id ulong dst_id ulong cnt ulong req_hits ulong req_misses ulong to void
+tr_resp_reset
+tr_resp_text tr_j_ok_pre
+tr_resp_lang_code src_id
+tr_resp_text tr_j_to
+tr_resp_lang_code dst_id
+tr_resp_text tr_j_chunks
+tr_resp_u64 cnt
+tr_resp_text tr_j_fc
+tr_resp_u64 req_hits
+tr_resp_text tr_j_ms
+tr_resp_u64 req_misses
+tr_resp_text tr_j_ev
+tr_resp_u64 get tr_g_cache_evicts 0
+tr_resp_text tr_j_items
+m = ulong 0
+while lt m cnt bound 64
+if gt m 0
+tr_resp_byte 44
+end
+tr_emit_one_item src_id dst_id m
+m = add m 1
+end
+tr_resp_text tr_j_end
+end
+
+fn tr_req_from_id to ulong
+fbuf = new uchar 64 0
+flen = get tr_g_req_from_len 0
+fi = ulong 0
+while lt fi flen bound 64
+put fbuf fi get tr_g_req_from fi
+fi = add fi 1
+end
+ret tr_lang_find_src fbuf 0 flen
+end
+
+fn tr_req_to_id to ulong
+tbuf = new uchar 64 0
+tlen = get tr_g_req_to_len 0
+ti = ulong 0
+while lt ti tlen bound 64
+put tbuf ti get tr_g_req_to ti
+ti = add ti 1
+end
+ret tr_lang_find tbuf 0 tlen
+end
+
+fn tr_process_chunk src_id ulong dst_id ulong idx ulong to ulong
+cbuf = new uchar 512 0
+coff = get tr_g_chk_off idx
+clen = get tr_g_chk_len idx
+if gt clen TR_CACHE_VAL_CAP
+clen = TR_CACHE_VAL_CAP
+end
+ci = ulong 0
+while lt ci clen bound 512
+put cbuf ci get tr_g_req_text add coff ci
+ci = add ci 1
+end
+hit = tr_cache_get src_id dst_id part cbuf 0 clen clen
+if eq hit 1
+ret 1
+end
+ci2 = ulong 0
+while lt ci2 clen bound 512
+put tr_g_tmp_out ci2 get cbuf ci2
+ci2 = add ci2 1
+end
+put tr_g_tmp_out_len 0 clen
+tr_cache_put src_id dst_id part cbuf 0 clen clen
+ret 0
+end
+
+fn tr_handle_request line view uchar * llen ulong to ulong
+txt = new uchar 16385 0
+perr = tr_parse_req_line line llen
+if ne perr TR_OK
+tr_resp_error perr
+ret perr
+end
+src_id = tr_req_from_id
+if eq src_id TR_LANG_INVALID
+tr_resp_error TR_ERR_LANG
+ret TR_ERR_LANG
+end
+dst_id = tr_req_to_id
+if eq dst_id TR_LANG_INVALID
+tr_resp_error TR_ERR_LANG
+ret TR_ERR_LANG
+end
+txlen = get tr_g_req_text_len 0
+xi = ulong 0
+while lt xi txlen bound 16385
+put txt xi get tr_g_req_text xi
+xi = add xi 1
+end
+cerr = tr_chunk_utf8 txt txlen get tr_g_req_maxc 0
+if ne cerr TR_OK
+tr_resp_error cerr
+ret cerr
+end
+cnt = get tr_g_chk_cnt 0
+req_hits = ulong 0
+req_misses = ulong 0
+k = ulong 0
+while lt k cnt bound 64
+if eq tr_process_chunk src_id dst_id k 1
+req_hits = add req_hits 1
+else
+req_misses = add req_misses 1
+end
+k = add k 1
+end
+tr_emit_ok_resp src_id dst_id cnt req_hits req_misses
+ret TR_OK
+end
