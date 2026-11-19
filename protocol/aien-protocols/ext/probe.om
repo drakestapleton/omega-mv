@@ -1,0 +1,108 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/aien-protocols/ext/probe.om: pure-Omega port of aien-probe
+note Implements probe request validation, challenge-response attestation hashing,
+note response verification, and deterministic SLA verdict classification.
+note Compose after si/directives/om2.om, om/tls/sha2.om, and protocol/aien-protocols/core/types.om.
+
+const PRB_OK ulong 0
+const PRB_ERR_KIND ulong 1
+const PRB_ERR_TARGET ulong 2
+const PRB_ERR_NONCE ulong 3
+const PRB_ERR_TIMEOUT ulong 4
+const PRB_ERR_ATTEST ulong 5
+
+const PRB_KIND_LIVENESS ulong 1
+const PRB_KIND_CAPABILITY ulong 2
+const PRB_KIND_LATENCY ulong 3
+const PRB_KIND_INTEGRITY ulong 4
+
+const PRB_VERDICT_PASS ulong 1
+const PRB_VERDICT_DEGRADED ulong 2
+const PRB_VERDICT_FAIL ulong 3
+const PRB_VERDICT_TIMEOUT ulong 4
+
+const PRB_MAX_TARGET_LEN ulong 256
+const PRB_MAX_TIMEOUT_MS ulong 300000
+
+text prb_dom_attest "aien-probe:v1|"
+text prb_sep "|"
+
+fn prb_kind_valid k ulong to bool
+ret and ge k PRB_KIND_LIVENESS le k PRB_KIND_INTEGRITY
+end
+
+fn prb_target_valid target view uchar * to bool
+n = len target
+if or eq n ulong 0 gt n PRB_MAX_TARGET_LEN
+ret false
+end
+i = ulong 0
+while lt i n bound 256
+b = get target i
+if or lt b uchar 33 gt b uchar 126
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn prb_validate_request kind ulong target view uchar * nonce view uchar 16 timeout_ms ulong to ulong
+if not prb_kind_valid kind
+ret PRB_ERR_KIND
+end
+if not prb_target_valid target
+ret PRB_ERR_TARGET
+end
+if uuid_is_nil nonce
+ret PRB_ERR_NONCE
+end
+if or eq timeout_ms ulong 0 gt timeout_ms PRB_MAX_TIMEOUT_MS
+ret PRB_ERR_TIMEOUT
+end
+ret PRB_OK
+end
+
+fn prb_attest_head ctx edit ulong 40 kind ulong target view uchar * nonce view uchar 16 to void
+sha256_init ctx
+sha256_update ctx prb_dom_attest
+kb = new uchar 8 0
+klen = pt_put_u64_le kb ulong 0 kind
+sha256_update ctx part kb ulong 0 klen
+sha256_update ctx target
+sha256_update ctx prb_sep
+sha256_update ctx nonce
+end
+
+fn prb_attest_finish ctx edit ulong 40 status_code ulong rtt_us ulong dst edit uchar 32 to void
+buf = new uchar 16 0
+p0 = pt_put_u64_le buf ulong 0 status_code
+p1 = pt_put_u64_le buf p0 rtt_us
+sha256_update ctx part buf ulong 0 p1
+sha256_final ctx dst
+end
+
+fn prb_verify_attestation ctx edit ulong 40 status_code ulong rtt_us ulong claimed view uchar 32 to ulong
+exp = new uchar 32 0
+prb_attest_finish ctx status_code rtt_us exp
+if not digest_eq exp claimed
+ret PRB_ERR_ATTEST
+end
+ret PRB_OK
+end
+
+fn prb_classify_verdict status_code ulong rtt_us ulong soft_sla_us ulong hard_sla_us ulong to ulong
+if or eq hard_sla_us ulong 0 gt soft_sla_us hard_sla_us
+ret PRB_VERDICT_FAIL
+end
+if gt rtt_us hard_sla_us
+ret PRB_VERDICT_TIMEOUT
+end
+if ne status_code ulong 0
+ret PRB_VERDICT_FAIL
+end
+if gt rtt_us soft_sla_us
+ret PRB_VERDICT_DEGRADED
+end
+ret PRB_VERDICT_PASS
+end

@@ -1,0 +1,156 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/aien-protocols/ext/discovery_capsule.om: pure-Omega port of aien-discovery-capsule
+note Implements recipient URI validation, capsule lifecycle state machine,
+note hop-limit & TTL routing enforcement, and canonical capsule digest verification.
+note Compose after si/directives/om2.om, om/tls/sha2.om, and protocol/aien-protocols/core/types.om.
+
+const DC_OK ulong 0
+const DC_ERR_RECIPIENT ulong 1
+const DC_ERR_TTL ulong 2
+const DC_ERR_HOPS ulong 3
+const DC_ERR_STATE ulong 4
+const DC_ERR_DIGEST ulong 5
+const DC_ERR_ID ulong 6
+
+const DC_STATE_DRAFT ulong 1
+const DC_STATE_SEALED ulong 2
+const DC_STATE_ROUTED ulong 3
+const DC_STATE_DELIVERED ulong 4
+const DC_STATE_EXPIRED ulong 5
+const DC_STATE_REVOKED ulong 6
+
+const DC_MAX_HOPS ulong 16
+const DC_MAX_TTL_S ulong 86400
+
+text dc_dom_cap "aien-dc:v1|"
+text dc_sep "|"
+text dc_pfx_did "did:"
+text dc_pfx_rad "rad:"
+text dc_pfx_node "node:"
+
+fn dc_state_valid s ulong to bool
+ret and ge s DC_STATE_DRAFT le s DC_STATE_REVOKED
+end
+
+fn dc_transition_check cur ulong nxt ulong to ulong
+if not dc_state_valid cur
+ret DC_ERR_STATE
+end
+if not dc_state_valid nxt
+ret DC_ERR_STATE
+end
+if eq cur DC_STATE_DRAFT
+if or eq nxt DC_STATE_SEALED eq nxt DC_STATE_REVOKED
+ret DC_OK
+end
+ret DC_ERR_STATE
+end
+if eq cur DC_STATE_SEALED
+if or eq nxt DC_STATE_ROUTED or eq nxt DC_STATE_EXPIRED eq nxt DC_STATE_REVOKED
+ret DC_OK
+end
+ret DC_ERR_STATE
+end
+if eq cur DC_STATE_ROUTED
+if or eq nxt DC_STATE_ROUTED or eq nxt DC_STATE_DELIVERED or eq nxt DC_STATE_EXPIRED eq nxt DC_STATE_REVOKED
+ret DC_OK
+end
+ret DC_ERR_STATE
+end
+ret DC_ERR_STATE
+end
+
+fn dc_validate_recipient recip view uchar * to ulong
+n = len recip
+if or lt n ulong 8 gt n ulong 128
+ret DC_ERR_RECIPIENT
+end
+i = ulong 0
+while lt i n bound 128
+b = get recip i
+if or lt b uchar 33 gt b uchar 126
+ret DC_ERR_RECIPIENT
+end
+i = add i ulong 1
+end
+has_pfx = false
+if pt_slice_eq part recip ulong 0 ulong 4 dc_pfx_did
+has_pfx = true
+end
+if pt_slice_eq part recip ulong 0 ulong 4 dc_pfx_rad
+has_pfx = true
+end
+if pt_slice_eq part recip ulong 0 ulong 5 dc_pfx_node
+has_pfx = true
+end
+if not has_pfx
+ret DC_ERR_RECIPIENT
+end
+ret DC_OK
+end
+
+fn dc_check_routing hops ulong max_hops ulong issued_s ulong ttl_s ulong now_s ulong to ulong
+if or eq max_hops ulong 0 gt max_hops DC_MAX_HOPS
+ret DC_ERR_HOPS
+end
+if gt hops max_hops
+ret DC_ERR_HOPS
+end
+if or eq ttl_s ulong 0 gt ttl_s DC_MAX_TTL_S
+ret DC_ERR_TTL
+end
+if lt now_s issued_s
+ret DC_ERR_TTL
+end
+elapsed = sub now_s issued_s
+if gt elapsed ttl_s
+ret DC_ERR_TTL
+end
+ret DC_OK
+end
+
+fn dc_hash_head ctx edit ulong 40 cap_id view uchar 16 recip view uchar * payload_dig view uchar 32 to void
+sha256_init ctx
+sha256_update ctx dc_dom_cap
+sha256_update ctx cap_id
+sha256_update ctx dc_sep
+sha256_update ctx recip
+sha256_update ctx dc_sep
+sha256_update ctx payload_dig
+end
+
+fn dc_hash_finish ctx edit ulong 40 ttl_s ulong max_hops ulong dst edit uchar 32 to void
+buf = new uchar 16 0
+p0 = pt_put_u64_le buf ulong 0 ttl_s
+p1 = pt_put_u64_le buf p0 max_hops
+sha256_update ctx part buf ulong 0 p1
+sha256_final ctx dst
+end
+
+fn dc_verify_capsule cap_id view uchar 16 recip view uchar * payload_dig view uchar 32 ttl_s ulong max_hops ulong to ulong
+if uuid_is_nil cap_id
+ret DC_ERR_ID
+end
+if ne dc_validate_recipient recip DC_OK
+ret DC_ERR_RECIPIENT
+end
+if digest_is_zero payload_dig
+ret DC_ERR_DIGEST
+end
+if or eq ttl_s ulong 0 gt ttl_s DC_MAX_TTL_S
+ret DC_ERR_TTL
+end
+if or eq max_hops ulong 0 gt max_hops DC_MAX_HOPS
+ret DC_ERR_HOPS
+end
+ret DC_OK
+end
+
+fn dc_verify_digest ctx edit ulong 40 ttl_s ulong max_hops ulong claimed view uchar 32 to ulong
+exp = new uchar 32 0
+dc_hash_finish ctx ttl_s max_hops exp
+if not digest_eq exp claimed
+ret DC_ERR_DIGEST
+end
+ret DC_OK
+end
