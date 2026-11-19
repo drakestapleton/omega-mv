@@ -1,0 +1,241 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/runtime/inference_abi.om
+note Pure OM-2 conversion of aien-inference-abi/src/lib.rs and aien-inference-protocol/src/{limits,request,events}.rs.
+note Canonical little-endian binary wire framing for inference requests and decode outputs,
+note strict SamplingParams validation (NaN/range guards), and StopTokenGuard finish state machine.
+
+const ABI_MAGIC ulong 0x4149454e
+const ABI_VERSION ulong 1
+const ABI_REQ_FRAME_BYTES ulong 48
+const ABI_OUT_FRAME_BYTES ulong 32
+const ABI_MAX_PROMPT_TOKENS ulong 32768
+const ABI_MAX_GEN_TOKENS ulong 4096
+const ABI_MAX_STOP_TOKENS ulong 8
+
+const ABI_OK ulong 0
+const ABI_ERR_BAD_MAGIC ulong 1
+const ABI_ERR_BAD_VERSION ulong 2
+const ABI_ERR_TRUNCATED ulong 3
+const ABI_ERR_BAD_LIMITS ulong 4
+const ABI_ERR_BAD_TEMP ulong 5
+const ABI_ERR_BAD_TOP_P ulong 6
+const ABI_ERR_STOP_FULL ulong 7
+const ABI_ERR_ALREADY_FINISHED ulong 8
+
+const FINISH_NONE ulong 0
+const FINISH_STOP_TOKEN ulong 1
+const FINISH_LENGTH ulong 2
+const FINISH_CANCELLED ulong 3
+const FINISH_ERROR ulong 4
+
+struct InferenceReqFrame req_id ulong model_handle ulong prompt_tokens ulong max_tokens ulong priority ulong flags ulong end
+struct DecodeOutFrame req_id ulong token_id ulong finish_reason ulong total_tokens ulong end
+struct SamplingParams temp f32 top_p f32 max_tokens ulong top_k ulong stop_cnt ulong stop0 uint stop1 uint stop2 uint stop3 uint end
+struct StopGuard max_tokens ulong emitted ulong finished ulong reason ulong stop_cnt ulong stop0 uint stop1 uint stop2 uint stop3 uint end
+
+note Little-endian u32/u64 wire helpers.
+fn abi_put_u32 buf edit uchar * off ulong v ulong to void
+for i ulong 4
+sh = mul i 8
+put buf add off i uchar and shr v sh ulong 255
+end
+end
+
+fn abi_get_u32 buf view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 4
+sh = mul i 8
+acc = or acc shl ulong get buf add off i sh
+end
+ret acc
+end
+
+fn abi_put_u64 buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul i 8
+put buf add off i uchar and shr v sh ulong 255
+end
+end
+
+fn abi_get_u64 buf view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 8
+sh = mul i 8
+acc = or acc shl ulong get buf add off i sh
+end
+ret acc
+end
+
+note Encode InferenceReqFrame into a 48-byte little-endian wire buffer.
+note Layout: [0..4) magic, [4..8) version, [8..16) req_id, [16..24) model_handle,
+note         [24..32) prompt_tokens, [32..40) max_tokens, [40..44) priority, [44..48) flags.
+fn abi_encode_req f view InferenceReqFrame dst edit uchar 48 to ulong
+if or eq get f max_tokens 0 gt get f max_tokens ABI_MAX_GEN_TOKENS
+ret ABI_ERR_BAD_LIMITS
+end
+if gt get f prompt_tokens ABI_MAX_PROMPT_TOKENS
+ret ABI_ERR_BAD_LIMITS
+end
+abi_put_u32 dst 0 ABI_MAGIC
+abi_put_u32 dst 4 ABI_VERSION
+abi_put_u64 dst 8 get f req_id
+abi_put_u64 dst 16 get f model_handle
+abi_put_u64 dst 24 get f prompt_tokens
+abi_put_u64 dst 32 get f max_tokens
+abi_put_u32 dst 40 get f priority
+abi_put_u32 dst 44 get f flags
+ret ABI_OK
+end
+
+note Decode and validate InferenceReqFrame from wire slice (fail-closed on magic/version/len/bounds).
+fn abi_decode_req src view uchar * out_f edit InferenceReqFrame to ulong
+if lt len src ABI_REQ_FRAME_BYTES
+ret ABI_ERR_TRUNCATED
+end
+if ne abi_get_u32 src 0 ABI_MAGIC
+ret ABI_ERR_BAD_MAGIC
+end
+if ne abi_get_u32 src 4 ABI_VERSION
+ret ABI_ERR_BAD_VERSION
+end
+pt = abi_get_u64 src 24
+mt = abi_get_u64 src 32
+if or eq mt 0 gt mt ABI_MAX_GEN_TOKENS
+ret ABI_ERR_BAD_LIMITS
+end
+if gt pt ABI_MAX_PROMPT_TOKENS
+ret ABI_ERR_BAD_LIMITS
+end
+put out_f req_id abi_get_u64 src 8
+put out_f model_handle abi_get_u64 src 16
+put out_f prompt_tokens pt
+put out_f max_tokens mt
+put out_f priority abi_get_u32 src 40
+put out_f flags abi_get_u32 src 44
+ret ABI_OK
+end
+
+note Encode DecodeOutFrame into a 32-byte little-endian wire buffer.
+fn abi_encode_out f view DecodeOutFrame dst edit uchar 32 to ulong
+if gt get f finish_reason FINISH_ERROR
+ret ABI_ERR_BAD_LIMITS
+end
+abi_put_u32 dst 0 ABI_MAGIC
+abi_put_u32 dst 4 ABI_VERSION
+abi_put_u64 dst 8 get f req_id
+abi_put_u32 dst 16 get f token_id
+abi_put_u32 dst 20 get f finish_reason
+abi_put_u64 dst 24 get f total_tokens
+ret ABI_OK
+end
+
+note Decode DecodeOutFrame from wire slice.
+fn abi_decode_out src view uchar * out_f edit DecodeOutFrame to ulong
+if lt len src ABI_OUT_FRAME_BYTES
+ret ABI_ERR_TRUNCATED
+end
+if ne abi_get_u32 src 0 ABI_MAGIC
+ret ABI_ERR_BAD_MAGIC
+end
+if ne abi_get_u32 src 4 ABI_VERSION
+ret ABI_ERR_BAD_VERSION
+end
+fr = abi_get_u32 src 20
+if gt fr FINISH_ERROR
+ret ABI_ERR_BAD_LIMITS
+end
+put out_f req_id abi_get_u64 src 8
+put out_f token_id abi_get_u32 src 16
+put out_f finish_reason fr
+put out_f total_tokens abi_get_u64 src 24
+ret ABI_OK
+end
+
+note Check IEEE-754 f32 is finite (not NaN, not Inf).
+fn abi_f32_is_finite x f32 to bool
+u = bitcast uint x
+exp = and shr u uint 23 uint 0xff
+ret ne exp uint 0xff
+end
+
+note Validate SamplingParams fail-closed (finite temp in [0.0, 2.0], finite top_p in (0.0, 1.0],
+note max_tokens in 1..4096, top_k <= 2048, stop_cnt <= 4).
+fn abi_validate_sampling sp view SamplingParams to ulong
+t = get sp temp
+if not abi_f32_is_finite t
+ret ABI_ERR_BAD_TEMP
+end
+if or lt t 0.0f32 gt t 2.0f32
+ret ABI_ERR_BAD_TEMP
+end
+tp = get sp top_p
+if not abi_f32_is_finite tp
+ret ABI_ERR_BAD_TOP_P
+end
+if or le tp 0.0f32 gt tp 1.0f32
+ret ABI_ERR_BAD_TOP_P
+end
+mt = get sp max_tokens
+if or eq mt 0 gt mt ABI_MAX_GEN_TOKENS
+ret ABI_ERR_BAD_LIMITS
+end
+if gt get sp top_k 2048
+ret ABI_ERR_BAD_LIMITS
+end
+if gt get sp stop_cnt 4
+ret ABI_ERR_STOP_FULL
+end
+ret ABI_OK
+end
+
+note Initialize StopGuard from validated SamplingParams.
+fn abi_stop_guard_init g edit StopGuard sp view SamplingParams to ulong
+st = abi_validate_sampling sp
+if ne st ABI_OK
+ret st
+end
+put g max_tokens get sp max_tokens
+put g emitted 0
+put g finished 0
+put g reason FINISH_NONE
+put g stop_cnt get sp stop_cnt
+put g stop0 get sp stop0
+put g stop1 get sp stop1
+put g stop2 get sp stop2
+put g stop3 get sp stop3
+ret ABI_OK
+end
+
+note Observe one generated token; updates StopGuard and returns ABI_OK or ABI_ERR_ALREADY_FINISHED.
+fn abi_stop_guard_step g edit StopGuard tok uint to ulong
+if ne get g finished 0
+ret ABI_ERR_ALREADY_FINISHED
+end
+sc = get g stop_cnt
+hit = false
+if and gt sc 0 eq tok get g stop0
+hit = true
+end
+if and gt sc 1 eq tok get g stop1
+hit = true
+end
+if and gt sc 2 eq tok get g stop2
+hit = true
+end
+if and gt sc 3 eq tok get g stop3
+hit = true
+end
+ne_cnt = add get g emitted 1
+put g emitted ne_cnt
+if hit
+put g finished 1
+put g reason FINISH_STOP_TOKEN
+ret ABI_OK
+end
+if ge ne_cnt get g max_tokens
+put g finished 1
+put g reason FINISH_LENGTH
+ret ABI_OK
+end
+ret ABI_OK
+end

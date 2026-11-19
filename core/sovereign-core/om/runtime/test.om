@@ -1,0 +1,307 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/runtime/test.om
+note Comprehensive behavioral test suite with negative/refusal controls for the
+note pure-Omega aien-runtime, inference-abi, capability membrane, and execution journal.
+note Compose with:
+note   si/directives/om2.om core/sovereign-core/om/runtime/inference_abi.om om/tls/sha2.om
+note   core/sovereign-core/om/runtime/membrane.om core/sovereign-core/om/runtime/test.om
+
+text t_pass "PASS "
+text t_fail "FAIL "
+text t_nl "\n"
+text t_all_ok "SOVEREIGN-CORE RUNTIME TEST SUITE PASS\n"
+text t_all_bad "SOVEREIGN-CORE RUNTIME TEST SUITE FAIL\n"
+
+text t_n1 "abi_frame_roundtrip_and_negative"
+text t_n2 "abi_sampling_and_stop_token_guard"
+text t_n3 "world_store_fork_and_no_escalation"
+text t_n4 "controller_idempotency_and_negative"
+text t_n5 "membrane_authorize_and_containment_freeze"
+text t_n6 "journal_sha256_chain_and_negative_tamper"
+
+global t_fails ulong 1
+
+fn t_w s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 256
+k = write 1 s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn t_report name view uchar * ok bool to void
+if ok
+t_w t_pass
+else
+t_w t_fail
+put t_fails 0 add get t_fails 0 1
+end
+t_w name
+t_w t_nl
+end
+
+note Test 1: InferenceReqFrame & DecodeOutFrame wire roundtrip + negative magic/ver/len/bounds.
+fn test_abi_frames to bool
+req = new InferenceReqFrame 42 7 128 256 2 3
+wire = new uchar 48 0
+if ne abi_encode_req req wire ABI_OK
+ret false
+end
+dec = new InferenceReqFrame 0 0 0 0 0 0
+if ne abi_decode_req wire dec ABI_OK
+ret false
+end
+if or ne get dec req_id 42 or ne get dec model_handle 7 ne get dec prompt_tokens 128
+ret false
+end
+if or ne get dec max_tokens 256 or ne get dec priority 2 ne get dec flags 3
+ret false
+end
+note NEGATIVE: truncated buffer, bad magic, bad version, max_tokens=0
+if ne abi_decode_req part wire 0 30 dec ABI_ERR_TRUNCATED
+ret false
+end
+put wire 0 xor get wire 0 uchar 1
+if ne abi_decode_req wire dec ABI_ERR_BAD_MAGIC
+ret false
+end
+put wire 0 xor get wire 0 uchar 1
+put wire 4 uchar 99
+if ne abi_decode_req wire dec ABI_ERR_BAD_VERSION
+ret false
+end
+req_bad = new InferenceReqFrame 1 1 10 0 1 0
+if ne abi_encode_req req_bad wire ABI_ERR_BAD_LIMITS
+ret false
+end
+note DecodeOutFrame roundtrip + bad finish_reason negative
+out_f = new DecodeOutFrame 42 151645 FINISH_STOP_TOKEN 64
+owire = new uchar 32 0
+if ne abi_encode_out out_f owire ABI_OK
+ret false
+end
+odec = new DecodeOutFrame 0 0 0 0
+if ne abi_decode_out owire odec ABI_OK
+ret false
+end
+if ne get odec req_id 42
+ret false
+end
+if ne get odec token_id 151645
+ret false
+end
+if ne get odec finish_reason FINISH_STOP_TOKEN
+ret false
+end
+if ne get odec total_tokens 64
+ret false
+end
+out_bad = new DecodeOutFrame 42 1 99 1
+if ne abi_encode_out out_bad owire ABI_ERR_BAD_LIMITS
+ret false
+end
+ret true
+end
+
+note Test 2: SamplingParams validation (incl. NaN/range) and StopTokenGuard state machine.
+fn test_sampling_and_stop to bool
+sp = new SamplingParams 0.7f32 0.95f32 3 40 2 uint 2 uint 151645 uint 0 uint 0
+if ne abi_validate_sampling sp ABI_OK
+ret false
+end
+note NEGATIVE: NaN temperature, temp > 2.0, top_p == 0.0, top_p > 1.0, max_tokens == 0
+nan_f = bitcast f32 uint 0x7fc00000
+sp_nan = new SamplingParams nan_f 0.9f32 16 40 0 uint 0 uint 0 uint 0 uint 0
+if ne abi_validate_sampling sp_nan ABI_ERR_BAD_TEMP
+ret false
+end
+sp_hi = new SamplingParams 2.5f32 0.9f32 16 40 0 uint 0 uint 0 uint 0 uint 0
+if ne abi_validate_sampling sp_hi ABI_ERR_BAD_TEMP
+ret false
+end
+sp_tp0 = new SamplingParams 0.7f32 0.0f32 16 40 0 uint 0 uint 0 uint 0 uint 0
+if ne abi_validate_sampling sp_tp0 ABI_ERR_BAD_TOP_P
+ret false
+end
+sp_tp2 = new SamplingParams 0.7f32 1.1f32 16 40 0 uint 0 uint 0 uint 0 uint 0
+if ne abi_validate_sampling sp_tp2 ABI_ERR_BAD_TOP_P
+ret false
+end
+note StopGuard: hits stop token 151645 on step 2, then refuses step 3
+g = new StopGuard 0 0 0 0 0 uint 0 uint 0 uint 0 uint 0
+if ne abi_stop_guard_init g sp ABI_OK
+ret false
+end
+if ne abi_stop_guard_step g uint 100 ABI_OK
+ret false
+end
+if ne get g finished 0
+ret false
+end
+if ne abi_stop_guard_step g uint 151645 ABI_OK
+ret false
+end
+if or ne get g finished 1 ne get g reason FINISH_STOP_TOKEN
+ret false
+end
+if ne abi_stop_guard_step g uint 101 ABI_ERR_ALREADY_FINISHED
+ret false
+end
+note StopGuard: length finish after 3 non-stop tokens
+if ne abi_stop_guard_init g sp ABI_OK
+ret false
+end
+if ne abi_stop_guard_step g uint 10 ABI_OK
+ret false
+end
+if ne abi_stop_guard_step g uint 11 ABI_OK
+ret false
+end
+if ne abi_stop_guard_step g uint 12 ABI_OK
+ret false
+end
+if or ne get g finished 1 ne get g reason FINISH_LENGTH
+ret false
+end
+ret true
+end
+
+note Test 3: Persistent WorldStore fork & strict capability non-escalation.
+fn test_world_fork_and_escalation to bool
+rt_init
+pcaps = or RT_CAP_INFER or RT_CAP_FORK_WORLD RT_CAP_READ_FS
+root = rt_world_create_root 1001 pcaps 500
+if eq root 0
+ret false
+end
+note Attenuated child fork succeeds
+child = rt_world_fork root RT_CAP_INFER 501
+if or eq child 0 ne rt_world_parent child root
+ret false
+end
+if ne rt_world_caps child RT_CAP_INFER
+ret false
+end
+note NEGATIVE: child without RT_CAP_FORK_WORLD cannot fork again
+if ne rt_world_fork child RT_CAP_INFER 502 0
+ret false
+end
+note NEGATIVE: requesting RT_CAP_EXEC_CMD not held by parent is refused (anti-escalation)
+if ne rt_world_fork root or RT_CAP_INFER RT_CAP_EXEC_CMD 503 0
+ret false
+end
+note NEGATIVE: unknown parent refused
+if ne rt_world_fork 999 RT_CAP_INFER 504 0
+ret false
+end
+if ne rt_world_count 2
+ret false
+end
+ret true
+end
+
+note Test 4: RuntimeController idempotency & protocol version validation.
+fn test_controller_idempotency to bool
+rt_init
+if ne rt_ctrl_begin_op 1 777 RT_OK
+ret false
+end
+if not rt_ctrl_is_processed 777
+ret false
+end
+note NEGATIVE: replay of operation_id 777 refused
+if ne rt_ctrl_begin_op 1 777 RT_ERR_DUPLICATE_OP
+ret false
+end
+note NEGATIVE: wrong protocol version or op_id 0 refused
+if ne rt_ctrl_begin_op 2 778 RT_ERR_BAD_PROTO
+ret false
+end
+if ne rt_ctrl_begin_op 1 0 RT_ERR_BAD_PROTO
+ret false
+end
+ret true
+end
+
+note Test 5: Capability membrane authorization, denial, and containment freeze.
+fn test_membrane_and_freeze to bool
+rt_init
+w1 = rt_world_create_root 10 or RT_CAP_INFER RT_CAP_ADMIN 100
+w2 = rt_world_create_root 20 RT_CAP_INFER 101
+note Authorized infer succeeds
+if ne rt_authorize_effect 1 1001 w1 RT_EFF_INFER RT_OK
+ret false
+end
+note NEGATIVE: unauthorized exec_cmd denied
+if ne rt_authorize_effect 1 1002 w2 RT_EFF_EXEC_CMD RT_ERR_UNAUTHORIZED
+ret false
+end
+note NEGATIVE: unknown world denied
+if ne rt_authorize_effect 1 1003 999 RT_EFF_INFER RT_ERR_NOT_FOUND
+ret false
+end
+note Enable emergency containment freeze -> non-admin infer denied, admin still allowed
+rt_set_freeze 1
+if ne rt_authorize_effect 1 1004 w2 RT_EFF_INFER RT_ERR_CONTAINED
+ret false
+end
+if ne rt_authorize_effect 1 1005 w1 RT_EFF_ADMIN RT_OK
+ret false
+end
+if ne rt_journal_count 5
+ret false
+end
+if ne rt_journal_verify_chain RT_OK
+ret false
+end
+ret true
+end
+
+note Test 6 (NEGATIVE): SHA-256 execution journal chain verification catches status & prev_hash tampering.
+fn test_journal_tamper_negative to bool
+rt_init
+w = rt_world_create_root 1 RT_CAP_INFER 1
+for i ulong 4
+if ne rt_authorize_effect 1 add ulong 500 i w RT_EFF_INFER RT_OK
+ret false
+end
+end
+if ne rt_journal_verify_chain RT_OK
+ret false
+end
+note Tamper with record 1 status -> must fail with RT_ERR_JRN_HASH
+rt_jrn_tamper_status 1 RT_ERR_UNAUTHORIZED
+if ne rt_journal_verify_chain RT_ERR_JRN_HASH
+ret false
+end
+note Restore status, then tamper with record 2 prev_hash -> must fail with RT_ERR_JRN_PREV
+rt_jrn_tamper_status 1 RT_OK
+if ne rt_journal_verify_chain RT_OK
+ret false
+end
+rt_jrn_tamper_prev 2 5 uchar 0x40
+if ne rt_journal_verify_chain RT_ERR_JRN_PREV
+ret false
+end
+ret true
+end
+
+fn main to int
+put t_fails 0 0
+t_report t_n1 test_abi_frames
+t_report t_n2 test_sampling_and_stop
+t_report t_n3 test_world_fork_and_escalation
+t_report t_n4 test_controller_idempotency
+t_report t_n5 test_membrane_and_freeze
+t_report t_n6 test_journal_tamper_negative
+if eq get t_fails 0 0
+t_w t_all_ok
+ret 0
+end
+t_w t_all_bad
+ret 1
+end
