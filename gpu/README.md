@@ -26,7 +26,7 @@ see [`gpu/UNITS.md`](UNITS.md) and [`gpu/nvidia/README.md`](nvidia/README.md) fo
 | `gpu/adapters/` | Pure-Omega hardware accelerator adapter and provider router (converted from `spark-adapters`, `da269adf5ff1`, 3 `.om` files). |
 | `gpu/head-to-head/` | Pure-Omega paired A/B GPU benchmark comparator and parity verifier (converted from `gpu-head-to-head`, `48e331f2cf5e`, 3 `.om` files). |
 | `gpu/forge/` | Pure-Omega FORGE hardware descriptor, envelope, provider and realization engine (converted from `physics-mv`, `29039514eaf8`, 6 `.om` files). |
-| `gpu/extra-units.tsv`, `gpu/extra-units-gate.om` | Compile-reproducibility gate (`OMEGA-GPU-EXTRA-UNITS`, 22 units) for `gpu/driver/`, `gpu/cuda-crack/`, `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, and `gpu/turing/`, kept separate so `gpu/units.tsv` (405 units, `OMEGA-GPU-UNITS`) stays unchanged. |
+| `gpu/extra-units.tsv`, `gpu/extra-units-gate.om`, `gpu/extra-units-run.tsv` | Compile-reproducibility gate (`OMEGA-GPU-EXTRA-UNITS`, 22 units, `tests/gates/run.sh gpu-extra-units`; it also runs the host test units named in `gpu/extra-units-run.tsv` on the CPU, hardware units stay compile-only) for `gpu/driver/`, `gpu/cuda-crack/`, `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, and `gpu/turing/`, kept separate so `gpu/units.tsv` (405 units, `OMEGA-GPU-UNITS`) stays unchanged. |
 
 A moved back end keeps the history of its Omega files: `git log --follow gpu/amd/gfx942/hsaco.om` shows
 its CUDApp commits. To find the new commit for a CUDApp commit, look it up in
