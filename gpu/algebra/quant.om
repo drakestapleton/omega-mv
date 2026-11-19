@@ -1,0 +1,134 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/algebra/quant.om: pure-Omega float -> ternary absmean quantization & relative L2 error
+note (replaces src/algebra/oma_quant.{h,c}).
+note Compose after: si/directives/om2.om gpu/algebra/trit.om
+
+fn oma_f32_isfinite x f32 to bool
+bits = bitcast uint x
+ret ne and bits 0x7f800000 0x7f800000
+end
+
+fn oma_flt_min_f64 to f64
+note IEEE 754 binary32 FLT_MIN = 2^-126 (0x00800000)
+ret f64 bitcast f32 uint 0x00800000
+end
+
+fn oma_round_trit ratio f64 to byte
+note round half away from zero, clamped to {-1, 0, +1}:
+note sign(ratio) if |ratio| >= 0.5, else 0.
+if ge ratio 0.5f64
+ret byte 1
+end
+if le ratio -0.5f64
+ret byte -1
+end
+ret byte 0
+end
+
+fn oma_quant_absmean w view f32 * n ulong q edit byte * res edit OmaQuantRes to int
+if or gt n len w gt n len q
+put res rc OMA_E_ARG
+ret OMA_E_ARG
+end
+sum = 0.0f64
+i = ulong 0
+while lt i n bound 65536
+wi = get w i
+if eq oma_f32_isfinite wi false
+put res rc OMA_E_ARG
+ret OMA_E_ARG
+end
+sum = add sum fabs f64 wi
+i = add i 1
+end
+if or eq n 0 eq sum 0.0f64
+i = ulong 0
+while lt i n bound 65536
+put q i byte 0
+i = add i 1
+end
+put res scale 0.0f32
+put res rc OMA_OK
+ret OMA_OK
+end
+mean = div sum f64 n
+if lt mean oma_flt_min_f64
+put res rc OMA_E_UNDERFLOW
+ret OMA_E_UNDERFLOW
+end
+s = f32 mean
+sd = f64 s
+i = ulong 0
+while lt i n bound 65536
+ratio = div f64 get w i sd
+put q i oma_round_trit ratio
+i = add i 1
+end
+put res scale s
+put res rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_quant_rel_l2_validate w view f32 * q view byte * n ulong scale f32 to int
+if eq oma_f32_isfinite scale false
+ret OMA_E_ARG
+end
+if lt scale 0.0f32
+ret OMA_E_ARG
+end
+i = ulong 0
+while lt i n bound 65536
+if eq oma_f32_isfinite get w i false
+ret OMA_E_ARG
+end
+qi = int get q i
+if or lt qi -1 gt qi 1
+ret OMA_E_INVALID_TRIT
+end
+i = add i 1
+end
+ret OMA_OK
+end
+
+fn oma_sq_diff wi f32 qi byte sd f64 to f64
+d = sub f64 wi mul f64 int qi sd
+ret mul d d
+end
+
+fn oma_sq_f32 wi f32 to f64
+wd = f64 wi
+ret mul wd wd
+end
+
+fn oma_quant_rel_l2 w view f32 * q view byte * n ulong io edit OmaRelL2Res to int
+if or gt n len w gt n len q
+put io rc OMA_E_ARG
+ret OMA_E_ARG
+end
+rc = oma_quant_rel_l2_validate w q n get io scale
+if ne rc OMA_OK
+put io rc rc
+ret rc
+end
+num = 0.0f64
+den = 0.0f64
+sd = f64 get io scale
+i = ulong 0
+while lt i n bound 65536
+num = add num oma_sq_diff get w i get q i sd
+den = add den oma_sq_f32 get w i
+i = add i 1
+end
+if eq den 0.0f64
+if ne num 0.0f64
+put io rc OMA_E_ARG
+ret OMA_E_ARG
+end
+put io err 0.0f64
+put io rc OMA_OK
+ret OMA_OK
+end
+put io err fsqrt div num den
+put io rc OMA_OK
+ret OMA_OK
+end

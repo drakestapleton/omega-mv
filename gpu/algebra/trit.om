@@ -1,0 +1,553 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/algebra/trit.om: pure-Omega mixed algebra core (replaces src/algebra/oma_trit.{h,c}).
+note Balanced trit encoding (H1), 64-trit bitplane blocks, H2 multiply, exact dot products,
+note ternary-weight x int8 dot product (H3), and int64 <-> balanced ternary conversion.
+note Compose with: si/directives/om2.om gpu/algebra/trit.om [z3.om pack.om quant.om] ...
+
+note Explicit return codes (matching src/algebra/oma_trit.h).
+const OMA_OK int 0
+const OMA_E_INVALID_TRIT int -1
+const OMA_E_INVALID_CODE int -2
+const OMA_E_INVALID_PLANES int -3
+const OMA_E_OVERFLOW int -4
+const OMA_E_INVALID_BYTE int -5
+const OMA_E_INVALID_Z3 int -6
+const OMA_E_ARG int -7
+const OMA_E_UNDERFLOW int -8
+
+note 2-bit trit codes: bit0 = pos plane, bit1 = neg plane; 0b11 is invalid.
+const OMA_CODE_ZERO uchar 0
+const OMA_CODE_POS uchar 1
+const OMA_CODE_NEG uchar 2
+const OMA_CODE_INVALID uchar 3
+
+const OMA_BLOCK_TRITS ulong 64
+const OMA_BLOCK_BYTES ulong 16
+const OMA_DENSE_TRITS_PER_BYTE ulong 5
+const OMA_DENSE_BYTE_LIMIT int 243
+const OMA_DOT_I8_MAX_N ulong 16777215
+const OMA_INT64_MAX_DIGITS ulong 41
+
+const OMA_U64_ALL ulong 0xffffffffffffffff
+const OMA_I64_MAX long 9223372036854775807
+
+note All algebra structs declared before first fn (required by omc).
+struct OmaBlock pos ulong negp ulong end
+struct OmaZ3Block one ulong two ulong end
+struct OmaVal rc int val long end
+struct OmaAddRes rc int sum int carry int end
+struct OmaQuantRes rc int scale f32 end
+struct OmaRelL2Res rc int scale f32 err f64 end
+
+note ---- bit helpers ----
+
+fn oma_popcount64 x ulong to int
+v = sub x and shr x 1 0x5555555555555555
+v = add and v 0x3333333333333333 and shr v 2 0x3333333333333333
+v = and add v shr v 4 0x0f0f0f0f0f0f0f0f
+p = mul v 0x0101010101010101
+ret int shr p 56
+end
+
+fn oma_ctz64 x ulong to ulong
+if eq x 0
+ret ulong 64
+end
+n = ulong 0
+m = x
+while eq and m 1 0 bound 64
+m = shr m 1
+n = add n 1
+end
+ret n
+end
+
+fn oma_i64_min to long
+ret sub long -9223372036854775807 long 1
+end
+
+fn oma_add_i64 a long b long res edit OmaVal to int
+i64max = OMA_I64_MAX
+i64min = oma_i64_min
+if gt b 0
+if gt a sub i64max b
+put res rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+end
+if lt b 0
+if lt a sub i64min b
+put res rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+end
+put res val add a b
+put res rc OMA_OK
+ret OMA_OK
+end
+
+note ---- single trit and 2-bit code ops ----
+
+fn oma_trit_make v int res edit OmaVal to int
+if or lt v -1 gt v 1
+put res rc OMA_E_INVALID_TRIT
+ret OMA_E_INVALID_TRIT
+end
+put res val long v
+put res rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_trit_to_code t int res edit OmaVal to int
+if eq t 0
+put res val long 0
+put res rc OMA_OK
+ret OMA_OK
+end
+if eq t 1
+put res val long 1
+put res rc OMA_OK
+ret OMA_OK
+end
+if eq t -1
+put res val long 2
+put res rc OMA_OK
+ret OMA_OK
+end
+put res rc OMA_E_INVALID_TRIT
+ret OMA_E_INVALID_TRIT
+end
+
+fn oma_code_to_trit code int res edit OmaVal to int
+if or lt code 0 gt code 2
+put res rc OMA_E_INVALID_CODE
+ret OMA_E_INVALID_CODE
+end
+p = and code 1
+n = and shr code 1 1
+put res val long sub p n
+put res rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_code_neg a int res edit OmaVal to int
+if or lt a 0 gt a 2
+put res rc OMA_E_INVALID_CODE
+ret OMA_E_INVALID_CODE
+end
+r = or shl and a 1 1 and shr a 1 1
+put res val long r
+put res rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_block_validate b view OmaBlock to int
+if ne and get b pos get b negp 0
+ret OMA_E_INVALID_PLANES
+end
+ret OMA_OK
+end
+
+fn oma_block_add a view OmaBlock b view OmaBlock s edit OmaBlock c edit OmaBlock to int
+rc = oma_block_validate a
+if ne rc OMA_OK
+ret rc
+end
+rc = oma_block_validate b
+if ne rc OMA_OK
+ret rc
+end
+ap = get a pos
+an = get a negp
+bp = get b pos
+bn = get b negp
+az = xor or ap an OMA_U64_ALL
+bz = xor or bp bn OMA_U64_ALL
+t = or and ap bz and az bp
+put s pos or t and an bn
+t = or and an bz and az bn
+put s negp or t and ap bp
+put c pos and ap bp
+put c negp and an bn
+ret OMA_OK
+end
+
+fn oma_block_mul a view OmaBlock b view OmaBlock res edit OmaBlock to int
+rc = oma_block_validate a
+if ne rc OMA_OK
+ret rc
+end
+rc = oma_block_validate b
+if ne rc OMA_OK
+ret rc
+end
+ap = get a pos
+an = get a negp
+bp = get b pos
+bn = get b negp
+put res pos or and ap bp and an bn
+put res negp or and ap bn and an bp
+ret OMA_OK
+end
+
+fn oma_blk_to_code b view OmaBlock to int
+p = and get b pos 1
+n = shl and get b negp 1 1
+ret int or p n
+end
+
+fn oma_code_add a int b int res edit OmaAddRes to int
+if or or lt a 0 gt a 2 or lt b 0 gt b 2
+put res rc OMA_E_INVALID_CODE
+ret OMA_E_INVALID_CODE
+end
+ba = new OmaBlock ulong and a 1 ulong and shr a 1 1
+bb = new OmaBlock ulong and b 1 ulong and shr b 1 1
+bs = new OmaBlock 0 0
+bc = new OmaBlock 0 0
+rc = oma_block_add view ba view bb edit bs edit bc
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+put res sum oma_blk_to_code view bs
+put res carry oma_blk_to_code view bc
+put res rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_code_mul a int b int res edit OmaVal to int
+if or or lt a 0 gt a 2 or lt b 0 gt b 2
+put res rc OMA_E_INVALID_CODE
+ret OMA_E_INVALID_CODE
+end
+ba = new OmaBlock ulong and a 1 ulong and shr a 1 1
+bb = new OmaBlock ulong and b 1 ulong and shr b 1 1
+bp = new OmaBlock 0 0
+rc = oma_block_mul view ba view bb edit bp
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+put res val long oma_blk_to_code view bp
+put res rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_trit_neg a int res edit OmaVal to int
+ca = new OmaVal 0 0
+rc = oma_trit_to_code a edit ca
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+cn = new OmaVal 0 0
+rc = oma_code_neg int get ca val edit cn
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+ret oma_code_to_trit int get cn val res
+end
+
+fn oma_trit_add a int b int res edit OmaAddRes to int
+ca = new OmaVal 0 0
+cb = new OmaVal 0 0
+rc = oma_trit_to_code a edit ca
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+rc = oma_trit_to_code b edit cb
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+ar = new OmaAddRes 0 0 0
+rc = oma_code_add int get ca val int get cb val edit ar
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+ts = new OmaVal 0 0
+tc = new OmaVal 0 0
+rc = oma_code_to_trit get ar sum edit ts
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+rc = oma_code_to_trit get ar carry edit tc
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+put res sum int get ts val
+put res carry int get tc val
+put res rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_trit_mul a int b int res edit OmaVal to int
+ca = new OmaVal 0 0
+cb = new OmaVal 0 0
+rc = oma_trit_to_code a edit ca
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+rc = oma_trit_to_code b edit cb
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+cm = new OmaVal 0 0
+rc = oma_code_mul int get ca val int get cb val edit cm
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+ret oma_code_to_trit int get cm val res
+end
+
+note ---- 64-trit block ops ----
+
+fn oma_block_encode inp view byte 64 res edit OmaBlock to int
+p = ulong 0
+n = ulong 0
+for i ulong 64
+t = int get inp i
+if eq t 1
+p = or p shl ulong 1 i
+else
+if eq t -1
+n = or n shl ulong 1 i
+else
+if ne t 0
+ret OMA_E_INVALID_TRIT
+end
+end
+end
+end
+put res pos p
+put res negp n
+ret OMA_OK
+end
+
+fn oma_block_decode b view OmaBlock res edit byte 64 to int
+rc = oma_block_validate b
+if ne rc OMA_OK
+ret rc
+end
+bp = get b pos
+bn = get b negp
+for i ulong 64
+pv = int and shr bp i 1
+nv = int and shr bn i 1
+put res i byte sub pv nv
+end
+ret OMA_OK
+end
+
+fn oma_block_neg a view OmaBlock res edit OmaBlock to int
+rc = oma_block_validate a
+if ne rc OMA_OK
+ret rc
+end
+ap = get a pos
+an = get a negp
+put res pos an
+put res negp ap
+ret OMA_OK
+end
+
+fn oma_block_dot a view OmaBlock b view OmaBlock res edit OmaVal to int
+p = new OmaBlock 0 0
+rc = oma_block_mul a b edit p
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+d = sub oma_popcount64 get p pos oma_popcount64 get p negp
+put res val long d
+put res rc OMA_OK
+ret OMA_OK
+end
+
+note ---- ternary weights x int8 activations (H3, add/sub only) ----
+note w_planes holds 2*ceil(n/64) ulongs: [pos_0, neg_0, pos_1, neg_1, ...].
+
+fn oma_dot_tw_i8_blk wp ulong wn ulong x view byte * base ulong to int
+acc = int 0
+m = wp
+while ne m 0 bound 64
+idx = oma_ctz64 m
+acc = add acc int get x add base idx
+m = and m sub m 1
+end
+m = wn
+while ne m 0 bound 64
+idx = oma_ctz64 m
+acc = sub acc int get x add base idx
+m = and m sub m 1
+end
+ret acc
+end
+
+fn oma_check_planes_live wp ulong wn ulong n ulong base ulong to int
+if ne and wp wn 0
+ret OMA_E_INVALID_PLANES
+end
+rem_l = sub n base
+if lt rem_l 64
+live = sub shl ulong 1 rem_l 1
+if ne and or wp wn xor live OMA_U64_ALL 0
+ret OMA_E_ARG
+end
+end
+ret OMA_OK
+end
+
+fn oma_dot_tw_i8 w_planes view ulong * x view byte * n ulong res edit OmaVal to int
+if gt n OMA_DOT_I8_MAX_N
+put res rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+if gt n len x
+put res rc OMA_E_ARG
+ret OMA_E_ARG
+end
+nb = div add n 63 64
+if lt len w_planes mul nb 2
+put res rc OMA_E_ARG
+ret OMA_E_ARG
+end
+acc = int 0
+k = ulong 0
+while lt k nb bound 262144
+wp = get w_planes mul k 2
+wn = get w_planes add mul k 2 1
+base = mul k 64
+rc = oma_check_planes_live wp wn n base
+if ne rc OMA_OK
+put res rc rc
+ret rc
+end
+acc = add acc oma_dot_tw_i8_blk wp wn x base
+k = add k 1
+end
+put res val long acc
+put res rc OMA_OK
+ret OMA_OK
+end
+
+note ---- int64 <-> balanced ternary (little-endian) ----
+
+fn oma_int_to_bt v long digits edit byte * ndigits edit OmaVal to int
+tmp = new byte 41 0
+n = ulong 0
+u = ulong 0
+if lt v 0
+if eq v oma_i64_min
+u = ulong 0x8000000000000000
+else
+u = ulong neg v
+end
+else
+u = ulong v
+end
+while ne u 0 bound 42
+r = rem u 3
+u = div u 3
+if eq r 2
+put tmp n byte -1
+u = add u 1
+else
+put tmp n byte int r
+end
+n = add n 1
+end
+if gt n len digits
+put ndigits rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+i = ulong 0
+while lt i n bound 42
+d = int get tmp i
+if lt v 0
+d = neg d
+end
+put digits i byte d
+i = add i 1
+end
+put ndigits val long n
+put ndigits rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_int_to_bt_fixed v long digits edit byte * n ulong to int
+if gt n len digits
+ret OMA_E_ARG
+end
+tmp = new byte 41 0
+used = new OmaVal 0 0
+rc = oma_int_to_bt v edit tmp edit used
+if ne rc OMA_OK
+ret rc
+end
+un = ulong get used val
+if gt un n
+ret OMA_E_OVERFLOW
+end
+i = ulong 0
+while lt i un bound 42
+put digits i get tmp i
+i = add i 1
+end
+while lt i n bound 1024
+put digits i byte 0
+i = add i 1
+end
+ret OMA_OK
+end
+
+fn oma_bt_to_int digits view byte * n ulong res edit OmaVal to int
+if gt n len digits
+put res rc OMA_E_ARG
+ret OMA_E_ARG
+end
+i = ulong 0
+while lt i n bound 1024
+d = int get digits i
+if or lt d -1 gt d 1
+put res rc OMA_E_INVALID_TRIT
+ret OMA_E_INVALID_TRIT
+end
+i = add i 1
+end
+acc = long 0
+t = new OmaVal 0 0
+rem_i = n
+while gt rem_i 0 bound 1024
+rem_i = sub rem_i 1
+dv = long int get digits rem_i
+rc = oma_add_i64 acc dv edit t
+if ne rc OMA_OK
+put res rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+rc = oma_add_i64 get t val acc edit t
+if ne rc OMA_OK
+put res rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+rc = oma_add_i64 get t val acc edit t
+if ne rc OMA_OK
+put res rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+acc = get t val
+end
+put res val acc
+put res rc OMA_OK
+ret OMA_OK
+end
