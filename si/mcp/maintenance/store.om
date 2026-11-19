@@ -1,0 +1,1524 @@
+note Maintenance storage: no shell, exec, fork, arbitrary paths, target creation or deletion.
+note The file host words used here (fopen, renames) take paths relative to cwd, so it uses fchdir on pinned descriptors.
+note This single-threaded executable uses checked fchdir + basename-only operations as its dirfd boundary.
+note Root parsing/opening happens before requests. All later cwd changes use retained descriptors only.
+
+fn am_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+for i ulong len a
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn am_prefix a view uchar * b view uchar * to bool
+if lt len a len b
+ret false
+end
+for i ulong len b
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn am_no code int to bool
+if eq get amwhy 0 0
+put amwhy 0 code
+end
+ret false
+end
+
+fn am_text a view uchar * to bool
+s = ulong 0
+for i ulong len a
+c = get a i
+if eq c 0
+ret false
+end
+s = js_u8st s c
+if eq s 9
+ret false
+end
+end
+ret eq s 0
+end
+
+fn am_slug a view uchar * to bool
+if or eq len a 0 gt len a 64
+ret false
+end
+for i ulong len a
+c = get a i
+ok = or and ge c 97 le c 122 and ge c 48 le c 57
+if gt i 0
+ok = or ok or eq c 95 eq c 45
+end
+if not ok
+ret false
+end
+end
+ret true
+end
+
+fn am_id file view uchar 128 to bool
+n = get amreq 0
+if or eq n 0 gt n 127
+ret false
+end
+if am_eq part file 0 n amrules
+ret true
+end
+if am_eq part file 0 n amwatch
+ret true
+end
+if am_eq part file 0 n amconfig
+ret true
+end
+if le n add len amagentp len ammd
+ret false
+end
+if not am_prefix part file 0 n amagentp
+ret false
+end
+if not am_eq part file sub n len ammd len ammd ammd
+ret false
+end
+ret am_slug part file len amagentp sub sub n len amagentp len ammd
+end
+
+fn am_base file view uchar 128 to ulong
+if am_prefix part file 0 get amreq 0 amagentp
+ret len amagentp
+end
+ret 0
+end
+
+fn am_close slot ulong to bool
+fd = get amfd slot
+put amfd slot -1
+if lt fd 0
+ret true
+end
+r = fclose fd
+ret eq r 0
+end
+
+fn am_parent_close to bool
+ok = am_close 2
+p = get amfd 1
+put amfd 1 -1
+r = fchdir get amfd 0
+if ne r 0
+ok = false
+end
+if and ge p 0 ne p get amfd 0
+r = fclose p
+if ne r 0
+ok = false
+end
+end
+ret ok
+end
+
+note Canonical input spelling is mandatory, rather than normalizing away traversal or empty components.
+fn am_rootvalid a view uchar * to bool
+if or eq len a 0 gt len a 4095
+ret false
+end
+if ne get a 0 47
+ret false
+end
+if not am_text a
+ret false
+end
+if eq len a 1
+ret true
+end
+p = ulong 1
+for i ulong sub len a 1
+q = add i 1
+if eq get a q 47
+if eq p q
+ret false
+end
+if am_dotpart part a p sub q p
+ret false
+end
+p = add q 1
+end
+end
+if eq p len a
+ret false
+end
+ret not am_dotpart part a p sub len a p
+end
+
+fn am_dotpart a view uchar * to bool
+if eq len a 1
+ret eq get a 0 46
+end
+if eq len a 2
+ret and eq get a 0 46 eq get a 1 46
+end
+ret false
+end
+
+fn am_protected a view uchar * to bool
+if not am_prefix a amkeep
+ret false
+end
+if eq len a len amkeep
+ret true
+end
+ret eq get a len amkeep 47
+end
+
+fn am_pin a view uchar * to bool
+r = fopen amslash 0 len amslash amodir 0
+if lt r 0
+ret am_no 28
+end
+put amfd 0 int r
+p = ulong 1
+while lt p len a bound 4095
+r = fchdir get amfd 0
+if ne r 0
+ret am_no 28
+end
+q = p
+while lt q len a bound 4095
+if eq get a q 47
+break
+end
+q = add q 1
+end
+r = fopen a p sub q p amodir 0
+if lt r 0
+ret am_no 28
+end
+old = get amfd 0
+put amfd 0 int r
+r = fclose old
+if ne r 0
+ret am_no 28
+end
+p = add q 1
+end
+ret am_rootnow
+end
+
+note cwd is queried after fchdir(root), so inventory reports the actual pinned root, not caller spelling.
+fn am_rootnow to bool
+r = fchdir get amfd 0
+if ne r 0
+ret am_no 28
+end
+r = cwd amroot 0 4096
+if le r 1
+ret am_no 28
+end
+n = sub ulong r 1
+if ne get amroot 0 47
+ret am_no 28
+end
+if ne get amroot n 0
+ret am_no 28
+end
+put amv amrootn n
+put amv amprot 0
+if am_rootkeep n
+put amv amprot 1
+end
+ret true
+end
+
+fn am_rootkeep n ulong to bool
+if lt n len amkeep
+ret false
+end
+for i ulong len amkeep
+if ne get amroot i get amkeep i
+ret false
+end
+end
+if eq n len amkeep
+ret true
+end
+ret eq get amroot len amkeep 47
+end
+
+fn am_identity to bool
+u = getuid
+e = geteuid
+g = getgid
+h = getegid
+if or le u 0 le e 0
+ret false
+end
+if or lt g 0 lt h 0
+ret false
+end
+if or ne u e ne g h
+ret false
+end
+ret am_caps
+end
+
+note A non-root process with Linux permitted/effective/inheritable/ambient capabilities is privileged too.
+note Missing, duplicated, truncated or nonzero capability fields refuse startup/mutation.
+fn am_capline a view uchar * key view uchar * to int
+if not am_prefix a key
+ret 0
+end
+n = ulong 0
+for i ulong sub len a len key
+c = get a add i len key
+if or eq c 9 eq c 32
+if ne n 0
+ret -1
+end
+else
+if ne c 48
+ret -1
+end
+n = add n 1
+end
+end
+if ne n 16
+ret -1
+end
+ret 1
+end
+
+fn am_capbits a view uchar * seen uint to uint
+r = am_capline a amcinh
+bit = uint 1
+if eq r 0
+r = am_capline a amcprm
+bit = 2
+end
+if eq r 0
+r = am_capline a amceff
+bit = 4
+end
+if eq r 0
+r = am_capline a amcamb
+bit = 8
+end
+if lt r 0
+ret 16
+end
+if eq r 0
+ret seen
+end
+if ne and seen bit 0
+ret 16
+end
+ret or seen bit
+end
+
+fn am_caps to bool
+a = new uchar 8192 0
+r = fopen amproc 0 len amproc amord 0
+if lt r 0
+ret false
+end
+fd = int r
+n = ulong 0
+eof = false
+while lt n 8192 bound 8192
+r = read fd a n sub 8192 n
+if le r 0
+if eq r 0
+eof = true
+end
+break
+end
+n = add n ulong r
+end
+r = fclose fd
+if or ne r 0 not eof
+ret false
+end
+if eq n 0
+ret false
+end
+if ne get a sub n 1 10
+ret false
+end
+p = ulong 0
+seen = uint 0
+for i ulong n
+if eq get a i 10
+seen = am_capbits part a p sub i p seen
+if ge seen 16
+ret false
+end
+p = add i 1
+end
+end
+ret eq seen 15
+end
+
+fn am_boot to int
+for i ulong 5
+put amfd i -1
+end
+for i ulong 16
+put amv i 0
+end
+put amerror 0 0
+put amwhy 0 0
+if not am_identity
+ret 90
+end
+a = new uchar 4096 0
+root = new uchar 4096 0
+n = ulong 0
+i = ulong 1
+while lt i ulong argcnt bound 4
+r = argread i a 0 4096
+if lt r 0
+ret 90
+end
+if am_eq part a 0 ulong r amargwr
+if ne get amv amwrite 0
+ret 90
+end
+put amv amwrite 1
+else
+if not am_eq part a 0 ulong r amargro
+ret 90
+end
+if ne n 0
+ret 90
+end
+i = add i 1
+if ge i ulong argcnt
+ret 90
+end
+r = argread i root 0 4096
+if le r 0
+ret 90
+end
+n = ulong r
+end
+i = add i 1
+end
+if not am_rootvalid part root 0 n
+ret 90
+end
+if ne get amv amwrite 0
+if am_protected part root 0 n
+put amwhy 0 13
+ret 90
+end
+end
+if not am_pin part root 0 n
+ok = am_close 0
+ret 90
+end
+if and ne get amv amwrite 0 ne get amv amprot 0
+put amwhy 0 13
+ok = am_close 0
+ret 90
+end
+ret 0
+end
+
+fn am_parent file view uchar 128 to bool
+if not am_parent_close
+ret am_no 28
+end
+if not am_id file
+ret am_no 1
+end
+if eq am_base file 0
+put amfd 1 get amfd 0
+ret true
+end
+r = fopen amagents 0 len amagents amodir 0
+if lt r 0
+if eq r -2
+ret am_no 2
+end
+ret am_no 3
+end
+put amfd 1 int r
+r = fchdir int r
+if ne r 0
+ret am_no 28
+end
+ret true
+end
+
+note Linux ARM64 stat layout: asm-generic/stat.h; pinned fixture stat.om confirms size at byte48.
+fn am_le a view uchar * p ulong n ulong to ulong
+v = ulong 0
+for i ulong n
+v = or v shl ulong get a add p i mul i 8
+end
+ret v
+end
+
+fn am_mget st view uchar 128 i ulong to ulong
+if lt i 2
+ret am_le st mul i 8 8
+end
+if lt i 6
+ret am_le st add 16 mul sub i 2 4 4
+end
+if eq i 6
+ret am_le st 48 8
+end
+ret am_le st add 88 mul sub i 7 8 8
+end
+
+fn am_metaget st view uchar 128 to void
+for i ulong 11
+put ammeta i am_mget st i
+end
+end
+
+fn am_metasame st view uchar 128 to bool
+for i ulong 11
+if ne get ammeta i am_mget st i
+ret false
+end
+end
+ret true
+end
+
+fn am_regular to bool
+mode = get ammeta 2
+if ne and mode amtyp amreg
+ret am_no 5
+end
+if ne get ammeta 3 1
+ret am_no 6
+end
+if ne and mode amxbit 0
+ret am_no 7
+end
+if gt get ammeta 6 ammax
+ret am_no 8
+end
+ret true
+end
+
+note At most 65536 data bytes; an independent EOF read refuses a concurrently growing file.
+fn am_loadfd fd int cur edit uchar 65536 to bool
+st = new uchar 128 0
+extra = new uchar 1 0
+r = fstat fd st 0 128
+if ne r 0
+ret am_no 4
+end
+am_metaget st
+if not am_regular
+ret false
+end
+n = ulong 0
+while lt n ammax bound 65536
+r = read fd cur n sub ammax n
+if le r 0
+if lt r 0
+ret am_no 9
+end
+break
+end
+n = add n ulong r
+end
+r = read fd extra 0 1
+if ne r 0
+if gt r 0
+ret am_no 8
+end
+ret am_no 9
+end
+r = fstat fd st 0 128
+if ne r 0
+ret am_no 4
+end
+if not am_metasame st
+ret am_no 11
+end
+if ne get ammeta 6 n
+ret am_no 11
+end
+if not am_text part cur 0 n
+ret am_no 10
+end
+put amv amcurn n
+am_hash cur n
+ret true
+end
+
+fn am_load file view uchar 128 cur edit uchar 65536 to bool
+put amv amcurn 0
+if not am_parent file
+ret false
+end
+o = am_base file
+r = fopen file o sub get amreq 0 o amord 0
+if lt r 0
+if eq r -2
+ret am_no 2
+end
+ret am_no 3
+end
+put amfd 2 int r
+ret am_loadfd int r cur
+end
+
+fn am_hash cur view uchar 65536 n ulong to void
+d = new uchar 32 0
+sha256_hash part cur 0 n d
+for i ulong 32
+c = get d i
+put amhash mul i 2 get amhex ulong shr c 4
+put amhash add mul i 2 1 get amhex ulong and c 15
+end
+end
+
+fn am_hasheq token view uchar 128 to bool
+if ne get amreq 2 64
+ret false
+end
+for i ulong 64
+if ne get amhash i get token i
+ret false
+end
+end
+ret true
+end
+
+fn am_savedhash after bool to bool
+for i ulong 64
+v = get ampre i
+if after
+v = get ampost i
+end
+if ne get amhash i v
+ret false
+end
+end
+ret true
+end
+
+fn am_tokmatch token view uchar 128 to bool
+if ne get amreq 2 64
+ret false
+end
+for i ulong 64
+if ne get token i get amtok i
+ret false
+end
+end
+ret true
+end
+
+fn am_newtoken to bool
+b = new uchar 32 0
+r = random b 0 32 0
+if ne r 32
+ret am_no 16
+end
+for i ulong 32
+c = get b i
+put amtok mul i 2 get amhex ulong shr c 4
+put amtok add mul i 2 1 get amhex ulong and c 15
+end
+ret true
+end
+
+fn am_capture file view uchar 128 body view uchar 65536 cur view uchar 65536 to void
+put amv amfilen get amreq 0
+put amv ambefn get amv amcurn
+put amv amaftn get amreq 1
+for i ulong get amreq 0
+put amfile i get file i
+end
+for i ulong get amv ambefn
+put ambef i get cur i
+end
+for i ulong get amv amaftn
+put amaft i get body i
+end
+for i ulong 64
+put ampre i get amhash i
+end
+for i ulong 11
+put ampmeta i get ammeta i
+end
+am_hash body get amreq 1
+for i ulong 64
+put ampost i get amhash i
+end
+put amv amstate 1
+end
+
+fn am_changed to bool
+if ne get amv ambefn get amv amaftn
+ret true
+end
+for i ulong get amv ambefn
+if ne get ambef i get amaft i
+ret true
+end
+end
+ret false
+end
+
+fn am_canapply to bool
+if or eq get amv amwrite 0 ne get amv amprot 0
+ret false
+end
+u = geteuid
+if le u 0
+ret false
+end
+ret eq ulong u get ampmeta 4
+end
+
+fn am_ws ob edit uchar * s view uchar * to void
+js_wsbuf ob s 0 len s
+end
+
+fn am_wroot ob edit uchar * to void
+js_wsbeg ob
+for i ulong get amv amrootn
+js_wsb ob get amroot i
+end
+js_wsend ob
+end
+
+fn am_wtoken ob edit uchar * to void
+js_wsbeg ob
+for i ulong 64
+js_wsb ob get amtok i
+end
+js_wsend ob
+end
+
+fn am_whash ob edit uchar * which ulong to void
+js_wsbeg ob
+for i ulong 64
+c = get amhash i
+if eq which 1
+c = get ampre i
+end
+if eq which 2
+c = get ampost i
+end
+js_wsb ob c
+end
+js_wsend ob
+end
+
+fn am_wsaved ob edit uchar * after bool to void
+n = get amv ambefn
+if after
+n = get amv amaftn
+end
+js_wsbeg ob
+for i ulong n
+c = get ambef i
+if after
+c = get amaft i
+end
+js_wsb ob c
+end
+js_wsend ob
+end
+
+fn am_errstr ob edit uchar * to void
+want = get amwhy 0
+p = ulong 0
+k = int 1
+for i ulong len amerrs
+if eq get amerrs i 124
+if eq k want
+js_wsbuf ob amerrs p sub i p
+ret
+end
+p = add i 1
+k = add k 1
+end
+end
+am_ws ob amrefuse
+end
+
+fn am_start ob edit uchar * ok bool to void
+js_wobj ob
+am_ws ob amkok
+js_wbool ob ok
+end
+
+fn am_limits ob edit uchar * to void
+am_ws ob amklimit
+am_ws ob amlim
+end
+
+fn am_outstate ob edit uchar * to void
+am_ws ob amkstate
+if eq get amv amstate 2
+am_ws ob amappl
+else
+am_ws ob amrolled
+end
+am_ws ob amkcomm
+js_wbool ob ne get amv amrenam 0
+am_ws ob amkdur
+js_wbool ob eq get amv amderr 0
+am_ws ob amkreld
+js_wbool ob false
+am_ws ob amkpers
+js_wbool ob false
+end
+
+fn am_failure ob edit uchar * to void
+put amerror 0 1
+am_start ob false
+am_ws ob amkerr
+am_errstr ob
+if ne get amv amvalc 0
+am_ws ob amkvalid
+js_wulong ob get amv amvalc
+end
+if ne get amv amrenam 0
+am_ws ob amkprop
+am_wtoken ob
+am_outstate ob
+end
+am_limits ob
+js_wobje ob
+end
+
+note The target metadata snapshot is taken under the exclusive lock after the expected hash matches.
+note The final pre-rename reread must still match that snapshot, including mtime and ctime.
+fn am_proposal_meta to bool
+for i ulong 11
+if ne get ammeta i get ampmeta i
+ret am_no 30
+end
+end
+ret true
+end
+
+fn am_owned to bool
+u = geteuid
+if le u 0
+ret am_no 20
+end
+if ne get ammeta 4 ulong u
+ret am_no 20
+end
+ret true
+end
+
+fn am_writemode to bool
+if eq get amv amwrite 0
+ret am_no 12
+end
+if not am_identity
+ret am_no 20
+end
+if not am_rootnow
+ret false
+end
+if ne get amv amprot 0
+ret am_no 13
+end
+ret true
+end
+
+fn am_getlock to bool
+r = fchdir get amfd 0
+if ne r 0
+ret am_no 28
+end
+r = fopen amlock 0 len amlock amolock ampriv
+if lt r 0
+ret am_no 21
+end
+put amfd 4 int r
+put amv amlocko 1
+ret true
+end
+
+fn am_stagename to bool
+b = new uchar 32 0
+r = random b 0 32 0
+if ne r 32
+ret am_no 16
+end
+for i ulong len amstpre
+put amstage i get amstpre i
+end
+for i ulong 32
+c = get b i
+put amstage add len amstpre mul i 2 get amhex ulong shr c 4
+put amstage add add len amstpre mul i 2 1 get amhex ulong and c 15
+end
+n = add len amstpre 64
+for i ulong len amstend
+put amstage add n i get amstend i
+end
+put amv amstgn add n len amstend
+ret true
+end
+
+fn am_stage_new to bool
+if not am_stagename
+ret false
+end
+r = fchdir get amfd 1
+if ne r 0
+ret am_no 28
+end
+r = fopen amstage 0 get amv amstgn amonew ampriv
+if lt r 0
+ret am_no 22
+end
+put amfd 3 int r
+put amv amstageo 1
+r = fchmod int r int and get ampmeta 2 ampmode
+if ne r 0
+ret am_no 29
+end
+ret true
+end
+
+fn am_stage_write after bool to bool
+n = get amv ambefn
+if after
+n = get amv amaftn
+end
+p = ulong 0
+while lt p n bound 65536
+r = long 0
+if after
+r = write get amfd 3 amaft p sub n p
+else
+r = write get amfd 3 ambef p sub n p
+end
+if le r 0
+ret am_no 23
+end
+p = add p ulong r
+end
+r = fsync get amfd 3
+if ne r 0
+ret am_no 24
+end
+r = fseek get amfd 3 0 0
+if ne r 0
+ret am_no 9
+end
+ret true
+end
+
+note Rollback restores captured legacy bytes exactly, without imposing the new structural schema.
+fn am_stage_check file view uchar 128 cur edit uchar 65536 after bool to bool
+if not am_loadfd get amfd 3 cur
+ret false
+end
+if not am_savedhash after
+ret am_no 23
+end
+if not am_owned
+ret false
+end
+if ne get ammeta 5 get ampmeta 5
+ret am_no 29
+end
+if ne and get ammeta 2 ampmode and get ampmeta 2 ampmode
+ret am_no 29
+end
+if after
+put amreq 1 get amv amcurn
+c = am_validate file cur
+put amreq 1 0
+if ne c 0
+put amv amvalc ulong c
+ret am_no 14
+end
+end
+for i ulong 11
+put amnext i get ammeta i
+end
+ret true
+end
+
+note Final reread stays anchored to the same target-parent fd as the staged file.
+fn am_recheck file view uchar 128 cur edit uchar 65536 after bool to bool
+if not am_close 2
+ret am_no 26
+end
+r = fchdir get amfd 1
+if ne r 0
+ret am_no 28
+end
+o = am_base file
+r = fopen file o sub get amreq 0 o amord 0
+if lt r 0
+ret am_no 3
+end
+put amfd 2 int r
+if not am_loadfd int r cur
+ret false
+end
+if not am_savedhash after
+ret am_no 15
+end
+if not am_proposal_meta
+ret false
+end
+ret am_owned
+end
+
+fn am_rename file view uchar 128 after bool to bool
+pk = new uchar 256 0
+put pk 0 2
+n = get amv amstgn
+put pk 2 uchar n
+for i ulong n
+put pk add i 4 get amstage i
+end
+p = add n 4
+o = am_base file
+n = sub get amreq 0 o
+put pk p uchar n
+p = add p 2
+for i ulong n
+put pk add p i get file add o i
+end
+r = fchdir get amfd 1
+if ne r 0
+ret am_no 28
+end
+r = renames pk 0 add p n 0
+if ne r 0
+ret am_no 25
+end
+note Rename is the commit point. State changes before any fallible close or directory sync.
+put amv amrenam 1
+put amv amstageo 0
+put amv amstate 3
+if after
+put amv amstate 2
+end
+for i ulong 11
+put ampmeta i get amnext i
+end
+r = fsync get amfd 1
+if ne r 0
+put amv amderr 1
+ret am_no 27
+end
+ret true
+end
+
+fn am_samename fd int name view uchar * to bool
+a = new uchar 128 0
+b = new uchar 128 0
+r = fstat fd a 0 128
+if ne r 0
+ret false
+end
+r = lstat name 0 len name b 0 128
+if ne r 0
+ret false
+end
+ret and eq am_le a 0 8 am_le b 0 8 eq am_le a 8 8 am_le b 8 8
+end
+
+fn am_delstage to bool
+name = new uchar 128 0
+n = get amv amstgn
+for i ulong n
+put name i get amstage i
+end
+r = fchdir get amfd 1
+if ne r 0
+ret false
+end
+if not am_samename get amfd 3 part name 0 n
+ret false
+end
+r = unlink name 0 n
+if ne r 0
+ret false
+end
+put amv amstageo 0
+ret true
+end
+
+note Only names whose dev/ino still match this connection's open descriptor may be removed.
+note SIGKILL/power loss may leave a lock/stage behind: never steal a stale lock automatically.
+fn am_cleanup to bool
+ok = true
+if ne get amv amstageo 0
+if not am_delstage
+ok = false
+end
+end
+if not am_close 3
+ok = false
+end
+if not am_parent_close
+ok = false
+end
+if ne get amv amlocko 0
+r = fchdir get amfd 0
+if eq r 0
+if am_samename get amfd 4 amlock
+r = unlink amlock 0 len amlock
+if eq r 0
+put amv amlocko 0
+else
+ok = false
+end
+else
+ok = false
+end
+else
+ok = false
+end
+end
+if not am_close 4
+ok = false
+end
+if not ok
+put amwhy 0 26
+end
+ret ok
+end
+
+fn am_transaction cur edit uchar 65536 after bool to bool
+file = new uchar 128 0
+put amreq 0 get amv amfilen
+for i ulong get amv amfilen
+put file i get amfile i
+end
+if not am_getlock
+ret false
+end
+if not am_load file cur
+ret false
+end
+if not am_savedhash not after
+ret am_no 15
+end
+if not am_owned
+ret false
+end
+for i ulong 11
+put ampmeta i get ammeta i
+end
+if not am_stage_new
+ret false
+end
+if not am_stage_write after
+ret false
+end
+if not am_stage_check file cur after
+ret false
+end
+if not am_recheck file cur not after
+ret false
+end
+if not am_writemode
+ret false
+end
+ret am_rename file after
+end
+
+fn am_emitfile ob edit uchar * file view uchar 128 to void
+am_ws ob amkfile
+js_wsbuf ob file 0 get amreq 0
+end
+
+fn am_preview ob edit uchar * file view uchar 128 to void
+am_start ob true
+am_emitfile ob file
+am_ws ob amkprop
+am_wtoken ob
+am_ws ob amkbef
+am_wsaved ob false
+am_ws ob amkaft
+am_wsaved ob true
+am_ws ob amkpre
+am_whash ob 1
+am_ws ob amkpost
+am_whash ob 2
+am_ws ob amkchng
+js_wbool ob am_changed
+am_ws ob amkallow
+js_wbool ob am_canapply
+am_ws ob amkpers
+js_wbool ob false
+am_limits ob
+js_wobje ob
+end
+
+fn am_validation file view uchar 128 body view uchar 65536 to bool
+if not am_text part body 0 get amreq 1
+ret am_no 10
+end
+c = am_validate file body
+if ne c 0
+if lt c 0
+put amv amvalc ulong neg c
+else
+put amv amvalc ulong c
+end
+ret am_no 14
+end
+ret true
+end
+
+fn am_propose file view uchar 128 body view uchar 65536 token view uchar 128 cur edit uchar 65536 to bool
+if not am_validation file body
+ret false
+end
+if not am_load file cur
+ret false
+end
+if not am_hasheq token
+ret am_no 15
+end
+if not am_newtoken
+ret false
+end
+am_capture file body cur
+ret true
+end
+
+fn am_readresult ob edit uchar * file view uchar 128 cur view uchar 65536 to void
+am_start ob true
+am_emitfile ob file
+am_ws ob amkbody
+js_wsbuf ob cur 0 get amv amcurn
+am_ws ob amksha
+am_whash ob 0
+am_ws ob amksize
+js_wulong ob get amv amcurn
+js_wobje ob
+end
+
+fn am_savedresult ob edit uchar * to void
+am_start ob true
+am_ws ob amkfile
+js_wsbeg ob
+for i ulong get amv amfilen
+js_wsb ob get amfile i
+end
+js_wsend ob
+am_ws ob amkprop
+am_wtoken ob
+am_ws ob amksha
+if eq get amv amstate 2
+am_whash ob 2
+else
+am_whash ob 1
+end
+am_outstate ob
+am_limits ob
+js_wobje ob
+end
+
+note Each absent/refused fixed file remains an individual inventory result, not a server failure.
+fn am_entry ob edit uchar * file view uchar 128 cur edit uchar 65536 to void
+put amwhy 0 0
+ok = am_load file cur
+js_wobj ob
+am_emitfile ob file
+am_ws ob amkstat
+if ok
+am_ws ob amexists
+am_ws ob amksha
+am_whash ob 0
+am_ws ob amksize
+js_wulong ob get amv amcurn
+else
+if eq get amwhy 0 2
+am_ws ob ammiss
+else
+am_ws ob amrefuse
+end
+am_ws ob amkerr
+am_errstr ob
+end
+js_wobje ob
+put amwhy 0 0
+if not am_parent_close
+unused = am_no 26
+end
+put amv aminvc add get amv aminvc 1
+end
+
+fn am_setfile file edit uchar 128 name view uchar * to void
+for i ulong len name
+put file i get name i
+end
+put amreq 0 len name
+end
+
+note getdents64 record: ino u64, offset i64, reclen u16 at16, type byte18, NUL name at19.
+note The record lengths and name terminator are checked before any read; d_type is never trusted.
+fn am_dname buf view uchar 32768 p ulong r ulong file edit uchar 128 to bool
+n = ulong 0
+term = false
+for i ulong sub r 19
+c = get buf add add p 19 i
+if eq c 0
+term = true
+break
+end
+if ge n sub 128 len amagentp
+ret false
+end
+put file add len amagentp n c
+n = add n 1
+end
+if not term
+ret false
+end
+for i ulong len amagentp
+put file i get amagentp i
+end
+put amreq 0 add len amagentp n
+ret am_id file
+end
+
+fn am_dirbatch buf view uchar 32768 n ulong file edit uchar 128 cur edit uchar 65536 ob edit uchar * to bool
+p = ulong 0
+while lt p n bound 32768
+if lt sub n p 20
+ret am_no 31
+end
+r = am_le buf add p 16 2
+if or lt r 20 gt r sub n p
+ret am_no 31
+end
+if am_dname buf p r file
+if ge get amv aminvc 1024
+ret am_no 31
+end
+am_entry ob file cur
+if ne get amwhy 0 0
+ret false
+end
+if ne js_werr ob 0
+ret am_no 33
+end
+end
+p = add p r
+end
+ret true
+end
+
+fn am_inventory ob edit uchar * cur edit uchar 65536 to void
+file = new uchar 128 0
+buf = new uchar 32768 0
+put amv aminvc 0
+am_start ob true
+am_ws ob amkroot
+am_wroot ob
+am_ws ob amkmode
+if eq get amv amwrite 0
+am_ws ob amrdonly
+else
+am_ws ob amwrmode
+end
+am_ws ob amkprot
+js_wbool ob ne get amv amprot 0
+am_ws ob amkfiles
+js_warr ob
+am_setfile file amrules
+am_entry ob file cur
+if ne get amwhy 0 0
+ret
+end
+am_setfile file amwatch
+am_entry ob file cur
+if ne get amwhy 0 0
+ret
+end
+am_setfile file amconfig
+am_entry ob file cur
+if ne get amwhy 0 0
+ret
+end
+r = fchdir get amfd 0
+if ne r 0
+unused = am_no 28
+ret
+end
+df = fopen amagents 0 len amagents amodir 0
+if lt df 0
+js_warre ob
+am_ws ob amkadir
+if eq df -2
+am_ws ob ammiss
+else
+am_ws ob amrefuse
+end
+am_limits ob
+js_wobje ob
+ret
+end
+eof = false
+for i ulong 1024
+r = getdnts int df buf 0 32768
+if eq r 0
+eof = true
+break
+end
+if lt r 0
+unused = am_no 9
+break
+end
+if not am_dirbatch buf ulong r file cur ob
+break
+end
+end
+r = fclose int df
+if ne r 0
+unused = am_no 26
+end
+if and not eof eq get amwhy 0 0
+unused = am_no 31
+end
+if ne get amwhy 0 0
+ret
+end
+js_warre ob
+am_ws ob amkadir
+am_ws ob amexists
+am_limits ob
+js_wobje ob
+end
+
+fn am_mutate token view uchar 128 cur edit uchar 65536 after bool to bool
+if not am_writemode
+ret false
+end
+if eq get amv amstate 0
+ret am_no 17
+end
+if not am_tokmatch token
+ret am_no 18
+end
+want = ulong 2
+if after
+want = 1
+end
+if ne get amv amstate want
+ret am_no 19
+end
+ret am_transaction cur after
+end
+
+fn am_reqlimits to bool
+if gt get amreq 0 127
+ret false
+end
+if gt get amreq 1 ammax
+ret false
+end
+ret le get amreq 2 127
+end
+
+note Fixed sized arrays keep the public call within the seeded compiler's six argument slots.
+note amreq lengths are authoritative; unused array tails are never interpreted.
+fn am_call op ulong file view uchar 128 body view uchar 65536 token view uchar 128 ob edit uchar 787472 to void
+cur = new uchar 65536 0
+put amerror 0 0
+put amwhy 0 0
+put amv amvalc 0
+put amv amrenam 0
+put amv amderr 0
+if eq op 3
+note Even a refused replacement proposal invalidates the previous connection token.
+put amv amstate 0
+end
+if or ne get amv amstageo 0 ne get amv amlocko 0
+unused = am_no 26
+else
+if not am_reqlimits
+unused = am_no 1
+else
+if or ne js_wlen ob 0 ne js_werr ob 0
+unused = am_no 33
+else
+if not am_rootnow
+unused = am_no 28
+else
+if le op 3
+if ne op 0
+if not am_id file
+unused = am_no 1
+end
+end
+end
+if eq get amwhy 0 0
+if eq op 0
+am_inventory ob cur
+else
+if eq op 1
+if am_load file cur
+am_readresult ob file cur
+end
+else
+if eq op 2
+if am_validation file body
+am_start ob true
+am_emitfile ob file
+am_ws ob amkstat
+am_ws ob amvalid
+am_limits ob
+js_wobje ob
+end
+else
+if eq op 3
+if am_propose file body token cur
+am_preview ob file
+end
+else
+if or eq op 4 eq op 5
+if am_mutate token cur eq op 4
+am_savedresult ob
+end
+else
+unused = am_no 1
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+clean = am_cleanup
+if ne js_werr ob 0
+unused = am_no 33
+end
+if ne get amwhy 0 0
+if and eq op 3 eq get amv amrenam 0
+put amv amstate 0
+end
+r = js_winit ob
+am_failure ob
+end
+end
