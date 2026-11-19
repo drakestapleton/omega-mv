@@ -1,0 +1,493 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/interplane/core/envelope.om: pure-Omega port of interplane-core envelope,
+note version, identifier validation, strict untrusted-input parser, and canonical trust digest.
+note Invariant: parsing NEVER executes and NEVER grants authorization.
+note Compose after si/directives/om2.om and om/tls/sha2.om.
+
+const IP_OK ulong 0
+const IP_ERR_BAD_LEN ulong 1
+const IP_ERR_BAD_CHAR ulong 2
+const IP_ERR_BAD_VERSION ulong 3
+const IP_ERR_BAD_IDENT ulong 4
+const IP_ERR_BAD_HEX ulong 5
+const IP_ERR_DUP_KEY ulong 6
+const IP_ERR_UNKNOWN_KEY ulong 7
+const IP_ERR_MISSING_FIELD ulong 8
+const IP_ERR_BAD_LINE ulong 9
+const IP_ERR_TOO_MANY_LINES ulong 10
+const IP_ERR_BAD_TRANSPORT ulong 11
+const IP_ERR_BAD_POLICY_HINT ulong 12
+
+const IP_MAX_ENV_BYTES ulong 4096
+const IP_MAX_ENV_LINES ulong 32
+
+const TRANS_UNTRUSTED ulong 0
+const TRANS_TLS ulong 1
+const TRANS_MTLS ulong 2
+const TRANS_LOOPBACK ulong 3
+
+const POL_DENY_ALL ulong 0
+const POL_READ_ONLY ulong 1
+const POL_STANDARD ulong 2
+const POL_ELEVATED ulong 3
+
+text ip_hex_digits "0123456789abcdef"
+
+text ip_k_version "version"
+text ip_k_id "envelope_id"
+text ip_k_origin "origin_id"
+text ip_k_action "action"
+text ip_k_payload "payload_sha256"
+text ip_k_transport "transport"
+text ip_k_claimed "claimed_policy"
+
+text ip_t_untrusted "untrusted"
+text ip_t_tls "tls"
+text ip_t_mtls "mtls"
+text ip_t_loopback "loopback"
+
+note --- Basic slice, byte, and I/O helpers ---
+
+fn ip_slice_eq a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+if gt na ulong 65536
+ret false
+end
+i = ulong 0
+while lt i na bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn ip_write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn ip_put_u32_le dst edit uchar * pos ulong v uint to ulong
+if gt add pos ulong 4 len dst
+ret pos
+end
+put dst pos uchar and v uint 255
+put dst add pos ulong 1 uchar and shr v uint 8 uint 255
+put dst add pos ulong 2 uchar and shr v uint 16 uint 255
+put dst add pos ulong 3 uchar and shr v uint 24 uint 255
+ret add pos ulong 4
+end
+
+fn ip_put_u64_le dst edit uchar * pos ulong v ulong to ulong
+if gt add pos ulong 8 len dst
+ret pos
+end
+for i ulong 8
+sh = mul i ulong 8
+put dst add pos i uchar and shr v sh ulong 255
+end
+ret add pos ulong 8
+end
+
+fn ip_hex_nibble b uchar to int
+if and ge b uchar 48 le b uchar 57
+ret sub int b int 48
+end
+if and ge b uchar 97 le b uchar 102
+ret add sub int b int 97 int 10
+end
+ret int -1
+end
+
+fn ip_digest_to_hex d view uchar 32 dst edit uchar 64 to void
+for i ulong 32
+b = ulong get d i
+put dst mul i ulong 2 get ip_hex_digits shr b ulong 4
+put dst add mul i ulong 2 ulong 1 get ip_hex_digits and b ulong 15
+end
+end
+
+fn ip_digest_eq a view uchar 32 b view uchar 32 to bool
+for i ulong 32
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note --- Strict untrusted-input validators ---
+
+fn ip_is_lower_hex64 s view uchar * to bool
+if ne len s ulong 64
+ret false
+end
+for i ulong 64
+if lt ip_hex_nibble get s i int 0
+ret false
+end
+end
+ret true
+end
+
+note Strict Interplane identifier: 1..64 bytes of [a-z0-9._-], no leading/trailing '.' or '-', no ".."
+fn ip_valid_ident s view uchar * to ulong
+n = len s
+if eq n ulong 0
+ret IP_ERR_BAD_IDENT
+end
+if gt n ulong 64
+ret IP_ERR_BAD_IDENT
+end
+first = get s 0
+last = get s sub n ulong 1
+if or eq first uchar 46 eq first uchar 45
+ret IP_ERR_BAD_IDENT
+end
+if or eq last uchar 46 eq last uchar 45
+ret IP_ERR_BAD_IDENT
+end
+prev_dot = false
+i = ulong 0
+while lt i n bound 64
+b = get s i
+ok = false
+if and ge b uchar 97 le b uchar 122
+ok = true
+end
+if and ge b uchar 48 le b uchar 57
+ok = true
+end
+if or eq b uchar 46 or eq b uchar 95 eq b uchar 45
+ok = true
+end
+if not ok
+ret IP_ERR_BAD_IDENT
+end
+if eq b uchar 46
+if prev_dot
+ret IP_ERR_BAD_IDENT
+end
+prev_dot = true
+else
+prev_dot = false
+end
+i = add i ulong 1
+end
+ret IP_OK
+end
+
+note Strict protocol version: "major.minor", digits only, no leading zeros (except "0"), major in 1..1
+fn ip_parse_ver_part s view uchar * to long
+n = len s
+if eq n ulong 0
+ret long -1
+end
+if gt n ulong 5
+ret long -1
+end
+if gt n ulong 1
+if eq get s 0 uchar 48
+ret long -1
+end
+end
+acc = ulong 0
+i = ulong 0
+while lt i n bound 5
+b = get s i
+if or lt b uchar 48 gt b uchar 57
+ret long -1
+end
+acc = add mul acc ulong 10 sub ulong b ulong 48
+i = add i ulong 1
+end
+if gt acc ulong 65535
+ret long -1
+end
+ret long acc
+end
+
+fn ip_validate_version s view uchar * to ulong
+n = len s
+if lt n ulong 3
+ret IP_ERR_BAD_VERSION
+end
+if gt n ulong 11
+ret IP_ERR_BAD_VERSION
+end
+dot = ulong 999
+i = ulong 0
+while lt i n bound 11
+if eq get s i uchar 46
+if ne dot ulong 999
+ret IP_ERR_BAD_VERSION
+end
+dot = i
+end
+i = add i ulong 1
+end
+if eq dot ulong 999
+ret IP_ERR_BAD_VERSION
+end
+maj = ip_parse_ver_part part s 0 dot
+min = ip_parse_ver_part part s add dot ulong 1 sub sub n dot ulong 1
+if or lt maj long 0 lt min long 0
+ret IP_ERR_BAD_VERSION
+end
+if ne maj long 1
+ret IP_ERR_BAD_VERSION
+end
+ret IP_OK
+end
+
+fn ip_parse_transport s view uchar * to long
+if ip_slice_eq s ip_t_untrusted
+ret long TRANS_UNTRUSTED
+end
+if ip_slice_eq s ip_t_tls
+ret long TRANS_TLS
+end
+if ip_slice_eq s ip_t_mtls
+ret long TRANS_MTLS
+end
+if ip_slice_eq s ip_t_loopback
+ret long TRANS_LOOPBACK
+end
+ret long -1
+end
+
+fn ip_parse_policy_hint s view uchar * to long
+if ne len s ulong 1
+ret long -1
+end
+b = get s 0
+if or lt b uchar 48 gt b uchar 51
+ret long -1
+end
+ret long sub ulong b ulong 48
+end
+
+note --- Canonical length-prefixed SHA-256 trust digest helper ---
+
+fn ip_hash_lp_field ctx edit ulong 40 fld view uchar * to void
+lb = new uchar 4 0
+w = ip_put_u32_le lb ulong 0 uint len fld
+if ne w ulong 4
+trap 8
+end
+sha256_update ctx lb
+sha256_update ctx fld
+end
+
+note --- Untrusted Wire Envelope Parser ---
+note Parses key=value lines separated by '\n'. Rejects control chars, NULs, duplicate keys,
+note unknown keys, and missing required fields.
+note meta[0] = seen_mask, meta[1] = transport_class, meta[2] = claimed_policy (hint only!),
+note meta[3] = lifecycle_state (always set to 1=PARSED on IP_OK, NEVER authorized/executed).
+note Also computes canonical trust digest over the 5 core fields into digest_out[32].
+
+fn ip_check_printable_line line view uchar * to bool
+n = len line
+if gt n ulong 512
+ret false
+end
+i = ulong 0
+while lt i n bound 512
+b = get line i
+if or lt b uchar 32 ge b uchar 127
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn ip_find_eq line view uchar * to ulong
+n = len line
+if gt n ulong 512
+ret ulong 9999
+end
+i = ulong 0
+while lt i n bound 512
+if eq get line i uchar 61
+ret i
+end
+i = add i ulong 1
+end
+ret ulong 9999
+end
+
+note Field bitmask: 1=version, 2=envelope_id, 4=origin_id, 8=action, 16=payload_sha256,
+note                32=transport, 64=claimed_policy. Required mask = 31 (bits 0..4).
+fn ip_parse_line line view uchar * meta edit ulong 4 ctx edit ulong 40 to ulong
+if not ip_check_printable_line line
+ret IP_ERR_BAD_CHAR
+end
+eqp = ip_find_eq line
+if eq eqp ulong 9999
+ret IP_ERR_BAD_LINE
+end
+if eq eqp ulong 0
+ret IP_ERR_BAD_LINE
+end
+klen = eqp
+voff = add eqp ulong 1
+vlen = sub len line voff
+seen = get meta 0
+if ip_slice_eq part line 0 klen ip_k_version
+if ne and seen ulong 1 ulong 0
+ret IP_ERR_DUP_KEY
+end
+rc = ip_validate_version part line voff vlen
+if ne rc IP_OK
+ret rc
+end
+put meta 0 or seen ulong 1
+ip_hash_lp_field ctx part line voff vlen
+ret IP_OK
+end
+if ip_slice_eq part line 0 klen ip_k_id
+if ne and seen ulong 2 ulong 0
+ret IP_ERR_DUP_KEY
+end
+rc = ip_valid_ident part line voff vlen
+if ne rc IP_OK
+ret rc
+end
+put meta 0 or seen ulong 2
+ip_hash_lp_field ctx part line voff vlen
+ret IP_OK
+end
+if ip_slice_eq part line 0 klen ip_k_origin
+if ne and seen ulong 4 ulong 0
+ret IP_ERR_DUP_KEY
+end
+rc = ip_valid_ident part line voff vlen
+if ne rc IP_OK
+ret rc
+end
+put meta 0 or seen ulong 4
+ip_hash_lp_field ctx part line voff vlen
+ret IP_OK
+end
+if ip_slice_eq part line 0 klen ip_k_action
+if ne and seen ulong 8 ulong 0
+ret IP_ERR_DUP_KEY
+end
+rc = ip_valid_ident part line voff vlen
+if ne rc IP_OK
+ret rc
+end
+put meta 0 or seen ulong 8
+ip_hash_lp_field ctx part line voff vlen
+ret IP_OK
+end
+if ip_slice_eq part line 0 klen ip_k_payload
+if ne and seen ulong 16 ulong 0
+ret IP_ERR_DUP_KEY
+end
+if not ip_is_lower_hex64 part line voff vlen
+ret IP_ERR_BAD_HEX
+end
+put meta 0 or seen ulong 16
+ip_hash_lp_field ctx part line voff vlen
+ret IP_OK
+end
+if ip_slice_eq part line 0 klen ip_k_transport
+if ne and seen ulong 32 ulong 0
+ret IP_ERR_DUP_KEY
+end
+tr = ip_parse_transport part line voff vlen
+if lt tr long 0
+ret IP_ERR_BAD_TRANSPORT
+end
+put meta 0 or seen ulong 32
+put meta 1 ulong tr
+ret IP_OK
+end
+if ip_slice_eq part line 0 klen ip_k_claimed
+if ne and seen ulong 64 ulong 0
+ret IP_ERR_DUP_KEY
+end
+ph = ip_parse_policy_hint part line voff vlen
+if lt ph long 0
+ret IP_ERR_BAD_POLICY_HINT
+end
+put meta 0 or seen ulong 64
+put meta 2 ulong ph
+ret IP_OK
+end
+ret IP_ERR_UNKNOWN_KEY
+end
+
+fn ip_parse_envelope raw view uchar * meta edit ulong 4 digest_out edit uchar 32 to ulong
+put meta 0 ulong 0
+put meta 1 TRANS_UNTRUSTED
+put meta 2 POL_DENY_ALL
+put meta 3 ulong 0
+n = len raw
+if eq n ulong 0
+ret IP_ERR_BAD_LEN
+end
+if gt n IP_MAX_ENV_BYTES
+ret IP_ERR_BAD_LEN
+end
+ctx = new ulong 40 0
+sha256_init ctx
+lines = ulong 0
+start = ulong 0
+i = ulong 0
+while le i n bound 4097
+at_nl = false
+if eq i n
+at_nl = true
+else
+if eq get raw i uchar 10
+at_nl = true
+end
+end
+if at_nl
+llen = sub i start
+if gt llen ulong 0
+lines = add lines ulong 1
+if gt lines IP_MAX_ENV_LINES
+ret IP_ERR_TOO_MANY_LINES
+end
+rc = ip_parse_line part raw start llen meta ctx
+if ne rc IP_OK
+ret rc
+end
+end
+start = add i ulong 1
+end
+i = add i ulong 1
+end
+req_mask = ulong 31
+if ne and get meta 0 req_mask req_mask
+ret IP_ERR_MISSING_FIELD
+end
+sha256_final ctx digest_out
+note Parsing NEVER authorizes or executes: lifecycle state is strictly 1 (LC_PARSED).
+put meta 3 ulong 1
+ret IP_OK
+end
