@@ -51,6 +51,20 @@ uint32_t omega2_q38_bf16_xbatch_max(uint64_t *result, uint64_t o_hd, uint64_t o_
 uint32_t omega2_q38_plan_final(uint64_t *result, const uint64_t *o_cfg, uint64_t o_cfg_len, uint32_t *o_dst, uint64_t o_dst_len);
 /* export fn q38_attn256_cache_policy env_mode ulong to ulong */
 uint32_t omega2_q38_attn256_cache_policy(uint64_t *result, uint64_t o_env_mode);
+#define OMEGA2_IDENT_moe_plan "omega-ident 1 unit=moe_plan abi=2 profile=OM-2 src=4c857b5a73d8ad1b273a7cbd63eba499f3518076a8fbdca0a925a1d03fbb654b omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_moe_plan(void);
+/* export fn moe_queue_init q edit uint 512 cap ulong to ulong */
+uint32_t omega2_moe_queue_init(uint64_t *result, uint32_t *o_q, uint64_t o_q_len, uint64_t o_cap);
+/* export fn moe_queue_enqueue q edit uint 512 req_id ulong tokens ulong layer ulong flags ulong to ulong */
+uint32_t omega2_moe_queue_enqueue(uint64_t *result, uint32_t *o_q, uint64_t o_q_len, uint64_t o_req_id, uint64_t o_tokens, uint64_t o_layer, uint64_t o_flags);
+/* export fn moe_queue_claim_batch q edit uint 512 max_tokens ulong out_slots edit uint 64 to ulong */
+uint32_t omega2_moe_queue_claim_batch(uint64_t *result, uint32_t *o_q, uint64_t o_q_len, uint64_t o_max_tokens, uint32_t *o_out_slots, uint64_t o_out_slots_len);
+/* export fn moe_queue_complete_batch q edit uint 512 n ulong slots view uint 64 status ulong to ulong */
+uint32_t omega2_moe_queue_complete_batch(uint64_t *result, uint32_t *o_q, uint64_t o_q_len, uint64_t o_n, const uint32_t *o_slots, uint64_t o_slots_len, uint64_t o_status);
+/* export fn moe_plan_layer cfg view ulong 8 dst edit uint 128 to ulong */
+uint32_t omega2_moe_plan_layer(uint64_t *result, const uint64_t *o_cfg, uint64_t o_cfg_len, uint32_t *o_dst, uint64_t o_dst_len);
+/* export fn moe_plan_traffic cfg view ulong 8 distinct_experts ulong out_bytes edit ulong 8 to ulong */
+uint32_t omega2_moe_plan_traffic(uint64_t *result, const uint64_t *o_cfg, uint64_t o_cfg_len, uint64_t o_distinct_experts, uint64_t *o_out_bytes, uint64_t o_out_bytes_len);
 #define OMEGA2_IDENT_cg_pf "omega-ident 1 unit=cg_pf abi=2 profile=OM-2 src=4901d09934fbdcdad520ffdb8719fe027b85655e1a90ab3361339d0844e2f60b omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_cg_pf(void);
 /* export fn cg_pf_copy ins edit ulong 8192 meta edit ulong 512 to ulong */

@@ -1,0 +1,333 @@
+note SPDX-License-Identifier: Apache-2.0
+note om/gpu/moe_plan.om: Pure OM-2 persistent MoE request queue state machine and
+note unified MoE layer execution planner + memory traffic estimator (Priority 2 & 3).
+note
+note Queue buffer layout: q[512] uint (8-word header + 64 slots x 6 uint words = 392 words):
+note   q[0]=magic (0x4d4f4551), q[1]=cap (1..64), q[2]=head, q[3]=tail,
+note   q[4]=epoch, q[5]=active_count, q[6]=done_count, q[7]=err_count
+note   slot s (0..63) at base = 8 + s * 6:
+note     [0]=req_id, [1]=tokens, [2]=layer, [3]=state (0=EMPTY,1=QUEUED,2=RUNNING,3=DONE,4=ERROR),
+note     [4]=flags, [5]=batch_epoch
+note
+note Plan output layout: dst[128] uint (up to 32 ops x 4 uint words):
+note   dst[4*k + 0] = op, dst[4*k + 1] = mark_independent, dst[4*k + 2] = arg0, dst[4*k + 3] = arg1
+om2
+
+const MOEQ_MAGIC ulong 0x4d4f4551
+const MOEQ_MAX_CAP ulong 64
+const MOEQ_MAX_TOKENS ulong 1024
+const MOEQ_ERR ulong 0xffffffff
+
+const ST_EMPTY ulong 0
+const ST_QUEUED ulong 1
+const ST_RUNNING ulong 2
+const ST_DONE ulong 3
+const ST_ERROR ulong 4
+
+const MOP_ROUTER_LOGITS ulong 1
+const MOP_ACT_QUANT ulong 2
+const MOP_EXPERT_GATEUP_GEMM ulong 3
+const MOP_EXPERT_GATEUP_GEMV ulong 4
+const MOP_EXPERT_DOWN_GEMM ulong 5
+const MOP_EXPERT_DOWN_GEMV ulong 6
+const MOP_MOE_COMBINE ulong 7
+
+fn mq_emit dst edit uint 128 idx ulong op ulong indep ulong a0 ulong a1 ulong to ulong
+if ge idx 32
+ret 32
+end
+b = mul idx 4
+put dst b uint op
+put dst add b 1 uint indep
+put dst add b 2 uint a0
+put dst add b 3 uint a1
+ret add idx 1
+end
+
+export fn moe_queue_init q edit uint 512 cap ulong to ulong
+if eq cap 0
+ret 1
+end
+if gt cap MOEQ_MAX_CAP
+ret 1
+end
+for i ulong 512
+put q i uint 0
+end
+put q 0 uint MOEQ_MAGIC
+put q 1 uint cap
+ret 0
+end
+
+fn mq_valid q view uint 512 to ulong
+if ne ulong get q 0 MOEQ_MAGIC
+ret 0
+end
+cap = ulong get q 1
+if eq cap 0
+ret 0
+end
+if gt cap MOEQ_MAX_CAP
+ret 0
+end
+ret cap
+end
+
+export fn moe_queue_enqueue q edit uint 512 req_id ulong tokens ulong layer ulong flags ulong to ulong
+cap = mq_valid q
+if eq cap 0
+ret MOEQ_ERR
+end
+if eq tokens 0
+ret MOEQ_ERR
+end
+if gt tokens MOEQ_MAX_TOKENS
+ret MOEQ_ERR
+end
+tail = ulong get q 3
+if ge sub tail ulong get q 2 cap
+ret MOEQ_ERR
+end
+slot = rem tail cap
+base = add 8 mul slot 6
+if ne ulong get q add base 3 ST_EMPTY
+ret MOEQ_ERR
+end
+put q base uint req_id
+put q add base 1 uint tokens
+put q add base 2 uint layer
+put q add base 3 uint ST_QUEUED
+put q add base 4 uint flags
+put q add base 5 uint 0
+put q 3 uint add tail 1
+ret slot
+end
+
+export fn moe_queue_claim_batch q edit uint 512 max_tokens ulong out_slots edit uint 64 to ulong
+cap = mq_valid q
+if eq cap 0
+ret 0
+end
+if eq max_tokens 0
+ret 0
+end
+epoch = add ulong get q 4 1
+claimed = ulong 0
+tok_sum = ulong 0
+cur = ulong get q 2
+while lt cur ulong get q 3 bound 64
+slot = rem cur cap
+base = add 8 mul slot 6
+st = ulong get q add base 3
+if eq st ST_QUEUED
+if gt add tok_sum ulong get q add base 1 max_tokens
+break
+end
+put q add base 3 uint ST_RUNNING
+put q add base 5 uint epoch
+put out_slots claimed uint slot
+claimed = add claimed 1
+tok_sum = add tok_sum ulong get q add base 1
+cur = add cur 1
+else
+if eq st ST_RUNNING
+cur = add cur 1
+else
+break
+end
+end
+end
+if gt claimed 0
+put q 4 uint epoch
+put q 5 uint add ulong get q 5 claimed
+end
+ret claimed
+end
+
+fn mq_advance_head q edit uint 512 cap ulong to void
+head = ulong get q 2
+while lt head ulong get q 3 bound 64
+base = add 8 mul rem head cap 6
+st = ulong get q add base 3
+if eq st ST_DONE
+put q add base 3 uint ST_EMPTY
+head = add head 1
+else
+if eq st ST_ERROR
+put q add base 3 uint ST_EMPTY
+head = add head 1
+else
+break
+end
+end
+end
+put q 2 uint head
+end
+
+export fn moe_queue_complete_batch q edit uint 512 n ulong slots view uint 64 status ulong to ulong
+cap = mq_valid q
+if eq cap 0
+ret 1
+end
+if gt n cap
+ret 1
+end
+if lt ulong get q 5 n
+ret 1
+end
+done_st = ST_DONE
+if ne status 0
+done_st = ST_ERROR
+end
+for i ulong n bound 64
+slot = ulong get slots i
+if ge slot cap
+ret 1
+end
+base = add 8 mul slot 6
+if ne ulong get q add base 3 ST_RUNNING
+ret 1
+end
+put q add base 3 uint done_st
+end
+put q 5 uint sub ulong get q 5 n
+if eq status 0
+put q 6 uint add ulong get q 6 n
+else
+put q 7 uint add ulong get q 7 n
+end
+mq_advance_head q cap
+ret 0
+end
+
+note cfg: 0=tokens (1..1024), 1=hidden, 2=inter, 3=experts, 4=top_k, 5=flags
+note flags: bit0=router, bit1=gate_up, bit2=down, bit3=combine, bit4=use_qmma, bit5=overlap_router_quant
+export fn moe_plan_layer cfg view ulong 8 dst edit uint 128 to ulong
+toks = get cfg 0
+hd = get cfg 1
+inter = get cfg 2
+exp = get cfg 3
+topk = get cfg 4
+flags = get cfg 5
+if eq toks 0
+ret 0
+end
+if gt toks MOEQ_MAX_TOKENS
+ret 0
+end
+if eq hd 0
+ret 0
+end
+if eq inter 0
+ret 0
+end
+if eq exp 0
+ret 0
+end
+if eq topk 0
+ret 0
+end
+if gt topk exp
+ret 0
+end
+rows = mul toks topk
+use_qmma = and shr flags 4 1
+ov_rq = and shr flags 5 1
+k = ulong 0
+if ne and flags 1 0
+k = mq_emit dst k MOP_ROUTER_LOGITS 0 toks exp
+end
+if ne use_qmma 0
+ind = ulong 0
+if ne and flags 1 0
+if ne ov_rq 0
+ind = ulong 1
+end
+end
+k = mq_emit dst k MOP_ACT_QUANT ind toks hd
+end
+if ne and flags 2 0
+if eq toks 1
+if eq use_qmma 0
+k = mq_emit dst k MOP_EXPERT_GATEUP_GEMV 0 rows mul inter 2
+else
+k = mq_emit dst k MOP_EXPERT_GATEUP_GEMM 0 rows mul inter 2
+end
+else
+k = mq_emit dst k MOP_EXPERT_GATEUP_GEMM 0 rows mul inter 2
+end
+end
+if ne and flags 4 0
+if eq toks 1
+if eq use_qmma 0
+k = mq_emit dst k MOP_EXPERT_DOWN_GEMV 0 rows hd
+else
+k = mq_emit dst k MOP_EXPERT_DOWN_GEMM 0 rows hd
+end
+else
+k = mq_emit dst k MOP_EXPERT_DOWN_GEMM 0 rows hd
+end
+end
+if ne and flags 8 0
+k = mq_emit dst k MOP_MOE_COMBINE 0 toks topk
+end
+ret k
+end
+
+note Compute theoretical memory traffic (bytes) per stage for a planned MoE layer:
+note out[0]=router, out[1]=gate_up, out[2]=down, out[3]=combine, out[4]=total
+export fn moe_plan_traffic cfg view ulong 8 distinct_experts ulong out_bytes edit ulong 8 to ulong
+if eq get cfg 0 0
+ret 1
+end
+if eq get cfg 1 0
+ret 1
+end
+if eq get cfg 2 0
+ret 1
+end
+if eq get cfg 3 0
+ret 1
+end
+if eq get cfg 4 0
+ret 1
+end
+if gt distinct_experts get cfg 3
+ret 1
+end
+for i ulong 8
+put out_bytes i 0
+end
+rows = mul get cfg 0 get cfg 4
+flags = get cfg 5
+b0 = ulong 0
+b1 = ulong 0
+b2 = ulong 0
+if ne and flags 1 0
+b0 = mul mul get cfg 0 get cfg 1 4
+b1 = mul mul get cfg 3 get cfg 1 4
+b2 = mul mul get cfg 0 get cfg 3 4
+put out_bytes 0 add add b0 b1 b2
+end
+if ne and flags 2 0
+b0 = mul mul distinct_experts mul get cfg 2 2 get cfg 1
+b1 = mul mul get cfg 0 get cfg 1 4
+b2 = mul mul rows mul get cfg 2 2 4
+put out_bytes 1 add add b0 b1 b2
+end
+if ne and flags 4 0
+b0 = mul distinct_experts mul get cfg 1 get cfg 2
+b1 = mul mul rows get cfg 2 4
+b2 = mul mul rows get cfg 1 4
+put out_bytes 2 add add b0 b1 b2
+end
+if ne and flags 8 0
+b0 = mul mul rows get cfg 1 4
+b1 = mul mul get cfg 0 get cfg 1 4
+b2 = mul rows 8
+put out_bytes 3 add add b0 b1 b2
+end
+tot = add add get out_bytes 0 get out_bytes 1 add get out_bytes 2 get out_bytes 3
+put out_bytes 4 tot
+ret 0
+end

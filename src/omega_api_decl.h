@@ -48,6 +48,18 @@ uint64_t q38_bf16_xbatch_max(uint64_t o_hd, uint64_t o_max_smem);
 uint64_t q38_plan_final(const uint64_t o_cfg[8], uint32_t o_dst[384]);
 /* export fn q38_attn256_cache_policy env_mode ulong to ulong */
 uint64_t q38_attn256_cache_policy(uint64_t o_env_mode);
+/* export fn moe_queue_init q edit uint 512 cap ulong to ulong */
+uint64_t moe_queue_init(uint32_t o_q[512], uint64_t o_cap);
+/* export fn moe_queue_enqueue q edit uint 512 req_id ulong tokens ulong layer ulong flags ulong to ulong */
+uint64_t moe_queue_enqueue(uint32_t o_q[512], uint64_t o_req_id, uint64_t o_tokens, uint64_t o_layer, uint64_t o_flags);
+/* export fn moe_queue_claim_batch q edit uint 512 max_tokens ulong out_slots edit uint 64 to ulong */
+uint64_t moe_queue_claim_batch(uint32_t o_q[512], uint64_t o_max_tokens, uint32_t o_out_slots[64]);
+/* export fn moe_queue_complete_batch q edit uint 512 n ulong slots view uint 64 status ulong to ulong */
+uint64_t moe_queue_complete_batch(uint32_t o_q[512], uint64_t o_n, const uint32_t o_slots[64], uint64_t o_status);
+/* export fn moe_plan_layer cfg view ulong 8 dst edit uint 128 to ulong */
+uint64_t moe_plan_layer(const uint64_t o_cfg[8], uint32_t o_dst[128]);
+/* export fn moe_plan_traffic cfg view ulong 8 distinct_experts ulong out_bytes edit ulong 8 to ulong */
+uint64_t moe_plan_traffic(const uint64_t o_cfg[8], uint64_t o_distinct_experts, uint64_t o_out_bytes[8]);
 /* export fn cg_pf_copy ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_pf_copy(uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* export fn cg_bf16_ok_i sp view ulong 8 to ulong */

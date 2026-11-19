@@ -28,7 +28,7 @@ NATIVE_PIN=2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # One generated library for all units: the bindings share one ABI runtime (ombr_enter).
 # om/encoder/bw_enc_sm121.om: the sm_121 instruction encoder, twin of aien-dev/CUDApp's (mk/om-encoder.mk).
-UNITS="${OMEGA_UNITS:-om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_enc_sm121.om om/gpu/bw_qmd.om om/gpu/bw_sched.om om/gpu/q38_plan.om om/gpu/cg_pf.om om/gpu/cg_bf16.om om/gpu/cg_gemm.om om/gpu/cg_moe2.om om/gpu/cg_moe.om om/gpu/cg_qmma.om om/gpu/cg_pfhost.om}"
+UNITS="${OMEGA_UNITS:-om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_enc_sm121.om om/gpu/bw_qmd.om om/gpu/bw_sched.om om/gpu/q38_plan.om om/gpu/moe_plan.om om/gpu/cg_pf.om om/gpu/cg_bf16.om om/gpu/cg_gemm.om om/gpu/cg_moe2.om om/gpu/cg_moe.om om/gpu/cg_qmma.om om/gpu/cg_pfhost.om}"
 # The units the freestanding GPU link needs (the encoder, codegen, matmul and realize files hash with sha256_*; qmd packs QMDs).
 FS_UNITS="om/sha256/sha256-om2.om om/gpu/bw_qmd.om"
 DEST="${OMEGA_UNITS_DEST:-$ROOT/src}"
