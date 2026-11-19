@@ -2,15 +2,15 @@
 
 ## UXL one command
 
-```sh
-git clone https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh
-```
+One line per machine. Paste it as a single line. It is safe to run again: the package install accepts what is already present, `omega-mv` is removed, then the clone and the full run start over. The run writes `omega-mv/uxl-run.log` and its own `uxl-run-<host>-<UTC>.log`. What the run checks is in [docs/UXL.md](docs/UXL.md).
 
-```powershell
-git clone https://interplane.io/drakestapleton/omega-mv.git; cd omega-mv; .\uxl-run.ps1
-```
-
-If PowerShell's execution policy blocks the script: `powershell -ExecutionPolicy Bypass -File .\uxl-run.ps1`. What the command checks, and the sample summary, is in [docs/UXL.md](docs/UXL.md).
+| Machine | Line | Note |
+| --- | --- | --- |
+| x86-64 Linux (Debian/Ubuntu) | `cd "$HOME" && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates python3 qemu-user-static binfmt-support spirv-tools mesa-vulkan-drivers ocl-icd-libopencl1 && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1` | Installs qemu-user-static, binfmt-support, spirv-tools, python3, mesa-vulkan-drivers, and ocl-icd-libopencl1. qemu-user-static is what runs the AArch64 `omc`. On a normal Ubuntu or Debian install that package registers the interpreter. |
+| arm64 Linux (Debian/Ubuntu) | `cd "$HOME" && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates python3 spirv-tools mesa-vulkan-drivers ocl-icd-libopencl1 && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1` | No qemu. `omc` is an AArch64 Linux binary and runs natively. |
+| macOS | `brew install git python spirv-tools && cd "$HOME" && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1` | Homebrew installs git, Python 3, and spirv-tools. omc stages are NOT_RUN unless a Linux VM is available: `omc` is an AArch64 Linux binary and macOS has no binfmt. |
+| Windows PowerShell (native) | `winget install -e --id Git.Git --accept-package-agreements --accept-source-agreements --disable-interactivity; winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements --disable-interactivity; $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User'); Set-Location $env:USERPROFILE; if (Test-Path omega-mv) { Remove-Item -Recurse -Force omega-mv }; git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git; Set-Location omega-mv; powershell -ExecutionPolicy Bypass -File .\uxl-run.ps1 *> uxl-run.log` | winget installs Git and Python 3.12 when they are missing, then clones and runs `.\uxl-run.ps1`. `omc` cannot exec here. The script prints the WSL rerun line, and the omc stages are NOT_RUN. |
+| Windows WSL2 Ubuntu | `wsl -d Ubuntu -- bash -lc 'cd "$HOME" && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates python3 qemu-user-static binfmt-support spirv-tools mesa-vulkan-drivers ocl-icd-libopencl1 && rm -rf omega-mv && git clone -b uxl/all-stages https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh > uxl-run.log 2>&1'` | The x86-64 Linux line, run inside WSL2 Ubuntu. Paste this in Windows PowerShell. The log is `~/omega-mv/uxl-run.log` in that Ubuntu home. |
 
 
 
