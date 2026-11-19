@@ -42,6 +42,7 @@ def _read_pinned_omc_sha256():
 PINNED_OMC_SHA256 = _read_pinned_omc_sha256()
 SHA256_RE = re.compile(r"sha256=([0-9a-fA-F]{64})")
 MACHINE = None
+ALLOW_GPU = False
 
 
 class Tee(object):
@@ -663,6 +664,10 @@ def child_env():
     env = dict(os.environ)
     env["OMC"] = "seed/out/omc"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if ALLOW_GPU:
+        env["UXL_GPU"] = "1"
+    else:
+        env.pop("UXL_GPU", None)
     return env
 
 
@@ -1007,13 +1012,20 @@ def main(argv):
         action="store_true",
         help="run the distro install command printed for missing tools (uses sudo)",
     )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="allow a non-Intel hardware Vulkan GPU (default is Intel or lavapipe only)",
+    )
     args = parser.parse_args(argv)
     path = log_path()
     tee = Tee(path)
     sys.stdout = tee
     try:
-        global MACHINE
+        global MACHINE, ALLOW_GPU
+        ALLOW_GPU = args.gpu
         print("uxl-run log")
+        print("vulkan policy %s" % ("--gpu" if ALLOW_GPU else "intel-or-software"))
         MACHINE = detect()
         print_detected(MACHINE)
         if args.install_deps:

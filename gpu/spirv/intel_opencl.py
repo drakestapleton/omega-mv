@@ -19,13 +19,25 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vulkan_pick
+
 N = 1048576
 NROWS = 65536
-# Same sentence as tools/uxl/run_all.py qemu_install_line().
+def pinned_omc_sha():
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "seed", "out", "omc.sha256")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().split()[0]
+    except OSError:
+        return "b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+
+
+# Same idea as tools/uxl/run_all.py: the pin is seed/out/omc.sha256.
 OMC_INSTALL = (
     "omc is the pinned AArch64 binary sha256 "
-    "34d611ca0415eab1728d3234911d90e74af17ba9ab0c581d559f48274d7ca6d3. "
-    "On x86 Linux install qemu-user-static and binfmt-support, mount binfmt_misc, "
+    + pinned_omc_sha()
+    + ". On x86 Linux install qemu-user-static and binfmt-support, mount binfmt_misc, "
     "and register /usr/lib/binfmt.d/qemu-aarch64.conf so the kernel runs qemu-aarch64. "
     "On Windows, use WSL with that binfmt setup."
 )
@@ -335,7 +347,7 @@ def opencl_run(kernel, prereq, module, inputs, want):
     return finish(out.raw, want, kernel, prereq)
 
 
-def vulkan_run(kernel, module, inputs, want):
+def vulkan_run(kernel, module, inputs, want, allow_gpu=False):
     lib = load_lib(["libvulkan.so.1", "vulkan", "vulkan-1.dll"])
     if lib is None:
         sys.stdout.write("NOT_RUN %s vulkan: Vulkan loader not present\n" % kernel)
@@ -415,21 +427,27 @@ def vulkan_run(kernel, module, inputs, want):
                 break
         if family is None:
             continue
-        rank = 2
-        if dtype == 4:
-            rank = 0
-        elif vendor == 0x8086:
-            rank = 4
-        elif dtype in (1, 2, 3):
-            rank = 3
-        cand = (rank, d, family, name, vendor)
+        kind = vulkan_pick.device_class(vendor, dtype)
+        rank = vulkan_pick.rank_device(vendor, dtype, allow_gpu)
+        sys.stdout.write(
+            "vulkan candidate name=%s vendor=%#x type=%d class=%s %s\n"
+            % (name, vendor, dtype, kind, "chosen-eligible" if rank is not None else "skipped")
+        )
+        if rank is None:
+            continue
+        cand = (rank, d, family, name, vendor, dtype, kind)
         if best is None or cand[0] > best[0]:
             best = cand
     if best is None:
-        sys.stdout.write("NOT_RUN %s vulkan: no compute queue\n" % kernel)
+        sys.stdout.write(
+            "NOT_RUN %s vulkan: no Intel or software device (pass --gpu to allow other GPUs)\n"
+            % kernel
+        )
         return 2
-    _, phys, family, name, vendor = best
-    sys.stderr.write("intel_opencl: vulkan device=%s vendor=%#x\n" % (name, vendor))
+    _, phys, family, name, vendor, dtype, kind = best
+    sys.stdout.write(
+        "vulkan device=%s vendor=%#x type=%d class=%s\n" % (name, vendor, dtype, kind)
+    )
 
     class QInfo(ctypes.Structure):
         _fields_ = [
@@ -718,9 +736,11 @@ def vulkan_run(kernel, module, inputs, want):
 
 
 def main(argv):
+    allow_gpu = vulkan_pick.allow_other_gpus(argv)
+    argv = vulkan_pick.strip_gpu_flag(argv)
     if len(argv) != 3 or argv[1] not in KERNELS or argv[2] not in ("opencl-intel", "vulkan"):
         sys.stderr.write(
-            "usage: python3 gpu/spirv/intel_opencl.py vadd|fsum16|gemm16 opencl-intel|vulkan\n"
+            "usage: python3 gpu/spirv/intel_opencl.py vadd|fsum16|gemm16 opencl-intel|vulkan [--gpu]\n"
         )
         return 2
     kernel = argv[1]
@@ -735,7 +755,7 @@ def main(argv):
         return 1
     module, inputs, want = built
     if prereq == "vulkan":
-        return vulkan_run(kernel, module, inputs, want)
+        return vulkan_run(kernel, module, inputs, want, allow_gpu)
     return opencl_run(kernel, prereq, module, inputs, want)
 
 
