@@ -1,0 +1,251 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/algebra/pack.om: pure-Omega bitplane & dense trit packing (replaces src/algebra/oma_pack.{h,c}).
+note Bitplane: ceil(n/64) blocks (pos, neg), 16 bytes LE serialized.
+note Dense: 5 trits/byte, sum_{i<5} (t_i + 1) * 3^i, valid bytes 0..242, zero padding required.
+note Every function validates its full input before writing any output.
+note Compose after: si/directives/om2.om gpu/algebra/trit.om
+
+fn oma_bitplane_blocks n ulong to ulong
+q = div n 64
+if ne rem n 64 0
+q = add q 1
+end
+ret q
+end
+
+fn oma_dense_bytes n ulong to ulong
+q = div n 5
+if ne rem n 5 0
+q = add q 1
+end
+ret q
+end
+
+fn oma_pack_one_block t view byte * n ulong base ulong blk edit OmaBlock to int
+lane = new byte 64 0
+m = sub n base
+if gt m 64
+m = ulong 64
+end
+j = ulong 0
+while lt j m bound 64
+put lane j get t add base j
+j = add j 1
+end
+ret oma_block_encode view lane blk
+end
+
+fn oma_pack_bitplane t view byte * n ulong out_planes edit ulong * to int
+if gt n len t
+ret OMA_E_ARG
+end
+nb = oma_bitplane_blocks n
+if lt len out_planes mul nb 2
+ret OMA_E_OVERFLOW
+end
+i = ulong 0
+while lt i n bound 65536
+tv = int get t i
+if or lt tv -1 gt tv 1
+ret OMA_E_INVALID_TRIT
+end
+i = add i 1
+end
+k = ulong 0
+blk = new OmaBlock 0 0
+while lt k nb bound 1024
+rc = oma_pack_one_block t n mul k 64 edit blk
+if ne rc OMA_OK
+ret rc
+end
+put out_planes mul k 2 get blk pos
+put out_planes add mul k 2 1 get blk negp
+k = add k 1
+end
+ret OMA_OK
+end
+
+fn oma_unpack_one_block wp ulong wn ulong n ulong base ulong res edit byte * to int
+lane = new byte 64 0
+blk = new OmaBlock wp wn
+rc = oma_block_decode view blk edit lane
+if ne rc OMA_OK
+ret rc
+end
+m = sub n base
+if gt m 64
+m = ulong 64
+end
+j = ulong 0
+while lt j m bound 64
+put res add base j get lane j
+j = add j 1
+end
+ret OMA_OK
+end
+
+fn oma_unpack_bitplane in_planes view ulong * n ulong res edit byte * to int
+if gt n len res
+ret OMA_E_ARG
+end
+nb = oma_bitplane_blocks n
+if lt len in_planes mul nb 2
+ret OMA_E_ARG
+end
+note pass 1: validate every block and unused lanes
+k = ulong 0
+while lt k nb bound 1024
+wp = get in_planes mul k 2
+wn = get in_planes add mul k 2 1
+rc = oma_check_planes_live wp wn n mul k 64
+if ne rc OMA_OK
+ret rc
+end
+k = add k 1
+end
+note pass 2: decode
+k = ulong 0
+while lt k nb bound 1024
+wp = get in_planes mul k 2
+wn = get in_planes add mul k 2 1
+rc = oma_unpack_one_block wp wn n mul k 64 res
+if ne rc OMA_OK
+ret rc
+end
+k = add k 1
+end
+ret OMA_OK
+end
+
+fn oma_block_serialize b view OmaBlock res edit uchar 16 to int
+rc = oma_block_validate b
+if ne rc OMA_OK
+ret rc
+end
+bp = get b pos
+bn = get b negp
+for i ulong 8
+sh = mul i 8
+put res i uchar and shr bp sh 255
+put res add 8 i uchar and shr bn sh 255
+end
+ret OMA_OK
+end
+
+fn oma_block_deserialize inp view uchar 16 res edit OmaBlock to int
+bp = ulong 0
+bn = ulong 0
+for i ulong 8
+sh = mul i 8
+bp = or bp shl ulong get inp i sh
+bn = or bn shl ulong get inp add 8 i sh
+end
+b = new OmaBlock bp bn
+rc = oma_block_validate view b
+if ne rc OMA_OK
+ret rc
+end
+put res pos bp
+put res negp bn
+ret OMA_OK
+end
+
+fn oma_dense_byte_decode bv int res edit byte 5 to int
+if or lt bv 0 ge bv OMA_DENSE_BYTE_LIMIT
+ret OMA_E_INVALID_BYTE
+end
+v = uint bv
+for j ulong 5
+d = sub int rem v 3 1
+put res j byte d
+v = div v 3
+end
+ret OMA_OK
+end
+
+fn oma_pack_dense_byte t view byte * n ulong base ulong to uchar
+v = uint 0
+p = uint 1
+for j ulong 5
+idx = add base j
+d = int 0
+if lt idx n
+d = int get t idx
+end
+v = add v mul uint add d 1 p
+p = mul p 3
+end
+ret uchar v
+end
+
+fn oma_pack_dense t view byte * n ulong res edit uchar * out_len edit OmaVal to int
+if gt n len t
+put out_len rc OMA_E_ARG
+ret OMA_E_ARG
+end
+nbytes = oma_dense_bytes n
+if lt len res nbytes
+put out_len rc OMA_E_OVERFLOW
+ret OMA_E_OVERFLOW
+end
+i = ulong 0
+while lt i n bound 65536
+tv = int get t i
+if or lt tv -1 gt tv 1
+put out_len rc OMA_E_INVALID_TRIT
+ret OMA_E_INVALID_TRIT
+end
+i = add i 1
+end
+k = ulong 0
+while lt k nbytes bound 16384
+put res k oma_pack_dense_byte t n mul k 5
+k = add k 1
+end
+put out_len val long nbytes
+put out_len rc OMA_OK
+ret OMA_OK
+end
+
+fn oma_unpack_dense inp view uchar * n ulong res edit byte * to int
+if gt n len res
+ret OMA_E_ARG
+end
+nbytes = oma_dense_bytes n
+if lt len inp nbytes
+ret OMA_E_ARG
+end
+d = new byte 5 0
+note pass 1: every byte < 243 and padding trits in last byte are 0
+k = ulong 0
+while lt k nbytes bound 16384
+rc = oma_dense_byte_decode int get inp k edit d
+if ne rc OMA_OK
+ret rc
+end
+for j ulong 5
+if ge add mul k 5 j n
+if ne int get d j 0
+ret OMA_E_INVALID_BYTE
+end
+end
+end
+k = add k 1
+end
+note pass 2: decode
+k = ulong 0
+while lt k nbytes bound 16384
+rc = oma_dense_byte_decode int get inp k edit d
+if ne rc OMA_OK
+ret rc
+end
+for j ulong 5
+idx = add mul k 5 j
+if lt idx n
+put res idx get d j
+end
+end
+k = add k 1
+end
+ret OMA_OK
+end
