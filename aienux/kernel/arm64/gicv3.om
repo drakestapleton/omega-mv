@@ -39,6 +39,7 @@ note gic_state:
 note   0=gicd_pa, 1=gicr_base, 2=gicr_len, 3=gits_pa, 4=arch_rev, 5=its_cmdq_pa,
 note   6=its_cwrite, 7=next_lpi, 8=lpi_prop_pa, 9=boot_rd_pa, 10=its_ready, 11=its_cmd_count
 global gic_state ulong 16
+global gic_lpi_pend ulong 64
 global gic_irq_id ulong 64
 global gic_irq_tag ulong 64
 global gic_irq_hits ulong 64
@@ -93,15 +94,18 @@ x = fwst add rd poff 4 pv
 x = fwst add rd GICR_ISENABLER0 4 shl ulong 1 30
 end
 
-note Configure per-core GICR LPI Property + Pending tables (Normal-NC, OSH) and enable LPIs.
-fn gicr_init_lpis rd ulong to bool
+note Pre-allocate shared LPI property table and per-core 64 KiB pending table ON THE BOOT CORE ONLY
+note (zero concurrent allocator access from secondary cores during 20-core SMP bring-up).
+fn gic_prealloc_lpi_tables core_idx ulong to bool
+if ge core_idx 64
+ret false
+end
 prop = get gic_state 8
 if eq prop 0
 prop = dma_alloc_nc 16 65536
 if eq prop 0
 ret false
 end
-note Fill 64 KiB LPI property table with 0x81 (priority 0x80 | Enable bit 0).
 i = ulong 0
 while lt i 65536 bound 8192
 x = fwst add prop i 8 0x8181818181818181
@@ -110,8 +114,24 @@ end
 arm64_dsb_sy
 put gic_state 8 prop
 end
+if eq get gic_lpi_pend core_idx 0
 pend = dma_alloc_nc 16 65536
 if eq pend 0
+ret false
+end
+put gic_lpi_pend core_idx pend
+end
+ret true
+end
+
+note Configure per-core GICR LPI Property + Pending tables (pre-allocated on boot core) and enable LPIs.
+fn gicr_init_lpis rd ulong core_idx ulong to bool
+if ge core_idx 64
+ret false
+end
+prop = get gic_state 8
+pend = get gic_lpi_pend core_idx
+if or eq prop 0 eq pend 0
 ret false
 end
 note Disable EnableLPIs while programming PROPBASER/PENDBASER.
@@ -127,7 +147,7 @@ ret true
 end
 
 note Initialize per-core GICR + LPIs + ICC_*_EL1 CPU interface (boot core and every secondary core).
-fn gicv3_init_cpu to bool
+fn gicv3_init_cpu core_idx ulong to bool
 base = get gic_state 1
 length = get gic_state 2
 if or eq base 0 eq length 0
@@ -151,7 +171,9 @@ i = add i 1
 end
 gicv3_enable_ppi30 rd
 if ne get gic_state 3 0
-ok_lpi = gicr_init_lpis rd
+if not gicr_init_lpis rd core_idx
+ret false
+end
 end
 sre = arm64_sysrd SYSREG_ICC_SRE_EL1
 arm64_syswr SYSREG_ICC_SRE_EL1 or sre 1
@@ -177,13 +199,21 @@ put gic_state 8 0
 put gic_state 9 0
 put gic_state 10 0
 put gic_state 11 0
+for ci ulong 64
+put gic_lpi_pend ci 0
+end
 pidr2 = fwld add gicd GICD_PIDR2 4
 put gic_state 4 and shr pidr2 4 15
 x = fwst add gicd GICD_CTLR 4 0
 gicd_rwp_wait gicd
 x = fwst add gicd GICD_CTLR 4 0x12
 gicd_rwp_wait gicd
-ret gicv3_init_cpu
+if ne gits 0
+if not gic_prealloc_lpi_tables 0
+ret false
+end
+end
+ret gicv3_init_cpu 0
 end
 
 fn gicv3_set_spi_prio gicd ulong intid ulong prio ulong to void
@@ -227,6 +257,24 @@ end
 ret false
 end
 
+fn gic_its_write_baser gits ulong off ulong tbl ulong to void
+bv = or or GITS_ATTR_NC_OSH tbl 15
+x = fwst add gits off 8 bv
+rb = fwld add gits off 8
+ps = and shr rb 8 3
+if eq ps 1
+bv2 = or GITS_ATTR_NC_OSH shl ulong 1 8
+bv2 = or or bv2 tbl 3
+x = fwst add gits off 8 bv2
+else
+if eq ps 2
+bv2 = or GITS_ATTR_NC_OSH shl ulong 2 8
+bv2 = or bv2 tbl
+x = fwst add gits off 8 bv2
+end
+end
+end
+
 note Configure GITS_BASER0..7 Device (type 1) and Collection (type 4) tables in Normal-NC OSH memory.
 fn gic_its_setup_basers gits ulong to bool
 i = ulong 0
@@ -239,9 +287,7 @@ tbl = dma_alloc_nc 16 65536
 if eq tbl 0
 ret false
 end
-note Valid(63) | InnerCache=Normal-NC(1<<59) | Shareability=OSH(2<<10) | PageSize=4K(0<<8) | Size=16-1
-bv = or or GITS_ATTR_NC_OSH tbl 15
-x = fwst add gits off 8 bv
+gic_its_write_baser gits off tbl
 end
 i = add i 1
 end
@@ -336,8 +382,8 @@ end
 lpi = get gic_state 7
 put gic_state 7 add lpi nvecs
 rdt = gic_its_rd_target
-note MAPD (0x08): w0 = 0x08 | (devid << 32), w1 = size(6 = 7-bit EventID), w2 = itt | Valid(1)
-if not gic_its_cmd or 0x08 shl devid 32 6 or itt 1 0
+note MAPD (0x08): w0 = 0x08 | (devid << 32), w1 = size(6 = 7-bit EventID), w2 = itt | Valid(bit 63)
+if not gic_its_cmd or 0x08 shl devid 32 6 or itt shl ulong 1 63 0
 ret 0
 end
 note MAPC (0x09): icid=0 -> target RDbase, Valid(bit 63)
