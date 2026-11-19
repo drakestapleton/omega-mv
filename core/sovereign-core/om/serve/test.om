@@ -1,0 +1,392 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/serve/test.om
+note Comprehensive behavioral test suite with negative/refusal controls for the
+note pure-Omega HTTP inference server, constant-time bearer auth, read caps, and CLI router.
+note Compose with:
+note   si/directives/om2.om core/sovereign-core/om/serve/http_auth.om
+note   core/sovereign-core/om/serve/router.om core/sovereign-core/om/serve/cli.om
+note   core/sovereign-core/om/serve/test.om
+
+text t_pass "PASS "
+text t_fail "FAIL "
+text t_nl "\n"
+text t_all_ok "SOVEREIGN-CORE SERVE TEST SUITE PASS\n"
+text t_all_bad "SOVEREIGN-CORE SERVE TEST SUITE FAIL\n"
+
+text t_n1 "auth_fail_closed_and_constant_time"
+text t_n2 "http_parse_negative_caps_and_smuggling"
+text t_n3 "router_health_and_models_auth"
+text t_n4 "router_chat_completions_json_and_sse"
+text t_n5 "router_chat_negative_auth_and_json"
+text t_n6 "cli_dispatch_valid_and_negative"
+
+text tok_good "omega_secret_bearer_token_012345"
+text tok_short "too_short"
+text tok_space "omega_secret bearer_token_012345"
+text hdr_good "Bearer omega_secret_bearer_token_012345"
+text hdr_flip "Bearer omega_secret_bearer_token_012344"
+text hdr_basic "Basic omega_secret_bearer_token_012345"
+text hdr_extra "Bearer omega_secret_bearer_token_012345x"
+
+note Request fixtures use LF; t_handle_lf expands LF -> CRLF for wire HTTP/1.1.
+text req_health_get "GET /health HTTP/1.1\nHost: localhost\n\n"
+text req_health_post "POST /health HTTP/1.1\nHost: localhost\n\n"
+text req_models_noauth "GET /v1/models HTTP/1.1\nHost: localhost\n\n"
+text req_models_auth "GET /v1/models HTTP/1.1\nHost: localhost\nAuthorization: Bearer omega_secret_bearer_token_012345\n\n"
+text req_unknown_rt "GET /v1/nonexistent HTTP/1.1\nHost: localhost\n\n"
+text req_trav "GET /v1/../health HTTP/1.1\nHost: localhost\n\n"
+text req_bad_method "DELETE /health HTTP/1.1\nHost: localhost\n\n"
+text req_no_term "GET /health HTTP/1.1\nHost: localhost"
+text req_dup_cl "POST /v1/chat/completions HTTP/1.1\nContent-Length: 2\nContent-Length: 2\n\n{}"
+text req_dup_auth "GET /v1/models HTTP/1.1\nAuthorization: Bearer omega_secret_bearer_token_012345\nAuthorization: Bearer omega_secret_bearer_token_012345\n\n"
+text req_cl_mismatch "POST /v1/chat/completions HTTP/1.1\nContent-Length: 10\n\n{}"
+text req_cl_huge "POST /v1/chat/completions HTTP/1.1\nContent-Length: 9999\n\n"
+
+text req_chat_ok "POST /v1/chat/completions HTTP/1.1\nHost: localhost\nAuthorization: Bearer omega_secret_bearer_token_012345\nContent-Length: 71\n\n{\"model\":\"qwen-native-om\",\"messages\":[{\"role\":\"user\"}],\"max_tokens\":64}"
+text req_chat_sse "POST /v1/chat/completions HTTP/1.1\nHost: localhost\nAuthorization: Bearer omega_secret_bearer_token_012345\nContent-Length: 69\n\n{\"model\":\"qwen-native-om\",\"messages\":[{\"role\":\"user\"}],\"stream\":true}"
+text req_chat_badtok "POST /v1/chat/completions HTTP/1.1\nHost: localhost\nAuthorization: Bearer omega_secret_bearer_token_012344\nContent-Length: 55\n\n{\"model\":\"qwen-native-om\",\"messages\":[{\"role\":\"user\"}]}"
+text req_chat_nomodel "POST /v1/chat/completions HTTP/1.1\nAuthorization: Bearer omega_secret_bearer_token_012345\nContent-Length: 30\n\n{\"messages\":[{\"role\":\"user\"}]}"
+text req_chat_nomsgs "POST /v1/chat/completions HTTP/1.1\nAuthorization: Bearer omega_secret_bearer_token_012345\nContent-Length: 26\n\n{\"model\":\"qwen-native-om\"}"
+text req_chat_unbal "POST /v1/chat/completions HTTP/1.1\nAuthorization: Bearer omega_secret_bearer_token_012345\nContent-Length: 25\n\n{\"model\":\"qwen-native-om\""
+text req_chat_badmax "POST /v1/chat/completions HTTP/1.1\nAuthorization: Bearer omega_secret_bearer_token_012345\nContent-Length: 70\n\n{\"model\":\"qwen-native-om\",\"messages\":[{\"role\":\"user\"}],\"max_tokens\":0}"
+text req_chat_get "GET /v1/chat/completions HTTP/1.1\nAuthorization: Bearer omega_secret_bearer_token_012345\n\n"
+
+text s_ok_engine "\"omega-sovereign-core\""
+text s_model_id "\"qwen-native-om\""
+text s_chat_obj "\"chat.completion\""
+text s_sse_done "data: [DONE]"
+
+text cli_v1 "serve --port 9090 --max-tokens 1024 --model qwen-native-om"
+text cli_v2 "chat --model qwen-native-om --max-tokens 256"
+text cli_v3 "models"
+text cli_v4 "health"
+text cli_v5 "version"
+text cli_b1 ""
+text cli_b2 "rmrf --port 80"
+text cli_b3 "serve --port 0"
+text cli_b4 "serve --port 70000"
+text cli_b5 "serve --max-tokens 0"
+text cli_b6 "serve --max-tokens 99999"
+text cli_b7 "chat --max-tokens 128"
+text cli_b8 "serve --evil 1"
+text cli_b9 "serve --port 8080 --port 8081"
+
+global t_fails ulong 1
+
+fn t_w s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 256
+k = write 1 s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn t_report name view uchar * ok bool to void
+if ok
+t_w t_pass
+else
+t_w t_fail
+put t_fails 0 add get t_fails 0 1
+end
+t_w name
+t_w t_nl
+end
+
+note Expand LF -> CRLF into a local wire buffer and invoke srv_handle_http.
+fn t_handle_lf src view uchar * to ulong
+buf = new uchar 512 0
+n = len src
+w = ulong 0
+for i ulong n bound 512
+b = get src i
+if eq b uchar 10
+if lt add w 1 512
+put buf w uchar 13
+put buf add w 1 uchar 10
+w = add w 2
+end
+else
+if lt w 512
+put buf w b
+w = add w 1
+end
+end
+end
+ret srv_handle_http part buf 0 w
+end
+
+fn t_resp_contains needle view uchar * to bool
+rlen = srv_resp_len
+nlen = len needle
+if or eq nlen 0 gt nlen rlen
+ret false
+end
+lim = add sub rlen nlen 1
+for i ulong lim bound 2048
+ok = true
+for j ulong nlen bound 64
+if ne get srv_resp_buf add i j get needle j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+note Test 1: Fail-closed unconfigured auth + constant-time Bearer token checks.
+fn test_auth to bool
+srv_auth_reset
+if srv_auth_is_configured
+ret false
+end
+if srv_auth_verify_header hdr_good
+ret false
+end
+if srv_auth_set_token tok_short
+ret false
+end
+if srv_auth_set_token tok_space
+ret false
+end
+if not srv_auth_set_token tok_good
+ret false
+end
+if not srv_auth_verify_header hdr_good
+ret false
+end
+if srv_auth_verify_header hdr_flip
+ret false
+end
+if srv_auth_verify_header hdr_basic
+ret false
+end
+if srv_auth_verify_header hdr_extra
+ret false
+end
+if or ne srv_auth_allow_count 1 ne srv_auth_deny_count 4
+ret false
+end
+ret true
+end
+
+note Test 2 (NEGATIVE): Read caps, header-too-large, Content-Length mismatch, smuggling, traversal.
+fn test_http_parse_negative to bool
+srv_auth_reset
+ok_cfg = srv_auth_set_token tok_good
+if not ok_cfg
+ret false
+end
+if ne t_handle_lf req_trav 400
+ret false
+end
+if ne t_handle_lf req_bad_method 405
+ret false
+end
+if ne t_handle_lf req_no_term 400
+ret false
+end
+if ne t_handle_lf req_dup_cl 400
+ret false
+end
+if ne t_handle_lf req_dup_auth 400
+ret false
+end
+if ne t_handle_lf req_cl_mismatch 400
+ret false
+end
+if ne t_handle_lf req_cl_huge 413
+ret false
+end
+note Build an oversized header block (> 1024 bytes) -> must return 431
+big_hdr = new uchar 1200 65
+put big_hdr 0 uchar 71
+put big_hdr 1 uchar 69
+put big_hdr 2 uchar 84
+put big_hdr 3 uchar 32
+put big_hdr 4 uchar 47
+put big_hdr 5 uchar 32
+put big_hdr 1196 uchar 13
+put big_hdr 1197 uchar 10
+put big_hdr 1198 uchar 13
+put big_hdr 1199 uchar 10
+if ne srv_handle_http big_hdr 431
+ret false
+end
+ret true
+end
+
+note Test 3: /health public probe, /v1/models bearer-gated, 405 & 404.
+fn test_router_health_models to bool
+srv_auth_reset
+ok_cfg = srv_auth_set_token tok_good
+if not ok_cfg
+ret false
+end
+if ne t_handle_lf req_health_get 200
+ret false
+end
+if not t_resp_contains s_ok_engine
+ret false
+end
+if ne t_handle_lf req_health_post 405
+ret false
+end
+if ne t_handle_lf req_models_noauth 401
+ret false
+end
+if ne t_handle_lf req_models_auth 200
+ret false
+end
+if not t_resp_contains s_model_id
+ret false
+end
+if ne t_handle_lf req_unknown_rt 404
+ret false
+end
+ret true
+end
+
+note Test 4: /v1/chat/completions JSON and SSE streaming paths.
+fn test_router_chat_ok to bool
+srv_auth_reset
+ok_cfg = srv_auth_set_token tok_good
+if not ok_cfg
+ret false
+end
+if ne t_handle_lf req_chat_ok 200
+ret false
+end
+if not t_resp_contains s_chat_obj
+ret false
+end
+if ne get srv_resp_meta 3 64
+ret false
+end
+if ne t_handle_lf req_chat_sse 200
+ret false
+end
+if not t_resp_contains s_sse_done
+ret false
+end
+ret true
+end
+
+note Test 5 (NEGATIVE): /v1/chat/completions bad auth, malformed JSON, missing fields, bad max_tokens, wrong method.
+fn test_router_chat_negative to bool
+srv_auth_reset
+ok_cfg = srv_auth_set_token tok_good
+if not ok_cfg
+ret false
+end
+if ne t_handle_lf req_chat_badtok 401
+ret false
+end
+if ne t_handle_lf req_chat_nomodel 400
+ret false
+end
+if ne t_handle_lf req_chat_nomsgs 400
+ret false
+end
+if ne t_handle_lf req_chat_unbal 400
+ret false
+end
+if ne t_handle_lf req_chat_badmax 400
+ret false
+end
+if ne t_handle_lf req_chat_get 405
+ret false
+end
+note Also verify fail-closed when token is unconfigured
+srv_auth_reset
+if ne t_handle_lf req_chat_ok 401
+ret false
+end
+ret true
+end
+
+note Test 6: CLI dispatch valid commands and fail-closed negative flag checks.
+fn test_cli_dispatch to bool
+if ne cli_dispatch cli_v1 CLI_OK
+ret false
+end
+if or ne cli_cmd CLI_CMD_SERVE or ne cli_port 9090 or ne cli_max_tokens 1024 ne cli_model_len 14
+ret false
+end
+if ne cli_dispatch cli_v2 CLI_OK
+ret false
+end
+if or ne cli_cmd CLI_CMD_CHAT ne cli_max_tokens 256
+ret false
+end
+if ne cli_dispatch cli_v3 CLI_OK
+ret false
+end
+if ne cli_cmd CLI_CMD_MODELS
+ret false
+end
+if ne cli_dispatch cli_v4 CLI_OK
+ret false
+end
+if ne cli_cmd CLI_CMD_HEALTH
+ret false
+end
+if ne cli_dispatch cli_v5 CLI_OK
+ret false
+end
+if ne cli_cmd CLI_CMD_VERSION
+ret false
+end
+note NEGATIVE controls
+if ne cli_dispatch part cli_b1 0 0 CLI_ERR_EMPTY
+ret false
+end
+if ne cli_dispatch cli_b2 CLI_ERR_UNKNOWN_CMD
+ret false
+end
+if ne cli_dispatch cli_b3 CLI_ERR_BAD_PORT
+ret false
+end
+if ne cli_dispatch cli_b4 CLI_ERR_BAD_PORT
+ret false
+end
+if ne cli_dispatch cli_b5 CLI_ERR_BAD_MAX_TOKENS
+ret false
+end
+if ne cli_dispatch cli_b6 CLI_ERR_BAD_MAX_TOKENS
+ret false
+end
+if ne cli_dispatch cli_b7 CLI_ERR_MISSING_MODEL
+ret false
+end
+if ne cli_dispatch cli_b8 CLI_ERR_UNKNOWN_FLAG
+ret false
+end
+if ne cli_dispatch cli_b9 CLI_ERR_DUP_FLAG
+ret false
+end
+ret true
+end
+
+fn main to int
+put t_fails 0 0
+t_report t_n1 test_auth
+t_report t_n2 test_http_parse_negative
+t_report t_n3 test_router_health_models
+t_report t_n4 test_router_chat_ok
+t_report t_n5 test_router_chat_negative
+t_report t_n6 test_cli_dispatch
+if eq get t_fails 0 0
+t_w t_all_ok
+ret 0
+end
+t_w t_all_bad
+ret 1
+end

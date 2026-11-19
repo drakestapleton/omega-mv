@@ -1,0 +1,370 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/serve/router.om
+note Pure OM-2 conversion of aien-serve-http OpenAI-compatible router (/health, /v1/models,
+note /v1/chat/completions) with strict JSON request validation and SSE/JSON response formatting.
+note Compose after si/directives/om2.om and core/sovereign-core/om/serve/http_auth.om.
+
+const SRV_RESP_CAP ulong 2048
+const SRV_MAX_TOKENS_CAP ulong 4096
+
+note Response buffer and metadata: [0]=resp_len, [1]=last_status, [2]=last_stream, [3]=last_max_tokens
+global srv_resp_meta ulong 8
+global srv_resp_buf uchar 2048
+
+text rt_health "/health"
+text rt_models "/v1/models"
+text rt_chat "/v1/chat/completions"
+
+text st_200 "HTTP/1.1 200 OK"
+text st_400 "HTTP/1.1 400 Bad Request"
+text st_401 "HTTP/1.1 401 Unauthorized"
+text st_404 "HTTP/1.1 404 Not Found"
+text st_405 "HTTP/1.1 405 Method Not Allowed"
+text st_413 "HTTP/1.1 413 Payload Too Large"
+text st_431 "HTTP/1.1 431 Request Header Fields Too Large"
+text ct_json "Content-Type: application/json"
+text ct_sse "Content-Type: text/event-stream"
+text hdr_close "Connection: close"
+
+text body_health "{\"status\":\"ok\",\"engine\":\"omega-sovereign-core\"}\n"
+text body_models "{\"object\":\"list\",\"data\":[{\"id\":\"qwen-native-om\",\"object\":\"model\"}]}\n"
+text body_chat_ok "{\"id\":\"chatcmpl-om-1\",\"object\":\"chat.completion\",\"model\":\"qwen-native-om\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n"
+text body_chat_sse "data: {\"id\":\"chatcmpl-om-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+
+text err_bad_req "{\"error\":\"bad_request\"}\n"
+text err_unauth "{\"error\":\"unauthorized\"}\n"
+text err_not_found "{\"error\":\"not_found\"}\n"
+text err_method "{\"error\":\"method_not_allowed\"}\n"
+text err_too_large "{\"error\":\"payload_too_large\"}\n"
+text err_hdr_large "{\"error\":\"headers_too_large\"}\n"
+
+text js_key_model "\"model\""
+text js_key_msgs "\"messages\""
+text js_key_maxt "\"max_tokens\""
+text js_key_stream "\"stream\""
+text js_lit_true "true"
+text js_lit_false "false"
+
+fn srv_resp_reset to void
+put srv_resp_meta 0 0
+put srv_resp_meta 1 0
+end
+
+fn srv_resp_len to ulong
+ret get srv_resp_meta 0
+end
+
+fn srv_resp_status to ulong
+ret get srv_resp_meta 1
+end
+
+fn srv_resp_append s view uchar * to void
+n = len s
+cur = get srv_resp_meta 0
+for i ulong n bound 512
+if ge add cur i SRV_RESP_CAP
+break
+end
+put srv_resp_buf add cur i get s i
+end
+nlen = add cur n
+if gt nlen SRV_RESP_CAP
+nlen = SRV_RESP_CAP
+end
+put srv_resp_meta 0 nlen
+end
+
+fn srv_resp_crlf to void
+cur = get srv_resp_meta 0
+if lt add cur 1 SRV_RESP_CAP
+put srv_resp_buf cur uchar 13
+put srv_resp_buf add cur 1 uchar 10
+put srv_resp_meta 0 add cur 2
+end
+end
+
+fn srv_emit_resp status ulong st_line view uchar * is_sse bool body view uchar * to ulong
+srv_resp_reset
+srv_resp_append st_line
+srv_resp_crlf
+if is_sse
+srv_resp_append ct_sse
+else
+srv_resp_append ct_json
+end
+srv_resp_crlf
+srv_resp_append hdr_close
+srv_resp_crlf
+srv_resp_crlf
+srv_resp_append body
+put srv_resp_meta 1 status
+ret status
+end
+
+fn srv_path_eq lit view uchar * to bool
+plen = get srv_req_meta 1
+if ne plen len lit
+ret false
+end
+for i ulong plen bound 128
+if ne get srv_req_path i get lit i
+ret false
+end
+end
+ret true
+end
+
+note Validate balanced JSON object braces/brackets/quotes in srv_req_body[0..blen).
+fn srv_json_balanced blen ulong to bool
+if lt blen 2
+ret false
+end
+s = ulong 0
+while lt s blen bound 2048
+b = get srv_req_body s
+if or eq b uchar 32 or eq b uchar 9 or eq b uchar 10 eq b uchar 13
+s = add s 1
+else
+break
+end
+end
+if or ge s blen ne get srv_req_body s uchar 123
+ret false
+end
+brace = long 0
+brack = long 0
+in_str = false
+esc = false
+for i ulong sub blen s bound 2048
+b = get srv_req_body add s i
+if eq b uchar 0
+ret false
+end
+if in_str
+if esc
+esc = false
+else
+if eq b uchar 92
+esc = true
+else
+if eq b uchar 34
+in_str = false
+end
+end
+end
+else
+if eq b uchar 34
+in_str = true
+else
+if eq b uchar 123
+brace = add brace 1
+else
+if eq b uchar 125
+brace = sub brace 1
+if lt brace 0
+ret false
+end
+else
+if eq b uchar 91
+brack = add brack 1
+else
+if eq b uchar 93
+brack = sub brack 1
+if lt brack 0
+ret false
+end
+end
+end
+end
+end
+end
+end
+end
+if or in_str or ne brace 0 ne brack 0
+ret false
+end
+ret true
+end
+
+note Find literal needle inside srv_req_body[0..blen); returns index after needle or 18446744073709551615.
+fn srv_body_find_after blen ulong needle view uchar * to ulong
+nlen = len needle
+if or eq nlen 0 gt nlen blen
+ret 18446744073709551615
+end
+lim = add sub blen nlen 1
+for i ulong lim bound 2048
+ok = true
+for j ulong nlen bound 64
+if ne get srv_req_body add i j get needle j
+ok = false
+break
+end
+end
+if ok
+ret add i nlen
+end
+end
+ret 18446744073709551615
+end
+
+note Skip JSON whitespace + ':' + whitespace starting at pos; returns value start or 18446744073709551615.
+fn srv_body_skip_colon blen ulong pos ulong to ulong
+p = pos
+while lt p blen bound 2048
+b = get srv_req_body p
+if or eq b uchar 32 or eq b uchar 9 or eq b uchar 10 eq b uchar 13
+p = add p 1
+else
+break
+end
+end
+if or ge p blen ne get srv_req_body p uchar 58
+ret 18446744073709551615
+end
+p = add p 1
+while lt p blen bound 2048
+b = get srv_req_body p
+if or eq b uchar 32 or eq b uchar 9 or eq b uchar 10 eq b uchar 13
+p = add p 1
+else
+break
+end
+end
+if ge p blen
+ret 18446744073709551615
+end
+ret p
+end
+
+fn srv_body_match_at blen ulong pos ulong lit view uchar * to bool
+nlen = len lit
+if gt add pos nlen blen
+ret false
+end
+for i ulong nlen bound 32
+if ne get srv_req_body add pos i get lit i
+ret false
+end
+end
+ret true
+end
+
+note Validate /v1/chat/completions JSON body: requires balanced {}, "model": "...", "messages": [...],
+note optional "max_tokens" in 1..SRV_MAX_TOKENS_CAP, optional "stream": true|false.
+fn srv_validate_chat_body to bool
+blen = get srv_req_meta 6
+if not srv_json_balanced blen
+ret false
+end
+mp = srv_body_find_after blen js_key_model
+if eq mp 18446744073709551615
+ret false
+end
+mv = srv_body_skip_colon blen mp
+if or eq mv 18446744073709551615 ne get srv_req_body mv uchar 34
+ret false
+end
+note Non-empty model string
+if or ge add mv 1 blen eq get srv_req_body add mv 1 uchar 34
+ret false
+end
+msp = srv_body_find_after blen js_key_msgs
+if eq msp 18446744073709551615
+ret false
+end
+msv = srv_body_skip_colon blen msp
+if or eq msv 18446744073709551615 ne get srv_req_body msv uchar 91
+ret false
+end
+put srv_resp_meta 2 0
+put srv_resp_meta 3 256
+tp = srv_body_find_after blen js_key_maxt
+if ne tp 18446744073709551615
+tv = srv_body_skip_colon blen tp
+if eq tv 18446744073709551615
+ret false
+end
+acc = ulong 0
+digits = ulong 0
+p = tv
+while lt p blen bound 16
+b = get srv_req_body p
+if and ge b uchar 48 le b uchar 57
+acc = add mul acc 10 ulong sub b uchar 48
+digits = add digits 1
+p = add p 1
+else
+break
+end
+end
+if or eq digits 0 or eq acc 0 gt acc SRV_MAX_TOKENS_CAP
+ret false
+end
+put srv_resp_meta 3 acc
+end
+sp = srv_body_find_after blen js_key_stream
+if ne sp 18446744073709551615
+sv = srv_body_skip_colon blen sp
+if eq sv 18446744073709551615
+ret false
+end
+if srv_body_match_at blen sv js_lit_true
+put srv_resp_meta 2 1
+else
+if not srv_body_match_at blen sv js_lit_false
+ret false
+end
+end
+end
+ret true
+end
+
+note Main HTTP request handler: parse -> route -> auth -> validate -> emit response.
+fn srv_handle_http raw view uchar * to ulong
+pst = srv_parse_http_req raw
+if ne pst PARSE_OK
+if eq pst PARSE_ERR_TOO_LARGE
+ret srv_emit_resp 413 st_413 false err_too_large
+end
+if eq pst PARSE_ERR_HDR_TOO_LARGE
+ret srv_emit_resp 431 st_431 false err_hdr_large
+end
+if eq pst PARSE_ERR_METHOD
+ret srv_emit_resp 405 st_405 false err_method
+end
+ret srv_emit_resp 400 st_400 false err_bad_req
+end
+m = get srv_req_meta 0
+if srv_path_eq rt_health
+if or eq m HTTP_M_GET eq m HTTP_M_HEAD
+ret srv_emit_resp 200 st_200 false body_health
+end
+ret srv_emit_resp 405 st_405 false err_method
+end
+if srv_path_eq rt_models
+if ne m HTTP_M_GET
+ret srv_emit_resp 405 st_405 false err_method
+end
+if not srv_auth_verify_req
+ret srv_emit_resp 401 st_401 false err_unauth
+end
+ret srv_emit_resp 200 st_200 false body_models
+end
+if srv_path_eq rt_chat
+if ne m HTTP_M_POST
+ret srv_emit_resp 405 st_405 false err_method
+end
+if not srv_auth_verify_req
+ret srv_emit_resp 401 st_401 false err_unauth
+end
+if not srv_validate_chat_body
+ret srv_emit_resp 400 st_400 false err_bad_req
+end
+if ne get srv_resp_meta 2 0
+ret srv_emit_resp 200 st_200 true body_chat_sse
+end
+ret srv_emit_resp 200 st_200 false body_chat_ok
+end
+ret srv_emit_resp 404 st_404 false err_not_found
+end
