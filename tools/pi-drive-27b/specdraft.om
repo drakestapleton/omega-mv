@@ -1,0 +1,175 @@
+note SPDX-License-Identifier: Apache-2.0
+note tools/pi-drive-27b/specdraft.om -- pure Omega (OM-1) L2-resident CPU prompt-lookup
+note speculative drafter for GB10 CPU+GPU co-execution (Cortex-X925, <128 KiB static state).
+note Library unit (no fn main); concatenate ahead of a driver unit and compile with seed/out/omc.
+
+const SDCAP ulong 8192
+const SDMASK ulong 8191
+const SDMAXK ulong 8
+const SDMAXN ulong 4
+
+note Static state: 64 KiB token ring + 176 B buffers/counters = 65712 B (<128 KiB L2 resident).
+global sdctx ulong 8192
+global sdlen ulong 1
+global sddraftbuf ulong 8
+global sdtgtbuf ulong 9
+global sdtotal_draft ulong 1
+global sdtotal_acc ulong 1
+global sdsteps ulong 1
+global sdlast_ng ulong 1
+
+note Reset ring state, draft/target buffers, and acceptance counters.
+fn sdreset to void
+put sdlen 0 0
+put sdtotal_draft 0 0
+put sdtotal_acc 0 0
+put sdsteps 0 0
+put sdlast_ng 0 0
+i = ulong 0
+while lt i SDMAXK bound 8
+put sddraftbuf i 0
+i = add i 1
+end
+j = ulong 0
+while lt j 9 bound 9
+put sdtgtbuf j 0
+j = add j 1
+end
+k = ulong 0
+while lt k SDCAP bound 8192
+put sdctx k 0
+k = add k 1
+end
+end
+
+note Append one token to the bounded 8192-token ring and advance monotonic sdlen.
+fn sdpush tok ulong to void
+n = get sdlen 0
+idx = and n SDMASK
+put sdctx idx tok
+put sdlen 0 add n 1
+end
+
+note Read token at logical position pos from the ring.
+fn sdget pos ulong to ulong
+idx = and pos SDMASK
+ret get sdctx idx
+end
+
+note Earliest live logical position retained in the 8192-token ring.
+fn sdstart to ulong
+n = get sdlen 0
+if gt n SDCAP
+ret sub n SDCAP
+end
+ret 0
+end
+
+note Compare ng-gram at logical pos against suffix at logical suf.
+fn sdmatch pos ulong suf ulong ng ulong to bool
+i = ulong 0
+while lt i ng bound 4
+a = sdget add pos i
+b = sdget add suf i
+if ne a b
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note Search backwards in live ring [sdstart..sdlen) for prior match of current ng-gram suffix.
+note Returns continuation start pos + ng (>0 and <sdlen) on hit, or 0 on miss.
+fn sdfind ng ulong to ulong
+n = get sdlen 0
+lo = sdstart
+live = sub n lo
+if le live ng
+ret 0
+end
+suf = sub n ng
+rcnt = sub suf lo
+off = ulong 1
+while le off rcnt bound 8192
+pos = sub suf off
+if sdmatch pos suf ng
+ret add pos ng
+end
+off = add off 1
+end
+ret 0
+end
+
+note Propose up to k (<= 8) draft tokens into sddraftbuf by searching backwards for
+note longest matching suffix of length 4, 3, 2, then 1. Returns drafted count 0..k.
+fn sddraft k ulong to ulong
+put sdlast_ng 0 0
+if eq k 0
+ret 0
+end
+if gt k SDMAXK
+ret 0
+end
+n = get sdlen 0
+if lt n 2
+ret 0
+end
+src = ulong 0
+ng = SDMAXN
+while gt ng 0 bound 4
+src = sdfind ng
+if gt src 0
+put sdlast_ng 0 ng
+break
+end
+ng = sub ng 1
+end
+if eq src 0
+ret 0
+end
+avail = sub n src
+cnt = k
+if lt avail cnt
+cnt = avail
+end
+i = ulong 0
+while lt i cnt bound 8
+tok = sdget add src i
+put sddraftbuf i tok
+i = add i 1
+end
+ret cnt
+end
+
+note Verify n drafted tokens in sddraftbuf against n+1 target tokens in sdtgtbuf.
+note Finds first mismatch m, commits m accepted draft tokens + target token at m into sdctx,
+note updates sdtotal_draft, sdtotal_acc, sdsteps, and returns total committed tokens (m + 1).
+fn sdverify n ulong to ulong
+if gt n SDMAXK
+ret 0
+end
+m = ulong 0
+while lt m n bound 8
+d = get sddraftbuf m
+t = get sdtgtbuf m
+if ne d t
+break
+end
+m = add m 1
+end
+commit = add m 1
+i = ulong 0
+while lt i commit bound 9
+tok = get sdtgtbuf i
+sdpush tok
+i = add i 1
+end
+td = get sdtotal_draft 0
+put sdtotal_draft 0 add td n
+ta = get sdtotal_acc 0
+put sdtotal_acc 0 add ta m
+st = get sdsteps 0
+put sdsteps 0 add st 1
+ret commit
+end
