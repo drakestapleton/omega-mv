@@ -1,0 +1,322 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gsp/arena_bm.om: Zero-BSS direct-in-Normal-NC GB20B Profile 2 arena & COTv2 composer.
+note Eliminates the 160 MiB static .bss of arena.om for SPARK.EFI by writing WPR meta, Libos
+note args, 7 log rings, 129-page cmdq/statq, 4-level ELF radix tree, BL/sig/FMC/FMC-args, and
+note CrashCat queue directly into Piece 1's pre-carved Normal-NC DMA pool (<40-bit PA).
+note Safety invariant (#23/#29/#30): strictly enforces empty RPC 73 (breg 0) so GSP-RM keeps
+note compiled-in thermal/DPM defaults (CBKDPM=0/CBKPW2=0 forbidden on bare-metal Spark).
+note Compose after: gsp/bm_hal.om, gsp/fw_bm.om, gsp/rpc.om, gsp/sysinfo.om. Prefix ab / AB.
+
+const ABOK long 0
+const ABECFG long -1
+const ABECAP long -3
+const ABEDMA long -5
+const ABEQUE long -6
+const ABHEAPSZ ulong 139460608
+const ABWPRMAG ulong 15869187694674993331
+const ABNVDM ulong 336649854
+const ABMCTP2 ulong 3221225472
+
+global abbase ulong 1
+global abcap ulong 1
+global abused ulong 1
+global abheappa ulong 1
+global abheapsz ulong 1
+global aboff ulong 18
+global absize ulong 18
+global abcmdpa ulong 1
+global abstatpa ulong 1
+global abcot uchar 1024
+global abclen ulong 1
+global abtail ulong 1
+global abnp ulong 4
+global ablvl ulong 4
+text ABNAMES "LOGINIT|LOGINTR|LOGRM|LOGMNOC|LOGDBG|LOGROOT|LOGKRNL|RMARGS|"
+
+fn abtake k ulong n ulong to bool
+sz = and add n 4095 not ulong 4095
+u = get abused 0
+if or lt sz n gt u get abcap 0
+ret false
+end
+if gt sz sub get abcap 0 u
+ret false
+end
+put aboff k u
+put absize k n
+put abused 0 add u sz
+bmmemzero add get abbase 0 u sz
+ret true
+end
+
+fn abpa k ulong to ulong
+ret add get abbase 0 get aboff k
+end
+
+fn abcopy k ulong srcpa ulong n ulong to void
+dst = abpa k
+o = ulong 0
+while lt o n bound 9223372036854775807
+if and eq and or add dst o add srcpa o 7 0 ge sub n o 8
+bmmemwr64 add dst o bmmemrd64 add srcpa o
+o = add o 8
+else
+bmmemwr8 add dst o bmmemrd8 add srcpa o
+o = add o 1
+end
+end
+end
+
+fn abcput o ulong v ulong n ulong to void
+for i ulong n
+put abcot add o i uchar and shr v mul i 8 255
+end
+end
+
+fn ablogpt k ulong to void
+n = div get absize k 4096
+a = abpa k
+for j ulong n
+bmmemwr64 add a add 8 mul j 8 add a mul j 4096
+end
+end
+
+fn ablogs to void
+pos = ulong 0
+for i ulong 8
+id = ulong 0
+while ne get ABNAMES pos 124 bound 8
+id = or shl id 8 ulong get ABNAMES pos
+pos = add pos 1
+end
+pos = add pos 1
+k = add i 2
+if eq i 7
+k = ulong 9
+end
+e = add abpa 1 mul i 32
+bmmemwr64 e id
+bmmemwr64 add e 8 abpa k
+bmmemwr64 add e 16 get absize k
+bmmemwr8 add e 24 1
+bmmemwr8 add e 25 1
+end
+for i ulong 7
+ablogpt add i 2
+end
+end
+
+note Populate RMARGS (slot 9), FMC boot args (slot 15), and GB20B WPR meta (slot 0 + CrashCat slot 17).
+fn abfixed to void
+a = abpa 9
+bmmemwr64 a abpa 10
+bmmemwr32 add a 8 129
+bmmemwr64 add a 16 4096
+bmmemwr64 add a 24 add ulong 4096 262144
+bmmemwr32 add a 44 0
+bmmemwr8 add a 48 1
+bmmemwr64 add a 72 get abheappa 0
+bmmemwr64 add a 80 get abheapsz 0
+f = abpa 15
+bmmemwr32 f 0
+bmmemwr32 add f 8 1
+bmmemwr32 add f 12 256
+bmmemwr64 add f 16 abpa 0
+bmmemwr8 add f 36 1
+bmmemwr32 add f 40 2
+bmmemwr64 add f 48 abpa 1
+w = abpa 0
+bmmemwr64 w ABWPRMAG
+bmmemwr64 add w 8 1
+bmmemwr64 add w 16 abpa 11
+bmmemwr64 add w 24 get fbimgsz 0
+bmmemwr64 add w 32 abpa 12
+bmmemwr64 add w 40 get fbblsz 0
+bmmemwr64 add w 48 61440
+bmmemwr64 add w 56 2560
+bmmemwr64 add w 64 0
+bmmemwr64 add w 72 abpa 13
+bmmemwr64 add w 80 get absize 13
+bmmemwr64 add w 128 ABHEAPSZ
+bmmemwr64 add w 224 abpa 17
+bmmemwr64 add w 232 get absize 17
+end
+
+fn abradixfill base11 ulong to void
+for i ulong 3
+l0 = get ablvl i
+l1 = get ablvl add i 1
+for j ulong get abnp add i 1
+o = add base11 add l0 mul j 8
+v = add base11 add l1 mul j 4096
+bmmemwr64 o v
+end
+end
+end
+
+note 4-level radix tree over .fwimage directly in Normal-NC DMA pool.
+fn abradix to bool
+isz = get fbimgsz 0
+if eq isz 0
+ret false
+end
+put abnp 3 div add isz 4095 4096
+for j ulong 3
+i = sub 3 j
+put abnp sub i 1 add div sub get abnp i 1 512 1
+end
+if ne get abnp 0 1
+ret false
+end
+put ablvl 0 0
+for i ulong 3
+put ablvl add i 1 add get ablvl i mul get abnp i 4096
+end
+sz = add get ablvl 3 mul get abnp 3 4096
+if not abtake 11 sz
+ret false
+end
+abradixfill abpa 11
+put aboff 16 add get aboff 11 get ablvl 3
+put absize 16 isz
+abcopy 16 get fbimgpa 0 isz
+ret true
+end
+
+note Pre-queue RPC 72 (GSP_SET_SYSTEM_INFO, 936 B) into cmdq; strictly omit RPC 73 (thermal/DPM safety).
+fn abpre to bool
+rqinit
+for i ulong 936
+put rqpay i get siout i
+end
+if ne rqsend 72 936 936 false 0
+ret false
+end
+cpa = get abcmdpa 0
+for i ulong 262144
+bmmemwr8 add cpa i get rqcmd i
+end
+ret true
+end
+
+note Build GB20B COTv2 packet (868 B = 217 dwords, MCTP SOM|EOM 0xc0000000, ver=2, size=860, FRTS=0).
+fn abcotmk to void
+for i ulong 1024
+put abcot i 0
+end
+abcput 0 ABMCTP2 4
+abcput 4 ABNVDM 4
+abcput 8 2 2
+abcput 10 860 2
+abcput 12 abpa 14 8
+hpa = get fbhshpa 0
+for i ulong 48
+put abcot add 44 i bmmemrd8 add hpa i
+end
+pkpa = get fbpkeypa 0
+sgpa = get fbfsigpa 0
+for i ulong 384
+put abcot add 92 i bmmemrd8 add pkpa i
+put abcot add 476 i bmmemrd8 add sgpa i
+end
+abcput 860 abpa 15 8
+put abclen 0 868
+put abtail 0 864
+end
+
+note Compose complete GB20B Profile 2 arena directly in Piece 1's Normal-NC DMA pool.
+fn abbuild basepa ulong cap ulong heappa ulong heapsz ulong to long
+put abclen 0 0
+put abtail 0 0
+if or eq cap 0 or ne and basepa 4095 0 ge basepa BMPALIM
+ret ABECFG
+end
+if gt cap sub BMPALIM basepa
+ret ABEDMA
+end
+if or eq heappa 0 or lt heapsz ABHEAPSZ or ne and heappa 4095 0 ne and heapsz 4095 0
+ret ABECFG
+end
+if or ge heappa BMPALIM gt heapsz sub BMPALIM heappa
+ret ABEDMA
+end
+if eq get fbimgsz 0 0
+ret ABECFG
+end
+if ne get fbsigsz 0 4096
+ret ABECFG
+end
+if ne get fbblsz 0 212992
+ret ABECFG
+end
+if ne get fbfmcsz 0 212296
+ret ABECFG
+end
+put abbase 0 basepa
+put abcap 0 cap
+put abused 0 0
+put abheappa 0 heappa
+put abheapsz 0 heapsz
+for i ulong 18
+put aboff i 0
+put absize i 0
+end
+if not abtake 0 4096
+ret ABECAP
+end
+put absize 0 256
+if not abtake 1 4096
+ret ABECAP
+end
+for i ulong 7
+sz = ulong 65536
+if eq i 5
+sz = ulong 4096
+end
+if not abtake add i 2 sz
+ret ABECAP
+end
+end
+if not abtake 9 4096
+ret ABECAP
+end
+if not abtake 10 mul ulong 129 4096
+ret ABECAP
+end
+put abcmdpa 0 add abpa 10 4096
+put abstatpa 0 add get abcmdpa 0 262144
+p10 = abpa 10
+for i ulong 129
+bmmemwr64 add p10 mul i 8 add p10 mul i 4096
+end
+if not abradix
+ret ABECAP
+end
+if not abtake 12 get fbblsz 0
+ret ABECAP
+end
+abcopy 12 get fbblpa 0 get fbblsz 0
+if not abtake 13 4096
+ret ABECAP
+end
+abcopy 13 get fbsigpa 0 4096
+if not abtake 14 get fbfmcsz 0
+ret ABECAP
+end
+abcopy 14 get fbfmcpa 0 get fbfmcsz 0
+if not abtake 15 4096
+ret ABECAP
+end
+put absize 15 88
+if not abtake 17 4096
+ret ABECAP
+end
+ablogs
+abfixed
+if not abpre
+ret ABEQUE
+end
+abcotmk
+bmdsb
+ret ABOK
+end

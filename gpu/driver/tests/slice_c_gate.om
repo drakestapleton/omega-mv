@@ -1,0 +1,737 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note tests/slice_c_gate.om: Host replay gate for Phase 2 Slice C (GB20B bare-metal GSP boot &
+note compute channel 0xca6f/0xcec0 in pure .om, zero 184 MiB .bss, zero Linux syscalls in bare-metal units).
+note Build:
+note   cat gpu/driver/gsp/bm_hal.om gpu/driver/gsp/profile.om gpu/driver/gsp/mmio_bm.om \
+note       gpu/driver/gsp/sec2.om gpu/driver/gsp/seq.om gpu/driver/gsp/seqcore.om \
+note       gpu/driver/gsp/rpc.om gpu/driver/gsp/sysinfo.om gpu/driver/chan/params.om \
+note       gpu/driver/gsp/boot.om gpu/driver/gsp/dispatch.om gpu/driver/gsp/fw_bm.om \
+note       gpu/driver/gsp/arena_bm.om gpu/driver/gsp/transport_bm.om \
+note       gpu/driver/chan/gmmu_bm.om gpu/driver/chan/mem.om gpu/driver/chan/chan.om \
+note       gpu/driver/chan/complete.om gpu/driver/chan/rmchan.om \
+note       gpu/driver/tests/slice_c_gate.om | seed/out/omc > slice_c_gate
+note Host replay ONLY; never touches real Spark silicon (hardware=NOT_RUN).
+
+const TBASE ulong 2147483648
+const TRAMSZ ulong 4194304
+const THEAPPA ulong 3221225472
+const THEAPSZ ulong 139460608
+const TBARSZ ulong 16777216
+const TFRQ ulong 1000000000
+const TBOOT42 uint 465178624
+
+text TPASS "PASS slice_c_gate\n"
+text TGNUN "GNU"
+text TSTG "123456\n"
+
+note Small 4 MiB host replay RAM + BAR0 register model (replaces 184 MiB host-sim .bss)
+global tram uchar 4194304
+global ttick ulong 1
+global tsec2st ulong 1
+global tmsgqok ulong 1
+global ttailfirst ulong 1
+global tememw ulong 1
+global tememr ulong 1
+global temem uchar 1024
+global ts2rsp uchar 24
+global tbellcnt ulong 1
+global tlastdb ulong 1
+global tlastreg ulong 1
+global tseqreg ulong 1
+global tcorest ulong 1
+global tmmutrig ulong 1
+global tmmpdb ulong 1
+global tmmupr ulong 1
+global trmseq uint 1
+global tfreeord ulong 8
+global tfreecnt ulong 1
+
+fn tck ok bool to void
+if not ok
+trap 1
+end
+end
+
+note Stubs for dead simulator branches in sec2.om and chan.om (never called in gspmode=2 / mmmode=2)
+fn s2simrd off ulong to ulong
+trap 9
+end
+fn s2simwr off ulong v ulong to void
+trap 9
+end
+fn gsbind chid uint tok uint ent uint gpva ulong upa ulong ipa ulong to long
+trap 9
+end
+fn gsdisable chid uint to long
+trap 9
+end
+fn gsidle chid uint to long
+trap 9
+end
+
+note Host replay callbacks for bm_hal.om
+fn bmrcntvct to ulong
+t = get ttick 0
+put ttick 0 add t 10000
+ret t
+end
+
+fn bmrmemrd8 pa ulong to uchar
+o = sub pa TBASE
+if ge o TRAMSZ
+trap 3
+end
+ret get tram o
+end
+
+fn bmrmemwr8 pa ulong v uchar to void
+o = sub pa TBASE
+if ge o TRAMSZ
+trap 3
+end
+put tram o v
+end
+
+fn bmrbarrd off ulong to ulong
+note FWSEC scratch 0x5e0 (1504): returns 0xFF
+if eq off 1504
+ret 255
+end
+note SEC2 QUEUE_HEAD(0) 0x840c00 / QUEUE_TAIL(0) 0x840c04: empty
+if or eq off 8653824 eq off 8653828
+ret 0
+end
+note SEC2 EMEMC(0) 0x840ac0: return current dword offset in [7:2] and block in [15:8]
+if eq off 8653504
+dw = get tememw 0
+if ne get tsec2st 0 1
+dw = get tememr 0
+end
+blk = div dw 64
+remdw = rem dw 64
+ret or shl blk 8 shl remdw 2
+end
+note SEC2 EMEMD(0) 0x840ac4: return reply dword when reading MSGQ (reply starts at dword 4)
+if eq off 8653508
+dw = get tememr 0
+put tememr 0 add dw 1
+if lt dw 4
+ret 0
+end
+o = mul sub dw 4 4
+if gt add o 4 24
+ret 0
+end
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get ts2rsp add o i mul i 8
+end
+ret v
+end
+note SEC2 MSGQ_HEAD(0) 0x840c80 / MSGQ_TAIL(0) 0x840c84
+if eq off 8653952
+if eq get tsec2st 0 2
+ret 16
+end
+ret 16
+end
+if eq off 8653956
+if eq get tsec2st 0 2
+ret 32
+end
+ret 16
+end
+note GSP HWCFG2 0x1100f4: mask released, lockdown clear, mem scrubbing clear
+if eq off 1114356
+ret 1
+end
+note GSP MAILBOX0 0x110040: 0 = FMC OK
+if eq off 1114176
+ret 0
+end
+note GSP RISCV_CPUCTL 0x111388: ACTIVE_STAT bit 7 (128)
+if eq off 1119112
+ret 128
+end
+note GSP FALCON_CPUCTL 0x110100: HALTED bit 4 (16) after core halt check
+if eq off 1114368
+ret 16
+end
+note Sequencer test register 0x123400 (1192960)
+if eq off 1192960
+ret get tseqreg 0
+end
+note GMMU invalidate 0xB830B0: trigger bit cleared immediately
+if eq off 12071088
+ret 0
+end
+ret 0
+end
+
+fn bmrbarwr off ulong v ulong to void
+put tlastreg 0 off
+note SEC2 EMEMC(0) 0x840ac0
+if eq off 8653504
+if ne and v 16777216 0
+put tsec2st 0 1
+put tememw 0 0
+end
+if ne and v 33554432 0
+put tememr 0 ememdw v
+end
+ret
+end
+note SEC2 EMEMD(0) 0x840ac4
+if eq off 8653508
+dw = get tememw 0
+put tememw 0 add dw 1
+ret
+end
+note SEC2 QUEUE_HEAD(0) 0x840c00: triggers reply ready
+if eq off 8653824
+put tsec2st 0 2
+ret
+end
+note SEC2 MSGQ_TAIL(0) 0x840c84 MUST be written before MSGQ_HEAD(0) 0x840c80
+if eq off 8653956
+if eq get tsec2st 0 2
+put ttailfirst 0 1
+put tsec2st 0 3
+end
+ret
+end
+if eq off 8653952
+if eq get tsec2st 0 3
+put tmsgqok 0 1
+put tsec2st 0 4
+end
+ret
+end
+note PGSP_QUEUE_HEAD(0) 0x110c00
+if eq off 1117184
+put tbellcnt 0 add get tbellcnt 0 1
+ret
+end
+note BAR0 VF Doorbell 0x00BB0090 (12255376)
+if eq off 12255376
+put tlastdb 0 v
+ret
+end
+note Sequencer test register 0x123400 (1192960)
+if eq off 1192960
+put tseqreg 0 v
+ret
+end
+note GMMU invalidate regs
+if eq off 12071072
+put tmmpdb 0 v
+ret
+end
+if eq off 12071076
+put tmmupr 0 v
+ret
+end
+if eq off 12071088
+put tmmutrig 0 v
+ret
+end
+end
+
+note Helper: write a string into replay RAM at pa and return next offset
+fn twrstr pa ulong s ulong to ulong
+n = ulong 0
+if eq s 0
+n = len FBNIMG
+for i ulong n
+bmmemwr8 add pa i get FBNIMG i
+end
+end
+if eq s 1
+n = len FBNVER
+for i ulong n
+bmmemwr8 add pa i get FBNVER i
+end
+end
+if eq s 2
+n = len FBNBID
+for i ulong n
+bmmemwr8 add pa i get FBNBID i
+end
+end
+if eq s 3
+n = len FBNSIG
+for i ulong n
+bmmemwr8 add pa i get FBNSIG i
+end
+end
+if eq s 4
+n = len FBVER
+for i ulong n
+bmmemwr8 add pa i get FBVER i
+end
+end
+bmmemwr8 add pa n 0
+ret add n 1
+end
+
+fn twrshdr pa ulong nm ulong ty ulong of ulong sz ulong to void
+bmmemwr32 pa nm
+bmmemwr32 add pa 4 ty
+bmmemwr64 add pa 24 of
+bmmemwr64 add pa 32 sz
+end
+
+note Test 1: fw_bm.om in-RAM ELF64 GspFwBundle parser (zero 16 MiB .bss)
+fn test_fw_bm to void
+elfpa = TBASE
+bmmemzero elfpa 32768
+note ELF64 header: magic, class=2, data=1, ver=1, ET_REL=1, EM_RISCV=243, shoff=64, shentsize=64, shnum=6, shstrndx=1
+bmmemwr8 elfpa 127
+bmmemwr8 add elfpa 1 69
+bmmemwr8 add elfpa 2 76
+bmmemwr8 add elfpa 3 70
+bmmemwr8 add elfpa 4 2
+bmmemwr8 add elfpa 5 1
+bmmemwr8 add elfpa 6 1
+bmmemwr32 add elfpa 16 or 1 shl ulong 243 16
+bmmemwr64 add elfpa 40 64
+bmmemwr32 add elfpa 56 shl ulong 64 16
+bmmemwr32 add elfpa 60 or 6 shl ulong 1 16
+note String table at offset 1024
+sp = add elfpa 1024
+bmmemwr8 sp 0
+o0 = ulong 1
+o1 = add o0 twrstr add sp o0 0
+o2 = add o1 twrstr add sp o1 1
+o3 = add o2 twrstr add sp o2 2
+o4 = add o3 twrstr add sp o3 3
+note Section data: .fwversion at 2048, .note.gnu.build-id at 2112, .fwsignature_gb20y at 4096 (4096 B), .fwimage at 8192 (8192 B)
+vlen = twrstr add elfpa 2048 4
+np = add elfpa 2112
+bmmemwr32 np 4
+bmmemwr32 add np 4 20
+bmmemwr32 add np 8 3
+for i ulong 3
+bmmemwr8 add np add 12 i get TGNUN i
+end
+bmmemwr8 add np 15 0
+bmmemwr8 add elfpa 4096 171
+bmmemwr8 add elfpa 8192 205
+note Section headers at offset 64 (6 * 64 = 384 bytes)
+sh = add elfpa 64
+twrshdr sh 0 0 0 0
+twrshdr add sh 64 0 3 1024 o4
+twrshdr add sh 128 o0 1 8192 8192
+twrshdr add sh 192 o1 1 2048 vlen
+twrshdr add sh 256 o2 7 2112 36
+twrshdr add sh 320 o3 1 4096 4096
+tck eq fbparseelf elfpa 16384 FBOK
+tck eq get fbimgpa 0 add elfpa 8192
+tck eq get fbimgsz 0 8192
+tck eq get fbsigpa 0 add elfpa 4096
+tck eq get fbsigsz 0 4096
+note Negative check: bad signature size (4095) refused with FBESIG
+bmmemwr64 add add sh 320 32 4095
+tck eq fbparseelf elfpa 16384 FBESIG
+bmmemwr64 add add sh 320 32 4096
+note Negative check: bad version string refused with FBEVER
+bmmemwr8 add elfpa 2057 49
+tck eq fbparseelf elfpa 16384 FBEVER
+bmmemwr8 add elfpa 2057 50
+tck eq fbparseelf elfpa 16384 FBOK
+test_fw_blobs
+end
+
+fn test_fw_blobs to void
+note Bind 5 pre-extracted GB20B bindata blobs in replay RAM (offsets 65536..524288)
+blpa = add TBASE 65536
+fmcpa = add TBASE 286720
+hshpa = add TBASE 507904
+pkpa = add TBASE 512000
+sgpa = add TBASE 516096
+bmmemwr8 hshpa 90
+bmmemwr8 pkpa 165
+bmmemwr8 sgpa 60
+tck eq fbbindblobs blpa 212991 fmcpa 212296 hshpa pkpa FBEBLOB
+tck eq fbbindblobs blpa 212992 fmcpa 212296 hshpa pkpa FBOK
+tck eq fbbindsig sgpa 12345 FBOK
+end
+
+note Test 2: arena_bm.om direct Normal-NC Profile 2 composition (zero 160 MiB .bss, empty RPC 73)
+fn test_arena_bm to void
+sireset
+tck eq siseti 0 603979776 SIEOK
+tck eq siseti 4 64424509696 SIEOK
+siencode
+abp = add TBASE 1048576
+tck eq abbuild abp 2621440 THEAPPA THEAPSZ ABOK
+note Verify WPR meta magic, rev=1, 133 MiB heap, CrashCat +224/+232
+w = abpa 0
+tck eq bmmemrd64 w ABWPRMAG
+tck eq bmmemrd64 add w 8 1
+tck eq bmmemrd64 add w 128 ABHEAPSZ
+tck eq bmmemrd64 add w 224 abpa 17
+tck eq bmmemrd64 add w 232 4096
+note Verify RPC 72 pre-queued and RPC 73 omitted (cmdq.writePtr == 1)
+tck eq bmmemrd32 add get abcmdpa 0 16 1
+note Verify 868 B COTv2 packet: MCTP=0xc0000000, NVDM=0x1410de7e, ver=2, size=860, FRTS=0
+tck eq get abclen 0 868
+tck eq get abtail 0 864
+tck eq get abcot 3 192
+tck eq get abcot 8 2
+tck eq get abcot 44 90
+tck eq get abcot 92 165
+tck eq get abcot 476 60
+for i ulong 24
+tck eq get abcot add 20 i 0
+end
+end
+
+note Test 3: sec2.om + mmio_bm.om in gspmode=2 (MSGQ TAIL before HEAD, CNTVCT_EL0 timer)
+fn test_sec2_bm to void
+tck eq bmticks2ms 1000000000 1000
+tck eq bmticks2us 1000000 1000
+put gspmode 0 2
+put gspd0ok 0 1
+put gsppns 0 1000
+for i ulong 1024
+put gpkt i get abcot i
+end
+put gin 0 get abclen 0
+put gin 1 abpa 15
+put gin 2 get fbappver 0
+for i ulong 4
+put gin add i 3 4
+end
+for i ulong 7
+put s2cfg i 1
+end
+put s2cfg 0 2
+put s2cfg 1 2
+put s2cfg 2 4
+put s2cfg 3 4
+note Prepare valid 20-byte SEC2 COTv2 response: MCTP SOM|EOM, NVDM 0x1510de7e, seq=0, cmd=0x14 (20), err=0
+for i ulong 24
+put ts2rsp i 0
+end
+put ts2rsp 3 192
+put ts2rsp 4 126
+put ts2rsp 5 222
+put ts2rsp 6 16
+put ts2rsp 7 21
+put ts2rsp 12 20
+tck eq s2boot TBOOT42 EOK
+tck eq get ttailfirst 0 1
+tck eq get tmsgqok 0 1
+end
+
+fn tstatpub e ulong to void
+spa = get abstatpa 0
+wr = bmmemrd32 add spa 16
+for s ulong e
+slot = rem add wr s RQCOUNT
+dst = add spa mul add slot 1 RQSLOT
+src = mul s RQSLOT
+for j ulong RQSLOT
+bmmemwr8 add dst j get rqtmp add src j
+end
+end
+bmmemwr32 add spa 16 rem add wr e RQCOUNT
+end
+
+note Helper: inject one GSP->CPU message frame into statq in replay RAM
+fn tstatpush fnid ulong seqnum ulong res ulong priv ulong n ulong to void
+e = div add n 4175 4096
+for i ulong mul e 4096
+put rqtmp i 0
+end
+rqput32 2 36 ulong get trmseq 0
+put trmseq 0 add get trmseq 0 1
+rqput32 2 40 e
+rqput32 2 48 RQVER
+rqput32 2 52 RQSIG
+logn = n
+if eq fnid 103
+logn = ulong 32
+end
+rqput32 2 56 add 32 logn
+rqput32 2 60 fnid
+rqput32 2 64 res
+rqput32 2 68 priv
+rqput32 2 72 seqnum
+for i ulong n
+put rqtmp add 80 i get rqpay i
+end
+rqput32 2 32 rqsum 2 mul div add logn 87 8 8
+tstatpub e
+end
+
+note Test 4: transport_bm.om + boot.om + seq.om + seqcore.om (opcodes 5..8) + RPC 54/79
+fn test_boot_seq_pd to void
+note Initialize statq header in replay RAM
+spa = get abstatpa 0
+bmmemwr32 spa 0
+bmmemwr32 add spa 4 RQQSZ
+bmmemwr32 add spa 8 RQSLOT
+bmmemwr32 add spa 12 RQCOUNT
+bmmemwr32 add spa 16 0
+bmmemwr32 add spa 20 1
+bmmemwr32 add spa 24 32
+bmmemwr32 add spa 28 RQSLOT
+bmmemwr32 add spa 32 0
+put bstate 0 4
+put bbudget 0 64
+put bstaticn 0 64
+put bgen 0 1
+tck eq tbattach get abcmdpa 0 spa TBOOT42 0
+note [18..21]: CORE_RESET(5), CORE_START(6), CORE_WAIT_FOR_HALT(7), CORE_RESUME(8) -> ci=22, words=23
+rqclear 132
+rqput32 4 0 23
+rqput32 4 4 22
+rqput32 4 40 0
+rqput32 4 44 1192960
+rqput32 4 48 16
+rqput32 4 52 1
+rqput32 4 56 1192960
+rqput32 4 60 15
+rqput32 4 64 5
+rqput32 4 68 2
+rqput32 4 72 1192960
+rqput32 4 76 255
+rqput32 4 80 21
+rqput32 4 84 1
+rqput32 4 88 0
+rqput32 4 92 3
+rqput32 4 96 5
+rqput32 4 100 4
+rqput32 4 104 1192960
+rqput32 4 108 0
+rqput32 4 112 5
+rqput32 4 116 6
+rqput32 4 120 7
+rqput32 4 124 8
+tstatpush 4098 0 0 0 132
+tck eq bpoll 2
+tck eq get bstate 0 11
+dspinit
+dspperms DSPMALL
+put sqcore 0 1
+put sqbud 0 4
+tck eq dspauto 0
+tck eq get bstate 0 4
+tck eq get tseqreg 0 21
+tck eq get sqsave 0 21
+tck eq get sccount 0 1
+tck eq get sccount 1 1
+tck eq get sccount 2 1
+tck eq get sccount 3 1
+note Inject 0x1001 (GSP_INIT_DONE)
+rqclear 4
+tstatpush 4097 0 0 0 4
+tck eq bpoll 1
+tck eq get bstate 0 5
+note RPC 1 SET_GUEST_SYSTEM_INFO (792 B)
+rqclear 792
+rqput32 4 0 580
+rqput32 4 4 173
+tck eq bguest 0
+tstatpush 1 ulong get rqsent 0 0 0 792
+tck eq bpoll 1
+tck eq get bstate 0 7
+note RPC 65 GET_GSP_STATIC_INFO (64 B)
+tck eq bstatic 0
+rqclear 64
+tstatpush 65 ulong get rqsent 0 0 0 64
+tck eq bpoll 1
+tck eq get bstate 0 9
+note RPC 54 SET_PAGE_DIRECTORY (48 B)
+for i ulong 11
+put pain i 0
+end
+put pain 0 1001
+put pain 1 1002
+put pain 3 add TBASE 3670016
+put pain 4 512
+put pain 5 2
+put pain 7 1004
+tck eq pasetpd 48
+tck eq bsetpd 8 0
+for i ulong 48
+put rqpay i get pabuf i
+end
+tstatpush 54 ulong get rqsent 0 0 0 48
+tck eq bpoll 1
+tck eq get bstate 0 9
+note RPC 79 UNSET_PAGE_DIRECTORY (16 B)
+tck eq paunsetpd 1001 1002 1004 0 16
+tck eq bunsetpd 8 0
+for i ulong 16
+put rqpay i get pabuf i
+end
+tstatpush 79 ulong get rqsent 0 0 0 16
+tck eq bpoll 1
+tck eq get bstate 0 9
+end
+
+note Test 5: gmmu_bm.om 32 GiB (29+ GiB) 2 MiB-page mapping & TLB invalidate
+fn test_gmmu_bm to void
+tck eq mmwinit TBASE 137438953472 MMOK
+ptpool = add TBASE 3670016
+tck eq mmasinit ptpool 128 MMOK
+note Map 32 GiB (34359738368 B) of 2 MiB pages at VA 0x10_0000_0000 -> PA 0x3_2380_0000
+va32g = ulong 68719476736
+pa32g = ulong 13480493056
+sz32g = ulong 34359738368
+tck eq mmmap va32g pa32g sz32g MMSZ2M MMAPSYS 0 MMOK
+tck eq mmwalk va32g MMSZ2M false MMWMAP
+tck eq mmwalk add va32g sub sz32g MMSZ2M MMSZ2M false MMWMAP
+tck eq mminval 4 MMOK
+tck ne get tmmutrig 0 0
+end
+
+note Helper: respond to the currently pending RM RPC in boot.om
+fn treplyrm tok ulong to void
+f = get bfunc 0
+seq = get bseq 0
+if eq f 103
+n = get bplen 0
+rqclear add 32 n
+for i ulong 4
+rqput32 4 mul i 4 get bhead i
+end
+rqput32 4 20 n
+for i ulong n
+put rqpay add 32 i get pabuf i
+end
+tstatpush 103 seq 0 0 add 32 n
+ret
+end
+if eq f 76
+n = get bplen 0
+rqclear add 40 n
+for i ulong 3
+rqput32 4 mul i 4 get bhead i
+end
+rqput32 4 16 n
+if eq get bhead 2 PACMWST
+rqput32 4 40 tok
+else
+for i ulong n
+put rqpay add 40 i get pabuf i
+end
+end
+tstatpush 76 seq 0 0 add 40 n
+ret
+end
+if eq f 10
+k = get tfreecnt 0
+if lt k 8
+put tfreeord k get bhead 1
+put tfreecnt 0 add k 1
+end
+rqclear 16
+rqput32 4 0 get bhead 0
+rqput32 4 8 get bhead 1
+tstatpush 10 seq 0 0 16
+ret
+end
+end
+
+note Test 6: rmchan.om GB20B (0xca6f + 0xcec0 + 0xc36f0108 bit-30 token + rl>=127 reject + DSB SY chain)
+fn test_rmchan_gb20b to void
+note Initialize mem allocator + channel slot 0 over gmmu_bm.om
+gmbufpa = add TBASE 3407872
+tck eq gminit 8 gmbufpa 64 8589934592 GMOK
+chinit
+tck eq chprep 0 42 3 64 CHOK
+tck eq cminit CMOK
+tck eq gmalloc 4096 1 GMHPOLL GMOK
+semslot = get gmout 0
+tck eq cmbind 0 semslot 0 get mmwgen 0 CMOK
+tck eq rminit RMOK
+rmcfg 1001 1002 1003 1004 1005 1006
+rmcfgch 1007 42 1 99
+rmcfg20 true 1008
+tck eq rmbind 0 get mmwgen 0 RMOK
+tck eq rmstart 8 RMOK
+note Step through ROOT -> DEV -> SUB -> VAS -> TSG -> CTX -> 0xca6f -> 0xcec0 -> RMSREADY
+tok20 = ulong 1073938474
+while ne get rmst 0 RMSREADY bound 32
+if eq get rmst 0 RMSACHAN
+tck eq get bhead 3 PACGPFB
+end
+if eq get rmst 0 RMSACMP
+tck eq get bhead 3 PACCMP
+end
+treplyrm tok20
+tck eq rmstep 1
+end
+note Schedule + GET_WORK_SUBMIT_TOKEN (0xc36f0108) -> verify bit-30 token stored in chtok[0]
+tck eq rmsched 8 RMOK
+treplyrm tok20
+tck eq rmstep 1
+tck eq get rmst 0 RMSWST
+treplyrm tok20
+tck eq rmstep 1
+tck eq get rmst 0 RMSACTV
+tck eq get rmtok 0 tok20
+tck eq ulong get chtok 0 tok20
+note Verify rl >= 127 (INVALID_RUNLIST) is rejected by both bmtokgb20 and chtokgb20chk
+tck eq bmtokgb20 127 0 BMERANGE
+tck eq chtokgb20chk 127 0 -1
+tck eq bmtokgb20 3 42 long tok20
+tck eq chtokgb20chk 3 42 long tok20
+note Verify strict DSB SY submission chain: PB(1) -> DSB(2) -> GPFIFO(3) -> DSB(2) -> USERD(4) -> DSB(2) -> DB(5)
+put bmtrcn 0 0
+tck eq bmsettok 3 42 BMOK
+gppa = get gmbpa get chgp 0
+udpa = get gmbpa get chud 0
+tck eq rmpub get mmwgen 0 RMOK
+tck eq bmsubmit gppa udpa 8589938688 16 0 64 1
+put chput 0 1
+tck eq cmsub 0 1 CMOK
+bmmemwr32 get gmbpa semslot 1
+tck eq get bmtrcn 0 7
+tck eq get bmtrc 0 1
+tck eq get bmtrc 1 2
+tck eq get bmtrc 2 3
+tck eq get bmtrc 3 2
+tck eq get bmtrc 4 4
+tck eq get bmtrc 5 2
+tck eq get bmtrc 6 5
+tck eq get tlastdb 0 tok20
+note Teardown: disable -> drain -> reverse free (0xcec0 freed strictly before 0xca6f)
+tck eq rmdis 8 RMOK
+treplyrm tok20
+tck eq rmstep 1
+tck eq get rmst 0 RMSDRAIN
+tck eq rmdrain 0 4 RMOK
+put tfreecnt 0 0
+tck eq rmfree 8 RMOK
+while ne get rmst 0 RMSDONE bound 32
+treplyrm tok20
+tck eq rmstep 1
+end
+tck eq get tfreecnt 0 8
+tck eq get tfreeord 0 1008
+tck eq get tfreeord 1 1007
+tck eq get tfreeord 7 1001
+end
+
+fn main to int
+tck eq bminit 0 603979776 TBARSZ TBASE TRAMSZ TFRQ BMOK
+test_fw_bm
+r = write 1 TSTG 0 1
+test_arena_bm
+r = write 1 TSTG 1 1
+test_sec2_bm
+r = write 1 TSTG 2 1
+test_boot_seq_pd
+r = write 1 TSTG 3 1
+test_gmmu_bm
+r = write 1 TSTG 4 1
+test_rmchan_gb20b
+r = write 1 TSTG 5 2
+r = write 1 TPASS 0 len TPASS
+ret 0
+end
