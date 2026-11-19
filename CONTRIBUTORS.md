@@ -7,6 +7,8 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| Grok 4.7 (via Cursor Agent) | Kept the strict rerun JSON check when sealing R15 binaries, and made `verify_commit` archive the tree id stored in the commit object (`tools/r15_qualify.sh`) so a commit-graph cannot substitute another tree. |
+| OpenAI Codex | Bound R15 qualification to fresh candidate/dependency archives, sealed executables, per-execution digest checks, final tree state and receipt-enforced build provenance. |
 | Grok 4.7 (via Cursor Agent) | Ran the R15 rerun validator under qemu-user on this x86 host: the seeded compiler is AArch64, so `tools/r15_receipt.sh` uses `qemu-aarch64` only when `uname -m` is not aarch64. Added refusal cases for a second trailing JSON value and for a `\u0050ASS` value, which must still count as PASS. |
 | Codex | Replaced R15 rerun substring acceptance with strict seeded-Omega JSON and exact-schema validation, including duplicate, nested, malformed, extra-key and non-string regression controls. |
 | Grok 4.7 (via Cursor Agent) | Closed the pinned-checkout copy so a sibling `uploadpack.packObjectsHook` or fsmonitor does not run, took the root tree from the commit object, and refused a physics.lock that is not one 40-hex commit before any recipe echoes it. `tools/test_pinned_checkout.sh`: 15 checks PASS. |
