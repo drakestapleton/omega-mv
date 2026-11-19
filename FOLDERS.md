@@ -5,6 +5,17 @@ These notes were kept from the retired crumb files (Drake, 2026-11-08: "get rid 
 makes a note wrong, fix the note in the same change. Folders with no written note are not listed.
 Two crumb files already under evidence/ stay, because existing evidence is never deleted; their notes are still listed here.
 
+## `aienux/`
+
+Aienux, the OS layer of Sovereign Intelligence (SI), mirroring `gpu/`: pure-Omega units moved here from canonical Aienux (`rad:z2Q6ob2gL6Qo5oUMpyehukayVF7mN`, `1f12818d`) one slice per landing with the Git history of its Omega files. `aienux/README.md` gives the layout and `aienux/UNITS.md` lists the moved units.
+
+Rules:
+
+- only Omega source and the provenance tables describing the move; C, Rust, assembly, Python, shell and other files stay in Aienux until rewritten in Omega and are listed in `aienux/NOT-YET-OMEGA.tsv`
+- every unit is built by this repository's own `seed/out/omc`; no moved unit carries a compiler pin of its own and `aienux/units-gate.om` refuses any other compiler
+- `aienux/import/` is the record of each move (`filter-repo` command, `paths.txt`, `commit-map`, `ref-map`); never edited after the landing that wrote it
+- existing receipts stay in Aienux where they were written; new receipts are written in this repository's `evidence/`
+
 ## `bench/inference_cost/`
 
 Held-out inference-cost benchmark: evaluate verified programs produced per unit of inference cost; `handover.om` decides from its run records whether a candidate model takes over a job (no real handover decided yet)
