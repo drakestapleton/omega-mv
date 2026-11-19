@@ -84,3 +84,5 @@ Not here, because they are not Omega:
   nvml and smi READMEs and the crumb files.
 
 Nothing here opens a device; chip tiers stay NOT_RUN.
+
+`gpu/units-gate.om` and `gpu/extra-units-gate.om` also run every unit named in `gpu/units-run.tsv` and `gpu/extra-units-run.tsv` (`tests/gates/run.sh gpu-units`, `tests/gates/run.sh gpu-extra-units`): a `run` row must exit 0 with stdin `/dev/null`, write no stderr, and end its stdout with the recorded line; a `not_run` row is printed `NOT_RUN` and never counted as a pass. `gpu/units.tsv` has no test unit (0 runs); `gpu/extra-units.tsv` runs `adapters_test`, `head_to_head_test` and `forge_test` on the host CPU. No hardware unit (`ogd_*`, `driver_*`, `cuda_crack_*`) is ever executed; they stay compile-only.

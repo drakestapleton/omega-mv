@@ -15,11 +15,16 @@ note SCRATCH/NAME.om and compiled twice by OMC: each compile exits 0 with empty 
 note bytes. A malformed or repeated row, a missing part, a failed compile, two different outputs or a table with no
 note unit is a FAIL line. The runner (core/README.md) also requires the exact unit count.
 note Control, must be caught: a compiler one byte longer fails the digest check.
-note Output: one line per unit, then OMEGA-CORE-UNITS PASS|FAIL units=U controls=C caught=K hardware=NOT_RUN.
+note Output: one line per unit and per run, then OMEGA-CORE-UNITS PASS|FAIL units=U runs=R not_run=N controls=C caught=K
+note hardware=NOT_RUN.
 note Exit 0 PASS, 1 FAIL, 2 bad usage or setup, 69 compiler digest refused. Every input is length-checked; a trap
 note exit (101..114) would be a defect of this gate, never a pass.
-note This gate checks that the units compile reproducibly with this repository's compiler. It does not run them:
-note their behaviour checks are still C, Python and shell upstream (core/UNITS.md lists them).
+note Runs. core/units-run.tsv names the units this gate also executes, one row per line: NAME run LINE (SCRATCH/NAME.1
+note is run from the repository root with no arguments and stdin /dev/null; it must exit 0 with empty stderr and
+note its last non-empty stdout line must be LINE byte for byte) or NAME not_run REASON (built, never executed,
+note printed NOT_RUN and never counted as a pass). Every unit whose NAME ends in _test needs a row; a row naming
+note no unit, a repeated row or another mode is a FAIL. Control, must be caught: the first passing run does not
+note match its LINE with the last byte dropped. Hardware units are not tests here and are never executed.
 text t_pin "seed/out/omc.sha256"
 text t_tab "core/units.tsv"
 text t_om ".om"
@@ -61,6 +66,22 @@ text t_su " units="
 text t_sc " controls="
 text t_sk " caught="
 text t_hw " hardware=NOT_RUN\n"
+text t_rtab "core/units-run.tsv"
+text t_notrt "OMEGA-CORE-UNITS INVALID: cannot read core/units-run.tsv (or it is over 64 KiB)\n"
+text t_null "/dev/null"
+text t_ro ".r"
+text t_re ".re"
+text t_tsuf "_test"
+text t_run "run "
+text t_mnr "not_run "
+text t_nr "NOT_RUN unit "
+text t_norow "units-run.tsv: a _test unit has no row"
+text t_rmode "units-run.tsv: mode is neither run LINE nor not_run REASON"
+text t_rlast "last stdout line differs from units-run.tsv"
+text t_rorph "a row names no unit, or a name is repeated"
+text t_rctl "run-line-mismatch"
+text t_sr " runs="
+text t_snr " not_run="
 global g_pa uchar 4096
 global g_scr uchar 4096
 global g_omc uchar 4096
@@ -75,9 +96,10 @@ global g_d1 uchar 32
 global g_stb uchar 4
 global g_n ulong 32
 global g_seen uchar 65536
+global g_r uchar 65536
 note g_n: 0 path length, 1 omc length, 2 scratch length (with '/'), 3 argv bytes, 4 argc, 5 output length,
 note 6 buffer length, 7 table length, 8 units, 11 failures, 12 controls, 13 caught, 14 name length, 15 g_seen length,
-note 16 unit rows
+note 16 unit rows, 17 passing runs, 18 not_run rows, 19 run table length, 20 run table rows, 21 run rows matched
 note ---- output
 fn oc c ulong to void
 n = get g_n 5
@@ -610,6 +632,9 @@ ret
 end
 if compose k e
 z = build
+urun z
+else
+urun false
 end
 end
 note a unit name uses only A-Z a-z 0-9 _ (A-Z a-z 0-9 _), so it names a file in SCRATCH
@@ -693,6 +718,218 @@ ofail t_unit t_empty
 end
 ret true
 end
+note ---- runs
+note load the run table into g_r and count its rows (not empty, not #); false when unreadable or over 64 KiB
+fn rtable to bool
+pclr
+pt t_rtab
+put g_n 6 0
+if not bload
+ret false
+end
+n = get g_n 6
+if ge n len g_r
+ret false
+end
+for q ulong n bound 65536
+put g_r q get g_b q
+end
+put g_n 19 n
+c = ulong 0
+p = ulong 0
+while lt p n bound 65536
+q = p
+while and lt q n ne get g_r q 10 bound 65536
+q = add q 1
+end
+if gt q p
+if ne get g_r p 35
+c = add c 1
+end
+end
+p = add q 1
+end
+put g_n 20 c
+ret true
+end
+note the run row g_r[p, q) is for the current name: not a comment, NAME then a space
+fn rnameat p ulong q ulong to bool
+m = get g_n 14
+if le sub q p m
+ret false
+end
+if eq get g_r p 35
+ret false
+end
+for j ulong m bound 256
+if ne get g_r add p j get g_nm j
+ret false
+end
+end
+ret eq get g_r add p m 32
+end
+note the offset just past NAME and its space in the current name's run row, or 2^63 when there is none
+fn rfind to ulong
+n = get g_n 19
+p = ulong 0
+while lt p n bound 65536
+q = p
+while and lt q n ne get g_r q 10 bound 65536
+q = add q 1
+end
+if rnameat p q
+ret add p add get g_n 14 1
+end
+p = add q 1
+end
+ret shl ulong 1 63
+end
+note the end of the run row that holds offset a
+fn rend a ulong to ulong
+n = get g_n 19
+e = a
+while and lt e n ne get g_r e 10 bound 65536
+e = add e 1
+end
+ret e
+end
+note g_r[a, e) starts with t
+fn rpre a ulong e ulong t view uchar * to bool
+if gt add a len t e
+ret false
+end
+for j ulong len t bound 4096
+if ne get g_r add a j get t j
+ret false
+end
+end
+ret true
+end
+note the current name ends in _test
+fn istest to bool
+m = get g_n 14
+if lt m len t_tsuf
+ret false
+end
+b = sub m len t_tsuf
+for j ulong len t_tsuf bound 16
+if ne get g_nm add b j get t_tsuf j
+ret false
+end
+end
+ret true
+end
+note g_b[s, e) equals g_r[x, y)
+fn lineq s ulong e ulong x ulong y ulong to bool
+if ne sub e s sub y x
+ret false
+end
+for j ulong sub e s bound 65536
+if ne get g_b add s j get g_r add x j
+ret false
+end
+end
+ret true
+end
+note SCRATCH/NAME.1 < /dev/null > SCRATCH/NAME.r 2> SCRATCH/NAME.re
+fn xrun to ulong
+pclr
+pt t_null
+fi = frd
+aclr
+psn t_b1
+apa
+psn t_ro
+fo = fwr
+psn t_re
+fe = fwr
+ret spawn fi fo fe
+end
+note the current unit's run row, if any: run it (when built) or report it NOT_RUN
+fn urun z bool to void
+a = rfind
+if ge a shl ulong 1 63
+if istest
+ofail t_unit t_norow
+end
+ret
+end
+put g_n 21 add get g_n 21 1
+if not z
+ret
+end
+e = rend a
+if rpre a e t_mnr
+ot t_nr
+onm
+oc 32
+b = add a len t_mnr
+for j ulong sub e b bound 65536
+oc ulong get g_r add b j
+end
+onl
+put g_n 18 add get g_n 18 1
+ret
+end
+if not rpre a e t_run
+ofail t_unit t_rmode
+ret
+end
+x = add a len t_run
+if le e x
+ofail t_unit t_rmode
+ret
+end
+r = xrun
+if ne r 0
+ot t_fail
+ot t_run
+onm
+ot t_exit
+onum r
+onl
+put g_n 11 add get g_n 11 1
+ret
+end
+psn t_re
+if ne fsize 0
+ofail t_run t_stderr
+ret
+end
+psn t_ro
+put g_n 6 0
+if not bload
+ofail t_run t_big
+ret
+end
+f = get g_n 6
+while gt f 0 bound 16777217
+if ne get g_b sub f 1 10
+break
+end
+f = sub f 1
+end
+s = f
+while gt s 0 bound 16777217
+if eq get g_b sub s 1 10
+break
+end
+s = sub s 1
+end
+if not lineq s f x e
+ofail t_run t_rlast
+ret
+end
+ot t_ok
+ot t_run
+onm
+onl
+put g_n 17 add get g_n 17 1
+if eq get g_n 17 1
+c = not lineq s f x sub e 1
+caught c t_rctl
+end
+end
 note ---- controls
 fn caught c bool what view uchar * to void
 put g_n 12 add get g_n 12 1
@@ -767,9 +1004,17 @@ ret 2
 end
 put g_scr n 47
 put g_n 2 add n 1
+if not rtable
+r = write 2 t_notrt 0 len t_notrt
+ret 2
+end
 if not table
 r = write 2 t_notab 0 len t_notab
 ret 2
+end
+if ne get g_n 20 get g_n 21
+nmset t_rtab
+ofail t_unit t_rorph
 end
 cwrong
 f = get g_n 11
@@ -781,6 +1026,10 @@ ot t_fl
 end
 ot t_su
 onum get g_n 8
+ot t_sr
+onum get g_n 17
+ot t_snr
+onum get g_n 18
 ot t_sc
 onum get g_n 12
 ot t_sk

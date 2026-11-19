@@ -220,20 +220,34 @@ case "$step" in
     [ "$rc" -eq 0 ] || exit "$rc"
     grep -qx 'OMEGA-GPU-AMD-REST PASS sections=34 objects=34 verdicts=377 not_run=120 writer=19 kfd=103 plan=200 controls=14 caught=14 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
       { echo "OMEGA-GPU-AMD-REST FAIL: the summary line does not show the expected sections, verdicts, plan rows and controls" >&2; exit 1; } ;;
-  # Omega GPU units (gpu/units.tsv, moved from CUDApp om/ and backend/): the gate is seeded Omega, gpu/units-gate.om,
-  # Omega GPU units (gpu/units.tsv, moved from CUDApp om/, backend/ and native/): the gate is seeded Omega, gpu/units-gate.om,
-  # built with seed/ng/sha256.om by seed/out/omc after that compiler's digest is checked; the gate checks it again.
-  # The expected count follows gpu/units.tsv; a change to the table changes it in the same commit.
-  gpu-units)
-    sha256sum -c --quiet seed/out/omc.sha256 || { echo "OMEGA-GPU-UNITS REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
+  # Omega layer units (LAYER/units.tsv; gpu also has gpu/extra-units.tsv): each gate is seeded Omega,
+  # LAYER/units-gate.om (gpu/extra-units-gate.om), built with seed/ng/sha256.om by seed/out/omc after that compiler's
+  # digest is checked; the gate checks it again. It compiles every unit twice, and runs every unit named in
+  # LAYER/units-run.tsv (every *_test unit needs a row): exit 0, empty stderr, last stdout line as recorded, or
+  # NOT_RUN with its reason, never counted as a pass. Host only: no row runs a hardware unit.
+  # The expected counts follow the tables; a change to a table changes them in the same commit.
+  gpu-units|gpu-extra-units|aienux-units|apps-units|bridge-units|core-units|protocol-units|si-units|train-units)
+    case "$step" in
+      gpu-units)       src=gpu/units-gate.om;       want="OMEGA-GPU-UNITS PASS units=405 runs=0 not_run=0 controls=1 caught=1 hardware=NOT_RUN" ;;
+      gpu-extra-units) src=gpu/extra-units-gate.om; want="OMEGA-GPU-EXTRA-UNITS PASS units=17 runs=3 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      aienux-units)    src=aienux/units-gate.om;    want="OMEGA-AIENUX-UNITS PASS units=73 runs=3 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      apps-units)      src=apps/units-gate.om;      want="OMEGA-APPS-UNITS PASS units=127 runs=4 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      bridge-units)    src=bridge/units-gate.om;    want="OMEGA-BRIDGE-UNITS PASS units=175 runs=0 not_run=1 controls=1 caught=1 hardware=NOT_RUN" ;;
+      core-units)      src=core/units-gate.om;      want="OMEGA-CORE-UNITS PASS units=44 runs=6 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      protocol-units)  src=protocol/units-gate.om;  want="OMEGA-PROTOCOL-UNITS PASS units=23 runs=3 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      si-units)        src=si/units-gate.om;        want="OMEGA-SI-UNITS PASS units=499 runs=8 not_run=0 controls=2 caught=2 hardware=NOT_RUN" ;;
+      train-units)     src=train/units-gate.om;     want="OMEGA-TRAIN-UNITS PASS units=78 runs=0 not_run=0 controls=1 caught=1 hardware=NOT_RUN" ;;
+    esac
+    tag="${want%% *}"
+    sha256sum -c --quiet seed/out/omc.sha256 || { echo "$tag REFUSED: seed/out/omc differs from seed/out/omc.sha256" >&2; exit 69; }
     rm -rf "$OUT_DIR/gate" "$OUT_DIR/work"
-    { printf 'om2\n'; cat seed/ng/sha256.om gpu/units-gate.om; } | seed/out/omc > "$OUT_DIR/gate"
+    { printf 'om2\n'; cat seed/ng/sha256.om "$src"; } | seed/out/omc > "$OUT_DIR/gate"
     chmod 700 "$OUT_DIR/gate"
-    rc=0; "$OUT_DIR/gate" seed/out/omc "$OUT_DIR/work" > "$OUT_DIR/gate.log" || rc=$?
+    rc=0; "$OUT_DIR/gate" seed/out/omc "$OUT_DIR/work" < /dev/null > "$OUT_DIR/gate.log" || rc=$?
     cat "$OUT_DIR/gate.log"
     [ "$rc" -eq 0 ] || exit "$rc"
-    grep -qx 'OMEGA-GPU-UNITS PASS units=405 controls=1 caught=1 hardware=NOT_RUN' "$OUT_DIR/gate.log" ||
-      { echo "OMEGA-GPU-UNITS FAIL: the summary line does not show the expected units and controls" >&2; exit 1; } ;;
+    grep -qx "$want" "$OUT_DIR/gate.log" ||
+      { echo "$tag FAIL: the summary line does not show the expected units, runs, not_run rows and controls" >&2; exit 1; } ;;
   # One slice of the CUDApp merge: new Omega for part of the C decision logic of CUDApp nvrm/ and m16/ (gpu/nvidia/driver/). The gate is seeded Omega,
   # gpu/nvidia/driver/gate.om, composed in the order of gpu/nvidia/driver/parts.txt and built by seed/out/omc after its
   # digest is checked. It recomputes every case the C oracle printed (oracle-cases.tsv) and runs one changed-answer
