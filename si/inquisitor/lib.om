@@ -35,18 +35,25 @@ const SUB_STUB_HARD ulong 15
 const SUB_TODO_WARN ulong 16
 const SUB_UNSLOP_DASH ulong 17
 const SUB_UNSLOP_BUZZ ulong 18
+const SUB_PATH_AIEN_TEST ulong 19
 
 const INQ_MAX_IN ulong 131072
 const INQ_MAX_OUT ulong 32768
 const INQ_MAX_FIND ulong 128
-const INQ_PATH_CAP ulong 4096
 
 global inq_in uchar 131072
 global inq_in_len ulong 1
 global inq_out uchar 32768
 global inq_out_len ulong 1
-global inq_path uchar 4096
+global inq_path_off ulong 1
 global inq_path_len ulong 1
+global inq_a_off ulong 1
+global inq_a_len ulong 1
+global inq_tmp_off ulong 1
+global inq_tmp_len ulong 1
+global inq_num_val ulong 1
+global inq_num_pos ulong 1
+global inq_num_ok ulong 1
 
 global inq_verdict ulong 1
 global inq_blocks ulong 1
@@ -63,6 +70,13 @@ global inq_find_line ulong 128
 global inq_find_sub ulong 128
 
 global inq_in_bin ulong 1
+global inq_in_hunk ulong 1
+global inq_hunk_has_cnt ulong 1
+global inq_hunk_old ulong 1
+global inq_hunk_new ulong 1
+global inq_expect_plus ulong 1
+global inq_has_git_hdr ulong 1
+global inq_in_git_body ulong 1
 global inq_skip_file ulong 1
 global inq_diff_checked ulong 1
 global inq_seen_notrun ulong 1
@@ -76,12 +90,31 @@ note Diff header prefixes
 text p_diff_git "diff --git "
 text p_plus3 "+++ "
 text p_minus3 "--- "
+text p_hunk "@@ "
+text p_hunk3 "@@@ "
 text p_bin_files "Binary files "
 text p_git_bin "GIT binary patch"
 text p_file_rec "FILE: "
 text p_dev_null "/dev/null"
 text p_b_slash "b/"
 text p_a_slash "a/"
+text p_sp_b_slash " b/"
+text p_sp_qb_slash " \"b/"
+text p_sp_and_sp " and "
+text p_sp_and_b " and b/"
+text p_sp_and_dev " and /dev/null"
+text p_sp_differ " differ"
+text p_ren_from "rename from "
+text p_ren_to "rename to "
+text p_cpy_from "copy from "
+text p_cpy_to "copy to "
+text p_hdr_idx "index "
+text p_hdr_omode "old mode "
+text p_hdr_nmode "new mode "
+text p_hdr_nfmode "new file mode "
+text p_hdr_dfmode "deleted file mode "
+text p_hdr_sim "similarity index "
+text p_hdr_dis "dissimilarity index "
 
 note Self-exclusion paths for non-secret rule literals (DRA-440: never exempt from secrets scanning)
 text p_self_inq "spark-inquisitor"
@@ -100,6 +133,8 @@ text p_ghwf_pre ".github/workflows/"
 text p_ghwf_mid "/.github/workflows/"
 text p_fgjo_pre ".forgejo/"
 text p_fgjo_mid "/.forgejo/"
+text p_aient_pre "tools/aien-test/"
+text p_aient_mid "/tools/aien-test/"
 text p_ext_md ".md"
 
 note Secret patterns
@@ -253,6 +288,7 @@ text sd_evid "protected_evidence_path"
 text sd_aien "protected_aien_path"
 text sd_gates "protected_gates_path"
 text sd_ci "protected_ci_workflow_path"
+text sd_aient "protected_aien_test_path"
 text sd_dirty "dirty_worktree_flag"
 text sd_fpi "not_run_or_skipped_labelled_pass"
 text sd_fpr "audit_record_pass_with_zero_or_not_run"
@@ -307,7 +343,12 @@ ret mul x ulong 0x100000001b3
 end
 
 fn inq_reset to void
+put inq_path_off 0 0
 put inq_path_len 0 0
+put inq_a_off 0 0
+put inq_a_len 0 0
+put inq_tmp_off 0 0
+put inq_tmp_len 0 0
 put inq_out_len 0 0
 put inq_verdict 0 SEV_PASS
 put inq_blocks 0 0
@@ -317,6 +358,13 @@ put inq_lines 0 0
 put inq_added 0 0
 put inq_find_cnt 0 0
 put inq_in_bin 0 0
+put inq_in_hunk 0 0
+put inq_hunk_has_cnt 0 0
+put inq_hunk_old 0 0
+put inq_hunk_new 0 0
+put inq_expect_plus 0 0
+put inq_has_git_hdr 0 0
+put inq_in_git_body 0 0
 put inq_skip_file 0 0
 put inq_diff_checked 0 0
 put inq_seen_notrun 0 0
@@ -459,117 +507,142 @@ end
 ret false
 end
 
-fn inq_path_starts pat view uchar * to bool
-pn = get inq_path_len 0
+fn inq_find_substr_cs off ulong nlen ulong pat view uchar * to ulong
 pl = len pat
-if lt pn pl
+if or eq pl 0 lt nlen pl
+ret nlen
+end
+lim = add sub nlen pl 1
+for i ulong lim bound 131072
+if inq_match_cs add off i pat
+ret i
+end
+end
+ret nlen
+end
+
+fn inq_slice_eq_pat off ulong nlen ulong pat view uchar * to bool
+if ne nlen len pat
+ret false
+end
+for i ulong nlen bound 128
+if ne get inq_in add off i get pat i
+ret false
+end
+end
+ret true
+end
+
+fn inq_slice_eq_in off1 ulong len1 ulong off2 ulong len2 ulong to bool
+if ne len1 len2
+ret false
+end
+for i ulong len1 bound 131072
+if ne get inq_in add off1 i get inq_in add off2 i
+ret false
+end
+end
+ret true
+end
+
+fn inq_slice_starts_ci off ulong nlen ulong pat view uchar * to bool
+pl = len pat
+if lt nlen pl
 ret false
 end
 for i ulong pl bound 128
-if ne inq_to_lower get inq_path i inq_to_lower get pat i
+if ne inq_to_lower get inq_in add off i inq_to_lower get pat i
 ret false
 end
 end
 ret true
 end
 
-fn inq_path_ends pat view uchar * to bool
-pn = get inq_path_len 0
+fn inq_slice_ends_ci off ulong nlen ulong pat view uchar * to bool
 pl = len pat
-if lt pn pl
+if lt nlen pl
 ret false
 end
-base = sub pn pl
+base = add off sub nlen pl
 for i ulong pl bound 128
-if ne inq_to_lower get inq_path add base i inq_to_lower get pat i
+if ne inq_to_lower get inq_in add base i inq_to_lower get pat i
 ret false
 end
 end
 ret true
 end
 
-fn inq_path_match_ci pos ulong pat view uchar * to bool
-pl = len pat
-for j ulong pl bound 128
-c1 = inq_to_lower get inq_path add pos j
-c2 = inq_to_lower get pat j
-if ne c1 c2
-ret false
-end
-end
-ret true
-end
-
-fn inq_path_contains pat view uchar * to bool
-pn = get inq_path_len 0
-pl = len pat
-if or eq pl 0 lt pn pl
-ret false
-end
-lim = add sub pn pl 1
-for i ulong lim bound 4096
-if inq_path_match_ci i pat
-ret true
-end
-end
-ret false
-end
-
-fn inq_path_is_env to bool
-pn = get inq_path_len 0
-if lt pn 4
+fn inq_slice_is_env off ulong nlen ulong to bool
+if lt nlen 4
 ret false
 end
 base = ulong 0
-for i ulong pn bound 4096
-if eq get inq_path i 47
+for i ulong nlen bound 131072
+if eq get inq_in add off i 47
 base = add i 1
 end
 end
-blen = sub pn base
+blen = sub nlen base
 if lt blen 4
 ret false
 end
-if ne get inq_path base 46
+p0 = add off base
+if ne get inq_in p0 46
 ret false
 end
-if ne inq_to_lower get inq_path add base 1 101
+if ne inq_to_lower get inq_in add p0 1 101
 ret false
 end
-if ne inq_to_lower get inq_path add base 2 110
+if ne inq_to_lower get inq_in add p0 2 110
 ret false
 end
-if ne inq_to_lower get inq_path add base 3 118
+if ne inq_to_lower get inq_in add p0 3 118
 ret false
 end
 if eq blen 4
 ret true
 end
-if eq get inq_path add base 4 46
+if eq get inq_in add p0 4 46
 ret true
 end
 ret false
 end
 
-fn inq_set_path off ulong nlen ulong to void
+fn inq_is_trim_char c uchar to bool
+if or eq c 32 or eq c 9 eq c 13
+ret true
+end
+if or eq c 34 eq c 39
+ret true
+end
+ret false
+end
+
+fn inq_trim_slice off ulong nlen ulong to void
 s = off
 e = add off nlen
 while lt s e bound 131072
-c = get inq_in s
-if or eq c 32 or eq c 9 or eq c 34 eq c 39
+if inq_is_trim_char get inq_in s
 s = add s 1
 else
 break
 end
 end
 while gt e s bound 131072
-c = get inq_in sub e 1
-if or eq c 32 or eq c 9 or eq c 13 or eq c 34 eq c 39
+if inq_is_trim_char get inq_in sub e 1
 e = sub e 1
 else
 break
 end
 end
+put inq_tmp_off 0 s
+put inq_tmp_len 0 sub e s
+end
+
+fn inq_norm_slice off ulong nlen ulong to void
+inq_trim_slice off nlen
+s = get inq_tmp_off 0
+e = add s get inq_tmp_len 0
 if ge sub e s 2
 c0 = get inq_in s
 c1 = get inq_in add s 1
@@ -577,52 +650,101 @@ if and eq c1 47 or eq c0 97 eq c0 98
 s = add s 2
 end
 end
-plen = sub e s
-if gt plen INQ_PATH_CAP
-s = sub e INQ_PATH_CAP
-plen = INQ_PATH_CAP
+while ge sub e s 2 bound 65536
+c0 = get inq_in s
+c1 = get inq_in add s 1
+if and eq c0 46 eq c1 47
+s = add s 2
+else
+break
 end
-for i ulong plen bound 4096
-put inq_path i get inq_in add s i
 end
-put inq_path_len 0 plen
-if or inq_path_contains p_self_inq inq_path_contains p_self_con
+put inq_tmp_off 0 s
+put inq_tmp_len 0 sub e s
+end
+
+fn inq_set_active_path off ulong nlen ulong to void
+put inq_path_off 0 off
+put inq_path_len 0 nlen
+if or inq_contains_ci off nlen p_self_inq inq_contains_ci off nlen p_self_con
 put inq_skip_file 0 1
 else
 put inq_skip_file 0 0
 end
 end
 
-fn inq_check_path line_no ulong to void
-if eq get inq_path_len 0 0
+fn inq_check_path_slice off ulong nlen ulong line_no ulong to void
+if eq nlen 0
 ret
 end
-if inq_path_is_env
+if inq_slice_eq_pat off nlen p_dev_null
+ret
+end
+if inq_slice_is_env off nlen
 inq_record RULE_ENV_FILE SEV_BLOCK line_no SUB_ENV_FILE
 end
-if or inq_path_starts p_evid_pre inq_path_contains p_evid_mid
+if or inq_slice_starts_ci off nlen p_evid_pre inq_contains_ci off nlen p_evid_mid
 inq_record RULE_PROTECTED_PATH SEV_BLOCK line_no SUB_PATH_EVIDENCE
 end
-if or inq_path_starts p_aien_pre inq_path_contains p_aien_mid
+if or inq_slice_starts_ci off nlen p_aien_pre inq_contains_ci off nlen p_aien_mid
 inq_record RULE_PROTECTED_PATH SEV_BLOCK line_no SUB_PATH_AIEN
 end
-if or inq_path_starts p_gates_pre inq_path_contains p_gates_mid
+if or inq_slice_starts_ci off nlen p_gates_pre inq_contains_ci off nlen p_gates_mid
 inq_record RULE_PROTECTED_PATH SEV_BLOCK line_no SUB_PATH_GATES
 end
-if or inq_path_starts p_ghwf_pre inq_path_contains p_ghwf_mid
+if or inq_slice_starts_ci off nlen p_ghwf_pre inq_contains_ci off nlen p_ghwf_mid
 inq_record RULE_PROTECTED_PATH SEV_BLOCK line_no SUB_PATH_CI
 else
-if or inq_path_starts p_fgjo_pre inq_path_contains p_fgjo_mid
+if or inq_slice_starts_ci off nlen p_fgjo_pre inq_contains_ci off nlen p_fgjo_mid
 inq_record RULE_PROTECTED_PATH SEV_BLOCK line_no SUB_PATH_CI
 end
 end
+if or inq_slice_starts_ci off nlen p_aient_pre inq_contains_ci off nlen p_aient_mid
+inq_record RULE_PROTECTED_PATH SEV_BLOCK line_no SUB_PATH_AIEN_TEST
+end
+end
+
+fn inq_diff_git_find_t2 pos ulong end_p ulong to ulong
+rem_l = sub end_p pos
+idx = inq_find_substr_cs pos rem_l p_sp_b_slash
+if lt idx rem_l
+ret add pos add idx 1
+end
+idx = inq_find_substr_cs pos rem_l p_sp_qb_slash
+if lt idx rem_l
+ret add pos add idx 1
+end
+p = pos
+while lt p end_p bound 131072
+if ne get inq_in p 32
+p = add p 1
+else
+break
+end
+end
+while lt p end_p bound 131072
+if eq get inq_in p 32
+p = add p 1
+else
+break
+end
+end
+ret p
 end
 
 fn inq_parse_diff_git off ulong nlen ulong line_no ulong to void
 put inq_in_bin 0 0
-put inq_diff_checked 0 1
+put inq_in_hunk 0 0
+put inq_hunk_has_cnt 0 0
+put inq_hunk_old 0 0
+put inq_hunk_new 0 0
+put inq_expect_plus 0 1
+put inq_has_git_hdr 0 1
+put inq_in_git_body 0 0
+put inq_diff_checked 0 0
+put inq_a_off 0 0
+put inq_a_len 0 0
 put inq_files 0 add get inq_files 0 1
-note Extract second token after "diff --git " (e.g. b/path)
 pos = add off 11
 end_p = add off nlen
 while lt pos end_p bound 131072
@@ -632,91 +754,415 @@ else
 break
 end
 end
-note Skip first path token (a/...)
-while lt pos end_p bound 131072
-if ne get inq_in pos 32
-pos = add pos 1
+if ge pos end_p
+ret
+end
+t2_s = inq_diff_git_find_t2 pos end_p
+if lt t2_s end_p
+t1_e = t2_s
+while gt t1_e pos bound 131072
+if eq get inq_in sub t1_e 1 32
+t1_e = sub t1_e 1
 else
 break
 end
 end
-while lt pos end_p bound 131072
-if eq get inq_in pos 32
-pos = add pos 1
+inq_norm_slice pos sub t1_e pos
+a_off = get inq_tmp_off 0
+a_len = get inq_tmp_len 0
+put inq_a_off 0 a_off
+put inq_a_len 0 a_len
+inq_norm_slice t2_s sub end_p t2_s
+b_off = get inq_tmp_off 0
+b_len = get inq_tmp_len 0
+if not inq_slice_eq_in a_off a_len b_off b_len
+inq_check_path_slice a_off a_len line_no
+end
+inq_set_active_path b_off b_len
+inq_check_path_slice b_off b_len line_no
+put inq_diff_checked 0 1
 else
-break
+inq_norm_slice pos sub end_p pos
+a_off = get inq_tmp_off 0
+a_len = get inq_tmp_len 0
+put inq_a_off 0 a_off
+put inq_a_len 0 a_len
+inq_set_active_path a_off a_len
+inq_check_path_slice a_off a_len line_no
 end
 end
-if lt pos end_p
-inq_set_path pos sub end_p pos
-inq_check_path line_no
+
+fn inq_strip_tab_len pos ulong rem_l ulong to ulong
+tab_i = ulong 0
+while lt tab_i rem_l bound 131072
+if eq get inq_in add pos tab_i 9
+ret tab_i
+end
+tab_i = add tab_i 1
+end
+ret rem_l
+end
+
+fn inq_plus_header_allowed off ulong nlen ulong to bool
+if eq get inq_expect_plus 0 0
+ret false
+end
+if eq get inq_expect_plus 0 2
+ret true
+end
+pos = add off 4
+inq_trim_slice pos inq_strip_tab_len pos sub nlen 4
+s = get inq_tmp_off 0
+tl = get inq_tmp_len 0
+if inq_slice_eq_pat s tl p_dev_null
+ret true
+end
+if ge tl 2
+if eq get inq_in s 98
+if eq get inq_in add s 1 47
+ret true
+end
+end
+end
+ret false
+end
+
+fn inq_minus_is_git_path off ulong nlen ulong to bool
+pos = add off 4
+inq_trim_slice pos inq_strip_tab_len pos sub nlen 4
+s = get inq_tmp_off 0
+tl = get inq_tmp_len 0
+if inq_slice_eq_pat s tl p_dev_null
+ret true
+end
+if ge tl 2
+if eq get inq_in add s 1 47
+c0 = get inq_in s
+if or eq c0 97 eq c0 98
+ret true
+end
+end
+end
+ret false
+end
+
+fn inq_parse_minus_header off ulong nlen ulong line_no ulong exp_mode ulong to void
+put inq_in_bin 0 0
+put inq_expect_plus 0 exp_mode
+pos = add off 4
+rem_l = inq_strip_tab_len pos sub nlen 4
+inq_norm_slice pos rem_l
+ns = get inq_tmp_off 0
+npl = get inq_tmp_len 0
+if or eq npl 0 inq_slice_eq_pat ns npl p_dev_null
+ret
+end
+already = false
+if eq get inq_diff_checked 0 1
+if inq_slice_eq_in ns npl get inq_a_off 0 get inq_a_len 0
+already = true
+end
+end
+if not already
+inq_check_path_slice ns npl line_no
 end
 end
 
 fn inq_parse_plus_header off ulong nlen ulong line_no ulong to void
 put inq_in_bin 0 0
+put inq_expect_plus 0 0
+if eq get inq_has_git_hdr 0 1
+put inq_in_git_body 0 1
+end
 pos = add off 4
-rem_l = sub nlen 4
-note Strip optional diff -u tab-delimited timestamp after path
-tab_i = ulong 0
-while lt tab_i rem_l bound 131072
-if eq get inq_in add pos tab_i 9
-rem_l = tab_i
-break
-end
-tab_i = add tab_i 1
-end
-if inq_starts_cs pos rem_l p_dev_null
+rem_l = inq_strip_tab_len pos sub nlen 4
+inq_norm_slice pos rem_l
+ns = get inq_tmp_off 0
+npl = get inq_tmp_len 0
+if or eq npl 0 inq_slice_eq_pat ns npl p_dev_null
 put inq_diff_checked 0 0
 ret
 end
-inq_set_path pos rem_l
-if eq get inq_diff_checked 0 0
-put inq_files 0 add get inq_files 0 1
-inq_check_path line_no
-else
+already = false
+if eq get inq_diff_checked 0 1
+if inq_slice_eq_in ns npl get inq_path_off 0 get inq_path_len 0
+already = true
+end
+end
+inq_set_active_path ns npl
 put inq_diff_checked 0 0
+if not already
+put inq_files 0 add get inq_files 0 1
+inq_check_path_slice ns npl line_no
+end
+end
+
+fn inq_check_bin_pair a_off ulong a_len ulong b_off ulong b_len ulong line_no ulong to void
+a_ok = and gt a_len 0 not inq_slice_eq_pat a_off a_len p_dev_null
+b_ok = and gt b_len 0 not inq_slice_eq_pat b_off b_len p_dev_null
+if or a_ok b_ok
+put inq_files 0 add get inq_files 0 1
+end
+if a_ok
+if or not b_ok not inq_slice_eq_in a_off a_len b_off b_len
+inq_check_path_slice a_off a_len line_no
+end
+end
+if b_ok
+inq_set_active_path b_off b_len
+inq_check_path_slice b_off b_len line_no
+else
+if a_ok
+inq_set_active_path a_off a_len
+end
 end
 end
 
 fn inq_parse_bin_files off ulong nlen ulong line_no ulong to void
 note Format: "Binary files <src> and <dst> differ"
 put inq_in_bin 0 0
+put inq_in_hunk 0 0
+put inq_hunk_has_cnt 0 0
+put inq_hunk_old 0 0
+put inq_hunk_new 0 0
+put inq_expect_plus 0 0
+put inq_has_git_hdr 0 0
+put inq_in_git_body 0 0
 put inq_diff_checked 0 0
-pos = add off 13
+s = add off 13
+e = add off nlen
+while gt e s bound 131072
+c = get inq_in sub e 1
+if or eq c 32 eq c 13
+e = sub e 1
+else
+break
+end
+end
+if ge sub e s 7
+if inq_match_cs sub e 7 p_sp_differ
+e = sub e 7
+end
+end
+rem_l = sub e s
+sp = inq_find_substr_cs s rem_l p_sp_and_b
+if eq sp rem_l
+sp = inq_find_substr_cs s rem_l p_sp_and_dev
+end
+if eq sp rem_l
+sp = inq_find_substr_cs s rem_l p_sp_and_sp
+end
+if ge sp rem_l
+ret
+end
+inq_norm_slice s sp
+a_off = get inq_tmp_off 0
+a_len = get inq_tmp_len 0
+dst_s = add s add sp 5
+inq_norm_slice dst_s sub e dst_s
+inq_check_bin_pair a_off a_len get inq_tmp_off 0 get inq_tmp_len 0 line_no
+end
+
+fn inq_read_u64_at pos ulong end_p ulong to void
+digits = ulong 0
+val = ulong 0
+p = pos
+while lt p end_p bound 131072
+c = get inq_in p
+if and ge c 48 le c 57
+digits = add digits 1
+if le digits 9
+val = add mul val 10 ulong sub c 48
+end
+p = add p 1
+else
+break
+end
+end
+put inq_num_pos 0 p
+put inq_num_val 0 val
+if and gt digits 0 le digits 9
+put inq_num_ok 0 1
+else
+put inq_num_ok 0 0
+end
+end
+
+fn inq_parse_hunk_hdr off ulong nlen ulong to void
+put inq_in_bin 0 0
+put inq_expect_plus 0 0
+if eq get inq_has_git_hdr 0 1
+put inq_in_git_body 0 1
+end
+put inq_in_hunk 0 1
+put inq_hunk_has_cnt 0 0
+put inq_hunk_old 0 0
+put inq_hunk_new 0 0
+p = add off 3
 end_p = add off nlen
-tok_idx = ulong 0
-dst_s = ulong 0
-dst_e = ulong 0
-while lt pos end_p bound 131072
-while lt pos end_p bound 131072
-if eq get inq_in pos 32
-pos = add pos 1
+while lt p end_p bound 131072
+if eq get inq_in p 32
+p = add p 1
 else
 break
 end
 end
-ts = pos
-while lt pos end_p bound 131072
-if ne get inq_in pos 32
-pos = add pos 1
+if ge p end_p
+ret
+end
+if ne get inq_in p 45
+ret
+end
+p = add p 1
+inq_read_u64_at p end_p
+if eq get inq_num_ok 0 0
+ret
+end
+p = get inq_num_pos 0
+old_c = ulong 1
+if lt p end_p
+if eq get inq_in p 44
+p = add p 1
+inq_read_u64_at p end_p
+if eq get inq_num_ok 0 0
+ret
+end
+old_c = get inq_num_val 0
+p = get inq_num_pos 0
+end
+end
+if ge p end_p
+ret
+end
+if ne get inq_in p 32
+ret
+end
+while lt p end_p bound 131072
+if eq get inq_in p 32
+p = add p 1
 else
 break
 end
 end
-if gt pos ts
-if eq tok_idx 2
-dst_s = ts
-dst_e = pos
+if ge p end_p
+ret
 end
-tok_idx = add tok_idx 1
+if ne get inq_in p 43
+ret
+end
+p = add p 1
+inq_read_u64_at p end_p
+if eq get inq_num_ok 0 0
+ret
+end
+p = get inq_num_pos 0
+new_c = ulong 1
+if lt p end_p
+if eq get inq_in p 44
+p = add p 1
+inq_read_u64_at p end_p
+if eq get inq_num_ok 0 0
+ret
+end
+new_c = get inq_num_val 0
+p = get inq_num_pos 0
 end
 end
-if gt dst_e dst_s
-put inq_files 0 add get inq_files 0 1
-inq_set_path dst_s sub dst_e dst_s
-inq_check_path line_no
+if ge p end_p
+ret
 end
+if ne get inq_in p 32
+ret
+end
+while lt p end_p bound 131072
+if eq get inq_in p 32
+p = add p 1
+else
+break
+end
+end
+if lt sub end_p p 2
+ret
+end
+if or ne get inq_in p 64 ne get inq_in add p 1 64
+ret
+end
+if and eq old_c 0 eq new_c 0
+put inq_in_hunk 0 0
+ret
+end
+put inq_hunk_old 0 old_c
+put inq_hunk_new 0 new_c
+put inq_hunk_has_cnt 0 1
+end
+
+fn inq_hunk_step kind ulong to void
+if eq get inq_in_hunk 0 0
+ret
+end
+if eq get inq_hunk_has_cnt 0 0
+ret
+end
+old_r = get inq_hunk_old 0
+new_r = get inq_hunk_new 0
+if or eq kind 0 eq kind 45
+if gt old_r 0
+old_r = sub old_r 1
+put inq_hunk_old 0 old_r
+end
+end
+if or eq kind 0 eq kind 43
+if gt new_r 0
+new_r = sub new_r 1
+put inq_hunk_new 0 new_r
+end
+end
+if and eq old_r 0 eq new_r 0
+put inq_in_hunk 0 0
+put inq_hunk_has_cnt 0 0
+end
+end
+
+fn inq_try_git_ext_hdr off ulong nlen ulong line_no ulong to bool
+if inq_starts_cs off nlen p_ren_from
+inq_norm_slice add off 12 sub nlen 12
+inq_check_path_slice get inq_tmp_off 0 get inq_tmp_len 0 line_no
+ret true
+end
+if inq_starts_cs off nlen p_ren_to
+inq_norm_slice add off 10 sub nlen 10
+ns = get inq_tmp_off 0
+npl = get inq_tmp_len 0
+inq_set_active_path ns npl
+inq_check_path_slice ns npl line_no
+ret true
+end
+if inq_starts_cs off nlen p_cpy_from
+inq_norm_slice add off 10 sub nlen 10
+inq_check_path_slice get inq_tmp_off 0 get inq_tmp_len 0 line_no
+ret true
+end
+if inq_starts_cs off nlen p_cpy_to
+inq_norm_slice add off 8 sub nlen 8
+ns = get inq_tmp_off 0
+npl = get inq_tmp_len 0
+inq_set_active_path ns npl
+inq_check_path_slice ns npl line_no
+ret true
+end
+if or inq_starts_cs off nlen p_hdr_idx inq_starts_cs off nlen p_hdr_omode
+ret true
+end
+if or inq_starts_cs off nlen p_hdr_nmode inq_starts_cs off nlen p_hdr_nfmode
+ret true
+end
+if or inq_starts_cs off nlen p_hdr_dfmode inq_starts_cs off nlen p_hdr_sim
+ret true
+end
+if inq_starts_cs off nlen p_hdr_dis
+ret true
+end
+ret false
 end
 
 fn inq_has_aws_key off ulong nlen ulong to bool
@@ -931,7 +1377,7 @@ if inq_has_tel_vendor off nlen
 inq_record RULE_TELEMETRY SEV_BLOCK line_no SUB_TELEM_VENDOR
 ret
 end
-if not inq_path_ends p_ext_md
+if not inq_slice_ends_ci get inq_path_off 0 get inq_path_len 0 p_ext_md
 if inq_contains_ci off nlen p_tel_raw
 if not inq_tel_is_negated off nlen
 inq_record RULE_TELEMETRY SEV_BLOCK line_no SUB_TELEM_RAW
@@ -1049,12 +1495,20 @@ if eq nlen 0
 put inq_seen_notrun 0 0
 put inq_seen_pass 0 0
 put inq_rec_flagged 0 0
+put inq_expect_plus 0 0
+if eq get inq_in_hunk 0 1
+inq_hunk_step 0
+end
 ret
 end
 if and eq nlen 3 inq_starts_cs off nlen p_rec_sep
 put inq_seen_notrun 0 0
 put inq_seen_pass 0 0
 put inq_rec_flagged 0 0
+put inq_expect_plus 0 0
+if eq get inq_in_hunk 0 1
+inq_hunk_step 45
+end
 ret
 end
 if inq_starts_cs off nlen p_diff_git
@@ -1066,18 +1520,18 @@ ret
 end
 if inq_starts_cs off nlen p_file_rec
 put inq_in_bin 0 0
+put inq_in_hunk 0 0
+put inq_hunk_has_cnt 0 0
+put inq_expect_plus 0 0
+put inq_has_git_hdr 0 0
+put inq_in_git_body 0 0
 put inq_diff_checked 0 0
 put inq_files 0 add get inq_files 0 1
-inq_set_path add off 6 sub nlen 6
-inq_check_path line_no
-ret
-end
-if inq_starts_cs off nlen p_plus3
-inq_parse_plus_header off nlen line_no
-ret
-end
-if inq_starts_cs off nlen p_minus3
-put inq_in_bin 0 0
+inq_norm_slice add off 6 sub nlen 6
+ns = get inq_tmp_off 0
+npl = get inq_tmp_len 0
+inq_set_active_path ns npl
+inq_check_path_slice ns npl line_no
 ret
 end
 if inq_starts_cs off nlen p_bin_files
@@ -1086,12 +1540,76 @@ ret
 end
 if inq_starts_cs off nlen p_git_bin
 put inq_in_bin 0 1
+put inq_in_hunk 0 0
+put inq_hunk_has_cnt 0 0
+put inq_expect_plus 0 0
+put inq_has_git_hdr 0 0
+put inq_in_git_body 0 0
+put inq_diff_checked 0 0
+ret
+end
+if eq get inq_in_hunk 0 0
+if inq_starts_cs off nlen p_plus3
+if inq_plus_header_allowed off nlen
+inq_parse_plus_header off nlen line_no
+ret
+end
+end
+if eq get inq_in_git_body 0 0
+if inq_starts_cs off nlen p_minus3
+inq_parse_minus_header off nlen line_no 2
+ret
+end
+if eq get inq_in_bin 0 0
+if inq_try_git_ext_hdr off nlen line_no
+ret
+end
+end
+else
+if inq_starts_cs off nlen p_minus3
+if inq_minus_is_git_path off nlen
+put inq_diff_checked 0 0
+inq_parse_minus_header off nlen line_no 1
+ret
+end
+end
+end
+end
+if inq_starts_cs off nlen p_hunk
+inq_parse_hunk_hdr off nlen
+ret
+end
+if inq_starts_cs off nlen p_hunk3
+put inq_in_bin 0 0
+put inq_expect_plus 0 0
+if eq get inq_has_git_hdr 0 1
+put inq_in_git_body 0 1
+end
+put inq_in_hunk 0 1
+put inq_hunk_has_cnt 0 0
 ret
 end
 if eq get inq_in_bin 0 1
 ret
 end
+put inq_expect_plus 0 0
+if eq get inq_has_git_hdr 0 1
+put inq_in_git_body 0 1
+end
 first_c = get inq_in off
+if eq get inq_in_hunk 0 1
+if eq first_c 43
+inq_hunk_step 43
+else
+if eq first_c 45
+inq_hunk_step 45
+else
+if eq first_c 32
+inq_hunk_step 0
+end
+end
+end
+end
 if eq get inq_skip_file 0 1
 note DRA-440: secrets scanning must never self-exempt spark-inquisitor or constitution.rs
 if eq first_c 43
@@ -1286,6 +1804,10 @@ ret
 end
 if eq s SUB_PATH_CI
 inq_out_str sd_ci
+ret
+end
+if eq s SUB_PATH_AIEN_TEST
+inq_out_str sd_aient
 ret
 end
 if eq s SUB_DIRTY_TREE
