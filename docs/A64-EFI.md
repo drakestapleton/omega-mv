@@ -7,6 +7,9 @@ Cortex-X925 host, EDK2 `QEMU_EFI.fd` 2024.02). One machine and one firmware are 
 The purpose is a program that runs on an Arm machine with nothing beneath it but the machine's own
 firmware: no operating system and no driver. The first user is `ollm`, the Omega LLM of aien-train,
 whose x86 UEFI image already boots an Intel iMac.
+Omega LLM's `.om` sources now live in this repository at [`train/omega-llm/`](../train/omega-llm/) (unit
+`ollm_a64efi` in `train/units.tsv`); the aien-train commits and paths cited below are the historical
+record of the runs.
 
 ## Selection
 

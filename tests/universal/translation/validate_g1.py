@@ -854,7 +854,7 @@ def check_pins(a):
         exe_name = Path(getattr(a, key)).name
         for bj in sorted(repo_root.glob('build/*/build.json')):
             if (bj.parent / exe_name).is_file():
-                tools[key]['build'] = {'dir': str(bj.parent.relative_to(repo_root)), 'build_json_sha256': sha(bj.read_bytes()),
+                tools[key]['build'] = {'dir': bj.parent.relative_to(repo_root).as_posix(), 'build_json_sha256': sha(bj.read_bytes()),
                                        'binary_sha256': sha((bj.parent / exe_name).read_bytes()),
                                        'build_json': json.loads(bj.read_text())}
     if a.sa:

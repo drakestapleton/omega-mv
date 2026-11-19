@@ -15,14 +15,14 @@ assert compiler.is_file() and hashlib.sha256(compiler.read_bytes()).hexdigest()=
 # Unchanged vendor SHA256 and the unchanged #621 v2 codec (its `decode` is the full source-aware v1/v2 check).
 parts=[ROOT/'src/source-aware/vendor/sha256.om',ROOT/'src/source-aware/core-v2.om',ROOT/'src/adapters/upper-retarget.om']
 for p in parts:
-    if not p.is_file():raise SystemExit('RETARGET_MISSING_SOURCE: '+str(p.relative_to(ROOT)))
+    if not p.is_file():raise SystemExit('RETARGET_MISSING_SOURCE: '+p.relative_to(ROOT).as_posix())
 subprocess.run(['sha256sum','-c','tools/source-aware/imports.sha256'],cwd=ROOT,check=True,stdout=subprocess.PIPE)
 program=b'\n'.join(p.read_bytes() for p in parts)+b'\n'
 result=subprocess.run([str(compiler)],input=program,capture_output=True,timeout=60)
 if result.returncode:raise SystemExit('RETARGET_COMPILE_FAILED: '+result.stderr.decode(errors='replace'))
 binary=result.stdout
 assert len(binary)>64 and binary[:4]==b'\x7fELF' and struct.unpack_from('<HH',binary,16)==(2,183),'RETARGET_NOT_AARCH64_EXEC'
-report={'schema':'omega.upper-retarget.build.v1','compiler_sha256':expected,'compiler_origin':'omega-mv seed/out/omc via seed/omega-from-seed.sh (translation-v1 section 1)','inputs':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in parts},'combined_source_sha256':hashlib.sha256(program).hexdigest(),'binary_sha256':hashlib.sha256(binary).hexdigest(),'host_orchestration':'Python process/filesystem only; no host parser or compute fallback in the native artifact'}
+report={'schema':'omega.upper-retarget.build.v1','compiler_sha256':expected,'compiler_origin':'omega-mv seed/out/omc via seed/omega-from-seed.sh (translation-v1 section 1)','inputs':{p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in parts},'combined_source_sha256':hashlib.sha256(program).hexdigest(),'binary_sha256':hashlib.sha256(binary).hexdigest(),'host_orchestration':'Python process/filesystem only; no host parser or compute fallback in the native artifact'}
 with tempfile.TemporaryDirectory(prefix='.retarget-build-',dir=build) as temp:
     t=Path(temp)
     (t/'program.om').write_bytes(program);(t/'retarget').write_bytes(binary);(t/'retarget').chmod(0o700)
