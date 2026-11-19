@@ -1,0 +1,497 @@
+note door/ (the agent door, docs/AGENT-DOOR.md): the public activity stream <base>events.json
+note (schema interplane/events/1, also <base>events and <base>feed with Accept: application/json),
+note the feed page <base>feed, and their store: the append-only, hash-chained file <data>events/log.
+note Names: functions ev*, globals gev*, texts tev*. Needs collab/ (corefs, coload: the COB model) and
+note social/ (the social log parser and the account names) composed; otherwise run.sh composes the
+note seam server/nodoor.om, which answers 501 for these pages.
+note Collection is change-triggered, never on a clock: before a page of the stream is answered, evcollect
+note compares cheap fingerprints (the size of the social log, the change time of the open shelf list,
+note and per public repository the change times of the ref folders that every Radicle ref update
+note renames into) with the last ones and reads only what changed (docs/AGENT-DOOR.md).
+note Log line, tab-separated, sanitized (no tab, newline or control byte inside a field):
+note   seq time kind actor rid source path json x subject prev
+note seq from 1, time epoch seconds from the source record, kind 1..14, actor a did:key or empty, rid
+note without rad: or empty, source the object id the event was read from, path and json relative to
+note the base, x the verdict word (review) or "<old sha> <count>" (branch moved) or the followed did
+note (follow) or the shelf name (open), prev the hex sha256 of the previous line (64 zeros for line 1).
+const EVMAX ulong 262144
+const EVLMAX ulong 8192
+const EVBMAX ulong 32768
+text tevdir "events"
+text tevrdir "events/r"
+text tevlog "events/log"
+text tevrp "events/r/"
+text tevtmp ".tmp"
+text tevlist "open/list.tsv"
+text tevfer "for-each-ref"
+text tevfmt "--format=%(objectname) %(creatordate:unix) %(refname)"
+text tevrh "refs/heads/"
+text tevrt "refs/tags"
+text tevrtp "refs/tags/"
+text tevns "refs/namespaces/"
+text tevnst "/refs/tags"
+text tevnstp "/refs/tags/"
+text tevcpg "refs/namespaces/*/refs/cobs/xyz.radicle.patch/*"
+text tevcig "refs/namespaces/*/refs/cobs/xyz.radicle.issue/*"
+text tevcpm "/refs/cobs/xyz.radicle.patch/"
+text tevcim "/refs/cobs/xyz.radicle.issue/"
+text tevrl "rev-list"
+text tevcnt "--count"
+text tevdots ".."
+text tevsrh "/refs/heads"
+text tevsrt "/refs/tags"
+text tevsns "/refs/namespaces"
+text tevspk "/packed-refs"
+text tevsrad "/refs/rad"
+text tevdidk "did:key:"
+text tevsocs "social.log:"
+text tevopns "open/list.tsv:"
+text tevopnp "open/"
+text tevopnj "open.json"
+text tevjsx ".json"
+text tevpatp "/patches/"
+text tevissp "/issues/"
+text tevrelp "/releases/tag/"
+text tevcmpp "/compare/"
+text tevtdot "..."
+text tevheld "held"
+text tevstor "stored"
+text tevwdr "withdrawn"
+text tevvacc "accept"
+text tevvrej "reject"
+text tevmovd " moved"
+text tevncom " new commit"
+text tevncs "s"
+text tevon " on "
+text tevlbad "EVENTS-LOG TAMPER: events off at line "
+text tevlwr "EVENTS-LOG write failed: events off"
+text tevlpas "events: pass "
+text tevlpus " us, sources read "
+text tevlpev ", events added "
+text tevlcob "events: COB not loaded, no events from it: "
+text tevlcut "events: ref list longer than the buffer, repository skipped: "
+text tevlbfl "events: batch full, flushed early"
+note the log index: gevoff[k] is the byte offset of line k (seq k+1); gevoff[gevn] is the end
+global gevoff ulong 262145
+global gevn ulong 1
+note gevok: 0 not loaded, 1 loaded and appendable, 2 refused (the chain did not verify, a write failed)
+global gevok ulong 1
+global gevprv uchar 32
+note gevset: open-addressing set of event keys (FNV-1a 64 of kind, rid, source and x; never 0)
+global gevset ulong 524288
+note per allow-list index: the fingerprint of the repository's ref folders when it was last read
+global gevfp ulong 256
+note the social log bytes already read, and the open list fingerprint
+global gevsoff ulong 1
+global gevofp ulong 1
+note read buffer (log lines, social lines), the old ref snapshot of one repository, the new one
+global gevrb uchar 2097152
+global gevold uchar 4194304
+global gevoldl ulong 1
+global gevnew uchar 4194304
+global gevnewl ulong 1
+global gevst uchar 128
+global gevde uchar 16384
+note the line being written
+global gevln uchar 8192
+global gevlnl ulong 1
+note the event being built: kind, time, and its byte fields (each a buffer and its length)
+global gevk ulong 1
+global gevt ulong 1
+global gevact uchar 128
+global gevactl ulong 1
+global gevrid uchar 64
+global gevridl ulong 1
+global gevsub uchar 512
+global gevsubl ulong 1
+global gevpth uchar 1024
+global gevpthl ulong 1
+global gevjs uchar 1024
+global gevjsl ulong 1
+global gevsrc uchar 128
+global gevsrcl ulong 1
+global gevx uchar 192
+global gevxl ulong 1
+note the batch of one collection pass: partial lines (time .. subject) sorted by time before append
+global gevbat uchar 16777216
+global gevbatl ulong 1
+global gevbo ulong 32768
+global gevbl ulong 32768
+global gevbt ulong 32768
+global gevbi ulong 32768
+global gevbj ulong 32768
+global gevbn ulong 1
+note counters of one collection pass (its stderr line names them with its cost in microseconds)
+global gevpr ulong 1
+global gevpe ulong 1
+note changed COB ids of the repository being read: id (40 bytes) and kind (1 patch, 2 issue)
+global gevcid uchar 163840
+global gevckd ulong 4096
+global gevcn ulong 1
+note one stderr line (evgb, evgt, evgn, evgc, then evgout)
+global gevlg uchar 512
+global gevlgl ulong 1
+fn evgb to void
+put gevlgl 0 0
+end
+fn evgc c uchar to void
+n = get gevlgl 0
+if lt n 510
+put gevlg n c
+put gevlgl 0 add n 1
+end
+end
+fn evgt t view uchar * to void
+for i ulong len t bound 256
+evgc get t i
+end
+end
+fn evgn v ulong to void
+d = new uchar 24 0
+k = evdec v d
+for j ulong k bound 24
+evgc get d j
+end
+end
+fn evgout to void
+evgc 10
+w = write 2 gevlg 0 get gevlgl 0
+end
+note ---- byte helpers for the line being written
+fn evlc c uchar to void
+n = get gevlnl 0
+if lt n sub EVLMAX 1
+put gevln n c
+put gevlnl 0 add n 1
+end
+end
+note evdec v d: the decimal digits of v into d at 0; returns their count
+fn evdec v ulong d edit uchar 24 to ulong
+t = new uchar 24 0
+k = ulong 0
+x = v
+for it ulong 21
+put t k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for j ulong k bound 24
+put d j get t sub sub k j 1
+end
+ret k
+end
+fn evlnum v ulong to void
+d = new uchar 24 0
+k = evdec v d
+for j ulong k bound 24
+evlc get d j
+end
+end
+note evsafe: a field byte as stored: tab, newline and the other control bytes become a space
+fn evsafe c uchar to uchar
+if or lt c 32 eq c 127
+ret uchar 32
+end
+ret c
+end
+note ---- path helpers: fpth = <data><t>
+fn evpath t view uchar * to void
+fpb
+fpt tfdata
+fpt t
+end
+note evmkdirs: <data>events and <data>events/r (an existing folder is fine)
+fn evmkdirs to void
+evpath tevdir
+x = makedir fpth 0 get fpthl 0 448
+evpath tevrdir
+y = makedir fpth 0 get fpthl 0 448
+end
+note evstat: stat fpth into gevst; a fingerprint of its change time and size, 0 when it is missing
+fn evstat to ulong
+r = stat fpth 0 get fpthl 0 gevst 0 128
+if lt r 0
+ret 0
+end
+h = ulong 14695981039346656037
+for k ulong 8
+h = evfnv h get gevst add 48 k
+h = evfnv h get gevst add 104 k
+h = evfnv h get gevst add 112 k
+end
+ret h
+end
+fn evst64 o ulong to ulong
+v = ulong 0
+for i ulong 8
+b = ulong get gevst add o i
+v = or v shl b mul i 8
+end
+ret v
+end
+note ---- event field setters (a collector fills one event, then evemit)
+fn evclr to void
+put gevk 0 0
+put gevt 0 0
+put gevactl 0 0
+put gevridl 0 0
+put gevsubl 0 0
+put gevpthl 0 0
+put gevjsl 0 0
+put gevsrcl 0 0
+put gevxl 0 0
+end
+fn evactc c uchar to void
+n = get gevactl 0
+if lt n len gevact
+put gevact n evsafe c
+put gevactl 0 add n 1
+end
+end
+fn evactt t view uchar * to void
+for i ulong len t bound 128
+evactc get t i
+end
+end
+fn evridc c uchar to void
+n = get gevridl 0
+if lt n len gevrid
+put gevrid n evsafe c
+put gevridl 0 add n 1
+end
+end
+note evsubc: the subject is one line of at most 400 bytes (evsubend cuts it at a character start)
+fn evsubc c uchar to void
+n = get gevsubl 0
+if lt n 400
+put gevsub n evsafe c
+put gevsubl 0 add n 1
+end
+end
+fn evsubt t view uchar * to void
+for i ulong len t bound 400
+evsubc get t i
+end
+end
+fn evsubend to void
+n = get gevsubl 0
+if lt n 400
+ret
+end
+for it ulong 4
+k = get gevsubl 0
+if eq k 0
+ret
+end
+c = get gevsub sub k 1
+if ne and c 192 128
+put gevsubl 0 sub k 1
+ret
+end
+put gevsubl 0 sub k 1
+end
+end
+note evpthc: one byte of a URL path, percent-encoded unless unreserved or /; evpthr: raw
+fn evpthc c uchar to void
+if evunres c
+evpthr c
+ret
+end
+evpthr 37
+evpthr evhexu shr ulong c 4
+evpthr evhexu and ulong c 15
+end
+fn evpthr c uchar to void
+n = get gevpthl 0
+if lt n len gevpth
+put gevpth n c
+put gevpthl 0 add n 1
+end
+end
+fn evptht t view uchar * to void
+for i ulong len t bound 64
+evpthr get t i
+end
+end
+fn evunres c uchar to bool
+if and ge c 97 le c 122
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 48 le c 57
+ret true
+end
+ret or or eq c 45 eq c 46 or or eq c 95 eq c 126 eq c 47
+end
+fn evhexu v ulong to uchar
+if lt v 10
+ret uchar add v 48
+end
+ret uchar add v 55
+end
+note evpthrepo i: path = <owner>/<repo name of i>
+fn evpthrepo i ulong to void
+put gevpthl 0 0
+evptht tfowner
+evpthr 47
+for k ulong frnlen i bound 128
+evpthc frnbyte i k
+end
+end
+note evjsame: json = path (the page answers JSON at its own address with Accept: application/json)
+fn evjsame to void
+n = get gevpthl 0
+for k ulong n bound 1024
+put gevjs k get gevpth k
+end
+put gevjsl 0 n
+end
+fn evjsc c uchar to void
+n = get gevjsl 0
+if lt n len gevjs
+put gevjs n c
+put gevjsl 0 add n 1
+end
+end
+fn evjst t view uchar * to void
+for i ulong len t bound 64
+evjsc get t i
+end
+end
+fn evsrcc c uchar to void
+n = get gevsrcl 0
+if lt n len gevsrc
+put gevsrc n evsafe c
+put gevsrcl 0 add n 1
+end
+end
+fn evsrct t view uchar * to void
+for i ulong len t bound 64
+evsrcc get t i
+end
+end
+fn evsrcnum v ulong to void
+d = new uchar 24 0
+k = evdec v d
+for j ulong k bound 24
+evsrcc get d j
+end
+end
+fn evxc c uchar to void
+n = get gevxl 0
+if lt n len gevx
+put gevx n evsafe c
+put gevxl 0 add n 1
+end
+end
+fn evxt t view uchar * to void
+for i ulong len t bound 64
+evxc get t i
+end
+end
+note evridi i: the event is about allow-list repository i
+fn evridi i ulong to void
+put gevridl 0 0
+for k ulong fridlen i bound 64
+evridc fridbyte i k
+end
+end
+note evowndid: the actor is the node delegate (did:key:<tfnid>)
+fn evowndid to void
+put gevactl 0 0
+evactt tevdidk
+evactt tfnid
+end
+note ---- FNV-1a 64
+fn evfnv h ulong c uchar to ulong
+x = xor h ulong c
+ret mul x 1099511628211
+end
+note evkey: the key of the event being built (kind, rid, source, x)
+fn evkey to ulong
+h = evfnv ulong 14695981039346656037 uchar get gevk 0
+h = evfnv h 0
+for i ulong get gevridl 0 bound 64
+h = evfnv h get gevrid i
+end
+h = evfnv h 0
+for i ulong get gevsrcl 0 bound 128
+h = evfnv h get gevsrc i
+end
+h = evfnv h 0
+for i ulong get gevxl 0 bound 192
+h = evfnv h get gevx i
+end
+if eq h 0
+ret ulong 1
+end
+ret h
+end
+note ---- the key set
+fn evhas k ulong to bool
+m = sub len gevset 1
+s = and k m
+for it ulong len gevset
+v = get gevset s
+if eq v 0
+ret false
+end
+if eq v k
+ret true
+end
+s = and add s 1 m
+end
+ret false
+end
+fn evput k ulong to void
+m = sub len gevset 1
+s = and k m
+for it ulong len gevset
+v = get gevset s
+if or eq v 0 eq v k
+put gevset s k
+ret
+end
+s = and add s 1 m
+end
+end
+note ---- digits
+fn evdig c uchar to bool
+ret and ge c 48 le c 57
+end
+fn evhexd c uchar to bool
+if evdig c
+ret true
+end
+ret and ge c 97 le c 102
+end
+fn evhexc v ulong to uchar
+if lt v 10
+ret uchar add v 48
+end
+ret uchar add v 87
+end
+note evridpub: the allow-list index of the event's RID (gevrid, no rad:), 9999 when it is not public
+fn evridpub to ulong
+n = get gevridl 0
+for i ulong get fan 0 bound FAMAX
+if eq fridlen i n
+same = true
+for k ulong n bound 64
+if ne fridbyte i k get gevrid k
+same = false
+break
+end
+end
+if same
+ret i
+end
+end
+end
+ret ulong 9999
+end

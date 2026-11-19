@@ -1,0 +1,588 @@
+note community/00core.om -- the community runner hub (protocol ipcc1, spark-connector docs/PROTOCOL.md).
+note Keys register with a signed message; a registered key asks for a job, reruns a published salvage
+note part on its own machine and posts a signed result; the hub checks the signature, the job, the
+note revision and the compiler, stores every accepted message and appends one ledger line, and
+note records every refusal with its reason. The hub never executes, compiles or opens anything a
+note runner sends: messages are parsed as fixed-form text, and every file name built from one is
+note lowercase hex of a fixed length below the store root.
+note Store: INTERPLANE_COMMUNITY_DIR (absolute, ending in /); the slice answers "off" without it.
+note Composed after om/tls/ec.om (ecdsa_verify_raw) and the salvage slice (published parts).
+
+note cmgv: scalar cells
+global cmgv ulong 32
+global cmroot uchar 1024
+global cmproot uchar 1024
+global cmpth uchar 4096
+note cmfo / cmfn: offset and length in fbody of each parsed field (index constants cmf*)
+global cmfo ulong 16
+global cmfn ulong 16
+note cmpub: the sender's public point; cmkid: its key id; cmsha: the message SHA-256 (hex)
+global cmpub uchar 65
+global cmkid uchar 64
+global cmsha uchar 64
+global cmpick uchar 64
+
+const cmrl ulong 0
+const cmpl ulong 1
+const cmkind ulong 2
+const cmsigo ulong 3
+const cmboot ulong 4
+const cmon ulong 5
+const cmcur ulong 6
+const cmlock ulong 7
+const cmcn ulong 8
+const cmck ulong 9
+const cmcg ulong 10
+const cmctie ulong 11
+const cmchub ulong 12
+const cmcsec ulong 13
+const cmrate ulong 14
+const cmdj ulong 20
+const cmdm ulong 21
+const cmlen ulong 22
+const cmrw ulong 27
+const cmrc ulong 28
+note a ledger or refusal log is set aside as <name>.<seconds> once it reaches 4 MiB (cm_app)
+const cmrotb ulong 4194304
+const cmprl ulong 29
+
+note field indexes
+const cmfkey ulong 0
+const cmftime ulong 1
+const cmfthird ulong 2
+const cmfjob ulong 3
+const cmfpart ulong 4
+const cmfcomp ulong 5
+const cmfbin ulong 6
+const cmfout ulong 7
+const cmfexit ulong 8
+const cmfsig ulong 9
+
+note protocol bounds (form and meaning, not volume caps): a message is at most 4096 bytes (the
+note longest valid one is under 1 KiB), clock skew 300 s (replay window of signed messages), a job
+note answers within 3600 s. Volume is watched, not refused: alarm thresholds per key 150 signed
+note messages (after the signature and replay checks) an hour, all keys 3600, refusals 3600 (cm_tally);
+note the edge (nginx) limits request rate.
+const cmmaxb ulong 4096
+const cmskew ulong 300
+const cmjlife ulong 3600
+const cmakey ulong 150
+const cmaall ulong 3600
+const cmaref ulong 3600
+text cmtalm "alarms"
+text cmtalw " ALARM "
+text cmtalp " passed "
+text cmtalh " in the hour: "
+text cmtamsg "signed-messages"
+text cmtaref "refusals"
+text cmtrfn "refused"
+
+text cmenv "INTERPLANE_COMMUNITY_DIR="
+text cmpenv "INTERPLANE_COMMUNITY_PUB="
+text cmdirs "keys/jobs/used/msgs/parts/rate/"
+text cmtlk "writer.lock"
+text cmtkeys "keys/"
+text cmtjobs "jobs/"
+text cmtused "used/"
+text cmtmsgs "msgs/"
+text cmtparts "parts/"
+text cmtrate "rate/"
+text cmtall "all"
+text cmtk "/k/"
+text cmtg "/g/"
+text cmtv ".v"
+text cmtled "ledger"
+text cmtref "refused"
+text cmtdeny "deny"
+text cmtnew ".new"
+text cmtip "ipcc1 "
+text cmtreg "register"
+text cmtnext "next"
+text cmtres "result"
+text cmtlv "leave"
+text cmnpub "pub"
+text cmnkey "key"
+text cmntime "time"
+text cmnrate "rate"
+text cmnnon "nonce"
+text cmnjob "job"
+text cmnpart "part"
+text cmncomp "compiler"
+text cmnbin "binary"
+text cmnout "stdout"
+text cmnexit "exit"
+text cmnsig "sig"
+text cmhex "0123456789abcdef"
+text cmdkey "key "
+text cmdpart "part "
+text cmxsig "signal"
+text cmxtmo "timeout"
+text cmxomc "omc"
+text cmxomcs "omcsignal"
+text cmxomct "omctimeout"
+text cmxcell "cell"
+text cmsp " "
+text cmnl "\n"
+text cmdash "-"
+
+note refusal reasons (docs/PROTOCOL.md)
+const cmemal ulong 1
+const cmesize ulong 2
+const cmeclk ulong 3
+const cmesig ulong 4
+const cmeunr ulong 5
+const cmeden ulong 6
+const cmejob ulong 7
+const cmemis ulong 8
+const cmedup ulong 9
+const cmeoff ulong 12
+const cmeio ulong 13
+text cmw1 "malformed"
+text cmw2 "size"
+text cmw3 "clock"
+text cmw4 "signature"
+text cmw5 "unregistered"
+text cmw6 "denied"
+text cmw7 "job"
+text cmw8 "mismatch"
+text cmw9 "duplicate"
+text cmw12 "off"
+text cmw13 "store"
+
+note ---- small helpers
+fn cm_now to ulong
+ret ulong div realns 1000000000
+end
+
+fn cm_hv c uchar to ulong
+if and ge c 48 le c 57
+ret sub ulong c 48
+end
+if and ge c 97 le c 102
+ret sub ulong c 87
+end
+ret 16
+end
+
+fn cm_ishex s view uchar * to bool
+for i ulong len s bound 65536
+if gt cm_hv get s i 15
+ret false
+end
+end
+ret true
+end
+
+fn cm_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+for i ulong len a bound 65536
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn cm_tohex s view uchar * d edit uchar * to void
+for i ulong len s bound 32768
+put d mul i 2 get cmhex ulong shr get s i 4
+put d add mul i 2 1 get cmhex ulong and get s i 15
+end
+end
+
+fn cm_unhex s view uchar * d edit uchar * to bool
+if ne len s mul len d 2
+ret false
+end
+for i ulong len d bound 32768
+a = cm_hv get s mul i 2
+b = cm_hv get s add mul i 2 1
+if or gt a 15 gt b 15
+ret false
+end
+put d i uchar or shl a 4 b
+end
+ret true
+end
+
+note cm_dec: a decimal of 1..19 digits, no leading zero unless "0"; 2^64-1 when malformed
+fn cm_dec s view uchar * to ulong
+bad = ulong 18446744073709551615
+if or eq len s 0 gt len s 19
+ret bad
+end
+if and gt len s 1 eq get s 0 48
+ret bad
+end
+v = ulong 0
+for i ulong len s bound 19
+c = get s i
+if or lt c 48 gt c 57
+ret bad
+end
+v = add mul v 10 sub ulong c 48
+end
+ret v
+end
+
+fn cm_decput d edit uchar * o ulong v ulong to ulong
+t = new uchar 20 0
+i = ulong 20
+x = v
+for it ulong 20
+i = sub i 1
+put t i uchar add rem x 10 48
+x = div x 10
+if eq x 0
+break
+end
+end
+k = o
+for j ulong sub 20 i bound 20
+put d k get t add i j
+k = add k 1
+end
+ret k
+end
+
+fn cm_cp d edit uchar * o ulong s view uchar * to ulong
+for i ulong len s bound 65536
+put d add o i get s i
+end
+ret add o len s
+end
+
+note ---- paths: cmpth = root, then appended pieces
+fn cm_p0 to void
+n = get cmgv cmrl
+for i ulong n bound 1024
+put cmpth i get cmroot i
+end
+put cmgv cmpl n
+end
+
+fn cm_pa s view uchar * to void
+n = get cmgv cmpl
+for i ulong len s bound 4096
+put cmpth add n i get s i
+end
+put cmgv cmpl add n len s
+end
+
+note cm_pcp: a copy of cmpth into d; its length
+fn cm_pcp d edit uchar * to ulong
+n = get cmgv cmpl
+for i ulong n bound 4096
+put d i get cmpth i
+end
+ret n
+end
+
+fn cm_pkid to void
+k = new uchar 64 0
+for i ulong 64
+put k i get cmkid i
+end
+cm_pa k
+end
+
+note ---- files under cmpth
+fn cm_rd b edit uchar * to long
+fd = fopen cmpth 0 get cmgv cmpl 557056 0
+if lt fd 0
+ret fd
+end
+n = ulong 0
+rc = long 0
+while lt n len b bound 9223372036854775807
+r = read int fd b n sub len b n
+if lt r 0
+rc = r
+break
+end
+if eq r 0
+break
+end
+n = add n ulong r
+end
+x = fclose int fd
+if lt rc 0
+ret rc
+end
+ret long n
+end
+
+fn cm_wfd fd long d view uchar * to bool
+n = ulong 0
+while lt n len d bound 9223372036854775807
+r = write int fd d n sub len d n
+if le r 0
+ret false
+end
+n = add n ulong r
+end
+ret true
+end
+
+note cm_wnew: create cmpth with O_EXCL (0600) holding d; false when it exists or fails
+fn cm_wnew d view uchar * to bool
+fd = fopen cmpth 0 get cmgv cmpl 557249 384
+if lt fd 0
+ret false
+end
+ok = cm_wfd fd d
+s = fsync int fd
+x = fclose int fd
+ret and ok eq s 0
+end
+
+note cm_app: append d to cmpth (created 0600 when absent); one write per line keeps lines whole.
+note A log that has reached cmrotb bytes is first renamed to <name>.<unix seconds> (kept, served at
+note /community/<name>.<seconds>, never deleted), so no file grows toward forged's file-size limit;
+note the store's size is the operator's to watch (the gate measures it).
+fn cm_app d view uchar * to bool
+sb = new uchar 128 0
+fd = fopen cmpth 0 get cmgv cmpl 558145 384
+if lt fd 0
+ret false
+end
+r = fstat int fd sb 0 128
+sz = ulong 0
+for i ulong 8
+sz = or sz shl ulong get sb add 48 i mul i 8
+end
+if and eq r 0 ge sz cmrotb
+x = fclose int fd
+if not cm_rot
+ret false
+end
+fd = fopen cmpth 0 get cmgv cmpl 558145 384
+if lt fd 0
+ret false
+end
+end
+ok = cm_wfd fd d
+x = fclose int fd
+ret ok
+end
+
+note cm_rot: rename cmpth to cmpth.<unix seconds> (no replacement); cmpth is unchanged afterwards
+fn cm_rot to bool
+a = new uchar 4100 0
+b = new uchar 4130 0
+p = new uchar 8300 0
+n = cm_pcp a
+k = cm_cp b 0 part a 0 n
+put b k 46
+k = cm_decput b add k 1 cm_now
+put p 0 2
+put p 1 0
+o = cm_pk p 2 part a 0 n
+o = cm_pk p o part b 0 k
+r = renames p 0 o 1
+ret or eq r 0 eq r -17
+end
+
+note cm_repl: write d to "<cmpth>.new", fsync, then rename it over cmpth (records)
+fn cm_repl d view uchar * to bool
+ret cm_repl2 d true
+end
+
+note cm_replq: the same without fsync, for volume counters (a count lost in a crash is harmless)
+fn cm_replq d view uchar * to bool
+ret cm_repl2 d false
+end
+
+fn cm_repl2 d view uchar * sync bool to bool
+a = new uchar 4100 0
+b = new uchar 4100 0
+p = new uchar 8300 0
+n = cm_pcp a
+cm_pa cmtnew
+nb = cm_pcp b
+fd = fopen cmpth 0 get cmgv cmpl 557633 384
+if lt fd 0
+ret false
+end
+ok = cm_wfd fd d
+s = long 0
+if sync
+s = fsync int fd
+end
+x = fclose int fd
+if not and ok eq s 0
+ret false
+end
+put p 0 2
+put p 1 0
+k = cm_pk p 2 part b 0 nb
+ret cm_ren p k part a 0 n
+end
+
+fn cm_ren p edit uchar * k ulong b view uchar * to bool
+o = cm_pk p k b
+r = renames p 0 o 0
+ret eq r 0
+end
+
+fn cm_pk p edit uchar * o ulong s view uchar * to ulong
+put p o uchar and len s 255
+put p add o 1 uchar shr len s 8
+for i ulong len s bound 65536
+put p add add o 2 i get s i
+end
+ret add add o 2 len s
+end
+
+fn cm_exists to bool
+ret eq faccess cmpth 0 get cmgv cmpl 0 0
+end
+
+fn cm_mkdir to bool
+r = makedir cmpth 0 get cmgv cmpl 448
+ret or eq r 0 eq r -17
+end
+
+note ---- start-up: the store root and the read-only root from the environment, the store's
+note directories, and the salvage store. INTERPLANE_COMMUNITY_DIR is the writable store (records).
+note INTERPLANE_COMMUNITY_PUB holds what the hub only reads: dist/ (the join script, the runner,
+note the compiler, SHA256SUMS: what volunteers download) and deny (the operator's list). In
+note production it is a host folder outside forge-data, bound read-only at /community directly
+note under the sandbox's read-only root, so no path the server can write or rename leads to it.
+note Both are required; without either the slice is off.
+fn cm_on to bool
+if eq get cmgv cmboot 1
+ret eq get cmgv cmon 1
+end
+put cmgv cmboot 1
+put cmgv cmon 0
+if not slboot
+ret false
+end
+b = new uchar 1024 0
+n = cm_env cmenv b
+if or lt n 2 gt n 900
+ret false
+end
+if not cm_rootok part b 0 ulong n
+ret false
+end
+for i ulong ulong n bound 1024
+put cmroot i get b i
+end
+put cmgv cmrl ulong n
+n = cm_env cmpenv b
+if or lt n 2 gt n 900
+ret false
+end
+if not cm_rootok part b 0 ulong n
+ret false
+end
+for i ulong ulong n bound 1024
+put cmproot i get b i
+end
+put cmgv cmprl ulong n
+if not cm_mkall
+ret false
+end
+put cmgv cmon 1
+ret true
+end
+
+note cm_q0: cmpth = the read-only root
+fn cm_q0 to void
+n = get cmgv cmprl
+for i ulong n bound 1024
+put cmpth i get cmproot i
+end
+put cmgv cmpl n
+end
+
+note cm_rootok: absolute, ends in /, no control byte, no segment starting with a dot
+fn cm_rootok b view uchar * to bool
+if or lt len b 2 gt len b 900
+ret false
+end
+if or ne get b 0 47 ne get b sub len b 1 47
+ret false
+end
+for i ulong len b bound 1024
+c = get b i
+if or lt c 32 eq c 127
+ret false
+end
+end
+for i ulong sub len b 1 bound 1024
+if and eq get b i 47 eq get b add i 1 46
+ret false
+end
+end
+ret true
+end
+
+fn cm_env pre view uchar * b edit uchar * to long
+e = new uchar 1100 0
+for i ulong ulong envcnt bound 1000000
+n = envread i e 0 1100
+if gt n long len pre
+if cm_eq part e 0 len pre pre
+m = sub ulong n len pre
+if gt m len b
+ret -1
+end
+for j ulong m bound 1100
+put b j get e add len pre j
+end
+ret long m
+end
+end
+end
+ret -1
+end
+
+note cm_mkall: the root and its six directories (names in cmdirs, each ending in /)
+fn cm_mkall to bool
+cm_p0
+if not cm_mkdir
+ret false
+end
+s = ulong 0
+for i ulong len cmdirs
+if eq get cmdirs i 47
+cm_p0
+cm_pa part cmdirs s add sub i s 1
+if not cm_mkdir
+ret false
+end
+s = add i 1
+end
+end
+ret true
+end
+
+note cm_lock: the writer lock (flock on <root>writer.lock); held until the request ends
+fn cm_lock to bool
+cm_p0
+cm_pa cmtlk
+fd = fopen cmpth 0 get cmgv cmpl 557122 384
+if lt fd 0
+ret false
+end
+r = flock int fd 2
+if ne r 0
+x = fclose int fd
+ret false
+end
+put cmgv cmlock ulong fd
+ret true
+end
+
+fn cm_unlock to void
+fd = get cmgv cmlock
+if ne fd 0
+x = fclose int fd
+put cmgv cmlock 0
+end
+end

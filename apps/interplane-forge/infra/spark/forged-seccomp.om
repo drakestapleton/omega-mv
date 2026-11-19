@@ -1,0 +1,140 @@
+om2
+note forged-seccomp: writes the sandbox's socket filter, a classic BPF seccomp program, to stdout.
+note run.sh builds it beside forged and runs it once into forged-seccomp.bpf; forged-sandbox.sh
+note hands those bytes to bubblewrap (--seccomp), which installs the filter in the sandbox just
+note before it executes forged. Every process in the sandbox inherits it.
+note Why: the listener is made outside, in the host network namespace, and so is every connection
+note forged accepts from it. Interface questions asked through such a socket (SIOCGIFCONF,
+note SIOCGIFNAME, SIOCGIFADDR, SIOCGIFHWADDR, ...) are answered about the host network, and a
+note socket that is not yet bound to a device can be bound by index and read back by name
+note (SO_BINDTOIFINDEX, then SO_BINDTODEVICE). No namespace setting can change that, because the
+note namespace belongs to the socket. The filter refuses those calls by number, whatever socket
+note they target:
+note   ioctl: only FIOCLEX, FIONCLEX, FIONBIO, FIONREAD, TCGETS and TIOCGWINSZ; everything else,
+note     including every 0x89xx socket request, fails with EPERM.
+note   socket and socketpair: only AF_UNIX (glibc's name-cache lookup); no netlink, inet or packet
+note     socket can be made inside.
+note   setsockopt: only IPPROTO_TCP TCP_NODELAY and SOL_SOCKET SO_REUSEADDR, SO_SNDBUF, SO_RCVBUF,
+note     SO_KEEPALIVE; SO_REUSEPORT, SO_BINDTODEVICE and SO_BINDTOIFINDEX fail with EPERM.
+note   connect and shutdown: EPERM, on every socket.
+note   io_uring_setup, io_uring_enter, io_uring_register: EPERM (io_uring carries socket commands).
+note   A system call from any architecture other than AArch64 kills the process.
+note   Everything else is allowed; the namespaces, no_new_privs, limits and mounts do the rest.
+note The listener is shared with the supervisor, which holds it for its whole life, so the child
+note must not be able to give the port away (netns r2 review of 8f6b4a29, findings 1 and 2, and
+note the same class through connect):
+note   shutdown(SHUT_RD or SHUT_RDWR) on a listening socket, and connect with an AF_UNSPEC address,
+note     disconnect it: it stops listening, and a local process with SO_REUSEADDR can then bind
+note     127.0.0.1 on the port and receive the connections. Forged never calls either; inside the
+note     sandbox the only connect is glibc's name-cache lookup (git, ssh-keygen), which finds no
+note     socket there and falls back to the files, as it did with ENOENT before.
+note   SO_REUSEPORT on the listener lets a local process with SO_REUSEPORT bind the same address
+note     and take a share of the new connections. The listener is bound outside the filter, so
+note     nothing inside needs the option.
+note Arguments are compared on their low 32 bits: the kernel reads ioctl's request, socket's domain
+note and setsockopt's level and name as 32-bit values, so the high half cannot change the outcome.
+note Layout: struct sock_filter {u16 code; u8 jt; u8 jf; u32 k}, little endian, 8 bytes each.
+note struct seccomp_data: nr at 0, arch at 4, args[i] at 16 + 8 i (low half first).
+note Linux AArch64 numbers: ioctl 29, socket 198, socketpair 199, connect 203, setsockopt 208,
+note shutdown 210, io_uring_setup 425, io_uring_enter 426, io_uring_register 427.
+note Exit 0 after writing the whole program, 1 if the write fails.
+global bp uchar 2048
+global bn ulong 1
+fn op c ulong t ulong f ulong k ulong to void
+o = mul get bn 0 8
+put bp o uchar and c 255
+put bp add o 1 uchar shr c 8
+put bp add o 2 uchar t
+put bp add o 3 uchar f
+put bp add o 4 uchar and k 255
+put bp add o 5 uchar and shr k 8 255
+put bp add o 6 uchar and shr k 16 255
+put bp add o 7 uchar shr k 24
+put bn 0 add get bn 0 1
+end
+note BPF_LD|BPF_W|BPF_ABS: A = the 32-bit word at offset k of seccomp_data.
+fn ld k ulong to void
+op 32 0 0 k
+end
+note BPF_JMP|BPF_JEQ|BPF_K: skip t instructions when A == k, else skip f.
+fn jeq k ulong t ulong f ulong to void
+op 21 t f k
+end
+note BPF_RET|BPF_K
+fn rt k ulong to void
+op 6 0 0 k
+end
+fn allow to void
+rt 2147418112
+end
+fn deny to void
+note SECCOMP_RET_ERRNO | EPERM
+rt 327681
+end
+fn allowif k ulong to void
+note When A == k return ALLOW; otherwise fall through to the next test.
+jeq k 0 1
+allow
+end
+fn denyif k ulong to void
+note When A == k return EPERM; otherwise fall through to the next test.
+jeq k 0 1
+deny
+end
+fn familyonly to void
+note 4 instructions: allow only AF_UNIX (1) in args[0].
+ld 16
+allowif 1
+deny
+end
+fn main to int
+note Architecture: AUDIT_ARCH_AARCH64 0xC00000B7, otherwise SECCOMP_RET_KILL_PROCESS.
+ld 4
+jeq 3221225655 1 0
+rt 2147483648
+ld 0
+note ioctl: 1 + 2 * 6 + 1 = 14 instructions follow.
+jeq 29 0 14
+ld 24
+allowif 21585
+allowif 21584
+allowif 21537
+allowif 21531
+allowif 21505
+allowif 21523
+deny
+jeq 198 0 4
+familyonly
+jeq 199 0 4
+familyonly
+note setsockopt: 18 instructions follow.
+jeq 208 0 18
+ld 24
+note level IPPROTO_TCP (6): 4 instructions.
+jeq 6 0 4
+ld 32
+allowif 1
+deny
+note level SOL_SOCKET (1): 10 instructions. SO_REUSEPORT (15) is not on the list.
+jeq 1 0 10
+ld 32
+allowif 2
+allowif 7
+allowif 8
+allowif 9
+deny
+deny
+note connect and shutdown: the listener shared with the supervisor stays listening.
+denyif 203
+denyif 210
+denyif 425
+denyif 426
+denyif 427
+allow
+n = mul get bn 0 8
+w = write 1 bp 0 n
+if ne w long n
+ret 1
+end
+ret 0
+end

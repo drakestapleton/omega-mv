@@ -1,0 +1,298 @@
+note tools/bring/src/10base.om: the interplane program's shared core (Linux and macOS alike).
+note Output, decimal numbers, byte copies and compares, little-endian fields, the packed argument
+note list, temp folder paths and the exit path. Platform words live in plat-*.om (pl_* functions).
+note Every loop that walks input carries the largest bound (2^63 - 1): each pass consumes at least
+note one byte or one record of finite input, so the bound is never what stops it.
+text tver "interplane 0.1.1\n"
+text tpfx "interplane: "
+text tnl "\n"
+global gtmp uchar 4096
+global gtmpl ulong 1
+global gtmpok uchar 1
+global gavn ulong 1
+text tavlong "a program's argument list does not fit the 4096 bytes the process start word carries"
+text ttmpf "cannot open the temp file "
+text tnames "reqh\nfiles\ndirs\nkeep\nlist.tar\nstmt\nstmt.sig\nchal\nchal.sig\nbody\nhdr\ncode\ncerr\nform\nget.tar\nmbox\ngout\n"
+
+fn wall fd int b view uchar * to bool
+n = ulong 0
+while lt n len b bound 9223372036854775807
+r = write fd b n sub len b n
+if le r 0
+ret false
+end
+n = add n ulong r
+end
+ret true
+end
+
+fn say b view uchar * to void
+x = wall 1 b
+end
+
+fn warn b view uchar * to void
+x = wall 2 b
+end
+
+note decw: the decimal digits of v at o[n..]; returns the new end
+fn decw v ulong o edit uchar * n ulong to ulong
+d = new uchar 20 0
+k = ulong 0
+x = v
+while true bound 21
+put d k uchar add 48 rem x 10
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+for i ulong k
+put o add n i get d sub sub k i 1
+end
+ret add n k
+end
+
+fn sayd v ulong to void
+d = new uchar 24 0
+k = decw v d 0
+say part d 0 k
+end
+
+fn warnd v ulong to void
+d = new uchar 24 0
+k = decw v d 0
+warn part d 0 k
+end
+
+note outp: a path or other untrusted bytes for the terminal: control bytes print as '?'
+fn sayp b view uchar * to void
+o = new uchar 4096 0
+n = ulong 0
+for i ulong len b bound 9223372036854775807
+c = get b i
+if or lt c 32 eq c 127
+c = uchar 63
+end
+put o n c
+n = add n 1
+if eq n 4096
+say part o 0 n
+n = ulong 0
+end
+end
+say part o 0 n
+end
+
+note cpy: copy s into d at n; returns the new end (d too short traps 3: callers size d first)
+fn cpy d edit uchar * n ulong s view uchar * to ulong
+for i ulong len s bound 9223372036854775807
+put d add n i get s i
+end
+ret add n len s
+end
+
+fn beq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+for i ulong len a bound 9223372036854775807
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note bat: b[i..] starts with t (false when b ends first)
+fn bat b view uchar * i ulong t view uchar * to bool
+if gt add i len t len b
+ret false
+end
+for k ulong len t bound 9223372036854775807
+if ne get b add i k get t k
+ret false
+end
+end
+ret true
+end
+
+note bfind: the first index >= from where t starts in b, or -1
+fn bfind b view uchar * t view uchar * from ulong to long
+if gt len t len b
+ret -1
+end
+i = from
+while le add i len t len b bound 9223372036854775807
+if bat b i t
+ret long i
+end
+i = add i 1
+end
+ret -1
+end
+
+fn lcb c uchar to uchar
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+note bati: as bat, ASCII case-insensitive (t is lowercase)
+fn bati b view uchar * i ulong t view uchar * to bool
+if gt add i len t len b
+ret false
+end
+for k ulong len t bound 9223372036854775807
+if ne lcb get b add i k get t k
+ret false
+end
+end
+ret true
+end
+
+fn isdig c uchar to bool
+ret and ge c 48 le c 57
+end
+
+fn isaln c uchar to bool
+a = and ge c 65 le c 90
+b = and ge c 97 le c 122
+ret or or a b isdig c
+end
+
+fn rd16 b view uchar * o ulong to ulong
+ret or ulong get b o shl ulong get b add o 1 8
+end
+
+fn rd32 b view uchar * o ulong to ulong
+lo = rd16 b o
+ret or lo shl rd16 b add o 2 16
+end
+
+fn rd64 b view uchar * o ulong to ulong
+lo = rd32 b o
+ret or lo shl rd32 b add o 4 32
+end
+
+fn wr16 b edit uchar * o ulong v ulong to void
+put b o uchar and v 255
+put b add o 1 uchar and shr v 8 255
+end
+
+fn wr64 b edit uchar * o ulong v ulong to void
+for i ulong 8
+put b add o i uchar and shr v mul i 8 255
+end
+end
+
+note pdec: a decimal number from all of s; false (o untouched) when s is empty, has a non-digit
+note or does not fit 64 bits
+fn pdec s view uchar * o edit ulong 1 to bool
+if eq len s 0
+ret false
+end
+v = ulong 0
+for i ulong len s bound 9223372036854775807
+c = get s i
+if not isdig c
+ret false
+end
+if gt v 1844674407370955160
+ret false
+end
+w = add mul v 10 ulong sub c 48
+if lt w mul v 10
+ret false
+end
+v = w
+end
+put o 0 v
+ret true
+end
+
+note ---- packed argument list (OMEGESE s10: u16 count, then u16 length + bytes per record)
+fn avinit a edit uchar * to void
+put a 0 0
+put a 1 0
+put gavn 0 2
+end
+
+fn avadd a edit uchar * s view uchar * to void
+n = get gavn 0
+if gt add add n 2 len s len a
+die tavlong
+end
+wr16 a n len s
+n = cpy a add n 2 s
+put gavn 0 n
+wr16 a 0 add rd16 a 0 1
+end
+
+note ---- the private temp folder
+note tpath: <temp folder>/<nm> into o; returns its length
+fn tpath nm view uchar * o edit uchar 4096 to ulong
+n = get gtmpl 0
+for i ulong n bound 4096
+put o i get gtmp i
+end
+put o n 47
+ret cpy o add n 1 nm
+end
+
+note topen: open the temp file nm: how 0 read, 2 write (created or emptied, mode 0600)
+fn topen nm view uchar * how ulong to int
+p = new uchar 4096 0
+k = tpath nm p
+fd = pl_open part p 0 k how 384
+if lt fd 0
+warn tpfx
+warn ttmpf
+warn nm
+warn tnl
+cleanup
+exit 1
+end
+ret int fd
+end
+
+note cleanup: remove the temp folder's known files, then the folder (best effort, never fails)
+fn cleanup to void
+if eq get gtmpok 0 0
+ret
+end
+p = new uchar 4096 0
+s = ulong 0
+for i ulong len tnames
+if eq get tnames i 10
+k = tpath part tnames s sub i s p
+x = pl_unlink part p 0 k
+s = add i 1
+end
+end
+k = get gtmpl 0
+for i ulong k bound 4096
+put p i get gtmp i
+end
+x = pl_rmdir part p 0 k
+put gtmpok 0 0
+end
+
+note die: one line on stderr, cleanup, exit 1
+fn die m view uchar * to void
+warn tpfx
+warn m
+warn tnl
+cleanup
+exit 1
+end
+
+fn die2 m view uchar * a view uchar * to void
+warn tpfx
+warn m
+warn a
+warn tnl
+cleanup
+exit 1
+end
