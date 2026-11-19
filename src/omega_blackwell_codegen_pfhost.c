@@ -34,8 +34,11 @@ uint32_t omega_rl_shared_bytes(const OmegaRlSpec *s) {
 
 int omega_blackwell_codegen_rl_prog(const OmegaRlSpec *spec, BlackwellIRProgram *prog) {
     if (!spec || !prog) return -1;
+    omega_bw_ir_init(prog);
     uint64_t sp[8] = { spec->k, spec->e, spec->t, (uint64_t)(uint32_t)spec->mutant, 0, 0, 0, 0 };
     uint64_t ins[8192], meta[512], rc = 1;
+    memset(ins, 0, sizeof ins);
+    memset(meta, 0, sizeof meta);
     if (omega2_cg_rl_emit(&rc, sp, 8u, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
     return omega_bw_ir_from_om(ins, meta, prog);
 }
@@ -50,8 +53,11 @@ int omega_mc_spec_ok(const OmegaMcSpec *s) {
 
 int omega_blackwell_codegen_mc_prog(const OmegaMcSpec *spec, BlackwellIRProgram *prog) {
     if (!spec || !prog) return -1;
+    omega_bw_ir_init(prog);
     uint64_t sp[8] = { spec->h, spec->top_k, (uint64_t)(uint32_t)spec->mutant, 0, 0, 0, 0, 0 };
     uint64_t ins[8192], meta[512], rc = 1;
+    memset(ins, 0, sizeof ins);
+    memset(meta, 0, sizeof meta);
     if (omega2_cg_mc_emit(&rc, sp, 8u, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
     return omega_bw_ir_from_om(ins, meta, prog);
 }

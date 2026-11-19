@@ -22,7 +22,10 @@
 
 int omega_blackwell_codegen_pf_copy_prog(BlackwellIRProgram *prog) {
     if (!prog) return -1;
+    omega_bw_ir_init(prog);
     uint64_t ins[8192], meta[512], rc = 1;
+    memset(ins, 0, sizeof ins);
+    memset(meta, 0, sizeof meta);
     if (omega2_cg_pf_copy(&rc, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
     return omega_bw_ir_from_om(ins, meta, prog);
 }

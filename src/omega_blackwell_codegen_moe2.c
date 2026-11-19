@@ -49,7 +49,10 @@ uint32_t omega_fp8_gemv2_shared_bytes(const OmegaFp8GemvSpec *spec) {
 
 int omega_blackwell_codegen_fp8_gemv2_prog(const OmegaFp8GemvSpec *spec, BlackwellIRProgram *prog) {
     if (!spec || !prog) return -1;
+    omega_bw_ir_init(prog);
     uint64_t sp[8], ins[8192], meta[512], rc = 1;
+    memset(ins, 0, sizeof ins);
+    memset(meta, 0, sizeof meta);
     moe2_pack_spec(spec, sp);
     if (omega2_cg_moe2_emit(&rc, sp, 8u, ins, 8192u, meta, 512u) != 0 || rc != 0) return -1;
     return omega_bw_ir_from_om(ins, meta, prog);

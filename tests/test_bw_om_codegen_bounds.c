@@ -135,7 +135,147 @@ static void test_unpacker_bounds(void) {
 
     make_valid_minimal(ins, meta);
     meta[3] = 1; meta[320] = 0; meta[321] = 2; /* end >= n */
-    CHK(omega_bw_ir_from_om(ins, meta, &prog) != 0, "reject loop end >= n");
+    CHK(omega_bw_ir_from_om(ins, meta, &prog) != 0 && prog.count == 0 && prog.regalloc.num_vregs == 0,
+        "reject loop end >= n without partial prog residue");
+
+    /* mid-stream invalid opcode must leave prog completely cleared (no partial program accepted) */
+    make_valid_minimal(ins, meta);
+    ins[8] = (uint64_t)BW_IR_ATOMG_ADD_F32_STRONG_GPU + 99u; /* ins 0 valid, ins 1 invalid */
+    CHK(omega_bw_ir_from_om(ins, meta, &prog) != 0 && prog.count == 0 && prog.regalloc.num_vregs == 0 && prog.regalloc.num_uvregs == 0,
+        "reject mid-stream invalid opcode with zero partial residue");
+}
+
+static void test_qmma_and_pfhost_error_paths(void) {
+    static BlackwellIRProgram prog;
+
+    /* QMMA probe invalid specs */
+    prog.count = 77;
+    CHK(omega_blackwell_codegen_qmma_probe_prog(-1, 0, &prog) != 0 && prog.count == 0, "qmma_probe mutant=-1");
+    prog.count = 77;
+    CHK(omega_blackwell_codegen_qmma_probe_prog(2, 0, &prog) != 0 && prog.count == 0, "qmma_probe mutant=2");
+    prog.count = 77;
+    CHK(omega_blackwell_codegen_qmma_probe_prog(0, 17, &prog) != 0 && prog.count == 0, "qmma_probe wait_nops=17");
+
+    /* QMMA peak invalid specs */
+    struct { uint32_t iters, chains, stall, threads; const char *name; } qbad[] = {
+        { 0, 4, 4, 256, "qmma_peak iters=0" },
+        { 8, 0, 4, 256, "qmma_peak chains=0" },
+        { 8, 17, 4, 256, "qmma_peak chains=17" },
+        { 8, 4, 0, 256, "qmma_peak stall=0" },
+        { 8, 4, 16, 256, "qmma_peak stall=16" },
+        { 8, 4, 4, 0, "qmma_peak threads=0" },
+        { 8, 4, 4, 33, "qmma_peak threads=33" },
+        { 8, 4, 4, 1056, "qmma_peak threads=1056" },
+    };
+    for (size_t i = 0; i < sizeof(qbad) / sizeof(qbad[0]); i++) {
+        prog.count = 77;
+        CHK(omega_blackwell_codegen_qmma_peak_prog(qbad[i].iters, qbad[i].chains, qbad[i].stall, qbad[i].threads, &prog) != 0 && prog.count == 0,
+            qbad[i].name);
+    }
+
+    /* pfhost router logits (rl) invalid specs */
+    OmegaRlSpec rbad[] = {
+        { .k = 0,     .e = 128,  .t = 4,  .mutant = 0 },
+        { .k = 64,    .e = 128,  .t = 4,  .mutant = 0 },
+        { .k = 16512, .e = 128,  .t = 4,  .mutant = 0 },
+        { .k = 2048,  .e = 16,   .t = 4,  .mutant = 0 },
+        { .k = 2048,  .e = 1056, .t = 4,  .mutant = 0 },
+        { .k = 2048,  .e = 128,  .t = 0,  .mutant = 0 },
+        { .k = 2048,  .e = 128,  .t = 17, .mutant = 0 },
+        { .k = 2048,  .e = 128,  .t = 3,  .mutant = 0 }, /* t % (e/32) != 0 */
+        { .k = 2048,  .e = 128,  .t = 4,  .mutant = 3 },
+    };
+    for (size_t i = 0; i < sizeof(rbad) / sizeof(rbad[0]); i++) {
+        prog.count = 77;
+        CHK(omega_blackwell_codegen_rl_prog(&rbad[i], &prog) != 0 && prog.count == 0, "rl rejects invalid spec cleanly");
+        CHK(!omega_rl_spec_ok(&rbad[i]) && omega_rl_shared_bytes(&rbad[i]) == 0, "rl helpers refuse invalid spec");
+    }
+
+    /* pfhost MoE combine (mc) invalid specs */
+    OmegaMcSpec mbad[] = {
+        { .h = 0,    .top_k = 8,  .mutant = 0 },
+        { .h = 2,    .top_k = 8,  .mutant = 0 },
+        { .h = 2048, .top_k = 0,  .mutant = 0 },
+        { .h = 2048, .top_k = 3,  .mutant = 0 },
+        { .h = 2048, .top_k = 20, .mutant = 0 },
+        { .h = 2048, .top_k = 8,  .mutant = 3 },
+    };
+    for (size_t i = 0; i < sizeof(mbad) / sizeof(mbad[0]); i++) {
+        prog.count = 77;
+        CHK(omega_blackwell_codegen_mc_prog(&mbad[i], &prog) != 0 && prog.count == 0, "mc rejects invalid spec cleanly");
+        CHK(!omega_mc_spec_ok(&mbad[i]), "mc_spec_ok refuses invalid spec");
+    }
+}
+
+static void check_max_headroom(const char *name, const BlackwellIRProgram *p) {
+    static uint8_t code[BW_MAX_IR_INSNS * 16];
+    size_t len = 0;
+    int enc = omega_bw_encode_program(p, code, sizeof code, &len);
+    size_t want = omega_bw_program_code_bytes(p);
+    CHK(enc == 0 && len == want && want >= p->count * 16u, name);
+    printf("HEADROOM %-32s insns=%3zu/%d vregs=%3d/%d uvregs=%2d/%d\n",
+           name, p->count, BW_MAX_IR_INSNS,
+           p->regalloc.num_vregs, BW_MAX_VREGS,
+           p->regalloc.num_uvregs, BW_MAX_UVREGS);
+    CHK(p->count <= BW_MAX_IR_INSNS, "insns within BW_MAX_IR_INSNS");
+    CHK(p->regalloc.num_vregs <= BW_MAX_VREGS, "vregs within BW_MAX_VREGS");
+    CHK(p->regalloc.num_uvregs <= BW_MAX_UVREGS, "uvregs within BW_MAX_UVREGS");
+}
+
+static void test_max_size_legal_inputs(void) {
+    static BlackwellIRProgram p;
+    {
+        OmegaFp8GemmSpec s = { .k = 32768, .lane_bytes = 16, .mt = 8, .warps = 16, .mutant = 0, .rowmap = 0 };
+        CHK(omega_blackwell_codegen_fp8gemm_prog(&s, &p) == 0, "max legal gemm k32768 mt8");
+        check_max_headroom("max_gemm_k32768_mt8", &p);
+    }
+    {
+        OmegaBf16GemvSpec s = { .k = 5120, .rows = 1, .warps = 16, .depth = 5, .mutant = 0, .ystride = 248320, .xbatch = 4, .mask = 0 };
+        CHK(omega_blackwell_codegen_bf16_gemv_prog(&s, &p) == 0, "max legal bf16 k5120 xb4");
+        check_max_headroom("max_bf16_k5120_xb4", &p);
+    }
+    {
+        OmegaBf16GemvSpec s = { .k = 5120, .rows = 1, .warps = 16, .depth = 5, .mutant = 0, .ystride = 0, .xbatch = 0, .mask = 1 };
+        CHK(omega_blackwell_codegen_bf16_gemv_prog(&s, &p) == 0, "max legal bf16 k5120 mask");
+        check_max_headroom("max_bf16_k5120_mask", &p);
+    }
+    {
+        OmegaFp8GemvSpec s = { .k = 17408, .lane_bytes = 16, .rows = 1, .warps = 16, .mutant = 0, .depth = 2, .sched = 1, .coal = 1, .wfirst = 1 };
+        CHK(omega_blackwell_codegen_fp8_gemv_prog(&s, &p) == 0, "max legal moe k17408");
+        check_max_headroom("max_moe_k17408_d2_s1", &p);
+    }
+    {
+        OmegaFp8GemvSpec s = { .k = 4096, .lane_bytes = 16, .rows = 1, .warps = 16, .mutant = 0 };
+        CHK(omega_blackwell_codegen_fp8_gemv2_prog(&s, &p) == 0, "max legal moe2 k4096");
+        check_max_headroom("max_moe2_k4096_w16", &p);
+    }
+    {
+        CHK(omega_blackwell_codegen_qmma_probe_prog(0, 16, &p) == 0, "max legal qmma_probe wait16");
+        check_max_headroom("max_qmma_probe_w16", &p);
+    }
+    {
+        CHK(omega_blackwell_codegen_qmma_peak_prog(1024, 16, 15, 1024, &p) == 0, "max legal qmma_peak c16 t1024");
+        check_max_headroom("max_qmma_peak_c16_t1024", &p);
+    }
+    {
+        CHK(omega_blackwell_codegen_f2e4_probe_prog(&p) == 0, "legal f2e4_probe");
+        check_max_headroom("f2e4_probe", &p);
+    }
+    {
+        OmegaRlSpec s = { .k = 16384, .e = 32, .t = 16, .mutant = 0 };
+        CHK(omega_blackwell_codegen_rl_prog(&s, &p) == 0, "max legal rl k16384 e32 t16");
+        check_max_headroom("max_rl_k16384_e32_t16", &p);
+    }
+    {
+        OmegaRlSpec s = { .k = 16384, .e = 512, .t = 16, .mutant = 0 };
+        CHK(omega_blackwell_codegen_rl_prog(&s, &p) == 0, "max legal rl k16384 e512 t16");
+        check_max_headroom("max_rl_k16384_e512_t16", &p);
+    }
+    {
+        OmegaMcSpec s = { .h = 4096, .top_k = 16, .mutant = 0 };
+        CHK(omega_blackwell_codegen_mc_prog(&s, &p) == 0, "max legal mc h4096 topk16");
+        check_max_headroom("max_mc_h4096_topk16", &p);
+    }
 }
 
 static void test_gemm_error_paths(void) {
@@ -255,6 +395,8 @@ static void dump_metrics(void) {
 int main(void) {
     test_unpacker_bounds();
     test_gemm_error_paths();
+    test_qmma_and_pfhost_error_paths();
+    test_max_size_legal_inputs();
     dump_metrics();
     printf("test_bw_om_codegen_bounds: %d passed, %d failed: %s\n", g_pass, g_fail, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
