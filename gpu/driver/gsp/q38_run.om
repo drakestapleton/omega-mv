@@ -54,8 +54,10 @@ const Q3GDNSMEM uint 5728
 const Q3ATTNSMEM uint 14896
 const Q3BF16SMEM uint 20480
 const Q3ATTNROWB ulong 512
+const Q3ATTNSLACK ulong 8256
 const Q3ATTNNORMB ulong 2048
-const Q3ATTNPARTMIN ulong 65536
+const Q3ATTNPARTSTEP ulong 6192
+const Q3MAXCTX ulong 131072
 const Q3ZEROPERCTA ulong 4096
 
 note Step modes: 0 = PREFILL (593 launches, skips lm_head + argmax), 1 = DECODE (596 launches)
@@ -168,12 +170,13 @@ ret or le add a asz b le add b bsz a
 end
 
 note Blackwell Trap #4: declared GPRs >= peak + 2, rounded up to 8, minimum 64 (omega_blackwell_codegen.c:2854).
+note Computed in ulong to prevent u32 wrap; callers reject peak > 253 (HW max 255 GPRs/thread).
 fn q3_gpr_declared peak uint to uint
-d = mul div add add peak 2 7 8 8
+d = mul div add add ulong peak 2 7 8 8
 if lt d 64
-d = uint 64
+d = ulong 64
 end
-ret d
+ret uint and d Q3U32MASK
 end
 
 note Flush CPU Normal-WB range [pa, pa + nbytes) to PoC via DC CIVAC + DSB SY before GPU read.
@@ -382,6 +385,9 @@ end
 if not q3_va_ok code_va 256
 ret Q3ERANGE
 end
+if gt peak_gpr 253
+ret Q3ERANGE
+end
 g = q3_gpr_declared peak_gpr
 if gt mul ulong tx ulong g 65536
 ret Q3ERANGE
@@ -484,6 +490,10 @@ cnts = q3_ncva 15
 for i ulong mul Q3ATTNL 4
 mmwr32 add cnts mul i 4 0
 end
+mva = get q3st 4
+for i ulong 8
+mmwr32 add mva mul i 4 0
+end
 end
 
 note Initialize Q38 bare-metal runtime with disjoint Normal-NC and GPU-cached LPDDR5x pools.
@@ -522,7 +532,7 @@ end
 if not q3_disjoint pb_pa 65536 marker_va 4096
 ret Q3EINVAL
 end
-if or eq max_ctx 0 or gt max_ctx 262144 ne rem max_ctx 256 0
+if or eq max_ctx 0 or gt max_ctx Q3MAXCTX ne rem max_ctx 256 0
 ret Q3EINVAL
 end
 for i ulong 32
@@ -555,7 +565,7 @@ fn q3_set_code kind ulong code_va ulong peak_gpr uint smem uint to long
 if or eq get q3st 0 0 ge kind Q3KCOUNT
 ret Q3EINVAL
 end
-if gt smem Q3MAXSMEM
+if or gt smem Q3MAXSMEM gt peak_gpr 253
 ret Q3ERANGE
 end
 if not q3_va_ok code_va 256
@@ -704,13 +714,14 @@ put q3st 24 1
 ret Q3OK
 end
 
-note Bind 16-layer attention KV cache, RoPE table, Q/K norms, and split-K partials pools
+note Bind 16-layer attention KV cache (with OMEGA_DATTN256_PLANE_SLACK=8256 per plane),
+note RoPE table, Q/K norms, and split-K partials pool (4 * (max_ctx / 256) * 6192 B).
 fn q3_set_attn_pools kv_va ulong rope_va ulong norms_va ulong part_va ulong to long
 if eq get q3st 0 0
 ret Q3ESTATE
 end
 mctx = get q3st 5
-plane = mul mul Q3KVHEADS mctx Q3ATTNROWB
+plane = add mul mul Q3KVHEADS mctx Q3ATTNROWB Q3ATTNSLACK
 if not q3_va_ok kv_va mul mul Q3ATTNL 2 plane
 ret Q3ERANGE
 end
@@ -720,7 +731,7 @@ end
 if not q3_va_ok norms_va mul Q3ATTNL Q3ATTNNORMB
 ret Q3ERANGE
 end
-if not q3_va_ok part_va Q3ATTNPARTMIN
+if not q3_va_ok part_va mul mul Q3KVHEADS div mctx 256 Q3ATTNPARTSTEP
 ret Q3ERANGE
 end
 put q3st 17 kv_va
@@ -930,7 +941,7 @@ end
 note Exact 25-word ATTN256 decode launch (omega_gpu_decode_attn256_api.c:212-234, smem=14896)
 fn q3_launch_attn ki ulong kv_pos uint to long
 mctx = get q3st 5
-plane = mul mul Q3KVHEADS mctx Q3ATTNROWB
+plane = add mul mul Q3KVHEADS mctx Q3ATTNROWB Q3ATTNSLACK
 kc = add get q3st 17 mul mul ki 2 plane
 vc = add kc plane
 nm = add get q3st 19 mul ki Q3ATTNNORMB
@@ -946,7 +957,7 @@ q3_put64 8 nm
 q3_put64 10 add nm 1024
 q3_put64 12 q3_wbva 3
 q3_put64 14 get q3st 20
-q3_put64 16 q3_ncva 15
+q3_put64 16 add q3_ncva 15 mul ki 16
 put q3args 18 kv_pos
 put q3args 19 256
 put q3args 20 uint splits
@@ -1162,8 +1173,8 @@ ret Q3EVERIFY
 end
 end
 cnts = q3_ncva 15
-for j ulong Q3ATTNL
-if ne mmrd32 add cnts mul j 16 0
+for j ulong mul Q3ATTNL 4
+if ne mmrd32 add cnts mul j 4 0
 ret Q3EVERIFY
 end
 end
