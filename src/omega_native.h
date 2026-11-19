@@ -51,6 +51,18 @@ uint32_t omega2_q38_bf16_xbatch_max(uint64_t *result, uint64_t o_hd, uint64_t o_
 uint32_t omega2_q38_plan_final(uint64_t *result, const uint64_t *o_cfg, uint64_t o_cfg_len, uint32_t *o_dst, uint64_t o_dst_len);
 /* export fn q38_attn256_cache_policy env_mode ulong to ulong */
 uint32_t omega2_q38_attn256_cache_policy(uint64_t *result, uint64_t o_env_mode);
+#define OMEGA2_IDENT_cg_pf "omega-ident 1 unit=cg_pf abi=2 profile=OM-2 src=4901d09934fbdcdad520ffdb8719fe027b85655e1a90ab3361339d0844e2f60b omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_pf(void);
+/* export fn cg_pf_copy ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_pf_copy(uint64_t *result, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_bf16 "omega-ident 1 unit=cg_bf16 abi=2 profile=OM-2 src=3fb1c25a3bd1419fb72604a75d395da675ec4dc5e0c1354b20919f4006fcd854 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_bf16(void);
+/* export fn cg_bf16_ok_i sp view ulong 8 to ulong */
+uint32_t omega2_cg_bf16_ok_i(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
+/* export fn cg_bf16_ok sp view ulong 8 to ulong */
+uint32_t omega2_cg_bf16_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
+/* export fn cg_bf16_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_bf16_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 #ifdef __cplusplus
 }
 #endif
