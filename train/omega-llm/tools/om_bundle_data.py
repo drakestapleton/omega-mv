@@ -27,7 +27,44 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 T_CTX = 256
-BUNDLES = ("om-core", "gb20b-mmio", "aienux-kernel", "libos-rpc")
+BUNDLES = ("om-core", "aienux-kernel", "gb20b-mmio", "libos-rpc")
+
+# Merkle specialist chain hierarchy (parent -> child links; each child's OLLMSP01
+# base_hash cryptographically pins its frozen prefix layers 0..freeze_layers-1).
+CHAIN_TOPOLOGY = {
+    "om-core": {
+        "link_depth": 1,
+        "parent": "base",
+        "freeze_layers": 8,
+        "target_layers": 10,
+        "strand": "trunk",
+        "role": "Core .om syntax/stdlib/OLLM CPU + live omc refusal-repair pairs (errors 1..30)",
+    },
+    "aienux-kernel": {
+        "link_depth": 2,
+        "parent": "om-core",
+        "freeze_layers": 10,
+        "target_layers": 12,
+        "strand": "trunk",
+        "role": "Aienux OS, ARM64/x86 UEFI, MMU/boot, bare-metal drivers",
+    },
+    "gb20b-mmio": {
+        "link_depth": 3,
+        "parent": "aienux-kernel",
+        "freeze_layers": 12,
+        "target_layers": 14,
+        "strand": "branch-a",
+        "role": "GB20B / Blackwell GPU, GSP/SEC2, MMIO, CUDApp, VFIO/KFD",
+    },
+    "libos-rpc": {
+        "link_depth": 3,
+        "parent": "aienux-kernel",
+        "freeze_layers": 12,
+        "target_layers": 14,
+        "strand": "branch-b",
+        "role": "LibosLog, GSP/host RPC, HTTP/JSON/TLS wire codecs, serve.om, IPC",
+    },
+}
 
 CANONICAL_REPO_ORDER = (
     "omega-mv",
@@ -822,7 +859,12 @@ def cmd_build(args: argparse.Namespace) -> int:
     report = scan_workspace(workspace)
     refusals = generate_verified_refusals(omc, include_err24=args.include_err24)
 
-    summary = {"bundles": {}, "refusal_pairs": len(refusals), "refusal_codes": sorted({r["code"] for r in refusals})}
+    summary = {
+        "chain_topology": CHAIN_TOPOLOGY,
+        "bundles": {},
+        "refusal_pairs": len(refusals),
+        "refusal_codes": sorted({r["code"] for r in refusals}),
+    }
 
     for bundle in BUNDLES:
         train_pairs: List[Tuple[str, str]] = []
@@ -879,6 +921,11 @@ def cmd_build(args: argparse.Namespace) -> int:
                     f.write(json.dumps({"prompt": pr, "completion": co}) + "\n")
 
         binfo = {
+            "link_depth": CHAIN_TOPOLOGY[bundle]["link_depth"],
+            "parent": CHAIN_TOPOLOGY[bundle]["parent"],
+            "freeze_layers": CHAIN_TOPOLOGY[bundle]["freeze_layers"],
+            "target_layers": CHAIN_TOPOLOGY[bundle]["target_layers"],
+            "strand": CHAIN_TOPOLOGY[bundle]["strand"],
             "train_files": len(train_hashes),
             "held_files": len(held_hashes),
             "train_examples": len(train_pairs),
