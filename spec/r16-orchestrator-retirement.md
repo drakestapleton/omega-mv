@@ -623,6 +623,12 @@ blocked).
      the completer and the digest of the evidence observed at completion.
      A bound-store drain must therefore run as the assigned worker and use
      `rx_gen_finish_work_as`; unbound R9 and visor accounting remains legacy.
+     The finish resource length-prefixes the store directory before hashing it.
+     Rebase onto main (2026-11-19) ran `tests/runtime/rx_gen_work_auth.c`
+     (PASS, including UBSan) and typechecked `tests/runtime/rx_r16_negative.c`.
+     The R9, R16 and visor binaries were not linked: this tree has no aienos
+     or physics sibling. The ladder list below is the 2026-11-15 run, not
+     that rebase.
    - Host ladder rerun after this fix: R7, R8 (116/0), R9, R10 (198/0), R11
      (436/0), R13 host, R14 host (A to F PASS), R15 parity host (5 pairs, 0
      failures), R15 G7 host (57/0), workflow fusion (17059/0; its check count

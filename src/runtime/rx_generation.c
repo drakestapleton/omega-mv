@@ -276,10 +276,16 @@ static uint64_t work_resource_value(const RxGenStore *store, const Candidate *c,
     put_u64(ids, c->parent_id);
     put_u64(ids + 8, c->id);
     put_u64(ids + 16, work_id);
+    /* Length-prefix the directory. A raw concatenation aliases a longer path
+     * with a shorter path whose next hashed bytes continue it. */
+    uint64_t dir_len = strlen(store->dir);
+    uint8_t dir_len_le[8];
+    put_u64(dir_len_le, dir_len);
     sha256_ctx ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, domain, sizeof domain - 1);
-    sha256_update(&ctx, (const uint8_t *)store->dir, strlen(store->dir));
+    sha256_update(&ctx, dir_len_le, sizeof dir_len_le);
+    sha256_update(&ctx, (const uint8_t *)store->dir, (size_t)dir_len);
     sha256_update(&ctx, ids, sizeof ids);
     sha256_final(&ctx, digest);
     uint64_t resource = get_u64(digest);
