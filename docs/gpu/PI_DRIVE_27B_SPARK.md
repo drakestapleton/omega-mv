@@ -56,3 +56,29 @@ Compiled and executed natively on `hub` (`Linux hub 7.0.0-1023-raspi aarch64 GNU
 - `gpu/driver/gsp/logdec.om`: cast `uchar` to `ulong` and split `kind`/`loc` check in `lgtabparse` (`error 12`).
 - `gpu/driver/gsp/compute.om`: split `get cbrblob` temp before `put rqpay` (`error 12`).
 - `gpu/driver/tests/bootfs_trace.om` & `gpu/driver/tests/logdec_trace.om`: typed bare arithmetic literals with `ulong` (`error 11`).
+
+---
+
+## 3. Back-to-Back 3-Way Live Stress Benchmark (2026-11-19)
+
+All three trials ran back-to-back on the exact same DGX Spark GB10 (`580.173.02`), same model (`qwen3.8-27b-fp8-017b9c7a`), and byte-identical `.om` codebase prompts (`pi_drive.om` bumped to `512 KiB` request buffer, still `68 KB` static ELF).
+
+| Metric / Stage | Trial 1: Pi 5 (68 KB `.om`) → Spark Omega | Trial 2: Spark-Local → Spark Omega | Trial 3: CUDA + PyTorch (`torch 2.14.0+cu130`, `transformers 5.17.0`) |
+|---|---:|---:|---:|
+| **Model Load Time** | **`51.4 s`** (`READY 47 s`) | **`47 s`** | **`171.8 s`** (3.5× slower) |
+| **Memory at Load** | `38.55 GB` RSS (incl. 128k KV; `71 GiB` free) | `38.55 GB` RSS (incl. 128k KV) | `29.47 GB` CUDA + `0.69 GiB` RSS (0 KV allocated) |
+| **Client Footprint** | **`68 KB` ELF, `512–640 KB` RSS, `0.00 s` CPU** | Local Python process | Python + PyTorch + HF venv |
+| **S1 (`45` in / `37` out)** | **`5.22 s`** (`8.05 tok/s` decode) | **`5.21 s`** (`8.04 tok/s` decode) | **CRASH** (`ImportError: finegrained-fp8 kernel unavailable`, 0 tok) |
+| **S2 (`3,264` in / `128` out)** | **`31.99 s`** (`7.88 tok/s` decode) | **`31.54 s`** (`7.89 tok/s` decode) | Not reached (crashed on S1) |
+| **S3 (`13,127` in / `64` out)** | **`72.72 s`** (`7.36 tok/s` decode) | **`72.36 s`** (`7.39 tok/s` decode) | Not reached |
+| **S4 (`39,820` in / `32` out)** | **`215.68 s`** (`6.40 tok/s` decode) | **`214.43 s`** (`6.42 tok/s` decode) | Not reached |
+| **S5 (~99K tok / 240 KB JSON)** | Hit `420 s` client timeout in prefill (no OOM/crash; `68 GiB` free) | — | — |
+
+### Live GB10 Telemetry During Trial 1 (364 samples @ 2 s)
+- **GPU Utilization:** max `96%`, active average `64.6%` (`362/364` active samples)
+- **SM Clock:** `208 MHz` idle → **`2,502 MHz`** peak
+- **Temperature:** `41°C` idle → **`74°C`** peak
+- **Power Draw:** `4.73 W` idle → **`48.81 W`** peak
+- **Spark `MemAvailable` after 40K+ token stress:** **`68 GiB`** still free (zero swap, zero OOM)
+- **Pi 5 remote overhead vs. Spark-local:** **< 1%** (`+0.01 s` at 45 tok; `+1.25 s` / `+0.6%` at 40K tok).
+
