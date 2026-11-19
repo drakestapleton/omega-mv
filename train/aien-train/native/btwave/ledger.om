@@ -1,0 +1,290 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note BTWAVE-P0: Give-Before-Take Reciprocal Compute Ledger (native/btwave/ledger.om).
+note Enforces extracted <= contributed across all events with OM-2 abstract types
+note CreditJ and GrantJ plus chained 256-bit FIPS 180-4 SHA-256 work receipts.
+note Refusal leaves epoch, contributed, extracted, and chain 100% unchanged.
+
+note Ledger globals:
+note   Lstate[0] = epoch, Lstate[1] = contributed raw, Lstate[2] = extracted raw,
+note   Lstate[3] = gives_ok, Lstate[4] = takes_ok, Lstate[5] = refusals.
+note   Lresp[0] = last accepted or refused response y (0 on refusal).
+note   Lchain[0..31] = 32-byte chained SHA-256 receipt state.
+global Lstate ulong 8
+global Lresp long 2
+global Lchain uchar 32
+
+note 16 canonical case rows (7 fields per row = 112 long entries).
+global Lcases long 112
+global Lexp long 16
+
+fn cred_add c CreditJ delta ulong to CreditJ
+ret CreditJmk add open c delta
+end
+
+fn grant_add g GrantJ delta GrantJ to GrantJ
+ret GrantJmk add open g open delta
+end
+
+fn cred_pos c CreditJ to bool
+ret gt open c 0
+end
+
+fn recip_ok c CreditJ g GrantJ req GrantJ to bool
+ret le add open g open req open c
+end
+
+fn scale_bad sc long to bool
+if or eq sc 0 or lt sc neg VMAX gt sc VMAX
+ret true
+end
+ret false
+end
+
+fn ldg_reset to void
+for i ulong 8
+put Lstate i 0
+end
+put Lresp 0 0
+put Lresp 1 0
+for i ulong 32
+put Lchain i 0
+end
+end
+
+fn ldg_chid to ulong
+b = new uchar 8 0
+for i ulong 8 unroll
+put b i get Lchain i
+end
+ret rd64le view b 0
+end
+
+note Compute 32-byte SHA-256 receipt of (Lchain[0..31] || ep_le8 || w_le8 || y_tc_le8).
+fn ldg_rcpt ep ulong w ulong y long outd edit uchar 32 to void
+msg = new uchar 56 0
+for i ulong 32
+put msg i get Lchain i
+end
+wr64le msg 32 ep
+wr64le msg 40 w
+wr64le msg 48 u64_tc y
+sha256_slice view msg outd
+end
+
+note Constant-time 32-byte receipt equality under ARM64 PSTATE.DIT.
+fn rcpt_eq a view uchar 32 b view uchar 32 to bool
+d0 = dit 1
+acc = uint 0
+for i ulong 32 unroll
+acc = or acc xor uint get a i uint get b i
+end
+sc = scrub 64
+d1 = dit int d0
+ret eq add ulong acc ulong sc 0
+end
+
+fn build_rx sym ulong mode ulong to Trit32
+rx = h16enc sym
+if eq mode 1
+rx = t32flip rx 1
+rx = t32flip rx 3
+rx = t32flip rx 5
+rx = t32flip rx 7
+end
+if eq mode 4
+rx = t32flip rx 0
+rx = t32flip rx 5
+rx = t32flip rx 11
+end
+ret rx
+end
+
+fn ldg_commit_give reqep ulong worku ulong yv long expr view uchar 32 to void
+curc = CreditJmk get Lstate 1
+newc = cred_add curc worku
+put Lstate 0 reqep
+put Lstate 1 open newc
+put Lstate 3 add get Lstate 3 1
+for i ulong 32 unroll
+put Lchain i get expr i
+end
+put Lresp 0 yv
+end
+
+note Execute GIVE step (op == 1) after opcode and epoch guards pass.
+fn ldg_give ev view long 7 to long
+expr = new uchar 32 0
+rxr = new uchar 32 0
+reqep = ulong get ev 1
+worku = ulong get ev 2
+takeu = ulong get ev 3
+sc = get ev 4
+sym = ulong get ev 5
+mode = ulong get ev 6
+if or or eq worku 0 gt worku WMAX ne takeu 0
+ret -3
+end
+decs = h16dec build_rx sym mode
+if lt decs 0
+ret -4
+end
+jw = job_wave ulong decs
+if eq mode 2
+jw = h16enc ulong decs
+end
+if ne t32pow jw 32
+ret -5
+end
+if scale_bad sc
+ret -6
+end
+yv = wave_eval jw sc
+ldg_rcpt reqep open jw yv expr
+for i ulong 32 unroll
+put rxr i get expr i
+end
+if eq mode 3
+put rxr 31 uchar xor uint get rxr 31 1
+end
+if not rcpt_eq expr rxr
+ret -7
+end
+ldg_commit_give reqep worku yv expr
+ret 0
+end
+
+fn ldg_commit_take reqep ulong curg GrantJ reqg GrantJ yv long newd view uchar 32 to void
+newg = grant_add curg reqg
+put Lstate 0 reqep
+put Lstate 2 open newg
+put Lstate 4 add get Lstate 4 1
+for i ulong 32 unroll
+put Lchain i get newd i
+end
+put Lresp 0 yv
+end
+
+note Execute TAKE step (op == 2) after opcode and epoch guards pass.
+fn ldg_take ev view long 7 to long
+newd = new uchar 32 0
+reqep = ulong get ev 1
+worku = ulong get ev 2
+takeu = ulong get ev 3
+sc = get ev 4
+sym = ulong get ev 5
+mode = ulong get ev 6
+if or or eq takeu 0 gt takeu WMAX ne worku 0
+ret -8
+end
+curc = CreditJmk get Lstate 1
+if not cred_pos curc
+ret -9
+end
+curg = GrantJmk get Lstate 2
+reqg = GrantJmk takeu
+if not recip_ok curc curg reqg
+ret -10
+end
+if scale_bad sc
+ret -6
+end
+anc = ldg_chid
+if eq mode 5
+anc = xor anc 1
+end
+if ne anc ldg_chid
+ret -11
+end
+wd = wdup_tag uint and reqep 0xffff
+if not wdup_chk wd uint and reqep 0xffff
+ret -12
+end
+yv = wave_eval job_wave sym sc
+ldg_rcpt reqep open reqg yv newd
+ldg_commit_take reqep curg reqg yv newd
+ret 0
+end
+
+note Top-level admission and settlement step for one event.
+fn ldg_step ev view long 7 to long
+put Lresp 0 0
+op = get ev 0
+reqe = get ev 1
+st = long 0
+if and ne op 1 ne op 2
+st = -1
+else
+if lt reqe 0
+st = -2
+else
+if ne ulong reqe add get Lstate 0 1
+st = -2
+else
+if or lt get ev 2 0 or lt get ev 3 0 or lt get ev 5 0 gt get ev 5 31
+st = -3
+else
+if eq op 1
+st = ldg_give ev
+else
+st = ldg_take ev
+end
+end
+end
+end
+end
+if ne st 0
+put Lstate 5 add get Lstate 5 1
+end
+ret st
+end
+
+fn set_c1 cid ulong op long re long wu long to void
+o = mul cid 7
+put Lcases o op
+put Lcases add o 1 re
+put Lcases add o 2 wu
+end
+
+fn set_c2 cid ulong tu long sc long sym long md long ex long to void
+o = mul cid 7
+put Lcases add o 3 tu
+put Lcases add o 4 sc
+put Lcases add o 5 sym
+put Lcases add o 6 md
+put Lexp cid ex
+end
+
+fn init_cases to void
+set_c1 0 2 1 0
+set_c2 0 10 2 3 0 -9
+set_c1 1 1 1 50
+set_c2 1 0 3 5 0 0
+set_c1 2 3 2 10
+set_c2 2 0 1 1 0 -1
+set_c1 3 1 1 20
+set_c2 3 0 1 1 0 -2
+set_c1 4 1 2 0
+set_c2 4 0 1 1 0 -3
+set_c1 5 1 2 30
+set_c2 5 0 2 0 1 -4
+set_c1 6 1 2 30
+set_c2 6 0 2 0 2 -5
+set_c1 7 1 2 30
+set_c2 7 0 70000 2 0 -6
+set_c1 8 1 2 30
+set_c2 8 0 2 4 3 -7
+set_c1 9 1 2 40
+set_c2 9 0 -4 13 4 0
+set_c1 10 2 3 0
+set_c2 10 35 5 9 0 0
+set_c1 11 2 4 0
+set_c2 11 0 1 9 0 -8
+set_c1 12 2 4 0
+set_c2 12 60 2 9 0 -10
+set_c1 13 2 4 0
+set_c2 13 25 2 9 5 -11
+set_c1 14 2 4 0
+set_c2 14 55 -2 21 0 0
+set_c1 15 2 5 0
+set_c2 15 1 1 2 0 -10
+end

@@ -1,0 +1,1001 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note omegallm eio.om (aien-train#52): the UEFI platform unit for `target x86efi`. It replaces lio.om
+note and defines the same functions (oargc, oargr, oflush, ocwopen, ocwput, ocwend, ofsz, ogradw,
+note ocsinit, ocsg, ocsp, odread, owflush, owopen, owclose, ooffrd, oprd, obmsave, main) with efi words only: efi 1 key, efi 2 stall, efi 10 millisecond clock,
+note efi 12 file (one open file; ARG bits 0..7 sub, 8..15 volume, 16..63 position; result bit 63 set
+note on error), efi 13 console text, efi 14 machine identity (CPUID, SystemTable FirmwareVendor and
+note FirmwareRevision, SMBIOS structure table). Every file is on the volume the image was loaded
+note from (k = 255). After the banner main prints the identity line `ID cpu=... fw=... fwrev=...
+note smbios=.../.../...` (CONTRACT section 9); it never prints the SMBIOS serial number or UUID.
+note The command lines come from \OLLM\JOB.TXT (CONTRACT section 9): one command per line without the
+note program name, tokens split on space or tab, a token in double quotes may hold spaces, empty lines
+note and lines starting with # are skipped. Each job's line is echoed as `> line`, its output follows
+note (with a line feed added when it does not end in one), then `J ms` (wall milliseconds, 0 when the
+note firmware has no clock). Output goes to the console
+note (bytes outside 9, 10, 13, 32..126 shown as ?) and, byte-exact, to \OLLM\OUT.TXT, which main
+note recreates at start; each flush appends. After the last job main prints `OLLM DONE jobs ms` and
+note waits up to 300 s for a key. A refusal (exit N) ends the application at once with status N, as
+note on Linux; OUT.TXT then ends with the failing job's output so far.
+note One job is not a cli command: `ask CK SEED N TEMPMILLI [MERGES]` (oask) is a typed conversation with
+note the model at the machine's own keyboard and screen. It prints `You: `, reads a line of keys (efi 1;
+note 32..126 only, Backspace removes one, at most 900), and runs `sample CK SEED+turn N TEMPMILLI LINE
+note [MERGES]` for it, again and again. An empty line, Esc, or ten minutes without a key ends the job. The
+note typed line and the answer go to OUT.TXT like every other output. It needs a keyboard, so no
+note recorded job file uses it.
+note Differences from lio.om: a checkpoint is written in place (no PATH.tmp + rename: the UEFI file
+note protocol has no rename), and a path longer than 255 bytes is an I/O refusal (exit 70).
+const OEV ulong 65280
+const OERR ulong 9223372036854775808
+const OJCAP ulong 65536
+global ojob uchar 65536
+global ojn ulong 1
+global otb ulong 64
+global otl ulong 64
+global otc ulong 1
+global opn uchar 16
+global ocon uchar 4096
+global oop ulong 1
+global owq0 uchar 256
+global owq1 uchar 256
+global owql ulong 2
+global owps ulong 2
+global oclk uchar 8
+global okey uchar 8
+global olc ulong 1
+global oidc uchar 16
+global oidb uchar 48
+global oidv uchar 512
+global oids uchar 65536
+
+fn oeerr r ulong to bool
+ret ge r OERR
+end
+
+note efi 12 ARG for sub-op s at byte position p on the boot volume
+fn oefa s ulong p ulong to ulong
+ret or or s OEV shl p 16
+end
+
+note close the open file; a failed close is an I/O refusal
+fn oeclose to void
+c = efi 12 oefa 4 0 opn 0 0
+if oeerr c
+exit 70
+end
+end
+
+note opn = \OLLM\JOB.TXT (w = 0) or \OLLM\OUT.TXT (w = 1), 13 bytes
+fn opath w ulong to void
+put opn 0 92
+put opn 1 79
+put opn 2 76
+put opn 3 76
+put opn 4 77
+put opn 5 92
+if eq w 0
+put opn 6 74
+put opn 7 79
+put opn 8 66
+else
+put opn 6 79
+put opn 7 85
+put opn 8 84
+end
+put opn 9 46
+put opn 10 84
+put opn 11 88
+put opn 12 84
+end
+
+note the bytes of a little-endian u64 packing, low byte first, zero bytes skipped
+fn oputw v ulong to void
+for k ulong 8
+c = and shr v mul k 8 255
+if ne c 0
+oputc c
+end
+end
+end
+
+note onsnow: the firmware clock in nanoseconds (kvcmp's step timing in cli.om), ms resolution
+fn onsnow to ulong
+ret mul oms 1000000
+end
+
+note firmware milliseconds (efi 10), 0 when unavailable
+fn oms to ulong
+st = efi 10 0 oclk 0 8
+if ne st 0
+ret 0
+end
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get oclk i mul i 8
+end
+ret v
+end
+
+note wait up to 300 s (3000 polls 100 ms apart) for a key
+fn owait to void
+for i ulong 3000
+st = efi 1 0 okey 0 4
+if eq st 0
+break
+end
+s2 = efi 2 100000 okey 0 0
+end
+end
+
+fn oargc to ulong
+ret get otc 0
+end
+
+note the current job is `ask` with four or five arguments (MERGES is optional, as for sample)
+fn oisask to bool
+if and ne get otc 0 6 ne get otc 0 7
+ret false
+end
+if ne get otl 1 3
+ret false
+end
+b = get otb 1
+ret and and eq ulong get ojob b 97 eq ulong get ojob add b 1 115 eq ulong get ojob add b 2 107
+end
+
+note ocon[0 .. n) to the console only (not OUT.TXT)
+fn ocons n ulong to void
+t = efi 13 0 ocon 0 n
+end
+
+note the console line `You: ` + the n typed bytes kept at ojob[64544 ..), after a carriage return and
+note followed by e spaces and, when e > 0, the same line again (so a removed character disappears)
+fn oaskline n ulong e ulong to void
+put ocon 0 13
+put ocon 1 89
+put ocon 2 111
+put ocon 3 117
+put ocon 4 58
+put ocon 5 32
+for k ulong n
+put ocon add 6 k get ojob add 64544 k
+end
+for k ulong e
+put ocon add add 6 n k 32
+end
+ocons add add 6 n e
+if gt e 0
+ocons add 6 n
+end
+end
+
+note read one typed line into ojob[64544 ..): its length, or OERR when Esc was pressed or no key came
+note for ten minutes (30000 polls 20 ms apart, the count restarting at every key)
+fn oaskread to ulong
+n = ulong 0
+oaskline 0 0
+idle = ulong 0
+for i ulong 4000000000
+st = efi 1 0 okey 0 4
+if ne st 0
+idle = add idle 1
+if ge idle 30000
+ret OERR
+end
+s2 = efi 2 20000 okey 0 0
+else
+idle = 0
+c = or ulong get okey 2 shl ulong get okey 3 8
+sc = or ulong get okey 0 shl ulong get okey 1 8
+if eq c 13
+ret n
+end
+if and eq c 0 eq sc 23
+ret OERR
+end
+if and eq c 8 gt n 0
+n = sub n 1
+oaskline n 1
+end
+if and and ge c 32 le c 126 lt n 900
+put ojob add 64544 n uchar c
+n = add n 1
+oaskline n 0
+end
+end
+end
+ret OERR
+end
+
+note v in decimal at ojob[64520 ..); the number of digits
+fn oaskseed v ulong to ulong
+dl = ulong 1
+x = v
+for k ulong 19
+x = div x 10
+if gt x 0
+dl = add dl 1
+end
+end
+x = v
+for k ulong dl
+p = sub add 64519 dl k
+put ojob p uchar add 48 rem x 10
+x = div x 10
+end
+ret dl
+end
+
+note the typed line of n bytes to OUT.TXT and the console as `You: line`, over the echoed one
+fn oaskecho n ulong to void
+put ocon 0 13
+ocons 1
+oputc 89
+oputc 111
+oputc 117
+oputc 58
+oputc 32
+for k ulong n
+oputc ulong get ojob add 64544 k
+end
+oputc 10
+oflush
+end
+
+note the seed argument of the ask job as a number (exit 2 unless it is 1 to 19 decimal digits, the
+note bound sample's own argument has, so the number never wraps)
+fn oaskbase to ulong
+sb = get otb 3
+if or eq get otl 3 0 gt get otl 3 19
+exit 2
+end
+seed = ulong 0
+for k ulong get otl 3
+d = ulong get ojob add sb k
+if or lt d 48 gt d 57
+exit 2
+end
+seed = add mul seed 10 sub d 48
+end
+ret seed
+end
+
+note ask CK SEED N TEMPMILLI [MERGES]: see the head of this file. The rewritten job is built in the last
+note 1024 bytes of ojob, which the job file may not reach (exit 2): `sample` at 64512, the turn's seed
+note in decimal at 64520, the typed line at 64544.
+fn oask to void
+if gt get ojn 0 64000
+exit 2
+end
+put ojob 64512 115
+put ojob 64513 97
+put ojob 64514 109
+put ojob 64515 112
+put ojob 64516 108
+put ojob 64517 101
+seed = oaskbase
+hm = eq get otc 0 7
+mb = get otb 6
+ml = get otl 6
+for turn ulong 1000000
+n = oaskread
+if or oeerr n eq n 0
+break
+end
+oaskecho n
+dl = oaskseed add seed turn
+put otb 1 64512
+put otl 1 6
+put otb 3 64520
+put otl 3 dl
+put otb 6 64544
+put otl 6 n
+if hm
+put otb 7 mb
+put otl 7 ml
+put otc 0 8
+else
+put otc 0 7
+end
+rc = ocmd
+oflush
+if ne get olc 0 10
+oputc 10
+oflush
+end
+end
+put ocon 0 10
+ocons 1
+end
+
+note token i of the current job into oarg (at most 4096 bytes copied); argv[0] is "ollm"; returns
+note the token length, or -1 when there is no token i
+fn oargr i ulong to long
+if ge i get otc 0
+ret sub long 0 long 1
+end
+if eq i 0
+put oarg 0 111
+put oarg 1 108
+put oarg 2 108
+put oarg 3 109
+ret long 4
+end
+s = get otb i
+n = get otl i
+m = n
+if gt m 4096
+m = ulong 4096
+end
+for k ulong m
+put oarg k get ojob add s k
+end
+ret long n
+end
+
+note append oout to OUT.TXT, then show it on the console
+fn oflush to void
+n = get oon 0
+if gt n 0
+opath 1
+r = efi 12 oefa 5 0 opn 0 13
+if oeerr r
+exit 70
+end
+if ne r get oop 0
+exit 70
+end
+w = efi 12 oefa 3 get oop 0 oout 0 n
+if ne w n
+exit 70
+end
+oeclose
+put oop 0 add get oop 0 n
+for k ulong n
+c = ulong get oout k
+ok = or or eq c 9 eq c 10 or eq c 13 and ge c 32 le c 126
+if ok
+put ocon k uchar c
+else
+put ocon k 63
+end
+end
+t = efi 13 0 ocon 0 n
+put olc 0 ulong get oout sub n 1
+put oon 0 0
+end
+end
+
+note v1 checkpoint stream (ckpt.om): create (or empty) the file named by argument ai and keep it
+note open (efi 12 holds one open file; nothing else is opened until ocwend)
+fn ocwopen ai ulong to void
+pl = oargp ai
+r = efi 12 oefa 1 0 oarg 0 pl
+if oeerr r
+exit 70
+end
+end
+
+note write ock[0 .. n) at byte position pos of the open checkpoint file
+fn ocwput pos ulong n ulong to void
+w = efi 12 oefa 3 pos ock 0 n
+if ne w n
+exit 70
+end
+end
+
+note close the checkpoint file (written in place: UEFI has no rename)
+fn ocwend ai ulong to void
+oeclose
+end
+
+note size in bytes of the file named by argument ai
+fn ofsz ai ulong to ulong
+pl = oargp ai
+sz = efi 12 oefa 0 0 oarg 0 pl
+if oeerr sz
+exit 70
+end
+oeclose
+ret sz
+end
+
+note gradient of the step loss: one process only, so K > 1 is refused (CONTRACT-V1 section 5.1)
+fn ogradw to f64
+if gt get og 45 1
+exit 29
+end
+ret ograd
+end
+
+note cold store (CONTRACT-V3 section 2): GRD and the Adam moments, 3 P values, in three globals of
+note OCSB = 15833472 values (the x86efi limit is the v2 bank-A capacity; one global holds at most
+note 16777216 values)
+const OCSB ulong 15833472
+global ocs0 f64 15833472
+global ocs1 f64 15833472
+global ocs2 f64 15833472
+
+note capacity of the cold store in f64 values
+fn ocsinit to ulong
+ret mul 3 OCSB
+end
+
+fn ocsg i ulong to f64
+if lt i OCSB
+ret get ocs0 i
+end
+j = sub i OCSB
+if lt j OCSB
+ret get ocs1 j
+end
+ret get ocs2 sub j OCSB
+end
+
+fn ocsp i ulong v f64 to void
+if lt i OCSB
+put ocs0 i v
+ret
+end
+j = sub i OCSB
+if lt j OCSB
+put ocs1 j v
+else
+put ocs2 sub j OCSB v
+end
+end
+
+note read the file named by argument i into od0/od1; exit 21 when longer than ODCAP
+fn odread i ulong to ulong
+n = oargp i
+sz = efi 12 oefa 0 0 oarg 0 n
+if oeerr sz
+exit 70
+end
+if gt sz ODCAP
+exit 21
+end
+p = ulong 0
+while lt p sz bound 999999
+r = ulong 0
+if lt p ODHALF
+e = sz
+if gt e ODHALF
+e = ODHALF
+end
+r = efi 12 oefa 2 p od0 p sub e p
+else
+r = efi 12 oefa 2 p od1 sub p ODHALF sub sz p
+end
+if or oeerr r eq r 0
+exit 70
+end
+p = add p r
+end
+if ne p sz
+exit 70
+end
+oeclose
+put odn 0 p
+ret p
+end
+
+note prep output: append writer k's buffer to its file (efi 12 sub 5 opens without truncation and
+note returns the current size, which must equal the bytes this writer has written)
+fn owflush k ulong to void
+n = get owbn k
+if gt n 0
+l = get owql k
+r = ulong 0
+if eq k 0
+r = efi 12 oefa 5 0 owq0 0 l
+else
+r = efi 12 oefa 5 0 owq1 0 l
+end
+if oeerr r
+exit 70
+end
+if ne r get owps k
+exit 70
+end
+w = ulong 0
+if eq k 0
+w = efi 12 oefa 3 r owb0 0 n
+else
+w = efi 12 oefa 3 r owb1 0 n
+end
+if ne w n
+exit 70
+end
+oeclose
+put owps k add r n
+end
+put owbn k 0
+end
+
+note create (or empty) the file named by argument i for writer k
+fn owopen k ulong i ulong to void
+n = oargp i
+if gt n 255
+exit 70
+end
+for j ulong n
+if eq k 0
+put owq0 j get oarg j
+else
+put owq1 j get oarg j
+end
+end
+put owql k n
+r = efi 12 oefa 1 0 oarg 0 n
+if oeerr r
+exit 70
+end
+oeclose
+put owps k 0
+put owbn k 0
+end
+
+fn owclose k ulong to void
+owflush k
+end
+
+note read argument ai (B little-endian u64 offsets) into ochk; exit 21 unless it holds exactly 8 B bytes
+fn ooffrd ai ulong to void
+n = oargp ai
+sz = efi 12 oefa 0 0 oarg 0 n
+if oeerr sz
+exit 70
+end
+if ge sz 65536
+exit 21
+end
+p = ulong 0
+while lt p sz bound 70000
+r = efi 12 oefa 2 p ochk p sub sz p
+if or oeerr r eq r 0
+exit 70
+end
+p = add p r
+end
+if ne p sz
+exit 70
+end
+oeclose
+if ne p mul 8 get og 6
+exit 21
+end
+end
+
+note ojob[p] is a token separator (space or tab)
+fn ojsep p ulong to bool
+ch = ulong get ojob p
+ret or eq ch 32 eq ch 9
+end
+
+note split ojob[s .. e) into tokens 1.. (otb start, otl length); otc = 1 + tokens; exit 2 over 63
+fn ojtok s ulong e ulong to void
+c = ulong 1
+p = s
+while lt p e bound 65537
+ch = ulong get ojob p
+if or eq ch 32 eq ch 9
+p = add p 1
+else
+q = p
+r = p
+if eq ch 34
+q = add p 1
+r = q
+while and lt r e ne ulong get ojob r 34 bound 65537
+r = add r 1
+end
+p = add r 1
+else
+while and lt r e not ojsep r bound 65537
+r = add r 1
+end
+p = r
+end
+if ge c 64
+exit 2
+end
+put otb c q
+put otl c sub r q
+c = add c 1
+end
+end
+put otc 0 c
+end
+
+note read \OLLM\JOB.TXT into ojob; on a missing or over-long file print `OLLM efi JOB.TXT?`, wait, exit 2
+fn ojread to void
+opath 0
+sz = efi 12 oefa 0 0 opn 0 13
+bad = oeerr sz
+if not bad
+if ge sz OJCAP
+bad = true
+oeclose
+end
+end
+if bad
+oputw 7594869011017124943
+oputc 32
+oputw 4563369441009749834
+oputc 10
+n = get oon 0
+for k ulong n
+put ocon k get oout k
+end
+t = efi 13 0 ocon 0 n
+owait
+exit 2
+end
+p = ulong 0
+while lt p sz bound 70000
+r = efi 12 oefa 2 p ojob p sub sz p
+if or oeerr r eq r 0
+exit 70
+end
+p = add p r
+end
+if ne p sz
+exit 70
+end
+oeclose
+put ojn 0 p
+end
+
+note identity byte: c itself when 32..126, else ?
+fn oidp c ulong to void
+if and ge c 32 le c 126
+oputc c
+else
+oputc 63
+end
+end
+
+note CPUID leaf l into oidc (efi 14 sub 0); true when efi 14 answered
+fn oidq l ulong to bool
+r = efi 14 shl l 16 oidc 0 16
+ret eq r 16
+end
+
+note the little-endian u32 at oidc[k]
+fn oidu k ulong to ulong
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get oidc add k i mul i 8
+end
+ret v
+end
+
+note true when brand byte i is padding (32 or 0); and/or evaluate both sides, so the trim loops in
+note oidcpu test the index in the while and the byte inside the body: oidb[48] is never read
+fn oidbl i ulong to bool
+v = ulong get oidb i
+ret or eq v 32 eq v 0
+end
+
+note the CPUID brand string (leaves 0x80000002..4) without leading or trailing spaces and NULs, or -
+fn oidcpu to void
+ok = oidq 2147483648
+if ok
+ok = ge oidu 0 2147483652
+end
+if not ok
+oputc 45
+ret
+end
+for j ulong 3
+ok = oidq add 2147483650 j
+if not ok
+oputc 45
+ret
+end
+for k ulong 16
+put oidb add mul j 16 k get oidc k
+end
+end
+s = ulong 0
+while lt s 48 bound 48
+if not oidbl s
+break
+end
+s = add s 1
+end
+e = ulong 48
+while gt e s bound 48
+if not oidbl sub e 1
+break
+end
+e = sub e 1
+end
+if eq e s
+oputc 45
+end
+for i ulong sub e s
+oidp ulong get oidb add s i
+end
+end
+
+note SystemTable FirmwareVendor, one byte per UCS-2 code unit (? outside 32..126), or -
+fn oidfw to void
+r = efi 14 1 oidv 0 512
+if or oeerr r eq r 0
+oputc 45
+ret
+end
+for k ulong div r 2
+oidp or ulong get oidv mul k 2 shl ulong get oidv add mul k 2 1 8
+end
+end
+
+note SystemTable FirmwareRevision as 8 lowercase hex digits, or -
+fn oidrev to void
+r = efi 14 2 oidc 0 0
+if oeerr r
+oputc 45
+ret
+end
+for i ulong 8
+d = and shr r mul sub 7 i 4 15
+if lt d 10
+oputc add 48 d
+else
+oputc add 87 d
+end
+end
+end
+
+note true when oids[q] and oids[q+1] are both 0 (the end of a structure's strings); callers keep q+1 < t
+fn oidz q ulong to bool
+ret and eq ulong get oids q 0 eq ulong get oids add q 1 0
+end
+
+note SMBIOS string number n of the structure at p (table length t), or - when n is 0, when the
+note structure's string set ends first (a string never starts with 0: that 0 ends the set), or when
+note the string's NUL lies at or past t. Every read is below t, so the walk never leaves the structure.
+fn oidstr p ulong n ulong t ulong to void
+if eq n 0
+oputc 45
+ret
+end
+q = add p ulong get oids add p 1
+c = ulong 1
+while lt q t bound 65536
+if eq ulong get oids q 0
+oputc 45
+ret
+end
+if eq c n
+e = q
+while lt e t bound 65536
+if eq ulong get oids e 0
+break
+end
+e = add e 1
+end
+if ge e t
+oputc 45
+ret
+end
+while lt q e bound 65536
+oidp ulong get oids q
+q = add q 1
+end
+ret
+end
+while lt q t bound 65536
+if eq ulong get oids q 0
+break
+end
+q = add q 1
+end
+q = add q 1
+c = add c 1
+end
+oputc 45
+end
+
+note field i (0 Manufacturer, 1 Product Name, 2 Version) of the type 1 structure at p, length ln;
+note - when the field lies outside the formatted area or at or past t
+fn oidf p ulong ln ulong i ulong t ulong to void
+k = add add p 4 i
+if and lt add 4 i ln lt k t
+oidstr p ulong get oids k t
+else
+oputc 45
+end
+end
+
+note SMBIOS type 1 Manufacturer/Product Name/Version, each - when missing; the serial number (offset
+note 7) and the UUID (8..23) are never printed
+fn oidsm to void
+t = efi 14 3 oids 0 65536
+p = ulong 0
+if oeerr t
+t = ulong 0
+end
+while lt add p 4 t bound 65537
+ty = ulong get oids p
+ln = ulong get oids add p 1
+if eq ty 1
+oidf p ln 0 t
+oputc 47
+oidf p ln 1 t
+oputc 47
+oidf p ln 2 t
+ret
+end
+if or eq ty 127 lt ln 4
+break
+end
+q = add p ln
+while lt add q 1 t bound 65536
+if oidz q
+break
+end
+q = add q 1
+end
+p = add q 2
+end
+oputc 45
+oputc 47
+oputc 45
+oputc 47
+oputc 45
+end
+
+note the identity line: ID cpu=... fw=... fwrev=... smbios=.../.../... (ID, not M: mathck prints M e/M l)
+fn oident to void
+oputc 73
+oputc 68
+oputc 32
+oputc 99
+oputc 112
+oputc 117
+oputc 61
+oidcpu
+oputc 32
+oputc 102
+oputc 119
+oputc 61
+oidfw
+oputc 32
+oputc 102
+oputc 119
+oputc 114
+oputc 101
+oputc 118
+oputc 61
+oidrev
+oputc 32
+oputc 115
+oputc 109
+oputc 98
+oputc 105
+oputc 111
+oputc 115
+oputc 61
+oidsm
+oputc 10
+end
+
+fn main to int
+ojread
+opath 1
+r = efi 12 oefa 1 0 opn 0 13
+if oeerr r
+exit 70
+end
+oeclose
+put oop 0 0
+oputw 7594869011017124943
+oputc 32
+oputu get ojn 0
+oputc 10
+oident
+oflush
+t0 = oms
+nj = ulong 0
+n = get ojn 0
+s = ulong 0
+while lt s n bound 65537
+e = s
+while and lt e n ne ulong get ojob e 10 bound 65537
+e = add e 1
+end
+lend = e
+if gt lend s
+if eq ulong get ojob sub lend 1 13
+lend = sub lend 1
+end
+end
+if gt lend s
+if ne ulong get ojob s 35
+oputc 62
+oputc 32
+for k ulong sub lend s
+oputc ulong get ojob add s k
+end
+oputc 10
+oflush
+ojtok s lend
+if ge oargc 2
+t1 = oms
+if oisask
+oask
+else
+rc = ocmd
+end
+oflush
+if ne get olc 0 10
+oputc 10
+end
+oputc 74
+oputc 32
+oputu sub oms t1
+oputc 10
+oflush
+nj = add nj 1
+end
+end
+end
+s = add e 1
+end
+oputw 5642803763645008975
+oputc 69
+oputc 32
+oputu nj
+oputc 32
+oputu sub oms t0
+oputc 10
+oflush
+owait
+ret 0
+end
+
+note v1 positioned read (CONTRACT-V1 section 3), as lio.om: up to n bytes of the file named by
+note argument ai, from byte pos, into opw[off .. off + n); opened and closed on every call (efi 12
+note holds one open file). Returns n, fewer only when the file ends first, 0 at or after its end.
+fn oprd ai ulong pos ulong off ulong n ulong to ulong
+pl = oargp ai
+sz = efi 12 oefa 0 0 oarg 0 pl
+if oeerr sz
+exit 70
+end
+m = ulong 0
+if lt pos sz
+m = sub sz pos
+if gt m n
+m = n
+end
+end
+p = ulong 0
+for o ulong 3
+while lt p m bound 999999
+r = efi 12 oefa 2 add pos p opw add off p sub m p
+if or oeerr r eq r 0
+exit 70
+end
+p = add p r
+end
+end
+oeclose
+ret m
+end
+
+note v1 (CONTRACT-V1 section 7): write obm[0 .. n) (bpe.om) to the path in argument ai, in place
+fn obmsave ai ulong n ulong to void
+pl = oargp ai
+r = efi 12 oefa 1 0 oarg 0 pl
+if oeerr r
+exit 70
+end
+w = efi 12 oefa 3 0 obm 0 n
+if ne w n
+exit 70
+end
+oeclose
+end
