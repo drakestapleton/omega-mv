@@ -30,6 +30,7 @@ set -euo pipefail
 unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEFILES
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+python3 tools/uxl/windows_paths.py
 step="${1:?usage: tests/gates/run.sh <step>}"
 
 # Every step builds in its own directory. The Spark judge (aien-test) runs a repository's host gates

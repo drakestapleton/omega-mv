@@ -1,5 +1,19 @@
 # Omega
 
+## UXL one command
+
+```sh
+git clone https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh
+```
+
+```powershell
+git clone https://interplane.io/drakestapleton/omega-mv.git; cd omega-mv; .\uxl-run.ps1
+```
+
+If PowerShell's execution policy blocks the script: `powershell -ExecutionPolicy Bypass -File .\uxl-run.ps1`. What the command checks, and the sample summary, is in [docs/UXL.md](docs/UXL.md).
+
+
+
 Omega is a programming language, and a compiler for it that is written in Omega itself. It is the language of
 Sovereign Intelligence (SI), my name for the whole stack: the language, the runtime, the GPU layer and the
 models that run on them.

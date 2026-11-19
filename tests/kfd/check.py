@@ -13,13 +13,16 @@ import shutil
 import subprocess
 import sys
 
+root = Path(__file__).resolve().parents[2]
+scan = subprocess.run([sys.executable, str(root / 'tools/uxl/windows_paths.py')])
+if scan.returncode:
+    sys.exit(scan.returncode)
+
 host_sys = platform.system()
 host_arch = platform.machine()
 if host_sys != 'Linux' or not Path('/usr/include/linux/kfd_ioctl.h').is_file():
     print(f'NOT_RUN tests/kfd/check.py: requires Linux with /usr/include/linux/kfd_ioctl.h (host: {host_sys}/{host_arch})', file=sys.stderr)
     sys.exit(77)
-
-root = Path(__file__).resolve().parents[2]
 os.chdir(root)
 out = root / 'build/kfd'
 out.mkdir(parents=True, exist_ok=True)
@@ -341,7 +344,13 @@ end
                 p=run([out/'fdtrace',b,mode,size])
                 record('fd trace synthetic mode '+str(mode),p.returncode,0,p.stderr.decode())
 else:
-    print('NOT_RUN AArch64 native trace oracle: host is not aarch64')
+    skip_msg = (
+        'SKIP arm64-only tests/kfd/trace.c and tests/kfd/fdtrace.c: '
+        'host is %s/%s (AArch64 ptrace oracle; not compiled, not passed)'
+        % (host_sys, host_arch)
+    )
+    print(skip_msg)
+    rows.append(dict(name='arm64-only trace oracle', actual='SKIP', expected='SKIP', detail=skip_msg))
 
 # Faults are planted in independent compiler copies, never in the compiler under test.
 # Each must compile and let precisely the formerly refused case through.
@@ -415,7 +424,9 @@ for label, patches, case, function in mutants:
 (out/'results.json').write_text(json.dumps(rows,indent=2)+'\n')
 print('compiler_sha256',hashlib.sha256(omc.read_bytes()).hexdigest())
 fail=sum(r['actual']!=r['expected'] for r in rows)
-print('KFD_CPU',len(rows),'checks',fail,'failures; hardware NOT_RUN')
+skipped=sum(r['actual']=='SKIP' for r in rows)
+passed=sum(r['actual']==r['expected'] and r['actual']!='SKIP' for r in rows)
+print('KFD_CPU',len(rows),'checks',passed,'passed',fail,'failures',skipped,'skipped; hardware NOT_RUN')
 if not fail and '--record-history' in sys.argv[1:]:
     # Measuring-instrument output, not a maintained copy of compiler facts.
     ledger=root/'seed/omc/size-history.tsv'
