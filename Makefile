@@ -3058,10 +3058,13 @@ $(GPU_L2_REUSE_TEST): tests/gpu_l2_reuse_test.c src/omega_gpu_fp8_api.h src/omeg
 .PHONY: test-gpu-q38-graph-host
 GPU_Q38_GRAPH_TEST = $(OUT_DIR)/gpu_q38_graph_test
 GPU_Q38_GRAPH_HOST_TEST = $(OUT_DIR)/test_omega_gpu_q38_graph_host
+GPU_Q38_STROKE_EXACT_TEST = $(OUT_DIR)/gpu_q38_stroke_exact_test
 $(GPU_Q38_GRAPH_TEST): tests/gpu_q38_graph_test.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_q38_graph_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 $(GPU_Q38_GRAPH_HOST_TEST): tests/test_omega_gpu_q38_graph_host.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/test_omega_gpu_q38_graph_host.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+$(GPU_Q38_STROKE_EXACT_TEST): tests/gpu_q38_stroke_exact_test.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
+	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_q38_stroke_exact_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 test-gpu-q38-graph-host: $(GPU_Q38_GRAPH_TEST) $(GPU_Q38_GRAPH_HOST_TEST)
 	./$(GPU_Q38_GRAPH_TEST) --host-only
 	./$(GPU_Q38_GRAPH_HOST_TEST)
