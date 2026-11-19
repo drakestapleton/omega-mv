@@ -1,0 +1,444 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/serve/http_auth.om
+note Pure OM-2 conversion of aien-serve-http HTTP/1.1 request parser, bounded read caps,
+note anti-smuggling header validation, and constant-time Authorization: Bearer enforcement.
+
+const SRV_MAX_REQ_BYTES ulong 4096
+const SRV_MAX_HDR_BYTES ulong 1024
+const SRV_MAX_BODY_BYTES ulong 2048
+const SRV_MAX_HEADERS ulong 24
+const SRV_MAX_PATH_LEN ulong 128
+const SRV_MAX_AUTH_LEN ulong 128
+const SRV_MIN_TOKEN_LEN ulong 16
+const SRV_MAX_TOKEN_LEN ulong 64
+
+note HTTP Methods
+const HTTP_M_UNKNOWN ulong 0
+const HTTP_M_GET ulong 1
+const HTTP_M_HEAD ulong 2
+const HTTP_M_POST ulong 3
+
+note Parse result codes (directly map to HTTP status on error)
+const PARSE_OK ulong 0
+const PARSE_ERR_BAD_REQ ulong 400
+const PARSE_ERR_METHOD ulong 405
+const PARSE_ERR_TOO_LARGE ulong 413
+const PARSE_ERR_HDR_TOO_LARGE ulong 431
+
+note Auth config: [0]=configured(0/1), [1]=tok_len, [2]=allow_cnt, [3]=deny_cnt
+global srv_auth_meta ulong 8
+global srv_auth_tok uchar 64
+
+note Parsed HTTP request state:
+note srv_req_meta: [0]=method, [1]=path_len, [2]=auth_len, [3]=has_auth, [4]=has_clen, [5]=clen_val, [6]=body_len, [7]=hdr_cnt
+global srv_req_meta ulong 8
+global srv_req_path uchar 128
+global srv_req_auth uchar 128
+global srv_req_body uchar 2048
+
+text srv_tok_get "GET"
+text srv_tok_head "HEAD"
+text srv_tok_post "POST"
+text srv_tok_h11 "HTTP/1.1"
+text srv_tok_h10 "HTTP/1.0"
+text srv_tok_bearer "Bearer "
+text srv_hdr_auth "authorization"
+text srv_hdr_clen "content-length"
+
+note ---- Auth (fail-closed, constant-time) ----
+
+fn srv_auth_reset to void
+for i ulong 8
+put srv_auth_meta i 0
+end
+for i ulong 64
+put srv_auth_tok i uchar 0
+end
+end
+
+fn srv_auth_is_configured to bool
+ret ne get srv_auth_meta 0 0
+end
+
+fn srv_auth_allow_count to ulong
+ret get srv_auth_meta 2
+end
+
+fn srv_auth_deny_count to ulong
+ret get srv_auth_meta 3
+end
+
+note Configure operator bearer token; refuses < 16 bytes, > 64 bytes, or whitespace/control chars.
+fn srv_auth_set_token tok view uchar * to bool
+n = len tok
+if or lt n SRV_MIN_TOKEN_LEN gt n SRV_MAX_TOKEN_LEN
+ret false
+end
+for i ulong n bound 64
+b = get tok i
+if or le b uchar 32 ge b uchar 127
+ret false
+end
+end
+for i ulong 64
+put srv_auth_tok i uchar 0
+end
+for i ulong n bound 64
+put srv_auth_tok i get tok i
+end
+put srv_auth_meta 0 1
+put srv_auth_meta 1 n
+ret true
+end
+
+note Constant-time check of Authorization header value against configured Bearer token.
+note Fail-closed: returns false if unconfigured, missing "Bearer " prefix, or any mismatch.
+fn srv_auth_verify_header val view uchar * to bool
+if eq get srv_auth_meta 0 0
+put srv_auth_meta 3 add get srv_auth_meta 3 1
+ret false
+end
+vlen = len val
+plen = len srv_tok_bearer
+if lt vlen plen
+put srv_auth_meta 3 add get srv_auth_meta 3 1
+ret false
+end
+pdiff = uchar 0
+for i ulong plen bound 16
+pdiff = or pdiff xor get val i get srv_tok_bearer i
+end
+tlen = get srv_auth_meta 1
+cand_len = sub vlen plen
+len_ok = eq cand_len tlen
+tdiff = uchar 0
+for i ulong SRV_MAX_TOKEN_LEN
+in_tok = lt i tlen
+in_cand = lt i cand_len
+cb = uchar 0
+if in_cand
+cb = get val add plen i
+end
+tb = uchar 0
+if in_tok
+tb = get srv_auth_tok i
+end
+if in_tok
+tdiff = or tdiff xor cb tb
+end
+end
+ok = and eq pdiff uchar 0 and len_ok eq tdiff uchar 0
+if ok
+put srv_auth_meta 2 add get srv_auth_meta 2 1
+else
+put srv_auth_meta 3 add get srv_auth_meta 3 1
+end
+ret ok
+end
+
+note Verify the Authorization header captured in srv_req_auth.
+fn srv_auth_verify_req to bool
+if eq get srv_req_meta 3 0
+put srv_auth_meta 3 add get srv_auth_meta 3 1
+ret false
+end
+alen = get srv_req_meta 2
+buf = new uchar 128 0
+for i ulong alen bound 128
+put buf i get srv_req_auth i
+end
+ret srv_auth_verify_header part buf 0 alen
+end
+
+note ---- Byte/ASCII helpers ----
+
+fn srv_lower b uchar to uchar
+if and ge b uchar 65 le b uchar 90
+ret add b uchar 32
+end
+ret b
+end
+
+fn srv_slice_eq raw view uchar * off ulong slen ulong lit view uchar * to bool
+if ne slen len lit
+ret false
+end
+for i ulong slen bound 256
+if ne get raw add off i get lit i
+ret false
+end
+end
+ret true
+end
+
+fn srv_slice_ieq raw view uchar * off ulong slen ulong lit view uchar * to bool
+if ne slen len lit
+ret false
+end
+for i ulong slen bound 256
+if ne srv_lower get raw add off i get lit i
+ret false
+end
+end
+ret true
+end
+
+note Parse strict non-negative decimal integer in raw[off..off+slen); returns 18446744073709551615 on error.
+fn srv_parse_u64 raw view uchar * off ulong slen ulong to ulong
+if or eq slen 0 gt slen 12
+ret 18446744073709551615
+end
+acc = ulong 0
+for i ulong slen bound 16
+b = get raw add off i
+if or lt b uchar 48 gt b uchar 57
+ret 18446744073709551615
+end
+acc = add mul acc 10 ulong sub b uchar 48
+end
+ret acc
+end
+
+note Find \r\n\r\n header terminator in raw[0..lim); returns index of first \r or 18446744073709551615.
+fn srv_find_hdr_end raw view uchar * lim ulong to ulong
+if lt lim 4
+ret 18446744073709551615
+end
+end_i = sub lim 3
+for i ulong end_i bound 4096
+if eq get raw i uchar 13
+if eq get raw add i 1 uchar 10
+if eq get raw add i 2 uchar 13
+if eq get raw add i 3 uchar 10
+ret i
+end
+end
+end
+end
+end
+ret 18446744073709551615
+end
+
+note Find \r\n starting at off up to lim; returns index of \r or 18446744073709551615.
+fn srv_find_crlf raw view uchar * off ulong lim ulong to ulong
+if ge add off 1 lim
+ret 18446744073709551615
+end
+i = off
+while lt add i 1 lim bound 2048
+if eq get raw i uchar 13
+if eq get raw add i 1 uchar 10
+ret i
+end
+end
+i = add i 1
+end
+ret 18446744073709551615
+end
+
+note Parse request line: METHOD SP PATH SP HTTP/1.x
+fn srv_parse_req_line raw view uchar * line_end ulong to ulong
+sp1 = ulong 18446744073709551615
+sp2 = ulong 18446744073709551615
+for i ulong line_end bound 512
+b = get raw i
+if or eq b uchar 0 lt b uchar 32
+ret PARSE_ERR_BAD_REQ
+end
+if eq b uchar 32
+if eq sp1 18446744073709551615
+sp1 = i
+else
+if eq sp2 18446744073709551615
+sp2 = i
+else
+ret PARSE_ERR_BAD_REQ
+end
+end
+end
+end
+if or eq sp1 18446744073709551615 eq sp2 18446744073709551615
+ret PARSE_ERR_BAD_REQ
+end
+m = HTTP_M_UNKNOWN
+if srv_slice_eq raw 0 sp1 srv_tok_get
+m = HTTP_M_GET
+else
+if srv_slice_eq raw 0 sp1 srv_tok_head
+m = HTTP_M_HEAD
+else
+if srv_slice_eq raw 0 sp1 srv_tok_post
+m = HTTP_M_POST
+end
+end
+end
+if eq m HTTP_M_UNKNOWN
+ret PARSE_ERR_METHOD
+end
+put srv_req_meta 0 m
+poff = add sp1 1
+plen = sub sp2 poff
+if or eq plen 0 gt plen SRV_MAX_PATH_LEN
+ret PARSE_ERR_BAD_REQ
+end
+if ne get raw poff uchar 47
+ret PARSE_ERR_BAD_REQ
+end
+note Reject path traversal ("..") and control/space characters
+for i ulong plen bound 128
+b = get raw add poff i
+if or le b uchar 32 ge b uchar 127
+ret PARSE_ERR_BAD_REQ
+end
+if eq b uchar 46
+if lt add i 1 plen
+if eq get raw add poff add i 1 uchar 46
+ret PARSE_ERR_BAD_REQ
+end
+end
+end
+put srv_req_path i b
+end
+put srv_req_meta 1 plen
+voff = add sp2 1
+vlen = sub line_end voff
+v_ok = or srv_slice_eq raw voff vlen srv_tok_h11 srv_slice_eq raw voff vlen srv_tok_h10
+if not v_ok
+ret PARSE_ERR_BAD_REQ
+end
+ret PARSE_OK
+end
+
+note Parse one HTTP header line raw[off..lend). Enforces duplicate-header anti-smuggling.
+fn srv_parse_one_hdr raw view uchar * off ulong lend ulong to ulong
+colon = ulong 18446744073709551615
+i = off
+while lt i lend bound 1024
+b = get raw i
+if or eq b uchar 0 and lt b uchar 32 ne b uchar 9
+ret PARSE_ERR_BAD_REQ
+end
+if and eq colon 18446744073709551615 eq b uchar 58
+colon = i
+end
+i = add i 1
+end
+if or eq colon 18446744073709551615 eq colon off
+ret PARSE_ERR_BAD_REQ
+end
+nlen = sub colon off
+vstart = add colon 1
+while lt vstart lend bound 1024
+vb = get raw vstart
+if or eq vb uchar 32 eq vb uchar 9
+vstart = add vstart 1
+else
+break
+end
+end
+vend = lend
+while gt vend vstart bound 1024
+eb = get raw sub vend 1
+if or eq eb uchar 32 eq eb uchar 9
+vend = sub vend 1
+else
+break
+end
+end
+vlen = sub vend vstart
+if srv_slice_ieq raw off nlen srv_hdr_auth
+if ne get srv_req_meta 3 0
+ret PARSE_ERR_BAD_REQ
+end
+if gt vlen SRV_MAX_AUTH_LEN
+ret PARSE_ERR_HDR_TOO_LARGE
+end
+for k ulong vlen bound 128
+put srv_req_auth k get raw add vstart k
+end
+put srv_req_meta 2 vlen
+put srv_req_meta 3 1
+ret PARSE_OK
+end
+if srv_slice_ieq raw off nlen srv_hdr_clen
+if ne get srv_req_meta 4 0
+ret PARSE_ERR_BAD_REQ
+end
+cl = srv_parse_u64 raw vstart vlen
+if eq cl 18446744073709551615
+ret PARSE_ERR_BAD_REQ
+end
+if gt cl SRV_MAX_BODY_BYTES
+ret PARSE_ERR_TOO_LARGE
+end
+put srv_req_meta 4 1
+put srv_req_meta 5 cl
+ret PARSE_OK
+end
+ret PARSE_OK
+end
+
+note Parse complete HTTP/1.1 request with strict read caps and anti-smuggling validation.
+fn srv_parse_http_req raw view uchar * to ulong
+for i ulong 8
+put srv_req_meta i 0
+end
+rlen = len raw
+if gt rlen SRV_MAX_REQ_BYTES
+ret PARSE_ERR_TOO_LARGE
+end
+hdr_end = srv_find_hdr_end raw rlen
+if eq hdr_end 18446744073709551615
+if gt rlen SRV_MAX_HDR_BYTES
+ret PARSE_ERR_HDR_TOO_LARGE
+end
+ret PARSE_ERR_BAD_REQ
+end
+if gt hdr_end SRV_MAX_HDR_BYTES
+ret PARSE_ERR_HDR_TOO_LARGE
+end
+line1_end = srv_find_crlf raw 0 add hdr_end 2
+if eq line1_end 18446744073709551615
+ret PARSE_ERR_BAD_REQ
+end
+st1 = srv_parse_req_line raw line1_end
+if ne st1 PARSE_OK
+ret st1
+end
+pos = add line1_end 2
+while lt pos hdr_end bound 64
+lend = srv_find_crlf raw pos add hdr_end 2
+if eq lend 18446744073709551615
+ret PARSE_ERR_BAD_REQ
+end
+hcnt = add get srv_req_meta 7 1
+if gt hcnt SRV_MAX_HEADERS
+ret PARSE_ERR_HDR_TOO_LARGE
+end
+put srv_req_meta 7 hcnt
+hst = srv_parse_one_hdr raw pos lend
+if ne hst PARSE_OK
+ret hst
+end
+pos = add lend 2
+end
+body_off = add hdr_end 4
+body_len = sub rlen body_off
+if gt body_len SRV_MAX_BODY_BYTES
+ret PARSE_ERR_TOO_LARGE
+end
+if ne get srv_req_meta 4 0
+if ne body_len get srv_req_meta 5
+ret PARSE_ERR_BAD_REQ
+end
+else
+if gt body_len 0
+ret PARSE_ERR_BAD_REQ
+end
+end
+for i ulong body_len bound 2048
+put srv_req_body i get raw add body_off i
+end
+put srv_req_meta 6 body_len
+ret PARSE_OK
+end
