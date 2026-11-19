@@ -76,10 +76,11 @@ system under it has to call the firmware and, later, touch devices.
 | `fwst ADDR W V` | store the low W bytes of V at ADDR; result 0 |
 | `fwsys K` | 0 ImageHandle, 1 SystemTable, 2 CNTVCT_EL0 (after ISB), 3 CNTFRQ_EL0, anything else MIDR_EL1 |
 | `fwadr A OFF N` | the address of `A[OFF]`, with `OFF + N` inside A (trap 3); A may be a global |
+| `fwop OP A B C` | one privileged AArch64 operation selected by OP, operands A B C, result X0. The OP table is the `FWOP_*` constants of `aienux/kernel/arm64/fwops.om` (DSB/ISB, TLBI VMALLE1IS, DC CIVAC/CVAC, IC IALLU, DAIF mask/unmask, WFE/SEV/WFI, system register read/write, SMC/HVC, EL2 to EL1, PSCI CPU_ON, LDAR/STLR, metadata, post-EBS guard) |
 
-All are `ulong` in and out. Ids: efi 178, fwcall 250, fwld 251, fwst 252, fwsys 253, fwadr 254. They
+All are `ulong` in and out. Ids: efi 178, fwcall 250, fwld 251, fwst 252, fwsys 253, fwadr 254, fwop 255. They
 are recognised by `fn kwa`, where a value starts, and are not in the keyword chain `fn kw`. Under this
-target the six names (`efi` and the five firmware words) are reserved: defining a variable, parameter,
+target the seven names (`efi` and the six firmware words) are reserved: defining a variable, parameter,
 global, constant, text or function with one of them is error 16, as for a keyword. Without the target
 line they are ordinary names.
 

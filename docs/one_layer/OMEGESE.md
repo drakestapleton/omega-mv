@@ -465,7 +465,7 @@ An initial line `target a64efi` selects the AArch64 UEFI backend: the default AA
 generator, a PE32+ image a 64-bit Arm firmware starts with no operating system, base-relative
 addresses, and no host words (error 25, as is function mode and a run-time pool). Its `efi` word
 keeps the x86efi contract and compiles to a call of the program's own `fn efirt`
-(`seed/a64efi/efirt.om`); the firmware words `fwcall`, `fwld`, `fwst`, `fwsys` and `fwadr` exist
+(`seed/a64efi/efirt.om`); the firmware words `fwcall`, `fwld`, `fwst`, `fwsys`, `fwadr` and `fwop` exist
 under this target only. See [the a64efi design and evidence](../A64-EFI.md).
 
 ### 9.2 Functions and calls
