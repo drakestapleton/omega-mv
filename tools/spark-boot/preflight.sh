@@ -135,6 +135,10 @@ verify_pe32plus_arm64() {
     fail "SPARK.EFI too small ($sz bytes): $f"
     return 1
   fi
+  if [ "$sz" -gt "$MAX_IMAGE_SIZE_BYTES" ]; then
+    fail "SPARK.EFI raw file size=${sz}B exceeds 64 MiB safety ceiling: $f"
+    return 1
+  fi
   mz=$(read_hex_bytes "$f" 0 2)
   if [ "$mz" != "4d5a" ]; then
     fail "SPARK.EFI invalid DOS magic (got 0x$mz, want 0x4d5a 'MZ'): $f"
@@ -166,8 +170,8 @@ verify_pe32plus_arm64() {
     fail "SPARK.EFI Subsystem mismatch (got $subsystem, want 10 EFI_APPLICATION)"
     return 1
   fi
-  if [ "$size_of_image" -gt "$MAX_IMAGE_SIZE_BYTES" ]; then
-    fail "SPARK.EFI SizeOfImage=$size_of_image exceeds 64 MiB safety ceiling (check for static .bss bloat)"
+  if [ "$size_of_image" -lt 4096 ] || [ "$size_of_image" -gt "$MAX_IMAGE_SIZE_BYTES" ]; then
+    fail "SPARK.EFI SizeOfImage=$size_of_image out of valid range [4096, $MAX_IMAGE_SIZE_BYTES]"
     return 1
   fi
   sha=$(sha256_file "$f")
@@ -270,6 +274,9 @@ echo "SECTION:EFI"
 efibootmgr -v 2>&1 || echo "ERR_EFIBOOTMGR"
 
 echo "SECTION:ESP"
+ESP_SRC=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || echo "UNMOUNTED")
+ESP_FSTYPE=$(findmnt -n -o FSTYPE /boot/efi 2>/dev/null || echo "NONE")
+printf 'ESP_SRC=%s\nESP_FSTYPE=%s\n' "$ESP_SRC" "$ESP_FSTYPE"
 df -B1 /boot/efi 2>&1 | tail -n 1 || echo "ERR_DF"
 test -f /boot/efi/EFI/ubuntu/shimaa64.efi && echo "UBUNTU_SHIM=OK" || echo "UBUNTU_SHIM=MISSING"
 
@@ -328,7 +335,8 @@ fi
 
 echo "SECTION:GPUBUSY"
 # Strictly read-only procfs symlink inspection (NEVER opens /dev/nvidia*)
-BUSY_PROCS=$(sudo -n sh -c '
+# Fail closed if sudo -n fails (never falsely report NONE).
+if BUSY_PROCS=$(sudo -n sh -c '
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     for fd in "$p"/fd/*; do
@@ -341,11 +349,14 @@ BUSY_PROCS=$(sudo -n sh -c '
       esac
     done
   done
-' 2>/dev/null || true)
-if [ -n "$BUSY_PROCS" ]; then
-  printf 'GPU_OPEN_PROCS=%s\n' "$(printf '%s\n' "$BUSY_PROCS" | paste -sd',' -)"
+' 2>/dev/null); then
+  if [ -n "$BUSY_PROCS" ]; then
+    printf 'GPU_OPEN_PROCS=%s\n' "$(printf '%s\n' "$BUSY_PROCS" | paste -sd',' -)"
+  else
+    echo "GPU_OPEN_PROCS=NONE"
+  fi
 else
-  echo "GPU_OPEN_PROCS=NONE"
+  echo "GPU_OPEN_PROCS=UNKNOWN_SUDO_FAILED"
 fi
 REMOTE_SH
   ) || {
@@ -377,9 +388,16 @@ REMOTE_SH
       warn "Spark BootNext is already set to $BOOT_NEXT (clear with: sudo efibootmgr -N)"
     fi
 
-    # 2. ESP free space >= 64 MiB + Ubuntu shim
+    # 2. ESP mount (/dev/nvme0n1p1 vfat) + free space >= 64 MiB + Ubuntu shim
+    ESP_SRC=$(printf '%s\n' "$REMOTE_OUT" | awk -F= '/^ESP_SRC=/{print $2; exit}')
+    ESP_FSTYPE=$(printf '%s\n' "$REMOTE_OUT" | awk -F= '/^ESP_FSTYPE=/{print $2; exit}')
     ESP_AVAIL=$(printf '%s\n' "$REMOTE_OUT" | awk '/^SECTION:ESP/{f=1;next}/^SECTION:/{f=0}f && /^\//{print $4; exit}')
     UBUNTU_SHIM=$(printf '%s\n' "$REMOTE_OUT" | awk -F= '/^UBUNTU_SHIM=/{print $2; exit}')
+    if [ "$ESP_SRC" = "/dev/nvme0n1p1" ] && [ "$ESP_FSTYPE" = "vfat" ]; then
+      pass "Spark ESP /boot/efi mounted: source=$ESP_SRC fstype=$ESP_FSTYPE"
+    else
+      fail "Spark ESP /boot/efi mount mismatch (source=${ESP_SRC:-missing} fstype=${ESP_FSTYPE:-missing}, want /dev/nvme0n1p1 vfat)"
+    fi
     if [ -n "$ESP_AVAIL" ] && [ "$ESP_AVAIL" -ge "$MIN_ESP_FREE_BYTES" ] 2>/dev/null; then
       ESP_MIB=$((ESP_AVAIL / 1048576))
       pass "Spark ESP /boot/efi free space ${ESP_MIB} MiB (${ESP_AVAIL} B) >= 64 MiB"
@@ -444,10 +462,12 @@ REMOTE_SH
       fail "Spark RTL8127 NIC (0007:01:00.0 / r8127) not detected"
     fi
 
-    # 7. GPU busy advisory (read-only procfs symlink check)
+    # 7. GPU busy advisory (read-only procfs symlink check; fail-closed on sudo failure)
     GPU_BUSY=$(printf '%s\n' "$REMOTE_OUT" | awk -F= '/^GPU_OPEN_PROCS=/{print $2; exit}')
     if [ "$GPU_BUSY" = "NONE" ]; then
       pass "Spark /dev/nvidia* open processes: NONE (idle)"
+    elif [ "$GPU_BUSY" = "UNKNOWN_SUDO_FAILED" ] || [ -z "$GPU_BUSY" ]; then
+      fail "Spark /dev/nvidia* open-process check failed (sudo -n failed; refusing to assume GPU idle)"
     else
       warn "Spark /dev/nvidia* currently held open by: $GPU_BUSY (stage_bootnext.sh --apply will refuse without --force-while-gpu-busy)"
     fi

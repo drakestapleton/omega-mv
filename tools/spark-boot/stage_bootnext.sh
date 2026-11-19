@@ -101,6 +101,17 @@ sha256_file() {
   fi
 }
 
+sha256_str() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  else
+    echo "ERROR: neither sha256sum nor shasum found" >&2
+    exit 1
+  fi
+}
+
 file_size_bytes() {
   wc -c < "$1" | tr -d '[:space:]'
 }
@@ -145,6 +156,10 @@ if [ "$EFI_SIZE" -lt 512 ]; then
   echo "FAIL: SPARK.EFI too small (${EFI_SIZE} B): $SPARK_EFI" >&2
   exit 1
 fi
+if [ "$EFI_SIZE" -gt "$MAX_IMAGE_SIZE_BYTES" ]; then
+  echo "FAIL: SPARK.EFI raw file size (${EFI_SIZE} B) exceeds 64 MiB safety ceiling" >&2
+  exit 1
+fi
 
 MZ=$(read_hex_bytes "$SPARK_EFI" 0 2)
 [ "$MZ" = "4d5a" ] || { echo "FAIL: invalid DOS MZ header (got 0x$MZ)" >&2; exit 1; }
@@ -167,12 +182,16 @@ OPT_MAGIC=$(read_u16_le "$SPARK_EFI" $((LFANEW + 24)))
 SIZE_OF_IMAGE=$(read_u32_le "$SPARK_EFI" $((LFANEW + 80)))
 SUBSYSTEM=$(read_u16_le "$SPARK_EFI" $((LFANEW + 92)))
 [ "$SUBSYSTEM" -eq 10 ] || { echo "FAIL: Subsystem=$SUBSYSTEM (want 10 EFI_APPLICATION)" >&2; exit 1; }
-if [ "$SIZE_OF_IMAGE" -gt "$MAX_IMAGE_SIZE_BYTES" ]; then
-  echo "FAIL: SizeOfImage=$SIZE_OF_IMAGE exceeds 64 MiB safety ceiling" >&2
+if [ "$SIZE_OF_IMAGE" -lt 4096 ] || [ "$SIZE_OF_IMAGE" -gt "$MAX_IMAGE_SIZE_BYTES" ]; then
+  echo "FAIL: SizeOfImage=$SIZE_OF_IMAGE out of valid range [4096, $MAX_IMAGE_SIZE_BYTES]" >&2
   exit 1
 fi
 
 LOCAL_SHA=$(sha256_file "$SPARK_EFI")
+if ! printf '%s\n' "$LOCAL_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+  echo "FAIL: invalid local SHA-256 digest: $LOCAL_SHA" >&2
+  exit 1
+fi
 echo "[OK] Local SPARK.EFI validated: path=$SPARK_EFI size=${EFI_SIZE}B SizeOfImage=${SIZE_OF_IMAGE}B sha256=${LOCAL_SHA}"
 
 if [ "$SKIP_SSH" -eq 1 ]; then
@@ -194,11 +213,15 @@ set -eu
 echo "SECTION:EFI"
 efibootmgr -v
 echo "SECTION:ESP"
+ESP_SRC=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || echo "UNMOUNTED")
+ESP_FSTYPE=$(findmnt -n -o FSTYPE /boot/efi 2>/dev/null || echo "NONE")
+printf 'ESP_SRC=%s\nESP_FSTYPE=%s\n' "$ESP_SRC" "$ESP_FSTYPE"
 df -B1 /boot/efi | tail -n 1
 test -f /boot/efi/EFI/ubuntu/shimaa64.efi && echo "UBUNTU_SHIM=OK" || echo "UBUNTU_SHIM=MISSING"
 echo "SECTION:GPUBUSY"
 # Read-only procfs symlink inspection — NEVER opens /dev/nvidia*
-BUSY=$(sudo -n sh -c '
+# Fail closed if sudo -n fails (never falsely report NONE).
+if BUSY=$(sudo -n sh -c '
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
     for fd in "$p"/fd/*; do
@@ -211,11 +234,14 @@ BUSY=$(sudo -n sh -c '
       esac
     done
   done
-' 2>/dev/null || true)
-if [ -n "$BUSY" ]; then
-  printf 'GPU_OPEN_PROCS=%s\n' "$(printf '%s\n' "$BUSY" | paste -sd',' -)"
+' 2>/dev/null); then
+  if [ -n "$BUSY" ]; then
+    printf 'GPU_OPEN_PROCS=%s\n' "$(printf '%s\n' "$BUSY" | paste -sd',' -)"
+  else
+    echo "GPU_OPEN_PROCS=NONE"
+  fi
 else
-  echo "GPU_OPEN_PROCS=NONE"
+  echo "GPU_OPEN_PROCS=UNKNOWN_SUDO_FAILED"
 fi
 REMOTE_PRE
 ) || {
@@ -229,16 +255,16 @@ EXISTING_SPARK_BOOT=$(printf '%s\n' "$PRE_OUT" | awk '
   /^Boot[0-9A-Fa-f]{4}/ && index($0, "\\EFI\\AIENOS\\SPARK.EFI") > 0 {
     print substr($1, 5, 4); exit
   }')
+ESP_SRC=$(printf '%s\n' "$PRE_OUT" | awk -F= '/^ESP_SRC=/{print $2; exit}')
+ESP_FSTYPE=$(printf '%s\n' "$PRE_OUT" | awk -F= '/^ESP_FSTYPE=/{print $2; exit}')
 ESP_AVAIL=$(printf '%s\n' "$PRE_OUT" | awk '/^SECTION:ESP/{f=1;next}/^SECTION:/{f=0}f && /^\//{print $4; exit}')
 UBUNTU_SHIM=$(printf '%s\n' "$PRE_OUT" | awk -F= '/^UBUNTU_SHIM=/{print $2; exit}')
 GPU_BUSY=$(printf '%s\n' "$PRE_OUT" | awk -F= '/^GPU_OPEN_PROCS=/{print $2; exit}')
 
-case "$ORIG_BOOTORDER" in
-  0001|0001,*) ;;
-  *)
-    echo "FAIL: Spark BootOrder does not start with 0001 (got: ${ORIG_BOOTORDER:-missing}); refusing." >&2
-    exit 1 ;;
-esac
+if ! printf '%s\n' "$ORIG_BOOTORDER" | grep -Eq '^0001(,[0-9A-Fa-f]{4})*$'; then
+  echo "FAIL: Spark BootOrder invalid or does not start with 0001 (got: ${ORIG_BOOTORDER:-missing}); refusing." >&2
+  exit 1
+fi
 
 case "$ORIG_BOOT0001" in
   *ubuntu*shimaa64.efi*) ;;
@@ -246,6 +272,16 @@ case "$ORIG_BOOT0001" in
     echo "FAIL: Spark Boot0001 is not Ubuntu shim (got: ${ORIG_BOOT0001:-missing}); refusing." >&2
     exit 1 ;;
 esac
+ORIG_0001_SHA=$(sha256_str "$ORIG_BOOT0001")
+if ! printf '%s\n' "$ORIG_0001_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+  echo "FAIL: failed to hash ORIG_BOOT0001" >&2
+  exit 1
+fi
+
+if [ "$ESP_SRC" != "/dev/nvme0n1p1" ] || [ "$ESP_FSTYPE" != "vfat" ]; then
+  echo "FAIL: /boot/efi mount mismatch (source=${ESP_SRC:-missing} fstype=${ESP_FSTYPE:-missing}, want /dev/nvme0n1p1 vfat); refusing." >&2
+  exit 1
+fi
 
 if [ "$UBUNTU_SHIM" != "OK" ]; then
   echo "FAIL: /boot/efi/EFI/ubuntu/shimaa64.efi missing on $SPARK_HOST; refusing." >&2
@@ -257,16 +293,20 @@ if [ -z "$ESP_AVAIL" ] || [ "$ESP_AVAIL" -lt "$MIN_ESP_FREE_BYTES" ] 2>/dev/null
   exit 1
 fi
 
-echo "[OK] Spark BootOrder=$ORIG_BOOTORDER, Boot0001=ubuntu intact, ESP free=$((ESP_AVAIL / 1048576)) MiB"
+echo "[OK] Spark BootOrder=$ORIG_BOOTORDER, Boot0001=ubuntu intact, ESP=${ESP_SRC}(${ESP_FSTYPE}) free=$((ESP_AVAIL / 1048576)) MiB"
 
 if [ "$GPU_BUSY" != "NONE" ]; then
   if [ "$APPLY" -eq 1 ] && [ "$FORCE_GPU_BUSY" -ne 1 ]; then
-    echo "REFUSED: Live GPU workload detected holding /dev/nvidia* open: $GPU_BUSY" >&2
-    echo "         Stop GPU workloads first or pass --force-while-gpu-busy." >&2
+    if [ "$GPU_BUSY" = "UNKNOWN_SUDO_FAILED" ] || [ -z "$GPU_BUSY" ]; then
+      echo "REFUSED: Could not verify /dev/nvidia* idle state (sudo -n failed; fail-closed)." >&2
+    else
+      echo "REFUSED: Live GPU workload detected holding /dev/nvidia* open: $GPU_BUSY" >&2
+    fi
+    echo "         Stop GPU workloads / ensure sudo -n works, or pass --force-while-gpu-busy." >&2
     echo "         Zero changes were made to Spark ESP or NVRAM." >&2
     exit 3
   fi
-  echo "[WARN] Live /dev/nvidia* open processes detected: $GPU_BUSY"
+  echo "[WARN] /dev/nvidia* status: ${GPU_BUSY:-UNKNOWN}"
 else
   echo "[OK] Spark /dev/nvidia* idle (no open processes)"
 fi
@@ -294,17 +334,30 @@ fi
 echo ""
 echo "=== APPLYING STAGING + ONE-SHOT BootNext ON $SPARK_HOST ==="
 
-REMOTE_TMP="/tmp/SPARK.EFI.stage.$$"
+# Verify non-interactive sudo works BEFORE creating temp files or touching /boot/efi
+if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$SPARK_HOST" 'sudo -n true' 2>/dev/null; then
+  echo "FAIL: passwordless sudo (sudo -n) is not available on $SPARK_HOST; zero changes made." >&2
+  exit 1
+fi
+
+REMOTE_DIR=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$SPARK_HOST" 'mktemp -d /tmp/spark-stage.XXXXXX')
+if [ -z "$REMOTE_DIR" ]; then
+  echo "FAIL: could not create 0700 staging temp dir on $SPARK_HOST" >&2
+  exit 1
+fi
+REMOTE_TMP="${REMOTE_DIR}/SPARK.EFI"
 scp -q "$SPARK_EFI" "${SPARK_HOST}:${REMOTE_TMP}"
 
 APPLY_OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$SPARK_HOST" \
-  "sh -s '$REMOTE_TMP' '$LOCAL_SHA' '$ORIG_BOOTORDER'" <<'REMOTE_APPLY'
+  "sh -s '$REMOTE_DIR' '$LOCAL_SHA' '$ORIG_BOOTORDER' '$ORIG_0001_SHA'" <<'REMOTE_APPLY'
 set -eu
-RTMP="$1"
+RDIR="$1"
+RTMP="${RDIR}/SPARK.EFI"
 WANT_SHA="$2"
 ORIG_ORDER="$3"
+ORIG_0001_SHA="$4"
 
-cleanup() { rm -f "$RTMP"; }
+cleanup() { rm -rf "$RDIR"; }
 trap cleanup EXIT
 
 GOT_SHA=$(sha256sum "$RTMP" | awk '{print $1}')
@@ -313,15 +366,23 @@ if [ "$GOT_SHA" != "$WANT_SHA" ]; then
   exit 1
 fi
 
-sudo mkdir -p /boot/efi/EFI/AIENOS
-sudo install -m 0644 "$RTMP" /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp
-STAGE_SHA=$(sudo sha256sum /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp | awk '{print $1}')
+# Re-verify /boot/efi mount right before writing
+ESP_SRC=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || echo "UNMOUNTED")
+ESP_FSTYPE=$(findmnt -n -o FSTYPE /boot/efi 2>/dev/null || echo "NONE")
+if [ "$ESP_SRC" != "/dev/nvme0n1p1" ] || [ "$ESP_FSTYPE" != "vfat" ]; then
+  echo "FAIL: /boot/efi mount changed (source=$ESP_SRC fstype=$ESP_FSTYPE); aborting before write" >&2
+  exit 1
+fi
+
+sudo -n mkdir -p /boot/efi/EFI/AIENOS
+sudo -n install -m 0644 "$RTMP" /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp
+STAGE_SHA=$(sudo -n sha256sum /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp | awk '{print $1}')
 if [ "$STAGE_SHA" != "$WANT_SHA" ]; then
-  sudo rm -f /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp
+  sudo -n rm -f /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp
   echo "FAIL: staged ESP SHA-256 mismatch" >&2
   exit 1
 fi
-sudo mv -f /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp /boot/efi/EFI/AIENOS/SPARK.EFI
+sudo -n mv -f /boot/efi/EFI/AIENOS/.SPARK.EFI.tmp /boot/efi/EFI/AIENOS/SPARK.EFI
 sync
 
 BOOTNUM=$(efibootmgr -v | awk '
@@ -331,7 +392,7 @@ BOOTNUM=$(efibootmgr -v | awk '
 
 if [ -z "$BOOTNUM" ]; then
   # --create-only creates the entry WITHOUT modifying BootOrder
-  sudo efibootmgr --create-only \
+  sudo -n efibootmgr --create-only \
     --disk /dev/nvme0n1 --part 1 \
     --label "AIENOS Spark" \
     --loader '\EFI\AIENOS\SPARK.EFI' >/dev/null
@@ -341,35 +402,37 @@ if [ -z "$BOOTNUM" ]; then
     }')
 fi
 
-if [ -z "$BOOTNUM" ]; then
-  echo "FAIL: could not locate BootXXXX for \\EFI\\AIENOS\\SPARK.EFI" >&2
+if [ -z "$BOOTNUM" ] || [ "$BOOTNUM" = "0001" ] || ! printf '%s\n' "$BOOTNUM" | grep -Eq '^[0-9A-Fa-f]{4}$'; then
+  echo "FAIL: invalid or protected BOOTNUM='${BOOTNUM:-empty}' for \\EFI\\AIENOS\\SPARK.EFI" >&2
   exit 1
 fi
 
 # Set ONE-SHOT BootNext ONLY
-sudo efibootmgr --bootnext "$BOOTNUM" >/dev/null
+sudo -n efibootmgr --bootnext "$BOOTNUM" >/dev/null
 
-# Post-apply safety verification
+# Post-apply safety verification (byte-exact BootOrder and Boot0001)
 POST_EFI=$(efibootmgr -v)
 POST_ORDER=$(printf '%s\n' "$POST_EFI" | awk '/^BootOrder:/ {print $2; exit}')
 POST_NEXT=$(printf '%s\n' "$POST_EFI" | awk '/^BootNext:/ {print $2; exit}')
 POST_0001=$(printf '%s\n' "$POST_EFI" | grep -E '^Boot0001' | head -n 1 || true)
+POST_0001_SHA=$(printf '%s' "$POST_0001" | sha256sum | awk '{print $1}')
 
 if [ "$POST_ORDER" != "$ORIG_ORDER" ]; then
   echo "EMERGENCY: BootOrder changed from $ORIG_ORDER to $POST_ORDER; restoring immediately!" >&2
-  sudo efibootmgr -o "$ORIG_ORDER" >/dev/null
-  sudo efibootmgr -N >/dev/null
+  sudo -n efibootmgr -o "$ORIG_ORDER" >/dev/null
+  sudo -n efibootmgr -N >/dev/null
   exit 1
 fi
 
 if [ "$POST_NEXT" != "$BOOTNUM" ]; then
   echo "FAIL: BootNext verification failed (got=$POST_NEXT want=$BOOTNUM)" >&2
+  sudo -n efibootmgr -N >/dev/null || true
   exit 1
 fi
 
-if ! printf '%s\n' "$POST_0001" | grep -q 'ubuntu.*shimaa64\.efi'; then
-  echo "FAIL: Boot0001 verification failed after staging!" >&2
-  sudo efibootmgr -N >/dev/null
+if [ "$POST_0001_SHA" != "$ORIG_0001_SHA" ]; then
+  echo "FAIL: Boot0001 changed after staging (sha got=$POST_0001_SHA want=$ORIG_0001_SHA); clearing BootNext!" >&2
+  sudo -n efibootmgr -N >/dev/null || true
   exit 1
 fi
 
@@ -378,6 +441,7 @@ echo "STAGED_SHA256=$STAGE_SHA"
 echo "BOOTNUM=$BOOTNUM"
 echo "POST_BOOTNEXT=$POST_NEXT"
 echo "POST_BOOTORDER=$POST_ORDER"
+echo "POST_BOOT0001_SHA256=$POST_0001_SHA"
 REMOTE_APPLY
 )
 

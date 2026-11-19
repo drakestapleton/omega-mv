@@ -46,29 +46,33 @@ chmod +x /tmp/pack_bundle
 
 ### 2. Extract GB20B `580.173.02` Bindata & Pack `OMFWBND1` into a `0700` Directory
 
-On Spark (`nvme0n1p2`), create a root/operator-only `0700` staging directory and pack all 7 verified blobs (`gsp_ga10x.bin` `75,012,080 B`, `bl.img` `212,992 B`, `fmc.img` `212,296 B`, `fmc.hash` `48 B`, `fmc.pubkey` `384 B`, `fmc.sig` `384 B`, `bl_desc` `84 B`):
+`gpu/driver/fwprep.om` writes the 5 GB20B bindata blobs (`bl.img` `212,992 B`, `fmc.img` `212,296 B`, `fmc.hash` `48 B`, `fmc.pubkey` `384 B`, `fmc.sig` `384 B`) plus the text manifest `fw.gb20b.manifest` (which records `bl_desc` fields including `app_version`). On Spark (`nvme0n1p2`), create a root/operator-only `0700` staging directory and pack `gsp_ga10x.bin` (`75,012,080 B`) + the 5 extracted binary blobs (and optional `fw.gb20b.manifest` as kind `7`):
 
 ```sh
 FW_WORK="$HOME/.local/state/aienos-fw-580.173.02"
 install -d -m 0700 "$FW_WORK"
 
-# Extract the 5 GB20B bindata blobs + bl_desc from pinned open-gpu-kernel-modules-580.173.02
+# Extract the 5 GB20B bindata blobs + fw.gb20b.manifest from pinned open-gpu-kernel-modules-580.173.02
 /tmp/fwprep \
   /lib/firmware/nvidia/580.173.02/gsp_ga10x.bin \
   "$OGKM_580_173_02_DIR" \
   "$FW_WORK" \
   gb20b
 
-# Pack 4 KiB-aligned OMFWBND1 bundle with per-entry SHA-256 TOC (app_version=58017302)
+# Read app_version recorded by fwprep in fw.gb20b.manifest
+APP_VER=$(awk '/^bl_desc / { for (i=1;i<=NF;i++) if ($i ~ /^app_version=/) { sub(/^app_version=/,"",$i); print $i; exit } }' "$FW_WORK/fw.gb20b.manifest")
+echo "fwprep app_version=${APP_VER:?missing app_version in fw.gb20b.manifest}"
+
+# Pack 4 KiB-aligned OMFWBND1 bundle with per-entry SHA-256 TOC
 sudo install -d -m 0700 /aienos
-/tmp/pack_bundle "$FW_WORK/spark-bundle.img" 58017302 \
+/tmp/pack_bundle "$FW_WORK/spark-bundle.img" "$APP_VER" \
   1 /lib/firmware/nvidia/580.173.02/gsp_ga10x.bin \
   2 "$FW_WORK/bl.img" \
   3 "$FW_WORK/fmc.img" \
   4 "$FW_WORK/fmc.hash" \
   5 "$FW_WORK/fmc.pubkey" \
   6 "$FW_WORK/fmc.sig" \
-  7 "$FW_WORK/bl_desc"
+  7 "$FW_WORK/fw.gb20b.manifest"
 
 sudo install -m 0600 "$FW_WORK/spark-bundle.img" /aienos/spark-bundle.img
 sha256sum /aienos/spark-bundle.img
@@ -216,7 +220,26 @@ Because `stage_bootnext.sh` sets **one-shot `BootNext` only** and leaves `BootOr
     sudo rm -f /boot/efi/EFI/AIENOS/SPARK.EFI
     # Optional: remove the BootXXXX entry for \EFI\AIENOS\SPARK.EFI (never touch Boot0001!)
     BOOTNUM=$(efibootmgr -v | awk "/^Boot[0-9A-Fa-f]{4}/ && index(\$0, \"\\\\EFI\\\\AIENOS\\\\SPARK.EFI\")>0 {print substr(\$1,5,4); exit}")
-    [ -n "$BOOTNUM" ] && sudo efibootmgr -b "$BOOTNUM" -B
+    [ -n "$BOOTNUM" ] && [ "$BOOTNUM" != "0001" ] && sudo efibootmgr -b "$BOOTNUM" -B
     efibootmgr -v
   '
   ```
+
+---
+
+## Post-Boot Optimization Plan (Phase 4 — Strictly After Window 0 First-Boot & Token Parity)
+
+Do **not** mix these optimizations into Window 0 bring-up. Land and benchmark them only after bare-metal first-boot, EC fan/thermal verification, and bit-exact Qwen3.8-27B token parity pass:
+
+1. **Projection Overlap & Barrier Tuning (`gpu/driver/gsp/q38_run.om`):**
+   - Port `OVERLAP_AB` (overlap independent projections) and configurable barrier modes (`WFI` vs `WFI+CBICALL`) in `q38_run.om`.
+   - Measure per-stage latency directly via GPU `PTIMER` stamps.
+2. **GPU-Side Embedding Gather & Multi-Token Pushbuffer Batching (`N=4..8`):**
+   - Move embedding gather onto the GPU and batch `N=4..8` greedy `OMTK v1` decode tokens per pushbuffer submission to eliminate per-token C3 `L2_FLUSH_DIRTY` + semaphore host round-trips, while preserving prompt `EOS` and `CANCEL` responsiveness.
+3. **Long-Context `attn256` Optimization (`32k–128k`):**
+   - Optimize long-context KV scan / reduction paths in `cg_attn256.om` across `32k–128k` contexts.
+4. **Explicit Skips (Do Not Implement for Dense 27B):**
+   - **Weight L2 caching:** thrashes GB10's 24 MiB L2 cache on 27B streaming weights.
+   - **`o_proj` prefetch:** 30B-only optimization; skip for 27B.
+   - **Range-syncing:** already reduced to a single `dsb sy` no-op on bare-metal ARM64.
+   - **`AIEN_OMEGA_FP8_GROUPED_WAVE=1`:** 35B MoE grouped-expert path only; not applicable to dense Qwen3.8-27B.
