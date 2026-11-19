@@ -55,10 +55,31 @@ const CBCHMAX uint 4095
 const CBDBBAR0 ulong 12255376
 const CBDBUM ulong 144
 const CBGPPUT ulong 140
-note Pushbuffer INC_METHOD (2<<28), compute setup 0x0184, inline QMD 0x0318 (96 dwords),
-note L2 flush 0x0028 (0x80000000), host semaphore 0x005C..0x006C (release 1 / WFI 0x100001)
+note Pushbuffer INC_METHOD (2<<28), compute setup 0x0184 + 18-word bare-metal windows,
+note PCAS 0x02b4/0x02c0, WFI 0x0110, INVALIDATE_SHADER_CACHES 0x021c, inline QMD 0x0318 (96 dwords),
+note L2 flush 0x0028 (0x80000000), host semaphore 0x005C..0x006C (release 1 / WFI 0x100001).
+note Bare-metal disjoint 40-bit shader windows: shared 0x70_0000_0000 (hi 112), local 0x72_0000_0000 (hi 114).
 const CBINC uint 536870912
 const CBMSETUP uint 388
+const CBMSET1 uint 584
+const CBMSET2 uint 672
+const CBMSHWIN uint 5492
+const CBMSHLO uint 5496
+const CBMSHSZ uint 5500
+const CBMLMWIN uint 5468
+const CBMLMLO uint 5472
+const CBMLMSZ uint 5476
+const CBSHWINHI uint 112
+const CBLMWINHI uint 114
+const CBSHSZ uint 1048575
+const CBMWFI uint 272
+const CBMICACHE uint 540
+const CBICALL uint 4113
+const CBICDATA uint 16
+const CBICFLUSH uint 20
+const CBMPCASA uint 692
+const CBMPCASB uint 704
+const CBPCASACT uint 3
 const CBMIQMD uint 792
 const CBML2 uint 40
 const CBMSEM uint 92
@@ -66,7 +87,7 @@ const CBQMDWDS ulong 96
 const CBSEMREL uint 1
 const CBSEMWFI uint 1048577
 const CBL2EXEC uint 2147483648
-const CBPBMAX ulong 1024
+const CBPBMAX ulong 16384
 note GP entry: va & ~3, LEVEL bit 41 (1<<41), VA limit 1<<40, length max 0x1FFFFF
 const CBVAMASK ulong 18446744073709551612
 const CBGPB41 ulong 2199023255552
@@ -94,8 +115,8 @@ global cbrblob uchar 4096
 global cbrbpos ulong 1
 global cbrkin uchar 128
 global cbrvin uchar 512
-note Pushbuffer and inline QMD staging arrays
-global cbpb uint 1024
+note Pushbuffer (64 KiB = 16384 dwords) and inline QMD staging arrays
+global cbpb uint 16384
 global cbpblen ulong 1
 global cbqmd uint 96
 
@@ -429,8 +450,9 @@ end
 
 note Section 4: GB20B work-submit token encoder and doorbell write helpers
 note kfifoGenerateWorkSubmitTokenHal_GB202: 0x40000000 | ((runlist & 0x7F) << 16) | (chId & 0xFFF).
+note Rejects rl >= 127 (0x7F is RUNLIST_ID_INVALID_RUNLIST, gb100/dev_vm.h:625).
 fn cbtoken rl uint chid uint to long
-if or gt rl CBRLMAX gt chid CBCHMAX
+if or ge rl CBRLMAX gt chid CBCHMAX
 ret CBERANGE
 end
 tok = or CBDBEN or shl rl 16 chid
@@ -486,6 +508,94 @@ if lt r 0
 ret r
 end
 ret cbpbemit cls
+end
+
+note Emit one single-word INC_METHOD pair (subc 1) into cbpb; caller checks capacity.
+fn cbpbpair mthd uint val uint to long
+r = cbpbemit cbmthd 1 mthd 1
+if lt r 0
+ret r
+end
+ret cbpbemit val
+end
+
+note Full 18-word bare-metal compute setup with disjoint 40-bit shader windows:
+note shared=0x70_0000_0000 (size 0x000fffff), local=0x72_0000_0000 (size 0).
+fn cbpbsetup18 cls uint to long
+n = get cbpblen 0
+if gt add n 18 CBPBMAX
+ret CBEFULL
+end
+r = cbpbpair CBMSETUP cls
+if lt r 0
+ret r
+end
+r = cbpbpair CBMSET1 1
+if lt r 0
+ret r
+end
+r = cbpbpair CBMSET2 15
+if lt r 0
+ret r
+end
+r = cbpbpair CBMSHWIN CBSHWINHI
+if lt r 0
+ret r
+end
+r = cbpbpair CBMSHLO 0
+if lt r 0
+ret r
+end
+r = cbpbpair CBMSHSZ CBSHSZ
+if lt r 0
+ret r
+end
+r = cbpbpair CBMLMWIN CBLMWINHI
+if lt r 0
+ret r
+end
+r = cbpbpair CBMLMLO 0
+if lt r 0
+ret r
+end
+ret cbpbpair CBMLMSZ 0
+end
+
+note Inter-launch WAIT_FOR_IDLE (subc 1, method 0x0110, payload 0; 2 words).
+fn cbpbwfi to long
+n = get cbpblen 0
+if gt add n 2 CBPBMAX
+ret CBEFULL
+end
+ret cbpbpair CBMWFI 0
+end
+
+note Inter-launch INVALIDATE_SHADER_CACHES (subc 1, method 0x021c, flags e.g. CBICALL 0x1011; 2 words).
+fn cbpbicache flags uint to long
+n = get cbpblen 0
+if gt add n 2 CBPBMAX
+ret CBEFULL
+end
+ret cbpbpair CBMICACHE flags
+end
+
+note PCAS QMD dispatch (subc 1, SEND_PCAS_A 0x02b4 + SEND_SIGNALING_PCAS2_B 0x02c0 action 3; 4 words).
+fn cbpbpcas qmdva ulong to long
+if or eq qmdva 0 ge qmdva CBVALIM
+ret CBERANGE
+end
+if ne and qmdva 255 0
+ret CBEALIGN
+end
+n = get cbpblen 0
+if gt add n 4 CBPBMAX
+ret CBEFULL
+end
+r = cbpbpair CBMPCASA uint and shr qmdva 8 CBU32MAX
+if lt r 0
+ret r
+end
+ret cbpbpair CBMPCASB CBPCASACT
 end
 
 note Inline 384-byte (96-dword) QMD launch packet (subc 1, method 0x0318, count 98).
@@ -585,7 +695,7 @@ end
 ret cbpbemit exec
 end
 
-note Flush staged pushbuffer words to physical/window address pbpa via mmwr32.
+note Flush staged pushbuffer words to physical/window address pbpa via mmwr32, then DSB SY.
 fn cbpbflush pbpa ulong to long
 if ne and pbpa 3 0
 ret CBEALIGN
@@ -597,6 +707,7 @@ end
 for i ulong n
 mmwr32 add pbpa mul i 4 ulong get cbpb i
 end
+cpufence
 ret long n
 end
 
@@ -609,7 +720,7 @@ fn cbgpentok va ulong words uint to bool
 ret and eq and va 3 0 and lt va CBVALIM and gt words 0 le words CBLENMAX
 end
 
-note Write 64-bit GP entry to GPFIFO ring at (gpput % ent) * 8; returns nextput = (gpput + 1) % ent.
+note Write 64-bit GP entry to GPFIFO ring at (gpput % ent) * 8, then DSB SY; returns nextput = (gpput + 1) % ent.
 fn cbwrgp gppa ulong gpput uint ent uint gpent ulong to long
 if or or lt ent 2 gt ent 65536 ne and ent sub ent 1 0
 ret CBEINVAL
@@ -619,12 +730,14 @@ ret CBEALIGN
 end
 idx = ulong rem gpput ent
 mmwr64 add gppa mul idx 8 gpent
+cpufence
 ret long ulong rem add gpput 1 ent
 end
 
-note Update USERD GPPut (+0x8C / 140).
+note Update USERD GPPut (+0x8C / 140), then DSB SY before doorbell.
 fn cbwruserd userdpa ulong nextput uint to void
 mmwr32 add userdpa CBGPPUT ulong nextput
+cpufence
 end
 
 note Full BAR0 kick sequence: write GP entry, advance USERD GPPut, fence, write BAR0 0xBB0090 doorbell.

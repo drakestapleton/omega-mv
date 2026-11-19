@@ -1,0 +1,1012 @@
+note gsp/q38_run.om: Pure-Omega bare-metal Qwen3.8-27B-FP8 inference runtime (Slice E / Piece 5).
+note Zero C, zero CUDA, zero libomega_gpu.a, zero Linux syscalls.
+note Composes after: gpu/driver/gsp/compute.om (plus platform mmwr32/mmrd32 and q3_dc_civac).
+note Implements:
+note   - Disjoint bare-metal GPU VA map: LPDDR5x [0x00_8000_0000, 0x40_0000_0000),
+note     shader shared window 0x70_0000_0000, shader local window 0x72_0000_0000.
+note   - Sanitized CBANK0 builder (all unpatched NVRM 0x3_*/0x2_* VA words strictly zeroed).
+note   - Blackwell QMD v5 builder (32 KiB shared_bytes cap, SKEDCHECK05 word 37 = 0).
+note   - Strict Normal-NC (host-touched) vs GPU-cached (chip-only) layout + WB DC CIVAC flush.
+note   - Piece 5 <-> Piece 6 non-blocking contract: q38_reset_kv, q38_stage_step, q38_verify_step.
+note Prefix q3 / Q3.
+
+const Q3OK long 0
+const Q3EINVAL long -1
+const Q3EUNSUP long -2
+const Q3ERANGE long -3
+const Q3ESTATE long -4
+const Q3EVERIFY long -5
+const Q3EALIGN long -6
+
+note Qwen3.8-27B-FP8 architectural constants (src/omega_gpu_q38_graph.h)
+const Q3HIDDEN ulong 5120
+const Q3INTER ulong 17408
+const Q3LAYERS ulong 64
+const Q3GDNL ulong 48
+const Q3ATTNL ulong 16
+const Q3QHEADS ulong 24
+const Q3KVHEADS ulong 4
+const Q3GDNHEADS ulong 48
+const Q3ROTARY ulong 64
+const Q3VOCAB ulong 248320
+const Q3GDNQKV ulong 10240
+const Q3GDNMIX ulong 16384
+const Q3AB ulong 96
+const Q3ATTMIX ulong 14336
+const Q3ATTQKV ulong 8192
+const Q3MOUT ulong 6144
+const Q3AMCTAS ulong 122
+const Q3AMSPAN ulong 2048
+const Q3MAXLAUNCH ulong 600
+
+note Step modes: 0 = PREFILL (593 launches, skips lm_head + argmax), 1 = DECODE (596 launches)
+const Q3MODE_PF uchar 0
+const Q3MODE_DEC uchar 1
+
+note Poison / semaphore / QMD constants
+const Q3POISON uint 4294967295
+const Q3SEMINIT uint 5
+const Q3SEMDONE uint 6
+const Q3MAXSMEM uint 32768
+const Q3U32MASK ulong 4294967295
+const Q3SCALE2P64 uint 1602224128
+const Q3ONEF32 uint 1065353216
+const Q3EPSF32 uint 897988541
+
+note Disjoint bare-metal GPU VA map (safety #23/#25/#30):
+note LPDDR5x identity range [0x00_8000_0000, 0x40_0000_0000) strictly disjoint from
+note shader windows 0x70_0000_0000 (shared) and 0x72_0000_0000 (local).
+const Q3LPDDRLO ulong 2147483648
+const Q3LPDDRHI ulong 274877906944
+const Q3SHWINHI uint 112
+const Q3LMWINHI uint 114
+
+note Kernel table indices (12 static sm_121 SASS code objects)
+const Q3KNORM ulong 0
+const Q3KADDNORM ulong 1
+const Q3KSWIGLU ulong 2
+const Q3KGATHER ulong 3
+const Q3KGATE ulong 4
+const Q3KAM0 ulong 5
+const Q3KAM1 ulong 6
+const Q3KFP8 ulong 7
+const Q3KBF16 ulong 8
+const Q3KGDN ulong 9
+const Q3KGDNZERO ulong 10
+const Q3KATTN ulong 11
+const Q3KCOUNT ulong 12
+
+note Runtime state arrays
+note q3st: 0=init, 1=nc_base, 2=wb_base, 3=pb_pa, 4=marker_va, 5=max_ctx,
+note       6=sem_seq, 7=staged_n, 8=kv_pos, 9=overlap_ab, 10=wb_flushes,
+note       11=emb_va, 12=lm_va, 13=fnorm_va, 14=gdn_st_va, 15=attn_kv_va,
+note       16=attn_mask, 17=last_mode, 18=cur_gy, 19=cur_elems
+global q3st ulong 24
+note Normal-NC layout offsets from nc_base (all 256-byte aligned):
+note 0=x, 1=ab, 2=hidden, 3=logits, 4=am_v, 5=am_i, 6=out_tok, 7=norms,
+note 8=fnorm, 9=tabs, 10=gtab, 11=banks, 12=qmds, 13=sems, 14=scratch,
+note 15=attn_cnts, 16=nc_total
+global q3nc ulong 20
+note GPU-cached (WB) layout offsets from wb_base (all 256-byte aligned):
+note 0=xq, 1=mix, 2=agg, 3=att, 4=o, 5=gu, 6=act, 7=wb_total
+global q3wb ulong 12
+note Compiled sm_121 SASS kernel table: code_va, gpr, smem, bound(1)
+global q3kcode ulong 12
+global q3kgpr uint 12
+global q3ksmem uint 12
+global q3kset uchar 12
+note Per-layer weight VAs (64 layers): mix, o, gate_up, down, ab, set(1)
+global q3lmix ulong 64
+global q3lo ulong 64
+global q3lgu ulong 64
+global q3ldn ulong 64
+global q3lab ulong 64
+global q3lset uchar 64
+note Scratch argument buffer for per-launch CBANK0 args (at +0x380, up to 16 u32 words)
+global q3args uint 16
+
+fn q3al256 v ulong to ulong
+ret and add v 255 18446744073709551360
+end
+
+fn q3lo32 v ulong to uint
+ret uint and v Q3U32MASK
+end
+
+fn q3hi32 v ulong to uint
+ret uint shr v 32
+end
+
+note Validate that [va, va + sz) lies strictly inside the bare-metal LPDDR5x VA window,
+note is 256-byte aligned, non-empty, and never wraps or collides with 0x70/0x72 shader windows.
+fn q3_va_ok va ulong sz ulong to bool
+if or eq sz 0 ne and va 255 0
+ret false
+end
+if or lt va Q3LPDDRLO ge va Q3LPDDRHI
+ret false
+end
+if gt sz sub Q3LPDDRHI va
+ret false
+end
+ret true
+end
+
+note Flush CPU Normal-WB range [pa, pa + nbytes) to PoC via DC CIVAC + DSB SY before GPU read.
+fn q3_wb_flush pa ulong nbytes ulong to long
+if not q3_va_ok pa nbytes
+ret Q3ERANGE
+end
+q3_dc_civac pa nbytes
+cpufence
+put q3st 10 add get q3st 10 1
+ret Q3OK
+end
+
+note Exact partial-RoPE permutation slot (matches omega_dattn256_perm_slot in omega_gpu_decode_attn256_api.h)
+fn q3_perm_slot i ulong rdim ulong to ulong
+p = div rdim 2
+if lt i p
+ret i
+end
+if lt i 128
+ret add rdim sub i p
+end
+if lt i add 128 p
+ret add p sub i 128
+end
+ret i
+end
+
+note Single gather slot index for q3_gather_table (keeps register count low)
+fn q3_gather_slot n ulong qh ulong kvh ulong to ulong
+qn = mul qh 256
+if lt n qn
+ret add mul div n 256 512 q3_perm_slot rem n 256 Q3ROTARY
+end
+kn = mul kvh 256
+if lt n add qn kn
+d = sub n qn
+ret add add mul qh 512 mul div d 256 256 q3_perm_slot rem d 256 Q3ROTARY
+end
+qkv = add qn mul 2 kn
+if lt n qkv
+ret add add mul qh 512 kn sub n add qn kn
+end
+d = sub n qkv
+ret add add mul div d 256 512 256 rem d 256
+end
+
+note Build Qwen3.8 attention gather table (matches omega_q38_gather_table in omega_gpu_q38_graph.c:80-93)
+fn q3_gather_table qh ulong kvh ulong tab edit uint 14336 to long
+if or eq qh 0 or gt qh 24 or eq kvh 0 ne rem qh kvh 0
+ret Q3EINVAL
+end
+mix = mul add qh kvh 512
+if gt mix 14336
+ret Q3ERANGE
+end
+for n ulong mix
+put tab n uint q3_gather_slot n qh kvh
+end
+ret Q3OK
+end
+
+note Fold zero-centred RMSNorm weight: wout[i] = 1.0f32 + win[i]
+fn q3_fold_norm win view f32 5120 wout edit f32 5120 n ulong to long
+if or eq n 0 gt n Q3HIDDEN
+ret Q3ERANGE
+end
+for i ulong n
+put wout i add 1.0f32 get win i
+end
+ret Q3OK
+end
+
+note Helper: write u32 word idx into Normal-NC bank_va
+fn q3bw bank_va ulong idx ulong val uint to void
+mmwr32 add bank_va mul idx 4 ulong val
+end
+
+note Write sanitized 224-word bare-metal CBANK0 to Normal-NC bank_va.
+note Zeroes all 224 words first so NO NVRM 0x3_*/0x2_* VA words ([0..1],[70..71],[82..83],[126..127],[166..167])
+note survive. Sets disjoint shader windows [64..65]=0x70_0000_0000 and [66..67]=0x72_0000_0000 (LE).
+fn q3_cbank0_write bank_va ulong tx uint ty uint gx uint gy uint to long
+if not q3_va_ok bank_va 1024
+ret Q3ERANGE
+end
+for i ulong 256
+q3bw bank_va i 0
+end
+note Architectural non-VA constants from empirical GB10 CBANK0 template
+q3bw bank_va 62 1048575
+note Disjoint shader shared memory window: 0x70_0000_0000 (LE lo, hi)
+q3bw bank_va 64 0
+q3bw bank_va 65 Q3SHWINHI
+note Disjoint shader local memory window: 0x72_0000_0000 (LE lo, hi)
+q3bw bank_va 66 0
+q3bw bank_va 67 Q3LMWINHI
+note Self CBANK0 VA (LE lo, hi)
+q3bw bank_va 68 q3lo32 bank_va
+q3bw bank_va 69 q3hi32 bank_va
+q3bw bank_va 80 1
+q3bw bank_va 91 1024
+q3bw bank_va 108 79311560
+q3bw bank_va 114 1
+q3bw bank_va 118 288
+q3bw bank_va 128 1
+q3bw bank_va 129 1
+q3bw bank_va 130 1
+q3bw bank_va 132 Q3ONEF32
+q3bw bank_va 133 Q3ONEF32
+q3bw bank_va 134 Q3ONEF32
+q3bw bank_va 135 1024
+q3bw bank_va 136 1
+q3bw bank_va 137 1
+q3bw bank_va 138 1
+q3bw bank_va 139 1
+q3bw bank_va 148 79311560
+q3bw bank_va 154 1
+q3bw bank_va 158 288
+q3bw bank_va 168 1
+q3bw bank_va 169 1
+q3bw bank_va 170 1
+q3bw bank_va 172 Q3ONEF32
+q3bw bank_va 173 Q3ONEF32
+q3bw bank_va 174 Q3ONEF32
+q3bw bank_va 175 1024
+q3bw bank_va 176 1
+q3bw bank_va 177 1
+q3bw bank_va 178 1
+q3bw bank_va 179 1
+q3bw bank_va 180 48
+q3bw bank_va 183 16777216
+q3bw bank_va 185 59840
+q3bw bank_va 189 59840
+q3bw bank_va 190 16777216
+q3bw bank_va 191 59839
+note Argument window pointers: bank_va + 0x380 (896) and bank_va + 0x39c (924) (LE lo, hi)
+a0 = add bank_va 896
+a1 = add bank_va 924
+q3bw bank_va 210 q3lo32 a0
+q3bw bank_va 211 q3hi32 a0
+q3bw bank_va 212 q3lo32 a1
+q3bw bank_va 213 q3hi32 a1
+note CTA and grid dimensions at words 216..223
+q3bw bank_va 216 tx
+q3bw bank_va 217 ty
+q3bw bank_va 218 1
+q3bw bank_va 220 gx
+q3bw bank_va 221 gy
+q3bw bank_va 222 1
+q3bw bank_va 223 16776640
+ret Q3OK
+end
+
+note Write nargs (1..16) kernel argument words from q3args[] to bank_va + 0x380
+fn q3_args_write bank_va ulong nargs ulong to long
+if or eq nargs 0 gt nargs 16
+ret Q3ERANGE
+end
+for i ulong nargs
+mmwr32 add add bank_va 896 mul i 4 ulong get q3args i
+end
+ret Q3OK
+end
+
+note Write QMD1 words 0..33 and 59 (header, sem_va, code_va)
+fn q3_qmd1_head qmd_va ulong sem_va ulong code_va ulong to void
+for i ulong 96
+mmwr32 add qmd_va mul i 4 0
+end
+note Word 4: QMD_GROUP_ID=0x3f, QMD_TYPE=2 (GRID_CTA)
+mmwr32 add qmd_va 16 20905984
+note Word 9: RELEASE_ENABLE=1, RELEASE_STRUCTURE_SIZE=1 (ONE_WORD)
+mmwr32 add qmd_va 36 3
+note Word 14: QMD_VERSION=5, SASS_VERSION=0xa4, SAMPLER=1, cache invalidation flags
+mmwr32 add qmd_va 56 793772964
+note Words 15-17: RELEASE_SEMAPHORE0 writes 6 (Q3SEMDONE) to sem_va
+mmwr32 add qmd_va 60 ulong q3lo32 sem_va
+mmwr32 add qmd_va 64 ulong q3hi32 sem_va
+mmwr32 add qmd_va 68 ulong Q3SEMDONE
+note Word 19: CWD_MEMBAR_TYPE=1, FREE_CTA_SLOTS=24, PRE_EXIT=1
+mmwr32 add qmd_va 76 2172715008
+note Words 20, 22: ARRIVE_AT_LATCH (ID 56, VALID=1)
+mmwr32 add qmd_va 80 56
+mmwr32 add qmd_va 88 67108864
+note Words 32-33: PROGRAM_ADDRESS (code_va >> 4) + prefetch 0xa << 21
+mmwr32 add qmd_va 128 ulong q3lo32 shr code_va 4
+mmwr32 add qmd_va 132 or and shr code_va 36 2097151 20971520
+note Word 59: PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED8 = code_va >> 8
+mmwr32 add qmd_va 236 ulong q3lo32 shr code_va 8
+end
+
+note Write QMD1 constant bank pointers (words 42..58)
+fn q3_qmd1_cbs qmd_va ulong bank_va ulong scr_va ulong to void
+mmwr32 add qmd_va 168 ulong q3lo32 shr bank_va 6
+mmwr32 add qmd_va 172 or and shr bank_va 38 524287 33554432
+mmwr32 add qmd_va 176 ulong q3lo32 shr scr_va 6
+mmwr32 add qmd_va 180 or and shr scr_va 38 524287 75497472
+cb5 = add bank_va 768
+mmwr32 add qmd_va 208 ulong q3lo32 shr cb5 6
+mmwr32 add qmd_va 212 or and shr cb5 38 524287 8388608
+mmwr32 add qmd_va 224 ulong q3lo32 shr scr_va 6
+mmwr32 add qmd_va 228 or and shr scr_va 38 524287 2147483648
+mmwr32 add qmd_va 232 271581201
+end
+
+note Write 96-dword Blackwell QMD v5 to Normal-NC qmd_va for launch slot.
+note Enforces shared_bytes <= 32768 (bw_qmd.om:104), SKEDCHECK05 word 37 = 0, sem release = 6.
+fn q3_qmd1_write slot ulong code_va ulong gpr uint smem uint tx uint gx uint to long
+if ge slot Q3MAXLAUNCH
+ret Q3ERANGE
+end
+if gt smem Q3MAXSMEM
+ret Q3ERANGE
+end
+if or eq tx 0 eq gx 0
+ret Q3EINVAL
+end
+if not q3_va_ok code_va 256
+ret Q3ERANGE
+end
+qmd_va = add q3_ncva 12 mul slot 512
+q3_qmd1_head qmd_va add q3_ncva 13 mul slot 16 code_va
+q3_qmd1_cbs qmd_va add q3_ncva 11 mul slot 1024 q3_ncva 14
+g = gpr
+if lt g 64
+g = uint 64
+end
+g = mul div add g 7 8 8
+mmwr32 add qmd_va 136 or and ulong tx 65535 shl ulong 1 16
+mmwr32 add qmd_va 140 or or ulong 1 shl and ulong g 511 8 131072
+s7 = ulong 8
+if ne smem 0
+s7 = div add ulong smem 127 128
+end
+mmwr32 add qmd_va 144 or 78923776 s7
+mmwr32 add qmd_va 148 0
+gy = get q3st 18
+if eq gy 0
+gy = ulong 1
+end
+mmwr32 add qmd_va 156 ulong gx
+mmwr32 add qmd_va 160 gy
+mmwr32 add qmd_va 164 1
+ret Q3OK
+end
+
+note Compute Normal-NC and GPU-cached (WB) buffer layouts (256-byte aligned).
+fn q3_layout_init to void
+o = ulong 0
+put q3nc 0 o
+o = q3al256 add o mul Q3HIDDEN 4
+put q3nc 1 o
+o = q3al256 add o mul Q3AB 4
+put q3nc 2 o
+o = q3al256 add o mul Q3HIDDEN 4
+put q3nc 3 o
+o = q3al256 add o mul mul Q3AMCTAS Q3AMSPAN 4
+put q3nc 4 o
+o = q3al256 add o mul Q3AMSPAN 4
+put q3nc 5 o
+o = q3al256 add o mul Q3AMSPAN 4
+put q3nc 6 o
+o = q3al256 add o 16
+put q3nc 7 o
+o = q3al256 add o mul mul Q3LAYERS 2 mul Q3HIDDEN 4
+put q3nc 8 o
+o = q3al256 add o mul Q3HIDDEN 4
+put q3nc 9 o
+o = q3al256 add o add mul Q3LAYERS 64 64
+put q3nc 10 o
+o = q3al256 add o mul Q3ATTMIX 4
+put q3nc 11 o
+o = q3al256 add o mul Q3MAXLAUNCH 1024
+put q3nc 12 o
+o = q3al256 add o mul Q3MAXLAUNCH 512
+put q3nc 13 o
+o = q3al256 add o mul Q3MAXLAUNCH 16
+put q3nc 14 o
+o = q3al256 add o 16384
+put q3nc 15 o
+o = q3al256 add o mul Q3ATTNL 16
+put q3nc 16 o
+w = ulong 0
+put q3wb 0 w
+w = q3al256 add w mul Q3HIDDEN 4
+put q3wb 1 w
+w = q3al256 add w mul Q3GDNMIX 4
+put q3wb 2 w
+w = q3al256 add w mul Q3ATTMIX 4
+put q3wb 3 w
+w = q3al256 add w mul Q3MOUT 4
+put q3wb 4 w
+w = q3al256 add w mul Q3HIDDEN 4
+put q3wb 5 w
+w = q3al256 add w mul mul 2 Q3INTER 4
+put q3wb 6 w
+w = q3al256 add w mul Q3INTER 4
+put q3wb 7 w
+end
+
+fn q3_disjoint a ulong asz ulong b ulong bsz ulong to bool
+ret or le add a asz b le add b bsz a
+end
+
+note Initialize Q38 bare-metal runtime with disjoint Normal-NC and GPU-cached LPDDR5x pools.
+fn q3_init nc_base ulong wb_base ulong pb_pa ulong marker_va ulong max_ctx ulong to long
+q3_layout_init
+ncsz = get q3nc 16
+wbsz = get q3wb 7
+if not q3_va_ok nc_base ncsz
+ret Q3ERANGE
+end
+if not q3_va_ok wb_base wbsz
+ret Q3ERANGE
+end
+if not q3_va_ok pb_pa 65536
+ret Q3ERANGE
+end
+if not q3_va_ok marker_va 4096
+ret Q3ERANGE
+end
+if not q3_disjoint nc_base ncsz wb_base wbsz
+ret Q3EINVAL
+end
+if not q3_disjoint nc_base ncsz pb_pa 65536
+ret Q3EINVAL
+end
+if not q3_disjoint nc_base ncsz marker_va 4096
+ret Q3EINVAL
+end
+if not q3_disjoint wb_base wbsz pb_pa 65536
+ret Q3EINVAL
+end
+if not q3_disjoint wb_base wbsz marker_va 4096
+ret Q3EINVAL
+end
+if not q3_disjoint pb_pa 65536 marker_va 4096
+ret Q3EINVAL
+end
+if or eq max_ctx 0 gt max_ctx 262144
+ret Q3EINVAL
+end
+put q3st 0 1
+put q3st 1 nc_base
+put q3st 2 wb_base
+put q3st 3 pb_pa
+put q3st 4 marker_va
+put q3st 5 max_ctx
+put q3st 6 0
+put q3st 7 0
+put q3st 8 0
+put q3st 9 1
+put q3st 10 0
+note Default Qwen3.8-27B attention mask: every 4th layer (bits 3,7,11,...,63)
+put q3st 16 9838263505978427528
+for i ulong Q3KCOUNT
+put q3kset i 0
+end
+for i ulong Q3LAYERS
+put q3lset i 0
+end
+ret Q3OK
+end
+
+note Bind compiled sm_121 SASS kernel code object (must reside in LPDDR5x VA window, smem <= 32 KiB)
+fn q3_set_code kind ulong code_va ulong gpr uint smem uint to long
+if or eq get q3st 0 0 ge kind Q3KCOUNT
+ret Q3EINVAL
+end
+if gt smem Q3MAXSMEM
+ret Q3ERANGE
+end
+if not q3_va_ok code_va 256
+ret Q3ERANGE
+end
+put q3kcode kind code_va
+put q3kgpr kind gpr
+put q3ksmem kind smem
+put q3kset kind 1
+ret Q3OK
+end
+
+note Bind per-layer weight VAs (mix, o, gate_up, down, ab; ab=0 on attention layers)
+fn q3_set_layer l ulong mix_va ulong o_va ulong gu_va ulong dn_va ulong ab_va ulong to long
+if or eq get q3st 0 0 ge l Q3LAYERS
+ret Q3EINVAL
+end
+if not q3_va_ok mix_va 256
+ret Q3ERANGE
+end
+if not q3_va_ok o_va 256
+ret Q3ERANGE
+end
+if not q3_va_ok gu_va 256
+ret Q3ERANGE
+end
+if not q3_va_ok dn_va 256
+ret Q3ERANGE
+end
+isatt = and shr get q3st 16 l 1
+if eq isatt 0
+if not q3_va_ok ab_va 256
+ret Q3ERANGE
+end
+else
+if ne ab_va 0
+ret Q3EINVAL
+end
+end
+put q3lmix l mix_va
+put q3lo l o_va
+put q3lgu l gu_va
+put q3ldn l dn_va
+put q3lab l ab_va
+put q3lset l 1
+ret Q3OK
+end
+
+note Bind model-level embedding, lm_head, final norm, GDN state pool, and attention KV pool VAs
+fn q3_set_model emb_va ulong lm_va ulong fnorm_va ulong gdn_st_va ulong attn_kv_va ulong to long
+if eq get q3st 0 0
+ret Q3ESTATE
+end
+if not q3_va_ok emb_va 256
+ret Q3ERANGE
+end
+if not q3_va_ok lm_va 256
+ret Q3ERANGE
+end
+if not q3_va_ok fnorm_va 256
+ret Q3ERANGE
+end
+if not q3_va_ok gdn_st_va 256
+ret Q3ERANGE
+end
+if not q3_va_ok attn_kv_va 256
+ret Q3ERANGE
+end
+put q3st 11 emb_va
+put q3st 12 lm_va
+put q3st 13 fnorm_va
+put q3st 14 gdn_st_va
+put q3st 15 attn_kv_va
+ret Q3OK
+end
+
+fn q3_put64 idx ulong v ulong to void
+put q3args idx q3lo32 v
+put q3args add idx 1 q3hi32 v
+end
+
+note Stage one PCAS launch into slot (CBANK0 + args + QMD1 + optional WFI/ICACHE + PCAS).
+note indep=true omits WFI/ICACHE (used for ab/mix overlap on GDN layers).
+fn q3_add_launch kind ulong tx uint gx uint gy uint nargs ulong indep bool to long
+slot = get q3st 7
+if ge slot Q3MAXLAUNCH
+ret Q3ERANGE
+end
+if eq get q3kset kind 0
+ret Q3ESTATE
+end
+mmwr32 add q3_ncva 13 mul slot 16 ulong Q3SEMINIT
+bank_va = add q3_ncva 11 mul slot 1024
+r = q3_cbank0_write bank_va tx 1 gx gy
+if lt r 0
+ret r
+end
+r = q3_args_write bank_va nargs
+if lt r 0
+ret r
+end
+put q3st 18 ulong gy
+r = q3_qmd1_write slot get q3kcode kind get q3kgpr kind get q3ksmem kind tx gx
+if lt r 0
+ret r
+end
+if or eq slot 0 not indep
+r = cbpbwfi
+if lt r 0
+ret r
+end
+r = cbpbicache CBICALL
+if lt r 0
+ret r
+end
+end
+r = cbpbpcas add q3_ncva 12 mul slot 512
+if lt r 0
+ret r
+end
+put q3st 7 add slot 1
+ret Q3OK
+end
+
+note Append final L2 flush + WFI host semaphore and flush PB to pb_pa (with DSB SY).
+fn q3_finish_pb to long
+r = cbpbl2flush
+if lt r 0
+ret r
+end
+seq = add get q3st 6 1
+put q3st 6 seq
+r = cbpbsem get q3st 4 q3lo32 seq true
+if lt r 0
+ret r
+end
+ret cbpbflush get q3st 3
+end
+
+note Piece 5 <-> Piece 6 contract: q38_reset_kv(keep_pos).
+note keep_pos > 0 returns -2 (Q3EUNSUP: GDN recurrent state cannot rewind without snapshots).
+note keep_pos == 0 stages GPU-side cg_gdn.om state-zero launch + L2 flush + WFI sem,
+note returning pb_words > 0 for Piece 6 to kick & poll (never zeros GPU-cached GDN state from CPU).
+fn q38_reset_kv keep_pos ulong to long
+if eq get q3st 0 0
+ret Q3ESTATE
+end
+if gt keep_pos 0
+ret Q3EUNSUP
+end
+if or eq get q3kset Q3KGDNZERO 0 eq get q3st 14 0
+ret Q3ESTATE
+end
+put q3st 8 0
+put q3st 7 0
+put q3st 17 ulong Q3MODE_PF
+cbpbinit
+r = cbpbsetup18 uint CBCCMP
+if lt r 0
+ret r
+end
+q3_put64 0 get q3st 14
+put q3args 2 uint Q3GDNL
+put q3args 3 0
+r = q3_add_launch Q3KGDNZERO 256 uint Q3GDNL 1 4 false
+if lt r 0
+ret r
+end
+ret q3_finish_pb
+end
+
+fn q3_ncva idx ulong to ulong
+ret add get q3st 1 get q3nc idx
+end
+
+fn q3_wbva idx ulong to ulong
+ret add get q3st 2 get q3wb idx
+end
+
+note Stage one GDN layer (9 launches: ab, mix[overlap], gdn, o, addnorm, gate_up, swiglu, down, addnorm)
+fn q3_stage_gdn l ulong is_last bool to long
+in_n = add q3_ncva 7 mul mul l 2 mul Q3HIDDEN 4
+post_n = add in_n mul Q3HIDDEN 4
+note 1. ab BF16 GEMV [96 x 5120]
+q3_put64 0 get q3lab l
+q3_put64 2 q3_wbva 0
+q3_put64 4 q3_ncva 1
+r = q3_add_launch Q3KBF16 256 12 1 6 false
+if lt r 0
+ret r
+end
+note 2. mix FP8 GEMV [16384 x 5120], overlapped with ab (both read xq only)
+q3_put64 0 get q3lmix l
+q3_put64 2 q3_wbva 0
+q3_put64 4 q3_wbva 1
+r = q3_add_launch Q3KFP8 256 48 1 6 ne get q3st 9 0
+if lt r 0
+ret r
+end
+note 3. GDN step (conv1d + SiLU + L2norm + recurrent state + RMSNorm + gate)
+q3_put64 0 q3_wbva 1
+q3_put64 2 add q3_wbva 1 mul Q3GDNQKV 4
+q3_put64 4 q3_ncva 1
+q3_put64 6 q3_wbva 3
+q3_put64 8 get q3st 14
+put q3args 10 uint l
+r = q3_add_launch Q3KGDN 256 uint Q3GDNHEADS 1 11 false
+if lt r 0
+ret r
+end
+note 4. o_proj FP8 GEMV [5120 x 6144]
+q3_put64 0 get q3lo l
+q3_put64 2 q3_wbva 3
+q3_put64 4 q3_wbva 4
+r = q3_add_launch Q3KFP8 256 48 1 6 false
+if lt r 0
+ret r
+end
+note 5. ADD|NORM x += o; xq = RMSNorm(x) * post_norm * 2^64
+q3_put64 0 q3_ncva 0
+q3_put64 2 q3_wbva 4
+q3_put64 4 post_n
+q3_put64 6 q3_wbva 0
+put q3args 8 Q3EPSF32
+put q3args 9 Q3SCALE2P64
+r = q3_add_launch Q3KADDNORM 256 1 1 10 false
+if lt r 0
+ret r
+end
+note 6. gate_up FP8 GEMV [34816 x 5120]
+q3_put64 0 get q3lgu l
+q3_put64 2 q3_wbva 0
+q3_put64 4 q3_wbva 5
+r = q3_add_launch Q3KFP8 256 48 1 6 false
+if lt r 0
+ret r
+end
+note 7. SWIGLU act[17408] = silu(gate) * up * 2^64
+q3_put64 0 q3_wbva 5
+q3_put64 2 q3_wbva 6
+put q3args 4 Q3SCALE2P64
+r = q3_add_launch Q3KSWIGLU 256 uint div Q3INTER 256 1 5 false
+if lt r 0
+ret r
+end
+note 8. down FP8 GEMV [5120 x 17408]
+q3_put64 0 get q3ldn l
+q3_put64 2 q3_wbva 6
+q3_put64 4 q3_wbva 4
+r = q3_add_launch Q3KFP8 256 48 1 6 false
+if lt r 0
+ret r
+end
+note 9. ADD|NORM x += o; next in_norm (or final_norm -> hidden)
+nw = add in_n mul mul 2 Q3HIDDEN 4
+yv = q3_wbva 0
+sc = Q3SCALE2P64
+if is_last
+nw = get q3st 13
+yv = q3_ncva 2
+sc = Q3ONEF32
+end
+q3_put64 0 q3_ncva 0
+q3_put64 2 q3_wbva 4
+q3_put64 4 nw
+q3_put64 6 yv
+put q3args 8 Q3EPSF32
+put q3args 9 sc
+ret q3_add_launch Q3KADDNORM 256 1 1 10 false
+end
+
+note Stage one full-attention layer (10 launches: mix, gather, attn256, gate, o, addnorm, gate_up, swiglu, down, addnorm)
+fn q3_stage_attn l ulong kv_pos uint is_last bool to long
+in_n = add q3_ncva 7 mul mul l 2 mul Q3HIDDEN 4
+post_n = add in_n mul Q3HIDDEN 4
+note 1. mix FP8 GEMV [14336 x 5120]
+q3_put64 0 get q3lmix l
+q3_put64 2 q3_wbva 0
+q3_put64 4 q3_wbva 1
+r = q3_add_launch Q3KFP8 256 48 1 6 false
+if lt r 0
+ret r
+end
+note 2. GATHER partial-RoPE permutation (14336 floats)
+q3_put64 0 q3_wbva 1
+q3_put64 2 q3_ncva 10
+q3_put64 4 q3_wbva 2
+r = q3_add_launch Q3KGATHER 256 uint div Q3ATTMIX 256 1 6 false
+if lt r 0
+ret r
+end
+note 3. Decode attention head_dim=256 (grid splits x 4 KV heads)
+splits = div add ulong kv_pos 256 256
+if eq splits 0
+splits = ulong 1
+end
+q3_put64 0 q3_wbva 2
+q3_put64 2 q3_wbva 3
+q3_put64 4 get q3st 15
+put q3args 6 kv_pos
+put q3args 7 uint l
+r = q3_add_launch Q3KATTN 256 uint splits uint Q3KVHEADS 8 false
+if lt r 0
+ret r
+end
+note 4. GATE att *= sigmoid(agg + 8192)
+q3_put64 0 q3_wbva 3
+q3_put64 2 add q3_wbva 2 mul Q3ATTQKV 4
+q3_put64 4 q3_wbva 3
+put q3args 6 uint Q3MOUT
+r = q3_add_launch Q3KGATE 256 uint div Q3MOUT 256 1 7 false
+if lt r 0
+ret r
+end
+note 5. o_proj FP8 GEMV [5120 x 6144]
+q3_put64 0 get q3lo l
+q3_put64 2 q3_wbva 3
+q3_put64 4 q3_wbva 4
+r = q3_add_launch Q3KFP8 256 48 1 6 false
+if lt r 0
+ret r
+end
+note 6. ADD|NORM x += o; xq = RMSNorm(x) * post_norm * 2^64
+q3_put64 0 q3_ncva 0
+q3_put64 2 q3_wbva 4
+q3_put64 4 post_n
+q3_put64 6 q3_wbva 0
+put q3args 8 Q3EPSF32
+put q3args 9 Q3SCALE2P64
+r = q3_add_launch Q3KADDNORM 256 1 1 10 false
+if lt r 0
+ret r
+end
+note 7. gate_up FP8 GEMV [34816 x 5120]
+q3_put64 0 get q3lgu l
+q3_put64 2 q3_wbva 0
+q3_put64 4 q3_wbva 5
+r = q3_add_launch Q3KFP8 256 48 1 6 false
+if lt r 0
+ret r
+end
+note 8. SWIGLU
+q3_put64 0 q3_wbva 5
+q3_put64 2 q3_wbva 6
+put q3args 4 Q3SCALE2P64
+r = q3_add_launch Q3KSWIGLU 256 uint div Q3INTER 256 1 5 false
+if lt r 0
+ret r
+end
+note 9. down FP8 GEMV
+q3_put64 0 get q3ldn l
+q3_put64 2 q3_wbva 6
+q3_put64 4 q3_wbva 4
+r = q3_add_launch Q3KFP8 256 48 1 6 false
+if lt r 0
+ret r
+end
+note 10. ADD|NORM x += o; next in_norm (or final_norm -> hidden)
+nw = add in_n mul mul 2 Q3HIDDEN 4
+yv = q3_wbva 0
+sc = Q3SCALE2P64
+if is_last
+nw = get q3st 13
+yv = q3_ncva 2
+sc = Q3ONEF32
+end
+q3_put64 0 q3_ncva 0
+q3_put64 2 q3_wbva 4
+q3_put64 4 nw
+q3_put64 6 yv
+put q3args 8 Q3EPSF32
+put q3args 9 sc
+ret q3_add_launch Q3KADDNORM 256 1 1 10 false
+end
+
+note Piece 5 <-> Piece 6 contract: q38_stage_step(tok_in, kv_pos, mode).
+note mode=0 (PREFILL): 593 launches (skips lm_head + argmax). mode=1 (DECODE): 596 launches.
+note Writes banks[], qmds[], and 64 KiB PCAS pushbuffer + L2 flush + WFI sem; returns pb_words > 0.
+note Does NOT ring doorbell or poll (Piece 6 owns cbkickbar0 + non-blocking cmpoll).
+fn q38_stage_step tok_in uint kv_pos uint mode uchar to long
+if eq get q3st 0 0
+ret Q3ESTATE
+end
+if or ge ulong tok_in Q3VOCAB ge ulong kv_pos get q3st 5
+ret Q3ERANGE
+end
+if gt mode Q3MODE_DEC
+ret Q3EINVAL
+end
+for m ulong 5
+if eq get q3st add 11 m 0
+ret Q3ESTATE
+end
+end
+for k ulong Q3KCOUNT
+if eq get q3kset k 0
+ret Q3ESTATE
+end
+end
+for l ulong Q3LAYERS
+if eq get q3lset l 0
+ret Q3ESTATE
+end
+end
+note Poison Normal-NC out_tok before staging (Trap #13 unwritten-output guard)
+mmwr32 q3_ncva 6 ulong Q3POISON
+mmwr32 add q3_ncva 6 4 ulong Q3POISON
+note Copy token embedding row [5120] from emb_va + tok_in*20480 into Normal-NC x
+erow = add get q3st 11 mul ulong tok_in mul Q3HIDDEN 4
+if not q3_va_ok erow mul Q3HIDDEN 4
+ret Q3ERANGE
+end
+for i ulong Q3HIDDEN
+mmwr32 add q3_ncva 0 mul i 4 mmrd32 add erow mul i 4
+end
+put q3st 7 0
+put q3st 8 ulong kv_pos
+put q3st 17 ulong mode
+cbpbinit
+r = cbpbsetup18 uint CBCCMP
+if lt r 0
+ret r
+end
+note Initial layer-0 RMSNorm: x -> xq * 2^64
+q3_put64 0 q3_ncva 0
+q3_put64 2 0
+q3_put64 4 q3_ncva 7
+q3_put64 6 q3_wbva 0
+put q3args 8 Q3EPSF32
+put q3args 9 Q3SCALE2P64
+r = q3_add_launch Q3KNORM 256 1 1 10 false
+if lt r 0
+ret r
+end
+note All 64 layers (48 GDN + 16 full attention)
+for l ulong Q3LAYERS
+is_last = eq add l 1 Q3LAYERS
+isatt = and shr get q3st 16 l 1
+if eq isatt 0
+r = q3_stage_gdn l is_last
+else
+r = q3_stage_attn l kv_pos is_last
+end
+if lt r 0
+ret r
+end
+end
+note MODE_DECODE: append lm_head BF16 GEMV + 2-stage ARGMAX writing out_tok
+if eq mode Q3MODE_DEC
+q3_put64 0 get q3st 12
+q3_put64 2 q3_ncva 2
+q3_put64 4 q3_ncva 3
+r = q3_add_launch Q3KBF16 256 48 1 6 false
+if lt r 0
+ret r
+end
+q3_put64 0 q3_ncva 3
+q3_put64 2 0
+q3_put64 4 q3_ncva 4
+q3_put64 6 q3_ncva 5
+r = q3_add_launch Q3KAM0 256 uint Q3AMCTAS 1 8 false
+if lt r 0
+ret r
+end
+q3_put64 0 q3_ncva 4
+q3_put64 2 q3_ncva 5
+q3_put64 4 add q3_ncva 6 4
+q3_put64 6 q3_ncva 6
+r = q3_add_launch Q3KAM1 256 1 1 8 false
+if lt r 0
+ret r
+end
+end
+ret q3_finish_pb
+end
+
+note Piece 5 <-> Piece 6 contract: q38_verify_step(mode).
+note Called by Piece 6 after cmpoll > 0. Checks all staged QMD semaphores == 6,
+note all 16 attention split counters == 0, and (for DECODE) out_tok != poison && < vocab.
+fn q38_verify_step mode uchar to long
+if eq get q3st 0 0
+ret Q3ESTATE
+end
+n = get q3st 7
+if eq n 0
+ret Q3ESTATE
+end
+cpufence
+nc = get q3st 1
+sems = add nc get q3nc 13
+for i ulong n
+if ne mmrd32 add sems mul i 16 ulong Q3SEMDONE
+ret Q3EVERIFY
+end
+end
+cnts = add nc get q3nc 15
+for j ulong Q3ATTNL
+if ne mmrd32 add cnts mul j 16 0
+ret Q3EVERIFY
+end
+end
+if eq mode Q3MODE_DEC
+tok = mmrd32 add nc get q3nc 6
+if or eq tok ulong Q3POISON ge tok Q3VOCAB
+ret Q3EVERIFY
+end
+ret long tok
+end
+ret Q3OK
+end
