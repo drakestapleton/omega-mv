@@ -5,7 +5,12 @@ note Implements:
 note   - Disjoint bare-metal GPU VA map: LPDDR5x [0x00_8000_0000, 0x40_0000_0000),
 note     shader shared window 0x70_0000_0000, shader local window 0x72_0000_0000.
 note   - Sanitized CBANK0 builder (all unpatched NVRM 0x3_*/0x2_* VA words strictly zeroed).
-note   - Blackwell QMD v5 builder (32 KiB shared_bytes cap, SKEDCHECK05 word 37 = 0).
+note   - Blackwell QMD v5 builder (32 KiB shared_bytes cap, SKEDCHECK05 word 37 = 0,
+note     Trap #4 declared = round8(peak + 2) >= 64 and tx * declared <= 65536).
+note   - Exact C-oracle CBANK0 argument layouts for RES (12w), SWIGLU (5w), GATHER (6w), GATE (7w),
+note     ARGMAX (8w), FP8 GEMV (10w), BF16 GEMV (8w), GDN (18w, grid 3x16, smem 5728),
+note     GDN_ZERO (4w, tail + state), and ATTN256 (25w, smem 14896, per-layer ki).
+note   - Strict C3 completion tail: marker1(WFI) -> L2_FLUSH -> marker2(WFI) (17 words).
 note   - Strict Normal-NC (host-touched) vs GPU-cached (chip-only) layout + WB DC CIVAC flush.
 note   - Piece 5 <-> Piece 6 non-blocking contract: q38_reset_kv, q38_stage_step, q38_verify_step.
 note Prefix q3 / Q3.
@@ -27,6 +32,8 @@ const Q3ATTNL ulong 16
 const Q3QHEADS ulong 24
 const Q3KVHEADS ulong 4
 const Q3GDNHEADS ulong 48
+const Q3GDNRATIO ulong 3
+const Q3GDNKEYH ulong 16
 const Q3ROTARY ulong 64
 const Q3VOCAB ulong 248320
 const Q3GDNQKV ulong 10240
@@ -39,12 +46,25 @@ const Q3AMCTAS ulong 122
 const Q3AMSPAN ulong 2048
 const Q3MAXLAUNCH ulong 600
 
+note Exact per-layer byte sizes (src/omega_blackwell_codegen_gdn.h, omega_gpu_decode_attn256_api.h)
+const Q3GDNPARB ulong 164736
+const Q3GDNTAILB ulong 294912
+const Q3GDNSTATB ulong 3145728
+const Q3GDNSMEM uint 5728
+const Q3ATTNSMEM uint 14896
+const Q3BF16SMEM uint 20480
+const Q3ATTNROWB ulong 512
+const Q3ATTNNORMB ulong 2048
+const Q3ATTNPARTMIN ulong 65536
+const Q3ZEROPERCTA ulong 4096
+
 note Step modes: 0 = PREFILL (593 launches, skips lm_head + argmax), 1 = DECODE (596 launches)
 const Q3MODE_PF uchar 0
 const Q3MODE_DEC uchar 1
 
-note Poison / semaphore / QMD constants
+note Poison / semaphore / float bit constants (Wolfram/IEEE-754 verified)
 const Q3POISON uint 4294967295
+const Q3NEGPAD uint 4048155338
 const Q3SEMINIT uint 5
 const Q3SEMDONE uint 6
 const Q3MAXSMEM uint 32768
@@ -52,6 +72,7 @@ const Q3U32MASK ulong 4294967295
 const Q3SCALE2P64 uint 1602224128
 const Q3ONEF32 uint 1065353216
 const Q3EPSF32 uint 897988541
+const Q3QSCALE uint 1035512379
 
 note Disjoint bare-metal GPU VA map (safety #23/#25/#30):
 note LPDDR5x identity range [0x00_8000_0000, 0x40_0000_0000) strictly disjoint from
@@ -61,7 +82,7 @@ const Q3LPDDRHI ulong 274877906944
 const Q3SHWINHI uint 112
 const Q3LMWINHI uint 114
 
-note Kernel table indices (12 static sm_121 SASS code objects)
+note Kernel table indices (14 static sm_121 SASS code objects; distinct FP8 K shapes)
 const Q3KNORM ulong 0
 const Q3KADDNORM ulong 1
 const Q3KSWIGLU ulong 2
@@ -69,19 +90,23 @@ const Q3KGATHER ulong 3
 const Q3KGATE ulong 4
 const Q3KAM0 ulong 5
 const Q3KAM1 ulong 6
-const Q3KFP8 ulong 7
-const Q3KBF16 ulong 8
-const Q3KGDN ulong 9
-const Q3KGDNZERO ulong 10
-const Q3KATTN ulong 11
-const Q3KCOUNT ulong 12
+const Q3KFP8_5120 ulong 7
+const Q3KFP8_6144 ulong 8
+const Q3KFP8_17408 ulong 9
+const Q3KBF16_5120 ulong 10
+const Q3KGDN ulong 11
+const Q3KGDNZERO ulong 12
+const Q3KATTN ulong 13
+const Q3KCOUNT ulong 14
 
 note Runtime state arrays
 note q3st: 0=init, 1=nc_base, 2=wb_base, 3=pb_pa, 4=marker_va, 5=max_ctx,
 note       6=sem_seq, 7=staged_n, 8=kv_pos, 9=overlap_ab, 10=wb_flushes,
-note       11=emb_va, 12=lm_va, 13=fnorm_va, 14=gdn_st_va, 15=attn_kv_va,
-note       16=attn_mask, 17=last_mode, 18=cur_gy, 19=cur_elems
-global q3st ulong 24
+note       11=emb_va, 12=lm_va, 13=fnorm_va, 14=gdn_par_va, 15=gdn_tail_va,
+note       16=gdn_state_va, 17=attn_kv_va, 18=attn_rope_va, 19=attn_norms_va,
+note       20=attn_part_va, 21=attn_mask, 22=last_mode, 23=cur_gy,
+note       24=gdn_bound, 25=attn_bound, 26=model_bound
+global q3st ulong 32
 note Normal-NC layout offsets from nc_base (all 256-byte aligned):
 note 0=x, 1=ab, 2=hidden, 3=logits, 4=am_v, 5=am_i, 6=out_tok, 7=norms,
 note 8=fnorm, 9=tabs, 10=gtab, 11=banks, 12=qmds, 13=sems, 14=scratch,
@@ -90,20 +115,18 @@ global q3nc ulong 20
 note GPU-cached (WB) layout offsets from wb_base (all 256-byte aligned):
 note 0=xq, 1=mix, 2=agg, 3=att, 4=o, 5=gu, 6=act, 7=wb_total
 global q3wb ulong 12
-note Compiled sm_121 SASS kernel table: code_va, gpr, smem, bound(1)
-global q3kcode ulong 12
-global q3kgpr uint 12
-global q3ksmem uint 12
-global q3kset uchar 12
-note Per-layer weight VAs (64 layers): mix, o, gate_up, down, ab, set(1)
-global q3lmix ulong 64
-global q3lo ulong 64
-global q3lgu ulong 64
-global q3ldn ulong 64
+note Compiled sm_121 SASS kernel table: code_va, peak_gpr, smem, warps, rows, bound(1)
+global q3kcode ulong 14
+global q3kgpr uint 14
+global q3ksmem uint 14
+global q3kwarps uint 14
+global q3krows uint 14
+global q3kset uchar 14
+note Per-layer weight metadata (64 layers): ab_va (GDN), set_mask (bit 0=fp8, bit 1=mlp)
 global q3lab ulong 64
 global q3lset uchar 64
-note Scratch argument buffer for per-launch CBANK0 args (at +0x380, up to 16 u32 words)
-global q3args uint 16
+note Scratch argument buffer for per-launch CBANK0 args (0x380..0x3ff, up to 32 u32 words)
+global q3args uint 32
 
 fn q3al256 v ulong to ulong
 ret and add v 255 18446744073709551360
@@ -115,6 +138,14 @@ end
 
 fn q3hi32 v ulong to uint
 ret uint shr v 32
+end
+
+fn q3_ncva idx ulong to ulong
+ret add get q3st 1 get q3nc idx
+end
+
+fn q3_wbva idx ulong to ulong
+ret add get q3st 2 get q3wb idx
 end
 
 note Validate that [va, va + sz) lies strictly inside the bare-metal LPDDR5x VA window,
@@ -130,6 +161,19 @@ if gt sz sub Q3LPDDRHI va
 ret false
 end
 ret true
+end
+
+fn q3_disjoint a ulong asz ulong b ulong bsz ulong to bool
+ret or le add a asz b le add b bsz a
+end
+
+note Blackwell Trap #4: declared GPRs >= peak + 2, rounded up to 8, minimum 64 (omega_blackwell_codegen.c:2854).
+fn q3_gpr_declared peak uint to uint
+d = mul div add add peak 2 7 8 8
+if lt d 64
+d = uint 64
+end
+ret d
 end
 
 note Flush CPU Normal-WB range [pa, pa + nbytes) to PoC via DC CIVAC + DSB SY before GPU read.
@@ -158,7 +202,7 @@ end
 ret i
 end
 
-note Single gather slot index for q3_gather_table (keeps register count low)
+note Single gather slot index for q3_gather_table
 fn q3_gather_slot n ulong qh ulong kvh ulong to ulong
 qn = mul qh 256
 if lt n qn
@@ -209,8 +253,9 @@ mmwr32 add bank_va mul idx 4 ulong val
 end
 
 note Write sanitized 224-word bare-metal CBANK0 to Normal-NC bank_va.
-note Zeroes all 224 words first so NO NVRM 0x3_*/0x2_* VA words ([0..1],[70..71],[82..83],[126..127],[166..167])
-note survive. Sets disjoint shader windows [64..65]=0x70_0000_0000 and [66..67]=0x72_0000_0000 (LE).
+note Zeroes all 256 words (1024 B) first so NO NVRM 0x3_*/0x2_* VA words
+note ([0..1],[70..71],[82..83],[126..127],[166..167]) survive.
+note Sets disjoint shader windows [64..65]=0x70_0000_0000 and [66..67]=0x72_0000_0000 (LE).
 fn q3_cbank0_write bank_va ulong tx uint ty uint gx uint gy uint to long
 if not q3_va_ok bank_va 1024
 ret Q3ERANGE
@@ -218,15 +263,11 @@ end
 for i ulong 256
 q3bw bank_va i 0
 end
-note Architectural non-VA constants from empirical GB10 CBANK0 template
 q3bw bank_va 62 1048575
-note Disjoint shader shared memory window: 0x70_0000_0000 (LE lo, hi)
 q3bw bank_va 64 0
 q3bw bank_va 65 Q3SHWINHI
-note Disjoint shader local memory window: 0x72_0000_0000 (LE lo, hi)
 q3bw bank_va 66 0
 q3bw bank_va 67 Q3LMWINHI
-note Self CBANK0 VA (LE lo, hi)
 q3bw bank_va 68 q3lo32 bank_va
 q3bw bank_va 69 q3hi32 bank_va
 q3bw bank_va 80 1
@@ -265,14 +306,12 @@ q3bw bank_va 185 59840
 q3bw bank_va 189 59840
 q3bw bank_va 190 16777216
 q3bw bank_va 191 59839
-note Argument window pointers: bank_va + 0x380 (896) and bank_va + 0x39c (924) (LE lo, hi)
 a0 = add bank_va 896
 a1 = add bank_va 924
 q3bw bank_va 210 q3lo32 a0
 q3bw bank_va 211 q3hi32 a0
 q3bw bank_va 212 q3lo32 a1
 q3bw bank_va 213 q3hi32 a1
-note CTA and grid dimensions at words 216..223
 q3bw bank_va 216 tx
 q3bw bank_va 217 ty
 q3bw bank_va 218 1
@@ -283,9 +322,9 @@ q3bw bank_va 223 16776640
 ret Q3OK
 end
 
-note Write nargs (1..16) kernel argument words from q3args[] to bank_va + 0x380
+note Write nargs (1..32) kernel argument words from q3args[] to bank_va + 0x380..0x3ff
 fn q3_args_write bank_va ulong nargs ulong to long
-if or eq nargs 0 gt nargs 16
+if or eq nargs 0 gt nargs 32
 ret Q3ERANGE
 end
 for i ulong nargs
@@ -299,25 +338,17 @@ fn q3_qmd1_head qmd_va ulong sem_va ulong code_va ulong to void
 for i ulong 96
 mmwr32 add qmd_va mul i 4 0
 end
-note Word 4: QMD_GROUP_ID=0x3f, QMD_TYPE=2 (GRID_CTA)
 mmwr32 add qmd_va 16 20905984
-note Word 9: RELEASE_ENABLE=1, RELEASE_STRUCTURE_SIZE=1 (ONE_WORD)
 mmwr32 add qmd_va 36 3
-note Word 14: QMD_VERSION=5, SASS_VERSION=0xa4, SAMPLER=1, cache invalidation flags
 mmwr32 add qmd_va 56 793772964
-note Words 15-17: RELEASE_SEMAPHORE0 writes 6 (Q3SEMDONE) to sem_va
 mmwr32 add qmd_va 60 ulong q3lo32 sem_va
 mmwr32 add qmd_va 64 ulong q3hi32 sem_va
 mmwr32 add qmd_va 68 ulong Q3SEMDONE
-note Word 19: CWD_MEMBAR_TYPE=1, FREE_CTA_SLOTS=24, PRE_EXIT=1
 mmwr32 add qmd_va 76 2172715008
-note Words 20, 22: ARRIVE_AT_LATCH (ID 56, VALID=1)
 mmwr32 add qmd_va 80 56
 mmwr32 add qmd_va 88 67108864
-note Words 32-33: PROGRAM_ADDRESS (code_va >> 4) + prefetch 0xa << 21
 mmwr32 add qmd_va 128 ulong q3lo32 shr code_va 4
 mmwr32 add qmd_va 132 or and shr code_va 36 2097151 20971520
-note Word 59: PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED8 = code_va >> 8
 mmwr32 add qmd_va 236 ulong q3lo32 shr code_va 8
 end
 
@@ -336,8 +367,9 @@ mmwr32 add qmd_va 232 271581201
 end
 
 note Write 96-dword Blackwell QMD v5 to Normal-NC qmd_va for launch slot.
-note Enforces shared_bytes <= 32768 (bw_qmd.om:104), SKEDCHECK05 word 37 = 0, sem release = 6.
-fn q3_qmd1_write slot ulong code_va ulong gpr uint smem uint tx uint gx uint to long
+note Enforces: shared_bytes <= 32768 (bw_qmd.om:104), SKEDCHECK05 word 37 = 0,
+note Trap #4 declared = round8(peak + 2) >= 64, and tx * declared <= 65536.
+fn q3_qmd1_write slot ulong code_va ulong peak_gpr uint smem uint tx uint gx uint to long
 if ge slot Q3MAXLAUNCH
 ret Q3ERANGE
 end
@@ -350,14 +382,13 @@ end
 if not q3_va_ok code_va 256
 ret Q3ERANGE
 end
+g = q3_gpr_declared peak_gpr
+if gt mul ulong tx ulong g 65536
+ret Q3ERANGE
+end
 qmd_va = add q3_ncva 12 mul slot 512
 q3_qmd1_head qmd_va add q3_ncva 13 mul slot 16 code_va
 q3_qmd1_cbs qmd_va add q3_ncva 11 mul slot 1024 q3_ncva 14
-g = gpr
-if lt g 64
-g = uint 64
-end
-g = mul div add g 7 8 8
 mmwr32 add qmd_va 136 or and ulong tx 65535 shl ulong 1 16
 mmwr32 add qmd_va 140 or or ulong 1 shl and ulong g 511 8 131072
 s7 = ulong 8
@@ -366,7 +397,7 @@ s7 = div add ulong smem 127 128
 end
 mmwr32 add qmd_va 144 or 78923776 s7
 mmwr32 add qmd_va 148 0
-gy = get q3st 18
+gy = get q3st 23
 if eq gy 0
 gy = ulong 1
 end
@@ -430,11 +461,33 @@ w = q3al256 add w mul Q3INTER 4
 put q3wb 7 w
 end
 
-fn q3_disjoint a ulong asz ulong b ulong bsz ulong to bool
-ret or le add a asz b le add b bsz a
+note Populate Normal-NC init buffers: gtab, logits tail NEG_PAD, am_v NEG_PAD, scratch=0, attn_cnts=0.
+fn q3_init_nc_bufs to void
+gtv = q3_ncva 10
+for n ulong Q3ATTMIX
+mmwr32 add gtv mul n 4 q3_gather_slot n Q3QHEADS Q3KVHEADS
+end
+lgt = q3_ncva 3
+ltot = mul Q3AMCTAS Q3AMSPAN
+for i ulong sub ltot Q3VOCAB
+mmwr32 add lgt mul add Q3VOCAB i 4 ulong Q3NEGPAD
+end
+amv = q3_ncva 4
+for i ulong Q3AMSPAN
+mmwr32 add amv mul i 4 ulong Q3NEGPAD
+end
+scr = q3_ncva 14
+for i ulong 4096
+mmwr32 add scr mul i 4 0
+end
+cnts = q3_ncva 15
+for i ulong mul Q3ATTNL 4
+mmwr32 add cnts mul i 4 0
+end
 end
 
 note Initialize Q38 bare-metal runtime with disjoint Normal-NC and GPU-cached LPDDR5x pools.
+note Enforces max_ctx % 256 == 0 (OMEGA_DATTN256_CHUNK).
 fn q3_init nc_base ulong wb_base ulong pb_pa ulong marker_va ulong max_ctx ulong to long
 q3_layout_init
 ncsz = get q3nc 16
@@ -469,8 +522,11 @@ end
 if not q3_disjoint pb_pa 65536 marker_va 4096
 ret Q3EINVAL
 end
-if or eq max_ctx 0 gt max_ctx 262144
+if or eq max_ctx 0 or gt max_ctx 262144 ne rem max_ctx 256 0
 ret Q3EINVAL
+end
+for i ulong 32
+put q3st i 0
 end
 put q3st 0 1
 put q3st 1 nc_base
@@ -478,24 +534,24 @@ put q3st 2 wb_base
 put q3st 3 pb_pa
 put q3st 4 marker_va
 put q3st 5 max_ctx
-put q3st 6 0
-put q3st 7 0
-put q3st 8 0
 put q3st 9 1
-put q3st 10 0
 note Default Qwen3.8-27B attention mask: every 4th layer (bits 3,7,11,...,63)
-put q3st 16 9838263505978427528
+put q3st 21 9838263505978427528
 for i ulong Q3KCOUNT
 put q3kset i 0
+put q3kwarps i 8
+put q3krows i 4
 end
 for i ulong Q3LAYERS
 put q3lset i 0
+put q3lab i 0
 end
+q3_init_nc_bufs
 ret Q3OK
 end
 
-note Bind compiled sm_121 SASS kernel code object (must reside in LPDDR5x VA window, smem <= 32 KiB)
-fn q3_set_code kind ulong code_va ulong gpr uint smem uint to long
+note Bind compiled sm_121 SASS kernel code object (peak_gpr checked against Trap #4, smem <= 32 KiB)
+fn q3_set_code kind ulong code_va ulong peak_gpr uint smem uint to long
 if or eq get q3st 0 0 ge kind Q3KCOUNT
 ret Q3EINVAL
 end
@@ -505,33 +561,93 @@ end
 if not q3_va_ok code_va 256
 ret Q3ERANGE
 end
+d = q3_gpr_declared peak_gpr
+if gt mul ulong 256 ulong d 65536
+ret Q3ERANGE
+end
 put q3kcode kind code_va
-put q3kgpr kind gpr
+put q3kgpr kind peak_gpr
 put q3ksmem kind smem
 put q3kset kind 1
 ret Q3OK
 end
 
-note Bind per-layer weight VAs (mix, o, gate_up, down, ab; ab=0 on attention layers)
-fn q3_set_layer l ulong mix_va ulong o_va ulong gu_va ulong dn_va ulong ab_va ulong to long
+note Configure GEMV warp/row geometry for FP8/BF16 kernel kinds (must match compiled SASS)
+fn q3_set_gemv_shape kind ulong warps uint rows uint to long
+if or eq get q3st 0 0 ge kind Q3KCOUNT
+ret Q3EINVAL
+end
+if or eq warps 0 or gt warps 32 or eq rows 0 gt rows 16
+ret Q3EINVAL
+end
+put q3kwarps kind warps
+put q3krows kind rows
+ret Q3OK
+end
+
+note Write one {u64 w_va, u64 s_va} entry into Normal-NC tabs (q3_ncva 9 + l*64 + slot*16)
+fn q3_put_tab l ulong slot ulong w_va ulong s_va ulong to void
+base = add add q3_ncva 9 mul l 64 mul slot 16
+mmwr32 base ulong q3lo32 w_va
+mmwr32 add base 4 ulong q3hi32 w_va
+mmwr32 add base 8 ulong q3lo32 s_va
+mmwr32 add base 12 ulong q3hi32 s_va
+end
+
+note Bind per-layer attention/GDN mix and o_proj FP8 {w_va, s_va} tables
+fn q3_set_layer_fp8 l ulong mix_w ulong mix_s ulong o_w ulong o_s ulong to long
 if or eq get q3st 0 0 ge l Q3LAYERS
 ret Q3EINVAL
 end
-if not q3_va_ok mix_va 256
+isatt = and shr get q3st 21 l 1
+mix_n = Q3GDNMIX
+if ne isatt 0
+mix_n = Q3ATTMIX
+end
+if not q3_va_ok mix_w mul mix_n Q3HIDDEN
 ret Q3ERANGE
 end
-if not q3_va_ok o_va 256
+if not q3_va_ok mix_s mul mul div mix_n 128 div Q3HIDDEN 128 4
 ret Q3ERANGE
 end
-if not q3_va_ok gu_va 256
+if not q3_va_ok o_w mul Q3HIDDEN Q3MOUT
 ret Q3ERANGE
 end
-if not q3_va_ok dn_va 256
+if not q3_va_ok o_s mul mul div Q3HIDDEN 128 div Q3MOUT 128 4
 ret Q3ERANGE
 end
-isatt = and shr get q3st 16 l 1
+q3_put_tab l 0 mix_w mix_s
+q3_put_tab l 1 o_w o_s
+put q3lset l or get q3lset l 1
+ret Q3OK
+end
+
+const Q3GUWB ulong 178257920
+const Q3GUSB ulong 43520
+const Q3DNWB ulong 89128960
+const Q3DNSB ulong 21760
+const Q3ABWB ulong 983040
+
+note Bind per-layer MLP gate_up & down FP8 {w_va, s_va} tables plus GDN ab BF16 VA (0 on attn)
+fn q3_set_layer_mlp l ulong gu_w ulong gu_s ulong dn_w ulong dn_s ulong ab_va ulong to long
+if or eq get q3st 0 0 ge l Q3LAYERS
+ret Q3EINVAL
+end
+if not q3_va_ok gu_w Q3GUWB
+ret Q3ERANGE
+end
+if not q3_va_ok gu_s Q3GUSB
+ret Q3ERANGE
+end
+if not q3_va_ok dn_w Q3DNWB
+ret Q3ERANGE
+end
+if not q3_va_ok dn_s Q3DNSB
+ret Q3ERANGE
+end
+isatt = and shr get q3st 21 l 1
 if eq isatt 0
-if not q3_va_ok ab_va 256
+if not q3_va_ok ab_va Q3ABWB
 ret Q3ERANGE
 end
 else
@@ -539,40 +655,79 @@ if ne ab_va 0
 ret Q3EINVAL
 end
 end
-put q3lmix l mix_va
-put q3lo l o_va
-put q3lgu l gu_va
-put q3ldn l dn_va
+q3_put_tab l 2 gu_w gu_s
+q3_put_tab l 3 dn_w dn_s
 put q3lab l ab_va
-put q3lset l 1
+put q3lset l or get q3lset l 2
 ret Q3OK
 end
 
-note Bind model-level embedding, lm_head, final norm, GDN state pool, and attention KV pool VAs
-fn q3_set_model emb_va ulong lm_va ulong fnorm_va ulong gdn_st_va ulong attn_kv_va ulong to long
+note Bind model-level embedding, BF16 lm_head, and final norm VAs (full byte sizes validated)
+fn q3_set_model emb_va ulong lm_va ulong fnorm_va ulong to long
 if eq get q3st 0 0
 ret Q3ESTATE
 end
-if not q3_va_ok emb_va 256
+if not q3_va_ok emb_va mul Q3VOCAB mul Q3HIDDEN 4
 ret Q3ERANGE
 end
-if not q3_va_ok lm_va 256
+if not q3_va_ok lm_va mul Q3VOCAB mul Q3HIDDEN 2
 ret Q3ERANGE
 end
-if not q3_va_ok fnorm_va 256
-ret Q3ERANGE
-end
-if not q3_va_ok gdn_st_va 256
-ret Q3ERANGE
-end
-if not q3_va_ok attn_kv_va 256
+if not q3_va_ok fnorm_va mul Q3HIDDEN 4
 ret Q3ERANGE
 end
 put q3st 11 emb_va
 put q3st 12 lm_va
 put q3st 13 fnorm_va
-put q3st 14 gdn_st_va
-put q3st 15 attn_kv_va
+put q3st 26 1
+ret Q3OK
+end
+
+note Bind 48-layer GDN parameter, conv-tail, and recurrent-state pools (full byte sizes validated)
+fn q3_set_gdn_pools par_va ulong tail_va ulong state_va ulong to long
+if eq get q3st 0 0
+ret Q3ESTATE
+end
+if not q3_va_ok par_va mul Q3GDNL Q3GDNPARB
+ret Q3ERANGE
+end
+if not q3_va_ok tail_va mul Q3GDNL Q3GDNTAILB
+ret Q3ERANGE
+end
+if not q3_va_ok state_va mul Q3GDNL Q3GDNSTATB
+ret Q3ERANGE
+end
+put q3st 14 par_va
+put q3st 15 tail_va
+put q3st 16 state_va
+put q3st 24 1
+ret Q3OK
+end
+
+note Bind 16-layer attention KV cache, RoPE table, Q/K norms, and split-K partials pools
+fn q3_set_attn_pools kv_va ulong rope_va ulong norms_va ulong part_va ulong to long
+if eq get q3st 0 0
+ret Q3ESTATE
+end
+mctx = get q3st 5
+plane = mul mul Q3KVHEADS mctx Q3ATTNROWB
+if not q3_va_ok kv_va mul mul Q3ATTNL 2 plane
+ret Q3ERANGE
+end
+if not q3_va_ok rope_va mul mctx 1024
+ret Q3ERANGE
+end
+if not q3_va_ok norms_va mul Q3ATTNL Q3ATTNNORMB
+ret Q3ERANGE
+end
+if not q3_va_ok part_va Q3ATTNPARTMIN
+ret Q3ERANGE
+end
+put q3st 17 kv_va
+put q3st 18 rope_va
+put q3st 19 norms_va
+put q3st 20 part_va
+put q3st 25 1
 ret Q3OK
 end
 
@@ -601,7 +756,7 @@ r = q3_args_write bank_va nargs
 if lt r 0
 ret r
 end
-put q3st 18 ulong gy
+put q3st 23 ulong gy
 r = q3_qmd1_write slot get q3kcode kind get q3kgpr kind get q3ksmem kind tx gx
 if lt r 0
 ret r
@@ -624,120 +779,201 @@ put q3st 7 add slot 1
 ret Q3OK
 end
 
-note Append final L2 flush + WFI host semaphore and flush PB to pb_pa (with DSB SY).
+note Exact C3 completion tail (src/omega_gpu_cmdlist.c:243-253, 17 words):
+note   1. marker1 at marker_va (RELEASE_WFI = 0x100001) -> drains subc 1 compute before L2 flush
+note   2. cbpbl2flush (subc 0 mem-op 0x0028) -> flushes dirty GPU L2 lines to DRAM
+note   3. marker2 at marker_va + 0x10 (RELEASE_WFI = 0x100001) -> host-polled completion
+note Then flushes staged PB to pb_pa with DSB SY.
 fn q3_finish_pb to long
+seq = add get q3st 6 1
+put q3st 6 seq
+mva = get q3st 4
+r = cbpbsem mva q3lo32 seq true
+if lt r 0
+ret r
+end
 r = cbpbl2flush
 if lt r 0
 ret r
 end
-seq = add get q3st 6 1
-put q3st 6 seq
-r = cbpbsem get q3st 4 q3lo32 seq true
+r = cbpbsem add mva 16 q3lo32 seq true
 if lt r 0
 ret r
 end
 ret cbpbflush get q3st 3
 end
 
+note Exact 12-word RES launch (omega_blackwell_codegen_dec.h:85-92):
+note X(0..1), A(2..3), W=0(4..5), NW(6..7), Y(8..9), EPS(10), SCALE(11)
+fn q3_launch_res kind ulong x_va ulong a_va ulong nw_va ulong y_va ulong sc uint to long
+q3_put64 0 x_va
+q3_put64 2 a_va
+q3_put64 4 0
+q3_put64 6 nw_va
+q3_put64 8 y_va
+put q3args 10 Q3EPSF32
+put q3args 11 sc
+ret q3_add_launch kind 256 1 1 12 false
+end
+
+note Exact 10-word FP8 GEMV launch (omega_gpu_fp8_api.c:473-495):
+note tab_va(0..1), x_va(2..3), y_va(4..5), RG(6), x_stride=0(7), y_stride=N*4(8), gx*warps(9)
+fn q3_launch_fp8 kind ulong tab_va ulong x_va ulong y_va ulong n_rows ulong indep bool to long
+w = ulong get q3kwarps kind
+rw = ulong get q3krows kind
+if or eq w 0 or eq rw 0 ne rem n_rows rw 0
+ret Q3EINVAL
+end
+rg = div n_rows rw
+gx = div add rg sub w 1 w
+if gt gx 384
+gx = ulong 384
+end
+if eq gx 0
+gx = ulong 1
+end
+q3_put64 0 tab_va
+q3_put64 2 x_va
+q3_put64 4 y_va
+put q3args 6 uint rg
+put q3args 7 0
+put q3args 8 uint mul n_rows 4
+put q3args 9 uint mul gx w
+ret q3_add_launch kind uint mul 32 w uint gx 1 10 indep
+end
+
+note Exact 8-word BF16 GEMV launch (omega_gpu_bf16_gemv_api.c:273-295):
+note w_va(0..1), x_va(2..3), y_va(4..5), RG(6), gx*warps(7)
+fn q3_launch_bf16 w_va ulong x_va ulong y_va ulong n_rows ulong to long
+w = ulong get q3kwarps Q3KBF16_5120
+rw = ulong get q3krows Q3KBF16_5120
+if or eq w 0 or eq rw 0 ne rem n_rows rw 0
+ret Q3EINVAL
+end
+rg = div n_rows rw
+gx = div add rg sub w 1 w
+if gt gx 256
+gx = ulong 256
+end
+if eq gx 0
+gx = ulong 1
+end
+q3_put64 0 w_va
+q3_put64 2 x_va
+q3_put64 4 y_va
+put q3args 6 uint rg
+put q3args 7 uint mul gx w
+ret q3_add_launch Q3KBF16_5120 uint mul 32 w uint gx 1 8 false
+end
+
 note Piece 5 <-> Piece 6 contract: q38_reset_kv(keep_pos).
 note keep_pos > 0 returns -2 (Q3EUNSUP: GDN recurrent state cannot rewind without snapshots).
-note keep_pos == 0 stages GPU-side cg_gdn.om state-zero launch + L2 flush + WFI sem,
-note returning pb_words > 0 for Piece 6 to kick & poll (never zeros GPU-cached GDN state from CPU).
+note keep_pos == 0 resets attn_cnts=0, stages TWO GPU-side KK_ZERO launches (omega_gpu_gdn_api.c:331-358):
+note   launch 0: zero all 48 GDN conv tails (14,155,776 B, grid_x = 3456)
+note   launch 1: zero all 48 GDN recurrent states (150,994,944 B, grid_x = 36864)
+note followed by C3 tail (marker1 WFI -> L2 flush -> marker2 WFI), returning pb_words > 0.
 fn q38_reset_kv keep_pos ulong to long
-if eq get q3st 0 0
+if or eq get q3st 0 0 eq get q3st 24 0
 ret Q3ESTATE
 end
 if gt keep_pos 0
 ret Q3EUNSUP
 end
-if or eq get q3kset Q3KGDNZERO 0 eq get q3st 14 0
+if eq get q3kset Q3KGDNZERO 0
 ret Q3ESTATE
+end
+cnts = q3_ncva 15
+for i ulong mul Q3ATTNL 4
+mmwr32 add cnts mul i 4 0
 end
 put q3st 8 0
 put q3st 7 0
-put q3st 17 ulong Q3MODE_PF
+put q3st 22 ulong Q3MODE_PF
 cbpbinit
 r = cbpbsetup18 uint CBCCMP
 if lt r 0
 ret r
 end
-q3_put64 0 get q3st 14
-put q3args 2 uint Q3GDNL
-put q3args 3 0
-r = q3_add_launch Q3KGDNZERO 256 uint Q3GDNL 1 4 false
+note KK_ZERO launch 0: {src=0, dst=gdn_tail_va}, grid_x = 48 * 294912 / 4096 = 3456
+q3_put64 0 0
+q3_put64 2 get q3st 15
+r = q3_add_launch Q3KGDNZERO 256 uint div mul Q3GDNL Q3GDNTAILB Q3ZEROPERCTA 1 4 false
+if lt r 0
+ret r
+end
+note KK_ZERO launch 1: {src=0, dst=gdn_state_va}, grid_x = 48 * 3145728 / 4096 = 36864
+q3_put64 0 0
+q3_put64 2 get q3st 16
+r = q3_add_launch Q3KGDNZERO 256 uint div mul Q3GDNL Q3GDNSTATB Q3ZEROPERCTA 1 4 false
 if lt r 0
 ret r
 end
 ret q3_finish_pb
 end
 
-fn q3_ncva idx ulong to ulong
-ret add get q3st 1 get q3nc idx
-end
-
-fn q3_wbva idx ulong to ulong
-ret add get q3st 2 get q3wb idx
-end
-
-note Stage one GDN layer (9 launches: ab, mix[overlap], gdn, o, addnorm, gate_up, swiglu, down, addnorm)
-fn q3_stage_gdn l ulong is_last bool to long
-in_n = add q3_ncva 7 mul mul l 2 mul Q3HIDDEN 4
-post_n = add in_n mul Q3HIDDEN 4
-note 1. ab BF16 GEMV [96 x 5120]
-q3_put64 0 get q3lab l
-q3_put64 2 q3_wbva 0
-q3_put64 4 q3_ncva 1
-r = q3_add_launch Q3KBF16 256 12 1 6 false
-if lt r 0
-ret r
-end
-note 2. mix FP8 GEMV [16384 x 5120], overlapped with ab (both read xq only)
-q3_put64 0 get q3lmix l
-q3_put64 2 q3_wbva 0
-q3_put64 4 q3_wbva 1
-r = q3_add_launch Q3KFP8 256 48 1 6 ne get q3st 9 0
-if lt r 0
-ret r
-end
-note 3. GDN step (conv1d + SiLU + L2norm + recurrent state + RMSNorm + gate)
+note Exact 18-word GDN decode launch (omega_gpu_gdn_api.c:392-412, grid_x=3, grid_y=16, smem=5728)
+fn q3_launch_gdn gi ulong to long
 q3_put64 0 q3_wbva 1
 q3_put64 2 add q3_wbva 1 mul Q3GDNQKV 4
 q3_put64 4 q3_ncva 1
-q3_put64 6 q3_wbva 3
-q3_put64 8 get q3st 14
-put q3args 10 uint l
-r = q3_add_launch Q3KGDN 256 uint Q3GDNHEADS 1 11 false
+q3_put64 6 add get q3st 14 mul gi Q3GDNPARB
+q3_put64 8 add get q3st 15 mul gi Q3GDNTAILB
+q3_put64 10 add get q3st 16 mul gi Q3GDNSTATB
+q3_put64 12 q3_wbva 3
+put q3args 14 Q3EPSF32
+put q3args 15 Q3EPSF32
+put q3args 16 Q3ONEF32
+put q3args 17 Q3SCALE2P64
+ret q3_add_launch Q3KGDN 256 uint Q3GDNRATIO uint Q3GDNKEYH 18 false
+end
+
+note Exact 25-word ATTN256 decode launch (omega_gpu_decode_attn256_api.c:212-234, smem=14896)
+fn q3_launch_attn ki ulong kv_pos uint to long
+mctx = get q3st 5
+plane = mul mul Q3KVHEADS mctx Q3ATTNROWB
+kc = add get q3st 17 mul mul ki 2 plane
+vc = add kc plane
+nm = add get q3st 19 mul ki Q3ATTNNORMB
+splits = div add ulong kv_pos 256 256
+if eq splits 0
+splits = ulong 1
+end
+q3_put64 0 q3_wbva 2
+q3_put64 2 kc
+q3_put64 4 vc
+q3_put64 6 get q3st 18
+q3_put64 8 nm
+q3_put64 10 add nm 1024
+q3_put64 12 q3_wbva 3
+q3_put64 14 get q3st 20
+q3_put64 16 q3_ncva 15
+put q3args 18 kv_pos
+put q3args 19 256
+put q3args 20 uint splits
+put q3args 21 uint mul mctx Q3ATTNROWB
+put q3args 22 Q3EPSF32
+put q3args 23 Q3SCALE2P64
+put q3args 24 Q3QSCALE
+ret q3_add_launch Q3KATTN 256 uint splits uint Q3KVHEADS 25 false
+end
+
+note Shared layer tail: o_proj -> ADD|NORM -> gate_up -> SWIGLU -> down -> ADD|NORM (6 launches)
+fn q3_stage_mlp l ulong is_last bool to long
+tab = add q3_ncva 9 mul l 64
+in_n = add q3_ncva 7 mul mul l 2 mul Q3HIDDEN 4
+post_n = add in_n mul Q3HIDDEN 4
+r = q3_launch_fp8 Q3KFP8_6144 add tab 16 q3_wbva 3 q3_wbva 4 Q3HIDDEN false
 if lt r 0
 ret r
 end
-note 4. o_proj FP8 GEMV [5120 x 6144]
-q3_put64 0 get q3lo l
-q3_put64 2 q3_wbva 3
-q3_put64 4 q3_wbva 4
-r = q3_add_launch Q3KFP8 256 48 1 6 false
+r = q3_launch_res Q3KADDNORM q3_ncva 0 q3_wbva 4 post_n q3_wbva 0 Q3SCALE2P64
 if lt r 0
 ret r
 end
-note 5. ADD|NORM x += o; xq = RMSNorm(x) * post_norm * 2^64
-q3_put64 0 q3_ncva 0
-q3_put64 2 q3_wbva 4
-q3_put64 4 post_n
-q3_put64 6 q3_wbva 0
-put q3args 8 Q3EPSF32
-put q3args 9 Q3SCALE2P64
-r = q3_add_launch Q3KADDNORM 256 1 1 10 false
+r = q3_launch_fp8 Q3KFP8_5120 add tab 32 q3_wbva 0 q3_wbva 5 mul 2 Q3INTER false
 if lt r 0
 ret r
 end
-note 6. gate_up FP8 GEMV [34816 x 5120]
-q3_put64 0 get q3lgu l
-q3_put64 2 q3_wbva 0
-q3_put64 4 q3_wbva 5
-r = q3_add_launch Q3KFP8 256 48 1 6 false
-if lt r 0
-ret r
-end
-note 7. SWIGLU act[17408] = silu(gate) * up * 2^64
 q3_put64 0 q3_wbva 5
 q3_put64 2 q3_wbva 6
 put q3args 4 Q3SCALE2P64
@@ -745,15 +981,10 @@ r = q3_add_launch Q3KSWIGLU 256 uint div Q3INTER 256 1 5 false
 if lt r 0
 ret r
 end
-note 8. down FP8 GEMV [5120 x 17408]
-q3_put64 0 get q3ldn l
-q3_put64 2 q3_wbva 6
-q3_put64 4 q3_wbva 4
-r = q3_add_launch Q3KFP8 256 48 1 6 false
+r = q3_launch_fp8 Q3KFP8_17408 add tab 48 q3_wbva 6 q3_wbva 4 Q3HIDDEN false
 if lt r 0
 ret r
 end
-note 9. ADD|NORM x += o; next in_norm (or final_norm -> hidden)
 nw = add in_n mul mul 2 Q3HIDDEN 4
 yv = q3_wbva 0
 sc = Q3SCALE2P64
@@ -762,28 +993,34 @@ nw = get q3st 13
 yv = q3_ncva 2
 sc = Q3ONEF32
 end
-q3_put64 0 q3_ncva 0
-q3_put64 2 q3_wbva 4
-q3_put64 4 nw
-q3_put64 6 yv
-put q3args 8 Q3EPSF32
-put q3args 9 sc
-ret q3_add_launch Q3KADDNORM 256 1 1 10 false
+ret q3_launch_res Q3KADDNORM q3_ncva 0 q3_wbva 4 nw yv sc
 end
 
-note Stage one full-attention layer (10 launches: mix, gather, attn256, gate, o, addnorm, gate_up, swiglu, down, addnorm)
-fn q3_stage_attn l ulong kv_pos uint is_last bool to long
-in_n = add q3_ncva 7 mul mul l 2 mul Q3HIDDEN 4
-post_n = add in_n mul Q3HIDDEN 4
-note 1. mix FP8 GEMV [14336 x 5120]
-q3_put64 0 get q3lmix l
-q3_put64 2 q3_wbva 0
-q3_put64 4 q3_wbva 1
-r = q3_add_launch Q3KFP8 256 48 1 6 false
+note Stage one GDN layer (9 launches: ab, mix[overlap], gdn, + 6 MLP/res launches)
+fn q3_stage_gdn l ulong gi ulong is_last bool to long
+tab = add q3_ncva 9 mul l 64
+r = q3_launch_bf16 get q3lab l q3_wbva 0 q3_ncva 1 Q3AB
 if lt r 0
 ret r
 end
-note 2. GATHER partial-RoPE permutation (14336 floats)
+r = q3_launch_fp8 Q3KFP8_5120 tab q3_wbva 0 q3_wbva 1 Q3GDNMIX ne get q3st 9 0
+if lt r 0
+ret r
+end
+r = q3_launch_gdn gi
+if lt r 0
+ret r
+end
+ret q3_stage_mlp l is_last
+end
+
+note Stage one full-attention layer (10 launches: mix, gather, attn256, gate, + 6 MLP/res launches)
+fn q3_stage_attn l ulong ki ulong kv_pos uint is_last bool to long
+tab = add q3_ncva 9 mul l 64
+r = q3_launch_fp8 Q3KFP8_5120 tab q3_wbva 0 q3_wbva 1 Q3ATTMIX false
+if lt r 0
+ret r
+end
 q3_put64 0 q3_wbva 1
 q3_put64 2 q3_ncva 10
 q3_put64 4 q3_wbva 2
@@ -791,21 +1028,10 @@ r = q3_add_launch Q3KGATHER 256 uint div Q3ATTMIX 256 1 6 false
 if lt r 0
 ret r
 end
-note 3. Decode attention head_dim=256 (grid splits x 4 KV heads)
-splits = div add ulong kv_pos 256 256
-if eq splits 0
-splits = ulong 1
-end
-q3_put64 0 q3_wbva 2
-q3_put64 2 q3_wbva 3
-q3_put64 4 get q3st 15
-put q3args 6 kv_pos
-put q3args 7 uint l
-r = q3_add_launch Q3KATTN 256 uint splits uint Q3KVHEADS 8 false
+r = q3_launch_attn ki kv_pos
 if lt r 0
 ret r
 end
-note 4. GATE att *= sigmoid(agg + 8192)
 q3_put64 0 q3_wbva 3
 q3_put64 2 add q3_wbva 2 mul Q3ATTQKV 4
 q3_put64 4 q3_wbva 3
@@ -814,73 +1040,24 @@ r = q3_add_launch Q3KGATE 256 uint div Q3MOUT 256 1 7 false
 if lt r 0
 ret r
 end
-note 5. o_proj FP8 GEMV [5120 x 6144]
-q3_put64 0 get q3lo l
-q3_put64 2 q3_wbva 3
-q3_put64 4 q3_wbva 4
-r = q3_add_launch Q3KFP8 256 48 1 6 false
-if lt r 0
-ret r
-end
-note 6. ADD|NORM x += o; xq = RMSNorm(x) * post_norm * 2^64
-q3_put64 0 q3_ncva 0
-q3_put64 2 q3_wbva 4
-q3_put64 4 post_n
-q3_put64 6 q3_wbva 0
-put q3args 8 Q3EPSF32
-put q3args 9 Q3SCALE2P64
-r = q3_add_launch Q3KADDNORM 256 1 1 10 false
-if lt r 0
-ret r
-end
-note 7. gate_up FP8 GEMV [34816 x 5120]
-q3_put64 0 get q3lgu l
-q3_put64 2 q3_wbva 0
-q3_put64 4 q3_wbva 5
-r = q3_add_launch Q3KFP8 256 48 1 6 false
-if lt r 0
-ret r
-end
-note 8. SWIGLU
-q3_put64 0 q3_wbva 5
-q3_put64 2 q3_wbva 6
-put q3args 4 Q3SCALE2P64
-r = q3_add_launch Q3KSWIGLU 256 uint div Q3INTER 256 1 5 false
-if lt r 0
-ret r
-end
-note 9. down FP8 GEMV
-q3_put64 0 get q3ldn l
-q3_put64 2 q3_wbva 6
-q3_put64 4 q3_wbva 4
-r = q3_add_launch Q3KFP8 256 48 1 6 false
-if lt r 0
-ret r
-end
-note 10. ADD|NORM x += o; next in_norm (or final_norm -> hidden)
-nw = add in_n mul mul 2 Q3HIDDEN 4
-yv = q3_wbva 0
-sc = Q3SCALE2P64
-if is_last
-nw = get q3st 13
-yv = q3_ncva 2
-sc = Q3ONEF32
-end
-q3_put64 0 q3_ncva 0
-q3_put64 2 q3_wbva 4
-q3_put64 4 nw
-q3_put64 6 yv
-put q3args 8 Q3EPSF32
-put q3args 9 sc
-ret q3_add_launch Q3KADDNORM 256 1 1 10 false
+ret q3_stage_mlp l is_last
 end
 
 note Piece 5 <-> Piece 6 contract: q38_stage_step(tok_in, kv_pos, mode).
 note mode=0 (PREFILL): 593 launches (skips lm_head + argmax). mode=1 (DECODE): 596 launches.
-note Writes banks[], qmds[], and 64 KiB PCAS pushbuffer + L2 flush + WFI sem; returns pb_words > 0.
+note Writes banks[], qmds[], and 64 KiB PCAS pushbuffer + C3 tail; returns pb_words > 0.
 note Does NOT ring doorbell or poll (Piece 6 owns cbkickbar0 + non-blocking cmpoll).
 fn q38_stage_step tok_in uint kv_pos uint mode uchar to long
 if eq get q3st 0 0
+ret Q3ESTATE
+end
+if eq get q3st 24 0
+ret Q3ESTATE
+end
+if eq get q3st 25 0
+ret Q3ESTATE
+end
+if eq get q3st 26 0
 ret Q3ESTATE
 end
 if or ge ulong tok_in Q3VOCAB ge ulong kv_pos get q3st 5
@@ -889,18 +1066,13 @@ end
 if gt mode Q3MODE_DEC
 ret Q3EINVAL
 end
-for m ulong 5
-if eq get q3st add 11 m 0
-ret Q3ESTATE
-end
-end
 for k ulong Q3KCOUNT
 if eq get q3kset k 0
 ret Q3ESTATE
 end
 end
 for l ulong Q3LAYERS
-if eq get q3lset l 0
+if ne get q3lset l 3
 ret Q3ESTATE
 end
 end
@@ -917,31 +1089,29 @@ mmwr32 add q3_ncva 0 mul i 4 mmrd32 add erow mul i 4
 end
 put q3st 7 0
 put q3st 8 ulong kv_pos
-put q3st 17 ulong mode
+put q3st 22 ulong mode
 cbpbinit
 r = cbpbsetup18 uint CBCCMP
 if lt r 0
 ret r
 end
-note Initial layer-0 RMSNorm: x -> xq * 2^64
-q3_put64 0 q3_ncva 0
-q3_put64 2 0
-q3_put64 4 q3_ncva 7
-q3_put64 6 q3_wbva 0
-put q3args 8 Q3EPSF32
-put q3args 9 Q3SCALE2P64
-r = q3_add_launch Q3KNORM 256 1 1 10 false
+note Initial layer-0 RMSNorm (12-word RES layout): x -> xq * 2^64
+r = q3_launch_res Q3KNORM q3_ncva 0 0 q3_ncva 7 q3_wbva 0 Q3SCALE2P64
 if lt r 0
 ret r
 end
-note All 64 layers (48 GDN + 16 full attention)
+note All 64 layers (48 GDN indexed by gi=0..47, 16 full attention indexed by ki=0..15)
+gi = ulong 0
+ki = ulong 0
 for l ulong Q3LAYERS
 is_last = eq add l 1 Q3LAYERS
-isatt = and shr get q3st 16 l 1
+isatt = and shr get q3st 21 l 1
 if eq isatt 0
-r = q3_stage_gdn l is_last
+r = q3_stage_gdn l gi is_last
+gi = add gi 1
 else
-r = q3_stage_attn l kv_pos is_last
+r = q3_stage_attn l ki kv_pos is_last
+ki = add ki 1
 end
 if lt r 0
 ret r
@@ -949,10 +1119,7 @@ end
 end
 note MODE_DECODE: append lm_head BF16 GEMV + 2-stage ARGMAX writing out_tok
 if eq mode Q3MODE_DEC
-q3_put64 0 get q3st 12
-q3_put64 2 q3_ncva 2
-q3_put64 4 q3_ncva 3
-r = q3_add_launch Q3KBF16 256 48 1 6 false
+r = q3_launch_bf16 get q3st 12 q3_ncva 2 q3_ncva 3 Q3VOCAB
 if lt r 0
 ret r
 end
@@ -988,21 +1155,20 @@ if eq n 0
 ret Q3ESTATE
 end
 cpufence
-nc = get q3st 1
-sems = add nc get q3nc 13
+sems = q3_ncva 13
 for i ulong n
 if ne mmrd32 add sems mul i 16 ulong Q3SEMDONE
 ret Q3EVERIFY
 end
 end
-cnts = add nc get q3nc 15
+cnts = q3_ncva 15
 for j ulong Q3ATTNL
 if ne mmrd32 add cnts mul j 16 0
 ret Q3EVERIFY
 end
 end
 if eq mode Q3MODE_DEC
-tok = mmrd32 add nc get q3nc 6
+tok = mmrd32 q3_ncva 6
 if or eq tok ulong Q3POISON ge tok Q3VOCAB
 ret Q3EVERIFY
 end

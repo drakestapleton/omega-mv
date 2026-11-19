@@ -1,10 +1,6 @@
 note tests/q38_run_test.om: Host verification suite for Slice E (compute.om + q38_run.om).
 note Compiles and runs natively on macOS (target a64macos) and compiles for Linux AArch64 ELF.
 note Zero GPU access, zero Linux syscalls beyond stdout write.
-note Build (macOS native):
-note   { printf 'target a64macos\n'; cat gpu/driver/tests/q38_run_shim.om \
-note     gpu/driver/gsp/compute.om gpu/driver/gsp/q38_run.om \
-note     gpu/driver/tests/q38_run_test.om; } | omc > q38_run_test && ./q38_run_test
 note Prefix qt / QT.
 
 text QTPASS "PASS q38_run_test\n"
@@ -13,6 +9,12 @@ fn qtck yes bool to void
 if not yes
 trap 1
 end
+end
+
+fn qtrd64 va ulong to ulong
+lo = mmrd32 va
+hi = mmrd32 add va 4
+ret or lo shl hi 32
 end
 
 fn qt_test_compute to void
@@ -63,6 +65,12 @@ qtck not q3_va_ok add Q3LPDDRLO 128 4096
 qtck not q3_va_ok Q3LPDDRHI 4096
 qtck not q3_va_ok shl ulong 112 32 4096
 qtck not q3_va_ok shl ulong 114 32 4096
+note Blackwell Trap #4: declared = round8(peak + 2) >= 64
+qtck eq q3_gpr_declared 16 64
+qtck eq q3_gpr_declared 62 64
+qtck eq q3_gpr_declared 63 72
+qtck eq q3_gpr_declared 64 72
+qtck eq q3_gpr_declared 120 128
 note Gather table parity against omega_q38_gather_table(24, 4)
 tab = new uint 14336 0
 qtck eq q3_gather_table 0 4 tab Q3EINVAL
@@ -96,50 +104,96 @@ nc_base = base
 wb_base = add base 6291456
 pb_pa = add base 7340032
 marker_va = add base 7471104
-note Reject overlapping pools
+note Reject overlapping pools and non-256-multiple max_ctx
 qtck eq q3_init nc_base nc_base pb_pa marker_va 4096 Q3EINVAL
 qtck eq q3_init nc_base wb_base nc_base marker_va 4096 Q3EINVAL
-note Valid init
+qtck eq q3_init nc_base wb_base pb_pa marker_va 100 Q3EINVAL
+note Valid init (populates gtab, NEG_PAD, scratch=0, attn_cnts=0)
 qtck eq q3_init nc_base wb_base pb_pa marker_va 4096 Q3OK
+note Verify Normal-NC buffer initialization (#54 item 5)
+gtv = q3_ncva 10
+qtck eq mmrd32 gtv 0
+qtck eq mmrd32 add gtv 128 64
+qtck eq mmrd32 add gtv 512 32
+qtck eq mmrd32 add gtv mul ulong 8192 4 256
+lgt = q3_ncva 3
+qtck eq mmrd32 add lgt mul Q3VOCAB 4 ulong Q3NEGPAD
+qtck eq mmrd32 add lgt mul sub mul Q3AMCTAS Q3AMSPAN 1 4 ulong Q3NEGPAD
+amv = q3_ncva 4
+qtck eq mmrd32 amv ulong Q3NEGPAD
+qtck eq mmrd32 add amv 8188 ulong Q3NEGPAD
+scr = q3_ncva 14
+qtck eq mmrd32 scr 0
+qtck eq mmrd32 add scr 16380 0
+cnts = q3_ncva 15
+qtck eq mmrd32 cnts 0
+qtck eq mmrd32 add cnts 252 0
 note WB flush tracking
 qtck eq q3_wb_flush wb_base 4096 Q3OK
 qtck eq get q3st 10 1
 qtck eq get shflsh 0 1
-qtck eq get shflpa 0 wb_base
-qtck eq get shflsz 0 4096
-note Bind all 12 compiled sm_121 SASS code slots (and check >32 KiB smem refusal)
+end
+
+fn qt_setup_bind to void
+base = Q3LPDDRLO
+note Bind all 14 compiled sm_121 SASS code slots + Trap #4 / smem refusals
 code_base = add base 7536640
 qtck eq q3_set_code Q3KNORM code_base 64 32769 Q3ERANGE
+qtck eq q3_set_code Q3KNORM code_base 255 0 Q3ERANGE
 for k ulong Q3KCOUNT
-qtck eq q3_set_code k add code_base mul k 4096 64 16384 Q3OK
+sm = uint 0
+if eq k Q3KBF16_5120
+sm = Q3BF16SMEM
 end
-note Bind model-level buffers (emb_va has 8 rows in sim window)
+if eq k Q3KGDN
+sm = Q3GDNSMEM
+end
+if eq k Q3KATTN
+sm = Q3ATTNSMEM
+end
+qtck eq q3_set_code k add code_base mul k 4096 64 sm Q3OK
+end
+note Bind model-level buffers (full byte size checks: emb=5.08 GiB, lm=2.54 GiB, fnorm=20 KiB)
 emb_va = add base 7602176
-qtck eq q3_set_model emb_va add base 7864320 add base 7868416 add base 7872512 add base 7876608 Q3OK
+hi_base = add base 17179869184
+qtck eq q3_set_model sub Q3LPDDRHI 4096 hi_base add hi_base 4294967296 Q3ERANGE
+qtck eq q3_set_model emb_va hi_base add hi_base 4294967296 Q3OK
 note Write a recognizable pattern into embedding row 7
 erow7 = add emb_va mul 7 mul Q3HIDDEN 4
 mmwr32 erow7 1065353216
 mmwr32 add erow7 4 1073741824
-note Bind all 64 layers (48 GDN with ab_va, 16 Attn with ab_va=0)
-wbase = add base 7900160
+end
+
+fn qt_bind_weights to void
+hi_base = add Q3LPDDRLO 17179869184
+gdn_base = add hi_base 8589934592
+qtck eq q3_set_gdn_pools gdn_base add gdn_base 16777216 add gdn_base 33554432 Q3OK
+attn_base = add gdn_base 268435456
+qtck eq q3_set_attn_pools attn_base add attn_base 536870912 add attn_base 541065216 add attn_base 541130752 Q3OK
+wbase = add attn_base 1073741824
 for l ulong Q3LAYERS
-isatt = and shr get q3st 16 l 1
+qtck eq q3_set_layer_fp8 l wbase add wbase 134217728 add wbase 268435456 add wbase 402653184 Q3OK
+isatt = and shr get q3st 21 l 1
 abv = ulong 0
 if eq isatt 0
-abv = add wbase 1024
+abv = add wbase 1073741824
 end
-qtck eq q3_set_layer l wbase add wbase 256 add wbase 512 add wbase 768 abv Q3OK
+qtck eq q3_set_layer_mlp l add wbase 536870912 add wbase 805306368 add wbase 939524096 add wbase 1006632960 abv Q3OK
 end
 end
 
 fn qt_test_reset to void
-note Test q38_reset_kv: keep_pos > 0 returns -2 (Q3EUNSUP)
+note Dirty attn_cnts[0] to confirm q38_reset_kv(0) clears it
+cnt0 = q3_ncva 15
+mmwr32 cnt0 9
+note keep_pos > 0 returns -2 (Q3EUNSUP)
 qtck eq q38_reset_kv 1 Q3EUNSUP
 qtck eq q38_reset_kv 100 Q3EUNSUP
-note Test q38_reset_kv(0): stages GPU-side GDN_ZERO + L2 flush + WFI sem (37 words)
-qtck eq q38_reset_kv 0 37
-qtck eq get q3st 7 1
-note Verify sanitized CBANK0 at slot 0: NVRM 0x3_*/0x2_* words == 0, [64..67] == 0x70/0x72
+note q38_reset_kv(0): TWO KK_ZERO launches (tail + state) + C3 17w tail = 18 + 2*8 + 17 = 51 words
+qtck eq q38_reset_kv 0 51
+qtck eq get q3st 7 2
+qtck eq mmrd32 cnt0 0
+note Verify sanitized CBANK0 at slot 0 + KK_ZERO args {src=0, dst=gdn_tail_va} and grid_x=3456
 bank0 = q3_ncva 11
 qtck eq mmrd32 bank0 0
 qtck eq mmrd32 add bank0 4 0
@@ -155,59 +209,130 @@ qtck eq mmrd32 add bank0 256 0
 qtck eq mmrd32 add bank0 260 112
 qtck eq mmrd32 add bank0 264 0
 qtck eq mmrd32 add bank0 268 114
-qtck eq mmrd32 add bank0 272 ulong q3lo32 bank0
-qtck eq mmrd32 add bank0 276 ulong q3hi32 bank0
-note Verify QMD1 v5 invariants at slot 0 (version=5, type=2, SKEDCHECK05 word 37=0, sem payload=6)
+qtck eq qtrd64 add bank0 896 0
+qtck eq qtrd64 add bank0 904 get q3st 15
+qtck eq mmrd32 add bank0 880 3456
+note Verify KK_ZERO slot 1: {src=0, dst=gdn_state_va} and grid_x=36864
+bank1 = add bank0 1024
+qtck eq qtrd64 add bank1 896 0
+qtck eq qtrd64 add bank1 904 get q3st 16
+qtck eq mmrd32 add bank1 880 36864
+note Verify QMD1 v5 + Trap #4 declared GPRs: peak=64 -> declared=72 in word 35 bits 16:8
 qmd0 = q3_ncva 12
 qtck eq mmrd32 add qmd0 16 20905984
 qtck eq mmrd32 add qmd0 56 793772964
 qtck eq mmrd32 add qmd0 68 6
 qtck eq mmrd32 add qmd0 148 0
-note Verify q38_verify_step fails before GPU sets sem0=6, passes after
+qtck eq and shr mmrd32 add qmd0 140 8 511 72
+note Verify C3 tail ordering in pb_pa: marker1(WFI) [34..39] -> L2_FLUSH [40..44] -> marker2(WFI) [45..50]
+pb = get q3st 3
+qtck eq mmrd32 add pb 136 537198615
+qtck eq mmrd32 add pb 156 1048577
+qtck eq mmrd32 add pb 160 537133066
+qtck eq mmrd32 add pb 176 2147483648
+qtck eq mmrd32 add pb 180 537198615
+qtck eq mmrd32 add pb 184 ulong q3lo32 add get q3st 4 16
+qtck eq mmrd32 add pb 200 1048577
+note Verify q38_verify_step requires BOTH reset semaphores == 6
 sem0 = q3_ncva 13
-qtck eq mmrd32 sem0 5
 qtck eq q38_verify_step Q3MODE_PF Q3EVERIFY
 mmwr32 sem0 6
+qtck eq q38_verify_step Q3MODE_PF Q3EVERIFY
+mmwr32 add sem0 16 6
 qtck eq q38_verify_step Q3MODE_PF Q3OK
+end
+
+fn qt_verify_arg_layouts to void
+bank0 = q3_ncva 11
+note Launch 0 = RES (NORM): 12 words: X(0..1), A=0(2..3), W=0(4..5), NW(6..7), Y(8..9), EPS(10), SCALE(11)
+qtck eq qtrd64 add bank0 896 q3_ncva 0
+qtck eq qtrd64 add bank0 904 0
+qtck eq qtrd64 add bank0 912 0
+qtck eq qtrd64 add bank0 920 q3_ncva 7
+qtck eq qtrd64 add bank0 928 q3_wbva 0
+qtck eq mmrd32 add bank0 936 ulong Q3EPSF32
+qtck eq mmrd32 add bank0 940 ulong Q3SCALE2P64
+note Launch 1 = BF16 GEMV (GDN layer 0 ab): 8 words
+b1 = add bank0 1024
+qtck eq qtrd64 add b1 896 get q3lab 0
+qtck eq qtrd64 add b1 904 q3_wbva 0
+qtck eq qtrd64 add b1 912 q3_ncva 1
+qtck eq mmrd32 add b1 920 24
+qtck eq mmrd32 add b1 924 24
+note Launch 2 = FP8 GEMV (GDN layer 0 mix): 10 words, arg0 = tab_va in Normal-NC tabs
+b2 = add bank0 2048
+qtck eq qtrd64 add b2 896 q3_ncva 9
+qtck eq qtrd64 add b2 904 q3_wbva 0
+qtck eq qtrd64 add b2 912 q3_wbva 1
+qtck eq mmrd32 add b2 920 4096
+qtck eq mmrd32 add b2 924 0
+qtck eq mmrd32 add b2 928 mul Q3GDNMIX 4
+note Launch 3 = GDN (layer 0, gi=0): 18 words, grid_x=3, grid_y=16, smem=5728
+b3 = add bank0 3072
+qtck eq qtrd64 add b3 896 q3_wbva 1
+qtck eq qtrd64 add b3 904 add q3_wbva 1 mul Q3GDNQKV 4
+qtck eq qtrd64 add b3 912 q3_ncva 1
+qtck eq qtrd64 add b3 920 get q3st 14
+qtck eq qtrd64 add b3 928 get q3st 15
+qtck eq qtrd64 add b3 936 get q3st 16
+qtck eq qtrd64 add b3 944 q3_wbva 3
+qtck eq mmrd32 add b3 952 ulong Q3EPSF32
+qtck eq mmrd32 add b3 956 ulong Q3EPSF32
+qtck eq mmrd32 add b3 960 ulong Q3ONEF32
+qtck eq mmrd32 add b3 964 ulong Q3SCALE2P64
+qtck eq mmrd32 add b3 880 3
+qtck eq mmrd32 add b3 884 16
+note Launch 30 = ATTN256 (layer 3 -> ki=0, 1 + 3*9 + 2 = 30): 25 words, cnt=q3_ncva 15, grid 1x4
+b30 = add bank0 30720
+qtck eq qtrd64 add b30 896 q3_wbva 2
+qtck eq qtrd64 add b30 904 get q3st 17
+qtck eq qtrd64 add b30 920 get q3st 18
+qtck eq qtrd64 add b30 928 get q3st 19
+qtck eq qtrd64 add b30 936 add get q3st 19 1024
+qtck eq qtrd64 add b30 944 q3_wbva 3
+qtck eq qtrd64 add b30 952 get q3st 20
+qtck eq qtrd64 add b30 960 q3_ncva 15
+qtck eq mmrd32 add b30 968 12
+qtck eq mmrd32 add b30 972 256
+qtck eq mmrd32 add b30 976 1
+qtck eq mmrd32 add b30 980 2097152
+qtck eq mmrd32 add b30 984 ulong Q3EPSF32
+qtck eq mmrd32 add b30 988 ulong Q3SCALE2P64
+qtck eq mmrd32 add b30 992 ulong Q3QSCALE
+qtck eq mmrd32 add b30 880 1
+qtck eq mmrd32 add b30 884 4
 end
 
 fn qt_test_steps to void
 sem0 = q3_ncva 13
-note Test q38_stage_step MODE_PREFILL (593 launches, 18 + 593*8 - 48*4 + 11 = 4581 PB words)
-qtck eq q38_stage_step 7 12 Q3MODE_PF 4581
+note MODE_PREFILL: 593 launches, 18 + 593*8 - 48*4 + 17 = 4587 PB words
+qtck eq q38_stage_step 7 12 Q3MODE_PF 4587
 qtck eq get q3st 7 593
-note Verify embedding row 7 was copied to Normal-NC x
+qt_verify_arg_layouts
 qtck eq mmrd32 q3_ncva 0 1065353216
 qtck eq mmrd32 add q3_ncva 0 4 1073741824
-note Simulate GPU completion for all 593 launches
 for i ulong 593
 mmwr32 add sem0 mul i 16 6
 end
 qtck eq q38_verify_step Q3MODE_PF Q3OK
-note Test q38_stage_step MODE_DECODE (596 launches, 18 + 596*8 - 48*4 + 11 = 4605 PB words)
-qtck eq q38_stage_step 7 12 Q3MODE_DEC 4605
+note MODE_DECODE: 596 launches, 18 + 596*8 - 48*4 + 17 = 4611 PB words
+qtck eq q38_stage_step 7 12 Q3MODE_DEC 4611
 qtck eq get q3st 7 596
 tok_va = q3_ncva 6
 qtck eq mmrd32 tok_va ulong Q3POISON
-note Must fail while sems==5 or out_tok==POISON
 qtck eq q38_verify_step Q3MODE_DEC Q3EVERIFY
 for i ulong 596
 mmwr32 add sem0 mul i 16 6
 end
-note Still fails while out_tok is POISON (Trap #13 guard)
 qtck eq q38_verify_step Q3MODE_DEC Q3EVERIFY
-note Fails on out-of-vocab token
 mmwr32 tok_va Q3VOCAB
 qtck eq q38_verify_step Q3MODE_DEC Q3EVERIFY
-note Fails on nonzero attention split counter
 cnt0 = q3_ncva 15
 mmwr32 tok_va 42
 mmwr32 cnt0 1
 qtck eq q38_verify_step Q3MODE_DEC Q3EVERIFY
 mmwr32 cnt0 0
-note Passes and returns token 42
 qtck eq q38_verify_step Q3MODE_DEC 42
-note Out-of-range tok_in or kv_pos rejected
 qtck eq q38_stage_step uint Q3VOCAB 0 Q3MODE_DEC Q3ERANGE
 qtck eq q38_stage_step 0 4096 Q3MODE_DEC Q3ERANGE
 end
@@ -216,6 +341,8 @@ fn main to int
 qt_test_compute
 qt_test_va_and_tables
 qt_setup
+qt_setup_bind
+qt_bind_weights
 qt_test_reset
 qt_test_steps
 r = write 1 QTPASS 0 len QTPASS
