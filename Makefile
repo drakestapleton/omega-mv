@@ -2,6 +2,13 @@ CC ?= gcc
 .DEFAULT_GOAL := all
 PHYSICS_DIR ?= ../physics
 OUT_DIR ?= build
+# aienos.lock is code-adjacent input: parse it as data before mk/*.mk or any recipe sees it.
+# Exactly one lowercase 40-hex commit line (final newline optional), else make stops;
+# `override` so a command-line or environment AIENOS_LOCK cannot replace the parsed value.
+override AIENOS_LOCK := $(shell LC_ALL=C awk 'NR == 1 && length($$0) == 40 && $$0 ~ /^[0-9a-f]+$$/ { commit = $$0; next } { invalid = 1 } END { if (!invalid && NR == 1) print commit; else exit 1 }' aienos.lock 2>/dev/null)
+ifneq ($(words $(AIENOS_LOCK)),1)
+$(error aienos.lock must contain exactly one lowercase 40-hex commit)
+endif
 -include mk/*.mk
 PHYSICS_LOCK_CHECK ?= 1
 
@@ -115,14 +122,13 @@ check-physics-lock:
 			echo "error: physics.lock not found at repo root" >&2; exit 1; \
 		fi; \
 		locked=$$(tr -d '[:space:]' < physics.lock); \
-		actual=$$(git -C $(PHYSICS_DIR) rev-parse HEAD 2>/dev/null); \
-		if [ -z "$$actual" ]; then \
-			echo "error: could not read HEAD of PHYSICS_DIR=$(PHYSICS_DIR) (git -C $(PHYSICS_DIR) rev-parse HEAD failed)" >&2; \
-			exit 1; \
-		fi; \
-		if [ "$$actual" != "$$locked" ]; then \
-			echo "error: PHYSICS_DIR=$(PHYSICS_DIR) is at commit $$actual but physics.lock pins $$locked." >&2; \
-			echo "       Checkout the pinned physics commit, or override with PHYSICS_LOCK_CHECK=0." >&2; \
+		case "$$locked" in \
+			[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; \
+			*) echo "error: physics.lock must contain exactly one lowercase 40-hex commit" >&2; exit 1 ;; \
+		esac; \
+		if ! tools/pinned_checkout.sh verify "$(PHYSICS_DIR)" "$$locked" >/dev/null; then \
+			printf '%s\n' "error: PHYSICS_DIR=$(PHYSICS_DIR) is not an exact worktree of physics.lock ($$locked)." >&2; \
+			echo "       Use an unmodified checkout at the pin, or override with PHYSICS_LOCK_CHECK=0." >&2; \
 			exit 1; \
 		fi; \
 	fi
@@ -138,8 +144,9 @@ $(OUT_DIR)/%.o: src/%.c | $(OUT_DIR)
 # path for exactly these). They must be rebuilt when PHYSICS_DIR points at another tree, not only
 # when a file there is newer, and none may compile before check-physics-lock passes (#488).
 # The stamp records the resolved PHYSICS_DIR and its git HEAD and is rewritten only when that
-# text changes, so an unchanged PHYSICS_DIR rebuilds nothing. Its phony prerequisite runs the
-# lock check first: when the check refuses, the stamp is not made and no physics object compiles.
+# text changes, so an unchanged PHYSICS_DIR rebuilds nothing. Its phony prerequisite proves the
+# commit, every tree/blob and the raw worktree bytes and modes first: when that proof refuses,
+# the stamp is not made and no physics object compiles.
 # The other objects take nothing from PHYSICS_DIR and are shared with physics-free builds
 # (crumbline-learner, omega, test-program-id), so they stay ungated.
 PHYSICS_STAMP = $(OUT_DIR)/physics.stamp
@@ -260,6 +267,13 @@ test-gate14-combine:
 .PHONY: test-gate-physics-pin
 test-gate-physics-pin:
 	tools/test_gate_physics_pin.sh
+	tools/test_pinned_checkout.sh
+
+# Host-only self-test of exact pinned-checkout materialization and verification:
+# dirty sources and replace refs cannot affect output; byte, mode and extra-path mutants refuse.
+.PHONY: test-pinned-checkout
+test-pinned-checkout:
+	tools/test_pinned_checkout.sh
 
 # Host-only self-test of the E1 closure combiner (tools/e1_combine.sh): good
 # synthetic constituent set accepted, every hostile mutant refused. No GPU.
@@ -457,16 +471,16 @@ test-sem-incremental: $(RX_SEM_TEST)
 # and no unignored extra file sits beside them. The proof runs on every build (phony
 # prerequisite), so a source edited after extraction stops the build.
 AIENOS_LOCK_REPO ?= ../aienos-argus-cap
-AIENOS_LOCK = $(shell head -n 1 aienos.lock)
+# AIENOS_LOCK is the validated commit parsed at the top of this Makefile.
 AIENOS_R7_DEFAULT = $(OUT_DIR)/aienos-authority/$(AIENOS_LOCK)
 AIENOS_R7_DIR ?= $(AIENOS_R7_DEFAULT)
 AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/$(AIENOS_LOCK)/libaienos_capability.a
 # $(call aienos_source,<subpaths>): materialize into the default cache, or prove the override.
 aienos_source = if [ "$(AIENOS_R7_DIR)" = "$(AIENOS_R7_DEFAULT)" ]; then \
-		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_R7_DIR= bash tools/aienos_lock_source.sh materialize "$(AIENOS_R7_DIR)" $(1); \
+		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_LOCK='$(AIENOS_LOCK)' AIENOS_R7_DIR= bash tools/aienos_lock_source.sh materialize "$(AIENOS_R7_DIR)" $(1); \
 	else \
-		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_R7_DIR="$(AIENOS_R7_DIR)" bash tools/aienos_lock_source.sh verify-dir "$(AIENOS_R7_DIR)" $(1); \
-	fi || { echo "error: the aienos authority source is not the aienos.lock commit $(AIENOS_LOCK) (see above)."; \
+		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_LOCK='$(AIENOS_LOCK)' AIENOS_R7_DIR="$(AIENOS_R7_DIR)" bash tools/aienos_lock_source.sh verify-dir "$(AIENOS_R7_DIR)" $(1); \
+	fi || { echo 'error: the aienos authority source is not the aienos.lock commit $(AIENOS_LOCK) (see above).'; \
 		echo "  pass AIENOS_LOCK_REPO=<an aienos clone holding that commit>, or AIENOS_R7_DIR=<a clean tree of it inside such a clone>;"; \
 		echo "  a modified default cache under $(OUT_DIR)/aienos-authority must be deleted, not reused."; exit 1; }
 RX_R7_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
@@ -1427,8 +1441,18 @@ test-typed-results: $(RX_TYPED_TEST)
 # same library as the default targets (with no observer set it
 # costs one NULL check per admin operation), RX_ARGUS=0 included.
 ARGUS_REPO ?= ../aienos-argus
-ARGUS_COMMIT ?= $(shell head -n 1 argus.lock)
-ARGUS_SHORT = $(shell echo $(ARGUS_COMMIT) | cut -c1-7)
+# The lock is code-adjacent input: parse it as data and expose only validated
+# lowercase commit text to recipes.  The second field is derived in the same
+# parser so no lock content is ever interpolated into another shell command.
+# Pin: aien-dev/aienux native/argus (ARGUS-0, ABI v1.1), feat/argus-0 integrator
+# round 3. argus_abi.h is byte-identical at 398cfb9, 03b9f06, be2814d and
+# b375dca. Branch head a64bc55 differs from b375dca in native/argus only by docs.
+override ARGUS_LOCK_FIELDS := $(shell LC_ALL=C awk 'NR == 1 && length($$0) == 40 && $$0 ~ /^[0-9a-f]+$$/ { commit = $$0; next } { invalid = 1 } END { if (!invalid && NR == 1) printf "%s %s\n", commit, substr(commit, 1, 7); else exit 1 }' argus.lock 2>/dev/null)
+ifneq ($(words $(ARGUS_LOCK_FIELDS)),2)
+$(error argus.lock must contain exactly one lowercase 40-hex commit)
+endif
+override ARGUS_COMMIT := $(word 1,$(ARGUS_LOCK_FIELDS))
+override ARGUS_SHORT := $(word 2,$(ARGUS_LOCK_FIELDS))
 ARGUS_SRC = $(OUT_DIR)/argus-src/$(ARGUS_SHORT)/native/argus
 ARGUS_STAMP = $(OUT_DIR)/argus-src/$(ARGUS_SHORT)/.extracted
 ARGUS_LIB_SRCS = $(addprefix $(ARGUS_SRC)/,argus_event.c argus_ring.c argus_core.c argus_detect.c)
@@ -1443,11 +1467,23 @@ ARGUS_CFLAGS = $(CFLAGS) -DRX_ARGUS=$(RX_ARGUS) -I$(ARGUS_SRC)
 ARGUS_STREAMS ?= $(HOME)/workspace/argus-runtime-streams
 ARGUS_RUN_ID = $(shell git rev-parse --short HEAD 2>/dev/null)-argus$(ARGUS_SHORT)
 
+.PHONY: check-argus-lock test-argus-lock
+check-argus-lock:
+	@:
+
+test-argus-lock:
+	bash tests/argus_lock_validation.sh
+
+# aienos.lock is parsed at the top of this Makefile; this prints the parsed commit
+# (hostile shapes: tests/aienos_lock_source/run.sh section 4).
+.PHONY: check-aienos-lock
+check-aienos-lock:
+	@printf '%s\n' '$(AIENOS_LOCK)'
+
 $(ARGUS_STAMP):
-	@test -n "$(ARGUS_COMMIT)" || { echo "argus.lock is empty"; exit 1; }
-	mkdir -p $(OUT_DIR)/argus-src/$(ARGUS_SHORT)
-	git -C $(ARGUS_REPO) archive $(ARGUS_COMMIT) native/argus | tar -x -C $(OUT_DIR)/argus-src/$(ARGUS_SHORT)
-	touch $@
+	mkdir -p "$(OUT_DIR)/argus-src/$(ARGUS_SHORT)"
+	git -C "$(ARGUS_REPO)" archive "$(ARGUS_COMMIT)" -- native/argus | tar -x -C "$(OUT_DIR)/argus-src/$(ARGUS_SHORT)"
+	touch "$@"
 
 $(ARGUS_LIB_SRCS): $(ARGUS_STAMP)
 

@@ -23,8 +23,10 @@
 # Pinned sibling sources. The hosted jobs checked out aien-spark/physics at physics.lock,
 # aien-dev/aienux at aienos.lock and aien-dev/aienux at
 # argus.lock, as physics-src/, aienos-src/ and aienos-argus/ next to the Makefile, and exclude
-# them from git status. Here the same commits are materialised under build/pins/ (build/ is
-# gitignored) from the sibling local clones ../physics and ../aienos, offline.
+# them from git status. Here the same commits are materialised as private, read-only checkouts
+# under build/pins/ (build/ is gitignored) from the sibling clones, offline. Each invocation
+# gets fresh source bytes proven against the locked commit's objects; no gate consumes a shared
+# mutable dependency worktree.
 set -euo pipefail
 # Reviewer 2026-11-15 (P1032): an inherited MAKEFLAGS (e.g. -i/-k) or MAKEFILES (e.g. a file with .IGNORE:) would let a failing gate pass; gates run with a clean make.
 unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEFILES
@@ -36,35 +38,43 @@ step="${1:?usage: tests/gates/run.sh <step>}"
 # at the same moment in one worktree; with one shared build/ a gate links an object another gate's
 # compiler is still writing (omega#511: OMEGA-M12 "undefined reference to omega_tern_*" with the
 # object on the link line). OUT_DIR is read by the Makefile (?=) and by every make it spawns.
-# The pins stay at build/pins, shared read-only under their own lock. The directory name keeps
-# only [A-Za-z0-9_.-] from the step word: "spark:test-r13-host" would put a colon in a make
-# target ("multiple target patterns").
-export OUT_DIR="build/step-$(printf '%s' "$step" | tr -c 'A-Za-z0-9_.-' '-')"
-mkdir -p "$OUT_DIR"
+# Each invocation's pins stay in a private random directory under build/pins. The step directory
+# name keeps only [A-Za-z0-9_.-] from the step word: "spark:test-r13-host" would put a colon in
+# a make target ("multiple target patterns").
+step_key="$(printf '%s' "$step" | tr -c 'A-Za-z0-9_.-' '-')"
+export OUT_DIR="build/step-$step_key"
+mkdir -p "$OUT_DIR" "$ROOT/build/pins"
 obs() { printf 'AIEN-OBS %s %s\n' "$1" "$2"; }
 
-PINS="$ROOT/build/pins"
+PINS="$(mktemp -d "$ROOT/build/pins/$step_key.XXXXXX")"
+STEP_MARK=""
+cleanup() {
+  if [ -n "$STEP_MARK" ]; then rm -f -- "$STEP_MARK"; fi
+  case "$PINS" in
+    "$ROOT/build/pins/$step_key".*)
+      chmod -R u+w -- "$PINS" 2>/dev/null || true
+      rm -rf -- "$PINS" ;;
+  esac
+}
+trap cleanup EXIT
 NOPHYS="PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0"
 lock() { awk 'NF && $1 !~ /^#/ {print $1; exit}' "$1"; }
 
-# pin <dir-name> <sibling repo> <sha40>: build/pins/<dir-name> is a detached checkout of <sha40>
-# taken from the object store of ../<sibling repo>. Reused when already at that commit.
+# pin <dir-name> <sibling repo> <sha40>: materialize a fresh detached checkout of <sha40>
+# from ../<sibling repo>. pinned_checkout.sh disables replacement objects and grafts, copies
+# the commit graph into this invocation's repository, re-hashes commit/tree/blob identities,
+# verifies raw worktree bytes and modes, and makes the result read-only before returning it.
 pin() {
-  local name="$1" repo="$2" sha="$3" dir="$PINS/$1"
+  local name="$1" repo="$2" sha="$3" dir="$PINS/$1" tree
   if [ ! -d "../$repo/.git" ] && [ ! -f "../$repo/.git" ]; then
     echo "run.sh: ../$repo is missing; the hosted job checks out aien-dev/$repo at $sha" >&2
     exit 3
   fi
-  mkdir -p "$PINS"
-  (
-    flock -x 9
-    if [ ! -d "$dir" ] || [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" != "$sha" ]; then
-      rm -rf "$dir"
-      git clone --quiet --shared --no-checkout "../$repo" "$dir"
-      git -C "$dir" checkout --quiet --detach "$sha"
-    fi
-  ) 9>"$PINS/.$name.lock"
+  chmod u+w -- "$PINS"
+  tree="$(tools/pinned_checkout.sh materialize "../$repo" "$sha" "$dir")"
+  chmod a-w -- "$PINS"
   obs "pin_${name//-/_}" "\"$sha\""
+  obs "pin_${name//-/_}_tree" "\"$tree\""
 }
 # Every step that builds against physics takes the commit from physics.lock, never a literal:
 # the Makefile's check-physics-lock refuses any other commit, so a literal here goes red on
@@ -78,7 +88,6 @@ export OMEGA_CANDIDATE_COMMIT="$(git rev-parse HEAD)"
 # Only receipts written during this step count: a hosted job starts from a fresh checkout, so it
 # can only see its own run, while a reused local tree keeps build/qual-runs from earlier runs.
 STEP_MARK="$(mktemp /tmp/omega-gate-step.XXXXXX)"
-trap 'rm -f "$STEP_MARK"' EXIT
 receipt() {
   local r; r="$(find build/qual-runs -name "$1" -type f -newer "$STEP_MARK" | head -n 1)"; shift
   test -n "$r"

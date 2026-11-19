@@ -62,6 +62,9 @@
  * on the authority root; this is the same number. */
 #define RX_GEN_RES_PROMOTION 0x905ull
 #define RX_GEN_RIGHT_PROMOTE 0x200u
+/* Work completion uses an ordinary WRITE capability on a resource derived
+ * from the store, parent generation, candidate, work id and finish operation. */
+#define RX_GEN_RIGHT_FINISH  0x2u
 
 enum {
     RX_WORK_EPHEMERAL = 1,
@@ -120,6 +123,19 @@ typedef struct {
     uint32_t class;
     uint32_t state;
     int required;
+    /* On a bound store, only the candidate proposer may add work. `worker`
+     * names its owner/delegate when worker_set is nonzero (otherwise the
+     * proposer owns it), including when the explicit worker is subject zero.
+     * finish_cap_* names that worker's capability for rx_gen_work_resource.
+     * The remaining fields are runtime-owned completion provenance; input
+     * values are ignored. Unbound stores retain legacy accounting behavior. */
+    uint32_t worker;
+    int worker_set;
+    uint32_t finish_cap_id;
+    uint64_t finish_cap_generation;
+    uint32_t completer;
+    uint64_t finish_resource;
+    uint8_t evidence_digest[32];
 } RxGenWork;
 
 typedef struct {
@@ -164,7 +180,7 @@ typedef struct {
     int result;
     /* Finer stamps inside the barrier (R15 trace, spec §6.7). */
     uint64_t verified_ns;        /* work classified, observations and proofs checked */
-    uint64_t blobs_ns;           /* the six generation blobs written and synced */
+    uint64_t blobs_ns;           /* generation and work-provenance blobs written and synced */
     uint64_t candidate_ns;       /* root and CANDIDATE journal written and synced */
     uint64_t reachable_ns;       /* root re-read from disk and checked */
     uint64_t flipped_ns;         /* FLIPPED journal written and synced */
@@ -188,9 +204,10 @@ int rx_gen_last_phases(const RxGenStore *store, RxGenPhases *out);
 int rx_gen_active(const RxGenStore *store, uint64_t *id, uint64_t *lineage);
 
 /* One blob of committed generation `id` ("evidence", "model", "realization",
- * "config", "provenance" or "objects"), checked against that generation's
- * root: length and SHA-256. A missing root is RX_GEN_ERR_MISSING; a blob that
- * does not match is RX_GEN_ERR_TORN. */
+ * "config", "provenance", "objects" or "work"), checked against that
+ * generation's root: length and SHA-256. The work blob records each item's
+ * owner, scoped capability, completer and evidence digest. A missing root is
+ * RX_GEN_ERR_MISSING; a blob that does not match is RX_GEN_ERR_TORN. */
 int rx_gen_read_blob(const RxGenStore *store, uint64_t id, const char *name, uint8_t *buf,
                      size_t cap, size_t *out_len);
 
@@ -208,11 +225,18 @@ int rx_gen_observe_object(RxGenStore *store, uint64_t candidate, uint32_t index,
                           uint32_t generation);
 int rx_gen_add_work(RxGenStore *store, uint64_t candidate, const RxGenWork *work);
 int rx_gen_finish_work(RxGenStore *store, uint64_t candidate, uint64_t work_id);
+/* Return the exact authority resource for finishing `work_id`. It is scoped
+ * to this store, the candidate's parent generation, candidate and operation.
+ * Call this after proposal and mint/delegate RX_GEN_RIGHT_FINISH to the work's
+ * worker before rx_gen_add_work_as. */
+int rx_gen_work_resource(const RxGenStore *store, uint64_t candidate, uint64_t work_id,
+                         uint64_t *out_resource);
 /* R16 C7: the work-accounting calls present the caller credential. On a bound
  * store the bare rx_gen_add_work and rx_gen_finish_work are refused with
- * RX_GEN_ERR_IDENTITY. Work is added pending or issued only (else
- * RX_GEN_ERR_ARG); only rx_gen_finish_work(_as) marks it done. A drain
- * callback on a bound store must use rx_gen_finish_work_as. */
+ * RX_GEN_ERR_IDENTITY. Only the candidate proposer may add pending/issued
+ * work and name its worker; the worker's scoped, live capability is checked
+ * both when added and when finished. Only rx_gen_finish_work_as marks it done.
+ * A drain callback on a bound store must use the delegated worker credential. */
 int rx_gen_add_work_as(RxGenStore *store, uint32_t subject, const RxCallerCred *cred,
                        uint64_t candidate, const RxGenWork *work);
 int rx_gen_finish_work_as(RxGenStore *store, uint32_t subject, const RxCallerCred *cred,
@@ -231,9 +255,10 @@ int rx_gen_promote(RxGenStore *store, const RxPromotionRequest *request,
  * promotion authority, once (RX_GEN_ERR_BUSY if already bound). From then
  * on: rx_gen_propose_as and rx_gen_promote check the proposer's / the
  * request subject's credential through `caller` before anything else
- * (RX_GEN_ERR_IDENTITY), and rx_gen_promote validates the promotion right
- * with the bound `auth` / `auth_ctx` only: an authority callback passed by the
- * caller is not consulted. There is no unbind. */
+ * (RX_GEN_ERR_IDENTITY). Work assignment/completion validates its scoped
+ * finish capability and rx_gen_promote validates the promotion right with the
+ * bound `auth` / `auth_ctx` only: an authority callback passed by the caller
+ * is not consulted. There is no unbind. */
 /* `op` is RX_CALLER_OP_CHECK, or RX_CALLER_OP_HOLD then RX_CALLER_OP_RELEASE
  * (rx_caller.h): C7, rx_gen_promote checks the request subject again with
  * HOLD right before the active pointer moves, and refuses the flip

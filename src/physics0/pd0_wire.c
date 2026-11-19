@@ -137,10 +137,13 @@ int pd0_rec_chained(const pd0_rec *r, const pd0_rec *prev) {
 }
 
 size_t pd0_req_describe(uint8_t *out) { out[0] = PD0_OP_DESCRIBE; return 1; }
-size_t pd0_req_reset(uint8_t n_obs, const int64_t *vals, uint8_t *out) {
+size_t pd0_req_reset(uint8_t n_obs, const int64_t *vals, uint8_t *out, size_t cap) {
+    if (n_obs < 1 || n_obs > PD0_MAX_OBS || !vals || !out) return 0;
+    size_t need = 2 + 8u * n_obs;
+    if (cap < need) return 0;
     out[0] = PD0_OP_RESET; out[1] = n_obs;
-    for (unsigned i = 0; i < n_obs && i < PD0_MAX_OBS; i++) pd0_put_u64(out + 2 + 8 * i, (uint64_t)vals[i]);
-    return 2 + 8u * n_obs;
+    for (unsigned i = 0; i < n_obs; i++) pd0_put_u64(out + 2 + 8 * i, (uint64_t)vals[i]);
+    return need;
 }
 size_t pd0_req_step(uint8_t channel, int64_t value, uint8_t *out) {
     out[0] = PD0_OP_STEP; out[1] = channel;

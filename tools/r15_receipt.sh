@@ -25,6 +25,9 @@
 #   <raw-dir>/machine.json   hardware identity and commits (§13), written by
 #                            tools/r15_qualify.sh at run time
 #   <raw-dir>/SHA256SUMS     the raw file digests
+#   <raw-dir>/build-provenance.json, final-state.json and
+#                            PROVENANCE_SHA256SUMS bind the archived sources,
+#                            toolchain, sealed executables and final tree state
 #   candidate-commit         the commit proposed for R15 (default: env
 #                            OMEGA_CANDIDATE_COMMIT; empty = not candidate-bound)
 #   reruns.json              the §14 correctness reruns (+ §16 item 9 SEQ parity)
@@ -45,12 +48,14 @@
 # embedded byte for byte. The writer only decides the outcome:
 #   PASS only if every gate G1-G16 is PASS (all_gates_pass true), the raw
 #   directory verifies against SHA256SUMS and the reducer's raw digest, the
-#   run is candidate-bound (run commit == candidate, clean tree), silicon was
-#   observed, aienos and physics commits are recorded and equal the pins in
-#   aienos.lock/physics.lock at the run commit, and every required correctness
-#   rerun is PASS. Anything else is FAIL, with the reasons listed.
-# Shell and coreutils only (sha256sum, grep, sed, git). No jq, no Python.
+#   run is candidate-bound (run commit == candidate, clean initial/final tree,
+#   archive-built binaries unchanged through execution), silicon was observed,
+#   aienos and physics commits equal the pins at the run commit, and every
+#   required correctness rerun is PASS. Anything else is FAIL, with reasons.
+# Shell, coreutils, git and the seeded Omega compiler. No jq, Python or C is
+# introduced on this path; reruns.json is parsed by seed/json/json.om.
 set -u
+export GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/r15-receipt-grafts
 
 RAW=${1:?raw run directory}
 OUTDIR=${2:?output directory}
@@ -67,6 +72,9 @@ if [ -s "$RAW/instrument-unavailable.txt" ]; then
 fi
 SUM=$RAW/summary.json
 MACH=$RAW/machine.json
+PROV=$RAW/build-provenance.json
+FINAL=$RAW/final-state.json
+PROV_SUMS=$RAW/PROVENANCE_SHA256SUMS
 for f in "$SUM" "$MACH" "$RAW/SHA256SUMS"; do
     [ -s "$f" ] || { echo "r15_receipt: missing $f" >&2; exit 2; }
 done
@@ -78,7 +86,12 @@ REQUIRED_RERUNS="R3 R7 R8 R9 R10 R11 R12_host R12_silicon R13_host R13_silicon R
 mstr() { grep -o "\"$1\":\"[^\"]*\"" "$MACH" | head -1 | sed 's/^"[^"]*":"//; s/"$//'; }
 mraw() { grep -o "\"$1\":[^,}]*" "$MACH" | head -1 | sed 's/^"[^"]*"://'; }
 sraw() { grep -o "\"$1\":[^,}]*" "$SUM" | tail -1 | sed 's/^"[^"]*"://'; }
+fstr() { grep -o "\"$2\":\"[^\"]*\"" "$1" 2>/dev/null | head -1 | sed 's/^"[^"]*":"//; s/"$//'; }
+fraw() { grep -o "\"$2\":[^,}]*" "$1" 2>/dev/null | head -1 | sed 's/^"[^"]*"://'; }
+fobj() { grep -o "\"$2\":{[^}]*}" "$1" 2>/dev/null | head -1 | sed 's/^"[^"]*"://'; }
 jstr() { printf '"%s"' "$(printf '%s' "$1" | tr -d '"\\' | tr '\n' ' ')"; }
+is_sha256() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+is_commit() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 
 REASONS=()
 fail() { REASONS+=("$1"); }
@@ -91,6 +104,28 @@ AIENOS=$(mstr aienos_commit)
 PHYSICS=$(mstr physics_commit)
 REDUCER_SRC=$(mstr reducer_source_sha256)
 BINARIES=$(grep -o '"binaries":{[^}]*}' "$MACH" | sed 's/^"binaries"://')
+PROV_SCHEMA=$(fstr "$PROV" schema)
+PROV_COMMIT=$(fstr "$PROV" candidate_commit)
+PROV_CANDIDATE_ARCHIVE=$(fstr "$PROV" candidate_archive_sha256)
+PROV_PHYSICS=$(fstr "$PROV" physics_commit)
+PROV_PHYSICS_ARCHIVE=$(fstr "$PROV" physics_archive_sha256)
+PROV_AIENOS=$(fstr "$PROV" aienos_commit)
+PROV_AIENOS_ARCHIVE=$(fstr "$PROV" aienos_archive_sha256)
+PROV_BUILD_COMMAND=$(fstr "$PROV" build_command)
+PROV_COMPILER=$(fstr "$PROV" compiler_sha256)
+PROV_MAKE=$(fstr "$PROV" make_sha256)
+PROV_BUILD_LOG=$(fstr "$PROV" build_log_sha256)
+PROV_BINARIES=$(fobj "$PROV" binaries)
+PROV_TRIAL=$(fstr "$PROV" trial)
+PROV_NODIGEST=$(fstr "$PROV" nodigest)
+PROV_REDUCER=$(fstr "$PROV" reducer)
+FINAL_SCHEMA=$(fstr "$FINAL" schema)
+FINAL_COMMIT=$(fstr "$FINAL" candidate_commit)
+FINAL_HEAD=$(fstr "$FINAL" final_head)
+FINAL_DIRTY=$(fraw "$FINAL" tracked_tree_dirty)
+FINAL_HEAD_UNCHANGED=$(fraw "$FINAL" head_unchanged)
+FINAL_BINARIES_UNCHANGED=$(fraw "$FINAL" binaries_unchanged)
+FINAL_BINARIES=$(fobj "$FINAL" binaries)
 SCHEMA_IN=$(grep -o '"schema":"[^"]*"' "$SUM" | head -1 | sed 's/.*:"//; s/"$//')
 ALL_PASS=$(sraw all_gates_pass)
 DIGEST_CLAIMED=$(grep -o '"raw_digest_sha256_of_SHA256SUMS":"[0-9a-f]*"' "$SUM" | sed 's/.*:"//; s/"$//')
@@ -99,6 +134,10 @@ GATES=$(grep -o '"gates":\[[^]]*\]' "$SUM" | sed 's/^"gates"://')
 
 [ "$SCHEMA_IN" = AIEN_RX_R15_SUMMARY_V1 ] || fail "summary.json schema is '$SCHEMA_IN', not AIEN_RX_R15_SUMMARY_V1"
 [ -n "$GATES" ] || fail "summary.json has no gate table"
+RUN_COMMIT_OK=true
+is_commit "$RUN_COMMIT" || { RUN_COMMIT_OK=false; fail "run commit is missing or malformed"; }
+MODE_OK=true
+case "$MODE" in host|silicon) ;; *) MODE_OK=false; fail "run mode '$MODE' is invalid";; esac
 
 # ---- gates (§11): every one of G1-G16 present and PASS
 NGATES=0
@@ -119,30 +158,148 @@ DIGEST_OK=false
 if [ -n "$DIGEST_CLAIMED" ] && [ "$DIGEST_CLAIMED" = "$DIGEST_ACTUAL" ]; then DIGEST_OK=true
 else fail "raw digest in summary.json ($DIGEST_CLAIMED) != SHA-256 of SHA256SUMS ($DIGEST_ACTUAL)"; fi
 
-# ---- candidate binding
+# ---- build and execution provenance
+PROV_FILES_OK=false
+PROV_DIGEST=""
+if [ ! -s "$PROV_SUMS" ]; then
+    fail "PROVENANCE_SHA256SUMS missing"
+elif [ "$MODE_OK" != true ]; then
+    fail "cannot validate executable provenance for invalid run mode"
+elif ! awk -v b1="bin/rx_r15_perf_$MODE" -v b2="bin/rx_r15_perf_${MODE}_nodigest" '
+        NF != 2 { bad = 1; next }
+        $2 != "build.log" && $2 != "build-provenance.json" && $2 != "final-state.json" &&
+            $2 != b1 && $2 != b2 && $2 != "bin/r15_reduce" { bad = 1 }
+        { if (++seen[$2] != 1) bad = 1 }
+        END { if (NR != 6 || bad) exit 1 }
+    ' "$PROV_SUMS"; then
+    fail "PROVENANCE_SHA256SUMS has an unexpected, duplicate or malformed path"
+elif ! (cd "$RAW" && sha256sum --quiet -c PROVENANCE_SHA256SUMS >/dev/null 2>&1); then
+    fail "build provenance files do not verify against PROVENANCE_SHA256SUMS"
+else
+    MANIFEST_COMPLETE=true
+    for rel in build.log build-provenance.json final-state.json \
+        "bin/rx_r15_perf_$MODE" "bin/rx_r15_perf_${MODE}_nodigest" bin/r15_reduce; do
+        awk -v want="$rel" 'NF == 2 && $2 == want { found = 1 } END { exit !found }' "$PROV_SUMS" \
+            || { MANIFEST_COMPLETE=false; fail "$rel missing from PROVENANCE_SHA256SUMS"; }
+    done
+    if [ "$MANIFEST_COMPLETE" = true ]; then PROV_FILES_OK=true; fi
+    PROV_DIGEST=$(sha256sum "$PROV_SUMS" | cut -d' ' -f1)
+fi
+
+PROVENANCE_OK=true
+[ "$PROV_SCHEMA" = AIEN_RX_R15_BUILD_PROVENANCE_V1 ] || { PROVENANCE_OK=false; fail "build provenance schema is '$PROV_SCHEMA'"; }
+[ "$PROV_COMMIT" = "$RUN_COMMIT" ] || { PROVENANCE_OK=false; fail "build provenance commit $PROV_COMMIT != run commit $RUN_COMMIT"; }
+[ "$PROV_PHYSICS" = "$PHYSICS" ] || { PROVENANCE_OK=false; fail "build provenance physics commit $PROV_PHYSICS != recorded $PHYSICS"; }
+[ "$PROV_AIENOS" = "$AIENOS" ] || { PROVENANCE_OK=false; fail "build provenance aienos commit $PROV_AIENOS != recorded $AIENOS"; }
+[ "$PROV_BINARIES" = "$BINARIES" ] || { PROVENANCE_OK=false; fail "build provenance binary hashes differ from machine.json"; }
+[ -n "$PROV_BUILD_COMMAND" ] || { PROVENANCE_OK=false; fail "build provenance has no build command"; }
+for ent in "candidate archive:$PROV_CANDIDATE_ARCHIVE" "physics archive:$PROV_PHYSICS_ARCHIVE" \
+    "aienos archive:$PROV_AIENOS_ARCHIVE" "compiler:$PROV_COMPILER" "make:$PROV_MAKE" \
+    "build log:$PROV_BUILD_LOG"; do
+    label=${ent%%:*}; value=${ent#*:}
+    is_sha256 "$value" || { PROVENANCE_OK=false; fail "$label digest is missing or malformed"; }
+done
+if [ -s "$RAW/build.log" ]; then
+    [ "$PROV_BUILD_LOG" = "$(sha256sum "$RAW/build.log" | cut -d' ' -f1)" ] \
+        || { PROVENANCE_OK=false; fail "build log digest differs from build provenance"; }
+else
+    PROVENANCE_OK=false; fail "build.log missing"
+fi
+if [ "$MODE_OK" = true ]; then
+    for ent in "bin/rx_r15_perf_$MODE:$PROV_TRIAL" \
+        "bin/rx_r15_perf_${MODE}_nodigest:$PROV_NODIGEST" "bin/r15_reduce:$PROV_REDUCER"; do
+        rel=${ent%%:*}; expected=${ent#*:}
+        if ! is_sha256 "$expected"; then
+            PROVENANCE_OK=false; fail "$rel digest is missing or malformed"
+        elif [ ! -f "$RAW/$rel" ] || [ "$(sha256sum "$RAW/$rel" | cut -d' ' -f1)" != "$expected" ]; then
+            PROVENANCE_OK=false; fail "$rel does not match the source-to-binary manifest"
+        fi
+    done
+else
+    PROVENANCE_OK=false
+fi
+
+FINAL_OK=true
+[ "$FINAL_SCHEMA" = AIEN_RX_R15_FINAL_STATE_V1 ] || { FINAL_OK=false; fail "final state schema is '$FINAL_SCHEMA'"; }
+[ "$FINAL_COMMIT" = "$RUN_COMMIT" ] || { FINAL_OK=false; fail "final state commit $FINAL_COMMIT != run commit $RUN_COMMIT"; }
+[ "$FINAL_HEAD" = "$RUN_COMMIT" ] || { FINAL_OK=false; fail "final HEAD $FINAL_HEAD != run commit $RUN_COMMIT"; }
+[ "$FINAL_DIRTY" = false ] || { FINAL_OK=false; fail "run tree was dirty at final seal"; }
+[ "$FINAL_HEAD_UNCHANGED" = true ] || { FINAL_OK=false; fail "HEAD did not remain unchanged through the run"; }
+[ "$FINAL_BINARIES_UNCHANGED" = true ] || { FINAL_OK=false; fail "an executed binary changed during the run"; }
+[ "$FINAL_BINARIES" = "$BINARIES" ] || { FINAL_OK=false; fail "final binary hashes differ from machine.json"; }
+
+SILICON=false
+if [ "$MODE" = silicon ]; then SILICON=true
+elif [ "$MODE_OK" = true ]; then fail "run mode is '$MODE', not silicon"
+fi
+
+# ---- pinned dependencies (aienos.lock / physics.lock at the run commit)
+AIENOS_LOCK=""; PHYSICS_LOCK=""
+if [ "$RUN_COMMIT_OK" = true ]; then
+    AIENOS_LOCK=$(git -C "$HERE" show "$RUN_COMMIT:aienos.lock" 2>/dev/null | tr -d '[:space:]')
+    PHYSICS_LOCK=$(git -C "$HERE" show "$RUN_COMMIT:physics.lock" 2>/dev/null | tr -d '[:space:]')
+fi
+DEPENDENCIES_OK=true
+[ "$RUN_COMMIT_OK" = true ] || DEPENDENCIES_OK=false
+if [ -z "$AIENOS" ]; then DEPENDENCIES_OK=false; fail "aienos_commit not recorded in machine.json"
+elif [ "$AIENOS" != "$AIENOS_LOCK" ]; then DEPENDENCIES_OK=false; fail "aienos_commit $AIENOS != aienos.lock $AIENOS_LOCK"; fi
+if [ -z "$PHYSICS" ]; then DEPENDENCIES_OK=false; fail "physics_commit not recorded in machine.json"
+elif [ "$PHYSICS" != "$PHYSICS_LOCK" ]; then DEPENDENCIES_OK=false; fail "physics_commit $PHYSICS != physics.lock $PHYSICS_LOCK"; fi
+
+# ---- candidate binding: every source, executable and final-state control
 BOUND=false
 if [ -z "$CANDIDATE" ]; then fail "no candidate commit given"
 elif [ "$CANDIDATE" != "$RUN_COMMIT" ]; then fail "run commit $RUN_COMMIT is not the candidate $CANDIDATE"
-elif [ "$TREE_DIRTY" != false ]; then fail "run tree was dirty"
+elif [ "$TREE_DIRTY" != false ]; then fail "run tree was dirty at start"
+elif [ "$PROV_FILES_OK" != true ] || [ "$PROVENANCE_OK" != true ] || \
+     [ "$FINAL_OK" != true ] || [ "$DEPENDENCIES_OK" != true ]; then :
 else BOUND=true; fi
 
-SILICON=false
-if [ "$MODE" = silicon ]; then SILICON=true; else fail "run mode is '$MODE', not silicon"; fi
-
-# ---- pinned dependencies (aienos.lock / physics.lock at the run commit)
-AIENOS_LOCK=$(git -C "$HERE" show "$RUN_COMMIT:aienos.lock" 2>/dev/null | tr -d '[:space:]')
-PHYSICS_LOCK=$(git -C "$HERE" show "$RUN_COMMIT:physics.lock" 2>/dev/null | tr -d '[:space:]')
-if [ -z "$AIENOS" ]; then fail "aienos_commit not recorded in machine.json"
-elif [ "$AIENOS" != "$AIENOS_LOCK" ]; then fail "aienos_commit $AIENOS != aienos.lock $AIENOS_LOCK"; fi
-if [ -z "$PHYSICS" ]; then fail "physics_commit not recorded in machine.json"
-elif [ "$PHYSICS" != "$PHYSICS_LOCK" ]; then fail "physics_commit $PHYSICS != physics.lock $PHYSICS_LOCK"; fi
-
 # ---- correctness reruns (§14, §16 item 9)
+# Parse before embedding. The schema-specific Omega validator composes the
+# repository's strict RFC 8259 reader and rejects non-root, missing, extra,
+# duplicate or non-PASS members (including escaped spellings of a duplicate).
 if [ -n "$RERUNS" ] && [ -s "$RERUNS" ]; then
-    RERUN_JSON=$(tr -d '\n' < "$RERUNS")
-    for k in $REQUIRED_RERUNS; do
-        printf '%s' "$RERUN_JSON" | grep -q "\"$k\":\"PASS\"" || fail "correctness rerun $k not PASS"
+    OMC=$HERE/seed/out/omc
+    JSON_UNIT=$HERE/seed/json/json.om
+    RERUN_UNIT=$HERE/tools/r15_reruns_validate.om
+    for f in "$OMC" "$HERE/seed/out/omc.sha256" "$JSON_UNIT" "$RERUN_UNIT"; do
+        [ -s "$f" ] || { echo "r15_receipt: missing $f" >&2; exit 2; }
     done
+    [ -x "$OMC" ] || { echo "r15_receipt: seeded compiler $OMC is not executable" >&2; exit 2; }
+    (cd "$HERE" && sha256sum --quiet -c seed/out/omc.sha256) || {
+        echo "r15_receipt: seeded compiler does not match seed/out/omc.sha256" >&2
+        exit 2
+    }
+    # omc and the programs it emits are AArch64. The digest above binds the
+    # compiler bytes. On any other machine, qemu-user runs those same bytes.
+    OM_PFX=()
+    if [ "$(uname -m)" != aarch64 ]; then
+        command -v qemu-aarch64 >/dev/null 2>&1 || {
+            echo "r15_receipt: seeded compiler is AArch64 and qemu-aarch64 is not installed" >&2
+            exit 2
+        }
+        OM_PFX=(qemu-aarch64 -L /usr/aarch64-linux-gnu)
+    fi
+    RERUN_CHECK=$(mktemp "$OUTDIR/.r15-reruns-check.XXXXXX") || exit 2
+    if ! { printf 'om2\n'; cat "$JSON_UNIT" "$RERUN_UNIT"; } | "${OM_PFX[@]}" "$OMC" > "$RERUN_CHECK"; then
+        rm -f "$RERUN_CHECK"
+        echo "r15_receipt: cannot build strict rerun validator" >&2
+        exit 2
+    fi
+    chmod 700 "$RERUN_CHECK" || { rm -f "$RERUN_CHECK"; exit 2; }
+    "${OM_PFX[@]}" "$RERUN_CHECK" < "$RERUNS"
+    RERUN_RC=$?
+    rm -f "$RERUN_CHECK"
+    if [ "$RERUN_RC" = 0 ]; then
+        RERUN_JSON=$(tr -d '\r\n' < "$RERUNS")
+    elif [ "$RERUN_RC" = 1 ]; then
+        RERUN_JSON='{"status":"invalid"}'
+        fail "correctness reruns must be one exact root object with every required key once and string value PASS"
+    else
+        echo "r15_receipt: rerun validator failed with exit $RERUN_RC" >&2
+        exit 2
+    fi
 else
     RERUN_JSON='{"status":"not done"}'
     fail "correctness reruns (§14) not recorded"
@@ -219,6 +376,13 @@ TMP=$(mktemp "$OUTDIR/.r15-receipt.XXXXXX") || exit 2
     printf '  "physics_commit": %s,\n' "$(jstr "$PHYSICS")"
     printf '  "physics_lock": %s,\n' "$(jstr "$PHYSICS_LOCK")"
     printf '  "benchmark_binaries_sha256": %s,\n' "${BINARIES:-null}"
+    printf '  "provenance_digest_sha256": %s,\n' "$(jstr "$PROV_DIGEST")"
+    printf '  "provenance_files_verified": %s,\n' "$PROV_FILES_OK"
+    printf '  "build_provenance": '
+    if [ -s "$PROV" ]; then tr -d '\n' < "$PROV"; else printf 'null'; fi
+    printf ',\n  "final_state": '
+    if [ -s "$FINAL" ]; then tr -d '\n' < "$FINAL"; else printf 'null'; fi
+    printf ',\n'
     printf '  "raw_digest_sha256": %s,\n' "$(jstr "$DIGEST_ACTUAL")"
     printf '  "raw_digest_matches_reducer": %s,\n' "$DIGEST_OK"
     printf '  "raw_files_verified": %s,\n' "$RAW_FILES_OK"

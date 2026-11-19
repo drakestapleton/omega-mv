@@ -224,7 +224,8 @@ static int record_committed_effect(Env *e, const char *dir, uint64_t effect_id) 
     uint64_t cand = 0;
     int rc = rx_gen_propose(store, SUBJ_PROPOSER, &d, &cand);
     if (rc == RX_GEN_OK) {
-        RxGenWork work = { effect_id, RX_WORK_EXTERNAL, RX_WORK_ISSUED, 0 };
+        RxGenWork work = {.id = effect_id, .class = RX_WORK_EXTERNAL,
+                          .state = RX_WORK_ISSUED, .required = 0};
         rc = rx_gen_add_work(store, cand, &work);
     }
     if (rc == RX_GEN_OK) {

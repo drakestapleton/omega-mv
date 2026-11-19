@@ -166,8 +166,9 @@ make $V test-r13-silicon
 make $V test-r14-silicon
 make $V test-r15-parity-silicon
 make $V test-r16-authpath-silicon     # G3 silicon
-make $V r15-perf-silicon              # builds the R15 binaries and reducer
-PHYSICS_DIR=... AIENOS_R7_DIR=... tools/r15_qualify.sh --detach silicon
+PHYSICS_DIR=... AIENOS_LOCK_REPO=... tools/r15_qualify.sh --detach silicon
+# r15_qualify verifies the pinned Git objects, builds private archive copies,
+# and executes only the digest-bound copies stored in the new raw run directory.
 make r15-receipt RUN=evidence/R15/raw/<run-id> CANDIDATE=<commit> RERUNS=<file> NOTES=<file>
 ```
 
