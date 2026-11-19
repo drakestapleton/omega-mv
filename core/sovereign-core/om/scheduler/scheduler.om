@@ -1,0 +1,837 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/scheduler/scheduler.om
+note Pure OM-2 conversion of aien-sovereign-core-mv/crates/aien-scheduler/src/sequence.rs and lib.rs.
+note Generational 64-bit SequenceId arena, continuous-batching scheduler with chunked prefill,
+note watermark memory-pressure preemption with anti-thrashing headroom, zero-copy fork admission,
+note and stale-handle purging.
+note Compose after si/directives/om2.om and core/sovereign-core/om/scheduler/kv_cache.om.
+
+const SEQ_ARENA_CAP ulong 64
+const SEQ_QUEUE_CAP ulong 64
+const SEQ_BATCH_CAP ulong 64
+
+note Invalid SequenceId: slot=0xffffffff, generation=0 (generation 0 is strictly invalid).
+const SEQ_ID_INVALID ulong 18446744069414584320
+
+note Priority levels (mirrors aien_platform::Priority)
+const PRIO_BACKGROUND ulong 0
+const PRIO_NORMAL ulong 1
+const PRIO_INTERACTIVE ulong 2
+const PRIO_REALTIME ulong 3
+
+note SequencePhase (mirrors sequence.rs::SequencePhase)
+const PHASE_WAITING ulong 0
+const PHASE_PREFILL ulong 1
+const PHASE_PREFILL_INFLIGHT ulong 2
+const PHASE_DECODE ulong 3
+const PHASE_DECODE_INFLIGHT ulong 4
+const PHASE_PREEMPTED ulong 5
+const PHASE_FINISHED ulong 6
+const PHASE_CANCELLED ulong 7
+
+const SCHED_OK ulong 0
+const SCHED_ERR_ARENA_FULL ulong 1
+const SCHED_ERR_STALE ulong 2
+const SCHED_ERR_INVALID_ID ulong 3
+const SCHED_ERR_QUEUE_FULL ulong 4
+const SCHED_ERR_KV_FAILED ulong 5
+
+note Arena arrays (64 slots)
+global ar_gen ulong 64
+global ar_active ulong 64
+global ar_prio ulong 64
+global ar_phase ulong 64
+global ar_prompt_len ulong 64
+global ar_prefilled ulong 64
+global ar_is_prefilled ulong 64
+global ar_toks_gen ulong 64
+global ar_max_toks ulong 64
+global ar_parent ulong 64
+global ar_arrival ulong 64
+
+note SchedulerConfig:
+note [0]=max_batch_size, [1]=max_batch_tokens, [2]=max_prefill_tokens,
+note [3]=prefill_chunk_size, [4]=chunk_prefill (0/1), [5]=watermark_blocks
+global sc_cfg ulong 8
+
+note SchedulerMetrics & state:
+note [0]=step_id, [1]=total_steps, [2]=admitted_reqs, [3]=finished_reqs,
+note [4]=preempted_reqs, [5]=total_prefill_toks, [6]=total_decode_toks,
+note [7]=chunked_prefill_steps
+global sc_met ulong 8
+
+note Waiting queue (ring buffer: head, tail, count in sc_qmeta[0..2])
+note Preempted queue (ring buffer: head, tail, count in sc_qmeta[3..5])
+note Running list count in sc_qmeta[6]
+global sc_qmeta ulong 8
+global sc_wait_q ulong 64
+global sc_preempt_q ulong 64
+global sc_running ulong 64
+
+note Current BatchPlan output:
+note sc_bmeta: [0]=step_id, [1]=prefill_cnt, [2]=decode_cnt, [3]=total_tokens, [4]=prefill_budget, [5]=preempted_this_step
+global sc_bmeta ulong 8
+global sc_bp_seq ulong 64
+global sc_bp_start ulong 64
+global sc_bp_len ulong 64
+global sc_bd_seq ulong 64
+global sc_bd_pos ulong 64
+
+note ---- SequenceId bit packing: [slot: u32 high][generation: u32 low] ----
+
+fn seq_id_make slot ulong gen ulong to ulong
+if or eq gen 0 or ge slot SEQ_ARENA_CAP gt gen ulong 4294967295
+ret SEQ_ID_INVALID
+end
+ret or shl slot ulong 32 and gen ulong 0xffffffff
+end
+
+fn seq_id_slot id ulong to ulong
+ret shr id ulong 32
+end
+
+fn seq_id_gen id ulong to ulong
+ret and id ulong 0xffffffff
+end
+
+fn seq_id_is_valid id ulong to bool
+g = seq_id_gen id
+if eq g 0
+ret false
+end
+ret lt seq_id_slot id SEQ_ARENA_CAP
+end
+
+note ---- SequenceArena ----
+
+fn arena_init to void
+for i ulong SEQ_ARENA_CAP
+put ar_gen i 1
+put ar_active i 0
+put ar_prio i 0
+put ar_phase i PHASE_WAITING
+put ar_prompt_len i 0
+put ar_prefilled i 0
+put ar_is_prefilled i 0
+put ar_toks_gen i 0
+put ar_max_toks i 0
+put ar_parent i SEQ_ID_INVALID
+put ar_arrival i 0
+end
+end
+
+fn arena_is_stale id ulong to bool
+if not seq_id_is_valid id
+ret true
+end
+slot = seq_id_slot id
+gen = seq_id_gen id
+if eq get ar_active slot 0
+ret true
+end
+ret ne get ar_gen slot gen
+end
+
+fn arena_insert prompt_len ulong max_toks ulong prio ulong arrival_ns ulong to ulong
+for i ulong SEQ_ARENA_CAP
+if eq get ar_active i 0
+gen = get ar_gen i
+if eq gen 0
+gen = ulong 1
+put ar_gen i gen
+end
+put ar_active i 1
+put ar_prio i prio
+put ar_phase i PHASE_WAITING
+put ar_prompt_len i prompt_len
+put ar_prefilled i 0
+put ar_is_prefilled i 0
+put ar_toks_gen i 0
+put ar_max_toks i max_toks
+put ar_parent i SEQ_ID_INVALID
+put ar_arrival i arrival_ns
+ret seq_id_make i gen
+end
+end
+ret SEQ_ID_INVALID
+end
+
+fn arena_fork_seq parent_id ulong to ulong
+if arena_is_stale parent_id
+ret SEQ_ID_INVALID
+end
+pslot = seq_id_slot parent_id
+for i ulong SEQ_ARENA_CAP
+if eq get ar_active i 0
+gen = get ar_gen i
+if eq gen 0
+gen = ulong 1
+put ar_gen i gen
+end
+put ar_active i 1
+put ar_prio i get ar_prio pslot
+put ar_phase i get ar_phase pslot
+put ar_prompt_len i get ar_prompt_len pslot
+put ar_prefilled i get ar_prefilled pslot
+put ar_is_prefilled i get ar_is_prefilled pslot
+put ar_toks_gen i get ar_toks_gen pslot
+put ar_max_toks i get ar_max_toks pslot
+put ar_parent i parent_id
+put ar_arrival i get ar_arrival pslot
+ret seq_id_make i gen
+end
+end
+ret SEQ_ID_INVALID
+end
+
+note Release a slot, mark terminal phase, and bump generation so old SequenceIds become stale.
+fn arena_release id ulong term_phase ulong to ulong
+if arena_is_stale id
+ret SCHED_ERR_STALE
+end
+slot = seq_id_slot id
+put ar_phase slot term_phase
+put ar_active slot 0
+ngen = add get ar_gen slot 1
+if or eq ngen 0 gt ngen ulong 4294967295
+ngen = ulong 1
+end
+put ar_gen slot ngen
+ret SCHED_OK
+end
+
+fn arena_get_phase id ulong to ulong
+if arena_is_stale id
+ret PHASE_CANCELLED
+end
+ret get ar_phase seq_id_slot id
+end
+
+fn arena_get_prefilled id ulong to ulong
+if arena_is_stale id
+ret 0
+end
+ret get ar_prefilled seq_id_slot id
+end
+
+fn arena_get_toks_gen id ulong to ulong
+if arena_is_stale id
+ret 0
+end
+ret get ar_toks_gen seq_id_slot id
+end
+
+note ---- Queue helpers ----
+
+fn q_wait_push id ulong to ulong
+cnt = get sc_qmeta 2
+if ge cnt SEQ_QUEUE_CAP
+ret SCHED_ERR_QUEUE_FULL
+end
+tail = get sc_qmeta 1
+put sc_wait_q tail id
+put sc_qmeta 1 rem add tail 1 SEQ_QUEUE_CAP
+put sc_qmeta 2 add cnt 1
+ret SCHED_OK
+end
+
+fn q_wait_front to ulong
+if eq get sc_qmeta 2 0
+ret SEQ_ID_INVALID
+end
+ret get sc_wait_q get sc_qmeta 0
+end
+
+fn q_wait_pop to ulong
+cnt = get sc_qmeta 2
+if eq cnt 0
+ret SEQ_ID_INVALID
+end
+head = get sc_qmeta 0
+id = get sc_wait_q head
+put sc_qmeta 0 rem add head 1 SEQ_QUEUE_CAP
+put sc_qmeta 2 sub cnt 1
+ret id
+end
+
+fn q_wait_push_front id ulong to ulong
+cnt = get sc_qmeta 2
+if ge cnt SEQ_QUEUE_CAP
+ret SCHED_ERR_QUEUE_FULL
+end
+head = get sc_qmeta 0
+if eq head 0
+head = sub SEQ_QUEUE_CAP 1
+else
+head = sub head 1
+end
+put sc_wait_q head id
+put sc_qmeta 0 head
+put sc_qmeta 2 add cnt 1
+ret SCHED_OK
+end
+
+fn q_preempt_push id ulong to ulong
+cnt = get sc_qmeta 5
+if ge cnt SEQ_QUEUE_CAP
+ret SCHED_ERR_QUEUE_FULL
+end
+tail = get sc_qmeta 4
+put sc_preempt_q tail id
+put sc_qmeta 4 rem add tail 1 SEQ_QUEUE_CAP
+put sc_qmeta 5 add cnt 1
+ret SCHED_OK
+end
+
+fn q_preempt_front to ulong
+if eq get sc_qmeta 5 0
+ret SEQ_ID_INVALID
+end
+ret get sc_preempt_q get sc_qmeta 3
+end
+
+fn q_preempt_pop to ulong
+cnt = get sc_qmeta 5
+if eq cnt 0
+ret SEQ_ID_INVALID
+end
+head = get sc_qmeta 3
+id = get sc_preempt_q head
+put sc_qmeta 3 rem add head 1 SEQ_QUEUE_CAP
+put sc_qmeta 5 sub cnt 1
+ret id
+end
+
+fn q_preempt_push_front id ulong to ulong
+cnt = get sc_qmeta 5
+if ge cnt SEQ_QUEUE_CAP
+ret SCHED_ERR_QUEUE_FULL
+end
+head = get sc_qmeta 3
+if eq head 0
+head = sub SEQ_QUEUE_CAP 1
+else
+head = sub head 1
+end
+put sc_preempt_q head id
+put sc_qmeta 3 head
+put sc_qmeta 5 add cnt 1
+ret SCHED_OK
+end
+
+fn running_push id ulong to ulong
+cnt = get sc_qmeta 6
+if ge cnt SEQ_ARENA_CAP
+ret SCHED_ERR_QUEUE_FULL
+end
+put sc_running cnt id
+put sc_qmeta 6 add cnt 1
+ret SCHED_OK
+end
+
+fn running_remove_at idx ulong to void
+cnt = get sc_qmeta 6
+if ge idx cnt
+ret
+end
+last = sub cnt 1
+for i ulong sub last idx bound 64
+pos = add idx i
+put sc_running pos get sc_running add pos 1
+end
+put sc_running last SEQ_ID_INVALID
+put sc_qmeta 6 last
+end
+
+note Insertion-sort running_sequences ascending by SequenceId (deterministic scheduling order).
+fn running_sort to void
+cnt = get sc_qmeta 6
+if le cnt 1
+ret
+end
+i = ulong 1
+while lt i cnt bound 64
+key = get sc_running i
+j = i
+while gt j 0 bound 64
+prev = get sc_running sub j 1
+if le prev key
+break
+end
+put sc_running j prev
+j = sub j 1
+end
+put sc_running j key
+i = add i 1
+end
+end
+
+note ---- Scheduler initialization & public API ----
+
+fn sched_init max_bs ulong max_bt ulong max_pt ulong chunk_sz ulong chunk_on ulong watermark ulong to void
+arena_init
+put sc_cfg 0 max_bs
+put sc_cfg 1 max_bt
+put sc_cfg 2 max_pt
+put sc_cfg 3 chunk_sz
+put sc_cfg 4 chunk_on
+put sc_cfg 5 watermark
+for i ulong 8
+put sc_met i 0
+put sc_qmeta i 0
+put sc_bmeta i 0
+end
+for i ulong SEQ_QUEUE_CAP
+put sc_wait_q i SEQ_ID_INVALID
+put sc_preempt_q i SEQ_ID_INVALID
+put sc_running i SEQ_ID_INVALID
+end
+end
+
+fn sched_waiting_count to ulong
+ret get sc_qmeta 2
+end
+
+fn sched_preempted_count to ulong
+ret get sc_qmeta 5
+end
+
+fn sched_running_count to ulong
+ret get sc_qmeta 6
+end
+
+fn sched_step_id to ulong
+ret get sc_met 0
+end
+
+fn sched_admitted_count to ulong
+ret get sc_met 2
+end
+
+fn sched_finished_count to ulong
+ret get sc_met 3
+end
+
+fn sched_preempted_total to ulong
+ret get sc_met 4
+end
+
+fn sched_prefill_tokens_total to ulong
+ret get sc_met 5
+end
+
+fn sched_decode_tokens_total to ulong
+ret get sc_met 6
+end
+
+fn sched_batch_prefill_count to ulong
+ret get sc_bmeta 1
+end
+
+fn sched_batch_decode_count to ulong
+ret get sc_bmeta 2
+end
+
+fn sched_batch_total_tokens to ulong
+ret get sc_bmeta 3
+end
+
+fn sched_batch_prefill_seq idx ulong to ulong
+if ge idx get sc_bmeta 1
+ret SEQ_ID_INVALID
+end
+ret get sc_bp_seq idx
+end
+
+fn sched_batch_prefill_start idx ulong to ulong
+if ge idx get sc_bmeta 1
+ret 0
+end
+ret get sc_bp_start idx
+end
+
+fn sched_batch_prefill_len idx ulong to ulong
+if ge idx get sc_bmeta 1
+ret 0
+end
+ret get sc_bp_len idx
+end
+
+fn sched_batch_decode_seq idx ulong to ulong
+if ge idx get sc_bmeta 2
+ret SEQ_ID_INVALID
+end
+ret get sc_bd_seq idx
+end
+
+fn sched_batch_decode_pos idx ulong to ulong
+if ge idx get sc_bmeta 2
+ret 0
+end
+ret get sc_bd_pos idx
+end
+
+note Submit a new sequence request to waiting_queue. Returns SequenceId or SEQ_ID_INVALID.
+fn sched_submit prompt_len ulong max_toks ulong prio ulong arrival_ns ulong to ulong
+if ge get sc_qmeta 2 SEQ_QUEUE_CAP
+ret SEQ_ID_INVALID
+end
+id = arena_insert prompt_len max_toks prio arrival_ns
+if eq id SEQ_ID_INVALID
+ret SEQ_ID_INVALID
+end
+st = q_wait_push id
+if ne st SCHED_OK
+rc = arena_release id PHASE_CANCELLED
+ret SEQ_ID_INVALID
+end
+put sc_met 2 add get sc_met 2 1
+ret id
+end
+
+note Zero-copy sequence fork: forks arena state and KV block table, adds child directly to running.
+fn sched_fork_seq parent_id ulong to ulong
+if arena_is_stale parent_id
+ret SEQ_ID_INVALID
+end
+if not kv_has_sequence parent_id
+ret SEQ_ID_INVALID
+end
+cid = arena_fork_seq parent_id
+if eq cid SEQ_ID_INVALID
+ret SEQ_ID_INVALID
+end
+kst = kv_fork_seq parent_id cid
+if ne kst KV_OK
+rc = arena_release cid PHASE_CANCELLED
+ret SEQ_ID_INVALID
+end
+rst = running_push cid
+if ne rst SCHED_OK
+kf = kv_free_sequence cid
+rc = arena_release cid PHASE_CANCELLED
+ret SEQ_ID_INVALID
+end
+put sc_met 2 add get sc_met 2 1
+ret cid
+end
+
+note Cancel a sequence: frees KV blocks if allocated and marks Cancelled (bumping generation).
+fn sched_cancel seq_id ulong to ulong
+if arena_is_stale seq_id
+ret SCHED_ERR_STALE
+end
+if kv_has_sequence seq_id
+kf = kv_free_sequence seq_id
+end
+ret arena_release seq_id PHASE_CANCELLED
+end
+
+note Discard stale handles from queue heads and running_sequences without panics.
+fn sched_purge_stale to void
+while gt get sc_qmeta 2 0 bound 64
+fid = q_wait_front
+if arena_is_stale fid
+popped = q_wait_pop
+else
+break
+end
+end
+while gt get sc_qmeta 5 0 bound 64
+fid = q_preempt_front
+if arena_is_stale fid
+popped = q_preempt_pop
+else
+break
+end
+end
+rcnt = get sc_qmeta 6
+widx = ulong 0
+for i ulong rcnt bound 64
+rid = get sc_running i
+if not arena_is_stale rid
+put sc_running widx rid
+widx = add widx 1
+end
+end
+put sc_qmeta 6 widx
+end
+
+note Phase 1: Watermark memory-pressure preemption of the lowest-priority running sequence.
+fn sched_phase1_watermark to void
+avail = kv_available_blocks
+wm = get sc_cfg 5
+rcnt = get sc_qmeta 6
+if or ge avail wm eq rcnt 0
+ret
+end
+best_idx = ulong 0
+best_prio = ulong 255
+found = false
+for i ulong rcnt bound 64
+rid = get sc_running i
+if not arena_is_stale rid
+p = get ar_prio seq_id_slot rid
+if or not found lt p best_prio
+best_prio = p
+best_idx = i
+found = true
+end
+end
+end
+if not found
+ret
+end
+pid = get sc_running best_idx
+running_remove_at best_idx
+if kv_has_sequence pid
+kf = kv_free_sequence pid
+end
+pslot = seq_id_slot pid
+put ar_phase pslot PHASE_PREEMPTED
+put ar_prefilled pslot 0
+put ar_is_prefilled pslot 0
+pst = q_preempt_push pid
+put sc_met 4 add get sc_met 4 1
+put sc_bmeta 5 1
+end
+
+note Helper: schedule one running sequence (decode or continuing prefill chunk).
+fn sched_schedule_one rid ulong to void
+if arena_is_stale rid
+ret
+end
+rslot = seq_id_slot rid
+if ne get ar_is_prefilled rslot 0
+if kv_has_sequence rid
+dcnt = get sc_bmeta 2
+pos = add get ar_prompt_len rslot get ar_toks_gen rslot
+put sc_bd_seq dcnt rid
+put sc_bd_pos dcnt pos
+put sc_bmeta 2 add dcnt 1
+put sc_bmeta 3 add get sc_bmeta 3 1
+end
+ret
+end
+plen = get ar_prompt_len rslot
+pfill = get ar_prefilled rslot
+rem_p = ulong 0
+if gt plen pfill
+rem_p = sub plen pfill
+end
+take = rem_p
+csz = get sc_cfg 3
+if gt take csz
+take = csz
+end
+pbud = get sc_bmeta 4
+if gt take pbud
+take = pbud
+end
+if gt take 0
+pcnt = get sc_bmeta 1
+put sc_bp_seq pcnt rid
+put sc_bp_start pcnt pfill
+put sc_bp_len pcnt take
+put sc_bmeta 1 add pcnt 1
+put sc_bmeta 3 add get sc_bmeta 3 take
+put sc_bmeta 4 sub pbud take
+end
+end
+
+note Phase 2: Schedule active decode sequences and continuing chunked prefill spans.
+fn sched_phase2_running to void
+running_sort
+rcnt = get sc_qmeta 6
+for i ulong rcnt bound 64
+if ge add get sc_bmeta 1 get sc_bmeta 2 get sc_cfg 0
+break
+end
+if ge get sc_bmeta 3 get sc_cfg 1
+break
+end
+sched_schedule_one get sc_running i
+end
+end
+
+note Helper: try admitting one sequence (returns true to keep admitting, false to stop).
+fn sched_admit_one nid ulong is_pre bool to bool
+nslot = seq_id_slot nid
+plen = get ar_prompt_len nslot
+bsize = kv_block_size
+req_blks = ulong 0
+if gt plen 0
+req_blks = div add plen sub bsize 1 bsize
+end
+min_need = req_blks
+if is_pre
+min_need = add req_blks get sc_cfg 5
+end
+if lt kv_available_blocks min_need
+ret false
+end
+if is_pre
+popped = q_preempt_pop
+else
+popped = q_wait_pop
+end
+note Zero-copy fork invariant: pre-allocated KV table skips prefill and enters decode directly.
+if kv_has_sequence nid
+put ar_is_prefilled nslot 1
+put ar_phase nslot PHASE_DECODE
+put ar_prefilled nslot plen
+dcnt = get sc_bmeta 2
+put sc_bd_seq dcnt nid
+put sc_bd_pos dcnt add plen get ar_toks_gen nslot
+put sc_bmeta 2 add dcnt 1
+put sc_bmeta 3 add get sc_bmeta 3 1
+rst = running_push nid
+ret true
+end
+take = plen
+if ne get sc_cfg 4 0
+if gt take get sc_cfg 3
+take = get sc_cfg 3
+end
+end
+pbud = get sc_bmeta 4
+if gt take pbud
+take = pbud
+end
+if eq take 0
+if is_pre
+ps = q_preempt_push_front nid
+else
+ps = q_wait_push_front nid
+end
+ret false
+end
+if ne kv_allocate_sequence nid plen KV_OK
+if is_pre
+ps = q_preempt_push_front nid
+else
+ps = q_wait_push_front nid
+end
+ret false
+end
+pcnt = get sc_bmeta 1
+put sc_bp_seq pcnt nid
+put sc_bp_start pcnt 0
+put sc_bp_len pcnt take
+put sc_bmeta 1 add pcnt 1
+put sc_bmeta 3 add get sc_bmeta 3 take
+put sc_bmeta 4 sub pbud take
+put ar_phase nslot PHASE_PREFILL
+rst = running_push nid
+ret true
+end
+
+note Phase 3: Admit preempted (with watermark headroom) then waiting sequences.
+fn sched_phase3_admit to void
+if ne get sc_bmeta 5 0
+ret
+end
+while true bound 64
+if ge add get sc_bmeta 1 get sc_bmeta 2 get sc_cfg 0
+break
+end
+if ge get sc_bmeta 3 get sc_cfg 1
+break
+end
+if eq get sc_bmeta 4 0
+break
+end
+is_pre = false
+nid = SEQ_ID_INVALID
+if gt get sc_qmeta 5 0
+nid = q_preempt_front
+is_pre = true
+else
+if gt get sc_qmeta 2 0
+nid = q_wait_front
+else
+break
+end
+end
+if arena_is_stale nid
+if is_pre
+popped = q_preempt_pop
+else
+popped = q_wait_pop
+end
+continue
+end
+if not sched_admit_one nid is_pre
+break
+end
+end
+end
+
+note Build the next BatchPlan (returns true if non-empty batch was scheduled).
+fn sched_build_batch to bool
+sid = add get sc_met 0 1
+put sc_met 0 sid
+sched_purge_stale
+put sc_bmeta 0 sid
+put sc_bmeta 1 0
+put sc_bmeta 2 0
+put sc_bmeta 3 0
+put sc_bmeta 4 get sc_cfg 2
+put sc_bmeta 5 0
+sched_phase1_watermark
+sched_phase2_running
+sched_phase3_admit
+if and eq get sc_bmeta 1 0 eq get sc_bmeta 2 0
+ret false
+end
+ret true
+end
+
+note Complete the scheduled batch step: advance prefill spans, append KV tokens for decode items,
+note and finish sequences that reached max_tokens (freeing their KV blocks).
+fn sched_complete_step to ulong
+pcnt = get sc_bmeta 1
+dcnt = get sc_bmeta 2
+put sc_met 1 add get sc_met 1 1
+if gt pcnt 0
+put sc_met 7 add get sc_met 7 1
+end
+for i ulong pcnt bound 64
+pid = get sc_bp_seq i
+plen_chunk = get sc_bp_len i
+put sc_met 5 add get sc_met 5 plen_chunk
+if not arena_is_stale pid
+pslot = seq_id_slot pid
+if eq get ar_is_prefilled pslot 0
+np = add get ar_prefilled pslot plen_chunk
+put ar_prefilled pslot np
+if ge np get ar_prompt_len pslot
+put ar_is_prefilled pslot 1
+put ar_phase pslot PHASE_DECODE
+end
+end
+end
+end
+ares = new KvAppendRes 0 0 0 0
+for i ulong dcnt bound 64
+did = get sc_bd_seq i
+if arena_is_stale did
+continue
+end
+dslot = seq_id_slot did
+st = kv_append_token did ares
+if ne st KV_OK
+ret SCHED_ERR_KV_FAILED
+end
+ng = add get ar_toks_gen dslot 1
+put ar_toks_gen dslot ng
+put sc_met 6 add get sc_met 6 1
+if ge ng get ar_max_toks dslot
+kf = kv_free_sequence did
+rc = arena_release did PHASE_FINISHED
+put sc_met 3 add get sc_met 3 1
+end
+end
+sched_purge_stale
+ret SCHED_OK
+end

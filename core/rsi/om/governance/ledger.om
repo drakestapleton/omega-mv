@@ -1,0 +1,314 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/rsi/om/governance/ledger.om
+note Pure OM-2 conversion of spark-rsi-mv/src/ledger/record.rs and src/ledger/merkle.rs.
+note Cryptographic SHA-256 hash-chained improvement ledger and domain-separated binary
+note Merkle tree root + leaf inclusion verification.
+note Compose after si/directives/om2.om and om/tls/sha2.om.
+
+const RSI_LDG_CAP ulong 64
+const RSI_LDG_HASH_BYTES ulong 32
+const RSI_LDG_HASH_TOTAL ulong 2048
+
+const RSI_LDG_OK ulong 0
+const RSI_LDG_ERR_FULL ulong 1
+const RSI_LDG_ERR_SEQ ulong 2
+const RSI_LDG_ERR_PREV_HASH ulong 3
+const RSI_LDG_ERR_HASH ulong 4
+const RSI_LDG_ERR_EMPTY ulong 5
+const RSI_LDG_ERR_OOB ulong 6
+
+text rsi_ldg_dom "RSI-LEDGER-V1"
+text rsi_leaf_dom "RSI-LEAF-V1"
+text rsi_node_dom "RSI-NODE-V1"
+
+note Ledger metadata: [0]=count, [1]=last_seq
+global rldg_meta ulong 4
+global rldg_seq ulong 64
+global rldg_cand_id ulong 64
+global rldg_tier ulong 64
+global rldg_verdict ulong 64
+global rldg_perf_delta long 64
+global rldg_corr_bps ulong 64
+global rldg_trust_src ulong 64
+global rldg_prev_hash uchar 2048
+global rldg_hash uchar 2048
+
+note Working Merkle level buffers (2 levels of up to 64 * 32 = 2048 bytes each)
+global rldg_m_cur uchar 2048
+global rldg_m_nxt uchar 2048
+
+fn rsi_ledger_reset to void
+for i ulong 4
+put rldg_meta i 0
+end
+for i ulong RSI_LDG_CAP
+put rldg_seq i 0
+put rldg_cand_id i 0
+put rldg_tier i 0
+put rldg_verdict i 0
+put rldg_perf_delta i long 0
+put rldg_corr_bps i 0
+put rldg_trust_src i 0
+end
+for i ulong RSI_LDG_HASH_TOTAL
+put rldg_prev_hash i uchar 0
+put rldg_hash i uchar 0
+put rldg_m_cur i uchar 0
+put rldg_m_nxt i uchar 0
+end
+end
+
+fn rsi_ledger_count to ulong
+ret get rldg_meta 0
+end
+
+note Write a u64 in little-endian into buf[off..off+8).
+fn rldg_put_u64 buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul i 8
+put buf add off i uchar and shr v sh ulong 255
+end
+end
+
+note Compute canonical SHA-256 hash of ledger record at index idx into out_h[0..32).
+fn rldg_compute_rec_hash idx ulong out_h edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx rsi_ldg_dom
+hdr = new uchar 56 0
+rldg_put_u64 hdr 0 get rldg_seq idx
+rldg_put_u64 hdr 8 get rldg_cand_id idx
+rldg_put_u64 hdr 16 get rldg_tier idx
+rldg_put_u64 hdr 24 get rldg_verdict idx
+rldg_put_u64 hdr 32 bitcast ulong get rldg_perf_delta idx
+rldg_put_u64 hdr 40 get rldg_corr_bps idx
+rldg_put_u64 hdr 48 get rldg_trust_src idx
+sha256_update ctx hdr
+prev = new uchar 32 0
+pbase = mul idx RSI_LDG_HASH_BYTES
+for i ulong 32
+put prev i get rldg_prev_hash add pbase i
+end
+sha256_update ctx prev
+sha256_final ctx out_h
+end
+
+note Constant-time 32-byte equality comparison.
+fn rldg_hash_eq a view uchar 32 b view uchar 32 to bool
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get a i get b i
+end
+ret eq diff uchar 0
+end
+
+note Append an evaluated improvement record to the cryptographic hash-chained ledger.
+fn rsi_ledger_append cand_id ulong tier ulong verdict ulong perf_delta long corr_bps ulong trust_src ulong to ulong
+cnt = get rldg_meta 0
+if ge cnt RSI_LDG_CAP
+ret RSI_LDG_ERR_FULL
+end
+nseq = add get rldg_meta 1 1
+put rldg_seq cnt nseq
+put rldg_cand_id cnt cand_id
+put rldg_tier cnt tier
+put rldg_verdict cnt verdict
+put rldg_perf_delta cnt perf_delta
+put rldg_corr_bps cnt corr_bps
+put rldg_trust_src cnt trust_src
+pbase = mul cnt RSI_LDG_HASH_BYTES
+if eq cnt 0
+for i ulong 32
+put rldg_prev_hash add pbase i uchar 0
+end
+else
+lbase = mul sub cnt 1 RSI_LDG_HASH_BYTES
+for i ulong 32
+put rldg_prev_hash add pbase i get rldg_hash add lbase i
+end
+end
+h = new uchar 32 0
+rldg_compute_rec_hash cnt h
+for i ulong 32
+put rldg_hash add pbase i get h i
+end
+put rldg_meta 0 add cnt 1
+put rldg_meta 1 nseq
+ret RSI_LDG_OK
+end
+
+note Verify the entire ledger chain from genesis: strict sequence monotonicity, prev_hash links, and SHA-256 hashes.
+fn rsi_ledger_verify_chain to ulong
+cnt = get rldg_meta 0
+exp_prev = new uchar 32 0
+cur_prev = new uchar 32 0
+stored_h = new uchar 32 0
+comp_h = new uchar 32 0
+for i ulong cnt bound 64
+if ne get rldg_seq i add i 1
+ret RSI_LDG_ERR_SEQ
+end
+pbase = mul i RSI_LDG_HASH_BYTES
+for j ulong 32
+put cur_prev j get rldg_prev_hash add pbase j
+put stored_h j get rldg_hash add pbase j
+end
+if not rldg_hash_eq cur_prev exp_prev
+ret RSI_LDG_ERR_PREV_HASH
+end
+rldg_compute_rec_hash i comp_h
+if not rldg_hash_eq stored_h comp_h
+ret RSI_LDG_ERR_HASH
+end
+for j ulong 32
+put exp_prev j get stored_h j
+end
+end
+ret RSI_LDG_OK
+end
+
+note Hash one Merkle leaf: SHA-256("RSI-LEAF-V1" || record_hash).
+fn rldg_hash_leaf rec_idx ulong dst_idx ulong to void
+ctx = new ulong 40 0
+leaf_in = new uchar 32 0
+leaf_out = new uchar 32 0
+sbase = mul rec_idx 32
+for j ulong 32
+put leaf_in j get rldg_hash add sbase j
+end
+sha256_init ctx
+sha256_update ctx rsi_leaf_dom
+sha256_update ctx leaf_in
+sha256_final ctx leaf_out
+dbase = mul dst_idx 32
+for j ulong 32
+put rldg_m_cur add dbase j get leaf_out j
+end
+end
+
+note Hash two Merkle children (left, right) in rldg_m_cur into rldg_m_nxt[dst_idx].
+fn rldg_hash_pair left_idx ulong right_idx ulong dst_idx ulong to void
+ctx = new ulong 40 0
+pair = new uchar 64 0
+lbase = mul left_idx 32
+rbase = mul right_idx 32
+for j ulong 32
+put pair j get rldg_m_cur add lbase j
+put pair add j 32 get rldg_m_cur add rbase j
+end
+node_out = new uchar 32 0
+sha256_init ctx
+sha256_update ctx rsi_node_dom
+sha256_update ctx pair
+sha256_final ctx node_out
+dbase = mul dst_idx 32
+for j ulong 32
+put rldg_m_nxt add dbase j get node_out j
+end
+end
+
+note Advance rldg_m_cur one Merkle level up and return the new width.
+fn rldg_merkle_step_level width ulong to ulong
+nwidth = div add width 1 2
+for p ulong nwidth bound 32
+lidx = mul p 2
+ridx = add lidx 1
+if ge ridx width
+ridx = lidx
+end
+rldg_hash_pair lidx ridx p
+end
+nbytes = mul nwidth 32
+for b ulong nbytes bound 2048
+put rldg_m_cur b get rldg_m_nxt b
+end
+ret nwidth
+end
+
+note Combine cur_h with sibling at sib_idx in rldg_m_cur into cur_h.
+fn rldg_merkle_combine cur_h edit uchar 32 sib_idx ulong is_right bool to void
+pair = new uchar 64 0
+ctx = new ulong 40 0
+sbase = mul sib_idx 32
+if is_right
+for j ulong 32
+put pair j get rldg_m_cur add sbase j
+put pair add j 32 get cur_h j
+end
+else
+for j ulong 32
+put pair j get cur_h j
+put pair add j 32 get rldg_m_cur add sbase j
+end
+end
+sha256_init ctx
+sha256_update ctx rsi_node_dom
+sha256_update ctx pair
+sha256_final ctx cur_h
+end
+
+note Compute binary Merkle root over all ledger record hashes (odd levels duplicate last node).
+fn rsi_merkle_root out_root edit uchar 32 to ulong
+cnt = get rldg_meta 0
+if eq cnt 0
+ret RSI_LDG_ERR_EMPTY
+end
+for i ulong cnt bound 64
+rldg_hash_leaf i i
+end
+width = cnt
+while gt width 1 bound 8
+width = rldg_merkle_step_level width
+end
+for j ulong 32
+put out_root j get rldg_m_cur j
+end
+ret RSI_LDG_OK
+end
+
+note Compute Merkle inclusion proof for leaf_idx and verify it matches expected_root.
+fn rsi_merkle_verify_leaf leaf_idx ulong expected_root view uchar 32 to bool
+cnt = get rldg_meta 0
+if or eq cnt 0 ge leaf_idx cnt
+ret false
+end
+for i ulong cnt bound 64
+rldg_hash_leaf i i
+end
+cur_h = new uchar 32 0
+lbase = mul leaf_idx 32
+for j ulong 32
+put cur_h j get rldg_m_cur add lbase j
+end
+pos = leaf_idx
+width = cnt
+while gt width 1 bound 8
+is_right = eq rem pos 2 1
+sib_idx = add pos 1
+if is_right
+sib_idx = sub pos 1
+else
+if ge sib_idx width
+sib_idx = pos
+end
+end
+rldg_merkle_combine cur_h sib_idx is_right
+width = rldg_merkle_step_level width
+pos = div pos 2
+end
+ret rldg_hash_eq cur_h expected_root
+end
+
+note Test-only tamper helper (used by negative controls to simulate on-disk corruption).
+fn rsi_ledger_tamper_perf idx ulong bad_val long to void
+if lt idx get rldg_meta 0
+put rldg_perf_delta idx bad_val
+end
+end
+
+fn rsi_ledger_tamper_prev idx ulong byte_idx ulong xor_mask uchar to void
+if and lt idx get rldg_meta 0 lt byte_idx 32
+off = add mul idx 32 byte_idx
+put rldg_prev_hash off xor get rldg_prev_hash off xor_mask
+end
+end

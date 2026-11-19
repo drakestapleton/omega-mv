@@ -1,0 +1,163 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/rsi/om/governance/promotion_gate.om
+note Pure OM-2 conversion of spark-rsi-mv/src/safety_envelope.rs, src/promotion_gate.rs,
+note src/ratify.rs, and src/meta/three_criteria.rs.
+note Fail-closed safety envelope, non-synthetic trust enforcement, branch-only ratification,
+note protected-path refusal, and three-criteria meta-improvement promotion gate.
+
+note Candidate improvement tiers (mirrors meta/tier.rs)
+const RSI_TIER_L0_PARAM ulong 0
+const RSI_TIER_L1_KERNEL ulong 1
+const RSI_TIER_L2_ALGO ulong 2
+const RSI_TIER_L3_META ulong 3
+
+note Trust input provenance (mirrors test_no_synthetic_trust_inputs.rs)
+const RSI_TRUST_SYNTHETIC ulong 0
+const RSI_TRUST_MEASURED_CANARY ulong 1
+const RSI_TRUST_MEASURED_SILICON ulong 2
+
+note Deterministic promotion verdicts
+const RSI_PROMOTE ulong 0
+const RSI_HOLD_NO_GAIN ulong 1
+const RSI_DENY_SYNTHETIC_TRUST ulong 10
+const RSI_DENY_NOT_BRANCH_ONLY ulong 11
+const RSI_DENY_PROTECTED_PATH ulong 12
+const RSI_DENY_SECURITY ulong 13
+const RSI_DENY_CORRECTNESS ulong 14
+const RSI_DENY_REPLAY ulong 15
+const RSI_DENY_ENVELOPE ulong 16
+const RSI_DENY_REGRESSION ulong 17
+const RSI_DENY_META_THRESHOLD ulong 18
+const RSI_DENY_INVALID_TIER ulong 19
+
+note Candidate evaluation record
+struct RsiCandidate id ulong tier ulong diff_lines ulong files_changed ulong correctness_bps ulong perf_delta_bps long res_delta_bps long sec_findings ulong replay_pass ulong trust_src ulong touches_protected ulong branch_only ulong end
+
+note Safety envelope & promotion thresholds:
+note [0]=max_diff_lines, [1]=max_files_changed, [2]=min_correctness_bps (out of 10000),
+note [3]=max_regression_bps (positive magnitude), [4]=min_perf_gain_bps, [5]=min_res_gain_bps,
+note [6]=meta_gain_mult (e.g. 2 for L3_META)
+global rsi_env ulong 8
+
+note Gate decision counters: [0]=evaluated, [1]=promoted, [2]=held, [3]=denied
+global rsi_gate_stats ulong 4
+
+fn rsi_gate_init max_diff ulong max_files ulong min_corr ulong max_reg ulong min_perf ulong min_res ulong to void
+put rsi_env 0 max_diff
+put rsi_env 1 max_files
+put rsi_env 2 min_corr
+put rsi_env 3 max_reg
+put rsi_env 4 min_perf
+put rsi_env 5 min_res
+put rsi_env 6 2
+put rsi_env 7 1
+for i ulong 4
+put rsi_gate_stats i 0
+end
+end
+
+fn rsi_gate_evaluated to ulong
+ret get rsi_gate_stats 0
+end
+
+fn rsi_gate_promoted to ulong
+ret get rsi_gate_stats 1
+end
+
+fn rsi_gate_held to ulong
+ret get rsi_gate_stats 2
+end
+
+fn rsi_gate_denied to ulong
+ret get rsi_gate_stats 3
+end
+
+fn rsi_record_verdict v ulong to ulong
+put rsi_gate_stats 0 add get rsi_gate_stats 0 1
+if eq v RSI_PROMOTE
+put rsi_gate_stats 1 add get rsi_gate_stats 1 1
+else
+if eq v RSI_HOLD_NO_GAIN
+put rsi_gate_stats 2 add get rsi_gate_stats 2 1
+else
+put rsi_gate_stats 3 add get rsi_gate_stats 3 1
+end
+end
+ret v
+end
+
+note Evaluate a candidate against the fail-closed safety envelope and three-criteria gate.
+fn rsi_evaluate_candidate cand view RsiCandidate to ulong
+note 1. Reject uninitialized envelope (fail-closed)
+if eq get rsi_env 7 0
+ret rsi_record_verdict RSI_DENY_ENVELOPE
+end
+note 2. Validate tier
+tier = get cand tier
+if gt tier RSI_TIER_L3_META
+ret rsi_record_verdict RSI_DENY_INVALID_TIER
+end
+note 3. Reject synthetic trust inputs unconditionally
+tsrc = get cand trust_src
+if eq tsrc RSI_TRUST_SYNTHETIC
+ret rsi_record_verdict RSI_DENY_SYNTHETIC_TRUST
+end
+if gt tsrc RSI_TRUST_MEASURED_SILICON
+ret rsi_record_verdict RSI_DENY_SYNTHETIC_TRUST
+end
+note 4. Branch-only ratification invariant
+if eq get cand branch_only 0
+ret rsi_record_verdict RSI_DENY_NOT_BRANCH_ONLY
+end
+note 5. Protected governance/safety path refusal
+if ne get cand touches_protected 0
+ret rsi_record_verdict RSI_DENY_PROTECTED_PATH
+end
+note 6. Zero security findings required
+if gt get cand sec_findings 0
+ret rsi_record_verdict RSI_DENY_SECURITY
+end
+note 7. Correctness floor and longitudinal replay pass required
+if lt get cand correctness_bps get rsi_env 2
+ret rsi_record_verdict RSI_DENY_CORRECTNESS
+end
+if eq get cand replay_pass 0
+ret rsi_record_verdict RSI_DENY_REPLAY
+end
+note 8. Diff blast-radius safety envelope
+if gt get cand diff_lines get rsi_env 0
+ret rsi_record_verdict RSI_DENY_ENVELOPE
+end
+if gt get cand files_changed get rsi_env 1
+ret rsi_record_verdict RSI_DENY_ENVELOPE
+end
+note 9. Regression guard (neither performance nor resource efficiency may regress past bound)
+max_reg_neg = neg long get rsi_env 3
+pdelta = get cand perf_delta_bps
+rdelta = get cand res_delta_bps
+if lt pdelta max_reg_neg
+ret rsi_record_verdict RSI_DENY_REGRESSION
+end
+if lt rdelta max_reg_neg
+ret rsi_record_verdict RSI_DENY_REGRESSION
+end
+note 10. Three-criteria positive gain check (stricter multiplier for L3_META)
+req_perf = long get rsi_env 4
+req_res = long get rsi_env 5
+if eq tier RSI_TIER_L3_META
+mult = long get rsi_env 6
+mperf = mul req_perf mult
+mres = mul req_res mult
+if or ge pdelta mperf ge rdelta mres
+ret rsi_record_verdict RSI_PROMOTE
+end
+if or ge pdelta req_perf ge rdelta req_res
+ret rsi_record_verdict RSI_DENY_META_THRESHOLD
+end
+ret rsi_record_verdict RSI_HOLD_NO_GAIN
+end
+if or ge pdelta req_perf ge rdelta req_res
+ret rsi_record_verdict RSI_PROMOTE
+end
+ret rsi_record_verdict RSI_HOLD_NO_GAIN
+end
