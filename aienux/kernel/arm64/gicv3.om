@@ -1,6 +1,6 @@
 note SPDX-License-Identifier: Apache-2.0
-note aienux/kernel/arm64/gicv3.om: Pure-Omega GICv3 Distributor + per-core Redistributor +
-note ICC_*_EL1 CPU interface + GICv3 ITS (MAPD/MAPC/MAPTI/INVALL for MSI-X LPIs) + IRQ dispatch.
+note aienux/kernel/arm64/gicv3.om: Pure-Omega GICv3 Distributor + per-core Redistributor (with LPI tables)
+note + ICC_*_EL1 CPU interface + GICv3 ITS (GITS_CBASER/GITS_BASERn + MAPD/MAPC/MAPTI/INVALL/SYNC) + IRQ dispatch.
 
 const GICD_CTLR ulong 0x0000
 const GICD_PIDR2 ulong 0xffe8
@@ -9,24 +9,36 @@ const GICD_ISENABLER ulong 0x0100
 const GICD_IPRIORITYR ulong 0x0400
 const GICD_IROUTER ulong 0x6000
 
+const GICR_CTLR ulong 0x0000
 const GICR_TYPER ulong 0x0008
 const GICR_WAKER ulong 0x0014
+const GICR_PROPBASER ulong 0x0070
+const GICR_PENDBASER ulong 0x0078
 const GICR_SGI ulong 0x10000
 const GICR_IGROUPR0 ulong 0x10080
 const GICR_ISENABLER0 ulong 0x10100
 const GICR_IPRIORITYR ulong 0x10400
 
 const GITS_CTLR ulong 0x0000
+const GITS_TYPER ulong 0x0008
 const GITS_CBASER ulong 0x0080
 const GITS_CWRITER ulong 0x0088
 const GITS_CREADR ulong 0x0090
 const GITS_BASER0 ulong 0x0100
 const GITS_TRANSLATER ulong 0x10040
 
+note ITS attribute bits (IHI 0069H): Valid (bit 63), InnerCache=Normal-NC (0b001 << 59), Shareability=OSH (0b10 << 10)
+const GITS_ATTR_NC_OSH ulong 0x8800000000000800
+note GICR_PROPBASER/PENDBASER attrs: InnerCache=Normal-NC (0b001 << 7), Shareability=OSH (0b10 << 10)
+const GICR_ATTR_NC_OSH ulong 0x0000000000000880
+const GICR_PEND_PTZ ulong 0x4000000000000000
+
 const GIC_MAX_HANDLERS ulong 64
 
-note gic_state: 0=gicd_pa, 1=gicr_base, 2=gicr_len, 3=gits_pa, 4=arch_rev, 5=its_cmdq_pa, 6=its_cwrite, 7=next_lpi
-global gic_state ulong 8
+note gic_state:
+note   0=gicd_pa, 1=gicr_base, 2=gicr_len, 3=gits_pa, 4=arch_rev, 5=its_cmdq_pa,
+note   6=its_cwrite, 7=next_lpi, 8=lpi_prop_pa, 9=boot_rd_pa, 10=its_ready, 11=its_cmd_count
+global gic_state ulong 16
 global gic_irq_id ulong 64
 global gic_irq_tag ulong 64
 global gic_irq_hits ulong 64
@@ -59,11 +71,9 @@ raff = shr typer 32
 if eq raff aff
 ret rd
 end
-note GICR_TYPER.Last (bit 4)
 if ne and typer 16 0
 ret 0
 end
-note VLPIS (bit 1): stride 256 KiB if set, else 128 KiB
 stride = ulong 0x20000
 if ne and typer 2 0
 stride = ulong 0x40000
@@ -83,7 +93,40 @@ x = fwst add rd poff 4 pv
 x = fwst add rd GICR_ISENABLER0 4 shl ulong 1 30
 end
 
-note Initialize per-core GICR + ICC_*_EL1 CPU interface (called on boot core and every secondary core).
+note Configure per-core GICR LPI Property + Pending tables (Normal-NC, OSH) and enable LPIs.
+fn gicr_init_lpis rd ulong to bool
+prop = get gic_state 8
+if eq prop 0
+prop = dma_alloc_nc 16 65536
+if eq prop 0
+ret false
+end
+note Fill 64 KiB LPI property table with 0x81 (priority 0x80 | Enable bit 0).
+i = ulong 0
+while lt i 65536 bound 8192
+x = fwst add prop i 8 0x8181818181818181
+i = add i 8
+end
+arm64_dsb_sy
+put gic_state 8 prop
+end
+pend = dma_alloc_nc 16 65536
+if eq pend 0
+ret false
+end
+note Disable EnableLPIs while programming PROPBASER/PENDBASER.
+ctlr = fwld add rd GICR_CTLR 4
+x = fwst add rd GICR_CTLR 4 and ctlr ulong 0xfffffffe
+arm64_dsb_sy
+x = fwst add rd GICR_PROPBASER 8 or or GICR_ATTR_NC_OSH prop 15
+x = fwst add rd GICR_PENDBASER 8 or or GICR_PEND_PTZ GICR_ATTR_NC_OSH pend
+arm64_dsb_sy
+x = fwst add rd GICR_CTLR 4 or ctlr 1
+arm64_dsb_sy
+ret true
+end
+
+note Initialize per-core GICR + LPIs + ICC_*_EL1 CPU interface (boot core and every secondary core).
 fn gicv3_init_cpu to bool
 base = get gic_state 1
 length = get gic_state 2
@@ -94,7 +137,9 @@ rd = gicr_find_mine base length
 if eq rd 0
 ret false
 end
-note Wake up Redistributor: clear ProcessorSleep (bit 1), wait for ChildrenAsleep (bit 2) == 0.
+if eq get gic_state 9 0
+put gic_state 9 rd
+end
 waker = fwld add rd GICR_WAKER 4
 x = fwst add rd GICR_WAKER 4 and waker ulong 0xfffffffd
 i = ulong 0
@@ -105,7 +150,9 @@ end
 i = add i 1
 end
 gicv3_enable_ppi30 rd
-note Enable GICv3 system register interface at EL1.
+if ne get gic_state 3 0
+ok_lpi = gicr_init_lpis rd
+end
 sre = arm64_sysrd SYSREG_ICC_SRE_EL1
 arm64_syswr SYSREG_ICC_SRE_EL1 or sre 1
 arm64_syswr SYSREG_ICC_PMR_EL1 0xf0
@@ -126,9 +173,12 @@ put gic_state 1 gicr
 put gic_state 2 gicr_len
 put gic_state 3 gits
 put gic_state 7 8192
+put gic_state 8 0
+put gic_state 9 0
+put gic_state 10 0
+put gic_state 11 0
 pidr2 = fwld add gicd GICD_PIDR2 4
 put gic_state 4 and shr pidr2 4 15
-note Disable distributor, wait RWP, enable ARE_NS (bit 4) | EnableGrp1NS (bit 1).
 x = fwst add gicd GICD_CTLR 4 0
 gicd_rwp_wait gicd
 x = fwst add gicd GICD_CTLR 4 0x12
@@ -166,40 +216,151 @@ arm64_dsb_sy
 ret true
 end
 
-note Minimal GICv3 ITS bring-up (Normal-NC command queue from pre-carved DMA pool).
+fn gic_its_quiescent_wait gits ulong to bool
+i = ulong 0
+while lt i 1000000 bound 1000000
+if ne and fwld add gits GITS_CTLR 4 0x80000000 0
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note Configure GITS_BASER0..7 Device (type 1) and Collection (type 4) tables in Normal-NC OSH memory.
+fn gic_its_setup_basers gits ulong to bool
+i = ulong 0
+while lt i 8 bound 8
+off = add GITS_BASER0 mul i 8
+val = fwld add gits off 8
+btype = and shr val 56 7
+if or eq btype 1 eq btype 4
+tbl = dma_alloc_nc 16 65536
+if eq tbl 0
+ret false
+end
+note Valid(63) | InnerCache=Normal-NC(1<<59) | Shareability=OSH(2<<10) | PageSize=4K(0<<8) | Size=16-1
+bv = or or GITS_ATTR_NC_OSH tbl 15
+x = fwst add gits off 8 bv
+end
+i = add i 1
+end
+ret true
+end
+
+note GICv3 ITS bring-up: poll Quiescent, program GITS_CBASER (Normal-NC, OSH), GITS_BASERn, enable ITS.
 fn gic_its_init to bool
 gits = get gic_state 3
 if eq gits 0
 ret false
 end
-note Allocate 64 KiB (16 pages) Normal-NC ITS command queue, 64 KiB aligned.
+x = fwst add gits GITS_CTLR 4 0
+arm64_dsb_sy
+if not gic_its_quiescent_wait gits
+ret false
+end
 cq = dma_alloc_nc 16 65536
 if eq cq 0
 ret false
 end
 put gic_state 5 cq
 put gic_state 6 0
-note Disable ITS first, program GITS_CBASER (Valid bit 63 | Normal-NC | 16 pages - 1 = 15), CWRITER = 0, enable ITS.
-x = fwst add gits GITS_CTLR 4 0
-arm64_dsb_sy
-cbaser = or or shl ulong 1 63 cq 15
+if not gic_its_setup_basers gits
+ret false
+end
+note GITS_CBASER: Valid(63) | InnerCache=Normal-NC(1<<59) | Shareability=OSH(2<<10) | cq | (16-1)
+cbaser = or or GITS_ATTR_NC_OSH cq 15
 x = fwst add gits GITS_CBASER 8 cbaser
 x = fwst add gits GITS_CWRITER 8 0
 arm64_dsb_sy
 x = fwst add gits GITS_CTLR 4 1
 arm64_dsb_sy
+put gic_state 10 1
 ret true
 end
 
-note Allocate LPI range for PCIe MSI-X DeviceID and return doorbell PA (gits_pa + GITS_TRANSLATER).
-note Stores lpi_base in out_lpi[0]; returns 0 on failure.
+note Enqueue one 32-byte ITS command, advance GITS_CWRITER, and wait for GITS_CREADR to catch up.
+fn gic_its_cmd w0 ulong w1 ulong w2 ulong w3 ulong to bool
+gits = get gic_state 3
+cq = get gic_state 5
+if or eq gits 0 or eq cq 0 eq get gic_state 10 0
+ret false
+end
+cw = get gic_state 6
+slot = add cq cw
+x = fwst add slot 0 8 w0
+x = fwst add slot 8 8 w1
+x = fwst add slot 16 8 w2
+x = fwst add slot 24 8 w3
+arm64_dsb_sy
+ncw = and add cw 32 0xffff
+put gic_state 6 ncw
+x = fwst add gits GITS_CWRITER 8 ncw
+arm64_dsb_sy
+put gic_state 11 add get gic_state 11 1
+i = ulong 0
+while lt i 1000000 bound 1000000
+cr = and fwld add gits GITS_CREADR 8 0xfffe0
+if eq cr ncw
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+note Compute target RDbase field for MAPC/SYNC (either physical RD address or Processor_Number per GITS_TYPER.PTA).
+fn gic_its_rd_target to ulong
+gits = get gic_state 3
+rd = get gic_state 9
+typer = fwld add gits GITS_TYPER 8
+note GITS_TYPER.PTA (bit 19): 1 = physical address >> 16, 0 = GICR_TYPER.Processor_Number
+if ne and typer 0x80000 0
+ret shr rd 16
+end
+rtyper = fwld add rd GICR_TYPER 8
+ret and shr rtyper 8 0xffff
+end
+
+note Allocate LPI range for PCIe MSI-X DeviceID, submit MAPD/MAPC/MAPTI/INVALL/SYNC,
+note and return doorbell PA (gits_pa + GITS_TRANSLATER). Stores lpi_base in out_lpi[0]; 0 on failure.
 fn gic_its_map_msix devid ulong nvecs ulong out_lpi edit ulong 1 to ulong
 gits = get gic_state 3
-if or eq gits 0 or eq nvecs 0 gt nvecs 64
+if or eq gits 0 or eq get gic_state 10 0 or eq nvecs 0 gt nvecs 64
+ret 0
+end
+itt = dma_alloc_nc 1 4096
+if eq itt 0
 ret 0
 end
 lpi = get gic_state 7
 put gic_state 7 add lpi nvecs
+rdt = gic_its_rd_target
+note MAPD (0x08): w0 = 0x08 | (devid << 32), w1 = size(6 = 7-bit EventID), w2 = itt | Valid(1)
+if not gic_its_cmd or 0x08 shl devid 32 6 or itt 1 0
+ret 0
+end
+note MAPC (0x09): icid=0 -> target RDbase, Valid(bit 63)
+if not gic_its_cmd 0x09 0 or shl ulong 1 63 shl rdt 16 0
+ret 0
+end
+note MAPTI (0x0a) for each event 0..nvecs-1 -> lpi + ev on collection 0
+ev = ulong 0
+while lt ev nvecs bound 64
+w0 = or 0x0a shl devid 32
+w1 = or ev shl add lpi ev 32
+if not gic_its_cmd w0 w1 0 0
+ret 0
+end
+ev = add ev 1
+end
+note INVALL (0x0d) + SYNC (0x05)
+if not gic_its_cmd 0x0d 0 0 0
+ret 0
+end
+if not gic_its_cmd 0x05 0 shl rdt 16 0
+ret 0
+end
 put out_lpi 0 lpi
 ret add gits GITS_TRANSLATER
 end
@@ -218,7 +379,7 @@ end
 ret false
 end
 
-note irqhook: called by vbar_el1 EL1h IRQ vector with intid from ICC_IAR1_EL1.
+note irqhook: called by vbar_el1 EL1h IRQ vector with intid from ICC_IAR1_EL1 (SPIs 32..1019 and LPIs 8192+).
 fn irqhook intid ulong to void
 i = ulong 0
 while lt i GIC_MAX_HANDLERS bound 64

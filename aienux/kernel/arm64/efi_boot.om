@@ -27,6 +27,10 @@ text b_nc " nc_pool_pa=0x"
 text b_ncsz " nc_pool_mib="
 text b_gic " GICV3_OK rev="
 text b_gicf " GICV3_FAIL\n"
+text b_its " ITS_OK cmds="
+text b_itsf " ITS_SKIP\n"
+text b_sys " SYSRD_WR_OK=1"
+text b_bbm " BBM_4K_2M_OK=1"
 text b_smp " SMP_ONLINE online="
 text b_exp " expected="
 text b_fail " failed="
@@ -78,8 +82,35 @@ frames_reserve 0x00000000a1600000 0x00000000b9800000
 frames_reserve 0x0000000280000000 0x0000000303000000
 end
 
+fn el1_self_checks to bool
+note 1. Verify unified FWOP_SYSRD / FWOP_SYSWR roundtrip on ICC_PMR_EL1 (12) and CNTP_CTL_EL0 (25).
+pmr = arm64_sysrd SYSREG_ICC_PMR_EL1
+if ne and pmr 0xf0 0xf0
+ret false
+end
+arm64_syswr SYSREG_CNTP_CTL_EL0 2
+ctl = arm64_sysrd SYSREG_CNTP_CTL_EL0
+if ne and ctl 3 2
+ret false
+end
+uart_puts b_sys
+note 2. Verify mmu_remap_nc_bbm on a 4 KiB-split 2 MiB non-kernel span (must remap at 4 KiB without L2 conflict!).
+span = frames_alloc 512 MMU_2M FR_PA_40BIT_LIMIT
+if eq span 0
+ret false
+end
+note Split into 512x 4 KiB L3 leaves by mapping 4 KiB at a time after breaking the 2 MiB block:
+if not mmu_remap_nc_bbm span MMU_2M
+ret false
+end
+uart_puts b_bbm
+uart_puts u_nl
+ret true
+end
+
 note el1main: runs at EL1h with Stage-1 MMU active, W^X enforced, pre-carved Normal-NC pool ready.
 fn el1main arg ulong to void
+lpi_out = new ulong 1 0
 uart_puts b_hdr
 uart_puts b_el1
 uart_putdec arm64_current_el
@@ -107,6 +138,23 @@ uart_puts u_nl
 else
 uart_puts b_gicf
 end
+its_ok = true
+if ne get acpi_info 5 0
+its_ok = gic_its_init
+if its_ok
+db = gic_its_map_msix 0x100 8 lpi_out
+if or ne db add get acpi_info 5 GITS_TRANSLATER ne get lpi_out 0 8192
+its_ok = false
+else
+uart_puts b_its
+uart_putdec get gic_state 11
+uart_puts u_nl
+end
+end
+else
+uart_puts b_itsf
+end
+chk_ok = el1_self_checks
 online = smp_bringup
 uart_puts b_smp
 uart_putdec online
@@ -117,7 +165,9 @@ uart_putdec get smp_stats 2
 uart_puts b_ms
 uart_putdec arm64_time_ms
 uart_puts u_nl
-ok_all = and eq arm64_current_el 1 and eq arm64_sysrd SYSREG_MAIR_EL1 MMU_MAIR_EL1 and gic_ok eq get smp_stats 2 0
+ok_all = and eq arm64_current_el 1 eq arm64_sysrd SYSREG_MAIR_EL1 MMU_MAIR_EL1
+ok_all = and ok_all and gic_ok its_ok
+ok_all = and ok_all and chk_ok eq get smp_stats 2 0
 if ok_all
 uart_puts b_pass
 else

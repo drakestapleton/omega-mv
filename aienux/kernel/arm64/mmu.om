@@ -26,13 +26,16 @@ const MMU_PAGE ulong 4096
 const MMU_2M ulong 0x200000
 const MMU_1G ulong 0x40000000
 const MMU_ADDR_MASK ulong 0x0000fffffffff000
-const MMU_MAX_PT_FRAMES ulong 1024
+const MMU_MAX_PT_FRAMES ulong 256
+const MMU_BBM_MAX_LEAVES ulong 2048
 
 note mmu_state:
 note   0=l0_pa, 1=npt_frames, 2=tcr_el1, 3=sctlr_el1, 4=live (0=pre-MMU, 1=MMU on),
-note   5=img_base, 6=img_end, 7=el1_stack_lo, 8=el1_stack_hi
+note   5=img_base, 6=img_end, 7=el1_stack_lo, 8=el1_stack_hi,
+note   9=pt_pool_base, 10=pt_pool_cap, 11=pt_pool_used
 global mmu_state ulong 16
-global mmu_pt_frames ulong 1024
+global mmu_pt_frames ulong 256
+global mmu_bbm_sz ulong 2048
 note el2_to_el1 context (8 * u64 = 64 bytes)
 global mmu_el1_ctx uchar 64
 
@@ -44,18 +47,18 @@ i = add i 8
 end
 end
 
+note Allocate a 4 KiB page-table frame from the pre-carved PT pool (never mutates fr_base/fr_end!).
 fn mmu_alloc_pt_frame to ulong
-nf = get mmu_state 1
-if ge nf MMU_MAX_PT_FRAMES
+used = get mmu_state 11
+cap = get mmu_state 10
+if ge used cap
 ret 0
 end
-pa = frames_alloc 1 MMU_PAGE FR_PA_40BIT_LIMIT
-if eq pa 0
-ret 0
-end
+pa = add get mmu_state 9 mul used MMU_PAGE
 mmu_zero_page pa
-put mmu_pt_frames nf pa
-put mmu_state 1 add nf 1
+put mmu_pt_frames used pa
+put mmu_state 11 add used 1
+put mmu_state 1 add used 1
 ret pa
 end
 
@@ -70,14 +73,10 @@ se = get mmu_state 8
 if and ne se 0 and lt lo se gt hi sb
 ret true
 end
-nf = get mmu_state 1
-i = ulong 0
-while lt i nf bound 1024
-fp = get mmu_pt_frames i
-if and lt lo add fp MMU_PAGE gt hi fp
+ptb = get mmu_state 9
+pte = add ptb mul get mmu_state 10 MMU_PAGE
+if and ne pte ptb and lt lo pte gt hi ptb
 ret true
-end
-i = add i 1
 end
 ret false
 end
@@ -245,9 +244,10 @@ end
 ret 0
 end
 
-note Safe post-MMU remap of a pre-split non-kernel 4 KiB/2 MiB range to Normal-NC (SH=OSH, RW, XN).
+note Safe post-MMU remap of a pre-split non-kernel range to Normal-NC (SH=OSH, RW, XN).
+note Remaps at the EXACT broken leaf granularity (never writes an L2 block over a valid L2 table!).
 note Exact ARMv8/v9 BBM sequence:
-note   Break(0) -> DSB ISH -> TLBI VMALLE1IS -> DSB ISH -> ISB -> Make(NC) -> DSB ISH -> ISB -> DC CIVAC -> DSB SY
+note   Break(0) -> DSB ISH -> TLBI VMALLE1IS -> DSB ISH -> ISB -> Make(NC at broken leaf sz) -> DSB ISH -> ISB -> DC CIVAC -> DSB SY
 fn mmu_remap_nc_bbm pa ulong length ulong to bool
 if or eq length 0 or ne and pa 0xfff 0 ne and length 0xfff 0
 ret false
@@ -256,17 +256,33 @@ if mmu_is_protected_range pa add pa length
 ret false
 end
 off = ulong 0
-while lt off length bound 131072
+k = ulong 0
+while lt off length bound 2048
+if ge k MMU_BBM_MAX_LEAVES
+ret false
+end
 lsz = mmu_break_one_leaf add pa off sub length off
 if eq lsz 0
 ret false
 end
+put mmu_bbm_sz k lsz
+k = add k 1
 off = add off lsz
+end
+if ne off length
+ret false
 end
 arm64_dsb_ish
 arm64_tlbi_vmalle1is
-if not mmu_map_id pa length MMU_MAIR_NORMAL_NC MMU_SH_OSH MMU_FLAG_RW
+off = ulong 0
+j = ulong 0
+while lt j k bound 2048
+lsz = get mmu_bbm_sz j
+if not mmu_map_leaf add pa off add pa off lsz MMU_MAIR_NORMAL_NC MMU_SH_OSH MMU_FLAG_RW
 ret false
+end
+off = add off lsz
+j = add j 1
 end
 arm64_dsb_ish
 arm64_dc_civac_range pa length
@@ -328,6 +344,11 @@ ret mmu_map_id nc_pa nc_bytes MMU_MAIR_NORMAL_NC MMU_SH_OSH MMU_FLAG_RW
 end
 
 fn mmu_map_ram_and_pts to bool
+note Map pre-carved PT pool ONCE as Normal-WB RW+XN (never mutates fr_base/fr_end!).
+pt_len = mul get mmu_state 10 MMU_PAGE
+if not mmu_map_id get mmu_state 9 pt_len MMU_MAIR_WB MMU_SH_ISH MMU_FLAG_RW
+ret false
+end
 nr = frames_region_count
 ri = ulong 0
 while lt ri nr bound 256
@@ -339,14 +360,6 @@ ret false
 end
 end
 ri = add ri 1
-end
-pi = ulong 0
-while lt pi get mmu_state 1 bound 1024
-fpa = get mmu_pt_frames pi
-if not mmu_map_id fpa MMU_PAGE MMU_MAIR_WB MMU_SH_ISH MMU_FLAG_RW
-ret false
-end
-pi = add pi 1
 end
 ret true
 end
@@ -400,6 +413,14 @@ end
 put mmu_state 2 tcr
 note SCTLR_EL1: RES1 (0x30d00800) | M (bit 0) | C (bit 2) | I (bit 12) = 0x30d01805
 put mmu_state 3 0x30d01805
+note Pre-carve dedicated PT frame pool (256 pages = 1 MiB, < 40-bit PA) BEFORE mapping RAM.
+pt_pool = frames_alloc MMU_MAX_PT_FRAMES MMU_PAGE FR_PA_40BIT_LIMIT
+if eq pt_pool 0
+ret false
+end
+put mmu_state 9 pt_pool
+put mmu_state 10 MMU_MAX_PT_FRAMES
+put mmu_state 11 0
 l0 = mmu_alloc_pt_frame
 if eq l0 0
 ret false
@@ -448,6 +469,8 @@ x = fwst add ctx_pa 40 8 entry_fn
 x = fwst add ctx_pa 48 8 arg
 x = fwst add ctx_pa 56 8 add get mmu_state 7 16384
 arm64_dc_cvac_range ctx_pa 64
+note Clean x27 private metadata [0..512) (vbar_el1, hooks) to PoC for MMU-off reads in el2_to_el1/el1_switch.
+arm64_dc_cvac_range arm64_meta 1 512
 put mmu_state 4 1
 el = arm64_current_el
 if eq el 2

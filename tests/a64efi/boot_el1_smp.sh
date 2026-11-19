@@ -28,22 +28,24 @@ run_qemu() {
   rm -rf "$work/esp" && mkdir -p "$work/esp/EFI/BOOT"
   cp "$img" "$work/esp/EFI/BOOT/BOOTAA64.EFI"
   timeout 40 qemu-system-aarch64 \
-    -M virt,gic-version=3,virtualization=on -cpu max -smp 20 -m "$mem" \
+    -M virt,gic-version=3,its=on,virtualization=on -cpu max -smp 20 -m "$mem" \
     -display none -bios "$code" \
     -drive if=none,id=d0,format=raw,file=fat:rw:"$work/esp" \
     -device virtio-blk-device,drive=d0 \
     -net none -serial file:"$log" -monitor none -no-reboot </dev/null >/dev/null 2>&1
 }
 
-echo "=== QEMU 20-core 4 GiB boot (512 MiB Normal-NC pool) ==="
+echo "=== QEMU 20-core 4 GiB boot (512 MiB Normal-NC pool + GICv3 ITS) ==="
 run_qemu "$efi" 4096 "$work/boot.log"
-tr -d '\r' < "$work/boot.log" | grep -E 'AIENUX_A64EFI|EL1_ALIVE|free_mib=|GICV3_|SMP_ONLINE|SLICE_A_QEMU'
+tr -d '\r' < "$work/boot.log" | grep -E 'AIENUX_A64EFI|EL1_ALIVE|free_mib=|GICV3_|ITS_|SYSRD_WR_|SMP_ONLINE|SLICE_A_QEMU'
 grep -q 'EL1_ALIVE current_el=1 mair=0x00000000440004ff' "$work/boot.log"
 grep -q 'nc_pool_mib=512' "$work/boot.log"
 grep -q 'GICV3_OK rev=3' "$work/boot.log"
+grep -q 'ITS_OK cmds=12' "$work/boot.log"
+grep -q 'SYSRD_WR_OK=1 BBM_4K_2M_OK=1' "$work/boot.log"
 grep -q 'SMP_ONLINE online=20 expected=20 failed=0' "$work/boot.log"
 grep -q 'SLICE_A_QEMU_BOOT_PASS' "$work/boot.log"
-echo "PASS qemu_20core_el1_mmu_gicv3_smp"
+echo "PASS qemu_20core_el1_mmu_gicv3_its_smp"
 
 if [ -n "$neg" ]; then
   echo "=== QEMU post-EBS trap negative control ==="
