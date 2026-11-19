@@ -1,0 +1,223 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/efi_boot.om: Pure-Omega Bare-Metal Aienux UEFI Boot Entry (Piece 1 / Slice A).
+note Concatenated after: target a64efi, om2, seed/a64efi/efirt.om, fwops.om, uart.om, frames.om,
+note acpi.om, mmu.om, gicv3.om, smp.om.
+note Flow:
+note   1. Disable UEFI watchdog, find ACPI 2.0 RSDP via UEFI ConfigurationTable (efcfg)
+note   2. GetMemoryMap (64 KiB static buffer) + ExitBootServices retry loop (max 8 attempts)
+note   3. Mask DAIF + arm post_ebs guard (never calls dead UEFI services on trap/exit)
+note   4. Parse ACPI RSDP -> XSDT -> MADT (20 cores, GICD, GICR, GITS), FADT (PSCI), SPCR (UART), MCFG, IORT
+note   5. Init UART (SPCR or Spark 0x16A00000), ingest EfiConventionalMemory + reserve non-conv/image/RMRs
+note   6. Build Stage-1 MMU (MAIR=0x440004ff, pre-carved Normal-NC pool, W^X image, IPS >= 40-bit)
+note   7. EL2 -> EL1h eret (immediate ISB after HCR_EL2.E2H=0, CNTVOFF_EL2=0, TLBI VMALLE1IS)
+note   8. In el1main: init GICv3 + ITS, bring up all 20 cores via PSCI CPU_ON, print BootHandoff, reset via PSCI.
+
+const EFI_MMAP_CAP ulong 65536
+global efi_mmap uchar 65536
+note efi_mm_out (8 * u64 = 64 bytes): 0=map_size, 8=map_key, 16=desc_size, 24=desc_ver, 32=exit_attempts, 40=rsdp_pa, 48=boot_el
+global efi_mm_out uchar 64
+
+text b_hdr "\nAIENUX_A64EFI_BOOT_START\n"
+text b_el1 "EL1_ALIVE current_el="
+text b_mair " mair=0x"
+text b_sctlr " sctlr=0x"
+text b_tcr " tcr=0x"
+text b_ram " free_mib="
+text b_nc " nc_pool_pa=0x"
+text b_ncsz " nc_pool_mib="
+text b_gic " GICV3_OK rev="
+text b_gicf " GICV3_FAIL\n"
+text b_its " ITS_OK cmds="
+text b_itsf " ITS_SKIP\n"
+text b_sys " SYSRD_WR_OK=1"
+text b_bbm " BBM_4K_2M_OK=1"
+text b_smp " SMP_ONLINE online="
+text b_exp " expected="
+text b_fail " failed="
+text b_mcfg " mcfg_segs="
+text b_ms " boot_ms="
+text b_pass "\nSLICE_A_QEMU_BOOT_PASS\n"
+text b_fail_sum "\nSLICE_A_QEMU_BOOT_FAIL\n"
+
+note ACPI 2.0 Table GUID: 8868e871-e4f1-11d3-bc22-0080c73c8881
+note Little-endian halves: a = 0x11d3e4f18868e871, b = 0x81883cc7800022bc
+fn efi_find_acpi2_rsdp to ulong
+ret efcfg 0x11d3e4f18868e871 0x81883cc7800022bc
+end
+
+note UEFI BootServices offsets (UEFI 2.10 Table 4-3):
+note   56 GetMemoryMap(MemoryMapSize*, MemoryMap, MapKey*, DescriptorSize*, DescriptorVersion*)
+note   232 ExitBootServices(ImageHandle, MapKey)
+note   256 SetWatchdogTimer(Timeout, WatchdogCode, DataSize, WatchdogData)
+fn efi_exit_boot_services to bool
+bs = efbs
+ih = fwsys 0
+x = fwcall fwld add bs 256 8 0 0 0 0 0 0
+outp = fwadr efi_mm_out 0 64
+x = fwst add outp 40 8 efi_find_acpi2_rsdp
+x = fwst add outp 48 8 arm64_current_el
+gmm = fwld add bs 56 8
+ebs = fwld add bs 232 8
+mp = fwadr efi_mmap 0 EFI_MMAP_CAP
+att = ulong 0
+while lt att 8 bound 8
+x = fwst outp 8 EFI_MMAP_CAP
+s = fwcall gmm outp mp add outp 8 add outp 16 add outp 24 0
+if ne s 0
+ret false
+end
+s2 = fwcall ebs ih fwld add outp 8 8 0 0 0 0
+att = add att 1
+if eq s2 0
+x = fwst add outp 32 8 att
+ret true
+end
+end
+ret false
+end
+
+note Reserve mandatory GB10 IORT RMR carveouts if present in RAM range.
+fn reserve_gb10_rmrs to void
+frames_reserve 0x00000000a1600000 0x00000000b9800000
+frames_reserve 0x0000000280000000 0x0000000303000000
+end
+
+fn el1_self_checks to bool
+note 1. Verify unified FWOP_SYSRD / FWOP_SYSWR roundtrip on ICC_PMR_EL1 (12) and CNTP_CTL_EL0 (25).
+pmr = arm64_sysrd SYSREG_ICC_PMR_EL1
+if ne and pmr 0xf0 0xf0
+ret false
+end
+arm64_syswr SYSREG_CNTP_CTL_EL0 2
+ctl = arm64_sysrd SYSREG_CNTP_CTL_EL0
+if ne and ctl 3 2
+ret false
+end
+uart_puts b_sys
+note 2. Verify mmu_remap_nc_bbm on a 4 KiB-split 2 MiB non-kernel span (must remap at 4 KiB without L2 conflict!).
+span = frames_alloc 512 MMU_2M FR_PA_40BIT_LIMIT
+if eq span 0
+ret false
+end
+note Split into 512x 4 KiB L3 leaves by mapping 4 KiB at a time after breaking the 2 MiB block:
+if not mmu_remap_nc_bbm span MMU_2M
+ret false
+end
+uart_puts b_bbm
+uart_puts u_nl
+ret true
+end
+
+note el1main: runs at EL1h with Stage-1 MMU active, W^X enforced, pre-carved Normal-NC pool ready.
+fn el1main arg ulong to void
+lpi_out = new ulong 1 0
+uart_puts b_hdr
+uart_puts b_el1
+uart_putdec arm64_current_el
+uart_puts b_mair
+uart_puthex arm64_sysrd SYSREG_MAIR_EL1
+uart_puts b_sctlr
+uart_puthex arm64_sysrd SYSREG_SCTLR_EL1
+uart_puts b_tcr
+uart_puthex arm64_sysrd SYSREG_TCR_EL1
+uart_puts u_nl
+uart_puts b_ram
+uart_putdec div frames_free_bytes 1048576
+uart_puts b_nc
+uart_puthex dma_pool_base
+uart_puts b_ncsz
+uart_putdec div dma_pool_size 1048576
+uart_puts b_mcfg
+uart_putdec get acpi_info 12
+uart_puts u_nl
+gic_ok = gicv3_init get acpi_info 2 get acpi_info 3 get acpi_info 4 get acpi_info 5
+if gic_ok
+uart_puts b_gic
+uart_putdec get gic_state 4
+uart_puts u_nl
+else
+uart_puts b_gicf
+end
+its_ok = true
+if ne get acpi_info 5 0
+its_ok = gic_its_init
+if its_ok
+db = gic_its_map_msix 0x100 8 lpi_out
+if or ne db add get acpi_info 5 GITS_TRANSLATER ne get lpi_out 0 8192
+its_ok = false
+else
+uart_puts b_its
+uart_putdec get gic_state 11
+uart_puts u_nl
+end
+end
+else
+uart_puts b_itsf
+end
+chk_ok = el1_self_checks
+online = smp_bringup
+uart_puts b_smp
+uart_putdec online
+uart_puts b_exp
+uart_putdec get smp_stats 1
+uart_puts b_fail
+uart_putdec get smp_stats 2
+uart_puts b_ms
+uart_putdec arm64_time_ms
+uart_puts u_nl
+ok_all = and eq arm64_current_el 1 eq arm64_sysrd SYSREG_MAIR_EL1 MMU_MAIR_EL1
+ok_all = and ok_all and gic_ok its_ok
+ok_all = and ok_all and chk_ok eq get smp_stats 2 0
+if ok_all
+uart_puts b_pass
+else
+uart_puts b_fail_sum
+end
+arm64_psci_reset get acpi_info 7
+i = ulong 0
+while lt i 9223372036854775807 bound 9223372036854775807
+arm64_wfe
+end
+end
+
+fn main to int
+if not efi_exit_boot_services
+ret 1
+end
+note Post-ExitBootServices: mask DAIF and arm post_ebs guard immediately!
+arm64_daif_mask
+arm64_post_ebs_set UART_SPARK_16550_PA PSCI_CONDUIT_NONE
+outp = fwadr efi_mm_out 0 64
+rsdp = fwld add outp 40 8
+ok_acpi = acpi_parse_rsdp rsdp
+conduit = get acpi_info 7
+if ne get acpi_info 8 0
+uart_init get acpi_info 8 get acpi_info 9 conduit
+else
+uart_init UART_SPARK_16550_PA UART_KIND_16550_32 conduit
+end
+arm64_post_ebs_set uart_base conduit
+frames_init
+mp = fwadr efi_mmap 0 EFI_MMAP_CAP
+cnt = frames_ingest_efi_raw mp fwld outp 8 fwld add outp 16 8
+if eq cnt 0
+trap 8
+end
+ib = arm64_meta 0
+bss = arm64_meta 1
+ie = arm64_meta 2
+frames_reserve ib ie
+reserve_gb10_rmrs
+if ne rsdp 0
+frames_reserve rsdp add rsdp 4096
+end
+if not mmu_build_initial ib bss ie
+trap 8
+end
+e1 = arm64_meta 4
+if eq e1 0
+trap 8
+end
+mmu_enter_el1 e1 rsdp
+ret 0
+end

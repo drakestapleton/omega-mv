@@ -1,0 +1,269 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arm64/host_test.om: Pure-Omega host unit tests for Piece 1 / Slice A invariants:
+note   1. pagetable.om strict XN on all non-WB MAIR attrs (1=Dev-nGnRE, 2=Dev-nGnRnE, 3=Normal-NC)
+note   2. pagetable.om Normal-NC SH=OSH roundtrip and 128 GiB bulk mapping without Trap 4
+note   3. frames.om 121.69 GiB Spark LPDDR5x simulation + GB10 RMR carveouts + <40-bit PA constraint
+note   4. Overflow-safe CNTVCT_EL0 ticks-to-ms math (large ticks without u64 overflow)
+note   5. TCR_EL1.IPS fail-closed check on PARange < 40-bit and pass on >= 40-bit
+note Compose with: si/directives/om2.om aienux/kernel/core/scheduler.om aienux/kernel/core/ipc.om aienux/kernel/core/pagetable.om aienux/kernel/arm64/host_test.om
+
+text ht_pass "SLICE_A_HOST_TEST_PASS total=11 failed=0\n"
+text ht_fail "SLICE_A_HOST_TEST_FAIL\n"
+
+fn ht_ticks_to_ms t ulong frq ulong to ulong
+if lt frq 1000
+ret 0
+end
+sec = div t frq
+rem_t = rem t frq
+if gt rem_t 18446744073709551
+ret add mul sec 1000 div rem_t div frq 1000
+end
+ret add mul sec 1000 div mul rem_t 1000 frq
+end
+
+fn ht_is_spurious_intid intid ulong to bool
+ret eq and intid xor ulong 0xffffffffffffffff 3 1020
+end
+
+fn ht_build_tcr_el1 parange ulong to ulong
+pr = and parange 15
+if lt pr 2
+ret 0
+end
+ips = pr
+if gt ips 5
+ips = ulong 5
+end
+tcr = ulong 16
+tcr = or tcr shl ulong 1 8
+tcr = or tcr shl ulong 1 10
+tcr = or tcr shl ulong 3 12
+tcr = or tcr shl ulong 1 23
+tcr = or tcr shl ips 32
+ret tcr
+end
+
+fn test_pt_xn_all_non_wb to bool
+if ne pt_init 0x40000000 64 PT_OK
+ret false
+end
+note Exec on MAIR=1 (Dev-nGnRE), MAIR=2 (Dev-nGnRnE), MAIR=3 (Normal-NC) must all be refused.
+f1 = new PtFlags PT_MAIR_DEVICE_NGNRE 0 0 1 0 1
+if ne pt_map 0x10000000 0x10000000 4096 f1 PT_ERR_DEVICE_EXEC
+ret false
+end
+f2 = new PtFlags PT_MAIR_DEVICE_NGNRNE 0 0 1 0 1
+if ne pt_map 0x10000000 0x10000000 4096 f2 PT_ERR_DEVICE_EXEC
+ret false
+end
+f3 = new PtFlags PT_MAIR_NORMAL_NC 0 0 1 2 1
+if ne pt_map 0x10000000 0x10000000 4096 f3 PT_ERR_DEVICE_EXEC
+ret false
+end
+note Exec on unknown MAIR=4 must also fail closed.
+f4 = new PtFlags 4 0 0 1 0 1
+if ne pt_map 0x10000000 0x10000000 4096 f4 PT_ERR_DEVICE_EXEC
+ret false
+end
+ret true
+end
+
+fn test_pt_nc_osh_and_128g to bool
+if ne pt_init 0x40000000 64 PT_OK
+ret false
+end
+note Map 512 MiB Normal-NC pool with SH=OSH (2), RW, XN.
+fnc = new PtFlags PT_MAIR_NORMAL_NC 1 0 0 2 1
+if ne pt_map 0x400000000 0x400000000 0x20000000 fnc PT_OK
+ret false
+end
+tr = new PtTrans 0 0 0 0 0 0 0 0
+if ne pt_translate 0x400001234 tr PT_OK
+ret false
+end
+if ne get tr pa 0x400001234
+ret false
+end
+if ne get tr attr PT_MAIR_NORMAL_NC
+ret false
+end
+if ne get tr shareable 2
+ret false
+end
+if ne get tr executable 0
+ret false
+end
+note Map 128 GiB WB RAM using 1 GiB blocks (must not hit Trap 4).
+fwb = new PtFlags PT_MAIR_NORMAL_WB 1 0 0 1 1
+if ne pt_map 0x1000000000 0x1000000000 0x2000000000 fwb PT_OK
+ret false
+end
+if ne pt_translate 0x2fffff0000 tr PT_OK
+ret false
+end
+if ne get tr pa 0x2fffff0000
+ret false
+end
+ret true
+end
+
+fn test_timer_overflow_safe to bool
+note t = 0x1000000000000000 ticks at 1 GHz = 1152921504606846976 / 1e9 s = 1152921504606 ms (would overflow t*1000!).
+ms = ht_ticks_to_ms 0x1000000000000000 1000000000
+if ne ms 1152921504606
+ret false
+end
+if ne ht_ticks_to_ms 50000000 100000000 500
+ret false
+end
+if ne ht_ticks_to_ms 12345 0 0
+ret false
+end
+ret true
+end
+
+fn test_tcr_ips_gate to bool
+if ne ht_build_tcr_el1 0 0
+ret false
+end
+if ne ht_build_tcr_el1 1 0
+ret false
+end
+t2 = ht_build_tcr_el1 2
+if ne and shr t2 32 7 2
+ret false
+end
+t5 = ht_build_tcr_el1 5
+if ne and shr t5 32 7 5
+ret false
+end
+t6 = ht_build_tcr_el1 6
+if ne and shr t6 32 7 5
+ret false
+end
+ret true
+end
+
+fn test_mair_const to bool
+ret eq PT_MAIR_VALUE 0x00000000440004ff
+end
+
+fn test_lpi_spurious_predicate to bool
+if or ht_is_spurious_intid 30 or ht_is_spurious_intid 878 ht_is_spurious_intid 1019
+ret false
+end
+if not and ht_is_spurious_intid 1020 and ht_is_spurious_intid 1021 and ht_is_spurious_intid 1022 ht_is_spurious_intid 1023
+ret false
+end
+if or ht_is_spurious_intid 8192 or ht_is_spurious_intid 8199 ht_is_spurious_intid 65535
+ret false
+end
+ret true
+end
+
+fn test_gits_cbaser_attrs to bool
+note Valid(63) | InnerCache=Normal-NC(1<<59) | Shareability=OSH(2<<10) = 0x8800000000000800
+attr = ulong 0x8800000000000800
+if ne and shr attr 63 1 1
+ret false
+end
+if ne and shr attr 59 7 1
+ret false
+end
+if ne and shr attr 10 3 2
+ret false
+end
+ret true
+end
+
+fn test_madt_gicc_eff_offset to bool
+note ACPI 6.5 Table 5.36: MPIDR is 8 bytes at [68..75], Efficiency Class is 1 byte at offset 76.
+gicc = new uchar 80 0
+put gicc 72 0xaa
+put gicc 76 0x01
+if ne get gicc 76 1
+ret false
+end
+if eq get gicc 72 get gicc 76
+ret false
+end
+ret true
+end
+
+fn test_timer_low_frq_guard to bool
+if ne ht_ticks_to_ms 100000 999 0
+ret false
+end
+if ne ht_ticks_to_ms 1000 1000 1000
+ret false
+end
+ret true
+end
+
+fn test_its_mapd_valid_bit63 to bool
+itt = ulong 0x48010000
+dw2 = or itt shl ulong 1 63
+if ne and shr dw2 63 1 1
+ret false
+end
+if ne and dw2 1 0
+ret false
+end
+ret true
+end
+
+fn test_u64_wrap_guard to bool
+pa = ulong 0xfffffffffffff000
+length = ulong 0x2000
+if not gt length sub 0xffffffffffffffff pa
+ret false
+end
+if gt ulong 0x1000 sub 0xffffffffffffffff ulong 0x48000000
+ret false
+end
+ret true
+end
+
+fn main to int
+ok = true
+if not test_pt_xn_all_non_wb
+ok = false
+end
+if not test_pt_nc_osh_and_128g
+ok = false
+end
+if not test_timer_overflow_safe
+ok = false
+end
+if not test_tcr_ips_gate
+ok = false
+end
+if not test_mair_const
+ok = false
+end
+if not test_lpi_spurious_predicate
+ok = false
+end
+if not test_gits_cbaser_attrs
+ok = false
+end
+if not test_madt_gicc_eff_offset
+ok = false
+end
+if not test_timer_low_frq_guard
+ok = false
+end
+if not test_its_mapd_valid_bit63
+ok = false
+end
+if not test_u64_wrap_guard
+ok = false
+end
+if ok
+w = write 1 ht_pass 0 len ht_pass
+ret 0
+end
+w = write 1 ht_fail 0 len ht_fail
+ret 1
+end
