@@ -81,11 +81,12 @@ echo "PASS neg_bad_type (rc=$bad_rc)"
 
 # Self-rebuild fixpoint: omc-macos builds gen1, gen1 builds gen2, gen1 == gen2
 { printf 'target a64macos\n'; cat seed/omc/omc.om; } > "$tmp/omc-mac.om"
-"$omc" < "$tmp/omc-mac.om" > "$tmp/omc1"
+"$omc" < "$tmp/omc-mac.om" > "$tmp/omc1.unsigned"
+cp "$tmp/omc1.unsigned" "$tmp/omc1"
 chmod 755 "$tmp/omc1"
 codesign -s - -f "$tmp/omc1" >/dev/null 2>&1
 "$tmp/omc1" < "$tmp/omc-mac.om" > "$tmp/omc2"
-cmp -s "$tmp/omc1" "$tmp/omc2" || { echo "FAIL fixpoint: gen1 != gen2" >&2; exit 1; }
-h=$(shasum -a 256 "$tmp/omc1" | awk '{print $1}')
+cmp -s "$tmp/omc1.unsigned" "$tmp/omc2" || { echo "FAIL fixpoint: gen1 != gen2" >&2; exit 1; }
+h=$(shasum -a 256 "$tmp/omc1.unsigned" | awk '{print $1}')
 echo "PASS fixpoint sha256=$h"
 echo "GATE-MACOS PASS"
