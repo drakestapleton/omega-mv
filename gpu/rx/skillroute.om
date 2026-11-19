@@ -1,0 +1,331 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/rx/skillroute.om: pure-Omega M20/COMPOSITION-2 Skill Router over Capability Graph
+note (replaces src/runtime/rx_skillroute.{h,c}).
+note Admissibility runs before ranking so a cheaper inadmissible provider never hides an admissible one.
+note Fail-closed route revalidation detects withdrawn, unavailable, stale (gen/ver/digest), or lease-expired routes.
+note Compose after: si/directives/om2.om gpu/rx/regulate.om
+
+const SR_MAX_ENTRIES ulong 64
+const SR_MAX_EXEC ulong 32
+const SR_MAX_MACHINES ulong 16
+
+note Capability graph entries (parallel arrays, zero heap)
+global g_sr_op uint 64
+global g_sr_sid uint 64
+global g_sr_ver uint 64
+global g_sr_dlo ulong 64
+global g_sr_dhi ulong 64
+global g_sr_mid uint 64
+global g_sr_live int 64
+global g_sr_avail int 64
+global g_sr_held int 64
+global g_sr_lat ulong 64
+global g_sr_cost ulong 64
+global g_sr_gen ulong 64
+global g_sr_cnt ulong 4
+
+note Local executable skill table
+global g_ex_sid uint 32
+global g_ex_dlo ulong 32
+global g_ex_dhi ulong 32
+
+note Machine table (id, is_self, canonical_known, lease_expiry_us)
+global g_m_id uint 16
+global g_m_self int 16
+global g_m_known int 16
+global g_m_exp ulong 16
+
+fn sr_reset to void
+put g_sr_cnt 0 ulong 0
+put g_sr_cnt 1 ulong 0
+put g_sr_cnt 2 ulong 0
+ret
+end
+
+fn sr_add_machine mid uint is_self int known int lease_exp ulong to int
+n = get g_sr_cnt 2
+if ge n SR_MAX_MACHINES
+ret SR_E_ARG
+end
+put g_m_id n mid
+put g_m_self n is_self
+put g_m_known n known
+put g_m_exp n lease_exp
+put g_sr_cnt 2 add n 1
+ret SR_OK
+end
+
+fn sr_find_machine mid uint to int
+n = get g_sr_cnt 2
+i = ulong 0
+while lt i n bound 16
+if eq get g_m_id i mid
+ret int i
+end
+i = add i 1
+end
+ret -1
+end
+
+fn sr_add_exec sid uint dlo ulong dhi ulong to int
+n = get g_sr_cnt 1
+if ge n SR_MAX_EXEC
+ret SR_E_ARG
+end
+put g_ex_sid n sid
+put g_ex_dlo n dlo
+put g_ex_dhi n dhi
+put g_sr_cnt 1 add n 1
+ret SR_OK
+end
+
+fn sr_find_exec sid uint to int
+n = get g_sr_cnt 1
+i = ulong 0
+while lt i n bound 32
+if eq get g_ex_sid i sid
+ret int i
+end
+i = add i 1
+end
+ret -1
+end
+
+fn sr_add_entry op uint sid uint ver uint mid uint lat ulong cost ulong to int
+n = get g_sr_cnt 0
+if ge n SR_MAX_ENTRIES
+ret SR_E_ARG
+end
+put g_sr_op n op
+put g_sr_sid n sid
+put g_sr_ver n ver
+put g_sr_dlo n ulong 0
+put g_sr_dhi n ulong 0
+put g_sr_mid n mid
+put g_sr_live n int 1
+put g_sr_avail n int 1
+put g_sr_held n int 1
+put g_sr_lat n lat
+put g_sr_cost n cost
+put g_sr_gen n ulong 1
+put g_sr_cnt 0 add n 1
+ret int n
+end
+
+fn sr_set_entry_digest idx ulong dlo ulong dhi ulong to void
+put g_sr_dlo idx dlo
+put g_sr_dhi idx dhi
+put g_sr_gen idx add get g_sr_gen idx 1
+ret
+end
+
+fn sr_set_entry_flags idx ulong live int avail int held int to void
+put g_sr_live idx live
+put g_sr_avail idx avail
+put g_sr_held idx held
+put g_sr_gen idx add get g_sr_gen idx 1
+ret
+end
+
+fn sr_check_local_exec idx ulong sid uint to uint
+ei = sr_find_exec sid
+if lt ei 0
+ret SR_WHY_NOT_EXECUTABLE
+end
+eu = ulong ei
+if ne get g_ex_dlo eu get g_sr_dlo idx
+ret SR_WHY_DIGEST
+end
+if ne get g_ex_dhi eu get g_sr_dhi idx
+ret SR_WHY_DIGEST
+end
+ret uint 0
+end
+
+note Check admissibility of entry idx against req at now_us.
+note Returns 0 if admissible, else SR_WHY_* bitmask.
+fn sr_check_admit idx ulong req view SrReq now_us ulong to uint
+if eq get g_sr_live idx 0
+ret SR_WHY_GONE
+end
+if eq get g_sr_avail idx 0
+ret SR_WHY_UNAVAILABLE
+end
+if and ne get req req_held 0 eq get g_sr_held idx 0
+ret SR_WHY_AUTHORITY
+end
+sid = get g_sr_sid idx
+if eq sid 0
+ret SR_WHY_NOT_SKILL
+end
+mi = sr_find_machine get g_sr_mid idx
+if lt mi 0
+ret SR_WHY_MACHINE_UNKNOWN
+end
+mu = ulong mi
+if eq get g_m_known mu 0
+ret SR_WHY_MACHINE_UNKNOWN
+end
+if eq get g_m_self mu 0
+if ge now_us get g_m_exp mu
+ret SR_WHY_GONE
+end
+if ne get req local_only 0
+ret SR_WHY_REMOTE_REFUSED
+end
+else
+lw = sr_check_local_exec idx sid
+if ne lw 0
+ret lw
+end
+end
+if and ne get req pin_ver 0 ne get g_sr_ver idx get req pin_ver
+ret SR_WHY_PIN
+end
+if or ne get req pin_dlo 0 ne get req pin_dhi 0
+if ne get g_sr_dlo idx get req pin_dlo
+ret SR_WHY_PIN
+end
+if ne get g_sr_dhi idx get req pin_dhi
+ret SR_WHY_PIN
+end
+end
+if and ne get req pin_mset 0 ne get g_sr_mid idx get req pin_mid
+ret SR_WHY_MACHINE
+end
+ret uint 0
+end
+
+note True if candidate a strictly beats candidate b under caller priority + deterministic tie-breaks.
+fn sr_better a ulong b ulong prio_cost int to bool
+if ne prio_cost 0
+if ne get g_sr_cost a get g_sr_cost b
+ret lt get g_sr_cost a get g_sr_cost b
+end
+if ne get g_sr_lat a get g_sr_lat b
+ret lt get g_sr_lat a get g_sr_lat b
+end
+else
+if ne get g_sr_lat a get g_sr_lat b
+ret lt get g_sr_lat a get g_sr_lat b
+end
+if ne get g_sr_cost a get g_sr_cost b
+ret lt get g_sr_cost a get g_sr_cost b
+end
+end
+if ne get g_sr_sid a get g_sr_sid b
+ret lt get g_sr_sid a get g_sr_sid b
+end
+ret lt get g_sr_ver a get g_sr_ver b
+end
+
+fn sr_route req view SrReq now_us ulong dst edit SrRoute to int
+put dst verdict SR_E_NO_CANDIDATE
+put dst entry_idx -1
+put dst skill_id uint 0
+put dst ver uint 0
+put dst machine_id uint 0
+put dst remote int 0
+put dst gen ulong 0
+put dst why uint 0
+put dst n_adm uint 0
+if ne get req pin_mset 0
+pm = sr_find_machine get req pin_mid
+if lt pm 0
+put dst verdict SR_E_MACHINE
+ret SR_E_MACHINE
+end
+pmu = ulong pm
+if eq get g_m_known pmu 0
+put dst verdict SR_E_MACHINE
+ret SR_E_MACHINE
+end
+if and eq get g_m_self pmu 0 ge now_us get g_m_exp pmu
+put dst verdict SR_E_MACHINE
+ret SR_E_MACHINE
+end
+end
+n = get g_sr_cnt 0
+best = int -1
+why_acc = uint 0
+adm = uint 0
+i = ulong 0
+while lt i n bound 64
+if eq get g_sr_op i get req op
+w = sr_check_admit i req now_us
+if ne w 0
+why_acc = or why_acc w
+else
+adm = add adm 1
+if lt best 0
+best = int i
+else
+if sr_better i ulong best get req prio_cost
+best = int i
+end
+end
+end
+end
+i = add i 1
+end
+put dst why why_acc
+put dst n_adm adm
+if lt best 0
+put dst verdict SR_E_NO_CANDIDATE
+ret SR_E_NO_CANDIDATE
+end
+bu = ulong best
+put dst entry_idx best
+put dst skill_id get g_sr_sid bu
+put dst ver get g_sr_ver bu
+put dst machine_id get g_sr_mid bu
+put dst gen get g_sr_gen bu
+mi = ulong sr_find_machine get g_sr_mid bu
+if eq get g_m_self mi 0
+put dst remote int 1
+put dst verdict SR_E_REMOTE
+ret SR_E_REMOTE
+end
+put dst remote int 0
+put dst verdict SR_OK
+ret SR_OK
+end
+
+note COMPOSITION-2: revalidate a held route against the current graph and local executable table.
+fn sr_route_check rt view SrRoute now_us ulong to int
+idx_i = get rt entry_idx
+if or lt idx_i 0 ge ulong idx_i get g_sr_cnt 0
+ret SR_E_WITHDRAWN
+end
+idx = ulong idx_i
+if eq get g_sr_live idx 0
+ret SR_E_WITHDRAWN
+end
+if eq get g_sr_avail idx 0
+ret SR_E_UNAVAILABLE
+end
+if or ne get g_sr_gen idx get rt gen ne get g_sr_ver idx get rt ver
+ret SR_E_STALE
+end
+if ne get g_sr_sid idx get rt skill_id
+ret SR_E_STALE
+end
+mi = sr_find_machine get g_sr_mid idx
+if lt mi 0
+ret SR_E_MACHINE
+end
+mu = ulong mi
+if eq get g_m_known mu 0
+ret SR_E_MACHINE
+end
+if eq get g_m_self mu 0
+if ge now_us get g_m_exp mu
+ret SR_E_MACHINE
+end
+ret SR_OK
+end
+if ne sr_check_local_exec idx get g_sr_sid idx 0
+ret SR_E_STALE
+end
+ret SR_OK
+end

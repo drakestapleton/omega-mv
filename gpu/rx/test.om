@@ -1,0 +1,331 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/rx/test.om: comprehensive positive & negative-control test suite for gpu/rx (regulate + skillroute).
+note Compose: si/directives/om2.om gpu/rx/regulate.om gpu/rx/skillroute.om gpu/rx/test.om
+
+text t_ok1 "PASS rx_regulate envelope validation + negative controls (8/8)\n"
+text t_ok2 "PASS rx_regulate hysteresis, dwell, PROTECT precedence & idempotency\n"
+text t_ok3 "PASS rx_regulate authority-independent apply, fairness & halt refusal\n"
+text t_ok4 "PASS sr_route admissibility-before-ranking, local_only, pins & SR_WHY\n"
+text t_ok5 "PASS sr_route_check fail-closed revalidation (WITHDRAWN, UNAVAILABLE, STALE, MACHINE)\n"
+text t_all "ALL PASS gpu-rx\n"
+text t_fail "FAIL gpu-rx\n"
+
+fn rx_puts s view uchar * to void
+k = write 1 s 0 len s
+if lt k 0
+exit 2
+end
+ret
+end
+
+fn test_reg_envelope to int
+e = new RxEnv 2 8 1024 4096 100 500 80 30 90 60 3
+base = new RxBudget 4 2048 250 16 1
+if ne rx_regulate_envelope_ok view e view base RX_OK
+ret 1
+end
+note negative controls: smin=0, smin>smax, base outside, clo>=chi, phi>100, dwell=0
+put e smin uint 0
+if ne rx_regulate_envelope_ok view e view base RX_ERR_ARG
+ret 2
+end
+put e smin uint 10
+if ne rx_regulate_envelope_ok view e view base RX_ERR_ARG
+ret 3
+end
+put e smin uint 2
+put base slots uint 9
+if ne rx_regulate_envelope_ok view e view base RX_ERR_ARG
+ret 4
+end
+put base slots uint 4
+put e clo ulong 80
+if ne rx_regulate_envelope_ok view e view base RX_ERR_ARG
+ret 5
+end
+put e clo ulong 30
+put e phi ulong 101
+if ne rx_regulate_envelope_ok view e view base RX_ERR_ARG
+ret 6
+end
+put e phi ulong 90
+put e dwell ulong 0
+if ne rx_regulate_envelope_ok view e view base RX_ERR_ARG
+ret 7
+end
+ret 0
+end
+
+fn test_reg_hysteresis to int
+e = new RxEnv 2 8 1024 4096 100 500 80 30 90 60 2
+base = new RxBudget 4 2048 250 16 1
+pol = new RxPolicy 1 4 2048 250 0 0 0 0
+note 1. Contention hits 85 -> immediately enters EXPAND (ver=2, slots=8, flips=1)
+if ne rx_regulate_step view e view base edit pol 1 85 10 RX_OK
+ret 10
+end
+if or ne get pol regime ulong RX_REG_EXPAND ne get pol slots 8
+ret 11
+end
+note 2. Idempotent re-run on same cseq=1 -> RX_NOOP, dwell unchanged
+if ne rx_regulate_step view e view base edit pol 1 0 0 RX_NOOP
+ret 12
+end
+note 3. Contention drops to 10 (<= clo=30), but dwell=0 < min_dwell=2 -> stays EXPAND, dwell=1
+if ne rx_regulate_step view e view base edit pol 2 10 10 RX_OK
+ret 13
+end
+if or ne get pol regime ulong RX_REG_EXPAND ne get pol dwell 1
+ret 14
+end
+note 4. Contention=10 again, dwell=1 < 2 -> stays EXPAND, dwell=2
+if ne rx_regulate_step view e view base edit pol 3 10 10 RX_OK
+ret 15
+end
+if or ne get pol regime ulong RX_REG_EXPAND ne get pol dwell 2
+ret 16
+end
+note 5. Contention=50 (in dead band > clo=30), dwell=2 -> stays EXPAND (anti-chatter)
+if ne rx_regulate_step view e view base edit pol 4 50 10 RX_OK
+ret 17
+end
+if ne get pol regime ulong RX_REG_EXPAND
+ret 18
+end
+note 6. Pressure spikes to 95 while contention=90 -> PROTECT wins immediately over EXPAND!
+if ne rx_regulate_step view e view base edit pol 5 90 95 RX_OK
+ret 19
+end
+if or ne get pol regime ulong RX_REG_PROTECT ne get pol slots 2
+ret 20
+end
+note 7. Pressure drops to 40, needs dwell=2 to leave PROTECT -> enters NOMINAL on seq 8
+if ne rx_regulate_step view e view base edit pol 6 10 40 RX_OK
+ret 21
+end
+if ne rx_regulate_step view e view base edit pol 7 10 40 RX_OK
+ret 22
+end
+if ne get pol regime ulong RX_REG_PROTECT
+ret 23
+end
+if ne rx_regulate_step view e view base edit pol 8 10 40 RX_OK
+ret 24
+end
+if or ne get pol regime ulong RX_REG_NOMINAL ne get pol slots 4
+ret 25
+end
+ret 0
+end
+
+fn test_reg_apply to int
+e = new RxEnv 2 8 1024 4096 100 500 80 30 90 60 2
+base = new RxBudget 4 2048 250 42 7
+pol = new RxPolicy 1 8 4096 500 1 1 0 1
+st = new RxRegState 0 0 0
+app = new RxBudget 0 0 0 0 0
+note 1. Valid apply installs EXPAND budget and preserves base fairness (starv=42, loc=7)
+if ne rx_regulate_apply view e view base view pol edit st edit app RX_OK
+ret 30
+end
+if or ne get app slots 8 ne get app starv 42
+ret 31
+end
+if ne get app loc 7
+ret 32
+end
+note 2. Re-applying same version -> RX_NOOP
+if ne rx_regulate_apply view e view base view pol edit st edit app RX_NOOP
+ret 33
+end
+note 3. Tampered policy (slots=99 > smax=8) -> RX_ERR_BOUNDS, applied budget untouched, refused=1
+put pol ver ulong 2
+put pol slots ulong 99
+if ne rx_regulate_apply view e view base view pol edit st edit app RX_ERR_BOUNDS
+ret 34
+end
+if or ne get app slots 8 ne get st refused 1
+ret 35
+end
+note 4. Invalid regime=9 -> RX_ERR_BOUNDS
+put pol slots ulong 4
+put pol regime ulong 9
+if ne rx_regulate_apply view e view base view pol edit st edit app RX_ERR_BOUNDS
+ret 36
+end
+note 5. Emergency stop halted=1 -> RX_ERR_HALTED, budget untouched
+put pol regime ulong 0
+put st halted int 1
+if ne rx_regulate_apply view e view base view pol edit st edit app RX_ERR_HALTED
+ret 37
+end
+if or ne get app slots 8 ne get st refused 3
+ret 38
+end
+ret 0
+end
+
+fn test_sr_routing to int
+sr_reset
+note Machines: 1=local self, 2=remote leased until t=1000, 3=remote expired at t=100
+if ne sr_add_machine 1 1 1 0 SR_OK
+ret 40
+end
+if ne sr_add_machine 2 0 1 1000 SR_OK
+ret 41
+end
+if ne sr_add_machine 3 0 1 100 SR_OK
+ret 42
+end
+note Local executables: skill 10 (digest 0xaa,0xbb), skill 20 (digest 0x11,0x22)
+if ne sr_add_exec 10 0xaa 0xbb SR_OK
+ret 43
+end
+if ne sr_add_exec 20 0x11 0x22 SR_OK
+ret 44
+end
+note Entry 0: cheapest (lat=5) local skill 10, BUT digest mismatch -> inadmissible!
+e0 = sr_add_entry 7 10 1 1 5 5
+sr_set_entry_digest ulong e0 0xdead 0xbeef
+note Entry 1: cheap (lat=10) remote skill 30 on machine 2 (leased)
+e1 = sr_add_entry 7 30 1 2 10 10
+sr_set_entry_digest ulong e1 0x33 0x44
+note Entry 2: local skill 20 (lat=20) with matching digest -> admissible local!
+e2 = sr_add_entry 7 20 2 1 20 20
+sr_set_entry_digest ulong e2 0x11 0x22
+note Entry 3: remote skill 40 on expired machine 3 (lat=1) -> inadmissible (GONE)
+e3 = sr_add_entry 7 40 1 3 1 1
+sr_set_entry_digest ulong e3 0x55 0x66
+
+rt = new SrRoute 0 -1 0 0 0 0 0 0 0
+note 1. local_only=0 at now_us=500 -> remote skill 30 (lat=10) beats local skill 20 (lat=20) -> SR_E_REMOTE
+req = new SrReq 7 1 0 0 0 0 0 0 0
+if ne sr_route view req 500 edit rt SR_E_REMOTE
+ret 45
+end
+if or ne get rt skill_id 30 ne get rt remote 1
+ret 46
+end
+if ne get rt n_adm 2
+ret 47
+end
+note 2. local_only=1 -> remote refused, local skill 20 wins (SR_OK); cheaper digest-mismatched e0 did not hide it!
+put req local_only int 1
+if ne sr_route view req 500 edit rt SR_OK
+ret 48
+end
+if or ne get rt skill_id 20 ne get rt remote 0
+ret 49
+end
+if eq and get rt why SR_WHY_DIGEST 0
+ret 50
+end
+if eq and get rt why SR_WHY_REMOTE_REFUSED 0
+ret 51
+end
+note 3. Pin unknown machine 99 -> SR_E_MACHINE
+put req local_only int 0
+put req pin_mset int 1
+put req pin_mid uint 99
+if ne sr_route view req 500 edit rt SR_E_MACHINE
+ret 52
+end
+note 4. Pin version=99 (none match) -> SR_E_NO_CANDIDATE with SR_WHY_PIN
+put req pin_mset int 0
+put req pin_ver uint 99
+if ne sr_route view req 500 edit rt SR_E_NO_CANDIDATE
+ret 53
+end
+if eq and get rt why SR_WHY_PIN 0
+ret 54
+end
+ret 0
+end
+
+fn test_sr_revalidate to int
+sr_reset
+rc = sr_add_machine 1 1 1 0
+rc = sr_add_machine 2 0 1 1000
+rc = sr_add_exec 20 0x11 0x22
+e0 = sr_add_entry 9 20 2 1 15 15
+sr_set_entry_digest ulong e0 0x11 0x22
+e1 = sr_add_entry 9 30 1 2 10 10
+sr_set_entry_digest ulong e1 0x33 0x44
+req = new SrReq 9 0 1 0 0 0 0 0 0
+rt = new SrRoute 0 -1 0 0 0 0 0 0 0
+if ne sr_route view req 500 edit rt SR_OK
+ret 60
+end
+note 1. Fresh route validates SR_OK
+if ne sr_route_check view rt 500 SR_OK
+ret 61
+end
+note 2. Local executable digest drifts -> SR_E_STALE
+put g_ex_dlo 0 ulong 0x9999
+if ne sr_route_check view rt 500 SR_E_STALE
+ret 62
+end
+put g_ex_dlo 0 ulong 0x11
+note 3. Entry becomes unavailable -> SR_E_UNAVAILABLE
+sr_set_entry_flags ulong e0 1 0 1
+if ne sr_route_check view rt 500 SR_E_UNAVAILABLE
+ret 63
+end
+note 4. Entry withdrawn -> SR_E_WITHDRAWN
+sr_set_entry_flags ulong e0 0 1 1
+if ne sr_route_check view rt 500 SR_E_WITHDRAWN
+ret 64
+end
+note 5. Remote route validates before lease expiry and fails SR_E_MACHINE after expiry
+put req local_only int 0
+if ne sr_route view req 500 edit rt SR_E_REMOTE
+ret 65
+end
+if ne sr_route_check view rt 999 SR_OK
+ret 66
+end
+if ne sr_route_check view rt 1000 SR_E_MACHINE
+ret 67
+end
+ret 0
+end
+
+fn main to int
+rc = test_reg_envelope
+if ne rc 0
+rx_puts t_fail
+ret rc
+end
+rx_puts t_ok1
+
+rc = test_reg_hysteresis
+if ne rc 0
+rx_puts t_fail
+ret rc
+end
+rx_puts t_ok2
+
+rc = test_reg_apply
+if ne rc 0
+rx_puts t_fail
+ret rc
+end
+rx_puts t_ok3
+
+rc = test_sr_routing
+if ne rc 0
+rx_puts t_fail
+ret rc
+end
+rx_puts t_ok4
+
+rc = test_sr_revalidate
+if ne rc 0
+rx_puts t_fail
+ret rc
+end
+rx_puts t_ok5
+
+rx_puts t_all
+ret 0
+end
