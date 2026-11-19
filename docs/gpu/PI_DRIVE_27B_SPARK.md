@@ -82,3 +82,19 @@ All three trials ran back-to-back on the exact same DGX Spark GB10 (`580.173.02`
 - **Spark `MemAvailable` after 40K+ token stress:** **`68 GiB`** still free (zero swap, zero OOM)
 - **Pi 5 remote overhead vs. Spark-local:** **< 1%** (`+0.01 s` at 45 tok; `+1.25 s` / `+0.6%` at 40K tok).
 
+---
+
+## 4. Spark CPU + GPU Co-Execution: Live Benchmark & Pure-Omega Modules (2026-11-19)
+
+### Live Spark Overlap & Warm-Prefix Reuse Benchmark (`bin-cc45f45e`)
+Tested `AIEN_OMEGA_Q38_OVERLAP_AB=1`, `AIEN_OMEGA_Q38_BUF_CACHED=1`, `AIEN_OMEGA_GDN_STATE_CACHED=1`, `AIEN_OMEGA_DGRAPH_PREFETCH=1`, `--prefill-device-host on`:
+- **Warm-prefix reuse (`S2_warm_3k`, `reuse Live(3392)`, 30 new tok):** prefill dropped from **`15,477 ms` → `502 ms` (`30.8× faster`)**, total wall `3.47 s`, decode `7.77 tok/s`.
+- **Env overlap flags vs default:** cold prefill and decode were within ~1% of default (`7.95` vs `8.04 tok/s`, `15.48 s` vs `15.31 s` at 3.2K, `63.19 s` vs `63.69 s` at 13K), confirming `bin-cc45f45e` defaults are already optimal and that the largest CPU+GPU wins come from **prefix-pool reuse**, **L2-resident CPU speculative drafting**, and **mid-decode OM-1 grammar guarding**.
+
+### Pure-Omega CPU Co-Execution Modules (Verified Live on Pi ARM64 `seed/out/omc`)
+| Module | Size / Footprint | Live AArch64 Verdict | Purpose on Grace ARM64 Cores |
+|---|---|---|---|
+| `tools/pi-drive-27b/specdraft.om` + `specdraft_trace.om` | `12 KB` ELF, `400 KB` RSS, `0.00 s` | **`PASS`** (`SPECDRAFT TEST PASS 8/8`, `rc=0`) | L2-resident (`64.17 KiB` state, 0 DRAM contention) 4/3/2/1-gram prompt-lookup speculative drafter + exact verification/rollback (`1..8` tokens/step) |
+| `tools/pi-drive-27b/omguard.om` + `omguard_trace.om` | `20 KB` ELF, `400 KB` RSS, `0.00 s` | **`PASS`** (`OMGUARD TEST PASS 8/8`, `rc=0`) | Incremental mid-decode OM-1 syntax/register guard (`0x`, `>6` params, `>16` locals / `error 12`, missing `bound`, unbalanced `end`) + 64-slot FNV-1a unified-RAM prefix-pool index with LRU eviction |
+
+
