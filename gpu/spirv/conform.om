@@ -7,21 +7,29 @@ note fsum16 is the frozen left-to-right row sum of 16 floats over 65536 rows; it
 note magnitudes (every fifth column scaled by 65536) so that a different summation order changes bits:
 note   x[16r+k] = f32((31r + 17k) % 101) * 0.37 - 18.0, times 65536.0 when k % 5 == 0
 note   o[r] = (((x[16r] + x[16r+1]) + x[16r+2]) ... ) + x[16r+15]
+note rmsnorm is that same x, one row of 16 per work-item, 65536 rows (1048576 outputs, same length as vadd):
+note   w[k] = f32(k + 1) * 0.5
+note   ss = (((x0*x0 + x1*x1) + ...) + x15*x15)          left to right, one rounding each square and add
+note   y[16r+k] = (x[16r+k] * (1 / fsqrt(ss * 0.0625 + 0.000001))) * w[k]
+note 0.0625 is 1/16 and is exact. 0.000001f32 is bits 0x358637BD. The square root is fsqrt (IEEE sqrt)
+note and the reciprocal is a separate div. No rsqrt, no fma. Tolerance is 0 ulp: a tree sum or a contracted
+note multiply-add is a mismatch, which is why the sum-order mutant must not match.
 note Every operation is one IEEE binary32 operation rounded to nearest (omc f32, OMEGESE 9.9), so the
 note reference is the exact bit pattern a conforming FP32 device must produce for these kernels.
 note
 note Usage:
 note   conform in vadd|vmul|vsub|vmax A.bin B.bin       write the two vadd inputs (little-endian binary32)
 note   conform in fsum16 X.bin           write the fsum16 input
-note   conform ref vadd|vmul|vsub|vmax|fsum16 OUT.bin   write the reference output
-note   conform check vadd|vmul|vsub|vmax|fsum16 OUT.bin compare OUT.bin with the reference bit for bit
+note   conform in rmsnorm X.bin W.bin    write the rmsnorm input and the 16 weights
+note   conform ref vadd|vmul|vsub|vmax|fsum16|rmsnorm OUT.bin   write the reference output
+note   conform check vadd|vmul|vsub|vmax|fsum16|rmsnorm OUT.bin compare OUT.bin with the reference bit for bit
 note check prints one line: CONFORM <kernel> n=<n> wrong=<w> unwritten=<u> first=<index or none>
 note Loops run in blocks of 4096 because a for count above 1000000 traps 4 (OMEGESE 9.1).
 note (unwritten counts the launcher's poison 0xFFC0FFEE). Exit: 0 every element equal; 1 a mismatch;
 note 2 usage; 3 I/O or wrong file size. Traps exit 100 + code.
 om2
 
-text tuse "usage: conform in vadd A B | in fsum16 X | ref K OUT | check K OUT\n"
+text tuse "usage: conform in vadd A B | in fsum16 X | in rmsnorm X W | ref K OUT | check K OUT\n"
 text tio "conform: I/O error or wrong file size\n"
 text tin "in"
 text tref "ref"
@@ -31,6 +39,7 @@ text tfsum "fsum16"
 text tvmul "vmul"
 text tvsub "vsub"
 text tvmax "vmax"
+text trms "rmsnorm"
 text tcf "CONFORM "
 text tn " n="
 text twr " wrong="
@@ -154,7 +163,36 @@ ret x
 end
 ret y
 end
+if eq get gst 0 5
+ret rmsat i
+end
 ret rsum i
+end
+
+fn ww k ulong to f32
+ret mul f32 add k 1 0.5f32
+end
+
+fn ssq r ulong to f32
+b = mul r 16
+v = vx b
+acc = mul v v
+for k ulong 15
+v = vx add b add k 1
+acc = add acc mul v v
+end
+ret acc
+end
+
+fn rscale r ulong to f32
+acc = mul ssq r 0.0625f32
+ret div 1.0f32 fsqrt add acc 0.000001f32
+end
+
+fn rmsat i ulong to f32
+r = div i 16
+k = rem i 16
+ret mul mul vx i rscale r ww k
 end
 
 fn putu i ulong v uint to void
@@ -226,6 +264,9 @@ end
 if argis ai tvmax
 put gst 0 4
 end
+if argis ai trms
+put gst 0 5
+end
 if eq get gst 0 9
 fail 2 tuse
 end
@@ -233,6 +274,23 @@ end
 
 fn doin to void
 ac = argcnt
+if eq get gst 0 5
+if ne ac 5
+fail 2 tuse
+end
+for h ulong div NVADD 4096
+for l ulong 4096
+i = add mul h 4096 l
+putu i bitcast uint vx i
+end
+end
+wfile 3 mul NVADD 4
+for k ulong 16
+putu k bitcast uint ww k
+end
+wfile 4 64
+ret
+end
 if ne get gst 0 1
 if ne ac 5
 fail 2 tuse
@@ -313,6 +371,9 @@ ot tvsub
 end
 if eq get gst 0 4
 ot tvmax
+end
+if eq get gst 0 5
+ot trms
 end
 ot tn
 odec n
