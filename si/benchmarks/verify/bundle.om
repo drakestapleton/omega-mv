@@ -1,0 +1,272 @@
+note SPDX-License-Identifier: Apache-2.0
+note si/benchmarks/verify/bundle.om: pure-Omega port of benchmarks-mv verification engine:
+note benchmark bundle validator, MEASURED vs MODELED discriminator, quantile monotonicity,
+note hardware roofline ceiling comparator, and basis-point regression gate.
+note Compose after si/directives/om2.om and om/tls/sha2.om.
+
+const BM_OK ulong 0
+const BM_ERR_BAD_CLASS ulong 1
+const BM_ERR_MODELED_AS_MEASURED ulong 2
+const BM_ERR_NOT_MEASURED ulong 3
+const BM_ERR_DIRTY_TREE ulong 4
+const BM_ERR_BAD_SHA ulong 5
+const BM_ERR_TOO_FEW_SAMPLES ulong 6
+const BM_ERR_NONMONOTONIC_Q ulong 7
+const BM_ERR_ZERO_THROUGHPUT ulong 8
+const BM_ERR_EXCEEDS_CEILING ulong 9
+const BM_ERR_REGRESSION ulong 10
+const BM_ERR_ZERO_BASELINE ulong 11
+const BM_ERR_BELOW_FLOOR ulong 12
+const BM_ERR_OVERFLOW ulong 13
+
+const BM_CLASS_MEASURED ulong 1
+const BM_CLASS_MODELED ulong 2
+const BM_CLASS_ESTIMATED ulong 3
+const BM_CLASS_SYNTHETIC ulong 4
+
+text bm_lbl_measured "MEASURED"
+text bm_lbl_modeled "MODELED"
+text bm_lbl_estimated "ESTIMATED"
+text bm_lbl_synthetic "SYNTHETIC"
+
+note --- Basic helpers ---
+
+fn bm_slice_eq a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+if gt na ulong 4096
+ret false
+end
+i = ulong 0
+while lt i na bound 4096
+if ne get a i get b i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn bm_write_all fd int buf view uchar * to bool
+n = len buf
+if eq n ulong 0
+ret true
+end
+if gt n ulong 1048576
+ret false
+end
+off = ulong 0
+while lt off n bound 1048576
+remn = sub n off
+k = write fd buf off remn
+if le k long 0
+ret false
+end
+off = add off ulong k
+end
+ret true
+end
+
+fn bm_put_u64_le dst edit uchar * pos ulong v ulong to ulong
+if gt add pos ulong 8 len dst
+ret pos
+end
+for i ulong 8
+sh = mul i ulong 8
+put dst add pos i uchar and shr v sh ulong 255
+end
+ret add pos ulong 8
+end
+
+fn bm_is_lower_hex s view uchar * expected_len ulong to bool
+if ne len s expected_len
+ret false
+end
+if gt expected_len ulong 128
+ret false
+end
+i = ulong 0
+while lt i expected_len bound 128
+b = get s i
+ok = false
+if and ge b uchar 48 le b uchar 57
+ok = true
+end
+if and ge b uchar 97 le b uchar 102
+ok = true
+end
+if not ok
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+fn bm_digest_eq a view uchar 32 b view uchar 32 to bool
+for i ulong 32
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note --- MEASURED vs MODELED Discriminator ---
+
+fn bm_parse_class lbl view uchar * to ulong
+if bm_slice_eq lbl bm_lbl_measured
+ret BM_CLASS_MEASURED
+end
+if bm_slice_eq lbl bm_lbl_modeled
+ret BM_CLASS_MODELED
+end
+if bm_slice_eq lbl bm_lbl_estimated
+ret BM_CLASS_ESTIMATED
+end
+if bm_slice_eq lbl bm_lbl_synthetic
+ret BM_CLASS_SYNTHETIC
+end
+ret ulong 0
+end
+
+note Anti-laundering invariant: a MEASURED label MUST NOT be extrapolated, dirty, sample-less, or missing a HW receipt.
+fn bm_discriminate_class ev_class ulong samples ulong has_hw_receipt bool dirty bool extrapolated bool to ulong
+if or eq ev_class ulong 0 gt ev_class BM_CLASS_SYNTHETIC
+ret BM_ERR_BAD_CLASS
+end
+if eq ev_class BM_CLASS_MEASURED
+if dirty
+ret BM_ERR_DIRTY_TREE
+end
+if extrapolated
+ret BM_ERR_MODELED_AS_MEASURED
+end
+if not has_hw_receipt
+ret BM_ERR_MODELED_AS_MEASURED
+end
+if eq samples ulong 0
+ret BM_ERR_TOO_FEW_SAMPLES
+end
+end
+ret BM_OK
+end
+
+note Only MEASURED evidence may support a silicon/qualification benchmark claim.
+fn bm_allow_qualification ev_class ulong to ulong
+if ne ev_class BM_CLASS_MEASURED
+ret BM_ERR_NOT_MEASURED
+end
+ret BM_OK
+end
+
+note --- Benchmark Bundle Validator ---
+note Validates quantile ordering: min_us <= p50_us <= p95_us <= p99_us <= max_us, and min_us > 0.
+
+fn bm_validate_quantiles min_us ulong p50_us ulong p95_us ulong p99_us ulong max_us ulong to ulong
+if eq min_us ulong 0
+ret BM_ERR_NONMONOTONIC_Q
+end
+if gt min_us p50_us
+ret BM_ERR_NONMONOTONIC_Q
+end
+if gt p50_us p95_us
+ret BM_ERR_NONMONOTONIC_Q
+end
+if gt p95_us p99_us
+ret BM_ERR_NONMONOTONIC_Q
+end
+if gt p99_us max_us
+ret BM_ERR_NONMONOTONIC_Q
+end
+ret BM_OK
+end
+
+fn bm_validate_bundle_shas commit_sha view uchar * receipt_sha view uchar * to ulong
+if not bm_is_lower_hex commit_sha ulong 40
+ret BM_ERR_BAD_SHA
+end
+if not bm_is_lower_hex receipt_sha ulong 64
+ret BM_ERR_BAD_SHA
+end
+ret BM_OK
+end
+
+fn bm_validate_bundle_counts samples ulong min_samples ulong throughput ulong to ulong
+if lt samples min_samples
+ret BM_ERR_TOO_FEW_SAMPLES
+end
+if eq throughput ulong 0
+ret BM_ERR_ZERO_THROUGHPUT
+end
+ret BM_OK
+end
+
+note --- Hardware Roofline Ceiling & Basis-Point Regression Comparator ---
+
+fn bm_check_ceiling measured_val ulong physical_ceiling ulong to ulong
+if eq physical_ceiling ulong 0
+ret BM_ERR_EXCEEDS_CEILING
+end
+if gt measured_val physical_ceiling
+ret BM_ERR_EXCEEDS_CEILING
+end
+ret BM_OK
+end
+
+note Checks latency regression: candidate_us * 10000 <= baseline_us * (10000 + max_regress_bps)
+note Guarded against ulong overflow (inputs capped at 10^14 so * 20000 fits safely in ulong).
+fn bm_check_latency_regression baseline_us ulong candidate_us ulong max_regress_bps ulong to ulong
+if eq baseline_us ulong 0
+ret BM_ERR_ZERO_BASELINE
+end
+if gt max_regress_bps ulong 10000
+ret BM_ERR_OVERFLOW
+end
+cap = ulong 100000000000000
+if or gt baseline_us cap gt candidate_us cap
+ret BM_ERR_OVERFLOW
+end
+lhs = mul candidate_us ulong 10000
+rhs = mul baseline_us add ulong 10000 max_regress_bps
+if gt lhs rhs
+ret BM_ERR_REGRESSION
+end
+ret BM_OK
+end
+
+fn bm_check_throughput_floor measured_tps ulong floor_tps ulong to ulong
+if lt measured_tps floor_tps
+ret BM_ERR_BELOW_FLOOR
+end
+ret BM_OK
+end
+
+note Canonical SHA-256 digest of a benchmark bundle (meta[4]={ev_class,samples,p50,p99}, commit_sha).
+fn bm_bundle_digest meta view ulong 4 commit_sha view uchar * dst edit uchar 32 to void
+ctx = new ulong 40 0
+hdr = new uchar 32 0
+w1 = bm_put_u64_le hdr ulong 0 get meta 0
+if ne w1 ulong 8
+trap 8
+end
+w2 = bm_put_u64_le hdr ulong 8 get meta 1
+if ne w2 ulong 16
+trap 8
+end
+w3 = bm_put_u64_le hdr ulong 16 get meta 2
+if ne w3 ulong 24
+trap 8
+end
+w4 = bm_put_u64_le hdr ulong 24 get meta 3
+if ne w4 ulong 32
+trap 8
+end
+sha256_init ctx
+sha256_update ctx hdr
+sha256_update ctx commit_sha
+sha256_final ctx dst
+end
