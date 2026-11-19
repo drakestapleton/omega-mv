@@ -1,0 +1,533 @@
+om2
+note jflat: JSON on stdin, one line per value on stdout: PATH, a tab, VALUE, a newline.
+note PATH is "/" followed by the object keys and array indices from the root, joined by "/"
+note (`/errors/7/meaning`, `/words/fopen/types/0`); the root value alone has the path "/".
+note VALUE is a string with its JSON escapes decoded (\uXXXX and surrogate pairs become UTF-8),
+note then newline, tab and backslash written as \n, \t and \\ so that every value stays on one
+note line; numbers, true, false and null are copied as written; an empty object or array is
+note written as {} or []. In a key, "/" and "\" are written \/ and \\, and newline and tab \n and \t,
+note so a path splits only on its separators and never holds a tab. Lines come in document order, so the
+note output is a deterministic function of the input bytes. Nesting is limited by the 8 MiB stack: a
+note document nested deeper than it can hold stops with trap 6 (exit 106).
+note Exit 0 on success; 2 when the input is not one JSON value (stderr names the byte offset),
+note when it is 16777216 bytes or longer, or when a write fails; on an error, output not yet written
+note is dropped. The input refusal is the size of the largest global array at the pinned omc (omega-mv
+note has no run-time memory growth yet); `guides check` alarms when data/reference.tsv passes half of it.
+
+global src uchar 16777216
+global obf uchar 1048576
+global pth uchar 1048576
+global nb uchar 32
+global st ulong 8
+
+note st cells: input position, input length, path length, output length
+const c_p ulong 0
+const c_n ulong 1
+const c_pl ulong 2
+const c_ol ulong 3
+
+text m_big "jflat: input is 16777216 bytes or longer\n"
+text m_bad "jflat: malformed JSON at byte "
+text m_deep "jflat: a path is 1048576 bytes or longer\n"
+text m_tail ": expected one JSON value\n"
+text k_true "true"
+text k_false "false"
+text k_null "null"
+
+fn ow2 t view uchar * to void
+n = len t
+p = ulong 0
+while lt p n bound 1048576
+k = write 2 t p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+end
+
+fn flush to void
+n = get st c_ol
+p = ulong 0
+while lt p n bound 1048576
+k = write 1 obf p sub n p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+put st c_ol 0
+end
+
+fn ob c uchar to void
+n = get st c_ol
+if eq n 1048576
+flush
+n = ulong 0
+end
+put obf n c
+put st c_ol add n 1
+end
+
+note bad: report the position and stop with exit 2
+fn bad to void
+ow2 m_bad
+v = get st c_p
+i = ulong 32
+while true bound 21
+i = sub i 1
+put nb i uchar add rem v 10 48
+v = div v 10
+if eq v 0
+break
+end
+end
+p = i
+while lt p 32 bound 32
+k = write 2 nb p sub 32 p
+if le k 0
+exit 2
+end
+p = add p ulong k
+end
+ow2 m_tail
+exit 2
+end
+
+fn padd c uchar to void
+n = get st c_pl
+if eq n 1048576
+ow2 m_deep
+exit 2
+end
+put pth n c
+put st c_pl add n 1
+end
+
+note pnum: v in decimal onto the path
+fn pnum v ulong to void
+i = ulong 32
+n = v
+while true bound 21
+i = sub i 1
+put nb i uchar add rem n 10 48
+n = div n 10
+if eq n 0
+break
+end
+end
+while lt i 32 bound 32
+padd get nb i
+i = add i 1
+end
+end
+
+note opath: the current path and a tab
+fn opath to void
+n = get st c_pl
+if eq n 0
+ob uchar 47
+end
+i = ulong 0
+while lt i n bound 1048576
+ob get pth i
+i = add i 1
+end
+ob uchar 9
+end
+
+fn peek to uchar
+p = get st c_p
+if lt p get st c_n
+ret get src p
+end
+ret uchar 0
+end
+
+fn step to void
+put st c_p add get st c_p 1
+end
+
+fn isws c uchar to bool
+if or eq c 32 eq c 10
+ret true
+end
+ret or eq c 13 eq c 9
+end
+
+fn skipws to void
+p = get st c_p
+n = get st c_n
+while lt p n bound 16777216
+if not isws get src p
+break
+end
+p = add p 1
+end
+put st c_p p
+end
+
+note sput: one decoded byte of a string, into the path (key) or the output (value)
+fn sput c uchar k bool to void
+if k
+if or eq c 47 eq c 92
+padd uchar 92
+end
+if eq c 10
+padd uchar 92
+padd uchar 110
+ret
+end
+if eq c 9
+padd uchar 92
+padd uchar 116
+ret
+end
+padd c
+ret
+end
+if eq c 10
+ob uchar 92
+ob uchar 110
+ret
+end
+if eq c 9
+ob uchar 92
+ob uchar 116
+ret
+end
+if eq c 92
+ob uchar 92
+end
+ob c
+end
+
+note hexv: the value of one hex digit, or 16 when c is not one
+fn hexv c uchar to ulong
+if and ge c 48 le c 57
+ret ulong sub c 48
+end
+if and ge c 97 le c 102
+ret ulong sub c 87
+end
+if and ge c 65 le c 70
+ret ulong sub c 55
+end
+ret ulong 16
+end
+
+note hex4: the 4 hex digits at the position; the position moves past them
+fn hex4 to ulong
+p = get st c_p
+if gt add p 4 get st c_n
+bad
+end
+v = ulong 0
+for i ulong 4
+d = hexv get src add p i
+if eq d 16
+bad
+end
+v = add mul v 16 d
+end
+put st c_p add p 4
+ret v
+end
+
+note utf8: code point v as UTF-8
+fn utf8 v ulong k bool to void
+if lt v 128
+sput uchar v k
+ret
+end
+if lt v 2048
+sput uchar or 192 shr v 6 k
+sput uchar or 128 and v 63 k
+ret
+end
+if lt v 65536
+sput uchar or 224 shr v 12 k
+sput uchar or 128 and shr v 6 63 k
+sput uchar or 128 and v 63 k
+ret
+end
+sput uchar or 240 shr v 18 k
+sput uchar or 128 and shr v 12 63 k
+sput uchar or 128 and shr v 6 63 k
+sput uchar or 128 and v 63 k
+end
+
+note uesc: after `\u`; a high surrogate must be followed by `\u` and a low one
+fn uesc k bool to void
+v = hex4
+if and ge v 56320 le v 57343
+bad
+end
+if and ge v 55296 le v 56319
+if ne peek 92
+bad
+end
+step
+if ne peek 117
+bad
+end
+step
+w = hex4
+if or lt w 56320 gt w 57343
+bad
+end
+v = add 65536 add shl sub v 55296 10 sub w 56320
+end
+utf8 v k
+end
+
+note esc: after a backslash
+fn esc k bool to void
+e = peek
+step
+if or eq e 34 or eq e 92 eq e 47
+sput e k
+ret
+end
+if eq e 98
+sput uchar 8 k
+ret
+end
+if eq e 102
+sput uchar 12 k
+ret
+end
+if eq e 110
+sput uchar 10 k
+ret
+end
+if eq e 114
+sput uchar 13 k
+ret
+end
+if eq e 116
+sput uchar 9 k
+ret
+end
+if eq e 117
+uesc k
+ret
+end
+put st c_p sub get st c_p 1
+bad
+end
+
+note str: the string at the position (its opening quote), decoded into the path or the output
+fn str k bool to void
+step
+while true bound 16777216
+if ge get st c_p get st c_n
+bad
+end
+c = peek
+step
+if eq c 34
+ret
+end
+if lt c 32
+put st c_p sub get st c_p 1
+bad
+end
+if eq c 92
+esc k
+else
+sput c k
+end
+end
+end
+
+fn same s ulong e ulong t view uchar * to bool
+if ne sub e s len t
+ret false
+end
+for i ulong len t bound 8
+if ne get src add s i get t i
+ret false
+end
+end
+ret true
+end
+
+fn isnum c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+if or eq c 45 eq c 43
+ret true
+end
+ret or eq c 46 or eq c 101 eq c 69
+end
+
+note lit: a number, true, false or null, copied as written
+fn lit to void
+s = get st c_p
+p = s
+n = get st c_n
+while lt p n bound 16777216
+c = get src p
+if or isws c or eq c 44 or eq c 125 eq c 93
+break
+end
+p = add p 1
+end
+if eq p s
+bad
+end
+c0 = get src s
+if or eq c0 116 or eq c0 102 eq c0 110
+if not or same s p k_true or same s p k_false same s p k_null
+bad
+end
+else
+if not or eq c0 45 and ge c0 48 le c0 57
+bad
+end
+i = s
+while lt i p bound 16777216
+if not isnum get src i
+put st c_p i
+bad
+end
+i = add i 1
+end
+end
+opath
+i = s
+while lt i p bound 16777216
+ob get src i
+i = add i 1
+end
+ob uchar 10
+put st c_p p
+end
+
+note empty: an empty object or array, written as its two brackets
+fn empty a uchar b uchar to void
+opath
+ob a
+ob b
+ob uchar 10
+end
+
+fn obj to void
+step
+skipws
+if eq peek 125
+step
+empty uchar 123 uchar 125
+ret
+end
+base = get st c_pl
+while true bound 16777216
+skipws
+if ne peek 34
+bad
+end
+padd uchar 47
+str true
+skipws
+if ne peek 58
+bad
+end
+step
+val
+put st c_pl base
+skipws
+c = peek
+if eq c 125
+step
+ret
+end
+if ne c 44
+bad
+end
+step
+end
+end
+
+fn arr to void
+step
+skipws
+if eq peek 93
+step
+empty uchar 91 uchar 93
+ret
+end
+base = get st c_pl
+i = ulong 0
+while true bound 16777216
+padd uchar 47
+pnum i
+val
+put st c_pl base
+skipws
+c = peek
+if eq c 93
+step
+ret
+end
+if ne c 44
+bad
+end
+step
+i = add i 1
+end
+end
+
+fn val to void
+skipws
+if ge get st c_p get st c_n
+bad
+end
+c = peek
+if eq c 123
+obj
+ret
+end
+if eq c 91
+arr
+ret
+end
+if eq c 34
+opath
+str false
+ob uchar 10
+ret
+end
+lit
+end
+
+fn main to int
+n = ulong 0
+while true bound 16777217
+if eq n 16777216
+ow2 m_big
+ret 2
+end
+k = read 0 src n sub 16777216 n
+if lt k 0
+ow2 m_big
+ret 2
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+put st c_n n
+put st c_p 0
+put st c_pl 0
+put st c_ol 0
+val
+skipws
+if ne get st c_p n
+bad
+end
+flush
+ret 0
+end
