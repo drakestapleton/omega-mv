@@ -11,20 +11,36 @@ note Every module is checked by spirv-val and by backend/targets.om before any r
 note
 note Kernels (n = element count for vadd, row count for fsum16; gid = global invocation x):
 note   vadd    c[gid] = a[gid] + b[gid]                      for gid < n (hello_gpu's operation)
+note   vmul    c[gid] = a[gid] * b[gid]                      for gid < n
+note   vsub    c[gid] = a[gid] - b[gid]                      for gid < n
+note   vmax    c[gid] = a[gid] > b[gid] ? a[gid] : b[gid]    for gid < n (OpFOrdGreaterThan, OpSelect)
 note   fsum16  o[gid] = (((x[16g] + x[16g+1]) + x[16g+2]) ... + x[16g+15])  frozen left-to-right order
-note cl arguments: vadd (a, b, c, uint n), fsum16 (x, o, uint n).
-note vk bindings set 0: vadd a=0 b=1 c=2, fsum16 x=0 o=1; n = OpArrayLength of the output buffer;
+note   rmsnorm one work-item per row of 16 (train/openaccel-lab/workloads/rmsnorm/omega.om, frozen):
+note     ss = (((x0*x0 + x1*x1) + x2*x2) ... + x15*x15)
+note     yk = (xk * (1 / sqrt(ss * (1/16) + eps))) * wk     eps = binary32(0.000001) = 0x358637BD
+note     sqrt then div, not rsqrt and not fma. 1/16 is 0.0625 and is exact.
+note cl arguments: vadd, vmul, vsub, vmax (a, b, c, uint n), fsum16 (x, o, uint n),
+note   rmsnorm (x, w, y, uint nrows). w is 16 floats, shared by every row.
+note vk bindings set 0: vadd, vmul, vsub, vmax a=0 b=1 c=2, fsum16 x=0 o=1, rmsnorm x=0 w=1 y=2;
+note n = OpArrayLength of the output buffer (rmsnorm divides that length by 16);
 note LocalSize 64 1 1.
 note
-note Usage: emit vadd|fsum16 cl|vk [mutant]
-note mutant plants a wrong kernel for negative controls: vadd uses OpFSub, fsum16 adds right-to-left.
+note Usage: emit vadd|vmul|vsub|vmax|fsum16|rmsnorm cl|vk [mutant]
+note mutant plants a wrong kernel for negative controls: vadd uses OpFSub, vmul and vsub use OpFAdd,
+note vmax selects the other operand (min), fsum16 and rmsnorm add right-to-left.
 note Exit: 0 module written; 2 usage; 3 stdout write failed. Traps exit 100 + code.
 om2
 
-text tuse "usage: emit vadd|fsum16 cl|vk [mutant]\n"
+text tuse "usage: emit vadd|vmul|vsub|vmax|fsum16|rmsnorm cl|vk [mutant]\n"
 text tio "emit: stdout write failed\n"
 text tvadd "vadd"
 text tfsum "fsum16"
+text tvmul "vmul"
+text tvsub "vsub"
+text tvmax "vmax"
+text trms "rmsnorm"
+text tocls "OpenCL.std"
+text tglsl "GLSL.std.450"
 text tcl "cl"
 text tvk "vk"
 text tmut "mutant"
@@ -50,11 +66,15 @@ const IN uint 18
 const IK0 uint 20
 const IK16 uint 36
 const IDYN uint 40
+const IEXT uint 19
+const IONE uint 37
+const IEPS uint 38
+const IINV uint 39
 
 global gw uint 4096
 global gob uchar 16384
 global garg uchar 16
-note gst: 0 word fill, 1 next id, 2 env (0 cl, 1 vk), 3 kernel (0 vadd, 1 fsum16), 4 mutant
+note gst: 0 word fill, 1 next id, 2 env (0 cl, 1 vk), 3 kernel (0 vadd, 1 fsum16, 2 vmul, 3 vsub, 4 vmax), 4 mutant
 global gst ulong 8
 
 fn usage to void
@@ -119,6 +139,22 @@ if eq get gst 3 0
 wstr tvadd
 ret
 end
+if eq get gst 3 2
+wstr tvmul
+ret
+end
+if eq get gst 3 3
+wstr tvsub
+ret
+end
+if eq get gst 3 4
+wstr tvmax
+ret
+end
+if eq get gst 3 5
+wstr trms
+ret
+end
 wstr tfsum
 end
 
@@ -126,14 +162,26 @@ fn knamewc to uint
 if eq get gst 3 0
 ret strwc tvadd
 end
+if eq get gst 3 2
+ret strwc tvmul
+end
+if eq get gst 3 3
+ret strwc tvsub
+end
+if eq get gst 3 4
+ret strwc tvmax
+end
+if eq get gst 3 5
+ret strwc trms
+end
 ret strwc tfsum
 end
 
 fn nbuf to uint
-if eq get gst 3 0
-ret 3
-end
+if eq get gst 3 1
 ret 2
+end
+ret 3
 end
 
 note Buffer i (0-based) as an id: cl parameters and vk variables share IB0..IB2.
@@ -145,10 +193,26 @@ fn outbuf to uint
 ret bufid sub nbuf 1
 end
 
+fn extimp to void
+if ne get gst 3 5
+ret
+end
+if isvk
+op 11 add 2 strwc tglsl
+w IEXT
+wstr tglsl
+ret
+end
+op 11 add 2 strwc tocls
+w IEXT
+wstr tocls
+end
+
 fn header to void
 if isvk
 op 17 2
 w 1
+extimp
 op 14 3
 w 0
 w 1
@@ -171,6 +235,7 @@ op 17 2
 w 6
 op 17 2
 w 11
+extimp
 op 14 3
 w 2
 w 2
@@ -282,6 +347,7 @@ w IU32
 end
 
 note Index constants k = 0..16 at ids IK0 + k: ulong for cl (two literal words), uint for vk.
+note rmsnorm also emits 1, eps and 1/16 at IONE, IEPS, IINV.
 fn consts to void
 for k uint 17
 if isvk
@@ -298,6 +364,21 @@ w k
 w 0
 end
 end
+if ne get gst 3 5
+ret
+end
+op 43 4
+w IF32
+w IONE
+w 0x3f800000
+op 43 4
+w IF32
+w IEPS
+w 0x358637bd
+op 43 4
+w IF32
+w IINV
+w 0x3d800000
 end
 
 fn vars to void
@@ -393,14 +474,54 @@ w b
 ret r
 end
 
+note Elementwise binary kernels: vadd FAdd 129, vmul FMul 133, vsub FSub 131; mutants swap the opcode.
+fn binop to uint
+c = uint 129
+if eq get gst 3 2
+c = 133
+end
+if eq get gst 3 3
+c = 131
+end
+if eq get gst 4 1
+c = 129
+if eq get gst 3 0
+c = 131
+end
+end
+ret c
+end
+
+fn bvmax a uint b uint to uint
+c = nid
+op 186 5
+w IBOOL
+w c
+w a
+w b
+r = nid
+op 169 6
+w IF32
+w r
+w c
+if eq get gst 4 1
+w b
+w a
+ret r
+end
+w a
+w b
+ret r
+end
+
 fn bvadd x uint to void
 a = ld eptr IB0 x
 b = ld eptr IB1 x
-c = uint 129
-if eq get gst 4 1
-c = 131
+if eq get gst 3 4
+st eptr IB2 x bvmax a b
+ret
 end
-s = farith c a b
+s = farith binop a b
 st eptr IB2 x s
 end
 
@@ -417,6 +538,55 @@ if ne k 0
 x = iarith 128 bs add IK0 k
 end
 ret ld eptr IB0 x
+end
+
+fn sqrtv a uint to uint
+r = nid
+op 12 6
+w IF32
+w r
+w IEXT
+if isvk
+w 31
+end
+if not isvk
+w 61
+end
+w a
+ret r
+end
+
+fn fldat bs uint k uint to uint
+x = bs
+if ne k 0
+x = iarith 128 bs add IK0 k
+end
+ret ld eptr IB0 x
+end
+
+note rmsnorm: left-to-right sum of squares, then (x * (1 / sqrt(ss * 1/16 + eps))) * w.
+note The mutant reverses only the sum, the same way fsum16 does.
+fn brms x uint to void
+bs = iarith 132 x IK16
+z = fld bs fsel 0
+acc = farith 133 z z
+for i uint 15
+v = fld bs fsel add i 1
+acc = farith 129 acc farith 133 v v
+end
+acc = farith 133 acc IINV
+acc = farith 129 acc IEPS
+acc = farith 136 IONE sqrtv acc
+for i uint 16
+xv = fldat bs i
+p = farith 133 xv acc
+yv = farith 133 p ld eptr IB1 add IK0 i
+idx = bs
+if ne i 0
+idx = iarith 128 bs add IK0 i
+end
+st eptr IB2 idx yv
+end
 end
 
 fn bfsum x uint to void
@@ -437,7 +607,16 @@ w IU32
 w n
 w outbuf
 w 0
+if ne get gst 3 5
 ret n
+end
+d = nid
+op 194 5
+w IU32
+w d
+w n
+w add IK0 4
+ret d
 end
 op 113 4
 w IU64
@@ -493,11 +672,17 @@ w tl
 w ml
 op 248 2
 w tl
-if eq get gst 3 0
+k = get gst 3
+if eq k 1
+bfsum x
+end
+if eq k 5
+brms x
+end
+if ne k 1
+if ne k 5
 bvadd x
 end
-if eq get gst 3 1
-bfsum x
 end
 op 249 2
 w ml
@@ -547,6 +732,18 @@ put gst 3 0
 end
 if argis 1 tfsum
 put gst 3 1
+end
+if argis 1 tvmul
+put gst 3 2
+end
+if argis 1 tvsub
+put gst 3 3
+end
+if argis 1 tvmax
+put gst 3 4
+end
+if argis 1 trms
+put gst 3 5
 end
 put gst 2 9
 if argis 2 tcl
