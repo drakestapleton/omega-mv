@@ -1,0 +1,144 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/aien-protocols/ext/microjob.om: pure-Omega port of aien-microjob (AIENET-0)
+note Implements microjob status transitions, envelope validation, deadline checks,
+note payout conservation, canonical job digest, and receipt digest verification.
+note Compose after si/directives/om2.om, om/tls/sha2.om, and protocol/aien-protocols/core/types.om.
+
+const MJ_OK ulong 0
+const MJ_ERR_BAD_ID ulong 1
+const MJ_ERR_BAD_STATE ulong 2
+const MJ_ERR_DEADLINE ulong 3
+const MJ_ERR_BUDGET ulong 4
+const MJ_ERR_DIGEST ulong 5
+const MJ_ERR_PAYOUT ulong 6
+const MJ_ERR_TIMEOUT ulong 7
+
+const MJ_STAT_OPEN ulong 1
+const MJ_STAT_CLAIMED ulong 2
+const MJ_STAT_SUBMITTED ulong 3
+const MJ_STAT_VERIFIED ulong 4
+const MJ_STAT_SETTLED ulong 5
+const MJ_STAT_REJECTED ulong 6
+const MJ_STAT_EXPIRED ulong 7
+
+const MJ_MAX_DURATION_MS ulong 86400000
+
+text mj_dom_job "aienet0:microjob:v1|"
+text mj_dom_rcpt "aienet0:receipt:v1|"
+
+fn mj_status_valid s ulong to bool
+ret and ge s MJ_STAT_OPEN le s MJ_STAT_EXPIRED
+end
+
+fn mj_transition_check cur ulong nxt ulong to ulong
+if not mj_status_valid cur
+ret MJ_ERR_BAD_STATE
+end
+if not mj_status_valid nxt
+ret MJ_ERR_BAD_STATE
+end
+if eq cur MJ_STAT_OPEN
+if or eq nxt MJ_STAT_CLAIMED eq nxt MJ_STAT_EXPIRED
+ret MJ_OK
+end
+ret MJ_ERR_BAD_STATE
+end
+if eq cur MJ_STAT_CLAIMED
+if or eq nxt MJ_STAT_SUBMITTED or eq nxt MJ_STAT_EXPIRED eq nxt MJ_STAT_REJECTED
+ret MJ_OK
+end
+ret MJ_ERR_BAD_STATE
+end
+if eq cur MJ_STAT_SUBMITTED
+if or eq nxt MJ_STAT_VERIFIED eq nxt MJ_STAT_REJECTED
+ret MJ_OK
+end
+ret MJ_ERR_BAD_STATE
+end
+if eq cur MJ_STAT_VERIFIED
+if eq nxt MJ_STAT_SETTLED
+ret MJ_OK
+end
+ret MJ_ERR_BAD_STATE
+end
+ret MJ_ERR_BAD_STATE
+end
+
+fn mj_validate_envelope job_id view uchar 16 input_dig view uchar 32 reward ulong max_ms ulong to ulong
+if uuid_is_nil job_id
+ret MJ_ERR_BAD_ID
+end
+if digest_is_zero input_dig
+ret MJ_ERR_DIGEST
+end
+if eq reward ulong 0
+ret MJ_ERR_BUDGET
+end
+if or eq max_ms ulong 0 gt max_ms MJ_MAX_DURATION_MS
+ret MJ_ERR_TIMEOUT
+end
+ret MJ_OK
+end
+
+fn mj_check_deadline created_ms ulong deadline_ms ulong now_ms ulong to ulong
+if le deadline_ms created_ms
+ret MJ_ERR_DEADLINE
+end
+if gt now_ms deadline_ms
+ret MJ_ERR_DEADLINE
+end
+ret MJ_OK
+end
+
+fn mj_check_payout escrow ulong worker_pay ulong fee ulong refund ulong to ulong
+if gt worker_pay escrow
+ret MJ_ERR_PAYOUT
+end
+rem1 = sub escrow worker_pay
+if gt fee rem1
+ret MJ_ERR_PAYOUT
+end
+rem2 = sub rem1 fee
+if ne refund rem2
+ret MJ_ERR_PAYOUT
+end
+ret MJ_OK
+end
+
+fn mj_compute_digest job_id view uchar 16 input_dig view uchar 32 reward ulong deadline_ms ulong dst edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx mj_dom_job
+sha256_update ctx job_id
+sha256_update ctx input_dig
+buf = new uchar 16 0
+p0 = pt_put_u64_le buf ulong 0 reward
+p1 = pt_put_u64_le buf p0 deadline_ms
+sha256_update ctx part buf ulong 0 p1
+sha256_final ctx dst
+end
+
+fn mj_compute_receipt_digest job_id view uchar 16 input_dig view uchar 32 output_dig view uchar 32 dst edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx mj_dom_rcpt
+sha256_update ctx job_id
+sha256_update ctx input_dig
+sha256_update ctx output_dig
+sha256_final ctx dst
+end
+
+fn mj_verify_receipt job_id view uchar 16 input_dig view uchar 32 output_dig view uchar 32 claimed view uchar 32 to ulong
+if uuid_is_nil job_id
+ret MJ_ERR_BAD_ID
+end
+if or digest_is_zero input_dig digest_is_zero output_dig
+ret MJ_ERR_DIGEST
+end
+exp = new uchar 32 0
+mj_compute_receipt_digest job_id input_dig output_dig exp
+if not digest_eq exp claimed
+ret MJ_ERR_DIGEST
+end
+ret MJ_OK
+end
