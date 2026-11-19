@@ -1,0 +1,186 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/interplane/core/policy.om: pure-Omega trust-boundary policy evaluator,
+note conformance lifecycle state machine, and hash-chained provenance ledger.
+note Enforces all 5 Interplane security invariants:
+note   1. Parsing never executes (LC_PARSED cannot jump to LC_EXECUTED)
+note   2. Transport never grants (mTLS/loopback never bypasses runtime policy)
+note   3. Valid envelope != authorization (only LC_POLICY_AUTHORIZED can execute)
+note   4. Signature proves origin != authority (ORIG_SIG_VALID never grants ops)
+note   5. Runtime policy decides and requests cannot upgrade it (claimed_policy > runtime_policy refused)
+note Compose after si/directives/om2.om, om/tls/sha2.om, and protocol/interplane/core/envelope.om.
+
+const ORIG_UNVERIFIED ulong 0
+const ORIG_SIG_VALID ulong 1
+const ORIG_REVOKED ulong 2
+
+const OP_READ ulong 1
+const OP_WRITE ulong 2
+const OP_EXEC ulong 4
+const OP_ADMIN ulong 8
+const OP_POLICY_MUTATE ulong 16
+const OP_ALL_MASK ulong 31
+
+const LC_RECEIVED ulong 0
+const LC_PARSED ulong 1
+const LC_ORIGIN_CHECKED ulong 2
+const LC_POLICY_AUTHORIZED ulong 3
+const LC_EXECUTED ulong 4
+const LC_DENIED ulong 5
+
+const POL_OK ulong 0
+const POL_ERR_NOT_PARSED ulong 1
+const POL_ERR_ORIGIN_UNVERIFIED ulong 2
+const POL_ERR_ORIGIN_REVOKED ulong 3
+const POL_ERR_POLICY_DENIED ulong 4
+const POL_ERR_OP_NOT_ALLOWED ulong 5
+const POL_ERR_ESCALATION ulong 6
+const POL_ERR_BAD_OP ulong 7
+const POL_ERR_UNAUTH_TRANSITION ulong 8
+const POL_ERR_BAD_STATE ulong 9
+const POL_ERR_LEDGER_TAMPER ulong 10
+
+note --- Conformance Lifecycle State Machine ---
+note Allowed transitions:
+note   LC_RECEIVED -> LC_PARSED | LC_DENIED
+note   LC_PARSED -> LC_ORIGIN_CHECKED | LC_DENIED
+note   LC_ORIGIN_CHECKED -> LC_POLICY_AUTHORIZED | LC_DENIED
+note   LC_POLICY_AUTHORIZED -> LC_EXECUTED | LC_DENIED
+note   LC_EXECUTED, LC_DENIED -> terminal (no further transitions)
+
+fn ip_lc_transition cur ulong nxt ulong to ulong
+if or gt cur LC_DENIED gt nxt LC_DENIED
+ret POL_ERR_BAD_STATE
+end
+if eq cur LC_RECEIVED
+if or eq nxt LC_PARSED eq nxt LC_DENIED
+ret POL_OK
+end
+ret POL_ERR_UNAUTH_TRANSITION
+end
+if eq cur LC_PARSED
+if or eq nxt LC_ORIGIN_CHECKED eq nxt LC_DENIED
+ret POL_OK
+end
+ret POL_ERR_UNAUTH_TRANSITION
+end
+if eq cur LC_ORIGIN_CHECKED
+if or eq nxt LC_POLICY_AUTHORIZED eq nxt LC_DENIED
+ret POL_OK
+end
+ret POL_ERR_UNAUTH_TRANSITION
+end
+if eq cur LC_POLICY_AUTHORIZED
+if or eq nxt LC_EXECUTED eq nxt LC_DENIED
+ret POL_OK
+end
+ret POL_ERR_UNAUTH_TRANSITION
+end
+ret POL_ERR_UNAUTH_TRANSITION
+end
+
+note Invariant 1 & 3: only an explicitly policy-authorized envelope may execute.
+fn ip_can_execute lc_state ulong to bool
+ret eq lc_state LC_POLICY_AUTHORIZED
+end
+
+note Required minimum runtime policy level for an operation mask.
+fn ip_op_min_policy req_op ulong to ulong
+if ne and req_op OP_POLICY_MUTATE ulong 0
+ret POL_ELEVATED
+end
+if ne and req_op OP_ADMIN ulong 0
+ret POL_ELEVATED
+end
+if ne and req_op or OP_WRITE OP_EXEC ulong 0
+ret POL_STANDARD
+end
+if ne and req_op OP_READ ulong 0
+ret POL_READ_ONLY
+end
+ret POL_ELEVATED
+end
+
+note --- Trust-Boundary Policy Evaluator ---
+note Inputs:
+note   runtime_pol:   authoritative runtime policy level (POL_DENY_ALL..POL_ELEVATED)
+note   allowed_ops:   authoritative runtime allowed-ops bitmask
+note   origin_status: ORIG_UNVERIFIED | ORIG_SIG_VALID | ORIG_REVOKED
+note   transport:     TRANS_UNTRUSTED..TRANS_LOOPBACK (recorded only; NEVER grants authority)
+note   req_op:        requested operation bitmask (must be non-zero subset of OP_ALL_MASK)
+note   claimed_pol:   untrusted policy level claimed by the request (MUST NOT exceed runtime_pol)
+
+fn ip_eval_policy runtime_pol ulong allowed_ops ulong origin_status ulong transport ulong req_op ulong claimed_pol ulong to ulong
+note Transport is intentionally NOT used to grant or elevate authority (Invariant 2).
+if gt transport TRANS_LOOPBACK
+ret POL_ERR_POLICY_DENIED
+end
+note Reject unknown or empty op masks.
+if eq req_op ulong 0
+ret POL_ERR_BAD_OP
+end
+if ne and req_op not OP_ALL_MASK ulong 0
+ret POL_ERR_BAD_OP
+end
+note Invariant 5: a request claiming a higher policy level than runtime_pol is an escalation attempt.
+if gt claimed_pol runtime_pol
+ret POL_ERR_ESCALATION
+end
+note Invariant 4: origin verification is required, and revoked origins are always denied.
+if eq origin_status ORIG_REVOKED
+ret POL_ERR_ORIGIN_REVOKED
+end
+if ne origin_status ORIG_SIG_VALID
+ret POL_ERR_ORIGIN_UNVERIFIED
+end
+note Runtime policy DENY_ALL blocks everything, regardless of valid signature or loopback transport.
+if eq runtime_pol POL_DENY_ALL
+ret POL_ERR_POLICY_DENIED
+end
+note Runtime policy level must meet operation minimum.
+min_pol = ip_op_min_policy req_op
+if lt runtime_pol min_pol
+ret POL_ERR_POLICY_DENIED
+end
+note Runtime allowed_ops mask must explicitly include every requested op bit.
+if ne and allowed_ops req_op req_op
+ret POL_ERR_OP_NOT_ALLOWED
+end
+ret POL_OK
+end
+
+note End-to-end checked authorization step: requires lc_state == LC_ORIGIN_CHECKED.
+fn ip_authorize_step lc_state ulong runtime_pol ulong allowed_ops ulong origin_status ulong req_op ulong claimed_pol ulong to ulong
+if ne lc_state LC_ORIGIN_CHECKED
+ret POL_ERR_UNAUTH_TRANSITION
+end
+ret ip_eval_policy runtime_pol allowed_ops origin_status TRANS_UNTRUSTED req_op claimed_pol
+end
+
+note --- Hash-Chained Provenance Ledger ---
+note entry_digest = SHA-256(prev_digest[32] || seq_u64_le[8] || env_digest[32] || verdict_u32_le[4])
+
+fn ip_ledger_step prev_dig view uchar 32 seq ulong env_dig view uchar 32 verdict ulong out_dig edit uchar 32 to void
+ctx = new ulong 40 0
+sb = new uchar 8 0
+vb = new uchar 4 0
+w1 = ip_put_u64_le sb ulong 0 seq
+w2 = ip_put_u32_le vb ulong 0 uint verdict
+if or ne w1 ulong 8 ne w2 ulong 4
+trap 8
+end
+sha256_init ctx
+sha256_update ctx prev_dig
+sha256_update ctx sb
+sha256_update ctx env_dig
+sha256_update ctx vb
+sha256_final ctx out_dig
+end
+
+fn ip_ledger_verify prev_dig view uchar 32 seq ulong env_dig view uchar 32 verdict ulong expected view uchar 32 to ulong
+calc = new uchar 32 0
+ip_ledger_step prev_dig seq env_dig verdict calc
+if not ip_digest_eq calc expected
+ret POL_ERR_LEDGER_TAMPER
+end
+ret POL_OK
+end
