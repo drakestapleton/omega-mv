@@ -1,0 +1,375 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/runtime/membrane.om
+note Pure OM-2 conversion of aien-runtime/src/{world,control,spine}.rs.
+note Persistent WorldStore with monotonic capability attenuation on fork, idempotent
+note RuntimeController, fail-closed capability membrane with containment freeze,
+note and SHA-256 hash-chained execution journal / receipt emitter.
+note Compose after si/directives/om2.om, inference_abi.om, and om/tls/sha2.om.
+
+const RT_MAX_WORLDS ulong 64
+const RT_MAX_OPS ulong 64
+const RT_MAX_JOURNAL ulong 64
+const RT_JOURNAL_HASH_TOTAL ulong 2048
+const RT_CTRL_PROTO_VER ulong 1
+
+note Capability bitmask
+const RT_CAP_NONE ulong 0
+const RT_CAP_INFER ulong 1
+const RT_CAP_FORK_WORLD ulong 2
+const RT_CAP_READ_FS ulong 4
+const RT_CAP_WRITE_FS ulong 8
+const RT_CAP_EXEC_CMD ulong 16
+const RT_CAP_SEND_MSG ulong 32
+const RT_CAP_ADMIN ulong 64
+
+note Effect intent kinds
+const RT_EFF_INFER ulong 1
+const RT_EFF_WRITE_FS ulong 2
+const RT_EFF_EXEC_CMD ulong 3
+const RT_EFF_SEND_MSG ulong 4
+const RT_EFF_ADMIN ulong 5
+
+note Status / refusal codes
+const RT_OK ulong 0
+const RT_ERR_FULL ulong 1
+const RT_ERR_NOT_FOUND ulong 2
+const RT_ERR_CAP_ESCALATION ulong 3
+const RT_ERR_UNAUTHORIZED ulong 4
+const RT_ERR_CONTAINED ulong 5
+const RT_ERR_DUPLICATE_OP ulong 6
+const RT_ERR_BAD_PROTO ulong 7
+const RT_ERR_JRN_SEQ ulong 8
+const RT_ERR_JRN_PREV ulong 9
+const RT_ERR_JRN_HASH ulong 10
+
+text rt_jrn_dom "AIEN-RT-RECEIPT-V1"
+
+note WorldStore metadata: [0]=world_cnt, [1]=next_world_id, [2]=contained_freeze(0/1), [3]=op_cnt, [4]=jrn_cnt, [5]=jrn_seq
+global rt_meta ulong 8
+
+note WorldManifest slots (0..63)
+global rt_w_used ulong 64
+global rt_w_id ulong 64
+global rt_w_parent ulong 64
+global rt_w_caps ulong 64
+global rt_w_tok_root ulong 64
+global rt_w_created ulong 64
+
+note RuntimeController processed operation_id set (0..63)
+global rt_ops_seen ulong 64
+
+note SHA-256 hash-chained execution journal / receipts (0..63)
+global rt_j_seq ulong 64
+global rt_j_world ulong 64
+global rt_j_op ulong 64
+global rt_j_eff ulong 64
+global rt_j_status ulong 64
+global rt_j_prev uchar 2048
+global rt_j_hash uchar 2048
+
+fn rt_init to void
+for i ulong 8
+put rt_meta i 0
+end
+put rt_meta 1 1
+for i ulong 64
+put rt_w_used i 0
+put rt_w_id i 0
+put rt_w_parent i 0
+put rt_w_caps i 0
+put rt_w_tok_root i 0
+put rt_w_created i 0
+put rt_ops_seen i 0
+put rt_j_seq i 0
+put rt_j_world i 0
+put rt_j_op i 0
+put rt_j_eff i 0
+put rt_j_status i 0
+end
+for i ulong RT_JOURNAL_HASH_TOTAL
+put rt_j_prev i uchar 0
+put rt_j_hash i uchar 0
+end
+end
+
+fn rt_set_freeze frozen ulong to void
+put rt_meta 2 frozen
+end
+
+fn rt_is_frozen to bool
+ret ne get rt_meta 2 0
+end
+
+fn rt_world_count to ulong
+ret get rt_meta 0
+end
+
+fn rt_journal_count to ulong
+ret get rt_meta 4
+end
+
+fn rt_find_world wid ulong to ulong
+for i ulong RT_MAX_WORLDS
+if ne get rt_w_used i 0
+if eq get rt_w_id i wid
+ret i
+end
+end
+end
+ret 18446744073709551615
+end
+
+fn rt_world_caps wid ulong to ulong
+slot = rt_find_world wid
+if eq slot 18446744073709551615
+ret 0
+end
+ret get rt_w_caps slot
+end
+
+fn rt_world_parent wid ulong to ulong
+slot = rt_find_world wid
+if eq slot 18446744073709551615
+ret 0
+end
+ret get rt_w_parent slot
+end
+
+note Create a root world manifest; returns world_id or 0 on full.
+fn rt_world_create_root tok_root ulong caps ulong ts ulong to ulong
+cnt = get rt_meta 0
+if ge cnt RT_MAX_WORLDS
+ret 0
+end
+wid = get rt_meta 1
+put rt_meta 1 add wid 1
+put rt_w_used cnt 1
+put rt_w_id cnt wid
+put rt_w_parent cnt 0
+put rt_w_caps cnt caps
+put rt_w_tok_root cnt tok_root
+put rt_w_created cnt ts
+put rt_meta 0 add cnt 1
+ret wid
+end
+
+note Fork a child world from parent_id.
+note Enforces strict capability non-escalation: child req_caps must be a subset of parent caps,
+note and parent must hold RT_CAP_FORK_WORLD. Returns child world_id or 0 on refusal.
+fn rt_world_fork parent_id ulong req_caps ulong ts ulong to ulong
+pslot = rt_find_world parent_id
+if eq pslot 18446744073709551615
+ret 0
+end
+pcaps = get rt_w_caps pslot
+if eq and pcaps RT_CAP_FORK_WORLD 0
+ret 0
+end
+note Refuse any requested bit not present in parent caps (fail-closed anti-escalation)
+if ne and req_caps pcaps req_caps
+ret 0
+end
+cnt = get rt_meta 0
+if ge cnt RT_MAX_WORLDS
+ret 0
+end
+wid = get rt_meta 1
+put rt_meta 1 add wid 1
+put rt_w_used cnt 1
+put rt_w_id cnt wid
+put rt_w_parent cnt parent_id
+put rt_w_caps cnt req_caps
+put rt_w_tok_root cnt get rt_w_tok_root pslot
+put rt_w_created cnt ts
+put rt_meta 0 add cnt 1
+ret wid
+end
+
+note ---- RuntimeController idempotent operation_id tracking ----
+
+fn rt_ctrl_is_processed op_id ulong to bool
+cnt = get rt_meta 3
+for i ulong cnt bound 64
+if eq get rt_ops_seen i op_id
+ret true
+end
+end
+ret false
+end
+
+fn rt_ctrl_begin_op proto_ver ulong op_id ulong to ulong
+if ne proto_ver RT_CTRL_PROTO_VER
+ret RT_ERR_BAD_PROTO
+end
+if eq op_id 0
+ret RT_ERR_BAD_PROTO
+end
+if rt_ctrl_is_processed op_id
+ret RT_ERR_DUPLICATE_OP
+end
+cnt = get rt_meta 3
+if ge cnt RT_MAX_OPS
+ret RT_ERR_FULL
+end
+put rt_ops_seen cnt op_id
+put rt_meta 3 add cnt 1
+ret RT_OK
+end
+
+note ---- SHA-256 hash-chained Execution Journal / Receipt Emitter ----
+
+fn rt_jrn_compute_hash idx ulong out_h edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx rt_jrn_dom
+hdr = new uchar 40 0
+abi_put_u64 hdr 0 get rt_j_seq idx
+abi_put_u64 hdr 8 get rt_j_world idx
+abi_put_u64 hdr 16 get rt_j_op idx
+abi_put_u64 hdr 24 get rt_j_eff idx
+abi_put_u64 hdr 32 get rt_j_status idx
+sha256_update ctx hdr
+prev = new uchar 32 0
+pbase = mul idx 32
+for i ulong 32
+put prev i get rt_j_prev add pbase i
+end
+sha256_update ctx prev
+sha256_final ctx out_h
+end
+
+fn rt_jrn_hash_eq a view uchar 32 b view uchar 32 to bool
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get a i get b i
+end
+ret eq diff uchar 0
+end
+
+fn rt_jrn_append wid ulong op_id ulong eff ulong status ulong to ulong
+cnt = get rt_meta 4
+if ge cnt RT_MAX_JOURNAL
+ret RT_ERR_FULL
+end
+nseq = add get rt_meta 5 1
+put rt_j_seq cnt nseq
+put rt_j_world cnt wid
+put rt_j_op cnt op_id
+put rt_j_eff cnt eff
+put rt_j_status cnt status
+pbase = mul cnt 32
+if eq cnt 0
+for i ulong 32
+put rt_j_prev add pbase i uchar 0
+end
+else
+lbase = mul sub cnt 1 32
+for i ulong 32
+put rt_j_prev add pbase i get rt_j_hash add lbase i
+end
+end
+h = new uchar 32 0
+rt_jrn_compute_hash cnt h
+for i ulong 32
+put rt_j_hash add pbase i get h i
+end
+put rt_meta 4 add cnt 1
+put rt_meta 5 nseq
+ret RT_OK
+end
+
+note Verify entire execution journal chain from genesis (constant-time hash checks).
+fn rt_journal_verify_chain to ulong
+cnt = get rt_meta 4
+exp_prev = new uchar 32 0
+cur_prev = new uchar 32 0
+stored_h = new uchar 32 0
+comp_h = new uchar 32 0
+for i ulong cnt bound 64
+if ne get rt_j_seq i add i 1
+ret RT_ERR_JRN_SEQ
+end
+pbase = mul i 32
+for j ulong 32
+put cur_prev j get rt_j_prev add pbase j
+put stored_h j get rt_j_hash add pbase j
+end
+if not rt_jrn_hash_eq cur_prev exp_prev
+ret RT_ERR_JRN_PREV
+end
+rt_jrn_compute_hash i comp_h
+if not rt_jrn_hash_eq stored_h comp_h
+ret RT_ERR_JRN_HASH
+end
+for j ulong 32
+put exp_prev j get stored_h j
+end
+end
+ret RT_OK
+end
+
+note Map effect intent kind to required capability bit (0 if unknown -> fail-closed).
+fn rt_required_cap eff ulong to ulong
+if eq eff RT_EFF_INFER
+ret RT_CAP_INFER
+end
+if eq eff RT_EFF_WRITE_FS
+ret RT_CAP_WRITE_FS
+end
+if eq eff RT_EFF_EXEC_CMD
+ret RT_CAP_EXEC_CMD
+end
+if eq eff RT_EFF_SEND_MSG
+ret RT_CAP_SEND_MSG
+end
+if eq eff RT_EFF_ADMIN
+ret RT_CAP_ADMIN
+end
+ret 0
+end
+
+note Authorize and journal an effect intent for (world_id, op_id, eff) fail-closed.
+fn rt_authorize_effect proto_ver ulong op_id ulong wid ulong eff ulong to ulong
+cst = rt_ctrl_begin_op proto_ver op_id
+if ne cst RT_OK
+ret cst
+end
+slot = rt_find_world wid
+if eq slot 18446744073709551615
+jst = rt_jrn_append wid op_id eff RT_ERR_NOT_FOUND
+ret RT_ERR_NOT_FOUND
+end
+req_cap = rt_required_cap eff
+if eq req_cap 0
+jst = rt_jrn_append wid op_id eff RT_ERR_UNAUTHORIZED
+ret RT_ERR_UNAUTHORIZED
+end
+if and rt_is_frozen ne eff RT_EFF_ADMIN
+jst = rt_jrn_append wid op_id eff RT_ERR_CONTAINED
+ret RT_ERR_CONTAINED
+end
+wcaps = get rt_w_caps slot
+if eq and wcaps req_cap 0
+jst = rt_jrn_append wid op_id eff RT_ERR_UNAUTHORIZED
+ret RT_ERR_UNAUTHORIZED
+end
+jst = rt_jrn_append wid op_id eff RT_OK
+if ne jst RT_OK
+ret jst
+end
+ret RT_OK
+end
+
+note Test-only tamper helpers for negative chain-integrity controls.
+fn rt_jrn_tamper_status idx ulong bad_st ulong to void
+if lt idx get rt_meta 4
+put rt_j_status idx bad_st
+end
+end
+
+fn rt_jrn_tamper_prev idx ulong b_idx ulong mask uchar to void
+if and lt idx get rt_meta 4 lt b_idx 32
+off = add mul idx 32 b_idx
+put rt_j_prev off xor get rt_j_prev off mask
+end
+end
