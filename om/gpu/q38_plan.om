@@ -1,0 +1,186 @@
+note SPDX-License-Identifier: Apache-2.0
+note om/gpu/q38_plan.om: Pure OM-2 Qwen3.8-27B GPU multi-head batching, overlap, exact-head,
+note attn256 L2-cache, and QMMA prefill tile planner.
+note Output record layout in out[384] (up to 96 ops x 4 uint words):
+note   out[4*k + 0] = op, out[4*k + 1] = mark_independent, out[4*k + 2] = arg0, out[4*k + 3] = arg1
+om2
+
+const OP_NORM_R ulong 1
+const OP_PERM_XQ ulong 2
+const OP_AB_ROWS ulong 3
+const OP_MIX_GEMM ulong 4
+const OP_GDN ulong 5
+const OP_PERM_O_ONE ulong 6
+const OP_GATHER_R ulong 7
+const OP_ATTN ulong 8
+const OP_GATE_ONE ulong 9
+const OP_PERM_O_ALL ulong 10
+const OP_O_GEMM ulong 11
+const OP_ADDNORM_POST ulong 12
+const OP_GU_GEMM ulong 13
+const OP_SWIGLU_R ulong 14
+const OP_PERM_ACT ulong 15
+const OP_DOWN_GEMM ulong 16
+const OP_ADDNORM_END ulong 17
+
+const FOP_XS_ALL ulong 101
+const FOP_PERM_XH ulong 102
+const FOP_GEMM_SCREEN ulong 103
+const FOP_XB ulong 104
+const FOP_TAU_AM0 ulong 105
+const FOP_TAU_AM1 ulong 106
+const FOP_BF16_MASK ulong 107
+const FOP_BF16_XBATCH ulong 108
+const FOP_LOG_AM0 ulong 109
+const FOP_LOG_AM1 ulong 110
+const FOP_HEAD_FINAL ulong 111
+
+fn emit_op dst edit uint 384 idx ulong op ulong in_f ulong p0 ulong p1 ulong to ulong
+if ge idx 96
+ret 96
+end
+b = mul idx 4
+put dst b uint op
+put dst add b 1 uint in_f
+put dst add b 2 uint p0
+put dst add b 3 uint p1
+ret add idx 1
+end
+
+fn emit_heads dst edit uint 384 k ulong op ulong n ulong to ulong
+for h ulong n bound 8
+inf = ulong 0
+if gt h 0
+inf = ulong 1
+end
+k = emit_op dst k op inf h 1
+end
+ret k
+end
+
+note cfg: 0=N_heads (1..8), 1=is_attn, 2=overlap_ab, 3=need_in_norm
+export fn q38_plan_layer cfg view ulong 8 dst edit uint 384 to ulong
+n = get cfg 0
+if eq n 0
+ret 0
+end
+if gt n 8
+ret 0
+end
+is_attn = get cfg 1
+ov_ab = get cfg 2
+need_norm = get cfg 3
+k = ulong 0
+if ne need_norm 0
+k = emit_op dst k OP_NORM_R 0 0 n
+end
+k = emit_op dst k OP_PERM_XQ 0 0 n
+if eq is_attn 0
+k = emit_op dst k OP_AB_ROWS 0 0 n
+k = emit_op dst k OP_MIX_GEMM ov_ab 0 n
+k = emit_heads dst k OP_GDN n
+k = emit_heads dst k OP_PERM_O_ONE n
+else
+k = emit_op dst k OP_MIX_GEMM 0 0 n
+k = emit_op dst k OP_GATHER_R 0 0 n
+k = emit_heads dst k OP_ATTN n
+k = emit_heads dst k OP_GATE_ONE n
+k = emit_op dst k OP_PERM_O_ALL 0 0 n
+end
+k = emit_op dst k OP_O_GEMM 0 0 n
+k = emit_op dst k OP_ADDNORM_POST 0 0 n
+k = emit_op dst k OP_PERM_XQ 0 0 n
+k = emit_op dst k OP_GU_GEMM 0 0 n
+k = emit_op dst k OP_SWIGLU_R 0 0 n
+k = emit_op dst k OP_PERM_ACT 0 0 n
+k = emit_op dst k OP_DOWN_GEMM 0 0 n
+k = emit_op dst k OP_ADDNORM_END 0 0 n
+ret k
+end
+
+export fn q38_bf16_xbatch_max hd ulong max_smem ulong to ulong
+if eq hd 0
+ret 0
+end
+row_b = mul hd 4
+if lt max_smem row_b
+ret 0
+end
+xb = div max_smem row_b
+if gt xb 4
+xb = ulong 4
+end
+ret xb
+end
+
+note cfg: 0=N_heads (1..8), 1=H, 2=max_smem, 3=all_exact, 4=any_exact, 5=head8
+export fn q38_plan_final cfg view ulong 8 dst edit uint 384 to ulong
+n = get cfg 0
+if eq n 0
+ret 0
+end
+if gt n 8
+ret 0
+end
+hd = get cfg 1
+max_sm = get cfg 2
+all_ex = get cfg 3
+any_ex = get cfg 4
+head8 = get cfg 5
+k = ulong 0
+if ne all_ex 0
+if ge n 2
+k = emit_op dst k FOP_XS_ALL 0 0 n
+k = emit_op dst k FOP_PERM_XH 0 0 n
+k = emit_op dst k FOP_GEMM_SCREEN 0 0 n
+k = emit_heads dst k FOP_XB n
+k = emit_heads dst k FOP_TAU_AM0 n
+k = emit_heads dst k FOP_TAU_AM1 n
+k = emit_heads dst k FOP_BF16_MASK n
+k = emit_heads dst k FOP_LOG_AM0 n
+k = emit_heads dst k FOP_LOG_AM1 n
+ret k
+end
+end
+max_xb = q38_bf16_xbatch_max hd max_sm
+can_xb = ulong 1
+if lt max_xb 2
+can_xb = ulong 0
+end
+if ne any_ex 0
+can_xb = ulong 0
+end
+if ne head8 0
+can_xb = ulong 0
+end
+if eq can_xb 1
+h0 = ulong 0
+while lt h0 n bound 8
+xb = sub n h0
+if gt xb max_xb
+xb = max_xb
+end
+k = emit_op dst k FOP_BF16_XBATCH 0 h0 xb
+h0 = add h0 xb
+end
+k = emit_heads dst k FOP_LOG_AM0 n
+k = emit_heads dst k FOP_LOG_AM1 n
+ret k
+end
+for h ulong n bound 8
+k = emit_op dst k FOP_HEAD_FINAL 0 h 1
+end
+ret k
+end
+
+note attn256 L2 cache policy: env_mode 0=default (part/rope/norms cached), 1=also cache kv, 2=all uncached
+note Returns bitmask: bit 0 = cache part/rope/norms, bit 1 = cache kv
+export fn q38_attn256_cache_policy env_mode ulong to ulong
+if eq env_mode 2
+ret 0
+end
+if eq env_mode 1
+ret 3
+end
+ret 1
+end

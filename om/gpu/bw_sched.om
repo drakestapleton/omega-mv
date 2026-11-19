@@ -1,0 +1,267 @@
+note SPDX-License-Identifier: Apache-2.0
+note om/gpu/bw_sched.om: Pure OM-2 Blackwell IR dependency-driven stall scheduler.
+note Walks a register-allocated BlackwellIR program (same 8-ulong-per-insn layout as bw_enc_sm121.om)
+note and sets each fixed-latency instruction's control-word stall count to the minimum value (>= 1)
+note that keeps every physical-register consumer >= 6 cycles behind its fixed-latency producer,
+note draining before control instructions (BRA, EXIT, BAR_SYNC, BSSY, BSYNC) and branch targets.
+om2
+
+const SCH_MAX_INSNS ulong 1024
+const SCH_FIXED_LAT ulong 6
+const SCH_NEG ulong 0x8000000000000000
+
+fn is_fixed_op op ulong to ulong
+if eq op 1
+ret 1
+end
+if eq op 2
+ret 1
+end
+if eq op 8
+ret 1
+end
+if eq op 9
+ret 1
+end
+if eq op 14
+ret 1
+end
+if eq op 17
+ret 1
+end
+if eq op 18
+ret 1
+end
+if eq op 29
+ret 1
+end
+if eq op 30
+ret 1
+end
+if eq op 31
+ret 1
+end
+if eq op 32
+ret 1
+end
+if eq op 33
+ret 1
+end
+if eq op 36
+ret 1
+end
+if eq op 37
+ret 1
+end
+if eq op 51
+ret 1
+end
+if eq op 52
+ret 1
+end
+if eq op 53
+ret 1
+end
+ret 0
+end
+
+fn is_ctrl_op op ulong to ulong
+if eq op 45
+ret 1
+end
+if eq op 46
+ret 1
+end
+if eq op 48
+ret 1
+end
+if eq op 54
+ret 1
+end
+if eq op 55
+ret 1
+end
+ret 0
+end
+
+fn span_cnt bsz view ulong 256 v ulong to ulong
+c = get bsz v
+if eq c 0
+ret 1
+end
+ret c
+end
+
+fn mark_targets ins view ulong 8192 n ulong tgt edit uchar 1025 to ulong
+for i ulong 1025
+put tgt i 0
+end
+for i ulong n bound 1024
+base = mul i 8
+op = get ins base
+is_br = ulong 0
+if eq op 46
+is_br = ulong 1
+end
+if eq op 54
+is_br = ulong 1
+end
+if eq is_br 1
+imm32 = and get ins add base 6 0xffffffff
+delta = long imm32
+if ge imm32 0x80000000
+delta = sub delta 0x100000000
+end
+ti = add long i delta
+if lt ti 0
+ret 1
+end
+if gt ti long n
+ret 1
+end
+put tgt ulong ti 1
+end
+end
+ret 0
+end
+
+fn mark_ready ready edit ulong 264 ph ulong cnt ulong tval ulong to ulong
+for k ulong cnt bound 8
+idx = add ph k
+if ge idx 264
+ret 1
+end
+put ready idx tval
+end
+ret 0
+end
+
+fn max_ready_op ready view ulong 264 phys view ulong 256 bsz view ulong 256 v ulong cur ulong to ulong
+if ge v 256
+ret cur
+end
+ph = get phys v
+if ge ph SCH_NEG
+ret cur
+end
+cnt = span_cnt bsz v
+best = cur
+for k ulong cnt bound 8
+idx = add ph k
+if lt idx 264
+r = get ready idx
+if gt r best
+best = r
+end
+end
+end
+ret best
+end
+
+fn next_need ins view ulong 8192 phys view ulong 256 bsz view ulong 256 ready view ulong 264 nx_i ulong cur ulong to ulong
+nxb = mul nx_i 8
+best = cur
+for q ulong 4
+opv = get ins add nxb add 1 q
+best = max_ready_op ready phys bsz opv best
+end
+ret best
+end
+
+fn update_ctrl ins edit ulong 8192 base ulong st ulong to void
+w6 = get ins add base 6
+ctrl = shr w6 32
+mask = xor ulong 0xffffffff shl ulong 0xf 9
+nctrl = or and ctrl mask shl st 9
+put ins add base 6 or and w6 0xffffffff shl nctrl 32
+end
+
+fn mark_fixed_dst ins view ulong 8192 phys view ulong 256 bsz view ulong 256 ready edit ulong 264 base ulong trdy ulong to ulong
+dv = get ins add base 1
+if ge dv 256
+ret 0
+end
+ph = get phys dv
+if ge ph SCH_NEG
+ret 0
+end
+if ne mark_ready ready ph span_cnt bsz dv trdy 0
+ret 2
+end
+ret 1
+end
+
+fn step_one ins edit ulong 8192 phys view ulong 256 bsz view ulong 256 ready edit ulong 264 tgt view uchar 1025 st_arr edit ulong 4 to ulong
+base = mul get st_arr 0 8
+s_emit = and shr shr get ins add base 6 32 9 0xf
+fixed = is_fixed_op get ins base
+if eq fixed 1
+mr = mark_fixed_dst ins phys bsz ready base add get st_arr 2 SCH_FIXED_LAT
+if eq mr 2
+ret 1
+end
+if eq mr 1
+if gt add get st_arr 2 SCH_FIXED_LAT get st_arr 3
+put st_arr 3 add get st_arr 2 SCH_FIXED_LAT
+end
+end
+end
+need = add get st_arr 2 s_emit
+if eq fixed 1
+need = add get st_arr 2 1
+end
+if lt add get st_arr 0 1 get st_arr 1
+need = next_need ins phys bsz ready add get st_arr 0 1 need
+if eq is_ctrl_op get ins mul add get st_arr 0 1 8 1
+if gt get st_arr 3 need
+need = get st_arr 3
+end
+end
+if ne get tgt add get st_arr 0 1 0
+if gt get st_arr 3 need
+need = get st_arr 3
+end
+end
+end
+st = sub need get st_arr 2
+if gt st 15
+ret 1
+end
+if eq st 0
+if eq fixed 1
+ret 1
+end
+if ne s_emit 0
+ret 1
+end
+end
+if eq fixed 1
+update_ctrl ins base st
+else
+if gt st s_emit
+update_ctrl ins base st
+end
+end
+put st_arr 2 need
+ret 0
+end
+
+export fn bw_sched_stalls ins edit ulong 8192 phys view ulong 256 bsz view ulong 256 n ulong to ulong
+if gt n SCH_MAX_INSNS
+ret 1
+end
+tgt = new uchar 1025 0
+if ne mark_targets ins n tgt 0
+ret 1
+end
+ready = new ulong 264 0
+st_arr = new ulong 4 0
+put st_arr 1 n
+for i ulong n bound 1024
+put st_arr 0 i
+if ne step_one ins phys bsz ready tgt st_arr 0
+ret 1
+end
+end
+ret 0
+end

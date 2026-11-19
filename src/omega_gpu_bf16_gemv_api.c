@@ -168,11 +168,21 @@ int omega_gpu_bf16_prepare(uint32_t k) {
     OmegaBf16GemvSpec spec; uint32_t ctas; spec_for(k, &spec, &ctas);
     return prepare_spec(&spec);
 }
+static void xbatch_fit_depth(OmegaBf16GemvSpec *spec) {
+    if (g.depth || spec->xbatch <= 1u) return;
+    const uint32_t ks = spec->k / 256u;
+    uint32_t peak = 0;
+    while (spec->depth > 1u) {
+        if (omega_bf16_gemv_prog_stats(spec, NULL, &peak) == 0 && (uint64_t)32u * spec->warps * gpr_declared(peak) <= 65536u) return;
+        do { spec->depth--; } while (spec->depth > 1u && ks % spec->depth);
+    }
+}
 int omega_gpu_bf16_prepare_xbatch(uint32_t k, uint32_t xbatch, uint32_t ystride) {
     if (xbatch <= 1u) return omega_gpu_bf16_prepare(k);
     if (xbatch > OMEGA_BF16_MAX_XBATCH || ystride == 0) return OMEGA_GPU_BF16_BAD_ARGS;
     OmegaBf16GemvSpec spec; uint32_t ctas; spec_for(k, &spec, &ctas);
     spec.xbatch = xbatch; spec.ystride = ystride;
+    xbatch_fit_depth(&spec);
     return prepare_spec(&spec);
 }
 /* the MASK kernel as gemv_core builds it (rows 1, mask 1), pinned: the exact head's record never compiles mid-token */
@@ -240,6 +250,7 @@ static int gemv_core(const OmegaGpuBf16Tensor *t, const float *x32, const uint16
     if (xbatch > 1u) { /* XBATCH form (record-only): xbatch x rows share every weight read; y row m at y + m * ystride f32 */
         if (!rec || xrows || xbatch > OMEGA_BF16_MAX_XBATCH || ystride < n) return OMEGA_GPU_BF16_BAD_ARGS;
         spec.xbatch = xbatch; spec.ystride = ystride;
+        xbatch_fit_depth(&spec);
     }
     if (n % spec.rows) return OMEGA_GPU_BF16_CODEGEN_FAIL;
     const uint32_t RG = n / spec.rows;

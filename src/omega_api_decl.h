@@ -32,6 +32,22 @@ void sha256_update(sha256_ctx *o_c, const uint8_t *o_d, size_t o_d_len);
 void sha256_final(sha256_ctx *o_c, uint8_t o_o[32]);
 /* export fn sha256_hash d view uchar * o out uchar 32 to void */
 void sha256_hash(const uint8_t *o_d, size_t o_d_len, uint8_t o_o[32]);
+/* export fn bw_qmd0 q edit uint 96 qmd1_va ulong to ulong */
+uint64_t bw_qmd0(uint32_t o_q[96], uint64_t o_qmd1_va);
+/* export fn bw_qmd1 m view ulong 16 q edit uint 96 to ulong */
+uint64_t bw_qmd1(const uint64_t o_m[16], uint32_t o_q[96]);
+/* export fn bw_qmd_verify q view uint 96 to ulong */
+uint64_t bw_qmd_verify(const uint32_t o_q[96]);
+/* export fn bw_sched_stalls ins edit ulong 8192 phys view ulong 256 bsz view ulong 256 n ulong to ulong */
+uint64_t bw_sched_stalls(uint64_t o_ins[8192], const uint64_t o_phys[256], const uint64_t o_bsz[256], uint64_t o_n);
+/* export fn q38_plan_layer cfg view ulong 8 dst edit uint 384 to ulong */
+uint64_t q38_plan_layer(const uint64_t o_cfg[8], uint32_t o_dst[384]);
+/* export fn q38_bf16_xbatch_max hd ulong max_smem ulong to ulong */
+uint64_t q38_bf16_xbatch_max(uint64_t o_hd, uint64_t o_max_smem);
+/* export fn q38_plan_final cfg view ulong 8 dst edit uint 384 to ulong */
+uint64_t q38_plan_final(const uint64_t o_cfg[8], uint32_t o_dst[384]);
+/* export fn q38_attn256_cache_policy env_mode ulong to ulong */
+uint64_t q38_attn256_cache_policy(uint64_t o_env_mode);
 #ifdef __cplusplus
 }
 #endif

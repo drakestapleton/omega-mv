@@ -144,7 +144,7 @@ static int spec_ok(const OmegaBf16GemvSpec *s) {
     if (s->rows != 1 && s->rows != 2 && s->rows != 4) return 0;
     if (s->warps < 1 || s->warps > 32) return 0;
     if (s->k == 0 || s->k > OMEGA_BF16_MAX_K || s->k % 256u || s->k % (32u * s->warps)) return 0;
-    if (s->k > 512u * s->warps) return 0; /* at most 16 staging rounds */
+    if (s->k > 2048u * s->warps) return 0; /* at most 64 staging rounds (chunked by 8) */
     uint32_t ks = s->k / 256u;
     if (s->depth == 0 || s->depth > 16 || ks % s->depth || s->rows * s->depth > 16u) return 0;
     if (s->mask > 1) return 0;
@@ -152,7 +152,7 @@ static int spec_ok(const OmegaBf16GemvSpec *s) {
     const uint32_t xb = s->xbatch ? s->xbatch : 1u;
     if (xb > OMEGA_BF16_MAX_XBATCH) return 0;
     if (xb > 1u && (s->ystride == 0 || s->rows * xb > 16u || (uint64_t)xb * s->k * 4u > OMEGA_BW_QMD_MAX_SHARED_BYTES)) return 0;
-    if (xb > 1u && ((uint64_t)xb * s->k > 512u * s->warps || (uint64_t)(xb - 1u) * s->ystride * 4u >= (1ull << 31))) return 0; /* 16 staging rounds; y row offsets as immediates */
+    if (xb > 1u && ((uint64_t)xb * s->k > 2048u * s->warps || (uint64_t)(xb - 1u) * s->ystride * 4u >= (1ull << 31))) return 0; /* up to 64 staging rounds; y row offsets as immediates */
     /* mutant 4: MASK inverts the skip, XBATCH reads row 0's x for every row (the forms never mix) */
     if (s->mutant < 0 || s->mutant > 4 || (s->mutant == 4 && !s->mask && xb < 2u)) return 0;
     if (s->ystride > (1u << 28)) return 0; /* ystride * 4 fits the 32-bit IMAD.WIDE immediate */
@@ -193,17 +193,22 @@ int omega_blackwell_codegen_bf16_gemv_prog(const OmegaBf16GemvSpec *spec, Blackw
     imadi(e, rg, cx, 0, W, warp);         /* first row group of this warp */
     imadi(e, xl0, lane, 0, 32, NOREG);    /* this lane's x chunk (8 floats) of step 0, shared byte offset */
 
-    /* ---- stage x (k floats, XB rows back to back) in shared memory: one 32-bit word per thread per round ---- */
+    /* ---- stage x (k floats, XB rows back to back) in shared memory: one 32-bit word per thread per round (batched by 8) ---- */
     {
         const uint32_t rounds = XB * K / (32u * W);
-        int pxt = V64(e), sa0 = V(e), sa = V(e), pxs[16], xst[16];
-        for (uint32_t j = 0; j < rounds; j++) { pxs[j] = V64(e); xst[j] = V(e); }
+        int pxt = V64(e), sa0 = V(e), sa = V(e);
         if (e->err) return -1;
         imadw(e, pxt, tid, 4, px);
         imadi(e, sa0, tid, 0, 4, NOREG);
-        for (uint32_t j = 0; j < rounds; j++) imadw(e, pxs[j], one, j * 128u * W, pxt);
-        for (uint32_t j = 0; j < rounds; j++) ldg32(e, xst[j], pxs[j], udesc, j == 0);
-        for (uint32_t j = 0; j < rounds; j++) { imadi(e, sa, one, 0, j * 128u * W, sa0); sts32(e, sa, xst[j]); }
+        for (uint32_t j0 = 0; j0 < rounds; j0 += 8u) {
+            const uint32_t nj = rounds - j0 < 8u ? rounds - j0 : 8u;
+            int pxs[8], xst[8];
+            for (uint32_t q = 0; q < nj; q++) { pxs[q] = V64(e); xst[q] = V(e); }
+            if (e->err) return -1;
+            for (uint32_t q = 0; q < nj; q++) imadw(e, pxs[q], one, (j0 + q) * 128u * W, pxt);
+            for (uint32_t q = 0; q < nj; q++) ldg32(e, xst[q], pxs[q], udesc, q == 0);
+            for (uint32_t q = 0; q < nj; q++) { imadi(e, sa, one, 0, (j0 + q) * 128u * W, sa0); sts32(e, sa, xst[q]); }
+        }
         bar_sync(e);
     }
 

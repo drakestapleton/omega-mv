@@ -300,7 +300,7 @@ static void e4m3_quant_check(void) {
 /* qwen38/decode-speed: the big-k rule's choices (chip parity of these specs: fp8par1 in the speed handoff) */
 static void bigk_check(void) {
     static const struct { uint32_t n, k, warps, depth; } want[] = { { 34816, 5120, 16, 5 }, { 16384, 5120, 16, 5 }, { 14336, 5120, 16, 5 },
-                                                                    { 5120, 6144, 16, 6 }, { 5120, 17408, 16, 0 }, { 2048, 4096, 8, 0 }, { 5120, 2048, 8, 4 } };
+                                                                    { 5120, 6144, 16, 6 }, { 5120, 17408, 16, 2 }, { 2048, 4096, 8, 0 }, { 5120, 2048, 8, 4 } };
     for (int on = 0; on < 2; on++) {
         omega_gpu_fp8_set_bigk(on);
         for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {

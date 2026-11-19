@@ -24,6 +24,7 @@
  * SB0, only the first waits), so a warp has every load of the step in flight at once.
  */
 #include "omega_blackwell_codegen_moe.h"
+#include "omega_native.h"
 #ifndef OMEGA_GPU_NO_POSIX
 #include <stdlib.h>
 #endif
@@ -154,7 +155,7 @@ static int spec_ok(const OmegaFp8GemvSpec *s) {
     if (s->depth) { /* deep kernel: staging rounds (32-bit words, one per thread per round) must be exact and few */
         uint32_t ks = s->k / (32u * s->lane_bytes);
         if (s->depth > 16 || ks % s->depth || s->rows * s->depth * s->lane_bytes > 128u) return 0; /* <= 128 weight bytes per lane per iteration: instruction and register budgets */
-        if (s->k > 512u * s->warps) return 0; /* at most 16 staging rounds; a partial last round is clamped */
+        if (s->k > 2048u * s->warps) return 0; /* at most 64 staging rounds (chunked by 8); a partial last round is clamped */
     }
     /* row offsets of a step must fit the 24-bit signed LDG immediate */
     if ((uint64_t)(s->rows - 1) * s->k + s->lane_bytes >= (1u << 23)) return 0;
@@ -210,72 +211,32 @@ static void decode_pipe(Em *e, int wqv, uint32_t words, const int *xq, int dot, 
     }
 }
 
-/* ---- sched 1: dependency-driven stall counts (after register allocation) ----
- * The emitter gives every fixed-latency instruction stall 6, which keeps any user >= 6 cycles behind its producer but
- * also makes independent instructions wait 6 cycles each. The repository's chip-proven rule is the distance, not the
- * per-instruction count: a fixed-latency producer stalls >= 5 cycles before its consumer (we keep 6;
- * omega_gpu_elementwise_api.c:13). Same pass as omega_blackwell_codegen_tern.c (chip-proven at TERN-T0 2300f164) with
- * this kernel's fixed-latency set, which adds FFMA, FADD and LOP3_XOR: walk the program in order on physical registers
- * and give each instruction the smallest stall that keeps the next instruction >= OMEGA_FP8_FIXED_LAT cycles behind
- * every fixed-latency write it reads or overwrites. Before a control instruction (BRA, EXIT, BSSY, BSYNC, BAR) or a
- * branch target every fixed-latency write has completed, so straight-line timing never spans a jump. Other instructions
- * keep at least their emitted stall (loads 4, ISETP 14 before a predicated branch); wait masks are untouched. */
-static int fp8_fixed(BlackwellIROpcode op) {
-    switch (op) {
-    case BW_IR_IMAD: case BW_IR_IMAD_WIDE: case BW_IR_SHF_R: case BW_IR_LOP3_AND: case BW_IR_LOP3_XOR: case BW_IR_MOV_IMM:
-    case BW_IR_MOV_RZ: case BW_IR_FFMA: case BW_IR_FADD: return 1;
-    default: return 0;
-    }
-}
-static int fp8_control(BlackwellIROpcode op) {
-    return op == BW_IR_BRA || op == BW_IR_EXIT || op == BW_IR_BSSY || op == BW_IR_BSYNC || op == BW_IR_BAR_SYNC;
-}
-static void fp8_span(const BlackwellIRProgram *p, int v, int *lo, int *cnt) {
-    *lo = -1; *cnt = 0;
-    if (v < 0 || v >= p->regalloc.num_vregs) return;
-    const int ph = p->regalloc.vreg_to_phys[v];
-    if (ph < 0) return;
-    *lo = ph; *cnt = (int)(p->regalloc.intervals[v].bundle_size ? p->regalloc.intervals[v].bundle_size : 1u);
-}
+/* ---- sched 1: dependency-driven stall counts via pure OM-2 unit om/gpu/bw_sched.om ---- */
 static int fp8_schedule_stalls(BlackwellIRProgram *p) {
-    static uint8_t target[BW_MAX_IR_INSNS + 1];
-    uint64_t ready[BW_MAX_VREGS + 8];
     const size_t n = p->count;
-    memset(target, 0, sizeof target);
-    memset(ready, 0, sizeof ready);
+    if (n > BW_MAX_IR_INSNS) return -1;
+    uint64_t ins[BW_MAX_IR_INSNS * 8], phys[BW_MAX_VREGS], bsz[BW_MAX_VREGS];
     for (size_t i = 0; i < n; i++) {
         const BlackwellIRInsn *in = &p->insns[i];
-        if (in->op == BW_IR_BRA || in->op == BW_IR_BSSY) {
-            const long t = (long)i + (long)(int32_t)in->imm;
-            if (t < 0 || t > (long)n) return -1;
-            target[t] = 1;
-        }
+        uint64_t *r = &ins[i * 8];
+        r[0] = (uint64_t)(int64_t)(int)in->op;
+        r[1] = (uint64_t)(int64_t)in->dst_vreg;
+        r[2] = (uint64_t)(int64_t)in->src1_vreg;
+        r[3] = (uint64_t)(int64_t)in->src2_vreg;
+        r[4] = (uint64_t)(int64_t)in->src3_vreg;
+        r[5] = (uint64_t)(int64_t)in->ureg;
+        r[6] = (uint64_t)in->imm | ((uint64_t)in->control << 32);
+        r[7] = 0;
     }
-    uint64_t T = 0, all = 0;
-    for (size_t i = 0; i < n; i++) {
-        BlackwellIRInsn *in = &p->insns[i];
-        const uint32_t s_emit = (in->control >> 9) & 0xfu;
-        const int fixed = fp8_fixed(in->op);
-        if (fixed) {
-            int lo, c; fp8_span(p, in->dst_vreg, &lo, &c);
-            for (int k = 0; k < c; k++) { if (lo + k >= BW_MAX_VREGS + 8) return -1; ready[lo + k] = T + OMEGA_FP8_FIXED_LAT; }
-            if (c && T + OMEGA_FP8_FIXED_LAT > all) all = T + OMEGA_FP8_FIXED_LAT;
-        }
-        uint64_t need = T + (fixed ? 1u : s_emit);
-        if (i + 1 < n) {
-            const BlackwellIRInsn *nx = &p->insns[i + 1];
-            const int ops[4] = { nx->dst_vreg, nx->src1_vreg, nx->src2_vreg, nx->src3_vreg };
-            for (int q = 0; q < 4; q++) {
-                int lo, c; fp8_span(p, ops[q], &lo, &c);
-                for (int k = 0; k < c; k++) if (lo + k < BW_MAX_VREGS + 8 && ready[lo + k] > need) need = ready[lo + k];
-            }
-            if ((fp8_control(nx->op) || target[i + 1]) && all > need) need = all;
-        }
-        const uint64_t s = need - T;
-        if (s > 15 || (s == 0 && (fixed || s_emit != 0))) return -1; /* stall 0 only where emitted (the final self-branch) */
-        if (fixed || s > s_emit) in->control = (in->control & ~(0xfu << 9)) | ((uint32_t)s << 9);
-        T = need;
+    for (size_t i = n * 8; i < BW_MAX_IR_INSNS * 8; i++) ins[i] = 0;
+    for (int v = 0; v < BW_MAX_VREGS; v++) {
+        phys[v] = (v < p->regalloc.num_vregs) ? (uint64_t)(int64_t)p->regalloc.vreg_to_phys[v] : (uint64_t)-1;
+        bsz[v] = (v < p->regalloc.num_vregs && p->regalloc.intervals[v].bundle_size) ? p->regalloc.intervals[v].bundle_size : 1u;
     }
+    uint64_t res = 1;
+    if (omega2_bw_sched_stalls(&res, ins, BW_MAX_IR_INSNS * 8, phys, BW_MAX_VREGS, bsz, BW_MAX_VREGS, (uint64_t)n) != OMEGA_OK || res != 0)
+        return -1;
+    for (size_t i = 0; i < n; i++) p->insns[i].control = (uint32_t)(ins[i * 8 + 6] >> 32);
     return 0;
 }
 
@@ -338,33 +299,37 @@ int omega_blackwell_codegen_fp8_gemv_prog(const OmegaFp8GemvSpec *spec, Blackwel
     if (e->err) return -1;
 
     if (deep) {
-        /* ---- stage this group's x' row in shared memory (k floats), one 32-bit word per thread per round ---- */
+        /* ---- stage this group's x' row in shared memory (k floats), one 32-bit word per thread per round (batched by 8) ---- */
         const uint32_t rounds = (K + 32u * W - 1u) / (32u * W);
-        int pxt = V64(e), sa0 = V(e), sa = V(e), sap = V(e), pxs[16], xst[16], kq = V(e), over = V(e), tq = V(e), qs = V(e), qg = V(e);
-        for (uint32_t j = 0; j < rounds; j++) { pxs[j] = V64(e); xst[j] = V(e); }
+        int pxt = V64(e), sa0 = V(e), sa = V(e), sap = V(e), kq = V(e), over = V(e), tq = V(e), qs = V(e), qg = V(e);
         xl = V(e); xl0 = V(e);
         if (e->err) return -1;
         imadw(e, pxt, tid, 4, xrow);
         imadi(e, sa0, tid, 0, 4, NOREG);
-        for (uint32_t j = 0; j < rounds; j++) imadw(e, pxs[j], one, j * 128u * W, pxt);
-        if (K % (32u * W)) {
-            /* partial last round: word q = tid + j * 32 W may pass K. over = (q >= K) as 0/1 = (K - 1 - q) >> 31;
-             * the load is clamped to x[K - 1] and the store to the dummy slot K (never read). */
-            const uint32_t j = rounds - 1u;
-            imadi(e, kq, tid, 0, 1, NOREG); imadi(e, kq, one, 0, j * 32u * W, kq);          /* q */
-            imadi(e, tq, kq, 0, 0xffffffffu, NOREG); imadi(e, tq, one, 0, K - 1u, tq);     /* K - 1 - q */
-            shr(e, over, tq, 0, 31);                                                        /* 1 iff q >= K */
-            imadi(e, tq, kq, 0, 1, NOREG); imadi(e, tq, one, 0, (uint32_t)(0u - K), tq);   /* q - K */
-            imadr(e, qs, over, tq, NOREG); imadi(e, qs, qs, 0, 0xffffffffu, kq);           /* q - over * (q - K): K when over */
-            imadi(e, qg, tq, 0, 1, NOREG); imadi(e, qg, one, 0, 1, qg);                   /* q - K + 1 */
-            imadr(e, qg, over, qg, NOREG); imadi(e, qg, qg, 0, 0xffffffffu, kq);           /* K - 1 when over */
-            imadw(e, pxs[j], qg, 4, xrow);
-            imadi(e, sap, qs, 0, 4, NOREG);
-        }
-        for (uint32_t j = 0; j < rounds; j++) ldg32(e, xst[j], pxs[j], udesc, j == 0);
-        for (uint32_t j = 0; j < rounds; j++) {
-            if (K % (32u * W) && j == rounds - 1u) { sts32(e, sap, xst[j]); continue; }
-            imadi(e, sa, one, 0, j * 128u * W, sa0); sts32(e, sa, xst[j]);
+        for (uint32_t j0 = 0; j0 < rounds; j0 += 8u) {
+            const uint32_t nj = rounds - j0 < 8u ? rounds - j0 : 8u;
+            int pxs[8], xst[8];
+            for (uint32_t q = 0; q < nj; q++) { pxs[q] = V64(e); xst[q] = V(e); }
+            if (e->err) return -1;
+            for (uint32_t q = 0; q < nj; q++) imadw(e, pxs[q], one, (j0 + q) * 128u * W, pxt);
+            if ((K % (32u * W)) && j0 + nj == rounds) {
+                const uint32_t j = rounds - 1u, q = nj - 1u;
+                imadi(e, kq, tid, 0, 1, NOREG); imadi(e, kq, one, 0, j * 32u * W, kq);
+                imadi(e, tq, kq, 0, 0xffffffffu, NOREG); imadi(e, tq, one, 0, K - 1u, tq);
+                shr(e, over, tq, 0, 31);
+                imadi(e, tq, kq, 0, 1, NOREG); imadi(e, tq, one, 0, (uint32_t)(0u - K), tq);
+                imadr(e, qs, over, tq, NOREG); imadi(e, qs, qs, 0, 0xffffffffu, kq);
+                imadi(e, qg, tq, 0, 1, NOREG); imadi(e, qg, one, 0, 1, qg);
+                imadr(e, qg, over, qg, NOREG); imadi(e, qg, qg, 0, 0xffffffffu, kq);
+                imadw(e, pxs[q], qg, 4, xrow);
+                imadi(e, sap, qs, 0, 4, NOREG);
+            }
+            for (uint32_t q = 0; q < nj; q++) ldg32(e, xst[q], pxs[q], udesc, q == 0);
+            for (uint32_t q = 0; q < nj; q++) {
+                const uint32_t j = j0 + q;
+                if ((K % (32u * W)) && j == rounds - 1u) { sts32(e, sap, xst[q]); continue; }
+                imadi(e, sa, one, 0, j * 128u * W, sa0); sts32(e, sa, xst[q]);
+            }
         }
         bar_sync(e);
         imadi(e, xl0, lane, 0, LB * 4u, NOREG);     /* this lane's x' chunk of step 0, shared byte offset */

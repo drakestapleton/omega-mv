@@ -19,6 +19,7 @@
  * scheduling rules) plus one addition: weight and scale prefetch loads use scoreboards 3 (buffer A) and 4 (buffer B)
  * and are waited for only by the step that decodes them, so the next step's weights stream while this step computes. */
 #include "omega_blackwell_codegen_gemm.h"
+#include "omega_native.h"
 #ifndef OMEGA_GPU_NO_POSIX
 #include <stdlib.h>
 #endif
@@ -160,15 +161,45 @@ static int spec_ok(const OmegaFp8GemmSpec *s) {
 uint32_t omega_fp8gemm_steps(const OmegaFp8GemmSpec *spec) { return spec_ok(spec) ? spec->k / (32u * spec->lane_bytes) : 0; }
 uint32_t omega_fp8gemm_shared_bytes(const OmegaFp8GemmSpec *spec) { return spec_ok(spec) ? spec->mt * 128u * spec->lane_bytes : 0u; }
 
-/* e4m3 byte i of word w -> f32 bits (value * 2^-120): ((b & 0x7F) << 20) | ((b & 0x80) << 24) */
-static void decode_byte(Em *e, int f, int wq, unsigned word, unsigned i, int u, int a, int s) {
+/* Decode all 4 e4m3 bytes of word `word` -> f32 bits (value * 2^-120) interleaved across i = 0..3 for 4-way ILP. */
+static void decode_word4(Em *e, const int fr[4], int wq, unsigned word, const int u[4]) {
     const uint32_t M = 0x07F00000u;
-    if (i < 3) imadi(e, u, wq, word, 1u << (20u - 8u * i), NOREG);
-    else shr(e, u, wq, word, 4);
-    andi(e, a, u, 0, M);
-    andi(e, s, wq, word, 0x80u << (8u * i));
-    if (i < 3) imadi(e, f, s, 0, 1u << (24u - 8u * i), a);
-    else imadi(e, f, s, 0, 1u, a);
+    for (unsigned i = 0; i < 4; i++) {
+        if (i < 3) imadi(e, u[i], wq, word, 1u << (20u - 8u * i), NOREG);
+        else shr(e, u[i], wq, word, 4);
+    }
+    for (unsigned i = 0; i < 4; i++) andi(e, u[i], u[i], 0, M);
+    for (unsigned i = 0; i < 4; i++) andi(e, fr[i], wq, word, 0x80u << (8u * i));
+    for (unsigned i = 0; i < 4; i++) imadi(e, fr[i], fr[i], 0, i < 3 ? (1u << (24u - 8u * i)) : 1u, u[i]);
+}
+
+/* Schedule stalls through pure OM-2 unit om/gpu/bw_sched.om (omega2_bw_sched_stalls). */
+static int gemm_sched_om(BlackwellIRProgram *p) {
+    const size_t n = p->count;
+    if (n > BW_MAX_IR_INSNS) return -1;
+    uint64_t ins[BW_MAX_IR_INSNS * 8], phys[BW_MAX_VREGS], bsz[BW_MAX_VREGS];
+    for (size_t i = 0; i < n; i++) {
+        const BlackwellIRInsn *in = &p->insns[i];
+        uint64_t *r = &ins[i * 8];
+        r[0] = (uint64_t)(int64_t)(int)in->op;
+        r[1] = (uint64_t)(int64_t)in->dst_vreg;
+        r[2] = (uint64_t)(int64_t)in->src1_vreg;
+        r[3] = (uint64_t)(int64_t)in->src2_vreg;
+        r[4] = (uint64_t)(int64_t)in->src3_vreg;
+        r[5] = (uint64_t)(int64_t)in->ureg;
+        r[6] = (uint64_t)in->imm | ((uint64_t)in->control << 32);
+        r[7] = 0;
+    }
+    for (size_t i = n * 8; i < BW_MAX_IR_INSNS * 8; i++) ins[i] = 0;
+    for (int v = 0; v < BW_MAX_VREGS; v++) {
+        phys[v] = (v < p->regalloc.num_vregs) ? (uint64_t)(int64_t)p->regalloc.vreg_to_phys[v] : (uint64_t)-1;
+        bsz[v] = (v < p->regalloc.num_vregs && p->regalloc.intervals[v].bundle_size) ? p->regalloc.intervals[v].bundle_size : 1u;
+    }
+    uint64_t res = 1;
+    if (omega2_bw_sched_stalls(&res, ins, BW_MAX_IR_INSNS * 8, phys, BW_MAX_VREGS, bsz, BW_MAX_VREGS, (uint64_t)n) != OMEGA_OK || res != 0)
+        return -1;
+    for (size_t i = 0; i < n; i++) p->insns[i].control = (uint32_t)(ins[i * 8 + 6] >> 32);
+    return 0;
 }
 
 int omega_blackwell_codegen_fp8gemm_prog(const OmegaFp8GemmSpec *spec, BlackwellIRProgram *prog) {
@@ -230,11 +261,11 @@ int omega_blackwell_codegen_fp8gemm_prog(const OmegaFp8GemmSpec *spec, Blackwell
     int xrp = V64(e), xs = V64(e), pwc = V64(e), psc = V64(e), cntk = V(e), pyr = V64(e), pya = V64(e), t = V(e), tq = V(e), fl = V(e), sv = V(e);
     int xb[16], yi[16], xso = NOREG, ma = NOREG; /* rowmap: x' base per staged quad (row through XMAP), the step byte offset, y rows through YMAP */
     if (RM) { if (NJ > 16u) return -1; for (uint32_t j = 0; j < NJ; j++) xb[j] = V64(e); for (uint32_t m = 0; m < MT; m++) yi[m] = V(e); xso = V(e); ma = V64(e); }
-    int acc[16], dot[16], xq[4], wq[2], sc[2], fr[4], u = V(e), a = V(e), sg = V(e), onef = V(e), dum = V(e);
+    int acc[16], dot[16], xq[4], wq[2], sc[2], fr[4], u[4], onef = V(e), dum = V(e);
     for (uint32_t m = 0; m < MT; m++) { acc[m] = V(e); dot[m] = V(e); }
     for (int q = 0; q < 4; q++) xq[q] = V128(e);
     for (int b = 0; b < 2; b++) { wq[b] = LB == 16 ? V128(e) : V64(e); sc[b] = V(e); }
-    for (int i = 0; i < 4; i++) fr[i] = V(e);
+    for (int i = 0; i < 4; i++) { fr[i] = V(e); u[i] = V(e); }
     if (e->err) return -1;
 
     /* ---- weight-row loop (uniform per CTA) ---- */
@@ -318,14 +349,14 @@ int omega_blackwell_codegen_fp8gemm_prog(const OmegaFp8GemmSpec *spec, Blackwell
         /* compute */
         for (uint32_t m = 0; m < MT; m++) movrz(e, dot[m]);
         for (uint32_t word = 0; word < WORDS; word++) {
-            for (unsigned i = 0; i < 4; i++) decode_byte(e, fr[i], wq[cur], word, i, u, a, sg);
+            decode_word4(e, fr, wq[cur], word, u);
             for (uint32_t m0 = 0; m0 < MT; m0 += 4) {
                 const uint32_t nb = MT - m0 < 4 ? MT - m0 : 4;
                 for (uint32_t q = 0; q < nb; q++) {
                     const uint32_t m = m0 + q, mm = spec->mutant == 3 ? (m ^ 1u) % MT : m;
                     lds128(e, xq[q], xl, mm * ROWW * 4u + word * 512u, q == 0);
                 }
-                for (uint32_t q = 0; q < nb; q++) for (unsigned i = 0; i < 4; i++) ffma(e, dot[m0 + q], fr[i], xq[q], i, dot[m0 + q]);
+                for (unsigned i = 0; i < 4; i++) for (uint32_t q = 0; q < nb; q++) ffma(e, dot[m0 + q], fr[i], xq[q], i, dot[m0 + q]);
             }
         }
         if (spec->mutant == 1) { movi(e, onef, 0x3f800000u); ffma(e, dum, sc[cur], onef, 0, onef); } /* scales dropped, but the scale load stays consumed */
@@ -378,7 +409,8 @@ int omega_blackwell_codegen_fp8gemm_prog(const OmegaFp8GemmSpec *spec, Blackwell
     if (bra_empty >= 0) patch_bra(e, bra_empty, L_end);
     tail(e);
     if (e->err) return -1;
-    return omega_bw_regalloc_solve(prog);
+    if (omega_bw_regalloc_solve(prog) != 0) return -1;
+    return gemm_sched_om(prog);
 }
 
 int omega_fp8gemm_prog_stats(const OmegaFp8GemmSpec *spec, uint32_t *insns, uint32_t *gprs) {

@@ -29,6 +29,28 @@ uint32_t omega2_sha256_hash(uint64_t *result, const uint8_t *o_d, uint64_t o_d_l
 uint32_t omega_omb3(uint64_t *result, void *o_st, uint64_t o_st_len, const void *o_b, uint64_t o_b_len, uint64_t o_n, uint64_t o_fin, void *o_o, uint64_t o_o_len);
 /* fn bw_enc_sm121 ins view ulong 8192 phys view ulong 288 n ulong pad ulong code edit uchar 16384 to ulong */
 uint32_t omega_bw_enc_sm121(uint64_t *result, const void *o_ins, uint64_t o_ins_len, const void *o_phys, uint64_t o_phys_len, uint64_t o_n, uint64_t o_pad, void *o_code, uint64_t o_code_len);
+#define OMEGA2_IDENT_bw_qmd "omega-ident 1 unit=bw_qmd abi=2 profile=OM-2 src=4f02c00af83371da6d14b99a4187e64ce46612b19ad5fd8804b878f68a3bacd4 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_bw_qmd(void);
+/* export fn bw_qmd0 q edit uint 96 qmd1_va ulong to ulong */
+uint32_t omega2_bw_qmd0(uint64_t *result, uint32_t *o_q, uint64_t o_q_len, uint64_t o_qmd1_va);
+/* export fn bw_qmd1 m view ulong 16 q edit uint 96 to ulong */
+uint32_t omega2_bw_qmd1(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, uint32_t *o_q, uint64_t o_q_len);
+/* export fn bw_qmd_verify q view uint 96 to ulong */
+uint32_t omega2_bw_qmd_verify(uint64_t *result, const uint32_t *o_q, uint64_t o_q_len);
+#define OMEGA2_IDENT_bw_sched "omega-ident 1 unit=bw_sched abi=2 profile=OM-2 src=3a0f8dc29a2e6d45a59a0e23c49c7ddc155a6b5b1e2909403c9c4b474214f01a omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_bw_sched(void);
+/* export fn bw_sched_stalls ins edit ulong 8192 phys view ulong 256 bsz view ulong 256 n ulong to ulong */
+uint32_t omega2_bw_sched_stalls(uint64_t *result, uint64_t *o_ins, uint64_t o_ins_len, const uint64_t *o_phys, uint64_t o_phys_len, const uint64_t *o_bsz, uint64_t o_bsz_len, uint64_t o_n);
+#define OMEGA2_IDENT_q38_plan "omega-ident 1 unit=q38_plan abi=2 profile=OM-2 src=61599f615a453835d031b2cf099b9f0372109bc7f77b90c9c4148ebeac9c4687 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_q38_plan(void);
+/* export fn q38_plan_layer cfg view ulong 8 dst edit uint 384 to ulong */
+uint32_t omega2_q38_plan_layer(uint64_t *result, const uint64_t *o_cfg, uint64_t o_cfg_len, uint32_t *o_dst, uint64_t o_dst_len);
+/* export fn q38_bf16_xbatch_max hd ulong max_smem ulong to ulong */
+uint32_t omega2_q38_bf16_xbatch_max(uint64_t *result, uint64_t o_hd, uint64_t o_max_smem);
+/* export fn q38_plan_final cfg view ulong 8 dst edit uint 384 to ulong */
+uint32_t omega2_q38_plan_final(uint64_t *result, const uint64_t *o_cfg, uint64_t o_cfg_len, uint32_t *o_dst, uint64_t o_dst_len);
+/* export fn q38_attn256_cache_policy env_mode ulong to ulong */
+uint32_t omega2_q38_attn256_cache_policy(uint64_t *result, uint64_t o_env_mode);
 #ifdef __cplusplus
 }
 #endif
