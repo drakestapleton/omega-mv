@@ -1,0 +1,360 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/turing/test.om: comprehensive positive, negative, K.6 kill-test & mutant-control suite for gpu/turing.
+note Compose: si/directives/om2.om gpu/turing/types.om gpu/turing/select.om gpu/turing/energy.om gpu/turing/test.om
+
+text ty_ok1 "PASS turing SplitMix64 + ranking core (min mean, tie-break) + history control arm\n"
+text ty_ok2 "PASS turing Field v1 selection, citations, leave-one-cell-out & nearest-footprint fallback\n"
+text ty_ok3 "PASS turing Field v1 fail-closed filter refusals (8/8 reason codes)\n"
+text ty_ok4 "PASS turing K.6 kill-test (v1 0-regret vs retired v0 tie-band regret) + mutants M1/M2\n"
+text ty_ok5 "PASS turing TY-4/TY-5 energy interval & conserving attribution fail-closed checks\n"
+text ty_all "ALL PASS gpu-turing\n"
+text ty_fail "FAIL gpu-turing\n"
+
+fn ty_puts s view uchar * to void
+k = write 1 s 0 len s
+if lt k 0
+exit 2
+end
+ret
+end
+
+fn test_ranking_and_history to int
+r1 = new ulong 1 99
+r2 = new ulong 1 99
+if ne turing_splitmix64 edit r1 turing_splitmix64 edit r2
+ret 1
+end
+turing_store_reset ulong 777
+s0 = turing_store_add_spec ulong 777 ulong 128 1 1
+s1 = turing_store_add_spec ulong 777 ulong 128 1 0
+s2 = turing_store_add_spec ulong 777 ulong 32 1 0
+b = new TuringBucket 0 0 0 0 0.0f64 0 0
+turing_bucket_reset edit b ulong 64 ulong 64 TURING_PACK_ONCE
+turing_bucket_shuffle edit b ulong 42 ulong 3
+q = new TuringQuery 64 64 500 0 0
+d = new TuringDecision 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+note Cold start: explores s0 and s1 (skips s2 because q.n=64 > max_n=32)
+c1 = turing_history_select edit b view q edit d
+if or ne get d verdict TURING_V_EXPLORE eq c1 int s2
+ret 2
+end
+if ne get d reason ulong s2 TURING_R_MAX_N
+ret 3
+end
+turing_bucket_observe edit b ulong c1 ulong 1200
+c = turing_history_select edit b view q edit d
+if or ne get d verdict TURING_V_EXPLORE eq c c1
+ret 4
+end
+if eq c int s2
+ret 5
+end
+turing_bucket_observe edit b ulong c ulong 1200
+note Exact tie (both 1200 ps): lowest spec index (s0 = 0) MUST win!
+c = turing_history_select edit b view q edit d
+if or ne get d verdict TURING_V_CHOSEN ne c int s0
+ret 6
+end
+note Feed lower cost to s1 -> s1 now has lower running mean -> s1 wins!
+turing_bucket_observe edit b ulong s1 ulong 600
+c = turing_history_select edit b view q edit d
+if or ne get d verdict TURING_V_CHOSEN ne c int s1
+ret 7
+end
+ret 0
+end
+
+fn test_field_select_positive to int
+turing_store_reset ulong 101
+r0 = turing_store_add_receipt 1
+s0 = turing_store_add_spec ulong 101 ulong 256 1 1
+s1 = turing_store_add_spec ulong 101 ulong 256 1 0
+note Footprint (64, 64): s0=2000ps, s1=1000ps (s1 is 2x faster)
+ev = turing_store_add_ev s0 ulong 64 ulong 64 uint 500 r0 TURING_TIER_E2
+turing_store_set_ev_meas ev 1 uint 0 ulong 2000 ulong 100 uint 10000
+ev = turing_store_add_ev s1 ulong 64 ulong 64 uint 500 r0 TURING_TIER_E3
+turing_store_set_ev_meas ev 1 uint 0 ulong 1000 ulong 100 uint 10000
+note Footprint (128, 128): s0=3000ps, s1=4000ps (s0 is faster here)
+ev = turing_store_add_ev s0 ulong 128 ulong 128 uint 500 r0 TURING_TIER_E4
+turing_store_set_ev_meas ev 1 uint 0 ulong 3000 ulong 100 uint 10000
+ev = turing_store_add_ev s1 ulong 128 ulong 128 uint 500 r0 TURING_TIER_E4
+turing_store_set_ev_meas ev 1 uint 0 ulong 4000 ulong 100 uint 10000
+q = new TuringQuery 64 64 500 0 0
+d = new TuringDecision 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne turing_field_select view q edit d 0
+ret 10
+end
+if or ne get d chosen int s1 ne get d exact_cell 1
+ret 11
+end
+if ne get d ncite uint 2
+ret 12
+end
+if ne turing_regret_ppm get d chosen view q ulong 0
+ret 13
+end
+note Leave-one-cell-out on (64, 64, 500) -> falls back to nearest footprint (128, 128) where s0 wins!
+put q exclude_exact_cell 1
+if ne turing_field_select view q edit d 0
+ret 14
+end
+if or ne get d chosen int s0 ne get d exact_cell 0
+ret 15
+end
+if or ne get d cell_n ulong 128 ne get d cell_m ulong 128
+ret 16
+end
+ret 0
+end
+
+fn test_field_select_negative to int
+turing_store_reset ulong 202
+r_ok = turing_store_add_receipt 1
+r_bad = turing_store_add_receipt 0
+note 8 specs (indices 0..7) testing all 8 filter refusal codes
+sp = turing_store_add_spec ulong 999 ulong 256 1 0
+sp = turing_store_add_spec ulong 202 ulong 256 0 0
+sp = turing_store_add_spec ulong 202 ulong 32 1 0
+sp = turing_store_add_spec ulong 202 ulong 256 1 0
+sp = turing_store_add_spec ulong 202 ulong 256 1 0
+sp = turing_store_add_spec ulong 202 ulong 256 1 0
+sp = turing_store_add_spec ulong 202 ulong 256 1 0
+sp = turing_store_add_spec ulong 202 ulong 256 1 0
+ev = turing_store_add_ev uint 4 ulong 64 ulong 64 uint 500 r_bad TURING_TIER_E2
+turing_store_set_ev_meas ev 1 uint 0 ulong 500 ulong 0 uint 1000
+ev = turing_store_add_ev uint 5 ulong 64 ulong 64 uint 500 r_ok TURING_TIER_E2
+turing_store_set_ev_meas ev 0 uint 0 ulong 500 ulong 0 uint 1000
+ev = turing_store_add_ev uint 6 ulong 64 ulong 64 uint 500 r_ok TURING_TIER_E2
+turing_store_set_ev_meas ev 1 uint 1 ulong 500 ulong 0 uint 1000
+ev = turing_store_add_ev uint 7 ulong 64 ulong 64 uint 500 r_ok TURING_TIER_OTHER
+turing_store_set_ev_meas ev 1 uint 0 ulong 500 ulong 0 uint 1000
+q = new TuringQuery 64 64 500 0 0
+d = new TuringDecision 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+note No candidate survives -> returns 1 (NONE) with exact reason code for every spec!
+if ne turing_field_select view q edit d 1
+ret 20
+end
+if ne get d verdict TURING_V_NONE
+ret 21
+end
+if ne get d reason 0 TURING_R_CONTRACT_MISMATCH
+ret 22
+end
+if ne get d reason 1 TURING_R_NOT_EXACT
+ret 23
+end
+if ne get d reason 2 TURING_R_MAX_N
+ret 24
+end
+if ne get d reason 3 TURING_R_NO_EVIDENCE
+ret 25
+end
+if ne get d reason 4 TURING_R_RECEIPT_UNVERIFIED
+ret 26
+end
+if ne get d reason 5 TURING_R_UNVERIFIED_RUN
+ret 27
+end
+if ne get d reason 6 TURING_R_CONTENTION_FORCED
+ret 28
+end
+if ne get d reason 7 TURING_R_TIER
+ret 29
+end
+ret 0
+end
+
+fn test_kill_test_and_mutants to int
+turing_store_reset ulong 303
+r_ok = turing_store_add_receipt 1
+r_bad = turing_store_add_receipt 0
+note K.6 kill-test: ref spec s0=1050ps vs fast spec s1=1000ps, noise band = 8% (80000ppm) > margin 5% (50000ppm)
+s0 = turing_store_add_spec ulong 303 ulong 256 1 1
+s1 = turing_store_add_spec ulong 303 ulong 256 1 0
+ev = turing_store_add_ev s0 ulong 64 ulong 64 uint 500 r_ok TURING_TIER_E2
+turing_store_set_ev_meas ev 1 uint 0 ulong 1050 ulong 0 uint 80000
+ev = turing_store_add_ev s1 ulong 64 ulong 64 uint 500 r_ok TURING_TIER_E2
+turing_store_set_ev_meas ev 1 uint 0 ulong 1000 ulong 0 uint 80000
+q = new TuringQuery 64 64 500 0 0
+d1 = new TuringDecision 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+d0 = new TuringDecision 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne turing_field_select view q edit d1 0
+ret 30
+end
+if or ne get d1 chosen int s1 ne get d1 verdict TURING_V_CHOSEN
+ret 31
+end
+if ne turing_regret_ppm get d1 chosen view q ulong 0
+ret 32
+end
+note Retired v0 triggers tie-band rule and picks s0 (reference) -> 50000 ppm regret (K.6 FAIL reproduced!)
+if ne turing_field_select_v0_retired view q edit d0 0
+ret 33
+end
+if or ne get d0 chosen int s0 ne get d0 verdict TURING_V_TIE
+ret 34
+end
+reg0 = turing_regret_ppm get d0 chosen view q
+if ne reg0 ulong 50000
+ret 35
+end
+note Mutant M1: inverted ranking comparator picks s0 instead of s1 -> nonzero regret detected!
+b = new TuringBucket 0 0 0 0 0.0f64 0 0
+turing_bucket_reset edit b ulong 64 ulong 64 TURING_PACK_ONCE
+turing_bucket_observe edit b ulong s0 ulong 1050
+turing_bucket_observe edit b ulong s1 ulong 1000
+al = new int 8 1
+m1_pick = turing_rank_min_cost_mutant view b view al ulong 2
+if ne m1_pick int s0
+ret 36
+end
+if eq turing_regret_ppm m1_pick view q ulong 0
+ret 37
+end
+note Mutant M2: dropping receipt verification accepts unverified receipt that live v1 refuses!
+turing_store_reset ulong 304
+r_b = turing_store_add_receipt 0
+sm = turing_store_add_spec ulong 304 ulong 256 1 0
+em = turing_store_add_ev sm ulong 64 ulong 64 uint 500 r_b TURING_TIER_E2
+turing_store_set_ev_meas em 1 uint 0 ulong 900 ulong 0 uint 5000
+if ne turing_field_select_impl view q edit d1 0 0 1
+ret 38
+end
+if ne turing_field_select_impl view q edit d0 0 1 0
+ret 39
+end
+ret 0
+end
+
+fn test_energy_invariants to int
+note Confidence -> FORGE energy_source mapping
+if ne ty_conf_forge TY_DIRECT TY_FORGE_ENERGY_MEASURED
+ret 40
+end
+if ne ty_conf_forge TY_COUNTER_DERIVED TY_FORGE_ENERGY_MEASURED
+ret 41
+end
+if ne ty_conf_forge TY_MODELLED TY_FORGE_ENERGY_ESTIMATED
+ret 42
+end
+if ne ty_conf_forge TY_UNATTRIBUTED TY_FORGE_ENERGY_NOT_MEASURED
+ret 43
+end
+note Valid interval passes
+iv = new TyInterval 1 0 100000 250000 1000 5000 1100 4900 3800 100000000 100 100 10000 10000 1
+if ne ty_interval_check view iv TYE_OK
+ret 44
+end
+note Negative controls: sensor, wrap, headroom, gap, partial, mismatch, multiplexed
+put iv sensor_ok 0
+if ne ty_interval_check view iv TYE_E_SENSOR
+ret 45
+end
+put iv sensor_ok 1
+put iv e1_uj ulong 50000
+if ne ty_interval_check view iv TYE_E_WRAP
+ret 46
+end
+put iv e1_uj sub TY_WRAP_UJ ulong 100
+if ne ty_interval_check view iv TYE_E_HEADROOM
+ret 47
+end
+put iv e1_uj ulong 250000
+put iv max_gap_ns ulong 300000001
+if ne ty_interval_check view iv TYE_E_SAMPLING_GAP
+ret 48
+end
+put iv max_gap_ns ulong 100000000
+put iv work_t0_ns ulong 900
+if ne ty_interval_check view iv TYE_E_INTERVAL_MISMATCH
+ret 49
+end
+put iv work_t0_ns ulong 1100
+put iv planned_ns ulong 5000
+if ne ty_interval_check view iv TYE_E_PARTIAL_RUN
+ret 50
+end
+put iv planned_ns ulong 3800
+put iv pmu_running_ns ulong 9900
+if ne ty_interval_check view iv TYE_E_MULTIPLEXED
+ret 51
+end
+note Window overlap detection
+if ne ty_windows_overlap ulong 100 ulong 200 ulong 200 ulong 300 0
+ret 52
+end
+if ne ty_windows_overlap ulong 100 ulong 200 ulong 150 ulong 250 1
+ret 53
+end
+note Conserving attribution positive & negative controls
+att = new TyAttrib 100000 1000 2 0 0 0
+put att shares_uj 0 long 60000
+put att shares_uj 1 long 40000
+put att part_id 0 uint 0
+put att part_id 1 uint 1
+if ne ty_attribution_check view att uint 3 TYE_OK
+ret 54
+end
+put att shares_uj 0 long 70000
+if ne ty_attribution_check view att uint 3 TYE_E_OVER_ALLOCATED
+ret 55
+end
+put att shares_uj 0 long -2000
+if ne ty_attribution_check view att uint 3 TYE_E_NEGATIVE_SHARE
+ret 56
+end
+put att shares_uj 0 long 50000
+put att part_id 1 uint 0
+if ne ty_attribution_check view att uint 3 TYE_E_DOUBLE_COUNT
+ret 57
+end
+put att part_id 1 uint 2
+if ne ty_attribution_check view att uint 3 TYE_E_UNKNOWN_PARTICIPANT
+ret 58
+end
+put att n_part uint 1
+if ne ty_attribution_check view att uint 3 TYE_E_MISSING_PARTICIPANT
+ret 59
+end
+ret 0
+end
+
+fn main to int
+rc = test_ranking_and_history
+if ne rc 0
+ty_puts ty_fail
+ret rc
+end
+ty_puts ty_ok1
+
+rc = test_field_select_positive
+if ne rc 0
+ty_puts ty_fail
+ret rc
+end
+ty_puts ty_ok2
+
+rc = test_field_select_negative
+if ne rc 0
+ty_puts ty_fail
+ret rc
+end
+ty_puts ty_ok3
+
+rc = test_kill_test_and_mutants
+if ne rc 0
+ty_puts ty_fail
+ret rc
+end
+ty_puts ty_ok4
+
+rc = test_energy_invariants
+if ne rc 0
+ty_puts ty_fail
+ret rc
+end
+ty_puts ty_ok5
+
+ty_puts ty_all
+ret 0
+end
