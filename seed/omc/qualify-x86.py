@@ -1333,7 +1333,7 @@ def _exercise_bridge(plan, compiler, qemu, options, scratch, state):
                               f"source_sha256={digest(data)} old_hex={mutation['old'].hex()} new_hex={mutation['new'].hex()}")
             data = data.replace(mutation["old"], mutation["new"])
         path.write_bytes(data)
-        return {"path": str(path.relative_to(work)), "sha256": digest(data),
+        return {"path": path.relative_to(work).as_posix(), "sha256": digest(data),
                 "old_hex": mutation.get("old", b"").hex(), "new_hex": mutation.get("new", mutation.get("append", b"")).hex()}
 
     if plan["operation"] == "units-check":

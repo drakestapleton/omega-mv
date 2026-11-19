@@ -23,7 +23,7 @@ assert len(binary)>64 and binary[:4]==b'\x7fELF' and struct.unpack_from('<HH',bi
 report={'schema':'omega.python-u64-import.build.v1','profile':'spec/universal/python-u64-v1.md','compiler_sha256':expected,
         'compiler_choice':'bridge-seed omc 191b776e, the pinned compiler of the C importer and the #621 codec; the vendor SHA256 core is qualified under it',
         'seed_source_archive':'0fc7d8662cb799e7c206b17c18ea4c3ec2b8fea9','birth_seed':'29b12760',
-        'inputs':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in parts},
+        'inputs':{p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in parts},
         'combined_source_sha256':hashlib.sha256(program).hexdigest(),'binary_sha256':hashlib.sha256(binary).hexdigest(),
         'host_orchestration':'Python process/filesystem only; no Python parser, ast module or compute fallback in the native artifact'}
 with tempfile.TemporaryDirectory(prefix='.python-import-build-',dir=build) as temp:

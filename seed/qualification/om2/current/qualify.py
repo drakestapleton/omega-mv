@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -140,9 +141,9 @@ class Qualification:
             if not found:
                 raise NotRun(f'missing qualification tool: {tool}')
             self.tools[tool] = found
-        self.report['platform'] = {'uname': list(os.uname()), 'python': sys.version,
+        self.report['platform'] = {'uname': list(platform.uname()), 'python': sys.version,
                                    'python_executable': sys.executable}
-        if os.uname().sysname != 'Linux' or os.uname().machine not in ('aarch64', 'arm64'):
+        if platform.system() != 'Linux' or platform.machine() not in ('aarch64', 'arm64'):
             raise NotRun('this native caller instrument requires Linux AArch64')
         self.run('source-clean', [self.tools['git'], 'diff', '--quiet', 'HEAD', '--'])
         self.run('bridge-clean', [self.tools['git'], '-C', self.bridge, 'diff', '--quiet', 'HEAD', '--'])
@@ -192,7 +193,7 @@ class Qualification:
         final_head = self.run('source-head-final', [self.tools['git'], 'rev-parse', 'HEAD']).read_text().strip()
         self.require(final_head == source_head, 'source HEAD changed during qualification')
         self.report['artifacts'] = [
-            {'path': str(p.relative_to(self.out)), 'sha256': digest(p)}
+            {'path': p.relative_to(self.out).as_posix(), 'sha256': digest(p)}
             for p in sorted(self.out.rglob('*'))
             if p.is_file() and p.name not in ('result.json', 'result.json.tmp')
         ]

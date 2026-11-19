@@ -47,7 +47,7 @@ def run(name, d, args, rc, stdout=b'', stderr=b''):
     record = {'name': name, 'command': command, 'exit': p.returncode,
               'stdout': p.stdout.decode(errors='replace'), 'stderr': p.stderr.decode(errors='replace'),
               'expected_exit': rc, 'expected_stdout': stdout.decode(), 'pass': ok,
-              'inputs': {str(f.relative_to(d)): hashlib.sha256(f.read_bytes()).hexdigest()
+              'inputs': {f.relative_to(d).as_posix(): hashlib.sha256(f.read_bytes()).hexdigest()
                          for f in (d / 'inbox').glob('*') if f.is_file()}}
     checks.append(record)
     print(('PASS ' if ok else 'FAIL ') + name)
