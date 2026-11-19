@@ -31,26 +31,28 @@ static void put64(uint32_t *cb, uint32_t off, const void *p) { uint64_t a = (uin
 /* launch argument words start at the constant bank's 0x380 */
 static void put64v(uint32_t *args, uint32_t off, uint64_t a) { args[(off - 0x380u) / 4] = (uint32_t)a; args[(off - 0x380u) / 4 + 1] = (uint32_t)(a >> 32); }
 
-/* XBOUND on n rows (grid ceil(n / 256), the last CTA partial). hscale spreads |h| over decades. Returns the number of
- * rows whose lo / hi break the bound (or are loose by more than 2^-8 relative); *untouched = rows past n left alone. */
-static int sim_xbound(uint32_t n, int mutant, uint32_t seed, float hscale, size_t *bad, size_t *loose, int *untouched, char *msg, size_t msgn) {
+/* XBOUND on n rows (grid ceil(n / 256), the last CTA partial) at hidden width W (0 = 2048). hscale spreads |h| over decades.
+ * Returns the number of rows whose lo / hi break the bound (or are loose by more than 2^-8 relative); *untouched = rows past n left alone. */
+static int sim_xbound_w(uint32_t n, uint32_t width, int mutant, uint32_t seed, float hscale, size_t *bad, size_t *loose, int *untouched, char *msg, size_t msgn) {
     static BlackwellIRProgram prog;
     OmegaDecSpec spec; memset(&spec, 0, sizeof spec);
-    spec.kind = OMEGA_DEC_XBOUND; spec.mutant = mutant;
+    spec.kind = OMEGA_DEC_XBOUND; spec.width = width; spec.mutant = mutant;
+    const uint32_t H = width ? width : 2048u;
     if (omega_blackwell_codegen_dec_prog(&spec, &prog) != 0) { snprintf(msg, msgn, "codegen refused"); return -1; }
     const uint32_t ctas = (n + 255u) / 256u, cap = ctas * 256u + 8u;
-    float *s = aligned_alloc(16, cap * 4), *c = aligned_alloc(16, cap * 4), *h = aligned_alloc(16, 2048 * 4);
+    float *s = aligned_alloc(16, cap * 4), *c = aligned_alloc(16, cap * 4), *h = aligned_alloc(16, H * 4);
     float *lo = aligned_alloc(16, cap * 4), *hi = aligned_alloc(16, cap * 4);
     uint8_t *smem = aligned_alloc(16, OMEGA_DEC_SHARED_BYTES);
     uint32_t st = seed;
-    for (uint32_t i = 0; i < 2048; i++) h[i] = frand(&st, -1.0f, 1.0f) * hscale * (i % 97 == 0 ? 40.0f : 1.0f);
+    for (uint32_t i = 0; i < H; i++) h[i] = frand(&st, -1.0f, 1.0f) * hscale * (i % 97 == 0 ? 40.0f : 1.0f);
+    if (H > 2048u) h[H - 1] = 250.0f * hscale; /* tail-element sensitivity: proves all H elements contribute to |h| */
     for (uint32_t i = 0; i < cap; i++) {
         s[i] = frand(&st, -30.0f, 30.0f) * (i % 7 == 0 ? 1e3f : 1.0f);
         c[i] = frand(&st, 0.0f, 0.02f);
         lo[i] = hi[i] = -999.0f;
     }
     s[0] = 0.0f; c[1] = 0.0f; s[2] = -0.0f;
-    double hn = 0; for (uint32_t i = 0; i < 2048; i++) hn += (double)h[i] * h[i];
+    double hn = 0; for (uint32_t i = 0; i < H; i++) hn += (double)h[i] * h[i];
     hn = sqrt(hn);
     WsSim w; memset(&w, 0, sizeof w);
     w.p = &prog; w.threads = OMEGA_DEC_THREADS; w.order = (int)(seed & 1u); w.smem = smem; w.smem_bytes = OMEGA_DEC_SHARED_BYTES;
@@ -59,7 +61,7 @@ static int sim_xbound(uint32_t n, int mutant, uint32_t seed, float hscale, size_
     w.nranges = 5;
     w.ranges[0].lo = (uintptr_t)s; w.ranges[0].hi = (uintptr_t)(s + cap);
     w.ranges[1].lo = (uintptr_t)c; w.ranges[1].hi = (uintptr_t)(c + cap);
-    w.ranges[2].lo = (uintptr_t)h; w.ranges[2].hi = (uintptr_t)(h + 2048);
+    w.ranges[2].lo = (uintptr_t)h; w.ranges[2].hi = (uintptr_t)(h + H);
     w.ranges[3].lo = (uintptr_t)lo; w.ranges[3].hi = (uintptr_t)(lo + cap);
     w.ranges[4].lo = (uintptr_t)hi; w.ranges[4].hi = (uintptr_t)(hi + cap);
     int err = ws_run(&w, ctas, 1);
@@ -74,10 +76,13 @@ static int sim_xbound(uint32_t n, int mutant, uint32_t seed, float hscale, size_
         }
         int u = 1; for (uint32_t i = n; i < cap; i++) u &= lo[i] == -999.0f && hi[i] == -999.0f;
         *bad = b; *loose = l; *untouched = u;
-        snprintf(msg, msgn, "%u rows: %zu break the bound, %zu looser than 2^-8, rows past count %s", n, b, l, u ? "untouched" : "WRITTEN");
+        snprintf(msg, msgn, "%u rows (H=%u): %zu break the bound, %zu looser than 2^-8, rows past count %s", n, H, b, l, u ? "untouched" : "WRITTEN");
     }
     free(s); free(c); free(h); free(lo); free(hi); free(smem);
     return err;
+}
+static int sim_xbound(uint32_t n, int mutant, uint32_t seed, float hscale, size_t *bad, size_t *loose, int *untouched, char *msg, size_t msgn) {
+    return sim_xbound_w(n, 0, mutant, seed, hscale, bad, loose, untouched, msg, msgn);
 }
 
 /* XBOUND mode 1 (SCALE) on n values: out == in * 2^64 bit for bit, values past n untouched */
@@ -132,6 +137,25 @@ static void sim_battery(void) {
     }
     m2.mutant = 1; m2.mode = 1;
     CHECK(omega_blackwell_codegen_dec_prog(&m2, &p2) != 0, "XBOUND SCALE refuses a mutant");
+    /* 9B (4096) and 27B (5120) hidden widths */
+    static const uint32_t q38_widths[] = { 4096u, 5120u };
+    for (size_t i = 0; i < sizeof q38_widths / sizeof q38_widths[0]; i++) {
+        size_t b = 1, l = 1; int u2 = 0;
+        int e2 = sim_xbound_w(530, q38_widths[i], 0, 11 + (uint32_t)i, 1.0f, &b, &l, &u2, msg, sizeof msg);
+        CHECK(!e2 && b == 0 && l == 0 && u2, "sim XBOUND H=%u: %s", q38_widths[i], msg);
+        printf("sim XBOUND H=%u: %s %s\n", q38_widths[i], e2 ? "ERROR" : b || l || !u2 ? "MISMATCH" : "ok", msg);
+    }
+    {
+        size_t b = 0, l = 0; int u2 = 0;
+        int e2 = sim_xbound_w(530, 5120u, 1, 12, 1.0f, &b, &l, &u2, msg, sizeof msg);
+        CHECK(!e2 && b != 0, "sim XBOUND H=5120 mutant 1 must be caught: %s", msg);
+        printf("sim XBOUND H=5120 mutant 1: %s %s\n", e2 ? "ERROR" : b ? "caught" : "NOT CAUGHT", msg);
+    }
+    {
+        size_t xb = 1; int xe = sim_xscale(5120u, 13, &xb, msg, sizeof msg);
+        CHECK(!xe && xb == 0, "sim XBOUND SCALE n 5120: %s", msg);
+        printf("sim XBOUND SCALE n 5120: %s %s\n", xe ? "ERROR" : xb ? "MISMATCH" : "ok", msg);
+    }
 }
 
 /* ------------------------------------------------------------- chip */

@@ -72,7 +72,7 @@ extern "C" {
 #define OMEGA_GEMM_MAX_SHARED 16384u
 
 typedef struct {
-    uint32_t k;          /* multiple of 128 and of 32 * lane_bytes; <= 16384 */
+    uint32_t k;          /* multiple of 128 and of 32 * lane_bytes; <= 32768 (17408 is Qwen3.8-27B down_proj) */
     uint32_t lane_bytes; /* 8 or 16 (the GEMV's choice: 16 when k % 512 == 0, else 8) */
     uint32_t mt;         /* rows per pass: a power of two, mt * 128 * lane_bytes <= 16384 */
     uint32_t warps;      /* warps % lane_bytes == 0, (mt * lane_bytes) % warps == 0, 1 .. 32 (host simulator: build with -DWS_MAX_THREADS=512) */

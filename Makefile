@@ -3057,10 +3057,14 @@ $(GPU_L2_REUSE_TEST): tests/gpu_l2_reuse_test.c src/omega_gpu_fp8_api.h src/omeg
 # sc #642 (2026-10-18): Qwen3.8-27B decode graph (one token = one command list), chip test vs the APIs one call at a time
 .PHONY: test-gpu-q38-graph-host
 GPU_Q38_GRAPH_TEST = $(OUT_DIR)/gpu_q38_graph_test
+GPU_Q38_GRAPH_HOST_TEST = $(OUT_DIR)/test_omega_gpu_q38_graph_host
 $(GPU_Q38_GRAPH_TEST): tests/gpu_q38_graph_test.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_q38_graph_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-q38-graph-host: $(GPU_Q38_GRAPH_TEST)
+$(GPU_Q38_GRAPH_HOST_TEST): tests/test_omega_gpu_q38_graph_host.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
+	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/test_omega_gpu_q38_graph_host.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+test-gpu-q38-graph-host: $(GPU_Q38_GRAPH_TEST) $(GPU_Q38_GRAPH_HOST_TEST)
 	./$(GPU_Q38_GRAPH_TEST) --host-only
+	./$(GPU_Q38_GRAPH_HOST_TEST)
 
 # HUM L314 exact two-pass lm_head (XBOUND simulator proofs; the chip run comes with the export)
 GPU_EXACT_HEAD_TEST = $(OUT_DIR)/gpu_exact_head_test

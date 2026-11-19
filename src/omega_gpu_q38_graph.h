@@ -61,6 +61,7 @@ extern "C" {
 #define OMEGA_GPU_Q38_MIXER_OUT 6144u    /* GDN 48 x 128 = attention 24 x 256 */
 #define OMEGA_GPU_Q38_ROTARY 64u
 #define OMEGA_GPU_Q38_MAX_LAYERS 64u
+#define OMEGA_GPU_Q38_MAX_HEADS 8u
 
 /* Model shape (2026-10-27): the widths above and in the comments are the Qwen3.8-27B shape, which is also each width's
  * maximum. A zero shape field of the config takes its 27B value, and the 27B builds the same kernels as before the fields
@@ -114,6 +115,36 @@ int omega_gpu_q38_graph_set_final_norm(OmegaGpuQ38Graph *g, const float *final_n
  * omega_gpu_q38_graph_read returns the unscaled hidden (exact power-of-two rescale). Logits are those of the quantised head:
  * callers own the drift study against the bf16 head. */
 int omega_gpu_q38_graph_set_lm_head_fp8(OmegaGpuQ38Graph *g, const OmegaGpuFp8Tensor *head);
+/* Strokes: N heads (conversations) through ONE graph. create_heads lays out N slots of x, hidden, xq, logits and token;
+ * head 0 uses cfg.gdn / cfg.attn, every head (0 included) can be pointed at other state objects by set_head_state (same
+ * shapes). create() == create_heads(cfg, 1). */
+int omega_gpu_q38_graph_create_heads(const OmegaGpuQ38GraphConfig *cfg, uint32_t heads, OmegaGpuQ38Graph **out);
+int omega_gpu_q38_graph_set_head_state(OmegaGpuQ38Graph *g, uint32_t head, OmegaGpuGdn *gdn, OmegaGpuDecodeAttn256Cache *attn);
+/* x_embed f32 [heads][hidden], pos [heads] -> tokens [heads]; layer-major. */
+int omega_gpu_q38_graph_stroke(OmegaGpuQ38Graph *g, const float *x_embed, const uint32_t *pos, uint32_t heads, uint32_t *tokens,
+                               OmegaGpuDecodeGraphStats *st);
+int omega_gpu_q38_graph_begin_stroke(OmegaGpuQ38Graph *g, const float *x_embed, uint32_t heads);
+int omega_gpu_q38_graph_record_head_layer(OmegaGpuQ38Graph *g, uint32_t head, uint32_t layer, uint32_t pos);
+int omega_gpu_q38_graph_record_head_final(OmegaGpuQ38Graph *g, uint32_t head);
+int omega_gpu_q38_graph_end_stroke(OmegaGpuQ38Graph *g, uint32_t *tokens, OmegaGpuDecodeGraphStats *st);
+/* As read(), for head h of the last stroke. */
+int omega_gpu_q38_graph_read_head(OmegaGpuQ38Graph *g, uint32_t head, float *x, float *hidden, float *logits);
+/* Batched dense decode (v2): with set_batch(g, 1), stroke() records each FP8 layer for every head at once using grouped
+ * FP8 GEMM (mix, o, gate_up, down read once per layer for all heads; GDN and attention stay per head). bf16 layers fall
+ * back to per-head launches. set_batch pins the FP8 GEMM shapes (H, mout, I); AIEN_OMEGA_Q38_BATCH=1 at create does the same. */
+int omega_gpu_q38_graph_set_batch(OmegaGpuQ38Graph *g, int on);
+int omega_gpu_q38_graph_batch(const OmegaGpuQ38Graph *g);
+int omega_gpu_q38_graph_record_layer_heads(OmegaGpuQ38Graph *g, uint32_t layer, const uint32_t *pos);
+/* HUM L314 exact two-pass head (bf16 lm_head only; ignored while an FP8 lm_head is set). screen: the fp8b copy of lm_head
+ * ([vocab][hidden], 128 x 128 block scales); coef: f32 [vocab] row bound coefficients; roundings: rounding count used to
+ * build coef (e.g. 10384 for hidden 5120, must be > 0 when screen != NULL). Copies coef; screen must outlive g. NULL screen
+ * removes it. On by default once set. */
+uint64_t omega_gpu_q38_exact_extra_bytes(void);
+int omega_gpu_q38_graph_set_exact_head(OmegaGpuQ38Graph *g, const OmegaGpuFp8Tensor *screen, const float *coef, uint32_t roundings);
+void omega_gpu_q38_graph_set_exact_head_on(OmegaGpuQ38Graph *g, int on);
+int omega_gpu_q38_graph_exact_head_active(const OmegaGpuQ38Graph *g);
+void omega_gpu_q38_graph_set_head_exact_head_on(OmegaGpuQ38Graph *g, uint32_t head, int on);
+int omega_gpu_q38_graph_exact_head_active_head(const OmegaGpuQ38Graph *g, uint32_t head);
 /* GDN layers record the a|b GEMV first and the mix GEMV beside it (no barrier between the two; both only read xq), process-wide.
  * 1 (default) or 0 (mix then a|b, each behind a barrier); env AIEN_OMEGA_Q38_OVERLAP_AB when never set. Values are identical. */
 void omega_gpu_q38_graph_set_overlap_ab(int on);
@@ -135,19 +166,22 @@ int omega_gpu_q38_graph_read_buf(OmegaGpuQ38Graph *g, int which, float *out, uin
 /* The gather table (u32 [(q_heads + kv_heads) * 512]): agg[n] = mix[tab[n]] (host side; the graph uploads it at create).
  * 24 / 4 is the 27B table. Returns -1 for a shape the graph refuses (q_heads 0 or above 24, kv_heads 0 or not dividing). */
 int omega_q38_gather_table(uint32_t q_heads, uint32_t kv_heads, uint32_t *tab);
+/* the FP8 GEMM's x' lane permutation as a GATHER table (k a multiple of 512) */
+void omega_q38_perm_table(uint32_t *tab, uint32_t k);
 
 /* ---- timeline (measurement; as the decode graph) ---- */
 enum {
     OMEGA_GPU_Q38_K_NORM = 0, OMEGA_GPU_Q38_K_MIX, OMEGA_GPU_Q38_K_AB, OMEGA_GPU_Q38_K_GDN, OMEGA_GPU_Q38_K_GATHER, OMEGA_GPU_Q38_K_ATTN,
     OMEGA_GPU_Q38_K_GATE, OMEGA_GPU_Q38_K_O, OMEGA_GPU_Q38_K_RES, OMEGA_GPU_Q38_K_GATE_UP, OMEGA_GPU_Q38_K_SWIGLU, OMEGA_GPU_Q38_K_DOWN,
-    OMEGA_GPU_Q38_K_LM_HEAD, OMEGA_GPU_Q38_K_ARGMAX, OMEGA_GPU_Q38_K_COUNT
+    OMEGA_GPU_Q38_K_LM_HEAD, OMEGA_GPU_Q38_K_ARGMAX, OMEGA_GPU_Q38_K_PERM, OMEGA_GPU_Q38_K_COUNT
 };
 void omega_gpu_q38_graph_set_stamps(OmegaGpuQ38Graph *g, int on);
 int omega_gpu_q38_graph_stamps(const OmegaGpuQ38Graph *g, uint64_t *stamps, uint8_t *kinds, uint32_t cap);
 const char *omega_gpu_q38_graph_kind_name(uint8_t kind);
 /* 1: submit after every launch (the comparison path). */
 void omega_gpu_q38_graph_set_flush_each(OmegaGpuQ38Graph *g, int on);
-/* TEST ONLY: 1 SWIGLU up half off by one, 2 GATHER index + 1, 3 GATE dropped, 4 post-norm without its weight. 0 none. */
+/* TEST ONLY: 1 SWIGLU up half off by one, 2 GATHER index + 1, 3 GATE dropped, 4 post-norm without its weight,
+ * 5 exact head MASK inverted, 6 exact head XBOUND drops c|h|. 0 none. */
 void omega_gpu_q38_graph_test_set_mutant(OmegaGpuQ38Graph *g, int mutant);
 
 #ifdef __cplusplus

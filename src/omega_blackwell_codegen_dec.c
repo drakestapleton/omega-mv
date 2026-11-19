@@ -481,11 +481,14 @@ static int gen_xscale(Em *e) {
 static int gen_xbound(Em *e, const OmegaDecSpec *sp) {
     if (sp->mode > 1 || sp->mutant < 0 || sp->mutant > 1 || (sp->mode == 1 && sp->mutant)) return -1;
     if (sp->mode == 1) return gen_xscale(e);
+    const uint32_t H = sp->width ? sp->width : OMEGA_DEC_HIDDEN;
+    const uint32_t N = H / OMEGA_DEC_THREADS, Q = N / 4u;
+    if (H % (4u * OMEGA_DEC_THREADS) || N > RES_MAX_VALS) return -1;
     int udesc = UV64(e), ps = V64(e), pc = V64(e), ph = V64(e), plo = V64(e), phi = V64(e), lim = V(e);
     int tid = V(e), cx = V(e), warp = V(e), lane = V(e), one = V(e), t = V(e), a0 = V(e), acc = V(e), tot = V(e), r = V(e);
     int hn = V(e), cst = V(e), n = V(e), ha = V64(e), sa = V64(e), ca = V64(e), la = V64(e), hia = V64(e);
-    int sv = V(e), cv = V(e), b = V(e), ab = V(e), lo = V(e), hi = V(e), hq[2];
-    if (new_quads(e, hq, 2)) return -1;
+    int sv = V(e), cv = V(e), b = V(e), ab = V(e), lo = V(e), hi = V(e), hq[RES_MAX_VALS / 4];
+    if (new_quads(e, hq, Q)) return -1;
     ldcu64(e, udesc, 0x358);
     ldc64(e, ps, OMEGA_DEC_XB_S); ldc64(e, pc, OMEGA_DEC_XB_C); ldc64(e, ph, OMEGA_DEC_XB_H);
     ldc64(e, plo, OMEGA_DEC_XB_LO); ldc64(e, phi, OMEGA_DEC_XB_HI); ldc32(e, lim, OMEGA_DEC_XB_N);
@@ -493,11 +496,11 @@ static int gen_xbound(Em *e, const OmegaDecSpec *sp) {
     movi(e, one, 1);
     shr(e, warp, tid, 5);
     andi(e, R(lane), R(tid), 31u);
-    /* |h|: 8 values per thread, warp sums, the 8 warp partials in shared memory */
-    imadw(e, ha, tid, 32u, ph);
-    ldg_quads(e, hq, 2, ha, 0, udesc);
+    /* |h|: N values per thread (H / 256), warp sums, the 8 warp partials in shared memory */
+    imadw(e, ha, tid, 4u * N, ph);
+    ldg_quads(e, hq, Q, ha, 0, udesc);
     movrz(e, R(acc));
-    for (unsigned i = 0; i < 8; i++) ffma(e, R(acc), S(hq[i / 4], i % 4), S(hq[i / 4], i % 4), R(acc));
+    for (unsigned i = 0; i < N; i++) ffma(e, R(acc), S(hq[i / 4], i % 4), S(hq[i / 4], i % 4), R(acc));
     warp_sum(e, acc, t);
     imadi(e, R(a0), R(warp), 4u, NOREG);
     lane0_sts(e, lane, one, a0, R(acc));
