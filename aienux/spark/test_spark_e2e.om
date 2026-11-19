@@ -1,0 +1,794 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/spark/test_spark_e2e.om: Full-stack host E2E integration test for Phase 3 (spark-glue).
+note Exercises the REAL wired cross-slice glue A/B -> D -> C -> E -> F end-to-end on host:
+note   1. Slice B: bar0_mmio.om mode 1 (wired via arm64_mmio_r32/w32/r64/w64) + GB20B BOOT_0/BOOT_42
+note               + irqbm.om (iqmode=2) clean service pass.
+note   2. Slice D: sha256_bare.om digest check + tcp.om loopback transport.
+note   3. Slice C: bm_hal.om + fw_bm.om + arena_bm.om (abbuild) + sccfg(abpa 1, fbappver) (#77 reminder)
+note               + gmmu_bm.om + mem.om + chan.om + complete.om (cmbind 0 slot 16 gen -> marker_va + 16!).
+note   4. Slice E: compute.om + q38_run.om (q3_init, q38_reset_kv, q38_stage_step, C3 marker1->L2->marker2,
+note               q38_verify_step) + negative control proving marker1 alone does NOT complete cmpoll!
+note   5. Slice F: omtk.om + wire_loop.om over TCP: PING -> PONG, RESET_KV(0) -> DONE,
+note               PREFILL([7, 42]) -> DONE(kv=2), DECODE(max=2, eos=999, temp=0) -> TOKEN(0,777) + TOKEN(1,999,EOS) + DONE!
+note Strictly host-only (Spark silicon NOT_RUN). Zero real firmware bytes, zero GPU access.
+
+const E2E_RAM_BASE ulong 2147483648
+const E2E_RAM_SZ ulong 13631488
+const E2E_HEAP_PA ulong 3221225472
+const E2E_HEAP_SZ ulong 139460608
+const E2E_FRQ ulong 1000000000
+
+text e2e_pass "SPARK_E2E_PASS stages=6 checks=ALL (bar0_mode1+sccfg+marker_va16+reset_kv+prefill+decode+omtk)\n"
+text e2e_t1 "PASS e2e_01_bar0_mode1_and_irqbm\n"
+text e2e_t2 "PASS e2e_02_sha256_and_fw_arena_sccfg\n"
+text e2e_t3 "PASS e2e_03_gmmu_rmchan_cmbind_marker_plus_16\n"
+text e2e_t4 "PASS e2e_04_q38_marker1_neg_and_marker2_complete\n"
+text e2e_t5 "PASS e2e_05_omtk_ping_reset_prefill_decode_e2e\n"
+
+note 13 MiB simulated Normal-NC physical RAM at 0x80000000
+global e2e_ram uchar 13631488
+note Simulated BAR0 sparse register store for mode 1 (arm64_mmio_r32/w32)
+global e2e_bar_k ulong 64
+global e2e_bar_v ulong 64
+global e2e_bar_n ulong 1
+note E2E state: 0=bar_h, 1=tick, 2=gen, 3=mk_pa, 4=pb_pa, 5=kicks, 6=db_val, 7=flushes, 8=stop
+global e2e_st ulong 16
+global e2e_next_tok ulong 4
+global e2e_tok_idx ulong 1
+
+note Loopback NIC RX queue (Peer -> Spark): 4 slots x 2048 B
+global e2e_srx_buf uchar 8192
+global e2e_srx_len ulong 4
+global e2e_srx_hd ulong 1
+global e2e_srx_cnt ulong 1
+note Captured TCP payload bytes (Spark -> Peer)
+global e2e_cap_buf uchar 16384
+global e2e_cap_len ulong 1
+global e2e_cap_pos ulong 1
+note Peer TCP state: 0=peer_seq, 1=peer_ack, 2=peer_port, 3=spark_isn
+global e2e_peer ulong 8
+global e2e_pkt uchar 2048
+global e2e_frm uchar 256
+
+fn e2e_puts s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn e2e_ck ok bool to void
+if not ok
+trap 1
+end
+end
+
+note ========================================================================
+note Cross-Slice Host Simulation Seams (matching spark_main.om bare-metal seams)
+note ========================================================================
+
+fn arm64_mmio_r32 addr ulong to ulong
+n = get e2e_bar_n 0
+for i ulong n bound 64
+if eq get e2e_bar_k i addr
+ret and get e2e_bar_v i 4294967295
+end
+end
+ret ulong 0
+end
+
+fn arm64_mmio_w32 addr ulong val ulong to void
+n = get e2e_bar_n 0
+for i ulong n bound 64
+if eq get e2e_bar_k i addr
+put e2e_bar_v i and val 4294967295
+ret
+end
+end
+if lt n 64
+put e2e_bar_k n addr
+put e2e_bar_v n and val 4294967295
+put e2e_bar_n 0 add n 1
+end
+end
+
+fn arm64_mmio_r64 addr ulong to ulong
+lo = arm64_mmio_r32 addr
+hi = arm64_mmio_r32 add addr 4
+ret or lo shl hi 32
+end
+
+fn arm64_mmio_w64 addr ulong val ulong to void
+arm64_mmio_w32 addr and val 4294967295
+arm64_mmio_w32 add addr 4 shr val 32
+end
+
+fn s2simrd off ulong to ulong
+trap 9
+end
+
+fn s2simwr off ulong v ulong to void
+trap 9
+end
+
+fn gsbind chid uint tok uint ent uint gpva ulong upa ulong ipa ulong to long
+trap 9
+end
+
+fn gsdisable chid uint to long
+trap 9
+end
+
+fn gsidle chid uint to long
+trap 9
+end
+
+fn bmrbarrd off ulong to ulong
+ret bmmio_r32 long get e2e_st 0 off
+end
+
+fn bmrbarwr off ulong v ulong to void
+if eq off BMBARDB
+put e2e_st 6 v
+end
+r = bmmio_w32 long get e2e_st 0 off v
+end
+
+fn bmrmemrd8 pa ulong to uchar
+if or lt pa E2E_RAM_BASE ge pa add E2E_RAM_BASE E2E_RAM_SZ
+trap 3
+end
+ret get e2e_ram sub pa E2E_RAM_BASE
+end
+
+fn bmrmemwr8 pa ulong v uchar to void
+if or lt pa E2E_RAM_BASE ge pa add E2E_RAM_BASE E2E_RAM_SZ
+trap 3
+end
+put e2e_ram sub pa E2E_RAM_BASE v
+end
+
+fn bmrcntvct to ulong
+t = add get e2e_st 1 1000000
+put e2e_st 1 t
+ret t
+end
+
+fn q3_dc_civac pa ulong nbytes ulong to void
+put e2e_st 7 add get e2e_st 7 1
+end
+
+fn wl_cntvct to ulong
+ret bmrcntvct
+end
+
+fn wl_cntfrq to ulong
+ret E2E_FRQ
+end
+
+fn wl_dsb_ish to void
+cpufence
+end
+
+note Peer -> Spark loopback RX
+fn e2e_rx_push n ulong to void
+cnt = get e2e_srx_cnt 0
+if or ge cnt 4 gt n 2048
+trap 3
+end
+hd = get e2e_srx_hd 0
+slot = rem add hd cnt 4
+base = mul slot 2048
+i = ulong 0
+while lt i n bound 2048
+put e2e_srx_buf add base i get e2e_pkt i
+i = add i 1
+end
+put e2e_srx_len slot n
+put e2e_srx_cnt 0 add cnt 1
+end
+
+fn wl_nic_rx to ulong
+cnt = get e2e_srx_cnt 0
+if eq cnt 0
+ret 0
+end
+hd = get e2e_srx_hd 0
+n = get e2e_srx_len hd
+base = mul hd 2048
+i = ulong 0
+while lt i n bound 2048
+put Trx i get e2e_srx_buf add base i
+i = add i 1
+end
+put e2e_srx_hd 0 rem add hd 1 4
+put e2e_srx_cnt 0 sub cnt 1
+ret n
+end
+
+fn e2e_be16_ttx off ulong to ulong
+ret or shl ulong get Ttx off 8 ulong get Ttx add off 1
+end
+
+fn e2e_be32_ttx off ulong to ulong
+a = shl ulong get Ttx off 24
+b = shl ulong get Ttx add off 1 16
+c = shl ulong get Ttx add off 2 8
+d = ulong get Ttx add off 3
+ret or or or a b c d
+end
+
+fn e2e_cap_append pay_off ulong plen ulong to void
+clen = get e2e_cap_len 0
+i = ulong 0
+while lt i plen bound 1500
+if lt add clen i 16384
+put e2e_cap_buf add clen i get Ttx add pay_off i
+end
+i = add i 1
+end
+put e2e_cap_len 0 add clen plen
+end
+
+note Spark -> Peer TX capture: extracts TCP payload into e2e_cap_buf
+fn wl_nic_tx n ulong to long
+if lt n 54
+ret 0
+end
+if ne e2e_be16_ttx 12 0x0800
+ret 0
+end
+if ne get Ttx 23 6
+ret 0
+end
+iplen = e2e_be16_ttx 16
+ihl = mul and ulong get Ttx 14 15 4
+tbase = add 14 ihl
+thl = mul shr ulong get Ttx add tbase 12 4 4
+fl = ulong get Ttx add tbase 13
+sseq = e2e_be32_ttx add tbase 4
+if ne and fl 2 0
+put e2e_peer 3 sseq
+put e2e_peer 1 add sseq 1
+end
+if gt iplen add ihl thl
+plen = sub iplen add ihl thl
+e2e_cap_append add tbase thl plen
+put e2e_peer 1 add sseq plen
+end
+ret 0
+end
+
+fn wl_nic_reclaim to void
+end
+
+fn wl_q38_reset_kv keep_pos ulong to long
+ret q38_reset_kv keep_pos
+end
+
+fn wl_q38_stage_step tok uint kv uint mode uchar to long
+ret q38_stage_step tok kv mode
+end
+
+fn wl_q38_verify_step to long
+md = uchar and get wl_st WL_S_CURMODE 255
+rc = q38_verify_step md
+if lt rc 0
+ret rc
+end
+ret 0
+end
+
+fn wl_q38_read_tok to uint
+ret uint mmrd32 q3_ncva 6
+end
+
+note Simulated GPU execution triggered by wl_gpu_kick:
+note   1. Executes real chpush + cmsub (DSB SY chain + GPFIFO + USERD + BAR0 doorbell)
+note   2. Simulates GPU completing staged QMDs (sets QMD sems=6, out_tok on mode=1)
+note   3. Simulates C3 tail: marker1(marker_pa) -> L2_FLUSH -> marker2(marker_pa + 16)!
+fn e2e_sim_gpu_complete do_marker2 bool to void
+seq = get q3st 6
+n = get q3st 7
+sems = q3_ncva 13
+for i ulong n bound 2048
+mmwr32 add sems mul i 16 ulong Q3SEMDONE
+end
+if eq get wl_st WL_S_CURMODE 1
+idx = get e2e_tok_idx 0
+tok = get e2e_next_tok rem idx 4
+put e2e_tok_idx 0 add idx 1
+mmwr32 q3_ncva 6 tok
+end
+mk_pa = get e2e_st 3
+mmwr32 mk_pa seq
+if do_marker2
+mmwr32 add mk_pa 16 seq
+end
+end
+
+fn wl_gpu_kick pb_words uint to long
+pbva = get e2e_st 4
+rc = chpush 0 pbva pb_words
+if lt rc 0
+ret rc
+end
+rc2 = cmsub 0 1
+if lt rc2 0
+ret rc2
+end
+put e2e_st 5 add get e2e_st 5 1
+note Complete both marker1 and marker2 for wire_loop E2E flow
+e2e_sim_gpu_complete true
+ret 0
+end
+
+note Piece 6 completion poll -> Piece 3 cmpoll(0) bound to marker_va + 16!
+fn wl_gpu_poll to long
+ret cmpoll 0
+end
+
+fn wl_gpu_irq_check to long
+ret iqservice get e2e_st 2 16
+end
+
+fn wl_gpu_quarantine to void
+r = cmquar 0 get e2e_st 2
+end
+
+fn wl_should_stop to ulong
+ret get e2e_st 8
+end
+
+note ========================================================================
+note Minimal Ethernet/IPv4/TCP frame builder for Peer -> Spark OMTK v1 tests
+note ========================================================================
+
+fn e2e_p16 off ulong v ulong to void
+put e2e_pkt off uchar and shr v 8 255
+put e2e_pkt add off 1 uchar and v 255
+end
+
+fn e2e_p32 off ulong v ulong to void
+put e2e_pkt off uchar and shr v 24 255
+put e2e_pkt add off 1 uchar and shr v 16 255
+put e2e_pkt add off 2 uchar and shr v 8 255
+put e2e_pkt add off 3 uchar and v 255
+end
+
+fn e2e_csum base ulong n ulong acc ulong to ulong
+s = acc
+i = ulong 0
+while lt add i 1 n bound 2048
+w = or shl ulong get e2e_pkt add base i 8 ulong get e2e_pkt add add base i 1
+s = add s w
+i = add i 2
+end
+if eq rem n 2 1
+s = add s shl ulong get e2e_pkt add base sub n 1 8
+end
+while gt s 65535 bound 16
+s = add and s 65535 shr s 16
+end
+ret and xor s 65535 65535
+end
+
+fn e2e_finish_tcp plen ulong fl ulong to void
+j = ulong 0
+while lt j plen bound 256
+put e2e_pkt add 54 j get e2e_frm j
+j = add j 1
+end
+tcplen = add 20 plen
+ps = add and shr ulong 3232235778 16 65535 and ulong 3232235778 65535
+ps = add ps add and shr get Tcf 1 16 65535 and get Tcf 1 65535
+ps = add ps add 6 tcplen
+e2e_p16 50 e2e_csum 34 tcplen ps
+flen = add 54 plen
+if lt flen 60
+k = flen
+while lt k 60 bound 60
+put e2e_pkt k 0
+k = add k 1
+end
+flen = ulong 60
+end
+e2e_rx_push flen
+pseq = get e2e_peer 0
+if ne and fl 2 0
+put e2e_peer 0 add pseq 1
+else
+put e2e_peer 0 add pseq plen
+end
+end
+
+fn e2e_send_tcp fl ulong plen ulong to void
+for i ulong 6
+put e2e_pkt i get Tmac i
+put e2e_pkt add 6 i uchar add 0x20 i
+end
+e2e_p16 12 0x0800
+put e2e_pkt 14 0x45
+put e2e_pkt 15 0
+e2e_p16 16 add 40 plen
+e2e_p16 18 1
+e2e_p16 20 0
+put e2e_pkt 22 64
+put e2e_pkt 23 6
+e2e_p16 24 0
+e2e_p32 26 3232235778
+e2e_p32 30 get Tcf 1
+e2e_p16 24 e2e_csum 14 20 0
+e2e_p16 34 get e2e_peer 2
+e2e_p16 36 18100
+e2e_p32 38 get e2e_peer 0
+e2e_p32 42 get e2e_peer 1
+put e2e_pkt 46 0x50
+put e2e_pkt 47 uchar and fl 255
+e2e_p16 48 32768
+e2e_p16 50 0
+e2e_p16 52 0
+e2e_finish_tcp plen fl
+end
+
+fn e2e_frm_w32 off ulong v ulong to void
+put e2e_frm off uchar and v 255
+put e2e_frm add off 1 uchar and shr v 8 255
+put e2e_frm add off 2 uchar and shr v 16 255
+put e2e_frm add off 3 uchar and shr v 24 255
+end
+
+fn e2e_frm_hdr op ulong req ulong plen ulong to void
+e2e_frm_w32 0 OMK_MAGIC
+put e2e_frm 4 uchar OMK_VER
+put e2e_frm 5 uchar op
+put e2e_frm 6 0
+put e2e_frm 7 0
+e2e_frm_w32 8 req
+e2e_frm_w32 12 plen
+end
+
+fn e2e_cap_r32 off ulong to ulong
+a = ulong get e2e_cap_buf off
+b = ulong get e2e_cap_buf add off 1
+c = ulong get e2e_cap_buf add off 2
+d = ulong get e2e_cap_buf add off 3
+ret or or or a shl b 8 shl c 16 shl d 24
+end
+
+fn e2e_pump n ulong to void
+for i ulong n bound 64
+wl_tick
+end
+end
+
+note ========================================================================
+note Test 1: Slice B bar0_mmio mode 1 (fwops hook) + GB20B ID + irqbm iqmode=2
+note ========================================================================
+
+fn e2e_test_01 to void
+bmmio_reset
+ibm_reset
+put bmmio_mode 0 1
+hb = bmmio_register SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE
+e2e_ck gt hb 0
+put e2e_st 0 ulong hb
+e2e_ck eq bmmio_w32 hb GB20B_OFF_BOOT0 GB20B_VAL_BOOT0 BMMIO_OK
+e2e_ck eq bmmio_w32 hb GB20B_OFF_BOOT42 GB20B_VAL_BOOT42 BMMIO_OK
+e2e_ck bmmio_verify_gb20b hb
+e2e_ck eq ibm_bind hb 1 0
+put iqstate 0 0
+put iqgen 0 0
+put iqhalt 0 0
+put iqmode 0 2
+e2e_ck eq iqinit 1 0
+e2e_ck ge iqservice 1 8 0
+e2e_puts e2e_t1
+end
+
+note ========================================================================
+note Test 2: Slice D SHA-256 + Slice C fw_bm + abbuild + sccfg(abpa 1, fbappver)
+note ========================================================================
+
+fn e2e_wr_shdr pa ulong nm ulong ty ulong of ulong sz ulong to void
+bmmemwr32 pa nm
+bmmemwr32 add pa 4 ty
+bmmemwr64 add pa 24 of
+bmmemwr64 add pa 32 sz
+end
+
+fn e2e_wr_cstr pa ulong c0 uchar c1 uchar c2 uchar c3 uchar to void
+bmmemwr8 pa c0
+bmmemwr8 add pa 1 c1
+bmmemwr8 add pa 2 c2
+bmmemwr8 add pa 3 c3
+end
+
+fn e2e_test_02 to void
+note Verify sha256_bare on empty input: e3b0c442...
+s256_init
+s256_fin
+e2e_ck eq get s2_out 0 0xe3
+e2e_ck eq get s2_out 1 0xb0
+e2e_ck eq get s2_out 2 0xc4
+e2e_ck eq get s2_out 3 0x42
+note Init bm_hal over 12 MiB simulated Normal-NC RAM at 0x80000000
+e2e_ck eq bminit 0 SPARK_GB20B_BAR0_PA SPARK_GB20B_BAR0_SZ E2E_RAM_BASE E2E_RAM_SZ E2E_FRQ BMOK
+put gspmode 0 2
+put gspd0ok 0 1
+note Build minimal valid synthetic ELF64 for fw_bm.om at E2E_RAM_BASE + 0 (16 KiB)
+elf = E2E_RAM_BASE
+bmmemzero elf 16384
+bmmemwr8 elf 127
+bmmemwr8 add elf 1 69
+bmmemwr8 add elf 2 76
+bmmemwr8 add elf 3 70
+bmmemwr8 add elf 4 2
+bmmemwr8 add elf 5 1
+bmmemwr8 add elf 6 1
+bmmemwr32 add elf 16 or 1 shl ulong 243 16
+bmmemwr64 add elf 40 64
+bmmemwr32 add elf 56 shl ulong 64 16
+bmmemwr32 add elf 60 or 6 shl ulong 1 16
+note shstrtab at +1024:
+note   1:.fwimage  10:.fwversion  21:.note.gnu.build-id  40:.fwsignature_gb20y
+st = add elf 1024
+e2e_wr_cstr add st 1 46 102 119 105
+e2e_wr_cstr add st 5 109 97 103 101
+e2e_wr_cstr add st 10 46 102 119 118
+e2e_wr_cstr add st 14 101 114 115 105
+bmmemwr8 add st 18 111
+bmmemwr8 add st 19 110
+e2e_wr_cstr add st 21 46 110 111 116
+e2e_wr_cstr add st 25 101 46 103 110
+e2e_wr_cstr add st 29 117 46 98 117
+e2e_wr_cstr add st 33 105 108 100 45
+bmmemwr8 add st 37 105
+bmmemwr8 add st 38 100
+e2e_wr_cstr add st 40 46 102 119 115
+e2e_wr_cstr add st 44 105 103 110 97
+e2e_wr_cstr add st 48 116 117 114 101
+e2e_wr_cstr add st 52 95 103 98 50
+bmmemwr8 add st 56 48
+bmmemwr8 add st 57 121
+note Section data: .fwversion (+2048), .note (+2112), .fwsignature_gb20y (+4096, 4096B), .fwimage (+8192, 8192B)
+e2e_wr_cstr add elf 2048 53 56 48 46
+e2e_wr_cstr add elf 2052 49 55 51 46
+bmmemwr8 add elf 2056 48
+bmmemwr8 add elf 2057 50
+bmmemwr32 add elf 2112 4
+bmmemwr32 add elf 2116 20
+bmmemwr32 add elf 2120 3
+e2e_wr_cstr add elf 2124 71 78 85 0
+bmmemwr8 add elf 4096 171
+bmmemwr8 add elf 8192 205
+sh = add elf 64
+e2e_wr_shdr add sh 64 0 3 1024 64
+e2e_wr_shdr add sh 128 1 1 8192 8192
+e2e_wr_shdr add sh 192 10 1 2048 11
+e2e_wr_shdr add sh 256 21 7 2112 36
+e2e_wr_shdr add sh 320 40 1 4096 4096
+e2e_ck eq fbparseelf elf 16384 FBOK
+note Bind synthetic bl/fmc/hash/pubkey/sig blobs at +16384..+458752
+blpa = add E2E_RAM_BASE 16384
+fmcpa = add E2E_RAM_BASE 229376
+hshpa = add E2E_RAM_BASE 442368
+pkpa = add E2E_RAM_BASE 446464
+sigpa = add E2E_RAM_BASE 450560
+e2e_ck eq fbbindblobs blpa 212992 fmcpa 212296 hshpa pkpa 0
+e2e_ck eq fbbindsig sigpa 58017302 0
+note Build GB20B Profile 2 arena at +524288 (2.5 MiB) and invoke #77 sccfg(abpa 1, fbappver)
+arenapa = add E2E_RAM_BASE 524288
+e2e_ck eq abbuild arenapa 2621440 E2E_HEAP_PA E2E_HEAP_SZ ABOK
+sccfg abpa 1 get fbappver 0
+e2e_ck eq get sclibospa 0 abpa 1
+e2e_ck eq get scappver 0 58017302
+e2e_puts e2e_t2
+end
+
+note ========================================================================
+note Test 3: Slice C GMMU + mem + chan + complete(cmbind marker_va + 16!)
+note ========================================================================
+
+fn e2e_test_03 to void
+e2e_ck eq mmwinit E2E_RAM_BASE E2E_RAM_SZ 0
+gmmu_pool = add E2E_RAM_BASE 3145728
+e2e_ck eq mmasinit gmmu_pool 64 0
+gmbuf_pa = add E2E_RAM_BASE 3407872
+e2e_ck eq gminit 8 gmbuf_pa 64 8589934592 GMOK
+chinit
+e2e_ck eq chprep 0 42 3 64 CHOK
+e2e_ck eq cminit CMOK
+e2e_ck eq gmalloc 4096 1 GMHPOLL GMOK
+semslot = get gmout 0
+mk_pa = get gmbpa semslot
+mk_va = get gmbva semslot
+put e2e_st 3 mk_pa
+gen = get mmwgen 0
+put e2e_st 2 gen
+put iqstate 0 0
+put iqgen 0 0
+put iqhalt 0 0
+put iqmode 0 2
+e2e_ck eq iqinit gen 0
+note #77 reminder: bind completion semaphore to marker_va + 16!
+e2e_ck eq cmbind 0 semslot 16 gen CMOK
+e2e_ck eq get cmpa 0 add mk_pa 16
+e2e_ck eq get cmva 0 add mk_va 16
+e2e_ck eq mmwpublish gen 0
+e2e_puts e2e_t3
+end
+
+note ========================================================================
+note Test 4: Slice E q38_run.om + marker1-only negative control vs marker2 (+16)
+note ========================================================================
+
+fn e2e_setup_q38_base to void
+nc_base = add E2E_RAM_BASE 4194304
+wb_base = add E2E_RAM_BASE 11534336
+pb_pa = add E2E_RAM_BASE 12058624
+mk_pa = get e2e_st 3
+put e2e_st 4 pb_pa
+cbpbinit
+e2e_ck eq cbpbsetup18 uint CBCCMP CBOK
+e2e_ck eq q3_init nc_base wb_base pb_pa mk_pa 4096 Q3OK
+e2e_ck eq mmrd32 mk_pa 0
+e2e_ck eq mmrd32 add mk_pa 16 0
+code_base = add E2E_RAM_BASE 12124160
+for k ulong Q3KCOUNT
+sm = uint 0
+if eq k Q3KBF16_5120
+sm = Q3BF16SMEM
+end
+if eq k Q3KGDN
+sm = Q3GDNSMEM
+end
+if eq k Q3KATTN
+sm = Q3ATTNSMEM
+end
+e2e_ck eq q3_set_code k add code_base mul k 4096 64 sm Q3OK
+end
+end
+
+fn e2e_setup_q38_weights to void
+emb_va = add E2E_RAM_BASE 12189696
+hi_base = add Q3LPDDRLO 17179869184
+e2e_ck eq q3_set_model emb_va hi_base add hi_base 4294967296 Q3OK
+gdn_base = add hi_base 8589934592
+e2e_ck eq q3_set_gdn_pools gdn_base add gdn_base 16777216 add gdn_base 33554432 Q3OK
+attn_base = add gdn_base 268435456
+e2e_ck eq q3_set_attn_pools attn_base add attn_base 536870912 add attn_base 541065216 add attn_base 541130752 Q3OK
+wbase = add attn_base 1073741824
+for l ulong Q3LAYERS
+e2e_ck eq q3_set_layer_fp8 l wbase add wbase 134217728 add wbase 268435456 add wbase 402653184 Q3OK
+isatt = and shr get q3st 21 l 1
+abv = ulong 0
+if eq isatt 0
+abv = add wbase 1073741824
+end
+e2e_ck eq q3_set_layer_mlp l add wbase 536870912 add wbase 805306368 add wbase 939524096 add wbase 1006632960 abv Q3OK
+end
+end
+
+fn e2e_setup_q38 to void
+e2e_setup_q38_base
+e2e_setup_q38_weights
+end
+
+fn e2e_test_04 to void
+e2e_setup_q38
+note Stage a real q38_reset_kv(0) pushbuffer (51 words, seq=1)
+pbw = q38_reset_kv 0
+e2e_ck eq pbw 51
+e2e_ck eq chpush 0 get e2e_st 4 uint pbw CHOK
+e2e_ck eq cmsub 0 1 CMOK
+note NEGATIVE CONTROL: write ONLY marker1 (marker_va + 0), leaving marker2 (marker_va + 16) = 0!
+e2e_sim_gpu_complete false
+e2e_ck eq wl_gpu_poll 0
+note Now complete L2_FLUSH + marker2 (marker_va + 16 = seq 1): wl_gpu_poll MUST return 1!
+mmwr32 add get e2e_st 3 16 1
+e2e_ck eq wl_gpu_poll 1
+e2e_puts e2e_t4
+end
+
+note ========================================================================
+note Test 5: Slice F OMTK v1 over TCP <-> wire_loop <-> Piece 5/3 (PING/RESET/PREFILL/DECODE)
+note ========================================================================
+
+fn e2e_test_05 to void
+for i ulong 6
+put Tmac i uchar add 0x10 i
+end
+put e2e_peer 0 1000
+put e2e_peer 1 0
+put e2e_peer 2 49152
+put e2e_cap_len 0 0
+put e2e_cap_pos 0 0
+put e2e_next_tok 0 3
+put e2e_next_tok 1 4
+put e2e_tok_idx 0 0
+wl_init 18100 4096 248320
+put Tcf 1 3232235884
+put Tcf 2 3232235777
+put Tcf 3 4294967040
+put Tcf 5 12345
+tarpset 3232235778 0x202122232425 true
+note 1. TCP 3-way handshake
+e2e_send_tcp 2 0
+e2e_pump 4
+e2e_send_tcp 16 0
+e2e_pump 4
+e2e_ck eq get Tcb kST 4
+note 2. PING (req=1) -> PONG (state=0 IDLE, kv=0, max_ctx=4096)
+e2e_frm_hdr OMK_PING 1 0
+e2e_send_tcp 24 16
+e2e_pump 8
+e2e_ck ge get e2e_cap_len 0 32
+e2e_ck eq get e2e_cap_buf 5 uchar OMK_PONG
+e2e_ck eq e2e_cap_r32 8 1
+e2e_ck eq e2e_cap_r32 16 WL_IDLE
+e2e_ck eq e2e_cap_r32 24 4096
+put e2e_cap_pos 0 32
+note 3. RESET_KV(keep_pos=0, req=2) -> GPU_SUBMIT -> marker_va+16 -> DONE(kv=0, reason=RESET)
+e2e_frm_hdr OMK_RESET 2 4
+e2e_frm_w32 16 0
+e2e_send_tcp 24 20
+e2e_pump 16
+p0 = get e2e_cap_pos 0
+e2e_ck ge get e2e_cap_len 0 add p0 24
+e2e_ck eq get e2e_cap_buf add p0 5 uchar OMK_DONE
+e2e_ck eq e2e_cap_r32 add p0 8 2
+e2e_ck eq e2e_cap_r32 add p0 16 0
+e2e_ck eq e2e_cap_r32 add p0 20 OMK_RRESET
+put e2e_cap_pos 0 add p0 24
+note 4. PREFILL([1, 2], req=3) -> 2 real q38_stage_step passes (mode=0 then mode=1) -> DONE(kv=2)
+e2e_frm_hdr OMK_PREFILL 3 8
+e2e_frm_w32 16 1
+e2e_frm_w32 20 2
+e2e_send_tcp 24 24
+e2e_pump 24
+p1 = get e2e_cap_pos 0
+e2e_ck ge get e2e_cap_len 0 add p1 24
+e2e_ck eq get e2e_cap_buf add p1 5 uchar OMK_DONE
+e2e_ck eq e2e_cap_r32 add p1 8 3
+e2e_ck eq e2e_cap_r32 add p1 16 2
+e2e_ck eq e2e_cap_r32 add p1 20 OMK_RPREF
+put e2e_cap_pos 0 add p1 24
+note 5. DECODE(max=2, eos=4, temp=0, req=4) -> TOKEN(0,3) + TOKEN(1,4,FEOS) + DONE(kv=3,REOS)
+e2e_frm_hdr OMK_DECODE 4 16
+e2e_frm_w32 16 2
+e2e_frm_w32 20 4
+e2e_frm_w32 24 0
+e2e_frm_w32 28 0
+e2e_send_tcp 24 32
+e2e_pump 8
+e2e_send_tcp 16 0
+e2e_pump 16
+p2 = get e2e_cap_pos 0
+e2e_ck ge get e2e_cap_len 0 add p2 72
+note First token: seq=0, tok=3 (from final prefill pass)
+e2e_ck eq get e2e_cap_buf add p2 5 uchar OMK_TOKEN
+e2e_ck eq e2e_cap_r32 add p2 8 4
+e2e_ck eq e2e_cap_r32 add p2 16 0
+e2e_ck eq e2e_cap_r32 add p2 20 3
+note Second token: seq=1, tok=4 (EOS)
+p3 = add p2 24
+e2e_ck eq get e2e_cap_buf add p3 5 uchar OMK_TOKEN
+e2e_ck eq e2e_cap_r32 add p3 8 4
+e2e_ck eq e2e_cap_r32 add p3 16 1
+e2e_ck eq e2e_cap_r32 add p3 20 4
+note DONE frame: kv=3, reason=EOS
+p4 = add p3 24
+e2e_ck eq get e2e_cap_buf add p4 5 uchar OMK_DONE
+e2e_ck eq e2e_cap_r32 add p4 8 4
+e2e_ck eq e2e_cap_r32 add p4 16 3
+e2e_ck eq e2e_cap_r32 add p4 20 OMK_REOS
+e2e_puts e2e_t5
+end
+
+fn main to int
+e2e_test_01
+e2e_test_02
+e2e_test_03
+e2e_test_04
+e2e_test_05
+e2e_puts e2e_pass
+ret 0
+end

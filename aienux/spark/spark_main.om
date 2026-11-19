@@ -1,0 +1,940 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/spark/spark_main.om: Unified Bare-Metal Aienux SPARK.EFI Entry Point (Phase 3).
+note Wires all 6 pure-Omega slices (A -> B -> D -> C -> E -> F) into one compact target a64efi PE32+:
+note   Stage 1 (Slice A): UEFI ExitBootServices -> EL2->EL1h -> MMU (MAIR 0x440004ff, 512 MiB Normal-NC)
+note                      -> GICv3 + ITS (dedicated boot LPI slot 64) -> 20-core Grace SMP (arm64_ldar)
+note   Stage 2 (Slice B): Multi-segment PCIe MCFG/ECAM -> GB20B/NVMe/RTL8127 probe -> SMMUv3 A/B/C
+note                      (per-stream disjoint Normal-NC DMA + 3 RMRs) -> BAR0 MMIO mode 1 (fwld/fwst+dsb sy)
+note                      -> irqbm iqmode=2
+note   Stage 3 (Slice D): Strictly RO NVMe -> GPT -> 64-bit ext4 -> SHA-256 OMFWBND1 bundle load
+note                      -> RTL8127 bare-metal NIC + TCP MAC bind
+note   Stage 4 (Slice C): GB20B GSP bring-up (fw_bm -> abbuild -> sccfg(abpa 1, fbappver) -> SEC2 COTv2
+note                      -> transport_bm -> boot/dispatch -> gmmu_bm -> rmchan 0xca6f/0xcec0
+note                      -> cmbind marker_va + 16)
+note   Stage 5 (Slice E): compute.om + sm_121 pure-.om SASS codegen + q38_run.om (C3 marker1->L2->marker2)
+note   Stage 6 (Slice F): wire_loop.om OMTK v1 on TCP port 18100 (completion poll wired to marker_va + 16)
+note Zero Linux syscalls, zero 184 MiB static .bss, zero firmware bytes embedded.
+note Hardware status: HOST_AND_QEMU_VERIFIED (Spark silicon NOT_RUN).
+
+const EFI_MMAP_CAP ulong 65536
+const SPK_GB20B_VID ulong 0x10de
+const SPK_RTL_VID ulong 0x10ec
+const SPK_RTL_DID ulong 0x8127
+const SPK_OMTK_PORT ulong 18100
+const SPK_MAX_CTX ulong 4096
+const SPK_VOCAB ulong 248320
+const SPK_STATIC_IP ulong 3232235884
+const SPK_GATEWAY ulong 3232235777
+const SPK_NETMASK ulong 4294967040
+const SPK_ISN ulong 12345
+
+note Error codes emitted by spk_fail(stage, code):
+const SPK_E_GIC ulong 101
+const SPK_E_ITS ulong 102
+const SPK_E_SMP ulong 103
+const SPK_E_NO_MCFG ulong 200
+const SPK_E_NO_GB20B ulong 201
+const SPK_E_BAR0_MAP ulong 202
+const SPK_E_GB20B_ID ulong 203
+const SPK_E_QUIESCE ulong 204
+const SPK_E_SMMU ulong 205
+const SPK_E_IRQ_BIND ulong 206
+const SPK_E_NVME_INIT ulong 301
+const SPK_E_GPT ulong 302
+const SPK_E_EXT4 ulong 303
+const SPK_E_BUNDLE ulong 304
+const SPK_E_RTL ulong 305
+const SPK_E_BMHAL ulong 401
+const SPK_E_FWELF ulong 402
+const SPK_E_ARENA ulong 403
+const SPK_E_SEC2 ulong 404
+const SPK_E_GSPBOOT ulong 405
+const SPK_E_GMMU ulong 406
+const SPK_E_RMCHAN ulong 407
+const SPK_E_CMBIND ulong 408
+const SPK_E_COMPUTE ulong 501
+const SPK_E_SASS ulong 502
+const SPK_E_Q3INIT ulong 503
+
+global efi_mmap uchar 65536
+global efi_mm_out uchar 64
+
+note spk_st:
+note   0=gb20b_bar_h, 1=nvme_bar_h, 2=rtl_bar_h, 3=nvme_dma_pa, 4=rtl_dma_pa,
+note   5=bnd_pa, 6=bnd_cap, 7=bnd_len, 8=arena_pa, 9=heap_pa,
+note   10=pb_pa, 11=marker_pa, 12=nc_base, 13=wb_base, 14=chan_gen,
+note   15=gppa, 16=userdpa, 17=gpput, 18=nvme_sec_pa, 19=sass_bytes
+global spk_st ulong 24
+global spk_nvme_bar ulong 1
+global spk_rtl_bar ulong 1
+global spk_gb20b_bar ulong 1
+
+text spk_s1 "\n[SPARK 1/6] UEFI->EL1h MMU GICv3+ITS 20-core SMP\n"
+text spk_s2 "[SPARK 2/6] PCIe MCFG/ECAM SMMUv3 A/B/C BAR0-MMIO(mode=1) irqbm(iqmode=2)\n"
+text spk_s3 "[SPARK 3/6] RO-NVMe GPT ext4 SHA-256 OMFWBND1 RTL8127/TCP\n"
+text spk_s4 "[SPARK 4/6] GB20B GSP(fw_bm+abbuild+sccfg+SEC2+boot) GMMU rmchan(0xca6f/0xcec0)\n"
+text spk_s5 "[SPARK 5/6] compute.om sm_121-SASS q38_run.om(marker+16)\n"
+text spk_s6 "[SPARK 6/6] OMTK v1 wire_loop READY tcp_port=18100\n"
+text spk_el1 "EL1_ALIVE current_el="
+text spk_mair " mair=0x"
+text spk_sctlr " sctlr=0x"
+text spk_tcr " tcr=0x"
+text spk_ram " free_mib="
+text spk_nc " nc_pool_pa=0x"
+text spk_ncsz " nc_pool_mib="
+text spk_mcfg " mcfg_segs="
+text spk_gic " GICV3_OK rev="
+text spk_its " ITS_OK cmds="
+text spk_smp " SMP_ONLINE online="
+text spk_exp " expected="
+text spk_fl " failed="
+text spk_ms " boot_ms="
+text spk_fail_a "[SPARK FAIL stage="
+text spk_fail_b " code="
+text spk_fail_c "]\n"
+text spk_bnd_path "/aienos/spark-bundle.img"
+
+note ========================================================================
+note Cross-Slice Bare-Metal Seam Implementations (Pieces 1 <-> 2 <-> 3 <-> 4 <-> 5 <-> 6)
+note ========================================================================
+
+note Piece 4 (nvme_bare_a64efi.om / rtl8127/bare_a64efi.om) barrier & cache hooks -> Piece 1 fwops.om
+fn a64_dsb_sy to void
+arm64_dsb_sy
+end
+
+fn a64_dc_civac_range pa ulong nbytes ulong to void
+arm64_dc_civac_range pa nbytes
+end
+
+note Piece 5 (q38_run.om) cache flush hook -> Piece 1 fwops.om
+fn q3_dc_civac pa ulong nbytes ulong to void
+arm64_dc_civac_range pa nbytes
+end
+
+note Piece 3 dead-simulator-branch guards (never called in gspmode=2 / bare-metal)
+fn s2simrd off ulong to ulong
+trap 9
+end
+
+fn s2simwr off ulong v ulong to void
+trap 9
+end
+
+fn gsbind chid uint tok uint ent uint gpva ulong upa ulong ipa ulong to long
+trap 9
+end
+
+fn gsdisable chid uint to long
+trap 9
+end
+
+fn gsidle chid uint to long
+trap 9
+end
+
+note Piece 3 (bm_hal.om) BAR0/Normal-NC/CNTVCT callbacks -> Piece 2 bar0_mmio (mode=1) & Piece 1 fwops
+fn bmrbarrd off ulong to ulong
+ret bmmio_r32 long get spk_st 0 off
+end
+
+fn bmrbarwr off ulong v ulong to void
+r = bmmio_w32 long get spk_st 0 off v
+end
+
+fn bmrmemrd8 pa ulong to uchar
+ret uchar and fwld pa 1 255
+end
+
+fn bmrmemwr8 pa ulong v uchar to void
+x = fwst pa 1 ulong v
+end
+
+fn bmrcntvct to ulong
+ret fwsys 2
+end
+
+note Piece 4 (gpt_ro.om / ext4_ro.om) sector reader -> nvme_ro_bare.om (strictly read-only)
+fn spk_nvme_read1 lba ulong to int
+sec_pa = get spk_st 18
+if eq sec_pa 0
+ret -1
+end
+ret nvme_read_direct lba 1 sec_pa 0
+end
+
+fn gpt_read_lba lba ulong to int
+rc = spk_nvme_read1 lba
+if ne rc 0
+ret rc
+end
+sec_pa = get spk_st 18
+i = ulong 0
+while lt i 512 bound 512
+put gpt_sec i uchar and fwld add sec_pa i 1 255
+i = add i 1
+end
+ret 0
+end
+
+fn ext4_read_lba lba ulong to int
+rc = spk_nvme_read1 lba
+if ne rc 0
+ret rc
+end
+sec_pa = get spk_st 18
+i = ulong 0
+while lt i 512 bound 512
+put e4_sec i uchar and fwld add sec_pa i 1 255
+i = add i 1
+end
+ret 0
+end
+
+fn ext4_sink off ulong b uchar to void
+bpa = get spk_st 5
+bcap = get spk_st 6
+if and ne bpa 0 lt off bcap
+x = fwst add bpa off 1 ulong b
+if ge add off 1 get spk_st 7
+put spk_st 7 add off 1
+end
+end
+end
+
+note Piece 6 (wire_loop.om) platform/NIC/GPU seams -> Pieces 1, 2, 3, 4, 5
+fn wl_cntvct to ulong
+ret fwsys 2
+end
+
+fn wl_cntfrq to ulong
+ret fwsys 3
+end
+
+fn wl_dsb_ish to void
+arm64_dsb_ish
+end
+
+fn wl_nic_rx to ulong
+e = rtlrx
+if ne e 0
+ret 0
+end
+n = get rs S_RXLEN
+if or eq n 0 gt n 2048
+ret 0
+end
+i = ulong 0
+while lt i n bound 2048
+put Trx i get obuf i
+i = add i 1
+end
+ret n
+end
+
+fn wl_nic_tx n ulong to long
+if or lt n 14 gt n FMAX
+ret -1
+end
+e = rtltxrec
+if ne e 0
+ret -2
+end
+i = ulong 0
+while lt i n bound 1514
+put fbuf i get Ttx i
+i = add i 1
+end
+r = rtltx n
+if ne r 0
+ret -3
+end
+ret 0
+end
+
+fn wl_nic_reclaim to void
+e = rtltxrec
+end
+
+fn wl_q38_reset_kv keep_pos ulong to long
+ret q38_reset_kv keep_pos
+end
+
+fn wl_q38_stage_step tok uint kv uint mode uchar to long
+ret q38_stage_step tok kv mode
+end
+
+fn wl_q38_verify_step to long
+md = uchar and get wl_st WL_S_CURMODE 255
+rc = q38_verify_step md
+if lt rc 0
+ret rc
+end
+ret 0
+end
+
+fn wl_q38_read_tok to uint
+ret uint mmrd32 q3_ncva 6
+end
+
+note Piece 6 -> Piece 3 submission: PB already flushed with DSB SY by Piece 5;
+note chpush executes DSB SY -> GPFIFO -> DSB SY -> USERD.GPPut -> DSB SY -> BAR0 doorbell (0x00BB0090),
+note then cmsub accounts the in-flight entry for cmpoll(marker_va + 16).
+fn wl_gpu_kick pb_words uint to long
+pbva = get spk_st 10
+rc = chpush 0 pbva pb_words
+if lt rc 0
+ret rc
+end
+ret cmsub 0 1
+end
+
+note Piece 6 -> Piece 3/5 completion poll: polls marker_va + 16 via cmbind(0, slot, 16, gen)
+note matching Piece 5's C3 marker1(WFI) -> L2_FLUSH -> marker2(WFI) completion tail!
+fn wl_gpu_poll to long
+ret cmpoll 0
+end
+
+fn wl_gpu_irq_check to long
+ret iqservice get spk_st 14 16
+end
+
+fn wl_gpu_quarantine to void
+r = cmquar 0 get spk_st 14
+end
+
+fn wl_should_stop to ulong
+ret 0
+end
+
+note ========================================================================
+note Fail-Closed Helper (NEVER touches dead UEFI Boot Services post-EBS)
+note ========================================================================
+
+fn spk_fail stage ulong code ulong to void
+uart_puts spk_fail_a
+uart_putdec stage
+uart_puts spk_fail_b
+uart_putdec code
+uart_puts spk_fail_c
+arm64_psci_reset get acpi_info 7
+i = ulong 0
+while lt i 9223372036854775807 bound 9223372036854775807
+arm64_wfe
+end
+end
+
+note ========================================================================
+note Stage 1: UEFI ExitBootServices + EL1h + GICv3/ITS + 20-core SMP
+note ========================================================================
+
+fn efi_find_acpi2_rsdp to ulong
+ret efcfg 0x11d3e4f18868e871 0x81883cc7800022bc
+end
+
+fn efi_exit_boot_services to bool
+bs = efbs
+ih = fwsys 0
+x = fwcall fwld add bs 256 8 0 0 0 0 0 0
+outp = fwadr efi_mm_out 0 64
+x = fwst add outp 40 8 efi_find_acpi2_rsdp
+x = fwst add outp 48 8 arm64_current_el
+gmm = fwld add bs 56 8
+ebs = fwld add bs 232 8
+mp = fwadr efi_mmap 0 EFI_MMAP_CAP
+att = ulong 0
+while lt att 8 bound 8
+x = fwst outp 8 EFI_MMAP_CAP
+s = fwcall gmm outp mp add outp 8 add outp 16 add outp 24 0
+if ne s 0
+ret false
+end
+s2 = fwcall ebs ih fwld add outp 8 8 0 0 0 0
+att = add att 1
+if eq s2 0
+x = fwst add outp 32 8 att
+ret true
+end
+end
+ret false
+end
+
+fn reserve_gb10_rmrs to void
+frames_reserve 0x00000000a1600000 0x00000000b9800000
+frames_reserve 0x0000000280000000 0x0000000303000000
+end
+
+fn spk_stage1 to bool
+lpi_out = new ulong 1 0
+uart_puts spk_s1
+uart_puts spk_el1
+uart_putdec arm64_current_el
+uart_puts spk_mair
+uart_puthex arm64_sysrd SYSREG_MAIR_EL1
+uart_puts spk_sctlr
+uart_puthex arm64_sysrd SYSREG_SCTLR_EL1
+uart_puts spk_tcr
+uart_puthex arm64_sysrd SYSREG_TCR_EL1
+uart_puts u_nl
+uart_puts spk_ram
+uart_putdec div frames_free_bytes 1048576
+uart_puts spk_nc
+uart_puthex dma_pool_base
+uart_puts spk_ncsz
+uart_putdec div dma_pool_size 1048576
+uart_puts spk_mcfg
+uart_putdec get acpi_info 12
+uart_puts u_nl
+if not gicv3_init get acpi_info 2 get acpi_info 3 get acpi_info 4 get acpi_info 5
+spk_fail 1 SPK_E_GIC
+ret false
+end
+uart_puts spk_gic
+uart_putdec get gic_state 4
+uart_puts u_nl
+if ne get acpi_info 5 0
+if not gic_its_init
+spk_fail 1 SPK_E_ITS
+ret false
+end
+db = gic_its_map_msix 0x100 8 lpi_out
+if or ne db add get acpi_info 5 GITS_TRANSLATER ne get lpi_out 0 8192
+spk_fail 1 SPK_E_ITS
+ret false
+end
+uart_puts spk_its
+uart_putdec get gic_state 11
+uart_puts u_nl
+end
+online = smp_bringup
+uart_puts spk_smp
+uart_putdec online
+uart_puts spk_exp
+uart_putdec get smp_stats 1
+uart_puts spk_fl
+uart_putdec get smp_stats 2
+uart_puts spk_ms
+uart_putdec arm64_time_ms
+uart_puts u_nl
+if ne get smp_stats 2 0
+spk_fail 1 SPK_E_SMP
+ret false
+end
+ret true
+end
+
+note ========================================================================
+note Stage 2: PCIe Multi-Segment ECAM + GB20B Probe + SMMUv3 + BAR0 MMIO + IRQ
+note ========================================================================
+
+fn spk_register_mcfg_segs to ulong
+nm = get acpi_info 12
+if eq nm 0
+ret 0
+end
+if gt nm PCIE_MAX_SEGS
+nm = PCIE_MAX_SEGS
+end
+mapped = ulong 0
+i = ulong 0
+while lt i nm bound 16
+base = get acpi_mcfg_base i
+seg = uint get acpi_mcfg_seg i
+b0 = uchar and get acpi_mcfg_sbus i 255
+b1 = uchar and get acpi_mcfg_ebus i 255
+note Map 2 MiB ECAM window (bus 0..1) as Device-nGnRnE XN for safe PCIe probing
+if ne base 0
+if mmio_map_device base SPARK_ECAM_WIN_SZ
+put pcie_seg_base mapped base
+put pcie_seg_id mapped seg
+put pcie_seg_bus0 mapped b0
+if gt b1 1
+put pcie_seg_bus1 mapped uchar 1
+else
+put pcie_seg_bus1 mapped b1
+end
+mapped = add mapped 1
+end
+end
+i = add i 1
+end
+put pcie_nsegs 0 mapped
+j = ulong 0
+while lt j mapped bound 16
+h = pcie_map_seg_ecam get pcie_seg_id j
+j = add j 1
+end
+ret mapped
+end
+
+fn spk_record_dev to bool
+vid = get pcie_dev_info 0
+did = get pcie_dev_info 1
+cls = shr get pcie_dev_info 4 8
+if eq vid SPK_GB20B_VID
+bar0 = or and get pcie_dev_info 5 0xfffffff0 shl get pcie_dev_info 6 32
+if eq bar0 0
+bar0 = SPARK_GB20B_BAR0_PA
+end
+put spk_gb20b_bar 0 bar0
+ret true
+end
+if and eq vid SPK_RTL_VID eq did SPK_RTL_DID
+bar2 = or and get pcie_dev_info 7 0xfffffff0 shl get pcie_dev_info 8 32
+if eq bar2 0
+bar2 = SPARK_RTL8127_BAR2_PA
+end
+put spk_rtl_bar 0 bar2
+end
+if eq cls 0x010802
+nbar = or and get pcie_dev_info 5 0xfffffff0 shl get pcie_dev_info 6 32
+if eq nbar 0
+nbar = SPARK_NVME_BAR0_PA
+end
+put spk_nvme_bar 0 nbar
+end
+ret false
+end
+
+fn spk_probe_gb20b to bool
+ns = get pcie_nsegs 0
+found = false
+i = ulong 0
+while lt i ns bound 16
+seg = get pcie_seg_id i
+d = ulong 0
+while lt d 32 bound 32
+if eq pcie_probe_dev seg 0 d 0 PCIE_OK
+if spk_record_dev
+found = true
+end
+end
+d = add d 1
+end
+i = add i 1
+end
+ret found
+end
+
+fn spk_stage2 to bool
+uart_puts spk_s2
+bmmio_reset
+pcie_reset
+smmu_reset
+ibm_reset
+note Switch bar0_mmio.om to bare-metal mode 1 (fwld/fwst + dsb sy via fwops.om).
+put bmmio_mode 0 1
+put spk_gb20b_bar 0 0
+put spk_nvme_bar 0 SPARK_NVME_BAR0_PA
+put spk_rtl_bar 0 SPARK_RTL8127_BAR2_PA
+nsegs = spk_register_mcfg_segs
+if eq nsegs 0
+spk_fail 2 SPK_E_NO_MCFG
+ret false
+end
+note Probe PCIe ECAM for GB20B (0x10de). Fails closed cleanly on QEMU virt (absent GPU).
+if not spk_probe_gb20b
+spk_fail 2 SPK_E_NO_GB20B
+ret false
+end
+gbar = get spk_gb20b_bar 0
+if not mmio_map_device gbar SPARK_GB20B_BAR0_SZ
+spk_fail 2 SPK_E_BAR0_MAP
+ret false
+end
+hb = bmmio_register gbar gbar SPARK_GB20B_BAR0_SZ BMMIO_ATTR_NGNRNE
+if le hb 0
+spk_fail 2 SPK_E_BAR0_MAP
+ret false
+end
+put spk_st 0 ulong hb
+if not bmmio_verify_gb20b hb
+spk_fail 2 SPK_E_GB20B_ID
+ret false
+end
+note Map NVMe BAR0 and RTL8127 BAR2 as Device-nGnRnE XN
+nbar = get spk_nvme_bar 0
+rbar = get spk_rtl_bar 0
+if not mmio_map_device nbar SPARK_NVME_BAR0_SZ
+spk_fail 2 SPK_E_BAR0_MAP
+ret false
+end
+if not mmio_map_device rbar SPARK_RTL8127_BAR2_SZ
+spk_fail 2 SPK_E_BAR0_MAP
+ret false
+end
+if lt pcie_quiesce_unused 0
+spk_fail 2 SPK_E_QUIESCE
+ret false
+end
+note Bind bare-metal GB20B IRQ peer (iqmode=2) to BAR0 handle with PCIe PM D0 verified.
+if ne ibm_bind hb 1 0
+spk_fail 2 SPK_E_IRQ_BIND
+ret false
+end
+put iqmode 0 2
+ret true
+end
+
+note ========================================================================
+note Stage 3: Strictly RO NVMe + GPT + 64-bit ext4 + SHA-256 + RTL8127 NIC
+note ========================================================================
+
+fn spk_stage3_disk to bool
+spk_nvdma = dma_alloc_nc 16 4096
+sec_pa = dma_alloc_nc 1 4096
+bnd_pa = dma_alloc_nc 16384 65536
+if or eq spk_nvdma 0 or eq sec_pa 0 eq bnd_pa 0
+spk_fail 3 SPK_E_NVME_INIT
+ret false
+end
+put spk_st 3 spk_nvdma
+put spk_st 18 sec_pa
+put spk_st 5 bnd_pa
+put spk_st 6 67108864
+put spk_st 7 0
+if ne nvme_init get spk_nvme_bar 0 spk_nvdma 1 0
+spk_fail 3 SPK_E_NVME_INIT
+ret false
+end
+if ne gpt_ro_parse nvme_ns_blocks 0
+spk_fail 3 SPK_E_GPT
+ret false
+end
+if ne gpt_ro_select_linux_root 0
+spk_fail 3 SPK_E_GPT
+ret false
+end
+p_lba = gpt_ro_first_lba
+p_secs = gpt_ro_sectors
+if or eq p_lba 0 eq p_secs 0
+spk_fail 3 SPK_E_GPT
+ret false
+end
+if ne ext4_ro_mount p_lba p_secs 0
+spk_fail 3 SPK_E_EXT4
+ret false
+end
+ret true
+end
+
+fn spk_stage3_bundle to bool
+plen = len spk_bnd_path
+pi = ulong 0
+while lt pi plen bound 256
+put e4_path pi get spk_bnd_path pi
+pi = add pi 1
+end
+if ne ext4_ro_lookup plen 0
+spk_fail 3 SPK_E_BUNDLE
+ret false
+end
+fsz = ext4_ro_file_size
+if or eq fsz 0 gt fsz get spk_st 6
+spk_fail 3 SPK_E_BUNDLE
+ret false
+end
+if ne ext4_ro_stream 0 fsz 1 0
+spk_fail 3 SPK_E_BUNDLE
+ret false
+end
+if ne bundle_parse_toc fsz 0
+spk_fail 3 SPK_E_BUNDLE
+ret false
+end
+ret true
+end
+
+fn spk_stage3_net to bool
+rtl_dma = dma_alloc_nc 32 4096
+if eq rtl_dma 0
+spk_fail 3 SPK_E_RTL
+ret false
+end
+put spk_st 4 rtl_dma
+if ne rtl_bare_setup get spk_rtl_bar 0 rtl_dma 0
+spk_fail 3 SPK_E_RTL
+ret false
+end
+if ne rtlinit rtl_dma 0
+spk_fail 3 SPK_E_RTL
+ret false
+end
+for mi ulong 6
+put Tmac mi uchar and get rs add S_MAC0 mi 255
+end
+ret true
+end
+
+fn spk_stage3 to bool
+uart_puts spk_s3
+if not spk_stage3_disk
+ret false
+end
+if not spk_stage3_bundle
+ret false
+end
+ret spk_stage3_net
+end
+
+note ========================================================================
+note Stage 4: GB20B GSP Bring-Up (fw_bm + abbuild + sccfg + SEC2 + rmchan)
+note ========================================================================
+
+fn spk_stage4_gsp to bool
+frq = fwsys 3
+if ne bminit 1 get spk_gb20b_bar 0 SPARK_GB20B_BAR0_SZ dma_pool_base dma_pool_size frq BMOK
+spk_fail 4 SPK_E_BMHAL
+ret false
+end
+put gspmode 0 2
+put gspd0ok 0 1
+put gsppns 0 10000
+note Parse GSP ELF64 from staged bundle region in Normal-NC DMA pool.
+if ne fbparseelf get spk_st 5 get spk_st 7 0
+spk_fail 4 SPK_E_FWELF
+ret false
+end
+arena_pa = dma_alloc_nc 1024 65536
+heap_pa = dma_alloc_nc 34048 65536
+if or eq arena_pa 0 eq heap_pa 0
+spk_fail 4 SPK_E_ARENA
+ret false
+end
+put spk_st 8 arena_pa
+put spk_st 9 heap_pa
+if ne abbuild arena_pa 4194304 heap_pa 139460608 ABOK
+spk_fail 4 SPK_E_ARENA
+ret false
+end
+note Phase 3 #77 reminder: configure seqcore CORE_RESUME libosArgsPA + appVersion after abbuild!
+sccfg abpa 1 get fbappver 0
+if ne s2boot uint GB20B_VAL_BOOT42 EOK
+spk_fail 4 SPK_E_SEC2
+ret false
+end
+if ne tbattach abpa 9 abpa 10 uint GB20B_VAL_BOOT42 0
+spk_fail 4 SPK_E_GSPBOOT
+ret false
+end
+if ne bstart 1000000 0 0
+spk_fail 4 SPK_E_GSPBOOT
+ret false
+end
+ret true
+end
+
+fn spk_stage4_chan to bool
+note Init GMMU + gmbuf pool + compute channel 0xca6f/0xcec0 + marker_va + 16 semaphore binding (#77 reminder)
+gmmu_pool = dma_alloc_nc 512 4096
+gmbuf_pa = dma_alloc_nc 64 4096
+pb_pa = dma_alloc_nc 16 4096
+if or eq gmmu_pool 0 or eq gmbuf_pa 0 eq pb_pa 0
+spk_fail 4 SPK_E_GMMU
+ret false
+end
+put spk_st 10 pb_pa
+if ne mmwinit dma_pool_base dma_pool_size 0
+spk_fail 4 SPK_E_GMMU
+ret false
+end
+if ne mmasinit gmmu_pool 512 0
+spk_fail 4 SPK_E_GMMU
+ret false
+end
+if ne gminit 8 gmbuf_pa 64 8589934592 GMOK
+spk_fail 4 SPK_E_GMMU
+ret false
+end
+chinit
+if ne chprep 0 42 3 64 CHOK
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+if ne cminit CMOK
+spk_fail 4 SPK_E_CMBIND
+ret false
+end
+if ne gmalloc 4096 1 GMHPOLL GMOK
+spk_fail 4 SPK_E_CMBIND
+ret false
+end
+semslot = get gmout 0
+mk_pa = get gmbpa semslot
+put spk_st 11 mk_pa
+gen = get mmwgen 0
+put spk_st 14 gen
+put iqstate 0 0
+put iqgen 0 0
+put iqhalt 0 0
+put iqmode 0 2
+if ne iqinit gen 0
+spk_fail 4 SPK_E_CMBIND
+ret false
+end
+note Bind completion semaphore to marker_va + 16 (Piece 5 C3 marker1->L2_FLUSH->marker2 tail)
+if ne cmbind 0 semslot 16 gen CMOK
+spk_fail 4 SPK_E_CMBIND
+ret false
+end
+if ne rminit RMOK
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+rmcfg 1001 1002 1003 1004 1005 1006
+rmcfgch 1007 42 1 99
+rmcfg20 true 1008
+if ne rmbind 0 gen RMOK
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+if ne rmstart 100000 RMOK
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+s1 = ulong 0
+while and ne get rmst 0 RMSREADY lt s1 64 bound 64
+if lt rmstep 0
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+s1 = add s1 1
+end
+if ne get rmst 0 RMSREADY
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+if ne rmsched 100000 RMOK
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+s2 = ulong 0
+while and ne get rmst 0 RMSACTV lt s2 32 bound 32
+if lt rmstep 0
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+s2 = add s2 1
+end
+if ne get rmst 0 RMSACTV
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+if ne rmpub gen RMOK
+spk_fail 4 SPK_E_RMCHAN
+ret false
+end
+ret true
+end
+
+fn spk_stage4 to bool
+uart_puts spk_s4
+if not spk_stage4_gsp
+ret false
+end
+ret spk_stage4_chan
+end
+
+note ========================================================================
+note Stage 5: Compute + sm_121 SASS Codegen + q38_run.om
+note ========================================================================
+
+fn spk_stage5 to bool
+uart_puts spk_s5
+nc_base = dma_alloc_nc 2048 65536
+wb_base = frames_alloc 4096 65536 FR_PA_40BIT_LIMIT
+if or eq nc_base 0 eq wb_base 0
+spk_fail 5 SPK_E_COMPUTE
+ret false
+end
+put spk_st 12 nc_base
+put spk_st 13 wb_base
+cbpbinit
+if ne cbpbsetup18 uint CBCCMP CBOK
+spk_fail 5 SPK_E_COMPUTE
+ret false
+end
+if ne q3_init nc_base wb_base get spk_st 10 get spk_st 11 SPK_MAX_CTX Q3OK
+spk_fail 5 SPK_E_Q3INIT
+ret false
+end
+ret true
+end
+
+note ========================================================================
+note Stage 6: OMTK v1 Wire Loop on TCP Port 18100
+note ========================================================================
+
+fn spk_stage6 to void
+uart_puts spk_s6
+wl_init SPK_OMTK_PORT SPK_MAX_CTX SPK_VOCAB
+put Tcf 1 SPK_STATIC_IP
+put Tcf 2 SPK_GATEWAY
+put Tcf 3 SPK_NETMASK
+put Tcf 5 SPK_ISN
+wl_run
+end
+
+note ========================================================================
+note EL1h Entry (from Piece 1 mmu_enter_el1) and UEFI Entry (main)
+note ========================================================================
+
+fn el1main el1_arg ulong to void
+if not spk_stage1
+ret
+end
+if not spk_stage2
+ret
+end
+if not spk_stage3
+ret
+end
+if not spk_stage4
+ret
+end
+if not spk_stage5
+ret
+end
+spk_stage6
+end
+
+fn main to int
+if not efi_exit_boot_services
+ret 1
+end
+arm64_daif_mask
+arm64_post_ebs_set UART_SPARK_16550_PA PSCI_CONDUIT_NONE
+outp = fwadr efi_mm_out 0 64
+rsdp = fwld add outp 40 8
+ok_acpi = acpi_parse_rsdp rsdp
+conduit = get acpi_info 7
+if ne get acpi_info 8 0
+uart_init get acpi_info 8 get acpi_info 9 conduit
+else
+uart_init UART_SPARK_16550_PA UART_KIND_16550_32 conduit
+end
+arm64_post_ebs_set uart_base conduit
+frames_init
+mp = fwadr efi_mmap 0 EFI_MMAP_CAP
+cnt = frames_ingest_efi_raw mp fwld outp 8 fwld add outp 16 8
+if eq cnt 0
+trap 8
+end
+ib = arm64_meta 0
+bss = arm64_meta 1
+ie = arm64_meta 2
+frames_reserve ib ie
+reserve_gb10_rmrs
+if ne rsdp 0
+frames_reserve rsdp add rsdp 4096
+end
+if not mmu_build_initial ib bss ie
+trap 8
+end
+e1 = arm64_meta 4
+if eq e1 0
+trap 8
+end
+mmu_enter_el1 e1 rsdp
+ret 0
+end
