@@ -40,21 +40,21 @@ In the table, B counts token rows, H local heads, T cache positions, S selected 
 | dense | activation[M,K], weights[N,K], out[M,N], K,N | (tiles(N),M) · 128 |
 | rms_stat | input[B,D], reciprocal RMS[B], D | (B) · 1 |
 | rms_apply | input[B,D], gain[D], reciprocal RMS[B], out[B,D], D | (tiles(D),B) · 128 |
-| rotary_tail | in/out[B,H,D], interleaved cos/sin[B,32,2], D,H,sign | (H,B) · 32 |
+| rotary_tail | in/out[B,H,D], interleaved cos/sin[B,32,2], D (at least 64),H,sign | (H,B) · 32 |
 | compress_pair | KV[B,2,512], score[B,2,512], out[B,512] | (4,B) · 128 |
 | route6 | logits[B,384], selection bias[384], expert IDs[B,6], weights[B,6] | (B) · 1 |
 | engram_rows | absolute IDs[B], shard FP8 rows[R,256], shard byte scales[R,8], decode table, out[B,256], start ID,R | (B) · 256 |
 | bf16_pack, bf16_unpack | source, destination, element count | (tiles(count)) · 128 |
-| index_scores | query[B,H,128], key[B,T,128], prescaled BF16 head weights[B,H], lengths[B], keep mask[B,ceil(T/8)], out[B,T], H,T | (tiles(T),B) · 128 |
+| index_scores | query[B,H,128], key[B,T,128], prescaled BF16-rounded head weights stored as FP32[B,H], uint32 lengths[B], int32 keep mask[B,ceil(T/8)], out[B,T], H,T | (tiles(T),B) · 128 |
 | candidate_blocks | index scores[B,T], reachable lengths[B], out[B,ceil(T/8)], T | (ceil(T/8),B) · 1 |
 | top_positions | scores[B,T], indices[B,K], keep mask[B,T], T,K,index offset | (B) · 1 |
-| engram_gate | residual[B,4,5120], keys[B,4,5120], product of query and key weights[4,5120], token mask[B], gates[B,4] | (4,B) · 1 |
+| engram_gate | residual[B,4,5120], keys[B,4,5120], product of query and key weights[4,5120], int32 token mask[B], gates[B,4] | (4,B) · 1 |
 | engram_add | residual[B,4,5120], value[B,5120], gates[B,4], out[B,4,5120] | (40,4,B) · 128 |
 | token_embed | token IDs[B], shard BF16 table[R,5120], out[B,4,5120], start ID,R | (40,B) · 128 |
 | moe_sum | six down-projections[B,6,5120], shared output[B,5120], out[B,5120] | (40,B) · 128 |
 | window_step | new KV[B,512], position per row[B], in/out cache[B,128,512], indices[B,128] | (4,B) · 128 |
 
-**Precision and layout.** Unqualified floating-point buffers in the table use FP32 storage. Supply BF16 activations widened to FP32 where the checkpoint expects BF16, and round at each checkpoint dtype boundary. The pack and unpack kernels perform those conversions. FP4 uses low nibble first, E2M1. Both GEMMs consume E4M3 activations and require K divisible by 32. Activation scale shape is [M,K/32]. FP4 weight scales are [N,K/32], and FP8 weight scales are [ceil(N/32),K/32]. Both use E8M0 bytes. Supply `decode.f32le` as 272 contiguous device float32 values. The quantizers produce both packed values and widened BF16 reconstructions. FP8 and FP4 indexer groups have width 32 and a power-of-two scale. Compressed KV groups have width 16 and an E4M3 scale. Compressed-KV scale checks cover the finite representable range.
+**Precision and layout.** Unqualified floating-point buffers in the table use FP32 storage. Supply BF16 activations widened to FP32 where the checkpoint expects BF16, and round at each checkpoint dtype boundary. The pack and unpack kernels perform those conversions. FP4 uses low nibble first, E2M1. Both GEMMs consume E4M3 activations and require K divisible by 32. Activation scale shape is [M,K/32]. FP4 weight scales are [N,K/32], and FP8 weight scales are [ceil(N/32),K/32]. Both use E8M0 bytes. Supply `decode.f32le` as 272 contiguous device float32 values. The quantizers produce both packed values and widened BF16 reconstructions. FP8 and FP4 indexer groups have width 32 and a power-of-two scale. Compressed KV groups have width 16 and an E4M3 scale. Compressed-KV tests include the minimum scale, ordinary groups, halfway cases and the largest finite E4M3 scale (448). The Engram gather test exercises a seven-row local shard with a large global starting ID.
 
 **Attention and routing.** Pass one query per batch row to the sparse pair. Supply identical indices to both stages. Each index is a cache position or -1. The mixer follows the reference's 64-position online softmax and rounds each numerator weight to BF16. Apply the residual gates in the upstream layer order. Send the previous sublayer's pre coefficients to hc_pre. The router ranks biased scores, takes weights from the unbiased scores, normalizes them and applies the checkpoint's factor of 1.5. It resolves ties by lower expert ID. top_positions returns ascending positions, fills unreachable entries with -1, and gives a 32-bit keep mask. It also resolves score ties by lower index. Supply K at most T and an offset that fits signed int32. For two-level selection, run candidate_blocks, top_positions on the block scores, index_scores with the resulting mask, then top_positions on the filtered scores.
 

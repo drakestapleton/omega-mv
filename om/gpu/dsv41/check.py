@@ -120,6 +120,8 @@ def check(device):
         values[1, :8] = [-0., .25, .75, 1.25, 1.75, 2.5, 3.5, 5.]
         values[1, 8:] = 6
         values[2] *= 2**-14
+        if name == "quant_kv":
+            values[3] = bf16(np.linspace(-2688., 2688., group, dtype=np.float32))
         maxval = 6 if fp4 else 448
         floor = 6*2**-9 if name == "quant_kv" else (6*2**-126 if fp4 else 1e-4)
         ratio = np.maximum(np.abs(values).max(axis=1), floor) / np.float32(maxval)
@@ -174,6 +176,10 @@ def check(device):
         got, _ = device.run("rotary_tail", (2,3,1), 32, [xs, freq], 2,
                             (128, 2, np.float32(sign).view(np.uint32)))
         np.testing.assert_allclose(got, expected, atol=1e-6, rtol=1e-6)
+    narrow = normal(32)
+    got, _ = device.run("rotary_tail", (1,1,1), 32, [narrow.copy(), freq[0]], 2,
+                        (32, 1, np.float32(1).view(np.uint32)))
+    np.testing.assert_array_equal(got, narrow)
     print("PASS rotary_tail", flush=True)
     vals, gates = normal(3,2,512), normal(3,2,512)*35
     coeff = np.exp(gates - gates.max(axis=1, keepdims=True))
@@ -186,6 +192,11 @@ def check(device):
     selected_w = np.take_along_axis(raw, selected, axis=1)
     verify("route6", (3,1,1), 1, [logits,bias],
            [selected, selected_w * 1.5 / (selected_w.sum(axis=1, keepdims=True)+1e-20)])
+    tie_logits = np.zeros((1,384),np.float32)
+    tie_bias = np.zeros(384,np.float32)
+    tie_bias[:6],tie_bias[6] = 1.,2.
+    verify("route6",(1,1,1),1,[tie_logits,tie_bias],
+           [np.array([[6,0,1,2,3,4]],np.int32),np.full((1,6),.25,np.float32)])
     code = rng.integers(0, 110, (7,256),dtype=np.uint8)
     scale = rng.integers(124,131,(7,8),dtype=np.uint8)
     shard = 180000000
