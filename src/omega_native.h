@@ -327,6 +327,10 @@ uint32_t omega2_osc_pool_free(uint64_t *result, uint8_t *o_p, uint64_t o_loop_de
 const char *omega2_ident_osc_trace(void);
 /* export fn osc_trace_record trace edit uchar * event view trinput to void */
 uint32_t omega2_osc_trace_record(uint64_t *result, uint8_t *o_trace, uint64_t o_trace_len, const uint8_t *o_event);
+#define OMEGA2_IDENT_osc_lifetimes "omega-ident 1 unit=osc_lifetimes abi=2 profile=OM-2 src=18c938959aaaa0a67d15a5cd71bbfa191c8b46e687ae78054e1a47035ab61352 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_osc_lifetimes(void);
+/* export fn osc_scope_exit visible view ushort 480 symbols view uchar 76800 owners edit uchar 5120 borrows edit uchar 12288 work edit exitwork to ulong */
+uint32_t omega2_osc_scope_exit(uint64_t *result, const uint16_t *o_visible, uint64_t o_visible_len, const uint8_t *o_symbols, uint64_t o_symbols_len, uint8_t *o_owners, uint64_t o_owners_len, uint8_t *o_borrows, uint64_t o_borrows_len, uint8_t *o_work);
 #ifdef __cplusplus
 }
 #endif

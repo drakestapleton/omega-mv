@@ -440,42 +440,44 @@ static int arena_escape(C *c, const OscNode *at, int as, const char *who, const 
  * scopes are walked innermost first and symbols newest first, the owners and
  * borrows declared inside an arena body end before the arena is destroyed,
  * and an inner arena before an outer one. */
+_Static_assert(OSC_CHECK_MAX_SYMS == 480 && OSC_CHECK_MAX_OBJS == 256 && OSC_CHECK_MAX_BORS == 512 &&
+               sizeof(Sym) == 160 && offsetof(Sym, kind) == 68 && offsetof(Sym, obj) == 92 &&
+               offsetof(Sym, bor) == 96 && SK_OWNER == 2 && SK_BORROW == 3 && SK_ARENA == 4 && SK_POOL == 5,
+               "OSC lifetime walker symbol layout");
+_Static_assert(OM_LIVE == 0 && OM_GONE == 2 && OM_MAYBE == 3, "OSC lifetime walker owner states");
+
 static int scope_exit_events(C *c, int levels, uint32_t line, OscNode *rec)
 {
     OscAst *a = c->ast;
     rec->rel_start = a->nrel;
     rec->rel_count = 0;
-    for (int lv = 0; lv < levels; lv++) {
-        int d = c->names.depth - 1 - lv;
-        /* each level visits only its own symbols (inner levels were done) */
-        int hi = lv == 0 ? c->names.count : c->names.start[d + 1];
-        for (int i = hi - 1; i >= c->names.start[d]; i--) {
-            int s = c->names.visible[i];
-            Sym *y = &c->sym[s];
-            if (y->kind == SK_BORROW) {
-                if (y->bor >= 0 && c->bor[y->bor].live) end_bor(c, y->bor, line);
-            } else if (y->kind == SK_OWNER) {
-                Obj *o = &c->obj[y->obj];
-                /* OSC-3 item 3: a maybe-moved owner is listed too; the lowerer
-                 * guards its release with the owner's drop flag */
-                if ((o->moved == OM_LIVE || o->moved == OM_MAYBE) && !o->arena1) {
-                    tr_ev(c, OSC_EV_RELEASE, y->obj, -1, -1, -1, line, 0);
-                    o->moved = 2; /* released (scope gone) */
-                    if (a->nrel < OSC_AST_MAX_REL) { a->rel[a->nrel++] = (int16_t)s; rec->rel_count++; }
-                }
-            } else if (y->kind == SK_ARENA) {
-                for (int b = 0; b < c->nbor; b++)
-                    if (c->bor[b].live && c->obj[c->bor[b].obj].arena1 == s + 1)
-                        return arena_escape(c, rec, s, "scope end", "borrow live at arena end");
-                tr_region(c, OSC_EV_REGION_DESTROY, -1, y->region, line, 0);
-                for (int o = 0; o < c->nobj; o++)
-                    if (c->obj[o].arena1 == s + 1 && !c->obj[o].moved) c->obj[o].moved = 2;
-                if (a->nrel < OSC_AST_MAX_REL) { a->rel[a->nrel++] = (int16_t)s; rec->rel_count++; }
-            } else if (y->kind == SK_POOL) {
-                /* OSC-3 item 2: the pool closes (PCLOSE); its handles are
-                 * values declared inside its scope, so none outlives it */
-                if (a->nrel < OSC_AST_MAX_REL) { a->rel[a->nrel++] = (int16_t)s; rec->rel_count++; }
-            }
+    if (!levels) return 0;
+    uint32_t first = c->names.start[c->names.depth - (unsigned)levels];
+    if (first == c->names.count) return 0;
+    OscScopeExit work;
+    work.first = first;
+    work.count = c->names.count;
+    work.objects = (uint32_t)c->nobj;
+    work.borrows = (uint32_t)c->nbor;
+    size_t count = osc_scope_exit(c->names.visible, (const uint8_t *)c->sym,
+                                  (uint8_t *)c->obj, (uint8_t *)c->bor, &work);
+    for (size_t i = 0; i < count; i++) {
+        int s = (int)(work.actions[i] & 0xffffu);
+        unsigned action = work.actions[i] >> 16;
+        Sym *y = &c->sym[s];
+        if (action == OSC_SCOPE_END_BORROW) {
+            tr_ev(c, OSC_EV_END_BORROW, -1, -1, y->bor, -1, line, 0);
+            continue;
+        }
+        if (action == OSC_SCOPE_REFUSE_ESCAPE)
+            return arena_escape(c, rec, s, "scope end", "borrow live at arena end");
+        if (action == OSC_SCOPE_RELEASE_OWNER)
+            tr_ev(c, OSC_EV_RELEASE, y->obj, -1, -1, -1, line, 0);
+        if (action == OSC_SCOPE_DESTROY_ARENA)
+            tr_region(c, OSC_EV_REGION_DESTROY, -1, y->region, line, 0);
+        if (a->nrel < OSC_AST_MAX_REL) {
+            a->rel[a->nrel++] = (int16_t)s;
+            rec->rel_count++;
         }
     }
     return 0;
