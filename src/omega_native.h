@@ -33,6 +33,10 @@ uint32_t omega2_arboris_spread_step(uint64_t *result, const uint32_t *o_topo, ui
 const char *omega2_ident_arboris_gated(void);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
 uint32_t omega2_arboris_gated_tick(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint64_t *o_offsets, uint64_t o_offsets_len, uint16_t *o_arena, uint64_t o_arena_len, uint64_t o_page);
+#define OMEGA2_IDENT_blackwell_arboris_emit "omega-ident 1 unit=blackwell_arboris_emit abi=2 profile=OM-2 src=007348dc1169818a02e5c6eeb15330ccfe0e33d12c45173a687a0cd81e4d50d3 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_blackwell_arboris_emit(void);
+/* export fn arboris_emit_spread n ulong code edit uchar 16384 to ulong */
+uint32_t omega2_arboris_emit_spread(uint64_t *result, uint64_t o_n, uint8_t *o_code, uint64_t o_code_len);
 #define OMEGA2_IDENT_sha256_om2 "omega-ident 1 unit=sha256_om2 abi=2 profile=OM-2 src=dbf002dd6aa36585632b9d01d98ac3f0bd2fa0f0475082940de53638847994bb omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_sha256_om2(void);
 /* export fn sha256_init c edit shactx to void */

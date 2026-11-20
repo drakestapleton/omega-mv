@@ -385,3 +385,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Implemented the checked five-slab Arboris arena plan and bounded CSR topology validation in seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Ported the Arboris v0.1.0 ontology rules into a static graph loader and implemented a batched binary32 CPU spreading-activation oracle. |
 | Codex (under Drake Stapleton's direction) | Implemented the gated-vector v1 CPU oracle over the planned Arboris slabs, including depth-first compartment reduction and ping-pong state updates. |
+| Codex (under Drake Stapleton's direction) | Emitted the batched Arboris sparse wave with the SM121 Omega encoder and checked its instruction listing and scoreboard dependencies. |

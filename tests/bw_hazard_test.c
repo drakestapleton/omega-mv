@@ -651,6 +651,18 @@ static void disasm_cross_check(const char *family, const char *variant, const ui
 }
 
 int main(int argc, char **argv) {
+    /* Reuse the decoder and CFG walker for an independently emitted kernel. */
+    if (argc == 3 && !strcmp(argv[1], "--kernel")) {
+        FILE *f = fopen(argv[2], "rb");
+        if (!f) return 1;
+        size_t size = fread(g_code, 1, sizeof g_code, f);
+        int complete = !ferror(f) && size > 0 && size < sizeof g_code && feof(f);
+        fclose(f);
+        if (!complete || omega_bw_hazard_check(g_code, size, &g_rep) != 0) return 1;
+        printf("scoreboard: %zu instructions, %zu reachable, %zu hazards\n",
+               g_rep.insns, g_rep.reachable, g_rep.count);
+        return g_rep.count != 0;
+    }
     const char *dir = "tests/fixtures/bw_hazard";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--disasm")) g_disasm = 1;

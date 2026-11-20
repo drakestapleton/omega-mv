@@ -646,6 +646,11 @@ case "$step" in
   runtime-api)        # omega-mv#594: the Runtime API manifest against the C headers, plus its negative controls.
                       # Host only (gcc for -aux-info), no GPU, no physics checkout.
     make $NOPHYS test-runtime-api ;;
+  arboris)
+    physics_pin
+    sh seed/omega-from-seed.sh > "$OUT_DIR/seed.log" 2>&1
+    OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
+    ;;
   om-units)           # The C entry points whose algorithm is Omega (om/units.sh): omc born from the seed here,
                       # the generator pinned by om/omega-bridge.lock; regenerated binding, SHA-256 and BLAKE3
                       # byte parity against the C they replaced, and the BLAKE3 mutants. NOT_RUN (3) without tools.

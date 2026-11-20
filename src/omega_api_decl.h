@@ -25,6 +25,8 @@ uint64_t arboris_topology_digest(const uint32_t *o_topo, size_t o_topo_len, cons
 uint64_t arboris_spread_step(const uint32_t *o_topo, size_t o_topo_len, const uint32_t *o_weights, size_t o_weights_len, uint32_t *o_state, size_t o_state_len);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
 uint64_t arboris_gated_tick(const uint64_t o_m[16], const uint64_t o_offsets[6], uint16_t *o_arena, size_t o_arena_len, uint64_t o_page);
+/* export fn arboris_emit_spread n ulong code edit uchar 16384 to ulong */
+uint64_t arboris_emit_spread(uint64_t o_n, uint8_t o_code[16384]);
 #define SHA256_DIGEST_SIZE 32
 #define SHA256_BLOCK_SIZE 64
 typedef struct {
