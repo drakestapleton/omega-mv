@@ -291,6 +291,14 @@ OMBR_ASSERT(offsetof(OscOperandState, pending) == 8, "layout opstate field pendi
 uint64_t osc_expr_step(OscExprStack *o_stack, uint64_t o_look, uint64_t o_operand);
 /* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
 uint64_t osc_operand_step(OscOperandState *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
+#define OSC_ARG_SCALAR 1
+#define OSC_ARG_SLICE 2
+#define OSC_ARG_OWNER 3
+#define OSC_ARG_BORROW 4
+#define OSC_ARG_SCALAR_BORROW 5
+#define OSC_ARG_SLICE_BORROW 6
+#define OSC_ARG_OWNER_FORM 7
+#define OSC_ARG_BORROW_FORM 8
 #define OSC_INFER_DONE 0
 #define OSC_INFER_CHECK 1
 #define OSC_INFER_CAST_LITERAL 2
@@ -304,6 +312,23 @@ uint64_t osc_operand_step(OscOperandState *o_state, uint64_t o_kind, uint64_t o_
 #define OSC_INFER_SHIFT_RANGE 10
 #define OSC_INFER_ARITH_TYPE 11
 #define OSC_INFER_ZERO_DIVISOR 12
+typedef struct {
+    int32_t params[6];
+    int32_t args[7];
+    uint32_t actions[6];
+    int32_t cells[6];
+    uint32_t np;
+    uint32_t na;
+    uint32_t clause;
+} OscCallArgs;
+OMBR_ASSERT(sizeof(OscCallArgs) == 112, "layout callargs size");
+OMBR_ASSERT(offsetof(OscCallArgs, params) == 0, "layout callargs field params");
+OMBR_ASSERT(offsetof(OscCallArgs, args) == 24, "layout callargs field args");
+OMBR_ASSERT(offsetof(OscCallArgs, actions) == 52, "layout callargs field actions");
+OMBR_ASSERT(offsetof(OscCallArgs, cells) == 76, "layout callargs field cells");
+OMBR_ASSERT(offsetof(OscCallArgs, np) == 100, "layout callargs field np");
+OMBR_ASSERT(offsetof(OscCallArgs, na) == 104, "layout callargs field na");
+OMBR_ASSERT(offsetof(OscCallArgs, clause) == 108, "layout callargs field clause");
 typedef struct {
     uint64_t v[6];
     uint8_t k[6];
@@ -368,6 +393,14 @@ uint64_t osc_constant_tree(const uint8_t *o_nodes, size_t o_nodes_len, uint64_t 
 uint64_t osc_fold_tree(uint8_t *o_nodes, size_t o_nodes_len, uint64_t o_typ, uint64_t *o_stack, size_t o_stack_len, uint64_t o_report[3]);
 /* export fn osc_infer_step nodes edit uchar * stack edit ulong * frame edit infer checked ulong to ulong */
 uint64_t osc_infer_step(uint8_t *o_nodes, size_t o_nodes_len, uint64_t *o_stack, size_t o_stack_len, OscInference *o_frame, uint64_t o_checked);
+/* export fn osc_call_args nodes view uchar * param long arg long call edit callargs to void */
+void osc_call_args(const uint8_t *o_nodes, size_t o_nodes_len, int64_t o_param, int64_t o_arg, OscCallArgs *o_call);
+/* export fn osc_bind_cell_argument call edit callargs index ulong symbol long to ulong */
+uint64_t osc_bind_cell_argument(OscCallArgs *o_call, uint64_t o_index, int64_t o_symbol);
+/* export fn osc_call_requires nodes view uchar * call view callargs bindings edit contract stack edit ulong * to ulong */
+uint64_t osc_call_requires(const uint8_t *o_nodes, size_t o_nodes_len, const OscCallArgs *o_call, OscContractBindings *o_bindings, uint64_t *o_stack, size_t o_stack_len);
+/* export fn osc_slice_args types view uint * args view ulong * to long */
+int64_t osc_slice_args(const uint32_t *o_types, size_t o_types_len, const uint64_t *o_args, size_t o_args_len);
 #define OSC_A64_ERR_UNUSED_SHIFT 1
 #define OSC_A64_ERR_UNUSED_COND 2
 #define OSC_A64_ERR_UNUSED_IMM2 3
@@ -596,6 +629,8 @@ void osc_scope_bind(OscCheckedScope *o_table, uint64_t o_id, const uint8_t *o_na
 uint64_t osc_scope_push(OscCheckedScope *o_table);
 /* export fn osc_scope_pop table edit scopetab to void */
 void osc_scope_pop(OscCheckedScope *o_table);
+/* export fn osc_find_function names view uchar * name view uchar * to long */
+int64_t osc_find_function(const uint8_t *o_names, size_t o_names_len, const uint8_t *o_name, size_t o_name_len);
 #define OSC_POOL_FULL 1
 #define OSC_POOL_RETIRED 2
 #define OSC_HANDLE_UNKNOWN 0

@@ -225,7 +225,7 @@ const char *omega2_ident_osc_expr(void);
 uint32_t omega2_osc_expr_step(uint64_t *result, uint8_t *o_stack, uint64_t o_look, uint64_t o_operand);
 /* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
 uint32_t omega2_osc_operand_step(uint64_t *result, uint8_t *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
-#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=28238165ae668bbf8493bc4f27ca69af1c8cccb9ddd7d47a0889f288d0e7dc73 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=75c88ca554b6dfb5c2436728aa4dfdbd4bbb87348b65ad0c29b2fb7c2ad7cd34 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_scalar(void);
 /* export fn osc_alu_width t ulong to ulong */
 uint32_t omega2_osc_alu_width(uint64_t *result, uint64_t o_t);
@@ -253,6 +253,14 @@ uint32_t omega2_osc_constant_tree(uint64_t *result, const uint8_t *o_nodes, uint
 uint32_t omega2_osc_fold_tree(uint64_t *result, uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t o_typ, uint64_t *o_stack, uint64_t o_stack_len, uint64_t *o_report, uint64_t o_report_len);
 /* export fn osc_infer_step nodes edit uchar * stack edit ulong * frame edit infer checked ulong to ulong */
 uint32_t omega2_osc_infer_step(uint64_t *result, uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t *o_stack, uint64_t o_stack_len, uint8_t *o_frame, uint64_t o_checked);
+/* export fn osc_call_args nodes view uchar * param long arg long call edit callargs to void */
+uint32_t omega2_osc_call_args(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t o_param, uint64_t o_arg, uint8_t *o_call);
+/* export fn osc_bind_cell_argument call edit callargs index ulong symbol long to ulong */
+uint32_t omega2_osc_bind_cell_argument(uint64_t *result, uint8_t *o_call, uint64_t o_index, uint64_t o_symbol);
+/* export fn osc_call_requires nodes view uchar * call view callargs bindings edit contract stack edit ulong * to ulong */
+uint32_t omega2_osc_call_requires(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, const uint8_t *o_call, uint8_t *o_bindings, uint64_t *o_stack, uint64_t o_stack_len);
+/* export fn osc_slice_args types view uint * args view ulong * to long */
+uint32_t omega2_osc_slice_args(uint64_t *result, const uint32_t *o_types, uint64_t o_types_len, const uint64_t *o_args, uint64_t o_args_len);
 #define OMEGA2_IDENT_osc_a64_fields "omega-ident 1 unit=osc_a64_fields abi=2 profile=OM-2 src=6b0d855c4b12c67d8413d184d84f0005b737a1b73d5bc462dd6c4aff99f8e266 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_a64_fields(void);
 /* export fn osc_a64_pack_fields form ulong base ulong f view a64field to ulong */
@@ -311,7 +319,7 @@ uint32_t omega2_osc_snapshot_restore(uint64_t *result, const uint8_t *o_shape, u
 uint32_t omega2_osc_join_snapshot(uint64_t *result, const uint32_t *o_saved, uint64_t o_saved_len, uint32_t *o_owners, uint64_t o_owners_len, int32_t *o_changes, uint64_t o_changes_len);
 /* export fn osc_snapshot_moves saved view uint * owners view uint 1280 ids edit int * to ulong */
 uint32_t omega2_osc_snapshot_moves(uint64_t *result, const uint32_t *o_saved, uint64_t o_saved_len, const uint32_t *o_owners, uint64_t o_owners_len, int32_t *o_ids, uint64_t o_ids_len);
-#define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=04d9c3dead3cabf5dbfa96da36fe4c58c64aa20ea36494bbfa92d1d0d3a17c4e omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+#define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=ad6c63bca4f4d1f5e0cec5830a73cd708269ebefe506f5cff48e448e4c6cc4a4 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_scope(void);
 /* export fn osc_scope_reset table edit scopetab to void */
 uint32_t omega2_osc_scope_reset(uint64_t *result, uint8_t *o_table);
@@ -323,6 +331,8 @@ uint32_t omega2_osc_scope_bind(uint64_t *result, uint8_t *o_table, uint64_t o_id
 uint32_t omega2_osc_scope_push(uint64_t *result, uint8_t *o_table);
 /* export fn osc_scope_pop table edit scopetab to void */
 uint32_t omega2_osc_scope_pop(uint64_t *result, uint8_t *o_table);
+/* export fn osc_find_function names view uchar * name view uchar * to long */
+uint32_t omega2_osc_find_function(uint64_t *result, const uint8_t *o_names, uint64_t o_names_len, const uint8_t *o_name, uint64_t o_name_len);
 #define OMEGA2_IDENT_osc_pool "omega-ident 1 unit=osc_pool abi=2 profile=OM-2 src=e4198750f150c94c266f9e64627ec9ad1ecbd3f6dd462814038991ab0916b968 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_pool(void);
 /* export fn osc_pool_init p edit poolstat cap ulong base ulong loop_depth long cond_depth long to void */
