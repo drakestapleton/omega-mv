@@ -1,7 +1,8 @@
 #!/bin/sh
 # gate-pools.sh [OMC] -- run-time pools (docs/RUNTIME-POOLS.md sections 3, 4, 5, 7 and 11). The compiler
 # under test is the argument, else $OMC, else seed/out/omc. The control CTRL (environment) defaults to the
-# base omc 1e628c80..., read from history (f615b139), with the pinned bool-field correction below. Cases: seed/omc/tests/pools
+# base omc 1e628c80..., read from history (f615b139), with the pinned bool-field correction and the rules
+# copied from the current compiler below. Cases: seed/omc/tests/pools
 # (NAME.om, NAME.want: stdout, then `status N`). One line per check; last line RC=0 when all passed.
 #  0. Controls: CTRL refuses `global P ulong *` (error 16) and `enlarge` (error 3), and every pools case.
 #     The cases are generated: `python3 seed/omc/tests/pools/mk.py DIR` gives every committed NAME.om and
@@ -71,14 +72,24 @@ else
   git cat-file blob f615b139:seed/out/omc > $B/ctrl 2> /dev/null || bad "control: commit f615b139 is not in this clone"
   [ "$(sha256sum $B/ctrl | cut -d' ' -f1)" = $BASE ] || bad "control: f615b139:seed/out/omc is not omc $BASE"
   chmod +x $B/ctrl
-  # Keep the historical no-pools implementation as the reference, with only the
-  # independently reproduced bool-field opcode correction. No corpus row is skipped.
+  # Historical no-pools compiler (f615b139). The bool-field opcode correction is
+  # checked on its own pinned image. The reference then learns later rules by
+  # copying them out of the current seed/omc/omc.om (the fourth argument), not
+  # by freezing that source:
+  #   kwa, kwx, and the kfdctl/kfdmap/kfdres keyword ids 241..243
+  #   fn kfdreg through fn hostval, which is the current KFD lowering, including
+  #   the drm/xe ioctl allowlist and kxezero
+  #   mnew, xhmnew, aret, aefival
+  #   a64efi: xefa, bare-unit error 25, host words error 25, read/write error 25,
+  #   reserved firmware names error 16, missing efirt error 16
+  #   s_global: a pool declaration with no fn main is error 9; with fn main it
+  #   stays error 16, because this control still has no pool lowering
   mv "$B/ctrl" "$B/ctrl-raw"
   git cat-file blob f615b139:seed/omc/omc.om > "$B/ctrl-src.om"
-  python3 - "$B/ctrl-raw" "$B/ctrl-src.om" "$B/ctrl" <<'PYBOOL'
+  python3 - "$B/ctrl-raw" "$B/ctrl-src.om" "$B/ctrl" "$R/seed/omc/omc.om" <<'PYBOOL'
 from pathlib import Path
 import hashlib, subprocess, sys
-raw, source, out = map(Path, sys.argv[1:])
+raw, source, out, current = map(Path, sys.argv[1:])
 sha = lambda b: hashlib.sha256(b).hexdigest()
 assert sha(raw.read_bytes()) == '1e628c80d5bd2ad0b08eb46d8abff66eff284a74e5a302e589c2d61cfe9f7347'
 data = source.read_bytes()
@@ -94,17 +105,281 @@ for fn, old, new in [
     assert part.count(old+'\n') == 1
     s = s[:start] + part.replace(old+'\n', new+'\n') + s[end:]
 assert sha(s.encode()) == '33e993b566c5dbd36fa9d3a063584019485777841d4e4252655503bd9374b418'
-image = subprocess.run([raw], input=s.encode(), capture_output=True, check=True, timeout=60).stdout
-assert sha(image) == 'a0db6165a56811f1315cb445b037568a13bd40d82a155636a53550d123db8748'
-out.write_bytes(image); out.chmod(0o700)
+bool_image = subprocess.run([raw], input=s.encode(), capture_output=True, check=True, timeout=60).stdout
+assert sha(bool_image) == 'a0db6165a56811f1315cb445b037568a13bd40d82a155636a53550d123db8748'
+bool_path = out.with_name('ctrl-bool')
+bool_path.write_bytes(bool_image); bool_path.chmod(0o700)
 probe = b'struct W a uint f bool end\nfn main to int\nw = new W 1 false\nput w f true\nif get w f\nret 7\nend\nret 1\nend\n'
-for compiler, want, suffix in [(raw, -4, 'raw'), (out, 7, 'corrected')]:
+for compiler, want, suffix in [(raw, -4, 'raw'), (bool_path, 7, 'corrected')]:
     p = subprocess.run([compiler], input=probe, capture_output=True, check=True, timeout=60)
     exe = out.with_name('bool-probe-'+suffix)
     exe.write_bytes(p.stdout); exe.chmod(0o700)
     result = subprocess.run([exe], capture_output=True, timeout=10)
     assert result.returncode == want, (suffix, result.returncode, want)
 print('PASS historical control bool correction: original SIGILL, corrected exit 7; source and image pins match')
+
+def fn_span(text, name, end_name=None):
+    lines = text.splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines) if line.startswith('fn '+name+' '))
+    if end_name is None:
+        end = next(i for i, line in enumerate(lines) if i > start and line.startswith('fn '))
+    else:
+        end = next(i for i, line in enumerate(lines) if i > start and line.startswith('fn '+end_name+' '))
+    return ''.join(lines[start:end])
+
+def replace_fn(text, name, body):
+    lines = text.splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines) if line.startswith('fn '+name+' '))
+    end = next(i for i, line in enumerate(lines) if i > start and line.startswith('fn '))
+    if not body.endswith('\n'):
+        body += '\n'
+    return ''.join(lines[:start]) + body + ''.join(lines[end:])
+
+cur = current.read_text()
+kfd = fn_span(cur, 'kfdreg', 'hostval')
+mnew = fn_span(cur, 'mnew')
+xhmnew = fn_span(cur, 'xhmnew')
+aret = fn_span(cur, 'aret', 'aefival')
+aefival = fn_span(cur, 'aefival', 'afw')
+kwa = fn_span(cur, 'kwa')
+kwx = fn_span(cur, 'kwx')
+assert 'fn kxezero ' in kfd
+assert '3224396870' in kfd
+assert 'global d2site ' not in s
+s = s.replace(
+    'global xtarget ulong 1\n',
+    'global xtarget ulong 1\n'
+    'note xefa: 1 when the unit\'s first line is target a64efi. 0 on every other unit.\n'
+    'global xefa ulong 1\n'
+    'note d2site: one cell for the fail-path writes copied with the KFD and a64efi code.\n'
+    'global d2site ulong 1\n',
+    1)
+s = s.replace('fn kw w ulong to ulong\n', kwa + kwx + 'fn kw w ulong to ulong\n', 1)
+old_kw = (
+    'if eq w 31359662648747367\n'
+    'ret 240\n'
+    'end\n'
+    'if eq w 461229747302\n'
+)
+new_kw = (
+    'if eq w 31359662648747367\n'
+    'ret 240\n'
+    'end\n'
+    'if eq w 119247139530347\n'
+    'ret 241\n'
+    'end\n'
+    'if eq w 123563749434987\n'
+    'ret 242\n'
+    'end\n'
+    'if eq w 126879548073579\n'
+    'ret 243\n'
+    'end\n'
+    'if eq w 461229747302\n'
+)
+assert s.count(old_kw) == 1
+s = s.replace(old_kw, new_kw, 1)
+s = replace_fn(s, 'mnew', mnew)
+s = replace_fn(s, 'xhmnew', xhmnew)
+hook = (
+    'if and ge c 241 le c 243\n'
+    'mtinit\n'
+    'if eq c 241\n'
+    'kctl dst x\n'
+    'else\n'
+    'mnew c dst x\n'
+    'end\n'
+    'ret\n'
+    'end\n'
+)
+anchor = (
+    'x = mul get depth 0 32\n'
+    'put a_ar add get a_rb 77 add x 7 get nslot 0\n'
+    'note VFIO words are program-only. These IDs are disjoint from efi178, qty223 and peername224.\n'
+)
+assert s.count(anchor) == 1
+s = s.replace(anchor, anchor.split('note VFIO')[0] + hook + 'note VFIO words are program-only. These IDs are disjoint from efi178, qty223 and peername224.\n', 1)
+xhook = (
+    'if and ge c 241 le c 243\n'
+    'mtinit\n'
+    'if eq c 241\n'
+    'kctl dst x\n'
+    'else\n'
+    'xhmnew c dst x\n'
+    'end\n'
+    'ret\n'
+    'end\n'
+)
+xanchor = (
+    'x = mul get depth 0 32\n'
+    'put a_ar add get a_rb 77 add x 7 get nslot 0\n'
+    'if and ge c 236 le c 238\n'
+)
+assert s.count(xanchor) == 1
+s = s.replace(xanchor, xanchor.split('if and ge c 236')[0] + xhook + 'if and ge c 236 le c 238\n', 1)
+disp = 'if or or and ge c 228 le c 232 or eq c 233 eq c 235 and ge c 236 le c 240\n'
+assert s.count(disp) == 1
+s = s.replace(disp, disp.replace('le c 240', 'le c 243'), 1)
+host = 'fn hostval c ulong dst ulong to void\n'
+assert s.count(host) == 1
+s = s.replace(host, kfd + host, 1)
+s = s.replace(
+    'fn newname w ulong l ulong s ulong to void\n',
+    'fn newname w ulong l ulong s ulong to void\n'
+    'if le l 8\n'
+    'if ne kwx w 0\n'
+    'fail 16\n'
+    'end\n'
+    'end\n',
+    1)
+s = s.replace(
+    'fn addname w ulong r ulong t ulong ln ulong k ulong a ulong to void\n',
+    'fn addname w ulong r ulong t ulong ln ulong k ulong a ulong to void\n'
+    'if ne kwx w 0\n'
+    'fail 16\n'
+    'end\n',
+    1)
+s = s.replace(
+    'xhost c dst\n'
+    'ret\n'
+    'end\n'
+    'if ne get xtarget 0 0\n'
+    'fail 25\n'
+    'end\n'
+    'note Function mode (no program image: no argv in x27, no x28 stack floor, no globals) refuses host\n',
+    'xhost c dst\n'
+    'ret\n'
+    'end\n'
+    'if ne get xtarget 0 0\n'
+    'fail 25\n'
+    'end\n'
+    'note target a64efi has no Linux beneath it: every host word is error 25.\n'
+    'if ne get xefa 0 0\n'
+    'fail 25\n'
+    'end\n'
+    'note Function mode (no program image: no argv in x27, no x28 stack floor, no globals) refuses host\n',
+    1)
+s = s.replace(
+    'if and eq get tw 0 115888505632888 eq get tl 0 6\n'
+    'put xtarget 0 2\n'
+    'else\n'
+    'fail 25\n'
+    'end\n',
+    'if and eq get tw 0 115888505632888 eq get tl 0 6\n'
+    'put xtarget 0 2\n'
+    'else\n'
+    'if and eq get tw 0 115888505501281 eq get tl 0 6\n'
+    'put xefa 0 1\n'
+    'else\n'
+    'fail 25\n'
+    'end\n'
+    'end\n',
+    1)
+s = s.replace(
+    'c = kw get tw 0\n'
+    'if eq c 178\n'
+    'xefival dst\n'
+    'ret\n'
+    'end\n',
+    'c = kw get tw 0\n'
+    'if ne get xefa 0 0\n'
+    'ca = kwa get tw 0\n'
+    'if eq ca 178\n'
+    'aefival dst\n'
+    'ret\n'
+    'end\n'
+    'end\n'
+    'if eq c 178\n'
+    'xefival dst\n'
+    'ret\n'
+    'end\n',
+    1)
+s = s.replace(
+    'if ne get xtarget 0 0\n'
+    'put oc 0 512\n'
+    'if eq get xtarget 0 2\n'
+    'if eq get progmode 0 0\n'
+    'fail 25\n'
+    'end\n',
+    'if ne get xefa 0 0\n'
+    'if eq get progmode 0 0\n'
+    'fail 25\n'
+    'end\n'
+    'end\n'
+    'if ne get xtarget 0 0\n'
+    'put oc 0 512\n'
+    'if eq get xtarget 0 2\n'
+    'if eq get progmode 0 0\n'
+    'fail 25\n'
+    'end\n',
+    1)
+old_vs = (
+    'fn vs_call c ulong fk ulong fv ulong e ulong ro ulong rn ulong to void\n'
+    'if ne get xtarget 0 0\n'
+    'xio c fk fv e ro rn\n'
+    'ret\n'
+    'end\n'
+    'save\n'
+)
+new_vs = (
+    'fn vs_call c ulong fk ulong fv ulong e ulong ro ulong rn ulong to void\n'
+    'if ne get xtarget 0 0\n'
+    'xio c fk fv e ro rn\n'
+    'ret\n'
+    'end\n'
+    'note target a64efi: read and write are Linux system calls; there is no Linux beneath the image\n'
+    'if ne get xefa 0 0\n'
+    'fail 25\n'
+    'end\n'
+    'save\n'
+)
+assert s.count(old_vs) == 1
+s = s.replace(old_vs, new_vs, 1)
+needle = 'fn xefival '
+assert needle in s
+s = s.replace(needle, aret + aefival + needle, 1)
+old_sg = (
+    'fn s_global to void\n'
+    'w = topname\n'
+    't = typeword\n'
+    'elemtype t\n'
+    'n = lenval 16\n'
+)
+new_sg = (
+    'fn s_global to void\n'
+    'w = topname\n'
+    't = typeword\n'
+    'elemtype t\n'
+    'note a lone * after the element type is a run-time pool. With no fn main, program mode is\n'
+    'note off and the current compiler refuses that declaration with error 9 (sg_pool). A pool\n'
+    'note in program mode stays unknown here, so lenval still reports error 16.\n'
+    'pc = get cur 0\n'
+    'pl = get line 0\n'
+    'tok\n'
+    'if eq get tk 0 1\n'
+    'if eq get tl 0 1\n'
+    'if eq get tw 0 42\n'
+    'if eq get progmode 0 0\n'
+    'fail 9\n'
+    'end\n'
+    'end\n'
+    'end\n'
+    'end\n'
+    'put cur 0 pc\n'
+    'put line 0 pl\n'
+    'n = lenval 16\n'
+)
+assert s.count(old_sg) == 1
+s = s.replace(old_sg, new_sg, 1)
+assert sha(s.encode()) == 'e1b19576c759b78cb3febb761e1e6409ea29694dfe7abda9d20248db433f5852'
+image = subprocess.run([raw], input=s.encode(), capture_output=True, check=True, timeout=180).stdout
+assert sha(image) == '58f91dbdebf6ba0d4d17a12372897916dbf3b7d6cb62a3d17a607d91b21ba766'
+out.write_bytes(image); out.chmod(0o700)
+p = subprocess.run([out], input=probe, capture_output=True, check=True, timeout=60)
+exe = out.with_name('bool-probe-final')
+exe.write_bytes(p.stdout); exe.chmod(0o700)
+result = subprocess.run([exe], capture_output=True, timeout=10)
+assert result.returncode == 7, result.returncode
+print('PASS historical control a64efi refusals, KFD words, xe allowlist and pool-without-main: source and image pins match')
 PYBOOL
   CTRL=$B/ctrl
 fi
