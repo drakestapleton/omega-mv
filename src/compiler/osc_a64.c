@@ -39,77 +39,68 @@ typedef struct {
     const char *name;
     uint32_t base;
     uint8_t cls;
-    uint8_t kd, kn, km, ka;
+    uint8_t kd, kn, km, ka, flags; /* bit 0 writeback, bit 1 load pair */
 } OpInfo;
 
 static const OpInfo OPS[OSC_A64_NOPS] = {
-    [OSC_A64_ADD_REG]  = {"add",   0x8B000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_SUB_REG]  = {"sub",   0xCB000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_ADDS_REG] = {"adds",  0xAB000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_SUBS_REG] = {"subs",  0xEB000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_ADD_IMM]  = {"add",   0x91000000u, CLS_RI,     K_SP, K_SP, K_NONE, K_NONE},
-    [OSC_A64_SUB_IMM]  = {"sub",   0xD1000000u, CLS_RI,     K_SP, K_SP, K_NONE, K_NONE},
-    [OSC_A64_ADDS_IMM] = {"adds",  0xB1000000u, CLS_RI,     K_ZR, K_SP, K_NONE, K_NONE},
-    [OSC_A64_SUBS_IMM] = {"subs",  0xF1000000u, CLS_RI,     K_ZR, K_SP, K_NONE, K_NONE},
-    [OSC_A64_MADD]     = {"madd",  0x9B000000u, CLS_R4,     K_ZR, K_ZR, K_ZR, K_ZR},
-    [OSC_A64_MSUB]     = {"msub",  0x9B008000u, CLS_R4,     K_ZR, K_ZR, K_ZR, K_ZR},
-    [OSC_A64_SMULH]    = {"smulh", 0x9B407C00u, CLS_MULH,   K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_UMULH]    = {"umulh", 0x9BC07C00u, CLS_MULH,   K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_SDIV]     = {"sdiv",  0x9AC00C00u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_UDIV]     = {"udiv",  0x9AC00800u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_LSLV]     = {"lslv",  0x9AC02000u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_LSRV]     = {"lsrv",  0x9AC02400u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_ASRV]     = {"asrv",  0x9AC02800u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_AND_REG]  = {"and",   0x8A000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_ORR_REG]  = {"orr",   0xAA000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_EOR_REG]  = {"eor",   0xCA000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_ORN_REG]  = {"orn",   0xAA200000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_SBFM]     = {"sbfm",  0x93400000u, CLS_BFM,    K_ZR, K_ZR, K_NONE, K_NONE},
-    [OSC_A64_UBFM]     = {"ubfm",  0xD3400000u, CLS_BFM,    K_ZR, K_ZR, K_NONE, K_NONE},
-    [OSC_A64_CSINC]    = {"csinc", 0x9A800400u, CLS_CSINC,  K_ZR, K_ZR, K_ZR, K_NONE},
-    [OSC_A64_MOVZ]     = {"movz",  0xD2800000u, CLS_MOV16,  K_ZR, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_MOVN]     = {"movn",  0x92800000u, CLS_MOV16,  K_ZR, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_MOVK]     = {"movk",  0xF2800000u, CLS_MOV16,  K_ZR, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_LDR_UOFF] = {"ldr",   0xF9400000u, CLS_MEM,    K_ZR, K_SP, K_NONE, K_NONE},
-    [OSC_A64_STR_UOFF] = {"str",   0xF9000000u, CLS_MEM,    K_ZR, K_SP, K_NONE, K_NONE},
-    [OSC_A64_STP_OFF]  = {"stp",   0xA9000000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR},
-    [OSC_A64_STP_PRE]  = {"stp!",  0xA9800000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR},
-    [OSC_A64_STP_POST] = {"stp+",  0xA8800000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR},
-    [OSC_A64_LDP_OFF]  = {"ldp",   0xA9400000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR},
-    [OSC_A64_LDP_PRE]  = {"ldp!",  0xA9C00000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR},
-    [OSC_A64_LDP_POST] = {"ldp+",  0xA8C00000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR},
-    [OSC_A64_B]        = {"b",     0x14000000u, CLS_B26,    K_NONE, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_BL]       = {"bl",    0x94000000u, CLS_B26,    K_NONE, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_BCOND]    = {"b.cond",0x54000000u, CLS_BCOND,  K_NONE, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_CBZ]      = {"cbz",   0xB4000000u, CLS_CB,     K_ZR, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_CBNZ]     = {"cbnz",  0xB5000000u, CLS_CB,     K_ZR, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_BLR]      = {"blr",   0xD63F0000u, CLS_BREG,   K_NONE, K_X, K_NONE, K_NONE},
-    [OSC_A64_RET]      = {"ret",   0xD65F0000u, CLS_BREG,   K_NONE, K_X, K_NONE, K_NONE},
-    [OSC_A64_BRK]      = {"brk",   0xD4200000u, CLS_BRK,    K_NONE, K_NONE, K_NONE, K_NONE},
-    [OSC_A64_LDRB_REG] = {"ldrb",  0x38606800u, CLS_R3,     K_ZR, K_SP, K_ZR, K_NONE},
+    [OSC_A64_ADD_REG]  = {"add",   0x8B000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_SUB_REG]  = {"sub",   0xCB000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_ADDS_REG] = {"adds",  0xAB000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_SUBS_REG] = {"subs",  0xEB000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_ADD_IMM]  = {"add",   0x91000000u, CLS_RI,     K_SP, K_SP, K_NONE, K_NONE, 0},
+    [OSC_A64_SUB_IMM]  = {"sub",   0xD1000000u, CLS_RI,     K_SP, K_SP, K_NONE, K_NONE, 0},
+    [OSC_A64_ADDS_IMM] = {"adds",  0xB1000000u, CLS_RI,     K_ZR, K_SP, K_NONE, K_NONE, 0},
+    [OSC_A64_SUBS_IMM] = {"subs",  0xF1000000u, CLS_RI,     K_ZR, K_SP, K_NONE, K_NONE, 0},
+    [OSC_A64_MADD]     = {"madd",  0x9B000000u, CLS_R4,     K_ZR, K_ZR, K_ZR, K_ZR, 0},
+    [OSC_A64_MSUB]     = {"msub",  0x9B008000u, CLS_R4,     K_ZR, K_ZR, K_ZR, K_ZR, 0},
+    [OSC_A64_SMULH]    = {"smulh", 0x9B407C00u, CLS_MULH,   K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_UMULH]    = {"umulh", 0x9BC07C00u, CLS_MULH,   K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_SDIV]     = {"sdiv",  0x9AC00C00u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_UDIV]     = {"udiv",  0x9AC00800u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_LSLV]     = {"lslv",  0x9AC02000u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_LSRV]     = {"lsrv",  0x9AC02400u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_ASRV]     = {"asrv",  0x9AC02800u, CLS_R3,     K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_AND_REG]  = {"and",   0x8A000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_ORR_REG]  = {"orr",   0xAA000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_EOR_REG]  = {"eor",   0xCA000000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_ORN_REG]  = {"orn",   0xAA200000u, CLS_RRR_SH, K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_SBFM]     = {"sbfm",  0x93400000u, CLS_BFM,    K_ZR, K_ZR, K_NONE, K_NONE, 0},
+    [OSC_A64_UBFM]     = {"ubfm",  0xD3400000u, CLS_BFM,    K_ZR, K_ZR, K_NONE, K_NONE, 0},
+    [OSC_A64_CSINC]    = {"csinc", 0x9A800400u, CLS_CSINC,  K_ZR, K_ZR, K_ZR, K_NONE, 0},
+    [OSC_A64_MOVZ]     = {"movz",  0xD2800000u, CLS_MOV16,  K_ZR, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_MOVN]     = {"movn",  0x92800000u, CLS_MOV16,  K_ZR, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_MOVK]     = {"movk",  0xF2800000u, CLS_MOV16,  K_ZR, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_LDR_UOFF] = {"ldr",   0xF9400000u, CLS_MEM,    K_ZR, K_SP, K_NONE, K_NONE, 0},
+    [OSC_A64_STR_UOFF] = {"str",   0xF9000000u, CLS_MEM,    K_ZR, K_SP, K_NONE, K_NONE, 0},
+    [OSC_A64_STP_OFF]  = {"stp",   0xA9000000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR, 0},
+    [OSC_A64_STP_PRE]  = {"stp!",  0xA9800000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR, 1},
+    [OSC_A64_STP_POST] = {"stp+",  0xA8800000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR, 1},
+    [OSC_A64_LDP_OFF]  = {"ldp",   0xA9400000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR, 2},
+    [OSC_A64_LDP_PRE]  = {"ldp!",  0xA9C00000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR, 3},
+    [OSC_A64_LDP_POST] = {"ldp+",  0xA8C00000u, CLS_PAIR,   K_ZR, K_SP, K_NONE, K_ZR, 3},
+    [OSC_A64_B]        = {"b",     0x14000000u, CLS_B26,    K_NONE, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_BL]       = {"bl",    0x94000000u, CLS_B26,    K_NONE, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_BCOND]    = {"b.cond",0x54000000u, CLS_BCOND,  K_NONE, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_CBZ]      = {"cbz",   0xB4000000u, CLS_CB,     K_ZR, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_CBNZ]     = {"cbnz",  0xB5000000u, CLS_CB,     K_ZR, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_BLR]      = {"blr",   0xD63F0000u, CLS_BREG,   K_NONE, K_X, K_NONE, K_NONE, 0},
+    [OSC_A64_RET]      = {"ret",   0xD65F0000u, CLS_BREG,   K_NONE, K_X, K_NONE, K_NONE, 0},
+    [OSC_A64_BRK]      = {"brk",   0xD4200000u, CLS_BRK,    K_NONE, K_NONE, K_NONE, K_NONE, 0},
+    [OSC_A64_LDRB_REG] = {"ldrb",  0x38606800u, CLS_R3,     K_ZR, K_SP, K_ZR, K_NONE, 0},
 };
 
-/* variable-field mask per class (bits not fixed by the opcode) */
-static uint32_t cls_varmask(int cls) {
-    switch (cls) {
-    case CLS_RRR_SH: return 0x00DFFFFFu;  /* shift 23:22, Rm 20:16, imm6 15:10, Rn, Rd */
-    case CLS_RI:     return 0x007FFFFFu;  /* sh 22, imm12 21:10, Rn, Rd */
-    case CLS_R4:     return 0x001F7FFFu;  /* Rm, Ra 14:10, Rn, Rd */
-    case CLS_MULH:   return 0x001F03FFu;
-    case CLS_R3:     return 0x001F03FFu;
-    case CLS_BFM:    return 0x003FFFFFu;
-    case CLS_CSINC:  return 0x001FF3FFu;  /* Rm, cond 15:12, Rn, Rd */
-    case CLS_MOV16:  return 0x007FFFFFu;  /* hw 22:21, imm16 20:5, Rd */
-    case CLS_MEM:    return 0x003FFFFFu;
-    case CLS_PAIR:   return 0x003FFFFFu;  /* imm7 21:15, Rt2 14:10, Rn, Rt */
-    case CLS_B26:    return 0x03FFFFFFu;
-    case CLS_BCOND:  return 0x00FFFFEFu;  /* imm19 23:5, cond 3:0 (bit 4 fixed 0) */
-    case CLS_CB:     return 0x00FFFFFFu;
-    case CLS_BREG:   return 0x000003E0u;
-    case CLS_BRK:    return 0x001FFFE0u;
-    default:         return 0;
-    }
-}
+/* The seeded codec reads these two fixed records as byte spans. */
+_Static_assert(sizeof(OpInfo) == 24 && offsetof(OpInfo, base) == 8 &&
+               offsetof(OpInfo, cls) == 12 && offsetof(OpInfo, kd) == 13 &&
+               offsetof(OpInfo, kn) == 14 && offsetof(OpInfo, km) == 15 &&
+               offsetof(OpInfo, ka) == 16 && offsetof(OpInfo, flags) == 17, "AArch64 opcode descriptor ABI");
+_Static_assert(sizeof(OscA64Insn) == 24 && offsetof(OscA64Insn, op) == 0 &&
+               offsetof(OscA64Insn, rd) == 1 && offsetof(OscA64Insn, rn) == 2 &&
+               offsetof(OscA64Insn, rm) == 3 && offsetof(OscA64Insn, ra) == 4 &&
+               offsetof(OscA64Insn, shift) == 5 && offsetof(OscA64Insn, cond) == 6 &&
+               offsetof(OscA64Insn, imm) == 8 && offsetof(OscA64Insn, imm2) == 16,
+               "AArch64 instruction ABI");
+_Static_assert(OSC_A64_XZR == 32 && OSC_A64_SP == 33, "AArch64 typed register values");
 
 static int fail(char *err, size_t n, const char *fmt, ...) {
     if (err && n) {
@@ -121,29 +112,6 @@ static int fail(char *err, size_t n, const char *fmt, ...) {
     return -1;
 }
 
-/* map typed operand -> 5-bit field, refusing the wrong kind */
-static int regfield(int kind, int r, uint32_t *f, const char *pos, const char *op, char *err, size_t n) {
-    if (r >= 0 && r <= 30) { *f = (uint32_t)r; return 0; }
-    if (kind == K_ZR && r == OSC_A64_XZR) { *f = 31; return 0; }
-    if (kind == K_SP && r == OSC_A64_SP) { *f = 31; return 0; }
-    if (r == OSC_A64_SP) return fail(err, n, "%s: %s cannot be SP", op, pos);
-    if (r == OSC_A64_XZR) return fail(err, n, "%s: %s cannot be XZR", op, pos);
-    return fail(err, n, "%s: %s register %d out of range", op, pos, r);
-}
-
-static int unreg(int kind, uint32_t f) {
-    if (f < 31) return (int)f;
-    if (kind == K_ZR) return OSC_A64_XZR;
-    if (kind == K_SP) return OSC_A64_SP;
-    return 255; /* not encodable: re-encode check refuses */
-}
-
-static unsigned pair_flags(int op) {
-    int writeback = op == OSC_A64_STP_PRE || op == OSC_A64_STP_POST || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
-    int loadpair = op == OSC_A64_LDP_OFF || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
-    return (unsigned)writeback | ((unsigned)loadpair << 1);
-}
-
 int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
     if (!in || !word) return fail(err, n, "null");
     int op = in->op;
@@ -151,19 +119,17 @@ int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
         return fail(err, n, "unknown op %d", op);
     const OpInfo *oi = &OPS[op];
     const char *nm = oi->name;
-    uint32_t rd = 0, rn = 0, rm = 0, ra = 0;
-    /* unused register / field positions must be zero (canonical form) */
-    if (oi->kd == K_NONE && in->rd) return fail(err, n, "%s: rd unused but set", nm);
-    if (oi->kn == K_NONE && in->rn) return fail(err, n, "%s: rn unused but set", nm);
-    if (oi->km == K_NONE && in->rm) return fail(err, n, "%s: rm unused but set", nm);
-    if (oi->ka == K_NONE && in->ra) return fail(err, n, "%s: ra unused but set", nm);
-    if (oi->kd != K_NONE && regfield(oi->kd, in->rd, &rd, "rd", nm, err, n)) return -1;
-    if (oi->kn != K_NONE && regfield(oi->kn, in->rn, &rn, "rn", nm, err, n)) return -1;
-    if (oi->km != K_NONE && regfield(oi->km, in->rm, &rm, "rm", nm, err, n)) return -1;
-    if (oi->ka != K_NONE && regfield(oi->ka, in->ra, &ra, "ra", nm, err, n)) return -1;
-    const OscA64Fields f = {.rd = rd, .rn = rn, .rm = rm, .ra = ra, .shift = in->shift,
-                            .cond = in->cond, .imm = in->imm, .imm2 = in->imm2};
-    uint64_t packed = osc_a64_checked_word(oi->cls, oi->base, &f, pair_flags(op));
+    uint64_t packed = osc_a64_write((const uint8_t *)oi, (const uint8_t *)in);
+    unsigned code = (unsigned)(packed >> 32);
+    if (code >= OSC_A64_ERR_UNUSED_REG && code < OSC_A64_ERR_BAD_REG + 4) {
+        const char *const positions[] = {"rd", "rn", "rm", "ra"};
+        const unsigned regs[] = {in->rd, in->rn, in->rm, in->ra};
+        unsigned i = (code - OSC_A64_ERR_UNUSED_REG) % 4;
+        if (code < OSC_A64_ERR_REG_SP) return fail(err, n, "%s: %s unused but set", nm, positions[i]);
+        if (code < OSC_A64_ERR_REG_ZR) return fail(err, n, "%s: %s cannot be SP", nm, positions[i]);
+        if (code < OSC_A64_ERR_BAD_REG) return fail(err, n, "%s: %s cannot be XZR", nm, positions[i]);
+        return fail(err, n, "%s: %s register %u out of range", nm, positions[i], regs[i]);
+    }
     switch (packed >> 32) {
     case 0: break;
     case OSC_A64_ERR_UNUSED_SHIFT:
@@ -215,28 +181,10 @@ int osc_a64_reencode(const OscA64Insn *in, uint32_t *word) {
 }
 
 int osc_a64_decode(uint32_t w, OscA64Insn *out) {
-    for (int op = 1; op < OSC_A64_NOPS; op++) {
-        const OpInfo *oi = &OPS[op];
-        if (!oi->name) continue;
-        if ((w & ~cls_varmask(oi->cls)) != oi->base) continue;
-        OscA64Insn d;
-        memset(&d, 0, sizeof d);
-        d.op = (uint8_t)op;
-        OscA64Fields f;
-        if (!osc_a64_canonical_word(oi->cls, oi->base, w, pair_flags(op), &f)) continue;
-        if (!out) return 0;
-        if (oi->kd != K_NONE) d.rd = (uint8_t)unreg(oi->kd, f.rd);
-        if (oi->kn != K_NONE) d.rn = (uint8_t)unreg(oi->kn, f.rn);
-        if (oi->km != K_NONE) d.rm = (uint8_t)unreg(oi->km, f.rm);
-        if (oi->ka != K_NONE) d.ra = (uint8_t)unreg(oi->ka, f.ra);
-        d.shift = (uint8_t)f.shift;
-        d.cond = (uint8_t)f.cond;
-        d.imm = f.imm;
-        d.imm2 = f.imm2;
-        *out = d;
-        return 0;
-    }
-    return -1;
+    OscA64Insn decoded = {0};
+    if (!osc_a64_read(w, (const uint8_t *)OPS, sizeof OPS, (uint8_t *)&decoded)) return -1;
+    if (out) *out = decoded;
+    return 0;
 }
 
 const char *osc_a64_op_name(int op) {

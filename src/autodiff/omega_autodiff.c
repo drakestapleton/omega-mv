@@ -24,6 +24,9 @@
  * calls (the MAX routing step only compares and moves values).
  */
 #include "omega_autodiff.h"
+#include "omega_api_decl.h"
+
+_Static_assert(OMEGA_TENSOR_MAX_RANK == 8, "gradient_shape.om uses eight reduction steps");
 
 #include <string.h>
 
@@ -61,10 +64,7 @@ static uint32_t push(OmegaAdTape *t, OmegaAdOp op, uint32_t in0, uint32_t in1, u
 }
 
 static bool same_shape(const OmegaTensorInfo *x, const OmegaTensorInfo *y) {
-    if (x->rank != y->rank) return false;
-    for (uint32_t d = 0; d < x->rank; d++)
-        if (x->shape[d] != y->shape[d]) return false;
-    return true;
+    return ad_same_shape(x->shape, x->rank, y->shape, y->rank);
 }
 
 /* Rank-0 F32 constant. */
@@ -94,26 +94,17 @@ static int unbroadcast(OmegaAdTape *t, OmegaTensor full, const OmegaTensorInfo *
     OmegaTensorInfo ci;
     int rc = omega_tensor_info(t->ctx, cur, &ci);
     if (rc) { rel(t, cur); return rc; }
-    if (ci.rank < target->rank) { rel(t, cur); return OMEGA_AD_ERR_SHAPE; }
-    while (ci.rank > target->rank) {
-        OmegaTensor nx;
-        rc = omega_tensor_reduce(t->ctx, OMEGA_TR_SUM, cur, 0, false, &nx);
+    uint8_t steps[OMEGA_TENSOR_MAX_RANK];
+    int64_t count = ad_unbroadcast_steps(ci.shape, ci.rank, target->shape, target->rank, steps);
+    if (count < 0) { rel(t, cur); return OMEGA_AD_ERR_SHAPE; }
+    for (int64_t i = 0; i < count; i++) {
+        OmegaTensor next;
+        rc = omega_tensor_reduce(t->ctx, OMEGA_TR_SUM, cur, steps[i] / 2, steps[i] & 1, &next);
         rel(t, cur);
         if (rc) return rc;
-        cur = nx;
+        cur = next;
         rc = omega_tensor_info(t->ctx, cur, &ci);
         if (rc) { rel(t, cur); return rc; }
-    }
-    for (uint32_t d = 0; d < target->rank; d++) {
-        if (target->shape[d] == 1 && ci.shape[d] != 1) { /* MUT:UNBROADCAST */
-            OmegaTensor nx;
-            rc = omega_tensor_reduce(t->ctx, OMEGA_TR_SUM, cur, d, true, &nx);
-            rel(t, cur);
-            if (rc) return rc;
-            cur = nx;
-            rc = omega_tensor_info(t->ctx, cur, &ci);
-            if (rc) { rel(t, cur); return rc; }
-        }
     }
     *out = cur;
     return OMEGA_AD_OK;
@@ -213,7 +204,7 @@ static int expand_reduced(OmegaAdTape *t, const OmegaAdNode *n, OmegaTensor *out
     if (!rc) rc = omega_tensor_info(t->ctx, n->grad, &gi);
     if (rc) return rc;
     uint64_t kshape[OMEGA_TENSOR_MAX_RANK];
-    for (uint32_t d = 0; d < ai.rank; d++) kshape[d] = (d == n->axis) ? 1 : ai.shape[d];
+    ad_restore_axis(ai.shape, ai.rank, n->axis, kshape, ai.rank);
     OmegaTensor r, b;
     rc = omega_tensor_reshape(t->ctx, n->grad, ai.rank, kshape, &r);
     if (rc) return rc;
