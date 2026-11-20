@@ -1,0 +1,399 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+om2
+layout CxWrite 64
+field opidx uint at 0 big
+field qpds uint at 4 big
+field flags uchar at 11 little
+field dst ulong at 16 big
+field rkey uint at 24 big
+field count uint at 32 big
+field lkey uint at 36 big
+field src ulong at 40 big
+end
+layout CxHead 64
+field word ulong at 0 little
+end
+layout CxCqe 64
+field sopqpn uint at 56 big
+field counter ushort at 60 big
+field opown uchar at 63 little
+end
+layout CxBe32 4
+field number uint at 0 big
+end
+layout CxLe32 4
+field number uint at 0 little
+end
+layout CxTile 256
+field bits uint 64 at 0 little
+end
+struct CxQueue sq long sqoff ulong sqcnt ulong cq long cqoff ulong cqcnt ulong stride ulong db long 2 dboff ulong 2 bf long bfoff ulong half ulong qpn uint pi ulong ci ulong busy int end
+struct CxRank arena long capacity ulong localva ulong 2 peerva ulong 2 lkey uint 2 rkey uint 2 limit uint 2 rankid int epoch uint active int phase int 2 start ulong 2 finish ulong 2 cursor ulong 2 end
+
+const CX_PAYLOAD int 0
+const CX_WAIT_READY int 1
+const CX_WAIT_ACK int 2
+const CX_DONE int 3
+const CX_REDUCE int 4
+
+fn cxPowerTwo x ulong to bool
+ret and ne x 0 eq and x sub x 1 0
+end
+
+fn cxFits base ulong size ulong to bool
+ret le size sub ulong 0xffffffffffffffff base
+end
+
+fn cxQueueValid q view CxQueue to bool
+if or le get q sq 0 le get q cq 0
+ret false
+end
+if or le get q db 0 0 le get q db 1 0
+ret false
+end
+if or le get q bf 0 gt get q qpn 0xffffff
+ret false
+end
+if or eq get q qpn 0 ne get q busy 0
+ret false
+end
+if or not cxPowerTwo get q sqcnt not cxPowerTwo get q cqcnt
+ret false
+end
+if and ne get q stride 64 ne get q stride 128
+ret false
+end
+if gt get q sqcnt div ulong 0xffffffffffffffff 64
+ret false
+end
+if gt get q cqcnt div ulong 0xffffffffffffffff get q stride
+ret false
+end
+if or ne and get q sqoff 63 0 ne and get q cqoff 63 0
+ret false
+end
+if or ne and get q dboff 0 3 0 ne and get q dboff 1 3 0
+ret false
+end
+if or ne and get q bfoff 7 0 ne and get q half 7 0
+ret false
+end
+if lt get q half 8
+ret false
+end
+if not cxFits get q bfoff get q half
+ret false
+end
+if not cxFits add get q bfoff get q half 8
+ret false
+end
+if not cxFits get q sqoff mul get q sqcnt 64
+ret false
+end
+ret cxFits get q cqoff mul get q cqcnt get q stride
+end
+
+fn cxNativeDb n uint to ulong
+b = new uchar 4 0
+cxPackDb b n
+ret cxReadDb b
+end
+fn cxPackDb b edit CxBe32 n uint to void
+put b number n
+end
+fn cxReadDb b view CxLe32 to ulong
+ret ulong get b number
+end
+
+fn cxControl w edit CxWrite q view CxQueue to void
+idx = uint and get q pi 0xffff
+put w opidx or shl idx 8 8
+put w qpds or shl get q qpn 8 3
+put w flags 8
+end
+
+fn cxSegment w edit CxWrite a view CxRank rail ulong src ulong dst ulong bytes uint to void
+put w src add get a localva rail src
+put w dst add get a peerva rail dst
+put w lkey get a lkey rail
+put w rkey get a rkey rail
+put w count bytes
+end
+
+note Private helper. One outstanding signalled RDMA write per exclusively owned SQ.
+fn cxPost q edit CxQueue a view CxRank rail ulong src ulong dst ulong bytes uint to int
+extent = add mul get a capacity 8 20
+if or ne get q busy 0 eq bytes 0
+ret -1
+end
+if or gt src extent gt dst extent
+ret -1
+end
+if or gt ulong bytes sub extent src gt ulong bytes sub extent dst
+ret -1
+end
+if or gt bytes get a limit rail gt bytes 0x7fffffff
+ret -1
+end
+w = new uchar 64 0
+cxControl w q
+cxSegment w a rail src dst bytes
+cxPublish q w
+ret 0
+end
+
+fn cxPublish q edit CxQueue w view CxWrite to void
+pi = get q pi
+slot = and pi sub get q sqcnt 1
+pos = add get q sqoff mul slot 64
+sq = get q sq
+copied = mapwrite sq pos w 0 64
+cxRing q cxHeader w
+end
+
+fn cxHeader w view CxHead to ulong
+ret get w word
+end
+
+fn cxRing q edit CxQueue header ulong to void
+pi = get q pi
+nextpi = add pi 1
+dbval = cxNativeDb uint and nextpi 0xffff
+status = mapset get q db 0 get q dboff 0 4 dbval
+bfpos = add get q bfoff mul and pi 1 get q half
+status = mapset get q bf bfpos 8 header
+put q pi nextpi
+put q busy 1
+end
+
+fn cxMatch c view CxCqe q view CxQueue to bool
+if ne and get c opown 0xfc 0
+ret false
+end
+expected = or shl uint 8 24 get q qpn
+if ne get c sopqpn expected
+ret false
+end
+ret eq ulong get c counter and sub get q pi 1 0xffff
+end
+
+note 0 pending, 1 retired, -1 terminal. A failed CQE stays available for diagnosis.
+fn cxPoll q edit CxQueue to int
+if ne get q busy 1
+ret -1
+end
+pos = cxCqePos q
+ci = get q ci
+count = get q cqcnt
+cq = get q cq
+b = new uchar 64 0
+n = mapread cq add pos 63 b 63 1
+tag = get b 63
+if eq shr tag 4 15
+ret 0
+end
+owner = and ulong tag 1
+if ne owner and div ci count 1
+ret 0
+end
+cpufence
+n = mapread cq pos b 0 64
+if not cxMatch b q
+put q busy -1
+ret -1
+end
+cxRetire q
+ret 1
+end
+
+fn cxCqePos q view CxQueue to ulong
+ci = get q ci
+count = get q cqcnt
+slot = and ci sub count 1
+stride = get q stride
+pos = add get q cqoff mul slot stride
+pos = add pos sub stride 64
+ret pos
+end
+
+fn cxRetire q edit CxQueue to void
+ci = get q ci
+nextci = add ci 1
+db = get q db 1
+dboff = get q dboff 1
+dbval = cxNativeDb uint and nextci 0xffffff
+status = mapset db dboff 4 dbval
+put q ci nextci
+put q busy 0
+end
+
+note Arena: activation and inbox of capacity FP32 each, then epoch, ready[2], ack[2].
+fn cxBegin a edit CxRank left view CxQueue right view CxQueue elements ulong to int
+if or ne get a active 0 gt elements get a capacity
+ret -1
+end
+if or lt get a rankid 0 gt get a rankid 1
+ret -1
+end
+if or le get a arena 0 eq get a epoch 0xffffffff
+ret -1
+end
+if or not cxQueueValid left not cxQueueValid right
+ret -1
+end
+if not cxArenaValid a
+ret -1
+end
+cxStart a elements
+ret 0
+end
+
+fn cxArenaValid a view CxRank to bool
+cap = get a capacity
+if gt cap div sub ulong 0xffffffffffffffff 20 8
+ret false
+end
+extent = add mul cap 8 20
+for rail ulong 2
+if or not cxFits get a localva rail extent not cxFits get a peerva rail extent
+ret false
+end
+if or ne and get a localva rail 3 0 ne and get a peerva rail 3 0
+ret false
+end
+if lt get a limit rail 4
+ret false
+end
+end
+ret true
+end
+
+fn cxStart a edit CxRank elements ulong to void
+cap = get a capacity
+split = mul add div elements 2 rem elements 2 4
+put a start 0 0
+put a finish 0 split
+put a start 1 split
+put a finish 1 mul elements 4
+for rail ulong 2
+put a cursor rail get a start rail
+put a phase rail CX_PAYLOAD
+end
+epoch = add get a epoch 1
+put a epoch epoch
+status = mapset get a arena mul cap 8 4 ulong epoch
+put a active 1
+end
+
+fn cxAddTile local edit CxTile peer view CxTile count ulong rankid int to void
+for i ulong count
+x = bitcast f32 get local bits i
+y = bitcast f32 get peer bits i
+if eq rankid 0
+put local bits i bitcast uint add x y
+else
+put local bits i bitcast uint add y x
+end
+end
+end
+
+fn cxReduceTile a edit CxRank rail ulong to void
+local = new uchar 256 0
+peer = new uchar 256 0
+pos = get a cursor rail
+stop = get a finish rail
+arena = get a arena
+inbox = mul get a capacity 4
+size = sub stop pos
+if gt size 256
+size = ulong 256
+end
+copied = mapread arena pos local 0 size
+copied = mapread arena add inbox pos peer 0 size
+cxAddTile local peer div size 4 get a rankid
+copied = mapwrite arena pos local 0 size
+put a cursor rail add pos size
+end
+
+note Progress exactly one rail; each notification follows its payload on that rail's RC QP.
+fn cxAdvance a edit CxRank q edit CxQueue rail ulong to int
+if ne get q busy 0
+completion = cxPoll q
+if le completion 0
+ret completion
+end
+end
+phase = get a phase rail
+flags = mul get a capacity 8
+ready = add add flags 4 mul rail 4
+ack = add ready 8
+if eq phase CX_PAYLOAD
+pos = get a cursor rail
+size = sub get a finish rail pos
+if gt size 0
+limit = ulong and get a limit rail 0xfffffffc
+if gt limit 0x7ffffffc
+limit = ulong 0x7ffffffc
+end
+if gt size limit
+size = limit
+end
+dst = add mul get a capacity 4 pos
+rc = cxPost q a rail pos dst uint size
+if eq rc 0
+put a cursor rail add pos size
+end
+ret rc
+end
+rc = cxPost q a rail flags ready 4
+if eq rc 0
+put a phase rail CX_WAIT_READY
+end
+ret rc
+end
+epoch = ulong get a epoch
+if eq phase CX_WAIT_READY
+if ne mapget get a arena ready 4 epoch
+ret 0
+end
+put a cursor rail get a start rail
+put a phase rail CX_REDUCE
+end
+if eq get a phase rail CX_REDUCE
+if lt get a cursor rail get a finish rail
+cxReduceTile a rail
+ret 0
+end
+rc = cxPost q a rail flags ack 4
+if eq rc 0
+put a phase rail CX_WAIT_ACK
+end
+ret rc
+end
+if eq phase CX_WAIT_ACK
+if eq mapget get a arena ack 4 epoch
+put a phase rail CX_DONE
+end
+end
+ret 0
+end
+
+note Public entry. 0 pending, 1 result consumable, -1 terminal or idle.
+fn cxProgress a edit CxRank left edit CxQueue right edit CxQueue to int
+if ne get a active 1
+ret -1
+end
+if lt cxAdvance a left 0 0
+put a active -1
+ret -1
+end
+if lt cxAdvance a right 1 0
+put a active -1
+ret -1
+end
+if and eq get a phase 0 CX_DONE eq get a phase 1 CX_DONE
+put a active 0
+ret 1
+end
+ret 0
+end

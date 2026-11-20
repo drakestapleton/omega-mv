@@ -1,0 +1,293 @@
+note Device-free oracle. Each simulated HCA fetches wire bytes and owns an independent consumer counter.
+fn testCheck ok bool code int to void
+if not ok
+exit code
+end
+end
+
+fn testMap to long
+h = mapnew -1 0 4096 3 34
+testCheck gt h 0 10
+ret h
+end
+
+fn testQueue q edit CxQueue number uint stride ulong to void
+h = testMap
+put q sq h
+put q cq h
+put q db 0 h
+put q db 1 h
+put q bf h
+put q dboff 0 16
+put q dboff 1 20
+put q qpn number
+put q stride stride
+note Device WQ consumer and producer DB begin near 16-bit roll-over.
+put q pi 65534
+put q ci 0xfffffe
+status = mapset h 0 8 65534
+status = mapset h 16 4 0xfeff0000
+b = new uchar 64 0
+put b 63 0xf0
+for i ulong 2
+pos = add get q cqoff mul i stride
+status = mapwrite h add pos sub stride 64 b 0 64
+end
+end
+
+fn testRank a edit CxRank other view CxRank to void
+for rail ulong 2
+put a localva rail add mapaddr get a arena mul rail 4096
+put a peerva rail add mapaddr get other arena mul rail 4096
+put a lkey rail add add uint 0x11223300 uint rail uint get a rankid
+put a rkey rail add add uint 0xaabbcc00 uint rail uint get other rankid
+end
+end
+
+fn testBE b view uchar 64 offset ulong size ulong to ulong
+v = ulong 0
+for i ulong size
+v = or shl v 8 ulong get b add offset i
+end
+ret v
+end
+
+fn testPayload w view uchar 64 a view CxRank peer view CxRank rail ulong to void
+bytes = testBE w 32 4
+src = sub testBE w 40 8 get a localva rail
+dst = sub testBE w 16 8 get a peerva rail
+testCheck eq testBE w 36 4 ulong get a lkey rail 24
+testCheck eq testBE w 24 4 ulong get a rkey rail 25
+testCheck le bytes ulong get a limit rail 26
+note Independent oracle accepts only the advertised peer inbox or the rail's own ready/ack word.
+flags = mul get a capacity 8
+if eq src flags
+ready = add add flags 4 mul rail 4
+testCheck and eq bytes 4 or eq dst ready eq dst add ready 8 27
+else
+testCheck eq dst add mul get a capacity 4 src 28
+testCheck ge src get a start rail 29
+testCheck le add src bytes get a finish rail 30
+end
+buf = new uchar 256 0
+n = mapread get a arena src buf 0 bytes
+n = mapwrite get peer arena dst buf 0 bytes
+end
+
+fn testCqe q view CxQueue seq ulong to void
+b = new uchar 64 0
+qnum = get q qpn
+put b 56 8
+put b 57 uchar and shr qnum 16 255
+put b 58 uchar and shr qnum 8 255
+put b 59 uchar and qnum 255
+put b 60 uchar and shr seq 8 255
+put b 61 uchar and seq 255
+ci = add ulong 0xfffffe sub seq 65534
+put b 63 uchar and div ci 2 1
+stride = get q stride
+base = add get q cqoff mul rem ci 2 stride
+n = mapwrite get q cq add base sub stride 64 b 0 64
+end
+
+fn testFetch q view CxQueue w edit uchar 64 seq ulong to void
+h = get q sq
+pos = add get q sqoff mul rem seq 2 64
+n = mapread h pos w 0 64
+testCheck eq testBE w 0 4 or shl and seq 0xffff 8 8 20
+testCheck eq testBE w 4 4 or shl ulong get q qpn 8 3 21
+testCheck eq get w 11 8 22
+door = add get q bfoff mul rem seq 2 get q half
+testCheck eq mapget h door 8 mapget h pos 8 23
+for i ulong 64
+if or and ge i 8 lt i 11 and ge i 12 lt i 16
+testCheck eq get w i 0 31
+end
+if or and ge i 28 lt i 32 ge i 48
+testCheck eq get w i 0 31
+end
+end
+end
+
+fn testHca q view CxQueue a view CxRank peer view CxRank rail ulong to void
+h = get q sq
+seq = mapget h 0 8
+db = new uchar 64 0
+n = mapread h 16 db 0 4
+posted = testBE db 0 4
+if eq posted and seq 0xffff
+ret
+end
+testCheck eq posted and add seq 1 0xffff 19
+w = new uchar 64 0
+testFetch q w seq
+testPayload w a peer rail
+testCqe q seq
+n = mapset h 0 8 add seq 1
+end
+
+fn testFill a view CxRank factor f32 to void
+for i ulong get a capacity
+value = mul f32 add i 1 factor
+s = mapset get a arena mul i 4 4 ulong bitcast uint value
+end
+end
+fn testSum a view CxRank elements ulong factor f32 to void
+for i ulong get a capacity
+scale = factor
+if lt i elements
+scale = 11.0f32
+end
+ref = mul f32 add i 1 scale
+v = mapget get a arena mul i 4 4
+testCheck eq v ulong bitcast uint ref 35
+end
+end
+
+fn testLoop a edit CxRank b edit CxRank al edit CxQueue ar edit CxQueue bl edit CxQueue br edit CxQueue to void
+for tick ulong 1000
+if eq get a active 1
+st = cxProgress a al ar
+testCheck ge st 0 40
+end
+if eq get b active 1
+st = cxProgress b bl br
+testCheck ge st 0 41
+end
+testHca al a b 0
+testHca bl b a 0
+if gt tick 12
+testHca ar a b 1
+testHca br b a 1
+else
+testCheck and eq get a active 1 eq get b active 1 42
+end
+if and eq get a active 0 eq get b active 0
+ret
+end
+end
+exit 43
+end
+
+note Withhold one remote acknowledgment while delivering its local send completion.
+note The other rank can finish. This rank must retain its old epoch until the delayed word arrives.
+fn testAck a edit CxRank b edit CxRank al edit CxQueue ar edit CxQueue bl edit CxQueue br edit CxQueue to void
+testCheck eq cxBegin a al ar 0 0 60
+testCheck eq cxBegin b bl br 0 0 61
+for tick ulong 40
+if eq get a active 1
+st = cxProgress a al ar
+testCheck ge st 0 62
+end
+if eq get b active 1
+st = cxProgress b bl br
+testCheck ge st 0 63
+end
+testHca al a b 0
+testHca ar a b 1
+testHca bl b a 0
+testHca br b a 1
+if eq get b phase 1 2
+offset = add mul get a capacity 8 16
+rc = mapset get a arena offset 4 ulong sub get a epoch 1
+end
+end
+testCheck eq get b active 0 64
+testCheck eq get a active 1 65
+testCheck eq cxBegin a al ar 1 -1 66
+testCheck eq cxBegin b bl br 1 0 67
+st = cxProgress b bl br
+testCheck eq st 0 68
+testHca bl b a 0
+testHca br b a 1
+offset = add mul get a capacity 8 16
+rc = mapset get a arena offset 4 ulong get a epoch
+testCheck eq cxProgress a al ar 1 69
+testCheck eq cxBegin a al ar 1 0 70
+testLoop a b al ar bl br
+end
+
+fn testDb q view CxQueue to void
+b = new uchar 64 0
+n = mapread get q db 1 get q dboff 1 b 0 4
+testCheck eq testBE b 0 4 and get q ci 0xffffff 48
+end
+
+fn testBad q edit CxQueue a view CxRank kind int to void
+rc = cxPost q a 0 0 0 4
+testCheck eq rc 0 50
+testCheck eq cxPost q a 0 0 0 4 -1 51
+seq = sub get q pi 1
+testCqe q seq
+pos = cxCqePos q
+b = new uchar 64 0
+n = mapread get q cq pos b 0 64
+tag = get b 63
+put b 63 xor tag 1
+n = mapwrite get q cq pos b 0 64
+testCheck eq cxPoll q 0 52
+put b 63 tag
+if eq kind 0
+put b 63 or tag 0xd0
+end
+if eq kind 1
+put b 59 xor get b 59 1
+end
+if eq kind 2
+put b 61 xor get b 61 1
+end
+if eq kind 3
+put b 63 or tag 12
+end
+n = mapwrite get q cq pos b 0 64
+testCheck eq cxPoll q -1 53
+testCheck eq get q busy -1 54
+end
+
+fn main to int
+a = new CxRank 0 135 0 0 0 0 132 0 0 0 0 0 0 0
+b = new CxRank 0 135 0 0 0 0 132 1 0 0 0 0 0 0
+al = new CxQueue 0 64 2 0 256 2 64 0 0 0 640 256 0 0 0 0
+ar = new CxQueue 0 64 2 0 256 2 64 0 0 0 640 256 0 0 0 0
+bl = new CxQueue 0 64 2 0 256 2 64 0 0 0 640 256 0 0 0 0
+br = new CxQueue 0 64 2 0 256 2 64 0 0 0 640 256 0 0 0 0
+testQueue al 0x123456 64
+testQueue ar 0x234567 128
+testQueue bl 0x345678 128
+testQueue br 0x456789 64
+put a arena testMap
+put b arena testMap
+testRank a b
+testRank b a
+testCheck eq cxBegin a al ar 136 -1 11
+put a peerva 1 0xfffffffffffffffc
+testCheck eq cxBegin a al ar 5 -1 16
+testRank a b
+put ar stride 32
+testCheck eq cxBegin a al ar 5 -1 12
+put ar stride 128
+for run ulong 5
+elements = run
+if eq run 3
+elements = ulong 135
+end
+testFill a 1.0f32
+testFill b 10.0f32
+testCheck eq cxBegin a al ar elements 0 13
+testCheck eq cxBegin a al ar elements -1 14
+testCheck eq cxBegin b bl br elements 0 15
+testLoop a b al ar bl br
+testSum a elements 1.0f32
+testSum b elements 10.0f32
+end
+testAck a b al ar bl br
+testDb al
+testDb ar
+testDb bl
+testDb br
+testBad al a 0
+testBad ar a 1
+testBad bl b 2
+testBad br b 3
+ret 0
+end

@@ -205,6 +205,10 @@ Handwritten .om units of omega-mv that are not part of the seed ladder: the ORIG
 
 Bounded native .om reverse-mode tape (rank 2, f32, 32 nodes) over M20 metadata-v1; E1-tile reductions and C M21 accumulation order (#664, not qualified)
 
+## `native/connectx7/`
+
+Seeded Omega TP=2 FP32 AllReduce over two preconfigured mlx5 RC rails, with a device-free host fixture. Its README specifies the registered arena and queue handoff.
+
 ## `native/orig4/`
 
 ORIG-4 shadow advice for the matvec arm chooser (omega-mv#731, spec/shadow-advice-v0.md): shadow.om advisor unit, shadowmain.om entry, orig4.pin, immutable ORIG-2 candidate images. Default off; advice only, never a decision.

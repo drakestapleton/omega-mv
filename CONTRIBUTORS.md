@@ -376,3 +376,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Rewrote lexical scope destruction in Omega, including nested borrow closure, conditional owner release, arena escape and pool teardown. |
 | Codex (under Drake Stapleton's direction) | Converted OSC handle provenance, stale read/write/free decisions, branch snapshots and loop settlement to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Converted OSC owner and borrow snapshots, rollback of fresh borrows, branch joins and move replay to seeded Omega. |
+| Codex (under Drake Stapleton’s direction) | Implemented the pure Omega dual-rail mlx5 TP=2 FP32 AllReduce and its two-rank AArch64 host fixture in `native/connectx7/`. |
