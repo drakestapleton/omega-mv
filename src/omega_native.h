@@ -99,6 +99,10 @@ uint32_t omega2_cg_rl_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp
 uint32_t omega2_cg_mc_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
 /* export fn cg_mc_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_mc_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_gpu_attn "omega-ident 1 unit=cg_gpu_attn abi=2 profile=OM-2 src=076e736c118de55183d6255f1d8417d5e298253ae2358d99e3fc829558632f3e omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_gpu_attn(void);
+/* export fn cg_gpu_attn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_gpu_attn_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 #ifdef __cplusplus
 }
 #endif
