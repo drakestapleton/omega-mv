@@ -15,6 +15,12 @@ extern "C" {
 #define OMEGA_REENTRY 33u
 #define OMEGA_BAD_RT 34u
 #define OMEGA_NO_STACK 35u
+#define OMEGA2_IDENT_arboris_arena "omega-ident 1 unit=arboris_arena abi=2 profile=OM-2 src=8ebd9677c1863b5747f0fda2f1d31f5186d7758a7f89d9dd136e7caa681aed11 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_arboris_arena(void);
+/* export fn arboris_plan_arena m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong */
+uint32_t omega2_arboris_plan_arena(uint64_t *result, uint64_t *o_m, uint64_t o_m_len, uint64_t o_budget, uint64_t o_page, uint64_t *o_offsets, uint64_t o_offsets_len);
+/* export fn arboris_check_csr m view ulong 16 data view uint * to ulong */
+uint32_t omega2_arboris_check_csr(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint32_t *o_data, uint64_t o_data_len);
 #define OMEGA2_IDENT_sha256_om2 "omega-ident 1 unit=sha256_om2 abi=2 profile=OM-2 src=dbf002dd6aa36585632b9d01d98ac3f0bd2fa0f0475082940de53638847994bb omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_sha256_om2(void);
 /* export fn sha256_init c edit shactx to void */
