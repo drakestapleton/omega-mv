@@ -392,6 +392,7 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Selected 4 KiB system-memory pages for guarded Arboris allocations and exercised RM extent checks on duplicate objects. |
 | Codex (under Drake Stapleton's direction) | Connected the device completion word to the Arboris receipt, verified Ed25519 step signatures, and published the epoch and bank through a single ordered cursor store. |
 | Codex (under Drake Stapleton's direction) | Vectorized the fused Arboris tick to process eight FP16 coordinates per lane with aligned 128-bit global loads and stores. |
+| Codex (under Drake Stapleton's direction) | Packed hub somas into a stable suffix, remapped handles and both banks, and checked the reordered gated tick against the CPU oracle. |
 | Codex (under Drake Stapleton's direction) | Checked the batched sparse CPU fixtures against closed-form outputs at both routing sizes. |
 | Codex (under Drake Stapleton's direction) | Implemented seeded Omega SM121 kernels and decode tables for the DeepSeek-V4.1-Flash text backbone, added driver-loadable cubin metadata and single-Spark numerical checks. |
 | Codex (under Drake Stapleton's direction) | Built the resident pure-Omega DeepSeek-V4.1-Flash final-head executor, native QMD submission chain, packed-BF16 vocabulary projection, and full-vocabulary checkpoint comparison. |

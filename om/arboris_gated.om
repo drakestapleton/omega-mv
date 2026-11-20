@@ -217,3 +217,151 @@ export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ush
   end
   ret 0
 end
+
+
+note Cold loader workspace is two equal arena images followed by 2*N uint
+note remap entries. Input image is first, output second. Only logical slab
+note bytes are copied. Each half is bound by the same checked plan. The map
+note is new-to-old followed by old-to-new. d[15] holds image length in ushorts.
+fn ag_fan a view ushort * d view ulong 16 i ulong to ulong
+  ret sub ag_u32 a get d 5 add i 1 ag_u32 a get d 5 i
+end
+fn ag_word a edit ushort * base ulong i ulong value ulong to void
+  p = add base mul i 2
+  put a p ushort and value 65535
+  put a add p 1 ushort and shr value 16 65535
+end
+fn ag_order a edit ushort * d view ulong 16 threshold ulong count ulong to void
+  first = ulong 0
+  hub = count
+  ids = mul get d 15 2
+  n = get d 0
+  for i ulong n bound 0x1000000
+    index = first
+    if le ag_fan a d i threshold
+      first = add first 1
+    else
+      index = hub
+      hub = add hub 1
+    end
+    ag_word a ids index i
+    ag_word a ids add n i index
+  end
+end
+fn ag_copy_row a edit ushort * d view ulong 16 base_slot ulong old ulong destination ulong to void
+  old = add get d base_slot mul old get d 3
+  destination = add add get d 15 get d base_slot mul destination get d 3
+  for i ulong get d 3 bound 24576
+    put a add destination i get a add old i
+  end
+end
+
+fn ag_copy_syn a edit ushort * d view ulong 16 k ulong new_k ulong to void
+  old = ag_u32 a get d 7 k
+  id = ag_u32 a mul get d 15 2 add get d 0 old
+  ag_word a add get d 15 get d 7 new_k id
+  ag_copy_row a d 9 k new_k
+end
+
+note Cursor is new soma, old branch, new branch, new synapse.
+fn ag_copy_branch a edit ushort * d view ulong 16 cursor edit ulong 4 to void
+  b = get cursor 1
+  new_b = get cursor 2
+  meta = ag_u32 a get d 8 b
+  ag_word a add get d 15 get d 8 new_b or and meta 0xff000000 get cursor 0
+  ag_copy_row a d 10 b new_b
+  k = ag_u32 a get d 6 b
+  stop = ag_u32 a get d 6 add b 1
+  new_k = get cursor 3
+  ag_word a add get d 15 get d 6 new_b new_k
+  while lt k stop bound handle_limit
+    ag_copy_syn a d k new_k
+    new_k = add new_k 1
+    k = add k 1
+  end
+  put cursor 3 new_k
+  put cursor 2 add new_b 1
+end
+fn ag_copy_graph a edit ushort * d view ulong 16 to void
+  cursor = new ulong 4 0
+  for i ulong get d 0 bound 0x1000000
+    old = ag_u32 a mul get d 15 2 i
+    put cursor 0 i
+    ag_word a add get d 15 get d 5 i get cursor 2
+    b = ag_u32 a get d 5 old
+    stop = ag_u32 a get d 5 add old 1
+    while lt b stop bound handle_limit
+      put cursor 1 b
+      ag_copy_branch a d cursor
+      b = add b 1
+    end
+    for j ulong 4
+      ag_copy_row a d add 11 j old i
+    end
+  end
+  ag_word a add get d 15 get d 5 get d 0 get d 1
+  ag_word a add get d 15 get d 6 get d 1 get d 2
+end
+fn ag_partition a edit ushort * d view ulong 16 smem ulong limits edit ulong 2 to bool
+  tile = get d 3
+  if gt tile 256
+    tile = ulong 256
+  end
+  hub = div smem mul tile 4
+  threshold = div hub 4
+  if and ne get limits 0 0 lt get limits 0 threshold
+    threshold = get limits 0
+  end
+  count = ulong 0
+  for i ulong get d 0 bound 0x1000000
+    fan = ag_fan a d i
+    if gt fan hub
+      ret false
+    end
+    if le fan threshold
+      count = add count 1
+    end
+  end
+  ag_order a d threshold count
+  put limits 1 count
+  ret true
+end
+fn ag_image_header m view ulong 16 a edit ushort * cells ulong to void
+  for i ulong 16
+    ag_word a cells mul i 2 get m i
+    ag_word a cells add mul i 2 1 shr get m i 32
+  end
+end
+
+note limits[0] optionally lowers the standard branch cap. limits[1] receives
+note the prefix boundary. Run before plan lock, when the arena digest is zero.
+export fn arboris_pack_gated m view ulong 16 offsets view ulong 6 a edit ushort * limits edit ulong 2 to ulong
+  d = new ulong 16 0
+  cells = div get m 12 2
+  if or ne get m 15 0 gt get m 12 len a
+    ret 1
+  end
+  if not ag_layout m offsets cells 4096 d
+    ret 1
+  end
+  if gt get d 3 24576
+    ret 2
+  end
+  if ne sub len a get m 12 mul get d 0 4
+    ret 2
+  end
+  if not ag_input_ok a d
+    ret 3
+  end
+  put d 15 cells
+  if not ag_partition a d get m 13 limits
+    ret 4
+  end
+  ag_image_header m a cells
+  ag_copy_graph a d
+  receipt = add cells div get offsets 5 2
+  for i ulong 32
+    put a add receipt i 0
+  end
+  ret 0
+end

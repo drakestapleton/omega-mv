@@ -29,6 +29,8 @@ uint64_t arboris_spread_step(const uint32_t *o_topo, size_t o_topo_len, const ui
 uint64_t arboris_relax_step(const uint32_t *o_topo, size_t o_topo_len, const uint32_t *o_weights, size_t o_weights_len, uint32_t *o_state, size_t o_state_len);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
 uint64_t arboris_gated_tick(const uint64_t o_m[16], const uint64_t o_offsets[6], uint16_t *o_arena, size_t o_arena_len, uint64_t o_page);
+/* export fn arboris_pack_gated m view ulong 16 offsets view ulong 6 a edit ushort * limits edit ulong 2 to ulong */
+uint64_t arboris_pack_gated(const uint64_t o_m[16], const uint64_t o_offsets[6], uint16_t *o_a, size_t o_a_len, uint64_t o_limits[2]);
 /* export fn arboris_emit_spread n ulong code edit uchar 16384 to ulong */
 uint64_t arboris_emit_spread(uint64_t o_n, uint8_t o_code[16384]);
 /* export fn arboris_emit_relax n ulong code edit uchar 16384 to ulong */

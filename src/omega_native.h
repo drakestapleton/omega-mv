@@ -15,7 +15,7 @@ extern "C" {
 #define OMEGA_REENTRY 33u
 #define OMEGA_BAD_RT 34u
 #define OMEGA_NO_STACK 35u
-#define OMEGA2_IDENT_arboris_arena "omega-ident 1 unit=arboris_arena abi=2 profile=OM-2 src=b297c68004a50e33497a8a5f5e8d0edfaf0600273c15773e300309148c2b416d omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_arboris_arena "omega-ident 1 unit=arboris_arena abi=2 profile=OM-2 src=299e46f3f69433b7d0f7591b8888135dcd31e7f8a43b52e429f91c03c9cc7458 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_arena(void);
 /* export fn arboris_plan_arena m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong */
 uint32_t omega2_arboris_plan_arena(uint64_t *result, uint64_t *o_m, uint64_t o_m_len, uint64_t o_budget, uint64_t o_page, uint64_t *o_offsets, uint64_t o_offsets_len);
@@ -33,10 +33,12 @@ uint32_t omega2_arboris_topology_digest(uint64_t *result, const uint32_t *o_topo
 uint32_t omega2_arboris_spread_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
 /* export fn arboris_relax_step topo view uint * weights view uint * state edit uint * to ulong */
 uint32_t omega2_arboris_relax_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
-#define OMEGA2_IDENT_arboris_gated "omega-ident 1 unit=arboris_gated abi=2 profile=OM-2 src=0a567d908abb3696564107a73b5c746fab4128662cf7bbf8e63ea11f4ed12df5 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_arboris_gated "omega-ident 1 unit=arboris_gated abi=2 profile=OM-2 src=7c4410e5586fb8afc5f4d963ae7280ccc71d57b602659e41da36d3982177a300 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_gated(void);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
 uint32_t omega2_arboris_gated_tick(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint64_t *o_offsets, uint64_t o_offsets_len, uint16_t *o_arena, uint64_t o_arena_len, uint64_t o_page);
+/* export fn arboris_pack_gated m view ulong 16 offsets view ulong 6 a edit ushort * limits edit ulong 2 to ulong */
+uint32_t omega2_arboris_pack_gated(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint64_t *o_offsets, uint64_t o_offsets_len, uint16_t *o_a, uint64_t o_a_len, uint64_t *o_limits, uint64_t o_limits_len);
 #define OMEGA2_IDENT_blackwell_arboris_emit "omega-ident 1 unit=blackwell_arboris_emit abi=2 profile=OM-2 src=a98a7066eda403b2c76445cbbf3076c84274b6b3762d7baa1f1f5ed25a4de2f5 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_blackwell_arboris_emit(void);
 /* export fn arboris_emit_spread n ulong code edit uchar 16384 to ulong */
