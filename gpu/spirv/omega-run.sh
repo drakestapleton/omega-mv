@@ -26,8 +26,15 @@ case "$K" in
 esac
 B=$(mktemp -d)
 trap 'rm -rf "$B"' EXIT
+HOST_ARCH=$(uname -m 2>/dev/null || echo aarch64)
+TGT=${OMEGA_TARGET:-}
+if [ -z "$TGT" ] && [ "$HOST_ARCH" = "x86_64" ]; then TGT=x86linux; fi
 for f in emit val run conform; do
-  "$OMC" < "$S/$f.om" > "$B/$f" 2>"$B/$f.err"
+  if [ -n "$TGT" ]; then
+    { printf 'target %s\n' "$TGT"; cat "$S/$f.om"; } | "$OMC" > "$B/$f" 2>"$B/$f.err"
+  else
+    "$OMC" < "$S/$f.om" > "$B/$f" 2>"$B/$f.err"
+  fi
   CRC=$?
   if [ "$CRC" -ne 0 ]; then
     if [ "$CRC" -eq 126 ] || [ "$CRC" -eq 127 ]; then

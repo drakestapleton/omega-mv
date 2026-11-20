@@ -9,9 +9,19 @@ OMC=${OMC:-seed/out/omc}
 S=$(dirname "$0")
 B=$(mktemp -d)
 trap 'rm -rf "$B"' EXIT
+HOST_ARCH=$(uname -m 2>/dev/null || echo aarch64)
+TGT=${OMEGA_TARGET:-}
+if [ -z "$TGT" ] && [ "$HOST_ARCH" = "x86_64" ]; then TGT=x86linux; fi
+compile_om() {
+  if [ -n "$TGT" ]; then
+    { printf 'target %s\n' "$TGT"; cat "$1"; } | "$OMC" > "$2"
+  else
+    "$OMC" < "$1" > "$2"
+  fi
+}
 fail=0
 for f in records batch isa plan launch; do
-  "$OMC" < "$S/xe/$f.om" > "$B/$f" || { echo "FAIL compile xe/$f.om"; exit 1; }
+  compile_om "$S/xe/$f.om" "$B/$f" || { echo "FAIL compile xe/$f.om"; exit 1; }
   chmod +x "$B/$f"
   echo "PASS compile xe/$f.om"
 done

@@ -7,10 +7,20 @@
 # checks validator, mutant, and cross-kernel negative controls.
 # Usage: sh gpu/spirv/check.sh   (env: OMC=seed/out/omc, SPIRV_VAL=spirv-val). Exit 0 all pass, 1 fail.
 OMC=${OMC:-seed/out/omc}; SV=${SPIRV_VAL:-spirv-val}; S=$(dirname "$0"); B=${B:-$(mktemp -d)}
+HOST_ARCH=$(uname -m 2>/dev/null || echo aarch64)
+TGT=${OMEGA_TARGET:-}
+if [ -z "$TGT" ] && [ "$HOST_ARCH" = "x86_64" ]; then TGT=x86linux; fi
+compile_om() {
+  if [ -n "$TGT" ]; then
+    { printf 'target %s\n' "$TGT"; cat "$1"; } | "$OMC" > "$2"
+  else
+    "$OMC" < "$1" > "$2"
+  fi
+}
 fail=0
 have_sv=0
 if command -v "$SV" >/dev/null 2>&1 || [ -x "$SV" ]; then have_sv=1; fi
-for f in emit val run conform; do "$OMC" < "$S/$f.om" > "$B/$f" || { echo "FAIL compile $f"; exit 1; }; chmod +x "$B/$f"; done
+for f in emit val run conform; do compile_om "$S/$f.om" "$B/$f" || { echo "FAIL compile $f"; exit 1; }; chmod +x "$B/$f"; done
 for k in vadd vmul vsub vmax fsum16 rmsnorm gemm16; do for e in cl vk; do
   env=opencl2.2; [ $e = vk ] && env=vulkan1.1
   "$B/emit" $k $e > "$B/$k.$e.spv" || fail=1
