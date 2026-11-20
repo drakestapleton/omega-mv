@@ -74,11 +74,11 @@ python3 om/gpu/dsv41/check-head.py --fixture frames.bin
 From the repository root, in a single-Spark correctness window:
 
 ```sh
-spark-window run build/dsv41/dsv41-head model-00043-of-00048.safetensors < frames.bin > logits.f32
+spark-window run env --ignore-signal=PIPE build/dsv41/dsv41-head model-00043-of-00048.safetensors < frames.bin > logits.f32
 python3 om/gpu/dsv41/check-head.py model-00043-of-00048.safetensors frames.bin logits.f32
 ```
 
-A frame is 40,976 bytes. First write four row-major 5120-element residual streams as little-endian BF16, then four little-endian FP32 mixing coefficients. Each complete frame produces 129,280 little-endian FP32 logits in token-ID order (517,120 bytes). EOF between frames ends the session. After emitting one million frames the process closes its resources and exits 75. The caller may open a new session for subsequent frames. A partial frame exits 65. Exit 74 reports a native resource, submission, completion, or IO error. Keep the checkpoint immutable for the lifetime of the process.
+A frame is 40,976 bytes. First write four row-major 5120-element residual streams as little-endian BF16, then four little-endian FP32 mixing coefficients. Each complete frame produces 129,280 little-endian FP32 logits in token-ID order (517,120 bytes). EOF between frames ends the session. After emitting one million frames the process closes its resources and exits 75. The caller may open a new session for subsequent frames. A partial frame exits 65. Exit 74 reports a native resource, submission, completion, or IO error. The example inherits an ignored SIGPIPE so a closed output pipe returns 74 through explicit device cleanup. Direct invocation with the default POSIX signal disposition terminates on SIGPIPE when a reader disconnects. Keep the checkpoint immutable for the lifetime of the process.
 
 Every frame goes through BF16 widening, the four-stream pre-mix, BF16 rounding, RMS normalization, weighted scaling, a second BF16 rounding, and the packed vocabulary projection. The projection uses one warp per vocabulary row and accumulates in FP32. The earlier 40 decoder layers supply the frame in a complete inference graph. The check accepts independent test frames and compares every vocabulary row with a CPU calculation using the released weights.
 
