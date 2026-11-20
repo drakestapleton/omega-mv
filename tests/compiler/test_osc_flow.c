@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 
 static unsigned map_attempts;
@@ -28,6 +29,24 @@ int main(void)
     char error[128] = {0};
     if (osc_ir_validate(&unit, error, sizeof error) || map_attempts) {
         fprintf(stderr, "standalone validation: %s, mmap attempts %u\n", error, map_attempts);
+        return 1;
+    }
+
+    /* In-memory callers may leave inactive vtypes untouched. Make that
+     * slot look like a bool and verify that a clause cannot consume it. */
+    f->nparams = 1;
+    f->vtype[0].s = OSC_T_BOOL;
+    f->nreq = 1;
+    f->req[0] = (OscCterm){.kind = OSC_CT_PARAM};
+    if (osc_ir_validate(&unit, error, sizeof error) != -1 ||
+        strcmp(error, "func 0: malformed requires/ensures object")) {
+        fprintf(stderr, "inactive contract parameter: %s\n", error);
+        return 1;
+    }
+    f->req[0] = (OscCterm){.kind = OSC_CT_CONST, .sub = OSC_T_BOOL, .imm = 1};
+    if (osc_ir_validate(&unit, error, sizeof error) != -1 || strcmp(error, "func 0: bad nvregs") ||
+        map_attempts) {
+        fprintf(stderr, "constant contract on malformed register table: %s\n", error);
         return 1;
     }
 
