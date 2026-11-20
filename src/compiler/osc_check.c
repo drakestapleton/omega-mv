@@ -71,10 +71,8 @@ typedef OscCheckedOwner Obj;
 typedef OscCheckedBorrow Bor;
 
 typedef struct {
-    Obj obj[OSC_CHECK_MAX_OBJS];
-    Bor bor[OSC_CHECK_MAX_BORS];
-    int symbor[OSC_CHECK_MAX_SYMS];
-    int nobj, nbor, nsym;
+    OscSnapshotShape shape;
+    uint32_t words[];
 } Snap;
 
 _Static_assert(sizeof(((OscCheckedScope *)0)->visible) / sizeof(uint16_t) == OSC_CHECK_MAX_SYMS, "OSC scope symbol capacity");
@@ -483,19 +481,37 @@ static void pop_scope(C *c)
 }
 
 /* ------------------------------------------------------------ state snapshots */
+/* The Omega walker reads native record words. The generated owner and borrow
+ * layouts assert their field offsets; the scope walker asserts the symbol
+ * stride and borrow-index offset. */
+_Static_assert(sizeof(Obj) == 5 * sizeof(uint32_t) && sizeof(Bor) == 6 * sizeof(uint32_t) &&
+               _Alignof(Obj) >= _Alignof(uint32_t) && _Alignof(Bor) >= _Alignof(uint32_t) &&
+               _Alignof(Sym) >= _Alignof(uint32_t), "OSC snapshot word layout");
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "OSC snapshot state byte order");
+
+static size_t snap_words(const OscSnapshotShape *shape)
+{
+    return (size_t)shape->owners * OSC_SNAP_OWNER_WORDS +
+           (size_t)shape->borrows * OSC_SNAP_BORROW_WORDS + shape->symbols;
+}
+
 static Snap *snap_take(C *c)
 {
-    Snap *s = c->a->alloc(c->a->ctx, sizeof *s);
+    OscSnapshotShape shape = {.owners = (uint32_t)c->nobj, .borrows = (uint32_t)c->nbor,
+                              .symbols = (uint32_t)c->nsym, .active = (uint32_t)c->nbor};
+    size_t words = snap_words(&shape);
+    Snap *s = c->a->alloc(c->a->ctx, sizeof *s + words * sizeof *s->words);
     if (!s) return NULL;
-    memcpy(s->obj, c->obj, sizeof(Obj) * (size_t)c->nobj);
-    memcpy(s->bor, c->bor, sizeof(Bor) * (size_t)c->nbor);
-    for (int i = 0; i < c->nsym; i++) s->symbor[i] = c->sym[i].bor;
-    s->nobj = c->nobj;
-    s->nbor = c->nbor;
-    s->nsym = c->nsym;
+    s->shape = shape;
+    osc_snapshot_save(&shape, (const uint32_t *)c->obj, (const uint32_t *)c->bor,
+                      (const uint32_t *)c->sym, s->words, words);
     return s;
 }
-static void snap_free(C *c, Snap *s) { c->a->free(c->a->ctx, s, sizeof *s); }
+
+static void snap_free(C *c, Snap *s)
+{
+    if (s) c->a->free(c->a->ctx, s, sizeof *s + snap_words(&s->shape) * sizeof *s->words);
+}
 /* OSC-3 item 2: handle state (freed provenances, provenance per handle) */
 static HSave *hs_take(C *c)
 {
@@ -521,10 +537,10 @@ static void hs_settle(C *c, const HSave *before, const HSave *other, uint32_t li
  * allocated (ids are single assignment) but are dead */
 static void snap_restore(C *c, const Snap *s)
 {
-    memcpy(c->obj, s->obj, sizeof(Obj) * (size_t)s->nobj);
-    memcpy(c->bor, s->bor, sizeof(Bor) * (size_t)s->nbor);
-    for (int i = s->nbor; i < c->nbor; i++) c->bor[i].live = 0;
-    for (int i = 0; i < s->nsym; i++) c->sym[i].bor = s->symbor[i];
+    OscSnapshotShape shape = s->shape;
+    shape.active = (uint32_t)c->nbor;
+    osc_snapshot_restore(&shape, (uint32_t *)c->obj, (uint32_t *)c->bor,
+                         (uint32_t *)c->sym, s->words, snap_words(&shape));
 }
 
 /* ------------------------------------------------------------ integer helpers */
@@ -1504,9 +1520,8 @@ static int chk_if(C *c, int i)
          * definitely moved (no flag). Neither: unchanged. Pre-existing
          * objects are never OM_GONE on a path that falls through. */
         int32_t changed[OSC_CHECK_MAX_OBJS];
-        size_t bytes = (size_t)nobj0 * sizeof(Obj);
-        size_t nchanged = osc_join_owners((const uint8_t *)s1->obj, bytes, (uint8_t *)c->obj, bytes,
-                                          changed, (size_t)nobj0);
+        size_t nchanged = osc_join_snapshot(s1->words, (size_t)nobj0 * OSC_SNAP_OWNER_WORDS,
+                                            (uint32_t *)c->obj, changed, (size_t)nobj0);
         for (size_t j = 0; j < nchanged; j++) {
             int sym = c->obj[changed[j]].sym;
             if (sym >= 0) NODE(c->sym[sym].decl)->dflag = 1;
@@ -1514,9 +1529,13 @@ static int chk_if(C *c, int i)
     }
     c->term = 0;
     /* re-emit moves that hold after the if */
-    for (int o = 0; o < nobj0; o++)
-        if (c->obj[o].moved == 1 && s0->obj[o].moved != 1)
-            tr_ev(c, OSC_EV_MOVE, o, -1, -1, -1, c->obj[o].moveline, 0);
+    if (c->tr && nobj0) {
+        int32_t ids[OSC_CHECK_MAX_OBJS];
+        size_t count = osc_snapshot_moves(s0->words, (size_t)nobj0 * OSC_SNAP_OWNER_WORDS,
+                                          (const uint32_t *)c->obj, ids, (size_t)nobj0);
+        for (size_t j = 0; j < count; j++)
+            tr_ev(c, OSC_EV_MOVE, ids[j], -1, -1, -1, c->obj[ids[j]].moveline, 0);
+    }
     hs_settle(c, h0, t1 || t2 ? NULL : h1, n->line);
     rc = 0;
 out:

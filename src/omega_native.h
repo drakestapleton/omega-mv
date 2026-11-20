@@ -277,7 +277,7 @@ uint32_t omega2_osc_read_import(uint64_t *result, uint8_t *o_state, uint64_t o_k
 uint32_t omega2_osc_clause_word(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_used, uint64_t o_prev, uint64_t o_kind, const uint8_t *o_word, uint64_t o_word_len);
 /* export fn osc_statement_plan plan edit stmtplan kind ulong nextkind ulong third ulong spelling view uchar * to ulong */
 uint32_t omega2_osc_statement_plan(uint64_t *result, uint8_t *o_plan, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third, const uint8_t *o_spelling, uint64_t o_spelling_len);
-#define OMEGA2_IDENT_osc_ownership "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=b89c54bb7edd8e242def52f184a2df63754b02bf921b39839344f1d5d7f6fdec omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+#define OMEGA2_IDENT_osc_ownership "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=c4f5ef3c8ab48d0e1ec05732683b61feaf807691bbbbe73e73399d0ae36670bc omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_ownership(void);
 /* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
 uint32_t omega2_osc_owner_access(uint64_t *result, uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
@@ -303,6 +303,14 @@ uint32_t omega2_osc_close_borrow(uint64_t *result, uint8_t *o_owner, uint8_t *o_
 uint32_t omega2_osc_close_reborrow(uint64_t *result, uint8_t *o_parent, uint8_t *o_child);
 /* export fn osc_join_owners taken view uchar * remaining edit uchar * changes edit int * to ulong */
 uint32_t omega2_osc_join_owners(uint64_t *result, const uint8_t *o_taken, uint64_t o_taken_len, uint8_t *o_remaining, uint64_t o_remaining_len, int32_t *o_changes, uint64_t o_changes_len);
+/* export fn osc_snapshot_save shape view snapdim owners view uint 1280 borrows view uint 3072 symbols view uint 19200 saved edit uint * to void */
+uint32_t omega2_osc_snapshot_save(uint64_t *result, const uint8_t *o_shape, const uint32_t *o_owners, uint64_t o_owners_len, const uint32_t *o_borrows, uint64_t o_borrows_len, const uint32_t *o_symbols, uint64_t o_symbols_len, uint32_t *o_saved, uint64_t o_saved_len);
+/* export fn osc_snapshot_restore shape view snapdim owners edit uint 1280 borrows edit uint 3072 symbols edit uint 19200 saved view uint * to void */
+uint32_t omega2_osc_snapshot_restore(uint64_t *result, const uint8_t *o_shape, uint32_t *o_owners, uint64_t o_owners_len, uint32_t *o_borrows, uint64_t o_borrows_len, uint32_t *o_symbols, uint64_t o_symbols_len, const uint32_t *o_saved, uint64_t o_saved_len);
+/* export fn osc_join_snapshot saved view uint * owners edit uint 1280 changes edit int * to ulong */
+uint32_t omega2_osc_join_snapshot(uint64_t *result, const uint32_t *o_saved, uint64_t o_saved_len, uint32_t *o_owners, uint64_t o_owners_len, int32_t *o_changes, uint64_t o_changes_len);
+/* export fn osc_snapshot_moves saved view uint * owners view uint 1280 ids edit int * to ulong */
+uint32_t omega2_osc_snapshot_moves(uint64_t *result, const uint32_t *o_saved, uint64_t o_saved_len, const uint32_t *o_owners, uint64_t o_owners_len, int32_t *o_ids, uint64_t o_ids_len);
 #define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=04d9c3dead3cabf5dbfa96da36fe4c58c64aa20ea36494bbfa92d1d0d3a17c4e omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_scope(void);
 /* export fn osc_scope_reset table edit scopetab to void */
