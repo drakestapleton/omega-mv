@@ -26,6 +26,15 @@ sh tests/arboris/build-sparse-probe.sh "$out/sparse-chip"
 sh tests/arboris/build-sparse-probe.sh "$out/wave-chip" tests/arboris/sparse-silicon.om wave
 sh tests/arboris/build-sparse-probe.sh "$out/small-chip" tests/arboris/sparse-silicon.om small
 sh tests/arboris/build-sparse-probe.sh "$out/gated-chip" tests/arboris/gated-silicon.om
+for model in small sparse wave; do
+    "$out/$model-chip" reference > "$out/$model-reference.log"
+    case "$model" in
+        small)  expected=33dfc6bc867a2bfbe09192038538c209c9b8bc89e16b6cedcaf0e7cf32b1a8f6 ;;
+        sparse) expected=8ded4456ffe03d54cad43b7b7b8d07ff1997919c103dd1b49b61c6782d6e3d19 ;;
+        wave)   expected=b2d9f9458d97db2f5415078fbc43ad0256229175bbc28127eeaad941a708dc7a ;;
+    esac
+    grep -qx "output_sha256=$expected" "$out/$model-reference.log"
+done
 "$out/gated-chip" reference > "$out/gated-reference.log"
 compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om tests/arboris_spread_test.om
 "$out/spread"
