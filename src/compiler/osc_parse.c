@@ -109,20 +109,23 @@ static int tok_eq(P *p, const OscToken *t, const char *s)
 }
 
 /* index of the struct named by token t, -1 if none is declared (yet) */
+_Static_assert(offsetof(OscStruct, name) == 0 && offsetof(OscField, name) == 0 &&
+               OSC_NAME_MAX == 64, "OSC record name layout");
+
 static int find_struct(P *p, const OscToken *t)
 {
-    for (int k = 0; k < p->ast->nstructs; k++)
-        if (tok_eq(p, t, p->ast->structs[k].name)) return k;
-    return -1;
+    if (t->kind != OT_NAME) return -1;
+    return (int)osc_record_name((const uint8_t *)p->ast->structs,
+                                (size_t)p->ast->nstructs * sizeof(OscStruct),
+                                (const uint8_t *)p->ast->src + t->off, t->len, sizeof(OscStruct), 0);
 }
 
-/* index of field `t` in struct k, -1 if none */
 static int find_field(P *p, int k, const OscToken *t)
 {
+    if (t->kind != OT_NAME) return -1;
     const OscStruct *s = &p->ast->structs[k];
-    for (int f = 0; f < s->nfields; f++)
-        if (tok_eq(p, t, s->fields[f].name)) return f;
-    return -1;
+    return (int)osc_record_name((const uint8_t *)s->fields, s->nfields * sizeof(OscField),
+                                (const uint8_t *)p->ast->src + t->off, t->len, sizeof(OscField), 0);
 }
 
 static int undefined_type(P *p, const OscToken *t)

@@ -491,6 +491,8 @@ uint64_t osc_bind_cell_argument(OscCallArgs *o_call, uint64_t o_index, int64_t o
 uint64_t osc_call_requires(const uint8_t *o_nodes, size_t o_nodes_len, const OscCallArgs *o_call, OscContractBindings *o_bindings, uint64_t *o_stack, size_t o_stack_len);
 /* export fn osc_slice_args types view uint * args view ulong * to long */
 int64_t osc_slice_args(const uint32_t *o_types, size_t o_types_len, const uint64_t *o_args, size_t o_args_len);
+/* export fn osc_return_ensures nodes view uchar * selectors view uint 3 bindings edit contract stack edit ulong * to ulong */
+uint64_t osc_return_ensures(const uint8_t *o_nodes, size_t o_nodes_len, const uint32_t o_selectors[3], OscContractBindings *o_bindings, uint64_t *o_stack, size_t o_stack_len);
 #define OSC_A64_ERR_UNUSED_SHIFT 1
 #define OSC_A64_ERR_UNUSED_COND 2
 #define OSC_A64_ERR_UNUSED_IMM2 3
@@ -719,6 +721,8 @@ void osc_scope_bind(OscCheckedScope *o_table, uint64_t o_id, const uint8_t *o_na
 uint64_t osc_scope_push(OscCheckedScope *o_table);
 /* export fn osc_scope_pop table edit scopetab to void */
 void osc_scope_pop(OscCheckedScope *o_table);
+/* export fn osc_record_name records view uchar * name view uchar * stride ulong newest ulong to long */
+int64_t osc_record_name(const uint8_t *o_records, size_t o_records_len, const uint8_t *o_name, size_t o_name_len, uint64_t o_stride, uint64_t o_newest);
 /* export fn osc_find_function names view uchar * name view uchar * to long */
 int64_t osc_find_function(const uint8_t *o_names, size_t o_names_len, const uint8_t *o_name, size_t o_name_len);
 #define OSC_POOL_FULL 1

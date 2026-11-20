@@ -926,9 +926,8 @@ static const OscField *chk_field(C *c, OscNode *n, int s)
         return NULL;
     }
     const OscStruct *st = &c->ast->structs[y->ty.sid - 1];
-    int f = -1;
-    for (int k = 0; k < st->nfields; k++)
-        if (!strcmp(st->fields[k].name, fname)) f = k;
+    int f = (int)osc_record_name((const uint8_t *)st->fields, st->nfields * sizeof(OscField),
+                                 (const uint8_t *)fname, strlen(fname), sizeof(OscField), 1);
     if (f < 0) {
         const OscToken *ft = &c->ast->toks[n->lo];
         osc_diag_set(c->d, OSC_DIAG_UNKNOWN_FIELD, ft->line, ft->col, fname, c->ast->struct_line[y->ty.sid - 1],
@@ -1580,16 +1579,12 @@ static int chk_return_ensures(C *c, OscNode *n)
     OscAst *a = c->ast;
     int fi = c->fi;
     if (a->ensn[fi] < 0 || a->ens_elide[fi] || a->res_sym[fi] < 0) return 0;
-    CEnv env;
-    memset(&env, 0, sizeof env);
-    env.res_sym = -1;
-    uint64_t rv, v;
-    if (!ceval(c, n->a, &env, &rv)) return 0;
-    env.res_sym = a->res_sym[fi];
-    env.known = 1;
-    env.result = rv;
-    if (!ceval(c, a->ensn[fi], &env, &v)) return 0;
-    if (!v) {
+    CEnv env = {0};
+    uint32_t selectors[] = {(uint32_t)n->a, (uint32_t)a->ensn[fi], (uint32_t)a->res_sym[fi]};
+    uint64_t decision = osc_return_ensures((const uint8_t *)a->nodes, a->nnodes * sizeof(OscNode),
+                                           selectors, &env, c->expr_work, c->expr_words);
+    if (!decision) return 0;
+    if (decision == 2) {
         char fname[64];
         osc_node_name(a, NODE(c->fnode), fname, sizeof fname);
         osc_diag_set(c->d, OSC_DIAG_CONTRACT_VIOLATION, n->line, n->col, fname, NODE(a->ensn[fi])->line, a->ens[fi],
