@@ -52,7 +52,7 @@ trap cleanup EXIT
 # Git discovery as aien-run refuses their ownership. Use their object store
 # only as input to pack-objects in the newly initialized destination.
 spark_sibling_objects() {
-    local source=$1 root sibling project mirror link admin path
+    local source=$1 root sibling project mirror link admin path operator_uid owner_uid
     [ "$(id -un)" = aien-run ] || return 1
     root=$(pwd -P)
     [[ "$root" =~ ^/var/lib/aien-run/wt/omega/[0-9a-f]{40}/omega$ ]] || return 1
@@ -71,9 +71,15 @@ spark_sibling_objects() {
     [[ "${admin#"$mirror/worktrees/"}" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
     [ "$(realpath -e -- "$admin")" = "$admin" ] || return 1
     [ "$(realpath -e -- "$mirror/objects")" = "$mirror/objects" ] || return 1
+    # wt.sh installs the worktree registry inside the root-owned sandbox home.
+    [ "$(stat -c %u /var/lib/aien-run)" = 0 ] || return 1
+    operator_uid=$(stat -c %u /var/lib/aien-run/wt) || return 1
+    [ "$operator_uid" != "$(id -u)" ] || return 1
     for path in /var/lib/aien-run /var/lib/aien-run/wt /var/lib/aien-run/wt/omega "${root%/*}" "$source" "$source/.git" /var/lib/aien-run/mirror \
                 "$mirror" "$mirror/worktrees" "$admin" "$admin/gitdir" "$admin/commondir" "$mirror/objects"; do
         [ ! -w "$path" ] && [ ! -L "$path" ] || return 1
+        owner_uid=$(stat -c %u -- "$path") || return 1
+        [ "$owner_uid" = 0 ] || [ "$owner_uid" = "$operator_uid" ] || return 1
     done
     [ "$(<"$admin/gitdir")" = "$source/.git" ] && [ "$(<"$admin/commondir")" = ../.. ] || return 1
     [ ! -e "$mirror/objects/info/alternates" ] && [ ! -L "$mirror/objects/info/alternates" ] || return 1
@@ -167,7 +173,7 @@ verify_checkout() {
             120000:blob)
                 if [ -L "$file" ]; then
                     # readlink -z preserves embedded/trailing newlines; remove only its NUL delimiter.
-                    got=$(readlink -z -- "$file" | head -c -1 | gitc hash-object --stdin 2>/dev/null) || got=""
+                    got=$(readlink -z -- "$file" | head -c -1 | gitc -C "$dir" hash-object --stdin 2>/dev/null) || got=""
                     [ "$got" = "$id" ] || bad+="$path(symlink) "
                 else
                     bad+="$path(type) "
@@ -188,7 +194,7 @@ verify_checkout() {
     done < "$tmpd/entries"
 
     if [ -s "$tmpd/regular" ]; then
-        gitc hash-object --no-filters --stdin-paths < "$tmpd/regular" > "$tmpd/regular.got" 2>/dev/null ||
+        gitc -C "$dir" hash-object --no-filters --stdin-paths < "$tmpd/regular" > "$tmpd/regular.got" 2>/dev/null ||
             die "cannot hash regular files under $dir"
         if ! cmp -s "$tmpd/regular.ids" "$tmpd/regular.got"; then
             bad+="regular-file-content "
