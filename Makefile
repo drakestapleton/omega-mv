@@ -136,6 +136,21 @@ check-physics-lock:
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
+.PHONY: test-m18
+test-m18: $(TARGET)
+	./$(TARGET) --run-m18-gates
+
+# M18 refuses an executable built in a dirty checkout or from a different commit.
+# A content-stable header also invalidates an old object when only Git HEAD moves.
+.PHONY: m18-build-revision
+$(OUT_DIR)/m18-build-revision.h: m18-build-revision | $(OUT_DIR)
+	@set -e; rev=""; if state=$$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none) && test -z "$$state"; then rev=$$(git rev-parse --verify 'HEAD^{commit}'); fi; \
+	tmp=$@.$$$$; printf '#define OMEGA_M18_BUILD_COMMIT "%s"\n' "$$rev" > "$$tmp"; \
+	if cmp -s "$$tmp" $@; then rm -f "$$tmp"; else mv "$$tmp" $@; fi
+
+$(OUT_DIR)/omega_blackwell_gates.o: $(OUT_DIR)/m18-build-revision.h
+$(OUT_DIR)/omega_blackwell_gates.o: private override CFLAGS += -include $(abspath $(OUT_DIR)/m18-build-revision.h)
+
 $(OUT_DIR)/%.o: src/%.c | $(OUT_DIR)
 	$(CC) $(CFLAGS) $(CUDAPP_ENCODER_DEFS) -c $< -o $@
 
