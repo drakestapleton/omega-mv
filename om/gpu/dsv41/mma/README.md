@@ -1,0 +1,9 @@
+# GB10 mixed-format expert projections
+
+These fixed seeded OM-2 emitters reproduce SM121a instruction streams calibrated with PTXAS 13.0.88. The projection uses one warp per eight output channels. The mixed QMMA takes E4M3 activations, E2M1 weights with the nibble placed in bits 2 through 5 of its byte, and E8M0 scales per group of 32. Output accumulators are FP32. The FP8 control expands each weight nibble exactly into E4M3 and uses the same scales. The build uses omc and kpack.
+
+Launch exactly 32 threads per block. Arguments are activation bytes, weight bytes, activation scales, weight scales, output float32 values and K as a u32. K must be a positive multiple of 32 and N a positive multiple of eight. Inputs and weights are K-contiguous. The caller supplies buffers sized for the entire grid. Use grid (N/8,M,1) for the single-row projection. The tiled projection uses grid (N/8,M/16,1) and requires M divisible by 16.
+
+The researcher experiment uses the W1, W3 and W2 tensors of layer 0 expert 0 of DeepSeek-V4.1-Flash revision 314113f8a7dadb388215396ba5fbee2c610a04d6, a fixed route weight of 0.375 and deterministic synthetic activations. Its GPU event interval includes both activation quantizations, all three projections, BF16 conversion kernels and weighted SwiGLU. Weight staging and readback occur outside the interval. Launch uses the CUDA driver test harness. The executables are independent projection kernels. A native serving executor must still wire their device buffers, grid and completion handling.
+
+Copy the [researcher setup prompt](RESEARCHER-PROMPT.md) into your agent to reproduce the checkpoint-backed benchmark on a DGX Spark.
