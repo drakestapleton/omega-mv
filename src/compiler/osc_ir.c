@@ -103,7 +103,9 @@ static bool canonical_for(OscScalar s, uint64_t v) {
     return v < (1ULL << w);
 }
 
-static bool is_term(uint8_t op) { return op == OSC_I_BR || op == OSC_I_CBR || op == OSC_I_RET; }
+_Static_assert(OSC_MAX_INSNS == 4096 && sizeof(OscInsn) == 48 && offsetof(OscInsn, op) == 0 &&
+               sizeof(OscBlock) == 8 && offsetof(OscBlock, first) == 0 && offsetof(OscBlock, count) == 4 &&
+               OSC_I_BR == 13 && OSC_I_CBR == 14 && OSC_I_RET == 15, "OSC block partition ABI");
 
 /* uses / def of an instruction (for def-before-use) */
 static int insn_uses(const OscInsn *in, int16_t *u) {
@@ -422,23 +424,19 @@ static int validate_func(const OscAlloc *a, const OscUnit *u, int fi, char *err,
     if (f->nblocks < 1 || f->nblocks > OSC_MAX_BLOCKS) return vfail(err, n, "func %d: bad nblocks", fi);
 
     /* blocks partition the instruction array */
-    uint8_t cover[OSC_MAX_INSNS];
-    memset(cover, 0, sizeof cover);
-    for (int b = 0; b < f->nblocks; b++) {
-        const OscBlock *bl = &f->blocks[b];
-        if (bl->count < 1 || (uint64_t)bl->first + bl->count > f->ninsns)
-            return vfail(err, n, "func %d block %d: bad range", fi, b);
-        for (uint32_t i = bl->first; i < bl->first + bl->count; i++) {
-            if (cover[i]) return vfail(err, n, "func %d: insn %u in two blocks", fi, i);
-            cover[i] = 1;
-            bool last = i == bl->first + bl->count - 1;
-            if (is_term(f->insns[i].op) != last)
-                return vfail(err, n, last ? "func %d block %d: missing terminator" :
-                                            "func %d block %d: terminator before block end", fi, b);
-        }
+    uint64_t location;
+    uint64_t partition = osc_block_partition((const uint8_t *)f->blocks, f->nblocks * sizeof(OscBlock),
+                                             (const uint8_t *)f->insns, f->ninsns * sizeof(OscInsn),
+                                             &location);
+    switch (partition) {
+    case 0: break;
+    case OSC_BLOCK_BAD_RANGE: return vfail(err, n, "func %d block %u: bad range", fi, (unsigned)location);
+    case OSC_BLOCK_OVERLAP: return vfail(err, n, "func %d: insn %u in two blocks", fi, (unsigned)location);
+    case OSC_BLOCK_NO_TERMINATOR: return vfail(err, n, "func %d block %u: missing terminator", fi, (unsigned)location);
+    case OSC_BLOCK_EARLY_TERMINATOR: return vfail(err, n, "func %d block %u: terminator before block end", fi, (unsigned)location);
+    case OSC_BLOCK_UNCOVERED: return vfail(err, n, "func %d: insn %u in no block", fi, (unsigned)location);
+    default: return vfail(err, n, "func %d: unknown block partition result", fi);
     }
-    for (uint32_t i = 0; i < f->ninsns; i++)
-        if (!cover[i]) return vfail(err, n, "func %d: insn %u in no block", fi, i);
     for (uint32_t i = 0; i < f->ninsns; i++)
         if (validate_insn(u, fi, f, i, err, n)) return -1;
     for (uint32_t i = 0; i < f->ninsns; i++) {
@@ -520,36 +518,33 @@ static int validate_func(const OscAlloc *a, const OscUnit *u, int fi, char *err,
 
     /* definite assignment: every use reads a vreg defined on every path */
     int nb = f->nblocks;
-    size_t bsz = sizeof(uint64_t) * BSW * (size_t)nb;
-    uint64_t *in = a->alloc(a->ctx, bsz), *out = a->alloc(a->ctx, bsz);
-    if (!in || !out) { a->free(a->ctx, in, bsz); a->free(a->ctx, out, bsz); vfail(err, n, "out of memory"); return -2; }
-    uint64_t params[BSW] = {0};
-    for (int v = 0; v < f->nparams; v++) params[v / 64] |= 1ULL << (v % 64);
-    for (int b = 0; b < nb; b++) for (int k = 0; k < BSW; k++) { in[b * BSW + k] = ~0ULL; out[b * BSW + k] = ~0ULL; }
-    int rc = 0;
-    for (int changed = 1; changed;) {  /* monotone decreasing: terminates */
-        changed = 0;
-        for (int b = 0; b < nb; b++) {
-            uint64_t cur[BSW];
-            for (int k = 0; k < BSW; k++) cur[k] = (b == 0) ? params[k] : ~0ULL;
-            /* meet over predecessors */
-            for (int p = 0; p < nb; p++) {
-                const OscInsn *t = &f->insns[f->blocks[p].first + f->blocks[p].count - 1];
-                bool pred = (t->op == OSC_I_BR && t->blk_t == b) ||
-                            (t->op == OSC_I_CBR && (t->blk_t == b || t->blk_f == b));
-                if (pred) for (int k = 0; k < BSW; k++) cur[k] &= out[p * BSW + k];
-            }
-            if (memcmp(cur, &in[b * BSW], sizeof cur)) { memcpy(&in[b * BSW], cur, sizeof cur); changed = 1; }
-            for (uint32_t i = f->blocks[b].first; i < f->blocks[b].first + f->blocks[b].count; i++) {
-                int d = insn_def(&f->insns[i]);
-                if (d >= 0) cur[d / 64] |= 1ULL << (d % 64);
-            }
-            if (memcmp(cur, &out[b * BSW], sizeof cur)) { memcpy(&out[b * BSW], cur, sizeof cur); changed = 1; }
-        }
+    size_t width = f->nvregs ? ((size_t)f->nvregs + 63) / 64 : 1;
+    size_t input_words = nb * width, transfer_words = nb * (width + 2);
+    uint64_t *in = a->alloc(a->ctx, input_words * sizeof(*in));
+    uint64_t *transfers = a->alloc(a->ctx, transfer_words * sizeof(*transfers));
+    if (!in || !transfers) {
+        a->free(a->ctx, in, input_words * sizeof(*in));
+        a->free(a->ctx, transfers, transfer_words * sizeof(*transfers));
+        vfail(err, n, "out of memory");
+        return -2;
     }
+    for (int b = 0; b < nb; b++) {
+        uint64_t *record = transfers + b * (width + 2);
+        memset(record, 0, width * sizeof(*record));
+        const OscBlock *bl = &f->blocks[b];
+        for (uint32_t i = bl->first; i < bl->first + bl->count; i++) {
+            int d = insn_def(&f->insns[i]);
+            if (d >= 0) record[d / 64] |= UINT64_C(1) << (d % 64);
+        }
+        const OscInsn *term = &f->insns[bl->first + bl->count - 1];
+        record[width] = term->op == OSC_I_RET ? nb : term->blk_t;
+        record[width + 1] = term->op == OSC_I_CBR ? term->blk_f : nb;
+    }
+    osc_definite_inputs(transfers, transfer_words, in, input_words, f->nparams, width);
+    int rc = 0;
     for (int b = 0; b < nb && !rc; b++) {
         uint64_t cur[BSW];
-        memcpy(cur, &in[b * BSW], sizeof cur);
+        memcpy(cur, &in[b * width], width * sizeof(*cur));
         for (uint32_t i = f->blocks[b].first; i < f->blocks[b].first + f->blocks[b].count && !rc; i++) {
             int16_t us[OSC_MAX_PARAMS + 2];
             int k = insn_uses(&f->insns[i], us);
@@ -562,8 +557,8 @@ static int validate_func(const OscAlloc *a, const OscUnit *u, int fi, char *err,
             if (d >= 0) cur[d / 64] |= 1ULL << (d % 64);
         }
     }
-    a->free(a->ctx, in, bsz);
-    a->free(a->ctx, out, bsz);
+    a->free(a->ctx, in, input_words * sizeof(*in));
+    a->free(a->ctx, transfers, transfer_words * sizeof(*transfers));
     return rc;
 }
 

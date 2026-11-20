@@ -1,0 +1,253 @@
+note SPDX-License-Identifier: Apache-2.0
+note OSC statement reachability and IR basic-block partitioning.
+note bridge c-define OSC_FLOW_RETURNS 1
+note bridge c-define OSC_FLOW_UNREACHABLE 2
+note bridge c-define OSC_BLOCK_BAD_RANGE 1
+note bridge c-define OSC_BLOCK_OVERLAP 2
+note bridge c-define OSC_BLOCK_NO_TERMINATOR 3
+note bridge c-define OSC_BLOCK_EARLY_TERMINATOR 4
+note bridge c-define OSC_BLOCK_UNCOVERED 5
+om2
+
+const node_size ulong 104
+const block_node ulong 3
+const if_node ulong 10
+const while_node ulong 11
+const for_node ulong 12
+const return_node ulong 13
+const arena_node ulong 27
+const pool_node ulong 28
+const absent ulong 4294967295
+const ir_insn_size ulong 48
+const ir_br uchar 13
+const ir_ret uchar 15
+
+fn read_le bytes view uchar * pos ulong width ulong to ulong
+  value = ulong 0
+  for i ulong width
+    value = or value shl ulong get bytes add pos i mul i 8
+  end
+  ret value
+end
+
+fn summarize_stmt nodes view uchar * id ulong flow edit uchar * to void
+  base = mul id node_size
+  kind = read_le nodes base 2
+  returns = uchar 0
+  if eq kind return_node
+    returns = 1
+  end
+  if or eq kind arena_node eq kind pool_node
+    returns = get flow read_le nodes add base 16 4
+  end
+  if eq kind if_node
+    other = read_le nodes add base 20 4
+    if ne other absent
+      then_id = read_le nodes add base 16 4
+      returns = and get flow other get flow then_id
+    end
+  end
+  if eq kind block_node
+    stmt = read_le nodes add base 12 4
+    while ne stmt absent
+      if ne returns 0
+        put flow stmt or get flow stmt uchar 2
+      else
+        returns = get flow stmt
+      end
+      stmt = read_le nodes add mul stmt node_size 24 4
+    end
+  end
+  put flow id returns
+end
+
+note Visit only statements, recording parents before their children. Reversing
+note this order computes each child's return status before its parent needs it.
+note A loop may execute zero times even if its entire body returns.
+export fn osc_statement_flow nodes view uchar * order edit ulong * flow edit uchar * to void
+requires eq len nodes mul len flow node_size
+requires ge len order len flow
+  note The caller puts the function body in order[0].
+  count = ulong 1
+  cursor = ulong 0
+  while lt cursor count
+    base = mul get order cursor node_size
+    cursor = add cursor 1
+    kind = read_le nodes base 2
+    if eq kind block_node
+      stmt = read_le nodes add base 12 4
+      while ne stmt absent
+        put order count stmt
+        count = add count 1
+        stmt = read_le nodes add mul stmt node_size 24 4
+      end
+    else
+      loop_body = or eq kind while_node eq kind for_node
+      region_body = or eq kind arena_node eq kind pool_node
+      if or eq kind if_node or loop_body region_body
+        put order count read_le nodes add base 16 4
+        count = add count 1
+        if eq kind if_node
+          other = read_le nodes add base 20 4
+          if ne other absent
+            put order count other
+            count = add count 1
+          end
+        end
+      end
+    end
+  end
+  for step ulong count
+    id = get order sub sub count 1 step
+    summarize_stmt nodes id flow
+  end
+end
+
+fn check_block insns view uchar * cover edit uchar 4096 first ulong count ulong location edit ulong 1 to ulong
+  if or eq count 0 gt add first count div len insns ir_insn_size
+    ret 1
+  end
+  for offset ulong count
+    i = add first offset
+    if ne get cover i 0
+      put location 0 i
+      ret 2
+    end
+    put cover i 1
+    op = get insns mul i ir_insn_size
+    term = and ge op ir_br le op ir_ret
+    if eq add offset 1 count
+      if eq term false
+        ret 3
+      end
+    else
+      if term
+        ret 4
+      end
+    end
+  end
+  ret 0
+end
+
+note Block order determines the first diagnostic. Report its block index for a
+note bad range or terminator and its instruction index for a coverage error.
+export fn osc_block_partition blocks view uchar * insns view uchar * location out ulong 1 to ulong
+requires eq rem len blocks 8 0
+requires eq rem len insns ir_insn_size 0
+requires le div len insns ir_insn_size 4096
+  cover = new uchar 4096 0
+  ninsns = div len insns ir_insn_size
+  for b ulong div len blocks 8
+    base = mul b 8
+    first = read_le blocks base 4
+    count = read_le blocks add base 4 4
+    put location 0 b
+    failure = check_block insns cover first count location
+    if ne failure 0
+      ret failure
+    end
+  end
+  for i ulong ninsns
+    if eq get cover i 0
+      put location 0 i
+      ret 5
+    end
+  end
+  put location 0 0
+  ret 0
+end
+
+note Each transfer record holds a block's generated register bitset followed
+note by its two successor indices, with the block count meaning no successor.
+note Propagate IN union GEN along each edge. Intersection at the destination
+note retains only registers defined on every incoming path.
+fn meet_words inputs edit ulong * generated view ulong * source ulong dest ulong to bool
+  changed = false
+  for k ulong len generated
+    outgoing = or get inputs add source k get generated k
+    old = get inputs add dest k
+    restricted = and old outgoing
+    if ne restricted old
+      put inputs add dest k restricted
+      changed = true
+    end
+  end
+  ret changed
+end
+
+fn meet_edge inputs edit ulong * record view ulong * source ulong successor ulong to bool
+  width = sub len record 2
+  target = get record add width successor
+  if eq target div len inputs width
+    ret false
+  end
+  ret meet_words inputs part record 0 width source mul target width
+end
+
+export fn osc_definite_inputs transfers view ulong * inputs edit ulong * params ulong width ulong to void
+requires gt width 0
+requires eq rem len inputs width 0
+requires ge len inputs width
+requires eq len transfers mul div len inputs width add width 2
+requires le params 6
+  blocks = div len inputs width
+  for i ulong len inputs
+    put inputs i 0xffffffffffffffff
+  end
+  for k ulong width
+    put inputs k 0
+  end
+  put inputs 0 sub shl ulong 1 params 1
+  changed = true
+  while changed
+    changed = false
+    for b ulong blocks
+      record = mul b add width 2
+      for successor ulong 2
+        if meet_edge inputs part transfers record add width 2 mul b width successor
+          changed = true
+        end
+      end
+    end
+  end
+end
+
+fn copy_insn source view ulong 24576 dest edit ulong 24576 src ulong dst ulong to void
+  for k ulong 6
+    put dest add dst k get source add src k
+  end
+end
+
+note Stable counting sort of emitted instructions by block, preserving both
+note block creation order and instruction emission order within each block.
+export fn osc_layout_blocks tags view short * source view ulong 24576 dest edit ulong 24576 blocks edit uint 1024 nblocks ulong to void
+requires le nblocks 512
+requires le len tags 4096
+  for i ulong len tags
+    label = get tags i
+    if or lt label 0 ge long label long nblocks
+      trap 3
+    end
+  end
+  for b ulong nblocks
+    put blocks add mul b 2 1 0
+  end
+  for i ulong len tags
+    pos = add mul ulong get tags i 2 1
+    put blocks pos add get blocks pos 1
+  end
+  first = uint 0
+  for b ulong nblocks
+    pos = mul b 2
+    put blocks pos first
+    first = add first get blocks add pos 1
+    put blocks add pos 1 0
+  end
+  for i ulong len tags
+    pos = mul ulong get tags i 2
+    count = get blocks add pos 1
+    dst = mul ulong add get blocks pos count 6
+    put blocks add pos 1 add count 1
+    copy_insn source dest mul i 6 dst
+  end
+end
