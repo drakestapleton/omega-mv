@@ -8,7 +8,17 @@ note bridge c-define OSC_OWN_READ_ONLY 3
 note bridge c-define OSC_OWN_LOOP_MOVE 4
 note bridge c-type oscowner OscCheckedOwner
 note bridge c-type oscbor OscCheckedBorrow
+note bridge c-type snapdim OscSnapshotShape
+note bridge c-define OSC_SNAP_OWNER_WORDS 3
+note bridge c-define OSC_SNAP_BORROW_WORDS 2
 om2
+
+layout snapdim 16
+field owners uint at 0 little
+field borrows uint at 4 little
+field symbols uint at 8 little
+field active uint at 12 little
+end
 
 note The checker snapshots this record at each branch. sym is the owning
 note symbol or -1, and arena1 is the arena symbol plus one or zero.
@@ -192,6 +202,134 @@ requires eq len remaining len taken
       end
       put remaining offset owner_maybe
       put changes count int i
+      count = add count 1
+    end
+  end
+  ret count
+end
+
+note The first three owner words carry the move state, child counts and move
+note line. Owner identity and arena affiliation are fixed at creation. For a
+note borrow only liveness and child counts can change after it is bound.
+note The remaining snapshot words hold each existing symbol's borrow index.
+fn save_owner_words owners view uint 1280 saved edit uint * count ulong to void
+  for i ulong count
+    src = mul i 5
+    dst = mul i 3
+    put saved dst get owners src
+    put saved add dst 1 get owners add src 1
+    put saved add dst 2 get owners add src 2
+  end
+end
+
+fn save_borrow_words borrows view uint 3072 saved edit uint * base ulong count ulong to void
+  for i ulong count
+    src = mul i 6
+    dst = add base mul i 2
+    put saved dst get borrows src
+    put saved add dst 1 get borrows add src 3
+  end
+end
+
+fn save_bindings symbols view uint 19200 saved edit uint * base ulong count ulong to void
+  for j ulong count
+    put saved add base j get symbols add mul j 40 24
+  end
+end
+
+export fn osc_snapshot_save shape view snapdim owners view uint 1280 borrows view uint 3072 symbols view uint 19200 saved edit uint * to void
+requires le get shape owners 256
+requires le get shape borrows 512
+requires le get shape symbols 480
+  save_owner_words owners saved ulong get shape owners
+  base = mul ulong get shape owners 3
+  save_borrow_words borrows saved base ulong get shape borrows
+  base = add base mul ulong get shape borrows 2
+  save_bindings symbols saved base ulong get shape symbols
+end
+
+fn restore_owner_words saved view uint * owners edit uint 1280 count ulong to void
+  for i ulong count
+    src = mul i 3
+    dst = mul i 5
+    put owners dst get saved src
+    put owners add dst 1 get saved add src 1
+    put owners add dst 2 get saved add src 2
+  end
+end
+
+fn restore_borrow_words shape view snapdim saved view uint * borrows edit uint 3072 base ulong to void
+  count = ulong get shape borrows
+  for i ulong count
+    src = add base mul i 2
+    dst = mul i 6
+    put borrows dst get saved src
+    put borrows add dst 3 get saved add src 1
+  end
+  note Preserve fresh IDs and all metadata. Only their live byte is cleared.
+  for j ulong sub ulong get shape active count
+    pos = mul add count j 6
+    put borrows pos and get borrows pos 4294967040
+  end
+end
+
+fn restore_bindings symbols edit uint 19200 saved view uint * base ulong count ulong to void
+  for j ulong count
+    put symbols add mul j 40 24 get saved add base j
+  end
+end
+
+export fn osc_snapshot_restore shape view snapdim owners edit uint 1280 borrows edit uint 3072 symbols edit uint 19200 saved view uint * to void
+requires le get shape owners 256
+requires le get shape borrows 512
+requires le get shape symbols 480
+requires ge get shape active get shape borrows
+requires le get shape active 512
+  restore_owner_words saved owners ulong get shape owners
+  base = mul ulong get shape owners 3
+  restore_borrow_words shape saved borrows base
+  base = add base mul ulong get shape borrows 2
+  restore_bindings symbols saved base ulong get shape symbols
+end
+
+note Join the entry owners present in both falling-through paths. The saved
+note arm has three words per owner; the live checker has five.
+fn join_saved_owner saved view uint * owners edit uint 1280 i ulong to bool
+  pos = mul i 5
+  src = mul i 3
+  record = get owners pos
+  current = uchar and record 255
+  taken = uchar and get saved src 255
+  if eq taken current
+    ret false
+  end
+  if keep_taken_line taken current
+    put owners add pos 2 get saved add src 2
+  end
+  put owners pos or and record 4294967040 uint owner_maybe
+  ret true
+end
+
+export fn osc_join_snapshot saved view uint * owners edit uint 1280 changes edit int * to ulong
+requires eq len saved mul len changes 3
+  count = ulong 0
+  for i ulong len changes
+    if join_saved_owner saved owners i
+      put changes count int i
+      count = add count 1
+    end
+  end
+  ret count
+end
+
+export fn osc_snapshot_moves saved view uint * owners view uint 1280 ids edit int * to ulong
+requires eq len saved mul len ids 3
+  count = ulong 0
+  for i ulong len ids
+    before = and get saved mul i 3 255
+    now = and get owners mul i 5 255
+    if and ne before 1 eq now 1
+      put ids count int i
       count = add count 1
     end
   end

@@ -577,6 +577,19 @@ uint64_t osc_statement_plan(OscStmtPlan *o_plan, uint64_t o_kind, uint64_t o_nex
 #define OSC_OWN_ALIAS 2
 #define OSC_OWN_READ_ONLY 3
 #define OSC_OWN_LOOP_MOVE 4
+#define OSC_SNAP_OWNER_WORDS 3
+#define OSC_SNAP_BORROW_WORDS 2
+typedef struct {
+    uint32_t owners;
+    uint32_t borrows;
+    uint32_t symbols;
+    uint32_t active;
+} OscSnapshotShape;
+OMBR_ASSERT(sizeof(OscSnapshotShape) == 16, "layout snapdim size");
+OMBR_ASSERT(offsetof(OscSnapshotShape, owners) == 0, "layout snapdim field owners");
+OMBR_ASSERT(offsetof(OscSnapshotShape, borrows) == 4, "layout snapdim field borrows");
+OMBR_ASSERT(offsetof(OscSnapshotShape, symbols) == 8, "layout snapdim field symbols");
+OMBR_ASSERT(offsetof(OscSnapshotShape, active) == 12, "layout snapdim field active");
 typedef struct {
     uint8_t moved;
     uint8_t ombr_pad1[1];
@@ -638,6 +651,14 @@ void osc_close_borrow(OscCheckedOwner *o_owner, OscCheckedBorrow *o_child);
 void osc_close_reborrow(OscCheckedBorrow *o_parent, OscCheckedBorrow *o_child);
 /* export fn osc_join_owners taken view uchar * remaining edit uchar * changes edit int * to ulong */
 uint64_t osc_join_owners(const uint8_t *o_taken, size_t o_taken_len, uint8_t *o_remaining, size_t o_remaining_len, int32_t *o_changes, size_t o_changes_len);
+/* export fn osc_snapshot_save shape view snapdim owners view uint 1280 borrows view uint 3072 symbols view uint 19200 saved edit uint * to void */
+void osc_snapshot_save(const OscSnapshotShape *o_shape, const uint32_t o_owners[1280], const uint32_t o_borrows[3072], const uint32_t o_symbols[19200], uint32_t *o_saved, size_t o_saved_len);
+/* export fn osc_snapshot_restore shape view snapdim owners edit uint 1280 borrows edit uint 3072 symbols edit uint 19200 saved view uint * to void */
+void osc_snapshot_restore(const OscSnapshotShape *o_shape, uint32_t o_owners[1280], uint32_t o_borrows[3072], uint32_t o_symbols[19200], const uint32_t *o_saved, size_t o_saved_len);
+/* export fn osc_join_snapshot saved view uint * owners edit uint 1280 changes edit int * to ulong */
+uint64_t osc_join_snapshot(const uint32_t *o_saved, size_t o_saved_len, uint32_t o_owners[1280], int32_t *o_changes, size_t o_changes_len);
+/* export fn osc_snapshot_moves saved view uint * owners view uint 1280 ids edit int * to ulong */
+uint64_t osc_snapshot_moves(const uint32_t *o_saved, size_t o_saved_len, const uint32_t o_owners[1280], int32_t *o_ids, size_t o_ids_len);
 typedef struct {
     uint16_t head[256];
     uint16_t prior[480];
