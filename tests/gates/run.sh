@@ -661,14 +661,22 @@ case "$step" in
   arboris-sparse-silicon)
     sh seed/omega-from-seed.sh
     OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
-    "$OUT_DIR/caproot-issuer" "$OUT_DIR/sparse-chip" --sparse-silicon > "$OUT_DIR/arboris-device.log" || {
-      cat "$OUT_DIR/arboris-device.log"
-      exit 1
-    }
-    cat "$OUT_DIR/arboris-device.log"
-    grep -qx 'matching_fp32_words=200000' "$OUT_DIR/arboris-device.log"
-    grep -qx 'kernel_sha256=c9c1f2a6c5c7de7f8379d85d8bba1ad49e20479c76d0dde70b1fca1becfeba5b' "$OUT_DIR/arboris-device.log"
-    grep -qx 'output_sha256=8ded4456ffe03d54cad43b7b7b8d07ff1997919c103dd1b49b61c6782d6e3d19' "$OUT_DIR/arboris-device.log"
+    for model in sparse small wave; do
+      log="$OUT_DIR/arboris-$model.log"
+      "$OUT_DIR/caproot-issuer" "$OUT_DIR/$model-chip" --arboris-silicon > "$log" || {
+        cat "$log"
+        exit 1
+      }
+      cat "$log"
+      case "$model" in
+        sparse) words=200000; code=relax.bin; output=8ded4456ffe03d54cad43b7b7b8d07ff1997919c103dd1b49b61c6782d6e3d19 ;;
+        small) words=4096; code=small.bin; output=33dfc6bc867a2bfbe09192038538c209c9b8bc89e16b6cedcaf0e7cf32b1a8f6 ;;
+        wave) words=400000; code=wave.bin; output=b2d9f9458d97db2f5415078fbc43ad0256229175bbc28127eeaad941a708dc7a ;;
+      esac
+      grep -qx "matching_fp32_words=$words" "$log"
+      grep -qx "kernel_sha256=$(sha256sum "$OUT_DIR/$code" | cut -d' ' -f1)" "$log"
+      grep -qx "output_sha256=$output" "$log"
+    done
     ;;
   arboris)
     sh seed/omega-from-seed.sh > "$OUT_DIR/seed.log" 2>&1

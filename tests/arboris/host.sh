@@ -20,7 +20,11 @@ compile "$out/native-arena" om/arboris_arena.om gpu/nvidia/native/nvrm/context.o
 "$out/native-arena"
 sh tests/arboris/build-sparse-probe.sh "$out/sparse-packet" tests/arboris/sparse-packet.om
 "$out/sparse-packet"
+sh tests/arboris/build-sparse-probe.sh "$out/commit-packet" tests/arboris/commit-packet.om
+"$out/commit-packet"
 sh tests/arboris/build-sparse-probe.sh "$out/sparse-chip"
+sh tests/arboris/build-sparse-probe.sh "$out/wave-chip" tests/arboris/sparse-silicon.om wave
+sh tests/arboris/build-sparse-probe.sh "$out/small-chip" tests/arboris/sparse-silicon.om small
 sh tests/arboris/build-sparse-probe.sh "$out/gated-chip" tests/arboris/gated-silicon.om
 "$out/gated-chip" reference > "$out/gated-reference.log"
 compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om tests/arboris_spread_test.om
@@ -55,6 +59,8 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/scoreboard_oracle.c sr
 "$out/check-wave" < "$out/wave.bin"
 "$out/check-wave" < "$out/relax.bin"
 "$out/check-wave" < "$out/gated.sass"
+"$out/emit" compound relax small > "$out/small.bin"
+"$out/check-wave" < "$out/small.bin"
 "$out/emit" mutant > "$out/wave-mutant.bin"
 if "$out/check-wave" < "$out/wave-mutant.bin" > "$out/negative.log"; then
     echo "FAIL: scoreboard accepted a missing load wait"

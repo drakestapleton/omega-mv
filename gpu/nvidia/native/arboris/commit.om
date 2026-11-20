@@ -1,0 +1,208 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note The supervisor holds the per-world writer lock through submission, signature
+note verification and publication. Its provisioned Ed25519 key is an argument
+note of this trusted boundary. Request/arena bytes cannot select a key.
+note ARBSTP01 signs 176 bytes: eight little-endian words (domain, model, subject,
+note grant id, generation, starting epoch, input bank, channel sequence),
+note three SHA-256 digests, and the output norm and traversed arc count.
+fn ar_wire_word body edit uchar 65536 i ulong v ulong to void
+  for k ulong 8
+    put body add mul i 8 k uchar and shr v mul k 8 255
+  end
+end
+
+fn ar_encode_step body edit uchar 65536 claims view ulong 8 hashes view uchar 96 norm ulong arcs ulong to void
+  for i ulong 8
+    ar_wire_word body i get claims i
+  end
+  for i ulong 96
+    put body add 64 i get hashes i
+  end
+  ar_wire_word body 20 norm
+  ar_wire_word body 21 arcs
+end
+
+fn ar_norm_word w ulong gated bool sum f64 to f64
+  if gated
+    if or eq and w 0x7c00 0x7c00 eq and w 0x7c000000 0x7c000000
+      ret neg 1.0f64
+    end
+    x = f64 f32of f16to32 and w 65535
+    y = f64 f32of f16to32 shr w 16
+    ret add add sum mul x x mul y y
+  end
+  if gt w 0x3f800000
+    ret neg 1.0f64
+  end
+  x = f64 f32of w
+  ret add sum mul x x
+end
+
+note Deterministic L2 norm. Visit logical output coordinates in dense order,
+note accumulate in binary64, take sqrt, truncate to unsigned Q32.32. Refuse
+note nonfinite values and a result outside the wire format.
+fn ar_norm m view ulong 16 metrics edit ulong 3 to bool
+  tok = get ar_maps sub ulong 4 get m 6
+  gated = eq get m 0 arboris_magic
+  count = div get m 11 4
+  if gated
+    count = div mul get m 1 get m 4 2
+  end
+  sum = f64 0
+  for i ulong count bound 0x4000000000
+    w = mapget tok mul i 4 4
+    sum = ar_norm_word w gated sum
+    if lt sum 0.0f64
+      ret false
+    end
+  end
+  v = fsqrt sum
+  if ge v 4294967296.0f64
+    ret false
+  end
+  put metrics 0 ulong mul v 4294967296.0f64
+  if gated
+    put metrics 1 get m 2
+    put metrics 2 get m 3
+  else
+    put metrics 1 0
+    put metrics 2 mul get m 2 get m 3
+  end
+  ret true
+end
+
+fn ar_step_message m view ulong 16 subject ulong handle view ulong 2 body edit uchar 65536 metrics edit ulong 3 to bool
+  seq = get ar_fenced_seq 0
+  hashes = new uchar 96 0
+  if or eq get m 7 0xffffffffffffffff not ar_step_digests m seq hashes
+    ret false
+  end
+  if not ar_norm m metrics
+    ret false
+  end
+  claims = new ulong 8 0
+  put claims 0 0x3130505453425241
+  put claims 1 get m 0
+  put claims 2 subject
+  put claims 3 get handle 0
+  put claims 4 get handle 1
+  put claims 5 get m 7
+  put claims 6 get m 6
+  put claims 7 seq
+  ar_encode_step body claims hashes get metrics 0 get metrics 2
+  ret true
+end
+
+fn ar_publish m view ulong 16 body view uchar 65536 metrics view ulong 3 to bool
+  if not ar_snapshot_matches m
+    ret false
+  end
+  if not ar_device_receipt get ar_maps 5 get ar_fenced_seq 0
+    ret false
+  end
+  tok = get ar_maps 5
+  tag = ulong 0
+  for i ulong 8
+    tag = or tag shl ulong get body add 128 i mul i 8
+  end
+  if ne mapset tok 8 8 get metrics 1 0
+    ret false
+  end
+  if ne mapset tok 16 8 get metrics 2 0
+    ret false
+  end
+  if ne mapset tok 24 8 get metrics 0 0
+    ret false
+  end
+  if ne mapset tok 40 8 tag 0
+    ret false
+  end
+  note Single aligned, system-ordered store makes the next state visible.
+  if ne mapset tok 32 8 add get m 7 1 0
+    ret false
+  end
+  put ar_fenced_seq 0 0
+  ret true
+end
+
+fn ar_commit_step table long subject ulong handle view ulong 2 m view ulong 16 trusted_pk view uchar 32 sig view uchar 64 to bool
+  if not caproot_validate table subject handle m
+    ret false
+  end
+  body = new uchar 65536 0
+  metrics = new ulong 3 0
+  if not ar_step_message m subject handle body metrics
+    ret false
+  end
+  if ne edverify trusted_pk body 176 sig 0 1
+    ret false
+  end
+  if not caproot_validate table subject handle m
+    ret false
+  end
+  ret ar_publish m body metrics
+end
+
+note Synchronous local signer channel. The supervisor supplies the connected
+note write/read descriptors and pinned public key. The signer accepts a 176-byte execution
+note claim, records the signed claim, then replies with its 64-byte signature.
+note A refused or disconnected signer leaves the completed bank pending.
+fn ar_signer_write fd int body view uchar 65536 to bool
+  offset = ulong 0
+  while lt offset 176
+    n = write fd body offset sub ulong 176 offset
+    if ne n neg long 4
+      if le n 0
+        ret false
+      end
+      offset = add offset ulong n
+    end
+  end
+  ret true
+end
+
+fn ar_signer_read fd int signature edit uchar 64 to bool
+  offset = ulong 0
+  while lt offset 64
+    n = read fd signature offset sub ulong 64 offset
+    if ne n neg long 4
+      if le n 0
+        ret false
+      end
+      offset = add offset ulong n
+    end
+  end
+  ret true
+end
+
+fn ar_seal_step table long grant view ulong 3 m view ulong 16 signer view int 2 pk view uchar 32 signed_receipt edit uchar 240 to bool
+  subject = get grant 0
+  handle = new ulong 2 0
+  put handle 0 get grant 1
+  put handle 1 get grant 2
+  if not caproot_validate table subject handle m
+    ret false
+  end
+  body = new uchar 65536 0
+  metrics = new ulong 3 0
+  if not ar_step_message m subject handle body metrics
+    ret false
+  end
+  if not ar_signer_write get signer 0 body
+    ret false
+  end
+  signature = new uchar 64 0
+  if not ar_signer_read get signer 1 signature
+    ret false
+  end
+  if not ar_commit_step table subject handle m pk signature
+    ret false
+  end
+  for i ulong 176
+    put signed_receipt i get body i
+  end
+  for i ulong 64
+    put signed_receipt add 176 i get signature i
+  end
+  ret true
+end
