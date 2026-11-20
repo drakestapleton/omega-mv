@@ -3,6 +3,7 @@ import hashlib
 import json
 import struct
 import sys
+from urllib.request import Request, urlopen
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,25 @@ def load_tensors(path):
     return tensor("head.weight"), widened(tensor("norm.weight"))
 
 
+def fixture(path):
+    """Fetch only embedding rows 1234..1241 from the pinned public shard."""
+    base = ("https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/"
+            "314113f8a7dadb388215396ba5fbee2c610a04d6/model-00002-of-00048.safetensors")
+    start = 8 + 344 + 1234 * 10240
+    stop = start + 81920 - 1
+    req = Request(f"{base}?omega-range={start}-{stop}", headers={"Range": f"bytes={start}-{stop}"})
+    with urlopen(req, timeout=60) as resp:
+        if resp.status != 206 or not resp.headers.get("Content-Range", "").startswith(f"bytes {start}-{stop}/"):
+            raise ValueError("embedding server did not honor the byte range")
+        rows = resp.read(81921)
+    if hashlib.sha256(rows).hexdigest() != "bbbf862be017006ae7d4e4e6dfe9d6883364ef74314a7c17825bd0c8dd9cc7a6":
+        raise ValueError("embedding slice SHA-256 mismatch")
+    frames = (rows[:40960] + struct.pack("<4f", .1, .3, .6, 0.) +
+              rows[40960:] + struct.pack("<4f", -.2, .4, 1., .25))
+    with path.open("xb") as f:
+        f.write(frames)
+
+
 def verify(shard, frames, logits):
     weights, gain = load_tensors(shard)
     width = gain.size
@@ -46,7 +66,7 @@ def verify(shard, frames, logits):
         offset = i * record_size
         streams = widened(np.frombuffer(data, "<u2", 4*width, offset).reshape(4, width))
         mix = np.frombuffer(data, "<f4", 4, offset+8*width)
-        state = rounded((streams.astype(np.float64) * mix[:, None]).sum(axis=0))
+        state = rounded((streams * mix[:, None]).sum(axis=0, dtype=np.float32))
         rms = np.float32(1 / np.sqrt(np.mean(state.astype(np.float64)**2) + 1e-20))
         hidden.append(rounded(state*rms*gain))
     hidden = np.stack(hidden)
@@ -65,4 +85,9 @@ def verify(shard, frames, logits):
 
 
 if __name__ == "__main__":
-    verify(*(Path(arg) for arg in sys.argv[1:]))
+    if len(sys.argv) == 3 and sys.argv[1] == "--fixture":
+        fixture(Path(sys.argv[2]))
+    elif len(sys.argv) == 4:
+        verify(*(Path(arg) for arg in sys.argv[1:]))
+    else:
+        sys.exit("usage: check-head.py --fixture FRAMES | SHARD FRAMES LOGITS")

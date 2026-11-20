@@ -64,6 +64,13 @@ In the table, B counts token rows, H local heads, T cache positions, S selected 
 
 The build also produces `dsv41-head`, a seeded AArch64 Linux executable for the original checkpoint's final text head. It opens the installed NVIDIA kernel devices directly, creates an RM/UVM context, and submits Omega-emitted SM121 instructions through QMDs. It loads `head.weight` and `norm.weight` from shard 43 once and keeps them resident across input frames. The head matrix occupies 1,323,827,200 bytes in BF16. The binary consumes the final decoder layer's residual streams and pre-mix coefficients.
 
+For a reproducible researcher run, obtain the head shard from the pinned release and create the two input frames. The fixture command fetches 80 KiB of embedding rows 1234 through 1241 and verifies their SHA-256 before writing a new file.
+
+```sh
+curl -fL 'https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/314113f8a7dadb388215396ba5fbee2c610a04d6/model-00043-of-00048.safetensors' -o model-00043-of-00048.safetensors
+python3 om/gpu/dsv41/check-head.py --fixture frames.bin
+```
+
 From the repository root, in a single-Spark correctness window:
 
 ```sh
