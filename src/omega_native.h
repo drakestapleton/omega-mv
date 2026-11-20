@@ -21,6 +21,14 @@ const char *omega2_ident_arboris_arena(void);
 uint32_t omega2_arboris_plan_arena(uint64_t *result, uint64_t *o_m, uint64_t o_m_len, uint64_t o_budget, uint64_t o_page, uint64_t *o_offsets, uint64_t o_offsets_len);
 /* export fn arboris_check_csr m view ulong 16 data view uint * to ulong */
 uint32_t omega2_arboris_check_csr(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint32_t *o_data, uint64_t o_data_len);
+#define OMEGA2_IDENT_arboris_spread "omega-ident 1 unit=arboris_spread abi=2 profile=OM-2 src=d222fcb6591e0bae98f42f031660b3e432a40adae15b8ae06ab4fc29a35ef5ae omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_arboris_spread(void);
+/* export fn arboris_load_records r view uint * topo edit uint * weights edit uint * to ulong */
+uint32_t omega2_arboris_load_records(uint64_t *result, const uint32_t *o_r, uint64_t o_r_len, uint32_t *o_topo, uint64_t o_topo_len, uint32_t *o_weights, uint64_t o_weights_len);
+/* export fn arboris_topology_digest topo view uint * weights view uint * digest edit uchar 32 to ulong */
+uint32_t omega2_arboris_topology_digest(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint8_t *o_digest, uint64_t o_digest_len);
+/* export fn arboris_spread_step topo view uint * weights view uint * state edit uint * to ulong */
+uint32_t omega2_arboris_spread_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
 #define OMEGA2_IDENT_sha256_om2 "omega-ident 1 unit=sha256_om2 abi=2 profile=OM-2 src=dbf002dd6aa36585632b9d01d98ac3f0bd2fa0f0475082940de53638847994bb omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_sha256_om2(void);
 /* export fn sha256_init c edit shactx to void */

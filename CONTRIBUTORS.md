@@ -383,3 +383,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Converted OSC owner and borrow snapshots, rollback of fresh borrows, branch joins and move replay to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Migrated OSC statement reachability, return-path analysis, IR block layout and partition validation, and definite-assignment propagation to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Implemented the checked five-slab Arboris arena plan and bounded CSR topology validation in seeded Omega. |
+| Codex (under Drake Stapleton's direction) | Ported the Arboris v0.1.0 ontology rules into a static graph loader and implemented a batched binary32 CPU spreading-activation oracle. |
