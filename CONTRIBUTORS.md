@@ -374,3 +374,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Converted OSC ownership, arena, handle and branch trace serialization, model ID limits and overflow tracking to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Rewrote lexical scope destruction in Omega, including nested borrow closure, conditional owner release, arena escape and pool teardown. |
 | Codex (under Drake Stapleton's direction) | Converted OSC handle provenance, stale read/write/free decisions, branch snapshots and loop settlement to seeded Omega. |
+| Codex (under Drake Stapleton's direction) | Converted OSC owner and borrow snapshots, rollback of fresh borrows, branch joins and move replay to seeded Omega. |
