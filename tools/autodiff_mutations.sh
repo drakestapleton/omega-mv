@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # M21 OMEGA_AUTODIFF mutation sweep. For each rule marked MUT:<name> in
-# src/autodiff/*.c, copy src/autodiff to a scratch directory, break that one
+# src/autodiff, copy the sources to a scratch directory, break that one
 # rule, rebuild the CPU test against the copy and require the test to FAIL.
 # A mutation that does not apply, does not build, or that the tests do not
 # catch, fails the sweep. The source tree is never edited. CPU only, no
@@ -36,7 +36,7 @@ FLAGS="-std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -ffp-contract=off -O2 -DOM
 # contract and the 1e-3 FD bound; it is aimed at the bit-exact layer.
 MUTATIONS='TAPE_WALK|omega_autodiff.c|s/root + 1; i-- > 0/root; i-- > 0/
 ACCUMULATE|omega_autodiff.c|s/omega_tensor_binary(t->ctx, OMEGA_TB_ADD, n->grad, contrib, &sum)/omega_tensor_contiguous(t->ctx, contrib, \&sum)/
-UNBROADCAST|omega_autodiff.c|s/if (target->shape/if (0 \&\& target->shape/
+UNBROADCAST|gradient_shape.om|{n;s/if and eq get target axis 1 ne get source add leading axis 1/if false/;}
 SUB_NEGATE|omega_autodiff.c|s/-1\.0f/1.0f/
 MUL_OPERAND|omega_autodiff.c|s/t->nodes\[n->in1\]\.value/t->nodes[n->in0].value/
 MATMUL_TRANSPOSE|omega_autodiff.c|s/matmul(t->ctx, g, tmp, &c)/matmul(t->ctx, g, nb->value, \&c)/
@@ -51,10 +51,30 @@ DIV_FORMULA|omega_autodiff.c|{s/OMEGA_TB_DIV, n->value, nb->value, &tmp)/OMEGA_T
 # script is a thin adapter: it feeds the rows above, then maps the runner's
 # per-mutant stderr lines back to the legacy stdout lines and exit codes.
 # Rows name src/autodiff/<file>, relative to the runner's scratch tree.
-BUILD="gcc $FLAGS -Isrc -Isrc/tensor -Isrc/autodiff -o t tests/test_omega_autodiff.c src/autodiff/omega_autodiff.c \
+# Rebuild the seeded binding only for a changed Omega source.
+AUTODIFF_ROOT=$(pwd)
+export AUTODIFF_ROOT
+case " ${ONLY:-UNBROADCAST} " in
+    *" UNBROADCAST "*)
+        compiler=${OMEGA_OMC:-$AUTODIFF_ROOT/seed/out/omc}
+        bridge=${OMEGA_BRIDGE:-$AUTODIFF_ROOT/../omega-bridge}
+        if [ ! -x "$compiler" ] || [ ! -r "$bridge/src/native.om" ]; then
+            echo "autodiff mutations: NOT_RUN (UNBROADCAST needs the pinned omc and omega-bridge)" >&2
+            exit 3
+        fi
+        OMEGA_OMC=$(realpath "$compiler") || exit 3
+        OMEGA_BRIDGE=$(realpath "$bridge") || exit 3
+        export OMEGA_OMC OMEGA_BRIDGE ;;
+esac
+REGEN='if ! cmp -s src/autodiff/gradient_shape.om "$AUTODIFF_ROOT/src/autodiff/gradient_shape.om"; then
+    unset OMEGA_UNITS
+    OMEGA_UNITS_DEST="$PWD/src" sh om/units.sh || exit 1
+fi'
+BUILD="$REGEN
+gcc $FLAGS -Isrc -Isrc/tensor -Isrc/autodiff -o t tests/test_omega_autodiff.c src/autodiff/omega_autodiff.c \
 $TENSOR $DEPS"
 printf '%s\n' "$MUTATIONS" | sed 's#^\([A-Z_]*\)|#\1|src/autodiff/#' > "$SCRATCH/rows"
-tools/mutation_runner.sh -k marker -m "$SCRATCH/rows" -d . -c "src tests/test_omega_autodiff.c" \
+tools/mutation_runner.sh -k marker -m "$SCRATCH/rows" -d . -c "src om tests/test_omega_autodiff.c" \
     -b "$BUILD" -t ./t -f FAIL -B > "$SCRATCH/runner.out" 2> "$SCRATCH/runner.err"
 if grep -q 'unmutated baseline' "$SCRATCH/runner.out"; then
     cat "$SCRATCH/runner.err"

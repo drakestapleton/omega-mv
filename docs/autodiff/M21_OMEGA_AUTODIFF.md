@@ -42,7 +42,8 @@ any edit of `src/tensor` or `src/train`.
 | File | Role |
 |---|---|
 | `src/autodiff/omega_autodiff.h` | The meaning: ops, ownership, determinism rules, per-op error contract |
-| `src/autodiff/omega_autodiff.c` | The tape: recording, backward walk, unbroadcast, M22 flatten. No heap allocation |
+| `src/autodiff/omega_autodiff.c` | Tape recording, reverse walk, tensor ownership and M22 flatten |
+| `src/autodiff/gradient_shape.om` | Unbroadcast reduction order, shape equality and restoration of a reduced axis on the caller’s stack |
 | `tests/test_omega_autodiff.c` | Contract, bit-exact replay, finite-difference, determinism, error-path and leak checks |
 | `tools/autodiff_mutations.sh` | Source mutation sweep (12 mutants) |
 | `mk/autodiff.mk` | `make test-autodiff`, `make test-autodiff-mutations` (alias `autodiff-mutants`) |
