@@ -382,3 +382,7 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Converted OSC handle provenance, stale read/write/free decisions, branch snapshots and loop settlement to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Converted OSC owner and borrow snapshots, rollback of fresh borrows, branch joins and move replay to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Migrated OSC statement reachability, return-path analysis, IR block layout and partition validation, and definite-assignment propagation to seeded Omega. |
+| Codex (under Drake Stapleton's direction) | Implemented seeded Omega SM121 kernels and decode tables for the DeepSeek-V4.1-Flash text backbone, added driver-loadable cubin metadata and single-Spark numerical checks. |
+| Codex (under Drake Stapleton's direction) | Built the resident pure-Omega DeepSeek-V4.1-Flash final-head executor, native QMD submission chain, packed-BF16 vocabulary projection, and full-vocabulary checkpoint comparison. |
+
+- Drake Stapleton and Codex — calibrated and measured DeepSeek mixed-format SM121a expert projections against the pinned checkpoint on GB10.
