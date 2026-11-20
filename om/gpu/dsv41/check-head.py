@@ -48,6 +48,8 @@ def fixture(path):
         raise ValueError("embedding slice SHA-256 mismatch")
     frames = (rows[:40960] + struct.pack("<4f", .1, .3, .6, 0.) +
               rows[40960:] + struct.pack("<4f", -.2, .4, 1., .25))
+    cancellation = b"".join(struct.pack("<H", word) * 5120 for word in (0xbf80, 0x3f81, 0, 0))
+    frames += cancellation + struct.pack("<4f", 8454145/16777216, 8388609/16777216, .5, .5)
     with path.open("xb") as f:
         f.write(frames)
 
@@ -60,6 +62,8 @@ def verify(shard, frames, logits):
     count, tail = divmod(len(data), record_size)
     if tail or not count:
         raise ValueError("expected one or more complete residual frames")
+    if logits.stat().st_size != count * weights.shape[0] * 4:
+        raise ValueError("output byte length does not match complete frames")
     actual = np.fromfile(logits, "<f4").reshape(count, weights.shape[0])
     hidden = []
     for i in range(count):
