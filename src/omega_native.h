@@ -27,7 +27,7 @@ uint32_t omega2_sha256_final(uint64_t *result, uint8_t *o_c, uint8_t *o_o);
 uint32_t omega2_sha256_hash(uint64_t *result, const uint8_t *o_d, uint64_t o_d_len, uint8_t *o_o);
 /* fn omb3 st edit ulong 448 b view uchar 1024 n ulong fin ulong o edit uchar 32 to void */
 uint32_t omega_omb3(uint64_t *result, void *o_st, uint64_t o_st_len, const void *o_b, uint64_t o_b_len, uint64_t o_n, uint64_t o_fin, void *o_o, uint64_t o_o_len);
-#define OMEGA2_IDENT_b3hash "omega-ident 1 unit=b3hash abi=2 profile=OM-2 src=78d1c682baa551d9dc28cd55fd124400a628e55bb94f48acc5d564b7f087e3e7 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_b3hash "omega-ident 1 unit=b3hash abi=2 profile=OM-2 src=ff878c665a43b1a66cfae59441c98b722b31da01eae55c95dbbcc49a65dd2f25 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_b3hash(void);
 /* export fn omega_blake3_hash input view uchar * digest out uchar 32 to void */
 uint32_t omega2_omega_blake3_hash(uint64_t *result, const uint8_t *o_input, uint64_t o_input_len, uint8_t *o_digest);

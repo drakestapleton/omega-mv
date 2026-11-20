@@ -20,6 +20,7 @@ build() { # build <src dir> <out>
   cc -O2 "$(dirname "$0")/par.c" "$T/sha.o" "$T/oracle.o" -o "$2" -pthread
 }
 build "$ROOT/src" "$T/par"
+"$T/par" --large
 out=$("$T/par" "$V" | tail -1); echo "$out"
 [ "$out" = "vectors=35 vecfail=0 cases=1000 diff=0" ] || { echo "BLAKE3-PARITY FAIL"; exit 1; }
 # The mutants are part of the verdict: without the pinned tools this is NOT_RUN (exit 3), never PASS.
