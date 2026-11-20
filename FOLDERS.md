@@ -555,4 +555,4 @@ Boolean struct-field execution regressions, exact expected outcomes, scalar cont
 
 ## `om/gpu/dsv41/`
 
-Seeded Omega SM121 kernel emitters, their byte-level ABI and single-Spark operator checks for the original DeepSeek-V4.1-Flash text checkpoint.
+Seeded Omega SM121 kernel emitters, their byte-level ABI, the native final-head executor, and single-Spark numerical checks for the original DeepSeek-V4.1-Flash text checkpoint.

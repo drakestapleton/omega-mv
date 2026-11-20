@@ -58,4 +58,28 @@ In the table, B counts token rows, H local heads, T cache positions, S selected 
 
 **Attention and routing.** Pass one query per batch row to the sparse pair. Supply identical indices to both stages. Each index is a cache position or -1. The mixer follows the reference's 64-position online softmax and rounds each numerator weight to BF16. Apply the residual gates in the upstream layer order. Send the previous sublayer's pre coefficients to hc_pre. The router ranks biased scores, takes weights from the unbiased scores, normalizes them and applies the checkpoint's factor of 1.5. It resolves ties by lower expert ID. top_positions returns ascending positions, fills unreachable entries with -1, and gives a 32-bit keep mask. It also resolves score ties by lower index. Supply K at most T and an offset that fits signed int32. For two-level selection, run candidate_blocks, top_positions on the block scores, index_scores with the resulting mask, then top_positions on the filtered scores.
 
-**Integration.** The collection operates on caller-owned buffers. A model executor must load and shard weights and Engram tables, construct hash IDs and rotary frequencies, schedule the 40 layers and BF16 boundaries, maintain cache state, and perform rank collectives. The CUDA Driver API is used for this hardware check. Use of the native Omega submission path by a serving executor remains to be exercised.
+**Integration.** The collection operates on caller-owned buffers. A model executor must load and shard weights and Engram tables, construct hash IDs and rotary frequencies, schedule the 40 layers and BF16 boundaries, maintain cache state, and perform rank collectives. The CUDA Driver API is used for this hardware check. The final-head executor below uses the native Omega submission path.
+
+## Native final-head executor
+
+The build also produces `dsv41-head`, a seeded AArch64 Linux executable for the original checkpoint's final text head. It opens the installed NVIDIA kernel devices directly, creates an RM/UVM context, and submits Omega-emitted SM121 instructions through QMDs. It loads `head.weight` and `norm.weight` from shard 43 once and keeps them resident across input frames. The head matrix occupies 1,323,827,200 bytes in BF16. The binary consumes the final decoder layer's residual streams and pre-mix coefficients.
+
+For a reproducible researcher run, obtain the head shard from the pinned release and create three input frames. The fixture command fetches 80 KiB of embedding rows 1234 through 1241 and verifies their SHA-256 before writing a new file. Two frames use those rows. A third exercises FP32 product cancellation at the BF16 pre-mix boundary.
+
+```sh
+curl -fL 'https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/314113f8a7dadb388215396ba5fbee2c610a04d6/model-00043-of-00048.safetensors' -o model-00043-of-00048.safetensors
+python3 om/gpu/dsv41/check-head.py --fixture frames.bin
+```
+
+From the repository root, in a single-Spark correctness window:
+
+```sh
+spark-window run build/dsv41/dsv41-head model-00043-of-00048.safetensors < frames.bin > logits.f32
+python3 om/gpu/dsv41/check-head.py model-00043-of-00048.safetensors frames.bin logits.f32
+```
+
+A frame is 40,976 bytes. First write four row-major 5120-element residual streams as little-endian BF16, then four little-endian FP32 mixing coefficients. Each complete frame produces 129,280 little-endian FP32 logits in token-ID order (517,120 bytes). EOF between frames ends the session. After emitting one million frames the process closes its resources and exits 75. The caller may open a new session for subsequent frames. A partial frame exits 65. Exit 74 reports a native resource, submission, completion, or IO error. Keep the checkpoint immutable for the lifetime of the process.
+
+Every frame goes through BF16 widening, the four-stream pre-mix, BF16 rounding, RMS normalization, weighted scaling, a second BF16 rounding, and the packed vocabulary projection. The projection uses one warp per vocabulary row and accumulates in FP32. The earlier 40 decoder layers supply the frame in a complete inference graph. The check accepts independent test frames and compares every vocabulary row with a CPU calculation using the released weights.
+
+The original head shard is 1,323,837,624 bytes with SHA-256 `d762b688f138e00a24eac96f27b842715bb4b534ecc9ca39076bed2b8c33201e`. The loader validates the two tensor descriptors, dtype, shapes, payload coverage and non-overlap before opening a device. The numerical check additionally verifies the published file checksum. [Pinned checkpoint shard](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/314113f8a7dadb388215396ba5fbee2c610a04d6/model-00043-of-00048.safetensors)
