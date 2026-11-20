@@ -25,6 +25,7 @@
 #include "omega_gpu_cmdlist.h"
 #include "omega_blackwell_codegen.h"
 #include "omega_blackwell_qmd.h"
+#include "omega_native.h"
 #include "omega_blackwell_submit.h"
 #include <string.h>
 
@@ -161,6 +162,36 @@ void omega_gpu_cmdlist_free(OmegaGpuCmdList *cl) {
 
 static uint32_t round8(uint32_t v) { return (v + 7u) / 8u * 8u; }
 
+static int publish_slot(OmegaGpuCmdList *cl, uint32_t i) {
+    cl->indep[i] = 0;
+    cl->wait_va[i] = cl->pending_wait;
+    if (cl->pending_wait) cl->nwaits++;
+    cl->pending_wait = 0;
+    cl->n++;
+    return (int)i;
+}
+
+int omega_gpu_cmdlist_record_attn256(OmegaGpuCmdList *cl, const uint64_t spec[16], uint64_t code_va,
+                                     uint32_t gprs, uint32_t grid_y, uint32_t output_words) {
+    if (!cl || !spec || stale(cl)) return -1;
+    if (cl->n >= cl->cap) { omega_gpu_session_set_error("cmdlist add: list full"); return -1; }
+    const uint32_t i = cl->n;
+    const size_t bank_off = (size_t)i * OMEGA_GPU_CMDLIST_BANK_BYTES;
+    const size_t qmd_off = (size_t)i * OMEGA_GPU_CMDLIST_QMD_BYTES;
+    uint32_t *bank = (uint32_t *)((uint8_t *)cl->banks.cpu + bank_off);
+    uint32_t *q1 = (uint32_t *)((uint8_t *)cl->qmds.cpu + qmd_off);
+    const uint64_t slot[8] = {code_va, cl->banks.va + bank_off, cl->scratch.va, cl->sems.va + (uint64_t)i * 16u,
+                              cl->qmds.va + qmd_off, gprs, grid_y, output_words};
+    uint64_t result = 1;
+    if (omega2_bw_attn256_record(&result, spec, 16, slot, 8, omega_bw_cbank_driver_template, OMEGA_BW_CBANK_DRIVER_WORDS,
+                                 bank, 249, q1, OMEGA_BW_QMD_WORDS, q1 + 0x200 / sizeof(*q1), OMEGA_BW_QMD_WORDS)
+        != OMEGA_OK || result != 0) {
+        omega_gpu_session_set_error("cmdlist record: hd256 attention");
+        return -1;
+    }
+    return publish_slot(cl, i);
+}
+
 int omega_gpu_cmdlist_add(OmegaGpuCmdList *cl, const OmegaGpuLaunch *L) {
     if (!cl || !L || !L->args || L->n_args == 0 || L->n_args > OMEGA_GPU_SESSION_MAX_ARGS || L->threads_x == 0 || L->grid_x == 0 || L->grid_y == 0 ||
         L->code_va == 0) { omega_gpu_session_set_error("cmdlist add: arguments"); return -1; }
@@ -191,12 +222,7 @@ int omega_gpu_cmdlist_add(OmegaGpuCmdList *cl, const OmegaGpuLaunch *L) {
     uint8_t *qs = (uint8_t *)cl->qmds.cpu + (size_t)i * OMEGA_GPU_CMDLIST_QMD_BYTES;
     memcpy(qs, q1, sizeof q1);
     memcpy(qs + 0x200, q0, sizeof q0);
-    cl->indep[cl->n] = 0;
-    cl->wait_va[cl->n] = cl->pending_wait;
-    if (cl->pending_wait) cl->nwaits++;
-    cl->pending_wait = 0;
-    cl->n++;
-    return (int)i;
+    return publish_slot(cl, i);
 }
 
 #define WAIT_OK 0

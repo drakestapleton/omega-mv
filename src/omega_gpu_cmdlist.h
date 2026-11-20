@@ -115,6 +115,9 @@ int omega_gpu_cmdlist_mark_independent(OmegaGpuCmdList *cl);
  * until submit returns. Returns the launch index, or -1 (full, bad arguments, QMD refused). L->timeout_ms and
  * L->spin_us are ignored (the list has one completion). */
 int omega_gpu_cmdlist_add(OmegaGpuCmdList *cl, const OmegaGpuLaunch *L);
+/* Single-token hd256 launch. The caller holds the session lock, as for cmdlist_add. */
+int omega_gpu_cmdlist_record_attn256(OmegaGpuCmdList *cl, const uint64_t spec[16], uint64_t code_va,
+                                     uint32_t gprs, uint32_t grid_y, uint32_t output_words);
 /* Caller holds the lock, device open, not latched. Submits every recorded launch in order, waits for the completion,
  * checks every launch semaphore. 0 ok; -1 with the stage named (omega_gpu_session_last_error). */
 int omega_gpu_cmdlist_submit(OmegaGpuCmdList *cl, const OmegaGpuCmdListOpts *opts, OmegaGpuCmdListStats *st);

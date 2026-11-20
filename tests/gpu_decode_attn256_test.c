@@ -20,6 +20,8 @@
  */
 #include "omega_gpu_decode_attn256_api.h"
 #include "omega_gpu_session.h"
+#include "omega_native.h"
+#include "omega_blackwell_qmd.h"
 #include "omega_gpu_hostmath.h"
 #include "bw_warp_sim_k.h"
 #include <inttypes.h>
@@ -195,7 +197,42 @@ static void perm_checks(void) {
         printf("perm rotary %3u: bijection, pairs, rope-by-permutation max abs diff %.3g over 50 positions\n", R, maxd);
     }
 }
+/* Compare the complete recorded bytes with the original generic launch format.
+ * The chosen addresses exercise carry into the high word in K/V and norm offsets. */
+static void record_format(void) {
+    const uint64_t s[16] = {0x123456789ull, 0x2fffffff0ull, 4096, 0x3abcdef08ull,
+                            0x4fffffff0ull, 0x567890ab0ull, 0x6abcd0120ull, 0x7fedc0040ull,
+                            3, 256, 256, 2, 131072, 0x358637bd, 0x5f800000, 0x3db8aa3b};
+    uint64_t slot[8] = {0x890123400ull, 0x9ffffff00ull, 0xa12340000ull, 0xb00004000ull,
+                        0xc00006000ull, 73, VY, OW};
+    uint32_t expected[249], bank[249], ref1[96], ref0[96], q1[96], q0[96];
+    omega_blackwell_build_cbank_driver_2d(expected, slot[1], HD, 1, 2, VY);
+    uint64_t norm = s[4] + s[8] * 2 * HD * 4;
+    uint64_t addresses[9] = {s[0], s[1], s[1] + s[2], s[3], norm, norm + HD * 4, s[5], s[6], s[7]};
+    for (unsigned i = 0; i < 9; i++) {
+        expected[224 + 2*i] = (uint32_t)addresses[i];
+        expected[225 + 2*i] = (uint32_t)(addresses[i] >> 32);
+    }
+    uint32_t scalars[7] = {256, 256, 2, 131072 * OMEGA_DATTN256_ROW_BYTES, s[13], s[14], s[15]};
+    memcpy(expected + 242, scalars, sizeof scalars);
+    OmegaBlackwellQmdConfig cfg = {.code_va = slot[0], .cbank_va = slot[1], .scratch_va = slot[2],
+        .sem_va = slot[3], .qmd0_va = slot[4] + 512, .qmd1_va = slot[4], .num_elements = OW,
+        .threads_x = HD, .threads_y = 1, .grid_x = 2, .grid_y = VY, .gpr_count = 80,
+        .shared_bytes = OMEGA_DATTN256_SHARED_BYTES};
+    CHECK(omega_blackwell_build_qmd1(ref1, &cfg) == 0 && omega_blackwell_build_qmd0(ref0, cfg.qmd0_va, cfg.qmd1_va) == 0,
+          "reference record descriptors");
+    uint64_t result = 1;
+    CHECK(omega2_bw_attn256_record(&result, s, 16, slot, 8, omega_bw_cbank_driver_template, 224,
+          bank, 249, q1, 96, q0, 96) == OMEGA_OK && result == 0, "record valid hd256 launch");
+    CHECK(memcmp(expected, bank, sizeof bank) == 0 && memcmp(ref1, q1, sizeof q1) == 0 &&
+          memcmp(ref0, q0, sizeof q0) == 0, "record matches generic bank and both descriptors byte for byte");
+    slot[6] = 0;
+    CHECK(omega2_bw_attn256_record(&result, s, 16, slot, 8, omega_bw_cbank_driver_template, 224,
+          bank, 249, q1, 96, q0, 96) == OMEGA_OK && result != 0, "empty grid refused");
+}
+
 static void host_only(void) {
+    record_format();
     float row[HD]; omega_dattn256_rope_row(0, THETA, 64, row);
     int ok = 1; for (unsigned i = 0; i < 128; i++) ok &= row[i] == 1.0f && row[128 + i] == 0.0f;
     CHECK(ok, "rope row 0 is cos 1 sin 0");
