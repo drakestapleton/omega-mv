@@ -251,3 +251,507 @@ requires le len tags 4096
     copy_insn source dest mul i 6 dst
   end
 end
+
+note OscInsn stores signed 16-bit register indices. A decoded value with
+note the high bit set is absent or invalid. validate_insn checks every
+note mandatory operand before the resource and dataflow walks.
+const IR_CONST uchar 1
+const IR_MOV uchar 2
+const IR_BIN uchar 3
+const IR_UN uchar 4
+const IR_CMP uchar 5
+const IR_CAST uchar 6
+const IR_ALLOC uchar 7
+const IR_RELEASE uchar 8
+const IR_LOAD uchar 9
+const IR_STORE uchar 10
+const IR_CALL uchar 11
+const IR_CBR uchar 14
+const IR_FLOAD uchar 16
+const IR_FSTORE uchar 17
+const IR_AOPEN uchar 18
+const IR_AALLOC uchar 19
+const IR_ADESTROY uchar 20
+const IR_POPEN uchar 21
+const IR_PCLOSE uchar 22
+const IR_HALLOC uchar 23
+const IR_HGEN uchar 24
+const IR_HFREE uchar 25
+const IR_HLOAD uchar 26
+const IR_HSTORE uchar 27
+const IR_SLOAD uchar 28
+const IR_SSTORE uchar 29
+const NO_REG ulong 65535
+
+fn ir_def insn view uchar * to ulong
+  op = get insn 0
+  if and ge op IR_CONST le op IR_ALLOC
+    ret read_le insn 2 2
+  end
+  if or eq op IR_LOAD or eq op IR_CALL eq op IR_FLOAD
+    ret read_le insn 2 2
+  end
+  if or eq op IR_AOPEN or eq op IR_AALLOC eq op IR_POPEN
+    ret read_le insn 2 2
+  end
+  if or eq op IR_HALLOC or eq op IR_HGEN or eq op IR_HLOAD eq op IR_SLOAD
+    ret read_le insn 2 2
+  end
+  ret NO_REG
+end
+
+note Return uses in diagnostic order. Fixed slots match OSC_MAX_PARAMS.
+fn ir_uses insn view uchar * uses edit ushort 6 to ulong
+  op = get insn 0
+  a = ushort read_le insn 4 2
+  b = ushort read_le insn 6 2
+  c = ushort read_le insn 8 2
+  put uses 0 a
+  if or eq op IR_MOV or eq op IR_UN or eq op IR_CAST eq op IR_ALLOC
+    ret 1
+  end
+  if or eq op IR_RELEASE or eq op IR_CBR or eq op IR_ADESTROY eq op IR_PCLOSE
+    ret 1
+  end
+  if eq op ir_ret
+    if lt a 32768
+      ret 1
+    end
+    ret 0
+  end
+  put uses 1 b
+  if or eq op IR_AALLOC or eq op IR_HALLOC eq op IR_HGEN
+    ret 2
+  end
+  if or eq op IR_BIN or eq op IR_CMP eq op IR_LOAD
+    ret 2
+  end
+  put uses 2 c
+  if or eq op IR_STORE or eq op IR_HFREE eq op IR_HLOAD
+    ret 3
+  end
+  if eq op IR_HSTORE
+    put uses 3 ushort read_le insn 18 2
+    ret 4
+  end
+  if or eq op IR_SLOAD eq op IR_SSTORE
+    put uses 1 add a 1
+    put uses 2 b
+    if eq op IR_SSTORE
+      put uses 3 c
+      ret 4
+    end
+    ret 3
+  end
+  if or eq op IR_FLOAD eq op IR_FSTORE
+    count = ulong 1
+    if lt b 32768
+      count = 2
+    end
+    if eq op IR_FSTORE
+      put uses count c
+      count = add count 1
+    end
+    ret count
+  end
+  if eq op IR_CALL
+    count = ulong get insn 16
+    if gt count 6
+      count = 6
+    end
+    for i ulong count
+      put uses i ushort read_le insn add 18 mul i 2 2
+    end
+    ret count
+  end
+  ret 0
+end
+
+export fn osc_ir_operands insn view uchar 48 uses edit ushort 6 to ulong
+  ret ir_uses insn uses
+end
+
+fn reads_marked insn view uchar * marks view uchar * to bool
+  uses = new ushort 6 0
+  count = ir_uses insn uses
+  for i ulong count
+    if ne get marks ulong get uses i 0
+      ret true
+    end
+  end
+  ret false
+end
+
+note These passes follow the validator's public refusal order. Collect all
+note defining instructions first because a handle may occur in earlier blocks.
+fn arena_use insn view uchar * arenas view uchar * to ulong
+  op = get insn 0
+  dst = ir_def insn
+  if and ne op IR_AOPEN lt dst len arenas
+    if ne get arenas dst 0
+      ret 3
+    end
+  end
+  if eq op IR_AALLOC
+    handle = read_le insn 6 2
+    init = read_le insn 4 2
+    if or eq get arenas handle 0 ne get arenas init 0
+      ret 4
+    end
+  else
+    if eq op IR_ADESTROY
+      if eq get arenas read_le insn 4 2 0
+        ret 5
+      end
+    else
+      if reads_marked insn arenas
+        ret 6
+      end
+    end
+  end
+  ret 0
+end
+
+fn check_store_value pools view uchar * types view uchar * pool ulong value ulong to ulong
+  if ne get pools value 0
+    ret 14
+  end
+  if ne get types value get pools pool
+    ret 14
+  end
+  ret 0
+end
+
+fn pool_use insn view uchar * pools view uchar * types view uchar * to ulong
+  op = get insn 0
+  dst = ir_def insn
+  if and ne op IR_POPEN lt dst len pools
+    if ne get pools dst 0
+      ret 8
+    end
+  end
+  a = read_le insn 4 2
+  b = read_le insn 6 2
+  if eq op IR_PCLOSE
+    if eq get pools a 0
+      ret 9
+    end
+    ret 0
+  end
+  if eq op IR_HALLOC
+    if or eq get pools b 0 ne get pools a 0
+      ret 10
+    end
+    if ne get types a get pools b
+      ret 11
+    end
+    ret 0
+  end
+  if and ge op IR_HGEN le op IR_HSTORE
+    if or eq get pools a 0 ne get pools b 0
+      ret 12
+    end
+    if ne op IR_HGEN
+      if ne get pools read_le insn 8 2 0
+        ret 12
+      end
+    end
+    if eq op IR_HLOAD
+      if ne get types dst get pools a
+        ret 13
+      end
+    end
+    if eq op IR_HSTORE
+      ret check_store_value pools types a read_le insn 18 2
+    end
+    ret 0
+  end
+  if reads_marked insn pools
+    ret 15
+  end
+  ret 0
+end
+
+fn slice_defs insns view uchar * slices view uchar 480 to ulong
+  for i ulong div len insns ir_insn_size
+    dst = ir_def part insns mul i ir_insn_size ir_insn_size
+    if lt dst len slices
+      if ne get slices dst 0
+        ret or shl i 8 1
+      end
+    end
+  end
+  ret 0
+end
+
+fn check_arenas insns view uchar * arenas edit uchar 480 params ulong to ulong
+  for i ulong div len insns ir_insn_size
+    start = mul i ir_insn_size
+    if eq get insns start IR_AOPEN
+      dst = read_le insns add start 2 2
+      if or ne get arenas dst 0 lt dst params
+        ret or shl i 8 2
+      end
+      put arenas dst 1
+    end
+  end
+  for i ulong div len insns ir_insn_size
+    status = arena_use part insns mul i ir_insn_size ir_insn_size arenas
+    if ne status 0
+      ret or shl i 8 status
+    end
+  end
+  ret 0
+end
+
+fn check_pools insns view uchar * arenas view uchar 480 types view uchar 480 params ulong to ulong
+  pools = new uchar 480 0
+  for i ulong div len insns ir_insn_size
+    start = mul i ir_insn_size
+    if eq get insns start IR_POPEN
+      dst = read_le insns add start 2 2
+      used = or get pools dst get arenas dst
+      if or ne used 0 lt dst params
+        ret or shl i 8 7
+      end
+      put pools dst get insns add start 1
+    end
+  end
+  for i ulong div len insns ir_insn_size
+    status = pool_use part insns mul i ir_insn_size ir_insn_size pools types
+    if ne status 0
+      ret or shl i 8 status
+    end
+  end
+  ret 0
+end
+
+note Return the first refused instruction above the low diagnostic byte.
+export fn osc_ir_resources insns view uchar * types view uchar 480 slices view uchar 480 params ulong to ulong
+requires eq rem len insns ir_insn_size 0
+  arenas = new uchar 480 0
+  status = slice_defs insns slices
+  if ne status 0
+    ret status
+  end
+  status = check_arenas insns arenas params
+  if ne status 0
+    ret status
+  end
+  ret check_pools insns arenas types params
+end
+
+fn mark_def bits edit ulong * dst ulong to void
+  if ne dst NO_REG
+    slot = div dst 64
+    mask = shl ulong 1 rem dst 64
+    value = or get bits slot mask
+    put bits slot value
+  end
+end
+
+fn register_gen insns view uchar * bits edit ulong * to void
+  for j ulong len bits
+    put bits j 0
+  end
+  for j ulong div len insns ir_insn_size
+    dst = ir_def part insns mul j ir_insn_size ir_insn_size
+    mark_def bits dst
+  end
+end
+
+fn record_edges term view uchar * record edit ulong * absent_block ulong to void
+  width = sub len record 2
+  first = absent_block
+  other = absent_block
+  if ne get term 0 ir_ret
+    first = read_le term 10 2
+    if eq get term 0 IR_CBR
+      other = read_le term 12 2
+    end
+  end
+  put record width first
+  put record add width 1 other
+end
+
+export fn osc_ir_block_transfer insns view uchar * record edit ulong * blocks ulong to void
+  register_gen insns part record 0 sub len record 2
+  record_edges part insns sub len insns ir_insn_size ir_insn_size record blocks
+end
+
+fn first_missing insn view uchar * available view ulong * to ulong
+  uses = new ushort 6 0
+  count = ir_uses insn uses
+  for i ulong count
+    reg = ulong get uses i
+    word = get available div reg 64
+    if eq and shr word rem reg 64 1 0
+      ret add reg 1
+    end
+  end
+  ret 0
+end
+
+export fn osc_ir_block_reads insns view uchar * available edit ulong * to ulong
+  for j ulong div len insns ir_insn_size
+    base = mul j ir_insn_size
+    missing = first_missing part insns base ir_insn_size available
+    if ne missing 0
+      ret or shl j 16 missing
+    end
+    dst = ir_def part insns base ir_insn_size
+    mark_def available dst
+  end
+  ret 0
+end
+
+note Version 6 structured contracts are postfix programs over value scalars.
+note The scalar type tags and term discriminants come from osc_ir.h.
+const CT_PARAM uchar 1
+const CT_RESULT uchar 2
+const CT_CONST uchar 3
+const CT_BIN uchar 4
+const CT_UN uchar 5
+const CT_CMP uchar 6
+const CT_CAST uchar 7
+const T_BOOL uchar 1
+const T_U8 uchar 2
+const T_U64 uchar 5
+const T_I8 uchar 6
+const T_I64 uchar 9
+
+export fn osc_ir_canonical scalar ulong value ulong to ulong
+  if eq scalar ulong T_BOOL
+    if lt value 2
+      ret 1
+    end
+    ret 0
+  end
+  if or lt scalar ulong T_U8 gt scalar ulong T_I64
+    ret 0
+  end
+  width = shl ulong 8 and sub scalar ulong T_U8 3
+  if eq width 64
+    ret 1
+  end
+  limit = shl ulong 1 width
+  bits = and value sub limit 1
+  if ge scalar ulong T_I8
+    sign = shr limit 1
+    bits = sub xor bits sign sign
+  end
+  if eq bits value
+    ret 1
+  end
+  ret 0
+end
+
+fn term_operator op uchar subop uchar stack edit uchar 64 depth ulong to ulong
+  if eq depth 0
+    ret 0
+  end
+  b = get stack sub depth 1
+  if eq op CT_UN
+    if eq subop 3
+      if eq b T_BOOL
+        ret depth
+      end
+    else
+      if and ne b T_BOOL or eq subop 1 eq subop 2
+        ret depth
+      end
+    end
+    ret 0
+  end
+  if eq op CT_CAST
+    if or eq b T_BOOL or lt subop T_U8 gt subop T_I64
+      ret 0
+    end
+    put stack sub depth 1 subop
+    ret depth
+  end
+  if lt depth 2
+    ret 0
+  end
+  a = get stack sub depth 2
+  if eq op CT_CMP
+    if or ne a b or lt subop 1 gt subop 6
+      ret 0
+    end
+    put stack sub depth 2 T_BOOL
+    ret sub depth 1
+  end
+  if or ne op CT_BIN or lt subop 1 gt subop 10
+    ret 0
+  end
+  if ge subop 9
+    if or eq a T_BOOL eq b T_BOOL
+      ret 0
+    end
+  else
+    if or ne a b and lt subop 6 eq a T_BOOL
+      ret 0
+    end
+  end
+  ret sub depth 1
+end
+
+fn contract_term term view uchar * params view uchar 256 result uchar stack edit uchar 64 depth ulong to ulong
+  op = get term 0
+  subop = get term 1
+  arg = ulong get term 2
+  imm = read_le term 8 8
+  if eq op CT_PARAM
+    if or ne subop 0 or ne imm 0 ge arg len params
+      ret 0
+    end
+    ty = get params arg
+    if eq ty 0
+      ret 0
+    end
+    put stack depth ty
+    ret add depth 1
+  end
+  if ne arg 0
+    ret 0
+  end
+  if eq op CT_CONST
+    if eq osc_ir_canonical ulong subop imm 0
+      ret 0
+    end
+    put stack depth subop
+    ret add depth 1
+  end
+  if ne imm 0
+    ret 0
+  end
+  if eq op CT_RESULT
+    if or ne subop 0 eq result 0
+      ret 0
+    end
+    put stack depth result
+    ret add depth 1
+  end
+  ret term_operator op subop stack depth
+end
+
+export fn osc_ir_contract terms view uchar * params view uchar 256 result ulong to ulong
+  if eq len terms 0
+    ret 1
+  end
+  if or ne rem len terms 16 0 gt div len terms 16 64
+    ret 0
+  end
+  stack = new uchar 64 0
+  depth = ulong 0
+  for i ulong div len terms 16
+    depth = contract_term part terms mul i 16 16 params uchar result stack depth
+    if eq depth 0
+      ret 0
+    end
+  end
+  if and eq depth 1 eq get stack 0 T_BOOL
+    ret 1
+  end
+  ret 0
+end

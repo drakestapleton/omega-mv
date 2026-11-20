@@ -92,57 +92,16 @@ static bool ref_bindable(const OscType *dst, const OscType *src) {
     default: return false;
     }
 }
-static bool canonical_for(OscScalar s, uint64_t v) {
-    unsigned w = osc_scalar_width(s);
-    if (s == OSC_T_BOOL) return v <= 1;
-    if (w == 64) return true;
-    if (osc_scalar_signed(s)) {
-        int64_t x = (int64_t)v, lo = -(1LL << (w - 1)), hi = (1LL << (w - 1)) - 1;
-        return x >= lo && x <= hi;
-    }
-    return v < (1ULL << w);
-}
-
 _Static_assert(OSC_MAX_INSNS == 4096 && sizeof(OscInsn) == 48 && offsetof(OscInsn, op) == 0 &&
                sizeof(OscBlock) == 8 && offsetof(OscBlock, first) == 0 && offsetof(OscBlock, count) == 4 &&
                OSC_I_BR == 13 && OSC_I_CBR == 14 && OSC_I_RET == 15, "OSC block partition ABI");
 
-/* uses / def of an instruction (for def-before-use) */
-static int insn_uses(const OscInsn *in, int16_t *u) {
-    int k = 0;
-    switch (in->op) {
-    case OSC_I_MOV: case OSC_I_UN: case OSC_I_CAST: case OSC_I_ALLOC: case OSC_I_RELEASE:
-    case OSC_I_CBR: u[k++] = in->a; break;
-    case OSC_I_AALLOC: u[k++] = in->a; u[k++] = in->b; break;
-    case OSC_I_ADESTROY: u[k++] = in->a; break;
-    case OSC_I_PCLOSE: u[k++] = in->a; break;
-    case OSC_I_HALLOC: case OSC_I_HGEN: u[k++] = in->a; u[k++] = in->b; break;
-    case OSC_I_HFREE: case OSC_I_HLOAD: u[k++] = in->a; u[k++] = in->b; u[k++] = in->c; break;
-    case OSC_I_HSTORE: u[k++] = in->a; u[k++] = in->b; u[k++] = in->c; u[k++] = in->args[0]; break;
-    case OSC_I_BIN: case OSC_I_CMP: case OSC_I_LOAD: u[k++] = in->a; u[k++] = in->b; break;
-    case OSC_I_STORE: u[k++] = in->a; u[k++] = in->b; u[k++] = in->c; break;
-    case OSC_I_SLOAD: u[k++] = in->a; u[k++] = in->a + 1; u[k++] = in->b; break;
-    case OSC_I_SSTORE: u[k++] = in->a; u[k++] = in->a + 1; u[k++] = in->b; u[k++] = in->c; break;
-    case OSC_I_FLOAD: u[k++] = in->a; if (in->b >= 0) u[k++] = in->b; break;
-    case OSC_I_FSTORE: u[k++] = in->a; if (in->b >= 0) u[k++] = in->b; u[k++] = in->c; break;
-    case OSC_I_CALL: for (int i = 0; i < in->nargs && i < OSC_MAX_PARAMS; i++) u[k++] = in->args[i]; break;
-    case OSC_I_RET: if (in->a >= 0) u[k++] = in->a; break;
-    default: break;
-    }
-    return k;
-}
-static int insn_def(const OscInsn *in) {
-    switch (in->op) {
-    case OSC_I_CONST: case OSC_I_MOV: case OSC_I_BIN: case OSC_I_UN: case OSC_I_CMP:
-    case OSC_I_CAST: case OSC_I_ALLOC: case OSC_I_LOAD: case OSC_I_FLOAD: case OSC_I_SLOAD: return in->dst;
-    case OSC_I_AOPEN: case OSC_I_AALLOC: return in->dst;
-    case OSC_I_POPEN: case OSC_I_HALLOC: case OSC_I_HGEN: case OSC_I_HLOAD: return in->dst;
-    case OSC_I_CALL: return in->dst;  /* may be -1 */
-    default: return -1;
-    }
-}
-
-#define BSW ((OSC_MAX_VREGS + 63) / 64)
+_Static_assert(offsetof(OscInsn, dst) == 2 && offsetof(OscInsn, a) == 4 &&
+               offsetof(OscInsn, b) == 6 && offsetof(OscInsn, c) == 8 &&
+               offsetof(OscInsn, blk_t) == 10 && offsetof(OscInsn, blk_f) == 12 &&
+               offsetof(OscInsn, sub) == 1 && offsetof(OscInsn, nargs) == 16 &&
+               offsetof(OscInsn, args) == 18 && OSC_MAX_PARAMS == 6 &&
+               OSC_MAX_VREGS == 480 && OSC_I_SSTORE == 29, "OSC register flow ABI");
 
 static int validate_insn(const OscUnit *u, int fi, const OscFunc *f, uint32_t ii, char *err, size_t n) {
     const OscInsn *in = &f->insns[ii];
@@ -154,7 +113,7 @@ static int validate_insn(const OscUnit *u, int fi, const OscFunc *f, uint32_t ii
     case OSC_I_CONST:
         NEED(VR(in->dst), "CONST bad dst vreg %d", fi, ii, in->dst);
         NEED(type_is_scalar(&T[in->dst]), "CONST dst not scalar", fi, ii);
-        NEED(canonical_for(T[in->dst].s, in->imm), "CONST imm not canonical for %s", fi, ii, osc_scalar_name(T[in->dst].s));
+        NEED(osc_ir_canonical(T[in->dst].s, in->imm), "CONST imm not canonical for %s", fi, ii, osc_scalar_name(T[in->dst].s));
         break;
     case OSC_I_MOV:
         NEED(VR(in->dst) && VR(in->a), "MOV bad vreg", fi, ii);
@@ -240,10 +199,10 @@ static int validate_insn(const OscUnit *u, int fi, const OscFunc *f, uint32_t ii
     case OSC_I_HFREE:
     case OSC_I_HLOAD:
     case OSC_I_HSTORE: {
-        int16_t us[OSC_MAX_PARAMS + 3];
-        int k = insn_uses(in, us);
-        for (int j = 0; j < k; j++) NEED(VR(us[j]) && type_is_scalar(&T[us[j]]), "handle op bad operand", fi, ii);
-        int d = insn_def(in);
+        uint16_t us[OSC_MAX_PARAMS];
+        unsigned k = (unsigned)osc_ir_operands((const uint8_t *)in, us);
+        for (unsigned j = 0; j < k; j++) NEED(us[j] < nv && type_is_scalar(&T[us[j]]), "handle op bad operand", fi, ii);
+        int d = in->dst;
         if (in->op == OSC_I_HALLOC || in->op == OSC_I_HGEN || in->op == OSC_I_HLOAD)
             NEED(VR(d) && type_is_scalar(&T[d]), "handle op bad dst", fi, ii);
         if (in->op == OSC_I_HALLOC || in->op == OSC_I_HGEN) NEED(T[d].s == OSC_T_U64, "handle slot/gen not u64", fi, ii);
@@ -344,56 +303,21 @@ static bool str_ok(const char *s, size_t cap) { return memchr(s, 0, cap) != NULL
  * section 11.4) is a postfix program over a typed value stack that leaves exactly one
  * bool (an empty list: no clause). Typing follows the IR's BIN/UN/CMP/CAST rules over
  * value scalars; every field a term does not use is 0, so one object has one form. */
-static bool contract_ok(const OscFunc *f, const OscCterm *t, unsigned n, bool ens) {
-    OscScalar st[OSC_CONTRACT_MAX];
-    unsigned d = 0;
-    if (n > OSC_CONTRACT_MAX) return false;
-    for (unsigned i = 0; i < n; i++) {
-        const OscCterm *c = &t[i];
-        OscScalar a = d >= 2 ? st[d - 2] : OSC_T_VOID, b = d >= 1 ? st[d - 1] : OSC_T_VOID;
-        bool sub_only = c->arg == 0 && c->imm == 0;  /* operator and cast terms carry only `sub` */
-        switch (c->kind) {
-        case OSC_CT_PARAM:
-            if (c->sub || c->imm || c->arg >= f->nparams || !type_is_scalar(&f->vtype[c->arg])) return false;
-            st[d++] = f->vtype[c->arg].s;
-            break;
-        case OSC_CT_RESULT:
-            if (c->sub || c->arg || c->imm || !ens || !type_is_scalar(&f->ret)) return false;
-            st[d++] = f->ret.s;
-            break;
-        case OSC_CT_CONST:
-            if (c->arg || !is_value_scalar((OscScalar)c->sub) || !canonical_for((OscScalar)c->sub, c->imm)) return false;
-            st[d++] = (OscScalar)c->sub;
-            break;
-        case OSC_CT_BIN:
-            if (!sub_only || d < 2 || c->sub < OSC_B_ADD || c->sub > OSC_B_SHR) return false;
-            if (c->sub == OSC_B_SHL || c->sub == OSC_B_SHR) {
-                if (!osc_scalar_is_int(a) || !osc_scalar_is_int(b)) return false;
-            } else if (c->sub == OSC_B_AND || c->sub == OSC_B_OR || c->sub == OSC_B_XOR) {
-                if (a != b) return false;
-            } else if (!osc_scalar_is_int(a) || a != b) return false;
-            d--;  /* the result has a's type, now on top */
-            break;
-        case OSC_CT_UN:
-            if (!sub_only || d < 1) return false;
-            if (c->sub == OSC_U_LNOT) { if (b != OSC_T_BOOL) return false; }
-            else if ((c->sub != OSC_U_NEG && c->sub != OSC_U_BNOT) || !osc_scalar_is_int(b)) return false;
-            break;
-        case OSC_CT_CMP:
-            if (!sub_only || d < 2 || c->sub < OSC_C_EQ || c->sub > OSC_C_GE || a != b) return false;
-            st[--d - 1] = OSC_T_BOOL;
-            break;
-        case OSC_CT_CAST:
-            if (!sub_only || d < 1 || !osc_scalar_is_int(b) || !osc_scalar_is_int((OscScalar)c->sub)) return false;
-            st[d - 1] = (OscScalar)c->sub;
-            break;
-        default: return false;
-        }
-    }
-    return n == 0 || (d == 1 && st[0] == OSC_T_BOOL);
-}
+_Static_assert(sizeof(OscCterm) == 16 && offsetof(OscCterm, kind) == 0 &&
+               offsetof(OscCterm, sub) == 1 && offsetof(OscCterm, arg) == 2 &&
+               offsetof(OscCterm, imm) == 8 && OSC_CONTRACT_MAX == 64, "OSC contract ABI");
+
 static bool func_contracts_ok(const OscFunc *f) {
-    return contract_ok(f, f->req, f->nreq, false) && contract_ok(f, f->ens, f->nens, true);
+    if (!f->nreq && !f->nens) return true;
+    if (f->nreq > OSC_CONTRACT_MAX || f->nens > OSC_CONTRACT_MAX) return false;
+    /* Zero denotes an absent parameter or a non-scalar value. Parameter
+     * indices are bytes in the object, including on the strict decode path. */
+    uint8_t params[UINT8_MAX + 1] = {0};
+    for (unsigned i = 0; i < f->nparams; ++i)
+        if (type_is_scalar(&f->vtype[i])) params[i] = (uint8_t)f->vtype[i].s;
+    return osc_ir_contract((const uint8_t *)f->req, f->nreq * sizeof(OscCterm), params, 0) &&
+           osc_ir_contract((const uint8_t *)f->ens, f->nens * sizeof(OscCterm), params,
+                           type_is_scalar(&f->ret) ? f->ret.s : 0);
 }
 
 static int validate_func(const OscAlloc *a, const OscUnit *u, int fi, char *err, size_t n) {
@@ -439,81 +363,33 @@ static int validate_func(const OscAlloc *a, const OscUnit *u, int fi, char *err,
     }
     for (uint32_t i = 0; i < f->ninsns; i++)
         if (validate_insn(u, fi, f, i, err, n)) return -1;
-    for (uint32_t i = 0; i < f->ninsns; i++) {
-        int d = insn_def(&f->insns[i]);
-        if (d >= 0 && d < f->nvregs && sl[d]) return vfail(err, n, "func %d insn %u: slice register redefined", fi, i);
-    }
-
-    /* OSC-2 arenas: an arena handle vreg is defined by exactly one AOPEN (no
-     * other definition, not a parameter) and is used only as the handle of
-     * AALLOC / ADESTROY, so a handle (an address) never reaches a value. */
-    uint8_t hk[OSC_MAX_VREGS];
-    memset(hk, 0, sizeof hk);
-    for (uint32_t i = 0; i < f->ninsns; i++) {
-        const OscInsn *x = &f->insns[i];
-        if (x->op != OSC_I_AOPEN) continue;
-        if (hk[x->dst] || x->dst < f->nparams) return vfail(err, n, "func %d insn %u: AOPEN handle vreg reused", fi, i);
-        hk[x->dst] = 1;
-    }
-    for (uint32_t i = 0; i < f->ninsns; i++) {
-        const OscInsn *x = &f->insns[i];
-        int d = insn_def(x);
-        if (x->op != OSC_I_AOPEN && d >= 0 && hk[d])
-            return vfail(err, n, "func %d insn %u: arena handle vreg redefined", fi, i);
-        if (x->op == OSC_I_AALLOC) {
-            if (!hk[x->b] || hk[x->a]) return vfail(err, n, "func %d insn %u: AALLOC handle misuse", fi, i);
-        } else if (x->op == OSC_I_ADESTROY) {
-            if (!hk[x->a]) return vfail(err, n, "func %d insn %u: ADESTROY of a non-handle", fi, i);
-        } else {
-            int16_t us[OSC_MAX_PARAMS + 3];
-            int k = insn_uses(x, us);
-            for (int j = 0; j < k; j++)
-                if (hk[us[j]]) return vfail(err, n, "func %d insn %u: arena handle used as a value", fi, i);
-        }
-    }
-
-    /* OSC-3 item 2: a pool vreg is defined by exactly one POPEN (not a
-     * parameter, never redefined) and is used only as the pool operand of
-     * HALLOC / HGEN / HFREE / HLOAD / HSTORE / PCLOSE. Element types of
-     * HALLOC init, HLOAD dst and HSTORE value match the POPEN element type. */
-    uint8_t pk[OSC_MAX_VREGS];
-    memset(pk, 0, sizeof pk);
-    for (uint32_t i = 0; i < f->ninsns; i++) {
-        const OscInsn *x = &f->insns[i];
-        if (x->op != OSC_I_POPEN) continue;
-        if (pk[x->dst] || hk[x->dst] || x->dst < f->nparams)
-            return vfail(err, n, "func %d insn %u: POPEN pool vreg reused", fi, i);
-        pk[x->dst] = (uint8_t)x->sub;
-    }
-    for (uint32_t i = 0; i < f->ninsns; i++) {
-        const OscInsn *x = &f->insns[i];
-        int d = insn_def(x);
-        if (x->op != OSC_I_POPEN && d >= 0 && pk[d])
-            return vfail(err, n, "func %d insn %u: pool vreg redefined", fi, i);
-        switch (x->op) {
-        case OSC_I_PCLOSE:
-            if (!pk[x->a]) return vfail(err, n, "func %d insn %u: PCLOSE of a non-pool", fi, i);
-            break;
-        case OSC_I_HALLOC:
-            if (!pk[x->b] || pk[x->a]) return vfail(err, n, "func %d insn %u: HALLOC pool misuse", fi, i);
-            if (f->vtype[x->a].s != (OscScalar)pk[x->b])
-                return vfail(err, n, "func %d insn %u: HALLOC init type != pool element type", fi, i);
-            break;
-        case OSC_I_HGEN: case OSC_I_HFREE: case OSC_I_HLOAD: case OSC_I_HSTORE:
-            if (!pk[x->a] || pk[x->b] || (x->op != OSC_I_HGEN && pk[x->c]))
-                return vfail(err, n, "func %d insn %u: handle pool misuse", fi, i);
-            if (x->op == OSC_I_HLOAD && f->vtype[x->dst].s != (OscScalar)pk[x->a])
-                return vfail(err, n, "func %d insn %u: HLOAD type != pool element type", fi, i);
-            if (x->op == OSC_I_HSTORE && (pk[x->args[0]] || f->vtype[x->args[0]].s != (OscScalar)pk[x->a]))
-                return vfail(err, n, "func %d insn %u: HSTORE value type != pool element type", fi, i);
-            break;
-        default: {
-            int16_t us[OSC_MAX_PARAMS + 3];
-            int k = insn_uses(x, us);
-            for (int j = 0; j < k; j++)
-                if (pk[us[j]]) return vfail(err, n, "func %d insn %u: pool used as a value", fi, i);
-        }
-        }
+    static const char *const resource_errors[] = {
+        NULL,
+        "slice register redefined",
+        "AOPEN handle vreg reused",
+        "arena handle vreg redefined",
+        "AALLOC handle misuse",
+        "ADESTROY of a non-handle",
+        "arena handle used as a value",
+        "POPEN pool vreg reused",
+        "pool vreg redefined",
+        "PCLOSE of a non-pool",
+        "HALLOC pool misuse",
+        "HALLOC init type != pool element type",
+        "handle pool misuse",
+        "HLOAD type != pool element type",
+        "HSTORE value type != pool element type",
+        "pool used as a value",
+    };
+    uint8_t scalars[OSC_MAX_VREGS] = {0};
+    for (unsigned i = 0; i < f->nvregs; ++i) scalars[i] = (uint8_t)f->vtype[i].s;
+    uint64_t error = osc_ir_resources((const uint8_t *)f->insns, f->ninsns * sizeof(OscInsn),
+                                      scalars, sl, f->nparams);
+    if (error) {
+        unsigned reason = (unsigned)(error & 255);
+        const char *why = reason < sizeof resource_errors / sizeof *resource_errors ?
+                          resource_errors[reason] : "unknown resource validation error";
+        return vfail(err, n, "func %d insn %u: %s", fi, (unsigned)(error >> 8), why);
     }
 
     /* definite assignment: every use reads a vreg defined on every path */
@@ -529,33 +405,19 @@ static int validate_func(const OscAlloc *a, const OscUnit *u, int fi, char *err,
         return -2;
     }
     for (int b = 0; b < nb; b++) {
-        uint64_t *record = transfers + b * (width + 2);
-        memset(record, 0, width * sizeof(*record));
         const OscBlock *bl = &f->blocks[b];
-        for (uint32_t i = bl->first; i < bl->first + bl->count; i++) {
-            int d = insn_def(&f->insns[i]);
-            if (d >= 0) record[d / 64] |= UINT64_C(1) << (d % 64);
-        }
-        const OscInsn *term = &f->insns[bl->first + bl->count - 1];
-        record[width] = term->op == OSC_I_RET ? nb : term->blk_t;
-        record[width + 1] = term->op == OSC_I_CBR ? term->blk_f : nb;
+        osc_ir_block_transfer((const uint8_t *)&f->insns[bl->first], bl->count * sizeof(OscInsn),
+                              transfers + b * (width + 2), width + 2, nb);
     }
     osc_definite_inputs(transfers, transfer_words, in, input_words, f->nparams, width);
     int rc = 0;
     for (int b = 0; b < nb && !rc; b++) {
-        uint64_t cur[BSW];
-        memcpy(cur, &in[b * width], width * sizeof(*cur));
-        for (uint32_t i = f->blocks[b].first; i < f->blocks[b].first + f->blocks[b].count && !rc; i++) {
-            int16_t us[OSC_MAX_PARAMS + 2];
-            int k = insn_uses(&f->insns[i], us);
-            for (int j = 0; j < k; j++)
-                if (!(cur[us[j] / 64] >> (us[j] % 64) & 1)) {
-                    rc = vfail(err, n, "func %d insn %u: vreg %d may be used before it is defined", fi, i, us[j]);
-                    break;
-                }
-            int d = insn_def(&f->insns[i]);
-            if (d >= 0) cur[d / 64] |= 1ULL << (d % 64);
-        }
+        const OscBlock *bl = &f->blocks[b];
+        uint64_t missing = osc_ir_block_reads((const uint8_t *)&f->insns[bl->first],
+                                              bl->count * sizeof(OscInsn), in + b * width, width);
+        if (missing)
+            rc = vfail(err, n, "func %d insn %u: vreg %d may be used before it is defined",
+                       fi, bl->first + (unsigned)(missing >> 16), (int)(missing & 65535) - 1);
     }
     a->free(a->ctx, in, input_words * sizeof(*in));
     a->free(a->ctx, transfers, transfer_words * sizeof(*transfers));
