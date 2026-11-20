@@ -260,6 +260,17 @@ uint64_t rx_fus_eligible_kind(uint64_t o_k);
 #define OSC_LITERAL_OVERFLOW 2
 /* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
 uint64_t osc_parse_literal(const uint8_t *o_spelling, size_t o_spelling_len, uint64_t o_value[1]);
+#define OSC_OWN_ALLOWED 0
+#define OSC_OWN_MOVED 1
+#define OSC_OWN_ALIAS 2
+#define OSC_OWN_READ_ONLY 3
+#define OSC_OWN_LOOP_MOVE 4
+/* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+uint64_t osc_owner_access(uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
+/* export fn osc_borrow_access writable ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+uint64_t osc_borrow_access(uint64_t o_writable, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
+/* export fn osc_owner_move moved ulong shared_count ulong mut_count ulong declaration_depth long loop_depth long to ulong */
+uint64_t osc_owner_move(uint64_t o_moved, uint64_t o_shared_count, uint64_t o_mut_count, int64_t o_declaration_depth, int64_t o_loop_depth);
 #ifdef __cplusplus
 }
 #endif
