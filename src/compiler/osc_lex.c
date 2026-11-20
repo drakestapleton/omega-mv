@@ -19,6 +19,7 @@
  * OSC-1 slice; not a general Omega compiler; no self-hosting.
  */
 #include "osc_lex.h"
+#include "omega_api_decl.h"
 
 #include <string.h>
 
@@ -68,13 +69,6 @@ void osc_tok_text(const char *src, const OscToken *t, char *buf, size_t cap)
 
 static int is_alpha(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 static int is_digit(int c) { return c >= '0' && c <= '9'; }
-static int digit_val(int c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return 99;
-}
 
 int osc_lex(const char *src, size_t len, OscToken *toks, uint32_t cap, uint32_t *ntok, OscDiag *d)
 {
@@ -138,39 +132,23 @@ int osc_lex(const char *src, size_t len, OscToken *toks, uint32_t cap, uint32_t 
         }
         if (is_digit(c)) {
             size_t s = i;
-            unsigned base = 10;
-            if (c == '0' && i + 1 < len && (src[i + 1] == 'x' || src[i + 1] == 'b')) {
-                base = src[i + 1] == 'x' ? 16 : 2;
-                ADV(); ADV();
-            }
-            size_t ds = i;
-            int overflow = 0;
-            uint64_t v = 0;
-            while (i < len && (is_alpha(src[i]) || is_digit(src[i]))) {
-                int dv = digit_val(src[i]);
-                if (dv >= (int)base) break;
-                if (v > (UINT64_MAX - (uint64_t)dv) / base) overflow = 1;
-                v = v * base + (uint64_t)dv;
-                ADV();
-            }
+            while (i < len && (is_alpha(src[i]) || is_digit(src[i]))) ADV();
             t->len = (uint32_t)(i - s);
+            uint64_t status = osc_parse_literal((const uint8_t *)src + s, i - s, &t->ival);
             char buf[64];
-            if (i == ds || (i < len && (is_alpha(src[i]) || is_digit(src[i])))) {
-                while (i < len && (is_alpha(src[i]) || is_digit(src[i]))) ADV();
-                t->len = (uint32_t)(i - s);
+            if (status == OSC_LITERAL_MALFORMED) {
                 osc_tok_text(src, t, buf, sizeof buf);
                 osc_diag_set(d, OSC_DIAG_SYNTAX, t->line, t->col, buf, 0, NULL, "malformed literal",
                              "malformed integer literal '%s'", buf);
                 return -1;
             }
-            if (overflow) {
+            if (status == OSC_LITERAL_OVERFLOW) {
                 osc_tok_text(src, t, buf, sizeof buf);
                 osc_diag_set(d, OSC_DIAG_OVERFLOW_UNSAFE, t->line, t->col, buf, 0, NULL, "literal wider than 64 bits",
                              "integer literal does not fit in 64 bits");
                 return -1;
             }
             t->kind = OT_INT;
-            t->ival = v;
             n++;
             continue;
         }
