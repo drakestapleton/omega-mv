@@ -42,6 +42,10 @@ uint64_t bw_qmd_verify(const uint32_t o_q[96]);
 uint64_t bw_sched_stalls(uint64_t o_ins[8192], const uint64_t o_phys[256], const uint64_t o_bsz[256], uint64_t o_n);
 /* export fn bw_regalloc_solve cfg view ulong 4 vinfo view long 768 uinfo view ulong 32 res edit long 290 to ulong */
 uint64_t bw_regalloc_solve(const uint64_t o_cfg[4], const int64_t o_vinfo[768], const uint64_t o_uinfo[32], int64_t o_res[290]);
+/* export fn bw_encode_vecadd buf edit uchar 512 to ulong */
+uint64_t bw_encode_vecadd(uint8_t o_buf[512]);
+/* export fn bw_cmdlist_nop ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t bw_cmdlist_nop(uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* export fn cg_matmul_tensor sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_matmul_tensor(const uint64_t o_sp[12], uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* export fn cg_matmul_tensor_loop sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 to ulong */
@@ -52,6 +56,8 @@ uint64_t cg_matmul_frag(const uint64_t o_sp[12], uint64_t o_ins[8192], uint64_t 
 uint64_t cg_matmul_frag_block(const uint64_t o_sp[12], uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* export fn cg_matmul_frag_shape mt ulong nt ulong kp ulong res edit ulong 4 to ulong */
 uint64_t cg_matmul_frag_shape(uint64_t o_mt, uint64_t o_nt, uint64_t o_kp, uint64_t o_res[4]);
+/* export fn cg_matmul_i32 sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_matmul_i32(const uint64_t o_sp[12], uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* export fn q38_plan_layer cfg view ulong 8 dst edit uint 384 to ulong */
 uint64_t q38_plan_layer(const uint64_t o_cfg[8], uint32_t o_dst[384]);
 /* export fn q38_bf16_xbatch_max hd ulong max_smem ulong to ulong */

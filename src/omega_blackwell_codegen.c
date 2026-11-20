@@ -1280,161 +1280,22 @@ int omega_bw_encode_program(const BlackwellIRProgram *prog, uint8_t *code_buf, s
     return 0;
 }
 
+static int bw_ir_unpack_raw(const uint64_t ins[8192], const uint64_t meta[512], BlackwellIRProgram *prog);
+
 int omega_blackwell_codegen_matmul_i32_prog(const OmegaMatMulSpec *spec, BlackwellIRProgram *prog) {
     if (!spec || !prog) return -1;
-    if (spec->m == 0 || spec->k == 0 || spec->n == 0) return -1;
-
-    /* Fail closed loudly if K exceeds bounded unroll limit */
-    if (spec->k > 32) {
-        BW_DIAG("ERROR: MatMul integer codegen exceeds bounded unroll limit (K=%u > 32)\n", spec->k);
+    uint64_t sp[12] = { spec->m, spec->k, spec->n, 0 };
+    uint64_t ins[8192], meta[512];
+    memset(ins, 0, sizeof(ins));
+    memset(meta, 0, sizeof(meta));
+    uint64_t rc = 1;
+    if (omega2_cg_matmul_i32(&rc, sp, 12, ins, 8192, meta, 512) != OMEGA_OK || rc != 0) {
+        omega_bw_ir_init(prog);
         return -1;
     }
-
-    omega_bw_ir_init(prog);
-
-    /* 1. Allocate virtual registers */
-    /* 64-bit base pointers */
-    int v_ptr_a   = omega_bw_ir_alloc_vreg64(prog);
-    int v_ptr_b   = omega_bw_ir_alloc_vreg64(prog);
-    int v_ptr_c   = omega_bw_ir_alloc_vreg64(prog);
-    int uv_desc   = omega_bw_ir_alloc_uvreg64(prog);
-
-    /* 32-bit CTA / Thread indexing */
-    int v_ctaid_x = omega_bw_ir_alloc_vreg(prog);
-    int v_ctaid_y = omega_bw_ir_alloc_vreg(prog);
-    int v_tid_x   = omega_bw_ir_alloc_vreg(prog);
-    int v_tid_y   = omega_bw_ir_alloc_vreg(prog);
-
-    /* 2D Coordinates & loop invariants */
-    int v_col     = omega_bw_ir_alloc_vreg(prog);
-    int v_row     = omega_bw_ir_alloc_vreg(prog);
-    int v_row_k   = omega_bw_ir_alloc_vreg(prog);
-    int v_const_1 = omega_bw_ir_alloc_vreg(prog);
-    int v_acc     = omega_bw_ir_alloc_vreg(prog);
-
-    /* Working registers for memory address and operands */
-    int v_idx_a   = omega_bw_ir_alloc_vreg(prog);
-    int v_off_a   = omega_bw_ir_alloc_vreg64(prog);
-    int v_val_a   = omega_bw_ir_alloc_vreg(prog);
-
-    int v_idx_b   = omega_bw_ir_alloc_vreg(prog);
-    int v_off_b   = omega_bw_ir_alloc_vreg64(prog);
-    int v_val_b   = omega_bw_ir_alloc_vreg(prog);
-
-    int v_idx_c   = omega_bw_ir_alloc_vreg(prog);
-    int v_off_c   = omega_bw_ir_alloc_vreg64(prog);
-
-    if (v_off_c < 0) return -1;
-
-    /* 2. Load 64-bit global memory descriptor into uniform register pair */
-    /* LDCU.64 uv_desc, c[0x0][0x358] */
-    BlackwellIRInsn insn_desc = { .op = BW_IR_LDCU64, .dst_vreg = uv_desc, .imm = 0x358, .is_uniform = true };
-    omega_bw_ir_append(prog, &insn_desc);
-
-    /* 3. Load 64-bit base pointers from Constant Bank 0 */
-    /* LDC.64 v_ptr_a, c[0x0][0x380] */
-    BlackwellIRInsn insn_ptra = { .op = BW_IR_LDC64, .dst_vreg = v_ptr_a, .imm = 0x380 };
-    omega_bw_ir_append(prog, &insn_ptra);
-
-    /* LDC.64 v_ptr_b, c[0x0][0x388] */
-    BlackwellIRInsn insn_ptrb = { .op = BW_IR_LDC64, .dst_vreg = v_ptr_b, .imm = 0x388 };
-    omega_bw_ir_append(prog, &insn_ptrb);
-
-    /* LDC.64 v_ptr_c, c[0x0][0x390] */
-    BlackwellIRInsn insn_ptrc = { .op = BW_IR_LDC64, .dst_vreg = v_ptr_c, .imm = 0x390 };
-    omega_bw_ir_append(prog, &insn_ptrc);
-
-    /* 4. Query 2D CTA and Thread coordinates */
-    /* S2R v_ctaid_x, SR_CTAID.X */
-    BlackwellIRInsn insn_ctax = { .op = BW_IR_S2R, .dst_vreg = v_ctaid_x, .imm = BW_SR_CTAID_X };
-    omega_bw_ir_append(prog, &insn_ctax);
-
-    /* S2R v_ctaid_y, SR_CTAID.Y */
-    BlackwellIRInsn insn_ctay = { .op = BW_IR_S2R, .dst_vreg = v_ctaid_y, .imm = BW_SR_CTAID_Y };
-    omega_bw_ir_append(prog, &insn_ctay);
-
-    /* S2R v_tid_x, SR_TID.X */
-    BlackwellIRInsn insn_tidx = { .op = BW_IR_S2R, .dst_vreg = v_tid_x, .imm = BW_SR_TID_X };
-    omega_bw_ir_append(prog, &insn_tidx);
-
-    /* S2R v_tid_y, SR_TID.Y */
-    BlackwellIRInsn insn_tidy = { .op = BW_IR_S2R, .dst_vreg = v_tid_y, .imm = BW_SR_TID_Y };
-    omega_bw_ir_append(prog, &insn_tidy);
-
-    /* 5. Compute 2D (row, col) coordinates */
-    /* Standard 16x16 tile threads: col = ctaid_x * 16 + tid_x */
-    BlackwellIRInsn insn_col = { .op = BW_IR_IMAD, .dst_vreg = v_col, .src1_vreg = v_ctaid_x, .src2_vreg = -1, .imm = 16, .src3_vreg = v_tid_x };
-    omega_bw_ir_append(prog, &insn_col);
-
-    /* row = ctaid_y * 16 + tid_y */
-    BlackwellIRInsn insn_row = { .op = BW_IR_IMAD, .dst_vreg = v_row, .src1_vreg = v_ctaid_y, .src2_vreg = -1, .imm = 16, .src3_vreg = v_tid_y };
-    omega_bw_ir_append(prog, &insn_row);
-
-    /* 6. Precompute row base index: v_row_k = v_row * K + RZ */
-    BlackwellIRInsn insn_row_k = { .op = BW_IR_IMAD, .dst_vreg = v_row_k, .src1_vreg = v_row, .src2_vreg = -1, .imm = spec->k, .src3_vreg = -1 };
-    omega_bw_ir_append(prog, &insn_row_k);
-
-    /* 7. Initialize v_const_1 = 1 for immediate linear indexing */
-    BlackwellIRInsn insn_c1 = { .op = BW_IR_MOV_IMM, .dst_vreg = v_const_1, .imm = 1 };
-    omega_bw_ir_append(prog, &insn_c1);
-
-    /* 8. Initialize accumulator to zero: MOV v_acc, RZ */
-    BlackwellIRInsn insn_init_acc = { .op = BW_IR_MOV_RZ, .dst_vreg = v_acc };
-    omega_bw_ir_append(prog, &insn_init_acc);
-
-    /* 9. Synthesize inner accumulation loop across K iterations */
-    for (uint32_t step = 0; step < spec->k; step++) {
-        /* A[row, step]: idx_a = v_row_k + step = v_const_1 * step + v_row_k */
-        BlackwellIRInsn insn_idxa = { .op = BW_IR_IMAD, .dst_vreg = v_idx_a, .src1_vreg = v_const_1, .src2_vreg = -1, .imm = step, .src3_vreg = v_row_k };
-        omega_bw_ir_append(prog, &insn_idxa);
-
-        /* off_a = v_ptr_a + idx_a * 4 */
-        BlackwellIRInsn insn_offa = { .op = BW_IR_IMAD_WIDE, .dst_vreg = v_off_a, .src1_vreg = v_idx_a, .src2_vreg = -1, .imm = 4, .src3_vreg = v_ptr_a };
-        omega_bw_ir_append(prog, &insn_offa);
-
-        /* Load A[row, step]: LDG.E v_val_a, desc[uv_desc][v_off_a.64] */
-        BlackwellIRInsn insn_lda = { .op = BW_IR_LDG_E, .dst_vreg = v_val_a, .src1_vreg = v_off_a, .src2_vreg = -1, .src3_vreg = -1, .ureg = uv_desc, .control = 0x001ea800 };
-        omega_bw_ir_append(prog, &insn_lda);
-
-        /* B[step, col]: idx_b = step * N + col = v_const_1 * (step * N) + v_col */
-        uint32_t step_n = step * spec->n;
-        BlackwellIRInsn insn_idxb = { .op = BW_IR_IMAD, .dst_vreg = v_idx_b, .src1_vreg = v_const_1, .src2_vreg = -1, .imm = step_n, .src3_vreg = v_col };
-        omega_bw_ir_append(prog, &insn_idxb);
-
-        /* off_b = v_ptr_b + idx_b * 4 */
-        BlackwellIRInsn insn_offb = { .op = BW_IR_IMAD_WIDE, .dst_vreg = v_off_b, .src1_vreg = v_idx_b, .src2_vreg = -1, .imm = 4, .src3_vreg = v_ptr_b };
-        omega_bw_ir_append(prog, &insn_offb);
-
-        /* Load B[step, col]: LDG.E v_val_b, desc[uv_desc][v_off_b.64] */
-        BlackwellIRInsn insn_ldb = { .op = BW_IR_LDG_E, .dst_vreg = v_val_b, .src1_vreg = v_off_b, .src2_vreg = -1, .src3_vreg = -1, .ureg = uv_desc, .control = 0x002ea800 };
-        omega_bw_ir_append(prog, &insn_ldb);
-
-        /* Multiply and accumulate: IMAD v_acc, v_val_a, v_val_b, v_acc */
-        BlackwellIRInsn insn_acc = { .op = BW_IR_IMAD, .dst_vreg = v_acc, .src1_vreg = v_val_a, .src2_vreg = v_val_b, .src3_vreg = v_acc, .control = 0x004fca00 };
-        omega_bw_ir_append(prog, &insn_acc);
-    }
-
-    /* 10. Compute output index: idx_c = row * N + col */
-    BlackwellIRInsn insn_idxc = { .op = BW_IR_IMAD, .dst_vreg = v_idx_c, .src1_vreg = v_row, .src2_vreg = -1, .imm = spec->n, .src3_vreg = v_col };
-    omega_bw_ir_append(prog, &insn_idxc);
-
-    /* off_c = v_ptr_c + idx_c * 4 */
-    BlackwellIRInsn insn_offc = { .op = BW_IR_IMAD_WIDE, .dst_vreg = v_off_c, .src1_vreg = v_idx_c, .src2_vreg = -1, .imm = 4, .src3_vreg = v_ptr_c };
-    omega_bw_ir_append(prog, &insn_offc);
-
-    /* Store C[row, col]: STG.E desc[uv_desc][v_off_c.64], v_acc */
-    BlackwellIRInsn insn_stc = { .op = BW_IR_STG_E, .src1_vreg = v_off_c, .src2_vreg = v_acc, .src3_vreg = -1, .ureg = uv_desc };
-    omega_bw_ir_append(prog, &insn_stc);
-
-    /* 11. Kernel termination */
-    BlackwellIRInsn insn_exit = { .op = BW_IR_EXIT, .predicate_p0 = false };
-    omega_bw_ir_append(prog, &insn_exit);
-
-    BlackwellIRInsn insn_bra = { .op = BW_IR_BRA };
-    omega_bw_ir_append(prog, &insn_bra);
-
-    /* 12. Solve bounded deterministic register allocation */
+    if (bw_ir_unpack_raw(ins, meta, prog) != 0) return -1;
     if (omega_bw_regalloc_solve(prog) != 0) {
+        omega_bw_ir_init(prog);
         return -1;
     }
     return 0;
