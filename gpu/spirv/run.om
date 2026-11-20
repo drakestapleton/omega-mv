@@ -1,0 +1,796 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note run.om: pure seeded-Omega SPIR-V compute binary executor (replaces Vulkan/lavapipe).
+note Decodes and executes SPIR-V 1.3 Vulkan Shader (GLCompute) and SPIR-V 1.0 OpenCL Kernel
+note binary modules directly in seeded Omega with exact IEEE binary32 arithmetic (0 ulp, no FMA).
+note
+note Usage:
+note   run MODULE.spv N_WORK N_OUT OUT.bin IN0.bin [IN1.bin]
+note   MODULE.spv  SPIR-V binary file (little-endian 32-bit words, magic 0x07230203)
+note   N_WORK      number of work-items (gid = 0 .. N_WORK - 1)
+note   N_OUT       number of f32 elements in OUT.bin
+note   OUT.bin     output binary file (written as N_OUT little-endian binary32 values)
+note   IN0.bin     first input binary file (little-endian binary32 values)
+note   IN1.bin     optional second input binary file
+note
+note Exit: 0 ok; 2 usage; 3 I/O error; 4 invalid or unsupported SPIR-V module. Traps exit 100 + code.
+om2
+
+text tuse "usage: run MODULE.spv N_WORK N_OUT OUT.bin IN0.bin [IN1.bin]\n"
+text tio "run: I/O error or size limit exceeded\n"
+text tbad "run: invalid or unsupported SPIR-V module\n"
+text tocls "OpenCL.std"
+text tglsl "GLSL.std.450"
+
+const MAXBUF ulong 1048576
+const MAXIDS ulong 1024
+const MAXINST ulong 1024
+const POISON uint 4290838510
+
+global gspv uchar 65536
+global gw uint 16384
+global gio uchar 4194304
+global gbuf0 uint 1048576
+global gbuf1 uint 1048576
+global gbuf2 uint 1048576
+global gblen ulong 4
+global gval ulong 1024
+global gbind uint 1024
+global glabel uint 1024
+global giop uint 1024
+global gia1 uint 1024
+global gia2 uint 1024
+global gia3 uint 1024
+global gia4 uint 1024
+global gpath uchar 4096
+global garg uchar 64
+note gst:
+note   0 nwords, 1 id_bound, 2 exec_model (5 vk, 6 cl), 3 entry_fn,
+note   4 gid_var, 5 ext_id, 6 ext_kind (1 glsl, 2 ocl), 7 nin_files (1 or 2),
+note   8 n_work, 9 n_out, 10 n_inst, 11 n_ptr_params, 12 n_param_id, 13 in_entry,
+note   14 out_slot (1 if 1 input, 2 if 2 inputs), 15 ptr_f32_tid
+global gst ulong 16
+
+fn fail code int msg view uchar * to void
+n = write 2 msg 0 len msg
+exit code
+end
+
+fn parseu ai ulong to ulong
+n = argread ai garg 0 len garg
+if or le n 0 gt n 20
+fail 2 tuse
+end
+v = ulong 0
+for i ulong ulong n
+c = get garg i
+if or lt c 48 gt c 57
+fail 2 tuse
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn spvu32 i ulong to uint
+o = mul i 4
+v = uint 0
+for k ulong 4
+v = or v shl uint get gspv add o k mul uint k 8
+end
+ret v
+end
+
+fn giou32 i ulong to uint
+o = mul i 4
+v = uint 0
+for k ulong 4
+v = or v shl uint get gio add o k mul uint k 8
+end
+ret v
+end
+
+fn putgio32 i ulong v uint to void
+o = mul i 4
+for k ulong 4
+put gio add o k uchar and shr v mul uint k 8 255
+end
+end
+
+fn readspv ai ulong to void
+n = argread ai gpath 0 len gpath
+if le n 0
+fail 2 tuse
+end
+fd = fopen gpath 0 ulong n 0 0
+if lt fd 0
+fail 3 tio
+end
+sz = fseek int fd 0 2
+if or lt sz 20 gt sz 65536
+c = fclose int fd
+fail 4 tbad
+end
+if ne rem ulong sz 4 0
+c = fclose int fd
+fail 4 tbad
+end
+r = pread int fd gspv 0 ulong sz 0
+c = fclose int fd
+if ne r sz
+fail 3 tio
+end
+nw = div ulong sz 4
+put gst 0 nw
+for i ulong nw
+put gw i spvu32 i
+end
+end
+
+fn loadbuf ai ulong slot ulong to void
+n = argread ai gpath 0 len gpath
+if le n 0
+fail 2 tuse
+end
+fd = fopen gpath 0 ulong n 0 0
+if lt fd 0
+fail 3 tio
+end
+sz = fseek int fd 0 2
+if or lt sz 0 gt sz 4194304
+c = fclose int fd
+fail 3 tio
+end
+if ne rem ulong sz 4 0
+c = fclose int fd
+fail 3 tio
+end
+r = pread int fd gio 0 ulong sz 0
+c = fclose int fd
+if ne r sz
+fail 3 tio
+end
+nelem = div ulong sz 4
+put gblen slot nelem
+pos = ulong 0
+while lt pos nelem bound 260
+step = sub nelem pos
+if gt step 4096
+step = 4096
+end
+for l ulong step
+idx = add pos l
+v = giou32 idx
+if eq slot 0
+put gbuf0 idx v
+end
+if eq slot 1
+put gbuf1 idx v
+end
+end
+pos = add pos step
+end
+end
+
+fn saveout ai ulong nelem ulong to void
+n = argread ai gpath 0 len gpath
+if le n 0
+fail 2 tuse
+end
+pos = ulong 0
+while lt pos nelem bound 260
+step = sub nelem pos
+if gt step 4096
+step = 4096
+end
+for l ulong step
+idx = add pos l
+putgio32 idx get gbuf2 idx
+end
+pos = add pos step
+end
+nb = mul nelem 4
+fd = fopen gpath 0 ulong n 577 420
+if lt fd 0
+fail 3 tio
+end
+r = write int fd gio 0 nb
+c = fclose int fd
+if ne r long nb
+fail 3 tio
+end
+end
+
+fn initout nelem ulong to void
+put gblen get gst 14 nelem
+pos = ulong 0
+while lt pos nelem bound 260
+step = sub nelem pos
+if gt step 4096
+step = 4096
+end
+for l ulong step
+put gbuf2 add pos l POISON
+end
+pos = add pos step
+end
+end
+
+fn wbyte woff ulong i ulong to uchar
+w = get gw add woff div i 4
+sh = mul uint rem i 4 8
+ret uchar and shr w sh 255
+end
+
+fn stris woff ulong wc ulong t view uchar * to bool
+for i ulong len t
+if ge div i 4 wc
+ret false
+end
+if ne wbyte woff i get t i
+ret false
+end
+end
+if ge div len t 4 wc
+ret false
+end
+ret eq wbyte woff len t 0
+end
+
+fn chk_id id uint to void
+if ge ulong id MAXIDS
+fail 4 tbad
+end
+end
+
+fn addinst op uint a1 uint a2 uint a3 uint a4 uint to void
+k = get gst 10
+if ge k MAXINST
+fail 4 tbad
+end
+put giop k op
+put gia1 k a1
+put gia2 k a2
+put gia3 k a3
+put gia4 k a4
+put gst 10 add k 1
+end
+
+fn parse_meta op uint p ulong wc ulong to void
+if eq op 11
+if lt wc 3
+fail 4 tbad
+end
+eid = get gw add p 1
+chk_id eid
+if stris add p 2 sub wc 2 tglsl
+put gst 5 ulong eid
+put gst 6 1
+end
+if stris add p 2 sub wc 2 tocls
+put gst 5 ulong eid
+put gst 6 2
+end
+ret
+end
+if eq op 15
+if lt wc 4
+fail 4 tbad
+end
+put gst 2 ulong get gw add p 1
+put gst 3 ulong get gw add p 2
+ret
+end
+if eq op 71
+if lt wc 3
+fail 4 tbad
+end
+tid = get gw add p 1
+dec = get gw add p 2
+chk_id tid
+if and eq dec 11 ge wc 4
+if eq get gw add p 3 28
+put gst 4 ulong tid
+end
+end
+if and eq dec 33 ge wc 4
+slot = get gw add p 3
+if gt slot 2
+fail 4 tbad
+end
+put gbind ulong tid add slot 1
+end
+ret
+end
+if eq op 32
+if lt wc 4
+fail 4 tbad
+end
+tid = get gw add p 1
+sc = get gw add p 2
+if eq sc 5
+put gst 15 ulong tid
+end
+ret
+end
+if eq op 43
+if lt wc 4
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+v = ulong get gw add p 3
+if ge wc 5
+v = or v shl ulong get gw add p 4 32
+end
+put gval ulong rid v
+ret
+end
+end
+
+fn parse_body op uint p ulong wc ulong to void
+if eq op 55
+if lt wc 3
+fail 4 tbad
+end
+ty = get gw add p 1
+pid = get gw add p 2
+chk_id pid
+if eq ulong ty get gst 15
+ps = get gst 11
+if gt ps 2
+fail 4 tbad
+end
+put gbind ulong pid uint add ps 1
+put gst 11 add ps 1
+ret
+end
+put gst 12 ulong pid
+put gval ulong pid get gst 8
+ret
+end
+if eq op 248
+if lt wc 2
+fail 4 tbad
+end
+lid = get gw add p 1
+chk_id lid
+put glabel ulong lid uint add get gst 10 1
+ret
+end
+if eq op 247
+ret
+end
+if eq op 249
+if lt wc 2
+fail 4 tbad
+end
+addinst op get gw add p 1 0 0 0
+ret
+end
+if eq op 250
+if lt wc 4
+fail 4 tbad
+end
+addinst op get gw add p 1 get gw add p 2 get gw add p 3 0
+ret
+end
+if eq op 253
+addinst op 0 0 0 0
+ret
+end
+if eq op 61
+if lt wc 4
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 0 0
+ret
+end
+if eq op 62
+if lt wc 3
+fail 4 tbad
+end
+addinst op get gw add p 1 get gw add p 2 0 0
+ret
+end
+if eq op 81
+if lt wc 5
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 get gw add p 4 0
+ret
+end
+if eq op 68
+if lt wc 5
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 0 0
+ret
+end
+if eq op 113
+if lt wc 4
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 0 0
+ret
+end
+if eq op 65
+if lt wc 6
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 get gw add p 5 0
+ret
+end
+if eq op 70
+if lt wc 5
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 get gw add p 4 0
+ret
+end
+if eq op 12
+if lt wc 6
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 get gw add p 4 get gw add p 5
+ret
+end
+if eq op 169
+if lt wc 6
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 get gw add p 4 get gw add p 5
+ret
+end
+parse_body_bin op p wc
+end
+
+fn is_binop op uint to bool
+if eq op 128
+ret true
+end
+if eq op 129
+ret true
+end
+if eq op 131
+ret true
+end
+if eq op 132
+ret true
+end
+if eq op 133
+ret true
+end
+if eq op 134
+ret true
+end
+if eq op 136
+ret true
+end
+if eq op 137
+ret true
+end
+if eq op 176
+ret true
+end
+if eq op 186
+ret true
+end
+ret eq op 194
+end
+
+fn parse_body_bin op uint p ulong wc ulong to void
+if not is_binop op
+fail 4 tbad
+end
+if lt wc 5
+fail 4 tbad
+end
+rid = get gw add p 2
+chk_id rid
+addinst op rid get gw add p 3 get gw add p 4 0
+end
+
+fn decode to void
+nw = get gst 0
+if lt nw 5
+fail 4 tbad
+end
+if ne get gw 0 0x07230203
+fail 4 tbad
+end
+bnd = ulong get gw 3
+if or eq bnd 0 gt bnd MAXIDS
+fail 4 tbad
+end
+put gst 1 bnd
+p = ulong 5
+while lt p nw bound 16384
+hd = get gw p
+wc = ulong shr hd 16
+op = and hd 65535
+if or eq wc 0 gt add p wc nw
+fail 4 tbad
+end
+if eq op 54
+if lt wc 5
+fail 4 tbad
+end
+fid = ulong get gw add p 2
+if eq fid get gst 3
+put gst 13 1
+end
+end
+if eq op 56
+put gst 13 0
+end
+if and eq get gst 13 1 and ne op 54 ne op 56
+parse_body op p wc
+end
+if eq get gst 13 0
+parse_meta op p wc
+end
+p = add p wc
+end
+if eq get gst 10 0
+fail 4 tbad
+end
+end
+
+fn bufget slot ulong idx ulong to uint
+if ge idx get gblen slot
+fail 4 tbad
+end
+if eq slot 0
+ret get gbuf0 idx
+end
+if eq slot 1
+if eq get gst 14 1
+ret get gbuf2 idx
+end
+ret get gbuf1 idx
+end
+if eq slot 2
+ret get gbuf2 idx
+end
+fail 4 tbad
+ret 0
+end
+
+fn bufput slot ulong idx ulong v uint to void
+if ge idx get gblen slot
+fail 4 tbad
+end
+if eq slot get gst 14
+put gbuf2 idx v
+ret
+end
+fail 4 tbad
+end
+
+fn exec_alu op uint a1 ulong a2 ulong a3 ulong a4 ulong to void
+if eq op 128
+put gval a1 add get gval a2 get gval a3
+ret
+end
+if eq op 132
+put gval a1 mul get gval a2 get gval a3
+ret
+end
+if eq op 134
+put gval a1 div get gval a2 get gval a3
+ret
+end
+if eq op 137
+put gval a1 rem get gval a2 get gval a3
+ret
+end
+if eq op 194
+put gval a1 shr get gval a2 get gval a3
+ret
+end
+if eq op 176
+if lt get gval a2 get gval a3
+put gval a1 1
+ret
+end
+put gval a1 0
+ret
+end
+if eq op 129
+fa = bitcast f32 uint get gval a2
+fb = bitcast f32 uint get gval a3
+put gval a1 ulong bitcast uint add fa fb
+ret
+end
+if eq op 131
+fa = bitcast f32 uint get gval a2
+fb = bitcast f32 uint get gval a3
+put gval a1 ulong bitcast uint sub fa fb
+ret
+end
+if eq op 133
+fa = bitcast f32 uint get gval a2
+fb = bitcast f32 uint get gval a3
+put gval a1 ulong bitcast uint mul fa fb
+ret
+end
+if eq op 136
+fa = bitcast f32 uint get gval a2
+fb = bitcast f32 uint get gval a3
+put gval a1 ulong bitcast uint div fa fb
+ret
+end
+if eq op 186
+fa = bitcast f32 uint get gval a2
+fb = bitcast f32 uint get gval a3
+if gt fa fb
+put gval a1 1
+ret
+end
+put gval a1 0
+ret
+end
+if eq op 169
+if ne get gval a2 0
+put gval a1 get gval a3
+ret
+end
+put gval a1 get gval a4
+ret
+end
+if eq op 12
+if ne a2 get gst 5
+fail 4 tbad
+end
+ok = false
+if and eq get gst 6 1 eq a3 31
+ok = true
+end
+if and eq get gst 6 2 eq a3 61
+ok = true
+end
+if not ok
+fail 4 tbad
+end
+fa = bitcast f32 uint get gval a4
+put gval a1 ulong bitcast uint fsqrt fa
+ret
+end
+fail 4 tbad
+end
+
+fn exec_step op uint a1 ulong a2 ulong a3 ulong a4 ulong to void
+if eq op 61
+pv = get gval a2
+put gval a1 ulong bufget shr pv 32 and pv 4294967295
+ret
+end
+if eq op 62
+pv = get gval a1
+bufput shr pv 32 and pv 4294967295 uint get gval a2
+ret
+end
+if eq op 81
+if eq a3 0
+put gval a1 get gval a2
+else
+put gval a1 0
+end
+ret
+end
+if eq op 68
+b = get gbind a2
+if eq b 0
+fail 4 tbad
+end
+put gval a1 get gblen ulong sub b 1
+ret
+end
+if eq op 113
+put gval a1 and get gval a2 4294967295
+ret
+end
+if or eq op 65 eq op 70
+b = get gbind a2
+if eq b 0
+fail 4 tbad
+end
+put gval a1 or shl ulong sub b 1 32 and get gval a3 4294967295
+ret
+end
+exec_alu op a1 a2 a3 a4
+end
+
+fn jump_pc lbl ulong to ulong
+t = get glabel lbl
+if eq t 0
+fail 4 tbad
+end
+ret ulong sub t 1
+end
+
+fn run_one gid ulong to void
+ninst = get gst 10
+gvar = get gst 4
+pc = ulong 0
+while lt pc ninst bound 4096
+op = get giop pc
+a1 = ulong get gia1 pc
+a2 = ulong get gia2 pc
+if eq op 253
+ret
+end
+if eq op 249
+pc = jump_pc a1
+continue
+end
+if eq op 250
+if ne get gval a1 0
+pc = jump_pc a2
+else
+pc = jump_pc ulong get gia3 pc
+end
+continue
+end
+if and eq op 61 eq a2 gvar
+put gval a1 gid
+pc = add pc 1
+continue
+end
+exec_step op a1 a2 ulong get gia3 pc ulong get gia4 pc
+pc = add pc 1
+end
+end
+
+fn main to int
+ac = argcnt
+if and ne ac 6 ne ac 7
+fail 2 tuse
+end
+nin = ulong sub ac 5
+put gst 7 nin
+put gst 14 nin
+nw = parseu 2
+no = parseu 3
+if or gt nw MAXBUF gt no MAXBUF
+fail 3 tio
+end
+put gst 8 nw
+put gst 9 no
+readspv 1
+loadbuf 5 0
+if eq nin 2
+loadbuf 6 1
+end
+initout no
+decode
+pos = ulong 0
+while lt pos nw bound 260
+step = sub nw pos
+if gt step 4096
+step = 4096
+end
+for l ulong step
+run_one add pos l
+end
+pos = add pos step
+end
+saveout 4 no
+ret 0
+end

@@ -3,7 +3,7 @@
 
 Usage: python3 gpu/spirv/intel_rmsnorm.py <prerequisite>
 
-prerequisite is one of: opencl-intel, opencl-pocl, levelzero, vulkan.
+prerequisite is one of: opencl-intel, opencl-pocl, levelzero, omega.
 Exit 0 prints PASS and means every output byte matched conform.om.
 Exit 2 is NOT_RUN: the prerequisite device is missing, or omc cannot execute
 (Exec format error, missing qemu, or a non-Linux host).
@@ -17,9 +17,6 @@ import os
 import subprocess
 import sys
 import tempfile
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import vulkan_pick
 
 NROWS = 65536
 ROW = 16
@@ -564,363 +561,46 @@ def levelzero_run(module, x, w, want):
     return finish(dst.raw, want, "levelzero")
 
 
-def vulkan_run(module, x, w, want, allow_gpu=False):
-    lib = load_lib(["libvulkan.so.1", "vulkan", "vulkan-1.dll"])
-    if lib is None:
-        sys.stdout.write("NOT_RUN rmsnorm vulkan: Vulkan loader not present\n")
+
+def omega_run(root, tmp, module, x, w, want):
+    runner = os.path.join(tmp, "run")
+    got = run_omc(root, os.path.join(root, "gpu", "spirv", "run.om"), runner)
+    if got == "noexec":
         return 2
-    u32 = ctypes.c_uint32
-    u64 = ctypes.c_uint64
-    vp = ctypes.c_void_p
-    sz = ctypes.c_size_t
-
-    def load(getaddr, inst, name, rest, args):
-        getaddr.restype = vp
-        getaddr.argtypes = [vp, ctypes.c_char_p]
-        addr = getaddr(inst, name)
-        if not addr:
-            return None
-        return ctypes.CFUNCTYPE(rest, *args)(addr)
-
-    vkGetInstanceProcAddr = lib.vkGetInstanceProcAddr
-    vkCreateInstance = load(vkGetInstanceProcAddr, None, b"vkCreateInstance", u32, [vp, vp, ctypes.POINTER(vp)])
-    if vkCreateInstance is None:
-        sys.stdout.write("NOT_RUN rmsnorm vulkan: vkCreateInstance missing\n")
-        return 2
-
-    class App(ctypes.Structure):
-        _fields_ = [
-            ("sType", u32), ("pNext", vp), ("pApplicationName", ctypes.c_char_p),
-            ("applicationVersion", u32), ("pEngineName", ctypes.c_char_p),
-            ("engineVersion", u32), ("apiVersion", u32),
-        ]
-
-    class InstInfo(ctypes.Structure):
-        _fields_ = [
-            ("sType", u32), ("pNext", vp), ("flags", u32), ("pApplicationInfo", vp),
-            ("enabledLayerCount", u32), ("ppEnabledLayerNames", vp),
-            ("enabledExtensionCount", u32), ("ppEnabledExtensionNames", vp),
-        ]
-
-    app = App(0, None, b"rmsnorm", 1, b"omega", 1, 0x00401000)
-    info = InstInfo(1, None, 0, ctypes.cast(ctypes.byref(app), vp), 0, None, 0, None)
-    inst = vp()
-    rc = vkCreateInstance(ctypes.byref(info), None, ctypes.byref(inst))
-    if rc != 0:
-        sys.stdout.write("NOT_RUN rmsnorm vulkan: vkCreateInstance %s\n" % rc)
-        return 2
-    enumdev = load(vkGetInstanceProcAddr, inst, b"vkEnumeratePhysicalDevices", u32, [vp, ctypes.POINTER(u32), vp])
-    props_fn = load(vkGetInstanceProcAddr, inst, b"vkGetPhysicalDeviceProperties", None, [vp, vp])
-    qprops = load(vkGetInstanceProcAddr, inst, b"vkGetPhysicalDeviceQueueFamilyProperties", None, [vp, ctypes.POINTER(u32), vp])
-    createdev = load(vkGetInstanceProcAddr, inst, b"vkCreateDevice", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-    if not all([enumdev, props_fn, qprops, createdev]):
-        sys.stdout.write("NOT_RUN rmsnorm vulkan: instance procs missing\n")
-        return 2
-    ndev = u32(0)
-    enumdev(inst, ctypes.byref(ndev), None)
-    if ndev.value == 0:
-        sys.stdout.write("NOT_RUN rmsnorm vulkan: no physical device\n")
-        return 2
-    devs = (vp * ndev.value)()
-    enumdev(inst, ctypes.byref(ndev), ctypes.cast(devs, vp))
-    best = None
-    for d in devs:
-        blob = ctypes.create_string_buffer(4096)
-        props_fn(d, blob)
-        vendor, device, dtype = ctypes.cast(blob, ctypes.POINTER(u32))[2:5]
-        name = blob.raw[20:276].split(b"\x00", 1)[0].decode("utf-8", "replace")
-        nq = u32(0)
-        qprops(d, ctypes.byref(nq), None)
-        fam = ctypes.create_string_buffer(24 * nq.value)
-        qprops(d, ctypes.byref(nq), fam)
-        family = None
-        for i in range(nq.value):
-            flags = ctypes.cast(fam, ctypes.POINTER(u32))[i * 6]
-            if flags & 2:
-                family = i
-                break
-        if family is None:
-            continue
-        kind = vulkan_pick.device_class(vendor, dtype)
-        rank = vulkan_pick.rank_device(vendor, dtype, allow_gpu)
-        sys.stdout.write(
-            "vulkan candidate name=%s vendor=%#x type=%d class=%s %s\n"
-            % (name, vendor, dtype, kind, "chosen-eligible" if rank is not None else "skipped")
-        )
-        if rank is None:
-            continue
-        cand = (rank, d, family, name, vendor, dtype, kind)
-        if best is None or cand[0] > best[0]:
-            best = cand
-    if best is None:
-        sys.stdout.write(
-            "NOT_RUN rmsnorm vulkan: no Intel or software device (pass --gpu to allow other GPUs)\n"
-        )
-        return 2
-    _, phys, family, name, vendor, dtype, kind = best
-    sys.stdout.write(
-        "vulkan device=%s vendor=%#x type=%d class=%s\n" % (name, vendor, dtype, kind)
-    )
-
-    class QInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("queueFamilyIndex", u32), ("queueCount", u32), ("pQueuePriorities", vp)]
-
-    class DevInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("queueCreateInfoCount", u32), ("pQueueCreateInfos", vp), ("enabledLayerCount", u32), ("ppEnabledLayerNames", vp), ("enabledExtensionCount", u32), ("ppEnabledExtensionNames", vp), ("pEnabledFeatures", vp)]
-
-    prio = ctypes.c_float(1.0)
-    qi = QInfo(2, None, 0, family, 1, ctypes.cast(ctypes.byref(prio), vp))
-    di = DevInfo(3, None, 0, 1, ctypes.cast(ctypes.byref(qi), vp), 0, None, 0, None, None)
-    dev = vp()
-    rc = createdev(phys, ctypes.byref(di), None, ctypes.byref(dev))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: vkCreateDevice %s\n" % rc)
+    if not got:
+        sys.stdout.write("FAIL rmsnorm omega: omc failed on gpu/spirv/run.om\n")
         return 1
-    getdev = load(vkGetInstanceProcAddr, inst, b"vkGetDeviceProcAddr", vp, [vp, ctypes.c_char_p])
-
-    def dfn(n, rest, args):
-        addr = getdev(dev, n)
-        if not addr:
-            raise RuntimeError(n.decode())
-        return ctypes.CFUNCTYPE(rest, *args)(addr)
-
-    try:
-        getq = dfn(b"vkGetDeviceQueue", None, [vp, u32, u32, ctypes.POINTER(vp)])
-        mkshader = dfn(b"vkCreateShaderModule", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-        mkdsl = dfn(b"vkCreateDescriptorSetLayout", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-        mkpl = dfn(b"vkCreatePipelineLayout", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-        mkpipe = dfn(b"vkCreateComputePipelines", u32, [vp, vp, u32, vp, vp, ctypes.POINTER(vp)])
-        mkpool = dfn(b"vkCreateDescriptorPool", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-        allocds = dfn(b"vkAllocateDescriptorSets", u32, [vp, vp, ctypes.POINTER(vp)])
-        update = dfn(b"vkUpdateDescriptorSets", None, [vp, u32, vp, u32, vp])
-        mkbuf = dfn(b"vkCreateBuffer", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-        reqfn = dfn(b"vkGetBufferMemoryRequirements", None, [vp, vp, vp])
-        memprops = load(vkGetInstanceProcAddr, inst, b"vkGetPhysicalDeviceMemoryProperties", None, [vp, vp])
-        allocmem = dfn(b"vkAllocateMemory", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-        bindmem = dfn(b"vkBindBufferMemory", u32, [vp, vp, vp, u64])
-        mapmem = dfn(b"vkMapMemory", u32, [vp, vp, u64, u64, u32, ctypes.POINTER(vp)])
-        unmap = dfn(b"vkUnmapMemory", None, [vp, vp])
-        mkcp = dfn(b"vkCreateCommandPool", u32, [vp, vp, vp, ctypes.POINTER(vp)])
-        alloccb = dfn(b"vkAllocateCommandBuffers", u32, [vp, vp, ctypes.POINTER(vp)])
-        begin = dfn(b"vkBeginCommandBuffer", u32, [vp, vp])
-        bindpipe = dfn(b"vkCmdBindPipeline", None, [vp, u32, vp])
-        bindds = dfn(b"vkCmdBindDescriptorSets", None, [vp, u32, vp, u32, u32, ctypes.POINTER(vp), u32, vp])
-        dispatch = dfn(b"vkCmdDispatch", None, [vp, u32, u32, u32])
-        end = dfn(b"vkEndCommandBuffer", u32, [vp])
-        submit = dfn(b"vkQueueSubmit", u32, [vp, u32, vp, vp])
-        wait = dfn(b"vkQueueWaitIdle", u32, [vp])
-    except RuntimeError as e:
-        sys.stdout.write("FAIL rmsnorm vulkan: missing %s\n" % e)
+    spv = os.path.join(tmp, "rmsnorm.omega.spv")
+    with open(spv, "wb") as f:
+        f.write(module)
+    xpath = os.path.join(tmp, "om_x.bin")
+    wpath = os.path.join(tmp, "om_w.bin")
+    out_path = os.path.join(tmp, "om_y.bin")
+    with open(xpath, "wb") as f:
+        f.write(x)
+    with open(wpath, "wb") as f:
+        f.write(w)
+    r = subprocess.run([runner, spv, str(NROWS), str(NOUT), out_path, xpath, wpath])
+    if r.returncode != 0:
+        sys.stdout.write("FAIL rmsnorm omega: run.om exit %d\n" % r.returncode)
         return 1
-
-    class ShaderInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("codeSize", sz), ("pCode", vp)]
-
-    class Bind(ctypes.Structure):
-        _fields_ = [("binding", u32), ("descriptorType", u32), ("descriptorCount", u32), ("stageFlags", u32), ("pImmutableSamplers", vp)]
-
-    class DSLInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("bindingCount", u32), ("pBindings", vp)]
-
-    class PLInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("setLayoutCount", u32), ("pSetLayouts", vp), ("pushConstantRangeCount", u32), ("pPushConstantRanges", vp)]
-
-    class Stage(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("stage", u32), ("module", vp), ("pName", ctypes.c_char_p), ("pSpecializationInfo", vp)]
-
-    class PipeInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("stage", Stage), ("layout", vp), ("basePipelineHandle", vp), ("basePipelineIndex", ctypes.c_int32)]
-
-    class PoolSize(ctypes.Structure):
-        _fields_ = [("type", u32), ("descriptorCount", u32)]
-
-    class PoolInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("maxSets", u32), ("poolSizeCount", u32), ("pPoolSizes", vp)]
-
-    class AllocInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("descriptorPool", vp), ("descriptorSetCount", u32), ("pSetLayouts", vp)]
-
-    class BufInfo(ctypes.Structure):
-        _fields_ = [("buffer", vp), ("offset", u64), ("range", u64)]
-
-    class Write(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("dstSet", vp), ("dstBinding", u32), ("dstArrayElement", u32), ("descriptorCount", u32), ("descriptorType", u32), ("pImageInfo", vp), ("pBufferInfo", vp), ("pTexelBufferView", vp)]
-
-    class BufCreate(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("size", u64), ("usage", u32), ("sharingMode", u32), ("queueFamilyIndexCount", u32), ("pQueueFamilyIndices", vp)]
-
-    class MemReq(ctypes.Structure):
-        _fields_ = [("size", u64), ("alignment", u64), ("memoryTypeBits", u32)]
-
-    class MemAlloc(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("allocationSize", u64), ("memoryTypeIndex", u32)]
-
-    class PoolCreate(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("queueFamilyIndex", u32)]
-
-    class CbAlloc(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("commandPool", vp), ("level", u32), ("commandBufferCount", u32)]
-
-    class BeginInfo(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("flags", u32), ("pInheritanceInfo", vp)]
-
-    class Submit(ctypes.Structure):
-        _fields_ = [("sType", u32), ("pNext", vp), ("waitSemaphoreCount", u32), ("pWaitSemaphores", vp), ("pWaitDstStageMask", vp), ("commandBufferCount", u32), ("pCommandBuffers", vp), ("signalSemaphoreCount", u32), ("pSignalSemaphores", vp)]
-
-    code = (ctypes.c_uint32 * (len(module) // 4)).from_buffer_copy(module)
-    shinfo = ShaderInfo(16, None, 0, len(module), ctypes.cast(code, vp))
-    shader = vp()
-    rc = mkshader(dev, ctypes.byref(shinfo), None, ctypes.byref(shader))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: shader module %s\n" % rc)
+    with open(out_path, "rb") as f:
+        raw = f.read()
+    if len(raw) != len(want):
+        sys.stdout.write("FAIL rmsnorm omega: unexpected output size %d\n" % len(raw))
         return 1
-    binds = (Bind * 3)(*[Bind(i, 7, 1, 0x20, None) for i in range(3)])
-    dslinfo = DSLInfo(32, None, 0, 3, ctypes.cast(binds, vp))
-    dsl = vp()
-    rc = mkdsl(dev, ctypes.byref(dslinfo), None, ctypes.byref(dsl))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: descriptor layout %s\n" % rc)
-        return 1
-    plinfo = PLInfo(30, None, 0, 1, ctypes.cast(ctypes.byref(dsl), vp), 0, None)
-    layout = vp()
-    rc = mkpl(dev, ctypes.byref(plinfo), None, ctypes.byref(layout))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: pipeline layout %s\n" % rc)
-        return 1
-    stage = Stage(18, None, 0, 0x20, shader, b"rmsnorm", None)
-    pinfo = PipeInfo(29, None, 0, stage, layout, None, -1)
-    pipe = vp()
-    rc = mkpipe(dev, None, 1, ctypes.byref(pinfo), None, ctypes.byref(pipe))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: pipeline %s\n" % rc)
-        return 1
-
-    memblob = ctypes.create_string_buffer(4096)
-    memprops(phys, memblob)
-    ntypes = ctypes.cast(memblob, ctypes.POINTER(u32))[0]
-    # VkMemoryType is flags, heapIndex (8 bytes) starting after typeCount and 3 pad, then heaps.
-    # Layout: uint32 typeCount, pad4, types[32] of 8 bytes, heapCount, heaps. typeCount is first.
-    types_off = 4
-    types = ctypes.cast(ctypes.addressof(memblob) + types_off, ctypes.POINTER(u32))
-
-    def make_buf(data, usage_extra):
-        bc = BufCreate(12, None, 0, len(data), 0x20 | usage_extra, 0, 0, None)
-        buf = vp()
-        rc = mkbuf(dev, ctypes.byref(bc), None, ctypes.byref(buf))
-        if rc != 0:
-            raise RuntimeError("buffer %s" % rc)
-        req = MemReq()
-        reqfn(dev, buf, ctypes.byref(req))
-        idx = None
-        for i in range(min(ntypes, 32)):
-            flags = types[i * 2]
-            if (req.memoryTypeBits & (1 << i)) and (flags & 6) == 6:
-                idx = i
-                break
-        if idx is None:
-            raise RuntimeError(
-                "no host-visible memory types=%d bits=%s head=%s"
-                % (ntypes, req.memoryTypeBits, memblob.raw[:64].hex())
-            )
-        ma = MemAlloc(5, None, req.size, idx)
-        mem = vp()
-        rc = allocmem(dev, ctypes.byref(ma), None, ctypes.byref(mem))
-        if rc != 0:
-            raise RuntimeError("alloc %s" % rc)
-        rc = bindmem(dev, buf, mem, 0)
-        if rc != 0:
-            raise RuntimeError("bind %s" % rc)
-        ptr = vp()
-        rc = mapmem(dev, mem, 0, req.size, 0, ctypes.byref(ptr))
-        if rc != 0:
-            raise RuntimeError("map %s" % rc)
-        ctypes.memmove(ptr, data, len(data))
-        unmap(dev, mem)
-        return buf, mem
-
-    try:
-        bx, _mx = make_buf(x, 0)
-        bw, _mw = make_buf(w, 0)
-        by, my = make_buf(b"\xff" * len(want), 0)
-    except RuntimeError as e:
-        sys.stdout.write("FAIL rmsnorm vulkan: %s\n" % e)
-        return 1
-
-    psz = PoolSize(7, 3)
-    poolinfo = PoolInfo(33, None, 0, 1, 1, ctypes.cast(ctypes.byref(psz), vp))
-    pool = vp()
-    rc = mkpool(dev, ctypes.byref(poolinfo), None, ctypes.byref(pool))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: descriptor pool %s\n" % rc)
-        return 1
-    ai = AllocInfo(34, None, pool, 1, ctypes.cast(ctypes.byref(dsl), vp))
-    dset = vp()
-    rc = allocds(dev, ctypes.byref(ai), ctypes.byref(dset))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: allocate set %s\n" % rc)
-        return 1
-    binfos = (BufInfo * 3)(BufInfo(bx, 0, len(x)), BufInfo(bw, 0, len(w)), BufInfo(by, 0, len(want)))
-    writes = (Write * 3)()
-    for i in range(3):
-        writes[i] = Write(35, None, dset, i, 0, 1, 7, None, ctypes.cast(ctypes.byref(binfos[i]), vp), None)
-    update(dev, 3, ctypes.cast(writes, vp), 0, None)
-
-    cpinfo = PoolCreate(39, None, 2, family)
-    cpool = vp()
-    rc = mkcp(dev, ctypes.byref(cpinfo), None, ctypes.byref(cpool))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: command pool %s\n" % rc)
-        return 1
-    cbinfo = CbAlloc(40, None, cpool, 0, 1)
-    cb = vp()
-    rc = alloccb(dev, ctypes.byref(cbinfo), ctypes.byref(cb))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: command buffer %s\n" % rc)
-        return 1
-    binfo = BeginInfo(42, None, 0, None)
-    rc = begin(cb, ctypes.byref(binfo))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: begin %s\n" % rc)
-        return 1
-    bindpipe(cb, 1, pipe)  # VK_PIPELINE_BIND_POINT_COMPUTE = 1
-    bindds(cb, 1, layout, 0, 1, ctypes.byref(dset), 0, None)
-    dispatch(cb, NROWS // 64, 1, 1)
-    rc = end(cb)
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: end %s\n" % rc)
-        return 1
-    queue = vp()
-    getq(dev, family, 0, ctypes.byref(queue))
-    sub = Submit(4, None, 0, None, None, 1, ctypes.cast(ctypes.byref(cb), vp), 0, None)
-    rc = submit(queue, 1, ctypes.byref(sub), None)
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: submit %s\n" % rc)
-        return 1
-    rc = wait(queue)
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: wait %s\n" % rc)
-        return 1
-    ptr = vp()
-    rc = mapmem(dev, my, 0, len(want), 0, ctypes.byref(ptr))
-    if rc != 0:
-        sys.stdout.write("FAIL rmsnorm vulkan: remap %s\n" % rc)
-        return 1
-    got = ctypes.string_at(ptr, len(want))
-    unmap(dev, my)
-    return finish(got, want, "vulkan")
+    return finish(raw, want, "omega")
 
 
 def main(argv):
-    allow_gpu = vulkan_pick.allow_other_gpus(argv)
-    argv = vulkan_pick.strip_gpu_flag(argv)
-    if len(argv) != 2 or argv[1] not in ("opencl-intel", "opencl-pocl", "levelzero", "vulkan"):
+    if len(argv) != 2 or argv[1] not in ("opencl-intel", "opencl-pocl", "levelzero", "omega"):
         sys.stderr.write(
-            "usage: python3 gpu/spirv/intel_rmsnorm.py opencl-intel|opencl-pocl|levelzero|vulkan [--gpu]\n"
+            "usage: python3 gpu/spirv/intel_rmsnorm.py opencl-intel|opencl-pocl|levelzero|omega\n"
         )
         return 2
     prereq = argv[1]
     root = repo_root()
-    env = "vk" if prereq == "vulkan" else "cl"
+    env = "vk" if prereq == "omega" else "cl"
     tmp = tempfile.mkdtemp(prefix="rmsnorm-")
     built = build_module(root, tmp, env)
     if built == "noexec":
@@ -935,7 +615,7 @@ def main(argv):
         return finish(got, want, prereq)
     if prereq == "levelzero":
         return levelzero_run(module, x, w, want)
-    return vulkan_run(module, x, w, want, allow_gpu)
+    return omega_run(root, tmp, module, x, w, want)
 
 
 if __name__ == "__main__":

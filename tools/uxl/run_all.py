@@ -42,7 +42,6 @@ def _read_pinned_omc_sha256():
 PINNED_OMC_SHA256 = _read_pinned_omc_sha256()
 SHA256_RE = re.compile(r"sha256=([0-9a-fA-F]{64})")
 MACHINE = None
-ALLOW_GPU = False
 
 
 class Tee(object):
@@ -408,7 +407,7 @@ class Machine(object):
         self.distro = "linux"
         self.omc = "not-run"
         self.spirv_val = "no"
-        self.vulkan = "no"
+        self.omega_spirv = "no"
         self.opencl_intel = "no"
         self.levelzero = "no"
         self.install = ""
@@ -460,36 +459,6 @@ def spirv_val_present():
     return "no"
 
 
-def vulkan_backend():
-    found = []
-    directories = (
-        Path("/usr/share/vulkan/icd.d"),
-        Path("/usr/local/share/vulkan/icd.d"),
-        Path("/etc/vulkan/icd.d"),
-    )
-    for directory in directories:
-        if not directory.is_dir():
-            continue
-        for path in sorted(directory.glob("*.json")):
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace").lower()
-            except OSError:
-                text = path.name.lower()
-            if "lvp" in text or "lavapipe" in text:
-                found.append("lavapipe")
-            elif "intel" in text:
-                found.append("intel")
-            else:
-                found.append("other")
-    if not found:
-        return "no"
-    ordered = []
-    for name in ("lavapipe", "intel", "other"):
-        if name in found:
-            ordered.append(name)
-    return ",".join(ordered)
-
-
 def levelzero_backend():
     names = (
         "/usr/lib/x86_64-linux-gnu/libze_loader.so.1",
@@ -528,7 +497,7 @@ def install_command(machine):
     like = (release.get("ID_LIKE") or "").lower()
     family = ident + " " + like
     if "debian" in family or "ubuntu" in family or ident in ("debian", "ubuntu"):
-        packages = ["python3", "spirv-tools", "mesa-vulkan-drivers", "ocl-icd-libopencl1"]
+        packages = ["python3", "spirv-tools", "ocl-icd-libopencl1"]
         if machine.arch == "x86_64":
             packages[1:1] = ["qemu-user-static", "binfmt-support"]
         command = (
@@ -546,12 +515,12 @@ def install_command(machine):
             command += " && sudo " + binfmt_register_command()
         return command
     if "fedora" in family or "rhel" in family or ident in ("fedora", "rhel", "centos"):
-        packages = "python3 spirv-tools mesa-vulkan-drivers ocl-icd"
+        packages = "python3 spirv-tools ocl-icd"
         if machine.arch == "x86_64":
             packages = "qemu-user-static " + packages
         return "sudo dnf install -y " + packages
     if ident == "arch" or "arch" in like.split():
-        packages = "python spirv-tools vulkan-swrast ocl-icd"
+        packages = "python spirv-tools ocl-icd"
         if machine.arch == "x86_64":
             packages = "qemu-user-static " + packages
         return "sudo pacman -Sy --needed --noconfirm " + packages
@@ -563,7 +532,7 @@ def toolchain_gap(machine):
         return not machine.wsl
     if machine.os == "macos":
         return machine.spirv_val == "no"
-    if machine.omc == "not-run" or machine.spirv_val == "no" or machine.vulkan == "no":
+    if machine.omc == "not-run" or machine.spirv_val == "no":
         return True
     return False
 
@@ -606,7 +575,6 @@ def detect():
     machine.wsl = wsl_name()
     machine.arch = norm_arch(platform.machine())
     machine.spirv_val = spirv_val_present()
-    machine.vulkan = vulkan_backend()
     gpu, _runtime, _detail = opencl_probe()
     machine.opencl_intel = "yes" if gpu else "no"
     machine.levelzero = levelzero_backend()
@@ -620,6 +588,7 @@ def detect():
             machine.omc = "qemu"
         else:
             machine.omc = "not-run"
+    machine.omega_spirv = "yes" if machine.omc != "not-run" else "no"
     if toolchain_gap(machine):
         machine.install = install_command(machine)
     return machine
@@ -633,7 +602,7 @@ def print_detected(machine):
     print("  distro %s" % machine.distro)
     print("  omc %s" % machine.omc)
     print("  spirv-val %s" % machine.spirv_val)
-    print("  vulkan %s" % machine.vulkan)
+    print("  omega-spirv %s" % machine.omega_spirv)
     print("  opencl-intel %s" % machine.opencl_intel)
     print("  levelzero %s" % machine.levelzero)
     hint = omc_hint(machine) if machine.omc == "not-run" else ""
@@ -664,10 +633,6 @@ def child_env():
     env = dict(os.environ)
     env["OMC"] = "seed/out/omc"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    if ALLOW_GPU:
-        env["UXL_GPU"] = "1"
-    else:
-        env.pop("UXL_GPU", None)
     return env
 
 
@@ -1012,20 +977,14 @@ def main(argv):
         action="store_true",
         help="run the distro install command printed for missing tools (uses sudo)",
     )
-    parser.add_argument(
-        "--gpu",
-        action="store_true",
-        help="allow a non-Intel hardware Vulkan GPU (default is Intel or lavapipe only)",
-    )
     args = parser.parse_args(argv)
     path = log_path()
     tee = Tee(path)
     sys.stdout = tee
     try:
-        global MACHINE, ALLOW_GPU
-        ALLOW_GPU = args.gpu
+        global MACHINE
         print("uxl-run log")
-        print("vulkan policy %s" % ("--gpu" if ALLOW_GPU else "intel-or-software"))
+        print("spirv executor omega (gpu/spirv/run.om)")
         MACHINE = detect()
         print_detected(MACHINE)
         if args.install_deps:
