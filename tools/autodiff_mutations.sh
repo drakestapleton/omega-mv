@@ -54,12 +54,22 @@ DIV_FORMULA|omega_autodiff.c|{s/OMEGA_TB_DIV, n->value, nb->value, &tmp)/OMEGA_T
 # Rebuild the seeded binding only for a changed Omega source.
 AUTODIFF_ROOT=$(pwd)
 export AUTODIFF_ROOT
-export OMEGA_OMC="${OMEGA_OMC:-$AUTODIFF_ROOT/seed/out/omc}"
-export OMEGA_BRIDGE="${OMEGA_BRIDGE:-$AUTODIFF_ROOT/../omega-bridge}"
 case " ${ONLY:-UNBROADCAST} " in
-    *" UNBROADCAST "*) [ -x "$OMEGA_OMC" ] || sh seed/omega-from-seed.sh || exit 1 ;;
+    *" UNBROADCAST "*)
+        compiler=${OMEGA_OMC:-$AUTODIFF_ROOT/seed/out/omc}
+        bridge=${OMEGA_BRIDGE:-$AUTODIFF_ROOT/../omega-bridge}
+        if [ ! -x "$compiler" ] || [ ! -r "$bridge/src/native.om" ]; then
+            echo "autodiff mutations: NOT_RUN (UNBROADCAST needs the pinned omc and omega-bridge)" >&2
+            exit 3
+        fi
+        OMEGA_OMC=$(realpath "$compiler") || exit 3
+        OMEGA_BRIDGE=$(realpath "$bridge") || exit 3
+        export OMEGA_OMC OMEGA_BRIDGE ;;
 esac
-REGEN='if ! cmp -s src/autodiff/gradient_shape.om "$AUTODIFF_ROOT/src/autodiff/gradient_shape.om"; then sh om/units.sh || exit 1; fi'
+REGEN='if ! cmp -s src/autodiff/gradient_shape.om "$AUTODIFF_ROOT/src/autodiff/gradient_shape.om"; then
+    unset OMEGA_UNITS
+    OMEGA_UNITS_DEST="$PWD/src" sh om/units.sh || exit 1
+fi'
 BUILD="$REGEN
 gcc $FLAGS -Isrc -Isrc/tensor -Isrc/autodiff -o t tests/test_omega_autodiff.c src/autodiff/omega_autodiff.c \
 $TENSOR $DEPS"
