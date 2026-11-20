@@ -92,15 +92,17 @@ Historical timing of the original PR #732 source on the Spark (arm64): 16 MiB in
 - A read error after some bytes were consumed exits 65 (the C driver has no such path to
   compare against; the status is a definition, not a parity result).
 
-## In the product: `b3unit.om`
+## Receipt hashing
 
-`src/omega_blake3.c` no longer computes BLAKE3. `om/blake3/b3unit.om` is the same tree
-construction as one function-mode unit, entry `omb3`, bound through the omega-bridge native call
-ABI v1 (omega-bridge #8, #12) and generated with the SHA-256 unit into `src/omega_om_units.inc`
-(`om/units.sh`; one file because every binding defines the shared ABI runtime). The C file keeps
-only `omega_blake3_hash`, which cuts the input into 1024-byte chunks (ABI v1 arrays are fixed
-length): state is the caller's 448-word array (54-row chaining-value stack, depth, chunk count).
-Its only caller is `omega_receipt.c` (the aien-proof EvidenceReceiptV1 id).
+The receipt resolver calls `omega_blake3_hash(data, len, out)`. The OM-2 entry in
+`b3hash.om` owns the 1024-byte chunks and the chaining-value stack. Its `out`
+parameter stages the digest until the function returns, including when the
+caller places the digest inside the input buffer.
+
+`om/units.sh` concatenates `b3hash.om` and `b3unit.om` in that order for the
+one-shot API. The unit identity hashes those exact concatenated bytes and
+records both source paths. The same build also compiles `b3unit.om` alone
+for existing callers of the ABI v1 chunk entry `omega_omb3`.
 
 `om/blake3/parity/run.sh` (with `OMEGA_OMC`, `OMEGA_BRIDGE`): 35/35 official vectors and 1,000
 inputs (boundaries, random to 3 MiB) identical to the replaced C (`src/omega_blake3.c` @ 633a1735);

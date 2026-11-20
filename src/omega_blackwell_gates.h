@@ -25,6 +25,7 @@ void run_demonstration_blackwell_vector(void);
 
 /* Runs qualification gates for Milestone 18 (Stage 1). Returns 0 if Stage-1 passes, 1 on failure */
 int run_m18_gates(void);
+int run_m18_nested_gates(void);
 
 /* Runs physical silicon demonstration of matrix multiplication on Grace Blackwell GB10 */
 void run_demonstration_blackwell_matmul(void);
