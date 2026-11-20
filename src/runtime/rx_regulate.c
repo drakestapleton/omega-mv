@@ -14,10 +14,31 @@
  * limitations under the License.
  */
 
-/* ADAPTIVE-M4: bounded resource regulation. Contract in rx_regulate.h. */
+/* ADAPTIVE-M4: bounded resource regulation. Contract in rx_regulate.h.
+ * Core decision, envelope validation, policy derivation, bounds check,
+ * and step transition execute in pure OM-2 (om/runtime/rx_regulate.om). */
 #include "runtime/rx_regulate.h"
+#include "omega_native.h"
 
 #include <string.h>
+
+static void pack_env(const RxRegulateEnvelope *e, uint64_t out[16]) {
+    memset(out, 0, sizeof(uint64_t) * 16);
+    out[0] = e->slots_min;
+    out[1] = e->slots_max;
+    out[2] = e->memory_min;
+    out[3] = e->memory_max;
+    out[4] = e->energy_min;
+    out[5] = e->energy_max;
+    out[6] = e->base.slots;
+    out[7] = e->base.memory_bytes;
+    out[8] = e->base.energy_budget;
+    out[9] = e->contention_hi;
+    out[10] = e->contention_lo;
+    out[11] = e->pressure_hi;
+    out[12] = e->pressure_lo;
+    out[13] = e->min_dwell;
+}
 
 static const RxSnapshotDep *in_of(const RxCtx *c, RxObjRef r) {
     for (uint32_t i = 0; i < c->n_in; i++)
@@ -31,47 +52,30 @@ static void put(RxCtx *c, RxObjRef o, uint32_t field, uint64_t v) {
 
 int rx_regulate_envelope_ok(const RxRegulateEnvelope *e) {
     if (!e) return RX_ERR_ARG;
-    if (e->slots_min == 0 || e->slots_min > e->slots_max) return RX_ERR_ARG;
-    if (e->memory_min > e->memory_max || e->energy_min > e->energy_max) return RX_ERR_ARG;
-    if (e->base.slots < e->slots_min || e->base.slots > e->slots_max) return RX_ERR_ARG;
-    if (e->base.memory_bytes < e->memory_min || e->base.memory_bytes > e->memory_max)
-        return RX_ERR_ARG;
-    if (e->base.energy_budget < e->energy_min || e->base.energy_budget > e->energy_max)
-        return RX_ERR_ARG;
-    if (e->contention_lo >= e->contention_hi) return RX_ERR_ARG;
-    if (e->pressure_lo >= e->pressure_hi || e->pressure_hi > 100) return RX_ERR_ARG;
-    if (e->min_dwell == 0) return RX_ERR_ARG;
-    return RX_OK;
+    uint64_t env[16], res = 0;
+    pack_env(e, env);
+    if (omega2_rx_reg_envelope_ok(&res, env, 16) != OMEGA_OK) return RX_ERR_ARG;
+    return (int)(int64_t)res;
 }
 
 void rx_regulate_policy_for(const RxRegulateEnvelope *e, uint32_t regime, RxResourceBudget *out) {
     *out = e->base;
-    if (regime == RX_REG_EXPAND) {
-        out->slots = e->slots_max;
-        out->memory_bytes = e->memory_max;
-        out->energy_budget = e->energy_max;
-    } else if (regime == RX_REG_PROTECT) {
-        out->slots = e->slots_min;
-        out->memory_bytes = e->memory_min;
-        out->energy_budget = e->energy_min;
+    uint64_t env[16], dst[4] = { 0 }, res = 0;
+    pack_env(e, env);
+    if (omega2_rx_reg_policy_for(&res, env, 16, (uint64_t)regime, dst, 4) == OMEGA_OK) {
+        out->slots = (uint32_t)dst[0];
+        out->memory_bytes = dst[1];
+        out->energy_budget = dst[2];
     }
 }
 
 uint32_t rx_regulate_decide(const RxRegulateEnvelope *e, uint32_t regime, uint64_t dwell,
                             uint64_t contention, uint64_t pressure) {
-    int settled = dwell >= e->min_dwell;
-    /* Protection enters at once and wins over expansion. */
-    if (pressure >= e->pressure_hi) return RX_REG_PROTECT;
-    switch (regime) {
-    case RX_REG_PROTECT:
-        if (!settled || pressure > e->pressure_lo) return RX_REG_PROTECT;
-        return contention >= e->contention_hi ? RX_REG_EXPAND : RX_REG_NOMINAL;
-    case RX_REG_EXPAND:
-        if (!settled || contention > e->contention_lo) return RX_REG_EXPAND;
-        return RX_REG_NOMINAL;
-    default:
-        return contention >= e->contention_hi ? RX_REG_EXPAND : RX_REG_NOMINAL;
-    }
+    uint64_t env[16], res = RX_REG_NOMINAL;
+    pack_env(e, env);
+    if (omega2_rx_reg_decide(&res, env, 16, (uint64_t)regime, dwell, contention, pressure) != OMEGA_OK)
+        return RX_REG_PROTECT;
+    return (uint32_t)res;
 }
 
 /* Policy written only here. A condition sample already decided on (same seq)
@@ -81,25 +85,23 @@ static int fn_regulate(RxCtx *c) {
     const RxSnapshotDep *cond = in_of(c, r->condition);
     const RxSnapshotDep *pol = in_of(c, r->policy);
     if (!cond || !pol) return RX_ERR_ARG;
-    uint64_t cseq = cond->field[0];
-    if (cseq == pol->field[5]) return 0;
-    uint32_t regime = (uint32_t)pol->field[4];
-    uint64_t dwell = pol->field[6];
-    uint32_t next = rx_regulate_decide(&r->env, regime, dwell, cond->field[1], cond->field[3]);
-    put(c, r->policy, 5, cseq);
-    if (next == regime) {
-        put(c, r->policy, 6, dwell + 1);
+    uint64_t env[16], dst[8] = { 0 }, act = 0;
+    pack_env(&r->env, env);
+    if (omega2_rx_reg_step(&act, env, 16, cond->field, 8, pol->field, 8, dst, 8) != OMEGA_OK)
+        return RX_ERR_ARG;
+    if (act == 0) return 0;
+    put(c, r->policy, 5, dst[5]);
+    if (act == 1) {
+        put(c, r->policy, 6, dst[6]);
         return 0;
     }
-    RxResourceBudget b;
-    rx_regulate_policy_for(&r->env, next, &b);
-    put(c, r->policy, 0, pol->field[0] + 1);
-    put(c, r->policy, 1, b.slots);
-    put(c, r->policy, 2, b.memory_bytes);
-    put(c, r->policy, 3, b.energy_budget);
-    put(c, r->policy, 4, next);
-    put(c, r->policy, 6, 0);
-    put(c, r->policy, 7, pol->field[7] + 1);
+    put(c, r->policy, 0, dst[0]);
+    put(c, r->policy, 1, dst[1]);
+    put(c, r->policy, 2, dst[2]);
+    put(c, r->policy, 3, dst[3]);
+    put(c, r->policy, 4, dst[4]);
+    put(c, r->policy, 6, dst[6]);
+    put(c, r->policy, 7, dst[7]);
     return 0;
 }
 
@@ -156,17 +158,17 @@ int rx_regulate_apply(RxRegulator *r) {
     if (rc != RX_OK) return rc;
     if (p.field[0] == r->applied_version) return 1;
     const RxRegulateEnvelope *e = &r->env;
+    uint64_t env[16], chk = 0;
+    pack_env(e, env);
+    if (omega2_rx_reg_apply_check(&chk, env, 16, p.field, 8) != OMEGA_OK ||
+        (int64_t)chk != RX_OK) {
+        r->refused++;
+        return RX_ERR_BOUNDS;
+    }
     RxResourceBudget b = e->base;           /* fairness and offers: never regulated */
     b.slots = (uint32_t)p.field[1];
     b.memory_bytes = p.field[2];
     b.energy_budget = p.field[3];
-    if (p.field[1] > UINT32_MAX || b.slots < e->slots_min || b.slots > e->slots_max ||
-        b.memory_bytes < e->memory_min || b.memory_bytes > e->memory_max ||
-        b.energy_budget < e->energy_min || b.energy_budget > e->energy_max ||
-        p.field[4] > RX_REG_PROTECT) {
-        r->refused++;
-        return RX_ERR_BOUNDS;
-    }
     rx_world_set_resources(r->w, &b);
     r->applied = b;
     r->applied_version = p.field[0];

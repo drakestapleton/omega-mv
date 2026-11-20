@@ -25,6 +25,7 @@
  * own store, so no link ever writes into another's journal.
  */
 #include "rx_cortex_record.h"
+#include "omega_native.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -54,19 +55,11 @@ static uint64_t cx_of(const CortexLink *l, uint64_t crumb) {
 }
 
 static void kind_of(RxCrumbKind k, uint32_t *cls, uint32_t *kind, uint32_t *protect) {
-    *protect = 0;
-    switch (k) {
-    case RX_CRUMB_EXTERNAL:
-        *cls = CX_OBSERVATION; *kind = CX_K_WORK_ACCEPTED; *protect = CX_PROT_AUTHORITY; break;
-    case RX_CRUMB_CREATE:  *cls = CX_ENTITY; *kind = CX_K_ENTITY_CREATED; break;
-    case RX_CRUMB_RETIRE:  *cls = CX_ENTITY; *kind = CX_K_ENTITY_RETIRED; break;
-    case RX_CRUMB_COMMIT:
-        *cls = CX_EXECUTION; *kind = CX_K_EXEC_COMMIT; *protect = CX_PROT_COMMIT_RECEIPT; break;
-    case RX_CRUMB_NOOP:    *cls = CX_EXECUTION; *kind = CX_K_EXEC_NOOP; break;
-    case RX_CRUMB_BLOCKED_AUTHORITY:
-        *cls = CX_FAILURE; *kind = CX_K_EXEC_FAILED; *protect = CX_PROT_AUTHORITY; break;
-    default:               *cls = CX_FAILURE; *kind = CX_K_EXEC_FAILED; break;
-    }
+    uint64_t dst[4] = { 0 }, res = 0;
+    (void)omega2_rx_cx_kind_of(&res, (uint64_t)k, dst, 4);
+    *cls = (uint32_t)dst[0];
+    *kind = (uint32_t)dst[1];
+    *protect = (uint32_t)dst[2];
 }
 
 /* Subject of `ref` in link `l`; 0 = this link does not record it. */
@@ -96,15 +89,14 @@ static void record_link(CortexLink *l, const RxWorld *w, const RxCrumb *k) {
     h.t = l->s->n + 1;
     h.generation = ref ? ref->generation : 0;
     h.tag = (uint64_t)k->kind;
-    uint32_t nl = 0;
     uint64_t cause = cx_of(l, k->wake_cause);
-    if (cause) h.links[nl++] = cause;
-    for (uint32_t i = 0; i < k->n_parents && nl < CX_LINKS; i++) {
-        uint64_t p = cx_of(l, k->parents[i]);
-        int dup = p == 0;
-        for (uint32_t j = 0; j < nl && !dup; j++) dup = h.links[j] == p;
-        if (!dup) h.links[nl++] = p;
-    }
+    uint64_t p_ids[RX_MAX_PARENTS];
+    uint32_t np = k->n_parents < RX_MAX_PARENTS ? k->n_parents : RX_MAX_PARENTS;
+    for (uint32_t i = 0; i < np; i++) p_ids[i] = cx_of(l, k->parents[i]);
+    uint64_t link_out[8] = { 0 }, nl64 = 0;
+    (void)omega2_rx_cx_dedup_links(&nl64, cause, p_ids, (uint64_t)np, link_out, 8, (uint64_t)CX_LINKS);
+    uint32_t nl = (uint32_t)nl64;
+    for (uint32_t i = 0; i < nl && i < CX_LINKS; i++) h.links[i] = link_out[i];
 
     uint64_t p[CX_WREC_WORDS];
     memset(p, 0, sizeof p);
@@ -121,10 +113,10 @@ static void record_link(CortexLink *l, const RxWorld *w, const RxCrumb *k) {
     if (ref && ref->id < RX_MAX_OBJECTS)
         for (uint32_t f = 0; f < RX_MAX_FIELDS && f < 8; f++)
             p[CX_WREC_FIELD0 + f] = w->objects[ref->id].field[f];
-    for (int i = 0; i < 4; i++) {
-        uint64_t v = 0;
-        for (int b = 0; b < 8; b++) v |= (uint64_t)k->digest[8 * i + b] << (8 * b);
-        p[CX_WREC_DIGEST0 + i] = v;
+    {
+        uint64_t digw[4] = { 0 }, res = 0;
+        (void)omega2_rx_cx_pack_digest(&res, k->digest, 32, digw, 4);
+        for (int i = 0; i < 4; i++) p[CX_WREC_DIGEST0 + i] = digw[i];
     }
     p[CX_WREC_N_INPUTS] = k->n_inputs;
     p[CX_WREC_N_OUTPUTS] = k->n_outputs;

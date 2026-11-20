@@ -20,6 +20,7 @@
  */
 #include "rx_plan.h"
 
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <stdlib.h>
@@ -33,9 +34,9 @@ static uint64_t now_ns(void) {
 }
 
 uint64_t pl_word(const uint8_t id[32], uint32_t k) {
-    uint64_t v = 0;
-    for (uint32_t i = 0; i < 8; i++) v |= (uint64_t)id[k * 8 + i] << (8 * i);
-    return v;
+    uint64_t res = 0;
+    (void)omega2_rx_pl_word(&res, id, 32, (uint64_t)k);
+    return res;
 }
 
 /* ---- canonical bytes ---- */
@@ -53,22 +54,30 @@ static void p32(Buf *o, uint32_t v) {
 }
 static void p64(Buf *o, uint64_t v) { p32(o, (uint32_t)v); p32(o, (uint32_t)(v >> 32)); }
 
-static int pred_cmp(const PlPred *a, const PlPred *b) {
-    const uint32_t x[5] = { a->kind, a->slot, a->field, a->slot2, a->type };
-    const uint32_t y[5] = { b->kind, b->slot, b->field, b->slot2, b->type };
-    for (int i = 0; i < 5; i++)
-        if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
-    if (a->value != b->value) return a->value < b->value ? -1 : 1;
-    return 0;
-}
-
 static void sort_list(PlPredList *l) {
-    for (uint32_t i = 1; i < l->n; i++)
-        for (uint32_t j = i; j > 0 && pred_cmp(&l->p[j - 1], &l->p[j]) > 0; j--) {
-            PlPred t = l->p[j];
-            l->p[j] = l->p[j - 1];
-            l->p[j - 1] = t;
+    if (l->n <= 1) return;
+    uint32_t n = l->n <= PL_MAX_PREDS ? l->n : PL_MAX_PREDS;
+    uint64_t buf[PL_MAX_PREDS * 6];
+    memset(buf, 0, sizeof buf);
+    for (uint32_t i = 0; i < n; i++) {
+        buf[i * 6 + 0] = l->p[i].kind;
+        buf[i * 6 + 1] = l->p[i].slot;
+        buf[i * 6 + 2] = l->p[i].field;
+        buf[i * 6 + 3] = l->p[i].slot2;
+        buf[i * 6 + 4] = l->p[i].type;
+        buf[i * 6 + 5] = l->p[i].value;
+    }
+    uint64_t res = 0;
+    if (omega2_rx_pl_sort_preds(&res, buf, PL_MAX_PREDS * 6, (uint64_t)n) == OMEGA_OK) {
+        for (uint32_t i = 0; i < n; i++) {
+            l->p[i].kind  = (uint32_t)buf[i * 6 + 0];
+            l->p[i].slot  = (uint32_t)buf[i * 6 + 1];
+            l->p[i].field = (uint32_t)buf[i * 6 + 2];
+            l->p[i].slot2 = (uint32_t)buf[i * 6 + 3];
+            l->p[i].type  = (uint32_t)buf[i * 6 + 4];
+            l->p[i].value = buf[i * 6 + 5];
         }
+    }
 }
 
 void rx_plan_sort(PlanTemplate *t) {

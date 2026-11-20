@@ -20,6 +20,7 @@
  */
 #include "rx_route.h"
 
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <math.h>
@@ -74,8 +75,9 @@ struct RxCogRouter {
 /* ---- small helpers ---- */
 
 static uint32_t conf_bin(uint32_t conf) {
-    if (conf >= RX_COG_CONF_ONE) return RX_COG_BINS - 1;
-    return (uint32_t)(((uint64_t)conf * RX_COG_BINS) / RX_COG_CONF_ONE);
+    uint64_t res = 0;
+    (void)omega2_rx_rt_conf_bin(&res, (uint64_t)conf, (uint64_t)RX_COG_CONF_ONE, (uint64_t)RX_COG_BINS);
+    return (uint32_t)res;
 }
 
 static uint64_t mono_ns(void) {
@@ -84,19 +86,21 @@ static uint64_t mono_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* Wilson score interval at 95%. */
+/* Wilson score interval at 95%, executed in pure OM-2 (om/runtime/rx_route_core.om). */
 static double wilson_lower(uint64_t k, uint64_t n) {
-    if (n == 0) return 0.0;
-    const double z = 1.959964;
-    double p = (double)k / (double)n, nn = (double)n;
-    double c = p + z * z / (2 * nn);
-    double r = z * sqrt(p * (1 - p) / nn + z * z / (4 * nn * nn));
-    return (c - r) / (1 + z * z / nn);
+    uint64_t dst[2] = { 0 }, res = 0;
+    double lo = 0.0;
+    (void)omega2_rx_rt_wilson(&res, k, n, dst, 2);
+    memcpy(&lo, &dst[0], sizeof(double));
+    return lo;
 }
 
 static double wilson_upper(uint64_t k, uint64_t n) {
-    if (n == 0) return 1.0;
-    return 1.0 - wilson_lower(n - k, n);
+    uint64_t dst[2] = { 0 }, res = 0;
+    double hi = 1.0;
+    (void)omega2_rx_rt_wilson(&res, k, n, dst, 2);
+    memcpy(&hi, &dst[1], sizeof(double));
+    return hi;
 }
 
 static int index_of(const RxCogRouter *r, uint32_t id) {

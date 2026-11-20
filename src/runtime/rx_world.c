@@ -19,6 +19,7 @@
  */
 #include "rx_world.h"
 #include "rx_argus.h"
+#include "omega_native.h"
 #include "sha256.h"
 #include "rx_generation.h"   /* RX_GEN_HALT_MARK */
 #include "omega_path_check.h"
@@ -88,31 +89,10 @@ static void object_digest(RxObject *o) {
 /* ---- lifecycle ---------------------------------------------------------- */
 
 bool rx_state_transition_legal(RxState from, RxState to) {
-    switch (from) {
-    case RX_DORMANT:
-        return to == RX_READY || to == RX_BLOCKED_RESOURCE;
-    case RX_READY:
-        return to == RX_RUNNING || to == RX_BLOCKED_AUTHORITY ||
-               to == RX_BLOCKED_RESOURCE || to == RX_INVALIDATED;
-    case RX_RUNNING:
-        /* RUNNING -> READY only when a deferred effect is resumed
-         * (RX_FN_DEFER, rx_world_resume): the same admitted activation runs
-         * again. */
-        return to == RX_PUBLISHING || to == RX_FAILED || to == RX_CANCELLED ||
-               to == RX_INVALIDATED || to == RX_READY;
-    case RX_PUBLISHING:
-        /* Stale input is detected while validating the publication, so the
-         * explicit exit is PUBLISHING -> INVALIDATED. */
-        return to == RX_COMMITTED || to == RX_CONFLICT || to == RX_REJECTED ||
-               to == RX_INVALIDATED;
-    case RX_BLOCKED_RESOURCE:
-        return to == RX_DORMANT || to == RX_READY;
-    case RX_COMMITTED: case RX_INVALIDATED: case RX_FAILED: case RX_CANCELLED:
-    case RX_CONFLICT: case RX_REJECTED: case RX_BLOCKED_AUTHORITY:
-        return to == RX_DORMANT;
-    default:
+    uint64_t res = 0;
+    if (omega2_rx_world_state_legal(&res, (uint64_t)from, (uint64_t)to) != OMEGA_OK)
         return false;
-    }
+    return res != 0;
 }
 
 const char *rx_state_name(RxState s) {
@@ -347,19 +327,19 @@ static bool cause_is_external(const RxWorld *w, uint64_t cause) {
 
 static bool res_fits(const RxWorld *w, const RxReaction *r) {
     const RxResourceNeed *n = &r->desc.need;
-    if (w->used_slots >= w->budget.slots) return false;
-    if (w->used_memory > w->budget.memory_bytes) return false;
-    if (w->used_energy > w->budget.energy_budget) return false;
-    if (n->memory_bytes > w->budget.memory_bytes - w->used_memory) return false;
-    if (n->energy_cost > w->budget.energy_budget - w->used_energy) return false;
-    if (n->locality && (n->locality & w->budget.offered_locality) != n->locality) return false;
-    if (n->accelerator_features &&
-        (n->accelerator_features & w->budget.offered_accel) != n->accelerator_features)
+    uint64_t used[4] = { w->used_slots, w->used_memory, w->used_energy, 0 };
+    uint64_t budget[6] = {
+        w->budget.slots, w->budget.memory_bytes, w->budget.energy_budget,
+        w->budget.offered_locality, w->budget.offered_accel, w->budget.compute_mask
+    };
+    uint64_t need[5] = {
+        n->memory_bytes, n->energy_cost, n->locality,
+        n->accelerator_features, n->compute_class
+    };
+    uint64_t res = 0;
+    if (omega2_rx_world_res_fits(&res, used, 4, budget, 6, need, 5) != OMEGA_OK)
         return false;
-    if (n->compute_class &&
-        (w->budget.compute_mask & (1u << (n->compute_class & 31u))) == 0)
-        return false;
-    return true;
+    return res != 0;
 }
 
 static void enqueue(RxWorld *w, uint32_t rid) {
@@ -386,9 +366,11 @@ static void gauge_blocked(RxWorld *w) {
 }
 
 static int better_admit(const RxReaction *a, const RxReaction *b) {
-    if (a->desc.priority != b->desc.priority) return a->desc.priority < b->desc.priority;
-    if (a->wait_seq != b->wait_seq) return a->wait_seq < b->wait_seq;
-    return a->service < b->service;
+    uint64_t pa[3] = { a->desc.priority, a->wait_seq, a->service };
+    uint64_t pb[3] = { b->desc.priority, b->wait_seq, b->service };
+    uint64_t res = 0;
+    if (omega2_rx_world_better_admit(&res, pa, 3, pb, 3) != OMEGA_OK) return 0;
+    return res != 0;
 }
 
 static void charge(RxWorld *w, RxReaction *r) {

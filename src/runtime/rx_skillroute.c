@@ -18,6 +18,7 @@
  * rx_skillroute.c -- Skill Router. See rx_skillroute.h.
  */
 #include "rx_skillroute.h"
+#include "omega_native.h"
 
 #include <string.h>
 
@@ -65,9 +66,9 @@ static const AgSkill *executable(const AgSkillTable *t, uint32_t id) {
 }
 
 static int digest_zero(const uint8_t *d) {
-    uint8_t acc = 0;
-    for (int i = 0; i < 32; i++) acc |= d[i];
-    return acc == 0;
+    uint64_t res = 1;
+    if (omega2_rx_sr_digest_zero(&res, d, 32) != OMEGA_OK) return 1;
+    return res != 0;
 }
 
 /* Admissible target: a Skill; matching the requirement's pins (version,
@@ -106,18 +107,21 @@ static int admit(void *ctx, const CqEntry *e, const CqCandidate *c) {
 }
 
 static uint32_t why_of(const SrRoute *o) {
-    uint32_t w = 0;
-    if (o->stats.rejected_dead) w |= SR_WHY_GONE;
-    if (o->stats.rejected_unavailable) w |= SR_WHY_UNAVAILABLE;
-    if (o->stats.rejected_authority) w |= SR_WHY_AUTHORITY;
-    if (o->rejected.not_a_skill) w |= SR_WHY_NOT_SKILL;
-    if (o->rejected.not_executable) w |= SR_WHY_NOT_EXECUTABLE;
-    if (o->rejected.digest_mismatch) w |= SR_WHY_DIGEST;
-    if (o->rejected.remote_refused) w |= SR_WHY_REMOTE_REFUSED;
-    if (o->rejected.pin_mismatch) w |= SR_WHY_PIN;
-    if (o->rejected.machine_mismatch) w |= SR_WHY_MACHINE;
-    if (o->rejected.machine_unknown) w |= SR_WHY_MACHINE_UNKNOWN;
-    return w;
+    uint64_t counts[10] = {
+        o->stats.rejected_dead,
+        o->stats.rejected_unavailable,
+        o->stats.rejected_authority,
+        o->rejected.not_a_skill,
+        o->rejected.not_executable,
+        o->rejected.digest_mismatch,
+        o->rejected.remote_refused,
+        o->rejected.pin_mismatch,
+        o->rejected.machine_mismatch,
+        o->rejected.machine_unknown
+    };
+    uint64_t res = 0;
+    (void)omega2_rx_sr_why_of(&res, counts, 10);
+    return (uint32_t)res;
 }
 
 static void fill_target(const SrRouter *r, const CqCandidate *c, SrRoute *x) {

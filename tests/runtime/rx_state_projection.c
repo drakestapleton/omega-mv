@@ -945,8 +945,24 @@ static void write_receipt(int gate_pass, int preserve, int reduce, int controls,
     printf("receipt: %s\n", path);
 }
 
+static void summary_boundaries(void) {
+    const uint32_t n = 1000001;
+    uint64_t *words = calloc(n, sizeof(*words));
+    CHECK(words != NULL, "allocate projection boundary fixture");
+    if (!words) return;
+    words[n - 1] = 3;
+    pj_summarize(words, n, words);
+    const uint64_t expected[] = {n, 3, 9, 0, 3};
+    CHECK(memcmp(words, expected, sizeof expected) == 0, "large aliased summary");
+    pj_summarize(NULL, 0, words);
+    const uint64_t empty[PJ_SUMMARY_WORDS] = {0};
+    CHECK(memcmp(words, empty, sizeof empty) == 0, "empty summary");
+    free(words);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    summary_boundaries();
     printf("[*] part A: five operations x %u planted histories, whole store vs projection\n", SEEDS);
     for (uint32_t w = 0; w < W_COUNT; w++) {
         for (uint32_t seed = 0; seed < SEEDS; seed++) run_task(w, seed);

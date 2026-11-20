@@ -20,6 +20,7 @@
  */
 #include "rx_projection.h"
 
+#include "omega_api_decl.h"
 #include "sha256.h"
 
 #include <stdlib.h>
@@ -60,18 +61,9 @@ int pj_need_add(CognitiveNeed *n, uint32_t cls, uint32_t kind, uint32_t treatmen
 }
 
 void pj_summarize(const uint64_t *w, uint32_t n, uint64_t out[PJ_SUMMARY_WORDS]) {
-    uint64_t sum = 0, sq = 0, mn = UINT64_MAX, mx = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        sum += w[i];
-        sq += w[i] * w[i];
-        if (w[i] < mn) mn = w[i];
-        if (w[i] > mx) mx = w[i];
-    }
-    out[0] = n;
-    out[1] = sum;
-    out[2] = sq;
-    out[3] = n ? mn : 0;
-    out[4] = mx;
+    uint64_t summary[PJ_SUMMARY_WORDS];
+    rx_pj_summarize(w, n, summary);
+    memcpy(out, summary, sizeof summary);
 }
 
 /* ---- a small id set ---- */
@@ -141,19 +133,11 @@ static int add_subject(uint64_t *list, uint32_t *n, uint32_t cap, uint64_t s) {
 static int is_protected(const CxObject *o) { return o->protect != 0 || o->cls == CX_EVIDENCE; }
 
 static uint32_t section_of(const CxObject *o, uint32_t treatment, uint32_t temporal) {
-    if (treatment == PJ_LIVE && temporal == PJ_T_LATEST) return PJ_SEC_WORLD;
-    if (is_protected(o)) return PJ_SEC_EVIDENCE;
-    if (o->cls == CX_CLAIM) return PJ_SEC_HYPOTHESIS;
-    return PJ_SEC_CORTEX;
+    return (uint32_t)rx_pj_section_of(o->protect, o->cls, treatment, temporal);
 }
 
 static uint32_t form_of(uint32_t treatment) {
-    switch (treatment) {
-    case PJ_COMPRESSIBLE: return PJ_FORM_SUMMARY;
-    case PJ_RECALLABLE:
-    case PJ_REFERENCE_ONLY: return PJ_FORM_REF;
-    default: return PJ_FORM_FULL;
-    }
+    return (uint32_t)rx_pj_form_of(treatment);
 }
 
 static int grow(void **p, uint64_t *cap, uint64_t need, size_t elem) {

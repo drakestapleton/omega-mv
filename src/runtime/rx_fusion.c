@@ -27,6 +27,7 @@
 #include "rx_fusion.h"
 
 #include "omega_core.h"
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <string.h>
@@ -46,17 +47,17 @@ static void put64(sha256_ctx *c, uint64_t v) {
 }
 
 static uint64_t word64(const uint8_t *d) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) v = (v << 8) | d[i];
-    return v;
+    uint64_t res = 0;
+    (void)omega2_rx_fus_word64(&res, d, 8);
+    return res;
 }
 
 static int bit(uint64_t set, uint32_t n) { return (int)((set >> n) & 1u); }
 
 static int eligible_kind(AgKind k) {
-    return k == AG_CONST || k == AG_PURE || k == AG_WORLD_READ || k == AG_RECALL ||
-           k == AG_PHYSICAL || k == AG_SKILL || k == AG_RETRY || k == AG_EFFECT_PROPOSE ||
-           k == AG_VERIFY;
+    uint64_t res = 0;
+    if (omega2_rx_fus_eligible_kind(&res, (uint64_t)k) != OMEGA_OK) return 0;
+    return res != 0;
 }
 
 static int step_reads(AgKind k) { return k == AG_WORLD_READ || k == AG_RECALL; }

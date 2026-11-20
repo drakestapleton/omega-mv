@@ -1,0 +1,171 @@
+om2
+note rx_costmodel_core.om -- Pure OM-2 f64 linear algebra and Bayesian
+note sufficient-statistics updates for src/runtime/rx_costmodel.c.
+note f64 arrays are passed as bit-preserving ulong arrays (bitcast f64/ulong).
+
+const PRIOR_A f64 1.0
+const PRIOR_B f64 0.01
+const NOISE_FLOOR f64 0.0009
+
+fn unpack_sym tri view ulong 36 A edit f64 64 to void
+  k = ulong 0
+  for i ulong 8
+    j = i
+    while lt j 8 bound 8
+      v = bitcast f64 get tri k
+      put A add mul i 8 j v
+      put A add mul j 8 i v
+      k = add k 1
+      j = add j 1
+    end
+  end
+end
+
+fn chol_diag A view f64 64 L view f64 64 j ulong to f64
+  s = get A add mul j 8 j
+  for k ulong j bound 8
+    lk = get L add mul j 8 k
+    s = sub s mul lk lk
+  end
+  ret s
+end
+
+fn chol_off A view f64 64 L view f64 64 i ulong j ulong to f64
+  t = get A add mul i 8 j
+  for k ulong j bound 8
+    lik = get L add mul i 8 k
+    ljk = get L add mul j 8 k
+    t = sub t mul lik ljk
+  end
+  ret t
+end
+
+fn cholesky_8 tri view ulong 36 L edit f64 64 to long
+  A = new f64 64 0.0f64
+  unpack_sym tri A
+  for z ulong 64
+    put L z 0.0f64
+  end
+  for j ulong 8
+    s = chol_diag A L j
+    if not gt s 0.0f64
+      ret -1
+    end
+    ljj = fsqrt s
+    put L add mul j 8 j ljj
+    i = add j 1
+    while lt i 8 bound 8
+      t = chol_off A L i j
+      put L add mul i 8 j div t ljj
+      i = add i 1
+    end
+  end
+  ret 0
+end
+
+fn fwd_8 L view f64 64 b view f64 8 v edit f64 8 to void
+  for i ulong 8
+    s = get b i
+    for k ulong i bound 8
+      s = sub s mul get L add mul i 8 k get v k
+    end
+    put v i div s get L add mul i 8 i
+  end
+end
+
+fn bwd_8 L view f64 64 v view f64 8 x edit f64 8 to void
+  r = ulong 0
+  while lt r 8 bound 8
+    i = sub 7 r
+    s = get v i
+    k = add i 1
+    while lt k 8 bound 8
+      s = sub s mul get L add mul k 8 i get x k
+      k = add k 1
+    end
+    put x i div s get L add mul i 8 i
+    r = add r 1
+  end
+end
+
+fn dot_8 a view f64 8 b view f64 8 to f64
+  s = f64 0.0f64
+  for i ulong 8
+    s = add s mul get a i get b i
+  end
+  ret s
+end
+
+fn norm2_8 a view f64 8 to f64
+  s = f64 0.0f64
+  for i ulong 8
+    x = get a i
+    s = add s mul x x
+  end
+  ret s
+end
+
+fn post_sd n ulong yty_bits ulong quad f64 lev f64 dst edit ulong 4 to void
+  yty = bitcast f64 yty_bits
+  a = add PRIOR_A mul 0.5f64 f64 n
+  b = add PRIOR_B mul 0.5f64 sub yty quad
+  if lt b PRIOR_B
+    b = PRIOR_B
+  end
+  sigma2 = div b a
+  if lt sigma2 NOISE_FLOOR
+    sigma2 = NOISE_FLOOR
+  end
+  sd = fsqrt mul sigma2 add 1.0f64 lev
+  dof = mul 2.0f64 a
+  put dst 1 bitcast ulong sd
+  put dst 2 bitcast ulong dof
+end
+
+note Predictive Student-t for one (cell, arm).
+note meta[0] = n (ulong), meta[1] = bitcast(yty).
+note dst[0..2] = bitcast(mean, sd, dof). Returns 1 on success, 0 if no data / non-PD.
+export fn rx_cm_fit_predict tri view ulong 36 xty_u view ulong 8 phi_u view ulong 8 meta view ulong 2 dst edit ulong 4 to ulong
+  n = get meta 0
+  if eq n 0
+    ret 0
+  end
+  L = new f64 64 0.0f64
+  if ne cholesky_8 tri L 0
+    ret 0
+  end
+  xty = new f64 8 0.0f64
+  phi = new f64 8 0.0f64
+  for i ulong 8
+    put xty i bitcast f64 get xty_u i
+    put phi i bitcast f64 get phi_u i
+  end
+  v = new f64 8 0.0f64
+  mu = new f64 8 0.0f64
+  w = new f64 8 0.0f64
+  fwd_8 L xty v
+  bwd_8 L v mu
+  fwd_8 L phi w
+  put dst 0 bitcast ulong dot_8 mu phi
+  post_sd n get meta 1 norm2_8 v norm2_8 w dst
+  ret 1
+end
+
+note Rank-1 sufficient-statistics update: tri += phi * phi^T, xty += phi * y.
+export fn rx_cm_rank1_update tri edit ulong 36 xty edit ulong 8 phi view ulong 8 y_bits ulong to void
+  y = bitcast f64 y_bits
+  k = ulong 0
+  for i ulong 8
+    pi = bitcast f64 get phi i
+    j = i
+    while lt j 8 bound 8
+      pj = bitcast f64 get phi j
+      cur = bitcast f64 get tri k
+      put tri k bitcast ulong add cur mul pi pj
+      k = add k 1
+      j = add j 1
+    end
+    cx = bitcast f64 get xty i
+    put xty i bitcast ulong add cx mul pi y
+  end
+end

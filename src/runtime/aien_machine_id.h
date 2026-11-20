@@ -81,6 +81,7 @@
 #ifndef AIEN_MACHINE_ID_H
 #define AIEN_MACHINE_ID_H
 
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <stddef.h>
@@ -118,9 +119,9 @@ typedef struct {
 } AienMachineId;
 
 static inline int aien_mid_is_zero_(const uint8_t *b) {
-    uint8_t acc = 0;
-    for (unsigned i = 0; i < AIEN_MID_ID_BYTES; i++) acc |= b[i];
-    return acc == 0;
+    uint64_t res = 1;
+    if (omega2_rx_mid_is_zero(&res, b, AIEN_MID_ID_BYTES) != OMEGA_OK) return 1;
+    return res != 0;
 }
 
 static inline int aien_mid_root_valid_(uint8_t r) {
@@ -166,17 +167,25 @@ static inline void aien_mid_to_slot(const AienMachineId *m, uint8_t slot[AIEN_MI
 /* Equality and hash: the 32 id bytes only. Hash is the first 8 id bytes read
  * big-endian: the same on every host, no seed. */
 static inline int aien_mid_equal(const AienMachineId *a, const AienMachineId *b) {
-    return memcmp(a->id, b->id, AIEN_MID_ID_BYTES) == 0;
+    if (a == b) return 1;
+    uint64_t res = 0;
+    if (omega2_rx_mid_equal(&res, a->id, AIEN_MID_ID_BYTES, b->id, AIEN_MID_ID_BYTES) != OMEGA_OK)
+        return 0;
+    return res != 0;
 }
 
 static inline int aien_mid_compare(const AienMachineId *a, const AienMachineId *b) {
-    return memcmp(a->id, b->id, AIEN_MID_ID_BYTES);
+    if (a == b) return 0;
+    uint64_t res = 0;
+    if (omega2_rx_mid_compare(&res, a->id, AIEN_MID_ID_BYTES, b->id, AIEN_MID_ID_BYTES) != OMEGA_OK)
+        return 0;
+    return (int)(int64_t)res;
 }
 
 static inline uint64_t aien_mid_hash(const AienMachineId *m) {
-    uint64_t h = 0;
-    for (unsigned i = 0; i < 8; i++) h = (h << 8) | m->id[i];
-    return h;
+    uint64_t res = 0;
+    (void)omega2_rx_mid_hash(&res, m->id, AIEN_MID_ID_BYTES);
+    return res;
 }
 
 static inline void aien_mid_check_(const uint8_t rec[AIEN_MID_RECORD_BYTES], uint8_t out[4]) {
@@ -186,13 +195,12 @@ static inline void aien_mid_check_(const uint8_t rec[AIEN_MID_RECORD_BYTES], uin
 }
 
 static inline int aien_mid_encode(const AienMachineId *m, uint8_t out[AIEN_MID_RECORD_BYTES]) {
-    if (!m || !out || !aien_mid_root_valid_(m->root)) return AIEN_MID_E_ARG;
-    if (aien_mid_is_zero_(m->id)) return AIEN_MID_E_ZERO;
-    out[0] = 'A'; out[1] = 'M'; out[2] = 'I'; out[3] = 'D';
-    out[4] = AIEN_MID_VERSION;
-    out[5] = m->root;
-    out[6] = 0; out[7] = 0;
-    memcpy(out + 8, m->id, AIEN_MID_ID_BYTES);
+    if (!m || !out) return AIEN_MID_E_ARG;
+    uint64_t res = 0;
+    if (omega2_rx_mid_pack_hdr(&res, (uint64_t)m->root, m->id, AIEN_MID_ID_BYTES,
+                               out, AIEN_MID_RECORD_BYTES) != OMEGA_OK)
+        return AIEN_MID_E_ARG;
+    if ((int64_t)res != AIEN_MID_OK) return (int)(int64_t)res;
     aien_mid_check_(out, out + 40);
     return AIEN_MID_OK;
 }
@@ -200,48 +208,39 @@ static inline int aien_mid_encode(const AienMachineId *m, uint8_t out[AIEN_MID_R
 static inline int aien_mid_decode(const uint8_t *in, size_t len, AienMachineId *out) {
     if (!in || !out) return AIEN_MID_E_ARG;
     if (len != AIEN_MID_RECORD_BYTES) return AIEN_MID_E_FORMAT;
-    if (in[0] != 'A' || in[1] != 'M' || in[2] != 'I' || in[3] != 'D' ||
-        in[4] != AIEN_MID_VERSION || in[6] != 0 || in[7] != 0)
-        return AIEN_MID_E_FORMAT;
-    if (!aien_mid_root_valid_(in[5])) return AIEN_MID_E_FORMAT;
-    uint8_t chk[4];
+    uint8_t chk[4], dst[33];
     aien_mid_check_(in, chk);
-    if (memcmp(chk, in + 40, 4) != 0) return AIEN_MID_E_CHECK;
-    if (aien_mid_is_zero_(in + 8)) return AIEN_MID_E_ZERO;
-    out->root = in[5];
-    memcpy(out->id, in + 8, AIEN_MID_ID_BYTES);
+    uint64_t res = 0;
+    if (omega2_rx_mid_val_rec(&res, in, AIEN_MID_RECORD_BYTES, chk, 4, dst, 33) != OMEGA_OK)
+        return AIEN_MID_E_ARG;
+    if ((int64_t)res != AIEN_MID_OK) return (int)(int64_t)res;
+    out->root = dst[0];
+    memcpy(out->id, dst + 1, AIEN_MID_ID_BYTES);
     return AIEN_MID_OK;
 }
 
 /* Text form: out must hold AIEN_MID_TEXT_CHARS + 1 bytes (NUL-terminated). */
 static inline int aien_mid_to_text(const AienMachineId *m, char out[AIEN_MID_TEXT_CHARS + 1]) {
-    static const char hx[] = "0123456789abcdef";
     uint8_t rec[AIEN_MID_RECORD_BYTES];
     int rc = aien_mid_encode(m, rec);
     if (rc != AIEN_MID_OK) return rc;
-    for (unsigned i = 0; i < AIEN_MID_RECORD_BYTES; i++) {
-        out[2 * i] = hx[rec[i] >> 4];
-        out[2 * i + 1] = hx[rec[i] & 15];
-    }
+    uint64_t res = 0;
+    if (omega2_rx_mid_to_hex(&res, rec, AIEN_MID_RECORD_BYTES,
+                             (uint8_t *)out, AIEN_MID_TEXT_CHARS) != OMEGA_OK)
+        return AIEN_MID_E_ARG;
     out[AIEN_MID_TEXT_CHARS] = 0;
     return AIEN_MID_OK;
-}
-
-static inline int aien_mid_hexval_(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;   /* uppercase is not canonical */
 }
 
 static inline int aien_mid_from_text(const char *s, AienMachineId *out) {
     if (!s || !out) return AIEN_MID_E_ARG;
     if (strlen(s) != AIEN_MID_TEXT_CHARS) return AIEN_MID_E_FORMAT;
     uint8_t rec[AIEN_MID_RECORD_BYTES];
-    for (unsigned i = 0; i < AIEN_MID_RECORD_BYTES; i++) {
-        int hi = aien_mid_hexval_(s[2 * i]), lo = aien_mid_hexval_(s[2 * i + 1]);
-        if (hi < 0 || lo < 0) return AIEN_MID_E_FORMAT;
-        rec[i] = (uint8_t)(hi << 4 | lo);
-    }
+    uint64_t res = 0;
+    if (omega2_rx_mid_from_hex(&res, (const uint8_t *)s, AIEN_MID_TEXT_CHARS,
+                               rec, AIEN_MID_RECORD_BYTES) != OMEGA_OK)
+        return AIEN_MID_E_FORMAT;
+    if ((int64_t)res != AIEN_MID_OK) return (int)(int64_t)res;
     return aien_mid_decode(rec, sizeof rec, out);
 }
 

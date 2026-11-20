@@ -24,6 +24,7 @@
  */
 #include "rx_capq.h"
 
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <stdlib.h>
@@ -186,11 +187,10 @@ CqKey cq_key_of_candidate(const CqCandidate *x) {
 }
 
 static uint32_t key_hash(const CqKey *k) {
-    uint64_t h = (uint64_t)k->capability_id * 0x9E3779B97F4A7C15ull;
-    h ^= (uint64_t)k->realization_id + 0xBF58476D1CE4E5B9ull + (h << 6) + (h >> 2);
-    h ^= (uint64_t)k->machine_id + 0x94D049BB133111EBull + (h << 6) + (h >> 2);
-    h ^= (uint64_t)k->skill_id + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
-    return (uint32_t)(h ^ (h >> 32));
+    uint64_t res = 0;
+    (void)omega2_rx_cq_key_hash(&res, (uint64_t)k->capability_id, (uint64_t)k->realization_id,
+                                (uint64_t)k->machine_id, (uint64_t)k->skill_id);
+    return (uint32_t)res;
 }
 
 static int key_eq(const CqEntry *e, const CqKey *k) {
@@ -448,17 +448,29 @@ int cq_compile(const CqCatalog *c, const CqNeed *need, CqPlan *plan) {
 
 /* ---- ranking ---- */
 
+static void pack_cand_7(const CqCandidate *c, uint64_t out[7]) {
+    out[0] = c->expected_cost;
+    out[1] = c->expected_latency;
+    out[2] = c->expected_energy;
+    out[3] = c->confidence;
+    out[4] = c->reliability;
+    out[5] = c->required_authority.held ? 1ull : 0ull;
+    out[6] = c->local ? 1ull : 0ull;
+}
+
+static void pack_cand_11(const CqCandidate *c, uint64_t out[11]) {
+    pack_cand_7(c, out);
+    out[7] = c->capability_id;
+    out[8] = c->realization_id;
+    out[9] = c->machine_id;
+    out[10] = c->skill_id;
+}
+
 uint64_t cq_dim_value(const CqCandidate *c, uint32_t dim) {
-    switch (dim) {
-    case CQ_DIM_COST:        return c->expected_cost;
-    case CQ_DIM_LATENCY:     return c->expected_latency;
-    case CQ_DIM_ENERGY:      return c->expected_energy;
-    case CQ_DIM_CONFIDENCE:  return c->confidence >= CQ_PPM ? 0 : CQ_PPM - c->confidence;
-    case CQ_DIM_RELIABILITY: return c->reliability >= CQ_PPM ? 0 : CQ_PPM - c->reliability;
-    case CQ_DIM_AUTHORITY:   return c->required_authority.held ? 0 : 1;
-    case CQ_DIM_LOCALITY:    return c->local ? 0 : 1;
-    default:                 return 0;
-    }
+    uint64_t vals[7], res = 0;
+    pack_cand_7(c, vals);
+    (void)omega2_rx_cq_dim_value(&res, vals, 7, (uint64_t)dim);
+    return res;
 }
 
 typedef struct {
@@ -469,15 +481,13 @@ typedef struct {
 
 /* Strict order: the named dimensions, then the ids. */
 static int cmp_full(const CqCandidate *a, const CqCandidate *b, const uint8_t *dims, uint32_t nd) {
-    for (uint32_t i = 0; i < nd; i++) {
-        uint64_t x = cq_dim_value(a, dims[i]), y = cq_dim_value(b, dims[i]);
-        if (x != y) return x < y ? -1 : 1;
-    }
-    uint32_t ka[4] = { a->capability_id, a->realization_id, a->machine_id, a->skill_id };
-    uint32_t kb[4] = { b->capability_id, b->realization_id, b->machine_id, b->skill_id };
-    for (int i = 0; i < 4; i++)
-        if (ka[i] != kb[i]) return ka[i] < kb[i] ? -1 : 1;
-    return 0;
+    uint64_t pa[11], pb[11], res = 0;
+    uint8_t d7[7] = { 0 };
+    pack_cand_11(a, pa);
+    pack_cand_11(b, pb);
+    for (uint32_t i = 0; i < nd && i < 7; i++) d7[i] = dims[i];
+    (void)omega2_rx_cq_cmp_full(&res, pa, 11, pb, 11, d7, 7, (uint64_t)nd);
+    return (int)(int64_t)res;
 }
 
 static __thread RankCtx t_sort;   /* qsort has no context argument */
@@ -488,18 +498,19 @@ static int cmp_idx(const void *a, const void *b) {
 }
 
 static int dominates(const CqCandidate *a, const CqCandidate *b, const uint8_t *dims, uint32_t nd) {
-    int strict = 0;
-    for (uint32_t i = 0; i < nd; i++) {
-        uint64_t x = cq_dim_value(a, dims[i]), y = cq_dim_value(b, dims[i]);
-        if (x > y) return 0;
-        if (x < y) strict = 1;
-    }
-    return strict;
+    uint64_t pa[7], pb[7], res = 0;
+    uint8_t d7[7] = { 0 };
+    pack_cand_7(a, pa);
+    pack_cand_7(b, pb);
+    for (uint32_t i = 0; i < nd && i < 7; i++) d7[i] = dims[i];
+    (void)omega2_rx_cq_dominates(&res, pa, 7, pb, 7, d7, 7, (uint64_t)nd);
+    return res != 0;
 }
 
 static int within(uint64_t v, uint64_t best, uint32_t tol_ppm) {
-    unsigned __int128 lim = (unsigned __int128)best * (CQ_PPM + (uint64_t)tol_ppm);
-    return (unsigned __int128)v * CQ_PPM <= lim;
+    uint64_t res = 0;
+    (void)omega2_rx_cq_within(&res, v, best, (uint64_t)tol_ppm);
+    return res != 0;
 }
 
 int cq_rank(const CqCandidate *in, uint32_t n, const CqTradeoffs *t, CqCandidate *out, uint32_t k,
