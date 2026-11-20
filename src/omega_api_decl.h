@@ -667,6 +667,21 @@ uint64_t osc_scope_push(OscCheckedScope *o_table);
 void osc_scope_pop(OscCheckedScope *o_table);
 #define OSC_POOL_FULL 1
 #define OSC_POOL_RETIRED 2
+#define OSC_HANDLE_UNKNOWN 0
+#define OSC_HANDLE_LIVE 1
+#define OSC_HANDLE_STALE 2
+#define OSC_HANDLE_STALE_COPY 3
+typedef struct {
+    uint32_t count;
+    uint32_t nbind;
+    uint8_t freed[1024];
+    int32_t binding[480];
+} OscHandleState;
+OMBR_ASSERT(sizeof(OscHandleState) == 2952, "layout handles size");
+OMBR_ASSERT(offsetof(OscHandleState, count) == 0, "layout handles field count");
+OMBR_ASSERT(offsetof(OscHandleState, nbind) == 4, "layout handles field nbind");
+OMBR_ASSERT(offsetof(OscHandleState, freed) == 8, "layout handles field freed");
+OMBR_ASSERT(offsetof(OscHandleState, binding) == 1032, "layout handles field binding");
 typedef struct {
     uint64_t gbase;
     uint64_t dallocs;
@@ -691,6 +706,20 @@ void osc_pool_init(OscCheckedPool *o_p, uint64_t o_cap, uint64_t o_base, int64_t
 uint64_t osc_pool_alloc(OscCheckedPool *o_p, int64_t o_loop_depth, int64_t o_cond_depth);
 /* export fn osc_pool_free p edit poolstat loop_depth long cond_depth long to void */
 void osc_pool_free(OscCheckedPool *o_p, int64_t o_loop_depth, int64_t o_cond_depth);
+/* export fn osc_handle_allocate h edit handles to long */
+int64_t osc_handle_allocate(OscHandleState *o_h);
+/* export fn osc_handle_bind h edit handles provenance long to ulong */
+uint64_t osc_handle_bind(OscHandleState *o_h, int64_t o_provenance);
+/* export fn osc_handle_visit h edit handles sites edit ulong 1024 b ulong freeing ulong symbol long line ulong to ulong */
+uint64_t osc_handle_visit(OscHandleState *o_h, uint64_t o_sites[1024], uint64_t o_b, uint64_t o_freeing, int64_t o_symbol, uint64_t o_line);
+/* export fn osc_handles_save h view handles s edit handles to void */
+void osc_handles_save(const OscHandleState *o_h, OscHandleState *o_s);
+/* export fn osc_handles_restore h edit handles s view handles bindings ulong to void */
+void osc_handles_restore(OscHandleState *o_h, const OscHandleState *o_s, uint64_t o_bindings);
+/* export fn osc_handles_settle h edit handles before view handles other view handles to void */
+void osc_handles_settle(OscHandleState *o_h, const OscHandleState *o_before, const OscHandleState *o_other);
+/* export fn osc_handle_frees h view handles before view handles ids edit uint 1024 to ulong */
+uint64_t osc_handle_frees(const OscHandleState *o_h, const OscHandleState *o_before, uint32_t o_ids[1024]);
 typedef struct {
     uint8_t op;
     uint8_t refused;
