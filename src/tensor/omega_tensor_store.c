@@ -21,6 +21,7 @@
  * src/runtime/rx_generation.c; nothing from src/runtime is linked.
  */
 #include "omega_tensor_store.h"
+#include "omega_native.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -217,16 +218,15 @@ static bool is_payload_name(const char *s) {
 
 /* ---- shapes and payload bytes ----------------------------------------- */
 
-/* Element count of a shape; 0 when the shape is invalid. */
-static uint64_t shape_elems(uint32_t dtype, uint32_t rank, const uint64_t *shape) {
-    if (omega_dtype_size((OmegaDType)dtype) == 0 || rank > OMEGA_TENSOR_MAX_RANK) return 0;
-    uint64_t e = 1;
-    for (uint32_t d = 0; d < rank; d++) {
-        if (shape[d] == 0 || shape[d] > OMEGA_TENSOR_MAX_ELEMS) return 0;
-        e *= shape[d];
-        if (e > OMEGA_TENSOR_MAX_ELEMS) return 0;
-    }
-    return e;
+/* Preserve the caller's file-integrity error for an invalid shape. */
+static int shape_elems(uint32_t dtype, uint32_t rank, const uint64_t *shape,
+                       int invalid, uint64_t *elems) {
+    if (omega_dtype_size((OmegaDType)dtype) == 0 || rank > OMEGA_TENSOR_MAX_RANK) return invalid;
+    if (!rank) { *elems = 1; return OMEGA_TENSOR_OK; }
+    uint64_t result;
+    if (omega2_tensor_shape_size(&result, shape, rank, elems, 1) != OMEGA_OK)
+        return OMEGA_TENSOR_ERR_CAPACITY;
+    return result ? invalid : OMEGA_TENSOR_OK;
 }
 
 /* Every NaN becomes the canonical quiet NaN of its dtype (same rule as the
@@ -265,9 +265,10 @@ static int payload_value_id(OmegaTensorStore *st, const StoreSlot *sl, const uin
  * NULL) receives a malloc'd buffer of exactly the expected size.
  */
 static int load_payload(OmegaTensorStore *st, const StoreSlot *sl, uint8_t **out) {
-    uint64_t elems = shape_elems((uint32_t)sl->dtype, sl->rank, sl->shape);
+    uint64_t elems;
+    int shape_rc = shape_elems((uint32_t)sl->dtype, sl->rank, sl->shape, OMEGA_TSTORE_ERR_CORRUPT, &elems);
+    if (shape_rc) return shape_rc;
     size_t expect = (size_t)elems * omega_dtype_size(sl->dtype);
-    if (elems == 0) return OMEGA_TSTORE_ERR_CORRUPT;
     char name[69], path[PATH_MAX_LEN];
     hex_name(sl->value_id, name);
     if (path_join(path, sizeof path, st->dir, name)) return OMEGA_TSTORE_ERR_IO;
@@ -346,7 +347,9 @@ static int apply_record(OmegaTensorStore *st, const Record *r, uint64_t expect_s
     StoreSlot *sl = &st->slots[r->slot];
     if (r->kind == REC_PUT) {
         if (sl->live || sl->gen == UINT64_MAX || r->gen != sl->gen) return OMEGA_TSTORE_ERR_TORN;
-        if (shape_elems(r->dtype, r->rank, r->shape) == 0) return OMEGA_TSTORE_ERR_TORN;
+        uint64_t elems;
+        int rc = shape_elems(r->dtype, r->rank, r->shape, OMEGA_TSTORE_ERR_TORN, &elems);
+        if (rc) return rc;
         for (uint32_t d = r->rank; d < OMEGA_TENSOR_MAX_RANK; d++)
             if (r->shape[d] != 0) return OMEGA_TSTORE_ERR_TORN;
         sl->live = true;
