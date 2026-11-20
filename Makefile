@@ -2254,7 +2254,7 @@ test-vcstore: tests/test_omega_vcstore.c src/omega_vcstore.c src/omega_vcstore.h
 # VC1-RESOLVE (VC1 stage 4): import resolution in the Omega OSC compiler. `import NAME;` resolves
 # only through omega.lock -> semantic id -> Verified Crumb Store -> receipt check -> transitive
 # verified closure (src/omega_resolve.c), with a C reader of the aien-proof receipt wire contract
-# (src/omega_receipt.c, BLAKE3 in om/blake3/b3unit.om behind src/omega_blake3.c). oscv is the verified
+# (src/omega_receipt.c, BLAKE3 in om/blake3/b3hash.om and b3unit.om). oscv is the verified
 # driver. Test inputs: tests/resolve/ (official BLAKE3 vectors, three receipts written by the Rust
 # implementation). Mutation proof: each mutant is a copy of ONE source file with one tagged line
 # (VC1R:<tag> in omega_resolve.c / omega_receipt.c) replaced; the test must exit 1 with "MUTANT <name>
@@ -2265,7 +2265,7 @@ test-vcstore: tests/test_omega_vcstore.c src/omega_vcstore.c src/omega_vcstore.h
 RESOLVE_FLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc -Isrc/compiler -Isrc/compiler/model
 RESOLVE_DIR = $(OUT_DIR)/resolve-test
 RESOLVE_OSC_LIB = $(filter-out src/compiler/oscc_main.c,$(wildcard src/compiler/*.c))
-RESOLVE_SRC = src/omega_resolve.c src/omega_receipt.c src/omega_blake3.c
+RESOLVE_SRC = src/omega_resolve.c src/omega_receipt.c
 RESOLVE_REST = src/omega_resolve_osc.c src/omega_vcstore.c $(RESOLVE_OSC_LIB) src/omega_om_units.c
 RESOLVE_HDRS = $(wildcard src/compiler/*.h) src/omega_resolve.h src/omega_receipt.h src/omega_blake3.h src/omega_resolve_osc.h src/omega_vcstore.h src/sha256.h
 $(OUT_DIR)/compiler/oscv: src/oscv_main.c $(RESOLVE_SRC) $(RESOLVE_REST) $(RESOLVE_HDRS)
@@ -2380,7 +2380,7 @@ RESOLVE_HDRS += src/omega_genesis.h src/omega_vcstore_priv.h src/omega_program_i
 # production source can select the variant. Mutants below break one guard each in the copies.
 .PHONY: test-genesis
 GENESIS_DIR = $(OUT_DIR)/genesis-test
-GENESIS_STACK = src/omega_receipt.c src/omega_blake3.c src/omega_om_units.c $(RESOLVE_PROGRAM_STACK)
+GENESIS_STACK = src/omega_receipt.c src/omega_om_units.c $(RESOLVE_PROGRAM_STACK)
 GENESIS_CFLAGS = $(RESOLVE_FLAGS) -I$(GENESIS_DIR) -Itests
 test-genesis: tests/test_omega_genesis_set.c tests/genesis_variant/member.inc src/omega_vcstore.c src/omega_resolve.c src/omega_genesis.h $(RESOLVE_HDRS)
 	@set -eu; mkdir -p $(GENESIS_DIR)/genesis_variant; \
@@ -2495,7 +2495,7 @@ test-vcstore-genesis: test-vcstore
 # (src/omega_vc_bridge.c), so both link the bridge, the resolver, the receipt reader and the store.
 # `+=` at the end is read by the recipes above (they use the variables lazily); the extra
 # prerequisite rules below make sure the new objects are built first.
-VC_BRIDGE_CORE = omega_program_ir omega_vc_bridge omega_resolve omega_receipt omega_blake3 omega_vcstore
+VC_BRIDGE_CORE = omega_program_ir omega_vc_bridge omega_resolve omega_receipt omega_vcstore
 VC_BRIDGE_OBJS = $(addprefix $(OUT_DIR)/,$(addsuffix .o,$(VC_BRIDGE_CORE)))
 LEARNER_CORE += $(VC_BRIDGE_CORE)
 $(LEARNER): $(VC_BRIDGE_OBJS)
@@ -2529,7 +2529,7 @@ test-genesis-real: tests/test_omega_genesis.c src/omega_genesis.h docs/osc/VC-GE
 # check must FAIL. The tag lines are single lines, so sed replaces whole lines.
 .PHONY: test-vc-bridge
 VCB_DIR = $(OUT_DIR)/vc-bridge-test
-VCB_STACK = src/omega_library.c src/omega_receipt.c src/omega_blake3.c src/omega_om_units.c src/omega_vcstore.c $(RESOLVE_PROGRAM_STACK)
+VCB_STACK = src/omega_library.c src/omega_receipt.c src/omega_om_units.c src/omega_vcstore.c $(RESOLVE_PROGRAM_STACK)
 test-vc-bridge: tests/test_omega_vc_bridge.c src/omega_vc_bridge.c src/omega_vc_bridge.h src/omega_resolve.c src/omega_resolve.h
 	@mkdir -p $(VCB_DIR)
 	$(CC) $(RESOLVE_FLAGS) -o $(VCB_DIR)/test_omega_vc_bridge tests/test_omega_vc_bridge.c src/omega_vc_bridge.c src/omega_resolve.c $(VCB_STACK)

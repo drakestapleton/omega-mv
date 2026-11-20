@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Replaced the BLAKE3 C chunk adapter with a seeded Omega one-shot entry sharing the original compression and tree functions. |
 | OpenAI Codex | Restored verified dependency materialization for operator-owned Spark sibling checkouts. |
 | OpenAI Codex | Ported the OSC AArch64 fixed-opcode matcher, register encoding and typed-register decoding to seeded Omega. |
 | OpenAI Codex | Ported M21 gradient unbroadcast reduction planning, reduced-axis restoration and shape matching to seeded Omega. |
