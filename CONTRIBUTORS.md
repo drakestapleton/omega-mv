@@ -7,6 +7,9 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Fixed the M18 clean rebuild to verify the source and independent clone commits before hardware qualification. |
+| OpenAI Codex | Replaced the BLAKE3 C chunk adapter with a seeded Omega one-shot entry sharing the original compression and tree functions. |
+| OpenAI Codex | Restored verified dependency materialization for operator-owned Spark sibling checkouts. |
 | OpenAI Codex | Migrated OSC AST node initialization and contract token-stream rendering to seeded Omega. |
 | OpenAI Codex | Ported the M22 training snapshot header codec and generation validation to seeded Omega. |
 | OpenAI Codex | Migrated the reaction runtime cost model’s OGCM v1 state encoding, validation and restoration to seeded Omega. |

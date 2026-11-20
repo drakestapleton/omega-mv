@@ -34,6 +34,9 @@ int omega_cc_run(const char *dir, const char *prog, char *const argv[], const ch
  * program exits 0 and printed a line that fit. */
 bool omega_cc_capture_line(const char *dir, const char *prog, char *const argv[], char *out, size_t out_size);
 
+/* Return the exact commit of a clean checkout. A Git error or untracked file refuses. */
+bool omega_cc_clean_revision(const char *dir, char out[41]);
+
 /* Remove path and everything under it without following symlinks.
  * Refuses an empty path, "/", a relative path, or a path outside the plain
  * charset. Returns 0 when the tree is gone (or was never there), -1 otherwise. */

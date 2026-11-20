@@ -1011,8 +1011,8 @@ static bool test_m18_gate16_clean_clone(void) {
     if (getenv("OMEGA_IN_CLEAN_CLONE") != NULL) {
         return true;
     }
-    /* Copy the repo this omegatool runs from (the code under test), not a
-     * hardcoded checkout, and pass the PHYSICS_DIR this process resolves at run time
+    /* Rebuild the committed source of the running omegatool in an independent
+     * checkout. Pass the PHYSICS_DIR this process resolves at run time
      * (omega_physics_dir.h) as an absolute path so the copy does not fall back to
      * the Makefile default ../physics. Mirrors M19.
      *
@@ -1065,12 +1065,22 @@ static bool test_m18_gate16_clean_clone(void) {
         (void)rmdir(clone);
         return false;
     }
-    char *cp_argv[] = {"cp", "-r", "--", root, checkout, NULL};
+    char source_head[41], clone_head[41];
+    if (!omega_cc_clean_revision(root, source_head)) {
+        fprintf(stderr, "M18 clean clone: could not verify a clean source revision\n");
+        (void)rmdir(clone);
+        return false;
+    }
+    char *clone_argv[] = {"git", "clone", "--quiet", "--no-local", "--", root, checkout, NULL};
     char *clean_argv[] = {"make", "clean", NULL};
     char *make_argv[] = {"make", "-j", physics_arg, NULL};
     char *run_argv[] = {"./build/omegatool", "--run-m18-gates", NULL};
-    const char *step = "cp";
-    int rc = omega_cc_run(NULL, "cp", cp_argv, NULL, false);
+    const char *step = "git clone";
+    int rc = omega_cc_run(NULL, "git", clone_argv, NULL, false);
+    if (rc == 0) {
+        step = "verify checkout";
+        if (!omega_cc_clean_revision(checkout, clone_head) || strcmp(source_head, clone_head) != 0) rc = 1;
+    }
     if (rc == 0) { step = "make clean"; rc = omega_cc_run(checkout, "make", clean_argv, NULL, false); }
     if (rc == 0) { step = "make"; rc = omega_cc_run(checkout, "make", make_argv, NULL, false); }
     /* The log sits beside the checkout: <clone>/clean_clone_m18.log. */

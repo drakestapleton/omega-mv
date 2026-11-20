@@ -58,7 +58,8 @@ int omega_cc_run(const char *dir, const char *prog, char *const argv[], const ch
     return cc_wait(pid);
 }
 
-bool omega_cc_capture_line(const char *dir, const char *prog, char *const argv[], char *out, size_t out_size) {
+static bool cc_capture(const char *dir, const char *prog, char *const argv[], char *out, size_t out_size,
+                       bool expect_empty) {
     if (!prog || !argv || !argv[0] || !out || out_size == 0) return false;
     out[0] = '\0';
     int fds[2];
@@ -87,12 +88,13 @@ bool omega_cc_capture_line(const char *dir, const char *prog, char *const argv[]
     close(fds[1]);
     close(err_fd);
     size_t used = 0;
-    bool overflow = false;
+    bool overflow = false, read_ok = true;
     char buf[256];
     for (;;) {
         ssize_t n = read(fds[0], buf, sizeof(buf));
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n < 0) { read_ok = false; break; }
+        if (n == 0) break;
         for (ssize_t i = 0; i < n; i++) {
             if (used + 1 < out_size) out[used++] = buf[i];
             else overflow = true;
@@ -101,10 +103,27 @@ bool omega_cc_capture_line(const char *dir, const char *prog, char *const argv[]
     close(fds[0]);
     out[used] = '\0';
     int rc = cc_wait(pid);
+    if (rc != 0 || !read_ok) return false;
+    if (expect_empty) return used == 0 && !overflow;
     char *nl = strpbrk(out, "\r\n");
     if (nl) *nl = '\0';
     else if (overflow) return false;
-    return rc == 0 && out[0] != '\0';
+    return out[0] != '\0';
+}
+
+bool omega_cc_capture_line(const char *dir, const char *prog, char *const argv[], char *out, size_t out_size) {
+    return cc_capture(dir, prog, argv, out, out_size, false);
+}
+
+bool omega_cc_clean_revision(const char *dir, char out[41]) {
+    char status[1], commit[64];
+    char *status_argv[] = {"git", "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none", NULL};
+    char *head_argv[] = {"git", "rev-parse", "--verify", "HEAD^{commit}", NULL};
+    if (!cc_capture(dir, "git", status_argv, status, sizeof status, true) ||
+        !omega_cc_capture_line(dir, "git", head_argv, commit, sizeof commit) ||
+        strlen(commit) != 40 || strspn(commit, "0123456789abcdef") != 40) return false;
+    memcpy(out, commit, 41);
+    return true;
 }
 
 static int cc_remove_entry(const char *path, const struct stat *sb, int type, struct FTW *ftw) {
