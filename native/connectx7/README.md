@@ -4,9 +4,11 @@
 
 For each rail, Omega encodes a signalled, single-SGE RDMA_WRITE in one 64-byte WQEBB. It publishes the producer DB record, then writes the first eight descriptor bytes to the alternating private BlueFlame doorbell halves. The device fetches the descriptor from the SQ. Ordered `mapset` provides AArch64 barriers around both stores. Polling reads the ownership byte, issues a CPU fence after acquisition, checks CQE format, opcode, SQ number and WQE counter, and publishes the CQ consumer DB. This implementation keeps one signalled write in flight per rail.
 
+For a two-Spark hardware run, use the packaged rank executable and the [researcher runbook](RESEARCHER.md).
+
 ## Cold-path handoff
 
-The caller supplies live resources in the **same Omega process and mapping context**. Linux mlx5 remains responsible for pinning, translation, QP setup and UAR mapping. A live uverbs resource adapter and Blackwell launch integration are outstanding. An integer address from a different process cannot stand in for an Omega mapping handle.
+The caller supplies live resources in the **same Omega process and mapping context**. Linux mlx5 remains responsible for pinning, translation, QP setup and UAR mapping. The experimental `rank.om` executable performs this setup using the Linux uverbs write ABI. Its first hardware run and the Blackwell buffer integration are outstanding. An integer address from a different process cannot stand in for an Omega mapping handle.
 
 - Set up two exclusively owned RTS RC QPs to the other rank, one through each cable. Choose different PCIe domains as well as different physical ports. On the documented topology, `rocep1s0f0` and `roceP2p1s0f1` are one such pair. Verify the route and port correspondence on both hosts. [DGX Spark networking](https://docs.nvidia.com/dgx/dgx-spark/spark-clustering.html)
 - Hand over fresh SQs, private doorbell apertures and dedicated polled send CQs with standard, uncompressed 64- or 128-byte entries. Disable WQE signatures. Only this polling thread may post, poll or use either UAR. The two rails may have the same QPN in different device namespaces. [mlx5 posting](https://github.com/linux-rdma/rdma-core/blob/v58.0/providers/mlx5/qp.c) and [mlx5 CQ polling](https://github.com/linux-rdma/rdma-core/blob/v58.0/providers/mlx5/cq.c)
@@ -17,7 +19,7 @@ The caller supplies live resources in the **same Omega process and mapping conte
 
 ## Calling the collective
 
-Concatenate `tp2.om` and the caller, then compile the combined source with seeded `omc`. Call `cxBegin rank left right elements` once per epoch. It returns 0 on admission and -1 on refusal. Repeatedly call `cxProgress rank left right` with the same objects. Return 0 means pending, 1 means the local result and both inboxes are reusable for this rank's next collective, and -1 means idle or failed. A CQ failure latches the rank in a failed state and retains the offending CQE. Quiesce both peers and reconstruct resources on a terminal failure or timeout. Never replay a partially posted epoch onto the same queues. Reinitialize the session before the 32-bit epoch would repeat.
+Concatenate `tp2.om` and the caller, then compile the combined source with seeded `omc`. Call `cxBegin rank left right elements` once per epoch. It returns 0 on admission and -1 on refusal. Repeatedly call `cxProgress rank left right` with the same objects. Return 0 means pending, 1 means the local result is available and this rank may begin its next collective, and -1 means idle or failed. A CQ failure latches the rank in a failed state and retains the offending CQE. Quiesce both peers and reconstruct resources on a terminal failure or timeout. Never replay a partially posted epoch onto the same queues. Reinitialize the session before the 32-bit epoch would repeat.
 
 On each rail, data writes precede a separate epoch write into the peer's ready word. An observed peer-ready word and retired local sends permit reduction. The receiver then writes its acknowledgment, permitting its peer to reuse that inbox. The two rails make independent progress. Empty stripes still participate in the handshake. The caller owns deadlines and cancellation and can insert `cpurelax` between progress calls.
 

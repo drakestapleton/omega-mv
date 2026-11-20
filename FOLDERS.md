@@ -207,7 +207,7 @@ Bounded native .om reverse-mode tape (rank 2, f32, 32 nodes) over M20 metadata-v
 
 ## `native/connectx7/`
 
-Seeded Omega TP=2 FP32 AllReduce over two preconfigured mlx5 RC rails, with a device-free host fixture. Its README specifies the registered arena and queue handoff.
+Seeded Omega TP=2 FP32 AllReduce over two preconfigured mlx5 RC rails, with a device-free host fixture, an experimental Linux uverbs rank executable, and a two-Spark researcher runbook.
 
 ## `native/orig4/`
 

@@ -1,0 +1,523 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Linux AArch64, 4 KiB pages, ConnectX-7 legacy write-command uAPI. One context per rail.
+note Commands include the 8-byte ib_uverbs_cmd_hdr. Payload offsets follow rdma/ib_user_verbs.h and mlx5-abi.h.
+global cxCmd uchar 256
+global cxReply long 1
+global cxFd int 2
+global cxPd uint 2
+global cxQph uint 2
+global cxCqh uint 2
+global cxBfsize uint 2
+global cxBfcount uint 2
+global cxGidIndex uchar 2
+global cxHello uchar 96
+global cxPeer uchar 96
+text cxAux "/proc/self/auxv"
+text cxPrefix "/dev/infiniband/uverbs"
+text cxUsage "usage: cx7-rank RANK ELEMENTS LEFT_UVERBS LEFT_GID_INDEX LEFT_GID RIGHT_UVERBS RIGHT_GID_INDEX RIGHT_GID\n"
+text cxFail "CX7 FAIL stage="
+text cxErr " kernel_result="
+text cxNl "\n"
+text cxPass "CX7 PASS host-pinned FP32 rank="
+text cxElems " elements="
+text cxTime " elapsed_ns="
+
+fn cxPrint v ulong to void
+b = new uchar 20 0
+i = ulong 20
+while true
+i = sub i 1
+put b i uchar add rem v 10 48
+v = div v 10
+if eq v 0
+break
+end
+end
+n = write 2 b i sub 20 i
+end
+
+fn cxFailAt code int result long to void
+n = write 2 cxFail 0 len cxFail
+cxPrint ulong code
+n = write 2 cxErr 0 len cxErr
+b = new uchar 1 45
+if lt result 0
+n = write 2 b 0 1
+cxPrint ulong neg result
+else
+cxPrint ulong result
+end
+n = write 2 cxNl 0 1
+exit code
+end
+
+fn cxNumber arg ulong largest ulong to ulong
+b = new uchar 20 0
+n = argread arg b 0 20
+if le n 0
+cxFailAt 2 n
+end
+v = ulong 0
+for i ulong ulong n
+c = get b i
+if or lt c 48 gt c 57
+cxFailAt 2 0
+end
+digit = sub ulong c 48
+if gt digit largest
+cxFailAt 2 0
+end
+if gt v div sub largest digit 10
+cxFailAt 2 0
+end
+v = add mul v 10 digit
+end
+ret v
+end
+
+fn cxCheckPage to void
+fd = fopen cxAux 0 len cxAux 0 0
+if lt fd 0
+cxFailAt 5 long fd
+end
+pair = new uchar 16 0
+while true
+n = read int fd pair 0 16
+if ne n 16
+cxFailAt 5 n
+end
+if eq get pair 0 6
+if or ne get pair 8 0 ne get pair 9 16
+cxFailAt 5 0
+end
+for i ulong 6
+if ne get pair add 10 i 0
+cxFailAt 5 0
+end
+end
+break
+end
+if eq get pair 0 0
+cxFailAt 5 1
+end
+end
+rc = fclose int fd
+end
+
+fn cxOpen arg ulong to int
+b = new uchar 64 0
+for i ulong len cxPrefix
+put b i get cxPrefix i
+end
+idx = cxNumber arg 0xffffffff
+n = argread arg b len cxPrefix sub 64 len cxPrefix
+if le n 0
+cxFailAt 2 n
+end
+fd = fopen b 0 add len cxPrefix ulong n 2 0
+if lt fd 0
+cxFailAt 3 long fd
+end
+ret int fd
+end
+
+fn cxMem size ulong to long
+h = mapnew -1 0 size 3 34
+if le h 0
+cxFailAt 4 h
+end
+ret h
+end
+
+fn cxPut offset ulong value ulong bytes ulong to void
+for i ulong bytes
+put cxCmd add offset i uchar and shr value mul i 8 255
+end
+end
+
+fn cxHdr opcode uint bytes ulong answer ulong to void
+for i ulong 256
+put cxCmd i 0
+end
+cxPut 0 ulong opcode 4
+cxPut 4 div bytes 4 2
+cxPut 6 div answer 4 2
+if ne answer 0
+cxPut 8 mapaddr get cxReply 0 8
+n = mapwrite get cxReply 0 0 cxCmd 16 answer
+end
+end
+
+fn cxSubmit rail ulong bytes ulong stage int to void
+n = write get cxFd rail cxCmd 0 bytes
+if ne n long bytes
+cxFailAt stage n
+end
+end
+
+fn cxR32 pos ulong to uint
+ret uint mapget get cxReply 0 pos 4
+end
+fn cxR8 pos ulong to uchar
+b = new uchar 1 0
+n = mapread get cxReply 0 pos b 0 1
+ret get b 0
+end
+
+fn cxHelloPut offset ulong value ulong bytes ulong to void
+for i ulong bytes
+put cxHello add offset i uchar and shr value mul i 8 255
+end
+end
+fn cxPeerGet offset ulong bytes ulong to ulong
+v = ulong 0
+for i ulong bytes
+v = or v shl ulong get cxPeer add offset i mul i 8
+end
+ret v
+end
+
+fn cxHex c uchar to uchar
+if and ge c 48 le c 57
+ret sub c 48
+end
+c = or c 32
+if and ge c 97 le c 102
+ret sub c 87
+end
+cxFailAt 2 long c
+ret 0
+end
+
+fn cxGid arg ulong rail ulong to void
+b = new uchar 39 0
+n = argread arg b 0 39
+if ne n 39
+cxFailAt 2 n
+end
+base = add 32 mul rail 40
+nonzero = uchar 0
+for i ulong 16
+pos = add mul i 2 div i 2
+if and gt i 0 eq rem i 2 0
+if ne get b sub pos 1 58
+cxFailAt 2 0
+end
+end
+v = or shl cxHex get b pos 4 cxHex get b add pos 1
+put cxHello add base i v
+nonzero = or nonzero v
+end
+if eq nonzero 0
+cxFailAt 2 0
+end
+end
+
+fn cxContext rail ulong to void
+cxHdr 0 48 80
+cxPut 16 8 4
+cxPut 20 4 4
+cxSubmit rail 48 10
+put cxBfsize rail cxR32 12
+put cxBfcount rail cxR32 16
+if or eq get cxBfcount rail 0 ne cxR8 52 0
+cxFailAt 11 0
+end
+if or ne cxR32 64 12 ne cxR32 68 1
+cxFailAt 11 1
+end
+cxHdr 1 16 176
+cxSubmit rail 16 12
+if or ne cxR32 40 0x15b3 ne cxR32 44 0x1021
+cxFailAt 13 0
+end
+end
+
+fn cxRegister a edit CxRank rail ulong to void
+cell = add 16 mul rail 40
+cxHdr 2 24 40
+cxPut 16 1 1
+cxSubmit rail 24 14
+if or ne cxR8 26 4 ne cxR8 37 2
+cxFailAt 15 0
+end
+if ge uint get cxGidIndex rail cxR32 16
+cxFailAt 15 1
+end
+mtu = cxR8 28
+if or lt mtu 1 gt mtu 5
+cxFailAt 15 2
+end
+cxHelloPut add cell 32 ulong mtu 1
+put a limit rail cxR32 4
+cxHelloPut add cell 36 ulong get a limit rail 4
+cxHdr 3 16 8
+cxSubmit rail 16 16
+put cxPd rail cxR32 0
+addr = mapaddr get a arena
+cxHdr 9 48 12
+cxPut 16 addr 8
+cxPut 24 add mul get a capacity 8 20 8
+cxPut 32 addr 8
+cxPut 40 ulong get cxPd rail 4
+cxPut 44 3 4
+cxSubmit rail 48 17
+put a localva rail addr
+put a lkey rail cxR32 4
+cxHelloPut cell addr 8
+cxHelloPut add cell 8 ulong cxR32 8 4
+end
+
+fn cxCreateCq q edit CxQueue rail ulong to void
+put q cq cxMem 4096
+put q db 1 cxMem 4096
+b = new uchar 64 0
+put b 63 0xf0
+for i ulong 64
+n = mapwrite get q cq mul i 64 b 0 64
+end
+cxHdr 18 72 16
+cxPut 24 63 4
+cxPut 32 0xffffffff 4
+cxPut 40 mapaddr get q cq 8
+cxPut 48 mapaddr get q db 1 8
+cxPut 56 64 4
+cxSubmit rail 72 18
+if ne cxR32 4 63
+cxFailAt 19 long cxR32 4
+end
+put cxCqh rail cxR32 0
+end
+
+fn cxMapUar q edit CxQueue rail ulong index uint to void
+size = ulong get cxBfsize rail
+if or eq index 0 ge div ulong index 4 div ulong get cxBfcount rail 2
+cxFailAt 21 long index
+end
+if ge rem index 4 2
+cxFailAt 21 long index
+end
+if or lt size 16 ne rem size 16 0
+cxFailAt 21 long size
+end
+off = add ulong 0x800 mul ulong rem index 4 size
+if gt add off size 4096
+cxFailAt 21 long size
+end
+page = mul div ulong index 4 4096
+h = mapnew get cxFd rail page 4096 3 1
+if le h 0
+cxFailAt 22 h
+end
+put q bf h
+put q bfoff off
+put q half div size 2
+end
+
+fn cxCreateQp q edit CxQueue rail ulong to void
+put q sq cxMem 4096
+put q db 0 cxMem 4096
+put q dboff 0 4
+cxHdr 24 120 72
+cxPut 24 ulong get cxPd rail 4
+cxPut 28 ulong get cxCqh rail 4
+cxPut 32 ulong get cxCqh rail 4
+cxPut 40 1 4
+cxPut 48 1 4
+cxPut 61 2 1
+cxPut 64 mapaddr get q sq 8
+cxPut 72 mapaddr get q db 0 8
+cxPut 80 64 4
+cxSubmit rail 120 20
+put cxQph rail cxR32 0
+put q qpn cxR32 4
+cxMapUar q rail cxR32 32
+cell = add 16 mul rail 40
+cxHelloPut add cell 12 ulong get q qpn 4
+end
+
+fn cxModify rail ulong state uint to void
+cxHdr 26 120 0
+cxPut 72 ulong get cxQph rail 4
+cxPut 104 ulong state 1
+cell = add 16 mul rail 40
+if eq state 1
+cxPut 76 0x39 4
+cxPut 96 2 4
+cxPut 112 1 1
+end
+if eq state 2
+cxPut 76 0x129181 4
+for i ulong 16
+put cxCmd add 8 i get cxPeer add add cell 16 i
+end
+cxPut 32 ulong get cxGidIndex rail 1
+cxPut 33 64 1
+cxPut 38 1 1
+cxPut 39 1 1
+cxPut 84 cxPeerGet add cell 33 3 4
+cxPut 92 cxPeerGet add cell 12 4 4
+mtu = get cxHello add cell 32
+other = get cxPeer add cell 32
+if lt other mtu
+mtu = other
+end
+cxPut 106 ulong mtu 1
+cxPut 111 12 1
+end
+if eq state 3
+cxPut 76 0x12e01 4
+psn = ulong 0
+for i ulong 3
+psn = or psn shl ulong get cxHello add add cell 33 i mul i 8
+end
+cxPut 88 psn 4
+cxPut 113 14 1
+cxPut 114 7 1
+cxPut 115 7 1
+end
+cxSubmit rail 120 add int state 22
+end
+
+fn cxExchange size ulong to void
+pos = ulong 0
+while lt pos size
+n = write 1 cxHello pos sub size pos
+if le n 0
+cxFailAt 26 n
+end
+pos = add pos ulong n
+end
+pos = ulong 0
+while lt pos size
+n = read 0 cxPeer pos sub size pos
+if le n 0
+cxFailAt 27 n
+end
+pos = add pos ulong n
+end
+end
+
+fn cxJoin a edit CxRank rail ulong to void
+cell = add 16 mul rail 40
+mtu = get cxPeer add cell 32
+qpn = cxPeerGet add cell 12 4
+if or eq qpn 0 gt qpn 0xffffff
+cxFailAt 28 1
+end
+if or lt mtu 1 gt mtu 5
+cxFailAt 28 2
+end
+put a peerva rail cxPeerGet cell 8
+put a rkey rail uint cxPeerGet add cell 8 4
+other = uint cxPeerGet add cell 36 4
+if lt other get a limit rail
+put a limit rail other
+end
+cxModify rail 2
+cxModify rail 3
+end
+
+fn cxSetup a edit CxRank q edit CxQueue rail ulong arg ulong to void
+put cxGidIndex rail uchar cxNumber add arg 1 255
+cxGid add arg 2 rail
+put cxFd rail cxOpen arg
+cxContext rail
+cxRegister a rail
+cxCreateCq q rail
+cxCreateQp q rail
+cxModify rail 1
+n = random cxHello add 49 mul rail 40 3 0
+if ne n 3
+cxFailAt 29 n
+end
+end
+
+fn cxSignal marker uchar to void
+put cxHello 0 marker
+cxExchange 1
+if ne get cxPeer 0 marker
+cxFailAt 30 0
+end
+end
+
+fn cxValue i ulong to f32
+ret f32 add rem i 251 1
+end
+
+fn cxRun a edit CxRank left edit CxQueue right edit CxQueue to void
+factor = f32 add get a rankid 1
+for i ulong get a capacity
+bits = bitcast uint mul cxValue i factor
+s = mapset get a arena mul i 4 4 ulong bits
+end
+cxSignal 0x91
+started = monons
+if ne cxBegin a left right get a capacity 0
+cxFailAt 31 0
+end
+while true
+st = cxProgress a left right
+if lt st 0
+cxFailAt 32 long st
+end
+if eq st 1
+break
+end
+cpurelax
+end
+elapsed = sub monons started
+for i ulong get a capacity
+val = mapget get a arena mul i 4 4
+expected = bitcast uint mul cxValue i 3.0f32
+if ne val ulong expected
+cxFailAt 33 long i
+end
+end
+cxSignal 0xa2
+n = write 2 cxPass 0 len cxPass
+cxPrint ulong get a rankid
+n = write 2 cxElems 0 len cxElems
+cxPrint get a capacity
+n = write 2 cxTime 0 len cxTime
+cxPrint ulong elapsed
+n = write 2 cxNl 0 1
+end
+
+fn main to int
+if ne argcnt 9
+n = write 2 cxUsage 0 len cxUsage
+ret 2
+end
+a = new CxRank 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+left = new CxQueue 0 0 64 0 0 64 64 0 0 0 0 0 0 0 0 0
+right = new CxQueue 0 0 64 0 0 64 64 0 0 0 0 0 0 0 0 0
+cxCheckPage
+put a rankid int cxNumber 1 1
+count = cxNumber 2 div sub ulong 0x7fffffffffffffff 20 8
+put a capacity count
+if eq cxNumber 3 0xffffffff cxNumber 6 0xffffffff
+cxFailAt 2 1
+end
+put a arena cxMem add mul count 8 20
+put cxReply 0 cxMem 4096
+cxHelloPut 0 0x31375043 4
+cxHelloPut 4 ulong get a rankid 4
+cxHelloPut 8 count 8
+cxSetup a left 0 3
+cxSetup a right 1 6
+cxExchange 96
+if ne cxPeerGet 0 4 0x31375043
+cxFailAt 28 3
+end
+if ne cxPeerGet 4 4 ulong sub int 1 get a rankid
+cxFailAt 28 4
+end
+if ne cxPeerGet 8 8 count
+cxFailAt 28 5
+end
+cxJoin a 0
+cxJoin a 1
+cxRun a left right
+ret 0
+end
