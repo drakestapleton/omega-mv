@@ -646,6 +646,11 @@ case "$step" in
   runtime-api)        # omega-mv#594: the Runtime API manifest against the C headers, plus its negative controls.
                       # Host only (gcc for -aux-info), no GPU, no physics checkout.
     make $NOPHYS test-runtime-api ;;
+  arboris-sparse-silicon)
+    sh seed/omega-from-seed.sh
+    OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
+    "$OUT_DIR/caproot-issuer" "$OUT_DIR/sparse-chip" --sparse-silicon
+    ;;
   arboris)
     sh seed/omega-from-seed.sh > "$OUT_DIR/seed.log" 2>&1
     OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"

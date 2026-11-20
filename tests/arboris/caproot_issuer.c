@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -69,9 +70,19 @@ static int exercise(const char *program, RxCapRoot *root, RxCapAdmin *admin) {
 int main(int argc, char **argv) {
     RxCapRoot root;
     RxCapAdmin admin;
-    if (argc != 2 || rx_caproot_start(&root, &admin) != RX_CAP_OK) return 1;
-    int result = exercise(argv[1], &root, &admin);
+    int device = argc == 3 && strcmp(argv[2], "--sparse-silicon") == 0;
+    if ((!device && argc != 2) || rx_caproot_start(&root, &admin) != RX_CAP_OK) return 1;
+    int result;
+    if (device) {
+        RxCapMint mint = {.subject = 42, .resource = GPU_RESOURCE, .rights = RX_RIGHT_EFFECT,
+                          .parent = {UINT32_MAX, 0}, .authority = admin.office};
+        RxCapRef ref;
+        result = rx_capadmin_mint(&admin, &mint, &ref) != RX_CAP_OK ||
+                 check(argv[1], &root, 42, ref, 1, ref.generation, 1);
+    } else {
+        result = exercise(argv[1], &root, &admin);
+    }
     rx_caproot_stop(&root, &admin);
-    if (result == 0) puts("PASS sealed capability root, delegated effect, scope, epoch, generation, expiry and revocation");
+    if (result == 0 && !device) puts("PASS sealed capability root, delegated effect, scope, epoch, generation, expiry and revocation");
     return result;
 }

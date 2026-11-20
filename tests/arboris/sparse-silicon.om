@@ -1,0 +1,277 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Native differential probe. FD3 is the issuer table. Fork before either
+note process opens RM. The producer exits after import, closing all source
+note aliases before the worker validates inputs and publishes its command.
+const probe_n ulong 100000
+const probe_batch ulong 2
+
+fn probe_log label view uchar * v ulong to void
+  digits = new uchar 21 0
+  p = ulong 20
+  put digits p 10
+  while true bound 20
+    p = sub p 1
+    put digits p uchar add 48 rem v 10
+    v = div v 10
+    if eq v 0
+      break
+    end
+  end
+  ignored = write 1 label 0 len label
+  ignored = write 1 digits p sub 21 p
+end
+text ps_stage "nvrm_stage="
+text ps_error "nvrm_error_bits="
+text ps_cpu "cpu_validated_hop_ns="
+text ps_gpu "gpu_validated_hop_ns="
+text ps_words "matching_fp32_words="
+text ps_rc "hop_status="
+
+fn probe_le bytes view uchar * i ulong width ulong to ulong
+  v = ulong 0
+  for j ulong width bound 8
+    v = or v shl ulong get bytes add i j mul j 8
+  end
+  ret v
+end
+
+fn probe_seed i ulong to ulong
+  if eq rem add rem i probe_n div i probe_n 3 0
+    ret 0x3f800000
+  end
+  ret 0
+end
+
+fn probe_fill m view ulong 16 i ulong tok long to bool
+  if eq i 0
+    for j ulong 16
+      if ne mapset tok mul j 8 8 get m j 0
+        ret false
+      end
+    end
+  end
+  if eq i 1
+    if ne mapset tok 0 4 0x41525431 0
+      ret false
+    end
+    if or ne mapset tok 4 4 probe_n 0 ne mapset tok 8 4 probe_n 0
+      ret false
+    end
+    for j ulong add probe_n 1
+      if ne mapset tok add 12 mul j 4 4 mul div j 2 2 0
+        ret false
+      end
+    end
+    off = mul add probe_n 4 4
+    for j ulong probe_n
+      if ne mapset tok add off mul j 4 4 j 0
+        ret false
+      end
+    end
+  end
+  if eq i 2
+    for j ulong probe_n
+      weight = ulong 0x3f000000
+      if ne and j 1 0
+        weight = ulong 0x3f400000
+      end
+      if ne mapset tok mul j 4 4 weight 0
+        ret false
+      end
+    end
+  end
+  if eq i 3
+    for j ulong mul probe_n probe_batch
+      if ne mapset tok mul j 4 4 probe_seed j 0
+        ret false
+      end
+    end
+  end
+  ret true
+end
+
+fn probe_produce m view ulong 16 offsets view ulong 6 sendfd int ackfd int to int
+  if not nvfull
+    ret 10
+  end
+  rec = new uchar 144 0
+  for i ulong 6
+    tok = nvalloc ar_region_bytes m offsets i true
+    if le tok 0
+      ret 11
+    end
+    if not probe_fill m i tok
+      ret 12
+    end
+    if not nvexport tok
+      ret 13
+    end
+    for j ulong 24
+      put rec add mul i 24 j get nvshrec j
+    end
+  end
+  cpufence
+  if ne write sendfd rec 0 144 144
+    ret 14
+  end
+  if ne read ackfd rec 0 1 1
+    ret 15
+  end
+  ret 0
+end
+
+fn probe_import m view ulong 16 offsets view ulong 6 to int
+  fds = new uchar 16 0
+  if ne pipefds fds 0 8 0 0
+    ret 16
+  end
+  if ne pipefds fds 8 8 0 0
+    ret 16
+  end
+  pid = fork
+  if lt pid 0
+    ret 17
+  end
+  if eq pid 0
+    ignored = fclose int probe_le fds 0 4
+    ignored = fclose int probe_le fds 12 4
+    rc = probe_produce m offsets int probe_le fds 4 4 int probe_le fds 8 4
+    if not nvstop
+      rc = int 18
+    end
+    exit rc
+  end
+  ignored = fclose int probe_le fds 4 4
+  ignored = fclose int probe_le fds 8 4
+  records = new uchar 144 0
+  ok = eq read int probe_le fds 0 4 records 0 144 144
+  if ok
+    ok = nvfull
+  end
+  if ok
+    ok = nvchan
+  end
+  if ok
+    ok = ar_map_arena records m get m 12
+  end
+  if ok
+    ok = eq write int probe_le fds 12 4 records 0 1 1
+  end
+  ignored = fclose int probe_le fds 12 4
+  ignored = fclose int probe_le fds 0 4
+  if ne waitpid int pid fds 0 8 0 pid
+    ret 19
+  end
+  if ne probe_le fds 0 4 0
+    ret 20
+  end
+  if not ok
+    ret 21
+  end
+  ret 0
+end
+
+fn probe_compare to int
+  t = new uint 200004 0
+  w = new uint 100000 0
+  state = new uint 400004 0
+  for i ulong len t
+    put t i uint mapget get ar_maps 1 mul i 4 4
+  end
+  for i ulong len w
+    put w i uint mapget get ar_maps 2 mul i 4 4
+  end
+  put state 0 uint probe_batch
+  put state 2 0x3f000000
+  words = mul probe_n probe_batch
+  for i ulong words
+    put state add i 4 uint mapget get ar_maps 3 mul i 4 4
+  end
+  start = monons
+  if ne arboris_relax_step t w state 0
+    ret 30
+  end
+  elapsed = sub monons start
+  probe_log ps_cpu ulong elapsed
+  for i ulong words
+    if ne get state add add words 4 i uint mapget get ar_maps 4 mul i 4 4
+      ret 31
+    end
+  end
+  probe_log ps_words words
+  ret 0
+end
+
+fn probe_run table long h view ulong 2 meta edit ulong 16 to int
+  offsets = new ulong 6 0
+  if ne arboris_plan_sparse meta 0x10000000 4096 offsets 0
+    ret 1
+  end
+  if not caproot_validate table 42 h meta
+    ret 2
+  end
+  rc = probe_import meta offsets
+  if ne rc 0
+    ret rc
+  end
+  if not ar_step_open meta
+    ret 22
+  end
+  start = monons
+  hop = ar_sparse_hop table 42 h meta 0x3f000000 0
+  elapsed = sub monons start
+  probe_log ps_rc hop
+  if ne hop 0
+    ret 23
+  end
+  probe_log ps_gpu ulong elapsed
+  ret probe_compare
+end
+
+fn main to int
+  bytes = new uchar 48 0
+  if ne read 0 bytes 0 48 48
+    ret 3
+  end
+  if ne probe_le bytes 0 8 42
+    ret 4
+  end
+  h = new ulong 2 0
+  put h 0 probe_le bytes 8 8
+  put h 1 probe_le bytes 16 8
+  m = new ulong 16 0
+  put m 0 arboris_sparse_magic
+  put m 1 probe_n
+  put m 2 probe_batch
+  put m 3 probe_n
+  put m 4 1
+  put m 7 probe_le bytes 24 8
+  put m 8 probe_le bytes 32 8
+  table = mapnew int 3 0 22560 1 1
+  if le table 0
+    ret 5
+  end
+  rc = probe_run table h m
+  if ne rc 0
+    probe_log ps_stage ulong get nvstage 0
+    note RM statuses are positive and Linux errors negative.
+    probe_log ps_error and ulong get nverr 0 0xffffffff
+  end
+  if not ar_step_close
+    if eq rc 0
+      rc = int 34
+    end
+  end
+  if not ar_unmap
+    if eq rc 0
+      rc = int 32
+    end
+  end
+  if not nvstop
+    if eq rc 0
+      rc = int 33
+    end
+  end
+  ignored = mapdrop table
+  ret rc
+end

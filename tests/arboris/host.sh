@@ -18,6 +18,9 @@ compile "$out/arena" om/arboris_arena.om tests/arboris_arena_test.om
 "$out/arena"
 compile "$out/native-arena" om/arboris_arena.om gpu/nvidia/native/nvrm/context.om gpu/nvidia/native/share/share.om gpu/nvidia/native/arboris/arena.om tests/arboris/native-arena.om
 "$out/native-arena"
+sh tests/arboris/build-sparse-probe.sh "$out/sparse-packet" tests/arboris/sparse-packet.om
+"$out/sparse-packet"
+sh tests/arboris/build-sparse-probe.sh "$out/sparse-chip"
 compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om tests/arboris_spread_test.om
 "$out/spread"
 compile "$out/gated" om/arboris_arena.om gpu/nvidia/om/numeric/numeric.om om/arboris_gated.om tests/arboris_gated_test.om

@@ -17,6 +17,8 @@ extern "C" {
 uint64_t arboris_plan_arena(uint64_t o_m[16], uint64_t o_budget, uint64_t o_page, uint64_t o_offsets[6]);
 /* export fn arboris_check_csr m view ulong 16 data view uint * to ulong */
 uint64_t arboris_check_csr(const uint64_t o_m[16], const uint32_t *o_data, size_t o_data_len);
+/* export fn arboris_plan_sparse m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong */
+uint64_t arboris_plan_sparse(uint64_t o_m[16], uint64_t o_budget, uint64_t o_page, uint64_t o_offsets[6]);
 /* export fn arboris_load_records r view uint * topo edit uint * weights edit uint * to ulong */
 uint64_t arboris_load_records(const uint32_t *o_r, size_t o_r_len, uint32_t *o_topo, size_t o_topo_len, uint32_t *o_weights, size_t o_weights_len);
 /* export fn arboris_topology_digest topo view uint * weights view uint * digest edit uchar 32 to ulong */
