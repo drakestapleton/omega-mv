@@ -362,6 +362,19 @@ _Static_assert(OMEGA_DT_F32 == 1 && OMEGA_DT_F16 == 2 && OMEGA_DT_BF16 == 3,
                "Omega tensor value dtype tags");
 enum { VALUE_CHUNK_BYTES = 65536 };
 
+/* Compare a scalar value or a one-element tail without rewriting both buffers. */
+static uint32_t canon_bits(OmegaDType dtype, const uint8_t *p) {
+    uint32_t bits;
+    if (dtype == OMEGA_DT_F32) {
+        memcpy(&bits, p, sizeof bits);
+    } else {
+        uint16_t half;
+        memcpy(&half, p, sizeof half);
+        bits = half;
+    }
+    return (uint32_t)tensor_canonical_word((uint64_t)dtype, bits);
+}
+
 /* Components are gathered in native byte order. The value domain is little-endian. */
 static void canonicalize_chunk(OmegaDType dtype, uint8_t *data, size_t bytes) {
     const uint16_t one = 1;
@@ -418,7 +431,9 @@ int omega_tensor_value_equal(const OmegaTensorCtx *ctx, OmegaTensor a, OmegaTens
     for (size_t pos = 0; pos < bytes && same;) {
         size_t count = bytes - pos;
         if (count > VALUE_CHUNK_BYTES) count = VALUE_CHUNK_BYTES;
-        if (memcmp(ba + pos, bb + pos, count)) {
+        if (count == es) {
+            same = canon_bits(xa->info.dtype, ba + pos) == canon_bits(xb->info.dtype, bb + pos);
+        } else if (memcmp(ba + pos, bb + pos, count)) {
             canonicalize_chunk(xa->info.dtype, ba + pos, count);
             canonicalize_chunk(xb->info.dtype, bb + pos, count);
             same = memcmp(ba + pos, bb + pos, count) == 0;
