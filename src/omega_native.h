@@ -349,7 +349,7 @@ const char *omega2_ident_osc_expr(void);
 uint32_t omega2_osc_expr_step(uint64_t *result, uint8_t *o_stack, uint64_t o_look, uint64_t o_operand);
 /* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
 uint32_t omega2_osc_operand_step(uint64_t *result, uint8_t *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
-#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=f89175447a9a8bc9666757c30931f59e8d4d37b14c3ca48408dca0ce56fbb7ea omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=fc8d3b2c4febdf700985133dfdab8453e46acf2d1985d98d33abd6ddbea72667 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_scalar(void);
 /* export fn osc_alu_width t ulong to ulong */
 uint32_t omega2_osc_alu_width(uint64_t *result, uint64_t o_t);
