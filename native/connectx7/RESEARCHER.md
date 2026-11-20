@@ -11,6 +11,7 @@ On each machine unpack the same archive into a user-owned directory. From its ro
 ```sh
 sha256sum -c SHA256SUMS
 ./cx7-host && echo 'PASS device-free fixture'
+./cx7-rank --self-test    # injects one CQ error and must finish with PASS
 getconf PAGESIZE
 ulimit -l
 ibdev2netdev
@@ -37,16 +38,16 @@ peer=spark-peer
 left0=3; right0=3
 left1=3; right1=3
 elements=4097
-log=$(mktemp)
-socat "EXEC:timeout 90 ./run-rank.sh 0 $elements $left0 $right0" \
-      "EXEC:ssh -T -o BatchMode=yes $peer timeout 90 ./cx7-lab/run-rank.sh 1 $elements $left1 $right1" 2>"$log"
-cat "$log"
-grep -q "^CX7 PASS host-pinned FP32 rank=0 elements=$elements elapsed_ns=" "$log" &&
-grep -q "^CX7 PASS host-pinned FP32 rank=1 elements=$elements elapsed_ns=" "$log" &&
+logs=$(mktemp -d)
+socat "SYSTEM:timeout 90 ./run-rank.sh 0 $elements $left0 $right0 2>$logs/rank0" \
+      "SYSTEM:ssh -T -o BatchMode=yes $peer timeout 90 ./cx7-lab/run-rank.sh 1 $elements $left1 $right1 2>$logs/rank1"
+cat "$logs/rank0" "$logs/rank1"
+grep -Eq "^CX7 PASS host-pinned FP32 rank=0 elements=$elements elapsed_ns=[0-9]+$" "$logs/rank0" &&
+grep -Eq "^CX7 PASS host-pinned FP32 rank=1 elements=$elements elapsed_ns=[0-9]+$" "$logs/rank1" &&
 echo 'PASS both ranks'
 ```
 
-Record both rank lines. Each time spans admission through remote acknowledgments. Initialization, final checking and SSH barriers lie outside that interval. The run uses one signalled write in flight per physical rail and reduces in CPU tiles. Use a fresh pair of processes after any timeout or error. Exit stages 10–17 cover context, identity, port, PD and MR setup. Stages 18–22 cover CQ, QP and UAR setup, 23–25 cover INIT/RTR/RTS and 26–30 cover peer exchange. Stage 32 signals a CQ failure and 33 reports the first incorrect element. Report the stage and signed kernel result or offending index. Permission, memlock, ABI, GID and path-MTU problems can surface before posting.
+Record both rank lines. Each time spans admission through remote acknowledgments. Initialization, final checking and SSH barriers lie outside that interval. The run uses one signalled write in flight per physical rail and reduces in CPU tiles. Use a fresh pair of processes after any timeout or error. Exit stages 10–17 cover context, identity, port, PD and MR setup. Stages 18–22 cover CQ, QP and UAR setup, 23–25 cover INIT/RTR/RTS and 26–30 cover peer exchange. Exit 32 reports the rail, opcode, format, WQE counter, SOP/QPN and error syndromes for a failed CQE and 33 reports the first incorrect element. Report the stage and signed kernel result or offending index. Permission, memlock, ABI, GID and path-MTU problems can surface before posting.
 
 ## Evidence to return
 
