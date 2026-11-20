@@ -7,6 +7,16 @@ omc=$(realpath "${OMC:-../../../../seed/out/omc}")
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"
+# The sampler can end immediately after the final identifier.
+printf 'note multiply the arguments\nfn calc a ulong b ulong to ulong' >boundary-prompt
+printf 'note multiply the arguments\nfn calc x ulong y ulong to ulong' >boundary-normalized
+"$bin/normalize" boundary-prompt | cmp - boundary-normalized
+for newline in no yes; do
+  printf 's = mul x y\nret mul s s\nend' >boundary-body
+  printf 's = mul a b\nret mul s s\nend' >boundary-expected
+  if [[ $newline == yes ]]; then printf '\n' >>boundary-body; printf '\n' >>boundary-expected; fi
+  "$bin/normalize" boundary-prompt boundary-body | cmp - boundary-expected
+done
 # Exercise real policy decisions using saved generator proposals.
 cp "$src/example/prompt.om" prompt
 cp "$src/example/example.om" first
