@@ -1,0 +1,337 @@
+note SPDX-License-Identifier: Apache-2.0
+note Parse bounded loop headers. The maximum spelling after "for" is seven
+note tokens: NAME in - INT .. - INT. used identifies the first unconsumed
+note token even on refusal. Partial results mirror the source-order AST writes.
+note bridge c-type imprec OscImportParse
+note bridge c-type forrange OscForRange
+note bridge c-define OSC_FOR_WINDOW 7
+note bridge c-define OSC_FOR_NAME 1
+note bridge c-define OSC_FOR_IN 2
+note bridge c-define OSC_FOR_INT 3
+note bridge c-define OSC_FOR_OVERFLOW 4
+note bridge c-define OSC_FOR_DOTS 5
+note bridge c-define OSC_FOR_TRIPS 6
+note bridge c-define OSC_BOUND_KEYWORD 1
+note bridge c-define OSC_BOUND_INT 2
+note bridge c-define OSC_BOUND_RANGE 3
+note bridge c-define OSC_IMPORT_POSITION 1
+note bridge c-define OSC_IMPORT_NAME 2
+note bridge c-define OSC_IMPORT_FULL 3
+note bridge c-define OSC_IMPORT_DUP 4
+note bridge c-define OSC_IMPORT_SEMI 5
+note bridge c-type stmtplan OscStmtPlan
+note bridge c-define OSC_ST_CALL 70
+note bridge c-define OSC_ST_EXPR_A 71
+note bridge c-define OSC_ST_EXPR_B 72
+note bridge c-define OSC_ST_BORROW_A 73
+note bridge c-define OSC_ST_INDEX 74
+note bridge c-define OSC_ST_STORE 75
+om2
+
+layout forrange 24
+field used uint at 0 little
+field lower_at uint at 4 little
+field low ulong at 8 little
+field high ulong at 16 little
+end
+
+note The longest name-led statement is a subscripted store: index, ], =,
+note value, ;. Each step is punctuation to consume or a child AST operation.
+layout stmtplan 32
+field skip uint at 0 little
+field steps uint at 4 little
+field actions uint 5 at 8 little
+field nodekind uint at 28 little
+end
+
+layout imprec 20
+field started uint at 0 little
+field stride uint at 4 little
+field nameoff uint at 8 little
+field match uint at 12 little
+field nextkind uint at 16 little
+end
+
+const NAME ushort 1
+const INTEGER ushort 2
+const BOUND ushort 12
+const IN ushort 14
+const SEMI ushort 37
+const DOTDOT ushort 40
+const MINUS ushort 43
+const SIGN ulong 0x8000000000000000
+
+const OSC_FOR_NAME ulong 1
+const OSC_FOR_IN ulong 2
+const OSC_FOR_INT ulong 3
+const OSC_FOR_OVERFLOW ulong 4
+const OSC_FOR_DOTS ulong 5
+const OSC_FOR_TRIPS ulong 6
+
+fn range_end kinds view ushort 7 values view ulong 7 range edit forrange upper ulong to ulong
+pos = ulong get range used
+negative = eq get kinds pos MINUS
+if negative
+  pos = add pos 1
+  put range used uint pos
+end
+if ne get kinds pos INTEGER
+  ret OSC_FOR_INT
+end
+v = get values pos
+limit = sub SIGN 1
+if negative
+  limit = SIGN
+end
+if gt v limit
+  ret OSC_FOR_OVERFLOW
+end
+if negative
+  v = sub ulong 0 v
+end
+if ne upper 0
+  put range high v
+else
+  put range low v
+end
+put range used uint add pos 1
+ret 0
+end
+
+export fn osc_for_range kinds view ushort 7 values view ulong 7 limit ulong range edit forrange to ulong
+put range used 0
+put range lower_at 0
+put range low 0
+put range high 0
+if ne get kinds 0 NAME
+  ret OSC_FOR_NAME
+end
+put range used 1
+if ne get kinds 1 IN
+  ret OSC_FOR_IN
+end
+put range used 2
+put range lower_at 2
+status = range_end kinds values range 0
+if ne status 0
+  ret status
+end
+pos = ulong get range used
+if ne get kinds pos DOTDOT
+  ret OSC_FOR_DOTS
+end
+put range used uint add pos 1
+status = range_end kinds values range 1
+if ne status 0
+  ret status
+end
+lo = get range low
+hi = get range high
+note Flipping the sign bit orders the signed ends. Subtract in ulong so that
+note the full INT64_MIN to INT64_MAX distance is defined before the limit test.
+if or lt xor hi SIGN xor lo SIGN gt sub hi lo limit
+  ret OSC_FOR_TRIPS
+end
+ret 0
+end
+
+note Both while and arena require "bound INT".
+const OSC_BOUND_KEYWORD ulong 1
+const OSC_BOUND_INT ulong 2
+const OSC_BOUND_RANGE ulong 3
+
+export fn osc_read_bound keyword ulong kind ulong value ulong limit ulong to ulong
+if ne keyword ulong BOUND
+  ret OSC_BOUND_KEYWORD
+end
+if ne kind ulong INTEGER
+  ret OSC_BOUND_INT
+end
+if or eq value 0 gt value limit
+  ret OSC_BOUND_RANGE
+end
+ret 0
+end
+
+fn same_import table view uchar * old ulong dest ulong width ulong to bool
+j = ulong 0
+while lt j width
+  if ne get table add old j get table add dest j
+    ret false
+  end
+  j = add j 1
+end
+ret eq get table add old width 0
+end
+
+fn record_import spelling view uchar * table edit uchar * dest ulong to ulong
+width = len spelling
+capacity = sub len table dest
+if ge width capacity
+  width = sub capacity 1
+end
+i = ulong 0
+while lt i width
+  put table add dest i get spelling i
+  i = add i 1
+end
+put table add dest width 0
+ret width
+end
+
+note Match and record "import NAME ;". C owns the table and supplies its
+note byte layout. Installing the candidate name before duplicate/semicolon
+note checks preserves the visible partial declaration on either refusal.
+const OSC_IMPORT_POSITION ulong 1
+const OSC_IMPORT_NAME ulong 2
+const OSC_IMPORT_FULL ulong 3
+const OSC_IMPORT_DUP ulong 4
+const OSC_IMPORT_SEMI ulong 5
+
+export fn osc_read_import state edit imprec kind ulong spelling view uchar * table edit uchar * to ulong
+put state match 0
+stride = ulong get state stride
+nameoff = ulong get state nameoff
+if ne get state started 0
+  ret OSC_IMPORT_POSITION
+end
+if ne kind ulong NAME
+  ret OSC_IMPORT_NAME
+end
+note The caller passes populated entries plus one writable slot, or an empty
+note view when full. Each stored name is terminated within its own record.
+if eq len table 0
+  ret OSC_IMPORT_FULL
+end
+slot = sub len table stride
+dest = add slot nameoff
+width = record_import spelling table dest
+base = ulong 0
+while lt base slot
+  if same_import table add base nameoff dest width
+    put state match uint div base stride
+    ret OSC_IMPORT_DUP
+  end
+  base = add base stride
+end
+if ne get state nextkind uint SEMI
+  ret OSC_IMPORT_SEMI
+end
+ret 0
+end
+
+note Render a contract one spelling at a time. Parentheses suppress their
+note adjacent space. Refusal leaves the already formatted prefix intact.
+export fn osc_clause_word dst edit uchar 256 used ulong prev ulong kind ulong word view uchar * to ulong
+space = and ne used 0 and ne prev 30 ne kind 31
+endpos = add used len word
+if space
+  endpos = add endpos 1
+end
+if ge endpos len dst
+  ret len dst
+end
+if space
+  put dst used 32
+  used = add used 1
+end
+i = ulong 0
+while lt i len word
+  put dst add used i get word i
+  i = add i 1
+end
+put dst endpos 0
+ret endpos
+end
+
+const LPAREN uint 30
+const RPAREN uint 31
+const LBRACK uint 34
+const RBRACK uint 35
+const ASSIGN uint 41
+const AMP uint 47
+const DOT uint 63
+const RETURN uint 15
+const RESERVED uint 3
+const CALL_CHILD uint 70
+const EXPR_A uint 71
+const EXPR_B uint 72
+const BORROW_A uint 73
+const INDEX_CHILD uint 74
+const STORE_VALUE uint 75
+note Node IDs come from OscNodeKind, checked in the parser bridge.
+const N_ASSIGN uint 8
+const N_STORE uint 9
+const N_RETURN uint 13
+const N_CALLSTMT uint 14
+const N_FSTORE uint 26
+const N_PFREE uint 31
+
+fn is_free word view uchar * to bool
+if ne len word 4
+  ret false
+end
+ret and eq get word 0 102 and eq get word 1 114 and eq get word 2 101 eq get word 3 101
+end
+
+fn end_statement plan edit stmtplan count ulong to ulong
+put plan actions count uint SEMI
+put plan steps uint add count 1
+ret 0
+end
+
+fn rhs_action kind ulong to uint
+if eq uint kind AMP
+  ret BORROW_A
+end
+ret EXPR_A
+end
+
+export fn osc_statement_plan plan edit stmtplan kind ulong nextkind ulong third ulong spelling view uchar * to ulong
+if eq uint kind RETURN
+  put plan nodekind N_RETURN
+  put plan skip 1
+  if eq uint nextkind uint SEMI
+    ret end_statement plan 0
+  end
+  put plan actions 0 rhs_action nextkind
+  ret end_statement plan 1
+end
+if eq uint nextkind LPAREN
+  put plan nodekind N_CALLSTMT
+  put plan skip 0
+  put plan actions 0 CALL_CHILD
+  ret end_statement plan 1
+end
+if eq uint nextkind DOT
+  if and eq uint third RESERVED is_free spelling
+    put plan nodekind N_PFREE
+    put plan skip 3
+    put plan actions 0 LPAREN
+    put plan actions 1 EXPR_A
+    put plan actions 2 RPAREN
+    ret end_statement plan 3
+  end
+  put plan nodekind N_FSTORE
+  put plan skip 0
+  put plan actions 0 ASSIGN
+  put plan actions 1 EXPR_B
+  ret end_statement plan 2
+end
+if eq uint nextkind ASSIGN
+  put plan nodekind N_ASSIGN
+  put plan skip 2
+  put plan actions 0 rhs_action third
+  ret end_statement plan 1
+end
+if eq uint nextkind LBRACK
+  put plan nodekind N_STORE
+  put plan skip 2
+  put plan actions 0 INDEX_CHILD
+  put plan actions 1 RBRACK
+  put plan actions 2 ASSIGN
+  put plan actions 3 STORE_VALUE
+  ret end_statement plan 4
+end
+ret 1
+end
