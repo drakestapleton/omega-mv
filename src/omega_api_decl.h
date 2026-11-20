@@ -291,6 +291,19 @@ OMBR_ASSERT(offsetof(OscOperandState, pending) == 8, "layout opstate field pendi
 uint64_t osc_expr_step(OscExprStack *o_stack, uint64_t o_look, uint64_t o_operand);
 /* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
 uint64_t osc_operand_step(OscOperandState *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
+#define OSC_INFER_DONE 0
+#define OSC_INFER_CHECK 1
+#define OSC_INFER_CAST_LITERAL 2
+#define OSC_INFER_COMPARE_LITERALS 3
+#define OSC_INFER_COMPARE_BOOL 4
+#define OSC_INFER_ARITH_BOOL 5
+#define OSC_INFER_UNARY_TYPE 6
+#define OSC_INFER_CAST_TYPE 7
+#define OSC_INFER_SHIFT_TYPE 8
+#define OSC_INFER_AMOUNT_TYPE 9
+#define OSC_INFER_SHIFT_RANGE 10
+#define OSC_INFER_ARITH_TYPE 11
+#define OSC_INFER_ZERO_DIVISOR 12
 typedef struct {
     uint64_t v[6];
     uint8_t k[6];
@@ -308,6 +321,27 @@ OMBR_ASSERT(offsetof(OscContractBindings, nk) == 56, "layout contract field nk")
 OMBR_ASSERT(offsetof(OscContractBindings, res_sym) == 60, "layout contract field res_sym");
 OMBR_ASSERT(offsetof(OscContractBindings, known) == 64, "layout contract field known");
 OMBR_ASSERT(offsetof(OscContractBindings, result) == 72, "layout contract field result");
+typedef struct {
+    uint64_t root;
+    uint64_t want;
+    uint64_t phase;
+    uint64_t first;
+    uint64_t second;
+    uint64_t literal2;
+    uint64_t optype;
+    uint64_t site;
+    uint64_t context;
+} OscInference;
+OMBR_ASSERT(sizeof(OscInference) == 72, "layout infer size");
+OMBR_ASSERT(offsetof(OscInference, root) == 0, "layout infer field root");
+OMBR_ASSERT(offsetof(OscInference, want) == 8, "layout infer field want");
+OMBR_ASSERT(offsetof(OscInference, phase) == 16, "layout infer field phase");
+OMBR_ASSERT(offsetof(OscInference, first) == 24, "layout infer field first");
+OMBR_ASSERT(offsetof(OscInference, second) == 32, "layout infer field second");
+OMBR_ASSERT(offsetof(OscInference, literal2) == 40, "layout infer field literal2");
+OMBR_ASSERT(offsetof(OscInference, optype) == 48, "layout infer field optype");
+OMBR_ASSERT(offsetof(OscInference, site) == 56, "layout infer field site");
+OMBR_ASSERT(offsetof(OscInference, context) == 64, "layout infer field context");
 /* export fn osc_alu_width t ulong to ulong */
 uint64_t osc_alu_width(uint64_t o_t);
 /* export fn osc_alu_canon t ulong v ulong to ulong */
@@ -332,6 +366,8 @@ uint64_t osc_contract_value(const uint8_t *o_nodes, size_t o_nodes_len, const Os
 uint64_t osc_constant_tree(const uint8_t *o_nodes, size_t o_nodes_len, uint64_t o_id, uint64_t o_require_literals, uint64_t *o_pending, size_t o_pending_len);
 /* export fn osc_fold_tree nodes edit uchar * typ ulong stack edit ulong * report edit ulong 3 to ulong */
 uint64_t osc_fold_tree(uint8_t *o_nodes, size_t o_nodes_len, uint64_t o_typ, uint64_t *o_stack, size_t o_stack_len, uint64_t o_report[3]);
+/* export fn osc_infer_step nodes edit uchar * stack edit ulong * frame edit infer checked ulong to ulong */
+uint64_t osc_infer_step(uint8_t *o_nodes, size_t o_nodes_len, uint64_t *o_stack, size_t o_stack_len, OscInference *o_frame, uint64_t o_checked);
 #define OSC_A64_ERR_UNUSED_SHIFT 1
 #define OSC_A64_ERR_UNUSED_COND 2
 #define OSC_A64_ERR_UNUSED_IMM2 3

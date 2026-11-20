@@ -369,3 +369,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Migrated OSC operand recognition, prefix and cast parsing, scalar arithmetic and traps, constant folding and contract arithmetic, scalar opcode selection, and AArch64 instruction fields to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Migrated OSC name-led and return statements, loop bounds, import declarations, and contract text formatting to seeded Omega and checked their ASTs and diagnostics against the historical parser. |
 | Codex (under Drake Stapleton's direction) | Converted the OSC constant-expression walk, integer folding and contract expression evaluation to seeded Omega. |
+| Codex (under Drake Stapleton's direction) | Migrated scalar operator type inference, operand contexts and checked refusal ordering into seeded Omega. |

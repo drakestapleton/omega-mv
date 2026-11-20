@@ -551,8 +551,6 @@ static void snap_restore(C *c, const Snap *s)
 }
 
 /* ------------------------------------------------------------ integer helpers */
-static int is_shift(int op) { return op == OT_SHL || op == OT_SHR; }
-static int is_cmpop(int op) { return op == OT_EQ || op == OT_NE || op == OT_LT || op == OT_LE || op == OT_GT || op == OT_GE; }
 
 /* The expression walkers read parsed OSC nodes directly. Guard every ABI
  * field they consume; diagnostic strings continue to use the host API. */
@@ -964,11 +962,56 @@ static const OscField *chk_field(C *c, OscNode *n, int s)
     return fd;
 }
 
+/* Omega chooses the operand order, type context, result and refusal site. */
+static int check_operator(C *c, int i, OscScalar want)
+{
+    OscInference frame = {.root = (uint64_t)i, .want = want};
+    int checked = 0;
+    uint64_t action;
+    do {
+        action = osc_infer_step((uint8_t *)c->ast->nodes, c->ast->nnodes * sizeof(OscNode),
+                                c->expr_work, c->expr_words, &frame, (uint64_t)checked);
+        if (action == OSC_INFER_CHECK) {
+            checked = chk(c, (int)frame.site, (OscScalar)frame.context);
+            if (checked < 0) return -1;
+        }
+    } while (action == OSC_INFER_CHECK);
+
+    OscNode *at = NODE(frame.site);
+    OscScalar t = (OscScalar)frame.optype;
+    char msg[320];
+    switch (action) {
+    case OSC_INFER_DONE: return (int)frame.context;
+    case OSC_INFER_CAST_LITERAL:
+        osc_diag_set(c->d, OSC_DIAG_AMBIGUOUS_WIDTH, at->line, at->col, c->sobj, 0, NULL,
+                     "literal as 'as' source", "the source of 'as' must not be a bare literal (ambiguous width)");
+        return -1;
+    case OSC_INFER_COMPARE_LITERALS:
+        osc_diag_set(c->d, OSC_DIAG_AMBIGUOUS_WIDTH, at->line, at->col, c->sobj, 0, NULL,
+                     "literal without type context", "comparison of two literals (ambiguous width)");
+        return -1;
+    case OSC_INFER_COMPARE_BOOL: return tmismatch(c, at, "bool", "integer literal compared with bool");
+    case OSC_INFER_ARITH_BOOL: return tmismatch(c, at, "bool", "arithmetic on bool");
+    case OSC_INFER_UNARY_TYPE: return tmismatch(c, at, tname(t), "'-' and '~' need an integer operand");
+    case OSC_INFER_CAST_TYPE:
+        snprintf(msg, sizeof msg, "'as' converts between integer types only (%s as %s)", tname(t), tname(at->ty.s));
+        return tmismatch(c, at, tname(t), msg);
+    case OSC_INFER_SHIFT_TYPE: return tmismatch(c, at, tname(t), "shift of a non-integer");
+    case OSC_INFER_AMOUNT_TYPE: return tmismatch(c, at, tname(t), "shift amount must be an integer");
+    case OSC_INFER_SHIFT_RANGE:
+        snprintf(msg, sizeof msg, "constant shift amount outside 0..%u for %s", osc_scalar_width(t) - 1, tname(t));
+        return ovf(c, at, "literal shift >= width", msg);
+    case OSC_INFER_ARITH_TYPE: return tmismatch(c, at, tname(t), "arithmetic needs integer operands");
+    case OSC_INFER_ZERO_DIVISOR: return ovf(c, at, "literal zero divisor", "division by a constant zero");
+    default: return tmismatch(c, at, NULL, "unexpected operator inference result");
+    }
+}
+
 static int chk(C *c, int i, OscScalar want)
 {
     OscNode *n = NODE(i);
     char msg[320];
-    if (ctxfree(c, i) && !want) {
+    if (!want && ctxfree(c, i)) {
         osc_diag_set(c->d, OSC_DIAG_AMBIGUOUS_WIDTH, n->line, n->col, c->sobj, 0, NULL, "literal without type context",
                      "integer literal has no type from context (ambiguous width)");
         return -1;
@@ -1089,113 +1132,10 @@ static int chk(C *c, int i, OscScalar want)
     }
     case ON_BORROW:
         return tmismatch(c, n, NULL, "a borrow is not a value here");
-    case ON_UN: {
-        if (n->op == OT_BANG) {
-            if (chk(c, n->a, OSC_T_BOOL) < 0) return -1;
-            t = OSC_T_BOOL;
-            break;
-        }
-        int r = chk(c, n->a, ctxfree(c, n->a) ? want : 0);
-        if (r < 0) return -1;
-        t = (OscScalar)r;
-        if (!osc_scalar_is_int(t)) return tmismatch(c, n, tname(t), "'-' and '~' need an integer operand");
-        break;
-    }
-    case ON_CAST: {
-        if (ctxfree(c, n->a)) {
-            osc_diag_set(c->d, OSC_DIAG_AMBIGUOUS_WIDTH, NODE(n->a)->line, NODE(n->a)->col, c->sobj, 0, NULL,
-                         "literal as 'as' source", "the source of 'as' must not be a bare literal (ambiguous width)");
-            return -1;
-        }
-        int r = chk(c, n->a, 0);
-        if (r < 0) return -1;
-        if (!osc_scalar_is_int((OscScalar)r) || !osc_scalar_is_int(n->ty.s)) {
-            snprintf(msg, sizeof msg, "'as' converts between integer types only (%s as %s)", tname((OscScalar)r),
-                     tname(n->ty.s));
-            return tmismatch(c, n, tname((OscScalar)r), msg);
-        }
-        t = n->ty.s;
-        break;
-    }
-    case ON_BIN: {
-        int op = n->op;
-        if (op == OT_ANDAND || op == OT_OROR) {
-            if (chk(c, n->a, OSC_T_BOOL) < 0 || chk(c, n->b, OSC_T_BOOL) < 0) return -1;
-            t = OSC_T_BOOL;
-            break;
-        }
-        if (is_cmpop(op)) {
-            OscScalar T;
-            if (ctxfree(c, n->a) && ctxfree(c, n->b)) {
-                osc_diag_set(c->d, OSC_DIAG_AMBIGUOUS_WIDTH, n->line, n->col, c->sobj, 0, NULL,
-                             "literal without type context", "comparison of two literals (ambiguous width)");
-                return -1;
-            }
-            if (ctxfree(c, n->a)) {
-                int r = chk(c, n->b, 0);
-                if (r < 0) return -1;
-                T = (OscScalar)r;
-                if (T == OSC_T_BOOL) return tmismatch(c, NODE(n->a), "bool", "integer literal compared with bool");
-                if (chk(c, n->a, T) < 0) return -1;
-            } else {
-                int r = chk(c, n->a, 0);
-                if (r < 0) return -1;
-                T = (OscScalar)r;
-                if (T == OSC_T_BOOL && ctxfree(c, n->b))
-                    return tmismatch(c, NODE(n->b), "bool", "integer literal compared with bool");
-                if (chk(c, n->b, T) < 0) return -1;
-            }
-            n->flag = (uint8_t)T; /* operand type for lowering */
-            t = OSC_T_BOOL;
-            break;
-        }
-        if (is_shift(op)) {
-            int r = chk(c, n->a, ctxfree(c, n->a) ? want : 0);
-            if (r < 0) return -1;
-            OscScalar T = (OscScalar)r;
-            if (!osc_scalar_is_int(T)) return tmismatch(c, n, tname(T), "shift of a non-integer");
-            int ra;
-            if (ctxfree(c, n->b)) ra = chk(c, n->b, T);
-            else ra = chk(c, n->b, 0);
-            if (ra < 0) return -1;
-            if (!osc_scalar_is_int((OscScalar)ra)) return tmismatch(c, NODE(n->b), tname((OscScalar)ra), "shift amount must be an integer");
-            const OscNode *bn = NODE(n->b);
-            if (bn->is_const) {
-                unsigned w = osc_scalar_width(T);
-                int neg = osc_scalar_signed((OscScalar)ra) && (int64_t)bn->cval < 0;
-                if (neg || bn->cval >= w) {
-                    snprintf(msg, sizeof msg, "constant shift amount outside 0..%u for %s", w - 1, tname(T));
-                    return ovf(c, bn, "literal shift >= width", msg);
-                }
-            }
-            t = T;
-            break;
-        }
-        /* arithmetic / bitwise */
-        OscScalar T;
-        if (ctxfree(c, n->a) && ctxfree(c, n->b)) {
-            /* only reachable with want (else ambiguous above) and non-constant leaves */
-            int r = chk(c, n->a, want);
-            if (r < 0) return -1;
-            T = (OscScalar)r;
-            if (chk(c, n->b, T) < 0) return -1;
-        } else if (ctxfree(c, n->a)) {
-            int r = chk(c, n->b, 0);
-            if (r < 0) return -1;
-            T = (OscScalar)r;
-            if (T == OSC_T_BOOL) return tmismatch(c, NODE(n->b), "bool", "arithmetic on bool");
-            if (chk(c, n->a, T) < 0) return -1;
-        } else {
-            int r = chk(c, n->a, 0);
-            if (r < 0) return -1;
-            T = (OscScalar)r;
-            if (T == OSC_T_BOOL) return tmismatch(c, NODE(n->a), "bool", "arithmetic on bool");
-            if (chk(c, n->b, T) < 0) return -1;
-        }
-        if (!osc_scalar_is_int(T)) return tmismatch(c, n, tname(T), "arithmetic needs integer operands");
-        if ((op == OT_SLASH || op == OT_PERCENT) && NODE(n->b)->is_const && NODE(n->b)->cval == 0)
-            return ovf(c, NODE(n->b), "literal zero divisor", "division by a constant zero");
-        t = T;
+    case ON_UN: case ON_CAST: case ON_BIN: {
+        int result = check_operator(c, i, want);
+        if (result < 0) return -1;
+        t = (OscScalar)result;
         break;
     }
     case ON_PALLOC: /* OSC-3 item 2 */

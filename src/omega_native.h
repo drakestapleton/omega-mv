@@ -225,7 +225,7 @@ const char *omega2_ident_osc_expr(void);
 uint32_t omega2_osc_expr_step(uint64_t *result, uint8_t *o_stack, uint64_t o_look, uint64_t o_operand);
 /* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
 uint32_t omega2_osc_operand_step(uint64_t *result, uint8_t *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
-#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=fc8d3b2c4febdf700985133dfdab8453e46acf2d1985d98d33abd6ddbea72667 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=28238165ae668bbf8493bc4f27ca69af1c8cccb9ddd7d47a0889f288d0e7dc73 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_scalar(void);
 /* export fn osc_alu_width t ulong to ulong */
 uint32_t omega2_osc_alu_width(uint64_t *result, uint64_t o_t);
@@ -251,6 +251,8 @@ uint32_t omega2_osc_contract_value(uint64_t *result, const uint8_t *o_nodes, uin
 uint32_t omega2_osc_constant_tree(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t o_id, uint64_t o_require_literals, uint64_t *o_pending, uint64_t o_pending_len);
 /* export fn osc_fold_tree nodes edit uchar * typ ulong stack edit ulong * report edit ulong 3 to ulong */
 uint32_t omega2_osc_fold_tree(uint64_t *result, uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t o_typ, uint64_t *o_stack, uint64_t o_stack_len, uint64_t *o_report, uint64_t o_report_len);
+/* export fn osc_infer_step nodes edit uchar * stack edit ulong * frame edit infer checked ulong to ulong */
+uint32_t omega2_osc_infer_step(uint64_t *result, uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t *o_stack, uint64_t o_stack_len, uint8_t *o_frame, uint64_t o_checked);
 #define OMEGA2_IDENT_osc_a64_fields "omega-ident 1 unit=osc_a64_fields abi=2 profile=OM-2 src=9611ed84cd164f070399a77dcae62086f741201bcc972d969f912b21ce8824b4 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_a64_fields(void);
 /* export fn osc_a64_pack_fields form ulong base ulong f view a64field to ulong */
