@@ -27,6 +27,7 @@
 
 #include "sha256.h"
 #include "omega_native.h"
+#include "omega_api_decl.h"
 
 typedef struct {
     uint64_t   gen;
@@ -357,17 +358,27 @@ static void put_u64(sha256_ctx *h, uint64_t v) {
     sha256_update(h, b, 8);
 }
 
-/* Canonical element bits: every NaN becomes the canonical quiet NaN. */
-static uint32_t canon_bits(OmegaDType dt, const uint8_t *p) {
-    if (dt == OMEGA_DT_F32) {
-        uint32_t u;
-        memcpy(&u, p, 4);
-        return ((u & 0x7f800000U) == 0x7f800000U && (u & 0x007fffffU)) ? 0x7fc00000U : u;
+_Static_assert(OMEGA_DT_F32 == 1 && OMEGA_DT_F16 == 2 && OMEGA_DT_BF16 == 3,
+               "Omega tensor value dtype tags");
+enum { VALUE_CHUNK_BYTES = 65536 };
+
+/* Compare a scalar value or a one-element tail without rewriting both buffers. */
+static uint32_t canon_bits(OmegaDType dtype, const uint8_t *p) {
+    uint32_t bits;
+    if (dtype == OMEGA_DT_F32) {
+        memcpy(&bits, p, sizeof bits);
+    } else {
+        uint16_t half;
+        memcpy(&half, p, sizeof half);
+        bits = half;
     }
-    uint16_t h;
-    memcpy(&h, p, 2);
-    if (dt == OMEGA_DT_F16) return ((h & 0x7c00U) == 0x7c00U && (h & 0x03ffU)) ? 0x7e00U : h;
-    return ((h & 0x7f80U) == 0x7f80U && (h & 0x007fU)) ? 0x7fc0U : h;
+    return (uint32_t)tensor_canonical_word((uint64_t)dtype, bits);
+}
+
+/* Components are gathered in native byte order. The value domain is little-endian. */
+static void canonicalize_chunk(OmegaDType dtype, uint8_t *data, size_t bytes) {
+    const uint16_t one = 1;
+    tensor_value_bytes(data, bytes, (uint64_t)dtype, *(const uint8_t *)&one);
 }
 
 int omega_tensor_value_id(const OmegaTensorCtx *ctx, OmegaTensor t, uint8_t id[32]) {
@@ -386,10 +397,13 @@ int omega_tensor_value_id(const OmegaTensorCtx *ctx, OmegaTensor t, uint8_t id[3
     put_u64(&h, (uint64_t)x->info.dtype);
     put_u64(&h, x->info.rank);
     for (uint32_t d = 0; d < x->info.rank; d++) put_u64(&h, x->info.shape[d]);
-    for (uint64_t e = 0; e < x->info.elements; e++) {
-        uint32_t c = canon_bits(x->info.dtype, buf + e * es);
-        uint8_t b[4] = {(uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16), (uint8_t)(c >> 24)};
-        sha256_update(&h, b, es);
+    size_t bytes = (size_t)x->info.elements * es;
+    for (size_t pos = 0; pos < bytes;) {
+        size_t count = bytes - pos;
+        if (count > VALUE_CHUNK_BYTES) count = VALUE_CHUNK_BYTES;
+        canonicalize_chunk(x->info.dtype, buf + pos, count);
+        sha256_update(&h, buf + pos, count);
+        pos += count;
     }
     sha256_final(&h, id);
     free(buf);
@@ -414,8 +428,18 @@ int omega_tensor_value_equal(const OmegaTensorCtx *ctx, OmegaTensor a, OmegaTens
     gather(sa, &xa->info, ba);
     gather(sb, &xb->info, bb);
     bool same = true;
-    for (uint64_t e = 0; e < xa->info.elements && same; e++)
-        same = canon_bits(xa->info.dtype, ba + e * es) == canon_bits(xb->info.dtype, bb + e * es);
+    for (size_t pos = 0; pos < bytes && same;) {
+        size_t count = bytes - pos;
+        if (count > VALUE_CHUNK_BYTES) count = VALUE_CHUNK_BYTES;
+        if (count == es) {
+            same = canon_bits(xa->info.dtype, ba + pos) == canon_bits(xb->info.dtype, bb + pos);
+        } else if (memcmp(ba + pos, bb + pos, count)) {
+            canonicalize_chunk(xa->info.dtype, ba + pos, count);
+            canonicalize_chunk(xb->info.dtype, bb + pos, count);
+            same = memcmp(ba + pos, bb + pos, count) == 0;
+        }
+        pos += count;
+    }
     free(ba);
     free(bb);
     *eq = same;
