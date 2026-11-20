@@ -166,6 +166,10 @@ uint64_t rx_sr_why_of(const uint64_t o_counts[10]);
 uint64_t rx_fus_word64(const uint8_t o_d[8]);
 /* export fn rx_fus_eligible_kind k ulong to ulong */
 uint64_t rx_fus_eligible_kind(uint64_t o_k);
+#define OSC_LITERAL_MALFORMED 1
+#define OSC_LITERAL_OVERFLOW 2
+/* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
+uint64_t osc_parse_literal(const uint8_t *o_spelling, size_t o_spelling_len, uint64_t o_value[1]);
 #ifdef __cplusplus
 }
 #endif
