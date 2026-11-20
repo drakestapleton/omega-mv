@@ -30,10 +30,10 @@ $(TRAIN_DIR)/test_train_asan: tests/train/test_train.c $(TRAIN_SRCS) $(TRAIN_HDR
 
 train-purity:
 	@bad=$$(grep -HE '^[[:space:]]*#[[:space:]]*include' src/train/*.c src/train/*.h | \
-		grep -vE '^src/train/tg_sgd\.c:#[[:space:]]*include[[:space:]]+"omega_api_decl\.h"$$' | \
+		grep -vE '^src/train/tg_(sgd|store)\.c:#[[:space:]]*include[[:space:]]+"omega_api_decl\.h"$$' | \
 		grep -vE '#[[:space:]]*include[[:space:]]+(<[a-z/]+\.h>|"sha256\.h"|"train/tg_[a-z]+\.h")' || true); \
 	if [ -n "$$bad" ]; then echo "train-purity: FAIL, unexpected includes:"; echo "$$bad"; exit 1; fi; \
-	echo "train-purity: src/train depends only on libc, sha256, the seeded SGD binding and itself"
+	echo "train-purity: src/train depends only on libc, sha256, the seeded SGD and generation bindings and itself"
 
 test-train: train-purity $(TRAIN_DIR)/test_train $(TRAIN_DIR)/test_train_asan
 	./$(TRAIN_DIR)/test_train $(TRAIN_DIR)/scratch > $(TRAIN_DIR)/plain.log 2>&1; rc=$$?; \

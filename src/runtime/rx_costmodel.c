@@ -22,6 +22,7 @@
  */
 #include "runtime/rx_costmodel.h"
 #include "omega_native.h"
+#include "omega_api_decl.h"
 #include "sha256.h"
 
 #include <math.h>
@@ -427,61 +428,32 @@ void rx_cm_charge(RxCostModel *m, uint64_t work_ps, uint64_t explore_ps) {
 
 /* ---- canonical bytes ---- */
 
-#define MAGIC   0x4d43474fu   /* "OGCM" little-endian */
-/* VERSION binds the feature basis and the cell layout. RX_CM_CELLS already
- * includes RX_CM_OPS, so a new operation family changes the blob length and
- * this header's cells field. Bump VERSION in that same change. Deserialize
- * refuses a different version, basis size, cell count, arm cap or core count. */
-#define VERSION 1u
+/* OGCM v1. The Omega codec reads the contiguous persisted fields and omits
+ * the two runtime counters. Changing the model dimensions requires a wire version. */
+enum { CM_WIRE_BYTES = 28080, CM_DIGEST_BYTES = 32 };
+_Static_assert(RX_CM_D == 8 && RX_CM_CELLS == 9 && RX_CM_ARMS == 8 && RX_CM_CORES == 3 &&
+               sizeof(RxCmArmStats) == 384 && sizeof(RxCostModel) == 28072 &&
+               offsetof(RxCostModel, n_arms) == 0 && offsetof(RxCostModel, lambda) == 8 &&
+               offsetof(RxCostModel, cell) == 16 && offsetof(RxCostModel, power_mw) == 27664 &&
+               offsetof(RxCostModel, verify_ns) == 27856 && offsetof(RxCostModel, synth_ns) == 27920 &&
+               offsetof(RxCostModel, code_bytes) == 27984 && offsetof(RxCostModel, sd_scale) == 28048 &&
+               offsetof(RxCostModel, explore_ps) == 28056 && offsetof(RxCostModel, work_ps) == 28064,
+               "OGCM v1 model layout");
 
-typedef struct {
-    uint32_t magic, version, n_arms, d, cells, arms_cap, cores;
-    uint32_t reserved;
-    double lambda;
-} Header;
-
-static size_t body_size(void) {
-    const RxCostModel *m = 0;
-    return sizeof m->cell + sizeof m->power_mw + sizeof m->verify_ns + sizeof m->synth_ns +
-           sizeof m->code_bytes + sizeof m->sd_scale;
-}
-
-size_t rx_cm_blob_size(void) { return sizeof(Header) + body_size() + 32u; }
-
-static size_t pack(const RxCostModel *m, uint8_t *out) {
-    Header h;
-    memset(&h, 0, sizeof h);
-    h.magic = MAGIC;
-    h.version = VERSION;
-    h.n_arms = m->n_arms;
-    h.d = RX_CM_D;
-    h.cells = RX_CM_CELLS;
-    h.arms_cap = RX_CM_ARMS;
-    h.cores = RX_CM_CORES;
-    h.lambda = m->lambda;
-    uint8_t *p = out;
-    memcpy(p, &h, sizeof h);
-    p += sizeof h;
-    memcpy(p, m->cell, sizeof m->cell);
-    p += sizeof m->cell;
-    memcpy(p, m->power_mw, sizeof m->power_mw);
-    p += sizeof m->power_mw;
-    memcpy(p, m->verify_ns, sizeof m->verify_ns);
-    p += sizeof m->verify_ns;
-    memcpy(p, m->synth_ns, sizeof m->synth_ns);
-    p += sizeof m->synth_ns;
-    memcpy(p, m->code_bytes, sizeof m->code_bytes);
-    p += sizeof m->code_bytes;
-    memcpy(p, &m->sd_scale, sizeof m->sd_scale);
-    p += sizeof m->sd_scale;
-    return (size_t)(p - out);
-}
+size_t rx_cm_blob_size(void) { return CM_WIRE_BYTES + CM_DIGEST_BYTES; }
 
 int rx_cm_serialize(const RxCostModel *m, uint8_t *out, size_t cap, size_t *out_len) {
     if (!m || !out || cap < rx_cm_blob_size()) return RX_CM_ERR_ARG;
-    size_t n = pack(m, out);
-    sha256_hash(out, n, out + n);
-    if (out_len) *out_len = n + 32u;
+    uintptr_t src = (uintptr_t)m, dest = (uintptr_t)out;
+    if (dest >= src ? dest - src < sizeof *m : src - dest < CM_WIRE_BYTES) {
+        uint8_t wire[CM_WIRE_BYTES];
+        rx_cm_pack_v1((const uint8_t *)m, wire);
+        memcpy(out, wire, sizeof wire);
+    } else {
+        rx_cm_pack_v1((const uint8_t *)m, out);
+    }
+    sha256_hash(out, CM_WIRE_BYTES, out + CM_WIRE_BYTES);
+    if (out_len) *out_len = rx_cm_blob_size();
     return RX_CM_OK;
 }
 
@@ -490,35 +462,14 @@ int rx_cm_deserialize(RxCostModel *m, const uint8_t *in, size_t len) {
     uint8_t d[32];
     sha256_hash(in, len - 32u, d);
     if (memcmp(d, in + len - 32u, 32) != 0) return RX_CM_ERR_DIGEST;
-    Header h;
-    memcpy(&h, in, sizeof h);
-    if (h.magic != MAGIC || h.version != VERSION || h.d != RX_CM_D || h.cells != RX_CM_CELLS ||
-        h.arms_cap != RX_CM_ARMS || h.cores != RX_CM_CORES || h.n_arms == 0 ||
-        h.n_arms > RX_CM_ARMS)
-        return RX_CM_ERR_FORMAT;
-    RxCostModel t;
-    memset(&t, 0, sizeof t);
-    t.n_arms = h.n_arms;
-    t.lambda = h.lambda;
-    const uint8_t *p = in + sizeof h;
-    memcpy(t.cell, p, sizeof t.cell);
-    p += sizeof t.cell;
-    memcpy(t.power_mw, p, sizeof t.power_mw);
-    p += sizeof t.power_mw;
-    memcpy(t.verify_ns, p, sizeof t.verify_ns);
-    p += sizeof t.verify_ns;
-    memcpy(t.synth_ns, p, sizeof t.synth_ns);
-    p += sizeof t.synth_ns;
-    memcpy(t.code_bytes, p, sizeof t.code_bytes);
-    p += sizeof t.code_bytes;
-    memcpy(&t.sd_scale, p, sizeof t.sd_scale);
-    if (!(t.sd_scale >= 1.0 && t.sd_scale < 1e6)) return RX_CM_ERR_FORMAT;
+    RxCostModel t = {0};
+    if (!rx_cm_unpack_v1(in, (uint8_t *)&t)) return RX_CM_ERR_FORMAT;
     *m = t;
     return RX_CM_OK;
 }
 
 void rx_cm_digest(const RxCostModel *m, uint8_t out[32]) {
-    uint8_t buf[sizeof(Header) + sizeof(((RxCostModel *)0)->cell) + 4096];
-    size_t n = pack(m, buf);
-    sha256_hash(buf, n, out);
+    uint8_t buf[CM_WIRE_BYTES];
+    rx_cm_pack_v1((const uint8_t *)m, buf);
+    sha256_hash(buf, sizeof buf, out);
 }

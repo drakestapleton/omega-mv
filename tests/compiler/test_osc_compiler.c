@@ -47,6 +47,7 @@
 #include <sys/mman.h>
 #include <time.h>
 
+#include "omega_api_decl.h"
 #include "osc_cg.h"
 #include "osc_front.h"
 #include "osc_interp.h"
@@ -2154,6 +2155,11 @@ int main(int argc, char **argv)
     struct_layout();
     struct_dtor_order(pdir);
     arena_dtor_order(pdir);
+    /* The bridge accepts full-width cell counts. A full one-cell arena must
+     * retain its usage on refusal, even at the upper end of that ABI. */
+    uint8_t full_arena[160] = { [104] = 1, [106] = 1 };
+    CHECK(!osc_reserve_arena(full_arena, 0, 0, UINT64_MAX) &&
+          full_arena[106] == 1 && full_arena[107] == 0, "full arena reservation changed usage");
     struct_fuzz(fuzz / 8 ? fuzz / 8 : 16);
     arena_fuzz(fuzz / 8 ? fuzz / 8 : 16);
     handle_fuzz(fuzz / 8 ? fuzz / 8 : 16);
