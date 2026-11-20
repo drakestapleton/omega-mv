@@ -475,105 +475,99 @@ static int parse_call(P *p)
     return n;
 }
 
-static int parse_primary(P *p)
+static int parse_operand(P *p)
 {
-    const OscToken *t = cur(p);
-    int n;
-    switch (t->kind) {
-    case OT_INT:
-        n = new_node(p, ON_INT, t);
-        if (n < 0) return -1;
-        N(n)->ival = t->ival;
-        adv(p);
-        return n;
-    case OT_TRUE: case OT_FALSE:
-        n = new_node(p, ON_BOOL, t);
-        if (n < 0) return -1;
-        N(n)->ival = t->kind == OT_TRUE;
-        adv(p);
-        return n;
-    case OT_NAME:
-        if (peek_kind(p, 1) == OT_LPAREN) return parse_call(p);
-        if (peek_kind(p, 1) == OT_DOT && peek_kind(p, 2) == OT_ALLOC) { /* OSC-3 item 2: P.alloc(e) */
-            n = new_node(p, ON_PALLOC, t);
-            if (n < 0) return -1;
-            adv(p); adv(p); adv(p);
-            if (expect(p, OT_LPAREN)) return -1;
-            if (enter(p)) return -1;
-            int e0 = parse_expr(p);
+    OscOperandState state = {0};
+    const uint32_t first_prefix = p->ast->nnodes;
+    int value = -1;
+    for (;;) {
+        const OscToken *t = cur(p);
+        uint64_t action = osc_operand_step(&state, t->kind, peek_kind(p, 1), peek_kind(p, 2));
+        int n;
+        switch (action) {
+        case OSC_OPERAND_PREFIX:
+            if (enter(p) || new_node(p, ON_UN, t) < 0) return -1;
+            adv(p);
+            break;
+        case OSC_OPERAND_UNWIND:
+            n = (int)(first_prefix + state.pending);
+            N(n)->op = p->ast->toks[N(n)->tok].kind;
+            N(n)->a = value;
             leave(p);
-            if (e0 < 0) return -1;
-            N(n)->a = e0;
-            if (expect(p, OT_RPAREN)) return -1;
-            return n;
+            value = n;
+            break;
+        case OSC_OPERAND_INTEGER:
+        case OSC_OPERAND_TRUE:
+        case OSC_OPERAND_FALSE:
+        case OSC_OPERAND_NAME: {
+            int kind = action == OSC_OPERAND_INTEGER ? ON_INT : action == OSC_OPERAND_NAME ? ON_NAME : ON_BOOL;
+            value = new_node(p, kind, t);
+            if (value < 0) return -1;
+            N(value)->ival = action == OSC_OPERAND_INTEGER ? t->ival : action == OSC_OPERAND_TRUE;
+            adv(p);
+            break;
         }
-        if (peek_kind(p, 1) == OT_DOT) return parse_field_ref(p, ON_FIELD);
-        if (peek_kind(p, 1) == OT_LBRACK) {
+        case OSC_OPERAND_CALL:
+            value = parse_call(p);
+            if (value < 0) return -1;
+            break;
+        case OSC_OPERAND_FIELD:
+            value = parse_field_ref(p, ON_FIELD);
+            if (value < 0) return -1;
+            break;
+        case OSC_OPERAND_INDEX:
             n = new_node(p, ON_INDEX, t);
             if (n < 0) return -1;
             adv(p); adv(p);
-            int ix = parse_expr(p);
-            if (ix < 0) return -1;
-            N(n)->a = ix;
+            value = parse_expr(p);
+            if (value < 0) return -1;
+            N(n)->a = value;
             if (expect(p, OT_RBRACK)) return -1;
-            return n;
+            value = n;
+            break;
+        case OSC_OPERAND_POOL:
+            n = new_node(p, ON_PALLOC, t);
+            if (n < 0) return -1;
+            adv(p); adv(p); adv(p);
+            if (expect(p, OT_LPAREN) || enter(p)) return -1;
+            value = parse_expr(p);
+            leave(p);
+            if (value < 0) return -1;
+            N(n)->a = value;
+            if (expect(p, OT_RPAREN)) return -1;
+            value = n;
+            break;
+        case OSC_OPERAND_GROUP:
+            if (enter(p)) return -1;
+            adv(p);
+            value = parse_expr(p);
+            if (value < 0 || expect(p, OT_RPAREN)) return -1;
+            leave(p);
+            break;
+        case OSC_OPERAND_CAST:
+            n = new_node(p, ON_CAST, t);
+            if (n < 0) return -1;
+            adv(p);
+            if (parse_type(p, &N(n)->ty, OSC_TYPE_SCALAR, OSC_REF_NONE)) return -1;
+            N(n)->a = value;
+            N(n)->line = N(value)->line;
+            N(n)->col = N(value)->col;
+            value = n;
+            break;
+        case OSC_OPERAND_DONE:
+            return value;
+        case OSC_OPERAND_CAST_ERROR:
+            return syntax(p, "';' (chained 'as' needs parentheses)");
+        case OSC_OPERAND_BORROW_ERROR:
+            osc_diag_set(p->d, OSC_DIAG_UNSUPPORTED, t->line, t->col, "&", 0, NULL, "borrow in expression",
+                         "a borrow may only be a call argument or a borrow binding's value");
+            return -1;
+        case OSC_OPERAND_SYNTAX:
+            return syntax(p, "an expression");
+        default:
+            abort();
         }
-        n = new_node(p, ON_NAME, t);
-        if (n < 0) return -1;
-        adv(p);
-        return n;
-    case OT_LPAREN: {
-        if (enter(p)) return -1;
-        adv(p);
-        int e = parse_expr(p);
-        if (e < 0) return -1;
-        if (expect(p, OT_RPAREN)) return -1;
-        leave(p);
-        return e;
     }
-    case OT_AMP:
-        osc_diag_set(p->d, OSC_DIAG_UNSUPPORTED, t->line, t->col, "&", 0, NULL, "borrow in expression",
-                     "a borrow may only be a call argument or a borrow binding's value");
-        return -1;
-    default:
-        return syntax(p, "an expression");
-    }
-}
-
-static int parse_postfix(P *p)
-{
-    int e = parse_primary(p);
-    if (e < 0) return -1;
-    if (at(p, OT_AS)) {
-        int n = new_node(p, ON_CAST, cur(p));
-        if (n < 0) return -1;
-        adv(p);
-        if (parse_type(p, &N(n)->ty, OSC_TYPE_SCALAR, OSC_REF_NONE)) return -1;
-        N(n)->a = e;
-        N(n)->line = N(e)->line;
-        N(n)->col = N(e)->col;
-        if (at(p, OT_AS)) return syntax(p, "';' (chained 'as' needs parentheses)");
-        return n;
-    }
-    return e;
-}
-
-static int parse_unary(P *p)
-{
-    int k = cur(p)->kind;
-    if (k == OT_MINUS || k == OT_TILDE || k == OT_BANG) {
-        if (enter(p)) return -1;
-        int n = new_node(p, ON_UN, cur(p));
-        if (n < 0) return -1;
-        adv(p);
-        int a = parse_unary(p);
-        leave(p);
-        if (a < 0) return -1;
-        N(n)->op = (uint16_t)k;
-        N(n)->a = a;
-        return n;
-    }
-    return parse_postfix(p);
 }
 
 /* Omega decides when to consume the next operator and when to finish an
@@ -582,7 +576,7 @@ static int parse_unary(P *p)
 static int parse_expr(P *p)
 {
     OscExprStack stack = {0};
-    int operand = parse_unary(p);
+    int operand = parse_operand(p);
     while (operand >= 0) {
         uint64_t action = osc_expr_step(&stack, cur(p)->kind, (uint64_t)operand);
         switch (action) {
@@ -594,7 +588,7 @@ static int parse_expr(P *p)
             stack.node[stack.depth - 1] = n;
             N(n)->op = cur(p)->kind;
             adv(p);
-            operand = parse_unary(p);
+            operand = parse_operand(p);
             break;
         }
         case OSC_EXPR_REDUCE:

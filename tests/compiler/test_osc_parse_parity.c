@@ -76,6 +76,11 @@ static void expression_cases(void)
         "fn f() -> u64 { return a * b + c << d & e ^ f | g == h && i || j; }",
         "fn f() -> u64 { return a == b * c < d; }",
         "fn f() -> u64 { return a == b && c == d; }",
+        "fn f() -> i32 { return !~-f(1, x[0]) as i32; }",
+        "fn f() -> i32 { return (x as i8) as i32; }",
+        "fn f() -> i32 { return -x as i8 as i32; }",
+        "fn f() -> i32 { return ~-!x as", "fn f() -> i32 { return ~-!; }",
+        "fn f() -> i32 { return !p.alloc(f(x.field[0])); }",
         "fn f() -> u64 { return a * (b + c", "fn f() -> u64 { return -(-a) << ~b; }"
     };
     for (size_t i = 0; i < sizeof edge / sizeof *edge; ++i)

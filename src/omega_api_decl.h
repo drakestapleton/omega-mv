@@ -318,6 +318,22 @@ uint64_t osc_read_type(const uint16_t o_kinds[7], const uint64_t o_values[7], ui
 #define OSC_EXPR_SHIFT 1
 #define OSC_EXPR_REDUCE 2
 #define OSC_EXPR_CHAINED 3
+#define OSC_OPERAND_DONE 0
+#define OSC_OPERAND_PREFIX 1
+#define OSC_OPERAND_INTEGER 2
+#define OSC_OPERAND_TRUE 3
+#define OSC_OPERAND_FALSE 4
+#define OSC_OPERAND_NAME 5
+#define OSC_OPERAND_CALL 6
+#define OSC_OPERAND_FIELD 7
+#define OSC_OPERAND_INDEX 8
+#define OSC_OPERAND_POOL 9
+#define OSC_OPERAND_GROUP 10
+#define OSC_OPERAND_BORROW_ERROR 11
+#define OSC_OPERAND_SYNTAX 12
+#define OSC_OPERAND_CAST 13
+#define OSC_OPERAND_CAST_ERROR 14
+#define OSC_OPERAND_UNWIND 15
 typedef struct {
     uint32_t depth;
     uint32_t rank[9];
@@ -333,8 +349,81 @@ OMBR_ASSERT(offsetof(OscExprStack, node) == 40, "layout exprstk field node");
 OMBR_ASSERT(offsetof(OscExprStack, lhs) == 76, "layout exprstk field lhs");
 OMBR_ASSERT(offsetof(OscExprStack, parent) == 112, "layout exprstk field parent");
 OMBR_ASSERT(offsetof(OscExprStack, left) == 116, "layout exprstk field left");
+typedef struct {
+    uint32_t phase;
+    uint32_t prefixes;
+    uint32_t pending;
+} OscOperandState;
+OMBR_ASSERT(sizeof(OscOperandState) == 12, "layout opstate size");
+OMBR_ASSERT(offsetof(OscOperandState, phase) == 0, "layout opstate field phase");
+OMBR_ASSERT(offsetof(OscOperandState, prefixes) == 4, "layout opstate field prefixes");
+OMBR_ASSERT(offsetof(OscOperandState, pending) == 8, "layout opstate field pending");
 /* export fn osc_expr_step stack edit exprstk look ulong operand ulong to ulong */
 uint64_t osc_expr_step(OscExprStack *o_stack, uint64_t o_look, uint64_t o_operand);
+/* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
+uint64_t osc_operand_step(OscOperandState *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
+/* export fn osc_alu_width t ulong to ulong */
+uint64_t osc_alu_width(uint64_t o_t);
+/* export fn osc_alu_canon t ulong v ulong to ulong */
+uint64_t osc_alu_canon(uint64_t o_t, uint64_t o_v);
+/* export fn osc_alu_bin op ulong t ulong a ulong b ulong value out ulong 1 to ulong */
+uint64_t osc_alu_bin(uint64_t o_op, uint64_t o_t, uint64_t o_a, uint64_t o_b, uint64_t o_value[1]);
+/* export fn osc_alu_un op ulong t ulong a ulong value out ulong 1 to ulong */
+uint64_t osc_alu_un(uint64_t o_op, uint64_t o_t, uint64_t o_a, uint64_t o_value[1]);
+/* export fn osc_alu_cmp cc ulong t ulong a ulong b ulong to ulong */
+uint64_t osc_alu_cmp(uint64_t o_cc, uint64_t o_t, uint64_t o_a, uint64_t o_b);
+/* export fn osc_alu_cast target ulong src ulong a ulong value out ulong 1 to ulong */
+uint64_t osc_alu_cast(uint64_t o_target, uint64_t o_src, uint64_t o_a, uint64_t o_value[1]);
+/* export fn osc_binary_opcode tok ulong to ulong */
+uint64_t osc_binary_opcode(uint64_t o_tok);
+/* export fn osc_compare_opcode tok ulong to ulong */
+uint64_t osc_compare_opcode(uint64_t o_tok);
+/* export fn osc_literal_fits t ulong magnitude ulong negative ulong to ulong */
+uint64_t osc_literal_fits(uint64_t o_t, uint64_t o_magnitude, uint64_t o_negative);
+#define OSC_A64_ERR_UNUSED_SHIFT 1
+#define OSC_A64_ERR_UNUSED_COND 2
+#define OSC_A64_ERR_UNUSED_IMM2 3
+#define OSC_A64_ERR_UNUSED_IMM 4
+#define OSC_A64_ERR_SHIFT_KIND 5
+#define OSC_A64_ERR_SHIFT_AMOUNT 6
+#define OSC_A64_ERR_IMM12 7
+#define OSC_A64_ERR_LSL12 8
+#define OSC_A64_ERR_IMMR 9
+#define OSC_A64_ERR_IMMS 10
+#define OSC_A64_ERR_COND 11
+#define OSC_A64_ERR_IMM16 12
+#define OSC_A64_ERR_MOV_SHIFT 13
+#define OSC_A64_ERR_MEM_OFFSET 14
+#define OSC_A64_ERR_PAIR_OFFSET 15
+#define OSC_A64_ERR_WRITEBACK_ALIAS 16
+#define OSC_A64_ERR_LOAD_ALIAS 17
+#define OSC_A64_ERR_BRANCH_OFFSET 18
+#define OSC_A64_ERR_BRANCH_COND 19
+typedef struct {
+    uint32_t rd;
+    uint32_t rn;
+    uint32_t rm;
+    uint32_t ra;
+    uint32_t shift;
+    uint32_t cond;
+    int64_t imm;
+    int64_t imm2;
+} OscA64Fields;
+OMBR_ASSERT(sizeof(OscA64Fields) == 40, "layout a64field size");
+OMBR_ASSERT(offsetof(OscA64Fields, rd) == 0, "layout a64field field rd");
+OMBR_ASSERT(offsetof(OscA64Fields, rn) == 4, "layout a64field field rn");
+OMBR_ASSERT(offsetof(OscA64Fields, rm) == 8, "layout a64field field rm");
+OMBR_ASSERT(offsetof(OscA64Fields, ra) == 12, "layout a64field field ra");
+OMBR_ASSERT(offsetof(OscA64Fields, shift) == 16, "layout a64field field shift");
+OMBR_ASSERT(offsetof(OscA64Fields, cond) == 20, "layout a64field field cond");
+OMBR_ASSERT(offsetof(OscA64Fields, imm) == 24, "layout a64field field imm");
+OMBR_ASSERT(offsetof(OscA64Fields, imm2) == 32, "layout a64field field imm2");
+/* export fn osc_a64_pack_fields form ulong base ulong f view a64field to ulong */
+uint64_t osc_a64_pack_fields(uint64_t o_form, uint64_t o_base, const OscA64Fields *o_f);
+/* export fn osc_a64_unpack_fields form ulong word ulong f edit a64field to void */
+void osc_a64_unpack_fields(uint64_t o_form, uint64_t o_word, OscA64Fields *o_f);
+/* export fn osc_a64_check_fields cls ulong f view a64field writeback ulong loadpair ulong to ulong */
+uint64_t osc_a64_check_fields(uint64_t o_cls, const OscA64Fields *o_f, uint64_t o_writeback, uint64_t o_loadpair);
 #ifdef __cplusplus
 }
 #endif

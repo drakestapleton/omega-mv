@@ -19,6 +19,7 @@
  * OSC-1 slice; not a general Omega compiler; no self-hosting.
  */
 #include "osc_lower.h"
+#include "omega_api_decl.h"
 #include "osc_check.h"
 
 #include <stdlib.h>
@@ -162,35 +163,6 @@ static void releases(L *l, const OscNode *n)
     }
 }
 
-static int bop(int tok)
-{
-    switch (tok) {
-    case OT_PLUS: return OSC_B_ADD;
-    case OT_MINUS: return OSC_B_SUB;
-    case OT_STAR: return OSC_B_MUL;
-    case OT_SLASH: return OSC_B_DIV;
-    case OT_PERCENT: return OSC_B_REM;
-    case OT_AMP: return OSC_B_AND;
-    case OT_PIPE: return OSC_B_OR;
-    case OT_CARET: return OSC_B_XOR;
-    case OT_SHL: return OSC_B_SHL;
-    case OT_SHR: return OSC_B_SHR;
-    default: return 0;
-    }
-}
-static int cop(int tok)
-{
-    switch (tok) {
-    case OT_EQ: return OSC_C_EQ;
-    case OT_NE: return OSC_C_NE;
-    case OT_LT: return OSC_C_LT;
-    case OT_LE: return OSC_C_LE;
-    case OT_GT: return OSC_C_GT;
-    case OT_GE: return OSC_C_GE;
-    default: return 0;
-    }
-}
-
 /* symbol s is an external byte slice (its vreg is the pointer register) */
 static int is_slice(L *l, int s)
 {
@@ -313,9 +285,9 @@ static int expr(L *l, int i)
         int a = expr(l, n->a);
         int b = expr(l, n->b);
         int r = newvs(l, n->ty.s, n->line);
-        int cc = cop(n->op);
+        uint64_t cc = osc_compare_opcode(n->op);
         OscInsn *x = emit(l, cc ? OSC_I_CMP : OSC_I_BIN, n->line);
-        x->sub = (uint8_t)(cc ? cc : bop(n->op));
+        x->sub = (uint8_t)(cc ? cc : osc_binary_opcode(n->op));
         x->dst = (int16_t)r;
         x->a = (int16_t)a;
         x->b = (int16_t)b;

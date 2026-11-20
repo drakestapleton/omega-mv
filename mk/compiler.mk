@@ -60,6 +60,20 @@ $(OSC_DIR)/test_osc_parse_parity: $(OSC_PARSE_PARITY_SRC) $(OSC_PARSE_ORACLE).o 
 test-osc-parse-parity: $(OSC_DIR)/test_osc_parse_parity
 	@$(OSC_DIR)/test_osc_parse_parity $(OSC_LEX_FIXTURES)
 
+# The frozen interpreter supplies the arithmetic oracle, including its native
+# C trap path, only when running differential tests from a source checkout.
+$(OSC_DIR)/osc_interp_reference.c:
+	@mkdir -p $(OSC_DIR)
+	git show $(OSC_PARSE_BASE):src/compiler/osc_interp.c > $@.tmp && mv $@.tmp $@
+
+OSC_SCALAR_PARITY_LIB = $(filter-out src/compiler/osc_interp.c,$(OSC_LIB))
+$(OSC_DIR)/test_osc_scalar_parity: tests/compiler/test_osc_scalar_parity.c $(OSC_DIR)/osc_interp_reference.c $(OSC_SCALAR_PARITY_LIB) $(OSC_HDRS) src/omega_api_decl.h
+	$(CC) $(OSC_CFLAGS) -I$(OSC_DIR) -o $@ $< $(OSC_SCALAR_PARITY_LIB)
+
+.PHONY: test-osc-scalar-parity
+test-osc-scalar-parity: $(OSC_DIR)/test_osc_scalar_parity
+	@$(OSC_DIR)/test_osc_scalar_parity
+
 $(OSC_DIR)/test_osc_model: tests/compiler/test_osc_model.c $(OSC_MODEL) $(OSC_MODEL_GEN) $(OSC_HDRS)
 	@mkdir -p $(OSC_DIR)
 	$(CC) $(OSC_CFLAGS) -o $@ tests/compiler/test_osc_model.c $(OSC_MODEL) $(OSC_MODEL_GEN)

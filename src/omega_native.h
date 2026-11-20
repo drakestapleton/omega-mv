@@ -341,10 +341,40 @@ uint32_t omega2_osc_lex_next(uint64_t *result, const uint8_t *o_src, uint64_t o_
 const char *omega2_ident_osc_type(void);
 /* export fn osc_read_type kinds view ushort 7 values view ulong 7 form ulong refkind ulong limit ulong result edit typerec to ulong */
 uint32_t omega2_osc_read_type(uint64_t *result, const uint16_t *o_kinds, uint64_t o_kinds_len, const uint64_t *o_values, uint64_t o_values_len, uint64_t o_form, uint64_t o_refkind, uint64_t o_limit, uint8_t *o_result);
-#define OMEGA2_IDENT_osc_expr "omega-ident 1 unit=osc_expr abi=2 profile=OM-2 src=253f0e1162235b4bda264d8e6d6b7953f0cf6f38fcc254523961502a6ca93207 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_expr "omega-ident 1 unit=osc_expr abi=2 profile=OM-2 src=e869e7be788d2f0c942d9c4c8d87d3fe6efc45713c0ced12d82183e3fa3dba1b omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_expr(void);
 /* export fn osc_expr_step stack edit exprstk look ulong operand ulong to ulong */
 uint32_t omega2_osc_expr_step(uint64_t *result, uint8_t *o_stack, uint64_t o_look, uint64_t o_operand);
+/* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
+uint32_t omega2_osc_operand_step(uint64_t *result, uint8_t *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
+#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=9f5f4721178d24ba8a31a2053da0464bc02950d353c67a11c53f0f89df7cf858 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_osc_scalar(void);
+/* export fn osc_alu_width t ulong to ulong */
+uint32_t omega2_osc_alu_width(uint64_t *result, uint64_t o_t);
+/* export fn osc_alu_canon t ulong v ulong to ulong */
+uint32_t omega2_osc_alu_canon(uint64_t *result, uint64_t o_t, uint64_t o_v);
+/* export fn osc_alu_bin op ulong t ulong a ulong b ulong value out ulong 1 to ulong */
+uint32_t omega2_osc_alu_bin(uint64_t *result, uint64_t o_op, uint64_t o_t, uint64_t o_a, uint64_t o_b, uint64_t *o_value);
+/* export fn osc_alu_un op ulong t ulong a ulong value out ulong 1 to ulong */
+uint32_t omega2_osc_alu_un(uint64_t *result, uint64_t o_op, uint64_t o_t, uint64_t o_a, uint64_t *o_value);
+/* export fn osc_alu_cmp cc ulong t ulong a ulong b ulong to ulong */
+uint32_t omega2_osc_alu_cmp(uint64_t *result, uint64_t o_cc, uint64_t o_t, uint64_t o_a, uint64_t o_b);
+/* export fn osc_alu_cast target ulong src ulong a ulong value out ulong 1 to ulong */
+uint32_t omega2_osc_alu_cast(uint64_t *result, uint64_t o_target, uint64_t o_src, uint64_t o_a, uint64_t *o_value);
+/* export fn osc_binary_opcode tok ulong to ulong */
+uint32_t omega2_osc_binary_opcode(uint64_t *result, uint64_t o_tok);
+/* export fn osc_compare_opcode tok ulong to ulong */
+uint32_t omega2_osc_compare_opcode(uint64_t *result, uint64_t o_tok);
+/* export fn osc_literal_fits t ulong magnitude ulong negative ulong to ulong */
+uint32_t omega2_osc_literal_fits(uint64_t *result, uint64_t o_t, uint64_t o_magnitude, uint64_t o_negative);
+#define OMEGA2_IDENT_osc_a64_fields "omega-ident 1 unit=osc_a64_fields abi=2 profile=OM-2 src=9611ed84cd164f070399a77dcae62086f741201bcc972d969f912b21ce8824b4 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_osc_a64_fields(void);
+/* export fn osc_a64_pack_fields form ulong base ulong f view a64field to ulong */
+uint32_t omega2_osc_a64_pack_fields(uint64_t *result, uint64_t o_form, uint64_t o_base, const uint8_t *o_f);
+/* export fn osc_a64_unpack_fields form ulong word ulong f edit a64field to void */
+uint32_t omega2_osc_a64_unpack_fields(uint64_t *result, uint64_t o_form, uint64_t o_word, uint8_t *o_f);
+/* export fn osc_a64_check_fields cls ulong f view a64field writeback ulong loadpair ulong to ulong */
+uint32_t omega2_osc_a64_check_fields(uint64_t *result, uint64_t o_cls, const uint8_t *o_f, uint64_t o_writeback, uint64_t o_loadpair);
 #ifdef __cplusplus
 }
 #endif
