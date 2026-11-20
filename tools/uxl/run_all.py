@@ -36,7 +36,7 @@ def _read_pinned_omc_sha256():
         toks = pin.read_text(encoding="utf-8").strip().split()
         if toks:
             return toks[0]
-    return "b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+    return "210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 
 
 PINNED_OMC_SHA256 = _read_pinned_omc_sha256()

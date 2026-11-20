@@ -10,11 +10,19 @@ S=$(dirname "$0")
 B=$(mktemp -d)
 trap 'rm -rf "$B"' EXIT
 fail=0
-for f in records batch isa plan; do
+for f in records batch isa plan launch; do
   "$OMC" < "$S/xe/$f.om" > "$B/$f" || { echo "FAIL compile xe/$f.om"; exit 1; }
   chmod +x "$B/$f"
   echo "PASS compile xe/$f.om"
 done
+
+# 0. Compile launch.om for x86-64 Linux too (Panther Lake target) and run native AArch64 selftest
+{ printf 'target x86linux\n'; cat "$S/xe/launch.om"; } > "$B/launch.x86.om"
+"$OMC" < "$B/launch.x86.om" > "$B/launch.x86" && echo "PASS compile xe/launch.om (x86linux)" || { echo "FAIL compile xe/launch.om (x86linux)"; fail=1; }
+"$B/launch" selftest && echo "PASS launch selftest (all 11 drm/xe ioctls -> -EBADF)" || { echo "FAIL launch selftest"; fail=1; }
+# Negative control: wrong ABI size for DRM_IOCTL_XE_VM_CREATE must be refused by omc (error 9)
+printf 'om2\nfn main to int\nr = new uchar 32 0\nret int kfdctl -1 3223348291 r 0 16\nend\n' > "$B/bad_sz.om"
+"$OMC" < "$B/bad_sz.om" > "$B/bad_sz" 2>/dev/null && { echo "FAIL control: omc accepted wrong XE_VM_CREATE size"; fail=1; } || echo "PASS control: omc rejects wrong XE_VM_CREATE size"
 
 # 1. Serialize every drm/xe ioctl record (0..12) from requests.tsv and check exact wire size
 idx=0
