@@ -397,6 +397,7 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Bound installed GPU code to the mapped model and exercised failed-bind reservation cleanup with the seeded compiler. |
 | Codex (under Drake Stapleton's direction) | Implemented the scoped Arboris Ed25519 signer in seeded Omega and verified durable publication and retries with a dedicated Spark world identity. |
 | Codex (under Drake Stapleton's direction) | Applied the measured SM121 register headroom rule to the gated QMD following the Spark warp exception. |
+| Codex (under Drake Stapleton's direction) | Connected pre-submission policy admission to the dedicated world signer and verified the committed bank through the supervisor channel. |
 | Codex (under Drake Stapleton's direction) | Checked the batched sparse CPU fixtures against closed-form outputs at both routing sizes. |
 | Codex (under Drake Stapleton's direction) | Implemented seeded Omega SM121 kernels and decode tables for the DeepSeek-V4.1-Flash text backbone, added driver-loadable cubin metadata and single-Spark numerical checks. |
 | Codex (under Drake Stapleton's direction) | Built the resident pure-Omega DeepSeek-V4.1-Flash final-head executor, native QMD submission chain, packed-BF16 vocabulary projection, and full-vocabulary checkpoint comparison. |
