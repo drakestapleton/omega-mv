@@ -491,7 +491,7 @@ uint32_t omega2_osc_trace_record(uint64_t *result, uint8_t *o_trace, uint64_t o_
 const char *omega2_ident_osc_lifetimes(void);
 /* export fn osc_scope_exit visible view ushort 480 symbols view uchar 76800 owners edit uchar 5120 borrows edit uchar 12288 work edit exitwork to ulong */
 uint32_t omega2_osc_scope_exit(uint64_t *result, const uint16_t *o_visible, uint64_t o_visible_len, const uint8_t *o_symbols, uint64_t o_symbols_len, uint8_t *o_owners, uint64_t o_owners_len, uint8_t *o_borrows, uint64_t o_borrows_len, uint8_t *o_work);
-#define OMEGA2_IDENT_osc_flow "omega-ident 1 unit=osc_flow abi=2 profile=OM-2 src=4206a6ca7df880fe7dd4e095e032158b2b587d677cb5e06c06548c8110ebd614 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_flow "omega-ident 1 unit=osc_flow abi=2 profile=OM-2 src=561334dffdf9c38cab0f03a0d0f11a18dd3eab63efed08c14447e20693c38644 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_flow(void);
 /* export fn osc_statement_flow nodes view uchar * order edit ulong * flow edit uchar * to void */
 uint32_t omega2_osc_statement_flow(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t *o_order, uint64_t o_order_len, uint8_t *o_flow, uint64_t o_flow_len);

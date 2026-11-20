@@ -48,7 +48,7 @@ for u in $UNITS; do
   { cat "$src"; printf '\0'; printf '%08d' "$(wc -c < "$T/u.bin")"; cat "$T/u.bin"
     [ $abi = 1 ] || printf 'omega-unit %s %s\n' "$name" "$OMC_PIN"; } > "$T/u.in"
   cat "$T/u.in" >> "$T/units.in"
-  if [ "$src" -ef "$ROOT/src/tensor/tensor_shape.om" ]; then
+  if [ "$src" -ef "$ROOT/src/tensor/tensor_shape.om" ] || [ "$src" -ef "$ROOT/om/compiler/osc_flow.om" ]; then
     cat "$T/u.in" >> "$T/leaf.in"
   else
     cat "$T/u.in" >> "$T/host.in"

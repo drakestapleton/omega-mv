@@ -38,7 +38,15 @@ $(OSC_DIR)/test_osc_lex: $(OSC_LEX_TEST_SRC) $(OSC_HDRS) src/omega_api_decl.h
 test-osc-lex: $(OSC_DIR)/test_osc_lex
 	@$(OSC_DIR)/test_osc_lex $(OSC_LEX_FIXTURES)
 
-test-compiler test-compiler-quick: test-osc-lex
+$(OSC_DIR)/test_osc_flow: tests/compiler/test_osc_flow.c $(OSC_LIB) $(OSC_HDRS) src/omega_native.h
+	@mkdir -p $(OSC_DIR)
+	$(CC) $(OSC_CFLAGS) -Wl,--wrap=mmap -o $@ $< $(OSC_LIB)
+
+.PHONY: test-osc-flow
+test-osc-flow: $(OSC_DIR)/test_osc_flow
+	@$(OSC_DIR)/test_osc_flow
+
+test-compiler test-compiler-quick: test-osc-lex test-osc-flow
 
 # Optional differential run for source checkouts with Git history. Compile the
 # last all-C parser independently and keep it out of the production link.
