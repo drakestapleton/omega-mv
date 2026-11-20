@@ -93,7 +93,7 @@ typedef struct {
     int nobj;
     int nbor;
     int loop_depth;
-    int term;             /* current path has returned */
+    uint8_t *flow;        /* per-statement reachability from osc_statement_flow */
     char sobj[64];        /* statement object (diagnostics) */
     int contract;         /* 0 body; 1 checking a requires clause; 2 an ensures clause (OSC-2) */
     int cond_depth;       /* OSC-2 arenas: nesting of if/else branches */
@@ -1472,25 +1472,23 @@ static int chk_if(C *c, int i)
     if (!h0) { cap_fail(c, n->line, "checker memory"); goto out; }
     tr_control(c, OSC_TR_SAVE, n->line);
     if (chk_block(c, n->b, 1)) goto out;
-    int t1 = c->term;
+    int t1 = c->flow[n->b] & OSC_FLOW_RETURNS;
     s1 = snap_take(c);
     h1 = hs_take(c);
     if (!s1 || !h1) { cap_fail(c, n->line, "checker memory"); goto out; }
     tr_control(c, OSC_TR_RESTORE, n->line);
     snap_restore(c, s0);
     osc_handles_restore(&c->handles, h0, 1);
-    c->term = 0;
     int t2 = 0;
     if (n->c >= 0) {
         tr_control(c, OSC_TR_SAVE, n->line);
         if (NODE(n->c)->kind == ON_IF) { if (chk_if(c, n->c)) goto out; }
         else if (chk_block(c, n->c, 1)) goto out;
-        t2 = c->term;
+        t2 = c->flow[n->c] & OSC_FLOW_RETURNS;
         tr_control(c, OSC_TR_RESTORE, n->line);
     }
     /* state after else is in c; after then is s1 */
     if (t1 && t2) {
-        c->term = 1;
         rc = 0;
         goto out;
     }
@@ -1514,7 +1512,6 @@ static int chk_if(C *c, int i)
             if (sym >= 0) NODE(c->sym[sym].decl)->dflag = 1;
         }
     }
-    c->term = 0;
     /* re-emit moves that hold after the if */
     if (c->tr && nobj0) {
         int32_t ids[OSC_CHECK_MAX_OBJS];
@@ -1563,7 +1560,6 @@ static int chk_loop_body(C *c, OscNode *n, int is_for)
      * entry, then settle handle assignments against the body that ran. */
     osc_handles_restore(&c->handles, h0, 0);
     hs_settle(c, h0, NULL, n->line);
-    c->term = 0;
     rc = 0;
 out:
     snap_free(c, s0);
@@ -1844,7 +1840,6 @@ static int chk_stmt(C *c, int i)
             if (chk_return_ensures(c, n)) return -1;
         }
         if (scope_exit_events(c, c->names.depth, n->line, n)) return -1;
-        c->term = 1;
         return 0;
     }
     case ON_ARENA: { /* OSC-2: arena NAME bound K { body } */
@@ -1862,7 +1857,7 @@ static int chk_stmt(C *c, int i)
         tr_region(c, OSC_EV_REGION_OPEN, -1, y->region, n->line, 0);
         if (chk_block(c, n->b, 1)) return -1;
         /* destroy after the body's own scope exit (its owners and borrows end first) */
-        if (!c->term && scope_exit_events(c, 1, (uint32_t)NODE(n->b)->ival, n)) return -1;
+        if (!(c->flow[n->b] & OSC_FLOW_RETURNS) && scope_exit_events(c, 1, (uint32_t)NODE(n->b)->ival, n)) return -1;
         pop_scope(c);
         return 0;
     }
@@ -1876,7 +1871,7 @@ static int chk_stmt(C *c, int i)
         osc_pool_init(&y->slots, (uint16_t)n->ival, (uint64_t)n->lo, c->loop_depth, c->cond_depth);
         n->sym = s;
         if (chk_block(c, n->b, 1)) return -1;
-        if (!c->term && scope_exit_events(c, 1, (uint32_t)NODE(n->b)->ival, n)) return -1;
+        if (!(c->flow[n->b] & OSC_FLOW_RETURNS) && scope_exit_events(c, 1, (uint32_t)NODE(n->b)->ival, n)) return -1;
         pop_scope(c);
         return 0;
     }
@@ -1927,14 +1922,14 @@ static int chk_block(C *c, int i, int new_scope)
     OscNode *n = NODE(i);
     if (new_scope && push_scope(c, n->line)) return -1;
     for (int s = n->a; s >= 0; s = NODE(s)->next) {
-        if (c->term) {
+        if (c->flow[s] & OSC_FLOW_UNREACHABLE) {
             osc_diag_set(c->d, OSC_DIAG_UNSUPPORTED, NODE(s)->line, NODE(s)->col, "return", 0, NULL,
                          "unreachable statement", "statement after 'return' is unreachable");
             return -1;
         }
         if (chk_stmt(c, s)) return -1;
     }
-    if (!c->term && new_scope && scope_exit_events(c, 1, (uint32_t)n->ival, n)) return -1;
+    if (!(c->flow[i] & OSC_FLOW_RETURNS) && new_scope && scope_exit_events(c, 1, (uint32_t)n->ival, n)) return -1;
     if (new_scope) pop_scope(c);
     return 0;
 }
@@ -1944,11 +1939,14 @@ static int chk_fn(C *c, int fi)
     OscAst *a = c->ast;
     int f = a->fns[fi];
     OscNode *fn = NODE(f);
+    c->expr_work[0] = (uint64_t)fn->b;
+    osc_statement_flow((const uint8_t *)a->nodes, a->nnodes * sizeof(OscNode),
+                       c->expr_work, c->expr_words, c->flow, a->nnodes);
     osc_scope_reset(&c->names);
     c->fi = fi;
     c->fnode = f;
     c->fret = fn->ty;
-    c->nsym = c->nobj = c->nbor = c->loop_depth = c->term = 0;
+    c->nsym = c->nobj = c->nbor = c->loop_depth = 0;
     c->cond_depth = 0;
     c->nregion = 0;
     c->handles.count = c->handles.nbind = 0;
@@ -1990,7 +1988,7 @@ static int chk_fn(C *c, int fi)
     }
     if (chk_contracts(c, fi)) return -1;
     if (chk_block(c, fn->b, 1)) return -1;
-    if (!c->term) {
+    if (!(c->flow[fn->b] & OSC_FLOW_RETURNS)) {
         if (fn->ty.s != OSC_T_VOID) {
             uint32_t end = (uint32_t)NODE(fn->b)->ival;
             osc_diag_set(c->d, OSC_DIAG_MISSING_RETURN, end, 0, fname, fn->line, NULL, "fall off end of non-void function",
@@ -2003,15 +2001,20 @@ static int chk_fn(C *c, int fi)
     return 0;
 }
 
+_Static_assert(ON_BLOCK == 3 && ON_IF == 10 && ON_WHILE == 11 && ON_FOR == 12 &&
+               ON_RETURN == 13 && ON_ARENA == 27 && ON_POOL == 28 && offsetof(OscNode, c) == 20,
+               "OSC statement flow AST layout");
+
 int osc_check(const OscAlloc *a, OscAst *ast, OscDiag *d, OscTrace *trace)
 {
     size_t expr_words = (size_t)ast->nnodes * 2 + 1;
-    size_t bytes = sizeof(C) + expr_words * sizeof(uint64_t);
+    size_t bytes = sizeof(C) + expr_words * sizeof(uint64_t) + ast->nnodes;
     C *c = a->alloc(a->ctx, bytes);
     if (c) {
         memset(c, 0, offsetof(C, sym));
         c->expr_work = (uint64_t *)(c + 1);
         c->expr_words = expr_words;
+        c->flow = (uint8_t *)(c->expr_work + expr_words);
     }
     if (!c) {
         osc_diag_set(d, OSC_DIAG_CAPACITY, 0, 0, "unit", 0, NULL, "checker memory", "out of memory");

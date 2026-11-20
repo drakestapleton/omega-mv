@@ -831,6 +831,21 @@ OMBR_ASSERT(offsetof(OscScopeExit, borrows) == 12, "layout exitwork field borrow
 OMBR_ASSERT(offsetof(OscScopeExit, actions) == 16, "layout exitwork field actions");
 /* export fn osc_scope_exit visible view ushort 480 symbols view uchar 76800 owners edit uchar 5120 borrows edit uchar 12288 work edit exitwork to ulong */
 uint64_t osc_scope_exit(const uint16_t o_visible[480], const uint8_t o_symbols[76800], uint8_t o_owners[5120], uint8_t o_borrows[12288], OscScopeExit *o_work);
+#define OSC_FLOW_RETURNS 1
+#define OSC_FLOW_UNREACHABLE 2
+#define OSC_BLOCK_BAD_RANGE 1
+#define OSC_BLOCK_OVERLAP 2
+#define OSC_BLOCK_NO_TERMINATOR 3
+#define OSC_BLOCK_EARLY_TERMINATOR 4
+#define OSC_BLOCK_UNCOVERED 5
+/* export fn osc_statement_flow nodes view uchar * order edit ulong * flow edit uchar * to void */
+void osc_statement_flow(const uint8_t *o_nodes, size_t o_nodes_len, uint64_t *o_order, size_t o_order_len, uint8_t *o_flow, size_t o_flow_len);
+/* export fn osc_block_partition blocks view uchar * insns view uchar * location out ulong 1 to ulong */
+uint64_t osc_block_partition(const uint8_t *o_blocks, size_t o_blocks_len, const uint8_t *o_insns, size_t o_insns_len, uint64_t o_location[1]);
+/* export fn osc_definite_inputs transfers view ulong * inputs edit ulong * params ulong width ulong to void */
+void osc_definite_inputs(const uint64_t *o_transfers, size_t o_transfers_len, uint64_t *o_inputs, size_t o_inputs_len, uint64_t o_params, uint64_t o_width);
+/* export fn osc_layout_blocks tags view short * source view ulong 24576 dest edit ulong 24576 blocks edit uint 1024 nblocks ulong to void */
+void osc_layout_blocks(const int16_t *o_tags, size_t o_tags_len, const uint64_t o_source[24576], uint64_t o_dest[24576], uint32_t o_blocks[1024], uint64_t o_nblocks);
 /* export fn tensor_shape_size dims view ulong * elems edit ulong 1 to long */
 int64_t tensor_shape_size(const uint64_t *o_dims, size_t o_dims_len, uint64_t o_elems[1]);
 /* export fn tensor_dense_strides dims view ulong * strides edit ulong * to void */

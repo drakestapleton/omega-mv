@@ -491,6 +491,16 @@ uint32_t omega2_osc_trace_record(uint64_t *result, uint8_t *o_trace, uint64_t o_
 const char *omega2_ident_osc_lifetimes(void);
 /* export fn osc_scope_exit visible view ushort 480 symbols view uchar 76800 owners edit uchar 5120 borrows edit uchar 12288 work edit exitwork to ulong */
 uint32_t omega2_osc_scope_exit(uint64_t *result, const uint16_t *o_visible, uint64_t o_visible_len, const uint8_t *o_symbols, uint64_t o_symbols_len, uint8_t *o_owners, uint64_t o_owners_len, uint8_t *o_borrows, uint64_t o_borrows_len, uint8_t *o_work);
+#define OMEGA2_IDENT_osc_flow "omega-ident 1 unit=osc_flow abi=2 profile=OM-2 src=4206a6ca7df880fe7dd4e095e032158b2b587d677cb5e06c06548c8110ebd614 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_osc_flow(void);
+/* export fn osc_statement_flow nodes view uchar * order edit ulong * flow edit uchar * to void */
+uint32_t omega2_osc_statement_flow(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t *o_order, uint64_t o_order_len, uint8_t *o_flow, uint64_t o_flow_len);
+/* export fn osc_block_partition blocks view uchar * insns view uchar * location out ulong 1 to ulong */
+uint32_t omega2_osc_block_partition(uint64_t *result, const uint8_t *o_blocks, uint64_t o_blocks_len, const uint8_t *o_insns, uint64_t o_insns_len, uint64_t *o_location);
+/* export fn osc_definite_inputs transfers view ulong * inputs edit ulong * params ulong width ulong to void */
+uint32_t omega2_osc_definite_inputs(uint64_t *result, const uint64_t *o_transfers, uint64_t o_transfers_len, uint64_t *o_inputs, uint64_t o_inputs_len, uint64_t o_params, uint64_t o_width);
+/* export fn osc_layout_blocks tags view short * source view ulong 24576 dest edit ulong 24576 blocks edit uint 1024 nblocks ulong to void */
+uint32_t omega2_osc_layout_blocks(uint64_t *result, const int16_t *o_tags, uint64_t o_tags_len, const uint64_t *o_source, uint64_t o_source_len, uint64_t *o_dest, uint64_t o_dest_len, uint32_t *o_blocks, uint64_t o_blocks_len, uint64_t o_nblocks);
 #define OMEGA2_IDENT_tensor_shape "omega-ident 1 unit=tensor_shape abi=2 profile=OM-2 src=c28554bdff536175775cdf0bf99e71054300e9341059f24c9dbe65cccc0c0aac omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_tensor_shape(void);
 /* export fn tensor_shape_size dims view ulong * elems edit ulong 1 to long */

@@ -636,6 +636,11 @@ static void block(L *l, int i)
     if (l->cur >= 0) releases(l, n);
 }
 
+_Static_assert(OSC_MAX_INSNS == 4096 && OSC_MAX_BLOCKS == 512 &&
+               sizeof(OscInsn) == 6 * sizeof(uint64_t) && _Alignof(OscInsn) >= _Alignof(uint64_t) &&
+               sizeof(OscBlock) == 8 && offsetof(OscBlock, first) == 0 && offsetof(OscBlock, count) == 4,
+               "OSC lowering block layout");
+
 static int lower_fn(L *l, int fi)
 {
     const OscAst *a = l->ast;
@@ -683,14 +688,9 @@ static int lower_fn(L *l, int fi)
     }
     if (l->failed) return -1;
     /* layout: blocks in creation order, instructions in emission order */
-    uint32_t k = 0;
-    for (int b = 0; b < l->nblk; b++) {
-        f->blocks[b].first = k;
-        for (uint32_t j = 0; j < l->nins; j++)
-            if (l->iblk[j] == b) f->insns[k++] = l->ins[j];
-        f->blocks[b].count = k - f->blocks[b].first;
-    }
-    f->ninsns = k;
+    osc_layout_blocks(l->iblk, l->nins, (const uint64_t *)l->ins, (uint64_t *)f->insns,
+                      (uint32_t *)f->blocks, (uint64_t)l->nblk);
+    f->ninsns = l->nins;
     f->nblocks = (uint16_t)l->nblk;
     return 0;
 }
