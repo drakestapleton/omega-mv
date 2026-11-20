@@ -1,0 +1,309 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note isa.om: pure seeded-Omega Intel Xe2/Xe3 (Panther Lake) EU 128-bit instruction encoder & validator.
+note Encodes 128-bit (16-byte) Intel Xe EU instructions with:
+note   - Explicit SWSB (Software Scoreboard) dependency tokens in lo64[15:8] (RegDist + SBID set/wait)
+note   - Exact LSC (Load/Store Cache) stateless A64 D32 send descriptors (intel-graphics-compiler MessageDecoderLSC.cpp)
+note   - Separate FP32 mul (0x41) and add (0x40) with zero FMA contraction on reductions
+note   - Exact IEEE-754 binary32 Newton-Raphson reciprocal refinement (math.invm + madm) for rmsnorm 0-ulp div
+note   - Mandatory thread-spawn EOT send termination (SFID_TS=0x3, EOT bit 34)
+note
+note Usage:
+note   isa emit vadd|fsum16|gemm16|rmsnorm
+note   isa check FILE.bin
+note Exit: 0 ok; 1 invalid kernel binary; 2 usage; 3 I/O error.
+om2
+
+text tuse "usage: isa emit vadd|fsum16|gemm16|rmsnorm | check FILE.bin\n"
+text temit "emit"
+text tchk "check"
+text tvadd "vadd"
+text tfsum "fsum16"
+text tgemm "gemm16"
+text trms "rmsnorm"
+text tbad "isa: invalid Xe3 EU kernel binary\n"
+text tio "isa: I/O error\n"
+
+note Intel Xe2/Xe3 EU 7-bit opcodes (lo64[6:0]):
+const XE_SEND uint 0x31
+const XE_MATH uint 0x38
+const XE_ADD uint 0x40
+const XE_MUL uint 0x41
+const XE_MADM uint 0x5c
+const XE_NOP uint 0x60
+const XE_MOV uint 0x61
+const XE_SEL uint 0x62
+const XE_CMP uint 0x70
+
+note ExecSize=16 (SIMD16, bits 23:21 = 4 -> 0x00800000)
+const EXEC16 ulong 0x00800000
+note SWSB tokens in lo64[15:8]: RegDist1 = 0x0100, SBID0.set = 0x1000, SBID0.dst = 0x3000, SBID1.set = 0x1100, SBID1.dst = 0x3100
+const SWSB_DIST1 ulong 0x00000100
+const SWSB_SET0 ulong 0x00001000
+const SWSB_WAIT0 ulong 0x00003000
+const SWSB_SET1 ulong 0x00001100
+const SWSB_WAIT1 ulong 0x00003100
+
+note Send SFID (lo64[11:8] in Xe send) and EOT (bit 34)
+const SEND_EOT ulong 0x0000000400000000
+const SFID_TS ulong 0x00000300
+const SFID_UGM ulong 0x00000f00
+
+note Exact LSC stateless A64 D32 descriptors (IGC MessageDecoderLSC.cpp):
+note   LSC_LOAD=0x00, LSC_STORE=0x04, AddrSize=A64(3<<7=0x180), DataSize=D32(2<<9=0x400),
+note   Src0Len=1(1<<25=0x02000000), DstLen=1(1<<20=0x00100000)
+const LSC_LOAD_A64_D32 ulong 0x02100580
+const LSC_STORE_A64_D32 ulong 0x02000584
+
+global glo ulong 256
+global ghi ulong 256
+global gbuf uchar 4096
+global gpath uchar 4096
+global garg uchar 64
+global gst ulong 4
+
+fn fail code int msg view uchar * to void
+n = write 2 msg 0 len msg
+exit code
+end
+
+fn argis i ulong t view uchar * to bool
+n = argread i garg 0 len garg
+if ne n long len t
+ret false
+end
+for k ulong len t
+if ne get garg k get t k
+ret false
+end
+end
+ret true
+end
+
+fn emit_inst lo ulong hi ulong to void
+n = get gst 0
+put glo n lo
+put ghi n hi
+put gst 0 add n 1
+end
+
+fn alu op uint swsb ulong dst ulong s0 ulong s1 ulong to void
+lo = or ulong op or swsb or EXEC16 shl and dst 255 48
+hi = or shl and s0 255 8 shl and s1 255 40
+emit_inst lo hi
+end
+
+fn lsc_load sbid ulong dst ulong addr_reg ulong to void
+lo = or ulong XE_SEND or SFID_UGM or sbid or EXEC16 shl and dst 255 48
+hi = or shl and addr_reg 255 8 LSC_LOAD_A64_D32
+emit_inst lo hi
+end
+
+fn lsc_store sbid ulong addr_reg ulong data_reg ulong to void
+lo = or ulong XE_SEND or SFID_UGM or sbid EXEC16
+hi = or shl and addr_reg 255 8 or shl and data_reg 255 40 LSC_STORE_A64_D32
+emit_inst lo hi
+end
+
+fn emit_ieee_inv dst ulong src ulong tmp ulong to void
+note Exact IEEE-754 binary32 1.0f / src via math.invm + 2-step madm Newton-Raphson refinement
+alu XE_MATH SWSB_SET0 dst src 0
+alu XE_MADM SWSB_WAIT0 tmp src dst
+alu XE_MADM SWSB_DIST1 dst tmp dst
+alu XE_MADM SWSB_DIST1 tmp src dst
+alu XE_MADM SWSB_DIST1 dst tmp dst
+end
+
+fn emit_eot to void
+lo = or ulong XE_SEND or SFID_TS or SWSB_DIST1 or EXEC16 SEND_EOT
+hi = ulong 0x00000010
+emit_inst lo hi
+end
+
+fn emit_vadd to void
+lsc_load SWSB_SET0 4 2
+lsc_load SWSB_SET1 6 3
+alu XE_ADD SWSB_WAIT0 8 4 6
+lsc_store SWSB_DIST1 1 8
+emit_eot
+end
+
+fn emit_fsum16 to void
+lsc_load SWSB_SET0 4 2
+alu XE_MOV SWSB_WAIT0 8 4 0
+for k ulong 15
+lsc_load SWSB_SET0 6 2
+alu XE_ADD SWSB_WAIT0 8 8 6
+end
+lsc_store SWSB_DIST1 1 8
+emit_eot
+end
+
+fn emit_gemm16 to void
+alu XE_MOV SWSB_DIST1 8 0 0
+for k ulong 16
+lsc_load SWSB_SET0 4 2
+lsc_load SWSB_SET1 6 3
+alu XE_MUL SWSB_WAIT0 10 4 6
+alu XE_ADD SWSB_DIST1 8 8 10
+end
+lsc_store SWSB_DIST1 1 8
+emit_eot
+end
+
+fn emit_rmsnorm to void
+alu XE_MOV SWSB_DIST1 8 0 0
+for k ulong 16
+lsc_load SWSB_SET0 4 2
+alu XE_MUL SWSB_WAIT0 10 4 4
+alu XE_ADD SWSB_DIST1 8 8 10
+end
+alu XE_MUL SWSB_DIST1 8 8 12
+alu XE_ADD SWSB_DIST1 8 8 13
+alu XE_MATH SWSB_SET0 14 8 0
+emit_ieee_inv 8 14 15
+for k ulong 16
+lsc_load SWSB_SET0 4 2
+lsc_load SWSB_SET1 6 3
+alu XE_MUL SWSB_WAIT0 10 4 8
+alu XE_MUL SWSB_DIST1 10 10 6
+lsc_store SWSB_DIST1 1 10
+end
+emit_eot
+end
+
+fn putu64 off ulong v ulong to void
+for k ulong 8
+put gbuf add off k uchar and shr v mul k 8 255
+end
+end
+
+fn getu64 off ulong to ulong
+v = ulong 0
+for k ulong 8
+v = or v shl ulong get gbuf add off k mul k 8
+end
+ret v
+end
+
+fn do_emit to void
+if ne argcnt 3
+fail 2 tuse
+end
+if argis 2 tvadd
+emit_vadd
+else
+if argis 2 tfsum
+emit_fsum16
+else
+if argis 2 tgemm
+emit_gemm16
+else
+if argis 2 trms
+emit_rmsnorm
+else
+fail 2 tuse
+end
+end
+end
+end
+n = get gst 0
+for i ulong n
+putu64 mul i 16 get glo i
+putu64 add mul i 16 8 get ghi i
+end
+nb = mul n 16
+r = write 1 gbuf 0 nb
+if ne r long nb
+fail 3 tio
+end
+end
+
+fn valid_op op uint to bool
+if eq op XE_SEND
+ret true
+end
+if eq op XE_MATH
+ret true
+end
+if eq op XE_ADD
+ret true
+end
+if eq op XE_MUL
+ret true
+end
+if eq op XE_MADM
+ret true
+end
+if eq op XE_NOP
+ret true
+end
+if eq op XE_MOV
+ret true
+end
+if eq op XE_SEL
+ret true
+end
+ret eq op XE_CMP
+end
+
+fn do_check to void
+if ne argcnt 3
+fail 2 tuse
+end
+pn = argread 2 gpath 0 len gpath
+if le pn 0
+fail 2 tuse
+end
+fd = fopen gpath 0 ulong pn 0 0
+if lt fd 0
+fail 3 tio
+end
+sz = fseek int fd 0 2
+if or lt sz 16 gt sz 4096
+c = fclose int fd
+fail 1 tbad
+end
+if ne rem ulong sz 16 0
+c = fclose int fd
+fail 1 tbad
+end
+r = pread int fd gbuf 0 ulong sz 0
+c = fclose int fd
+if ne r sz
+fail 3 tio
+end
+n = div ulong sz 16
+seen_eot = false
+for i ulong n
+lo = getu64 mul i 16
+op = uint and lo 127
+if not valid_op op
+fail 1 tbad
+end
+if eq and shr lo 8 255 0
+fail 1 tbad
+end
+if and eq op XE_SEND ne and lo SEND_EOT 0
+seen_eot = true
+end
+end
+if not seen_eot
+fail 1 tbad
+end
+end
+
+fn main to int
+if lt argcnt 3
+fail 2 tuse
+end
+if argis 1 temit
+do_emit
+ret 0
+end
+if argis 1 tchk
+do_check
+ret 0
+end
+fail 2 tuse
+ret 2
+end

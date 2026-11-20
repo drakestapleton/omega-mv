@@ -18,9 +18,10 @@ static inline int omega_bw_om_check_reg(int64_t r64, uint8_t sub, uint64_t limit
     return 0;
 }
 
-static inline int omega_bw_ir_from_om(const uint64_t ins[8192], const uint64_t meta[512], BlackwellIRProgram *prog) {
+static inline int omega_bw_ir_from_om_limit(const uint64_t ins[8192], const uint64_t meta[512], BlackwellIRProgram *prog, uint32_t gpr_limit) {
     if (!prog) return -1;
     omega_bw_ir_init(prog);
+    if (gpr_limit != 0u && omega_bw_ir_set_gpr_limit(prog, gpr_limit) != 0) return -1;
     if (!ins || !meta) return -1;
     if (meta[5] != 0) return -1; /* emitter recorded an internal overflow or validation error */
     const uint64_t n = meta[0], nv = meta[1], nu = meta[2], nl = meta[3];
@@ -97,6 +98,10 @@ static inline int omega_bw_ir_from_om(const uint64_t ins[8192], const uint64_t m
 fail:
     omega_bw_ir_init(prog);
     return -1;
+}
+
+static inline int omega_bw_ir_from_om(const uint64_t ins[8192], const uint64_t meta[512], BlackwellIRProgram *prog) {
+    return omega_bw_ir_from_om_limit(ins, meta, prog, 0u);
 }
 
 #endif /* OMEGA_BW_OM_IR_H */

@@ -97,15 +97,19 @@ int omega_gpu_cmdlist_mark_independent(OmegaGpuCmdList *cl) {
     return 0;
 }
 
+#include "omega_bw_om_ir.h"
+#include "omega_native.h"
+
 static int build_nop(OmegaGpuCmdList *cl) {
     BlackwellIRProgram *prog = omega_gpu_host_calloc(1, sizeof *prog);
     if (!prog) return -1;
-    omega_bw_ir_init(prog);
-    BlackwellIRInsn ex; memset(&ex, 0, sizeof ex);
-    ex.op = BW_IR_EXIT; ex.dst_vreg = ex.src1_vreg = ex.src2_vreg = ex.src3_vreg = ex.ureg = -1;
-    ex.control = (5u << 9) | (7u << 14) | (7u << 17);
-    BlackwellIRInsn self = ex; self.op = BW_IR_BRA; self.control = 0x000fc000u;
-    int rc = (omega_bw_ir_append(prog, &ex) < 0 || omega_bw_ir_append(prog, &self) < 0 || omega_bw_regalloc_solve(prog) != 0) ? -1 : 0;
+    uint64_t ins[8192], meta[512];
+    memset(ins, 0, sizeof(ins));
+    memset(meta, 0, sizeof(meta));
+    uint64_t om_rc = 1;
+    int rc = (omega2_bw_cmdlist_nop(&om_rc, ins, 8192, meta, 512) == OMEGA_OK && om_rc == 0)
+                 ? omega_bw_ir_from_om(ins, meta, prog)
+                 : -1;
     size_t need = rc == 0 ? omega_bw_program_code_bytes(prog) : 0;
     if (need == 0 || omega_gpu_session_alloc_code(need, &cl->nop_code) != 0) { omega_gpu_host_free(prog); return -1; }
     OmegaBlackwellKernel k;

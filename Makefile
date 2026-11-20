@@ -93,7 +93,7 @@ SRCS += src/omega_blackwell_codegen_tgemm.c src/omega_gpu_tgemm_api.c
 # OWN-30B L1 GEMM (W-L1G, 2026-10-14): native FP8 QMMA, new files only
 SRCS += src/omega_blackwell_codegen_qmma.c src/omega_blackwell_codegen_qg.c
 # OWN-30B W-L1G-D (2026-10-14): router logits + MoE combine for the whole-prompt prefill, new files only
-SRCS += src/omega_blackwell_codegen_pfhost.c src/omega_gpu_pfhost.c
+SRCS += src/omega_blackwell_codegen_pfhost.c src/omega_gpu_pfhost.c src/omega_gpu_moe_plan.c
 # Ternary engine T0 (2026-10-15): KT1, the W2A8 ternary GEMV (omega_gpu_tern_api.h), new files only
 SRCS += src/omega_blackwell_codegen_tern.c src/omega_gpu_tern_api.c
 OBJS = $(patsubst %.c,$(OUT_DIR)/%.o,$(notdir $(SRCS)))
@@ -2892,6 +2892,10 @@ $(GPU_QGEMM_TEST): tests/gpu_qgemm_test.c tests/bw_qmma_model.h tests/bw_warp_si
 GPU_PFHOST_TEST = $(OUT_DIR)/gpu_pfhost_test
 $(GPU_PFHOST_TEST): tests/gpu_pfhost_test.c tests/bw_warp_sim_tc.h src/omega_gpu_pfhost.h src/omega_blackwell_codegen_pfhost.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -DWS_MAX_THREADS=1024 -Itests -o $@ tests/gpu_pfhost_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+
+GPU_MOE_PLAN_TEST = $(OUT_DIR)/gpu_moe_plan_test
+$(GPU_MOE_PLAN_TEST): tests/gpu_moe_plan_test.c src/omega_gpu_moe_plan.h src/omega_gpu_pfhost.h $(OUT_DIR)/libomega_gpu.a
+	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_moe_plan_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 # omega#456: the prefill tests above, host model and warp simulator only. Every run names --host-only or --sim, the two
 # modes that never open the device (each test's main returns before its chip part); chip runs stay under the GB10 lock.
 .PHONY: test-gpu-prefill-host

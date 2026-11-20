@@ -6,11 +6,9 @@
 git clone https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh
 ```
 
-```powershell
-git clone https://interplane.io/drakestapleton/omega-mv.git; cd omega-mv; .\uxl-run.ps1
-```
+On Windows, the same clone, then `.\uxl-run.ps1`. If WSL2 is installed, that script runs `./uxl-run.sh` inside it. If not, it runs the same checks here.
 
-If PowerShell's execution policy blocks the script: `powershell -ExecutionPolicy Bypass -File .\uxl-run.ps1`. What the command checks, and the sample summary, is in [docs/UXL.md](docs/UXL.md).
+`./uxl-run.sh` detects the OS, the CPU, and which backends are present, prints that at the top of the log, and adapts. x86 Linux uses qemu-aarch64 when binfmt is registered. arm64 Linux runs `omc` natively. macOS runs the checks that do not need `omc` and marks the rest NOT_RUN. Native Windows without WSL does the same, and the hint is `wsl --install -d Ubuntu`. When a toolchain package is missing, the log prints one install command for that distro and does not run sudo. `./uxl-run.sh --install-deps` is the switch that runs it. SPIR-V validation, execution (`cl` and `vk`), and conformance checking all run directly in pure seeded Omega (`gpu/spirv/emit.om`, `val.om`, `run.om`, `conform.om`) with no `spirv-tools`, OpenCL ICD, Level Zero, Vulkan, or lavapipe dependency. The process exits 0 when nothing FAILed. NOT_RUN is not a failure. What the run checks is in [docs/UXL.md](docs/UXL.md).
 
 
 

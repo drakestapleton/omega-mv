@@ -16,6 +16,18 @@
 #include "omega_blackwell_codegen_pf.h"
 #include "omega_blackwell_codegen_pfhost.h"
 #include "omega_blackwell_codegen_qmma.h"
+#include "omega_blackwell_codegen_tgemm.h"
+#include "omega_blackwell_codegen_tc2.h"
+#include "omega_blackwell_codegen_qg.h"
+#include "omega_blackwell_codegen_tc.h"
+#include "omega_blackwell_codegen_pattn256.h"
+#include "omega_blackwell_codegen_router.h"
+#include "omega_blackwell_codegen_pattn.h"
+#include "omega_blackwell_codegen_attn.h"
+#include "omega_blackwell_codegen_tern.h"
+#include "omega_blackwell_codegen_attn256.h"
+#include "omega_blackwell_codegen_dec.h"
+#include "omega_blackwell_codegen_gdn.h"
 #include "sha256.h"
 
 static int g_pass = 0, g_fail = 0;
@@ -276,6 +288,124 @@ static void test_max_size_legal_inputs(void) {
         CHK(omega_blackwell_codegen_mc_prog(&s, &p) == 0, "max legal mc h4096 topk16");
         check_max_headroom("max_mc_h4096_topk16", &p);
     }
+    {
+        OmegaTgemmSpec s = { .k = 2304, .n = 768, .rt = 8, .ct = 2, .warps = 16, .kc = 32, .aqn = 1, .layout = 0, .epi = 0, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tgemm_prog(&s, &p) == 0, "max legal tgemm rt8 w16 aqn1");
+        check_max_headroom("max_tgemm_k2304_rt8_w16", &p);
+    }
+    {
+        OmegaTc2Spec s = { .k = 2048, .rt = 8, .ct = 2, .warps = 16, .aqn = 2, .epi = OMEGA_TC2_EPI_F32, .direct = 0, .n = 2048, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tc2_prog(&s, &p) == 0, "max legal tc2 f32 rt8 w16");
+        check_max_headroom("max_tc2_f32_rt8_w16", &p);
+    }
+    {
+        OmegaTc2Spec s = { .k = 2048, .rt = 8, .ct = 2, .warps = 16, .aqn = 2, .epi = OMEGA_TC2_EPI_SWIGLU, .direct = 0, .n = 1536, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tc2_prog(&s, &p) == 0, "max legal tc2 swiglu rt8 w16");
+        check_max_headroom("max_tc2_swiglu_rt8_w16", &p);
+    }
+    {
+        OmegaPqSpec s = { .k = 32768, .in_type = OMEGA_QG_IN_BF16, .mutant = 0, .groups = 32 };
+        CHK(omega_blackwell_codegen_pq_prog(&s, &p) == 0, "max legal pq k32768 bf16 g32");
+        check_max_headroom("max_pq_k32768_bf16_g32", &p);
+    }
+    {
+        OmegaQgSpec s = { .k = 2048, .rt = 4, .warps = 8, .epi = OMEGA_QG_EPI_SWIGLU, .direct = 0, .n = 1536, .wait = 24, .mutant = 0 };
+        CHK(omega_blackwell_codegen_qgemm_prog(&s, &p) == 0, "max legal qgemm swiglu rt4 w8");
+        check_max_headroom("max_qgemm_swiglu_rt4_w8", &p);
+    }
+    {
+        OmegaTcGemmSpec s = { .k = 2048, .rt = 4, .ct = 2, .warps = 8, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tcgemm_prog(&s, &p) == 0, "max legal tcgemm rt4 ct2 w8");
+        check_max_headroom("max_tcgemm_rt4_ct2_w8", &p);
+    }
+}
+
+static void test_qg_and_tc_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_pq_prog(NULL, &prog) != 0 && prog.count == 0, "pq NULL spec");
+    OmegaPqSpec pq_bad[] = {
+        { .k = 64,   .in_type = 0, .mutant = 0,  .groups = 0 },
+        { .k = 128,  .in_type = 2, .mutant = 0,  .groups = 0 },
+        { .k = 128,  .in_type = 0, .mutant = -1, .groups = 0 },
+        { .k = 128,  .in_type = 0, .mutant = 4,  .groups = 0 },
+        { .k = 5120, .in_type = 0, .mutant = 0,  .groups = 0 },
+    };
+    for (size_t i = 0; i < sizeof(pq_bad) / sizeof(pq_bad[0]); i++) {
+        prog.count = 44;
+        CHK(omega_blackwell_codegen_pq_prog(&pq_bad[i], &prog) != 0 && prog.count == 0, "pq invalid spec");
+    }
+    CHK(omega_blackwell_codegen_qgemm_prog(NULL, &prog) != 0 && prog.count == 0, "qgemm NULL spec");
+    OmegaQgSpec qg_bad[] = {
+        { .k = 64,  .rt = 4, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 8, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 4, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 8, .epi = 2, .direct = 0, .n = 256, .wait = 24, .mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 121,.mutant = 0 },
+        { .k = 128, .rt = 4, .warps = 8, .epi = 0, .direct = 0, .n = 256, .wait = 24, .mutant = -1 },
+    };
+    for (size_t i = 0; i < sizeof(qg_bad) / sizeof(qg_bad[0]); i++) {
+        prog.count = 45;
+        CHK(omega_blackwell_codegen_qgemm_prog(&qg_bad[i], &prog) != 0 && prog.count == 0, "qgemm invalid spec");
+        CHK(omega_qg_shared_bytes(&qg_bad[i]) == 0 && omega_qg_span(&qg_bad[i]) == 0, "qg helpers 0");
+    }
+    prog.count = 46;
+    CHK(omega_blackwell_codegen_tc_probe_prog(-1, &prog) != 0 && prog.count == 0, "tc_probe mutant -1");
+    prog.count = 46;
+    CHK(omega_blackwell_codegen_tc_probe_prog(2, &prog) != 0 && prog.count == 0, "tc_probe mutant 2");
+    prog.count = 47;
+    CHK(omega_blackwell_codegen_tc_peak_prog(0, 4, 8, 32, &prog) != 0 && prog.count == 0, "tc_peak iters 0");
+    prog.count = 47;
+    CHK(omega_blackwell_codegen_tc_peak_prog(16, 17, 8, 32, &prog) != 0 && prog.count == 0, "tc_peak chains 17");
+    prog.count = 48;
+    CHK(omega_blackwell_codegen_tc_bw_prog(0, 1, 32, &prog) != 0 && prog.count == 0, "tc_bw iters 0");
+    prog.count = 48;
+    CHK(omega_blackwell_codegen_tc_bw_prog(16, 1, 16, &prog) != 0 && prog.count == 0, "tc_bw threads 16");
+    CHK(omega_blackwell_codegen_tcgemm_prog(NULL, &prog) != 0 && prog.count == 0, "tcgemm NULL spec");
+    OmegaTcGemmSpec tc_bad[] = {
+        { .k = 64,  .rt = 2, .ct = 2, .warps = 4, .mutant = 0 },
+        { .k = 128, .rt = 1, .ct = 2, .warps = 4, .mutant = 0 },
+        { .k = 128, .rt = 2, .ct = 2, .warps = 4, .mutant = -1 },
+        { .k = 128, .rt = 2, .ct = 2, .warps = 4, .mutant = 5 },
+    };
+    for (size_t i = 0; i < sizeof(tc_bad) / sizeof(tc_bad[0]); i++) {
+        prog.count = 49;
+        CHK(omega_blackwell_codegen_tcgemm_prog(&tc_bad[i], &prog) != 0 && prog.count == 0, "tcgemm invalid spec");
+        CHK(omega_tcgemm_shared_bytes(&tc_bad[i]) == 0 && omega_tcgemm_span(&tc_bad[i]) == 0, "tcgemm helpers 0");
+    }
+}
+
+static void test_tgemm_and_tc2_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_tgemm_prog(NULL, &prog) != 0 && prog.count == 0, "tgemm NULL spec");
+    OmegaTgemmSpec tg_bad[] = {
+        { .k = 64,   .n = 256, .rt = 4, .ct = 2, .warps = 8,  .kc = 32, .aqn = 2, .layout = 0, .epi = 0, .mutant = 0 },
+        { .k = 128,  .n = 256, .rt = 3, .ct = 2, .warps = 8,  .kc = 32, .aqn = 2, .layout = 0, .epi = 0, .mutant = 0 },
+        { .k = 128,  .n = 256, .rt = 4, .ct = 1, .warps = 8,  .kc = 32, .aqn = 2, .layout = 0, .epi = 0, .mutant = 0 },
+        { .k = 128,  .n = 256, .rt = 4, .ct = 2, .warps = 4,  .kc = 32, .aqn = 2, .layout = 0, .epi = 0, .mutant = 0 },
+        { .k = 128,  .n = 256, .rt = 4, .ct = 2, .warps = 8,  .kc = 32, .aqn = 2, .layout = 0, .epi = 0, .mutant = -1 },
+        { .k = 128,  .n = 256, .rt = 4, .ct = 2, .warps = 8,  .kc = 32, .aqn = 2, .layout = 0, .epi = 0, .mutant = 6 },
+    };
+    for (size_t i = 0; i < sizeof(tg_bad) / sizeof(tg_bad[0]); i++) {
+        prog.count = 55;
+        CHK(omega_blackwell_codegen_tgemm_prog(&tg_bad[i], &prog) != 0 && prog.count == 0, "tgemm invalid spec");
+        CHK(omega_tgemm_shared_bytes(&tg_bad[i]) == 0 && omega_tgemm_span(&tg_bad[i]) == 0 && omega_tgemm_bm(&tg_bad[i]) == 0, "tgemm helpers 0");
+    }
+    CHK(omega_blackwell_codegen_tc2_prog(NULL, &prog) != 0 && prog.count == 0, "tc2 NULL spec");
+    OmegaTc2Spec tc_bad[] = {
+        { .k = 64,   .rt = 4, .ct = 2, .warps = 8,  .aqn = 2, .epi = 0, .direct = 0, .n = 256, .mutant = 0 },
+        { .k = 128,  .rt = 3, .ct = 2, .warps = 8,  .aqn = 2, .epi = 0, .direct = 0, .n = 256, .mutant = 0 },
+        { .k = 128,  .rt = 4, .ct = 1, .warps = 8,  .aqn = 2, .epi = 0, .direct = 0, .n = 256, .mutant = 0 },
+        { .k = 128,  .rt = 4, .ct = 2, .warps = 2,  .aqn = 2, .epi = 0, .direct = 0, .n = 256, .mutant = 0 },
+        { .k = 128,  .rt = 4, .ct = 2, .warps = 8,  .aqn = 2, .epi = 2, .direct = 0, .n = 256, .mutant = 0 },
+        { .k = 128,  .rt = 4, .ct = 2, .warps = 8,  .aqn = 2, .epi = 0, .direct = 2, .n = 256, .mutant = 0 },
+        { .k = 128,  .rt = 4, .ct = 2, .warps = 8,  .aqn = 2, .epi = 0, .direct = 0, .n = 256, .mutant = -1 },
+        { .k = 128,  .rt = 4, .ct = 2, .warps = 8,  .aqn = 2, .epi = 0, .direct = 0, .n = 256, .mutant = 5 },
+    };
+    for (size_t i = 0; i < sizeof(tc_bad) / sizeof(tc_bad[0]); i++) {
+        prog.count = 66;
+        CHK(omega_blackwell_codegen_tc2_prog(&tc_bad[i], &prog) != 0 && prog.count == 0, "tc2 invalid spec");
+        CHK(omega_tc2_shared_bytes(&tc_bad[i]) == 0 && omega_tc2_span(&tc_bad[i]) == 0, "tc2 helpers 0");
+    }
 }
 
 static void test_gemm_error_paths(void) {
@@ -390,12 +520,392 @@ static void dump_metrics(void) {
         CHK(omega_blackwell_codegen_mc_prog(&s, &p) == 0, "mc h2048 topk8");
         report_kernel("pfhost_mc_h2048_k8", &p, 16);
     }
+    {
+        OmegaTgemmSpec s = { .k = 2304, .n = 768, .rt = 8, .ct = 2, .warps = 16, .kc = 32, .aqn = 1, .layout = 0, .epi = 0, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tgemm_prog(&s, &p) == 0, "tgemm k2304 rt8 w16");
+        report_kernel("tgemm_k2304_n768_rt8_w16", &p, 16);
+    }
+    {
+        OmegaTc2Spec s = { .k = 2048, .rt = 8, .ct = 2, .warps = 16, .aqn = 2, .epi = OMEGA_TC2_EPI_F32, .direct = 0, .n = 2048, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tc2_prog(&s, &p) == 0, "tc2 f32 k2048 rt8 w16");
+        report_kernel("tc2_f32_k2048_rt8_w16", &p, 16);
+    }
+    {
+        OmegaTc2Spec s = { .k = 2048, .rt = 8, .ct = 2, .warps = 16, .aqn = 2, .epi = OMEGA_TC2_EPI_SWIGLU, .direct = 1, .n = 1536, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tc2_prog(&s, &p) == 0, "tc2 swiglu direct k2048 rt8 w16");
+        report_kernel("tc2_swiglu_d1_k2048_rt8_w16", &p, 16);
+    }
+    {
+        OmegaPqSpec s = { .k = 2048, .in_type = OMEGA_QG_IN_BF16, .mutant = 0, .groups = 0 };
+        CHK(omega_blackwell_codegen_pq_prog(&s, &p) == 0, "pq bf16 k2048");
+        report_kernel("qg_pq_bf16_k2048", &p, 16);
+    }
+    {
+        OmegaQgSpec s = { .k = 2048, .rt = 4, .warps = 8, .epi = OMEGA_QG_EPI_F32, .direct = 0, .n = 2048, .wait = 24, .mutant = 0 };
+        CHK(omega_blackwell_codegen_qgemm_prog(&s, &p) == 0, "qgemm f32 k2048 rt4 w8");
+        report_kernel("qg_qgemm_f32_k2048_rt4_w8", &p, 8);
+    }
+    {
+        OmegaQgSpec s = { .k = 2048, .rt = 4, .warps = 8, .epi = OMEGA_QG_EPI_SWIGLU, .direct = 1, .n = 1536, .wait = 24, .mutant = 0 };
+        CHK(omega_blackwell_codegen_qgemm_prog(&s, &p) == 0, "qgemm swiglu d1 k2048 rt4 w8");
+        report_kernel("qg_qgemm_swiglu_d1_k2048", &p, 8);
+    }
+    {
+        CHK(omega_blackwell_codegen_tc_probe_prog(0, &p) == 0, "tc_probe");
+        report_kernel("tc_probe_m0", &p, 1);
+    }
+    {
+        OmegaTcGemmSpec s = { .k = 2048, .rt = 4, .ct = 2, .warps = 8, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tcgemm_prog(&s, &p) == 0, "tcgemm k2048 rt4 ct2 w8");
+        report_kernel("tc_tcgemm_k2048_rt4_ct2_w8", &p, 8);
+    }
+    {
+        CHK(omega_blackwell_codegen_tc_peak_prog(64, 8, 8, 256, &p) == 0, "tc_peak");
+        report_kernel("tc_peak_c8_s8_t256", &p, 8);
+    }
+    {
+        CHK(omega_blackwell_codegen_tc_bw_prog(64, 4, 256, &p) == 0, "tc_bw");
+        report_kernel("tc_bw_g4_t256", &p, 8);
+    }
+    {
+        OmegaPrefillAttn256Spec s = { .mutant = 0, .q_heads = 24, .kv_heads = 4 };
+        CHK(omega_blackwell_codegen_prefill_attn256_prog(&s, &p) == 0, "pattn256 q24 kv4");
+        report_kernel("pattn256_q24_kv4", &p, 8);
+    }
+    {
+        OmegaPrefillAttn256Spec s = { .mutant = 0, .q_heads = 16, .kv_heads = 2 };
+        CHK(omega_blackwell_codegen_prefill_attn256_prog(&s, &p) == 0, "pattn256 q16 kv2");
+        report_kernel("pattn256_q16_kv2", &p, 8);
+    }
+    {
+        OmegaRouterSpec s = { .warps = 8, .depth = 4, .mutant = 0, .experts = 128, .shared = 0, .xstride = 0, .lbstride = 0 };
+        CHK(omega_blackwell_codegen_router_prog(&s, &p) == 0, "router w8 d4 e128");
+        report_kernel("router_w8_d4_e128", &p, 8);
+    }
+    {
+        OmegaRouterSpec s = { .warps = 8, .depth = 4, .mutant = 0, .experts = 256, .shared = 1, .xstride = 8192, .lbstride = 16384 };
+        CHK(omega_blackwell_codegen_router_prog(&s, &p) == 0, "router w8 d4 e256 sh1 rows");
+        report_kernel("router_w8_d4_e256_sh1_rows", &p, 8);
+    }
+    {
+        OmegaPrefillAttnSpec s = { .warps = 8, .mutant = 0, .mode = OMEGA_PATTN_MODE_FUSED, .mirror = 0 };
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&s, &p) == 0, "pattn w8 fused");
+        report_kernel("pattn_w8_fused", &p, 8);
+    }
+    {
+        OmegaPrefillAttnSpec s = { .warps = 4, .mutant = 0, .mode = OMEGA_PATTN_MODE_ATTEND, .mirror = 0 };
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&s, &p) == 0, "pattn w4 attend");
+        report_kernel("pattn_w4_attend", &p, 4);
+    }
+    {
+        OmegaPrefillAttnSpec s = { .warps = 8, .mutant = 0, .mode = OMEGA_PATTN_MODE_APPEND, .mirror = 1 };
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&s, &p) == 0, "pattn w8 append mirror");
+        report_kernel("pattn_w8_append_mirror", &p, 8);
+    }
+    {
+        OmegaDecodeAttnSpec s = { .depth = 2, .mutant = 0 };
+        CHK(omega_blackwell_codegen_decode_attn_prog(&s, &p) == 0, "attn d2");
+        report_kernel("attn_d2", &p, 8);
+    }
+    {
+        OmegaDecodeAttnSpec s = { .depth = 4, .mutant = 0 };
+        CHK(omega_blackwell_codegen_decode_attn_prog(&s, &p) == 0, "attn d4");
+        report_kernel("attn_d4", &p, 8);
+    }
+    {
+        OmegaTernGemvSpec s = { .k = 2560, .layout = OMEGA_TERN_LAYOUT_ROWMAJOR, .rows = 1, .warps = 8, .depth = 2, .epi = OMEGA_TERN_EPI_F32, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tern_gemv_prog(&s, &p) == 0, "tern rm r1 w8 d2 f32");
+        report_kernel("tern_rm_r1_w8_d2_f32", &p, 8);
+    }
+    {
+        OmegaTernGemvSpec s = { .k = 10240, .layout = OMEGA_TERN_LAYOUT_BLOCK, .rows = 4, .warps = 8, .depth = 2, .epi = OMEGA_TERN_EPI_I32, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tern_gemv_prog(&s, &p) == 0, "tern blk r4 w8 d2 2ch");
+        report_kernel("tern_blk_r4_w8_d2_2ch", &p, 8);
+    }
+    {
+        OmegaDecodeAttn256Spec s = { .depth = 2, .mutant = 0, .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 };
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&s, &p) == 0, "attn256 d2 q24");
+        report_kernel("attn256_d2_q24", &p, 8);
+    }
+    {
+        OmegaDecodeAttn256Spec s = { .depth = 2, .mutant = 0, .prep = 1, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 };
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&s, &p) == 0, "attn256 prep q24");
+        report_kernel("attn256_prep_q24", &p, 8);
+    }
+    {
+        OmegaDecodeAttn256Spec s = { .depth = 2, .mutant = 0, .prep = 0, .q_heads = 16, .kv_heads = 2, .q_per_cta = 4, .multi = 1 };
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&s, &p) == 0, "attn256 multi q16");
+        report_kernel("attn256_multi_q16", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_AXPY, .stride = 256 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec axpy");
+        report_kernel("dec_axpy", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_RES, .mode = OMEGA_DEC_RES_COMBINE | OMEGA_DEC_RES_NORM | OMEGA_DEC_RES_ROWS, .stride = 64, .width = 2048, .groups = 9 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec res comb norm rows g9");
+        report_kernel("dec_res_comb_norm_rows_g9", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_RES, .mode = OMEGA_DEC_RES_ADD | OMEGA_DEC_RES_NORM, .width = 5120 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec res add norm w5120");
+        report_kernel("dec_res_add_norm_w5120", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_SWIGLU, .width = 17408 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec swiglu");
+        report_kernel("dec_swiglu_w17408", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_ARGMAX, .mode = 1 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec argmax idx");
+        report_kernel("dec_argmax_idx", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_GATHER, .width = 2048, .stride = 10240 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec gather");
+        report_kernel("dec_gather", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_GATE, .mode = 1, .width = 2048, .stride = 2048 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec gate rows");
+        report_kernel("dec_gate_rows", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_GROUP, .groups = 9 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec group g9");
+        report_kernel("dec_group_g9", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_XBOUND, .mode = 0, .width = 2048 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec xbound");
+        report_kernel("dec_xbound", &p, 8);
+    }
+    {
+        OmegaDecSpec s = { .kind = OMEGA_DEC_XBOUND, .mode = 1 };
+        CHK(omega_blackwell_codegen_dec_prog(&s, &p) == 0, "dec xscale");
+        report_kernel("dec_xscale", &p, 8);
+    }
+    {
+        OmegaGdnSpec s = { .mutant = 0, .copy = 0, .ratio = 3, .state_bf16 = 0 };
+        CHK(omega_blackwell_codegen_gdn_prog(&s, &p) == 0, "gdn decode f32");
+        report_kernel("gdn_decode_r3_f32", &p, 8);
+    }
+    {
+        OmegaGdnSpec s = { .mutant = 0, .copy = 0, .ratio = 2, .state_bf16 = 1 };
+        CHK(omega_blackwell_codegen_gdn_prog(&s, &p) == 0, "gdn decode r2 bf16");
+        report_kernel("gdn_decode_r2_bf16", &p, 8);
+    }
+    {
+        OmegaGdnSpec s = { .mutant = 0, .copy = OMEGA_GDN_COPY };
+        CHK(omega_blackwell_codegen_gdn_copy_prog(&s, &p) == 0, "gdn copy");
+        report_kernel("gdn_copy", &p, 8);
+    }
+    {
+        OmegaGdnSpec s = { .mutant = 0, .copy = 0, .ratio = 3 };
+        CHK(omega_blackwell_codegen_gdn_prep_prog(&s, &p) == 0, "gdn prep r3");
+        report_kernel("gdn_prep_r3", &p, 4);
+    }
+    {
+        OmegaGdnSpec s = { .mutant = 0, .copy = 0, .ratio = 2, .state_bf16 = 1 };
+        CHK(omega_blackwell_codegen_gdn_scan_prog(&s, &p) == 0, "gdn scan r2 bf16");
+        report_kernel("gdn_scan_r2_bf16", &p, 8);
+    }
+    {
+        OmegaGdnSpec s = { .mutant = 0, .copy = 0, .ratio = 3 };
+        CHK(omega_blackwell_codegen_gdn_post_prog(&s, &p) == 0, "gdn post r3");
+        report_kernel("gdn_post_r3", &p, 8);
+    }
+    {
+        OmegaGdnSpec s = { .mutant = 0, .copy = 0, .ratio = 3 };
+        CHK(omega_blackwell_codegen_gdn_multi_prog(&s, &p) == 0, "gdn multi r3");
+        report_kernel("gdn_multi_r3", &p, 8);
+    }
+}
+
+static void test_dec_and_gdn_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_dec_prog(NULL, &prog) != 0 && prog.count == 0, "dec NULL spec");
+    OmegaDecSpec dc_bad[] = {
+        { .kind = 0 },
+        { .kind = OMEGA_DEC_AXPY, .stride = 0 },
+        { .kind = OMEGA_DEC_AXPY, .stride = 100 },
+        { .kind = OMEGA_DEC_RES, .mode = 0 },
+        { .kind = OMEGA_DEC_RES, .mode = OMEGA_DEC_RES_ADD | OMEGA_DEC_RES_COMBINE },
+        { .kind = OMEGA_DEC_RES, .mode = OMEGA_DEC_RES_COMBINE, .width = 4096 },
+        { .kind = OMEGA_DEC_RES, .mode = OMEGA_DEC_RES_COMBINE | OMEGA_DEC_RES_ROWS, .stride = 8 },
+        { .kind = OMEGA_DEC_RES, .mode = OMEGA_DEC_RES_ADD, .groups = 9 },
+        { .kind = OMEGA_DEC_SWIGLU, .width = 100 },
+        { .kind = OMEGA_DEC_GATHER, .width = 0, .stride = 128 },
+        { .kind = OMEGA_DEC_GROUP, .groups = 17 },
+        { .kind = OMEGA_DEC_GROUP, .groups = 8, .mode = 1 },
+        { .kind = OMEGA_DEC_XBOUND, .mode = 2 },
+        { .kind = OMEGA_DEC_XBOUND, .mode = 0, .mutant = -1 },
+        { .kind = OMEGA_DEC_XBOUND, .mode = 1, .mutant = 1 },
+    };
+    for (size_t i = 0; i < sizeof(dc_bad) / sizeof(dc_bad[0]); i++) {
+        prog.count = 57;
+        CHK(omega_blackwell_codegen_dec_prog(&dc_bad[i], &prog) != 0 && prog.count == 0, "dec invalid spec");
+    }
+    CHK(omega_blackwell_codegen_gdn_prog(NULL, &prog) != 0 && prog.count == 0, "gdn NULL spec");
+    OmegaGdnSpec gd_bad[] = {
+        { .mutant = -1, .copy = 0, .ratio = 3 },
+        { .mutant = 5,  .copy = 0, .ratio = 3 },
+        { .mutant = 0,  .copy = 1, .ratio = 3 },
+        { .mutant = 0,  .copy = 0, .ratio = 4 },
+    };
+    for (size_t i = 0; i < sizeof(gd_bad) / sizeof(gd_bad[0]); i++) {
+        prog.count = 58;
+        CHK(omega_blackwell_codegen_gdn_prog(&gd_bad[i], &prog) != 0 && prog.count == 0, "gdn invalid spec");
+        prog.count = 58;
+        CHK(omega_blackwell_codegen_gdn_multi_prog(&gd_bad[i], &prog) != 0 && prog.count == 0, "gdn multi invalid spec");
+    }
+    OmegaGdnSpec cp_bad = { .mutant = 1, .copy = OMEGA_GDN_COPY };
+    prog.count = 59;
+    CHK(omega_blackwell_codegen_gdn_copy_prog(&cp_bad, &prog) != 0 && prog.count == 0, "gdn copy invalid mutant");
+}
+
+static void test_tern_and_attn256_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_tern_gemv_prog(NULL, &prog) != 0 && prog.count == 0, "tern NULL spec");
+    OmegaTernGemvSpec tn_bad[] = {
+        { .k = 0,     .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 16640, .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 2560,  .layout = 1, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 2560,  .layout = 2, .rows = 2, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 10240, .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 1, .mutant = 0 },
+        { .k = 2560,  .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = -1 },
+        { .k = 2560,  .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 6 },
+    };
+    for (size_t i = 0; i < sizeof(tn_bad) / sizeof(tn_bad[0]); i++) {
+        prog.count = 55;
+        CHK(omega_blackwell_codegen_tern_gemv_prog(&tn_bad[i], &prog) != 0 && prog.count == 0, "tern invalid spec");
+        CHK(omega_tern_gemv_spec_ok(&tn_bad[i]) == 0, "tern_spec_ok 0");
+    }
+    CHK(omega_blackwell_codegen_decode_attn256_prog(NULL, &prog) != 0 && prog.count == 0, "attn256 NULL spec");
+    OmegaDecodeAttn256Spec a2_bad[] = {
+        { .depth = 0, .mutant = 0,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 5, .mutant = 0,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = -1, .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = 6,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = 0,  .prep = 2, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = 0,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 7, .multi = 0 },
+        { .depth = 2, .mutant = 0,  .prep = 0, .q_heads = 18, .kv_heads = 3, .q_per_cta = 6, .multi = 1 },
+    };
+    for (size_t i = 0; i < sizeof(a2_bad) / sizeof(a2_bad[0]); i++) {
+        prog.count = 56;
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&a2_bad[i], &prog) != 0 && prog.count == 0, "attn256 invalid spec");
+    }
+}
+
+static void test_pattn_and_attn_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_prefill_attn_prog(NULL, &prog) != 0 && prog.count == 0, "pattn NULL spec");
+    OmegaPrefillAttnSpec pa_bad[] = {
+        { .warps = 2, .mutant = 0,  .mode = 0, .mirror = 0 },
+        { .warps = 8, .mutant = -1, .mode = 0, .mirror = 0 },
+        { .warps = 8, .mutant = 5,  .mode = 0, .mirror = 0 },
+        { .warps = 8, .mutant = 0,  .mode = 3, .mirror = 0 },
+        { .warps = 8, .mutant = 0,  .mode = 0, .mirror = 1 },
+        { .warps = 8, .mutant = 0,  .mode = 1, .mirror = 2 },
+    };
+    for (size_t i = 0; i < sizeof(pa_bad) / sizeof(pa_bad[0]); i++) {
+        prog.count = 53;
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&pa_bad[i], &prog) != 0 && prog.count == 0, "pattn invalid spec");
+        CHK(omega_pattn_spec_ok(&pa_bad[i]) == 0, "pattn_spec_ok 0");
+    }
+    CHK(omega_blackwell_codegen_decode_attn_prog(NULL, &prog) != 0 && prog.count == 0, "attn NULL spec");
+    OmegaDecodeAttnSpec da_bad[] = {
+        { .depth = 0, .mutant = 0 },
+        { .depth = 5, .mutant = 0 },
+        { .depth = 2, .mutant = -1 },
+        { .depth = 2, .mutant = 5 },
+    };
+    for (size_t i = 0; i < sizeof(da_bad) / sizeof(da_bad[0]); i++) {
+        prog.count = 54;
+        CHK(omega_blackwell_codegen_decode_attn_prog(&da_bad[i], &prog) != 0 && prog.count == 0, "attn invalid spec");
+    }
+}
+
+static void test_pattn256_and_router_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_prefill_attn256_prog(NULL, &prog) != 0 && prog.count == 0, "pattn256 NULL spec");
+    OmegaPrefillAttn256Spec pa_bad[] = {
+        { .mutant = -1, .q_heads = 24, .kv_heads = 4 },
+        { .mutant = 3,  .q_heads = 24, .kv_heads = 4 },
+        { .mutant = 0,  .q_heads = 25, .kv_heads = 4 },
+        { .mutant = 0,  .q_heads = 36, .kv_heads = 4 },
+    };
+    for (size_t i = 0; i < sizeof(pa_bad) / sizeof(pa_bad[0]); i++) {
+        prog.count = 51;
+        CHK(omega_blackwell_codegen_prefill_attn256_prog(&pa_bad[i], &prog) != 0 && prog.count == 0, "pattn256 invalid spec");
+        CHK(omega_pattn256_spec_ok(&pa_bad[i]) == 0, "pattn256_spec_ok 0");
+    }
+    CHK(omega_blackwell_codegen_router_prog(NULL, &prog) != 0 && prog.count == 0, "router NULL spec");
+    OmegaRouterSpec rt_bad[] = {
+        { .warps = 4,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 3, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = -1, .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 7,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 5,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 6,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 64,  .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 2, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 8192, .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 4096, .lbstride = 16 },
+    };
+    for (size_t i = 0; i < sizeof(rt_bad) / sizeof(rt_bad[0]); i++) {
+        prog.count = 52;
+        CHK(omega_blackwell_codegen_router_prog(&rt_bad[i], &prog) != 0 && prog.count == 0, "router invalid spec");
+    }
+}
+
+static void test_regalloc_and_matmul_error_paths(void) {
+    uint64_t cfg[4] = { 257, 0, 0, 0 };
+    int64_t vinfo[256 * 3];
+    uint64_t uinfo[32];
+    int64_t res[290];
+    memset(vinfo, 0, sizeof(vinfo));
+    memset(uinfo, 0, sizeof(uinfo));
+    memset(res, 0, sizeof(res));
+    uint64_t rc = 0;
+    CHK(omega2_bw_regalloc_solve(&rc, cfg, 4, vinfo, 256 * 3, uinfo, 32, res, 290) == OMEGA_OK && rc == 1,
+        "regalloc nv>256 rejected");
+    cfg[0] = 0; cfg[1] = 33; cfg[2] = 0; rc = 0;
+    CHK(omega2_bw_regalloc_solve(&rc, cfg, 4, vinfo, 256 * 3, uinfo, 32, res, 290) == OMEGA_OK && rc == 1,
+        "regalloc nu>32 rejected");
+    cfg[0] = 0; cfg[1] = 0; cfg[2] = 247; rc = 0;
+    CHK(omega2_bw_regalloc_solve(&rc, cfg, 4, vinfo, 256 * 3, uinfo, 32, res, 290) == OMEGA_OK && rc == 1,
+        "regalloc gpr_limit>246 rejected");
+
+    BlackwellIRProgram prog;
+    OmegaMatMulSpec bad = { .m = 15, .k = 16, .n = 8, .precision = OMEGA_MATMUL_PRECISION_BF16 };
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_tensor_prog(&bad, &prog) != 0 && prog.count == 0,
+        "matmul_tensor bad m fails closed");
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_tensor_loop_prog(&bad, 1, 0, &prog) != 0 && prog.count == 0,
+        "matmul_tensor_loop bad m fails closed");
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_frag_prog(&bad, 1, 1, 0, &prog) != 0 && prog.count == 0,
+        "matmul_frag bad m fails closed");
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_frag_block_prog(&bad, 1, 1, 2, 2, 0, &prog) != 0 && prog.count == 0,
+        "matmul_frag_block bad m fails closed");
 }
 
 int main(void) {
     test_unpacker_bounds();
     test_gemm_error_paths();
     test_qmma_and_pfhost_error_paths();
+    test_tgemm_and_tc2_error_paths();
+    test_qg_and_tc_error_paths();
+    test_pattn256_and_router_error_paths();
+    test_pattn_and_attn_error_paths();
+    test_tern_and_attn256_error_paths();
+    test_dec_and_gdn_error_paths();
+    test_regalloc_and_matmul_error_paths();
     test_max_size_legal_inputs();
     dump_metrics();
     printf("test_bw_om_codegen_bounds: %d passed, %d failed: %s\n", g_pass, g_fail, g_fail ? "FAIL" : "PASS");
