@@ -17,6 +17,7 @@
 /* tg_store.c -- M22 transactional parameter-state substrate. See tg_store.h. */
 #include "train/tg_store.h"
 #include "sha256.h"
+#include "omega_api_decl.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -28,8 +29,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define GEN_MAGIC "OMTRGEN1"
-#define GEN_VERSION 1u
 #define GEN_HDR 152u          /* bytes; digest is the last 32 */
 #define GEN_HASHED_HDR 120u   /* header bytes covered by the digest */
 #define CUR_MAGIC "OMTRCUR1"
@@ -179,17 +178,8 @@ static void record_refusal(const char *dir, int err, uint64_t gen, const char *d
 static void gen_header(uint8_t h[GEN_HDR], uint64_t gen, uint64_t step, size_t pb, size_t ob,
                        uint64_t dlen, const uint8_t dhead[TG_DIGEST], const uint8_t prev[TG_DIGEST])
 {
-    memset(h, 0, GEN_HDR);
-    memcpy(h, GEN_MAGIC, 8);
-    put32(h + 8, GEN_VERSION);
-    put32(h + 12, 0);
-    put64(h + 16, gen);
-    put64(h + 24, step);
-    put64(h + 32, (uint64_t)pb);
-    put64(h + 40, (uint64_t)ob);
-    put64(h + 48, dlen);
-    memcpy(h + 56, dhead, TG_DIGEST);
-    memcpy(h + 88, prev, TG_DIGEST);
+    const uint64_t fields[5] = { gen, step, pb, ob, dlen };
+    tg_encode_generation(fields, dhead, prev, h);
 }
 
 static void gen_digest(const uint8_t h[GEN_HDR], const uint8_t *p, size_t pb, const uint8_t *o, size_t ob,
@@ -223,15 +213,10 @@ static int load_gen(const char *path, uint64_t expect_gen, const uint8_t *expect
     size_t got;
     if (read_full(fd, h, GEN_HDR, &got) < 0) { close(fd); return TG_E_IO; }
     if (got < GEN_HDR) { close(fd); return TG_E_TRUNC; }
-    if (memcmp(h, GEN_MAGIC, 8) || get32(h + 8) != GEN_VERSION || get32(h + 12) != 0) { close(fd); return TG_E_FORMAT; }
-    uint64_t pb = get64(h + 32), ob = get64(h + 40);
-    /* Each length is capped at 2^40 before the sum, so `want` cannot overflow
-     * and the file-size check below bounds every allocation. */
-    if (pb > (1ull << 40) || ob > (1ull << 40)) { close(fd); return TG_E_FORMAT; }
-    uint64_t want = GEN_HDR + pb + ob;
-    if ((uint64_t)sb.st_size < want) { close(fd); return TG_E_TRUNC; }
-    if ((uint64_t)sb.st_size > want) { close(fd); return TG_E_FORMAT; }
-    if (get64(h + 16) != expect_gen) { close(fd); return TG_E_FORMAT; }
+    uint64_t fields[5] = {0};
+    uint64_t status = tg_decode_generation(h, (uint64_t)sb.st_size, expect_gen, fields);
+    if (status != 1) { close(fd); return status == 2 ? TG_E_TRUNC : TG_E_FORMAT; }
+    uint64_t pb = fields[2], ob = fields[3];
     out->params = malloc(pb ? pb : 1);
     out->opt = malloc(ob ? ob : 1);
     if (!out->params || !out->opt) { close(fd); tg_snapshot_free(out); return TG_E_NOMEM; }
@@ -247,10 +232,10 @@ static int load_gen(const char *path, uint64_t expect_gen, const uint8_t *expect
         tg_snapshot_free(out); return TG_E_DIGEST;
     }
     out->gen = expect_gen;
-    out->step = get64(h + 24);
+    out->step = fields[1];
     out->param_bytes = pb;
     out->opt_bytes = ob;
-    out->dispatch_len = get64(h + 48);
+    out->dispatch_len = fields[4];
     memcpy(out->dispatch_head, h + 56, TG_DIGEST);
     memcpy(out->prev_digest, h + 88, TG_DIGEST);
     memcpy(out->digest, d, TG_DIGEST);
