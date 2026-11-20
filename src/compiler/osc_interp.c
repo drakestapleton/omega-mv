@@ -18,11 +18,11 @@
  * osc_interp.c -- reference interpreter for the OSC-1 IR (DESIGN section 5).
  * OSC-1 slice; not a general Omega compiler; no self-hosting.
  *
- * Checked signed arithmetic is computed exactly in 128-bit integers and then
- * range-checked, independently of the native code's flag/extension tricks, so
- * the differential test compares two different derivations of section 5.
+ * Scalar operations use the seeded OSC scalar unit. It reports OSC trap
+ * codes to this runtime and executes independently of the native back end.
  */
 #include "osc_interp.h"
+#include "omega_api_decl.h"
 
 #include <string.h>
 
@@ -32,95 +32,7 @@ typedef struct {
     uint64_t steps;
 } Ctx;
 
-typedef __int128 i128;
-
 static void trap(Ctx *c, unsigned code) { osc_rt_trap(c->rt, code); }
-
-static uint64_t canon(OscScalar t, uint64_t x) {
-    unsigned w = osc_scalar_width(t);
-    if (t == OSC_T_BOOL) return x & 1;
-    if (w >= 64) return x;
-    if (osc_scalar_signed(t)) {
-        uint64_t m = 1ULL << (w - 1);
-        x &= (1ULL << w) - 1;
-        return (x ^ m) - m;
-    }
-    return x & ((1ULL << w) - 1);
-}
-
-static i128 smin(unsigned w) { return -((i128)1 << (w - 1)); }
-static i128 smax(unsigned w) { return ((i128)1 << (w - 1)) - 1; }
-
-/* exact signed result -> canonical, or OVERFLOW */
-static uint64_t sfit(Ctx *c, unsigned w, i128 r) {
-    if (r < smin(w) || r > smax(w)) trap(c, OSC_TRAP_OVERFLOW);
-    return (uint64_t)(int64_t)r;
-}
-
-static uint64_t do_bin(Ctx *c, unsigned sub, OscScalar t, OscScalar tb, uint64_t a, uint64_t b) {
-    unsigned w = osc_scalar_width(t);
-    bool s = osc_scalar_signed(t);
-    i128 A = s ? (i128)(int64_t)a : (i128)a, B = osc_scalar_signed(tb) ? (i128)(int64_t)b : (i128)b;
-    switch (sub) {
-    case OSC_B_ADD: return s ? sfit(c, w, A + B) : canon(t, a + b);
-    case OSC_B_SUB: return s ? sfit(c, w, A - B) : canon(t, a - b);
-    case OSC_B_MUL: return s ? sfit(c, w, A * B) : canon(t, a * b);
-    case OSC_B_DIV:
-        if (b == 0) trap(c, OSC_TRAP_DIV0);
-        return s ? sfit(c, w, A / B) : a / b;              /* C: truncation toward zero */
-    case OSC_B_REM:
-        if (b == 0) trap(c, OSC_TRAP_DIV0);
-        return s ? (uint64_t)(int64_t)(A % B) : a % b;     /* sign of the dividend; MIN % -1 == 0 */
-    case OSC_B_AND: return a & b;
-    case OSC_B_OR: return a | b;
-    case OSC_B_XOR: return a ^ b;
-    case OSC_B_SHL:
-    case OSC_B_SHR: {
-        if (B < 0 || B >= (i128)w) trap(c, OSC_TRAP_SHIFT);
-        unsigned k = (unsigned)B;
-        if (sub == OSC_B_SHL) return s ? sfit(c, w, A * ((i128)1 << k)) : canon(t, a << k);
-        return s ? (uint64_t)((int64_t)a >> k) : a >> k;
-    }
-    default: trap(c, OSC_TRAP_RUNTIME);
-    }
-    return 0;
-}
-
-static uint64_t do_un(Ctx *c, unsigned sub, OscScalar t, uint64_t a) {
-    switch (sub) {
-    case OSC_U_NEG:
-        if (osc_scalar_signed(t)) return sfit(c, osc_scalar_width(t), -(i128)(int64_t)a);
-        return canon(t, 0 - a);
-    case OSC_U_BNOT: return canon(t, ~a);
-    case OSC_U_LNOT: return a ^ 1;
-    default: trap(c, OSC_TRAP_RUNTIME);
-    }
-    return 0;
-}
-
-static uint64_t do_cmp(unsigned cc, OscScalar t, uint64_t a, uint64_t b) {
-    bool lt, eq = a == b;
-    if (osc_scalar_signed(t)) lt = (int64_t)a < (int64_t)b;
-    else lt = a < b;
-    switch (cc) {
-    case OSC_C_EQ: return eq;
-    case OSC_C_NE: return !eq;
-    case OSC_C_LT: return lt;
-    case OSC_C_LE: return lt || eq;
-    case OSC_C_GT: return !lt && !eq;
-    case OSC_C_GE: return !lt;
-    default: return 0;
-    }
-}
-
-static uint64_t do_cast(Ctx *c, OscScalar to, OscScalar from, uint64_t a) {
-    i128 v = osc_scalar_signed(from) ? (i128)(int64_t)a : (i128)a;
-    unsigned w = osc_scalar_width(to);
-    i128 lo = osc_scalar_signed(to) ? smin(w) : 0;
-    i128 hi = osc_scalar_signed(to) ? smax(w) : (((i128)1 << w) - 1);
-    if (v < lo || v > hi) trap(c, OSC_TRAP_CAST);
-    return (uint64_t)v;
-}
 
 /* element pointer with the bounds rule of section 5 */
 static uint64_t *elem(Ctx *c, const OscType *rt_, uint64_t base, OscScalar ti, uint64_t idx) {
@@ -178,10 +90,24 @@ static uint64_t run_func(Ctx *c, int fi, const uint64_t *args) {
             switch (in->op) {
             case OSC_I_CONST: v[in->dst] = in->imm; break;
             case OSC_I_MOV: v[in->dst] = v[in->a]; break;
-            case OSC_I_BIN: v[in->dst] = do_bin(c, in->sub, T[in->a].s, T[in->b].s, v[in->a], v[in->b]); break;
-            case OSC_I_UN: v[in->dst] = do_un(c, in->sub, T[in->a].s, v[in->a]); break;
-            case OSC_I_CMP: v[in->dst] = do_cmp(in->sub, T[in->a].s, v[in->a], v[in->b]); break;
-            case OSC_I_CAST: v[in->dst] = do_cast(c, T[in->dst].s, T[in->a].s, v[in->a]); break;
+            case OSC_I_BIN: {
+                uint64_t code = osc_alu_bin(in->sub, T[in->a].s, v[in->a], v[in->b], &v[in->dst]);
+                if (code) trap(c, (unsigned)code);
+                break;
+            }
+            case OSC_I_UN: {
+                uint64_t code = osc_alu_un(in->sub, T[in->a].s, v[in->a], &v[in->dst]);
+                if (code) trap(c, (unsigned)code);
+                break;
+            }
+            case OSC_I_CMP:
+                v[in->dst] = osc_alu_cmp(in->sub, T[in->a].s, v[in->a], v[in->b]);
+                break;
+            case OSC_I_CAST: {
+                uint64_t code = osc_alu_cast(T[in->dst].s, T[in->a].s, v[in->a], &v[in->dst]);
+                if (code) trap(c, (unsigned)code);
+                break;
+            }
             case OSC_I_ALLOC: v[in->dst] = osc_rt_alloc(c->rt, T[in->dst].len, v[in->a]); break;
             case OSC_I_RELEASE: osc_rt_release(c->rt, v[in->a], T[in->a].len); break;
             case OSC_I_AOPEN: v[in->dst] = osc_rt_arena_open(c->rt, in->imm); break;
@@ -234,7 +160,7 @@ static int check_args(const OscUnit *u, int func, const uint64_t *args, unsigned
         if (t->s == OSC_T_BYTES || t->s == OSC_T_CELLS) continue; /* external pointer: checked as a pair below */
         if (t->s == OSC_T_REF) {
             if (!osc_rt_is_live_ref(rt, args[p], t->len)) return -1;
-        } else if (canon(t->s, args[p]) != args[p]) {
+        } else if (osc_alu_canon(t->s, args[p]) != args[p]) {
             return -1;
         }
     }

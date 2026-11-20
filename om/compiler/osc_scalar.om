@@ -1,0 +1,313 @@
+note SPDX-License-Identifier: Apache-2.0
+note Scalar semantics of validated OSC IR. Checked operations return the OSC
+note trap code as data. The host delivers that trap through the program runtime.
+om2
+
+note IDs from osc_ir.h. Operands enter in their canonical 64-bit representation.
+const T_BOOL ulong 1
+const T_U8 ulong 2
+const T_U64 ulong 5
+const T_I8 ulong 6
+const T_I64 ulong 9
+const SIGN64 ulong 0x8000000000000000
+const OVERFLOW ulong 1
+const DIV_ZERO ulong 2
+const CAST_RANGE ulong 5
+const BAD_SHIFT ulong 7
+const BAD_OPCODE ulong 8
+
+fn alu_signed t ulong to bool
+ret and ge t T_I8 le t T_I64
+end
+
+export fn osc_alu_width t ulong to ulong
+if eq t T_BOOL
+  ret 1
+end
+if and ge t T_U8 le t T_U64
+  ret shl ulong 8 sub t T_U8
+end
+if alu_signed t
+  ret shl ulong 8 sub t T_I8
+end
+ret 0
+end
+
+fn alu_mask width ulong to ulong
+if eq width 64
+  ret 0xffffffffffffffff
+end
+ret sub shl ulong 1 width 1
+end
+
+export fn osc_alu_canon t ulong v ulong to ulong
+w = osc_alu_width t
+v = and v alu_mask w
+if alu_signed t
+  sign = shl ulong 1 sub w 1
+  v = sub xor v sign sign
+end
+ret v
+end
+
+fn alu_mag v ulong to ulong
+if ge v SIGN64
+  ret sub ulong 0 v
+end
+ret v
+end
+
+fn alu_limit width ulong negative bool to ulong
+top = shl ulong 1 sub width 1
+if negative
+  ret top
+end
+ret sub top 1
+end
+
+fn alu_addsub op ulong t ulong a ulong b ulong value edit ulong 1 to ulong
+w = osc_alu_width t
+signedop = alu_signed t
+r = add a b
+if eq op 2
+  r = sub a b
+end
+if signedop
+  sign = shl ulong 1 sub w 1
+  changed = and xor r a sign
+  diff = and xor a b sign
+  if ne changed 0
+    if eq eq op 1 eq diff 0
+      ret OVERFLOW
+    end
+  end
+end
+put value 0 osc_alu_canon t r
+ret 0
+end
+
+fn alu_mul t ulong a ulong b ulong value edit ulong 1 to ulong
+w = osc_alu_width t
+signedop = alu_signed t
+if signedop
+  limit = alu_limit w ge xor a b SIGN64
+  bm = alu_mag b
+  if ne bm 0
+    if gt alu_mag a div limit bm
+      ret OVERFLOW
+    end
+  end
+end
+put value 0 osc_alu_canon t mul a b
+ret 0
+end
+
+fn alu_divrem op ulong t ulong a ulong b ulong value edit ulong 1 to ulong
+w = osc_alu_width t
+signedop = alu_signed t
+if eq b 0
+  ret DIV_ZERO
+end
+am = a
+bm = b
+if signedop
+  am = alu_mag a
+  bm = alu_mag b
+end
+if eq op 4
+  r = div am bm
+  if signedop
+    negative = ge xor a b SIGN64
+    if gt r alu_limit w negative
+      ret OVERFLOW
+    end
+    if negative
+      r = sub ulong 0 r
+    end
+  end
+  put value 0 r
+else
+  r = rem am bm
+  if and signedop ge a SIGN64
+    r = sub ulong 0 r
+  end
+  put value 0 r
+end
+ret 0
+end
+
+fn alu_shift op ulong t ulong a ulong b ulong value edit ulong 1 to ulong
+w = osc_alu_width t
+signedop = alu_signed t
+note A negative canonical count is unsigned-greater than every valid width.
+if ge b w
+  ret BAD_SHIFT
+end
+if eq op 9
+  if signedop
+    limit = alu_limit w ge a SIGN64
+    if gt alu_mag a shr limit b
+      ret OVERFLOW
+    end
+  end
+  put value 0 osc_alu_canon t shl a b
+else
+  r = shr a b
+  if and signedop ge a SIGN64
+    r = not shr not a b
+  end
+  put value 0 r
+end
+ret 0
+end
+
+export fn osc_alu_bin op ulong t ulong a ulong b ulong value out ulong 1 to ulong
+put value 0 0
+if eq osc_alu_width t 0
+  ret BAD_OPCODE
+end
+if or eq op 1 eq op 2
+  ret alu_addsub op t a b value
+end
+if eq op 3
+  ret alu_mul t a b value
+end
+if or eq op 4 eq op 5
+  ret alu_divrem op t a b value
+end
+if eq op 6
+  put value 0 and a b
+  ret 0
+end
+if eq op 7
+  put value 0 or a b
+  ret 0
+end
+if eq op 8
+  put value 0 xor a b
+  ret 0
+end
+if or eq op 9 eq op 10
+  ret alu_shift op t a b value
+end
+ret BAD_OPCODE
+end
+
+export fn osc_alu_un op ulong t ulong a ulong value out ulong 1 to ulong
+put value 0 0
+if eq op 1
+  if alu_signed t
+    if ge a SIGN64
+      if gt alu_mag a alu_limit osc_alu_width t false
+        ret OVERFLOW
+      end
+    end
+  end
+  put value 0 osc_alu_canon t sub ulong 0 a
+  ret 0
+end
+if eq op 2
+  put value 0 osc_alu_canon t not a
+  ret 0
+end
+if eq op 3
+  put value 0 xor a 1
+  ret 0
+end
+ret BAD_OPCODE
+end
+
+fn alu_truth flag bool to ulong
+if flag
+  ret 1
+end
+ret 0
+end
+
+export fn osc_alu_cmp cc ulong t ulong a ulong b ulong to ulong
+if alu_signed t
+  a = xor a SIGN64
+  b = xor b SIGN64
+end
+if eq cc 1
+  ret alu_truth eq a b
+end
+if eq cc 2
+  ret alu_truth ne a b
+end
+if eq cc 3
+  ret alu_truth lt a b
+end
+if eq cc 4
+  ret alu_truth le a b
+end
+if eq cc 5
+  ret alu_truth gt a b
+end
+if eq cc 6
+  ret alu_truth ge a b
+end
+ret 0
+end
+
+export fn osc_alu_cast target ulong src ulong a ulong value out ulong 1 to ulong
+put value 0 0
+negative = and alu_signed src ge a SIGN64
+width = osc_alu_width target
+if alu_signed target
+  magnitude = a
+  if negative
+    magnitude = alu_mag a
+  end
+  if gt magnitude alu_limit width negative
+    ret CAST_RANGE
+  end
+else
+  if or negative gt a alu_mask width
+    ret CAST_RANGE
+  end
+end
+put value 0 a
+ret 0
+end
+
+note OSC surface token numbers from osc_lex.h and scalar sub-opcodes from osc_ir.h.
+const TOK_PLUS ulong 42
+const TOK_XOR ulong 49
+const TOK_SHL ulong 54
+const TOK_SHR ulong 55
+const TOK_EQ ulong 56
+const TOK_GE ulong 61
+
+export fn osc_binary_opcode tok ulong to ulong
+if and ge tok TOK_PLUS le tok TOK_XOR
+  ret add sub tok TOK_PLUS 1
+end
+if eq tok TOK_SHL
+  ret 9
+end
+if eq tok TOK_SHR
+  ret 10
+end
+ret 0
+end
+
+export fn osc_compare_opcode tok ulong to ulong
+if and ge tok TOK_EQ le tok TOK_GE
+  ret add sub tok TOK_EQ 1
+end
+ret 0
+end
+
+note The minus of a literal may denote the signed minimum directly, even
+note though its positive magnitude cannot stand alone as that signed type.
+export fn osc_literal_fits t ulong magnitude ulong negative ulong to ulong
+w = osc_alu_width t
+if alu_signed t
+  ret alu_truth le magnitude alu_limit w ne negative 0
+end
+if ne negative 0
+  ret alu_truth eq magnitude 0
+end
+ret alu_truth le magnitude alu_mask w
+end

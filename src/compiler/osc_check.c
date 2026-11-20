@@ -559,30 +559,6 @@ static void snap_restore(C *c, const Snap *s)
 }
 
 /* ------------------------------------------------------------ integer helpers */
-typedef __int128 i128;
-
-static int fits(OscScalar t, i128 v)
-{
-    unsigned w = osc_scalar_width(t);
-    if (osc_scalar_signed(t)) {
-        i128 lo = -((i128)1 << (w - 1)), hi = ((i128)1 << (w - 1)) - 1;
-        return v >= lo && v <= hi;
-    }
-    return v >= 0 && v <= (((i128)1 << w) - 1);
-}
-static i128 wrapu(OscScalar t, i128 v)
-{
-    unsigned w = osc_scalar_width(t);
-    unsigned __int128 m = (((unsigned __int128)1) << w) - 1;
-    return (i128)((unsigned __int128)v & m);
-}
-static uint64_t canon(OscScalar t, i128 v)
-{
-    if (t == OSC_T_BOOL) return v ? 1 : 0;
-    if (osc_scalar_signed(t)) return (uint64_t)(int64_t)v;
-    return (uint64_t)wrapu(t, v);
-}
-
 static int is_shift(int op) { return op == OT_SHL || op == OT_SHR; }
 static int is_arith(int op)
 {
@@ -623,106 +599,75 @@ static int ovf(C *c, const OscNode *n, const char *transition, const char *msg)
     return -1;
 }
 
-/* fold constant expression i at type t; value as mathematical integer in range of t */
-static int fold(C *c, int i, OscScalar t, i128 *out)
+/* Fold using the same OSC scalar semantics as the reference interpreter.
+ * Constant negation of a nonzero unsigned value is refused by the front end. */
+static int fold(C *c, int i, OscScalar t, uint64_t *out)
 {
     OscNode *n = NODE(i);
     char msg[320];
     if (t == OSC_T_BOOL) return tmismatch(c, n, "bool", "integer literal where bool is required");
-    int sg = osc_scalar_signed(t);
-    unsigned w = osc_scalar_width(t);
-    i128 v, a, b;
+    uint64_t v, a, b;
     switch (n->kind) {
     case ON_INT:
-        v = (i128)n->ival;
-        if (!fits(t, v)) {
+        v = n->ival;
+        if (!osc_literal_fits(t, v, 0)) {
             snprintf(msg, sizeof msg, "literal %llu does not fit %s", (unsigned long long)n->ival, tname(t));
             return ovf(c, n, "literal does not fit type", msg);
         }
         break;
     case ON_UN:
         if (n->op == OT_MINUS && NODE(n->a)->kind == ON_INT) {
-            const OscNode *l = NODE(n->a);
-            v = -(i128)l->ival;
-            if (!sg && l->ival != 0) {
+            OscNode *l = NODE(n->a);
+            if (!osc_scalar_signed(t) && l->ival) {
                 snprintf(msg, sizeof msg, "negative literal -%llu for unsigned %s", (unsigned long long)l->ival, tname(t));
                 return ovf(c, n, "negative literal for unsigned type", msg);
             }
-            if (!fits(t, v)) {
+            if (!osc_literal_fits(t, l->ival, 1)) {
                 snprintf(msg, sizeof msg, "literal -%llu does not fit %s", (unsigned long long)l->ival, tname(t));
                 return ovf(c, n, "literal does not fit type", msg);
             }
-            NODE(n->a)->ty.s = t;
-            NODE(n->a)->is_const = 1;
-            NODE(n->a)->cval = canon(t, (i128)l->ival);
+            l->ty.s = t;
+            l->is_const = 1;
+            l->cval = l->ival;
+            v = 0 - l->ival;
             break;
         }
         if (fold(c, n->a, t, &a)) return -1;
-        if (n->op == OT_MINUS) {
-            if (!sg) {
-                if (a != 0) return ovf(c, n, "negative constant for unsigned type", "negation of a non-zero unsigned constant");
-                v = 0;
-            } else {
-                v = -a;
-                if (!fits(t, v)) return ovf(c, n, "signed constant overflow", "constant negation overflows");
-            }
-        } else { /* ~ */
-            v = sg ? (i128)(~(int64_t)a) : wrapu(t, ~a);
-        }
+        if (n->op == OT_MINUS && !osc_scalar_signed(t) && a)
+            return ovf(c, n, "negative constant for unsigned type", "negation of a non-zero unsigned constant");
+        if (osc_alu_un(n->op == OT_MINUS ? OSC_U_NEG : OSC_U_BNOT, t, a, &v))
+            return ovf(c, n, "signed constant overflow", "constant negation overflows");
         break;
-    case ON_BIN:
+    case ON_BIN: {
         if (fold(c, n->a, t, &a) || fold(c, n->b, t, &b)) return -1;
-        switch (n->op) {
-        case OT_PLUS: v = a + b; break;
-        case OT_MINUS: v = a - b; break;
-        case OT_STAR:
-            if (sg) v = a * b;
-            else v = (i128)(((unsigned __int128)a * (unsigned __int128)b) & ((((unsigned __int128)1) << w) - 1));
-            break;
-        case OT_SLASH: case OT_PERCENT:
-            if (b == 0) return ovf(c, NODE(n->b), "literal zero divisor", "division by a constant zero");
-            v = n->op == OT_SLASH ? a / b : a % b;
-            break;
-        case OT_AMP: v = sg ? (i128)((int64_t)a & (int64_t)b) : (a & b); break;
-        case OT_PIPE: v = sg ? (i128)((int64_t)a | (int64_t)b) : (a | b); break;
-        case OT_CARET: v = sg ? (i128)((int64_t)a ^ (int64_t)b) : (a ^ b); break;
-        case OT_SHL: case OT_SHR:
-            if (b < 0 || b >= (i128)w) {
-                snprintf(msg, sizeof msg, "constant shift amount %lld outside 0..%u", (long long)b, w - 1);
-                return ovf(c, NODE(n->b), "literal shift >= width", msg);
-            }
-            if (n->op == OT_SHL) {
-                if (sg) {
-                    v = a * ((i128)1 << (int)b);
-                    if (!fits(t, v)) return ovf(c, n, "signed constant overflow", "constant left shift overflows");
-                } else {
-                    v = wrapu(t, a << (int)b);
-                }
-            } else {
-                v = sg ? (a >> (int)b) : (a >> (int)b);
-            }
-            break;
-        default: return tmismatch(c, n, NULL, "operator not allowed in a constant");
-        }
-        if (sg) {
-            if (!fits(t, v)) {
-                snprintf(msg, sizeof msg, "constant expression overflows %s", tname(t));
-                return ovf(c, n, "signed constant overflow", msg);
-            }
-        } else {
-            v = wrapu(t, v);
+        uint64_t code = osc_alu_bin(osc_binary_opcode(n->op), t, a, b, &v);
+        switch (code) {
+        case OSC_TRAP_NONE: break;
+        case OSC_TRAP_DIV0:
+            return ovf(c, NODE(n->b), "literal zero divisor", "division by a constant zero");
+        case OSC_TRAP_SHIFT:
+            snprintf(msg, sizeof msg, "constant shift amount %lld outside 0..%u",
+                     (long long)b, osc_scalar_width(t) - 1);
+            return ovf(c, NODE(n->b), "literal shift >= width", msg);
+        case OSC_TRAP_OVERFLOW:
+            if (n->op == OT_SHL)
+                return ovf(c, n, "signed constant overflow", "constant left shift overflows");
+            snprintf(msg, sizeof msg, "constant expression overflows %s", tname(t));
+            return ovf(c, n, "signed constant overflow", msg);
+        default:
+            return tmismatch(c, n, NULL, "operator not allowed in a constant");
         }
         break;
+    }
     default:
         return tmismatch(c, n, NULL, "not a constant");
     }
     n->ty.s = t;
     n->is_const = 1;
-    n->cval = canon(t, v);
+    n->cval = v;
     *out = v;
     return 0;
 }
-
 
 /* ------------------------------------------------------------ contracts (OSC-2) */
 /* Static evaluation of a checked contract clause (docs/osc/OSC-2-DESIGN.md
@@ -742,20 +687,6 @@ typedef struct {
     uint64_t res_val;
 } CEnv;
 
-static uint64_t ccanon(OscScalar t, uint64_t x)
-{
-    unsigned w = osc_scalar_width(t);
-    if (t == OSC_T_BOOL) return x & 1;
-    if (w >= 64) return x;
-    if (osc_scalar_signed(t)) {
-        uint64_t m = 1ULL << (w - 1);
-        x &= (1ULL << w) - 1;
-        return (x ^ m) - m;
-    }
-    return x & ((1ULL << w) - 1);
-}
-static int sfits(unsigned w, i128 r) { return r >= -((i128)1 << (w - 1)) && r <= ((i128)1 << (w - 1)) - 1; }
-
 /* 1 known (*out canonical for the node's type), 0 unknown */
 static int ceval(C *c, int i, const CEnv *env, uint64_t *out)
 {
@@ -770,29 +701,12 @@ static int ceval(C *c, int i, const CEnv *env, uint64_t *out)
         return 0;
     case ON_UN: {
         if (!ceval(c, n->a, env, &a)) return 0;
-        OscScalar t = n->ty.s;
-        if (n->op == OT_BANG) { *out = a ^ 1; return 1; }
-        if (n->op == OT_TILDE) { *out = ccanon(t, ~a); return 1; }
-        if (osc_scalar_signed(t)) {
-            i128 r = -(i128)(int64_t)a;
-            if (!sfits(osc_scalar_width(t), r)) return 0;
-            *out = (uint64_t)(int64_t)r;
-            return 1;
-        }
-        *out = ccanon(t, 0 - a);
-        return 1;
+        OscUnOp op = n->op == OT_BANG ? OSC_U_LNOT : n->op == OT_TILDE ? OSC_U_BNOT : OSC_U_NEG;
+        return osc_alu_un(op, n->ty.s, a, out) == OSC_TRAP_NONE;
     }
-    case ON_CAST: {
+    case ON_CAST:
         if (!ceval(c, n->a, env, &a)) return 0;
-        OscScalar from = NODE(n->a)->ty.s, to = n->ty.s;
-        i128 v = osc_scalar_signed(from) ? (i128)(int64_t)a : (i128)a;
-        unsigned w = osc_scalar_width(to);
-        i128 lo = osc_scalar_signed(to) ? -((i128)1 << (w - 1)) : 0;
-        i128 hi = osc_scalar_signed(to) ? ((i128)1 << (w - 1)) - 1 : (((i128)1 << w) - 1);
-        if (v < lo || v > hi) return 0;
-        *out = (uint64_t)v;
-        return 1;
-    }
+        return osc_alu_cast(n->ty.s, NODE(n->a)->ty.s, a, out) == OSC_TRAP_NONE;
     case ON_BIN: {
         int op = n->op;
         if (op == OT_ANDAND || op == OT_OROR) {
@@ -804,50 +718,12 @@ static int ceval(C *c, int i, const CEnv *env, uint64_t *out)
             return 1;
         }
         if (!ceval(c, n->a, env, &a) || !ceval(c, n->b, env, &b)) return 0;
-        if (is_cmpop(op)) {
-            OscScalar T = (OscScalar)n->flag;
-            int lt = osc_scalar_signed(T) ? (int64_t)a < (int64_t)b : a < b, eq = a == b;
-            switch (op) {
-            case OT_EQ: *out = eq; break;
-            case OT_NE: *out = !eq; break;
-            case OT_LT: *out = lt; break;
-            case OT_LE: *out = lt || eq; break;
-            case OT_GT: *out = !lt && !eq; break;
-            default: *out = !lt; break;
-            }
+        uint64_t cc = osc_compare_opcode(op);
+        if (cc) {
+            *out = osc_alu_cmp(cc, n->flag, a, b);
             return 1;
         }
-        OscScalar t = n->ty.s, tb = NODE(n->b)->ty.s;
-        unsigned w = osc_scalar_width(t);
-        int s = osc_scalar_signed(t);
-        i128 A = s ? (i128)(int64_t)a : (i128)a, B = osc_scalar_signed(tb) ? (i128)(int64_t)b : (i128)b, r;
-        switch (op) {
-        case OT_PLUS: if (!s) { *out = ccanon(t, a + b); return 1; } r = A + B; break;
-        case OT_MINUS: if (!s) { *out = ccanon(t, a - b); return 1; } r = A - B; break;
-        case OT_STAR: if (!s) { *out = ccanon(t, a * b); return 1; } r = A * B; break;
-        case OT_SLASH:
-            if (b == 0) return 0;
-            if (!s) { *out = a / b; return 1; }
-            r = A / B;
-            break;
-        case OT_PERCENT:
-            if (b == 0) return 0;
-            *out = s ? (uint64_t)(int64_t)(A % B) : a % b;
-            return 1;
-        case OT_AMP: *out = a & b; return 1;
-        case OT_PIPE: *out = a | b; return 1;
-        case OT_CARET: *out = a ^ b; return 1;
-        case OT_SHL: case OT_SHR:
-            if (B < 0 || B >= (i128)w) return 0;
-            if (op == OT_SHR) { *out = s ? (uint64_t)((int64_t)a >> (unsigned)B) : a >> (unsigned)B; return 1; }
-            if (!s) { *out = ccanon(t, a << (unsigned)B); return 1; }
-            r = A * ((i128)1 << (unsigned)B);
-            break;
-        default: return 0;
-        }
-        if (!sfits(w, r)) return 0;
-        *out = (uint64_t)(int64_t)r;
-        return 1;
+        return osc_alu_bin(osc_binary_opcode(op), n->ty.s, a, b, out) == OSC_TRAP_NONE;
     }
     default:
         return 0; /* ON_INDEX (memory), ON_CALL (refused in clauses anyway) */
@@ -1194,13 +1070,13 @@ static int chk(C *c, int i, OscScalar want)
         return -1;
     }
     if (want && constexpr_(c, i)) {
-        i128 v;
+        uint64_t v;
         if (fold(c, i, want, &v)) return -1;
         return (int)want;
     }
     OscScalar t;
     switch (n->kind) {
-    case ON_INT: { i128 v; if (fold(c, i, want, &v)) return -1; return (int)want; } /* unreachable: constexpr */
+    case ON_INT: { uint64_t v; if (fold(c, i, want, &v)) return -1; return (int)want; } /* unreachable: constexpr */
     case ON_BOOL:
         t = OSC_T_BOOL;
         break;

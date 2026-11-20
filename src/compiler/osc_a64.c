@@ -21,6 +21,7 @@
  * range-checked and an out-of-range or wrong-kind operand is refused.
  */
 #include "osc_a64.h"
+#include "omega_api_decl.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -137,8 +138,6 @@ static int unreg(int kind, uint32_t f) {
     return 255; /* not encodable: re-encode check refuses */
 }
 
-static int is_sp(int r) { return r == OSC_A64_SP; }
-
 int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
     if (!in || !word) return fail(err, n, "null");
     int op = in->op;
@@ -146,7 +145,7 @@ int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
         return fail(err, n, "unknown op %d", op);
     const OpInfo *oi = &OPS[op];
     const char *nm = oi->name;
-    uint32_t w = oi->base, rd = 0, rn = 0, rm = 0, ra = 0;
+    uint32_t rd = 0, rn = 0, rm = 0, ra = 0;
     /* unused register / field positions must be zero (canonical form) */
     if (oi->kd == K_NONE && in->rd) return fail(err, n, "%s: rd unused but set", nm);
     if (oi->kn == K_NONE && in->rn) return fail(err, n, "%s: rn unused but set", nm);
@@ -156,105 +155,58 @@ int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
     if (oi->kn != K_NONE && regfield(oi->kn, in->rn, &rn, "rn", nm, err, n)) return -1;
     if (oi->km != K_NONE && regfield(oi->km, in->rm, &rm, "rm", nm, err, n)) return -1;
     if (oi->ka != K_NONE && regfield(oi->ka, in->ra, &ra, "ra", nm, err, n)) return -1;
-    int uses_shift = oi->cls == CLS_RRR_SH;
-    int uses_cond = oi->cls == CLS_CSINC || oi->cls == CLS_BCOND;
-    int uses_imm2 = oi->cls == CLS_RI || oi->cls == CLS_BFM || oi->cls == CLS_MOV16;
-    int uses_imm = !(oi->cls == CLS_R4 || oi->cls == CLS_MULH || oi->cls == CLS_R3 ||
-                     oi->cls == CLS_CSINC || oi->cls == CLS_BREG);
-    if (!uses_shift && in->shift) return fail(err, n, "%s: shift unused but set", nm);
-    if (!uses_cond && in->cond) return fail(err, n, "%s: cond unused but set", nm);
-    if (!uses_imm2 && in->imm2) return fail(err, n, "%s: imm2 unused but set", nm);
-    if (!uses_imm && in->imm) return fail(err, n, "%s: imm unused but set", nm);
-    int64_t imm = in->imm, imm2 = in->imm2;
-
-    switch (oi->cls) {
-    case CLS_RRR_SH:
-        if (in->shift > OSC_A64_ASR) return fail(err, n, "%s: shift type %u refused", nm, in->shift);
-        if (imm < 0 || imm > 63) return fail(err, n, "%s: shift amount %lld out of range", nm, (long long)imm);
-        w |= ((uint32_t)in->shift << 22) | (rm << 16) | ((uint32_t)imm << 10) | (rn << 5) | rd;
-        break;
-    case CLS_RI:
-        if (imm < 0 || imm > 4095) return fail(err, n, "%s: imm12 %lld out of range", nm, (long long)imm);
-        if (imm2 != 0 && imm2 != 1) return fail(err, n, "%s: lsl12 flag %lld invalid", nm, (long long)imm2);
-        w |= ((uint32_t)imm2 << 22) | ((uint32_t)imm << 10) | (rn << 5) | rd;
-        break;
-    case CLS_R4:
-        w |= (rm << 16) | (ra << 10) | (rn << 5) | rd;
-        break;
-    case CLS_MULH:
-    case CLS_R3:
-        w |= (rm << 16) | (rn << 5) | rd;
-        break;
-    case CLS_BFM:
-        if (imm < 0 || imm > 63) return fail(err, n, "%s: immr %lld out of range", nm, (long long)imm);
-        if (imm2 < 0 || imm2 > 63) return fail(err, n, "%s: imms %lld out of range", nm, (long long)imm2);
-        w |= ((uint32_t)imm << 16) | ((uint32_t)imm2 << 10) | (rn << 5) | rd;
-        break;
-    case CLS_CSINC:
-        if (in->cond > OSC_A64_AL) return fail(err, n, "%s: cond %u refused", nm, in->cond);
-        w |= (rm << 16) | ((uint32_t)in->cond << 12) | (rn << 5) | rd;
-        break;
-    case CLS_MOV16:
-        if (imm < 0 || imm > 0xFFFF) return fail(err, n, "%s: imm16 %lld out of range", nm, (long long)imm);
-        if (imm2 != 0 && imm2 != 16 && imm2 != 32 && imm2 != 48)
-            return fail(err, n, "%s: shift %lld invalid", nm, (long long)imm2);
-        w |= ((uint32_t)(imm2 / 16) << 21) | ((uint32_t)imm << 5) | rd;
-        break;
-    case CLS_MEM:
-        if (imm < 0 || imm > 4095 * 8 || (imm & 7))
-            return fail(err, n, "%s: offset %lld not a multiple of 8 in 0..32760", nm, (long long)imm);
-        w |= ((uint32_t)(imm / 8) << 10) | (rn << 5) | rd;
-        break;
-    case CLS_PAIR: {
-        if (imm < -512 || imm > 504 || (imm & 7))
-            return fail(err, n, "%s: offset %lld not a multiple of 8 in -512..504", nm, (long long)imm);
-        int wb = op == OSC_A64_STP_PRE || op == OSC_A64_STP_POST || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
-        int load = op == OSC_A64_LDP_OFF || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
-        if (wb && !is_sp(in->rn) && (in->rn == in->rd || in->rn == in->ra))
-            return fail(err, n, "%s: writeback base equals a transfer register (unpredictable)", nm);
-        if (load && in->rd == in->ra)
-            return fail(err, n, "%s: Rt == Rt2 (unpredictable)", nm);
-        uint32_t i7 = (uint32_t)((imm / 8) & 0x7F);
-        w |= (i7 << 15) | (ra << 10) | (rn << 5) | rd;
-        break;
+    const OscA64Fields f = {.rd = rd, .rn = rn, .rm = rm, .ra = ra, .shift = in->shift,
+                            .cond = in->cond, .imm = in->imm, .imm2 = in->imm2};
+    int writeback = op == OSC_A64_STP_PRE || op == OSC_A64_STP_POST || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
+    int loadpair = op == OSC_A64_LDP_OFF || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
+    switch (osc_a64_check_fields(oi->cls, &f, writeback, loadpair)) {
+    case 0: break;
+    case OSC_A64_ERR_UNUSED_SHIFT:
+        return fail(err, n, "%s: shift unused but set", nm);
+    case OSC_A64_ERR_UNUSED_COND:
+        return fail(err, n, "%s: cond unused but set", nm);
+    case OSC_A64_ERR_UNUSED_IMM2:
+        return fail(err, n, "%s: imm2 unused but set", nm);
+    case OSC_A64_ERR_UNUSED_IMM:
+        return fail(err, n, "%s: imm unused but set", nm);
+    case OSC_A64_ERR_SHIFT_KIND:
+        return fail(err, n, "%s: shift type %u refused", nm, in->shift);
+    case OSC_A64_ERR_SHIFT_AMOUNT:
+        return fail(err, n, "%s: shift amount %lld out of range", nm, (long long)in->imm);
+    case OSC_A64_ERR_IMM12:
+        return fail(err, n, "%s: imm12 %lld out of range", nm, (long long)in->imm);
+    case OSC_A64_ERR_LSL12:
+        return fail(err, n, "%s: lsl12 flag %lld invalid", nm, (long long)in->imm2);
+    case OSC_A64_ERR_IMMR:
+        return fail(err, n, "%s: immr %lld out of range", nm, (long long)in->imm);
+    case OSC_A64_ERR_IMMS:
+        return fail(err, n, "%s: imms %lld out of range", nm, (long long)in->imm2);
+    case OSC_A64_ERR_COND:
+        return fail(err, n, "%s: cond %u refused", nm, in->cond);
+    case OSC_A64_ERR_IMM16:
+        return fail(err, n, "%s: imm16 %lld out of range", nm, (long long)in->imm);
+    case OSC_A64_ERR_MOV_SHIFT:
+        return fail(err, n, "%s: shift %lld invalid", nm, (long long)in->imm2);
+    case OSC_A64_ERR_MEM_OFFSET:
+        return fail(err, n, "%s: offset %lld not a multiple of 8 in 0..32760", nm, (long long)in->imm);
+    case OSC_A64_ERR_PAIR_OFFSET:
+        return fail(err, n, "%s: offset %lld not a multiple of 8 in -512..504", nm, (long long)in->imm);
+    case OSC_A64_ERR_WRITEBACK_ALIAS:
+        return fail(err, n, "%s: writeback base equals a transfer register (unpredictable)", nm);
+    case OSC_A64_ERR_LOAD_ALIAS:
+        return fail(err, n, "%s: Rt == Rt2 (unpredictable)", nm);
+    case OSC_A64_ERR_BRANCH_OFFSET:
+        return fail(err, n, "%s: offset %lld out of range or misaligned", nm, (long long)in->imm);
+    case OSC_A64_ERR_BRANCH_COND:
+        return fail(err, n, "%s: cond %u refused (AL/NV not used)", nm, in->cond);
+    default: return fail(err, n, "bad class");
     }
-    case CLS_B26:
-        if ((imm & 3) || imm < -(1LL << 27) || imm > (1LL << 27) - 4)
-            return fail(err, n, "%s: offset %lld out of range or misaligned", nm, (long long)imm);
-        w |= (uint32_t)((imm / 4) & 0x03FFFFFF);
-        break;
-    case CLS_BCOND:
-        if (in->cond > 13) return fail(err, n, "%s: cond %u refused (AL/NV not used)", nm, in->cond);
-        if ((imm & 3) || imm < -(1LL << 20) || imm > (1LL << 20) - 4)
-            return fail(err, n, "%s: offset %lld out of range or misaligned", nm, (long long)imm);
-        w |= ((uint32_t)((imm / 4) & 0x7FFFF) << 5) | in->cond;
-        break;
-    case CLS_CB:
-        if ((imm & 3) || imm < -(1LL << 20) || imm > (1LL << 20) - 4)
-            return fail(err, n, "%s: offset %lld out of range or misaligned", nm, (long long)imm);
-        w |= ((uint32_t)((imm / 4) & 0x7FFFF) << 5) | rd;
-        break;
-    case CLS_BREG:
-        w |= rn << 5;
-        break;
-    case CLS_BRK:
-        if (imm < 0 || imm > 0xFFFF) return fail(err, n, "%s: imm16 %lld out of range", nm, (long long)imm);
-        w |= (uint32_t)imm << 5;
-        break;
-    default:
-        return fail(err, n, "bad class");
-    }
-    *word = w;
+    *word = (uint32_t)osc_a64_pack_fields(oi->cls, oi->base, &f);
     return 0;
 }
 
 int osc_a64_reencode(const OscA64Insn *in, uint32_t *word) {
     return osc_a64_encode(in, word, NULL, 0);
-}
-
-static int64_t sext(uint32_t v, unsigned bits) {
-    uint64_t m = 1ULL << (bits - 1);
-    return (int64_t)(((uint64_t)v ^ m) - m);
 }
 
 int osc_a64_decode(uint32_t w, OscA64Insn *out) {
@@ -265,25 +217,16 @@ int osc_a64_decode(uint32_t w, OscA64Insn *out) {
         OscA64Insn d;
         memset(&d, 0, sizeof d);
         d.op = (uint8_t)op;
-        uint32_t f_rd = w & 31, f_rn = (w >> 5) & 31, f_rm = (w >> 16) & 31, f_ra = (w >> 10) & 31;
-        if (oi->kd != K_NONE) d.rd = (uint8_t)unreg(oi->kd, f_rd);
-        if (oi->kn != K_NONE) d.rn = (uint8_t)unreg(oi->kn, f_rn);
-        if (oi->km != K_NONE) d.rm = (uint8_t)unreg(oi->km, f_rm);
-        if (oi->ka != K_NONE) d.ra = (uint8_t)unreg(oi->ka, f_ra);
-        switch (oi->cls) {
-        case CLS_RRR_SH: d.shift = (uint8_t)((w >> 22) & 3); d.imm = (w >> 10) & 63; break;
-        case CLS_RI: d.imm = (w >> 10) & 0xFFF; d.imm2 = (w >> 22) & 1; break;
-        case CLS_BFM: d.imm = (w >> 16) & 63; d.imm2 = (w >> 10) & 63; break;
-        case CLS_CSINC: d.cond = (uint8_t)((w >> 12) & 15); break;
-        case CLS_MOV16: d.imm = (w >> 5) & 0xFFFF; d.imm2 = ((w >> 21) & 3) * 16; break;
-        case CLS_MEM: d.imm = (int64_t)((w >> 10) & 0xFFF) * 8; break;
-        case CLS_PAIR: d.imm = sext((w >> 15) & 0x7F, 7) * 8; break;
-        case CLS_B26: d.imm = sext(w & 0x03FFFFFF, 26) * 4; break;
-        case CLS_BCOND: d.imm = sext((w >> 5) & 0x7FFFF, 19) * 4; d.cond = (uint8_t)(w & 15); break;
-        case CLS_CB: d.imm = sext((w >> 5) & 0x7FFFF, 19) * 4; break;
-        case CLS_BRK: d.imm = (w >> 5) & 0xFFFF; break;
-        default: break;
-        }
+        OscA64Fields f;
+        osc_a64_unpack_fields(oi->cls, w, &f);
+        if (oi->kd != K_NONE) d.rd = (uint8_t)unreg(oi->kd, f.rd);
+        if (oi->kn != K_NONE) d.rn = (uint8_t)unreg(oi->kn, f.rn);
+        if (oi->km != K_NONE) d.rm = (uint8_t)unreg(oi->km, f.rm);
+        if (oi->ka != K_NONE) d.ra = (uint8_t)unreg(oi->ka, f.ra);
+        d.shift = (uint8_t)f.shift;
+        d.cond = (uint8_t)f.cond;
+        d.imm = f.imm;
+        d.imm2 = f.imm2;
         uint32_t re;
         if (osc_a64_encode(&d, &re, NULL, 0) != 0 || re != w) continue;
         if (out) *out = d;
