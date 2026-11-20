@@ -21,7 +21,7 @@
  *
  * Why it exists: an aien-proof EvidenceReceiptV1 id is BLAKE3 over the receipt's canonical
  * bytes (aien-protocols specs/evidence-receipt/SUBSET.md section 1), and the resolver must
- * recompute that id itself (SPEC 5.1 rule 1). Portable C, no SIMD, no allocation, no state.
+ * recompute that id itself (SPEC 5.1 rule 1). The seeded Omega entry uses a per-call chunk buffer and chaining-value stack.
  * Verified against the official BLAKE3 test vectors (tests/resolve/blake3_vectors.txt, from
  * BLAKE3-team/BLAKE3 test_vectors/test_vectors.json, input = 0,1,..,250 repeating). */
 

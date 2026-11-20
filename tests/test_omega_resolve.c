@@ -19,7 +19,7 @@
  * Usage (run from the repository root):
  *   test_omega_resolve            run every check; exit 0 only if all pass
  *   test_omega_resolve <mutant>   the binary was linked against a deliberately broken copy of
- *                                 src/omega_resolve.c, src/omega_receipt.c or src/omega_blake3.c
+ *                                 src/omega_resolve.c, src/omega_receipt.c or the Omega BLAKE3 unit
  *                                 (built by `make test-resolve`); run every check and require the
  *                                 mapped check to FAIL. Exit 1 = killed (what the Makefile
  *                                 asserts), 3 = survived, 2 = unknown mutant.
@@ -1326,7 +1326,7 @@ static int scan_file(const char *path, const char **hit) {
 }
 static void t_no_escape(void) {
     static const char *const files[] = { "src/omega_resolve.c", "src/omega_resolve.h", "src/omega_receipt.c", "src/omega_receipt.h",
-        "src/omega_blake3.c", "src/omega_blake3.h", "src/omega_resolve_osc.c", "src/omega_resolve_osc.h", "src/oscv_main.c",
+        "om/blake3/b3hash.om", "om/blake3/b3unit.om", "src/omega_blake3.h", "src/omega_resolve_osc.c", "src/omega_resolve_osc.h", "src/oscv_main.c",
         "src/omega_genesis.h", "src/omega_vcstore_priv.h", "src/omega_program_ir.c", "src/omega_program_ir.h", "src/omega_vc_bridge.c", "src/omega_vc_bridge.h" };
     const char *hit = NULL;
     int found = 0, nfiles = 0;

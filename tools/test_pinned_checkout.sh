@@ -49,6 +49,11 @@ check "symlink retained" test "$(readlink "$PIN1/link")" = regular
 check "materialized tree verifies" test "$("$TOOL" verify "$PIN1" "$LOCK")" = "$TREE"
 check "source files are read-only" test "$((8#$(stat -c %a "$PIN1/regular") & 8#222))" -eq 0
 
+# The caller's repository need not use the pin's object format.
+git init --quiet --object-format=sha256 "$SCR/sha256-caller"
+check "SHA-1 checkout verifies from a SHA-256 repository" \
+    test "$(cd "$SCR/sha256-caller" && "$TOOL" verify "$PIN1" "$LOCK")" = "$TREE"
+
 HOOK="$SCR/hook-ran"
 rm -f "$HOOK"
 git -C "$SRC" config uploadpack.packObjectsHook "touch $HOOK"
