@@ -21,6 +21,7 @@
  * src/runtime/rx_generation.c; nothing from src/runtime is linked.
  */
 #include "omega_tensor_store.h"
+#include "omega_api_decl.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -220,13 +221,8 @@ static bool is_payload_name(const char *s) {
 /* Element count of a shape; 0 when the shape is invalid. */
 static uint64_t shape_elems(uint32_t dtype, uint32_t rank, const uint64_t *shape) {
     if (omega_dtype_size((OmegaDType)dtype) == 0 || rank > OMEGA_TENSOR_MAX_RANK) return 0;
-    uint64_t e = 1;
-    for (uint32_t d = 0; d < rank; d++) {
-        if (shape[d] == 0 || shape[d] > OMEGA_TENSOR_MAX_ELEMS) return 0;
-        e *= shape[d];
-        if (e > OMEGA_TENSOR_MAX_ELEMS) return 0;
-    }
-    return e;
+    uint64_t elems;
+    return tensor_shape_size(shape, rank, &elems) == 0 ? elems : 0;
 }
 
 /* Every NaN becomes the canonical quiet NaN of its dtype (same rule as the

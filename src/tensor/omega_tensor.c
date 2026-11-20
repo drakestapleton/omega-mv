@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "sha256.h"
+#include "omega_api_decl.h"
 
 typedef struct {
     uint64_t   gen;
@@ -186,38 +187,23 @@ int omega_tensor_release(OmegaTensorCtx *ctx, OmegaTensor t) {
 
 /* ---- shapes ------------------------------------------------------------- */
 
+_Static_assert(OMEGA_TENSOR_MAX_RANK == 8 && OMEGA_TENSOR_MAX_ELEMS == UINT64_C(1073741824) &&
+               OMEGA_TENSOR_ERR_SHAPE == -3 && OMEGA_TENSOR_ERR_BOUNDS == -6 &&
+               OMEGA_TENSOR_ERR_CAPACITY == -8, "seeded tensor shape limits and status codes");
+
 static int shape_check(uint32_t rank, const uint64_t *shape, uint64_t *elems) {
     if (rank > OMEGA_TENSOR_MAX_RANK) return OMEGA_TENSOR_ERR_RANK;
     if (rank && !shape) return OMEGA_TENSOR_ERR_BAD_ARGS;
-    uint64_t n = 1;
-    for (uint32_t d = 0; d < rank; d++) {
-        if (shape[d] == 0) return OMEGA_TENSOR_ERR_SHAPE;
-        if (shape[d] > OMEGA_TENSOR_MAX_ELEMS || __builtin_mul_overflow(n, shape[d], &n) ||
-            n > OMEGA_TENSOR_MAX_ELEMS)
-            return OMEGA_TENSOR_ERR_CAPACITY;
-    }
-    *elems = n;
-    return OMEGA_TENSOR_OK;
+    static const uint64_t empty = 0;
+    return (int)tensor_shape_size(shape ? shape : &empty, rank, elems);
 }
 
 static void dense_strides(uint32_t rank, const uint64_t *shape, uint64_t *strides) {
-    uint64_t s = 1;
-    for (uint32_t d = rank; d-- > 0;) {
-        strides[d] = s;
-        s *= shape[d];
-    }
+    if (rank) tensor_dense_strides(shape, rank, strides, rank);
 }
 
-/* Largest storage index a descriptor reaches must lie inside the storage. */
 static int bounds_check(const OmegaTensorInfo *in, uint64_t storage_elems) {
-    uint64_t hi = in->offset;
-    for (uint32_t d = 0; d < in->rank; d++) {
-        uint64_t step;
-        if (__builtin_mul_overflow(in->shape[d] - 1, in->strides[d], &step) ||
-            __builtin_add_overflow(hi, step, &hi))
-            return OMEGA_TENSOR_ERR_BOUNDS;
-    }
-    return hi < storage_elems ? OMEGA_TENSOR_OK : OMEGA_TENSOR_ERR_BOUNDS;
+    return (int)tensor_view_bounds(in->shape, in->rank, in->strides, in->rank, in->offset, storage_elems);
 }
 
 int omega_tensor_broadcast_shape(uint32_t ra, const uint64_t *sa, uint32_t rb, const uint64_t *sb,
@@ -225,14 +211,11 @@ int omega_tensor_broadcast_shape(uint32_t ra, const uint64_t *sa, uint32_t rb, c
     if (!rout || !sout || (ra && !sa) || (rb && !sb)) return OMEGA_TENSOR_ERR_BAD_ARGS;
     if (ra > OMEGA_TENSOR_MAX_RANK || rb > OMEGA_TENSOR_MAX_RANK) return OMEGA_TENSOR_ERR_RANK;
     uint32_t r = ra > rb ? ra : rb;
+    static const uint64_t empty = 0;
     uint64_t tmp[OMEGA_TENSOR_MAX_RANK];
-    for (uint32_t i = 0; i < r; i++) {   /* i counts from the trailing axis */
-        uint64_t da = i < ra ? sa[ra - 1 - i] : 1;
-        uint64_t db = i < rb ? sb[rb - 1 - i] : 1;
-        if (da == 0 || db == 0) return OMEGA_TENSOR_ERR_SHAPE;
-        if (da != db && da != 1 && db != 1) return OMEGA_TENSOR_ERR_SHAPE;
-        tmp[r - 1 - i] = da > db ? da : db;
-    }
+    int rc = (int)tensor_broadcast_dims(sa ? sa : &empty, ra, sb ? sb : &empty, rb, tmp, r);
+    if (rc) return rc;
+    /* Inputs and output may overlap. Publish only a complete shape. */
     memcpy(sout, tmp, r * sizeof(uint64_t));
     *rout = r;
     return OMEGA_TENSOR_OK;
@@ -522,12 +505,7 @@ int omega_tensor_slice(OmegaTensorCtx *ctx, OmegaTensor t, const uint64_t *start
 }
 
 static bool is_row_major(const OmegaTensorInfo *in) {
-    uint64_t expect = 1;
-    for (uint32_t d = in->rank; d-- > 0;) {
-        if (in->shape[d] != 1 && in->strides[d] != expect) return false;
-        expect *= in->shape[d];
-    }
-    return true;
+    return tensor_is_row_major(in->shape, in->rank, in->strides, in->rank) != 0;
 }
 
 int omega_tensor_reshape(OmegaTensorCtx *ctx, OmegaTensor t, uint32_t rank,
