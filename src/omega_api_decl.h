@@ -62,6 +62,8 @@ uint64_t cg_matmul_i32(const uint64_t o_sp[12], uint64_t o_ins[8192], uint64_t o
 uint64_t cg_gpu_gemm_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* export fn cg_gpu_gemm_plan sp view ulong 10 res edit ulong 18 to ulong */
 uint64_t cg_gpu_gemm_plan(const uint64_t o_sp[10], uint64_t o_res[18]);
+/* export fn cg_gpu_attn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_gpu_attn_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* export fn q38_plan_layer cfg view ulong 8 dst edit uint 384 to ulong */
 uint64_t q38_plan_layer(const uint64_t o_cfg[8], uint32_t o_dst[384]);
 /* export fn q38_bf16_xbatch_max hd ulong max_smem ulong to ulong */

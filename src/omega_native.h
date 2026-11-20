@@ -71,6 +71,10 @@ const char *omega2_ident_cg_gpu_gemm(void);
 uint32_t omega2_cg_gpu_gemm_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 /* export fn cg_gpu_gemm_plan sp view ulong 10 res edit ulong 18 to ulong */
 uint32_t omega2_cg_gpu_gemm_plan(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_res, uint64_t o_res_len);
+#define OMEGA2_IDENT_cg_gpu_attn "omega-ident 1 unit=cg_gpu_attn abi=2 profile=OM-2 src=076e736c118de55183d6255f1d8417d5e298253ae2358d99e3fc829558632f3e omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_gpu_attn(void);
+/* export fn cg_gpu_attn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_gpu_attn_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 #define OMEGA2_IDENT_q38_plan "omega-ident 1 unit=q38_plan abi=2 profile=OM-2 src=61599f615a453835d031b2cf099b9f0372109bc7f77b90c9c4148ebeac9c4687 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_q38_plan(void);
 /* export fn q38_plan_layer cfg view ulong 8 dst edit uint 384 to ulong */
