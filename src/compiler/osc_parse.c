@@ -614,23 +614,129 @@ static int parse_name_tok(P *p, int n)
     return 0;
 }
 
-static int parse_int_signed(P *p, int64_t *out)
+static int parse_for_range(P *p, int n, const OscToken *kw)
 {
-    int neg = 0;
-    if (at(p, OT_MINUS)) { neg = 1; adv(p); }
-    if (!at(p, OT_INT)) return syntax(p, "an integer literal");
-    const OscToken *t = cur(p);
-    if (t->ival > (uint64_t)INT64_MAX + (uint64_t)neg) {
-        osc_diag_set(p->d, OSC_DIAG_OVERFLOW_UNSAFE, t->line, t->col, "for", 0, NULL, "literal does not fit i64",
-                     "for-loop end does not fit i64");
+    uint16_t kinds[OSC_FOR_WINDOW] = {0};
+    uint64_t values[OSC_FOR_WINDOW] = {0};
+    uint32_t start = p->pos;
+    for (unsigned i = 0; i < OSC_FOR_WINDOW && i < p->ast->ntok - start; ++i) {
+        kinds[i] = p->ast->toks[start + i].kind;
+        values[i] = p->ast->toks[start + i].ival;
+    }
+    OscForRange range;
+    uint64_t status = osc_for_range(kinds, values, LOOP_BOUND_MAX, &range);
+    if (range.used) N(n)->tok = start;
+    p->pos += range.used;
+    N(n)->lo = (int64_t)range.low;
+    N(n)->hi = (int64_t)range.high;
+    switch (status) {
+    case 0: return 0;
+    case OSC_FOR_NAME: return syntax(p, "a name");
+    case OSC_FOR_IN: return syntax(p, osc_tok_kind_name(OT_IN));
+    case OSC_FOR_INT: return syntax(p, "an integer literal");
+    case OSC_FOR_DOTS: return syntax(p, osc_tok_kind_name(OT_DOTDOT));
+    case OSC_FOR_OVERFLOW:
+        osc_diag_set(p->d, OSC_DIAG_OVERFLOW_UNSAFE, cur(p)->line, cur(p)->col, "for", 0, NULL,
+                     "literal does not fit i64", "for-loop end does not fit i64");
+        return -1;
+    case OSC_FOR_TRIPS: {
+        char nm[64];
+        osc_node_name(p->ast, N(n), nm, sizeof nm);
+        const OscToken *lt = &p->ast->toks[start + range.lower_at];
+        osc_diag_set(p->d, OSC_DIAG_UNBOUNDED_LOOP, lt->line, lt->col, nm, kw->line, NULL,
+                     "for range outside 0..1000000 trips", "for range must satisfy A <= B and B - A <= %d",
+                     LOOP_BOUND_MAX);
         return -1;
     }
-    *out = neg ? (int64_t)(0 - t->ival) : (int64_t)t->ival;
+    default: abort();
+    }
+}
+
+static int parse_bound(P *p, int n, const OscToken *kw)
+{
+    int arena = kw->kind == OT_ARENA;
+    int limit = arena ? OSC_ARENA_MAX_CELLS : LOOP_BOUND_MAX;
+    const OscToken *value = p->pos + 1 < p->ast->ntok ? cur(p) + 1 : cur(p);
+    uint64_t status = osc_read_bound(cur(p)->kind, value->kind, value->ival, limit);
+    if (status == OSC_BOUND_KEYWORD) {
+        if (arena) return syntax(p, "'bound K' after the arena name");
+        osc_diag_set(p->d, OSC_DIAG_UNBOUNDED_LOOP, kw->line, kw->col, "while", 0, NULL, "while without bound",
+                     "'while' needs 'bound N' (static trip-count bound)");
+        return -1;
+    }
+    adv(p);
+    if (status == OSC_BOUND_INT) return syntax(p, "bound INT");
+    if (status == OSC_BOUND_RANGE) {
+        if (arena) {
+            char nm[64];
+            osc_node_name(p->ast, N(n), nm, sizeof nm);
+            osc_diag_set(p->d, OSC_DIAG_ARENA_CAPACITY, value->line, value->col, nm, kw->line, NULL,
+                         "arena bound outside 1..64", "arena bound %llu outside 1..%d cells",
+                         (unsigned long long)value->ival, limit);
+        } else {
+            osc_diag_set(p->d, OSC_DIAG_UNBOUNDED_LOOP, value->line, value->col, "while", kw->line, NULL,
+                         "bound outside 1..1000000", "loop bound %llu outside 1..%d",
+                         (unsigned long long)value->ival, limit);
+        }
+        return -1;
+    }
+    if (status != 0) abort();
+    N(n)->ival = value->ival;
     adv(p);
     return 0;
 }
 
 static int parse_if(P *p);
+
+_Static_assert(ON_ASSIGN == 8 && ON_STORE == 9 && ON_RETURN == 13 && ON_CALLSTMT == 14 &&
+               ON_FSTORE == 26 && ON_PFREE == 31, "statement plan AST kinds");
+
+static int parse_simple_stmt(P *p)
+{
+    const OscToken *t = cur(p);
+    const OscToken *third = p->ast->ntok - p->pos > 2 ? t + 2 : &p->ast->toks[p->ast->ntok - 1];
+    OscStmtPlan plan;
+    if (osc_statement_plan(&plan, t->kind, peek_kind(p, 1), third->kind,
+                           (const uint8_t *)p->ast->src + third->off, third->len)) {
+        adv(p);
+        return syntax(p, "'=', '[' or '(' after a name at statement start");
+    }
+    int n = plan.nodekind == ON_FSTORE ? parse_field_ref(p, ON_FSTORE) : new_node(p, plan.nodekind, t);
+    if (n < 0) return -1;
+    p->pos += plan.skip;
+    int index = -1;
+    for (unsigned i = 0; i < plan.steps; ++i) {
+        unsigned action = plan.actions[i];
+        int child;
+        switch (action) {
+        case OSC_ST_CALL: child = parse_call(p); break;
+        case OSC_ST_BORROW_A: child = parse_borrow(p); break;
+        case OSC_ST_INDEX:
+        case OSC_ST_EXPR_A:
+        case OSC_ST_EXPR_B: child = parse_expr(p); break;
+        case OSC_ST_STORE:
+            if (at(p, OT_AMP)) {
+                const OscToken *bt = cur(p);
+                char nm[64];
+                osc_node_name(p->ast, N(n), nm, sizeof nm);
+                osc_diag_set(p->d, OSC_DIAG_BORROW_OUTLIVES_OWNER, bt->line, bt->col, nm, 0, NULL,
+                             "store borrow into array", "a borrow cannot be stored anywhere but a borrow binding");
+                return -1;
+            }
+            child = parse_expr(p);
+            break;
+        default:
+            if (expect(p, (int)action)) return -1;
+            continue;
+        }
+        if (child < 0) return -1;
+        if (action == OSC_ST_INDEX) index = child;
+        else if (action == OSC_ST_STORE) { N(n)->a = index; N(n)->b = child; }
+        else if (action == OSC_ST_EXPR_B) N(n)->b = child;
+        else N(n)->a = child;
+    }
+    return n;
+}
 
 static int parse_stmt(P *p)
 {
@@ -732,76 +838,9 @@ static int parse_stmt(P *p)
         if (expect(p, OT_SEMI)) return -1;
         return n;
     }
-    case OT_NAME: {
-        int k1 = peek_kind(p, 1);
-        if (k1 == OT_LPAREN) {
-            n = new_node(p, ON_CALLSTMT, t);
-            if (n < 0) return -1;
-            int c = parse_call(p);
-            if (c < 0) return -1;
-            N(n)->a = c;
-            if (expect(p, OT_SEMI)) return -1;
-            return n;
-        }
-        if (k1 == OT_DOT && peek_kind(p, 2) == OT_RESERVED && p->ast->toks[p->pos + 2].len == 4 &&
-            memcmp(p->ast->src + p->ast->toks[p->pos + 2].off, "free", 4) == 0) { /* OSC-3 item 2: P.free(h); */
-            n = new_node(p, ON_PFREE, t);
-            if (n < 0) return -1;
-            adv(p); adv(p); adv(p);
-            if (expect(p, OT_LPAREN)) return -1;
-            int h = parse_expr(p);
-            if (h < 0) return -1;
-            N(n)->a = h;
-            if (expect(p, OT_RPAREN)) return -1;
-            if (expect(p, OT_SEMI)) return -1;
-            return n;
-        }
-        if (k1 == OT_DOT) {
-            n = parse_field_ref(p, ON_FSTORE);
-            if (n < 0) return -1;
-            if (expect(p, OT_ASSIGN)) return -1;
-            int v = parse_expr(p);
-            if (v < 0) return -1;
-            N(n)->b = v;
-            if (expect(p, OT_SEMI)) return -1;
-            return n;
-        }
-        if (k1 == OT_ASSIGN) {
-            n = new_node(p, ON_ASSIGN, t);
-            if (n < 0) return -1;
-            adv(p); adv(p);
-            int e = at(p, OT_AMP) ? parse_borrow(p) : parse_expr(p);
-            if (e < 0) return -1;
-            N(n)->a = e;
-            if (expect(p, OT_SEMI)) return -1;
-            return n;
-        }
-        if (k1 == OT_LBRACK) {
-            n = new_node(p, ON_STORE, t);
-            if (n < 0) return -1;
-            adv(p); adv(p);
-            int ix = parse_expr(p);
-            if (ix < 0) return -1;
-            if (expect(p, OT_RBRACK)) return -1;
-            if (expect(p, OT_ASSIGN)) return -1;
-            if (at(p, OT_AMP)) {
-                const OscToken *bt = cur(p);
-                char nm[64];
-                osc_node_name(p->ast, N(n), nm, sizeof nm);
-                osc_diag_set(p->d, OSC_DIAG_BORROW_OUTLIVES_OWNER, bt->line, bt->col, nm, 0, NULL,
-                             "store borrow into array", "a borrow cannot be stored anywhere but a borrow binding");
-                return -1;
-            }
-            int v = parse_expr(p);
-            if (v < 0) return -1;
-            N(n)->a = ix;
-            N(n)->b = v;
-            if (expect(p, OT_SEMI)) return -1;
-            return n;
-        }
-        adv(p);
-        return syntax(p, "'=', '[' or '(' after a name at statement start");
-    }
+    case OT_NAME:
+    case OT_RETURN:
+        return parse_simple_stmt(p);
     case OT_POOL: { /* OSC-3 item 2: pool NAME: [T; K] [gen B] { ... } */
         n = new_node(p, ON_POOL, t);
         if (n < 0) return -1;
@@ -841,20 +880,7 @@ static int parse_stmt(P *p)
         if (n < 0) return -1;
         adv(p);
         if (parse_name_tok(p, n)) return -1;
-        if (!at(p, OT_BOUND)) return syntax(p, "'bound K' after the arena name");
-        adv(p);
-        if (!at(p, OT_INT)) return syntax(p, "bound INT");
-        const OscToken *bt = cur(p);
-        if (bt->ival == 0 || bt->ival > OSC_ARENA_MAX_CELLS) {
-            char nm[64];
-            osc_node_name(p->ast, N(n), nm, sizeof nm);
-            osc_diag_set(p->d, OSC_DIAG_ARENA_CAPACITY, bt->line, bt->col, nm, t->line, NULL,
-                         "arena bound outside 1..64", "arena bound %llu outside 1..%d cells",
-                         (unsigned long long)bt->ival, OSC_ARENA_MAX_CELLS);
-            return -1;
-        }
-        N(n)->ival = bt->ival;
-        adv(p);
+        if (parse_bound(p, n, t)) return -1;
         int b = parse_block(p);
         if (b < 0) return -1;
         N(n)->b = b;
@@ -869,23 +895,8 @@ static int parse_stmt(P *p)
         int c = parse_expr(p);
         if (c < 0) return -1;
         N(n)->a = c;
-        if (!at(p, OT_BOUND)) {
-            osc_diag_set(p->d, OSC_DIAG_UNBOUNDED_LOOP, t->line, t->col, "while", 0, NULL, "while without bound",
-                         "'while' needs 'bound N' (static trip-count bound)");
-            return -1;
-        }
-        adv(p);
-        if (!at(p, OT_INT)) return syntax(p, "bound INT");
-        const OscToken *bt = cur(p);
-        if (bt->ival == 0 || bt->ival > LOOP_BOUND_MAX) {
-            osc_diag_set(p->d, OSC_DIAG_UNBOUNDED_LOOP, bt->line, bt->col, "while", t->line, NULL,
-                         "bound outside 1..1000000", "loop bound %llu outside 1..%d",
-                         (unsigned long long)bt->ival, LOOP_BOUND_MAX);
-            return -1;
-        }
-        N(n)->ival = bt->ival;
+        if (parse_bound(p, n, t)) return -1;
         N(n)->flag = 1;
-        adv(p);
         int b = parse_block(p);
         if (b < 0) return -1;
         N(n)->b = b;
@@ -895,35 +906,10 @@ static int parse_stmt(P *p)
         n = new_node(p, ON_FOR, t);
         if (n < 0) return -1;
         adv(p);
-        if (parse_name_tok(p, n)) return -1;
-        if (expect(p, OT_IN)) return -1;
-        const OscToken *lt = cur(p);
-        if (parse_int_signed(p, &N(n)->lo)) return -1;
-        if (expect(p, OT_DOTDOT)) return -1;
-        if (parse_int_signed(p, &N(n)->hi)) return -1;
-        if (N(n)->hi < N(n)->lo || (uint64_t)(N(n)->hi - N(n)->lo) > LOOP_BOUND_MAX) {
-            char nm[64];
-            osc_node_name(p->ast, N(n), nm, sizeof nm);
-            osc_diag_set(p->d, OSC_DIAG_UNBOUNDED_LOOP, lt->line, lt->col, nm, t->line, NULL,
-                         "for range outside 0..1000000 trips", "for range must satisfy A <= B and B - A <= %d",
-                         LOOP_BOUND_MAX);
-            return -1;
-        }
+        if (parse_for_range(p, n, t)) return -1;
         int b = parse_block(p);
         if (b < 0) return -1;
         N(n)->b = b;
-        return n;
-    }
-    case OT_RETURN: {
-        n = new_node(p, ON_RETURN, t);
-        if (n < 0) return -1;
-        adv(p);
-        if (!at(p, OT_SEMI)) {
-            int e = at(p, OT_AMP) ? parse_borrow(p) : parse_expr(p);
-            if (e < 0) return -1;
-            N(n)->a = e;
-        }
-        if (expect(p, OT_SEMI)) return -1;
         return n;
     }
     case OT_LBRACE:
@@ -979,6 +965,7 @@ static int parse_block(P *p)
  * source text is still recorded (token spellings joined by single spaces,
  * none after '(' or before ')') and carried into the IR; the expression node
  * is checked and lowered into runtime checks by the checker / lowerer. */
+_Static_assert(OSC_CLAUSE_MAX == 256, "OSC clause buffer must match the Omega binding");
 static int parse_clause(P *p, char *out, const OscToken *kw, int32_t *node)
 {
     uint32_t start = p->pos;
@@ -993,16 +980,13 @@ static int parse_clause(P *p, char *out, const OscToken *kw, int32_t *node)
     for (uint32_t i = start; i < p->pos; i++) {
         const OscToken *t = &p->ast->toks[i];
         int k = t->kind;
-        int sp = len > 0 && prev != OT_LPAREN && k != OT_RPAREN;
-        if (len + (size_t)sp + t->len + 1 > OSC_CLAUSE_MAX) {
+        len = osc_clause_word((uint8_t *)out, len, (uint64_t)prev, k,
+                              (const uint8_t *)p->ast->src + t->off, t->len);
+        if (len == OSC_CLAUSE_MAX) {
             osc_diag_set(p->d, OSC_DIAG_CAPACITY, kw->line, kw->col, osc_tok_kind_name(kw->kind), 0, NULL,
                          "contract text length", "contract clause longer than %d bytes", OSC_CLAUSE_MAX - 1);
             return -1;
         }
-        if (sp) out[len++] = ' ';
-        memcpy(out + len, p->ast->src + t->off, t->len);
-        len += t->len;
-        out[len] = 0;
         prev = k;
     }
     *node = e;
@@ -1099,10 +1083,21 @@ static int parse_import(P *p)
 {
     OscAst *a = p->ast;
     const OscToken *kw = cur(p);
+    const OscToken *nm = kw + 1; /* The import token always precedes another token or EOF. */
+    size_t slots = a->nimports < OSC_MAX_IMPORTS ? a->nimports + 1u : 0u;
+    OscImportParse entry = {.started = a->nstructs || a->nfns, .stride = sizeof(OscImport),
+                            .nameoff = offsetof(OscImport, name), .nextkind = peek_kind(p, 2)};
+    uint64_t status = osc_read_import(&entry, nm->kind,
+                                      (const uint8_t *)a->src + nm->off, nm->len,
+                                      (uint8_t *)a->imports, slots * sizeof(OscImport));
+    if (status == OSC_IMPORT_POSITION) {
+        osc_diag_set(p->d, OSC_DIAG_SYNTAX, kw->line, kw->col, "import", 0, NULL, "import position",
+                     "imports must come before any struct or function");
+        return -1;
+    }
     adv(p);
-    if (!at(p, OT_NAME)) return syntax(p, "NAME");
-    const OscToken *nm = cur(p);
-    if (a->nimports >= OSC_MAX_IMPORTS) {
+    if (status == OSC_IMPORT_NAME) return syntax(p, "NAME");
+    if (status == OSC_IMPORT_FULL) {
         osc_diag_set(p->d, OSC_DIAG_CAPACITY, kw->line, kw->col, "unit", 0, NULL, "import capacity",
                      "more than %d imports", OSC_MAX_IMPORTS);
         return -1;
@@ -1110,15 +1105,15 @@ static int parse_import(P *p)
     OscImport *im = &a->imports[a->nimports];
     im->line = nm->line;
     im->col = nm->col;
-    osc_tok_text(a->src, nm, im->name, sizeof im->name);
-    for (uint8_t k = 0; k < a->nimports; k++)
-        if (strcmp(a->imports[k].name, im->name) == 0) {
-            osc_diag_set(p->d, OSC_DIAG_REDEFINED_NAME, nm->line, nm->col, im->name, a->imports[k].line, NULL,
-                         "import", "import '%s' is listed twice", im->name);
-            return -1;
-        }
+    if (status == OSC_IMPORT_DUP) {
+        osc_diag_set(p->d, OSC_DIAG_REDEFINED_NAME, nm->line, nm->col, im->name, a->imports[entry.match].line, NULL,
+                     "import", "import '%s' is listed twice", im->name);
+        return -1;
+    }
     adv(p);
-    if (expect(p, OT_SEMI)) return -1;
+    if (status == OSC_IMPORT_SEMI) return syntax(p, osc_tok_kind_name(OT_SEMI));
+    if (status != 0) abort();
+    adv(p);
     a->nimports++;
     return 0;
 }
@@ -1133,12 +1128,6 @@ int osc_parse(OscAst *ast, OscDiag *d)
     ast->nimports = 0;
     while (!at(&p, OT_EOF)) {
         if (at(&p, OT_IMPORT)) {
-            if (ast->nstructs || ast->nfns) {
-                const OscToken *t = cur(&p);
-                osc_diag_set(d, OSC_DIAG_SYNTAX, t->line, t->col, "import", 0, NULL, "import position",
-                             "imports must come before any struct or function");
-                return -1;
-            }
             if (parse_import(&p)) return -1;
             continue;
         }

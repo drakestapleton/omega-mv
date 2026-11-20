@@ -375,6 +375,18 @@ uint32_t omega2_osc_a64_pack_fields(uint64_t *result, uint64_t o_form, uint64_t 
 uint32_t omega2_osc_a64_unpack_fields(uint64_t *result, uint64_t o_form, uint64_t o_word, uint8_t *o_f);
 /* export fn osc_a64_check_fields cls ulong f view a64field writeback ulong loadpair ulong to ulong */
 uint32_t omega2_osc_a64_check_fields(uint64_t *result, uint64_t o_cls, const uint8_t *o_f, uint64_t o_writeback, uint64_t o_loadpair);
+#define OMEGA2_IDENT_osc_statement "omega-ident 1 unit=osc_statement abi=2 profile=OM-2 src=a7b0105f7f6556f4b78142c36b3208d8d5072df232898491f5fc010a7903c914 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_osc_statement(void);
+/* export fn osc_for_range kinds view ushort 7 values view ulong 7 limit ulong range edit forrange to ulong */
+uint32_t omega2_osc_for_range(uint64_t *result, const uint16_t *o_kinds, uint64_t o_kinds_len, const uint64_t *o_values, uint64_t o_values_len, uint64_t o_limit, uint8_t *o_range);
+/* export fn osc_read_bound keyword ulong kind ulong value ulong limit ulong to ulong */
+uint32_t omega2_osc_read_bound(uint64_t *result, uint64_t o_keyword, uint64_t o_kind, uint64_t o_value, uint64_t o_limit);
+/* export fn osc_read_import state edit imprec kind ulong spelling view uchar * table edit uchar * to ulong */
+uint32_t omega2_osc_read_import(uint64_t *result, uint8_t *o_state, uint64_t o_kind, const uint8_t *o_spelling, uint64_t o_spelling_len, uint8_t *o_table, uint64_t o_table_len);
+/* export fn osc_clause_word dst edit uchar 256 used ulong prev ulong kind ulong word view uchar * to ulong */
+uint32_t omega2_osc_clause_word(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_used, uint64_t o_prev, uint64_t o_kind, const uint8_t *o_word, uint64_t o_word_len);
+/* export fn osc_statement_plan plan edit stmtplan kind ulong nextkind ulong third ulong spelling view uchar * to ulong */
+uint32_t omega2_osc_statement_plan(uint64_t *result, uint8_t *o_plan, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third, const uint8_t *o_spelling, uint64_t o_spelling_len);
 #ifdef __cplusplus
 }
 #endif

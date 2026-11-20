@@ -365,3 +365,4 @@ Update this table in the same commit as the work it credits.
 
 | Codex (under Drake Stapleton’s direction) | Replayed the nine-check Spark GB10 Q38 stress suite on `371a882a5` and published the [November 20 measurements](docs/gpu/Q38_27B_GB10_STRESS_20261120.md). |
 | Codex (under Drake Stapleton’s direction) | Implemented the seeded Omega training harness for native tokenization, CPU and GB10 fine-tuning and held-out evaluation. |
+| Codex (under Drake Stapleton's direction) | Migrated OSC name-led and return statements, loop bounds, import declarations, and contract text formatting to seeded Omega and checked their ASTs and diagnostics against the historical parser. |

@@ -424,6 +424,72 @@ uint64_t osc_a64_pack_fields(uint64_t o_form, uint64_t o_base, const OscA64Field
 void osc_a64_unpack_fields(uint64_t o_form, uint64_t o_word, OscA64Fields *o_f);
 /* export fn osc_a64_check_fields cls ulong f view a64field writeback ulong loadpair ulong to ulong */
 uint64_t osc_a64_check_fields(uint64_t o_cls, const OscA64Fields *o_f, uint64_t o_writeback, uint64_t o_loadpair);
+#define OSC_FOR_WINDOW 7
+#define OSC_FOR_NAME 1
+#define OSC_FOR_IN 2
+#define OSC_FOR_INT 3
+#define OSC_FOR_OVERFLOW 4
+#define OSC_FOR_DOTS 5
+#define OSC_FOR_TRIPS 6
+#define OSC_BOUND_KEYWORD 1
+#define OSC_BOUND_INT 2
+#define OSC_BOUND_RANGE 3
+#define OSC_IMPORT_POSITION 1
+#define OSC_IMPORT_NAME 2
+#define OSC_IMPORT_FULL 3
+#define OSC_IMPORT_DUP 4
+#define OSC_IMPORT_SEMI 5
+#define OSC_ST_CALL 70
+#define OSC_ST_EXPR_A 71
+#define OSC_ST_EXPR_B 72
+#define OSC_ST_BORROW_A 73
+#define OSC_ST_INDEX 74
+#define OSC_ST_STORE 75
+typedef struct {
+    uint32_t used;
+    uint32_t lower_at;
+    uint64_t low;
+    uint64_t high;
+} OscForRange;
+OMBR_ASSERT(sizeof(OscForRange) == 24, "layout forrange size");
+OMBR_ASSERT(offsetof(OscForRange, used) == 0, "layout forrange field used");
+OMBR_ASSERT(offsetof(OscForRange, lower_at) == 4, "layout forrange field lower_at");
+OMBR_ASSERT(offsetof(OscForRange, low) == 8, "layout forrange field low");
+OMBR_ASSERT(offsetof(OscForRange, high) == 16, "layout forrange field high");
+typedef struct {
+    uint32_t skip;
+    uint32_t steps;
+    uint32_t actions[5];
+    uint32_t nodekind;
+} OscStmtPlan;
+OMBR_ASSERT(sizeof(OscStmtPlan) == 32, "layout stmtplan size");
+OMBR_ASSERT(offsetof(OscStmtPlan, skip) == 0, "layout stmtplan field skip");
+OMBR_ASSERT(offsetof(OscStmtPlan, steps) == 4, "layout stmtplan field steps");
+OMBR_ASSERT(offsetof(OscStmtPlan, actions) == 8, "layout stmtplan field actions");
+OMBR_ASSERT(offsetof(OscStmtPlan, nodekind) == 28, "layout stmtplan field nodekind");
+typedef struct {
+    uint32_t started;
+    uint32_t stride;
+    uint32_t nameoff;
+    uint32_t match;
+    uint32_t nextkind;
+} OscImportParse;
+OMBR_ASSERT(sizeof(OscImportParse) == 20, "layout imprec size");
+OMBR_ASSERT(offsetof(OscImportParse, started) == 0, "layout imprec field started");
+OMBR_ASSERT(offsetof(OscImportParse, stride) == 4, "layout imprec field stride");
+OMBR_ASSERT(offsetof(OscImportParse, nameoff) == 8, "layout imprec field nameoff");
+OMBR_ASSERT(offsetof(OscImportParse, match) == 12, "layout imprec field match");
+OMBR_ASSERT(offsetof(OscImportParse, nextkind) == 16, "layout imprec field nextkind");
+/* export fn osc_for_range kinds view ushort 7 values view ulong 7 limit ulong range edit forrange to ulong */
+uint64_t osc_for_range(const uint16_t o_kinds[7], const uint64_t o_values[7], uint64_t o_limit, OscForRange *o_range);
+/* export fn osc_read_bound keyword ulong kind ulong value ulong limit ulong to ulong */
+uint64_t osc_read_bound(uint64_t o_keyword, uint64_t o_kind, uint64_t o_value, uint64_t o_limit);
+/* export fn osc_read_import state edit imprec kind ulong spelling view uchar * table edit uchar * to ulong */
+uint64_t osc_read_import(OscImportParse *o_state, uint64_t o_kind, const uint8_t *o_spelling, size_t o_spelling_len, uint8_t *o_table, size_t o_table_len);
+/* export fn osc_clause_word dst edit uchar 256 used ulong prev ulong kind ulong word view uchar * to ulong */
+uint64_t osc_clause_word(uint8_t o_dst[256], uint64_t o_used, uint64_t o_prev, uint64_t o_kind, const uint8_t *o_word, size_t o_word_len);
+/* export fn osc_statement_plan plan edit stmtplan kind ulong nextkind ulong third ulong spelling view uchar * to ulong */
+uint64_t osc_statement_plan(OscStmtPlan *o_plan, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third, const uint8_t *o_spelling, size_t o_spelling_len);
 #ifdef __cplusplus
 }
 #endif
