@@ -55,7 +55,7 @@ for u in $UNITS; do
     src="$T/arboris_gated.om"
   fi
   if [ "$src" -ef "$ROOT/om/blackwell_arboris_emit.om" ]; then
-    { echo om2; cat "$ROOT/om/encoder/bw_enc_sm121.om" "$src"; } > "$T/blackwell_arboris_emit.om"
+    { echo om2; cat "$ROOT/om/encoder/bw_enc_sm121.om" "$src" "$ROOT/om/blackwell_arboris_gated_emit.om"; } > "$T/blackwell_arboris_emit.om"
     src="$T/blackwell_arboris_emit.om"
   fi
   if [ "$src" -ef "$ROOT/om/blackwell_arboris_qmd.om" ]; then

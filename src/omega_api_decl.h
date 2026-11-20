@@ -33,6 +33,8 @@ uint64_t arboris_gated_tick(const uint64_t o_m[16], const uint64_t o_offsets[6],
 uint64_t arboris_emit_spread(uint64_t o_n, uint8_t o_code[16384]);
 /* export fn arboris_emit_relax n ulong code edit uchar 16384 to ulong */
 uint64_t arboris_emit_relax(uint64_t o_n, uint8_t o_code[16384]);
+/* export fn arboris_emit_gated n ulong d ulong standard ulong code edit uchar 16384 to ulong */
+uint64_t arboris_emit_gated(uint64_t o_n, uint64_t o_d, uint64_t o_standard, uint8_t o_code[16384]);
 /* export fn arboris_wave_qmd shape view ulong 7 slots view ulong 20 driver view uint 224 bank edit uint 236 q0 edit uint 96 q1 edit uint 96 to ulong */
 uint64_t arboris_wave_qmd(const uint64_t o_shape[7], const uint64_t o_slots[20], const uint32_t o_driver[224], uint32_t o_bank[236], uint32_t o_q0[96], uint32_t o_q1[96]);
 /* export fn arboris_relax_qmd shape view ulong 7 slots view ulong 20 driver view uint 224 bank edit uint 236 q0 edit uint 96 q1 edit uint 96 to ulong */

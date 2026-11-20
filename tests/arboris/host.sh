@@ -21,6 +21,8 @@ compile "$out/native-arena" om/arboris_arena.om gpu/nvidia/native/nvrm/context.o
 sh tests/arboris/build-sparse-probe.sh "$out/sparse-packet" tests/arboris/sparse-packet.om
 "$out/sparse-packet"
 sh tests/arboris/build-sparse-probe.sh "$out/sparse-chip"
+sh tests/arboris/build-sparse-probe.sh "$out/gated-chip" tests/arboris/gated-silicon.om
+"$out/gated-chip" reference > "$out/gated-reference.log"
 compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om tests/arboris_spread_test.om
 "$out/spread"
 compile "$out/gated" om/arboris_arena.om gpu/nvidia/om/numeric/numeric.om om/arboris_gated.om tests/arboris_gated_test.om
@@ -34,6 +36,12 @@ compile "$out/wave-qmd" om/gpu/bw_qmd.om om/blackwell_arboris_qmd.om tests/arbor
 "$out/wave-qmd"
 echo om2 > "$out/profile.om"
 compile "$out/emit" "$out/profile.om" om/encoder/bw_enc_sm121.om om/blackwell_arboris_emit.om tests/arboris/emit-spread.om
+compile "$out/emit-gated" "$out/profile.om" om/encoder/bw_enc_sm121.om om/blackwell_arboris_emit.om om/blackwell_arboris_gated_emit.om tests/arboris/emit-gated.om
+"$out/emit-gated" > "$out/gated.sass"
+echo "80727df94388dc8ca2e6e0d8e8cc6bf3b4e50bbde2c431cceed51bafef1f89ee  $out/gated.sass" | sha256sum -c -
+grep -qx "output_sha256=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089" "$out/gated-reference.log"
+"$dis" -b SM121 "$out/gated.sass" > "$out/gated.dis"
+diff -u tests/arboris/gated-sm121.dis "$out/gated.dis"
 "$out/emit" > "$out/wave.bin"
 echo "53058a3139706a7688ef68192a8bf8a679ef5dbad77cebc6c65b7081dfc7eb42  $out/wave.bin" | sha256sum -c -
 "$dis" -b SM121 "$out/wave.bin" > "$out/wave.dis"
@@ -46,6 +54,7 @@ cc -O1 -c src/omega_om_units.c -o "$out/units.o"
 cc -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/scoreboard_oracle.c src/omega_bw_hazard.c "$out/units.o" -o "$out/check-wave"
 "$out/check-wave" < "$out/wave.bin"
 "$out/check-wave" < "$out/relax.bin"
+"$out/check-wave" < "$out/gated.sass"
 "$out/emit" mutant > "$out/wave-mutant.bin"
 if "$out/check-wave" < "$out/wave-mutant.bin" > "$out/negative.log"; then
     echo "FAIL: scoreboard accepted a missing load wait"
