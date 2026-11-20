@@ -913,6 +913,12 @@ int64_t tg_sgd_mode(uint64_t o_learning, uint64_t o_momentum);
 void tg_update_velocity(uint32_t *o_velocity, size_t o_velocity_len, const uint32_t *o_gradient, size_t o_gradient_len, uint64_t o_bits);
 /* export fn tg_update_params params edit uint * direction view uint * bits ulong to void */
 void tg_update_params(uint32_t *o_params, size_t o_params_len, const uint32_t *o_direction, size_t o_direction_len, uint64_t o_bits);
+/* export fn ad_unbroadcast_steps source view ulong * target view ulong * steps edit uchar 8 to long */
+int64_t ad_unbroadcast_steps(const uint64_t *o_source, size_t o_source_len, const uint64_t *o_target, size_t o_target_len, uint8_t o_steps[8]);
+/* export fn ad_same_shape lhs view ulong * rhs view ulong * to ulong */
+uint64_t ad_same_shape(const uint64_t *o_lhs, size_t o_lhs_len, const uint64_t *o_rhs, size_t o_rhs_len);
+/* export fn ad_restore_axis shape view ulong * axis ulong restored edit ulong * to void */
+void ad_restore_axis(const uint64_t *o_shape, size_t o_shape_len, uint64_t o_axis, uint64_t *o_restored, size_t o_restored_len);
 #ifdef __cplusplus
 }
 #endif

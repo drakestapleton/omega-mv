@@ -547,6 +547,14 @@ uint32_t omega2_tg_sgd_mode(uint64_t *result, uint64_t o_learning, uint64_t o_mo
 uint32_t omega2_tg_update_velocity(uint64_t *result, uint32_t *o_velocity, uint64_t o_velocity_len, const uint32_t *o_gradient, uint64_t o_gradient_len, uint64_t o_bits);
 /* export fn tg_update_params params edit uint * direction view uint * bits ulong to void */
 uint32_t omega2_tg_update_params(uint64_t *result, uint32_t *o_params, uint64_t o_params_len, const uint32_t *o_direction, uint64_t o_direction_len, uint64_t o_bits);
+#define OMEGA2_IDENT_gradient_shape "omega-ident 1 unit=gradient_shape abi=2 profile=OM-2 src=72bbfb692f58df6113c6b9d3ab7028ec40185ada88baafd773e02145ddde8d62 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_gradient_shape(void);
+/* export fn ad_unbroadcast_steps source view ulong * target view ulong * steps edit uchar 8 to long */
+uint32_t omega2_ad_unbroadcast_steps(uint64_t *result, const uint64_t *o_source, uint64_t o_source_len, const uint64_t *o_target, uint64_t o_target_len, uint8_t *o_steps, uint64_t o_steps_len);
+/* export fn ad_same_shape lhs view ulong * rhs view ulong * to ulong */
+uint32_t omega2_ad_same_shape(uint64_t *result, const uint64_t *o_lhs, uint64_t o_lhs_len, const uint64_t *o_rhs, uint64_t o_rhs_len);
+/* export fn ad_restore_axis shape view ulong * axis ulong restored edit ulong * to void */
+uint32_t omega2_ad_restore_axis(uint64_t *result, const uint64_t *o_shape, uint64_t o_shape_len, uint64_t o_axis, uint64_t *o_restored, uint64_t o_restored_len);
 #ifdef __cplusplus
 }
 #endif
