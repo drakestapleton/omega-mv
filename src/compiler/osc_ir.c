@@ -313,7 +313,7 @@ static bool func_contracts_ok(const OscFunc *f) {
     /* Zero denotes an absent parameter or a non-scalar value. Parameter
      * indices are bytes in the object, including on the strict decode path. */
     uint8_t params[UINT8_MAX + 1] = {0};
-    for (unsigned i = 0; i < f->nparams; ++i)
+    for (unsigned i = 0; i < f->nparams && i < f->nvregs; ++i)
         if (type_is_scalar(&f->vtype[i])) params[i] = (uint8_t)f->vtype[i].s;
     return osc_ir_contract((const uint8_t *)f->req, f->nreq * sizeof(OscCterm), params, 0) &&
            osc_ir_contract((const uint8_t *)f->ens, f->nens * sizeof(OscCterm), params,
