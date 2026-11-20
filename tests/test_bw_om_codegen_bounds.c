@@ -861,6 +861,40 @@ static void test_pattn256_and_router_error_paths(void) {
     }
 }
 
+static void test_regalloc_and_matmul_error_paths(void) {
+    uint64_t cfg[4] = { 257, 0, 0, 0 };
+    int64_t vinfo[256 * 3];
+    uint64_t uinfo[32];
+    int64_t res[290];
+    memset(vinfo, 0, sizeof(vinfo));
+    memset(uinfo, 0, sizeof(uinfo));
+    memset(res, 0, sizeof(res));
+    uint64_t rc = 0;
+    CHK(omega2_bw_regalloc_solve(&rc, cfg, 4, vinfo, 256 * 3, uinfo, 32, res, 290) == OMEGA_OK && rc == 1,
+        "regalloc nv>256 rejected");
+    cfg[0] = 0; cfg[1] = 33; cfg[2] = 0; rc = 0;
+    CHK(omega2_bw_regalloc_solve(&rc, cfg, 4, vinfo, 256 * 3, uinfo, 32, res, 290) == OMEGA_OK && rc == 1,
+        "regalloc nu>32 rejected");
+    cfg[0] = 0; cfg[1] = 0; cfg[2] = 247; rc = 0;
+    CHK(omega2_bw_regalloc_solve(&rc, cfg, 4, vinfo, 256 * 3, uinfo, 32, res, 290) == OMEGA_OK && rc == 1,
+        "regalloc gpr_limit>246 rejected");
+
+    BlackwellIRProgram prog;
+    OmegaMatMulSpec bad = { .m = 15, .k = 16, .n = 8, .precision = OMEGA_MATMUL_PRECISION_BF16 };
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_tensor_prog(&bad, &prog) != 0 && prog.count == 0,
+        "matmul_tensor bad m fails closed");
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_tensor_loop_prog(&bad, 1, 0, &prog) != 0 && prog.count == 0,
+        "matmul_tensor_loop bad m fails closed");
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_frag_prog(&bad, 1, 1, 0, &prog) != 0 && prog.count == 0,
+        "matmul_frag bad m fails closed");
+    prog.count = 7;
+    CHK(omega_blackwell_codegen_matmul_frag_block_prog(&bad, 1, 1, 2, 2, 0, &prog) != 0 && prog.count == 0,
+        "matmul_frag_block bad m fails closed");
+}
+
 int main(void) {
     test_unpacker_bounds();
     test_gemm_error_paths();
@@ -871,6 +905,7 @@ int main(void) {
     test_pattn_and_attn_error_paths();
     test_tern_and_attn256_error_paths();
     test_dec_and_gdn_error_paths();
+    test_regalloc_and_matmul_error_paths();
     test_max_size_legal_inputs();
     dump_metrics();
     printf("test_bw_om_codegen_bounds: %d passed, %d failed: %s\n", g_pass, g_fail, g_fail ? "FAIL" : "PASS");
