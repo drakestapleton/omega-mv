@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Ported OSC IR register dataflow, arena and pool discipline, structured contract validation, scoped symbol declarations, AArch64 move-wide constant selection, and CLI artifact entry serialization to seeded Omega. |
 | OpenAI Codex | Trained and tested the seeded Omega coding controller on Spark, including its learned second-example check and CPU behavior replay. |
 | OpenAI Codex | Migrated binary32 SGD and heavy-ball momentum updates, retaining transaction replay and gradient alias behavior. |
 | OpenAI Codex | Migrated tensor shape validation, row-major strides, view bounds and broadcast shape calculation to seeded Omega. |

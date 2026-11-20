@@ -541,6 +541,8 @@ uint64_t osc_a64_check_fields(uint64_t o_cls, const OscA64Fields *o_f, uint64_t 
 uint64_t osc_a64_checked_word(uint64_t o_form, uint64_t o_base, const OscA64Fields *o_f, uint64_t o_flags);
 /* export fn osc_a64_canonical_word form ulong base ulong word ulong flags ulong fields edit a64field to ulong */
 uint64_t osc_a64_canonical_word(uint64_t o_form, uint64_t o_base, uint64_t o_word, uint64_t o_flags, OscA64Fields *o_fields);
+/* export fn osc_a64_materialize value ulong plan edit ulong 4 to ulong */
+uint64_t osc_a64_materialize(uint64_t o_value, uint64_t o_plan[4]);
 #define OSC_FOR_WINDOW 7
 #define OSC_FOR_NAME 1
 #define OSC_FOR_IN 2
@@ -695,6 +697,22 @@ uint64_t osc_join_snapshot(const uint32_t *o_saved, size_t o_saved_len, uint32_t
 /* export fn osc_snapshot_moves saved view uint * owners view uint 1280 ids edit int * to ulong */
 uint64_t osc_snapshot_moves(const uint32_t *o_saved, size_t o_saved_len, const uint32_t o_owners[1280], int32_t *o_ids, size_t o_ids_len);
 typedef struct {
+    uint32_t id;
+    uint32_t line;
+    uint32_t node;
+    uint32_t loop;
+    uint8_t kind;
+    uint8_t mut;
+    uint8_t ombr_pad18[2];
+} OscDeclSite;
+OMBR_ASSERT(sizeof(OscDeclSite) == 20, "layout declsite size");
+OMBR_ASSERT(offsetof(OscDeclSite, id) == 0, "layout declsite field id");
+OMBR_ASSERT(offsetof(OscDeclSite, line) == 4, "layout declsite field line");
+OMBR_ASSERT(offsetof(OscDeclSite, node) == 8, "layout declsite field node");
+OMBR_ASSERT(offsetof(OscDeclSite, loop) == 12, "layout declsite field loop");
+OMBR_ASSERT(offsetof(OscDeclSite, kind) == 16, "layout declsite field kind");
+OMBR_ASSERT(offsetof(OscDeclSite, mut) == 17, "layout declsite field mut");
+typedef struct {
     uint16_t head[256];
     uint16_t prior[480];
     uint16_t bucket[480];
@@ -725,6 +743,8 @@ void osc_scope_pop(OscCheckedScope *o_table);
 int64_t osc_record_name(const uint8_t *o_records, size_t o_records_len, const uint8_t *o_name, size_t o_name_len, uint64_t o_stride, uint64_t o_newest);
 /* export fn osc_find_function names view uchar * name view uchar * to long */
 int64_t osc_find_function(const uint8_t *o_names, size_t o_names_len, const uint8_t *o_name, size_t o_name_len);
+/* export fn osc_declare_symbol table edit scopetab symbols edit uchar 76800 name view uchar * ty view uchar 16 site view declsite to long */
+int64_t osc_declare_symbol(OscCheckedScope *o_table, uint8_t o_symbols[76800], const uint8_t *o_name, size_t o_name_len, const uint8_t o_ty[16], const OscDeclSite *o_site);
 #define OSC_POOL_FULL 1
 #define OSC_POOL_RETIRED 2
 #define OSC_HANDLE_UNKNOWN 0
@@ -846,6 +866,35 @@ uint64_t osc_block_partition(const uint8_t *o_blocks, size_t o_blocks_len, const
 void osc_definite_inputs(const uint64_t *o_transfers, size_t o_transfers_len, uint64_t *o_inputs, size_t o_inputs_len, uint64_t o_params, uint64_t o_width);
 /* export fn osc_layout_blocks tags view short * source view ulong 24576 dest edit ulong 24576 blocks edit uint 1024 nblocks ulong to void */
 void osc_layout_blocks(const int16_t *o_tags, size_t o_tags_len, const uint64_t o_source[24576], uint64_t o_dest[24576], uint32_t o_blocks[1024], uint64_t o_nblocks);
+/* export fn osc_ir_operands insn view uchar 48 uses edit ushort 6 to ulong */
+uint64_t osc_ir_operands(const uint8_t o_insn[48], uint16_t o_uses[6]);
+/* export fn osc_ir_resources insns view uchar * types view uchar 480 slices view uchar 480 params ulong to ulong */
+uint64_t osc_ir_resources(const uint8_t *o_insns, size_t o_insns_len, const uint8_t o_types[480], const uint8_t o_slices[480], uint64_t o_params);
+/* export fn osc_ir_block_transfer insns view uchar * record edit ulong * blocks ulong to void */
+void osc_ir_block_transfer(const uint8_t *o_insns, size_t o_insns_len, uint64_t *o_record, size_t o_record_len, uint64_t o_blocks);
+/* export fn osc_ir_block_reads insns view uchar * available edit ulong * to ulong */
+uint64_t osc_ir_block_reads(const uint8_t *o_insns, size_t o_insns_len, uint64_t *o_available, size_t o_available_len);
+/* export fn osc_ir_canonical scalar ulong value ulong to ulong */
+uint64_t osc_ir_canonical(uint64_t o_scalar, uint64_t o_value);
+/* export fn osc_ir_contract terms view uchar * params view uchar 256 result ulong to ulong */
+uint64_t osc_ir_contract(const uint8_t *o_terms, size_t o_terms_len, const uint8_t o_params[256], uint64_t o_result);
+typedef struct {
+    uint32_t index;
+    uint32_t count;
+    uint32_t result;
+    uint32_t kind[6];
+    uint32_t offset;
+} OscArtifactEntry;
+OMBR_ASSERT(sizeof(OscArtifactEntry) == 40, "layout entry size");
+OMBR_ASSERT(offsetof(OscArtifactEntry, index) == 0, "layout entry field index");
+OMBR_ASSERT(offsetof(OscArtifactEntry, count) == 4, "layout entry field count");
+OMBR_ASSERT(offsetof(OscArtifactEntry, result) == 8, "layout entry field result");
+OMBR_ASSERT(offsetof(OscArtifactEntry, kind) == 12, "layout entry field kind");
+OMBR_ASSERT(offsetof(OscArtifactEntry, offset) == 36, "layout entry field offset");
+/* export fn osc_artifact_entry row view entry name view uchar * dst edit uchar * to long */
+int64_t osc_artifact_entry(const OscArtifactEntry *o_row, const uint8_t *o_name, size_t o_name_len, uint8_t *o_dst, size_t o_dst_len);
+/* export fn osc_artifact_hex digest view uchar 32 dst edit uchar 65 to void */
+void osc_artifact_hex(const uint8_t o_digest[32], uint8_t o_dst[65]);
 /* export fn tensor_shape_size dims view ulong * elems edit ulong 1 to long */
 int64_t tensor_shape_size(const uint64_t *o_dims, size_t o_dims_len, uint64_t o_elems[1]);
 /* export fn tensor_dense_strides dims view ulong * strides edit ulong * to void */

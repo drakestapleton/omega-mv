@@ -380,31 +380,35 @@ static int lookup(C *c, const char *name)
                                (const uint8_t *)name, strlen(name));
 }
 
+_Static_assert(sizeof(Sym) == 160 && offsetof(Sym, line) == 64 && offsetof(Sym, kind) == 68 &&
+               offsetof(Sym, mut) == 69 && offsetof(Sym, ty) == 72 && sizeof(OscType) == 16 &&
+               offsetof(Sym, loop_depth) == 88 && offsetof(Sym, obj) == 92 && offsetof(Sym, bor) == 96 &&
+               offsetof(Sym, decl) == 152, "OSC scoped declaration layout");
+
+static int redefined(C *c, const OscNode *n, const char *name, int prev)
+{
+    osc_diag_set(c->d, OSC_DIAG_REDEFINED_NAME, n->line, n->col, name, c->sym[prev].line, NULL,
+                 "redefine visible name", "'%s' is already defined at line %u (no shadowing)", name,
+                 c->sym[prev].line);
+    return -1;
+}
+
+static int bind_symbol(C *c, const OscNode *n, const char *name, uint8_t kind, const OscType *ty, int mut)
+{
+    OscDeclSite site = {.id = (uint32_t)c->nsym, .line = n->line, .node = (uint32_t)(n - c->ast->nodes),
+                        .loop = (uint32_t)c->loop_depth, .kind = kind, .mut = (uint8_t)mut};
+    int prev = (int)osc_declare_symbol(&c->names, (uint8_t *)c->sym, (const uint8_t *)name,
+                                       strlen(name), (const uint8_t *)ty, &site);
+    if (prev >= 0) return redefined(c, n, name, prev);
+    if (prev == -2) return cap_fail(c, n->line, "symbol capacity");
+    return c->nsym++;
+}
+
 static int declare(C *c, const OscNode *n, uint8_t kind, const OscType *ty, int mut)
 {
     char name[64];
     osc_node_name(c->ast, n, name, sizeof name);
-    int prev = lookup(c, name);
-    if (prev >= 0) {
-        osc_diag_set(c->d, OSC_DIAG_REDEFINED_NAME, n->line, n->col, name, c->sym[prev].line, NULL,
-                     "redefine visible name", "'%s' is already defined at line %u (no shadowing)", name,
-                     c->sym[prev].line);
-        return -1;
-    }
-    if (c->nsym >= OSC_CHECK_MAX_SYMS) return cap_fail(c, n->line, "symbol capacity");
-    int s = c->nsym++;
-    Sym *y = &c->sym[s];
-    memset(y, 0, sizeof *y);
-    memcpy(y->name, name, strlen(name) + 1);
-    y->line = n->line;
-    y->kind = kind;
-    y->mut = (uint8_t)mut;
-    y->ty = *ty;
-    y->loop_depth = c->loop_depth;
-    y->obj = y->bor = -1;
-    y->decl = (int)(n - c->ast->nodes);
-    osc_scope_bind(&c->names, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
-    return s;
+    return bind_symbol(c, n, name, kind, ty, mut);
 }
 
 static int push_scope(C *c, uint32_t line)
@@ -1200,16 +1204,8 @@ static int chk_contracts(C *c, int fi)
         }
         if (c->fret.s != OSC_T_VOID) {
             /* the `result` pseudo binding, visible only inside the clause */
-            if (c->nsym >= OSC_CHECK_MAX_SYMS) return cap_fail(c, NODE(e)->line, "symbol capacity");
-            int s = c->nsym++;
-            Sym *y = &c->sym[s];
-            memset(y, 0, sizeof *y);
-            snprintf(y->name, sizeof y->name, "result");
-            y->line = NODE(e)->line;
-            y->kind = SK_SCALAR;
-            y->ty = c->fret;
-            y->obj = y->bor = -1;
-            osc_scope_bind(&c->names, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
+            int s = bind_symbol(c, NODE(e), "result", SK_SCALAR, &c->fret, 0);
+            if (s < 0) return -1;
             a->res_sym[fi] = s;
         }
         c->contract = 2;
@@ -1602,7 +1598,7 @@ static int chk_stmt(C *c, int i)
         char name[64];
         osc_node_name(c->ast, n, name, sizeof name);
         int prev = lookup(c, name);
-        if (prev >= 0) return declare(c, n, SK_SCALAR, &n->ty, n->mut) < 0 ? -1 : -1;
+        if (prev >= 0) return redefined(c, n, name, prev);
         if (slice_noescape(c, n->a)) return -1;
         if (chk(c, n->a, n->ty.s) < 0) return -1;
         int s = declare(c, n, SK_SCALAR, &n->ty, n->mut);
@@ -1614,7 +1610,8 @@ static int chk_stmt(C *c, int i)
         set_sobj_tok(c, n);
         char name[64];
         osc_node_name(c->ast, n, name, sizeof name);
-        if (lookup(c, name) >= 0) return declare(c, n, SK_OWNER, &n->ty, 0) < 0 ? -1 : -1;
+        int prev = lookup(c, name);
+        if (prev >= 0) return redefined(c, n, name, prev);
         if (n->ty.sid) {  /* struct literal: field values in source order */
             const OscStruct *st = &c->ast->structs[n->ty.sid - 1];
             for (int fi = n->a; fi >= 0; fi = NODE(fi)->next)
@@ -1640,7 +1637,8 @@ static int chk_stmt(C *c, int i)
         set_sobj_tok(c, n);
         char name[64];
         osc_node_name(c->ast, n, name, sizeof name);
-        if (lookup(c, name) >= 0) return declare(c, n, SK_OWNER, &n->ty, 0) < 0 ? -1 : -1;
+        int prev = lookup(c, name);
+        if (prev >= 0) return redefined(c, n, name, prev);
         if (n->c >= 0) {
             osc_diag_set(c->d, OSC_DIAG_ARENA_MOVE, n->line, n->col, name, 0, NULL, "move into arena",
                          "'%s': an owner cannot be moved into an arena (arena objects are created in place)", name);
@@ -1671,7 +1669,8 @@ static int chk_stmt(C *c, int i)
         set_sobj_tok(c, n);
         char name[64];
         osc_node_name(c->ast, n, name, sizeof name);
-        if (lookup(c, name) >= 0) return declare(c, n, SK_BORROW, &n->ty, n->mut) < 0 ? -1 : -1;
+        int prev = lookup(c, name);
+        if (prev >= 0) return redefined(c, n, name, prev);
         OscNode *bn = NODE(n->a);
         int src;
         if (chk_borrow_src(c, bn, &n->ty, &src)) return -1;
@@ -1879,7 +1878,8 @@ static int chk_stmt(C *c, int i)
         set_sobj_tok(c, n);
         char name[64];
         osc_node_name(c->ast, n, name, sizeof name);
-        if (lookup(c, name) >= 0) return declare(c, n, SK_HANDLE, &n->ty, n->mut) < 0 ? -1 : -1;
+        int prev = lookup(c, name);
+        if (prev >= 0) return redefined(c, n, name, prev);
         int ps = pool_sym(c, NODE(n->c));
         if (ps < 0) return -1;
         int pv = handle_value(c, NODE(n->a), ps, name);

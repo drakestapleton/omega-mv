@@ -32,13 +32,7 @@
 #include "osc_cg.h"
 #include "osc_front.h"
 #include "sha256.h"
-
-static void hex(const uint8_t *d, char *out)
-{
-    static const char h[] = "0123456789abcdef";
-    for (int i = 0; i < 32; i++) { out[2 * i] = h[d[i] >> 4]; out[2 * i + 1] = h[d[i] & 15]; }
-    out[64] = 0;
-}
+#include "omega_api_decl.h"
 
 /* `oscc <file.osc> OUT`: also write the compiler's own output to files, for packaging into a signed
  * unit container (aien-protocols specs/osc-unit-artifact). OUT.ir = canonical IR bytes (osc_ir_encode),
@@ -65,46 +59,44 @@ static void remove_outputs(const char *pre)
     }
 }
 
-static int write_tmp(const char *pre, int i, const void *p, size_t n, const char *text)
+static int write_tmp(const char *pre, int i, const void *p, size_t n)
 {
     char path[4096];
     if (out_path(path, sizeof path, pre, k_ext[i], ".tmp")) return -1;
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    int bad = text ? fputs(text, f) == EOF : fwrite(p, 1, n, f) != n;
+    int bad = fwrite(p, 1, n, f) != n;
     return (fclose(f) != 0 || bad) ? -1 : 0;
 }
-
-/* 1..9 scalars, 11 bytes, 12 cells (OSC_UNIT_ARTIFACT.md section 6.1); 0 and 10 are refused. */
-static int kind_ok(unsigned k) { return (k >= 1 && k <= 9) || k == 11 || k == 12; }
 
 /* 0 written; 1 refused (message in err); -1 cannot write. */
 static int emit_files(const char *pre, const OscUnit *u, const OscCode *code, char *err, size_t errn)
 {
-    static char ent[OSC_MAX_FUNCS * 128];
+    static uint8_t ent[OSC_MAX_FUNCS * 128];
     size_t at = 0;
     for (unsigned fi = 0; fi < u->nfuncs; fi++) {
         const OscFunc *fn = &u->funcs[fi];
-        for (unsigned r = 0; r < fn->nparams; r++)
-            if (!kind_ok((unsigned)fn->vtype[r].s)) {
-                snprintf(err, errn, "function %s parameter register %u has kind %u, which a unit container refuses",
-                         fn->name, r, (unsigned)fn->vtype[r].s);
-                return 1;
-            }
-        int w = snprintf(ent + at, sizeof ent - at, "%u %u %u", fi, (unsigned)fn->nparams, (unsigned)fn->ret.s);
-        for (unsigned r = 0; r < 6 && w > 0 && (size_t)w < sizeof ent - at; r++)
-            w += snprintf(ent + at + w, sizeof ent - at - w, " %u", r < fn->nparams ? (unsigned)fn->vtype[r].s : 0u);
-        if (w > 0 && (size_t)w < sizeof ent - at)
-            w += snprintf(ent + at + w, sizeof ent - at - w, " %u %s\n", (unsigned)code->entry[fi], fn->name);
-        if (w <= 0 || (size_t)w >= sizeof ent - at) return -1;
-        at += (size_t)w;
+        OscArtifactEntry row = {.index = fi, .count = fn->nparams, .result = fn->ret.s,
+                                .offset = code->entry[fi]};
+        _Static_assert(OSC_MAX_PARAMS == 6, "unit artifact parameter slots");
+        for (unsigned r = 0; r < fn->nparams; ++r) row.kind[r] = fn->vtype[r].s;
+        int64_t written = osc_artifact_entry(&row, (const uint8_t *)fn->name, strlen(fn->name),
+                                             ent + at, sizeof ent - at);
+        if (written < -OSC_MAX_PARAMS) return -1;
+        if (written < 0) {
+            unsigned r = (unsigned)(-1 - written);
+            snprintf(err, errn, "function %s parameter register %u has kind %u, which a unit container refuses",
+                     fn->name, r, row.kind[r]);
+            return 1;
+        }
+        at += (size_t)written;
     }
     size_t n = 0;
     if (osc_ir_encode(u, NULL, 0, &n)) return -1;
     uint8_t *ir = malloc(n ? n : 1);
     if (!ir) return -1;
-    int rc = osc_ir_encode(u, ir, n, &n) || write_tmp(pre, 0, ir, n, NULL) ||
-             write_tmp(pre, 1, code->code, code->len, NULL) || write_tmp(pre, 2, NULL, 0, ent);
+    int rc = osc_ir_encode(u, ir, n, &n) || write_tmp(pre, 0, ir, n) ||
+             write_tmp(pre, 1, code->code, code->len) || write_tmp(pre, 2, ent, at);
     free(ir);
     char from[4096], to[4096];
     for (int i = 0; !rc && i < 3; i++)
@@ -167,10 +159,10 @@ int main(int argc, char **argv)
         free(src);
         return erc > 0 ? 1 : 2;
     }
-    hex(dig, hx);
+    osc_artifact_hex(dig, (uint8_t *)hx);
     printf("ir_sha256=%s\n", hx);
     sha256_hash(code.code, code.len, dig);
-    hex(dig, hx);
+    osc_artifact_hex(dig, (uint8_t *)hx);
     printf("code_sha256=%s\n", hx);
     printf("funcs=%u\n", (unsigned)u->nfuncs);
     osc_cg_free(&code);

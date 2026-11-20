@@ -28,6 +28,7 @@
  */
 #include "osc_cg.h"
 #include "osc_a64.h"
+#include "omega_api_decl.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -121,30 +122,15 @@ static int64_t slot(int v) { return 8 * ((int64_t)v + 1); }
 static void ld(Cg *g, int r, int v) { E(g, osc_a64_mem(OSC_A64_LDR_UOFF, r, SP, slot(v))); }
 static void st(Cg *g, int r, int v) { E(g, osc_a64_mem(OSC_A64_STR_UOFF, r, SP, slot(v))); }
 
+_Static_assert(OSC_A64_MOVZ == 25 && OSC_A64_MOVN == 26 && OSC_A64_MOVK == 27,
+               "OSC move-wide opcode tags");
+
 static void mat(Cg *g, int r, uint64_t imm) {
-    int zeros = 0, ones = 0;
-    for (int i = 0; i < 4; i++) {
-        uint16_t c = (uint16_t)(imm >> (16 * i));
-        zeros += c == 0;
-        ones += c == 0xFFFF;
-    }
-    int first = 1;
-    if (ones > zeros) {
-        for (int i = 0; i < 4; i++) {
-            uint16_t c = (uint16_t)(imm >> (16 * i));
-            if (c == 0xFFFF) continue;
-            if (first) { E(g, osc_a64_mov16(OSC_A64_MOVN, r, (uint16_t)~c, 16 * i)); first = 0; }
-            else E(g, osc_a64_mov16(OSC_A64_MOVK, r, c, 16 * i));
-        }
-        if (first) E(g, osc_a64_mov16(OSC_A64_MOVN, r, 0, 0)); /* all ones */
-    } else {
-        for (int i = 0; i < 4; i++) {
-            uint16_t c = (uint16_t)(imm >> (16 * i));
-            if (c == 0) continue;
-            if (first) { E(g, osc_a64_mov16(OSC_A64_MOVZ, r, c, 16 * i)); first = 0; }
-            else E(g, osc_a64_mov16(OSC_A64_MOVK, r, c, 16 * i));
-        }
-        if (first) E(g, osc_a64_mov16(OSC_A64_MOVZ, r, 0, 0));
+    uint64_t plan[4];
+    size_t count = osc_a64_materialize(imm, plan);
+    for (size_t i = 0; i < count; i++) {
+        OscA64Op op = (OscA64Op)(plan[i] >> 32);
+        E(g, osc_a64_mov16(op, r, (uint16_t)plan[i], (uint16_t)(plan[i] >> 16)));
     }
 }
 
