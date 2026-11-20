@@ -28,7 +28,7 @@ NATIVE_PIN=2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # One generated library for all units: the bindings share one ABI runtime (ombr_enter).
 # om/encoder/bw_enc_sm121.om: the sm_121 instruction encoder, twin of aien-dev/CUDApp's (mk/om-encoder.mk).
-UNITS="${OMEGA_UNITS:-om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_enc_sm121.om om/gpu/bw_qmd.om om/gpu/bw_sched.om om/gpu/bw_regalloc.om om/gpu/bw_vecadd.om om/gpu/cg_matmul.om om/gpu/cg_gpu_gemm.om om/gpu/cg_gpu_attn.om om/gpu/q38_plan.om om/gpu/moe_plan.om om/gpu/cg_pf.om om/gpu/cg_bf16.om om/gpu/cg_gemm.om om/gpu/cg_moe2.om om/gpu/cg_moe.om om/gpu/cg_qmma.om om/gpu/cg_pfhost.om om/gpu/cg_tgemm.om om/gpu/cg_tc2.om om/gpu/cg_qg.om om/gpu/cg_tc.om om/gpu/cg_pattn256.om om/gpu/cg_router.om om/gpu/cg_pattn.om om/gpu/cg_attn.om om/gpu/cg_tern.om om/gpu/cg_attn256.om om/gpu/cg_dec.om om/gpu/cg_gdn.om om/runtime/rx_regulate.om om/runtime/rx_mid.om om/runtime/rx_cortex_rec.om om/runtime/rx_plan_core.om om/runtime/rx_projection.om om/runtime/rx_capq_core.om om/runtime/rx_costmodel_core.om om/runtime/rx_route_core.om om/runtime/rx_world_core.om om/runtime/rx_skillroute_core.om om/runtime/rx_fusion_core.om om/compiler/osc_literal.om om/compiler/osc_type.om om/compiler/osc_expr.om om/compiler/osc_scalar.om om/compiler/osc_a64_fields.om om/compiler/osc_statement.om om/compiler/osc_ownership.om om/compiler/osc_scope.om om/compiler/osc_pool.om om/compiler/osc_trace.om om/compiler/osc_lifetimes.om}"
+UNITS="${OMEGA_UNITS:-om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_enc_sm121.om om/gpu/bw_qmd.om om/gpu/bw_sched.om om/gpu/bw_regalloc.om om/gpu/bw_vecadd.om om/gpu/cg_matmul.om om/gpu/cg_gpu_gemm.om om/gpu/cg_gpu_attn.om om/gpu/q38_plan.om om/gpu/moe_plan.om om/gpu/cg_pf.om om/gpu/cg_bf16.om om/gpu/cg_gemm.om om/gpu/cg_moe2.om om/gpu/cg_moe.om om/gpu/cg_qmma.om om/gpu/cg_pfhost.om om/gpu/cg_tgemm.om om/gpu/cg_tc2.om om/gpu/cg_qg.om om/gpu/cg_tc.om om/gpu/cg_pattn256.om om/gpu/cg_router.om om/gpu/cg_pattn.om om/gpu/cg_attn.om om/gpu/cg_tern.om om/gpu/cg_attn256.om om/gpu/cg_dec.om om/gpu/cg_gdn.om om/runtime/rx_regulate.om om/runtime/rx_mid.om om/runtime/rx_cortex_rec.om om/runtime/rx_plan_core.om om/runtime/rx_projection.om om/runtime/rx_capq_core.om om/runtime/rx_costmodel_core.om om/runtime/rx_route_core.om om/runtime/rx_world_core.om om/runtime/rx_skillroute_core.om om/runtime/rx_fusion_core.om om/compiler/osc_literal.om om/compiler/osc_type.om om/compiler/osc_expr.om om/compiler/osc_scalar.om om/compiler/osc_a64_fields.om om/compiler/osc_statement.om om/compiler/osc_ownership.om om/compiler/osc_scope.om om/compiler/osc_pool.om om/compiler/osc_trace.om om/compiler/osc_lifetimes.om src/tensor/tensor_shape.om}"
 # The units the freestanding GPU link needs (the encoder, codegen, matmul and realize files hash with sha256_*; qmd packs QMDs; regalloc solves intervals; bw_vecadd emits vecadd; cg_matmul emits tensor/frag/i32 IR).
 FS_UNITS="om/sha256/sha256-om2.om om/gpu/bw_qmd.om om/gpu/bw_regalloc.om om/gpu/bw_vecadd.om om/gpu/cg_matmul.om om/gpu/cg_gpu_attn.om"
 DEST="${OMEGA_UNITS_DEST:-$ROOT/src}"
@@ -38,7 +38,7 @@ OUTS="omega_om_units.c omega_native.h omega_api_decl.h omega_om_units.ident omeg
 [ "$(sha256sum < "$OMEGA_BRIDGE/src/native.om" | cut -c1-64)" = "$NATIVE_PIN" ] || { echo "NOT_RUN: native.om is not the pinned generator"; exit 3; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 "$OMEGA_OMC" < "$OMEGA_BRIDGE/src/native.om" > "$T/native"; chmod +x "$T/native"
-: > "$T/units.in"; : > "$T/fs.in"; : > "$T/omega_om_units.ident"
+: > "$T/units.in"; : > "$T/host.in"; : > "$T/leaf.in"; : > "$T/fs.in"; : > "$T/omega_om_units.ident"
 for u in $UNITS; do
   case "$u" in /*) src=$u ;; *) src=$ROOT/$u ;; esac
   name=$(basename "$u" .om | tr -c 'A-Za-z0-9_\n' '_')
@@ -48,10 +48,22 @@ for u in $UNITS; do
   { cat "$src"; printf '\0'; printf '%08d' "$(wc -c < "$T/u.bin")"; cat "$T/u.bin"
     [ $abi = 1 ] || printf 'omega-unit %s %s\n' "$name" "$OMC_PIN"; } > "$T/u.in"
   cat "$T/u.in" >> "$T/units.in"
+  case "$u" in
+    src/tensor/tensor_shape.om) cat "$T/u.in" >> "$T/leaf.in" ;;
+    *) cat "$T/u.in" >> "$T/host.in" ;;
+  esac
   case " $FS_UNITS " in *" $u "*) cat "$T/u.in" >> "$T/fs.in";; esac
   echo "omega-ident 1 unit=$name abi=$abi profile=$prof src=$(sha256sum < "$src" | cut -c1-64) omc=$OMC_PIN path=$u" >> "$T/omega_om_units.ident"
 done
-{ "$T/native" c < "$T/units.in"; "$T/native" apic < "$T/units.in"; } > "$T/omega_om_units.c"
+{ "$T/native" c < "$T/host.in"; "$T/native" apic < "$T/host.in"; } > "$T/omega_om_units.c"
+# Bounded leaf units use the generator's caller-stack ABI. Namespace its private
+# helpers (including assembly labels) so the two generated bindings can share
+# one translation unit. Public entry points and embedded code stay unchanged.
+if [ -s "$T/leaf.in" ]; then
+  "$T/native" freest < "$T/leaf.in" > "$T/leaf.c"
+  "$T/native" fapic < "$T/leaf.in" >> "$T/leaf.c"
+  sed 's/ombr/ombr_leaf/g' "$T/leaf.c" >> "$T/omega_om_units.c"
+fi
 "$T/native" h < "$T/units.in" > "$T/omega_native.h"
 "$T/native" apih < "$T/units.in" > "$T/omega_api_decl.h"
 { "$T/native" freest < "$T/fs.in"; "$T/native" fapic < "$T/fs.in"; } > "$T/omega_om_units_fs.c"
