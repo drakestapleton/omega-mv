@@ -211,6 +211,14 @@ uint32_t omega2_rx_fus_eligible_kind(uint64_t *result, uint64_t o_k);
 const char *omega2_ident_osc_literal(void);
 /* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
 uint32_t omega2_osc_parse_literal(uint64_t *result, const uint8_t *o_spelling, uint64_t o_spelling_len, uint64_t *o_value);
+#define OMEGA2_IDENT_osc_ownership "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=b947984425bedd6508a3b9f6154fb9ef35c0fada6ba0a81a609767cb54515e2d omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_osc_ownership(void);
+/* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+uint32_t omega2_osc_owner_access(uint64_t *result, uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
+/* export fn osc_borrow_access writable ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+uint32_t omega2_osc_borrow_access(uint64_t *result, uint64_t o_writable, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
+/* export fn osc_owner_move moved ulong shared_count ulong mut_count ulong declaration_depth long loop_depth long to ulong */
+uint32_t omega2_osc_owner_move(uint64_t *result, uint64_t o_moved, uint64_t o_shared_count, uint64_t o_mut_count, uint64_t o_declaration_depth, uint64_t o_loop_depth);
 #ifdef __cplusplus
 }
 #endif

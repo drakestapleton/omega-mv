@@ -1971,6 +1971,73 @@ __attribute__((visibility("default"))) uint32_t omega2_osc_parse_literal(uint64_
         return OMEGA_BAD_ARG;
     return ombr2_run(ombr2_entry_osc_parse_literal, a, result, 1, ou, no);
 }
+__asm__(".section .text.omega_bridge,\"ax\",@progbits\n.balign 4\n.local ombr2_code_osc_ownership\n.hidden ombr2_code_osc_ownership\nombr2_code_osc_ownership:\n.byte 0x10,0x00,0x00,0x14,0x23,0x00,0x00,0x14,0x3a,0x00,0x00,0x14,0x5f,0x00,0x00,0xf1,0xe3,0x07,0x9f,0x9a,0x1f,0x00,0x00,0xf1,0xe4,0x07,0x9f,0x9a,0x3f,0x00,0x00,0xf1,0xe5,0x07,0x9f,0x9a,0x86,0x00,0x05,0x8a,0x68,0x00,0x06,0xaa,0x68,0x00,0x00,0xb4,0x40,0x00,0x80,0xd2,0xc0,0x03,0x5f,0xd6,0x00,0x00,0x80,0xd2,0xc0,0x03,0x5f,0xd6,0x1f,0x00,0x00,0xf1,0x60,0x00,0x00,0x54,0x20,0x00,0x80,0xd2,0xc0,0x03,0x5f,0xd6,0xff,0xc3,0x00,0xd1,0xe0,0x03,0x00,0xf9,0xe1,0x07,0x00,0xf9,0xe2,0x0b,0x00,0xf9,0xe3,0x0f,0x00,0xf9,0xfe,0x13,0x00,0xf9,0xe0,0x07,0x40,0xf9,0xe1,0x0b,0x40,0xf9,0xe2,0x0f,0x40,0xf9,0xe6,0xff,0xff,0x97,0xe1,0x07,0x40,0xf9,0xe2,0x0b,0x40,0xf9,0xe3,0x0f,0x40,0xf9,0xfe,0x13,0x40,0xf9,0xff,0xc3,0x00,0x91,0xc0,0x03,0x5f,0xd6,0x3f,0x00,0x00,0xf1,0xe4,0x07,0x9f,0x9a,0x1f,0x00,0x00,0xf1,0xe5,0x17,0x9f,0x9a,0x86,0x00,0x05,0x8a,0x66,0x00,0x00,0xb4,0x60,0x00,0x80,0xd2,0xc0,0x03,0x5f,0xd6,0xff,0xc3,0x00,0xd1,0xe0,0x03,0x00,0xf9,0xe1,0x07,0x00,0xf9,0xe2,0x0b,0x00,0xf9,0xe3,0x0f,0x00,0xf9,0xfe,0x13,0x00,0xf9,0xe0,0x07,0x40,0xf9,0xe1,0x0b,0x40,0xf9,0xe2,0x0f,0x40,0xf9,0xce,0xff,0xff,0x97,0xe1,0x07,0x40,0xf9,0xe2,0x0b,0x40,0xf9,0xe3,0x0f,0x40,0xf9,0xfe,0x13,0x40,0xf9,0xff,0xc3,0x00,0x91,0xc0,0x03,0x5f,0xd6,0xff,0x03,0x01,0xd1,0xe0,0x03,0x00,0xf9,0xe1,0x07,0x00,0xf9,0xe2,0x0b,0x00,0xf9,0xe3,0x0f,0x00,0xf9,0xe4,0x13,0x00,0xf9,0xe5,0x17,0x00,0xf9,0xfe,0x1b,0x00,0xf9,0xe0,0x03,0x40,0xf9,0x21,0x00,0x80,0xd2,0xe2,0x07,0x40,0xf9,0xe3,0x0b,0x40,0xf9,0xc8,0xff,0xff,0x97,0xe5,0x03,0x00,0xaa,0xe0,0x03,0x40,0xf9,0xe1,0x07,0x40,0xf9,0xe2,0x0b,0x40,0xf9,0xe3,0x0f,0x40,0xf9,0xe4,0x13,0x40,0xf9,0xfe,0x1b,0x40,0xf9,0xff,0x03,0x01,0x91,0xbf,0x00,0x00,0xf1,0x60,0x00,0x00,0x54,0xe0,0x03,0x05,0xaa,0xc0,0x03,0x5f,0xd6,0x7f,0x00,0x04,0xeb,0x6a,0x00,0x00,0x54,0x80,0x00,0x80,0xd2,0xc0,0x03,0x5f,0xd6,0x00,0x00,0x80,0xd2,0xc0,0x03,0x5f,0xd6\n.previous\n");
+static const char ombr2_ident_osc_ownership[] = "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=b947984425bedd6508a3b9f6154fb9ef35c0fada6ba0a81a609767cb54515e2d omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2";
+__attribute__((visibility("default"))) const char *omega2_ident_osc_ownership(void)
+{
+    return ombr2_ident_osc_ownership;
+}
+__asm__(".section .text.omega_bridge,\"ax\",@progbits\n.balign 4\n.local ombr2_entry_osc_owner_access\n.hidden ombr2_entry_osc_owner_access\nombr2_entry_osc_owner_access:\nhint #34\nb ombr2_code_osc_ownership+0\n.previous\n");
+extern const unsigned char ombr2_entry_osc_owner_access[] __attribute__((visibility("hidden")));
+/* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+__attribute__((visibility("default"))) uint32_t omega2_osc_owner_access(uint64_t *result, uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count)
+{
+    ombr_span sp[7];
+    unsigned ns = 0;
+    uint64_t a[6] = {0};
+    ombr2_out ou[6] = {{0, 0, 0}};
+    unsigned no = 0;
+    if (ombr_span_add(sp, &ns, result, 1u, 1u, 8u, 1))
+        return OMEGA_BAD_ARG;
+    a[0] = o_moved;
+    a[1] = o_exclusive;
+    a[2] = o_shared_count;
+    a[3] = o_mut_count;
+    if (ombr2_overlap(sp, ns))
+        return OMEGA_BAD_ARG;
+    return ombr2_run(ombr2_entry_osc_owner_access, a, result, 1, ou, no);
+}
+__asm__(".section .text.omega_bridge,\"ax\",@progbits\n.balign 4\n.local ombr2_entry_osc_borrow_access\n.hidden ombr2_entry_osc_borrow_access\nombr2_entry_osc_borrow_access:\nhint #34\nb ombr2_code_osc_ownership+4\n.previous\n");
+extern const unsigned char ombr2_entry_osc_borrow_access[] __attribute__((visibility("hidden")));
+/* export fn osc_borrow_access writable ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+__attribute__((visibility("default"))) uint32_t omega2_osc_borrow_access(uint64_t *result, uint64_t o_writable, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count)
+{
+    ombr_span sp[7];
+    unsigned ns = 0;
+    uint64_t a[6] = {0};
+    ombr2_out ou[6] = {{0, 0, 0}};
+    unsigned no = 0;
+    if (ombr_span_add(sp, &ns, result, 1u, 1u, 8u, 1))
+        return OMEGA_BAD_ARG;
+    a[0] = o_writable;
+    a[1] = o_exclusive;
+    a[2] = o_shared_count;
+    a[3] = o_mut_count;
+    if (ombr2_overlap(sp, ns))
+        return OMEGA_BAD_ARG;
+    return ombr2_run(ombr2_entry_osc_borrow_access, a, result, 1, ou, no);
+}
+__asm__(".section .text.omega_bridge,\"ax\",@progbits\n.balign 4\n.local ombr2_entry_osc_owner_move\n.hidden ombr2_entry_osc_owner_move\nombr2_entry_osc_owner_move:\nhint #34\nb ombr2_code_osc_ownership+8\n.previous\n");
+extern const unsigned char ombr2_entry_osc_owner_move[] __attribute__((visibility("hidden")));
+/* export fn osc_owner_move moved ulong shared_count ulong mut_count ulong declaration_depth long loop_depth long to ulong */
+__attribute__((visibility("default"))) uint32_t omega2_osc_owner_move(uint64_t *result, uint64_t o_moved, uint64_t o_shared_count, uint64_t o_mut_count, uint64_t o_declaration_depth, uint64_t o_loop_depth)
+{
+    ombr_span sp[7];
+    unsigned ns = 0;
+    uint64_t a[6] = {0};
+    ombr2_out ou[6] = {{0, 0, 0}};
+    unsigned no = 0;
+    if (ombr_span_add(sp, &ns, result, 1u, 1u, 8u, 1))
+        return OMEGA_BAD_ARG;
+    a[0] = o_moved;
+    a[1] = o_shared_count;
+    a[2] = o_mut_count;
+    a[3] = o_declaration_depth;
+    a[4] = o_loop_depth;
+    if (ombr2_overlap(sp, ns))
+        return OMEGA_BAD_ARG;
+    return ombr2_run(ombr2_entry_osc_owner_move, a, result, 1, ou, no);
+}
 /* Generated by omega-bridge src/native.om: the definitions of the C API declared in
  * omega_api_decl.h (output apic). Each calls omega2_<name> and calls abort() on a nonzero status.
  * Regenerate it; do not edit it. */
@@ -2549,6 +2616,30 @@ uint64_t osc_parse_literal(const uint8_t *o_spelling, size_t o_spelling_len, uin
 {
     uint64_t r = 0;
     if (omega2_osc_parse_literal(&r, o_spelling, o_spelling_len, o_value) != OMEGA_OK)
+        abort();
+    return r;
+}
+/* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+uint64_t osc_owner_access(uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count)
+{
+    uint64_t r = 0;
+    if (omega2_osc_owner_access(&r, (uint64_t)o_moved, (uint64_t)o_exclusive, (uint64_t)o_shared_count, (uint64_t)o_mut_count) != OMEGA_OK)
+        abort();
+    return r;
+}
+/* export fn osc_borrow_access writable ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
+uint64_t osc_borrow_access(uint64_t o_writable, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count)
+{
+    uint64_t r = 0;
+    if (omega2_osc_borrow_access(&r, (uint64_t)o_writable, (uint64_t)o_exclusive, (uint64_t)o_shared_count, (uint64_t)o_mut_count) != OMEGA_OK)
+        abort();
+    return r;
+}
+/* export fn osc_owner_move moved ulong shared_count ulong mut_count ulong declaration_depth long loop_depth long to ulong */
+uint64_t osc_owner_move(uint64_t o_moved, uint64_t o_shared_count, uint64_t o_mut_count, int64_t o_declaration_depth, int64_t o_loop_depth)
+{
+    uint64_t r = 0;
+    if (omega2_osc_owner_move(&r, (uint64_t)o_moved, (uint64_t)o_shared_count, (uint64_t)o_mut_count, (uint64_t)o_declaration_depth, (uint64_t)o_loop_depth) != OMEGA_OK)
         abort();
     return r;
 }

@@ -22,6 +22,7 @@
  */
 #include "osc_alloc.h"
 #include "osc_check.h"
+#include "omega_api_decl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -292,13 +293,14 @@ static int access(C *c, int s, int wr, uint32_t line, uint32_t col)
     if (y->kind == SK_OWNER) {
         Obj *o = &c->obj[y->obj];
         uint32_t k = wr ? OSC_EV_USE_WRITE : OSC_EV_USE_READ;
-        if (o->moved) {
+        uint64_t decision = osc_owner_access(o->moved, wr, o->n_shared, o->n_mut);
+        if (decision == OSC_OWN_MOVED) {
             int mb = maybe_path(c, y);
             tr_ev(c, k, y->obj, -1, -1, -1, line, 1);
             snprintf(msg, sizeof msg, mb ? "'%s' used after it may have been moved at line %u (moved on some path of an 'if')" : "'%s' used after it was moved at line %u", y->name, o->move_line);
             return diag_own(c, OSC_DIAG_USE_AFTER_MOVE, line, col, s, NULL, mb ? "use after maybe-move" : "use after move", msg);
         }
-        if (o->n_mut || (wr && o->n_shared)) {
+        if (decision == OSC_OWN_ALIAS) {
             conflict_name(c, y->obj, -1, !wr, other, sizeof other);
             tr_ev(c, k, y->obj, -1, -1, -1, line, 1);
             snprintf(msg, sizeof msg, "direct %s of '%s' while %s is live", wr ? "store" : "read", y->name, other);
@@ -312,12 +314,13 @@ static int access(C *c, int s, int wr, uint32_t line, uint32_t col)
     int b = y->bor;
     Bor *x = &c->bor[b];
     uint32_t k = wr ? OSC_EV_USE_WRITE : OSC_EV_USE_READ;
-    if (wr && !x->mut) {
+    uint64_t decision = osc_borrow_access(x->mut, wr, x->kids_shared, x->kids_mut);
+    if (decision == OSC_OWN_READ_ONLY) {
         tr_ev(c, k, x->obj, -1, -1, b, line, 1);
         snprintf(msg, sizeof msg, "store through shared borrow '%s' (read only)", y->name);
         return diag_own(c, OSC_DIAG_READ_ONLY_BORROW, line, col, s, NULL, "write through shared borrow", msg);
     }
-    if (x->kids_mut || (wr && x->kids_shared)) {
+    if (decision == OSC_OWN_ALIAS) {
         conflict_name(c, -1, b, !wr, other, sizeof other);
         tr_ev(c, k, x->obj, -1, -1, b, line, 1);
         snprintf(msg, sizeof msg, "use of '%s' while its reborrow %s is live", y->name, other);
@@ -336,13 +339,14 @@ static int take_borrow(C *c, int s, int mut, uint32_t line, uint32_t col)
     uint32_t k = mut ? OSC_EV_BORROW_MUT : OSC_EV_BORROW_SHARED;
     if (y->kind == SK_OWNER) {
         Obj *o = &c->obj[y->obj];
-        if (o->moved) {
+        uint64_t decision = osc_owner_access(o->moved, mut, o->n_shared, o->n_mut);
+        if (decision == OSC_OWN_MOVED) {
             int mb = maybe_path(c, y);
             tr_ev(c, k, y->obj, -1, c->nbor, -1, line, 1);
             snprintf(msg, sizeof msg, mb ? "borrow of '%s' after it may have been moved at line %u (moved on some path of an 'if')" : "borrow of '%s' after it was moved at line %u", y->name, o->move_line);
             return diag_own(c, OSC_DIAG_USE_AFTER_MOVE, line, col, s, NULL, mb ? "use after maybe-move" : "use after move", msg);
         }
-        if (o->n_mut || (mut && o->n_shared)) {
+        if (decision == OSC_OWN_ALIAS) {
             conflict_name(c, y->obj, -1, !mut, other, sizeof other);
             tr_ev(c, k, y->obj, -1, c->nbor, -1, line, 1);
             snprintf(msg, sizeof msg, "%s of '%s' while %s is live", mut ? "&mut" : "&", y->name, other);
@@ -357,12 +361,13 @@ static int take_borrow(C *c, int s, int mut, uint32_t line, uint32_t col)
     }
     int p = y->bor;
     Bor *x = &c->bor[p];
-    if (mut && !x->mut) {
+    uint64_t decision = osc_borrow_access(x->mut, mut, x->kids_shared, x->kids_mut);
+    if (decision == OSC_OWN_READ_ONLY) {
         tr_ev(c, k, x->obj, -1, c->nbor, p, line, 1);
         snprintf(msg, sizeof msg, "&mut reborrow through shared borrow '%s' (read only)", y->name);
         return diag_own(c, OSC_DIAG_READ_ONLY_BORROW, line, col, s, NULL, "borrow_mut through shared borrow", msg);
     }
-    if (x->kids_mut || (mut && x->kids_shared)) {
+    if (decision == OSC_OWN_ALIAS) {
         conflict_name(c, -1, p, !mut, other, sizeof other);
         tr_ev(c, k, x->obj, -1, c->nbor, p, line, 1);
         snprintf(msg, sizeof msg, "reborrow of '%s' while %s is live", y->name, other);
@@ -381,19 +386,20 @@ static int do_move(C *c, int s, int dest, uint32_t line, uint32_t col)
     Sym *y = &c->sym[s];
     Obj *o = &c->obj[y->obj];
     char other[64], msg[160];
-    if (o->moved) {
+    uint64_t decision = osc_owner_move(o->moved, o->n_shared, o->n_mut, y->loop_depth, c->loop_depth);
+    if (decision == OSC_OWN_MOVED) {
         int mb = maybe_path(c, y);
         tr_ev(c, OSC_EV_MOVE, y->obj, dest, -1, -1, line, 1);
         snprintf(msg, sizeof msg, mb ? "'%s' moved again after it may have been moved at line %u (moved on some path of an 'if')" : "'%s' moved again after it was moved at line %u", y->name, o->move_line);
         return diag_own(c, OSC_DIAG_USE_AFTER_MOVE, line, col, s, NULL, mb ? "use after maybe-move" : "use after move", msg);
     }
-    if (o->n_shared || o->n_mut) {
+    if (decision == OSC_OWN_ALIAS) {
         conflict_name(c, y->obj, -1, 0, other, sizeof other);
         tr_ev(c, OSC_EV_MOVE, y->obj, dest, -1, -1, line, 1);
         snprintf(msg, sizeof msg, "move of '%s' while %s is live", y->name, other);
         return diag_own(c, OSC_DIAG_MUTABLE_ALIAS, line, col, s, other, "move while borrowed", msg);
     }
-    if (y->loop_depth < c->loop_depth) {
+    if (decision == OSC_OWN_LOOP_MOVE) {
         /* first iteration moves, the next iteration would use a moved owner */
         tr_ev(c, OSC_EV_MOVE, y->obj, dest, -1, -1, line, 0);
         int d2 = -1;
