@@ -649,15 +649,19 @@ case "$step" in
   arboris-gated-silicon)
     sh seed/omega-from-seed.sh
     OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
-    "$OUT_DIR/caproot-issuer" "$OUT_DIR/gated-chip" --arboris-silicon > "$OUT_DIR/gated-device.log" || {
-      cat "$OUT_DIR/gated-device.log"
-      exit 1
-    }
-    cat "$OUT_DIR/gated-device.log"
-    grep -Eq '^step_message=4152425354503032[0-9a-f]{352}$' "$OUT_DIR/gated-device.log"
-    grep -qx 'matching_fp16_elements=40' "$OUT_DIR/gated-device.log"
-    grep -qx 'kernel_sha256=66efbbc55e3e0434aa0e43416d25c22112c383a3f4c91da5337304d1fea85182' "$OUT_DIR/gated-device.log"
-    grep -qx 'output_sha256=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089' "$OUT_DIR/gated-device.log"
+    for model in gated wide; do
+      log="$OUT_DIR/$model-device.log"
+      "$OUT_DIR/caproot-issuer" "$OUT_DIR/$model-chip" --arboris-silicon > "$log" || { cat "$log"; exit 1; }
+      cat "$log"
+      case "$model" in
+        gated) halves=40; output=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089 ;;
+        wide) halves=1320; output=ca8052acb8c6306df043531ab6c116c5d8dd69a7e565974338088119f8355e34 ;;
+      esac
+      grep -Eq '^step_message=4152425354503032[0-9a-f]{352}$' "$log"
+      grep -qx "matching_fp16_elements=$halves" "$log"
+      grep -qx "kernel_sha256=$(sha256sum "$OUT_DIR/$model.sass" | cut -d' ' -f1)" "$log"
+      grep -qx "output_sha256=$output" "$log"
+    done
     ;;
   arboris-sparse-silicon)
     sh seed/omega-from-seed.sh

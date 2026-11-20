@@ -34,6 +34,7 @@ sh tests/arboris/build-sparse-probe.sh "$out/sparse-chip"
 sh tests/arboris/build-sparse-probe.sh "$out/wave-chip" tests/arboris/sparse-silicon.om wave
 sh tests/arboris/build-sparse-probe.sh "$out/small-chip" tests/arboris/sparse-silicon.om small
 sh tests/arboris/build-sparse-probe.sh "$out/gated-chip" tests/arboris/gated-silicon.om
+sh tests/arboris/build-sparse-probe.sh "$out/wide-chip" tests/arboris/gated-silicon.om wide
 for model in small sparse wave; do
     "$out/$model-chip" reference > "$out/$model-reference.log"
     case "$model" in
@@ -44,6 +45,8 @@ for model in small sparse wave; do
     grep -qx "output_sha256=$expected" "$out/$model-reference.log"
 done
 "$out/gated-chip" reference > "$out/gated-reference.log"
+"$out/wide-chip" reference > "$out/wide-reference.log"
+grep -qx "output_sha256=ca8052acb8c6306df043531ab6c116c5d8dd69a7e565974338088119f8355e34" "$out/wide-reference.log"
 compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om tests/arboris_spread_test.om
 "$out/spread"
 compile "$out/gated" om/arboris_arena.om gpu/nvidia/om/numeric/numeric.om om/arboris_gated.om tests/arboris_gated_test.om
@@ -76,6 +79,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/scoreboard_oracle.c sr
 "$out/check-wave" < "$out/wave.bin"
 "$out/check-wave" < "$out/relax.bin"
 "$out/check-wave" < "$out/gated.sass"
+"$out/emit-gated" wide > "$out/wide.sass"
+echo "e1950992aaf3ba1a22562f68ddf2575d27dc39fc8e50f33e2683e0f2c6ed32af  $out/wide.sass" | sha256sum -c -
+"$out/check-wave" < "$out/wide.sass"
 "$out/emit" compound relax small > "$out/small.bin"
 "$out/check-wave" < "$out/small.bin"
 "$out/emit" mutant > "$out/wave-mutant.bin"

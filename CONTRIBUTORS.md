@@ -399,6 +399,7 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Applied the measured SM121 register headroom rule to the gated QMD following the Spark warp exception. |
 | Codex (under Drake Stapleton's direction) | Connected pre-submission policy admission to the dedicated world signer and verified the committed bank through the supervisor channel. |
 | Codex (under Drake Stapleton's direction) | Instrumented repeated resident CPU and native GPU sparse queries for paired latency and whole-board energy measurements. |
+| Codex (under Drake Stapleton's direction) | Extended gated differential verification to all warp lanes, a partial second dimension tile, and 1,320 FP16 coordinates. |
 | Codex (under Drake Stapleton's direction) | Checked the batched sparse CPU fixtures against closed-form outputs at both routing sizes. |
 | Codex (under Drake Stapleton's direction) | Implemented seeded Omega SM121 kernels and decode tables for the DeepSeek-V4.1-Flash text backbone, added driver-loadable cubin metadata and single-Spark numerical checks. |
 | Codex (under Drake Stapleton's direction) | Built the resident pure-Omega DeepSeek-V4.1-Flash final-head executor, native QMD submission chain, packed-BF16 vocabulary projection, and full-vocabulary checkpoint comparison. |

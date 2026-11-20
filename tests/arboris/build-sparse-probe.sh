@@ -7,16 +7,18 @@ bin=${1:?supply output executable}
 main=${2:-tests/arboris/sparse-silicon.om}
 # Compile an exact fixture into each probe so replay cannot change its shape.
 case "${3:-compound}" in
-    compound) dims="100000 2 1" ;;
-    wave)     dims="100000 2 2" ;;
-    small)    dims="4096 1 1" ;;
+    compound) dims="100000 2 1 8" ;;
+    wave)     dims="100000 2 2 8" ;;
+    small)    dims="4096 1 1 8" ;;
+    wide)     dims="100000 2 1 264" ;;
     *) exit 2 ;;
 esac
 set -- $dims
 printf 'const probe_n ulong %s
 const probe_batch ulong %s
 const probe_planes ulong %s
-' "$1" "$2" "$3" > "$bin.shape.om"
+const probe_dim ulong %s
+' "$1" "$2" "$3" "$4" > "$bin.shape.om"
 common=tests/arboris/probe-common.om
 case "$main" in *packet.om) common=/dev/null ;; esac
 # Only the gated CPU oracle needs the numeric reference. Its public "shape"
